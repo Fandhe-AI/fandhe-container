@@ -312,6 +312,69 @@ fn mac1_build_vz_configuration_readonly_share_escape_checks() {
     );
 }
 
+/// MAC-1・SEC-4・TASK-115.3: 仕様の生成後に共有元・その祖先を symlink へ差し替えると、公開 API の
+/// `build_vz_configuration` は VZ へパスを渡す前の再検証で `config.shared_dir_symlink` を返して拒否する
+/// （指定していないホストディレクトリを共有しない）。元へ戻すと受理される。
+#[test]
+fn mac1_sec4_build_vz_configuration_rejects_share_swapped_to_symlink() {
+    let s = Scratch::new("share-swap", false);
+    let kernel = s.file("vmlinux", b"dummy");
+    let parent = s.dir.join("parent");
+    let shared = parent.join("shared");
+    std::fs::create_dir_all(&shared).expect("create shared dir");
+    // 差し替え先（呼び出し元が指定していないホストディレクトリ）。
+    let victim = s.dir.join("victim");
+    std::fs::create_dir_all(victim.join("shared")).expect("create victim dir");
+    let spec = VmConfigSpec::from_parts(&kernel, None, "console=hvc0")
+        .expect("spec")
+        .with_shared_directories(
+            VirtiofsSharesSpec::try_new(vec![VirtiofsShareSpec::new(
+                VirtiofsTag::try_new("ro").expect("tag"),
+                SharedDirectoryPath::try_new(&shared).expect("shared path"),
+                ShareAccess::ReadOnly,
+            )])
+            .expect("shares"),
+        );
+
+    // 共有元そのものを差し替える。
+    std::fs::remove_dir(&shared).expect("remove shared dir");
+    std::os::unix::fs::symlink(&victim, &shared).expect("symlink");
+    match build_vz_configuration(&spec) {
+        Err(e) => {
+            assert_eq!(e.code(), "config.shared_dir_symlink");
+            assert_eq!(
+                e,
+                ConfigError::SharedDirSymlink {
+                    path: shared.clone()
+                }
+            );
+        }
+        Ok(_) => panic!("a share swapped to a symlink must be rejected"),
+    }
+    std::fs::remove_file(&shared).expect("remove symlink");
+
+    // 祖先を差し替える（解決先に同名の `shared` がある）。
+    std::fs::remove_dir(&parent).expect("remove parent dir");
+    std::os::unix::fs::symlink(&victim, &parent).expect("symlink");
+    match build_vz_configuration(&spec) {
+        Err(e) => assert_eq!(
+            e,
+            ConfigError::SharedDirSymlink {
+                path: parent.clone()
+            }
+        ),
+        Ok(_) => panic!("a share whose ancestor was swapped to a symlink must be rejected"),
+    }
+    std::fs::remove_file(&parent).expect("remove symlink");
+
+    // 元へ戻すと受理される。
+    std::fs::create_dir_all(&shared).expect("recreate shared dir");
+    match build_vz_configuration(&spec) {
+        Ok(cfg) => assert_eq!(cfg.shared_directories().len(), 1),
+        Err(e) => panic!("restored share must be accepted: {e}"),
+    }
+}
+
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
 }

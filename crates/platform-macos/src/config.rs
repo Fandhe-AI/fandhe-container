@@ -1671,6 +1671,31 @@ impl VmConfigSpec {
         })
     }
 
+    /// 生成時に検証したホストのパス（kernel・initrd・共有元）を、同じ検証でもう一度確かめる
+    /// （MAC-1・SEC-4・TASK-115.3）。
+    ///
+    /// 仕様の生成から使用までの間にパスが差し替えられる窓を縮めるための再検証。共有元は
+    /// [`crate::virtiofs::SharedDirectoryPath::try_new`]（実在ディレクトリ・全要素が symlink でない）、kernel・
+    /// initrd は生成時と同じ検証（絶対・UTF-8・通常ファイル）をそのまま再実行する（別実装を持たない）。
+    /// 共有配下の走査は symlink を解決した実体を調べるが、VZ へ渡すのは解決前のパスのため、生成後に共有元や
+    /// その祖先が symlink へ差し替えられると、指定していないホストディレクトリが共有され得る。
+    /// `build_vz_configuration` が virtiofs デバイスを組み立てる直前に呼び、差し替えを
+    /// [`ConfigError::SharedDirSymlink`] 等で拒否する。仕様を生成してから時間を置いて使う呼び出し元
+    /// （plugin の create → start）もこの経路で検査される。
+    ///
+    /// 残余: この検証の直後から Virtualization.framework が実際にパスを開くまでの差し替えは検出できない
+    /// （VZ は fd ではなくパスを受け取るため。残余リスクとして受け入れる）。
+    pub fn revalidate_host_paths(&self) -> Result<(), ConfigError> {
+        KernelImagePath::try_new(self.kernel.as_path())?;
+        if let Some(initrd) = &self.initrd {
+            InitrdPath::try_new(initrd.as_path())?;
+        }
+        for share in self.shares.shares() {
+            crate::virtiofs::SharedDirectoryPath::try_new(share.host_dir.as_path())?;
+        }
+        Ok(())
+    }
+
     /// virtiofs 共有を差し替える（TASK-65.1）。検証は [`VirtiofsSharesSpec::try_new`] 済み。
     pub fn with_shared_directories(mut self, shares: VirtiofsSharesSpec) -> Self {
         self.shares = shares;
@@ -1989,6 +2014,8 @@ impl VzVmConfiguration {
 /// Rust 側の検証と VZ の許容範囲照合をすべて終えてから FFI の setter を呼ぶ（ObjC 例外は捕捉できないため）。
 /// `validateWithError` は entitlement 依存の可能性があり、ここでは呼ばず、`vm::Vm::create` が VM 生成前に呼ぶ（TASK-64.4）。
 ///
+/// virtiofs デバイスを組み立てる直前に、kernel・initrd・共有元を生成時と同じ検証で再検証する
+/// （[`VmConfigSpec::revalidate_host_paths`]。生成後の symlink への差し替えを拒否する。MAC-1・SEC-4）。
 /// 共有配下の走査に期限は無い。期限が要る呼び出し元は [`build_vz_configuration_within`] を使う。
 #[cfg(target_os = "macos")]
 pub fn build_vz_configuration(spec: &VmConfigSpec) -> Result<VzVmConfiguration, ConfigError> {
@@ -1999,7 +2026,8 @@ pub fn build_vz_configuration(spec: &VmConfigSpec) -> Result<VzVmConfiguration, 
 /// `share_scan` 内に打ち切って行う（REPAIR-5・MAC-1・TASK-115.3）。
 ///
 /// `vm::Vm::launch` が `OpTimeouts::share_scan` の指定時に呼ぶ。期限超過は
-/// [`ConfigError::SharedDirScanTimeout`]（副作用の前に返す）。
+/// [`ConfigError::SharedDirScanTimeout`]（副作用の前に返す）。期限は走査と、その後のホストパスの再検証
+/// （[`VmConfigSpec::revalidate_host_paths`]）の合計に掛かる。
 #[cfg(target_os = "macos")]
 pub fn build_vz_configuration_within(
     spec: &VmConfigSpec,
@@ -2037,10 +2065,9 @@ fn build_vz_configuration_limited(
     }
 
     // ReadWrite 共有が起動入力を含む構成と、ReadOnly を含む共有範囲外経路のある構成は、副作用の前に拒否する。
-    match share_scan {
-        Some(budget) => spec.check_share_conflicts_within(budget)?,
-        None => spec.check_share_conflicts()?,
-    }
+    // 期限は走査と、下のパス再検証で共有する（期限つき入口のみ）。
+    let limit = share_scan.map(ShareScanLimit::starting_now);
+    spec.check_share_conflicts_limited(limit)?;
 
     // 実効コマンドライン（ゲスト mount の指示を含む）と待機対象を、副作用（ログ作成・スレッド起動）の前に確定する。
     let effective_cmdline = spec.effective_cmdline()?;
@@ -2089,6 +2116,12 @@ fn build_vz_configuration_limited(
             id.as_deref(),
         ));
     }
+
+    // 仕様の生成後に kernel・initrd・共有元（とその祖先）が差し替えられていないかを、VZ へパスを渡す直前に
+    // 生成時と同じ検証で確かめる（走査は symlink の解決先を調べるが、VZ へは解決前のパスを渡すため。
+    // MAC-1・SEC-4・TASK-115.3）。期限つき入口では再検証も期限内に収める。
+    spec.revalidate_host_paths()?;
+    check_scan_limit(limit)?;
 
     // virtiofs 共有（副作用なし。件数は VirtiofsSharesSpec が上限検証済み）。
     // タグは VZ 側でも検証してから init する（init は不正値で ObjC 例外を投げ、捕捉できず abort するため）。
@@ -2736,6 +2769,74 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// MAC-1・SEC-4・TASK-115.3: 仕様の生成後に共有元・その祖先が symlink へ差し替えられたら、再検証が
+    /// `config.shared_dir_symlink` で拒否する（指定していないホストディレクトリを共有しない）。kernel の
+    /// 削除も生成時と同じ検証で拒否する。差し替えを戻せば再び通る。
+    #[cfg(unix)]
+    #[test]
+    fn revalidation_rejects_share_swapped_to_symlink_after_creation() {
+        use crate::virtiofs::{ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsTag};
+        let t = TempDir::new("share-swap");
+        let real = std::fs::canonicalize(&t.0).unwrap();
+        let k = real.join("vmlinux");
+        std::fs::write(&k, b"k").unwrap();
+        let parent = real.join("parent");
+        let shared = parent.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        // 差し替え先（呼び出し元が指定していないホストディレクトリ）。
+        let victim = real.join("victim");
+        std::fs::create_dir_all(victim.join("shared")).unwrap();
+        let spec = VmConfigSpec::from_parts(&k, None, "console=hvc0")
+            .unwrap()
+            .with_shared_directories(
+                VirtiofsSharesSpec::try_new(vec![VirtiofsShareSpec::new(
+                    VirtiofsTag::try_new("s").unwrap(),
+                    SharedDirectoryPath::try_new(&shared).unwrap(),
+                    ShareAccess::ReadOnly,
+                )])
+                .unwrap(),
+            );
+        assert_eq!(spec.revalidate_host_paths(), Ok(()));
+
+        // 共有元そのものを symlink へ差し替える。
+        std::fs::remove_dir(&shared).unwrap();
+        std::os::unix::fs::symlink(&victim, &shared).unwrap();
+        let err = spec.revalidate_host_paths().unwrap_err();
+        assert_eq!(err.code(), "config.shared_dir_symlink");
+        assert_eq!(
+            err,
+            ConfigError::SharedDirSymlink {
+                path: shared.clone()
+            }
+        );
+        // 走査は解決先（victim）を調べて通ってしまうため、再検証が無いと差し替えを検出できない。
+        assert_eq!(
+            spec.check_share_conflicts_within(Duration::from_secs(60)),
+            Ok(())
+        );
+        std::fs::remove_file(&shared).unwrap();
+
+        // 祖先を symlink へ差し替える（解決先に同名の `shared` がある）。
+        std::fs::remove_dir(&parent).unwrap();
+        std::os::unix::fs::symlink(&victim, &parent).unwrap();
+        assert_eq!(
+            spec.revalidate_host_paths(),
+            Err(ConfigError::SharedDirSymlink {
+                path: parent.clone()
+            })
+        );
+        std::fs::remove_file(&parent).unwrap();
+
+        // 元へ戻せば通り、kernel が消えれば生成時と同じ検証で拒否する。
+        std::fs::create_dir_all(&shared).unwrap();
+        assert_eq!(spec.revalidate_host_paths(), Ok(()));
+        std::fs::remove_file(&k).unwrap();
+        assert_eq!(
+            spec.revalidate_host_paths().unwrap_err().code(),
+            "config.path_not_found"
+        );
     }
 
     /// REPAIR-5・MAC-1・TASK-115.3: 期限つきの共有検査は、期限超過で走査を打ち切り

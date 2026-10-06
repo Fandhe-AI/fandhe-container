@@ -54,11 +54,11 @@
 //! `wsl.exe` の生出力は載せない。
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{
     DistroState, MAX_OUTPUT_BYTES, Wsl2Error, Wsl2ErrorCode, Wsl2Status, check_timeout,
-    detect_with_program, run, wsl_exe_path,
+    detect_with_program, remaining_until, run, wsl_exe_path,
 };
 use crate::instrument::{
     NoopWinOpRecorder, WinOpKind, WinOpRecorder, WinOpTimer, WinWarning, WinWarningCode,
@@ -1511,14 +1511,35 @@ fn prepare_with_exec(
     })
 }
 
-/// `wsl.exe` 相当の実行器を `program` から作る（各呼び出しにタイムアウトと出力上限を適用。REPAIR-5）。
+/// `wsl.exe` 相当の実行器を `program` から作る（出力上限と、全呼び出しで共有する合計期限 `timeout` を適用。
+/// 個々の呼び出しには残り時間だけを渡し、複数マウントの処理でも合計が `timeout` を超えない。REPAIR-5）。
 fn program_exec(
     program: &Path,
     timeout: Duration,
 ) -> impl FnMut(&[String], usize) -> Result<run::Captured, Wsl2Error> + '_ {
+    program_exec_from(program, timeout, Some(Instant::now()))
+}
+
+/// [`program_exec`] と同じだが、合計期限の起点を最初の呼び出し時にする（起動ステップ後のロールバック用。
+/// 起動ステップの所要時間でロールバックの持ち時間を削らない）。
+fn program_exec_lazy(
+    program: &Path,
+    timeout: Duration,
+) -> impl FnMut(&[String], usize) -> Result<run::Captured, Wsl2Error> + '_ {
+    program_exec_from(program, timeout, None)
+}
+
+fn program_exec_from(
+    program: &Path,
+    timeout: Duration,
+    started: Option<Instant>,
+) -> impl FnMut(&[String], usize) -> Result<run::Captured, Wsl2Error> + '_ {
+    let mut deadline = started.map(|t| t + timeout);
     move |args: &[String], max: usize| {
+        let deadline = *deadline.get_or_insert_with(|| Instant::now() + timeout);
+        let left = remaining_until(deadline)?;
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        run::run_capture(program, &refs, &[("WSL_UTF8", "1")], timeout, max)
+        run::run_capture(program, &refs, &[("WSL_UTF8", "1")], left, max)
     }
 }
 
@@ -1786,7 +1807,10 @@ fn launch_with_program_timed<'r, T>(
         let status = detect_with_program(program, timeout)?;
         prepare_with_exec(&status, virtiofs, req, &mut exec)
     })();
-    finish_launch(prepared, timer, &mut exec, recorder, start)
+    // 起動ステップ失敗時のロールバックには準備とは別に `timeout` を割り当てる（準備で期限を使い切っても
+    // 解除の機会を失わない。解除できなければ `MountError::unreleased` で呼び出し側へ返る。REPAIR-5・WIN-2）。
+    let mut rollback_exec = program_exec_lazy(program, timeout);
+    finish_launch(prepared, timer, &mut rollback_exec, recorder, start)
 }
 
 #[cfg(test)]
@@ -3379,6 +3403,16 @@ mod tests {
         );
         assert!(g.umounts.is_empty());
         assert_eq!(g.ids, [1, 100]);
+    }
+
+    /// REPAIR-5: 実行器の期限は全呼び出しで共有する合計期限で、使い切った後は wsl.exe を起動せず Timeout を返す。
+    #[test]
+    fn program_exec_deadline_is_shared_across_calls() {
+        let mut exec = program_exec(Path::new("unused-wsl.exe"), Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(20));
+        let e = exec(&[], 16).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::Timeout);
+        assert_eq!(e.message(), "wsl.exe did not finish before the deadline");
     }
 
     /// REPAIR-5: タイムアウトから回復して外したマウントの記録も消える。

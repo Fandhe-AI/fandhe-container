@@ -38,6 +38,7 @@
 //! `HostDir`）経由でのみ渡し、検証エラーの message は固定文言で受信値を反射しない。
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use fandhe_container_platform_windows::error::{WinError, WinErrorCode};
 use fandhe_container_platform_windows::instrument::{
@@ -53,6 +54,21 @@ use crate::frame_loop::RequestHandler;
 
 /// 同時に保持するコンテナ登録の上限（無制限確保の防止）。
 pub const MAX_CONTAINERS: usize = 64;
+
+/// start 1 回で使う共有マウント準備の合計期限。失敗時のロールバックは別に同じ長さを持つため、
+/// start の合計は準備 + ロールバックで `2 * LAUNCH_BUDGET` 以内（ゲスト起動ステップ分を除く）。
+/// core 側の plugin RPC 期限（既定 10 秒。REPAIR-5）に収める値にする。
+pub const LAUNCH_BUDGET: Duration = Duration::from_secs(4);
+
+/// stop 1 回で使うマウント解除の合計期限（全マウントで共有。REPAIR-5・WIN-2）。
+pub const RELEASE_BUDGET: Duration = Duration::from_secs(4);
+
+/// [`WindowsRuntimeAdapter::release_all`] 全体の合計期限（複数コンテナ・複数マウントで共有）。
+/// 超過分は解除せず `entries` に残し、[`ReleaseAllReport::remaining`] で報告する。
+pub const RELEASE_ALL_BUDGET: Duration = Duration::from_secs(8);
+
+/// 残り期限がこの値未満のときは新たな解除を始めない（platform-windows の最小期限より十分大きく取る）。
+const MIN_STEP_BUDGET: Duration = Duration::from_millis(50);
 
 /// コンテナ ID の最大バイト数（core の `ContainerId` と同じ規則。TASK-114 で core 型へ置換予定）。
 const MAX_ID_LEN: usize = 255;
@@ -170,17 +186,25 @@ pub trait WindowsBackend {
     fn check_distro(&self, distro: &DistroName) -> Result<(), WinError>;
 
     /// 共有マウントを準備し、成功時のみ `guest` を呼ぶ。`guest` 失敗時はマウントをロールバックする。
+    ///
+    /// `budget` はマウント準備全体の合計期限（複数マウントで共有）。`guest` 失敗時のロールバックには
+    /// 準備とは別に同じ長さが割り当てられる（解除できなければ `unreleased` で返す。WIN-2・REPAIR-5）。
     fn launch(
         &self,
         req: &LaunchRequest,
         guest: &dyn GuestStart<Self::Prepared>,
+        budget: Duration,
     ) -> Result<LaunchOutcome<Self::Prepared>, BackendFailure<Self::Prepared>>;
 
-    /// 準備済みマウントを解除する。
-    fn release(&self, prepared: &Self::Prepared) -> Result<(), BackendFailure<Self::Prepared>>;
+    /// 準備済みマウントを解除する。`budget` は全マウントの解除で共有する合計期限。
+    fn release(
+        &self,
+        prepared: &Self::Prepared,
+        budget: Duration,
+    ) -> Result<(), BackendFailure<Self::Prepared>>;
 }
 
-/// 実バックエンド。platform-windows の関数へそのまま委譲する（期限は `DEFAULT_WSL_TIMEOUT`。REPAIR-5）。
+/// 実バックエンド。platform-windows の関数へ委譲する（期限は呼び出し側が渡す合計期限。REPAIR-5）。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PlatformBackend;
 
@@ -216,12 +240,11 @@ impl WindowsBackend for PlatformBackend {
         &self,
         req: &LaunchRequest,
         guest: &dyn GuestStart<PreparedLaunch>,
+        budget: Duration,
     ) -> Result<LaunchOutcome<PreparedLaunch>, BackendFailure<PreparedLaunch>> {
         let Launched { prepared, .. } =
-            wsl2::launch_with_recorder(req, DEFAULT_WSL_TIMEOUT, &StderrJsonRecorder, |p| {
-                guest.start(p)
-            })
-            .map_err(failure_from_mount)?;
+            wsl2::launch_with_recorder(req, budget, &StderrJsonRecorder, |p| guest.start(p))
+                .map_err(failure_from_mount)?;
         Ok(LaunchOutcome {
             transport: prepared.transport(),
             warning: prepared.warning().map(|w| w.code()),
@@ -229,13 +252,13 @@ impl WindowsBackend for PlatformBackend {
         })
     }
 
-    fn release(&self, prepared: &PreparedLaunch) -> Result<(), BackendFailure<PreparedLaunch>> {
-        wsl2::release_virtiofs_launch_with_recorder(
-            prepared,
-            DEFAULT_WSL_TIMEOUT,
-            &StderrJsonRecorder,
-        )
-        .map_err(failure_from_mount)
+    fn release(
+        &self,
+        prepared: &PreparedLaunch,
+        budget: Duration,
+    ) -> Result<(), BackendFailure<PreparedLaunch>> {
+        wsl2::release_virtiofs_launch_with_recorder(prepared, budget, &StderrJsonRecorder)
+            .map_err(failure_from_mount)
     }
 }
 
@@ -416,7 +439,7 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
                     "container is not in created state",
                 ));
             }
-            Some(Entry::Created(req)) => self.backend.launch(req, &self.guest),
+            Some(Entry::Created(req)) => self.backend.launch(req, &self.guest, LAUNCH_BUDGET),
         };
         match result {
             Ok(o) => {
@@ -439,15 +462,30 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
 
     /// 保持中のマウントをすべて解除する（接続終了・異常終了時の後始末。WIN-2・REPAIR-5）。
     ///
-    /// `serve` 終了後に呼ぶほか、[`Drop`] からも呼ばれる（冪等）。解除に失敗した準備済みマウントは
-    /// `entries` に残し、件数を [`ReleaseAllReport::remaining`] で返す。各解除は
-    /// `DEFAULT_WSL_TIMEOUT` で有界。
+    /// `serve` 終了後に呼ぶほか、[`Drop`] からも呼ばれる（冪等）。全体で [`RELEASE_ALL_BUDGET`] の
+    /// 合計期限を持ち、各解除には残り時間（最大 [`RELEASE_BUDGET`]）だけを渡す。解除に失敗した・期限切れで
+    /// 着手できなかった準備済みマウントは `entries` に残し、件数を [`ReleaseAllReport::remaining`] で返す
+    /// （手動回収または次回の stop / release_all で再試行できる）。
     pub fn release_all(&mut self) -> ReleaseAllReport {
+        self.release_all_within(RELEASE_ALL_BUDGET)
+    }
+
+    fn release_all_within(&mut self, total: Duration) -> ReleaseAllReport {
         let mut report = ReleaseAllReport::default();
+        let deadline = Instant::now() + total;
         // 1 件ずつ取り出して解除する。`backend.release` が panic しても（記録先 stderr の破損による
         // `eprintln!` の panic 等）、未処理のエントリは `entries` に残り、Drop で再試行できる。
         let ids: Vec<String> = self.entries.keys().cloned().collect();
         for id in ids {
+            if matches!(self.entries.get(&id), Some(Entry::Created(_)) | None) {
+                continue;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left < MIN_STEP_BUDGET {
+                // 期限切れ: 着手しないエントリは所有情報ごとそのまま残す。
+                report.remaining += 1;
+                continue;
+            }
             let Some(entry) = self.entries.remove(&id) else {
                 continue;
             };
@@ -456,8 +494,10 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
                 Entry::Running(p) | Entry::Unreleased(p) => p,
             };
             let backend = &self.backend;
-            let outcome =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| backend.release(&p)));
+            let budget = left.min(RELEASE_BUDGET);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                backend.release(&p, budget)
+            }));
             match outcome {
                 Ok(Ok(())) => report.released += 1,
                 Ok(Err(f)) => {
@@ -483,18 +523,30 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
         };
         match entry {
             Entry::Created(_) => Ok(reply("stopped", "", "")),
-            Entry::Running(p) | Entry::Unreleased(p) => match self.backend.release(&p) {
-                Ok(()) => Ok(reply("stopped", "", "")),
-                Err(f) => {
-                    let e = failure_to_plugin_error(&f);
-                    // 解除失敗時は所有情報を失わない（特権操作の後始末。WIN-2）。バックエンドが
-                    // 未解除部分を明示したときだけ置き換え、不明なら元の準備済みマウントを保持して
-                    // 次の stop で解除を再試行できるようにする。
-                    let keep = f.unreleased.unwrap_or(p);
-                    self.entries.insert(id.to_string(), Entry::Unreleased(keep));
-                    Err(e)
+            Entry::Running(p) | Entry::Unreleased(p) => {
+                let backend = &self.backend;
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    backend.release(&p, RELEASE_BUDGET)
+                }));
+                match outcome {
+                    Ok(Ok(())) => Ok(reply("stopped", "", "")),
+                    Ok(Err(f)) => {
+                        let e = failure_to_plugin_error(&f);
+                        // 解除失敗時は所有情報を失わない（特権操作の後始末。WIN-2）。バックエンドが
+                        // 未解除部分を明示したときだけ置き換え、不明なら元の準備済みマウントを保持して
+                        // 次の stop で解除を再試行できるようにする。
+                        let keep = f.unreleased.unwrap_or(p);
+                        self.entries.insert(id.to_string(), Entry::Unreleased(keep));
+                        Err(e)
+                    }
+                    Err(_) => {
+                        // panic 時は解除済みか不明なため、未解除として保持し直す（次の stop /
+                        // release_all で再試行できる。WIN-2）。
+                        self.entries.insert(id.to_string(), Entry::Unreleased(p));
+                        Err(err(PluginErrorCode::Internal, "unmount panicked"))
+                    }
                 }
-            },
+            }
         }
     }
 }
@@ -538,6 +590,8 @@ mod tests {
         launch_err: RefCell<Option<BackendFailure<FakePrepared>>>,
         release_err: RefCell<Option<BackendFailure<FakePrepared>>>,
         panic_once: RefCell<bool>,
+        /// 渡された合計期限（launch / release の呼び出し順）。
+        budgets: RefCell<Vec<Duration>>,
     }
 
     impl WindowsBackend for Fake {
@@ -555,7 +609,9 @@ mod tests {
             &self,
             req: &LaunchRequest,
             guest: &dyn GuestStart<FakePrepared>,
+            budget: Duration,
         ) -> Result<LaunchOutcome<FakePrepared>, BackendFailure<FakePrepared>> {
+            self.budgets.borrow_mut().push(budget);
             let mounts: Vec<String> = req
                 .mounts()
                 .iter()
@@ -578,7 +634,12 @@ mod tests {
                 warning: None,
             })
         }
-        fn release(&self, p: &FakePrepared) -> Result<(), BackendFailure<FakePrepared>> {
+        fn release(
+            &self,
+            p: &FakePrepared,
+            budget: Duration,
+        ) -> Result<(), BackendFailure<FakePrepared>> {
+            self.budgets.borrow_mut().push(budget);
             self.calls.borrow_mut().push(format!("release:{}", p.0));
             if self.panic_once.replace(false) {
                 panic!("fake release panic");
@@ -809,6 +870,59 @@ mod tests {
         assert_eq!((r.released, r.remaining), (1, 0));
         assert_eq!(a.release_all(), ReleaseAllReport::default());
         drop(calls);
+    }
+
+    /// WIN-2・REPAIR-5: stop 中の解除が panic しても所有情報を失わず、次の stop で再試行できる。
+    #[test]
+    fn task116_3_win2_stop_panic_keeps_entry_for_retry() {
+        let (mut a, calls) = adapter(Fake::default());
+        a.handle(&s(CREATE)).unwrap();
+        a.handle(&s(&["start", "c1"])).unwrap();
+        *a.backend.panic_once.borrow_mut() = true;
+        let e = a.handle(&s(&["stop", "c1"])).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Internal);
+        assert_eq!(
+            a.handle(&s(&["stop", "c1"])).unwrap(),
+            s(&["stopped", "", ""])
+        );
+        let releases = calls
+            .borrow()
+            .iter()
+            .filter(|c| c.starts_with("release"))
+            .count();
+        assert_eq!(releases, 2);
+        assert_eq!(a.release_all(), ReleaseAllReport::default());
+    }
+
+    /// REPAIR-5: start / stop は定数の合計期限を、release_all は残り時間（上限 RELEASE_BUDGET）を渡す。
+    #[test]
+    fn task116_3_repair5_budgets_are_propagated_to_backend() {
+        let (mut a, _) = adapter(Fake::default());
+        a.handle(&s(CREATE)).unwrap();
+        a.handle(&s(&["start", "c1"])).unwrap();
+        a.handle(&s(&["stop", "c1"])).unwrap();
+        a.handle(&s(CREATE)).unwrap();
+        a.handle(&s(&["start", "c1"])).unwrap();
+        let r = a.release_all();
+        assert_eq!((r.released, r.remaining), (1, 0));
+        let b = a.backend.budgets.borrow().clone();
+        assert_eq!(b.len(), 4);
+        assert_eq!((b[0], b[1]), (LAUNCH_BUDGET, RELEASE_BUDGET));
+        assert_eq!(b[2], LAUNCH_BUDGET);
+        assert!(b[3] <= RELEASE_BUDGET && b[3] >= MIN_STEP_BUDGET);
+    }
+
+    /// REPAIR-5・WIN-2: 合計期限を使い切った release_all は着手せず所有情報ごと残し、後の呼び出しで解除する。
+    #[test]
+    fn task116_3_repair5_release_all_exhausted_budget_keeps_entries() {
+        let (mut a, calls) = adapter(Fake::default());
+        a.handle(&s(CREATE)).unwrap();
+        a.handle(&s(&["start", "c1"])).unwrap();
+        let r = a.release_all_within(Duration::ZERO);
+        assert_eq!((r.released, r.remaining), (0, 1));
+        assert!(!calls.borrow().iter().any(|c| c.starts_with("release")));
+        let r = a.release_all();
+        assert_eq!((r.released, r.remaining), (1, 0));
     }
 
     #[test]

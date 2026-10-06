@@ -141,6 +141,10 @@ where
         });
     }
     if let Some(v) = env_socket.filter(|v| !v.is_empty()) {
+        // 環境変数も untrusted。引数と同じ上限で格納前に拒否する（無制限の長さを保持させない）。
+        if v.len() > ONE_SHOT_ARGS_MAX_BYTES {
+            return Err(invalid("socket environment value too large"));
+        }
         return Ok(StartupConfig {
             socket_path: validate_path(&v)?,
             socket_source: SocketSource::Env,
@@ -291,6 +295,12 @@ mod tests {
         }
         assert_eq!(
             code(resolve_startup([], Some(os("rel.sock")), no_default)),
+            PluginErrorCode::InvalidArgument
+        );
+        // 環境変数値にも長さ上限を適用する（上限ちょうどは受理、超過は拒否）。
+        let big = format!("/{}", "a".repeat(ONE_SHOT_ARGS_MAX_BYTES));
+        assert_eq!(
+            code(resolve_startup([], Some(os(&big)), no_default)),
             PluginErrorCode::InvalidArgument
         );
     }

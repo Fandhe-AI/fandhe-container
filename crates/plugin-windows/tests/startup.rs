@@ -69,20 +69,36 @@ fn task116_1_relative_path_rejected() {
     assert!(err.contains("\"code\":\"INVALID_ARGUMENT\""), "{err}");
 }
 
+/// `/tmp` 直下に未使用の名前で 0700 のディレクトリを排他的に作成する。
+#[cfg(unix)]
+fn create_unique_dir() -> std::path::PathBuf {
+    use std::os::unix::fs::DirBuilderExt;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    for n in 0..100u32 {
+        let p = std::path::PathBuf::from("/tmp")
+            .join(format!("fc-pw-{}-{nanos:x}-{n}", std::process::id()));
+        match std::fs::DirBuilder::new().mode(0o700).create(&p) {
+            Ok(()) => return p,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => panic!("create test dir: {e}"),
+        }
+    }
+    panic!("could not create a unique test dir");
+}
+
 #[cfg(unix)]
 #[test]
 fn task116_1_default_path_uses_runtime_dir() {
-    use std::os::unix::fs::DirBuilderExt;
     // macOS の `temp_dir()`（/var/folders/...）は長く `sun_path`（104 バイト）を超えるため、
-    // 短い固定の `/tmp` 直下を使う（PLUG-12 の長さ検証自体は plugin crate 側の責務）。
-    let base = std::path::PathBuf::from("/tmp").join(format!("fc-pw-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&base)
-        .expect("create base");
+    // 短い `/tmp` 直下を使う（PLUG-12 の長さ検証自体は plugin crate 側の責務）。
+    // 名前は pid・時刻・連番で一意化し、`create`（既存なら AlreadyExists）で排他的に作る。
+    // 既存ディレクトリは削除せず、この試験が作成したものだけを後始末する。
+    let base = create_unique_dir();
     let (code, err) = run(&[], &[("XDG_RUNTIME_DIR", base.to_str().expect("utf8"))]);
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&base); // 排他作成した自前のディレクトリのみ
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("\"socket_source\":\"default\""), "{err}");
 }

@@ -9,8 +9,11 @@
 //! # 契約
 //!
 //! - 対象の固定は pidfd を **先に** 開いてから `/proc/<pid>` を検証する順で行う。検証後・参加前に
-//!   対象が終了しても、pidfd は元のプロセスを指し続けるため `ESRCH` で失敗し、再利用された別プロセスの
-//!   namespace へは入らない（pid 再利用対策。SEC-1）
+//!   対象が終了しても、pidfd は元のプロセスを指し続けるため、再利用された別プロセスの namespace へは
+//!   入らない（pid 再利用対策。SEC-1）。さらに [`join_namespaces`] は `setns` の直前に pidfd の終了状態を
+//!   再確認し、終了済みなら `FailedPrecondition` で拒否する（カーネルが終了済みの対象を `ESRCH` で拒否する
+//!   挙動には依存しない。fail-closed）。残る隙間は確認から `setns` までの極小の窓で、その間に終了した
+//!   場合も pidfd は元のプロセスを指すため別プロセスへは入らない
 //! - 対象は入れ子の PID namespace の PID 1（`NSpid:` の要素が 2 以上で末尾が 1）に限り、自プロセスと
 //!   同じ pid / mnt namespace へは参加しない。任意プロセスの namespace へ入る汎用手段にしない
 //! - 参加は **不可逆** で、呼び出しスレッドに作用する。単一スレッドのプロセスからのみ呼べる
@@ -160,6 +163,7 @@ pub struct NamespaceJoinReport {
 
 /// 検証済みの対象 `target` の namespace 群へ、1 回の `setns(2)` で参加する。
 ///
+/// 参加の直前に対象の終了を再確認し、終了済みなら `FailedPrecondition`。
 /// 呼び出しスレッドの namespace を不可逆に変える。単一スレッドでなければ `FailedPrecondition`、
 /// `set` が空なら `InvalidArgument`。契約全体はモジュール doc を参照（SUP-6・TASK-163.1）。
 pub fn join_namespaces(
@@ -172,6 +176,19 @@ pub fn join_namespaces(
             ErrorCode::InvalidArgument,
             stage,
             "namespace set to join is empty",
+        ));
+    }
+    // 検証（`open`）から参加までの間に対象が終了していないか、参加の直前に再確認する。
+    let exited = sys::poll_readable(target.pidfd.as_fd(), 0)
+        .map_err(|e| setns_error(e, "poll target pidfd"))?;
+    if exited {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            stage,
+            format!(
+                "process {} has already exited; refusing to setns",
+                target.pid
+            ),
         ));
     }
     let own = read_bounded("/proc/self/status")
@@ -285,5 +302,21 @@ mod tests {
         assert_eq!(err.stage, IsolationStage::SetNs);
         let _ = tx.send(());
         let _ = helper.join();
+    }
+
+    /// SUP-6: 検証後に終了した対象への参加は、setns の前に FailedPrecondition で拒否される。
+    #[test]
+    fn sup6_join_rejects_exited_target() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        let pidfd = sys::pidfd_open(pid).unwrap();
+        child.wait().unwrap();
+        let target = Pid1Target {
+            pid: NonZeroU32::new(pid).unwrap(),
+            pidfd,
+        };
+        let err = join_namespaces(&target, &JoinNamespace::SUP6_SET).unwrap_err();
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert!(err.message.contains("already exited"), "{}", err.message);
     }
 }

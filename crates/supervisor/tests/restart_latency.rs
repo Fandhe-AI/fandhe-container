@@ -290,7 +290,7 @@ mod linux {
             let r = supervise_with_restart(
                 &mut state,
                 Box::new(first),
-                &Respawn,
+                &(Arc::new(Respawn) as Arc<dyn Relauncher>),
                 &monitor_cfg,
                 &restart_cfg,
                 &stop,

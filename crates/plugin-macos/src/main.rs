@@ -6,6 +6,9 @@
 //! `UdsStream::connect`（peer credential 検証つき。PLUG-12）で接続し、`frame_loop::serve` で要求を
 //! 順次処理して結果を終了コードへ写すこと。
 //!
+//! 接続経路は peer 認証つき `UdsStream::connect` のみ（TASK-115.4・#388）。別 UID の listener には
+//! 1 バイトも送らず `PERMISSION_DENIED`・終了コード 3 で fail-closed する（PLUG-12）。
+//!
 //! 失敗時は stderr へ 1 行 `error: <CODE>: <message>`（機械可読な code と固定文言。REPAIR-4）を出す。
 //! 終了コード: 0 = 正常（`--help`・相手の正常切断）、2 = `InvalidArgument`（起動引数・パス）、
 //! 3 = 接続失敗、4 = フレームループの異常終了（転送エラー・プロトコル違反）、1 = その他の起動失敗。

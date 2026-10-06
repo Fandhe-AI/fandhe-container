@@ -59,16 +59,25 @@ impl Tmp {
         let base = PathBuf::from("/tmp");
         #[cfg(not(unix))]
         let base = std::env::temp_dir();
-        let p = base.join(format!("fc-pm-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).expect("create tmp dir");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
-                .expect("chmod tmp dir");
+        // 既存パスは削除せず、排他的な `create_dir` が衝突したら連番を進めて別名で作り直す
+        // （予測可能なパスの先取り・symlink 差し替えに対して fail-closed。短さも維持する）。
+        for n in 0..1000u32 {
+            let p = base.join(format!("fc-pm-{tag}-{}-{n}", std::process::id()));
+            match std::fs::create_dir(&p) {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
+                            .expect("chmod tmp dir");
+                    }
+                    return Tmp(p);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("create tmp dir: {e}"),
+            }
         }
-        Tmp(p)
+        panic!("no free tmp dir name for tag {tag}");
     }
 }
 

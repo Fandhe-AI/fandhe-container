@@ -99,6 +99,7 @@ mod process;
 mod rootfs;
 mod seccomp;
 mod stages;
+mod tmpfs;
 mod violation;
 
 pub use capabilities::CapabilityReport;
@@ -138,6 +139,7 @@ pub use seccomp::{ProbeOutcome, SeccompProbeRecord};
 #[doc(hidden)]
 pub use seccomp::{SeccompEnforcementObservation, observe_default_seccomp_enforcement};
 pub use stages::{StageHook, StageKind, StagePipeline, StageReport, StageStatus};
+pub use tmpfs::{TmpfsMountOutcome, TmpfsReport, mount_tmpfs};
 
 pub use violation::{
     IsolationViolation, VIOLATION_SUBJECT_MAX_CHARS, ViolationKind, ViolationReason,
@@ -397,6 +399,8 @@ pub enum IsolationStage {
     Landlock,
     /// seccomp ステージ（TASK-38。#832 のステージ列の第 5 段。#178 で組み込み段）。
     Seccomp,
+    /// rootfs 配下への tmpfs マウント（SUP-12・TASK-169.2。`--shm-size` / `--tmpfs`）。
+    MountTmpfs,
 }
 
 /// 実行層の構造化エラー（`code` は `traits::types::ErrorCode` を再利用）。

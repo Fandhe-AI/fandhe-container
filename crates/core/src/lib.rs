@@ -50,6 +50,8 @@
 //!   start（TASK-29.3）は実装済みだが起動は `ProcessLauncher` の依存注入で、本番 launcher と実 exec は未提供。
 //!   kill（TASK-30.1）も実装済みで、送信は `ProcessSignaler` の依存注入（本番実装は supervisor 待ち）。delete（TASK-30.2・TASK-30.3）は cgroup（`ContainerCgroupRemover` の依存注入）と `StateStore` のレコードの削除を実装済みで、OCI-7 の参照解除は TASK-183 で未実装。
 //!   失敗のエラー型 `OciRuntimeError`（ERR-2・TASK-96.1）は定義済みで、4 操作（create / start / kill / delete）は結線済み・`write_json_line` で stderr 向け 1 行を出せる（TASK-96.2・TASK-96.3）。実 stderr 出力・終了は CLI 側で未実装
+//! - `tmpfs`: tmpfs マウントの検証済み仕様型（`--shm-size` / `--tmpfs`。SUP-12・TASK-169.2）。OS 非依存で、
+//!   Linux 限定の適用は `exec::mount_tmpfs`。launcher・CLI への配線は未実装（REPAIR-3）
 //! - `state_store`: ファイルベース `StateStore`（TASK-31.1・OCI-5）は実装済み。3 OS でコンパイルされるが
 //!   使えるのは Linux のみで、他 OS の `FileStateStore::open` は状態ルートの信頼境界（所有者・ACL）を
 //!   検査できないため `Unimplemented`（fail-closed。start の `BundleLock` と同じ扱い）。
@@ -97,6 +99,7 @@ pub mod seccomp;
 pub mod state_store;
 #[cfg(target_os = "linux")]
 mod sys;
+pub mod tmpfs;
 pub mod traits;
 
 /// 非 Linux ビルドの確認（CORE-1・TASK-27.5）。

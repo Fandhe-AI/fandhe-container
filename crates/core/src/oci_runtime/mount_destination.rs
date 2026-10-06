@@ -48,7 +48,7 @@ pub struct MountDestination(String);
 
 impl MountDestination {
     /// destination 文字列を検証・正規化する（段 A）。
-    pub(super) fn parse(value: &str) -> Result<Self, OciConfigError> {
+    pub(crate) fn parse(value: &str) -> Result<Self, OciConfigError> {
         if value.is_empty() || value.contains('\0') || value.contains('\\') {
             return Err(OciConfigError::invalid(DEST_FIELD));
         }

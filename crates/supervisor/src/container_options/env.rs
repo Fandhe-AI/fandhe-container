@@ -262,7 +262,7 @@ impl EnvSet {
     /// 検証するのは env 単体の上限のみで、パス・argv を含めた起動可能性は保証しない
     /// （[`EnvSet::check_entrypoint_budget`] で別途検証する）。
     /// 重複排除は KEY の索引で行い入力件数に対し線形。値の複製は上限検証の後に 1 回だけ行う。入力の各要素は検証済み（[`EnvVar::parse`]・
-    /// [`EnvFile::parse`] 経由）であることが前提で、統合後の件数は都度上限検証する。
+    /// [`EnvFile::parse`] 経由）であることが前提で、件数は新規 KEY の追加ごとに、合計長は後勝ちで確定した最終値に対して検証する。
     pub fn resolve(
         base: &[EnvVar],
         files: &[EnvFile],
@@ -276,16 +276,12 @@ impl EnvSet {
             .iter()
             .chain(files.iter().flat_map(|f| f.vars.iter()))
             .chain(vars.iter());
-        let mut total = 0usize;
         for v in all {
-            let len = v.key.len() + 1 + v.value.len();
             match index.get(v.key.as_str()) {
                 Some(&i) => {
                     let Some(slot) = picked.get_mut(i) else {
                         return Err(invalid("env index is inconsistent"));
                     };
-                    let old = slot.key.len() + 1 + slot.value.len();
-                    total = total.saturating_sub(old + 1).saturating_add(len + 1);
                     *slot = v;
                 }
                 None => {
@@ -294,12 +290,16 @@ impl EnvSet {
                     }
                     index.insert(v.key.as_str(), picked.len());
                     picked.push(v);
-                    total = total.saturating_add(len + 1);
                 }
             }
-            if total > ENV_MAX_TOTAL_BYTES {
-                return Err(invalid("env is too large"));
-            }
+        }
+        // 合計長は後勝ちで確定した最終採用値のみで検証する（途中経過では判定しない。
+        // 後続の短い値による上書きで上限内に収まる入力を拒否しないため）。複製の前に行う。
+        let total = picked.iter().fold(0usize, |acc, v| {
+            acc.saturating_add(v.key.len() + 1 + v.value.len() + 1)
+        });
+        if total > ENV_MAX_TOTAL_BYTES {
+            return Err(invalid("env is too large"));
         }
         let set = Self {
             entries: picked.into_iter().cloned().collect(),
@@ -495,6 +495,26 @@ mod tests {
         let over: Vec<_> = (0..11).map(|i| big(&format!("K{i}"))).collect();
         assert_eq!(
             EnvSet::resolve(&base, &[], &over).unwrap_err().message(),
+            "env is too large"
+        );
+    }
+
+    /// SUP-12・TASK-169.4: 途中で上限を超える値でも、後続の上書きで最終的に収まれば受理する。
+    #[test]
+    fn sup12_env_resolve_transient_overflow_overridden() {
+        let big: Vec<_> = (0..11)
+            .map(|i| var(&format!("K{i}={}", "x".repeat(100_000))))
+            .collect();
+        let shrink: Vec<_> = (0..11).map(|i| var(&format!("K{i}=v"))).collect();
+        let set = EnvSet::resolve(&big, &[], &shrink).unwrap();
+        assert_eq!(set.len(), 11);
+        assert_eq!(
+            set.to_env_strings().first().map(String::as_str),
+            Some("K0=v")
+        );
+        // 最終値が上限を超えるなら従来どおり拒否する。
+        assert_eq!(
+            EnvSet::resolve(&big, &[], &[]).unwrap_err().message(),
             "env is too large"
         );
     }

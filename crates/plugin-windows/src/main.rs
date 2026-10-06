@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use fandhe_container_plugin::{JsonLinesPeerAuthObserver, PluginError, UdsStream};
 use fandhe_container_plugin_windows::adapter::{
-    PlatformBackend, UnimplementedGuestStart, WindowsRuntimeAdapter,
+    PlatformBackend, UnimplementedGuestStart, WindowsRuntimeAdapter, stderr_line,
 };
 use fandhe_container_plugin_windows::frame_loop::serve;
 use fandhe_container_plugin_windows::{PLUGIN_SOCKET_ENV, default_socket_path, resolve_startup};
@@ -34,11 +34,12 @@ fn report(event: &str, source: Option<&str>, e: &PluginError, extra: &str) {
     let src = source
         .map(|s| format!("\"socket_source\":\"{s}\","))
         .unwrap_or_default();
-    eprintln!(
+    // 壊れた stderr で panic しない出力を使う（解除失敗の終了コード 5 を panic 終了で上書きしない）。
+    stderr_line(&format!(
         "{{\"event\":\"{event}\",{src}\"code\":\"{}\",\"message\":\"{}\"{extra}}}",
         e.code().as_str(),
         e.message()
-    );
+    ));
 }
 
 fn main() -> ExitCode {
@@ -67,10 +68,10 @@ fn main() -> ExitCode {
     // EOF・異常終了のどちらでも、保持中の共有マウントの解除を試みる（WIN-2）。
     let cleanup = adapter.release_all();
     if cleanup.released + cleanup.remaining > 0 {
-        eprintln!(
+        stderr_line(&format!(
             "{{\"event\":\"plugin.cleanup\",\"released\":{},\"remaining\":{}}}",
             cleanup.released, cleanup.remaining
-        );
+        ));
     }
     if let Err(e) = &result {
         report("plugin.frame_loop", Some(source), e, "");

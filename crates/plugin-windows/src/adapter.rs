@@ -44,6 +44,7 @@
 //! `HostDir`）経由でのみ渡し、検証エラーの message は固定文言で受信値を反射しない。
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 use fandhe_container_platform_windows::error::{WinError, WinErrorCode};
@@ -338,17 +339,26 @@ pub fn warning_line(w: &WinWarning) -> String {
     )
 }
 
+/// stderr へ 1 行書く。書き込みの失敗（閉じられた・壊れた stderr）は無視し、panic しない。
+///
+/// `eprintln!` は書き込み失敗で panic する。記録先がマウント準備・解除の途中で panic すると、
+/// platform-windows の内側にある準備済みマウントの所有情報を失うため、本 plugin の診断出力は
+/// すべて本関数を通す（WIN-2・REPAIR-4）。
+pub fn stderr_line(line: &str) {
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
+}
+
 /// platform-windows の計測・警告を stderr へ 1 行 JSON で出す記録先。有界時間・非 panic の契約を満たす。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StderrJsonRecorder;
 
 impl WinOpRecorder for StderrJsonRecorder {
     fn record_win_op(&self, sample: &WinOpSample) {
-        eprintln!("{}", op_line(sample));
+        stderr_line(&op_line(sample));
     }
 
     fn record_win_warning(&self, warning: &WinWarning) {
-        eprintln!("{}", warning_line(warning));
+        stderr_line(&warning_line(warning));
     }
 }
 
@@ -502,7 +512,17 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
             }
             Some(Entry::Created(req)) => {
                 let budget = launch_budget(deadline.remaining()?);
-                self.backend.launch(req, &self.guest, budget)
+                let (backend, guest) = (&self.backend, &self.guest);
+                // stop / release_all と同じく panic を要求元へのエラーフレームに変える。panic 時は
+                // 準備済みマウントの所有情報がバックエンドの内側で失われており、ここでは回収できない
+                // （そのため記録先 `StderrJsonRecorder` は panic しない実装にしている）。登録は Created の
+                // まま残し、再度の start は platform-windows が既存マウントを検出して拒否する（fail-closed）。
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    backend.launch(req, guest, budget)
+                })) {
+                    Ok(r) => r,
+                    Err(_) => return Err(err(PluginErrorCode::Internal, "launch panicked")),
+                }
             }
         };
         match result {
@@ -554,7 +574,7 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
         let mut report = ReleaseAllReport::default();
         let deadline = Instant::now() + total;
         // 1 件ずつ取り出して解除する。`backend.release` が panic しても（記録先 stderr の破損による
-        // `eprintln!` の panic 等）、未処理のエントリは `entries` に残り、Drop で再試行できる。
+        // 想定外の panic 等）、未処理のエントリは `entries` に残り、Drop で再試行できる。
         let ids: Vec<String> = self.entries.keys().cloned().collect();
         for id in ids {
             if matches!(self.entries.get(&id), Some(Entry::Created(_)) | None) {
@@ -680,6 +700,7 @@ mod tests {
         launch_err: RefCell<Option<BackendFailure<FakePrepared>>>,
         release_err: RefCell<Option<BackendFailure<FakePrepared>>>,
         panic_once: RefCell<bool>,
+        launch_panic_once: RefCell<bool>,
         /// 渡された合計期限（launch / release の呼び出し順）。
         budgets: RefCell<Vec<Duration>>,
         /// check_distro へ渡された合計期限。
@@ -716,6 +737,9 @@ mod tests {
                 req.transport_policy(),
                 mounts.join(",")
             ));
+            if self.launch_panic_once.replace(false) {
+                panic!("fake launch panic");
+            }
             if let Some(f) = self.launch_err.borrow_mut().take() {
                 return Err(f);
             }
@@ -984,6 +1008,36 @@ mod tests {
             .filter(|c| c.starts_with("release"))
             .count();
         assert_eq!(releases, 2);
+        assert_eq!(a.release_all(), ReleaseAllReport::default());
+    }
+
+    /// WIN-2: launch が panic しても plugin は落ちず INTERNAL のエラーフレームを返す。登録は Created の
+    /// まま残り（解除すべき所有情報は持たない）、続く start はやり直せ、stop は解除を呼ばずに登録を消す。
+    #[test]
+    fn task116_3_win2_launch_panic_becomes_internal_error_and_keeps_created() {
+        let (mut a, calls) = adapter(Fake::default());
+        a.handle(&s(CREATE)).unwrap();
+        *a.backend.launch_panic_once.borrow_mut() = true;
+        let e = a.handle(&s(&["start", "c1"])).unwrap_err();
+        assert_eq!(
+            (e.code().as_str(), e.message()),
+            ("INTERNAL", "launch panicked")
+        );
+        assert_eq!(calls.borrow().len(), 2);
+        assert_eq!(
+            a.handle(&s(&["start", "c1"])).unwrap(),
+            s(&["running", "virtiofs", ""])
+        );
+
+        let (mut a, calls) = adapter(Fake::default());
+        a.handle(&s(CREATE)).unwrap();
+        *a.backend.launch_panic_once.borrow_mut() = true;
+        a.handle(&s(&["start", "c1"])).unwrap_err();
+        assert_eq!(
+            a.handle(&s(&["stop", "c1"])).unwrap(),
+            s(&["stopped", "", ""])
+        );
+        assert!(!calls.borrow().iter().any(|c| c.starts_with("release")));
         assert_eq!(a.release_all(), ReleaseAllReport::default());
     }
 

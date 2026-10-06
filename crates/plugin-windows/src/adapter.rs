@@ -22,6 +22,16 @@
 //!   マウントはロールバックされる。
 //! - kill / delete / state は未実装（`UNIMPLEMENTED`）。状態はプロセス内メモリのみで永続化しない。
 //! - delete が無いため stop が保持資源をすべて手放す（上限 [`MAX_CONTAINERS`] を残骸で埋めない）。
+//! - 所有情報（準備済みマウント）の永続化は未実装。再起動後の回収は将来仕様（WIN-2・REPAIR-3）で、
+//!   現状は接続終了時・adapter 破棄時に [`WindowsRuntimeAdapter::release_all`] が解除を試みる
+//!   （解除できなかった件数は [`ReleaseAllReport::remaining`] で観測できる）。
+//!
+//! # 実行場所の前提（WIN-1）
+//! 実バックエンド [`PlatformBackend`] は Windows ホスト上で `wsl.exe` を起動して WSL2 の検出・virtiofs
+//! マウントを行う。したがって本 plugin は Windows ホスト側プロセスとして動く前提である。非 Windows
+//! ビルド（WSL2 ゲスト内の Linux 等）では `wsl.exe` を解決できず、create は `UNIMPLEMENTED` で
+//! fail-closed になる（成功を装わない）。Windows ホスト上の UDS 接続は plugin 境界機構側が未対応で、
+//! TASK-114 で確定する（REPAIR-3）。
 //!
 //! # 外部入力の扱い
 //! 受信文字列はすべて untrusted。platform-windows へは検証済み newtype（`DistroName`・`MountName`・
@@ -347,6 +357,16 @@ enum Entry<P> {
     Unreleased(P),
 }
 
+/// [`WindowsRuntimeAdapter::release_all`] の結果（件数のみ。識別子・パスは含めない）。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReleaseAllReport {
+    /// 解除に成功したマウント保持エントリ数。
+    pub released: usize,
+    /// 解除に失敗して残ったエントリ数（0 でなければ手動回収が必要）。
+    pub remaining: usize,
+}
+
 /// `frame_loop::serve` のハンドラ。create / start / stop を [`WindowsBackend`] へ委譲する。
 ///
 /// 状態はプロセス内メモリのみ（都度起動モードでは create と start が別プロセスになり引き継げない。
@@ -417,6 +437,30 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
         }
     }
 
+    /// 保持中のマウントをすべて解除する（接続終了・異常終了時の後始末。WIN-2・REPAIR-5）。
+    ///
+    /// `serve` 終了後に呼ぶほか、[`Drop`] からも呼ばれる（冪等）。解除に失敗した準備済みマウントは
+    /// `entries` に残し、件数を [`ReleaseAllReport::remaining`] で返す。各解除は
+    /// `DEFAULT_WSL_TIMEOUT` で有界。
+    pub fn release_all(&mut self) -> ReleaseAllReport {
+        let mut report = ReleaseAllReport::default();
+        for (id, entry) in std::mem::take(&mut self.entries) {
+            match entry {
+                Entry::Created(_) => {}
+                Entry::Running(p) | Entry::Unreleased(p) => match self.backend.release(&p) {
+                    Ok(()) => report.released += 1,
+                    Err(f) => {
+                        report.remaining += 1;
+                        // 所有情報を失わないため、元の ID のまま再試行可能な形で保持し直す。
+                        let keep = f.unreleased.unwrap_or(p);
+                        self.entries.insert(id, Entry::Unreleased(keep));
+                    }
+                },
+            }
+        }
+        report
+    }
+
     fn stop(&mut self, body: &[String]) -> Result<Vec<String>, PluginError> {
         let id = parse_id_only(body)?;
         let Some(entry) = self.entries.remove(id) else {
@@ -437,6 +481,14 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
                 }
             },
         }
+    }
+}
+
+impl<B: WindowsBackend, G: GuestStart<B::Prepared>> Drop for WindowsRuntimeAdapter<B, G> {
+    fn drop(&mut self) {
+        // panic・早期 return 経路でも共有マウントを残さない（WIN-2）。結果は呼び出し元が
+        // 明示的に `release_all` を呼んだ場合のみ観測できる。
+        let _ = self.release_all();
     }
 }
 
@@ -691,6 +743,56 @@ mod tests {
         assert_eq!(releases, vec!["release:Ubuntu", "release:Ubuntu"]);
         let e = a.handle(&s(&["stop", "c1"])).unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::NotFound);
+    }
+
+    #[test]
+    fn task116_3_win2_release_all_cleans_running_and_unreleased_on_shutdown() {
+        let fake = Fake::default();
+        *fake.launch_err.borrow_mut() = Some(BackendFailure {
+            error: WinError::new(WinErrorCode::Internal, "unmount failed"),
+            unreleased: Some(FakePrepared("Ubuntu".into())),
+            warning: None,
+        });
+        let (mut a, calls) = adapter(fake);
+        a.handle(&s(CREATE)).unwrap();
+        a.handle(&s(&["start", "c1"])).unwrap_err();
+        let mut c2 = s(CREATE);
+        c2[1] = "c2".into();
+        a.handle(&c2).unwrap();
+        a.handle(&s(&["start", "c2"])).unwrap();
+        let r = a.release_all();
+        assert_eq!((r.released, r.remaining), (2, 0));
+        assert_eq!(
+            calls
+                .borrow()
+                .iter()
+                .filter(|c| c.starts_with("release"))
+                .count(),
+            2
+        );
+        assert_eq!(a.release_all(), ReleaseAllReport::default());
+    }
+
+    #[test]
+    fn task116_3_win2_release_all_reports_remaining_and_drop_retries() {
+        let fake = Fake::default();
+        *fake.release_err.borrow_mut() = Some(BackendFailure {
+            error: WinError::new(WinErrorCode::Timeout, "timed out"),
+            unreleased: None,
+            warning: None,
+        });
+        let (mut a, calls) = adapter(fake);
+        a.handle(&s(CREATE)).unwrap();
+        a.handle(&s(&["start", "c1"])).unwrap();
+        let r = a.release_all();
+        assert_eq!((r.released, r.remaining), (0, 1));
+        drop(a);
+        let releases = calls
+            .borrow()
+            .iter()
+            .filter(|c| c.starts_with("release"))
+            .count();
+        assert_eq!(releases, 2);
     }
 
     #[test]

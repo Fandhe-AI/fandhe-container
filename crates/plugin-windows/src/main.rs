@@ -6,6 +6,9 @@
 //! （TASK-116.2・#393、TASK-116.3・#394）。終了時に stderr へ 1 行 JSON
 //! （英語・機械可読）を出す。
 //!
+//! serve 終了後（正常切断・異常終了とも）に `release_all` で保持中の共有マウントを解除し、件数を出す（WIN-2）。
+//! 実行場所は Windows ホスト（`wsl.exe` を起動できる側）の前提。非 Windows では create が `UNIMPLEMENTED`。
+//!
 //! 終了コード: 0 = 相手の正常切断でループ終了、2 = 起動設定の解決失敗、3 = 接続失敗、
 //! 4 = フレームループの異常終了（転送エラー・プロトコル違反）。
 //! 接続経路は peer 認証つき `UdsStream::connect` のみ（TASK-116.4・#395・PLUG-12）。別 UID の listener は
@@ -58,10 +61,17 @@ fn main() -> ExitCode {
             return ExitCode::from(3);
         }
     };
-    match serve(
-        &mut stream,
-        &mut WindowsRuntimeAdapter::new(PlatformBackend, UnimplementedGuestStart),
-    ) {
+    let mut adapter = WindowsRuntimeAdapter::new(PlatformBackend, UnimplementedGuestStart);
+    let result = serve(&mut stream, &mut adapter);
+    // EOF・異常終了のどちらでも、保持中の共有マウントの解除を試みる（WIN-2）。
+    let cleanup = adapter.release_all();
+    if cleanup.released + cleanup.remaining > 0 {
+        eprintln!(
+            "{{\"event\":\"plugin.cleanup\",\"released\":{},\"remaining\":{}}}",
+            cleanup.released, cleanup.remaining
+        );
+    }
+    match result {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             report("plugin.frame_loop", Some(source), &e, "");

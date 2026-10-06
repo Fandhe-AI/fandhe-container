@@ -41,7 +41,7 @@
 //!
 //! 未実装（将来仕様と対応ビヘイビア ID）:
 //! - restart ポリシー `no` / `on-failure[:N]` / `always` / `unless-stopped` の評価と最大回数 N での打ち切り（SUP-3）。
-//!   ポリシー実装後、異常終了の既定判定（`is_abnormal_exit`）はポリシー評価に置き換わる。
+//!   ポリシー実装後、異常終了の既定判定（[`crate::restart`] の `is_abnormal_exit`。TASK-159.1 で移設）はポリシー評価（#488）に置き換わる。
 //! - 再試行間隔（バックオフ）。バックオフ 0 のとき再起動レイテンシ中央値 100ms 以下が目標（SUP-3）。
 //!   上限 N とバックオフが無いと再起動ストームになるため、ポリシー実装時に必須とする。
 //! - 本番 `ProcessLauncher` による再 launch と、新しい pid での `Running` 再記録・監視継続（SUP-3。core の launcher 提供が前提）。
@@ -78,6 +78,7 @@ use fandhe_container_core::traits::{
 };
 
 use crate::logs::{CaptureSummary, LogCapture, LogSink, OutputStreams, StreamSummary};
+use crate::restart::{exit_code_of, is_abnormal_exit};
 use crate::state::SupervisedState;
 
 /// 捕捉の終端待ち（drain）の既定の上限。
@@ -659,27 +660,6 @@ pub(crate) fn precondition(msg: &'static str) -> TraitError {
 
 pub(crate) fn is_running_with_pid(rec: &StateRecord, pid: NonZeroU32) -> bool {
     rec.status().state() == ContainerState::Running && rec.status().pid() == Some(pid)
-}
-
-/// 終了状態を状態ファイルへ記録する終了コードへ写す（`Signaled(s)` は `128 + s`）。
-fn exit_code_of(exit: ProcessExit) -> Option<i32> {
-    match exit {
-        ProcessExit::Exited(c) => Some(c),
-        ProcessExit::Signaled(s) => 128i32.checked_add(s),
-        _ => None,
-    }
-}
-
-/// 異常終了（非 0 終了・シグナル終了）か。`restart_count` を進める既定判定（TASK-157.5・SUP-3）。
-///
-/// SUP-3 のポリシー実装時は `always` / `unless-stopped` が正常終了も対象にし `no` は対象外にするため、
-/// この判定はポリシー評価に置き換わる。未知の終了種別は根拠なくカウンタを進めない（加算しない）。
-fn is_abnormal_exit(exit: ProcessExit) -> bool {
-    match exit {
-        ProcessExit::Exited(c) => c != 0,
-        ProcessExit::Signaled(_) => true,
-        _ => false,
-    }
 }
 
 /// revision 不一致のときだけ `refresh` して再構築・再書き込みする（上限 [`MAX_WRITE_ATTEMPTS`]）。

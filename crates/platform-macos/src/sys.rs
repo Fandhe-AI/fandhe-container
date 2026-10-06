@@ -450,6 +450,10 @@ struct QueueBound<T>(T);
 // 動かしても、中身を触る・最後の参照を解放するのは常にそのキューのスレッドである。中身へ到達する唯一の窓口
 // `VmRef` は `!Send` / `!Sync` のため、キュー上のクロージャから別スレッドへ持ち出せない。対象は
 // `VmObjects` に限る（任意の型へ広げない）。
+// 生成（`VmHost::new` の `initWithConfiguration:queue:` の呼び出し）は任意のスレッドで起き得る
+// （`fandhe-container-plugin-macos` の isolate 作業スレッドで `Vm::launch` を実行し、できた `Vm` を
+// 要求処理スレッドへ渡す経路を含む）。生成スレッドがどれであっても、生成後に中身を触る・最後の参照を
+// 解放するのはキュー上だけ、という上の不変条件は変わらない。
 unsafe impl Send for QueueBound<VmObjects> {}
 // SAFETY: 上記と同じ不変条件。共有参照越しに中身へ到達できるのもキュー上のクロージャ（`VmRef`）だけ。
 unsafe impl Sync for QueueBound<VmObjects> {}
@@ -658,6 +662,9 @@ impl VmHost {
         let delegate = VmDelegate::new(handler);
         // SAFETY: 設定は検証済みで VZ が copy する。キューはシリアル。init ファミリーの戻りは +1 所有で
         // `Retained` が管理する。生成後の操作はすべて `queue` 上で行う。
+        // この init の呼び出し自体は任意のスレッド（plugin-macos の isolate 作業スレッドを含む）で起き得るが、
+        // `initWithConfiguration:queue:` は呼び出しスレッドを問わず、以後の操作を `queue` 上に限る契約。
+        // 生成した VM を触る・最後に解放するのは `queue` 上だけ（`QueueBound` の不変条件）。
         let vm = unsafe {
             VZVirtualMachine::initWithConfiguration_queue(VZVirtualMachine::alloc(), config, &queue)
         };

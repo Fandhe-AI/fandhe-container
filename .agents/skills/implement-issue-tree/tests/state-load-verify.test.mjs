@@ -42,6 +42,8 @@ const SLICE_EXPORTS = [
   'canonicalJson',
   'verifyLoadedItems',
   'prBindingProblem',
+  'isValidBranchName',
+  'branchMatchesIssue',
   'loadState',
   'mergeVerifyPrompt',
   'monitorPrompt',
@@ -51,6 +53,7 @@ const SLICE_EXPORTS = [
   'applyPrereqTransitions',
   'normalizeBlockedReason',
   'MERGE_SCHEMA',
+  'MERGE_VERIFY_SCHEMA',
 ]
 writeFileSync(slicePath, `${definitionPart}\nexport { ${SLICE_EXPORTS.join(', ')} }\n`)
 const {
@@ -58,6 +61,8 @@ const {
   canonicalJson,
   verifyLoadedItems,
   prBindingProblem,
+  isValidBranchName,
+  branchMatchesIssue,
   loadState,
   mergeVerifyPrompt,
   monitorPrompt,
@@ -67,6 +72,7 @@ const {
   applyPrereqTransitions,
   normalizeBlockedReason,
   MERGE_SCHEMA,
+  MERGE_VERIFY_SCHEMA,
 } = await import(pathToFileURL(slicePath).href)
 
 const nodeSha = (s) => createHash('sha256').update(s, 'utf8').digest('hex')
@@ -227,7 +233,7 @@ function installAgentStub(behavior) {
   const calls = []
   globalThis.agent = async (prompt, opts) => {
     calls.push({ prompt, opts })
-    return behavior(opts)
+    return behavior(opts, prompt)
   }
   const logs = []
   globalThis.log = (msg) => { logs.push(msg) }
@@ -246,7 +252,9 @@ test('loadState: 捏造 items（PR = issue + 1006）は採用せず state-unveri
   assert.deepEqual(r.items, {})
   assert.equal(r.verified, false)
   assert.deepEqual(r.unverified, [42, 43, 44, 45])
-  assert.deepEqual(calls.map((c) => c.opts.label), ['state:load', 'state:load-verify'])
+  // 不一致の項目は再取得の対象になる。fill が値を返さない（null）ため最大 2 巡で打ち切られ、不採用のまま止まる。
+  assert.deepEqual(calls.slice(0, 2).map((c) => c.opts.label), ['state:load', 'state:load-verify'])
+  assert.ok(calls.slice(2).every((c) => c.opts.label.startsWith('state:load-fill')))
   // 検証エージェントには読込結果を渡さない（鸚鵡返し防止）。
   assert.ok(!calls[1].prompt.includes('1049'), '検証プロンプトに読込結果が混入している')
   assert.ok(logs.some((l) => /state-unverified 4 件/.test(l)))
@@ -312,6 +320,104 @@ test('loadState: 新規作成（items: {}）は検証成立で verified: true', 
   assert.equal(r.highWaterVersion, 2)
 })
 
+// Issue #535: state:load が先頭 5 件しか返さない場合、ホストが欠落キーを特定して 5 件ずつ再取得する。
+const makeItems = (n) => Object.fromEntries(Array.from({ length: n }, (_, i) => [String(100 + i), { status: 'monitoring', pr: 1000 + i, branch: `fix/${100 + i}-x` }]))
+const hashesOf = (items) => Object.fromEntries(Object.entries(items).map(([k, v]) => [k, sha256Hex(canonicalJson(v))]))
+const verifyResult = (hashes) => ({ fileExists: true, hashes, keysSha256: keysOf(hashes), keysCount: Object.keys(hashes).length, highWaterBytes: 0, highWaterVersion: 0 })
+// fill プロンプトの --argjson k '[...]' から要求キーを取り出し、実ファイル相当の items から返す。
+const requestedKeys = (prompt) => JSON.parse(/--argjson k '(\[[^']*\])'/.exec(prompt)[1])
+
+test('loadState: 30 件の状態ファイルで state:load が先頭 5 件しか返しても、ホストが 5 件ずつ再取得して全件採用する', async () => {
+  const all = makeItems(30)
+  const hashes = hashesOf(all)
+  const first5 = Object.fromEntries(Object.entries(all).slice(0, 5))
+  const fillCalls = []
+  installAgentStub((opts, prompt) => {
+    if (opts.label === 'state:load') return loadResult(first5)
+    if (opts.label === 'state:load-verify') return verifyResult(hashes)
+    fillCalls.push(prompt)
+    return { items: Object.fromEntries(requestedKeys(prompt).map((k) => [k, all[k]])) }
+  })
+  const r = await loadState()
+  assert.equal(Object.keys(r.items).length, 30)
+  assert.deepEqual(r.items, all)
+  assert.equal(r.verified, true)
+  assert.deepEqual(r.unverified, [])
+  // 25 件 ÷ 5 件ずつ = 5 回。各プロンプトは要求キーだけを含み、ホストが組み立てた jq コマンドである。
+  assert.equal(fillCalls.length, 5)
+  const seen = fillCalls.flatMap(requestedKeys)
+  assert.equal(new Set(seen).size, 25)
+  assert.ok(seen.every((k) => !(k in first5)))
+  assert.ok(fillCalls.every((p) => requestedKeys(p).length <= 5 && /jq -c --argjson k /.test(p) && p.includes('.items | with_entries')))
+})
+
+test('loadState: 再取得が値を返さない場合は 2 巡で打ち切り、欠落キーを state-unverified として明示する（throw しない）', async () => {
+  const all = makeItems(12)
+  const { calls, logs } = installAgentStub((opts) => {
+    if (opts.label === 'state:load') return loadResult(Object.fromEntries(Object.entries(all).slice(0, 5)))
+    if (opts.label === 'state:load-verify') return verifyResult(hashesOf(all))
+    return { items: {} }
+  })
+  const r = await loadState()
+  assert.equal(r.verified, false)
+  assert.deepEqual(r.unverified, Array.from({ length: 7 }, (_, i) => 105 + i))
+  assert.deepEqual(Object.keys(r.items).sort(), ['100', '101', '102', '103', '104'])
+  // 7 件 = 2 塊 × 2 巡。fill は schema 適合応答（空 items）なのでフォールバックしない。
+  assert.equal(calls.filter((c) => c.opts.label === 'state:load-fill').length, 4)
+  assert.ok(logs.some((l) => /state-unverified 7 件/.test(l)))
+})
+
+test('loadState: 初回が改変して返した項目も、再取得の正しい値で救済される', async () => {
+  const all = makeItems(8)
+  const tampered = { ...all, 103: { ...all[103], pr: 9999 } }
+  installAgentStub((opts, prompt) => {
+    if (opts.label === 'state:load') return loadResult(tampered)
+    if (opts.label === 'state:load-verify') return verifyResult(hashesOf(all))
+    return { items: Object.fromEntries(requestedKeys(prompt).map((k) => [k, all[k]])) }
+  })
+  const r = await loadState()
+  assert.deepEqual(r.items, all)
+  assert.equal(r.verified, true)
+})
+
+test('loadState: 再取得が要求外のキー・捏造値を返しても採用しない', async () => {
+  const all = makeItems(7)
+  const { logs } = installAgentStub((opts, prompt) => {
+    if (opts.label === 'state:load') return loadResult(Object.fromEntries(Object.entries(all).slice(0, 5)))
+    if (opts.label === 'state:load-verify') return verifyResult(hashesOf(all))
+    const fabricated = Object.fromEntries(requestedKeys(prompt).map((k) => [k, { ...all[k], pr: 1 }]))
+    return { items: { ...fabricated, 999: { status: 'monitoring', pr: 1 }, __proto__x: {} } }
+  })
+  const r = await loadState()
+  assert.equal(r.verified, false)
+  assert.deepEqual(Object.keys(r.items).sort(), ['100', '101', '102', '103', '104'])
+  assert.ok(!('999' in r.items))
+  assert.ok(logs.some((l) => /state-unverified 2 件/.test(l)))
+})
+
+test('loadState: 再取得プロンプトには数値キー以外（__proto__・コマンド片）を埋め込まない', async () => {
+  const all = makeItems(6)
+  // JSON.parse は __proto__ を own プロパティとして生成する（実応答の再現）。
+  const hashes = JSON.parse(JSON.stringify({ ...hashesOf(all), '1; rm -rf x': 'a'.repeat(64) }).replace(/}$/, `,"__proto__":"${'b'.repeat(64)}"}`))
+  const fills = []
+  installAgentStub((opts, prompt) => {
+    if (opts.label === 'state:load') return loadResult(Object.fromEntries(Object.entries(all).slice(0, 5)))
+    if (opts.label === 'state:load-verify') return verifyResult(hashes)
+    fills.push(prompt)
+    return { items: {} }
+  })
+  await loadState().catch(() => {})
+  assert.ok(fills.every((p) => !p.includes('rm -rf') && !p.includes('__proto__')))
+})
+
+test('loadState: 全件が初回で返れば再取得エージェントは起動しない（回帰）', async () => {
+  const all = makeItems(30)
+  const { calls } = installAgentStub((opts) => (opts.label === 'state:load' ? loadResult(all) : verifyResult(hashesOf(all))))
+  const r = await loadState()
+  assert.equal(r.verified, true)
+  assert.deepEqual(calls.map((c) => c.opts.label), ['state:load', 'state:load-verify'])
+})
+
 // ---------------------------------------------------------------------------
 // 層 3: プロンプト・駆動部の配線
 // ---------------------------------------------------------------------------
@@ -327,6 +433,7 @@ test('検証プロンプトは項目ごとの jq -jcS ハッシュを要求し�
   assert.match(calls[1].prompt, /shasum -a 256/)
   assert.match(calls[0].prompt, /5 件ずつ/)
   assert.match(calls[0].prompt, /推測で埋めない/)
+  assert.match(calls[0].prompt, /ホストが再取得/)
 })
 
 test('mergeVerifyPrompt は headRefName・baseRefName・closingIssuesReferences を取得させる', () => {
@@ -491,21 +598,21 @@ function buildPrHints({ targets, results, savedItems, unverifiedIssues }) {
   const from = driverPart.indexOf('  const prHints = {}', fnStart)
   const to = driverPart.indexOf('  let probe', from)
   assert.ok(fnStart > 0 && from > fnStart && to > from)
-  const fn = new Function('targets', 'results', 'savedItems', 'unverifiedIssues', `${driverPart.slice(from, to)}\nreturn prHints`)
-  return fn(targets, results, savedItems, unverifiedIssues)
+  const fn = new Function('targets', 'results', 'savedItems', 'unverifiedIssues', 'knownBranchByIssue', 'isValidBranchName', 'branchMatchesIssue', `${driverPart.slice(from, to)}\nreturn { prHints, branchHints }`)
+  return fn(targets, results, savedItems, unverifiedIssues, new Map(), isValidBranchName, branchMatchesIssue)
 }
 
 test('probePrereqCompletion: state-unverified の issue の保存済み pr は prHints に渡さず、MERGED でも done にしない（Bugbot High）', () => {
-  const savedItems = { 365: { status: 'blocked', pr: 1366, branch: 'feat/365-bar' }, 366: { status: 'failed', pr: 1400 } }
-  const unverified = buildPrHints({ targets: [365, 366], results: [], savedItems, unverifiedIssues: new Set([365]) })
+  const savedItems = { 365: { status: 'blocked', pr: 1366, branch: 'feat/365-bar' }, 366: { status: 'failed', pr: 1400, branch: 'feat/366-baz' } }
+  const { prHints: unverified, branchHints } = buildPrHints({ targets: [365, 366], results: [], savedItems, unverifiedIssues: new Set([365]) })
   assert.deepEqual(unverified, { 366: 1400 })
   const done = new Set()
   const failedSet = new Set([365, 366])
   const probe = { results: [
     { issue: 365, issueState: 'OPEN', prState: 'MERGED', pr: 1366 },
-    { issue: 366, issueState: 'OPEN', prState: 'MERGED', pr: 1400 },
+    { issue: 366, issueState: 'OPEN', prState: 'MERGED', pr: 1400, headRefName: 'feat/366-baz', baseRefName: 'main', isCrossRepository: false, closingIssues: [366] },
   ] }
-  const t = applyPrereqTransitions(probe, [365, 366], done, failedSet, unverified)
+  const t = applyPrereqTransitions(probe, [365, 366], done, failedSet, unverified, branchHints)
   assert.deepEqual(t, [{ issue: 366, kind: 'merged', pr: 1400 }])
   assert.ok(failedSet.has(365) && !done.has(365), '未照合 PR の MERGED で前提を done にしてはならない')
   // 人手で CLOSED になった場合の遷移は従来どおり
@@ -846,4 +953,73 @@ test('ホストは monitor の blockedReason: "unbound" を enum 外扱いにせ
   const norm = driverPart.indexOf('lastBlockedReason = normalizeBlockedReason(m?.blockedReason)')
   const branch = driverPart.indexOf("if (lastBlockedReason === 'unbound') {", norm)
   assert.ok(norm > 0 && branch > norm && branch - norm < 900)
+})
+
+// ---------------------------------------------------------------------------
+// MERGE_VERIFY_SCHEMA: PR 照合（prBindingProblem）に使う取得値は必須項目（Bugbot 指摘への対応）。
+// 任意項目のままだと、構造化出力が省いた正当な PR が fail-closed の照合不成立になる。
+// ---------------------------------------------------------------------------
+const BINDING_FIELDS = ['headRefName', 'baseRefName', 'isCrossRepository', 'closingIssues']
+const VALID_VERIFY = { state: 'OPEN', headRefOid: 'a'.repeat(40), headRefName: 'feat/365-bar', baseRefName: 'main', isCrossRepository: false, closingIssues: [365] }
+
+test('MERGE_VERIFY_SCHEMA: 照合に使う 4 項目が required に入り、properties に定義され description を持つ', () => {
+  assert.ok(MERGE_VERIFY_SCHEMA.required.includes('state'))
+  assert.ok(MERGE_VERIFY_SCHEMA.required.includes('headRefOid'))
+  for (const f of BINDING_FIELDS) {
+    assert.ok(MERGE_VERIFY_SCHEMA.required.includes(f), `${f} が required にない`)
+    assert.ok(MERGE_VERIFY_SCHEMA.properties[f], `${f} が properties にない`)
+    assert.ok(MERGE_VERIFY_SCHEMA.properties[f].description, `${f} に description がない`)
+  }
+  // 4 項目のいずれかを省いた出力は required 違反（スキーマ側で省略を許さない）
+  for (const f of BINDING_FIELDS) {
+    const omitted = { ...VALID_VERIFY }
+    delete omitted[f]
+    assert.ok(MERGE_VERIFY_SCHEMA.required.some((k) => !(k in omitted)), `${f} 省略が required 違反にならない`)
+  }
+  assert.ok(MERGE_VERIFY_SCHEMA.required.every((k) => k in VALID_VERIFY))
+})
+
+test('prBindingProblem: 4 項目が揃った正当な値は空文字（結び付く）', () => {
+  assert.equal(prBindingProblem(365, 'feat/365-bar', VALID_VERIFY), '')
+  assert.equal(prBindingProblem(365, 'feat/365-bar', { ...VALID_VERIFY, state: 'MERGED', closingIssues: [] }), '')
+})
+
+test('prBindingProblem: 各項目の取得失敗値（プロンプトが指示する値）は必ず不成立になる', () => {
+  // 取得失敗値: headRefName / baseRefName は空文字、isCrossRepository は true、closingIssues は [-1]
+  assert.notEqual(prBindingProblem(365, 'feat/365-bar', { ...VALID_VERIFY, headRefName: '' }), '')
+  assert.notEqual(prBindingProblem(365, 'feat/365-bar', { ...VALID_VERIFY, baseRefName: '' }), '')
+  assert.notEqual(prBindingProblem(365, 'feat/365-bar', { ...VALID_VERIFY, isCrossRepository: true }), '')
+  // closingIssues の失敗値 [-1] は空配列（紐付け無しの正当値）と区別され、不成立になる
+  assert.equal(prBindingProblem(365, 'feat/365-bar', { ...VALID_VERIFY, closingIssues: [] }), '')
+  assert.equal(prBindingProblem(365, 'feat/365-bar', { ...VALID_VERIFY, closingIssues: [-1] }), 'closingIssues')
+  // コマンド全体の失敗値（state UNKNOWN + 全項目の失敗値）
+  assert.notEqual(prBindingProblem(365, 'feat/365-bar', { state: 'UNKNOWN', headRefOid: '', headRefName: '', baseRefName: '', isCrossRepository: true, closingIssues: [-1] }), '')
+})
+
+test('mergeVerifyPrompt: 4 項目の取得・返却と各失敗値を明示し、スキーマの description と一致する', () => {
+  const p = mergeVerifyPrompt({ number: 365 }, { prNumber: 1366 })
+  const ret = p.split('\n').find((l) => l.startsWith('返却: '))
+  assert.ok(ret, '返却行が見つからない')
+  for (const f of MERGE_VERIFY_SCHEMA.required) assert.ok(ret.includes(f), `返却に ${f} がない`)
+  assert.ok(p.includes('--json state,headRefOid,mergeCommit,headRefName,baseRefName,closingIssuesReferences,isCrossRepository'))
+  const step3 = p.split('\n').find((l) => l.startsWith('3. '))
+  assert.ok(step3)
+  for (const frag of ['state: "UNKNOWN"', 'headRefOid: ""', 'headRefName: ""', 'baseRefName: ""', 'isCrossRepository: true', 'closingIssues: [-1]']) {
+    assert.ok(step3.includes(frag), `手順 3 に ${frag} がない`)
+  }
+  // 手順 2 の fallback（gh が closingIssuesReferences 未対応）でも取得不能を [] に化けさせない
+  const step2 = p.split('\n').find((l) => l.startsWith('2. '))
+  assert.ok(step2, '手順 2 が見つからない')
+  assert.ok(step2.includes('[-1]'), '手順 2 に [-1] がない')
+  assert.ok(!/再実行し\s*\[\]/.test(step2), '手順 2 が fallback で [] を返す指示を残している')
+  assert.ok(MERGE_VERIFY_SCHEMA.properties.closingIssues.description.includes('[-1]'))
+  assert.ok(MERGE_VERIFY_SCHEMA.properties.isCrossRepository.description.includes('true'))
+})
+
+test('MERGE_VERIFY_SCHEMA の 3 利用箇所（pr-bind / merged-probe / merge-verify）は mergeVerifyPrompt とペアで使い、結果を prBindingProblem へ渡す', () => {
+  assert.equal([...source.matchAll(/schema: MERGE_VERIFY_SCHEMA/g)].length, 3)
+  assert.equal([...source.matchAll(/= await agent\(mergeVerifyPrompt\(/g)].length, 3)
+  assert.match(source, /prBindingProblem\(item\.number, branch, bind\)/)
+  assert.match(source, /prBindingProblem\(item\.number, impl\.branch, mergedProbe\)/)
+  assert.match(source, /prBindingProblem\(item\.number, impl\.branch, v\)/)
 })

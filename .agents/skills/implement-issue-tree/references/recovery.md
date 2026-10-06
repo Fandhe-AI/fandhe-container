@@ -116,6 +116,12 @@ state 系呼び出しは共通ヘルパー `runStateAgent` を経由する。hai
   照合し、件数も突き合わせて、両エージェントが同じ項目を読み落とした場合や件数を合わせた捏造を
   検出する。検証エージェントが `KEYS` 行を見ずに自分のキー一覧から sha256 を計算して返す故意の
   偽装はプロンプト指示だけでは完全には防げない（残余リスク）
+- `state:load` が件数を読み切らず先頭 5 件で止まる事故があった（Issue #535）。読込側へ終了条件を
+  負わせず、`check.hashes`（実ファイルのキー集合の正本）に対し未返却・不一致のキーをホストが
+  特定し、ホストが組み立てた `jq -c --argjson k '[...]'` を実行する `state:load-fill` で 5 件ずつ
+  再取得する（塊は並列・最大 2 巡）。キーは数値表記のみを `JSON.stringify` で埋め込み、
+  要求したキーの項目だけを受理し、取得分も同じハッシュ照合を通す。2 巡後も採用できない
+  キーは従来どおり `state-unverified` で止め、ログに残存キーを出す
 - 照合自体が成立しない（`state:load-verify` が haiku / sonnet とも不成立、既存のはずのファイルを
   検証側が見つけられない、またはキー一覧の sha256 が一致しない）場合はランを停止する（新規着手 0 件）。そのまま再実行し、
   解消しなければ状態ファイルを退避して内容を確認する。ファイルが無く新規作成した場合だけは
@@ -136,7 +142,7 @@ state 系呼び出しは共通ヘルパー `runStateAgent` を経由する。hai
 monitoring 再開の前に、`pr-bind:#N` が保存済み PR の `state` / `headRefName` /
 `baseRefName` / `isCrossRepository` / `closingIssuesReferences` を取得し、ホストが照合する
 （`prBindingProblem`）。PR が実在し、fork からの PR でなく、base が `args.branch` で、期待ブランチが本 issue の命名で `headRefName` と一致し、
-`closingIssuesReferences` が空か本 issue を含む場合だけ再開する。一致しない場合も、`gh` の一時的な
+`closingIssuesReferences` が空か本 issue を含む場合だけ再開する。これら 4 項目（`headRefName` / `baseRefName` / `isCrossRepository` / `closingIssues`）は `MERGE_VERIFY_SCHEMA` の必須項目で、取得失敗時は照合が必ず不成立になる値（空文字 / `true` / `[-1]`）を返させる（空配列は「紐付け無し」の正当値で、失敗値にしない）。一致しない場合も、`gh` の一時的な
 失敗で照合できない場合も、再開も close も通常の実装（Recover・新規 PR 作成）もせず、状態ファイルを
 書き換えないまま `state-unverified` の `blocked`（halt 非カウント）で終える（MERGED / CLOSED の
 既存 PR は open PR の検索に掛からず、通常の実装へ進むと再実装・重複 PR になり得るため。元の再開情報の
@@ -150,7 +156,7 @@ Merge ループへ渡す前に同じ照合を通し、不一致なら `blocked` 
 新規の実装・PR 作成をさせない）。monitor が手順 1 の照合不成立を返した場合
 （`blockedReason: "unbound"`）も、状態ファイルを書き換えずに `state-unverified` の `blocked` で終える。`state-unverified` で止めた issue の保存済み `pr` は、前提完了プローブの
 ホスト既知 PR に渡さない（照合できない MERGED PR を根拠に前提を完了扱いにしない。人手で issue が
-CLOSED になった場合の遷移は従来どおり）。opt-in 前の MERGED 確認で
+CLOSED になった場合の遷移は従来どおり）。前提完了プローブの MERGED 受理には、PR 番号の一致に加え `prBindingProblem` と同じ結び付け照合（実在・同一リポジトリ・base・headRefName 完全一致・closingIssues。期待ブランチはホスト決定の `knownBranchByIssue` → 状態ファイルの `branch` で、エージェントへ渡さない）が必要で、不成立は MERGED とせず issue CLOSED 判定へ落とす（Issue #533）。opt-in 前の MERGED 確認で
 照合が不一致の場合も `blocked` で終端する。merge-verify による
 merged（`already-merged` を含む）の受理にも同じ照合を課し、monitor・merge-exec の手順 1 にも同じ
 照合を指示する。再開判定（`isActiveMonitoring`）は、保存済みブランチがその issue の命名

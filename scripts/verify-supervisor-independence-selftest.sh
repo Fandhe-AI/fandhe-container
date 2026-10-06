@@ -34,7 +34,7 @@ fail() { echo "FAIL: $1" >&2; failures=$((failures + 1)); }
 # スタブ launcher。`run --id <prefix>-<n> --bundle <dir>` を受け、コンテナ側プロセスを 1 つ起動して READY を出す。
 # STUB_MODE: normal（監視プロセスが死んでもコンテナは残る）/ collateral（対象の死で他の監視プロセスも死ぬ）/
 # die_with_target（対象のコンテナが監視プロセスと共に死ぬ）/ other_dies（他コンテナが対象の死で死ぬ）/
-# no_ready（READY を出さない）/ short_start（最後の launcher が起動直後に終了）/ restart（コンテナを再起動する）。
+# scrub_env（コンテナ側プロセスが環境変数を継承しない）/ no_ready（READY を出さない）/ short_start（最後の launcher が起動直後に終了）/ restart（コンテナを再起動する）。
 # 待機はすべて組み込みの read -t（fork しない）で行い、一過性の子プロセスを作らない。
 cat >"${root}/launcher.sh" <<'STUB'
 #!/usr/bin/env bash
@@ -55,10 +55,14 @@ start_container() {
   esac
   if [ -n "$watch" ]; then
     bash -c 'exec 8<>"$2"; while :; do if read -r p <"$1" 2>/dev/null; then kill -0 "$p" 2>/dev/null || break; fi; read -t 0.2 -u 8 || true; done' _ "$watch" "$STUB_DIR/$id.fifo" &
+  elif [ "$STUB_MODE" = scrub_env ]; then
+    # 環境変数を継承しないコンテナ側プロセス（実機の実装を模す）。
+    env -i sleep 300 &
   else
     sleep 300 &
   fi
   c=$!
+  echo "$c" >"$STUB_DIR/$id.cpid"
 }
 start_container
 trap 'kill "$c" 2>/dev/null; exit 0' TERM
@@ -189,6 +193,21 @@ run_case normal --output "${root}/c9-result.json"
 expect_eq "output: exit code" 0 "$RC"
 expect_eq "output: file result" pass "$(json_get result "${root}/c9-result.json")"
 expect_eq "output: stdout is empty" "" "$(cat "$OUT")"
+
+# 9b. 環境変数を継承しないコンテナ側プロセスも、後始末で記録した同一性により回収される（トークン照合だけでは漏れる）。
+run_case scrub_env --output "${root}/c10-result.json"
+expect_eq "scrub_env: exit code" 0 "$RC"
+expect_eq "scrub_env: file result" pass "$(json_get result "${root}/c10-result.json")"
+scrub_dir="${root}/c${case_no}"
+scrub_left=0
+for f in "${scrub_dir}"/*.cpid; do
+  cp="$(cat "$f")"
+  if [ -r "/proc/${cp}/stat" ] && ! sed 's/^.*) //' "/proc/${cp}/stat" | grep -q '^[ZX] '; then
+    scrub_left=$((scrub_left + 1))
+    kill -KILL "$cp" 2>/dev/null || true
+  fi
+done
+expect_eq "scrub_env: env-less container processes left" 0 "$scrub_left"
 
 # 10. 引数エラーは 2（起動もしない）。
 arg_case() { # <説明> <引数...>

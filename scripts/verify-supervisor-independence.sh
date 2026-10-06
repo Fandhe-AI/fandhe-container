@@ -24,7 +24,9 @@
 #   <launcher> run --id <id> --bundle <bundle> を本スクリプトの直接の子として起動する（配列で直接 exec。
 #   eval・sh -c を使わない）。launcher はコンテナ 1 つを監視してフォアグラウンドに留まり、起動完了時に標準出力へ
 #   `READY` だけの行を出す。環境変数 FANDHE_BENCH_OWNER に実行ごとの乱数トークンを渡し、後始末で
-#   /proc/*/environ のトークン一致により孤児化した子孫も回収する。停止は SIGTERM、期限超過で SIGKILL。
+#   /proc/*/environ のトークン一致により孤児化した子孫も回収する。環境変数を継承しないコンテナ側プロセスは、
+#   起動時に記録した pid・起動時刻の同一性でも追跡して回収する（回収できなければ終了コード 4）。
+#   停止は SIGTERM、期限超過で SIGKILL。
 #   launcher の標準出力・標準エラーは一時ファイルへ記録する（READY の確認用。実行後に削除する）。
 #
 # 使い方:
@@ -37,11 +39,12 @@
 # 出力: JSON（標準出力。--output 指定時はそのファイル）。launcher・bundle のパス、cmdline、環境変数は出さない。
 # 終了コード: 0 = 全判定成立 / 1 = 判定不成立・起動数不足・期限切れ（起動数不足では結果を公開しない）/
 #   2 = 引数・入力・出力先エラー / 3 = 前提欠如（非 Linux 等。0 で合格に見せない）/
-#   4 = 後始末失敗（残存プロセス。最優先）/ 129・130・143 = HUP・INT・TERM による中断（後始末の完了後）。
+#   4 = 後始末失敗（残存プロセス。最優先。結果ファイルは後始末の完了後に公開するため、4 のときは作られない）/ 129・130・143 = HUP・INT・TERM による中断（後始末の完了後）。
 # 1 は機械照合できる事実の報告で、SUP-5 の合否判定・レポート化は #499（人間）が行う。
 # 既知の制約: 起動時刻の照合でも列挙から送信までの極めて短い pid 再利用の窓は理論上残る。コンテナ側プロセスは
 # 一過性の子を含めて「記録時点で存在した全プロセス」を対象にするため、一過性の子を持つ実装では不一致になり得る
-# （その場合は不一致の内訳を #499 で確認する）。
+# （その場合は不一致の内訳を #499 で確認する）。後始末の最中に届く INT・TERM・HUP は無視して回収を完遂する。
+# 環境変数を継承せず、かつ記録後に新規 fork された子孫は、回収・残存検出のどちらも保証できない。
 set -euo pipefail
 
 readonly num_re='^(0|[1-9][0-9]{0,8})$'
@@ -190,7 +193,9 @@ owner_tok=""
 out_tmp=""
 final_rc=0
 spawned=0
-declare -A SP SS SZ CH
+declare -A SP SS SZ CH TRK
+publish_pending=0
+out_buf=""
 
 # 実行ごとの乱数トークン（孤児化した子孫の所有証明用）。
 owner_tok="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
@@ -311,33 +316,94 @@ any_launcher_alive() {
   return 1
 }
 
-# 後始末。launcher へ SIGTERM → 期限超過で SIGKILL → トークン一致の所有プロセス（孤児を含む）を回収し、
-# 残存があれば 1 を返す。EXIT trap から必ず呼ぶ。
+# 起動した launcher の現在の子孫（コンテナ側プロセス）と kill 前スナップショット DESC の子孫を、記録した
+# pid・起動時刻の組として TRK へ追加する。環境変数を継承しないコンテナ側プロセス（実機の実装）は
+# FANDHE_BENCH_OWNER のトークンでは見つからないため、起動時に記録した同一性で追跡する（SIGKILL 後の孤児を含む）。
+track_descendants() {
+  local i d c rest
+  scan
+  for i in "${!pids[@]}"; do
+    if snap_alive "${pids[$i]}" "${pstart[$i]:-}"; then
+      tree_of "${pids[$i]}"
+      for d in $TREE; do
+        c="${d%%:*}"
+        rest="${d#*:}"
+        TRK[$c]="${rest%%:*}"
+      done
+    fi
+    for d in ${DESC[$i]:-}; do
+      c="${d%%:*}"
+      rest="${d#*:}"
+      TRK[$c]="${rest%%:*}"
+    done
+  done
+}
+
+# TRK に記録した同一プロセス（pid・起動時刻の一致）のうち生存しているものへ SIGKILL を送る。
+tracked_kill() {
+  local c
+  for c in "${!TRK[@]}"; do sig_same_proc KILL "$c" "${TRK[$c]}"; done
+}
+
+# TRK に記録した同一プロセスがまだ生存していれば 0。
+tracked_alive() {
+  local c
+  for c in "${!TRK[@]}"; do
+    if same_proc_alive "$c" "${TRK[$c]}"; then return 0; fi
+  done
+  return 1
+}
+
+# 後始末。子孫を記録 → launcher へ SIGTERM → 期限超過で SIGKILL → トークン一致の所有プロセスと記録済みの
+# コンテナ側プロセス（孤児を含む）を回収し、残存があれば 1 を返す。EXIT trap から必ず呼ぶ。
 cleanup_procs() {
   local i round
+  track_descendants
   for i in "${!pids[@]}"; do sig_same_proc TERM "${pids[$i]}" "${pstart[$i]:-}" "$$"; done
   wait_until 10 _none_alive || true
   for i in "${!pids[@]}"; do sig_same_proc KILL "${pids[$i]}" "${pstart[$i]:-}" "$$"; done
   for round in 1 2 3 4 5; do
     owned_scan
-    [ "${#OWNED[@]}" -gt 0 ] || break
+    if [ "${#OWNED[@]}" -eq 0 ] && ! tracked_alive; then break; fi
     owned_kill
+    tracked_kill
     sleep 0.3
   done
   owned_scan
-  [ "${#OWNED[@]}" -eq 0 ]
+  [ "${#OWNED[@]}" -eq 0 ] && ! tracked_alive
 }
 _none_alive() { ! any_launcher_alive; }
 
+# 結果の公開。後始末の成功を確認した後にだけ呼ぶ（後始末失敗時に pass の結果が残らないようにする）。
+publish_result() {
+  if [ -n "$output" ]; then
+    if ! out_tmp="$(mktemp "${output}.XXXXXX" 2>/dev/null)"; then err "output-failed" "cannot create temporary file next to the output"; return 2; fi
+    printf '%s\n' "$out_buf" >"$out_tmp" 2>/dev/null || { err "output-failed" "cannot write temporary file"; return 2; }
+    # ln -T（link(2)）で公開する。出力先が既に存在すれば失敗し、symlink を辿らない。
+    if ! ln -T -- "$out_tmp" "$output" 2>/dev/null; then
+      err "output-failed" "cannot publish output (it may already exist, or hard links are unsupported)"
+      return 2
+    fi
+  else
+    printf '%s\n' "$out_buf"
+  fi
+}
+
 on_exit() {
   local rc=$?
-  trap - EXIT INT TERM HUP
+  # 後始末の最中に届く INT・TERM・HUP は無視する（2 回目のシグナルで後始末が中断され、launcher・コンテナが
+  # 残るのを防ぐ）。EXIT trap だけ先に外す。
+  trap - EXIT
+  trap '' INT TERM HUP
   [ "$final_rc" -eq 0 ] || rc="$final_rc"
   if [ "$spawned" -eq 1 ]; then
     if ! cleanup_procs; then
       err "cleanup-failed" "owned processes remain after cleanup"
       rc=4
     fi
+  fi
+  if [ "$rc" -eq 0 ] && [ "$publish_pending" -eq 1 ]; then
+    publish_result || rc=$?
   fi
   [ -z "$out_tmp" ] || rm -f -- "$out_tmp" || true
   [ -z "$logdir" ] || rm -rf -- "$logdir" || true
@@ -506,15 +572,6 @@ if [ "$result" != "pass" ]; then
   exit 1
 fi
 
-if [ -n "$output" ]; then
-  if ! out_tmp="$(mktemp "${output}.XXXXXX" 2>/dev/null)"; then err "output-failed" "cannot create temporary file next to the output"; exit 2; fi
-  printf '%s\n' "$out_buf" >"$out_tmp" 2>/dev/null || { err "output-failed" "cannot write temporary file"; exit 2; }
-  # ln -T（link(2)）で公開する。出力先が既に存在すれば失敗し、symlink を辿らない。
-  if ! ln -T -- "$out_tmp" "$output" 2>/dev/null; then
-    err "output-failed" "cannot publish output (it may already exist, or hard links are unsupported)"
-    exit 2
-  fi
-else
-  printf '%s\n' "$out_buf"
-fi
+# 結果の公開は後始末の完了後（on_exit）に行う。後始末が失敗（終了コード 4）したときは pass の結果を残さない。
+publish_pending=1
 exit 0

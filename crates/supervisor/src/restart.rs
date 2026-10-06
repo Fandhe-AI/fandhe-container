@@ -86,6 +86,7 @@ pub(crate) fn is_abnormal_exit(exit: ProcessExit) -> bool {
         _ => false,
     }
 }
+
 /// ポリシー文字列の最大長（バイト）。外部入力の長さを先に検証する（DoS 防止）。
 const MAX_POLICY_LEN: usize = 32;
 
@@ -224,6 +225,7 @@ pub fn evaluate_restart(
         },
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4,7 +4,7 @@
 //! PLUG-1 区分は core（plugin 境界〔PLUG-2〕を経由せず実行層コアの一部。crate-naming.md）。
 //!
 //! 現状は状態配線（[`state`]。TASK-157.3）・監視ループ基本（[`run`]。TASK-157.4）・restart の土台（異常終了時の `restart_count` 更新。TASK-157.5）・healthcheck フック（[`health`]。TASK-157.6。コマンド実行は未実装）・logs 捕捉の土台（[`logs`]。TASK-157.7。永続化・ローテーションは SUP-7・TASK-164 で未実装）が実装済みで、終了分類（[`restart`]。TASK-159.1・#487）も実装済みで、restart ポリシー評価（SUP-3。#488）等は未実装（TASK-1.3・TASK-157.1〔#235〕・REPAIR-1。スタブの明示は REPAIR-3）。
-//! cgroup 統計の読み取り・パース（[`stats`]。SUP-10・TASK-167.1・#520）も実装済みで、機械可読形式での出力・CLI 配線（TASK-167.2・#521）は未実装。
+//! cgroup 統計の読み取り・パース（[`stats`]。SUP-10・TASK-167.1・#520）と機械可読形式（JSON Lines）での出力（TASK-167.2・#521）も実装済みで、`stats` の CLI 配線は未実装。
 //! 本体は G12（TASK-157〜171）で、次の分割に沿って実装する。
 //!
 //! | issue | TASK | 内容 |

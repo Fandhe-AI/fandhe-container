@@ -6,16 +6,18 @@
 //! 既存契約では socket の絶対パスは `env_clear()` 後に環境変数 [`PLUGIN_SOCKET_ENV`] のみで渡る。
 //!
 //! # 未実装範囲（REPAIR-3）
-//! 本 sub（TASK-116.1・#392）は雛形で、UDS への bind / connect・フレーム送受信（#393）、
-//! `ContainerRuntime` アダプタ（#394）、peer 認証・discovery 登録（#395）、
+//! 起動設定の解決は TASK-116.1（#392）、UDS 接続後のフレーム送受信ループは TASK-116.2（#393。[`frame_loop`]）で実装済み。
+//! `ContainerRuntime` アダプタ（#394）、discovery 登録・plugin 側 bind（#395）、
 //! シャットダウン・ヘルスチェック（#396）は未実装。実行時は WSL2 内の Linux で動く前提（WIN-1）で、
 //! 非 unix ネイティブビルドでは既定パス解決が `Unimplemented` となり fail-closed になる。
 //!
 //! # 暫定契約（spec 未規定）
 //! 引数構文 `--socket <path>` / `--socket=<path>` と既定 socket 名 [`DEFAULT_SOCKET_NAME`] は本リポ独自の暫定値。
-//! 接続方向（core が bind し plugin が connect する既存契約か、plugin が bind するか）は #395 で確定する。
+//! 接続方向は既存契約（core が bind し plugin が connect）の connect 側を #393 で実装した。bind 側への変更可否は #395 で確定する。
 //!
 //! 対応 ID: TASK-116・PLUG-1・PLUG-4・PLUG-11・PLUG-12・WIN-1・REPAIR-3。
+
+pub mod frame_loop;
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};

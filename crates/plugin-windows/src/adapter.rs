@@ -71,7 +71,7 @@ use fandhe_container_platform_windows::wsl2::{
     PreparedLaunch, SharedMount, SharedTransport, TransportPolicy,
 };
 use fandhe_container_plugin::{
-    ONE_SHOT_EXIT_TIMEOUT, PluginError, PluginErrorCode, UDS_RPC_TIMEOUT_DEFAULT,
+    ONE_SHOT_EXIT_TIMEOUT, PluginError, PluginErrorCode, UDS_RPC_TIMEOUT_DEFAULT, UdsStream,
 };
 
 use crate::frame_loop::RequestHandler;
@@ -721,6 +721,41 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> Drop for WindowsRuntimeAdapt
             let _ = self.release_all();
         }
     }
+}
+
+/// [`serve_session`] の結果（フレームループの終了要因と、終了時の共有マウント解除の件数）。
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct SessionOutcome {
+    /// フレームループの終了結果（相手の切断・SIGTERM・異常終了）。
+    pub result: Result<crate::frame_loop::LoopExit, PluginError>,
+    /// ループ終了後の [`WindowsRuntimeAdapter::release_all`] の結果（WIN-2）。
+    pub cleanup: ReleaseAllReport,
+}
+
+/// 接続 1 本分のセッションを処理する（`main.rs` から呼ばれる。TASK-116.5・#396）。
+///
+/// `stop`（SIGTERM フラグ）が立つまで要求を処理し、終了要因（切断・SIGTERM・異常終了）に関わらず
+/// `release_all` で保持中の共有マウントを解除し、`plugin.shutdown` / `plugin.cleanup` を stderr へ出す
+/// （固定文言と件数のみ）。終了コードの決定は呼び出し側が行う。結合試験が偽バックエンドで
+/// 「SIGTERM 時に保持中のマウントを解除する」契約を検証できるよう、バイナリ入口から切り出している。
+pub fn serve_session<B: WindowsBackend, G: GuestStart<B::Prepared>>(
+    stream: &mut UdsStream,
+    adapter: &mut WindowsRuntimeAdapter<B, G>,
+    stop: &std::sync::atomic::AtomicBool,
+) -> SessionOutcome {
+    let result = crate::frame_loop::serve_until(stream, adapter, stop);
+    if matches!(result, Ok(crate::frame_loop::LoopExit::ShutdownRequested)) {
+        stderr_line("{\"event\":\"plugin.shutdown\",\"reason\":\"signal\"}");
+    }
+    let cleanup = adapter.release_all();
+    if cleanup.released + cleanup.remaining > 0 {
+        stderr_line(&format!(
+            "{{\"event\":\"plugin.cleanup\",\"released\":{},\"remaining\":{}}}",
+            cleanup.released, cleanup.remaining
+        ));
+    }
+    SessionOutcome { result, cleanup }
 }
 
 impl<B: WindowsBackend, G: GuestStart<B::Prepared>> RequestHandler for WindowsRuntimeAdapter<B, G> {

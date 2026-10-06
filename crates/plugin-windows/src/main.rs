@@ -28,9 +28,10 @@ use std::time::Duration;
 
 use fandhe_container_plugin::{JsonLinesPeerAuthObserver, PluginError, UdsStream};
 use fandhe_container_plugin_windows::adapter::{
-    PlatformBackend, UnimplementedGuestStart, WindowsRuntimeAdapter, stderr_line,
+    PlatformBackend, SessionOutcome, UnimplementedGuestStart, WindowsRuntimeAdapter, serve_session,
+    stderr_line,
 };
-use fandhe_container_plugin_windows::frame_loop::{LoopExit, serve_until};
+use fandhe_container_plugin_windows::frame_loop::LoopExit;
 use fandhe_container_plugin_windows::sys::install_sigterm_flag;
 use fandhe_container_plugin_windows::{PLUGIN_SOCKET_ENV, default_socket_path, resolve_startup};
 
@@ -79,19 +80,11 @@ fn main() -> ExitCode {
         }
     };
     let mut adapter = WindowsRuntimeAdapter::new(PlatformBackend, UnimplementedGuestStart);
-    let result = serve_until(&mut stream, &mut adapter, stop);
-    if matches!(result, Ok(LoopExit::ShutdownRequested)) {
-        // 固定の 1 行のみ（socket パス・引数・受信データを含めない）。
-        stderr_line("{\"event\":\"plugin.shutdown\",\"reason\":\"signal\"}");
-    }
-    // EOF・異常終了のどちらでも、保持中の共有マウントの解除を試みる（WIN-2）。
-    let cleanup = adapter.release_all();
-    if cleanup.released + cleanup.remaining > 0 {
-        stderr_line(&format!(
-            "{{\"event\":\"plugin.cleanup\",\"released\":{},\"remaining\":{}}}",
-            cleanup.released, cleanup.remaining
-        ));
-    }
+    // 切断・SIGTERM・異常終了のどれでも、保持中の共有マウントの解除を試みる（WIN-2）。
+    // shutdown / cleanup の固定行（socket パス・引数・受信データを含めない）は serve_session が出す。
+    let SessionOutcome {
+        result, cleanup, ..
+    } = serve_session(&mut stream, &mut adapter, stop);
     if let Err(e) = &result {
         report("plugin.frame_loop", Some(source), e, "");
     }

@@ -51,3 +51,9 @@ indent_style = tab
 # .gitmodules（git submodule コマンドがタブインデントで生成・更新する）
 [.gitmodules]
 indent_style = tab
+
+# upstream（kubernetes/cri-api）からバイト一致で配置する .proto（TASK-56.2・CRI-3）。
+# 出典ハッシュを保つため、タブ・行末空白を含む原文を整形しない。
+[crates/cri/proto/*.proto]
+indent_style = unset
+trim_trailing_whitespace = unset

@@ -1,5 +1,5 @@
 {
-  "_comment": "editorconfig-checker の除外設定。CI は Fandhe-AI/actions/lint-docs reusable workflow（editorconfig ジョブ）が本ファイルを参照する。upstream 配布のスキル実体（修正先は agent-cli-skills）・private submodule・作業ディレクトリを除外する。Exclude は正規表現。IndentSize 検査は Markdown の継続行・設定ファイルの 2 スペース慣行（YAML/JSON 系）と [*] indent_size = 4 が構造的に衝突するため無効化する（indent_style・final newline・trailing whitespace の検査は維持）。",
+  "_comment": "editorconfig-checker の除外設定。CI は Fandhe-AI/actions/lint-docs reusable workflow（editorconfig ジョブ）が本ファイルを参照する。upstream 配布のスキル実体（修正先は agent-cli-skills）・private submodule・作業ディレクトリを除外する。crates/cri/proto の upstream 無改変 .proto（タブ・行末空白を含む原文。TASK-56.2）も除外する。Exclude は正規表現。IndentSize 検査は Markdown の継続行・設定ファイルの 2 スペース慣行（YAML/JSON 系）と [*] indent_size = 4 が構造的に衝突するため無効化する（indent_style・final newline・trailing whitespace の検査は維持）。",
   "Disable": {
     "IndentSize": true
   },
@@ -8,6 +8,7 @@
     "^\\.claude/",
     "^\\.agents/skills/",
     "^docs/spec/",
-    "^LICENSE$"
+    "^LICENSE$",
+    "^crates/cri/proto/.*\\.proto$"
   ]
 }

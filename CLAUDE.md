@@ -37,6 +37,7 @@ fandhe-container/
 │   ├── core/                      #   実行層（namespace・cgroups v2・seccomp/Landlock・rootless）
 │   ├── supervisor/                #   コンテナごとの軽量監視プロセス
 │   ├── oci/ / cri/                #   OCI イメージ・ライフサイクル / CRI
+│   │   └── cri/proto/             #     cri-api の .proto（kubernetes/cri-api v0.37.1 無改変）と出典 README（TASK-56.2・CRI-3）
 │   ├── platform-macos/ / platform-windows/ / microvm/  # プラットフォーム層
 │   ├── gpu/ / net/                #   GPU パススルー（CDI）/ network
 │   ├── plugin/                    #   plugin 境界機構（UDS＋長さ接頭辞フレーム。fandhe-container-plugin）

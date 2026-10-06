@@ -26,6 +26,12 @@
 //!   現状は接続終了時・adapter 破棄時に [`WindowsRuntimeAdapter::release_all`] が解除を試みる
 //!   （解除できなかった件数は [`ReleaseAllReport::remaining`] で観測できる）。
 //!
+//! # 期限（REPAIR-5）
+//! 要求 1 件の WSL2 操作全体（検出・マウント準備・回復・解除）は、受信時に始まる合計期限
+//! [`REQUEST_BUDGET`]（要求元の plugin RPC 既定期限 `UDS_RPC_TIMEOUT_DEFAULT` から応答の余裕を引いた値）を
+//! 共有し、各段には残り時間から配分する。期限切れは `TIMEOUT` のエラーフレームで返し、解除できなかった
+//! マウントの所有情報は保持して stop / 終了時の解除で回収する（WIN-2）。
+//!
 //! # 実行場所の前提（WIN-1）
 //! 実バックエンド [`PlatformBackend`] は Windows ホスト上で `wsl.exe` を起動して WSL2 の検出・virtiofs
 //! マウントを行う。したがって本 plugin は Windows ホスト側プロセスとして動く前提である。非 Windows
@@ -45,22 +51,30 @@ use fandhe_container_platform_windows::instrument::{
     WinOpOutcome, WinOpRecorder, WinOpSample, WinWarning, WinWarningCode,
 };
 use fandhe_container_platform_windows::wsl2::{
-    self, DEFAULT_WSL_TIMEOUT, DistroName, HostDir, LaunchRequest, Launched, MAX_SHARED_MOUNTS,
-    MountError, MountName, PreparedLaunch, SharedMount, SharedTransport, TransportPolicy,
+    self, DistroName, HostDir, LaunchRequest, Launched, MAX_SHARED_MOUNTS, MountError, MountName,
+    PreparedLaunch, SharedMount, SharedTransport, TransportPolicy,
 };
-use fandhe_container_plugin::{PluginError, PluginErrorCode};
+use fandhe_container_plugin::{PluginError, PluginErrorCode, UDS_RPC_TIMEOUT_DEFAULT};
 
 use crate::frame_loop::RequestHandler;
 
 /// 同時に保持するコンテナ登録の上限（無制限確保の防止）。
 pub const MAX_CONTAINERS: usize = 64;
 
-/// start 1 回で使う共有マウント準備の合計期限。失敗時のロールバックは別に同じ長さを持つため、
-/// start の合計は準備 + ロールバックで `2 * LAUNCH_BUDGET` 以内（ゲスト起動ステップ分を除く）。
-/// core 側の plugin RPC 期限（既定 10 秒。REPAIR-5）に収める値にする。
-pub const LAUNCH_BUDGET: Duration = Duration::from_secs(4);
+/// 応答フレームの符号化・送信と、要求元が計時を始めてから本 plugin が受信するまでの遅延に残す余裕。
+pub const RESPONSE_MARGIN: Duration = Duration::from_secs(2);
 
-/// stop 1 回で使うマウント解除の合計期限（全マウントで共有。REPAIR-5・WIN-2）。
+/// 要求 1 件（create / start / stop）の WSL2 操作全体で共有する合計期限（REPAIR-5）。
+///
+/// 要求元（core 側 proxy）の plugin RPC 既定期限 `UDS_RPC_TIMEOUT_DEFAULT`（上限も同じ値）から
+/// [`RESPONSE_MARGIN`] を引いた値で、起点は要求の処理開始時。検出・マウント準備・回復・解除の各段には
+/// この期限の残り時間から配分するため、成功応答も失敗時の解除結果も RPC 期限内に要求元へ届く。
+/// 要求ごとの期限はワイヤーに載っていないため既定値を前提にする（期限の受け渡しは TASK-114 で確定。
+/// REPAIR-3）。期限切れになった `wsl.exe` を kill して回収する猶予（platform-windows 側）は含まない。
+pub const REQUEST_BUDGET: Duration = UDS_RPC_TIMEOUT_DEFAULT.saturating_sub(RESPONSE_MARGIN);
+
+/// stop 1 回・[`WindowsRuntimeAdapter::release_all`] の 1 エントリで使うマウント解除の合計期限の上限
+/// （全マウントで共有。stop では要求の残り時間とのうち短い方を渡す。REPAIR-5・WIN-2）。
 pub const RELEASE_BUDGET: Duration = Duration::from_secs(4);
 
 /// [`WindowsRuntimeAdapter::release_all`] 全体の合計期限（複数コンテナ・複数マウントで共有）。
@@ -73,6 +87,7 @@ const MIN_STEP_BUDGET: Duration = Duration::from_millis(50);
 /// コンテナ ID の最大バイト数（core の `ContainerId` と同じ規則。TASK-114 で core 型へ置換予定）。
 const MAX_ID_LEN: usize = 255;
 
+const MSG_DEADLINE: &str = "request deadline exceeded before the WSL2 operation started";
 const MSG_UNIMPLEMENTED: &str = "operation is not implemented";
 const MSG_BAD_REQUEST: &str = "malformed request";
 const MSG_BAD_ID: &str = "invalid container id";
@@ -124,6 +139,35 @@ fn win_err(e: WinError) -> PluginError {
     to_plugin_error(e.code(), e.message())
 }
 
+// ---- 要求の合計期限（REPAIR-5）----
+
+/// 要求 1 件の合計期限。`handle` の入口で作り、バックエンドの各操作へ残り時間を配分する。
+#[derive(Debug, Clone, Copy)]
+struct RequestDeadline(Instant);
+
+impl RequestDeadline {
+    fn after(total: Duration) -> Self {
+        Self(Instant::now() + total)
+    }
+
+    /// 残り時間を返す。[`MIN_STEP_BUDGET`] 未満なら操作に着手させず `TIMEOUT` を返す。
+    fn remaining(self) -> Result<Duration, PluginError> {
+        let left = self.0.saturating_duration_since(Instant::now());
+        if left < MIN_STEP_BUDGET {
+            return Err(err(PluginErrorCode::Timeout, MSG_DEADLINE));
+        }
+        Ok(left)
+    }
+}
+
+/// start の残り時間 `left` から [`WindowsBackend::launch`] へ渡す `budget` を決める。
+///
+/// launch は「検出 + マウント準備」と「回復・ロールバック」にそれぞれ `budget` を使えるため、半分ずつ
+/// 配分して合計を `left` 以内に収める（回復の持ち分を先に確保し、準備が期限を使い切っても解除できる）。
+fn launch_budget(left: Duration) -> Duration {
+    left / 2
+}
+
 // ---- 継ぎ目（3 OS の CI で実 wsl.exe を起動せずテストするため）----
 
 /// バックエンド失敗（未解除マウントと 9P 降格の警告を保持する）。
@@ -159,6 +203,10 @@ pub struct LaunchOutcome<P> {
 }
 
 /// ゲスト内ランタイムの起動ステップ（platform-windows の `launch_with` の `start` に注入する。TASK-116 の後続）。
+///
+/// 現状の実装（[`UnimplementedGuestStart`]）は即座に返るため、要求の合計期限 [`REQUEST_BUDGET`] に
+/// 起動ステップの持ち分は無い。実体を実装するときは有界時間で返すようにし、その持ち分を
+/// [`REQUEST_BUDGET`] の配分へ加える（REPAIR-3・REPAIR-5）。
 pub trait GuestStart<P> {
     /// 共有マウント準備後に呼ばれる。`Err` ならマウントはロールバックされる。
     fn start(&self, prepared: &P) -> Result<(), WinError>;
@@ -183,12 +231,15 @@ pub trait WindowsBackend {
     type Prepared;
 
     /// WSL2 が有効で、`distro` が起動可能な WSL2 ディストリとして存在することを確認する（WIN-1）。
-    fn check_distro(&self, distro: &DistroName) -> Result<(), WinError>;
+    ///
+    /// `budget` は検出全体の合計期限（REPAIR-5）。
+    fn check_distro(&self, distro: &DistroName, budget: Duration) -> Result<(), WinError>;
 
     /// 共有マウントを準備し、成功時のみ `guest` を呼ぶ。`guest` 失敗時はマウントをロールバックする。
     ///
-    /// `budget` はマウント準備全体の合計期限（複数マウントで共有）。`guest` 失敗時のロールバックには
-    /// 準備とは別に同じ長さが割り当てられる（解除できなければ `unreleased` で返す。WIN-2・REPAIR-5）。
+    /// `budget` は WSL2 の検出とマウント準備全体（複数マウント）で共有する合計期限。準備失敗時の回復と
+    /// `guest` 失敗時のロールバックには、準備とは別に同じ長さが割り当てられる（解除できなければ
+    /// `unreleased` で返す。WIN-2・REPAIR-5）。したがって `guest` を除く合計は `2 * budget` 以内。
     fn launch(
         &self,
         req: &LaunchRequest,
@@ -220,8 +271,8 @@ fn failure_from_mount(e: MountError) -> BackendFailure<PreparedLaunch> {
 impl WindowsBackend for PlatformBackend {
     type Prepared = PreparedLaunch;
 
-    fn check_distro(&self, distro: &DistroName) -> Result<(), WinError> {
-        let status = wsl2::detect(DEFAULT_WSL_TIMEOUT)?;
+    fn check_distro(&self, distro: &DistroName, budget: Duration) -> Result<(), WinError> {
+        let status = wsl2::detect(budget)?;
         let found = status
             .distros
             .iter()
@@ -410,7 +461,11 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
         }
     }
 
-    fn create(&mut self, body: &[String]) -> Result<Vec<String>, PluginError> {
+    fn create(
+        &mut self,
+        body: &[String],
+        deadline: RequestDeadline,
+    ) -> Result<Vec<String>, PluginError> {
         let (id, req) = parse_create(body)?;
         if self.entries.contains_key(id) {
             return Err(err(
@@ -424,12 +479,18 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
                 "too many containers",
             ));
         }
-        self.backend.check_distro(req.distro()).map_err(win_err)?;
+        self.backend
+            .check_distro(req.distro(), deadline.remaining()?)
+            .map_err(win_err)?;
         self.entries.insert(id.to_string(), Entry::Created(req));
         Ok(reply("created", "", ""))
     }
 
-    fn start(&mut self, body: &[String]) -> Result<Vec<String>, PluginError> {
+    fn start(
+        &mut self,
+        body: &[String],
+        deadline: RequestDeadline,
+    ) -> Result<Vec<String>, PluginError> {
         let id = parse_id_only(body)?;
         let result = match self.entries.get(id) {
             None => return Err(err(PluginErrorCode::NotFound, "container not found")),
@@ -439,7 +500,10 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
                     "container is not in created state",
                 ));
             }
-            Some(Entry::Created(req)) => self.backend.launch(req, &self.guest, LAUNCH_BUDGET),
+            Some(Entry::Created(req)) => {
+                let budget = launch_budget(deadline.remaining()?);
+                self.backend.launch(req, &self.guest, budget)
+            }
         };
         match result {
             Ok(o) => {
@@ -457,6 +521,22 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
                 }
                 Err(e)
             }
+        }
+    }
+
+    /// 要求 1 件を、いまから `total` 以内の合計期限で処理する（[`RequestHandler::handle`] の本体。
+    /// 本番は [`REQUEST_BUDGET`]、テストは期限切れの経路を確かめるため短い値を渡す。REPAIR-5）。
+    fn handle_within(
+        &mut self,
+        body: &[String],
+        total: Duration,
+    ) -> Result<Vec<String>, PluginError> {
+        let deadline = RequestDeadline::after(total);
+        match body.first().map(String::as_str) {
+            Some("create") => self.create(body, deadline),
+            Some("start") => self.start(body, deadline),
+            Some("stop") => self.stop(body, deadline),
+            _ => Err(err(PluginErrorCode::Unimplemented, MSG_UNIMPLEMENTED)),
         }
     }
 
@@ -516,8 +596,23 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
         report
     }
 
-    fn stop(&mut self, body: &[String]) -> Result<Vec<String>, PluginError> {
+    fn stop(
+        &mut self,
+        body: &[String],
+        deadline: RequestDeadline,
+    ) -> Result<Vec<String>, PluginError> {
         let id = parse_id_only(body)?;
+        if !self.entries.contains_key(id) {
+            return Err(err(PluginErrorCode::NotFound, "container not found"));
+        }
+        // 期限切れなら解除に着手せず、エントリ（所有情報）をそのまま残して `TIMEOUT` を返す
+        // （次の stop / release_all で解除できる。WIN-2）。マウントを持たない登録の削除は期限を要しない。
+        let budget = match self.entries.get(id) {
+            Some(Entry::Running(_) | Entry::Unreleased(_)) => {
+                deadline.remaining()?.min(RELEASE_BUDGET)
+            }
+            _ => RELEASE_BUDGET,
+        };
         let Some(entry) = self.entries.remove(id) else {
             return Err(err(PluginErrorCode::NotFound, "container not found"));
         };
@@ -526,7 +621,7 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
             Entry::Running(p) | Entry::Unreleased(p) => {
                 let backend = &self.backend;
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    backend.release(&p, RELEASE_BUDGET)
+                    backend.release(&p, budget)
                 }));
                 match outcome {
                     Ok(Ok(())) => Ok(reply("stopped", "", "")),
@@ -561,12 +656,7 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> Drop for WindowsRuntimeAdapt
 
 impl<B: WindowsBackend, G: GuestStart<B::Prepared>> RequestHandler for WindowsRuntimeAdapter<B, G> {
     fn handle(&mut self, body: &[String]) -> Result<Vec<String>, PluginError> {
-        match body.first().map(String::as_str) {
-            Some("create") => self.create(body),
-            Some("start") => self.start(body),
-            Some("stop") => self.stop(body),
-            _ => Err(err(PluginErrorCode::Unimplemented, MSG_UNIMPLEMENTED)),
-        }
+        self.handle_within(body, REQUEST_BUDGET)
     }
 }
 
@@ -592,11 +682,14 @@ mod tests {
         panic_once: RefCell<bool>,
         /// 渡された合計期限（launch / release の呼び出し順）。
         budgets: RefCell<Vec<Duration>>,
+        /// check_distro へ渡された合計期限。
+        check_budgets: RefCell<Vec<Duration>>,
     }
 
     impl WindowsBackend for Fake {
         type Prepared = FakePrepared;
-        fn check_distro(&self, d: &DistroName) -> Result<(), WinError> {
+        fn check_distro(&self, d: &DistroName, budget: Duration) -> Result<(), WinError> {
+            self.check_budgets.borrow_mut().push(budget);
             self.calls
                 .borrow_mut()
                 .push(format!("check:{}", d.as_str()));
@@ -894,7 +987,97 @@ mod tests {
         assert_eq!(a.release_all(), ReleaseAllReport::default());
     }
 
-    /// REPAIR-5: start / stop は定数の合計期限を、release_all は残り時間（上限 RELEASE_BUDGET）を渡す。
+    /// REPAIR-5: 要求の合計期限は plugin RPC の既定期限（10 秒）より応答の余裕 2 秒だけ短い 8 秒で、
+    /// start の配分（検出 + 準備 4 秒・回復 4 秒）も stop の解除（4 秒）もその内側に収まる。
+    #[test]
+    fn task116_3_repair5_request_budget_fits_in_plugin_rpc_timeout() {
+        assert_eq!(UDS_RPC_TIMEOUT_DEFAULT, Duration::from_secs(10));
+        assert_eq!(RESPONSE_MARGIN, Duration::from_secs(2));
+        assert_eq!(REQUEST_BUDGET, Duration::from_secs(8));
+        assert_eq!(launch_budget(REQUEST_BUDGET), Duration::from_secs(4));
+        assert_eq!(2 * launch_budget(REQUEST_BUDGET), REQUEST_BUDGET);
+        assert_eq!(
+            launch_budget(Duration::from_millis(900)),
+            Duration::from_millis(450)
+        );
+        assert_eq!(RELEASE_BUDGET, Duration::from_secs(4));
+        assert!(RELEASE_BUDGET <= REQUEST_BUDGET);
+    }
+
+    /// REPAIR-5: create は要求の残り時間（8 秒以内）を検出へ、start はその半分（4 秒以内）を準備へ渡す
+    /// （残りの半分は回復の持ち分）。処理開始からの経過分だけ短くなるため、下限は 1 秒の余裕で確かめる。
+    #[test]
+    fn task116_3_repair5_create_and_start_share_the_request_deadline() {
+        let (mut a, _) = adapter(Fake::default());
+        a.handle(&s(CREATE)).unwrap();
+        a.handle(&s(&["start", "c1"])).unwrap();
+        let slack = Duration::from_secs(1);
+        let c = a.backend.check_budgets.borrow().clone();
+        assert_eq!(c.len(), 1);
+        assert!(c[0] <= Duration::from_secs(8) && c[0] > Duration::from_secs(8) - slack);
+        let b = a.backend.budgets.borrow().clone();
+        assert_eq!(b.len(), 1);
+        assert!(b[0] <= Duration::from_secs(4) && b[0] > Duration::from_secs(4) - slack);
+
+        // 短い合計期限でも同じ配分になる（create は全体、start は半分）。
+        let (mut a, _) = adapter(Fake::default());
+        let total = Duration::from_secs(2);
+        a.handle_within(&s(CREATE), total).unwrap();
+        a.handle_within(&s(&["start", "c1"]), total).unwrap();
+        a.handle_within(&s(&["stop", "c1"]), total).unwrap();
+        let c = a.backend.check_budgets.borrow().clone();
+        assert!(c[0] <= Duration::from_secs(2) && c[0] > Duration::from_secs(1));
+        let b = a.backend.budgets.borrow().clone();
+        assert_eq!(b.len(), 2);
+        assert!(b[0] <= Duration::from_secs(1) && b[0] > Duration::from_millis(500));
+        // stop の解除は残り時間（2 秒以内）と RELEASE_BUDGET（4 秒）の短い方。
+        assert!(b[1] <= Duration::from_secs(2) && b[1] > Duration::from_secs(1));
+    }
+
+    /// REPAIR-5・WIN-2: 合計期限を使い切った要求はバックエンドに着手せず TIMEOUT のエラーフレームを返す。
+    /// 登録も所有情報も変えないため、期限内の再要求で create / start / stop（解除）をやり直せる。
+    #[test]
+    fn task116_3_repair5_exhausted_request_deadline_is_timeout_and_keeps_state() {
+        let (mut a, calls) = adapter(Fake::default());
+        let timeout = |r: Result<Vec<String>, PluginError>| {
+            let e = r.unwrap_err();
+            assert_eq!(e.code().as_str(), "TIMEOUT");
+            assert_eq!(
+                e.message(),
+                "request deadline exceeded before the WSL2 operation started"
+            );
+        };
+        timeout(a.handle_within(&s(CREATE), Duration::ZERO));
+        assert!(calls.borrow().is_empty());
+        // create は登録されていない（start は NOT_FOUND）。
+        let e = a.handle(&s(&["start", "c1"])).unwrap_err();
+        assert_eq!(e.code().as_str(), "NOT_FOUND");
+
+        a.handle(&s(CREATE)).unwrap();
+        timeout(a.handle_within(&s(&["start", "c1"]), Duration::ZERO));
+        assert_eq!(*calls.borrow(), vec!["check:Ubuntu"]);
+        // Created のまま残り、期限内の start は成功する。
+        a.handle(&s(&["start", "c1"])).unwrap();
+
+        timeout(a.handle_within(&s(&["stop", "c1"]), Duration::ZERO));
+        assert!(!calls.borrow().iter().any(|c| c.starts_with("release")));
+        // 所有情報は残っており、期限内の stop で解除できる。
+        assert_eq!(
+            a.handle(&s(&["stop", "c1"])).unwrap(),
+            s(&["stopped", "", ""])
+        );
+        assert_eq!(calls.borrow().last().unwrap(), "release:Ubuntu");
+
+        // マウントを持たない登録（Created）の stop は WSL2 操作が無いため期限切れでも削除できる。
+        a.handle(&s(CREATE)).unwrap();
+        assert_eq!(
+            a.handle_within(&s(&["stop", "c1"]), Duration::ZERO)
+                .unwrap(),
+            s(&["stopped", "", ""])
+        );
+    }
+
+    /// REPAIR-5: start / stop は要求の期限から配分した合計期限を、release_all は残り時間（上限 RELEASE_BUDGET）を渡す。
     #[test]
     fn task116_3_repair5_budgets_are_propagated_to_backend() {
         let (mut a, _) = adapter(Fake::default());
@@ -907,8 +1090,11 @@ mod tests {
         assert_eq!((r.released, r.remaining), (1, 0));
         let b = a.backend.budgets.borrow().clone();
         assert_eq!(b.len(), 4);
-        assert_eq!((b[0], b[1]), (LAUNCH_BUDGET, RELEASE_BUDGET));
-        assert_eq!(b[2], LAUNCH_BUDGET);
+        let launch = launch_budget(REQUEST_BUDGET);
+        let slack = Duration::from_secs(1);
+        assert!(b[0] <= launch && b[0] > launch - slack);
+        assert_eq!(b[1], RELEASE_BUDGET);
+        assert!(b[2] <= launch && b[2] > launch - slack);
         assert!(b[3] <= RELEASE_BUDGET && b[3] >= MIN_STEP_BUDGET);
     }
 

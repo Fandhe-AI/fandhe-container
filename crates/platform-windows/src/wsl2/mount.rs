@@ -10,7 +10,7 @@
 //! - 入力の検証済み newtype（[`HostDir`]・[`MountName`]・[`DistroName`]・[`SharedMount`]・[`LaunchRequest`]）。
 //!   生の文字列を `wsl.exe` の引数へ直接連結せず、型で「壊れた値を表現できない」ようにする（REPAIR-2）。
 //! - 純粋関数（事前判定・argv 組み立て・`/proc/self/mountinfo` 解析）。全 OS でユニットテストする。
-//! - 実行部（`run::run_capture` 経由。各呼び出しにタイムアウトを適用する。REPAIR-5）。
+//! - 実行部（`run::run_capture` 経由。各呼び出しには操作ごとの合計期限の残り時間を渡す。REPAIR-5）。
 //!
 //! 後始末の追跡の前提: ゲスト内の root は信頼境界の内側として扱い、root や WSL がゲスト内プロセスを強制終了した
 //! 場合の後始末は対象外とする。`/run/fandhe` の残留物（柵の claim・ロックファイル・未回収の記録）は tmpfs 上にあり
@@ -1546,7 +1546,17 @@ fn program_exec(
     program: &Path,
     timeout: Duration,
 ) -> impl FnMut(&[String], usize) -> Result<run::Captured, Wsl2Error> + '_ {
-    program_exec_from(program, timeout, Some(Instant::now()))
+    program_exec_from(program, timeout, Some(Instant::now() + timeout))
+}
+
+/// [`program_exec`] と同じだが、合計期限を呼び出し側が決めた時刻 `deadline` にする（検出と準備で 1 つの
+/// 期限を共有するため。REPAIR-5）。
+fn program_exec_until(
+    program: &Path,
+    deadline: Instant,
+) -> impl FnMut(&[String], usize) -> Result<run::Captured, Wsl2Error> + '_ {
+    // 期限が確定しているため `timeout`（遅延起点用）は使われない。
+    program_exec_from(program, Duration::ZERO, Some(deadline))
 }
 
 /// [`program_exec`] と同じだが、合計期限の起点を最初の呼び出し時にする（起動ステップ後のロールバック用。
@@ -1561,9 +1571,8 @@ fn program_exec_lazy(
 fn program_exec_from(
     program: &Path,
     timeout: Duration,
-    started: Option<Instant>,
+    mut deadline: Option<Instant>,
 ) -> impl FnMut(&[String], usize) -> Result<run::Captured, Wsl2Error> + '_ {
-    let mut deadline = started.map(|t| t + timeout);
     move |args: &[String], max: usize| {
         let deadline = *deadline.get_or_insert_with(|| Instant::now() + timeout);
         let left = remaining_until(deadline)?;
@@ -1591,16 +1600,22 @@ pub(super) fn prepare_with_program(
     timeout: Duration,
 ) -> Result<PreparedLaunch, MountError> {
     check_timeout(timeout)?;
-    let status = detect_with_program(program, timeout)?;
-    // 合計期限の起点は最初のマウント系呼び出し時にする（検出に使った時間で持ち時間を削らない）。
+    // 検出と準備は 1 つの合計期限 `timeout` を共有する（検出が長引けば準備は残り時間だけで行い、
+    // 足りなければマウント前に Timeout で fail-closed。呼び出し全体を要求元の期限に収めるため。REPAIR-5）。
     // 回復・ロールバックには準備とは別の有界期限を割り当てる（準備で期限を使い切っても解除の機会を失わない）。
-    let mut exec = program_exec_lazy(program, timeout);
+    let deadline = Instant::now() + timeout;
+    let status = detect_with_program(program, remaining_until(deadline)?)?;
+    let mut exec = program_exec_until(program, deadline);
     let mut recovery = program_exec_lazy(program, timeout);
     prepare_with_exec(&status, virtiofs, req, &mut exec, Some(&mut recovery))
 }
 
 /// 共有マウントを準備する（関数名は TASK-67.4 からの互換。既定の [`TransportPolicy::PreferVirtiofs`] では
-/// virtiofs が使えない場合に 9P へフォールバックする）。`timeout` は各 `wsl.exe` 呼び出しに適用する（REPAIR-5）。
+/// virtiofs が使えない場合に 9P へフォールバックする）。
+///
+/// `timeout` は WSL2 の検出とマウント準備（全マウント）で共有する合計期限。失敗時の所有確認・取り下げ・
+/// ロールバックには別に同じ長さの期限を割り当てるため、呼び出し全体は `2 * timeout` 以内に収まる
+/// （期限切れの `wsl.exe` を kill して回収する猶予を除く。REPAIR-5・WIN-2）。
 ///
 /// 成功時は全マウントが virtiofs（方針が許せば 9P。[`PreparedLaunch::transport`]・[`PreparedLaunch::warning`]）で
 /// 成立している。失敗時は本呼び出しで作ったマウントを後始末して `Err`。
@@ -1660,6 +1675,8 @@ fn release_with_exec(prepared: &PreparedLaunch, exec: Exec<'_>) -> RollbackOutco
 /// 後始末をやり直せる（件数は [`MAX_UNRELEASED_MOUNTS`] 以下）。未確定の記録（マウント ID が `None`）は
 /// ゲスト内の記録を読み直し、記録の ID で所有を確かめられたものだけを外す。ゲスト内で既に外し終えていれば
 /// 完了として扱い、記録が `none`（自分のマウントを特定できない）なら外さずに件数だけを報告する（fail-closed）。
+///
+/// `timeout` は全マウントの解除で共有する合計期限（REPAIR-5）。
 pub fn release_virtiofs_launch(
     prepared: &PreparedLaunch,
     timeout: Duration,
@@ -1786,6 +1803,11 @@ fn launch_with_exec<T>(
 ///
 /// 記録先を持たないため、9P 降格の警告（WIN-2）は成功時は [`PreparedLaunch::warning`]、
 /// `start` 失敗時は [`MountError::warning`] から確認する。
+///
+/// `timeout` は WSL2 の検出とマウント準備で共有する合計期限。準備失敗時の回復と `start` 失敗時の
+/// ロールバックには別に同じ長さの期限を割り当てるため、`start` の所要時間を除く合計は `2 * timeout` 以内
+/// （期限切れの `wsl.exe` を kill して回収する猶予を除く。REPAIR-5・WIN-2）。`start` 自体の期限は
+/// 呼び出し側が持つ。
 pub fn launch_with<T>(
     req: &LaunchRequest,
     timeout: Duration,
@@ -1833,16 +1855,18 @@ fn launch_with_program_timed<'r, T>(
     timer: WinOpTimer<'r>,
     start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
 ) -> Result<Launched<T>, MountError> {
-    // 合計期限の起点は検出後の最初のマウント系呼び出し時にする（検出は独立した `timeout` を使うため、
-    // 構築時起点だと検出で持ち時間を削られる）。回復・ロールバックには準備とは別に `timeout` を割り当て
+    // 検出と準備は 1 つの合計期限 `timeout` を共有する（検出が長引けば準備は残り時間だけで行い、
+    // 足りなければマウント前に Timeout で fail-closed。呼び出し全体を要求元の期限に収めるため）。
+    // 回復・ロールバックには準備とは別に `timeout` を割り当て、起点は最初の回復系呼び出し時にする
     // （準備で期限を使い切っても所有確認・取り下げ・解除の機会を失わない。解除できなければ
     // `MountError::unreleased` で呼び出し側へ返る。起動ステップ失敗時のロールバックも同じ実行器を使う。
     // REPAIR-5・WIN-2）。
-    let mut exec = program_exec_lazy(program, timeout);
+    let deadline = Instant::now() + timeout;
+    let mut exec = program_exec_until(program, deadline);
     let mut rollback_exec = program_exec_lazy(program, timeout);
     let prepared = (|| -> Result<PreparedLaunch, MountError> {
         check_timeout(timeout)?;
-        let status = detect_with_program(program, timeout)?;
+        let status = detect_with_program(program, remaining_until(deadline)?)?;
         prepare_with_exec(&status, virtiofs, req, &mut exec, Some(&mut rollback_exec))
     })();
     finish_launch(prepared, timer, &mut rollback_exec, recorder, start)
@@ -3488,6 +3512,17 @@ mod tests {
     #[test]
     fn program_exec_deadline_is_shared_across_calls() {
         let mut exec = program_exec(Path::new("unused-wsl.exe"), Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(20));
+        let e = exec(&[], 16).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::Timeout);
+        assert_eq!(e.message(), "wsl.exe did not finish before the deadline");
+    }
+
+    /// REPAIR-5: 呼び出し側が決めた期限（検出と共有する合計期限）を過ぎていれば、wsl.exe を起動せず
+    /// Timeout を返す。
+    #[test]
+    fn program_exec_until_rejects_calls_after_the_shared_deadline() {
+        let mut exec = program_exec_until(Path::new("unused-wsl.exe"), Instant::now());
         std::thread::sleep(Duration::from_millis(20));
         let e = exec(&[], 16).unwrap_err();
         assert_eq!(e.code(), Wsl2ErrorCode::Timeout);

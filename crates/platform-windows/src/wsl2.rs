@@ -155,7 +155,8 @@ pub fn list_distros(timeout: Duration) -> Result<Vec<WslDistro>, Wsl2Error> {
 /// WSL2 が使えるかを確認し、バージョンとディストリ一覧を返す。
 ///
 /// WSL が無効、または WSL2 のディストリが 1 件もない場合は有効化手順つきの
-/// `FAILED_PRECONDITION` を返す（WIN-1）。各呼び出しに `timeout` を適用する。
+/// `FAILED_PRECONDITION` を返す（WIN-1）。`timeout` は検出全体（2 回の `wsl.exe` 呼び出し）で共有する
+/// 合計期限（REPAIR-5）。
 pub fn detect(timeout: Duration) -> Result<Wsl2Status, Wsl2Error> {
     check_timeout(timeout)?;
     detect_with_program(&wsl_exe_path()?, timeout)

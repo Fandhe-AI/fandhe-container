@@ -44,8 +44,16 @@ impl InspectReport {
     /// 公開 API 経由の任意の [`StateRecord`] でも出力サイズを有界に保つため、bundle・cgroupScope が
     /// 各 [`MAX_FIELD_BYTES`] バイトを超えるレコードは [`ErrorCode::InvalidArgument`] で拒否する
     /// （`StateRecord::new` は絶対パスしか検証しない。無制限確保の防止。SUP-11・TASK-168.1）。
+    /// また bundle が UTF-8 でない場合も拒否する（`to_string_lossy` が不正バイトを置換文字へ変え、
+    /// 元のパスと一致しない値を黙って出力するのを防ぐ。core の state.json も同入力を拒否する）。
     /// ID は [`ContainerId`] 構築時に 255 バイト以下へ検証済み。
     pub fn from_record(record: &StateRecord) -> Result<Self, TraitError> {
+        if record.bundle().to_str().is_none() {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "bundle path must be valid UTF-8",
+            ));
+        }
         if record.bundle().as_os_str().len() > MAX_FIELD_BYTES {
             return Err(TraitError::new(
                 ErrorCode::InvalidArgument,
@@ -329,6 +337,22 @@ mod tests {
         };
         assert!(InspectReport::from_record(&mk(ok.clone())).is_ok());
         let e = InspectReport::from_record(&mk(ok.join("x"))).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sup11_task168_1_from_record_rejects_non_utf8_bundle() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut raw = b"/b".to_vec();
+        raw.push(0xff);
+        let rec = StateRecord::new(
+            ContainerStatus::created(cid("c"), None),
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(raw)),
+            StateRevision::from_raw(1),
+        )
+        .unwrap();
+        let e = InspectReport::from_record(&rec).unwrap_err();
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
     }
 

@@ -580,9 +580,10 @@ for desc in ${DESC[$target_index]}; do
 done
 
 # --- --check-restart（opt-in。SUP-3 の restart ポリシー実装が前提）: 残り N-1 個のコンテナ側プロセスを kill して再起動を確認 ---
-# 再起動の成立条件: 各監視プロセスについて、kill 前に記録した子孫（pid・起動時刻）に含まれない「新しい」直接の子で、
+# 再起動の成立条件: kill した旧プロセス（pid・起動時刻）がすべて消滅していること、かつ各監視プロセスについて、kill 前に記録した子孫（pid・起動時刻）に含まれない「新しい」直接の子で、
 # kill した子とシグネチャ（comm＋完全な cmdline）が一致するものが、シグネチャごとに kill した直接の子の数以上、生存していること。
-# 同名・別コマンドの補助プロセスが増えただけでは成立しない。成立後に settle 秒待ち、
+# 同名・別コマンドの補助プロセスが増えただけでは成立しない。待機中と settle 中も子孫を追跡し続け（環境変数を
+# 継承しない再起動後の子も後始末で回収する）、成立後に settle 秒待ち、
 # N-1 個の監視プロセスと再起動したコンテナ側プロセスが同一のまま生存していること（稼働継続）も再照合する。
 # 既知の制約: 現行の launcher 契約にはコンテナ ID・ランタイム状態を取得する手段がないため、対応関係はコマンド同一性
 # （シグネチャ）と「直接の子」という位置で近似する。同一コマンドの補助プロセスは区別できず、再起動でコマンドラインが変わる
@@ -591,6 +592,7 @@ restart_check="skipped"
 restart_confirmed=null
 if [ "$check_restart" -eq 1 ]; then
   declare -A OLDKIDS=() OLDSET=() OLDN=() NEWKIDS=() OLDSIGS=() OLDSIGN=()
+  OLDPAIRS=()
   sig_unreadable=0
   for i in $(seq 1 "$count"); do
     for desc in ${DESC[$i]}; do
@@ -624,6 +626,7 @@ if [ "$check_restart" -eq 1 ]; then
         sigv="${OLDSIGN["$sigkey"]}"
         OLDSIGN["$sigkey"]=$((sigv + 1))
       fi
+      OLDPAIRS+=("${cpid}:${cstart}")
       sig_same_proc KILL "$cpid" "$cstart" "$cppid"
     done
   done
@@ -631,6 +634,11 @@ if [ "$check_restart" -eq 1 ]; then
     local j c n=0 fresh sg sigv
     local -A freshn
     scan
+    # kill した旧プロセス（pid・起動時刻の組）がすべて消滅するまで、新しい子を再起動と認定しない。
+    # SIGKILL の失敗（権限・競合）で旧プロセスが残ったまま同一コマンドの子が増えても pass にしない。
+    for c in ${OLDPAIRS[@]+"${OLDPAIRS[@]}"}; do
+      ! snap_alive "${c%%:*}" "${c#*:}" || return 1
+    done
     for j in $(seq 1 "$count"); do
       [ "$j" -ne "$target_index" ] || continue
       [ "${OLDN[$j]}" -ge 1 ] || return 1
@@ -663,9 +671,9 @@ if [ "$check_restart" -eq 1 ]; then
     restart_check="fail"
     restart_confirmed=0
     bad_detail+="restart-unverifiable "
-  elif wait_until "$timeout_s" restarted_all; then
+  elif wait_tracked "$timeout_s" restarted_all; then
     # 再起動後の稼働継続: settle 後に N-1 個の監視プロセスと新しいコンテナ側プロセスを同一性つきで再照合する。
-    sleep "$settle"
+    settle_tracked
     scan
     restart_sup_alive=0
     restart_ok=1

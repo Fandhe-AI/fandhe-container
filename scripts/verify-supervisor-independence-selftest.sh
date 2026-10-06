@@ -57,8 +57,10 @@ start_container() {
     bash -c 'exec 8<>"$2"; while :; do if read -r p <"$1" 2>/dev/null; then kill -0 "$p" 2>/dev/null || break; fi; read -t 0.2 -u 8 || true; done' _ "$watch" "$STUB_DIR/$id.fifo" &
   elif [ "$STUB_MODE" = many_kids ]; then
     local k
-    # 2 階層（bash → sleep）で 512 件を超える木を作る。1 階層目だけで上限に達し、2 階層目に子孫が残る。
-    for k in $(seq 1 520); do bash -c 'sleep 300; :' & done
+    # 走査上限 512 件を超える木を 1 番目の launcher だけで作る（全体で約 520 プロセス。OOM・flake を避ける）。
+    if [ "$n" = 1 ]; then
+      for k in $(seq 1 520); do sleep 300 & done
+    fi
     sleep 300 &
   elif [ "$STUB_MODE" = scrub_env ]; then
     # 環境変数を継承しないコンテナ側プロセス（実機の実装を模す）。
@@ -89,9 +91,13 @@ while :; do
     fi
     continue
   fi
-  if [ "$STUB_MODE" = restart_short ]; then
-    sleep 0.5 &
+  if [ "$STUB_MODE" = restart_short ] && [ -z "${short_done:-}" ]; then
+    # 旧コンテナと同じコマンド（sleep 300）で再起動し、約 1 秒後に終了させる（settle 内の liveness 再照合へ到達させる）。
+    short_done=1
+    sleep 300 &
     c=$!
+    read -t 1 -u 9 || true
+    kill "$c" 2>/dev/null
     continue
   fi
   if [ "$STUB_MODE" = restart_alias ] && [ -z "${aux_done:-}" ]; then
@@ -235,7 +241,7 @@ expect_eq "restart_alias: exit code" 1 "$RC"
 expect_eq "restart_alias: restart_check" fail "$(json_get restart_check "$OUT")"
 
 # 8f. 子孫が走査上限（512 件）を超えると判定不成立・追跡不能（4）。pass にならない。
-run_case many_kids --count 2 --target-index 2 --timeout 10
+run_case many_kids --count 2 --target-index 1 --timeout 10
 expect_eq "many_kids: exit code" 4 "$RC"
 expect_eq "many_kids: no result" "" "$(json_get result "$OUT")"
 

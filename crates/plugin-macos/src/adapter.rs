@@ -50,7 +50,7 @@
 //!   `guest_mount.timeout` になる。MAC-1）。rootfs ブロックデバイス・コンソールログ・CPU / メモリ指定も含まない。
 //! - 起動失敗後の `start` 再試行は拒否する（失敗した VM の停止は非同期で完了を確認できず、VM が重複し得るため。
 //!   `stop` も拒否し、同じ ID の再作成を許さない。登録は plugin プロセス終了まで残る）。同時実行 VM 数は
-//!   [`SHUTDOWN_BUDGET`] 内に逐次停止できる数から 1 台分の処理余裕を引いた数（停止待ち 2 秒なら 1）に制限する。停止できず残った VM の回収は `Vm` の drop 停止要求（非同期）と
+//!   [`SHUTDOWN_BUDGET`] 内に逐次停止できる数から 1 台分の処理余裕を引いた数（停止待ち 2 秒なら 1）に制限する。停止できず残った VM（起動失敗後に停止を確認できない VM を含む）は `stop_all` の `remaining` として報告し、回収は `Vm` の drop 停止要求（非同期）と
 //!   core の終了処理に委ね、完了は保証しない。
 //! - 1 コンテナ = 1 VM（常駐 VM 共用の MAC-4 は未決）。状態はプロセス内メモリのみ（都度起動モードでは引き継げない）。
 //! - VM 操作の期限は core 側 RPC・都度起動の合計期限（10 秒）と終了猶予（5 秒）に収まる固定値
@@ -211,14 +211,52 @@ struct Entry<H> {
 pub struct StopAllSummary {
     /// 停止に成功した実行中 VM の数。
     pub stopped: usize,
-    /// 停止に失敗して残った実行中 VM の数。
+    /// 停止に失敗して残った実行中 VM と、起動失敗後に停止を確認できない VM の数。
     pub remaining: usize,
 }
+
+/// 1 回の操作の計測結果（REPAIR-4）。入力値（id・パス・cmdline）は含めず、固定の列挙名と数値のみ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpEvent {
+    /// 操作名（`create` / `start` / `stop` のいずれか。それ以外の操作は計測しない）。
+    pub op: &'static str,
+    /// 失敗時のエラーコード名（成功は `None`）。
+    pub error_code: Option<&'static str>,
+    /// この操作の所要時間（マイクロ秒）。
+    pub latency_us: u64,
+    /// この操作種別の累計成功数。
+    pub ok_total: u64,
+    /// この操作種別の累計失敗数。
+    pub err_total: u64,
+}
+
+impl OpEvent {
+    /// 構造化ログ 1 行分の JSON（固定の識別子と数値のみで、エスケープ不要）。
+    pub fn to_json_line(&self) -> String {
+        let result = if self.error_code.is_some() {
+            "err"
+        } else {
+            "ok"
+        };
+        let code = self
+            .error_code
+            .map_or_else(String::new, |c| format!(",\"code\":\"{c}\""));
+        format!(
+            "{{\"event\":\"plugin.op\",\"op\":\"{}\",\"result\":\"{result}\"{code},\"latency_us\":{},\"ok_total\":{},\"err_total\":{}}}",
+            self.op, self.latency_us, self.ok_total, self.err_total
+        )
+    }
+}
+
+/// 操作種別ごとの累計 [成功, 失敗]（create / start / stop の順）。
+type OpCounts = [[u64; 2]; 3];
 
 /// create / start / stop を [`MacosBackend`] へ委譲する要求ハンドラ。
 pub struct MacosRuntimeAdapter<B: MacosBackend> {
     backend: B,
     entries: BTreeMap<String, Entry<B::Handle>>,
+    counts: OpCounts,
+    sink: Box<dyn FnMut(&OpEvent)>,
 }
 
 impl<B: MacosBackend> MacosRuntimeAdapter<B> {
@@ -227,7 +265,16 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
         Self {
             backend,
             entries: BTreeMap::new(),
+            counts: [[0; 2]; 3],
+            sink: Box::new(|_| {}),
         }
+    }
+
+    /// 操作ごとの計測イベントの出力先を設定する（既定は捨てる。`main.rs` が stderr の JSON 行へ出す。REPAIR-4）。
+    #[must_use]
+    pub fn with_op_sink(mut self, sink: impl FnMut(&OpEvent) + 'static) -> Self {
+        self.sink = Box::new(sink);
+        self
     }
 
     /// [`SHUTDOWN_BUDGET`] 内で [`Self::stop_all_within`] を行う。
@@ -242,7 +289,8 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
     /// 残り予算が 1 回の停止待ち（[`MacosBackend::stop_timeout`]）に満たなければ以降の VM は試さず
     /// `remaining` に数える（core の終了猶予を超えて plugin が強制終了されるのを避ける。REPAIR-5）。
     /// 同時に実行できる VM 数は [`Self::max_running`] で予算内に全件停止できる数へ抑えているため、
-    /// 通常は `remaining` が 0 になる。停止できず残った VM は登録簿に残り、呼び出し側（`main.rs`）が
+    /// 通常は `remaining` が 0 になる。起動に失敗して停止を確認できない VM（`LaunchFailed`）も `remaining` に数える。
+    /// 停止できず残った VM は登録簿に残り、呼び出し側（`main.rs`）が
     /// `plugin.cleanup` の `remaining` と終了コードで報告する。以降の回収は `Vm` の drop による停止要求
     /// （非同期・有界回数）と core 側の終了処理に委ねる（完了は保証しない。REPAIR-3）。
     pub fn stop_all_within(&mut self, budget: Duration) -> StopAllSummary {
@@ -254,7 +302,13 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
         };
         let backend = &self.backend;
         self.entries.retain(|_, entry| match &entry.state {
-            State::Created | State::LaunchFailed => false,
+            State::Created => false,
+            // 起動に失敗した VM は drop による非同期の停止要求しか出せず、停止を確認できない。
+            // 登録を残して remaining に数え、呼び出し側が成功終了を避けられるようにする（REPAIR-3）。
+            State::LaunchFailed => {
+                summary.remaining += 1;
+                true
+            }
             State::Running(h) => {
                 let affordable = deadline
                     .checked_duration_since(Instant::now())
@@ -410,15 +464,38 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
 
 impl<B: MacosBackend> RequestHandler for MacosRuntimeAdapter<B> {
     fn handle(&mut self, body: &[String]) -> Result<Vec<String>, PluginError> {
-        match body.first().map(String::as_str) {
-            Some("create") => self.create(body),
-            Some("start") => self.start(body),
-            Some("stop") => self.stop(body),
-            _ => Err(PluginError::new(
-                PluginErrorCode::Unimplemented,
-                MSG_UNIMPLEMENTED,
-            )),
+        let (idx, op) = match body.first().map(String::as_str) {
+            Some("create") => (0, "create"),
+            Some("start") => (1, "start"),
+            Some("stop") => (2, "stop"),
+            _ => {
+                return Err(PluginError::new(
+                    PluginErrorCode::Unimplemented,
+                    MSG_UNIMPLEMENTED,
+                ));
+            }
+        };
+        let started = Instant::now();
+        let result = match idx {
+            0 => self.create(body),
+            1 => self.start(body),
+            _ => self.stop(body),
+        };
+        let latency_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let slot = usize::from(result.is_err());
+        if let Some(c) = self.counts.get_mut(idx).and_then(|c| c.get_mut(slot)) {
+            *c = c.saturating_add(1);
         }
+        let [ok_total, err_total] = self.counts.get(idx).copied().unwrap_or([0; 2]);
+        let event = OpEvent {
+            op,
+            error_code: result.as_ref().err().map(|e| e.code().as_str()),
+            latency_us,
+            ok_total,
+            err_total,
+        };
+        (self.sink)(&event);
+        result
     }
 }
 
@@ -778,6 +855,59 @@ mod tests {
         let (c, _) = err_of(a.handle(&s(&["create", "a", &k, "", ""])));
         assert_eq!(c, PluginErrorCode::AlreadyExists);
         assert!(f.0.borrow().stopped.is_empty());
+    }
+
+    /// TASK-115.3・REPAIR-3: 起動失敗後の停止未確認 VM は stop_all で remaining に数え、登録を残す。
+    #[test]
+    fn task115_3_repair3_launch_failed_counts_as_remaining() {
+        let dir = tmp_dir("launchfail-remaining");
+        let k = kernel(&dir);
+        let (mut a, f) = adapter();
+        create_ok(&mut a, "a", &k);
+        f.0.borrow_mut().fail_launch = true;
+        err_of(a.handle(&s(&["start", "a"])));
+        assert_eq!(
+            a.stop_all(),
+            StopAllSummary {
+                stopped: 0,
+                remaining: 1
+            }
+        );
+        // 登録は残るため再度数える。
+        assert_eq!(a.stop_all().remaining, 1);
+    }
+
+    /// TASK-115.3・REPAIR-4: 操作ごとに成功・失敗の累計とレイテンシを入力値抜きで出力する。
+    #[test]
+    fn task115_3_repair4_op_events_count_without_inputs() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let dir = tmp_dir("opevents");
+        let k = kernel(&dir);
+        let events: Rc<RefCell<Vec<OpEvent>>> = Rc::default();
+        let sink = Rc::clone(&events);
+        let (a, _f) = adapter();
+        let mut a = a.with_op_sink(move |e| sink.borrow_mut().push(e.clone()));
+        create_ok(&mut a, "SECRETID", &k);
+        a.handle(&s(&["start", "SECRETID"])).expect("start");
+        err_of(a.handle(&s(&["start", "SECRETID"])));
+        a.handle(&s(&["stop", "SECRETID"])).expect("stop");
+        let ev = events.borrow();
+        let ops: Vec<_> = ev.iter().map(|e| (e.op, e.error_code)).collect();
+        assert_eq!(
+            ops,
+            vec![
+                ("create", None),
+                ("start", None),
+                ("start", Some("FAILED_PRECONDITION")),
+                ("stop", None),
+            ]
+        );
+        assert_eq!((ev[2].ok_total, ev[2].err_total), (1, 1));
+        let line = ev[2].to_json_line();
+        assert!(line.starts_with("{\"event\":\"plugin.op\",\"op\":\"start\",\"result\":\"err\""));
+        assert!(line.contains("\"code\":\"FAILED_PRECONDITION\""), "{line}");
+        assert!(!line.contains("SECRETID"));
     }
 
     /// TASK-115.3・REPAIR-5: 同時実行 VM 数は終了予算内に全件停止できる数に制限され、全件停止できる。

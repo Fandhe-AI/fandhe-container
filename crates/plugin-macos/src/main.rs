@@ -17,6 +17,8 @@
 //! peer 認証の拒否イベント行は socket パスを含むため転記しない（永続的な監査ログへの配線は
 //! core 側 TASK-114 で未実装。REPAIR-3・SEC-4）。
 //! 要求は `adapter::MacosRuntimeAdapter`（TASK-115.3・#387）が処理し、終了時に実行中 VM を `stop_all`（総予算 `SHUTDOWN_BUDGET` 4 秒。core の 5 秒の終了猶予内に収める。REPAIR-5）で停止する。
+//! create / start / stop は 1 操作ごとに成功・失敗の累計とレイテンシを入力値抜きの 1 行 JSON（`plugin.op`。REPAIR-4）で stderr へ出す。
+//! 起動に失敗して停止を確認できない VM も `remaining` に数え、終了コード 5 で成功終了を避ける（REPAIR-3）。
 //! 停止結果は stderr へ件数のみの 1 行 JSON（`plugin.cleanup`）で出す。
 
 use std::process::ExitCode;
@@ -69,7 +71,8 @@ fn main() -> ExitCode {
             return ExitCode::from(EXIT_CONNECT_FAILED);
         }
     };
-    let mut adapter = MacosRuntimeAdapter::new(PlatformBackend);
+    let mut adapter = MacosRuntimeAdapter::new(PlatformBackend)
+        .with_op_sink(|ev| eprintln!("{}", ev.to_json_line()));
     let outcome = serve(&mut stream, &mut adapter);
     // Vm の Drop は停止を待たないため、正常切断・異常終了のどちらでも期限つきで明示停止する。
     let summary = adapter.stop_all();

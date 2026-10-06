@@ -326,11 +326,15 @@ fn task115_3_plug1_adapter_rejects_invalid_create_with_fixed_messages() {
     expect_unimplemented(h.call(3, &["kill", "a"]), 3);
     let (code, err) = h.finish();
     assert_eq!(code, 0, "{err}");
-    assert_eq!(err, "");
+    // 計測は create の 2 回分のみ（未実装操作は対象外）。入力値は含まれない（REPAIR-4）。
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(lines.len(), 2, "{err}");
+    assert!(lines.iter().all(|l| l.starts_with("{\"event\":\"plugin.op\",\"op\":\"create\",\"result\":\"err\"")), "{err}");
+    assert!(!err.contains("SECRET"), "{err}");
 }
 
 /// create 成功後の start は、非 macOS では UNIMPLEMENTED、macOS では entitlement なしの VZ 失敗（Error）になる。
-/// いずれも接続は継続し、後続要求に応答して終了コード 0 で終わる。
+/// いずれも接続は継続し、後続要求に応答する。起動失敗 VM は停止未確認として終了コード 5 で終わる。
 #[test]
 fn task115_3_mac1_start_returns_error_frame_and_keeps_connection() {
     let mut h = Harness::start();
@@ -359,5 +363,11 @@ fn task115_3_mac1_start_returns_error_frame_and_keeps_connection() {
     }
     expect_unimplemented(h.call(3, &["delete", "a"]), 3);
     let (code, err) = h.finish();
-    assert_eq!(code, 0, "{err}");
+    // 起動に失敗した VM は停止を確認できないため、成功終了にせず終了コード 5 で報告する（REPAIR-3）。
+    assert_eq!(code, 5, "{err}");
+    assert!(
+        err.contains("\"event\":\"plugin.cleanup\",\"stopped\":0,\"remaining\":1"),
+        "{err}"
+    );
+    assert!(err.contains("\"op\":\"start\",\"result\":\"err\""), "{err}");
 }

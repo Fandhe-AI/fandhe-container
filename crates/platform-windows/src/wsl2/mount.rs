@@ -1486,7 +1486,29 @@ fn prepare_with_exec(
     virtiofs: VirtiofsState,
     req: &LaunchRequest,
     exec: Exec<'_>,
+    recovery: Option<Exec<'_>>,
+) -> Result<PreparedLaunch, MountError> {
+    prepare_with_exec_cancel(status, virtiofs, req, exec, recovery, &|| false)
+}
+
+/// 停止要求により起動を打ち切ったときの失敗（WIN-2。呼び出し側の SIGTERM 等。TASK-116.5）。
+fn cancelled() -> Wsl2Error {
+    precondition("the launch was cancelled by a shutdown request")
+}
+
+/// [`prepare_with_exec`] に打ち切り判定 `cancel` を加えたもの。
+///
+/// `cancel` は実行中の `wsl.exe` を中断せず、安全な境界（mountinfo の読み取り前・各マウントの着手前・
+/// fstype 確認前）でだけ確認する。打ち切った場合は、それまでに所有したマウントを通常の失敗と同じ経路で
+/// 巻き戻し、解除できなかったものは `unreleased` に載せる（呼び出し側が停止時の解除へ進めるようにする。
+/// WIN-2・REPAIR-5）。
+fn prepare_with_exec_cancel(
+    status: &Wsl2Status,
+    virtiofs: VirtiofsState,
+    req: &LaunchRequest,
+    exec: Exec<'_>,
     mut recovery: Option<Exec<'_>>,
+    cancel: &dyn Fn() -> bool,
 ) -> Result<PreparedLaunch, MountError> {
     preflight(status, virtiofs, req)?;
     let distro = &req.distro;
@@ -1503,6 +1525,9 @@ fn prepare_with_exec(
     // （mount_one / MOUNT_SCRIPT。検証と mount を別呼び出しにすると差し替え競合が起きる）。
     // 自分が作っていないマウントは外さないため、既存のマウントがあれば何もせず拒否する
     // （mountinfo は論理パスで照合する。symlink を含むパスは MOUNT_SCRIPT が mount 前に拒否する）。
+    if cancel() {
+        return Err(cancelled().into());
+    }
     let before = read_mountinfo(distro, &mut *exec)?;
     for m in &req.mounts {
         let target = m.guest_path();
@@ -1513,6 +1538,15 @@ fn prepare_with_exec(
     let before_ids: Vec<u32> = before.iter().map(|e| e.mount_id).collect();
     let mut owned: Vec<OwnedMount> = Vec::new();
     for m in &req.mounts {
+        if cancel() {
+            let failed = rollback(distro, &owned, pick_recovery(&mut recovery, &mut *exec));
+            return Err(MountError::with_unreleased(
+                cancelled(),
+                distro,
+                &failed,
+                None,
+            ));
+        }
         if let Err(e) = mount_one(
             distro,
             m,
@@ -1524,6 +1558,15 @@ fn prepare_with_exec(
             let failed = rollback(distro, &owned, pick_recovery(&mut recovery, &mut *exec));
             return Err(MountError::with_unreleased(e, distro, &failed, None));
         }
+    }
+    if cancel() {
+        let failed = rollback(distro, &owned, pick_recovery(&mut recovery, &mut *exec));
+        return Err(MountError::with_unreleased(
+            cancelled(),
+            distro,
+            &failed,
+            None,
+        ));
     }
     let (transport, warning) = match verify_shared(req, virtiofs, &owned, &mut *exec) {
         Ok(decided) => decided,
@@ -1825,10 +1868,33 @@ pub fn launch_with_recorder<T>(
     recorder: &dyn WinOpRecorder,
     start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
 ) -> Result<Launched<T>, MountError> {
+    launch_cancellable_with_recorder(req, timeout, recorder, &|| false, start)
+}
+
+/// [`launch_with_recorder`] に打ち切り判定 `cancel` を加えたもの（TASK-116.5・WIN-2・REPAIR-5）。
+///
+/// `cancel` が `true` を返すと、検出前・各マウントの着手前・fstype 確認前・`start` 呼び出し前の
+/// 安全な境界で起動を打ち切り、所有済みのマウントを巻き戻す（解除できなければ [`MountError::unreleased`]）。
+/// 実行中の `wsl.exe` 呼び出しは中断しない。SIGTERM を受けた plugin が、終了猶予内に解除へ進むために使う。
+pub fn launch_cancellable_with_recorder<T>(
+    req: &LaunchRequest,
+    timeout: Duration,
+    recorder: &dyn WinOpRecorder,
+    cancel: &dyn Fn() -> bool,
+    start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
+) -> Result<Launched<T>, MountError> {
     let timer = WinOpTimer::start(recorder, WinOpKind::Wsl2MountShared);
     // 環境の解決に失敗した場合は timer の Drop が Failure を記録する。
     let (program, state) = resolve_environment(timeout)?;
-    launch_with_program_timed(&program, state, req, timeout, recorder, timer, start)
+    launch_with_program_timed(
+        (&program, state),
+        req,
+        timeout,
+        recorder,
+        timer,
+        cancel,
+        start,
+    )
 }
 
 /// `program` を `wsl.exe` として使い、`.wslconfig` の状態を `virtiofs` で与える [`launch_with`]
@@ -1843,16 +1909,24 @@ pub(super) fn launch_with_program<T>(
 ) -> Result<Launched<T>, MountError> {
     let recorder = &NoopWinOpRecorder;
     let timer = WinOpTimer::start(recorder, WinOpKind::Wsl2MountShared);
-    launch_with_program_timed(program, virtiofs, req, timeout, recorder, timer, start)
+    launch_with_program_timed(
+        (program, virtiofs),
+        req,
+        timeout,
+        recorder,
+        timer,
+        &|| false,
+        start,
+    )
 }
 
 fn launch_with_program_timed<'r, T>(
-    program: &Path,
-    virtiofs: VirtiofsState,
+    (program, virtiofs): (&Path, VirtiofsState),
     req: &LaunchRequest,
     timeout: Duration,
     recorder: &'r dyn WinOpRecorder,
     timer: WinOpTimer<'r>,
+    cancel: &dyn Fn() -> bool,
     start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
 ) -> Result<Launched<T>, MountError> {
     // 検出と準備は 1 つの合計期限 `timeout` を共有する（検出が長引けば準備は残り時間だけで行い、
@@ -1866,10 +1940,26 @@ fn launch_with_program_timed<'r, T>(
     let mut rollback_exec = program_exec_lazy(program, timeout);
     let prepared = (|| -> Result<PreparedLaunch, MountError> {
         check_timeout(timeout)?;
+        if cancel() {
+            return Err(cancelled().into());
+        }
         let status = detect_with_program(program, remaining_until(deadline)?)?;
-        prepare_with_exec(&status, virtiofs, req, &mut exec, Some(&mut rollback_exec))
+        prepare_with_exec_cancel(
+            &status,
+            virtiofs,
+            req,
+            &mut exec,
+            Some(&mut rollback_exec),
+            cancel,
+        )
     })();
-    finish_launch(prepared, timer, &mut rollback_exec, recorder, start)
+    // 準備後・ゲスト起動前の境界でも打ち切る（起動失敗と同じ経路で準備済みマウントを巻き戻す）。
+    finish_launch(prepared, timer, &mut rollback_exec, recorder, |p| {
+        if cancel() {
+            return Err(cancelled());
+        }
+        start(p)
+    })
 }
 
 #[cfg(test)]
@@ -2718,6 +2808,39 @@ mod tests {
         v: VirtiofsState,
     ) -> Result<PreparedLaunch, MountError> {
         prepare_with_exec(&ok_status(), v, r, &mut |a, m| g.run(a, m), None)
+    }
+
+    /// TASK-116.5・WIN-2・REPAIR-5: 打ち切り判定が 2 件目のマウント着手前に真になると、成立済みの 1 件目だけを
+    /// 巻き戻して失敗を返し、2 件目には着手しない（所有情報・記録は残らない）。
+    #[test]
+    fn prepare_cancel_between_mounts_rolls_back_owned_only() {
+        let mut g = Guest::new("virtiofs");
+        let r = req(vec![sm("C:\\a", "a", false), sm("C:\\b", "b", false)]);
+        let calls = std::cell::Cell::new(0u32);
+        // 1 回目: mountinfo 前、2 回目: a の着手前、3 回目: b の着手前。
+        let cancel = || {
+            calls.set(calls.get() + 1);
+            calls.get() >= 3
+        };
+        let e = prepare_with_exec_cancel(
+            &ok_status(),
+            VirtiofsState::Enabled,
+            &r,
+            &mut |a, m| g.run(a, m),
+            None,
+            &cancel,
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "the launch was cancelled by a shutdown request"
+        );
+        assert!(e.unreleased().is_none());
+        assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
+        // Guest の初期マウント 1 件だけが残る（a は外れ、b には着手していない）。
+        assert_eq!(g.mounts.len(), 1);
+        assert!(g.records.is_empty() && g.claims.is_empty());
     }
 
     /// WIN-2: virtiofs で成立した場合のみ PreparedLaunch が返る。

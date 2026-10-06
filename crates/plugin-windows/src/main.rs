@@ -9,11 +9,15 @@
 //! serve 終了後（正常切断・異常終了とも）に `release_all` で保持中の共有マウントを解除し、件数を出す（WIN-2）。
 //! 実行場所は Windows ホスト（`wsl.exe` を起動できる側）の前提。非 Windows では create が `UNIMPLEMENTED`。
 //!
-//! 終了コード: 0 = 相手の正常切断でループ終了、2 = 起動設定の解決失敗、3 = 接続失敗、
+//! 終了コード: 0 = 相手の正常切断または SIGTERM でループ終了、1 = SIGTERM ハンドラの登録失敗（TASK-116.5・#396）、2 = 起動設定の解決失敗、3 = 接続失敗、
 //! 4 = フレームループの異常終了（転送エラー・プロトコル違反）、5 = 共有マウントの解除失敗が残った
 //! （serve の結果に関わらず優先。`plugin.cleanup` は `remaining` の件数のみを出す）。終了後に残った
 //! マウントを本 plugin から回収する手段は未実装で、対象の特定に必要な情報も出力しない（プロセスを
 //! またぐ回収は #1412。理由は `adapter` のモジュール doc「未実装範囲」を参照。WIN-2・REPAIR-3）。
+//! SIGTERM（#396）: 次の受信境界（検知遅れは最大 `IDLE_POLL` 1 秒）でループを抜け、`plugin.shutdown` を出して
+//! 上記の `release_all`（最大 `RELEASE_ALL_BUDGET` 4 秒）で共有マウントを解除してから終了する。要求処理中に届いた場合は、各段の境界（次の WSL2 操作の着手前）で要求を打ち切って解除へ進む（実行中の 1 段は中断できず、その持ち分までは待つ）。SIGKILL・猶予超過では
+//! マウントが残り得る（回収は #1412）。SIGINT / SIGHUP・Windows ホスト上の終了要求は対象外（未実装。REPAIR-3）。
+//! ヘルスチェック（`ping`）は adapter が即応答する。
 //! 接続経路は peer 認証つき `UdsStream::connect` のみ（TASK-116.4・#395・PLUG-12）。別 UID の listener は
 //! `PERMISSION_DENIED`・終了コード 3 で fail-closed し、`peer_auth_rejections` に件数のみ出す。
 //! 出力は固定文言と列挙名のみで、socket パス・引数値・環境変数値・受信データを含めない。
@@ -24,9 +28,11 @@ use std::time::Duration;
 
 use fandhe_container_plugin::{JsonLinesPeerAuthObserver, PluginError, UdsStream};
 use fandhe_container_plugin_windows::adapter::{
-    PlatformBackend, UnimplementedGuestStart, WindowsRuntimeAdapter, stderr_line,
+    PlatformBackend, SessionOutcome, UnimplementedGuestStart, WindowsRuntimeAdapter, serve_session,
+    stderr_line,
 };
-use fandhe_container_plugin_windows::frame_loop::serve;
+use fandhe_container_plugin_windows::frame_loop::LoopExit;
+use fandhe_container_plugin_windows::sys::install_sigterm_flag;
 use fandhe_container_plugin_windows::{PLUGIN_SOCKET_ENV, default_socket_path, resolve_startup};
 
 /// 接続期限（core の常駐起動期限 10 秒より短くする。REPAIR-5）。
@@ -55,6 +61,14 @@ fn main() -> ExitCode {
         }
     };
     let source = cfg.socket_source().as_str();
+    // 接続前に登録して取りこぼしを避ける。解除できない状態では動かさない（fail-closed）。
+    let stop = match install_sigterm_flag() {
+        Ok(flag) => flag,
+        Err(e) => {
+            report("plugin.signal", Some(source), &e, "");
+            return ExitCode::from(1);
+        }
+    };
     let mut observer = JsonLinesPeerAuthObserver::new();
     let mut stream = match UdsStream::connect(cfg.socket_path(), CONNECT_TIMEOUT, &mut observer) {
         Ok(s) => s,
@@ -66,15 +80,11 @@ fn main() -> ExitCode {
         }
     };
     let mut adapter = WindowsRuntimeAdapter::new(PlatformBackend, UnimplementedGuestStart);
-    let result = serve(&mut stream, &mut adapter);
-    // EOF・異常終了のどちらでも、保持中の共有マウントの解除を試みる（WIN-2）。
-    let cleanup = adapter.release_all();
-    if cleanup.released + cleanup.remaining > 0 {
-        stderr_line(&format!(
-            "{{\"event\":\"plugin.cleanup\",\"released\":{},\"remaining\":{}}}",
-            cleanup.released, cleanup.remaining
-        ));
-    }
+    // 切断・SIGTERM・異常終了のどれでも、保持中の共有マウントの解除を試みる（WIN-2）。
+    // shutdown / cleanup の固定行（socket パス・引数・受信データを含めない）は serve_session が出す。
+    let SessionOutcome {
+        result, cleanup, ..
+    } = serve_session(&mut stream, &mut adapter, stop);
     if let Err(e) = &result {
         report("plugin.frame_loop", Some(source), e, "");
     }
@@ -85,7 +95,8 @@ fn main() -> ExitCode {
         return ExitCode::from(5);
     }
     match result {
-        Ok(_) => ExitCode::SUCCESS,
-        Err(_) => ExitCode::from(4),
+        Ok(LoopExit::PeerClosed | LoopExit::ShutdownRequested) => ExitCode::SUCCESS,
+        // 将来追加される終了要因（non_exhaustive）を成功扱いにしない。
+        Ok(_) | Err(_) => ExitCode::from(4),
     }
 }

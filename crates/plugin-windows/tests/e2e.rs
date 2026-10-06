@@ -548,13 +548,15 @@ mod real_wsl2 {
                     ));
                 }
                 let script = format!("test -f '{}/marker.txt'", m.guest_path);
-                if !guest_sh_ok(&self.distro, &script, self.timeout.min(left)) {
-                    if began.elapsed() >= remaining {
-                        return Err(WinError::new(
-                            WinErrorCode::Timeout,
-                            "guest marker check exceeded the launch deadline",
-                        ));
-                    }
+                let visible = guest_sh_ok(&self.distro, &script, self.timeout.min(left));
+                // 最後の確認が期限超過後に成功した場合も Timeout にする（REPAIR-5）。
+                if began.elapsed() >= remaining {
+                    return Err(WinError::new(
+                        WinErrorCode::Timeout,
+                        "guest marker check exceeded the launch deadline",
+                    ));
+                }
+                if !visible {
                     return Err(WinError::new(
                         WinErrorCode::FailedPrecondition,
                         "marker file is not visible from the guest",

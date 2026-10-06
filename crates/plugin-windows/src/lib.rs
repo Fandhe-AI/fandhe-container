@@ -79,10 +79,15 @@ fn invalid(msg: &str) -> PluginError {
     PluginError::new(PluginErrorCode::InvalidArgument, msg)
 }
 
-/// 外部入力のパスを検証する（絶対パス・`..` なし・空でない）。メッセージに入力値を含めない。
+/// 外部入力のパスを検証する（絶対パス・`..` なし・NUL なし・空でない）。メッセージに入力値を含めない。
 fn validate_path(value: &OsStr) -> Result<PathBuf, PluginError> {
     if value.is_empty() {
         return Err(invalid("socket path is empty"));
+    }
+    // NUL を含むパスは UDS の sockaddr_un.sun_path として有効なパスにならない（切り詰め・bind 失敗の原因）。
+    // NUL は有効な UTF-8 のため lossy 変換でも保持され、unix / 非 unix の双方で判定できる。
+    if value.to_string_lossy().contains('\0') {
+        return Err(invalid("socket path must not contain NUL"));
     }
     let path = PathBuf::from(value);
     if !path.is_absolute() {
@@ -99,7 +104,7 @@ fn validate_path(value: &OsStr) -> Result<PathBuf, PluginError> {
 /// 優先順位は `--socket` ＞ 環境変数 ＞ 既定。`default_path` は引数・環境変数が無い場合に限り
 /// 遅延して呼ぶ（`RuntimeDir::from_env` がディレクトリ作成・残骸掃除の副作用を持つため）。
 /// argv / env は untrusted: 件数・合計バイト数の上限（親の spawn 経路と同値）、未知引数・重複・
-/// 値欠落・相対パス・`..` を `InvalidArgument` で拒否する。空の環境変数は未設定扱い。
+/// 値欠落・相対パス・`..`・NUL を `InvalidArgument` で拒否する。空の環境変数は未設定扱い。
 pub fn resolve_startup<I, F>(
     args: I,
     env_socket: Option<OsString>,
@@ -228,6 +233,31 @@ mod tests {
         let c = resolve_startup([os("--socket"), os(other)], Some(os(ABS)), no_default).unwrap();
         assert_eq!(c.socket_path(), Path::new(other));
         assert_eq!(c.socket_source(), SocketSource::Arg);
+    }
+
+    #[test]
+    fn plug1_rejects_nul_in_arg_and_env() {
+        let nul = format!("{ABS}\0x");
+        assert_eq!(
+            code(resolve_startup(
+                [os("--socket"), os(&nul)],
+                None,
+                no_default
+            )),
+            PluginErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            code(resolve_startup(
+                [os(&format!("--socket={nul}"))],
+                None,
+                no_default
+            )),
+            PluginErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            code(resolve_startup([], Some(os(&nul)), no_default)),
+            PluginErrorCode::InvalidArgument
+        );
     }
 
     #[test]

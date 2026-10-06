@@ -9,6 +9,8 @@
 //! 変換先の [`Rlimits`] は `fandhe_container_core::exec::StagePipeline::with_rlimits`（fork 後・capability
 //! 削減の前に `prlimit(2)` で適用。Linux 限定）が消費する。
 //!
+//! `--ipc`（`host` / `shareable`）は [`ipc`] サブモジュールの [`IpcMode`] で保持する（#528・TASK-169.3）。
+//!
 //! # 未結線の箇所（REPAIR-3）
 //!
 //! 本番の `ProcessLauncher` が未提供のため、現時点で [`ContainerOptions`] の消費者は無い
@@ -18,6 +20,10 @@
 //!
 //! `--ulimit` 文字列は外部入力として、長さ上限・形式・数値・種別名を検証してから型へ写す。
 //! エラーメッセージは固定の英語文言で、入力値は含めない。
+
+pub mod ipc;
+
+pub use ipc::IpcMode;
 
 use fandhe_container_core::rlimits::{RLIMIT_INFINITY, Rlimit, RlimitKind, Rlimits};
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
@@ -63,11 +69,12 @@ impl Ulimit {
     }
 }
 
-/// コンテナ起動オプション（現状は ulimit のみ。後続 issue が拡張する）。
+/// コンテナ起動オプション（現状は ulimit と `--ipc`。後続 issue が拡張する）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ContainerOptions {
     rlimits: Rlimits,
+    ipc: IpcMode,
 }
 
 impl ContainerOptions {
@@ -80,6 +87,17 @@ impl ContainerOptions {
     pub fn with_ulimits(mut self, ulimits: Vec<Ulimit>) -> Result<Self, TraitError> {
         self.rlimits = Rlimits::new(ulimits.into_iter().map(|u| u.rlimit()).collect())?;
         Ok(self)
+    }
+
+    /// `--ipc` の指定を設定する（SUP-12・TASK-169.3。未指定は `Private`）。
+    pub fn with_ipc_mode(mut self, mode: IpcMode) -> Self {
+        self.ipc = mode;
+        self
+    }
+
+    /// `--ipc` の指定。Linux では `IpcMode::apply_to` で分離する namespace 集合へ反映する。
+    pub fn ipc_mode(&self) -> IpcMode {
+        self.ipc
     }
 
     /// core の `StagePipeline::with_rlimits` へ渡す集合。
@@ -218,6 +236,13 @@ mod tests {
             [(RlimitKind::Nofile, 1024, 2048), (RlimitKind::Core, 0, 0)]
         );
         assert!(ContainerOptions::new().rlimits().is_empty());
+        assert_eq!(ContainerOptions::new().ipc_mode(), IpcMode::Private);
+        assert_eq!(
+            ContainerOptions::new()
+                .with_ipc_mode(IpcMode::Host)
+                .ipc_mode(),
+            IpcMode::Host
+        );
         let e = ContainerOptions::new()
             .with_ulimits(vec![
                 Ulimit::parse("nofile=1").unwrap(),

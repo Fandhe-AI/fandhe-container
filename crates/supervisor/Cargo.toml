@@ -6,6 +6,7 @@
 # crate-naming.md 決定 6）を導入した。状態のファイルベース実装は core に一本化し、supervisor は配線のみを持つ。
 # TASK-157.7（#241）で logs 捕捉の土台（src/logs.rs）を追加した（std のみ。依存は不変）。
 # TASK-169.1（#526）で container_options（ulimit の指定モデル。core の rlimits 型へ変換）を追加した（依存は不変）。
+# TASK-169.3（#528）で --ipc の指定モデルと実機前提の結合試験 container_options_ipc を追加した（依存は不変）。
 # 外部クレート（crates.io）の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 
 [package]
@@ -14,6 +15,14 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+
+# --ipc=host / shareable の IPC namespace 共有・分離の結合試験（SUP-12・TASK-169.3）。
+# CLONE_NEWUSER はマルチスレッドから EINVAL になるため harness = false（core の unshare_isolation と同じ理由）。
+# `-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
+[[test]]
+name = "container_options_ipc"
+path = "tests/container_options_ipc.rs"
+harness = false
 
 [dependencies]
 fandhe-container-core = { path = "../core" }

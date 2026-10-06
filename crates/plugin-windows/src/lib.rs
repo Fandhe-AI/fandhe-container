@@ -7,13 +7,18 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //! 起動設定の解決は TASK-116.1（#392）、UDS 接続後のフレーム送受信ループは TASK-116.2（#393。[`frame_loop`]）で実装済み。
-//! `ContainerRuntime` アダプタ（#394）、discovery 登録・plugin 側 bind（#395）、
+//! `ContainerRuntime` アダプタ（#394）、
 //! シャットダウン・ヘルスチェック（#396）は未実装。実行時は WSL2 内の Linux で動く前提（WIN-1）で、
 //! 非 unix ネイティブビルドでは既定パス解決が `Unimplemented` となり fail-closed になる。
 //!
 //! # 暫定契約（spec 未規定）
 //! 引数構文 `--socket <path>` / `--socket=<path>` と既定 socket 名 [`DEFAULT_SOCKET_NAME`] は本リポ独自の暫定値。
-//! 接続方向は既存契約（core が bind し plugin が connect）の connect 側を #393 で実装した。bind 側への変更可否は #395 で確定する。
+//! 接続方向は既存契約（core が bind し plugin が connect）の connect 側を #393 で実装した。
+//! #395（TASK-116.4）で、plugin 側 bind（listen モード）は導入せず connect 側を維持すると確定した。
+//! plugin の接続経路は peer 認証つき `UdsStream::connect`（接続直後に server の peer UID を照合し、不一致は
+//! 1 バイトも送らず切断。PLUG-12）のみで、迂回する起動フラグ・環境変数は設けない。bind 側の保護（0700 配置
+//! ディレクトリ・stale 判定・accept 時の peer 検証）は core 側 `UdsListener` が担う。discovery 登録は
+//! バイナリ名（`fandhe-container-plugin-*`。#392）で満たし、UDS 上の登録 RPC は spec 未規定のため設けない。
 //!
 //! 対応 ID: TASK-116・PLUG-1・PLUG-4・PLUG-11・PLUG-12・WIN-1・REPAIR-3。
 
@@ -57,7 +62,8 @@ impl SocketSource {
 }
 
 /// 解決済みの起動設定。bind / connect 前の値であり、`sun_path` 長・配置ディレクトリの
-/// 所有者 / 権限・symlink の検証は `fandhe-container-plugin` の transport 層の責務（#395。ここでは二重実装しない）。
+/// 所有者 / 権限・symlink の bind 側検証は core 側 `UdsListener::bind`、接続時の server peer 検証は
+/// `UdsStream::connect` の責務（TASK-116.4・#395。ここでは二重実装しない）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StartupConfig {

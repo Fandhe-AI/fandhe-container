@@ -45,7 +45,9 @@
 //! | [`BackendError::LaunchNotStarted`]・create の検証を開始できない | `UNAVAILABLE` |
 //!
 //! message は先頭に元の `code()` を付ける（core が元の分類を区別できる）。`Config` 系は `message()` が要求由来の
-//! パスを埋め込むため使わず固定文言にする（入力の反射防止）。`GuestMount` 系も共有タグを含むため固定文言にする。アダプタ自身の検証エラーも固定文言のみ。
+//! パスを埋め込むため使わず固定文言にする（入力の反射防止）。`GuestMount` 系も共有タグを含むため固定文言にする。
+//! `VirtiofsIo` 系（共有タグ・相手由来の本文を含む）と将来追加される分類も固定文言にする。`message()` を
+//! そのまま載せるのは `Vm` 系（操作名・VM 状態・期限・VZ の NSError の domain / code で、要求由来の値を含まない）だけ。アダプタ自身の検証エラーも固定文言のみ。
 //!
 //! # 共有ディレクトリの検証（MAC-1・SEC-4。分離境界のため fail-closed）
 //!
@@ -136,6 +138,8 @@ const MSG_INVALID_ID: &str = "invalid container id";
 const MSG_UNIMPLEMENTED: &str = "operation is not implemented";
 const MSG_UNSUPPORTED_HOST: &str = "Virtualization.framework is only available on macOS";
 const MSG_CONFIG_REJECTED: &str = "VM configuration was rejected";
+const MSG_VIRTIOFS_IO_FAILED: &str = "virtiofs I/O operation failed";
+const MSG_PLATFORM_FAILED: &str = "platform operation failed";
 const MSG_VALIDATION_TIMEOUT: &str = "request validation did not finish in time";
 const MSG_LAUNCH_TIMEOUT: &str = "VM launch did not finish in time";
 const MSG_WORKERS_BUSY: &str = "too many operations are blocked on the host file system";
@@ -835,10 +839,12 @@ pub fn to_plugin_error(e: &PlatformError) -> PluginError {
                 }
                 _ => C::Internal,
             };
-            (code, e.message())
+            // message() は ReadOnlyShare が要求由来の共有タグ、Protocol・ConnectionLost・ReconnectFailed が
+            // 相手（ゲスト側サーバ）由来の本文を埋め込むため使わない。分類は `virtiofs_io.*` のコードで伝える。
+            (code, MSG_VIRTIOFS_IO_FAILED.to_string())
         }
-        // 将来追加される分類は fail-closed で INTERNAL にする。
-        _ => (C::Internal, e.message()),
+        // 将来追加される分類は fail-closed で INTERNAL にし、内容の分からない message() は載せない。
+        _ => (C::Internal, MSG_PLATFORM_FAILED.to_string()),
     };
     PluginError::new(code, format!("{}: {}", e.code(), detail))
 }
@@ -1881,10 +1887,19 @@ mod tests {
             pe(proto(IoErrorCode::ResourceExhausted)),
             (
                 C::FailedPrecondition,
-                format!(
-                    "virtiofs_io.resource_exhausted: {}",
-                    proto(IoErrorCode::ResourceExhausted).message()
-                )
+                "virtiofs_io.resource_exhausted: virtiofs I/O operation failed".to_string()
+            )
+        );
+        // 相手由来の本文（IoError の message）を応答へ載せない。
+        let peer = PlatformError::VirtiofsIo(VirtiofsIoError::Protocol {
+            op: VirtiofsIoOp::Write,
+            source: IoError::new(IoErrorCode::Timeout, "PEERTEXT"),
+        });
+        assert_eq!(
+            pe(peer),
+            (
+                C::Timeout,
+                "virtiofs_io.timeout: virtiofs I/O operation failed".to_string()
             )
         );
         let lost = |n| {
@@ -1924,13 +1939,16 @@ mod tests {
             .0,
             C::Internal
         );
-        let tag = VirtiofsTag::try_new("t").expect("tag");
+        // 要求由来の共有タグを応答へ載せない。
+        let tag = VirtiofsTag::try_new("SECRETTAG").expect("tag");
         assert_eq!(
             pe(PlatformError::VirtiofsIo(VirtiofsIoError::ReadOnlyShare {
                 tag
-            }))
-            .0,
-            C::FailedPrecondition
+            })),
+            (
+                C::FailedPrecondition,
+                "virtiofs_io.read_only_share: virtiofs I/O operation failed".to_string()
+            )
         );
     }
 

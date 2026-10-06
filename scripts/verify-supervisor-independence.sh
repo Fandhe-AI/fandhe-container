@@ -39,12 +39,14 @@
 # 出力: JSON（標準出力。--output 指定時はそのファイル）。launcher・bundle のパス、cmdline、環境変数は出さない。
 # 終了コード: 0 = 全判定成立 / 1 = 判定不成立・起動数不足・期限切れ（起動数不足では結果を公開しない）/
 #   2 = 引数・入力・出力先エラー / 3 = 前提欠如（非 Linux 等。0 で合格に見せない）/
-#   4 = 後始末失敗（残存プロセス。最優先。結果ファイルは後始末の完了後に公開するため、4 のときは作られない）/ 129・130・143 = HUP・INT・TERM による中断（後始末の完了後）。
+#   4 = 後始末失敗（残存プロセス、または子孫を追跡しきれず回収を確認できない場合。最優先。結果ファイルは後始末の完了後に公開するため、4 のときは作られない）/ 129・130・143 = HUP・INT・TERM による中断（後始末の完了後）。
 # 1 は機械照合できる事実の報告で、SUP-5 の合否判定・レポート化は #499（人間）が行う。
 # 既知の制約: 起動時刻の照合でも列挙から送信までの極めて短い pid 再利用の窓は理論上残る。コンテナ側プロセスは
 # 一過性の子を含めて「記録時点で存在した全プロセス」を対象にするため、一過性の子を持つ実装では不一致になり得る
 # （その場合は不一致の内訳を #499 で確認する）。後始末の最中に届く INT・TERM・HUP は無視して回収を完遂する。
-# 環境変数を継承せず、かつ記録後に新規 fork された子孫は、回収・残存検出のどちらも保証できない。
+# 環境変数を継承せず、かつ記録後に新規 fork された子孫は、回収・残存検出のどちらも保証できない。そのため
+# 起動直後から 0.1〜0.5 秒間隔で子孫を記録し続け、子孫を 1 つも観測できないまま消滅した launcher・走査上限
+# （512 件）に達した木は追跡不能として終了コード 4 にする（回収成功とは判定しない）。
 set -euo pipefail
 
 readonly num_re='^(0|[1-9][0-9]{0,8})$'
@@ -179,7 +181,7 @@ fi
 # --- 前提確認（欠如は 3。0 を返して合格に見せない） ---
 if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then err "unsupported-os" "bash 5 or later is required"; exit 3; fi
 if [ "$(uname -s 2>/dev/null || true)" != "Linux" ]; then err "unsupported-os" "only Linux is supported"; exit 3; fi
-for req in mktemp ln grep sleep kill uname date od; do
+for req in mktemp ln grep sleep kill uname date od head tr; do
   command -v "$req" >/dev/null 2>&1 || { err "unsupported-os" "$req is required"; exit 3; }
 done
 [ -r /proc/self/stat ] || { err "unsupported-os" "/proc is required"; exit 3; }
@@ -193,7 +195,9 @@ owner_tok=""
 out_tmp=""
 final_rc=0
 spawned=0
-declare -A SP SS SZ CH TRK
+declare -A SP SS SZ CH TRK SEEN
+untracked=0
+TREE_TRUNC=0
 publish_pending=0
 out_buf=""
 
@@ -239,6 +243,18 @@ read_comm() {
   COMM="${COMM// /_}"
 }
 
+# pid の識別シグネチャ（comm と完全な cmdline〔先頭 4096 バイト。NUL は \001、改行は \002 に置換〕）を SIG へ入れる。
+# 再起動の照合で「kill した子と同じコマンド」であることを確認するために使う（comm だけでは同名の補助プロセスと
+# 区別できない）。cmdline が読めない・空のときは SIG を空にする（照合不能として再起動を認定しない）。値は出力しない。
+read_sig() {
+  local cl
+  SIG=""
+  read_comm "$1"
+  cl="$(head -c 4096 "/proc/$1/cmdline" 2>/dev/null | tr '\000\n' '\001\002' || true)"
+  [ -n "$cl" ] && [ -n "$COMM" ] || return 0
+  SIG="${COMM}|${cl}"
+}
+
 # 全プロセスの状態・親・起動時刻・子の一覧を 1 回の走査で SZ・SP・SS・CH へ入れる（同じ時点の値で判定する）。
 scan() {
   local d p s rest f
@@ -257,9 +273,12 @@ scan() {
 }
 
 # scan の結果を使い、pid の子孫（根を除く）を "pid:起動時刻:親pid" の空白区切りで TREE へ入れる。
+# 走査は 512 件で打ち切る。打ち切り時に未走査の子孫が残る場合は TREE_TRUNC=1 にする（呼び出し側は
+# 判定不成立・追跡不能として扱う。上限超過の子孫を黙って無視して pass にしない）。
 tree_of() { # <root pid>
   local queue=("$1") next p c n=0
   TREE=""
+  TREE_TRUNC=0
   while [ "${#queue[@]}" -gt 0 ] && [ "$n" -lt 512 ]; do
     next=()
     for p in "${queue[@]}"; do
@@ -271,6 +290,9 @@ tree_of() { # <root pid>
       done
     done
     queue=("${next[@]}")
+  done
+  for p in "${queue[@]}"; do
+    [ -z "${CH[$p]:-}" ] || { TREE_TRUNC=1; break; }
   done
 }
 
@@ -326,23 +348,54 @@ any_launcher_alive() {
 # 起動した launcher の現在の子孫（コンテナ側プロセス）と kill 前スナップショット DESC の子孫を、記録した
 # pid・起動時刻の組として TRK へ追加する。環境変数を継承しないコンテナ側プロセス（実機の実装）は
 # FANDHE_BENCH_OWNER のトークンでは見つからないため、起動時に記録した同一性で追跡する（SIGKILL 後の孤児を含む）。
+# 起動直後から定期的に呼ぶ（待機ループ・settle 中）ことで、launcher が途中で終了しても、それまでに見えた子孫は
+# 記録済みになる。子孫を 1 つも記録できないまま消滅した launcher（SEEN 未設定）と、走査上限（512 件）に達した
+# 木は追跡不能（untracked=1）として記録し、後始末の成功とは判定しない（cleanup_procs が失敗を返す）。
 track_descendants() {
   local i d c rest
   scan
   for i in "${!pids[@]}"; do
     if snap_alive "${pids[$i]}" "${pstart[$i]:-}"; then
       tree_of "${pids[$i]}"
+      [ "$TREE_TRUNC" -eq 0 ] || untracked=1
       for d in $TREE; do
         c="${d%%:*}"
         rest="${d#*:}"
         TRK[$c]="${rest%%:*}"
+        SEEN[$i]=1
       done
+    elif [ -z "${SEEN[$i]:-}" ] && [ -z "${DESC[$i]:-}" ]; then
+      # 既に消滅した launcher で、子孫を 1 つも観測できていない。
+      untracked=1
     fi
     for d in ${DESC[$i]:-}; do
       c="${d%%:*}"
       rest="${d#*:}"
       TRK[$c]="${rest%%:*}"
     done
+  done
+}
+
+# 待機中の定期追跡つき。<秒> <コマンド...> を wait_until と同じ規則で待ち、各試行の前に子孫を記録する。
+wait_tracked() {
+  local limit=$(($1 * 10)) n=0
+  shift
+  while :; do
+    track_descendants
+    "$@" && return 0
+    n=$((n + 1))
+    [ "$n" -lt "$limit" ] || return 1
+    sleep 0.1
+  done
+}
+
+# settle 秒の待機。0.5 秒ごとに子孫を記録する。
+settle_tracked() {
+  local k=$((settle * 2))
+  while [ "$k" -gt 0 ]; do
+    track_descendants
+    sleep 0.5
+    k=$((k - 1))
   done
 }
 
@@ -362,7 +415,7 @@ tracked_alive() {
 }
 
 # 後始末。子孫を記録 → launcher へ SIGTERM → 期限超過で SIGKILL → トークン一致の所有プロセスと記録済みの
-# コンテナ側プロセス（孤児を含む）を回収し、残存があれば 1 を返す。EXIT trap から必ず呼ぶ。
+# コンテナ側プロセス（孤児を含む）を回収し、残存があるか追跡不能（untracked）なら 1 を返す。EXIT trap から必ず呼ぶ。
 cleanup_procs() {
   local i round
   track_descendants
@@ -377,7 +430,7 @@ cleanup_procs() {
     sleep 0.3
   done
   owned_scan
-  [ "${#OWNED[@]}" -eq 0 ] && ! tracked_alive
+  [ "${#OWNED[@]}" -eq 0 ] && ! tracked_alive && [ "$untracked" -eq 0 ]
 }
 _none_alive() { ! any_launcher_alive; }
 
@@ -405,7 +458,7 @@ on_exit() {
   [ "$final_rc" -eq 0 ] || rc="$final_rc"
   if [ "$spawned" -eq 1 ]; then
     if ! cleanup_procs; then
-      err "cleanup-failed" "owned processes remain after cleanup"
+      err "cleanup-failed" "owned processes remain or could not be tracked after cleanup"
       rc=4
     fi
   fi
@@ -451,10 +504,10 @@ for i in $(seq 1 "$count"); do spawn_one "$i"; done
 for i in $(seq 1 "$count"); do
   [ -n "${pstart[$i]:-}" ] || { err "launch-failed" "cannot record the start time of a launcher"; final_rc=1; exit 1; }
 done
-wait_until "$timeout_s" all_ready || timed_out "not all ${count} launchers became ready within ${timeout_s}s"
+wait_tracked "$timeout_s" all_ready || timed_out "not all ${count} launchers became ready within ${timeout_s}s"
 
 # --- kill 前スナップショット: 全 launcher の生存・木の大きさ・子孫（コンテナ側プロセス）を記録 ---
-sleep "$settle"
+settle_tracked
 scan
 for i in $(seq 1 "$count"); do
   if [ "${SS[${pids[$i]}]:-}" != "${pstart[$i]}" ] || [ "${SP[${pids[$i]}]:-}" != "$$" ]; then
@@ -463,6 +516,12 @@ for i in $(seq 1 "$count"); do
     exit 1
   fi
   tree_of "${pids[$i]}"
+  if [ "$TREE_TRUNC" -eq 1 ]; then
+    err "launch-failed" "a launcher tree exceeds the 512-process scan limit (cannot verify every container-side process)"
+    untracked=1
+    final_rc=1
+    exit 1
+  fi
   DESC[i]="$TREE"
   # shellcheck disable=SC2086
   set -- $TREE
@@ -479,8 +538,8 @@ tstart="${pstart[$target_index]}"
 sig_same_proc KILL "$tpid" "$tstart" "$$"
 _target_gone() { ! same_proc_alive "$tpid" "$tstart"; }
 target_dead=false
-if wait_until "$timeout_s" _target_gone; then target_dead=true; fi
-sleep "$settle"
+if wait_tracked "$timeout_s" _target_gone; then target_dead=true; fi
+settle_tracked
 
 # --- 判定 ---
 scan
@@ -517,13 +576,18 @@ for desc in ${DESC[$target_index]}; do
 done
 
 # --- --check-restart（opt-in。SUP-3 の restart ポリシー実装が前提）: 残り N-1 個のコンテナ側プロセスを kill して再起動を確認 ---
-# 再起動の成立条件: 各監視プロセスについて、kill 前に記録した子孫（pid・起動時刻）に含まれない「新しい」直接の子で、kill した子と同じ実行ファイル名（comm）のものが、
-# kill した直接の子の数以上、生存していること。補助プロセスが 1 つ増えただけでは成立しない。成立後に settle 秒待ち、
+# 再起動の成立条件: 各監視プロセスについて、kill 前に記録した子孫（pid・起動時刻）に含まれない「新しい」直接の子で、
+# kill した子とシグネチャ（comm＋完全な cmdline）が一致するものが、シグネチャごとに kill した直接の子の数以上、生存していること。
+# 同名・別コマンドの補助プロセスが増えただけでは成立しない。成立後に settle 秒待ち、
 # N-1 個の監視プロセスと再起動したコンテナ側プロセスが同一のまま生存していること（稼働継続）も再照合する。
+# 既知の制約: 現行の launcher 契約にはコンテナ ID・ランタイム状態を取得する手段がないため、対応関係はコマンド同一性
+# （シグネチャ）と「直接の子」という位置で近似する。同一コマンドの補助プロセスは区別できず、再起動でコマンドラインが変わる
+# 実装は不成立になる（安全側）。SUP-3 の実装後は、コンテナ ID・状態の取得手段で照合に置き換える（#499 で確認）。
 restart_check="skipped"
 restart_confirmed=null
 if [ "$check_restart" -eq 1 ]; then
-  declare -A OLDKIDS=() OLDSET=() OLDN=() NEWKIDS=() OLDCOMM=()
+  declare -A OLDKIDS=() OLDSET=() OLDN=() NEWKIDS=() OLDSIGS=() OLDSIGN=()
+  sig_unreadable=0
   for i in $(seq 1 "$count"); do
     for desc in ${DESC[$i]}; do
       rest="${desc#*:}"
@@ -534,7 +598,7 @@ if [ "$check_restart" -eq 1 ]; then
     [ "$i" -ne "$target_index" ] || continue
     OLDKIDS[$i]=""
     OLDN[$i]=0
-    OLDCOMM[$i]=" "
+    OLDSIGS[$i]=""
     for desc in ${DESC[$i]}; do
       cpid="${desc%%:*}"
       rest="${desc#*:}"
@@ -543,36 +607,59 @@ if [ "$check_restart" -eq 1 ]; then
       [ "$cppid" = "${pids[$i]}" ] || continue
       OLDKIDS[$i]+="${cpid} "
       OLDN[$i]=$((OLDN[$i] + 1))
-      read_comm "$cpid"
-      OLDCOMM[$i]+="${COMM} "
+      read_sig "$cpid"
+      if [ -z "$SIG" ]; then
+        sig_unreadable=1
+      else
+        if [ -z "${OLDSIGN["${i}|${SIG}"]:-}" ]; then
+          OLDSIGN["${i}|${SIG}"]=0
+          OLDSIGS[$i]+="${SIG}"$'\n'
+        fi
+        # 添字を算術式に渡さない（cmdline 由来の文字列を算術評価させない）。
+        sigkey="${i}|${SIG}"
+        sigv="${OLDSIGN["$sigkey"]}"
+        OLDSIGN["$sigkey"]=$((sigv + 1))
+      fi
       sig_same_proc KILL "$cpid" "$cstart" "$cppid"
     done
   done
   restarted_all() {
-    local j c n=0 fresh
+    local j c n=0 fresh sg sigv
+    local -A freshn
     scan
     for j in $(seq 1 "$count"); do
       [ "$j" -ne "$target_index" ] || continue
       [ "${OLDN[$j]}" -ge 1 ] || return 1
       fresh=""
+      freshn=()
       for c in ${CH[${pids[$j]}]:-}; do
         case "${SZ[$c]:-}" in Z | X | x | '') continue ;; esac
         [ -z "${OLDSET["${c}:${SS[$c]}"]:-}" ] || continue
-        # 新しい子のうち、kill した子と同じ実行ファイル名（comm）のものだけを再起動したコンテナ側プロセスとして数える。
-        read_comm "$c"
-        case "${OLDCOMM[$j]}" in *" ${COMM} "*) ;; *) continue ;; esac
+        # 新しい子のうち、kill した子とシグネチャ（comm＋cmdline）が一致するものだけを再起動したコンテナ側プロセスとして数える。
+        read_sig "$c"
+        [ -n "$SIG" ] || continue
+        [ -n "${OLDSIGN["${j}|${SIG}"]:-}" ] || continue
+        sigv="${freshn["$SIG"]:-0}"
+        freshn["$SIG"]=$((sigv + 1))
         fresh+="${c}:${SS[$c]} "
       done
-      # shellcheck disable=SC2086
-      set -- $fresh
-      [ "$#" -ge "${OLDN[$j]}" ] || return 1
+      # シグネチャごとに、kill した数以上が再起動していること。
+      while IFS= read -r sg; do
+        [ -n "$sg" ] || continue
+        [ "${freshn[$sg]:-0}" -ge "${OLDSIGN["${j}|${sg}"]}" ] || return 1
+      done <<<"${OLDSIGS[$j]}"
       NEWKIDS[$j]="$fresh"
       n=$((n + 1))
     done
     RESTARTED="$n"
   }
   RESTARTED=0
-  if wait_until "$timeout_s" restarted_all; then
+  if [ "$sig_unreadable" -eq 1 ]; then
+    # kill 前の子のコマンドを読めない場合は対応関係を照合できないため、再起動を認定しない。
+    restart_check="fail"
+    restart_confirmed=0
+    bad_detail+="restart-unverifiable "
+  elif wait_until "$timeout_s" restarted_all; then
     # 再起動後の稼働継続: settle 後に N-1 個の監視プロセスと新しいコンテナ側プロセスを同一性つきで再照合する。
     sleep "$settle"
     scan

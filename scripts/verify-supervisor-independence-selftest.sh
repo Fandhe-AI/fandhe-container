@@ -34,7 +34,7 @@ fail() { echo "FAIL: $1" >&2; failures=$((failures + 1)); }
 # スタブ launcher。`run --id <prefix>-<n> --bundle <dir>` を受け、コンテナ側プロセスを 1 つ起動して READY を出す。
 # STUB_MODE: normal（監視プロセスが死んでもコンテナは残る）/ collateral（対象の死で他の監視プロセスも死ぬ）/
 # die_with_target（対象のコンテナが監視プロセスと共に死ぬ）/ other_dies（他コンテナが対象の死で死ぬ）/
-# scrub_env（コンテナ側プロセスが環境変数を継承しない）/ no_ready（READY を出さない）/ short_start（最後の launcher が起動直後に終了）/ restart（コンテナを再起動する）/ restart_aux（補助プロセスだけ増やす）/ restart_short（再起動後すぐ終了）/ restart_sup_dies（再起動後に監視プロセスが終了）。
+# scrub_env（コンテナ側プロセスが環境変数を継承しない）/ no_ready（READY を出さない）/ short_start（最後の launcher が起動直後に終了）/ restart（コンテナを再起動する）/ restart_aux（補助プロセスだけ増やす）/ restart_short（再起動後すぐ終了）/ restart_sup_dies（再起動後に監視プロセスが終了）/ restart_alias（同名・別コマンドの補助プロセスだけ増やす）/ many_kids（子孫が走査上限 512 件を超える）。
 # 待機はすべて組み込みの read -t（fork しない）で行い、一過性の子プロセスを作らない。
 cat >"${root}/launcher.sh" <<'STUB'
 #!/usr/bin/env bash
@@ -55,6 +55,11 @@ start_container() {
   esac
   if [ -n "$watch" ]; then
     bash -c 'exec 8<>"$2"; while :; do if read -r p <"$1" 2>/dev/null; then kill -0 "$p" 2>/dev/null || break; fi; read -t 0.2 -u 8 || true; done' _ "$watch" "$STUB_DIR/$id.fifo" &
+  elif [ "$STUB_MODE" = many_kids ]; then
+    local k
+    # 2 階層（bash → sleep）で 512 件を超える木を作る。1 階層目だけで上限に達し、2 階層目に子孫が残る。
+    for k in $(seq 1 520); do bash -c 'sleep 300; :' & done
+    sleep 300 &
   elif [ "$STUB_MODE" = scrub_env ]; then
     # 環境変数を継承しないコンテナ側プロセス（実機の実装を模す）。
     env -i sleep 300 &
@@ -87,6 +92,12 @@ while :; do
   if [ "$STUB_MODE" = restart_short ]; then
     sleep 0.5 &
     c=$!
+    continue
+  fi
+  if [ "$STUB_MODE" = restart_alias ] && [ -z "${aux_done:-}" ]; then
+    # コンテナ（sleep 300）は再起動せず、同じ comm（sleep）で別コマンドラインの補助プロセスだけを起動する。
+    aux_done=1
+    sleep 301 &
     continue
   fi
   if [ "$STUB_MODE" = restart_aux ] && [ -z "${aux_done:-}" ]; then
@@ -189,7 +200,7 @@ expect_eq "no_ready: stdout is empty" "" "$(cat "$OUT")"
 
 # 6. N 個未満しか起動しない → 結果を公開せず 1。
 run_case short_start --timeout 3
-expect_eq "short_start: exit code" 1 "$RC"
+expect_eq "short_start: exit code (launcher vanished untracked => cleanup cannot be confirmed)" 4 "$RC"
 expect_eq "short_start: stdout is empty" "" "$(cat "$OUT")"
 
 # 7. --check-restart: コンテナを再起動するスタブ → 成功。
@@ -217,6 +228,16 @@ expect_eq "restart_short: restart_check" fail "$(json_get restart_check "$OUT")"
 run_case restart_sup_dies --check-restart
 expect_eq "restart_sup_dies: exit code" 1 "$RC"
 expect_eq "restart_sup_dies: restart_check" fail "$(json_get restart_check "$OUT")"
+
+# 8e. 同名・別コマンドの補助プロセスだけでは再起動と認定しない（SUP-5・SUP-3）。
+run_case restart_alias --check-restart --timeout 3
+expect_eq "restart_alias: exit code" 1 "$RC"
+expect_eq "restart_alias: restart_check" fail "$(json_get restart_check "$OUT")"
+
+# 8f. 子孫が走査上限（512 件）を超えると判定不成立・追跡不能（4）。pass にならない。
+run_case many_kids --count 2 --target-index 2 --timeout 10
+expect_eq "many_kids: exit code" 4 "$RC"
+expect_eq "many_kids: no result" "" "$(json_get result "$OUT")"
 
 # 9. --output は新規ファイルへ公開する（正常系）。
 run_case normal --output "${root}/c9-result.json"

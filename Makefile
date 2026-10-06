@@ -864,6 +864,43 @@ concurrent-memory: ## 50 コンテナ同時起動時の集約 PSS を計測す�
 		*) echo "error: measurement-failed: unexpected exit status $$rc" >&2; exit 1 ;; \
 	esac
 
+# 監視プロセス独立性の実証スクリプト（TASK-162・SUP-5。実証・判定は #499 で人間が実機実行する）。
+# `supervisor-independence-selftest` はスタブ launcher だけで照合する自己テスト（CI の bench-regression ジョブでも実行）、
+# `supervisor-independence` は N（既定 50）個の監視プロセスのうち 1 個を SIGKILL して残りの継続と孤児の稼働継続を確認する
+# 実機前提ターゲット（make ci には含めない。スクリプト内で sudo は呼ばない。launcher 契約はスクリプト冒頭を参照）。
+# スクリプトの終了コード 0〜4 はそのまま返し、timeout 超過（124・137）と想定外の値は 1、起動不能（125〜127）は 2。
+SUPERVISOR_INDEPENDENCE_TIMEOUT ?= 600
+SUPERVISOR_INDEPENDENCE_SCRIPT ?= scripts/verify-supervisor-independence.sh
+
+.PHONY: supervisor-independence-selftest
+supervisor-independence-selftest: ## 監視プロセス独立性実証スクリプトの自己テスト（SUP-5・REPAIR-12。スタブ launcher のみ）
+	bash scripts/verify-supervisor-independence-selftest.sh
+
+.PHONY: supervisor-independence
+supervisor-independence: ## 監視プロセス 1 個を kill して他の継続と孤児の稼働継続を確認する（実機前提・timeout 付き。LAUNCHER=<絶対パス> BUNDLE=<dir> 必須。SUP-5）
+	@if [ -z $(call fio_bench_sq,$(LAUNCHER)) ] || [ -z $(call fio_bench_sq,$(BUNDLE)) ]; then \
+		echo "usage: make supervisor-independence LAUNCHER=<abs-path> BUNDLE=<dir> [COUNT=<n, default 50>] [TARGET_INDEX=<k, default count/2 rounded up>] [OUTPUT=<new file>] [SUPERVISOR_INDEPENDENCE_TIMEOUT=<secs, default 600>]" >&2; \
+		exit 2; \
+	fi; \
+	t=$(call fio_bench_sq,$(SUPERVISOR_INDEPENDENCE_TIMEOUT)); \
+	case "$$t" in ''|*[!0-9]*|???????*) t=invalid ;; esac; \
+	if [ "$$t" = invalid ] || [ "$$t" -eq 0 ]; then \
+		echo "error: invalid-argument: SUPERVISOR_INDEPENDENCE_TIMEOUT must be an integer from 1 to 999999 (seconds)" >&2; \
+		exit 2; \
+	fi; \
+	if ! command -v timeout >/dev/null 2>&1; then \
+		echo "error: unsupported-os: timeout (coreutils) is required" >&2; \
+		exit 2; \
+	fi; \
+	rc=0; \
+	timeout --kill-after=60 "$$t" bash $(call fio_bench_sq,$(SUPERVISOR_INDEPENDENCE_SCRIPT)) --launcher $(call fio_bench_sq,$(LAUNCHER)) --bundle $(call fio_bench_sq,$(BUNDLE))$(if $(COUNT), --count $(call fio_bench_sq,$(COUNT)))$(if $(TARGET_INDEX), --target-index $(call fio_bench_sq,$(TARGET_INDEX)))$(if $(OUTPUT), --output $(call fio_bench_sq,$(OUTPUT))) || rc=$$?; \
+	case "$$rc" in \
+		0|1|2|3|4) exit "$$rc" ;; \
+		124|137) echo "error: timeout: verification or cleanup stalled for $${t}s" >&2; exit 1 ;; \
+		125|126|127) echo "error: invalid-input: cannot run the verification under timeout (exit $$rc)" >&2; exit 2 ;; \
+		*) echo "error: verification-failed: unexpected exit status $$rc" >&2; exit 1 ;; \
+	esac
+
 # --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）
 # --------------------------------------------------

@@ -776,6 +776,7 @@ pub use mac::Vm;
 
 #[cfg(target_os = "macos")]
 mod mac {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::Receiver;
     use std::sync::{Arc, Mutex, MutexGuard};
     use std::time::Duration;
@@ -863,13 +864,38 @@ mod mac {
         /// コンソールログは失敗の診断材料として削除しない。本 crate は一時ファイルを作らず（kernel・initrd・
         /// ディスクイメージは呼び出し側の所有物）、追記先として検証したパスを削除対象にする経路も作らない。
         pub fn launch(spec: &VmConfigSpec, timeouts: OpTimeouts) -> Result<Vm, PlatformError> {
+            Vm::launch_cancellable(spec, timeouts, &AtomicBool::new(false))
+        }
+
+        /// [`Vm::launch`] と同じ起動を、`cancel` が立っていれば VM の生成前・開始要求前に中止して行う
+        /// （REPAIR-5・TASK-115.3）。
+        ///
+        /// 起動を別スレッドで待つ呼び出し元（plugin の RPC 経路）が、応答期限を過ぎた後に VM が共有つきで
+        /// 起動するのを避けるために使う。確認するのは「構成の構築後・VM 生成前」と「VM 生成後・開始要求前」の
+        /// 2 点で、立っていれば `VmError::Cancelled`（`vm.cancelled`）を返す（前者は VM なし、後者は未開始の VM を
+        /// 破棄）。確認点の間（構成構築中の OS 呼び出し・開始要求の後）は取り消せず、開始要求の後に立った
+        /// 場合は VM が起動し得る（戻り値の `Vm` を呼び出し側が drop して停止を要求する）。
+        pub fn launch_cancellable(
+            spec: &VmConfigSpec,
+            timeouts: OpTimeouts,
+            cancel: &AtomicBool,
+        ) -> Result<Vm, PlatformError> {
             // 宣言順の逆に drop される: `vm`（先）→ `config`（後）。
             // 共有配下の走査は、期限の指定があればその範囲で打ち切る（REPAIR-5・TASK-115.3）。
             let mut config = match timeouts.share_scan() {
                 Some(budget) => build_vz_configuration_within(spec, budget)?,
                 None => build_vz_configuration(spec)?,
             };
+            if cancel.load(Ordering::SeqCst) {
+                drop(config);
+                return Err(VmError::Cancelled { before: "create" }.into());
+            }
             let vm = Vm::create_with_timeouts(&config, timeouts)?;
+            if cancel.load(Ordering::SeqCst) {
+                drop(vm);
+                drop(config);
+                return Err(VmError::Cancelled { before: "start" }.into());
+            }
             if let Err(e) = vm.start() {
                 drop(vm);
                 drop(config);

@@ -74,6 +74,12 @@ pub enum VmError {
         min: Duration,
         max: Duration,
     },
+    /// 呼び出し側が起動を取り消したため、VM を生成・開始する前に中止した（`Vm::launch_cancellable`。
+    /// REPAIR-5・TASK-115.3）。`before` は中止した段階（`create` = VM 生成前、`start` = 開始要求前）。
+    /// `create` で中止した場合 VM は作られていない。`start` で中止した場合は未開始の VM を破棄している。
+    Cancelled {
+        before: &'static str,
+    },
 }
 
 impl VmError {
@@ -88,6 +94,7 @@ impl VmError {
             VmError::Timeout { .. } => "vm.timeout",
             VmError::CallbackLost { .. } => "vm.callback_lost",
             VmError::InvalidTimeout { .. } => "vm.invalid_timeout",
+            VmError::Cancelled { .. } => "vm.cancelled",
         }
     }
 
@@ -133,6 +140,9 @@ impl VmError {
                 format!(
                     "{field} timeout {requested:?} is outside the allowed range {min:?}..={max:?}"
                 )
+            }
+            VmError::Cancelled { before } => {
+                format!("virtual machine launch was cancelled before {before}")
             }
         }
     }
@@ -323,6 +333,21 @@ mod tests {
     }
 
     /// MAC-1・ERR-1・TASK-64.5: タイムアウト範囲外のエラー文字列。
+    /// REPAIR-5・TASK-115.3: 起動の取り消しは `vm.cancelled` で、中止した段階を固定の語で伝える。
+    #[test]
+    fn cancelled_code_and_message_are_concrete() {
+        let e = VmError::Cancelled { before: "create" };
+        assert_eq!(e.code(), "vm.cancelled");
+        assert_eq!(
+            e.message(),
+            "virtual machine launch was cancelled before create"
+        );
+        assert_eq!(
+            VmError::Cancelled { before: "start" }.message(),
+            "virtual machine launch was cancelled before start"
+        );
+    }
+
     #[test]
     fn invalid_timeout_message_is_concrete() {
         let e = VmError::InvalidTimeout {

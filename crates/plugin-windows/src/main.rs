@@ -11,7 +11,9 @@
 //!
 //! 終了コード: 0 = 相手の正常切断でループ終了、2 = 起動設定の解決失敗、3 = 接続失敗、
 //! 4 = フレームループの異常終了（転送エラー・プロトコル違反）、5 = 共有マウントの解除失敗が残った
-//! （serve の結果に関わらず優先。`plugin.cleanup` の `remaining` 件は呼び出し元が手動回収する）。
+//! （serve の結果に関わらず優先。`plugin.cleanup` は `remaining` の件数のみを出す）。終了後に残った
+//! マウントを本 plugin から回収する手段は未実装で、対象の特定に必要な情報も出力しない（プロセスを
+//! またぐ回収は #1412。理由は `adapter` のモジュール doc「未実装範囲」を参照。WIN-2・REPAIR-3）。
 //! 接続経路は peer 認証つき `UdsStream::connect` のみ（TASK-116.4・#395・PLUG-12）。別 UID の listener は
 //! `PERMISSION_DENIED`・終了コード 3 で fail-closed し、`peer_auth_rejections` に件数のみ出す。
 //! 出力は固定文言と列挙名のみで、socket パス・引数値・環境変数値・受信データを含めない。
@@ -77,7 +79,8 @@ fn main() -> ExitCode {
         report("plugin.frame_loop", Some(source), e, "");
     }
     // 解除失敗は成功扱いにしない（共有マウントが残り得る。特権操作の後始末・WIN-2）。
-    // adapter 破棄後は所有情報が失われるため、件数つきの plugin.cleanup 行で呼び出し元に回収を促す。
+    // adapter 破棄後はプロセス内の所有情報が失われる。呼び出し元へは終了コード 5 と plugin.cleanup の
+    // 件数だけが伝わり、残ったマウントの回収は未実装（#1412。REPAIR-3）。
     if cleanup.remaining > 0 {
         return ExitCode::from(5);
     }

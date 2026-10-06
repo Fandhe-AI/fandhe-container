@@ -24,9 +24,10 @@
 //! 実ハンドラは `adapter::WindowsRuntimeAdapter`・#394）。ヘルスチェック（`ping`）は adapter が応答する（#396）。
 //!
 //! # シャットダウン（TASK-116.5・#396）
-//! [`serve_until`] は停止フラグ（SIGTERM。`sys::install_sigterm_flag`）を、フレームを 1 バイトも
-//! 受けていない間だけ [`IDLE_POLL`] ごとに確認し、立っていれば [`LoopExit::ShutdownRequested`] で抜ける。
-//! 受信途中のフレームは打ち切らず [`FRAME_DEADLINE`] 内で受け切って応答する（境界ずれ防止）。
+//! [`serve_until`] は停止フラグ（SIGTERM。`sys::install_sigterm_flag`）を、受信中（ヘッダ・本体の途中を
+//! 含む）も [`IDLE_POLL`] ごとに確認し、立っていれば [`LoopExit::ShutdownRequested`] で抜ける。
+//! 受信途中のフレームは応答せず破棄して接続を閉じる（途中で止まった相手に [`FRAME_DEADLINE`] まで
+//! 待たされ、共有マウント解除が終了猶予を超えるのを防ぐ。WIN-2・REPAIR-5）。
 //! 要求処理中に立った場合は、ハンドラへ [`RequestHandler::handle_with_stop`] で伝え、ハンドラが各段の
 //! 境界で処理を早期に打ち切る（共有マウント解除の時間を確保する。WIN-2・REPAIR-5）。
 //! 呼び出し側（`main.rs`）が抜けた後に共有マウントを解除して終了する。
@@ -176,7 +177,7 @@ enum Recv {
     Frame(Frame),
     /// フレーム境界での正常な EOF。
     Closed,
-    /// 停止フラグが立った（フレームを 1 バイトも受けていない時点のみ）。
+    /// 停止フラグが立った（受信途中のフレームは破棄済み）。
     Shutdown,
     /// 切断済み接続の生 I/O が拒否された（`io_timeout_unrestored`）。`read_frame` へフォールバックする。
     RawUnusable,
@@ -202,7 +203,8 @@ fn recv_frame<R: Read>(r: &mut R, deadline: Duration) -> Result<Recv, PluginErro
 }
 
 /// フレーム 1 つを 2 段階で受信する。`r` の read 期限は呼び出し側が [`IDLE_POLL`] 程度に設定しておく。
-/// `stop` は 1 バイトも受けていない間（`got == 0`）だけ確認する。
+/// `stop` は受信の全段階（ヘッダ・本体の途中を含む）で確認し、立っていれば未完了フレームを破棄して
+/// [`Recv::Shutdown`] を返す（TASK-116.5・#396）。
 fn recv_frame_until<R: Read>(
     r: &mut R,
     deadline: Duration,
@@ -215,7 +217,7 @@ fn recv_frame_until<R: Read>(
         if started.is_some_and(|t| t.elapsed() >= deadline) {
             return Err(timeout_err());
         }
-        if got == 0 && stop.load(Ordering::SeqCst) {
+        if stop.load(Ordering::SeqCst) {
             return Ok(Recv::Shutdown);
         }
         let Some(slot) = hdr.get_mut(got..) else {
@@ -246,6 +248,9 @@ fn recv_frame_until<R: Read>(
     let total = header.body_len();
     let mut body: Vec<u8> = Vec::new();
     while body.len() < total {
+        if stop.load(Ordering::SeqCst) {
+            return Ok(Recv::Shutdown);
+        }
         if started.elapsed() >= deadline {
             return Err(timeout_err());
         }
@@ -633,18 +638,66 @@ mod tests {
     }
 
     #[test]
-    fn task116_5_win1_flag_set_mid_frame_still_completes_frame() {
+    fn task116_5_win1_flag_set_mid_frame_discards_and_shuts_down() {
         let stop = AtomicBool::new(false);
         let f = req(1, &["op"]);
-        // 1 バイトずつ届く最中にフラグが立っても、フレームは受け切る（境界ずれ防止）。
+        // 1 バイトずつ届く最中にフラグが立ったら、未完了フレームは破棄して Shutdown（#396）。
         let mut r = SetAfterFirst {
             inner: chunky(f.encode(), 1, 0),
             stop: &stop,
         };
-        match recv_frame_until(&mut r, LONG, &stop).expect("recv") {
-            Recv::Frame(got) => assert_eq!(got.payload(), f.payload()),
-            other => panic!("unexpected {other:?}"),
-        }
-        assert!(stop.load(Ordering::SeqCst));
+        assert!(matches!(
+            recv_frame_until(&mut r, LONG, &stop).expect("recv"),
+            Recv::Shutdown
+        ));
+        assert!(r.inner.pos < f.encode().len());
+    }
+
+    /// 停止フラグが立った時点で本体の途中なら、期限（FRAME_DEADLINE 相当）を待たず Shutdown になる。
+    #[test]
+    fn task116_5_win1_stalled_partial_body_with_stop_shuts_down_quickly() {
+        let stop = AtomicBool::new(false);
+        let f = req(1, &["op"]);
+        let bytes = f.encode();
+        let hdr_len = FRAME_HEADER_LEN;
+        // ヘッダ + 本体の一部だけ届いて以降は停止する相手。
+        let mut r = SetAfterFirst {
+            inner: Chunky {
+                data: bytes.get(..hdr_len + 1).unwrap_or(&[]).to_vec(),
+                pos: 0,
+                step: hdr_len + 1,
+                idle: 0,
+                stall: true,
+            },
+            stop: &stop,
+        };
+        let started = Instant::now();
+        assert!(matches!(
+            recv_frame_until(&mut r, Duration::from_secs(30), &stop).expect("recv"),
+            Recv::Shutdown
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// ヘッダの途中で止まった相手でも、停止フラグが立てば期限を待たず Shutdown になる。
+    #[test]
+    fn task116_5_win1_stalled_partial_header_with_stop_shuts_down_quickly() {
+        let stop = AtomicBool::new(false);
+        let mut r = SetAfterFirst {
+            inner: Chunky {
+                data: vec![1, 2, 3],
+                pos: 0,
+                step: 3,
+                idle: 0,
+                stall: true,
+            },
+            stop: &stop,
+        };
+        let started = Instant::now();
+        assert!(matches!(
+            recv_frame_until(&mut r, Duration::from_secs(30), &stop).expect("recv"),
+            Recv::Shutdown
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

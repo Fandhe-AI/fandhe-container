@@ -9,7 +9,8 @@
 //! 起動設定の解決は TASK-116.1（#392）、UDS 接続後のフレーム送受信ループは TASK-116.2（#393。[`frame_loop`]）で実装済み。
 //! `ContainerRuntime` アダプタ（#394。[`adapter`]）は create / start / stop を platform-windows へ委譲済みで、
 //! ゲスト内ランタイム起動・kill / delete / state・型つき本体は未実装。
-//! シャットダウン・ヘルスチェック（#396）は未実装。実バックエンドは Windows ホスト上で `wsl.exe` を起動して WSL2 を操作する（WIN-1。[`adapter`] 参照）。
+//! SIGTERM でのグレースフルシャットダウン（[`sys`]・`frame_loop::serve_until`）と `ping` 応答（[`adapter`]）は実装済み（TASK-116.5・#396）。
+//! SIGKILL・猶予超過・Windows ホスト上の終了要求ではマウント残留の余地があり、ゲスト内ランタイムの停止は未実装。実バックエンドは Windows ホスト上で `wsl.exe` を起動して WSL2 を操作する（WIN-1。[`adapter`] 参照）。
 //! plugin 境界機構の UDS は現状 unix 限定のため、Windows ホスト上の接続経路は TASK-114 で確定する。
 //! 非 unix ビルドでは既定パス解決が `Unimplemented`、非 Windows ビルドでは create が `Unimplemented` となり fail-closed になる。
 //!
@@ -26,6 +27,7 @@
 
 pub mod adapter;
 pub mod frame_loop;
+pub mod sys;
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};

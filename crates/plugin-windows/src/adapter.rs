@@ -12,6 +12,12 @@
 //! | create | `["create", id, distro, policy, (mount_name, host_dir, mode)*]` | `["created", "", ""]` |
 //! | start | `["start", id]` | `["running", transport, warning]` |
 //! | stop | `["stop", id]` | `["stopped", "", ""]` |
+//! | ping | `["ping"]`（要素 1 つのみ） | `["pong"]`（1 要素） |
+//!
+//! `ping` はヘルスチェック（TASK-116.5・#396）。登録簿・バックエンド・`wsl.exe` に触れずメモリ内だけで応答し、
+//! 内部状態（件数・id）を返さず、操作記録も出さない。単一スレッドで順次処理するため先行要求の後ろに並び、
+//! 最悪でも [`REQUEST_BUDGET`] ＋送受信で core の RPC 既定期限内に応答する。core 側のタイムアウト・
+//! 再起動判定は対象外（PLUG-4）。余分な要素は `INVALID_ARGUMENT`。
 //!
 //! `policy` は `prefer-virtiofs` / `require-virtiofs`、`mode` は `ro` / `rw`。`transport` は
 //! `virtiofs` / `9p` / 未観測は空、`warning` は 9P 降格の警告コード（WIN-2）または空。
@@ -20,6 +26,7 @@
 //! - ゲスト内ランタイムの起動ステップ（[`GuestStart`]）の実体は未実装で、既定の [`UnimplementedGuestStart`]
 //!   は `UNIMPLEMENTED` を返す（成功を装わない）。start は共有マウントの準備後にこれが失敗し、
 //!   マウントはロールバックされる。
+//! - 終了時（SIGTERM 含む）に止める対象は共有マウントのみで、ゲスト内ランタイムの停止は未実装（`GuestStart` の実体が無い）。
 //! - kill / delete / state は未実装（`UNIMPLEMENTED`）。状態はプロセス内メモリのみで永続化しない。
 //! - delete が無いため stop が保持資源をすべて手放す（上限 [`MAX_CONTAINERS`] を残骸で埋めない）。
 //! - プロセスをまたぐ共有マウントの回収は未実装（#1412 で実装する。WIN-2・REPAIR-3）。現状は接続終了時・
@@ -107,6 +114,10 @@ const MAX_ID_LEN: usize = 255;
 
 const MSG_DEADLINE: &str = "request deadline exceeded before the WSL2 operation started";
 const MSG_UNIMPLEMENTED: &str = "operation is not implemented";
+/// ヘルスチェック要求の操作名（TASK-116.5・#396。plugin-macos と同じ文字列の暫定契約。PLUG-1）。
+pub const OP_PING: &str = "ping";
+/// ヘルスチェックの成功応答（1 要素。内部状態を含めない）。
+pub const REPLY_PONG: &str = "pong";
 const MSG_BAD_REQUEST: &str = "malformed request";
 const MSG_BAD_ID: &str = "invalid container id";
 
@@ -571,6 +582,15 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
         body: &[String],
         total: Duration,
     ) -> Result<Vec<String>, PluginError> {
+        // ヘルスチェックは状態・バックエンド・時計に一切触れず即応答する（TASK-116.5・#396）。
+        // `release_all_done` を倒す前に処理するのは、ping で終了時の解除が二重に走る余地を作らないため。
+        if body.first().map(String::as_str) == Some(OP_PING) {
+            return if body.len() == 1 {
+                Ok(vec![REPLY_PONG.to_string()])
+            } else {
+                Err(invalid(MSG_BAD_REQUEST))
+            };
+        }
         let deadline = RequestDeadline::after(total);
         // 要求を処理した後の状態は未解除かもしれないため、終了時の解除をやり直せるようにする。
         self.release_all_done = false;
@@ -1233,6 +1253,52 @@ mod tests {
         a.handle(&s(&["start", "c1"])).unwrap();
         let r = a.release_all();
         assert_eq!((r.released, r.remaining), (0, 1));
+        drop(a);
+        let releases = calls
+            .borrow()
+            .iter()
+            .filter(|c| c.starts_with("release"))
+            .count();
+        assert_eq!(releases, 1);
+    }
+
+    /// TASK-116.5・PLUG-1: ping は pong を返し、余分な要素は入力を反射せず拒否する。
+    #[test]
+    fn task116_5_plug1_ping_returns_pong_and_rejects_extra() {
+        let (mut a, _) = adapter(Fake::default());
+        assert_eq!(a.handle(&s(&["ping"])).unwrap(), s(&["pong"]));
+        let e = a.handle(&s(&["ping", "SECRETARG"])).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "malformed request");
+    }
+
+    /// TASK-116.5・PLUG-1: ping はバックエンド呼び出し・期限配分に触れない。
+    #[test]
+    fn task116_5_plug1_ping_touches_nothing() {
+        let (mut a, calls) = adapter(Fake::default());
+        a.handle(&s(CREATE)).unwrap();
+        a.handle(&s(&["start", "c1"])).unwrap();
+        let before = calls.borrow().clone();
+        let (b0, c0) = (
+            a.backend.budgets.borrow().len(),
+            a.backend.check_budgets.borrow().len(),
+        );
+        for _ in 0..3 {
+            assert_eq!(a.handle(&s(&["ping"])).unwrap(), s(&["pong"]));
+        }
+        assert_eq!(*calls.borrow(), before);
+        assert_eq!(a.backend.budgets.borrow().len(), b0);
+        assert_eq!(a.backend.check_budgets.borrow().len(), c0);
+    }
+
+    /// TASK-116.5・WIN-2: release_all 後の ping は解除済みフラグを倒さず、Drop が再解除しない。
+    #[test]
+    fn task116_5_win2_ping_after_release_all_does_not_rearm_drop() {
+        let (mut a, calls) = adapter(Fake::default());
+        a.handle(&s(CREATE)).unwrap();
+        a.handle(&s(&["start", "c1"])).unwrap();
+        assert_eq!(a.release_all().released, 1);
+        assert_eq!(a.handle(&s(&["ping"])).unwrap(), s(&["pong"]));
         drop(a);
         let releases = calls
             .borrow()

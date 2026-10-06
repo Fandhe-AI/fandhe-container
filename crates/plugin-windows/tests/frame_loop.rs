@@ -327,3 +327,65 @@ fn task116_3_plug1_adapter_delegates_and_maps_errors() {
     let (code, err) = h.finish();
     assert_eq!(code, 0, "{err}");
 }
+
+/// 子プロセスへ SIGTERM を送る（テスト側に FFI を足さないため `kill` コマンドを使う。自分が spawn した子の PID のみ）。
+fn sigterm(h: &Harness) {
+    let status = Command::new("kill")
+        .arg("-TERM")
+        .arg(h.child.id().to_string())
+        .status()
+        .expect("kill");
+    assert!(status.success());
+}
+
+#[test]
+fn task116_5_plug1_ping_roundtrip_keeps_connection() {
+    let mut h = Harness::start();
+    let t = Instant::now();
+    match h.call(1, &["ping"]) {
+        ControlMessage::Response { id, body } => {
+            assert_eq!(id.get(), 1);
+            assert_eq!(body, vec!["pong".to_string()]);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    assert!(t.elapsed() < Duration::from_secs(10));
+    expect_unimplemented(h.call(2, &["list"]), 2);
+    let (code, err) = h.finish();
+    assert_eq!(code, 0, "{err}");
+}
+
+#[test]
+fn task116_5_win1_sigterm_idle_exits_zero() {
+    let h = Harness::start();
+    sigterm(&h);
+    let (code, err) = h.finish_with(false);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("{\"event\":\"plugin.shutdown\",\"reason\":\"signal\"}"),
+        "{err}"
+    );
+    assert!(!err.contains("plugin.cleanup"), "{err}");
+}
+
+#[test]
+fn task116_5_win1_sigterm_after_request_exits_zero() {
+    let mut h = Harness::start();
+    assert!(matches!(
+        h.call(1, &["ping"]),
+        ControlMessage::Response { .. }
+    ));
+    sigterm(&h);
+    let (code, err) = h.finish_with(false);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("plugin.shutdown"), "{err}");
+}
+
+#[test]
+fn task116_5_win1_double_sigterm_exits_zero() {
+    let h = Harness::start();
+    sigterm(&h);
+    sigterm(&h);
+    let (code, err) = h.finish_with(false);
+    assert_eq!(code, 0, "{err}");
+}

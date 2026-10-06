@@ -2,6 +2,7 @@
 # crate-naming.md の表 #17）。
 # 雛形は TASK-1.3（#11・REPAIR-1・MS-0）。本体は G8（TASK-116）で実装する。
 # バイナリ名は `fandhe-container-plugin-windows`（発見対象。PLUG-4・PLUG-11）。`[[bin]]`（src/main.rs）は TASK-116.1（#392）で定義し、UDS フレーム送受信ループ（src/frame_loop.rs）は TASK-116.2（#393）で追加した。
+# SIGTERM グレースフルシャットダウンと ping 応答（src/sys.rs ほか）は TASK-116.5（#396）で追加した（依存の追加なし）。
 # version は未指定（Cargo の既定で 0.0.0）。公開方針は未決定のため publish = false を明記する。
 # 依存は `fandhe-container-plugin`（境界機構）の workspace path 依存と、`fandhe-container-platform-windows` の path 依存
 # （TASK-116.3・#394。architecture.md・crate-naming.md 表 #17 で確定済みの内部辺）のみで、外部クレートの追加はない。

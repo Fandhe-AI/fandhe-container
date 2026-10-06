@@ -42,15 +42,17 @@
 //! | [`BackendError::UnsupportedHost`] | `UNIMPLEMENTED` |
 //!
 //! message は先頭に元の `code()` を付ける（core が元の分類を区別できる）。`Config` 系は `message()` が要求由来の
-//! パスを埋め込むため使わず固定文言にする（入力の反射防止）。アダプタ自身の検証エラーも固定文言のみ。
+//! パスを埋め込むため使わず固定文言にする（入力の反射防止）。`GuestMount` 系も共有タグを含むため固定文言にする。アダプタ自身の検証エラーも固定文言のみ。
 //!
 //! # 未実装範囲（実装済みを装わない。REPAIR-3）
 //! - 型つき本体と core の `ContainerRuntime` トレイトへの接続・kill / delete / state（TASK-114 待ち）。
 //! - virtiofs 共有は「デバイス構成のみ」。ゲスト内 mount 先の指定は受け付けない（ゲスト init 未実装のため
 //!   `guest_mount.timeout` になる。MAC-1）。rootfs ブロックデバイス・コンソールログ・CPU / メモリ指定も含まない。
-//! - 起動失敗後の `start` 再試行は拒否する（失敗した VM の停止は非同期で完了を確認できず、VM が重複し得るため。
+//! - VM が作られ得た起動失敗（`VmError::StartFailed`・`GuestMount` 等）の後の `start` 再試行は拒否する
+//!   （VM 生成前に確定した失敗〔`UnsupportedHost`・構成エラー〕は `Created` のまま再試行・`stop` を許す。
+//!   失敗した VM の停止は非同期で完了を確認できず、VM が重複し得るため。
 //!   `stop` も拒否し、同じ ID の再作成を許さない。登録は plugin プロセス終了まで残る）。同時実行 VM 数は
-//!   [`SHUTDOWN_BUDGET`] 内に逐次停止できる数から 1 台分の処理余裕を引いた数（停止待ち 2 秒なら 1）に制限する。停止できず残った VM（起動失敗後に停止を確認できない VM を含む）は `stop_all` の `remaining` として報告し、回収は `Vm` の drop 停止要求（非同期）と
+//!   [`SHUTDOWN_BUDGET`] 内に逐次停止できる数から 1 台分の処理余裕を引いた数（停止待ち 2 秒なら 1。起動失敗後に停止未確認の VM も算入）に制限する。停止できず残った VM（起動失敗後に停止を確認できない VM を含む）は `stop_all` の `remaining` として報告し、回収は `Vm` の drop 停止要求（非同期）と
 //!   core の終了処理に委ね、完了は保証しない。
 //! - 1 コンテナ = 1 VM（常駐 VM 共用の MAC-4 は未決）。状態はプロセス内メモリのみ（都度起動モードでは引き継げない）。
 //! - VM 操作の期限は core 側 RPC・都度起動の合計期限（10 秒）と終了猶予（5 秒）に収まる固定値
@@ -58,7 +60,7 @@
 //!   既定の `OpTimeouts`（start 30 秒・guest mount 60 秒・stop 15 秒）は使わない。
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use fandhe_container_platform_macos::config::{ConfigError, VmConfigSpec};
@@ -93,6 +95,7 @@ const MSG_MALFORMED: &str = "malformed request";
 const MSG_INVALID_ID: &str = "invalid container id";
 const MSG_UNIMPLEMENTED: &str = "operation is not implemented";
 const MSG_UNSUPPORTED_HOST: &str = "Virtualization.framework is only available on macOS";
+const MSG_SHARE_DIR_UNRESOLVED: &str = "shared directory could not be resolved";
 const MSG_CONFIG_REJECTED: &str = "VM configuration was rejected";
 
 /// platform-macos への委譲境界。実機は [`PlatformBackend`]、テストは偽実装。
@@ -131,6 +134,26 @@ impl BackendError {
                 ..
             }))
         )
+    }
+}
+
+impl BackendError {
+    /// 失敗した `launch` が VM（Virtualization.framework のインスタンス）を作った可能性がある場合 true。
+    ///
+    /// 非 macOS の `UnsupportedHost`・VM 構成の構築失敗（`PlatformError::Config`）・VM 生成前に確定する
+    /// `VirtualizationUnsupported` / `InvalidConfiguration` / `InvalidTimeout` は VM が存在しないので false。
+    /// 起動・停止・mount 待ちの失敗や未知の分類は停止を確認できないため true（fail-closed。REPAIR-3）。
+    fn vm_may_exist(&self) -> bool {
+        match self {
+            BackendError::UnsupportedHost => false,
+            BackendError::Platform(PlatformError::Config(_)) => false,
+            BackendError::Platform(PlatformError::Vm(
+                VmError::VirtualizationUnsupported
+                | VmError::InvalidConfiguration { .. }
+                | VmError::InvalidTimeout { .. },
+            )) => false,
+            BackendError::Platform(_) => true,
+        }
     }
 }
 
@@ -382,7 +405,7 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
                 };
                 shares.push(VirtiofsShareSpec::new(
                     VirtiofsTag::try_new(tag).map_err(config_to_plugin)?,
-                    SharedDirectoryPath::try_new(Path::new(dir.as_str()))
+                    SharedDirectoryPath::try_new(&canonical_share_dir(dir)?)
                         .map_err(config_to_plugin)?,
                     access,
                 ));
@@ -409,7 +432,7 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
         let running = self
             .entries
             .values()
-            .filter(|e| matches!(e.state, State::Running(_)))
+            .filter(|e| matches!(e.state, State::Running(_) | State::LaunchFailed))
             .count();
         let max_running = self.max_running();
         let entry = self.entries.get_mut(id).ok_or_else(not_found)?;
@@ -425,15 +448,20 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
                 "too many running VMs",
             ));
         }
-        // 失敗時は LaunchFailed にして再試行を拒否する（失敗した VM の停止は非同期で完了を確認できず、
-        // 再試行すると VM が重複し得るため。後始末は backend.launch が担う）。
+        // VM が作られ得た失敗は LaunchFailed にして再試行を拒否する（失敗した VM の停止は非同期で完了を
+        // 確認できず、再試行すると VM が重複し得るため。後始末は backend.launch が担う）。LaunchFailed は
+        // 上の上限判定にも算入する（停止未確認の VM を除外して別 ID を起動すると終了予算を超える。REPAIR-5）。
+        // VM 生成前に確定した失敗（非 macOS・構成エラー等）は Created のまま残し、修正後の再試行と
+        // stop による登録解除を許す（REPAIR-3）。
         match self.backend.launch(&entry.spec) {
             Ok(handle) => {
                 entry.state = State::Running(handle);
                 Ok(vec!["running".to_string()])
             }
             Err(e) => {
-                entry.state = State::LaunchFailed;
+                if e.vm_may_exist() {
+                    entry.state = State::LaunchFailed;
+                }
                 Err(backend_to_plugin(&e))
             }
         }
@@ -534,6 +562,19 @@ fn validate_id(id: &str) -> Result<(), PluginError> {
     }
 }
 
+/// 共有ディレクトリを正規化する。`SharedDirectoryPath::try_new` は symlink の祖先を拒否するため、
+/// macOS で `/tmp`・`/var` が symlink（`/private/...`）である通常のパスを通すには事前の解決が要る。
+/// 解決後のパスを共有元として固定する。失敗時のメッセージには要求由来のパスを含めない。
+fn canonical_share_dir(dir: &str) -> Result<PathBuf, PluginError> {
+    Path::new(dir).canonicalize().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            PluginError::new(PluginErrorCode::InvalidArgument, MSG_SHARE_DIR_UNRESOLVED)
+        } else {
+            PluginError::new(PluginErrorCode::Internal, MSG_SHARE_DIR_UNRESOLVED)
+        }
+    })
+}
+
 fn config_to_plugin(e: ConfigError) -> PluginError {
     to_plugin_error(&PlatformError::Config(e))
 }
@@ -580,14 +621,29 @@ pub fn to_plugin_error(e: &PlatformError) -> PluginError {
             (code, e.message())
         }
         PlatformError::GuestMount(g) => {
-            let code = match g {
-                GuestMountError::Timeout { .. } => C::Timeout,
-                GuestMountError::VmStopped { .. } | GuestMountError::ReportChannelClosed => {
-                    C::Unavailable
+            // message() は Failed / Timeout / InvalidReport が要求由来の共有タグ・報告内容を埋め込むため
+            // 使わない。詳細は入力値を含まないコード（`guest_mount.*`）で伝え、本文は固定文言にする。
+            let (code, detail) = match g {
+                GuestMountError::Timeout { .. } => {
+                    (C::Timeout, "guest did not report mount results in time")
                 }
-                _ => C::Internal,
+                GuestMountError::VmStopped { .. } => (
+                    C::Unavailable,
+                    "virtual machine stopped before guest mounts completed",
+                ),
+                GuestMountError::ReportChannelClosed => (
+                    C::Unavailable,
+                    "console reader ended before guest mounts completed",
+                ),
+                GuestMountError::Failed { .. } => {
+                    (C::Internal, "guest failed to mount a virtiofs share")
+                }
+                GuestMountError::InvalidReport { .. } => {
+                    (C::Internal, "invalid guest mount report")
+                }
+                _ => (C::Internal, "guest mount failed"),
             };
-            (code, e.message())
+            (code, detail.to_string())
         }
         PlatformError::VirtiofsIo(v) => {
             let code = match v {
@@ -645,6 +701,8 @@ mod tests {
         launched: Vec<(PathBuf, Vec<(String, bool)>)>,
         stopped: Vec<u32>,
         fail_launch: bool,
+        /// VM 生成前に確定する失敗（非 macOS 相当）を返す。
+        unsupported_launch: bool,
         fail_stop: bool,
         halted_stop: bool,
         stop_timeout: Duration,
@@ -658,6 +716,9 @@ mod tests {
         type Handle = u32;
         fn launch(&self, spec: &VmConfigSpec) -> Result<u32, BackendError> {
             let mut c = self.0.borrow_mut();
+            if c.unsupported_launch {
+                return Err(BackendError::UnsupportedHost);
+            }
             if c.fail_launch {
                 return Err(BackendError::Platform(PlatformError::Vm(
                     VmError::StartFailed {
@@ -934,6 +995,162 @@ mod tests {
                 stopped: 1,
                 remaining: 0
             }
+        );
+    }
+
+    /// TASK-115.3・REPAIR-5: 起動失敗後の停止未確認 VM（LaunchFailed）も実行中 VM 数の上限に算入する。
+    #[test]
+    fn task115_3_repair5_launch_failed_counts_toward_running_cap() {
+        let dir = tmp_dir("cap-launchfailed");
+        let k = kernel(&dir);
+        let (mut a, f) = adapter();
+        f.0.borrow_mut().stop_timeout = Duration::from_secs(2);
+        for id in ["a", "b"] {
+            create_ok(&mut a, id, &k);
+        }
+        f.0.borrow_mut().fail_launch = true;
+        err_of(a.handle(&s(&["start", "a"])));
+        f.0.borrow_mut().fail_launch = false;
+        assert_eq!(
+            err_of(a.handle(&s(&["start", "b"]))),
+            (
+                PluginErrorCode::FailedPrecondition,
+                "too many running VMs".to_string()
+            )
+        );
+        assert!(f.0.borrow().launched.is_empty());
+    }
+
+    /// TASK-115.3・REPAIR-3: VM 生成前に確定した失敗は Created のまま残り、再試行と stop による登録解除ができる。
+    #[test]
+    fn task115_3_repair3_pre_vm_failure_keeps_created() {
+        let dir = tmp_dir("prevm");
+        let k = kernel(&dir);
+        let (mut a, f) = adapter();
+        create_ok(&mut a, "a", &k);
+        f.0.borrow_mut().unsupported_launch = true;
+        assert_eq!(
+            err_of(a.handle(&s(&["start", "a"]))),
+            (
+                PluginErrorCode::Unimplemented,
+                MSG_UNSUPPORTED_HOST.to_string()
+            )
+        );
+        create_ok(&mut a, "b", &k);
+        f.0.borrow_mut().unsupported_launch = false;
+        a.handle(&s(&["start", "b"])).expect("retry start");
+        // 同 ID の再作成のため stop で登録を外せる。
+        a.handle(&s(&["stop", "a"])).expect("stop created");
+        create_ok(&mut a, "a", &k);
+    }
+
+    /// TASK-115.3・REPAIR-3: VM が作られ得た失敗と生成前に確定する失敗の判別。
+    #[test]
+    fn task115_3_repair3_vm_may_exist_classification() {
+        let vm = |e| BackendError::Platform(PlatformError::Vm(e));
+        assert!(!BackendError::UnsupportedHost.vm_may_exist());
+        assert!(!vm(VmError::VirtualizationUnsupported).vm_may_exist());
+        assert!(
+            !vm(VmError::InvalidConfiguration {
+                domain: "d".into(),
+                code: 1
+            })
+            .vm_may_exist()
+        );
+        assert!(
+            vm(VmError::StartFailed {
+                domain: "d".into(),
+                code: 1
+            })
+            .vm_may_exist()
+        );
+        assert!(
+            vm(VmError::Timeout {
+                op: VmOp::Start,
+                after: Duration::from_secs(1)
+            })
+            .vm_may_exist()
+        );
+        assert!(
+            BackendError::Platform(PlatformError::GuestMount(
+                GuestMountError::ReportChannelClosed
+            ))
+            .vm_may_exist()
+        );
+    }
+
+    /// TASK-115.3・MAC-1: guest mount のエラーは要求由来の共有タグを message に含めない。
+    #[test]
+    fn task115_3_mac1_guest_mount_message_has_no_tag() {
+        let gm = |e| PlatformError::GuestMount(e);
+        for e in [
+            GuestMountError::Timeout {
+                after: Duration::from_secs(60),
+                pending: vec!["SECRETTAG".into()],
+            },
+            GuestMountError::Failed {
+                tag: "SECRETTAG".into(),
+                errno: 5,
+            },
+            GuestMountError::InvalidReport {
+                reason: "SECRETTAG".into(),
+            },
+        ] {
+            let (_, m) = pe(gm(e));
+            assert!(!m.contains("SECRETTAG"), "{m}");
+        }
+        assert_eq!(
+            pe(gm(GuestMountError::Timeout {
+                after: Duration::from_secs(60),
+                pending: vec!["t".into()]
+            })),
+            (
+                PluginErrorCode::Timeout,
+                "guest_mount.timeout: guest did not report mount results in time".to_string()
+            )
+        );
+    }
+
+    /// TASK-115.3・MAC-1: 共有パスの祖先が symlink でも正規化して受け付け、存在しないパスは固定文言で拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn task115_3_mac1_share_dir_is_canonicalized() {
+        let dir = tmp_dir("canon-share");
+        let k = kernel(&dir);
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let (mut a, f) = adapter();
+        let r = a.handle(&s(&[
+            "create",
+            "c1",
+            &k,
+            "",
+            "",
+            "data",
+            link.to_str().expect("utf8"),
+            "ro",
+        ]));
+        assert_eq!(r.expect("create"), s(&["created"]));
+        a.handle(&s(&["start", "c1"])).expect("start");
+        assert_eq!(f.0.borrow().launched.len(), 1);
+        let missing = dir.join("missing");
+        assert_eq!(
+            err_of(a.handle(&s(&[
+                "create",
+                "c2",
+                &k,
+                "",
+                "",
+                "data",
+                missing.to_str().expect("utf8"),
+                "ro",
+            ]))),
+            (
+                PluginErrorCode::InvalidArgument,
+                MSG_SHARE_DIR_UNRESOLVED.to_string()
+            )
         );
     }
 

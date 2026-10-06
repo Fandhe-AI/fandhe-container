@@ -21,12 +21,18 @@
 //! # 未実装範囲（REPAIR-3）
 //! 本体型 `Vec<String>`（先頭要素が操作名）は spec 未規定の暫定契約で、型つき本体への置換は TASK-114 で確定する。
 //! [`UnimplementedHandler`] は未結線時・テスト用の全操作 `UNIMPLEMENTED` ハンドラで、実運用の要求は
-//! `adapter::MacosRuntimeAdapter`（#387）が処理する。シャットダウン / ヘルスチェック（#389）は未実装。#389 は [`IDLE_POLL`] の継ぎ目に
-//! 停止フラグ確認を足せる。
+//! `adapter::MacosRuntimeAdapter`（#387）が処理する。
+//!
+//! # シャットダウン（TASK-115.5・#389）
+//! [`serve_until`] は停止フラグ（SIGTERM で立つ。`crate::sys`）を、フレーム受信の先頭（1 バイトも受けていない間）
+//! で確認し、立っていれば [`LoopExit::ShutdownRequested`] で抜ける。受信途中のフレームは打ち切らず
+//! [`FRAME_DEADLINE`] 内で受け切って応答する（境界ずれを作らない）。検知の遅れは最大 [`IDLE_POLL`]。
+//! 要求処理中に届いた場合は、その応答後の次の受信で検知する。
 //!
 //! 対応 ID: TASK-115・PLUG-1・PLUG-2・PLUG-5・MAC-1・REPAIR-2・REPAIR-3・REPAIR-5・REPAIR-12。
 
 use std::io::{self, Read};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use fandhe_container_plugin::{
@@ -34,7 +40,7 @@ use fandhe_container_plugin::{
     RpcTimeout, UDS_RPC_TIMEOUT_DEFAULT, UdsStream, decode_message, encode_message,
 };
 
-/// アイドル待ちの read ポーリング周期。#389 の停止フラグ確認の継ぎ目になる。
+/// アイドル待ちの read ポーリング周期。停止フラグ確認の周期でもある（最大検知遅れ。TASK-115.5）。
 pub const IDLE_POLL: Duration = Duration::from_secs(1);
 
 /// 最初の 1 バイトを受けてからフレーム全体を受け切るまでの合計期限（REPAIR-5）。
@@ -80,12 +86,14 @@ impl RequestHandler for UnimplementedHandler {
     }
 }
 
-/// ループの正常終了要因。#389 がシャットダウン要因を追加できるよう `non_exhaustive`。
+/// ループの正常終了要因。要因の追加に備えて `non_exhaustive`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LoopExit {
     /// 相手（core）が接続を閉じた。
     PeerClosed,
+    /// 停止フラグ（SIGTERM）が立った（TASK-115.5・MAC-1）。
+    ShutdownRequested,
 }
 
 fn error_frame(id: MessageId, error: PluginError) -> Result<Frame, PluginError> {
@@ -147,6 +155,8 @@ enum Recv {
     Closed,
     /// 切断済み接続の生 I/O が拒否された（`io_timeout_unrestored`）。`read_frame` へフォールバックする。
     RawUnusable,
+    /// 受信開始前に停止フラグが立っていた。
+    Shutdown,
 }
 
 fn is_idle(kind: io::ErrorKind) -> bool {
@@ -162,14 +172,29 @@ fn timeout_err() -> PluginError {
     PluginError::new(PluginErrorCode::Timeout, "frame receive deadline exceeded")
 }
 
-/// フレーム 1 つを 2 段階で受信する。`r` の read 期限は呼び出し側が [`IDLE_POLL`] 程度に設定しておく。
+/// 停止フラグを持たない（決して立たない）受信。既存テスト用の薄いラッパー。
+#[cfg(test)]
 fn recv_frame<R: Read>(r: &mut R, deadline: Duration) -> Result<Recv, PluginError> {
+    recv_frame_until(r, deadline, &AtomicBool::new(false))
+}
+
+/// フレーム 1 つを 2 段階で受信する。`r` の read 期限は呼び出し側が [`IDLE_POLL`] 程度に設定しておく。
+///
+/// `stop` は 1 バイトも受けていない間だけ read の前に確認する（受信途中は打ち切らない。TASK-115.5）。
+fn recv_frame_until<R: Read>(
+    r: &mut R,
+    deadline: Duration,
+    stop: &AtomicBool,
+) -> Result<Recv, PluginError> {
     let mut hdr = [0u8; FRAME_HEADER_LEN];
     let mut got = 0usize;
     let mut started: Option<Instant> = None;
     while got < FRAME_HEADER_LEN {
         if started.is_some_and(|t| t.elapsed() >= deadline) {
             return Err(timeout_err());
+        }
+        if got == 0 && stop.load(Ordering::SeqCst) {
+            return Ok(Recv::Shutdown);
         }
         let Some(slot) = hdr.get_mut(got..) else {
             return Err(PluginError::new(PluginErrorCode::Internal, "header index"));
@@ -247,10 +272,21 @@ pub fn serve<H: RequestHandler>(
     stream: &mut UdsStream,
     handler: &mut H,
 ) -> Result<LoopExit, PluginError> {
+    serve_until(stream, handler, &AtomicBool::new(false))
+}
+
+/// [`serve`] に停止フラグを加えた版（TASK-115.5）。`stop` が立つと次の受信境界で
+/// `Ok(LoopExit::ShutdownRequested)` を返す。呼び出し側（`main.rs`）が `stop_all` で VM を停止する。
+pub fn serve_until<H: RequestHandler>(
+    stream: &mut UdsStream,
+    handler: &mut H,
+    stop: &AtomicBool,
+) -> Result<LoopExit, PluginError> {
     stream.set_io_timeout(IDLE_POLL)?;
     loop {
-        let frame = match recv_frame(stream, FRAME_DEADLINE)? {
+        let frame = match recv_frame_until(stream, FRAME_DEADLINE, stop)? {
             Recv::Frame(f) => f,
+            Recv::Shutdown => return Ok(LoopExit::ShutdownRequested),
             Recv::Closed => return Ok(LoopExit::PeerClosed),
             Recv::RawUnusable => match stream.read_frame(RpcTimeout::default()) {
                 Ok(f) => f,
@@ -413,6 +449,72 @@ mod tests {
     }
 
     const LONG: Duration = Duration::from_secs(5);
+
+    /// TASK-115.5・MAC-1: アイドル中（WouldBlock 連続）に停止フラグが立てば Shutdown。
+    #[test]
+    fn task115_5_mac1_recv_idle_then_flag_is_shutdown() {
+        struct FlagOnIdle<'a> {
+            stop: &'a AtomicBool,
+            reads: usize,
+        }
+        impl Read for FlagOnIdle<'_> {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                if self.reads == 3 {
+                    self.stop.store(true, Ordering::SeqCst);
+                }
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+        }
+        let stop = AtomicBool::new(false);
+        let mut r = FlagOnIdle {
+            stop: &stop,
+            reads: 0,
+        };
+        assert!(matches!(
+            recv_frame_until(&mut r, LONG, &stop).expect("recv"),
+            Recv::Shutdown
+        ));
+        assert_eq!(r.reads, 3);
+    }
+
+    /// TASK-115.5・MAC-1: 受信前からフラグが立っていれば、データが届いていても読まない。
+    #[test]
+    fn task115_5_mac1_recv_flag_set_before_read_does_not_read() {
+        let mut r = chunky(req(1, &["op"]).encode(), 1024, 0);
+        let stop = AtomicBool::new(true);
+        assert!(matches!(
+            recv_frame_until(&mut r, LONG, &stop).expect("recv"),
+            Recv::Shutdown
+        ));
+        assert_eq!(r.pos, 0);
+    }
+
+    /// TASK-115.5・MAC-1: 受信途中（1 バイト以上）にフラグが立ってもフレームは完成する。
+    #[test]
+    fn task115_5_mac1_recv_flag_mid_frame_completes_frame() {
+        struct FlagAfterFirst<'a> {
+            inner: Chunky,
+            stop: &'a AtomicBool,
+        }
+        impl Read for FlagAfterFirst<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let n = self.inner.read(buf)?;
+                self.stop.store(true, Ordering::SeqCst);
+                Ok(n)
+            }
+        }
+        let f = req(1, &["op"]);
+        let stop = AtomicBool::new(false);
+        let mut r = FlagAfterFirst {
+            inner: chunky(f.encode(), 3, 0),
+            stop: &stop,
+        };
+        match recv_frame_until(&mut r, LONG, &stop).expect("recv") {
+            Recv::Frame(got) => assert_eq!(got.payload(), f.payload()),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
 
     #[test]
     fn task115_2_plug1_recv_reassembles_split_frame_after_idle() {

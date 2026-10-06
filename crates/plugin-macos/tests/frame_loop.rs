@@ -376,3 +376,68 @@ fn task115_3_mac1_start_returns_error_frame_and_keeps_connection() {
     }
     assert!(err.contains("\"op\":\"start\",\"result\":\"err\""), "{err}");
 }
+/// 子へ SIGTERM を送る（テスト側に FFI・依存を足さないため `kill` コマンドを使う）。
+fn sigterm(h: &Harness) {
+    let st = Command::new("kill")
+        .args(["-TERM", &h.child.id().to_string()])
+        .status()
+        .expect("kill");
+    assert!(st.success());
+}
+
+/// TASK-115.5・PLUG-1: ping は pong を同じ MessageId で返し、接続は維持される。
+#[test]
+fn task115_5_plug1_ping_roundtrip_keeps_connection() {
+    let mut h = Harness::start();
+    let t = Instant::now();
+    match h.call(11, &["ping"]) {
+        ControlMessage::Response { id, body } => {
+            assert_eq!(id.get(), 11);
+            assert_eq!(body, vec!["pong".to_string()]);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    assert!(t.elapsed() < Duration::from_secs(10));
+    expect_unimplemented(h.call(12, &["kill", "a"]), 12);
+    let (code, err) = h.finish();
+    assert_eq!(code, 0, "{err}");
+    // ping は plugin.op 計測の対象外。
+    assert!(!err.contains("plugin.op"), "{err}");
+}
+
+/// TASK-115.5・MAC-1: 接続を開いたまま SIGTERM を受けると、期限内に終了コード 0 で終わる。
+#[test]
+fn task115_5_mac1_sigterm_idle_exits_zero() {
+    let h = Harness::start();
+    sigterm(&h);
+    let (code, err) = h.finish_with(false);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("{\"event\":\"plugin.shutdown\",\"reason\":\"signal\"}"),
+        "{err}"
+    );
+}
+
+/// TASK-115.5・MAC-1: 要求を 1 件処理した後の SIGTERM でも終了コード 0 で終わる。
+#[test]
+fn task115_5_mac1_sigterm_after_request_exits_zero() {
+    let mut h = Harness::start();
+    assert!(matches!(
+        h.call(1, &["ping"]),
+        ControlMessage::Response { .. }
+    ));
+    sigterm(&h);
+    let (code, err) = h.finish_with(false);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("plugin.shutdown"), "{err}");
+}
+
+/// TASK-115.5・MAC-1: SIGTERM を続けて 2 回送ってもプロセスは殺されず終了コード 0 で終わる。
+#[test]
+fn task115_5_mac1_double_sigterm_exits_zero() {
+    let h = Harness::start();
+    sigterm(&h);
+    sigterm(&h);
+    let (code, err) = h.finish_with(false);
+    assert_eq!(code, 0, "{err}");
+}

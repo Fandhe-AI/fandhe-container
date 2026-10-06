@@ -344,6 +344,44 @@ impl RestartConfig {
     }
 }
 
+/// terminate に失敗した（生存の可能性がある）プロセスのハンドルと失敗理由。
+pub type LateOrphan = (Box<dyn LaunchedProcess>, TraitError);
+
+/// 期限超過後に戻った再 launch のプロセスのうち、terminate に失敗して生存の可能性が残るものの受け皿。
+///
+/// 期限超過で [`SuperviseOutcome::RelaunchFailed`] を返した後に実行スレッドへ戻った新プロセスは、
+/// 実行スレッドが terminate する。その terminate が失敗したとき、ハンドルと失敗理由をここへ積む。
+/// 呼び出し側は [`LateOrphans::take`] で取り出して回収する（REPAIR-5。`Clone` は同じ受け皿を共有する）。
+#[derive(Clone, Default)]
+pub struct LateOrphans {
+    inner: Arc<Mutex<Vec<LateOrphan>>>,
+}
+
+impl LateOrphans {
+    fn push(&self, process: Box<dyn LaunchedProcess>, error: TraitError) {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((process, error));
+    }
+
+    /// 積まれている（terminate に失敗した）プロセスとその失敗理由をすべて取り出す。
+    pub fn take(&self) -> Vec<LateOrphan> {
+        std::mem::take(&mut *self.inner.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+impl fmt::Debug for LateOrphans {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let n = self
+            .inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        f.debug_struct("LateOrphans").field("pending", &n).finish()
+    }
+}
+
 /// [`supervise_with_restart`] の結果。`restarts` はこの呼び出し中に実施した再起動の回数。
 #[non_exhaustive]
 pub enum SuperviseOutcome {
@@ -372,6 +410,8 @@ pub enum SuperviseOutcome {
         exit: ProcessExit,
         /// 再 launch の失敗理由。
         error: TraitError,
+        /// 期限超過後に戻ったプロセスの terminate 失敗の受け皿（回収責任は呼び出し側。REPAIR-5）。
+        late: LateOrphans,
         /// 実施した再起動の回数。
         restarts: u32,
     },
@@ -391,6 +431,19 @@ pub enum SuperviseOutcome {
     MonitorFailed {
         /// `monitor` の結果。
         last: MonitorOutcome,
+        /// 終了を確認できていない（生存の可能性がある）起動ハンドル。回収責任は呼び出し側（REPAIR-5）。
+        /// 終了が回収済みの `ExitedUnrecorded` では `None`。
+        process: Option<Box<dyn LaunchedProcess>>,
+        /// 実施した再起動の回数。
+        restarts: u32,
+    },
+    /// `monitor` 自体が `Err`（事前条件違反・wait 失敗）で戻った。終了は確認できていないため、
+    /// 起動ハンドルを返す（回収責任は呼び出し側。REPAIR-5）。再起動はしない（fail-closed）。
+    MonitorError {
+        /// `monitor` の失敗理由。
+        error: TraitError,
+        /// 生存の可能性がある起動ハンドル。
+        process: Box<dyn LaunchedProcess>,
         /// 実施した再起動の回数。
         restarts: u32,
     },
@@ -422,11 +475,13 @@ impl fmt::Debug for SuperviseOutcome {
             Self::RelaunchFailed {
                 exit,
                 error,
+                late,
                 restarts,
             } => f
                 .debug_struct("RelaunchFailed")
                 .field("exit", exit)
                 .field("error", error)
+                .field("late", late)
                 .field("restarts", restarts)
                 .finish(),
             Self::RestartUnrecorded {
@@ -441,9 +496,21 @@ impl fmt::Debug for SuperviseOutcome {
                 .field("has_process", &process.is_some())
                 .field("restarts", restarts)
                 .finish(),
-            Self::MonitorFailed { last, restarts } => f
+            Self::MonitorFailed {
+                last,
+                process,
+                restarts,
+            } => f
                 .debug_struct("MonitorFailed")
                 .field("last", last)
+                .field("has_process", &process.is_some())
+                .field("restarts", restarts)
+                .finish(),
+            Self::MonitorError {
+                error, restarts, ..
+            } => f
+                .debug_struct("MonitorError")
+                .field("error", error)
                 .field("restarts", restarts)
                 .finish(),
         }
@@ -476,15 +543,17 @@ enum Slot {
 /// `relauncher.relaunch` を別スレッドで実行し、上限（＋[`RELAUNCH_REPLY_GRACE`]）までに戻った結果だけを返す（REPAIR-5）。
 ///
 /// 期限後に戻ったプロセスは受け渡し枠の `Mutex` の下で「待つのをやめた」印を見て、実行スレッド上で
-/// terminate する（誰にも処理されず捨てられることはない）。
+/// terminate する。terminate に失敗したらハンドルと理由を `late` へ積み、捨てない（REPAIR-5）。
 fn relaunch_bounded(
     relauncher: &Arc<dyn Relauncher>,
     timeout: Duration,
     terminate_timeout: Duration,
+    late: &LateOrphans,
 ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
     let shared = Arc::new((Mutex::new(Slot::Pending), Condvar::new()));
     let worker = Arc::clone(&shared);
     let r = Arc::clone(relauncher);
+    let late = late.clone();
     std::thread::Builder::new()
         .name("fandhe-relaunch".to_owned())
         .spawn(move || {
@@ -493,9 +562,11 @@ fn relaunch_bounded(
             let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
             if matches!(*slot, Slot::Abandoned) {
                 drop(slot);
-                if let Ok(late) = value {
+                if let Ok(proc) = value {
                     // 期限後に戻った生存プロセスを残さない（記録も回収手段も無いため）。
-                    let _ = late.terminate(terminate_timeout);
+                    if let Err(e) = proc.terminate(terminate_timeout) {
+                        late.push(proc, e);
+                    }
                 }
                 return;
             }
@@ -536,8 +607,9 @@ fn relaunch_bounded(
 /// [`MonitorOperation::Restart`] を再起動 1 回ごとに通知する。`elapsed` は終了検知から `Running` 記録完了までで、
 /// バックオフ時間を含む（バックオフ 0 のとき SUP-3 の「再起動レイテンシ中央値 100ms 以下」に相当）。
 ///
-/// `Err` は `monitor` 自体の失敗（事前条件違反・wait 失敗）で、`process` は呼び出し側に返らず破棄される。
-/// 停止要求はポリシー評価時・バックオフ中・relaunch の直前に確認する。再 launch の待ちは境界で強制する（[`Relauncher`]）。
+/// `monitor` 自体が失敗しても終了を確認できていない `process` は捨てず、[`SuperviseOutcome::MonitorError`] /
+/// [`SuperviseOutcome::MonitorFailed`] で呼び出し側へ返す（REPAIR-5）。
+/// 停止要求はポリシー評価時・バックオフ中・relaunch の直前と直後（`Running` 記録の前）に確認する。再 launch の待ちは境界で強制する（[`Relauncher`]）。
 pub fn supervise_with_restart(
     state: &mut SupervisedState,
     process: Box<dyn LaunchedProcess>,
@@ -550,7 +622,16 @@ pub fn supervise_with_restart(
     let mut process = process;
     let mut restarts: u32 = 0;
     loop {
-        let last = monitor_with_observer(state, process.as_ref(), monitor_config, stop, obs)?;
+        let last = match monitor_with_observer(state, process.as_ref(), monitor_config, stop, obs) {
+            Ok(last) => last,
+            Err(error) => {
+                return Ok(SuperviseOutcome::MonitorError {
+                    error,
+                    process,
+                    restarts,
+                });
+            }
+        };
         let (exit, restart_count) = match &last {
             MonitorOutcome::Exited { exit, record } => (*exit, record.restart_count()),
             MonitorOutcome::StopRequested { .. } => {
@@ -560,7 +641,16 @@ pub fn supervise_with_restart(
                     restarts,
                 });
             }
-            _ => return Ok(SuperviseOutcome::MonitorFailed { last, restarts }),
+            _ => {
+                // 回収済みの終了（ExitedUnrecorded）以外は終了未確認のためハンドルを返す。
+                let process =
+                    (!matches!(last, MonitorOutcome::ExitedUnrecorded { .. })).then_some(process);
+                return Ok(SuperviseOutcome::MonitorFailed {
+                    last,
+                    process,
+                    restarts,
+                });
+            }
         };
         let detected = Instant::now();
         let intent = if stop.is_stop_requested() {
@@ -603,10 +693,12 @@ pub fn supervise_with_restart(
                 elapsed: detected.elapsed(),
             });
         };
+        let late = LateOrphans::default();
         let new_process = match relaunch_bounded(
             relauncher,
             restart_config.relaunch_timeout,
             restart_config.terminate_timeout,
+            &late,
         ) {
             Ok(p) => p,
             Err(error) => {
@@ -614,10 +706,24 @@ pub fn supervise_with_restart(
                 return Ok(SuperviseOutcome::RelaunchFailed {
                     exit,
                     error,
+                    late,
                     restarts,
                 });
             }
         };
+        // 再 launch 中に停止要求が来ていたら、Running を記録せず新プロセスを終了・回収する（SUP-3）。
+        if stop.is_stop_requested() {
+            let process = match new_process.terminate(restart_config.terminate_timeout) {
+                Ok(()) => None,
+                // 終了未確認ならハンドルを呼び出し側へ返す（REPAIR-5）。
+                Err(_) => Some(new_process),
+            };
+            return Ok(SuperviseOutcome::Stopped {
+                last,
+                process,
+                restarts,
+            });
+        }
         let new_pid = new_process.pid();
         let id = state.id().clone();
         // 前回の終了記録（`Stopped`・監視権なし）のままであることを確かめて書く。delete 等で変わっていれば書かない。
@@ -1577,6 +1683,182 @@ mod tests {
             SuperviseOutcome::MonitorFailed { restarts: 0, .. }
         ));
         assert_eq!(q.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// wait が常に失敗する起動ハンドル（終了未確認のまま monitor が Err になる）。
+    struct WaitFails;
+
+    impl LaunchedProcess for WaitFails {
+        fn pid(&self) -> NonZeroU32 {
+            pidn(42)
+        }
+        fn wait(&self, _: Duration) -> Result<Option<ProcessExit>, TraitError> {
+            Err(TraitError::new(ErrorCode::Internal, "wait failure"))
+        }
+        fn terminate(&self, _: Duration) -> Result<(), TraitError> {
+            Ok(())
+        }
+    }
+
+    /// SUP-3・REPAIR-5・TASK-159.3: monitor が Err（wait 失敗）で戻っても、生存の可能性がある起動ハンドルを
+    /// 捨てず呼び出し側へ返す。再 launch はしない。
+    #[test]
+    fn sup3_task159_3_monitor_error_returns_handle() {
+        let st = store(0, 42);
+        let q = Arc::new(Queue::new(&[(43, FAIL)]));
+        let mut s = attach(&st);
+        let out = supervise_with_restart(
+            &mut s,
+            Box::new(WaitFails),
+            &rl(&q),
+            &MonitorConfig::default(),
+            &cfg("always"),
+            &StopToken::new(),
+            &Events::default(),
+        )
+        .unwrap();
+        let SuperviseOutcome::MonitorError {
+            error,
+            process,
+            restarts,
+        } = out
+        else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert_eq!(error.code(), ErrorCode::Internal);
+        assert_eq!(process.pid().get(), 42);
+        assert_eq!(restarts, 0);
+        assert_eq!(q.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// 期限後に terminate 不能なプロセスを返す再 launch。
+    struct SlowStuckRelauncher;
+
+    impl Relauncher for SlowStuckRelauncher {
+        fn relaunch(&self, _: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            std::thread::sleep(Duration::from_millis(1200));
+            Ok(Box::new(StuckProc(44)))
+        }
+    }
+
+    /// REPAIR-5・SUP-3・TASK-159.3: 期限超過後に戻ったプロセスの terminate が失敗したら、
+    /// ハンドルと失敗理由を `LateOrphans` から回収できる（捨てない）。
+    #[test]
+    fn sup3_task159_3_late_relaunch_terminate_failure_is_recoverable() {
+        let st = store(0, 42);
+        let q: Arc<dyn Relauncher> = Arc::new(SlowStuckRelauncher);
+        let config = cfg("always")
+            .with_relaunch_timeout(Duration::from_millis(50))
+            .unwrap();
+        let mut s = attach(&st);
+        let out = supervise_with_restart(
+            &mut s,
+            first(FAIL),
+            &q,
+            &MonitorConfig::default(),
+            &config,
+            &StopToken::new(),
+            &Events::default(),
+        )
+        .unwrap();
+        let SuperviseOutcome::RelaunchFailed { error, late, .. } = out else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert_eq!(error.code(), ErrorCode::Timeout);
+        let end = Instant::now() + Duration::from_secs(5);
+        let mut got = Vec::new();
+        while got.is_empty() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+            got = late.take();
+        }
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0.pid().get(), 44);
+        assert_eq!(got[0].1.code(), ErrorCode::Timeout);
+    }
+
+    /// 再 launch 中に停止要求を立てて新プロセスを返す再 launch。
+    struct StopsDuringRelaunch {
+        stop: StopToken,
+        stuck: bool,
+        terminated: Arc<AtomicU32>,
+    }
+
+    impl Relauncher for StopsDuringRelaunch {
+        fn relaunch(&self, _: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            self.stop.request_stop();
+            if self.stuck {
+                return Ok(Box::new(StuckProc(43)));
+            }
+            Ok(Box::new(Fp {
+                pid: 43,
+                exit: FAIL,
+                terminated: self.terminated.clone(),
+            }))
+        }
+    }
+
+    /// SUP-3・TASK-159.3: 再 launch 中に停止要求が来たら、Running を記録せず新プロセスを terminate して戻る。
+    /// restart_count は進まず、状態は Stopped のまま。
+    #[test]
+    fn sup3_task159_3_stop_during_relaunch_terminates_new_process() {
+        let st = store(0, 42);
+        let stop = StopToken::new();
+        let terminated = Arc::new(AtomicU32::new(0));
+        let q: Arc<dyn Relauncher> = Arc::new(StopsDuringRelaunch {
+            stop: stop.clone(),
+            stuck: false,
+            terminated: terminated.clone(),
+        });
+        let mut s = attach(&st);
+        let out = supervise_with_restart(
+            &mut s,
+            first(FAIL),
+            &q,
+            &MonitorConfig::default(),
+            &cfg("always"),
+            &stop,
+            &Events::default(),
+        )
+        .unwrap();
+        let SuperviseOutcome::Stopped {
+            process, restarts, ..
+        } = out
+        else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert!(process.is_none());
+        assert_eq!(restarts, 0);
+        assert_eq!(terminated.load(Ordering::SeqCst), 1);
+        let rec = st.rec.lock().unwrap();
+        assert_eq!(rec.restart_count(), 0);
+        assert_eq!(rec.status().state(), ContainerState::Stopped);
+    }
+
+    /// SUP-3・REPAIR-5・TASK-159.3: 停止要求後の新プロセスの terminate が失敗したらハンドルを返す。
+    #[test]
+    fn sup3_task159_3_stop_during_relaunch_terminate_failure_returns_handle() {
+        let st = store(0, 42);
+        let stop = StopToken::new();
+        let q: Arc<dyn Relauncher> = Arc::new(StopsDuringRelaunch {
+            stop: stop.clone(),
+            stuck: true,
+            terminated: Arc::new(AtomicU32::new(0)),
+        });
+        let mut s = attach(&st);
+        let out = supervise_with_restart(
+            &mut s,
+            first(FAIL),
+            &q,
+            &MonitorConfig::default(),
+            &cfg("always"),
+            &stop,
+            &Events::default(),
+        )
+        .unwrap();
+        let SuperviseOutcome::Stopped { process, .. } = out else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert_eq!(process.map(|p| p.pid().get()), Some(43));
     }
 
     /// SUP-3・TASK-159.3: 設定の境界値（バックオフ上限・タイムアウト 0 / 超過は InvalidArgument）。

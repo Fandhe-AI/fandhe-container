@@ -249,6 +249,38 @@ fn recv_frame_until<R: Read>(
     Ok(Recv::Frame(Frame::decode_body(header, &body)?))
 }
 
+/// [`Recv::RawUnusable`] 後の代替受信（`read_frame`）の結果。
+#[derive(Debug)]
+enum Fallback {
+    Frame(Frame),
+    Exit(LoopExit),
+}
+
+/// 代替受信の期限。通常のポーリングと同じ [`IDLE_POLL`] で、停止フラグの検知遅れを抑える（WIN-1）。
+fn fallback_timeout() -> Result<RpcTimeout, PluginError> {
+    RpcTimeout::new(IDLE_POLL)
+}
+
+/// 代替受信の結果を分類する（I/O なしの純粋関数）。
+///
+/// 切断済みで読み切った（`Unavailable`）はフレーム境界の切断として `PeerClosed`。期限切れ（`Timeout`）は
+/// 停止フラグが立っていれば `ShutdownRequested`、立っていなければ `Err`（接続は使用不可になるため fail-closed）。
+fn fallback_outcome(
+    res: Result<Frame, PluginError>,
+    stop: &AtomicBool,
+) -> Result<Fallback, PluginError> {
+    match res {
+        Ok(f) => Ok(Fallback::Frame(f)),
+        Err(e) if e.code() == PluginErrorCode::Unavailable => {
+            Ok(Fallback::Exit(LoopExit::PeerClosed))
+        }
+        Err(e) if e.code() == PluginErrorCode::Timeout && stop.load(Ordering::SeqCst) => {
+            Ok(Fallback::Exit(LoopExit::ShutdownRequested))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// 接続済み `stream` 上で要求を順次処理する（受信 → [`handle_frame`] → 送信の繰り返し）。
 ///
 /// 相手の正常切断で `Ok(LoopExit::PeerClosed)`。転送・フレーム不正・プロトコル違反・送信失敗は `Err`
@@ -273,14 +305,16 @@ pub fn serve_until<H: RequestHandler>(
             Recv::Frame(f) => f,
             Recv::Shutdown => return Ok(LoopExit::ShutdownRequested),
             Recv::Closed => return Ok(LoopExit::PeerClosed),
-            Recv::RawUnusable => match stream.read_frame(RpcTimeout::default()) {
-                Ok(f) => f,
-                // 切断済みで読み切った。フレーム境界の切断として扱う。
-                Err(e) if e.code() == PluginErrorCode::Unavailable => {
-                    return Ok(LoopExit::PeerClosed);
+            Recv::RawUnusable => {
+                // 代替経路でも受信前に停止フラグを確認し、受信期限は IDLE_POLL に絞る（WIN-1・REPAIR-5）。
+                if stop.load(Ordering::SeqCst) {
+                    return Ok(LoopExit::ShutdownRequested);
                 }
-                Err(e) => return Err(e),
-            },
+                match fallback_outcome(stream.read_frame(fallback_timeout()?), stop)? {
+                    Fallback::Frame(f) => f,
+                    Fallback::Exit(exit) => return Ok(exit),
+                }
+            }
         };
         let reply = handle_frame(&frame, handler)?;
         stream.write_frame(&reply, RpcTimeout::default())?;
@@ -518,6 +552,36 @@ mod tests {
             Recv::Shutdown
         ));
         assert_eq!(r.reads, 3);
+    }
+
+    #[test]
+    fn task116_5_win1_fallback_timeout_is_short() {
+        assert_eq!(
+            fallback_timeout().expect("timeout").as_duration(),
+            IDLE_POLL
+        );
+    }
+
+    #[test]
+    fn task116_5_win1_fallback_timeout_with_stop_is_shutdown() {
+        let timeout = || Err(PluginError::new(PluginErrorCode::Timeout, "t"));
+        let stop = AtomicBool::new(true);
+        assert!(matches!(
+            fallback_outcome(timeout(), &stop).expect("outcome"),
+            Fallback::Exit(LoopExit::ShutdownRequested)
+        ));
+        let idle = AtomicBool::new(false);
+        let e = fallback_outcome(timeout(), &idle).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Timeout);
+        let closed = Err(PluginError::new(PluginErrorCode::Unavailable, "c"));
+        assert!(matches!(
+            fallback_outcome(closed, &idle).expect("outcome"),
+            Fallback::Exit(LoopExit::PeerClosed)
+        ));
+        assert!(matches!(
+            fallback_outcome(Ok(req(1, &["op"])), &idle).expect("outcome"),
+            Fallback::Frame(_)
+        ));
     }
 
     #[test]

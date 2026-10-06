@@ -13,7 +13,7 @@
 //! 出力は固定文言と列挙名のみで、socket パス・引数値・環境変数値・受信データを含めない。
 //! peer 認証の拒否イベント行は socket パスを含むため転記しない（永続的な監査ログへの配線は
 //! core 側 TASK-114 で未実装。REPAIR-3・SEC-4）。
-//! 要求は `adapter::MacosRuntimeAdapter`（TASK-115.3・#387）が処理し、終了時に実行中 VM を `stop_all` で停止する。
+//! 要求は `adapter::MacosRuntimeAdapter`（TASK-115.3・#387）が処理し、終了時に実行中 VM を `stop_all`（総予算 `SHUTDOWN_BUDGET` 4 秒。core の 5 秒の終了猶予内に収める。REPAIR-5）で停止する。
 //! 停止結果は stderr へ件数のみの 1 行 JSON（`plugin.cleanup`）で出す。
 
 use std::process::ExitCode;

@@ -49,10 +49,13 @@
 //! - virtiofs 共有は「デバイス構成のみ」。ゲスト内 mount 先の指定は受け付けない（ゲスト init 未実装のため
 //!   `guest_mount.timeout` になる。MAC-1）。rootfs ブロックデバイス・コンソールログ・CPU / メモリ指定も含まない。
 //! - 1 コンテナ = 1 VM（常駐 VM 共用の MAC-4 は未決）。状態はプロセス内メモリのみ（都度起動モードでは引き継げない）。
-//! - VM 操作の期限は `OpTimeouts::default()`。core 側 RPC 期限との整合は TASK-114 の判断事項。
+//! - VM 操作の期限は core 側 RPC・都度起動の合計期限（10 秒）と終了猶予（5 秒）に収まる固定値
+//!   （[`LAUNCH_START_TIMEOUT`] 等・[`SHUTDOWN_BUDGET`]）。core からの期限伝達（要求本体への期限指定）は TASK-114。
+//!   既定の `OpTimeouts`（start 30 秒・guest mount 60 秒・stop 15 秒）は使わない。
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use fandhe_container_platform_macos::config::{ConfigError, VmConfigSpec};
 use fandhe_container_platform_macos::error::{GuestMountError, PlatformError, VmError};
@@ -66,6 +69,18 @@ use crate::frame_loop::RequestHandler;
 
 /// 登録できるコンテナ数の上限（無制限確保の防止）。
 pub const MAX_CONTAINERS: usize = 64;
+
+/// core 側 plugin RPC・都度起動の合計期限（10 秒）に収めるための `start` 完了待ち（REPAIR-5・TASK-115.3）。
+pub const LAUNCH_START_TIMEOUT: Duration = Duration::from_secs(3);
+/// 同 `stop` 完了待ち。停止はゲスト mount 待ちの失敗後始末と終了時停止でも使う。
+pub const LAUNCH_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+/// 同 状態照会の応答待ち。
+pub const LAUNCH_STATE_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
+/// 同 ゲスト内 virtiofs mount 報告の待機。start と合わせて 7 秒で、10 秒の RPC 期限に 3 秒の余裕を残す。
+pub const LAUNCH_GUEST_MOUNT_TIMEOUT: Duration = Duration::from_secs(4);
+/// 接続終了後の一括停止に使う総予算。core の `ResidentPlugin` は接続を閉じて 5 秒の猶予後に
+/// 強制終了するため、それより短くして `plugin.cleanup` の報告まで完了させる（REPAIR-5）。
+pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(4);
 
 /// id の最大バイト数（core の `ContainerId` と同じ）。
 const ID_MAX_BYTES: usize = 255;
@@ -84,6 +99,8 @@ pub trait MacosBackend {
     fn launch(&self, spec: &VmConfigSpec) -> Result<Self::Handle, BackendError>;
     /// 期限つきで VM を停止する。
     fn stop(&self, handle: &Self::Handle) -> Result<(), BackendError>;
+    /// [`MacosBackend::stop`] が 1 回に最大で待つ時間。一括停止の予算配分に使う。
+    fn stop_timeout(&self) -> Duration;
 }
 
 /// [`MacosBackend`] の失敗。
@@ -129,7 +146,19 @@ impl MacosBackend for PlatformBackend {
 
     fn launch(&self, spec: &VmConfigSpec) -> Result<Self::Handle, BackendError> {
         use fandhe_container_platform_macos::vm::{OpTimeouts, Vm};
-        Ok(Vm::launch(spec, OpTimeouts::default())?)
+        // 値は固定で範囲内だが、失敗しても panic せず構造化エラーへ写す。
+        let timeouts = OpTimeouts::try_new(
+            LAUNCH_START_TIMEOUT,
+            LAUNCH_STOP_TIMEOUT,
+            LAUNCH_STATE_QUERY_TIMEOUT,
+        )
+        .and_then(|t| t.with_guest_mount(LAUNCH_GUEST_MOUNT_TIMEOUT))
+        .map_err(PlatformError::Vm)?;
+        Ok(Vm::launch(spec, timeouts)?)
+    }
+
+    fn stop_timeout(&self) -> Duration {
+        LAUNCH_STOP_TIMEOUT
     }
 
     fn stop(&self, handle: &Self::Handle) -> Result<(), BackendError> {
@@ -152,6 +181,10 @@ impl MacosBackend for PlatformBackend {
 
     fn stop(&self, handle: &Self::Handle) -> Result<(), BackendError> {
         match *handle {}
+    }
+
+    fn stop_timeout(&self) -> Duration {
+        LAUNCH_STOP_TIMEOUT
     }
 }
 
@@ -189,10 +222,20 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
         }
     }
 
-    /// 実行中の VM すべてに期限つき停止を試み、停止できた分を登録簿から外す。
+    /// [`SHUTDOWN_BUDGET`] 内で [`Self::stop_all_within`] を行う。
     ///
     /// `Vm` の `Drop` は停止を要求するだけで待たないため、接続終了時に `main.rs` が明示的に呼ぶ。
     pub fn stop_all(&mut self) -> StopAllSummary {
+        self.stop_all_within(SHUTDOWN_BUDGET)
+    }
+
+    /// 実行中の VM に総予算 `budget` 内で順に停止を試み、停止できた分を登録簿から外す。
+    ///
+    /// 残り予算が 1 回の停止待ち（[`MacosBackend::stop_timeout`]）に満たなければ以降の VM は試さず
+    /// `remaining` に数える（core の終了猶予を超えて plugin が強制終了されるのを避ける。REPAIR-5）。
+    pub fn stop_all_within(&mut self, budget: Duration) -> StopAllSummary {
+        let deadline = Instant::now() + budget;
+        let per_stop = self.backend.stop_timeout();
         let mut summary = StopAllSummary {
             stopped: 0,
             remaining: 0,
@@ -201,9 +244,13 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
         self.entries.retain(|_, entry| match &entry.state {
             State::Created => false,
             State::Running(h) => {
-                if backend
-                    .stop(h)
-                    .map_or_else(|e| e.is_already_halted(), |()| true)
+                let affordable = deadline
+                    .checked_duration_since(Instant::now())
+                    .is_some_and(|left| left >= per_stop);
+                if affordable
+                    && backend
+                        .stop(h)
+                        .map_or_else(|e| e.is_already_halted(), |()| true)
                 {
                     summary.stopped += 1;
                     false
@@ -474,6 +521,7 @@ mod tests {
         fail_launch: bool,
         fail_stop: bool,
         halted_stop: bool,
+        stop_timeout: Duration,
         next: u32,
     }
 
@@ -502,6 +550,9 @@ mod tests {
                 .push((spec.kernel.as_path().to_path_buf(), shares));
             c.next += 1;
             Ok(c.next)
+        }
+        fn stop_timeout(&self) -> Duration {
+            self.0.borrow().stop_timeout
         }
         fn stop(&self, h: &u32) -> Result<(), BackendError> {
             let mut c = self.0.borrow_mut();
@@ -706,6 +757,45 @@ mod tests {
             a.stop_all(),
             StopAllSummary {
                 stopped: 1,
+                remaining: 0
+            }
+        );
+    }
+
+    /// TASK-115.3・REPAIR-5: 起動・終了の待機は core の RPC 期限 10 秒・終了猶予 5 秒に収まる。
+    #[test]
+    fn task115_3_repair5_timeouts_fit_core_deadlines() {
+        let launch = LAUNCH_START_TIMEOUT + LAUNCH_GUEST_MOUNT_TIMEOUT;
+        assert_eq!(launch, Duration::from_secs(7));
+        assert!(launch < Duration::from_secs(10));
+        assert_eq!(SHUTDOWN_BUDGET, Duration::from_secs(4));
+        assert!(SHUTDOWN_BUDGET < Duration::from_secs(5));
+        assert!(LAUNCH_STOP_TIMEOUT <= SHUTDOWN_BUDGET);
+    }
+
+    /// TASK-115.3・REPAIR-5: 予算が 1 回の停止待ちに満たなければ VM を試さず remaining に数える。
+    #[test]
+    fn task115_3_repair5_stop_all_respects_budget() {
+        let dir = tmp_dir("budget");
+        let k = kernel(&dir);
+        let (mut a, f) = adapter();
+        f.0.borrow_mut().stop_timeout = Duration::from_secs(2);
+        for id in ["a", "b"] {
+            create_ok(&mut a, id, &k);
+            a.handle(&s(&["start", id])).expect("start");
+        }
+        assert_eq!(
+            a.stop_all_within(Duration::from_secs(1)),
+            StopAllSummary {
+                stopped: 0,
+                remaining: 2
+            }
+        );
+        assert!(f.0.borrow().stopped.is_empty());
+        assert_eq!(
+            a.stop_all_within(Duration::from_secs(60)),
+            StopAllSummary {
+                stopped: 2,
                 remaining: 0
             }
         );

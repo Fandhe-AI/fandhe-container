@@ -351,34 +351,94 @@ pub type LateOrphan = (Box<dyn LaunchedProcess>, TraitError);
 ///
 /// 期限超過で [`SuperviseOutcome::RelaunchFailed`] を返した後に実行スレッドへ戻った新プロセスは、
 /// 実行スレッドが terminate する。その terminate が失敗したとき、ハンドルと失敗理由をここへ積む。
-/// 呼び出し側は [`LateOrphans::take`] で取り出して回収する（REPAIR-5。`Clone` は同じ受け皿を共有する）。
+/// 実行スレッドは期限後も動き続けるため、空の [`LateOrphans::take`] だけでは回収完了を判定できない。
+/// 呼び出し側は [`LateOrphans::wait_settled`]（または [`LateOrphans::is_settled`]）で実行スレッドの終了を
+/// 確認してから [`LateOrphans::take`] で取り出して回収する（REPAIR-5。`Clone` は同じ受け皿を共有する）。
 #[derive(Clone, Default)]
 pub struct LateOrphans {
-    inner: Arc<Mutex<Vec<LateOrphan>>>,
+    inner: Arc<(Mutex<LateInner>, Condvar)>,
+}
+
+#[derive(Default)]
+struct LateInner {
+    orphans: Vec<LateOrphan>,
+    /// 動作中の再 launch 実行スレッドの数（0 なら以後ハンドルが積まれない）。
+    active_workers: u32,
 }
 
 impl LateOrphans {
+    fn lock(&self) -> std::sync::MutexGuard<'_, LateInner> {
+        self.inner.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 実行スレッドの起動前に呼ぶ。
+    fn worker_started(&self) {
+        let mut g = self.lock();
+        g.active_workers = g.active_workers.saturating_add(1);
+    }
+
+    /// 実行スレッドの終了時（panic・起動失敗を含む）に呼ぶ。待機者を起こす。
+    fn worker_finished(&self) {
+        let mut g = self.lock();
+        g.active_workers = g.active_workers.saturating_sub(1);
+        drop(g);
+        self.inner.1.notify_all();
+    }
+
     fn push(&self, process: Box<dyn LaunchedProcess>, error: TraitError) {
-        self.inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push((process, error));
+        self.lock().orphans.push((process, error));
+    }
+
+    /// 再 launch の実行スレッドがすべて終了済みで、以後ハンドルが積まれないとき `true`。
+    pub fn is_settled(&self) -> bool {
+        self.lock().active_workers == 0
+    }
+
+    /// 実行スレッドの終了を `timeout` まで待つ。終了していれば `true`（以後の [`LateOrphans::take`] が最終結果）。
+    /// `false` は relaunch が戻らず未完了で、呼び出し側は受け皿を保持して後で再確認する（REPAIR-5）。
+    pub fn wait_settled(&self, timeout: Duration) -> bool {
+        let end = Instant::now().checked_add(timeout);
+        let mut g = self.lock();
+        while g.active_workers > 0 {
+            let remaining = match end {
+                Some(e) => match e.checked_duration_since(Instant::now()) {
+                    Some(r) if !r.is_zero() => r,
+                    _ => return false,
+                },
+                None => timeout,
+            };
+            g = self
+                .inner
+                .1
+                .wait_timeout(g, remaining)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        true
     }
 
     /// 積まれている（terminate に失敗した）プロセスとその失敗理由をすべて取り出す。
     pub fn take(&self) -> Vec<LateOrphan> {
-        std::mem::take(&mut *self.inner.lock().unwrap_or_else(PoisonError::into_inner))
+        std::mem::take(&mut self.lock().orphans)
+    }
+}
+
+/// 実行スレッド終了時に必ず [`LateOrphans::worker_finished`] を呼ぶガード。
+struct WorkerGuard(LateOrphans);
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        self.0.worker_finished();
     }
 }
 
 impl fmt::Debug for LateOrphans {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let n = self
-            .inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .len();
-        f.debug_struct("LateOrphans").field("pending", &n).finish()
+        let g = self.lock();
+        f.debug_struct("LateOrphans")
+            .field("pending", &g.orphans.len())
+            .field("active_workers", &g.active_workers)
+            .finish()
     }
 }
 
@@ -554,9 +614,13 @@ fn relaunch_bounded(
     let worker = Arc::clone(&shared);
     let r = Arc::clone(relauncher);
     let late = late.clone();
+    late.worker_started();
+    let guard = WorkerGuard(late.clone());
     std::thread::Builder::new()
         .name("fandhe-relaunch".to_owned())
         .spawn(move || {
+            // 全経路（panic を含む）で終了を通知する。terminate 失敗の push は通知より先に行う。
+            let _guard = guard;
             let value = r.relaunch(timeout);
             let (lock, cvar) = &*worker;
             let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -734,11 +798,16 @@ pub fn supervise_with_restart(
         }
         let new_pid = new_process.pid();
         let id = state.id().clone();
-        // 自分が監視して記録した終了記録（同一の `Stopped` 状態・監視権なし）のままであることを確かめて書く。
+        // 自分が監視して記録した終了記録（同一の `Stopped` 状態・監視権なし・同じ `restart_count`）のままであることを確かめて書く。
+        // 別処理が再起動して同じ終了で再び `Stopped` になっても `restart_count` が進むため、別の終了記録と取り違えない。
         // 競合後に stop / delete / 再作成など別の遷移が入っていれば書かない（health 更新による revision 変化は許容）。
         let written = write_with_retry_when(
             state,
-            |rec| rec.status() == &exited_status && rec.supervision().supervisor_pid().is_none(),
+            |rec| {
+                rec.status() == &exited_status
+                    && rec.supervision().supervisor_pid().is_none()
+                    && rec.restart_count() == restart_count
+            },
             |rec| {
                 // 競合後の refresh で他者の更新を消さないよう、書き込みごとに最新値から加算する（上限で頭打ち）。
                 Ok((
@@ -1052,8 +1121,6 @@ mod tests {
         UpdateStateRequest,
     };
 
-    use crate::run::MAX_WRITE_ATTEMPTS;
-
     fn cid() -> ContainerId {
         ContainerId::new("c1").unwrap()
     }
@@ -1062,7 +1129,7 @@ mod tests {
         NonZeroU32::new(n).unwrap()
     }
 
-    /// メモリ上の 1 レコードストア。`conflicts` 回だけ外部更新（restart_count +1）で競合させる。
+    /// メモリ上の 1 レコードストア。`conflicts` 回だけ外部更新（health の反転。restart_count は変えない）で競合させる。
     struct Store {
         rec: Mutex<StateRecord>,
         conflicts: Mutex<u32>,
@@ -1087,11 +1154,12 @@ mod tests {
             if *c > 0 {
                 *c -= 1;
                 let sup = g.supervision();
-                let s = SupervisionState::new(
-                    sup.supervisor_pid(),
-                    sup.health(),
-                    sup.restart_count() + 1,
-                );
+                let flipped = match sup.health() {
+                    Some(HealthStatus::Healthy) => HealthStatus::Unhealthy,
+                    _ => HealthStatus::Healthy,
+                };
+                let s =
+                    SupervisionState::new(sup.supervisor_pid(), Some(flipped), sup.restart_count());
                 *g = bump(&g, s, g.status().clone());
                 return Err(TraitError::new(ErrorCode::FailedPrecondition, "stale"));
             }
@@ -1411,11 +1479,11 @@ mod tests {
         assert_eq!(q.terminated.load(Ordering::SeqCst), 1);
         let g = st.rec.lock().unwrap();
         assert_eq!(g.status().state(), ContainerState::Stopped);
-        // 競合ごとの外部加算だけが残り、自分の加算は載らない。
-        assert_eq!(g.restart_count(), MAX_WRITE_ATTEMPTS);
+        // 競合は health の反転のみで、自分の加算は載らない。
+        assert_eq!(g.restart_count(), 0);
     }
 
-    /// SUP-3・TASK-159.3: 競合 1 回（外部が +1）の後も外部の更新を消さず、自分の +1 が載る（1 -> 3）。
+    /// SUP-3・TASK-159.3: 競合 1 回（外部が health を更新）の後も外部の更新を消さず、自分の +1 が載る（1 -> 2）。
     #[test]
     fn sup3_task159_3_increment_survives_revision_conflict() {
         let st = store(1, 42);
@@ -1444,8 +1512,8 @@ mod tests {
         .unwrap();
         // 2 周目の終了後は再 launch が尽きて失敗する。
         assert!(matches!(out, SuperviseOutcome::RelaunchFailed { .. }));
-        // 初期 1 + 競合の外部加算 1 + 自分の再起動 1 = 3（再 launch 失敗は数えない）。
-        assert_eq!(st.rec.lock().unwrap().restart_count(), 3);
+        // 初期 1 + 自分の再起動 1 = 2（競合は health のみで、再 launch 失敗は数えない）。
+        assert_eq!(st.rec.lock().unwrap().restart_count(), 2);
     }
 
     /// SUP-3・TASK-159.3: 競合後に別の遷移（別の終了コードの Stopped）が入っていたら Running で上書きせず、
@@ -1491,7 +1559,69 @@ mod tests {
         let g = st.rec.lock().unwrap();
         assert_eq!(g.status().state(), ContainerState::Stopped);
         assert_eq!(g.status().exit_code(), Some(99));
-        // 競合用の外部加算 1 のみで、自分の再起動は数えない。
+        // 自分の再起動は数えない。
+        assert_eq!(g.restart_count(), 0);
+    }
+
+    /// SUP-3・TASK-159.3: 別処理が再起動して同じ終了コードで再び Stopped になっても（restart_count が進む）、
+    /// 自分の終了記録ではないため Running で上書きせず、新プロセスを回収して中止する。
+    #[test]
+    fn sup3_task159_3_same_exit_after_foreign_restart_aborts() {
+        let st = store(0, 42);
+        struct Foreign(Queue, Arc<Store>);
+        impl Relauncher for Foreign {
+            fn relaunch(&self, t: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+                // 別処理が再起動し（count +1）、同じ終了コードで再び Stopped へ戻した状態を作る。
+                {
+                    let mut g = self.1.rec.lock().unwrap();
+                    let sup = g.supervision();
+                    let next = StateRecord::new(
+                        g.status().clone(),
+                        g.bundle().to_path_buf(),
+                        StateRevision::from_raw(g.revision().value() + 1),
+                    )
+                    .unwrap()
+                    .with_supervision(SupervisionState::new(
+                        None,
+                        sup.health(),
+                        sup.restart_count() + 1,
+                    ));
+                    *g = next;
+                }
+                *self.1.conflicts.lock().unwrap() = 1;
+                self.0.relaunch(t)
+            }
+        }
+        let q = Arc::new(Foreign(
+            Queue::new(&[(43, ProcessExit::Exited(0))]),
+            st.clone(),
+        ));
+        let mut s = attach(&st);
+        let out = supervise_with_restart(
+            &mut s,
+            first(FAIL),
+            &rl(&q),
+            &MonitorConfig::default(),
+            &cfg("always"),
+            &StopToken::new(),
+            &Events::default(),
+        )
+        .unwrap();
+        let SuperviseOutcome::RestartUnrecorded {
+            terminate_error,
+            process,
+            restarts,
+            ..
+        } = out
+        else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert!(terminate_error.is_none());
+        assert!(process.is_none());
+        assert_eq!(restarts, 0);
+        assert_eq!(q.0.terminated.load(Ordering::SeqCst), 1);
+        let g = st.rec.lock().unwrap();
+        assert_eq!(g.status().state(), ContainerState::Stopped);
         assert_eq!(g.restart_count(), 1);
     }
 
@@ -1819,12 +1949,10 @@ mod tests {
             panic!("unexpected outcome: {out:?}")
         };
         assert_eq!(error.code(), ErrorCode::Timeout);
-        let end = Instant::now() + Duration::from_secs(5);
-        let mut got = Vec::new();
-        while got.is_empty() && Instant::now() < end {
-            std::thread::sleep(Duration::from_millis(20));
-            got = late.take();
-        }
+        // 実行スレッドの完了を待ってから回収する（空の take で終えない。REPAIR-5）。
+        assert!(late.wait_settled(Duration::from_secs(5)));
+        assert!(late.is_settled());
+        let got = late.take();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0.pid().get(), 44);
         assert_eq!(got[0].1.code(), ErrorCode::Timeout);

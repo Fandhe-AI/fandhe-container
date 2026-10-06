@@ -49,8 +49,8 @@
 //! - virtiofs 共有は「デバイス構成のみ」。ゲスト内 mount 先の指定は受け付けない（ゲスト init 未実装のため
 //!   `guest_mount.timeout` になる。MAC-1）。rootfs ブロックデバイス・コンソールログ・CPU / メモリ指定も含まない。
 //! - 起動失敗後の `start` 再試行は拒否する（失敗した VM の停止は非同期で完了を確認できず、VM が重複し得るため。
-//!   `stop` で登録を解除し `create` し直す）。同時実行 VM 数は [`SHUTDOWN_BUDGET`] 内に逐次停止できる数
-//!   （停止待ち 2 秒なら 2）に制限する。停止できず残った VM の回収は `Vm` の drop 停止要求（非同期）と
+//!   `stop` も拒否し、同じ ID の再作成を許さない。登録は plugin プロセス終了まで残る）。同時実行 VM 数は
+//!   [`SHUTDOWN_BUDGET`] 内に逐次停止できる数から 1 台分の処理余裕を引いた数（停止待ち 2 秒なら 1）に制限する。停止できず残った VM の回収は `Vm` の drop 停止要求（非同期）と
 //!   core の終了処理に委ね、完了は保証しない。
 //! - 1 コンテナ = 1 VM（常駐 VM 共用の MAC-4 は未決）。状態はプロセス内メモリのみ（都度起動モードでは引き継げない）。
 //! - VM 操作の期限は core 側 RPC・都度起動の合計期限（10 秒）と終了猶予（5 秒）に収まる固定値
@@ -195,8 +195,8 @@ impl MacosBackend for PlatformBackend {
 enum State<H> {
     Created,
     /// 起動に失敗した。`Vm` の drop による停止要求は非同期で完了を待てないため、先の VM が止まったことを
-    /// 確認できない。そのため `start` の再試行を拒否し（VM の重複起動防止。REPAIR-3）、`stop` での登録解除と
-    /// 新規 `create` だけを許す。
+    /// 確認できない。そのため `start` の再試行と `stop` による登録解除（同じ ID の再 `create`）を拒否し、
+    /// VM の重複起動を防ぐ（REPAIR-3）。登録は plugin プロセス終了まで残る。
     LaunchFailed,
     Running(H),
 }
@@ -275,7 +275,9 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
         summary
     }
 
-    /// 同時に実行できる VM 数の上限。[`SHUTDOWN_BUDGET`] 内で逐次停止できる数（停止待ちが 0 なら制限しない）。
+    /// 同時に実行できる VM 数の上限。[`SHUTDOWN_BUDGET`] 内で逐次停止できる数から 1 台分の処理余裕を引いた数
+    /// （最低 1。停止待ちが 0 なら制限しない）。余裕を引くのは、先の停止が期限ぎりぎりまでかかっても
+    /// `stop_all_within` が最後の VM の停止を試みられる（残り時間が停止待ち以上になる）ようにするため（REPAIR-5）。
     fn max_running(&self) -> usize {
         let per_stop = self.backend.stop_timeout().as_millis();
         if per_stop == 0 {
@@ -283,6 +285,7 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
         }
         usize::try_from(SHUTDOWN_BUDGET.as_millis() / per_stop)
             .unwrap_or(usize::MAX)
+            .saturating_sub(1)
             .max(1)
     }
 
@@ -385,6 +388,12 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
     fn stop(&mut self, body: &[String]) -> Result<Vec<String>, PluginError> {
         let id = single_id(body)?;
         let entry = self.entries.get(id).ok_or_else(not_found)?;
+        if matches!(entry.state, State::LaunchFailed) {
+            return Err(PluginError::new(
+                PluginErrorCode::FailedPrecondition,
+                "previous launch failed and VM shutdown is unconfirmed",
+            ));
+        }
         if let State::Running(h) = &entry.state {
             // 失敗時は登録を残す（再試行可）。
             // 既に停止済み（InvalidState）なら停止成功として扱い、登録を外す。
@@ -747,7 +756,7 @@ mod tests {
         }
     }
 
-    /// TASK-115.3・REPAIR-3: launch 失敗後は start 再試行を拒否し（VM 重複防止）、stop で登録を解除できる。
+    /// TASK-115.3・REPAIR-3: launch 失敗後は start 再試行・stop による登録解除・同 ID の再 create を拒否する（VM 重複防止）。
     #[test]
     fn task115_3_repair3_launch_failure_blocks_restart() {
         let dir = tmp_dir("launchfail");
@@ -763,10 +772,12 @@ mod tests {
         assert_eq!(c, PluginErrorCode::FailedPrecondition);
         assert_eq!(m, "container is not in the created state");
         assert!(f.0.borrow().launched.is_empty());
-        assert_eq!(a.handle(&s(&["stop", "a"])).expect("stop"), s(&["stopped"]));
+        let (c, m) = err_of(a.handle(&s(&["stop", "a"])));
+        assert_eq!(c, PluginErrorCode::FailedPrecondition);
+        assert_eq!(m, "previous launch failed and VM shutdown is unconfirmed");
+        let (c, _) = err_of(a.handle(&s(&["create", "a", &k, "", ""])));
+        assert_eq!(c, PluginErrorCode::AlreadyExists);
         assert!(f.0.borrow().stopped.is_empty());
-        create_ok(&mut a, "a", &k);
-        a.handle(&s(&["start", "a"])).expect("start after recreate");
     }
 
     /// TASK-115.3・REPAIR-5: 同時実行 VM 数は終了予算内に全件停止できる数に制限され、全件停止できる。
@@ -776,13 +787,12 @@ mod tests {
         let k = kernel(&dir);
         let (mut a, f) = adapter();
         f.0.borrow_mut().stop_timeout = Duration::from_secs(2);
-        for id in ["a", "b", "c"] {
+        for id in ["a", "b"] {
             create_ok(&mut a, id, &k);
         }
         a.handle(&s(&["start", "a"])).expect("start");
-        a.handle(&s(&["start", "b"])).expect("start");
         assert_eq!(
-            err_of(a.handle(&s(&["start", "c"]))),
+            err_of(a.handle(&s(&["start", "b"]))),
             (
                 PluginErrorCode::FailedPrecondition,
                 "too many running VMs".to_string()
@@ -791,7 +801,7 @@ mod tests {
         assert_eq!(
             a.stop_all(),
             StopAllSummary {
-                stopped: 2,
+                stopped: 1,
                 remaining: 0
             }
         );
@@ -864,13 +874,13 @@ mod tests {
         let dir = tmp_dir("budget");
         let k = kernel(&dir);
         let (mut a, f) = adapter();
-        f.0.borrow_mut().stop_timeout = Duration::from_secs(2);
+        f.0.borrow_mut().stop_timeout = Duration::from_secs(1);
         for id in ["a", "b"] {
             create_ok(&mut a, id, &k);
             a.handle(&s(&["start", id])).expect("start");
         }
         assert_eq!(
-            a.stop_all_within(Duration::from_secs(1)),
+            a.stop_all_within(Duration::from_millis(500)),
             StopAllSummary {
                 stopped: 0,
                 remaining: 2

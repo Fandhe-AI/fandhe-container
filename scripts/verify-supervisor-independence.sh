@@ -232,6 +232,13 @@ sig_same_proc() { # <シグナル名> <pid> <起動時刻> [<親 pid>]
   kill "-$1" "$2" 2>/dev/null || true
 }
 
+# pid の実行ファイル名（/proc/<pid>/comm。空白は _ に置換）を COMM へ入れる。読めなければ空。
+read_comm() {
+  COMM=""
+  { IFS= read -r COMM <"/proc/$1/comm"; } 2>/dev/null || COMM=""
+  COMM="${COMM// /_}"
+}
+
 # 全プロセスの状態・親・起動時刻・子の一覧を 1 回の走査で SZ・SP・SS・CH へ入れる（同じ時点の値で判定する）。
 scan() {
   local d p s rest f
@@ -510,13 +517,24 @@ for desc in ${DESC[$target_index]}; do
 done
 
 # --- --check-restart（opt-in。SUP-3 の restart ポリシー実装が前提）: 残り N-1 個のコンテナ側プロセスを kill して再起動を確認 ---
+# 再起動の成立条件: 各監視プロセスについて、kill 前に記録した子孫（pid・起動時刻）に含まれない「新しい」直接の子で、kill した子と同じ実行ファイル名（comm）のものが、
+# kill した直接の子の数以上、生存していること。補助プロセスが 1 つ増えただけでは成立しない。成立後に settle 秒待ち、
+# N-1 個の監視プロセスと再起動したコンテナ側プロセスが同一のまま生存していること（稼働継続）も再照合する。
 restart_check="skipped"
 restart_confirmed=null
 if [ "$check_restart" -eq 1 ]; then
-  declare -A OLDKIDS=()
+  declare -A OLDKIDS=() OLDSET=() OLDN=() NEWKIDS=() OLDCOMM=()
+  for i in $(seq 1 "$count"); do
+    for desc in ${DESC[$i]}; do
+      rest="${desc#*:}"
+      OLDSET["${desc%%:*}:${rest%%:*}"]=1
+    done
+  done
   for i in $(seq 1 "$count"); do
     [ "$i" -ne "$target_index" ] || continue
     OLDKIDS[$i]=""
+    OLDN[$i]=0
+    OLDCOMM[$i]=" "
     for desc in ${DESC[$i]}; do
       cpid="${desc%%:*}"
       rest="${desc#*:}"
@@ -524,28 +542,66 @@ if [ "$check_restart" -eq 1 ]; then
       cppid="${rest#*:}"
       [ "$cppid" = "${pids[$i]}" ] || continue
       OLDKIDS[$i]+="${cpid} "
+      OLDN[$i]=$((OLDN[$i] + 1))
+      read_comm "$cpid"
+      OLDCOMM[$i]+="${COMM} "
       sig_same_proc KILL "$cpid" "$cstart" "$cppid"
     done
   done
   restarted_all() {
-    local j c old found n=0
+    local j c n=0 fresh
     scan
     for j in $(seq 1 "$count"); do
       [ "$j" -ne "$target_index" ] || continue
-      found=0
+      [ "${OLDN[$j]}" -ge 1 ] || return 1
+      fresh=""
       for c in ${CH[${pids[$j]}]:-}; do
         case "${SZ[$c]:-}" in Z | X | x | '') continue ;; esac
-        case " ${OLDKIDS[$j]} " in *" $c "*) ;; *) found=1 ;; esac
+        [ -z "${OLDSET["${c}:${SS[$c]}"]:-}" ] || continue
+        # 新しい子のうち、kill した子と同じ実行ファイル名（comm）のものだけを再起動したコンテナ側プロセスとして数える。
+        read_comm "$c"
+        case "${OLDCOMM[$j]}" in *" ${COMM} "*) ;; *) continue ;; esac
+        fresh+="${c}:${SS[$c]} "
       done
-      [ "$found" -eq 1 ] || return 1
+      # shellcheck disable=SC2086
+      set -- $fresh
+      [ "$#" -ge "${OLDN[$j]}" ] || return 1
+      NEWKIDS[$j]="$fresh"
       n=$((n + 1))
     done
     RESTARTED="$n"
   }
   RESTARTED=0
   if wait_until "$timeout_s" restarted_all; then
-    restart_check="pass"
-    restart_confirmed="$RESTARTED"
+    # 再起動後の稼働継続: settle 後に N-1 個の監視プロセスと新しいコンテナ側プロセスを同一性つきで再照合する。
+    sleep "$settle"
+    scan
+    restart_sup_alive=0
+    restart_ok=1
+    for i in $(seq 1 "$count"); do
+      [ "$i" -ne "$target_index" ] || continue
+      if snap_alive "${pids[$i]}" "${pstart[$i]}" && [ "${SP[${pids[$i]}]:-}" = "$$" ]; then
+        restart_sup_alive=$((restart_sup_alive + 1))
+      else
+        restart_ok=0
+        bad_detail+="restart-supervisor-${i} "
+      fi
+      kids_alive=0
+      for desc in ${NEWKIDS[$i]}; do
+        if snap_alive "${desc%%:*}" "${desc#*:}" && [ "${SP[${desc%%:*}]:-}" = "${pids[$i]}" ]; then kids_alive=$((kids_alive + 1)); fi
+      done
+      if [ "$kids_alive" -lt "${OLDN[$i]}" ]; then
+        restart_ok=0
+        bad_detail+="restart-container-${i} "
+      fi
+    done
+    if [ "$restart_ok" -eq 1 ] && [ "$restart_sup_alive" -eq $((count - 1)) ]; then
+      restart_check="pass"
+      restart_confirmed="$RESTARTED"
+    else
+      restart_check="fail"
+      restart_confirmed=0
+    fi
   else
     restart_check="fail"
     restart_confirmed=0

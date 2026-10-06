@@ -34,7 +34,7 @@ fail() { echo "FAIL: $1" >&2; failures=$((failures + 1)); }
 # スタブ launcher。`run --id <prefix>-<n> --bundle <dir>` を受け、コンテナ側プロセスを 1 つ起動して READY を出す。
 # STUB_MODE: normal（監視プロセスが死んでもコンテナは残る）/ collateral（対象の死で他の監視プロセスも死ぬ）/
 # die_with_target（対象のコンテナが監視プロセスと共に死ぬ）/ other_dies（他コンテナが対象の死で死ぬ）/
-# scrub_env（コンテナ側プロセスが環境変数を継承しない）/ no_ready（READY を出さない）/ short_start（最後の launcher が起動直後に終了）/ restart（コンテナを再起動する）。
+# scrub_env（コンテナ側プロセスが環境変数を継承しない）/ no_ready（READY を出さない）/ short_start（最後の launcher が起動直後に終了）/ restart（コンテナを再起動する）/ restart_aux（補助プロセスだけ増やす）/ restart_short（再起動後すぐ終了）/ restart_sup_dies（再起動後に監視プロセスが終了）。
 # 待機はすべて組み込みの read -t（fork しない）で行い、一過性の子プロセスを作らない。
 cat >"${root}/launcher.sh" <<'STUB'
 #!/usr/bin/env bash
@@ -75,9 +75,24 @@ while :; do
     continue
   fi
   wait "$c" || true
-  if [ "$STUB_MODE" = restart ]; then
+  if [ "$STUB_MODE" = restart ] || [ "$STUB_MODE" = restart_sup_dies ]; then
     sleep 300 &
     c=$!
+    if [ "$STUB_MODE" = restart_sup_dies ] && [ "$role" = o ] && [ "$n" = "$STUB_LAST" ]; then
+      read -t 0.3 -u 9 || true
+      exit 0
+    fi
+    continue
+  fi
+  if [ "$STUB_MODE" = restart_short ]; then
+    sleep 0.5 &
+    c=$!
+    continue
+  fi
+  if [ "$STUB_MODE" = restart_aux ] && [ -z "${aux_done:-}" ]; then
+    # 補助プロセスだけを起動する（コンテナは再起動しない）。
+    aux_done=1
+    bash -c 'sleep 300; :' &
     continue
   fi
   read -t 1 -u 9 || true
@@ -108,7 +123,7 @@ run_case() {
   OUT="${d}/out"
   ERR="${d}/err"
   RC=0
-  env STUB_MODE="$mode" STUB_DIR="$d" STUB_COUNT="$count" STUB_TARGET="$tindex" STUB_PREFIX="$prefix" SELFTEST_MARK="$mark" \
+  env STUB_MODE="$mode" STUB_DIR="$d" STUB_COUNT="$count" STUB_LAST="$count" STUB_TARGET="$tindex" STUB_PREFIX="$prefix" SELFTEST_MARK="$mark" \
     bash "$target" --launcher "${root}/launcher.sh" --bundle "${root}/bundle" --count "$count" --target-index "$tindex" \
     --id-prefix "$prefix" --settle 1 --timeout 5 "$@" >"$OUT" 2>"$ERR" || RC=$?
   while IFS= read -r p; do
@@ -187,6 +202,21 @@ expect_eq "restart: restart_confirmed" 4 "$(json_get restart_confirmed "$OUT")"
 run_case normal --check-restart --timeout 3
 expect_eq "no-restart: exit code" 1 "$RC"
 expect_eq "no-restart: restart_check" fail "$(json_get restart_check "$OUT")"
+
+# 8b. 補助プロセスが増えただけ（コンテナは再起動しない）→ 失敗。
+run_case restart_aux --check-restart --timeout 3
+expect_eq "restart_aux: exit code" 1 "$RC"
+expect_eq "restart_aux: restart_check" fail "$(json_get restart_check "$OUT")"
+
+# 8c. 再起動したコンテナが settle 内に終了する → 失敗（稼働継続の再照合）。
+run_case restart_short --check-restart
+expect_eq "restart_short: exit code" 1 "$RC"
+expect_eq "restart_short: restart_check" fail "$(json_get restart_check "$OUT")"
+
+# 8d. 再起動確認中に残りの監視プロセスが終了する → 失敗（再起動後の監視プロセス生存の再照合）。
+run_case restart_sup_dies --check-restart
+expect_eq "restart_sup_dies: exit code" 1 "$RC"
+expect_eq "restart_sup_dies: restart_check" fail "$(json_get restart_check "$OUT")"
 
 # 9. --output は新規ファイルへ公開する（正常系）。
 run_case normal --output "${root}/c9-result.json"

@@ -159,6 +159,8 @@ version = "0.0.0"
 name = "fandhe-container-plugin-macos"
 version = "0.0.0"
 dependencies = [
+ "fandhe-container-io",
+ "fandhe-container-platform-macos",
  "fandhe-container-plugin",
 ]
 

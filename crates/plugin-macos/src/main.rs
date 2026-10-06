@@ -12,17 +12,23 @@
 //! 失敗時は stderr へ 1 行 `error: <CODE>: <message>`（機械可読な code と固定文言。REPAIR-4）を出す。
 //! 終了コード: 0 = 正常（`--help`・相手の正常切断）、2 = `InvalidArgument`（起動引数・パス）、
 //! 3 = 接続失敗、4 = フレームループの異常終了（転送エラー・プロトコル違反）、1 = その他の起動失敗。
-//! 3・4 は plugin-windows と同じ値（core 側 proxy が同じ規則で扱えるようにする）。
+//! 5 = 終了時に停止できなかった VM が残った。3・4 は plugin-windows と同じ値（core 側 proxy が同じ規則で扱えるようにする）。
 //! 出力は固定文言と列挙名のみで、socket パス・引数値・環境変数値・受信データを含めない。
 //! peer 認証の拒否イベント行は socket パスを含むため転記しない（永続的な監査ログへの配線は
 //! core 側 TASK-114 で未実装。REPAIR-3・SEC-4）。
-//! 既定ハンドラは全操作に `UNIMPLEMENTED` を返す（`ContainerRuntime` アダプタは TASK-115.3）。
+//! 要求は `adapter::MacosRuntimeAdapter`（TASK-115.3・#387）が処理し、終了時に実行中 VM を `stop_all`（総予算 `SHUTDOWN_BUDGET` 4 秒。core の 5 秒の終了猶予内に収める。REPAIR-5）で停止する。
+//! create / start / stop は 1 操作ごとに成功・失敗の累計とレイテンシを入力値抜きの 1 行 JSON（`plugin.op`。REPAIR-4）で stderr へ出す。
+//! 起動に失敗して停止を確認できない VM も `remaining` に数え、終了コード 5 で成功終了を避ける（REPAIR-3）。
+//! 停止結果は stderr へ件数のみの 1 行 JSON（`plugin.cleanup`）で出す。
+//! フレームループが異常終了した場合は、停止できない VM が残っていても終了コードは 4 のまま（5 にはしない）。
+//! 残った VM の数は `plugin.cleanup` 行の `remaining` で伝える。
 
 use std::process::ExitCode;
 use std::time::Duration;
 
 use fandhe_container_plugin::{JsonLinesPeerAuthObserver, PluginError, PluginErrorCode, UdsStream};
-use fandhe_container_plugin_macos::frame_loop::{UnimplementedHandler, serve};
+use fandhe_container_plugin_macos::adapter::{MacosRuntimeAdapter, PlatformBackend};
+use fandhe_container_plugin_macos::frame_loop::serve;
 use fandhe_container_plugin_macos::startup::{self, RunOutcome};
 
 /// `InvalidArgument` の終了コード。
@@ -33,6 +39,8 @@ const EXIT_FAILURE: u8 = 1;
 const EXIT_CONNECT_FAILED: u8 = 3;
 /// フレームループ異常終了の終了コード。
 const EXIT_LOOP_FAILED: u8 = 4;
+/// 終了時の停止に失敗した VM が残った場合の終了コード。
+const EXIT_CLEANUP_INCOMPLETE: u8 = 5;
 
 /// 接続期限（core の常駐起動期限より短くする。REPAIR-5）。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -65,11 +73,27 @@ fn main() -> ExitCode {
             return ExitCode::from(EXIT_CONNECT_FAILED);
         }
     };
-    match serve(&mut stream, &mut UnimplementedHandler) {
-        Ok(_) => ExitCode::SUCCESS,
+    let mut adapter = MacosRuntimeAdapter::new(PlatformBackend::default())
+        .with_op_sink(|ev| eprintln!("{}", ev.to_json_line()));
+    let outcome = serve(&mut stream, &mut adapter);
+    // Vm の Drop は停止を待たないため、正常切断・異常終了のどちらでも期限つきで明示停止する。
+    let summary = adapter.stop_all();
+    if summary.stopped > 0 || summary.remaining > 0 {
+        eprintln!(
+            "{{\"event\":\"plugin.cleanup\",\"stopped\":{},\"remaining\":{}}}",
+            summary.stopped, summary.remaining
+        );
+    }
+    match outcome {
         Err(e) => {
             report(&e);
             ExitCode::from(EXIT_LOOP_FAILED)
         }
+        // 停止できなかった VM が残るなら成功扱いにしない（機械可読な code を stderr へ出す）。
+        Ok(_) if summary.remaining > 0 => {
+            eprintln!("error: INTERNAL: failed to stop remaining VMs");
+            ExitCode::from(EXIT_CLEANUP_INCOMPLETE)
+        }
+        Ok(_) => ExitCode::SUCCESS,
     }
 }

@@ -1,7 +1,7 @@
 # macOS バックエンド plugin バイナリ（fandhe-container-platform-macos の実装を別プロセス化。
 # crate-naming.md の表 #16）。macOS Venus（GPU-6）の virtio-gpu デバイスモデルもここに置く定義。
 # 雛形は TASK-1.3（#11・REPAIR-1・MS-0）。本体は G8（TASK-115）・G-別枠（TASK-172〜181）で実装する。
-# バイナリ名は `fandhe-container-plugin-macos`（発見対象。PLUG-4・PLUG-11）。TASK-115.1（#385）で `[[bin]]`/`main.rs` を追加した（起動引数と socket パス解決）。TASK-115.2（#386）で UDS フレーム送受信ループを追加した（依存の追加なし）。TASK-115.4（#388）で peer 認証の結合試験 tests/peer_auth.rs を追加した（依存の追加なし）。
+# バイナリ名は `fandhe-container-plugin-macos`（発見対象。PLUG-4・PLUG-11）。TASK-115.1（#385）で `[[bin]]`/`main.rs` を追加した（起動引数と socket パス解決）。TASK-115.2（#386）で UDS フレーム送受信ループを追加した（依存の追加なし）。TASK-115.3（#387）で platform-macos・io（テストのみ）への workspace 内 path 依存を追加した（外部クレートの追加なし）。TASK-115.4（#388）で peer 認証の結合試験 tests/peer_auth.rs を追加した（依存の追加なし）。
 # version は未指定（Cargo の既定で 0.0.0）。公開方針は未決定のため publish = false を明記する。
 # 依存の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 
@@ -15,6 +15,12 @@ publish = false
 [dependencies]
 # workspace 内の path 依存（外部クレートの追加ではない。PLUG-1: 境界機構 plugin crate を使う側）。
 fandhe-container-plugin = { workspace = true }
+# TASK-115.3（#387）: ContainerRuntime アダプタの委譲先（architecture.md で確定済みの内部辺）。
+fandhe-container-platform-macos = { path = "../platform-macos" }
+
+[dev-dependencies]
+# アダプタのエラー対応表テストで `IoError` を組み立てるためだけに使う（内部 path 依存）。
+fandhe-container-io = { path = "../io" }
 
 [[bin]]
 name = "fandhe-container-plugin-macos"

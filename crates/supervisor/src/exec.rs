@@ -11,7 +11,8 @@
 //!
 //! - 記録上の pid は **候補** にすぎず、シグナル送信・回収・`/proc` の宛先にそのまま使わない
 //!   （pid 再利用対策。SEC-1）。core の `Pid1Target::open` が pidfd 固定のうえで pid1 であることを検証し、
-//!   通ったものだけを [`ExecTarget`] にする
+//!   通ったものだけを [`ExecTarget`] にする。さらに pid が別コンテナに再利用されていないことを、
+//!   記録した cgroup 配置から導くコンテナ固有の cgroup 名で確認する（SEC-1）
 //! - [`enter_namespaces`] は呼び出しスレッドの namespace を不可逆に変える。単一スレッドのプロセスから
 //!   のみ呼べる。logs 捕捉スレッドを持つ supervisor 本体からは呼ばず、exec 専用プロセスから呼ぶ（#503）
 //! - 順序: cgroup.procs の fd 確保（#501）は [`enter_namespaces`] の前、seccomp / Landlock の再適用
@@ -23,6 +24,7 @@
 //! （#502・TASK-163.3）、fork・execve と統合テスト（#503・TASK-163.4）、user namespace への参加は
 //! 未実装（SUP-6）。
 
+use fandhe_container_core::cgroups::CgroupName;
 use fandhe_container_core::exec::{
     ExecError, JoinNamespace, NamespaceJoinReport, Pid1Target, join_namespaces,
 };
@@ -55,6 +57,36 @@ impl ExecTarget {
 /// 入れ子の PID 1・自分と別の pid / mnt namespace）を通ったときだけ採用する。
 pub fn identify_pid1(record: &StateRecord) -> Result<ExecTarget, TraitError> {
     let status = record.status();
+    if status.state() != ContainerState::Running || status.pid().is_none() {
+        return Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "container is not running or has no recorded pid; cannot identify pid1",
+        ));
+    }
+    // 記録 pid が別コンテナの PID 1 に再利用されていないことを、コンテナ固有の cgroup 名で確かめる
+    // （pidfd だけでは記録上の元プロセスとの同一性を証明できない。SEC-1）。cgroup 配置の記録がなければ
+    // 同一性を確認できないため拒否する（fail-closed）。
+    let Some(placement) = record.cgroup() else {
+        return Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "container has no recorded cgroup placement; cannot verify pid1 identity",
+        ));
+    };
+    let name = CgroupName::for_instance(status.id(), placement.instance()).map_err(|_| {
+        TraitError::new(ErrorCode::InvalidArgument, "invalid container cgroup name")
+    })?;
+    identify_pid1_in(record, name.as_str())
+}
+
+/// [`identify_pid1`] と同じ検証を、呼び出し側が解決済みの cgroup リーフ名（`fc-<id>@<instance>`）で行う。
+///
+/// 記録の cgroup 配置を介さず名前を直接渡したい呼び出し元（実機結合試験等）向け。名前は必須で、
+/// 対象が属さなければ `FailedPrecondition`（SEC-1）。
+pub fn identify_pid1_in(
+    record: &StateRecord,
+    expected_cgroup_name: &str,
+) -> Result<ExecTarget, TraitError> {
+    let status = record.status();
     if status.state() != ContainerState::Running {
         return Err(TraitError::new(
             ErrorCode::FailedPrecondition,
@@ -67,7 +99,7 @@ pub fn identify_pid1(record: &StateRecord) -> Result<ExecTarget, TraitError> {
             "container has no recorded pid; cannot identify pid1",
         ));
     };
-    let pid1 = Pid1Target::open(pid).map_err(from_exec_error)?;
+    let pid1 = Pid1Target::open(pid, expected_cgroup_name).map_err(from_exec_error)?;
     Ok(ExecTarget {
         id: status.id().clone(),
         pid1,
@@ -120,11 +152,21 @@ mod tests {
         }
     }
 
+    /// SUP-6・SEC-1: cgroup 配置の記録がなければ pid の同一性を確認できないため拒否する。
+    #[test]
+    fn sup6_identify_rejects_missing_cgroup_placement() {
+        let pid = NonZeroU32::new(std::process::id());
+        let err = identify_pid1(&record(ContainerStatus::running(cid(), pid))).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert!(err.message().contains("cgroup"), "{}", err.message());
+    }
+
     /// SUP-6: 記録 pid が pid1 でなければ（自プロセス）検証を素通りしない。
     #[test]
     fn sup6_identify_rejects_self_pid() {
         let pid = NonZeroU32::new(std::process::id());
-        let err = identify_pid1(&record(ContainerStatus::running(cid(), pid))).unwrap_err();
+        let rec = record(ContainerStatus::running(cid(), pid));
+        let err = identify_pid1_in(&rec, "fc-c1@1").unwrap_err();
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert!(err.message().contains("SetNs"), "{}", err.message());
     }

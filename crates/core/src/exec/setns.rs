@@ -14,6 +14,12 @@
 //!   再確認し、終了済みなら `FailedPrecondition` で拒否する（カーネルが終了済みの対象を `ESRCH` で拒否する
 //!   挙動には依存しない。fail-closed）。残る隙間は確認から `setns` までの極小の窓で、その間に終了した
 //!   場合も pidfd は元のプロセスを指すため別プロセスへは入らない
+//! - pidfd は「呼び出した時点でその pid にいたプロセス」を固定するだけで、`state.json` に記録された
+//!   元のコンテナのプロセスであることまでは証明しない（元のコンテナが終了し、その pid が別コンテナの
+//!   PID 1 に再利用されると、NSpid や namespace 差異の検査は通ってしまう）。そこで [`Pid1Target::open`] は
+//!   呼び出し側が渡す期待 cgroup 名（コンテナごとに一意な `fc-<id>@<instance>`。OCI-6）が対象の
+//!   `/proc/<pid>/cgroup` のパス要素に含まれることを必須にする。別コンテナの cgroup 名とは一致しないため、
+//!   再利用された別コンテナの PID 1 は拒否される（fail-closed。SEC-1）
 //! - 対象は入れ子の PID namespace の PID 1（`NSpid:` の要素が 2 以上で末尾が 1）に限り、自プロセスと
 //!   同じ pid / mnt namespace へは参加しない。任意プロセスの namespace へ入る汎用手段にしない
 //! - 参加は **不可逆** で、呼び出しスレッドに作用する。単一スレッドのプロセスからのみ呼べる
@@ -106,10 +112,25 @@ impl Pid1Target {
 
     /// `pid` を候補として pid1 を特定し、検証を通ったものだけを対象にする。
     ///
-    /// 手順は順序固定: pidfd で固定 → `NSpid` が入れ子の PID 1 → 自分と同じ pid / mnt namespace でない →
-    /// pidfd が未終了。いずれも満たさなければ `FailedPrecondition`（存在しない pid は `NotFound`）。
-    pub fn open(pid: NonZeroU32) -> Result<Self, ExecError> {
+    /// `expected_cgroup_name` は記録したコンテナの cgroup のリーフ名（`fc-<id>@<instance>`）。対象が
+    /// その cgroup に属さなければ、pid が別コンテナに再利用されたものとして拒否する（SEC-1）。
+    ///
+    /// 手順は順序固定: pidfd で固定 → `NSpid` が入れ子の PID 1 → 期待 cgroup に属する →
+    /// 自分と同じ pid / mnt namespace でない → pidfd が未終了。いずれも満たさなければ
+    /// `FailedPrecondition`（存在しない pid は `NotFound`、期待 cgroup 名が不正なら `InvalidArgument`）。
+    pub fn open(pid: NonZeroU32, expected_cgroup_name: &str) -> Result<Self, ExecError> {
         let stage = IsolationStage::SetNs;
+        if expected_cgroup_name.is_empty()
+            || expected_cgroup_name.contains(['/', '\0'])
+            || expected_cgroup_name == "."
+            || expected_cgroup_name == ".."
+        {
+            return Err(ExecError::new(
+                ErrorCode::InvalidArgument,
+                stage,
+                "expected cgroup name is empty or contains a path separator",
+            ));
+        }
         let pidfd = sys::pidfd_open(pid.get()).map_err(|e| setns_error(e, "pidfd_open"))?;
         let status = read_bounded(&format!("/proc/{pid}/status"))
             .map_err(|e| ExecError::from_io(&e, stage, "read target status"))?;
@@ -118,6 +139,15 @@ impl Pid1Target {
                 ErrorCode::FailedPrecondition,
                 stage,
                 format!("process {pid} is not PID 1 of a nested PID namespace"),
+            ));
+        }
+        let cgroup = read_bounded(&format!("/proc/{pid}/cgroup"))
+            .map_err(|e| ExecError::from_io(&e, stage, "read target cgroup"))?;
+        if !cgroup_has_component(&cgroup, expected_cgroup_name) {
+            return Err(ExecError::new(
+                ErrorCode::FailedPrecondition,
+                stage,
+                format!("process {pid} does not belong to the expected container cgroup"),
             ));
         }
         for ns in [JoinNamespace::Pid, JoinNamespace::Mount] {
@@ -250,9 +280,39 @@ fn nspid_is_nested_pid1(status: &str) -> bool {
     parsed.len() >= 2 && parsed.last() == Some(&1)
 }
 
+/// `/proc/<pid>/cgroup` の cgroup v2 行（`0::<path>`）のパス要素に `name` が完全一致で含まれるか。
+/// v2 行なし・不一致は fail-closed で `false`（接頭辞一致は認めない）。
+fn cgroup_has_component(cgroup: &str, name: &str) -> bool {
+    cgroup
+        .lines()
+        .filter_map(|l| l.strip_prefix("0::"))
+        .any(|path| path.split('/').any(|c| c == name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SUP-6・SEC-1: cgroup 名は v2 行のパス要素に完全一致したときだけ一致する。
+    #[test]
+    fn sup6_cgroup_component_match() {
+        let c = "0::/user.slice/fc-c1@7/leaf\n";
+        assert!(cgroup_has_component(c, "fc-c1@7"));
+        assert!(!cgroup_has_component(c, "fc-c1@8"));
+        assert!(!cgroup_has_component(c, "fc-c1"));
+        assert!(!cgroup_has_component("1:name=x:/fc-c1@7\n", "fc-c1@7"));
+        assert!(!cgroup_has_component("", "fc-c1@7"));
+    }
+
+    /// SUP-6: 期待 cgroup 名が不正なら InvalidArgument。
+    #[test]
+    fn sup6_open_rejects_invalid_cgroup_name() {
+        let me = NonZeroU32::new(std::process::id()).unwrap();
+        for bad in ["", "a/b", "..", "."] {
+            let err = Pid1Target::open(me, bad).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgument, "{bad}");
+        }
+    }
 
     /// SUP-6: NSpid の解析（入れ子の PID 1 のみ許可）。
     #[test]
@@ -269,7 +329,7 @@ mod tests {
     #[test]
     fn sup6_open_rejects_self() {
         let me = NonZeroU32::new(std::process::id()).unwrap();
-        let err = Pid1Target::open(me).unwrap_err();
+        let err = Pid1Target::open(me, "fc-x@1").unwrap_err();
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
         assert_eq!(err.stage, IsolationStage::SetNs);
     }
@@ -277,7 +337,7 @@ mod tests {
     /// SUP-6: PID_MAX_LIMIT 超の pid は存在しない（NotFound）。
     #[test]
     fn sup6_open_missing_pid_is_not_found() {
-        let err = Pid1Target::open(NonZeroU32::new(4_194_305).unwrap()).unwrap_err();
+        let err = Pid1Target::open(NonZeroU32::new(4_194_305).unwrap(), "fc-x@1").unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
         assert_eq!(err.stage, IsolationStage::SetNs);
     }

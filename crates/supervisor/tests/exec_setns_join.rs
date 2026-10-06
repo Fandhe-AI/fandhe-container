@@ -48,7 +48,7 @@ mod linux {
 
     use fandhe_container_core::exec::JoinNamespace;
     use fandhe_container_core::traits::{ContainerId, ContainerStatus, StateRecord, StateRevision};
-    use fandhe_container_supervisor::exec::{enter_namespaces, identify_pid1};
+    use fandhe_container_supervisor::exec::{enter_namespaces, identify_pid1_in};
 
     /// 参加で切り替わる namespace の `/proc/<..>/ns/` エントリ名（pid は参加後 `pid_for_children` に現れる）。
     const NS_ENTRIES: [&str; 4] = ["mnt", "uts", "ipc", "net"];
@@ -184,7 +184,21 @@ mod linux {
             StateRevision::from_raw(1),
         )
         .expect("record");
-        let target = identify_pid1(&rec).expect("identify pid1");
+        // pid1 は試験プロセスと同じ cgroup に属する（コンテナ用 cgroup は作れないため、実際の cgroup の
+        // リーフ名を期待値にする）。別名では pid 再利用対策として拒否されることも確認する。
+        let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("read cgroup");
+        let leaf = cgroup
+            .lines()
+            .find_map(|l| l.strip_prefix("0::"))
+            .and_then(|p| p.rsplit('/').find(|c| !c.is_empty()))
+            .expect("cgroup v2 leaf")
+            .to_owned();
+        let err = identify_pid1_in(&rec, "fc-c1@999999").unwrap_err();
+        assert_eq!(
+            err.code(),
+            fandhe_container_core::traits::ErrorCode::FailedPrecondition
+        );
+        let target = identify_pid1_in(&rec, &leaf).expect("identify pid1");
         assert_eq!(target.pid1().pid().get(), pid);
         let report = enter_namespaces(&target).expect("enter namespaces");
         assert_eq!(report.target_pid.get(), pid);

@@ -32,6 +32,11 @@
 //!   `exec/stages.rs` の順序テスト（`core1_no_new_privs_runs_after_capability_drop_and_before_landlock`・
 //!   `core1_empty_pipeline_applies_builtin_stages`）と、本物の `prctl` を別スレッドで確認する
 //!   `sys.rs` の `core1_set_no_new_privs_sets_calling_thread_flag`。継承値 0 の環境では本シナリオが設定操作も検証する
+//! - シナリオ `rlimits-apply`（SUP-12・TASK-169.1・#526。`with_rlimits`）: 組み込みの `Rlimits` 段が NOFILE
+//!   （soft 256 / hard 512。継承 hard が低ければそれ以下）と CORE（0 / 0）を子へ適用することを、Landlock スロットのフックが
+//!   記録した `/proc/self/limits` との完全一致で照合する。exec は証跡不在で `Exited(126)`・`PERMISSION_DENIED`
+//! - シナリオ `rlimit-fail`（同上）: `fs.nr_open` を超える NOFILE の hard 指定は root でも rootless でも `EPERM` となり、
+//!   `Exited(125)`・stderr に `at Rlimits` と `PERMISSION_DENIED`、後段のフックが実行されないことを照合する
 //! - シナリオ `stage-fail`（同上）: 途中の段のフック失敗で後続段と exec に進まず `Exited(125)`
 //!   （setup 失敗）、stderr に失敗した段（`at Landlock`。#173 以降 capability 削減は組み込みのためフック失敗の対象外）
 //!
@@ -98,6 +103,7 @@ mod linux {
         LandlockRuleset, detect_landlock_abi, path_rules_from_config,
     };
     use fandhe_container_core::oci_runtime::parse_config_bytes;
+    use fandhe_container_core::rlimits::{Rlimit, RlimitKind, Rlimits};
 
     const PROBE: &str = "fandhe-exec-probe";
     const PROBE_EXIT: i32 = 42;
@@ -105,12 +111,14 @@ mod linux {
     /// 子が pivot 後の `/` に追記するステージ実行ログ（親からは `<rootfs>/stage-log`）。
     const STAGE_LOG: &str = "stage-log";
     /// (シナリオ名, stderr に含まれるべき文字列)。
-    const SCENARIOS: [(&str, &str); 8] = [
+    const SCENARIOS: [(&str, &str); 10] = [
         ("ok", "PERMISSION_DENIED"),
         ("missing", "PERMISSION_DENIED"),
         ("not-executable", "PERMISSION_DENIED"),
         ("stages-order", "PERMISSION_DENIED"),
         ("stage-fail", "at Landlock"),
+        ("rlimits-apply", "PERMISSION_DENIED"),
+        ("rlimit-fail", "at Rlimits"),
         ("landlock-apply-ro", "Permission denied"),
         ("landlock-apply-rw", ""),
         ("landlock-fail", "landlock_open_path_failed"),
@@ -367,7 +375,7 @@ mod linux {
             "missing" => "/no-such-entrypoint".to_string(),
             "not-executable" => format!("/{NOT_EXEC}"),
             "stages-order" | "stage-fail" | "landlock-apply-ro" | "landlock-apply-rw"
-            | "landlock-fail" => format!("/{PROBE}"),
+            | "landlock-fail" | "rlimits-apply" | "rlimit-fail" => format!("/{PROBE}"),
             other => panic!("unknown scenario {other}"),
         };
         // SEC-1・CORE-5: Landlock が未適用の間は、root / 非 root を問わず
@@ -386,6 +394,38 @@ mod linux {
                         p.with_hook(StageKind::CgroupJoin, logging_hook(StageKind::CgroupJoin))
                     })
                     .unwrap_or_else(|e| panic!("register hooks: {e}"));
+                spawn_container_with_stages(rootfs, &entry, stages)
+            }
+            "rlimits-apply" => {
+                // SUP-12・TASK-169.1・#526: 組み込みの Rlimits 段が pivot 後・exec 前に子へ適用する。
+                // Landlock スロットのフックが子自身の `/proc/self/limits` を記録し、指定値との完全一致を親が照合する。
+                // exec は証跡不在のため従来どおり拒否される（`Exited(126)`・`PERMISSION_DENIED`）。
+                let (soft, hard) = rlimits_apply_nofile(inherited_nofile_hard());
+                let set = Rlimits::new(vec![
+                    Rlimit::new(RlimitKind::Nofile, soft, hard).expect("nofile"),
+                    Rlimit::new(RlimitKind::Core, 0, 0).expect("core"),
+                ])
+                .expect("rlimits");
+                let stages = StagePipeline::new()
+                    .with_rlimits(set)
+                    .and_then(|p| p.with_hook(StageKind::Landlock, limits_hook))
+                    .unwrap_or_else(|e| panic!("register rlimits: {e}"));
+                spawn_container_with_stages(rootfs, &entry, stages)
+            }
+            "rlimit-fail" => {
+                // SUP-12・TASK-169.1・#526: `fs.nr_open` を超える NOFILE の hard は root でも rootless でも
+                // `EPERM` になるため、起動拒否（`Exited(125)`・`PermissionDenied`）を euid 分岐なしで確認できる。
+                // 失敗した段より後（Landlock のフック・seccomp・exec）は実行されない。
+                let set = Rlimits::new(vec![
+                    Rlimit::new(RlimitKind::Nofile, 1, 1 << 40).expect("nofile"),
+                ])
+                .expect("rlimits");
+                let stages = StagePipeline::new()
+                    .with_hook(StageKind::CgroupJoin, logging_hook(StageKind::CgroupJoin))
+                    .and_then(|p| p.with_rlimits(set))
+                    .and_then(|p| p.with_hook(StageKind::Landlock, limits_hook))
+                    .unwrap_or_else(|e| panic!("register rlimits: {e}"));
+                want = ChildExit::Exited(125);
                 spawn_container_with_stages(rootfs, &entry, stages)
             }
             "stage-fail" => {
@@ -442,6 +482,19 @@ mod linux {
                 log,
                 format!("cgroup_join root=1 nnp={inherited_nnp}\nlandlock root=1 nnp=1\n"),
                 "hooks must run in fixed order after pivot_root, with the built-in capability drop and NO_NEW_PRIVS applied before landlock"
+            ),
+            "rlimits-apply" => {
+                let (soft, hard) = rlimits_apply_nofile(inherited_nofile_hard());
+                assert_eq!(
+                    log,
+                    format!("limits nofile={soft}/{hard} core=0/0\n"),
+                    "the built-in Rlimits stage must apply the requested values before the landlock slot"
+                );
+            }
+            "rlimit-fail" => assert_eq!(
+                log,
+                format!("cgroup_join root=1 nnp={inherited_nnp}\n"),
+                "no stage after the failed Rlimits stage may run"
             ),
             "stage-fail" => assert_eq!(
                 log,
@@ -509,6 +562,49 @@ mod linux {
                 .unwrap_or_else(|e| panic!("write stage log in the child: {e}"));
             Ok(())
         }
+    }
+
+    /// `/proc/self/limits` の `<label>` 行の (soft, hard)（`unlimited` はそのまま文字列で返す）。
+    fn limits_row(label: &str) -> (String, String) {
+        let text = std::fs::read_to_string("/proc/self/limits")
+            .unwrap_or_else(|e| panic!("read /proc/self/limits: {e}"));
+        let rest = text
+            .lines()
+            .find_map(|l| l.strip_prefix(label))
+            .unwrap_or_else(|| panic!("limits row missing: {label}"));
+        let mut cols = rest.split_whitespace();
+        let soft = cols.next().unwrap_or_else(|| panic!("soft missing"));
+        let hard = cols.next().unwrap_or_else(|| panic!("hard missing"));
+        (soft.to_string(), hard.to_string())
+    }
+
+    /// 継承している NOFILE の hard（無制限は `u64::MAX`）。
+    fn inherited_nofile_hard() -> u64 {
+        match limits_row("Max open files").1.as_str() {
+            "unlimited" => u64::MAX,
+            n => n.parse().unwrap_or_else(|e| panic!("parse hard: {e}")),
+        }
+    }
+
+    /// 継承 hard を超えない NOFILE の (soft, hard)。通常は (256, 512)。
+    fn rlimits_apply_nofile(inherited_hard: u64) -> (u64, u64) {
+        let hard = inherited_hard.min(512);
+        (hard.min(256), hard)
+    }
+
+    /// 子の NOFILE と CORE の (soft, hard) を pivot 後の `/` に追記するフック。
+    fn limits_hook() -> Result<(), ExecError> {
+        use std::io::Write as _;
+        let (ns, nh) = limits_row("Max open files");
+        let (cs, ch) = limits_row("Max core file size");
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("/{STAGE_LOG}"))
+            .unwrap_or_else(|e| panic!("open stage log in the child: {e}"));
+        writeln!(f, "limits nofile={ns}/{nh} core={cs}/{ch}")
+            .unwrap_or_else(|e| panic!("write stage log in the child: {e}"));
+        Ok(())
     }
 
     /// 必ず失敗するフック（公開 API で作れる `ExecError` として不正なホスト名の検証エラーを流用する）。

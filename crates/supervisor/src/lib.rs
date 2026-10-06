@@ -19,12 +19,14 @@
 //! | #242 | TASK-157.8 | 結合テスト |
 //! | #1069 | TASK-157.9 | state.json 書き込み排他 |
 //! | #487 | TASK-159.1 | 終了検知・終了コード分類（実装済み） |
+//! | #526 | TASK-169.1 | ulimit の指定モデル（[`container_options`]。適用は core の exec ステージ `Rlimits`。launcher 未結線のため消費者は無い。REPAIR-3） |
 //! | #488 | TASK-159.2 | restart ポリシー評価（実装済み） |
 //! | #489 | TASK-159.3 | restart_count 管理・state.json 反映・結合テスト（実装済み。本番 launcher は未実装） |
 //!
 //! supervisor から `fandhe-container-core` への一方向依存は導入済み（TASK-157.3・#237）。
 //! `StateStore` は core の既定実装を使い、2 つ目の実装は持たない（決定 6）。
 
+pub mod container_options;
 pub mod health;
 pub mod healthcheck;
 pub mod logs;

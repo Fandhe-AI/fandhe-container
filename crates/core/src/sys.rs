@@ -30,6 +30,7 @@
 //! 基本デバイスノード作成は、`mknodat(2)`・`O_PATH` での `openat(2)` を呼ぶために使う。
 //! 委譲 cgroup の検出と子 cgroup 作成（`crate::cgroups`。CORE-3・TASK-32.1・#158）は、
 //! `mkdirat(2)`・`unlinkat(2)`・`fstatfs(2)`（cgroup2 判定）と `O_NOFOLLOW` 付きの `openat(2)` を呼ぶために使う。
+//! rlimit の適用（`exec/rlimits.rs` の `apply_rlimits`。SUP-12・TASK-169.1・#526）は、fork 後の子で `prlimit(2)` を呼ぶために使う。
 //! さらに `crate::audit_log` のカーネル監査フォールバック（SEC-4・TASK-41.5.2・#840）が、
 //! `socket(2)`（NETLINK_AUDIT）・`sendto(2)`・`recvfrom(2)`・`poll(2)` を呼ぶ。
 //! std だけでは提供されない syscall のみを持ち、検証（hostname の文字種・パス形式等）は呼び出し側の型
@@ -186,6 +187,25 @@ mod consts {
     pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
     pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
 
+    // include/uapi/asm-generic/resource.h の `RLIMIT_*`（0〜15。SUP-12・TASK-169.1）。
+    // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const RLIMIT_CPU: i32 = 0;
+    pub const RLIMIT_FSIZE: i32 = 1;
+    pub const RLIMIT_DATA: i32 = 2;
+    pub const RLIMIT_STACK: i32 = 3;
+    pub const RLIMIT_CORE: i32 = 4;
+    pub const RLIMIT_RSS: i32 = 5;
+    pub const RLIMIT_NPROC: i32 = 6;
+    pub const RLIMIT_NOFILE: i32 = 7;
+    pub const RLIMIT_MEMLOCK: i32 = 8;
+    pub const RLIMIT_AS: i32 = 9;
+    pub const RLIMIT_LOCKS: i32 = 10;
+    pub const RLIMIT_SIGPENDING: i32 = 11;
+    pub const RLIMIT_MSGQUEUE: i32 = 12;
+    pub const RLIMIT_NICE: i32 = 13;
+    pub const RLIMIT_RTPRIO: i32 = 14;
+    pub const RLIMIT_RTTIME: i32 = 15;
+
     // include/uapi/linux/prctl.h の `PR_GET_SECCOMP`（21）・`PR_SET_SECCOMP`（22）と
     // include/uapi/linux/seccomp.h の `SECCOMP_MODE_FILTER`（2。可変長引数で渡すため u64）。
     pub const PR_GET_SECCOMP: i32 = 21;
@@ -327,6 +347,25 @@ mod consts {
     pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
     pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
 
+    // include/uapi/asm-generic/resource.h の `RLIMIT_*`（0〜15。SUP-12・TASK-169.1）。
+    // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const RLIMIT_CPU: i32 = 0;
+    pub const RLIMIT_FSIZE: i32 = 1;
+    pub const RLIMIT_DATA: i32 = 2;
+    pub const RLIMIT_STACK: i32 = 3;
+    pub const RLIMIT_CORE: i32 = 4;
+    pub const RLIMIT_RSS: i32 = 5;
+    pub const RLIMIT_NPROC: i32 = 6;
+    pub const RLIMIT_NOFILE: i32 = 7;
+    pub const RLIMIT_MEMLOCK: i32 = 8;
+    pub const RLIMIT_AS: i32 = 9;
+    pub const RLIMIT_LOCKS: i32 = 10;
+    pub const RLIMIT_SIGPENDING: i32 = 11;
+    pub const RLIMIT_MSGQUEUE: i32 = 12;
+    pub const RLIMIT_NICE: i32 = 13;
+    pub const RLIMIT_RTPRIO: i32 = 14;
+    pub const RLIMIT_RTTIME: i32 = 15;
+
     // include/uapi/linux/prctl.h の `PR_GET_SECCOMP`（21）・`PR_SET_SECCOMP`（22）と
     // include/uapi/linux/seccomp.h の `SECCOMP_MODE_FILTER`（2。可変長引数で渡すため u64）。
     pub const PR_GET_SECCOMP: i32 = 21;
@@ -435,6 +474,24 @@ mod consts {
 
     pub const PR_SET_NO_NEW_PRIVS: i32 = 0;
     pub const PR_GET_NO_NEW_PRIVS: i32 = 0;
+
+    // rlimit の定数（対応外アーキテクチャでは各ラッパーが SUPPORTED で弾くため未使用）。
+    pub const RLIMIT_CPU: i32 = 0;
+    pub const RLIMIT_FSIZE: i32 = 0;
+    pub const RLIMIT_DATA: i32 = 0;
+    pub const RLIMIT_STACK: i32 = 0;
+    pub const RLIMIT_CORE: i32 = 0;
+    pub const RLIMIT_RSS: i32 = 0;
+    pub const RLIMIT_NPROC: i32 = 0;
+    pub const RLIMIT_NOFILE: i32 = 0;
+    pub const RLIMIT_MEMLOCK: i32 = 0;
+    pub const RLIMIT_AS: i32 = 0;
+    pub const RLIMIT_LOCKS: i32 = 0;
+    pub const RLIMIT_SIGPENDING: i32 = 0;
+    pub const RLIMIT_MSGQUEUE: i32 = 0;
+    pub const RLIMIT_NICE: i32 = 0;
+    pub const RLIMIT_RTPRIO: i32 = 0;
+    pub const RLIMIT_RTTIME: i32 = 0;
 
     // seccomp 適用の定数（対応外アーキテクチャでは各ラッパーが SUPPORTED で弾くため未使用）。
     pub const PR_GET_SECCOMP: i32 = 0;
@@ -589,6 +646,23 @@ unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: `int poll(struct pollfd *fds, nfds_t nfds, int timeout)`
     // （`nfds_t` は `unsigned long`＝LP64 で u64）。
     fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int prlimit(pid_t pid, int resource, const struct rlimit64 *new_limit,
+    // struct rlimit64 *old_limit)`（glibc 2.13 以降・musl。LP64 の `pid_t` は i32、`resource` は
+    // `enum __rlimit_resource` 相当で `int` 幅）。構造体は下の [`RLimit64`]（`rlim64_t` = u64 × 2）。
+    fn prlimit(
+        pid: i32,
+        resource: i32,
+        new_limit: *const RLimit64,
+        old_limit: *mut RLimit64,
+    ) -> i32;
+}
+
+/// `struct rlimit64`（`rlim_cur` / `rlim_max` ともに 64 ビット。全アーキテクチャ共通の 16 バイト）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RLimit64 {
+    cur: u64,
+    max: u64,
 }
 
 /// `struct sockaddr_nl`（include/uapi/linux/netlink.h。全アーキテクチャ共通の 12 バイト）。
@@ -1568,6 +1642,97 @@ pub(crate) fn set_no_new_privs() -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// `RlimitKind` を `RLIMIT_*` の番号へ写す（網羅 match。アーキテクチャ別の値は `consts`）。
+fn rlimit_resource(kind: crate::rlimits::RlimitKind) -> i32 {
+    use crate::rlimits::RlimitKind as K;
+    match kind {
+        K::Cpu => consts::RLIMIT_CPU,
+        K::Fsize => consts::RLIMIT_FSIZE,
+        K::Data => consts::RLIMIT_DATA,
+        K::Stack => consts::RLIMIT_STACK,
+        K::Core => consts::RLIMIT_CORE,
+        K::Rss => consts::RLIMIT_RSS,
+        K::Nproc => consts::RLIMIT_NPROC,
+        K::Nofile => consts::RLIMIT_NOFILE,
+        K::Memlock => consts::RLIMIT_MEMLOCK,
+        K::As => consts::RLIMIT_AS,
+        K::Locks => consts::RLIMIT_LOCKS,
+        K::Sigpending => consts::RLIMIT_SIGPENDING,
+        K::Msgqueue => consts::RLIMIT_MSGQUEUE,
+        K::Nice => consts::RLIMIT_NICE,
+        K::Rtprio => consts::RLIMIT_RTPRIO,
+        K::Rttime => consts::RLIMIT_RTTIME,
+    }
+}
+
+/// `prlimit(2)` の薄い共通実装。`new` が `Some` なら設定、`None` なら読み取りだけ。旧値を返す。
+///
+/// `pid` は 0 で呼び出しプロセス自身。他プロセスを対象にする経路は `cfg(test)` の関数だけが使う。
+fn prlimit_raw(
+    pid: i32,
+    kind: crate::rlimits::RlimitKind,
+    new: Option<(u64, u64)>,
+) -> Result<(u64, u64), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let new_limit = new.map(|(cur, max)| RLimit64 { cur, max });
+    let mut old = RLimit64 { cur: 0, max: 0 };
+    let new_ptr = new_limit
+        .as_ref()
+        .map_or(core::ptr::null(), |r| r as *const RLimit64);
+    // SAFETY: `new_ptr` は NULL か、このスタックフレームの有効な `RLimit64`（呼び出しの間生存）を指し、
+    // カーネルは 16 バイトを読むだけ。`old` は書き込み可能な有効な `RLimit64` で、カーネルは 16 バイトだけ
+    // 書く。`resource` は網羅 match 由来の定数、`pid` は 0（自身）か呼び出し側が検査済みの値。
+    let rc = unsafe { prlimit(pid, rlimit_resource(kind), new_ptr, &mut old) };
+    if rc == -1 {
+        Err(last_error())
+    } else {
+        Ok((old.cur, old.max))
+    }
+}
+
+/// 呼び出しプロセス自身の rlimit を設定する（SUP-12・TASK-169.1・#526）。
+///
+/// `crate::exec` の `rlimits` ステージだけが fork 後の子から呼ぶ。`soft <= hard` は
+/// `crate::rlimits::Rlimit` が検証済み。hard の引き上げは `CAP_SYS_RESOURCE` が無いと `EPERM`。
+// `cfg(test)` では `exec/rlimits.rs` が偽物へ差し替えるため、テストビルドでは未使用になる。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn set_rlimit_self(
+    kind: crate::rlimits::RlimitKind,
+    soft: u64,
+    hard: u64,
+) -> Result<(), SysError> {
+    prlimit_raw(0, kind, Some((soft, hard))).map(|_old| ())
+}
+
+/// 呼び出しプロセス自身の rlimit `(soft, hard)` を読む。
+pub(crate) fn get_rlimit_self(kind: crate::rlimits::RlimitKind) -> Result<(u64, u64), SysError> {
+    prlimit_raw(0, kind, None)
+}
+
+/// 他プロセスの rlimit を読む（テスト専用。本番コードへ他プロセス操作の経路を増やさない）。
+#[cfg(test)]
+pub(crate) fn get_rlimit_of(
+    pid: u32,
+    kind: crate::rlimits::RlimitKind,
+) -> Result<(u64, u64), SysError> {
+    let pid = i32::try_from(pid).map_err(|_| SysError::Os(EINVAL))?;
+    prlimit_raw(pid, kind, None)
+}
+
+/// 他プロセスの rlimit を設定する（テスト専用）。
+#[cfg(test)]
+pub(crate) fn set_rlimit_of(
+    pid: u32,
+    kind: crate::rlimits::RlimitKind,
+    soft: u64,
+    hard: u64,
+) -> Result<(), SysError> {
+    let pid = i32::try_from(pid).map_err(|_| SysError::Os(EINVAL))?;
+    prlimit_raw(pid, kind, Some((soft, hard))).map(|_old| ())
+}
+
 /// 呼び出したスレッドの `NO_NEW_PRIVS` が立っているかを返す（`PR_GET_NO_NEW_PRIVS`）。
 pub(crate) fn no_new_privs_enabled() -> Result<bool, SysError> {
     if !consts::SUPPORTED {
@@ -2416,6 +2581,71 @@ mod tests {
         };
         // 終了ステータスの下位 7 ビットが終了シグナル。
         assert_eq!(status & 0x7f, 15);
+    }
+
+    /// SUP-12・TASK-169.1: RLIMIT_* の番号を固定値で照合する（asm-generic/resource.h）。
+    #[test]
+    fn sup12_rlimit_constants_are_fixed() {
+        use crate::rlimits::RlimitKind;
+        let got: Vec<i32> = RlimitKind::ALL
+            .iter()
+            .map(|k| rlimit_resource(*k))
+            .collect();
+        assert_eq!(got, (0..16).collect::<Vec<i32>>());
+        assert_eq!(consts::RLIMIT_NOFILE, 7);
+        assert_eq!(consts::RLIMIT_CORE, 4);
+    }
+
+    /// SUP-12・TASK-169.1: 自プロセスの rlimit が soft <= hard で読める（変更はしない）。
+    #[test]
+    fn sup12_get_rlimit_self_is_consistent() {
+        let (soft, hard) = get_rlimit_self(crate::rlimits::RlimitKind::Nofile).unwrap();
+        assert!(soft <= hard, "soft={soft} hard={hard}");
+    }
+
+    /// SUP-12・TASK-169.1: 別プロセス（sleep の子）へ設定した値が読み戻しと `/proc/<pid>/limits` の
+    /// 両方で具体値として一致する（テストプロセス自身の制限は変えない）。
+    #[test]
+    fn sup12_set_rlimit_of_child_is_reflected() {
+        use crate::rlimits::RlimitKind;
+        /// テストが失敗しても子を残さない。
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = KillOnDrop(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        let (_, hard) = get_rlimit_of(pid, RlimitKind::Nofile).unwrap();
+        let soft = 64u64;
+        let hard = hard.min(4096).max(soft);
+        set_rlimit_of(pid, RlimitKind::Nofile, soft, hard).unwrap();
+        assert_eq!(
+            get_rlimit_of(pid, RlimitKind::Nofile).unwrap(),
+            (soft, hard)
+        );
+        let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).unwrap();
+        let line = limits
+            .lines()
+            .find(|l| l.starts_with("Max open files"))
+            .unwrap()
+            .to_owned();
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        // "Max open files <soft> <hard> files"
+        assert_eq!(cols.get(3).copied(), Some("64"), "{line}");
+        assert_eq!(
+            cols.get(4).copied(),
+            Some(hard.to_string().as_str()),
+            "{line}"
+        );
     }
 
     /// テスト用の一時ディレクトリ（`chmod` で絞ったディレクトリを戻してから削除する）。

@@ -9,6 +9,8 @@
 //! - 行は LF を除いたバイト列で渡す（UTF-8 を仮定しない。CR は除去しない）。EOF 時の LF なし末尾行も 1 行として渡す。
 //!   読み取りがエラーで終わった場合、LF にも EOF にも達していない未完了の末尾は sink へ渡さず破棄する
 //!   （途中で欠けた内容を正常な行として残さない）。破棄は [`StreamSummary::discarded_lines`] に数える。
+//! - 行の内容は `read` の戻りサイズ・チャンク境界の位置に依らず同一（行の分断・結合・欠落なし）。
+//!   行単位捕捉は TASK-164.1（#505・SUP-7）で境界跨ぎを機械照合済み。
 //! - 1 行は [`MAX_LINE_BYTES`] で切り捨てる（超過ぶんは捨て、[`StreamSummary::truncated_lines`] へ数える。無制限確保の防止）。
 //! - [`LogSink::append`] が失敗したら、そのストリームでは以後 sink を呼ばない（故障した sink へ出力行数ぶんの
 //!   失敗処理を繰り返さない）。読み取りは EOF まで続けて破棄する（読みを止めるとパイプが詰まり、コンテナ側の write が
@@ -1662,5 +1664,183 @@ mod tests {
         let (sink, sum) = run(None, None);
         assert_eq!(sum, CaptureSummary::default());
         assert!(sink.snapshot().unwrap().is_empty());
+    }
+
+    /// 1 回の `read` で最大 `step` バイトだけ返すリーダー。実パイプの短い read（バッファ境界を跨ぐ到着）を決定的に再現する
+    /// （TASK-164.1・#505・SUP-7）。`LineSplitter` が read 戻りサイズに依存しないことの照合専用。
+    struct StepRead {
+        data: Cursor<Vec<u8>>,
+        step: usize,
+    }
+    impl Read for StepRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.step);
+            let head = buf.get_mut(..n).unwrap_or(&mut []);
+            self.data.read(head)
+        }
+    }
+
+    /// あらかじめ切ったチャンク列を 1 回の `read` につき 1 個ずつ返すリーダー（任意の境界位置を明示する用）。
+    /// 各チャンクは `READ_CHUNK_BYTES` 以下であること。
+    struct ChunkRead {
+        chunks: VecDeque<Vec<u8>>,
+    }
+    impl Read for ChunkRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let Some(c) = self.chunks.pop_front() else {
+                return Ok(0);
+            };
+            assert!(c.len() <= buf.len());
+            let dst = buf.get_mut(..c.len()).unwrap_or(&mut []);
+            dst.copy_from_slice(&c);
+            Ok(c.len())
+        }
+    }
+
+    fn chunked(chunks: &[&[u8]]) -> Option<Box<dyn Read + Send>> {
+        Some(Box::new(ChunkRead {
+            chunks: chunks.iter().map(|c| c.to_vec()).collect(),
+        }))
+    }
+
+    fn stepped(data: &[u8], step: usize) -> Option<Box<dyn Read + Send>> {
+        Some(Box::new(StepRead {
+            data: Cursor::new(data.to_vec()),
+            step,
+        }))
+    }
+
+    fn out_lines(sink: &MemoryLogSink) -> Vec<Vec<u8>> {
+        sink.snapshot()
+            .unwrap()
+            .into_iter()
+            .map(|l| l.bytes)
+            .collect()
+    }
+
+    /// TASK-164.1・SUP-7: チャンク境界が行内（単語途中）・LF 直前 / 直後・行をまたぐ位置にあっても行が壊れない。
+    #[test]
+    fn sup7_task164_1_chunk_boundaries_do_not_split_or_merge_lines() {
+        type Case<'a> = (Vec<&'a [u8]>, Vec<&'a [u8]>);
+        let cases: Vec<Case> = vec![
+            (vec![b"hel", b"lo\nwor", b"ld\n"], vec![b"hello", b"world"]),
+            (vec![b"abc\n", b"def\n"], vec![b"abc", b"def"]),
+            (vec![b"abc", b"\ndef\n"], vec![b"abc", b"def"]),
+            (vec![b"ab", b"c\nde", b"f"], vec![b"abc", b"def"]),
+            (vec![b"a\n", b"\n", b"b\n"], vec![b"a", b"", b"b"]),
+            (vec![b"x\r", b"\ny\n"], vec![b"x\r", b"y"]),
+        ];
+        for (chunks, want) in cases {
+            let (sink, sum) = run(chunked(&chunks), None);
+            let want: Vec<Vec<u8>> = want.iter().map(|w| w.to_vec()).collect();
+            assert_eq!(out_lines(&sink), want, "chunks={chunks:?}");
+            let s = sum.stdout().unwrap();
+            assert_eq!(s.lines(), want.len() as u64);
+            assert_eq!(s.truncated_lines(), 0);
+            assert_eq!(s.discarded_lines(), 0);
+            assert_eq!(s.error_code(), None);
+        }
+    }
+
+    /// TASK-164.1・SUP-7: マルチバイト UTF-8・非 UTF-8 の途中で分断されてもバイト列は同一。
+    #[test]
+    fn sup7_task164_1_multibyte_and_invalid_utf8_split_is_byte_exact() {
+        let (sink, _) = run(
+            chunked(&[&[0xe3], &[0x81], &[0x82, b'\n', 0xff], &[0xfe, b'\n']]),
+            None,
+        );
+        assert_eq!(
+            out_lines(&sink),
+            vec![vec![0xe3, 0x81, 0x82], vec![0xff, 0xfe]]
+        );
+    }
+
+    /// TASK-164.1・SUP-7: read の戻りサイズ（1・2・3・7・READ_CHUNK_BYTES-1・READ_CHUNK_BYTES）に依らず、
+    /// 一括入力と完全に同一の行列・集計になる。
+    #[test]
+    fn sup7_task164_1_result_is_independent_of_read_size() {
+        let mut data: Vec<u8> = Vec::new();
+        for i in 0..14u8 {
+            match i % 4 {
+                0 => data.extend_from_slice(format!("line-{i}\n").as_bytes()),
+                1 => data.extend_from_slice(b"\n"),
+                2 => data.extend_from_slice(format!("crlf-{i}\r\n").as_bytes()),
+                _ => data.extend_from_slice(&[0xff, 0xfe, b'a' + i, b'\n']),
+            }
+        }
+        data.extend_from_slice(b"tail-no-lf");
+        let (base_sink, base) = run(boxed(&data), None);
+        let want = out_lines(&base_sink);
+        assert_eq!(want.len(), 15);
+        assert_eq!(want.last().unwrap(), b"tail-no-lf");
+        for step in [1, 2, 3, 7, READ_CHUNK_BYTES - 1, READ_CHUNK_BYTES] {
+            let (sink, sum) = run(stepped(&data, step), None);
+            assert_eq!(out_lines(&sink), want, "step={step}");
+            assert_eq!(sum, base, "step={step}");
+            let s = sum.stdout().unwrap();
+            assert_eq!(s.lines(), 15);
+            assert_eq!(s.truncated_lines(), 0);
+            assert_eq!(s.discarded_lines(), 0);
+            assert_eq!(s.error_code(), None);
+        }
+    }
+
+    /// TASK-164.1・SUP-7: READ_CHUNK_BYTES（8KiB）境界を通常長の行が跨いでも内容・長さが一致する。
+    #[test]
+    fn sup7_task164_1_line_spanning_read_chunk_boundary_is_intact() {
+        let mut data = vec![b'p'; READ_CHUNK_BYTES - 3];
+        data.push(b'\n');
+        data.extend_from_slice(b"0123456789\n");
+        let (sink, sum) = run(boxed(&data), None);
+        assert_eq!(
+            out_lines(&sink),
+            vec![vec![b'p'; READ_CHUNK_BYTES - 3], b"0123456789".to_vec()]
+        );
+        assert_eq!(sum.stdout().unwrap().truncated_lines(), 0);
+    }
+
+    /// TASK-164.1・SUP-7: 上限（MAX_LINE_BYTES）ちょうどの行は細切れでも切り捨てない。+1 は 1 件切り捨てて次行は無傷。
+    #[test]
+    fn sup7_task164_1_max_line_boundary_values() {
+        let mut exact = vec![b'm'; MAX_LINE_BYTES];
+        exact.extend_from_slice(b"\nnext\n");
+        let (sink, sum) = run(stepped(&exact, 1000), None);
+        assert_eq!(
+            out_lines(&sink),
+            vec![vec![b'm'; MAX_LINE_BYTES], b"next".to_vec()]
+        );
+        assert_eq!(sum.stdout().unwrap().truncated_lines(), 0);
+
+        let mut over = vec![b'm'; MAX_LINE_BYTES + 1];
+        over.extend_from_slice(b"\nnext\n");
+        let (sink, sum) = run(stepped(&over, 1000), None);
+        assert_eq!(
+            out_lines(&sink),
+            vec![vec![b'm'; MAX_LINE_BYTES], b"next".to_vec()]
+        );
+        assert_eq!(sum.stdout().unwrap().truncated_lines(), 1);
+    }
+
+    /// TASK-164.1・SUP-7: stdout と stderr を異なる分割幅で流しても、行バッファはストリーム別で混ざらない。
+    #[test]
+    fn sup7_task164_1_streams_do_not_mix_partial_lines() {
+        let (sink, sum) = run(stepped(b"out-1\nout-2\n", 2), stepped(b"err-1\nerr-2\n", 5));
+        let all = sink.snapshot().unwrap();
+        let of = |k: StreamKind| -> Vec<Vec<u8>> {
+            all.iter()
+                .filter(|l| l.stream == k)
+                .map(|l| l.bytes.clone())
+                .collect()
+        };
+        assert_eq!(
+            of(StreamKind::Stdout),
+            vec![b"out-1".to_vec(), b"out-2".to_vec()]
+        );
+        assert_eq!(
+            of(StreamKind::Stderr),
+            vec![b"err-1".to_vec(), b"err-2".to_vec()]
+        );
+        assert_eq!(sum.stdout().unwrap().lines(), 2);
+        assert_eq!(sum.stderr().unwrap().lines(), 2);
     }
 }

@@ -79,3 +79,33 @@ fn sup1_task157_7_logs_rs_has_no_unsafe_or_global_state() {
         assert!(!code.contains(banned), "logs.rs must not contain {banned}");
     }
 }
+
+/// TASK-164.1（#505）・SUP-7: 実パイプで 1 行を複数回の write に分けて送っても、行が壊れず 2 行で捕捉される。
+/// sleep は read の分断を起こしやすくする補助で、どの分断タイミングでも成り立つ照合にしている。
+#[test]
+fn sup7_task164_1_line_split_across_pipe_writes_is_captured_intact() {
+    let (out_r, mut out_w) = std::io::pipe().unwrap();
+    let sink = Arc::new(MemoryLogSink::default());
+    let cap = LogCapture::start(
+        OutputStreams::new(&ReaderBudget::with_max_limit(), Some(Box::new(out_r)), None),
+        sink.clone(),
+    )
+    .unwrap();
+    let w = std::thread::spawn(move || {
+        for part in [&b"hel"[..], &b"lo\nwor"[..], &b"ld\n"[..]] {
+            out_w.write_all(part).unwrap();
+            out_w.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    w.join().unwrap();
+    let sum = cap.drain(Duration::from_secs(10)).unwrap();
+    assert_eq!(sum.stdout().unwrap().lines(), 2);
+    let got: Vec<Vec<u8>> = sink
+        .snapshot()
+        .unwrap()
+        .into_iter()
+        .map(|l| l.bytes)
+        .collect();
+    assert_eq!(got, vec![b"hello".to_vec(), b"world".to_vec()]);
+}

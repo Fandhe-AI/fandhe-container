@@ -93,16 +93,17 @@ pub const LAUNCH_START_TIMEOUT: Duration = Duration::from_secs(3);
 pub const LAUNCH_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// 同 状態照会の応答待ち。
 pub const LAUNCH_STATE_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
-/// 同 ゲスト内 virtiofs mount 報告の待機。start・共有走査（[`SHARE_SCAN_TIMEOUT`]）と合わせて 9 秒で、
-/// 10 秒の RPC 期限に 1 秒の余裕を残す。
-pub const LAUNCH_GUEST_MOUNT_TIMEOUT: Duration = Duration::from_secs(4);
+/// 同 ゲスト内 virtiofs mount 報告の待機。共有走査（[`SHARE_SCAN_TIMEOUT`] 1 秒）・start（3 秒）と合わせた
+/// `Vm::launch` の最大所要は 7 秒で、10 秒の RPC・都度起動の合計期限に 3 秒の余裕（plugin プロセスの起動・
+/// UDS 接続・フレーム送受信の分）を残す。各段階は固定配分で、合計がこの上限を超えない。
+pub const LAUNCH_GUEST_MOUNT_TIMEOUT: Duration = Duration::from_secs(3);
 /// 共有ディレクトリ配下の走査（`VmConfigSpec::check_share_conflicts_within`）の期限（REPAIR-5・MAC-1）。
 ///
-/// create は検証と登録だけなので 10 秒の RPC 期限に 8 秒の余裕を残す。start は `Vm::launch` が構成構築時に
+/// create は検証と登録だけなので 10 秒の RPC 期限に 9 秒の余裕を残す。start は `Vm::launch` が構成構築時に
 /// 同じ走査をやり直すため、同じ値を `OpTimeouts::with_share_scan` で渡す。全共有の合計で、超過は
 /// `config.shared_dir_scan_timeout`（`TIMEOUT`）。期限はエントリの合間に確かめるため、応答しないファイル
 /// システム上で 1 回の OS 呼び出しがブロックした場合は打ち切れない（platform-macos 側の残余）。
-pub const SHARE_SCAN_TIMEOUT: Duration = Duration::from_secs(2);
+pub const SHARE_SCAN_TIMEOUT: Duration = Duration::from_secs(1);
 /// 接続終了後の一括停止に使う総予算。core の `ResidentPlugin` は接続を閉じて 5 秒の猶予後に
 /// 強制終了するため、それより短くして `plugin.cleanup` の報告まで完了させる（REPAIR-5）。
 pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(4);
@@ -1340,7 +1341,7 @@ mod tests {
         std::fs::create_dir_all(&share).expect("mkdir");
         std::fs::write(share.join("f"), b"x").expect("write");
         let (mut a, _f) = adapter();
-        assert_eq!(a.share_scan_timeout, Duration::from_secs(2));
+        assert_eq!(a.share_scan_timeout, Duration::from_secs(1));
         a.share_scan_timeout = Duration::ZERO;
         let share = share.to_str().expect("utf8");
         assert_eq!(
@@ -1377,11 +1378,6 @@ mod tests {
             )
         );
         assert!(!BackendError::Platform(e).vm_may_exist());
-        // start の走査（Vm::launch）と合わせても RPC 期限 10 秒に収まる。
-        assert_eq!(
-            LAUNCH_START_TIMEOUT + LAUNCH_GUEST_MOUNT_TIMEOUT + SHARE_SCAN_TIMEOUT,
-            Duration::from_secs(9)
-        );
     }
 
     /// TASK-115.3・REPAIR-3: stop 失敗は登録を残す。
@@ -1493,8 +1489,12 @@ mod tests {
     #[test]
     fn task115_3_repair5_timeouts_fit_core_deadlines() {
         let launch = LAUNCH_START_TIMEOUT + LAUNCH_GUEST_MOUNT_TIMEOUT + SHARE_SCAN_TIMEOUT;
-        assert_eq!(launch, Duration::from_secs(9));
-        assert!(launch < Duration::from_secs(10));
+        // 走査 1 秒＋start 3 秒＋ゲスト mount 3 秒。RPC 期限 10 秒に 3 秒の余裕を残す。
+        assert_eq!(SHARE_SCAN_TIMEOUT, Duration::from_secs(1));
+        assert_eq!(LAUNCH_START_TIMEOUT, Duration::from_secs(3));
+        assert_eq!(LAUNCH_GUEST_MOUNT_TIMEOUT, Duration::from_secs(3));
+        assert_eq!(launch, Duration::from_secs(7));
+        assert_eq!(Duration::from_secs(10) - launch, Duration::from_secs(3));
         assert_eq!(SHUTDOWN_BUDGET, Duration::from_secs(4));
         assert!(SHUTDOWN_BUDGET < Duration::from_secs(5));
         assert!(LAUNCH_STOP_TIMEOUT <= SHUTDOWN_BUDGET);

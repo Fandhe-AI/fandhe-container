@@ -17,17 +17,19 @@
 //! # 契約
 //! - `unsafe fn` は公開しない。公開するのは安全な [`install_sigterm_flag`] のみ。
 //! - ハンドラは `static AtomicBool` への `store` だけを行う（async-signal-safe。確保・ロック・I/O をしない）。
-//! - 登録するのは `SIGTERM` の番号を確認済みの組（Linux の x86_64 / aarch64・macOS）だけ。それ以外
-//!   （Windows・FreeBSD 等の他の unix・Linux の他アーキテクチャ）は何も登録せず、決して立たないフラグを
-//!   `Ok` で返す（実装済みを装わない。REPAIR-3）。Windows には SIGTERM 経路が無い。他の unix と Linux の
-//!   他アーキテクチャでは SIGTERM が既定動作のまま届き、後始末を経ずに即終了する。
+//! - 登録するのは `SIGTERM` の番号を確認済みの組（Linux の x86_64 / aarch64・macOS）だけ。
+//! - Linux の他アーキテクチャは番号が未確認のため登録を試みず、`UNIMPLEMENTED` を返す（呼び出し側は
+//!   fail-closed で終了する。SIGTERM の既定動作で後始末を経ずに終了する状態では起動させない）。
+//! - Linux 以外の非対応 OS（Windows・FreeBSD 等の他の unix）は何も登録せず、決して立たないフラグを `Ok` で
+//!   返す（実装済みを装わない。REPAIR-3）。Windows には SIGTERM 経路が無い。他の unix では SIGTERM が
+//!   既定動作のまま届き、後始末を経ずに即終了する。
 //! - 返したフラグを立てるのはハンドラだけ、というのは呼び出し側の規約である。戻り値は
 //!   `&'static AtomicBool` で `store` を呼べるため、型では強制していない。
 //!
 //! # 限界（残存リスク）
 //! SIGKILL は捕捉できない。SIGTERM 送信側の猶予内に `stop_all`（最大 `SHUTDOWN_BUDGET` 4 秒）が終わらず
 //! SIGKILL された場合、VM は残留しうる。SIGINT / SIGHUP は本モジュールの対象外（#389 の受入基準は SIGTERM のみ）。
-//! 登録しない組（契約の項を参照）では、SIGTERM は既定動作で即終了するか（他の unix・Linux の他アーキテクチャ）
+//! 何も登録しない OS（契約の項を参照）では、SIGTERM は既定動作で即終了するか（他の unix）
 //! そもそも届かず（Windows）、VM は停止されない。
 
 use std::sync::atomic::AtomicBool;
@@ -38,13 +40,14 @@ use fandhe_container_plugin::PluginError;
 /// `&'static AtomicBool` として外へ渡すため、呼び出し側が立てないことは規約であり型では強制していない。
 static SIGTERM_RECEIVED: AtomicBool = AtomicBool::new(false);
 
-// `SIGTERM` の番号を定義した組だけで有効にする。それ以外（Linux の他アーキテクチャを含む）は
-// [`install_sigterm_flag`] の「登録しない」側へ倒す。`crates/plugin/src/sys.rs` の流儀に合わせた選択で、
-// 同ファイルは未確認の OS・アーキテクチャを実行時の縮退で扱い、`compile_error!` は構造体レイアウトの
-// 取り違えが未定義動作になる箇所に限っている。番号とハンドラのアドレスしか渡さない `signal(3)` に
-// その危険は無く、ビルドを拒否すると workspace 全体がそのターゲットでビルドできなくなる。
-// OS だけで分岐していた従来は Linux の他アーキテクチャで定数未定義のコンパイルエラーになっていた。
-// 対応済みの組の挙動は変えていない。
+// `SIGTERM` の番号を定義した組だけで有効にする。Linux の他アーキテクチャは [`install_sigterm_flag`] が
+// 実行時に `UNIMPLEMENTED` で拒否する。`crates/plugin/src/sys.rs` の流儀に合わせた選択で、同ファイルは
+// 未確認のアーキテクチャを `compile_error!` でなく実行時のエラー（`Unsupported`。fail-closed）で扱い、
+// `compile_error!` は構造体レイアウトの取り違えが未定義動作になる箇所に限っている。番号とハンドラの
+// アドレスしか渡さない `signal(3)` にその危険は無く、ビルドを拒否すると workspace 全体がそのターゲットで
+// ビルドできなくなる。OS だけで分岐していた従来は Linux の他アーキテクチャで定数未定義のコンパイル
+// エラーになっていた。ビルドは通すが起動は拒否するため、後始末なしで動く構成は増やさない。
+// 対応済みの組と Linux 以外の OS の挙動は変えていない。
 #[cfg(any(
     target_os = "macos",
     all(
@@ -97,27 +100,50 @@ mod imp {
 
 /// SIGTERM 受信フラグを登録して返す。接続前に 1 回だけ呼ぶ。
 ///
-/// 登録失敗は `INTERNAL`（固定文言）。VM を安全に止められない状態で動かさないため、呼び出し側は
-/// fail-closed で終了する。fail-closed になるのは登録を試みる組（Linux の x86_64 / aarch64・macOS）だけで、
-/// それ以外（Windows・他の unix・Linux の他アーキテクチャ）では登録せず、決して立たないフラグを `Ok` で返す
+/// 登録失敗は `INTERNAL`、Linux の未確認アーキテクチャは `UNIMPLEMENTED`（どちらも固定文言）。
+/// VM を安全に止められない状態で動かさないため、呼び出し側は fail-closed で終了する。
+/// Linux 以外の非対応 OS（Windows・他の unix）では登録せず、決して立たないフラグを `Ok` で返す
 /// （SIGTERM での後始末は効かない。モジュール doc「契約」参照。REPAIR-3）。
 pub fn install_sigterm_flag() -> Result<&'static AtomicBool, PluginError> {
-    #[cfg(any(
-        target_os = "macos",
-        all(
-            target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        )
-    ))]
-    {
-        if !imp::install() {
-            return Err(PluginError::new(
-                fandhe_container_plugin::PluginErrorCode::Internal,
-                "failed to install SIGTERM handler",
-            ));
-        }
-    }
+    register()?;
     Ok(&SIGTERM_RECEIVED)
+}
+
+/// 対応済みの組: ハンドラを登録する。失敗は `INTERNAL`。
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn register() -> Result<(), PluginError> {
+    if imp::install() {
+        Ok(())
+    } else {
+        Err(PluginError::new(
+            fandhe_container_plugin::PluginErrorCode::Internal,
+            "failed to install SIGTERM handler",
+        ))
+    }
+}
+
+/// Linux の未確認アーキテクチャ: `SIGTERM` の番号を持たないため登録を試みず拒否する（fail-closed）。
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+fn register() -> Result<(), PluginError> {
+    Err(PluginError::new(
+        fandhe_container_plugin::PluginErrorCode::Unimplemented,
+        "SIGTERM handler is not supported on this architecture",
+    ))
+}
+
+/// Linux 以外の非対応 OS: 何も登録しない（決して立たないフラグを返す側。REPAIR-3）。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn register() -> Result<(), PluginError> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -126,11 +152,34 @@ mod tests {
 
     use super::*;
 
-    /// TASK-115.5・MAC-1: 登録に成功し（登録しない組では何もせず `Ok`）、初期値は偽。
+    /// TASK-115.5・MAC-1: 登録に成功し（Linux 以外の非対応 OS では何もせず `Ok`）、初期値は偽。
+    #[cfg(not(all(
+        target_os = "linux",
+        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    )))]
     #[test]
     fn task115_5_mac1_install_succeeds_and_flag_starts_false() {
         let flag = install_sigterm_flag().expect("install");
         assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    /// TASK-115.5・MAC-1・REPAIR-3: Linux の未確認アーキテクチャは登録せず `UNIMPLEMENTED` で拒否する（fail-closed）。
+    #[cfg(all(
+        target_os = "linux",
+        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    ))]
+    #[test]
+    fn task115_5_mac1_unverified_linux_arch_is_rejected() {
+        let err = install_sigterm_flag().expect_err("must reject");
+        assert_eq!(
+            err.code(),
+            fandhe_container_plugin::PluginErrorCode::Unimplemented
+        );
+        assert_eq!(
+            err.message(),
+            "SIGTERM handler is not supported on this architecture"
+        );
+        assert!(!SIGTERM_RECEIVED.load(Ordering::SeqCst));
     }
 
     #[cfg(any(

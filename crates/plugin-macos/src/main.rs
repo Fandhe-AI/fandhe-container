@@ -72,8 +72,9 @@ fn main() -> ExitCode {
         }
     };
     // SIGTERM で起動中の VM を止めてから終了する（TASK-115.5・#389）。接続前に登録して取りこぼしを避け、
-    // 登録を試みる組（Linux の x86_64 / aarch64・macOS）で失敗した場合は、VM を止められない状態で
-    // 動かさないため fail-closed で終了する。それ以外の組は何も登録せず `Ok` が返る（`sys` の doc 参照。REPAIR-3）。
+    // 登録に失敗した場合と Linux の未確認アーキテクチャ（登録を試みず `UNIMPLEMENTED`）は、VM を
+    // 止められない状態で動かさないため fail-closed で終了する。Linux 以外の非対応 OS は何も登録せず
+    // `Ok` が返る（`sys` の doc 参照。REPAIR-3）。
     let stop = match install_sigterm_flag() {
         Ok(f) => f,
         Err(e) => {

@@ -45,7 +45,8 @@ pub const ENV_FILE_MAX_BYTES: usize = ENV_MAX_TOTAL_BYTES;
 /// `open(2)` に渡す `O_NONBLOCK`（unix のみ。`unsafe`・外部クレートなしで std の `custom_flags` へ渡す）。
 ///
 /// FIFO を読み取りで開くと書き手が現れるまで `open` がブロックするため、非ブロッキングで開いて
-/// fd の種別検査で弾く（REPAIR-5）。値は OS・アーキテクチャで異なるため `cfg` で分けて定義する。
+/// fd の種別検査で弾く（REPAIR-5）。値は OS・アーキテクチャで異なるため `cfg` で分けて定義する（core の `oci_runtime::config` の
+/// `open_checked_candidate` と同じ対象を揃える）。
 /// 定義できない環境は 0（フラグなし）になり、open 前の `metadata` 検査のみが防御になる。
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),
@@ -54,7 +55,12 @@ pub const ENV_FILE_MAX_BYTES: usize = ENV_MAX_TOTAL_BYTES;
         target_arch = "x86_64",
         target_arch = "arm",
         target_arch = "aarch64",
-        target_arch = "riscv64"
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "s390x",
+        target_arch = "loongarch64"
     )
 ))]
 const O_NONBLOCK: i32 = 0o4000;
@@ -75,7 +81,12 @@ const O_NONBLOCK: i32 = 0x4;
             target_arch = "x86_64",
             target_arch = "arm",
             target_arch = "aarch64",
-            target_arch = "riscv64"
+            target_arch = "riscv32",
+            target_arch = "riscv64",
+            target_arch = "powerpc",
+            target_arch = "powerpc64",
+            target_arch = "s390x",
+            target_arch = "loongarch64"
         )
     ),
     target_os = "macos",
@@ -165,6 +176,10 @@ impl EnvFile {
     /// KEY 側の前置空白は除去する。VALUE は加工しない。不正行は行番号つきのエラーにする
     /// （行の内容は含めない）。
     pub fn parse(content: &str) -> Result<Self, TraitError> {
+        // 行ごとの確保の前に全体長を検証する（無制限確保の防止。`read` と同じ上限）。
+        if content.len() > ENV_FILE_MAX_BYTES {
+            return Err(invalid("env file is too large"));
+        }
         let content = content.strip_prefix('\u{feff}').unwrap_or(content);
         let mut vars = Vec::new();
         for (idx, raw) in content.split('\n').enumerate() {
@@ -246,35 +261,49 @@ impl EnvSet {
     /// ベース < env ファイル（指定順）< `-e`（指定順）。件数・合計長の上限を超えると `InvalidArgument`。
     /// 検証するのは env 単体の上限のみで、パス・argv を含めた起動可能性は保証しない
     /// （[`EnvSet::check_entrypoint_budget`] で別途検証する）。
-    /// 重複排除は KEY の索引で行い入力件数に対し線形。入力の各要素は検証済み（[`EnvVar::parse`]・
+    /// 重複排除は KEY の索引で行い入力件数に対し線形。値の複製は上限検証の後に 1 回だけ行う。入力の各要素は検証済み（[`EnvVar::parse`]・
     /// [`EnvFile::parse`] 経由）であることが前提で、統合後の件数は都度上限検証する。
     pub fn resolve(
         base: &[EnvVar],
         files: &[EnvFile],
         vars: &[EnvVar],
     ) -> Result<Self, TraitError> {
-        let mut set = Self::new();
-        let mut index: HashMap<String, usize> = HashMap::new();
+        // 値を複製する前に、上書き・追加後の件数と合計長を借用のまま算出して上限検証する
+        // （入力が上限超過でも確保しない）。位置は最初に現れた KEY、値は最後に現れたものを採る。
+        let mut index: HashMap<&str, usize> = HashMap::new();
+        let mut picked: Vec<&EnvVar> = Vec::new();
         let all = base
             .iter()
             .chain(files.iter().flat_map(|f| f.vars.iter()))
             .chain(vars.iter());
+        let mut total = 0usize;
         for v in all {
-            match index.get(&v.key) {
+            let len = v.key.len() + 1 + v.value.len();
+            match index.get(v.key.as_str()) {
                 Some(&i) => {
-                    if let Some(e) = set.entries.get_mut(i) {
-                        e.value.clone_from(&v.value);
-                    }
+                    let Some(slot) = picked.get_mut(i) else {
+                        return Err(invalid("env index is inconsistent"));
+                    };
+                    let old = slot.key.len() + 1 + slot.value.len();
+                    total = total.saturating_sub(old + 1).saturating_add(len + 1);
+                    *slot = v;
                 }
                 None => {
-                    if set.entries.len() >= ENV_MAX_ENTRIES {
+                    if picked.len() >= ENV_MAX_ENTRIES {
                         return Err(invalid("too many env entries"));
                     }
-                    index.insert(v.key.clone(), set.entries.len());
-                    set.entries.push(v.clone());
+                    index.insert(v.key.as_str(), picked.len());
+                    picked.push(v);
+                    total = total.saturating_add(len + 1);
                 }
             }
+            if total > ENV_MAX_TOTAL_BYTES {
+                return Err(invalid("env is too large"));
+            }
         }
+        let set = Self {
+            entries: picked.into_iter().cloned().collect(),
+        };
         set.check_limits()?;
         Ok(set)
     }
@@ -442,6 +471,31 @@ mod tests {
         assert_eq!(
             EnvSet::resolve(&big, &[], &[]).unwrap_err().code(),
             ErrorCode::InvalidArgument
+        );
+    }
+
+    /// SUP-12・TASK-169.4: 上限超過の内容は行ごとの確保の前に拒否する。
+    #[test]
+    fn sup12_env_file_parse_rejects_oversized_content() {
+        let content = "\n".repeat(ENV_FILE_MAX_BYTES + 1);
+        let e = EnvFile::parse(&content).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "env file is too large");
+    }
+
+    /// SUP-12・TASK-169.4: 同一 KEY の上書きで合計が上限内に収まる場合は受理し、複製前に超過を拒否する。
+    #[test]
+    fn sup12_env_resolve_override_total_checked_before_copy() {
+        let big = |k: &str| var(&format!("{k}={}", "x".repeat(100_000)));
+        // 同一 KEY の繰り返しは合計に累積しない。
+        let same: Vec<_> = (0..50).map(|_| big("K")).collect();
+        assert_eq!(EnvSet::resolve(&same, &[], &[]).unwrap().len(), 1);
+        // 小さい値を大きい値で上書きして上限を超える場合も拒否する。
+        let base: Vec<_> = (0..10).map(|i| var(&format!("K{i}=v"))).collect();
+        let over: Vec<_> = (0..11).map(|i| big(&format!("K{i}"))).collect();
+        assert_eq!(
+            EnvSet::resolve(&base, &[], &over).unwrap_err().message(),
+            "env is too large"
         );
     }
 

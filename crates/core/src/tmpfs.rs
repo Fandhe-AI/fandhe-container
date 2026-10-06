@@ -133,7 +133,7 @@ impl TmpfsMountSet {
         Self::default()
     }
 
-    /// マウントを追加する。予約先・重複・件数上限超過は拒否する。
+    /// マウントを追加する。予約先・重複・子より後の親指定・件数上限超過は拒否する。
     pub fn push(&mut self, spec: TmpfsMountSpec) -> Result<(), TraitError> {
         let dest = spec.destination.as_str();
         if dest == "/proc" || dest.starts_with("/proc/") {
@@ -148,6 +148,17 @@ impl TmpfsMountSet {
             .any(|m| m.destination == spec.destination)
         {
             return Err(invalid("duplicate tmpfs mount destination"));
+        }
+        // 子が親より先に指定されると、後から重なる親の tmpfs が子を覆い隠して黙って無効になる。
+        let prefix = format!("{dest}/");
+        if self
+            .mounts
+            .iter()
+            .any(|m| m.destination.as_str().starts_with(&prefix))
+        {
+            return Err(invalid(
+                "tmpfs parent mount must be specified before its child",
+            ));
         }
         if self.mounts.len() >= TMPFS_MAX_MOUNTS {
             return Err(invalid("too many tmpfs mounts"));
@@ -227,6 +238,20 @@ mod tests {
             set.push(TmpfsMountSpec::new("/dev/shm/", None).expect("dup"))
                 .is_err()
         );
+        let mut order = TmpfsMountSet::new();
+        order
+            .push(TmpfsMountSpec::new("/a/b", None).expect("child"))
+            .expect("child first");
+        let e = order
+            .push(TmpfsMountSpec::new("/a", None).expect("parent"))
+            .expect_err("parent after child");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        let mut ok = TmpfsMountSet::new();
+        ok.push(TmpfsMountSpec::new("/a", None).expect("parent"))
+            .expect("parent first");
+        ok.push(TmpfsMountSpec::new("/a/b", None).expect("child"))
+            .expect("child after parent");
+        assert_eq!(ok.mounts().len(), 2);
         let mut full = TmpfsMountSet::new();
         for i in 0..TMPFS_MAX_MOUNTS {
             full.push(TmpfsMountSpec::new(&format!("/m{i}"), None).expect("m"))

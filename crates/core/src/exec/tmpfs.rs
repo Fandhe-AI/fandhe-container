@@ -194,21 +194,37 @@ fn open_or_create_chain(
     })
 }
 
-/// マウント後に同じ要素を開き直し、tmpfs であることを確かめる。`cfg(test)` の dry-run では実マウントが
-/// 無いため省く（判定本体 [`check_tmpfs_magic`] は単体で試験する）。
+/// マウント後に同じ要素を開き直し、tmpfs であることを確かめる。本体は cfg で差し替わる
+/// `fstatfs_magic_at` を介すだけで、`cfg(test)` の分岐は持たない（判定本体 [`check_tmpfs_magic`] は単体で試験する）。
 fn verify_mounted(
     root: BorrowedFd<'_>,
     rootfs: &std::path::Path,
     names: &[&OsStr],
     spec: &TmpfsMountSpec,
 ) -> Result<(), ExecError> {
-    if cfg!(test) {
-        return Ok(());
-    }
-    let dir = open_or_create_chain(root, rootfs, names)?;
-    let magic = sys::fs_type(dir.as_fd())
-        .map_err(|e| ExecError::from_sys(e, STAGE, "fstatfs(tmpfs mount target)"))?;
+    let magic = fstatfs_magic_at(root, rootfs, names)?;
     check_tmpfs_magic(magic, spec.destination.as_str())
+}
+
+#[cfg(not(test))]
+fn fstatfs_magic_at(
+    root: BorrowedFd<'_>,
+    rootfs: &std::path::Path,
+    names: &[&OsStr],
+) -> Result<i64, ExecError> {
+    let dir = open_or_create_chain(root, rootfs, names)?;
+    sys::fs_type(dir.as_fd())
+        .map_err(|e| ExecError::from_sys(e, STAGE, "fstatfs(tmpfs mount target)"))
+}
+
+/// dry-run: 実マウントが無いため tmpfs のマジックを返す（実機の検証は結合試験で行う）。
+#[cfg(test)]
+fn fstatfs_magic_at(
+    _root: BorrowedFd<'_>,
+    _rootfs: &std::path::Path,
+    _names: &[&OsStr],
+) -> Result<i64, ExecError> {
+    Ok(sys::TMPFS_MAGIC)
 }
 
 /// 事後条件の判定（純関数）。`statfs.f_type` が tmpfs でなければ拒否する。

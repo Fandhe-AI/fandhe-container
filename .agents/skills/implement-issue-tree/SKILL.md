@@ -571,7 +571,7 @@ open のサブイシューが残っている場合、または受入基準が未
 
 全イシューの処理結果をまとめてレポートを出力する。1 イシューの失敗では即停止せず次へ進むが、**3 イシュー連続で完了できなかった場合は新規着手を停止（halt）**し、ユーザーの判断を待つ。halt 後に着手しなかったイシューは `not-started` として記録される。out-of-scope 項目は各 PR 本文の「対象外（out-of-scope）」節（実装・セルフレビュー由来、**および Merge フェーズの未解決レビューコメント由来の記録を含む**）に記録されているため、レポート確認時にそれらを参照して Issue 化判断（承認後に references/out-of-scope-support.md「実装対象外（out-of-scope）の扱い」手順 3・4 を実行）を行う。あわせて、blocked / fix 対象外の未解決コメント（Merge ループの fixCount 上限到達・blocked 到達で自力解決できなかったレビュースレッド）は `done` 各エントリの `unresolvedComments`（構造化未解決コメント一覧）/ `outOfScope`（fix エージェントが対象外と判断したコメントのログ）フィールドに集約されるため、レポート生成時にそれらを本節へ一覧化する。
 
-前提イシューがラン中に外部完了（人手マージ・クローズ）した場合、**halt 発生前に限り**下流の依存ブロック項目は同一ラン内で再判定され着手される。halt（3 イシュー連続で完了できなかった場合の新規着手停止）後もプローブと状態記録（`prereqTransitions` への記録・state ファイルへの永続化）は継続するが、新規着手ゲート自体は再開しない（halt は新規イシュー投入を止めるユーザー判断待ちの防御であり、外部完了検知を理由に自動解除しない）。halt 後に検知・記録された外部完了は、次回ランの再実行時に下流着手へ反映される。この再判定件数はレポートの返却値 `prereqTransitions` に記録される。
+前提イシューがラン中に外部完了（人手マージ・クローズ）した場合、**halt 発生前に限り**下流の依存ブロック項目は同一ラン内で再判定され着手される。halt（3 イシュー連続で完了できなかった場合の新規着手停止）後もプローブと状態記録（`prereqTransitions` への記録・state ファイルへの永続化）は継続するが、新規着手ゲート自体は再開しない（halt は新規イシュー投入を止めるユーザー判断待ちの防御であり、外部完了検知を理由に自動解除しない）。halt 後に検知・記録された外部完了は、次回ランの再実行時に下流着手へ反映される。この再判定件数はレポートの返却値 `prereqTransitions` に記録される。前提の PR MERGED 判定は PR 番号の一致だけでなく、merge-verify と同じ PR と issue の結び付け照合（headRefName・base・同一リポジトリ・closingIssues）を満たす場合に限る（詳細は references/recovery.md）。
 
 レポート出力テンプレート（処理結果サマリー・完了イシュー・失敗/未着手イシュー・対象外/未解決コメントの各節）と返却値フィールドの説明は以下を参照。
 
@@ -632,7 +632,7 @@ open のサブイシューが残っている場合、または受入基準が未
 | `plan:declared-deps-*`（本文の依存宣言の機械抽出） | haiku | low | 定型コマンド出力の転記（判断なし） |
 | `plan:out-of-tree-deps-*` / `plan:root-ancestors-<round>`（ツリー外前提の state・ルートの祖先チェーンの機械取得） | haiku | low | 定型コマンド出力の転記（判断なし）。ツリー外の前提がある場合のみ起動。祖先チェーンはラウンドごとにラベルが変わる（`plan:root-ancestors-1` 等、最大 5 ラウンド） |
 | `detect:external-checks`（外部チェック判定） | haiku | low | 定型コマンド集計 |
-| `state:load` / `state:load-verify` / `state:update` / `state:cleanup` / `state:init-all` / `state:high-water` | haiku（未返却時 sonnet へ 1 回フォールバック） | low | jq の機械処理。StructuredOutput 未返却（例外・null・schema 不適合）が続く場合のみ同一プロンプトで sonnet へ 1 回フォールバックする。`state:load-verify` は読込結果を項目ごとの sha256 で照合する独立エージェント（詳細は `references/recovery.md`） |
+| `state:load` / `state:load-verify` / `state:load-fill` / `state:update` / `state:cleanup` / `state:init-all` / `state:high-water` | haiku（未返却時 sonnet へ 1 回フォールバック） | low | jq の機械処理。StructuredOutput 未返却（例外・null・schema 不適合）が続く場合のみ同一プロンプトで sonnet へ 1 回フォールバックする。`state:load-verify` は読込結果を項目ごとの sha256 で照合する独立エージェント。`state:load-fill` は返らなかったキーをホスト組み立ての jq で 5 件ずつ再取得する（詳細は `references/recovery.md`） |
 | `nonce:seed`（境界トークン用 seed 生成） | haiku | low | `/dev/urandom` 読み出しのみ（driver に乱数源が無いため。下記「非信頼データの扱い」2 を参照） |
 | `recover:#N`（中断作業の継続可否判断） | （指定なし＝セッション継承） | medium | 計画判断相当（Plan と同じ軸で判断） |
 | `plan:#N`（per-issue 計画立案） | （指定なし＝セッション継承） | high | 最も複雑な計画立案 |

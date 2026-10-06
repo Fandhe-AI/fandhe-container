@@ -28,13 +28,21 @@ mod linux {
     impl TmpDir {
         fn new(tag: &str) -> Self {
             use std::os::unix::fs::PermissionsExt;
-            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-            let p = std::env::temp_dir()
-                .join(format!("fandhe-sup-insp-{tag}-{}-{n}", std::process::id()));
-            let _ = fs::remove_dir_all(&p);
-            fs::create_dir_all(&p).unwrap();
-            fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
-            Self(p)
+            // 既存パスは削除せず、`create_dir`（原子的な新規作成）が AlreadyExists を返したら
+            // 連番を進めて別名で再試行する（所有確認なしの remove_dir_all を避ける）。
+            loop {
+                let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+                let p = std::env::temp_dir()
+                    .join(format!("fandhe-sup-insp-{tag}-{}-{n}", std::process::id()));
+                match fs::create_dir(&p) {
+                    Ok(()) => {
+                        fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
+                        return Self(p);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("create_dir {}: {e}", p.display()),
+                }
+            }
         }
         fn path(&self) -> &Path {
             &self.0

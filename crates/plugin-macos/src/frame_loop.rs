@@ -227,7 +227,16 @@ fn recv_frame<R: Read>(r: &mut R, deadline: Duration) -> Result<Recv, PluginErro
             Err(_) => return Err(io_err()),
         }
     }
-    Ok(Recv::Frame(Frame::decode_body(header, &body)?))
+    // 最後の read が期限後に返った場合も、フレーム全体の合計期限（REPAIR-5）を超えた成功は返さない。
+    if started.elapsed() >= deadline {
+        return Err(timeout_err());
+    }
+    let frame = Frame::decode_body(header, &body)?;
+    // デコード（チェックサム検証）に時間を要して期限を超えた場合も同様にタイムアウトとする。
+    if started.elapsed() >= deadline {
+        return Err(timeout_err());
+    }
+    Ok(Recv::Frame(frame))
 }
 
 /// 接続済み `stream` 上で要求を順次処理する（受信 → [`handle_frame`] → 送信の繰り返し）。
@@ -448,6 +457,42 @@ mod tests {
         }
         let e = recv_frame(&mut chunky(bytes, 64, 0), LONG).unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::DataLoss);
+    }
+
+    /// 最後の read が期限を跨いで成功しても、フレーム全体の期限超過はタイムアウトにする（REPAIR-5）。
+    struct SlowLast {
+        data: Vec<u8>,
+        pos: usize,
+        delay: Duration,
+    }
+
+    impl Read for SlowLast {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let rest = self.data.get(self.pos..).unwrap_or(&[]);
+            // 末尾まで読み切る read だけ遅延させる。
+            if rest.len() <= buf.len() && self.pos > 0 {
+                std::thread::sleep(self.delay);
+            }
+            let n = rest.len().min(buf.len());
+            if let (Some(dst), Some(src)) = (buf.get_mut(..n), rest.get(..n)) {
+                dst.copy_from_slice(src);
+            }
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn task115_2_plug1_recv_deadline_exceeded_by_last_read_is_timeout() {
+        let bytes = req(1, &["op"]).encode();
+        let mut r = SlowLast {
+            data: bytes,
+            pos: 0,
+            delay: Duration::from_millis(80),
+        };
+        // ヘッダは 1 回で読み、本体の最終 read が期限（30ms）を超える。
+        let e = recv_frame(&mut r, Duration::from_millis(30)).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Timeout);
     }
 
     #[test]

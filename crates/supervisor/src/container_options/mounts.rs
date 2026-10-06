@@ -34,6 +34,10 @@ pub const DEFAULT_SHM_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 /// `--tmpfs` 1 件の入力長上限（core の `CONFIG_MAX_PATH_BYTES` と同じ値）。
 const MAX_OPTION_BYTES: usize = 4096;
 
+/// サイズ文字列（`--shm-size`・`size=`）の入力長上限。u64 の 10 進（最大 20 桁）と単位に十分な値で、
+/// 小文字化の確保より前に検証して入力長比例の確保を防ぐ（SUP-12・TASK-169.2）。
+const MAX_SIZE_TEXT_BYTES: usize = 64;
+
 /// `--tmpfs` 1 件のオプション数上限（core の `CONFIG_MAX_MOUNT_OPTIONS` と同じ値）。
 const MAX_OPTION_ITEMS: usize = 64;
 
@@ -59,6 +63,9 @@ impl ShmSize {
 
 /// サイズ文字列を [`TmpfsSize`] にする（`--shm-size` と `--tmpfs` の `size=` で共通）。
 fn parse_size(text: &str) -> Result<TmpfsSize, TraitError> {
+    if text.len() > MAX_SIZE_TEXT_BYTES {
+        return Err(invalid("size is too long"));
+    }
     let lower = text.to_ascii_lowercase();
     let split = lower
         .find(|c: char| !c.is_ascii_digit())
@@ -276,6 +283,22 @@ mod tests {
             let e = TmpfsOption::parse(bad).expect_err(bad);
             assert_eq!(e.code(), ErrorCode::InvalidArgument, "{bad}");
         }
+    }
+
+    /// SUP-12・TASK-169.2: 過長なサイズ文字列は確保前に拒否する。
+    #[test]
+    fn sup12_task169_2_size_text_too_long_rejected() {
+        let long = "1".repeat(MAX_SIZE_TEXT_BYTES + 1);
+        let e = ShmSize::parse(&long).expect_err("long shm-size");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        let e = TmpfsOption::parse(&format!("/x:size={long}")).expect_err("long size=");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        let huge = "9".repeat(1_000_000);
+        assert_eq!(
+            ShmSize::parse(&huge).expect_err("huge").code(),
+            ErrorCode::InvalidArgument
+        );
+        assert_eq!(ShmSize::parse("64m").expect("ok").bytes(), 67_108_864);
     }
 
     /// SUP-12・TASK-169.2: shm_size は /dev/shm を先頭に置き、--tmpfs /dev/shm との併用は拒否する。

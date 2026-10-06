@@ -20,6 +20,8 @@
 //! create / start / stop は 1 操作ごとに成功・失敗の累計とレイテンシを入力値抜きの 1 行 JSON（`plugin.op`。REPAIR-4）で stderr へ出す。
 //! 起動に失敗して停止を確認できない VM も `remaining` に数え、終了コード 5 で成功終了を避ける（REPAIR-3）。
 //! 停止結果は stderr へ件数のみの 1 行 JSON（`plugin.cleanup`）で出す。
+//! フレームループが異常終了した場合は、停止できない VM が残っていても終了コードは 4 のまま（5 にはしない）。
+//! 残った VM の数は `plugin.cleanup` 行の `remaining` で伝える。
 
 use std::process::ExitCode;
 use std::time::Duration;

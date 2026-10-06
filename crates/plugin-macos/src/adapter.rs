@@ -32,7 +32,7 @@
 //! | `Vm`: `VirtualizationUnsupported`・`InvalidConfiguration`・`InvalidState` | `FAILED_PRECONDITION` |
 //! | `Vm`: `InvalidTimeout` | `INVALID_ARGUMENT` |
 //! | `Vm`: `StartFailed`・`StopFailed` | `INTERNAL` |
-//! | `Vm`・`GuestMount`: `Timeout` | `TIMEOUT` |
+//! | `Vm`・`GuestMount`: `Timeout`、`Vm`: `Cancelled` | `TIMEOUT` |
 //! | `Vm::CallbackLost`・`GuestMount::VmStopped`・`GuestMount::ReportChannelClosed` | `UNAVAILABLE` |
 //! | `GuestMount::Failed`・`InvalidReport` | `INTERNAL` |
 //! | `VirtiofsIo::Protocol` | 同名コードへ 1:1（`resource_exhausted` は `FAILED_PRECONDITION`） |
@@ -59,6 +59,16 @@
 //! 共有配下の走査（範囲外 symlink・ハードリンク・マウント境界）は create と start（`Vm::launch` 内の再検査）の
 //! どちらも [`SHARE_SCAN_TIMEOUT`] で打ち切り、超過は `TIMEOUT`（`config.shared_dir_scan_timeout`）で返す（REPAIR-5）。
 //!
+//! 検査の時点（create と start は別の RPC で、間隔に上限は無い）:
+//! - create: 共有元の `try_new`（symlink 非経由）・kernel / initrd の検証・共有配下の走査。
+//! - start: 登録済みの仕様を `Vm::launch` へ渡す。platform-macos の構成構築（`build_vz_configuration_within`）が
+//!   共有配下の走査をやり直し、VZ へパスを渡す直前に kernel・initrd・共有元を生成時と同じ検証で再検証する
+//!   （`VmConfigSpec::revalidate_host_paths`）。create 後に共有元やその祖先が symlink へ差し替えられた場合は
+//!   `config.shared_dir_symlink`（`INVALID_ARGUMENT`）で拒否し、登録は `Created` のまま残る。
+//!   非 macOS の実バックエンドは起動自体を `UNIMPLEMENTED` で拒否するため再検証に到達しない。
+//! - 残余: 再検証の直後から Virtualization.framework がパスを開くまでの差し替えは検出できない（VZ は fd では
+//!   なくパスを受け取る。残余リスクとして受け入れる）。
+//!
 //! # 取り消せない OS 呼び出しの隔離（REPAIR-5）
 //!
 //! 要求由来のパスに触れる処理（create の kernel・initrd・共有元の検証と共有走査、start の `Vm::launch`）は
@@ -69,6 +79,21 @@
 //! 別々に 4、合計 8）、上限に達した側は新しい
 //! 処理を開始せず `UNAVAILABLE` で拒否する。start の期限超過は VM が作られ得るため停止未確認
 //! （`LaunchFailed`）として扱う。stop は VM キューへの期限つき要求だけでファイルシステムに触れない。
+//!
+//! start の期限超過時は取り消しフラグを立て、作業スレッド側の `Vm::launch_cancellable` が「構成構築後・
+//! VM 生成前」と「VM 生成後・開始要求前」に確認して起動を中止する（応答後に VM が共有つきで起動するのを
+//! 避ける）。確認点の間（構成構築中の OS 呼び出し・開始要求の後）は取り消せず、その場合に完成した `Vm` は
+//! 作業スレッド側で drop されて停止要求が走る（完了は確認できないため `LaunchFailed` の扱いは変えない）。
+//!
+//! # 運用上の制約（挙動は fail-closed。REPAIR-3）
+//! - 停止要求が VM の `Error` 状態で拒否された VM（停止未確認）と `LaunchFailed` は登録に残り、同時実行上限
+//!   （停止待ち 2 秒では 1）に算入される。そのため以後の `start` は plugin プロセスを再起動するまで
+//!   `FAILED_PRECONDITION` で拒否される（回復手順は plugin の再起動）。Virtualization.framework が `Error` から
+//!   `Stopped` へ自発的に遷移するかは実機未確認で、遷移すれば `stop` の再試行で登録が外れる。
+//! - フレームループが異常終了した場合の終了コードは、停止できない VM が残っていても 4（`main.rs`）。残った
+//!   VM の数は stderr の `plugin.cleanup` 行の `remaining` に出る。
+//! - 期限超過で残った作業スレッドが Virtualization.framework の呼び出し中に `main` が戻った場合（プロセス
+//!   終了）の挙動は実機未確認。
 //!
 //! # 未実装範囲（実装済みを装わない。REPAIR-3）
 //! - 型つき本体と core の `ContainerRuntime` トレイトへの接続・kill / delete / state（TASK-114 待ち）。
@@ -92,8 +117,8 @@ use std::time::{Duration, Instant};
 use fandhe_container_platform_macos::config::{ConfigError, VmConfigSpec};
 use fandhe_container_platform_macos::error::{GuestMountError, PlatformError, VmError};
 use fandhe_container_platform_macos::virtiofs::{
-    ShareAccess, SharedDirectoryPath, VirtiofsIoError, VirtiofsShareSpec, VirtiofsSharesSpec,
-    VirtiofsTag,
+    MAX_VIRTIOFS_SHARES, ShareAccess, SharedDirectoryPath, VirtiofsIoError, VirtiofsShareSpec,
+    VirtiofsSharesSpec, VirtiofsTag,
 };
 use fandhe_container_plugin::{PluginError, PluginErrorCode};
 
@@ -208,7 +233,9 @@ impl BackendError {
             BackendError::Platform(PlatformError::Vm(
                 VmError::VirtualizationUnsupported
                 | VmError::InvalidConfiguration { .. }
-                | VmError::InvalidTimeout { .. },
+                | VmError::InvalidTimeout { .. }
+                // 取り消しは VM の開始要求より前にだけ起き、生成済みの VM は未開始のまま破棄されている。
+                | VmError::Cancelled { .. },
             )) => false,
             BackendError::Platform(_) => true,
         }
@@ -235,6 +262,9 @@ impl MacosBackend for PlatformBackend {
     type Handle = fandhe_container_platform_macos::vm::Vm;
 
     fn launch(&self, spec: &VmConfigSpec) -> Result<Self::Handle, BackendError> {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
         use fandhe_container_platform_macos::vm::{OpTimeouts, Vm};
         // 値は固定で範囲内だが、失敗しても panic せず構造化エラーへ写す。
         let timeouts = OpTimeouts::try_new(
@@ -248,11 +278,18 @@ impl MacosBackend for PlatformBackend {
         // 構成構築のファイルシステム操作は取り消せないため、起動全体を作業スレッドへ隔離して期限つきで待つ。
         // 期限後に完成した `Vm` は受け手が無く作業スレッド側で drop され、停止要求が走る（REPAIR-5）。
         let spec = spec.clone();
+        // 期限超過時に立てる取り消しフラグ。作業スレッドは VM の生成前・開始要求前に確認して起動を中止する
+        // （応答後に VM が共有つきで起動するのを避ける。OS 呼び出し中・開始要求の後は取り消せない）。
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
         match isolate::run(&self.workers, LAUNCH_TOTAL_TIMEOUT, move || {
-            Vm::launch(&spec, timeouts)
+            Vm::launch_cancellable(&spec, timeouts, &worker_cancel)
         }) {
             Ok(launched) => Ok(launched?),
-            Err(IsolateError::Timeout { after }) => Err(BackendError::LaunchTimedOut { after }),
+            Err(IsolateError::Timeout { after }) => {
+                cancel.store(true, Ordering::SeqCst);
+                Err(BackendError::LaunchTimedOut { after })
+            }
             Err(IsolateError::Busy) => Err(BackendError::LaunchNotStarted { busy: true }),
             // 作業スレッドを起動できなかった場合は起動を始めていない（VM なし）。
             Err(IsolateError::SpawnFailed) => Err(BackendError::LaunchNotStarted { busy: false }),
@@ -475,6 +512,15 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
                 PluginErrorCode::AlreadyExists,
                 "container already exists",
             ));
+        }
+        // 件数だけで決まる上限は、ホストのファイルシステムに触れる検証（各共有元の検証・別名の確認）より
+        // 先に確かめる（platform-macos の `VirtiofsSharesSpec::try_new` と同じ上限・同じエラー）。
+        let share_count = rest.len() / 3;
+        if share_count > MAX_VIRTIOFS_SHARES {
+            return Err(config_to_plugin(ConfigError::TooManyVirtiofsShares {
+                count: share_count,
+                max: MAX_VIRTIOFS_SHARES,
+            }));
         }
         if self.entries.len() >= MAX_CONTAINERS {
             return Err(PluginError::new(
@@ -779,7 +825,7 @@ pub fn to_plugin_error(e: &PlatformError) -> PluginError {
                 | VmError::InvalidConfiguration { .. }
                 | VmError::InvalidState { .. } => C::FailedPrecondition,
                 VmError::InvalidTimeout { .. } => C::InvalidArgument,
-                VmError::Timeout { .. } => C::Timeout,
+                VmError::Timeout { .. } | VmError::Cancelled { .. } => C::Timeout,
                 VmError::CallbackLost { .. } => C::Unavailable,
                 _ => C::Internal,
             };
@@ -1543,6 +1589,57 @@ mod tests {
             assert!(!e.vm_may_exist());
             let p = backend_to_plugin(&e);
             assert_eq!((p.code(), p.message()), (PluginErrorCode::Unavailable, msg));
+        }
+    }
+
+    /// TASK-115.3・MAC-1: 共有の件数上限（8）は、各共有元の検証より前に件数だけで拒否する
+    /// （存在しないパスを並べても `too_many` が返り、パスの検証エラーにならない）。上限ちょうどは件数では拒否しない。
+    #[test]
+    fn task115_3_mac1_share_count_limit_is_checked_before_paths() {
+        let dir = tmp_dir("share-count");
+        let k = kernel(&dir);
+        let missing = dir.join("missing");
+        let missing = missing.to_str().expect("utf8");
+        let request = |n: usize| {
+            let mut body = s(&["create", "c1", &k, "", ""]);
+            for i in 0..n {
+                body.extend(s(&[&format!("t{i}"), missing, "ro"]));
+            }
+            body
+        };
+        let (mut a, _f) = adapter();
+        assert_eq!(MAX_VIRTIOFS_SHARES, 8);
+        assert_eq!(
+            err_of(a.handle(&request(9))),
+            (
+                PluginErrorCode::InvalidArgument,
+                "config.too_many_virtiofs_shares: VM configuration was rejected".to_string()
+            )
+        );
+        assert_eq!(a.workers.live(), 0);
+        assert_eq!(
+            err_of(a.handle(&request(8))),
+            (
+                PluginErrorCode::InvalidArgument,
+                "config.path_not_found: VM configuration was rejected".to_string()
+            )
+        );
+    }
+
+    /// TASK-115.3・REPAIR-5: 起動の取り消しは `TIMEOUT` へ写し、VM が残らない失敗として扱う。
+    #[test]
+    fn task115_3_repair5_cancelled_launch_maps_to_timeout() {
+        for before in ["create", "start"] {
+            let e = PlatformError::Vm(VmError::Cancelled { before });
+            let p = to_plugin_error(&e);
+            assert_eq!(
+                (p.code(), p.message().to_string()),
+                (
+                    PluginErrorCode::Timeout,
+                    format!("vm.cancelled: virtual machine launch was cancelled before {before}")
+                )
+            );
+            assert!(!BackendError::Platform(e).vm_may_exist());
         }
     }
 

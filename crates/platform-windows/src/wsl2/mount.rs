@@ -10,7 +10,7 @@
 //! - 入力の検証済み newtype（[`HostDir`]・[`MountName`]・[`DistroName`]・[`SharedMount`]・[`LaunchRequest`]）。
 //!   生の文字列を `wsl.exe` の引数へ直接連結せず、型で「壊れた値を表現できない」ようにする（REPAIR-2）。
 //! - 純粋関数（事前判定・argv 組み立て・`/proc/self/mountinfo` 解析）。全 OS でユニットテストする。
-//! - 実行部（`run::run_capture` 経由。各呼び出しにタイムアウトを適用する。REPAIR-5）。
+//! - 実行部（`run::run_capture` 経由。各呼び出しには操作ごとの合計期限の残り時間を渡す。REPAIR-5）。
 //!
 //! 後始末の追跡の前提: ゲスト内の root は信頼境界の内側として扱い、root や WSL がゲスト内プロセスを強制終了した
 //! 場合の後始末は対象外とする。`/run/fandhe` の残留物（柵の claim・ロックファイル・未回収の記録）は tmpfs 上にあり
@@ -54,11 +54,11 @@
 //! `wsl.exe` の生出力は載せない。
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{
     DistroState, MAX_OUTPUT_BYTES, Wsl2Error, Wsl2ErrorCode, Wsl2Status, check_timeout,
-    detect_with_program, run, wsl_exe_path,
+    detect_with_program, remaining_until, run, wsl_exe_path,
 };
 use crate::instrument::{
     NoopWinOpRecorder, WinOpKind, WinOpRecorder, WinOpTimer, WinWarning, WinWarningCode,
@@ -864,6 +864,18 @@ fn find_mount<'a>(entries: &'a [MountEntry], guest_path: &str) -> Option<&'a Mou
 /// `wsl.exe` 相当の実行器: 引数列と stdout/stderr の上限バイト数を受け取り、タイムアウト付きで実行する。
 type Exec<'a> = &'a mut dyn FnMut(&[String], usize) -> Result<run::Captured, Wsl2Error>;
 
+/// 回復・後始末用の実行器を選ぶ（専用の実行器があればそれ、なければ通常の実行器）。
+///
+/// 通常の実行器の合計期限が mount の待機で尽きても、所有の確認・取り下げ・ロールバックの `wsl.exe` 呼び出しが
+/// 即 Timeout でスキップされないよう、呼び出し側（`launch_with` 等）は独立した有界期限の実行器を渡す
+/// （REPAIR-5・WIN-2）。専用の実行器を持たない模擬実行器（ユニットテスト）では通常の実行器を共用する。
+fn pick_recovery<'a>(recovery: &'a mut Option<Exec<'_>>, exec: Exec<'a>) -> Exec<'a> {
+    match recovery {
+        Some(r) => &mut **r,
+        None => exec,
+    }
+}
+
 fn step_failed(what: &str, out: &run::Captured) -> Wsl2Error {
     let code = out
         .code
@@ -1282,6 +1294,7 @@ fn mount_one(
     before_ids: &[u32],
     owned: &mut Vec<OwnedMount>,
     exec: Exec<'_>,
+    mut recovery: Option<Exec<'_>>,
 ) -> Result<(), Wsl2Error> {
     let nonce = new_nonce();
     let (failure, evidence) = match exec(&mount_argv(distro, m, &nonce), MAX_OUTPUT_BYTES) {
@@ -1338,12 +1351,15 @@ fn mount_one(
             // 標準出力から読めなければ（想定外の出力が混ざった等）、ゲスト内の記録で確かめる。
             let evidence = match parse_recorded_id(&out.stdout) {
                 Some(id) => Evidence::Mine(id),
-                None => read_record(distro, &nonce, exec),
+                None => read_record(distro, &nonce, pick_recovery(&mut recovery, &mut *exec)),
             };
             (failure, evidence)
         }
         // 標準出力を失ったので、MOUNT_SCRIPT がゲスト内に残した記録を読む。
-        Err(e) => (Some(e), read_record(distro, &nonce, exec)),
+        Err(e) => (
+            Some(e),
+            read_record(distro, &nonce, pick_recovery(&mut recovery, &mut *exec)),
+        ),
     };
     let guest_path = m.guest_path();
     let unconfirmed = |e: Wsl2Error| {
@@ -1388,11 +1404,16 @@ fn mount_one(
             if evidence == Evidence::Missing {
                 // MOUNT_SCRIPT は終了済みで本呼び出しのマウントは無いので、記録と claim を消す
                 // （Fenced の claim は遅れて動き出す処理を止める柵なので残す）。
-                clear_record(distro, &nonce, exec);
+                clear_record(distro, &nonce, pick_recovery(&mut recovery, &mut *exec));
             }
             match failure {
                 None => Err(unconfirmed(not_identified())),
-                Some(e) => match count_fresh_mounts(distro, &guest_path, before_ids, exec) {
+                Some(e) => match count_fresh_mounts(
+                    distro,
+                    &guest_path,
+                    before_ids,
+                    pick_recovery(&mut recovery, &mut *exec),
+                ) {
                     Some(0) => Err(e),
                     _ => Err(unconfirmed(e)),
                 },
@@ -1465,6 +1486,7 @@ fn prepare_with_exec(
     virtiofs: VirtiofsState,
     req: &LaunchRequest,
     exec: Exec<'_>,
+    mut recovery: Option<Exec<'_>>,
 ) -> Result<PreparedLaunch, MountError> {
     preflight(status, virtiofs, req)?;
     let distro = &req.distro;
@@ -1481,7 +1503,7 @@ fn prepare_with_exec(
     // （mount_one / MOUNT_SCRIPT。検証と mount を別呼び出しにすると差し替え競合が起きる）。
     // 自分が作っていないマウントは外さないため、既存のマウントがあれば何もせず拒否する
     // （mountinfo は論理パスで照合する。symlink を含むパスは MOUNT_SCRIPT が mount 前に拒否する）。
-    let before = read_mountinfo(distro, exec)?;
+    let before = read_mountinfo(distro, &mut *exec)?;
     for m in &req.mounts {
         let target = m.guest_path();
         if before.iter().any(|e| e.mount_point == target) {
@@ -1491,15 +1513,22 @@ fn prepare_with_exec(
     let before_ids: Vec<u32> = before.iter().map(|e| e.mount_id).collect();
     let mut owned: Vec<OwnedMount> = Vec::new();
     for m in &req.mounts {
-        if let Err(e) = mount_one(distro, m, &before_ids, &mut owned, exec) {
-            let failed = rollback(distro, &owned, exec);
+        if let Err(e) = mount_one(
+            distro,
+            m,
+            &before_ids,
+            &mut owned,
+            &mut *exec,
+            recovery.as_mut().map(|r| &mut **r as Exec<'_>),
+        ) {
+            let failed = rollback(distro, &owned, pick_recovery(&mut recovery, &mut *exec));
             return Err(MountError::with_unreleased(e, distro, &failed, None));
         }
     }
-    let (transport, warning) = match verify_shared(req, virtiofs, &owned, exec) {
+    let (transport, warning) = match verify_shared(req, virtiofs, &owned, &mut *exec) {
         Ok(decided) => decided,
         Err(e) => {
-            let failed = rollback(distro, &owned, exec);
+            let failed = rollback(distro, &owned, pick_recovery(&mut recovery, &mut *exec));
             return Err(MountError::with_unreleased(e, distro, &failed, None));
         }
     };
@@ -1511,14 +1540,44 @@ fn prepare_with_exec(
     })
 }
 
-/// `wsl.exe` 相当の実行器を `program` から作る（各呼び出しにタイムアウトと出力上限を適用。REPAIR-5）。
+/// `wsl.exe` 相当の実行器を `program` から作る（出力上限と、全呼び出しで共有する合計期限 `timeout` を適用。
+/// 個々の呼び出しには残り時間だけを渡し、複数マウントの処理でも合計が `timeout` を超えない。REPAIR-5）。
 fn program_exec(
     program: &Path,
     timeout: Duration,
 ) -> impl FnMut(&[String], usize) -> Result<run::Captured, Wsl2Error> + '_ {
+    program_exec_from(program, timeout, Some(Instant::now() + timeout))
+}
+
+/// [`program_exec`] と同じだが、合計期限を呼び出し側が決めた時刻 `deadline` にする（検出と準備で 1 つの
+/// 期限を共有するため。REPAIR-5）。
+fn program_exec_until(
+    program: &Path,
+    deadline: Instant,
+) -> impl FnMut(&[String], usize) -> Result<run::Captured, Wsl2Error> + '_ {
+    // 期限が確定しているため `timeout`（遅延起点用）は使われない。
+    program_exec_from(program, Duration::ZERO, Some(deadline))
+}
+
+/// [`program_exec`] と同じだが、合計期限の起点を最初の呼び出し時にする（起動ステップ後のロールバック用。
+/// 起動ステップの所要時間でロールバックの持ち時間を削らない）。
+fn program_exec_lazy(
+    program: &Path,
+    timeout: Duration,
+) -> impl FnMut(&[String], usize) -> Result<run::Captured, Wsl2Error> + '_ {
+    program_exec_from(program, timeout, None)
+}
+
+fn program_exec_from(
+    program: &Path,
+    timeout: Duration,
+    mut deadline: Option<Instant>,
+) -> impl FnMut(&[String], usize) -> Result<run::Captured, Wsl2Error> + '_ {
     move |args: &[String], max: usize| {
+        let deadline = *deadline.get_or_insert_with(|| Instant::now() + timeout);
+        let left = remaining_until(deadline)?;
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        run::run_capture(program, &refs, &[("WSL_UTF8", "1")], timeout, max)
+        run::run_capture(program, &refs, &[("WSL_UTF8", "1")], left, max)
     }
 }
 
@@ -1541,13 +1600,22 @@ pub(super) fn prepare_with_program(
     timeout: Duration,
 ) -> Result<PreparedLaunch, MountError> {
     check_timeout(timeout)?;
-    let status = detect_with_program(program, timeout)?;
-    let mut exec = program_exec(program, timeout);
-    prepare_with_exec(&status, virtiofs, req, &mut exec)
+    // 検出と準備は 1 つの合計期限 `timeout` を共有する（検出が長引けば準備は残り時間だけで行い、
+    // 足りなければマウント前に Timeout で fail-closed。呼び出し全体を要求元の期限に収めるため。REPAIR-5）。
+    // 回復・ロールバックには準備とは別の有界期限を割り当てる（準備で期限を使い切っても解除の機会を失わない）。
+    let deadline = Instant::now() + timeout;
+    let status = detect_with_program(program, remaining_until(deadline)?)?;
+    let mut exec = program_exec_until(program, deadline);
+    let mut recovery = program_exec_lazy(program, timeout);
+    prepare_with_exec(&status, virtiofs, req, &mut exec, Some(&mut recovery))
 }
 
 /// 共有マウントを準備する（関数名は TASK-67.4 からの互換。既定の [`TransportPolicy::PreferVirtiofs`] では
-/// virtiofs が使えない場合に 9P へフォールバックする）。`timeout` は各 `wsl.exe` 呼び出しに適用する（REPAIR-5）。
+/// virtiofs が使えない場合に 9P へフォールバックする）。
+///
+/// `timeout` は WSL2 の検出とマウント準備（全マウント）で共有する合計期限。失敗時の所有確認・取り下げ・
+/// ロールバックには別に同じ長さの期限を割り当てるため、呼び出し全体は `2 * timeout` 以内に収まる
+/// （期限切れの `wsl.exe` を kill して回収する猶予を除く。REPAIR-5・WIN-2）。
 ///
 /// 成功時は全マウントが virtiofs（方針が許せば 9P。[`PreparedLaunch::transport`]・[`PreparedLaunch::warning`]）で
 /// 成立している。失敗時は本呼び出しで作ったマウントを後始末して `Err`。
@@ -1607,6 +1675,8 @@ fn release_with_exec(prepared: &PreparedLaunch, exec: Exec<'_>) -> RollbackOutco
 /// 後始末をやり直せる（件数は [`MAX_UNRELEASED_MOUNTS`] 以下）。未確定の記録（マウント ID が `None`）は
 /// ゲスト内の記録を読み直し、記録の ID で所有を確かめられたものだけを外す。ゲスト内で既に外し終えていれば
 /// 完了として扱い、記録が `none`（自分のマウントを特定できない）なら外さずに件数だけを報告する（fail-closed）。
+///
+/// `timeout` は全マウントの解除で共有する合計期限（REPAIR-5）。
 pub fn release_virtiofs_launch(
     prepared: &PreparedLaunch,
     timeout: Duration,
@@ -1719,7 +1789,7 @@ fn launch_with_exec<T>(
     start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
 ) -> Result<Launched<T>, MountError> {
     let timer = WinOpTimer::start(recorder, WinOpKind::Wsl2MountShared);
-    let prepared = prepare_with_exec(status, virtiofs, req, exec);
+    let prepared = prepare_with_exec(status, virtiofs, req, &mut *exec, None);
     finish_launch(prepared, timer, exec, recorder, start)
 }
 
@@ -1733,6 +1803,11 @@ fn launch_with_exec<T>(
 ///
 /// 記録先を持たないため、9P 降格の警告（WIN-2）は成功時は [`PreparedLaunch::warning`]、
 /// `start` 失敗時は [`MountError::warning`] から確認する。
+///
+/// `timeout` は WSL2 の検出とマウント準備で共有する合計期限。準備失敗時の回復と `start` 失敗時の
+/// ロールバックには別に同じ長さの期限を割り当てるため、`start` の所要時間を除く合計は `2 * timeout` 以内
+/// （期限切れの `wsl.exe` を kill して回収する猶予を除く。REPAIR-5・WIN-2）。`start` 自体の期限は
+/// 呼び出し側が持つ。
 pub fn launch_with<T>(
     req: &LaunchRequest,
     timeout: Duration,
@@ -1780,13 +1855,21 @@ fn launch_with_program_timed<'r, T>(
     timer: WinOpTimer<'r>,
     start: impl FnOnce(&PreparedLaunch) -> Result<T, Wsl2Error>,
 ) -> Result<Launched<T>, MountError> {
-    let mut exec = program_exec(program, timeout);
+    // 検出と準備は 1 つの合計期限 `timeout` を共有する（検出が長引けば準備は残り時間だけで行い、
+    // 足りなければマウント前に Timeout で fail-closed。呼び出し全体を要求元の期限に収めるため）。
+    // 回復・ロールバックには準備とは別に `timeout` を割り当て、起点は最初の回復系呼び出し時にする
+    // （準備で期限を使い切っても所有確認・取り下げ・解除の機会を失わない。解除できなければ
+    // `MountError::unreleased` で呼び出し側へ返る。起動ステップ失敗時のロールバックも同じ実行器を使う。
+    // REPAIR-5・WIN-2）。
+    let deadline = Instant::now() + timeout;
+    let mut exec = program_exec_until(program, deadline);
+    let mut rollback_exec = program_exec_lazy(program, timeout);
     let prepared = (|| -> Result<PreparedLaunch, MountError> {
         check_timeout(timeout)?;
-        let status = detect_with_program(program, timeout)?;
-        prepare_with_exec(&status, virtiofs, req, &mut exec)
+        let status = detect_with_program(program, remaining_until(deadline)?)?;
+        prepare_with_exec(&status, virtiofs, req, &mut exec, Some(&mut rollback_exec))
     })();
-    finish_launch(prepared, timer, &mut exec, recorder, start)
+    finish_launch(prepared, timer, &mut rollback_exec, recorder, start)
 }
 
 #[cfg(test)]
@@ -2634,7 +2717,7 @@ mod tests {
         r: &LaunchRequest,
         v: VirtiofsState,
     ) -> Result<PreparedLaunch, MountError> {
-        prepare_with_exec(&ok_status(), v, r, &mut |a, m| g.run(a, m))
+        prepare_with_exec(&ok_status(), v, r, &mut |a, m| g.run(a, m), None)
     }
 
     /// WIN-2: virtiofs で成立した場合のみ PreparedLaunch が返る。
@@ -2886,10 +2969,16 @@ mod tests {
     fn prepare_with_no_mounts_skips_mountinfo() {
         let r = req(vec![]);
         let mut calls = 0;
-        let p = prepare_with_exec(&ok_status(), VirtiofsState::Enabled, &r, &mut |_, _| {
-            calls += 1;
-            Err(Wsl2Error::new(Wsl2ErrorCode::Internal, "unexpected"))
-        })
+        let p = prepare_with_exec(
+            &ok_status(),
+            VirtiofsState::Enabled,
+            &r,
+            &mut |_, _| {
+                calls += 1;
+                Err(Wsl2Error::new(Wsl2ErrorCode::Internal, "unexpected"))
+            },
+            None,
+        )
         .unwrap();
         assert!(p.mounts().is_empty());
         assert_eq!(calls, 0);
@@ -3065,6 +3154,44 @@ mod tests {
         assert_eq!(e.message(), "wsl.exe did not finish before the deadline");
         assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
         assert_eq!(g.mounts, [("/".to_string(), "ext4".to_string())]);
+    }
+
+    /// SEC・REPAIR-5: 通常の実行器の期限が mount の待機で尽きても、専用の回復実行器があれば所有確認と
+    /// ロールバックの `wsl.exe` 呼び出しがスキップされず、成立したマウントを外す。
+    #[test]
+    fn prepare_recovery_uses_separate_executor_after_deadline_exhausted() {
+        use std::cell::RefCell;
+        let g = RefCell::new(Guest::new("virtiofs"));
+        {
+            let mut gm = g.borrow_mut();
+            gm.timeout_mount_nth = Some(1);
+            gm.timeout_mount_lands = true;
+        }
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let mut calls = 0;
+        // 通常の実行器: mountinfo 読み取りと mount の 2 回まで通し、以降は期限切れとして即 Timeout を返す。
+        let mut exec = |a: &[String], m: usize| {
+            calls += 1;
+            if calls > 2 {
+                return Err(Wsl2Error::new(
+                    Wsl2ErrorCode::Timeout,
+                    "wsl.exe did not finish before the deadline",
+                ));
+            }
+            g.borrow_mut().run(a, m)
+        };
+        let mut recovery = |a: &[String], m: usize| g.borrow_mut().run(a, m);
+        let e = prepare_with_exec(
+            &ok_status(),
+            VirtiofsState::Enabled,
+            &r,
+            &mut exec,
+            Some(&mut recovery),
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::Timeout);
+        assert_eq!(e.message(), "wsl.exe did not finish before the deadline");
+        assert_eq!(g.borrow().umounts, ["/mnt/fandhe/a"]);
     }
 
     /// REPAIR-5: タイムアウトしたがマウントが成立していなければ、何も外さず元のエラーを返す。
@@ -3379,6 +3506,27 @@ mod tests {
         );
         assert!(g.umounts.is_empty());
         assert_eq!(g.ids, [1, 100]);
+    }
+
+    /// REPAIR-5: 実行器の期限は全呼び出しで共有する合計期限で、使い切った後は wsl.exe を起動せず Timeout を返す。
+    #[test]
+    fn program_exec_deadline_is_shared_across_calls() {
+        let mut exec = program_exec(Path::new("unused-wsl.exe"), Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(20));
+        let e = exec(&[], 16).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::Timeout);
+        assert_eq!(e.message(), "wsl.exe did not finish before the deadline");
+    }
+
+    /// REPAIR-5: 呼び出し側が決めた期限（検出と共有する合計期限）を過ぎていれば、wsl.exe を起動せず
+    /// Timeout を返す。
+    #[test]
+    fn program_exec_until_rejects_calls_after_the_shared_deadline() {
+        let mut exec = program_exec_until(Path::new("unused-wsl.exe"), Instant::now());
+        std::thread::sleep(Duration::from_millis(20));
+        let e = exec(&[], 16).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::Timeout);
+        assert_eq!(e.message(), "wsl.exe did not finish before the deadline");
     }
 
     /// REPAIR-5: タイムアウトから回復して外したマウントの記録も消える。

@@ -176,6 +176,7 @@ version = "0.0.0"
 name = "fandhe-container-plugin-windows"
 version = "0.0.0"
 dependencies = [
+ "fandhe-container-platform-windows",
  "fandhe-container-plugin",
 ]
 

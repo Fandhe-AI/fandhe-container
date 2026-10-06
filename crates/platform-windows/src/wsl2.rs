@@ -35,7 +35,7 @@ pub use mount::{
 };
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 外部プロセス待ちの既定タイムアウト。WSL のコールドスタートを見込んで 10 秒とする（REPAIR-5）。
 pub const DEFAULT_WSL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -155,7 +155,8 @@ pub fn list_distros(timeout: Duration) -> Result<Vec<WslDistro>, Wsl2Error> {
 /// WSL2 が使えるかを確認し、バージョンとディストリ一覧を返す。
 ///
 /// WSL が無効、または WSL2 のディストリが 1 件もない場合は有効化手順つきの
-/// `FAILED_PRECONDITION` を返す（WIN-1）。各呼び出しに `timeout` を適用する。
+/// `FAILED_PRECONDITION` を返す（WIN-1）。`timeout` は検出全体（2 回の `wsl.exe` 呼び出し）で共有する
+/// 合計期限（REPAIR-5）。
 pub fn detect(timeout: Duration) -> Result<Wsl2Status, Wsl2Error> {
     check_timeout(timeout)?;
     detect_with_program(&wsl_exe_path()?, timeout)
@@ -167,9 +168,23 @@ pub(crate) fn detect_with_program(
     timeout: Duration,
 ) -> Result<Wsl2Status, Wsl2Error> {
     check_timeout(timeout)?;
+    // `timeout` は検出全体の合計期限（2 回の wsl.exe 呼び出しで共有する。REPAIR-5）。
+    let deadline = Instant::now() + timeout;
     let version = query_version_with_program(program, timeout)?;
-    let distros = list_distros_with_program(program, timeout)?;
+    let distros = list_distros_with_program(program, remaining_until(deadline)?)?;
     evaluate(version, distros)
+}
+
+/// `deadline` までの残り時間を返す。[`MIN_WSL_TIMEOUT`] 未満なら `Timeout`（合計期限の超過。REPAIR-5）。
+pub(crate) fn remaining_until(deadline: Instant) -> Result<Duration, Wsl2Error> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left < MIN_WSL_TIMEOUT {
+        return Err(Wsl2Error::new(
+            Wsl2ErrorCode::Timeout,
+            "wsl.exe did not finish before the deadline",
+        ));
+    }
+    Ok(left)
 }
 
 /// 実行するプログラムを差し替えられる `query_version`（テスト用）。

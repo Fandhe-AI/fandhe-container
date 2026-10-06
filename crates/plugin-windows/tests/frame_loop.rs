@@ -159,7 +159,7 @@ fn expect_disconnected(h: &mut Harness) {
 #[test]
 fn task116_2_plug1_sequential_requests_keep_connection_and_exit_0_on_close() {
     let mut h = Harness::start();
-    expect_unimplemented(h.call(1, &["create", "a"]), 1);
+    expect_unimplemented(h.call(1, &["kill", "a"]), 1);
     expect_unimplemented(h.call(2, &["list"]), 2);
     let (code, err) = h.finish();
     assert_eq!(code, 0, "{err}");
@@ -288,4 +288,42 @@ fn task116_2_plug1_stalled_partial_frame_times_out() {
     let (code, err) = h.finish_with(false);
     assert_eq!(code, 4, "{err}");
     assert!(err.contains("\"code\":\"TIMEOUT\""), "{err}");
+}
+
+/// アダプタ結線（TASK-116.3）: 妥当な create は platform-windows へ委譲され、unix ではその `UNIMPLEMENTED`
+/// が Error フレームで返る。不正な create は `INVALID_ARGUMENT` で、どちらも接続は継続する。
+#[test]
+fn task116_3_plug1_adapter_delegates_and_maps_errors() {
+    let mut h = Harness::start();
+    let create = [
+        "create",
+        "c1",
+        "Ubuntu",
+        "prefer-virtiofs",
+        "d",
+        "C:\\data\\app",
+        "ro",
+    ];
+    match h.call(1, &create) {
+        ControlMessage::Error { id, error } => {
+            assert_eq!(id.get(), 1);
+            assert_eq!(error.code(), PluginErrorCode::Unimplemented);
+            assert_eq!(
+                error.message(),
+                "WSL2 detection is only supported on Windows"
+            );
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    match h.call(2, &["create", "..", "Ubuntu", "prefer-virtiofs"]) {
+        ControlMessage::Error { id, error } => {
+            assert_eq!(id.get(), 2);
+            assert_eq!(error.code(), PluginErrorCode::InvalidArgument);
+            assert_eq!(error.message(), "invalid container id");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    expect_unimplemented(h.call(3, &["list"]), 3);
+    let (code, err) = h.finish();
+    assert_eq!(code, 0, "{err}");
 }

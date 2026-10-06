@@ -7,9 +7,11 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //! 起動設定の解決は TASK-116.1（#392）、UDS 接続後のフレーム送受信ループは TASK-116.2（#393。[`frame_loop`]）で実装済み。
-//! `ContainerRuntime` アダプタ（#394）、
-//! シャットダウン・ヘルスチェック（#396）は未実装。実行時は WSL2 内の Linux で動く前提（WIN-1）で、
-//! 非 unix ネイティブビルドでは既定パス解決が `Unimplemented` となり fail-closed になる。
+//! `ContainerRuntime` アダプタ（#394。[`adapter`]）は create / start / stop を platform-windows へ委譲済みで、
+//! ゲスト内ランタイム起動・kill / delete / state・型つき本体は未実装。
+//! シャットダウン・ヘルスチェック（#396）は未実装。実バックエンドは Windows ホスト上で `wsl.exe` を起動して WSL2 を操作する（WIN-1。[`adapter`] 参照）。
+//! plugin 境界機構の UDS は現状 unix 限定のため、Windows ホスト上の接続経路は TASK-114 で確定する。
+//! 非 unix ビルドでは既定パス解決が `Unimplemented`、非 Windows ビルドでは create が `Unimplemented` となり fail-closed になる。
 //!
 //! # 暫定契約（spec 未規定）
 //! 引数構文 `--socket <path>` / `--socket=<path>` と既定 socket 名 [`DEFAULT_SOCKET_NAME`] は本リポ独自の暫定値。
@@ -22,6 +24,7 @@
 //!
 //! 対応 ID: TASK-116・PLUG-1・PLUG-4・PLUG-11・PLUG-12・WIN-1・REPAIR-3。
 
+pub mod adapter;
 pub mod frame_loop;
 
 use std::ffi::{OsStr, OsString};

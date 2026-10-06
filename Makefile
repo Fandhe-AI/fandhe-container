@@ -785,6 +785,55 @@ idle-memory-supervised: ## 監視プロセス込みのアイドル常駐メモ�
 	esac
 
 # --------------------------------------------------
+# 監視プロセス常駐メモリ（PSS）計測（TASK-158・SUP-2。Linux 限定。bash のみで完結）
+# --------------------------------------------------
+# 実測は製品バイナリ（fandhe-container-supervisor）提供後に人間が #485（TASK-158.h1）で行う。`make ci` には含めない（実機前提）。
+# PID=<pid ...>（空白区切りで複数可）または COUNT=<N> のどちらか必須。起動は操作者が事前に行う（スクリプトは起動しない・sudo を呼ばない）。
+# /proc の読み取りがハングし得るため timeout で包む（REPAIR-5）。秒数は SUPERVISOR_PSS_TIMEOUT（1〜999999・既定 300）。
+# スクリプトの終了コード 0〜3 はそのまま返し、timeout 超過（124・137）と想定外の値は 3、起動不能（125〜127）は 2。
+# SUPERVISOR_PSS_SCRIPT は selftest が配線を stub で照合するための差し替え口。
+SUPERVISOR_PSS_TIMEOUT ?= 300
+SUPERVISOR_PSS_SCRIPT ?= scripts/bench/supervisor_pss.sh
+
+.PHONY: supervisor-pss-selftest
+supervisor-pss-selftest: ## 監視プロセス常駐メモリ計測スクリプトの自己テスト（TASK-158・SUP-2・REPAIR-12）
+	bash scripts/bench/supervisor_pss_selftest.sh
+
+.PHONY: supervisor-pss
+supervisor-pss: ## 監視プロセスの PSS を計測（PID="<pid>..." または COUNT=<N>。[SAMPLES= INTERVAL= EXE_NAME= EXPECTED_DIR= OUTPUT=]。SUP-2・Linux・実機前提）
+	@t=$(call fio_bench_sq,$(SUPERVISOR_PSS_TIMEOUT)); \
+	case "$$t" in ''|*[!0-9]*|???????*) t=invalid ;; esac; \
+	if [ "$$t" = invalid ] || [ "$$t" -eq 0 ]; then \
+		echo "error: invalid-argument: SUPERVISOR_PSS_TIMEOUT must be an integer from 1 to 999999 (seconds)" >&2; \
+		exit 2; \
+	fi; \
+	if [ -z $(call fio_bench_sq,$(PID)) ] && [ -z $(call fio_bench_sq,$(COUNT)) ]; then \
+		echo "error: invalid-argument: PID=\"<pid> ...\" or COUNT=<N> is required (see scripts/bench/supervisor_pss.sh --help)" >&2; \
+		exit 2; \
+	fi; \
+	if ! command -v timeout >/dev/null 2>&1; then \
+		echo "error: unsupported-os: timeout (coreutils) is required" >&2; \
+		exit 2; \
+	fi; \
+	pids=$(call fio_bench_sq,$(PID)); \
+	set --; \
+	for p in $$pids; do set -- "$$@" --pid "$$p"; done; \
+	if [ -n $(call fio_bench_sq,$(COUNT)) ]; then set -- "$$@" --count $(call fio_bench_sq,$(COUNT)); fi; \
+	if [ -n $(call fio_bench_sq,$(SAMPLES)) ]; then set -- "$$@" --samples $(call fio_bench_sq,$(SAMPLES)); fi; \
+	if [ -n $(call fio_bench_sq,$(INTERVAL)) ]; then set -- "$$@" --interval $(call fio_bench_sq,$(INTERVAL)); fi; \
+	if [ -n $(call fio_bench_sq,$(EXE_NAME)) ]; then set -- "$$@" --exe-name $(call fio_bench_sq,$(EXE_NAME)); fi; \
+	if [ -n $(call fio_bench_sq,$(EXPECTED_DIR)) ]; then set -- "$$@" --expected-dir $(call fio_bench_sq,$(EXPECTED_DIR)); fi; \
+	if [ -n $(call fio_bench_sq,$(OUTPUT)) ]; then set -- "$$@" --output $(call fio_bench_sq,$(OUTPUT)); fi; \
+	rc=0; \
+	timeout --kill-after=10 "$$t" bash $(call fio_bench_sq,$(SUPERVISOR_PSS_SCRIPT)) --format json "$$@" || rc=$$?; \
+	case "$$rc" in \
+		0|1|2|3) exit "$$rc" ;; \
+		124|137) echo "error: measurement-failed: timed out after $${t}s reading /proc" >&2; exit 3 ;; \
+		125|126|127) echo "error: invalid-input: cannot run the measurement under timeout (exit $$rc)" >&2; exit 2 ;; \
+		*) echo "error: measurement-failed: unexpected exit status $$rc" >&2; exit 3 ;; \
+	esac
+
+# --------------------------------------------------
 # 50 コンテナ同時起動の集約メモリ計測（TASK-50.1 own 側・TASK-50.2 Docker 側と統合レポート・CORE-9・SUP-1。Linux 限定。bash のみで完結）
 # --------------------------------------------------
 # 実測は own の CLI・本番 launcher 提供後に人間が #219（TASK-50.h1）で行う。`make ci` には含めない（実機前提）。

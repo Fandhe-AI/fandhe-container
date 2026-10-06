@@ -7,7 +7,8 @@
 //! 本モジュールは socket を開かない（bind も connect もしない）。解決したパスは検証済みの絶対パスで、
 //! `main.rs` が `UdsStream::connect`（core が bind 済みの listener へ接続する既存契約）に使う。`sun_path` 長は既定パスを
 //! `RuntimeDir::socket_path`、明示パスを本モジュールの `validate_explicit` が検証する。
-//! 明示パスの配置ディレクトリの検証（所有者・権限・symlink。PLUG-12）も bind 時の既存機構へ委ねる。
+//! 明示パスの配置ディレクトリの検証（所有者・権限・symlink。PLUG-12）は bind 側（core の `UdsListener::bind`）、
+//! 接続時の server peer 検証は `UdsStream::connect` の責務である（TASK-115.4・#388）。
 //!
 //! 引数・環境変数は untrusted な外部入力として扱い、件数・合計バイト数を上限検証する。
 //! エラーメッセージへ入力値は転記しない（固定文言。ログ行の偽装・情報漏えいの防止）。

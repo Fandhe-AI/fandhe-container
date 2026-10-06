@@ -5,7 +5,7 @@
 # /proc から計測して出力する。CORE-7（常駐メモリ目標。PoC-17 supervisor-model の実測で確定済み）
 # の前提データ取得と、SUP-1（コンテナ 0 個なら常駐プロセス 0 個）の機械照合に使う。
 # 呼び出し元は Makefile の `idle-memory` ターゲット。後続の実測レポート（TASK-45.2）・
-# 回帰テスト（TASK-47。`idle_memory_supervised.sh` が `--expect-zero` 付きで呼ぶ）・supervisor の PSS 計測（TASK-158・利用予定）が利用し、
+# 回帰テスト（TASK-47。`idle_memory_supervised.sh` が `--expect-zero` 付きで呼ぶ）・supervisor の PSS 計測（TASK-158。`supervisor_pss.sh` が識別規則を踏襲）が参照し、
 # 出力フィールド名と終了コードはそれらとの契約として固定する。
 #
 # 使い方:

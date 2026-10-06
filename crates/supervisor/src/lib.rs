@@ -13,6 +13,7 @@
 //! | #238 | TASK-157.4 | 監視ループ基本（実装済み） |
 //! | #239 | TASK-157.5 | restart の土台（実装済み。ポリシー本体は SUP-3 で未実装） |
 //! | #240 | TASK-157.6 | healthcheck フックの土台（実装済み。コマンド実行・周期実行は TASK-161） |
+//! | #493 | TASK-161.1 | healthcheck 定義パース（[`healthcheck`]。実装済み。実行・周期は #495、`health` 反映は #496 で未実装） |
 //! | #241 | TASK-157.7 | logs 捕捉の土台（実装済み。永続化・ローテーションは SUP-7・TASK-164 で未実装） |
 //! | #242 | TASK-157.8 | 結合テスト |
 //! | #500 | TASK-163.1 | exec: pid1 特定・setns（`exec`。実装済み。コマンド実行は未実装） |
@@ -28,6 +29,7 @@
 #[cfg(target_os = "linux")]
 pub mod exec;
 pub mod health;
+pub mod healthcheck;
 pub mod logs;
 pub mod restart;
 pub mod run;

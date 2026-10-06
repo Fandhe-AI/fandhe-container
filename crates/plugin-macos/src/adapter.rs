@@ -28,6 +28,7 @@
 //! | `Config`: `PathIo`・`UrlConversion`・`DiskAttachment`・`ConsoleLogOpen`・`ConsoleLogWriter` | `INTERNAL` |
 //! | `Config`: `ConsoleLogNotOwned`・`ConsoleLogInsecureMode`・`ConsoleLogParentWorldWritable` | `PERMISSION_DENIED` |
 //! | `Config`: `ConsoleLogInUse` | `FAILED_PRECONDITION` |
+//! | `Config`: `SharedDirScanTimeout` | `TIMEOUT` |
 //! | `Vm`: `VirtualizationUnsupported`・`InvalidConfiguration`・`InvalidState` | `FAILED_PRECONDITION` |
 //! | `Vm`: `InvalidTimeout` | `INVALID_ARGUMENT` |
 //! | `Vm`: `StartFailed`・`StopFailed` | `INTERNAL` |
@@ -43,6 +44,16 @@
 //!
 //! message は先頭に元の `code()` を付ける（core が元の分類を区別できる）。`Config` 系は `message()` が要求由来の
 //! パスを埋め込むため使わず固定文言にする（入力の反射防止）。`GuestMount` 系も共有タグを含むため固定文言にする。アダプタ自身の検証エラーも固定文言のみ。
+//!
+//! # 共有ディレクトリの検証（MAC-1・SEC-4。分離境界のため fail-closed）
+//!
+//! `host_dir` は要求の値をそのまま `SharedDirectoryPath::try_new` に渡して検証する（相対パス・`.`/`..`・
+//! symlink 経由・非実在を拒否。検証の実装は platform-macos に一本化し、本モジュールで事前に解決しない）。
+//! 例外は macOS の既知の祖先 symlink（[`KNOWN_ROOT_ALIASES`]。`/tmp`・`/var`）だけで、先頭がその別名に
+//! 一致する絶対パスに限り、別名が実際に既知の実体を指すことを確かめてから実体パスへ文字列置換する
+//! （[`rewrite_known_alias`]）。それ以外の symlink は辿らない。置換後のパスも `try_new` が全要素を検証する。
+//! 共有配下の走査（範囲外 symlink・ハードリンク・マウント境界）は create と start（`Vm::launch` 内の再検査）の
+//! どちらも [`SHARE_SCAN_TIMEOUT`] で打ち切り、超過は `TIMEOUT`（`config.shared_dir_scan_timeout`）で返す（REPAIR-5）。
 //!
 //! # 未実装範囲（実装済みを装わない。REPAIR-3）
 //! - 型つき本体と core の `ContainerRuntime` トレイトへの接続・kill / delete / state（TASK-114 待ち）。
@@ -82,8 +93,16 @@ pub const LAUNCH_START_TIMEOUT: Duration = Duration::from_secs(3);
 pub const LAUNCH_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// 同 状態照会の応答待ち。
 pub const LAUNCH_STATE_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
-/// 同 ゲスト内 virtiofs mount 報告の待機。start と合わせて 7 秒で、10 秒の RPC 期限に 3 秒の余裕を残す。
+/// 同 ゲスト内 virtiofs mount 報告の待機。start・共有走査（[`SHARE_SCAN_TIMEOUT`]）と合わせて 9 秒で、
+/// 10 秒の RPC 期限に 1 秒の余裕を残す。
 pub const LAUNCH_GUEST_MOUNT_TIMEOUT: Duration = Duration::from_secs(4);
+/// 共有ディレクトリ配下の走査（`VmConfigSpec::check_share_conflicts_within`）の期限（REPAIR-5・MAC-1）。
+///
+/// create は検証と登録だけなので 10 秒の RPC 期限に 8 秒の余裕を残す。start は `Vm::launch` が構成構築時に
+/// 同じ走査をやり直すため、同じ値を `OpTimeouts::with_share_scan` で渡す。全共有の合計で、超過は
+/// `config.shared_dir_scan_timeout`（`TIMEOUT`）。期限はエントリの合間に確かめるため、応答しないファイル
+/// システム上で 1 回の OS 呼び出しがブロックした場合は打ち切れない（platform-macos 側の残余）。
+pub const SHARE_SCAN_TIMEOUT: Duration = Duration::from_secs(2);
 /// 接続終了後の一括停止に使う総予算。core の `ResidentPlugin` は接続を閉じて 5 秒の猶予後に
 /// 強制終了するため、それより短くして `plugin.cleanup` の報告まで完了させる（REPAIR-5）。
 pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(4);
@@ -95,7 +114,6 @@ const MSG_MALFORMED: &str = "malformed request";
 const MSG_INVALID_ID: &str = "invalid container id";
 const MSG_UNIMPLEMENTED: &str = "operation is not implemented";
 const MSG_UNSUPPORTED_HOST: &str = "Virtualization.framework is only available on macOS";
-const MSG_SHARE_DIR_UNRESOLVED: &str = "shared directory could not be resolved";
 const MSG_CONFIG_REJECTED: &str = "VM configuration was rejected";
 
 /// platform-macos への委譲境界。実機は [`PlatformBackend`]、テストは偽実装。
@@ -180,6 +198,7 @@ impl MacosBackend for PlatformBackend {
             LAUNCH_STATE_QUERY_TIMEOUT,
         )
         .and_then(|t| t.with_guest_mount(LAUNCH_GUEST_MOUNT_TIMEOUT))
+        .and_then(|t| t.with_share_scan(SHARE_SCAN_TIMEOUT))
         .map_err(PlatformError::Vm)?;
         Ok(Vm::launch(spec, timeouts)?)
     }
@@ -280,6 +299,8 @@ pub struct MacosRuntimeAdapter<B: MacosBackend> {
     entries: BTreeMap<String, Entry<B::Handle>>,
     counts: OpCounts,
     sink: Box<dyn FnMut(&OpEvent)>,
+    /// create の共有走査の期限（既定 [`SHARE_SCAN_TIMEOUT`]。テストだけが差し替える）。
+    share_scan_timeout: Duration,
 }
 
 impl<B: MacosBackend> MacosRuntimeAdapter<B> {
@@ -290,6 +311,7 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
             entries: BTreeMap::new(),
             counts: [[0; 2]; 3],
             sink: Box::new(|_| {}),
+            share_scan_timeout: SHARE_SCAN_TIMEOUT,
         }
     }
 
@@ -405,7 +427,8 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
                 };
                 shares.push(VirtiofsShareSpec::new(
                     VirtiofsTag::try_new(tag).map_err(config_to_plugin)?,
-                    SharedDirectoryPath::try_new(&canonical_share_dir(dir)?)
+                    // 要求の値を解決せずに検証する（既知の別名だけ実体へ置換。モジュール doc 参照）。
+                    SharedDirectoryPath::try_new(&rewrite_known_alias(dir, KNOWN_ROOT_ALIASES))
                         .map_err(config_to_plugin)?,
                     access,
                 ));
@@ -416,7 +439,9 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
             .with_shared_directories(
                 VirtiofsSharesSpec::try_new(shares).map_err(config_to_plugin)?,
             );
-        spec.check_share_conflicts().map_err(config_to_plugin)?;
+        // 走査は期限内に打ち切る（巨大な共有元で要求処理を占有しない。REPAIR-5）。
+        spec.check_share_conflicts_within(self.share_scan_timeout)
+            .map_err(config_to_plugin)?;
         self.entries.insert(
             id.clone(),
             Entry {
@@ -562,17 +587,43 @@ fn validate_id(id: &str) -> Result<(), PluginError> {
     }
 }
 
-/// 共有ディレクトリを正規化する。`SharedDirectoryPath::try_new` は symlink の祖先を拒否するため、
-/// macOS で `/tmp`・`/var` が symlink（`/private/...`）である通常のパスを通すには事前の解決が要る。
-/// 解決後のパスを共有元として固定する。失敗時のメッセージには要求由来のパスを含めない。
-fn canonical_share_dir(dir: &str) -> Result<PathBuf, PluginError> {
-    Path::new(dir).canonicalize().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            PluginError::new(PluginErrorCode::InvalidArgument, MSG_SHARE_DIR_UNRESOLVED)
-        } else {
-            PluginError::new(PluginErrorCode::Internal, MSG_SHARE_DIR_UNRESOLVED)
+/// macOS で既定の祖先 symlink（別名, 実体）。`/tmp`・`/var`（一時ディレクトリ `/var/folders/...` を含む）は
+/// `/private/...` への symlink で、通常の共有元がここを通る。他 OS では置換しない（空）。
+///
+/// ここに無い symlink は一切辿らない（`SharedDirectoryPath::try_new` が拒否する）。追加は分離境界の変更に
+/// あたるため、レビューを経て行う（MAC-1・SEC-4）。
+#[cfg(target_os = "macos")]
+const KNOWN_ROOT_ALIASES: &[(&str, &str)] = &[("/tmp", "/private/tmp"), ("/var", "/private/var")];
+#[cfg(not(target_os = "macos"))]
+const KNOWN_ROOT_ALIASES: &[(&str, &str)] = &[];
+
+/// 要求の共有ディレクトリ `dir` の先頭が既知の別名（`aliases` の `(別名, 実体)`）なら実体へ置換する。
+///
+/// 置換は次をすべて満たす場合だけ行い、それ以外は `dir` をそのまま返す（検証は呼び出し側の
+/// `SharedDirectoryPath::try_new` が行う。本関数は検証を緩めない）:
+/// - `dir` が別名そのもの、または別名 + `/` で始まる（要素境界で一致。`/tmpx` は対象外。相対パスは
+///   絶対の別名に一致しないため置換されず、`try_new` が拒否する）。
+/// - 別名が実際に symlink で、解決先が表の実体と一致する（別名が実ディレクトリの環境や、別の場所を指す
+///   環境では置換しない。呼び出し元が指定したのと別のディレクトリを共有しないため）。
+///
+/// 残りの部分は文字列のまま連結する（`..` 等を正規化で消さず、`try_new` の検査に掛ける）。解決するのは
+/// 表の別名 1 段だけで、要求由来の symlink は辿らない。
+fn rewrite_known_alias(dir: &str, aliases: &[(&str, &str)]) -> PathBuf {
+    for (alias, real) in aliases {
+        let Some(rest) = dir.strip_prefix(alias) else {
+            continue;
+        };
+        if !(rest.is_empty() || rest.starts_with('/')) {
+            continue;
         }
-    })
+        let points_to_real = std::fs::symlink_metadata(alias)
+            .is_ok_and(|m| m.file_type().is_symlink())
+            && std::fs::canonicalize(alias).is_ok_and(|p| p == Path::new(real));
+        if points_to_real {
+            return PathBuf::from(format!("{real}{rest}"));
+        }
+    }
+    PathBuf::from(dir)
 }
 
 fn config_to_plugin(e: ConfigError) -> PluginError {
@@ -603,6 +654,7 @@ pub fn to_plugin_error(e: &PlatformError) -> PluginError {
                 | ConfigError::ConsoleLogInsecureMode { .. }
                 | ConfigError::ConsoleLogParentWorldWritable { .. } => C::PermissionDenied,
                 ConfigError::ConsoleLogInUse { .. } => C::FailedPrecondition,
+                ConfigError::SharedDirScanTimeout { .. } => C::Timeout,
                 _ => C::InvalidArgument,
             };
             // message() は要求由来のパスを埋め込むため使わない。
@@ -1111,46 +1163,209 @@ mod tests {
         );
     }
 
-    /// TASK-115.3・MAC-1: 共有パスの祖先が symlink でも正規化して受け付け、存在しないパスは固定文言で拒否する。
+    #[cfg(unix)]
+    fn create_share(
+        a: &mut MacosRuntimeAdapter<Fake>,
+        id: &str,
+        k: &str,
+        host_dir: &str,
+    ) -> Result<Vec<String>, PluginError> {
+        a.handle(&s(&["create", id, k, "", "", "data", host_dir, "ro"]))
+    }
+
+    /// TASK-115.3・MAC-1・SEC-4: 共有元は要求の値のまま検証し、symlink 経由（最終要素・祖先）・相対パス・
+    /// `..`・非実在を解決せずに拒否する（固定文言。パスを反射しない）。
     #[cfg(unix)]
     #[test]
-    fn task115_3_mac1_share_dir_is_canonicalized() {
-        let dir = tmp_dir("canon-share");
+    fn task115_3_mac1_sec4_share_dir_rejects_symlink_and_relative() {
+        let dir = tmp_dir("share-strict");
         let k = kernel(&dir);
         let real = dir.join("real");
-        std::fs::create_dir_all(&real).expect("mkdir");
+        std::fs::create_dir_all(real.join("sub")).expect("mkdir");
         let link = dir.join("link");
         std::os::unix::fs::symlink(&real, &link).expect("symlink");
         let (mut a, f) = adapter();
-        let r = a.handle(&s(&[
-            "create",
-            "c1",
-            &k,
-            "",
-            "",
-            "data",
-            link.to_str().expect("utf8"),
-            "ro",
-        ]));
-        assert_eq!(r.expect("create"), s(&["created"]));
-        a.handle(&s(&["start", "c1"])).expect("start");
-        assert_eq!(f.0.borrow().launched.len(), 1);
-        let missing = dir.join("missing");
-        assert_eq!(
-            err_of(a.handle(&s(&[
-                "create",
-                "c2",
-                &k,
-                "",
-                "",
-                "data",
-                missing.to_str().expect("utf8"),
-                "ro",
-            ]))),
+        let rejected = |code: &str| {
             (
                 PluginErrorCode::InvalidArgument,
-                MSG_SHARE_DIR_UNRESOLVED.to_string()
+                format!("{code}: VM configuration was rejected"),
             )
+        };
+        for via_link in [link.clone(), link.join("sub")] {
+            assert_eq!(
+                err_of(create_share(
+                    &mut a,
+                    "c1",
+                    &k,
+                    via_link.to_str().expect("utf8")
+                )),
+                rejected("config.shared_dir_symlink")
+            );
+        }
+        // 相対パスは plugin の CWD 基準で解決しない（CWD に実在する `.` 始まりでも拒否）。
+        for relative in ["real", "./", "tmp/x"] {
+            assert_eq!(
+                err_of(create_share(&mut a, "c1", &k, relative)),
+                rejected("config.path_not_absolute")
+            );
+        }
+        let dotdot = format!("{}/sub/..", real.to_str().expect("utf8"));
+        assert_eq!(
+            err_of(create_share(&mut a, "c1", &k, &dotdot)),
+            rejected("config.shared_dir_not_normalized")
+        );
+        let missing = dir.join("missing");
+        assert_eq!(
+            err_of(create_share(
+                &mut a,
+                "c1",
+                &k,
+                missing.to_str().expect("utf8")
+            )),
+            rejected("config.path_not_found")
+        );
+        // 拒否された要求は登録されず、実体パスなら受理される。
+        assert_eq!(
+            err_of(a.handle(&s(&["start", "c1"]))).0,
+            PluginErrorCode::NotFound
+        );
+        assert_eq!(
+            create_share(&mut a, "c1", &k, real.to_str().expect("utf8")).expect("create"),
+            s(&["created"])
+        );
+        assert!(f.0.borrow().launched.is_empty());
+    }
+
+    /// TASK-115.3・MAC-1: OS の一時ディレクトリ配下の共有元を、呼び出し側が実体パスへ直さなくても受理する
+    /// （macOS は `/var/folders/...` が既知の別名 `/var` → `/private/var` を通る。Linux は別名なしで通る）。
+    #[cfg(unix)]
+    #[test]
+    fn task115_3_mac1_share_dir_under_os_temp_dir_is_accepted() {
+        let dir = tmp_dir("share-temp");
+        let k = kernel(&dir);
+        // 正規化していない綴り（macOS では祖先に symlink を含む）。
+        let raw = std::env::temp_dir()
+            .join(format!("fc-adapter-{}-share-temp", std::process::id()))
+            .join("share");
+        std::fs::create_dir_all(&raw).expect("mkdir");
+        let (mut a, f) = adapter();
+        assert_eq!(
+            create_share(&mut a, "c1", &k, raw.to_str().expect("utf8")).expect("create"),
+            s(&["created"])
+        );
+        a.handle(&s(&["start", "c1"])).expect("start");
+        assert_eq!(
+            f.0.borrow().launched,
+            vec![(PathBuf::from(&k), vec![("data".to_string(), true)])]
+        );
+    }
+
+    /// TASK-115.3・MAC-1・SEC-4: 既知の別名の置換は、別名が実際に表の実体を指す symlink で、要素境界で
+    /// 一致する絶対パスのときだけ行う。それ以外は入力をそのまま返す（検証は `try_new` に委ねる）。
+    #[cfg(unix)]
+    #[test]
+    fn task115_3_mac1_sec4_known_alias_rewrite_is_exact() {
+        let dir = tmp_dir("alias");
+        let real = dir.join("private-tmp");
+        let other = dir.join("other");
+        std::fs::create_dir_all(real.join("x")).expect("mkdir");
+        std::fs::create_dir_all(&other).expect("mkdir");
+        let alias = dir.join("tmp");
+        std::os::unix::fs::symlink(&real, &alias).expect("symlink");
+        let plain = dir.join("plain");
+        std::fs::create_dir_all(&plain).expect("mkdir");
+        let (alias, real, other, plain) = (
+            alias.to_str().expect("utf8"),
+            real.to_str().expect("utf8"),
+            other.to_str().expect("utf8"),
+            plain.to_str().expect("utf8"),
+        );
+        let table = [(alias, real)];
+        let rw = |d: &str, t: &[(&str, &str)]| rewrite_known_alias(d, t);
+        assert_eq!(rw(alias, &table), PathBuf::from(real));
+        assert_eq!(
+            rw(&format!("{alias}/x"), &table),
+            PathBuf::from(format!("{real}/x"))
+        );
+        // 残りは正規化せずに連結し、`..` を `try_new` の検査へ残す。
+        assert_eq!(
+            rw(&format!("{alias}/x/../y"), &table),
+            PathBuf::from(format!("{real}/x/../y"))
+        );
+        // 要素境界で一致しない・相対・表に無いパスは置換しない。
+        for untouched in [
+            format!("{alias}x/y"),
+            "tmp/x".to_string(),
+            plain.to_string(),
+        ] {
+            assert_eq!(rw(&untouched, &table), PathBuf::from(&untouched));
+        }
+        // 別名が表と違う場所を指す symlink・symlink でない実ディレクトリなら置換しない。
+        for wrong in [[(alias, other)], [(plain, real)]] {
+            let d = format!("{}/x", wrong[0].0);
+            assert_eq!(rw(&d, &wrong), PathBuf::from(&d));
+        }
+        // 既定の表は macOS だけが持ち、/tmp・/var の 2 件に限る。
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            KNOWN_ROOT_ALIASES,
+            &[("/tmp", "/private/tmp"), ("/var", "/private/var")]
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert!(KNOWN_ROOT_ALIASES.is_empty());
+    }
+
+    /// TASK-115.3・REPAIR-5・MAC-1: create の共有走査は期限で打ち切り、`TIMEOUT` の固定文言で返して登録しない。
+    #[cfg(unix)]
+    #[test]
+    fn task115_3_repair5_share_scan_deadline_returns_timeout() {
+        let dir = tmp_dir("scan-deadline");
+        let k = kernel(&dir);
+        let share = dir.join("share");
+        std::fs::create_dir_all(&share).expect("mkdir");
+        std::fs::write(share.join("f"), b"x").expect("write");
+        let (mut a, _f) = adapter();
+        assert_eq!(a.share_scan_timeout, Duration::from_secs(2));
+        a.share_scan_timeout = Duration::ZERO;
+        let share = share.to_str().expect("utf8");
+        assert_eq!(
+            err_of(create_share(&mut a, "c1", &k, share)),
+            (
+                PluginErrorCode::Timeout,
+                "config.shared_dir_scan_timeout: VM configuration was rejected".to_string()
+            )
+        );
+        assert_eq!(
+            err_of(a.handle(&s(&["start", "c1"]))).0,
+            PluginErrorCode::NotFound
+        );
+        // 既定の期限なら同じ要求は通る。
+        a.share_scan_timeout = SHARE_SCAN_TIMEOUT;
+        assert_eq!(
+            create_share(&mut a, "c1", &k, share).expect("create"),
+            s(&["created"])
+        );
+    }
+
+    /// TASK-115.3・REPAIR-5: 走査期限の超過は `TIMEOUT` へ写し、VM を作らない失敗として扱う。
+    #[test]
+    fn task115_3_repair5_scan_timeout_maps_to_timeout() {
+        let e = PlatformError::Config(ConfigError::SharedDirScanTimeout {
+            after: Duration::from_secs(2),
+        });
+        let p = to_plugin_error(&e);
+        assert_eq!(
+            (p.code(), p.message()),
+            (
+                PluginErrorCode::Timeout,
+                "config.shared_dir_scan_timeout: VM configuration was rejected"
+            )
+        );
+        assert!(!BackendError::Platform(e).vm_may_exist());
+        // start の走査（Vm::launch）と合わせても RPC 期限 10 秒に収まる。
+        assert_eq!(
+            LAUNCH_START_TIMEOUT + LAUNCH_GUEST_MOUNT_TIMEOUT + SHARE_SCAN_TIMEOUT,
+            Duration::from_secs(9)
         );
     }
 

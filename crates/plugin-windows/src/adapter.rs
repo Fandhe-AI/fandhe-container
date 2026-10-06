@@ -428,9 +428,11 @@ impl<B: WindowsBackend, G: GuestStart<B::Prepared>> WindowsRuntimeAdapter<B, G> 
                 Ok(()) => Ok(reply("stopped", "", "")),
                 Err(f) => {
                     let e = failure_to_plugin_error(&f);
-                    if let Some(u) = f.unreleased {
-                        self.entries.insert(id.to_string(), Entry::Unreleased(u));
-                    }
+                    // 解除失敗時は所有情報を失わない（特権操作の後始末。WIN-2）。バックエンドが
+                    // 未解除部分を明示したときだけ置き換え、不明なら元の準備済みマウントを保持して
+                    // 次の stop で解除を再試行できるようにする。
+                    let keep = f.unreleased.unwrap_or(p);
+                    self.entries.insert(id.to_string(), Entry::Unreleased(keep));
                     Err(e)
                 }
             },
@@ -661,6 +663,34 @@ mod tests {
             .filter(|c| c.starts_with("release"))
             .count();
         assert_eq!(releases, 2);
+    }
+
+    #[test]
+    fn task116_3_win2_release_failure_without_unreleased_keeps_original_for_retry() {
+        let fake = Fake::default();
+        *fake.release_err.borrow_mut() = Some(BackendFailure {
+            error: WinError::new(WinErrorCode::Timeout, "timed out"),
+            unreleased: None,
+            warning: None,
+        });
+        let (mut a, calls) = adapter(fake);
+        a.handle(&s(CREATE)).unwrap();
+        a.handle(&s(&["start", "c1"])).unwrap();
+        let e = a.handle(&s(&["stop", "c1"])).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Timeout);
+        assert_eq!(
+            a.handle(&s(&["stop", "c1"])).unwrap(),
+            s(&["stopped", "", ""])
+        );
+        let releases: Vec<String> = calls
+            .borrow()
+            .iter()
+            .filter(|c| c.starts_with("release"))
+            .cloned()
+            .collect();
+        assert_eq!(releases, vec!["release:Ubuntu", "release:Ubuntu"]);
+        let e = a.handle(&s(&["stop", "c1"])).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::NotFound);
     }
 
     #[test]

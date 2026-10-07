@@ -21,7 +21,7 @@
 //! - `--shm-size` 未指定時に `/dev/shm` を既定 [`DEFAULT_SHM_SIZE_BYTES`] で常時マウントする挙動
 //!   （launcher 配線と同時に決める）。サイズ未指定の `--tmpfs` はカーネル既定（Docker と同じ）
 //! - `uid=`・`gid=`・`%` 指定・小数サイズ・`suid` / `dev` の許可
-//! - `--ipc=host` / `shareable` と shm の関係（TASK-169.3）
+//! - `--ipc=host` と `--shm-size` の併用は `ContainerOptions::tmpfs_set` が拒否する（TASK-169.5.2）。`shareable` との関係は変えない
 
 use fandhe_container_core::tmpfs::{
     DEV_SHM_PATH, TMPFS_MAX_MOUNTS, TmpfsMode, TmpfsMountSet, TmpfsMountSpec, TmpfsSize,

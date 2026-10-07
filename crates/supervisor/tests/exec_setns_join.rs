@@ -4,7 +4,8 @@
 //! 検証する。`unshare` で新しい user / pid / mnt / uts / ipc / net namespace に pid1（`sleep`）を作り、
 //! その user namespace に `nsenter` で入った単一スレッドの joiner（本バイナリの `--joiner` 再入）が
 //! pid1 を特定して参加し、参加後の namespace 識別子（`/proc/thread-self/ns/*` のリンク先）が対象の
-//! 値と具体値で一致することを照合する。参加前は対象と異なることも確認する。
+//! 値と具体値で一致することを照合する。参加前は対象と異なることも確認する。続けて、mount namespace を
+//! 分離していない pid1（呼び出し側と同じ mnt namespace）が違反として拒否されることも照合する。
 //!
 //! # 試験専用の入口（`exec-test-support` feature）
 //! 試験環境ではコンテナ用 cgroup（`<scope>/fc-<id>@<instance>`）を作れないため、期待 cgroup パスを
@@ -32,7 +33,7 @@ fn main() {
 
 #[cfg(all(target_os = "linux", not(feature = "exec-test-support")))]
 fn main() {
-    if std::env::args().any(|a| a == "--ignored" || a == "--joiner") {
+    if std::env::args().any(|a| a == "--ignored" || a.starts_with("--joiner")) {
         eprintln!(
             "exec_setns_join: not verified; rebuild with `--features exec-test-support` (see AGENTS.md)"
         );
@@ -46,12 +47,18 @@ fn main() {
 #[cfg(all(target_os = "linux", feature = "exec-test-support"))]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if let Some(i) = args.iter().position(|a| a == "--joiner") {
-        let pid: u32 = args
-            .get(i + 1)
-            .and_then(|v| v.parse().ok())
-            .expect("joiner requires a pid");
+    let pid_after = |flag: &str| -> Option<u32> {
+        let i = args.iter().position(|a| a == flag)?;
+        Some(
+            args.get(i + 1)
+                .and_then(|v| v.parse().ok())
+                .expect("joiner requires a pid"),
+        )
+    };
+    if let Some(pid) = pid_after(linux::JOINER) {
         linux::joiner(pid);
+    } else if let Some(pid) = pid_after(linux::JOINER_SHARED_MNT) {
+        linux::joiner_shared_mnt(pid);
     } else if args.iter().any(|a| a == "--ignored") {
         linux::orchestrate();
     } else {
@@ -69,7 +76,9 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::exec::JoinNamespace;
-    use fandhe_container_core::traits::{ContainerId, ContainerStatus, StateRecord, StateRevision};
+    use fandhe_container_core::traits::{
+        ContainerId, ContainerStatus, ErrorCode, StateRecord, StateRevision,
+    };
     use fandhe_container_supervisor::exec::{enter_namespaces, identify_pid1_in};
 
     /// 参加で切り替わる namespace の `/proc/<..>/ns/` エントリ名（pid は参加後 `pid_for_children` に現れる）。
@@ -107,7 +116,23 @@ mod linux {
         }
     }
 
+    /// 成功経路の joiner の再入フラグ。
+    pub const JOINER: &str = "--joiner";
+    /// 「呼び出し側と同じ mount namespace」の拒否経路の joiner の再入フラグ。
+    pub const JOINER_SHARED_MNT: &str = "--joiner-shared-mnt";
+
     pub fn orchestrate() {
+        // 成功経路: 5 種すべてを分離した pid1 へ参加する。
+        run_scenario(&["--mount", "--uts", "--ipc", "--net"], JOINER);
+        // 拒否経路: mount namespace を分離していない pid1（呼び出し側と同じ mnt namespace）は、
+        // 入れ子の PID 1 で cgroup が一致していても対象にしない（SUP-6・SEC-4）。
+        run_scenario(&["--uts", "--ipc", "--net"], JOINER_SHARED_MNT);
+        println!("exec_setns_join: namespace join verified");
+    }
+
+    /// `unshare` で user / pid（と `extra_ns`）を分離した pid1（`sleep`）を作り、その user namespace に
+    /// `nsenter` で入った joiner（本バイナリの `joiner_flag` 再入）が 0 で終わることを確かめる。
+    fn run_scenario(extra_ns: &[&str], joiner_flag: &str) {
         let unshare = Command::new("unshare")
             .args([
                 "--user",
@@ -117,13 +142,9 @@ mod linux {
                 // fork した子であることを引数の上でも明示する。
                 "--fork",
                 "--kill-child",
-                "--mount",
-                "--uts",
-                "--ipc",
-                "--net",
-                "sleep",
-                "60",
             ])
+            .args(extra_ns)
+            .args(["sleep", "60"])
             .stdin(Stdio::null())
             .spawn()
             .expect("spawn unshare");
@@ -147,7 +168,7 @@ mod linux {
             .arg("--preserve-credentials")
             .arg(format!("--user=/proc/{pid1}/ns/user"))
             .arg(exe)
-            .arg("--joiner")
+            .arg(joiner_flag)
             .arg(pid1.to_string())
             .stdin(Stdio::null())
             .spawn()
@@ -160,12 +181,61 @@ mod linux {
             if Instant::now() >= deadline {
                 let _ = joiner.kill();
                 let _ = joiner.wait();
-                panic!("joiner did not exit within {:?}", timeout());
+                panic!("joiner {joiner_flag} did not exit within {:?}", timeout());
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        assert_eq!(status.code(), Some(0), "joiner must exit with 0");
-        println!("exec_setns_join: namespace join verified");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "joiner {joiner_flag} must exit with 0"
+        );
+    }
+
+    /// 試験用のレコード（Running・記録 pid あり）と、pid1 が実際に属する cgroup の絶対パス。
+    fn record_and_cgroup_path(pid: u32) -> (StateRecord, String) {
+        let status =
+            ContainerStatus::running(ContainerId::new("c1").expect("id"), NonZeroU32::new(pid));
+        let rec = StateRecord::new(
+            status,
+            std::env::temp_dir().join("b"),
+            StateRevision::from_raw(1),
+        )
+        .expect("record");
+        let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("read cgroup");
+        let path = cgroup
+            .lines()
+            .find_map(|l| l.strip_prefix("0::"))
+            .expect("cgroup v2 path")
+            .to_owned();
+        assert!(
+            path.starts_with('/') && path.len() > 1,
+            "pid1 must be in a non-root cgroup: {path}"
+        );
+        (rec, path)
+    }
+
+    /// 対象の user namespace に入った単一スレッドで、mount namespace を共有する pid1 が拒否されることを
+    /// 照合する（入れ子の PID 1・cgroup 一致・pid namespace は別、の条件で mnt の検査に届く）。
+    pub fn joiner_shared_mnt(pid: u32) {
+        assert_eq!(
+            link("/proc/thread-self/ns/mnt"),
+            link(&format!("/proc/{pid}/ns/mnt")),
+            "the target must share the mount namespace with the joiner"
+        );
+        assert_ne!(
+            link("/proc/thread-self/ns/pid"),
+            link(&format!("/proc/{pid}/ns/pid")),
+            "the target must be in another PID namespace"
+        );
+        let (rec, path) = record_and_cgroup_path(pid);
+        let err = identify_pid1_in(&rec, &path).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "exec stage SetNs: the exec target shares the mount namespace with the caller; \
+             refusing to join (violation: exec_target/exec_target_shares_mount_namespace, SUP-6)"
+        );
     }
 
     /// `unshare_pid` の子のうち、入れ子の PID namespace の PID 1（`NSpid` が 2 要素以上で末尾 1）のものを返す。
@@ -201,29 +271,11 @@ mod linux {
         let want_pid = target_ns("pid");
         assert_ne!(link("/proc/thread-self/ns/pid_for_children"), want_pid);
 
-        let status =
-            ContainerStatus::running(ContainerId::new("c1").expect("id"), NonZeroU32::new(pid));
-        let rec = StateRecord::new(
-            status,
-            std::env::temp_dir().join("b"),
-            StateRevision::from_raw(1),
-        )
-        .expect("record");
         // コンテナ用 cgroup は作れないため、pid1 が実際に属する cgroup の絶対パスを期待値にする
         // （本番は記録の配置から導く。`identify_pid1`）。別コンテナの cgroup・配下の子 cgroup・親 cgroup・
         // リーフ名だけの指定では、pid 再利用対策として拒否されることも確認する（SEC-1）。
-        let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("read cgroup");
-        let path = cgroup
-            .lines()
-            .find_map(|l| l.strip_prefix("0::"))
-            .expect("cgroup v2 path")
-            .to_owned();
-        assert!(
-            path.starts_with('/') && path.len() > 1,
-            "pid1 must be in a non-root cgroup: {path}"
-        );
+        let (rec, path) = record_and_cgroup_path(pid);
         let (parent, leaf) = path.rsplit_once('/').expect("cgroup leaf");
-        use fandhe_container_core::traits::ErrorCode;
         let mut rejected = vec![
             (
                 format!("{parent}/fc-c1@999999"),
@@ -238,6 +290,14 @@ mod linux {
         for (bad, code) in rejected {
             let err = identify_pid1_in(&rec, &bad).unwrap_err();
             assert_eq!(err.code(), code, "{bad}");
+            if code == ErrorCode::FailedPrecondition {
+                assert_eq!(
+                    err.message(),
+                    "exec stage SetNs: the exec target does not belong to the recorded container \
+                     cgroup (violation: exec_target/exec_target_cgroup_mismatch, SEC-1)",
+                    "{bad}"
+                );
+            }
         }
         let target = identify_pid1_in(&rec, &path).expect("identify pid1");
         assert_eq!(target.pid1().pid().get(), pid);

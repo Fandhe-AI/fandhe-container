@@ -372,8 +372,8 @@ fn run_in_worker_with(
     };
     let exit = wait_or_stop(
         &wait_deadline,
-        |left| child.wait_timeout(left),
-        |reap| child.kill_and_reap(reap),
+        |left| child.wait_timeout(left).map_err(from_exec_error),
+        |reap| child.kill_and_reap(reap).map_err(from_exec_error),
     )
     .map_err(|e| {
         if e.code() == ErrorCode::Timeout {
@@ -531,8 +531,8 @@ fn run_with_target(
     let child = spawn_exec_command(ready, entry).map_err(from_exec_error)?;
     let exit = wait_or_stop(
         &deadline,
-        |left| child.wait_timeout(left),
-        |reap| child.kill_and_reap(reap),
+        |left| child.wait_timeout(left).map_err(from_exec_error),
+        |reap| child.kill_and_reap(reap).map_err(from_exec_error),
     )?;
     Ok(ExecOutcome {
         exit,
@@ -548,15 +548,31 @@ fn run_with_target(
 /// `kill` は回収待ちの上限を受けて SIGKILL と回収を行う。
 fn wait_or_stop(
     deadline: &Deadline,
-    wait: impl FnOnce(Duration) -> Result<ChildExit, ExecError>,
-    stop: impl FnOnce(Duration) -> Result<ChildExit, ExecError>,
+    wait: impl FnOnce(Duration) -> Result<ChildExit, TraitError>,
+    stop: impl FnOnce(Duration) -> Result<ChildExit, TraitError>,
 ) -> Result<ChildExit, TraitError> {
     /// 期限切れ後の SIGKILL 回収待ちの上限。
     const REAP_TIMEOUT: Duration = Duration::from_secs(5);
     match deadline.remaining("waiting for the command") {
-        Ok(left) => wait(left).map_err(from_exec_error),
+        Ok(left) => match wait(left) {
+            Ok(exit) => Ok(exit),
+            // 待機エラー後も子が未回収の可能性がある（`ContainerChild::wait_timeout` の契約）。ハンドルを
+            // 失って worker・コンテナ内コマンドを残さないよう、回収を試みてから元のエラーを返す。
+            // `stop` は回収済みなら kill せず Ok を返すため、`Timeout`（既に kill・回収済み）でも安全。
+            Err(wait_err) => match stop(REAP_TIMEOUT) {
+                Ok(_) => Err(wait_err),
+                Err(stop_err) => Err(TraitError::new(
+                    wait_err.code(),
+                    format!(
+                        "{}; cleanup also failed: {}",
+                        wait_err.message(),
+                        stop_err.message()
+                    ),
+                )),
+            },
+        },
         Err(expired) => {
-            stop(REAP_TIMEOUT).map_err(from_exec_error)?;
+            stop(REAP_TIMEOUT)?;
             Err(expired)
         }
     }
@@ -778,6 +794,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(exit, ChildExit::Exited(0));
+    }
+
+    /// SUP-6・REPAIR-5・TASK-163.4: 待機が `Timeout` 以外のエラーで失敗しても、子を停止・回収してから
+    /// 元のエラーを返す。回収にも失敗したら両方のメッセージを含めて返す。
+    #[test]
+    fn sup6_task163_4_wait_error_still_kills_and_reaps_child() {
+        use std::cell::Cell;
+        let killed = Cell::new(false);
+        let err = wait_or_stop(
+            &Deadline::after(Duration::from_secs(60)),
+            |_| Err(TraitError::new(ErrorCode::Internal, "waitpid failed")),
+            |_| {
+                killed.set(true);
+                Ok(ChildExit::Signaled(9))
+            },
+        )
+        .unwrap_err();
+        assert!(killed.get());
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert_eq!(err.message(), "waitpid failed");
+
+        let err = wait_or_stop(
+            &Deadline::after(Duration::from_secs(60)),
+            |_| Err(TraitError::new(ErrorCode::Internal, "waitpid failed")),
+            |_| Err(TraitError::new(ErrorCode::Timeout, "not reaped")),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert_eq!(
+            err.message(),
+            "waitpid failed; cleanup also failed: not reaped"
+        );
     }
 
     /// SUP-6・REPAIR-5・TASK-163.4: worker の結果は pipe の 1 行で往復でき、壊れた行は `Internal` で拒否する。

@@ -715,8 +715,13 @@ fn collect_log_names(
             NameClass::Generation(n) => n,
             NameClass::Lock | NameClass::Other => return Ok(()),
         };
-        let meta = fs::symlink_metadata(dir.join(name))
-            .map_err(|_| internal("log file inspection failed"))?;
+        // 列挙後に並行ローテーションの rename で消えたエントリは、正常動作なので除外する（SUP-7）。
+        // それ以外の検査エラーは維持する。
+        let meta = match fs::symlink_metadata(dir.join(name)) {
+            Ok(m) => m,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(internal("log file inspection failed")),
+        };
         let ft = meta.file_type();
         if ft.is_dir() || (require_regular && !ft.is_file()) {
             return Err(invalid("existing log path is not a regular file"));

@@ -306,6 +306,13 @@ fn sup7_task164_1469_remove_all_cleans_logs_and_lock_file() {
         ["cl1.log.2", "cl1.log.1", "cl1.log"]
     );
 
+    // drain 完了後も、リーダースレッドが sink の Arc を手放すのはスレッド終了時で、drain の戻りより遅れ得る。
+    // 強参照が自分の 1 本になるまで待ってから落とし、ロック解放前の remove_all による不安定さを避ける。
+    let wait_until = std::time::Instant::now() + Duration::from_secs(10);
+    while Arc::strong_count(&sink) > 1 && std::time::Instant::now() < wait_until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(Arc::strong_count(&sink), 1);
     drop(sink);
     let removed = RotatingFileSink::remove_all(&dir, &id).unwrap();
     assert_eq!(removed.log_files(), 3);

@@ -108,7 +108,7 @@ pub use client::{
     LATENCY_HISTOGRAM_BUCKETS, LatencyStats, MAX_IN_FLIGHT_LIMIT, PipelineClient, RequestId,
     SendMetrics, SendOutcome, SendQueue,
 };
-pub use error::{IoError, IoErrorCode};
+pub use error::{IoError, IoErrorCode, MAX_IO_ERROR_MESSAGE_BYTES};
 pub use fs_normalize::{
     CaseCollisionSet, HostPathLength, MAX_COLLISION_MESSAGE_PATH_CHARS, MAX_HOST_PATH_CHARS,
     check_case_collisions, check_host_path_length, measure_host_path_length,

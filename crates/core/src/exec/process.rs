@@ -316,7 +316,15 @@ fn exec_entrypoint_verified(
         ));
     }
     drop::<OwnedFd>(root);
+    exec_checked_entrypoint(entry)
+}
 
+/// `exec_entrypoint_verified` の手順 2 以降（fd 3 以上の close → エントリポイントの検査 → 標準入出力の置換 →
+/// `execveat`）。launch 経路（pivot 直後の mount ID 照合の後）と、稼働中コンテナへの exec
+/// （`exec_command::spawn_exec_command` の子。参加後の `/` の照合は `reapply_restrictions` が済ませている。
+/// SUP-6・TASK-163.4）が共有する。呼び出し元は「`/` が正しい root であること」を事前に保証すること。
+pub(super) fn exec_checked_entrypoint(entry: &Entrypoint) -> Result<Infallible, ExecError> {
+    const STAGE: IsolationStage = IsolationStage::Exec;
     // 継承したホスト側の fd 3 以上を開く前に閉じる（rootfs 内の /proc/self/fd/N 経由で実体を開かれない）。
     close_inherited_fds()?;
     // 検査と実行を同じ fd に固定する（パスを再解決する execve では、検査後に差し替えられうる）。
@@ -603,6 +611,18 @@ fn do_execve(entry: &Entrypoint, _file: &std::fs::File) -> SysError {
     tests::record(format!("argv={}", show(&entry.argv)));
     tests::record(format!("env={}", show(&entry.env)));
     SysError::Os(sys::EINTR)
+}
+
+/// 稼働中コンテナへの exec の子のメイン（SUP-6・TASK-163.4）。`exec_checked_entrypoint` を通し、失敗したら
+/// stderr に英語 1 行を出して終了コードを返す（`child_main` と同じ規約。戻り値は `_exit` に渡される）。
+pub(super) fn exec_child_main(entry: &Entrypoint) -> i32 {
+    match exec_checked_entrypoint(entry) {
+        Ok(never) => match never {},
+        Err(err) => {
+            let _ = writeln!(std::io::stderr(), "fandhe-container: {err}");
+            exit_code_for(&err)
+        }
+    }
 }
 
 /// 子のメイン。`establish` → `prepare_rootfs` → `pivot_root` → `exec_entrypoint` を通し、失敗したら

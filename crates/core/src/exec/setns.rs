@@ -47,6 +47,20 @@
 //!   ため、記録 pid が再利用される時点でコンテナ内のプロセスは残っていない）で防いでいる。`NSpid` は
 //!   読み取りに使う procfs が属する PID namespace を起点に並ぶので、supervisor 自身が入れ子の PID namespace
 //!   で動く構成（自分の `/proc` をマウントしている場合）でも、コンテナの pid1 はちょうど 2 要素になる
+//! - **user namespace は呼び出し側と同じであること（SEC-5・SEC-1・TASK-163.4）**: user namespace への参加は
+//!   未実装のため、対象が呼び出し側と別の user namespace にいる場合は、`setns` が成功するかどうかによらず
+//!   違反記録 `exec_target_in_other_user_namespace` つきで拒否する（[`Pid1Target::open`] と、[`join_namespaces`] の
+//!   `setns` の直前の 2 回）。カーネルの `mntns_install` / `pidns_install` は「参加先 namespace を所有する user
+//!   namespace での `CAP_SYS_ADMIN`」を要求するだけで、初期 user namespace の root はすべての子孫 user namespace で
+//!   その権限を持つ。したがって照合が無ければ、rootful の exec 専用プロセスは user namespace を持つコンテナ
+//!   （rootless 起動）の mount / PID namespace へ **user namespace には入らずに** 参加でき、exec したコマンドは
+//!   初期 user namespace の uid 0 と（削減後も初期 user namespace に対して有効な）capability を持ったまま
+//!   コンテナの中で動く。コンテナ内プロセスの capability は自分の user namespace に閉じているため、これは
+//!   launch より強い権限になる。launch がコンテナへ与えた user namespace と exec プロセスの user namespace が
+//!   同じであることを、対象の `ns/user` と自分の `ns/user` の一致で確かめる。権威ある基準は mount namespace を
+//!   所有する user namespace（`ioctl(NS_GET_USERNS)`）だが、ioctl の追加を避けて pid1 の資格情報の user
+//!   namespace で代用している。pid1 が起動後にさらに入れ子の user namespace へ移った対象は、launch 時の user
+//!   namespace が呼び出し側と同じでも拒否される（拒否側に倒れる。user namespace は外側へは戻れない）
 //! - **参加の性質**: 参加は **不可逆** で、呼び出しスレッドに作用する。単一スレッドのプロセスからのみ呼べる
 //!   （`CLONE_NEWNS` はスレッドが複数あると拒否され、他 namespace もスレッドごとに食い違うため fail-closed で
 //!   拒否する）。呼び出すのは exec 専用の単一スレッドプロセスで、logs 捕捉スレッドを持つ supervisor 本体から
@@ -63,25 +77,30 @@
 //!   `/proc` の読み取り失敗・syscall 失敗・呼び出し側がマルチスレッドであることはシステムエラー / 呼び出し
 //!   文脈の誤りで、違反記録を付けない
 //!
-//! # 後続（#502〜#503）への必須前提
+//! # 参加の前後で必要な処理（#501〜#503 で実装済み）
 //!
-//! - 順序: ホスト側 fd の確保（cgroup.procs。#501・実装済みの `exec::cgroup_join`）は [`join_namespaces`] の **前**、seccomp / Landlock の
-//!   再適用（#502）は **後**（`setns` は seccomp の禁止 syscall に含まれ、適用後は参加できない）
+//! - 順序: ホスト側 fd の確保（cgroup.procs。#501 の `exec::cgroup_join`）は [`join_namespaces`] の **前**、制限の
+//!   再適用（#502・#503 の `exec/reapply.rs`）は **後**（`setns` は seccomp の禁止 syscall に含まれ、適用後は
+//!   参加できない）
 //! - `setns` は uid / gid・capability・補助グループ・`no_new_privs` を **変えない**。rootful では参加後も
-//!   全 capability を持つホスト root のままである。`execve` の前に capability 削減と `no_new_privs` の設定が
-//!   必要（#502・SEC-1）
+//!   全 capability を持つホスト root のままである。`execve` の前に、再適用が rlimit・capability 削減・
+//!   `no_new_privs`・Landlock・seccomp を載せる（SEC-1）
 //! - 継承した fd は参加後も開いたままである。ホスト側の fd（cgroup.procs・state・ログ等）をコンテナ内の
-//!   プロセスへ渡さないよう、`execve` の前に閉じる必要がある（#503。`close_range`）
+//!   プロセスへ渡さないよう、子が `execve` の前に `close_range` で閉じる。fork から `close_range` までの間に
+//!   子がコンテナ側から見える窓は、exec 専用 worker を non-dumpable にして閉じる（`exec/exec_command.rs`。#503）
 //!
 //! # 未実装（REPAIR-3）
 //!
 //! - user namespace への参加。本実装は `User` を型に持たず拒否する（SUP-6 の列挙は pid / mnt / uts / ipc /
-//!   net）。このため **既定の rootless（コンテナが user namespace を持つ）では、exec 専用プロセスが対象の
-//!   user namespace 内の `CAP_SYS_ADMIN` を持たず、`setns` が `EPERM` で失敗する**（fail-closed）。rootless で
-//!   exec を成立させるには user namespace への参加が必須で、未実装。実機結合試験（`exec_setns_join`）の
-//!   成功は、`nsenter --user` で先に対象の user namespace へ入れた構成でのものである
+//!   net）。このため **既定の rootless（コンテナが user namespace を持つ）への exec は、対象が呼び出し側と別の
+//!   user namespace にいることを理由に明示的に拒否する**（上記「user namespace は呼び出し側と同じであること」。
+//!   非特権の呼び出し側ならカーネルも `setns` を `EPERM` で拒否するが、rootful の呼び出し側では `setns` が
+//!   成功してしまうため、カーネルの拒否には依存しない。fail-closed）。rootless で exec を成立させるには user
+//!   namespace への参加が必須で、未実装。実機結合試験（`exec_setns_join`）の成功は、`nsenter --user` で先に
+//!   対象の user namespace へ入れた構成でのものである
 //! - 違反記録の監査ログ（SEC-4）への保存。`ExecError::violation` に載せて返すところまでで、sink への記録の
-//!   配線は TASK-41.5 系（#839）と呼び出し側（#503）で扱う
+//!   配線は未実装（#503 でも配線していない。書き込み経路 `audit_log::AuditFileWriter`〔TASK-41.5.1〕は実装済み
+//!   だが、`AuditLayer` に exec の対象を表す層が無く、exec 専用プロセスへ `AuditSink` を渡す経路も無い）
 //! - supervisor が起動時から保持する pidfd による同一性の保証（上記「同一性照合の前提」の恒久策）
 //! - 記録 pid が入れ子の PID 1 でない起動経路（rootless の代役 init 等の中間プロセス）の pid1 特定
 
@@ -173,6 +192,36 @@ impl Pid1Target {
         &self.expected_cgroup_path
     }
 
+    /// 対象の mount namespace の識別子（nsfs の `st_dev`・`st_ino`）。制限を exec の対象へ束縛するために
+    /// `exec::reapply` が参加の前に記録し、参加後の自プロセスの識別子と照合する（SUP-6・SEC-1・TASK-163.4）。
+    ///
+    /// 読み取りの後に pidfd の未終了を確認し、読んだ識別子が pidfd の指すプロセスのものであることを保証する。
+    pub(super) fn mnt_ns_identity(&self) -> Result<NsIdentity, ExecError> {
+        let id = ns_identity(&format!("/proc/{}/ns/mnt", self.pid))
+            .map_err(|e| target_proc_error(&e, "read target mount namespace"))?;
+        ensure_not_exited(self, "refusing to bind restrictions to it")?;
+        Ok(id)
+    }
+
+    /// 対象の PID namespace の識別子（nsfs の `st_dev`・`st_ino`）。参加後に子が入る PID namespace
+    /// （`ns/pid_for_children`）との照合に使う（SUP-6・SEC-1・TASK-163.4）。読み取りの後に pidfd の未終了を確認する。
+    pub(super) fn pid_ns_identity(&self) -> Result<NsIdentity, ExecError> {
+        let id = ns_identity(&format!("/proc/{}/ns/pid", self.pid))
+            .map_err(|e| target_proc_error(&e, "read target PID namespace"))?;
+        ensure_not_exited(self, "refusing to bind restrictions to it")?;
+        Ok(id)
+    }
+
+    /// 対象の `/proc/<pid>/limits` の内容（上限つきで読む）。コンテナの rlimit の記録上の出所が無いため、
+    /// exec プロセスへ同じ値を適用する材料にする（SUP-6・SUP-12・TASK-163.4）。読み取りの後に pidfd の
+    /// 未終了を確認する。
+    pub(super) fn read_limits(&self) -> Result<String, ExecError> {
+        let text = read_bounded(&format!("/proc/{}/limits", self.pid))
+            .map_err(|e| target_proc_error(&e, "read target limits"))?;
+        ensure_not_exited(self, "refusing to copy its limits")?;
+        Ok(text)
+    }
+
     /// `pid` を候補として pid1 を特定し、検証を通ったものだけを対象にする。
     ///
     /// 期待 cgroup パスは、記録のコンテナ ID と cgroup 配置から `<scope>/fc-<id>@<instance>` として
@@ -180,7 +229,7 @@ impl Pid1Target {
     /// しなければ、pid が別コンテナに再利用されたものとして拒否する（SEC-1）。
     ///
     /// 手順は順序固定: pidfd で固定 → `NSpid` が直接入れ子の PID 1 → 期待 cgroup に属する →
-    /// 自分と同じ pid / mnt namespace でない → pidfd が未終了。対象が前提を満たさなければ
+    /// 自分と同じ pid / mnt namespace でない → 自分と同じ user namespace にいる → pidfd が未終了。対象が前提を満たさなければ
     /// `FailedPrecondition`（違反記録つき）、存在しない pid・検証中に消えた対象は `NotFound`、cgroup 名を
     /// 作れない ID は `InvalidArgument`。
     pub fn open(
@@ -242,6 +291,7 @@ impl Pid1Target {
         if let Some(reason) = shared_namespace_violation(&identities) {
             return Err(ExecError::from_violation(reason, None));
         }
+        verify_same_user_namespace(pid)?;
         let target = Self {
             pid,
             pidfd,
@@ -258,7 +308,7 @@ impl Pid1Target {
 const CALLER_DISTINCT: [JoinNamespace; 2] = [JoinNamespace::Pid, JoinNamespace::Mount];
 
 /// namespace の識別子（nsfs の dev, ino）。
-type NsIdentity = (u64, u64);
+pub(super) type NsIdentity = (u64, u64);
 
 /// `(種別, 対象の識別子, 呼び出し側の識別子)` の並びから、呼び出し側と同じ namespace があれば最初の 1 件の
 /// 違反理由を返す（副作用の前に判定するテスト可能な純関数）。pid / mnt 以外の種別は判定対象にしない。
@@ -272,6 +322,30 @@ fn shared_namespace_violation(
             (true, JoinNamespace::Mount) => Some(ViolationReason::ExecTargetSharesMountNamespace),
             _ => None,
         })
+}
+
+/// 対象と呼び出し側の user namespace の識別子が異なれば違反理由を返す（副作用の前に判定するテスト可能な
+/// 純関数）。pid / mnt（[`shared_namespace_violation`]。同じであってはならない）とは逆に、user namespace は
+/// **同じでなければならない**（参加が未実装のため。モジュール doc「user namespace は呼び出し側と同じであること」）。
+fn user_namespace_violation(target: NsIdentity, own: NsIdentity) -> Option<ViolationReason> {
+    (target != own).then_some(ViolationReason::ExecTargetInOtherUserNamespace)
+}
+
+/// 対象 `pid` が呼び出し側と同じ user namespace にいることを確かめる（SUP-6・SEC-5・SEC-1・TASK-163.4）。
+///
+/// 別の user namespace なら `FailedPrecondition`（違反記録 `ExecTargetInOtherUserNamespace`）。`ns/user` を
+/// 読めない場合（user namespace 無効のカーネルを含む）は一致を確認できないためエラーにする（fail-closed）。
+/// 読んだ内容が pidfd の指すプロセスのものであることは、呼び出し側がこの後に pidfd の未終了を確認することで
+/// 保証する。
+fn verify_same_user_namespace(pid: NonZeroU32) -> Result<(), ExecError> {
+    let target = ns_identity(&format!("/proc/{pid}/ns/user"))
+        .map_err(|e| target_proc_error(&e, "read target user namespace"))?;
+    let own = ns_identity("/proc/self/ns/user")
+        .map_err(|e| ExecError::from_io(&e, IsolationStage::SetNs, "read own user namespace"))?;
+    match user_namespace_violation(target, own) {
+        Some(reason) => Err(ExecError::from_violation(reason, None)),
+        None => Ok(()),
+    }
 }
 
 /// 委譲スコープ（`"/"` または `"/a/b"`）とコンテナ用 cgroup 名から、cgroup v2 ルート起点の絶対パスを作る。
@@ -326,6 +400,15 @@ fn recheck_cgroup_membership(target: &Pid1Target) -> Result<(), ExecError> {
     ensure_not_exited(target, "refusing to setns")
 }
 
+/// 参加の直前に、対象が呼び出し側と同じ user namespace にいることを再照合する（SUP-6・SEC-5・SEC-1）。
+///
+/// `open` から参加までの間に対象が入れ子の user namespace へ移っていれば `FailedPrecondition`（違反記録つき）。
+/// 読み取りの後に pidfd の未終了を確認する（[`recheck_cgroup_membership`] と同じ手順）。
+fn recheck_user_namespace(target: &Pid1Target) -> Result<(), ExecError> {
+    verify_same_user_namespace(target.pid)?;
+    ensure_not_exited(target, "refusing to setns")
+}
+
 /// [`join_namespaces`] の成功結果（将来拡張できる構造）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -339,8 +422,8 @@ pub struct NamespaceJoinReport {
 /// 検証済みの対象 `target` の SUP-6 の 5 種（pid / mnt / uts / ipc / net）の namespace へ、1 回の
 /// `setns(2)` で参加する。参加する集合は固定で、呼び出し側は部分集合を選べない。
 ///
-/// 参加の直前に対象の終了と所属 cgroup（`open` で照合した期待パスとの完全一致）を再確認し、終了済み・
-/// 別 cgroup へ移動済みなら `FailedPrecondition`。
+/// 参加の直前に対象の終了と所属 cgroup（`open` で照合した期待パスとの完全一致）、user namespace（呼び出し側と
+/// 同じであること）を再確認し、終了済み・別 cgroup へ移動済み・別の user namespace なら `FailedPrecondition`。
 /// 呼び出しスレッドの namespace を不可逆に変える。単一スレッドでなければ `FailedPrecondition`。
 /// 契約全体はモジュール doc を参照（SUP-6・TASK-163.1）。
 pub fn join_namespaces(target: &Pid1Target) -> Result<NamespaceJoinReport, ExecError> {
@@ -356,8 +439,9 @@ pub fn join_namespaces(target: &Pid1Target) -> Result<NamespaceJoinReport, ExecE
             "the caller is multi-threaded or its thread count is unknown; refusing to setns",
         ));
     }
-    // 所属 cgroup の再照合は `setns` の直前に置く（残る窓を最小にする）。
+    // 所属 cgroup・user namespace の再照合は `setns` の直前に置く（残る窓を最小にする）。
     recheck_cgroup_membership(target)?;
+    recheck_user_namespace(target)?;
     let flags = JoinNamespace::SUP6_SET.map(JoinNamespace::flag);
     sys::setns_pidfd(target.pidfd.as_fd(), &flags).map_err(|e| setns_error(e, "setns"))?;
     Ok(NamespaceJoinReport {
@@ -735,6 +819,53 @@ mod tests {
             shared_namespace_violation(&identities[1..]),
             Some(ViolationReason::ExecTargetSharesMountNamespace)
         );
+    }
+
+    /// SUP-6・SEC-5・SEC-4・TASK-163.4: 対象の user namespace が呼び出し側と違えば違反
+    /// `exec_target_in_other_user_namespace`、同じなら違反なし（pid / mnt とは逆に、同じであることを要求する）。
+    /// inode 番号が同じでも dev が違えば別の namespace として拒否する。
+    #[test]
+    fn sup6_task163_4_user_namespace_violation_concrete_values() {
+        let own: NsIdentity = (4, 4_026_531_837);
+        let other: NsIdentity = (4, 4_026_532_600);
+        assert_eq!(user_namespace_violation(own, own), None);
+        assert_eq!(
+            user_namespace_violation(other, own),
+            Some(ViolationReason::ExecTargetInOtherUserNamespace)
+        );
+        assert_eq!(
+            user_namespace_violation((5, own.1), own),
+            Some(ViolationReason::ExecTargetInOtherUserNamespace)
+        );
+        let err = ExecError::from_violation(ViolationReason::ExecTargetInOtherUserNamespace, None);
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(err.stage, IsolationStage::SetNs);
+        assert_eq!(
+            err.message,
+            "the exec target is in another user namespace than the caller; refusing to join"
+        );
+        let v = err.violation.expect("violation");
+        assert_eq!(v.kind, ViolationKind::ExecTarget);
+        assert_eq!(v.reason.as_str(), "exec_target_in_other_user_namespace");
+        assert_eq!(v.behavior_id, "SUP-6");
+        assert_eq!(v.subject, None);
+    }
+
+    /// SUP-6・SEC-5・TASK-163.4: 実際の `/proc` の値での照合。自プロセスは自分と同じ user namespace にいるため
+    /// 通り、存在しない pid は読み取り失敗（`NotFound`。一致とみなさない）。参加直前の再照合も同じ判定を使う。
+    #[test]
+    fn sup6_task163_4_verify_same_user_namespace_with_real_identities() {
+        verify_same_user_namespace(me()).expect("own user namespace matches itself");
+        let err = verify_same_user_namespace(NonZeroU32::new(4_194_305).unwrap()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert_eq!(err.stage, IsolationStage::SetNs);
+        assert_eq!(err.violation, None);
+        let target = Pid1Target {
+            pid: me(),
+            pidfd: sys::pidfd_open(me().get()).unwrap(),
+            expected_cgroup_path: "/fc-x@1".to_owned(),
+        };
+        recheck_user_namespace(&target).expect("recheck passes for the caller's own namespace");
     }
 
     /// SUP-6: マルチスレッドの呼び出し側は FailedPrecondition（呼び出し文脈の誤りで、違反記録なし）。

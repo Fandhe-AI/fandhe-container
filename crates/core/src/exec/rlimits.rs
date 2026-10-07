@@ -29,7 +29,7 @@
 //! 制限を変えないため。本物の syscall は `sys.rs` のテストで別プロセスに対して確認する）。
 
 use super::{ExecError, IsolationStage};
-use crate::rlimits::Rlimits;
+use crate::rlimits::{RLIMIT_INFINITY, Rlimit, RlimitKind, Rlimits};
 use crate::traits::types::ErrorCode;
 
 #[cfg(not(test))]
@@ -55,6 +55,76 @@ pub(super) fn apply_rlimits(set: &Rlimits) -> Result<(), ExecError> {
         }
     }
     Ok(())
+}
+
+/// `/proc/<pid>/limits` の行頭ラベルと rlimit 種別の対応（カーネルの `lnx_rlimit` 表の文言。
+/// どのラベルも他のラベルの前置にならない）。
+const LIMITS_LABELS: [(&str, RlimitKind); 16] = [
+    ("Max cpu time", RlimitKind::Cpu),
+    ("Max file size", RlimitKind::Fsize),
+    ("Max data size", RlimitKind::Data),
+    ("Max stack size", RlimitKind::Stack),
+    ("Max core file size", RlimitKind::Core),
+    ("Max resident set", RlimitKind::Rss),
+    ("Max processes", RlimitKind::Nproc),
+    ("Max open files", RlimitKind::Nofile),
+    ("Max locked memory", RlimitKind::Memlock),
+    ("Max address space", RlimitKind::As),
+    ("Max file locks", RlimitKind::Locks),
+    ("Max pending signals", RlimitKind::Sigpending),
+    ("Max msgqueue size", RlimitKind::Msgqueue),
+    ("Max nice priority", RlimitKind::Nice),
+    ("Max realtime priority", RlimitKind::Rtprio),
+    ("Max realtime timeout", RlimitKind::Rttime),
+];
+
+/// 対象（pid1）の `/proc/<pid>/limits` の内容から、全 16 種の rlimit 集合を作る（SUP-6・SUP-12・TASK-163.4）。
+///
+/// exec プロセスへ「コンテナと同じ rlimit」を載せるための材料。`StagePipeline::with_rlimits` が受ける launch の
+/// 集合は `state.json` に記録されないため、実行中の pid1 の実効値を読む。外部入力として扱い、全 16 種が
+/// ちょうど 1 回ずつ現れること・値が `unlimited` か u64 であること・`soft <= hard` を要求し、満たさなければ
+/// 空集合へ落とさず `Internal` で拒否する（fail-closed。緩い制限のまま exec しない）。未知のラベルの行と
+/// 見出し行は無視する。値は単位の換算を要さない raw の値（`RLIMIT_*` と同じ単位）。
+pub(super) fn parse_proc_limits(text: &str) -> Result<Rlimits, ExecError> {
+    let stage = IsolationStage::Rlimits;
+    let bad = |what: &'static str| ExecError::new(ErrorCode::Internal, stage, what);
+    let mut found: Vec<Rlimit> = Vec::with_capacity(LIMITS_LABELS.len());
+    for line in text.lines() {
+        let Some((label, kind)) = LIMITS_LABELS
+            .iter()
+            .find(|(label, _)| line.strip_prefix(label).is_some_and(starts_with_blank))
+        else {
+            continue;
+        };
+        let rest = line.get(label.len()..).unwrap_or_default();
+        let mut cols = rest.split_whitespace();
+        let (Some(soft), Some(hard)) = (cols.next(), cols.next()) else {
+            return Err(bad("malformed target limits line"));
+        };
+        let value = |v: &str| -> Result<u64, ExecError> {
+            if v == "unlimited" {
+                Ok(RLIMIT_INFINITY)
+            } else {
+                v.parse::<u64>()
+                    .map_err(|_| bad("malformed target limits value"))
+            }
+        };
+        let limit = Rlimit::new(*kind, value(soft)?, value(hard)?)
+            .map_err(|_| bad("target limits soft exceeds hard"))?;
+        if found.iter().any(|r| r.kind() == *kind) {
+            return Err(bad("duplicate target limits line"));
+        }
+        found.push(limit);
+    }
+    if found.len() != LIMITS_LABELS.len() {
+        return Err(bad("target limits are incomplete"));
+    }
+    Rlimits::new(found).map_err(|_| bad("invalid target limits"))
+}
+
+/// ラベルの直後が空白（列の区切り）であること。`Max file size` が `Max file sizes` に一致しないようにする。
+fn starts_with_blank(rest: &str) -> bool {
+    rest.starts_with(' ') || rest.starts_with('\t')
 }
 
 /// テスト用の偽 syscall。呼び出し記録は `no_new_privs::testing` の記録器と共有する。
@@ -179,5 +249,104 @@ mod tests {
         assert!(apply_rlimits(&set).is_err());
         assert_eq!(take_sets(), [(RlimitKind::Nofile, 1, 2)]);
         take();
+    }
+
+    /// 実カーネルと同じ書式の `/proc/<pid>/limits`（Nice / Rtprio は単位列が空）。
+    const LIMITS_FIXTURE: &str = "\
+Limit                     Soft Limit           Hard Limit           Units     \n\
+Max cpu time              unlimited            unlimited            seconds   \n\
+Max file size             unlimited            unlimited            bytes     \n\
+Max data size             unlimited            unlimited            bytes     \n\
+Max stack size            8388608              unlimited            bytes     \n\
+Max core file size        0                    unlimited            bytes     \n\
+Max resident set          unlimited            unlimited            bytes     \n\
+Max processes             102024               102024               processes \n\
+Max open files            1024                 524288               files     \n\
+Max locked memory         8388608              8388608              bytes     \n\
+Max address space         unlimited            unlimited            bytes     \n\
+Max file locks            unlimited            unlimited            locks     \n\
+Max pending signals       102024               102024               signals   \n\
+Max msgqueue size         819200               819200               bytes     \n\
+Max nice priority         0                    0                    \n\
+Max realtime priority     0                    0                    \n\
+Max realtime timeout      unlimited            unlimited            us\n";
+
+    /// SUP-6・SUP-12・TASK-163.4: 実書式の全 16 行を具体値で読める（`unlimited` は `u64::MAX`）。
+    #[test]
+    fn sup6_task163_4_parse_proc_limits_reads_all_sixteen_kinds() {
+        let set = parse_proc_limits(LIMITS_FIXTURE).expect("parse");
+        assert_eq!(set.len(), 16);
+        let get = |k: RlimitKind| {
+            let r = set.iter().find(|r| r.kind() == k).expect("kind present");
+            (r.soft(), r.hard())
+        };
+        assert_eq!(get(RlimitKind::Cpu), (u64::MAX, u64::MAX));
+        assert_eq!(get(RlimitKind::Stack), (8_388_608, u64::MAX));
+        assert_eq!(get(RlimitKind::Core), (0, u64::MAX));
+        assert_eq!(get(RlimitKind::Nofile), (1024, 524_288));
+        assert_eq!(get(RlimitKind::Nproc), (102_024, 102_024));
+        assert_eq!(get(RlimitKind::Nice), (0, 0));
+        assert_eq!(get(RlimitKind::Rttime), (u64::MAX, u64::MAX));
+    }
+
+    /// SUP-6・TASK-163.4: 欠落・重複・不正値・soft > hard・途中で切れた行は、空集合へ落とさず `Internal` で拒否する。
+    #[test]
+    fn sup6_task163_4_parse_proc_limits_rejects_malformed_input() {
+        let without = |label: &str| {
+            LIMITS_FIXTURE
+                .lines()
+                .filter(|l| !l.starts_with(label))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let cases: [(String, &str); 6] = [
+            (String::new(), "target limits are incomplete"),
+            (without("Max open files"), "target limits are incomplete"),
+            (
+                format!("{LIMITS_FIXTURE}Max open files 1 2 files\n"),
+                "duplicate target limits line",
+            ),
+            (
+                LIMITS_FIXTURE.replace(
+                    "102024               102024               processes",
+                    "abc 5 processes",
+                ),
+                "malformed target limits value",
+            ),
+            (
+                LIMITS_FIXTURE.replace(
+                    "1024                 524288 ",
+                    "9999999              524288 ",
+                ),
+                "target limits soft exceeds hard",
+            ),
+            (
+                LIMITS_FIXTURE.replace(
+                    "Max open files            1024                 524288               files",
+                    "Max open files            1024",
+                ),
+                "malformed target limits line",
+            ),
+        ];
+        for (text, message) in cases {
+            let e = parse_proc_limits(&text).expect_err(message);
+            assert_eq!(e.code, ErrorCode::Internal, "{message}");
+            assert_eq!(e.stage, IsolationStage::Rlimits, "{message}");
+            assert_eq!(e.message, message);
+        }
+    }
+
+    /// SUP-6・TASK-163.4: ラベルは列の区切りまで一致を要する（`Max file sizes` を `Max file size` と取り違えない）。
+    #[test]
+    fn sup6_task163_4_parse_proc_limits_ignores_unknown_labels() {
+        let text = format!("{LIMITS_FIXTURE}Max file sizes 1 2 bytes\nMax future thing 1 2 x\n");
+        assert_eq!(parse_proc_limits(&text).expect("parse").len(), 16);
+    }
+
+    /// SUP-6・TASK-163.4: 実プロセスの `/proc/self/limits` を読める（書式の前提が本物のカーネルで成り立つ）。
+    #[test]
+    fn sup6_task163_4_parse_proc_limits_reads_real_self_limits() {
+        let text = std::fs::read_to_string("/proc/self/limits").expect("read limits");
+        assert_eq!(parse_proc_limits(&text).expect("parse real").len(), 16);
     }
 }

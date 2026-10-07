@@ -31,6 +31,9 @@
 //! 委譲 cgroup の検出と子 cgroup 作成（`crate::cgroups`。CORE-3・TASK-32.1・#158）は、
 //! `mkdirat(2)`・`unlinkat(2)`・`fstatfs(2)`（cgroup2 判定）と `O_NOFOLLOW` 付きの `openat(2)` を呼ぶために使う。
 //! rlimit の適用（`exec/rlimits.rs` の `apply_rlimits`。SUP-12・TASK-169.1・#526）は、fork 後の子で `prlimit(2)` を呼ぶために使う。
+//! 稼働中コンテナへの exec（`exec/exec_command.rs`。SUP-6・TASK-163.4・#503）は、exec 専用 worker を
+//! non-dumpable にし、子を親の生存に結び付けるために `prctl(2)`（`PR_SET_DUMPABLE` / `PR_GET_DUMPABLE` /
+//! `PR_SET_PDEATHSIG`）を呼ぶ。
 //! さらに `crate::audit_log` のカーネル監査フォールバック（SEC-4・TASK-41.5.2・#840）が、
 //! `socket(2)`（NETLINK_AUDIT）・`sendto(2)`・`recvfrom(2)`・`poll(2)` を呼ぶ。
 //! std だけでは提供されない syscall のみを持ち、検証（hostname の文字種・パス形式等）は呼び出し側の型
@@ -187,6 +190,15 @@ mod consts {
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
     pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
     pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
+
+    // include/uapi/linux/prctl.h の `PR_GET_DUMPABLE`（3）・`PR_SET_DUMPABLE`（4）。SUP-6・TASK-163.4。
+    // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const PR_GET_DUMPABLE: i32 = 3;
+    pub const PR_SET_DUMPABLE: i32 = 4;
+
+    // include/uapi/linux/prctl.h の `PR_SET_PDEATHSIG`（1）。SUP-6・REPAIR-5・TASK-163.4。
+    // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const PR_SET_PDEATHSIG: i32 = 1;
 
     // include/uapi/asm-generic/resource.h の `RLIMIT_*`（0〜15。SUP-12・TASK-169.1）。
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
@@ -349,6 +361,15 @@ mod consts {
     pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
     pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
 
+    // include/uapi/linux/prctl.h の `PR_GET_DUMPABLE`（3）・`PR_SET_DUMPABLE`（4）。SUP-6・TASK-163.4。
+    // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const PR_GET_DUMPABLE: i32 = 3;
+    pub const PR_SET_DUMPABLE: i32 = 4;
+
+    // include/uapi/linux/prctl.h の `PR_SET_PDEATHSIG`（1）。SUP-6・REPAIR-5・TASK-163.4。
+    // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const PR_SET_PDEATHSIG: i32 = 1;
+
     // include/uapi/asm-generic/resource.h の `RLIMIT_*`（0〜15。SUP-12・TASK-169.1）。
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
     pub const RLIMIT_CPU: i32 = 0;
@@ -477,6 +498,9 @@ mod consts {
 
     pub const PR_SET_NO_NEW_PRIVS: i32 = 0;
     pub const PR_GET_NO_NEW_PRIVS: i32 = 0;
+    pub const PR_GET_DUMPABLE: i32 = 0;
+    pub const PR_SET_DUMPABLE: i32 = 0;
+    pub const PR_SET_PDEATHSIG: i32 = 0;
 
     // rlimit の定数（対応外アーキテクチャでは各ラッパーが SUPPORTED で弾くため未使用）。
     pub const RLIMIT_CPU: i32 = 0;
@@ -1135,12 +1159,30 @@ pub(crate) fn fork_single_threaded<F: FnOnce() -> i32>(
     child: F,
     panic_exit: i32,
 ) -> Result<u32, SysError> {
+    fork_single_threaded_with(
+        || std::fs::read_to_string("/proc/self/status").is_ok_and(|status| threads_is_one(&status)),
+        child,
+        panic_exit,
+    )
+}
+
+/// [`fork_single_threaded`] の本体。`is_single_threaded` が「呼び出しプロセスのスレッド数が 1 である」ことを
+/// 返したときだけ fork する（SUP-6・TASK-163.4・#503）。
+///
+/// exec 専用プロセスは `setns(CLONE_NEWNS)` の後に `/proc` がコンテナ側の procfs になり、自プロセスを
+/// `/proc/self` で解決できない。そのため `setns` の前に開いた自プロセスの status fd からスレッド数を読む
+/// 判定（`ThreadCountSource::PreOpened`）を呼び出し側が渡す。判定の出所が変わるだけで「fork の直前に
+/// `Threads: 1` を確認する」という強制は同じ関数の内側に残る。判定が偽（読めない場合を含む）なら fork せず
+/// [`SysError::MultiThreaded`]（fail-closed）。
+pub(crate) fn fork_single_threaded_with<F: FnOnce() -> i32>(
+    is_single_threaded: impl FnOnce() -> bool,
+    child: F,
+    panic_exit: i32,
+) -> Result<u32, SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
-    let status =
-        std::fs::read_to_string("/proc/self/status").map_err(|_| SysError::MultiThreaded)?;
-    if !threads_is_one(&status) {
+    if !is_single_threaded() {
         return Err(SysError::MultiThreaded);
     }
     {
@@ -1148,7 +1190,7 @@ pub(crate) fn fork_single_threaded<F: FnOnce() -> i32>(
         let _ = io::stdout().flush();
         let _ = io::stderr().flush();
     }
-    // SAFETY: 直前に `Threads: 1` を確認済みで、fork した子には呼び出しスレッドだけが複製される
+    // SAFETY: 直前に呼び出し側の判定で `Threads: 1` を確認済みで、fork した子には呼び出しスレッドだけが複製される
     // ため、他スレッドが保持していたロック・ヒープの不整合を子が引き継がない。子は下の分岐で
     // `child` を実行して `_exit` し、呼び出し元のフレームへ戻らない。親は戻り値の pid だけを使う。
     let pid = unsafe { fork() };
@@ -1802,6 +1844,76 @@ pub(crate) fn no_new_privs_enabled() -> Result<bool, SysError> {
     }
 }
 
+/// 呼び出したプロセスを non-dumpable にする（`PR_SET_DUMPABLE` = 0。SUP-6・SEC-1・TASK-163.4・#503）。
+///
+/// `crate::exec` の exec 専用 worker（`spawn_exec_worker` の子）が、稼働中コンテナの namespace へ参加する前に
+/// 呼ぶ。exec の子は fork した時点でコンテナの PID namespace に入り、`close_range` と `execve` までの間
+/// コンテナ側の procfs から見える。dumpable のままだと、同じ uid のコンテナ内プロセスが `/proc/<pid>/fd` 等
+/// （`PTRACE_MODE_READ_FSCREDS`）や `ptrace` の attach を通じて、ホスト側の fd・メモリへ届く
+/// （CVE-2016-9962 型）。non-dumpable にすると、これらは対象の user namespace の `CAP_SYS_PTRACE` を持たない
+/// プロセスから拒否される。
+///
+/// フラグはプロセス（`mm`）単位で全スレッドに効き、fork で子へ継承される。`execve` は資格情報が変わらない
+/// 限り dumpable を 1 へ戻すため、コンテナ内で実行されるコマンド自身は launch 経路のプロセスと同じ扱いに
+/// なる。capability の削減（`capset`・bounding set の drop）は dumpable を変えない（カーネルが dumpable を
+/// 落とすのは uid / gid の変化か capability の増加のときだけ）。
+pub(crate) fn set_non_dumpable() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す
+    // （arg2 = 0 が `SUID_DUMP_DISABLE`。arg3〜5 はカーネルが参照しないが 0 に揃える）。呼び出した
+    // プロセスの `mm` のフラグを下げるだけで、メモリの内容・fd には触れない。
+    let rc = unsafe { prctl(consts::PR_SET_DUMPABLE, 0u64, 0u64, 0u64, 0u64) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 親が終了したら呼び出しプロセスへ `SIGKILL` が届くようにする（`PR_SET_PDEATHSIG`。SUP-6・REPAIR-5・
+/// TASK-163.4・#503）。
+///
+/// `crate::exec` の exec 経路（`exec/exec_command.rs`）で、fork した子（worker・コマンド）が最初に呼ぶ。
+/// worker が全体の期限で強制終了されたとき、worker が待っていたコマンドを孤児として残さないために使う。
+///
+/// - 対象は「このプロセスを作ったスレッド」の終了。設定より前に親が終了していた場合はシグナルが届かない
+///   ため、呼び出し側は設定の **後** に親の生存を別の手段（親の pidfd）で確かめること
+/// - 設定はプロセス（スレッド）単位で、fork した子へは継承されない。資格情報が変わらない `execve` では
+///   保持される（set-uid / capability 付きの実行ファイルではカーネルが解除するが、`NO_NEW_PRIVS` の下では
+///   資格情報が変わらない）。実行されたプログラム自身は `prctl` で解除できる
+/// - 親が別の PID namespace にいてもカーネルは届ける（`forget_original_parent` が子の `pdeath_signal` を送る）
+pub(crate) fn set_parent_death_sigkill() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let Ok(signal) = u64::try_from(consts::SIGKILL) else {
+        return Err(SysError::Os(EINVAL));
+    };
+    // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す
+    // （arg2 がシグナル番号。`SIGKILL` の定数だけを渡す。arg3〜5 はカーネルが参照しないが 0 に揃える）。
+    // 呼び出したスレッドの `pdeath_signal` を設定するだけで、メモリ・fd には触れない。
+    let rc = unsafe { prctl(consts::PR_SET_PDEATHSIG, signal, 0u64, 0u64, 0u64) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 呼び出したプロセスが dumpable か（`PR_GET_DUMPABLE`。SUP-6・SEC-1・TASK-163.4・#503）。
+///
+/// `0`（`SUID_DUMP_DISABLE`）だけを non-dumpable として `Ok(false)` を返す。`1`（`SUID_DUMP_USER`）と
+/// `2`（`SUID_DUMP_ROOT`。`fs.suid_dumpable=2` のホストで資格情報が変わったプロセス）は、コンテナ側から
+/// procfs 経由で読める・core が書かれる状態を含むため `Ok(true)`。想定外の値は `EINVAL`（fail-closed）。
+pub(crate) fn is_dumpable() -> Result<bool, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は u64 の 0 を 4 つ渡す（カーネルは参照しない）。
+    // 読み取りだけで状態を変えない。
+    let rc = unsafe { prctl(consts::PR_GET_DUMPABLE, 0u64, 0u64, 0u64, 0u64) };
+    match rc {
+        -1 => Err(last_error()),
+        0 => Ok(false),
+        1 | 2 => Ok(true),
+        _ => Err(SysError::Os(EINVAL)),
+    }
+}
+
 /// `struct sock_fprog`（include/uapi/linux/filter.h）。LP64 では `len` の後に 6 バイトの
 /// パディングが入り、`filter` はオフセット 8、全体 16 バイト。
 #[repr(C)]
@@ -2416,6 +2528,31 @@ mod tests {
         assert_eq!(consts::PR_GET_NO_NEW_PRIVS, 39);
     }
 
+    /// SUP-6・TASK-163.4: `prctl` の dumpable・親死亡シグナルのオプションの具体値（include/uapi/linux/prctl.h）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sup6_task163_4_prctl_dumpable_consts_are_exact() {
+        assert_eq!(consts::PR_GET_DUMPABLE, 3);
+        assert_eq!(consts::PR_SET_DUMPABLE, 4);
+        assert_eq!(consts::PR_SET_PDEATHSIG, 1);
+        // 親死亡シグナルの実 syscall は単体テストでは呼ばない（設定はスレッド単位で、テストプロセスを起動した
+        // スレッドが先に終わるとテストプロセス全体へ SIGKILL が届く）。実プロセスでの照合は supervisor の
+        // 結合試験 `exec_timeout` が行う。
+    }
+
+    /// SUP-6・SEC-1・TASK-163.4: テストプロセス自身は dumpable（`PR_GET_DUMPABLE` が 1）で、`/proc/self` 配下の
+    /// 所有者は自分の euid。dumpable はプロセス単位で元へ戻すと他のテストと競合するため、ここでは読み取り
+    /// だけを確かめる。`set_non_dumpable` の実 syscall と読み戻しは、単一スレッドの使い捨て worker で行う
+    /// supervisor の結合試験 `exec_timeout`（既定のテスト集合）が照合する。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sup6_task163_4_test_process_is_dumpable() {
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!(is_dumpable(), Ok(true));
+        let owner = std::fs::metadata("/proc/self/fd").unwrap().uid();
+        assert_eq!(owner, effective_uid());
+    }
+
     /// CORE-1・TASK-27.4.3: 専用スレッドで set し、GET と /proc の値で確認する（冪等）。
     /// フラグはスレッド単位なので、libtest の他スレッドに影響を残さないよう使い捨てスレッドで行う。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -2571,6 +2708,24 @@ mod tests {
         assert_eq!(err, SysError::MultiThreaded);
         tx.send(()).unwrap();
         helper.join().unwrap();
+    }
+
+    /// SUP-6（TASK-163.4）: 呼び出し側が渡す判定が偽なら、スレッド数によらず fork せず `MultiThreaded` で拒否する
+    /// （子のクロージャは実行されない）。判定の出所が変わっても「確認が偽なら fork しない」強制は同じ。
+    #[test]
+    fn sup6_task163_4_fork_with_refuses_when_predicate_is_false() {
+        let ran = std::cell::Cell::new(false);
+        let err = fork_single_threaded_with(
+            || false,
+            || {
+                ran.set(true);
+                0
+            },
+            125,
+        )
+        .unwrap_err();
+        assert_eq!(err, SysError::MultiThreaded);
+        assert!(!ran.get());
     }
 
     /// CORE-1（TASK-27.4.1）: `execve` の引数配列は要素数 + 1 の NULL 終端。

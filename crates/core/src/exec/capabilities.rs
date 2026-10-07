@@ -36,7 +36,7 @@
 //! 呼び出し順・エラー写像・読み戻し不一致を再現し、本物の syscall は `sys.rs` のテストと、使い捨て
 //! スレッドを使う `sec1_apply_default_capabilities_real_thread` で確認する。
 
-use super::{ExecError, IsolationStage};
+use super::{ExecError, IsolationStage, ThreadCountSource};
 use crate::capabilities::CapabilitySet;
 use crate::sys::{self, EINVAL, SysError, ThreadCaps};
 use crate::traits::types::ErrorCode;
@@ -53,10 +53,12 @@ trait CapKernel {
     fn thread_count(&mut self) -> Option<u64>;
 }
 
-/// 本物の syscall を呼ぶ実装。
-struct RealKernel;
+/// 本物の syscall を呼ぶ実装。スレッド数の取得元（`/proc/self/status` か、`setns` 前に開いた fd）を持つ。
+struct RealKernel<'a> {
+    threads: &'a mut ThreadCountSource,
+}
 
-impl CapKernel for RealKernel {
+impl CapKernel for RealKernel<'_> {
     fn bounding_contains(&mut self, cap: u8) -> Result<bool, SysError> {
         sys::cap_bounding_contains(cap)
     }
@@ -73,8 +75,7 @@ impl CapKernel for RealKernel {
         sys::cap_set_thread(caps)
     }
     fn thread_count(&mut self) -> Option<u64> {
-        let status = std::fs::read_to_string("/proc/self/status").ok()?;
-        super::status_threads(&status)
+        self.threads.count()
     }
 }
 
@@ -114,7 +115,17 @@ pub struct CapabilityReport {
 /// - 事後確認: 適用後にもう一度 `Threads: 1` を確認する。万一増えていれば（呼び出し側の
 ///   別経路の不具合等）`Ok` を返さず `Internal` で失敗し、権限が残った可能性を呼び出し側へ伝える
 pub(crate) fn apply_default_capabilities() -> Result<CapabilityReport, ExecError> {
-    apply_capabilities_single_threaded(CapabilitySet::oci_default(), &mut RealKernel)
+    apply_default_capabilities_with(&mut ThreadCountSource::ProcSelf)
+}
+
+/// [`apply_default_capabilities`] の、スレッド数の取得元を差し替えられる版（SUP-6・TASK-163.4・#503）。
+///
+/// exec 専用プロセスは `setns` の後に自プロセスを `/proc/self` で解決できないため、`setns` の前に開いた
+/// status fd（`ThreadCountSource::PreOpened`）で `Threads: 1` を適用の前後に確認する。検査自体は弱めない。
+pub(crate) fn apply_default_capabilities_with(
+    threads: &mut ThreadCountSource,
+) -> Result<CapabilityReport, ExecError> {
+    apply_capabilities_single_threaded(CapabilitySet::oci_default(), &mut RealKernel { threads })
 }
 
 /// 単一スレッド条件を適用の前後で検査して [`apply_capabilities`] を呼ぶ。事前検査は副作用の前に行う。
@@ -292,6 +303,13 @@ pub(super) mod testing {
         let mut k = Fake::new();
         k.drop_err = DROP_ERR.with(Cell::take);
         apply_capabilities_single_threaded(CapabilitySet::oci_default(), &mut k)
+    }
+
+    /// `reapply.rs` が `cfg(test)` で呼ぶ偽物（スレッド数の取得元は偽カーネルが持つため無視する）。
+    pub(in crate::exec) fn apply_default_capabilities_with(
+        _threads: &mut super::ThreadCountSource,
+    ) -> Result<CapabilityReport, ExecError> {
+        apply_default_capabilities()
     }
 
     /// 偽カーネルの状態と、呼び出し記録・注入するエラー。
@@ -570,6 +588,40 @@ mod tests {
         helper.join().unwrap();
     }
 
+    /// SUP-6・SEC-1・TASK-163.4: スレッド数の取得元を `setns` 前に開いた status fd に替えても、`Threads:` が 1 で
+    /// なければ何も変更せず `FailedPrecondition`（検査は弱まらない）。読めない取得元も同じ（fail-closed）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sup6_task163_4_pre_opened_thread_source_is_enforced() {
+        use std::io::{Seek as _, Write as _};
+        let before = status_value("CapBnd:");
+        let path = std::env::temp_dir().join(format!("fandhe-cap-threads-{}", std::process::id()));
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("create");
+        std::fs::remove_file(&path).expect("unlink");
+        writeln!(f, "Threads:\t2").expect("write");
+        f.seek(std::io::SeekFrom::Start(0)).expect("seek");
+        let mut sources = [
+            ThreadCountSource::PreOpened(f),
+            ThreadCountSource::PreOpened(std::fs::File::open("/dev/null").expect("null")),
+        ];
+        for source in &mut sources {
+            let e = apply_default_capabilities_with(source).unwrap_err();
+            assert_eq!(e.code, ErrorCode::FailedPrecondition);
+            assert_eq!(e.stage, IsolationStage::CapabilityDrop);
+            assert_eq!(
+                e.message,
+                "capability drop requires a single-threaded process (Threads: 1)"
+            );
+        }
+        assert_eq!(status_value("CapBnd:"), before);
+    }
+
     /// SEC-1: drop の EPERM は PermissionDenied・段は CapabilityDrop・後続を呼ばない。
     #[test]
     fn sec1_drop_eperm_maps_permission_denied_and_stops() {
@@ -637,14 +689,26 @@ mod tests {
             let bnd_has_extra = bnd & !DEFAULT_MASK & ((1u64 << 41) - 1) != 0;
             if eff & (1 << 8) == 0 {
                 if bnd_has_extra {
-                    let e = apply_capabilities(CapabilitySet::oci_default(), &mut RealKernel)
-                        .unwrap_err();
+                    let mut threads = ThreadCountSource::ProcSelf;
+                    let e = apply_capabilities(
+                        CapabilitySet::oci_default(),
+                        &mut RealKernel {
+                            threads: &mut threads,
+                        },
+                    )
+                    .unwrap_err();
                     assert_eq!(e.code, ErrorCode::PermissionDenied);
                     assert_eq!(e.stage, IsolationStage::CapabilityDrop);
                 }
             } else {
-                let report =
-                    apply_capabilities(CapabilitySet::oci_default(), &mut RealKernel).unwrap();
+                let mut threads = ThreadCountSource::ProcSelf;
+                let report = apply_capabilities(
+                    CapabilitySet::oci_default(),
+                    &mut RealKernel {
+                        threads: &mut threads,
+                    },
+                )
+                .unwrap();
                 assert_eq!(status_value("CapBnd:"), bnd & DEFAULT_MASK);
                 assert_eq!(status_value("CapEff:"), prm & DEFAULT_MASK);
                 assert_eq!(status_value("CapPrm:"), prm & DEFAULT_MASK);

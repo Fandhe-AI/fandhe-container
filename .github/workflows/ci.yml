@@ -519,6 +519,14 @@ jobs:
           fi
           echo "exec_setns_join: namespace join verified" >> "$GITHUB_STEP_SUMMARY"
 
+      # exec（`crates/supervisor/tests/exec.rs`。SUP-6・TASK-163.4・#503）: 稼働中コンテナへの setns・cgroup join・
+      # 制限の再適用・execve の通し結合試験。rootful の pivot_root と cgroup v2 の書き込みに root が必要で、
+      # hosted runner では実行しない（sudo の用途は増やさない）ため、ここでは型検査・ビルドだけを行う。
+      # 実行は AGENTS.md「実機前提テスト」の手順で実機に対して行い、結果を PR に記録する。
+      - name: exec のビルド（Linux のみ。実行は実機前提。SUP-6・TASK-163.4）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        run: cargo test -p fandhe-container-supervisor --features exec-test-support --test exec --no-run
+
       # container_options_ipc（`crates/supervisor/tests/container_options_ipc.rs`。SUP-12・TASK-169.3・#528）:
       # `--ipc=host` / `shareable` の IPC namespace 共有・分離を検証する実機前提テスト（harness = false）。
       # unshare_isolation と同じく Linux 限定・上で緩和した sysctl を再利用し、新しい check-run・sudo・

@@ -1,0 +1,356 @@
+//! 稼働中コンテナへのコマンド実行の入口（fork → `close_range` → `execve`。SUP-6・TASK-163.4・#503・MS-9）。
+//!
+//! # 役割と呼び出し文脈
+//!
+//! SUP-6 の exec は「pid1 の namespace へ `setns` → cgroup join → 制限の再適用 → コマンド実行」。本モジュールは
+//! 最後の「コマンド実行」を担う。`fandhe-container-supervisor` の `exec::run_command` が、`reapply_restrictions`
+//! の結果から作った [`ExecReady`] を渡して呼ぶ。
+//!
+//! ```text
+//! reapply_restrictions(..) -> ExecRestrictionReport      // rlimit・capability・NO_NEW_PRIVS・Landlock・seccomp
+//!   .into_complete()       -> ExecReady                  // 唯一の証跡（値で渡る）
+//! spawn_exec_command(ready, &entry)                      // 親: non-dumpable を確認 → cwd を照合済み root へ → fork
+//!   子: close_range(3..) -> エントリポイントを fd で検査 -> 標準入出力を /dev/null へ -> execveat
+//! 親: ContainerChild::wait_timeout(timeout)              // 期限超過は SIGKILL + 回収（REPAIR-5）
+//! ```
+//!
+//! 上の全体は [`spawn_exec_worker`] が fork した使い捨ての worker の中で行う（worker は開始時に自分を
+//! non-dumpable にする。下記「コンテナから見える窓を閉じる」）。
+//!
+//! # 契約
+//!
+//! - **入口は [`ExecReady`] だけを値で受け取る**（SEC-1）。`ExecRestrictionReport`・真偽値を受け取る入口、
+//!   `ExecReady` を作る別経路は無い。制限（`NO_NEW_PRIVS`・Landlock・seccomp・capability の bounding set・
+//!   rlimit）は fork / execve を越えて継承されるため、「適用 → fork → execve」の順で子へ載る
+//! - **コンテナから見える窓を閉じる（non-dumpable。SEC-1・CVE-2016-9962 型の対策）**: exec の子は fork した
+//!   時点でコンテナの PID namespace に入り、`close_range` が終わるまで（標準入出力は `/dev/null` へ置換する
+//!   まで）ホスト側の fd を持ったままコンテナの procfs から見える。launch 経路の子は新しい PID namespace の
+//!   PID 1 で、その時点で namespace の中に他のプロセスが居ないため、この窓は exec にしか無い。dumpable の
+//!   ままだと、同じ uid のコンテナ内プロセスが `/proc/<pid>/fd`・`/proc/<pid>/mem`（`PTRACE_MODE_*`。Yama の
+//!   `ptrace_scope` は読み取り系を制限しない）からホスト側の fd・メモリへ届く。そこで worker は
+//!   `setns` より前（開始時）に `PR_SET_DUMPABLE` = 0 にして読み戻し、[`spawn_exec_command`] は fork の直前に
+//!   non-dumpable であることを確認して、そうでなければ fork せず `FailedPrecondition` にする（worker の外から
+//!   呼ぶ経路を作らない）。フラグは fork で子へ継承され、capability の削減では戻らない。`execve` が成功すると
+//!   カーネルが dumpable を 1 へ戻すため、実行されるコマンド自身は launch 経路のプロセスと同じ扱いになる
+//! - **子を親の生存に結び付ける（REPAIR-5）**: worker は全体の期限を過ぎると親から `SIGKILL` で止められる。
+//!   そのとき worker が待っていたコマンドを孤児として残さないよう、fork した子（[`spawn_exec_worker`] の
+//!   worker と [`spawn_exec_command`] のコマンド）は最初に `PR_SET_PDEATHSIG` = `SIGKILL` を設定し、続けて
+//!   親が fork の前に開いた自分自身の pidfd で親の生存を確かめる（設定より前に親が終了していた場合は
+//!   シグナルが届かないため。親が別の PID namespace にいると `getppid` は常に 0 を返し、判定に使えない）。
+//!   親が既に終了していれば子は何もせず終了する。これで「呼び出しプロセスの終了 → worker の停止 →
+//!   コマンドの停止」が連鎖する。設定は資格情報の変わらない `execve` を越えて保持されるが、実行された
+//!   コマンド自身は `prctl` で解除できる（解除したコマンドと、コマンドがコンテナ内で作った子孫は、コンテナの
+//!   cgroup と制限の内側に残る。確実に止めるには exec 用の子 cgroup と `cgroup.kill` が要る。未実装）
+//! - **fork の前に cwd を照合済みの root へ置く**: `setns(CLONE_NEWNS)` が付け替えた cwd は検証していないため、
+//!   `ExecReady` が持つ照合済みの `/` の fd へ `fchdir` する。コマンドの cwd はコンテナの rootfs の根になる
+//! - **fork の健全性**: 子を fork する直前に、`setns` 前に開いた status fd から `Threads: 1` を確認する
+//!   （`setns` の後は自プロセスを `/proc/self` で解決できないため、`ProcSelf` は使えない）。満たさなければ
+//!   fork せず `FailedPrecondition`。fork は `sys::fork_single_threaded_with` が強制する
+//! - **別プロセスからは呼べない**: `ExecReady` を作ったプロセスと異なる pid からの呼び出しは何もせず拒否する
+//!   （fork した子の pid は数値が衝突し得るため、best-effort の誤用検知）
+//! - **子は launch 経路と同じ手順で exec する**: エントリポイントを開く前に fd 3 以上を `close_range` で閉じ
+//!   （cgroup・状態・固定した rootfs・status の fd をコンテナへ渡さない。CVE-2024-21626 型の対策）、標準 fd と同一
+//!   実体・ランタイム自身のバイナリを拒否し、シェバンを検証し、標準入出力を新 root の `/dev/null`（1:3 を検証）へ
+//!   置換して `execveat` する（`process::exec_checked_entrypoint`）。エントリポイントは絶対パスのみで PATH
+//!   探索はしない。子の失敗は stderr の英語 1 行と終了コード（125 / 126 / 127）で伝える
+//! - **親の待ちには必ずタイムアウトを設ける**（REPAIR-5）: 戻り値の [`ContainerChild`] は
+//!   `wait_timeout` のみを提供する。`Drop` では kill / wait しない
+//!
+//! # 未実装（REPAIR-3）
+//!
+//! - 標準入出力の受け渡し（CLI の exec・TASK-161 / SUP-4 の healthcheck の出力取得）。現状は launch と同じく
+//!   `/dev/null` へ固定する（ホスト側の端末・ファイルをコンテナへ渡さない。fail-closed）
+//! - 環境変数・作業ディレクトリ・ユーザーの指定（OCI `process` からの組み立て）。cwd は rootfs の根で固定
+//! - 子の失敗を構造のまま親へ返す同期パイプ（現状は終了コードと stderr）
+
+use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
+
+use crate::sys;
+use crate::traits::types::ErrorCode;
+
+use super::process::{EXIT_SETUP_FAILED, exec_child_main};
+use super::reapply::ExecReadyParts;
+use super::{ContainerChild, Entrypoint, ExecError, ExecReady, IsolationStage};
+
+/// 証跡 `ready` を消費し、`entry` を稼働中コンテナの namespace・cgroup・制限の下で実行する子を fork する。
+///
+/// 親（呼び出しプロセス）は子の pid を持つ [`ContainerChild`] を返すだけで、exec しない。単一スレッドの exec
+/// 専用プロセス（[`spawn_exec_worker`] の worker。non-dumpable）からのみ呼ぶ（契約はモジュール doc）。dumpable な
+/// プロセスから呼ぶと fork せず `FailedPrecondition`（段 `Spawn`）。失敗しても状態は戻せないため、呼び出し側は
+/// 続行せず終了する。
+///
+/// `ExecReady` を経由しない入口は無い（`ExecRestrictionReport` は渡せない）:
+///
+/// ```compile_fail,E0308
+/// fn f(
+///     report: fandhe_container_core::exec::ExecRestrictionReport,
+///     entry: &fandhe_container_core::exec::Entrypoint,
+/// ) {
+///     let _ = fandhe_container_core::exec::spawn_exec_command(report, entry);
+/// }
+/// ```
+pub fn spawn_exec_command(
+    ready: ExecReady,
+    entry: &Entrypoint,
+) -> Result<ContainerChild, ExecError> {
+    let ExecReadyParts {
+        root,
+        mut threads,
+        owner_pid,
+    } = ready.into_parts();
+    if owner_pid != std::process::id() {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::Spawn,
+            "exec must be started by the process that applied the restrictions",
+        ));
+    }
+    require_non_dumpable()?;
+    // 子が「親（この worker）の生存」を確かめるための、自プロセスの pidfd（fork で子へ継承される）。
+    let own = own_pidfd()?;
+    change_dir_to_verified_root(root.as_fd())?;
+    let pid = sys::fork_single_threaded_with(
+        || threads.count() == Some(1),
+        || match bind_to_parent_lifetime(own.as_fd()) {
+            Ok(()) => exec_child_main(entry),
+            Err(code) => code,
+        },
+        EXIT_SETUP_FAILED,
+    )
+    .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
+    Ok(ContainerChild::new(pid))
+}
+
+/// 呼び出しプロセス自身を指す pidfd を開く（fork する子へ継承させ、親の生存確認に使う。REPAIR-5）。
+///
+/// `pidfd_open` は pid を呼び出しプロセスの PID namespace で解決する。`setns(CLONE_NEWPID)` は呼び出し
+/// プロセス自身の PID namespace を変えないため、参加の後でも自分の pid で開ける。
+fn own_pidfd() -> Result<OwnedFd, ExecError> {
+    sys::pidfd_open(std::process::id())
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "pidfd_open(self)"))
+}
+
+/// fork した子を親の生存に結び付ける（REPAIR-5。契約はモジュール doc「子を親の生存に結び付ける」）。
+///
+/// 親死亡シグナル（`SIGKILL`）を設定してから、`parent`（親が fork の前に開いた親自身の pidfd）で親が終了して
+/// いないことを確かめる。設定・確認に失敗した場合と、親が既に終了していた場合は、stderr に英語 1 行を出して
+/// 子の終了コード（`EXIT_SETUP_FAILED`）を返す（呼び出し側は以降の処理を実行しない。fail-closed）。
+fn bind_to_parent_lifetime(parent: BorrowedFd<'_>) -> Result<(), i32> {
+    use std::io::Write as _;
+    // pidfd は対象の終了で読み取り可能になる（タイムアウト 0 で現在の状態だけを見る）。
+    let parent_exited =
+        sys::set_parent_death_sigkill().and_then(|()| sys::poll_readable(parent, 0));
+    if parent_exited == Ok(false) {
+        return Ok(());
+    }
+    let _ = writeln!(
+        std::io::stderr(),
+        "fandhe-container: the parent of the exec process is gone or cannot be watched; refusing to continue"
+    );
+    Err(EXIT_SETUP_FAILED)
+}
+
+/// 準備から実行までを担う使い捨ての worker プロセスを fork する（REPAIR-5・SUP-6・TASK-163.4・#503）。
+///
+/// `fandhe-container-supervisor` の `exec::run_command` が、`setns`・cgroup join・制限の再適用といった
+/// 割り込めないブロッキング段を **別プロセス** へ隔離し、親が全体の期限で待って期限超過時に worker を
+/// `SIGKILL` で止めて回収できるようにするために呼ぶ（単一スレッドのため、段の途中のハングを同一プロセス内の
+/// 期限確認では止められない）。
+///
+/// - 呼び出し元は単一スレッドでなければならない（満たさなければ fork せず `FailedPrecondition`。
+///   `sys::fork_single_threaded` が強制する）
+/// - `worker` は fork した子で実行され、戻り値（0〜255 に丸められる）で `_exit` する。panic は
+///   `EXIT_SETUP_FAILED`。呼び出し元のフレームへは戻らない。結果の受け渡しは呼び出し側が fork 前に用意した
+///   fd（pipe 等）で行う
+/// - worker は `worker` を実行する **前** に、自分を呼び出し元の生存に結び付け（呼び出し元が終了したら
+///   `SIGKILL` が届く。モジュール doc「子を親の生存に結び付ける」。REPAIR-5）、自分を non-dumpable にして
+///   読み戻して確認する（モジュール doc「コンテナから見える窓を閉じる」。SEC-1）。どちらかの設定・確認に
+///   失敗したら `worker` を実行せず `EXIT_SETUP_FAILED` で終了する（fail-closed）。それ以外の制限は適用しない。子へ載る制限は、worker 自身が
+///   `reapply_restrictions` で作った [`ExecReady`] 経由でしか exec へ進めない（`ExecReady` は別プロセスへ
+///   渡せない。SEC-1）
+/// - 戻り値の [`ContainerChild`] は `wait_timeout` で待つこと（`Drop` では kill / wait しない）
+pub fn spawn_exec_worker<F: FnOnce() -> i32>(worker: F) -> Result<ContainerChild, ExecError> {
+    let own = own_pidfd()?;
+    let pid = sys::fork_single_threaded(
+        || match bind_to_parent_lifetime(own.as_fd()).and_then(|()| make_worker_non_dumpable()) {
+            Ok(()) => worker(),
+            Err(code) => code,
+        },
+        EXIT_SETUP_FAILED,
+    )
+    .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
+    Ok(ContainerChild::new(pid))
+}
+
+/// worker（fork した子）を non-dumpable にし、読み戻して確認する。失敗時は stderr に英語 1 行を出し、
+/// worker の終了コード（`EXIT_SETUP_FAILED`）を返す（呼び出し側は `worker` を実行しない）。
+fn make_worker_non_dumpable() -> Result<(), i32> {
+    use std::io::Write as _;
+    let outcome = sys::set_non_dumpable().and_then(|()| sys::is_dumpable());
+    if outcome == Ok(false) {
+        return Ok(());
+    }
+    let _ = writeln!(
+        std::io::stderr(),
+        "fandhe-container: the exec worker could not become non-dumpable; refusing to continue"
+    );
+    Err(EXIT_SETUP_FAILED)
+}
+
+/// 呼び出しプロセスが non-dumpable であることを確かめる（fork の直前。SEC-1）。本番ビルドの実装。
+///
+/// dumpable なら `FailedPrecondition`（段 `Spawn`）。確認できない場合も fork しない（fail-closed）。
+#[cfg(not(test))]
+fn require_non_dumpable() -> Result<(), ExecError> {
+    let dumpable = sys::is_dumpable()
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "prctl(PR_GET_DUMPABLE)"))?;
+    reject_dumpable(dumpable)
+}
+
+/// テストビルドの差し込み点（libtest のプロセスは dumpable で、プロセス全体の状態のため変えない）。
+/// 呼ばれたことを記録し、`tests::DUMPABLE` の値で本番と同じ判定を通す。
+#[cfg(test)]
+fn require_non_dumpable() -> Result<(), ExecError> {
+    tests::CALLS.with(|c| c.borrow_mut().push("prctl(PR_GET_DUMPABLE)"));
+    reject_dumpable(tests::DUMPABLE.with(std::cell::Cell::get))
+}
+
+/// dumpable なプロセスからの exec を拒否する（判定の本体。本番・テストで共有する）。
+fn reject_dumpable(dumpable: bool) -> Result<(), ExecError> {
+    if dumpable {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::Spawn,
+            "exec requires a non-dumpable process; start it from the exec worker",
+        ));
+    }
+    Ok(())
+}
+
+/// cwd を照合済みの root（`O_PATH` の fd）へ置く。本番ビルドの実装。
+#[cfg(not(test))]
+fn change_dir_to_verified_root(root: BorrowedFd<'_>) -> Result<(), ExecError> {
+    sys::change_dir_fd(root)
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fchdir(root)"))
+}
+
+/// テストビルドの dry-run 差し込み点（libtest はマルチスレッドで、cwd はプロセス全体の状態のため変えない）。
+/// 呼ばれたことだけを記録する。
+#[cfg(test)]
+fn change_dir_to_verified_root(_root: BorrowedFd<'_>) -> Result<(), ExecError> {
+    tests::CALLS.with(|c| c.borrow_mut().push("fchdir(root)"));
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::io::{Seek as _, Write as _};
+
+    use super::*;
+    use crate::exec::ThreadCountSource;
+
+    thread_local! {
+        pub(super) static CALLS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+        /// `require_non_dumpable` の差し込み点が返す値（既定は non-dumpable = worker の中）。
+        pub(super) static DUMPABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn take_calls() -> Vec<&'static str> {
+        CALLS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
+
+    fn root_fd() -> OwnedFd {
+        OwnedFd::from(std::fs::File::open("/").expect("open /"))
+    }
+
+    /// `Threads:` を固定した使い捨ての status 相当ファイル（名前を残さない）。
+    fn status_with_threads(n: u64) -> ThreadCountSource {
+        let path = std::env::temp_dir().join(format!(
+            "fandhe-exec-command-{}-{n}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("create");
+        std::fs::remove_file(&path).expect("unlink");
+        write!(f, "Name:\tx\nThreads:\t{n}\n").expect("write");
+        f.seek(std::io::SeekFrom::Start(0)).expect("seek");
+        ThreadCountSource::PreOpened(f)
+    }
+
+    fn entry() -> Entrypoint {
+        Entrypoint::new("/bin/true", ["true"], Vec::<String>::new()).expect("entry")
+    }
+
+    /// SUP-6・SEC-1・TASK-163.4: `ExecReady` を作ったのと別のプロセスからは、cwd も変えず fork もせずに拒否する。
+    #[test]
+    fn sup6_task163_4_spawn_rejects_other_process() {
+        take_calls();
+        let ready = ExecReady::for_test(
+            root_fd(),
+            status_with_threads(1),
+            std::process::id().wrapping_add(1),
+        );
+        let e = spawn_exec_command(ready, &entry()).expect_err("other process");
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.stage, IsolationStage::Spawn);
+        assert_eq!(
+            e.message,
+            "exec must be started by the process that applied the restrictions"
+        );
+        assert_eq!(take_calls(), Vec::<&str>::new());
+    }
+
+    /// SUP-6・SEC-1・TASK-163.4: dumpable なプロセス（exec worker の外）からは、cwd も変えず fork もせずに
+    /// `FailedPrecondition`（段 `Spawn`）。コンテナの PID namespace に入る子を、コンテナ側から procfs 経由で
+    /// 読める状態で作らない（CVE-2016-9962 型）。
+    #[test]
+    fn sup6_task163_4_spawn_rejects_dumpable_process() {
+        take_calls();
+        DUMPABLE.with(|d| d.set(true));
+        let ready = ExecReady::for_test(root_fd(), status_with_threads(1), std::process::id());
+        let result = spawn_exec_command(ready, &entry());
+        DUMPABLE.with(|d| d.set(false));
+        let e = result.expect_err("dumpable");
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.stage, IsolationStage::Spawn);
+        assert_eq!(
+            e.message,
+            "exec requires a non-dumpable process; start it from the exec worker"
+        );
+        assert_eq!(e.violation, None);
+        assert_eq!(take_calls(), vec!["prctl(PR_GET_DUMPABLE)"]);
+    }
+
+    /// SUP-6・SEC-1・TASK-163.4: 判定の本体は dumpable のときだけ拒否する。
+    #[test]
+    fn sup6_task163_4_reject_dumpable_concrete_values() {
+        assert!(reject_dumpable(false).is_ok());
+        let e = reject_dumpable(true).expect_err("dumpable");
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.stage, IsolationStage::Spawn);
+    }
+
+    /// SUP-6・SEC-1・TASK-163.4: 保持した status fd が単一スレッドでないと示すなら、non-dumpable の確認と
+    /// cwd の設定の後で fork せずに `FailedPrecondition`（段 `Spawn`）。読めない場合も同じ（fail-closed）。
+    #[test]
+    fn sup6_task163_4_spawn_refuses_fork_when_not_single_threaded() {
+        for source in [
+            status_with_threads(3),
+            ThreadCountSource::PreOpened(std::fs::File::open("/dev/null").expect("null")),
+        ] {
+            take_calls();
+            let ready = ExecReady::for_test(root_fd(), source, std::process::id());
+            let e = spawn_exec_command(ready, &entry()).expect_err("multi-threaded");
+            assert_eq!(e.code, ErrorCode::FailedPrecondition);
+            assert_eq!(e.stage, IsolationStage::Spawn);
+            assert_eq!(take_calls(), vec!["prctl(PR_GET_DUMPABLE)", "fchdir(root)"]);
+        }
+    }
+}

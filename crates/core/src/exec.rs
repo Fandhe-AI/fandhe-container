@@ -92,6 +92,7 @@ use crate::sys::{self, NsFlag, SysError};
 use crate::traits::types::ErrorCode;
 
 mod capabilities;
+mod cgroup_join;
 mod devices;
 mod landlock;
 mod no_new_privs;
@@ -105,6 +106,7 @@ mod tmpfs;
 mod violation;
 
 pub use capabilities::CapabilityReport;
+pub use cgroup_join::{ExecCgroupJoin, ExecCgroupJoinReport, join_cgroup, prepare_cgroup_join};
 pub use devices::{DeviceNodeOutcome, DeviceNodeStatus, DeviceReport, create_default_devices};
 /// 結合試験 `tests/landlock.rs` 専用の再公開（CORE-5・TASK-39.5・#185。通常の利用者は呼ばない。詳細は定義側）。
 #[doc(hidden)]

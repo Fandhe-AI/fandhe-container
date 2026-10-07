@@ -44,6 +44,9 @@
 //!   [`ContainerCgroup::set_io_max`]（`io_max` サブモジュール。1 デバイス分の絶対値スロットル）（同上。未結線）
 //! - fork 後の子の `cgroup.procs` 参加（TASK-32.4・#161）: [`ContainerCgroup::join_hook`] が返す
 //!   [`CgroupJoin`] を `exec::StagePipeline` の `CgroupJoin` 段へ登録する（`exec::StageHook` 実装済み）
+//! - exec 経路の cgroup 参加（SUP-6・TASK-163.2・#501）: 記録した cgroup パスから fd で開いて `cgroup.procs` へ
+//!   書く `exec_join` サブモジュール（`exec::prepare_cgroup_join` / `join_cgroup` の実体。起動経路の
+//!   [`CgroupJoin`] とは別の入口）
 //!
 //! - delete 時の cgroup 削除（TASK-30.3・OCI-6）: [`DelegatedCgroup::open_child`] で名前から既存の子 cgroup を
 //!   検証つきで開き、`oci_runtime::ContainerCgroupRemover` の実装として [`DelegatedCgroup::remove_child`] へ渡す
@@ -79,6 +82,8 @@ mod io_max;
 pub use io_max::{BlockDevice, IoLimit, IoMax};
 mod pids;
 pub use pids::{PIDS_MAX_LIMIT, PidsMax};
+mod exec_join;
+pub(crate) use exec_join::{ExecJoinFds, contains_pid, open_cgroup_by_path};
 
 /// 退避リーフ cgroup の名前。自プロセスの移動先（レイアウトは本モジュール冒頭を参照）。
 const EVACUATION_LEAF: &str = "fc-runtime";
@@ -639,6 +644,25 @@ fn open_cgroup_dir(
     Ok(fd)
 }
 
+/// `/sys/fs/cgroup`（cgroup v2 ルート）を O_PATH で開き、cgroup2 であることを確認する。
+///
+/// `DelegatedCgroup::detect`（自プロセスの cgroup を辿る起点）と `exec_join`（記録した cgroup パスを辿る
+/// 起点。SUP-6・TASK-163.2）が共用する。各要素は `O_NOFOLLOW` で開く。
+fn open_cgroup_root() -> Result<OwnedFd, CgroupError> {
+    let open_step = CgroupStep::OpenRoot;
+    let mut cur = {
+        let slash = cstring(open_step, "/")?;
+        sys::open_dir_path_nofollow(None, &slash).map_err(|e| sys_error(open_step, "/", e))?
+    };
+    for comp in ["sys", "fs", "cgroup"] {
+        let c = cstring(open_step, comp)?;
+        cur = sys::open_dir_path_nofollow(Some(cur.as_fd()), &c)
+            .map_err(|e| sys_error(open_step, comp, e))?;
+    }
+    verify_cgroup2(cur.as_fd(), "/sys/fs/cgroup")?;
+    Ok(cur)
+}
+
 /// 委譲された cgroup（検出結果）。
 #[derive(Debug)]
 pub struct DelegatedCgroup {
@@ -816,16 +840,7 @@ impl DelegatedCgroup {
             ));
         }
         let open_step = CgroupStep::OpenRoot;
-        let mut cur = {
-            let slash = cstring(open_step, "/")?;
-            sys::open_dir_path_nofollow(None, &slash).map_err(|e| sys_error(open_step, "/", e))?
-        };
-        for comp in ["sys", "fs", "cgroup"] {
-            let c = cstring(open_step, comp)?;
-            cur = sys::open_dir_path_nofollow(Some(cur.as_fd()), &c)
-                .map_err(|e| sys_error(open_step, comp, e))?;
-        }
-        verify_cgroup2(cur.as_fd(), "/sys/fs/cgroup")?;
+        let mut cur = open_cgroup_root()?;
         for comp in &path.components {
             cur = open_cgroup_dir(open_step, cur.as_fd(), comp)?;
         }

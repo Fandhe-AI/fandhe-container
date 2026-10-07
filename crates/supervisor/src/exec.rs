@@ -1,9 +1,9 @@
-//! exec の入口: 稼働中コンテナの pid1 を特定し、その namespace へ参加する（SUP-6・TASK-163.1・#500・MS-9）。
+//! exec の入口: 稼働中コンテナの pid1 を特定し、その namespace と cgroup へ参加する（SUP-6・TASK-163.1・163.2・#500・#501・MS-9）。
 //!
 //! # 役割と呼び出し文脈
 //!
 //! `state.json` のレコードから対象を決め、`fandhe_container_core::exec` の安全 API（`Pid1Target` /
-//! `join_namespaces`）へ配線するだけの薄い層で、`unsafe` も OS 分岐も持たない（OS 局所化は core。CLI-1）。
+//! `join_namespaces` / `prepare_cgroup_join` / `join_cgroup`）へ配線するだけの薄い層で、`unsafe` も OS 分岐も持たない（OS 局所化は core。CLI-1）。
 //! 将来 #503 の exec 専用プロセスと TASK-161（SUP-4）の healthcheck が同じ関数を使う
 //! （`health.rs` の `HealthProbe` が期待する共通コードパス）。
 //!
@@ -21,18 +21,30 @@
 //!   `exec-test-support` feature を付けたビルドに限る）
 //! - [`enter_namespaces`] は呼び出しスレッドの namespace を不可逆に変える。単一スレッドのプロセスから
 //!   のみ呼べる。logs 捕捉スレッドを持つ supervisor 本体からは呼ばず、exec 専用プロセスから呼ぶ（#503）
-//! - 順序: cgroup.procs の fd 確保（#501）は [`enter_namespaces`] の前、seccomp / Landlock の再適用
-//!   （#502）は後
+//! - 順序: [`prepare_cgroup_join`]（cgroup.procs の fd 確保。#501）は [`enter_namespaces`] の **前**、
+//!   [`join_cgroup`] は準備の後（#503 は `enter_namespaces` の後・seccomp の前に呼ぶ想定）、seccomp /
+//!   Landlock の再適用（#502）は後。`/proc/self/cgroup` の fd も準備で確保する（`setns` 後は自プロセスを
+//!   procfs から解決できないため）
+//! - [`join_cgroup`] は呼び出しプロセスをコンテナの cgroup へ移す（`cgroup.procs` はスレッドグループ全体を
+//!   移す）。supervisor 本体から呼ばず、委譲スコープの内側で動く exec 専用プロセスからのみ呼ぶ（#503）。
+//!   失敗時は所属が不定のため、呼び出し側は続行せず終了する（fail-closed）。保持 fd は `execve` の前に
+//!   `close_range` で閉じる必要がある（#503）
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! namespace 参加までで、コマンド実行は未実装。cgroup join（#501・TASK-163.2）、seccomp / Landlock 再適用
-//! （#502・TASK-163.3）、fork・execve と統合テスト（#503・TASK-163.4）は未実装（SUP-6）。
+//! namespace 参加と cgroup join までで、コマンド実行は未実装。seccomp / Landlock 再適用
+//! （#502・TASK-163.3）、fork・execve と統合テスト（#503・TASK-163.4）は未実装（SUP-6）。実 cgroup への
+//! 参加の実機結合試験も #503 の統合テストで扱う（本 Issue では core の既定集合のユニットテストで
+//! `cgroup.procs` への書き込みと読み戻しを照合）。
 //! user namespace への参加も未実装で、既定の rootless（コンテナが user namespace を持つ）では
 //! [`enter_namespaces`] が `EPERM` で失敗する（fail-closed。rootless の exec には必須）。
 //! 違反記録（SEC-4）の監査ログへの保存の配線も未実装（#839・#503）。
 
-use fandhe_container_core::exec::{ExecError, NamespaceJoinReport, Pid1Target, join_namespaces};
+use fandhe_container_core::exec::{
+    ExecCgroupJoin, ExecCgroupJoinReport, ExecError, NamespaceJoinReport, Pid1Target,
+    join_cgroup as core_join_cgroup, join_namespaces,
+    prepare_cgroup_join as core_prepare_cgroup_join,
+};
 use fandhe_container_core::traits::{
     ContainerId, ContainerState, ErrorCode, StateRecord, TraitError,
 };
@@ -116,6 +128,17 @@ pub fn identify_pid1_in(
 /// SUP-6 の 5 種（pid / mnt / uts / ipc / net）の namespace へ参加する。単一スレッドからのみ呼ぶこと。
 pub fn enter_namespaces(target: &ExecTarget) -> Result<NamespaceJoinReport, TraitError> {
     join_namespaces(&target.pid1).map_err(from_exec_error)
+}
+
+/// 対象のコンテナ cgroup を開き、参加に必要な fd を確保する。[`enter_namespaces`] の **前** に呼ぶ（SUP-6・#501）。
+pub fn prepare_cgroup_join(target: &ExecTarget) -> Result<ExecCgroupJoin, TraitError> {
+    core_prepare_cgroup_join(&target.pid1).map_err(from_exec_error)
+}
+
+/// 自プロセスをコンテナの cgroup へ参加させ、所属を確認する。exec 専用プロセスからのみ呼ぶこと
+/// （契約はモジュール doc）。失敗時は続行せず終了すること。
+pub fn join_cgroup(join: ExecCgroupJoin) -> Result<ExecCgroupJoinReport, TraitError> {
+    core_join_cgroup(join).map_err(from_exec_error)
 }
 
 /// `ExecError` を `code` を保ったまま `TraitError` へ写す（段名はメッセージへ含める）。
@@ -221,5 +244,14 @@ mod tests {
             err.message()
         );
         assert!(!err.message().contains("violation"), "{}", err.message());
+    }
+
+    /// SUP-6・TASK-163.2: cgroup join の公開入口の型（検証済みの `ExecTarget` だけから準備でき、参加は準備の結果を
+    /// 消費する）。実 pid1 を要する成功経路は core のユニットテスト（`sup6_task163_2_*`）と #503 の統合
+    /// テストが担い、ここでは配線の型が保たれていることだけを機械照合する。
+    #[test]
+    fn sup6_task163_2_cgroup_join_entry_points_have_expected_shape() {
+        let _prepare: fn(&ExecTarget) -> Result<ExecCgroupJoin, TraitError> = prepare_cgroup_join;
+        let _join: fn(ExecCgroupJoin) -> Result<ExecCgroupJoinReport, TraitError> = join_cgroup;
     }
 }

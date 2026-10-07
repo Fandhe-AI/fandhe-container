@@ -149,6 +149,11 @@ impl ExecJoinFds {
         })
     }
 
+    /// 固定済みのコンテナ cgroup ディレクトリ fd（exec 用の子 cgroup の作成 `mkdirat` の起点。#1466）。
+    pub(crate) fn dir(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.dir.as_fd()
+    }
+
     /// テスト用: 通常のディレクトリ fd と任意の「自プロセスの cgroup」ファイルから組み立てる。
     #[cfg(test)]
     pub(crate) fn from_parts_for_test(

@@ -9,8 +9,8 @@
 //! - rlimit: `/proc/<pid>/limits` が pid1 と全 16 種で一致（launch と同じ値。SUP-12）
 //! - Landlock: 読み取り専用の root 配下への書き込みが拒否され（`deny/no` は作られない）、`rw` の mount 先
 //!   （`data/ok`）は作られる。seccomp: 禁止 syscall の `unshare(0)` が `EPERM`（`data/unshare_denied`）
-//! - cgroup: `/proc/<pid>/cgroup` がコンテナ用 cgroup（`<scope>/fc-<id>@<instance>`）の絶対パスと完全一致し、
-//!   joiner が元いた cgroup と異なる
+//! - cgroup: `/proc/<pid>/cgroup` がコンテナ用 cgroup（`<scope>/fc-<id>@<instance>`）直下の exec 用の子
+//!   cgroup（`exec-<nonce>`。#1466）で、joiner が元いた cgroup と異なる
 //! - namespace: `NSpid` が入れ子で、`ns/{mnt,uts,ipc,net,pid}` が pid1 と一致（pid は参加後に fork した子の値）
 //! - 環境変数・補助グループ（TASK-163 追補・#1457）: コマンドの `/proc/<pid>/environ` が、コンテナ定義
 //!   （`config.json` の `process.env`）へ明示の上書きを重ねたものと完全一致し、joiner だけが持つ環境変数を含まない。
@@ -836,9 +836,16 @@ mod linux {
                 "{ns} {ctx}"
             );
         }
-        // cgroup: コンテナ用 cgroup の絶対パスと完全一致し、joiner が元いた cgroup と異なる。
+        // cgroup: コマンドはコンテナ用 cgroup の直下の exec 用の子 cgroup（`exec-<nonce>` の 1 要素。#1466）に
+        // いて、joiner が元いた cgroup と異なる。通しの後に子 cgroup は削除済み（コンテナ cgroup 直下に残らない）。
         let cgroup = cgroup_of(&pid.to_string());
-        assert_eq!(cgroup, c.cgroup_path, "{ctx}");
+        let child = cgroup
+            .strip_prefix(&format!("{}/", c.cgroup_path))
+            .unwrap_or_else(|| panic!("{cgroup} is not under {} {ctx}", c.cgroup_path));
+        assert!(
+            child.starts_with("exec-") && !child.contains('/'),
+            "{child} {ctx}"
+        );
         assert_ne!(cgroup, original_cgroup, "{ctx}");
         // rlimit は launch と同じ（pid1 の実効値と全 16 種で一致）。
         let lines = limit_lines(pid);
@@ -1122,6 +1129,13 @@ mod linux {
         // 5 回の通し（本番の `identify_pid1` 経路。記録の cgroup 配置から期待 cgroup を導く）。
         for round in 1..=ROUNDS {
             one_round(&bundle, &a, round, &original_cgroup);
+            // #1466: 通しの後に exec 用の子 cgroup は削除済み（コンテナ cgroup 直下に残らない）。
+            let left: Vec<String> = fs::read_dir(&a.cgroup_dir)
+                .expect("read the container cgroup")
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|n| n.starts_with("exec-"))
+                .collect();
+            assert_eq!(left, Vec::<String>::new(), "round {round}");
         }
         // 拒否経路（TASK-163 追補）: `/dev/null` の差し替え（#1459）・インタープリタ経由のランタイム実行（#1458）。
         replaced_dev_null_is_rejected(&bundle, &a);

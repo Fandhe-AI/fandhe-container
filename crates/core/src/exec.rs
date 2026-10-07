@@ -120,7 +120,12 @@ mod violation;
 #[doc(hidden)]
 pub use capabilities::clear_supplementary_groups_for_test;
 pub use capabilities::{CapabilityReport, SupplementaryGroups};
-pub use cgroup_join::{ExecCgroupJoin, ExecCgroupJoinReport, join_cgroup, prepare_cgroup_join};
+#[cfg(feature = "exec-test-support")]
+pub use cgroup_join::remove_exec_child_cgroup_in;
+pub use cgroup_join::{
+    ExecCgroupJoin, ExecCgroupJoinReport, ExecCgroupName, ExecCgroupRemoval, ExecChildCgroup,
+    join_cgroup, prepare_cgroup_join, remove_exec_child_cgroup,
+};
 pub use container_env::{ContainerEnv, ExecCommand};
 pub use devices::{DeviceNodeOutcome, DeviceNodeStatus, DeviceReport, create_default_devices};
 pub use exec_command::{ExecChild, spawn_exec_command, spawn_exec_worker};

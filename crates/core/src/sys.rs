@@ -31,6 +31,8 @@
 //! 委譲 cgroup の検出と子 cgroup 作成（`crate::cgroups`。CORE-3・TASK-32.1・#158）は、
 //! `mkdirat(2)`・`unlinkat(2)`・`fstatfs(2)`（cgroup2 判定）と `O_NOFOLLOW` 付きの `openat(2)` を呼ぶために使う。
 //! rlimit の適用（`exec/rlimits.rs` の `apply_rlimits`。SUP-12・TASK-169.1・#526）は、fork 後の子で `prlimit(2)` を呼ぶために使う。
+//! 稼働中コンテナへの exec（`exec/exec_command.rs`。SUP-6・TASK-163.4・#503）は、exec 専用 worker を
+//! non-dumpable にするために `prctl(2)`（`PR_SET_DUMPABLE` / `PR_GET_DUMPABLE`）を呼ぶ。
 //! さらに `crate::audit_log` のカーネル監査フォールバック（SEC-4・TASK-41.5.2・#840）が、
 //! `socket(2)`（NETLINK_AUDIT）・`sendto(2)`・`recvfrom(2)`・`poll(2)` を呼ぶ。
 //! std だけでは提供されない syscall のみを持ち、検証（hostname の文字種・パス形式等）は呼び出し側の型
@@ -187,6 +189,11 @@ mod consts {
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
     pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
     pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
+
+    // include/uapi/linux/prctl.h の `PR_GET_DUMPABLE`（3）・`PR_SET_DUMPABLE`（4）。SUP-6・TASK-163.4。
+    // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const PR_GET_DUMPABLE: i32 = 3;
+    pub const PR_SET_DUMPABLE: i32 = 4;
 
     // include/uapi/asm-generic/resource.h の `RLIMIT_*`（0〜15。SUP-12・TASK-169.1）。
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
@@ -349,6 +356,11 @@ mod consts {
     pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
     pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
 
+    // include/uapi/linux/prctl.h の `PR_GET_DUMPABLE`（3）・`PR_SET_DUMPABLE`（4）。SUP-6・TASK-163.4。
+    // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const PR_GET_DUMPABLE: i32 = 3;
+    pub const PR_SET_DUMPABLE: i32 = 4;
+
     // include/uapi/asm-generic/resource.h の `RLIMIT_*`（0〜15。SUP-12・TASK-169.1）。
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
     pub const RLIMIT_CPU: i32 = 0;
@@ -477,6 +489,8 @@ mod consts {
 
     pub const PR_SET_NO_NEW_PRIVS: i32 = 0;
     pub const PR_GET_NO_NEW_PRIVS: i32 = 0;
+    pub const PR_GET_DUMPABLE: i32 = 0;
+    pub const PR_SET_DUMPABLE: i32 = 0;
 
     // rlimit の定数（対応外アーキテクチャでは各ラッパーが SUPPORTED で弾くため未使用）。
     pub const RLIMIT_CPU: i32 = 0;
@@ -1820,6 +1834,50 @@ pub(crate) fn no_new_privs_enabled() -> Result<bool, SysError> {
     }
 }
 
+/// 呼び出したプロセスを non-dumpable にする（`PR_SET_DUMPABLE` = 0。SUP-6・SEC-1・TASK-163.4・#503）。
+///
+/// `crate::exec` の exec 専用 worker（`spawn_exec_worker` の子）が、稼働中コンテナの namespace へ参加する前に
+/// 呼ぶ。exec の子は fork した時点でコンテナの PID namespace に入り、`close_range` と `execve` までの間
+/// コンテナ側の procfs から見える。dumpable のままだと、同じ uid のコンテナ内プロセスが `/proc/<pid>/fd` 等
+/// （`PTRACE_MODE_READ_FSCREDS`）や `ptrace` の attach を通じて、ホスト側の fd・メモリへ届く
+/// （CVE-2016-9962 型）。non-dumpable にすると、これらは対象の user namespace の `CAP_SYS_PTRACE` を持たない
+/// プロセスから拒否される。
+///
+/// フラグはプロセス（`mm`）単位で全スレッドに効き、fork で子へ継承される。`execve` は資格情報が変わらない
+/// 限り dumpable を 1 へ戻すため、コンテナ内で実行されるコマンド自身は launch 経路のプロセスと同じ扱いに
+/// なる。capability の削減（`capset`・bounding set の drop）は dumpable を変えない（カーネルが dumpable を
+/// 落とすのは uid / gid の変化か capability の増加のときだけ）。
+pub(crate) fn set_non_dumpable() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す
+    // （arg2 = 0 が `SUID_DUMP_DISABLE`。arg3〜5 はカーネルが参照しないが 0 に揃える）。呼び出した
+    // プロセスの `mm` のフラグを下げるだけで、メモリの内容・fd には触れない。
+    let rc = unsafe { prctl(consts::PR_SET_DUMPABLE, 0u64, 0u64, 0u64, 0u64) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 呼び出したプロセスが dumpable か（`PR_GET_DUMPABLE`。SUP-6・SEC-1・TASK-163.4・#503）。
+///
+/// `0`（`SUID_DUMP_DISABLE`）だけを non-dumpable として `Ok(false)` を返す。`1`（`SUID_DUMP_USER`）と
+/// `2`（`SUID_DUMP_ROOT`。`fs.suid_dumpable=2` のホストで資格情報が変わったプロセス）は、コンテナ側から
+/// procfs 経由で読める・core が書かれる状態を含むため `Ok(true)`。想定外の値は `EINVAL`（fail-closed）。
+pub(crate) fn is_dumpable() -> Result<bool, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は u64 の 0 を 4 つ渡す（カーネルは参照しない）。
+    // 読み取りだけで状態を変えない。
+    let rc = unsafe { prctl(consts::PR_GET_DUMPABLE, 0u64, 0u64, 0u64, 0u64) };
+    match rc {
+        -1 => Err(last_error()),
+        0 => Ok(false),
+        1 | 2 => Ok(true),
+        _ => Err(SysError::Os(EINVAL)),
+    }
+}
+
 /// `struct sock_fprog`（include/uapi/linux/filter.h）。LP64 では `len` の後に 6 バイトの
 /// パディングが入り、`filter` はオフセット 8、全体 16 バイト。
 #[repr(C)]
@@ -2432,6 +2490,27 @@ mod tests {
     fn core1_prctl_no_new_privs_consts_are_exact() {
         assert_eq!(consts::PR_SET_NO_NEW_PRIVS, 38);
         assert_eq!(consts::PR_GET_NO_NEW_PRIVS, 39);
+    }
+
+    /// SUP-6・TASK-163.4: `prctl` の dumpable オプションの具体値（include/uapi/linux/prctl.h）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sup6_task163_4_prctl_dumpable_consts_are_exact() {
+        assert_eq!(consts::PR_GET_DUMPABLE, 3);
+        assert_eq!(consts::PR_SET_DUMPABLE, 4);
+    }
+
+    /// SUP-6・SEC-1・TASK-163.4: テストプロセス自身は dumpable（`PR_GET_DUMPABLE` が 1）で、`/proc/self` 配下の
+    /// 所有者は自分の euid。dumpable はプロセス単位で元へ戻すと他のテストと競合するため、ここでは読み取り
+    /// だけを確かめる。`set_non_dumpable` の実 syscall と読み戻しは、単一スレッドの使い捨て worker で行う
+    /// supervisor の結合試験 `exec_timeout`（既定のテスト集合）が照合する。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sup6_task163_4_test_process_is_dumpable() {
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!(is_dumpable(), Ok(true));
+        let owner = std::fs::metadata("/proc/self/fd").unwrap().uid();
+        assert_eq!(owner, effective_uid());
     }
 
     /// CORE-1・TASK-27.4.3: 専用スレッドで set し、GET と /proc の値で確認する（冪等）。

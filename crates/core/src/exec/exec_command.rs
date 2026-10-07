@@ -9,16 +9,29 @@
 //! ```text
 //! reapply_restrictions(..) -> ExecRestrictionReport      // rlimit・capability・NO_NEW_PRIVS・Landlock・seccomp
 //!   .into_complete()       -> ExecReady                  // 唯一の証跡（値で渡る）
-//! spawn_exec_command(ready, &entry)                      // 親: cwd を照合済み root へ → fork して ContainerChild を返す
+//! spawn_exec_command(ready, &entry)                      // 親: non-dumpable を確認 → cwd を照合済み root へ → fork
 //!   子: close_range(3..) -> エントリポイントを fd で検査 -> 標準入出力を /dev/null へ -> execveat
 //! 親: ContainerChild::wait_timeout(timeout)              // 期限超過は SIGKILL + 回収（REPAIR-5）
 //! ```
+//!
+//! 上の全体は [`spawn_exec_worker`] が fork した使い捨ての worker の中で行う（worker は開始時に自分を
+//! non-dumpable にする。下記「コンテナから見える窓を閉じる」）。
 //!
 //! # 契約
 //!
 //! - **入口は [`ExecReady`] だけを値で受け取る**（SEC-1）。`ExecRestrictionReport`・真偽値を受け取る入口、
 //!   `ExecReady` を作る別経路は無い。制限（`NO_NEW_PRIVS`・Landlock・seccomp・capability の bounding set・
 //!   rlimit）は fork / execve を越えて継承されるため、「適用 → fork → execve」の順で子へ載る
+//! - **コンテナから見える窓を閉じる（non-dumpable。SEC-1・CVE-2016-9962 型の対策）**: exec の子は fork した
+//!   時点でコンテナの PID namespace に入り、`close_range` が終わるまで（標準入出力は `/dev/null` へ置換する
+//!   まで）ホスト側の fd を持ったままコンテナの procfs から見える。launch 経路の子は新しい PID namespace の
+//!   PID 1 で、その時点で namespace の中に他のプロセスが居ないため、この窓は exec にしか無い。dumpable の
+//!   ままだと、同じ uid のコンテナ内プロセスが `/proc/<pid>/fd`・`/proc/<pid>/mem`（`PTRACE_MODE_*`。Yama の
+//!   `ptrace_scope` は読み取り系を制限しない）からホスト側の fd・メモリへ届く。そこで worker は
+//!   `setns` より前（開始時）に `PR_SET_DUMPABLE` = 0 にして読み戻し、[`spawn_exec_command`] は fork の直前に
+//!   non-dumpable であることを確認して、そうでなければ fork せず `FailedPrecondition` にする（worker の外から
+//!   呼ぶ経路を作らない）。フラグは fork で子へ継承され、capability の削減では戻らない。`execve` が成功すると
+//!   カーネルが dumpable を 1 へ戻すため、実行されるコマンド自身は launch 経路のプロセスと同じ扱いになる
 //! - **fork の前に cwd を照合済みの root へ置く**: `setns(CLONE_NEWNS)` が付け替えた cwd は検証していないため、
 //!   `ExecReady` が持つ照合済みの `/` の fd へ `fchdir` する。コマンドの cwd はコンテナの rootfs の根になる
 //! - **fork の健全性**: 子を fork する直前に、`setns` 前に開いた status fd から `Threads: 1` を確認する
@@ -53,7 +66,9 @@ use super::{ContainerChild, Entrypoint, ExecError, ExecReady, IsolationStage};
 /// 証跡 `ready` を消費し、`entry` を稼働中コンテナの namespace・cgroup・制限の下で実行する子を fork する。
 ///
 /// 親（呼び出しプロセス）は子の pid を持つ [`ContainerChild`] を返すだけで、exec しない。単一スレッドの exec
-/// 専用プロセスからのみ呼ぶ（契約はモジュール doc）。失敗しても状態は戻せないため、呼び出し側は続行せず終了する。
+/// 専用プロセス（[`spawn_exec_worker`] の worker。non-dumpable）からのみ呼ぶ（契約はモジュール doc）。dumpable な
+/// プロセスから呼ぶと fork せず `FailedPrecondition`（段 `Spawn`）。失敗しても状態は戻せないため、呼び出し側は
+/// 続行せず終了する。
 ///
 /// `ExecReady` を経由しない入口は無い（`ExecRestrictionReport` は渡せない）:
 ///
@@ -81,6 +96,7 @@ pub fn spawn_exec_command(
             "exec must be started by the process that applied the restrictions",
         ));
     }
+    require_non_dumpable()?;
     change_dir_to_verified_root(root.as_fd())?;
     let pid = sys::fork_single_threaded_with(
         || threads.count() == Some(1),
@@ -103,13 +119,67 @@ pub fn spawn_exec_command(
 /// - `worker` は fork した子で実行され、戻り値（0〜255 に丸められる）で `_exit` する。panic は
 ///   `EXIT_SETUP_FAILED`。呼び出し元のフレームへは戻らない。結果の受け渡しは呼び出し側が fork 前に用意した
 ///   fd（pipe 等）で行う
-/// - この関数は制限を一切適用しない。子へ載る制限は、worker 自身が `reapply_restrictions` で作った
-///   [`ExecReady`] 経由でしか exec へ進めない（`ExecReady` は別プロセスへ渡せない。SEC-1）
+/// - worker は `worker` を実行する **前** に自分を non-dumpable にし、読み戻して確認する（モジュール doc
+///   「コンテナから見える窓を閉じる」。SEC-1）。設定・確認に失敗したら `worker` を実行せず
+///   `EXIT_SETUP_FAILED` で終了する（fail-closed）。それ以外の制限は適用しない。子へ載る制限は、worker 自身が
+///   `reapply_restrictions` で作った [`ExecReady`] 経由でしか exec へ進めない（`ExecReady` は別プロセスへ
+///   渡せない。SEC-1）
 /// - 戻り値の [`ContainerChild`] は `wait_timeout` で待つこと（`Drop` では kill / wait しない）
 pub fn spawn_exec_worker<F: FnOnce() -> i32>(worker: F) -> Result<ContainerChild, ExecError> {
-    let pid = sys::fork_single_threaded(worker, EXIT_SETUP_FAILED)
-        .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
+    let pid = sys::fork_single_threaded(
+        || match make_worker_non_dumpable() {
+            Ok(()) => worker(),
+            Err(code) => code,
+        },
+        EXIT_SETUP_FAILED,
+    )
+    .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
     Ok(ContainerChild::new(pid))
+}
+
+/// worker（fork した子）を non-dumpable にし、読み戻して確認する。失敗時は stderr に英語 1 行を出し、
+/// worker の終了コード（`EXIT_SETUP_FAILED`）を返す（呼び出し側は `worker` を実行しない）。
+fn make_worker_non_dumpable() -> Result<(), i32> {
+    use std::io::Write as _;
+    let outcome = sys::set_non_dumpable().and_then(|()| sys::is_dumpable());
+    if outcome == Ok(false) {
+        return Ok(());
+    }
+    let _ = writeln!(
+        std::io::stderr(),
+        "fandhe-container: the exec worker could not become non-dumpable; refusing to continue"
+    );
+    Err(EXIT_SETUP_FAILED)
+}
+
+/// 呼び出しプロセスが non-dumpable であることを確かめる（fork の直前。SEC-1）。本番ビルドの実装。
+///
+/// dumpable なら `FailedPrecondition`（段 `Spawn`）。確認できない場合も fork しない（fail-closed）。
+#[cfg(not(test))]
+fn require_non_dumpable() -> Result<(), ExecError> {
+    let dumpable = sys::is_dumpable()
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "prctl(PR_GET_DUMPABLE)"))?;
+    reject_dumpable(dumpable)
+}
+
+/// テストビルドの差し込み点（libtest のプロセスは dumpable で、プロセス全体の状態のため変えない）。
+/// 呼ばれたことを記録し、`tests::DUMPABLE` の値で本番と同じ判定を通す。
+#[cfg(test)]
+fn require_non_dumpable() -> Result<(), ExecError> {
+    tests::CALLS.with(|c| c.borrow_mut().push("prctl(PR_GET_DUMPABLE)"));
+    reject_dumpable(tests::DUMPABLE.with(std::cell::Cell::get))
+}
+
+/// dumpable なプロセスからの exec を拒否する（判定の本体。本番・テストで共有する）。
+fn reject_dumpable(dumpable: bool) -> Result<(), ExecError> {
+    if dumpable {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::Spawn,
+            "exec requires a non-dumpable process; start it from the exec worker",
+        ));
+    }
+    Ok(())
 }
 
 /// cwd を照合済みの root（`O_PATH` の fd）へ置く。本番ビルドの実装。
@@ -138,6 +208,8 @@ mod tests {
 
     thread_local! {
         pub(super) static CALLS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+        /// `require_non_dumpable` の差し込み点が返す値（既定は non-dumpable = worker の中）。
+        pub(super) static DUMPABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     fn take_calls() -> Vec<&'static str> {
@@ -191,8 +263,38 @@ mod tests {
         assert_eq!(take_calls(), Vec::<&str>::new());
     }
 
-    /// SUP-6・SEC-1・TASK-163.4: 保持した status fd が単一スレッドでないと示すなら、cwd を照合済み root へ
-    /// 置いた後で fork せずに `FailedPrecondition`（段 `Spawn`）。読めない場合も同じ（fail-closed）。
+    /// SUP-6・SEC-1・TASK-163.4: dumpable なプロセス（exec worker の外）からは、cwd も変えず fork もせずに
+    /// `FailedPrecondition`（段 `Spawn`）。コンテナの PID namespace に入る子を、コンテナ側から procfs 経由で
+    /// 読める状態で作らない（CVE-2016-9962 型）。
+    #[test]
+    fn sup6_task163_4_spawn_rejects_dumpable_process() {
+        take_calls();
+        DUMPABLE.with(|d| d.set(true));
+        let ready = ExecReady::for_test(root_fd(), status_with_threads(1), std::process::id());
+        let result = spawn_exec_command(ready, &entry());
+        DUMPABLE.with(|d| d.set(false));
+        let e = result.expect_err("dumpable");
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.stage, IsolationStage::Spawn);
+        assert_eq!(
+            e.message,
+            "exec requires a non-dumpable process; start it from the exec worker"
+        );
+        assert_eq!(e.violation, None);
+        assert_eq!(take_calls(), vec!["prctl(PR_GET_DUMPABLE)"]);
+    }
+
+    /// SUP-6・SEC-1・TASK-163.4: 判定の本体は dumpable のときだけ拒否する。
+    #[test]
+    fn sup6_task163_4_reject_dumpable_concrete_values() {
+        assert!(reject_dumpable(false).is_ok());
+        let e = reject_dumpable(true).expect_err("dumpable");
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.stage, IsolationStage::Spawn);
+    }
+
+    /// SUP-6・SEC-1・TASK-163.4: 保持した status fd が単一スレッドでないと示すなら、non-dumpable の確認と
+    /// cwd の設定の後で fork せずに `FailedPrecondition`（段 `Spawn`）。読めない場合も同じ（fail-closed）。
     #[test]
     fn sup6_task163_4_spawn_refuses_fork_when_not_single_threaded() {
         for source in [
@@ -204,7 +306,7 @@ mod tests {
             let e = spawn_exec_command(ready, &entry()).expect_err("multi-threaded");
             assert_eq!(e.code, ErrorCode::FailedPrecondition);
             assert_eq!(e.stage, IsolationStage::Spawn);
-            assert_eq!(take_calls(), vec!["fchdir(root)"]);
+            assert_eq!(take_calls(), vec!["prctl(PR_GET_DUMPABLE)", "fchdir(root)"]);
         }
     }
 }

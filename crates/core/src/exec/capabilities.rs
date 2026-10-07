@@ -151,9 +151,15 @@ pub enum SupplementaryGroups {
     /// 消去できず、**現状のまま残した**（`kept` 件）。`setgroups` が `EPERM` になり、かつ procfs の
     /// `/proc/<pid>/setgroups` で user namespace が `setgroups` を `deny` にしている（非特権で作った user
     /// namespace = rootless）と確認できた場合に限る。カーネルが意図して禁じている操作
-    /// （グループを落として「グループによる拒否」の ACL を回避させない）で、残るのは user namespace を作った
-    /// 非特権ユーザー自身の補助グループ（user namespace の中からは写像されず overflow gid に見える）であり、
-    /// そのユーザーが元から持つ権限を超えない。
+    /// （グループを落として「グループによる拒否」の ACL を回避させない）。
+    ///
+    /// **残るのは「このプロセスが持ち込んだ」補助グループ**（user namespace の中からは写像されず overflow gid に
+    /// 見える）で、誰のものかは経路で違う。launch の子は supervisor から fork されるため、user namespace を作った
+    /// 非特権ユーザー自身のグループであり、そのユーザーが元から持つ権限を超えない。稼働中コンテナへの exec では
+    /// **exec を起動したプロセスのグループ** で、user namespace の作成者と同じとは限らない（照合していない）。
+    /// そのため exec は、`setns` で user namespace へ入る **前**（初期 user namespace で `CAP_SETGID` を持つ間）に
+    /// [`clear_supplementary_groups_before_join`] で消去を試み、root・`sudo` 経由の起動者のグループを持ち込まない。
+    /// exec でこの値になるのは、起動者自身が既に `setgroups` を禁じた user namespace の中にいる場合だけである。
     KeptSetgroupsDenied {
         /// 残した件数。
         kept: usize,
@@ -387,6 +393,51 @@ fn apply_capabilities(
     })
 }
 
+/// 稼働中コンテナへの exec が、namespace へ参加する **前** に補助グループを空にする
+/// （SUP-6・SEC-1・SEC-5・TASK-163 追補・#1457）。本番ビルドの実装。
+///
+/// `reapply::prepare_exec_restrictions` が準備の最後に呼ぶ。exec 専用プロセスは、対象の user namespace へ
+/// `setns` した後では（その user namespace が `setgroups` を `deny` にしていれば）補助グループを消せず、exec を
+/// 起動したプロセス（root・`sudo` 経由・別のグループ集合のセッション）のホスト側の補助グループを持ち込んだまま
+/// コンテナ内でコマンドを動かすことになる。参加の前、まだ自分の user namespace で `CAP_SETGID` を持つ間に
+/// 消去しておけば、参加後の capability 削減は「元から空」になる。
+///
+/// 契約は [`drop_supplementary_groups`] と同じ（消去できず `deny` も確認できなければ拒否 = 準備の失敗で、
+/// 参加しない）。スレッド単位の syscall のため、前後で `Threads: 1` を確かめる。capability は変更しない。
+#[cfg(not(test))]
+pub(super) fn clear_supplementary_groups_before_join(
+    threads: &mut ThreadCountSource,
+    own_proc_dir: BorrowedFd<'_>,
+) -> Result<SupplementaryGroups, ExecError> {
+    clear_groups_single_threaded(&mut RealKernel {
+        threads,
+        own_proc_dir: Some(own_proc_dir),
+    })
+}
+
+/// 単一スレッド条件を前後で検査して [`drop_supplementary_groups`] を呼ぶ（事前検査は副作用の前）。
+fn clear_groups_single_threaded(
+    kernel: &mut impl CapKernel,
+) -> Result<SupplementaryGroups, ExecError> {
+    let stage = IsolationStage::CapabilityDrop;
+    if kernel.thread_count() != Some(1) {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            stage,
+            "clearing the supplementary groups requires a single-threaded process (Threads: 1)",
+        ));
+    }
+    let outcome = drop_supplementary_groups(kernel)?;
+    if kernel.thread_count() != Some(1) {
+        return Err(ExecError::new(
+            ErrorCode::Internal,
+            stage,
+            "process became multi-threaded while clearing the supplementary groups",
+        ));
+    }
+    Ok(outcome)
+}
+
 /// 結合試験専用: 呼び出したスレッドの補助グループを、本番と同じ関数・本物の syscall で空にする
 /// （SUP-6・SEC-1・SEC-5・TASK-163 追補・#1457）。
 ///
@@ -491,6 +542,27 @@ pub(super) mod testing {
         let mut k = Fake::new();
         k.drop_err = DROP_ERR.with(Cell::take);
         apply_capabilities_single_threaded(CapabilitySet::oci_default(), &mut k)
+    }
+
+    thread_local! {
+        static GROUPS_BEFORE_JOIN: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// 次の 1 回だけ、参加前の補助グループの偽物が持つ件数を設定する（使うと 0 へ戻る）。
+    pub(in crate::exec) fn fake_groups_before_join(count: usize) {
+        GROUPS_BEFORE_JOIN.with(|c| c.set(count));
+    }
+
+    /// `reapply.rs` が `cfg(test)` で呼ぶ偽物（libtest のプロセスの資格情報は変えない）。本物の判定ロジックを
+    /// 偽カーネルで走らせ、呼ばれたことを記録する。
+    pub(in crate::exec) fn clear_supplementary_groups_before_join(
+        _threads: &mut super::ThreadCountSource,
+        _own_proc_dir: std::os::fd::BorrowedFd<'_>,
+    ) -> Result<super::SupplementaryGroups, ExecError> {
+        crate::exec::no_new_privs::testing::rec("setgroups_before_join");
+        let mut k = Fake::new();
+        k.groups = GROUPS_BEFORE_JOIN.with(Cell::take);
+        super::clear_groups_single_threaded(&mut k)
     }
 
     /// `reapply.rs` が `cfg(test)` で呼ぶ偽物（スレッド数の取得元は偽カーネルが持つため無視する）。
@@ -850,6 +922,49 @@ mod tests {
         let fake = std::os::fd::OwnedFd::from(std::fs::File::open(&dir).unwrap());
         assert_eq!(read_setgroups_denied(Some(fake.as_fd())), None);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// SUP-6・SEC-1・SEC-5・TASK-163 追補（#1457）: 参加前の消去は単一スレッドでだけ行い、capability には触れない。
+    /// 初期 user namespace の root 相当（`setgroups` が通る）は消去され、非特権で消せず `deny` も確認できなければ
+    /// 準備の時点で拒否する（exec を起動した側のグループをコンテナへ持ち込まない）。
+    #[test]
+    fn sup6_sec1_task163_groups_are_cleared_before_joining_namespaces() {
+        let mut k = Fake::new();
+        k.groups = 5;
+        assert_eq!(
+            clear_groups_single_threaded(&mut k).unwrap(),
+            SupplementaryGroups::Cleared { cleared: 5 }
+        );
+        assert_eq!(k.calls, ["setgroups"]);
+        assert_eq!(k.bounding, (1u64 << 41) - 1);
+
+        // 起動者が既に `deny` の user namespace の中にいる場合だけ、残して記録する。
+        let mut k = Fake::new();
+        k.groups = 5;
+        k.setgroups_err = Some(SysError::Os(EPERM));
+        k.setgroups_denied = Some(true);
+        assert_eq!(
+            clear_groups_single_threaded(&mut k).unwrap(),
+            SupplementaryGroups::KeptSetgroupsDenied { kept: 5 }
+        );
+
+        let mut k = Fake::new();
+        k.groups = 5;
+        k.setgroups_err = Some(SysError::Os(EPERM));
+        let e = clear_groups_single_threaded(&mut k).unwrap_err();
+        assert_eq!(
+            (e.code, e.stage),
+            (ErrorCode::PermissionDenied, IsolationStage::CapabilityDrop)
+        );
+
+        // 単一スレッドでなければ何も呼ばない。
+        let mut k = Fake::new();
+        k.groups = 5;
+        k.threads = Some(2);
+        let e = clear_groups_single_threaded(&mut k).unwrap_err();
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(k.calls, Vec::<&str>::new());
+        assert_eq!(k.groups, 5);
     }
 
     /// SEC-1: capset に渡る値は effective = permitted = 既定集合、inheritable = 空。

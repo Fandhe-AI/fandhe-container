@@ -57,7 +57,10 @@
 //! - **補助グループは launch・exec とも空にする**（SEC-1・SEC-5・TASK-163 追補・#1457）: capability 削減の関数が
 //!   先頭で `setgroups(0)` を呼び、読み戻して確かめる（`exec/capabilities.rs` の `SupplementaryGroups`）。launch の
 //!   子は supervisor の、exec の子は exec を起動したプロセス（`sudo` 経由なら呼び出しユーザー）のホスト側の補助
-//!   グループを持ち越していたため、両者が一致しなかった。`config.json` の `process.user.additionalGids` は launch が
+//!   グループを持ち越していたため、両者が一致しなかった。**exec は namespace へ参加する前にも消去する**
+//!   （[`prepare_exec_restrictions`] の最後。対象の user namespace へ `setns` した後は `deny` で消せなくなり、
+//!   起動者のグループを持ち込むため。参加前に消せば参加後の削減は「元から空」になり、結果には参加前の消去を
+//!   残す）。`config.json` の `process.user.additionalGids` は launch が
 //!   非空を拒否するので「空」が唯一の指定で、解釈（指定したグループの付与）は launch・exec とも未実装。user
 //!   namespace が `setgroups` を `deny` にしている場合（rootless。`setns` の前に開いた自分の procfs の `setgroups` で
 //!   確認する。`EPERM` という errno だけでは判断しない）は消去できないため現状のまま残し、結果
@@ -173,10 +176,14 @@ use crate::sys;
 use crate::traits::types::ErrorCode;
 
 // テストでは本物（`Threads: 1` と実 syscall を要する）の代わりに偽物へ差し替える（`stages.rs` と同じ）。
-#[cfg(not(test))]
-use super::capabilities::apply_default_capabilities_with;
 #[cfg(test)]
-use super::capabilities::testing::apply_default_capabilities_with;
+use super::capabilities::testing::{
+    apply_default_capabilities_with, clear_supplementary_groups_before_join,
+};
+#[cfg(not(test))]
+use super::capabilities::{
+    apply_default_capabilities_with, clear_supplementary_groups_before_join,
+};
 #[cfg(not(test))]
 use super::landlock::apply_landlock_stage_with;
 #[cfg(test)]
@@ -199,6 +206,9 @@ pub struct ExecRestrictions {
     rlimits: Rlimits,
     /// 制限を準備した対象への束縛（参加後に別の対象へ適用させない）。
     binding: TargetBinding,
+    /// namespace へ参加する前に補助グループを空にした結果（[`prepare_exec_restrictions`] が行う。#1457）。
+    /// 観測用の経路・単体テストが直接組み立てた値では `None`（参加前の消去をしていない）。
+    groups_before_join: Option<SupplementaryGroups>,
 }
 
 /// 制限を exec の対象（pid1）へ束縛する材料（SUP-6・SEC-1・TASK-163.4）。
@@ -452,6 +462,9 @@ pub(super) struct ExecReadyParts {
 /// `oci_runtime::pin_bundle_rootfs` で固定したもの（`config` と同じ bundle のもの）を渡す。`target` は
 /// `join_namespaces` へ渡すのと同じ対象で、その mount namespace の識別子と実効 rlimit（対象の `limits`）を
 /// ここで記録する（参加後に別の対象へ適用させない。rlimit は launch と同じ値を exec プロセスへ載せる）。
+/// **準備の最後に、呼び出しプロセスの補助グループを空にする**（不可逆。参加の前に消去するため。#1457）。消去
+/// できず、user namespace の `setgroups` = `deny` も確認できなければ `PermissionDenied`（段 `CapabilityDrop`）で、
+/// 参加へ進ませない。
 /// ABI 検出・ルール生成の失敗（Landlock 未対応カーネルを含む）は `stage = Landlock` で拒否する
 /// （fail-closed。CORE-5）。`rootfs` が呼び出しプロセス自身の `/` と同じディレクトリなら、参加後の照合が
 /// 意味を持たないため違反記録 `rootfs_is_host_root` つきで拒否する（SEC-1）。
@@ -477,7 +490,32 @@ pub fn prepare_exec_restrictions(
         target_pid_ns,
         expected_cgroup: target.expected_cgroup_path().to_owned(),
     };
-    prepare_with_rootfs(config, rootfs, rlimits, binding)
+    let mut restrictions = prepare_with_rootfs(config, rootfs, rlimits, binding)?;
+    // 準備の最後（ここまでの失敗では何も変えない）に、補助グループを参加の **前** に空にする。対象の user
+    // namespace へ入った後では `setgroups` が `deny` で消せず、exec を起動したプロセスのホスト側の補助グループを
+    // 持ち込んでしまうため（#1457）。不可逆で、以後このプロセスは exec 専用として使い捨てる。
+    restrictions.groups_before_join = Some(clear_supplementary_groups_before_join(
+        &mut restrictions.threads,
+        restrictions.binding.proc_dir.as_fd(),
+    )?);
+    Ok(restrictions)
+}
+
+/// 参加前の消去の結果 `before` と、参加後の capability 削減の中での結果 `after` から、報告する値を決める。
+///
+/// 参加前に消去していれば、参加後は「元から空」になる。その場合は「消去した」ことと件数を残す。それ以外は
+/// 参加後の結果（最終的な状態）をそのまま使う。
+fn combine_group_outcomes(
+    before: Option<SupplementaryGroups>,
+    after: Option<SupplementaryGroups>,
+) -> Option<SupplementaryGroups> {
+    match (before, after) {
+        (
+            Some(cleared @ SupplementaryGroups::Cleared { .. }),
+            Some(SupplementaryGroups::AlreadyEmpty),
+        ) => Some(cleared),
+        (_, after) => after,
+    }
 }
 
 /// `rootfs` が呼び出しプロセス自身の `/` と別のディレクトリであることを確かめる
@@ -624,6 +662,7 @@ fn prepare_with_rootfs(
         rootfs,
         rlimits,
         binding,
+        groups_before_join: None,
     })
 }
 
@@ -726,6 +765,7 @@ fn reapply_inner(
         rootfs,
         rlimits,
         binding,
+        groups_before_join,
     } = restrictions;
     if owner_pid != std::process::id() {
         return Err(ExecError::new(
@@ -757,9 +797,12 @@ fn reapply_inner(
     let capability_bounding_dropped = capabilities
         .as_ref()
         .map_or(0, |report| report.bounding_dropped.len());
-    let supplementary_groups = capabilities
-        .as_ref()
-        .map(|report| report.supplementary_groups);
+    let supplementary_groups = combine_group_outcomes(
+        groups_before_join,
+        capabilities
+            .as_ref()
+            .map(|report| report.supplementary_groups),
+    );
     no_new_privs::apply_no_new_privs()?;
     let landlock = apply_landlock_stage_with(&landlock, &mut threads, root.as_fd())
         .map_err(|e| e.at_stage(IsolationStage::Landlock))?;
@@ -952,6 +995,7 @@ mod tests {
             rootfs: dir_fd(rootfs),
             rlimits: one_rlimit(),
             binding: own_binding(),
+            groups_before_join: None,
         }
     }
 
@@ -1075,6 +1119,56 @@ mod tests {
         let report = reapply_restrictions(restrictions(std::process::id())).expect("ok");
         assert_eq!(take(), expected);
         assert!(report.into_complete().is_ok());
+        let _ = crate::exec::rlimits::testing::take_sets();
+    }
+
+    /// SUP-6・SEC-1・SEC-5・TASK-163 追補（#1457）: 参加前に補助グループを消去していれば、参加後の capability 削減が
+    /// 「元から空」でも結果は「消去した」と件数を残す。それ以外は参加後の最終状態を報告する（参加前に消せず
+    /// 参加後も残った場合は「残した」、参加前の消去をしていない経路は参加後の結果そのまま）。
+    #[test]
+    fn sup6_sec1_task163_group_outcomes_before_and_after_join_are_combined() {
+        use SupplementaryGroups::{AlreadyEmpty, Cleared, KeptSetgroupsDenied};
+        let cleared = Cleared { cleared: 3 };
+        let kept = KeptSetgroupsDenied { kept: 3 };
+        for (before, after, want) in [
+            (Some(cleared), Some(AlreadyEmpty), Some(cleared)),
+            (Some(AlreadyEmpty), Some(AlreadyEmpty), Some(AlreadyEmpty)),
+            (Some(kept), Some(kept), Some(kept)),
+            (Some(kept), Some(Cleared { cleared: 3 }), Some(cleared)),
+            (None, Some(cleared), Some(cleared)),
+            (None, Some(AlreadyEmpty), Some(AlreadyEmpty)),
+            (Some(cleared), None, None),
+            (None, None, None),
+        ] {
+            assert_eq!(
+                combine_group_outcomes(before, after),
+                want,
+                "{before:?} {after:?}"
+            );
+        }
+
+        // 通しでも、参加前に消去した結果が報告へ残る（偽のカーネル。参加後は元から空）。
+        let _ = take();
+        let mut r = restrictions(std::process::id());
+        crate::exec::capabilities::testing::fake_groups_before_join(4);
+        r.groups_before_join = Some(
+            clear_supplementary_groups_before_join(&mut r.threads, r.binding.proc_dir.as_fd())
+                .expect("clear before join"),
+        );
+        assert_eq!(r.groups_before_join, Some(Cleared { cleared: 4 }));
+        let report = reapply_restrictions(r).expect("ok");
+        assert_eq!(report.supplementary_groups(), Some(Cleared { cleared: 4 }));
+        assert_eq!(
+            take(),
+            vec![
+                "setgroups_before_join",
+                "rlimits",
+                "capability_drop",
+                "no_new_privs",
+                "landlock",
+                "seccomp"
+            ]
+        );
         let _ = crate::exec::rlimits::testing::take_sets();
     }
 

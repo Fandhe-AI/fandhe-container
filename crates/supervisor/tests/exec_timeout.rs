@@ -5,7 +5,9 @@
 //! `run_in_worker_for_test` に渡し、期限内に構造化エラーが返ること・worker が回収されることを具体値で照合する。
 //! あわせて、worker が `work` を実行する前に non-dumpable になっていること（SEC-1。稼働中コンテナの PID
 //! namespace に入る子を、コンテナ側から procfs 経由で読める状態で作らない。CVE-2016-9962 型の対策）を、
-//! worker 自身の `/proc/self/fd` の所有者で照合する。root・実コンテナは不要で、既定のテスト集合で実行する。
+//! worker 自身の `/proc/self/fd` の所有者で照合する。さらに、worker が期限超過で強制終了されたとき、worker が
+//! 起動していた子（コマンド相当）も親の死亡シグナルで停止すること（REPAIR-5。孤児を残さない）を、入れ子の
+//! worker で照合する。root・実コンテナは不要で、既定のテスト集合で実行する。
 //!
 //! fork は呼び出しプロセスが単一スレッドであることを要求するため、libtest（マルチスレッド）ではなく
 //! `harness = false` の単一スレッド `main` で動かす。
@@ -30,6 +32,7 @@ mod linux {
     pub fn run() {
         worker_is_non_dumpable_before_work_runs();
         hung_step_times_out_within_deadline();
+        killed_worker_takes_its_child_down();
         failing_step_error_is_returned_as_is();
         panicking_worker_is_reported_as_internal();
         println!("exec_timeout: all scenarios passed");
@@ -101,6 +104,79 @@ mod linux {
             elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(5),
             "elapsed {elapsed:?}"
         );
+    }
+
+    /// `/proc/<pid>/stat` の `(状態, 開始時刻)`。プロセスが無ければ `None`。開始時刻は pid の再利用と区別する
+    /// ために使う（`comm` は括弧を含み得るため、最後の `)` より後ろを読む）。
+    fn proc_state_and_start(pid: u32) -> Option<(String, String)> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let rest = stat.get(stat.rfind(')')? + 1..)?;
+        let mut fields = rest.split_whitespace();
+        let state = fields.next()?.to_owned();
+        // 状態（3 番目）の後、開始時刻は 22 番目のフィールド。
+        let start = fields.nth(18)?.to_owned();
+        Some((state, start))
+    }
+
+    /// SUP-6・REPAIR-5・TASK-163.4: worker が期限超過で `SIGKILL` されると、worker が起動していた子も停止する。
+    ///
+    /// `run_command` では worker の子が稼働中コンテナ内のコマンドにあたる。ここでは worker（外側）の中で
+    /// もう 1 段 worker（内側。コマンド相当）を起動し、内側が自分の pid と開始時刻を書いて眠り続ける状況を作る。
+    /// 外側は内側の終了を待ち続けるため期限を過ぎ、呼び出しプロセスが外側を `SIGKILL` して `Timeout` を返す。
+    /// 内側は親（外側）の死亡シグナルで終了していなければならない（孤児として動き続けない）。内側は失敗時に
+    /// 残り続けないよう、自分でも 60 秒で終わる。
+    fn killed_worker_takes_its_child_down() {
+        let record = std::env::temp_dir().join(format!(
+            "fandhe-exec-timeout-child-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos())
+        ));
+        let record_tmp = record.with_extension("tmp");
+        let err = run_in_worker_for_test(
+            Duration::from_millis(1500),
+            Duration::from_millis(300),
+            || -> Result<ExecOutcome, TraitError> {
+                run_in_worker_for_test(
+                    Duration::from_secs(600),
+                    Duration::from_secs(1),
+                    || -> Result<ExecOutcome, TraitError> {
+                        let pid = std::process::id();
+                        let start = proc_state_and_start(pid).map_or_else(String::new, |s| s.1);
+                        let _ = std::fs::write(&record_tmp, format!("{pid} {start}"));
+                        let _ = std::fs::rename(&record_tmp, &record);
+                        let deadline = Instant::now() + Duration::from_secs(60);
+                        while Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                        Err(TraitError::new(ErrorCode::Internal, "inner child survived"))
+                    },
+                )
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert_eq!(err.message(), "exec timed out; the exec worker was killed");
+        let text = std::fs::read_to_string(&record).expect("the inner child must have started");
+        let _ = std::fs::remove_file(&record);
+        let (pid, start) = text.split_once(' ').expect("pid and start time");
+        let pid: u32 = pid.parse().expect("inner child pid");
+        assert!(!start.is_empty(), "inner child start time must be recorded");
+        // 内側は、終了済み（エントリなし・ゾンビ）か、同じ pid が別プロセスに再利用されている（開始時刻が違う）
+        // かのどちらかになる。親の死亡シグナルは非同期に届くため、短い期限つきで待つ。
+        let gone = |pid: u32| match proc_state_and_start(pid) {
+            None => true,
+            Some((state, now)) => state == "Z" || state == "X" || now != start,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !gone(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "the worker's child (pid {pid}) is still running after the worker was killed"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// worker が返したエラーは `code` / `message` のまま親へ届く（改行は空白へ置換される）。

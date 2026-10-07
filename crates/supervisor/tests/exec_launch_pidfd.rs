@@ -22,16 +22,28 @@ fn main() {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::num::NonZeroU32;
+    use std::sync::Mutex;
     use std::time::Duration;
 
+    use fandhe_container_core::audit_log::{AuditRecord, AuditSink};
     use fandhe_container_core::exec::{ContainerChild, spawn_exec_worker};
     use fandhe_container_core::traits::{
         CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, ErrorCode, StateRecord,
-        StateRevision,
+        StateRevision, TraitError,
     };
     use fandhe_container_supervisor::exec::{
         ExecRequest, identify_pid1_with_pidfd, run_command_with_pidfd,
     };
+
+    /// 記録された監査レコードを数えるメモリ sink（SEC-4・#1465）。
+    struct VecSink(Mutex<Vec<AuditRecord>>);
+
+    impl AuditSink for VecSink {
+        fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+            self.0.lock().expect("sink lock").push(record.clone());
+            Ok(())
+        }
+    }
 
     pub fn run() {
         let child = spawn_exec_worker(|| {
@@ -113,8 +125,13 @@ mod linux {
     ) {
         let request = ExecRequest::new("/bin/true", ["true"]).unwrap();
         let rec = record(child.pid() + 1, true);
-        let err =
-            run_command_with_pidfd(&rec, pidfd, &request, Duration::from_secs(20)).unwrap_err();
+        let sink = VecSink(Mutex::new(Vec::new()));
+        let rejected =
+            run_command_with_pidfd(&rec, pidfd, &request, Duration::from_secs(20), &sink)
+                .unwrap_err();
+        // 拒否は 1 件だけ監査へ記録される（SEC-4・#1465）。
+        assert_eq!(sink.0.lock().expect("sink lock").len(), 1);
+        let err = rejected.error;
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert!(
             err.message()
@@ -123,8 +140,11 @@ mod linux {
             err.message()
         );
         let rec = record(child.pid(), true);
-        let err =
-            run_command_with_pidfd(&rec, pidfd, &request, Duration::from_secs(20)).unwrap_err();
+        let rejected =
+            run_command_with_pidfd(&rec, pidfd, &request, Duration::from_secs(20), &sink)
+                .unwrap_err();
+        assert_eq!(sink.0.lock().expect("sink lock").len(), 2);
+        let err = rejected.error;
         assert!(
             err.message()
                 .contains("exec_target/exec_target_not_nested_pid1, SUP-6"),

@@ -17,7 +17,7 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! 永続化は TASK-41.5 系（#839）、本番 launcher・fork 後の子プロセスへの `AuditSink` の引き回しは
+//! ファイル永続化は実装済み（`AuditFileWriter`・#839）。本番 launcher・fork 後の子プロセスへの `AuditSink` の引き回しは
 //! 後続（TASK-29 / TASK-157 系）。現時点で本番経路からは呼ばれない。
 
 use std::path::Path;

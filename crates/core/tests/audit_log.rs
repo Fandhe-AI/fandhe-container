@@ -422,3 +422,30 @@ fn sec4_task41_6_sink_failure_does_not_override_rejection() {
     let err = record_seccomp_denial(&report, fixed_ts(), &FailingSink).unwrap_err();
     assert_eq!(err.code(), ErrorCode::Internal);
 }
+
+/// SEC-4・SUP-6・TASK-163 追補（#1465）: exec の対象の拒否は層 `exec_target` のレコード 1 件になり、ワイヤー表現は
+/// パスが null・reason が理由コード。exec 対象でない理由は記録されない。
+#[cfg(target_os = "linux")]
+#[test]
+fn sec4_sup6_task163_exec_target_rejection_is_one_record_without_path() {
+    use fandhe_container_core::exec::{ViolationReason, record_exec_target_rejection};
+
+    let sink = BoundedSink::new();
+    let r =
+        record_exec_target_rejection("rejected", ViolationReason::ExecTargetCgroupMismatch, &sink);
+    assert_eq!(r.error, "rejected");
+    assert_eq!(r.delivery, AuditDelivery::Recorded);
+    let recs = sink.snapshot();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].layer(), AuditLayer::ExecTarget);
+    assert_eq!(recs[0].path(), None);
+    assert_eq!(recs[0].pid().get(), std::process::id());
+    let j = wire(&recs[0]);
+    assert_eq!(j["layer"], "exec_target");
+    assert!(j["path"].is_null());
+    assert_eq!(j["reason"], "exec_target_cgroup_mismatch");
+
+    let r = record_exec_target_rejection("x", ViolationReason::EntrypointIsRuntimeBinary, &sink);
+    assert_eq!(r.delivery, AuditDelivery::NotApplicable);
+    assert_eq!(sink.snapshot().len(), 1);
+}

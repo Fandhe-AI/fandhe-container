@@ -149,10 +149,9 @@
 //! - 本番 launcher（`oci_runtime` の `ProcessLauncher` 実装）は未結線で、launch 経路の Landlock も本番では
 //!   まだ適用されない（`exec/landlock.rs`）。exec と launch の一致は「同じ `config.json` から同じ関数で導いた
 //!   ルールを、同じ rootfs のディレクトリを起点に同じ規則で辿る」ことで担保する
-//! - 拒否の違反記録（種別 `exec_target`）を監査ログへ保存する配線（SEC-4）。ファイルへの書き込み経路
-//!   （`audit_log::AuditFileWriter`。TASK-41.5.1）は実装済みだが、`AuditLayer` に exec の対象を表す層が無く、
-//!   exec 専用プロセスへ `AuditSink` を渡す経路も無い。現状は `ExecError::violation` に載せて返すところまでで、
-//!   supervisor が種別・理由コード・ビヘイビア ID をエラーメッセージへ残す
+//! - 拒否の違反記録（種別 `exec_target`）の監査ログへの保存のうち、本番の sink の実体の生成と CLI からの
+//!   受け渡し（SEC-4）。層 `AuditLayer::ExecTarget` と supervisor `run_command`（親プロセス側）の 1 拒否 1 件の
+//!   記録は実装済み（#1465）。この段関数単体は記録せず、`ExecError::violation` に載せて返す
 //! - `--ulimit` の指定値の記録（`state.json`）。現状は pid1 の実効値を写して代替する（限界は上記）
 //! - 実機前提の通し試験 `tests/exec.rs` の実行結果の記録（CI ではビルドのみ）
 

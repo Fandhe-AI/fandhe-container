@@ -2491,7 +2491,7 @@ mod tests {
     /// が `SendObserver::on_send` へ渡す `SendEventError::message` は、
     /// `PipelineClient::send` が最終的に返す `IoError::message()` と同じヒープ
     /// バッファを指す借用であり、複製されていないことを `ptr::eq` とアドレス・
-    /// 長さの一致で照合する。複製が起きていれば、1 MiB のメッセージに対して
+    /// 長さの一致で照合する。複製が起きていれば、`IoError` の上限（1024 バイト）を超える 1 MiB の入力に対して
     /// このアドレス一致は成立しない。
     #[test]
     fn repair5_repair12_notify_borrows_error_message_without_copying_huge_message() {
@@ -2502,7 +2502,9 @@ mod tests {
         let err = client
             .send(FrameKind::Write, &[1], test_timeout())
             .expect_err("the mock sender always fails");
-        assert_eq!(err.message().len(), HUGE_MESSAGE_LEN);
+        // #1116: `IoError::new` が 1 MiB を上限へ切り詰める。
+        assert_eq!(err.message().len(), crate::MAX_IO_ERROR_MESSAGE_BYTES);
+        assert!(err.message_truncated());
 
         let (captured_addr, captured_len) = client
             .observer()

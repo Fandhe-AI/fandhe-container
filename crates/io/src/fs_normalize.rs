@@ -117,6 +117,19 @@ use crate::error::{IoError, IoErrorCode};
 /// ため、char 境界で切り詰める。
 pub const MAX_COLLISION_MESSAGE_PATH_CHARS: usize = 128;
 
+/// [`quote_for_message`] がエスケープ後に 1 パスへ割り当てる最大バイト数（引用符・
+/// 切り詰めの `...` を除く）。マルチバイト文字・エスケープ展開（`\u{..}`）を含む
+/// 最悪ケースでも、衝突メッセージ（パス 4 つ埋め込み）が
+/// [`crate::MAX_IO_ERROR_MESSAGE_BYTES`] に収まり末尾の要素名が失われないようにする
+/// （#1116・IO-5）。
+pub const MAX_COLLISION_MESSAGE_PATH_BYTES: usize = 200;
+
+// 4 パス × (上限 + 引用符 2 + `...` 3) + 固定文言（約 100 バイト）が IoError の上限に
+// 収まることを固定する。
+const _: () = assert!(
+    4 * (MAX_COLLISION_MESSAGE_PATH_BYTES + 5) + 128 <= crate::error::MAX_IO_ERROR_MESSAGE_BYTES
+);
+
 /// ホストパスの長さ上限（UTF-16 コード単位。IO-5・WIN-4・TASK-20.1）。
 /// この値ちょうどは許容し、超えると [`check_host_path_length`] がエラーにする。
 pub const MAX_HOST_PATH_CHARS: usize = 260;
@@ -354,20 +367,31 @@ fn validate_guest_relative_path(path: &str) -> Result<Vec<&str>, IoError> {
 /// エラーメッセージへ埋め込むためにパスを衛生化する（改行・制御文字による
 /// ログ注入の防止・巨大メッセージの防止。security.md「インジェクション」観点）。
 ///
-/// `{:?}`（`Debug` によるエスケープ）でパスを整形したうえで、char 境界で
-/// [`MAX_COLLISION_MESSAGE_PATH_CHARS`] 文字までに切り詰める。切り詰めた
-/// 場合は末尾に `...` を付ける。添字アクセス（`[]`）ではなく `chars().take`
-/// を使い、マルチバイト文字の境界を壊さない。
+/// `{:?}`（`Debug` によるエスケープ）でパスを整形する。char 境界で
+/// [`MAX_COLLISION_MESSAGE_PATH_CHARS`] 文字、かつエスケープ後
+/// [`MAX_COLLISION_MESSAGE_PATH_BYTES`] バイトまでに切り詰め、切り詰めた場合は
+/// 末尾に `...` を付ける。添字アクセス（`[]`）は使わず、マルチバイト文字の境界を
+/// 壊さない。
 pub(crate) fn quote_for_message(path: &str) -> String {
-    let mut truncated: String = path
-        .chars()
-        .take(MAX_COLLISION_MESSAGE_PATH_CHARS)
-        .collect();
-    let was_truncated = path.chars().count() > MAX_COLLISION_MESSAGE_PATH_CHARS;
-    if was_truncated {
-        truncated.push_str("...");
+    let mut kept = String::new();
+    let mut escaped_bytes = 0usize;
+    let mut was_truncated = false;
+    for (index, c) in path.chars().enumerate() {
+        // 1 文字を `Debug` エスケープした後のバイト数（前後の引用符 2 バイトを除く）。
+        let cost = format!("{:?}", c.to_string()).len().saturating_sub(2);
+        if index >= MAX_COLLISION_MESSAGE_PATH_CHARS
+            || escaped_bytes.saturating_add(cost) > MAX_COLLISION_MESSAGE_PATH_BYTES
+        {
+            was_truncated = true;
+            break;
+        }
+        kept.push(c);
+        escaped_bytes += cost;
     }
-    format!("{truncated:?}")
+    if was_truncated {
+        kept.push_str("...");
+    }
+    format!("{kept:?}")
 }
 
 /// 衝突を表す構造化エラーを組み立てる。パス・コンポーネントはすべて
@@ -568,6 +592,39 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// IO-5・ERR-1（#1116）: マルチバイト・エスケープ展開の最悪ケースでも衝突メッセージが
+    /// `IoError` の上限に収まり、末尾の要素名（existing component）が失われない。
+    #[test]
+    fn io5_collision_error_fits_limit_for_worst_case_paths() {
+        let fillers = ["あ", "\u{1F600}", "\u{1b}", "a"];
+        for filler in fillers {
+            let long = filler.repeat(300);
+            let err = collision_error(&long, &long, &long, &long);
+            assert!(
+                !err.message_truncated(),
+                "filler {filler:?}: len={}",
+                err.message().len()
+            );
+            assert!(err.message().ends_with("differ only by case)"));
+            assert!(err.message().len() <= crate::MAX_IO_ERROR_MESSAGE_BYTES);
+        }
+    }
+
+    /// IO-5（#1116）: 短いパスの引用は従来どおり（切り詰めなし）。
+    #[test]
+    fn io5_quote_for_message_short_path_unchanged() {
+        assert_eq!(quote_for_message("a/b"), "\"a/b\"");
+        assert_eq!(quote_for_message("あ"), "\"あ\"");
+        assert_eq!(
+            quote_for_message(&"a".repeat(128)),
+            format!("\"{}\"", "a".repeat(128))
+        );
+        assert_eq!(
+            quote_for_message(&"a".repeat(129)),
+            format!("\"{}...\"", "a".repeat(128))
+        );
+    }
     use std::path::PathBuf;
 
     /// IO-5: 巨大パスでもエラーメッセージ用の変換は先頭のみ（有界）で、切り詰め表示になる。

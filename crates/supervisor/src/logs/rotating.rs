@@ -331,12 +331,14 @@ impl RotatingFileSink {
     /// 削除数・所要時間を構造化 1 行（JSON）で stderr へ出す（REPAIR-4。パス・errno は含めない。ERR-1）。
     pub fn remove_all(dir: &Path, id: &ContainerId) -> Result<RemovedLogs, TraitError> {
         let started = Instant::now();
-        let result = Self::remove_all_inner(dir, id);
-        let (outcome, code, removed) = match &result {
-            Ok(r) => ("ok", "", r.log_files()),
-            Err(e) => ("error", e.code().as_str(), 0),
+        let (removed, result) = Self::remove_all_inner(dir, id);
+        let (outcome, code) = match &result {
+            Ok(_) => ("ok", ""),
+            Err(e) => ("error", e.code().as_str()),
         };
-        eprintln!(
+        // eprintln! は stderr 書き込み失敗で panic するため、結果を無視する writeln! で出す（panic しない）。
+        let _ = writeln!(
+            std::io::stderr().lock(),
             "{{\"component\":\"supervisor.logs\",\"operation\":\"remove_all\",\"result\":\"{}\",\"code\":\"{}\",\"removed_log_files\":{},\"elapsed_us\":{}}}",
             outcome,
             code,
@@ -346,20 +348,33 @@ impl RotatingFileSink {
         result
     }
 
-    /// [`Self::remove_all`] の本体（観測は呼び出し側が全結果で行う）。
-    fn remove_all_inner(dir: &Path, id: &ContainerId) -> Result<RemovedLogs, TraitError> {
-        let dir = check_dir(dir)?;
+    /// [`Self::remove_all`] の本体。実際に消せた数と結果を別々に返す（失敗時も削除数を観測に出すため）。
+    fn remove_all_inner(dir: &Path, id: &ContainerId) -> (u32, Result<RemovedLogs, TraitError>) {
+        let dir = match check_dir(dir) {
+            Ok(d) => d,
+            Err(e) => return (0, Err(e)),
+        };
         let base = format!("{}.log", encode_file_stem(id.as_str()));
         if base.len().saturating_add(LOCK_SUFFIX.len()) > MAX_FILE_NAME_BYTES {
-            return Err(invalid("container id is too long for log file names"));
+            return (
+                0,
+                Err(invalid("container id is too long for log file names")),
+            );
         }
-        let lock = acquire_lock(&dir, &base)?;
-        let removed = remove_log_files(&dir, &base);
+        let lock = match acquire_lock(&dir, &base) {
+            Ok(l) => l,
+            Err(e) => return (0, Err(e)),
+        };
+        let (removed, log_result) = remove_log_files(&dir, &base);
         let lock_removed = remove_lock_file(lock, &lock_path(&dir, &base), &dir);
         // ログ削除側の失敗を優先して返す。
-        let removed = removed?;
-        lock_removed.map_err(|_| internal("log lock removal failed"))?;
-        Ok(removed)
+        if let Err(e) = log_result {
+            return (removed, Err(e));
+        }
+        if lock_removed.is_err() {
+            return (removed, Err(internal("log lock removal failed")));
+        }
+        (removed, Ok(RemovedLogs { log_files: removed }))
     }
 
     /// これまでのローテーション回数（観測用。REPAIR-4）。open 時の退避は数えない。
@@ -772,21 +787,26 @@ impl RemovedLogs {
 }
 
 /// ロック保持中に、検証してから現在ログ・世代を消す。検証で拒否したときは 1 つも消さない。
-fn remove_log_files(dir: &Path, base: &str) -> Result<RemovedLogs, TraitError> {
+///
+/// 実際に消せた数と結果を別々に返す（途中で失敗しても削除済みの数を観測に出すため）。
+fn remove_log_files(dir: &Path, base: &str) -> (u32, Result<(), TraitError>) {
     // symlink は辿らずリンク自体を消すので検証では許容する（ディレクトリだけ拒否）。
-    let names = collect_log_names(dir, base, false)?;
+    let names = match collect_log_names(dir, base, false) {
+        Ok(n) => n,
+        Err(e) => return (0, Err(e)),
+    };
     let mut removed = 0u32;
     for (_, name) in &names {
         match fs::remove_file(dir.join(name)) {
             Ok(()) => removed = removed.saturating_add(1),
             Err(e) if e.kind() == ErrorKind::NotFound => {}
-            Err(_) => return Err(internal("log removal failed")),
+            Err(_) => return (removed, Err(internal("log removal failed"))),
         }
     }
-    if removed > 0 {
-        sync_dir(dir).map_err(|_| internal("log removal failed"))?;
+    if removed > 0 && sync_dir(dir).is_err() {
+        return (removed, Err(internal("log removal failed")));
     }
-    Ok(RemovedLogs { log_files: removed })
+    (removed, Ok(()))
 }
 
 /// この ID のログファイルのパスを古い順（世代番号の大きい順 → 現在ログ）に列挙する。

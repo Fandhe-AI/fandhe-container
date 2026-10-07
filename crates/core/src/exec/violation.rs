@@ -4,7 +4,9 @@
 //!
 //! `crate::exec` の各拒否経路（`plan` / `plan_rootful_host_root` / `isolate` 系の前提、
 //! `MountIsolation::establish` の前提、`mount_proc` の証跡不一致・パス検証・shared 伝播、
-//! `prepare_rootfs` / `pivot_root` の証跡不一致・rootfs パス検証・shared 伝播。TASK-27.3・#135）は、
+//! `prepare_rootfs` / `pivot_root` の証跡不一致・rootfs パス検証・shared 伝播。TASK-27.3・#135、
+//! `setns` 参加前の exec の対象の検証〔種別 `exec_target`。入れ子の PID 1 でない・cgroup 不一致・呼び出し側と
+//! 同じ pid / mnt namespace。SUP-6・SEC-1・TASK-163.1・#500〕）は、
 //! 拒否時に [`IsolationViolation`] を `ExecError::violation` に載せて呼び出し側へ返す。
 //!
 //! **本モジュールは記録の経路のみを提供する。** マウント層の違反から `Mount` 監査イベントへの
@@ -54,6 +56,8 @@ pub enum ViolationKind {
     RootfsPivot,
     /// exec 直前のエントリポイントの検証（ランタイム自身のホスト側バイナリの指定等。TASK-27.4.1）。
     Entrypoint,
+    /// 稼働中コンテナへの exec の対象（pid1）の検証（`setns` 参加前。SUP-6・SEC-1・TASK-163.1）。
+    ExecTarget,
 }
 
 impl ViolationKind {
@@ -67,6 +71,7 @@ impl ViolationKind {
             Self::SharedPropagation => "shared_propagation",
             Self::RootfsPivot => "rootfs_pivot",
             Self::Entrypoint => "entrypoint",
+            Self::ExecTarget => "exec_target",
         }
     }
 }
@@ -147,6 +152,14 @@ pub enum ViolationReason {
     /// エントリポイントがランタイム自身の実行ファイル（`/proc/self/exe`）と同一の inode
     /// （CVE-2019-5736 型の多層防御。TASK-27.4.1）。
     EntrypointIsRuntimeBinary,
+    /// exec の対象が入れ子の PID namespace の PID 1 でない（`NSpid` が 2 要素・末尾 1 でない。SUP-6）。
+    ExecTargetNotNestedPid1,
+    /// exec の対象の所属 cgroup が、記録から導いた期待パスと一致しない（pid 再利用・移動。SEC-1）。
+    ExecTargetCgroupMismatch,
+    /// exec の対象が呼び出し側と同じ PID namespace にいる（参加しても分離境界を越えない対象。SUP-6）。
+    ExecTargetSharesPidNamespace,
+    /// exec の対象が呼び出し側と同じ mount namespace にいる（同上）。
+    ExecTargetSharesMountNamespace,
 }
 
 impl ViolationReason {
@@ -187,6 +200,10 @@ impl ViolationReason {
             Self::RootfsHasSubmounts => "rootfs_has_submounts",
             Self::RootfsHasExternalHardlink => "rootfs_has_external_hardlink",
             Self::EntrypointIsRuntimeBinary => "entrypoint_is_runtime_binary",
+            Self::ExecTargetNotNestedPid1 => "exec_target_not_nested_pid1",
+            Self::ExecTargetCgroupMismatch => "exec_target_cgroup_mismatch",
+            Self::ExecTargetSharesPidNamespace => "exec_target_shares_pid_namespace",
+            Self::ExecTargetSharesMountNamespace => "exec_target_shares_mount_namespace",
         }
     }
 
@@ -228,6 +245,10 @@ impl ViolationReason {
             | Self::RootfsHasSubmounts
             | Self::RootfsHasExternalHardlink => ViolationKind::RootfsPivot,
             Self::EntrypointIsRuntimeBinary => ViolationKind::Entrypoint,
+            Self::ExecTargetNotNestedPid1
+            | Self::ExecTargetCgroupMismatch
+            | Self::ExecTargetSharesPidNamespace
+            | Self::ExecTargetSharesMountNamespace => ViolationKind::ExecTarget,
         }
     }
 
@@ -237,6 +258,10 @@ impl ViolationReason {
             Self::UserNamespaceRequired | Self::HostRootIdentityMapping | Self::IdentityChanged => {
                 "SEC-5"
             }
+            Self::ExecTargetCgroupMismatch => "SEC-1",
+            Self::ExecTargetNotNestedPid1
+            | Self::ExecTargetSharesPidNamespace
+            | Self::ExecTargetSharesMountNamespace => "SUP-6",
             _ => "CORE-1",
         }
     }
@@ -277,12 +302,17 @@ impl ViolationReason {
             | Self::RootfsOnSharedMount
             | Self::RootfsMoved
             | Self::RootfsHasSubmounts
-            | Self::RootfsHasExternalHardlink => ErrorCode::FailedPrecondition,
+            | Self::RootfsHasExternalHardlink
+            | Self::ExecTargetNotNestedPid1
+            | Self::ExecTargetCgroupMismatch
+            | Self::ExecTargetSharesPidNamespace
+            | Self::ExecTargetSharesMountNamespace => ErrorCode::FailedPrecondition,
             Self::EntrypointIsRuntimeBinary => ErrorCode::PermissionDenied,
         }
     }
 
-    /// 拒否した段の既定（計画は `Validate`、rootfs 指定は `PrepareRootfs`、それ以外は `MountProc`）。
+    /// 拒否した段の既定（計画は `Validate`、rootfs 指定は `PrepareRootfs`、エントリポイントは `Exec`、
+    /// exec の対象は `SetNs`、それ以外は `MountProc`）。
     /// `prepare_rootfs` / `pivot_root` が共通のパス理由を返すときは、呼び出した段を
     /// `ExecError::from_violation_at` で明示する。
     pub(super) fn stage(self) -> IsolationStage {
@@ -290,6 +320,7 @@ impl ViolationReason {
             ViolationKind::PlanRejected => IsolationStage::Validate,
             ViolationKind::RootfsPivot => IsolationStage::PrepareRootfs,
             ViolationKind::Entrypoint => IsolationStage::Exec,
+            ViolationKind::ExecTarget => IsolationStage::SetNs,
             _ => IsolationStage::MountProc,
         }
     }
@@ -371,6 +402,18 @@ impl ViolationReason {
             Self::EntrypointIsRuntimeBinary => {
                 "the entrypoint is the runtime's own executable; refusing to exec it"
             }
+            Self::ExecTargetNotNestedPid1 => {
+                "the exec target is not PID 1 of a directly nested PID namespace"
+            }
+            Self::ExecTargetCgroupMismatch => {
+                "the exec target does not belong to the recorded container cgroup"
+            }
+            Self::ExecTargetSharesPidNamespace => {
+                "the exec target shares the PID namespace with the caller; refusing to join"
+            }
+            Self::ExecTargetSharesMountNamespace => {
+                "the exec target shares the mount namespace with the caller; refusing to join"
+            }
         }
     }
 }
@@ -378,7 +421,7 @@ impl ViolationReason {
 /// 違反記録の対象として保持する文字列の上限（文字数。超過分は切り詰める）。
 pub const VIOLATION_SUBJECT_MAX_CHARS: usize = 256;
 
-/// 違反の対象（呼び出し側が渡したパス）。制御文字とバックスラッシュはエスケープ済みで、
+/// 違反の対象（呼び出し側が渡したパス。exec の対象の cgroup 不一致では、記録から導いた期待 cgroup パス）。制御文字とバックスラッシュはエスケープ済みで、
 /// 長さは [`VIOLATION_SUBJECT_MAX_CHARS`] 文字以下（ログ注入・無制限確保を防ぐ）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViolationSubject {
@@ -479,7 +522,8 @@ impl IsolationViolation {
             ViolationKind::PlanRejected
             | ViolationKind::EstablishPrecondition
             | ViolationKind::EvidenceMismatch
-            | ViolationKind::Entrypoint => None,
+            | ViolationKind::Entrypoint
+            | ViolationKind::ExecTarget => None,
         }
     }
 }
@@ -566,6 +610,49 @@ mod tests {
         assert_eq!(r.error_code(), ErrorCode::PermissionDenied);
         assert_eq!(r.stage(), IsolationStage::Exec);
     }
+    /// SEC-4・SEC-1・SUP-6（TASK-163.1）: exec の対象の検証の理由コード・種別・ビヘイビア ID・`ErrorCode`・
+    /// 段・メッセージの具体値。マウント層の違反ではないため `Mount` 監査イベントへは写らない。
+    #[test]
+    fn sec4_sup6_exec_target_reason_metadata_is_exact() {
+        let cases = [
+            (
+                ViolationReason::ExecTargetNotNestedPid1,
+                "exec_target_not_nested_pid1",
+                "SUP-6",
+                "the exec target is not PID 1 of a directly nested PID namespace",
+            ),
+            (
+                ViolationReason::ExecTargetCgroupMismatch,
+                "exec_target_cgroup_mismatch",
+                "SEC-1",
+                "the exec target does not belong to the recorded container cgroup",
+            ),
+            (
+                ViolationReason::ExecTargetSharesPidNamespace,
+                "exec_target_shares_pid_namespace",
+                "SUP-6",
+                "the exec target shares the PID namespace with the caller; refusing to join",
+            ),
+            (
+                ViolationReason::ExecTargetSharesMountNamespace,
+                "exec_target_shares_mount_namespace",
+                "SUP-6",
+                "the exec target shares the mount namespace with the caller; refusing to join",
+            ),
+        ];
+        for (r, code, behavior, message) in cases {
+            assert_eq!(r.as_str(), code);
+            assert_eq!(r.kind(), ViolationKind::ExecTarget);
+            assert_eq!(r.kind().as_str(), "exec_target");
+            assert_eq!(r.behavior_id(), behavior);
+            assert_eq!(r.error_code(), ErrorCode::FailedPrecondition);
+            assert_eq!(r.stage(), IsolationStage::SetNs);
+            assert_eq!(r.message(), message);
+            let v = IsolationViolation::new(r, None);
+            assert_eq!(v.mount_audit_event(), None);
+        }
+    }
+
     /// SEC-4・TASK-41.4: 理由ごとの Mount 写像の有無を具体値で照合し、生パスを保持する。
     #[test]
     fn sec4_task41_4_mount_audit_event_mapping() {

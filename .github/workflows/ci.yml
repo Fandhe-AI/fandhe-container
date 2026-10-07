@@ -496,6 +496,29 @@ jobs:
           echo "unshare_isolation: full isolation verified (root=false)" >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::unshare_isolation verified"
 
+      # exec_setns_join（`crates/supervisor/tests/exec_setns_join.rs`。SUP-6・TASK-163.1・#500）:
+      # 実 pid1 の 5 種 namespace への setns 参加を検証する実機前提テスト。unshare_isolation と同じ理由で
+      # `harness = false`・`--ignored` 限定のため、緩和済みの AppArmor 設定のもとで実行し、成功行を照合する。
+      # 試験専用の入口（`exec::identify_pid1_in`）を使うため `exec-test-support` feature を付ける
+      # （付けないビルドは本体を持たず、`--ignored` 実行が非ゼロ終了になる。成功行の照合と合わせて fail-closed）。
+      - name: exec_setns_join のビルド（Linux のみ。SUP-6・TASK-163.1）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        run: cargo test -p fandhe-container-supervisor --features exec-test-support --test exec_setns_join --no-run
+
+      - name: exec_setns_join の実行（実機前提テスト・--ignored。SUP-6・TASK-163.1）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/exec_setns_join.log"
+          cargo test -p fandhe-container-supervisor --features exec-test-support \
+            --test exec_setns_join -- --ignored 2>&1 | tee "${log}"
+          if ! grep -Fq 'exec_setns_join: namespace join verified' "${log}"; then
+            echo "::error::exec_setns_join did not report a verified join (possibly not executed)" >&2
+            exit 1
+          fi
+          echo "exec_setns_join: namespace join verified" >> "$GITHUB_STEP_SUMMARY"
+
       # container_options_ipc（`crates/supervisor/tests/container_options_ipc.rs`。SUP-12・TASK-169.3・#528）:
       # `--ipc=host` / `shareable` の IPC namespace 共有・分離を検証する実機前提テスト（harness = false）。
       # unshare_isolation と同じく Linux 限定・上で緩和した sysctl を再利用し、新しい check-run・sudo・

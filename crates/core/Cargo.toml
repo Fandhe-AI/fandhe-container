@@ -30,6 +30,10 @@ fandhe-container-plugin = { workspace = true, optional = true }
 default = ["plugin"]
 plugin = ["dep:fandhe-container-plugin"]
 escape-probe = []
+# 実機結合試験（crates/supervisor/tests/exec_setns_join.rs）専用の入口 `exec::Pid1Target::open_with_cgroup_path`
+# （期待 cgroup パスを文字列で受ける）を公開する feature（SUP-6・SEC-1・TASK-163.1・#500）。既定のビルドでは無効で、
+# 公開 API は記録の型から期待パスを組み立てる `Pid1Target::open` だけになる。依存は増えない。
+exec-test-support = []
 
 # default-features = false は、`--no-default-features` のテスト時に自己参照経由で default が
 # 統合されて feature 無効構成を検証できなくなるのを防ぐ（既定の `cargo test` では影響しない）。

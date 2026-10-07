@@ -99,6 +99,7 @@ mod process;
 mod rlimits;
 mod rootfs;
 mod seccomp;
+mod setns;
 mod stages;
 mod tmpfs;
 mod violation;
@@ -139,6 +140,7 @@ pub use seccomp::{ProbeOutcome, SeccompProbeRecord};
 /// 結合試験 `tests/seccomp_enforcement.rs` 専用の再公開（通常の利用者は呼ばない。詳細は定義側）。`unsafe` を `sys` の外へ出さないための観測専用の入口。
 #[doc(hidden)]
 pub use seccomp::{SeccompEnforcementObservation, observe_default_seccomp_enforcement};
+pub use setns::{JoinNamespace, NamespaceJoinReport, Pid1Target, join_namespaces};
 pub use stages::{StageHook, StageKind, StagePipeline, StageReport, StageStatus};
 pub use tmpfs::{TmpfsMountOutcome, TmpfsReport, mount_tmpfs};
 
@@ -402,6 +404,8 @@ pub enum IsolationStage {
     Landlock,
     /// seccomp ステージ（TASK-38。#832 のステージ列の第 6 段。#178 で組み込み段）。
     Seccomp,
+    /// 稼働中コンテナの pid1 の特定と `setns(2)` による namespace 参加（SUP-6・TASK-163.1）。
+    SetNs,
     /// rootfs 配下への tmpfs マウント（SUP-12・TASK-169.2。`--shm-size` / `--tmpfs`）。
     MountTmpfs,
 }

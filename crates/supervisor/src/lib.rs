@@ -24,6 +24,7 @@
 //! | #526 | TASK-169.1 | ulimit の指定モデル（[`container_options`]。適用は core の exec ステージ `Rlimits`。launcher 未結線のため消費者は無い。REPAIR-3） |
 //! | #529 | TASK-169.4 | env / env ファイル（[`container_options::env`]。実装済み。secrets / configs 注入は tmpfs 機構〔#527〕のマージ待ちで未実装。REPAIR-3） |
 //! | #488 | TASK-159.2 | restart ポリシー評価（実装済み。配線は #489） |
+//! | #858 | TASK-171.1.2 | 権限昇格の必要最小集合と検証ロジック（[`privilege`]。実装済み。昇格 syscall 経路・setuid・fd 検証付き exec は方式承認待ちで未実装。REPAIR-3） |
 //! | #489 | TASK-159.3 | restart_count 管理・state.json 反映・結合テスト（未実装） |
 //! | #523 | TASK-168.1 | state.json 読み取り・inspect 出力フォーマット（実装済み） |
 //! | #524 | TASK-168.2 | inspect 出力のパース検証結合テスト（#523 で `tests/inspect_output.rs` を先行追加済み。#524 は未クローズ） |
@@ -36,6 +37,7 @@ pub mod health;
 pub mod healthcheck;
 pub mod inspect;
 pub mod logs;
+pub mod privilege;
 pub mod restart;
 pub mod run;
 pub mod state;

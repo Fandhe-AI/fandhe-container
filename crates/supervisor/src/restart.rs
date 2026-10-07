@@ -1771,6 +1771,62 @@ mod tests {
         assert_eq!(g.health(), Some(HealthStatus::Unhealthy));
     }
 
+    /// SUP-3・TASK-159.3: 再 launch 中に同じ ID が削除・再作成され、新しい記録が同じ内容（Stopped・終了コード 1・
+    /// restart_count 0・監視権なし）でも revision が異なれば、古いコンテナ用の pid 43 で Running に上書きしない。
+    /// 新プロセスは terminate 1 回で後始末し、再作成後の記録（revision 100）はそのまま残る。
+    #[test]
+    fn sup3_task159_3_recreated_container_with_same_content_is_not_overwritten() {
+        let st = store(0, 42);
+        struct Recreate(Queue, Arc<Store>);
+        impl Relauncher for Recreate {
+            fn relaunch(&self, t: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+                {
+                    let mut g = self.1.rec.lock().unwrap();
+                    let next = StateRecord::new(
+                        g.status().clone(),
+                        g.bundle().to_path_buf(),
+                        StateRevision::from_raw(100),
+                    )
+                    .unwrap()
+                    .with_supervision(g.supervision());
+                    *g = next;
+                }
+                self.0.relaunch(t)
+            }
+        }
+        let q = Arc::new(Recreate(Queue::new(&[(43, FAIL)]), st.clone()));
+        let mut s = attach(&st);
+        let out = supervise_with_restart(
+            &mut s,
+            first(FAIL),
+            &rl(&q),
+            &MonitorConfig::default(),
+            &cfg("always"),
+            &StopToken::new(),
+            &Events::default(),
+        )
+        .unwrap();
+        let SuperviseOutcome::RestartUnrecorded {
+            error,
+            terminate_error,
+            restarts,
+            ..
+        } = out
+        else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert_eq!(error.code(), ErrorCode::FailedPrecondition);
+        assert!(terminate_error.is_none());
+        assert_eq!(restarts, 0);
+        assert_eq!(q.0.terminated.load(Ordering::SeqCst), 1);
+        let g = st.rec.lock().unwrap();
+        assert_eq!(g.revision().value(), 100);
+        assert_eq!(g.status().state(), ContainerState::Stopped);
+        assert_eq!(g.status().exit_code(), Some(1));
+        assert_eq!(g.status().pid(), None);
+        assert_eq!(g.restart_count(), 0);
+    }
+
     /// SUP-3・TASK-159.3: 競合後に別の遷移（別の終了コードの Stopped）が入っていたら Running で上書きせず、
     /// 新プロセスを後始末して RestartUnrecorded で戻る。
     #[test]

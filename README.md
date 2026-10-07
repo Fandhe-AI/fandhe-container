@@ -31,7 +31,7 @@ Rust でフルスクラッチ開発する軽量なコンテナ実行基盤の実
 
 現時点では利用者向けの統一 CLI（TASK-79・`CLI-1`）が未提供のため、ここではソースからのビルドとテストの手順を示します。利用者向けの手順は CLI の実装後に追記します。
 
-前提: `git`・`make`・`rustup`（toolchain は `rust-toolchain.toml` で固定）。
+前提: `git`・`make`・`rustup`（toolchain は `rust-toolchain.toml` で固定）。`make setup` は最後に git hooks を導入するため、`lefthook`・`brew`・`npx` のいずれかも必要です（いずれも無いと `make hooks` が終了コード 1 で停止します。ビルドとテストだけなら `make setup` を使わず、`git submodule update --init`〔任意〕の後に下記の `cargo build` / `make test` を実行できます）。
 
 ```bash
 git clone https://github.com/Fandhe-AI/fandhe-container.git
@@ -47,6 +47,7 @@ make test                # テスト（lint・deny まで含めた一括検証�
 
 ```bash
 git clone git@github.com:Fandhe-AI/fandhe-container.git   # SSH の場合
+cd fandhe-container
 git submodule update --init   # docs/spec（private・要アクセス権）
 make hooks                    # git hooks のみ導入する場合
 make docker-ci                # 開発コンテナ内で make ci を実行（環境非依存の検証）

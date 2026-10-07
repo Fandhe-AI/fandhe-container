@@ -13,11 +13,14 @@
 //! - [`runtime_required_capabilities`] はランタイム側が一時的に保持する権限であり、コンテナへ渡す
 //!   OCI 既定集合（SEC-1）とは別物
 //! - カーネル応答（`/proc/<pid>/status`）は外部入力として扱い、長さ・行数を先に検証し、`unwrap`・添字アクセスを使わない
-//! - 検証は fail-closed。過剰権限・不足・`no_new_privs`・uid 0・ambient 不一致のいずれも `Ok` にしない。
+//! - 検証は fail-closed。過剰権限・不足・`no_new_privs`・uid 0・`PR_SET_KEEPCAPS` の残存 / 未確認・ambient 不一致の
+//!   いずれも `Ok` にしない。keepcaps は `/proc/<pid>/status` に現れないため、呼び出し元が `prctl(PR_GET_KEEPCAPS)` で
+//!   読み戻した値を [`KeepCapsState`] として渡す（読み戻し経路は syscall のため未実装。下記）
 //!   不足時に `sudo` へ黙ってフォールバックしない（設計書 6 章）
 //!
 //! # 未実装（REPAIR-3。承認待ち）
-//! 実際に bounding 削除・`capset`・ambient 載せ・`setresuid`・fd 検証付き exec を行う経路は未実装で、
+//! 実際に bounding 削除・`capset`・ambient 載せ・`setresuid`・`PR_SET_KEEPCAPS` の設定 / 解除 / 読み戻し・
+//! fd 検証付き exec を行う経路は未実装で、
 //! [`elevate`] は [`ErrorCode::Unimplemented`] を返す。方式（設計書 9 章）・新規 `unsafe`・crate 配置（同 8 章）の
 //! ユーザー承認が未取得のため着手していない。承認後に [`plan_reduction`] の計画を実行する形で実装する。
 
@@ -84,6 +87,8 @@ pub enum PrivilegeErrorReason {
     UnexpectedRootUid,
     /// gid 0 または補助グループが残っている。
     UnexpectedGroups,
+    /// `PR_SET_KEEPCAPS` が縮退後も残っている、または解除を読み戻しで確認できていない。
+    KeepCapsRetained,
     /// ambient / inheritable が期待と一致しない。
     AmbientMismatch,
     /// `/proc/<pid>/status` の形式不正・欠落・上限超過。
@@ -377,6 +382,22 @@ pub fn parse_proc_status(text: &str) -> Result<CredentialSnapshot, PrivilegeErro
     })
 }
 
+/// 縮退後の `PR_SET_KEEPCAPS`（securebits の `SECBIT_KEEP_CAPS`）の読み戻し結果。
+///
+/// `/proc/<pid>/status` には現れないため [`CredentialSnapshot`] とは別に渡す。将来の syscall 経路が
+/// `prctl(PR_GET_KEEPCAPS)` の戻り値から作る（未実装。REPAIR-3）。読み戻しに失敗した・読み戻していない場合は
+/// [`KeepCapsState::Unknown`] とし、[`verify_elevation`] はこれを成功にしない（fail-closed。設計書 5 章 4・6 章）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeepCapsState {
+    /// 解除済み（`PR_GET_KEEPCAPS` が 0）。
+    Cleared,
+    /// 有効のまま（`PR_GET_KEEPCAPS` が 1）。以後の uid 遷移で permitted が保持されてしまう。
+    Set,
+    /// 読み戻せていない（読み戻し失敗を含む）。
+    Unknown,
+}
+
 /// 昇格検証に成功した結果（将来の拡張に備えた構造体）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -397,11 +418,17 @@ fn denied(reason: PrivilegeErrorReason, message: &str) -> PrivilegeError {
 
 /// 縮退後のスナップショットが期待集合ちょうどであることを fail-closed で検証する。
 ///
-/// 判定順: `no_new_privs` → uid 0 残存 → gid 0・補助グループ残存（補助グループは空のみ許可）→ 過剰（permitted・effective・bounding・inheritable・ambient。未知ビット含む）
+/// 判定順: `no_new_privs` → uid 0 残存 → gid 0・補助グループ残存（補助グループは空のみ許可）→ `PR_SET_KEEPCAPS` の残存・未確認
+/// → 過剰（permitted・effective・bounding・inheritable・ambient。未知ビット含む）
 /// → 不足（permitted・effective・bounding）→ ambient 一致（ambient == 期待、inheritable ⊇ ambient）。
 /// ambient 一致は方式によらず要求する（設計書 5 章 4 は (c)(a) とも ambient へ載せるため）。
+///
+/// `keep_caps` は縮退の全手順（[`ReductionPlan::steps`]）を終えた後に読み戻した値を渡す。
+/// [`KeepCapsState::Cleared`] 以外は方式によらず拒否する（`Set` は `PermissionDenied`、`Unknown` は
+/// `FailedPrecondition`。いずれも理由は `KeepCapsRetained`）。
 pub fn verify_elevation(
     snapshot: &CredentialSnapshot,
+    keep_caps: KeepCapsState,
     expected: CapabilitySet,
     method: PrivilegeMethod,
 ) -> Result<ElevationReport, PrivilegeError> {
@@ -424,6 +451,22 @@ pub fn verify_elevation(
             PrivilegeErrorReason::UnexpectedGroups,
             "gid 0 or supplementary groups remain after privilege reduction",
         ));
+    }
+    match keep_caps {
+        KeepCapsState::Cleared => {}
+        KeepCapsState::Set => {
+            return Err(denied(
+                PrivilegeErrorReason::KeepCapsRetained,
+                "PR_SET_KEEPCAPS remains set after privilege reduction",
+            ));
+        }
+        KeepCapsState::Unknown => {
+            return Err(PrivilegeError::new(
+                ErrorCode::FailedPrecondition,
+                PrivilegeErrorReason::KeepCapsRetained,
+                "PR_SET_KEEPCAPS state was not read back after privilege reduction",
+            ));
+        }
     }
     let excess = [
         snapshot.permitted,
@@ -468,11 +511,16 @@ pub fn verify_elevation(
 ///
 /// 適用順は [`ReductionPlan::steps`] が返す次の列で固定する（SUP-14）:
 /// `clear_supplementary_groups`（`setgroups(0)`）→ `gid`（`setresgid`）→ `bounding_drop`（昇順・`CAP_SETPCAP` は最後）
-/// → `PR_SET_KEEPCAPS` → `uid`（`setresuid`）→ `capset` → ambient 載せ。
+/// → `PR_SET_KEEPCAPS` を 1 → `uid`（`setresuid`）→ `capset` → ambient 載せ → `PR_SET_KEEPCAPS` を 0。
 ///
 /// UID 0 から非 0 へ変えると effective capability は失われる（`CAP_SETPCAP` を要する bounding 削除ができなくなる）ため、
 /// bounding 削除は `setresuid` より前に終える。`setresuid` 後は permitted を `keepcaps` で保持し、`capset` で
 /// effective・inheritable を期待集合へ再設定してから ambient を載せる。
+///
+/// `PR_SET_KEEPCAPS` の設定と解除は必ず対で計画する（[`ReductionPlan::keep_capabilities`]）。解除は設計書 5 章 4 の
+/// とおり ambient を載せた後の最終手順とし、縮退後のプロセスに権限保持設定を残さない。適用側の契約（未実装。REPAIR-3）:
+/// 解除の失敗は縮退全体の失敗として扱い exec しない（fail-closed。設計書 6 章）。解除後は `prctl(PR_GET_KEEPCAPS)` で
+/// 読み戻し、[`KeepCapsState`] として [`verify_elevation`] へ渡す。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ReductionPlan {
@@ -493,6 +541,10 @@ pub struct ReductionPlan {
     pub gid: GidSet,
     /// 設定する uid（real・effective・saved・fs すべて非 0 の対象 uid。`setresuid` 相当）。
     pub uid: UidSet,
+    /// `setresuid` をまたいで permitted を保持するため `PR_SET_KEEPCAPS` を使うか。現在の uid が対象と異なる
+    /// （uid 遷移が起きる）ときだけ真。真なら [`ReductionStep::KeepCapabilities`] と
+    /// [`ReductionStep::ClearKeepCapabilities`] を必ず対で手順に含める。
+    pub keep_capabilities: bool,
 }
 
 /// 縮退計画の 1 手順（[`ReductionPlan::steps`] の要素。適用順は列の順）。
@@ -506,6 +558,7 @@ pub enum ReductionStep {
     /// bounding set からの削除（`CAP_SETPCAP` を要する。uid 変更前に行う）。
     DropBounding,
     /// `prctl(PR_SET_KEEPCAPS, 1)`。`setresuid` 後も permitted を保持する。
+    /// 必ず [`ReductionStep::ClearKeepCapabilities`] と対で現れる。
     KeepCapabilities,
     /// `setresuid`（`CAP_SETUID` を要する）。
     SetUid,
@@ -513,10 +566,15 @@ pub enum ReductionStep {
     Capset,
     /// ambient への載せ。
     RaiseAmbient,
+    /// `prctl(PR_SET_KEEPCAPS, 0)`。権限保持設定を縮退後に残さない（設計書 5 章 4）。常に最終手順。
+    /// 失敗は縮退全体の失敗として扱い、exec へ進まない（fail-closed）。
+    ClearKeepCapabilities,
 }
 
 impl ReductionPlan {
     /// 実行すべき手順を適用順で返す（空の補助グループ消去・空の bounding 削除は含まない）。
+    ///
+    /// `KeepCapabilities` を含むときは必ず末尾が `ClearKeepCapabilities` になる（uid 遷移が無い計画はどちらも含まない）。
     pub fn steps(&self) -> Vec<ReductionStep> {
         let mut v = Vec::new();
         if self.clear_supplementary_groups {
@@ -526,10 +584,15 @@ impl ReductionPlan {
         if !self.bounding_drop.is_empty() {
             v.push(ReductionStep::DropBounding);
         }
-        v.push(ReductionStep::KeepCapabilities);
+        if self.keep_capabilities {
+            v.push(ReductionStep::KeepCapabilities);
+        }
         v.push(ReductionStep::SetUid);
         v.push(ReductionStep::Capset);
         v.push(ReductionStep::RaiseAmbient);
+        if self.keep_capabilities {
+            v.push(ReductionStep::ClearKeepCapabilities);
+        }
         v
     }
 }
@@ -646,13 +709,15 @@ pub fn plan_reduction(
             saved: target_uid,
             fs: target_uid,
         },
+        keep_capabilities: need_setuid,
     })
 }
 
 /// 権限を実際に縮退・付与する入口（スタブ。実装済みを装わない）。
 ///
-/// 未実装（REPAIR-3）。将来仕様（設計書 5 章）: bounding 縮小 → `capset` → ambient 載せ → 読み戻し検証
-/// （[`verify_elevation`]）→ fd 検証付き exec。子の待機にはタイムアウトを設ける（REPAIR-5）。
+/// 未実装（REPAIR-3）。将来仕様（設計書 5 章）: [`ReductionPlan::steps`] の順に適用（bounding 縮小 → `capset` →
+/// ambient 載せ → `PR_SET_KEEPCAPS` 解除。途中の失敗は解除の失敗を含めすべて中断）→ 読み戻し検証
+/// （[`verify_elevation`]。keepcaps は `PR_GET_KEEPCAPS`）→ fd 検証付き exec。子の待機にはタイムアウトを設ける（REPAIR-5）。
 /// 方式・`unsafe`・crate 配置の承認後に実装する（SUP-14・TASK-171.1.2 の残作業）。
 pub fn elevate(_method: PrivilegeMethod) -> Result<ElevationReport, PrivilegeError> {
     Err(PrivilegeError::new(
@@ -694,6 +759,7 @@ mod tests {
     fn verify(t: &str) -> Result<ElevationReport, PrivilegeError> {
         verify_elevation(
             &parse_proc_status(t).unwrap(),
+            KeepCapsState::Cleared,
             runtime_required_capabilities(),
             PrivilegeMethod::SetuidRoot,
         )
@@ -720,6 +786,7 @@ mod tests {
         assert_eq!(snap.uid.effective, 1000);
         let r = verify_elevation(
             &snap,
+            KeepCapsState::Cleared,
             runtime_required_capabilities(),
             PrivilegeMethod::LauncherAmbient,
         )
@@ -876,8 +943,10 @@ mod tests {
                 ReductionStep::SetUid,
                 ReductionStep::Capset,
                 ReductionStep::RaiseAmbient,
+                ReductionStep::ClearKeepCapabilities,
             ]
         );
+        assert!(plan.keep_capabilities);
         // CAP_SETUID が無ければ uid を変えられない。
         let no_setuid = format!("{:016x}", 0x1ffffffffffu64 & !(1u64 << 7));
         let t = status("0", FULL, &no_setuid, FULL, "0", "0", root_uid);
@@ -888,6 +957,76 @@ mod tests {
         let t = status("0", FULL, &no_setgid, FULL, "0", "0", UID);
         let e = plan_reduction(&parse_proc_status(&t).unwrap(), exp, 1000, 1001).unwrap_err();
         assert_eq!(e.reason, PrivilegeErrorReason::MissingCapabilities);
+    }
+
+    /// SUP-14・設計書 5 章 4: `PR_SET_KEEPCAPS` の設定と解除は対で計画し、解除は最終手順にする。
+    #[test]
+    fn sup14_task171_1_2_plan_reduction_pairs_keepcaps_set_and_clear() {
+        let exp = runtime_required_capabilities();
+        // uid 遷移なし（ランチャーが対象 uid で動く）: keepcaps を設定も解除もしない。
+        let t = status("0", FULL, FULL, FULL, "0", "0", UID);
+        let plan = plan_reduction(&parse_proc_status(&t).unwrap(), exp, 1000, 1000).unwrap();
+        assert!(!plan.keep_capabilities);
+        assert_eq!(
+            plan.steps(),
+            vec![
+                ReductionStep::SetGid,
+                ReductionStep::DropBounding,
+                ReductionStep::SetUid,
+                ReductionStep::Capset,
+                ReductionStep::RaiseAmbient,
+            ]
+        );
+        // uid 遷移あり（saved だけが 0 の場合も含む）: 設定 1 回・解除 1 回で、解除が末尾。
+        for uid in ["0\t0\t0\t0", "1000\t1000\t0\t1000"] {
+            let t = status("0", FULL, FULL, FULL, "0", "0", uid);
+            let plan = plan_reduction(&parse_proc_status(&t).unwrap(), exp, 1000, 1000).unwrap();
+            let steps = plan.steps();
+            let pos = |s: ReductionStep| steps.iter().position(|x| *x == s);
+            let count = |s: ReductionStep| steps.iter().filter(|x| **x == s).count();
+            assert_eq!(count(ReductionStep::KeepCapabilities), 1);
+            assert_eq!(count(ReductionStep::ClearKeepCapabilities), 1);
+            assert_eq!(steps.last(), Some(&ReductionStep::ClearKeepCapabilities));
+            assert_eq!(pos(ReductionStep::KeepCapabilities), Some(2));
+            assert_eq!(pos(ReductionStep::SetUid), Some(3));
+            assert_eq!(pos(ReductionStep::RaiseAmbient), Some(5));
+            assert_eq!(pos(ReductionStep::ClearKeepCapabilities), Some(6));
+        }
+    }
+
+    /// SUP-14: 縮退後に keepcaps が残る・読み戻せていない状態は、他がすべて期待どおりでも拒否する。
+    #[test]
+    fn sup14_task171_1_2_verify_rejects_keepcaps_retained_or_unknown() {
+        let m = mask_hex();
+        let snap = parse_proc_status(&status(&m, &m, &m, &m, &m, "0", UID)).unwrap();
+        let exp = runtime_required_capabilities();
+        for method in [
+            PrivilegeMethod::SetuidRoot,
+            PrivilegeMethod::LauncherAmbient,
+        ] {
+            let e = verify_elevation(&snap, KeepCapsState::Set, exp, method).unwrap_err();
+            assert_eq!(
+                (e.code, e.reason),
+                (
+                    ErrorCode::PermissionDenied,
+                    PrivilegeErrorReason::KeepCapsRetained
+                )
+            );
+            assert_eq!(
+                e.message,
+                "PR_SET_KEEPCAPS remains set after privilege reduction"
+            );
+            let e = verify_elevation(&snap, KeepCapsState::Unknown, exp, method).unwrap_err();
+            assert_eq!(
+                (e.code, e.reason),
+                (
+                    ErrorCode::FailedPrecondition,
+                    PrivilegeErrorReason::KeepCapsRetained
+                )
+            );
+            let r = verify_elevation(&snap, KeepCapsState::Cleared, exp, method).unwrap();
+            assert_eq!(r.held, exp);
+        }
     }
 
     #[test]

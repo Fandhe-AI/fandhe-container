@@ -24,12 +24,34 @@ impl Drop for TmpDir {
     }
 }
 
+/// 排他的に（`create_dir` で）新規作成した一意なディレクトリを返す。
+/// 既存ディレクトリと衝突した場合は作成に失敗するため再試行し、既存の内容を後始末（再帰削除）で
+/// 消すことはない。後始末の対象は本関数が作成したディレクトリだけに限られる。
+fn make_unique_dir(prefix: &str) -> (PathBuf, TmpDir) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..64 {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("{prefix}-{}-{nanos}-{seq}", std::process::id()));
+        match fs::create_dir(&dir) {
+            Ok(()) => return (dir.clone(), TmpDir(dir)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => panic!("failed to create temp dir {}: {e}", dir.display()),
+        }
+    }
+    panic!("failed to create a unique temp dir with prefix {prefix}");
+}
+
 /// SUP-7: 複数回ローテーションしても全ファイルが上限以内で、捕捉側にエラーが出ない。
 #[test]
 fn sup7_task164_2_pipe_capture_rotates_within_limit() {
-    let dir = std::env::temp_dir().join(format!("fc-sup7-it-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
-    let _guard = TmpDir(dir.clone());
+    let (dir, _guard) = make_unique_dir("fc-sup7-it");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -149,9 +171,7 @@ fn sup7_task164_4_sequence_checker_detects_gap_and_duplicate() {
 /// 100 万行を実パイプ → LogCapture → RotatingFileSink へ流し、世代を古い順に読み戻して照合する。
 /// `names_oldest_first` は古い順の世代ファイル名、`start` は保持範囲の先頭の連番。
 fn run_million(tag: &str, cfg: RotationConfig, names_oldest_first: &[&str], start: u64) {
-    let dir = std::env::temp_dir().join(format!("fc-sup7-1m-{tag}-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
-    let _guard = TmpDir(dir.clone());
+    let (dir, _guard) = make_unique_dir(&format!("fc-sup7-1m-{tag}"));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

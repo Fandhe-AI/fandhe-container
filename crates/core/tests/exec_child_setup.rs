@@ -13,6 +13,9 @@
 //!   呼び出し側が制御端末を持つ状況は util-linux の `script`（疑似端末を割り当てる）の下で本バイナリを
 //!   再実行して作り、「制御端末を持つ呼び出し側から起動しても子は持たない」ことを照合する
 //! - **標準入出力**: fd 0〜2 がすべて文字デバイス 1:3（`/dev/null`）
+//! - **インタープリタ経由の拒否（#1458・SEC-4）**: `#!/proc/self/exe`・`#!/proc/<pid>/exe`・スクリプトの連鎖の
+//!   先がランタイム自身（ここでは試験バイナリ自身）に解決されるスクリプトは、子が `execveat` の前に終了コード 126 で
+//!   拒否し、報告は書かれない。対照として、通常のシェルスクリプト（`#!/bin/sh`）は手順を通る
 //!
 //! root・実コンテナ・user namespace は不要で、既定のテスト集合（`cargo test --workspace`・
 //! `make test-integration`）で実行する。fork は呼び出しプロセスが単一スレッドであることを要求するため、
@@ -123,6 +126,7 @@ mod linux {
         let work = WorkDir::create("main");
         session_is_detached_from_the_caller(&work.0, "report");
         child_has_no_controlling_terminal_under_a_pty(&work.0);
+        runtime_interpreter_is_rejected_before_exec(&work.0);
         println!("exec_child_setup: all scenarios passed");
     }
 
@@ -188,6 +192,54 @@ mod linux {
             fs::read_to_string(work.join(PTY_OK)).expect("the pty child must have run"),
             PTY_OK
         );
+    }
+
+    /// `path` へ `content` を排他的に書き、実行ビットを立てる。
+    fn write_script(path: &Path, content: &str) {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create the script");
+        file.write_all(content.as_bytes())
+            .expect("write the script");
+        file.set_permissions(fs::Permissions::from_mode(0o755))
+            .expect("chmod the script");
+    }
+
+    /// SUP-6・SEC-1・SEC-4・CORE-5・TASK-163 追補（#1458）: インタープリタがランタイム自身（試験バイナリ自身）に
+    /// 解決されるスクリプトは、実プロセスの子が `execveat` の前に拒否する（終了コード 126・報告なし）。
+    ///
+    /// 検査が無ければ子は手順を通って報告を書く（`execveat` まで進めば、カーネルが `/proc/self/exe` を
+    /// インタープリタとして開き、ホスト側のランタイムのバイナリがコンテナ内で実行される）。
+    fn runtime_interpreter_is_rejected_before_exec(work: &Path) {
+        let chained = work.join("chained");
+        write_script(&chained, "#!/proc/self/exe\n");
+        let cases = [
+            ("self", "#!/proc/self/exe\n".to_owned()),
+            ("arg", "#! /proc/self/exe --flag\n".to_owned()),
+            ("pid", format!("#!/proc/{}/exe\n", std::process::id())),
+            ("chain", format!("#!{}\n", chained.display())),
+        ];
+        for (name, content) in cases {
+            let script = work.join(format!("script-{name}"));
+            write_script(&script, &content);
+            let entry = Entrypoint::new(&script, ["script"], [] as [&str; 0]).expect("entrypoint");
+            let report = work.join(format!("report-{name}"));
+            let observation = observe_exec_child_setup(&entry, &report, timeout())
+                .expect("observe the exec child setup");
+            assert_eq!(observation.exit, ChildExit::Exited(126), "{name}");
+            assert_eq!(observation.report, None, "{name}");
+            assert!(!report.exists(), "{name}: the child must not reach exec");
+        }
+        // 対照: 通常のシェルスクリプトは手順を通る（スクリプトであること自体は拒否の理由にならない）。
+        let script = work.join("script-sh");
+        write_script(&script, "#!/bin/sh\nexit 0\n");
+        let entry = Entrypoint::new(&script, ["script"], [] as [&str; 0]).expect("entrypoint");
+        let report = observe_ok(&entry, work, "report-sh");
+        assert_eq!(report.stdio, [(true, NULL_RDEV); 3]);
     }
 
     /// `--pty-child`: 疑似端末を制御端末に持つ状態で、子が制御端末を持たないことを照合する。

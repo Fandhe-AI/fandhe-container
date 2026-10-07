@@ -158,6 +158,11 @@ pub enum ViolationReason {
     /// られている。SUP-6・SEC-1・TASK-163 追補・#1459）。コンテナは `CAP_MKNOD` で自分の `/dev/null` を差し替え
     /// られるため、標準入出力の置換先として開く前に検証し、差し替え先を開かずに拒否する。
     StdioNullNotNullDevice,
+    /// エントリポイントのインタープリタ（シェバンの連鎖・ELF の `PT_INTERP`）が、ランタイム自身の実行ファイルと
+    /// 同一の inode に解決される（`#!/proc/self/exe` 等。CVE-2019-5736 型。SUP-6・SEC-1・CORE-5・TASK-163 追補・
+    /// #1458）。カーネルはインタープリタを exec するプロセス自身の文脈で開くため、本体の照合
+    /// （[`Self::EntrypointIsRuntimeBinary`]）だけでは通ってしまう。
+    EntrypointInterpreterIsRuntimeBinary,
     /// exec の対象が入れ子の PID namespace の PID 1 でない（`NSpid` が 2 要素・末尾 1 でない。SUP-6）。
     ExecTargetNotNestedPid1,
     /// exec の対象の所属 cgroup が、記録から導いた期待パスと一致しない（pid 再利用・移動。SEC-1）。
@@ -227,6 +232,9 @@ impl ViolationReason {
             Self::RootfsHasExternalHardlink => "rootfs_has_external_hardlink",
             Self::EntrypointIsRuntimeBinary => "entrypoint_is_runtime_binary",
             Self::StdioNullNotNullDevice => "stdio_null_not_null_device",
+            Self::EntrypointInterpreterIsRuntimeBinary => {
+                "entrypoint_interpreter_is_runtime_binary"
+            }
             Self::ExecTargetNotNestedPid1 => "exec_target_not_nested_pid1",
             Self::ExecTargetCgroupMismatch => "exec_target_cgroup_mismatch",
             Self::ExecTargetSharesPidNamespace => "exec_target_shares_pid_namespace",
@@ -276,9 +284,9 @@ impl ViolationReason {
             | Self::RootfsMoved
             | Self::RootfsHasSubmounts
             | Self::RootfsHasExternalHardlink => ViolationKind::RootfsPivot,
-            Self::EntrypointIsRuntimeBinary | Self::StdioNullNotNullDevice => {
-                ViolationKind::Entrypoint
-            }
+            Self::EntrypointIsRuntimeBinary
+            | Self::StdioNullNotNullDevice
+            | Self::EntrypointInterpreterIsRuntimeBinary => ViolationKind::Entrypoint,
             Self::ExecTargetNotNestedPid1
             | Self::ExecTargetCgroupMismatch
             | Self::ExecTargetSharesPidNamespace
@@ -299,6 +307,7 @@ impl ViolationReason {
             }
             Self::ExecTargetCgroupMismatch
             | Self::StdioNullNotNullDevice
+            | Self::EntrypointInterpreterIsRuntimeBinary
             | Self::ExecRootNotContainerRootfs
             | Self::ExecJoinedNamespaceMismatch
             | Self::ExecJoinedPidNamespaceMismatch
@@ -357,9 +366,9 @@ impl ViolationReason {
             | Self::ExecJoinedNamespaceMismatch
             | Self::ExecJoinedPidNamespaceMismatch
             | Self::ExecJoinedCgroupMismatch => ErrorCode::FailedPrecondition,
-            Self::EntrypointIsRuntimeBinary | Self::StdioNullNotNullDevice => {
-                ErrorCode::PermissionDenied
-            }
+            Self::EntrypointIsRuntimeBinary
+            | Self::StdioNullNotNullDevice
+            | Self::EntrypointInterpreterIsRuntimeBinary => ErrorCode::PermissionDenied,
         }
     }
 
@@ -453,6 +462,10 @@ impl ViolationReason {
             }
             Self::EntrypointIsRuntimeBinary => {
                 "the entrypoint is the runtime's own executable; refusing to exec it"
+            }
+            Self::EntrypointInterpreterIsRuntimeBinary => {
+                "the interpreter of the entrypoint resolves to the runtime's own executable; \
+                 refusing to exec it"
             }
             Self::StdioNullNotNullDevice => {
                 "/dev/null in the new root is not the null device (1:3); refusing to open it"
@@ -679,6 +692,25 @@ mod tests {
         assert_eq!(r.behavior_id(), "CORE-1");
         assert_eq!(r.error_code(), ErrorCode::PermissionDenied);
         assert_eq!(r.stage(), IsolationStage::Exec);
+    }
+
+    /// SUP-6・SEC-1・SEC-4（TASK-163 追補・#1458）: インタープリタ経由の拒否の理由コード・種別・ビヘイビア ID・
+    /// `ErrorCode`・段・メッセージの具体値。
+    #[test]
+    fn sec4_sup6_task163_interpreter_reason_metadata_is_exact() {
+        let r = ViolationReason::EntrypointInterpreterIsRuntimeBinary;
+        assert_eq!(r.as_str(), "entrypoint_interpreter_is_runtime_binary");
+        assert_eq!(r.kind().as_str(), "entrypoint");
+        assert_eq!(r.behavior_id(), "SEC-1");
+        assert_eq!(r.error_code(), ErrorCode::PermissionDenied);
+        assert_eq!(r.stage(), IsolationStage::Exec);
+        assert_eq!(
+            r.message(),
+            "the interpreter of the entrypoint resolves to the runtime's own executable; \
+             refusing to exec it"
+        );
+        let v = IsolationViolation::new(r, Some(Path::new("/script")));
+        assert_eq!(v.mount_audit_event(), None);
     }
 
     /// SUP-6・SEC-1・SEC-4（TASK-163 追補・#1459）: `/dev/null` 差し替えの理由コード・種別・ビヘイビア ID・

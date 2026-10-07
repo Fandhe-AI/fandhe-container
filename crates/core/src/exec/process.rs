@@ -44,6 +44,11 @@
 //!   1:3 を確かめてから、procfs の magic link 経由で `O_RDWR|O_NOCTTY` に開き直す。稼働中のコンテナ
 //!   （`CAP_MKNOD` を持つ）が symlink・別のデバイスノードへ差し替えていても、差し替え先を開かずに違反
 //!   `stdio_null_not_null_device` で拒否する。launch・exec の両経路に掛かる
+//! - **インタープリタ経由でランタイム自身を実行させない**（SUP-6・SEC-1・CORE-5・TASK-163 追補・#1458）:
+//!   エントリポイント本体に加えて、シェバンの連鎖と ELF の `PT_INTERP` の解決先を `/proc/self/exe` の実体と
+//!   照合し、一致すれば違反 `entrypoint_interpreter_is_runtime_binary` で拒否する（`#!/proc/self/exe` 等）。
+//!   Landlock に依存しない層だが、検査と `execve` の間の差し替え（TOCTOU）は残る。方式の比較と限界は
+//!   `exec/interpreter.rs`。launch・exec の両経路に掛かる
 //! - **エントリポイントは fd に固定して `execveat` する**: 検査（`/proc/self/exe` との同一性）と実行の
 //!   間にパスが差し替わる TOCTOU を防ぐ。読み取り権限のない実行専用バイナリは開けず拒否される。
 //!   fd は 3 以上に置く。シェバン付きスクリプトは、インタープリタが開き直す新 root の `/dev/fd/N` が
@@ -74,10 +79,10 @@
 
 use std::convert::Infallible;
 use std::ffi::{CString, OsStr};
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -85,6 +90,7 @@ use std::time::{Duration, Instant};
 use crate::sys::{self, Signal, SysError};
 use crate::traits::types::ErrorCode;
 
+use super::interpreter::reject_runtime_interpreter;
 use super::{
     CapabilityReport, ExecError, IsolationStage, MountIsolation, PivotReport, StagePipeline,
     ViolationReason, describe, fd_mount_id, pivot_root, prepare_rootfs,
@@ -303,7 +309,8 @@ pub fn exec_entrypoint(
 ///    セッション・制御端末を切り離し（#1456。以後に開くファイルを制御端末にしない順序）、エントリポイントを新 root 内で `open` し、その fd を `fstat` する（不在なら `NotFound`）。`/proc/self/exe`
 ///    （ランタイム自身のホスト側バイナリ）と `(st_dev, st_ino)` が同じなら拒否する
 ///    （CVE-2019-5736 型の多層防御。検査した fd をそのまま `execveat(AT_EMPTY_PATH)` で実行し、
-///    検査から実行までの間のパス差し替え〔TOCTOU〕を防ぐ。memfd による自己複製は後続の課題）
+///    検査から実行までの間のパス差し替え〔TOCTOU〕を防ぐ。memfd による自己複製は後続の課題）。シェバンの連鎖・
+///    `PT_INTERP` の解決先がランタイムのバイナリなら同じく拒否する（#1458。`interpreter.rs`）
 /// 3. 開いたエントリポイントが fd 0〜2 と同一 inode なら拒否する（`/proc/self/fd/{0,1,2}` 経由の参照対策。
 ///    fd 0〜2 の実体を確認できなければ拒否。エントリポイントの fd は 3 以上に置く）。
 ///    シェバン付きスクリプトは新 root の `/dev/fd/N` が同じ実体に解決することを確認する（できなければ拒否）。
@@ -355,6 +362,11 @@ fn prepare_exec_child(entry: &Entrypoint) -> Result<std::fs::File, ExecError> {
     close_inherited_fds()?;
     // 呼び出し側のセッション・制御端末を切り離す（以後に開くファイルを制御端末にしない順序。#1456）。
     detach_session()?;
+    // 呼び出し元が照合を済ませた `/`（launch は pivot 直後のマウント ID、exec は固定した rootfs との一致。exec の
+    // 子の cwd も同じディレクトリ）と、その procfs。ランタイムの同一性の基準・固定した fd の開き直しの起点にする。
+    let root = sys::open_dir_path_nofollow(None, c"/")
+        .map_err(|e| ExecError::from_sys(e, STAGE, "openat(/)"))?;
+    let procfs = open_root_procfs(root.as_fd())?;
     // 検査と実行を同じ fd に固定する（パスを再解決する execve では、検査後に差し替えられうる）。
     let file = open_entrypoint(entry)?;
     let meta = file.metadata().map_err(|e| io_exec_error(&e, entry))?;
@@ -375,18 +387,21 @@ fn prepare_exec_child(entry: &Entrypoint) -> Result<std::fs::File, ExecError> {
             format!("the entrypoint {:?} is not a regular file", entry.path()),
         ));
     }
-    let exe = std::fs::metadata("/proc/self/exe").map_err(|e| io_exec_error(&e, entry))?;
-    if (meta.dev(), meta.ino()) == (exe.dev(), exe.ino()) {
+    let runtime = runtime_identity(procfs.as_fd())?;
+    if (meta.dev(), meta.ino()) == runtime {
         return Err(ExecError::from_violation_at(
             ViolationReason::EntrypointIsRuntimeBinary,
             Some(entry.path()),
             STAGE,
         ));
     }
+    // シェバン・`PT_INTERP` の解決先がランタイム自身でないことも確かめる（本体の照合だけでは
+    // `#!/proc/self/exe` を通してしまう。#1458。契約と限界は `interpreter.rs`）。
+    reject_runtime_interpreter(&file, entry.path(), runtime, procfs.as_fd())?;
     // シェバン付きスクリプトは fd が CLOEXEC だと execveat が ENOENT になるため、その場合だけ
     // mark_fds_cloexec の後に fd を継承させる（読み取り専用の同一ファイルの fd のみが漏れる）。
     let mut magic = [0u8; 2];
-    let is_script = matches!((&file).read(&mut magic), Ok(2)) && &magic == b"#!";
+    let is_script = matches!(file.read_at(&mut magic, 0), Ok(2)) && &magic == b"#!";
     if is_script {
         // インタープリタは `/dev/fd/N` を開き直すため、新 root 内でそれが同じ実体を指すことを確認する。
         verify_script_fd_path(Path::new("/dev/fd"), &file, &meta, entry)?;
@@ -399,8 +414,21 @@ fn prepare_exec_child(entry: &Entrypoint) -> Result<std::fs::File, ExecError> {
             .map_err(|e| ExecError::from_sys(e, STAGE, "fcntl(F_SETFD)"))?;
     }
     // 最後に標準入出力を置換する（以降の execve 失敗の診断は stderr へ出せず、終了コードのみで通知）。
-    redirect_stdio_to_null()?;
+    redirect_stdio_to_null(root.as_fd(), procfs.as_fd())?;
     Ok(file)
+}
+
+/// ランタイム自身のバイナリの `(st_dev, st_ino)`。検証済みの procfs（`proc_dir`）の `self/exe` を `O_PATH` で
+/// 開いて `fstat` する（`/proc` というパスを引き直さない。`/proc` に別の実体が置かれた rootfs で、基準を
+/// すり替えられない）。確認できなければ照合の基準が無いため拒否する（fail-closed）。
+fn runtime_identity(proc_dir: BorrowedFd<'_>) -> Result<(u64, u64), ExecError> {
+    const STAGE: IsolationStage = IsolationStage::Exec;
+    let exe = sys::open_path_follow_at(proc_dir, c"self/exe")
+        .map_err(|e| ExecError::from_sys(e, STAGE, "open of the runtime executable"))?;
+    let meta = std::fs::File::from(exe)
+        .metadata()
+        .map_err(|e| ExecError::from_io(&e, STAGE, "stat the runtime executable"))?;
+    Ok((meta.dev(), meta.ino()))
 }
 
 /// シェバン付きスクリプトを `execveat(AT_EMPTY_PATH)` で実行するときの前提を確認する。
@@ -545,15 +573,10 @@ fn mark_fds_cloexec() -> Result<(), ExecError> {
 /// 検証してから開いた `/dev/null` で、存在しない・`null` デバイス（1:3）でない場合は、別の実体を標準入出力に
 /// しないため fail-closed で拒否する。標準入出力の受け渡し（端末・パイプ）は TASK-29/30 の範囲（未実装）。
 #[cfg(not(test))]
-fn redirect_stdio_to_null() -> Result<(), ExecError> {
-    const STAGE: IsolationStage = IsolationStage::Exec;
-    // 呼び出し元が照合を済ませた `/`（launch は pivot 直後のマウント ID、exec は固定した rootfs との一致。
-    // exec の子の cwd も同じディレクトリ）を起点にする。
-    let root = sys::open_dir_path_nofollow(None, c"/")
-        .map_err(|e| ExecError::from_sys(e, STAGE, "openat(/)"))?;
-    let null = open_verified_null(root.as_fd())?;
-    drop(root);
-    sys::redirect_stdio_to(null).map_err(|e| ExecError::from_sys(e, STAGE, "dup2(/dev/null)"))
+fn redirect_stdio_to_null(root: BorrowedFd<'_>, procfs: BorrowedFd<'_>) -> Result<(), ExecError> {
+    let null = open_verified_null(root, procfs)?;
+    sys::redirect_stdio_to(null)
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::Exec, "dup2(/dev/null)"))
 }
 
 /// `root` 配下の `dev/null` を、**開く前に** 検証してから読み書きで開く（SUP-6・SEC-1・TASK-163 追補・#1459）。
@@ -567,13 +590,15 @@ fn redirect_stdio_to_null() -> Result<(), ExecError> {
 ///    辿らず symlink 自体を指す fd になる）
 /// 3. その fd を `fstat` し、文字デバイス 1:3 でなければ違反 `stdio_null_not_null_device` で拒否する
 ///    （SEC-4。ここまで対象を開いていない）
-/// 4. `root` の `proc` が本物の procfs であること（`fstatfs`）を確かめ、その `thread-self/fd/N`（magic link。
-///    パスを再解決せず 2 の inode そのものを指す）経由で `O_RDWR|O_NOCTTY` に開き直す
+/// 4. `procfs`（`root` の `proc`。本物の procfs であることを [`open_root_procfs`] が `fstatfs` で確認済み）の
+///    `thread-self/fd/N`（magic link。パスを再解決せず 2 の inode そのものを指す）経由で `O_RDWR|O_NOCTTY` に
+///    開き直す
 /// 5. 開いた fd をもう一度 `fstat` し、文字デバイス 1:3 であることを確かめる（開き直しの経路の多層防御）
 ///
-/// `/proc` が procfs でない rootfs は開き直せないため拒否する（launch 経路は `mount_proc` 済み、exec 経路は
-/// コンテナの procfs。fail-closed）。fork 後の子から呼ぶため、成功経路はアロケーションを伴わない。
-fn open_verified_null(root: BorrowedFd<'_>) -> Result<OwnedFd, ExecError> {
+/// `/proc` が procfs でない rootfs は開き直せないため、呼び出し元が先に拒否する（launch 経路は `prepare_rootfs` が
+/// マウント済み、exec 経路はコンテナの procfs。fail-closed）。fork 後の子から呼ぶため、成功経路はアロケーションを
+/// 伴わない。
+fn open_verified_null(root: BorrowedFd<'_>, procfs: BorrowedFd<'_>) -> Result<OwnedFd, ExecError> {
     const STAGE: IsolationStage = IsolationStage::Exec;
     let dev = sys::open_dir_path_nofollow(Some(root), c"dev").map_err(|e| {
         ExecError::new(
@@ -583,8 +608,7 @@ fn open_verified_null(root: BorrowedFd<'_>) -> Result<OwnedFd, ExecError> {
         )
     })?;
     let pinned = pin_null_device(dev.as_fd(), c"null")?;
-    let proc_dir = open_root_procfs(root)?;
-    reopen_null_device(proc_dir.as_fd(), pinned.as_fd())
+    reopen_null_device(procfs, pinned.as_fd())
 }
 
 /// `root` 配下の `proc` を開き、本物の procfs であることを確かめる（`fstatfs`。symlink・非ディレクトリ・別の
@@ -665,7 +689,7 @@ fn is_null_device(fd: BorrowedFd<'_>) -> Result<bool, ExecError> {
 
 /// テストビルドの dry-run 差し込み点。呼ばれたことだけを記録する。
 #[cfg(test)]
-fn redirect_stdio_to_null() -> Result<(), ExecError> {
+fn redirect_stdio_to_null(_root: BorrowedFd<'_>, _procfs: BorrowedFd<'_>) -> Result<(), ExecError> {
     tests::record("stdio->/dev/null".to_string());
     Ok(())
 }
@@ -1794,6 +1818,11 @@ mod tests {
         assert_eq!(keep_above_stdio(fd).unwrap().as_raw_fd(), raw);
     }
 
+    /// 実 `/` の procfs（検証済み）。
+    fn real_procfs() -> OwnedFd {
+        open_root_procfs(dir_fd(Path::new("/")).as_fd()).unwrap()
+    }
+
     fn dir_fd(path: &Path) -> OwnedFd {
         OwnedFd::from(std::fs::File::open(path).unwrap())
     }
@@ -1815,9 +1844,11 @@ mod tests {
     /// 文字デバイス 1:3。開き直しは検証の後に 1 回だけ起きる。
     #[test]
     fn sup6_sec1_task163_verified_null_is_reopened_read_write() {
+        use std::io::Read as _;
         use std::os::unix::fs::FileTypeExt as _;
         let _ = take_calls();
-        let null = open_verified_null(dir_fd(Path::new("/")).as_fd()).unwrap();
+        let null =
+            open_verified_null(dir_fd(Path::new("/")).as_fd(), real_procfs().as_fd()).unwrap();
         assert_eq!(take_calls(), vec!["reopen(/dev/null)".to_string()]);
         let mut file = std::fs::File::from(null);
         let meta = file.metadata().unwrap();
@@ -1842,7 +1873,8 @@ mod tests {
             std::os::unix::fs::symlink(target, dev.join("null")).unwrap();
             let err = pin_null_device(dir_fd(&dev).as_fd(), c"null").unwrap_err();
             assert_null_violation(&err);
-            let err = open_verified_null(dir_fd(&dir.0).as_fd()).unwrap_err();
+            let err =
+                open_verified_null(dir_fd(&dir.0).as_fd(), real_procfs().as_fd()).unwrap_err();
             assert_null_violation(&err);
             std::fs::remove_file(dev.join("null")).unwrap();
         }
@@ -1853,7 +1885,7 @@ mod tests {
             .create_new(true)
             .open(dev.join("null"))
             .unwrap();
-        let err = open_verified_null(dir_fd(&dir.0).as_fd()).unwrap_err();
+        let err = open_verified_null(dir_fd(&dir.0).as_fd(), real_procfs().as_fd()).unwrap_err();
         assert_null_violation(&err);
 
         // 別のデバイスノード（実 `/dev` の `zero` = 1:5 を `null` の名前の代わりに検査する。非特権では
@@ -1874,20 +1906,20 @@ mod tests {
         let dir = TempDir::create("dev-null-pre");
         let _ = take_calls();
         // `/dev` が無い。
-        let err = open_verified_null(dir_fd(&dir.0).as_fd()).unwrap_err();
+        let err = open_verified_null(dir_fd(&dir.0).as_fd(), real_procfs().as_fd()).unwrap_err();
         assert_eq!(
             (err.code, err.stage),
             (ErrorCode::FailedPrecondition, IsolationStage::Exec)
         );
         // `/dev` が symlink（本物の `/dev` を指していても辿らない）。
         std::os::unix::fs::symlink("/dev", dir.0.join("dev")).unwrap();
-        let err = open_verified_null(dir_fd(&dir.0).as_fd()).unwrap_err();
+        let err = open_verified_null(dir_fd(&dir.0).as_fd(), real_procfs().as_fd()).unwrap_err();
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
         assert!(err.message.starts_with("cannot open /dev as a directory"));
         std::fs::remove_file(dir.0.join("dev")).unwrap();
         // `/dev/null` が不在。
         std::fs::create_dir(dir.0.join("dev")).unwrap();
-        let err = open_verified_null(dir_fd(&dir.0).as_fd()).unwrap_err();
+        let err = open_verified_null(dir_fd(&dir.0).as_fd(), real_procfs().as_fd()).unwrap_err();
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
         assert!(err.message.starts_with("cannot find /dev/null"));
         assert_eq!(take_calls(), Vec::<String>::new());
@@ -2021,6 +2053,40 @@ mod tests {
                 "{path:?}"
             );
         }
+    }
+
+    /// SUP-6・SEC-1・SEC-4・TASK-163 追補（#1458）: インタープリタがランタイム自身に解決されるスクリプト
+    /// （`#!/proc/self/exe`）は、エントリポイント本体が別のファイルでも違反として拒否し、`execve` は呼ばない
+    /// （launch と exec が共有する手順の中で拒否される。終了コードは 126）。
+    #[test]
+    fn sup6_sec1_task163_exec_rejects_script_interpreted_by_runtime_binary() {
+        let dir = TempDir::create("exec-interp");
+        let script = dir.0.join("script");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&script)
+            .unwrap()
+            .write_all(b"#!/proc/self/exe\n")
+            .unwrap();
+        let entry = Entrypoint::new(&script, ["script"], [] as [&str; 0]).unwrap();
+        let _ = take_calls();
+        let err = exec_entrypoint_verified(current_root_mnt_id(), &entry).unwrap_err();
+        assert_eq!(
+            (err.code, err.stage),
+            (ErrorCode::PermissionDenied, IsolationStage::Exec)
+        );
+        assert_eq!(exit_code_for(&err), EXIT_EXEC_NOT_EXECUTABLE);
+        let v = err.violation.expect("violation record");
+        assert_eq!(
+            v.reason,
+            ViolationReason::EntrypointInterpreterIsRuntimeBinary
+        );
+        assert_eq!(v.behavior_id, "SEC-1");
+        assert_eq!(
+            take_calls(),
+            vec!["close_range(3,close)".to_string(), "setsid".to_string()]
+        );
     }
 
     /// CORE-1（TASK-27.4.1）: 不在のエントリポイントは `NotFound`（終了コード 127 に対応）。

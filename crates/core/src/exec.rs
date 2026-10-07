@@ -97,6 +97,7 @@ mod capabilities;
 mod cgroup_join;
 mod devices;
 mod exec_command;
+mod interpreter;
 mod landlock;
 mod no_new_privs;
 mod process;

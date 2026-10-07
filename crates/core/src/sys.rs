@@ -1558,6 +1558,26 @@ pub(crate) fn reopen_pinned_rdwr_noctty(
     open_follow_at(proc_dir, name, consts::O_RDWR | consts::O_NOCTTY)
 }
 
+/// 保持中の `O_PATH` fd `pinned` が指す inode を、procfs のディレクトリ fd `proc_dir` 配下の
+/// `thread-self/fd/N`（magic link）経由で `O_RDONLY|O_NONBLOCK|O_NOCTTY|O_CLOEXEC` に開き直す
+/// （TASK-163 追補・#1458）。
+///
+/// `crate::exec` のインタープリタ検査が、ランタイムのバイナリでないことを `O_PATH` の fd で確かめた通常ファイルの
+/// 先頭を読むために使う。[`reopen_pinned_read_nonblock`] と違い `format!` を使わず（fork 後の子から呼ぶ）、
+/// 起点の procfs を呼び出し側が検証して渡す。前提は [`reopen_pinned_rdwr_noctty`] と同じ。
+pub(crate) fn reopen_pinned_read(
+    proc_dir: BorrowedFd<'_>,
+    pinned: BorrowedFd<'_>,
+) -> Result<OwnedFd, SysError> {
+    let mut buf = [0u8; 32];
+    let name = proc_fd_entry(pinned.as_raw_fd(), &mut buf).ok_or(SysError::Os(EBADF))?;
+    open_follow_at(
+        proc_dir,
+        name,
+        consts::O_RDONLY | consts::O_NONBLOCK | consts::O_NOCTTY,
+    )
+}
+
 /// `parent` 配下の既存ファイル `name` を書き込み専用（`O_NOFOLLOW`）で開く。
 /// `cgroup.procs`・`cgroup.subtree_control` への書き込みに使う（CORE-3）。
 pub(crate) fn open_write_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<OwnedFd, SysError> {

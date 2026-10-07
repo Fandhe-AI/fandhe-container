@@ -20,7 +20,8 @@
 //! 別コンテナへ参加した場合の拒否（`exec_joined_namespace_mismatch`。何も適用しない）。
 //!
 //! TASK-163 追補の拒否経路: コンテナの `/dev/null` が symlink・別のデバイスノードへ差し替えられている場合に、
-//! exec の子が差し替え先を開かずに拒否し、コマンドが起動しないこと（#1459）。
+//! exec の子が差し替え先を開かずに拒否し、コマンドが起動しないこと（#1459）。`#!/proc/self/exe` のスクリプトを
+//! エントリポイントにした exec が `execveat` の前に拒否されること（#1458）。
 //!
 //! 通しは 5 回繰り返し、1 回でも不一致なら失敗する（リトライで隠さない）。
 //!
@@ -113,6 +114,8 @@ mod linux {
     const OCI_DEFAULT_CAPS: &str = "00000000a80425fb";
     /// プローブの bundle 内の名前。
     const PROBE: &str = "probe";
+    /// インタープリタにランタイム自身（`/proc/self/exe`）を指定したスクリプトの bundle 内の名前（#1458）。
+    const RUNTIME_SCRIPT: &str = "runtime-script";
     /// コンテナ ID（cgroup 名 `fc-<id>@<instance>` に使う）。
     const CONTAINER_ID: &str = "exec-test";
 
@@ -287,6 +290,12 @@ mod linux {
         fs::write(rootfs.join(PROBE), probe_elf()).expect("write probe");
         fs::set_permissions(rootfs.join(PROBE), fs::Permissions::from_mode(0o755))
             .expect("chmod probe");
+        fs::write(rootfs.join(RUNTIME_SCRIPT), b"#!/proc/self/exe\n").expect("write script");
+        fs::set_permissions(
+            rootfs.join(RUNTIME_SCRIPT),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod script");
         fs::write(
             bundle.dir.join("config.json"),
             br#"{"ociVersion":"1.2.0","root":{"path":"rootfs","readonly":true},"mounts":[{"destination":"/dev","options":["rw"]},{"destination":"/data","options":["rw"]}]}"#,
@@ -495,10 +504,20 @@ mod linux {
         let instance: u64 = arg(3).parse().expect("instance");
         let pid1: u32 = arg(4).parse().expect("pid1");
         let record = make_record(pid1, bundle, scope, instance);
-        let entry = Entrypoint::new(format!("/{PROBE}"), [format!("/{PROBE}")], [] as [&str; 0])
-            .expect("entrypoint");
+        // `run-script` だけは、インタープリタがランタイム自身を指すスクリプトをエントリポイントにする（#1458）。
+        let program = if mode == "run-script" {
+            RUNTIME_SCRIPT
+        } else {
+            PROBE
+        };
+        let entry = Entrypoint::new(
+            format!("/{program}"),
+            [format!("/{program}")],
+            [] as [&str; 0],
+        )
+        .expect("entrypoint");
         let result = match mode {
-            "run" => run_command(&record, &entry, timeout()),
+            "run" | "run-script" => run_command(&record, &entry, timeout()),
             "run-in" => run_command_in(&record, arg(5), &entry, timeout()),
             "mismatch" => return joiner_mismatch(bundle, scope, &record, args),
             other => panic!("unknown joiner mode {other}"),
@@ -835,6 +854,34 @@ mod linux {
         );
     }
 
+    /// TASK-163 追補（#1458・SEC-1・SEC-4・CORE-5）: `#!/proc/self/exe` のスクリプトをエントリポイントにした exec は、
+    /// 子が `execveat` の前に拒否する（終了コード 126）。ホスト側のランタイムのバイナリ（ここでは試験バイナリ）は
+    /// コンテナ内で実行されない。
+    ///
+    /// 拒否が Landlock（ルール外のバイナリの実行拒否）ではなくインタープリタの照合によることは、非特権で動く
+    /// core の `tests/exec_child_setup.rs`（Landlock を適用しない）が同じ入力の拒否を照合している。
+    fn runtime_interpreter_script_is_rejected(bundle: &Bundle, c: &Container) {
+        clean_probe_files(bundle);
+        let joiner = spawn_joiner(&[
+            "run-script".into(),
+            bundle.dir.display().to_string(),
+            own_cgroup_path(),
+            "1000".into(),
+            c.pid1.to_string(),
+        ]);
+        let jpid = joiner.id();
+        let (code, out) = finish_joiner(joiner);
+        assert_eq!(code, Some(0), "joiner output: {out}");
+        assert!(
+            out.starts_with(&format!("outcome exit={:?} ", ChildExit::Exited(126))),
+            "the exec child must refuse the runtime-interpreted script: {out}"
+        );
+        assert!(
+            probe_child(jpid, &std::env::current_exe().expect("current_exe")).is_none(),
+            "the runtime binary must not be running as the script interpreter"
+        );
+    }
+
     /// TASK-163 追補（#1459・SEC-1・SEC-4）: コンテナの `/dev/null` が symlink・別のデバイスノード（1:5）へ
     /// 差し替えられていたら、exec の子は差し替え先を開かずに拒否し、コマンドは起動しない（終了コード 126）。
     ///
@@ -935,8 +982,9 @@ mod linux {
         for round in 1..=ROUNDS {
             one_round(&bundle, &a, round, &original_cgroup);
         }
-        // 拒否経路（TASK-163 追補）: `/dev/null` の差し替え（#1459）。
+        // 拒否経路（TASK-163 追補）: `/dev/null` の差し替え（#1459）・インタープリタ経由のランタイム実行（#1458）。
         replaced_dev_null_is_rejected(&bundle, &a);
+        runtime_interpreter_script_is_rejected(&bundle, &a);
         // 拒否経路（条件 3・4(d)）。
         let b = start_container(&bundle, "b", 2000);
         other_container_is_rejected(&bundle, &a, &b);

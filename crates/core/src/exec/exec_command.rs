@@ -52,8 +52,9 @@
 //!   （cgroup・状態・固定した rootfs・status の fd をコンテナへ渡さない。CVE-2024-21626 型の対策）、`setsid` で
 //!   呼び出し側のセッション・制御端末を切り離し（端末から起動した CLI の exec で、コマンドが `/dev/tty` 経由で
 //!   ホスト側の端末へ届かない。失敗したら実行しない。TASK-163 追補・#1456）、標準 fd と同一
-//!   実体・ランタイム自身のバイナリを拒否し、シェバンを検証し、標準入出力を新 root の `/dev/null`（1:3 を検証）へ
-//!   置換して `execveat` する（`process::exec_checked_entrypoint`）。エントリポイントは絶対パスのみで PATH
+//!   実体・ランタイム自身のバイナリ（本体に加えて、シェバンの連鎖・`PT_INTERP` の解決先。`#!/proc/self/exe` 等。
+//!   #1458）を拒否し、シェバンを検証し、標準入出力を新 root の `/dev/null`（開く前に 1:3 を検証し、`O_NOCTTY`
+//!   つきで開き直す。#1459）へ置換して `execveat` する（`process::exec_checked_entrypoint`）。エントリポイントは絶対パスのみで PATH
 //!   探索はしない。子の失敗は stderr の英語 1 行と終了コード（125 / 126 / 127）で伝える
 //! - **親の待ちには必ずタイムアウトを設ける**（REPAIR-5）: 戻り値の [`ContainerChild`] は
 //!   `wait_timeout` のみを提供する。`Drop` では kill / wait しない

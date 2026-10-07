@@ -45,6 +45,11 @@
 //!   `ExecReady` で、[`require_exec_ready`]（core の `ExecRestrictionReport::into_complete`）だけが作る。
 //!   core の `spawn_exec_command`（fork → `close_range` → `execveat`）は `ExecReady` を値で受け取り、
 //!   `ExecRestrictionReport`・真偽値を受け取る入口はない（SEC-1）
+//! - **コンテナから見える窓を閉じる**: exec の子は fork した時点でコンテナの PID namespace に入り、
+//!   `close_range` までの間コンテナの procfs から見える。worker は開始時に自分を non-dumpable にし（core の
+//!   `spawn_exec_worker`）、core の `spawn_exec_command` は non-dumpable でないプロセスからの fork を拒否する。
+//!   同じ uid のコンテナ内プロセスが `/proc/<pid>/fd` 等からホスト側の fd へ届く経路を作らない
+//!   （CVE-2016-9962 型の対策。SEC-1。詳細は core の `exec/exec_command.rs`）
 //! - **制限は対象へ束縛される**: [`prepare_restrictions`] が対象 pid1 の mount namespace の識別子を記録し、
 //!   [`reapply_restrictions`] が参加後の自プロセスのものと照合する。同じ rootfs を共有する別コンテナへ参加した
 //!   場合は違反 `exec_joined_namespace_mismatch` で拒否し、何も適用しない（`/` の照合だけでは検出できない）
@@ -73,19 +78,29 @@
 //!
 //! 1. 完了を型で強制する: core の `spawn_exec_command` は `ExecReady` だけを値で受け取る
 //! 2. capability 削減と rlimit 適用を実装し、未適用の一覧は空
-//! 3. 制限を exec の対象へ束縛する（mount namespace の識別子の照合）
-//! 4. `setns` を伴う通し試験: `tests/exec.rs`（実機前提。AGENTS.md）
+//! 3. 制限を exec の対象へ束縛する（mount namespace・子が入る PID namespace・所属 cgroup の照合）
+//! 4. `setns` を伴う通し試験: `tests/exec.rs`（実機前提。AGENTS.md。root を要し、CI ではビルドのみで実行して
+//!    いない）。pivot 済みの対象へ参加した後の `/` が固定した rootfs と一致することだけは、CI で実行する
+//!    `tests/exec_setns_join.rs` が非特権の user namespace で照合する
 //! 5. exec 専用プロセス全体のタイムアウトと、`execve` 前の `close_range`（[`run_command`] と core の
 //!    `exec/exec_command.rs`）
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - user namespace への参加。既定の rootless（コンテナが user namespace を持つ）では [`enter_namespaces`] が
-//!   `EPERM` で失敗する（fail-closed。rootless の exec には必須。通しの結合試験は rootful のみ）
+//! - user namespace への参加。既定の rootless（コンテナが user namespace を持つ）では、対象が呼び出し側と別の
+//!   user namespace にいることを理由に [`identify_pid1`] が違反 `exec_target_in_other_user_namespace` で拒否する
+//!   （[`enter_namespaces`] も `setns` の直前に再照合する。rootful の呼び出し側では `setns` 自体は成功して
+//!   しまい、exec したコマンドがコンテナより強い権限で動くため、カーネルの拒否には依存しない。fail-closed。
+//!   rootless の exec には必須。通しの結合試験は rootful のみ）
 //! - コマンドの標準入出力の受け渡し（CLI の exec・TASK-161 / SUP-4 の healthcheck の出力取得）。現状は launch と
 //!   同じく `/dev/null` へ固定し、環境変数・cwd・ユーザーの指定も未対応（cwd はコンテナの rootfs の根）
-//! - 違反記録（SEC-4）の監査ログへの保存の配線（#839）
-//! - `--ulimit` の指定値の `state.json` への記録。現状は pid1 の実効値を写して代替する
+//! - 違反記録（SEC-4）の監査ログへの保存の配線。core のファイル書き込み経路（`audit_log::AuditFileWriter`。
+//!   TASK-41.5.1）は実装済みだが、exec の拒否（種別 `exec_target`）を表す監査の層と、exec 専用プロセスへ
+//!   `AuditSink` を渡す経路が無い。現状は種別・理由コード・ビヘイビア ID をエラーメッセージへ残すところまで
+//! - `--ulimit` の指定値の `state.json` への記録。現状は pid1 の実効値を写して代替する（hard は launch を
+//!   超えないが、soft は pid1 が hard の範囲で上げていれば launch の指定より高くなり得る。core の
+//!   `exec/reapply.rs` のモジュール doc）
+//! - 実機前提の通し試験 `tests/exec.rs` の実行結果の記録（root を要し、CI ではビルドのみで実行していない）
 
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::time::{Duration, Instant};
@@ -593,7 +608,7 @@ fn load_exec_bundle(bundle: &std::path::Path) -> Result<(OciConfig, RootfsDir), 
 ///
 /// 分離違反による拒否（`ExecError::violation`。SEC-4）は、種別・理由コード・ビヘイビア ID をメッセージの
 /// 末尾に機械可読な形で残す（`TraitError` は違反記録を運べないため）。違反の対象（期待 cgroup パス）は
-/// メッセージへ含めない。監査ログへの保存の配線は未実装（#839。REPAIR-3）。
+/// メッセージへ含めない。監査ログへの保存の配線は未実装（モジュール doc「未実装」。REPAIR-3）。
 fn from_exec_error(err: ExecError) -> TraitError {
     let violation = err.violation.as_ref().map_or_else(String::new, |v| {
         format!(

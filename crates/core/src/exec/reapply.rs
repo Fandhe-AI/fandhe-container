@@ -21,7 +21,10 @@
 //! - 全体の順序（exec 専用プロセス内。supervisor の `run_command` が固定する）: `identify_pid1` →
 //!   `prepare_cgroup_join` → [`prepare_exec_restrictions`] → `join_namespaces` → `join_cgroup` →
 //!   [`reapply_restrictions`] → [`ExecRestrictionReport::into_complete`] → `spawn_exec_command`（fork →
-//!   `close_range` → execve）。制限は fork / execve を越えて継承されるため「適用 → fork → execve」の順にする
+//!   `close_range` → execve）。制限は fork / execve を越えて継承されるため「適用 → fork → execve」の順にする。
+//!   namespace 参加を cgroup 参加より先に置くのは launch 経路と同じ相対順である（launch は namespace 分離と
+//!   `pivot_root` の後にステージ列の先頭で cgroup へ参加する。`StageKind::ORDER`）。cgroup 参加は事前に開いた
+//!   fd だけで完結するため `setns` の後でも成立し、どちらも制限の適用より前に終わる
 //! - 内部の適用順は rlimit → capability 削減 → `PR_SET_NO_NEW_PRIVS` → Landlock → seccomp で固定
 //!   （`StageKind::ORDER` の相対順と同じ。rlimit は capability 削減の後だと hard の引き上げができず、seccomp の
 //!   後だと `prlimit64` を許す必要が生じるため前に置く）。最初の失敗で打ち切り、後続は呼ばない。エラーの
@@ -32,8 +35,27 @@
 //!   (soft, hard) を exec プロセスへ適用して読み戻す（黙ってクランプしない。`apply_rlimits`）。解釈できない
 //!   内容は空集合へ落とさず拒否する（緩い制限のまま exec しない）。rootless で hard の引き上げが必要な
 //!   場合は `EPERM` で拒否する（launch と同じ fail-closed）。他プロセスへの `prlimit` 経路は作らない
-//! - **capability は OCI 既定集合へ削減する**（SEC-1）: launch と同じ `CapabilitySet::oci_default`。spec（SUP-6）が
+//! - **rlimit を写す方式の限界（launch の指定値そのものではない）**: 写すのは pid1 の **現在の** 値で、pid1 は
+//!   自分の rlimit を変えられる。OCI 既定の capability に `CAP_SYS_RESOURCE` は無く、hard の引き上げは初期 user
+//!   namespace の `CAP_SYS_RESOURCE` を要するため、コンテナ側にできるのは「hard を下げる（戻せない）」と
+//!   「soft を hard 以下の範囲で上げ下げする」だけである。したがって exec の **hard は launch の hard を
+//!   超えない** が、**soft は launch が指定した soft より高い値（launch の hard 以下）になり得る**。soft は
+//!   コンテナ内のどのプロセスも自分で hard まで上げられる値で、権限の境界は hard なので、exec がコンテナ内
+//!   プロセスより緩い上限を得ることはない。逆に pid1 が値を下げていれば exec はその厳しい値で動く（極端に
+//!   下げれば Landlock のパス解決や fork が失敗し、exec は拒否される。コンテナ側が自分の exec を失敗させ
+//!   られるだけで、緩くはならない）。launch の指定値どおりに戻すには `--ulimit` の記録が要る（下記「未実装」）
+//! - **capability は OCI 既定集合へ削減する**（SEC-1）: launch と同じ関数・同じ集合
+//!   （`CapabilitySet::oci_default` 固定）で、bounding set を許可集合まで落とし、ambient を空にし、
+//!   effective = permitted = 許可集合 ∩ 現在の permitted、inheritable = 空にして読み戻す。launch 経路も
+//!   `config.json` の `process.capabilities` を解釈せず同じ固定集合を使うため、exec が launch より広い
+//!   集合を与えることはない（設定による絞り込みは launch・exec とも未実装）。pid1 が起動後に自分の
+//!   capability をさらに落としていても、exec は launch がコンテナへ与えた集合（OCI 既定）で動く。uid / gid・
+//!   補助グループ・securebits は launch・exec とも変更しない（呼び出しプロセスの値を引き継ぐ）。spec（SUP-6）が
 //!   exec での capability 削減に言及しない点は確認事項で、「launch より弱くしない」側に倒している
+//! - **user namespace は対象と同じであること**: capability は user namespace に対する相対的な権限なので、
+//!   同じ集合でも exec プロセスが対象より外側の user namespace にいれば launch より強い。`Pid1Target::open` と
+//!   `join_namespaces` が、対象と呼び出し側の user namespace の一致を要求する（`exec/setns.rs`。不一致は違反
+//!   `exec_target_in_other_user_namespace`）
 //! - **制限を exec の対象へ束縛する**: [`prepare_exec_restrictions`] が対象の mount namespace の識別子（nsfs の
 //!   `st_dev`・`st_ino`）と自プロセスの procfs ディレクトリの fd（`setns` 後は `/proc/self` を解決できないため）を
 //!   保持し、[`reapply_restrictions`] が参加後の自プロセスの識別子と照合する。不一致は違反記録
@@ -90,26 +112,36 @@
 //!    作る別経路・`Clone`・公開コンストラクタはない（単体テスト専用の作成は `cfg(test)` のみ）
 //! 2. **capability 削減と rlimit 適用**: 上記の順序で適用し、未適用の一覧は空
 //! 3. **制限を exec の対象へ束縛する**: mount namespace の識別子の照合（上記）
-//! 4. **`setns` を伴う通し試験**: supervisor の `tests/exec.rs`（実機前提）が、実コンテナへ参加した後の `/` と
-//!    rootfs の一致・保持 status fd からのスレッド数の読み取り・pivot していない対象の拒否・別コンテナへの
-//!    参加の拒否を具体値で照合する。ルールパスの解決の起点が照合済みの fd であること（プロセスの `/` を引き直して
+//! 4. **`setns` を伴う通し試験**: supervisor の `tests/exec.rs`（実機前提。root を要し、CI ではビルドのみで
+//!    実行していない）が、実コンテナへ参加した後の `/` と rootfs の一致・保持 status fd からのスレッド数の
+//!    読み取り・pivot していない対象の拒否・別コンテナへの参加の拒否を具体値で照合する。このうち
+//!    「launcher と同じ手順で `pivot_root` した対象へ参加した後の `/` が、固定した rootfs と同じディレクトリに
+//!    なる」ことだけは、非特権の user namespace で動く `tests/exec_setns_join.rs`（CI で実行）が本番の
+//!    `join_namespaces` を通して具体値で照合する。ルールパスの解決の起点が照合済みの fd であること（プロセスの `/` を引き直して
 //!    いないこと）は、`open_verified_root` が返した fd を Landlock の適用と cwd の設定の両方へ渡す実装で担保し、
 //!    プロセスの `/` と起点が食い違う状況を作る専用の試験は未実装（下記）
-//! 5. **全体のタイムアウトと fd の後始末**: supervisor の `run_command` が段の間と子の待機で上限時間を課し
-//!    （REPAIR-5）、子は `execve` の前に `close_range` でホスト側の fd を閉じる（`exec/process.rs`）
+//! 5. **全体のタイムアウトと fd の後始末**: supervisor の `run_command` が準備から実行までを worker プロセスへ
+//!    隔離して全体の上限時間を課し（REPAIR-5）、子は `execve` の前に `close_range` でホスト側の fd を閉じる
+//!    （`exec/process.rs`）。fork から `close_range` までの間に子がコンテナ側から見える窓は、worker を
+//!    non-dumpable にして閉じる（`exec/exec_command.rs`）
 //!
 //! 準備時の pid との照合は best-effort で、`setns` で PID namespace に参加した後に fork した子の pid は数値が
 //! 衝突し得る。「適用 → fork → execve」の順を守り、子で適用しないことで避ける。
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - user namespace への参加（rootless の exec に必須。現状は `setns` が `EPERM` で fail-closed）
+//! - user namespace への参加（rootless の exec に必須。現状は対象が別の user namespace にいれば参加の前に
+//!   拒否する。fail-closed）
 //! - ルールパスの解決の起点とプロセスの `/` が食い違う状況での照合専用の試験（上記 4）
 //! - 本番 launcher（`oci_runtime` の `ProcessLauncher` 実装）は未結線で、launch 経路の Landlock も本番では
 //!   まだ適用されない（`exec/landlock.rs`）。exec と launch の一致は「同じ `config.json` から同じ関数で導いた
 //!   ルールを、同じ rootfs のディレクトリを起点に同じ規則で辿る」ことで担保する
-//! - 拒否の監査ログ保存の配線（#839・SEC-4）
-//! - `--ulimit` の指定値の記録（`state.json`）。現状は pid1 の実効値を写して代替する
+//! - 拒否の違反記録（種別 `exec_target`）を監査ログへ保存する配線（SEC-4）。ファイルへの書き込み経路
+//!   （`audit_log::AuditFileWriter`。TASK-41.5.1）は実装済みだが、`AuditLayer` に exec の対象を表す層が無く、
+//!   exec 専用プロセスへ `AuditSink` を渡す経路も無い。現状は `ExecError::violation` に載せて返すところまでで、
+//!   supervisor が種別・理由コード・ビヘイビア ID をエラーメッセージへ残す
+//! - `--ulimit` の指定値の記録（`state.json`）。現状は pid1 の実効値を写して代替する（限界は上記）
+//! - 実機前提の通し試験 `tests/exec.rs` の実行結果の記録（CI ではビルドのみ）
 
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::fs::MetadataExt as _;

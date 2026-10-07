@@ -29,8 +29,7 @@
 //!
 //! # 未実装（REPAIR-3）
 //! - `--blkio-weight`（比例配分の重み）は絶対値スロットルの `io.max` では表現できない。cgroup v2 での
-//!   実体は `io.weight` で、本モジュールは `io.max` のみを扱い `io.weight` は未実装（SUP-13 / TASK-170
-//!   の文言との不整合は spec 側の課題として報告済みの扱い）
+//!   実体は `io.weight` で、`io_weight` サブモジュールが担う（TASK-170.4）。本モジュールは `io.max` のみを扱う
 //! - OCI `linux.resources.blockIO` からの反映と launcher への結線（TASK-170.3・TASK-29 / TASK-157 系）
 
 use std::fs::File;

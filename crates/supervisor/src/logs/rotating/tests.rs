@@ -1085,6 +1085,61 @@ fn sup7_task164_open_for_read_rejects_symlink_without_reading_target() {
     assert_eq!(e.code(), ErrorCode::InvalidArgument);
 }
 
+/// SUP-7・REPAIR-5: FIFO（直接・FIFO を指す symlink）は open で停止せず `InvalidArgument` で拒否される。
+#[cfg(unix)]
+#[test]
+fn sup7_task164_open_for_read_rejects_fifo_without_blocking() {
+    let t = TmpDir::new("ofr-fifo");
+    let fifo = t.0.join("c1.log");
+    // 前提不備は skip せず失敗させる（AGENTS.md）。FIFO を作れなければ検証が成立しない。
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo must be runnable on unix test hosts");
+    assert!(made.success(), "mkfifo must succeed on unix test hosts");
+    assert_eq!(
+        open_for_read(&fifo).err().unwrap().code(),
+        ErrorCode::InvalidArgument
+    );
+    std::os::unix::fs::symlink(&fifo, t.0.join("c1.log.1")).unwrap();
+    assert_eq!(
+        open_for_read(&t.0.join("c1.log.1")).err().unwrap().code(),
+        ErrorCode::InvalidArgument
+    );
+    // 検査後の差し替えを模す: 非ブロッキング open は書き手不在の FIFO でも即座に返る。
+    let f = crate::container_options::env::open_nonblocking(&fifo).unwrap();
+    assert!(!f.metadata().unwrap().file_type().is_file());
+}
+
+/// SUP-7: ロックファイルを作れない（書き込み不可ディレクトリ）ときは `NotFound` でなく `Internal`。
+#[cfg(unix)]
+#[test]
+fn sup7_task164_acquire_lock_create_failure_is_internal() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = TmpDir::new("lock-ro");
+    fs::set_permissions(&t.0, fs::Permissions::from_mode(0o500)).unwrap();
+    let probe = fs::File::create(t.0.join("probe"));
+    let result = acquire_lock(&t.0, "c1.log");
+    fs::set_permissions(&t.0, fs::Permissions::from_mode(0o700)).unwrap();
+    if probe.is_ok() {
+        return; // root 等で権限が効かない環境では検証できない
+    }
+    assert_eq!(result.err().unwrap().code(), ErrorCode::Internal);
+}
+
+/// SUP-7: 既存のロックファイルは再利用され、ディレクトリは `InvalidArgument`。
+#[test]
+fn sup7_task164_acquire_lock_existing_cases() {
+    let t = TmpDir::new("lock-existing");
+    drop(acquire_lock(&t.0, "a.log").unwrap());
+    drop(acquire_lock(&t.0, "a.log").unwrap());
+    fs::create_dir(t.0.join("b.log.lock")).unwrap();
+    assert_eq!(
+        acquire_lock(&t.0, "b.log").err().unwrap().code(),
+        ErrorCode::InvalidArgument
+    );
+}
+
 /// Windows 限定（実行は windows-latest の CI）: 削除共有つきの読み手・削除共有なしの読み手と世代 rename。
 #[cfg(windows)]
 mod windows_share {

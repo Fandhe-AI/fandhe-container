@@ -582,8 +582,7 @@ const LOCK_SUFFIX: &str = ".lock";
 /// `<base>.lock` を開き排他ロックを取る。取れなければ（別の sink が使用中）`FailedPrecondition`。
 ///
 /// ロックファイルは内容を持たず、書き込みもしない。新規作成は `create_new`（symlink を辿らない）、
-/// 既存は通常ファイル（symlink・FIFO 等は拒否）のときだけ読み取りで開く。std には `O_NOFOLLOW` 相当が
-/// 無いため、開いた実体が検査したものと同じ通常ファイルであることを開いた後にも確かめる
+/// 既存は通常ファイル（symlink・FIFO 等は拒否）のときだけ読み取りで開く。開いた実体が検査したものと同じ通常ファイルであることを開いた後にも確かめる
 /// （検査と open の間の差し替え対策。unix は dev / inode も照合する）。
 fn acquire_lock(dir: &Path, base: &str) -> Result<File, TraitError> {
     let path = dir.join(format!("{base}{LOCK_SUFFIX}"));
@@ -598,7 +597,15 @@ fn acquire_lock(dir: &Path, base: &str) -> Result<File, TraitError> {
         Ok(f) => f,
         // 作れなかったときは、既存エントリの種別で分ける（既存がディレクトリのときの create_new の
         // エラー種別は OS で異なるため、種別は lstat で判定する）。
-        Err(_) => open_existing_regular_read(&path)?,
+        // 既存が無い（権限なし・書き込み不可ディレクトリ等で作れなかった）場合に `NotFound` を返すと、
+        // 本来の `Internal` が隠れるため、フォールバックの不在は作成失敗として `Internal` に正規化する。
+        Err(_) => open_existing_regular_read(&path).map_err(|e| {
+            if e.code() == ErrorCode::NotFound {
+                internal("log lock create failed")
+            } else {
+                e
+            }
+        })?,
     };
     match file.try_lock() {
         Ok(()) => Ok(file),
@@ -625,10 +632,14 @@ fn open_existing_regular_read(path: &Path) -> Result<File, TraitError> {
     if !before.file_type().is_file() {
         return Err(not_regular());
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .open(path)
-        .map_err(|_| internal("log file open failed"))?;
+    // unix は `O_NONBLOCK` で開く。検査後にパスが FIFO（FIFO を指す symlink を含む）へ差し替えられても
+    // open は停止せず（REPAIR-5）、開いた fd の種別・dev / inode の照合で拒否する。symlink への差し替えも
+    // 差し替え先の inode が検査済みのものと一致しないため拒否される。通常ファイルの読み取りは影響を受けない。
+    #[cfg(unix)]
+    let opened = crate::container_options::env::open_nonblocking(path);
+    #[cfg(not(unix))]
+    let opened = OpenOptions::new().read(true).open(path);
+    let file = opened.map_err(|_| internal("log file open failed"))?;
     let after = file
         .metadata()
         .map_err(|_| internal("log file open failed"))?;

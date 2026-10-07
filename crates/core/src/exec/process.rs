@@ -39,7 +39,11 @@
 //!   両方に掛かる（`exec_checked_entrypoint` を共有する。変更前はどちらも `setsid` していなかった）。実プロセスでの
 //!   照合は `tests/exec_child_setup.rs`（既定のテスト集合）
 //! - **標準入出力は `/dev/null` へ置換する**: 呼び出し元の fd 0〜2 の実体は渡さない。`/dev/null` が
-//!   無い rootfs は拒否する。端末・パイプの受け渡しは TASK-29/30 の範囲
+//!   無い rootfs は拒否する。端末・パイプの受け渡しは TASK-29/30 の範囲。`/dev/null` は **開く前に検証する**
+//!   （TASK-163 追補・#1459）: 照合済みの `/` を起点に `O_PATH|O_NOFOLLOW` で固定し、`fstat` で文字デバイス
+//!   1:3 を確かめてから、procfs の magic link 経由で `O_RDWR|O_NOCTTY` に開き直す。稼働中のコンテナ
+//!   （`CAP_MKNOD` を持つ）が symlink・別のデバイスノードへ差し替えていても、差し替え先を開かずに違反
+//!   `stdio_null_not_null_device` で拒否する。launch・exec の両経路に掛かる
 //! - **エントリポイントは fd に固定して `execveat` する**: 検査（`/proc/self/exe` との同一性）と実行の
 //!   間にパスが差し替わる TOCTOU を防ぐ。読み取り権限のない実行専用バイナリは開けず拒否される。
 //!   fd は 3 以上に置く。シェバン付きスクリプトは、インタープリタが開き直す新 root の `/dev/fd/N` が
@@ -71,7 +75,7 @@
 use std::convert::Infallible;
 use std::ffi::{CString, OsStr};
 use std::io::{Read as _, Write as _};
-use std::os::fd::{AsFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
@@ -306,7 +310,8 @@ pub fn exec_entrypoint(
 ///    fd 3 以上を `CLOEXEC` にする（CVE-2024-21626 型の fd 漏えい対策。カーネル 5.11 未満は
 ///    `ENOSYS`/`EINVAL` で fail-closed）
 /// 4. `SIGPIPE` を `SIG_DFL` へ戻す（Rust ランタイムが設定した ignore は `execve` を越えて継承される）
-/// 5. fd 0〜2 を新 root の `/dev/null`（1:3 を検証）へ置換する（継承されたホスト側の標準入出力を渡さない）
+/// 5. fd 0〜2 を新 root の `/dev/null`（開く前に `O_PATH` で固定して 1:3 を検証し、`O_NOCTTY` つきで開き直す。
+///    #1459）へ置換する（継承されたホスト側の標準入出力を渡さない）
 /// 6. `execveat`（開いた fd を実行。実行権限がなければ `EACCES`）。戻ってきたら失敗
 fn exec_entrypoint_verified(
     pivot_mnt_id: u64,
@@ -536,31 +541,126 @@ fn mark_fds_cloexec() -> Result<(), ExecError> {
 /// fd 0〜2 を新 root の `/dev/null` へ置き換える。本番ビルドの実装。
 ///
 /// 呼び出し元が引き継いだ 0〜2 番の実体（ホストのファイル・ソケット）をコンテナのエントリポイントへ
-/// 渡さない（CVE-2024-21626 型・fd 3 以上は `mark_fds_cloexec` が担当）。`/dev/null` が存在しない、
-/// または `null` デバイス（1:3）でなければ、別の実体を標準入出力にしないため fail-closed で拒否する。
-/// 標準入出力の受け渡し（端末・パイプ）は TASK-29/30 の範囲（未実装）。
+/// 渡さない（CVE-2024-21626 型・fd 3 以上は `mark_fds_cloexec` が担当）。置換先は [`open_verified_null`] が
+/// 検証してから開いた `/dev/null` で、存在しない・`null` デバイス（1:3）でない場合は、別の実体を標準入出力に
+/// しないため fail-closed で拒否する。標準入出力の受け渡し（端末・パイプ）は TASK-29/30 の範囲（未実装）。
 #[cfg(not(test))]
 fn redirect_stdio_to_null() -> Result<(), ExecError> {
-    use std::os::unix::fs::FileTypeExt as _;
-    let err = |msg: &str| ExecError::new(ErrorCode::PermissionDenied, IsolationStage::Exec, msg);
-    let fd = sys::open_file_rdwr(c"/dev/null").map_err(|e| {
+    const STAGE: IsolationStage = IsolationStage::Exec;
+    // 呼び出し元が照合を済ませた `/`（launch は pivot 直後のマウント ID、exec は固定した rootfs との一致。
+    // exec の子の cwd も同じディレクトリ）を起点にする。
+    let root = sys::open_dir_path_nofollow(None, c"/")
+        .map_err(|e| ExecError::from_sys(e, STAGE, "openat(/)"))?;
+    let null = open_verified_null(root.as_fd())?;
+    drop(root);
+    sys::redirect_stdio_to(null).map_err(|e| ExecError::from_sys(e, STAGE, "dup2(/dev/null)"))
+}
+
+/// `root` 配下の `dev/null` を、**開く前に** 検証してから読み書きで開く（SUP-6・SEC-1・TASK-163 追補・#1459）。
+///
+/// OCI 既定の capability には `CAP_MKNOD` が含まれ、稼働中のコンテナは自分の `/dev/null` を symlink や別の
+/// デバイスノードへ差し替えられる。パスを直接 `open` してから種別を調べる方式では、拒否する前に差し替え先の
+/// デバイスを 1 回開いてしまう（開くだけで副作用を持つデバイスがある）。そこで次の順にする。
+///
+/// 1. `root` から `dev` を `O_PATH|O_DIRECTORY|O_NOFOLLOW` で開く（symlink・非ディレクトリは `ENOTDIR`）
+/// 2. `dev` から `null` を `O_PATH|O_NOFOLLOW` で開く（`O_PATH` はドライバの `open` を呼ばない。symlink は
+///    辿らず symlink 自体を指す fd になる）
+/// 3. その fd を `fstat` し、文字デバイス 1:3 でなければ違反 `stdio_null_not_null_device` で拒否する
+///    （SEC-4。ここまで対象を開いていない）
+/// 4. `root` の `proc` が本物の procfs であること（`fstatfs`）を確かめ、その `thread-self/fd/N`（magic link。
+///    パスを再解決せず 2 の inode そのものを指す）経由で `O_RDWR|O_NOCTTY` に開き直す
+/// 5. 開いた fd をもう一度 `fstat` し、文字デバイス 1:3 であることを確かめる（開き直しの経路の多層防御）
+///
+/// `/proc` が procfs でない rootfs は開き直せないため拒否する（launch 経路は `mount_proc` 済み、exec 経路は
+/// コンテナの procfs。fail-closed）。fork 後の子から呼ぶため、成功経路はアロケーションを伴わない。
+fn open_verified_null(root: BorrowedFd<'_>) -> Result<OwnedFd, ExecError> {
+    const STAGE: IsolationStage = IsolationStage::Exec;
+    let dev = sys::open_dir_path_nofollow(Some(root), c"dev").map_err(|e| {
         ExecError::new(
-            exec_errno_to_code(e),
-            IsolationStage::Exec,
-            format!("open of /dev/null failed: {}", describe(e)),
+            ErrorCode::FailedPrecondition,
+            STAGE,
+            format!("cannot open /dev as a directory: {}", describe(e)),
         )
     })?;
-    let file = std::fs::File::from(fd);
-    let meta = file
-        .metadata()
-        .map_err(|_| err("cannot stat /dev/null to verify the stdio target"))?;
-    if !meta.file_type().is_char_device() || meta.rdev() != sys::makedev(1, 3) {
-        return Err(err(
-            "/dev/null in the new root is not the null device (1:3)",
+    let pinned = pin_null_device(dev.as_fd(), c"null")?;
+    let proc_dir = open_root_procfs(root)?;
+    reopen_null_device(proc_dir.as_fd(), pinned.as_fd())
+}
+
+/// `root` 配下の `proc` を開き、本物の procfs であることを確かめる（`fstatfs`。symlink・非ディレクトリ・別の
+/// ファイルシステムは `FailedPrecondition`）。固定した fd の開き直し（magic link）の起点にする。
+fn open_root_procfs(root: BorrowedFd<'_>) -> Result<OwnedFd, ExecError> {
+    sys::open_dir_path_nofollow(Some(root), c"proc")
+        .ok()
+        .filter(|dir| sys::fs_type(dir.as_fd()) == Ok(sys::PROC_MAGIC))
+        .ok_or_else(|| {
+            ExecError::new(
+                ErrorCode::FailedPrecondition,
+                IsolationStage::Exec,
+                "/proc in the new root is not procfs; cannot reopen a verified file",
+            )
+        })
+}
+
+/// `dev`（ディレクトリの fd）配下の `name` を開かずに固定し、文字デバイス 1:3 であることを確かめる
+/// （[`open_verified_null`] の手順 2・3）。返す fd は `O_PATH`（検証済みの inode の固定用）。
+///
+/// symlink・通常ファイル・別のデバイスノード（1:3 以外）は違反 `stdio_null_not_null_device`
+/// （`PermissionDenied`・段 `Exec`）で、対象を開かずに拒否する。不在は `FailedPrecondition`。
+fn pin_null_device(dev: BorrowedFd<'_>, name: &std::ffi::CStr) -> Result<OwnedFd, ExecError> {
+    const STAGE: IsolationStage = IsolationStage::Exec;
+    let pinned = sys::open_path_nofollow(dev, name).map_err(|e| {
+        ExecError::new(
+            ErrorCode::FailedPrecondition,
+            STAGE,
+            format!("cannot find /dev/null in the new root: {}", describe(e)),
+        )
+    })?;
+    if !is_null_device(pinned.as_fd())? {
+        return Err(ExecError::from_violation_at(
+            ViolationReason::StdioNullNotNullDevice,
+            Some(Path::new("/dev/null")),
+            STAGE,
         ));
     }
-    sys::redirect_stdio_to(OwnedFd::from(file))
-        .map_err(|e| ExecError::from_sys(e, IsolationStage::Exec, "dup2(/dev/null)"))
+    Ok(pinned)
+}
+
+/// 検証済みの `pinned` を読み書きで開き直し、開いた実体をもう一度確かめる（[`open_verified_null`] の手順 4・5）。
+fn reopen_null_device(
+    proc_dir: BorrowedFd<'_>,
+    pinned: BorrowedFd<'_>,
+) -> Result<OwnedFd, ExecError> {
+    const STAGE: IsolationStage = IsolationStage::Exec;
+    #[cfg(test)]
+    tests::record("reopen(/dev/null)".to_string());
+    let null = sys::reopen_pinned_rdwr_noctty(proc_dir, pinned)
+        .map_err(|e| ExecError::from_sys(e, STAGE, "reopen of the verified /dev/null"))?;
+    if !is_null_device(null.as_fd())? {
+        return Err(ExecError::from_violation_at(
+            ViolationReason::StdioNullNotNullDevice,
+            Some(Path::new("/dev/null")),
+            STAGE,
+        ));
+    }
+    Ok(null)
+}
+
+/// `fd` の実体が文字デバイス 1:3（`null`）か。`fstat` できなければ確認できないため拒否する（fail-closed）。
+fn is_null_device(fd: BorrowedFd<'_>) -> Result<bool, ExecError> {
+    use std::os::unix::fs::FileTypeExt as _;
+    // `O_PATH` の fd への fstat（パスを再解決しない）。複製は同じ open file description を指す。
+    let meta = fd
+        .try_clone_to_owned()
+        .and_then(|owned| std::fs::File::from(owned).metadata())
+        .map_err(|_| {
+            ExecError::new(
+                ErrorCode::PermissionDenied,
+                IsolationStage::Exec,
+                "cannot stat /dev/null to verify the stdio target",
+            )
+        })?;
+    Ok(meta.file_type().is_char_device() && meta.rdev() == sys::makedev(1, 3))
 }
 
 /// テストビルドの dry-run 差し込み点。呼ばれたことだけを記録する。
@@ -1692,6 +1792,128 @@ mod tests {
         let raw = fd.as_raw_fd();
         assert!(raw > 2, "std dup starts at 3; got {raw}");
         assert_eq!(keep_above_stdio(fd).unwrap().as_raw_fd(), raw);
+    }
+
+    fn dir_fd(path: &Path) -> OwnedFd {
+        OwnedFd::from(std::fs::File::open(path).unwrap())
+    }
+
+    /// 違反 `stdio_null_not_null_device`（`PermissionDenied`・段 `Exec`・SEC-1）であることを照合する。
+    fn assert_null_violation(err: &ExecError) {
+        assert_eq!(
+            (err.code, err.stage),
+            (ErrorCode::PermissionDenied, IsolationStage::Exec)
+        );
+        let v = err.violation.as_ref().expect("violation record");
+        assert_eq!(v.reason, ViolationReason::StdioNullNotNullDevice);
+        assert_eq!(v.reason.as_str(), "stdio_null_not_null_device");
+        assert_eq!(v.behavior_id, "SEC-1");
+        assert_eq!(exit_code_for(err), EXIT_EXEC_NOT_EXECUTABLE);
+    }
+
+    /// SUP-6・SEC-1・TASK-163 追補（#1459）: 実 `/dev/null` は検証を通り、開き直した fd は読み書きできる
+    /// 文字デバイス 1:3。開き直しは検証の後に 1 回だけ起きる。
+    #[test]
+    fn sup6_sec1_task163_verified_null_is_reopened_read_write() {
+        use std::os::unix::fs::FileTypeExt as _;
+        let _ = take_calls();
+        let null = open_verified_null(dir_fd(Path::new("/")).as_fd()).unwrap();
+        assert_eq!(take_calls(), vec!["reopen(/dev/null)".to_string()]);
+        let mut file = std::fs::File::from(null);
+        let meta = file.metadata().unwrap();
+        assert!(meta.file_type().is_char_device());
+        assert_eq!(meta.rdev(), sys::makedev(1, 3));
+        assert_eq!(file.write(b"discarded").unwrap(), 9);
+        let mut buf = [0u8; 4];
+        assert_eq!(file.read(&mut buf).unwrap(), 0);
+    }
+
+    /// SUP-6・SEC-1・SEC-4・TASK-163 追補（#1459）: `/dev/null` が symlink・通常ファイル・別のデバイスノードへ
+    /// 差し替えられていたら、対象を開かずに（開き直しに進まずに）違反として拒否する。
+    #[test]
+    fn sup6_sec1_task163_replaced_null_is_rejected_without_opening_it() {
+        let dir = TempDir::create("dev-null");
+        let dev = dir.0.join("dev");
+        std::fs::create_dir(&dev).unwrap();
+        let _ = take_calls();
+
+        // symlink（本物の null デバイスを指していても、symlink 自体を拒否する）。
+        for target in ["/dev/zero", "/dev/null"] {
+            std::os::unix::fs::symlink(target, dev.join("null")).unwrap();
+            let err = pin_null_device(dir_fd(&dev).as_fd(), c"null").unwrap_err();
+            assert_null_violation(&err);
+            let err = open_verified_null(dir_fd(&dir.0).as_fd()).unwrap_err();
+            assert_null_violation(&err);
+            std::fs::remove_file(dev.join("null")).unwrap();
+        }
+
+        // 通常ファイル。
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dev.join("null"))
+            .unwrap();
+        let err = open_verified_null(dir_fd(&dir.0).as_fd()).unwrap_err();
+        assert_null_violation(&err);
+
+        // 別のデバイスノード（実 `/dev` の `zero` = 1:5 を `null` の名前の代わりに検査する。非特権では
+        // デバイスノードを作れないため、名前を差し替えて同じ検査を通す）。
+        let err = pin_null_device(dir_fd(Path::new("/dev")).as_fd(), c"zero").unwrap_err();
+        assert_null_violation(&err);
+        // 対照: 同じ検査が本物の `null` は通す。
+        pin_null_device(dir_fd(Path::new("/dev")).as_fd(), c"null").unwrap();
+
+        // どの拒否でも開き直しには進んでいない（対象を開いていない）。
+        assert_eq!(take_calls(), Vec::<String>::new());
+    }
+
+    /// SUP-6・SEC-1・TASK-163 追補（#1459）: `/dev` が symlink・`/dev/null` が不在・`/proc` が procfs でない
+    /// rootfs は `FailedPrecondition` で拒否する（fail-closed。別の実体を標準入出力にしない）。
+    #[test]
+    fn sup6_sec1_task163_null_requires_real_dev_and_procfs() {
+        let dir = TempDir::create("dev-null-pre");
+        let _ = take_calls();
+        // `/dev` が無い。
+        let err = open_verified_null(dir_fd(&dir.0).as_fd()).unwrap_err();
+        assert_eq!(
+            (err.code, err.stage),
+            (ErrorCode::FailedPrecondition, IsolationStage::Exec)
+        );
+        // `/dev` が symlink（本物の `/dev` を指していても辿らない）。
+        std::os::unix::fs::symlink("/dev", dir.0.join("dev")).unwrap();
+        let err = open_verified_null(dir_fd(&dir.0).as_fd()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert!(err.message.starts_with("cannot open /dev as a directory"));
+        std::fs::remove_file(dir.0.join("dev")).unwrap();
+        // `/dev/null` が不在。
+        std::fs::create_dir(dir.0.join("dev")).unwrap();
+        let err = open_verified_null(dir_fd(&dir.0).as_fd()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert!(err.message.starts_with("cannot find /dev/null"));
+        assert_eq!(take_calls(), Vec::<String>::new());
+
+        // `/proc` が無い・procfs でない（通常のディレクトリ）・symlink の rootfs は、開き直しの起点にしない。
+        let rejected = |root: &Path| {
+            let err = open_root_procfs(dir_fd(root).as_fd()).unwrap_err();
+            assert_eq!(
+                (err.code, err.stage),
+                (ErrorCode::FailedPrecondition, IsolationStage::Exec)
+            );
+            assert_eq!(
+                err.message,
+                "/proc in the new root is not procfs; cannot reopen a verified file"
+            );
+        };
+        rejected(&dir.0);
+        std::fs::create_dir(dir.0.join("proc")).unwrap();
+        rejected(&dir.0);
+        std::fs::remove_dir(dir.0.join("proc")).unwrap();
+        std::os::unix::fs::symlink("/proc", dir.0.join("proc")).unwrap();
+        rejected(&dir.0);
+        // 対照: 本物の procfs は起点にでき、固定した fd を開き直せる。
+        let procfs = open_root_procfs(dir_fd(Path::new("/")).as_fd()).unwrap();
+        let pinned = pin_null_device(dir_fd(Path::new("/dev")).as_fd(), c"null").unwrap();
+        reopen_null_device(procfs.as_fd(), pinned.as_fd()).unwrap();
     }
 
     /// CORE-1（TASK-27.4.1）: シェバン付きスクリプトの `/dev/fd/N` の検証。`N` が開いた fd と同じ実体に

@@ -136,6 +136,8 @@ mod consts {
     // include/uapi/asm-generic/fcntl.h の `O_NONBLOCK`（x86_64 は上書きしない）。
     pub const O_NONBLOCK: i32 = 0o4_000;
     pub const O_RDWR: i32 = 2;
+    // include/uapi/asm-generic/fcntl.h の `O_NOCTTY`（x86_64 は上書きしない。TASK-163 追補・#1459）。
+    pub const O_NOCTTY: i32 = 0o400;
     // include/uapi/asm-generic/fcntl.h の `O_RDONLY`・`O_WRONLY`（全アーキテクチャ共通）。
     pub const O_RDONLY: i32 = 0;
     pub const O_WRONLY: i32 = 1;
@@ -305,6 +307,9 @@ mod consts {
     // include/uapi/asm-generic/fcntl.h の `O_NONBLOCK`（arm64 も上書きしない）。
     pub const O_NONBLOCK: i32 = 0o4_000;
     pub const O_RDWR: i32 = 2;
+    // include/uapi/asm-generic/fcntl.h の `O_NOCTTY`（arm64 の arch/arm64/include/uapi/asm/fcntl.h は
+    // `O_DIRECTORY`・`O_NOFOLLOW`・`O_DIRECT`・`O_LARGEFILE` だけを上書きし、`O_NOCTTY` は上書きしない）。
+    pub const O_NOCTTY: i32 = 0o400;
     // include/uapi/asm-generic/fcntl.h の `O_RDONLY`・`O_WRONLY`（全アーキテクチャ共通）。
     pub const O_RDONLY: i32 = 0;
     pub const O_WRONLY: i32 = 1;
@@ -463,6 +468,7 @@ mod consts {
     pub const O_PATH: i32 = 0;
     pub const O_NONBLOCK: i32 = 0;
     pub const O_RDWR: i32 = 0;
+    pub const O_NOCTTY: i32 = 0;
     pub const O_RDONLY: i32 = 0;
     pub const O_WRONLY: i32 = 0;
     pub const AT_REMOVEDIR: i32 = 0;
@@ -1275,25 +1281,6 @@ pub(crate) fn dup_fd_at_least(fd: BorrowedFd<'_>, min: i32) -> Result<OwnedFd, S
     Ok(unsafe { OwnedFd::from_raw_fd(new) })
 }
 
-/// 絶対パス `path` を読み書きで開く（`O_RDWR|O_CLOEXEC|O_NONBLOCK`。最終要素の symlink は辿る）。
-/// 呼び出し側が開いた実体の種別を検証する前提（[`redirect_stdio_to`] と組で使う）。
-#[cfg_attr(test, allow(dead_code))]
-pub(crate) fn open_file_rdwr(path: &CStr) -> Result<OwnedFd, SysError> {
-    if !consts::SUPPORTED {
-        return Err(SysError::Unsupported);
-    }
-    let flags = consts::O_RDWR | consts::O_CLOEXEC | consts::O_NONBLOCK;
-    // SAFETY: `path` は借用した NUL 終端文字列で呼び出しの間生存する。flags に O_CREAT / O_TMPFILE を
-    // 含まないため可変長引数（mode）は渡さない。成功時の戻り値は新規 fd で、直後に `OwnedFd` が
-    // 唯一の所有者となる（二重 close なし）。
-    let fd = unsafe { openat(AT_FDCWD, path.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(last_error());
-    }
-    // SAFETY: `fd` は上で成功した openat が返した、他に所有者のいない有効な fd。
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
 /// fd 0・1・2 を `fd` の実体で置き換える（`dup2`。置換先は close-on-exec が外れる）。呼び出し元が
 /// 引き継いだ標準入出力の実体（ホストのファイル・ソケット）をコンテナへ渡さないために使う。
 /// `fd` 自体が 0〜2 のいずれかのときは、その番号は置換せず close-on-exec を外して保持する。
@@ -1522,6 +1509,53 @@ pub(crate) fn reopen_pinned_read_nonblock(pinned: BorrowedFd<'_>) -> Result<Owne
         .map_err(|_| SysError::Unsupported)?;
     // 絶対パスのため dirfd は無視される（`pinned` を渡しても解決に影響しない）。
     open_follow_at(pinned, &path, consts::O_RDONLY | consts::O_NONBLOCK)
+}
+
+/// procfs の fd エントリ名 `thread-self/fd/<fd>` を、NUL 終端つきで `buf` に組み立てる（アロケーションなし）。
+///
+/// fork 後・`execve` 前の子（`crate::exec` の `/dev/null` の開き直し。TASK-163 追補・#1459）から呼ぶため、
+/// `format!` を使わずスタック上のバッファへ書く。`fd` が負なら `None`。
+fn proc_fd_entry(fd: i32, buf: &mut [u8; 32]) -> Option<&CStr> {
+    const PREFIX: &[u8] = b"thread-self/fd/";
+    let mut value = u32::try_from(fd).ok()?;
+    // 10 進の桁を下位から取り出す（u32 は最大 10 桁）。
+    let mut digits = [0u8; 10];
+    let mut count = 0usize;
+    loop {
+        *digits.get_mut(count)? = b'0'.checked_add(u8::try_from(value % 10).ok()?)?;
+        count += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    let mut len = 0usize;
+    for byte in PREFIX
+        .iter()
+        .chain(digits.get(..count)?.iter().rev())
+        .chain(std::iter::once(&0u8))
+    {
+        *buf.get_mut(len)? = *byte;
+        len += 1;
+    }
+    CStr::from_bytes_with_nul(buf.get(..len)?).ok()
+}
+
+/// 保持中の `O_PATH` fd `pinned` が指す inode を、procfs のディレクトリ fd `proc_dir` 配下の
+/// `thread-self/fd/N`（magic link）経由で `O_RDWR|O_NOCTTY|O_CLOEXEC` に開き直す（TASK-163 追補・#1459）。
+///
+/// パスを再解決せず `pinned` が固定した inode そのものを開くため、呼び出し側が `pinned` への `fstat` で
+/// 確かめた種別・デバイス番号と、開く実体が食い違わない（検査の後に名前を差し替えられても影響しない）。
+/// `O_NOCTTY` は、開いた端末を呼び出しプロセスの制御端末にしないため（検証済みの実体が端末でなくても常に付ける）。
+/// 呼び出し側の前提: `proc_dir` が本物の procfs であること（[`fs_type`] で [`PROC_MAGIC`] と照合済み）と、
+/// `pinned` の種別を確認済みであること。アロケーションを伴わない（fork 後の子から呼べる）。
+pub(crate) fn reopen_pinned_rdwr_noctty(
+    proc_dir: BorrowedFd<'_>,
+    pinned: BorrowedFd<'_>,
+) -> Result<OwnedFd, SysError> {
+    let mut buf = [0u8; 32];
+    let name = proc_fd_entry(pinned.as_raw_fd(), &mut buf).ok_or(SysError::Os(EBADF))?;
+    open_follow_at(proc_dir, name, consts::O_RDWR | consts::O_NOCTTY)
 }
 
 /// `parent` 配下の既存ファイル `name` を書き込み専用（`O_NOFOLLOW`）で開く。
@@ -2689,6 +2723,46 @@ mod tests {
 
     /// CORE-1（TASK-27.4.1）: fork / exec / wait 系の定数の具体値。syscall 番号・フラグ・シグナル番号は
     /// arch ごとに個別定義する（x86_64 = syscall_64.tbl、aarch64 = asm-generic/unistd.h）。
+    /// SUP-6・TASK-163 追補（#1459）: `O_NOCTTY` の値（x86_64・aarch64 とも asm-generic の 0o400）と、
+    /// procfs の fd エントリ名の組み立て（アロケーションなし）の具体値。
+    #[test]
+    fn sup6_task163_noctty_const_and_proc_fd_entry_are_exact() {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        assert_eq!(consts::O_NOCTTY, 0o400);
+        let mut buf = [0u8; 32];
+        assert_eq!(proc_fd_entry(0, &mut buf), Some(c"thread-self/fd/0"));
+        assert_eq!(proc_fd_entry(7, &mut buf), Some(c"thread-self/fd/7"));
+        assert_eq!(proc_fd_entry(1048, &mut buf), Some(c"thread-self/fd/1048"));
+        assert_eq!(
+            proc_fd_entry(i32::MAX, &mut buf),
+            Some(c"thread-self/fd/2147483647")
+        );
+        assert_eq!(proc_fd_entry(-1, &mut buf), None);
+    }
+
+    /// SUP-6・SEC-1・TASK-163 追補（#1459）: 固定した `O_PATH` fd を procfs の magic link 経由で読み書きに
+    /// 開き直すと、パスを再解決せず同じ inode（`/dev/null` = 文字デバイス 1:3）が開く。
+    #[test]
+    fn sup6_task163_reopen_pinned_rdwr_opens_the_pinned_inode() {
+        use std::io::Write as _;
+        use std::os::fd::AsFd as _;
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+        let proc_dir = open_dir_path_nofollow(None, c"/proc").unwrap();
+        let dev = open_dir_path_nofollow(None, c"/dev").unwrap();
+        let pinned = open_path_nofollow(dev.as_fd(), c"null").unwrap();
+        let reopened = reopen_pinned_rdwr_noctty(proc_dir.as_fd(), pinned.as_fd()).unwrap();
+        let mut file = std::fs::File::from(reopened);
+        let meta = file.metadata().unwrap();
+        assert!(meta.file_type().is_char_device());
+        assert_eq!(meta.rdev(), makedev(1, 3));
+        assert_eq!(file.write(b"x").unwrap(), 1);
+        // procfs でないディレクトリを起点にすると、エントリが無く開けない（ENOENT）。
+        assert_eq!(
+            reopen_pinned_rdwr_noctty(dev.as_fd(), pinned.as_fd()).unwrap_err(),
+            SysError::Os(ENOENT)
+        );
+    }
+
     #[test]
     fn core1_fork_exec_consts_are_exact() {
         #[cfg(target_arch = "x86_64")]

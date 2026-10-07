@@ -19,6 +19,9 @@
 //! pivot していない pid1（`/` が記録した rootfs でない）の拒否（コマンドが起動しない）と、同じ rootfs を共有する
 //! 別コンテナへ参加した場合の拒否（`exec_joined_namespace_mismatch`。何も適用しない）。
 //!
+//! TASK-163 追補の拒否経路: コンテナの `/dev/null` が symlink・別のデバイスノードへ差し替えられている場合に、
+//! exec の子が差し替え先を開かずに拒否し、コマンドが起動しないこと（#1459）。
+//!
 //! 通しは 5 回繰り返し、1 回でも不一致なら失敗する（リトライで隠さない）。
 //!
 //! # 構成（再入）
@@ -832,6 +835,51 @@ mod linux {
         );
     }
 
+    /// TASK-163 追補（#1459・SEC-1・SEC-4）: コンテナの `/dev/null` が symlink・別のデバイスノード（1:5）へ
+    /// 差し替えられていたら、exec の子は差し替え先を開かずに拒否し、コマンドは起動しない（終了コード 126）。
+    ///
+    /// rootfs の `dev/` は pid1 が `create_default_devices` で作ったホスト側のディレクトリそのものなので、
+    /// ホスト側から差し替える（コンテナが `CAP_MKNOD` で行う差し替えと同じ結果になる）。照合の前に必ず元へ戻す。
+    fn replaced_dev_null_is_rejected(bundle: &Bundle, c: &Container) {
+        let null = bundle.rootfs().join("dev/null");
+        let saved = bundle.rootfs().join("dev/null.saved");
+        for kind in ["symlink", "device"] {
+            clean_probe_files(bundle);
+            fs::rename(&null, &saved).expect("move the real /dev/null aside");
+            let replaced = match kind {
+                "symlink" => std::os::unix::fs::symlink("zero", &null).is_ok(),
+                _ => Command::new("mknod")
+                    .arg(&null)
+                    .args(["c", "1", "5"])
+                    .status()
+                    .is_ok_and(|s| s.success()),
+            };
+            let joiner = replaced.then(|| {
+                spawn_joiner(&[
+                    "run".into(),
+                    bundle.dir.display().to_string(),
+                    own_cgroup_path(),
+                    "1000".into(),
+                    c.pid1.to_string(),
+                ])
+            });
+            let result = joiner.map(finish_joiner);
+            // 元へ戻してから照合する（失敗しても後続のシナリオと後始末を壊さない）。
+            let _ = fs::remove_file(&null);
+            fs::rename(&saved, &null).expect("restore the real /dev/null");
+            let (code, out) = result.unwrap_or_else(|| panic!("replace /dev/null with a {kind}"));
+            assert_eq!(code, Some(0), "joiner output: {out}; {kind}");
+            assert!(
+                out.starts_with(&format!("outcome exit={:?} ", ChildExit::Exited(126))),
+                "the exec child must refuse the replaced /dev/null ({kind}): {out}"
+            );
+            assert!(
+                !bundle.rootfs().join("data/ok").exists(),
+                "the command must not have started ({kind})"
+            );
+        }
+    }
+
     /// `unshare_pid` の子のうち、入れ子の PID namespace の PID 1（`NSpid` が 2 要素以上で末尾 1）のもの。
     fn nested_pid1_child(unshare_pid: u32) -> Option<u32> {
         let children =
@@ -887,6 +935,8 @@ mod linux {
         for round in 1..=ROUNDS {
             one_round(&bundle, &a, round, &original_cgroup);
         }
+        // 拒否経路（TASK-163 追補）: `/dev/null` の差し替え（#1459）。
+        replaced_dev_null_is_rejected(&bundle, &a);
         // 拒否経路（条件 3・4(d)）。
         let b = start_container(&bundle, "b", 2000);
         other_container_is_rejected(&bundle, &a, &b);

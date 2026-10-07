@@ -154,6 +154,10 @@ pub enum ViolationReason {
     /// エントリポイントがランタイム自身の実行ファイル（`/proc/self/exe`）と同一の inode
     /// （CVE-2019-5736 型の多層防御。TASK-27.4.1）。
     EntrypointIsRuntimeBinary,
+    /// 新 root の `/dev/null` が文字デバイス 1:3 でない（symlink・通常ファイル・別のデバイスノードへ差し替え
+    /// られている。SUP-6・SEC-1・TASK-163 追補・#1459）。コンテナは `CAP_MKNOD` で自分の `/dev/null` を差し替え
+    /// られるため、標準入出力の置換先として開く前に検証し、差し替え先を開かずに拒否する。
+    StdioNullNotNullDevice,
     /// exec の対象が入れ子の PID namespace の PID 1 でない（`NSpid` が 2 要素・末尾 1 でない。SUP-6）。
     ExecTargetNotNestedPid1,
     /// exec の対象の所属 cgroup が、記録から導いた期待パスと一致しない（pid 再利用・移動。SEC-1）。
@@ -222,6 +226,7 @@ impl ViolationReason {
             Self::RootfsHasSubmounts => "rootfs_has_submounts",
             Self::RootfsHasExternalHardlink => "rootfs_has_external_hardlink",
             Self::EntrypointIsRuntimeBinary => "entrypoint_is_runtime_binary",
+            Self::StdioNullNotNullDevice => "stdio_null_not_null_device",
             Self::ExecTargetNotNestedPid1 => "exec_target_not_nested_pid1",
             Self::ExecTargetCgroupMismatch => "exec_target_cgroup_mismatch",
             Self::ExecTargetSharesPidNamespace => "exec_target_shares_pid_namespace",
@@ -271,7 +276,9 @@ impl ViolationReason {
             | Self::RootfsMoved
             | Self::RootfsHasSubmounts
             | Self::RootfsHasExternalHardlink => ViolationKind::RootfsPivot,
-            Self::EntrypointIsRuntimeBinary => ViolationKind::Entrypoint,
+            Self::EntrypointIsRuntimeBinary | Self::StdioNullNotNullDevice => {
+                ViolationKind::Entrypoint
+            }
             Self::ExecTargetNotNestedPid1
             | Self::ExecTargetCgroupMismatch
             | Self::ExecTargetSharesPidNamespace
@@ -291,6 +298,7 @@ impl ViolationReason {
                 "SEC-5"
             }
             Self::ExecTargetCgroupMismatch
+            | Self::StdioNullNotNullDevice
             | Self::ExecRootNotContainerRootfs
             | Self::ExecJoinedNamespaceMismatch
             | Self::ExecJoinedPidNamespaceMismatch
@@ -349,7 +357,9 @@ impl ViolationReason {
             | Self::ExecJoinedNamespaceMismatch
             | Self::ExecJoinedPidNamespaceMismatch
             | Self::ExecJoinedCgroupMismatch => ErrorCode::FailedPrecondition,
-            Self::EntrypointIsRuntimeBinary => ErrorCode::PermissionDenied,
+            Self::EntrypointIsRuntimeBinary | Self::StdioNullNotNullDevice => {
+                ErrorCode::PermissionDenied
+            }
         }
     }
 
@@ -443,6 +453,9 @@ impl ViolationReason {
             }
             Self::EntrypointIsRuntimeBinary => {
                 "the entrypoint is the runtime's own executable; refusing to exec it"
+            }
+            Self::StdioNullNotNullDevice => {
+                "/dev/null in the new root is not the null device (1:3); refusing to open it"
             }
             Self::ExecTargetNotNestedPid1 => {
                 "the exec target is not PID 1 of a directly nested PID namespace"
@@ -667,6 +680,25 @@ mod tests {
         assert_eq!(r.error_code(), ErrorCode::PermissionDenied);
         assert_eq!(r.stage(), IsolationStage::Exec);
     }
+
+    /// SUP-6・SEC-1・SEC-4（TASK-163 追補・#1459）: `/dev/null` 差し替えの理由コード・種別・ビヘイビア ID・
+    /// `ErrorCode`・段・メッセージの具体値。マウント層の違反ではないため `Mount` 監査イベントへは写らない。
+    #[test]
+    fn sec4_sup6_task163_stdio_null_reason_metadata_is_exact() {
+        let r = ViolationReason::StdioNullNotNullDevice;
+        assert_eq!(r.as_str(), "stdio_null_not_null_device");
+        assert_eq!(r.kind().as_str(), "entrypoint");
+        assert_eq!(r.behavior_id(), "SEC-1");
+        assert_eq!(r.error_code(), ErrorCode::PermissionDenied);
+        assert_eq!(r.stage(), IsolationStage::Exec);
+        assert_eq!(
+            r.message(),
+            "/dev/null in the new root is not the null device (1:3); refusing to open it"
+        );
+        let v = IsolationViolation::new(r, Some(Path::new("/dev/null")));
+        assert_eq!(v.mount_audit_event(), None);
+    }
+
     /// SEC-4・SEC-1・SUP-6（TASK-163.1）: exec の対象の検証の理由コード・種別・ビヘイビア ID・`ErrorCode`・
     /// 段・メッセージの具体値。マウント層の違反ではないため `Mount` 監査イベントへは写らない。
     #[test]

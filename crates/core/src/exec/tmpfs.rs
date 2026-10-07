@@ -116,7 +116,7 @@ fn mount_tmpfs_at(
                 .map(OsStr::new)
                 .collect(),
             created: Vec::new(),
-            mounted: false,
+            mounted: None,
         };
         let result = apply_one(root, &rootfs, spec, &mut state, is_shared);
         applied.push(state);
@@ -140,20 +140,22 @@ struct Applied<'a> {
     names: Vec<&'a OsStr>,
     /// この呼び出しの `mkdirat` が成功した要素の添字（昇順。既存・競合で先に作られた要素は含めない）。
     created: Vec<usize>,
-    /// `mount(2)` が成功したか。
-    mounted: bool,
+    /// 事後検証で「自分がマウントした tmpfs のルート」と確かめた fd（検証に通るまでは `None`）。
+    mounted: Option<OwnedFd>,
 }
 
 /// 失敗時の後始末（最善努力）。新しい順に、マウントした tmpfs を外してから、作成した要素を深い順に消す。
 ///
-/// 要素は `root` から名前で開き直して辿る（symlink は辿らない）。`unlinkat(AT_REMOVEDIR)` は空ディレクトリ
-/// しか消さず、`umount2` はマウントのルート以外を `EINVAL` で拒否するため、対象が差し替わっていても
-/// 既存の内容や他のマウントは壊さない。途中で失敗した件はそこで打ち切り、残りの件は続ける。
+/// 解除するのは、事後検証で自分のマウントと確かめて保持している fd が指すマウントだけで、名前から
+/// 開き直した先は解除しない（適用後に名前の位置が差し替わっていても、別のマウントを外さない）。
+/// `mount(2)` は成功したが事後検証に通らなかったマウントは特定できないため外さない（呼び出しスレッド
+/// 専用の mount namespace に閉じ、プロセスの破棄で消える）。作成した要素は `root` から名前で辿り
+/// （symlink は辿らない）、`unlinkat(AT_REMOVEDIR)` は空ディレクトリしか消さないため既存の内容は壊さない。
+/// 途中で失敗した件はそこで打ち切り、残りの件は続ける。
 fn roll_back(root: BorrowedFd<'_>, rootfs: &std::path::Path, applied: &[Applied<'_>]) {
     use std::os::unix::ffi::OsStrExt as _;
     for state in applied.iter().rev() {
-        if state.mounted
-            && let Ok(dir) = open_chain(root, rootfs, &state.names, None)
+        if let Some(dir) = &state.mounted
             && let Ok(target) = CString::new(format!("/proc/thread-self/fd/{}", dir.as_raw_fd()))
         {
             let _ = umount_tmpfs_syscall(&target);
@@ -236,8 +238,8 @@ fn apply_one(
             &format!("mount(tmpfs on {})", spec.destination.as_str()),
         )
     })?;
-    state.mounted = true;
-    verify_mounted(root, rootfs, &names, spec)
+    state.mounted = Some(verify_mounted(root, rootfs, &names, spec, &dir)?);
+    Ok(())
 }
 
 /// `root` から `names` を 1 要素ずつ `O_PATH|O_DIRECTORY|O_NOFOLLOW` で開く。
@@ -287,49 +289,73 @@ fn open_chain(
     })
 }
 
-/// マウント後に同じ要素を開き直し、tmpfs であることを確かめる。本体は cfg で差し替わる
-/// `fstatfs_magic_at` を介すだけで、`cfg(test)` の分岐は持たない（判定本体 [`check_tmpfs_magic`] は単体で試験する）。
+/// マウント後に同じ要素を名前で開き直し、それが「マウント前に固定した `before` とは別のマウントに属する
+/// tmpfs」であることを確かめて、その fd（自分がマウントした tmpfs のルート）を返す。
+///
+/// 観測は cfg で差し替わる [`observe_mount`] を介すだけで、`cfg(test)` の分岐は持たない（判定本体
+/// [`check_new_tmpfs`] は単体で試験する）。返した fd は失敗時の [`roll_back`] が解除対象の特定に使う。
 fn verify_mounted(
     root: BorrowedFd<'_>,
     rootfs: &std::path::Path,
     names: &[&OsStr],
     spec: &TmpfsMountSpec,
-) -> Result<(), ExecError> {
-    let magic = fstatfs_magic_at(root, rootfs, names)?;
-    check_tmpfs_magic(magic, spec.destination.as_str())
+    before: &OwnedFd,
+) -> Result<OwnedFd, ExecError> {
+    let after = open_chain(root, rootfs, names, None)?;
+    let observed = observe_mount(before, &after)?;
+    check_new_tmpfs(observed, spec.destination.as_str())?;
+    Ok(after)
+}
+
+/// マウント前後の fd の観測値（[`check_new_tmpfs`] の入力）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MountObservation {
+    /// 開き直した fd の `statfs.f_type`。
+    magic: i64,
+    /// マウント前に固定した fd が属するマウントの ID。
+    before_mnt_id: u64,
+    /// 開き直した fd が属するマウントの ID。
+    after_mnt_id: u64,
 }
 
 #[cfg(not(test))]
-fn fstatfs_magic_at(
-    root: BorrowedFd<'_>,
-    rootfs: &std::path::Path,
-    names: &[&OsStr],
-) -> Result<i64, ExecError> {
-    let dir = open_chain(root, rootfs, names, None)?;
-    sys::fs_type(dir.as_fd())
-        .map_err(|e| ExecError::from_sys(e, STAGE, "fstatfs(tmpfs mount target)"))
+fn observe_mount(before: &OwnedFd, after: &OwnedFd) -> Result<MountObservation, ExecError> {
+    Ok(MountObservation {
+        magic: sys::fs_type(after.as_fd())
+            .map_err(|e| ExecError::from_sys(e, STAGE, "fstatfs(tmpfs mount target)"))?,
+        before_mnt_id: super::fd_mount_id(before, STAGE)?,
+        after_mnt_id: super::fd_mount_id(after, STAGE)?,
+    })
 }
 
-/// dry-run: 実マウントが無いため tmpfs のマジックを返す（実機の検証は結合試験で行う）。
+/// dry-run: 実マウントが無いため「別マウントの tmpfs」を観測したことにする（実機の検証は結合試験で行う）。
 #[cfg(test)]
-fn fstatfs_magic_at(
-    _root: BorrowedFd<'_>,
-    _rootfs: &std::path::Path,
-    _names: &[&OsStr],
-) -> Result<i64, ExecError> {
-    Ok(sys::TMPFS_MAGIC)
+fn observe_mount(_before: &OwnedFd, _after: &OwnedFd) -> Result<MountObservation, ExecError> {
+    Ok(MountObservation {
+        magic: sys::TMPFS_MAGIC,
+        before_mnt_id: 1,
+        after_mnt_id: 2,
+    })
 }
 
-/// 事後条件の判定（純関数）。`statfs.f_type` が tmpfs でなければ拒否する。
-fn check_tmpfs_magic(magic: i64, destination: &str) -> Result<(), ExecError> {
-    if magic == sys::TMPFS_MAGIC {
-        return Ok(());
+/// 事後条件の判定（純関数）。開き直した先が tmpfs で、かつマウント前とは別のマウントでなければ拒否する
+/// （rootfs 自体が tmpfs の場合に、マウントが名前の位置に無いのを tmpfs と誤認しないため）。
+fn check_new_tmpfs(observed: MountObservation, destination: &str) -> Result<(), ExecError> {
+    if observed.magic != sys::TMPFS_MAGIC {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            STAGE,
+            format!("the mount at {destination} is not tmpfs after mount"),
+        ));
     }
-    Err(ExecError::new(
-        ErrorCode::FailedPrecondition,
-        STAGE,
-        format!("the mount at {destination} is not tmpfs after mount"),
-    ))
+    if observed.after_mnt_id == observed.before_mnt_id {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            STAGE,
+            format!("no new mount is present at {destination} after mount"),
+        ));
+    }
+    Ok(())
 }
 
 /// 違反記録の対象表示用に rootfs の実パスを得る（取れなければ固定文字列）。
@@ -604,12 +630,55 @@ mod tests {
         assert_eq!(take_calls().first().map(|c| c.1), Some(1 | 2 | 4));
     }
 
-    /// SUP-12・TASK-169.2: 事後条件は tmpfs のマジックだけを通す。
+    /// SUP-12・TASK-169.2: 事後条件は「マウント前とは別のマウントに属する tmpfs」だけを通す。
     #[test]
-    fn sup12_task169_2_post_condition_requires_tmpfs_magic() {
-        assert!(check_tmpfs_magic(0x0102_1994, "/run").is_ok());
-        let err = check_tmpfs_magic(0xEF53, "/run").expect_err("ext4");
+    fn sup12_task169_2_post_condition_requires_new_tmpfs_mount() {
+        let obs = |magic, before_mnt_id, after_mnt_id| MountObservation {
+            magic,
+            before_mnt_id,
+            after_mnt_id,
+        };
+        assert_eq!(check_new_tmpfs(obs(0x0102_1994, 30, 31), "/run"), Ok(()));
+        let err = check_new_tmpfs(obs(0xEF53, 30, 31), "/run").expect_err("ext4");
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
         assert_eq!(err.stage, IsolationStage::MountTmpfs);
+        assert_eq!(err.message, "the mount at /run is not tmpfs after mount");
+        // rootfs 自体が tmpfs でも、同じマウントのままなら新しいマウントは無い。
+        let err = check_new_tmpfs(obs(0x0102_1994, 30, 30), "/run").expect_err("same mount");
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(err.message, "no new mount is present at /run after mount");
+    }
+
+    /// SUP-12・TASK-169.2: 後始末は検証済みの fd が指すマウントだけを外し、適用後に名前の位置が
+    /// 差し替わっていても、名前から開き直した先は外さない。
+    #[test]
+    fn sup12_task169_2_roll_back_unmounts_only_the_verified_fd() {
+        let tmp = Tmp::new("rbfd");
+        let _ = take_umounts();
+        std::fs::create_dir_all(tmp.0.join("ours")).expect("ours");
+        let fd = tmp.fd();
+        let ours = open_chain(fd.as_fd(), &tmp.0, &[OsStr::new("ours")], None).expect("open");
+        // 適用後に名前 `ours` が別の実体へ差し替わった状況。
+        std::fs::rename(tmp.0.join("ours"), tmp.0.join("moved")).expect("rename");
+        std::fs::create_dir_all(tmp.0.join("ours")).expect("replacement");
+        let applied = [
+            Applied {
+                names: vec![OsStr::new("ours")],
+                created: Vec::new(),
+                mounted: Some(ours),
+            },
+            // 事後検証に通っていない件は外さない。
+            Applied {
+                names: vec![OsStr::new("unverified")],
+                created: Vec::new(),
+                mounted: None,
+            },
+        ];
+        roll_back(fd.as_fd(), &tmp.0, &applied);
+        assert_eq!(
+            take_umounts(),
+            vec![tmp.0.join("moved").to_string_lossy().into_owned()]
+        );
+        assert!(tmp.0.join("ours").is_dir());
     }
 }

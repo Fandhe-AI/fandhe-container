@@ -2,14 +2,13 @@
 //! （SUP-13・TASK-170.3・#534・MS-9。REPAIR-12 の機械照合）。
 //!
 //! 個別機能は `cgroup_cpus_conversion`・`cgroup_cpu_max`・`cgroup_pids_max`・`cgroup_io_max` が担い、
-//! 本試験は同一の子 cgroup 上で 3 制限が併存し、後から書いた制限が先の制限を壊さないことだけを見る。
+//! 本試験は同一の子 cgroup 上で 4 制限（`cpu.max`・`pids.max`・`io.max`・`io.weight`。TASK-170.4・#1474）が併存し、後から書いた制限が先の制限を壊さないことだけを見る。
 //!
 //! # 対象外（実装済みを装わない。REPAIR-3）
-//! - `--blkio-weight`（cgroup v2 の `io.weight`）は未実装。I/O 軸は `io.max` の絶対値スロットルで検証する。
 //! - CLI 引数パーサ・launcher への結線は未実装のため、本試験は公開 API を直接呼ぶ（結線は TASK-29 / TASK-157 系）。
 //!
 //! # 実機前提テストとしての分離
-//! 実 cgroup 版は `cpu`・`pids`・`io` が委譲された cgroup v2 サブツリーと、環境変数
+//! 実 cgroup 版は `cpu`・`pids`・`io` が委譲され `io.weight` を提供するカーネルの cgroup v2 サブツリーと、環境変数
 //! `FANDHE_CONTAINER_TEST_BLOCK_DEVICE`（ディスク全体の `MAJ:MIN`）が必要で、GitHub ホステッド runner
 //! では保証できないため `#[ignore]` で分離する（AGENTS.md「実機前提テスト」・ci.md）。条件が欠ける場合は
 //! 成功扱いにせず、欠けた要素を名指しして失敗する。自プロセスを cgroup 間で移動するため、実機前提テストは
@@ -25,7 +24,7 @@
 mod linux {
     use fandhe_container_core::cgroups::{
         BlockDevice, CgroupName, Controller, ControllerSet, CpuMax, CpuQuota, DelegatedCgroup,
-        IoLimit, IoMax, PidsMax,
+        IoLimit, IoMax, IoWeight, PidsMax,
     };
     use fandhe_container_core::traits::{ContainerId, ErrorCode};
     use std::fs;
@@ -55,12 +54,19 @@ mod linux {
         assert_eq!(io.device().major(), 8);
         assert_eq!(io.device().minor(), 0);
 
+        // --blkio-weight 500 / 10 / 1000
+        assert_eq!(IoWeight::from_blkio_weight(500).unwrap().weight(), 4950);
+        assert_eq!(IoWeight::from_blkio_weight(10).unwrap().weight(), 1);
+        assert_eq!(IoWeight::from_blkio_weight(1000).unwrap().weight(), 10_000);
+
         // 不正値はいずれも InvalidArgument
         let errs = [
             CpuMax::parse_cpus("0", CpuMax::DEFAULT_PERIOD_US).unwrap_err(),
             PidsMax::from_pids_limit(0).unwrap_err(),
             PidsMax::from_pids_limit(-2).unwrap_err(),
             IoMax::new(dev, IoLimit::Value(0), u, u, u).unwrap_err(),
+            IoWeight::from_blkio_weight(0).unwrap_err(),
+            IoWeight::from_blkio_weight(1001).unwrap_err(),
         ];
         for err in errs {
             assert_eq!(err.code, ErrorCode::InvalidArgument);
@@ -105,12 +111,24 @@ mod linux {
         assert_eq!(child.set_cpu_max(&cpu), Ok(cpu));
         assert_eq!(child.set_pids_max(&pids), Ok(pids));
         assert_eq!(child.set_io_max(&io), Ok(io));
+        let weight = IoWeight::from_blkio_weight(500).unwrap();
+        assert_eq!(
+            child.set_io_weight(
+                &fandhe_container_core::observability::OpRecorder::new(),
+                &weight
+            ),
+            Ok(weight)
+        );
 
-        // 3 つすべてを書いた後に照合し、後続の書き込みが先の制限を壊していないことを確認する。
+        // 4 つすべてを書いた後に照合し、後続の書き込みが先の制限を壊していないことを確認する。
         let io_line = format!("{token} rbps=1048576 wbps=max riops=max wiops=max");
         assert_eq!(read("cpu.max").trim_end(), "150000 100000");
         assert_eq!(read("pids.max").trim_end(), "100");
         assert_eq!(read("io.max").trim_end(), io_line);
+        assert_eq!(
+            read("io.weight").lines().next().map(str::trim_end),
+            Some("default 4950")
+        );
 
         // 無制限側: pids と io を戻しても cpu.max は変化しない。
         let unlimited = PidsMax::from_pids_limit(-1).unwrap();
@@ -120,6 +138,22 @@ mod linux {
         assert_eq!(read("cpu.max").trim_end(), "150000 100000");
         assert_eq!(read("pids.max").trim_end(), "max");
         assert_eq!(read("io.max").trim_end(), "");
+        assert_eq!(
+            read("io.weight").lines().next().map(str::trim_end),
+            Some("default 4950")
+        );
+        let default_weight = IoWeight::default();
+        assert_eq!(
+            child.set_io_weight(
+                &fandhe_container_core::observability::OpRecorder::new(),
+                &default_weight
+            ),
+            Ok(default_weight)
+        );
+        assert_eq!(
+            read("io.weight").lines().next().map(str::trim_end),
+            Some("default 100")
+        );
 
         // 不正値は構築で拒否され、ファイルは変化しない。
         let err = PidsMax::from_pids_limit(0).unwrap_err();
@@ -128,6 +162,12 @@ mod linux {
         assert_eq!(err.code, ErrorCode::InvalidArgument);
         let err = CpuMax::parse_cpus("0", CpuMax::DEFAULT_PERIOD_US).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
+        let err = IoWeight::from_blkio_weight(0).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert_eq!(
+            read("io.weight").lines().next().map(str::trim_end),
+            Some("default 100")
+        );
         assert_eq!(read("cpu.max").trim_end(), "150000 100000");
         assert_eq!(read("pids.max").trim_end(), "max");
         assert_eq!(read("io.max").trim_end(), "");

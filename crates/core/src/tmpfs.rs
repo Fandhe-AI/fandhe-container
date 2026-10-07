@@ -20,7 +20,7 @@
 //!
 //! `uid=`・`gid=`・`%` 指定・`suid` / `dev` の許可・OCI `mounts[]` からの変換（TASK-127・TASK-29 系）。
 
-use crate::oci_runtime::MountDestination;
+use crate::oci_runtime::{CONFIG_MAX_PATH_BYTES, MountDestination};
 use crate::traits::types::{ErrorCode, TraitError};
 
 /// 1 コンテナあたりの tmpfs マウント件数の上限（無制限確保・過大な設定の拒否）。
@@ -95,7 +95,12 @@ pub struct TmpfsMountSpec {
 
 impl TmpfsMountSpec {
     /// 任意のマウント先の tmpfs（`noexec`・読み書き・mode 1777）。
+    ///
+    /// `destination` は外部入力として扱い、正規化の確保より前に長さ（[`CONFIG_MAX_PATH_BYTES`]）を検証する。
     pub fn new(destination: &str, size: Option<TmpfsSize>) -> Result<Self, TraitError> {
+        if destination.len() > CONFIG_MAX_PATH_BYTES {
+            return Err(invalid("tmpfs mount destination is too long"));
+        }
         let destination = MountDestination::parse(destination)
             .map_err(|_| invalid("invalid tmpfs mount destination"))?;
         Ok(Self {
@@ -221,6 +226,19 @@ mod tests {
         assert!(TmpfsMountSpec::new("/a/../b", None).is_err());
         assert!(TmpfsMountSpec::new("/", None).is_err());
         assert!(TmpfsMountSpec::new("", None).is_err());
+        // 過長な入力は正規化（分割・連結の確保）より前に拒否する。
+        let long = "/".repeat(CONFIG_MAX_PATH_BYTES) + "a";
+        let e = TmpfsMountSpec::new(&long, None).expect_err("too long");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "tmpfs mount destination is too long");
+        let fits = format!("{}a", "/".repeat(CONFIG_MAX_PATH_BYTES - 1));
+        assert_eq!(
+            TmpfsMountSpec::new(&fits, None)
+                .expect("fits")
+                .destination
+                .as_str(),
+            "/a"
+        );
     }
 
     #[test]

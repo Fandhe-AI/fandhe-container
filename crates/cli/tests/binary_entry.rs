@@ -99,11 +99,156 @@ fn cli1_unknown_command_is_usage_error() {
     }
 }
 
-/// CLI-1: 既知の各コマンドは未実装として終了コード 3。余分な引数があっても同じ。
+/// CLI-1: create / start 以外の既知コマンドは未実装として終了コード 8（core の ERR-2 表）。余分な引数があっても同じ。
 #[test]
-fn cli1_known_commands_are_unimplemented() {
-    for c in ["create", "start", "stop", "delete", "list", "logs"] {
-        assert_failure(&run(&[c]), 3, UNIMPLEMENTED_JSON);
-        assert_failure(&run(&[c, "extra"]), 3, UNIMPLEMENTED_JSON);
+fn cli1_other_commands_are_unimplemented() {
+    for c in ["stop", "delete", "list", "logs"] {
+        assert_failure(&run(&[c]), 8, UNIMPLEMENTED_JSON);
+        assert_failure(&run(&[c, "extra"]), 8, UNIMPLEMENTED_JSON);
     }
+}
+
+/// CLI-1: create / start は引数不足・未知オプションで使い方エラー（2）。
+#[test]
+fn cli1_create_start_usage_errors() {
+    for a in [
+        &["create"][..],
+        &["create", "c1"],
+        &["create", "--bundle", "/b"],
+        &["create", "--bundle", "/b", "--x", "c1"],
+        &["start"],
+        &["start", "a", "b"],
+        &["--root"],
+    ] {
+        assert_failure(&run(a), 2, USAGE_JSON);
+    }
+}
+
+/// 一意な一時ディレクトリ（Drop で削除）。
+struct TmpDir(std::path::PathBuf);
+
+impl TmpDir {
+    fn new(tag: &str) -> Self {
+        let p = std::env::temp_dir().join(format!("fc-cli-bin-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("mkdir");
+        // 状態ルートの祖先は group / other 書き込み不可でなければならない（umask に依存せず 0700 に固定）。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
+        Self(p)
+    }
+}
+
+impl Drop for TmpDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn code_json(op: &str, code: &str, message: &str) -> String {
+    format!("{{\"op\":\"{op}\",\"code\":\"{code}\",\"message\":\"{message}\"}}\n")
+}
+
+/// stderr の 1 行 JSON の `op` / `code` を取り出す（message は core の文言に依存するため照合しない）。
+fn op_and_code(out: &Output) -> (String, String) {
+    let s = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(s.ends_with('\n') && s.matches('\n').count() == 1, "{s:?}");
+    let field = |key: &str| {
+        let pat = format!("\"{key}\":\"");
+        let start = s.find(&pat).expect("field") + pat.len();
+        let end = s[start..].find('"').expect("end") + start;
+        s[start..end].to_string()
+    };
+    (field("op"), field("code"))
+}
+
+/// CLI-1・OCI-4・ERR-2: Linux で create → 状態ファイル作成（0）、重複は 4、未作成 start は 3、
+/// 作成済み start は本番 launcher 未提供のため 8（REPAIR-3）。
+#[cfg(target_os = "linux")]
+#[test]
+fn cli1_create_start_flow_on_linux() {
+    let tmp = TmpDir::new("flow");
+    let bundle = tmp.0.join("bundle");
+    std::fs::create_dir_all(bundle.join("rootfs")).expect("rootfs");
+    std::fs::write(
+        bundle.join("config.json"),
+        r#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"process":{"user":{"uid":0,"gid":0},"args":["/bin/echo","it"],"cwd":"/"},"linux":{"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"user"},{"type":"uts"},{"type":"ipc"}]}}"#,
+    )
+    .expect("config");
+    let root = tmp.0.join("state");
+    let root_s = root.to_str().expect("utf8");
+    let bundle_s = bundle.to_str().expect("utf8");
+
+    let out = run(&["--root", root_s, "create", "--bundle", bundle_s, "c1"]);
+    assert_failure_free(&out);
+    assert!(root.join("c1").join("state.json").exists());
+
+    let out = run(&["--root", root_s, "create", "--bundle", bundle_s, "c1"]);
+    assert_eq!(out.status.code(), Some(4));
+    assert_eq!(
+        op_and_code(&out),
+        ("create".into(), "ALREADY_EXISTS".into())
+    );
+
+    let out = run(&["--root", root_s, "start", "nope"]);
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(op_and_code(&out), ("start".into(), "NOT_FOUND".into()));
+
+    let out = run(&["--root", root_s, "start", "c1"]);
+    assert_eq!(out.status.code(), Some(8));
+    assert_eq!(op_and_code(&out), ("start".into(), "UNIMPLEMENTED".into()));
+    assert!(out.stdout.is_empty());
+}
+
+/// 終了コード 0・stdout / stderr とも空。
+#[cfg(target_os = "linux")]
+fn assert_failure_free(out: &Output) {
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty(), "stdout must be empty");
+    assert!(out.stderr.is_empty(), "stderr must be empty");
+}
+
+/// ERR-2: 相対 bundle は INVALID_ARGUMENT（2）。状態ルートは作られる前でも拒否の形式は同じ。
+#[cfg(target_os = "linux")]
+#[test]
+fn err2_create_rejects_relative_bundle() {
+    let tmp = TmpDir::new("relative");
+    let root = tmp.0.join("state");
+    let out = run(&[
+        "--root",
+        root.to_str().expect("utf8"),
+        "create",
+        "--bundle",
+        "rel/b",
+        "c1",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        code_json("create", "INVALID_ARGUMENT", "bundle path must be absolute")
+    );
+}
+
+/// SEC-1: Linux 以外では状態ストアを開けず fail-closed の UNIMPLEMENTED（8）。
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn sec1_create_fails_closed_off_linux() {
+    let tmp = TmpDir::new("offlinux");
+    let root = tmp.0.join("state");
+    let abs_bundle = tmp.0.join("bundle");
+    let out = run(&[
+        "--root",
+        root.to_str().expect("utf8"),
+        "create",
+        "--bundle",
+        abs_bundle.to_str().expect("utf8"),
+        "c1",
+    ]);
+    assert_eq!(out.status.code(), Some(8));
+    assert_eq!(op_and_code(&out), ("create".into(), "UNIMPLEMENTED".into()));
+    assert!(out.stdout.is_empty());
 }

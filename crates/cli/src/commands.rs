@@ -1,16 +1,29 @@
-//! 統一 CLI の基本コマンド（create / start / stop / delete / list / logs）の入口（TASK-79.1・CLI-1・MS-6）。
+//! 統一 CLI の基本コマンド（create / start / stop / delete / list / logs）の入口（TASK-79.1・TASK-79.2.1・CLI-1・MS-6）。
 //!
-//! `main.rs`（bin `fandhe-container`）から [`run`] が呼ばれ、argv の先頭をコマンド名として判定する。
-//! 各コマンド本体は未実装で、既知のコマンドも `UNIMPLEMENTED` を返して非ゼロ終了する（実装済みを装わない。REPAIR-3）。
+//! `main.rs`（bin `fandhe-container`）から [`run`] が呼ばれ、argv の先頭（グローバル `--root` の後）をコマンド名として判定する。
+//! `create` / `start` は core の `oci_runtime::create` / `start` を直接呼ぶ（TASK-79.2.1・#866。`create_start` module）。
+//! ただし本番の `ProcessLauncher` が未提供のため、`start` は `UNIMPLEMENTED`（終了コード 8）で失敗する（REPAIR-3）。
+//! 他のコマンドは未実装で、`UNIMPLEMENTED` を返して非ゼロ終了する（実装済みを装わない）。
+//! 終了コードは core の ERR-2 表（`OCI_EXIT_*`）に揃える。
 //!
-//! 将来仕様（本骨格の範囲外）:
-//! - create / start: TASK-79.2.1（#866）。Linux は core を直接呼ぶ。
+//! 将来仕様（本実装の範囲外）:
+//! - start の実プロセス起動: supervisor 経由の launcher（TASK-157・TASK-37〜39）。
 //! - stop / delete: TASK-79.2.2（#867）。
 //! - list / logs: TASK-79.3（#640）。
 //! - macOS / Windows は plugin 発見機構経由で呼び、platform-* へは直接依存しない: TASK-79.4（#641・PLUG-4）。
 //! - エラー形式（`code` / `message`）の確定: TASK-95（ERR 系）。ここの [`CliExit`] は最小の先取り。
 
 use std::ffi::OsString;
+use std::io::Write;
+
+use fandhe_container_core::oci_runtime::{
+    OCI_EXIT_INVALID_ARGUMENT, OCI_EXIT_UNIMPLEMENTED, OciRuntimeError,
+};
+
+mod args;
+mod create_start;
+
+use args::{parse_create, parse_global, parse_start};
 
 /// 基本コマンド（CLI-1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,70 +65,102 @@ impl Command {
     }
 }
 
-/// 使い方エラーの終了コード。
-pub const EXIT_USAGE: u8 = 2;
-/// 未実装コマンドの終了コード。
-pub const EXIT_UNIMPLEMENTED: u8 = 3;
+/// 使い方エラーの終了コード（core の ERR-2 表の `INVALID_ARGUMENT`）。
+pub const EXIT_USAGE: u8 = OCI_EXIT_INVALID_ARGUMENT.get();
+/// 未実装コマンドの終了コード（core の ERR-2 表の `UNIMPLEMENTED`）。
+pub const EXIT_UNIMPLEMENTED: u8 = OCI_EXIT_UNIMPLEMENTED.get();
 
-/// [`run`] の結果。終了コードと機械可読なエラー（`code` / `message`。固定の英語文言のみ）を持つ。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// [`run`] の結果。終了コードと、失敗時の機械可読なエラー（`code` / `message`）を持つ。
 ///
-/// フィールドは非公開で、この module 内の固定文言からのみ構築できる。
-/// そのため [`CliExit::to_json_line`] はエスケープなしで常に妥当な JSON を返す。
-pub struct CliExit {
-    exit_code: u8,
-    code: &'static str,
-    message: &'static str,
+/// 固定文言の失敗（[`CliExit::Fixed`]）は module 内の固定文言からのみ構築されるためエスケープ不要で、
+/// core 由来の失敗は `OciRuntimeError::write_json_line`（serde_json）で出力する（JSON を手組みしない。REPAIR-2）。
+#[derive(Debug)]
+pub enum CliExit {
+    /// 成功（終了コード 0・出力なし。OCI の create / start は成功時に何も出さない）。
+    Success,
+    /// 使い方エラー・未実装などの固定文言の失敗。
+    Fixed {
+        exit_code: u8,
+        code: &'static str,
+        message: &'static str,
+    },
+    /// core のライフサイクル操作の失敗（ERR-2。終了コードは `OciRuntimeError::exit_code`）。
+    Runtime(OciRuntimeError),
 }
 
 impl CliExit {
     /// プロセスの終了コード。
     pub fn exit_code(&self) -> u8 {
-        self.exit_code
+        match self {
+            CliExit::Success => 0,
+            CliExit::Fixed { exit_code, .. } => *exit_code,
+            CliExit::Runtime(e) => e.exit_code().get(),
+        }
     }
 
-    /// 機械可読なエラーコード。
-    pub fn code(&self) -> &'static str {
-        self.code
+    /// 失敗の機械可読なエラーコード文字列（成功は `None`）。
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            CliExit::Success => None,
+            CliExit::Fixed { code, .. } => Some(code),
+            CliExit::Runtime(e) => Some(e.code().as_str()),
+        }
     }
 
-    /// 英語の固定メッセージ。
-    pub fn message(&self) -> &'static str {
-        self.message
-    }
-
-    /// stderr へ出す 1 行 JSON。値は固定文言のみ（構築経路が module 内に限られる）でエスケープ不要。
-    pub fn to_json_line(&self) -> String {
-        format!(
-            "{{\"code\":\"{}\",\"message\":\"{}\"}}",
-            self.code, self.message
-        )
+    /// stderr へ失敗の 1 行 JSON（LF 終端）を書く。成功では何も書かない。
+    pub fn write_stderr(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        match self {
+            CliExit::Success => Ok(()),
+            CliExit::Fixed { code, message, .. } => {
+                writeln!(out, "{{\"code\":\"{code}\",\"message\":\"{message}\"}}")
+            }
+            CliExit::Runtime(e) => e.write_json_line(out),
+        }
     }
 }
 
-/// argv（プログラム名を除く）を解釈して実行する。現時点では常に失敗を返す（本体は未実装）。
-///
-/// 引数値は出力へ埋め込まない（インジェクション回避）。
-pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> CliExit {
-    let usage = CliExit {
+fn usage() -> CliExit {
+    CliExit::Fixed {
         exit_code: EXIT_USAGE,
         code: "INVALID_ARGUMENT",
         message: "usage: fandhe-container <create|start|stop|delete|list|logs>",
+    }
+}
+
+fn unimplemented_command() -> CliExit {
+    CliExit::Fixed {
+        exit_code: EXIT_UNIMPLEMENTED,
+        code: "UNIMPLEMENTED",
+        message: "command is not implemented yet",
+    }
+}
+
+/// argv（プログラム名を除く）を解釈して実行する。
+///
+/// `create` / `start` は core を呼ぶ（TASK-79.2.1）。他のコマンドは未実装として失敗を返す。
+/// 引数値は出力へ埋め込まない（インジェクション回避）。
+pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> CliExit {
+    let Ok((global, rest)) = parse_global(args.into_iter().collect()) else {
+        return usage();
     };
-    let mut it = args.into_iter();
+    let mut it = rest.into_iter();
     let Some(first) = it.next() else {
-        return usage;
+        return usage();
     };
-    let Some(name) = first.to_str() else {
-        return usage;
+    let Some(command) = first.to_str().and_then(Command::parse) else {
+        return usage();
     };
-    match Command::parse(name) {
-        Some(_) => CliExit {
-            exit_code: EXIT_UNIMPLEMENTED,
-            code: "UNIMPLEMENTED",
-            message: "command is not implemented yet",
+    let tail: Vec<OsString> = it.collect();
+    match command {
+        Command::Create => match parse_create(tail) {
+            Ok(a) => create_start::run_create(&global, &a),
+            Err(_) => usage(),
         },
-        None => usage,
+        Command::Start => match parse_start(tail) {
+            Ok(a) => create_start::run_start(&global, &a),
+            Err(_) => usage(),
+        },
+        Command::Stop | Command::Delete | Command::List | Command::Logs => unimplemented_command(),
     }
 }
 
@@ -125,6 +170,12 @@ mod tests {
 
     fn args(v: &[&str]) -> Vec<OsString> {
         v.iter().map(OsString::from).collect()
+    }
+
+    fn stderr_of(e: &CliExit) -> String {
+        let mut buf = Vec::new();
+        e.write_stderr(&mut buf).expect("write");
+        String::from_utf8(buf).expect("utf8")
     }
 
     /// CLI-1: 6 コマンド名が列挙値に対応する。
@@ -153,33 +204,52 @@ mod tests {
         assert_eq!(Command::parse(""), None);
     }
 
-    /// CLI-1: 引数なし・未知コマンドは使い方エラー。
+    /// CLI-1: 引数なし・未知コマンド・引数不足の create / start は使い方エラー（2）。
     #[test]
     fn cli1_run_usage_errors() {
-        for a in [args(&[]), args(&["run"]), args(&[""])] {
+        for a in [
+            args(&[]),
+            args(&["run"]),
+            args(&[""]),
+            args(&["--root", "/r"]),
+            args(&["create"]),
+            args(&["start"]),
+        ] {
             let r = run(a);
             assert_eq!(r.exit_code(), 2);
-            assert_eq!(r.code(), "INVALID_ARGUMENT");
+            assert_eq!(r.code(), Some("INVALID_ARGUMENT"));
         }
     }
 
-    /// CLI-1: 既知コマンドは未実装として非ゼロ終了。
+    /// CLI-1: create / start 以外の既知コマンドは未実装として終了コード 8。
     #[test]
-    fn cli1_run_known_is_unimplemented() {
-        for c in Command::ALL {
+    fn cli1_run_other_commands_are_unimplemented() {
+        for c in [Command::Stop, Command::Delete, Command::List, Command::Logs] {
             let r = run(args(&[c.as_str()]));
-            assert_eq!(r.exit_code(), 3);
-            assert_eq!(r.code(), "UNIMPLEMENTED");
+            assert_eq!(r.exit_code(), 8);
+            assert_eq!(r.code(), Some("UNIMPLEMENTED"));
         }
     }
 
-    /// 出力は固定文言の 1 行 JSON。
+    /// 出力: 成功は 0 バイト、固定文言は 1 行 JSON、core 由来は op 付き 1 行 JSON。
     #[test]
-    fn json_line_is_fixed() {
-        let r = run(args(&["create"]));
+    fn err2_write_stderr_formats() {
+        assert_eq!(stderr_of(&CliExit::Success), "");
+        assert_eq!(CliExit::Success.exit_code(), 0);
         assert_eq!(
-            r.to_json_line(),
-            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"command is not implemented yet\"}"
+            stderr_of(&run(args(&["stop"]))),
+            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"command is not implemented yet\"}\n"
+        );
+        let e = OciRuntimeError::new(
+            fandhe_container_core::oci_runtime::LifecycleOp::Start,
+            fandhe_container_core::traits::ErrorCode::NotFound,
+            "missing",
+        );
+        let exit = CliExit::Runtime(e);
+        assert_eq!(exit.exit_code(), 3);
+        assert_eq!(
+            stderr_of(&exit),
+            "{\"op\":\"start\",\"code\":\"NOT_FOUND\",\"message\":\"missing\"}\n"
         );
     }
 }

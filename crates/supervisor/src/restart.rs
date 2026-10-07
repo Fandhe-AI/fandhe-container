@@ -2409,9 +2409,51 @@ mod tests {
         assert_eq!(rec.restart_count(), 1);
         assert_eq!(rec.status().state(), ContainerState::Running);
         assert_eq!(rec.status().pid().map(NonZeroU32::get), Some(43));
+        assert_eq!(rec.supervision().supervisor_pid(), None);
     }
 
-    /// terminate に成功するが、その間に別の supervisor（pid 999）が監視権を取る起動ハンドル。
+    /// terminate の時点の記録上の監視権を控える起動ハンドル。
+    struct RecordsOwner(Arc<Store>, Arc<Mutex<Vec<Option<u32>>>>);
+
+    impl LaunchedProcess for RecordsOwner {
+        fn pid(&self) -> NonZeroU32 {
+            pidn(43)
+        }
+        fn wait(&self, _: Duration) -> Result<Option<ProcessExit>, TraitError> {
+            Ok(None)
+        }
+        fn terminate(&self, _: Duration) -> Result<(), TraitError> {
+            let owner = self.0.rec.lock().unwrap().supervision().supervisor_pid();
+            self.1.lock().unwrap().push(owner.map(NonZeroU32::get));
+            Ok(())
+        }
+    }
+
+    /// SUP-3・SUP-1・TASK-159.3: 停止要求による再起動の取り消しは、監視権（自 pid）を取った状態で terminate する
+    /// （別の supervisor が監視権を取れない間だけ終了させる）。取り消し後は Stopped・restart_count == 0・監視権なし。
+    #[test]
+    fn sup3_task159_3_stop_racing_running_record_terminates_under_own_claim() {
+        let st = store(0, 42);
+        let stop = StopToken::new();
+        *st.stop_on_restart_write.lock().unwrap() = Some((stop.clone(), false));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let out = run_once(&st, Box::new(RecordsOwner(st.clone(), seen.clone())), &stop);
+        assert!(matches!(
+            out,
+            SuperviseOutcome::Stopped {
+                process: None,
+                restarts: 0,
+                ..
+            }
+        ));
+        assert_eq!(*seen.lock().unwrap(), vec![Some(std::process::id())]);
+        let rec = st.rec.lock().unwrap();
+        assert_eq!(rec.restart_count(), 0);
+        assert_eq!(rec.status().state(), ContainerState::Stopped);
+        assert_eq!(rec.supervision().supervisor_pid(), None);
+    }
+
+    /// terminate に成功するが、その間に記録上の監視権が別の supervisor（pid 999）へ書き換わる起動ハンドル。
     struct ClaimedWhileTerminating(Arc<Store>);
 
     impl LaunchedProcess for ClaimedWhileTerminating {
@@ -2436,7 +2478,7 @@ mod tests {
         }
     }
 
-    /// SUP-3・REPAIR-5・TASK-159.3: 新プロセスの終了確認後に記録を戻せない（別の supervisor が監視権を取った）場合は
+    /// SUP-3・REPAIR-5・TASK-159.3: 新プロセスの終了確認後に記録を戻せない（監視権が別の supervisor へ書き換わった）場合は
     /// `RestartUnrecorded`（FailedPrecondition・terminate_error なし・restarts == 0）で返し、他者の記録
     /// （Running(43)・restart_count == 1・監視権 999）を上書きしない。
     #[test]

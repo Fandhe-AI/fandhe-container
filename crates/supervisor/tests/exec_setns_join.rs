@@ -9,8 +9,11 @@
 //! # 試験専用の入口（`exec-test-support` feature）
 //! 試験環境ではコンテナ用 cgroup（`<scope>/fc-<id>@<instance>`）を作れないため、期待 cgroup パスを
 //! 呼び出し側から渡す `identify_pid1_in` を使う。この入口は `exec-test-support` feature を付けたビルドにだけ
-//! 存在し（本 target は `required-features` で要求する）、既定のビルドの公開 API は記録から期待値を導く
-//! `identify_pid1` だけである（SEC-1）。
+//! 存在し、既定のビルドの公開 API は記録から期待値を導く `identify_pid1` だけである（SEC-1）。
+//! feature なしのビルドでは本体をコンパイルせず、`-- --ignored` で実行を求められたら「検証していない」
+//! ことを非ゼロ終了で知らせる（検証せずに成功しない。fail-closed）。`required-features` にしないのは、
+//! `cargo test --workspace --test '*'`（`make test-integration`）が feature なしで本 target を選ぶと
+//! エラーになるため。
 //!
 //! # 単一スレッドの独自 main（harness = false）
 //! `setns(CLONE_NEWNS)` は複数スレッドのプロセスから拒否されるため、libtest ではなく独自 `main` で動かす。
@@ -27,7 +30,20 @@ fn main() {
     println!("exec_setns_join: Linux only, not applicable on this OS");
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "exec-test-support")))]
+fn main() {
+    if std::env::args().any(|a| a == "--ignored" || a == "--joiner") {
+        eprintln!(
+            "exec_setns_join: not verified; rebuild with `--features exec-test-support` (see AGENTS.md)"
+        );
+        std::process::exit(2);
+    }
+    println!(
+        "exec_setns_join: ignored (real-machine test; run with `-- --ignored`, see AGENTS.md)"
+    );
+}
+
+#[cfg(all(target_os = "linux", feature = "exec-test-support"))]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--joiner") {
@@ -45,7 +61,7 @@ fn main() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "exec-test-support"))]
 mod linux {
     use std::fs;
     use std::num::NonZeroU32;

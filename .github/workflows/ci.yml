@@ -629,6 +629,9 @@ jobs:
       # 疑似 /proc（mktemp -d 配下）だけで照合し、ランナーの実プロセスは計測しない（実測は製品バイナリ提供後に #485）
       - name: 監視プロセス常駐メモリ計測スクリプトの自己テスト（TASK-158・SUP-2・REPAIR-12）
         run: make supervisor-pss-selftest
+      # スタブ launcher だけで照合し、実コンテナ・root は使わない。実機での実測と SUP-3 の判定は #491（人間担当）
+      - name: restart レイテンシ計測スクリプトの自己テスト（TASK-160・SUP-3・REPAIR-12）
+        run: make restart-latency-selftest
       - name: ベンチ比較の配線確認（プレースホルダ・性能回帰は未検出）
         run: make bench-check
       # 計測とログ出力のみ。baseline.json 未登録のため基準値比較はせず、Δp50 の 15% 回帰判定は

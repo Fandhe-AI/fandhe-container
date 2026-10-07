@@ -9,6 +9,7 @@
 //! | ----- | ---- | ------ |
 //! | #526（TASK-169.1） | ulimit（`--ulimit <name>=<soft>[:<hard>]`）。core の [`Rlimits`] へ変換して保持 | exec ステージの `prlimit(2)` |
 //! | #529（TASK-169.4） | env・env ファイル（[`env`]） | `execve` の envp |
+//! | #855（TASK-169.5.1） | label（`--label`。[`labels`]） | state.json の `annotations`（core の `StateRecord`） |
 //!
 //! secrets / configs の tmpfs 注入（#529 の後半）は、tmpfs 機構（#527・TASK-169.2）のマージ待ちで未実装（REPAIR-3）。
 //!
@@ -25,7 +26,7 @@
 //! # 未結線の箇所（REPAIR-3）
 //!
 //! 本番の `ProcessLauncher` が未提供のため、現時点で [`ContainerOptions`] の消費者は無い
-//! （CLI・launcher からの結線は後続作業）。OS 非依存で、3 OS でビルド・テストする。
+//! （CLI・launcher からの結線は後続作業。label を `CreateStateRequest::with_annotations` へ渡す結線も同様）。OS 非依存で、3 OS でビルド・テストする。
 //!
 //! # 外部入力の扱い
 //!
@@ -34,9 +35,11 @@
 
 pub mod env;
 pub mod ipc;
+pub mod labels;
 pub mod mounts;
 
 pub use ipc::IpcMode;
+pub use labels::{Label, Labels};
 pub use mounts::{DEFAULT_SHM_SIZE_BYTES, MountOptions, ShmSize, TmpfsOption};
 
 use self::env::EnvSet;
@@ -84,13 +87,14 @@ impl Ulimit {
     }
 }
 
-/// コンテナ起動オプション（現状は ulimit・`--ipc`・env。後続 issue が拡張する）。
+/// コンテナ起動オプション（現状は ulimit・`--ipc`・env・label。後続 issue が拡張する）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ContainerOptions {
     rlimits: Rlimits,
     ipc: IpcMode,
     env: EnvSet,
+    labels: Labels,
 }
 
 impl ContainerOptions {
@@ -125,6 +129,17 @@ impl ContainerOptions {
     /// `exec::Entrypoint::new` の `env` へ渡す元（`EnvSet::to_env_strings`）。
     pub fn env(&self) -> &EnvSet {
         &self.env
+    }
+
+    /// 統合済みの label を設定する（`Labels::resolve` の結果。SUP-12・TASK-169.5.1）。
+    pub fn with_labels(mut self, labels: Labels) -> Self {
+        self.labels = labels;
+        self
+    }
+
+    /// label。`labels().annotations()` を `CreateStateRequest::with_annotations` へ渡すと state.json に反映される。
+    pub fn labels(&self) -> &Labels {
+        &self.labels
     }
 
     /// core の `StagePipeline::with_rlimits` へ渡す集合。
@@ -263,6 +278,7 @@ mod tests {
             [(RlimitKind::Nofile, 1024, 2048), (RlimitKind::Core, 0, 0)]
         );
         assert!(ContainerOptions::new().rlimits().is_empty());
+        assert!(ContainerOptions::new().labels().is_empty());
         assert_eq!(ContainerOptions::new().ipc_mode(), IpcMode::Private);
         assert_eq!(
             ContainerOptions::new()
@@ -277,5 +293,20 @@ mod tests {
             ])
             .unwrap_err();
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    }
+
+    /// SUP-12・TASK-169.5.1: with_labels で指定した label が labels() から具体値で読める。
+    #[test]
+    fn sup12_options_holds_labels() {
+        let labels = Labels::resolve(vec![
+            Label::parse("app=web").unwrap(),
+            Label::parse("tier").unwrap(),
+        ])
+        .unwrap();
+        let opts = ContainerOptions::new().with_labels(labels);
+        assert_eq!(
+            opts.labels().iter().collect::<Vec<_>>(),
+            [("app", "web"), ("tier", "")]
+        );
     }
 }

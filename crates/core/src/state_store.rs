@@ -72,7 +72,7 @@
 //! 同じ扱いである（CLI-1）。Linux でも `open(2)` フラグの値を `sys` が持たないアーキテクチャ
 //! （x86_64・aarch64 以外）では同様に `Unimplemented`
 
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -85,7 +85,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::{
-    CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, CreateStateRequest,
+    Annotations, CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, CreateStateRequest,
     DeleteStateRequest, DeleteStateResponse, ErrorCode, GetStateRequest, HealthStatus,
     ListStateRequest, StateList, StateListCursor, StateRecord, StateRevision, StateStore,
     SupervisionState, TraitError, UpdateStateRequest,
@@ -733,6 +733,10 @@ impl StateStore for FileStateStore {
         if let Some(sup) = req.supervision() {
             record = record.with_supervision(sup);
         }
+        // label は指定があればその値、なければ空（トレイト契約 10。SUP-12・TASK-169.5.1）。
+        if let Some(a) = req.annotations() {
+            record = record.with_annotations(a.clone());
+        }
         self.write_record(&record)?;
         Ok(record)
     }
@@ -762,6 +766,8 @@ impl StateStore for FileStateStore {
         // 監視状態は指定があれば置き換え、なければ引き継ぐ（トレイト契約 9。CLI 側の status 更新で
         // supervisor の項目を消さないため。SUP-1・TASK-157.2）。
         record = record.with_supervision(req.supervision().unwrap_or(existing.supervision()));
+        // label は作成時の値を変えずに引き継ぐ（トレイト契約 10。supervisor の status 更新で消さない）。
+        record = record.with_annotations(existing.annotations().clone());
         self.write_record(&record)?;
         Ok(record)
     }
@@ -1233,6 +1239,8 @@ fn open_nowait(path: &Path, opts: &mut OpenOptions) -> std::io::Result<File> {
 /// [`SupervisionState`] に対応する。`supervisorPid` と `health` は `None` なら書かず、`restartCount` は
 /// 常に書く。`supervisorPid` が 0・`health` が `starting` / `healthy` / `unhealthy` 以外の文字列の場合は
 /// 破損（`Internal`）とする（型不一致・負値・`u32` 超過は JSON 復号の失敗として同じく破損扱い）。
+/// `annotations`（SUP-12・TASK-169.5.1。label）は空なら書かない。不正（件数・長さ超過・不正キー）は
+/// 破損（`Internal`）とし、キーの無い既存ファイルは空として読む。
 /// 3 つとも持たない既存の `state.json`（導入前の版が書いたもの）は PID なし・未設定・0 回として読む
 /// （導入前は supervisor がこれらを書いていないため、破損にしない）。
 #[derive(Debug, Serialize, Deserialize)]
@@ -1257,6 +1265,8 @@ struct StateDto {
     health: Option<String>,
     #[serde(default)]
     restart_count: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    annotations: BTreeMap<String, String>,
 }
 
 impl StateDto {
@@ -1276,6 +1286,11 @@ impl StateDto {
             supervisor_pid: record.supervisor_pid().map(NonZeroU32::get),
             health: record.health().map(|h| h.as_str().to_owned()),
             restart_count: record.restart_count(),
+            annotations: record
+                .annotations()
+                .iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
         })
     }
 
@@ -1324,6 +1339,8 @@ impl StateDto {
             Some(h) => Some(HealthStatus::parse(h).ok_or_else(corrupted)?),
             None => None,
         };
+        // state.json は untrusted。書き込み側と同じ上限・キー形式で再検証し、違反は破損とする。
+        let annotations = Annotations::new(self.annotations).map_err(|_| corrupted())?;
         let record = StateRecord::new(
             status,
             PathBuf::from(self.bundle),
@@ -1334,7 +1351,8 @@ impl StateDto {
             supervisor_pid,
             health,
             self.restart_count,
-        ));
+        ))
+        .with_annotations(annotations);
         Ok(match cgroup {
             Some(c) => record.with_cgroup(c),
             None => record,
@@ -1511,7 +1529,7 @@ mod platform_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use crate::traits::ContainerState;
+    use crate::traits::{ANNOTATIONS_MAX_ENTRIES, ANNOTATIONS_MAX_TOTAL_BYTES, ContainerState};
     use std::num::NonZeroU32;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -1902,6 +1920,115 @@ mod tests {
             store.purge_corrupted(&cid(id)).unwrap();
         }
         assert!(store.list(&list_req(10)).unwrap().records().is_empty());
+    }
+
+    fn ann(pairs: &[(&str, &str)]) -> Annotations {
+        Annotations::new(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string()))).unwrap()
+    }
+
+    /// SUP-12・TASK-169.5.1: create の annotations が `state.json` に書かれ、update（監視状態変更を含む）で
+    /// 引き継がれ、再オープン後の get でも同じ値で読める（契約 10）。
+    #[test]
+    fn sup12_task169_5_1_annotations_persist_and_survive_update() {
+        let t = TmpDir::new("ann");
+        let store = t.open();
+        let labels = ann(&[("app", "web"), ("env", ""), ("com.example.tier", "a=b")]);
+        let req = CreateStateRequest::new(ContainerStatus::created(cid("web"), None), bundle())
+            .unwrap()
+            .with_annotations(labels.clone());
+        let rec = store.create(&req).unwrap();
+        assert_eq!(rec.annotations(), &labels);
+        let v = read_json(&t, "web");
+        assert_eq!(
+            v["annotations"],
+            serde_json::json!({"app": "web", "env": "", "com.example.tier": "a=b"})
+        );
+
+        let status = ContainerStatus::running(cid("web"), NonZeroU32::new(100));
+        let updated = store
+            .update(
+                &UpdateStateRequest::new(status, rec.revision()).with_supervision(sup(
+                    4242,
+                    Some(HealthStatus::Healthy),
+                    1,
+                )),
+            )
+            .unwrap();
+        assert_eq!(updated.annotations(), &labels);
+        let got = t.open().get(&GetStateRequest::new(cid("web"))).unwrap();
+        assert_eq!(got.annotations().get("app"), Some("web"));
+        assert_eq!(got.annotations().get("env"), Some(""));
+        assert_eq!(got.annotations().get("com.example.tier"), Some("a=b"));
+        assert_eq!(got.annotations().len(), 3);
+    }
+
+    /// SUP-12・TASK-169.5.1: annotations 無しのレコードは `annotations` キーを書かず、キーの無い既存
+    /// `state.json` は空として読める（破損にしない）。
+    #[test]
+    fn sup12_task169_5_1_absent_annotations_are_omitted_and_legacy_reads_empty() {
+        let t = TmpDir::new("annempty");
+        let store = t.open();
+        let rec = create(&store, "plain");
+        assert!(rec.annotations().is_empty());
+        assert!(read_json(&t, "plain").get("annotations").is_none());
+        let legacy = format!(
+            r#"{{"ociVersion":"1.2.0","id":"plain","status":"stopped","bundle":"{}","revision":{}}}"#,
+            bundle().to_str().unwrap(),
+            rec.revision().value()
+        );
+        fs::write(t.path().join("plain").join("state.json"), legacy).unwrap();
+        let got = store.get(&GetStateRequest::new(cid("plain"))).unwrap();
+        assert!(got.annotations().is_empty());
+    }
+
+    /// SUP-12・TASK-169.5.1: 不正な annotations（空キー・`=`・NUL・件数超過・型違い）を持つ
+    /// `state.json` は破損（`Internal`）として扱う。
+    #[test]
+    fn sup12_task169_5_1_invalid_annotations_are_corrupted() {
+        let t = TmpDir::new("annbad");
+        let store = t.open();
+        let many: String = (0..=ANNOTATIONS_MAX_ENTRIES)
+            .map(|i| format!(r#""k{i}":"v""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let bad = [
+            ("a", r#""annotations":{"":"v"}"#.to_string()),
+            ("b", r#""annotations":{"a=b":"v"}"#.to_string()),
+            ("c", r#""annotations":{"a":"v\u0000"}"#.to_string()),
+            ("d", format!(r#""annotations":{{{many}}}"#)),
+            ("e", r#""annotations":{"a":1}"#.to_string()),
+        ];
+        for (id, fields) in bad {
+            create(&store, id);
+            let body = format!(
+                r#"{{"ociVersion":"1.2.0","id":"{id}","status":"stopped","bundle":"/b","revision":10,{fields}}}"#
+            );
+            fs::write(t.path().join(id).join("state.json"), body).unwrap();
+            let e = store.get(&GetStateRequest::new(cid(id))).unwrap_err();
+            assert_eq!(e.code().as_str(), "INTERNAL", "{id}");
+        }
+    }
+
+    /// SUP-12・TASK-169.5.1: 上限いっぱいの annotations でも state.json の 64 KiB 上限に収まり書ける。
+    #[test]
+    fn sup12_task169_5_1_max_annotations_fit_in_state_file() {
+        let t = TmpDir::new("annmax");
+        let store = t.open();
+        let per = ANNOTATIONS_MAX_TOTAL_BYTES / ANNOTATIONS_MAX_ENTRIES;
+        let entries: Vec<(String, String)> = (0..ANNOTATIONS_MAX_ENTRIES)
+            .map(|i| {
+                let key = format!("{i:03}");
+                let value = "\"".repeat(per - key.len());
+                (key, value)
+            })
+            .collect();
+        let labels = Annotations::new(entries).unwrap();
+        let req = CreateStateRequest::new(ContainerStatus::created(cid("big"), None), bundle())
+            .unwrap()
+            .with_annotations(labels.clone());
+        store.create(&req).unwrap();
+        let got = t.open().get(&GetStateRequest::new(cid("big"))).unwrap();
+        assert_eq!(got.annotations(), &labels);
     }
 
     #[test]

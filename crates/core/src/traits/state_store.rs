@@ -43,6 +43,11 @@
 //!    （CLI 側の status 更新で supervisor の項目を消さないため）。`get` / `list` で返す。plugin 実装も
 //!    同じく往復させる。3 項目の相互関係や `status` との制約は本トレイトでは課さない（監視ループの仕様は
 //!    supervisor 側のタスクで決める）
+//! 10. [`StateRecord::annotations`]（コンテナの label。`--label` 相当。SUP-12・TASK-169.5.1）は、`create` で
+//!     [`CreateStateRequest::with_annotations`] の指定があればその値、なければ空で記録し、`update` では
+//!     変えずに引き継ぐ（[`UpdateStateRequest`] には持たせない。supervisor の status 更新で label を消さない。
+//!     契約 8 と同じ形）。`get` / `list` で返す。plugin 実装も同じく往復させる。純粋なメタデータで、
+//!     分離・権限・cgroup 等の判断には使わない
 //!
 //! メソッドは同期（`&self`、`async fn` を使わない）にし、ジェネリクスも持たない。
 //! `ContainerRuntime`（TASK-4.1）と同じく dyn 互換（object safety）を保つ。
@@ -340,6 +345,80 @@ impl SupervisionState {
     }
 }
 
+/// [`Annotations`] の件数上限（SUP-12・TASK-169.5.1）。
+pub const ANNOTATIONS_MAX_ENTRIES: usize = 64;
+/// [`Annotations`] のキー 1 件の最大バイト数。
+pub const ANNOTATION_MAX_KEY_BYTES: usize = 255;
+/// [`Annotations`] の全キー・値の合計最大バイト数。
+///
+/// state.json 全体の上限（64 KiB）に対し、JSON エスケープで最悪 6 倍になっても収まる水準。
+pub const ANNOTATIONS_MAX_TOTAL_BYTES: usize = 8 * 1024;
+
+/// コンテナのメタデータ（label。OCI state の `annotations` に対応。SUP-12・TASK-169.5.1・MS-9）。
+///
+/// 文字列 → 文字列の順序付き map（出力順を決定的にするため `BTreeMap`）。件数・長さ・キー形式を
+/// 構築時に検証し、壊れた値を表現させない。supervisor の `--label` 解析結果が
+/// [`CreateStateRequest::with_annotations`] 経由で [`StateRecord`] に載り、`FileStateStore` が
+/// `state.json` へ永続化する。純粋なメタデータで、分離・権限の判断には使わない。
+/// 値は利用者入力だが秘密情報の置き場ではないため、`Debug` は伏せない。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Annotations(std::collections::BTreeMap<String, String>);
+
+impl Annotations {
+    /// (key, value) の列から作る。同一キーは後勝ち。
+    ///
+    /// キーは空でなく `=`・NUL・制御文字を含まず、値は NUL を含まない。件数・キー長・合計長が
+    /// 上限（[`ANNOTATIONS_MAX_ENTRIES`] 等）を超えると `InvalidArgument`（エラー文言に入力値を含めない）。
+    pub fn new(entries: impl IntoIterator<Item = (String, String)>) -> Result<Self, TraitError> {
+        let invalid = |m: &'static str| TraitError::new(ErrorCode::InvalidArgument, m);
+        let mut map: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+        // 現在の map の key+value 合計。挿入ごとに増減を反映し、巨大入力でも確保前に打ち切る。
+        let mut total: usize = 0;
+        for (key, value) in entries {
+            if key.is_empty() || key.contains(['=', '\0']) || key.chars().any(char::is_control) {
+                return Err(invalid("annotation key is invalid"));
+            }
+            if key.len() > ANNOTATION_MAX_KEY_BYTES {
+                return Err(invalid("annotation key is too long"));
+            }
+            if value.contains('\0') {
+                return Err(invalid("annotation value must not contain NUL"));
+            }
+            let old = map.get(&key).map_or(0, |v| key.len() + v.len());
+            if old == 0 && map.len() >= ANNOTATIONS_MAX_ENTRIES {
+                return Err(invalid("too many annotations"));
+            }
+            let next_total = total - old + key.len() + value.len();
+            if next_total > ANNOTATIONS_MAX_TOTAL_BYTES {
+                return Err(invalid("annotations are too large"));
+            }
+            total = next_total;
+            map.insert(key, value);
+        }
+        Ok(Self(map))
+    }
+
+    /// 指定キーの値。
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).map(String::as_str)
+    }
+
+    /// キー昇順の (key, value) 列。
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    /// 件数。
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// 空かどうか。
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// コンテナ状態のレコード（[`StateStore`] が保持・返却する単位）。
 ///
 /// 真偽値やフラットな文字列ではなく、将来の拡張に備えて構造化された型にする
@@ -359,6 +438,8 @@ pub struct StateRecord {
     health: Option<HealthStatus>,
     /// 再起動回数。supervisor（TASK-157）が使う（SUP-1）。
     restart_count: u32,
+    /// コンテナの label（契約 10。SUP-12・TASK-169.5.1）。
+    annotations: Annotations,
 }
 
 impl StateRecord {
@@ -386,7 +467,20 @@ impl StateRecord {
             supervisor_pid: None,
             health: None,
             restart_count: 0,
+            annotations: Annotations::default(),
         })
+    }
+
+    /// label を設定する（[`Self::annotations`]）。ストア実装が create・読み込みで使う。
+    #[must_use]
+    pub fn with_annotations(mut self, annotations: Annotations) -> Self {
+        self.annotations = annotations;
+        self
+    }
+
+    /// コンテナの label を返す（契約 10。SUP-12・TASK-169.5.1）。
+    pub fn annotations(&self) -> &Annotations {
+        &self.annotations
     }
 
     /// 監視状態（`supervisor_pid`・`health`・`restart_count`）を設定する（[`Self::supervision`]）。
@@ -472,6 +566,7 @@ pub struct CreateStateRequest {
     bundle: PathBuf,
     cgroup_scope: Option<CgroupScope>,
     supervision: Option<SupervisionState>,
+    annotations: Option<Annotations>,
 }
 
 impl CreateStateRequest {
@@ -490,7 +585,20 @@ impl CreateStateRequest {
             bundle,
             cgroup_scope: None,
             supervision: None,
+            annotations: None,
         })
+    }
+
+    /// 記録する label を指定する（SUP-12・TASK-169.5.1。契約 10）。未指定なら空で作る。
+    #[must_use]
+    pub fn with_annotations(mut self, annotations: Annotations) -> Self {
+        self.annotations = Some(annotations);
+        self
+    }
+
+    /// 指定された label を返す（未指定なら `None`）。
+    pub fn annotations(&self) -> Option<&Annotations> {
+        self.annotations.as_ref()
     }
 
     /// 記録する監視状態を指定する（supervisor〔TASK-157〕が使う。SUP-1。契約 9）。未指定なら既定値で作る。
@@ -852,6 +960,10 @@ mod tests {
             if let Some(sup) = req.supervision() {
                 record = record.with_supervision(sup);
             }
+            // 契約 10: label は指定があればその値、なければ空。
+            if let Some(a) = req.annotations() {
+                record = record.with_annotations(a.clone());
+            }
             records.insert(req.id().clone(), record.clone());
             Ok(record)
         }
@@ -876,6 +988,8 @@ mod tests {
             }
             // 契約 9: 監視状態は指定があれば置き換え、なければ引き継ぐ。
             updated = updated.with_supervision(req.supervision().unwrap_or(current.supervision()));
+            // 契約 10: label は update で変えずに引き継ぐ。
+            updated = updated.with_annotations(current.annotations().clone());
             records.insert(req.id().clone(), updated.clone());
             Ok(updated)
         }
@@ -1292,6 +1406,90 @@ mod tests {
 
     /// TASK-30.3・OCI-6: `CgroupScope` はルート `/` と `/a/b` 形式だけを受理し、相対・空要素・`.`・`..`・
     /// NUL・要素長 / 深さ / 全体長の超過を `INVALID_ARGUMENT` で拒否する。
+    fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter()
+            .map(|(k, x)| (k.to_string(), x.to_string()))
+            .collect()
+    }
+
+    /// SUP-12・TASK-169.5.1: Annotations は妥当な入力を保持し、同一キーは後勝ち・キー昇順で返す。
+    #[test]
+    fn sup12_task169_5_1_annotations_accepts_valid_and_last_wins() {
+        let a = Annotations::new(pairs(&[
+            ("b", "2"),
+            ("a", "1"),
+            ("b", "3"),
+            ("e", ""),
+            ("日本", "語"),
+        ]))
+        .unwrap();
+        assert_eq!(a.len(), 4);
+        assert_eq!(
+            a.iter().collect::<Vec<_>>(),
+            [("a", "1"), ("b", "3"), ("e", ""), ("日本", "語")]
+        );
+        assert_eq!(a.get("b"), Some("3"));
+        assert_eq!(a.get("zz"), None);
+        assert!(Annotations::default().is_empty());
+    }
+
+    /// SUP-12・TASK-169.5.1: 空キー・`=`・NUL・制御文字・長さ・件数・合計の超過は InvalidArgument。
+    #[test]
+    fn sup12_task169_5_1_annotations_rejects_invalid() {
+        for bad in [
+            pairs(&[("", "v")]),
+            pairs(&[("a=b", "v")]),
+            pairs(&[("a\0", "v")]),
+            pairs(&[("a\n", "v")]),
+            pairs(&[("a", "v\0")]),
+        ] {
+            let e = Annotations::new(bad).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        }
+        let long_key = "k".repeat(ANNOTATION_MAX_KEY_BYTES + 1);
+        assert!(Annotations::new(vec![(long_key, String::new())]).is_err());
+        let ok_key = "k".repeat(ANNOTATION_MAX_KEY_BYTES);
+        assert!(Annotations::new(vec![(ok_key, String::new())]).is_ok());
+        let many = (0..=ANNOTATIONS_MAX_ENTRIES).map(|i| (format!("k{i}"), String::new()));
+        assert!(Annotations::new(many).is_err());
+        let exact = (0..ANNOTATIONS_MAX_ENTRIES).map(|i| (format!("k{i}"), String::new()));
+        assert_eq!(
+            Annotations::new(exact).unwrap().len(),
+            ANNOTATIONS_MAX_ENTRIES
+        );
+        let big = vec![("a".to_string(), "v".repeat(ANNOTATIONS_MAX_TOTAL_BYTES))];
+        assert!(Annotations::new(big).is_err());
+        let fit = vec![("a".to_string(), "v".repeat(ANNOTATIONS_MAX_TOTAL_BYTES - 1))];
+        assert!(Annotations::new(fit).is_ok());
+        // 同一キーの上書きは合計を二重計上しない。
+        let overwrite = vec![
+            ("a".to_string(), "v".repeat(ANNOTATIONS_MAX_TOTAL_BYTES - 1)),
+            ("a".to_string(), "v".repeat(ANNOTATIONS_MAX_TOTAL_BYTES - 1)),
+        ];
+        assert!(Annotations::new(overwrite).is_ok());
+    }
+
+    /// SUP-12・TASK-169.5.1: スタブストアでも契約 10（create で記録・update で引き継ぎ）が成り立つ。
+    #[test]
+    fn sup12_task169_5_1_annotations_round_trip_through_trait_store() {
+        let store = StubStateStore::new();
+        let labels = Annotations::new(pairs(&[("app", "web")])).unwrap();
+        let id = ContainerId::new("web".to_string()).unwrap();
+        let req = CreateStateRequest::new(
+            ContainerStatus::created(id.clone(), None),
+            std::env::temp_dir(),
+        )
+        .unwrap()
+        .with_annotations(labels.clone());
+        let rec = store.create(&req).unwrap();
+        assert_eq!(rec.annotations(), &labels);
+        let status = ContainerStatus::stopped(id, Some(0));
+        let updated = store
+            .update(&UpdateStateRequest::new(status, rec.revision()))
+            .unwrap();
+        assert_eq!(updated.annotations(), &labels);
+    }
+
     #[test]
     fn oci6_task30_3_cgroup_scope_validation() {
         for ok in ["/", "/user.slice", "/user.slice/user-1000.slice/x.scope"] {

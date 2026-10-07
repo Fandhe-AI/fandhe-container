@@ -28,6 +28,7 @@
 //! | #526 | TASK-169.1 | ulimit の指定モデル（[`container_options`]。適用は core の exec ステージ `Rlimits`。launcher 未結線のため消費者は無い。REPAIR-3） |
 //! | #528 | TASK-169.3 | `--ipc`（host / shareable）の指定モデル（[`container_options::ipc`]。Linux では core の `NamespaceSet` へ反映。他コンテナからの join は未実装。REPAIR-3） |
 //! | #529 | TASK-169.4 | env / env ファイル（[`container_options::env`]。実装済み。secrets / configs 注入は tmpfs 機構〔#527〕のマージ待ちで未実装。REPAIR-3） |
+//! | #855 | TASK-169.5.1 | label（`--label`。[`container_options::labels`]。core の `StateRecord::annotations` 経由で state.json へ反映。CLI・launcher 未結線。REPAIR-3） |
 //! | #488 | TASK-159.2 | restart ポリシー評価（実装済み） |
 //! | #858 | TASK-171.1.2 | 権限昇格の必要最小集合と検証ロジック（[`privilege`]。実装済み。昇格 syscall 経路・setuid・fd 検証付き exec は方式承認待ちで未実装。REPAIR-3） |
 //! | #489 | TASK-159.3 | restart_count 管理・state.json 反映・結合テスト（実装済み。本番 launcher は未実装） |

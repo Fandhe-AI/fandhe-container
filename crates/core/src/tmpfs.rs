@@ -134,7 +134,8 @@ impl TmpfsMountSpec {
         Self::new(DEV_SHM_PATH, Some(size))
     }
 
-    /// `mount(2)` の data 文字列（`mode=1777,size=67108864`）。型付きフィールドからのみ組み立てる。
+    /// 表示・照合用の表現（`mode=1777,size=67108864`）。型付きフィールドからのみ組み立てる。カーネルへは
+    /// 渡さない（`crate::exec::mount_tmpfs` は新マウント API へ `mode`・`size` を型付きで渡す。SUP-12・TASK-169 追補・#1472）。
     pub fn data_string(&self) -> String {
         match self.size {
             Some(s) => format!("mode={:o},size={}", self.mode.bits(), s.bytes()),

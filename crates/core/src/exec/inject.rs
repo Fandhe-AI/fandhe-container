@@ -54,7 +54,7 @@ use crate::traits::types::ErrorCode;
 
 use super::tmpfs::{
     Applied, display_destination, mount_tmpfs_syscall, open_chain, roll_back, root_display,
-    verify_mounted,
+    tmpfs_mount_error, verify_mounted,
 };
 use super::{
     ExecError, IsolationStage, MountIsolation, PreparedRootfs, ViolationReason, fd_still_at,
@@ -171,31 +171,21 @@ fn apply_group(
             STAGE,
         ));
     }
-    let target = fd_path(&dir)?;
-    let data = CString::new(format!("mode=0755,size={}", group.tmpfs_size)).map_err(|_| {
-        ExecError::new(
-            ErrorCode::Internal,
-            STAGE,
-            "failed to build the tmpfs mount data",
-        )
-    })?;
     // 書き込み中は rw。`nosuid,nodev,noexec` は常に付く。
-    let rw = sys::TmpfsMountFlags {
-        read_only: false,
-        exec: false,
+    let create = sys::TmpfsCreate {
+        mode: 0o755,
+        size: Some(group.tmpfs_size),
+        flags: sys::TmpfsMountFlags {
+            read_only: false,
+            exec: false,
+        },
     };
-    mount_tmpfs_syscall(&target, rw, &data)
-        .map_err(|e| ExecError::from_sys(e, STAGE, &format!("mount(tmpfs on {shown})")))?;
-    let tmpfs_root = verify_mounted(root, rootfs, &names, group.directory, &dir)
+    // 付け替え直後に自分のマウントの fd を保持する（事後検証に通らなくても後始末が外せる）。
+    let mount_fd = mount_tmpfs_syscall(dir.as_fd(), create)
+        .map_err(|e| tmpfs_mount_error(e, group.directory))?;
+    let tmpfs_root = &*state.mounted.insert(mount_fd);
+    verify_mounted(root, rootfs, &names, group.directory, &dir, tmpfs_root)
         .map_err(|e| e.at_stage(STAGE))?;
-    state.mounted = Some(tmpfs_root);
-    let Some(tmpfs_root) = state.mounted.as_ref() else {
-        return Err(ExecError::new(
-            ErrorCode::Internal,
-            STAGE,
-            "tmpfs root fd is missing",
-        ));
-    };
 
     let mut files = Vec::with_capacity(group.files.len());
     for f in &group.files {
@@ -213,7 +203,7 @@ fn apply_group(
     }
 
     let target = fd_path(tmpfs_root)?;
-    remount_read_only_syscall(&target, rw)
+    remount_read_only_syscall(&target, create.flags)
         .map_err(|e| ExecError::from_sys(e, STAGE, &format!("remount read-only({shown})")))?;
     if !observe_read_only(tmpfs_root)? {
         return Err(ExecError::new(

@@ -198,6 +198,9 @@ pub enum ViolationReason {
     /// cgroup 参加後の呼び出しプロセスの所属 cgroup が、制限を準備した時点の exec の対象のコンテナ cgroup と
     /// 一致しない（同上。SEC-1・TASK-163.4）。
     ExecJoinedCgroupMismatch,
+    /// 起動時から保持する pidfd の指すプロセスが、記録した pid と一致しない（pidfd の取り違え・記録の
+    /// 古さ。cgroup の所属に依らない同一性の照合。SUP-6・SEC-1・TASK-163 追補・#1461）。
+    ExecTargetPidfdMismatch,
 }
 
 impl ViolationReason {
@@ -253,6 +256,7 @@ impl ViolationReason {
             Self::ExecJoinedNamespaceMismatch => "exec_joined_namespace_mismatch",
             Self::ExecJoinedPidNamespaceMismatch => "exec_joined_pid_namespace_mismatch",
             Self::ExecJoinedCgroupMismatch => "exec_joined_cgroup_mismatch",
+            Self::ExecTargetPidfdMismatch => "exec_target_pidfd_mismatch",
         }
     }
 
@@ -306,7 +310,8 @@ impl ViolationReason {
             | Self::ExecRootNotContainerRootfs
             | Self::ExecJoinedNamespaceMismatch
             | Self::ExecJoinedPidNamespaceMismatch
-            | Self::ExecJoinedCgroupMismatch => ViolationKind::ExecTarget,
+            | Self::ExecJoinedCgroupMismatch
+            | Self::ExecTargetPidfdMismatch => ViolationKind::ExecTarget,
         }
     }
 
@@ -328,7 +333,8 @@ impl ViolationReason {
             Self::ExecTargetNotNestedPid1
             | Self::ExecTargetSharesPidNamespace
             | Self::ExecTargetSharesMountNamespace
-            | Self::ExecTargetInOtherUserNamespace => "SUP-6",
+            | Self::ExecTargetInOtherUserNamespace
+            | Self::ExecTargetPidfdMismatch => "SUP-6",
             _ => "CORE-1",
         }
     }
@@ -379,6 +385,7 @@ impl ViolationReason {
             | Self::ExecJoinedNamespaceMismatch
             | Self::ExecJoinedPidNamespaceMismatch
             | Self::ExecJoinedCgroupMismatch
+            | Self::ExecTargetPidfdMismatch
             | Self::ExecDevNotDirectory
             | Self::ExecProcNotProcfs => ErrorCode::FailedPrecondition,
             Self::EntrypointIsRuntimeBinary
@@ -515,6 +522,9 @@ impl ViolationReason {
             }
             Self::ExecJoinedCgroupMismatch => {
                 "the cgroup after joining is not the one of the prepared exec target"
+            }
+            Self::ExecTargetPidfdMismatch => {
+                "the process held by the launch pidfd is not the recorded exec target"
             }
         }
     }
@@ -834,6 +844,12 @@ mod tests {
                 "exec_joined_cgroup_mismatch",
                 "SEC-1",
                 "the cgroup after joining is not the one of the prepared exec target",
+            ),
+            (
+                ViolationReason::ExecTargetPidfdMismatch,
+                "exec_target_pidfd_mismatch",
+                "SUP-6",
+                "the process held by the launch pidfd is not the recorded exec target",
             ),
         ];
         for (r, code, behavior, message) in cases {

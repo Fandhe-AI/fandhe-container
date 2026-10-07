@@ -420,6 +420,14 @@ pub trait LaunchedProcess: Send {
             "the launched process cannot be signaled",
         ))
     }
+
+    /// 起動時（fork 直後・回収前）に開いた pidfd の借用。exec の対象（pid1）をこの pidfd で固定するために
+    /// supervisor が参照する（記録 pid や cgroup の所属に同一性を依存させない。SUP-6・SEC-1・CORE-1・
+    /// TASK-163 追補・#1461）。既定は `None`（pidfd を保持しない実装。呼び出し側は fail-closed にする）。
+    #[cfg(target_os = "linux")]
+    fn launch_pidfd(&self) -> Option<BorrowedFd<'_>> {
+        None
+    }
 }
 
 /// `exec::ContainerChild`（fork した子）を [`LaunchedProcess`] として扱うアダプタ（Linux。CORE-1・REPAIR-5）。
@@ -458,6 +466,10 @@ impl ContainerChildProcess {
 impl LaunchedProcess for ContainerChildProcess {
     fn pid(&self) -> NonZeroU32 {
         self.pid
+    }
+
+    fn launch_pidfd(&self) -> Option<BorrowedFd<'_>> {
+        self.child.pidfd()
     }
 
     fn wait(&self, timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
@@ -587,6 +599,45 @@ mod tests {
                 Duration::from_secs(10)
             )
         );
+    }
+
+    /// CORE-1・SUP-6（#1461）: `launch_pidfd` の既定は `None`、`ContainerChildProcess` は起動時の pidfd を返し、
+    /// その fdinfo の `Pid:` が子の pid と一致する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core1_launch_pidfd_default_none_and_child_process_returns_pidfd() {
+        struct NoPidfd;
+        impl LaunchedProcess for NoPidfd {
+            fn pid(&self) -> NonZeroU32 {
+                NonZeroU32::new(1).unwrap()
+            }
+            fn wait(&self, _: Duration) -> Result<Option<ProcessExit>, TraitError> {
+                Ok(None)
+            }
+            fn terminate(&self, _: Duration) -> Result<(), TraitError> {
+                Ok(())
+            }
+        }
+        assert!(NoPidfd.launch_pidfd().is_none());
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        let process =
+            ContainerChildProcess::new(crate::exec::ContainerChild::from_pid_for_test(pid))
+                .expect("wrap");
+        let fd = process
+            .launch_pidfd()
+            .expect("pidfd は Linux 5.3 以降が前提（pidfd 非対応環境では失敗させる）");
+        use std::os::fd::AsRawFd as _;
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd()))
+            .expect("fdinfo");
+        let line = info.lines().find(|l| l.starts_with("Pid:")).expect("Pid:");
+        assert_eq!(line.trim_start_matches("Pid:").trim(), pid.to_string());
+        child.kill().expect("kill");
+        child.wait().expect("wait");
     }
 
     /// CORE-2・OCI-6（TASK-30.1）: `ContainerChildProcess::signal` は実プロセスへ SIGKILL を送り、

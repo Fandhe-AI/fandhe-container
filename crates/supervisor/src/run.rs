@@ -56,6 +56,8 @@
 //! # pid 再利用対策（SEC-1）
 //! 生存確認と回収は保持する起動ハンドル経由のみで行う。状態に記録された pid を `kill(2)`・`waitpid(2)`・
 //! `/proc` の宛先に使わない（記録値は再利用され得る）。
+//! exec の対象（pid1）の固定も同じ方針で、起動ハンドルが起動時（fork 直後・回収前）から保持する pidfd
+//! （`LaunchedProcess::launch_pidfd`）を使う（`exec::run_command_with_pidfd`。CORE-1・SUP-6・SEC-1・#1461）。
 //!
 //! # 書き込みの再試行（REPAIR-5）
 //! state.rs が呼び出し側に委ねた判断として、revision 不一致（`FailedPrecondition`）のときだけ

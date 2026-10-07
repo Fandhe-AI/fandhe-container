@@ -1567,6 +1567,16 @@ impl ContainerChild {
         self.pid
     }
 
+    /// fork 直後（回収前）に開いた pidfd の借用（なければ `None`）。
+    ///
+    /// 回収前に開いているため、以後 pid が再利用されても元のプロセスを指し続ける。supervisor が exec の
+    /// 対象（pid1）をこの pidfd で固定するために使う（記録 pid からの `pidfd_open` や cgroup の所属に
+    /// 同一性を依存させない。SUP-6・SEC-1・CORE-1・TASK-163 追補・#1461）。`None` は pidfd 未対応の環境
+    /// （Linux 5.3 未満・seccomp 等）で、その場合に呼び出し側は fail-closed にすること。
+    pub fn pidfd(&self) -> Option<BorrowedFd<'_>> {
+        self.pidfd.as_ref().map(|fd| fd.as_fd())
+    }
+
     /// 子の終了を `timeout` まで待つ（REPAIR-5）。
     ///
     /// - 期限内に終われば終了状態を返す（別スレッドの待機が回収した場合も同じ値を返す）

@@ -116,8 +116,26 @@
 //! 5. exec 専用プロセス全体のタイムアウトと、`execve` 前の `close_range`（[`run_command`] と core の
 //!    `exec/exec_command.rs`）
 //!
+//! # 対象の固定: 起動時の pidfd と縮退経路（#1461）
+//!
+//! - **恒久策**: [`identify_pid1_with_pidfd`] / [`run_command_with_pidfd`] は、supervisor（起動ハンドル）が
+//!   起動時（fork 直後・回収前）から保持する pidfd（`LaunchedProcess::launch_pidfd`）で対象を固定し、同一性を
+//!   記録 pid との一致で確かめる。cgroup の所属に依存しないため、コンテナ内から cgroupfs に書ける構成でも
+//!   兄弟コンテナの cgroup への偽装で別コンテナを対象にされない（SEC-1）。pidfd が得られない
+//!   （未対応カーネル・seccomp・起動ハンドルなし）場合、この入口の内部では記録 pid へ縮退せず拒否する
+//! - **縮退経路**: [`identify_pid1`] / [`run_command`] は記録 pid から開き、cgroup の所属で同一性を照合する。
+//!   supervisor 不在（孤児化・再起動後で起動時の pidfd を失った）場合の明示された縮退経路で、「コンテナの中から
+//!   cgroupfs に書けない」前提（core の `exec/setns.rs` のモジュール doc）が成り立つ間だけ使う。cgroupfs の
+//!   マウント・cgroup namespace・`/sys/fs/cgroup` の bind mount を導入する変更は、この縮退経路を拒否へ切り替える
+//!   こと
+//!
 //! # 未実装（REPAIR-3）
 //!
+//! - supervisor から別プロセスの exec 専用プロセスへ pidfd を渡す 1 段目（execve 越しの継承、または外部 CLI への
+//!   `SCM_RIGHTS`）。supervisor のバイナリ入口・制御ソケットが無く、`SCM_RIGHTS` は UDS の所有者・peer credential
+//!   検証と core `sys` の cmsg ラッパーの設計を要する。fork 継承（[`run_command_with_pidfd`]）は pidfd を保持する
+//!   単一スレッドのプロセスが呼ぶ場合に限り成立し、logs 捕捉スレッドを持つ supervisor 本体は直接呼べない
+//!   （`setns` が拒否する）
 //! - user namespace への参加。既定の rootless（コンテナが user namespace を持つ）では、対象が呼び出し側と別の
 //!   user namespace にいることを理由に [`identify_pid1`] が違反 `exec_target_in_other_user_namespace` で拒否する
 //!   （[`enter_namespaces`] も `setns` の直前に再照合する。rootful の呼び出し側では `setns` 自体は成功して
@@ -136,6 +154,7 @@
 //! - 実機前提の通し試験 `tests/exec.rs` の実行結果の記録（root を要し、CI ではビルドのみで実行していない）
 
 use std::io::{BufRead as _, Read as _, Write as _};
+use std::os::fd::BorrowedFd;
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::exec::{
@@ -207,6 +226,42 @@ pub fn identify_pid1(record: &StateRecord) -> Result<ExecTarget, TraitError> {
     };
     let id = record.status().id();
     let pid1 = Pid1Target::open(pid, id, placement).map_err(from_exec_error)?;
+    Ok(ExecTarget {
+        id: id.clone(),
+        pid1,
+        bundle: record.bundle().to_path_buf(),
+    })
+}
+
+/// 起動時（fork 直後・回収前）から保持する pidfd で対象を固定して、`record` の稼働中コンテナから pid1 を
+/// 特定する（SUP-6・SEC-1・CORE-1・TASK-163 追補・#1461）。
+///
+/// `pidfd` は起動ハンドルが保持するもの（`LaunchedProcess::launch_pidfd`。`None` なら呼び出し側が拒否する）。
+/// [`identify_pid1`] が記録 pid から `pidfd_open` して cgroup の所属で同一性を照合するのに対し、こちらは
+/// pidfd の指すプロセスが記録 pid と一致することを同一性の根拠にする（cgroup の所属に依存しない。cgroup の
+/// 照合は多層防御として残る）。`pidfd` は複製して core へ渡す（呼び出し側の fd は閉じない。複製は
+/// close-on-exec）。稼働中でない記録・cgroup 配置の記録なしは [`identify_pid1`] と同じく
+/// `FailedPrecondition`。pidfd の不一致は違反 `exec_target_pidfd_mismatch` で拒否する。
+pub fn identify_pid1_with_pidfd(
+    record: &StateRecord,
+    pidfd: BorrowedFd<'_>,
+) -> Result<ExecTarget, TraitError> {
+    let pid = running_pid(record)?;
+    let Some(placement) = record.cgroup() else {
+        return Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "container has no recorded cgroup placement; cannot verify pid1 identity",
+        ));
+    };
+    let owned = pidfd.try_clone_to_owned().map_err(|e| {
+        TraitError::new(
+            ErrorCode::Internal,
+            format!("failed to duplicate the launch pidfd: {}", e.kind()),
+        )
+    })?;
+    let id = record.status().id();
+    let pid1 =
+        Pid1Target::open_with_launch_pidfd(owned, pid, id, placement).map_err(from_exec_error)?;
     Ok(ExecTarget {
         id: id.clone(),
         pid1,
@@ -473,6 +528,27 @@ pub fn run_command(
     running_pid(record)?;
     run_in_worker_with(deadline, WORKER_GRACE, || {
         let target = identify_pid1(record)?;
+        run_with_target(&target, request, deadline)
+    })
+}
+
+/// [`run_command`] の対象特定だけを [`identify_pid1_with_pidfd`]（起動時から保持する pidfd で対象を固定）に
+/// 替えたもの（SUP-6・SEC-1・CORE-1・TASK-163 追補・#1461）。契約は [`run_command`] と同じ。
+///
+/// worker は fork で親の fd を継承するため、pidfd は呼び出しプロセスが保持するものをそのまま worker が使う
+/// （追加の syscall なし。呼び出しプロセスは単一スレッドであること）。pidfd はコンテナ内コマンドへ渡らない
+/// （core が `execveat` の前に `close_range` で閉じ、複製は close-on-exec）。別プロセスの exec 専用プロセスへ
+/// 渡す 1 段目（execve 越しの継承・`SCM_RIGHTS`）は未実装（モジュール doc）。
+pub fn run_command_with_pidfd(
+    record: &StateRecord,
+    pidfd: BorrowedFd<'_>,
+    request: &ExecRequest,
+    timeout: Duration,
+) -> Result<ExecOutcome, TraitError> {
+    let deadline = Deadline::after(timeout);
+    running_pid(record)?;
+    run_in_worker_with(deadline, WORKER_GRACE, || {
+        let target = identify_pid1_with_pidfd(record, pidfd)?;
         run_with_target(&target, request, deadline)
     })
 }

@@ -17,8 +17,17 @@
 //! - 読み戻した内容はカーネル応答（外部入力）として `unwrap` / 添字アクセスなしで解析する
 //! - `unsafe` は持たない。待機を伴わないファイル I/O のみのためタイムアウトは設けない
 //!
+//! # `--cpus` 相当値の変換（SUP-13・TASK-170(1)・MS-9・#532）
+//! [`CpuMax::parse_cpus`] / [`CpuMax::from_nano_cpus`] が CPU 数（例: `1.5`）を `quota period` へ変換する。
+//! 浮動小数は使わず Docker の `NanoCPUs` と同じ整数表現（1 CPU = 10^9 nano CPU）で扱い、
+//! `quota = nano_cpus * period / 10^9`（端数は切り捨て。要求より多い CPU 時間を与えない）とする。
+//! - `0` は `InvalidArgument`。無制限は [`CpuQuota::Unlimited`] で表し、「`--cpus 0` = 無制限」の写像は
+//!   呼び出し側（CLI / launcher。TASK-170.3・TASK-29 / TASK-157 系）の責務
+//! - 既定 period では 0.01 CPU 未満は quota が [`MIN_QUOTA_US`] 未満となり拒否される（fail-closed）
+//! - ホストの CPU 数との比較はしない（カーネルは quota > ncpu × period を受理する。上限方針は呼び出し側）
+//!
 //! # 未実装（REPAIR-3）
-//! `cpu.weight`・`cpu.max.burst`・OCI `cpu.shares` の変換、親 cgroup の quota との階層整合検証
+//! `--cpus` オプションの CLI 受け付けと起動フロー（launcher）からの結線、`cpu.weight`・`cpu.max.burst`・OCI `cpu.shares` の変換、親 cgroup の quota との階層整合検証
 //! （カーネルが書き込み時に `EINVAL` で拒否する場合は `Internal` として返る）。
 
 use std::fs::File;
@@ -43,6 +52,13 @@ pub const MAX_PERIOD_US: u64 = 1_000_000;
 pub const MIN_QUOTA_US: u64 = 1_000;
 /// `cpu.max` の quota の上限（µs）。カーネルの `max_cfs_runtime`（`MAX_BW_USEC` = 2^44 - 1 µs）。
 pub const MAX_QUOTA_US: u64 = (1u64 << 44) - 1;
+
+/// 1 CPU あたりの nano CPU 数（Docker の `NanoCPUs` と同じ基数。SUP-13・TASK-170.1）。
+pub const NANO_CPUS_PER_CPU: u64 = 1_000_000_000;
+/// `--cpus` 文字列入力のバイト長上限（無制限の入力を処理しないための事前検証）。
+const CPUS_INPUT_MAX: usize = 32;
+/// `--cpus` 小数部の最大桁数（nano 精度。超過は黙って丸めず拒否する）。
+const CPUS_FRACTION_DIGITS_MAX: usize = 9;
 
 /// `cpu.max` の quota 部。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +115,54 @@ impl CpuMax {
             }
         };
         Self::new(quota, period_us)
+    }
+
+    /// nano CPU 数（1 CPU = 10^9）を `quota period` へ変換する（SUP-13・TASK-170.1）。
+    ///
+    /// `quota_us = nano_cpus * period_us / 10^9`（切り捨て）。乗算は `u128` で行いオーバーフローさせない。
+    /// 範囲外（quota・period）は [`CpuMax::new`] が `InvalidArgument` で拒否する。`0` も quota 下限未満で拒否。
+    pub fn from_nano_cpus(nano_cpus: u64, period_us: u64) -> Result<Self, CgroupError> {
+        let quota = u128::from(nano_cpus) * u128::from(period_us) / u128::from(NANO_CPUS_PER_CPU);
+        let quota = u64::try_from(quota)
+            .map_err(|_| invalid("cpu.max quota derived from cpus is too large".to_string()))?;
+        Self::new(CpuQuota::Micros(quota), period_us)
+    }
+
+    /// `--cpus` 相当の 10 進文字列（`1`・`1.5`・`0.25`）を `quota period` へ変換する（SUP-13・TASK-170.1）。
+    ///
+    /// 受理するのは ASCII 数字、または `整数部.小数部`（各 1 桁以上、小数部は 9 桁以下）のみ。
+    /// 符号・空白・指数表記・`inf` / `nan`・小数部 10 桁以上は `InvalidArgument`。
+    pub fn parse_cpus(s: &str, period_us: u64) -> Result<Self, CgroupError> {
+        let bad = |why: &str| invalid(format!("invalid cpus value ({why})"));
+        if s.is_empty() || s.len() > CPUS_INPUT_MAX {
+            return Err(bad("empty or too long"));
+        }
+        let (int_part, frac_part) = s.split_once('.').unwrap_or((s, ""));
+        let has_dot = s.contains('.');
+        let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+        if !digits(int_part) || (has_dot && !digits(frac_part)) {
+            return Err(bad("expected decimal digits"));
+        }
+        if frac_part.len() > CPUS_FRACTION_DIGITS_MAX {
+            return Err(bad("too many fractional digits"));
+        }
+        let int_nano = int_part
+            .parse::<u64>()
+            .ok()
+            .and_then(|v| v.checked_mul(NANO_CPUS_PER_CPU))
+            .ok_or_else(|| bad("out of range"))?;
+        // 小数部を 9 桁へ右ゼロ埋めすると nano CPU 数になる（桁数は上で検証済み）。
+        let frac_nano = if has_dot {
+            format!("{frac_part:0<9}")
+                .parse::<u64>()
+                .map_err(|_| bad("out of range"))?
+        } else {
+            0
+        };
+        let nano = int_nano
+            .checked_add(frac_nano)
+            .ok_or_else(|| bad("out of range"))?;
+        Self::from_nano_cpus(nano, period_us)
     }
 
     /// quota 部。
@@ -272,6 +336,76 @@ mod tests {
         }
     }
 
+    fn cpus(s: &str, p: u64) -> String {
+        CpuMax::parse_cpus(s, p).unwrap().to_file_content()
+    }
+
+    /// SUP-13・TASK-170.1: CPU 数から quota/period への変換（具体値・切り捨て）。
+    #[test]
+    fn sup13_task170_1_parse_cpus_values() {
+        let d = CpuMax::DEFAULT_PERIOD_US;
+        for (input, want) in [
+            ("1", "100000 100000"),
+            ("1.5", "150000 100000"),
+            ("2", "200000 100000"),
+            ("0.5", "50000 100000"),
+            ("0.25", "25000 100000"),
+            ("0.01", "1000 100000"),
+            ("0.333333333", "33333 100000"),
+        ] {
+            assert_eq!(cpus(input, d), want, "{input}");
+        }
+        assert_eq!(cpus("1.5", 50_000), "75000 50000");
+        assert_eq!(cpus("1.5", 1_000_000), "1500000 1000000");
+    }
+
+    /// SUP-13・TASK-170.1: nano CPU 変換と範囲外の fail-closed。
+    #[test]
+    fn sup13_task170_1_from_nano_cpus() {
+        assert_eq!(
+            CpuMax::from_nano_cpus(1_500_000_000, 100_000)
+                .unwrap()
+                .quota(),
+            CpuQuota::Micros(150_000)
+        );
+        assert_invalid(CpuMax::from_nano_cpus(u64::MAX, 1_000_000));
+        assert_invalid(CpuMax::from_nano_cpus(0, 100_000));
+        assert_invalid(CpuMax::from_nano_cpus(NANO_CPUS_PER_CPU, 999));
+        assert_invalid(CpuMax::from_nano_cpus(NANO_CPUS_PER_CPU, 1_000_001));
+    }
+
+    /// SUP-13・TASK-170.1: 下限未満・0・不正入力は `InvalidArgument`。
+    #[test]
+    fn sup13_task170_1_parse_cpus_rejects() {
+        let d = CpuMax::DEFAULT_PERIOD_US;
+        let long = "1".repeat(CPUS_INPUT_MAX + 1);
+        for bad in [
+            "0",
+            "0.0",
+            "0.001",
+            "0.009999999",
+            "",
+            "-1",
+            "+1",
+            " 1",
+            "1 ",
+            "1.2.3",
+            ".5",
+            "1.",
+            "1e2",
+            "inf",
+            "nan",
+            "max",
+            "1.0000000001",
+            "99999999999999999999",
+            long.as_str(),
+        ] {
+            assert_invalid(CpuMax::parse_cpus(bad, d));
+        }
+        assert_invalid(CpuMax::parse_cpus("1", 999));
+        assert_invalid(CpuMax::parse_cpus("1", 1_000_001));
+    }
+
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn scratch(tag: &str) -> std::path::PathBuf {
         let base = std::env::temp_dir().join(format!("fc-cpumax-{tag}-{}", std::process::id()));
@@ -292,6 +426,22 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(base.join("cpu.max")).unwrap(),
             "50000 100000"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// SUP-13・TASK-170.1: 変換結果を書き込み経路へ渡すと `150000 100000` が書かれる。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sup13_task170_1_converted_value_is_written() {
+        let base = scratch("cpus");
+        std::fs::write(base.join("cpu.max"), b"").unwrap();
+        let dir = File::open(&base).unwrap();
+        let want = CpuMax::parse_cpus("1.5", CpuMax::DEFAULT_PERIOD_US).unwrap();
+        assert_eq!(write_cpu_max_at(dir.as_fd(), &want), Ok(want));
+        assert_eq!(
+            std::fs::read_to_string(base.join("cpu.max")).unwrap(),
+            "150000 100000"
         );
         std::fs::remove_dir_all(&base).unwrap();
     }

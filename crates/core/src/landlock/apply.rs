@@ -34,6 +34,7 @@ use std::os::fd::{AsFd as _, OwnedFd};
 use std::path::Path;
 
 use super::rules::{AccessFs, LandlockRuleset, PathRule, RuleOrigin, RulePath};
+use crate::exec::ThreadCountSource;
 use crate::sys::{self, SysError};
 use crate::traits::ErrorCode;
 
@@ -215,15 +216,17 @@ pub(crate) trait LandlockKernel {
 }
 
 /// 実カーネルへの適用（`crate::sys` の安全なラッパーを呼ぶだけ）。
-struct RealKernel;
+struct RealKernel<'a> {
+    // `thread_count` は `&self` のため内部可変性で取得元（seek を伴う）を持つ。単一スレッド前提。
+    threads: std::cell::RefCell<&'a mut ThreadCountSource>,
+}
 
-impl LandlockKernel for RealKernel {
+impl LandlockKernel for RealKernel<'_> {
     type Ruleset = OwnedFd;
     type PathFd = OwnedFd;
 
     fn thread_count(&self) -> Option<u64> {
-        let status = std::fs::read_to_string("/proc/self/status").ok()?;
-        crate::exec::status_threads(&status)
+        self.threads.try_borrow_mut().ok()?.count()
     }
 
     fn no_new_privs_enabled(&self) -> Result<bool, SysError> {
@@ -295,7 +298,22 @@ impl LandlockKernel for RealKernel {
 pub(crate) fn apply_landlock_ruleset(
     ruleset: &LandlockRuleset,
 ) -> Result<LandlockApplyReport, LandlockApplyError> {
-    apply_with(&RealKernel, ruleset)
+    apply_landlock_ruleset_with(ruleset, &mut ThreadCountSource::ProcSelf)
+}
+
+/// [`apply_landlock_ruleset`] のスレッド数取得元を差し替える版（SUP-6・TASK-163.3・#502）。
+///
+/// exec の再適用が、`setns` の前に開いた status fd を渡すために使う。前提検査（NNP・
+/// 適用前後の `Threads: 1`）は [`apply_landlock_ruleset`] と同一。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn apply_landlock_ruleset_with(
+    ruleset: &LandlockRuleset,
+    threads: &mut ThreadCountSource,
+) -> Result<LandlockApplyReport, LandlockApplyError> {
+    let kernel = RealKernel {
+        threads: std::cell::RefCell::new(threads),
+    };
+    apply_with(&kernel, ruleset)
 }
 
 fn apply_with<K: LandlockKernel>(

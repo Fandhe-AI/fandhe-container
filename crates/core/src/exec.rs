@@ -7,7 +7,9 @@
 //! （[`StagePipeline`]。#832・TASK-27.4.2。`exec/stages.rs`）まで実装済み。各段の実体
 //! のうち `PR_SET_NO_NEW_PRIVS` は組み込みの固定ステージとして実装済み（#833・TASK-27.4.3。
 //! `exec/no_new_privs.rs`）、capability 削減（#173）と seccomp（#178・TASK-38.3）も同様に組み込み済み。
-//! cgroup 参加は `cgroups::CgroupJoin`（TASK-32.4・#161）が `StageHook` として実装済み（登録は呼び出し側）。制限適用の証跡は未実装（Landlock は `StagePipeline::with_landlock` で差し込み可能。#184）で、後続の sub-issue（#137、TASK-39・40）が追記する（REPAIR-3: 実装済みを装わない）。
+//! cgroup 参加は `cgroups::CgroupJoin`（TASK-32.4・#161）が `StageHook` として実装済み（登録は呼び出し側）。
+//! exec 経路（SUP-6）の seccomp / Landlock 再適用は [`prepare_exec_restrictions`] / [`reapply_restrictions`]
+//! （TASK-163.3・#502。`exec/reapply.rs`。`setns` の後に使えるよう status fd を事前に保持する二段階 API）。制限適用の証跡は未実装（Landlock は `StagePipeline::with_landlock` で差し込み可能。#184）で、後続の sub-issue（#137、TASK-39・40）が追記する（REPAIR-3: 実装済みを装わない）。
 //!
 //! # 目指すフロー（Linux 専用）
 //!
@@ -97,6 +99,7 @@ mod devices;
 mod landlock;
 mod no_new_privs;
 mod process;
+mod reapply;
 mod rlimits;
 mod rootfs;
 mod seccomp;
@@ -126,6 +129,12 @@ pub use process::{
     ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES, EXIT_EXEC_NOT_EXECUTABLE,
     EXIT_EXEC_NOT_FOUND, EXIT_SETUP_FAILED, Entrypoint, SignalDelivery, exec_entrypoint,
     spawn_container, spawn_container_with_stages,
+};
+/// 結合試験 `tests/exec_restrictions_reapply.rs` 専用の再公開（SUP-6・TASK-163.3・#502。通常の利用者は呼ばない。詳細は定義側）。
+#[doc(hidden)]
+pub use reapply::{ExecReapplyObservation, observe_exec_restriction_reapply};
+pub use reapply::{
+    ExecRestrictionReport, ExecRestrictions, prepare_exec_restrictions, reapply_restrictions,
 };
 pub use rootfs::{PivotReport, PreparedRootfs, pivot_root, prepare_rootfs};
 pub use seccomp::SeccompReport;
@@ -646,6 +655,47 @@ pub(crate) fn status_threads(status: &str) -> Option<u64> {
         .lines()
         .find_map(|l| l.strip_prefix("Threads:"))
         .and_then(|v| v.trim().parse().ok())
+}
+
+/// 適用前後の単一スレッド検査（`Threads: 1`）が読む `status` の取得元（SUP-6・TASK-163.3・#502）。
+///
+/// 通常は呼び出しプロセスの `/proc/self/status`（[`ProcSelf`](Self::ProcSelf)）。exec 経路では
+/// `setns(CLONE_NEWNS)` の後に `/proc` がコンテナ側の procfs になり、自プロセスを `/proc/self` で
+/// 解決できないため、`setns` の前に開いた fd を保持して読む（[`PreOpened`](Self::PreOpened)。
+/// `cgroups::ExecJoinFds` が `/proc/self/cgroup` を事前に開くのと同じ理由）。
+/// 取得元を替えても「適用の前後で `Threads: 1`」という検査自体は弱めない。
+#[derive(Debug)]
+pub(crate) enum ThreadCountSource {
+    /// `/proc/self/status` をそのつど開く（launch 経路。挙動は従来どおり）。
+    ProcSelf,
+    /// 事前に開いた `/proc/self/status` の fd。開いたプロセス自身のスレッド数を返す。
+    PreOpened(std::fs::File),
+}
+
+/// `status` 1 回分の読み取り上限（本物は数 KiB。無制限確保を避ける。REPAIR-5 の入力上限方針）。
+const STATUS_READ_LIMIT: u64 = 64 * 1024;
+
+impl ThreadCountSource {
+    /// 現在のスレッド数。読めない・パースできない場合は `None`（呼び出し側は適用を拒否する）。
+    pub(crate) fn count(&mut self) -> Option<u64> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        match self {
+            ThreadCountSource::ProcSelf => {
+                let status = std::fs::read_to_string("/proc/self/status").ok()?;
+                status_threads(&status)
+            }
+            ThreadCountSource::PreOpened(file) => {
+                // procfs のファイルは read のたびに再生成される。先頭へ戻して読み直す。
+                file.seek(SeekFrom::Start(0)).ok()?;
+                let mut buf = Vec::new();
+                std::io::Read::by_ref(file)
+                    .take(STATUS_READ_LIMIT)
+                    .read_to_end(&mut buf)
+                    .ok()?;
+                status_threads(&String::from_utf8_lossy(&buf))
+            }
+        }
+    }
 }
 
 /// [`MountIsolation::establish`] の前提（副作用の前に判定するテスト可能な純関数）。

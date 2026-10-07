@@ -24,7 +24,7 @@
 //! 本物の syscall は [`RealKernel`]（`sys` のラッパー）だけが呼ぶ。テストは偽の `SeccompKernel` で
 //! 呼び出し順・エラー写像を再現し、実 syscall は使い捨てスレッドで確認する。
 
-use super::{ExecError, IsolationStage};
+use super::{ExecError, IsolationStage, ThreadCountSource};
 use crate::seccomp::SeccompProgram;
 use crate::sys::{self, SysError};
 use crate::traits::types::ErrorCode;
@@ -41,13 +41,14 @@ trait SeccompKernel {
     fn mode(&mut self) -> Result<u32, SysError>;
 }
 
-/// 本物の syscall を呼ぶ実装。
-struct RealKernel;
+/// 本物の syscall を呼ぶ実装。スレッド数の取得元だけ差し替えられる（SUP-6・TASK-163.3）。
+struct RealKernel<'a> {
+    threads: &'a mut ThreadCountSource,
+}
 
-impl SeccompKernel for RealKernel {
+impl SeccompKernel for RealKernel<'_> {
     fn thread_count(&mut self) -> Option<u64> {
-        let status = std::fs::read_to_string("/proc/self/status").ok()?;
-        super::status_threads(&status)
+        self.threads.count()
     }
     fn no_new_privs_enabled(&mut self) -> Result<bool, SysError> {
         sys::no_new_privs_enabled()
@@ -76,7 +77,19 @@ pub struct SeccompReport {
 // テストでは `stages.rs` が偽物（`testing`）へ差し替えるため、本物は未使用になる。
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn apply_seccomp_filter(program: &SeccompProgram) -> Result<SeccompReport, ExecError> {
-    apply_single_threaded(program, &mut RealKernel)
+    apply_seccomp_filter_with(program, &mut ThreadCountSource::ProcSelf)
+}
+
+/// [`apply_seccomp_filter`] のスレッド数取得元を差し替える版（SUP-6・TASK-163.3・#502）。
+///
+/// exec の再適用（`exec/reapply.rs`）が、`setns` の前に開いた status fd を渡すために使う。
+/// 適用前後の `Threads: 1` 検査・`NO_NEW_PRIVS` 検証は [`apply_seccomp_filter`] と同一。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn apply_seccomp_filter_with(
+    program: &SeccompProgram,
+    threads: &mut ThreadCountSource,
+) -> Result<SeccompReport, ExecError> {
+    apply_single_threaded(program, &mut RealKernel { threads })
 }
 
 /// ビルド対象アーキの既定 deny フィルタを構築して適用する（CORE-5・TASK-38.3・#178）。
@@ -91,14 +104,26 @@ pub(crate) fn apply_seccomp_filter(program: &SeccompProgram) -> Result<SeccompRe
 // テストでは `stages.rs` が偽物（`testing`）へ差し替えるため、本物は未使用になる。
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn apply_default_seccomp() -> Result<SeccompReport, ExecError> {
-    let program = crate::seccomp::build_filter_for_target_arch().map_err(|e| {
+    apply_seccomp_filter(&build_default_program()?)
+}
+
+/// [`apply_default_seccomp`] のスレッド数取得元を差し替える版（SUP-6・TASK-163.3・#502）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn apply_default_seccomp_with(
+    threads: &mut ThreadCountSource,
+) -> Result<SeccompReport, ExecError> {
+    apply_seccomp_filter_with(&build_default_program()?, threads)
+}
+
+/// ビルド対象アーキの既定 deny フィルタを構築する（構築失敗は段 `Seccomp` の `ExecError`）。
+fn build_default_program() -> Result<SeccompProgram, ExecError> {
+    crate::seccomp::build_filter_for_target_arch().map_err(|e| {
         let code = match e {
             crate::seccomp::SeccompBuildError::UnsupportedArch => ErrorCode::Unimplemented,
             _ => ErrorCode::Internal,
         };
         ExecError::new(code, IsolationStage::Seccomp, e.to_string())
-    })?;
-    apply_seccomp_filter(&program)
+    })
 }
 
 /// [`observe_default_seccomp_enforcement`] の観測結果。errno は `Err(SysError::Os(n))` の `n`、成功は `None`。
@@ -630,7 +655,13 @@ mod tests {
         std::thread::spawn(|| {
             let p = program();
             assert_eq!(sys::set_no_new_privs(), Ok(()));
-            let report = apply_filter(&p, &mut RealKernel).unwrap();
+            let report = apply_filter(
+                &p,
+                &mut RealKernel {
+                    threads: &mut ThreadCountSource::ProcSelf,
+                },
+            )
+            .unwrap();
             assert_eq!(report.instructions, p.len());
             assert_eq!(thread_status_field("Seccomp:"), "2");
             // 通常は成功する unshare(0) が、禁止 syscall として EPERM になる。
@@ -648,7 +679,13 @@ mod tests {
     fn core5_apply_seccomp_without_nnp_real_thread() {
         std::thread::spawn(|| {
             if thread_status_field("NoNewPrivs:") == "0" {
-                let e = apply_filter(&program(), &mut RealKernel).unwrap_err();
+                let e = apply_filter(
+                    &program(),
+                    &mut RealKernel {
+                        threads: &mut ThreadCountSource::ProcSelf,
+                    },
+                )
+                .unwrap_err();
                 assert_eq!(e.code, ErrorCode::FailedPrecondition);
                 assert_eq!(e.stage, IsolationStage::Seccomp);
             }
@@ -663,7 +700,7 @@ mod tests {
 pub(super) mod testing {
     use std::cell::Cell;
 
-    use super::{ExecError, SeccompReport};
+    use super::{ExecError, SeccompReport, ThreadCountSource};
 
     thread_local! {
         static SECCOMP_ERR: Cell<Option<ExecError>> = const { Cell::new(None) };
@@ -681,5 +718,12 @@ pub(super) mod testing {
             Some(e) => Err(e),
             None => Ok(SeccompReport { instructions: 0 }),
         }
+    }
+
+    /// `exec/reapply.rs` が `cfg(test)` で呼ぶ偽物（取得元は読まない）。
+    pub(in crate::exec) fn apply_default_seccomp_with(
+        _threads: &mut ThreadCountSource,
+    ) -> Result<SeccompReport, ExecError> {
+        apply_default_seccomp()
     }
 }

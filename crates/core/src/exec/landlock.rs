@@ -30,7 +30,7 @@
 
 use std::path::PathBuf;
 
-use super::{ExecError, IsolationStage};
+use super::{ExecError, IsolationStage, ThreadCountSource};
 use crate::audit_log::{AuditRecord, AuditRecordError, landlock_denial_record_now};
 use crate::landlock::{
     LandlockApplyError, LandlockApplyReport, LandlockError, LandlockRuleError, LandlockRuleset,
@@ -49,6 +49,17 @@ pub(crate) fn apply_landlock_stage(
     ruleset: &LandlockRuleset,
 ) -> Result<LandlockApplyReport, ExecError> {
     crate::landlock::apply_landlock_ruleset(ruleset).map_err(from_landlock_apply)
+}
+
+/// [`apply_landlock_stage`] のスレッド数取得元を差し替える版（SUP-6・TASK-163.3・#502）。
+///
+/// exec の再適用（`exec/reapply.rs`）から、`setns` の前に開いた status fd を渡して呼ぶ。
+#[cfg_attr(test, allow(dead_code))]
+pub(super) fn apply_landlock_stage_with(
+    ruleset: &LandlockRuleset,
+    threads: &mut ThreadCountSource,
+) -> Result<LandlockApplyReport, ExecError> {
+    crate::landlock::apply_landlock_ruleset_with(ruleset, threads).map_err(from_landlock_apply)
 }
 
 /// `OciConfig` から Landlock ruleset を作る（ABI 検出 → ルール生成。CORE-5・TASK-39.4）。
@@ -199,7 +210,7 @@ pub fn observe_landlock_path_access(
 
 /// プローブ 1 件を実行し、成功は `None`・失敗は `Some(errno)` で返す。
 /// errno が無い I/O 失敗は `-1`、内容不一致は [`LANDLOCK_PROBE_CONTENT_MISMATCH`]。
-fn run_probe(p: &LandlockAccessProbe) -> Option<i32> {
+pub(super) fn run_probe(p: &LandlockAccessProbe) -> Option<i32> {
     use std::fs::OpenOptions;
     let res: std::io::Result<()> = match p.kind {
         LandlockAccessKind::ReadFile => match std::fs::read(&p.path) {
@@ -258,7 +269,7 @@ fn from_landlock_rule(e: LandlockRuleError) -> ExecError {
 pub(super) mod testing {
     use std::cell::Cell;
 
-    use super::{ExecError, LandlockApplyReport, LandlockRuleset};
+    use super::{ExecError, LandlockApplyReport, LandlockRuleset, ThreadCountSource};
 
     thread_local! {
         static LANDLOCK_ERR: Cell<Option<ExecError>> = const { Cell::new(None) };
@@ -282,6 +293,14 @@ pub(super) mod testing {
                 skipped_empty: 0,
             }),
         }
+    }
+
+    /// `exec/reapply.rs` が `cfg(test)` で呼ぶ偽物（取得元は読まない）。
+    pub(in crate::exec) fn apply_landlock_stage_with(
+        ruleset: &LandlockRuleset,
+        _threads: &mut ThreadCountSource,
+    ) -> Result<LandlockApplyReport, ExecError> {
+        apply_landlock_stage(ruleset)
     }
 }
 

@@ -107,6 +107,13 @@ name = "seccomp_enforcement"
 path = "tests/seccomp_enforcement.rs"
 harness = false
 
+# exec プロセスへの seccomp / Landlock 再適用の結合試験（SUP-6・TASK-163.3・#502）。不可逆の制限適用と単一スレッド
+# 前提のため harness = false。`-- --ignored` で Landlock ABI 6+ を必須にする実機前提モード（AGENTS.md）。
+[[test]]
+name = "exec_restrictions_reapply"
+path = "tests/exec_restrictions_reapply.rs"
+harness = false
+
 [[test]]
 name = "default_devices"
 path = "tests/default_devices.rs"

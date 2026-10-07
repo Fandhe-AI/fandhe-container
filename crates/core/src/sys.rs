@@ -967,6 +967,10 @@ pub(crate) fn mount_proc_at(target: &CStr) -> Result<(), SysError> {
 /// tmpfs の `statfs.f_type`（include/uapi/linux/magic.h の `TMPFS_MAGIC`。アーキテクチャ非依存）。
 pub(crate) const TMPFS_MAGIC: i64 = 0x0102_1994;
 
+/// procfs の `statfs.f_type`（include/uapi/linux/magic.h の `PROC_SUPER_MAGIC`。アーキテクチャ非依存）。
+/// `crate::exec` の exec 再適用が、スレッド数の取得元が本物の procfs であることを確かめるのに使う（SUP-6）。
+pub(crate) const PROC_MAGIC: i64 = 0x9fa0;
+
 /// [`mount_tmpfs_at`] に渡せるフラグ。可変なのは読み取り専用と実行許可の 2 値だけで、`nosuid`・
 /// `nodev` は常に付与する（任意のビットを渡せない型にして SEC-1 の fail-closed を保つ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2299,7 +2303,8 @@ mod tests {
     fn core3_task32_1_fs_type_identifies_procfs_not_cgroup2() {
         let proc_dir = std::fs::File::open("/proc").unwrap();
         // procfs の PROC_SUPER_MAGIC（include/uapi/linux/magic.h）。
-        assert_eq!(fs_type(proc_dir.as_fd()), Ok(0x9fa0));
+        assert_eq!(PROC_MAGIC, 0x9fa0);
+        assert_eq!(fs_type(proc_dir.as_fd()), Ok(PROC_MAGIC));
         assert_ne!(fs_type(proc_dir.as_fd()), Ok(CGROUP2_MAGIC));
     }
 

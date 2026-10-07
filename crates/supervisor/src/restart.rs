@@ -461,6 +461,9 @@ pub enum SuperviseOutcome {
         last: MonitorOutcome,
         /// 生存中の起動ハンドル。
         process: Option<Box<dyn LaunchedProcess>>,
+        /// 停止要求後に戻った新プロセスの terminate が失敗・超過したハンドルの受け皿（回収責任は呼び出し側。REPAIR-5）。
+        /// 超過時は実行スレッドが未完了のため [`LateOrphans::wait_settled`] で確認してから `take` する。
+        late: LateOrphans,
         /// 実施した再起動の回数。
         restarts: u32,
     },
@@ -481,9 +484,9 @@ pub enum SuperviseOutcome {
         error: TraitError,
         /// 新プロセスの terminate が失敗した場合の理由（成功なら `None`）。
         terminate_error: Option<TraitError>,
-        /// terminate で終了を確認できなかった生存の可能性があるプロセス（回収責任は呼び出し側。REPAIR-5）。
-        /// terminate に成功したら `None`。
-        process: Option<Box<dyn LaunchedProcess>>,
+        /// terminate で終了を確認できなかった生存の可能性があるプロセスの受け皿（回収責任は呼び出し側。REPAIR-5）。
+        /// terminate が超過した場合は実行スレッドが未完了のため [`LateOrphans::wait_settled`] で確認してから `take` する。
+        late: LateOrphans,
         /// 実施した再起動の回数（この失敗した 1 回は含まない）。
         restarts: u32,
     },
@@ -525,11 +528,13 @@ impl fmt::Debug for SuperviseOutcome {
             Self::Stopped {
                 last,
                 process,
+                late,
                 restarts,
             } => f
                 .debug_struct("Stopped")
                 .field("last", last)
                 .field("has_process", &process.is_some())
+                .field("late", late)
                 .field("restarts", restarts)
                 .finish(),
             Self::RelaunchFailed {
@@ -547,13 +552,13 @@ impl fmt::Debug for SuperviseOutcome {
             Self::RestartUnrecorded {
                 error,
                 terminate_error,
-                process,
+                late,
                 restarts,
             } => f
                 .debug_struct("RestartUnrecorded")
                 .field("error", error)
                 .field("terminate_error", terminate_error)
-                .field("has_process", &process.is_some())
+                .field("late", late)
                 .field("restarts", restarts)
                 .finish(),
             Self::MonitorFailed {
@@ -589,6 +594,75 @@ fn sleep_unless_stopped(backoff: Duration, stop: &StopToken) -> bool {
             return true;
         }
         std::thread::sleep(BACKOFF_SLICE.min(end - now));
+    }
+}
+
+/// [`terminate_bounded`] の結果の受け渡し枠。
+type TerminateSlot = (Mutex<Option<Result<(), TraitError>>>, Condvar);
+
+/// 起動済みプロセスを上限つきで terminate する。確認できたら `Ok`（REPAIR-5）。
+///
+/// 実装が `timeout` を守らず戻らなくても、呼び出し側は `timeout`＋[`RELAUNCH_REPLY_GRACE`] で待ちをやめて
+/// `Timeout` を返す（core の `LaunchedProcess::terminate` 契約と同じく呼び出し境界でも上限を強制する）。
+/// terminate は追跡つきの別スレッドで実行し、`Err` で戻ったハンドルは `late` へ積む（超過後に戻る場合も）。
+/// 戻らない間は `late` の実行スレッド数が 0 にならないため、呼び出し側は [`LateOrphans::wait_settled`] で
+/// 未完了を判別し、受け皿を保持して後で [`LateOrphans::take`] できる。実行スレッドを作れない場合も
+/// ハンドルを `late` へ積む。
+fn terminate_bounded(
+    process: Box<dyn LaunchedProcess>,
+    timeout: Duration,
+    late: &LateOrphans,
+) -> Result<(), TraitError> {
+    let cell = Arc::new(Mutex::new(Some(process)));
+    let result: Arc<TerminateSlot> = Arc::new((Mutex::new(None), Condvar::new()));
+    let (worker_cell, worker_result, worker_late) =
+        (Arc::clone(&cell), Arc::clone(&result), late.clone());
+    late.worker_started();
+    let guard = WorkerGuard(late.clone());
+    let spawned = std::thread::Builder::new()
+        .name("fandhe-terminate".to_owned())
+        .spawn(move || {
+            // 全経路で終了を通知する。`Err` のハンドルの push は通知より先に行う。
+            let _guard = guard;
+            let taken = worker_cell
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            let Some(proc) = taken else {
+                return;
+            };
+            let r = proc.terminate(timeout);
+            if let Err(e) = &r {
+                worker_late.push(proc, e.clone());
+            }
+            let (lock, cvar) = &*worker_result;
+            *lock.lock().unwrap_or_else(PoisonError::into_inner) = Some(r);
+            cvar.notify_all();
+        });
+    if spawned.is_err() {
+        let left = cell.lock().unwrap_or_else(PoisonError::into_inner).take();
+        let error = TraitError::new(ErrorCode::Unavailable, "failed to spawn terminate thread");
+        if let Some(proc) = left {
+            late.push(proc, error.clone());
+        }
+        return Err(error);
+    }
+    let deadline = Instant::now().checked_add(timeout.saturating_add(RELAUNCH_REPLY_GRACE));
+    let (lock, cvar) = &*result;
+    let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    loop {
+        if let Some(r) = slot.take() {
+            return r;
+        }
+        let now = Instant::now();
+        let remaining = match deadline {
+            Some(d) if d > now => d - now,
+            _ => return Err(TraitError::new(ErrorCode::Timeout, "terminate timed out")),
+        };
+        slot = cvar
+            .wait_timeout(slot, remaining)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
     }
 }
 
@@ -628,9 +702,8 @@ fn relaunch_bounded(
                 drop(slot);
                 if let Ok(proc) = value {
                     // 期限後に戻った生存プロセスを残さない（記録も回収手段も無いため）。
-                    if let Err(e) = proc.terminate(terminate_timeout) {
-                        late.push(proc, e);
-                    }
+                    // terminate にも呼び出し境界で上限を強制する。失敗・超過したハンドルは `late` に積まれる。
+                    let _ = terminate_bounded(proc, terminate_timeout, &late);
                 }
                 return;
             }
@@ -685,6 +758,8 @@ pub fn supervise_with_restart(
 ) -> Result<SuperviseOutcome, TraitError> {
     let mut process = process;
     let mut restarts: u32 = 0;
+    // 後始末の terminate が失敗・超過したハンドルの受け皿。`Stopped` / `RestartUnrecorded` で呼び出し側へ渡す。
+    let cleanup_late = LateOrphans::default();
     loop {
         let last = match monitor_with_observer(state, process.as_ref(), monitor_config, stop, obs) {
             Ok(last) => last,
@@ -711,6 +786,7 @@ pub fn supervise_with_restart(
                 return Ok(SuperviseOutcome::Stopped {
                     last,
                     process: Some(process),
+                    late: cleanup_late,
                     restarts,
                 });
             }
@@ -747,6 +823,7 @@ pub fn supervise_with_restart(
             return Ok(SuperviseOutcome::Stopped {
                 last,
                 process: None,
+                late: cleanup_late,
                 restarts,
             });
         }
@@ -755,6 +832,7 @@ pub fn supervise_with_restart(
             return Ok(SuperviseOutcome::Stopped {
                 last,
                 process: None,
+                late: cleanup_late,
                 restarts,
             });
         }
@@ -785,14 +863,12 @@ pub fn supervise_with_restart(
         };
         // 再 launch 中に停止要求が来ていたら、Running を記録せず新プロセスを終了・回収する（SUP-3）。
         if stop.is_stop_requested() {
-            let process = match new_process.terminate(restart_config.terminate_timeout) {
-                Ok(()) => None,
-                // 終了未確認ならハンドルを呼び出し側へ返す（REPAIR-5）。
-                Err(_) => Some(new_process),
-            };
+            // 上限を呼び出し境界で強制する。終了未確認のハンドルは `cleanup_late` に積まれる（REPAIR-5）。
+            let _ = terminate_bounded(new_process, restart_config.terminate_timeout, &cleanup_late);
             return Ok(SuperviseOutcome::Stopped {
                 last,
-                process,
+                process: None,
+                late: cleanup_late,
                 restarts,
             });
         }
@@ -829,15 +905,14 @@ pub fn supervise_with_restart(
             Err(error) => {
                 observe(Some(error.code()));
                 // 記録できない生存プロセスを残さない（core `start` の後始末と同じ方針）。
-                let terminate_error = new_process
-                    .terminate(restart_config.terminate_timeout)
-                    .err();
-                // 終了を確認できないときはハンドルを返し、呼び出し側が回収できるようにする（REPAIR-5）。
-                let process = terminate_error.is_some().then_some(new_process);
+                // 上限を呼び出し境界で強制し、終了未確認のハンドルは `cleanup_late` から回収できる（REPAIR-5）。
+                let terminate_error =
+                    terminate_bounded(new_process, restart_config.terminate_timeout, &cleanup_late)
+                        .err();
                 return Ok(SuperviseOutcome::RestartUnrecorded {
                     error,
                     terminate_error,
-                    process,
+                    late: cleanup_late,
                     restarts,
                 });
             }
@@ -1466,7 +1541,7 @@ mod tests {
         let SuperviseOutcome::RestartUnrecorded {
             error,
             terminate_error,
-            process,
+            late,
             restarts,
         } = out
         else {
@@ -1474,7 +1549,8 @@ mod tests {
         };
         assert_eq!(error.code(), ErrorCode::FailedPrecondition);
         assert!(terminate_error.is_none());
-        assert!(process.is_none());
+        assert!(late.wait_settled(Duration::from_secs(5)));
+        assert!(late.take().is_empty());
         assert_eq!(restarts, 0);
         assert_eq!(q.terminated.load(Ordering::SeqCst), 1);
         let g = st.rec.lock().unwrap();
@@ -1609,7 +1685,7 @@ mod tests {
         .unwrap();
         let SuperviseOutcome::RestartUnrecorded {
             terminate_error,
-            process,
+            late,
             restarts,
             ..
         } = out
@@ -1617,7 +1693,8 @@ mod tests {
             panic!("unexpected outcome: {out:?}")
         };
         assert!(terminate_error.is_none());
-        assert!(process.is_none());
+        assert!(late.wait_settled(Duration::from_secs(5)));
+        assert!(late.take().is_empty());
         assert_eq!(restarts, 0);
         assert_eq!(q.0.terminated.load(Ordering::SeqCst), 1);
         let g = st.rec.lock().unwrap();
@@ -1764,14 +1841,17 @@ mod tests {
         .unwrap();
         let SuperviseOutcome::RestartUnrecorded {
             terminate_error,
-            process,
+            late,
             ..
         } = out
         else {
             panic!("unexpected outcome: {out:?}")
         };
         assert_eq!(terminate_error.map(|e| e.code()), Some(ErrorCode::Timeout));
-        assert_eq!(process.map(|p| p.pid().get()), Some(43));
+        assert!(late.wait_settled(Duration::from_secs(5)));
+        let got = late.take();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0.pid().get(), 43);
     }
 
     /// 期限を超えて応答しない再 launch（戻った後は生存プロセスを返す）。
@@ -2003,12 +2083,17 @@ mod tests {
         )
         .unwrap();
         let SuperviseOutcome::Stopped {
-            process, restarts, ..
+            process,
+            late,
+            restarts,
+            ..
         } = out
         else {
             panic!("unexpected outcome: {out:?}")
         };
         assert!(process.is_none());
+        assert!(late.wait_settled(Duration::from_secs(5)));
+        assert!(late.take().is_empty());
         assert_eq!(restarts, 0);
         assert_eq!(terminated.load(Ordering::SeqCst), 1);
         let rec = st.rec.lock().unwrap();
@@ -2037,10 +2122,120 @@ mod tests {
             &Events::default(),
         )
         .unwrap();
-        let SuperviseOutcome::Stopped { process, .. } = out else {
+        let SuperviseOutcome::Stopped { late, .. } = out else {
             panic!("unexpected outcome: {out:?}")
         };
-        assert_eq!(process.map(|p| p.pid().get()), Some(43));
+        assert!(late.wait_settled(Duration::from_secs(5)));
+        let got = late.take();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0.pid().get(), 43);
+    }
+
+    /// terminate が timeout を無視して長く戻らない起動ハンドル（戻った後は失敗する）。
+    struct HangingProc(u32, Duration);
+
+    impl LaunchedProcess for HangingProc {
+        fn pid(&self) -> NonZeroU32 {
+            pidn(self.0)
+        }
+        fn wait(&self, _: Duration) -> Result<Option<ProcessExit>, TraitError> {
+            Ok(None)
+        }
+        fn terminate(&self, _: Duration) -> Result<(), TraitError> {
+            std::thread::sleep(self.1);
+            Err(TraitError::new(ErrorCode::Timeout, "hung"))
+        }
+    }
+
+    struct HangingRelauncher(Arc<Store>);
+
+    impl Relauncher for HangingRelauncher {
+        fn relaunch(&self, _: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            *self.0.conflicts.lock().unwrap() = 100;
+            Ok(Box::new(HangingProc(43, Duration::from_millis(1500))))
+        }
+    }
+
+    /// REPAIR-5・SUP-3・TASK-159.3: 後始末の terminate が timeout を無視して戻らなくても、
+    /// 監視ループは上限で戻り、未完了ハンドルは `late` で追跡して後から回収できる。
+    #[test]
+    fn sup3_task159_3_hanging_terminate_is_bounded_and_trackable() {
+        let st = store(0, 42);
+        let q: Arc<dyn Relauncher> = Arc::new(HangingRelauncher(st.clone()));
+        let config = cfg("always")
+            .with_terminate_timeout(Duration::from_millis(50))
+            .unwrap();
+        let mut s = attach(&st);
+        let started = Instant::now();
+        let out = supervise_with_restart(
+            &mut s,
+            first(FAIL),
+            &q,
+            &MonitorConfig::default(),
+            &config,
+            &StopToken::new(),
+            &Events::default(),
+        )
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(1200));
+        let SuperviseOutcome::RestartUnrecorded {
+            terminate_error,
+            late,
+            ..
+        } = out
+        else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert_eq!(terminate_error.map(|e| e.code()), Some(ErrorCode::Timeout));
+        // terminate はまだ戻っておらず、未完了として判別できる。
+        assert!(!late.is_settled());
+        assert!(late.take().is_empty());
+        assert!(late.wait_settled(Duration::from_secs(5)));
+        let got = late.take();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0.pid().get(), 43);
+    }
+
+    /// 期限後に戻る再 launch が terminate の戻らない（ただし timeout を無視する）プロセスを返す。
+    struct SlowHangingRelauncher;
+
+    impl Relauncher for SlowHangingRelauncher {
+        fn relaunch(&self, _: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            // 待ち上限＋猶予（550ms）を超えてから戻る。
+            std::thread::sleep(Duration::from_millis(1000));
+            Ok(Box::new(HangingProc(44, Duration::from_millis(1200))))
+        }
+    }
+
+    /// REPAIR-5・SUP-3・TASK-159.3: 期限超過後に戻ったプロセスの terminate が戻らなくても、
+    /// 再 launch の実行スレッドは上限で完了し、未完了の terminate は `late` で追跡できる。
+    #[test]
+    fn sup3_task159_3_late_relaunch_hanging_terminate_is_tracked() {
+        let st = store(0, 42);
+        let q: Arc<dyn Relauncher> = Arc::new(SlowHangingRelauncher);
+        let config = cfg("always")
+            .with_relaunch_timeout(Duration::from_millis(50))
+            .unwrap()
+            .with_terminate_timeout(Duration::from_millis(50))
+            .unwrap();
+        let mut s = attach(&st);
+        let out = supervise_with_restart(
+            &mut s,
+            first(FAIL),
+            &q,
+            &MonitorConfig::default(),
+            &config,
+            &StopToken::new(),
+            &Events::default(),
+        )
+        .unwrap();
+        let SuperviseOutcome::RelaunchFailed { late, .. } = out else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert!(late.wait_settled(Duration::from_secs(5)));
+        let got = late.take();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0.pid().get(), 44);
     }
 
     /// SUP-3・TASK-159.3: 設定の境界値（バックオフ上限・タイムアウト 0 / 超過は InvalidArgument）。

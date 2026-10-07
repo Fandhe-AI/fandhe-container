@@ -465,10 +465,14 @@ pub fn verify_elevation(
 }
 
 /// 縮退の計画（適用はしない。将来の syscall 経路が実行する入力）。
+///
+/// 適用順は「`clear_supplementary_groups` → `gid`（`setresgid`）→ `uid`（`setresuid`。capability を失う前に
+/// 特権が要る操作を終える）→ `bounding_drop`（昇順・`CAP_SETPCAP` は最後）→ `capset` → ambient 載せ」を想定する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ReductionPlan {
-    /// bounding set から落とす capability 番号（現在 bounding にあり期待集合外のもの。昇順）。
+    /// bounding set から落とす capability 番号。現在 bounding にあり期待集合外のもの。
+    /// bounding の削除自体に `CAP_SETPCAP` が要るため、含まれる場合は番号 8 を末尾に置き、昇順で並べる。
     pub bounding_drop: Vec<u8>,
     /// 設定する permitted。
     pub permitted: CapabilitySet,
@@ -480,15 +484,45 @@ pub struct ReductionPlan {
     pub ambient: CapabilitySet,
     /// 補助グループを全消去する（`setgroups(0)` 相当。縮退後の `Groups` は空が要件）。
     pub clear_supplementary_groups: bool,
+    /// 設定する gid（real・effective・saved・fs すべて非 0 の対象 gid。`setresgid` 相当）。
+    pub gid: GidSet,
+    /// 設定する uid（real・effective・saved・fs すべて非 0 の対象 uid。`setresuid` 相当）。
+    pub uid: UidSet,
 }
 
 /// 現在の資格情報から期待集合への縮退計画を算出する（純関数。何も適用しない）。
 ///
-/// 期待集合が現在の permitted または bounding に含まれない場合は昇格手段が無いものとして `MissingCapabilities`。
+/// 縮退後に [`verify_elevation`] を満たせない前提は計画せず拒否する（fail-closed）:
+/// - `no_new_privs` が立っている → `NoNewPrivsSet`
+/// - `target_uid` / `target_gid` が 0 → `UnexpectedRootUid` / `UnexpectedGroups`（uid・gid 0 を解消できない）
+/// - 期待集合が現在の permitted または bounding に含まれない → `MissingCapabilities`
+/// - bounding に落とす対象があるのに現在の effective が `CAP_SETPCAP` を持たない → `MissingCapabilities`
+///   （bounding 削除は `CAP_SETPCAP` を要する）
 pub fn plan_reduction(
     current: &CredentialSnapshot,
     expected: CapabilitySet,
+    target_uid: u32,
+    target_gid: u32,
 ) -> Result<ReductionPlan, PrivilegeError> {
+    if current.no_new_privs {
+        return Err(PrivilegeError::new(
+            ErrorCode::FailedPrecondition,
+            PrivilegeErrorReason::NoNewPrivsSet,
+            "no_new_privs is set; privilege elevation is not possible",
+        ));
+    }
+    if target_uid == 0 {
+        return Err(denied(
+            PrivilegeErrorReason::UnexpectedRootUid,
+            "target uid must not be 0",
+        ));
+    }
+    if target_gid == 0 {
+        return Err(denied(
+            PrivilegeErrorReason::UnexpectedGroups,
+            "target gid must not be 0",
+        ));
+    }
     let exp = CapMask::from_set(expected);
     if !current.permitted.is_superset_of(exp) || !current.bounding.is_superset_of(exp) {
         return Err(denied(
@@ -496,12 +530,27 @@ pub fn plan_reduction(
             "required capabilities are not in the permitted or bounding set",
         ));
     }
-    let bounding_drop = (0u8..64)
+    let setpcap = Capability::Setpcap.index();
+    let mut bounding_drop: Vec<u8> = (0u8..64)
         .filter(|i| {
             let bit = 1u64 << u32::from(*i);
             current.bounding.0 & bit != 0 && exp.0 & bit == 0
         })
         .collect();
+    if !bounding_drop.is_empty() {
+        let setpcap_bit = 1u64 << u32::from(setpcap);
+        if current.effective.0 & setpcap_bit == 0 {
+            return Err(denied(
+                PrivilegeErrorReason::MissingCapabilities,
+                "CAP_SETPCAP is required in the effective set to drop bounding capabilities",
+            ));
+        }
+        // CAP_SETPCAP 自身を先に落とすと後続の削除ができないため最後へ回す。
+        if let Some(pos) = bounding_drop.iter().position(|i| *i == setpcap) {
+            bounding_drop.remove(pos);
+            bounding_drop.push(setpcap);
+        }
+    }
     Ok(ReductionPlan {
         bounding_drop,
         permitted: expected,
@@ -509,6 +558,18 @@ pub fn plan_reduction(
         inheritable: expected,
         ambient: expected,
         clear_supplementary_groups: true,
+        gid: GidSet {
+            real: target_gid,
+            effective: target_gid,
+            saved: target_gid,
+            fs: target_gid,
+        },
+        uid: UidSet {
+            real: target_uid,
+            effective: target_uid,
+            saved: target_uid,
+            fs: target_uid,
+        },
     })
 }
 
@@ -681,18 +742,61 @@ mod tests {
     fn sup14_task171_1_2_plan_reduction_values() {
         let exp = runtime_required_capabilities();
         let t = status("0", FULL, FULL, FULL, "0", "0", UID);
-        let plan = plan_reduction(&parse_proc_status(&t).unwrap(), exp).unwrap();
+        let plan = plan_reduction(&parse_proc_status(&t).unwrap(), exp, 1000, 1000).unwrap();
         assert_eq!(plan.bounding_drop.len(), 41 - 7);
         assert_eq!(plan.bounding_drop.first(), Some(&0));
         assert!(!plan.bounding_drop.contains(&21));
         assert_eq!(plan.ambient, exp);
+        assert_eq!(plan.uid.effective, 1000);
+        assert_eq!(plan.gid.saved, 1000);
         let t = status("0", "0", "0", FULL, "0", "0", UID);
-        let e = plan_reduction(&parse_proc_status(&t).unwrap(), exp).unwrap_err();
+        let e = plan_reduction(&parse_proc_status(&t).unwrap(), exp, 1000, 1000).unwrap_err();
         assert_eq!(e.reason, PrivilegeErrorReason::MissingCapabilities);
         // permitted は足りても bounding が空なら計画できない。
         let t = status("0", FULL, FULL, "0", "0", "0", UID);
-        let e = plan_reduction(&parse_proc_status(&t).unwrap(), exp).unwrap_err();
+        let e = plan_reduction(&parse_proc_status(&t).unwrap(), exp, 1000, 1000).unwrap_err();
         assert_eq!(e.reason, PrivilegeErrorReason::MissingCapabilities);
+    }
+
+    #[test]
+    fn sup14_task171_1_2_plan_reduction_rejects_unexecutable_premises() {
+        let exp = runtime_required_capabilities();
+        let t = status("0", FULL, FULL, FULL, "0", "1", UID);
+        let snap = parse_proc_status(&t).unwrap();
+        let e = plan_reduction(&snap, exp, 1000, 1000).unwrap_err();
+        assert_eq!(
+            (e.code, e.reason),
+            (
+                ErrorCode::FailedPrecondition,
+                PrivilegeErrorReason::NoNewPrivsSet
+            )
+        );
+        let t = status("0", FULL, FULL, FULL, "0", "0", UID);
+        let snap = parse_proc_status(&t).unwrap();
+        let e = plan_reduction(&snap, exp, 0, 1000).unwrap_err();
+        assert_eq!(e.reason, PrivilegeErrorReason::UnexpectedRootUid);
+        let e = plan_reduction(&snap, exp, 1000, 0).unwrap_err();
+        assert_eq!(e.reason, PrivilegeErrorReason::UnexpectedGroups);
+        // bounding に落とす対象があるのに effective に CAP_SETPCAP が無い。
+        let no_setpcap = format!("{:016x}", 0x1ffffffffffu64 & !(1u64 << 8));
+        let t = status("0", FULL, &no_setpcap, FULL, "0", "0", UID);
+        let snap = parse_proc_status(&t).unwrap();
+        let e = plan_reduction(&snap, exp, 1000, 1000).unwrap_err();
+        assert_eq!(e.reason, PrivilegeErrorReason::MissingCapabilities);
+    }
+
+    #[test]
+    fn sup14_task171_1_2_plan_reduction_drops_setpcap_last() {
+        // 期待集合に CAP_SETPCAP を含めない場合、番号 8 は bounding_drop の末尾になる。
+        let exp = CapabilitySet::empty().with(Capability::SysAdmin);
+        let t = status("0", FULL, FULL, FULL, "0", "0", UID);
+        let plan = plan_reduction(&parse_proc_status(&t).unwrap(), exp, 1000, 1000).unwrap();
+        assert_eq!(plan.bounding_drop.last(), Some(&8));
+        assert_eq!(plan.bounding_drop.iter().filter(|i| **i == 8).count(), 1);
+        assert_eq!(plan.bounding_drop.len(), 40);
+        assert_eq!(plan.bounding_drop.first(), Some(&0));
+        assert_eq!(plan.bounding_drop.get(7), Some(&7));
+        assert_eq!(plan.bounding_drop.get(8), Some(&9));
     }
 
     #[test]

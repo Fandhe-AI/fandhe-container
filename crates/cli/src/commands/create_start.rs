@@ -111,16 +111,40 @@ fn production_runtime(global: &GlobalArgs, op: LifecycleOp) -> Result<Runtime, O
 /// 計測は stdout / stderr へ混ぜず、この環境変数が指すファイルへ追記する。未設定なら出力しない。
 pub(super) const OP_LOG_ENV: &str = "FANDHE_CONTAINER_OP_LOG";
 
-/// 計測を `path` のファイルへ追記する（best effort。失敗しても終了コード・エラー出力は変えない）。
+/// 計測出力の open に付ける O_NONBLOCK（REPAIR-5）。読み手のいない FIFO の open が無期限に
+/// ブロックして CLI が結果を返せなくなるのを防ぐ。libc 非依存のため OS ごとの値を直書きする。
+#[cfg(target_os = "linux")]
+const O_NONBLOCK: i32 = 0o4000;
+#[cfg(all(unix, not(target_os = "linux")))]
+const O_NONBLOCK: i32 = 0x4;
+
+/// 計測出力先を非ブロッキングで開く。通常ファイル以外（FIFO・デバイス等）は拒否する。
+fn open_op_log(path: &std::ffi::OsStr) -> Option<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(O_NONBLOCK);
+    }
+    let f = opts.open(path).ok()?;
+    // open 後のハンドルで種別を検証する（パスの事前検査による TOCTOU を避ける）。
+    if f.metadata().ok()?.is_file() {
+        Some(f)
+    } else {
+        None
+    }
+}
+
+/// 計測を `path` の通常ファイルへ追記する（best effort。失敗しても終了コード・エラー出力は変えない）。
+///
+/// open は O_NONBLOCK で行い、通常ファイル以外は拒否して書き込まない（REPAIR-5: 読み手のいない
+/// FIFO 等で CLI が無期限にブロックしない）。
 pub(super) fn export_ops(recorder: &OpRecorder, path: Option<&std::ffi::OsStr>) {
     let Some(path) = path.filter(|p| !p.is_empty()) else {
         return;
     };
-    let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    else {
+    let Some(mut f) = open_op_log(path) else {
         return;
     };
     let _ = recorder.export_json_lines(Some(&mut f));
@@ -238,6 +262,63 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("\"op_stats\""));
         assert!(lines[1].contains("\"op_stats_meta\""));
+    }
+
+    /// REPAIR-5: 計測出力先が FIFO でも `export_ops` がブロックせず、何も書き込まない。
+    /// 読み手がいない場合と、読み手が open しただけで読まない場合の両方を具体値で検証する。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_export_ops_rejects_fifo_without_blocking() {
+        use fandhe_container_core::observability::{OpName, OpOutcome};
+        use std::os::unix::fs::OpenOptionsExt;
+        let rec = Arc::new(OpRecorder::new());
+        rec.record(
+            &OpName::new("create").expect("name"),
+            OpOutcome::Success,
+            Duration::from_millis(1),
+        )
+        .expect("record");
+        let run = |path: std::path::PathBuf| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let rec = Arc::clone(&rec);
+            std::thread::spawn(move || {
+                export_ops(&rec, Some(path.as_os_str()));
+                let _ = tx.send(());
+            });
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("export_ops must not block on a FIFO");
+        };
+        let mkfifo = |name: &str| {
+            let p =
+                std::env::temp_dir().join(format!("fc-cli-oplog-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_file(&p);
+            let st = std::process::Command::new("mkfifo")
+                .arg(&p)
+                .status()
+                .expect("mkfifo");
+            assert!(st.success());
+            p
+        };
+        // 読み手なし。
+        let p1 = mkfifo("noreader");
+        run(p1.clone());
+        let _ = std::fs::remove_file(&p1);
+        // 読み手あり（open のみで読まない）。何も書かれていないこと。
+        let p2 = mkfifo("idlereader");
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK)
+            .open(&p2)
+            .expect("open reader");
+        run(p2.clone());
+        let mut buf = [0u8; 16];
+        let n = match std::io::Read::read(&mut &reader, &mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+            Err(e) => panic!("read: {e}"),
+        };
+        assert_eq!(n, 0);
+        let _ = std::fs::remove_file(&p2);
     }
 
     #[cfg(target_os = "linux")]

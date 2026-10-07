@@ -1,5 +1,7 @@
 # fandhe-container
 
+## 概要
+
 Rust でフルスクラッチ開発する軽量なコンテナ実行基盤の実装リポジトリです。Docker の課題（リソース消費の大きさ・ボリューム I/O のボトルネック・macOS / Windows での VM 越境オーバーヘッド）を是正することを目指します。
 
 ## 位置づけ
@@ -10,7 +12,7 @@ Rust でフルスクラッチ開発する軽量なコンテナ実行基盤の実
 
 ## ステータス
 
-実装は未着手です（ロードマップの着手判定は条件付き Go 済み。実装開始は別途の指示を経て行います）。タスク定義は spec リポの [`05-tasks.md`](https://github.com/Fandhe-AI/fandhe-container-spec/blob/main/05-tasks.md)、マイルストーンは [`06-roadmap.md`](https://github.com/Fandhe-AI/fandhe-container-spec/blob/main/06-roadmap.md)（MS-1〜14）を参照してください。
+開発進行中で、実装済みの範囲は crate ごとに異なります。進捗は GitHub の Issue で管理します。タスク定義は spec リポの [`05-tasks.md`](https://github.com/Fandhe-AI/fandhe-container-spec/blob/main/05-tasks.md)、マイルストーンは [`06-roadmap.md`](https://github.com/Fandhe-AI/fandhe-container-spec/blob/main/06-roadmap.md)（MS-1〜14）を参照してください。
 
 ## 実装方針（要点）
 
@@ -23,17 +25,34 @@ Rust でフルスクラッチ開発する軽量なコンテナ実行基盤の実
 - **AI 自己補修**: AI 自身が保守・改善・機能追加できるモジュール設計（crate 境界・型契約）を MVP の設計制約とします
 - **crate 名前空間**: `fandhe-container-*`（workspace 内部パスは `crates/<短縮名>`）
 
-詳細なビヘイビア（151 件）は spec リポの [`04-behavior/`](https://github.com/Fandhe-AI/fandhe-container-spec/tree/main/04-behavior) を唯一の正（SSOT）とします。
+詳細なビヘイビアは spec リポの [`04-behavior/`](https://github.com/Fandhe-AI/fandhe-container-spec/tree/main/04-behavior) を唯一の正（SSOT）とします。
+
+## クイックスタート
+
+現時点では利用者向けの統一 CLI（TASK-79・`CLI-1`）が未提供のため、ここではソースからのビルドとテストの手順を示します。利用者向けの手順は CLI の実装後に追記します。
+
+前提: `git`・`make`・`rustup`（toolchain は `rust-toolchain.toml` で固定）。
+
+```bash
+git clone https://github.com/Fandhe-AI/fandhe-container.git
+cd fandhe-container
+make setup               # submodule → rustup 確認 → git hooks 導入
+cargo build --workspace  # ビルド
+make test                # テスト（lint・deny まで含めた一括検証は make ci）
+```
+
+`make help` でターゲット一覧を表示します。コントリビュートの流れは [CONTRIBUTING.md](./CONTRIBUTING.md)、crate 境界は [docs/architecture.md](./docs/architecture.md)、ビルド・回帰確認コマンドは [AGENTS.md](./AGENTS.md) を参照してください。
 
 ## 開発環境構築
 
 ```bash
-git clone git@github.com:Fandhe-AI/fandhe-container.git
-cd fandhe-container
+git clone git@github.com:Fandhe-AI/fandhe-container.git   # SSH の場合
 git submodule update --init   # docs/spec（private・要アクセス権）
+make hooks                    # git hooks のみ導入する場合
+make docker-ci                # 開発コンテナ内で make ci を実行（環境非依存の検証）
 ```
 
-`docs/spec`（`fandhe-container-spec`）は private リポジトリのため、アクセス権のない環境では submodule 取得が失敗します。実装コードのビルド・テストは `docs/spec` 抜きでも成立するよう維持します。
+`docs/spec`（`fandhe-container-spec`）は private リポジトリのため、アクセス権のない環境では submodule 取得が失敗します（`make setup` は警告のみで続行します）。実装コードのビルド・テストは `docs/spec` 抜きでも成立するよう維持します。
 
 ## ライセンス
 

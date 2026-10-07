@@ -61,9 +61,13 @@
 //!   終了を待つ。超過したら worker を `SIGKILL` して回収し、構造化された `Timeout` を返す。worker の結果
 //!   （終了状態・適用件数、または `code` / `message`）は pipe の 1 行で返す。worker は `setns` 等で不可逆に
 //!   状態を変えるが、変わるのは使い捨ての worker だけで、呼び出しプロセスの namespace・cgroup・制限は変わらない
-//!   （コマンドは worker の子として実行される）。worker が起動後のコマンドを待つ間に強制終了された場合は、
-//!   コマンドが孤児として残り得る（worker 自身は期限でコマンドを kill するため、worker 自体が固まった場合に限る。
-//!   コマンドの停止は cgroup 経由の整理で担う想定。REPAIR-3）
+//!   （コマンドは worker の子として実行される）。worker が起動後のコマンドを待つ間に強制終了された場合に
+//!   コマンドを孤児として残さないよう、worker とコマンドはそれぞれ親の死亡シグナル（`SIGKILL`）を設定し、
+//!   設定の後に親の生存を親の pidfd で確かめる（core の `spawn_exec_worker` / `spawn_exec_command`）。呼び出し
+//!   プロセスの終了 → worker の停止 → コマンドの停止が連鎖する。**限界**: 実行されたコマンド自身は親の死亡
+//!   シグナルを `prctl` で解除でき、コマンドがコンテナ内で作った子孫には届かない。これらはコンテナの cgroup と
+//!   制限の内側に残る（コンテナ内の任意のプロセスが自分で作れる状態と同じ）。確実に止めるには exec 用の
+//!   子 cgroup と `cgroup.kill` が要る（未実装。REPAIR-3）
 //! - 再適用の Landlock ルールは、launcher が実際にマウントした結果ではなく bundle の `config.json` から
 //!   再導出する（launch 時の ruleset は保存されていない）。launch 後に `config.json` が書き換えられると
 //!   追従してしまうが、bundle は supervisor と同じ信頼境界（コンテナから書けない場所）にある前提とする。

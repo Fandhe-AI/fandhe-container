@@ -151,7 +151,8 @@ impl CapMask {
 
     /// 16 進文字列（`0x` なし）から作る。空・非 16 進・64 bit 超過は `None`。
     fn parse_hex(s: &str) -> Option<Self> {
-        if s.is_empty() {
+        // from_str_radix は先頭の `+` を受理するため、全文字が 16 進桁であることを先に確認する。
+        if s.is_empty() || !s.chars().all(|c| c.is_ascii_hexdigit()) {
             return None;
         }
         u64::from_str_radix(s, 16).ok().map(Self)
@@ -556,6 +557,7 @@ mod tests {
             ok.replace("CapAmb:\t", "Xx:\t"),
             format!("{ok}CapEff:\t{m}\n"),
             status("zz", &m, &m, &m, &m, "0", UID),
+            status("+ff", &m, &m, &m, &m, "0", UID),
             status("1ffffffffffffffff", &m, &m, &m, &m, "0", UID),
             status("", &m, &m, &m, &m, "0", UID),
             status(&m, &m, &m, &m, &m, "2", UID),

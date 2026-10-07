@@ -21,6 +21,7 @@
 //! | #487 | TASK-159.1 | 終了検知・終了コード分類（実装済み） |
 //! | #526 | TASK-169.1 | ulimit の指定モデル（[`container_options`]。適用は core の exec ステージ `Rlimits`。launcher 未結線のため消費者は無い。REPAIR-3） |
 //! | #528 | TASK-169.3 | `--ipc`（host / shareable）の指定モデル（[`container_options::ipc`]。Linux では core の `NamespaceSet` へ反映。他コンテナからの join は未実装。REPAIR-3） |
+//! | #529 | TASK-169.4 | env / env ファイル（[`container_options::env`]。実装済み。secrets / configs 注入は tmpfs 機構〔#527〕のマージ待ちで未実装。REPAIR-3） |
 //! | #488 | TASK-159.2 | restart ポリシー評価（実装済み。配線は #489） |
 //! | #489 | TASK-159.3 | restart_count 管理・state.json 反映・結合テスト（未実装） |
 //!

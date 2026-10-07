@@ -2,9 +2,15 @@
 //!
 //! # 役割と呼び出し文脈
 //!
-//! Docker の `docker run` 相当のオプション群（ulimit・後続の #527〜#530 が同じ型を拡張する）を、
-//! 検証済みの型として保持する入口。本 issue（TASK-169.1）は ulimit（`--ulimit <name>=<soft>[:<hard>]`）だけを扱い、
-//! core の [`Rlimits`] へ変換して保持する。
+//! Docker の `docker run` 相当のオプション群（ulimit・env・後続の #527・#528・#530 が同じ型を拡張する）を、
+//! 検証済みの型として保持する入口。
+//!
+//! | issue | 内容 | 反映先 |
+//! | ----- | ---- | ------ |
+//! | #526（TASK-169.1） | ulimit（`--ulimit <name>=<soft>[:<hard>]`）。core の [`Rlimits`] へ変換して保持 | exec ステージの `prlimit(2)` |
+//! | #529（TASK-169.4） | env・env ファイル（[`env`]） | `execve` の envp |
+//!
+//! secrets / configs の tmpfs 注入（#529 の後半）は、tmpfs 機構（#527・TASK-169.2）のマージ待ちで未実装（REPAIR-3）。
 //!
 //! 変換先の [`Rlimits`] は `fandhe_container_core::exec::StagePipeline::with_rlimits`（fork 後・capability
 //! 削減の前に `prlimit(2)` で適用。Linux 限定）が消費する。
@@ -21,10 +27,12 @@
 //! `--ulimit` 文字列は外部入力として、長さ上限・形式・数値・種別名を検証してから型へ写す。
 //! エラーメッセージは固定の英語文言で、入力値は含めない。
 
+pub mod env;
 pub mod ipc;
 
 pub use ipc::IpcMode;
 
+use self::env::EnvSet;
 use fandhe_container_core::rlimits::{RLIMIT_INFINITY, Rlimit, RlimitKind, Rlimits};
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
 
@@ -69,12 +77,13 @@ impl Ulimit {
     }
 }
 
-/// コンテナ起動オプション（現状は ulimit と `--ipc`。後続 issue が拡張する）。
+/// コンテナ起動オプション（現状は ulimit・`--ipc`・env。後続 issue が拡張する）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ContainerOptions {
     rlimits: Rlimits,
     ipc: IpcMode,
+    env: EnvSet,
 }
 
 impl ContainerOptions {
@@ -98,6 +107,17 @@ impl ContainerOptions {
     /// `--ipc` の指定。Linux では `IpcMode::apply_to` で分離する namespace 集合へ反映する。
     pub fn ipc_mode(&self) -> IpcMode {
         self.ipc
+    }
+
+    /// 統合済みの env を設定する（`EnvSet::resolve` の結果。SUP-12・TASK-169.4）。
+    pub fn with_env(mut self, env: EnvSet) -> Self {
+        self.env = env;
+        self
+    }
+
+    /// `exec::Entrypoint::new` の `env` へ渡す元（`EnvSet::to_env_strings`）。
+    pub fn env(&self) -> &EnvSet {
+        &self.env
     }
 
     /// core の `StagePipeline::with_rlimits` へ渡す集合。

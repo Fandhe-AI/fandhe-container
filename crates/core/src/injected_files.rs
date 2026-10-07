@@ -289,11 +289,19 @@ impl InjectedFileSet {
             }
         }
         for g in &mut groups {
-            let total: u64 = g.files.iter().map(|f| f.content.len() as u64).sum();
-            g.tmpfs_size = total
-                .div_ceil(INJECTED_TMPFS_SIZE_UNIT)
-                .max(1)
-                .saturating_mul(INJECTED_TMPFS_SIZE_UNIT);
+            // tmpfs はファイルごとにページ単位で容量を課金するため、内容サイズの合計ではなく
+            // 各ファイルを単位（64 KiB。4K / 16K / 64K ページのいずれでも足りる）へ切り上げて合算する。
+            // inode・dentry は size= に課金されないため、メタデータ分の余裕は要らない。
+            let total: u64 = g
+                .files
+                .iter()
+                .map(|f| {
+                    (f.content.len() as u64)
+                        .div_ceil(INJECTED_TMPFS_SIZE_UNIT)
+                        .saturating_mul(INJECTED_TMPFS_SIZE_UNIT)
+                })
+                .fold(0u64, u64::saturating_add);
+            g.tmpfs_size = total.max(INJECTED_TMPFS_SIZE_UNIT);
         }
         groups
     }
@@ -498,6 +506,13 @@ mod tests {
         assert_eq!(groups[0].tmpfs_size, 65_536);
         assert_eq!(groups[1].directory, "/etc/app");
         assert_eq!(groups[1].tmpfs_size, 131_072);
+        // 小さいファイルが多くてもファイルごとに 1 単位ずつ課金される。
+        let mut many = InjectedFileSet::new();
+        for i in 0..64 {
+            many.push(spec(&format!("/run/secrets/f{i}"), 1))
+                .expect("f");
+        }
+        assert_eq!(many.groups()[0].tmpfs_size, 64 * 65_536);
         let empty = InjectedFileSet::new();
         assert!(empty.groups().is_empty() && empty.is_empty());
     }

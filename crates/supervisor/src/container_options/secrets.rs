@@ -52,6 +52,9 @@ pub const CONFIGS_DEFAULT_DIR: &str = "/run/configs";
 /// 参照部（`source=...,target=...,mode=...`）の入力長上限（core の `CONFIG_MAX_PATH_BYTES` に name と mode を足せる値）。
 const MAX_SPEC_BYTES: usize = 4096 + 256;
 
+/// マウント先（既定ディレクトリを含む）の長さ上限（core の `CONFIG_MAX_PATH_BYTES` と同値）。
+const MAX_TARGET_BYTES: usize = 4096;
+
 /// name の長さ上限。
 const MAX_NAME_BYTES: usize = 64;
 
@@ -149,7 +152,17 @@ impl InjectedFileOption {
     /// コンテナ内のマウント先を設定する。相対指定は既定ディレクトリ配下として扱う。形式の検証は
     /// 変換時（core の [`InjectedFileSpec::new`]）に行うが、空文字と NUL はここで拒否する。
     pub fn with_target(mut self, target: &str) -> Result<Self, TraitError> {
-        if target.is_empty() || target.contains('\0') {
+        // 確保前に長さを検証する（core の `CONFIG_MAX_PATH_BYTES` と同値の上限。相対指定は
+        // 既定ディレクトリ分が付くため、その分を含めても上限内に収める。AGENTS.md「リソース上限」）。
+        let prefix = if target.starts_with('/') {
+            0
+        } else {
+            self.kind.default_dir().len() + 1
+        };
+        if target.is_empty()
+            || target.contains('\0')
+            || target.len().saturating_add(prefix) > MAX_TARGET_BYTES
+        {
             return Err(invalid("invalid secret or config target"));
         }
         self.target = Some(target.to_owned());
@@ -414,6 +427,20 @@ mod tests {
                 "secret or config reference is too long".to_owned()
             )
         );
+        // 公開 with_target も確保前に長さ上限を検証する（相対指定は既定ディレクトリ分を含む）。
+        let base = InjectedFileOption::new(InjectedKind::Secret, "s", inline(b"")).expect("opt");
+        assert!(
+            base.clone()
+                .with_target(&format!("/{}", "x".repeat(4095)))
+                .is_ok()
+        );
+        assert!(
+            base.clone()
+                .with_target(&format!("/{}", "x".repeat(4096)))
+                .is_err()
+        );
+        assert!(base.clone().with_target(&"x".repeat(4096 - 13)).is_ok());
+        assert!(base.with_target(&"x".repeat(4096 - 12)).is_err());
         // マウント先の検証は変換時（core）が行う（`..`・rootfs 直下）。
         let traversal = InjectedFileOption::parse(
             InjectedKind::Secret,
@@ -494,21 +521,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         let fifo = dir.join("fifo");
+        // FIFO を用意できない環境で検証を黙って省略しないよう、失敗は panic させる。
         let made = std::process::Command::new("mkfifo")
             .arg(&fifo)
             .status()
-            .is_ok_and(|s| s.success());
-        if made {
-            let o = InjectedFileOption::new(InjectedKind::Secret, "s", InjectedSource::File(fifo))
-                .expect("opt");
-            assert_eq!(
-                err(o.to_core_spec()),
-                (
-                    ErrorCode::InvalidArgument,
-                    "secret or config source must be a regular file".to_owned()
-                )
-            );
-        }
+            .expect("mkfifo must be runnable");
+        assert!(made.success(), "mkfifo must succeed");
+        let o = InjectedFileOption::new(InjectedKind::Secret, "s", InjectedSource::File(fifo))
+            .expect("opt");
+        assert_eq!(
+            err(o.to_core_spec()),
+            (
+                ErrorCode::InvalidArgument,
+                "secret or config source must be a regular file".to_owned()
+            )
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

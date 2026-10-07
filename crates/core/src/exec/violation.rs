@@ -294,7 +294,8 @@ impl ViolationReason {
         }
     }
 
-    /// 英語のメッセージ（`ExecError::message`）。
+    /// 英語のメッセージ（`ExecError::message`）。マウント先に関する文言は procfs（`mount_proc`）と tmpfs
+    /// （`mount_tmpfs`。SUP-12・TASK-169.2）の両方の段が使うため、種別を含めない中立な表現にする。
     pub fn message(self) -> &'static str {
         match self {
             Self::NoNamespaces => "at least one namespace must be selected",
@@ -337,25 +338,25 @@ impl ViolationReason {
             Self::EvidencePidNamespaceMismatch => {
                 "isolation evidence does not belong to the current PID namespace"
             }
-            Self::PathNotAbsolute => "rootfs and proc mount target must be absolute paths",
-            Self::PathContainsNul => "rootfs and proc mount target must not contain NUL",
-            Self::PathParentComponent => "rootfs and proc mount target must not contain '..'",
-            Self::TargetOutsideRootfs => "proc mount target must be under rootfs",
+            Self::PathNotAbsolute => "rootfs and mount target must be absolute paths",
+            Self::PathContainsNul => "rootfs and mount target must not contain NUL",
+            Self::PathParentComponent => "rootfs and mount target must not contain '..'",
+            Self::TargetOutsideRootfs => "mount target must be under rootfs",
             Self::RootfsMissing => "rootfs must exist",
             Self::RootfsSymlinkOrNotDirectory => {
                 "rootfs and its ancestors must be directories, not symlinks"
             }
             Self::TargetIsRootfs => {
-                "proc mount target must be a dedicated directory below rootfs, not rootfs itself"
+                "mount target must be a dedicated directory below rootfs, not rootfs itself"
             }
             Self::PathSymlinkOrNotDirectory => {
-                "proc mount target path components must be directories, not symlinks"
+                "mount target path components must be directories, not symlinks"
             }
-            Self::PathMissing => "proc mount target path must exist",
+            Self::PathMissing => "mount target path must exist",
             Self::TargetOnSharedMount => {
-                "proc mount target is on a shared mount; isolate the mount namespace first"
+                "mount target is on a shared mount; isolate the mount namespace first"
             }
-            Self::TargetMoved => "proc mount target was moved or removed after validation",
+            Self::TargetMoved => "mount target was moved or removed after validation",
             Self::RootfsIsHostRoot => "rootfs must not be the host root '/'",
             Self::RootfsOnSharedMount => {
                 "rootfs is on a shared mount; isolate the mount namespace first"

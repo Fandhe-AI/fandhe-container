@@ -2549,7 +2549,7 @@ mod tests {
         assert_eq!(err.stage, IsolationStage::MountProc);
         assert_eq!(
             err.message,
-            "proc mount target was moved or removed after validation"
+            "mount target was moved or removed after validation"
         );
         assert_eq!(
             violation_of(&err),

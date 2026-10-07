@@ -24,12 +24,17 @@
 //!   （型付きフィールドのみ）で、利用者文字列は渡さない
 //! - **事後条件**: マウント後に同じ要素を開き直し（作成はしない）、`statfs` が tmpfs であることを
 //!   確かめる（fail-closed）
+//! - **エラー message**: マウント先を message に入れるときは、違反記録（`ViolationSubject`）と同じ
+//!   エスケープ（制御文字・`\\`）と切り詰め（256 文字）を通す（ログ注入の防止）
 //! - **失敗時の後始末**: rootfs はホスト上のディレクトリの bind mount のため、自動作成したマウント先
 //!   ディレクトリはプロセスを破棄しても残る。失敗時は、この呼び出しでマウントした tmpfs を逆順に
 //!   `umount2(MNT_DETACH)` で外し、この呼び出しの `mkdirat` が成功した要素だけを逆順に `unlinkat(AT_REMOVEDIR)`
 //!   で削除する（空ディレクトリしか消えないため、既存の内容は消さない）。後始末は最善努力で、失敗しても
 //!   元のエラーを返す。fd 固定後に第三者が改名した要素は追跡しない。呼び出し後もプロセスは破棄する
-//!   （`crate::exec` のモジュール doc の契約）
+//!   （`crate::exec` のモジュール doc の契約）。**例外**: `mount(2)` は成功したが事後検証に通らなかった
+//!   件は、自分のマウントを特定できないため外さない。そのマウントが作成ディレクトリの上に残っていると
+//!   `unlinkat` が `EBUSY` になり、この経路では自動作成したディレクトリも rootfs に残り得る（マウント自体は
+//!   プロセスの破棄で消える）
 //! - **同一スレッド**: `MountIsolation::establish` と同じスレッドで呼ぶ
 //!
 //! # 未対応（REPAIR-3: 実装済みを装わない）
@@ -51,8 +56,8 @@ use crate::tmpfs::{TmpfsMountSet, TmpfsMountSpec};
 use crate::traits::types::ErrorCode;
 
 use super::{
-    ExecError, IsolationStage, MountIsolation, PreparedRootfs, ViolationReason, fd_still_at,
-    mount_is_shared, open_error,
+    ExecError, IsolationStage, MountIsolation, PreparedRootfs, ViolationReason, ViolationSubject,
+    fd_still_at, mount_is_shared, open_error,
 };
 
 const STAGE: IsolationStage = IsolationStage::MountTmpfs;
@@ -235,7 +240,10 @@ fn apply_one(
         ExecError::from_sys(
             e,
             STAGE,
-            &format!("mount(tmpfs on {})", spec.destination.as_str()),
+            &format!(
+                "mount(tmpfs on {})",
+                display_destination(spec.destination.as_str())
+            ),
         )
     })?;
     state.mounted = Some(verify_mounted(root, rootfs, &names, spec, &dir)?);
@@ -338,9 +346,19 @@ fn observe_mount(_before: &OwnedFd, _after: &OwnedFd) -> Result<MountObservation
     })
 }
 
+/// エラー message に入れるマウント先の表示形。違反記録と同じ `ViolationSubject` のエスケープ（制御文字・
+/// `\\` を `char::escape_default` 形式へ）と切り詰め（`VIOLATION_SUBJECT_MAX_CHARS` 文字）を通す。
+/// マウント先は NUL と `\\` 以外の制御文字（改行・ESC 等）を含み得るため、そのまま入れるとログ注入になる。
+fn display_destination(destination: &str) -> String {
+    ViolationSubject::from_path(std::path::Path::new(destination))
+        .as_str()
+        .to_owned()
+}
+
 /// 事後条件の判定（純関数）。開き直した先が tmpfs で、かつマウント前とは別のマウントでなければ拒否する
 /// （rootfs 自体が tmpfs の場合に、マウントが名前の位置に無いのを tmpfs と誤認しないため）。
 fn check_new_tmpfs(observed: MountObservation, destination: &str) -> Result<(), ExecError> {
+    let destination = display_destination(destination);
     if observed.magic != sys::TMPFS_MAGIC {
         return Err(ExecError::new(
             ErrorCode::FailedPrecondition,
@@ -647,6 +665,30 @@ mod tests {
         let err = check_new_tmpfs(obs(0x0102_1994, 30, 30), "/run").expect_err("same mount");
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
         assert_eq!(err.message, "no new mount is present at /run after mount");
+    }
+
+    /// SUP-12・TASK-169.2・SEC-4: message に入れるマウント先は制御文字をエスケープし 256 文字で切り詰める。
+    #[test]
+    fn sup12_task169_2_destination_in_messages_is_escaped_and_bounded() {
+        assert_eq!(
+            display_destination("/a\nINJECTED\u{1b}[31m\r/b"),
+            "/a\\nINJECTED\\u{1b}[31m\\r/b"
+        );
+        let long = format!("/{}", "x".repeat(400));
+        assert_eq!(display_destination(&long), format!("/{}", "x".repeat(255)));
+        let err = check_new_tmpfs(
+            MountObservation {
+                magic: 0xEF53,
+                before_mnt_id: 1,
+                after_mnt_id: 2,
+            },
+            "/run\nlevel=error msg=forged",
+        )
+        .expect_err("not tmpfs");
+        assert_eq!(
+            err.message,
+            "the mount at /run\\nlevel=error msg=forged is not tmpfs after mount"
+        );
     }
 
     /// SUP-12・TASK-169.2: 後始末は検証済みの fd が指すマウントだけを外し、適用後に名前の位置が

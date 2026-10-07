@@ -98,6 +98,7 @@ mod cgroup_join;
 mod container_env;
 mod devices;
 mod exec_command;
+mod inject;
 mod interpreter;
 mod landlock;
 mod no_new_privs;
@@ -121,6 +122,7 @@ pub use cgroup_join::{ExecCgroupJoin, ExecCgroupJoinReport, join_cgroup, prepare
 pub use container_env::{ContainerEnv, ExecCommand};
 pub use devices::{DeviceNodeOutcome, DeviceNodeStatus, DeviceReport, create_default_devices};
 pub use exec_command::{ExecChild, spawn_exec_command, spawn_exec_worker};
+pub use inject::{InjectReport, InjectedDirectoryOutcome, InjectedFileOutcome, inject_files};
 /// 結合試験 `tests/landlock.rs` 専用の再公開（CORE-5・TASK-39.5・#185。通常の利用者は呼ばない。詳細は定義側）。
 #[doc(hidden)]
 pub use landlock::{
@@ -436,6 +438,8 @@ pub enum IsolationStage {
     SetNs,
     /// rootfs 配下への tmpfs マウント（SUP-12・TASK-169.2。`--shm-size` / `--tmpfs`）。
     MountTmpfs,
+    /// secrets / configs の注入（専用 tmpfs への書き込みと read-only 再マウント。SUP-12・TASK-169.4.2）。
+    InjectFiles,
 }
 
 /// 実行層の構造化エラー（`code` は `traits::types::ErrorCode` を再利用）。
@@ -1640,6 +1644,32 @@ const MOUNTINFO_FIXED_FIELDS: usize = 6;
 /// 区切り `-` の後ろの必須フィールド数（`fstype source super_options`）。
 const MOUNTINFO_TAIL_FIELDS: usize = 3;
 
+/// `mnt_id` のマウントが read-only（mountinfo の per-mount options に `ro`）か判定する純関数。
+/// `inject_files` が read-only 再マウントの事後検証に使う（SUP-12・TASK-169.4.2）。書式に反する行・
+/// 該当行なし・複数行はエラー（fail-closed。`mount_is_shared_in` と同じ姿勢）。
+fn mount_is_read_only_in(info: &str, mnt_id: u64) -> Result<bool, ExecError> {
+    let malformed = || mountinfo_error("malformed line in /proc/thread-self/mountinfo");
+    let mut found: Option<bool> = None;
+    for line in info.lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        let id: u64 = fields
+            .first()
+            .and_then(|f| f.parse().ok())
+            .ok_or_else(malformed)?;
+        if id != mnt_id {
+            continue;
+        }
+        if found.is_some() {
+            return Err(mountinfo_error(
+                "duplicate mount ID in /proc/thread-self/mountinfo",
+            ));
+        }
+        let options = fields.get(5).ok_or_else(malformed)?;
+        found = Some(options.split(',').any(|o| o == "ro"));
+    }
+    found.ok_or_else(|| mountinfo_error("no mount entry found for the injected files mount"))
+}
+
 /// [`mount_is_shared`] の解析部（テスト可能な純関数）。先頭フィールド（mount ID）が
 /// `mnt_id` の行の optional fields に `shared:` があるかを返す。書式に反する行は 1 行でも
 /// あれば候補行かどうかに関わらずエラーにする（fail-closed。壊れた行を黙って飛ばして
@@ -2264,6 +2294,25 @@ mod tests {
 
     /// 走査で固定した `/` の fd の mnt_id は、mountinfo で最後に現れる（最上位の）
     /// マウントポイント `/` の mount ID と一致し、その行の shared 判定を返す。
+    #[test]
+    fn sup12_task169_4_2_mount_is_read_only_in_parses_per_mount_options() {
+        let info = "30 20 0:25 / /a ro,nosuid,nodev,noexec - tmpfs tmpfs rw,size=64k\n\
+                    31 20 0:26 / /b rw,nosuid,nodev,noexec shared:3 - tmpfs tmpfs ro\n";
+        assert!(mount_is_read_only_in(info, 30).expect("30"));
+        // super block 側の `ro`（末尾）ではなく per-mount options を見る。
+        assert!(!mount_is_read_only_in(info, 31).expect("31"));
+        assert!(mount_is_read_only_in(info, 99).is_err());
+        assert!(mount_is_read_only_in("x y z\n", 30).is_err());
+        assert!(mount_is_read_only_in("30 20 0:25 / /a\n", 30).is_err());
+        assert!(
+            mount_is_read_only_in(
+                "30 20 0:25 / /a ro - tmpfs t r\n30 1 0:1 / /b rw - tmpfs t r\n",
+                30
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn mount_is_shared_uses_mount_id_of_fd() {
         let fd = open_dir_beneath(Path::new("/"), &[]).unwrap();

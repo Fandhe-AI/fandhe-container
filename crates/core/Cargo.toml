@@ -108,6 +108,13 @@ name = "default_devices"
 path = "tests/default_devices.rs"
 harness = false
 
+# tmpfs マウント（mount_tmpfs。--shm-size / --tmpfs）の結合試験（SUP-12・TASK-169.2）。上と同じ理由で
+# harness = false。`-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
+[[test]]
+name = "tmpfs_mount"
+path = "tests/tmpfs_mount.rs"
+harness = false
+
 # user namespace UID/GID 写像（rootless）の結合試験（CORE-6・SEC-5・TASK-40.1）。上と同じ理由で
 # harness = false。`-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
 [[test]]

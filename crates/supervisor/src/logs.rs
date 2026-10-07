@@ -30,6 +30,8 @@
 //!   予算は省略できない: [`OutputStreams`] は [`ReaderBudget`] を渡さないと作れず、既定の予算を暗黙に作る経路は無い。
 //!   呼び出し側（supervisor プロセス）は予算を 1 つだけ作り、再起動・再捕捉をまたいで同じものを渡す
 //!   （捕捉ごとに作り直すと残存リーダーが数えられない）。
+//! - 期限切れで切り離される flush スレッドも同じ [`ReaderBudget`] が計数し（上限 [`MAX_LIVE_FLUSHERS`]）、超える flush は
+//!   スレッドを起動せず `Unavailable` で拒否する（戻らない [`LogSink::flush`] でのスレッド・sink 参照の蓄積防止。REPAIR-5）。
 //! - ストリームの所有権は捕捉側へ移る。監視の引き継ぎ時に再注入はできない（引き継ぎは #239・TASK-164 で扱う）。
 //!   代わりに取っ手（[`LogCapture`]）が捕捉の継続を表す。[`crate::run::monitor_with_capture`] は終端待ちを
 //!   しなかった全経路で取っ手を返すので、呼び出し側は [`LogCapture::cancel`] で止めるか、保持して後で
@@ -82,6 +84,10 @@ pub const READ_CHUNK_BYTES: usize = 8 * 1024;
 /// [`ReaderBudget`] の上限はこの値を超えられない。
 pub const MAX_LIVE_READERS: usize = 64;
 
+/// 期限切れで切り離された flush スレッド（[`LogSink::flush`] が戻らない間残る）の同時生存数の上限（REPAIR-5）。
+/// [`ReaderBudget`] が捕捉をまたいで共有して計数し、超える flush の開始は `Unavailable` で拒否する。
+pub const MAX_LIVE_FLUSHERS: usize = 4;
+
 /// 生存中のリーダースレッド数の予算（REPAIR-5）。
 ///
 /// [`OutputStreams`] を作るのに必須で、同じ予算から作ったストリームは捕捉をまたいで同じカウンタを共有する
@@ -92,6 +98,8 @@ pub const MAX_LIVE_READERS: usize = 64;
 #[derive(Debug, Clone)]
 pub struct ReaderBudget {
     live: Arc<AtomicUsize>,
+    /// 生存中の flush スレッド数（上限 [`MAX_LIVE_FLUSHERS`]。捕捉をまたいで共有）。
+    flushers: Arc<AtomicUsize>,
     limit: usize,
 }
 
@@ -107,6 +115,7 @@ impl ReaderBudget {
         }
         Ok(Self {
             live: Arc::new(AtomicUsize::new(0)),
+            flushers: Arc::new(AtomicUsize::new(0)),
             limit,
         })
     }
@@ -115,6 +124,7 @@ impl ReaderBudget {
     pub fn with_max_limit() -> Self {
         Self {
             live: Arc::new(AtomicUsize::new(0)),
+            flushers: Arc::new(AtomicUsize::new(0)),
             limit: MAX_LIVE_READERS,
         }
     }
@@ -127,6 +137,26 @@ impl ReaderBudget {
     /// 現在生存中のリーダー数。
     pub fn live(&self) -> usize {
         self.live.load(Ordering::SeqCst)
+    }
+
+    /// 現在生存中の flush スレッド数。
+    pub fn live_flushers(&self) -> usize {
+        self.flushers.load(Ordering::SeqCst)
+    }
+
+    /// flush スレッド 1 本ぶんの枠を確保する。上限 [`MAX_LIVE_FLUSHERS`] なら `None`。
+    fn reserve_flusher(&self) -> Option<ReaderSlot> {
+        let mut cur = self.flushers.load(Ordering::SeqCst);
+        loop {
+            let next = cur.checked_add(1).filter(|v| *v <= MAX_LIVE_FLUSHERS)?;
+            match self
+                .flushers
+                .compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return Some(ReaderSlot(Arc::clone(&self.flushers))),
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
     /// `n` 本ぶんの枠を確保する。上限を超えるなら何も確保せず `None`。
@@ -490,6 +520,8 @@ pub struct LogCapture {
     cancel: Arc<CancelGate>,
     /// [`LogCapture::cancel`] が、取消し後に受理済みの行を書き出すために保持する（TASK-164.3・SUP-7）。
     sink: Arc<dyn LogSink>,
+    /// flush スレッドの同時生存数を制限するための予算（[`OutputStreams`] の予算と同じカウンタを共有する）。
+    budget: ReaderBudget,
 }
 
 impl std::fmt::Debug for LogCapture {
@@ -602,6 +634,7 @@ impl LogCapture {
             expected,
             cancel,
             sink,
+            budget: streams.budget.clone(),
         })
     }
 
@@ -641,7 +674,7 @@ impl LogCapture {
                 // 受理済みの行を書き出す（リーダーは取消し後に flush しないため、ここで行わないと sink 内バッファに残る。SUP-7）。
                 // flush の失敗は元のエラーを優先するため捨てる。追加の猶予は設けず、drain の期限（deadline）
                 // までに限る（REPAIR-5）。期限が尽きていれば待たずに戻り、flush は別スレッドで完了し得る。
-                let _ = flush_bounded(&self.sink, deadline);
+                let _ = flush_bounded(&self.sink, &self.budget, deadline);
             }
         }
         result
@@ -665,7 +698,7 @@ impl LogCapture {
             // flush にも固定の猶予で期限を設ける（止まった sink で呼び出しスレッドが戻らなくならないように。REPAIR-5）。
             let now = Instant::now();
             let until = now.checked_add(CANCEL_SETTLE_TIMEOUT).unwrap_or(now);
-            flush_bounded(&self.sink, until)
+            flush_bounded(&self.sink, &self.budget, until)
         } else {
             Err(TraitError::new(
                 ErrorCode::Timeout,
@@ -797,12 +830,25 @@ impl LineSplitter<'_> {
 
 /// `sink.flush()` を別スレッドで実行し、`until` まで結果を待つ。超過は `Timeout`、スレッド起動失敗は `Internal`。
 /// 超過した flush はスレッド側で完了し得る（呼び出しスレッドは止まらない。REPAIR-5）。
-fn flush_bounded(sink: &Arc<dyn LogSink>, until: Instant) -> Result<(), TraitError> {
+/// 戻らない flush が溜まらないよう、`budget` の flush 枠（[`MAX_LIVE_FLUSHERS`]）を確保できなければ
+/// スレッドを起動せず `Unavailable` を返す。枠はスレッド終了時に戻る。
+fn flush_bounded(
+    sink: &Arc<dyn LogSink>,
+    budget: &ReaderBudget,
+    until: Instant,
+) -> Result<(), TraitError> {
+    let Some(flush_slot) = budget.reserve_flusher() else {
+        return Err(TraitError::new(
+            ErrorCode::Unavailable,
+            "too many log flush threads are still alive",
+        ));
+    };
     let (tx, rx) = mpsc::channel();
     let sink = Arc::clone(sink);
     let spawned = std::thread::Builder::new()
         .name("supervisor-log-flush".to_string())
         .spawn(move || {
+            let _flush_slot = flush_slot;
             // 受信側が待ち切れず破棄済みなら送信失敗は無視してよい。
             let _ = tx.send(sink.flush());
         });
@@ -2055,6 +2101,41 @@ mod tests {
         assert!(t0.elapsed() < Duration::from_secs(5));
         drop(release_tx);
         drop(w);
+    }
+
+    /// 戻らない flush を繰り返しても、切り離される flush スレッドは [`MAX_LIVE_FLUSHERS`] 本まで。
+    /// 超える開始は `Unavailable` で拒否し、解放後は枠が戻る（REPAIR-5・SUP-7）。
+    #[test]
+    fn sup7_task164_3_stuck_flush_threads_are_bounded() {
+        struct HangFlush(Mutex<mpsc::Receiver<()>>);
+        impl LogSink for HangFlush {
+            fn append(&self, _s: StreamKind, _l: &[u8]) -> Result<(), TraitError> {
+                Ok(())
+            }
+            fn flush(&self) -> Result<(), TraitError> {
+                let _ = self.0.lock().unwrap().recv();
+                Ok(())
+            }
+        }
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let sink: Arc<dyn LogSink> = Arc::new(HangFlush(Mutex::new(release_rx)));
+        let budget = ReaderBudget::new(1).unwrap();
+        for _ in 0..MAX_LIVE_FLUSHERS {
+            let until = Instant::now() + Duration::from_millis(10);
+            let err = flush_bounded(&sink, &budget, until).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::Timeout);
+        }
+        assert_eq!(budget.live_flushers(), MAX_LIVE_FLUSHERS);
+        let err =
+            flush_bounded(&sink, &budget, Instant::now() + Duration::from_millis(10)).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Unavailable);
+        assert_eq!(budget.live_flushers(), MAX_LIVE_FLUSHERS);
+        drop(release_tx);
+        let t0 = Instant::now();
+        while budget.live_flushers() > 0 && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(budget.live_flushers(), 0);
     }
 
     /// drain が期限切れで失敗しても、受理済みの行を flush してから戻る（SUP-7）。元のエラーは `Timeout` のまま。

@@ -73,6 +73,7 @@ fn sup7_task164_2_record_format_and_byte_exactness() {
     s.append(StreamKind::Stdout, b"hello").unwrap();
     s.append(StreamKind::Stderr, b"").unwrap();
     s.append(StreamKind::Stdout, b"\xff\xfe\r").unwrap();
+    s.flush().unwrap();
     let got = fs::read(t.0.join("c1.log")).unwrap();
     assert_eq!(got, b"stdout hello\nstderr \nstdout \xff\xfe\r\n");
 }
@@ -121,6 +122,7 @@ fn sup7_task164_2_exact_fit_does_not_rotate_but_one_more_byte_does() {
     );
     s.append(StreamKind::Stdout, b"").unwrap();
     assert_eq!(s.rotations().unwrap(), 1);
+    s.flush().unwrap();
     assert_eq!(fs::read(t.0.join("c1.log")).unwrap(), b"stdout \n");
     assert_eq!(
         fs::metadata(t.0.join("c1.log.1")).unwrap().len(),
@@ -231,6 +233,7 @@ fn sup7_task164_2_rotation_does_not_write_through_swapped_symlink() {
     fs::remove_file(t.0.join("c1.log")).unwrap();
     std::os::unix::fs::symlink(&target, t.0.join("c1.log")).unwrap();
     s.append(StreamKind::Stdout, b"x").unwrap();
+    s.flush().unwrap();
     assert_eq!(fs::read(&target).unwrap(), b"keep\n");
     assert_eq!(fs::read_link(t.0.join("c1.log.1")).unwrap(), target);
     assert_eq!(fs::read(t.0.join("c1.log")).unwrap(), b"stdout x\n");
@@ -297,6 +300,7 @@ fn sup7_task164_2_concurrent_appends_keep_records_whole() {
     for h in hs {
         h.join().unwrap();
     }
+    s.flush().unwrap();
     let b = fs::read(t.0.join("c1.log")).unwrap();
     let lines: Vec<&[u8]> = b.split(|c| *c == b'\n').filter(|l| !l.is_empty()).collect();
     assert_eq!(lines.len(), 1000);
@@ -572,6 +576,9 @@ fn sup7_task164_2_case_only_different_ids_do_not_collide() {
     sb.append(StreamKind::Stdout, b"lower").unwrap();
     let sc = RotatingFileSink::open(&t.0, &under, small()).unwrap();
     sc.append(StreamKind::Stdout, b"under").unwrap();
+    for sink in [&sa, &sb, &sc] {
+        sink.flush().unwrap();
+    }
     // 世代へ退避されたファイルはなく、全ファイル名が小文字のみ。
     assert_eq!(files(&t.0), ["__a.log", "_a.log", "a.log"]);
     assert!(fs::read(t.0.join("_a.log")).unwrap().ends_with(b"upper\n"));
@@ -591,6 +598,7 @@ fn sup7_task164_2_second_open_of_same_id_is_rejected_without_moving_files() {
     // 使用中のログは退避されず、先の sink はそのまま現在ログへ書ける。
     assert_eq!(files(&d.0), vec!["c1.log"]);
     first.append(StreamKind::Stdout, b"more").unwrap();
+    first.flush().unwrap();
     assert_eq!(
         fs::read(d.0.join("c1.log")).unwrap(),
         b"stdout keep\nstdout more\n"
@@ -612,6 +620,7 @@ fn sup7_task164_2_append_rejects_line_feed_without_failing_sink() {
     assert_eq!(err.code(), ErrorCode::InvalidArgument);
     // 拒否は sink を失敗状態にせず、何も書かない。
     sink.append(StreamKind::Stderr, b"ok").unwrap();
+    sink.flush().unwrap();
     assert_eq!(fs::read(d.0.join("c1.log")).unwrap(), b"stderr ok\n");
 }
 
@@ -721,6 +730,7 @@ fn sup7_task164_2_open_normalizes_trailing_separator() {
     p.push(std::path::MAIN_SEPARATOR_STR);
     let s = RotatingFileSink::open(Path::new(&p), &id(), small()).unwrap();
     s.append(StreamKind::Stdout, b"x").unwrap();
+    s.flush().unwrap();
     assert_eq!(fs::read(d.0.join("c1.log")).unwrap(), b"stdout x\n");
 }
 
@@ -757,6 +767,178 @@ fn sup7_task164_2_reserved_device_names_are_escaped() {
     let nul = ContainerId::new("nul").unwrap();
     let s = RotatingFileSink::open(&d.0, &nul, small()).unwrap();
     s.append(StreamKind::Stdout, b"x").unwrap();
+    s.flush().unwrap();
     assert_eq!(files(&d.0), ["_0nul.log"]);
     assert_eq!(fs::read(d.0.join("_0nul.log")).unwrap(), b"stdout x\n");
+}
+
+// ---- TASK-164.3（#507・SUP-7）: バッファ・フラッシュ制御 ----
+
+/// 連番つきの 992 バイトの行本体（レコードは `stdout ` + 行 + LF で 1000 バイトの固定長）。
+fn numbered_line(i: usize) -> Vec<u8> {
+    let mut l = format!("{i:06}").into_bytes();
+    l.resize(992, b'p');
+    l
+}
+
+/// 世代を渡した順に連結して連番（stream 名の後の 6 桁）の列を取り出す。各ファイルは LF で終わること。
+fn seqs_in(dir: &Path, names: &[&str]) -> Vec<usize> {
+    let mut out = Vec::new();
+    for n in names {
+        let Ok(b) = fs::read(dir.join(n)) else {
+            continue;
+        };
+        assert_eq!(b.last().copied(), Some(b'\n'), "{n} ends mid-record");
+        for rec in b.split(|c| *c == b'\n').filter(|l| !l.is_empty()) {
+            assert_eq!(rec.len(), 999, "{n} has a torn record");
+            let num = std::str::from_utf8(rec.get(7..13).unwrap()).unwrap();
+            out.push(num.parse().unwrap());
+        }
+    }
+    out
+}
+
+/// ローテーション境界を跨いでも、flush を呼ばずに旧世代が書き切られ、欠落・重複がない。
+#[test]
+fn sup7_task164_3_boundary_has_no_loss_or_duplication_without_explicit_flush() {
+    let t = TmpDir::new("b164-3");
+    let s = RotatingFileSink::open(&t.0, &id(), small()).unwrap();
+    // 1 レコード 1000 バイト。65 件で 65000 バイト、66 件目で上限（65544）を超えて回る。
+    for i in 0..66 {
+        s.append(StreamKind::Stdout, &numbered_line(i)).unwrap();
+    }
+    assert_eq!(s.rotations().unwrap(), 1);
+    // flush していなくても退避済みの世代は完全（65 レコード = 65000 バイト）。
+    assert_eq!(fs::metadata(t.0.join("c1.log.1")).unwrap().len(), 65_000);
+    assert_eq!(
+        seqs_in(&t.0, &["c1.log.1"]),
+        (0..65).collect::<Vec<usize>>()
+    );
+    s.flush().unwrap();
+    assert_eq!(
+        seqs_in(&t.0, &["c1.log.2", "c1.log.1", "c1.log"]),
+        (0..66).collect::<Vec<usize>>()
+    );
+    // 多数の境界を跨いでも同様（保持範囲内の連続した末尾）。
+    for i in 66..400 {
+        s.append(StreamKind::Stdout, &numbered_line(i)).unwrap();
+    }
+    s.flush().unwrap();
+    let got = seqs_in(&t.0, &["c1.log.2", "c1.log.1", "c1.log"]);
+    let first = got.first().copied().unwrap();
+    assert_eq!(got, (first..400).collect::<Vec<usize>>());
+    assert_eq!(s.rotations().unwrap(), 6);
+}
+
+/// stdout / stderr の 2 スレッドが境界を跨いで追記しても、ストリームごとに連番が欠落・重複しない。
+#[test]
+fn sup7_task164_3_concurrent_streams_across_boundaries() {
+    let t = TmpDir::new("conc164-3");
+    let cfg = RotationConfig::new(MIN_LOG_FILE_BYTES, 16).unwrap();
+    let s = Arc::new(RotatingFileSink::open(&t.0, &id(), cfg).unwrap());
+    let mut hs = Vec::new();
+    for kind in [StreamKind::Stdout, StreamKind::Stderr] {
+        let s = Arc::clone(&s);
+        hs.push(std::thread::spawn(move || {
+            for i in 0..300 {
+                s.append(kind, &numbered_line(i)).unwrap();
+            }
+        }));
+    }
+    for h in hs {
+        h.join().unwrap();
+    }
+    s.flush().unwrap();
+    assert!(s.rotations().unwrap() >= 1);
+    let mut names: Vec<String> = (1..16).rev().map(|n| format!("c1.log.{n}")).collect();
+    names.push("c1.log".to_string());
+    let mut per = [Vec::new(), Vec::new()];
+    for n in &names {
+        let Ok(b) = fs::read(t.0.join(n)) else {
+            continue;
+        };
+        assert_eq!(b.last().copied(), Some(b'\n'));
+        for rec in b.split(|c| *c == b'\n').filter(|l| !l.is_empty()) {
+            let idx = usize::from(rec.starts_with(b"stderr "));
+            let num: usize = std::str::from_utf8(rec.get(7..13).unwrap())
+                .unwrap()
+                .parse()
+                .unwrap();
+            per[idx].push(num);
+        }
+    }
+    for seq in per {
+        assert_eq!(seq, (0..300).collect::<Vec<usize>>());
+    }
+}
+
+/// バッファ中は未書き出しで、flush で書き出される。
+#[test]
+fn sup7_task164_3_small_append_is_buffered_until_flush() {
+    let t = TmpDir::new("buf164-3");
+    let s = RotatingFileSink::open(&t.0, &id(), small()).unwrap();
+    s.append(StreamKind::Stdout, b"hi").unwrap();
+    assert_eq!(fs::metadata(t.0.join("c1.log")).unwrap().len(), 0);
+    s.flush().unwrap();
+    assert_eq!(fs::read(t.0.join("c1.log")).unwrap(), b"stdout hi\n");
+}
+
+/// flush せずに drop しても、バッファ内のレコードは書き出される。
+#[test]
+fn sup7_task164_3_drop_writes_buffered_records() {
+    let t = TmpDir::new("drop164-3");
+    let s = RotatingFileSink::open(&t.0, &id(), small()).unwrap();
+    s.append(StreamKind::Stdout, b"one").unwrap();
+    s.append(StreamKind::Stderr, b"two").unwrap();
+    drop(s);
+    assert_eq!(
+        fs::read(t.0.join("c1.log")).unwrap(),
+        b"stdout one\nstderr two\n"
+    );
+}
+
+/// `sync` はバッファを書き出す。
+#[test]
+fn sup7_task164_3_sync_makes_content_visible() {
+    let t = TmpDir::new("sync164-3");
+    let s = RotatingFileSink::open(&t.0, &id(), small()).unwrap();
+    s.append(StreamKind::Stdout, b"durable").unwrap();
+    s.sync().unwrap();
+    assert_eq!(fs::read(t.0.join("c1.log")).unwrap(), b"stdout durable\n");
+}
+
+/// 失敗状態の sink では flush / sync も `Internal`（固定文言）。
+#[test]
+fn sup7_task164_3_flush_and_sync_fail_in_failed_state() {
+    let t = TmpDir::new("failed164-3");
+    let s = RotatingFileSink::open(&t.0, &id(), small()).unwrap();
+    fs::write(t.0.join("c1.log.1"), b"g1").unwrap();
+    let blocker = t.0.join("c1.log.2");
+    fs::create_dir(&blocker).unwrap();
+    fs::write(blocker.join("x"), b"").unwrap();
+    s.append(StreamKind::Stdout, &vec![b'a'; MAX_LINE_BYTES])
+        .unwrap();
+    assert!(s.append(StreamKind::Stdout, b"next").is_err());
+    for e in [s.flush().unwrap_err(), s.sync().unwrap_err()] {
+        assert_eq!(e.code(), ErrorCode::Internal);
+        assert!(!e.to_string().contains("c1"), "{e}");
+    }
+}
+
+/// 世代番号に抜けがある状態（中断されたローテーションの名残）から開き直しても、重複しない。
+#[test]
+fn sup7_task164_3_reopen_after_gap_in_generations_has_no_duplication() {
+    let t = TmpDir::new("gap164-3");
+    fs::write(t.0.join("c1.log"), b"stdout cur\n").unwrap();
+    fs::write(t.0.join("c1.log.2"), b"stdout old\n").unwrap();
+    let s = RotatingFileSink::open(&t.0, &id(), small()).unwrap();
+    s.append(StreamKind::Stdout, b"new").unwrap();
+    s.flush().unwrap();
+    let mut all = Vec::new();
+    for n in ["c1.log.2", "c1.log.1", "c1.log"] {
+        if let Ok(b) = fs::read(t.0.join(n)) {
+            all.extend(b);
+        }
+    }
+    assert_eq!(all, b"stdout old\nstdout cur\nstdout new\n");
 }

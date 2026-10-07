@@ -32,7 +32,8 @@
 //! `mkdirat(2)`・`unlinkat(2)`・`fstatfs(2)`（cgroup2 判定）と `O_NOFOLLOW` 付きの `openat(2)` を呼ぶために使う。
 //! rlimit の適用（`exec/rlimits.rs` の `apply_rlimits`。SUP-12・TASK-169.1・#526）は、fork 後の子で `prlimit(2)` を呼ぶために使う。
 //! 稼働中コンテナへの exec（`exec/exec_command.rs`。SUP-6・TASK-163.4・#503）は、exec 専用 worker を
-//! non-dumpable にするために `prctl(2)`（`PR_SET_DUMPABLE` / `PR_GET_DUMPABLE`）を呼ぶ。
+//! non-dumpable にし、子を親の生存に結び付けるために `prctl(2)`（`PR_SET_DUMPABLE` / `PR_GET_DUMPABLE` /
+//! `PR_SET_PDEATHSIG`）を呼ぶ。
 //! さらに `crate::audit_log` のカーネル監査フォールバック（SEC-4・TASK-41.5.2・#840）が、
 //! `socket(2)`（NETLINK_AUDIT）・`sendto(2)`・`recvfrom(2)`・`poll(2)` を呼ぶ。
 //! std だけでは提供されない syscall のみを持ち、検証（hostname の文字種・パス形式等）は呼び出し側の型
@@ -194,6 +195,10 @@ mod consts {
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
     pub const PR_GET_DUMPABLE: i32 = 3;
     pub const PR_SET_DUMPABLE: i32 = 4;
+
+    // include/uapi/linux/prctl.h の `PR_SET_PDEATHSIG`（1）。SUP-6・REPAIR-5・TASK-163.4。
+    // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const PR_SET_PDEATHSIG: i32 = 1;
 
     // include/uapi/asm-generic/resource.h の `RLIMIT_*`（0〜15。SUP-12・TASK-169.1）。
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
@@ -361,6 +366,10 @@ mod consts {
     pub const PR_GET_DUMPABLE: i32 = 3;
     pub const PR_SET_DUMPABLE: i32 = 4;
 
+    // include/uapi/linux/prctl.h の `PR_SET_PDEATHSIG`（1）。SUP-6・REPAIR-5・TASK-163.4。
+    // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const PR_SET_PDEATHSIG: i32 = 1;
+
     // include/uapi/asm-generic/resource.h の `RLIMIT_*`（0〜15。SUP-12・TASK-169.1）。
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
     pub const RLIMIT_CPU: i32 = 0;
@@ -491,6 +500,7 @@ mod consts {
     pub const PR_GET_NO_NEW_PRIVS: i32 = 0;
     pub const PR_GET_DUMPABLE: i32 = 0;
     pub const PR_SET_DUMPABLE: i32 = 0;
+    pub const PR_SET_PDEATHSIG: i32 = 0;
 
     // rlimit の定数（対応外アーキテクチャでは各ラッパーが SUPPORTED で弾くため未使用）。
     pub const RLIMIT_CPU: i32 = 0;
@@ -1858,6 +1868,32 @@ pub(crate) fn set_non_dumpable() -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// 親が終了したら呼び出しプロセスへ `SIGKILL` が届くようにする（`PR_SET_PDEATHSIG`。SUP-6・REPAIR-5・
+/// TASK-163.4・#503）。
+///
+/// `crate::exec` の exec 経路（`exec/exec_command.rs`）で、fork した子（worker・コマンド）が最初に呼ぶ。
+/// worker が全体の期限で強制終了されたとき、worker が待っていたコマンドを孤児として残さないために使う。
+///
+/// - 対象は「このプロセスを作ったスレッド」の終了。設定より前に親が終了していた場合はシグナルが届かない
+///   ため、呼び出し側は設定の **後** に親の生存を別の手段（親の pidfd）で確かめること
+/// - 設定はプロセス（スレッド）単位で、fork した子へは継承されない。資格情報が変わらない `execve` では
+///   保持される（set-uid / capability 付きの実行ファイルではカーネルが解除するが、`NO_NEW_PRIVS` の下では
+///   資格情報が変わらない）。実行されたプログラム自身は `prctl` で解除できる
+/// - 親が別の PID namespace にいてもカーネルは届ける（`forget_original_parent` が子の `pdeath_signal` を送る）
+pub(crate) fn set_parent_death_sigkill() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let Ok(signal) = u64::try_from(consts::SIGKILL) else {
+        return Err(SysError::Os(EINVAL));
+    };
+    // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す
+    // （arg2 がシグナル番号。`SIGKILL` の定数だけを渡す。arg3〜5 はカーネルが参照しないが 0 に揃える）。
+    // 呼び出したスレッドの `pdeath_signal` を設定するだけで、メモリ・fd には触れない。
+    let rc = unsafe { prctl(consts::PR_SET_PDEATHSIG, signal, 0u64, 0u64, 0u64) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
 /// 呼び出したプロセスが dumpable か（`PR_GET_DUMPABLE`。SUP-6・SEC-1・TASK-163.4・#503）。
 ///
 /// `0`（`SUID_DUMP_DISABLE`）だけを non-dumpable として `Ok(false)` を返す。`1`（`SUID_DUMP_USER`）と
@@ -2492,12 +2528,16 @@ mod tests {
         assert_eq!(consts::PR_GET_NO_NEW_PRIVS, 39);
     }
 
-    /// SUP-6・TASK-163.4: `prctl` の dumpable オプションの具体値（include/uapi/linux/prctl.h）。
+    /// SUP-6・TASK-163.4: `prctl` の dumpable・親死亡シグナルのオプションの具体値（include/uapi/linux/prctl.h）。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn sup6_task163_4_prctl_dumpable_consts_are_exact() {
         assert_eq!(consts::PR_GET_DUMPABLE, 3);
         assert_eq!(consts::PR_SET_DUMPABLE, 4);
+        assert_eq!(consts::PR_SET_PDEATHSIG, 1);
+        // 親死亡シグナルの実 syscall は単体テストでは呼ばない（設定はスレッド単位で、テストプロセスを起動した
+        // スレッドが先に終わるとテストプロセス全体へ SIGKILL が届く）。実プロセスでの照合は supervisor の
+        // 結合試験 `exec_timeout` が行う。
     }
 
     /// SUP-6・SEC-1・TASK-163.4: テストプロセス自身は dumpable（`PR_GET_DUMPABLE` が 1）で、`/proc/self` 配下の

@@ -18,7 +18,7 @@
 //!   （`container:<id>` の `setns`・ns パス公開・`/dev/shm` の配置）は未実装。`is_shareable` で印を保持するのみ。
 //!   core が `linux.namespaces[].path` を未実装としていることに依存する。
 //! - `--ipc=container:<id>`・`--ipc=none` は受理しない。
-//! - `Host` と `--shm-size` の併用可否は TASK-169.5.2（#856）で確定する。
+//! - `Host` と `--shm-size` の併用は拒否する（TASK-169.5.2・#856。`ContainerOptions::tmpfs_set` が消費時点で検証）。
 //! - 本番 `ProcessLauncher` が未提供のため消費者は無い。
 
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};

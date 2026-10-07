@@ -3,7 +3,7 @@
 //! OS 非依存のため 3 OS で実行する。
 
 use fandhe_container_core::traits::ErrorCode;
-use fandhe_container_supervisor::container_options::{MountOptions, ShmSize, TmpfsOption};
+use fandhe_container_supervisor::container_options::{IpcMode, MountOptions, ShmSize, TmpfsOption};
 
 /// SUP-12: `--shm-size 64m --tmpfs /run:rw,noexec,nosuid,size=65536k` が指定どおりの mount data になる。
 #[test]
@@ -12,7 +12,7 @@ fn sup12_shm_size_and_tmpfs_become_exact_mount_specs() {
         .with_shm_size(ShmSize::parse("64m").expect("shm"))
         .with_tmpfs(TmpfsOption::parse("/run:rw,noexec,nosuid,size=65536k").expect("tmpfs"))
         .expect("add tmpfs");
-    let set = opts.to_tmpfs_set().expect("set");
+    let set = opts.to_tmpfs_set(IpcMode::Private).expect("set");
     let got: Vec<(String, String, bool, bool)> = set
         .mounts()
         .iter()
@@ -51,7 +51,9 @@ fn sup12_unsafe_tmpfs_requests_are_rejected() {
     let opts = MountOptions::default()
         .with_tmpfs(TmpfsOption::parse("/proc/sys").expect("parse"))
         .expect("add tmpfs");
-    let e = opts.to_tmpfs_set().expect_err("reserved destination");
+    let e = opts
+        .to_tmpfs_set(IpcMode::Private)
+        .expect_err("reserved destination");
     assert_eq!(e.code(), ErrorCode::InvalidArgument);
     assert_eq!(e.message(), "tmpfs must not be mounted on /proc or below");
 }

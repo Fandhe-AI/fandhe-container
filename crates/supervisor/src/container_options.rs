@@ -9,9 +9,11 @@
 //! | ----- | ---- | ------ |
 //! | #526（TASK-169.1） | ulimit（`--ulimit <name>=<soft>[:<hard>]`）。core の [`Rlimits`] へ変換して保持 | exec ステージの `prlimit(2)` |
 //! | #529（TASK-169.4） | env・env ファイル（[`env`]） | `execve` の envp |
+//! | #527（TASK-169.2） | `--shm-size` / `--tmpfs`（[`mounts`]）。[`ContainerOptions::tmpfs_set`] で core の tmpfs 仕様型へ変換 | core の `exec::mount_tmpfs` |
 //! | #855（TASK-169.5.1） | label（`--label`。[`labels`]） | state.json の `annotations`（core の `StateRecord`） |
+//! | #856（TASK-169.5.2） | 全オプション同時指定の結合テスト（`tests/container_options.rs`）。`--ipc=host` と `--shm-size` の併用を拒否 | — |
 //!
-//! secrets / configs の tmpfs 注入（#529 の後半）は、tmpfs 機構（#527・TASK-169.2）のマージ待ちで未実装（REPAIR-3）。
+//! secrets / configs の tmpfs 注入（#529 の後半）は未実装（REPAIR-3。tmpfs 機構〔#527〕は導入済みだが注入の結線が無い）。
 //!
 //! 変換先の [`Rlimits`] は `fandhe_container_core::exec::StagePipeline::with_rlimits`（fork 後・capability
 //! 削減の前に `prlimit(2)` で適用。Linux 限定）が消費する。
@@ -44,6 +46,7 @@ pub use mounts::{DEFAULT_SHM_SIZE_BYTES, MountOptions, ShmSize, TmpfsOption};
 
 use self::env::EnvSet;
 use fandhe_container_core::rlimits::{RLIMIT_INFINITY, Rlimit, RlimitKind, Rlimits};
+use fandhe_container_core::tmpfs::TmpfsMountSet;
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
 
 /// `--ulimit` 1 件の最大バイト数（最長の名前 `sigpending` と u64 の 2 値に十分な余裕を持たせた上限）。
@@ -87,7 +90,7 @@ impl Ulimit {
     }
 }
 
-/// コンテナ起動オプション（現状は ulimit・`--ipc`・env・label。後続 issue が拡張する）。
+/// コンテナ起動オプション（現状は ulimit・`--ipc`・env・label・`--shm-size` / `--tmpfs`。後続 issue が拡張する）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ContainerOptions {
@@ -95,6 +98,7 @@ pub struct ContainerOptions {
     ipc: IpcMode,
     env: EnvSet,
     labels: Labels,
+    mounts: MountOptions,
 }
 
 impl ContainerOptions {
@@ -140,6 +144,27 @@ impl ContainerOptions {
     /// label。`labels().annotations()` を `CreateStateRequest::with_annotations` へ渡すと state.json に反映される。
     pub fn labels(&self) -> &Labels {
         &self.labels
+    }
+
+    /// `--shm-size` / `--tmpfs` を設定する（SUP-12・TASK-169.2／TASK-169.5.2）。
+    pub fn with_mounts(mut self, mounts: MountOptions) -> Self {
+        self.mounts = mounts;
+        self
+    }
+
+    /// 保持している `--shm-size` / `--tmpfs` の指定そのもの。
+    pub fn mounts(&self) -> &MountOptions {
+        &self.mounts
+    }
+
+    /// core の `exec::mount_tmpfs` へ渡す tmpfs 集合へ変換する。
+    ///
+    /// `--ipc=host` と `--shm-size`、および `--ipc=host` と `--tmpfs /dev/shm` の同時指定は拒否する
+    /// （SUP-12・TASK-169.5.2）。host IPC ではホストの `/dev/shm` を共有するはずで、コンテナ専用の
+    /// `/dev/shm` サイズ指定を黙って無視したり専用 tmpfs で覆ったりすると、指定した IPC モードと実際の共有状態が食い違うため（fail-closed）。
+    /// 検証は消費時点で行い、builder の呼び出し順で迂回できないようにする。
+    pub fn tmpfs_set(&self) -> Result<TmpfsMountSet, TraitError> {
+        self.mounts.to_tmpfs_set(self.ipc)
     }
 
     /// core の `StagePipeline::with_rlimits` へ渡す集合。
@@ -308,5 +333,31 @@ mod tests {
             opts.labels().iter().collect::<Vec<_>>(),
             [("app", "web"), ("tier", "")]
         );
+    }
+
+    /// SUP-12・TASK-169.5.2: Host と --shm-size の併用は順序によらず拒否し、他の組み合わせは許可する。
+    #[test]
+    fn sup12_task169_5_2_ipc_host_shm_size_rejected() {
+        let shm = || MountOptions::default().with_shm_size(ShmSize::parse("64m").unwrap());
+        let a = ContainerOptions::new()
+            .with_ipc_mode(IpcMode::Host)
+            .with_mounts(shm());
+        let b = ContainerOptions::new()
+            .with_mounts(shm())
+            .with_ipc_mode(IpcMode::Host);
+        for o in [a, b] {
+            let e = o.tmpfs_set().unwrap_err();
+            assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        }
+        for m in [IpcMode::Private, IpcMode::Shareable] {
+            let set = ContainerOptions::new()
+                .with_ipc_mode(m)
+                .with_mounts(shm())
+                .tmpfs_set()
+                .unwrap();
+            assert_eq!(set.mounts().len(), 1);
+        }
+        assert!(ContainerOptions::new().tmpfs_set().unwrap().is_empty());
+        assert!(ContainerOptions::new().mounts().tmpfs().is_empty());
     }
 }

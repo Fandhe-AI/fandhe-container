@@ -10,7 +10,7 @@ MVP のリソース制限が cgroups v2 単独対応であることと、非対�
 ## 対応範囲
 
 - cgroups v2（unified hierarchy）単独に対応する
-- 非特権ユーザーに委譲された cgroup v2 サブツリー上で子 cgroup を作成し、controller（`memory`・`cpu`）でリソースを制限する（CORE-3）
+- 非特権ユーザーに委譲された cgroup v2 サブツリー上で子 cgroup を作成し、controller（`memory`・`cpu`・`pids`・`io`）でリソースを制限する（CORE-3・SUP-13・TASK-170）
 
 ## 非対応
 

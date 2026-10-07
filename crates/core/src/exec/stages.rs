@@ -6,12 +6,12 @@
 //! `exec_entrypoint` の前に `StagePipeline::run_then` を呼び、次の順序で各段のフックを実行する。
 //!
 //! ```text
-//! cgroup 参加 -> capability 削減 -> PR_SET_NO_NEW_PRIVS -> Landlock -> seccomp -> exec
+//! cgroup 参加 -> rlimit 適用 -> capability 削減 -> PR_SET_NO_NEW_PRIVS -> Landlock -> seccomp -> exec
 //! ```
 //!
 //! cgroup 参加の実体は `crate::cgroups::CgroupJoin`（TASK-32.4・#161。[`StageHook`] 実装済みで、
 //! `ContainerCgroup::join_hook` が返すものを呼び出し側が `with_hook(StageKind::CgroupJoin, ..)` で登録する）。
-//! 残りの段の実体は後続の TASK が [`StageHook`] として差し込む（rootless: TASK-40。Landlock は [`StagePipeline::with_landlock`]（TASK-39.4・#184）で core の適用処理を差し込む）。`CapabilityDrop`（`exec/capabilities.rs`。
+//! 残りの段の実体は後続の TASK が [`StageHook`] として差し込む（rootless: TASK-40。Landlock は [`StagePipeline::with_landlock`]（TASK-39.4・#184）で core の適用処理を差し込む）。`Rlimits`（`exec/rlimits.rs`。SUP-12・TASK-169.1・#526。`with_rlimits` で渡した集合を適用し、未設定なら何もしない）・`CapabilityDrop`（`exec/capabilities.rs`。
 //! #173・TASK-37.2・SEC-1）・`NoNewPrivs`（`exec/no_new_privs.rs`。#833・TASK-27.4.3）・
 //! `Seccomp`（`exec/seccomp.rs`。#178・TASK-38.3・CORE-5。exec 直前の最終段）は
 //! 組み込みの固定ステージで、フックを登録しなくても必ず実行され、[`StagePipeline::with_hook`] による
@@ -27,7 +27,7 @@
 //!   その段に付け替える（フックが自分の段を偽れない。ERR-1）
 //! - **同じ段への二重登録は拒否する**: 既存の制限フックを no-op で上書きする経路を作らない
 //! - **組み込みの固定ステージは差し替えられない**: [`StageKind::is_builtin`] の段
-//!   （`CapabilityDrop`・`NoNewPrivs`・`Seccomp`）は `with_hook` で `InvalidArgument` になり、`run_then` はフック配列を読まず
+//!   （`Rlimits`・`CapabilityDrop`・`NoNewPrivs`・`Seccomp`）は `with_hook` で `InvalidArgument` になり、`run_then` はフック配列を読まず
 //!   組み込み処理へ直接振り分ける
 //! - **[`StageReport`] と `Applied` は制限適用の証跡ではない**: 「フックが `Ok` を返した」事実の
 //!   記録にすぎない。`process.rs::require_restriction_evidence` の判定には使わず、フック無し・
@@ -53,7 +53,7 @@ use super::capabilities::apply_default_capabilities;
 use super::landlock::apply_landlock_stage;
 #[cfg(not(test))]
 use super::seccomp::apply_default_seccomp;
-use super::{CapabilityReport, ExecError, IsolationStage, no_new_privs};
+use super::{CapabilityReport, ExecError, IsolationStage, no_new_privs, rlimits};
 // テストでは本物（`Threads: 1` を要求）の代わりに偽カーネルで走る関数へ差し替える。
 #[cfg(test)]
 use super::capabilities::testing::apply_default_capabilities;
@@ -62,6 +62,7 @@ use super::landlock::testing::apply_landlock_stage;
 #[cfg(test)]
 use super::seccomp::testing::apply_default_seccomp;
 use crate::landlock::LandlockRuleset;
+use crate::rlimits::Rlimits;
 use crate::traits::types::ErrorCode;
 
 /// ステージの種別。`ORDER` の順が実行順（固定）。
@@ -72,6 +73,9 @@ use crate::traits::types::ErrorCode;
 pub enum StageKind {
     /// cgroup 参加（TASK-32）。
     CgroupJoin,
+    /// rlimit 適用（SUP-12・TASK-169.1・#526）。組み込みの固定ステージ（差し替え不可）。
+    /// capability 削減より前に置くのは、削減後は `CAP_SYS_RESOURCE` が無く hard の引き上げが常に失敗するため。
+    Rlimits,
     /// capability 削減（#173・TASK-37.2）。組み込みの固定ステージ（差し替え不可）。
     CapabilityDrop,
     /// `PR_SET_NO_NEW_PRIVS`（#833・TASK-27.4.3）。組み込みの固定ステージ（差し替え不可）。
@@ -84,8 +88,9 @@ pub enum StageKind {
 
 impl StageKind {
     /// 実行順（唯一の定義元）。
-    pub const ORDER: [StageKind; 5] = [
+    pub const ORDER: [StageKind; 6] = [
         StageKind::CgroupJoin,
+        StageKind::Rlimits,
         StageKind::CapabilityDrop,
         StageKind::NoNewPrivs,
         StageKind::Landlock,
@@ -95,17 +100,21 @@ impl StageKind {
     fn index(self) -> usize {
         match self {
             StageKind::CgroupJoin => 0,
-            StageKind::CapabilityDrop => 1,
-            StageKind::NoNewPrivs => 2,
-            StageKind::Landlock => 3,
-            StageKind::Seccomp => 4,
+            StageKind::Rlimits => 1,
+            StageKind::CapabilityDrop => 2,
+            StageKind::NoNewPrivs => 3,
+            StageKind::Landlock => 4,
+            StageKind::Seccomp => 5,
         }
     }
 
     /// 組み込みの固定ステージか（`with_hook` で差し替えを拒否する唯一の判定元）。
     pub fn is_builtin(self) -> bool {
         match self {
-            StageKind::CapabilityDrop | StageKind::NoNewPrivs | StageKind::Seccomp => true,
+            StageKind::Rlimits
+            | StageKind::CapabilityDrop
+            | StageKind::NoNewPrivs
+            | StageKind::Seccomp => true,
             StageKind::CgroupJoin | StageKind::Landlock => false,
         }
     }
@@ -114,6 +123,7 @@ impl StageKind {
     pub fn as_str(self) -> &'static str {
         match self {
             StageKind::CgroupJoin => "cgroup_join",
+            StageKind::Rlimits => "rlimits",
             StageKind::CapabilityDrop => "capability_drop",
             StageKind::NoNewPrivs => "no_new_privs",
             StageKind::Landlock => "landlock",
@@ -124,6 +134,7 @@ impl StageKind {
     fn isolation_stage(self) -> IsolationStage {
         match self {
             StageKind::CgroupJoin => IsolationStage::CgroupJoin,
+            StageKind::Rlimits => IsolationStage::Rlimits,
             StageKind::CapabilityDrop => IsolationStage::CapabilityDrop,
             StageKind::NoNewPrivs => IsolationStage::NoNewPrivs,
             StageKind::Landlock => IsolationStage::Landlock,
@@ -169,7 +180,7 @@ pub enum StageStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StageReport {
-    statuses: [StageStatus; 5],
+    statuses: [StageStatus; 6],
 }
 
 impl StageReport {
@@ -190,7 +201,8 @@ impl StageReport {
 /// 順序固定のステージ列。空のままでも組み込みの capability 削減・`NO_NEW_PRIVS`・seccomp だけを適用して exec へ進み、
 /// exec の fail-closed（証跡要求）は変わらない。
 pub struct StagePipeline {
-    hooks: [Option<Box<dyn StageHook>>; 5],
+    hooks: [Option<Box<dyn StageHook>>; 6],
+    rlimits: Option<Rlimits>,
 }
 
 impl Default for StagePipeline {
@@ -218,7 +230,8 @@ impl StagePipeline {
     /// 全段が未登録の列を作る。
     pub fn new() -> Self {
         Self {
-            hooks: [None, None, None, None, None],
+            hooks: [None, None, None, None, None, None],
+            rlimits: None,
         }
     }
 
@@ -235,6 +248,24 @@ impl StagePipeline {
         self.with_hook(StageKind::Landlock, move || {
             apply_landlock_stage(&ruleset).map(|_report| ())
         })
+    }
+
+    /// rlimit 集合（SUP-12・TASK-169.1・#526）を `Rlimits` 段へ設定する。
+    ///
+    /// 集合は fork 前に親で検証済みの型（`crate::rlimits::Rlimits`）として作り、fork で子へコピーされて
+    /// 子で適用される。実行位置は [`StageKind::ORDER`] により cgroup 参加の後・capability 削減の前で固定。
+    /// 2 回目の呼び出しは `InvalidArgument`（`Validate` 段。Landlock の二重登録と同じ扱い）。
+    /// 適用失敗は `stage = Rlimits` のエラーで後続段と exec に進まない（fail-closed）。
+    pub fn with_rlimits(mut self, set: Rlimits) -> Result<Self, ExecError> {
+        if self.rlimits.is_some() {
+            return Err(ExecError::new(
+                ErrorCode::InvalidArgument,
+                IsolationStage::Validate,
+                "rlimits already set",
+            ));
+        }
+        self.rlimits = Some(set);
+        Ok(self)
     }
 
     /// 段にフックを登録する。同じ段への二重登録と、組み込みの固定ステージ
@@ -302,6 +333,15 @@ impl StagePipeline {
     /// - 移行方法: seccomp は core が常に適用するため登録は不要。exec 直前の観測点・独自処理は、
     ///   組み込みでない最後の段 `Landlock` を使う（#184 では Landlock を組み込みにせず `with_landlock` を提供した。組み込み化は後続作業）。
     ///
+    /// # 破壊的変更と移行方法（SUP-12・TASK-169.1・#526）
+    ///
+    /// - 変更内容: 公開 enum `StageKind` に variant `Rlimits` が増え、`ORDER` の長さが 5 から 6 になった
+    ///   （`StageReport` の段数も同様）。`with_hook(StageKind::Rlimits, …)` は組み込み段のため拒否される。
+    /// - 理由: rlimit は capability 削減の前に適用する必要があり（削減後は hard を引き上げられない）、
+    ///   no-op フックによる無効化経路も作らない。
+    /// - 移行方法: `StageKind` を網羅 match している利用者は `Rlimits` の腕を足す。`ORDER` の長さを
+    ///   定数で持っている場合は 6 に更新する。rlimit の指定は `StagePipeline::with_rlimits` を使う。
+    ///
     /// # 破壊的変更と移行方法（#833・TASK-27.4.3）
     ///
     /// - 変更内容: `pub fn run_then` から `pub(crate) fn run_then` へ縮小した。crate 外から
@@ -315,12 +355,22 @@ impl StagePipeline {
         mut self,
         exec: impl FnOnce(&StageReport, Option<&CapabilityReport>) -> Result<T, ExecError>,
     ) -> Result<T, ExecError> {
-        let mut statuses = [StageStatus::Skipped; 5];
+        let mut statuses = [StageStatus::Skipped; 6];
         let mut capability_report = None;
         for kind in StageKind::ORDER {
             let idx = kind.index();
             match kind {
                 // 組み込み: フック配列のスロットは読まない（差し替えも無効化もできない）。
+                StageKind::Rlimits => {
+                    // 未設定・空集合なら syscall を呼ばず `Skipped` のまま次の段へ進む。
+                    match self.rlimits.as_ref() {
+                        Some(set) if !set.is_empty() => {
+                            rlimits::apply_rlimits(set)
+                                .map_err(|e| e.at_stage(kind.isolation_stage()))?;
+                        }
+                        _ => continue,
+                    }
+                }
                 StageKind::CapabilityDrop => {
                     let r = apply_default_capabilities()
                         .map_err(|e| e.at_stage(kind.isolation_stage()))?;
@@ -355,6 +405,7 @@ impl StagePipeline {
 mod tests {
     use super::super::capabilities::testing::fake_capability_drop_err;
     use super::super::no_new_privs::testing::{fake, rec, take};
+    use super::super::rlimits::testing::{fake as fake_rlimits, take_sets};
     use super::super::seccomp::testing::fake_seccomp_err;
     use super::*;
     use crate::sys::{self, SysError};
@@ -366,6 +417,11 @@ mod tests {
         }
     }
 
+    fn rlimit_fixture() -> Rlimits {
+        use crate::rlimits::{Rlimit, RlimitKind};
+        Rlimits::new(vec![Rlimit::new(RlimitKind::Nofile, 256, 512).unwrap()]).unwrap()
+    }
+
     fn exec_ok(_: &StageReport, _: Option<&CapabilityReport>) -> Result<(), ExecError> {
         rec("exec");
         Ok(())
@@ -373,7 +429,7 @@ mod tests {
 
     /// 組み込み段を除く全段にダミーフックを登録する（逆順）。
     fn all_hooks_reversed() -> StagePipeline {
-        let mut p = StagePipeline::new();
+        let mut p = StagePipeline::new().with_rlimits(rlimit_fixture()).unwrap();
         for kind in StageKind::ORDER.iter().rev().filter(|k| !k.is_builtin()) {
             p = p.with_hook(*kind, ok_hook(*kind)).unwrap();
         }
@@ -387,6 +443,7 @@ mod tests {
             StageKind::ORDER,
             [
                 StageKind::CgroupJoin,
+                StageKind::Rlimits,
                 StageKind::CapabilityDrop,
                 StageKind::NoNewPrivs,
                 StageKind::Landlock,
@@ -402,6 +459,7 @@ mod tests {
     #[test]
     fn core1_dummy_hooks_run_in_fixed_order() {
         take();
+        take_sets();
         let report = all_hooks_reversed()
             .run_then(|r, _| {
                 rec("exec");
@@ -412,6 +470,7 @@ mod tests {
             take(),
             [
                 "cgroup_join",
+                "rlimits",
                 "capability_drop",
                 "no_new_privs",
                 "landlock",
@@ -471,6 +530,7 @@ mod tests {
             got,
             [
                 StageStatus::Skipped,
+                StageStatus::Skipped,
                 StageStatus::Applied,
                 StageStatus::Applied,
                 StageStatus::Applied,
@@ -495,7 +555,8 @@ mod tests {
         );
         assert_eq!(report.status(StageKind::Seccomp), StageStatus::Applied);
         for (kind, status) in report.iter() {
-            let expected = if kind.is_builtin() {
+            // Rlimits は組み込みだが、集合が未設定なら何もせず Skipped のまま。
+            let expected = if kind.is_builtin() && kind != StageKind::Rlimits {
                 StageStatus::Applied
             } else {
                 StageStatus::Skipped
@@ -509,7 +570,9 @@ mod tests {
     fn core1_hook_failure_stops_pipeline() {
         for (k, failing) in StageKind::ORDER.iter().enumerate() {
             take();
-            let mut p = StagePipeline::new();
+            take_sets();
+            // Rlimits 段も走らせるため、非空の集合を常に設定する（記録は "rlimits"）。
+            let mut p = StagePipeline::new().with_rlimits(rlimit_fixture()).unwrap();
             for kind in StageKind::ORDER {
                 if kind.is_builtin() {
                     continue;
@@ -530,6 +593,7 @@ mod tests {
                 }
             }
             match failing {
+                StageKind::Rlimits => fake_rlimits(Err(SysError::Os(sys::EPERM)), None),
                 StageKind::CapabilityDrop => fake_capability_drop_err(SysError::Os(sys::EPERM)),
                 StageKind::NoNewPrivs => fake(Err(SysError::Os(sys::EPERM)), Ok(true)),
                 StageKind::Seccomp => fake_seccomp_err(ExecError::new(
@@ -545,6 +609,7 @@ mod tests {
             let calls = take();
             assert_eq!(calls.len(), k + 1, "stopped after {}", failing.as_str());
             let last = match failing {
+                StageKind::Rlimits => "rlimits",
                 StageKind::CapabilityDrop => "capability_drop",
                 StageKind::NoNewPrivs => "no_new_privs",
                 StageKind::Seccomp => "seccomp",
@@ -552,7 +617,100 @@ mod tests {
             };
             assert_eq!(calls.last().copied(), Some(last));
             assert!(!calls.contains(&"exec"));
+            take_sets();
         }
+    }
+
+    /// SUP-12・TASK-169.1: Rlimits は cgroup 参加の後・capability 削減の前に走り、指定値で適用される。
+    #[test]
+    fn sup12_rlimits_run_after_cgroup_join_and_before_capability_drop() {
+        use crate::rlimits::RlimitKind;
+        take();
+        take_sets();
+        let report = StagePipeline::new()
+            .with_hook(StageKind::CgroupJoin, ok_hook(StageKind::CgroupJoin))
+            .unwrap()
+            .with_rlimits(rlimit_fixture())
+            .unwrap()
+            .run_then(|r, _| {
+                rec("exec");
+                Ok(r.clone())
+            })
+            .unwrap();
+        assert_eq!(
+            take(),
+            [
+                "cgroup_join",
+                "rlimits",
+                "capability_drop",
+                "no_new_privs",
+                "seccomp",
+                "exec"
+            ]
+        );
+        assert_eq!(take_sets(), [(RlimitKind::Nofile, 256, 512)]);
+        assert_eq!(report.status(StageKind::Rlimits), StageStatus::Applied);
+    }
+
+    /// SUP-12・TASK-169.1: 未設定・空集合では rlimit の syscall を呼ばず Skipped。
+    #[test]
+    fn sup12_rlimits_unset_or_empty_is_skipped() {
+        take();
+        take_sets();
+        for p in [
+            StagePipeline::new(),
+            StagePipeline::new()
+                .with_rlimits(Rlimits::new(Vec::new()).unwrap())
+                .unwrap(),
+        ] {
+            let report = p
+                .run_then(|r, _| {
+                    rec("exec");
+                    Ok(r.clone())
+                })
+                .unwrap();
+            assert_eq!(report.status(StageKind::Rlimits), StageStatus::Skipped);
+            assert_eq!(
+                take(),
+                ["capability_drop", "no_new_privs", "seccomp", "exec"]
+            );
+            assert!(take_sets().is_empty());
+        }
+    }
+
+    /// SUP-12・TASK-169.1: Rlimits は組み込みで、フックでは差し替えられない。二重の `with_rlimits` も拒否。
+    #[test]
+    fn sup12_rlimits_builtin_and_single_registration() {
+        let err = StagePipeline::new()
+            .with_hook(StageKind::Rlimits, || Ok(()))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert_eq!(err.stage, IsolationStage::Validate);
+        assert!(err.message.contains("built-in"), "{}", err.message);
+        let err = StagePipeline::new()
+            .with_rlimits(rlimit_fixture())
+            .unwrap()
+            .with_rlimits(rlimit_fixture())
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert_eq!(err.stage, IsolationStage::Validate);
+    }
+
+    /// SUP-12・TASK-169.1: rlimit 適用が失敗したら capability 削減以降と exec に進まない（fail-closed）。
+    #[test]
+    fn sup12_rlimits_failure_blocks_later_stages_and_exec() {
+        take();
+        take_sets();
+        fake_rlimits(Err(SysError::Os(sys::EPERM)), None);
+        let err = StagePipeline::new()
+            .with_rlimits(rlimit_fixture())
+            .unwrap()
+            .run_then(exec_ok)
+            .unwrap_err();
+        assert_eq!(err.stage, IsolationStage::Rlimits);
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert_eq!(take(), ["rlimits"]);
+        take_sets();
     }
 
     /// CORE-1・TASK-27.4.3・TASK-37.2: capability 削減が失敗したら NO_NEW_PRIVS には進まない。

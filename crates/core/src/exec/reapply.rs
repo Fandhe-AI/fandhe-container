@@ -964,6 +964,32 @@ mod tests {
         );
     }
 
+    /// SUP-6・SEC-1・TASK-163.4: 再適用の適用順は、launch 経路の順序表（`StageKind::ORDER`）から cgroup 参加
+    /// （exec では `join_cgroup` が再適用の前に済ませる）を除いた並びと一致する。launch 側で段の追加・順序の
+    /// 変更があれば、網羅 `match` のコンパイルエラーかこのテストの失敗として検出する（exec だけ別の順序・
+    /// 別の内容で動く状態を作らない）。
+    #[test]
+    fn sup6_task163_4_reapply_order_follows_launch_stage_order() {
+        let recorded_name = |kind: StageKind| match kind {
+            StageKind::CgroupJoin => None,
+            StageKind::Rlimits => Some("rlimits"),
+            StageKind::CapabilityDrop => Some("capability_drop"),
+            StageKind::NoNewPrivs => Some("no_new_privs"),
+            StageKind::Landlock => Some("landlock"),
+            StageKind::Seccomp => Some("seccomp"),
+        };
+        let expected: Vec<&str> = StageKind::ORDER
+            .into_iter()
+            .filter_map(recorded_name)
+            .collect();
+        assert_eq!(StageKind::ORDER.first(), Some(&StageKind::CgroupJoin));
+        let _ = take();
+        let report = reapply_restrictions(restrictions(std::process::id())).expect("ok");
+        assert_eq!(take(), expected);
+        assert!(report.into_complete().is_ok());
+        let _ = crate::exec::rlimits::testing::take_sets();
+    }
+
     /// SUP-6・TASK-163.4: 対象に rlimit が無い（空集合）なら `prlimit` を呼ばず、残りの段を同じ順で適用する。
     #[test]
     fn sup6_task163_4_empty_rlimits_skip_the_rlimit_stage() {

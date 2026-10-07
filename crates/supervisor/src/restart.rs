@@ -2301,6 +2301,127 @@ mod tests {
         );
     }
 
+    /// 新プロセスを 1 回だけ返す再 launch（テストごとに terminate の挙動を変える）。
+    struct Once(Mutex<Option<Box<dyn LaunchedProcess>>>);
+
+    impl Relauncher for Once {
+        fn relaunch(&self, _: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            self.0
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| TraitError::new(ErrorCode::Unavailable, "no more processes"))
+        }
+    }
+
+    fn run_once(
+        st: &Arc<Store>,
+        proc: Box<dyn LaunchedProcess>,
+        stop: &StopToken,
+    ) -> SuperviseOutcome {
+        let q: Arc<dyn Relauncher> = Arc::new(Once(Mutex::new(Some(proc))));
+        let mut s = attach(st);
+        supervise_with_restart(
+            &mut s,
+            first(FAIL),
+            &q,
+            &MonitorConfig::default(),
+            &cfg("always"),
+            stop,
+            &Events::default(),
+        )
+        .unwrap()
+    }
+
+    /// SUP-3・REPAIR-5・TASK-159.3: 停止要求と競合した `Running` 記録の取り消しで、新プロセスの終了を確認できない
+    /// （terminate が Timeout）場合は `Stopped` へ戻さない。記録は Running(43)・restart_count == 1 のままで、
+    /// ハンドル（pid 43）は `late` から回収でき、restarts は記録済みの 1 回を含む。
+    #[test]
+    fn sup3_task159_3_stop_racing_running_record_keeps_running_when_terminate_fails() {
+        let st = store(0, 42);
+        let stop = StopToken::new();
+        *st.stop_on_restart_write.lock().unwrap() = Some((stop.clone(), false));
+        let out = run_once(&st, Box::new(StuckProc(43)), &stop);
+        let SuperviseOutcome::Stopped {
+            process,
+            late,
+            restarts,
+            ..
+        } = out
+        else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert!(process.is_none());
+        assert_eq!(restarts, 1);
+        assert!(late.wait_settled(Duration::from_secs(5)));
+        let got = late.take();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0.pid().get(), 43);
+        assert_eq!(got[0].1.code(), ErrorCode::Timeout);
+        let rec = st.rec.lock().unwrap();
+        assert_eq!(rec.restart_count(), 1);
+        assert_eq!(rec.status().state(), ContainerState::Running);
+        assert_eq!(rec.status().pid().map(NonZeroU32::get), Some(43));
+    }
+
+    /// terminate に成功するが、その間に別の supervisor（pid 999）が監視権を取る起動ハンドル。
+    struct ClaimedWhileTerminating(Arc<Store>);
+
+    impl LaunchedProcess for ClaimedWhileTerminating {
+        fn pid(&self) -> NonZeroU32 {
+            pidn(43)
+        }
+        fn wait(&self, _: Duration) -> Result<Option<ProcessExit>, TraitError> {
+            Ok(None)
+        }
+        fn terminate(&self, _: Duration) -> Result<(), TraitError> {
+            let mut g = self.0.rec.lock().unwrap();
+            let claimed = SupervisionState::new(Some(pidn(999)), g.health(), g.restart_count());
+            let next = StateRecord::new(
+                g.status().clone(),
+                g.bundle().to_path_buf(),
+                StateRevision::from_raw(g.revision().value() + 1),
+            )
+            .unwrap()
+            .with_supervision(claimed);
+            *g = next;
+            Ok(())
+        }
+    }
+
+    /// SUP-3・REPAIR-5・TASK-159.3: 新プロセスの終了確認後に記録を戻せない（別の supervisor が監視権を取った）場合は
+    /// `RestartUnrecorded`（FailedPrecondition・terminate_error なし・restarts == 0）で返し、他者の記録
+    /// （Running(43)・restart_count == 1・監視権 999）を上書きしない。
+    #[test]
+    fn sup3_task159_3_stop_racing_running_record_reports_unreverted_record() {
+        let st = store(0, 42);
+        let stop = StopToken::new();
+        *st.stop_on_restart_write.lock().unwrap() = Some((stop.clone(), false));
+        let out = run_once(&st, Box::new(ClaimedWhileTerminating(st.clone())), &stop);
+        let SuperviseOutcome::RestartUnrecorded {
+            error,
+            terminate_error,
+            late,
+            restarts,
+        } = out
+        else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert_eq!(error.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(terminate_error.map(|e| e.code()), None);
+        assert_eq!(restarts, 0);
+        assert!(late.wait_settled(Duration::from_secs(5)));
+        assert!(late.take().is_empty());
+        let rec = st.rec.lock().unwrap();
+        assert_eq!(rec.restart_count(), 1);
+        assert_eq!(rec.status().state(), ContainerState::Running);
+        assert_eq!(rec.status().pid().map(NonZeroU32::get), Some(43));
+        assert_eq!(
+            rec.supervision().supervisor_pid().map(NonZeroU32::get),
+            Some(999)
+        );
+    }
+
     /// SUP-3・REPAIR-5・TASK-159.3: 停止要求後の新プロセスの terminate が失敗したらハンドルを返す。
     #[test]
     fn sup3_task159_3_stop_during_relaunch_terminate_failure_returns_handle() {

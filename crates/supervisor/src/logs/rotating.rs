@@ -8,8 +8,12 @@
 //! - `generations` は現在ログを含む総ファイル数。ディスク使用量の上限は `max_file_bytes × generations`。
 //! - 全ファイルは常に `len <= max_file_bytes`。現在ログは必ず空から始まり、空ファイルには最大レコードが
 //!   収まる（[`MIN_LOG_FILE_BYTES`] 以上を要求する）ので、1 レコードが世代をまたいで分断されることもない。
-//! - 1 レコード = `<stream 名> ` + 行バイト列 + LF。行は LF を含まないため、LF 区切りで一意に復元できる。
-//!   行の内容は不透明バイト列のまま書き、解釈・エスケープをしない。
+//! - 1 レコード = `<stream 名> ` + 行バイト列 + LF。LF 区切りで一意に復元できるよう、[`LogSink::append`] は
+//!   LF を含む行を `InvalidArgument` で拒否する（sink は失敗状態にしない）。それ以外の内容は不透明バイト列のまま
+//!   書き、解釈・エスケープをしない。
+//! - 同じ ID のログは同時に 1 つの sink だけが開ける。[`RotatingFileSink::open`] は `<id>.log.lock` への排他
+//!   ロック（unix は flock、Windows は LockFileEx 相当。sink の生存中保持し、プロセス終了で OS が解放する）を
+//!   取り、取れなければ（別の sink が使用中）既存ログを動かさず `FailedPrecondition` で拒否する。
 //! - 1 つの sink は supervisor プロセスにつき 1 回作り、再起動・再捕捉では同じものを使い回す。
 //!   [`RotatingFileSink::open`] は既存の `<id>.log` を開かず世代へ退避してから新規作成するため、
 //!   open するたびに 1 世代を消費する。
@@ -135,6 +139,8 @@ struct Inner {
 
 /// ファイルへ追記し、上限超過の前に世代を送る [`LogSink`]。
 pub struct RotatingFileSink {
+    /// 同一 ID の同時使用を排他するロックファイル（生存中保持。ドロップで解放。SUP-7）。
+    _lock: File,
     dir: PathBuf,
     base: String,
     config: RotationConfig,
@@ -176,19 +182,25 @@ impl RotatingFileSink {
         // `<id>.log.<n>` の最長名が NAME_MAX を超えると open / 初回ローテーションが失敗して
         // sink が failed のままになるため、ここで早期に拒否する。
         let base = format!("{}.log", encode_file_stem(id.as_str()));
-        let max_suffix = if config.generations > 1 {
+        let gen_suffix = if config.generations > 1 {
             // "." + 最大世代番号の 10 進桁数
             1 + (config.generations - 1).to_string().len()
         } else {
             0
         };
+        // ロックファイル `<base>.lock` の接尾辞（".lock"）も NAME_MAX に収める。
+        let max_suffix = gen_suffix.max(LOCK_SUFFIX.len());
         if base.len().saturating_add(max_suffix) > MAX_FILE_NAME_BYTES {
             return Err(TraitError::new(
                 ErrorCode::InvalidArgument,
                 "container id is too long for log file names",
             ));
         }
+        // 他の sink が同じ ID のログを使用中なら、何も動かさずに拒否する（先に開いた sink が
+        // 退避済み世代へ書き続け、世代のサイズ上限・順序が崩れるのを防ぐ。SUP-7）。
+        let lock = acquire_lock(&dir, &base)?;
         let sink = Self {
+            _lock: lock,
             dir,
             base,
             config,
@@ -336,6 +348,51 @@ impl RotatingFileSink {
     }
 }
 
+/// ロックファイル名の接尾辞（`<base>.lock`。世代番号は数字のみのため世代ファイルと衝突しない）。
+const LOCK_SUFFIX: &str = ".lock";
+
+/// `<base>.lock` を開き排他ロックを取る。取れなければ（別の sink が使用中）`FailedPrecondition`。
+///
+/// ロックファイルは内容を持たず、書き込みもしない。新規作成は `create_new`（symlink を辿らない）、
+/// 既存は通常ファイル（symlink・FIFO 等は拒否）のときだけ読み取りで開く。
+fn acquire_lock(dir: &Path, base: &str) -> Result<File, TraitError> {
+    let path = dir.join(format!("{base}{LOCK_SUFFIX}"));
+    let mut create = OpenOptions::new();
+    create.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        create.mode(0o600);
+    }
+    let file = match create.open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            match fs::symlink_metadata(&path) {
+                Ok(m) if m.file_type().is_file() => {}
+                _ => {
+                    return Err(TraitError::new(
+                        ErrorCode::InvalidArgument,
+                        "log lock path is not a regular file",
+                    ));
+                }
+            }
+            OpenOptions::new()
+                .read(true)
+                .open(&path)
+                .map_err(|_| internal("log lock open failed"))?
+        }
+        Err(_) => return Err(internal("log lock create failed")),
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "log is in use by another sink",
+        )),
+        Err(std::fs::TryLockError::Error(_)) => Err(internal("log lock failed")),
+    }
+}
+
 /// `dir` が実在するディレクトリで、経路上に（信頼できない）symlink を含まず、（unix では）他者書き込み不可で
 /// あることを確認し、解決済みの絶対パスを返す。以後のファイル操作はこの固定したパスで行う（再解決しない）。
 ///
@@ -387,6 +444,13 @@ fn check_dir(dir: &Path) -> Result<PathBuf, TraitError> {
 
 impl LogSink for RotatingFileSink {
     fn append(&self, stream: StreamKind, line: &[u8]) -> Result<(), TraitError> {
+        // LF を含むと 1 追記が複数レコードに見え、LF 区切りで一意に復元できなくなるため拒否する（SUP-7）。
+        if line.contains(&b'\n') {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "log line must not contain a line feed",
+            ));
+        }
         // 直接呼び出しでも確保量を抑えるため、確保前に MAX_LINE_BYTES へ切り詰める。
         let line = line.get(..MAX_LINE_BYTES).unwrap_or(line);
         let tag = stream.as_str();

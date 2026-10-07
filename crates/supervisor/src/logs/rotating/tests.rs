@@ -43,6 +43,8 @@ fn files(dir: &Path) -> Vec<String> {
     let mut v: Vec<String> = fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        // 排他ロック用の空ファイル（`<id>.log.lock`）はログ世代ではないため除く。
+        .filter(|n| !n.ends_with(".lock"))
         .collect();
     v.sort();
     v
@@ -328,14 +330,15 @@ fn sup7_task164_2_open_accepts_existing_files_within_limit() {
 #[test]
 fn sup7_task164_2_open_rejects_names_exceeding_name_max() {
     let t = TmpDir::new("namemax");
-    // ".log"(4) + ".2"(2) 付与で 255 を超える長さ（250 + 6 = 256）。
-    let long = ContainerId::new("a".repeat(250)).unwrap();
+    // ".log"(4) + ".lock"(5) 付与で 255 を超える長さ（247 + 9 = 256）。
+    let long = ContainerId::new("a".repeat(247)).unwrap();
     let e = RotatingFileSink::open(&t.0, &long, small()).err().unwrap();
     assert_eq!(e.code(), ErrorCode::InvalidArgument);
     assert!(files(&t.0).is_empty());
-    // 世代数 1 なら ".log" のみで 254 バイトに収まる。
+    // ロックファイル名も含めて 255 バイトに収まる長さ（246 + 9 = 255）は受理する。
+    let fit = ContainerId::new("a".repeat(246)).unwrap();
+    RotatingFileSink::open(&t.0, &fit, small()).unwrap();
     let one = RotationConfig::new(MIN_LOG_FILE_BYTES, 1).unwrap();
-    RotatingFileSink::open(&t.0, &long, one).unwrap();
     // 255 バイト ID は世代数 1 でも ".log" 付与で超えるため拒否。
     let max = ContainerId::new("b".repeat(255)).unwrap();
     assert!(RotatingFileSink::open(&t.0, &max, one).is_err());
@@ -436,4 +439,40 @@ fn sup7_task164_2_case_only_different_ids_do_not_collide() {
     assert!(fs::read(t.0.join("_a.log")).unwrap().ends_with(b"upper\n"));
     assert!(fs::read(t.0.join("a.log")).unwrap().ends_with(b"lower\n"));
     assert!(fs::read(t.0.join("__a.log")).unwrap().ends_with(b"under\n"));
+}
+
+#[test]
+fn sup7_task164_2_second_open_of_same_id_is_rejected_without_moving_files() {
+    let d = TmpDir::new("lock");
+    let first = RotatingFileSink::open(&d.0, &id(), small()).unwrap();
+    first.append(StreamKind::Stdout, b"keep").unwrap();
+    let err = RotatingFileSink::open(&d.0, &id(), small())
+        .err()
+        .expect("second open must be rejected");
+    assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+    // 使用中のログは退避されず、先の sink はそのまま現在ログへ書ける。
+    assert_eq!(files(&d.0), vec!["c1.log"]);
+    first.append(StreamKind::Stdout, b"more").unwrap();
+    assert_eq!(
+        fs::read(d.0.join("c1.log")).unwrap(),
+        b"stdout keep\nstdout more\n"
+    );
+    // 別 ID は同じディレクトリで同時に開ける。
+    let other = ContainerId::new("c2").unwrap();
+    assert!(RotatingFileSink::open(&d.0, &other, small()).is_ok());
+    // 解放後は開き直せる（open 時の退避で 1 世代進む）。
+    drop(first);
+    assert!(RotatingFileSink::open(&d.0, &id(), small()).is_ok());
+    assert_eq!(files(&d.0), vec!["c1.log", "c1.log.1", "c2.log"]);
+}
+
+#[test]
+fn sup7_task164_2_append_rejects_line_feed_without_failing_sink() {
+    let d = TmpDir::new("lf");
+    let sink = RotatingFileSink::open(&d.0, &id(), small()).unwrap();
+    let err = sink.append(StreamKind::Stdout, b"a\nb").unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidArgument);
+    // 拒否は sink を失敗状態にせず、何も書かない。
+    sink.append(StreamKind::Stderr, b"ok").unwrap();
+    assert_eq!(fs::read(d.0.join("c1.log")).unwrap(), b"stderr ok\n");
 }

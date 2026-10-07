@@ -690,10 +690,11 @@ fn open_existing_regular_read(path: &Path, deny_delete: bool) -> Result<File, Tr
         return Err(not_regular());
     }
     // unix は `O_NONBLOCK` で開く。検査後にパスが FIFO（FIFO を指す symlink を含む）へ差し替えられても
-    // open は停止せず（REPAIR-5）、開いた fd の種別・dev / inode の照合で拒否する。symlink への差し替えも
-    // 差し替え先の inode が検査済みのものと一致しないため拒否される。通常ファイルの読み取りは影響を受けない。
+    // open は停止せず（REPAIR-5）、開いた fd の種別・dev / inode の照合で拒否する。末尾要素の symlink への
+    // 差し替えは `O_NOFOLLOW` で open 自体を拒否し、リンク先を開かない（副作用を起こさない）。
+    // 通常ファイルの読み取りは影響を受けない。
     #[cfg(unix)]
-    let opened = crate::container_options::env::open_nonblocking(path);
+    let opened = open_read_nofollow_nonblocking(path);
     #[cfg(not(unix))]
     let opened = OpenOptions::new().read(true).open(path);
     let file = opened.map_err(|_| internal("log file open failed"))?;
@@ -762,6 +763,80 @@ fn open_existing_regular_read(path: &Path, deny_delete: bool) -> Result<File, Tr
         return Err(not_regular());
     }
     Ok(file)
+}
+
+/// `O_NOFOLLOW`（unix。末尾要素が symlink なら `open` が `ELOOP` で失敗する）。
+/// 値は OS・アーキテクチャで異なるため `cfg` で分ける。定義できない環境は 0 で、lstat と開いた後の
+/// dev / inode 照合のみが防御になる。
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "s390x",
+        target_arch = "loongarch64"
+    )
+))]
+const O_NOFOLLOW: i32 = 0o400000;
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64"
+    )
+))]
+const O_NOFOLLOW: i32 = 0o100000;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+const O_NOFOLLOW: i32 = 0x100;
+#[cfg(all(
+    unix,
+    not(any(
+        all(
+            any(target_os = "linux", target_os = "android"),
+            any(
+                target_arch = "x86",
+                target_arch = "x86_64",
+                target_arch = "riscv32",
+                target_arch = "riscv64",
+                target_arch = "s390x",
+                target_arch = "loongarch64",
+                target_arch = "arm",
+                target_arch = "aarch64",
+                target_arch = "powerpc",
+                target_arch = "powerpc64"
+            )
+        ),
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))
+))]
+const O_NOFOLLOW: i32 = 0;
+
+/// 読み取り専用・非ブロッキング・symlink 非追従（`O_NOFOLLOW`）でログを開く（unix。SUP-7・IO-5）。
+///
+/// lstat 後に末尾要素が symlink へ差し替えられても、リンク先を開かずに失敗する。
+#[cfg(unix)]
+pub(crate) fn open_read_nofollow_nonblocking(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(crate::container_options::env::O_NONBLOCK | O_NOFOLLOW)
+        .open(path)
 }
 
 fn map_lstat_error(e: io::Error) -> TraitError {

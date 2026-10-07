@@ -1120,6 +1120,23 @@ fn sup7_task164_open_for_read_rejects_fifo_without_blocking() {
     assert!(!f.metadata().unwrap().file_type().is_file());
 }
 
+/// SUP-7・IO-5: 末尾要素が symlink なら `O_NOFOLLOW` で open 自体が失敗する（lstat・inode 照合に依らない）。
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn sup7_task164_open_read_nofollow_rejects_final_symlink() {
+    let t = TmpDir::new("nofollow");
+    let real = t.0.join("real.log");
+    fs::write(&real, b"x\n").unwrap();
+    let link = t.0.join("link.log");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let err = open_read_nofollow_nonblocking(&link).err().unwrap();
+    // ELOOP（linux 40・macOS 62）。存在しないパスの NotFound とは区別される。
+    let eloop = if cfg!(target_os = "macos") { 62 } else { 40 };
+    assert_eq!(err.raw_os_error(), Some(eloop));
+    // 通常ファイルは開ける。
+    assert!(open_read_nofollow_nonblocking(&real).is_ok());
+}
+
 /// SUP-7: ロックファイルを作れない（親ディレクトリが存在しない）ときは `NotFound` でなく `Internal`。
 ///
 /// 権限に依存しない失敗注入（root・Windows でも成立する）。`create_new` が失敗し、フォールバックの

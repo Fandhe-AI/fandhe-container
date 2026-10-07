@@ -288,7 +288,13 @@ fn remove_at_path(
     name: &ExecCgroupName,
     timeout: Duration,
 ) -> Result<ExecCgroupRemoval, ExecError> {
-    let dir = open_cgroup_by_path(container_cgroup_path).map_err(ExecError::from_cgroup)?;
+    let dir = match open_cgroup_by_path(container_cgroup_path) {
+        Ok(dir) => dir,
+        // コンテナ cgroup 自体が既に無い（実行中にコンテナが停止した等）なら、配下の子 cgroup も残っていない。
+        // 後始末の対象が無いので冪等に `Absent` とし、コマンドの結果をエラーで上書きしない（#1466）。
+        Err(e) if e.code == ErrorCode::NotFound => return Ok(ExecCgroupRemoval::Absent),
+        Err(e) => return Err(ExecError::from_cgroup(e)),
+    };
     remove_exec_child_cgroup_at(dir.as_fd(), name.as_str(), timeout)
         .map(ExecCgroupRemoval::from)
         .map_err(ExecError::from_cgroup)
@@ -388,5 +394,18 @@ mod tests {
         let me = NonZeroU32::new(std::process::id()).unwrap();
         let err = Pid1Target::open(me, &id, &placement).unwrap_err();
         assert_eq!(err.stage, IsolationStage::SetNs);
+    }
+
+    /// SUP-6・TASK-163 追補・#1466: コンテナ cgroup 自体が既に無い場合の後始末は `Absent`（エラーにしない）。
+    #[test]
+    fn sup6_task163_remove_with_missing_container_cgroup_is_absent() {
+        let name = ExecCgroupName::unique();
+        let out = remove_at_path(
+            "/fandhe-nonexistent-container-cgroup-1466",
+            &name,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(out, ExecCgroupRemoval::Absent);
     }
 }

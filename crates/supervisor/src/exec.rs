@@ -336,8 +336,11 @@ fn run_with_target(
     let ready = require_exec_ready(report)?;
     deadline.remaining("starting the command")?;
     let child = spawn_exec_command(ready, entry).map_err(from_exec_error)?;
-    let remaining = deadline.remaining("waiting for the command")?;
-    let exit = child.wait_timeout(remaining).map_err(from_exec_error)?;
+    let exit = wait_or_stop(
+        &deadline,
+        |left| child.wait_timeout(left),
+        |reap| child.kill_and_reap(reap),
+    )?;
     Ok(ExecOutcome {
         exit,
         rlimits_applied,
@@ -345,6 +348,25 @@ fn run_with_target(
         landlock_rules,
         seccomp_instructions,
     })
+}
+
+/// 起動後の子に対する期限内の待機。期限が既に切れていれば待たずに直ちに `kill` で停止・回収してから `Timeout`
+/// を返す（`?` で早期 return して子を残さない。REPAIR-5・SUP-6・TASK-163.4）。`wait` は残り時間で待ち、
+/// `kill` は回収待ちの上限を受けて SIGKILL と回収を行う。
+fn wait_or_stop(
+    deadline: &Deadline,
+    wait: impl FnOnce(Duration) -> Result<ChildExit, ExecError>,
+    stop: impl FnOnce(Duration) -> Result<ChildExit, ExecError>,
+) -> Result<ChildExit, TraitError> {
+    /// 期限切れ後の SIGKILL 回収待ちの上限。
+    const REAP_TIMEOUT: Duration = Duration::from_secs(5);
+    match deadline.remaining("waiting for the command") {
+        Ok(left) => wait(left).map_err(from_exec_error),
+        Err(expired) => {
+            stop(REAP_TIMEOUT).map_err(from_exec_error)?;
+            Err(expired)
+        }
+    }
 }
 
 /// `bundle` の `config.json` を読み、その `root.path` が指す rootfs を固定する。
@@ -529,6 +551,40 @@ mod tests {
         let max = Deadline::after(Duration::MAX).remaining("x").unwrap();
         assert!(max <= Duration::from_secs(7 * 24 * 60 * 60));
         assert!(max > Duration::from_secs(6 * 24 * 60 * 60));
+    }
+
+    /// SUP-6・REPAIR-5・TASK-163.4: 起動直後に期限が切れていても待たずに子を停止・回収し、`Timeout` を返す
+    /// （子を残さない）。期限内なら残り時間で待ち、停止は呼ばない。
+    #[test]
+    fn sup6_task163_4_expired_deadline_kills_child_without_waiting() {
+        use std::cell::Cell;
+        let killed = Cell::new(false);
+        let err = wait_or_stop(
+            &Deadline::after(Duration::ZERO),
+            |_| panic!("must not wait when the deadline has expired"),
+            |_| {
+                killed.set(true);
+                Ok(ChildExit::Signaled(9))
+            },
+        )
+        .unwrap_err();
+        assert!(killed.get());
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert_eq!(
+            err.message(),
+            "exec timed out before waiting for the command"
+        );
+
+        let exit = wait_or_stop(
+            &Deadline::after(Duration::from_secs(60)),
+            |left| {
+                assert!(left > Duration::from_secs(50));
+                Ok(ChildExit::Exited(0))
+            },
+            |_| panic!("must not kill within the deadline"),
+        )
+        .unwrap();
+        assert_eq!(exit, ChildExit::Exited(0));
     }
 
     /// 祖先に symlink を含まない使い捨ての bundle ディレクトリ（rootfs の固定は symlink を辿らない）。

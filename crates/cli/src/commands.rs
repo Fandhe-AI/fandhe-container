@@ -1,4 +1,4 @@
-//! 統一 CLI の基本コマンド（create / start / stop / delete / list / logs）の入口（TASK-79.1・CLI-1）。
+//! 統一 CLI の基本コマンド（create / start / stop / delete / list / logs）の入口（TASK-79.1・CLI-1・MS-6）。
 //!
 //! `main.rs`（bin `fandhe-container`）から [`run`] が呼ばれ、argv の先頭をコマンド名として判定する。
 //! 各コマンド本体は未実装で、既知のコマンドも `UNIMPLEMENTED` を返して非ゼロ終了する（実装済みを装わない。REPAIR-3）。

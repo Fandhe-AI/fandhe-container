@@ -127,7 +127,7 @@ impl Pid1Target {
     ///
     /// 手順は順序固定: pidfd で固定 → `NSpid` が入れ子の PID 1 → 期待 cgroup に属する →
     /// 自分と同じ pid / mnt namespace でない → pidfd が未終了。いずれも満たさなければ
-    /// `FailedPrecondition`（存在しない pid は `NotFound`、期待 cgroup パスが不正なら `InvalidArgument`）。
+    /// `FailedPrecondition`（存在しない pid・検証中に消えた対象は `NotFound`、期待 cgroup パスが不正なら `InvalidArgument`）。
     pub fn open(pid: NonZeroU32, expected_cgroup_path: &str) -> Result<Self, ExecError> {
         let stage = IsolationStage::SetNs;
         if !is_valid_cgroup_path(expected_cgroup_path) {
@@ -139,7 +139,7 @@ impl Pid1Target {
         }
         let pidfd = sys::pidfd_open(pid.get()).map_err(|e| setns_error(e, "pidfd_open"))?;
         let status = read_bounded(&format!("/proc/{pid}/status"))
-            .map_err(|e| ExecError::from_io(&e, stage, "read target status"))?;
+            .map_err(|e| target_proc_error(&e, "read target status"))?;
         if !nspid_is_nested_pid1(&status) {
             return Err(ExecError::new(
                 ErrorCode::FailedPrecondition,
@@ -148,7 +148,7 @@ impl Pid1Target {
             ));
         }
         let cgroup = read_bounded(&format!("/proc/{pid}/cgroup"))
-            .map_err(|e| ExecError::from_io(&e, stage, "read target cgroup"))?;
+            .map_err(|e| target_proc_error(&e, "read target cgroup"))?;
         if !cgroup_path_matches(&cgroup, expected_cgroup_path) {
             return Err(ExecError::new(
                 ErrorCode::FailedPrecondition,
@@ -158,7 +158,7 @@ impl Pid1Target {
         }
         for ns in [JoinNamespace::Pid, JoinNamespace::Mount] {
             let target = ns_identity(&format!("/proc/{pid}/ns/{}", ns.proc_name()))
-                .map_err(|e| ExecError::from_io(&e, stage, "read target namespace"))?;
+                .map_err(|e| target_proc_error(&e, "read target namespace"))?;
             let own = ns_identity(&format!("/proc/self/ns/{}", ns.proc_name()))
                 .map_err(|e| ExecError::from_io(&e, stage, "read own namespace"))?;
             if target == own {
@@ -252,6 +252,19 @@ fn setns_error(err: SysError, what: &str) -> ExecError {
     } else {
         errno_to_code(err)
     };
+    e
+}
+
+/// 対象の `/proc/<pid>` 配下の読み取り失敗を `SetNs` 段の `ExecError` にする。
+///
+/// pidfd を開いた後に対象が終了・回収されると、`/proc/<pid>` のエントリが消えて `ENOENT`（開いた後の
+/// 読み取りでは `ESRCH`）になる。これは内部障害ではなく対象の終了なので、`pidfd_open` / `setns` の
+/// `ESRCH` と同じ `NotFound` に揃える。それ以外の errno は通常の分類に従う。
+fn target_proc_error(err: &std::io::Error, what: &str) -> ExecError {
+    let mut e = ExecError::from_io(err, IsolationStage::SetNs, what);
+    if matches!(err.raw_os_error(), Some(n) if n == sys::ENOENT || n == sys::ESRCH) {
+        e.code = ErrorCode::NotFound;
+    }
     e
 }
 
@@ -381,6 +394,26 @@ mod tests {
             assert_eq!(err.code, ErrorCode::InvalidArgument, "{bad}");
             assert_eq!(err.stage, IsolationStage::SetNs);
         }
+    }
+
+    /// SUP-6: 検証中に対象が消えた（`/proc/<pid>` の ENOENT / ESRCH）場合は Internal ではなく NotFound。
+    /// それ以外の errno は通常の分類（EACCES は PermissionDenied）。
+    #[test]
+    fn sup6_target_proc_error_maps_vanished_target_to_not_found() {
+        for errno in [sys::ENOENT, sys::ESRCH] {
+            let io = std::io::Error::from_raw_os_error(errno);
+            let err = target_proc_error(&io, "read target status");
+            assert_eq!(err.code, ErrorCode::NotFound, "{errno}");
+            assert_eq!(err.stage, IsolationStage::SetNs);
+            assert!(
+                err.message.starts_with("read target status failed: "),
+                "{}",
+                err.message
+            );
+        }
+        let io = std::io::Error::from_raw_os_error(sys::EACCES);
+        let err = target_proc_error(&io, "read target cgroup");
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
     }
 
     /// SUP-6: NSpid の解析（入れ子の PID 1 のみ許可）。

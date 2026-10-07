@@ -56,9 +56,16 @@ fn sup7_task164_2_pipe_capture_rotates_within_limit() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    assert_eq!(names, ["it1.log", "it1.log.1", "it1.log.2"]);
-    for n in names {
-        let len = fs::metadata(dir.join(&n)).unwrap().len();
-        assert!(len <= cfg.max_file_bytes(), "{n}: {len}");
-    }
+    // ログ 3 世代と、同一 ID の排他に使う空のロックファイルだけがある。
+    assert_eq!(names, ["it1.log", "it1.log.1", "it1.log.2", "it1.log.lock"]);
+    assert_eq!(fs::metadata(dir.join("it1.log.lock")).unwrap().len(), 0);
+    // 500 行 × 1007 バイト（"stdout " 7 + 999 + LF 1）。1 ファイルは 65 行（65,455 バイト）で、
+    // 7 回のローテーション後は現在ログに 45 行が残る。保持中の合計は上限 × 世代数以内。
+    let lens: Vec<u64> = ["it1.log", "it1.log.1", "it1.log.2"]
+        .iter()
+        .map(|n| fs::metadata(dir.join(n)).unwrap().len())
+        .collect();
+    assert_eq!(lens, [45 * 1007, 65 * 1007, 65 * 1007]);
+    assert!(lens.iter().all(|l| *l <= cfg.max_file_bytes()));
+    assert!(lens.iter().sum::<u64>() <= cfg.max_file_bytes() * u64::from(cfg.generations()));
 }

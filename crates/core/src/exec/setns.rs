@@ -98,9 +98,9 @@
 //!   成功してしまうため、カーネルの拒否には依存しない。fail-closed）。rootless で exec を成立させるには user
 //!   namespace への参加が必須で、未実装。実機結合試験（`exec_setns_join`）の成功は、`nsenter --user` で先に
 //!   対象の user namespace へ入れた構成でのものである
-//! - 違反記録の監査ログ（SEC-4）への保存。`ExecError::violation` に載せて返すところまでで、sink への記録の
-//!   配線は未実装（#503 でも配線していない。書き込み経路 `audit_log::AuditFileWriter`〔TASK-41.5.1〕は実装済み
-//!   だが、`AuditLayer` に exec の対象を表す層が無く、exec 専用プロセスへ `AuditSink` を渡す経路も無い）
+//! - 違反記録の監査ログ（SEC-4）への保存のうち、本番の sink の実体の生成と CLI からの受け渡し。記録の層
+//!   `AuditLayer::ExecTarget` と、通しの入口 supervisor `run_command` が親プロセス側で 1 拒否 1 件を記録する
+//!   経路は実装済み（#1465）。この段関数単体は記録せず、`ExecError::violation` に載せて返すところまで
 //! - supervisor が起動時から保持する pidfd による同一性の保証（上記「同一性照合の前提」の恒久策）
 //! - 記録 pid が入れ子の PID 1 でない起動経路（rootless の代役 init 等の中間プロセス）の pid1 特定
 

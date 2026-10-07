@@ -50,8 +50,10 @@
 //! - 常駐デーモンを前提にしない（CORE-1・D-19）
 //! - 分離違反の試行を拒否したエラーは `ExecError::violation` に構造化された違反記録
 //!   （[`IsolationViolation`]: 種別・理由コード・ビヘイビア ID・対象）を持つ。**記録の経路のみ**で、
-//!   マウント層の監査レコード化は [`audit_mount_violation`]（TASK-41.4）、保存・集約・出力先は
-//!   TASK-41.5 系（#839。SEC-4）が担う。システムエラーには付かない
+//!   マウント層の監査レコード化は [`audit_mount_violation`]（TASK-41.4）、exec の対象の拒否の監査レコード化
+//!   （層 `exec_target`）は [`audit_exec_violation`]・[`record_exec_target_rejection`]（#1465）が担う。
+//!   ファイルへの保存は `audit_log::AuditFileWriter`（#839）で実装済みで、本番経路への sink の配線は未実装
+//!   （REPAIR-3）。システムエラーには付かない
 //!
 //! # namespace 分離の契約（[`isolate`]・[`isolate_rootful_host_root`]）
 //!
@@ -186,7 +188,7 @@ pub use violation::{
 /// 記録せず `NotApplicable`。`err` は常にそのまま返り、記録の失敗で拒否は覆らない（fail-closed）。
 ///
 /// 本番の `spawn_container` 子プロセス・launcher への配線は未実装（`AuditSink` を fork 後へ渡す設計が
-/// 未決定。TASK-29 / TASK-157 系。REPAIR-3）。永続化は TASK-41.5 系（#839）。
+/// 未決定。TASK-29 / TASK-157 系。REPAIR-3）。ファイル永続化は `audit_log::AuditFileWriter`（#839）で実装済み。
 pub fn audit_mount_violation(
     err: ExecError,
     sink: &dyn crate::audit_log::AuditSink,
@@ -204,6 +206,51 @@ pub fn audit_mount_violation(
             }
         }
         None => crate::audit_log::AuditedRejection::not_applicable(err),
+    }
+}
+
+/// exec の対象の違反を `ExecTarget` 監査レコードとして記録する（SEC-4・SUP-6・TASK-163 追補・#1465）。
+///
+/// `err.violation` が種別 `ExecTarget` のときだけ 1 件 `sink` へ渡す。それ以外（マウント層の違反・
+/// システムエラー）は `NotApplicable`。`err` は常にそのまま返り、記録の失敗で拒否は覆らない（fail-closed）。
+/// プロセス内で `ExecError` を直接扱う呼び出し側向けで、supervisor の通しの入口は
+/// [`record_exec_target_rejection`] を使う。
+pub fn audit_exec_violation(
+    err: ExecError,
+    sink: &dyn crate::audit_log::AuditSink,
+) -> crate::audit_log::AuditedRejection<ExecError> {
+    let event = err
+        .violation
+        .as_ref()
+        .and_then(IsolationViolation::exec_audit_event);
+    match event {
+        Some(event) => {
+            let delivery = crate::audit_log::mount::deliver(event, sink);
+            crate::audit_log::AuditedRejection {
+                error: err,
+                delivery,
+            }
+        }
+        None => crate::audit_log::AuditedRejection::not_applicable(err),
+    }
+}
+
+/// 理由コードだけを持つ呼び出し側（supervisor が worker の結果行を復号した親プロセス）向けに、
+/// exec の対象の拒否 `error` を 1 件記録して返す（SEC-4・SUP-6・TASK-163 追補・#1465）。
+///
+/// `reason` が exec 対象の理由でなければ記録せず `NotApplicable`。時刻と PID は呼び出したプロセスのもの。
+/// 記録の成否で `error` は変わらない（fail-closed）。
+pub fn record_exec_target_rejection<E>(
+    error: E,
+    reason: ViolationReason,
+    sink: &dyn crate::audit_log::AuditSink,
+) -> crate::audit_log::AuditedRejection<E> {
+    match reason.exec_target_audit_event() {
+        Some(event) => {
+            let delivery = crate::audit_log::mount::deliver(event, sink);
+            crate::audit_log::AuditedRejection { error, delivery }
+        }
+        None => crate::audit_log::AuditedRejection::not_applicable(error),
     }
 }
 
@@ -445,8 +492,8 @@ pub enum IsolationStage {
 /// 実行層の構造化エラー（`code` は `traits::types::ErrorCode` を再利用）。
 ///
 /// 分離違反の試行を拒否した場合は `violation` に構造化された違反記録が入り、システム
-/// エラー（syscall 失敗・procfs の読み取り失敗等）では `None`。区別の定義と、記録の保存が
-/// 永続化が未実装（TASK-41.5 系・#839）であることは [`IsolationViolation`] を参照（SEC-4）。
+/// エラー（syscall 失敗・procfs の読み取り失敗等）では `None`。区別の定義と、記録の保存経路の
+/// 現状（ファイル書き込みは実装済み・本番経路への配線は未実装）は [`IsolationViolation`] を参照（SEC-4）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ExecError {
@@ -614,7 +661,7 @@ pub struct IsolationReport {
 /// [`mount_proc`] を呼べる状態（新しい PID namespace の PID 1 で、そのスレッドだけが属する
 /// 新しい mount namespace にいる）を、PID 1 自身が作って確かめた証跡（CORE-1）。前提を
 /// 満たさない呼び出しは fail-closed で拒否し、`ExecError::violation` に違反記録を載せる
-/// （SEC-4 の記録経路。保存は TASK-41.5 系・#839 で未実装。REPAIR-3）。
+/// （SEC-4 の記録経路。ファイル保存は実装済み、本番経路への sink の配線は未実装。REPAIR-3）。
 ///
 /// 生成は [`MountIsolation::establish`] のみで、呼び出し側の申告では作れない。証跡は作成時の
 /// mount namespace・PID namespace に束縛され、[`mount_proc`] は呼び出し直前に「PID 1 である

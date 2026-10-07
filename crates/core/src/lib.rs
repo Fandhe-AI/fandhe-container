@@ -27,7 +27,8 @@
 //!   実装済みで、Landlock は `with_landlock` で差し込み可能・cgroup 参加は未実装（seccomp は #178 で組み込み済み）。非 Linux ではビルド対象外のため本 doc からは
 //!   リンクしない）
 //! - `audit_log`: 分離違反の監査レコード型 `AuditRecord` 等（SEC-4・TASK-41.1・#192。OS 非依存で
-//!   型定義・マウント検証/API の記録ヘルパ〔TASK-41.4〕・seccomp フック〔TASK-41.2・#193。拒否報告→レコード→`AuditSink`〕・ローカルファイル書き込み主経路〔TASK-41.5.1・#839〕は実装済み。Landlock のフック〔TASK-41.3・#194。`landlock_denial_record` / `landlock_denial_record_now` と
+//!   型定義・マウント検証/API の記録ヘルパ〔TASK-41.4〕・seccomp フック〔TASK-41.2・#193。拒否報告→レコード→`AuditSink`〕・ローカルファイル書き込み主経路〔TASK-41.5.1・#839〕・exec の対象の拒否の記録ヘルパ〔`exec::audit_exec_violation`・
+//!   `exec::record_exec_target_rejection`。層 `exec_target`。#1465〕は実装済み。Landlock のフック〔TASK-41.3・#194。`landlock_denial_record` / `landlock_denial_record_now` と
 //!   `exec::observe_landlock_path_access` による適用後プローブの拒否記録〕も実装済み。配送経路〔TRAP / USER_NOTIF /
 //!   カーネル監査〕・ワークロードプロセスが受けた Landlock 拒否の捕捉は未実装。主経路失敗時のカーネル監査フォールバック〔#840 `KernelAuditFallback`〕は実装済み・本番経路への配線は未実装）
 //! - `capabilities`: capability 集合の型 `Capability`・`CapabilitySet`・OCI 既定集合（SEC-1・

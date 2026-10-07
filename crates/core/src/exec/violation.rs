@@ -11,8 +11,10 @@
 //! 拒否時に [`IsolationViolation`] を `ExecError::violation` に載せて呼び出し側へ返す。
 //!
 //! **本モジュールは記録の経路のみを提供する。** マウント層の違反から `Mount` 監査イベントへの
-//! 写像は [`IsolationViolation::mount_audit_event`]（TASK-41.4・#195）で実装済み。違反記録の
-//! 永続化・3 レイヤーへの集約・ログの出力先は TASK-41.5 系（#839）で扱い、未実装
+//! 写像は [`IsolationViolation::mount_audit_event`]（TASK-41.4・#195）、exec の対象の拒否から `ExecTarget`
+//! 監査イベントへの写像は [`IsolationViolation::exec_audit_event`]（SUP-6・TASK-163 追補・#1465）で実装済み。
+//! ファイルへの永続化（TASK-41.5.1・#839）とカーネル監査フォールバック（#840）も `audit_log` に実装済みで、
+//! 本モジュールの記録を実際の sink へ流す本番経路（launcher・CLI への配線）は未実装
 //! （REPAIR-3: 実装済みを装わない）。
 //!
 //! # 違反とシステムエラーの区別
@@ -31,10 +33,13 @@
 //! 違反記録には namespace の識別子（`mnt:[inode]` 等）や正規化後のホスト側実パスを含めない。
 //! 対象（[`ViolationSubject`]）は呼び出し側が渡したパスだけで、長さを上限で切り詰め、
 //! 制御文字とバックスラッシュをエスケープして保持する。
+//!
+//! exec 対象の監査イベントは理由コード（静的トークン）だけを持ち、対象パス（期待 cgroup パス等）も
+//! 載せない（`AuditEvent::ExecTarget` がパスのフィールドを持たない型で保証する。#1465）。
 
 use std::path::Path;
 
-use crate::audit_log::{AuditEvent, AuditPath};
+use crate::audit_log::{AuditEvent, AuditPath, AuditReason};
 use crate::traits::types::ErrorCode;
 
 use super::IsolationStage;
@@ -201,6 +206,37 @@ pub enum ViolationReason {
 }
 
 impl ViolationReason {
+    /// 種別 [`ViolationKind::ExecTarget`] の理由の全一覧（exec の対象の拒否。SUP-6・SEC-1）。
+    ///
+    /// supervisor の worker が返す理由コードを許可リストとして引き直すための SSOT（#1465）。
+    pub const EXEC_TARGET_REASONS: [ViolationReason; 9] = [
+        Self::ExecTargetNotNestedPid1,
+        Self::ExecTargetCgroupMismatch,
+        Self::ExecTargetSharesPidNamespace,
+        Self::ExecTargetSharesMountNamespace,
+        Self::ExecTargetInOtherUserNamespace,
+        Self::ExecRootNotContainerRootfs,
+        Self::ExecJoinedNamespaceMismatch,
+        Self::ExecJoinedPidNamespaceMismatch,
+        Self::ExecJoinedCgroupMismatch,
+    ];
+
+    /// exec 対象の理由コード文字列から理由を引き直す（許可リスト照合。未知の文字列は `None`）。
+    ///
+    /// 外部（worker の結果行）から届いた文字列を、監査レコードへ入る静的トークンへ変換する唯一の入口。
+    pub fn from_exec_target_token(token: &str) -> Option<Self> {
+        Self::EXEC_TARGET_REASONS
+            .into_iter()
+            .find(|r| r.as_str() == token)
+    }
+
+    /// exec 対象の理由なら `ExecTarget` 監査イベントを返す（それ以外は `None`）。パスは持たない。
+    pub fn exec_target_audit_event(self) -> Option<AuditEvent> {
+        (self.kind() == ViolationKind::ExecTarget).then(|| AuditEvent::ExecTarget {
+            reason: AuditReason::new(self.as_str()),
+        })
+    }
+
     /// 機械可読な理由コード（snake_case）。
     pub fn as_str(self) -> &'static str {
         match self {
@@ -567,12 +603,12 @@ impl ViolationSubject {
     }
 }
 
-/// 分離違反の試行を拒否したときの構造化された記録（SEC-4 の記録経路。マウント層の写像は TASK-41.4、保存は #839）。
+/// 分離違反の試行を拒否したときの構造化された記録（SEC-4 の記録経路。マウント層の写像は TASK-41.4、exec 対象の写像は #1465）。
 ///
 /// `ExecError::violation` から取り出す。生成は `crate::exec` の拒否経路のみ。
 ///
-/// - **記録の経路のみ**: 永続化・3 レイヤーへの集約・ログの出力先は TASK-41（#191）で扱い、
-///   未実装（REPAIR-3）。呼び出し側は受け取った記録を必要に応じて自分で扱う
+/// - **記録の経路のみ**: ファイルへの永続化は `audit_log` に実装済みだが、本番経路への sink の
+///   配線は未実装（REPAIR-3）。呼び出し側は受け取った記録を必要に応じて自分で扱う
 /// - **違反**（構成・呼び出し文脈・パスが分離の前提を満たさず fail-closed で拒否したもの）
 ///   にだけ付く。**システムエラー**（syscall 失敗・procfs の読み取り失敗・mountinfo の書式
 ///   不正・権限不足）と hostname の書式エラーには付かない
@@ -610,10 +646,17 @@ impl IsolationViolation {
         self.audit_path.as_ref()
     }
 
+    /// exec の対象の違反（種別 `ExecTarget`）なら `ExecTarget` 監査イベントを返す（SEC-4・SUP-6・#1465）。
+    ///
+    /// 理由コードだけを載せ、`audit_path`（期待 cgroup パス等）は使わない。
+    pub fn exec_audit_event(&self) -> Option<AuditEvent> {
+        self.reason.exec_target_audit_event()
+    }
+
     /// マウント検証層の違反なら `Mount` 監査イベントを返す（SEC-4・TASK-41.4）。
     ///
     /// 対象は `MountTarget`・`SharedPropagation`・`RootfsPivot`。計画・establish 前提・証跡不一致・
-    /// エントリポイントはマウント層の拒否ではないため `None`（扱いは #191 配下の後続）。
+    /// エントリポイントはマウント層の拒否ではないため `None`。exec の対象の拒否は [`Self::exec_audit_event`]。
     pub fn mount_audit_event(&self) -> Option<AuditEvent> {
         match self.kind {
             ViolationKind::MountTarget
@@ -875,6 +918,47 @@ mod tests {
             v.mount_audit_event(),
             Some(AuditEvent::Mount { path: None })
         );
+    }
+
+    /// SEC-4・SUP-6・TASK-163 追補: exec 対象の 9 理由は許可リスト往復でき、対象外・未知は引けない。
+    #[test]
+    fn sec4_sup6_task163_exec_target_token_allowlist() {
+        assert_eq!(ViolationReason::EXEC_TARGET_REASONS.len(), 9);
+        for r in ViolationReason::EXEC_TARGET_REASONS {
+            assert_eq!(r.kind(), ViolationKind::ExecTarget);
+            assert_eq!(ViolationReason::from_exec_target_token(r.as_str()), Some(r));
+        }
+        for t in [
+            "target_moved",
+            "entrypoint_is_runtime_binary",
+            "",
+            "unknown",
+            "exec_target",
+        ] {
+            assert_eq!(ViolationReason::from_exec_target_token(t), None, "{t}");
+        }
+        assert_eq!(
+            ViolationReason::EntrypointIsRuntimeBinary.exec_target_audit_event(),
+            None
+        );
+    }
+
+    /// SEC-4・SUP-6・TASK-163 追補: 期待 cgroup パスを subject に持つ違反でもレコードにパスは載らない。
+    #[test]
+    fn sec4_sup6_task163_exec_audit_event_has_no_path() {
+        let v = IsolationViolation::new(
+            ViolationReason::ExecTargetCgroupMismatch,
+            Some(Path::new("/sys/fs/cgroup/fandhe/c1")),
+        );
+        assert!(v.audit_path().is_some());
+        let ev = v.exec_audit_event();
+        assert_eq!(
+            ev,
+            Some(AuditEvent::ExecTarget {
+                reason: AuditReason::new("exec_target_cgroup_mismatch")
+            })
+        );
+        assert_eq!(v.mount_audit_event(), None);
     }
 
     /// SEC-4・TASK-41.4: audit_mount_violation は違反のみ記録し、エラーを変えない。

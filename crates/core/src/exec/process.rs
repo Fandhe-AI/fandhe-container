@@ -127,11 +127,32 @@ pub const EXIT_EXEC_NOT_FOUND: i32 = 127;
 ///
 /// 外部入力（イメージ設定・CLI・CRI）の値を `execve` へ渡す前の唯一の入口で、NUL・書式・件数・
 /// バイト数を検証済みの `CString` 群として保持する（壊れた値を表現できない型。REPAIR-2）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Entrypoint {
     path: CString,
     argv: Vec<CString>,
     env: Vec<CString>,
+}
+
+// env の値は秘密情報を含み得るため、`Debug` には KEY だけを出す（これを包む `ExecCommand` の `Debug` も同じ出力に
+// なる。supervisor の `EnvVar`・core の `ContainerEnv` と同じ方針。TASK-163 追補・#1457）。
+impl std::fmt::Debug for Entrypoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let keys: Vec<std::borrow::Cow<'_, str>> = self
+            .env
+            .iter()
+            .map(|var| {
+                let bytes = var.to_bytes();
+                let key = bytes.split(|b| *b == b'=').next().unwrap_or(bytes);
+                String::from_utf8_lossy(key)
+            })
+            .collect();
+        f.debug_struct("Entrypoint")
+            .field("path", &self.path)
+            .field("argv", &self.argv)
+            .field("env_keys", &keys)
+            .finish()
+    }
 }
 
 impl Entrypoint {
@@ -2420,6 +2441,25 @@ mod tests {
         );
         assert_eq!(err.message, "the exec status pipe is still open after exit");
         drop(writer);
+    }
+
+    /// SUP-6・TASK-163 追補（#1457）: `Debug` 出力は env の KEY だけを出し、値を出さない（秘密情報を診断ログへ
+    /// 漏らさない）。exec 用の `ExecCommand` の `Debug` も同じ。
+    #[test]
+    fn sup6_task163_entrypoint_debug_hides_env_values() {
+        let entry = Entrypoint::new("/bin/app", ["app"], ["TOKEN=s3cr3t-value", "EMPTY="]).unwrap();
+        let shown = format!("{entry:?}");
+        assert_eq!(
+            shown,
+            r#"Entrypoint { path: "/bin/app", argv: ["app"], env_keys: ["TOKEN", "EMPTY"] }"#
+        );
+        let env = crate::exec::ContainerEnv::empty()
+            .with_var("TOKEN", "s3cr3t-value")
+            .unwrap();
+        let command = crate::exec::ExecCommand::new("/bin/app", ["app"], &env).unwrap();
+        let shown = format!("{command:?}");
+        assert!(!shown.contains("s3cr3t"), "{shown}");
+        assert!(shown.contains(r#"env_keys: ["TOKEN"]"#), "{shown}");
     }
 
     /// CORE-1（TASK-27.4.1）: 不在のエントリポイントは `NotFound`（終了コード 127 に対応）。

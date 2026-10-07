@@ -59,7 +59,8 @@
 //!   子は supervisor の、exec の子は exec を起動したプロセス（`sudo` 経由なら呼び出しユーザー）のホスト側の補助
 //!   グループを持ち越していたため、両者が一致しなかった。`config.json` の `process.user.additionalGids` は launch が
 //!   非空を拒否するので「空」が唯一の指定で、解釈（指定したグループの付与）は launch・exec とも未実装。user
-//!   namespace が `setgroups` を `deny` にしている場合（rootless）は消去できないため現状のまま残し、結果
+//!   namespace が `setgroups` を `deny` にしている場合（rootless。`setns` の前に開いた自分の procfs の `setgroups` で
+//!   確認する。`EPERM` という errno だけでは判断しない）は消去できないため現状のまま残し、結果
 //!   （[`ExecRestrictionReport::supplementary_groups`]）へ記録する。それ以外の理由で消去できなければ拒否する
 //! - **user namespace は対象と同じであること**: capability は user namespace に対する相対的な権限なので、
 //!   同じ集合でも exec プロセスが対象より外側の user namespace にいれば launch より強い。`Pid1Target::open` と
@@ -747,7 +748,7 @@ fn reapply_inner(
     // capability 削減は、先頭で補助グループも空にする（launch 経路と同じ関数。#1457）。
     let capabilities = if drop_capabilities {
         Some(
-            apply_default_capabilities_with(&mut threads)
+            apply_default_capabilities_with(&mut threads, Some(binding.proc_dir.as_fd()))
                 .map_err(|e| e.at_stage(IsolationStage::CapabilityDrop))?,
         )
     } else {

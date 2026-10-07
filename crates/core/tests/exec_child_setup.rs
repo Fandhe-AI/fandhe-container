@@ -418,9 +418,9 @@ mod linux {
     /// 使い捨ての子で実 syscall により通す。結果は実行環境で決まり、どの環境でも具体値で照合する:
     ///
     /// - 補助グループが無い → 何もしない（`already_empty`）
-    /// - `CAP_SETGID` が無い（非特権。hosted runner の既定）→ ホスト側の補助グループを持ち越したまま進めない
-    ///   ため拒否し（`PERMISSION_DENIED`）、補助グループは変わらない
-    /// - `CAP_SETGID` があり user namespace が `setgroups` を禁じている → 現状維持を記録する
+    /// - `CAP_SETGID` が無く、user namespace が `setgroups` を禁じていない（非特権。hosted runner の既定）→
+    ///   ホスト側の補助グループを持ち越したまま進めないため拒否し（`PERMISSION_DENIED`）、補助グループは変わらない
+    /// - user namespace が `setgroups` を禁じている（procfs で `deny`）→ 現状維持を記録する
     /// - `CAP_SETGID` があり禁じられていない（root）→ 消去され、適用後の件数は 0
     fn supplementary_groups_are_cleared_or_refused() {
         let (groups, has_setgid, denied) = own_group_state();
@@ -453,12 +453,12 @@ mod linux {
             .to_owned();
         let expected = match (groups, has_setgid, denied) {
             (0, _, _) => "ok already_empty 0; groups after: 0".to_owned(),
-            (n, false, _) => format!(
-                "err {} cannot clear the supplementary groups: CAP_SETGID is missing; groups after: {n}",
+            (n, true, false) => format!("ok cleared {n}; groups after: 0"),
+            (n, _, true) => format!("ok kept_setgroups_denied {n}; groups after: {n}"),
+            (n, false, false) => format!(
+                "err {} cannot clear the supplementary groups: setgroups(0) was refused and the user namespace is not confirmed to deny setgroups; groups after: {n}",
                 ErrorCode::PermissionDenied.as_str()
             ),
-            (n, true, true) => format!("ok kept_setgroups_denied {n}; groups after: {n}"),
-            (n, true, false) => format!("ok cleared {n}; groups after: 0"),
         };
         assert_eq!(line, expected);
         // 子だけが変わり、試験プロセス自身の補助グループは変わらない。

@@ -39,6 +39,8 @@
 //!   未呼び出しで、本番 launcher〔TASK-29 / TASK-157 系〕で結線する）
 //! - `memory.max` / `memory.swap.max`（TASK-32.2・#159）: [`ContainerCgroup::set_memory_limits`]
 //!   （同上。未結線）
+//! - `pids.max` / `io.max`（SUP-13・TASK-170.2・#533）: [`ContainerCgroup::set_pids_max`]（`pids` サブモジュール）・
+//!   [`ContainerCgroup::set_io_max`]（`io_max` サブモジュール。1 デバイス分の絶対値スロットル）（同上。未結線）
 //! - fork 後の子の `cgroup.procs` 参加（TASK-32.4・#161）: [`ContainerCgroup::join_hook`] が返す
 //!   [`CgroupJoin`] を `exec::StagePipeline` の `CgroupJoin` 段へ登録する（`exec::StageHook` 実装済み）
 //!
@@ -54,6 +56,8 @@
 //!   `detect` → `prepare` → `join_hook` の結線（TASK-29 / TASK-157 系）
 //! - OCI `linux.cgroupsPath` の反映・create での委譲スコープの記録（`CreateStateRequest::with_cgroup_scope`）と
 //!   delete への本番の呼び出し元（CLI / plugin / supervisor）からの結線
+//! - `io.weight`（`--blkio-weight` の実体。比例配分の重みは `io.max` で表現できないため別ファイルの対応が必要）、
+//!   OCI `linux.resources.pids` / `blockIO` からの `set_pids_max` / `set_io_max` への反映（TASK-170.3 ほか）
 //! - cgroup v1 / hybrid は非対応（CORE-4。v2 以外は fail-closed）
 
 use std::collections::BTreeSet;
@@ -70,6 +74,10 @@ use crate::traits::{CgroupScope, ContainerId, ErrorCode, StateRevision, TraitErr
 
 mod cpu;
 pub use cpu::{CpuMax, CpuQuota};
+mod io_max;
+pub use io_max::{BlockDevice, IoLimit, IoMax};
+mod pids;
+pub use pids::{PIDS_MAX_LIMIT, PidsMax};
 
 /// 退避リーフ cgroup の名前。自プロセスの移動先（レイアウトは本モジュール冒頭を参照）。
 const EVACUATION_LEAF: &str = "fc-runtime";
@@ -120,6 +128,10 @@ pub enum CgroupStep {
     SetMemoryLimit,
     /// `cpu.max` の検証・書き込み・読み戻し。
     SetCpuMax,
+    /// `pids.max` の検証・書き込み・読み戻し（SUP-13・TASK-170.2）。
+    SetPidsMax,
+    /// `io.max` の検証・書き込み・読み戻し（SUP-13・TASK-170.2）。
+    SetIoMax,
     /// fork 後の子プロセスの `cgroup.procs` への参加（TASK-32.4）。
     JoinContainer,
     /// `memory.current` / `cpu.stat` / `io.stat` の読み取り（SUP-10・TASK-167.1）。

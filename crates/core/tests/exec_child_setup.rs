@@ -17,7 +17,8 @@
 //! - **標準入出力**: fd 0〜2 がすべて文字デバイス 1:3（`/dev/null`）
 //! - **インタープリタ経由の拒否（#1458・SEC-4）**: `#!/proc/self/exe`・`#!/proc/<pid>/exe`・スクリプトの連鎖の
 //!   先がランタイム自身（ここでは試験バイナリ自身）に解決されるスクリプトは、子が `execveat` の前に終了コード 126 で
-//!   拒否し、報告は書かれない。対照として、通常のシェルスクリプト（`#!/bin/sh`）は手順を通る
+//!   拒否し、報告は書かれない（symlink 経由・`/proc/thread-self/exe`・`PT_INTERP` がランタイム自身の ELF・
+//!   その ELF をインタープリタにするスクリプトも同様）。対照として、通常のシェルスクリプト（`#!/bin/sh`）は手順を通る
 //!
 //! - **`execve` 前の失敗の区別（#1460）**: 子が本番と同じ pipe で親へ知らせた内容から、「コマンドは起動して
 //!   いない」（終了コード 125〜127 と違反の理由）と「`execveat` の直前まで到達した」が区別される。子に残る fd が
@@ -234,6 +235,51 @@ mod linux {
             .expect("chmod the script");
     }
 
+    /// 内容をバイト列で書く実行可能ファイル（排他的に作る）。
+    fn write_bytes(path: &Path, content: &[u8]) {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create the file");
+        file.write_all(content).expect("write the file");
+        file.set_permissions(fs::Permissions::from_mode(0o755))
+            .expect("chmod the file");
+    }
+
+    /// 手組みの ELF64（ヘッダ 64 バイト + プログラムヘッダ 2 件 `PT_LOAD`・`PT_INTERP` + インタープリタ文字列）。
+    /// ネイティブのバイト順で組み、`e_machine` は照合に使われないため固定値でよい（x86_64 / aarch64 共通）。
+    /// 実行はしない（観測用の入口は `execveat` を呼ばない）ので、ローダとして成立する必要はない。
+    fn elf64_with_interp(interp: &[u8]) -> Vec<u8> {
+        let (hlen, plen) = (64usize, 56usize);
+        let mut b = vec![0x7f, b'E', b'L', b'F', 2, 1, 1, 0];
+        b.resize(16, 0);
+        b.extend_from_slice(&3u16.to_ne_bytes()); // e_type = ET_DYN
+        b.extend_from_slice(&62u16.to_ne_bytes()); // e_machine
+        b.extend_from_slice(&1u32.to_ne_bytes()); // e_version
+        b.extend_from_slice(&0u64.to_ne_bytes()); // e_entry
+        b.extend_from_slice(&(hlen as u64).to_ne_bytes()); // e_phoff
+        b.extend_from_slice(&0u64.to_ne_bytes()); // e_shoff
+        b.extend_from_slice(&0u32.to_ne_bytes()); // e_flags
+        b.extend_from_slice(&(hlen as u16).to_ne_bytes()); // e_ehsize
+        b.extend_from_slice(&(plen as u16).to_ne_bytes()); // e_phentsize
+        b.extend_from_slice(&2u16.to_ne_bytes()); // e_phnum
+        b.extend_from_slice(&[0u8; 6]);
+        assert_eq!(b.len(), hlen);
+        b.extend_from_slice(&1u32.to_ne_bytes()); // PT_LOAD
+        b.resize(hlen + plen, 0);
+        b.extend_from_slice(&3u32.to_ne_bytes()); // PT_INTERP
+        b.extend_from_slice(&4u32.to_ne_bytes()); // p_flags
+        b.extend_from_slice(&((hlen + 2 * plen) as u64).to_ne_bytes()); // p_offset
+        b.extend_from_slice(&[0u8; 16]); // p_vaddr, p_paddr
+        b.extend_from_slice(&(interp.len() as u64).to_ne_bytes()); // p_filesz
+        b.resize(hlen + 2 * plen, 0);
+        b.extend_from_slice(interp);
+        b
+    }
+
     /// SUP-6・SEC-1・SEC-4・CORE-5・TASK-163 追補（#1458）: インタープリタがランタイム自身（試験バイナリ自身）に
     /// 解決されるスクリプトは、実プロセスの子が `execveat` の前に拒否する（終了コード 126・報告なし）。
     ///
@@ -242,15 +288,55 @@ mod linux {
     fn runtime_interpreter_is_rejected_before_exec(work: &Path) {
         let chained = work.join("chained");
         write_script(&chained, "#!/proc/self/exe\n");
-        let cases = [
-            ("self", "#!/proc/self/exe\n".to_owned()),
-            ("arg", "#! /proc/self/exe --flag\n".to_owned()),
-            ("pid", format!("#!/proc/{}/exe\n", std::process::id())),
-            ("chain", format!("#!{}\n", chained.display())),
+        // `/proc/self/exe` への symlink（解決先で照合するため、名前が違っても拒否される）。
+        let link = work.join("exe-link");
+        std::os::unix::fs::symlink("/proc/self/exe", &link).expect("create the symlink");
+        // `PT_INTERP` がランタイム自身の ELF（ELF のローダ経由でも同じ経路が開く）と、それをインタープリタにする
+        // スクリプト。
+        let elf_runtime = work.join("elf-runtime");
+        write_bytes(&elf_runtime, &elf64_with_interp(b"/proc/self/exe\0"));
+        let cases: Vec<(&str, PathBuf, Vec<u8>)> = vec![
+            (
+                "self",
+                work.join("script-self"),
+                b"#!/proc/self/exe\n".to_vec(),
+            ),
+            (
+                "arg",
+                work.join("script-arg"),
+                b"#! /proc/self/exe --flag\n".to_vec(),
+            ),
+            (
+                "pid",
+                work.join("script-pid"),
+                format!("#!/proc/{}/exe\n", std::process::id()).into_bytes(),
+            ),
+            (
+                "chain",
+                work.join("script-chain"),
+                format!("#!{}\n", chained.display()).into_bytes(),
+            ),
+            (
+                "symlink",
+                work.join("script-symlink"),
+                format!("#!{}\n", link.display()).into_bytes(),
+            ),
+            (
+                "thread-self",
+                work.join("script-thread-self"),
+                b"#!/proc/thread-self/exe\n".to_vec(),
+            ),
+            ("elf", elf_runtime.clone(), Vec::new()),
+            (
+                "script-to-elf",
+                work.join("script-to-elf"),
+                format!("#!{}\n", elf_runtime.display()).into_bytes(),
+            ),
         ];
-        for (name, content) in cases {
-            let script = work.join(format!("script-{name}"));
-            write_script(&script, &content);
+        for (name, script, content) in cases {
+            if !content.is_empty() {
+                write_bytes(&script, &content);
+            }
             let entry =
                 ExecCommand::new(&script, ["script"], &ContainerEnv::empty()).expect("command");
             let report = work.join(format!("report-{name}"));
@@ -268,6 +354,12 @@ mod linux {
             assert_eq!(observation.report, None, "{name}");
             assert!(!report.exists(), "{name}: the child must not reach exec");
         }
+        // 対照: `PT_INTERP` が通常のローダ（`/bin/sh`）の ELF も手順を通る（ELF であること自体は拒否の理由にならない。
+        // `execveat` は呼ばないので実行はされない）。
+        let elf_sh = work.join("elf-sh");
+        write_bytes(&elf_sh, &elf64_with_interp(b"/bin/sh\0"));
+        let entry = ExecCommand::new(&elf_sh, ["elf"], &ContainerEnv::empty()).expect("command");
+        observe_ok(&entry, work, "report-elf-sh");
         // 対照: 通常のシェルスクリプトは手順を通る（スクリプトであること自体は拒否の理由にならない）。
         let script = work.join("script-sh");
         write_script(&script, "#!/bin/sh\nexit 0\n");

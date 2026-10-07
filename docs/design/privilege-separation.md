@@ -146,6 +146,7 @@ TASK-171 の成果物は `crates/supervisor/src/privilege.rs`（仮称）だが�
 
 補足:
 
+- 方式非依存の純ロジック（必要最小集合・`/proc/<pid>/status` のパースと昇格結果の fail-closed 検証・縮退計画の算出）は `crates/supervisor/src/privilege.rs` に実装済み（TASK-171.1.2・#858）。昇格を実際に行う syscall 経路（ambient 載せ・`capset`・bounding 削除・setuid フォールバック・fd 検証付き exec）は方式の承認待ちで未実装であり、`elevate` は `UNIMPLEMENTED` を返すスタブである
 - setuid ビット・`setcap` の付与はインストール時の操作でコード外である
 - 事前承認の範囲は各 crate の `sys` モジュール内の syscall ラッパーに限られる
 - 実機検証（sudo の `SIGKILL` 再現・昇格の実動作）は #538・#539 で扱い、本書の範囲外とする

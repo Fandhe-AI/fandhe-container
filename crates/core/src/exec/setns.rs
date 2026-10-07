@@ -17,9 +17,15 @@
 //! - pidfd は「呼び出した時点でその pid にいたプロセス」を固定するだけで、`state.json` に記録された
 //!   元のコンテナのプロセスであることまでは証明しない（元のコンテナが終了し、その pid が別コンテナの
 //!   PID 1 に再利用されると、NSpid や namespace 差異の検査は通ってしまう）。そこで [`Pid1Target::open`] は
-//!   呼び出し側が渡す期待 cgroup 名（コンテナごとに一意な `fc-<id>@<instance>`。OCI-6）が対象の
-//!   `/proc/<pid>/cgroup` のパス要素に含まれることを必須にする。別コンテナの cgroup 名とは一致しないため、
-//!   再利用された別コンテナの PID 1 は拒否される（fail-closed。SEC-1）
+//!   呼び出し側が渡す期待 cgroup パス（`<委譲スコープ>/fc-<id>@<instance>`。instance はストア全体で
+//!   再利用されず、コンテナごとに一意。OCI-6）と、対象の `/proc/<pid>/cgroup` の cgroup v2 行のパスが
+//!   **全体で完全一致** することを必須にする。別コンテナの cgroup とは一致しないため、再利用された
+//!   別コンテナの PID 1 は拒否される（fail-closed。SEC-1）。パス要素のどこかに名前が現れるだけ・末尾要素が
+//!   同名なだけでは認めない（コンテナが自分の配下に同名の子 cgroup を作って偽装する経路と、コンテナ用
+//!   cgroup の配下に作られた入れ子の PID namespace の PID 1 を取り違える経路を塞ぐ）。照合は文字列で行う
+//!   ため、記録した側と同じ cgroup 名前空間から読むことが前提で、食い違えば不一致として拒否する
+//!   （`CgroupScope` と同じ前提）。`/proc` の読み取りはすべて pidfd を開いた後・未終了の確認の前に行うので、
+//!   読んだ内容は pidfd の指すプロセスのものである（TOCTOU 対策）
 //! - 対象は入れ子の PID namespace の PID 1（`NSpid:` の要素が 2 以上で末尾が 1）に限り、自プロセスと
 //!   同じ pid / mnt namespace へは参加しない。任意プロセスの namespace へ入る汎用手段にしない
 //! - 参加は **不可逆** で、呼び出しスレッドに作用する。単一スレッドのプロセスからのみ呼べる
@@ -48,6 +54,9 @@ use crate::traits::types::ErrorCode;
 
 /// `/proc/<pid>/status` の読み取り上限（バイト）。通常は 2 KiB 前後で、無制限確保を避ける。
 const STATUS_READ_LIMIT: u64 = 64 * 1024;
+
+/// 期待 cgroup パスの最大バイト数（Linux の `PATH_MAX`）。
+const CGROUP_PATH_MAX: usize = 4096;
 
 /// 参加する namespace 種別（SUP-6。user namespace は含まない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -112,23 +121,20 @@ impl Pid1Target {
 
     /// `pid` を候補として pid1 を特定し、検証を通ったものだけを対象にする。
     ///
-    /// `expected_cgroup_name` は記録したコンテナの cgroup のリーフ名（`fc-<id>@<instance>`）。対象が
-    /// その cgroup に属さなければ、pid が別コンテナに再利用されたものとして拒否する（SEC-1）。
+    /// `expected_cgroup_path` は記録したコンテナの cgroup の絶対パス（cgroup v2 のルート起点。
+    /// `<委譲スコープ>/fc-<id>@<instance>`）。対象の所属 cgroup がこれと完全一致しなければ、pid が
+    /// 別コンテナに再利用されたものとして拒否する（SEC-1）。
     ///
     /// 手順は順序固定: pidfd で固定 → `NSpid` が入れ子の PID 1 → 期待 cgroup に属する →
     /// 自分と同じ pid / mnt namespace でない → pidfd が未終了。いずれも満たさなければ
-    /// `FailedPrecondition`（存在しない pid は `NotFound`、期待 cgroup 名が不正なら `InvalidArgument`）。
-    pub fn open(pid: NonZeroU32, expected_cgroup_name: &str) -> Result<Self, ExecError> {
+    /// `FailedPrecondition`（存在しない pid は `NotFound`、期待 cgroup パスが不正なら `InvalidArgument`）。
+    pub fn open(pid: NonZeroU32, expected_cgroup_path: &str) -> Result<Self, ExecError> {
         let stage = IsolationStage::SetNs;
-        if expected_cgroup_name.is_empty()
-            || expected_cgroup_name.contains(['/', '\0'])
-            || expected_cgroup_name == "."
-            || expected_cgroup_name == ".."
-        {
+        if !is_valid_cgroup_path(expected_cgroup_path) {
             return Err(ExecError::new(
                 ErrorCode::InvalidArgument,
                 stage,
-                "expected cgroup name is empty or contains a path separator",
+                "expected cgroup path must be an absolute, normalized, non-root cgroup path",
             ));
         }
         let pidfd = sys::pidfd_open(pid.get()).map_err(|e| setns_error(e, "pidfd_open"))?;
@@ -143,7 +149,7 @@ impl Pid1Target {
         }
         let cgroup = read_bounded(&format!("/proc/{pid}/cgroup"))
             .map_err(|e| ExecError::from_io(&e, stage, "read target cgroup"))?;
-        if !cgroup_has_component(&cgroup, expected_cgroup_name) {
+        if !cgroup_path_matches(&cgroup, expected_cgroup_path) {
             return Err(ExecError::new(
                 ErrorCode::FailedPrecondition,
                 stage,
@@ -280,37 +286,100 @@ fn nspid_is_nested_pid1(status: &str) -> bool {
     parsed.len() >= 2 && parsed.last() == Some(&1)
 }
 
-/// `/proc/<pid>/cgroup` の cgroup v2 行（`0::<path>`）のパス要素に `name` が完全一致で含まれるか。
-/// v2 行なし・不一致は fail-closed で `false`（接頭辞一致は認めない）。
-fn cgroup_has_component(cgroup: &str, name: &str) -> bool {
-    cgroup
-        .lines()
-        .filter_map(|l| l.strip_prefix("0::"))
-        .any(|path| path.split('/').any(|c| c == name))
+/// 期待 cgroup パスの形式検証: `/` 始まりの絶対パスで、ルート（`/`）でなく、各要素が空 / `.` / `..` で
+/// なく、NUL・改行を含まず、[`CGROUP_PATH_MAX`] 以下。ルートを認めないのは、コンテナ用 cgroup が必ず
+/// 委譲スコープの子であり、ルート所属の任意プロセスを対象にさせないため。
+fn is_valid_cgroup_path(path: &str) -> bool {
+    if path.len() > CGROUP_PATH_MAX || path.contains(['\0', '\n']) {
+        return false;
+    }
+    let Some(rest) = path.strip_prefix('/') else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest
+            .split('/')
+            .all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+/// `/proc/<pid>/cgroup` の cgroup v2 行（`0::<path>`）のパスが `expected` と全体で完全一致するか。
+///
+/// v2 行なし・v2 行が複数・不一致は fail-closed で `false`。部分一致（接頭辞・接尾辞・途中の要素）は
+/// 認めない。削除済み cgroup に残るプロセスはカーネルが ` (deleted)` を付けるため一致しない。
+fn cgroup_path_matches(cgroup: &str, expected: &str) -> bool {
+    let mut v2 = cgroup.lines().filter_map(|l| l.strip_prefix("0::"));
+    match (v2.next(), v2.next()) {
+        (Some(path), None) => path == expected,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// SUP-6・SEC-1: cgroup 名は v2 行のパス要素に完全一致したときだけ一致する。
+    /// SUP-6・SEC-1: cgroup は v2 行のパス全体が完全一致したときだけ一致する。別コンテナ（別 instance・
+    /// 別 ID・別スコープ）、配下の子 cgroup、他コンテナ配下に作られた同名の子 cgroup、削除済み、v1 行は
+    /// すべて不一致（pid 再利用と偽装の拒否）。
     #[test]
-    fn sup6_cgroup_component_match() {
-        let c = "0::/user.slice/fc-c1@7/leaf\n";
-        assert!(cgroup_has_component(c, "fc-c1@7"));
-        assert!(!cgroup_has_component(c, "fc-c1@8"));
-        assert!(!cgroup_has_component(c, "fc-c1"));
-        assert!(!cgroup_has_component("1:name=x:/fc-c1@7\n", "fc-c1@7"));
-        assert!(!cgroup_has_component("", "fc-c1@7"));
+    fn sup6_cgroup_path_exact_match() {
+        let want = "/user.slice/x.scope/fc-c1@7";
+        assert!(cgroup_path_matches(
+            "0::/user.slice/x.scope/fc-c1@7\n",
+            want
+        ));
+        for other in [
+            "0::/user.slice/x.scope/fc-c1@8\n",
+            "0::/user.slice/x.scope/fc-c2@7\n",
+            "0::/user.slice/y.scope/fc-c1@7\n",
+            "0::/user.slice/x.scope/fc-c1@7/nested\n",
+            "0::/user.slice/x.scope/fc-c2@9/fc-c1@7\n",
+            "0::/user.slice/x.scope/fc-c2@9/user.slice/x.scope/fc-c1@7\n",
+            "0::/user.slice/x.scope\n",
+            "0::/user.slice/x.scope/fc-c1@7 (deleted)\n",
+            "0::/user.slice/x.scope/fc-c1@7/\n",
+            "1:name=x:/user.slice/x.scope/fc-c1@7\n",
+            "0::/a\n0::/user.slice/x.scope/fc-c1@7\n",
+            "0::/user.slice/x.scope/fc-c1@7\n0::/user.slice/x.scope/fc-c1@7\n",
+            "",
+        ] {
+            assert!(!cgroup_path_matches(other, want), "{other:?}");
+        }
     }
 
-    /// SUP-6: 期待 cgroup 名が不正なら InvalidArgument。
+    /// SUP-6: 期待 cgroup パスの形式検証（絶対・正規形・ルート以外）。
     #[test]
-    fn sup6_open_rejects_invalid_cgroup_name() {
+    fn sup6_cgroup_path_validation() {
+        for ok in ["/fc-c1@7", "/user.slice/x.scope/fc-c1@7"] {
+            assert!(is_valid_cgroup_path(ok), "{ok}");
+        }
+        let too_long = format!("/{}", "a".repeat(CGROUP_PATH_MAX));
+        for bad in [
+            "",
+            "/",
+            "fc-c1@7",
+            "a/b",
+            "/a//b",
+            "/a/",
+            "/a/./b",
+            "/a/../b",
+            "/..",
+            "/a\0b",
+            "/a\n0::/b",
+            too_long.as_str(),
+        ] {
+            assert!(!is_valid_cgroup_path(bad), "{bad:?}");
+        }
+    }
+
+    /// SUP-6: 期待 cgroup パスが不正なら、対象へ触れる前に InvalidArgument。
+    #[test]
+    fn sup6_open_rejects_invalid_cgroup_path() {
         let me = NonZeroU32::new(std::process::id()).unwrap();
-        for bad in ["", "a/b", "..", "."] {
+        for bad in ["", "/", "fc-c1@7", "/a/../b", "/a//b"] {
             let err = Pid1Target::open(me, bad).unwrap_err();
             assert_eq!(err.code, ErrorCode::InvalidArgument, "{bad}");
+            assert_eq!(err.stage, IsolationStage::SetNs);
         }
     }
 
@@ -329,7 +398,7 @@ mod tests {
     #[test]
     fn sup6_open_rejects_self() {
         let me = NonZeroU32::new(std::process::id()).unwrap();
-        let err = Pid1Target::open(me, "fc-x@1").unwrap_err();
+        let err = Pid1Target::open(me, "/fc-x@1").unwrap_err();
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
         assert_eq!(err.stage, IsolationStage::SetNs);
     }
@@ -337,7 +406,7 @@ mod tests {
     /// SUP-6: PID_MAX_LIMIT 超の pid は存在しない（NotFound）。
     #[test]
     fn sup6_open_missing_pid_is_not_found() {
-        let err = Pid1Target::open(NonZeroU32::new(4_194_305).unwrap(), "fc-x@1").unwrap_err();
+        let err = Pid1Target::open(NonZeroU32::new(4_194_305).unwrap(), "/fc-x@1").unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
         assert_eq!(err.stage, IsolationStage::SetNs);
     }

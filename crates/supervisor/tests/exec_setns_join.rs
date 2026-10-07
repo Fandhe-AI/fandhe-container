@@ -184,21 +184,37 @@ mod linux {
             StateRevision::from_raw(1),
         )
         .expect("record");
-        // pid1 は試験プロセスと同じ cgroup に属する（コンテナ用 cgroup は作れないため、実際の cgroup の
-        // リーフ名を期待値にする）。別名では pid 再利用対策として拒否されることも確認する。
+        // コンテナ用 cgroup は作れないため、pid1 が実際に属する cgroup の絶対パスを期待値にする
+        // （本番は記録の配置から導く。`identify_pid1`）。別コンテナの cgroup・配下の子 cgroup・親 cgroup・
+        // リーフ名だけの指定では、pid 再利用対策として拒否されることも確認する（SEC-1）。
         let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("read cgroup");
-        let leaf = cgroup
+        let path = cgroup
             .lines()
             .find_map(|l| l.strip_prefix("0::"))
-            .and_then(|p| p.rsplit('/').find(|c| !c.is_empty()))
-            .expect("cgroup v2 leaf")
+            .expect("cgroup v2 path")
             .to_owned();
-        let err = identify_pid1_in(&rec, "fc-c1@999999").unwrap_err();
-        assert_eq!(
-            err.code(),
-            fandhe_container_core::traits::ErrorCode::FailedPrecondition
+        assert!(
+            path.starts_with('/') && path.len() > 1,
+            "pid1 must be in a non-root cgroup: {path}"
         );
-        let target = identify_pid1_in(&rec, &leaf).expect("identify pid1");
+        let (parent, leaf) = path.rsplit_once('/').expect("cgroup leaf");
+        use fandhe_container_core::traits::ErrorCode;
+        let mut rejected = vec![
+            (
+                format!("{parent}/fc-c1@999999"),
+                ErrorCode::FailedPrecondition,
+            ),
+            (format!("{path}/{leaf}"), ErrorCode::FailedPrecondition),
+            (leaf.to_owned(), ErrorCode::InvalidArgument),
+        ];
+        if !parent.is_empty() {
+            rejected.push((parent.to_owned(), ErrorCode::FailedPrecondition));
+        }
+        for (bad, code) in rejected {
+            let err = identify_pid1_in(&rec, &bad).unwrap_err();
+            assert_eq!(err.code(), code, "{bad}");
+        }
+        let target = identify_pid1_in(&rec, &path).expect("identify pid1");
         assert_eq!(target.pid1().pid().get(), pid);
         let report = enter_namespaces(&target).expect("enter namespaces");
         assert_eq!(report.target_pid.get(), pid);

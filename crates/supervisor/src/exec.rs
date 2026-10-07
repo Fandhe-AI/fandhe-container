@@ -12,7 +12,10 @@
 //! - 記録上の pid は **候補** にすぎず、シグナル送信・回収・`/proc` の宛先にそのまま使わない
 //!   （pid 再利用対策。SEC-1）。core の `Pid1Target::open` が pidfd 固定のうえで pid1 であることを検証し、
 //!   通ったものだけを [`ExecTarget`] にする。さらに pid が別コンテナに再利用されていないことを、
-//!   記録した cgroup 配置から導くコンテナ固有の cgroup 名で確認する（SEC-1）
+//!   記録した cgroup 配置（委譲スコープと instance）から導くコンテナ固有の cgroup パス
+//!   `<scope>/fc-<id>@<instance>` と対象の所属 cgroup の完全一致で確認する（SEC-1）。instance は
+//!   ストア全体で再利用されないため、`state.json` へプロセス識別情報（開始時刻等）を追加せずに
+//!   「記録したコンテナのプロセスであること」を照合できる（スキーマ変更なし）
 //! - [`enter_namespaces`] は呼び出しスレッドの namespace を不可逆に変える。単一スレッドのプロセスから
 //!   のみ呼べる。logs 捕捉スレッドを持つ supervisor 本体からは呼ばず、exec 専用プロセスから呼ぶ（#503）
 //! - 順序: cgroup.procs の fd 確保（#501）は [`enter_namespaces`] の前、seccomp / Landlock の再適用
@@ -75,16 +78,31 @@ pub fn identify_pid1(record: &StateRecord) -> Result<ExecTarget, TraitError> {
     let name = CgroupName::for_instance(status.id(), placement.instance()).map_err(|_| {
         TraitError::new(ErrorCode::InvalidArgument, "invalid container cgroup name")
     })?;
-    identify_pid1_in(record, name.as_str())
+    identify_pid1_in(
+        record,
+        &container_cgroup_path(placement.scope().as_str(), name.as_str()),
+    )
 }
 
-/// [`identify_pid1`] と同じ検証を、呼び出し側が解決済みの cgroup リーフ名（`fc-<id>@<instance>`）で行う。
+/// 委譲スコープ（`"/"` または `"/a/b"`）とコンテナ用 cgroup 名から、cgroup v2 ルート起点の絶対パスを作る。
+/// cgroup のパスはカーネルが `/` 区切りで返す文字列で、OS のパス区切りとは無関係（Linux 専用モジュール）。
+fn container_cgroup_path(scope: &str, name: &str) -> String {
+    if scope == "/" {
+        format!("/{name}")
+    } else {
+        format!("{scope}/{name}")
+    }
+}
+
+/// [`identify_pid1`] と同じ検証を、呼び出し側が解決済みの cgroup 絶対パス（`<scope>/fc-<id>@<instance>`）で行う。
 ///
-/// 記録の cgroup 配置を介さず名前を直接渡したい呼び出し元（実機結合試験等）向け。名前は必須で、
-/// 対象が属さなければ `FailedPrecondition`（SEC-1）。
+/// 記録の cgroup 配置を介さずパスを直接渡す呼び出し元（コンテナ用 cgroup を作れない実機結合試験）向け。
+/// パスは必須で、対象の所属 cgroup と完全一致しなければ `FailedPrecondition`（SEC-1）。本番経路は
+/// 記録から期待値を導く [`identify_pid1`] を使うこと（ここへ対象自身の `/proc/<pid>/cgroup` から読んだ値を
+/// 渡すと同一性の照合にならない）。
 pub fn identify_pid1_in(
     record: &StateRecord,
-    expected_cgroup_name: &str,
+    expected_cgroup_path: &str,
 ) -> Result<ExecTarget, TraitError> {
     let status = record.status();
     if status.state() != ContainerState::Running {
@@ -99,7 +117,7 @@ pub fn identify_pid1_in(
             "container has no recorded pid; cannot identify pid1",
         ));
     };
-    let pid1 = Pid1Target::open(pid, expected_cgroup_name).map_err(from_exec_error)?;
+    let pid1 = Pid1Target::open(pid, expected_cgroup_path).map_err(from_exec_error)?;
     Ok(ExecTarget {
         id: status.id().clone(),
         pid1,
@@ -122,7 +140,9 @@ fn from_exec_error(err: ExecError) -> TraitError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fandhe_container_core::traits::{ContainerStatus, StateRevision};
+    use fandhe_container_core::traits::{
+        CgroupPlacement, CgroupScope, ContainerStatus, StateRevision,
+    };
     use std::num::NonZeroU32;
 
     fn record(status: ContainerStatus) -> StateRecord {
@@ -161,12 +181,51 @@ mod tests {
         assert!(err.message().contains("cgroup"), "{}", err.message());
     }
 
+    /// SUP-6・SEC-1: 期待 cgroup パスは記録の委譲スコープと `fc-<id>@<instance>` の連結（ルートは `/` を重ねない）。
+    #[test]
+    fn sup6_container_cgroup_path_concrete_values() {
+        assert_eq!(
+            container_cgroup_path("/user.slice/x.scope", "fc-c1@7"),
+            "/user.slice/x.scope/fc-c1@7"
+        );
+        assert_eq!(container_cgroup_path("/", "fc-c1@7"), "/fc-c1@7");
+    }
+
+    /// SUP-6・SEC-1: cgroup 配置の記録があれば、記録から導いた期待パスで core の検証まで進む
+    /// （自プロセスは入れ子の PID 1 でないため SetNs 段で拒否される）。
+    #[test]
+    fn sup6_identify_with_placement_reaches_core_verification() {
+        let pid = NonZeroU32::new(std::process::id());
+        let rec = record(ContainerStatus::running(cid(), pid)).with_cgroup(CgroupPlacement::new(
+            CgroupScope::new("/user.slice/x.scope").unwrap(),
+            StateRevision::from_raw(7),
+        ));
+        let err = identify_pid1(&rec).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            format!(
+                "exec stage SetNs: process {} is not PID 1 of a nested PID namespace",
+                std::process::id()
+            )
+        );
+    }
+
+    /// SUP-6・SEC-1: 相対パス・リーフ名だけの期待値は、対象へ触れる前に InvalidArgument。
+    #[test]
+    fn sup6_identify_in_rejects_non_absolute_cgroup_path() {
+        let pid = NonZeroU32::new(std::process::id());
+        let rec = record(ContainerStatus::running(cid(), pid));
+        let err = identify_pid1_in(&rec, "fc-c1@1").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+    }
+
     /// SUP-6: 記録 pid が pid1 でなければ（自プロセス）検証を素通りしない。
     #[test]
     fn sup6_identify_rejects_self_pid() {
         let pid = NonZeroU32::new(std::process::id());
         let rec = record(ContainerStatus::running(cid(), pid));
-        let err = identify_pid1_in(&rec, "fc-c1@1").unwrap_err();
+        let err = identify_pid1_in(&rec, "/fc-c1@1").unwrap_err();
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert!(err.message().contains("SetNs"), "{}", err.message());
     }

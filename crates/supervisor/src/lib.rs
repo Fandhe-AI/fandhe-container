@@ -3,7 +3,7 @@
 //! 常駐デーモンを持たない設計（CORE-1・D-19）の実装主体で、コンテナ 1 つにつき 1 プロセスで監視する（SUP-1）。
 //! PLUG-1 区分は core（plugin 境界〔PLUG-2〕を経由せず実行層コアの一部。crate-naming.md）。
 //!
-//! 現状は状態配線（[`state`]。TASK-157.3）・監視ループ基本（[`run`]。TASK-157.4）・restart の土台（TASK-157.5。`restart_count` の加算は TASK-159.3 で再 launch 成功時へ移設）・healthcheck フック（[`health`]。TASK-157.6。コマンド実行は未実装）・logs 捕捉の土台（[`logs`]。TASK-157.7。永続化・ローテーションは SUP-7・TASK-164 で未実装）が実装済みで、終了分類と restart ポリシー評価（[`restart`]。TASK-159.1・#487／TASK-159.2・#488。呼び出し側への配線は未実装）と、再起動ループ（バックオフ・注入式の再 launch・`restart_count` 管理・state.json 反映。#489・TASK-159.3）も実装済みで、本番 launcher による再 launch・明示的 stop の検知（SUP-9）等は未実装（TASK-1.3・TASK-157.1〔#235〕・REPAIR-1。スタブの明示は REPAIR-3）。
+//! 現状は状態配線（[`state`]。TASK-157.3）・監視ループ基本（[`run`]。TASK-157.4）・restart の土台（TASK-157.5。`restart_count` の加算は TASK-159.3 で再 launch 成功時へ移設）・healthcheck フック（[`health`]。TASK-157.6。コマンド実行は未実装）・logs 捕捉の土台（[`logs`]。TASK-157.7。ファイルへのローテーション書き込みは TASK-164.2・#506 で実装済み、フラッシュ制御・大規模検証は SUP-7・TASK-164.3/4 で未実装）が実装済みで、終了分類と restart ポリシー評価（[`restart`]。TASK-159.1・#487／TASK-159.2・#488。呼び出し側への配線は未実装）と、再起動ループ（バックオフ・注入式の再 launch・`restart_count` 管理・state.json 反映。#489・TASK-159.3）も実装済みで、本番 launcher による再 launch・明示的 stop の検知（SUP-9）等は未実装（TASK-1.3・TASK-157.1〔#235〕・REPAIR-1。スタブの明示は REPAIR-3）。
 //! inspect 相当の機械可読出力（[`inspect`]。TASK-168.1・#523・SUP-11）も実装済みで、出力をパースして型・値域・キー順・値を照合する結合テスト（TASK-168.2・#524。メモリ上のフェイクは 3 OS、実ストアは Linux）（`tests/inspect_output.rs`）も併置済み（CLI 配線は未実装）。
 //! cgroup 統計の読み取り・パース（[`stats`]。SUP-10・TASK-167.1・#520）と機械可読形式（JSON Lines）での出力（TASK-167.2・#521）も実装済みで、`stats` の CLI 配線は未実装。
 //! `--shm-size` / `--tmpfs` の解析と core の仕様型への変換（[`container_options`]。SUP-12・TASK-169.2・#527）も実装済みで、launcher・CLI 配線は未実装。
@@ -17,8 +17,9 @@
 //! | #239 | TASK-157.5 | restart の土台（実装済み。ポリシーと加算は #487〜#489 で実装） |
 //! | #240 | TASK-157.6 | healthcheck フックの土台（実装済み。コマンド実行・周期実行は TASK-161） |
 //! | #493 | TASK-161.1 | healthcheck 定義パース（[`healthcheck`]。実装済み。実行・周期は #495、`health` 反映は #496 で未実装） |
-//! | #241 | TASK-157.7 | logs 捕捉の土台（実装済み。永続化・ローテーションは SUP-7・TASK-164 で未実装） |
-//! | #505 | TASK-164.1 | 行単位捕捉（実装は #241。バッファ境界跨ぎを検証済み。永続化・ローテーションは #506 以降で未実装） |
+//! | #241 | TASK-157.7 | logs 捕捉の土台（実装済み。永続化・ローテーションは #506 で実装） |
+//! | #505 | TASK-164.1 | 行単位捕捉（実装は #241。バッファ境界跨ぎを検証済み。ローテーション書き込みは #506） |
+//! | #506 | TASK-164.2 | ローテーションログ書き込み（[`logs::rotating`]。実装済み。フラッシュ制御は #507、100 万行規模の検証は #508 で未実装。`logs` 読み出し・実パイプ取得も未実装） |
 //! | #242 | TASK-157.8 | 結合テスト |
 //! | #500 | TASK-163.1 | exec: pid1 特定・setns（`exec`。実装済み。コマンド実行は未実装） |
 //! | #501 | TASK-163.2 | exec: cgroup join（`exec`。実装済み。コマンド実行は未実装） |

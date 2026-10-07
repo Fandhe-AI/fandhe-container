@@ -39,6 +39,8 @@
 //!   未呼び出しで、本番 launcher〔TASK-29 / TASK-157 系〕で結線する）
 //! - `memory.max` / `memory.swap.max`（TASK-32.2・#159）: [`ContainerCgroup::set_memory_limits`]
 //!   （同上。未結線）
+//! - `pids.max` / `io.max`（SUP-13・TASK-170.2・#533）: [`ContainerCgroup::set_pids_max`]（`pids` サブモジュール）・
+//!   [`ContainerCgroup::set_io_max`]（`io_max` サブモジュール。1 デバイス分の絶対値スロットル）（同上。未結線）
 //! - fork 後の子の `cgroup.procs` 参加（TASK-32.4・#161）: [`ContainerCgroup::join_hook`] が返す
 //!   [`CgroupJoin`] を `exec::StagePipeline` の `CgroupJoin` 段へ登録する（`exec::StageHook` 実装済み）
 //!
@@ -54,6 +56,8 @@
 //!   `detect` → `prepare` → `join_hook` の結線（TASK-29 / TASK-157 系）
 //! - OCI `linux.cgroupsPath` の反映・create での委譲スコープの記録（`CreateStateRequest::with_cgroup_scope`）と
 //!   delete への本番の呼び出し元（CLI / plugin / supervisor）からの結線
+//! - `io.weight`（`--blkio-weight` の実体。比例配分の重みは `io.max` で表現できないため別ファイルの対応が必要）、
+//!   OCI `linux.resources.pids` / `blockIO` からの `set_pids_max` / `set_io_max` への反映（TASK-170.3 ほか）
 //! - cgroup v1 / hybrid は非対応（CORE-4。v2 以外は fail-closed）
 
 use std::collections::BTreeSet;
@@ -70,6 +74,10 @@ use crate::traits::{CgroupScope, ContainerId, ErrorCode, StateRevision, TraitErr
 
 mod cpu;
 pub use cpu::{CpuMax, CpuQuota};
+mod io_max;
+pub use io_max::{BlockDevice, IoLimit, IoMax};
+mod pids;
+pub use pids::{PIDS_MAX_LIMIT, PidsMax};
 
 /// 退避リーフ cgroup の名前。自プロセスの移動先（レイアウトは本モジュール冒頭を参照）。
 const EVACUATION_LEAF: &str = "fc-runtime";
@@ -85,6 +93,8 @@ const SELF_CGROUP_LIMIT: u64 = 64 * 1024;
 const PROCS_LIMIT: u64 = 1024 * 1024;
 /// `cgroup.controllers` / `cgroup.subtree_control` / `cgroup.type` の読み取り上限。
 const SMALL_FILE_LIMIT: u64 = 4 * 1024;
+/// `io.stat` の読み取り上限。デバイス数に比例して伸びるため他の小さなファイルより大きく取る。
+const IO_STAT_LIMIT: u64 = 256 * 1024;
 /// cgroup パスの要素数の上限。
 const MAX_PATH_DEPTH: usize = 64;
 /// 子 cgroup ディレクトリのモード（umask 適用前。cgroup の所有者のみ書き込み可）。
@@ -118,8 +128,14 @@ pub enum CgroupStep {
     SetMemoryLimit,
     /// `cpu.max` の検証・書き込み・読み戻し。
     SetCpuMax,
+    /// `pids.max` の検証・書き込み・読み戻し（SUP-13・TASK-170.2）。
+    SetPidsMax,
+    /// `io.max` の検証・書き込み・読み戻し（SUP-13・TASK-170.2）。
+    SetIoMax,
     /// fork 後の子プロセスの `cgroup.procs` への参加（TASK-32.4）。
     JoinContainer,
+    /// `memory.current` / `cpu.stat` / `io.stat` の読み取り（SUP-10・TASK-167.1）。
+    ReadStats,
 }
 
 /// cgroup 操作のエラー。`code` は ERR 系の機械可読コード、`message` は英語の説明。
@@ -1524,6 +1540,63 @@ impl ContainerCgroup {
         verify_effective(requested, effective)
     }
 }
+/// 読み取れる統計ファイルの閉じた列挙（SUP-10・TASK-167.1）。
+///
+/// ファイル名と読み取り上限は本 crate 側で固定し、呼び出し側（supervisor の `stats`）から
+/// 任意のパス要素を注入できないようにする（パストラバーサル対策）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StatFile {
+    /// `memory.current`（現在のメモリ使用量。バイト）。
+    MemoryCurrent,
+    /// `cpu.stat`（CPU 使用時間・スロットリング）。
+    CpuStat,
+    /// `io.stat`（デバイスごとの I/O 量）。
+    IoStat,
+}
+
+impl StatFile {
+    /// cgroup ディレクトリ直下のファイル名。
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::MemoryCurrent => "memory.current",
+            Self::CpuStat => "cpu.stat",
+            Self::IoStat => "io.stat",
+        }
+    }
+
+    /// 読み取り上限（バイト）。
+    fn limit(self) -> u64 {
+        match self {
+            Self::MemoryCurrent | Self::CpuStat => SMALL_FILE_LIMIT,
+            Self::IoStat => IO_STAT_LIMIT,
+        }
+    }
+}
+
+impl ContainerCgroup {
+    /// 統計ファイルを上限付きで読む（SUP-10・TASK-167.1）。
+    ///
+    /// 呼び出し文脈: supervisor の `stats`（`fandhe-container-supervisor`）が自コンテナの cgroup に対し
+    /// 3 ファイルを順に読み、パースする。保持している cgroup ディレクトリ fd 起点の `openat` で開き、
+    /// パス文字列から cgroup を再解決しない。ファイル不在（controller 未有効）は `Ok(None)`、
+    /// 上限超過・非 UTF-8 は `FailedPrecondition`。読み取り専用で cgroup へは書き込まない。
+    pub fn read_stat_file(&self, file: StatFile) -> Result<Option<String>, CgroupError> {
+        read_stat_file_at(self.fd.as_fd(), file)
+    }
+}
+
+/// `dir` 起点で統計ファイルを読む。`ENOENT` のみ `None` に写し、他のエラーは伝える。
+fn read_stat_file_at(dir: BorrowedFd<'_>, file: StatFile) -> Result<Option<String>, CgroupError> {
+    let step = CgroupStep::ReadStats;
+    let name = cstring(step, file.file_name())?;
+    match sys::open_read_at(dir, &name) {
+        Ok(fd) => read_limited(step, fd, file.limit()).map(Some),
+        Err(SysError::Os(errno)) if errno == sys::ENOENT => Ok(None),
+        Err(e) => Err(sys_error(step, file.file_name(), e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2131,5 +2204,52 @@ mod tests {
         let over = ContainerId::new("a".repeat(252)).unwrap();
         let err = CgroupName::for_instance(&over, StateRevision::from_raw(0)).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    /// SUP-10・TASK-167.1: 統計ファイルが具体値で読め、不在は None になる。
+    #[test]
+    fn sup10_task167_1_read_stat_file_reads_and_maps_missing_to_none() {
+        let tmp = TmpDir::new("t1671-ok");
+        std::fs::write(tmp.0.join("memory.current"), "12345678\n").unwrap();
+        std::fs::write(
+            tmp.0.join("cpu.stat"),
+            "usage_usec 10\nuser_usec 6\nsystem_usec 4\n",
+        )
+        .unwrap();
+        let cg = limits_for(&tmp.0);
+        assert_eq!(
+            cg.read_stat_file(StatFile::MemoryCurrent),
+            Ok(Some("12345678\n".to_string()))
+        );
+        assert_eq!(
+            cg.read_stat_file(StatFile::CpuStat),
+            Ok(Some(
+                "usage_usec 10\nuser_usec 6\nsystem_usec 4\n".to_string()
+            ))
+        );
+        assert_eq!(cg.read_stat_file(StatFile::IoStat), Ok(None));
+    }
+
+    /// SUP-10・TASK-167.1: 上限超過と非 UTF-8 は FailedPrecondition・ReadStats。
+    #[test]
+    fn sup10_task167_1_read_stat_file_rejects_oversize_and_non_utf8() {
+        let tmp = TmpDir::new("t1671-bad");
+        std::fs::write(tmp.0.join("memory.current"), vec![b'1'; 4097]).unwrap();
+        std::fs::write(tmp.0.join("cpu.stat"), [0xff, 0xfe]).unwrap();
+        std::fs::write(tmp.0.join("io.stat"), vec![b'x'; 256 * 1024 + 1]).unwrap();
+        let cg = limits_for(&tmp.0);
+        for f in [StatFile::MemoryCurrent, StatFile::CpuStat, StatFile::IoStat] {
+            let e = cg.read_stat_file(f).unwrap_err();
+            assert_eq!(e.code, ErrorCode::FailedPrecondition, "{f:?}");
+            assert_eq!(e.step, CgroupStep::ReadStats, "{f:?}");
+        }
+        // 上限ちょうどは読める。
+        std::fs::write(tmp.0.join("memory.current"), vec![b'1'; 4096]).unwrap();
+        assert_eq!(
+            cg.read_stat_file(StatFile::MemoryCurrent)
+                .unwrap()
+                .map(|s| s.len()),
+            Some(4096)
+        );
     }
 }

@@ -96,6 +96,7 @@ mod devices;
 mod landlock;
 mod no_new_privs;
 mod process;
+mod rlimits;
 mod rootfs;
 mod seccomp;
 mod setns;
@@ -391,13 +392,15 @@ pub enum IsolationStage {
     CreateDevices,
     /// cgroup 参加ステージ（TASK-32。#832 のステージ列の第 1 段）。
     CgroupJoin,
-    /// capability 削減ステージ（TASK-37。#832 のステージ列の第 2 段）。
+    /// rlimit 適用ステージ（SUP-12・TASK-169.1・#526。ステージ列の第 2 段。組み込み段）。
+    Rlimits,
+    /// capability 削減ステージ（TASK-37。#832 のステージ列の第 3 段）。
     CapabilityDrop,
-    /// `PR_SET_NO_NEW_PRIVS` ステージ（#833。#832 のステージ列の第 3 段）。
+    /// `PR_SET_NO_NEW_PRIVS` ステージ（#833。#832 のステージ列の第 4 段）。
     NoNewPrivs,
-    /// Landlock ステージ（TASK-39。#832 のステージ列の第 4 段）。
+    /// Landlock ステージ（TASK-39。#832 のステージ列の第 5 段）。
     Landlock,
-    /// seccomp ステージ（TASK-38。#832 のステージ列の第 5 段。#178 で組み込み段）。
+    /// seccomp ステージ（TASK-38。#832 のステージ列の第 6 段。#178 で組み込み段）。
     Seccomp,
     /// 稼働中コンテナの pid1 の特定と `setns(2)` による namespace 参加（SUP-6・TASK-163.1）。
     SetNs,

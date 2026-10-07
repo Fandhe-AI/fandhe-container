@@ -6,7 +6,9 @@
 //! 読めること・互いに干渉しないこと・`--ipc=host` と `--shm-size` の併用を拒否することを具体値で確認する。
 //! root 不要で既定のテスト集合で動く。3 OS 共通の照合が本体で、Linux 限定部分は core の exec 入力と実ストア。
 //!
-//! 対象外（REPAIR-3）: secrets / configs の tmpfs 注入は未実装のため含めない（実装後に組み合わせを追加する）。
+//! secrets / configs（#1473・TASK-169.4.2）は `container_options_secrets.rs` が個別に照合し、本ファイルでは
+//! 他オプションとの同時指定（干渉しないこと）だけを確認する。
+//!
 //! 実カーネルへの適用（`prlimit(2)`・`mount(2)`・`unshare(2)`）は個別の実機前提テスト
 //! （`crates/core/tests/tmpfs_mount.rs` 等・`container_options_ipc.rs`）が担い、全オプション同時の
 //! 実機適用は本番 `ProcessLauncher` の提供後の課題。
@@ -15,7 +17,8 @@ use fandhe_container_core::rlimits::RlimitKind;
 use fandhe_container_core::traits::{ContainerId, ContainerStatus, CreateStateRequest, ErrorCode};
 use fandhe_container_supervisor::container_options::env::{EnvFile, EnvSet, EnvVar};
 use fandhe_container_supervisor::container_options::{
-    ContainerOptions, IpcMode, Label, Labels, MountOptions, ShmSize, TmpfsOption, Ulimit,
+    ContainerOptions, InjectedFileOption, InjectedFileOptions, InjectedKind, InjectedSource,
+    IpcMode, Label, Labels, MountOptions, ShmSize, TmpfsOption, Ulimit,
 };
 
 fn ulimits() -> Vec<Ulimit> {
@@ -139,6 +142,39 @@ fn sup12_task169_5_2_all_options_reflected_together() {
             ("tier", "")
         ]
     );
+}
+
+/// SUP-12・TASK-169.4.2: secrets / configs を全オプションと同時に指定しても、他オプションの値は変わらず、
+/// 注入仕様が具体値で読める（`/run` の tmpfs と重ならない配置）。
+#[test]
+fn sup12_task169_4_2_injected_files_with_all_options() {
+    let content =
+        fandhe_container_core::injected_files::InjectedContent::from_bytes(b"x".to_vec()).unwrap();
+    let secret = InjectedFileOption::parse(
+        InjectedKind::Secret,
+        "source=token,target=/srv/secrets/token,mode=0400",
+        InjectedSource::Inline(content),
+    )
+    .unwrap();
+    let o = all_options().with_injected_files(
+        InjectedFileOptions::default()
+            .with_secrets(vec![secret])
+            .unwrap(),
+    );
+    let set = o.injected_files().unwrap();
+    let files: Vec<_> = set
+        .files()
+        .iter()
+        .map(|f| (f.destination().as_str().to_owned(), f.mode().bits()))
+        .collect();
+    assert_eq!(files, [("/srv/secrets/token".to_owned(), 0o400)]);
+    assert_eq!(rlimits_of(&o), rlimits_of(&all_options()));
+    assert_eq!(tmpfs_of(&o), tmpfs_of(&all_options()));
+    assert_eq!(
+        o.env().to_env_strings(),
+        all_options().env().to_env_strings()
+    );
+    assert_eq!(label_pairs(&o), label_pairs(&all_options()));
 }
 
 /// AC: 各オプションは他のオプションの指定に干渉されず、builder の適用順にも依存しない。

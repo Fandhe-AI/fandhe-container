@@ -100,7 +100,7 @@ const O_NONBLOCK: i32 = 0x4;
 const O_NONBLOCK: i32 = 0;
 
 /// 読み取り専用・非ブロッキング（unix）で env ファイルを開く。
-fn open_nonblocking(path: &Path) -> std::io::Result<File> {
+pub(super) fn open_nonblocking(path: &Path) -> std::io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]

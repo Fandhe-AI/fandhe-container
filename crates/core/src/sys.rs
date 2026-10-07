@@ -112,6 +112,8 @@ mod consts {
     pub const MS_NOSUID: u64 = 2;
     pub const MS_NODEV: u64 = 4;
     pub const MS_NOEXEC: u64 = 8;
+    // include/uapi/linux/mount.h の `MS_REMOUNT`（全アーキテクチャ共通）。
+    pub const MS_REMOUNT: u64 = 0x20;
     pub const MS_BIND: u64 = 0x1000;
     pub const MS_REC: u64 = 0x4000;
     pub const MS_PRIVATE: u64 = 0x4_0000;
@@ -144,6 +146,9 @@ mod consts {
     // include/uapi/asm-generic/fcntl.h の `O_RDONLY`・`O_WRONLY`（全アーキテクチャ共通）。
     pub const O_RDONLY: i32 = 0;
     pub const O_WRONLY: i32 = 1;
+    // include/uapi/asm-generic/fcntl.h の `O_CREAT`・`O_EXCL`（x86_64・arm64 とも上書きしない）。
+    pub const O_CREAT: i32 = 0o100;
+    pub const O_EXCL: i32 = 0o200;
     // include/uapi/linux/fcntl.h の `AT_REMOVEDIR`（全アーキテクチャ共通）。
     pub const AT_REMOVEDIR: i32 = 0x200;
     // include/uapi/asm-generic/errno-base.h・errno.h の EBUSY・ENOTEMPTY（cgroup 操作の分類用）。
@@ -283,6 +288,8 @@ mod consts {
     pub const MS_NOSUID: u64 = 2;
     pub const MS_NODEV: u64 = 4;
     pub const MS_NOEXEC: u64 = 8;
+    // include/uapi/linux/mount.h の `MS_REMOUNT`（全アーキテクチャ共通）。
+    pub const MS_REMOUNT: u64 = 0x20;
     pub const MS_BIND: u64 = 0x1000;
     pub const MS_REC: u64 = 0x4000;
     pub const MS_PRIVATE: u64 = 0x4_0000;
@@ -321,6 +328,9 @@ mod consts {
     // include/uapi/asm-generic/fcntl.h の `O_RDONLY`・`O_WRONLY`（全アーキテクチャ共通）。
     pub const O_RDONLY: i32 = 0;
     pub const O_WRONLY: i32 = 1;
+    // include/uapi/asm-generic/fcntl.h の `O_CREAT`・`O_EXCL`（x86_64・arm64 とも上書きしない）。
+    pub const O_CREAT: i32 = 0o100;
+    pub const O_EXCL: i32 = 0o200;
     // include/uapi/linux/fcntl.h の `AT_REMOVEDIR`（全アーキテクチャ共通）。
     pub const AT_REMOVEDIR: i32 = 0x200;
     // include/uapi/asm-generic/errno-base.h・errno.h の EBUSY・ENOTEMPTY（cgroup 操作の分類用）。
@@ -461,6 +471,7 @@ mod consts {
     pub const MS_NOSUID: u64 = 0;
     pub const MS_NODEV: u64 = 0;
     pub const MS_NOEXEC: u64 = 0;
+    pub const MS_REMOUNT: u64 = 0;
     pub const MS_BIND: u64 = 0;
     pub const MS_REC: u64 = 0;
     pub const MS_PRIVATE: u64 = 0;
@@ -482,6 +493,8 @@ mod consts {
     pub const O_NOCTTY: i32 = 0;
     pub const O_RDONLY: i32 = 0;
     pub const O_WRONLY: i32 = 0;
+    pub const O_CREAT: i32 = 0;
+    pub const O_EXCL: i32 = 0;
     pub const AT_REMOVEDIR: i32 = 0;
     pub const EBUSY: i32 = -16;
     pub const ENOTEMPTY: i32 = -17;
@@ -1070,6 +1083,39 @@ pub(crate) fn mount_tmpfs_at(
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// `target`（マウントのルート）の tmpfs を、読み取り専用へ再マウントする（`MS_REMOUNT`）。
+///
+/// `crate::exec::inject_files` が、secrets / configs を書き終えた tmpfs を read-only にするために呼ぶ
+/// （SUP-12・TASK-169.4.2）。`flags` は最初のマウントと同じ [`TmpfsMountFlags`] を渡し、`read_only` は
+/// 本関数が強制的に真にする。user namespace 内ではロックされたフラグ（`nosuid`・`nodev`・`noexec`）を
+/// 落とす再マウントが `EPERM` になるため、最初のマウントと同じビットを必ず併せて渡す。data は NULL
+/// （既存の size / mode を保持する）。`target` は検証済みの fd を指す `/proc/thread-self/fd/N`。
+// テストビルドでは `crate::exec` の dry-run 差し込み点が本関数を呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn remount_read_only_at(target: &CStr, flags: TmpfsMountFlags) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let flags = TmpfsMountFlags {
+        read_only: true,
+        ..flags
+    };
+    // SAFETY: `target` は `&CStr` の借用で NUL 終端かつ呼び出しの間生存する。source / fstype / data は
+    // NULL（`MS_REMOUNT` ではカーネルが参照しない。data が NULL のため既存のマウントオプションを保つ）。
+    // flags は `TmpfsMountFlags::bits` で組んだ値に `MS_REMOUNT` を足したのみ。副作用は呼び出しスレッドの
+    // mount namespace 内の 1 マウントのフラグ変更に限る。
+    let rc = unsafe {
+        mount(
+            core::ptr::null(),
+            target.as_ptr(),
+            core::ptr::null(),
+            consts::MS_REMOUNT | flags.bits(),
+            core::ptr::null(),
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
 /// `target` のマウントを `MNT_DETACH` で切り離す（`umount2(target, MNT_DETACH)`）。
 ///
 /// `crate::exec::mount_tmpfs` の失敗時の後始末が、自分でマウントした tmpfs のルートを開き直した
@@ -1453,6 +1499,44 @@ fn open_file_at(parent: BorrowedFd<'_>, name: &CStr, access: i32) -> Result<Owne
     // `BorrowedFd`。flags に O_CREAT / O_TMPFILE を含まないため可変長引数（mode）は渡さない。
     // 成功時の戻り値は新規 fd で、直後に `OwnedFd` が唯一の所有者となる（二重 close なし）。
     let fd = unsafe { openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: `fd` は上で成功した openat が返した、他に所有者のいない有効な fd。
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// `parent` 配下に新規ファイル `name` を `O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC` で作って開く。
+///
+/// `crate::exec::inject_files` が、検証済みの tmpfs ルート fd の直下へ secrets / configs を作るために
+/// 使う（SUP-12・TASK-169.4.2）。`O_EXCL` により既存名（既存 symlink を含む。`O_EXCL` の `O_CREAT` は
+/// symlink を辿らず `EEXIST`）を拒否する。`mode` は `0o777` 以下に切り詰め、umask の影響を受けるため
+/// 呼び出し側が作成後に `fchmod` 相当で最終モードへ設定する。`name` は 1 要素に検証済みの前提。
+pub(crate) fn create_file_excl_at(
+    parent: BorrowedFd<'_>,
+    name: &CStr,
+    mode: u32,
+) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let flags = consts::O_WRONLY
+        | consts::O_CREAT
+        | consts::O_EXCL
+        | consts::O_NOFOLLOW
+        | consts::O_CLOEXEC;
+    // SAFETY: `name` は借用した NUL 終端文字列で呼び出しの間生存する。`parent` は生存中の
+    // `BorrowedFd`。flags に O_CREAT を含むため、可変長引数として mode を `c_uint` で渡す（`openat` の
+    // 宣言は可変長で、整数昇格後の `unsigned int` を読むのが C ABI）。成功時の戻り値は新規 fd で、
+    // 直後に `OwnedFd` が唯一の所有者となる（二重 close なし）。
+    let fd = unsafe {
+        openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            flags,
+            (mode & 0o777) as core::ffi::c_uint,
+        )
+    };
     if fd < 0 {
         return Err(last_error());
     }
@@ -2769,6 +2853,49 @@ mod tests {
         assert_eq!(f(false, true), 2 | 4);
         assert_eq!(f(true, true), 1 | 2 | 4);
         assert_eq!(TMPFS_MAGIC, 0x0102_1994);
+    }
+
+    /// SUP-12（TASK-169.4.2）: 再マウント・作成系フラグの定数値（x86_64・aarch64 共通）。
+    #[test]
+    fn sup12_task169_4_2_inject_consts_are_exact() {
+        assert_eq!(consts::MS_REMOUNT, 0x20);
+        assert_eq!(
+            (consts::O_CREAT, consts::O_EXCL, consts::O_WRONLY),
+            (0o100, 0o200, 1)
+        );
+    }
+
+    /// SUP-12（TASK-169.4.2）: `create_file_excl_at` は新規作成でき、既存名・既存 symlink 名は
+    /// `EEXIST`（辿らない）。
+    #[test]
+    fn sup12_task169_4_2_create_file_excl_at_refuses_existing_names() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let dir = std::env::temp_dir().join(format!("fandhe-sys-excl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let parent =
+            open_dir_path_nofollow(None, &CString::new(dir.to_str().expect("utf8")).expect("c"))
+                .expect("open dir");
+        let name = CString::new("new").expect("c");
+        let fd = create_file_excl_at(parent.as_fd(), &name, 0o600).expect("create");
+        drop(fd);
+        let mode = std::fs::metadata(dir.join("new"))
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777 & !0o077, 0o600 & !0o077);
+        assert_eq!(
+            create_file_excl_at(parent.as_fd(), &name, 0o600).expect_err("exists"),
+            SysError::Os(EEXIST)
+        );
+        symlink(dir.join("target-not-created"), dir.join("link")).expect("symlink");
+        let link = CString::new("link").expect("c");
+        assert_eq!(
+            create_file_excl_at(parent.as_fd(), &link, 0o600).expect_err("symlink"),
+            SysError::Os(EEXIST)
+        );
+        assert!(!dir.join("target-not-created").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// CORE-1（TASK-27.3）: mount 系フラグ・pivot_root の syscall 番号の具体値。番号は arch ごとに

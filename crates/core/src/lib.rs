@@ -53,6 +53,8 @@
 //!   失敗のエラー型 `OciRuntimeError`（ERR-2・TASK-96.1）は定義済みで、4 操作（create / start / kill / delete）は結線済み・`write_json_line` で stderr 向け 1 行を出せる（TASK-96.2・TASK-96.3）。実 stderr 出力・終了は CLI 側で未実装
 //! - `tmpfs`: tmpfs マウントの検証済み仕様型（`--shm-size` / `--tmpfs`。SUP-12・TASK-169.2）。OS 非依存で、
 //!   Linux 限定の適用は `exec::mount_tmpfs`。launcher・CLI への配線は未実装（REPAIR-3）
+//! - `injected_files`: secrets / configs 注入の検証済み仕様型（SUP-12・TASK-169.4.2）。OS 非依存で、
+//!   Linux 限定の適用は `exec::inject_files`（専用 tmpfs へ書き込み後に read-only 化）。配線は未実装（REPAIR-3）
 //! - `state_store`: ファイルベース `StateStore`（TASK-31.1・OCI-5）は実装済み。3 OS でコンパイルされるが
 //!   使えるのは Linux のみで、他 OS の `FileStateStore::open` は状態ルートの信頼境界（所有者・ACL）を
 //!   検査できないため `Unimplemented`（fail-closed。start の `BundleLock` と同じ扱い）。
@@ -95,6 +97,7 @@ pub mod capabilities;
 pub mod cgroups;
 #[cfg(target_os = "linux")]
 pub mod exec;
+pub mod injected_files;
 #[cfg(target_os = "linux")]
 pub mod landlock;
 pub mod observability;

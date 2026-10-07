@@ -33,7 +33,9 @@
 //! - **rlimit は対象（pid1）の実効値を写す**: コンテナの rlimit（`--ulimit`）は `state.json` に記録されないため、
 //!   [`prepare_exec_restrictions`] が `setns` の前に対象の `limits`（procfs）を上限つきで読み、全 16 種の
 //!   (soft, hard) を exec プロセスへ適用して読み戻す（黙ってクランプしない。`apply_rlimits`）。解釈できない
-//!   内容は空集合へ落とさず拒否する（緩い制限のまま exec しない）。rootless で hard の引き上げが必要な
+//!   内容は空集合へ落とさず拒否する（緩い制限のまま exec しない）。得られた集合が空の場合も、適用を省かず
+//!   `FailedPrecondition`（段 `Rlimits`）で拒否する（準備・再適用の両方で確かめる。TASK-163 追補・#1460。
+//!   適用を省いても未適用の一覧へ載らない経路を塞ぐ）。rootless で hard の引き上げが必要な
 //!   場合は `EPERM` で拒否する（launch と同じ fail-closed）。他プロセスへの `prlimit` 経路は作らない
 //! - **rlimit を写す方式の限界（launch の指定値そのものではない）**: 写すのは pid1 の **現在の** 値で、pid1 は
 //!   自分の rlimit を変えられる。OCI 既定の capability に `CAP_SYS_RESOURCE` は無く、hard の引き上げは初期 user
@@ -154,7 +156,9 @@ use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
-use super::landlock::{LandlockAccessProbe, landlock_ruleset_from_config, run_probe};
+use super::landlock::landlock_ruleset_from_config;
+#[cfg(feature = "exec-test-support")]
+use super::landlock::{LandlockAccessProbe, run_probe};
 use super::rlimits::{apply_rlimits, parse_proc_limits};
 use super::setns::{NsIdentity, cgroup_path_matches, read_bounded_from};
 use super::{
@@ -464,6 +468,8 @@ pub fn prepare_exec_restrictions(
     let target_mnt_ns = target.mnt_ns_identity()?;
     let target_pid_ns = target.pid_ns_identity()?;
     let rlimits = parse_proc_limits(&target.read_limits()?)?;
+    // 対象の実効値を 1 つも読めなかった場合、rlimit を載せずに exec することになるため拒否する（#1460）。
+    require_rlimits(&rlimits)?;
     let binding = TargetBinding {
         proc_dir: open_own_proc_dir()?,
         target_mnt_ns,
@@ -549,6 +555,7 @@ fn own_cgroup_matches(proc_dir: BorrowedFd<'_>, expected: &str) -> Result<bool, 
 }
 
 /// 自プロセスの cgroup v2 パス（`0::<path>`）。観測関数・単体テストが「対象は自分自身」の束縛を作るために使う。
+#[cfg(any(test, feature = "exec-test-support"))]
 fn own_cgroup_path(proc_dir: BorrowedFd<'_>) -> Result<String, ExecError> {
     let stage = IsolationStage::CgroupJoin;
     let fd = sys::open_read_at(proc_dir, c"cgroup")
@@ -619,6 +626,23 @@ fn prepare_with_rootfs(
     })
 }
 
+/// 再適用する rlimit の集合が空でないことを確かめる（SUP-6・SEC-1・REPAIR-3・TASK-163 追補・#1460）。
+///
+/// 空集合は「適用する値が無い」ため rlimit の適用を省くことになるが、結果の件数が 0 になるだけで未適用の
+/// 一覧には載らず、launch より緩い rlimit のまま exec へ進めてしまう。本番の入口（[`prepare_exec_restrictions`]・
+/// [`reapply_restrictions`]）は空集合を `FailedPrecondition`（段 `Rlimits`）で拒否する。通常は対象の `limits` から
+/// 全 16 種が入る。
+fn require_rlimits(rlimits: &Rlimits) -> Result<(), ExecError> {
+    if rlimits.is_empty() {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::Rlimits,
+            "the rlimits of the exec target are empty; refusing to exec without rlimits",
+        ));
+    }
+    Ok(())
+}
+
 /// 2 つの fd が同じディレクトリ（`st_dev`・`st_ino` が一致）を指すか。どちらかがディレクトリでない・
 /// 調べられない場合はエラー（段 `SetNs`。一致とも不一致とも扱わない）。
 fn same_directory(a: BorrowedFd<'_>, b: BorrowedFd<'_>) -> Result<bool, ExecError> {
@@ -671,16 +695,29 @@ fn open_verified_root(rootfs: BorrowedFd<'_>) -> Result<OwnedFd, ExecError> {
 pub fn reapply_restrictions(
     restrictions: ExecRestrictions,
 ) -> Result<ExecRestrictionReport, ExecError> {
-    reapply_inner(restrictions, true)
+    reapply_inner(restrictions, ReapplyMode::Complete)
 }
 
-/// [`reapply_restrictions`] の本体。`drop_capabilities` が偽のときだけ capability 削減を省き、結果の
-/// 未適用の一覧へ `CapabilityDrop` を載せる（完了を装わない。結合試験用の観測関数が、`CAP_SETPCAP` を持たない
-/// 非特権の使い捨て子で seccomp / Landlock の遮断だけを観測するために使う。本番の入口は常に真）。
+/// [`reapply_inner`] が適用する範囲。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReapplyMode {
+    /// 本番: すべての制限を適用する。rlimit の空集合は拒否する（#1460）。
+    Complete,
+    /// 結合試験用の観測関数専用: capability 削減を省き、rlimit の空集合を許す。省いたものは結果の未適用の
+    /// 一覧へ載るため、完了（`ExecReady`）にはならない。
+    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
+    ObservationWithoutCapabilityDrop,
+}
+
+/// [`reapply_restrictions`] の本体。`mode` が観測用のときだけ capability 削減を省き（`CAP_SETPCAP` を持たない
+/// 非特権の使い捨て子で seccomp / Landlock の遮断だけを観測するため）、rlimit の空集合を許す。省いた制限は
+/// 結果の未適用の一覧（`CapabilityDrop`・空集合のときは `Rlimits`）へ載せる（完了を装わない）。本番の入口は
+/// 常に [`ReapplyMode::Complete`] で、rlimit の空集合を何も適用する前に拒否する。
 fn reapply_inner(
     restrictions: ExecRestrictions,
-    drop_capabilities: bool,
+    mode: ReapplyMode,
 ) -> Result<ExecRestrictionReport, ExecError> {
+    let drop_capabilities = mode == ReapplyMode::Complete;
     let ExecRestrictions {
         landlock,
         mut threads,
@@ -696,10 +733,15 @@ fn reapply_inner(
             "restrictions must be reapplied by the process that prepared them",
         ));
     }
+    // 本番は rlimit の空集合を、何も適用する前に拒否する（未適用の一覧へ載らないまま省かれる経路を塞ぐ。#1460）。
+    if mode == ReapplyMode::Complete {
+        require_rlimits(&rlimits)?;
+    }
     verify_target_binding(&binding)?;
     let root = open_verified_root(rootfs.as_fd())?;
-    // 空集合なら syscall を呼ばない（launch の組み込み段と同じ）。通常は全 16 種が入る。
-    if !rlimits.is_empty() {
+    // 観測用の空集合では syscall を呼ばず、下で未適用の一覧へ `Rlimits` を載せる。通常は全 16 種が入る。
+    let rlimits_skipped = rlimits.is_empty();
+    if !rlimits_skipped {
         apply_rlimits(&rlimits).map_err(|e| e.at_stage(IsolationStage::Rlimits))?;
     }
     // capability 削減は、先頭で補助グループも空にする（launch 経路と同じ関数。#1457）。
@@ -728,10 +770,15 @@ fn reapply_inner(
         rlimits_applied: rlimits.len(),
         capability_bounding_dropped,
         supplementary_groups,
-        unapplied: if drop_capabilities {
-            ExecRestrictionReport::UNAPPLIED
-        } else {
-            &[UnappliedExecRestriction::CapabilityDrop]
+        // launch 経路の段の順（`Rlimits` → `CapabilityDrop`）で並べる。
+        unapplied: match (rlimits_skipped, drop_capabilities) {
+            (false, true) => ExecRestrictionReport::UNAPPLIED,
+            (false, false) => &[UnappliedExecRestriction::CapabilityDrop],
+            (true, true) => &[UnappliedExecRestriction::Rlimits],
+            (true, false) => &[
+                UnappliedExecRestriction::Rlimits,
+                UnappliedExecRestriction::CapabilityDrop,
+            ],
         },
         carry: ExecCarry {
             root,
@@ -742,6 +789,7 @@ fn reapply_inner(
 }
 
 /// [`observe_exec_restriction_reapply`] の観測結果。errno は成功を `None`、失敗を `Some(errno)`（不明は `-1`）。
+#[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
 #[derive(Debug)]
 #[non_exhaustive]
@@ -769,6 +817,7 @@ pub struct ExecReapplyObservation {
 }
 
 /// 観測 1 回で試せるプローブ数の上限（`exec/landlock.rs` と同じ固定リスト前提の防御）。
+#[cfg(feature = "exec-test-support")]
 const MAX_REAPPLY_PROBES: usize = 32;
 
 /// 本番の準備・再適用の経路をそのまま通し、seccomp と Landlock の遮断を観測する
@@ -783,10 +832,15 @@ const MAX_REAPPLY_PROBES: usize = 32;
 /// 準備・再適用のいずれかが失敗したらプローブは実行しない。`unsafe` は追加せず、syscall は既存の
 /// `crate::sys` ラッパーに限る。対象への束縛は自プロセスの mount namespace に対して行うため常に一致し、
 /// rlimit は変更しない（空集合）。`CAP_SETPCAP` を持たない非特権の子でも観測できるよう capability 削減は
-/// 省き、結果の未適用の一覧に `CapabilityDrop` が残る（capability 削減の実機確認は supervisor の
+/// 省き、結果の未適用の一覧に `Rlimits` と `CapabilityDrop` が残る（省いたものを適用済みと装わない。本番の
+/// 入口は rlimit の空集合を拒否する。#1460。capability 削減の実機確認は supervisor の
 /// `tests/exec.rs`）。
 ///
 /// `setns` を伴う通し確認は `fandhe-container-supervisor` の `tests/exec.rs`（TASK-163.4・#503）が行う。
+///
+/// `exec-test-support` feature を付けたビルドにだけ存在し、既定のビルド（リリース成果物を含む）の公開 API には
+/// 含まれない（TASK-163 追補・#1460。core 自身のテストでは dev-dependency の自己参照で有効になる）。
+#[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
 pub fn observe_exec_restriction_reapply(
     config: &OciConfig,
@@ -836,10 +890,12 @@ pub fn observe_exec_restriction_reapply(
     };
     match prepare_with_rootfs(config, expected, Rlimits::default(), binding) {
         Err(e) => obs.prepare_error = Some(e),
-        Ok(prepared) => match reapply_inner(prepared, false) {
-            Ok(report) => obs.report = Some(report),
-            Err(e) => obs.reapply_error = Some(e),
-        },
+        Ok(prepared) => {
+            match reapply_inner(prepared, ReapplyMode::ObservationWithoutCapabilityDrop) {
+                Ok(report) => obs.report = Some(report),
+                Err(e) => obs.reapply_error = Some(e),
+            }
+        }
     }
     obs.seccomp_after = status_field("Seccomp:").ok_or_else(|| internal("Seccomp missing"))?;
     obs.no_new_privs_after =
@@ -853,6 +909,7 @@ pub fn observe_exec_restriction_reapply(
     Ok(obs)
 }
 
+#[cfg(feature = "exec-test-support")]
 fn errno_of(r: Result<(), sys::SysError>) -> Option<i32> {
     match r {
         Ok(()) => None,
@@ -862,6 +919,7 @@ fn errno_of(r: Result<(), sys::SysError>) -> Option<i32> {
 }
 
 /// `/proc/thread-self/status` の指定フィールド値（前後の空白は除く）。
+#[cfg(feature = "exec-test-support")]
 fn status_field(name: &str) -> Option<String> {
     let status = std::fs::read_to_string("/proc/thread-self/status").ok()?;
     status
@@ -1019,17 +1077,71 @@ mod tests {
         let _ = crate::exec::rlimits::testing::take_sets();
     }
 
-    /// SUP-6・TASK-163.4: 対象に rlimit が無い（空集合）なら `prlimit` を呼ばず、残りの段を同じ順で適用する。
+    /// SUP-6・SEC-1・REPAIR-3・TASK-163 追補（#1460）: 本番の入口は rlimit の空集合を、何も適用する前に
+    /// `FailedPrecondition`（段 `Rlimits`）で拒否する（適用を省いたまま未適用の一覧へ載らない経路を塞ぐ）。
     #[test]
-    fn sup6_task163_4_empty_rlimits_skip_the_rlimit_stage() {
+    fn sup6_sec1_task163_empty_rlimits_are_rejected_before_applying_anything() {
         let _ = take();
         let mut r = restrictions(std::process::id());
         r.rlimits = Rlimits::default();
-        let report = reapply_restrictions(r).expect("ok");
+        let e = reapply_restrictions(r).unwrap_err();
+        assert_eq!(
+            (e.code, e.stage),
+            (ErrorCode::FailedPrecondition, IsolationStage::Rlimits)
+        );
+        assert_eq!(
+            e.message,
+            "the rlimits of the exec target are empty; refusing to exec without rlimits"
+        );
+        assert_eq!(e.violation, None);
+        assert_eq!(take(), Vec::<&str>::new());
+        assert_eq!(
+            require_rlimits(&Rlimits::default()).unwrap_err().stage,
+            IsolationStage::Rlimits
+        );
+        require_rlimits(&one_rlimit()).unwrap();
+    }
+
+    /// SUP-6・SEC-1・REPAIR-3・TASK-163 追補（#1460）: 観測用の経路は rlimit の空集合と capability 削減の省略を
+    /// 許すが、省いた制限を launch の段の順で未適用の一覧へ載せ、`ExecReady` を作らせない（完了を装わない）。
+    #[test]
+    fn sup6_sec1_task163_observation_lists_every_skipped_restriction() {
+        let _ = take();
+        let mut r = restrictions(std::process::id());
+        r.rlimits = Rlimits::default();
+        let report =
+            reapply_inner(r, ReapplyMode::ObservationWithoutCapabilityDrop).expect("observation");
+        assert_eq!(take(), vec!["no_new_privs", "landlock", "seccomp"]);
         assert_eq!(report.rlimits_applied(), 0);
+        assert_eq!(report.supplementary_groups(), None);
+        assert_eq!(
+            report.unapplied(),
+            [
+                UnappliedExecRestriction::Rlimits,
+                UnappliedExecRestriction::CapabilityDrop
+            ]
+        );
+        assert!(!report.is_complete());
+        let e = report.into_complete().unwrap_err();
+        assert_eq!(
+            e.message,
+            "exec restrictions are incomplete; not applied: rlimits, capability_drop"
+        );
+
+        // rlimit を持つ観測は、capability 削減だけが未適用として残る。
+        let report = reapply_inner(
+            restrictions(std::process::id()),
+            ReapplyMode::ObservationWithoutCapabilityDrop,
+        )
+        .expect("observation");
         assert_eq!(
             take(),
-            vec!["capability_drop", "no_new_privs", "landlock", "seccomp"]
+            vec!["rlimits", "no_new_privs", "landlock", "seccomp"]
+        );
+        let _ = crate::exec::rlimits::testing::take_sets();
+        assert_eq!(
+            report.unapplied(),
+            [UnappliedExecRestriction::CapabilityDrop]
         );
     }
 

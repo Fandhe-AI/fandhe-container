@@ -501,6 +501,8 @@ jobs:
       # `harness = false`・`--ignored` 限定のため、緩和済みの AppArmor 設定のもとで実行し、成功行を照合する。
       # 試験専用の入口（`exec::identify_pid1_in`）を使うため `exec-test-support` feature を付ける
       # （付けないビルドは本体を持たず、`--ignored` 実行が非ゼロ終了になる。成功行の照合と合わせて fail-closed）。
+      # 成功行はシナリオごとに照合する: 別の user namespace の対象の拒否・pivot 済みの対象へ参加した後の `/`・
+      # `setgroups` が deny の user namespace での補助グループの扱い（TASK-163 追補・#1457・#1460）。
       - name: exec_setns_join のビルド（Linux のみ。SUP-6・TASK-163.1）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         run: cargo test -p fandhe-container-supervisor --features exec-test-support --test exec_setns_join --no-run
@@ -513,11 +515,19 @@ jobs:
           log="${RUNNER_TEMP}/exec_setns_join.log"
           cargo test -p fandhe-container-supervisor --features exec-test-support \
             --test exec_setns_join -- --ignored 2>&1 | tee "${log}"
-          if ! grep -Fq 'exec_setns_join: namespace join verified' "${log}"; then
-            echo "::error::exec_setns_join did not report a verified join (possibly not executed)" >&2
-            exit 1
-          fi
-          echo "exec_setns_join: namespace join verified" >> "$GITHUB_STEP_SUMMARY"
+          # 最後の成功行だけでなく、各シナリオの成功行をすべて照合する（シナリオが黙って外れた場合を
+          # 成功にしない。TASK-163 追補・#1460）。
+          for line in \
+            'exec_setns_join: target in another user namespace rejected' \
+            'exec_setns_join: root after joining a pivoted target equals the pinned rootfs' \
+            'exec_setns_join: supplementary groups kept and recorded where setgroups is denied' \
+            'exec_setns_join: namespace join verified'; do
+            if ! grep -Fxq "${line}" "${log}"; then
+              echo "::error::exec_setns_join did not report: ${line} (possibly not executed)" >&2
+              exit 1
+            fi
+            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
+          done
 
       # exec（`crates/supervisor/tests/exec.rs`。SUP-6・TASK-163.4・#503）: 稼働中コンテナへの setns・cgroup join・
       # 制限の再適用・execve の通し結合試験。rootful の pivot_root と cgroup v2 の書き込みに root が必要で、

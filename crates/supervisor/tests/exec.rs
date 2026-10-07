@@ -99,9 +99,9 @@ mod linux {
 
     use fandhe_container_core::cgroups::CgroupName;
     use fandhe_container_core::exec::{
-        ChildExit, ContainerEnv, IsolationConfig, MountIsolation, Namespace, NamespaceSet,
-        create_default_devices, isolate_rootful_host_root, pivot_root, plan_rootful_host_root,
-        prepare_rootfs,
+        ChildExit, ContainerEnv, ExecExit, IsolationConfig, MountIsolation, Namespace,
+        NamespaceSet, ViolationReason, create_default_devices, isolate_rootful_host_root,
+        pivot_root, plan_rootful_host_root, prepare_rootfs,
     };
     use fandhe_container_core::oci_runtime::load_config;
     use fandhe_container_core::traits::{
@@ -829,7 +829,7 @@ mod linux {
             out.trim_end(),
             format!(
                 "outcome exit={:?} rlimits=16 caps_dropped={} landlock_rules=3 seccomp_instructions={} groups={}",
-                ChildExit::Signaled(15),
+                ExecExit::Command(ChildExit::Signaled(15)),
                 parse_after(&out, "caps_dropped="),
                 parse_after(&out, "seccomp_instructions="),
                 expected_groups_outcome(),
@@ -924,8 +924,9 @@ mod linux {
     /// 子が `execveat` の前に拒否する（終了コード 126）。ホスト側のランタイムのバイナリ（ここでは試験バイナリ）は
     /// コンテナ内で実行されない。
     ///
-    /// 拒否が Landlock（ルール外のバイナリの実行拒否）ではなくインタープリタの照合によることは、非特権で動く
-    /// core の `tests/exec_child_setup.rs`（Landlock を適用しない）が同じ入力の拒否を照合している。
+    /// 拒否が Landlock（ルール外のバイナリの実行拒否）ではなくインタープリタの照合によることは、結果に付く違反の
+    /// 理由で確かめる（非特権で動く core の `tests/exec_child_setup.rs` も、Landlock を適用しない子で同じ入力の
+    /// 拒否を照合している）。
     fn runtime_interpreter_script_is_rejected(bundle: &Bundle, c: &Container) {
         clean_probe_files(bundle);
         let joiner = spawn_joiner(&[
@@ -938,8 +939,16 @@ mod linux {
         let jpid = joiner.id();
         let (code, out) = finish_joiner(joiner);
         assert_eq!(code, Some(0), "joiner output: {out}");
+        // 拒否の理由がインタープリタの照合（違反 `entrypoint_interpreter_is_runtime_binary`）であること。Landlock が
+        // `execveat` を拒否した場合は違反の理由が付かない（`violation: None`）ため、ここで区別できる（#1460）。
         assert!(
-            out.starts_with(&format!("outcome exit={:?} ", ChildExit::Exited(126))),
+            out.starts_with(&format!(
+                "outcome exit={:?} ",
+                ExecExit::SetupFailed {
+                    exit: ChildExit::Exited(126),
+                    violation: Some(ViolationReason::EntrypointInterpreterIsRuntimeBinary),
+                }
+            )),
             "the exec child must refuse the runtime-interpreted script: {out}"
         );
         assert!(
@@ -982,8 +991,15 @@ mod linux {
             fs::rename(&saved, &null).expect("restore the real /dev/null");
             let (code, out) = result.unwrap_or_else(|| panic!("replace /dev/null with a {kind}"));
             assert_eq!(code, Some(0), "joiner output: {out}; {kind}");
+            // コマンドは起動しておらず（終了コードではなく pipe の報告で区別する。#1460）、違反の理由が届く。
             assert!(
-                out.starts_with(&format!("outcome exit={:?} ", ChildExit::Exited(126))),
+                out.starts_with(&format!(
+                    "outcome exit={:?} ",
+                    ExecExit::SetupFailed {
+                        exit: ChildExit::Exited(126),
+                        violation: Some(ViolationReason::StdioNullNotNullDevice),
+                    }
+                )),
                 "the exec child must refuse the replaced /dev/null ({kind}): {out}"
             );
             assert!(

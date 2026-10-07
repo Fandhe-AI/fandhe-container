@@ -17,6 +17,9 @@
 //!   先がランタイム自身（ここでは試験バイナリ自身）に解決されるスクリプトは、子が `execveat` の前に終了コード 126 で
 //!   拒否し、報告は書かれない。対照として、通常のシェルスクリプト（`#!/bin/sh`）は手順を通る
 //!
+//! - **`execve` 前の失敗の区別（#1460）**: 子が本番と同じ pipe で親へ知らせた内容から、「コマンドは起動して
+//!   いない」（終了コード 125〜127 と違反の理由）と「`execveat` の直前まで到達した」が区別される。子に残る fd が
+//!   その pipe と検査済みのエントリポイントの 2 本だけであること（継承 fd の後始末）も照合する
 //! - **環境変数（#1457）**: `execveat` に渡る環境変数が、コンテナ定義（`config.json` の `process.env`）と明示の
 //!   上書きだけで、試験プロセスの環境を含まない
 //! - **補助グループ（#1457）**: launch・exec が共有する補助グループの消去を、使い捨ての子で実 syscall により通す
@@ -59,8 +62,8 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::exec::{
-        ChildExit, ContainerEnv, ExecChildSetupReport, ExecCommand, SupplementaryGroups,
-        clear_supplementary_groups_for_test, observe_exec_child_setup,
+        ChildExit, ContainerEnv, ExecChildSetupReport, ExecCommand, ExecExit, SupplementaryGroups,
+        ViolationReason, clear_supplementary_groups_for_test, observe_exec_child_setup,
     };
     use fandhe_container_core::oci_runtime::parse_config_bytes;
     use fandhe_container_core::traits::ErrorCode;
@@ -124,7 +127,12 @@ mod linux {
     pub fn observe_ok(entry: &ExecCommand, work: &Path, name: &str) -> ExecChildSetupReport {
         let observation = observe_exec_child_setup(entry, &work.join(name), timeout())
             .expect("observe the exec child setup");
-        assert_eq!(observation.exit, ChildExit::Exited(0), "{name}");
+        // 手順を通った子は、本番と同じ pipe で「`execveat` の直前まで到達した」ことを知らせる（#1460）。
+        assert_eq!(
+            observation.exit,
+            ExecExit::Command(ChildExit::Exited(0)),
+            "{name}"
+        );
         observation.report.expect("the child must write its report")
     }
 
@@ -138,6 +146,8 @@ mod linux {
         session_is_detached_from_the_caller(&work.0, "report");
         child_has_no_controlling_terminal_under_a_pty(&work.0);
         runtime_interpreter_is_rejected_before_exec(&work.0);
+        setup_failures_are_distinguished_from_command_exits(&work.0);
+        inherited_fds_are_closed_except_the_status_pipe(&work.0);
         environment_comes_only_from_the_container_definition(&work.0);
         supplementary_groups_are_cleared_or_refused();
         println!("exec_child_setup: all scenarios passed");
@@ -244,7 +254,15 @@ mod linux {
             let report = work.join(format!("report-{name}"));
             let observation = observe_exec_child_setup(&entry, &report, timeout())
                 .expect("observe the exec child setup");
-            assert_eq!(observation.exit, ChildExit::Exited(126), "{name}");
+            // 終了コード 126 に加えて、「コマンドは起動していない」ことと違反の理由が親へ届く（#1460・SEC-4）。
+            assert_eq!(
+                observation.exit,
+                ExecExit::SetupFailed {
+                    exit: ChildExit::Exited(126),
+                    violation: Some(ViolationReason::EntrypointInterpreterIsRuntimeBinary),
+                },
+                "{name}"
+            );
             assert_eq!(observation.report, None, "{name}");
             assert!(!report.exists(), "{name}: the child must not reach exec");
         }
@@ -254,6 +272,75 @@ mod linux {
         let entry = ExecCommand::new(&script, ["script"], &ContainerEnv::empty()).expect("command");
         let report = observe_ok(&entry, work, "report-sh");
         assert_eq!(report.stdio, [(true, NULL_RDEV); 3]);
+    }
+
+    /// SUP-6・REPAIR-3・TASK-163 追補（#1460）: `execveat` より前の失敗は、終了コード（125〜127。コマンド自身も
+    /// 返し得る）ではなく、子が pipe で知らせた内容で「コマンドは起動していない」と判定される。
+    fn setup_failures_are_distinguished_from_command_exits(work: &Path) {
+        let observe = |command: &ExecCommand, name: &str| {
+            observe_exec_child_setup(command, &work.join(name), timeout())
+                .expect("observe the exec child setup")
+        };
+        let env = ContainerEnv::empty();
+        // 不在のエントリポイント: 終了コード 127。違反ではない。
+        let missing = ExecCommand::new("/no/such/entrypoint", ["x"], &env).expect("command");
+        let observation = observe(&missing, "report-missing");
+        assert_eq!(
+            observation.exit,
+            ExecExit::SetupFailed {
+                exit: ChildExit::Exited(127),
+                violation: None,
+            }
+        );
+        assert!(!observation.exit.command_started());
+        assert_eq!(observation.report, None);
+        // ランタイム自身のバイナリ（ここでは試験バイナリ自身）: 終了コード 126 と違反の理由。
+        let exe = std::env::current_exe().expect("current_exe");
+        let runtime = ExecCommand::new(&exe, ["x"], &env).expect("command");
+        assert_eq!(
+            observe(&runtime, "report-runtime").exit,
+            ExecExit::SetupFailed {
+                exit: ChildExit::Exited(126),
+                violation: Some(ViolationReason::EntrypointIsRuntimeBinary),
+            }
+        );
+        // 対照: 手順を通った子は「起動した」側に分類される。
+        let started = observe(&shell_entry(), "report-started");
+        assert_eq!(started.exit, ExecExit::Command(ChildExit::Exited(0)));
+        assert!(started.exit.command_started());
+    }
+
+    /// SUP-6・SEC-1・TASK-163.4 / 追補（#1460）: 子は呼び出し側から継承した fd 3 以上をすべて閉じ、残るのは
+    /// 状態を返す pipe と検査済みのエントリポイントの 2 本だけ（pipe の番号より小さい fd も大きい fd も閉じる）。
+    fn inherited_fds_are_closed_except_the_status_pipe(work: &Path) {
+        // 継承される fd を、状態を返す pipe の書き込み側より小さい番号と大きい番号の両方に用意する（std の fd は
+        // close-on-exec だが、`execveat` の前の子には見えている。子はこれらを閉じてからエントリポイントを開く）。
+        // 6 本開いてから先頭の 2 本を閉じると、観測用の入口が作る pipe は空いた 2 つの番号（読み取り側が小さい方）を
+        // 取り、残りの 4 本は pipe より大きい番号になる。小さい側は pipe の読み取り側自身が担う。
+        let mut inherited: Vec<fs::File> = (0..6)
+            .map(|_| fs::File::open("/proc/self/status").expect("open"))
+            .collect();
+        inherited.drain(..2);
+        let report = work.join("report-fds");
+        let observation = observe_exec_child_setup(&shell_entry(), &report, timeout())
+            .expect("observe the exec child setup");
+        drop(inherited);
+        let fds = observation.report.expect("report").open_fds;
+        let targets: Vec<&str> = fds.iter().map(|(_, target)| target.as_str()).collect();
+        assert_eq!(targets.len(), 2, "unexpected fds remain: {fds:?}");
+        assert!(
+            targets.iter().any(|t| t.starts_with("pipe:[")),
+            "the status pipe must remain: {fds:?}"
+        );
+        let shell = fs::canonicalize("/bin/sh").expect("canonicalize /bin/sh");
+        assert!(
+            targets.contains(&shell.to_str().expect("utf-8 path")),
+            "the verified entrypoint must remain: {fds:?}"
+        );
+        assert!(
+            !targets.iter().any(|t| t.contains("/status")),
+            "inherited fds must be closed: {fds:?}"
+        );
     }
 
     /// SUP-6・SEC-1・TASK-163 追補（#1457）: `execveat` に渡る環境変数は、コンテナ定義（`config.json` の

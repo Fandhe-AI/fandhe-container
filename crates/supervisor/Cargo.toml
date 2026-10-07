@@ -43,14 +43,23 @@ fandhe-container-core = { path = "../core" }
 # パスを呼び出し側から受け取る）を公開する。既定のビルドには含めず、記録から期待値を導く `identify_pid1` だけを
 # 公開 API にする（SEC-1。crates/io の crash-test-server と同じ仕組み。依存は増えない）。core 側の同名 feature
 # （`Pid1Target::open_with_cgroup_path`）を連動して有効にする。
+# worker 機構を任意の `work` で直接呼ぶ `exec::run_in_worker_for_test`（tests/exec_timeout.rs）も同じ feature の下に
+# 置く（TASK-163 追補・#1460）。リリースビルドで有効にするとコンパイルが止まる（src/lib.rs の `compile_error!`）。
 [features]
 exec-test-support = ["fandhe-container-core/exec-test-support"]
+
+# 自己参照の dev-dependency（core の escape-probe と同じ仕組み。外部クレートの追加ではない）: supervisor 自身の
+# テストでは `exec-test-support` を常に有効にし、試験専用の入口を使う結合試験（exec_timeout・exec_setns_join・exec）が
+# `cargo test --workspace`・`make test-integration` の既定のテスト集合から外れないようにする（TASK-163 追補・#1460）。
+# 通常のビルド（`cargo build`・リリース成果物）は dev-dependency を解決しないため、feature は無効のまま。
+[dev-dependencies]
+fandhe-container-supervisor = { path = ".", features = ["exec-test-support"] }
 
 # 実 pid1 の 5 種 namespace への setns 参加の結合試験（TASK-163.1・#500・SUP-6）。
 # setns(CLONE_NEWNS) は複数スレッドのプロセスから拒否されるため、単一スレッドの独自 main（harness = false）で動かす。
 # `-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。本体は exec-test-support feature を付けたときだけ
-# コンパイルする（required-features にすると `cargo test --workspace --test '*'` が feature なしでエラーになるため、
-# テスト側の cfg で分岐し、feature なしの `--ignored` 実行は非ゼロ終了にする）。
+# コンパイルする（上の自己参照の dev-dependency で常に有効になる。テスト側の cfg は、feature が外れた構成で
+# 検証せずに成功しないための分岐で、feature なしの `--ignored` 実行は非ゼロ終了にする）。
 [[test]]
 name = "exec_setns_join"
 path = "tests/exec_setns_join.rs"
@@ -67,7 +76,8 @@ harness = false
 
 # exec の全体上限時間（worker プロセス隔離）の結合試験（REPAIR-5・TASK-163.4・#503・SUP-6）。fork は単一スレッドの
 # 呼び出し元を要求するため、単一スレッドの独自 main（harness = false）で動かす。root・実コンテナは不要で、
-# 既定のテスト集合で実行する。
+# 既定のテスト集合で実行する（試験専用の入口 `run_in_worker_for_test` は exec-test-support の下にあり、上の
+# 自己参照の dev-dependency で有効になる。TASK-163 追補・#1460）。
 [[test]]
 name = "exec_timeout"
 path = "tests/exec_timeout.rs"

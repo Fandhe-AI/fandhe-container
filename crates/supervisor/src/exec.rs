@@ -19,7 +19,11 @@
 //!   「記録したコンテナのプロセスであること」を照合できる（スキーマ変更なし）。この照合が依存する前提
 //!   （コンテナから cgroupfs に書けないこと）と見直しの条件は core の `exec/setns.rs` のモジュール doc を参照
 //! - 既定のビルドの公開 API に、期待 cgroup パスを文字列で受ける入口は無い（core・supervisor とも
-//!   `exec-test-support` feature を付けたビルドに限る）
+//!   `exec-test-support` feature を付けたビルドに限る）。worker 機構を任意の処理で直接呼ぶ試験専用の入口
+//!   （`run_in_worker_for_test`）と core の観測用の入口も同じ feature の下に置き、**リリースビルドでこの feature が
+//!   有効だとコンパイルが止まる**（`src/lib.rs` の `compile_error!`。期待 cgroup パスを呼び出し側から渡せると
+//!   SEC-1 の同一性照合を迂回できるため。TASK-163 追補・#1460）。supervisor 自身のテストでは dev-dependency の
+//!   自己参照で有効になり、試験専用の入口を使う結合試験は既定のテスト集合に残る
 //! - [`enter_namespaces`] は呼び出しスレッドの namespace を不可逆に変える。単一スレッドのプロセスから
 //!   のみ呼べる。logs 捕捉スレッドを持つ supervisor 本体からは呼ばず、exec 専用プロセスから呼ぶ（[`run_command`]。#503）
 //! - 順序: [`prepare_cgroup_join`]（cgroup.procs の fd 確保。#501）は [`enter_namespaces`] の **前**、
@@ -55,6 +59,15 @@
 //!   capability 削減が `setgroups(0)` を呼ぶ。exec を起動したプロセスのホスト側の補助グループを持ち越さない）。
 //!   `setgroups` が `deny` の user namespace（rootless）では消去できないため残し、[`ExecOutcome`] の
 //!   `supplementary_groups` に記録する。uid / gid は変更しない（launch も同じ）
+//! - **`execve` 前の失敗とコマンドの終了を区別する**（REPAIR-3・TASK-163 追補・#1460）: [`ExecOutcome`] の `exit` は
+//!   core の `ExecExit` で、`Command`（コマンドが起動して終了した）と `SetupFailed`（コマンドは起動していない。
+//!   子が `execve` より前の手順か `execve` 自体で失敗した）を分ける。子の終了コード 125 / 126 / 127 は実行された
+//!   コマンド自身も返し得るため、終了コードでは判定しない。子が close-on-exec の pipe で親へ知らせた内容で
+//!   判定する（core の `exec/exec_command.rs`）。分離違反による拒否（ランタイム自身のバイナリ・インタープリタ経由・
+//!   `/dev/null` の差し替え）は理由コードを持ち、呼び出し側が違反として記録できる（SEC-4。監査ログへの保存の
+//!   配線は下記「未実装」）
+//! - **rlimit の空集合は拒否する**（TASK-163 追補・#1460）: 対象の実効 rlimit を 1 つも得られなかった場合、core は
+//!   適用を省かず `FailedPrecondition` で拒否する（rlimit を載せないまま exec へ進む経路を作らない）
 //! - **コンテナから見える窓を閉じる**: exec の子は fork した時点でコンテナの PID namespace に入り、
 //!   `close_range` までの間コンテナの procfs から見える。worker は開始時に自分を non-dumpable にし（core の
 //!   `spawn_exec_worker`）、core の `spawn_exec_command` は non-dumpable でないプロセスからの fork を拒否する。
@@ -123,8 +136,8 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::exec::{
     ChildExit, ContainerEnv, ExecCgroupJoin, ExecCgroupJoinReport, ExecCommand, ExecError,
-    ExecReady, ExecRestrictionReport, ExecRestrictions, NamespaceJoinReport, Pid1Target,
-    SupplementaryGroups, join_cgroup as core_join_cgroup, join_namespaces,
+    ExecExit, ExecReady, ExecRestrictionReport, ExecRestrictions, NamespaceJoinReport, Pid1Target,
+    SupplementaryGroups, ViolationReason, join_cgroup as core_join_cgroup, join_namespaces,
     prepare_cgroup_join as core_prepare_cgroup_join,
     prepare_exec_restrictions as core_prepare_exec_restrictions,
     reapply_restrictions as core_reapply_restrictions, spawn_exec_command, spawn_exec_worker,
@@ -333,9 +346,12 @@ pub fn require_exec_ready(report: ExecRestrictionReport) -> Result<ExecReady, Tr
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ExecOutcome {
-    /// コマンドの終了状態（子が `execve` 前に失敗した場合は 125 / 126 / 127 の `Exited`。core の
-    /// `exec/exec_command.rs` を参照）。
-    pub exit: ChildExit,
+    /// コマンドの結果。`Command` はコマンドが起動して終了した状態、`SetupFailed` はコマンドが起動して
+    /// いない（子が `execve` より前の手順か `execve` 自体で失敗した。終了コードは 125 / 126 / 127）ことを表す
+    /// （TASK-163 追補・#1460）。終了コード 125〜127 はコマンド自身も返し得るため、終了コードではなくこの区別で
+    /// 判定すること（healthcheck は `Command` の非 0 を不健全、`SetupFailed` を実行基盤側の失敗として扱える）。
+    /// 分離違反による拒否（ランタイム自身のバイナリ・インタープリタ経由・`/dev/null` の差し替え）は理由を持つ。
+    pub exit: ExecExit,
     /// 適用した rlimit の種別数（対象 pid1 の実効値。通常は 16）。
     pub rlimits_applied: usize,
     /// bounding set から落とした capability の数。
@@ -506,6 +522,10 @@ fn run_in_worker_with(
 
 /// 実機結合試験・タイムアウト試験専用の入口: `work` を [`run_command`] と同じ worker 機構で実行する。
 /// 各段が固まった場合を模した `work` で、期限内に `Timeout` が返ることを確かめるために使う（REPAIR-5・REPAIR-12）。
+///
+/// `exec-test-support` feature を付けたビルドにだけ存在し、既定のビルド（リリース成果物を含む）の公開 API には
+/// 含まれない（TASK-163 追補・#1460。supervisor 自身のテストでは dev-dependency の自己参照で有効になる）。
+#[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
 pub fn run_in_worker_for_test(
     timeout: Duration,
@@ -515,12 +535,20 @@ pub fn run_in_worker_for_test(
     run_in_worker_with(Deadline::after(timeout), grace, work)
 }
 
-/// worker の結果を pipe 用の 1 行へ符号化する。成功は `ok <exited|signaled> <値> <rlimit 数> <capability 数>
-/// <Landlock 数> <seccomp 命令数> <補助グループの扱い> <その件数>`、失敗は `err <ERR-1 コード> <メッセージ>`（改行は空白へ置換）。
+/// worker の結果を pipe 用の 1 行へ符号化する。成功は `ok <command|setup> <違反の理由コードまたは -> <exited|signaled>
+/// <値> <rlimit 数> <capability 数> <Landlock 数> <seccomp 命令数> <補助グループの扱い> <その件数>`、失敗は
+/// `err <ERR-1 コード> <メッセージ>`（改行は空白へ置換）。
 fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
     let line = match result {
         Ok(o) => {
-            let (kind, value) = match o.exit {
+            let (started, violation) = match o.exit {
+                ExecExit::Command(_) => ("command", "-"),
+                ExecExit::SetupFailed { violation, .. } => {
+                    ("setup", violation.map_or("-", ViolationReason::as_str))
+                }
+                _ => ("unknown", "-"),
+            };
+            let (kind, value) = match o.exit.child_exit() {
                 ChildExit::Exited(n) => ("exited", n),
                 ChildExit::Signaled(n) => ("signaled", n),
                 _ => ("unknown", 0),
@@ -530,7 +558,7 @@ fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
                 other => other.remaining(),
             };
             format!(
-                "ok {kind} {value} {} {} {} {} {} {groups}\n",
+                "ok {started} {violation} {kind} {value} {} {} {} {} {} {groups}\n",
                 o.rlimits_applied,
                 o.capability_bounding_dropped,
                 o.landlock_rules,
@@ -556,6 +584,13 @@ fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
     }
     line.into_bytes()
 }
+
+/// worker が返し得る違反の理由（`execve` 前の手順が返すもの。[`decode_worker_result`] が名前から引き直す）。
+const SETUP_VIOLATIONS: [ViolationReason; 3] = [
+    ViolationReason::EntrypointIsRuntimeBinary,
+    ViolationReason::EntrypointInterpreterIsRuntimeBinary,
+    ViolationReason::StdioNullNotNullDevice,
+];
 
 /// [`encode_worker_result`] の逆変換。形式に合わない入力（空・切れた行・未知の種別）は `Internal`（fail-closed）。
 fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, TraitError> {
@@ -587,14 +622,32 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, TraitError> {
     }
     let rest = text.strip_prefix("ok ").ok_or_else(malformed)?;
     let mut it = rest.split(' ');
+    let started = it.next().ok_or_else(malformed)?;
+    let violation = match it.next().ok_or_else(malformed)? {
+        "-" => None,
+        name => Some(
+            SETUP_VIOLATIONS
+                .into_iter()
+                .find(|reason| reason.as_str() == name)
+                .ok_or_else(malformed)?,
+        ),
+    };
     let kind = it.next().ok_or_else(malformed)?;
     let value: i32 = it
         .next()
         .and_then(|v| v.parse().ok())
         .ok_or_else(malformed)?;
-    let exit = match kind {
+    let child = match kind {
         "exited" => ChildExit::Exited(value),
         "signaled" => ChildExit::Signaled(value),
+        _ => return Err(malformed()),
+    };
+    let exit = match (started, violation) {
+        ("command", None) => ExecExit::Command(child),
+        ("setup", violation) => ExecExit::SetupFailed {
+            exit: child,
+            violation,
+        },
         _ => return Err(malformed()),
     };
     let mut count = || -> Result<usize, TraitError> {
@@ -679,11 +732,11 @@ fn run_with_target(
 /// 起動後の子に対する期限内の待機。期限が既に切れていれば待たずに直ちに `kill` で停止・回収してから `Timeout`
 /// を返す（`?` で早期 return して子を残さない。REPAIR-5・SUP-6・TASK-163.4）。`wait` は残り時間で待ち、
 /// `kill` は回収待ちの上限を受けて SIGKILL と回収を行う。
-fn wait_or_stop(
+fn wait_or_stop<T>(
     deadline: &Deadline,
-    wait: impl FnOnce(Duration) -> Result<ChildExit, TraitError>,
+    wait: impl FnOnce(Duration) -> Result<T, TraitError>,
     stop: impl FnOnce(Duration) -> Result<ChildExit, TraitError>,
-) -> Result<ChildExit, TraitError> {
+) -> Result<T, TraitError> {
     /// 期限切れ後の SIGKILL 回収待ちの上限。
     const REAP_TIMEOUT: Duration = Duration::from_secs(5);
     match deadline.remaining("waiting for the command") {
@@ -949,7 +1002,7 @@ mod tests {
     fn sup6_task163_4_expired_deadline_kills_child_without_waiting() {
         use std::cell::Cell;
         let killed = Cell::new(false);
-        let err = wait_or_stop(
+        let err = wait_or_stop::<ChildExit>(
             &Deadline::after(Duration::ZERO),
             |_| panic!("must not wait when the deadline has expired"),
             |_| {
@@ -983,7 +1036,7 @@ mod tests {
     fn sup6_task163_4_wait_error_still_kills_and_reaps_child() {
         use std::cell::Cell;
         let killed = Cell::new(false);
-        let err = wait_or_stop(
+        let err = wait_or_stop::<ChildExit>(
             &Deadline::after(Duration::from_secs(60)),
             |_| Err(TraitError::new(ErrorCode::Internal, "waitpid failed")),
             |_| {
@@ -996,7 +1049,7 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::Internal);
         assert_eq!(err.message(), "waitpid failed");
 
-        let err = wait_or_stop(
+        let err = wait_or_stop::<ChildExit>(
             &Deadline::after(Duration::from_secs(60)),
             |_| Err(TraitError::new(ErrorCode::Internal, "waitpid failed")),
             |_| Err(TraitError::new(ErrorCode::Timeout, "not reaped")),
@@ -1013,7 +1066,7 @@ mod tests {
     #[test]
     fn sup6_task163_4_worker_result_round_trips() {
         let outcome = ExecOutcome {
-            exit: ChildExit::Signaled(15),
+            exit: ExecExit::Command(ChildExit::Signaled(15)),
             rlimits_applied: 16,
             capability_bounding_dropped: 23,
             landlock_rules: 3,
@@ -1021,7 +1074,7 @@ mod tests {
             supplementary_groups: SupplementaryGroups::Cleared { cleared: 4 },
         };
         let line = encode_worker_result(&Ok(outcome));
-        assert_eq!(line, b"ok signaled 15 16 23 3 120 cleared 4\n");
+        assert_eq!(line, b"ok command - signaled 15 16 23 3 120 cleared 4\n");
         assert_eq!(decode_worker_result(&line).unwrap(), outcome);
         // 補助グループの扱いは 3 通りとも往復する（TASK-163 追補・#1457）。
         for (groups, text) in [
@@ -1038,10 +1091,69 @@ mod tests {
             let line = encode_worker_result(&Ok(outcome));
             assert_eq!(
                 String::from_utf8(line.clone()).unwrap(),
-                format!("ok signaled 15 16 23 3 120 {text}\n")
+                format!("ok command - signaled 15 16 23 3 120 {text}\n")
             );
             assert_eq!(decode_worker_result(&line).unwrap(), outcome);
         }
+
+        // TASK-163 追補（#1460）: `execve` 前の失敗（コマンドは起動していない）は、終了コードが同じでも
+        // コマンドの終了と別の値として往復する。違反の理由コードも運ぶ。
+        for (exit, text) in [
+            (
+                ExecExit::Command(ChildExit::Exited(126)),
+                "command - exited 126",
+            ),
+            (
+                ExecExit::SetupFailed {
+                    exit: ChildExit::Exited(126),
+                    violation: None,
+                },
+                "setup - exited 126",
+            ),
+            (
+                ExecExit::SetupFailed {
+                    exit: ChildExit::Exited(126),
+                    violation: Some(ViolationReason::EntrypointInterpreterIsRuntimeBinary),
+                },
+                "setup entrypoint_interpreter_is_runtime_binary exited 126",
+            ),
+            (
+                ExecExit::SetupFailed {
+                    exit: ChildExit::Exited(126),
+                    violation: Some(ViolationReason::StdioNullNotNullDevice),
+                },
+                "setup stdio_null_not_null_device exited 126",
+            ),
+            (
+                ExecExit::SetupFailed {
+                    exit: ChildExit::Exited(126),
+                    violation: Some(ViolationReason::EntrypointIsRuntimeBinary),
+                },
+                "setup entrypoint_is_runtime_binary exited 126",
+            ),
+            (
+                ExecExit::SetupFailed {
+                    exit: ChildExit::Signaled(9),
+                    violation: None,
+                },
+                "setup - signaled 9",
+            ),
+        ] {
+            let outcome = ExecOutcome { exit, ..outcome };
+            let line = encode_worker_result(&Ok(outcome));
+            assert_eq!(
+                String::from_utf8(line.clone()).unwrap(),
+                format!("ok {text} 16 23 3 120 cleared 4\n")
+            );
+            assert_eq!(decode_worker_result(&line).unwrap(), outcome);
+        }
+        assert_ne!(
+            ExecExit::Command(ChildExit::Exited(126)),
+            ExecExit::SetupFailed {
+                exit: ChildExit::Exited(126),
+                violation: None
+            }
+        );
 
         let err = TraitError::new(ErrorCode::Timeout, "exec timed out\nbefore x");
         let line = encode_worker_result(&Err(err));
@@ -1052,14 +1164,19 @@ mod tests {
 
         for bad in [
             &b""[..],
-            b"ok exited 0 1 2 3 4 cleared 1",
-            b"ok exited 0 1 2 3\n",
-            b"ok exited 0 1 2 3 4\n",
-            b"ok exited 0 1 2 3 4 cleared\n",
-            b"ok exited 0 1 2 3 4 unknown 1\n",
-            b"ok exited 0 1 2 3 4 already_empty 2\n",
-            b"ok exited 0 1 2 3 4 cleared 1 extra\n",
-            b"ok weird 0 1 2 3 4 cleared 1\n",
+            b"ok command - exited 0 1 2 3 4 cleared 1",
+            b"ok command - exited 0 1 2 3\n",
+            b"ok command - exited 0 1 2 3 4\n",
+            b"ok command - exited 0 1 2 3 4 cleared\n",
+            b"ok command - exited 0 1 2 3 4 unknown 1\n",
+            b"ok command - exited 0 1 2 3 4 already_empty 2\n",
+            b"ok command - exited 0 1 2 3 4 cleared 1 extra\n",
+            b"ok command - weird 0 1 2 3 4 cleared 1\n",
+            // 旧形式（起動の別が無い）・未知の起動の別・コマンドの終了に違反が付く・子が返さない理由コード。
+            b"ok exited 0 1 2 3 4 cleared 1\n",
+            b"ok started - exited 0 1 2 3 4 cleared 1\n",
+            b"ok command entrypoint_is_runtime_binary exited 0 1 2 3 4 cleared 1\n",
+            b"ok setup rootfs_is_host_root exited 126 1 2 3 4 cleared 1\n",
             b"hello\n",
         ] {
             let e = decode_worker_result(bad).unwrap_err();

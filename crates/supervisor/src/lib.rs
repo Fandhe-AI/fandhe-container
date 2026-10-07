@@ -41,6 +41,15 @@
 //! supervisor から `fandhe-container-core` への一方向依存は導入済み（TASK-157.3・#237）。
 //! `StateStore` は core の既定実装を使い、2 つ目の実装は持たない（決定 6）。
 
+// `exec-test-support` は試験専用の入口（期待 cgroup パスを呼び出し側から受け取る対象特定・`execveat` を伴わない
+// 観測・worker 機構の直接呼び出し）を公開する feature で、リリースビルドで有効にすると SEC-1 の同一性照合を
+// 迂回できる。最適化ビルド（`debug_assertions` が無効）で有効になっていたらコンパイルを止める
+// （SUP-6・SEC-1・REPAIR-3・TASK-163 追補・#1460。テスト・clippy は dev プロファイルのため影響しない）。
+#[cfg(all(feature = "exec-test-support", not(debug_assertions)))]
+compile_error!(
+    "the `exec-test-support` feature exposes test-only exec entry points and must not be enabled in release builds"
+);
+
 pub mod container_options;
 #[cfg(target_os = "linux")]
 pub mod exec;

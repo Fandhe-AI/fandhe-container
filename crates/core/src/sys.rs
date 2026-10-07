@@ -34,6 +34,9 @@
 //! 稼働中コンテナへの exec（`exec/exec_command.rs`。SUP-6・TASK-163.4・#503）は、exec 専用 worker を
 //! non-dumpable にし、子を親の生存に結び付けるために `prctl(2)`（`PR_SET_DUMPABLE` / `PR_GET_DUMPABLE` /
 //! `PR_SET_PDEATHSIG`）を呼ぶ。
+//! exec 入口の前提（TASK-163 追補・#1456〜#1460）は、exec 直前の子でセッションを切り離す `setsid(2)`、補助グループを
+//! 空にする `getgroups(2)` / `setgroups(2)`、`/dev/null` とインタープリタを検証済みの `O_PATH` fd から開き直す
+//! `openat(2)`（`O_NOCTTY`）、状態を返す pipe だけを残して fd を閉じる `close_range(2)` を呼ぶ。
 //! さらに `crate::audit_log` のカーネル監査フォールバック（SEC-4・TASK-41.5.2・#840）が、
 //! `socket(2)`（NETLINK_AUDIT）・`sendto(2)`・`recvfrom(2)`・`poll(2)` を呼ぶ。
 //! std だけでは提供されない syscall のみを持ち、検証（hostname の文字種・パス形式等）は呼び出し側の型
@@ -1348,27 +1351,33 @@ pub(crate) fn exec_fd(fd: BorrowedFd<'_>, argv: &[CString], envp: &[CString]) ->
     last_error()
 }
 
+/// `close_range(first, last, flags)` を呼ぶ（Linux 5.11 以降。glibc 2.34 未満にラッパーが無いため `syscall(2)` 経由）。
+/// 未対応カーネルは `ENOSYS`/`EINVAL` を返す（呼び出し側が fail-closed にする）。
+fn close_range_raw(first: u32, last: u32, flags: i64) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数のみでポインタを取らない（unsigned int 引数は register 幅に拡張して渡され、カーネルは
+    // 下位 32 bit を読む）。`flags` は 0（閉じる）か `CLOSE_RANGE_CLOEXEC`（閉じずに close-on-exec を立てる）で、
+    // 対象は `first`〜`last` の fd だけ。閉じる場合、呼び出し側（exec 直前の子）はそれらの fd をこの後使わない前提。
+    let rc = unsafe {
+        syscall(
+            consts::SYS_CLOSE_RANGE,
+            i64::from(first),
+            i64::from(last),
+            flags,
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
 /// fd `first` 以上のすべてを close-on-exec にする（`close_range(first, ~0, CLOSE_RANGE_CLOEXEC)`。
 /// Linux 5.11 以降）。exec 後のコンテナへホスト側の fd を漏らさない（CVE-2024-21626 型）。
 /// 未対応カーネルは `ENOSYS`/`EINVAL` を返す（呼び出し側が fail-closed にする）。
 // テストビルドでは dry-run 差し込み点が本関数を呼ばないため dead_code を許可する。
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn mark_fds_cloexec_from(first: u32) -> Result<(), SysError> {
-    if !consts::SUPPORTED {
-        return Err(SysError::Unsupported);
-    }
-    // SAFETY: 引数は整数のみでポインタを取らない（`close_range` は glibc 2.34 未満に無いため
-    // `syscall(2)` 経由。unsigned int 引数は register 幅に拡張して渡され、カーネルは下位 32 bit を
-    // 読む）。CLOEXEC 指定のため fd は閉じず、exec までの間は引き続き使える。
-    let rc = unsafe {
-        syscall(
-            consts::SYS_CLOSE_RANGE,
-            i64::from(first),
-            i64::from(u32::MAX),
-            consts::CLOSE_RANGE_CLOEXEC,
-        )
-    };
-    if rc == -1 { Err(last_error()) } else { Ok(()) }
+    close_range_raw(first, u32::MAX, consts::CLOSE_RANGE_CLOEXEC)
 }
 
 /// fd `first` 以上のすべてを閉じる（`close_range(first, ~0, 0)`。Linux 5.11 以降）。
@@ -1377,21 +1386,29 @@ pub(crate) fn mark_fds_cloexec_from(first: u32) -> Result<(), SysError> {
 /// 未対応カーネルは `ENOSYS`/`EINVAL` を返す（呼び出し側が fail-closed にする）。
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn close_fds_from(first: u32) -> Result<(), SysError> {
-    if !consts::SUPPORTED {
-        return Err(SysError::Unsupported);
-    }
-    // SAFETY: 引数は整数のみでポインタを取らない（`syscall(2)` 経由。unsigned int 引数は register
-    // 幅に拡張して渡され、カーネルは下位 32 bit を読む）。閉じる対象は `first` 以上の fd だけで、
-    // 呼び出し側（exec 直前の子）はそれらの fd をこの後使わない前提。
-    let rc = unsafe {
-        syscall(
-            consts::SYS_CLOSE_RANGE,
-            i64::from(first),
-            i64::from(u32::MAX),
-            0i64,
-        )
+    close_range_raw(first, u32::MAX, 0)
+}
+
+/// fd `first` 以上のうち、`keep` の 1 本だけを残してすべて閉じる（TASK-163 追補・#1460）。
+///
+/// 稼働中コンテナへの exec の子が、`execve` 前の失敗を親へ知らせる pipe の書き込み側（close-on-exec）だけを
+/// 残すために使う。`keep` の番号を動かさず、その前後の範囲を 2 回の `close_range` で閉じる（`dup2` で番号を
+/// 付け替えると、同じ番号を指す別の所有者と衝突し得るため）。`keep` が `first` 未満なら [`close_fds_from`] と同じ。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn close_fds_from_except(first: u32, keep: BorrowedFd<'_>) -> Result<(), SysError> {
+    let Ok(keep) = u32::try_from(keep.as_raw_fd()) else {
+        return Err(SysError::Os(EBADF));
     };
-    if rc == -1 { Err(last_error()) } else { Ok(()) }
+    if keep < first {
+        return close_range_raw(first, u32::MAX, 0);
+    }
+    if keep > first {
+        close_range_raw(first, keep - 1, 0)?;
+    }
+    match keep.checked_add(1) {
+        Some(next) => close_range_raw(next, u32::MAX, 0),
+        None => Ok(()),
+    }
 }
 
 /// [`open_path_nofollow`] が渡す `openat(2)` のフラグ（`O_PATH|O_NOFOLLOW|O_CLOEXEC`）。

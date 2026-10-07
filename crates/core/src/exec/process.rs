@@ -343,23 +343,34 @@ fn exec_entrypoint_verified(
 /// （`exec_command::spawn_exec_command` の子。参加後の `/` の照合は `reapply_restrictions` が済ませている。
 /// SUP-6・TASK-163.4）が共有する。呼び出し元は「`/` が正しい root であること」を事前に保証すること。
 pub(super) fn exec_checked_entrypoint(entry: &Entrypoint) -> Result<Infallible, ExecError> {
-    let file = prepare_exec_child(entry)?;
-    let err = do_execve(entry, &file);
-    Err(ExecError::new(
+    let file = prepare_exec_child(entry, None)?;
+    Err(execve_checked(entry, &file))
+}
+
+/// 検査済みの fd を `execveat` する。成功すると戻らず、戻ったら失敗（errno を `Exec` 段のエラーへ写す）。
+fn execve_checked(entry: &Entrypoint, file: &std::fs::File) -> ExecError {
+    let err = do_execve(entry, file);
+    ExecError::new(
         exec_errno_to_code(err),
         IsolationStage::Exec,
         format!("execve({:?}) failed: {}", entry.path(), describe(err)),
-    ))
+    )
 }
 
 /// [`exec_checked_entrypoint`] の `execveat` より前の全手順。戻り値は検査済みで実行に使う fd。
 ///
 /// 手順を 1 か所に置くことで、本番の子（直後に `execveat`）と、結合試験用の観測
 /// （`observe_exec_child_setup`。`execveat` の代わりに子自身の状態を報告する）が同じ処理を通る。
-fn prepare_exec_child(entry: &Entrypoint) -> Result<std::fs::File, ExecError> {
+///
+/// `keep` は、fd の後始末で 1 本だけ残す fd（稼働中コンテナへの exec の子が、`execve` 前の失敗を親へ知らせる
+/// pipe の書き込み側。close-on-exec で、`execveat` が成功すれば閉じる。#1460）。launch 経路は `None`。
+fn prepare_exec_child(
+    entry: &Entrypoint,
+    keep: Option<BorrowedFd<'_>>,
+) -> Result<std::fs::File, ExecError> {
     const STAGE: IsolationStage = IsolationStage::Exec;
     // 継承したホスト側の fd 3 以上を開く前に閉じる（rootfs 内の /proc/self/fd/N 経由で実体を開かれない）。
-    close_inherited_fds()?;
+    close_inherited_fds(keep)?;
     // 呼び出し側のセッション・制御端末を切り離す（以後に開くファイルを制御端末にしない順序。#1456）。
     detach_session()?;
     // 呼び出し元が照合を済ませた `/`（launch は pivot 直後のマウント ID、exec は固定した rootfs との一致。exec の
@@ -460,10 +471,14 @@ fn verify_script_fd_path(
     }
 }
 
-/// fd 3 以上をすべて閉じる。本番ビルドの実装。
+/// fd 3 以上をすべて閉じる（`keep` があればその 1 本だけ残す）。本番ビルドの実装。
 #[cfg(not(test))]
-fn close_inherited_fds() -> Result<(), ExecError> {
-    sys::close_fds_from(3).map_err(|e| {
+fn close_inherited_fds(keep: Option<BorrowedFd<'_>>) -> Result<(), ExecError> {
+    let closed = match keep {
+        Some(keep) => sys::close_fds_from_except(3, keep),
+        None => sys::close_fds_from(3),
+    };
+    closed.map_err(|e| {
         let mut err = ExecError::from_sys(e, IsolationStage::Exec, "close_range(close)");
         // Linux 5.11 未満は close_range が無い（ENOSYS）。継承 fd を残したまま進めない（fail-closed）。
         if e == SysError::Os(sys::ENOSYS) {
@@ -475,7 +490,7 @@ fn close_inherited_fds() -> Result<(), ExecError> {
 
 /// テストビルドの dry-run 差し込み点。呼ばれたことだけを記録する。
 #[cfg(test)]
-fn close_inherited_fds() -> Result<(), ExecError> {
+fn close_inherited_fds(_keep: Option<BorrowedFd<'_>>) -> Result<(), ExecError> {
     tests::record("close_range(3,close)".to_string());
     Ok(())
 }
@@ -777,16 +792,155 @@ fn do_execve(entry: &Entrypoint, _file: &std::fs::File) -> SysError {
     SysError::Os(sys::EINTR)
 }
 
-/// 稼働中コンテナへの exec の子のメイン（SUP-6・TASK-163.4）。`exec_checked_entrypoint` を通し、失敗したら
-/// stderr に英語 1 行を出して終了コードを返す（`child_main` と同じ規約。戻り値は `_exit` に渡される）。
-pub(super) fn exec_child_main(entry: &Entrypoint) -> i32 {
-    match exec_checked_entrypoint(entry) {
-        Ok(never) => match never {},
-        Err(err) => {
-            let _ = writeln!(std::io::stderr(), "fandhe-container: {err}");
-            exit_code_for(&err)
+/// 稼働中コンテナへの exec の結果（SUP-6・REPAIR-3・TASK-163 追補・#1460）。
+///
+/// `execve` より前に子が失敗した場合の終了コード（125 / 126 / 127）は、実行されたコマンド自身も返し得る値で、
+/// 終了コードだけでは「コマンドが失敗した」のか「コマンドは起動していない」のかを区別できない（healthcheck の
+/// 判定は前者を不健全、後者を実行基盤側の失敗として扱う必要がある）。子が親へ pipe で知らせた内容で区別する
+/// （`exec/process.rs` の `ExecStatusPipe`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExecExit {
+    /// コマンドが起動し（`execveat` が成功し）、この状態で終了した。
+    Command(ChildExit),
+    /// コマンドは起動していない。子が `execveat` より前の手順か `execveat` 自体で失敗した。
+    SetupFailed {
+        /// 子の終了状態（通常は `Exited(125 | 126 | 127)`。手順の途中でシグナルを受けた場合は `Signaled`）。
+        exit: ChildExit,
+        /// 分離違反による拒否だった場合の理由（SEC-4。ランタイム自身のバイナリ・インタープリタ経由・
+        /// `/dev/null` の差し替え）。違反でない失敗・理由を受け取れなかった場合は `None`。
+        violation: Option<ViolationReason>,
+    },
+}
+
+impl ExecExit {
+    /// 子プロセスの終了状態（コマンドが起動したかどうかによらない）。
+    pub fn child_exit(self) -> ChildExit {
+        match self {
+            Self::Command(exit) | Self::SetupFailed { exit, .. } => exit,
         }
     }
+
+    /// コマンドが起動したか（`execveat` が成功したか）。
+    pub fn command_started(self) -> bool {
+        matches!(self, Self::Command(_))
+    }
+}
+
+/// 子が「手順を終えて `execveat` を呼ぶ直前」に書く 1 行（[`read_exec_status`] のプロトコル）。
+const EXEC_STATUS_READY: &[u8] = b"R\n";
+
+/// 子が親へ返す状態の読み取り上限（バイト。1 行 2 件ぶんより十分大きい）。
+const EXEC_STATUS_MAX: usize = 256;
+
+/// 子が違反として報告し得る理由（`execveat` 前の手順が返す違反。[`read_exec_status`] が名前から引き直す）。
+const EXEC_CHILD_VIOLATIONS: [ViolationReason; 3] = [
+    ViolationReason::EntrypointIsRuntimeBinary,
+    ViolationReason::EntrypointInterpreterIsRuntimeBinary,
+    ViolationReason::StdioNullNotNullDevice,
+];
+
+/// 稼働中コンテナへの exec の子の本体（SUP-6・TASK-163.4。launch の `child_main` と同じ規約: 失敗したら stderr に
+/// 英語 1 行を出して終了コードを返す。戻り値は `_exit` に渡される）。
+///
+/// `status` は親が fork の前に作った pipe の書き込み側（close-on-exec）で、次のプロトコルで使う（#1460）。
+///
+/// 1. `execveat` より前の全手順（`prepare_exec_child`）が通ったら [`EXEC_STATUS_READY`] を書く
+/// 2. `terminal`（本番は `execveat`）を呼ぶ。`execveat` が成功すれば pipe は close-on-exec で閉じ、親は
+///    「`R` の 1 行だけ」を読む = コマンドは起動した
+/// 3. 手順か `terminal` が失敗したら `<終了コード> <違反の理由コードまたは ->` の 1 行を書く
+///
+/// 親（[`read_exec_status`]）は、`R` だけなら起動、失敗の行があれば未起動、何も無ければ「手順の途中で子が
+/// 終了した」= 未起動と判定する。`R` を書けなければ `execveat` へ進まない（親へ知らせられない状態で実行しない）。
+fn run_exec_child(
+    entry: &Entrypoint,
+    status: BorrowedFd<'_>,
+    terminal: impl FnOnce(&Entrypoint, &std::fs::File) -> Result<i32, ExecError>,
+) -> i32 {
+    let result = prepare_exec_child(entry, Some(status)).and_then(|file| {
+        write_exec_status(status, EXEC_STATUS_READY)?;
+        terminal(entry, &file)
+    });
+    match result {
+        Ok(code) => code,
+        Err(err) => {
+            let code = exit_code_for(&err);
+            let _ = writeln!(std::io::stderr(), "fandhe-container: {err}");
+            let reason = err.violation.as_ref().map_or("-", |v| v.reason.as_str());
+            let _ = write_exec_status(status, format!("{code} {reason}\n").as_bytes());
+            code
+        }
+    }
+}
+
+/// `status`（pipe の書き込み側）へ `line` を書く。失敗は `Internal`（段 `Exec`）。
+fn write_exec_status(status: BorrowedFd<'_>, line: &[u8]) -> Result<(), ExecError> {
+    // 借用した fd を複製して書く（複製は同じ pipe を指し、ここで閉じても元の fd は残る）。
+    status
+        .try_clone_to_owned()
+        .and_then(|owned| std::fs::File::from(owned).write_all(line))
+        .map_err(|e| ExecError::from_io(&e, IsolationStage::Exec, "report the exec status"))
+}
+
+/// 稼働中コンテナへの exec の子のメイン（[`run_exec_child`] の終端を `execveat` にしたもの）。
+pub(super) fn exec_child_main(entry: &Entrypoint, status: BorrowedFd<'_>) -> i32 {
+    run_exec_child(entry, status, |entry, file| {
+        Err(execve_checked(entry, file))
+    })
+}
+
+/// 終了した子が pipe（`status` = 読み取り側）へ残した状態から、コマンドが起動したかどうかを判定する
+/// （[`run_exec_child`] のプロトコル。#1460）。子が終了した **後** に呼ぶこと。
+///
+/// 書き込み側を持つのは子だけ（親は fork の直後に閉じ、実行されたコマンドには close-on-exec で渡らない）なので、
+/// 子の終了後は読み取りが待たされない。それでも書き込み側が開いたままなら（想定外）、待たずに `Internal` で
+/// 返す（REPAIR-5。起動したかどうかを推測しない）。解釈できない内容は未起動として扱う（fail-closed）。
+pub(super) fn read_exec_status(
+    status: &std::fs::File,
+    exit: ChildExit,
+) -> Result<ExecExit, ExecError> {
+    use std::io::Read as _;
+    let internal = |what: &str| ExecError::new(ErrorCode::Internal, IsolationStage::Wait, what);
+    let mut buf = [0u8; EXEC_STATUS_MAX];
+    let mut filled = 0usize;
+    loop {
+        // データが有るか、書き込み側がすべて閉じている（EOF）ときだけ読む。
+        match sys::poll_readable(status.as_fd(), 0) {
+            Ok(true) => {}
+            Ok(false) => return Err(internal("the exec status pipe is still open after exit")),
+            Err(_) => return Err(internal("cannot poll the exec status pipe")),
+        }
+        let Some(rest) = buf.get_mut(filled..).filter(|r| !r.is_empty()) else {
+            break;
+        };
+        match (&*status).read(rest) {
+            Ok(0) => break,
+            Ok(n) => filled = filled.saturating_add(n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(internal("cannot read the exec status pipe")),
+        }
+    }
+    Ok(classify_exec_status(buf.get(..filled).unwrap_or(&[]), exit))
+}
+
+/// pipe の内容 `status` と子の終了状態から結果を決める（純関数。規則は [`run_exec_child`]）。
+fn classify_exec_status(status: &[u8], exit: ChildExit) -> ExecExit {
+    if status == EXEC_STATUS_READY {
+        return ExecExit::Command(exit);
+    }
+    // 失敗の行（`R` の後、または単独）の 2 つ目の語が違反の理由コード。
+    let violation = status
+        .strip_prefix(EXEC_STATUS_READY)
+        .unwrap_or(status)
+        .split(|b| *b == b'\n')
+        .next()
+        .and_then(|line| line.split(|b| *b == b' ').nth(1))
+        .and_then(|name| {
+            EXEC_CHILD_VIOLATIONS
+                .into_iter()
+                .find(|reason| reason.as_str().as_bytes() == name)
+        });
+    ExecExit::SetupFailed { exit, violation }
 }
 
 /// [`observe_exec_child_setup`] の観測結果（結合試験専用。SUP-6・SEC-1・TASK-163 追補・#1456）。
@@ -795,8 +949,9 @@ pub(super) fn exec_child_main(entry: &Entrypoint) -> i32 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ExecChildSetupObservation {
-    /// 子の終了状態。`execveat` 前の手順が通れば `Exited(0)`、拒否されれば 125 / 126 / 127。
-    pub exit: ChildExit,
+    /// 本番と同じ pipe のプロトコルで判定した結果。`execveat` 前の手順が通れば `Command(Exited(0))`
+    /// （`execveat` を呼ぶ直前まで到達した）、拒否されれば `SetupFailed`（終了コード 125 / 126 / 127 と違反の理由）。
+    pub exit: ExecExit,
     /// 手順が通った子が、`execveat` の直前の自分の状態を書いた報告。拒否された場合は `None`。
     pub report: Option<ExecChildSetupReport>,
 }
@@ -821,6 +976,9 @@ pub struct ExecChildSetupReport {
     pub stdio: [(bool, u64); 3],
     /// `execveat` に渡す環境変数（`KEY=VALUE`。`ExecCommand` が持つ値そのもので、envp はこの列だけから作る）。
     pub env: Vec<String>,
+    /// 子に残っている fd 3 以上の `(番号, /proc/self/fd のリンク先)`（一覧の読み取りに使った fd は除く）。
+    /// 状態を返す pipe と、検査済みのエントリポイントの 2 本だけが残る。
+    pub open_fds: Vec<(i32, String)>,
 }
 
 /// 結合試験専用: exec の子の `execveat` より前の全手順を実プロセスで通し、`execveat` の代わりに子自身の状態を
@@ -835,6 +993,8 @@ pub struct ExecChildSetupReport {
 ///   namespace への参加・制限の適用も行わず、呼び出しプロセス自身の namespace と `/` に対して手順を通す
 /// - 子は手順が通れば `report`（呼び出し側が用意した、存在しないパス）へ状態を `create_new` で書いて 0 で終わる。
 ///   拒否された場合は本番と同じ規約（stderr の英語 1 行と終了コード 125 / 126 / 127）で終わり、報告は無い
+/// - `execve` 前の失敗を親へ知らせる pipe（#1460）も本番と同じものを通す: 子は fd の後始末で pipe の書き込み側
+///   だけを残し、結果は本番と同じ [`read_exec_status`] が判定する
 /// - 呼び出し元は単一スレッドであること（満たさなければ fork せず `FailedPrecondition`）。`timeout` を過ぎたら子を
 ///   `SIGKILL` して回収し `Timeout`（REPAIR-5）
 /// - `exec-test-support` feature を付けたビルドにだけ存在し、既定のビルドの公開 API には含まれない
@@ -846,18 +1006,20 @@ pub fn observe_exec_child_setup(
     timeout: Duration,
 ) -> Result<ExecChildSetupObservation, ExecError> {
     let entry = command.entrypoint();
+    let (status_read, status_write) = std::io::pipe()
+        .map_err(|e| ExecError::from_io(&e, IsolationStage::Spawn, "create the status pipe"))?;
     let pid = sys::fork_single_threaded(
-        || match prepare_exec_child(entry).and_then(|_file| write_setup_report(entry, report)) {
-            Ok(()) => 0,
-            Err(err) => {
-                let _ = writeln!(std::io::stderr(), "fandhe-container: {err}");
-                exit_code_for(&err)
-            }
+        || {
+            run_exec_child(entry, status_write.as_fd(), |entry, _file| {
+                write_setup_report(entry, report).map(|()| 0)
+            })
         },
         EXIT_SETUP_FAILED,
     )
     .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
+    drop(status_write);
     let exit = ContainerChild::new(pid).wait_timeout(timeout)?;
+    let exit = read_exec_status(&std::fs::File::from(OwnedFd::from(status_read)), exit)?;
     let report = match std::fs::read_to_string(report) {
         Ok(text) => Some(parse_setup_report(&text).ok_or_else(|| {
             ExecError::new(
@@ -908,6 +1070,22 @@ fn write_setup_report(entry: &Entrypoint, report: &Path) -> Result<(), ExecError
     for var in &entry.env {
         text.push_str(&format!("env={}\n", var.to_string_lossy()));
     }
+    // 残っている fd（3 以上）。一覧の読み取りに使うディレクトリの fd は、リンク先が fd ディレクトリ自身になる。
+    let own_fd_dir = format!("/proc/{}/fd", std::process::id());
+    let mut open: Vec<(i32, String)> = std::fs::read_dir("/proc/self/fd")
+        .map_err(|_| fail("list own fds"))?
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|fd| *fd >= 3)
+        .filter_map(|fd| {
+            let target = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
+            Some((fd, target.to_string_lossy().into_owned()))
+        })
+        .filter(|(_, target)| *target != own_fd_dir)
+        .collect();
+    open.sort();
+    for (fd, target) in open {
+        text.push_str(&format!("fd={fd} {target}\n"));
+    }
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -947,6 +1125,14 @@ fn parse_setup_report(text: &str) -> Option<ExecChildSetupReport> {
             .filter_map(|l| l.strip_prefix("env="))
             .map(str::to_owned)
             .collect(),
+        open_fds: text
+            .lines()
+            .filter_map(|l| l.strip_prefix("fd="))
+            .map(|v| {
+                let (fd, target) = v.split_once(' ')?;
+                Some((fd.parse().ok()?, target.to_owned()))
+            })
+            .collect::<Option<_>>()?,
     })
 }
 
@@ -2088,6 +2274,115 @@ mod tests {
             take_calls(),
             vec!["close_range(3,close)".to_string(), "setsid".to_string()]
         );
+    }
+
+    /// SUP-6・REPAIR-3・TASK-163 追補（#1460）: 子が pipe へ残した内容からの判定の具体値。`R` の 1 行だけなら
+    /// コマンドは起動した（終了コードが 125〜127 でも「コマンド自身の終了コード」）。失敗の行があるか、何も
+    /// 無ければ起動していない。違反の理由コードは `execveat` 前の手順が返すものだけを引き直す。
+    #[test]
+    fn sup6_task163_classify_exec_status_is_exact() {
+        let failed = |exit, violation| ExecExit::SetupFailed { exit, violation };
+        for code in [0, 1, 125, 126, 127] {
+            let exit = ChildExit::Exited(code);
+            assert_eq!(classify_exec_status(b"R\n", exit), ExecExit::Command(exit));
+            // 手順の途中で終了した（何も書いていない）。
+            assert_eq!(classify_exec_status(b"", exit), failed(exit, None));
+        }
+        let signaled = ChildExit::Signaled(15);
+        assert_eq!(
+            classify_exec_status(b"R\n", signaled),
+            ExecExit::Command(signaled)
+        );
+        assert_eq!(classify_exec_status(b"", signaled), failed(signaled, None));
+
+        let exit = ChildExit::Exited(126);
+        assert_eq!(classify_exec_status(b"126 -\n", exit), failed(exit, None));
+        // `execveat` 自体の失敗（`R` の後に失敗の行）。
+        assert_eq!(
+            classify_exec_status(b"R\n126 -\n", exit),
+            failed(exit, None)
+        );
+        for reason in EXEC_CHILD_VIOLATIONS {
+            let line = format!("126 {}\n", reason.as_str());
+            assert_eq!(
+                classify_exec_status(line.as_bytes(), exit),
+                failed(exit, Some(reason))
+            );
+            assert_eq!(reason.kind().as_str(), "entrypoint");
+        }
+        assert_eq!(
+            classify_exec_status(b"126 entrypoint_interpreter_is_runtime_binary\n", exit),
+            failed(
+                exit,
+                Some(ViolationReason::EntrypointInterpreterIsRuntimeBinary)
+            )
+        );
+        // 解釈できない内容・子が返さないはずの理由コード・切れた行は、起動していない扱い（理由なし）。
+        for garbage in [
+            &b"R"[..],
+            b"RR\n",
+            b"\n",
+            b"garbage",
+            b"126 rootfs_is_host_root\n",
+            b"126",
+            b"R\nR\n",
+        ] {
+            assert_eq!(
+                classify_exec_status(garbage, exit),
+                failed(exit, None),
+                "{garbage:?}"
+            );
+        }
+        assert!(ExecExit::Command(exit).command_started());
+        assert!(!failed(exit, None).command_started());
+        assert_eq!(failed(exit, None).child_exit(), exit);
+        assert_eq!(ExecExit::Command(signaled).child_exit(), signaled);
+    }
+
+    /// SUP-6・REPAIR-5・TASK-163 追補（#1460）: 実 pipe からの読み取り。書き込み側が閉じていれば内容（または
+    /// 空）で判定し、開いたままなら待たずに `Internal`（起動したかどうかを推測しない）。上限を超える内容は
+    /// 読み切らずに打ち切り、起動していない扱いにする。
+    #[test]
+    fn sup6_task163_read_exec_status_never_blocks() {
+        let exit = ChildExit::Exited(127);
+        let read = |content: &[u8]| {
+            let (reader, mut writer) = std::io::pipe().unwrap();
+            writer.write_all(content).unwrap();
+            drop(writer);
+            read_exec_status(&std::fs::File::from(OwnedFd::from(reader)), exit).unwrap()
+        };
+        assert_eq!(read(b"R\n"), ExecExit::Command(exit));
+        assert_eq!(
+            read(b""),
+            ExecExit::SetupFailed {
+                exit,
+                violation: None
+            }
+        );
+        assert_eq!(
+            read(b"127 stdio_null_not_null_device\n"),
+            ExecExit::SetupFailed {
+                exit,
+                violation: Some(ViolationReason::StdioNullNotNullDevice)
+            }
+        );
+        assert_eq!(
+            read(&[b'R'; 4096]),
+            ExecExit::SetupFailed {
+                exit,
+                violation: None
+            }
+        );
+
+        // 書き込み側が開いたまま（データなし）。
+        let (reader, writer) = std::io::pipe().unwrap();
+        let err = read_exec_status(&std::fs::File::from(OwnedFd::from(reader)), exit).unwrap_err();
+        assert_eq!(
+            (err.code, err.stage),
+            (ErrorCode::Internal, IsolationStage::Wait)
+        );
+        assert_eq!(err.message, "the exec status pipe is still open after exit");
+        drop(writer);
     }
 
     /// CORE-1（TASK-27.4.1）: 不在のエントリポイントは `NotFound`（終了コード 127 に対応）。

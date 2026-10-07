@@ -120,7 +120,7 @@ pub use capabilities::{CapabilityReport, SupplementaryGroups};
 pub use cgroup_join::{ExecCgroupJoin, ExecCgroupJoinReport, join_cgroup, prepare_cgroup_join};
 pub use container_env::{ContainerEnv, ExecCommand};
 pub use devices::{DeviceNodeOutcome, DeviceNodeStatus, DeviceReport, create_default_devices};
-pub use exec_command::{spawn_exec_command, spawn_exec_worker};
+pub use exec_command::{ExecChild, spawn_exec_command, spawn_exec_worker};
 /// 結合試験 `tests/landlock.rs` 専用の再公開（CORE-5・TASK-39.5・#185。通常の利用者は呼ばない。詳細は定義側）。
 #[doc(hidden)]
 pub use landlock::{
@@ -137,7 +137,7 @@ pub use process::spawn_container_seccomp_probe;
 pub use process::{
     ChildExit, ContainerChild, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV,
     ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES, EXIT_EXEC_NOT_EXECUTABLE,
-    EXIT_EXEC_NOT_FOUND, EXIT_SETUP_FAILED, Entrypoint, SignalDelivery, exec_entrypoint,
+    EXIT_EXEC_NOT_FOUND, EXIT_SETUP_FAILED, Entrypoint, ExecExit, SignalDelivery, exec_entrypoint,
     spawn_container, spawn_container_with_stages,
 };
 /// 結合試験 `tests/exec_child_setup.rs` 専用の再公開（SUP-6・TASK-163 追補・#1456。通常の利用者は呼ばない。詳細は定義側）。
@@ -149,6 +149,8 @@ pub use reapply::{
     prepare_exec_restrictions, reapply_restrictions,
 };
 /// 結合試験 `tests/exec_restrictions_reapply.rs` 専用の再公開（SUP-6・TASK-163.3・#502。通常の利用者は呼ばない。詳細は定義側）。
+/// `exec-test-support` feature を付けたビルドにだけ存在する（TASK-163 追補・#1460）。
+#[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
 pub use reapply::{ExecReapplyObservation, observe_exec_restriction_reapply};
 pub use rootfs::{PivotReport, PreparedRootfs, pivot_root, prepare_rootfs};

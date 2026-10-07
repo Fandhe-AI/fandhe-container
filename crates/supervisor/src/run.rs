@@ -1573,7 +1573,8 @@ mod tests {
         let live = e.take_live_capture().unwrap();
         assert!(e.take_live_capture().is_none());
         assert_eq!(live.cancel(), Ok(()));
-        std::io::Write::write_all(&mut writer, b"late\n").unwrap();
+        // リーダーが取消しを見て先に終了していると BrokenPipe になる（どちらでも追記されないことを確認する）。
+        let _ = std::io::Write::write_all(&mut writer, b"late\n");
         let start = Instant::now();
         while budget.live() != 0 && start.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(5));

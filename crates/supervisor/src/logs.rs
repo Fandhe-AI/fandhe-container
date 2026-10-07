@@ -636,7 +636,14 @@ impl LogCapture {
         let result = self.wait_all(deadline);
         if result.is_err() {
             // 期限（deadline）を超えては待たない。期限切れの場合は取消しを要求するだけで返る。
-            self.cancel.cancel(deadline);
+            let settled = self.cancel.cancel(deadline);
+            if settled {
+                // 受理済みの行を書き出す（リーダーは取消し後に flush しないため、ここで行わないと sink 内バッファに残る。SUP-7）。
+                // flush の失敗は元のエラーを優先するため捨てる。flush にも固定の猶予で期限を設ける（REPAIR-5）。
+                let now = Instant::now();
+                let until = now.checked_add(CANCEL_SETTLE_TIMEOUT).unwrap_or(now);
+                let _ = flush_bounded(&self.sink, until);
+            }
         }
         result
     }
@@ -650,11 +657,16 @@ impl LogCapture {
     /// 契約（SUP-7）: 実行中の追記が終わった（`Ok` を返す）場合、返る前に [`LogSink::flush`] を呼び、受理済みの行を
     /// 書き出す（リーダーは取消し後に flush しないため、ここで行わないと sink 内バッファの行が見えないまま失われる）。
     /// この時点でリーダーによる sink 呼び出しは無いので競合しない。flush の失敗はその `Err` を返す。
+    /// flush は別スレッドで実行し、さらに [`CANCEL_SETTLE_TIMEOUT`] まで待つ（超過は `Timeout`。最大でも合計 2 倍の猶予で戻る。
+    /// 超過した flush は別スレッドで完了し得る）。
     pub fn cancel(self) -> Result<(), TraitError> {
         let now = Instant::now();
         let until = now.checked_add(CANCEL_SETTLE_TIMEOUT).unwrap_or(now);
         if self.cancel.cancel(until) {
-            self.sink.flush()
+            // flush にも固定の猶予で期限を設ける（止まった sink で呼び出しスレッドが戻らなくならないように。REPAIR-5）。
+            let now = Instant::now();
+            let until = now.checked_add(CANCEL_SETTLE_TIMEOUT).unwrap_or(now);
+            flush_bounded(&self.sink, until)
         } else {
             Err(TraitError::new(
                 ErrorCode::Timeout,
@@ -781,6 +793,36 @@ impl LineSplitter<'_> {
         }
         self.buf.clear();
         self.cut = false;
+    }
+}
+
+/// `sink.flush()` を別スレッドで実行し、`until` まで結果を待つ。超過は `Timeout`、スレッド起動失敗は `Internal`。
+/// 超過した flush はスレッド側で完了し得る（呼び出しスレッドは止まらない。REPAIR-5）。
+fn flush_bounded(sink: &Arc<dyn LogSink>, until: Instant) -> Result<(), TraitError> {
+    let (tx, rx) = mpsc::channel();
+    let sink = Arc::clone(sink);
+    let spawned = std::thread::Builder::new()
+        .name("supervisor-log-flush".to_string())
+        .spawn(move || {
+            // 受信側が待ち切れず破棄済みなら送信失敗は無視してよい。
+            let _ = tx.send(sink.flush());
+        });
+    if spawned.is_err() {
+        return Err(TraitError::new(
+            ErrorCode::Internal,
+            "failed to spawn log flush thread",
+        ));
+    }
+    match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+        Ok(r) => r,
+        Err(RecvTimeoutError::Timeout) => Err(TraitError::new(
+            ErrorCode::Timeout,
+            "timed out waiting for log sink flush",
+        )),
+        Err(RecvTimeoutError::Disconnected) => Err(TraitError::new(
+            ErrorCode::Internal,
+            "log flush thread terminated unexpectedly",
+        )),
     }
 }
 
@@ -1077,7 +1119,8 @@ mod tests {
             "LogCapture { streams: 1, cancelled: false }"
         );
         assert_eq!(cap.cancel(), Ok(()));
-        writer.write_all(b"late\n").unwrap();
+        // リーダーが取消しを見て先に終了していると BrokenPipe になる（どちらでも追記されないことを確認する）。
+        let _ = writer.write_all(b"late\n");
         assert_eq!(wait_live(&budget, 0), 0);
         assert_eq!(sink.snapshot().unwrap(), Vec::<CapturedLine>::new());
         drop(writer);
@@ -1980,6 +2023,61 @@ mod tests {
         assert_eq!(cap.cancel(), Ok(()));
         let calls = sink.calls();
         assert_eq!(calls.first().map(String::as_str), Some("append a"));
+        assert_eq!(calls.len(), before + 1);
+        assert_eq!(calls.last().map(String::as_str), Some("flush"));
+        drop(w);
+    }
+
+    /// flush が戻らない sink でも cancel は猶予内に `Timeout` で戻る（REPAIR-5・SUP-7）。
+    #[test]
+    fn sup7_task164_3_cancel_returns_timeout_when_flush_hangs() {
+        struct HangFlush(Mutex<mpsc::Receiver<()>>);
+        impl LogSink for HangFlush {
+            fn append(&self, _s: StreamKind, _l: &[u8]) -> Result<(), TraitError> {
+                Ok(())
+            }
+            fn flush(&self) -> Result<(), TraitError> {
+                // 送信側が drop されるまで戻らない。
+                let _ = self.0.lock().unwrap().recv();
+                Ok(())
+            }
+        }
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (r, w) = std::io::pipe().unwrap();
+        let budget = ReaderBudget::new(1).unwrap();
+        let cap = LogCapture::start(
+            OutputStreams::new(&budget, Some(Box::new(r)), None),
+            Arc::new(HangFlush(Mutex::new(release_rx))),
+        )
+        .unwrap();
+        let t0 = Instant::now();
+        let err = cap.cancel().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        drop(release_tx);
+        drop(w);
+    }
+
+    /// drain が期限切れで失敗しても、受理済みの行を flush してから戻る（SUP-7）。元のエラーは `Timeout` のまま。
+    #[test]
+    fn sup7_task164_3_drain_timeout_flushes_accepted_lines() {
+        let sink = Arc::new(CallLog::default());
+        let (r, mut w) = std::io::pipe().unwrap();
+        let budget = ReaderBudget::new(1).unwrap();
+        let cap = LogCapture::start(
+            OutputStreams::new(&budget, Some(Box::new(r)), None),
+            sink.clone(),
+        )
+        .unwrap();
+        w.write_all(b"a\n").unwrap();
+        let t0 = Instant::now();
+        while sink.calls().len() < 2 && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let before = sink.calls().len();
+        let err = cap.drain(Duration::from_millis(50)).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        let calls = sink.calls();
         assert_eq!(calls.len(), before + 1);
         assert_eq!(calls.last().map(String::as_str), Some("flush"));
         drop(w);

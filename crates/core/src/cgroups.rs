@@ -83,7 +83,11 @@ pub use io_max::{BlockDevice, IoLimit, IoMax};
 mod pids;
 pub use pids::{PIDS_MAX_LIMIT, PidsMax};
 mod exec_join;
+mod exec_kill;
 pub(crate) use exec_join::{ExecJoinFds, contains_pid, open_cgroup_by_path};
+pub(crate) use exec_kill::{
+    ExecChildCgroupFds, ExecChildRemoval, remove_exec_child_cgroup_at, validate_exec_child_name,
+};
 
 /// 退避リーフ cgroup の名前。自プロセスの移動先（レイアウトは本モジュール冒頭を参照）。
 const EVACUATION_LEAF: &str = "fc-runtime";
@@ -1222,29 +1226,39 @@ impl DelegatedCgroup {
     /// `ENOENT`（[`removal_confirmed`]）のときだけ成功とする。開けた場合は別の cgroup を消したとして
     /// `Internal`、その他の失敗は保持していた cgroup が残っている可能性を否定できないためエラーを返す。
     fn remove_verified(&self, name: &str, held: BorrowedFd<'_>) -> Result<(), CgroupError> {
-        let step = CgroupStep::Cleanup;
-        let entry = open_cgroup_dir(step, self.fd.as_fd(), name)?;
-        if dir_identity(step, entry.as_fd(), "stat cgroup entry")?
-            != dir_identity(step, held, "stat held cgroup")?
-        {
-            return Err(CgroupError::precondition(
-                step,
-                "cgroup entry no longer matches the held handle",
-            ));
-        }
-        drop(entry);
-        let c = cstring(step, name)?;
-        sys::remove_dir_at(self.fd.as_fd(), &c).map_err(|e| sys_error(step, name, e))?;
-        let events = cstring(step, "cgroup.events")?;
-        match sys::open_read_at(held, &events) {
-            Err(e) if removal_confirmed(&e) => Ok(()),
-            Ok(_) => Err(CgroupError::new(
-                ErrorCode::Internal,
-                step,
-                "removed cgroup entry was not the held cgroup (concurrent replacement)",
-            )),
-            Err(e) => Err(sys_error(step, "confirm removal via held cgroup.events", e)),
-        }
+        remove_verified_at(self.fd.as_fd(), name, held)
+    }
+}
+
+/// `parent` 直下の `name` を、保持 fd `held` と同一の cgroup であることを確かめてから削除し、削除済みを確認する
+/// （[`DelegatedCgroup::remove_verified`] の実体。exec 用の子 cgroup の削除〔`exec_kill`〕も共用する）。
+fn remove_verified_at(
+    parent: BorrowedFd<'_>,
+    name: &str,
+    held: BorrowedFd<'_>,
+) -> Result<(), CgroupError> {
+    let step = CgroupStep::Cleanup;
+    let entry = open_cgroup_dir(step, parent, name)?;
+    if dir_identity(step, entry.as_fd(), "stat cgroup entry")?
+        != dir_identity(step, held, "stat held cgroup")?
+    {
+        return Err(CgroupError::precondition(
+            step,
+            "cgroup entry no longer matches the held handle",
+        ));
+    }
+    drop(entry);
+    let c = cstring(step, name)?;
+    sys::remove_dir_at(parent, &c).map_err(|e| sys_error(step, name, e))?;
+    let events = cstring(step, "cgroup.events")?;
+    match sys::open_read_at(held, &events) {
+        Err(e) if removal_confirmed(&e) => Ok(()),
+        Ok(_) => Err(CgroupError::new(
+            ErrorCode::Internal,
+            step,
+            "removed cgroup entry was not the held cgroup (concurrent replacement)",
+        )),
+        Err(e) => Err(sys_error(step, "confirm removal via held cgroup.events", e)),
     }
 }
 

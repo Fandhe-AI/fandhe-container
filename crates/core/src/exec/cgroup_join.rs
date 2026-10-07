@@ -38,19 +38,36 @@
 //! - 同一性照合の前提（コンテナ内から cgroupfs に書けないこと）は `setns.rs` のモジュール doc と同じ。
 //!   cgroup namespace・cgroupfs マウントの導入時は見直す
 //!
+//! # exec 用の子 cgroup（#1466）
+//!
+//! コマンドだけをコンテナ cgroup 直下の子 cgroup（[`ExecChildCgroup`]。名前は [`ExecCgroupName`]）へ入れ、
+//! `cgroup.kill` で子孫ごと止める。作成は [`ExecCgroupJoin::create_child_cgroup`]（固定済みのコンテナ cgroup の
+//! fd 相対・`enter_namespaces` の前）、参加は `spawn_exec_command` の子、停止は [`ExecChildCgroup::kill_all`]、
+//! 削除は制限の掛かっていない呼び出しプロセスが [`remove_exec_child_cgroup`] で名前から行う（冪等。再適用後の
+//! worker は Landlock で `rmdir` できない）。期待パスは記録の型（`ContainerId`・`CgroupPlacement`）から導き、
+//! 文字列で受ける入口は `exec-test-support` だけ。詳細は `crate::cgroups::exec_kill`。
+//!
 //! # 未実装（REPAIR-3）
 //!
-//! user namespace 参加（対象が呼び出し側と別の user namespace にいれば `Pid1Target::open` が拒否する）。
+//! 残留した `exec-*` の掃除（呼び出しプロセスが `SIGKILL` された場合に残り得る。delete 前・次回 exec 開始時。
+//! TASK-30.3・OCI-6・SUP-6）。user namespace 参加（対象が呼び出し側と別の user namespace にいれば `Pid1Target::open` が拒否する）。
 //! 制限の再適用は `exec/reapply.rs`（#502・#503）、fork・`close_range`・`execveat` は `exec/exec_command.rs`
 //! （#503）で実装済み。
 
 use std::num::NonZeroU32;
+use std::os::fd::AsFd as _;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use super::setns::{Pid1Target, cgroup_path_matches, ensure_not_exited};
+use super::setns::{Pid1Target, cgroup_path_matches, container_cgroup_path_for, ensure_not_exited};
 use super::{ExecError, IsolationStage, ViolationReason};
-use crate::cgroups::{ExecJoinFds, contains_pid, open_cgroup_by_path};
+use crate::cgroups::{
+    ExecChildCgroupFds, ExecChildRemoval, ExecJoinFds, contains_pid, open_cgroup_by_path,
+    remove_exec_child_cgroup_at,
+};
 use crate::traits::types::ErrorCode;
+use crate::traits::{CgroupPlacement, ContainerId};
 
 /// [`prepare_cgroup_join`] が確保した参加用の fd 一式。[`join_cgroup`] が消費する。
 pub struct ExecCgroupJoin {
@@ -130,6 +147,151 @@ pub fn join_cgroup(join: ExecCgroupJoin) -> Result<ExecCgroupJoinReport, ExecErr
         )
     })?;
     Ok(ExecCgroupJoinReport { pid, target_pid })
+}
+
+/// exec 用の子 cgroup の名前（`exec-<呼び出し pid>-<連番>`。検証済みの 1 要素。#1466）。
+///
+/// 呼び出しプロセスが exec ごとに [`Self::unique`] で作り、worker（作成）と呼び出しプロセス（名前からの後始末）が
+/// 同じ値で同じ cgroup を指す。一意性は `mkdirat` の `EEXIST` 失敗で担保する（既存の同名は採用しない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecCgroupName(String);
+
+impl ExecCgroupName {
+    /// 呼び出しプロセスの pid とプロセス内の連番から、一意な名前を作る。
+    pub fn unique() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+        Self(format!("exec-{}-{seq}", std::process::id()))
+    }
+
+    /// 検証して名前にする（`exec-` 接頭辞・`[a-z0-9-]`・長さ上限）。不正は `InvalidArgument`。
+    pub fn new(name: &str) -> Result<Self, ExecError> {
+        crate::cgroups::validate_exec_child_name(name).map_err(|_| {
+            ExecError::new(
+                ErrorCode::InvalidArgument,
+                IsolationStage::CgroupJoin,
+                "exec child cgroup name is not valid",
+            )
+        })?;
+        Ok(Self(name.to_owned()))
+    }
+
+    /// 名前（cgroup ディレクトリの 1 要素）。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// exec のコマンドだけを入れる子 cgroup（コンテナ cgroup 直下の `exec-<nonce>`）の書き込み fd 一式。
+///
+/// [`ExecCgroupJoin::create_child_cgroup`] が `enter_namespaces` と制限の再適用の **前** に作る。
+/// [`spawn_exec_command`](super::spawn_exec_command) は参照で受け取り、fork した子が `execve` の前に自分をここへ移す。
+/// 停止は [`Self::kill`]（`cgroup.kill`。制限の再適用後も保持 fd への write で成立する）。**削除は行わない**:
+/// 再適用後の worker は Landlock で `rmdir` できないため、制限の掛かっていない呼び出しプロセスが
+/// [`remove_exec_child_cgroup`] で名前から行う。
+#[derive(Debug)]
+pub struct ExecChildCgroup {
+    fds: ExecChildCgroupFds,
+}
+
+impl ExecChildCgroup {
+    /// この cgroup の全プロセス（コマンドの子孫を含む）を `cgroup.kill` で `SIGKILL` する。冪等。
+    pub fn kill_all(&self) -> Result<(), ExecError> {
+        self.fds.kill().map_err(ExecError::from_cgroup)
+    }
+
+    /// 呼び出しプロセス（fork した子）自身をこの cgroup へ移す。`spawn_exec_command` の子から呼ぶ。
+    pub(super) fn join_self(&self) -> Result<(), ExecError> {
+        self.fds.join_self().map_err(ExecError::from_cgroup)
+    }
+
+    /// 実機結合試験専用の入口: コンテナ cgroup の絶対パスを文字列で受けて子 cgroup を作る（`exec-test-support`。
+    /// [`ExecCgroupJoin::create_child_cgroup`] と同じ作成）。期待値を記録から導かないため本番経路には使わない。
+    #[cfg(feature = "exec-test-support")]
+    pub fn create_in_path_for_test(
+        container_cgroup_path: &str,
+        name: &ExecCgroupName,
+    ) -> Result<Self, ExecError> {
+        let dir = open_cgroup_by_path(container_cgroup_path).map_err(ExecError::from_cgroup)?;
+        let fds = ExecChildCgroupFds::create(dir.as_fd(), name.as_str())
+            .map_err(ExecError::from_cgroup)?;
+        Ok(Self { fds })
+    }
+
+    /// テスト用: `cgroup.procs` と `cgroup.kill` を置いた通常のディレクトリから組み立てる。
+    #[cfg(test)]
+    pub(super) fn from_dir_for_test(dir: std::os::fd::OwnedFd) -> Self {
+        Self {
+            fds: ExecChildCgroupFds::from_dir_for_test(dir).unwrap(),
+        }
+    }
+}
+
+impl ExecCgroupJoin {
+    /// コンテナ cgroup の直下に exec 用の子 cgroup `name` を作る（コマンドだけを入れる。#1466）。
+    ///
+    /// `enter_namespaces` の **前**（[`prepare_cgroup_join`] の後）に呼ぶ。固定済みのコンテナ cgroup の fd 相対で
+    /// 作り、`cgroup.kill` が使えない（Linux 5.14 未満）場合は `Unimplemented` で拒否する（fail-closed）。
+    pub fn create_child_cgroup(&self, name: &ExecCgroupName) -> Result<ExecChildCgroup, ExecError> {
+        let fds = ExecChildCgroupFds::create(self.fds.dir(), name.as_str())
+            .map_err(ExecError::from_cgroup)?;
+        Ok(ExecChildCgroup { fds })
+    }
+}
+
+/// [`remove_exec_child_cgroup`] の結果（将来拡張できる構造）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExecCgroupRemoval {
+    /// 子孫ごと停止して削除した。
+    Removed,
+    /// 既に存在しなかった（冪等）。
+    Absent,
+}
+
+impl From<ExecChildRemoval> for ExecCgroupRemoval {
+    fn from(value: ExecChildRemoval) -> Self {
+        match value {
+            ExecChildRemoval::Removed => Self::Removed,
+            ExecChildRemoval::Absent => Self::Absent,
+        }
+    }
+}
+
+/// 記録（`id`・`placement`）から導いたコンテナ cgroup の直下の `name` を、`cgroup.kill` で子孫ごと停止して削除する。
+///
+/// 制限の掛かっていない呼び出しプロセスが、worker の終了後（正常・期限切れ・異常終了のいずれも）に必ず呼ぶ。
+/// 冪等で、存在しなければ [`ExecCgroupRemoval::Absent`]。`timeout` は空になるまでの待機の上限（REPAIR-5。
+/// 超過は `Timeout`）。期待パスは記録の型から core が導き、文字列で受ける入口は無い（SEC-1）。
+pub fn remove_exec_child_cgroup(
+    id: &ContainerId,
+    placement: &CgroupPlacement,
+    name: &ExecCgroupName,
+    timeout: Duration,
+) -> Result<ExecCgroupRemoval, ExecError> {
+    remove_at_path(&container_cgroup_path_for(id, placement)?, name, timeout)
+}
+
+/// 実機結合試験専用の入口: コンテナ cgroup の絶対パスを文字列で受ける（`exec-test-support`。
+/// [`remove_exec_child_cgroup`] と同じ後始末）。
+#[cfg(feature = "exec-test-support")]
+pub fn remove_exec_child_cgroup_in(
+    container_cgroup_path: &str,
+    name: &ExecCgroupName,
+    timeout: Duration,
+) -> Result<ExecCgroupRemoval, ExecError> {
+    remove_at_path(container_cgroup_path, name, timeout)
+}
+
+fn remove_at_path(
+    container_cgroup_path: &str,
+    name: &ExecCgroupName,
+    timeout: Duration,
+) -> Result<ExecCgroupRemoval, ExecError> {
+    let dir = open_cgroup_by_path(container_cgroup_path).map_err(ExecError::from_cgroup)?;
+    remove_exec_child_cgroup_at(dir.as_fd(), name.as_str(), timeout)
+        .map(ExecCgroupRemoval::from)
+        .map_err(ExecError::from_cgroup)
 }
 
 #[cfg(test)]

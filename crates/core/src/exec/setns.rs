@@ -57,9 +57,9 @@
 //!   `/proc` の読み取り失敗・syscall 失敗・呼び出し側がマルチスレッドであることはシステムエラー / 呼び出し
 //!   文脈の誤りで、違反記録を付けない
 //!
-//! # 後続（#501〜#503）への必須前提
+//! # 後続（#502〜#503）への必須前提
 //!
-//! - 順序: ホスト側 fd の確保（cgroup.procs。#501）は [`join_namespaces`] の **前**、seccomp / Landlock の
+//! - 順序: ホスト側 fd の確保（cgroup.procs。#501・実装済みの `exec::cgroup_join`）は [`join_namespaces`] の **前**、seccomp / Landlock の
 //!   再適用（#502）は **後**（`setns` は seccomp の禁止 syscall に含まれ、適用後は参加できない）
 //! - `setns` は uid / gid・capability・補助グループ・`no_new_privs` を **変えない**。rootful では参加後も
 //!   全 capability を持つホスト root のままである。`execve` の前に capability 削減と `no_new_privs` の設定が
@@ -160,6 +160,11 @@ impl Pid1Target {
     /// 対象の pid（呼び出し側の PID namespace から見た値）。
     pub fn pid(&self) -> NonZeroU32 {
         self.pid
+    }
+
+    /// `open` で照合した期待 cgroup 絶対パス（`exec::cgroup_join` が cgroup を開くために使う）。
+    pub(super) fn expected_cgroup_path(&self) -> &str {
+        &self.expected_cgroup_path
     }
 
     /// `pid` を候補として pid1 を特定し、検証を通ったものだけを対象にする。
@@ -293,7 +298,7 @@ fn verify_cgroup_membership(pid: NonZeroU32, expected: &str) -> Result<(), ExecE
 
 /// pidfd の指すプロセスが終了済みなら `FailedPrecondition`（`what` はメッセージの末尾に付ける）。
 /// 対象の終了は分離違反の試行ではないため、違反記録は付けない。
-fn ensure_not_exited(target: &Pid1Target, what: &str) -> Result<(), ExecError> {
+pub(super) fn ensure_not_exited(target: &Pid1Target, what: &str) -> Result<(), ExecError> {
     let exited = sys::poll_readable(target.pidfd.as_fd(), 0)
         .map_err(|e| setns_error(e, "poll target pidfd"))?;
     if exited {
@@ -446,7 +451,7 @@ fn is_valid_cgroup_path(path: &str) -> bool {
 /// 内容が改行で終わらない（最終行が途中で切れている可能性がある）・v2 行なし・v2 行が複数・不一致は
 /// fail-closed で `false`。部分一致（接頭辞・接尾辞・途中の要素）は認めない。削除済み cgroup に残る
 /// プロセスはカーネルが ` (deleted)` を付けるため一致しない。
-fn cgroup_path_matches(cgroup: &str, expected: &str) -> bool {
+pub(super) fn cgroup_path_matches(cgroup: &str, expected: &str) -> bool {
     if !cgroup.ends_with('\n') {
         return false;
     }

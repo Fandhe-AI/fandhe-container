@@ -167,14 +167,20 @@ pub struct IoError {
 impl IoError {
     /// エラーコードとメッセージから構造化エラーを作る。
     ///
-    /// `message` が [`MAX_IO_ERROR_MESSAGE_BYTES`] を超える場合は文字境界で切り捨て、
-    /// 余剰容量も解放する。上限以下なら再確保せずそのまま保持する。
+    /// `message` が [`MAX_IO_ERROR_MESSAGE_BYTES`] を超える場合は文字境界で切り捨てる。
+    /// 切り捨ての有無にかかわらず、capacity が上限を超えている場合は余剰容量を解放する
+    /// （`message_truncated` は内容の切り捨てだけを表す）。
     pub fn new(code: IoErrorCode, message: impl Into<String>) -> Self {
         let mut message: String = message.into();
         let end = truncation_end(&message, MAX_IO_ERROR_MESSAGE_BYTES);
         let message_truncated = end < message.len();
         if message_truncated {
             message.truncate(end);
+        }
+        // 切り捨ての有無とは独立に、必要長に対して過大な capacity は解放する
+        // （受信バッファを短縮して渡された場合などに巨大な確保を保持し続けない）。
+        // 通常の `format!` 由来の小さな余剰（上限以下）では再確保しない。
+        if message.capacity() > MAX_IO_ERROR_MESSAGE_BYTES {
             message.shrink_to_fit();
         }
         Self {
@@ -295,6 +301,17 @@ mod tests {
         let short = IoError::new(IoErrorCode::Internal, "short");
         assert_eq!(short.message(), "short");
         assert!(!short.message_truncated());
+    }
+
+    /// ERR-1（#1116）: 短文でも過大な capacity は解放される。
+    #[test]
+    fn err1_short_message_releases_excess_capacity() {
+        let mut big = String::with_capacity(1024 * 1024);
+        big.push_str("short");
+        let err = IoError::new(IoErrorCode::Internal, big);
+        assert_eq!(err.message(), "short");
+        assert!(!err.message_truncated());
+        assert!(err.message.capacity() <= MAX_IO_ERROR_MESSAGE_BYTES);
     }
 
     /// ERR-1（#1116）: ヘルパー単体の具体値。

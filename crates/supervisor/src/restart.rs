@@ -2307,4 +2307,177 @@ mod tests {
         }
         assert!(base.with_relaunch_timeout(MAX_RELAUNCH_TIMEOUT).is_ok());
     }
+
+    // ---- 実行スレッドの起動失敗（REPAIR-5・SUP-3・TASK-159.3） ----
+
+    /// 常に失敗する [`SpawnFn`]（スレッド生成の失敗を再現する。`run` は実行せずに破棄する）。
+    fn failing_spawn(_: &str, _: Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()> {
+        Err(std::io::Error::other("forced spawn failure"))
+    }
+
+    fn active_workers(late: &LateOrphans) -> u32 {
+        late.lock().active_workers
+    }
+
+    /// REPAIR-5・SUP-3・TASK-159.3: 起動に失敗した実行スレッドは数に残らない。動作中の別スレッド 1 本は
+    /// 数えたまま（二重に減らさない）で、未実行の `body` は 1 度も走らない。
+    #[test]
+    fn sup3_task159_3_spawn_failure_restores_worker_count_exactly_once() {
+        let late = LateOrphans::default();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        spawn_tracked(spawn_os_thread, "t-live", &late, move || {
+            let _ = gate.recv();
+        })
+        .unwrap();
+        assert_eq!(active_workers(&late), 1);
+
+        let ran = Arc::new(AtomicU32::new(0));
+        let ran2 = ran.clone();
+        let err = spawn_tracked(failing_spawn, "t-fail", &late, move || {
+            ran2.fetch_add(1, Ordering::SeqCst);
+        })
+        .expect_err("forced failure");
+        assert_eq!(err.to_string(), "forced spawn failure");
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+        // 失敗した 1 本ぶんだけ戻り、動作中の 1 本は残る。
+        assert_eq!(active_workers(&late), 1);
+        assert!(!late.is_settled());
+
+        release.send(()).unwrap();
+        assert!(late.wait_settled(Duration::from_secs(5)));
+        assert_eq!(active_workers(&late), 0);
+    }
+
+    /// REPAIR-5・SUP-3・TASK-159.3: 実行スレッドの終了（正常・panic）で数が 0 に戻る。
+    #[test]
+    fn sup3_task159_3_spawn_tracked_settles_on_return_and_panic() {
+        let late = LateOrphans::default();
+        spawn_tracked(spawn_os_thread, "t-ok", &late, || {}).unwrap();
+        spawn_tracked(spawn_os_thread, "t-panic", &late, || {
+            panic!("worker panic (expected in test)")
+        })
+        .unwrap();
+        assert!(late.wait_settled(Duration::from_secs(5)));
+        assert_eq!(active_workers(&late), 0);
+    }
+
+    /// REPAIR-5・SUP-3・TASK-159.3: terminate の実行スレッドを作れないとき、`Unavailable` を返し、
+    /// ハンドル 1 件を `late` へ積み、`late` は完了済み（実行スレッド数 0）になる。terminate は呼ばれない。
+    #[test]
+    fn sup3_task159_3_terminate_spawn_failure_settles_and_keeps_handle() {
+        let late = LateOrphans::default();
+        let terminated = Arc::new(AtomicU32::new(0));
+        let proc = Box::new(Fp {
+            pid: 43,
+            exit: FAIL,
+            terminated: terminated.clone(),
+        });
+        let err =
+            terminate_bounded(proc, Duration::from_millis(50), &late, failing_spawn).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Unavailable);
+        assert_eq!(active_workers(&late), 0);
+        assert!(late.is_settled());
+        assert!(late.wait_settled(Duration::ZERO));
+        assert_eq!(terminated.load(Ordering::SeqCst), 0);
+        let got = late.take();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0.pid().get(), 43);
+        assert_eq!(got[0].1.code(), ErrorCode::Unavailable);
+
+        // 失敗の後も同じ受け皿で terminate でき、完了を確認できる。
+        let proc = Box::new(Fp {
+            pid: 44,
+            exit: FAIL,
+            terminated: terminated.clone(),
+        });
+        terminate_bounded(proc, Duration::from_millis(50), &late, spawn_os_thread).unwrap();
+        assert!(late.wait_settled(Duration::from_secs(5)));
+        assert_eq!(terminated.load(Ordering::SeqCst), 1);
+        assert!(late.take().is_empty());
+    }
+
+    /// REPAIR-5・SUP-3・TASK-159.3: 再 launch の実行スレッドを作れないとき、`Unavailable` を返し、
+    /// `relaunch` は呼ばれず、`late` は完了済み（実行スレッド数 0・ハンドル 0 件）になる。
+    /// 同じ受け皿での次の再 launch は成功する。
+    #[test]
+    fn sup3_task159_3_relaunch_spawn_failure_settles_and_next_relaunch_works() {
+        let late = LateOrphans::default();
+        let q = Arc::new(Queue::new(&[(43, FAIL)]));
+        let Err(err) = relaunch_bounded(
+            &rl(&q),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            &late,
+            failing_spawn,
+        ) else {
+            panic!("forced failure must be reported")
+        };
+        assert_eq!(err.code(), ErrorCode::Unavailable);
+        assert_eq!(q.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(active_workers(&late), 0);
+        assert!(late.is_settled());
+        assert!(late.wait_settled(Duration::ZERO));
+        assert!(late.take().is_empty());
+
+        let Ok(proc) = relaunch_bounded(
+            &rl(&q),
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+            &late,
+            spawn_os_thread,
+        ) else {
+            panic!("relaunch after a spawn failure must succeed")
+        };
+        assert_eq!(proc.pid().get(), 43);
+        assert_eq!(q.calls.load(Ordering::SeqCst), 1);
+        assert!(late.wait_settled(Duration::from_secs(5)));
+        assert_eq!(active_workers(&late), 0);
+    }
+
+    /// REPAIR-5・SUP-3・TASK-159.3: 期限後に戻った再 launch の後始末で terminate の実行スレッドを作れないとき、
+    /// ハンドル（pid 43）を `Unavailable` とともに `late` へ積み、実行スレッド数は 0 に戻る。
+    #[test]
+    fn sup3_task159_3_late_terminate_spawn_failure_settles_and_keeps_handle() {
+        /// 再 launch の実行スレッドだけ生成し、後始末の terminate の実行スレッドは生成に失敗する。
+        fn relaunch_only(n: &str, run: Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()> {
+            if n == "fandhe-relaunch" {
+                spawn_os_thread(n, run)
+            } else {
+                failing_spawn(n, run)
+            }
+        }
+        struct Slow(Arc<AtomicU32>);
+        impl Relauncher for Slow {
+            fn relaunch(&self, _: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+                // 待ち上限＋猶予（550ms）を超えてから戻る。
+                std::thread::sleep(Duration::from_millis(1000));
+                Ok(Box::new(Fp {
+                    pid: 43,
+                    exit: FAIL,
+                    terminated: self.0.clone(),
+                }))
+            }
+        }
+        let late = LateOrphans::default();
+        let terminated = Arc::new(AtomicU32::new(0));
+        let q: Arc<dyn Relauncher> = Arc::new(Slow(terminated.clone()));
+        let Err(err) = relaunch_bounded(
+            &q,
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            &late,
+            relaunch_only,
+        ) else {
+            panic!("relaunch must time out")
+        };
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert!(!late.is_settled());
+        assert!(late.wait_settled(Duration::from_secs(5)));
+        assert_eq!(active_workers(&late), 0);
+        assert_eq!(terminated.load(Ordering::SeqCst), 0);
+        let got = late.take();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0.pid().get(), 43);
+        assert_eq!(got[0].1.code(), ErrorCode::Unavailable);
+    }
 }

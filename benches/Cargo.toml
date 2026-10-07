@@ -51,3 +51,7 @@ harness = false
 [[bin]]
 name = "plugin-boundary-stub"
 path = "src/bin/plugin_boundary_stub.rs"
+
+# workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
+[lints]
+workspace = true

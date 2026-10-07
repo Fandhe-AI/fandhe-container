@@ -42,3 +42,7 @@ objc2-virtualization = { workspace = true, features = [
 ] }
 block2 = { workspace = true, features = ["std"] }
 dispatch2 = { workspace = true, features = ["std", "block2", "objc2"] }
+
+# workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
+[lints]
+workspace = true

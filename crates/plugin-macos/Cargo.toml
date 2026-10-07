@@ -28,3 +28,7 @@ path = "src/main.rs"
 # lib と bin の rustdoc 出力名の衝突を避ける。
 doc = false
 bench = false
+
+# workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
+[lints]
+workspace = true

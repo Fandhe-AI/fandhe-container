@@ -24,3 +24,7 @@ publish = false
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+# workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
+[lints]
+workspace = true

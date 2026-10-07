@@ -114,3 +114,7 @@ harness = false
 name = "static_dns_privileged"
 path = "tests/static_dns_privileged.rs"
 harness = false
+
+# workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
+[lints]
+workspace = true

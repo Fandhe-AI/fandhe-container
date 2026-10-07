@@ -560,7 +560,8 @@ jobs:
           echo "::notice::container_options_ipc verified"
 
       # tmpfs_mount（`crates/core/tests/tmpfs_mount.rs`。SUP-12・TASK-169.2・#527）:
-      # `--shm-size` / `--tmpfs` の実 `mount(2)`・失敗時の `umount2(2)` と作成ディレクトリの後始末・
+      # `--shm-size` / `--tmpfs` の実マウント（新マウント API: `fsopen`・`fsconfig`・`fsmount`・`move_mount`。
+      # #1472）・失敗時の `umount2(2)` と作成ディレクトリの後始末・検査後の差し替え・
       # `ro,exec` の実フラグ・サイズ未指定のマウントを検証する実機前提テスト（harness = false）。
       # unshare_isolation と同じく Linux 限定・上で緩和した sysctl を再利用し、新しい check-run・sudo・
       # permissions は追加しない（rootless 経路のみ。rootful 経路は未検証）。`--ignored` が届かなくても

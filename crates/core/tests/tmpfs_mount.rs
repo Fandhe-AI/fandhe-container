@@ -3,6 +3,9 @@
 //! `harness = false` の単一スレッド `main` で動かす理由・流れは `pivot_root_isolation.rs` と同じ
 //! （`Cargo.toml` の `[[test]]`）。非 Linux では `exec` モジュール自体がビルド対象外。
 //!
+//! 新マウント API（`fsopen`・`fsconfig`・`fsmount`・`move_mount`。Linux 5.2 以降）で載せたマウントを、実際の
+//! mountinfo で照合する（SUP-12・TASK-169 追補・#1472）。
+//!
 //! # 流れ
 //! - 親: `proc/`・`dev/`・`outside/` と symlink `link -> outside` を持つ rootfs を作る → 分離（root は
 //!   rootful、非 root は rootless）→ 自身を `--child <rootfs>` で起動（新しい PID namespace の PID 1）
@@ -11,7 +14,10 @@
 //!   1. **失敗時の後始末**: `/rb/one`（自動作成）→ `/link/x`（symlink で拒否）の 2 件を適用し、
 //!      `path_symlink_or_not_directory` で失敗すること、1 件目の tmpfs が呼び出しスレッドの mountinfo から
 //!      消えていること、自動作成した `rb` が rootfs に残らないこと、symlink の先に何も作られないこと
-//!   2. **成功経路**: `/dev/shm`（64 KiB）・`/scratch`（128 KiB）・`/roexec`（`ro,exec`・64 KiB）・
+//!   2. **検査後の差し替え**: `exec-test-support` の入口 `mount_tmpfs_with_attach_hook` で、移動検査の後・
+//!      付け替えの直前に `/swap` を改名して同名の新ディレクトリを作る。`failed_precondition` で失敗し、
+//!      `swap`・`swapped` のどちらにもマウントが残らず（自分のマウントを fd で外す）、両方が空のまま残ること
+//!   3. **成功経路**: `/dev/shm`（64 KiB）・`/scratch`（128 KiB）・`/roexec`（`ro,exec`・64 KiB）・
 //!      `/nosize`（サイズ未指定）を適用 → `pivot_root` の後、`/proc/self/mountinfo` で 4 件が fstype
 //!      `tmpfs`・`nosuid,nodev` で存在し、`noexec` / `ro` が指定どおりであること、サイズ指定の 3 件が
 //!      指定サイズであること、サイズ未指定の件に `size=` が出ないこと（カーネル既定のまま）、マウント先の
@@ -57,8 +63,8 @@ mod linux {
 
     use fandhe_container_core::exec::{
         IsolationConfig, IsolationStage, MountIsolation, Namespace, NamespaceSet, PreparedRootfs,
-        ViolationReason, isolate, isolate_rootful_host_root, mount_tmpfs, pivot_root, plan,
-        plan_rootful_host_root, prepare_rootfs,
+        ViolationReason, isolate, isolate_rootful_host_root, mount_tmpfs,
+        mount_tmpfs_with_attach_hook, pivot_root, plan, plan_rootful_host_root, prepare_rootfs,
     };
     use fandhe_container_core::tmpfs::{TmpfsMountSet, TmpfsMountSpec, TmpfsSize};
 
@@ -113,6 +119,8 @@ mod linux {
         std::fs::create_dir_all(base.join("dev")).expect("create rootfs/dev");
         // 失敗シナリオ用: rootfs 内の symlink（辿らずに拒否されること）とその先。
         std::fs::create_dir_all(base.join("outside")).expect("create rootfs/outside");
+        // 差し替えシナリオ用: 検査後に改名される既存のマウント先。
+        std::fs::create_dir_all(base.join("swap")).expect("create rootfs/swap");
         std::os::unix::fs::symlink("outside", base.join("link")).expect("create rootfs/link");
         Rootfs(base)
     }
@@ -229,6 +237,48 @@ mod linux {
         );
     }
 
+    /// 検査後の差し替え（SUP-12・TASK-169 追補・#1472）: 移動検査の後・付け替えの直前にマウント先を改名し
+    /// 同名の新しいディレクトリを作っても、tmpfs は固定した実体（改名後の `swapped`）にしか載らず、名前の
+    /// 位置（新しい `swap`）には載らない。事後検証が `failed_precondition` で拒否し、自分のマウントを fd で
+    /// 外すため、どちらにもマウントは残らない。
+    fn swap_scenario(isolation: &MountIsolation, prepared: &PreparedRootfs, rootfs: &Path) {
+        let mut set = TmpfsMountSet::new();
+        set.push(TmpfsMountSpec::new("/swap", None).expect("swap spec"))
+            .expect("push swap");
+        let (from, to) = (rootfs.join("swap"), rootfs.join("swapped"));
+        let err = mount_tmpfs_with_attach_hook(isolation, prepared, &set, &|| {
+            std::fs::rename(&from, &to).expect("rename swap");
+            std::fs::create_dir(&from).expect("recreate swap");
+        })
+        .expect_err("swapped target must be rejected");
+        assert_eq!(err.stage, IsolationStage::MountTmpfs);
+        assert_eq!(
+            err.code,
+            fandhe_container_core::traits::types::ErrorCode::FailedPrecondition
+        );
+        let info = std::fs::read_to_string("/proc/thread-self/mountinfo").expect("mountinfo");
+        let leftover: Vec<String> = info
+            .lines()
+            .filter_map(parse_line)
+            .map(|l| l.0)
+            .filter(|point| point.ends_with("/swap") || point.ends_with("/swapped"))
+            .collect();
+        assert_eq!(
+            leftover,
+            Vec::<String>::new(),
+            "our mount must be unmounted by fd"
+        );
+        for name in ["swap", "swapped"] {
+            assert_eq!(
+                std::fs::read_dir(rootfs.join(name))
+                    .unwrap_or_else(|e| panic!("{name} must remain a directory: {e}"))
+                    .count(),
+                0,
+                "{name} must stay empty"
+            );
+        }
+    }
+
     fn child(rootfs: &Path, _rootful: bool) {
         assert_eq!(
             std::process::id(),
@@ -238,6 +288,7 @@ mod linux {
         let isolation = MountIsolation::establish().expect("establish mount isolation");
         let prepared = prepare_rootfs(&isolation, rootfs).expect("prepare rootfs");
         rollback_scenario(&isolation, &prepared, rootfs);
+        swap_scenario(&isolation, &prepared, rootfs);
 
         let mut set = TmpfsMountSet::new();
         let kib64 = TmpfsSize::from_bytes(64 * 1024).expect("64 KiB");
@@ -292,6 +343,9 @@ mod linux {
             assert_eq!(opts.contains(&"ro"), read_only, "{point} ro: {opts:?}");
             assert_eq!(opts.contains(&"rw"), !read_only, "{point} rw: {opts:?}");
             let sup: Vec<&str> = sup.split(',').collect();
+            // superblock 側も読み取り専用（旧 `MS_RDONLY` と同じく superblock とマウントの両方が ro）。
+            assert_eq!(sup.contains(&"ro"), read_only, "{point} super ro: {sup:?}");
+            assert_eq!(sup.contains(&"rw"), !read_only, "{point} super rw: {sup:?}");
             let shown: Vec<&str> = sup
                 .iter()
                 .copied()

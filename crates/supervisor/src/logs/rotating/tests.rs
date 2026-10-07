@@ -340,3 +340,30 @@ fn sup7_task164_2_open_rejects_names_exceeding_name_max() {
     let max = ContainerId::new("b".repeat(255)).unwrap();
     assert!(RotatingFileSink::open(&t.0, &max, one).is_err());
 }
+
+/// 世代数を減らして開き直したとき、範囲外の旧世代が残るなら拒否する（上限契約。何も動かさない）。
+#[test]
+fn sup7_task164_2_open_rejects_stale_generations_after_reducing_count() {
+    let t = TmpDir::new("stale");
+    {
+        let cfg = RotationConfig::new(MIN_LOG_FILE_BYTES, 3).unwrap();
+        let s = RotatingFileSink::open(&t.0, &id(), cfg).unwrap();
+        for _ in 0..3 {
+            s.append(StreamKind::Stdout, b"x").unwrap();
+        }
+    }
+    fs::write(t.0.join("c1.log.1"), b"a").unwrap();
+    fs::write(t.0.join("c1.log.2"), b"b").unwrap();
+    let before = files(&t.0);
+    let one = RotationConfig::new(MIN_LOG_FILE_BYTES, 1).unwrap();
+    let e = RotatingFileSink::open(&t.0, &id(), one).err().unwrap();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    assert_eq!(files(&t.0), before);
+    // 2 世代でも c1.log.2 が範囲外なので拒否する。
+    let two = RotationConfig::new(MIN_LOG_FILE_BYTES, 2).unwrap();
+    let e = RotatingFileSink::open(&t.0, &id(), two).err().unwrap();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    // 元の 3 世代なら開ける。
+    let three = RotationConfig::new(MIN_LOG_FILE_BYTES, 3).unwrap();
+    assert!(RotatingFileSink::open(&t.0, &id(), three).is_ok());
+}

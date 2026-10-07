@@ -15,6 +15,8 @@
 //!   open するたびに 1 世代を消費する。
 //! - [`RotatingFileSink::open`] は既存の現在ログ・各世代が上限を超えていれば `InvalidArgument` で拒否し、
 //!   `<id>.log.<n>` が NAME_MAX を超える長さの ID も拒否する（いずれも既存ファイルは動かさない）。
+//! - 設定の世代数以上の番号の旧世代（`<id>.log.<n>`、`n >= generations`）が残っていれば、世代数を減らした
+//!   開き直しとして `InvalidArgument` で拒否する（上限契約を守るため。既存ファイルは動かさず、手動整理を求める）。
 //! - ローテーション・書き込みの失敗は握りつぶさず `Internal` で返し、sink を失敗状態に固定する（fail-closed）。
 //!   以後の `append` は両ストリームとも `Err` になる。エラーメッセージにパス・行内容・errno は含めない（ERR-1）。
 //!
@@ -172,6 +174,7 @@ impl RotatingFileSink {
         // 既存の現在ログ・各世代が上限を超えていたら、何も動かさずに拒否する（契約:
         // 全ファイル len <= max_file_bytes）。上限を下げて開き直した場合は手動で整理させる。
         sink.check_existing_sizes()?;
+        sink.check_stale_generations()?;
         // 既存エントリ（種別不問）があれば、辿らずに世代へ送ってから作り直す。
         if fs::symlink_metadata(sink.path(0)).is_ok() {
             sink.shift_generations()?;
@@ -243,6 +246,31 @@ impl RotatingFileSink {
                     ));
                 }
                 Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(_) => return Err(internal("log file inspection failed")),
+            }
+        }
+        Ok(())
+    }
+
+    /// 設定の世代数以上の番号を持つ旧世代（`<id>.log.<n>`、`n >= generations`）が残っていないことを確認する。
+    ///
+    /// 世代数を減らして開き直すと、範囲外の旧世代はローテーションの対象外のまま残り、
+    /// ディスク使用量の上限 `max_file_bytes × generations` の契約を破る。利用者のログを黙って
+    /// 消さないため、ファイルを変更する前に `InvalidArgument` で拒否し、手動で整理させる（SUP-7・TASK-164.2）。
+    fn check_stale_generations(&self) -> Result<(), TraitError> {
+        for n in self.config.generations.max(1)..MAX_LOG_GENERATIONS {
+            // NAME_MAX を超える名前は存在し得ず、問い合わせも ENAMETOOLONG になるため飛ばす。
+            if self.base.len() + 1 + n.to_string().len() > MAX_FILE_NAME_BYTES {
+                continue;
+            }
+            match fs::symlink_metadata(self.path(n)) {
+                Ok(_) => {
+                    return Err(TraitError::new(
+                        ErrorCode::InvalidArgument,
+                        "stale log generation exists beyond the configured generation count",
+                    ));
+                }
                 Err(e) if e.kind() == ErrorKind::NotFound => {}
                 Err(_) => return Err(internal("log file inspection failed")),
             }

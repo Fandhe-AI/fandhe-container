@@ -213,6 +213,24 @@ fn sup12_task169_5_2_ipc_host_with_shm_size_is_rejected() {
     assert_eq!(a.labels().iter().count(), 4);
 }
 
+/// AC: `--ipc=host` と `--tmpfs /dev/shm` の併用は（`--shm-size` なしでも）InvalidArgument で拒否する。
+#[test]
+fn sup12_task169_5_2_ipc_host_with_tmpfs_dev_shm_is_rejected() {
+    let o = ContainerOptions::new()
+        .with_ipc_mode(IpcMode::Host)
+        .with_mounts(
+            MountOptions::default()
+                .with_tmpfs(TmpfsOption::parse("/dev/shm:size=1m").unwrap())
+                .unwrap(),
+        );
+    let e = o.tmpfs_set().unwrap_err();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    assert_eq!(
+        e.message(),
+        "--tmpfs /dev/shm cannot be combined with --ipc=host"
+    );
+}
+
 /// 境界: `--ipc=host` でも `--shm-size` を伴わない `--tmpfs` は受理される。
 #[test]
 fn sup12_task169_5_2_ipc_host_without_shm_size_is_accepted() {
@@ -249,11 +267,17 @@ mod linux {
     impl TmpDir {
         fn new() -> Self {
             use std::os::unix::fs::PermissionsExt;
-            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-            let p =
-                std::env::temp_dir().join(format!("fandhe-sup-options-{}-{n}", std::process::id()));
-            let _ = fs::remove_dir_all(&p);
-            fs::create_dir_all(&p).unwrap();
+            // 既存パスは削除せず、未使用名が見つかるまで連番を進めて `create_dir`（既存なら失敗）で新規作成する。
+            let p = loop {
+                let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+                let p = std::env::temp_dir()
+                    .join(format!("fandhe-sup-options-{}-{n}", std::process::id()));
+                match fs::create_dir(&p) {
+                    Ok(()) => break p,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("create temp dir: {e}"),
+                }
+            };
             fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
             Self(p)
         }

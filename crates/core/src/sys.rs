@@ -2593,8 +2593,6 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
-    /// SEC-1・TASK-37.1: capability 関連の定数の具体値。
-    #[cfg(target_arch = "x86_64")]
     /// SUP-6・SEC-1・TASK-163 追補（#1457）: `getgroups` / `setgroups` の syscall 番号（x86_64 は
     /// syscall_64.tbl、aarch64 は asm-generic/unistd.h）と、件数の取得が実プロセスの `Groups:` と一致すること。
     #[test]
@@ -2613,6 +2611,8 @@ mod tests {
         assert_eq!(supplementary_group_count(), Ok(groups));
     }
 
+    /// SEC-1・TASK-37.1: capability 関連の定数の具体値。
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn sec1_capability_consts_are_exact_x86_64() {
         assert_eq!(consts::SYS_CAPGET, 125);
@@ -2823,8 +2823,6 @@ mod tests {
         );
     }
 
-    /// CORE-1（TASK-27.4.1）: fork / exec / wait 系の定数の具体値。syscall 番号・フラグ・シグナル番号は
-    /// arch ごとに個別定義する（x86_64 = syscall_64.tbl、aarch64 = asm-generic/unistd.h）。
     /// SUP-6・TASK-163 追補（#1459）: `O_NOCTTY` の値（x86_64・aarch64 とも asm-generic の 0o400）と、
     /// procfs の fd エントリ名の組み立て（アロケーションなし）の具体値。
     #[test]
@@ -2865,6 +2863,8 @@ mod tests {
         );
     }
 
+    /// CORE-1（TASK-27.4.1）: fork / exec / wait 系の定数の具体値。syscall 番号・フラグ・シグナル番号は
+    /// arch ごとに個別定義する（x86_64 = syscall_64.tbl、aarch64 = asm-generic/unistd.h）。
     #[test]
     fn core1_fork_exec_consts_are_exact() {
         #[cfg(target_arch = "x86_64")]

@@ -351,8 +351,10 @@ pub const ANNOTATIONS_MAX_ENTRIES: usize = 64;
 pub const ANNOTATION_MAX_KEY_BYTES: usize = 255;
 /// [`Annotations`] の全キー・値の合計最大バイト数。
 ///
-/// state.json 全体の上限（64 KiB）に対し、JSON エスケープで最悪 6 倍になっても収まる水準。
-pub const ANNOTATIONS_MAX_TOTAL_BYTES: usize = 8 * 1024;
+/// state.json 全体の上限（64 KiB）に対し、bundle パス（最大 4096 バイト）と合わせて JSON エスケープで
+/// 最悪 6 倍（制御文字の `\u00XX`）になっても収まる水準。最悪時は bundle 24 KiB + annotations 24 KiB
+/// + キー区切り等の構造オーバーヘッドで 64 KiB を下回る。
+pub const ANNOTATIONS_MAX_TOTAL_BYTES: usize = 4 * 1024;
 
 /// コンテナのメタデータ（label。OCI state の `annotations` に対応。SUP-12・TASK-169.5.1・MS-9）。
 ///

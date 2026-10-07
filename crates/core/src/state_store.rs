@@ -2031,6 +2031,34 @@ mod tests {
         assert_eq!(got.annotations(), &labels);
     }
 
+    /// SUP-12・TASK-169.5.1: 最悪エスケープ（bundle・annotations 全体が制御文字で 1 バイト 6 倍）でも書ける。
+    #[test]
+    fn sup12_task169_5_1_worst_case_escape_bundle_and_annotations_fit() {
+        let t = TmpDir::new("annworst");
+        let store = t.open();
+        let per = ANNOTATIONS_MAX_TOTAL_BYTES / ANNOTATIONS_MAX_ENTRIES;
+        let entries: Vec<(String, String)> = (0..ANNOTATIONS_MAX_ENTRIES)
+            .map(|i| {
+                let key = format!("{i:03}");
+                let value = "\u{1}".repeat(per - key.len());
+                (key, value)
+            })
+            .collect();
+        let labels = Annotations::new(entries).unwrap();
+        let worst_bundle = PathBuf::from(format!("/{}", "\u{1}".repeat(MAX_BUNDLE_PATH_BYTES - 1)));
+        assert_eq!(worst_bundle.as_os_str().len(), MAX_BUNDLE_PATH_BYTES);
+        let req = CreateStateRequest::new(
+            ContainerStatus::created(cid("worst"), None),
+            worst_bundle.clone(),
+        )
+        .unwrap()
+        .with_annotations(labels.clone());
+        store.create(&req).unwrap();
+        let got = t.open().get(&GetStateRequest::new(cid("worst"))).unwrap();
+        assert_eq!(got.annotations(), &labels);
+        assert_eq!(got.bundle(), worst_bundle.as_path());
+    }
+
     #[test]
     fn cri7_file_state_store_is_dyn_compatible() {
         let t = TmpDir::new("dyn");

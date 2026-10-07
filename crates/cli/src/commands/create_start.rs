@@ -105,12 +105,37 @@ fn production_runtime(global: &GlobalArgs, op: LifecycleOp) -> Result<Runtime, O
     })
 }
 
+/// 操作計測（`OpRecorder`）の JSON Lines 出力先を指す環境変数（REPAIR-4）。
+///
+/// OCI の stdout 契約（create / start は成功時に何も出さない）と stderr の 1 行エラー JSON を保つため、
+/// 計測は stdout / stderr へ混ぜず、この環境変数が指すファイルへ追記する。未設定なら出力しない。
+pub(super) const OP_LOG_ENV: &str = "FANDHE_CONTAINER_OP_LOG";
+
+/// 計測を `path` のファイルへ追記する（best effort。失敗しても終了コード・エラー出力は変えない）。
+pub(super) fn export_ops(recorder: &OpRecorder, path: Option<&std::ffi::OsStr>) {
+    let Some(path) = path.filter(|p| !p.is_empty()) else {
+        return;
+    };
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let _ = recorder.export_json_lines(Some(&mut f));
+}
+
 /// 本番入口の `create`。成功時は何も出さない（OCI の create 互換）。
 pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
-    let result = production_runtime(global, LifecycleOp::Create)
-        .and_then(|rt| create_container(&rt, args).map(|_| ()));
+    let rt = match production_runtime(global, LifecycleOp::Create) {
+        Ok(rt) => rt,
+        Err(e) => return CliExit::Runtime(e),
+    };
+    let result = create_container(&rt, args);
+    export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
     match result {
-        Ok(()) => CliExit::Success,
+        Ok(_) => CliExit::Success,
         Err(e) => CliExit::Runtime(e),
     }
 }
@@ -121,7 +146,9 @@ pub(super) fn run_start(global: &GlobalArgs, args: &StartArgs) -> CliExit {
         Ok(rt) => rt,
         Err(e) => return CliExit::Runtime(e),
     };
-    match start_container(&rt, args) {
+    let result = start_container(&rt, args);
+    export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
+    match result {
         // 本番 launcher（UnavailableLauncher）では到達しない。将来 launcher が差し替わっても、
         // 監視者へ引き渡せないまま CLI が終了して孤児プロセスを残さないよう、止めてから失敗を返す
         // （fail-closed）。supervisor への引き渡しは TASK-157。
@@ -164,7 +191,11 @@ mod tests {
     #[test]
     fn err2_build_requests_reject_invalid_id() {
         for id in ["a/b", "..", "", "a b"] {
-            let e = build_create_request(&create_args("/abs", id)).expect_err("id");
+            let e = build_create_request(&CreateArgs {
+                bundle: std::env::temp_dir(),
+                id: id.to_string(),
+            })
+            .expect_err("id");
             assert_eq!(e.code(), ErrorCode::InvalidArgument);
             let e = build_start_request(&StartArgs { id: id.to_string() }).expect_err("id");
             assert_eq!(e.code(), ErrorCode::InvalidArgument);
@@ -174,9 +205,39 @@ mod tests {
     /// CLI-1: 正常な引数は core の要求型へ値をそのまま写す。
     #[test]
     fn cli1_build_create_request_keeps_values() {
-        let req = build_create_request(&create_args("/abs/b", "c1")).expect("ok");
+        // OS ごとに絶対パスの形が違う（Windows は `/abs/b` を絶対と見なさない）ため temp_dir 由来にする。
+        let bundle = std::env::temp_dir().join("abs-b");
+        let req = build_create_request(&CreateArgs {
+            bundle: bundle.clone(),
+            id: "c1".to_string(),
+        })
+        .expect("ok");
         assert_eq!(req.id().as_str(), "c1");
-        assert_eq!(req.bundle(), std::path::Path::new("/abs/b"));
+        assert_eq!(req.bundle(), bundle.as_path());
+    }
+
+    /// REPAIR-4: 計測は指定ファイルへ JSON Lines で追記され、未指定なら何も書かない。
+    #[test]
+    fn repair4_export_ops_appends_json_lines() {
+        use fandhe_container_core::observability::{OpName, OpOutcome};
+        let rec = OpRecorder::new();
+        rec.record(
+            &OpName::new("create").expect("name"),
+            OpOutcome::Success,
+            Duration::from_millis(1),
+        )
+        .expect("record");
+        let path = std::env::temp_dir().join(format!("fc-cli-oplog-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        export_ops(&rec, None);
+        assert!(!path.exists());
+        export_ops(&rec, Some(path.as_os_str()));
+        let text = std::fs::read_to_string(&path).expect("read");
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"op_stats\""));
+        assert!(lines[1].contains("\"op_stats_meta\""));
     }
 
     #[cfg(target_os = "linux")]

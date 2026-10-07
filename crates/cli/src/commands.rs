@@ -72,18 +72,17 @@ pub const EXIT_UNIMPLEMENTED: u8 = OCI_EXIT_UNIMPLEMENTED.get();
 
 /// [`run`] の結果。終了コードと、失敗時の機械可読なエラー（`code` / `message`）を持つ。
 ///
-/// 固定文言の失敗（[`CliExit::Fixed`]）は module 内の固定文言からのみ構築されるためエスケープ不要で、
+/// 固定文言の失敗（[`CliExit::Usage`]・[`CliExit::Unimplemented`]）は閉じた列挙で、文言は本 module の
+/// 定数のみ（外部から任意の文字列・終了コードを構築できないためエスケープ不要・失敗に 0 も指定できない）。
 /// core 由来の失敗は `OciRuntimeError::write_json_line`（serde_json）で出力する（JSON を手組みしない。REPAIR-2）。
 #[derive(Debug)]
 pub enum CliExit {
     /// 成功（終了コード 0・出力なし。OCI の create / start は成功時に何も出さない）。
     Success,
-    /// 使い方エラー・未実装などの固定文言の失敗。
-    Fixed {
-        exit_code: u8,
-        code: &'static str,
-        message: &'static str,
-    },
+    /// 使い方エラー（終了コード 2・`INVALID_ARGUMENT`）。
+    Usage,
+    /// 未実装コマンド（終了コード 8・`UNIMPLEMENTED`）。
+    Unimplemented,
     /// core のライフサイクル操作の失敗（ERR-2。終了コードは `OciRuntimeError::exit_code`）。
     Runtime(OciRuntimeError),
 }
@@ -93,7 +92,8 @@ impl CliExit {
     pub fn exit_code(&self) -> u8 {
         match self {
             CliExit::Success => 0,
-            CliExit::Fixed { exit_code, .. } => *exit_code,
+            CliExit::Usage => EXIT_USAGE,
+            CliExit::Unimplemented => EXIT_UNIMPLEMENTED,
             CliExit::Runtime(e) => e.exit_code().get(),
         }
     }
@@ -102,7 +102,8 @@ impl CliExit {
     pub fn code(&self) -> Option<&'static str> {
         match self {
             CliExit::Success => None,
-            CliExit::Fixed { code, .. } => Some(code),
+            CliExit::Usage => Some("INVALID_ARGUMENT"),
+            CliExit::Unimplemented => Some("UNIMPLEMENTED"),
             CliExit::Runtime(e) => Some(e.code().as_str()),
         }
     }
@@ -111,28 +112,29 @@ impl CliExit {
     pub fn write_stderr(&self, out: &mut dyn Write) -> std::io::Result<()> {
         match self {
             CliExit::Success => Ok(()),
-            CliExit::Fixed { code, message, .. } => {
-                writeln!(out, "{{\"code\":\"{code}\",\"message\":\"{message}\"}}")
-            }
+            // 文言は引用符・バックスラッシュ・改行を含まない定数のみ（テストで固定）。
+            CliExit::Usage => writeln!(
+                out,
+                "{{\"code\":\"INVALID_ARGUMENT\",\"message\":\"{USAGE_MESSAGE}\"}}"
+            ),
+            CliExit::Unimplemented => writeln!(
+                out,
+                "{{\"code\":\"UNIMPLEMENTED\",\"message\":\"{UNIMPLEMENTED_MESSAGE}\"}}"
+            ),
             CliExit::Runtime(e) => e.write_json_line(out),
         }
     }
 }
 
+const USAGE_MESSAGE: &str = "usage: fandhe-container <create|start|stop|delete|list|logs>";
+const UNIMPLEMENTED_MESSAGE: &str = "command is not implemented yet";
+
 fn usage() -> CliExit {
-    CliExit::Fixed {
-        exit_code: EXIT_USAGE,
-        code: "INVALID_ARGUMENT",
-        message: "usage: fandhe-container <create|start|stop|delete|list|logs>",
-    }
+    CliExit::Usage
 }
 
 fn unimplemented_command() -> CliExit {
-    CliExit::Fixed {
-        exit_code: EXIT_UNIMPLEMENTED,
-        code: "UNIMPLEMENTED",
-        message: "command is not implemented yet",
-    }
+    CliExit::Unimplemented
 }
 
 /// argv（プログラム名を除く）を解釈して実行する。

@@ -795,7 +795,11 @@ fn open_entrypoint(
         )
     };
     // 絶対パスなので解決は呼び出しプロセスの root（= 照合済みの `root`）から始まる。
-    let pinned = sys::open_path_follow_at(root, &entry.path).map_err(open_error)?;
+    // 固定用の fd も 3 以上へ置く（呼び出し元の fd 0〜2 が閉じていると `openat` はその番号を返し、直後の
+    // 「継承した標準入出力と同一の実体か」の照合が、固定した fd 自身と一致して通常のファイルを誤って拒否する）。
+    let pinned = sys::open_path_follow_at(root, &entry.path)
+        .map_err(open_error)
+        .and_then(keep_above_stdio)?;
     let meta = pinned
         .try_clone()
         .and_then(|fd| std::fs::File::from(fd).metadata())
@@ -842,7 +846,9 @@ fn open_entrypoint(
 ///
 /// 標準入出力の置換（`dup2`）をまたいで保持する fd はすべてこれを通す: エントリポイント・照合済みの `/`・
 /// procfs・状態を返す pipe の両端（置換で潰される、または置換後の `/dev/null` を close で閉じてしまうため）。
-/// 置換より前に閉じる一時的な fd（`/dev`・固定用の `O_PATH`・インタープリタ）は対象外。
+/// 継承した標準入出力（fd 0〜2）の実体と照合する前に開く、エントリポイントの固定用の `O_PATH` も通す（0〜2 を
+/// 取ると照合が自分自身と一致する）。置換より前に閉じ、標準入出力との照合にも関わらない一時的な fd（`/dev`・
+/// `/dev/null` の固定用の `O_PATH`・インタープリタ・cwd・`self/exe`）は対象外。
 ///
 /// 複製は `sys::dup_fd_at_least(fd, 3)`（`F_DUPFD_CLOEXEC` に下限 3 を明示。カーネルが 3 以上を
 /// 保証するため、標準 fd が複数閉じていても 0〜2 には戻らない）。

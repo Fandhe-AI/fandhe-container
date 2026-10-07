@@ -82,6 +82,8 @@ pub enum PrivilegeErrorReason {
     MissingCapabilities,
     /// uid 0 が残っている。
     UnexpectedRootUid,
+    /// gid 0 または補助グループが残っている。
+    UnexpectedGroups,
     /// ambient / inheritable が期待と一致しない。
     AmbientMismatch,
     /// `/proc/<pid>/status` の形式不正・欠落・上限超過。
@@ -199,8 +201,27 @@ impl UidSet {
     }
 }
 
-/// `/proc/<pid>/status` から取り出した資格情報のスナップショット。
+/// gid の 4 つ組（real・effective・saved・fs）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GidSet {
+    /// real gid。
+    pub real: u32,
+    /// effective gid。
+    pub effective: u32,
+    /// saved set-group-ID。
+    pub saved: u32,
+    /// filesystem gid。
+    pub fs: u32,
+}
+
+impl GidSet {
+    fn any_root(self) -> bool {
+        self.real == 0 || self.effective == 0 || self.saved == 0 || self.fs == 0
+    }
+}
+
+/// `/proc/<pid>/status` から取り出した資格情報のスナップショット。
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CredentialSnapshot {
     /// `CapInh`。
@@ -217,6 +238,10 @@ pub struct CredentialSnapshot {
     pub no_new_privs: bool,
     /// `Uid`。
     pub uid: UidSet,
+    /// `Gid`。
+    pub gid: GidSet,
+    /// `Groups`（補助グループ。縮退後は空であることを要求する）。
+    pub groups: Vec<u32>,
 }
 
 #[derive(Default)]
@@ -228,6 +253,8 @@ struct Fields {
     amb: Option<CapMask>,
     nnp: Option<bool>,
     uid: Option<UidSet>,
+    gid: Option<GidSet>,
+    groups: Option<Vec<u32>>,
 }
 
 fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> Result<(), PrivilegeError> {
@@ -264,9 +291,38 @@ fn parse_uids(value: &str) -> Result<UidSet, PrivilegeError> {
     Ok(uid)
 }
 
+fn parse_gids(value: &str) -> Result<GidSet, PrivilegeError> {
+    let bad = || PrivilegeError::malformed("field Gid must have four decimal u32 values");
+    let mut it = value.split_whitespace();
+    let mut next = || -> Result<u32, PrivilegeError> {
+        it.next().ok_or_else(bad)?.parse::<u32>().map_err(|_| bad())
+    };
+    let gid = GidSet {
+        real: next()?,
+        effective: next()?,
+        saved: next()?,
+        fs: next()?,
+    };
+    if it.next().is_some() {
+        return Err(bad());
+    }
+    Ok(gid)
+}
+
+/// `Groups` 行（空も可）を取り出す。件数は入力長上限（`MAX_STATUS_BYTES`）で自然に抑えられる。
+fn parse_groups(value: &str) -> Result<Vec<u32>, PrivilegeError> {
+    value
+        .split_whitespace()
+        .map(|g| {
+            g.parse::<u32>()
+                .map_err(|_| PrivilegeError::malformed("field Groups must have decimal u32 values"))
+        })
+        .collect()
+}
+
 /// `/proc/<pid>/status` の内容から資格情報を取り出す（純関数）。
 ///
-/// 入力長・行数の上限超過、必須項目（`CapInh`・`CapPrm`・`CapEff`・`CapBnd`・`CapAmb`・`NoNewPrivs`・`Uid`）の
+/// 入力長・行数の上限超過、必須項目（`CapInh`・`CapPrm`・`CapEff`・`CapBnd`・`CapAmb`・`NoNewPrivs`・`Uid`・`Gid`・`Groups`）の
 /// 欠落・重複、形式不正・桁あふれは [`ErrorCode::FailedPrecondition`]（`MalformedStatus`）。
 /// `CapAmb`・`NoNewPrivs` を持たない古いカーネルは fail-closed に拒否する。
 pub fn parse_proc_status(text: &str) -> Result<CredentialSnapshot, PrivilegeError> {
@@ -302,6 +358,8 @@ pub fn parse_proc_status(text: &str) -> Result<CredentialSnapshot, PrivilegeErro
                 set_once(&mut f.nnp, v, key)?;
             }
             "Uid" => set_once(&mut f.uid, parse_uids(value)?, key)?,
+            "Gid" => set_once(&mut f.gid, parse_gids(value)?, key)?,
+            "Groups" => set_once(&mut f.groups, parse_groups(value)?, key)?,
             _ => {}
         }
     }
@@ -314,6 +372,8 @@ pub fn parse_proc_status(text: &str) -> Result<CredentialSnapshot, PrivilegeErro
         ambient: f.amb.ok_or_else(|| missing("CapAmb"))?,
         no_new_privs: f.nnp.ok_or_else(|| missing("NoNewPrivs"))?,
         uid: f.uid.ok_or_else(|| missing("Uid"))?,
+        gid: f.gid.ok_or_else(|| missing("Gid"))?,
+        groups: f.groups.ok_or_else(|| missing("Groups"))?,
     })
 }
 
@@ -327,6 +387,8 @@ pub struct ElevationReport {
     pub held: CapabilitySet,
     /// 確認時の uid。
     pub uid: UidSet,
+    /// 確認時の gid。
+    pub gid: GidSet,
 }
 
 fn denied(reason: PrivilegeErrorReason, message: &str) -> PrivilegeError {
@@ -335,7 +397,7 @@ fn denied(reason: PrivilegeErrorReason, message: &str) -> PrivilegeError {
 
 /// 縮退後のスナップショットが期待集合ちょうどであることを fail-closed で検証する。
 ///
-/// 判定順: `no_new_privs` → uid 0 残存 → 過剰（permitted・effective・bounding・inheritable・ambient。未知ビット含む）
+/// 判定順: `no_new_privs` → uid 0 残存 → gid 0・補助グループ残存（補助グループは空のみ許可）→ 過剰（permitted・effective・bounding・inheritable・ambient。未知ビット含む）
 /// → 不足（permitted・effective・bounding）→ ambient 一致（ambient == 期待、inheritable ⊇ ambient）。
 /// ambient 一致は方式によらず要求する（設計書 5 章 4 は (c)(a) とも ambient へ載せるため）。
 pub fn verify_elevation(
@@ -355,6 +417,12 @@ pub fn verify_elevation(
         return Err(denied(
             PrivilegeErrorReason::UnexpectedRootUid,
             "uid 0 remains after privilege reduction",
+        ));
+    }
+    if snapshot.gid.any_root() || !snapshot.groups.is_empty() {
+        return Err(denied(
+            PrivilegeErrorReason::UnexpectedGroups,
+            "gid 0 or supplementary groups remain after privilege reduction",
         ));
     }
     let excess = [
@@ -392,6 +460,7 @@ pub fn verify_elevation(
         method,
         held: snapshot.permitted.known(),
         uid: snapshot.uid,
+        gid: snapshot.gid,
     })
 }
 
@@ -409,6 +478,8 @@ pub struct ReductionPlan {
     pub inheritable: CapabilitySet,
     /// ambient に載せる集合。
     pub ambient: CapabilitySet,
+    /// 補助グループを全消去する（`setgroups(0)` 相当。縮退後の `Groups` は空が要件）。
+    pub clear_supplementary_groups: bool,
 }
 
 /// 現在の資格情報から期待集合への縮退計画を算出する（純関数。何も適用しない）。
@@ -437,6 +508,7 @@ pub fn plan_reduction(
         effective: expected,
         inheritable: expected,
         ambient: expected,
+        clear_supplementary_groups: true,
     })
 }
 
@@ -458,6 +530,7 @@ mod tests {
     use super::*;
 
     const UID: &str = "1000\t1000\t1000\t1000";
+    const GID: &str = "1000\t1000\t1000\t1000";
     const FULL: &str = "000001ffffffffff";
 
     fn status(
@@ -470,7 +543,7 @@ mod tests {
         uid: &str,
     ) -> String {
         format!(
-            "Name:\tx\nUid:\t{uid}\nCapInh:\t{inh}\nCapPrm:\t{prm}\nCapEff:\t{eff}\nCapBnd:\t{bnd}\nCapAmb:\t{amb}\nNoNewPrivs:\t{nnp}\n"
+            "Name:\tx\nUid:\t{uid}\nGid:\t{GID}\nGroups:\t\nCapInh:\t{inh}\nCapPrm:\t{prm}\nCapEff:\t{eff}\nCapBnd:\t{bnd}\nCapAmb:\t{amb}\nNoNewPrivs:\t{nnp}\n"
         )
     }
 
@@ -553,6 +626,30 @@ mod tests {
     }
 
     #[test]
+    fn sup14_task171_1_2_verify_rejects_gid_and_groups() {
+        let m = mask_hex();
+        let ok = status(&m, &m, &m, &m, &m, "0", UID);
+        let cases = [
+            ok.replace("Gid:\t1000\t1000\t1000\t1000", "Gid:\t1000\t0\t1000\t1000"),
+            ok.replace("Gid:\t1000\t1000\t1000\t1000", "Gid:\t0\t1000\t1000\t1000"),
+            ok.replace("Groups:\t\n", "Groups:\t0\n"),
+            ok.replace("Groups:\t\n", "Groups:\t1000 4\n"),
+        ];
+        for c in cases {
+            let e = verify(&c).unwrap_err();
+            assert_eq!(
+                (e.code, e.reason),
+                (
+                    ErrorCode::PermissionDenied,
+                    PrivilegeErrorReason::UnexpectedGroups
+                )
+            );
+        }
+        let r = verify(&ok).unwrap();
+        assert_eq!(r.gid.effective, 1000);
+    }
+
+    #[test]
     fn sup14_task171_1_2_parse_rejects_malformed() {
         let m = mask_hex();
         let ok = status(&m, &m, &m, &m, &m, "0", UID);
@@ -566,6 +663,10 @@ mod tests {
             status("", &m, &m, &m, &m, "0", UID),
             status(&m, &m, &m, &m, &m, "2", UID),
             status(&m, &m, &m, &m, &m, "0", "1\t2\t3"),
+            ok.replace("Gid:\t1000\t1000\t1000\t1000", "Gid:\t1\t2\t3"),
+            ok.replace("Groups:\t\n", "Groups:\tx\n"),
+            ok.replace("Groups:\t\n", ""),
+            ok.replace("Gid:", "Xid:"),
             "x".repeat(MAX_STATUS_BYTES + 1),
             "a\n".repeat(MAX_STATUS_LINES + 1),
         ];

@@ -12,7 +12,7 @@ use fandhe_container_supervisor::privilege::{
 
 fn fixture(prm: &str, bnd: &str, amb: &str) -> String {
     format!(
-        "Uid:\t1000\t1000\t1000\t1000\nCapInh:\t{amb}\nCapPrm:\t{prm}\nCapEff:\t{prm}\nCapBnd:\t{bnd}\nCapAmb:\t{amb}\nNoNewPrivs:\t0\n"
+        "Uid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nGroups:\t\nCapInh:\t{amb}\nCapPrm:\t{prm}\nCapEff:\t{prm}\nCapBnd:\t{bnd}\nCapAmb:\t{amb}\nNoNewPrivs:\t0\n"
     )
 }
 

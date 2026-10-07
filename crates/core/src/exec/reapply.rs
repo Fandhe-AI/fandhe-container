@@ -50,8 +50,15 @@
 //!   `config.json` の `process.capabilities` を解釈せず同じ固定集合を使うため、exec が launch より広い
 //!   集合を与えることはない（設定による絞り込みは launch・exec とも未実装）。pid1 が起動後に自分の
 //!   capability をさらに落としていても、exec は launch がコンテナへ与えた集合（OCI 既定）で動く。uid / gid・
-//!   補助グループ・securebits は launch・exec とも変更しない（呼び出しプロセスの値を引き継ぐ）。spec（SUP-6）が
+//!   securebits は launch・exec とも変更しない（呼び出しプロセスの値を引き継ぐ）。spec（SUP-6）が
 //!   exec での capability 削減に言及しない点は確認事項で、「launch より弱くしない」側に倒している
+//! - **補助グループは launch・exec とも空にする**（SEC-1・SEC-5・TASK-163 追補・#1457）: capability 削減の関数が
+//!   先頭で `setgroups(0)` を呼び、読み戻して確かめる（`exec/capabilities.rs` の `SupplementaryGroups`）。launch の
+//!   子は supervisor の、exec の子は exec を起動したプロセス（`sudo` 経由なら呼び出しユーザー）のホスト側の補助
+//!   グループを持ち越していたため、両者が一致しなかった。`config.json` の `process.user.additionalGids` は launch が
+//!   非空を拒否するので「空」が唯一の指定で、解釈（指定したグループの付与）は launch・exec とも未実装。user
+//!   namespace が `setgroups` を `deny` にしている場合（rootless）は消去できないため現状のまま残し、結果
+//!   （[`ExecRestrictionReport::supplementary_groups`]）へ記録する。それ以外の理由で消去できなければ拒否する
 //! - **user namespace は対象と同じであること**: capability は user namespace に対する相対的な権限なので、
 //!   同じ集合でも exec プロセスが対象より外側の user namespace にいれば launch より強い。`Pid1Target::open` と
 //!   `join_namespaces` が、対象と呼び出し側の user namespace の一致を要求する（`exec/setns.rs`。不一致は違反
@@ -151,8 +158,8 @@ use super::landlock::{LandlockAccessProbe, landlock_ruleset_from_config, run_pro
 use super::rlimits::{apply_rlimits, parse_proc_limits};
 use super::setns::{NsIdentity, cgroup_path_matches, read_bounded_from};
 use super::{
-    ExecError, IsolationStage, Pid1Target, StageKind, ThreadCountSource, ViolationReason,
-    no_new_privs,
+    ExecError, IsolationStage, Pid1Target, StageKind, SupplementaryGroups, ThreadCountSource,
+    ViolationReason, no_new_privs,
 };
 use crate::landlock::LandlockRuleset;
 use crate::oci_runtime::{OciConfig, RootfsDir};
@@ -298,6 +305,7 @@ impl std::fmt::Debug for ExecCarry {
 ///     seccomp_instructions: 0,
 ///     rlimits_applied: 0,
 ///     capability_bounding_dropped: 0,
+///     supplementary_groups: None,
 ///     unapplied: &[],
 ///     carry: todo!(),
 /// };
@@ -309,6 +317,7 @@ pub struct ExecRestrictionReport {
     seccomp_instructions: usize,
     rlimits_applied: usize,
     capability_bounding_dropped: usize,
+    supplementary_groups: Option<SupplementaryGroups>,
     unapplied: &'static [UnappliedExecRestriction],
     carry: ExecCarry,
 }
@@ -335,6 +344,12 @@ impl ExecRestrictionReport {
     /// capability 削減で bounding set から落とした capability の数。
     pub fn capability_bounding_dropped(&self) -> usize {
         self.capability_bounding_dropped
+    }
+
+    /// 補助グループの扱いの結果（capability 削減の中で、launch 経路と同じ関数が行う。TASK-163 追補・#1457）。
+    /// capability 削減を適用していない場合（未適用の一覧に `CapabilityDrop` が載る）は `None`。
+    pub fn supplementary_groups(&self) -> Option<SupplementaryGroups> {
+        self.supplementary_groups
     }
 
     /// launch 経路は適用するが、この再適用では適用していない制限（[`ExecRestrictionReport::UNAPPLIED`]）。
@@ -687,14 +702,21 @@ fn reapply_inner(
     if !rlimits.is_empty() {
         apply_rlimits(&rlimits).map_err(|e| e.at_stage(IsolationStage::Rlimits))?;
     }
-    let capability_bounding_dropped = if drop_capabilities {
-        apply_default_capabilities_with(&mut threads)
-            .map_err(|e| e.at_stage(IsolationStage::CapabilityDrop))?
-            .bounding_dropped
-            .len()
+    // capability 削減は、先頭で補助グループも空にする（launch 経路と同じ関数。#1457）。
+    let capabilities = if drop_capabilities {
+        Some(
+            apply_default_capabilities_with(&mut threads)
+                .map_err(|e| e.at_stage(IsolationStage::CapabilityDrop))?,
+        )
     } else {
-        0
+        None
     };
+    let capability_bounding_dropped = capabilities
+        .as_ref()
+        .map_or(0, |report| report.bounding_dropped.len());
+    let supplementary_groups = capabilities
+        .as_ref()
+        .map(|report| report.supplementary_groups);
     no_new_privs::apply_no_new_privs()?;
     let landlock = apply_landlock_stage_with(&landlock, &mut threads, root.as_fd())
         .map_err(|e| e.at_stage(IsolationStage::Landlock))?;
@@ -705,6 +727,7 @@ fn reapply_inner(
         seccomp_instructions: seccomp.instructions,
         rlimits_applied: rlimits.len(),
         capability_bounding_dropped,
+        supplementary_groups,
         unapplied: if drop_capabilities {
             ExecRestrictionReport::UNAPPLIED
         } else {
@@ -904,6 +927,7 @@ mod tests {
             seccomp_instructions: 2,
             rlimits_applied: 3,
             capability_bounding_dropped: 4,
+            supplementary_groups: Some(SupplementaryGroups::AlreadyEmpty),
             unapplied,
             carry: ExecCarry {
                 root: dir_fd(Path::new("/")),
@@ -949,6 +973,11 @@ mod tests {
         assert_eq!(report.landlock_rules(), 0);
         assert_eq!(report.seccomp_instructions(), 0);
         assert_eq!(report.rlimits_applied(), 1);
+        // TASK-163 追補（#1457）: capability 削減が補助グループの扱いも済ませ、結果に載る（偽のカーネルは空）。
+        assert_eq!(
+            report.supplementary_groups(),
+            Some(SupplementaryGroups::AlreadyEmpty)
+        );
         // SEC-1: TASK-163.4 で capability 削減・rlimit を実装し、未適用の一覧は空になった。
         assert_eq!(report.unapplied(), ExecRestrictionReport::UNAPPLIED);
         assert!(report.unapplied().is_empty());

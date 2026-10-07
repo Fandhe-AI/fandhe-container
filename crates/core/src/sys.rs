@@ -232,6 +232,11 @@ mod consts {
     // aarch64 は include/uapi/asm-generic/unistd.h。
     pub const SYS_CAPGET: i64 = 125;
     pub const SYS_CAPSET: i64 = 126;
+    // arch/x86/entry/syscalls/syscall_64.tbl の `getgroups`（115）・`setgroups`（116）。補助グループの
+    // 消去（SUP-6・SEC-1・SEC-5・TASK-163 追補・#1457）。glibc の `setgroups` は全スレッドへ反映する仕組み
+    // （setxid のシグナル配送）を持つため、capability と同じく呼び出しスレッドだけに効く生の syscall を使う。
+    pub const SYS_GETGROUPS: i64 = 115;
+    pub const SYS_SETGROUPS: i64 = 116;
     // 禁止 syscall 遮断の結合試験用プローブ（CORE-5・TASK-38.4・#179）。番号は `crate::seccomp` の
     // テーブルとは独立に、x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h から取る。
     // `PTRACE_CONT`（include/uapi/linux/ptrace.h）は attach を伴わない要求で、`KEXEC_SEGMENT_MAX`
@@ -405,6 +410,9 @@ mod consts {
     // aarch64 は include/uapi/asm-generic/unistd.h。
     pub const SYS_CAPGET: i64 = 90;
     pub const SYS_CAPSET: i64 = 91;
+    // include/uapi/asm-generic/unistd.h の `getgroups`（158）・`setgroups`（159）。TASK-163 追補・#1457。
+    pub const SYS_GETGROUPS: i64 = 158;
+    pub const SYS_SETGROUPS: i64 = 159;
     // 禁止 syscall 遮断の結合試験用プローブ（CORE-5・TASK-38.4・#179）。番号は `crate::seccomp` の
     // テーブルとは独立に、x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h から取る。
     // `PTRACE_CONT`（include/uapi/linux/ptrace.h）は attach を伴わない要求で、`KEXEC_SEGMENT_MAX`
@@ -536,6 +544,8 @@ mod consts {
     // aarch64 は include/uapi/asm-generic/unistd.h。
     pub const SYS_CAPGET: i64 = 0;
     pub const SYS_CAPSET: i64 = 0;
+    pub const SYS_GETGROUPS: i64 = 0;
+    pub const SYS_SETGROUPS: i64 = 0;
     // 禁止 syscall 遮断の結合試験用プローブ（CORE-5・TASK-38.4・#179）。番号は `crate::seccomp` の
     // テーブルとは独立に、x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h から取る。
     // `PTRACE_CONT`（include/uapi/linux/ptrace.h）は attach を伴わない要求で、`KEXEC_SEGMENT_MAX`
@@ -1687,6 +1697,43 @@ pub(crate) fn new_session() -> Result<u32, SysError> {
     u32::try_from(sid).map_err(|_| SysError::Os(EINVAL))
 }
 
+/// 呼び出しスレッドの補助グループの件数を返す（`getgroups(0, NULL)`。SUP-6・SEC-1・TASK-163 追補・#1457）。
+///
+/// `crate::exec` の capability 削減段が、補助グループを消去する前後に件数を確かめるために使う。サイズ 0 の
+/// 呼び出しはリストを書き込まず件数だけを返すため、バッファを渡さない。
+pub(crate) fn supplementary_group_count() -> Result<usize, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `getgroups(int size, gid_t *list)` に size = 0 と NULL を渡す。size が 0 のときカーネルは `list` を
+    // 参照せず件数だけを返す（getgroups(2)）ため、ポインタは読み書きされない。引数は register 幅の整数として渡す。
+    let count = unsafe { syscall(consts::SYS_GETGROUPS, 0i64, core::ptr::null_mut::<u32>()) };
+    if count < 0 {
+        return Err(last_error());
+    }
+    usize::try_from(count).map_err(|_| SysError::Os(EINVAL))
+}
+
+/// 呼び出しスレッドの補助グループをすべて消去する（`setgroups(0, NULL)`。SUP-6・SEC-1・SEC-5・TASK-163 追補・
+/// #1457）。
+///
+/// 自分の user namespace の `CAP_SETGID` を要し、user namespace が `setgroups` を `deny` にしている場合
+/// （非特権で作った user namespace。`/proc/<pid>/setgroups`）は権限があっても `EPERM` になる。生の syscall のため
+/// 効果は呼び出しスレッドだけに及ぶ（呼び出し側が単一スレッドであることを確かめる）。
+// テストビルドでは capability 削減段が偽のカーネルを使い、本関数を呼ばない（libtest のプロセスの資格情報を
+// 変えないため）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn clear_supplementary_groups() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `setgroups(size_t size, const gid_t *list)` に size = 0 と NULL を渡す。size が 0 のときカーネルは
+    // `list` を読まない（空のグループ集合を設定する）ため、ポインタは参照されない。効果は呼び出しスレッドの
+    // 資格情報（補助グループ）の変更のみで、メモリには触れない。
+    let rc = unsafe { syscall(consts::SYS_SETGROUPS, 0i64, core::ptr::null::<u32>()) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
 /// `signal(2)` の `SIG_DFL`（既定動作）と `SIG_ERR`（失敗）。`sighandler_t` はポインタ幅。
 const SIG_DFL: usize = 0;
 const SIG_ERR: usize = usize::MAX;
@@ -2531,6 +2578,24 @@ mod tests {
 
     /// SEC-1・TASK-37.1: capability 関連の定数の具体値。
     #[cfg(target_arch = "x86_64")]
+    /// SUP-6・SEC-1・TASK-163 追補（#1457）: `getgroups` / `setgroups` の syscall 番号（x86_64 は
+    /// syscall_64.tbl、aarch64 は asm-generic/unistd.h）と、件数の取得が実プロセスの `Groups:` と一致すること。
+    #[test]
+    fn sup6_task163_group_syscall_numbers_and_count_are_exact() {
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!((consts::SYS_GETGROUPS, consts::SYS_SETGROUPS), (115, 116));
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!((consts::SYS_GETGROUPS, consts::SYS_SETGROUPS), (158, 159));
+        let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+        let groups = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Groups:"))
+            .unwrap()
+            .split_whitespace()
+            .count();
+        assert_eq!(supplementary_group_count(), Ok(groups));
+    }
+
     #[test]
     fn sec1_capability_consts_are_exact_x86_64() {
         assert_eq!(consts::SYS_CAPGET, 125);

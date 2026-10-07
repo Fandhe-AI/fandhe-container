@@ -95,6 +95,7 @@ use crate::traits::types::ErrorCode;
 
 mod capabilities;
 mod cgroup_join;
+mod container_env;
 mod devices;
 mod exec_command;
 mod interpreter;
@@ -110,8 +111,14 @@ mod stages;
 mod tmpfs;
 mod violation;
 
-pub use capabilities::CapabilityReport;
+/// 結合試験 `tests/exec_child_setup.rs`・supervisor の `tests/exec_setns_join.rs` 専用の再公開
+/// （SUP-6・TASK-163 追補・#1457。通常の利用者は呼ばない。詳細は定義側）。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+#[doc(hidden)]
+pub use capabilities::clear_supplementary_groups_for_test;
+pub use capabilities::{CapabilityReport, SupplementaryGroups};
 pub use cgroup_join::{ExecCgroupJoin, ExecCgroupJoinReport, join_cgroup, prepare_cgroup_join};
+pub use container_env::{ContainerEnv, ExecCommand};
 pub use devices::{DeviceNodeOutcome, DeviceNodeStatus, DeviceReport, create_default_devices};
 pub use exec_command::{spawn_exec_command, spawn_exec_worker};
 /// 結合試験 `tests/landlock.rs` 専用の再公開（CORE-5・TASK-39.5・#185。通常の利用者は呼ばない。詳細は定義側）。

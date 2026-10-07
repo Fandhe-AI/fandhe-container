@@ -45,6 +45,16 @@
 //!   `ExecReady` で、[`require_exec_ready`]（core の `ExecRestrictionReport::into_complete`）だけが作る。
 //!   core の `spawn_exec_command`（fork → `close_range` → `execveat`）は `ExecReady` を値で受け取り、
 //!   `ExecRestrictionReport`・真偽値を受け取る入口はない（SEC-1）
+//! - **コマンドの環境と補助グループ**（SEC-1・SEC-5・TASK-163 追補・#1457）: [`run_command`] はコマンドを
+//!   [`ExecRequest`]（コンテナ内の絶対パス・argv・明示の環境変数）で受け取る。**環境変数の基底は呼び出し側から
+//!   渡せず**、worker が対象の bundle の `config.json` の `process.env`（コンテナ定義。launch がエントリポイントへ
+//!   渡すのと同じ出所）から組み立てる。呼び出し側が足せるのは、利用者がその exec に対して明示した値
+//!   （`ExecRequest::with_env`。検証済みの `EnvVar`）だけで、`execveat` の envp はこの 2 つだけから作る。exec を
+//!   起動したプロセス（CLI・supervisor）の環境は 1 つも渡らず、既定値の補完もしない（入口が `std::env::vars()` を
+//!   渡す形は型で書けない。core の `exec/container_env.rs`）。補助グループは launch と同じく空にする（core の
+//!   capability 削減が `setgroups(0)` を呼ぶ。exec を起動したプロセスのホスト側の補助グループを持ち越さない）。
+//!   `setgroups` が `deny` の user namespace（rootless）では消去できないため残し、[`ExecOutcome`] の
+//!   `supplementary_groups` に記録する。uid / gid は変更しない（launch も同じ）
 //! - **コンテナから見える窓を閉じる**: exec の子は fork した時点でコンテナの PID namespace に入り、
 //!   `close_range` までの間コンテナの procfs から見える。worker は開始時に自分を non-dumpable にし（core の
 //!   `spawn_exec_worker`）、core の `spawn_exec_command` は non-dumpable でないプロセスからの fork を拒否する。
@@ -97,7 +107,9 @@
 //!   しまい、exec したコマンドがコンテナより強い権限で動くため、カーネルの拒否には依存しない。fail-closed。
 //!   rootless の exec には必須。通しの結合試験は rootful のみ）
 //! - コマンドの標準入出力の受け渡し（CLI の exec・TASK-161 / SUP-4 の healthcheck の出力取得）。現状は launch と
-//!   同じく `/dev/null` へ固定し、環境変数・cwd・ユーザーの指定も未対応（cwd はコンテナの rootfs の根）
+//!   同じく `/dev/null` へ固定し、cwd・ユーザーの指定も未対応（cwd はコンテナの rootfs の根。`config.json` の
+//!   `process.user.additionalGids` の解釈〔指定したグループの付与〕も launch・exec とも未実装で、補助グループは
+//!   常に空）
 //! - 違反記録（SEC-4）の監査ログへの保存の配線。core のファイル書き込み経路（`audit_log::AuditFileWriter`。
 //!   TASK-41.5.1）は実装済みだが、exec の拒否（種別 `exec_target`）を表す監査の層と、exec 専用プロセスへ
 //!   `AuditSink` を渡す経路が無い。現状は種別・理由コード・ビヘイビア ID をエラーメッセージへ残すところまで
@@ -110,9 +122,9 @@ use std::io::{BufRead as _, Read as _, Write as _};
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::exec::{
-    ChildExit, Entrypoint, ExecCgroupJoin, ExecCgroupJoinReport, ExecError, ExecReady,
-    ExecRestrictionReport, ExecRestrictions, NamespaceJoinReport, Pid1Target,
-    join_cgroup as core_join_cgroup, join_namespaces,
+    ChildExit, ContainerEnv, ExecCgroupJoin, ExecCgroupJoinReport, ExecCommand, ExecError,
+    ExecReady, ExecRestrictionReport, ExecRestrictions, NamespaceJoinReport, Pid1Target,
+    SupplementaryGroups, join_cgroup as core_join_cgroup, join_namespaces,
     prepare_cgroup_join as core_prepare_cgroup_join,
     prepare_exec_restrictions as core_prepare_exec_restrictions,
     reapply_restrictions as core_reapply_restrictions, spawn_exec_command, spawn_exec_worker,
@@ -121,6 +133,8 @@ use fandhe_container_core::oci_runtime::{OciConfig, RootfsDir, load_config, pin_
 use fandhe_container_core::traits::{
     ContainerId, ContainerState, ErrorCode, StateRecord, TraitError,
 };
+
+use crate::container_options::env::EnvVar;
 
 /// 検証済みの exec 対象（コンテナ ID と、pidfd で固定した pid1、特定に使った記録の bundle）。
 #[derive(Debug)]
@@ -231,6 +245,65 @@ pub fn prepare_restrictions(target: &ExecTarget) -> Result<ExecRestrictions, Tra
     core_prepare_exec_restrictions(&target.pid1, &config, &rootfs).map_err(from_exec_error)
 }
 
+/// 稼働中コンテナの中で実行するコマンドの要求（コンテナ内の絶対パス・argv・明示の環境変数。
+/// SUP-6・SEC-1・TASK-163 追補・#1457）。
+///
+/// [`run_command`] の入力。**環境変数の基底は呼び出し側から渡せない**: 基底は常に、対象の記録の bundle の
+/// `config.json` の `process.env`（コンテナ定義。launch 経路がエントリポイントへ渡すのと同じ出所）で、worker が
+/// 読み込んで組み立てる。呼び出し側が足せるのは、利用者がその exec に対して明示した値（[`Self::with_env`]。
+/// CLI の `-e KEY=VALUE` 相当）だけで、検証済みの [`EnvVar`]（値なしの `-e KEY` によるホスト環境の継承を拒否する型。
+/// `container_options::env`）でしか受け取らない。exec を起動したプロセスの環境は、exec されたコマンドへ
+/// 1 つも渡らない（core の `exec/container_env.rs`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecRequest {
+    path: std::path::PathBuf,
+    args: Vec<String>,
+    env: Vec<EnvVar>,
+}
+
+impl ExecRequest {
+    /// 検証して作る。`path` は空でないコンテナ内の絶対パス、`args`（argv）は 1 件以上で NUL を含まない
+    /// （違反は `InvalidArgument`。fork する前に呼び出しプロセスで拒否する）。PATH 探索はしない。
+    pub fn new<P, A>(path: P, args: A) -> Result<Self, TraitError>
+    where
+        P: Into<std::path::PathBuf>,
+        A: IntoIterator,
+        A::Item: Into<String>,
+    {
+        let request = Self {
+            path: path.into(),
+            args: args.into_iter().map(Into::into).collect(),
+            env: Vec::new(),
+        };
+        // パス・argv の書式は、環境を足す前の時点で確かめられる（件数・合計長は worker が環境込みで検証する）。
+        request.command(&ContainerEnv::empty())?;
+        Ok(request)
+    }
+
+    /// 利用者がこの exec に対して明示した環境変数を足す（コンテナ定義の同じ KEY を上書きする。指定順で後勝ち）。
+    pub fn with_env(mut self, vars: &[EnvVar]) -> Self {
+        self.env.extend_from_slice(vars);
+        self
+    }
+
+    /// コンテナ内の絶対パス。
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// `base`（コンテナ定義の環境）へ明示の上書きを重ねて、core のコマンドを組み立てる。
+    fn command(&self, base: &ContainerEnv) -> Result<ExecCommand, TraitError> {
+        let env = self
+            .env
+            .iter()
+            .try_fold(base.clone(), |env, var| {
+                env.with_var(var.key(), var.value())
+            })
+            .map_err(from_exec_error)?;
+        ExecCommand::new(&self.path, &self.args, &env).map_err(from_exec_error)
+    }
+}
+
 /// rlimit → capability 削減 → `NO_NEW_PRIVS` → Landlock → seccomp を自プロセスへ不可逆に適用する。
 /// [`enter_namespaces`] と [`join_cgroup`] の **後**、準備したプロセス自身から単一スレッドで呼ぶ（SUP-6・#502・#503）。
 /// 適用の前に、参加後の mount namespace が準備時の対象のものであること・参加後の `/` が記録したコンテナの
@@ -271,6 +344,9 @@ pub struct ExecOutcome {
     pub landlock_rules: usize,
     /// 適用した seccomp の BPF 命令数。
     pub seccomp_instructions: usize,
+    /// 補助グループの扱いの結果（launch と同じく空にする。`setgroups` が `deny` の user namespace では残して
+    /// 記録する。TASK-163 追補・#1457）。
+    pub supplementary_groups: SupplementaryGroups,
 }
 
 /// 準備から fork までの全体の期限（REPAIR-5）。各段の間で残りを確かめ、超過したら次の段へ進まず `Timeout`。
@@ -303,7 +379,10 @@ impl Deadline {
     }
 }
 
-/// 稼働中コンテナ `record` の中で `entry` を実行し、終了を待つ（SUP-6・TASK-163.4・#503）。
+/// 稼働中コンテナ `record` の中で `request` のコマンドを実行し、終了を待つ（SUP-6・TASK-163.4・#503）。
+///
+/// コマンドの環境は、記録の bundle の `config.json` の `process.env` へ `request` の明示の指定を重ねたもので、
+/// 呼び出しプロセスの環境は使わない（TASK-163 追補・#1457。契約はモジュール doc）。
 ///
 /// 順序は固定: [`identify_pid1`] → [`prepare_cgroup_join`] → [`prepare_restrictions`] → [`enter_namespaces`] →
 /// [`join_cgroup`] → [`reapply_restrictions`] → [`require_exec_ready`] → core の `spawn_exec_command`
@@ -317,7 +396,7 @@ impl Deadline {
 /// エラーメッセージへホスト側パス・ルール内容・期待 cgroup パスを載せない。
 pub fn run_command(
     record: &StateRecord,
-    entry: &Entrypoint,
+    request: &ExecRequest,
     timeout: Duration,
 ) -> Result<ExecOutcome, TraitError> {
     let deadline = Deadline::after(timeout);
@@ -325,7 +404,7 @@ pub fn run_command(
     running_pid(record)?;
     run_in_worker_with(deadline, WORKER_GRACE, || {
         let target = identify_pid1(record)?;
-        run_with_target(&target, entry, deadline)
+        run_with_target(&target, request, deadline)
     })
 }
 
@@ -336,14 +415,14 @@ pub fn run_command(
 pub fn run_command_in(
     record: &StateRecord,
     expected_cgroup_path: &str,
-    entry: &Entrypoint,
+    request: &ExecRequest,
     timeout: Duration,
 ) -> Result<ExecOutcome, TraitError> {
     let deadline = Deadline::after(timeout);
     running_pid(record)?;
     run_in_worker_with(deadline, WORKER_GRACE, || {
         let target = identify_pid1_in(record, expected_cgroup_path)?;
-        run_with_target(&target, entry, deadline)
+        run_with_target(&target, request, deadline)
     })
 }
 
@@ -437,7 +516,7 @@ pub fn run_in_worker_for_test(
 }
 
 /// worker の結果を pipe 用の 1 行へ符号化する。成功は `ok <exited|signaled> <値> <rlimit 数> <capability 数>
-/// <Landlock 数> <seccomp 命令数>`、失敗は `err <ERR-1 コード> <メッセージ>`（改行は空白へ置換）。
+/// <Landlock 数> <seccomp 命令数> <補助グループの扱い> <その件数>`、失敗は `err <ERR-1 コード> <メッセージ>`（改行は空白へ置換）。
 fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
     let line = match result {
         Ok(o) => {
@@ -446,12 +525,17 @@ fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
                 ChildExit::Signaled(n) => ("signaled", n),
                 _ => ("unknown", 0),
             };
+            let groups = match o.supplementary_groups {
+                SupplementaryGroups::Cleared { cleared } => cleared,
+                other => other.remaining(),
+            };
             format!(
-                "ok {kind} {value} {} {} {} {}\n",
+                "ok {kind} {value} {} {} {} {} {} {groups}\n",
                 o.rlimits_applied,
                 o.capability_bounding_dropped,
                 o.landlock_rules,
-                o.seccomp_instructions
+                o.seccomp_instructions,
+                o.supplementary_groups.as_str(),
             )
         }
         Err(e) => format!(
@@ -508,31 +592,53 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, TraitError> {
         .next()
         .and_then(|v| v.parse().ok())
         .ok_or_else(malformed)?;
-    let mut count = || -> Result<usize, TraitError> {
-        it.next().and_then(|v| v.parse().ok()).ok_or_else(malformed)
-    };
     let exit = match kind {
         "exited" => ChildExit::Exited(value),
         "signaled" => ChildExit::Signaled(value),
         _ => return Err(malformed()),
     };
+    let mut count = || -> Result<usize, TraitError> {
+        it.next().and_then(|v| v.parse().ok()).ok_or_else(malformed)
+    };
+    let (rlimits_applied, capability_bounding_dropped) = (count()?, count()?);
+    let (landlock_rules, seccomp_instructions) = (count()?, count()?);
+    let groups_kind = it.next().ok_or_else(malformed)?;
+    let groups: usize = it
+        .next()
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(malformed)?;
+    let supplementary_groups = match groups_kind {
+        "already_empty" if groups == 0 => SupplementaryGroups::AlreadyEmpty,
+        "cleared" => SupplementaryGroups::Cleared { cleared: groups },
+        "kept_setgroups_denied" => SupplementaryGroups::KeptSetgroupsDenied { kept: groups },
+        _ => return Err(malformed()),
+    };
+    if it.next().is_some() {
+        return Err(malformed());
+    }
     Ok(ExecOutcome {
         exit,
-        rlimits_applied: count()?,
-        capability_bounding_dropped: count()?,
-        landlock_rules: count()?,
-        seccomp_instructions: count()?,
+        rlimits_applied,
+        capability_bounding_dropped,
+        landlock_rules,
+        seccomp_instructions,
+        supplementary_groups,
     })
 }
 
 /// 特定済みの対象に対して、参加 → 制限の再適用 → 実行 → 待機を順に行う（[`run_command`] の本体）。
 fn run_with_target(
     target: &ExecTarget,
-    entry: &Entrypoint,
+    request: &ExecRequest,
     deadline: Deadline,
 ) -> Result<ExecOutcome, TraitError> {
     let cgroup = prepare_cgroup_join(target)?;
-    let restrictions = prepare_restrictions(target)?;
+    // `config.json` は 1 回だけ読み、制限の準備とコマンドの環境の両方に使う（同じ定義から導く）。
+    let (config, rootfs) = load_exec_bundle(&target.bundle)?;
+    // コマンドの環境はコンテナ定義（`process.env`）が基底で、呼び出しプロセスの環境は使わない（#1457）。
+    let command = request.command(&ContainerEnv::from_config(&config).map_err(from_exec_error)?)?;
+    let restrictions =
+        core_prepare_exec_restrictions(&target.pid1, &config, &rootfs).map_err(from_exec_error)?;
     deadline.remaining("joining namespaces")?;
     enter_namespaces(target)?;
     deadline.remaining("joining the cgroup")?;
@@ -545,9 +651,16 @@ fn run_with_target(
     );
     let (landlock_rules, seccomp_instructions) =
         (report.landlock_rules(), report.seccomp_instructions());
+    // capability 削減を通った結果には必ず載る。無ければ未適用で、下の `require_exec_ready` も拒否する。
+    let supplementary_groups = report.supplementary_groups().ok_or_else(|| {
+        TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "exec stage CapabilityDrop: the supplementary groups were not handled",
+        )
+    })?;
     let ready = require_exec_ready(report)?;
     deadline.remaining("starting the command")?;
-    let child = spawn_exec_command(ready, entry).map_err(from_exec_error)?;
+    let child = spawn_exec_command(ready, &command).map_err(from_exec_error)?;
     let exit = wait_or_stop(
         &deadline,
         |left| child.wait_timeout(left).map_err(from_exec_error),
@@ -559,6 +672,7 @@ fn run_with_target(
         capability_bounding_dropped,
         landlock_rules,
         seccomp_instructions,
+        supplementary_groups,
     })
 }
 
@@ -739,14 +853,62 @@ mod tests {
     /// 実 pid1 を要する成功経路は結合試験 `tests/exec.rs`（`-- --ignored`）が担う。
     #[test]
     fn sup6_task163_4_run_command_entry_point_has_expected_shape() {
-        let _run: fn(&StateRecord, &Entrypoint, Duration) -> Result<ExecOutcome, TraitError> =
+        let _run: fn(&StateRecord, &ExecRequest, Duration) -> Result<ExecOutcome, TraitError> =
             run_command;
+    }
+
+    /// SUP-6・SEC-1・TASK-163 追補（#1457）: 要求はパス・argv を fork の前に検証し、コマンドの環境は
+    /// 「コンテナ定義の環境 + 明示の上書き」だけから組み立てる（テストプロセスの環境は入らない）。
+    #[test]
+    fn sup6_sec1_task163_exec_request_builds_env_from_definition_and_explicit_vars() {
+        use crate::container_options::env::EnvVar;
+        for bad in [
+            ExecRequest::new("relative", ["x"]).unwrap_err(),
+            ExecRequest::new("/bin/true", [] as [&str; 0]).unwrap_err(),
+            ExecRequest::new("/bin/true", ["a\0b"]).unwrap_err(),
+        ] {
+            assert_eq!(bad.code(), ErrorCode::InvalidArgument);
+            assert!(bad.message().starts_with("exec stage Validate: "));
+        }
+        // 対照: テストプロセス自身は環境変数を持つ。
+        assert!(std::env::vars_os().next().is_some());
+        let base = ContainerEnv::empty()
+            .with_var("A", "definition")
+            .unwrap()
+            .with_var("B", "definition")
+            .unwrap();
+        let request = ExecRequest::new("/bin/app", ["app", "--flag"])
+            .unwrap()
+            .with_env(&[
+                EnvVar::parse("B=explicit").unwrap(),
+                EnvVar::parse("C=explicit").unwrap(),
+            ]);
+        assert_eq!(request.path(), std::path::Path::new("/bin/app"));
+        let expected_env = ContainerEnv::empty()
+            .with_var("A", "definition")
+            .unwrap()
+            .with_var("B", "explicit")
+            .unwrap()
+            .with_var("C", "explicit")
+            .unwrap();
+        assert_eq!(
+            request.command(&base).unwrap(),
+            ExecCommand::new("/bin/app", ["app", "--flag"], &expected_env).unwrap()
+        );
+        // 明示の指定が無ければ、コンテナ定義の環境そのまま。
+        assert_eq!(
+            ExecRequest::new("/bin/app", ["app"])
+                .unwrap()
+                .command(&base)
+                .unwrap(),
+            ExecCommand::new("/bin/app", ["app"], &base).unwrap()
+        );
     }
 
     /// SUP-6・TASK-163.4: 稼働中でない記録・pid の無い記録は、参加も fork もせず対象の特定で拒否する。
     #[test]
     fn sup6_task163_4_run_command_rejects_non_running_record() {
-        let entry = Entrypoint::new("/bin/true", ["true"], Vec::<String>::new()).unwrap();
+        let entry = ExecRequest::new("/bin/true", ["true"]).unwrap();
         let pid = NonZeroU32::new(std::process::id());
         for st in [
             ContainerStatus::created(cid(), pid),
@@ -856,10 +1018,30 @@ mod tests {
             capability_bounding_dropped: 23,
             landlock_rules: 3,
             seccomp_instructions: 120,
+            supplementary_groups: SupplementaryGroups::Cleared { cleared: 4 },
         };
         let line = encode_worker_result(&Ok(outcome));
-        assert_eq!(line, b"ok signaled 15 16 23 3 120\n");
+        assert_eq!(line, b"ok signaled 15 16 23 3 120 cleared 4\n");
         assert_eq!(decode_worker_result(&line).unwrap(), outcome);
+        // 補助グループの扱いは 3 通りとも往復する（TASK-163 追補・#1457）。
+        for (groups, text) in [
+            (SupplementaryGroups::AlreadyEmpty, "already_empty 0"),
+            (
+                SupplementaryGroups::KeptSetgroupsDenied { kept: 7 },
+                "kept_setgroups_denied 7",
+            ),
+        ] {
+            let outcome = ExecOutcome {
+                supplementary_groups: groups,
+                ..outcome
+            };
+            let line = encode_worker_result(&Ok(outcome));
+            assert_eq!(
+                String::from_utf8(line.clone()).unwrap(),
+                format!("ok signaled 15 16 23 3 120 {text}\n")
+            );
+            assert_eq!(decode_worker_result(&line).unwrap(), outcome);
+        }
 
         let err = TraitError::new(ErrorCode::Timeout, "exec timed out\nbefore x");
         let line = encode_worker_result(&Err(err));
@@ -870,9 +1052,14 @@ mod tests {
 
         for bad in [
             &b""[..],
-            b"ok exited 0 1 2 3 4",
+            b"ok exited 0 1 2 3 4 cleared 1",
             b"ok exited 0 1 2 3\n",
-            b"ok weird 0 1 2 3 4\n",
+            b"ok exited 0 1 2 3 4\n",
+            b"ok exited 0 1 2 3 4 cleared\n",
+            b"ok exited 0 1 2 3 4 unknown 1\n",
+            b"ok exited 0 1 2 3 4 already_empty 2\n",
+            b"ok exited 0 1 2 3 4 cleared 1 extra\n",
+            b"ok weird 0 1 2 3 4 cleared 1\n",
             b"hello\n",
         ] {
             let e = decode_worker_result(bad).unwrap_err();

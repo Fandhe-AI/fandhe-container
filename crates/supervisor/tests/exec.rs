@@ -12,6 +12,9 @@
 //! - cgroup: `/proc/<pid>/cgroup` がコンテナ用 cgroup（`<scope>/fc-<id>@<instance>`）の絶対パスと完全一致し、
 //!   joiner が元いた cgroup と異なる
 //! - namespace: `NSpid` が入れ子で、`ns/{mnt,uts,ipc,net,pid}` が pid1 と一致（pid は参加後に fork した子の値）
+//! - 環境変数・補助グループ（TASK-163 追補・#1457）: コマンドの `/proc/<pid>/environ` が、コンテナ定義
+//!   （`config.json` の `process.env`）へ明示の上書きを重ねたものと完全一致し、joiner だけが持つ環境変数を含まない。
+//!   `Groups:` が空（launch と同じ扱い）
 //! - セッション（TASK-163 追補・#1456）: コマンドが新しいセッションのリーダーで、制御端末を持たず、joiner の
 //!   セッションに残らない
 //!
@@ -96,16 +99,18 @@ mod linux {
 
     use fandhe_container_core::cgroups::CgroupName;
     use fandhe_container_core::exec::{
-        ChildExit, Entrypoint, IsolationConfig, MountIsolation, Namespace, NamespaceSet,
+        ChildExit, ContainerEnv, IsolationConfig, MountIsolation, Namespace, NamespaceSet,
         create_default_devices, isolate_rootful_host_root, pivot_root, plan_rootful_host_root,
         prepare_rootfs,
     };
+    use fandhe_container_core::oci_runtime::load_config;
     use fandhe_container_core::traits::{
         CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, StateRecord, StateRevision,
     };
+    use fandhe_container_supervisor::container_options::env::EnvVar;
     use fandhe_container_supervisor::exec::{
-        enter_namespaces, identify_pid1, join_cgroup, prepare_cgroup_join, prepare_restrictions,
-        reapply_restrictions, run_command, run_command_in,
+        ExecRequest, enter_namespaces, identify_pid1, join_cgroup, prepare_cgroup_join,
+        prepare_restrictions, reapply_restrictions, run_command, run_command_in,
     };
 
     /// 5 回の通し（受入条件: 5 回中 5 回成功）。
@@ -116,6 +121,11 @@ mod linux {
     const PROBE: &str = "probe";
     /// インタープリタにランタイム自身（`/proc/self/exe`）を指定したスクリプトの bundle 内の名前（#1458）。
     const RUNTIME_SCRIPT: &str = "runtime-script";
+    /// exec を起動する側（joiner）だけが持つ環境変数。exec されたコマンドへ渡ってはならない（#1457）。
+    const HOST_ONLY_ENV: &str = "FANDHE_EXEC_TEST_HOST_ONLY";
+    /// exec されたコマンドの環境（`/proc/<pid>/environ`）の期待値: コンテナ定義（`config.json` の `process.env`）へ
+    /// joiner の明示の上書き（`OVERRIDDEN`・`EXTRA`）を重ねたもの。
+    const EXPECTED_ENVIRON: &[u8] = b"FANDHE_EXEC_ENV=from-config\0OVERRIDDEN=explicit\0EXTRA=1\0";
     /// コンテナ ID（cgroup 名 `fc-<id>@<instance>` に使う）。
     const CONTAINER_ID: &str = "exec-test";
 
@@ -152,7 +162,9 @@ mod linux {
             Some("--joiner") => joiner(&args[2..]),
             // root 不要の補助: 手組みのプローブだけをホスト上で自己検証する（`orchestrate` も最初に行う）。
             Some("--selfcheck-probe") => {
-                verify_probe_on_host(&make_bundle());
+                let bundle = make_bundle();
+                verify_bundle_definition(&bundle);
+                verify_probe_on_host(&bundle);
                 println!("exec: probe self-check ok");
             }
             _ if args.iter().any(|a| a == "--ignored") => orchestrate(),
@@ -298,7 +310,7 @@ mod linux {
         .expect("chmod script");
         fs::write(
             bundle.dir.join("config.json"),
-            br#"{"ociVersion":"1.2.0","root":{"path":"rootfs","readonly":true},"mounts":[{"destination":"/dev","options":["rw"]},{"destination":"/data","options":["rw"]}]}"#,
+            br#"{"ociVersion":"1.2.0","root":{"path":"rootfs","readonly":true},"process":{"user":{"uid":0,"gid":0},"cwd":"/","args":["/probe"],"env":["FANDHE_EXEC_ENV=from-config","OVERRIDDEN=config"]},"mounts":[{"destination":"/dev","options":["rw"]},{"destination":"/data","options":["rw"]}]}"#,
         )
         .expect("write config.json");
         bundle
@@ -510,12 +522,9 @@ mod linux {
         } else {
             PROBE
         };
-        let entry = Entrypoint::new(
-            format!("/{program}"),
-            [format!("/{program}")],
-            [] as [&str; 0],
-        )
-        .expect("entrypoint");
+        let entry = ExecRequest::new(format!("/{program}"), [format!("/{program}")])
+            .expect("request")
+            .with_env(&explicit_env());
         let result = match mode {
             "run" | "run-script" => run_command(&record, &entry, timeout()),
             "run-in" => run_command_in(&record, arg(5), &entry, timeout()),
@@ -525,12 +534,13 @@ mod linux {
         match result {
             Ok(o) => {
                 println!(
-                    "outcome exit={:?} rlimits={} caps_dropped={} landlock_rules={} seccomp_instructions={}",
+                    "outcome exit={:?} rlimits={} caps_dropped={} landlock_rules={} seccomp_instructions={} groups={}",
                     o.exit,
                     o.rlimits_applied,
                     o.capability_bounding_dropped,
                     o.landlock_rules,
-                    o.seccomp_instructions
+                    o.seccomp_instructions,
+                    o.supplementary_groups.as_str()
                 );
             }
             Err(e) => {
@@ -538,6 +548,33 @@ mod linux {
                 std::process::exit(3);
             }
         }
+    }
+
+    /// joiner が exec に対して明示する環境変数（CLI の `-e` 相当）。コンテナ定義の `OVERRIDDEN` を上書きし、
+    /// `EXTRA` を足す。
+    fn explicit_env() -> Vec<EnvVar> {
+        ["OVERRIDDEN=explicit", "EXTRA=1"]
+            .into_iter()
+            .map(|v| EnvVar::parse(v).expect("env var"))
+            .collect()
+    }
+
+    /// 自己検証（root 不要）: bundle の `config.json` が解釈でき、コンテナ定義の環境へ明示の上書きを重ねた結果が
+    /// [`EXPECTED_ENVIRON`] と一致する（期待値の誤りをランタイムの不具合と取り違えない）。
+    fn verify_bundle_definition(bundle: &Bundle) {
+        let config = load_config(&bundle.dir.join("config.json")).expect("load config.json");
+        let env = explicit_env()
+            .iter()
+            .try_fold(
+                ContainerEnv::from_config(&config).expect("container env"),
+                |env, var| env.with_var(var.key(), var.value()),
+            )
+            .expect("explicit overrides");
+        let environ: Vec<u8> = env
+            .iter()
+            .flat_map(|(k, v)| format!("{k}={v}\0").into_bytes())
+            .collect();
+        assert_eq!(environ, EXPECTED_ENVIRON);
     }
 
     /// 同じ rootfs を共有する別コンテナ B へ、A 用に準備した制限を持って参加する（条件 3）。再適用が
@@ -641,6 +678,8 @@ mod linux {
         Command::new(exe)
             .arg("--joiner")
             .args(args)
+            // exec を起動する側だけが持つ環境変数（exec されたコマンドへ渡らないことを照合する。#1457）。
+            .env(HOST_ONLY_ENV, "must-not-leak")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .spawn()
@@ -726,6 +765,21 @@ mod linux {
         assert_eq!(session, pid, "the command must lead its session; {ctx}");
         assert_eq!(tty_nr, 0, "the command must have no controlling tty; {ctx}");
         assert_ne!(session, session_and_tty(jpid).0, "{ctx}");
+        // TASK-163 追補（#1457）: コマンドの環境はコンテナ定義と明示の上書きだけで、joiner の環境（対照として
+        // joiner 自身は `HOST_ONLY_ENV` を持つ）は 1 つも渡らない。補助グループは空（launch と同じ扱い）。
+        let joiner_environ = fs::read(format!("/proc/{jpid}/environ")).expect("joiner environ");
+        assert!(
+            joiner_environ
+                .split(|b| *b == 0)
+                .any(|v| v.starts_with(HOST_ONLY_ENV.as_bytes())),
+            "the joiner must carry the host-only variable; {ctx}"
+        );
+        assert_eq!(
+            fs::read(format!("/proc/{pid}/environ")).expect("probe environ"),
+            EXPECTED_ENVIRON,
+            "{ctx}"
+        );
+        assert_eq!(status_field(&status, "Groups:"), "", "{ctx}");
         // namespace は pid1 と一致する（pid は参加後に fork した子の値）。
         for ns in ["mnt", "uts", "ipc", "net", "pid"] {
             assert_eq!(
@@ -774,13 +828,25 @@ mod linux {
         assert_eq!(
             out.trim_end(),
             format!(
-                "outcome exit={:?} rlimits=16 caps_dropped={} landlock_rules=3 seccomp_instructions={}",
+                "outcome exit={:?} rlimits=16 caps_dropped={} landlock_rules=3 seccomp_instructions={} groups={}",
                 ChildExit::Signaled(15),
                 parse_after(&out, "caps_dropped="),
                 parse_after(&out, "seccomp_instructions="),
+                expected_groups_outcome(),
             ),
             "{ctx}"
         );
+    }
+
+    /// 補助グループの扱いの期待値。joiner は本プロセス（root）と同じ補助グループを持つため、本プロセスが
+    /// 補助グループを持てば `cleared`（`setgroups(0)` で消去）、持たなければ `already_empty`。
+    fn expected_groups_outcome() -> &'static str {
+        let status = fs::read_to_string("/proc/self/status").expect("own status");
+        if status_field(&status, "Groups:").is_empty() {
+            "already_empty"
+        } else {
+            "cleared"
+        }
     }
 
     /// `key` の直後の数値トークン（観測できる範囲で具体値を組み立てるため。0 より大きいことも照合する）。
@@ -974,6 +1040,7 @@ mod linux {
             "this test needs root (rootful pivot_root, cgroup v2 writes); rootless exec is not implemented"
         );
         let bundle = make_bundle();
+        verify_bundle_definition(&bundle);
         verify_probe_on_host(&bundle);
         let original_cgroup = own_cgroup_path();
 

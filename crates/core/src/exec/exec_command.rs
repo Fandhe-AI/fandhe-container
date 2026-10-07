@@ -19,6 +19,11 @@
 //!
 //! # 契約
 //!
+//! - **コマンドの環境と補助グループ**（SEC-1・SEC-5・TASK-163 追補・#1457）: コマンドは [`ExecCommand`] で受け取り、
+//!   環境変数はコンテナ定義由来の `ContainerEnv` の中身だけが `execveat` の envp になる（呼び出しプロセスの環境は
+//!   渡らない）。補助グループは `reapply_restrictions` の capability 削減が launch と同じ関数で空にする
+//!   （`setgroups(0)`。fork の前に済み、子へ継承される。`setgroups` が `deny` の user namespace では残して記録する）。
+//!   uid / gid は変更しない
 //! - **入口は [`ExecReady`] だけを値で受け取る**（SEC-1）。`ExecRestrictionReport`・真偽値を受け取る入口、
 //!   `ExecReady` を作る別経路は無い。制限（`NO_NEW_PRIVS`・Landlock・seccomp・capability の bounding set・
 //!   rlimit）は fork / execve を越えて継承されるため、「適用 → fork → execve」の順で子へ載る
@@ -63,7 +68,9 @@
 //!
 //! - 標準入出力の受け渡し（CLI の exec・TASK-161 / SUP-4 の healthcheck の出力取得）。現状は launch と同じく
 //!   `/dev/null` へ固定する（ホスト側の端末・ファイルをコンテナへ渡さない。fail-closed）
-//! - 環境変数・作業ディレクトリ・ユーザーの指定（OCI `process` からの組み立て）。cwd は rootfs の根で固定
+//! - 作業ディレクトリ・ユーザーの指定（OCI `process` からの組み立て）。cwd は rootfs の根で固定。環境変数は
+//!   コンテナ定義（`config.json` の `process.env`）と明示の上書きだけを [`ExecCommand`] の `ContainerEnv` で受け取り、
+//!   exec を起動したプロセスの環境は引き継がない（TASK-163 追補・#1457。`exec/container_env.rs`）
 //! - 子の失敗を構造のまま親へ返す同期パイプ（現状は終了コードと stderr）
 
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
@@ -73,7 +80,7 @@ use crate::traits::types::ErrorCode;
 
 use super::process::{EXIT_SETUP_FAILED, exec_child_main};
 use super::reapply::ExecReadyParts;
-use super::{ContainerChild, Entrypoint, ExecError, ExecReady, IsolationStage};
+use super::{ContainerChild, ExecCommand, ExecError, ExecReady, IsolationStage};
 
 /// 証跡 `ready` を消費し、`entry` を稼働中コンテナの namespace・cgroup・制限の下で実行する子を fork する。
 ///
@@ -87,15 +94,28 @@ use super::{ContainerChild, Entrypoint, ExecError, ExecReady, IsolationStage};
 /// ```compile_fail,E0308
 /// fn f(
 ///     report: fandhe_container_core::exec::ExecRestrictionReport,
+///     command: &fandhe_container_core::exec::ExecCommand,
+/// ) {
+///     let _ = fandhe_container_core::exec::spawn_exec_command(report, command);
+/// }
+/// ```
+///
+/// コマンドは [`ExecCommand`] でしか渡せない（環境変数を任意の文字列の列で渡せる launch 用の `Entrypoint` は
+/// 受け取らない。TASK-163 追補・#1457。契約は `exec/container_env.rs`）:
+///
+/// ```compile_fail,E0308
+/// fn f(
+///     ready: fandhe_container_core::exec::ExecReady,
 ///     entry: &fandhe_container_core::exec::Entrypoint,
 /// ) {
-///     let _ = fandhe_container_core::exec::spawn_exec_command(report, entry);
+///     let _ = fandhe_container_core::exec::spawn_exec_command(ready, entry);
 /// }
 /// ```
 pub fn spawn_exec_command(
     ready: ExecReady,
-    entry: &Entrypoint,
+    command: &ExecCommand,
 ) -> Result<ContainerChild, ExecError> {
+    let entry = command.entrypoint();
     let ExecReadyParts {
         root,
         mut threads,
@@ -287,8 +307,8 @@ mod tests {
         ThreadCountSource::PreOpened(f)
     }
 
-    fn entry() -> Entrypoint {
-        Entrypoint::new("/bin/true", ["true"], Vec::<String>::new()).expect("entry")
+    fn entry() -> ExecCommand {
+        ExecCommand::new("/bin/true", ["true"], &crate::exec::ContainerEnv::empty()).expect("entry")
     }
 
     /// SUP-6・SEC-1・TASK-163.4: `ExecReady` を作ったのと別のプロセスからは、cwd も変えず fork もせずに拒否する。

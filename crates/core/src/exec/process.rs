@@ -819,7 +819,7 @@ pub struct ExecChildSetupReport {
     pub dev_tty_errno: Option<i32>,
     /// fd 0〜2 の実体の `(文字デバイスか, st_rdev)`。`/dev/null` は `(true, makedev(1, 3))`。
     pub stdio: [(bool, u64); 3],
-    /// `execveat` に渡す環境変数（`KEY=VALUE`。[`Entrypoint`] が持つ値そのもの）。
+    /// `execveat` に渡す環境変数（`KEY=VALUE`。`ExecCommand` が持つ値そのもので、envp はこの列だけから作る）。
     pub env: Vec<String>,
 }
 
@@ -841,10 +841,11 @@ pub struct ExecChildSetupReport {
 #[cfg(all(feature = "exec-test-support", not(test)))]
 #[doc(hidden)]
 pub fn observe_exec_child_setup(
-    entry: &Entrypoint,
+    command: &super::ExecCommand,
     report: &Path,
     timeout: Duration,
 ) -> Result<ExecChildSetupObservation, ExecError> {
+    let entry = command.entrypoint();
     let pid = sys::fork_single_threaded(
         || match prepare_exec_child(entry).and_then(|_file| write_setup_report(entry, report)) {
             Ok(()) => 0,

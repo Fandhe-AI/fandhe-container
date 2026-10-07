@@ -39,7 +39,7 @@ fail() { echo "FAIL: $1" >&2; failures=$((failures + 1)); }
 mkdir "$root/bundle"
 
 # スタブ launcher。`run --id <id> --bundle <dir> --restart <p> --restart-backoff-ms 0` を受ける。
-# STUB_MODE: normal / no_ready / early_exit / no_restart / same_pid / count_jump / foreign_pid /
+# STUB_MODE: normal / foreign_new（再起動後の state.json の pid が子孫でない無関係プロセス）/ no_ready / early_exit / no_restart / same_pid / count_jump / foreign_pid /
 # error_line / log_missing / log_short / log_garbage / deep（state.json の pid が孫プロセス）/
 # late_start（SIGTERM 時に環境変数を継承しない新コンテナを起動して state.json へ書く）/
 # late_two（全コンテナが環境変数を継承せず、SIGTERM 時にさらに新コンテナを起動。追跡済み pid も回収されること）/
@@ -51,7 +51,7 @@ mkdir "$root/bundle"
 cat >"${root}/launcher.sh" <<'STUB'
 #!/usr/bin/env bash
 id="$3"
-sd="${XDG_RUNTIME_DIR}/fandhe-container/${id}"
+sd="${FANDHE_BENCH_STATE_ROOT:?}/${id}"
 mkdir -p "$sd"
 count=0
 idx=0
@@ -140,6 +140,7 @@ while :; do
   esac
   shown="$child"
   [ "$STUB_MODE" != deep ] || shown="$grand"
+  [ "$STUB_MODE" != foreign_new ] || shown="$(<"${STUB_FOREIGN}")"
   [ "$STUB_MODE" != same_pid ] || shown="$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "${sd}/state.json")"
   write_state "$shown"
   e="${elapsed[$idx]:-1000}"
@@ -334,6 +335,20 @@ run_case foreign_pid 1 foreign_pid "" --trials 1 --warmup 0 --timeout 2 || true
 if kill -0 "$foreign_pid" 2>/dev/null; then pass "foreign_pid: unrelated process was not signaled"; else fail "foreign_pid: unrelated process was killed"; fi
 kill "$foreign_pid" 2>/dev/null || true
 foreign_pid=""
+
+# 再起動後の新 pid が launcher の子孫でないときも無関係プロセスとして扱い、kill せず終了コード 1（4 にしない）
+sleep 300 &
+foreign_pid=$!
+echo "$foreign_pid" >"${root}/foreign.pid"
+run_case foreign_new 1 foreign_new "" --trials 1 --warmup 0 --timeout 2 || true
+if kill -0 "$foreign_pid" 2>/dev/null; then pass "foreign_new: unrelated restarted pid was not signaled"; else fail "foreign_new: unrelated restarted pid was killed"; fi
+kill "$foreign_pid" 2>/dev/null || true
+foreign_pid=""
+
+# --state-root は FANDHE_BENCH_STATE_ROOT として launcher へ渡る（スタブは XDG を見ず、この変数の下へ書く）
+mkdir -m 0700 "${root}/sr"
+run_case state_root 0 normal "1000 1000" --trials 1 --warmup 0 --timeout 10 --state-root "${root}/sr" || true
+if [ -s "${root}/state_root.out" ]; then pass "state_root: result published"; else fail "state_root: no result"; fi
 
 # --- 引数・入力エラーは 2 ---
 chk2() { # <名前> <script 引数...>

@@ -19,6 +19,9 @@
 #   行を出し、環境変数 FANDHE_BENCH_OWNER の実行ごとのトークンを受け取る。停止は SIGTERM、期限超過で SIGKILL。
 #   コンテナ側プロセスは launcher の子孫で、state.json（<state-root>/<id>/state.json。camelCase の
 #   status・pid・restartCount）に実行中 pid と再起動回数を反映する。
+#   状態保存先: 環境変数 FANDHE_BENCH_STATE_ROOT に state.json 群の親ディレクトリ（<state-root>）の絶対パスを渡す
+#   （--state-root 指定時はその値。省略時は本スクリプトが決めた既定の場所。root で省略時は /run/fandhe-container）。
+#   launcher は state.json をこの下の <id>/state.json へ書く。
 #   restart のたびに構造化ログ {"component":"supervisor.monitor","operation":"restart","result":"ok",
 #   "elapsed_us":N} を標準エラーへ出す（任意。無ければ supervisor_reported は null）。
 #
@@ -451,11 +454,13 @@ container_id="${id_prefix}-${rand8}"
 launcher_env=()
 if [ -n "$state_root" ]; then
   state_dir="$state_root"
+  launcher_env=("FANDHE_BENCH_STATE_ROOT=$state_root")
 elif [ "$uid_now" -eq 0 ]; then
   state_dir="/run/fandhe-container"
+  launcher_env=("FANDHE_BENCH_STATE_ROOT=$state_dir")
 else
   mkdir -m 0700 "$workdir/xdg"
-  launcher_env=("XDG_RUNTIME_DIR=$workdir/xdg")
+  launcher_env=("XDG_RUNTIME_DIR=$workdir/xdg" "FANDHE_BENCH_STATE_ROOT=$workdir/xdg/fandhe-container")
   state_dir="$workdir/xdg/fandhe-container"
 fi
 state_file="$state_dir/$container_id/state.json"
@@ -528,6 +533,8 @@ for ((n = 1; n <= total; n++)); do
   new_pid="$ST_PID"
   # 観測時: 新 pid が生存し launcher の子孫であること（SUP-3。state.json だけ残って新プロセスが既に終了した試行は採用しない）。
   # 計測区間（t1）の外で行うのでレイテンシには含まれない。起動時刻を控えて確定時に再照合する。
+  # 生存していて子孫検査だけ失敗した pid は帰属不明（無関係）として後始末の対象から外す（開始時の old_pid と同じ扱い）。
+  if alive "$new_pid" && ! is_descendant "$new_pid"; then unrelated["$new_pid"]=1; fi
   alive "$new_pid" && is_descendant "$new_pid" || fail "new container process is not alive as a launcher descendant at observation in trial $n"
   new_start="$REPLY_START"
   track_pid "$new_pid" "$new_start"

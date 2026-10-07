@@ -194,13 +194,13 @@ fn encode_payload(record: &AuditRecord) -> Result<String, AuditWriteError> {
         None => out.push_str(" arch=?"),
     }
     let path = match record.event() {
-        AuditEvent::Seccomp { .. } => None,
+        AuditEvent::Seccomp { .. } | AuditEvent::ExecTarget { .. } => None,
         AuditEvent::Landlock { path, .. } => Some(path),
         AuditEvent::Mount { path } => path.as_ref(),
         AuditEvent::PluginTrust { path, .. } => Some(path),
     };
     push_path_fields(&mut out, path);
-    // plugin 信頼検証のみ末尾に理由を追記する（他レイヤーの本文は従来と同一）。
+    // plugin 信頼検証と exec 対象のみ末尾に理由を追記する（他レイヤーの本文は従来と同一）。
     if let Some(reason) = record.reason() {
         out.push_str(" reason=");
         out.push_str(reason.as_str());
@@ -547,6 +547,18 @@ mod tests {
             encode_payload(&r).unwrap(),
             "op=fandhe-audit layer=plugin_trust ts=1700000000.000000005 pid=1234 syscall=? arch=? \
              path=2F70 path_truncated=0 path_original_len=2 reason=untrusted_owner"
+        );
+    }
+
+    #[test]
+    fn sec4_sup6_task163_payload_exec_target_without_path() {
+        let r = rec(AuditEvent::ExecTarget {
+            reason: crate::audit_log::AuditReason::new("exec_target_cgroup_mismatch"),
+        });
+        assert_eq!(
+            encode_payload(&r).unwrap(),
+            "op=fandhe-audit layer=exec_target ts=1700000000.000000005 pid=1234 syscall=? arch=? \
+             path=? path_truncated=? path_original_len=? reason=exec_target_cgroup_mismatch"
         );
     }
 

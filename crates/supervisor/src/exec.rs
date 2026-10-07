@@ -68,8 +68,8 @@
 //!   子が `execve` より前の手順か `execve` 自体で失敗した）を分ける。子の終了コード 125 / 126 / 127 は実行された
 //!   コマンド自身も返し得るため、終了コードでは判定しない。子が close-on-exec の pipe で親へ知らせた内容で
 //!   判定する（core の `exec/exec_command.rs`）。分離違反による拒否（ランタイム自身のバイナリ・インタープリタ経由・
-//!   `/dev/null` の差し替え）は理由コードを持ち、呼び出し側が違反として記録できる（SEC-4。監査ログへの保存の
-//!   配線は下記「未実装」）
+//!   `/dev/null` の差し替え）は理由コードを持ち、呼び出し側が違反として記録できる（SEC-4。監査ログへの保存は
+//!   下記「未実装」）
 //! - **rlimit の空集合は拒否する**（TASK-163 追補・#1460）: 対象の実効 rlimit を 1 つも得られなかった場合、core は
 //!   適用を省かず `FailedPrecondition` で拒否する（rlimit を載せないまま exec へ進む経路を作らない）
 //! - **コンテナから見える窓を閉じる**: exec の子は fork した時点でコンテナの PID namespace に入り、
@@ -118,6 +118,20 @@
 //!   失敗時は所属が不定のため、呼び出し側は続行せず終了する（fail-closed）。保持 fd は子が `execve` の前に
 //!   `close_range` で閉じる（core の `exec/process.rs`）
 //!
+//! - **監査記録**（SEC-4・SUP-6・TASK-163 追補・#1465）: [`run_command`] は監査の記録先 [`AuditSink`] を必須の
+//!   引数に取り、exec の対象の拒否（種別 `exec_target`。理由 `exec_target_*`・`exec_root_not_container_rootfs`・
+//!   `exec_joined_*` の 9 種）を層 `exec_target` のレコードとして **1 拒否につき 1 件** 記録する。監査なしで通す
+//!   入口は無い。記録点は worker の結果を復号した直後の **親プロセス（exec を起動したプロセス）** の 1 箇所で、
+//!   worker の中では記録しない（worker は `setns` 後にコンテナの mount namespace と cgroup に入っており、そこで
+//!   sink の I/O やロックを走らせると、ホストの監査ファイルのロックをコンテナの cgroup 内のプロセスが保持し得る
+//!   ため）。記録の PID は記録を行った親プロセスのもの、時刻は親が worker の結果を受け取った時点（拒否から最大で
+//!   exec の上限時間ぶん遅れ得る）。**載せるのは層・理由コード（静的トークン）・時刻・PID だけ** で、ホスト側
+//!   パス・期待 cgroup パス・namespace 識別子・bundle パスは載せない（`AuditEvent::ExecTarget` がパスを持たない
+//!   型）。worker から親へ渡す理由コードは許可リストで引き直した静的値だけを記録へ入れる（ログ注入の経路を作らない）。
+//!   記録の成否で拒否は覆らない（fail-closed）。結果は [`AuditedRejection::delivery`] で返し、黙って捨てない。
+//!   段単位の公開関数（[`identify_pid1`]・[`enter_namespaces`]・[`join_cgroup`]・[`reapply_restrictions`] 等）は
+//!   単体では記録せず、記録するのは通しの入口だけ
+//!
 //! # `execve` を結線する前の 5 条件（#502 が残し、#503 で満たした）
 //!
 //! 1. 完了を型で強制する: core の `spawn_exec_command` は `ExecReady` だけを値で受け取る
@@ -160,9 +174,11 @@
 //!   同じく `/dev/null` へ固定し、cwd・ユーザーの指定も未対応（cwd はコンテナの rootfs の根。`config.json` の
 //!   `process.user.additionalGids` の解釈〔指定したグループの付与〕も launch・exec とも未実装で、補助グループは
 //!   常に空）
-//! - 違反記録（SEC-4）の監査ログへの保存の配線。core のファイル書き込み経路（`audit_log::AuditFileWriter`。
-//!   TASK-41.5.1）は実装済みだが、exec の拒否（種別 `exec_target`）を表す監査の層と、exec 専用プロセスへ
-//!   `AuditSink` を渡す経路が無い。現状は種別・理由コード・ビヘイビア ID をエラーメッセージへ残すところまで
+//! - 違反記録（SEC-4）の監査ログへの保存のうち、本番の `AuditSink` の実体（`AuditFileWriter` とカーネル監査
+//!   フォールバックを束ねたもの）の生成と、CLI・supervisor から [`run_command`] へ渡す配線（TASK-29 / TASK-157 系）。
+//!   層 `exec_target` と [`run_command`] での 1 拒否 1 件の記録は実装済み（#1465）。`ExecOutcome::exit` が運ぶ
+//!   `execve` 前の違反（`SetupFailed`。種別 `entrypoint`）の監査記録も未実装で、launch 経路と共有する種別のため
+//!   層の設計は別に決める
 //! - `--ulimit` の指定値の `state.json` への記録。現状は pid1 の実効値を写して代替する（hard は launch を
 //!   超えないが、soft は pid1 が hard の範囲で上げていれば launch の指定より高くなり得る。core の
 //!   `exec/reapply.rs` のモジュール doc）
@@ -172,6 +188,7 @@ use std::io::{BufRead as _, Read as _, Write as _};
 use std::os::fd::BorrowedFd;
 use std::time::{Duration, Instant};
 
+use fandhe_container_core::audit_log::{AuditSink, AuditedRejection};
 use fandhe_container_core::exec::{
     ChildExit, ContainerEnv, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV, ENTRYPOINT_MAX_STRING_BYTES,
     ENTRYPOINT_MAX_TOTAL_BYTES, ExecCgroupJoin, ExecCgroupJoinReport, ExecCgroupName,
@@ -180,8 +197,8 @@ use fandhe_container_core::exec::{
     join_cgroup as core_join_cgroup, join_namespaces,
     prepare_cgroup_join as core_prepare_cgroup_join,
     prepare_exec_restrictions as core_prepare_exec_restrictions,
-    reapply_restrictions as core_reapply_restrictions, remove_exec_child_cgroup,
-    spawn_exec_command, spawn_exec_worker,
+    reapply_restrictions as core_reapply_restrictions, record_exec_target_rejection,
+    remove_exec_child_cgroup, spawn_exec_command, spawn_exec_worker,
 };
 use fandhe_container_core::oci_runtime::{OciConfig, RootfsDir, load_config, pin_bundle_rootfs};
 use fandhe_container_core::traits::{
@@ -535,16 +552,22 @@ impl Deadline {
 /// 単一スレッドの exec 専用プロセスからのみ呼ぶこと**（logs 捕捉スレッドを持つ supervisor 本体からは呼ばない。
 /// 呼べば `setns` が拒否される）。失敗時は状態を戻せないため、呼び出し側は続行せずプロセスを終了する。
 /// エラーメッセージへホスト側パス・ルール内容・期待 cgroup パスを載せない。
+///
+/// `audit` は exec の対象の拒否の記録先（SEC-4・#1465。契約はモジュール doc「監査記録」）。拒否は `Err` の
+/// [`AuditedRejection`] で返り、`error` は記録の成否に関わらず元の拒否、`delivery` が記録の結果。移行: 呼び出しへ
+/// sink を渡し、`Err` は `.error` / `.delivery` を見る。`audit` の実装はブロックし得る I/O にタイムアウトを持つこと
+/// （REPAIR-5。`AuditSink` の契約）。記録は worker を回収した後に行うため、sink が詰まっても worker・コマンドは残らない。
 pub fn run_command(
     record: &StateRecord,
     request: &ExecRequest,
     timeout: Duration,
-) -> Result<ExecOutcome, TraitError> {
+    audit: &dyn AuditSink,
+) -> Result<ExecOutcome, AuditedRejection<TraitError>> {
     let deadline = Deadline::after(timeout);
-    // 稼働中でない記録は、fork せず呼び出しプロセスで拒否する（副作用なし）。
-    running_pid(record)?;
+    // 稼働中でない記録は、fork せず呼び出しプロセスで拒否する（副作用なし。記録の対象外）。
+    running_pid(record).map_err(AuditedRejection::not_applicable)?;
     let name = ExecCgroupName::unique();
-    run_in_worker_with(
+    let result = run_in_worker_with(
         deadline,
         WORKER_GRACE,
         || cleanup_child_cgroup(record, &name),
@@ -552,11 +575,26 @@ pub fn run_command(
             let target = identify_pid1(record)?;
             run_with_target(&target, request, deadline, &name)
         },
-    )
+    );
+    audit_worker_result(result, audit)
+}
+
+/// worker の結果を受け、exec の対象の拒否なら 1 件記録して返す（親プロセス側の記録点。SEC-4・#1465）。
+///
+/// 違反の理由を持たない失敗（タイムアウト・システムエラー・前提不成立）は記録せず `NotApplicable`。
+fn audit_worker_result(
+    result: Result<ExecOutcome, WorkerFailure>,
+    audit: &dyn AuditSink,
+) -> Result<ExecOutcome, AuditedRejection<TraitError>> {
+    result.map_err(|failure| match failure.violation {
+        Some(reason) => record_exec_target_rejection(failure.error, reason, audit),
+        None => AuditedRejection::not_applicable(failure.error),
+    })
 }
 
 /// [`run_command`] の対象特定だけを [`identify_pid1_with_pidfd`]（起動時から保持する pidfd で対象を固定）に
-/// 替えたもの（SUP-6・SEC-1・CORE-1・TASK-163 追補・#1461）。契約は [`run_command`] と同じ。
+/// 替えたもの（SUP-6・SEC-1・CORE-1・TASK-163 追補・#1461）。契約（`audit` の扱いと `Err` の
+/// [`AuditedRejection`] を含む）は [`run_command`] と同じ。exec の対象の拒否は必ず `audit` へ記録する（SEC-4・#1465）。
 ///
 /// worker は fork で親の fd を継承するため、pidfd は呼び出しプロセスが保持するものをそのまま worker が使う
 /// （追加の syscall なし。呼び出しプロセスは単一スレッドであること）。pidfd はコンテナ内コマンドへ渡らない
@@ -567,11 +605,12 @@ pub fn run_command_with_pidfd(
     pidfd: BorrowedFd<'_>,
     request: &ExecRequest,
     timeout: Duration,
-) -> Result<ExecOutcome, TraitError> {
+    audit: &dyn AuditSink,
+) -> Result<ExecOutcome, AuditedRejection<TraitError>> {
     let deadline = Deadline::after(timeout);
-    running_pid(record)?;
+    running_pid(record).map_err(AuditedRejection::not_applicable)?;
     let name = ExecCgroupName::unique();
-    run_in_worker_with(
+    let result = run_in_worker_with(
         deadline,
         WORKER_GRACE,
         || cleanup_child_cgroup(record, &name),
@@ -579,7 +618,8 @@ pub fn run_command_with_pidfd(
             let target = identify_pid1_with_pidfd(record, pidfd)?;
             run_with_target(&target, request, deadline, &name)
         },
-    )
+    );
+    audit_worker_result(result, audit)
 }
 
 /// 実機結合試験専用の入口: [`run_command`] の対象特定だけを [`identify_pid1_in`]（期待 cgroup パスを呼び出し側
@@ -591,11 +631,12 @@ pub fn run_command_in(
     expected_cgroup_path: &str,
     request: &ExecRequest,
     timeout: Duration,
-) -> Result<ExecOutcome, TraitError> {
+    audit: &dyn AuditSink,
+) -> Result<ExecOutcome, AuditedRejection<TraitError>> {
     let deadline = Deadline::after(timeout);
-    running_pid(record)?;
+    running_pid(record).map_err(AuditedRejection::not_applicable)?;
     let name = ExecCgroupName::unique();
-    run_in_worker_with(
+    let result = run_in_worker_with(
         deadline,
         WORKER_GRACE,
         || {
@@ -611,7 +652,27 @@ pub fn run_command_in(
             let target = identify_pid1_in(record, expected_cgroup_path)?;
             run_with_target(&target, request, deadline, &name)
         },
-    )
+    );
+    audit_worker_result(result, audit)
+}
+
+/// worker の失敗。拒否のエラーと、exec の対象の違反だった場合のその理由（監査記録の入力。#1465）。
+///
+/// `violation` は worker の結果行の理由コードを core の許可リスト（`ViolationReason::EXEC_TARGET_REASONS`）で
+/// 引き直した値だけを持つ。未知の文字列は結果行の不正として `Internal`（fail-closed）になりここへ来ない。
+#[derive(Debug)]
+struct WorkerFailure {
+    error: TraitError,
+    violation: Option<ViolationReason>,
+}
+
+impl From<TraitError> for WorkerFailure {
+    fn from(error: TraitError) -> Self {
+        Self {
+            error,
+            violation: None,
+        }
+    }
 }
 
 /// worker の終了待ちに足す猶予。worker 自身が期限超過後に子を `SIGKILL` して回収する時間（`wait_or_stop` の
@@ -635,7 +696,7 @@ fn run_in_worker_with(
     grace: Duration,
     cleanup: impl FnOnce() -> Result<(), TraitError>,
     work: impl FnOnce() -> Result<ExecOutcome, TraitError>,
-) -> Result<ExecOutcome, TraitError> {
+) -> Result<ExecOutcome, WorkerFailure> {
     // fork 前に期限を確かめる（切れていれば worker を作らない。fork 後の早期 return で worker を残さないため）。
     deadline.remaining("starting the exec worker")?;
     let (mut reader, writer) = std::io::pipe().map_err(|e| {
@@ -660,16 +721,19 @@ fn run_in_worker_with(
     let cleaned = cleanup();
     match (result, cleaned) {
         (Ok(outcome), Ok(())) => Ok(outcome),
-        (Ok(_), Err(cleanup_err)) => Err(cleanup_err),
+        (Ok(_), Err(cleanup_err)) => Err(cleanup_err.into()),
         (Err(err), Ok(())) => Err(err),
-        (Err(err), Err(cleanup_err)) => Err(TraitError::new(
-            err.code(),
-            format!(
-                "{}; cleanup also failed: {}",
-                err.message(),
-                cleanup_err.message()
+        (Err(err), Err(cleanup_err)) => Err(WorkerFailure {
+            error: TraitError::new(
+                err.error.code(),
+                format!(
+                    "{}; cleanup also failed: {}",
+                    err.error.message(),
+                    cleanup_err.message()
+                ),
             ),
-        )),
+            violation: err.violation,
+        }),
     }
 }
 
@@ -679,7 +743,7 @@ fn collect_worker_result(
     reader: &mut std::io::PipeReader,
     deadline: Deadline,
     grace: Duration,
-) -> Result<ExecOutcome, TraitError> {
+) -> Result<ExecOutcome, WorkerFailure> {
     // fork 後はどの経路でも worker を停止・回収してから返す（`wait_or_stop`。期限切れなら待たずに SIGKILL）。
     let wait_deadline = Deadline {
         at: deadline.at.checked_add(grace).unwrap_or(deadline.at),
@@ -703,7 +767,8 @@ fn collect_worker_result(
         return Err(TraitError::new(
             ErrorCode::Internal,
             format!("exec stage Spawn: the exec worker ended abnormally ({exit:?})"),
-        ));
+        )
+        .into());
     }
     let mut line = Vec::new();
     std::io::BufReader::new(reader.take(WORKER_RESULT_MAX))
@@ -751,12 +816,12 @@ pub fn run_in_worker_for_test(
     cleanup: impl FnOnce() -> Result<(), TraitError>,
     work: impl FnOnce() -> Result<ExecOutcome, TraitError>,
 ) -> Result<ExecOutcome, TraitError> {
-    run_in_worker_with(Deadline::after(timeout), grace, cleanup, work)
+    run_in_worker_with(Deadline::after(timeout), grace, cleanup, work).map_err(|f| f.error)
 }
 
 /// worker の結果を pipe 用の 1 行へ符号化する。成功は `ok <command|setup> <違反の理由コードまたは -> <exited|signaled>
 /// <値> <rlimit 数> <capability 数> <Landlock 数> <seccomp 命令数> <補助グループの扱い> <その件数>`、失敗は
-/// `err <ERR-1 コード> <メッセージ>`（改行は空白へ置換）。
+/// `err <ERR-1 コード> <exec 対象の違反の理由コードまたは -> <メッセージ>`（改行は空白へ置換）。
 fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
     let line = match result {
         Ok(o) => {
@@ -786,8 +851,9 @@ fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
             )
         }
         Err(e) => format!(
-            "err {} {}\n",
+            "err {} {} {}\n",
             e.code().as_str(),
+            exec_target_reason_of(e).map_or("-", ViolationReason::as_str),
             e.message().replace(['\n', '\r'], " ")
         ),
     };
@@ -804,6 +870,17 @@ fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
     line.into_bytes()
 }
 
+/// [`from_exec_error`] が exec の対象の違反の末尾へ付ける目印（種別と理由コードの前まで）。
+const EXEC_TARGET_VIOLATION_MARKER: &str = " (violation: exec_target/";
+
+/// `err` が exec の対象の違反による拒否なら、その理由を返す（[`from_exec_error`] の末尾の目印を許可リストで
+/// 引き直す。メッセージは core の静的トークンだけから組み立てられ、外部入力は載らない。#1465）。
+fn exec_target_reason_of(err: &TraitError) -> Option<ViolationReason> {
+    let tail = err.message().rsplit_once(EXEC_TARGET_VIOLATION_MARKER)?.1;
+    let (token, _) = tail.split_once(", ")?;
+    ViolationReason::from_exec_target_token(token)
+}
+
 /// worker が返し得る違反の理由（`execve` 前の手順が返すもの。[`decode_worker_result`] が名前から引き直す）。
 const SETUP_VIOLATIONS: [ViolationReason; 5] = [
     ViolationReason::EntrypointIsRuntimeBinary,
@@ -814,17 +891,22 @@ const SETUP_VIOLATIONS: [ViolationReason; 5] = [
 ];
 
 /// [`encode_worker_result`] の逆変換。形式に合わない入力（空・切れた行・未知の種別）は `Internal`（fail-closed）。
-fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, TraitError> {
+fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
     let malformed = || {
-        TraitError::new(
+        WorkerFailure::from(TraitError::new(
             ErrorCode::Internal,
             "exec stage Spawn: the exec worker returned a malformed result",
-        )
+        ))
     };
     let text = String::from_utf8_lossy(line);
     let text = text.strip_suffix('\n').ok_or_else(malformed)?;
     if let Some(rest) = text.strip_prefix("err ") {
-        let (code, message) = rest.split_once(' ').unwrap_or((rest, ""));
+        let (code, rest) = rest.split_once(' ').ok_or_else(malformed)?;
+        let (violation, message) = rest.split_once(' ').unwrap_or((rest, ""));
+        let violation = match violation {
+            "-" => None,
+            token => Some(ViolationReason::from_exec_target_token(token).ok_or_else(malformed)?),
+        };
         let code = [
             ErrorCode::InvalidArgument,
             ErrorCode::NotFound,
@@ -839,7 +921,10 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, TraitError> {
         .into_iter()
         .find(|c| c.as_str() == code)
         .unwrap_or(ErrorCode::Internal);
-        return Err(TraitError::new(code, message));
+        return Err(WorkerFailure {
+            error: TraitError::new(code, message),
+            violation,
+        });
     }
     let rest = text.strip_prefix("ok ").ok_or_else(malformed)?;
     let mut it = rest.split(' ');
@@ -871,7 +956,7 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, TraitError> {
         },
         _ => return Err(malformed()),
     };
-    let mut count = || -> Result<usize, TraitError> {
+    let mut count = || -> Result<usize, WorkerFailure> {
         it.next().and_then(|v| v.parse().ok()).ok_or_else(malformed)
     };
     let (rlimits_applied, capability_bounding_dropped) = (count()?, count()?);
@@ -1023,7 +1108,8 @@ fn load_exec_bundle(bundle: &std::path::Path) -> Result<(OciConfig, RootfsDir), 
 ///
 /// 分離違反による拒否（`ExecError::violation`。SEC-4）は、種別・理由コード・ビヘイビア ID をメッセージの
 /// 末尾に機械可読な形で残す（`TraitError` は違反記録を運べないため）。違反の対象（期待 cgroup パス）は
-/// メッセージへ含めない。監査ログへの保存の配線は未実装（モジュール doc「未実装」。REPAIR-3）。
+/// メッセージへ含めない。exec の対象の違反の監査記録は通しの入口 [`run_command`] が親プロセスで行い、worker は
+/// 末尾の目印から理由を結果行へ載せる（[`exec_target_reason_of`]。#1465）。
 fn from_exec_error(err: ExecError) -> TraitError {
     let violation = err.violation.as_ref().map_or_else(String::new, |v| {
         format!(
@@ -1042,6 +1128,7 @@ fn from_exec_error(err: ExecError) -> TraitError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fandhe_container_core::audit_log::{AuditDelivery, AuditLayer, AuditRecord};
     use fandhe_container_core::traits::{
         CgroupPlacement, CgroupScope, ContainerStatus, StateRevision,
     };
@@ -1150,8 +1237,13 @@ mod tests {
     /// 実 pid1 を要する成功経路は結合試験 `tests/exec.rs`（`-- --ignored`）が担う。
     #[test]
     fn sup6_task163_4_run_command_entry_point_has_expected_shape() {
-        let _run: fn(&StateRecord, &ExecRequest, Duration) -> Result<ExecOutcome, TraitError> =
-            run_command;
+        type Run = fn(
+            &StateRecord,
+            &ExecRequest,
+            Duration,
+            &dyn AuditSink,
+        ) -> Result<ExecOutcome, AuditedRejection<TraitError>>;
+        let _run: Run = run_command;
     }
 
     /// SUP-6・SEC-1・TASK-163 追補（#1457）: 要求はパス・argv を fork の前に検証し、コマンドの環境は
@@ -1238,7 +1330,13 @@ mod tests {
             ContainerStatus::stopped(cid(), Some(0)),
             ContainerStatus::running(cid(), None),
         ] {
-            let err = run_command(&record(st), &entry, Duration::from_secs(1)).unwrap_err();
+            let sink = RecordingSink::new(false);
+            let rejected =
+                run_command(&record(st), &entry, Duration::from_secs(1), &sink).unwrap_err();
+            // 稼働中でない記録は fork 前の前提不成立で、監査の対象外（記録 0 件）。
+            assert_eq!(rejected.delivery, AuditDelivery::NotApplicable);
+            assert_eq!(sink.snapshot().len(), 0);
+            let err = rejected.error;
             assert_eq!(err.code(), ErrorCode::FailedPrecondition);
             assert_eq!(
                 err.message(),
@@ -1441,10 +1539,11 @@ mod tests {
 
         let err = TraitError::new(ErrorCode::Timeout, "exec timed out\nbefore x");
         let line = encode_worker_result(&Err(err));
-        assert_eq!(line, b"err TIMEOUT exec timed out before x\n");
+        assert_eq!(line, b"err TIMEOUT - exec timed out before x\n");
         let back = decode_worker_result(&line).unwrap_err();
-        assert_eq!(back.code(), ErrorCode::Timeout);
-        assert_eq!(back.message(), "exec timed out before x");
+        assert_eq!(back.violation, None);
+        assert_eq!(back.error.code(), ErrorCode::Timeout);
+        assert_eq!(back.error.message(), "exec timed out before x");
 
         for bad in [
             &b""[..],
@@ -1462,8 +1561,12 @@ mod tests {
             b"ok command entrypoint_is_runtime_binary exited 0 1 2 3 4 cleared 1\n",
             b"ok setup rootfs_is_host_root exited 126 1 2 3 4 cleared 1\n",
             b"hello\n",
+            // 失敗行: 理由の欄が無い旧形式・未知の理由・exec 対象でない理由。
+            b"err TIMEOUT\n",
+            b"err INTERNAL unknown_reason boom\n",
+            b"err INTERNAL entrypoint_is_runtime_binary boom\n",
         ] {
-            let e = decode_worker_result(bad).unwrap_err();
+            let e = decode_worker_result(bad).unwrap_err().error;
             assert_eq!(e.code(), ErrorCode::Internal, "{bad:?}");
             assert_eq!(
                 e.message(),
@@ -1481,7 +1584,8 @@ mod tests {
             || panic!("cleanup must not run when no worker was forked"),
             || panic!("work must not run when the deadline has expired"),
         )
-        .unwrap_err();
+        .unwrap_err()
+        .error;
         assert_eq!(err.code(), ErrorCode::Timeout);
         assert_eq!(
             err.message(),
@@ -1496,9 +1600,125 @@ mod tests {
         let line = encode_worker_result(&Err(err));
         assert!(line.len() <= WORKER_LINE_MAX);
         assert_eq!(line.last(), Some(&b'\n'));
-        let back = decode_worker_result(&line).unwrap_err();
+        let back = decode_worker_result(&line).unwrap_err().error;
         assert_eq!(back.code(), ErrorCode::Internal);
         assert!(back.message().starts_with("あ"));
+    }
+
+    /// テスト用 sink（件数上限なし。`fail` なら記録に失敗する）。
+    struct RecordingSink {
+        records: std::sync::Mutex<Vec<AuditRecord>>,
+        fail: bool,
+    }
+
+    impl RecordingSink {
+        fn new(fail: bool) -> Self {
+            Self {
+                records: std::sync::Mutex::new(Vec::new()),
+                fail,
+            }
+        }
+
+        fn snapshot(&self) -> Vec<AuditRecord> {
+            self.records.lock().map(|r| r.clone()).unwrap_or_default()
+        }
+    }
+
+    impl AuditSink for RecordingSink {
+        fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+            if self.fail {
+                return Err(TraitError::new(ErrorCode::Internal, "sink failed"));
+            }
+            self.records
+                .lock()
+                .map_err(|_| TraitError::new(ErrorCode::Internal, "poisoned"))?
+                .push(record.clone());
+            Ok(())
+        }
+    }
+
+    /// `from_exec_error` が exec 対象の違反へ付ける末尾と同じ形のエラー（実経路は結合試験 `exec_audit` が通す）。
+    fn exec_target_failure(reason: ViolationReason) -> TraitError {
+        TraitError::new(
+            ErrorCode::FailedPrecondition,
+            format!(
+                "exec stage SetNs: rejected (violation: exec_target/{}, SUP-6)",
+                reason.as_str()
+            ),
+        )
+    }
+
+    /// SEC-4・SUP-6・TASK-163 追補（#1465）: 9 理由すべてが結果行へ理由コードとして載り、往復で同じ理由に戻る。
+    /// 期待 cgroup パスのような対象はメッセージにも結果行にも載らない。
+    #[test]
+    fn sec4_sup6_task163_worker_line_carries_exec_target_reason() {
+        for reason in ViolationReason::EXEC_TARGET_REASONS {
+            let err = exec_target_failure(reason);
+            assert_eq!(exec_target_reason_of(&err), Some(reason), "{reason:?}");
+            let line = encode_worker_result(&Err(err.clone()));
+            let text = String::from_utf8(line.clone()).unwrap();
+            assert!(
+                text.starts_with(&format!("err FAILED_PRECONDITION {} ", reason.as_str())),
+                "{text}"
+            );
+            let back = decode_worker_result(&line).unwrap_err();
+            assert_eq!(back.violation, Some(reason));
+            assert_eq!(back.error, err);
+        }
+        // exec 対象でない違反・違反なしは理由を持たない。
+        let other = TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "exec stage Spawn: x (violation: entrypoint/entrypoint_is_runtime_binary, SEC-1)",
+        );
+        assert_eq!(exec_target_reason_of(&other), None);
+        assert_eq!(
+            exec_target_reason_of(&TraitError::new(
+                ErrorCode::Internal,
+                "x (violation: exec_target/bogus, SUP-6)"
+            )),
+            None
+        );
+    }
+
+    /// SEC-4・SUP-6・TASK-163 追補（#1465）: 親側の記録は 9 理由それぞれ 1 件・層 `exec_target`・理由コード一致・
+    /// パスなし・自 PID。違反なしの失敗は 0 件で `NotApplicable`、失敗する sink でも拒否は元のまま。
+    #[test]
+    fn sec4_sup6_task163_parent_records_one_audit_per_exec_target_rejection() {
+        for reason in ViolationReason::EXEC_TARGET_REASONS {
+            let err = exec_target_failure(reason);
+            let sink = RecordingSink::new(false);
+            let failure = WorkerFailure {
+                error: err.clone(),
+                violation: Some(reason),
+            };
+            let rejected = audit_worker_result(Err(failure), &sink).unwrap_err();
+            assert_eq!(rejected.error, err);
+            assert_eq!(rejected.delivery, AuditDelivery::Recorded);
+            let recs = sink.snapshot();
+            assert_eq!(recs.len(), 1, "{reason:?}");
+            assert_eq!(recs[0].layer(), AuditLayer::ExecTarget);
+            assert_eq!(recs[0].reason().map(|r| r.as_str()), Some(reason.as_str()));
+            assert_eq!(recs[0].path(), None);
+            assert_eq!(recs[0].pid().get(), std::process::id());
+
+            let failing = RecordingSink::new(true);
+            let failure = WorkerFailure {
+                error: err.clone(),
+                violation: Some(reason),
+            };
+            let rejected = audit_worker_result(Err(failure), &failing).unwrap_err();
+            assert_eq!(rejected.error, err);
+            assert_eq!(
+                rejected.delivery,
+                AuditDelivery::SinkFailed(TraitError::new(ErrorCode::Internal, "sink failed"))
+            );
+        }
+        let sink = RecordingSink::new(false);
+        let timeout = TraitError::new(ErrorCode::Timeout, "exec timed out");
+        let rejected = audit_worker_result(Err(timeout.clone().into()), &sink).unwrap_err();
+        assert_eq!(rejected.error, timeout);
+        assert_eq!(rejected.delivery, AuditDelivery::NotApplicable);
+        assert_eq!(sink.snapshot().len(), 0);
     }
 
     /// 祖先に symlink を含まない使い捨ての bundle ディレクトリ（rootfs の固定は symlink を辿らない）。

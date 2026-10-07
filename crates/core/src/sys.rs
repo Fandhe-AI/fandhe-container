@@ -976,6 +976,8 @@ pub(crate) fn mount_tmpfs_at(
     }
     // SAFETY: `target`・`data` は `&CStr` の借用で NUL 終端かつ呼び出しの間生存する。
     // source / fstype は静的な NUL 終端文字列。flags は `TmpfsMountFlags::bits` で組んだ値のみ。
+    // カーネルは呼び出し中にこれらの文字列を複写するだけで、ポインタを保持しない。副作用は
+    // 呼び出しスレッドの mount namespace へのマウント 1 件の追加に限る。
     let rc = unsafe {
         mount(
             c"tmpfs".as_ptr(),

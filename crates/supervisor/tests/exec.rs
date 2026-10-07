@@ -577,17 +577,28 @@ mod linux {
             .collect()
     }
 
-    /// `joiner` の子のうち、実行ファイルがプローブ（host 側の `rootfs/probe` と同じ inode）のものの pid。
+    /// `pid` の直接の子（`/proc/<pid>/task/<pid>/children`）。
+    fn children_of(pid: u32) -> Vec<u32> {
+        fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+            .map(|c| {
+                c.split_whitespace()
+                    .filter_map(|t| t.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `joiner` の子孫（`run_command` は準備を worker プロセスへ隔離するため、プローブは joiner の孫になる。
+    /// REPAIR-5）のうち、実行ファイルがプローブ（host 側の `rootfs/probe` と同じ inode）のものの pid。
     fn probe_child(joiner: u32, probe: &Path) -> Option<u32> {
         let want = fs::metadata(probe).ok()?;
-        let children = fs::read_to_string(format!("/proc/{joiner}/task/{joiner}/children")).ok()?;
-        children
-            .split_whitespace()
-            .filter_map(|t| t.parse::<u32>().ok())
-            .find(|pid| {
-                fs::metadata(format!("/proc/{pid}/exe"))
-                    .is_ok_and(|m| (m.dev(), m.ino()) == (want.dev(), want.ino()))
-            })
+        let mut candidates = children_of(joiner);
+        let grandchildren: Vec<u32> = candidates.iter().flat_map(|c| children_of(*c)).collect();
+        candidates.extend(grandchildren);
+        candidates.into_iter().find(|pid| {
+            fs::metadata(format!("/proc/{pid}/exe"))
+                .is_ok_and(|m| (m.dev(), m.ino()) == (want.dev(), want.ino()))
+        })
     }
 
     /// joiner を起動する（標準出力は 1 行を読むためパイプ）。
@@ -711,7 +722,7 @@ mod linux {
         );
         assert!(denied.exists(), "unshare must be EPERM; {ctx}");
 
-        // プローブを止める（親は joiner。数値 pid へ送るのは、joiner が回収するまで再利用されない子のみ）。
+        // プローブを止める（親は worker。数値 pid へ送るのは、worker が回収するまで再利用されない子のみ）。
         let killed = Command::new("kill")
             .arg("-TERM")
             .arg(pid.to_string())

@@ -48,10 +48,17 @@
 //! - **制限は対象へ束縛される**: [`prepare_restrictions`] が対象 pid1 の mount namespace の識別子を記録し、
 //!   [`reapply_restrictions`] が参加後の自プロセスのものと照合する。同じ rootfs を共有する別コンテナへ参加した
 //!   場合は違反 `exec_joined_namespace_mismatch` で拒否し、何も適用しない（`/` の照合だけでは検出できない）
-//! - **全体の上限時間**: [`run_command`] は準備から終了待ちまでの全体に上限時間を課す（REPAIR-5）。段の間で
-//!   残りを確かめ、fork 後は残りで `wait_timeout` する（超過は子を `SIGKILL` して回収し `Timeout`）。単一スレッド
-//!   のため、procfs・cgroupfs の個々の読み書きの途中でのハングを割り込んで止める手段は持たない（それらは
-//!   ブロックしない通常ファイルで、対象の終了は pidfd で確認する）
+//! - **全体の上限時間**: [`run_command`] は対象の特定から終了待ちまでの全体に上限時間を課す（REPAIR-5）。
+//!   `setns`・cgroup join・制限の再適用・procfs / cgroupfs の読み書きは単一スレッドでブロックし得るため、
+//!   同一プロセス内の期限確認では途中のハングを止められない。そこで **準備から実行までを worker プロセスへ
+//!   隔離** する: 呼び出しプロセス（単一スレッド）が core の `spawn_exec_worker` で worker を fork し、全体の
+//!   期限（worker 内の段の間の確認・fork 後の `wait_timeout` が使う期限と同じ）に猶予を足した時間で worker の
+//!   終了を待つ。超過したら worker を `SIGKILL` して回収し、構造化された `Timeout` を返す。worker の結果
+//!   （終了状態・適用件数、または `code` / `message`）は pipe の 1 行で返す。worker は `setns` 等で不可逆に
+//!   状態を変えるが、変わるのは使い捨ての worker だけで、呼び出しプロセスの namespace・cgroup・制限は変わらない
+//!   （コマンドは worker の子として実行される）。worker が起動後のコマンドを待つ間に強制終了された場合は、
+//!   コマンドが孤児として残り得る（worker 自身は期限でコマンドを kill するため、worker 自体が固まった場合に限る。
+//!   コマンドの停止は cgroup 経由の整理で担う想定。REPAIR-3）
 //! - 再適用の Landlock ルールは、launcher が実際にマウントした結果ではなく bundle の `config.json` から
 //!   再導出する（launch 時の ruleset は保存されていない）。launch 後に `config.json` が書き換えられると
 //!   追従してしまうが、bundle は supervisor と同じ信頼境界（コンテナから書けない場所）にある前提とする。
@@ -80,6 +87,7 @@
 //! - 違反記録（SEC-4）の監査ログへの保存の配線（#839）
 //! - `--ulimit` の指定値の `state.json` への記録。現状は pid1 の実効値を写して代替する
 
+use std::io::{BufRead as _, Read as _, Write as _};
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::exec::{
@@ -88,7 +96,7 @@ use fandhe_container_core::exec::{
     join_cgroup as core_join_cgroup, join_namespaces,
     prepare_cgroup_join as core_prepare_cgroup_join,
     prepare_exec_restrictions as core_prepare_exec_restrictions,
-    reapply_restrictions as core_reapply_restrictions, spawn_exec_command,
+    reapply_restrictions as core_reapply_restrictions, spawn_exec_command, spawn_exec_worker,
 };
 use fandhe_container_core::oci_runtime::{OciConfig, RootfsDir, load_config, pin_bundle_rootfs};
 use fandhe_container_core::traits::{
@@ -294,8 +302,12 @@ pub fn run_command(
     timeout: Duration,
 ) -> Result<ExecOutcome, TraitError> {
     let deadline = Deadline::after(timeout);
-    let target = identify_pid1(record)?;
-    run_with_target(&target, entry, deadline)
+    // 稼働中でない記録は、fork せず呼び出しプロセスで拒否する（副作用なし）。
+    running_pid(record)?;
+    run_in_worker_with(deadline, WORKER_GRACE, || {
+        let target = identify_pid1(record)?;
+        run_with_target(&target, entry, deadline)
+    })
 }
 
 /// 実機結合試験専用の入口: [`run_command`] の対象特定だけを [`identify_pid1_in`]（期待 cgroup パスを呼び出し側
@@ -309,8 +321,167 @@ pub fn run_command_in(
     timeout: Duration,
 ) -> Result<ExecOutcome, TraitError> {
     let deadline = Deadline::after(timeout);
-    let target = identify_pid1_in(record, expected_cgroup_path)?;
-    run_with_target(&target, entry, deadline)
+    running_pid(record)?;
+    run_in_worker_with(deadline, WORKER_GRACE, || {
+        let target = identify_pid1_in(record, expected_cgroup_path)?;
+        run_with_target(&target, entry, deadline)
+    })
+}
+
+/// worker の終了待ちに足す猶予。worker 自身が期限超過後に子を `SIGKILL` して回収する時間（`wait_or_stop` の
+/// 回収待ち上限 5 秒）より長くし、通常は worker 自身の `Timeout` が先に返るようにする（REPAIR-5）。
+const WORKER_GRACE: Duration = Duration::from_secs(7);
+
+/// worker の結果 1 行の上限バイト数（pipe から読む量の上限。無制限確保の防止）。
+const WORKER_RESULT_MAX: u64 = 4096;
+
+/// `work` を worker プロセスで実行し、`deadline + grace` までに終わらなければ worker を `SIGKILL` して回収し
+/// `Timeout` を返す（REPAIR-5・SUP-6・TASK-163.4）。契約はモジュール doc「全体の上限時間」。
+///
+/// 呼び出しプロセスは単一スレッドであること（満たさなければ core が fork せず拒否する）。`work` は fork した
+/// 子で実行され、結果は pipe の 1 行（[`encode_worker_result`]）で返る。
+fn run_in_worker_with(
+    deadline: Deadline,
+    grace: Duration,
+    work: impl FnOnce() -> Result<ExecOutcome, TraitError>,
+) -> Result<ExecOutcome, TraitError> {
+    let (mut reader, writer) = std::io::pipe().map_err(|e| {
+        TraitError::new(
+            ErrorCode::Internal,
+            format!("exec stage Spawn: pipe failed: {}", e.kind()),
+        )
+    })?;
+    let child = spawn_exec_worker(|| {
+        let line = encode_worker_result(&work());
+        // 書けなければ親は「結果なし」として失敗扱いにする（fail-closed）。
+        let _ = (&writer).write_all(&line);
+        0
+    })
+    .map_err(from_exec_error)?;
+    // 親は書き込み側を閉じる（worker の終了後に読み取りが EOF で終わるようにする）。
+    drop(writer);
+    let left = deadline.remaining("starting the exec worker")?;
+    let exit = child
+        .wait_timeout(left.saturating_add(grace))
+        .map_err(|e| {
+            if e.code == ErrorCode::Timeout {
+                TraitError::new(
+                    ErrorCode::Timeout,
+                    "exec timed out; the exec worker was killed",
+                )
+            } else {
+                from_exec_error(e)
+            }
+        })?;
+    if exit != ChildExit::Exited(0) {
+        return Err(TraitError::new(
+            ErrorCode::Internal,
+            format!("exec stage Spawn: the exec worker ended abnormally ({exit:?})"),
+        ));
+    }
+    let mut line = Vec::new();
+    std::io::BufReader::new((&mut reader).take(WORKER_RESULT_MAX))
+        .read_until(b'\n', &mut line)
+        .map_err(|e| {
+            TraitError::new(
+                ErrorCode::Internal,
+                format!(
+                    "exec stage Spawn: reading the worker result failed: {}",
+                    e.kind()
+                ),
+            )
+        })?;
+    decode_worker_result(&line)
+}
+
+/// 実機結合試験・タイムアウト試験専用の入口: `work` を [`run_command`] と同じ worker 機構で実行する。
+/// 各段が固まった場合を模した `work` で、期限内に `Timeout` が返ることを確かめるために使う（REPAIR-5・REPAIR-12）。
+#[doc(hidden)]
+pub fn run_in_worker_for_test(
+    timeout: Duration,
+    grace: Duration,
+    work: impl FnOnce() -> Result<ExecOutcome, TraitError>,
+) -> Result<ExecOutcome, TraitError> {
+    run_in_worker_with(Deadline::after(timeout), grace, work)
+}
+
+/// worker の結果を pipe 用の 1 行へ符号化する。成功は `ok <exited|signaled> <値> <rlimit 数> <capability 数>
+/// <Landlock 数> <seccomp 命令数>`、失敗は `err <ERR-1 コード> <メッセージ>`（改行は空白へ置換）。
+fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
+    let line = match result {
+        Ok(o) => {
+            let (kind, value) = match o.exit {
+                ChildExit::Exited(n) => ("exited", n),
+                ChildExit::Signaled(n) => ("signaled", n),
+                _ => ("unknown", 0),
+            };
+            format!(
+                "ok {kind} {value} {} {} {} {}\n",
+                o.rlimits_applied,
+                o.capability_bounding_dropped,
+                o.landlock_rules,
+                o.seccomp_instructions
+            )
+        }
+        Err(e) => format!(
+            "err {} {}\n",
+            e.code().as_str(),
+            e.message().replace(['\n', '\r'], " ")
+        ),
+    };
+    line.into_bytes()
+}
+
+/// [`encode_worker_result`] の逆変換。形式に合わない入力（空・切れた行・未知の種別）は `Internal`（fail-closed）。
+fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, TraitError> {
+    let malformed = || {
+        TraitError::new(
+            ErrorCode::Internal,
+            "exec stage Spawn: the exec worker returned a malformed result",
+        )
+    };
+    let text = String::from_utf8_lossy(line);
+    let text = text.strip_suffix('\n').ok_or_else(malformed)?;
+    if let Some(rest) = text.strip_prefix("err ") {
+        let (code, message) = rest.split_once(' ').unwrap_or((rest, ""));
+        let code = [
+            ErrorCode::InvalidArgument,
+            ErrorCode::NotFound,
+            ErrorCode::AlreadyExists,
+            ErrorCode::FailedPrecondition,
+            ErrorCode::Unimplemented,
+            ErrorCode::Internal,
+            ErrorCode::PermissionDenied,
+            ErrorCode::Timeout,
+            ErrorCode::Unavailable,
+        ]
+        .into_iter()
+        .find(|c| c.as_str() == code)
+        .unwrap_or(ErrorCode::Internal);
+        return Err(TraitError::new(code, message));
+    }
+    let rest = text.strip_prefix("ok ").ok_or_else(malformed)?;
+    let mut it = rest.split(' ');
+    let kind = it.next().ok_or_else(malformed)?;
+    let value: i32 = it
+        .next()
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(malformed)?;
+    let mut count = || -> Result<usize, TraitError> {
+        it.next().and_then(|v| v.parse().ok()).ok_or_else(malformed)
+    };
+    let exit = match kind {
+        "exited" => ChildExit::Exited(value),
+        "signaled" => ChildExit::Signaled(value),
+        _ => return Err(malformed()),
+    };
+    Ok(ExecOutcome {
+        exit,
+        rlimits_applied: count()?,
+        capability_bounding_dropped: count()?,
+        landlock_rules: count()?,
+        seccomp_instructions: count()?,
+    })
 }
 
 /// 特定済みの対象に対して、参加 → 制限の再適用 → 実行 → 待機を順に行う（[`run_command`] の本体）。
@@ -585,6 +756,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(exit, ChildExit::Exited(0));
+    }
+
+    /// SUP-6・REPAIR-5・TASK-163.4: worker の結果は pipe の 1 行で往復でき、壊れた行は `Internal` で拒否する。
+    #[test]
+    fn sup6_task163_4_worker_result_round_trips() {
+        let outcome = ExecOutcome {
+            exit: ChildExit::Signaled(15),
+            rlimits_applied: 16,
+            capability_bounding_dropped: 23,
+            landlock_rules: 3,
+            seccomp_instructions: 120,
+        };
+        let line = encode_worker_result(&Ok(outcome));
+        assert_eq!(line, b"ok signaled 15 16 23 3 120\n");
+        assert_eq!(decode_worker_result(&line).unwrap(), outcome);
+
+        let err = TraitError::new(ErrorCode::Timeout, "exec timed out\nbefore x");
+        let line = encode_worker_result(&Err(err));
+        assert_eq!(line, b"err TIMEOUT exec timed out before x\n");
+        let back = decode_worker_result(&line).unwrap_err();
+        assert_eq!(back.code(), ErrorCode::Timeout);
+        assert_eq!(back.message(), "exec timed out before x");
+
+        for bad in [
+            &b""[..],
+            b"ok exited 0 1 2 3 4",
+            b"ok exited 0 1 2 3\n",
+            b"ok weird 0 1 2 3 4\n",
+            b"hello\n",
+        ] {
+            let e = decode_worker_result(bad).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::Internal, "{bad:?}");
+            assert_eq!(
+                e.message(),
+                "exec stage Spawn: the exec worker returned a malformed result"
+            );
+        }
     }
 
     /// 祖先に symlink を含まない使い捨ての bundle ディレクトリ（rootfs の固定は symlink を辿らない）。

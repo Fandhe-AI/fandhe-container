@@ -63,3 +63,11 @@ harness = false
 name = "exec"
 path = "tests/exec.rs"
 harness = false
+
+# exec の全体上限時間（worker プロセス隔離）の結合試験（REPAIR-5・TASK-163.4・#503・SUP-6）。fork は単一スレッドの
+# 呼び出し元を要求するため、単一スレッドの独自 main（harness = false）で動かす。root・実コンテナは不要で、
+# 既定のテスト集合で実行する。
+[[test]]
+name = "exec_timeout"
+path = "tests/exec_timeout.rs"
+harness = false

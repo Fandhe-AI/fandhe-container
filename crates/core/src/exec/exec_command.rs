@@ -91,6 +91,27 @@ pub fn spawn_exec_command(
     Ok(ContainerChild::new(pid))
 }
 
+/// 準備から実行までを担う使い捨ての worker プロセスを fork する（REPAIR-5・SUP-6・TASK-163.4・#503）。
+///
+/// `fandhe-container-supervisor` の `exec::run_command` が、`setns`・cgroup join・制限の再適用といった
+/// 割り込めないブロッキング段を **別プロセス** へ隔離し、親が全体の期限で待って期限超過時に worker を
+/// `SIGKILL` で止めて回収できるようにするために呼ぶ（単一スレッドのため、段の途中のハングを同一プロセス内の
+/// 期限確認では止められない）。
+///
+/// - 呼び出し元は単一スレッドでなければならない（満たさなければ fork せず `FailedPrecondition`。
+///   `sys::fork_single_threaded` が強制する）
+/// - `worker` は fork した子で実行され、戻り値（0〜255 に丸められる）で `_exit` する。panic は
+///   `EXIT_SETUP_FAILED`。呼び出し元のフレームへは戻らない。結果の受け渡しは呼び出し側が fork 前に用意した
+///   fd（pipe 等）で行う
+/// - この関数は制限を一切適用しない。子へ載る制限は、worker 自身が `reapply_restrictions` で作った
+///   [`ExecReady`] 経由でしか exec へ進めない（`ExecReady` は別プロセスへ渡せない。SEC-1）
+/// - 戻り値の [`ContainerChild`] は `wait_timeout` で待つこと（`Drop` では kill / wait しない）
+pub fn spawn_exec_worker<F: FnOnce() -> i32>(worker: F) -> Result<ContainerChild, ExecError> {
+    let pid = sys::fork_single_threaded(worker, EXIT_SETUP_FAILED)
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
+    Ok(ContainerChild::new(pid))
+}
+
 /// cwd を照合済みの root（`O_PATH` の fd）へ置く。本番ビルドの実装。
 #[cfg(not(test))]
 fn change_dir_to_verified_root(root: BorrowedFd<'_>) -> Result<(), ExecError> {

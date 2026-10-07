@@ -355,11 +355,35 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
-    /// SUP-13・TASK-170.4: 読み戻しが要求と食い違えば成功扱いにしない。
+    /// SUP-13・TASK-170.4: 読み戻した `default` 値が要求と食い違えば成功扱いにしない（不一致分岐）。
+    ///
+    /// 書き込みは `O_TRUNC` なしの上書きのため、`default 9999\n` へ `default 1` を書くと
+    /// `default 1999\n` が残る。形式は正しいので解析を通り、値の不一致として検出される。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn sup13_task170_4_io_weight_read_back_mismatch_fails() {
         let base = scratch("mismatch");
+        std::fs::write(base.join("io.weight"), b"default 9999\n").unwrap();
+        let dir = File::open(&base).unwrap();
+        let e = write_io_weight_at(dir.as_fd(), &IoWeight::new(1).unwrap()).unwrap_err();
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.step, CgroupStep::SetIoWeight);
+        assert_eq!(
+            e.message,
+            "io.weight read back as \"default 1999\", expected \"default 1\""
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("io.weight")).unwrap(),
+            "default 1999\n"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// SUP-13・TASK-170.4: 読み戻した内容が形式不正なら、値の比較より前に解析エラーで失敗する。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sup13_task170_4_io_weight_read_back_malformed_fails() {
+        let base = scratch("malformed");
         std::fs::write(
             base.join("io.weight"),
             b"default 9999\n8:0 300\nxxxxxxxxxxxx",
@@ -368,6 +392,11 @@ mod tests {
         let dir = File::open(&base).unwrap();
         let e = write_io_weight_at(dir.as_fd(), &IoWeight::new(1).unwrap()).unwrap_err();
         assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.step, CgroupStep::SetIoWeight);
+        assert_eq!(
+            e.message,
+            "unexpected io.weight content (expected `<key> <number>` lines): \"default 1999\\n8:0 300\\nxxxxxxxxxxxx\""
+        );
         std::fs::remove_dir_all(&base).unwrap();
     }
 

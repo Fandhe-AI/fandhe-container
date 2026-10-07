@@ -101,6 +101,7 @@ mod rootfs;
 mod seccomp;
 mod setns;
 mod stages;
+mod tmpfs;
 mod violation;
 
 pub use capabilities::CapabilityReport;
@@ -141,6 +142,7 @@ pub use seccomp::{ProbeOutcome, SeccompProbeRecord};
 pub use seccomp::{SeccompEnforcementObservation, observe_default_seccomp_enforcement};
 pub use setns::{JoinNamespace, NamespaceJoinReport, Pid1Target, join_namespaces};
 pub use stages::{StageHook, StageKind, StagePipeline, StageReport, StageStatus};
+pub use tmpfs::{TmpfsMountOutcome, TmpfsReport, mount_tmpfs};
 
 pub use violation::{
     IsolationViolation, VIOLATION_SUBJECT_MAX_CHARS, ViolationKind, ViolationReason,
@@ -404,6 +406,8 @@ pub enum IsolationStage {
     Seccomp,
     /// 稼働中コンテナの pid1 の特定と `setns(2)` による namespace 参加（SUP-6・TASK-163.1）。
     SetNs,
+    /// rootfs 配下への tmpfs マウント（SUP-12・TASK-169.2。`--shm-size` / `--tmpfs`）。
+    MountTmpfs,
 }
 
 /// 実行層の構造化エラー（`code` は `traits::types::ErrorCode` を再利用）。
@@ -2549,7 +2553,7 @@ mod tests {
         assert_eq!(err.stage, IsolationStage::MountProc);
         assert_eq!(
             err.message,
-            "proc mount target was moved or removed after validation"
+            "mount target was moved or removed after validation"
         );
         assert_eq!(
             violation_of(&err),

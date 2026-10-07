@@ -102,6 +102,7 @@ mod consts {
     pub const CLONE_NEWUSER: i32 = 0x1000_0000;
     pub const CLONE_NEWPID: i32 = 0x2000_0000;
     pub const CLONE_NEWNET: i32 = 0x4000_0000;
+    pub const MS_RDONLY: u64 = 1;
     pub const MS_NOSUID: u64 = 2;
     pub const MS_NODEV: u64 = 4;
     pub const MS_NOEXEC: u64 = 8;
@@ -256,6 +257,7 @@ mod consts {
     pub const CLONE_NEWUSER: i32 = 0x1000_0000;
     pub const CLONE_NEWPID: i32 = 0x2000_0000;
     pub const CLONE_NEWNET: i32 = 0x4000_0000;
+    pub const MS_RDONLY: u64 = 1;
     pub const MS_NOSUID: u64 = 2;
     pub const MS_NODEV: u64 = 4;
     pub const MS_NOEXEC: u64 = 8;
@@ -418,6 +420,7 @@ mod consts {
     pub const CLONE_NEWUSER: i32 = 0;
     pub const CLONE_NEWPID: i32 = 0;
     pub const CLONE_NEWNET: i32 = 0;
+    pub const MS_RDONLY: u64 = 0;
     pub const MS_NOSUID: u64 = 0;
     pub const MS_NODEV: u64 = 0;
     pub const MS_NOEXEC: u64 = 0;
@@ -958,6 +961,79 @@ pub(crate) fn mount_proc_at(target: &CStr) -> Result<(), SysError> {
             core::ptr::null(),
         )
     };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// tmpfs の `statfs.f_type`（include/uapi/linux/magic.h の `TMPFS_MAGIC`。アーキテクチャ非依存）。
+pub(crate) const TMPFS_MAGIC: i64 = 0x0102_1994;
+
+/// [`mount_tmpfs_at`] に渡せるフラグ。可変なのは読み取り専用と実行許可の 2 値だけで、`nosuid`・
+/// `nodev` は常に付与する（任意のビットを渡せない型にして SEC-1 の fail-closed を保つ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TmpfsMountFlags {
+    pub(crate) read_only: bool,
+    pub(crate) exec: bool,
+}
+
+impl TmpfsMountFlags {
+    /// `mount(2)` の flags 値（`MS_NOSUID|MS_NODEV` は固定）。
+    pub(crate) fn bits(self) -> u64 {
+        let mut f = consts::MS_NOSUID | consts::MS_NODEV;
+        if self.read_only {
+            f |= consts::MS_RDONLY;
+        }
+        if !self.exec {
+            f |= consts::MS_NOEXEC;
+        }
+        f
+    }
+}
+
+/// `target` に tmpfs を [`TmpfsMountFlags`] と `data`（`mode=...,size=...`）でマウントする。
+///
+/// `crate::exec::mount_tmpfs` が、検証済みの O_PATH fd を指す `/proc/thread-self/fd/N` を `target` に
+/// 渡す（magic link は fd の実体へ解決されるため、パス文字列を再解決しない）。`data` は型付き
+/// フィールドから組んだ文字列のみで、利用者文字列は渡さない。
+// テストビルドでは `crate::exec` の dry-run 差し込み点が本関数を呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn mount_tmpfs_at(
+    target: &CStr,
+    flags: TmpfsMountFlags,
+    data: &CStr,
+) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `target`・`data` は `&CStr` の借用で NUL 終端かつ呼び出しの間生存する。
+    // source / fstype は静的な NUL 終端文字列。flags は `TmpfsMountFlags::bits` で組んだ値のみ。
+    // カーネルは呼び出し中にこれらの文字列を複写するだけで、ポインタを保持しない。副作用は
+    // 呼び出しスレッドの mount namespace へのマウント 1 件の追加に限る。
+    let rc = unsafe {
+        mount(
+            c"tmpfs".as_ptr(),
+            target.as_ptr(),
+            c"tmpfs".as_ptr(),
+            flags.bits(),
+            data.as_ptr().cast(),
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `target` のマウントを `MNT_DETACH` で切り離す（`umount2(target, MNT_DETACH)`）。
+///
+/// `crate::exec::mount_tmpfs` の失敗時の後始末が、自分でマウントした tmpfs のルートを開き直した
+/// O_PATH fd を指す `/proc/thread-self/fd/N` を渡す（magic link を fd の実体へ解決させるため
+/// `UMOUNT_NOFOLLOW` は付けない）。`target` がマウントのルートでなければカーネルが `EINVAL` で拒否する。
+// テストビルドでは `crate::exec` の dry-run 差し込み点が本関数を呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn umount_detach_at(target: &CStr) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `target` は `&CStr` の借用で NUL 終端かつ呼び出しの間生存し、カーネルはポインタを
+    // 保持しない。flags は定数。副作用は呼び出しスレッドの mount namespace からのマウント 1 件の切り離しのみ。
+    let rc = unsafe { umount2(target.as_ptr(), consts::MNT_DETACH) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
@@ -2398,6 +2474,17 @@ mod tests {
             (EPERM, ENOENT, EACCES, ENOTDIR, EINVAL, ELOOP),
             (1, 2, 13, 20, 22, 40)
         );
+    }
+
+    /// SUP-12（TASK-169.2）: tmpfs のフラグは nosuid・nodev を常に含み、可変なのは ro / exec だけ。
+    #[test]
+    fn sup12_task169_2_tmpfs_flags_are_exact() {
+        let f = |read_only, exec| TmpfsMountFlags { read_only, exec }.bits();
+        assert_eq!(f(false, false), 2 | 4 | 8);
+        assert_eq!(f(true, false), 1 | 2 | 4 | 8);
+        assert_eq!(f(false, true), 2 | 4);
+        assert_eq!(f(true, true), 1 | 2 | 4);
+        assert_eq!(TMPFS_MAGIC, 0x0102_1994);
     }
 
     /// CORE-1（TASK-27.3）: mount 系フラグ・pivot_root の syscall 番号の具体値。番号は arch ごとに

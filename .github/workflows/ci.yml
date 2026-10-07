@@ -541,6 +541,30 @@ jobs:
           echo "container_options_ipc: host shared / shareable isolated verified (root=false)" >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::container_options_ipc verified"
 
+      # tmpfs_mount（`crates/core/tests/tmpfs_mount.rs`。SUP-12・TASK-169.2・#527）:
+      # `--shm-size` / `--tmpfs` の実 `mount(2)`・失敗時の `umount2(2)` と作成ディレクトリの後始末・
+      # `ro,exec` の実フラグ・サイズ未指定のマウントを検証する実機前提テスト（harness = false）。
+      # unshare_isolation と同じく Linux 限定・上で緩和した sysctl を再利用し、新しい check-run・sudo・
+      # permissions は追加しない（rootless 経路のみ。rootful 経路は未検証）。`--ignored` が届かなくても
+      # exit 0 になるため成功行を grep で照合する。
+      - name: tmpfs_mount のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        run: cargo test -p fandhe-container-core --test tmpfs_mount --no-run
+
+      - name: tmpfs_mount の実行（実機前提テスト・--ignored。SUP-12・TASK-169.2）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/tmpfs_mount.log"
+          cargo test -p fandhe-container-core --test tmpfs_mount -- --ignored 2>&1 | tee "${log}"
+          if ! grep -Fq 'tmpfs_mount: mounts, flags and rollback verified (root=false)' "${log}"; then
+            echo "::error::tmpfs_mount did not report verification (possibly not executed)" >&2
+            exit 1
+          fi
+          echo "tmpfs_mount: mounts, flags and rollback verified (root=false)" >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::tmpfs_mount verified"
+
   # --------------------------------------------------
   # bench-regression（ベンチ回帰「比較の仕組み」導入: TASK-86.3・REPAIR-7 第 4 段階・REPAIR-8）
   # --------------------------------------------------

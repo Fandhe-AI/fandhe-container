@@ -354,15 +354,16 @@ mod linux {
         assert!(root.join("c1").join("state.json").is_file());
     }
 
-    /// 異常終了で `restart_count` が進み、監視中に別ハンドルが書いた `health` が保たれる（SUP-3・SUP-4 の土台）。
+    /// 異常終了でも monitor 単体は `restart_count` を進めず（4 のまま。加算は再 launch 成功時。TASK-159.3）、
+    /// 監視中に別ハンドルが書いた `health` が保たれる（SUP-3・SUP-4）。
     #[test]
-    fn sup1_task157_8_abnormal_exit_increments_restart_count_and_keeps_health() {
+    fn sup1_task157_8_abnormal_exit_keeps_restart_count_and_keeps_health() {
         let t = TmpDir::new("abnormal");
         let root = t.root();
         create(&root, "c1");
         let child = spawn_container(&t.go(), 3);
         let mut state = mark_running(&root, "c1", child.pid());
-        // 初期値を 4 にして、加算が既存値の上に積まれることを確認する。
+        // 初期値を 4 にして、monitor が値を変えないことを確認する。
         state
             .write_supervision(SupervisionState::new(None, None, 4))
             .unwrap();
@@ -392,12 +393,12 @@ mod linux {
         let rec = s.record();
         assert_eq!(rec.status().state(), ContainerState::Stopped);
         assert_eq!(rec.status().exit_code(), Some(3));
-        assert_eq!(rec.restart_count(), 5);
+        assert_eq!(rec.restart_count(), 4);
         assert_eq!(rec.health(), Some(HealthStatus::Healthy));
         assert_eq!(rec.supervisor_pid(), None);
     }
 
-    /// シグナル終了は 128 + シグナル番号で記録され、異常終了として `restart_count` が進む。
+    /// シグナル終了は 128 + シグナル番号で記録され、monitor 単体では `restart_count` は進まない（0 のまま）。
     #[test]
     fn sup1_task157_8_signal_exit_is_recorded_as_128_plus_signal() {
         let t = TmpDir::new("signal");
@@ -421,7 +422,7 @@ mod linux {
         }
         let s = reread(&root, "c1");
         assert_eq!(s.record().status().exit_code(), Some(137));
-        assert_eq!(s.record().restart_count(), 1);
+        assert_eq!(s.record().restart_count(), 0);
         assert_eq!(s.record().supervisor_pid(), None);
     }
 
@@ -558,6 +559,6 @@ mod linux {
         assert_eq!(rec.status().state(), ContainerState::Stopped);
         assert_eq!(rec.status().exit_code(), Some(3));
         assert_eq!(rec.supervisor_pid(), None);
-        assert_eq!(rec.restart_count(), 1);
+        assert_eq!(rec.restart_count(), 0);
     }
 }

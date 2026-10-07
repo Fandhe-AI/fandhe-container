@@ -17,6 +17,11 @@
 //!
 //! `--ipc`（`host` / `shareable`）は [`ipc`] サブモジュールの [`IpcMode`] で保持する（#528・TASK-169.3）。
 //!
+//! # サブモジュール
+//!
+//! [`mounts`]（TASK-169.2・#527）が `--shm-size` / `--tmpfs` を解析し、core の tmpfs 仕様型へ変換する
+//! （適用は core の `exec::mount_tmpfs`。supervisor → core の一方向依存）。
+//!
 //! # 未結線の箇所（REPAIR-3）
 //!
 //! 本番の `ProcessLauncher` が未提供のため、現時点で [`ContainerOptions`] の消費者は無い
@@ -29,8 +34,10 @@
 
 pub mod env;
 pub mod ipc;
+pub mod mounts;
 
 pub use ipc::IpcMode;
+pub use mounts::{DEFAULT_SHM_SIZE_BYTES, MountOptions, ShmSize, TmpfsOption};
 
 use self::env::EnvSet;
 use fandhe_container_core::rlimits::{RLIMIT_INFINITY, Rlimit, RlimitKind, Rlimits};

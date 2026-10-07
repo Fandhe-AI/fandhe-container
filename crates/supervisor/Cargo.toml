@@ -14,6 +14,7 @@
 # TASK-169.4（#529）で container_options::env（env / env ファイルの指定モデル）を追加した（依存は不変）。
 # TASK-169.5.1（#855）で container_options::labels（label の指定モデル。state.json の annotations へ反映）を追加した（依存は不変）。
 # TASK-171.1.2（#858）で privilege（権限昇格の必要最小集合と検証。純ロジック・unsafe なし）を追加した（依存は不変）。
+# TASK-163.3（#502）で exec に seccomp / Landlock 再適用の配線を追加した（core の安全 API を呼ぶだけ。依存は不変）。
 # 外部クレート（crates.io）の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 
 [package]

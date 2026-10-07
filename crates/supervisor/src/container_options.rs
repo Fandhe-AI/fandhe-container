@@ -46,7 +46,7 @@ pub use mounts::{DEFAULT_SHM_SIZE_BYTES, MountOptions, ShmSize, TmpfsOption};
 
 use self::env::EnvSet;
 use fandhe_container_core::rlimits::{RLIMIT_INFINITY, Rlimit, RlimitKind, Rlimits};
-use fandhe_container_core::tmpfs::{DEV_SHM_PATH, TmpfsMountSet};
+use fandhe_container_core::tmpfs::TmpfsMountSet;
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
 
 /// `--ulimit` 1 件の最大バイト数（最長の名前 `sigpending` と u64 の 2 値に十分な余裕を持たせた上限）。
@@ -164,22 +164,7 @@ impl ContainerOptions {
     /// `/dev/shm` サイズ指定を黙って無視したり専用 tmpfs で覆ったりすると、指定した IPC モードと実際の共有状態が食い違うため（fail-closed）。
     /// 検証は消費時点で行い、builder の呼び出し順で迂回できないようにする。
     pub fn tmpfs_set(&self) -> Result<TmpfsMountSet, TraitError> {
-        if self.ipc == IpcMode::Host {
-            if self.mounts.shm_size().is_some() {
-                return Err(invalid("--shm-size cannot be combined with --ipc=host"));
-            }
-            if self
-                .mounts
-                .tmpfs()
-                .iter()
-                .any(|t| t.spec().destination.as_str() == DEV_SHM_PATH)
-            {
-                return Err(invalid(
-                    "--tmpfs /dev/shm cannot be combined with --ipc=host",
-                ));
-            }
-        }
-        self.mounts.to_tmpfs_set()
+        self.mounts.to_tmpfs_set(self.ipc)
     }
 
     /// core の `StagePipeline::with_rlimits` へ渡す集合。

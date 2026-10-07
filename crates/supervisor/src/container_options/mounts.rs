@@ -21,12 +21,14 @@
 //! - `--shm-size` 未指定時に `/dev/shm` を既定 [`DEFAULT_SHM_SIZE_BYTES`] で常時マウントする挙動
 //!   （launcher 配線と同時に決める）。サイズ未指定の `--tmpfs` はカーネル既定（Docker と同じ）
 //! - `uid=`・`gid=`・`%` 指定・小数サイズ・`suid` / `dev` の許可
-//! - `--ipc=host` と `--shm-size` の併用は `ContainerOptions::tmpfs_set` が拒否する（TASK-169.5.2）。`shareable` との関係は変えない
+//! - `--ipc=host` と `--shm-size` の併用は `MountOptions::to_tmpfs_set`（`ContainerOptions::tmpfs_set` 経由）が拒否する（TASK-169.5.2）。`shareable` との関係は変えない
 
 use fandhe_container_core::tmpfs::{
     DEV_SHM_PATH, TMPFS_MAX_MOUNTS, TmpfsMode, TmpfsMountSet, TmpfsMountSpec, TmpfsSize,
 };
 use fandhe_container_core::traits::{ErrorCode, TraitError};
+
+use super::IpcMode;
 
 /// Docker の `/dev/shm` 既定サイズ（64 MiB）。
 pub const DEFAULT_SHM_SIZE_BYTES: u64 = 64 * 1024 * 1024;
@@ -189,7 +191,26 @@ impl MountOptions {
 
     /// core の [`TmpfsMountSet`] へ変換する。`shm_size` 指定時は `/dev/shm` を先頭に置く。
     /// `--tmpfs /dev/shm` との同時指定は重複として拒否する（予約先・件数上限も core が検証する）。
-    pub fn to_tmpfs_set(&self) -> Result<TmpfsMountSet, TraitError> {
+    ///
+    /// `ipc` が [`IpcMode::Host`] のとき、`--shm-size` と `--tmpfs /dev/shm` を拒否する（SUP-12・TASK-169.5.2）。
+    /// host IPC ではホストの `/dev/shm` を共有するはずで、専用サイズ指定や専用 tmpfs で覆うと
+    /// 指定した IPC モードと実際の共有状態が食い違うため（fail-closed）。
+    /// IPC モードを必須引数にして、この公開 API 単独でも検証を迂回できないようにする。
+    pub fn to_tmpfs_set(&self, ipc: IpcMode) -> Result<TmpfsMountSet, TraitError> {
+        if ipc == IpcMode::Host {
+            if self.shm_size.is_some() {
+                return Err(invalid("--shm-size cannot be combined with --ipc=host"));
+            }
+            if self
+                .tmpfs
+                .iter()
+                .any(|t| t.spec().destination.as_str() == DEV_SHM_PATH)
+            {
+                return Err(invalid(
+                    "--tmpfs /dev/shm cannot be combined with --ipc=host",
+                ));
+            }
+        }
         let mut set = TmpfsMountSet::new();
         if let Some(shm) = self.shm_size {
             set.push(TmpfsMountSpec::dev_shm(TmpfsSize::from_bytes(
@@ -355,7 +376,7 @@ mod tests {
             .expect("add");
         assert_eq!(opts.shm_size().map(ShmSize::bytes), Some(67_108_864));
         assert_eq!(opts.tmpfs().len(), 1);
-        let set = opts.to_tmpfs_set().expect("set");
+        let set = opts.to_tmpfs_set(IpcMode::Private).expect("set");
         let dests: Vec<&str> = set
             .mounts()
             .iter()
@@ -369,15 +390,43 @@ mod tests {
             .with_tmpfs(TmpfsOption::parse("/dev/shm").expect("shm tmpfs"))
             .expect("add");
         assert_eq!(
-            conflict.to_tmpfs_set().expect_err("conflict").code(),
+            conflict
+                .to_tmpfs_set(IpcMode::Private)
+                .expect_err("conflict")
+                .code(),
             ErrorCode::InvalidArgument
         );
         let reserved = MountOptions::default()
             .with_tmpfs(TmpfsOption::parse("/proc").expect("proc"))
             .expect("add");
-        let e = reserved.to_tmpfs_set().expect_err("reserved");
+        let e = reserved
+            .to_tmpfs_set(IpcMode::Private)
+            .expect_err("reserved");
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
         assert_eq!(e.message(), "tmpfs must not be mounted on /proc or below");
+    }
+
+    /// SUP-12・TASK-169.5.2: 公開 `to_tmpfs_set` 単独でも host IPC と /dev/shm 指定の併用を拒否する。
+    #[test]
+    fn sup12_task169_5_2_to_tmpfs_set_rejects_host_ipc_conflicts() {
+        let shm = MountOptions::default().with_shm_size(ShmSize::parse("1m").expect("shm"));
+        let e = shm.to_tmpfs_set(IpcMode::Host).expect_err("shm-size");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "--shm-size cannot be combined with --ipc=host");
+        let tmpfs = MountOptions::default()
+            .with_tmpfs(TmpfsOption::parse("/dev/shm").expect("tmpfs"))
+            .expect("add");
+        let e = tmpfs.to_tmpfs_set(IpcMode::Host).expect_err("tmpfs");
+        assert_eq!(
+            e.message(),
+            "--tmpfs /dev/shm cannot be combined with --ipc=host"
+        );
+        assert!(
+            MountOptions::default()
+                .to_tmpfs_set(IpcMode::Host)
+                .expect("empty")
+                .is_empty()
+        );
     }
 
     /// SUP-12・TASK-169.2: `--tmpfs` は上限（64 件）までしか保持せず、65 件目は追加時に拒否する。
@@ -390,7 +439,13 @@ mod tests {
                 .expect("within limit");
         }
         assert_eq!(opts.tmpfs().len(), 64);
-        assert_eq!(opts.to_tmpfs_set().expect("set").mounts().len(), 64);
+        assert_eq!(
+            opts.to_tmpfs_set(IpcMode::Private)
+                .expect("set")
+                .mounts()
+                .len(),
+            64
+        );
         let e = opts
             .with_tmpfs(TmpfsOption::parse("/extra").expect("parse"))
             .expect_err("over limit");

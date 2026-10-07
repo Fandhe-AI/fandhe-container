@@ -44,6 +44,7 @@ mkdir "$root/bundle"
 # late_start（SIGTERM 時に環境変数を継承しない新コンテナを起動して state.json へ書く）/
 # late_two（全コンテナが環境変数を継承せず、SIGTERM 時にさらに新コンテナを起動。追跡済み pid も回収されること）/
 # late_session（late_start と同じだが新コンテナが別 session・トークンなし。帰属不明のため kill されないこと）/ dead_new（再起動後の新 pid が既に終了）/
+# decoy（所有トークンを「部分文字列」として含む環境変数を持つ無関係プロセスを起動する。回収で kill されないこと）/
 # log_late（restart ログを state.json 更新より後、最後の 1 行は SIGTERM 時に出す）。
 # ログの elapsed_us は STUB_ELAPSED（空白区切り）を順に使う。STUB_DELAY（秒・空白区切り）は kill 検知後から
 # 新コンテナ起動までの待ちを順に与える時間制御入力（observed の下限が決定的になる）。
@@ -105,6 +106,11 @@ case "$STUB_MODE" in
   *) trap term_handler TERM ;;
 esac
 start_child
+if [ "$STUB_MODE" = decoy ]; then
+  # トークンを含むが FANDHE_BENCH_OWNER=<token> の完全一致エントリではない（grep -F の部分一致なら誤検出する）。
+  env -u FANDHE_BENCH_OWNER "DECOY=x_FANDHE_BENCH_OWNER=${FANDHE_BENCH_OWNER}" sleep 300 &
+  echo "$!" >"${STUB_DIR}/decoy"
+fi
 shown="$child"
 [ "$STUB_MODE" != deep ] || shown="$grand"
 [ "$STUB_MODE" != foreign_pid ] || shown="$(<"${STUB_FOREIGN}")"
@@ -242,6 +248,49 @@ if [ -n "$late_pid" ] && kill -0 "$late_pid" 2>/dev/null; then late_alive=1; fi
 if [ "$late_alive" -eq 1 ]; then pass "late_session: unattributable new pid was not killed"; else fail "late_session: unattributable new pid was killed"; fi
 if grep -q 'cannot be attributed' "${root}/late_session.err"; then pass "late_session: warning logged"; else fail "late_session: no attribution warning"; fi
 [ -z "$late_pid" ] || kill -KILL "$late_pid" 2>/dev/null || true
+# 所有トークンを部分文字列として含む環境変数を持つ無関係プロセスは、完全一致しないため kill しない
+mkdir -p "${root}/d-decoy"
+decoy_rc=0
+STUB_MODE=decoy STUB_ELAPSED="" STUB_DELAY="" STUB_DIR="${root}/d-decoy" STUB_FOREIGN="${root}/foreign.pid" \
+  bash "$target" --launcher "${root}/launcher.sh" --bundle "${root}/bundle" --settle-ms 5 --trials 1 --warmup 0 --timeout 10 \
+  >"${root}/decoy.out" 2>"${root}/decoy.err" </dev/null || decoy_rc=$?
+if [ "$decoy_rc" -eq 0 ]; then pass "decoy: exit 0"; else fail "decoy: exit code ${decoy_rc}, want 0"; fi
+decoy_pid="$(cat "${root}/d-decoy/decoy" 2>/dev/null || true)"
+if [ -n "$decoy_pid" ] && kill -0 "$decoy_pid" 2>/dev/null; then pass "decoy: partial-match process was not killed"; else fail "decoy: partial-match process was killed"; fi
+[ -z "$decoy_pid" ] || kill -KILL "$decoy_pid" 2>/dev/null || true
+
+# 同一性照合の関数単体（PID 再利用・部分一致の再現）。本体から関数定義だけを取り出して検証する。
+fn_src="$(sed -n '/^proc_info() {/,/^}/p;/^alive() {/,/^}/p;/^same_proc() {/,/^}/p;/^env_owned() {/,/^}/p' "$target")"
+if [ -n "$fn_src" ]; then
+  eval "$fn_src"
+  sleep 300 &
+  fn_pid=$!
+  proc_info "$fn_pid"
+  fn_start="$REPLY_START"
+  if same_proc "$fn_pid" "$fn_start"; then pass "same_proc: matching start time"; else fail "same_proc: matching start time rejected"; fi
+  # PID 再利用の再現: 同じ pid で起動時刻が異なる（記録が古い）場合は不一致
+  if same_proc "$fn_pid" "$((fn_start + 1))"; then fail "same_proc: reused pid (different start time) accepted"; else pass "same_proc: reused pid rejected"; fi
+  if same_proc "$fn_pid" ""; then fail "same_proc: empty record accepted"; else pass "same_proc: empty record rejected"; fi
+  kill -KILL "$fn_pid" 2>/dev/null || true
+  wait "$fn_pid" 2>/dev/null || true
+  if same_proc "$fn_pid" "$fn_start"; then fail "same_proc: dead pid accepted"; else pass "same_proc: dead pid rejected"; fi
+  # env_owned: 完全一致のみ所有と認める
+  owner_tok="tok123"
+  env "FANDHE_BENCH_OWNER=tok123" sleep 300 &
+  own_pid=$!
+  env "DECOY=x_FANDHE_BENCH_OWNER=tok123" sleep 300 &
+  dec_pid=$!
+  env "FANDHE_BENCH_OWNER=tok1234" sleep 300 &
+  pre_pid=$!
+  sleep 0.2
+  if env_owned "$own_pid"; then pass "env_owned: exact entry owned"; else fail "env_owned: exact entry rejected"; fi
+  if env_owned "$dec_pid"; then fail "env_owned: substring-in-other-var accepted"; else pass "env_owned: substring-in-other-var rejected"; fi
+  if env_owned "$pre_pid"; then fail "env_owned: longer token (prefix match) accepted"; else pass "env_owned: longer token rejected"; fi
+  kill -KILL "$own_pid" "$dec_pid" "$pre_pid" 2>/dev/null || true
+  wait "$own_pid" "$dec_pid" "$pre_pid" 2>/dev/null || true
+else
+  fail "function extraction from target failed"
+fi
 # restart ログが state.json 更新より後（最後の 1 行は停止時）でも、launcher 停止後に集計して副系列が欠損しない
 if run_case log_late 0 log_late "9 1000 2000 3000" --trials 3 --warmup 1 --timeout 10; then
   jq_eq log_late "${root}/log_late.out" '.supervisor_reported | [.samples, .median, .p95]' '[3,2,3]'

@@ -245,6 +245,24 @@ alive() { # <pid>
   [[ "$s" != *") Z "* ]]
 }
 
+# pid の起動時刻が記録と一致するか（PID 再利用で別プロセスへ signal を送らないための直前再照合）。
+# 記録が空なら不一致扱い（同一性を証明できないものには送らない）。
+same_proc() { # <pid> <記録した起動時刻>
+  [ -n "$2" ] || return 1
+  alive "$1" && proc_info "$1" && [ "$REPLY_START" = "$2" ]
+}
+
+# /proc/<pid>/environ の NUL 区切りエントリに FANDHE_BENCH_OWNER=<token> が完全一致で含まれるか。
+# 他プロセスの環境変数値に部分文字列として含まれるだけの場合（grep -F の部分一致）は所有と認めない。
+env_owned() { # <pid>
+  local e
+  [ -n "$owner_tok" ] || return 1
+  while IFS= read -r -d '' e; do
+    [ "$e" = "FANDHE_BENCH_OWNER=$owner_tok" ] && return 0
+  done <"/proc/$1/environ" 2>/dev/null
+  return 1
+}
+
 # pid が launcher の子孫か（PPid 連鎖を 64 段まで辿る）。成功時の REPLY_START は対象 pid 自身の起動時刻
 # （祖先の起動時刻で上書きしない。孫以降の子孫でも同一性照合が成立するように先頭で退避する）。
 is_descendant() { # <pid>
@@ -317,30 +335,41 @@ do_cleanup() {
   [ "$cleaned" -eq 0 ] || return 0
   cleaned=1
   trap '' INT TERM HUP
-  if [ -n "$launcher_pid" ] && alive "$launcher_pid"; then
+  # launcher へは起動時刻が記録と一致する間だけ送る（先に終了して PID が再利用された場合に無関係プロセスを止めない）。
+  if [ -n "$launcher_pid" ] && same_proc "$launcher_pid" "$launcher_start"; then
     kill -TERM "$launcher_pid" 2>/dev/null || true
     for ((i = 0; i < 100; i++)); do
-      alive "$launcher_pid" || break
+      same_proc "$launcher_pid" "$launcher_start" || break
       nap 0.05
     done
-    kill -KILL "$launcher_pid" 2>/dev/null || true
+    if same_proc "$launcher_pid" "$launcher_start"; then kill -KILL "$launcher_pid" 2>/dev/null || true; fi
   fi
-  # 環境変数を継承した孤児はトークン一致で回収する。
+  # 環境変数を継承した孤児はトークンの完全一致で回収する。grep -F は候補の絞り込みだけに使い、
+  # 所有判定は environ の NUL 区切りエントリの完全一致（env_owned）で行い、kill 直前に起動時刻を再照合する。
   if [ -n "$owner_tok" ]; then
+    local -A stale_start=()
+    local s1
     for ((i = 0; i < 3; i++)); do
       stale=()
       while IFS= read -r p; do
         p="${p#/proc/}"; p="${p%%/*}"
-        [ "$p" = "$$" ] || stale+=("$p")
+        [ "$p" = "$$" ] && continue
+        proc_info "$p" || continue
+        s1="$REPLY_START"
+        env_owned "$p" || continue
+        if same_proc "$p" "$s1"; then
+          stale+=("$p")
+          stale_start["$p"]="$s1"
+          kill -KILL "$p" 2>/dev/null || true
+        fi
       done < <(grep -l -a -F -s "FANDHE_BENCH_OWNER=$owner_tok" /proc/[0-9]*/environ 2>/dev/null || true)
       [ "${#stale[@]}" -gt 0 ] || break
-      kill -KILL "${stale[@]}" 2>/dev/null || true
       nap 0.1
     done
     if [ "${#stale[@]}" -gt 0 ]; then
       nap 0.2
       for p in "${stale[@]}"; do
-        if alive "$p"; then rc=4; fi
+        if same_proc "$p" "${stale_start[$p]}"; then rc=4; fi
       done
     fi
   fi
@@ -353,7 +382,7 @@ do_cleanup() {
     && [ -z "${tracked[$ST_PID]+x}" ] && [ "$ST_PID" != "$$" ] && alive "$ST_PID"; then
     if proc_info "$ST_PID"; then
       if [ "$REPLY_SID" = "$launcher_pid" ] \
-        || grep -q -a -F -s "FANDHE_BENCH_OWNER=$owner_tok" "/proc/$ST_PID/environ" 2>/dev/null; then
+        || env_owned "$ST_PID"; then
         track_pid "$ST_PID" "$REPLY_START"
       else
         printf 'warning: pid %s in state.json cannot be attributed to this run; not signaling it\n' "$ST_PID" >&2 || true
@@ -367,7 +396,8 @@ do_cleanup() {
   for p in "${!tracked[@]}"; do
     if proc_info "$p" && [ "$REPLY_START" = "${tracked[$p]}" ]; then
       victims+=("$p")
-      kill -KILL "$p" 2>/dev/null || true
+      # 列挙時の照合から kill までの間に PID が再利用されていないか直前に再照合する。
+      if same_proc "$p" "${tracked[$p]}"; then kill -KILL "$p" 2>/dev/null || true; fi
     fi
   done
   if [ "${#victims[@]}" -gt 0 ]; then
@@ -377,7 +407,7 @@ do_cleanup() {
     done
   fi
   if [ -n "$launcher_pid" ]; then
-    if alive "$launcher_pid"; then rc=4; else wait "$launcher_pid" 2>/dev/null || true; fi
+    if same_proc "$launcher_pid" "$launcher_start"; then rc=4; else wait "$launcher_pid" 2>/dev/null || true; fi
   fi
   [ -z "$out_tmp" ] || rm -f -- "$out_tmp" 2>/dev/null || true
   [ -z "$workdir" ] || rm -rf -- "$workdir" 2>/dev/null || true

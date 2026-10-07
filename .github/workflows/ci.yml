@@ -554,6 +554,9 @@ jobs:
       # スタブ計測・スタブ driver だけで照合し、実コンテナ・実プロセスは起動しない。実計測は root の操作者が明示実行する
       - name: 監視プロセス込みアイドル常駐メモリ回帰テストの自己テスト（TASK-47・CORE-7・SUP-1・REPAIR-12）
         run: make idle-memory-supervised-selftest
+      # スタブ launcher だけで照合し、実コンテナ・実ランタイム・root は使わない。実機での N=50 実証は #499（人間担当）
+      - name: 監視プロセス独立性実証スクリプトの自己テスト（TASK-162・SUP-5・REPAIR-12）
+        run: make supervisor-independence-selftest
       # 疑似 /proc（mktemp -d 配下）だけで照合し、ランナーの実プロセスは計測しない（実測は製品バイナリ提供後に #485）
       - name: 監視プロセス常駐メモリ計測スクリプトの自己テスト（TASK-158・SUP-2・REPAIR-12）
         run: make supervisor-pss-selftest

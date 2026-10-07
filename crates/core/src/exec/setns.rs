@@ -346,6 +346,18 @@ impl Pid1Target {
             }
             FdinfoPid::Pid(Some(_)) => {}
         }
+        // pidfd を保持している間 fdinfo の `Pid:` は終了後も元の pid を示し続け（`-1` にならない）、終了を
+        // 検出できない。終了済み（zombie 含む）の pidfd は poll で readable になるため、pidfd と確認できた
+        // 後にここで終了を拒否する（非 pidfd の fd は poll が常に readable になるため、判定は後段に置く）。
+        let exited = sys::poll_readable(pidfd.as_fd(), 0)
+            .map_err(|e| setns_error(e, "poll launch pidfd"))?;
+        if exited {
+            return Err(ExecError::new(
+                ErrorCode::FailedPrecondition,
+                IsolationStage::SetNs,
+                "the process held by the launch pidfd has already exited",
+            ));
+        }
         Self::verify_pinned(recorded_pid, pidfd, expected_cgroup_path)
     }
 
@@ -569,7 +581,7 @@ fn target_proc_error(err: &std::io::Error, what: &str) -> ExecError {
 enum FdinfoPid {
     /// `Pid:` 行が 1 つだけで、正の pid（`Some`）または 0（`None`。名前空間外）。
     Pid(Option<NonZeroU32>),
-    /// `Pid: -1`（終了済み）。
+    /// `Pid: -1`（終了済み。pidfd 保持中は通常現れないため、終了の主たる検出は poll）。
     Exited,
     /// pidfd の fdinfo として解釈できない。
     NotPidfd,

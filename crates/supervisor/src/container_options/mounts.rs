@@ -24,7 +24,7 @@
 //! - `--ipc=host` / `shareable` と shm の関係（TASK-169.3）
 
 use fandhe_container_core::tmpfs::{
-    DEV_SHM_PATH, TmpfsMode, TmpfsMountSet, TmpfsMountSpec, TmpfsSize,
+    DEV_SHM_PATH, TMPFS_MAX_MOUNTS, TmpfsMode, TmpfsMountSet, TmpfsMountSpec, TmpfsSize,
 };
 use fandhe_container_core::traits::{ErrorCode, TraitError};
 
@@ -151,28 +151,40 @@ impl TmpfsOption {
 }
 
 /// マウント系オプション（`--shm-size`・`--tmpfs`）の束。
+///
+/// フィールドは非公開で、`--tmpfs` の追加は件数上限を検証する [`Self::with_tmpfs`] だけが行う
+/// （core の [`TMPFS_MAX_MOUNTS`] を超える件数を保持できない。外部入力の件数に比例した確保を防ぐ）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct MountOptions {
-    /// `--shm-size`。
-    pub shm_size: Option<ShmSize>,
-    /// `--tmpfs`（指定順）。
-    pub tmpfs: Vec<TmpfsOption>,
+    shm_size: Option<ShmSize>,
+    tmpfs: Vec<TmpfsOption>,
 }
 
 impl MountOptions {
-    /// `--shm-size` を設定する（`non_exhaustive` のため外部 crate はビルダ経由で組み立てる）。
+    /// `--shm-size`。
+    pub fn shm_size(&self) -> Option<ShmSize> {
+        self.shm_size
+    }
+
+    /// `--tmpfs`（指定順。[`TMPFS_MAX_MOUNTS`] 件以下）。
+    pub fn tmpfs(&self) -> &[TmpfsOption] {
+        &self.tmpfs
+    }
+
+    /// `--shm-size` を設定する。
     #[must_use]
     pub fn with_shm_size(mut self, size: ShmSize) -> Self {
         self.shm_size = Some(size);
         self
     }
 
-    /// `--tmpfs` を 1 件追加する（指定順）。
-    #[must_use]
-    pub fn with_tmpfs(mut self, tmpfs: TmpfsOption) -> Self {
+    /// `--tmpfs` を 1 件追加する（指定順）。[`TMPFS_MAX_MOUNTS`] 件を超える追加は確保せずに拒否する。
+    pub fn with_tmpfs(mut self, tmpfs: TmpfsOption) -> Result<Self, TraitError> {
+        if self.tmpfs.len() >= TMPFS_MAX_MOUNTS {
+            return Err(invalid("too many tmpfs mounts"));
+        }
         self.tmpfs.push(tmpfs);
-        self
+        Ok(self)
     }
 
     /// core の [`TmpfsMountSet`] へ変換する。`shm_size` 指定時は `/dev/shm` を先頭に置く。
@@ -310,10 +322,12 @@ mod tests {
     /// SUP-12・TASK-169.2: shm_size は /dev/shm を先頭に置き、--tmpfs /dev/shm との併用は拒否する。
     #[test]
     fn sup12_task169_2_to_tmpfs_set() {
-        let opts = MountOptions {
-            shm_size: Some(ShmSize::parse("64m").expect("shm")),
-            tmpfs: vec![TmpfsOption::parse("/run:size=1m").expect("run")],
-        };
+        let opts = MountOptions::default()
+            .with_shm_size(ShmSize::parse("64m").expect("shm"))
+            .with_tmpfs(TmpfsOption::parse("/run:size=1m").expect("run"))
+            .expect("add");
+        assert_eq!(opts.shm_size().map(ShmSize::bytes), Some(67_108_864));
+        assert_eq!(opts.tmpfs().len(), 1);
         let set = opts.to_tmpfs_set().expect("set");
         let dests: Vec<&str> = set
             .mounts()
@@ -323,18 +337,35 @@ mod tests {
         assert_eq!(dests, ["/dev/shm", "/run"]);
         assert_eq!(set.mounts()[0].data_string(), "mode=1777,size=67108864");
 
-        let conflict = MountOptions {
-            shm_size: Some(ShmSize::parse("1m").expect("shm")),
-            tmpfs: vec![TmpfsOption::parse("/dev/shm").expect("shm tmpfs")],
-        };
+        let conflict = MountOptions::default()
+            .with_shm_size(ShmSize::parse("1m").expect("shm"))
+            .with_tmpfs(TmpfsOption::parse("/dev/shm").expect("shm tmpfs"))
+            .expect("add");
         assert_eq!(
             conflict.to_tmpfs_set().expect_err("conflict").code(),
             ErrorCode::InvalidArgument
         );
-        let reserved = MountOptions {
-            shm_size: None,
-            tmpfs: vec![TmpfsOption::parse("/proc").expect("proc")],
-        };
+        let reserved = MountOptions::default()
+            .with_tmpfs(TmpfsOption::parse("/proc").expect("proc"))
+            .expect("add");
         assert!(reserved.to_tmpfs_set().is_err());
+    }
+
+    /// SUP-12・TASK-169.2: `--tmpfs` は上限（64 件）までしか保持せず、65 件目は追加時に拒否する。
+    #[test]
+    fn sup12_task169_2_with_tmpfs_enforces_count_limit() {
+        let mut opts = MountOptions::default();
+        for i in 0..TMPFS_MAX_MOUNTS {
+            opts = opts
+                .with_tmpfs(TmpfsOption::parse(&format!("/m{i}")).expect("parse"))
+                .expect("within limit");
+        }
+        assert_eq!(opts.tmpfs().len(), 64);
+        assert_eq!(opts.to_tmpfs_set().expect("set").mounts().len(), 64);
+        let e = opts
+            .with_tmpfs(TmpfsOption::parse("/extra").expect("parse"))
+            .expect_err("over limit");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "too many tmpfs mounts");
     }
 }

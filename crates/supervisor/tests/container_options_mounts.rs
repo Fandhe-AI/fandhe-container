@@ -9,7 +9,8 @@ use fandhe_container_supervisor::container_options::{MountOptions, ShmSize, Tmpf
 fn sup12_shm_size_and_tmpfs_become_exact_mount_specs() {
     let opts = MountOptions::default()
         .with_shm_size(ShmSize::parse("64m").expect("shm"))
-        .with_tmpfs(TmpfsOption::parse("/run:rw,noexec,nosuid,size=65536k").expect("tmpfs"));
+        .with_tmpfs(TmpfsOption::parse("/run:rw,noexec,nosuid,size=65536k").expect("tmpfs"))
+        .expect("add tmpfs");
     let set = opts.to_tmpfs_set().expect("set");
     let got: Vec<(String, String, bool, bool)> = set
         .mounts()
@@ -43,6 +44,8 @@ fn sup12_shm_size_and_tmpfs_become_exact_mount_specs() {
 fn sup12_unsafe_tmpfs_requests_are_rejected() {
     assert!(TmpfsOption::parse("/x:suid").is_err());
     assert!(TmpfsOption::parse("/x:dev").is_err());
-    let opts = MountOptions::default().with_tmpfs(TmpfsOption::parse("/proc/sys").expect("parse"));
+    let opts = MountOptions::default()
+        .with_tmpfs(TmpfsOption::parse("/proc/sys").expect("parse"))
+        .expect("add tmpfs");
     assert!(opts.to_tmpfs_set().is_err());
 }

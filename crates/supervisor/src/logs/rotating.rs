@@ -13,6 +13,8 @@
 //! - 1 つの sink は supervisor プロセスにつき 1 回作り、再起動・再捕捉では同じものを使い回す。
 //!   [`RotatingFileSink::open`] は既存の `<id>.log` を開かず世代へ退避してから新規作成するため、
 //!   open するたびに 1 世代を消費する。
+//! - [`RotatingFileSink::open`] は既存の現在ログ・各世代が上限を超えていれば `InvalidArgument` で拒否し、
+//!   `<id>.log.<n>` が NAME_MAX を超える長さの ID も拒否する（いずれも既存ファイルは動かさない）。
 //! - ローテーション・書き込みの失敗は握りつぶさず `Internal` で返し、sink を失敗状態に固定する（fail-closed）。
 //!   以後の `append` は両ストリームとも `Err` になる。エラーメッセージにパス・行内容・errno は含めない（ERR-1）。
 //!
@@ -51,6 +53,9 @@ pub const MAX_LOG_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// 世代数に指定できる最大値。
 pub const MAX_LOG_GENERATIONS: u32 = 16;
+
+/// ファイル名 1 要素の最大バイト数（NAME_MAX。Windows は UTF-16 単位 255 だがバイト数で見れば保守的）。
+const MAX_FILE_NAME_BYTES: usize = 255;
 
 /// レコード先頭の stream 名 + 区切りの最大長（`"stderr "`）。
 const MAX_TAG_BYTES: usize = 7;
@@ -140,15 +145,33 @@ impl RotatingFileSink {
     /// 既存の `<id>.log` は開かず、世代へ退避してから新規作成する（symlink 先への追記を防ぐ）。
     pub fn open(dir: &Path, id: &ContainerId, config: RotationConfig) -> Result<Self, TraitError> {
         check_dir(dir)?;
+        // `<id>.log.<n>` の最長名が NAME_MAX を超えると open / 初回ローテーションが失敗して
+        // sink が failed のままになるため、ここで早期に拒否する。
+        let base = format!("{}.log", id.as_str());
+        let max_suffix = if config.generations > 1 {
+            // "." + 最大世代番号の 10 進桁数
+            1 + (config.generations - 1).to_string().len()
+        } else {
+            0
+        };
+        if base.len().saturating_add(max_suffix) > MAX_FILE_NAME_BYTES {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "container id is too long for log file names",
+            ));
+        }
         let sink = Self {
             dir: dir.to_path_buf(),
-            base: format!("{}.log", id.as_str()),
+            base,
             config,
             inner: Mutex::new(Inner {
                 state: State::Failed,
                 rotations: 0,
             }),
         };
+        // 既存の現在ログ・各世代が上限を超えていたら、何も動かさずに拒否する（契約:
+        // 全ファイル len <= max_file_bytes）。上限を下げて開き直した場合は手動で整理させる。
+        sink.check_existing_sizes()?;
         // 既存エントリ（種別不問）があれば、辿らずに世代へ送ってから作り直す。
         if fs::symlink_metadata(sink.path(0)).is_ok() {
             sink.shift_generations()?;
@@ -193,6 +216,24 @@ impl RotatingFileSink {
                 Ok(()) => {}
                 Err(e) if e.kind() == ErrorKind::NotFound => {}
                 Err(_) => return Err(fail()),
+            }
+        }
+        Ok(())
+    }
+
+    /// 既存の現在ログ・各世代（`0..generations`）のサイズが上限以内であることを確認する。
+    fn check_existing_sizes(&self) -> Result<(), TraitError> {
+        for i in 0..self.config.generations {
+            match fs::symlink_metadata(self.path(i)) {
+                Ok(m) if m.len() > self.config.max_file_bytes => {
+                    return Err(TraitError::new(
+                        ErrorCode::InvalidArgument,
+                        "existing log file exceeds the size limit",
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(_) => return Err(internal("log file inspection failed")),
             }
         }
         Ok(())

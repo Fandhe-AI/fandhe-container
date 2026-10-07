@@ -282,3 +282,47 @@ fn sup7_task164_2_concurrent_appends_keep_records_whole() {
         );
     }
 }
+
+#[test]
+fn sup7_task164_2_open_rejects_oversized_existing_files() {
+    let t = TmpDir::new("oversize");
+    let big = vec![b'x'; (MIN_LOG_FILE_BYTES + 1) as usize];
+    fs::write(t.0.join("c1.log.1"), &big).unwrap();
+    let e = RotatingFileSink::open(&t.0, &id(), small()).err().unwrap();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    // 何も動かしていない。
+    assert_eq!(files(&t.0), vec!["c1.log.1".to_string()]);
+    // 現在ログが超過している場合も同様。
+    fs::remove_file(t.0.join("c1.log.1")).unwrap();
+    fs::write(t.0.join("c1.log"), &big).unwrap();
+    let e = RotatingFileSink::open(&t.0, &id(), small()).err().unwrap();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    assert_eq!(files(&t.0), vec!["c1.log".to_string()]);
+}
+
+#[test]
+fn sup7_task164_2_open_accepts_existing_files_within_limit() {
+    let t = TmpDir::new("withinlimit");
+    fs::write(t.0.join("c1.log"), vec![b'x'; MIN_LOG_FILE_BYTES as usize]).unwrap();
+    RotatingFileSink::open(&t.0, &id(), small()).unwrap();
+    assert_eq!(
+        files(&t.0),
+        vec!["c1.log".to_string(), "c1.log.1".to_string()]
+    );
+}
+
+#[test]
+fn sup7_task164_2_open_rejects_names_exceeding_name_max() {
+    let t = TmpDir::new("namemax");
+    // ".log"(4) + ".2"(2) 付与で 255 を超える長さ（250 + 6 = 256）。
+    let long = ContainerId::new("a".repeat(250)).unwrap();
+    let e = RotatingFileSink::open(&t.0, &long, small()).err().unwrap();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    assert!(files(&t.0).is_empty());
+    // 世代数 1 なら ".log" のみで 254 バイトに収まる。
+    let one = RotationConfig::new(MIN_LOG_FILE_BYTES, 1).unwrap();
+    RotatingFileSink::open(&t.0, &long, one).unwrap();
+    // 255 バイト ID は世代数 1 でも ".log" 付与で超えるため拒否。
+    let max = ContainerId::new("b".repeat(255)).unwrap();
+    assert!(RotatingFileSink::open(&t.0, &max, one).is_err());
+}

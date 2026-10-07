@@ -221,10 +221,21 @@ impl RotatingFileSink {
         Ok(())
     }
 
-    /// 既存の現在ログ・各世代（`0..generations`）のサイズが上限以内であることを確認する。
+    /// 既存の現在ログ・各世代（`0..generations`）が通常ファイルで、サイズが上限以内であることを確認する。
+    ///
+    /// ディレクトリ等の通常ファイル・symlink 以外は、`max_file_bytes × generations` の
+    /// 契約に収まらずローテーションも失敗し得るため、ファイルを変更する前に拒否する（SUP-7・TASK-164.2）。
+    /// symlink はリンク自体が rename / 削除されるだけで参照先を変更しないため許容する
+    /// （`symlink_log_target_is_not_modified` テスト参照）。
     fn check_existing_sizes(&self) -> Result<(), TraitError> {
         for i in 0..self.config.generations {
             match fs::symlink_metadata(self.path(i)) {
+                Ok(m) if !m.file_type().is_file() && !m.file_type().is_symlink() => {
+                    return Err(TraitError::new(
+                        ErrorCode::InvalidArgument,
+                        "existing log path is not a regular file",
+                    ));
+                }
                 Ok(m) if m.len() > self.config.max_file_bytes => {
                     return Err(TraitError::new(
                         ErrorCode::InvalidArgument,

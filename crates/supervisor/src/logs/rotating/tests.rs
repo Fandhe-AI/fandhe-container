@@ -301,6 +301,20 @@ fn sup7_task164_2_open_rejects_oversized_existing_files() {
 }
 
 #[test]
+fn sup7_task164_2_open_rejects_directory_generations_without_changes() {
+    for name in ["c1.log.1", "c1.log"] {
+        let t = TmpDir::new("dirgen");
+        fs::create_dir(t.0.join(name)).unwrap();
+        fs::write(t.0.join(name).join("data"), b"payload").unwrap();
+        let e = RotatingFileSink::open(&t.0, &id(), small()).err().unwrap();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        // 何も動かしていない（ディレクトリも中身もそのまま）。
+        assert_eq!(files(&t.0), vec![name.to_string()]);
+        assert_eq!(fs::read(t.0.join(name).join("data")).unwrap(), b"payload");
+    }
+}
+
+#[test]
 fn sup7_task164_2_open_accepts_existing_files_within_limit() {
     let t = TmpDir::new("withinlimit");
     fs::write(t.0.join("c1.log"), vec![b'x'; MIN_LOG_FILE_BYTES as usize]).unwrap();

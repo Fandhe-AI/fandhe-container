@@ -466,8 +466,13 @@ pub fn verify_elevation(
 
 /// 縮退の計画（適用はしない。将来の syscall 経路が実行する入力）。
 ///
-/// 適用順は「`clear_supplementary_groups` → `gid`（`setresgid`）→ `uid`（`setresuid`。capability を失う前に
-/// 特権が要る操作を終える）→ `bounding_drop`（昇順・`CAP_SETPCAP` は最後）→ `capset` → ambient 載せ」を想定する。
+/// 適用順は [`ReductionPlan::steps`] が返す次の列で固定する（SUP-14）:
+/// `clear_supplementary_groups`（`setgroups(0)`）→ `gid`（`setresgid`）→ `bounding_drop`（昇順・`CAP_SETPCAP` は最後）
+/// → `PR_SET_KEEPCAPS` → `uid`（`setresuid`）→ `capset` → ambient 載せ。
+///
+/// UID 0 から非 0 へ変えると effective capability は失われる（`CAP_SETPCAP` を要する bounding 削除ができなくなる）ため、
+/// bounding 削除は `setresuid` より前に終える。`setresuid` 後は permitted を `keepcaps` で保持し、`capset` で
+/// effective・inheritable を期待集合へ再設定してから ambient を載せる。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ReductionPlan {
@@ -490,6 +495,45 @@ pub struct ReductionPlan {
     pub uid: UidSet,
 }
 
+/// 縮退計画の 1 手順（[`ReductionPlan::steps`] の要素。適用順は列の順）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReductionStep {
+    /// `setgroups(0)`（`CAP_SETGID` を要する）。
+    ClearSupplementaryGroups,
+    /// `setresgid`（`CAP_SETGID` を要する）。
+    SetGid,
+    /// bounding set からの削除（`CAP_SETPCAP` を要する。uid 変更前に行う）。
+    DropBounding,
+    /// `prctl(PR_SET_KEEPCAPS, 1)`。`setresuid` 後も permitted を保持する。
+    KeepCapabilities,
+    /// `setresuid`（`CAP_SETUID` を要する）。
+    SetUid,
+    /// `capset`（permitted・effective・inheritable を期待集合へ）。
+    Capset,
+    /// ambient への載せ。
+    RaiseAmbient,
+}
+
+impl ReductionPlan {
+    /// 実行すべき手順を適用順で返す（空の補助グループ消去・空の bounding 削除は含まない）。
+    pub fn steps(&self) -> Vec<ReductionStep> {
+        let mut v = Vec::new();
+        if self.clear_supplementary_groups {
+            v.push(ReductionStep::ClearSupplementaryGroups);
+        }
+        v.push(ReductionStep::SetGid);
+        if !self.bounding_drop.is_empty() {
+            v.push(ReductionStep::DropBounding);
+        }
+        v.push(ReductionStep::KeepCapabilities);
+        v.push(ReductionStep::SetUid);
+        v.push(ReductionStep::Capset);
+        v.push(ReductionStep::RaiseAmbient);
+        v
+    }
+}
+
 /// 現在の資格情報から期待集合への縮退計画を算出する（純関数。何も適用しない）。
 ///
 /// 縮退後に [`verify_elevation`] を満たせない前提は計画せず拒否する（fail-closed）:
@@ -498,6 +542,8 @@ pub struct ReductionPlan {
 /// - 期待集合が現在の permitted または bounding に含まれない → `MissingCapabilities`
 /// - bounding に落とす対象があるのに現在の effective が `CAP_SETPCAP` を持たない → `MissingCapabilities`
 ///   （bounding 削除は `CAP_SETPCAP` を要する）
+/// - 補助グループが残る・gid が対象と異なるのに effective が `CAP_SETGID` を持たない、または uid が対象と異なるのに
+///   `CAP_SETUID` を持たない → `MissingCapabilities`（`setgroups`・`setresgid`・`setresuid` が実行不能）
 pub fn plan_reduction(
     current: &CredentialSnapshot,
     expected: CapabilitySet,
@@ -530,6 +576,36 @@ pub fn plan_reduction(
             "required capabilities are not in the permitted or bounding set",
         ));
     }
+    let need_setgid = !current.groups.is_empty()
+        || [
+            current.gid.real,
+            current.gid.effective,
+            current.gid.saved,
+            current.gid.fs,
+        ]
+        .iter()
+        .any(|g| *g != target_gid);
+    let need_setuid = [
+        current.uid.real,
+        current.uid.effective,
+        current.uid.saved,
+        current.uid.fs,
+    ]
+    .iter()
+    .any(|u| *u != target_uid);
+    let eff_has = |c: Capability| current.effective.0 & (1u64 << u32::from(c.index())) != 0;
+    if need_setgid && !eff_has(Capability::Setgid) {
+        return Err(denied(
+            PrivilegeErrorReason::MissingCapabilities,
+            "CAP_SETGID is required in the effective set to change gid or supplementary groups",
+        ));
+    }
+    if need_setuid && !eff_has(Capability::Setuid) {
+        return Err(denied(
+            PrivilegeErrorReason::MissingCapabilities,
+            "CAP_SETUID is required in the effective set to change uid",
+        ));
+    }
     let setpcap = Capability::Setpcap.index();
     let mut bounding_drop: Vec<u8> = (0u8..64)
         .filter(|i| {
@@ -557,7 +633,7 @@ pub fn plan_reduction(
         effective: expected,
         inheritable: expected,
         ambient: expected,
-        clear_supplementary_groups: true,
+        clear_supplementary_groups: !current.groups.is_empty(),
         gid: GidSet {
             real: target_gid,
             effective: target_gid,
@@ -782,6 +858,35 @@ mod tests {
         let t = status("0", FULL, &no_setpcap, FULL, "0", "0", UID);
         let snap = parse_proc_status(&t).unwrap();
         let e = plan_reduction(&snap, exp, 1000, 1000).unwrap_err();
+        assert_eq!(e.reason, PrivilegeErrorReason::MissingCapabilities);
+    }
+
+    #[test]
+    fn sup14_task171_1_2_plan_reduction_requires_setuid_setgid_and_orders_steps() {
+        let exp = runtime_required_capabilities();
+        let root_uid = "0\t0\t0\t0";
+        let t = status("0", FULL, FULL, FULL, "0", "0", root_uid);
+        let plan = plan_reduction(&parse_proc_status(&t).unwrap(), exp, 1000, 1000).unwrap();
+        assert_eq!(
+            plan.steps(),
+            vec![
+                ReductionStep::SetGid,
+                ReductionStep::DropBounding,
+                ReductionStep::KeepCapabilities,
+                ReductionStep::SetUid,
+                ReductionStep::Capset,
+                ReductionStep::RaiseAmbient,
+            ]
+        );
+        // CAP_SETUID が無ければ uid を変えられない。
+        let no_setuid = format!("{:016x}", 0x1ffffffffffu64 & !(1u64 << 7));
+        let t = status("0", FULL, &no_setuid, FULL, "0", "0", root_uid);
+        let e = plan_reduction(&parse_proc_status(&t).unwrap(), exp, 1000, 1000).unwrap_err();
+        assert_eq!(e.reason, PrivilegeErrorReason::MissingCapabilities);
+        // CAP_SETGID が無ければ gid を変えられない。
+        let no_setgid = format!("{:016x}", 0x1ffffffffffu64 & !(1u64 << 6));
+        let t = status("0", FULL, &no_setgid, FULL, "0", "0", UID);
+        let e = plan_reduction(&parse_proc_status(&t).unwrap(), exp, 1000, 1001).unwrap_err();
         assert_eq!(e.reason, PrivilegeErrorReason::MissingCapabilities);
     }
 

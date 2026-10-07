@@ -43,6 +43,12 @@ mod linux {
         assert_eq!(child.set_cpu_max(&unlimited), Ok(unlimited));
         assert_eq!(read().trim_end(), "max 100000");
 
+        // SUP-13・TASK-170.1: `--cpus` 相当値の変換結果も公開 API 経由で書き込める。
+        let converted = CpuMax::parse_cpus("1.5", CpuMax::DEFAULT_PERIOD_US).unwrap();
+        assert_eq!(child.set_cpu_max(&converted), Ok(converted));
+        assert_eq!(read().trim_end(), "150000 100000");
+        assert_eq!(child.set_cpu_max(&unlimited), Ok(unlimited));
+
         // 不正値は構築で拒否され、ファイルは変化しない。
         let err = CpuMax::new(CpuQuota::Micros(50_000), 0).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);

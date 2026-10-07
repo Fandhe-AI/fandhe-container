@@ -21,6 +21,7 @@
 # TASK-163.3（#502）で exec に seccomp / Landlock 再適用の配線を追加した（core の安全 API を呼ぶだけ。依存は不変）。
 # TASK-163.4（#503）で exec にコマンド実行（run_command）と実コンテナへの通し結合試験 tests/exec.rs を追加した（依存は不変）。
 # TASK-163 追補（#1465）で exec::run_command に監査の記録先を必須の引数として追加した（依存は不変）。
+# TASK-164 追補（#1470）で Windows の世代 rename 再試行・ロックファイル ID 照合（src/sys.rs。自前 FFI 宣言）を追加した（依存は不変）。
 # 外部クレート（crates.io）の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 
 [package]

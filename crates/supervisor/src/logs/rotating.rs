@@ -26,7 +26,8 @@
 //!   受理するのは、通常ファイルで `len <= max_file_bytes` の `<id>.log` と `<id>.log.<n>`
 //!   （`1 <= n < generations`、先頭 0 なし）だけである。したがって世代番号 0・先頭 0 つき・世代数以上の
 //!   番号（世代数を減らした開き直し）・上限超過・ディレクトリ・symlink・ASCII 大文字小文字だけが違う別名
-//!   （大文字小文字非区別 FS では同じファイルを指す）は拒否する。これらはローテーションの対象外のまま
+//!   （大文字小文字非区別 FS では同じファイルを指す）・Unicode の畳み込みで ASCII へ写る文字を含む別名
+//!   （U+212A `K` 等。[`fold_for_alias`] の 4 文字）は拒否する。これらはローテーションの対象外のまま
 //!   残り、ディスク使用量の上限を破るためである。
 //! - `<id>.log.<n>` が NAME_MAX を超える長さの ID も `InvalidArgument` で拒否する。
 //! - ローテーション・書き込みの失敗は握りつぶさず `Internal` で返し、sink を失敗状態に固定する（fail-closed）。
@@ -35,8 +36,10 @@
 //! # 安全性
 //! - 現在ログは `create_new`（`O_CREAT|O_EXCL`）でのみ開く。最終要素が symlink でも辿らないため、
 //!   symlink 先への追記を防ぐ。既存ファイルは開かず、rename / remove（symlink を辿らない）だけで動かす。
-//! - 既存のロックファイルは、開く前後の種別（unix は dev / inode も）が一致する通常ファイルのときだけ使い、
-//!   読み取りでしか開かない（検査後に symlink へ差し替えられても、その先へ書かない）。
+//! - 既存のロックファイルは、開く前後の種別が一致する通常ファイルのときだけ使い、読み取りでしか開かない
+//!   （検査後に symlink へ差し替えられても、その先へ書かない）。同一性の照合は unix が dev / inode、Windows は
+//!   reparse point を辿らず開いたうえで、2 回開いたハンドルのボリューム・ファイル ID（`FileIdInfo`。FAT 等の
+//!   未対応 FS は取得失敗で拒否）。読み出し側の入口 [`open_for_read`] も同じ検査を使う。
 //! - `dir` は絶対パスに限る（相対パスは CWD より上の要素を検査できない）。末尾の区切り文字・`.` は要素から
 //!   組み直して除く（`link/` は lstat が symlink を辿り、最終要素の検査をすり抜けるため）。`dir` が symlink・
 //!   非ディレクトリなら拒否し、unix では group / other 書き込み可も拒否する。経路上の親要素の symlink・`..` 要素も
@@ -56,6 +59,14 @@
 //!   境界で行が欠落・重複・誤配置しない。Windows は開いたファイルを rename できないので、この順序が必須でもある。
 //! - 失敗は fail-closed: 書き込み・flush・ローテーションが失敗した sink は失敗状態に固定し、バッファを捨てて再試行しない
 //!   （再書き込みによる重複を作らない）。そのとき、バッファにあった受理済みの複数レコードが失われ得る。
+//!   例外は世代の rename / remove で、バッファ書き出しとファイル close の後なので再書き込みを伴わず、
+//!   Windows の共有違反（`ERROR_SHARING_VIOLATION`・`ERROR_LOCK_VIOLATION`）に限り有界で再試行する
+//!   （10ms × 最大 4 回。1 回のローテーション全体で共有し、`logs` の最小の待ち上限 100ms を下回る）。
+//!   予算が尽きれば従来どおり失敗状態に固定する。途中まで進んだ世代送りは巻き戻さない（世代に穴が空くだけで
+//!   欠落・重複は生じず、開き直しも受理する）。
+//! - 読み出し側の契約（Windows）: 現在ログ・世代ファイルは削除共有（`FILE_SHARE_DELETE`）つきで開くこと。
+//!   正規の入口は [`open_for_read`]。削除共有なしで開いた読み手が居座ると、rename が再試行のあと失敗し sink は
+//!   失敗状態になる（可用性より fail-closed を優先する）。
 //! - fsync はローテーションで退避する世代と、明示の [`RotatingFileSink::sync`] だけ。現在ログはクラッシュ時に
 //!   最後の `sync` / ローテーション以降の分を失い得る。
 //!
@@ -63,20 +74,24 @@
 //! - flush ごとの fsync・設定可能な同期ポリシー・タイマーによる定期 flush（短い read を契機とする flush で代替）。
 //!   [`RotatingFileSink::sync`] をコンテナ終了時などに呼ぶ配線も未実装（配線側の責務）。
 //! - 両ストリーム混在での大規模検証（stdout 単独の 100 万行検証は `tests/log_rotation.rs`〔TASK-164.4・#508〕で実装済み）。
-//! - `logs` コマンドからの読み出し経路。open 後に差し替えられた世代が symlink の可能性は残るため、
-//!   読み出し側は symlink を辿らず開くこと。
-//! - 親ディレクトリ経路の検証後の差し替え（TOCTOU）は完全には防げない（dirfd 基準の固定には core の安全 open の公開が必要）。
-//!   所有者（uid）の照合もしない。Windows では権限（ACL）を検査しない。
-//! - 名前空間の別名検査は ASCII の大文字小文字だけを見る。FS 固有の Unicode 畳み込み（APFS の `K` U+212A 等）
-//!   による別名は検出しない。
-//! - Windows では、他プロセスが世代ファイルを削除共有なしで開いていると rename が失敗し、sink は失敗状態に
-//!   固定される（再試行しない）。読み出し側は削除共有つきで開くこと。
+//! - `logs` コマンド本体（読み出し経路の配線）。入口 [`open_for_read`] だけを用意した。open 後に差し替えられた
+//!   世代が symlink の可能性は残るため、読み出し側は [`open_for_read`] か同等の「辿らず開く」手段を使うこと。
+//! - 親ディレクトリ経路の検証後の差し替え（TOCTOU）と所有者（uid）の照合は、core の安全 open へ寄せられない
+//!   ため未対応のまま残す（#1470 の判断）。core の fd 相対 open は `pub(crate)` かつ Linux 限定で、supervisor
+//!   から呼べず、3 OS で動く sink の経路を置き換えられない。公開には OS 非依存の「ディレクトリハンドル相対
+//!   open」を core の公開 API として設計する必要があり（crate 境界の設計変更）、本モジュールの範囲外。
+//!   Windows では権限（ACL）も検査しない。
+//! - 名前空間の別名検査は、ASCII の大文字小文字と、Unicode の畳み込みで ASCII へ写る 4 文字（[`fold_for_alias`]）を
+//!   見る。それ以外の FS 固有の畳み込みで名前空間に入る別名は、sink が作る名前が ASCII のみであるため生じない。
+//! - Windows の rename 再試行の対象外: 移動先が削除共有なしで開かれている場合などに `ERROR_ACCESS_DENIED` が
+//!   返るなら再試行せず失敗状態になる（恒久エラーとの区別がつかないため。実機の CI 結果で要判断）。
 //! - `dir`（状態ルート配下のどこか）の決定は配線側の責務で、本モジュールは決めない。
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, ErrorKind, Write};
+use std::io::{self, BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 use fandhe_container_core::traits::{ContainerId, ErrorCode, TraitError};
 
@@ -181,7 +196,27 @@ pub struct RotatingFileSink {
     dir: PathBuf,
     base: String,
     config: RotationConfig,
+    /// 世代 rename の一過性失敗に対する再試行方針（Windows の共有違反用。既定は [`RenameRetry::DEFAULT`]）。
+    retry: RenameRetry,
     inner: Mutex<Inner>,
+}
+
+/// 世代 rename の再試行方針（1 回のローテーションで共有する予算。SUP-7・REPAIR-5）。
+///
+/// 待ち時間の総和（`interval × max_sleeps`）は、`inner` ロックを握ったままリーダースレッドから呼ばれる
+/// 都合で、`logs` 側の最小の待ち上限（`CANCEL_SETTLE_TIMEOUT` = 100ms）を十分下回る値にする。
+#[derive(Debug, Clone, Copy)]
+struct RenameRetry {
+    interval: Duration,
+    max_sleeps: u32,
+}
+
+impl RenameRetry {
+    /// 10ms × 4 回 = 総待ち最大 40ms。
+    const DEFAULT: Self = Self {
+        interval: Duration::from_millis(10),
+        max_sleeps: 4,
+    };
 }
 
 /// ID をファイル名用の小文字のみの可逆表現へ変換する（IO-5）。
@@ -225,6 +260,26 @@ fn is_reserved_device_name(s: &str) -> bool {
     }
 }
 
+/// 名前空間の別名検査用に、名前を ASCII 小文字へ畳み込む（IO-5）。
+///
+/// sink が作る名前は小文字・数字・`.`・`-`・`_` の ASCII だけなので、別名になり得るのは「大文字小文字の畳み込みや
+/// 正規化で ASCII 英字へ写る非 ASCII 文字」を含む名前だけである。ASCII は `to_ascii_lowercase`、非 ASCII は
+/// Unicode の畳み込み（`CaseFolding.txt` の C / S / T）と正規等価で ASCII 1 文字へ写る次の 4 文字だけを写す
+/// （std のみ・テーブル非依存）: U+212A（KELVIN SIGN。正規等価で `K`）→ `k`、U+017F（LATIN SMALL LETTER LONG S。
+/// 大文字化で `S`）→ `s`、U+0131（LATIN SMALL LETTER DOTLESS I。大文字化で `I`）→ `i`、
+/// U+0130（LATIN CAPITAL LETTER I WITH DOT ABOVE。T 行で `i`）→ `i`。
+/// これ以外の文字は名前空間に入らないのでそのまま返す。
+fn fold_for_alias(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            '\u{212A}' => 'k',
+            '\u{017F}' => 's',
+            '\u{0131}' | '\u{0130}' => 'i',
+            c => c.to_ascii_lowercase(),
+        })
+        .collect()
+}
+
 fn invalid(msg: &'static str) -> TraitError {
     TraitError::new(ErrorCode::InvalidArgument, msg)
 }
@@ -266,6 +321,7 @@ impl RotatingFileSink {
             dir,
             base,
             config,
+            retry: RenameRetry::DEFAULT,
             inner: Mutex::new(Inner {
                 state: State::Failed,
                 rotations: 0,
@@ -351,17 +407,36 @@ impl RotatingFileSink {
     }
 
     /// 現在ログを世代 1 へ送り、古い世代を 1 つずつ後ろへずらす（最古は上書きで消える）。
+    ///
+    /// rename / remove は、Windows の共有違反（[`is_transient_fs_error`]）に限り有界で再試行する。この時点で
+    /// バッファは書き切り済み・ファイルは close 済みなので、再試行はレコードを再書き込みせず重複を生まない。
+    /// 予算（[`RenameRetry`]）は世代数によらず 1 回のローテーション全体で共有する。尽きた場合・一過性でない
+    /// 失敗は `Internal` で返し、呼び出し側は sink を失敗状態にする（fail-closed）。
     fn shift_generations(&self) -> Result<(), TraitError> {
         let fail = || internal("log rotation failed");
+        let mut sleeps_left = self.retry.max_sleeps;
+        let sleep = || std::thread::sleep(self.retry.interval);
         if self.config.generations == 1 {
-            return match fs::remove_file(self.path(0)) {
+            let r = retry_transient(
+                || fs::remove_file(self.path(0)),
+                is_transient_fs_error,
+                &mut sleeps_left,
+                sleep,
+            );
+            return match r {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
                 Err(_) => Err(fail()),
             };
         }
         for i in (0..=self.config.generations - 2).rev() {
-            match fs::rename(self.path(i), self.path(i + 1)) {
+            let r = retry_transient(
+                || fs::rename(self.path(i), self.path(i + 1)),
+                is_transient_fs_error,
+                &mut sleeps_left,
+                sleep,
+            );
+            match r {
                 Ok(()) => {}
                 Err(e) if e.kind() == ErrorKind::NotFound => {}
                 Err(_) => return Err(fail()),
@@ -395,7 +470,7 @@ impl RotatingFileSink {
 
     /// `dir` を列挙し、この sink の名前空間に受理できない名前のエントリが無いことを確認する。
     ///
-    /// 名前空間は `<base>`・`<base>.lock`・`<base>.<10 進数字>`（ASCII の大文字小文字を無視して比較）。
+    /// 名前空間は `<base>`・`<base>.lock`・`<base>.<10 進数字>`（[`fold_for_alias`] で畳み込んで比較）。
     /// 他の ID の名前は `.log` / `.lock` / `<別の base>.<数字>` で終わるので、ここには入らない。
     /// 受理するのは、小文字の正確な綴りの `<base>`・`<base>.lock` と、先頭 0 なしで `1 <= n < generations`
     /// の `<base>.<n>` だけである。世代番号 0・先頭 0 つき・世代数以上の番号・大文字小文字違いの別名は、
@@ -421,7 +496,7 @@ impl RotatingFileSink {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            let lower = name.to_ascii_lowercase();
+            let lower = fold_for_alias(name);
             if lower == self.base || lower == lock_name {
                 if name != lower {
                     return Err(unexpected());
@@ -467,6 +542,40 @@ impl RotatingFileSink {
     }
 }
 
+/// 一過性の失敗なら再試行してよいか。Windows の `ERROR_SHARING_VIOLATION`（32）・`ERROR_LOCK_VIOLATION`（33）
+/// だけを対象にする（他プロセスが削除共有なしで開いている間の rename / remove の失敗）。`ERROR_ACCESS_DENIED`（5）は
+/// ディレクトリ衝突などの恒久的な失敗とも区別できないため含めない。他 OS では常に `false`（挙動は不変）。
+#[cfg(windows)]
+fn is_transient_fs_error(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(32 | 33))
+}
+
+#[cfg(not(windows))]
+fn is_transient_fs_error(_e: &io::Error) -> bool {
+    false
+}
+
+/// `op` を実行し、`is_transient` な失敗に限り、`sleeps_left` が残る間だけ `sleep` を挟んで再試行する。
+///
+/// `sleeps_left` は呼び出し側が持ち回る共有予算（1 回のローテーションの総待ち時間を有界にする。REPAIR-5）。
+/// 予算切れ・一過性でない失敗は、その時点のエラーをそのまま返す。
+fn retry_transient<T>(
+    mut op: impl FnMut() -> io::Result<T>,
+    is_transient: impl Fn(&io::Error) -> bool,
+    sleeps_left: &mut u32,
+    sleep: impl Fn(),
+) -> io::Result<T> {
+    loop {
+        match op() {
+            Err(e) if is_transient(&e) && *sleeps_left > 0 => {
+                *sleeps_left -= 1;
+                sleep();
+            }
+            r => return r,
+        }
+    }
+}
+
 /// ロックファイル名の接尾辞（`<base>.lock`。世代番号は数字のみのため世代ファイルと衝突しない）。
 const LOCK_SUFFIX: &str = ".lock";
 
@@ -489,34 +598,7 @@ fn acquire_lock(dir: &Path, base: &str) -> Result<File, TraitError> {
         Ok(f) => f,
         // 作れなかったときは、既存エントリの種別で分ける（既存がディレクトリのときの create_new の
         // エラー種別は OS で異なるため、種別は lstat で判定する）。
-        Err(_) => {
-            let not_regular = || invalid("log lock path is not a regular file");
-            let before = match fs::symlink_metadata(&path) {
-                Ok(m) if m.file_type().is_file() => m,
-                Ok(_) => return Err(not_regular()),
-                Err(_) => return Err(internal("log lock create failed")),
-            };
-            let file = OpenOptions::new()
-                .read(true)
-                .open(&path)
-                .map_err(|_| internal("log lock open failed"))?;
-            let after = file
-                .metadata()
-                .map_err(|_| internal("log lock open failed"))?;
-            if !after.file_type().is_file() {
-                return Err(not_regular());
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if before.dev() != after.dev() || before.ino() != after.ino() {
-                    return Err(not_regular());
-                }
-            }
-            #[cfg(not(unix))]
-            let _ = before;
-            file
-        }
+        Err(_) => open_existing_regular_read(&path)?,
     };
     match file.try_lock() {
         Ok(()) => Ok(file),
@@ -526,6 +608,111 @@ fn acquire_lock(dir: &Path, base: &str) -> Result<File, TraitError> {
         )),
         Err(std::fs::TryLockError::Error(_)) => Err(internal("log lock failed")),
     }
+}
+
+/// 既存の通常ファイルを、symlink / reparse point を辿らず読み取りで開く（SUP-7・IO-5・WIN-4）。
+///
+/// ロックファイルの再利用（[`acquire_lock`]）と、読み出し側の入口 [`open_for_read`] が共有する。開いた実体が
+/// 検査したものと同じ通常ファイルであることを、開いた後にも確かめる（検査と open の間の差し替え対策）。
+/// unix は lstat と fstat の種別・dev / inode を照合する。Windows は reparse point を辿らずに開き（属性で
+/// 通常ファイルを確認）、同じパスを 2 回開いたハンドルのボリューム・ファイル ID が一致することを照合する
+/// （`FileIdInfo` を持たない FS では取得に失敗し、fail-closed で拒否する）。
+/// 種別違反は `InvalidArgument`、存在しなければ `NotFound`、それ以外は `Internal`（パス・errno を含めない。ERR-1）。
+#[cfg(not(windows))]
+fn open_existing_regular_read(path: &Path) -> Result<File, TraitError> {
+    let not_regular = || invalid("log path is not a regular file");
+    let before = fs::symlink_metadata(path).map_err(map_lstat_error)?;
+    if !before.file_type().is_file() {
+        return Err(not_regular());
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|_| internal("log file open failed"))?;
+    let after = file
+        .metadata()
+        .map_err(|_| internal("log file open failed"))?;
+    if !after.file_type().is_file() {
+        return Err(not_regular());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.dev() != after.dev() || before.ino() != after.ino() {
+            return Err(not_regular());
+        }
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_existing_regular_read(path: &Path) -> Result<File, TraitError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+    /// `FILE_FLAG_OPEN_REPARSE_POINT`: reparse point（symlink・junction）を辿らず、その実体を開く。
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+    let not_regular = || invalid("log path is not a regular file");
+    let is_plain_file = |m: &fs::Metadata| {
+        m.file_type().is_file() && m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    };
+    let open = || -> Result<File, TraitError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .share_mode(READ_SHARE_MODE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|e| match e.kind() {
+                ErrorKind::NotFound => TraitError::new(ErrorCode::NotFound, "log file not found"),
+                _ => internal("log file open failed"),
+            })?;
+        let meta = file
+            .metadata()
+            .map_err(|_| internal("log file open failed"))?;
+        if !is_plain_file(&meta) {
+            return Err(not_regular());
+        }
+        Ok(file)
+    };
+    let before = fs::symlink_metadata(path).map_err(map_lstat_error)?;
+    if !is_plain_file(&before) {
+        return Err(not_regular());
+    }
+    let file = open()?;
+    // 開いている間にパスが別の実体へ差し替えられていないことを、2 本目のハンドルとのファイル ID 照合で確かめる。
+    let again = open()?;
+    let a = crate::sys::file_identity(&file).map_err(|_| internal("log file open failed"))?;
+    let b = crate::sys::file_identity(&again).map_err(|_| internal("log file open failed"))?;
+    if a != b {
+        return Err(not_regular());
+    }
+    Ok(file)
+}
+
+fn map_lstat_error(e: io::Error) -> TraitError {
+    if e.kind() == ErrorKind::NotFound {
+        TraitError::new(ErrorCode::NotFound, "log file not found")
+    } else {
+        internal("log file inspection failed")
+    }
+}
+
+/// Windows の読み取り open の共有モード（`FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`）。
+/// 削除共有を含めることで、読み手が開いたままでも sink の世代 rename が共有違反にならない。
+/// std の `OpenOptions` の既定も同じ値だが、契約として明示する（SUP-7・WIN-4）。
+#[cfg(windows)]
+const READ_SHARE_MODE: u32 = 0x1 | 0x2 | 0x4;
+
+/// `logs` の読み出し側が現在ログ・世代ファイルを読むための正規の入口（SUP-7・IO-5・WIN-4）。
+///
+/// symlink / reparse point を辿らず通常ファイルだけを読み取りで開く。Windows では削除共有つき
+/// （`FILE_SHARE_DELETE`）で開くため、読み手が開いたままでも sink の rename を妨げない。読み出し側が独自に
+/// 削除共有なしで開くと、sink の世代 rename が有界の再試行（[`RenameRetry`]）のあと失敗し、sink は失敗状態に
+/// 固定される。`logs` コマンド本体は未実装（REPAIR-3）で、現状の呼び出し元は無い。
+/// 種別違反は `InvalidArgument`、存在しなければ `NotFound`。
+pub fn open_for_read(path: &Path) -> Result<File, TraitError> {
+    open_existing_regular_read(path)
 }
 
 /// `dir` が実在するディレクトリで、経路上に（信頼できない）symlink を含まず、（unix では）他者書き込み不可で

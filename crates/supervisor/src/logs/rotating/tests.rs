@@ -942,3 +942,231 @@ fn sup7_task164_3_reopen_after_gap_in_generations_has_no_duplication() {
     }
     assert_eq!(all, b"stdout old\nstdout cur\nstdout new\n");
 }
+// ---- TASK-164 追補（#1470）: Windows のログローテーション失敗時の扱いとロック検査 ----
+
+/// IO-5: 畳み込みで ASCII へ写る非 ASCII 文字だけを写し、それ以外はそのまま返す（FS 非依存・全 OS）。
+#[test]
+fn sup7_io5_task164_fold_for_alias_values() {
+    assert_eq!(fold_for_alias("C1.LOG"), "c1.log");
+    assert_eq!(fold_for_alias("c1.lo\u{212A}"), "c1.lok");
+    assert_eq!(fold_for_alias("c1.log.\u{017F}"), "c1.log.s");
+    assert_eq!(fold_for_alias("\u{0131}\u{0130}"), "ii");
+    assert_eq!(fold_for_alias("ログ.txt"), "ログ.txt");
+}
+
+/// IO-5: Unicode の畳み込みで名前空間に入る別名は拒否し、既存ファイルは動かさない。
+#[test]
+fn sup7_io5_task164_open_rejects_unicode_case_fold_aliases() {
+    // ID `c1k` の base `c1k.log` に対し、K を U+212A にした別名・ロック名・世代名の別名。
+    let kid = ContainerId::new("c1k").unwrap();
+    for alias in ["c1\u{212A}.log", "c1k.log.loc\u{212A}", "c1k.log.\u{0131}"] {
+        let t = TmpDir::new("fold");
+        fs::write(t.0.join(alias), b"user").unwrap();
+        fs::write(t.0.join("c1k.log"), b"old\n").unwrap();
+        let r = RotatingFileSink::open(&t.0, &kid, small());
+        // `c1k.log.\u{0131}` は数字ではないので名前空間に入らない（受理される）。他 2 件は拒否される。
+        if alias.ends_with('\u{0131}') {
+            assert!(r.is_ok(), "{alias}");
+            continue;
+        }
+        let e = r.err().unwrap();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument, "{alias}");
+        assert_eq!(fs::read(t.0.join("c1k.log")).unwrap(), b"old\n");
+        assert!(!t.0.join("c1k.log.1").exists());
+    }
+}
+
+/// IO-5: 名前空間に入らない非 ASCII 名は無視され、open は成功する。
+#[test]
+fn sup7_io5_task164_open_ignores_unrelated_non_ascii_names() {
+    let t = TmpDir::new("fold-ok");
+    fs::write(t.0.join("ログ.txt"), b"user").unwrap();
+    let s = RotatingFileSink::open(&t.0, &id(), small()).unwrap();
+    drop(s);
+    assert_eq!(fs::read(t.0.join("ログ.txt")).unwrap(), b"user");
+}
+
+/// SUP-7: 再試行は一過性の失敗だけで、予算内なら成功し、回数は具体値で一致する。
+#[test]
+fn sup7_task164_retry_transient_succeeds_within_budget() {
+    use std::cell::Cell;
+    let calls = Cell::new(0u32);
+    let sleeps = Cell::new(0u32);
+    let mut left = 4;
+    let r = retry_transient(
+        || {
+            calls.set(calls.get() + 1);
+            if calls.get() <= 3 {
+                Err(io::Error::from(ErrorKind::WouldBlock))
+            } else {
+                Ok(7u8)
+            }
+        },
+        |e| e.kind() == ErrorKind::WouldBlock,
+        &mut left,
+        || sleeps.set(sleeps.get() + 1),
+    );
+    assert_eq!(r.unwrap(), 7);
+    assert_eq!((calls.get(), sleeps.get(), left), (4, 3, 1));
+}
+
+/// SUP-7・REPAIR-5: 予算が尽きたら最後のエラーを返し、待ちは予算分だけ。非一過性は即失敗で待たない。
+#[test]
+fn sup7_task164_retry_transient_is_bounded_and_skips_permanent_errors() {
+    use std::cell::Cell;
+    let calls = Cell::new(0u32);
+    let sleeps = Cell::new(0u32);
+    let mut left = 4;
+    let r: io::Result<()> = retry_transient(
+        || {
+            calls.set(calls.get() + 1);
+            Err(io::Error::from(ErrorKind::WouldBlock))
+        },
+        |_| true,
+        &mut left,
+        || sleeps.set(sleeps.get() + 1),
+    );
+    assert_eq!(r.unwrap_err().kind(), ErrorKind::WouldBlock);
+    assert_eq!((calls.get(), sleeps.get(), left), (5, 4, 0));
+
+    let calls = Cell::new(0u32);
+    let sleeps = Cell::new(0u32);
+    let mut left = 4;
+    let r: io::Result<()> = retry_transient(
+        || {
+            calls.set(calls.get() + 1);
+            Err(io::Error::from(ErrorKind::PermissionDenied))
+        },
+        |_| false,
+        &mut left,
+        || sleeps.set(sleeps.get() + 1),
+    );
+    assert_eq!(r.unwrap_err().kind(), ErrorKind::PermissionDenied);
+    assert_eq!((calls.get(), sleeps.get(), left), (1, 0, 4));
+}
+
+/// SUP-7: 総待ち時間（既定の再試行方針）は logs の最小の待ち上限 100ms を十分下回る。
+#[test]
+fn sup7_task164_default_retry_budget_is_under_cancel_settle() {
+    let total = RenameRetry::DEFAULT.interval * RenameRetry::DEFAULT.max_sleeps;
+    assert_eq!(total, Duration::from_millis(40));
+}
+
+/// SUP-7・IO-5: 読み出し入口は通常ファイルを読め、ディレクトリ・不在は拒否する。
+#[test]
+fn sup7_task164_open_for_read_reads_regular_and_rejects_others() {
+    use std::io::Read;
+    let t = TmpDir::new("ofr");
+    fs::write(t.0.join("a.log"), b"hello\n").unwrap();
+    let mut buf = String::new();
+    open_for_read(&t.0.join("a.log"))
+        .unwrap()
+        .read_to_string(&mut buf)
+        .unwrap();
+    assert_eq!(buf, "hello\n");
+    fs::create_dir(t.0.join("d")).unwrap();
+    assert_eq!(
+        open_for_read(&t.0.join("d")).err().unwrap().code(),
+        ErrorCode::InvalidArgument
+    );
+    assert_eq!(
+        open_for_read(&t.0.join("missing")).err().unwrap().code(),
+        ErrorCode::NotFound
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sup7_task164_open_for_read_rejects_symlink_without_reading_target() {
+    let t = TmpDir::new("ofr-link");
+    fs::write(t.0.join("target"), b"secret").unwrap();
+    std::os::unix::fs::symlink(t.0.join("target"), t.0.join("c1.log.1")).unwrap();
+    let e = open_for_read(&t.0.join("c1.log.1")).err().unwrap();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
+}
+
+/// Windows 限定（実行は windows-latest の CI）: 削除共有つきの読み手・削除共有なしの読み手と世代 rename。
+#[cfg(windows)]
+mod windows_share {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::time::Instant;
+
+    /// 現在ログを満たし、次の append でローテーションが起きる状態の sink を作る。
+    fn full_sink(t: &TmpDir) -> RotatingFileSink {
+        let s = RotatingFileSink::open(&t.0, &id(), small()).unwrap();
+        s.append(StreamKind::Stdout, &vec![b'a'; MAX_LINE_BYTES])
+            .unwrap();
+        s.flush().unwrap();
+        s
+    }
+
+    /// 削除共有なし（READ | WRITE のみ）で開く。
+    fn open_without_delete_share(path: &Path) -> File {
+        OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(path)
+            .unwrap()
+    }
+
+    /// SUP-7・WIN-4: `open_for_read`（削除共有つき）で開いたままでもローテーションは成功する。
+    #[test]
+    fn sup7_task164_windows_rotation_succeeds_with_delete_sharing_reader() {
+        let t = TmpDir::new("win-share");
+        let s = full_sink(&t);
+        let _reader = open_for_read(&t.0.join("c1.log")).unwrap();
+        s.append(StreamKind::Stdout, b"next").unwrap();
+        assert_eq!(s.rotations().unwrap(), 1);
+        assert_eq!(files(&t.0), vec!["c1.log", "c1.log.1"]);
+    }
+
+    /// SUP-7・REPAIR-5: 削除共有なしの読み手が居座ると、有界時間で失敗し sink は失敗状態に固定される。
+    #[test]
+    fn sup7_task164_windows_rotation_fails_closed_with_non_sharing_reader() {
+        let t = TmpDir::new("win-noshare");
+        let s = full_sink(&t);
+        let _reader = open_without_delete_share(&t.0.join("c1.log"));
+        let start = Instant::now();
+        let e = s.append(StreamKind::Stdout, b"next").unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Internal);
+        assert!(start.elapsed() < Duration::from_secs(5));
+        let e2 = s.append(StreamKind::Stderr, b"other").unwrap_err();
+        assert_eq!(e2.code(), ErrorCode::Internal);
+    }
+
+    /// SUP-7: 再試行予算の内に読み手が閉じれば、ローテーションは成功する（再書き込みなし）。
+    #[test]
+    fn sup7_task164_windows_rotation_retries_until_reader_closes() {
+        let t = TmpDir::new("win-retry");
+        let mut s = full_sink(&t);
+        // 解放までの時間に余裕を持たせるため、テストでは予算を長くする（50 × 10ms）。
+        s.retry = RenameRetry {
+            interval: Duration::from_millis(10),
+            max_sleeps: 50,
+        };
+        let reader = open_without_delete_share(&t.0.join("c1.log"));
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let h = std::thread::spawn(move || {
+            rx.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+            drop(reader);
+        });
+        tx.send(()).unwrap();
+        s.append(StreamKind::Stdout, b"next").unwrap();
+        h.join().unwrap();
+        assert_eq!(s.rotations().unwrap(), 1);
+        assert_eq!(files(&t.0), vec!["c1.log", "c1.log.1"]);
+    }
+
+    /// WIN-4・SUP-7: 既存ロックファイルありでも open でき、2 回目の open は FailedPrecondition。
+    #[test]
+    fn sup7_task164_windows_existing_lock_file_is_reused_with_identity_check() {
+        let t = TmpDir::new("win-lock");
+        fs::write(t.0.join("c1.log.lock"), b"").unwrap();
+        let s = RotatingFileSink::open(&t.0, &id(), small()).unwrap();
+        let e = RotatingFileSink::open(&t.0, &id(), small()).err().unwrap();
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        drop(s);
+    }
+}

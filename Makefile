@@ -950,6 +950,62 @@ supervisor-independence: ## 監視プロセス 1 個を kill して他の継続�
 		*) echo "error: verification-failed: unexpected exit status $$rc" >&2; exit 1 ;; \
 	esac
 
+# restart レイテンシ実機実測スクリプト（TASK-160・SUP-3。実測・合否判定は #491 で人間が行う）。
+# `restart-latency-selftest` はスタブ launcher だけで照合する自己テスト（CI の bench-regression ジョブでも実行）、
+# `restart-latency` はバックオフ 0 でコンテナを繰り返し SIGKILL して再起動レイテンシの中央値・p95 を JSON 出力する
+# 実機前提ターゲット（make ci には含めない。合否は出さない。スクリプト内で sudo は呼ばない。契約はスクリプト冒頭を参照）。
+# 全体期限 RESTART_LATENCY_TIMEOUT（秒・1〜999999）は未指定ならスクリプトの --print-budget の値を使う
+# （(試行数 + 2) × 各待機の上限 ＋ 試行ごとの余裕 ＋ 後始末 60 秒。既定の 20 試行・warmup 1・待機 30 秒で 813 秒）。
+# 固定値にしないのは、TRIALS・WARMUP・RESTART_LATENCY_WAIT_TIMEOUT を変えたときに正常な計測を途中で打ち切らないため
+# （REPAIR-5）。明示した値が上限より短い場合は警告を出してそのまま使う。
+# timeout は --preserve-status で使い、スクリプトの終了コードを保つ（期限切れの TERM でも後始末失敗の 4 を隠さない）。
+# スクリプトの終了コード 0〜4 はそのまま返す。期限切れ・中断（後始末は完了。129・130・143）と想定外の値は 1、
+# 後始末の完了前に SIGKILL された場合（137。--kill-after 60 秒の超過を含む）は残存を否定できないため 4、
+# 起動不能（125〜127）は 2。
+RESTART_LATENCY_TIMEOUT ?=
+RESTART_LATENCY_SCRIPT ?= scripts/measure-restart-latency.sh
+
+.PHONY: restart-latency-selftest
+restart-latency-selftest: ## restart レイテンシ計測スクリプトの自己テスト（SUP-3・REPAIR-12。スタブ launcher のみ）
+	bash scripts/measure-restart-latency-selftest.sh
+
+.PHONY: restart-latency
+restart-latency: ## バックオフ 0 の restart レイテンシを計測する（実機前提・timeout 付き。LAUNCHER=<絶対パス> BUNDLE=<dir> 必須。[TRIALS= WARMUP= OUTPUT= RESTART_LATENCY_WAIT_TIMEOUT=]。SUP-3）
+	@if [ -z $(call fio_bench_sq,$(LAUNCHER)) ] || [ -z $(call fio_bench_sq,$(BUNDLE)) ]; then \
+		echo "usage: make restart-latency LAUNCHER=<abs-path> BUNDLE=<dir> [TRIALS=<n, default 20>] [WARMUP=<n, default 1>] [OUTPUT=<new file>] [RESTART_LATENCY_WAIT_TIMEOUT=<secs per wait, default 30>] [RESTART_LATENCY_TIMEOUT=<secs for the whole run, default: computed from the above>]" >&2; \
+		exit 2; \
+	fi; \
+	if ! command -v timeout >/dev/null 2>&1; then \
+		echo "error: unsupported-os: timeout (coreutils) is required" >&2; \
+		exit 2; \
+	fi; \
+	set --; \
+	if [ -n $(call fio_bench_sq,$(TRIALS)) ]; then set -- "$$@" --trials $(call fio_bench_sq,$(TRIALS)); fi; \
+	if [ -n $(call fio_bench_sq,$(WARMUP)) ]; then set -- "$$@" --warmup $(call fio_bench_sq,$(WARMUP)); fi; \
+	if [ -n $(call fio_bench_sq,$(RESTART_LATENCY_WAIT_TIMEOUT)) ]; then set -- "$$@" --timeout $(call fio_bench_sq,$(RESTART_LATENCY_WAIT_TIMEOUT)); fi; \
+	budget="$$(bash $(call fio_bench_sq,$(RESTART_LATENCY_SCRIPT)) --print-budget "$$@")" || exit 2; \
+	case "$$budget" in ''|*[!0-9]*|???????*) echo "error: invalid-input: cannot compute the time budget" >&2; exit 2 ;; esac; \
+	t=$(call fio_bench_sq,$(RESTART_LATENCY_TIMEOUT)); \
+	if [ -z "$$t" ]; then t="$$budget"; fi; \
+	case "$$t" in ''|*[!0-9]*|???????*) t=invalid ;; esac; \
+	if [ "$$t" = invalid ] || [ "$$t" -eq 0 ]; then \
+		echo "error: invalid-argument: RESTART_LATENCY_TIMEOUT must be an integer from 1 to 999999 (seconds)" >&2; \
+		exit 2; \
+	fi; \
+	if [ "$$t" -lt "$$budget" ]; then \
+		echo "warning: RESTART_LATENCY_TIMEOUT=$${t}s is shorter than the worst-case duration $${budget}s; a slow but valid run may be cut off" >&2; \
+	fi; \
+	if [ -n $(call fio_bench_sq,$(OUTPUT)) ]; then set -- "$$@" --output $(call fio_bench_sq,$(OUTPUT)); fi; \
+	rc=0; \
+	timeout --preserve-status --kill-after=60 "$$t" bash $(call fio_bench_sq,$(RESTART_LATENCY_SCRIPT)) --launcher $(call fio_bench_sq,$(LAUNCHER)) --bundle $(call fio_bench_sq,$(BUNDLE)) "$$@" || rc=$$?; \
+	case "$$rc" in \
+		0|1|2|3|4) exit "$$rc" ;; \
+		129|130|143) echo "error: timeout: the measurement was stopped by a signal (time limit $${t}s or an interrupt); cleanup completed and no result is published" >&2; exit 1 ;; \
+		137) echo "error: cleanup-failed: the measurement was killed before cleanup finished; processes may remain, inspect and kill them manually" >&2; exit 4 ;; \
+		125|126|127) echo "error: invalid-input: cannot run the measurement under timeout (exit $$rc)" >&2; exit 2 ;; \
+		*) echo "error: measurement-failed: unexpected exit status $$rc" >&2; exit 1 ;; \
+	esac
+
 # --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）
 # --------------------------------------------------

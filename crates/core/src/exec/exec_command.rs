@@ -86,7 +86,7 @@ use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use crate::sys;
 use crate::traits::types::ErrorCode;
 
-use super::process::{EXIT_SETUP_FAILED, exec_child_main, read_exec_status};
+use super::process::{EXIT_SETUP_FAILED, exec_child_main, exec_status_pipe, read_exec_status};
 use super::reapply::ExecReadyParts;
 use super::{
     ChildExit, ContainerChild, ExecCommand, ExecError, ExecExit, ExecReady, IsolationStage,
@@ -103,8 +103,12 @@ pub struct ExecChild {
     child: ContainerChild,
     /// 子が状態を書く pipe の読み取り側。
     status: std::fs::File,
-    /// 判定済みの結果（pipe は 1 回しか読めないため、2 回目以降の待機は記録を返す）。
-    outcome: std::sync::OnceLock<ExecExit>,
+    /// 判定済みの結果（pipe は 1 回しか読めないため、2 回目以降の待機は記録を返す）。pipe の読み取りから
+    /// 記録までをこのロックの下で行い、並行に待つ呼び出しが pipe を取り合わないようにする（一方が `R` を読み、
+    /// 他方が EOF を読んで「起動していない」と記録することがない）。
+    /// 読み取りに失敗した場合も「判定できなかった」ことを記録する（`Some(None)`。部分的に読んだ後の再読み取りは
+    /// EOF になり、起動したコマンドを「起動していない」と誤判定し得るため、読み直さない）。
+    outcome: std::sync::Mutex<Option<Option<ExecExit>>>,
 }
 
 impl ExecChild {
@@ -128,11 +132,26 @@ impl ExecChild {
     }
 
     fn classify(&self, exit: ChildExit) -> Result<ExecExit, ExecError> {
-        if let Some(outcome) = self.outcome.get() {
-            return Ok(*outcome);
-        }
-        let outcome = read_exec_status(&self.status, exit)?;
-        Ok(*self.outcome.get_or_init(|| outcome))
+        // 毒化していても中身は判定の記録だけ（途中状態を持たない）ため、そのまま使う。
+        let mut recorded = self
+            .outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outcome = match *recorded {
+            Some(outcome) => outcome,
+            None => {
+                let outcome = read_exec_status(&self.status, exit);
+                *recorded = Some(outcome.as_ref().ok().copied());
+                Some(outcome?)
+            }
+        };
+        outcome.ok_or_else(|| {
+            ExecError::new(
+                ErrorCode::Internal,
+                IsolationStage::Wait,
+                "the exec status could not be read; cannot tell whether the command started",
+            )
+        })
     }
 }
 
@@ -184,8 +203,7 @@ pub fn spawn_exec_command(ready: ExecReady, command: &ExecCommand) -> Result<Exe
     let own = own_pidfd()?;
     change_dir_to_verified_root(root.as_fd())?;
     // 子が `execve` 前の失敗を知らせる pipe（両端とも close-on-exec。`execveat` が成功すれば書き込み側は閉じる）。
-    let (status_read, status_write) = std::io::pipe()
-        .map_err(|e| ExecError::from_io(&e, IsolationStage::Spawn, "create the status pipe"))?;
+    let (status_read, status_write) = exec_status_pipe()?;
     let pid = sys::fork_single_threaded_with(
         || threads.count() == Some(1),
         || match bind_to_parent_lifetime(own.as_fd()) {
@@ -200,8 +218,8 @@ pub fn spawn_exec_command(ready: ExecReady, command: &ExecCommand) -> Result<Exe
     drop(status_write);
     Ok(ExecChild {
         child: ContainerChild::new(pid),
-        status: std::fs::File::from(OwnedFd::from(status_read)),
-        outcome: std::sync::OnceLock::new(),
+        status: status_read,
+        outcome: std::sync::Mutex::new(None),
     })
 }
 
@@ -410,6 +428,68 @@ mod tests {
         );
         assert_eq!(e.violation, None);
         assert_eq!(take_calls(), vec!["prctl(PR_GET_DUMPABLE)"]);
+    }
+
+    /// 子が `content` を書いて終了した後の状態を模した `ExecChild`（pid は待機に使わない）。
+    fn exec_child_with_status(content: &[u8]) -> (ExecChild, OwnedFd) {
+        let (status, writer) = exec_status_pipe().expect("status pipe");
+        (&std::fs::File::from(writer.try_clone().expect("dup")))
+            .write_all(content)
+            .expect("write status");
+        let child = ExecChild {
+            child: ContainerChild::from_pid_for_test(std::process::id()),
+            status,
+            outcome: std::sync::Mutex::new(None),
+        };
+        (child, writer)
+    }
+
+    /// SUP-6・REPAIR-3・TASK-163 追補（#1460）: 並行に待つ呼び出しが状態の pipe を取り合っても、全員が同じ判定を
+    /// 受け取る（一方が `R` を読み、他方が EOF を読んで「起動していない」と記録することがない）。pipe の両端は
+    /// 標準入出力の番号（0〜2）に置かれない。
+    #[test]
+    fn sup6_task163_concurrent_waiters_share_one_exec_status() {
+        use std::os::fd::AsRawFd as _;
+        let exit = ChildExit::Exited(126);
+        for _ in 0..50 {
+            let (child, writer) = exec_child_with_status(b"R\n");
+            assert!(child.status.as_raw_fd() > 2 && writer.as_raw_fd() > 2);
+            drop(writer);
+            let results: Vec<ExecExit> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|_| scope.spawn(|| child.classify(exit).expect("classified")))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("join"))
+                    .collect()
+            });
+            assert_eq!(results, vec![ExecExit::Command(exit); 8]);
+        }
+    }
+
+    /// SUP-6・REPAIR-5・TASK-163 追補（#1460）: 状態を読めなかった判定は記録され、読み直さない（書き込み側が
+    /// 後から閉じても、EOF を「起動していない」と解釈し直さない）。
+    #[test]
+    fn sup6_task163_unreadable_exec_status_is_not_reinterpreted() {
+        let exit = ChildExit::Exited(0);
+        let (child, writer) = exec_child_with_status(b"");
+        // 書き込み側が開いたまま（データなし）: 待たずに `Internal`。
+        let first = child.classify(exit).expect_err("still open");
+        assert_eq!(
+            first.message,
+            "the exec status pipe is still open after exit"
+        );
+        drop(writer);
+        let second = child.classify(exit).expect_err("recorded as unreadable");
+        assert_eq!(
+            (second.code, second.stage),
+            (ErrorCode::Internal, IsolationStage::Wait)
+        );
+        assert_eq!(
+            second.message,
+            "the exec status could not be read; cannot tell whether the command started"
+        );
     }
 
     /// SUP-6・SEC-1・TASK-163.4: 判定の本体は dumpable のときだけ拒否する。

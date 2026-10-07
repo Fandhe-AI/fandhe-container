@@ -386,9 +386,12 @@ fn prepare_exec_child(
     detach_session()?;
     // 呼び出し元が照合を済ませた `/`（launch は pivot 直後のマウント ID、exec は固定した rootfs との一致。exec の
     // 子の cwd も同じディレクトリ）と、その procfs。ランタイムの同一性の基準・固定した fd の開き直しの起点にする。
+    // どちらも標準入出力の置換まで保持するため、番号を 3 以上へ置く（呼び出し元の fd 0〜2 が閉じていると
+    // `openat` はその番号を返し、置換（`dup2`）した `/dev/null` を、この関数の終わりの close が閉じてしまう）。
     let root = sys::open_dir_path_nofollow(None, c"/")
-        .map_err(|e| ExecError::from_sys(e, STAGE, "openat(/)"))?;
-    let procfs = open_root_procfs(root.as_fd())?;
+        .map_err(|e| ExecError::from_sys(e, STAGE, "openat(/)"))
+        .and_then(keep_above_stdio)?;
+    let procfs = open_root_procfs(root.as_fd()).and_then(keep_above_stdio)?;
     // 検査と実行を同じ fd に固定する（パスを再解決する execve では、検査後に差し替えられうる）。
     let file = open_entrypoint(entry)?;
     let meta = file.metadata().map_err(|e| io_exec_error(&e, entry))?;
@@ -755,9 +758,13 @@ fn open_entrypoint(entry: &Entrypoint) -> Result<std::fs::File, ExecError> {
 
 /// fd が 0〜2 なら 3 以上へ複製して元を閉じる（3 以上ならそのまま返す）。
 ///
+/// 標準入出力の置換（`dup2`）をまたいで保持する fd はすべてこれを通す: エントリポイント・照合済みの `/`・
+/// procfs・状態を返す pipe の両端（置換で潰される、または置換後の `/dev/null` を close で閉じてしまうため）。
+/// 置換より前に閉じる一時的な fd（`/dev`・固定用の `O_PATH`・インタープリタ）は対象外。
+///
 /// 複製は `sys::dup_fd_at_least(fd, 3)`（`F_DUPFD_CLOEXEC` に下限 3 を明示。カーネルが 3 以上を
 /// 保証するため、標準 fd が複数閉じていても 0〜2 には戻らない）。
-fn keep_above_stdio(fd: OwnedFd) -> Result<OwnedFd, ExecError> {
+pub(super) fn keep_above_stdio(fd: OwnedFd) -> Result<OwnedFd, ExecError> {
     use std::os::fd::AsRawFd as _;
     if fd.as_raw_fd() > 2 {
         return Ok(fd);
@@ -882,6 +889,19 @@ fn run_exec_child(
             code
         }
     }
+}
+
+/// 子が状態を返す pipe を作る。戻り値は `(読み取り側, 書き込み側)`（両端とも close-on-exec）。
+///
+/// 両端を 3 以上の番号へ置く: 呼び出しプロセスの fd 0〜2 が閉じていると pipe がその番号を取り、子の標準入出力の
+/// 置換（`dup2`）で書き込み側が `/dev/null` に潰される（状態が親へ届かず、起動したコマンドを「起動していない」と
+/// 判定してしまう）。
+pub(super) fn exec_status_pipe() -> Result<(std::fs::File, OwnedFd), ExecError> {
+    let (reader, writer) = std::io::pipe()
+        .map_err(|e| ExecError::from_io(&e, IsolationStage::Spawn, "create the status pipe"))?;
+    let reader = keep_above_stdio(OwnedFd::from(reader))?;
+    let writer = keep_above_stdio(OwnedFd::from(writer))?;
+    Ok((std::fs::File::from(reader), writer))
 }
 
 /// `status`（pipe の書き込み側）へ `line` を書く。失敗は `Internal`（段 `Exec`）。
@@ -1017,8 +1037,7 @@ pub fn observe_exec_child_setup(
     timeout: Duration,
 ) -> Result<ExecChildSetupObservation, ExecError> {
     let entry = command.entrypoint();
-    let (status_read, status_write) = std::io::pipe()
-        .map_err(|e| ExecError::from_io(&e, IsolationStage::Spawn, "create the status pipe"))?;
+    let (status_read, status_write) = exec_status_pipe()?;
     let pid = sys::fork_single_threaded(
         || {
             run_exec_child(entry, status_write.as_fd(), |entry, _file| {
@@ -1030,7 +1049,7 @@ pub fn observe_exec_child_setup(
     .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
     drop(status_write);
     let exit = ContainerChild::new(pid).wait_timeout(timeout)?;
-    let exit = read_exec_status(&std::fs::File::from(OwnedFd::from(status_read)), exit)?;
+    let exit = read_exec_status(&status_read, exit)?;
     let report = match std::fs::read_to_string(report) {
         Ok(text) => Some(parse_setup_report(&text).ok_or_else(|| {
             ExecError::new(

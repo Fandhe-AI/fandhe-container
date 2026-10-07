@@ -363,7 +363,7 @@ fn read_head(file: &std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
 ///
 /// スクリプトの連鎖を [`MAX_INTERPRETER_DEPTH`] 段まで辿り、各段のインタープリタと、最後に行き着いた ELF の
 /// `PT_INTERP` を照合する。一致は違反 `entrypoint_interpreter_is_runtime_binary`（`PermissionDenied`・段 `Exec`）。
-/// `root` は呼び出し元が照合を済ませた `/`（その `proc` が procfs であることはここで確かめる。開き直しが必要な
+/// `proc_dir` は呼び出し元が本物の procfs と確認したディレクトリ（照合済みの `/` の `proc`。連鎖の先を開き直す
 /// 場合だけ使う）。相対パスのインタープリタは呼び出しプロセスの cwd から解決する。
 pub(super) fn reject_runtime_interpreter(
     file: &std::fs::File,

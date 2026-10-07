@@ -43,7 +43,7 @@ mkdir "$root/bundle"
 # error_line / log_missing / log_short / log_garbage / deep（state.json の pid が孫プロセス）/
 # late_start（SIGTERM 時に環境変数を継承しない新コンテナを起動して state.json へ書く）/
 # late_two（全コンテナが環境変数を継承せず、SIGTERM 時にさらに新コンテナを起動。追跡済み pid も回収されること）/
-# late_session（late_start と同じだが新コンテナが別 session・トークンなし。帰属不明のため kill されないこと）/ dead_new（再起動後の新 pid が既に終了）/
+# late_session（late_start と同じだが新コンテナが別 session・トークンなし。帰属不明のため kill されず、終了コード 4 で結果を公開しないこと）/ dead_new（再起動後の新 pid が既に終了）/
 # decoy（所有トークンを「部分文字列」として含む環境変数を持つ無関係プロセスを起動する。回収で kill されないこと）/
 # log_late（restart ログを state.json 更新より後、最後の 1 行は SIGTERM 時に出す）。
 # ログの elapsed_us は STUB_ELAPSED（空白区切り）を順に使う。STUB_DELAY（秒・空白区切り）は kill 検知後から
@@ -235,13 +235,14 @@ run_case late_start 0 late_start "" --trials 1 --warmup 0 --timeout 10 || true
 # 全コンテナが環境変数を継承しない場合も、追跡した全 pid（再起動後の生存コンテナ）と SIGTERM 時の新コンテナを回収する
 run_case late_two 0 late_two "1000" --trials 1 --warmup 0 --timeout 10 || true
 # SIGTERM 時に別 session・トークンなしで起動された新 pid は本計測への帰属を確認できないため kill しない
-# （起動時刻が launcher 以降というだけでは回収しない。警告を出し、テスト側で後始末する）
+# （起動時刻が launcher 以降というだけでは回収しない。警告を出して終了コード 4・結果は公開しない。テスト側で後始末する）
 mkdir -p "${root}/d-late_session"
 late_rc=0
 STUB_MODE=late_session STUB_ELAPSED="" STUB_DELAY="" STUB_DIR="${root}/d-late_session" STUB_FOREIGN="${root}/foreign.pid" \
   bash "$target" --launcher "${root}/launcher.sh" --bundle "${root}/bundle" --settle-ms 5 --trials 1 --warmup 0 --timeout 10 \
   >"${root}/late_session.out" 2>"${root}/late_session.err" </dev/null || late_rc=$?
-if [ "$late_rc" -eq 0 ]; then pass "late_session: exit 0"; else fail "late_session: exit code ${late_rc}, want 0"; fi
+if [ "$late_rc" -eq 4 ]; then pass "late_session: exit 4"; else fail "late_session: exit code ${late_rc}, want 4"; fi
+if [ ! -s "${root}/late_session.out" ]; then pass "late_session: no result published"; else fail "late_session: result published despite leftover process"; fi
 late_alive=0
 late_pid="$(tail -n 1 "${root}/d-late_session/pids" 2>/dev/null || true)"
 if [ -n "$late_pid" ] && kill -0 "$late_pid" 2>/dev/null; then late_alive=1; fi

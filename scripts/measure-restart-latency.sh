@@ -49,7 +49,7 @@
 #   確認する（SUP-3。state.json だけ残って新プロセスが終了した試行は採用しない）。
 # 後始末: 試行中に観測した全コンテナ pid を起動時刻の同一性で回収し、launcher 停止後に state.json に現れた
 #   別 pid は session（launcher と一致）または所有トークン（環境変数）で帰属を確認できたものだけ回収し、
-#   確認できない pid は kill せず警告だけを出す（起動時刻だけを根拠にしない）。restart ログの副系列は
+#   確認できない pid は kill せず警告を出し、残存として終了コード 4 で結果を公開しない（起動時刻だけを根拠にしない）。restart ログの副系列は
 #   launcher 停止後に集計する（最後の restart ログが状態更新より遅れても欠損にしない）。
 # 安全策: kill の送信先は「state.json の pid」かつ「launcher の子孫」かつ「起動時刻が記録と一致」の
 #   3 条件を満たすものだけ（偽造 state.json・pid 再利用で無関係プロセスを kill しない）。
@@ -210,6 +210,7 @@ reported_err=0
 collect_log=0
 # 試行中に観測したコンテナ側プロセスの「pid → 起動時刻」。後始末で全件を同一性照合のうえ回収する。
 declare -A tracked=()
+declare -A unrelated=()
 cleaned=0
 napfd=""
 out_tmp=""
@@ -377,16 +378,21 @@ do_cleanup() {
   # 起動したコンテナ）は、本計測への帰属を証明できる場合だけ追跡へ加える。帰属の根拠は (1) session が
   # launcher（setsid の leader）と一致する、(2) 環境変数に本実行の所有トークンを持つ、のいずれか。
   # 起動時刻が launcher 以降という条件だけでは本計測の生成物と言えない（無関係な新規 pid の可能性）ため
-  # 根拠にしない。帰属を確認できない pid は kill せず警告ログだけを出す（権限付きシェルでの誤殺防止）。
+  # 根拠にしない。帰属を確認できない pid は kill せず警告ログを出して後始末失敗（rc=4）とする（権限付きシェルでの誤殺防止）。
   if [ -n "$state_file" ] && [ -n "$launcher_pid" ] && read_state && [ -n "$ST_PID" ] \
-    && [ -z "${tracked[$ST_PID]+x}" ] && [ "$ST_PID" != "$$" ] && alive "$ST_PID"; then
+    && [ -z "${tracked[$ST_PID]+x}" ] && [ -z "${unrelated[$ST_PID]+x}" ] && [ "$ST_PID" != "$$" ] && alive "$ST_PID"; then
     if proc_info "$ST_PID"; then
       if [ "$REPLY_SID" = "$launcher_pid" ] \
         || env_owned "$ST_PID"; then
         track_pid "$ST_PID" "$REPLY_START"
       else
+        # 生存したまま残るため後始末失敗（4）として扱い、結果は公開しない（特権操作の後始末。誤殺防止で kill はしない）。
         printf 'warning: pid %s in state.json cannot be attributed to this run; not signaling it\n' "$ST_PID" >&2 || true
+        rc=4
       fi
+    else
+      # 生存しているが帰属を判定できない pid も残存として扱う。
+      rc=4
     fi
   fi
   # launcher 停止後なので restart ログは出尽くしている。副系列はここで集計する（状態更新後にログを出す契約でも欠損にしない）。
@@ -493,7 +499,8 @@ for ((n = 1; n <= total; n++)); do
   old_count="$ST_COUNT"
   alive "$launcher_pid" || fail "launcher exited before trial $n"
   # kill 前の 3 条件: 子孫・起動時刻の記録・直前再照合（無関係プロセスへ送信しない）。
-  is_descendant "$old_pid" || fail "pid in state.json is not a descendant of the launcher; refusing to send a signal"
+  # 子孫でないと判定済みの pid は本計測の生成物でない（偽造・無関係）。後始末で残存扱いにしない。
+  is_descendant "$old_pid" || { unrelated["$old_pid"]=1; fail "pid in state.json is not a descendant of the launcher; refusing to send a signal"; }
   start1="$REPLY_START"
   track_pid "$old_pid" "$start1"
   proc_info "$old_pid" && [ "$REPLY_START" = "$start1" ] || fail "container process changed before the signal"

@@ -4,6 +4,7 @@
 //! PLUG-1 区分は core（plugin 境界〔PLUG-2〕を経由せず実行層コアの一部。crate-naming.md）。
 //!
 //! 現状は状態配線（[`state`]。TASK-157.3）・監視ループ基本（[`run`]。TASK-157.4）・restart の土台（異常終了時の `restart_count` 更新。TASK-157.5）・healthcheck フック（[`health`]。TASK-157.6。コマンド実行は未実装）・logs 捕捉の土台（[`logs`]。TASK-157.7。永続化・ローテーションは SUP-7・TASK-164 で未実装）が実装済みで、終了分類と restart ポリシー評価（[`restart`]。TASK-159.1・#487／TASK-159.2・#488。呼び出し側への配線は未実装）も実装済みで、再 launch・バックオフ・`restart_count` 管理（SUP-3。#489）等は未実装（TASK-1.3・TASK-157.1〔#235〕・REPAIR-1。スタブの明示は REPAIR-3）。
+//! inspect 相当の機械可読出力（[`inspect`]。TASK-168.1・#523・SUP-11）も実装済みで、実 `StateStore` 経由で出力をパースして型・値を照合する結合テスト（`tests/inspect_output.rs`）も併置済み（CLI 配線は未実装）。
 //! cgroup 統計の読み取り・パース（[`stats`]。SUP-10・TASK-167.1・#520）と機械可読形式（JSON Lines）での出力（TASK-167.2・#521）も実装済みで、`stats` の CLI 配線は未実装。
 //! 本体は G12（TASK-157〜171）で、次の分割に沿って実装する。
 //!
@@ -23,10 +24,13 @@
 //! | #1069 | TASK-157.9 | state.json 書き込み排他 |
 //! | #487 | TASK-159.1 | 終了検知・終了コード分類（実装済み） |
 //! | #526 | TASK-169.1 | ulimit の指定モデル（[`container_options`]。適用は core の exec ステージ `Rlimits`。launcher 未結線のため消費者は無い。REPAIR-3） |
+//! | #528 | TASK-169.3 | `--ipc`（host / shareable）の指定モデル（[`container_options::ipc`]。Linux では core の `NamespaceSet` へ反映。他コンテナからの join は未実装。REPAIR-3） |
 //! | #529 | TASK-169.4 | env / env ファイル（[`container_options::env`]。実装済み。secrets / configs 注入は tmpfs 機構〔#527〕のマージ待ちで未実装。REPAIR-3） |
 //! | #488 | TASK-159.2 | restart ポリシー評価（実装済み。配線は #489） |
 //! | #858 | TASK-171.1.2 | 権限昇格の必要最小集合と検証ロジック（[`privilege`]。実装済み。昇格 syscall 経路・setuid・fd 検証付き exec は方式承認待ちで未実装。REPAIR-3） |
 //! | #489 | TASK-159.3 | restart_count 管理・state.json 反映・結合テスト（未実装） |
+//! | #523 | TASK-168.1 | state.json 読み取り・inspect 出力フォーマット（実装済み） |
+//! | #524 | TASK-168.2 | inspect 出力のパース検証結合テスト（#523 で `tests/inspect_output.rs` を先行追加済み。#524 は未クローズ） |
 //!
 //! supervisor から `fandhe-container-core` への一方向依存は導入済み（TASK-157.3・#237）。
 //! `StateStore` は core の既定実装を使い、2 つ目の実装は持たない（決定 6）。
@@ -36,6 +40,7 @@ pub mod container_options;
 pub mod exec;
 pub mod health;
 pub mod healthcheck;
+pub mod inspect;
 pub mod logs;
 pub mod privilege;
 pub mod restart;

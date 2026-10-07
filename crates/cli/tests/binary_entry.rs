@@ -4,6 +4,7 @@
 
 use std::io::Read;
 use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,10 +15,25 @@ const UNIMPLEMENTED_JSON: &str =
 /// 子プロセスの終了を待つ上限（REPAIR-5）。超過時は kill して失敗させる。
 const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// kill 後の回収と、終了後の出力収集を待つ上限（REPAIR-5）。
+const REAP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// パイプを別スレッドで読み、結果をチャネルで返す（待つ側は `recv_timeout` で期限を設ける）。
+fn spawn_reader<R: Read + Send + 'static>(mut pipe: R) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
 /// 実バイナリを起動し、有限期限内に終了と出力収集を完了させる（REPAIR-5）。
 ///
 /// stdout / stderr は別スレッドで読み、パイプ詰まりによるデッドロックを避ける。
-/// 期限超過時は子を kill して回収し、panic で失敗させる。
+/// 回収・出力収集のいずれも期限付きで、期限超過時は読み取りを打ち切って panic で失敗させる
+/// （stdout を継承した子孫が残って EOF が来ない場合も無期限に待たない）。
 fn run(args: &[&str]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_fandhe-container"))
         .args(args)
@@ -26,18 +42,8 @@ fn run(args: &[&str]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("failed to spawn fandhe-container");
-    let mut out_pipe = child.stdout.take().expect("stdout is piped");
-    let mut err_pipe = child.stderr.take().expect("stderr is piped");
-    let out_reader = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = out_pipe.read_to_end(&mut buf);
-        buf
-    });
-    let err_reader = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = err_pipe.read_to_end(&mut buf);
-        buf
-    });
+    let out_rx = spawn_reader(child.stdout.take().expect("stdout is piped"));
+    let err_rx = spawn_reader(child.stderr.take().expect("stderr is piped"));
 
     let deadline = Instant::now() + CHILD_TIMEOUT;
     let status = loop {
@@ -45,19 +51,31 @@ fn run(args: &[&str]) -> Output {
             Some(status) => break status,
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
-                let _ = child.wait();
-                // 子が kill されればパイプは閉じ、読み取りスレッドも終了する。
-                let _ = out_reader.join();
-                let _ = err_reader.join();
+                // kill 後の回収も期限付きでポーリングする。
+                let reap_deadline = Instant::now() + REAP_TIMEOUT;
+                while Instant::now() < reap_deadline {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
                 panic!("fandhe-container did not exit within {CHILD_TIMEOUT:?}");
             }
             None => thread::sleep(Duration::from_millis(10)),
         }
     };
+    let collect_deadline = Instant::now() + REAP_TIMEOUT;
+    let remaining = || collect_deadline.saturating_duration_since(Instant::now());
+    let stdout = out_rx
+        .recv_timeout(remaining())
+        .expect("stdout was not collected within the deadline");
+    let stderr = err_rx
+        .recv_timeout(remaining())
+        .expect("stderr was not collected within the deadline");
     Output {
         status,
-        stdout: out_reader.join().expect("stdout reader panicked"),
-        stderr: err_reader.join().expect("stderr reader panicked"),
+        stdout,
+        stderr,
     }
 }
 

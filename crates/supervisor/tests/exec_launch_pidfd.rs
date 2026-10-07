@@ -67,10 +67,9 @@ mod linux {
     }
 
     fn scenarios(child: &ContainerChild) {
-        let Some(pidfd) = child.pidfd() else {
-            println!("exec_launch_pidfd: pidfd unsupported on this kernel, skipping");
-            return;
-        };
+        let pidfd = child
+            .pidfd()
+            .expect("pidfd は Linux 5.3 以降が前提（pidfd 非対応環境では失敗させる）");
         mismatched_record_pid_is_rejected(child, pidfd);
         matching_record_pid_reaches_nested_pid1_check(child, pidfd);
         run_command_with_inherited_pidfd(child, pidfd);

@@ -39,10 +39,13 @@
 //!   （pivot していない対象・`/` へ別のマウントが重ねられた対象）は違反 `exec_root_not_container_rootfs` で
 //!   拒否し、何も適用しない（SEC-1。根拠は core の `exec/reapply.rs` のモジュール doc）。bundle は
 //!   [`ExecTarget`] が特定時の記録から保持するため、別の記録の `config.json`・rootfs を取り違えない
-//! - **再適用の成功は exec してよい状態を意味しない**: 載るのは `NO_NEW_PRIVS`・Landlock・seccomp だけで、
-//!   capability 削減と rlimit 適用は行わない（`ExecRestrictionReport::unapplied` に列挙され、
-//!   `is_complete()` は `false`）。`setns` は資格情報を変えないため、rootful の exec プロセスは再適用の後も
-//!   全 capability を持つ。#503 は未適用が空になるまで `execve` しないこと（SEC-1）
+//! - **再適用の成功は exec してよい状態を意味しない（完了は型で表す）**: 載るのは `NO_NEW_PRIVS`・Landlock・
+//!   seccomp だけで、capability 削減と rlimit 適用は行わない。`setns` は資格情報を変えないため、rootful の exec
+//!   プロセスは再適用の後も全 capability を持つ。`ExecRestrictionReport` のフィールドは非公開で、crate の外から
+//!   未適用の一覧を書き換えたり値を構築したりできない。exec へ進んでよいことの証跡は core の `ExecReady` で、
+//!   [`require_exec_ready`]（core の `ExecRestrictionReport::into_complete`）だけが作る。未適用が残る間は必ず
+//!   `FailedPrecondition` になり、現在の実装では常に失敗する。**fork / execve の入口（#503 が追加する）は
+//!   `ExecReady` を値で受け取ること**（`ExecRestrictionReport`・真偽値を受け取る入口を作らない。SEC-1）
 //! - 再適用の Landlock ルールは、launcher が実際にマウントした結果ではなく bundle の `config.json` から
 //!   再導出する（launch 時の ruleset は保存されていない）。launch 後に `config.json` が書き換えられると
 //!   追従してしまうが、bundle は supervisor と同じ信頼境界（コンテナから書けない場所）にある前提とする。
@@ -53,13 +56,34 @@
 //!   失敗時は所属が不定のため、呼び出し側は続行せず終了する（fail-closed）。保持 fd は `execve` の前に
 //!   `close_range` で閉じる必要がある（#503）
 //!
+//! # #503（TASK-163.4）が `execve` を結線する前の条件
+//!
+//! 次の 5 点をすべて満たすまで、exec 専用プロセスはコマンドを実行してはならない（SUP-6・SEC-1。詳細は core の
+//! `exec/reapply.rs` のモジュール doc の同名の節）。
+//!
+//! 1. **完了を型で強制する**: fork / execve の入口は `ExecReady` だけを受け取る。本モジュールにも core にも、
+//!    `ExecReady` を作る別経路（テスト用の公開コンストラクタ・feature による抜け道を含む）を足さない
+//! 2. **capability 削減と rlimit 適用を実装し、未適用を空にする**: 実装したものを core の
+//!    `ExecRestrictionReport::UNAPPLIED` から外す。空になって初めて [`require_exec_ready`] が成功する
+//! 3. **制限を exec の対象へ束縛する**: 現在の `ExecRestrictions` は準備時の [`ExecTarget`] を覚えておらず、
+//!    [`reapply_restrictions`] は「[`enter_namespaces`] で参加した対象」と「[`prepare_restrictions`] に渡した
+//!    対象」が同じであることを確かめない。参加後の `/` の照合は rootfs のディレクトリの同一性だけを見るため、
+//!    同じ rootfs を共有する 2 つのコンテナでは取り違えても照合を通過する。対象の mount namespace の識別子を
+//!    準備時に記録して参加後に照合する等で束縛し、`ExecReady` も同じ対象に束縛する
+//! 4. **`setns` を伴う通し試験**: 実コンテナへ参加した後の `/` と rootfs の一致、保持した status fd からの
+//!    スレッド数の読み取り、ルールパスの解決の起点が照合済みの fd であること（プロセスの `/` を引き直して
+//!    いないことを区別できる検査）、pivot していない対象の拒否を具体値で照合する
+//! 5. **exec 専用プロセス全体のタイムアウトと fd の後始末**: 準備から `execve` までの全体に上限時間を設け
+//!    （REPAIR-5）、`execve` の前に `close_range` でホスト側の fd を閉じる
+//!
 //! # 未実装（REPAIR-3）
 //!
 //! namespace 参加・cgroup join・seccomp / Landlock 再適用までで、コマンド実行は未実装。fork・execve・
 //! `close_range` と統合テスト（#503・TASK-163.4）は未実装（SUP-6）。`setns` の後に保持 fd からスレッド数が
 //! 読めることの実機確認（再適用の通し試験）も #503 の統合テストで扱う（#502 のテストは `setns` をしない）。
 //! exec プロセスの capability 削減・rlimit 適用も未実装（TASK-163 の内容は seccomp / Landlock のみ。要確認）。
-//! 未実装である間、[`reapply_restrictions`] の成功結果は未適用の制限を列挙して返す（完了を装わない）。
+//! 未実装である間、[`reapply_restrictions`] の成功結果は未適用の制限を列挙し、[`require_exec_ready`] は
+//! 必ず失敗する（完了を装わない）。
 //! 実 cgroup への参加の実機結合試験も #503 の統合テストで扱う（本 Issue では core の既定集合のユニットテストで
 //! `cgroup.procs` への書き込みと読み戻しを照合）。
 //! user namespace への参加も未実装で、既定の rootless（コンテナが user namespace を持つ）では
@@ -67,9 +91,9 @@
 //! 違反記録（SEC-4）の監査ログへの保存の配線も未実装（#839・#503）。
 
 use fandhe_container_core::exec::{
-    ExecCgroupJoin, ExecCgroupJoinReport, ExecError, ExecRestrictionReport, ExecRestrictions,
-    NamespaceJoinReport, Pid1Target, join_cgroup as core_join_cgroup, join_namespaces,
-    prepare_cgroup_join as core_prepare_cgroup_join,
+    ExecCgroupJoin, ExecCgroupJoinReport, ExecError, ExecReady, ExecRestrictionReport,
+    ExecRestrictions, NamespaceJoinReport, Pid1Target, join_cgroup as core_join_cgroup,
+    join_namespaces, prepare_cgroup_join as core_prepare_cgroup_join,
     prepare_exec_restrictions as core_prepare_exec_restrictions,
     reapply_restrictions as core_reapply_restrictions,
 };
@@ -191,12 +215,21 @@ pub fn prepare_restrictions(target: &ExecTarget) -> Result<ExecRestrictions, Tra
 /// 適用の前に、参加後の `/` が記録したコンテナの rootfs であることを照合し、不一致なら何も適用せず拒否する。
 /// 失敗時は制限が部分的に載った不定状態のため、続行せず終了すること。
 ///
-/// 成功しても capability 削減と rlimit 適用は行われていない。戻り値の `unapplied` が空でない間
-/// （`is_complete()` が `false` の間）は `execve` へ進まないこと（SEC-1）。
+/// 成功しても capability 削減と rlimit 適用は行われていない。`execve` へ進んでよいことの証跡は
+/// [`require_exec_ready`] が返す `ExecReady` だけで、戻り値そのものは exec の許可に使えない（SEC-1）。
 pub fn reapply_restrictions(
     restrictions: ExecRestrictions,
 ) -> Result<ExecRestrictionReport, TraitError> {
     core_reapply_restrictions(restrictions).map_err(from_exec_error)
+}
+
+/// 再適用の結果を、exec へ進んでよいことの証跡 `ExecReady` に変える（SUP-6・SEC-1・#502）。
+///
+/// launch 経路と同じ制限のうち未適用のものが 1 つでも残っていれば `FailedPrecondition`。現在の実装は
+/// capability 削減と rlimit を適用しないため **必ず失敗する**（#503 が実装するまで exec へ進めない）。
+/// #503 の fork / execve の入口は、この関数が返す `ExecReady` を値で受け取ること（契約はモジュール doc）。
+pub fn require_exec_ready(report: ExecRestrictionReport) -> Result<ExecReady, TraitError> {
+    report.into_complete().map_err(from_exec_error)
 }
 
 /// `bundle` の `config.json` を読み、その `root.path` が指す rootfs を固定する。
@@ -333,6 +366,8 @@ mod tests {
             prepare_restrictions;
         let _reapply: fn(ExecRestrictions) -> Result<ExecRestrictionReport, TraitError> =
             reapply_restrictions;
+        // exec の許可は証跡 `ExecReady` だけ（結果そのもの・真偽値では表さない。SEC-1）。
+        let _ready: fn(ExecRestrictionReport) -> Result<ExecReady, TraitError> = require_exec_ready;
     }
 
     /// 祖先に symlink を含まない使い捨ての bundle ディレクトリ（rootfs の固定は symlink を辿らない）。

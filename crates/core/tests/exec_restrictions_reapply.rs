@@ -159,17 +159,28 @@ fn main() {
         assert!(o.reapply_error.is_none(), "{:?}", o.reapply_error);
         let report = o.report.as_ref().expect("report");
         // root（`/`）と `allowed` の 2 ルール。
-        assert_eq!(report.landlock_rules, 2, "{report:?}");
-        assert!(report.seccomp_instructions > 0, "{report:?}");
+        assert_eq!(report.landlock_rules(), 2, "{report:?}");
+        assert!(report.seccomp_instructions() > 0, "{report:?}");
         // SEC-1: 再適用の成功は exec してよい状態を意味しない（capability 削減・rlimit は未適用）。
         assert_eq!(
-            report.unapplied,
+            report.unapplied(),
             &[
-                UnappliedExecRestriction::CapabilityDrop,
-                UnappliedExecRestriction::Rlimits
+                UnappliedExecRestriction::Rlimits,
+                UnappliedExecRestriction::CapabilityDrop
             ]
         );
         assert!(!report.is_complete());
+        // exec へ進むための証跡（`ExecReady`）は作れない。
+        let incomplete = report
+            .clone()
+            .into_complete()
+            .expect_err("not ready to exec");
+        assert_eq!(incomplete.code, ErrorCode::FailedPrecondition);
+        assert_eq!(incomplete.stage, IsolationStage::Exec);
+        assert_eq!(
+            incomplete.message,
+            "exec restrictions are incomplete; not applied: rlimits, capability_drop"
+        );
         assert_eq!(o.seccomp_before, "0");
         assert_eq!(o.seccomp_after, "2");
         assert_eq!(o.no_new_privs_after, "1");

@@ -130,13 +130,13 @@ pub use process::{
     EXIT_EXEC_NOT_FOUND, EXIT_SETUP_FAILED, Entrypoint, SignalDelivery, exec_entrypoint,
     spawn_container, spawn_container_with_stages,
 };
+pub use reapply::{
+    ExecReady, ExecRestrictionReport, ExecRestrictions, UnappliedExecRestriction,
+    prepare_exec_restrictions, reapply_restrictions,
+};
 /// 結合試験 `tests/exec_restrictions_reapply.rs` 専用の再公開（SUP-6・TASK-163.3・#502。通常の利用者は呼ばない。詳細は定義側）。
 #[doc(hidden)]
 pub use reapply::{ExecReapplyObservation, observe_exec_restriction_reapply};
-pub use reapply::{
-    ExecRestrictionReport, ExecRestrictions, UnappliedExecRestriction, prepare_exec_restrictions,
-    reapply_restrictions,
-};
 pub use rootfs::{PivotReport, PreparedRootfs, pivot_root, prepare_rootfs};
 pub use seccomp::SeccompReport;
 /// 結合試験 `tests/escape_suite.rs` の ESC-03 専用の再公開（SEC-2・TASK-42.2・#200。通常の利用者は呼ばない。詳細は定義側）。
@@ -674,12 +674,13 @@ pub(crate) enum ThreadCountSource {
 }
 
 /// `status` 1 回分の読み取り上限（本物は数 KiB。無制限確保を避ける。REPAIR-5 の入力上限方針）。
+/// 超過は切り詰めずに読み取り失敗として扱う（`setns::read_bounded_from`）。
 const STATUS_READ_LIMIT: u64 = 64 * 1024;
 
 impl ThreadCountSource {
     /// 現在のスレッド数。読めない・パースできない場合は `None`（呼び出し側は適用を拒否する）。
     pub(crate) fn count(&mut self) -> Option<u64> {
-        use std::io::{Read as _, Seek as _, SeekFrom};
+        use std::io::{Seek as _, SeekFrom};
         match self {
             ThreadCountSource::ProcSelf => {
                 let status = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -687,13 +688,12 @@ impl ThreadCountSource {
             }
             ThreadCountSource::PreOpened(file) => {
                 // procfs のファイルは read のたびに再生成される。先頭へ戻して読み直す。
+                // 上限を超える内容は切り詰めずに失敗させる（途中で切れた内容から判定しない。fail-closed）。
                 file.seek(SeekFrom::Start(0)).ok()?;
-                let mut buf = Vec::new();
-                std::io::Read::by_ref(file)
-                    .take(STATUS_READ_LIMIT)
-                    .read_to_end(&mut buf)
-                    .ok()?;
-                status_threads(&String::from_utf8_lossy(&buf))
+                let status =
+                    setns::read_bounded_from(std::io::Read::by_ref(file), STATUS_READ_LIMIT)
+                        .ok()?;
+                status_threads(&status)
             }
         }
     }

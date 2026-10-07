@@ -58,13 +58,48 @@
 //!   保存されていない）。Landlock の適用は存在しない・開けないルールパスを拒否するため、config の mount
 //!   destination が稼働中の rootfs に無ければ [`reapply_restrictions`] は失敗し exec は拒否される
 //!   （fail-closed として正しい挙動）。bundle は supervisor と同じ信頼境界（コンテナから書けない）にある前提
-//! - **再適用だけでは exec してよい状態にならない**: 本モジュールが載せるのは `NO_NEW_PRIVS`・Landlock・
-//!   seccomp の 3 つだけで、launch 経路が同じ位置で行う rlimit 適用と capability 削減（`StageKind::ORDER` の
-//!   `Rlimits`・`CapabilityDrop`）は行わない。`setns` は資格情報を変えないため、rootful の exec では成功後も
-//!   全 capability を持つ。[`ExecRestrictionReport::unapplied`] が未適用の制限を列挙し、
-//!   [`ExecRestrictionReport::is_complete`] は未適用が残る間 `false` を返す。呼び出し側（#503）は成功を
-//!   「制限の再適用が完了した」と扱わず、未適用が空になるまで `execve` しないこと
+//! - **再適用だけでは exec してよい状態にならない（完了は型で表す）**: 本モジュールが載せるのは
+//!   `NO_NEW_PRIVS`・Landlock・seccomp の 3 つだけで、launch 経路が同じ位置で行う rlimit 適用と capability 削減
+//!   （`StageKind::ORDER` の `Rlimits`・`CapabilityDrop`）は行わない。`setns` は資格情報を変えないため、rootful の
+//!   exec では成功後も全 capability を持つ。成功結果 [`ExecRestrictionReport`] のフィールドは非公開で、未適用の
+//!   制限は [`ExecRestrictionReport::unapplied`] で読むだけ（crate の外から書き換え・構築できない）。
+//!   「launch 経路と同じ制限がすべて載った」ことの証跡は [`ExecReady`] で、
+//!   [`ExecRestrictionReport::into_complete`] だけが作る（未適用が残る間は必ず `Err`。現在の実装では常に `Err`）。
+//!   **fork / execve の入口（#503 が追加する）は [`ExecReady`] を値で受け取ること**。`ExecRestrictionReport` や
+//!   真偽値を受け取る入口、[`ExecReady`] を経由しない入口を作らない
 //! - エラーメッセージ・`Debug` 出力にホスト側パス・ルール内容を載せない
+//!
+//! # #503（TASK-163.4）が `execve` を結線する前の条件
+//!
+//! 次の 5 点をすべて満たすまで、exec 専用プロセスはコマンドを実行してはならない（SUP-6・SEC-1）。
+//!
+//! 1. **完了を型で強制する**: fork / execve の入口は [`ExecReady`] だけを受け取る（上記）。[`ExecReady`] を
+//!    作る別経路・`Clone`・公開コンストラクタを足さない
+//! 2. **capability 削減と rlimit 適用を実装し、未適用を空にする**: launch 経路と同じ規則（`Rlimits` →
+//!    `CapabilityDrop` → `NoNewPrivs` → Landlock → seccomp の順。capability 削減の後は hard の引き上げが
+//!    できない）で exec プロセスへ適用し、実装したものを [`ExecRestrictionReport::UNAPPLIED`] から外す。
+//!    一覧が空になって初めて [`ExecRestrictionReport::into_complete`] が `Ok` を返す。exec での要否そのものは
+//!    spec（SUP-6）の確認事項で、「適用しない」と決まった場合も一覧から外す変更としてレビューを通す
+//! 3. **制限を exec の対象へ束縛する**: 現在の [`ExecRestrictions`] は「どの対象（`Pid1Target`）のために
+//!    準備したか」を持たず、[`reapply_restrictions`] は参加先を確かめない。参加後の `/` の照合は rootfs の
+//!    ディレクトリの同一性だけを見るため、**同じ rootfs を共有する 2 つのコンテナ**では、コンテナ A 用に
+//!    準備した制限をコンテナ B へ参加したプロセスに適用しても照合を通過する（config の異なるルールが載る）。
+//!    準備時に対象の mount namespace の識別子（nsfs の `st_dev`・`st_ino`）を記録し、参加後の自プロセスの
+//!    mount namespace と一致することを適用前に確かめる等で束縛する。[`ExecReady`] も同じ対象に束縛し、
+//!    別の対象向けの証跡で実行できないようにする
+//! 4. **`setns` を伴う通し試験**: 実コンテナ（pivot 済み）へ参加した後に、(a) `/` が固定した rootfs と一致して
+//!    照合を通ること、(b) 保持した status fd からスレッド数を読めること、(c) ルールパスの解決の起点が
+//!    **照合済みの fd** であること（呼び出しプロセスの `/` を引き直していないことを区別できる検査。例:
+//!    照合の後に起点とプロセスの `/` が食い違う状況を作り、ルールが照合済みの側に付くことを確かめる）、
+//!    (d) pivot していない対象・`/` へマウントを重ねた対象が拒否されること、を具体値で照合する
+//! 5. **exec 専用プロセス全体のタイムアウトと fd の後始末**: 準備から `execve` までの全体に上限時間を設け
+//!    （REPAIR-5。pid1 の停止・procfs の応答待ちでハングしない）、`execve` の前に `close_range` でホスト側の
+//!    fd（cgroup・state・ログ・固定した rootfs 等）を閉じる
+//!
+//! このほか #503 で扱う既知の点: 準備時の pid との照合は best-effort で、`setns` で PID namespace に参加した
+//! 後に fork した子の pid は数値が衝突し得る（「適用 → fork → execve」の順を守り、子で適用しない）。参加後の
+//! cwd は `setns` が root と同じ場所へ付け替えるが検証していない（コマンドの cwd は `execve` の前に明示的に
+//! 設定する）。
 //!
 //! # 未実装（REPAIR-3）
 //!
@@ -83,7 +118,9 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
 use super::landlock::{LandlockAccessProbe, landlock_ruleset_from_config, run_probe};
-use super::{ExecError, IsolationStage, ThreadCountSource, ViolationReason, no_new_privs};
+use super::{
+    ExecError, IsolationStage, StageKind, ThreadCountSource, ViolationReason, no_new_privs,
+};
 use crate::landlock::LandlockRuleset;
 use crate::oci_runtime::{OciConfig, RootfsDir};
 use crate::sys;
@@ -125,41 +162,139 @@ impl std::fmt::Debug for ExecRestrictions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum UnappliedExecRestriction {
+    /// rlimit 適用（launch 経路の `StageKind::Rlimits`。SUP-12）。
+    Rlimits,
     /// capability 削減（launch 経路の `StageKind::CapabilityDrop`。SEC-1）。`setns` は資格情報を変えないため、
     /// rootful の exec プロセスは再適用の後も全 capability を持つ。
     CapabilityDrop,
-    /// rlimit 適用（launch 経路の `StageKind::Rlimits`。SUP-12）。
-    Rlimits,
+}
+
+impl UnappliedExecRestriction {
+    /// 機械可読な名前（エラーメッセージ・ログ用）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rlimits => "rlimits",
+            Self::CapabilityDrop => "capability_drop",
+        }
+    }
+
+    /// launch 経路でこの制限を適用する段。
+    pub fn launch_stage(self) -> StageKind {
+        match self {
+            Self::Rlimits => StageKind::Rlimits,
+            Self::CapabilityDrop => StageKind::CapabilityDrop,
+        }
+    }
 }
 
 /// [`reapply_restrictions`] の成功結果（将来拡張できる構造。制限適用の証跡ではない。REPAIR-3）。
 ///
 /// 成功は「`NO_NEW_PRIVS`・Landlock・seccomp を載せた」ことだけを表す。**exec してよい状態になったことは
-/// 表さない**: [`unapplied`](Self::unapplied) に未適用の制限が残る間（[`is_complete`](Self::is_complete) が
-/// `false` の間）は、呼び出し側は `execve` へ進まないこと。
+/// 表さない**。exec してよいことの証跡は [`ExecReady`] で、[`into_complete`](Self::into_complete) だけが作る。
+///
+/// フィールドは非公開で、crate の外からは構築も書き換えもできない（未適用の一覧を空に書き換えて完了を
+/// 装えない。SEC-1）。読み取りは getter で行う。
+///
+/// ```
+/// # #[cfg(target_os = "linux")]
+/// fn inspect(report: &fandhe_container_core::exec::ExecRestrictionReport) -> bool {
+///     report.unapplied().is_empty() && report.is_complete()
+/// }
+/// ```
+///
+/// 未適用の一覧は書き換えられない（非公開フィールド）:
+///
+/// ```compile_fail,E0616
+/// fn tamper(mut report: fandhe_container_core::exec::ExecRestrictionReport) {
+///     report.unapplied = &[];
+/// }
+/// ```
+///
+/// crate の外では構築できない:
+///
+/// ```compile_fail,E0451
+/// let _ = fandhe_container_core::exec::ExecRestrictionReport {
+///     landlock_rules: 0,
+///     seccomp_instructions: 0,
+///     unapplied: &[],
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-#[must_use = "a successful reapply does not make the process ready to exec; check `unapplied`"]
+#[must_use = "a successful reapply does not make the process ready to exec; call `into_complete`"]
 pub struct ExecRestrictionReport {
-    /// 追加した Landlock ルール数。
-    pub landlock_rules: usize,
-    /// 適用した seccomp の BPF 命令数。
-    pub seccomp_instructions: usize,
-    /// launch 経路は適用するが、この再適用では適用していない制限（[`ExecRestrictionReport::UNAPPLIED`]）。
-    pub unapplied: &'static [UnappliedExecRestriction],
+    landlock_rules: usize,
+    seccomp_instructions: usize,
+    unapplied: &'static [UnappliedExecRestriction],
 }
 
 impl ExecRestrictionReport {
-    /// 現在の実装が適用しない制限の一覧（唯一の定義元）。
+    /// 現在の実装が適用しない制限の一覧（唯一の定義元。launch 経路の段の順）。
     pub const UNAPPLIED: &'static [UnappliedExecRestriction] = &[
-        UnappliedExecRestriction::CapabilityDrop,
         UnappliedExecRestriction::Rlimits,
+        UnappliedExecRestriction::CapabilityDrop,
     ];
 
+    /// 追加した Landlock ルール数。
+    pub fn landlock_rules(&self) -> usize {
+        self.landlock_rules
+    }
+
+    /// 適用した seccomp の BPF 命令数。
+    pub fn seccomp_instructions(&self) -> usize {
+        self.seccomp_instructions
+    }
+
+    /// launch 経路は適用するが、この再適用では適用していない制限（[`ExecRestrictionReport::UNAPPLIED`]）。
+    pub fn unapplied(&self) -> &'static [UnappliedExecRestriction] {
+        self.unapplied
+    }
+
     /// launch 経路と同じ制限がすべて載ったか（未適用が残る間は `false`。現在の実装では常に `false`）。
+    /// 判定を見るだけの補助で、exec の許可には [`into_complete`](Self::into_complete) の証跡を使うこと。
     pub fn is_complete(&self) -> bool {
         self.unapplied.is_empty()
     }
+
+    /// 未適用の制限が無ければ、exec へ進んでよいことの証跡 [`ExecReady`] に変える（SEC-1）。
+    ///
+    /// 未適用が 1 つでも残っていれば `FailedPrecondition`（段 `Exec`。メッセージに未適用の名前を並べる）。
+    /// 現在の実装は capability 削減と rlimit を適用しないため、**必ず `Err` を返す**（#503 が両者を実装して
+    /// [`Self::UNAPPLIED`] を空にするまで、exec の入口へ渡せる値は作れない）。
+    pub fn into_complete(self) -> Result<ExecReady, ExecError> {
+        if self.unapplied.is_empty() {
+            return Ok(ExecReady { _sealed: () });
+        }
+        let names: Vec<&str> = self.unapplied.iter().map(|u| u.as_str()).collect();
+        Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::Exec,
+            format!(
+                "exec restrictions are incomplete; not applied: {}",
+                names.join(", ")
+            ),
+        ))
+    }
+}
+
+/// 「launch 経路と同じ制限がすべて exec プロセスへ載った」ことの証跡（SUP-6・SEC-1）。
+///
+/// [`ExecRestrictionReport::into_complete`] だけが作る。フィールドは非公開で、公開コンストラクタ・`Clone`・
+/// `Default` を持たないため、crate の外では構築も複製もできない。
+///
+/// # 契約（#503・TASK-163.4）
+///
+/// exec 専用プロセスの fork / execve の入口は、この型を **値で** 受け取ること（消費して二重実行を防ぐ）。
+/// `ExecRestrictionReport`・真偽値・`is_complete()` の結果を受け取る入口や、この型を経由しない入口を作らない。
+/// この型を作る別経路（テスト用を含む公開コンストラクタ・feature による抜け道）を足さない。対象（どの
+/// コンテナへの exec か）への束縛は未実装で、#503 の条件（モジュール doc）に含まれる。
+///
+/// ```compile_fail,E0451
+/// let _ = fandhe_container_core::exec::ExecReady { _sealed: () };
+/// ```
+#[derive(Debug)]
+#[must_use = "ExecReady is the only evidence that permits exec; pass it to the exec entry point"]
+pub struct ExecReady {
+    _sealed: (),
 }
 
 /// `config`（コンテナの `config.json`）から Landlock ruleset を作り、参加後の `/` と照合する rootfs と
@@ -265,7 +400,7 @@ fn open_verified_root(rootfs: BorrowedFd<'_>) -> Result<OwnedFd, ExecError> {
 /// 最初の失敗で打ち切る。失敗後の制限は部分的に載った不定状態のため、呼び出し側は続行せず終了すること。
 ///
 /// 成功しても capability 削減と rlimit 適用は行われていない（[`ExecRestrictionReport::unapplied`]）。
-/// 戻り値を確認せずに `execve` へ進まないこと。
+/// `execve` へ進んでよいことの証跡は [`ExecRestrictionReport::into_complete`] が返す [`ExecReady`] だけ。
 pub fn reapply_restrictions(
     restrictions: ExecRestrictions,
 ) -> Result<ExecRestrictionReport, ExecError> {
@@ -462,13 +597,110 @@ mod tests {
                 landlock_rules: 0,
                 seccomp_instructions: 0,
                 unapplied: &[
-                    UnappliedExecRestriction::CapabilityDrop,
                     UnappliedExecRestriction::Rlimits,
+                    UnappliedExecRestriction::CapabilityDrop,
                 ],
             }
         );
         // SEC-1: 再適用の成功は「exec してよい」を意味しない（capability 削減・rlimit が未適用）。
+        assert_eq!(report.landlock_rules(), 0);
+        assert_eq!(report.seccomp_instructions(), 0);
+        assert_eq!(report.unapplied(), ExecRestrictionReport::UNAPPLIED);
         assert!(!report.is_complete());
+        let e = report
+            .into_complete()
+            .expect_err("must not be ready to exec");
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.stage, IsolationStage::Exec);
+        assert_eq!(
+            e.message,
+            "exec restrictions are incomplete; not applied: rlimits, capability_drop"
+        );
+        assert!(e.violation.is_none());
+    }
+
+    /// SUP-6・SEC-1・TASK-163.3: `ExecReady` は未適用が空のときだけ作れる（空の一覧は crate 内でしか
+    /// 組み立てられない。外部 crate から構築・書き換えできないことは型の doc の `compile_fail` で照合する）。
+    /// 未適用が 1 つでも残れば `Err` で、名前を launch 経路の段の順に並べる。
+    #[test]
+    fn sup6_task163_3_exec_ready_requires_empty_unapplied() {
+        let report = |unapplied: &'static [UnappliedExecRestriction]| ExecRestrictionReport {
+            landlock_rules: 1,
+            seccomp_instructions: 2,
+            unapplied,
+        };
+        assert!(report(&[]).is_complete());
+        assert!(report(&[]).into_complete().is_ok());
+        for (unapplied, message) in [
+            (
+                &[UnappliedExecRestriction::Rlimits][..],
+                "exec restrictions are incomplete; not applied: rlimits",
+            ),
+            (
+                &[UnappliedExecRestriction::CapabilityDrop][..],
+                "exec restrictions are incomplete; not applied: capability_drop",
+            ),
+        ] {
+            assert!(!report(unapplied).is_complete());
+            let e = report(unapplied).into_complete().expect_err("incomplete");
+            assert_eq!(e.code, ErrorCode::FailedPrecondition);
+            assert_eq!(e.message, message);
+        }
+        // 現在の実装が返す一覧は空でない（#503 が capability 削減・rlimit を実装するまで exec へ進めない）。
+        assert!(
+            report(ExecRestrictionReport::UNAPPLIED)
+                .into_complete()
+                .is_err()
+        );
+    }
+
+    /// SUP-6・SEC-1・TASK-163.3: 未適用の一覧は、launch 経路の段（`StageKind::ORDER`）から「exec 経路で
+    /// 適用済みのもの」（cgroup 参加は `join_cgroup`、`NoNewPrivs`・`Landlock`・`Seccomp` は本モジュール）を
+    /// 除いた残りと、順序を含めて一致する。launch 経路に段が増えたのに exec 側で適用も列挙もしていない
+    /// 状態（黙って弱い制限で動く）を、このテストの失敗として検出する。
+    #[test]
+    fn sup6_task163_3_unapplied_matches_launch_stages_not_reapplied() {
+        const APPLIED_ON_EXEC: [StageKind; 4] = [
+            StageKind::CgroupJoin,
+            StageKind::NoNewPrivs,
+            StageKind::Landlock,
+            StageKind::Seccomp,
+        ];
+        let remaining: Vec<StageKind> = StageKind::ORDER
+            .into_iter()
+            .filter(|s| !APPLIED_ON_EXEC.contains(s))
+            .collect();
+        let unapplied: Vec<StageKind> = ExecRestrictionReport::UNAPPLIED
+            .iter()
+            .map(|u| u.launch_stage())
+            .collect();
+        assert_eq!(unapplied, remaining);
+        assert_eq!(
+            unapplied,
+            vec![StageKind::Rlimits, StageKind::CapabilityDrop]
+        );
+        let names: Vec<&str> = ExecRestrictionReport::UNAPPLIED
+            .iter()
+            .map(|u| u.as_str())
+            .collect();
+        assert_eq!(names, vec!["rlimits", "capability_drop"]);
+    }
+
+    /// SUP-6・TASK-163.3・REPAIR-5: 事前に開いた status が読み取り上限を超える場合は、切り詰めて解釈せず
+    /// `None`（適用は拒否される）。先頭に `Threads: 1` があっても採用しない。上限ちょうどは読める。
+    #[test]
+    fn sup6_task163_3_pre_opened_source_rejects_oversized_status() {
+        let limit = usize::try_from(crate::exec::STATUS_READ_LIMIT).expect("limit fits");
+        let head = b"Threads:\t1\n";
+        let mut exact = head.to_vec();
+        exact.resize(limit, b'\n');
+        let mut over = exact.clone();
+        over.push(b'\n');
+        assert_eq!(
+            ThreadCountSource::PreOpened(tmp_file(&exact)).count(),
+            Some(1)
+        );
+        assert_eq!(ThreadCountSource::PreOpened(tmp_file(&over)).count(), None);
     }
 
     /// SUP-6・SEC-1・SEC-4・TASK-163.3: 参加後の `/` が準備時に固定した rootfs と別のディレクトリなら、

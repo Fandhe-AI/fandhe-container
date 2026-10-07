@@ -397,7 +397,7 @@ fn read_bounded(path: &str) -> std::io::Result<String> {
 
 /// `limit` バイトまでのテキストを読む。`limit` を超える内容は切り詰めずに `InvalidData` で失敗させる
 /// （途中で切れた行が照合に使われることを防ぐ。無制限確保もしない）。
-fn read_bounded_from(reader: impl Read, limit: u64) -> std::io::Result<String> {
+pub(super) fn read_bounded_from(reader: impl Read, limit: u64) -> std::io::Result<String> {
     let mut buf = String::new();
     reader
         .take(limit.saturating_add(1))

@@ -2,6 +2,7 @@
 //! 公開 API のみを外部 crate 視点で使い、文字列から core の仕様型（mount data まで）への変換を具体値で確認する。
 //! OS 非依存のため 3 OS で実行する。
 
+use fandhe_container_core::traits::ErrorCode;
 use fandhe_container_supervisor::container_options::{MountOptions, ShmSize, TmpfsOption};
 
 /// SUP-12: `--shm-size 64m --tmpfs /run:rw,noexec,nosuid,size=65536k` が指定どおりの mount data になる。
@@ -42,10 +43,15 @@ fn sup12_shm_size_and_tmpfs_become_exact_mount_specs() {
 /// SUP-12: 分離を弱める指定（suid・dev）と予約先（/proc）は拒否される。
 #[test]
 fn sup12_unsafe_tmpfs_requests_are_rejected() {
-    assert!(TmpfsOption::parse("/x:suid").is_err());
-    assert!(TmpfsOption::parse("/x:dev").is_err());
+    for weakening in ["/x:suid", "/x:dev"] {
+        let e = TmpfsOption::parse(weakening).expect_err(weakening);
+        assert_eq!(e.code(), ErrorCode::InvalidArgument, "{weakening}");
+        assert_eq!(e.message(), "unsupported tmpfs option", "{weakening}");
+    }
     let opts = MountOptions::default()
         .with_tmpfs(TmpfsOption::parse("/proc/sys").expect("parse"))
         .expect("add tmpfs");
-    assert!(opts.to_tmpfs_set().is_err());
+    let e = opts.to_tmpfs_set().expect_err("reserved destination");
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    assert_eq!(e.message(), "tmpfs must not be mounted on /proc or below");
 }

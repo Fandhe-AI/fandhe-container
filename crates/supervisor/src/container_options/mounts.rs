@@ -105,12 +105,12 @@ impl TmpfsOption {
         if rest.is_empty() {
             return Ok(Self(spec));
         }
-        let items: Vec<&str> = rest.split(',').collect();
-        if items.len() > MAX_OPTION_ITEMS {
+        // 件数は確保せずに数えてから、同じ分割を走査する。
+        if rest.split(',').count() > MAX_OPTION_ITEMS {
             return Err(invalid("too many tmpfs options"));
         }
         let (mut size_seen, mut mode_seen) = (false, false);
-        for item in items {
+        for item in rest.split(',') {
             match item {
                 "rw" => spec.read_only = false,
                 "ro" => spec.read_only = true,
@@ -258,11 +258,22 @@ mod tests {
         assert_eq!(s.destination.as_str(), "/run");
         assert_eq!(s.size.map(|x| x.bytes()), Some(67_108_864));
         assert_eq!(s.mode.bits(), 0o755);
-        assert!(!s.read_only && s.exec);
+        assert_eq!((s.read_only, s.exec), (false, true));
         assert_eq!(s.data_string(), "mode=755,size=67108864");
         let d = TmpfsOption::parse("/tmp").expect("default");
-        assert!(!d.spec().exec && !d.spec().read_only && d.spec().size.is_none());
-        assert!(TmpfsOption::parse("/ro:ro").expect("ro").spec().read_only);
+        assert_eq!(
+            (d.spec().exec, d.spec().read_only, d.spec().size),
+            (false, false, None)
+        );
+        assert_eq!(
+            TmpfsOption::parse("/ro:ro")
+                .expect("ro")
+                .spec()
+                .data_string(),
+            "mode=1777"
+        );
+        let ro = TmpfsOption::parse("/ro:ro").expect("ro");
+        assert_eq!((ro.spec().read_only, ro.spec().exec), (true, false));
         assert_eq!(
             TmpfsOption::parse("/x:")
                 .expect("empty rest")
@@ -273,49 +284,65 @@ mod tests {
         );
     }
 
-    /// SUP-12・TASK-169.2: 未知・危険なオプションと不正な先の拒否。
+    /// SUP-12・TASK-169.2: 未知・危険なオプションと不正な先の拒否（message まで具体値で照合）。
     #[test]
     fn sup12_task169_2_tmpfs_rejects() {
         let many = format!("/x:{}", vec!["rw"; MAX_OPTION_ITEMS + 1].join(","));
         let long = format!("/{}", "a".repeat(MAX_OPTION_BYTES));
-        for bad in [
-            "/x:suid",
-            "/x:dev",
-            "/x:bogus",
-            "/x:uid=1000",
-            "/x:size=1m,size=2m",
-            "/x:mode=1777,mode=755",
-            "/x:mode=9",
-            "/x:mode=+777",
-            "/x:mode=",
-            "/x:mode=17777",
-            "/x:size=0",
-            "/x:size=50%",
-            "/x:rw,,ro",
-            "/a/../b",
-            "/",
-            "",
-            many.as_str(),
-            long.as_str(),
+        let deep = "/d".repeat(33);
+        let unsupported = "unsupported tmpfs option";
+        let octal = "tmpfs mode must be an octal number";
+        let destination = "invalid tmpfs mount destination";
+        for (bad, message) in [
+            ("/x:suid", unsupported),
+            ("/x:dev", unsupported),
+            ("/x:bogus", unsupported),
+            ("/x:uid=1000", unsupported),
+            ("/x:rw,,ro", unsupported),
+            ("/x:size=1m,size=2m", "duplicate tmpfs option: size"),
+            ("/x:mode=1777,mode=755", "duplicate tmpfs option: mode"),
+            ("/x:mode=9", octal),
+            ("/x:mode=+777", octal),
+            ("/x:mode=", octal),
+            ("/x:mode=17777", "tmpfs mode must not exceed 07777"),
+            ("/x:size=0", "tmpfs size must be greater than zero"),
+            ("/x:size=50%", "size has an unsupported unit"),
+            ("/a/../b", destination),
+            ("/", destination),
+            ("", destination),
+            (deep.as_str(), "tmpfs mount destination is too deep"),
+            (many.as_str(), "too many tmpfs options"),
+            (long.as_str(), "tmpfs option is too long"),
         ] {
             let e = TmpfsOption::parse(bad).expect_err(bad);
             assert_eq!(e.code(), ErrorCode::InvalidArgument, "{bad}");
+            assert_eq!(e.message(), message, "{bad}");
         }
+        // 上限ちょうど（64 個）は受理する。
+        let at_limit = format!("/x:{}", vec!["rw"; MAX_OPTION_ITEMS].join(","));
+        assert_eq!(
+            TmpfsOption::parse(&at_limit)
+                .expect("64 options")
+                .spec()
+                .destination
+                .as_str(),
+            "/x"
+        );
     }
 
     /// SUP-12・TASK-169.2: 過長なサイズ文字列は確保前に拒否する。
     #[test]
     fn sup12_task169_2_size_text_too_long_rejected() {
         let long = "1".repeat(MAX_SIZE_TEXT_BYTES + 1);
-        let e = ShmSize::parse(&long).expect_err("long shm-size");
-        assert_eq!(e.code(), ErrorCode::InvalidArgument);
-        let e = TmpfsOption::parse(&format!("/x:size={long}")).expect_err("long size=");
-        assert_eq!(e.code(), ErrorCode::InvalidArgument);
         let huge = "9".repeat(1_000_000);
-        assert_eq!(
-            ShmSize::parse(&huge).expect_err("huge").code(),
-            ErrorCode::InvalidArgument
-        );
+        for e in [
+            ShmSize::parse(&long).expect_err("long shm-size"),
+            TmpfsOption::parse(&format!("/x:size={long}")).expect_err("long size="),
+            ShmSize::parse(&huge).expect_err("huge"),
+        ] {
+            assert_eq!(e.code(), ErrorCode::InvalidArgument);
+            assert_eq!(e.message(), "size is too long");
+        }
         assert_eq!(ShmSize::parse("64m").expect("ok").bytes(), 67_108_864);
     }
 
@@ -348,7 +375,9 @@ mod tests {
         let reserved = MountOptions::default()
             .with_tmpfs(TmpfsOption::parse("/proc").expect("proc"))
             .expect("add");
-        assert!(reserved.to_tmpfs_set().is_err());
+        let e = reserved.to_tmpfs_set().expect_err("reserved");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "tmpfs must not be mounted on /proc or below");
     }
 
     /// SUP-12・TASK-169.2: `--tmpfs` は上限（64 件）までしか保持せず、65 件目は追加時に拒否する。

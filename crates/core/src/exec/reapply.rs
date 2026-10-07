@@ -29,6 +29,12 @@
 //!   部分的に載った不定状態のため、呼び出し側は続行せず終了する（巻き戻し不可。`join_cgroup` と同じ）
 //! - **fail-closed**: Landlock 未対応カーネル・ルール生成失敗は準備段階で `stage = Landlock` として拒否し、
 //!   Landlock 無しで続行する経路を作らない（CORE-5）。値を消費するため二重適用・fd の残留を型で防ぐ
+//! - **ルールパスは `setns` の後に解決される**: 準備段階の ruleset が持つのは config の mount destination
+//!   （コンテナ内パス。`RulePath`）の正規化済み文字列だけで、準備ではファイルを一切開かない・ホスト側パスへ
+//!   解決しない（fd の事前保持もしない）。パスを開く `O_PATH` fd（`landlock_add_rule` 用）は
+//!   [`reapply_restrictions`] の中（`join_namespaces` 後 = 参加先 mount namespace のルート `/` 起点・
+//!   `O_NOFOLLOW` の 1 要素ずつ）で開かれるため、準備時に固定されたホスト側の対象を指すことはない。
+//!   準備時に fd を保持する方式は `setns` 前のホスト mount namespace を指してしまうため採らない
 //! - ルールは launcher が実際にマウントした結果ではなく `config.json` から再導出する（launch 時の ruleset は
 //!   保存されていない）。Landlock の適用は存在しない・開けないルールパスを拒否するため、config の mount
 //!   destination が稼働中の rootfs に無ければ [`reapply_restrictions`] は失敗し exec は拒否される
@@ -371,6 +377,33 @@ mod tests {
                 assert_eq!(r.owner_pid, std::process::id());
                 let n = r.threads.count().expect("threads readable");
                 assert!(n >= 1, "{n}");
+            }
+            // Landlock 未対応のカーネルでは検出で拒否される（fail-closed）。
+            Err(e) => assert_eq!(e.stage, IsolationStage::Landlock),
+        }
+    }
+
+    /// SUP-6・TASK-163.3・CORE-5: 準備はルールパスを開かず解決もしない。実在しないパスを destination に
+    /// 持つ config でも準備は成功し、ruleset はコンテナ内パスの文字列をそのまま保持する
+    /// （開く処理は `setns` 後の `reapply_restrictions` 側。fail-closed の拒否もそこで起きる）。
+    #[test]
+    fn sup6_task163_3_prepare_keeps_container_paths_unresolved() {
+        let dest = "/fandhe-nonexistent-reapply-dest/data";
+        let c = config(
+            true,
+            &format!(r#"[{{"destination":"{dest}","options":["ro"]}}]"#),
+        );
+        match prepare_exec_restrictions(&c) {
+            Ok(r) => {
+                let paths: Vec<&str> = r
+                    .landlock
+                    .rules()
+                    .iter()
+                    .map(|rule| rule.path.as_str())
+                    .collect();
+                assert_eq!(paths, vec!["/", dest]);
+                // 準備（`join_namespaces` 前）でホストへ解決されていないこと: destination は実在しない。
+                assert!(!std::path::Path::new(dest).exists());
             }
             // Landlock 未対応のカーネルでは検出で拒否される（fail-closed）。
             Err(e) => assert_eq!(e.stage, IsolationStage::Landlock),

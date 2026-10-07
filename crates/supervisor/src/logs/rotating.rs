@@ -24,6 +24,7 @@
 //! - 現在ログは `create_new`（`O_CREAT|O_EXCL`）でのみ開く。最終要素が symlink でも辿らないため、
 //!   symlink 先への追記を防ぐ。既存エントリは種別を問わず rename / remove（symlink を辿らない）で退避する。
 //! - `dir` が symlink・非ディレクトリなら拒否し、unix では group / other 書き込み可も拒否する。
+//!   経路上の親要素の symlink・`..` 要素も拒否し（unix は root 所有の symlink のみ許容）、検証後は解決済みパスへ固定する。
 //!   新規ファイルは unix で 0600。ファイル名は検証済み [`ContainerId`] と固定接尾辞から `Path::join` で組み立てる。
 //!
 //! # 未実装・制限（REPAIR-3）
@@ -31,7 +32,7 @@
 //!   本実装は `File` へ直接 `write_all` するだけで、クラッシュ時の耐久性は保証しない。
 //! - 100 万行規模の欠落 0・重複 0 の検証: #508（TASK-164.4）。
 //! - `logs` コマンドからの読み出し経路。退避した世代が symlink の可能性があるため、読み出し側は symlink を辿らず開くこと。
-//! - 親ディレクトリ経路の検証後の差し替え（TOCTOU）は防げない（dirfd 基準の固定には core の安全 open の公開が必要）。
+//! - 親ディレクトリ経路の検証後の差し替え（TOCTOU）は完全には防げない（dirfd 基準の固定には core の安全 open の公開が必要）。
 //!   所有者（uid）の照合もしない。Windows では権限（ACL）を検査しない。
 //! - `dir`（状態ルート配下のどこか）の決定は配線側の責務で、本モジュールは決めない。
 
@@ -55,6 +56,9 @@ pub const MAX_LOG_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// 世代数に指定できる最大値。
 pub const MAX_LOG_GENERATIONS: u32 = 16;
+
+/// 旧世代の検査で走査するディレクトリエントリ数の上限（超過は fail-closed で拒否）。
+const MAX_SCAN_ENTRIES: usize = 1 << 20;
 
 /// ファイル名 1 要素の最大バイト数（NAME_MAX。Windows は UTF-16 単位 255 だがバイト数で見れば保守的）。
 const MAX_FILE_NAME_BYTES: usize = 255;
@@ -146,7 +150,7 @@ impl RotatingFileSink {
     /// `dir` は既存のディレクトリで、symlink でなく（unix では）group / other 書き込み不可であること。
     /// 既存の `<id>.log` は開かず、世代へ退避してから新規作成する（symlink 先への追記を防ぐ）。
     pub fn open(dir: &Path, id: &ContainerId, config: RotationConfig) -> Result<Self, TraitError> {
-        check_dir(dir)?;
+        let dir = check_dir(dir)?;
         // `<id>.log.<n>` の最長名が NAME_MAX を超えると open / 初回ローテーションが失敗して
         // sink が failed のままになるため、ここで早期に拒否する。
         let base = format!("{}.log", id.as_str());
@@ -163,7 +167,7 @@ impl RotatingFileSink {
             ));
         }
         let sink = Self {
-            dir: dir.to_path_buf(),
+            dir,
             base,
             config,
             inner: Mutex::new(Inner {
@@ -259,20 +263,39 @@ impl RotatingFileSink {
     /// ディスク使用量の上限 `max_file_bytes × generations` の契約を破る。利用者のログを黙って
     /// 消さないため、ファイルを変更する前に `InvalidArgument` で拒否し、手動で整理させる（SUP-7・TASK-164.2）。
     fn check_stale_generations(&self) -> Result<(), TraitError> {
-        for n in self.config.generations.max(1)..MAX_LOG_GENERATIONS {
-            // NAME_MAX を超える名前は存在し得ず、問い合わせも ENAMETOOLONG になるため飛ばす。
-            if self.base.len() + 1 + n.to_string().len() > MAX_FILE_NAME_BYTES {
+        let prefix = format!("{}.", self.base);
+        let rd = fs::read_dir(&self.dir).map_err(|_| internal("log directory scan failed"))?;
+        // 番号の上限では打ち切らず、ディレクトリを列挙して対象 ID の世代ファイルを全て検査する。
+        // 走査件数には上限を設け（超過は fail-closed）、確保はエントリ単位の一時値のみに留める。
+        let mut scanned = 0usize;
+        for entry in rd {
+            scanned += 1;
+            if scanned > MAX_SCAN_ENTRIES {
+                return Err(TraitError::new(
+                    ErrorCode::InvalidArgument,
+                    "log directory has too many entries to verify",
+                ));
+            }
+            let entry = entry.map_err(|_| internal("log directory scan failed"))?;
+            let name = entry.file_name();
+            let Some(num) = name.to_str().and_then(|n| n.strip_prefix(prefix.as_str())) else {
+                continue;
+            };
+            // 正規形（先頭 0 なしの 10 進数）だけが世代番号。桁あふれは十分大きい番号として扱う。
+            if num.is_empty()
+                || !num.bytes().all(|b| b.is_ascii_digit())
+                || (num.len() > 1 && num.starts_with('0'))
+            {
                 continue;
             }
-            match fs::symlink_metadata(self.path(n)) {
-                Ok(_) => {
-                    return Err(TraitError::new(
-                        ErrorCode::InvalidArgument,
-                        "stale log generation exists beyond the configured generation count",
-                    ));
-                }
-                Err(e) if e.kind() == ErrorKind::NotFound => {}
-                Err(_) => return Err(internal("log file inspection failed")),
+            let stale = num
+                .parse::<u64>()
+                .map_or(true, |n| n >= u64::from(self.config.generations));
+            if stale {
+                return Err(TraitError::new(
+                    ErrorCode::InvalidArgument,
+                    "stale log generation exists beyond the configured generation count",
+                ));
             }
         }
         Ok(())
@@ -291,19 +314,40 @@ impl RotatingFileSink {
     }
 }
 
-/// `dir` が実在するディレクトリで、symlink でなく、（unix では）他者書き込み不可であることを確認する。
-fn check_dir(dir: &Path) -> Result<(), TraitError> {
-    let meta = fs::symlink_metadata(dir).map_err(|_| {
-        TraitError::new(
-            ErrorCode::InvalidArgument,
-            "log directory is not accessible",
-        )
-    })?;
+/// `dir` が実在するディレクトリで、経路上に（信頼できない）symlink を含まず、（unix では）他者書き込み不可で
+/// あることを確認し、解決済みの絶対パスを返す。以後のファイル操作はこの固定したパスで行う（再解決しない）。
+///
+/// 親要素の symlink は、リンク先が状態ルート外でも最終要素の検査を通ってしまうため、全祖先を検査する。
+/// `..` 要素は拒否する。unix では root 所有の symlink（`/var` -> `/private/var` 等の OS 標準）のみ許容する
+/// （一般ユーザーは root 所有の symlink を作れない）。他 OS では symlink を一律拒否する。
+fn check_dir(dir: &Path) -> Result<PathBuf, TraitError> {
+    let invalid = |msg: &'static str| TraitError::new(ErrorCode::InvalidArgument, msg);
+    if dir
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(invalid("log directory path contains a parent reference"));
+    }
+    let meta = fs::symlink_metadata(dir).map_err(|_| invalid("log directory is not accessible"))?;
     if !meta.is_dir() {
-        return Err(TraitError::new(
-            ErrorCode::InvalidArgument,
-            "log directory is not a directory",
-        ));
+        return Err(invalid("log directory is not a directory"));
+    }
+    for anc in dir.ancestors().skip(1) {
+        if anc.as_os_str().is_empty() {
+            continue;
+        }
+        let m = fs::symlink_metadata(anc)
+            .map_err(|_| invalid("log directory parent is not accessible"))?;
+        if m.file_type().is_symlink() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if m.uid() == 0 {
+                    continue;
+                }
+            }
+            return Err(invalid("log directory path contains a symbolic link"));
+        }
     }
     #[cfg(unix)]
     {
@@ -315,7 +359,8 @@ fn check_dir(dir: &Path) -> Result<(), TraitError> {
             ));
         }
     }
-    Ok(())
+    // 検証済みの実体パスへ固定する（以後 sink は元の `dir` を再解決しない）。
+    fs::canonicalize(dir).map_err(|_| invalid("log directory is not accessible"))
 }
 
 impl LogSink for RotatingFileSink {

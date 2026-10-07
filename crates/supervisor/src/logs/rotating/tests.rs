@@ -367,3 +367,52 @@ fn sup7_task164_2_open_rejects_stale_generations_after_reducing_count() {
     let three = RotationConfig::new(MIN_LOG_FILE_BYTES, 3).unwrap();
     assert!(RotatingFileSink::open(&t.0, &id(), three).is_ok());
 }
+
+/// 番号上限（MAX_LOG_GENERATIONS）以上・桁あふれの旧世代も見逃さず拒否し、無関係なファイルは無視する。
+#[test]
+fn sup7_task164_2_open_rejects_stale_generations_at_or_above_max() {
+    for stale in ["c1.log.16", "c1.log.17", "c1.log.99999999999999999999999"] {
+        let t = TmpDir::new("stale-hi");
+        fs::write(t.0.join(stale), b"old").unwrap();
+        let cfg = RotationConfig::new(MIN_LOG_FILE_BYTES, 16).unwrap();
+        let e = RotatingFileSink::open(&t.0, &id(), cfg).err().unwrap();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument, "{stale}");
+    }
+    let t = TmpDir::new("stale-other");
+    for other in ["c1.log.x", "c1.log.01", "c1.log.", "c2.log.20", "c1.log.15"] {
+        fs::write(t.0.join(other), b"o").unwrap();
+    }
+    let cfg = RotationConfig::new(MIN_LOG_FILE_BYTES, 16).unwrap();
+    assert!(RotatingFileSink::open(&t.0, &id(), cfg).is_ok());
+}
+
+/// 親要素が symlink の経路は、リンク先が正当なディレクトリでも拒否する（状態ルート外への逸脱防止）。
+#[cfg(unix)]
+#[test]
+fn sup7_task164_2_open_rejects_symlinked_parent_component() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let t = TmpDir::new("parent-link");
+    let real = t.0.join("real");
+    fs::create_dir(&real).unwrap();
+    let sub = real.join("logs");
+    fs::create_dir(&sub).unwrap();
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o700)).unwrap();
+    let link = t.0.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    // root 所有のリンクは OS 標準として許容する仕様のため、root 実行時は拒否検証の対象外。
+    if fs::symlink_metadata(&link).unwrap().uid() != 0 {
+        let e = RotatingFileSink::open(&link.join("logs"), &id(), small())
+            .err()
+            .unwrap();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert!(!sub.join("c1.log").exists());
+    }
+    // `..` 要素は拒否する。
+    let dotdot = real.join("..").join("real").join("logs");
+    let e = RotatingFileSink::open(&dotdot, &id(), small())
+        .err()
+        .unwrap();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    // 実体パスなら開ける。
+    assert!(RotatingFileSink::open(&sub, &id(), small()).is_ok());
+}

@@ -660,7 +660,13 @@ impl LogCapture {
             let until = started
                 .checked_add(CANCEL_SETTLE_TIMEOUT)
                 .unwrap_or(started);
-            self.cancel.cancel(until);
+            if self.cancel.cancel(until) {
+                // 取消しが収束したら、受理済みの行を書き出す（SUP-7。リーダーは取消し後に flush しない）。
+                // flush の失敗は InvalidArgument を優先するため捨てる。待つのは固定の猶予まで（REPAIR-5）。
+                let now = Instant::now();
+                let until = now.checked_add(CANCEL_SETTLE_TIMEOUT).unwrap_or(now);
+                let _ = flush_bounded(&self.sink, &self.budget, until);
+            }
             return Err(TraitError::new(
                 ErrorCode::InvalidArgument,
                 "drain timeout is too large",
@@ -1009,7 +1015,8 @@ mod tests {
         assert_eq!(budget.live(), 1);
         let err = cap.drain(Duration::MAX).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
-        writer.write_all(b"late1\nlate2\n").unwrap();
+        // 取消し後の flush に時間がかかると、リーダーが先に終了して読み側が閉じる場合がある（BrokenPipe は許容）。
+        let _ = writer.write_all(b"late1\nlate2\n");
         assert_eq!(wait_live(&budget, 0), 0);
         assert_eq!(sink.snapshot().unwrap(), Vec::<CapturedLine>::new());
         drop(writer);
@@ -1670,7 +1677,8 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5));
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(err.message(), "drain timeout is too large");
-        writer.write_all(b"late\n").unwrap();
+        // 取消し後の flush に時間がかかると、リーダーが先に終了して読み側が閉じる場合がある（BrokenPipe は許容）。
+        let _ = writer.write_all(b"late\n");
         assert_eq!(wait_live(&budget, 0), 0);
         assert_eq!(sink.snapshot().unwrap(), Vec::<CapturedLine>::new());
         drop(writer);
@@ -2100,6 +2108,34 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::Timeout);
         assert!(t0.elapsed() < Duration::from_secs(5));
         drop(release_tx);
+        drop(w);
+    }
+
+    /// drain の timeout が上限超（InvalidArgument）の経路でも、取消し後に受理済みの行を flush する（SUP-7）。
+    #[test]
+    fn sup7_task164_3_drain_invalid_timeout_flushes_accepted_lines() {
+        let sink = Arc::new(CallLog::default());
+        let (r, mut w) = std::io::pipe().unwrap();
+        let budget = ReaderBudget::new(1).unwrap();
+        let cap = LogCapture::start(
+            OutputStreams::new(&budget, Some(Box::new(r)), None),
+            sink.clone(),
+        )
+        .unwrap();
+        w.write_all(b"a\n").unwrap();
+        let t0 = Instant::now();
+        while sink.calls().len() < 2 && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let before = sink.calls().len();
+        let err = cap
+            .drain(MAX_DRAIN_TIMEOUT + Duration::from_nanos(1))
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        let calls = sink.calls();
+        assert_eq!(calls.first().map(String::as_str), Some("append a"));
+        assert_eq!(calls.len(), before + 1);
+        assert_eq!(calls.last().map(String::as_str), Some("flush"));
         drop(w);
     }
 

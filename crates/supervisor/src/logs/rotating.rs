@@ -46,9 +46,22 @@
 //!   Windows の予約デバイス名（`con`・`nul`・`com1` 等。拡張子つきでもデバイスとして開かれ得る）で始まる
 //!   名前には、先頭に `_0` を付けて避ける（全 OS で同じ名前にする）。
 //!
+//! # バッファ・フラッシュ制御（TASK-164.3・#507）
+//! - 書き込みは固定 [`WRITE_BUFFER_BYTES`] のバッファ越しに行う。[`LogSink::append`] の `Ok` は受理を意味し、
+//!   ディスクへの到達は意味しない。読み出し側・リーダーは [`LogSink::flush`]（または drop）で書き出す。
+//! - `size` はバッファ内を含む論理バイト数で、ローテーション判定は論理サイズで行う（ディスク上の長さは常にそれ以下なので
+//!   「全ファイル `len <= max_file_bytes`」「1 レコードが世代をまたがない」は保たれる）。
+//! - ローテーションの順序は固定: 残りバッファを退避前の旧ファイルへ書き切る → `sync_data` → ファイルを閉じる →
+//!   世代の rename → （unix）ディレクトリの fsync → 新ファイル作成。バッファを新ファイルへ持ち越さないため、
+//!   境界で行が欠落・重複・誤配置しない。Windows は開いたファイルを rename できないので、この順序が必須でもある。
+//! - 失敗は fail-closed: 書き込み・flush・ローテーションが失敗した sink は失敗状態に固定し、バッファを捨てて再試行しない
+//!   （再書き込みによる重複を作らない）。そのとき、バッファにあった受理済みの複数レコードが失われ得る。
+//! - fsync はローテーションで退避する世代と、明示の [`RotatingFileSink::sync`] だけ。現在ログはクラッシュ時に
+//!   最後の `sync` / ローテーション以降の分を失い得る。
+//!
 //! # 未実装・制限（REPAIR-3）
-//! - ローテーション境界の欠落・重複防止のバッファリング、フラッシュ / fsync 制御: #507（TASK-164.3）。
-//!   本実装は `File` へ直接 `write_all` するだけで、クラッシュ時の耐久性は保証しない。
+//! - flush ごとの fsync・設定可能な同期ポリシー・タイマーによる定期 flush（短い read を契機とする flush で代替）。
+//!   [`RotatingFileSink::sync`] をコンテナ終了時などに呼ぶ配線も未実装（配線側の責務）。
 //! - 100 万行規模の欠落 0・重複 0 の検証: #508（TASK-164.4）。
 //! - `logs` コマンドからの読み出し経路。open 後に差し替えられた世代が symlink の可能性は残るため、
 //!   読み出し側は symlink を辿らず開くこと。
@@ -61,7 +74,7 @@
 //! - `dir`（状態ルート配下のどこか）の決定は配線側の責務で、本モジュールは決めない。
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
@@ -92,6 +105,10 @@ const MAX_TAG_BYTES: usize = 7;
 
 /// 1 ファイルあたり上限に指定できる最小値（最大 1 レコード長。空ファイルに必ず 1 レコードが収まる）。
 pub const MIN_LOG_FILE_BYTES: u64 = (MAX_TAG_BYTES + MAX_LINE_BYTES + 1) as u64;
+
+/// 書き込みバッファの容量（固定。sink あたりの常駐メモリ増を [`super::READ_CHUNK_BYTES`] と同じ 8KiB に抑える。CORE-7）。
+/// 容量を超えるレコードは `BufWriter` が直接書くので、確保は増えない。
+const WRITE_BUFFER_BYTES: usize = 8 * 1024;
 
 /// ローテーション設定（検証済み）。範囲外の値は作れない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,7 +161,8 @@ impl Default for RotationConfig {
 
 enum State {
     Active {
-        file: File,
+        writer: BufWriter<File>,
+        /// バッファ内を含む論理バイト数。
         size: u64,
     },
     /// ローテーション・書き込みの失敗後。以後の追記はすべて拒否する。
@@ -268,13 +286,53 @@ impl RotatingFileSink {
             Err(_) => return Err(internal("log file inspection failed")),
         }
         let file = sink.create_active()?;
-        sink.lock()?.state = State::Active { file, size: 0 };
+        sink.lock()?.state = State::Active {
+            writer: BufWriter::with_capacity(WRITE_BUFFER_BYTES, file),
+            size: 0,
+        };
         Ok(sink)
     }
 
     /// これまでのローテーション回数（観測用。REPAIR-4）。open 時の退避は数えない。
     pub fn rotations(&self) -> Result<u64, TraitError> {
         Ok(self.lock()?.rotations)
+    }
+
+    /// バッファを書き出し、現在ログの内容を `sync_data` で永続化する（コンテナ終了時など、末尾行を確実に残したい
+    /// 呼び出し側向け。TASK-164.3）。失敗すると sink は失敗状態に固定される。失敗状態では `Internal`。
+    pub fn sync(&self) -> Result<(), TraitError> {
+        let mut g = self.lock()?;
+        let State::Active { writer, .. } = &mut g.state else {
+            return Err(internal("log sink is in failed state"));
+        };
+        let ok = writer.flush().is_ok() && writer.get_ref().sync_data().is_ok();
+        if ok {
+            return Ok(());
+        }
+        fail_sink(&mut g.state);
+        Err(internal("log sync failed"))
+    }
+
+    /// 旧ファイルを書き切って退避し、新しい現在ログを作る（ローテーションの順序はモジュール doc 参照）。
+    /// 失敗時の呼び出し側は state を失敗状態にしたままにする。
+    fn rotate(&self, writer: BufWriter<File>) -> Result<BufWriter<File>, TraitError> {
+        let file = match writer.into_inner() {
+            Ok(f) => f,
+            Err(e) => {
+                // バッファは捨てる（drop による暗黙の再書き込みを避け、重複を作らない）。
+                let (_err, bw) = e.into_parts();
+                let _ = bw.into_parts();
+                return Err(internal("log write failed"));
+            }
+        };
+        file.sync_data()
+            .map_err(|_| internal("log rotation failed"))?;
+        // Windows は開いたままのファイルを rename できないため、閉じてから世代を送る。
+        drop(file);
+        self.shift_generations()?;
+        sync_dir(&self.dir)?;
+        let file = self.create_active()?;
+        Ok(BufWriter::with_capacity(WRITE_BUFFER_BYTES, file))
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Inner>, TraitError> {
@@ -553,24 +611,74 @@ impl LogSink for RotatingFileSink {
             .checked_add(rec_len)
             .is_none_or(|n| n > self.config.max_file_bytes);
         if needs_rotate {
-            // Windows は開いたままのファイルを rename できないため、先に失敗状態へ落として File を閉じる。
-            g.state = State::Failed;
-            self.shift_generations()?;
-            let file = self.create_active()?;
-            g.state = State::Active { file, size: 0 };
+            // 失敗状態へ落として writer を取り出す（以後どの失敗でも失敗状態のまま。再試行しない）。
+            let State::Active { writer, .. } = std::mem::replace(&mut g.state, State::Failed)
+            else {
+                return Err(internal("log sink is in failed state"));
+            };
+            let writer = self.rotate(writer)?;
+            g.state = State::Active { writer, size: 0 };
             g.rotations = g.rotations.saturating_add(1);
         }
-        let State::Active { file, size } = &mut g.state else {
+        let State::Active { writer, size } = &mut g.state else {
             return Err(internal("log sink is in failed state"));
         };
-        if file.write_all(&rec).is_err() {
-            // 部分書き込みの可能性があるため以後は書かない。
-            g.state = State::Failed;
-            return Err(internal("log write failed"));
+        if writer.write_all(&rec).is_ok() {
+            *size = size.saturating_add(rec_len);
+            return Ok(());
         }
-        *size = size.saturating_add(rec_len);
-        Ok(())
+        // 部分書き込みの可能性があるため以後は書かない（バッファも捨てる）。
+        fail_sink(&mut g.state);
+        Err(internal("log write failed"))
     }
+
+    /// バッファを書き出す（fsync はしない）。失敗すると sink は失敗状態に固定される（TASK-164.3）。
+    fn flush(&self) -> Result<(), TraitError> {
+        let mut g = self.lock()?;
+        let State::Active { writer, .. } = &mut g.state else {
+            return Err(internal("log sink is in failed state"));
+        };
+        if writer.flush().is_ok() {
+            return Ok(());
+        }
+        fail_sink(&mut g.state);
+        Err(internal("log flush failed"))
+    }
+}
+
+impl Drop for RotatingFileSink {
+    /// ロック解放（フィールドの drop）より前に、残りのバッファを best-effort で書き出す。失敗は捨てる。
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.inner.lock()
+            && let State::Active { writer, .. } = &mut g.state
+        {
+            let _ = writer.flush();
+        }
+    }
+}
+
+/// 失敗状態へ固定し、未書き出しのバッファを捨てる（`BufWriter` の drop による再書き込みを避ける）。
+fn fail_sink(state: &mut State) {
+    if let State::Active { writer, .. } = std::mem::replace(state, State::Failed) {
+        let _ = writer.into_parts();
+    }
+}
+
+/// ログディレクトリを fsync して rename を永続化する（unix。検証済みの `dir` を読み取りで開くだけ）。
+/// 他 OS ではディレクトリの fsync 手段が無いため何もしない。
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> Result<(), TraitError> {
+    let fail = || internal("log rotation failed");
+    let d = File::open(dir).map_err(|_| fail())?;
+    if !d.metadata().map_err(|_| fail())?.is_dir() {
+        return Err(fail());
+    }
+    d.sync_all().map_err(|_| fail())
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> Result<(), TraitError> {
+    Ok(())
 }
 
 #[cfg(test)]

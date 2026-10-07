@@ -4,7 +4,9 @@
 //!
 //! `crate::exec` の各拒否経路（`plan` / `plan_rootful_host_root` / `isolate` 系の前提、
 //! `MountIsolation::establish` の前提、`mount_proc` の証跡不一致・パス検証・shared 伝播、
-//! `prepare_rootfs` / `pivot_root` の証跡不一致・rootfs パス検証・shared 伝播。TASK-27.3・#135）は、
+//! `prepare_rootfs` / `pivot_root` の証跡不一致・rootfs パス検証・shared 伝播。TASK-27.3・#135、
+//! `setns` 参加前の exec の対象の検証〔種別 `exec_target`。入れ子の PID 1 でない・cgroup 不一致・呼び出し側と
+//! 同じ pid / mnt namespace。SUP-6・SEC-1・TASK-163.1・#500〕）は、
 //! 拒否時に [`IsolationViolation`] を `ExecError::violation` に載せて呼び出し側へ返す。
 //!
 //! **本モジュールは記録の経路のみを提供する。** マウント層の違反から `Mount` 監査イベントへの

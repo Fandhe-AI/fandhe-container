@@ -9,7 +9,7 @@
 //! - 本番の `ProcessLauncher` は core に未提供のため、起動ハンドル（`LaunchedProcess`）は呼び出し側から注入する。
 //!   supervisor のバイナリ入口（`main.rs`）は本 issue では追加しない（実プロセスを起動できないため実装済みを装わない）。
 //!   「コンテナ 0 個で supervisor プロセスが残存しない」ことの検証は結合テスト（#242・TASK-157.8）の担当。
-//! - `restart_count` 更新の土台は実装済み（TASK-157.5・#239）。restart ポリシー本体は未実装（次節）。
+//! - restart ポリシーの配線と `restart_count` の加算は [`crate::restart`]（TASK-159.3・#489）。次節に未実装の範囲を記す。
 //!   stdout / stderr 捕捉の土台は [`crate::logs`] と [`monitor_with_capture`]（#241・TASK-157.7）。永続化・ローテーションは未実装
 //!   （SUP-7・TASK-164）で、実パイプは core が未提供のため注入式。
 //!   `health` を書くフックは [`crate::health`] で提供済み（#240・SUP-4）。healthcheck コマンドの実行と周期実行は未実装（TASK-161）で、
@@ -24,28 +24,25 @@
 //!    `Ok(Some(_))` は終了（回収済み）、`Err` は握りつぶさず返す。ただし返す前に記録済みの `supervisor_pid` を
 //!    解除する（監視していないのに自 pid が残るのを防ぐ）。解除にも失敗したら [`MonitorOutcome::WaitFailedUnreleased`] で
 //!    wait の失敗と解除の失敗の両方を返し、呼び出し側が識別できるようにする。
-//! 4. 終了の記録: `Stopped` と終了コードを書き、`supervisor_pid` を `None` に戻す。異常終了（非 0 終了・シグナル終了）なら
-//!    同じ書き込みで `restart_count` を 1 進める（上限で頭打ち）。正常終了（終了コード 0）は進めない。回収後の書き込み失敗は
-//!    `Err` にせず [`MonitorOutcome::ExitedUnrecorded`] で終了状態ごと返す（プロセスは回収済みで再 wait 不可）。
-//!    回復（再書き込み・再起動判断）は SUP-3 の restart ポリシー実装時に扱い、TASK-157.5 では未実装。
-//!    現状はループ終了 = 監視なし。再起動で監視を続ける挙動は SUP-3 で変更する。
+//! 4. 終了の記録: `Stopped` と終了コードを書き、`supervisor_pid` を `None` に戻す（`health`・`restart_count` は保つ。
+//!    `restart_count` は実施済み再起動の回数で、加算は再 launch 成功時に [`crate::restart`] が行う。#489・TASK-159.3）。
+//!    回収後の書き込み失敗は `Err` にせず [`MonitorOutcome::ExitedUnrecorded`] で終了状態ごと返す
+//!    （プロセスは回収済みで再 wait 不可）。この回復は未実装（SUP-3）。
+//!    [`monitor`] 単体はループ終了 = 監視なしで、再起動を続ける外側のループは [`crate::restart::supervise_with_restart`]。
 //! 5. 停止要求（[`StopToken`]）: 監視をやめるだけで、プロセスは終了させない。状態は `Running` のまま
 //!    `supervisor_pid` だけ `None` に戻す。起動ハンドルは参照渡しのため所有権は常に呼び出し側に残り、
 //!    回収責任（終了・`wait` での回収、または別の監視への引き継ぎ）は呼び出し側が負う契約とする
 //!    （[`MonitorOutcome::StopRequested`] の doc 参照）。
 //!
-//! # restart の土台と未実装の将来仕様（TASK-157.5・SUP-3。REPAIR-3）
-//! 現状はスタブ: 異常終了を数えて `Stopped` に落とすだけで、**再起動（再 launch）は行わない**。
-//! このため `restart_count` の現時点の意味は「再起動対象となる異常終了を検知した回数」であり、
-//! 実際の再起動回数と一致するのは SUP-3 の再 launch 実装後になる（`inspect` への出力は SUP-11）。
+//! # restart と未実装の将来仕様（TASK-157.5・TASK-159.3・SUP-3。REPAIR-3）
+//! [`monitor`] 自体は再起動しない。ポリシー（`no` / `on-failure[:N]` / `always` / `unless-stopped`）の評価・バックオフ・再 launch・`restart_count` の加算・`Running` の再記録は
+//! [`crate::restart::supervise_with_restart`]（#489・TASK-159.3）が [`monitor_with_observer`] を周回させて行う
+//! （TASK-157.5 の土台だった「異常終了の検知回数」の加算は廃止し、`restart_count` を実施済み再起動回数に統一した）。
 //!
 //! 未実装（将来仕様と対応ビヘイビア ID）:
-//! - restart ポリシー `no` / `on-failure[:N]` / `always` / `unless-stopped` の評価と最大回数 N での打ち切り（SUP-3）。
-//!   ポリシー実装後、異常終了の既定判定（[`crate::restart`] の `is_abnormal_exit`。TASK-159.1 で移設）は、再 launch 実装時にポリシー評価（`evaluate_restart`。TASK-159.2 で実装済み）への配線に置き換わる（#489・TASK-159.3）。
-//! - 再試行間隔（バックオフ）。バックオフ 0 のとき再起動レイテンシ中央値 100ms 以下が目標（SUP-3）。
-//!   上限 N とバックオフが無いと再起動ストームになるため、ポリシー実装時に必須とする。
-//! - 本番 `ProcessLauncher` による再 launch と、新しい pid での `Running` 再記録・監視継続（SUP-3。core の launcher 提供が前提）。
-//! - 明示的な停止（`stop`）と異常終了の区別、停止シグナル・猶予時間、`unless-stopped` の判定（SUP-9）。
+//! - 本番 `ProcessLauncher` による再 launch（core の launcher 提供が前提。現状は [`crate::restart::Relauncher`] を注入する。SUP-3）。
+//! - 明示的な停止（`stop`）の検知と異常終了の区別、停止シグナル・猶予時間、再 launch 時の `unless-stopped` と `always` の差（SUP-9）。
+//! - 指数バックオフ等の高度な間隔制御（現状は固定のバックオフ。SUP-3）。
 //! - [`MonitorOutcome::ExitedUnrecorded`] の回復（SUP-3）。
 //!
 //! # 可観測性（REPAIR-4）
@@ -78,7 +75,7 @@ use fandhe_container_core::traits::{
 };
 
 use crate::logs::{CaptureSummary, LogCapture, LogSink, OutputStreams, StreamSummary};
-use crate::restart::{exit_code_of, is_abnormal_exit};
+use crate::restart::exit_code_of;
 use crate::state::SupervisedState;
 
 /// 捕捉の終端待ち（drain）の既定の上限。
@@ -180,17 +177,21 @@ impl StopToken {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MonitorOutcome {
-    /// 終了を検知し、`Stopped` を記録した。異常終了なら `record.restart_count()` は 1 進んだ値（SUP-3 の土台。上限で頭打ち）。
+    /// 終了を検知し、`Stopped` を記録した。`record.restart_count()` は終了前の値のまま（加算は再 launch 成功時。
+    /// [`crate::restart::supervise_with_restart`]。SUP-3・TASK-159.3）。
     Exited {
         /// 起動ハンドルが回収した終了状態。
         exit: ProcessExit,
         /// 書き込み後のレコード。
         record: StateRecord,
+        /// 終了を検知した時刻（`Stopped` 記録の前）。再起動レイテンシ（SUP-3）に終了記録の時間を含めるため
+        /// [`crate::restart::supervise_with_restart`] が起点に使う。
+        detected_at: Instant,
     },
     /// 終了を検知しプロセスは回収済みだが、`Stopped` の書き込みに失敗した（状態は `Running` のまま、
     /// `supervisor_pid` も自 pid のまま残り得る）。再 `wait` はできないため、終了状態を失わないよう
-    /// `exit` と書き込み失敗の `error` を呼び出し側へ返す。`restart_count` の加算も永続化されていない。
-    /// 回復（再書き込み・再起動判断）は SUP-3 で扱う（TASK-157.5 では未実装）。
+    /// `exit` と書き込み失敗の `error` を呼び出し側へ返す。終了の記録が永続化されていない。
+    /// 回復（再書き込み・再起動判断）は未実装（SUP-3）。再起動ループは再 launch せずに戻る。
     ExitedUnrecorded {
         /// 起動ハンドルが回収した終了状態。
         exit: ProcessExit,
@@ -242,6 +243,8 @@ pub enum MonitorOperation {
     RecordHealth,
     /// healthcheck 判定の実行（成功・失敗・期限超過とレイテンシ。#240・REPAIR-4）。
     Probe,
+    /// 再起動 1 回（終了検知からバックオフ・再 launch・`Running` 再記録まで。#489・SUP-3。[`crate::restart`]）。
+    Restart,
     /// 出力捕捉の開始（リーダースレッドの起動。#241）。
     CaptureStart,
     /// 終了検知後の出力捕捉の終端待ち（#241）。
@@ -259,6 +262,7 @@ impl MonitorOperation {
             Self::ReleaseAfterWaitError => "release_after_wait_error",
             Self::RecordHealth => "record_health",
             Self::Probe => "probe",
+            Self::Restart => "restart",
             Self::CaptureStart => "capture_start",
             Self::CaptureDrain => "capture_drain",
         }
@@ -408,28 +412,27 @@ fn monitor_after_claim(
         }) {
             Ok(None) => continue,
             Ok(Some(exit)) => {
+                let detected_at = Instant::now();
                 let code = exit_code_of(exit);
-                let abnormal = is_abnormal_exit(exit);
                 let id = state.id().clone();
                 // 回収後は再 wait できないため、書き込み失敗でも終了状態を返す。
                 let written = observed(obs, MonitorOperation::RecordExit, || {
                     write_with_retry(state, pid, |rec| {
                         ensure_owner(rec, self_pid)?;
-                        // 競合後の refresh で他者の更新を上書きしないよう、書き込みごとに最新値から加算する。
-                        // state.json 由来の値なので saturating_add で頭打ちにし、終了記録を優先する。
-                        let restart_count = if abnormal {
-                            rec.restart_count().saturating_add(1)
-                        } else {
-                            rec.restart_count()
-                        };
+                        // `restart_count` は実施済み再起動の回数で、加算は再 launch 成功時（[`crate::restart`]）だけが行う。
+                        // 終了記録では最新値を保つ（競合後の refresh で他者の更新も消さない）。
                         Ok((
                             ContainerStatus::stopped(id.clone(), code),
-                            SupervisionState::new(None, rec.health(), restart_count),
+                            SupervisionState::new(None, rec.health(), rec.restart_count()),
                         ))
                     })
                 });
                 return Ok(match written {
-                    Ok(record) => MonitorOutcome::Exited { exit, record },
+                    Ok(record) => MonitorOutcome::Exited {
+                        exit,
+                        record,
+                        detected_at,
+                    },
                     Err(error) => MonitorOutcome::ExitedUnrecorded { exit, error },
                 });
             }
@@ -663,6 +666,7 @@ pub(crate) fn is_running_with_pid(rec: &StateRecord, pid: NonZeroU32) -> bool {
 }
 
 /// revision 不一致のときだけ `refresh` して再構築・再書き込みする（上限 [`MAX_WRITE_ATTEMPTS`]）。
+/// 再試行時は「`Running` かつ `pid`」であることを確かめてから書く。
 pub(crate) fn write_with_retry<F>(
     state: &mut SupervisedState,
     pid: NonZeroU32,
@@ -671,11 +675,26 @@ pub(crate) fn write_with_retry<F>(
 where
     F: Fn(&StateRecord) -> Result<(ContainerStatus, SupervisionState), TraitError>,
 {
+    write_with_retry_when(state, |rec| is_running_with_pid(rec, pid), build)
+}
+
+/// [`write_with_retry`] の事前条件を述語で受ける版。`refresh` 後に `still_valid` が偽なら書かず `FailedPrecondition`。
+///
+/// [`crate::restart`] が `Stopped` から `Running(新 pid)` へ戻す書き込みで使う（条件が「自 pid で Running」ではないため）。
+pub(crate) fn write_with_retry_when<P, F>(
+    state: &mut SupervisedState,
+    still_valid: P,
+    build: F,
+) -> Result<StateRecord, TraitError>
+where
+    P: Fn(&StateRecord) -> bool,
+    F: Fn(&StateRecord) -> Result<(ContainerStatus, SupervisionState), TraitError>,
+{
     let mut last_err = precondition("state write attempts exhausted");
     for attempt in 0..MAX_WRITE_ATTEMPTS {
         if attempt > 0 {
             state.refresh()?;
-            if !is_running_with_pid(state.record(), pid) {
+            if !still_valid(state.record()) {
                 return Err(precondition(
                     "container state changed while writing supervision",
                 ));
@@ -853,7 +872,7 @@ mod tests {
         let mut s = attach(&store);
         let p = FakeProc::exiting(3, ProcessExit::Exited(7));
         let out = monitor(&mut s, &p, &MonitorConfig::default(), &StopToken::new()).unwrap();
-        let MonitorOutcome::Exited { exit, record } = out else {
+        let MonitorOutcome::Exited { exit, record, .. } = out else {
             panic!("unexpected outcome")
         };
         assert_eq!(exit, ProcessExit::Exited(7));
@@ -873,7 +892,7 @@ mod tests {
         let mut s = attach(&store);
         let p = FakeProc::exiting(1, ProcessExit::Signaled(9));
         let out = monitor(&mut s, &p, &MonitorConfig::default(), &StopToken::new()).unwrap();
-        let MonitorOutcome::Exited { exit, record } = out else {
+        let MonitorOutcome::Exited { exit, record, .. } = out else {
             panic!("unexpected outcome")
         };
         assert_eq!(exit, ProcessExit::Signaled(9));
@@ -1719,36 +1738,37 @@ mod tests {
         (out, store)
     }
 
-    /// SUP-1・TASK-157.5: 非 0 終了で restart_count が 2 から 3 になり、health は保たれる。
+    /// SUP-3・TASK-159.3: 非 0 終了でも monitor 単体は restart_count を進めず（2 のまま）、health は保たれる。
+    /// 加算は再 launch 成功時（`restart.rs`）だけが行う。
     #[test]
-    fn sup1_task157_5_abnormal_exit_increments_restart_count() {
+    fn sup3_task159_3_abnormal_exit_keeps_restart_count() {
         let init = SupervisionState::new(None, Some(HealthStatus::Healthy), 2);
         let (out, store) = exit_with(init, ProcessExit::Exited(7));
         let MonitorOutcome::Exited { record, .. } = out else {
             panic!("unexpected outcome")
         };
-        assert_eq!(record.restart_count(), 3);
+        assert_eq!(record.restart_count(), 2);
         assert_eq!(record.health(), Some(HealthStatus::Healthy));
         assert_eq!(record.status().state(), ContainerState::Stopped);
         assert_eq!(record.status().exit_code(), Some(7));
         assert_eq!(record.supervisor_pid(), None);
-        assert_eq!(store.rec.lock().unwrap().restart_count(), 3);
+        assert_eq!(store.rec.lock().unwrap().restart_count(), 2);
     }
 
-    /// SUP-1・TASK-157.5: シグナル終了も異常終了として 0 から 1 になる。
+    /// SUP-3・TASK-159.3: シグナル終了でも restart_count は 0 のまま、終了コードは 137。
     #[test]
-    fn sup1_task157_5_signal_exit_increments_restart_count() {
+    fn sup3_task159_3_signal_exit_keeps_restart_count() {
         let (out, _) = exit_with(SupervisionState::default(), ProcessExit::Signaled(9));
         let MonitorOutcome::Exited { record, .. } = out else {
             panic!("unexpected outcome")
         };
-        assert_eq!(record.restart_count(), 1);
+        assert_eq!(record.restart_count(), 0);
         assert_eq!(record.status().exit_code(), Some(137));
     }
 
-    /// SUP-1・TASK-157.5: 正常終了では restart_count は 2 のまま。
+    /// SUP-3・TASK-159.3: 正常終了でも restart_count は 2 のまま。
     #[test]
-    fn sup1_task157_5_normal_exit_keeps_restart_count() {
+    fn sup3_task159_3_normal_exit_keeps_restart_count() {
         let init = SupervisionState::new(None, None, 2);
         let (out, _) = exit_with(init, ProcessExit::Exited(0));
         let MonitorOutcome::Exited { record, .. } = out else {
@@ -1757,9 +1777,9 @@ mod tests {
         assert_eq!(record.restart_count(), 2);
     }
 
-    /// SUP-1・TASK-157.5: 競合 1 回（外部が +1）の後も外部の更新を保ち、自分の +1 が載る（0 -> 2）。
+    /// SUP-3・TASK-159.3: 競合 1 回（外部が +1）の後も外部の更新が保たれる（0 -> 1。monitor は加算しない）。
     #[test]
-    fn sup1_task157_5_increment_survives_revision_conflict() {
+    fn sup3_task159_3_exit_record_keeps_foreign_restart_count_update() {
         let store = running_store(1);
         let mut s = attach(&store);
         let p = FakeProc::exiting(1, ProcessExit::Exited(1));
@@ -1767,23 +1787,12 @@ mod tests {
         let MonitorOutcome::Exited { record, .. } = out else {
             panic!("unexpected outcome")
         };
-        assert_eq!(record.restart_count(), 2);
+        assert_eq!(record.restart_count(), 1);
     }
 
-    /// SUP-1・TASK-157.5: u32::MAX で頭打ちになり、ExitedUnrecorded にも panic にもならない。
+    /// SUP-3・TASK-159.3: 終了記録が失敗した場合、外部加算 3 回ぶんのみが残り Running のまま。
     #[test]
-    fn sup1_task157_5_restart_count_saturates() {
-        let init = SupervisionState::new(None, None, u32::MAX);
-        let (out, _) = exit_with(init, ProcessExit::Exited(1));
-        let MonitorOutcome::Exited { record, .. } = out else {
-            panic!("unexpected outcome")
-        };
-        assert_eq!(record.restart_count(), u32::MAX);
-    }
-
-    /// SUP-1・TASK-157.5: 終了記録が失敗した場合、自分の加算は永続化されない（外部加算 3 回ぶんのみ）。
-    #[test]
-    fn sup1_task157_5_unrecorded_exit_does_not_persist_increment() {
+    fn sup3_task159_3_unrecorded_exit_leaves_running() {
         let store = running_store(0);
         let mut s = attach(&store);
         struct Racy<'a>(&'a FakeStore);
@@ -1836,14 +1845,5 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(store.rec.lock().unwrap().restart_count(), 2);
-    }
-
-    /// TASK-157.5: 異常終了の判定表。
-    #[test]
-    fn sup1_task157_5_is_abnormal_exit_table() {
-        assert!(!is_abnormal_exit(ProcessExit::Exited(0)));
-        assert!(is_abnormal_exit(ProcessExit::Exited(1)));
-        assert!(is_abnormal_exit(ProcessExit::Exited(-1)));
-        assert!(is_abnormal_exit(ProcessExit::Signaled(15)));
     }
 }

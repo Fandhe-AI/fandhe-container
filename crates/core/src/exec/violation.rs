@@ -6,7 +6,8 @@
 //! `MountIsolation::establish` の前提、`mount_proc` の証跡不一致・パス検証・shared 伝播、
 //! `prepare_rootfs` / `pivot_root` の証跡不一致・rootfs パス検証・shared 伝播。TASK-27.3・#135、
 //! `setns` 参加前の exec の対象の検証〔種別 `exec_target`。入れ子の PID 1 でない・cgroup 不一致・呼び出し側と
-//! 同じ pid / mnt namespace。SUP-6・SEC-1・TASK-163.1・#500〕）は、
+//! 同じ pid / mnt namespace。SUP-6・SEC-1・TASK-163.1・#500〕、`setns` 参加後の root の照合〔同種別。参加後の
+//! `/` が記録したコンテナの rootfs でない。SUP-6・SEC-1・TASK-163.3・#502〕）は、
 //! 拒否時に [`IsolationViolation`] を `ExecError::violation` に載せて呼び出し側へ返す。
 //!
 //! **本モジュールは記録の経路のみを提供する。** マウント層の違反から `Mount` 監査イベントへの
@@ -56,7 +57,8 @@ pub enum ViolationKind {
     RootfsPivot,
     /// exec 直前のエントリポイントの検証（ランタイム自身のホスト側バイナリの指定等。TASK-27.4.1）。
     Entrypoint,
-    /// 稼働中コンテナへの exec の対象（pid1）の検証（`setns` 参加前。SUP-6・SEC-1・TASK-163.1）。
+    /// 稼働中コンテナへの exec の対象（pid1）の検証（`setns` 参加前の対象の検証と、参加後の root の照合。
+    /// SUP-6・SEC-1・TASK-163.1・TASK-163.3）。
     ExecTarget,
 }
 
@@ -160,6 +162,10 @@ pub enum ViolationReason {
     ExecTargetSharesPidNamespace,
     /// exec の対象が呼び出し側と同じ mount namespace にいる（同上）。
     ExecTargetSharesMountNamespace,
+    /// `setns` 参加後の呼び出しプロセスの `/` が、記録（bundle の `config.json`）から固定したコンテナの
+    /// rootfs と同じディレクトリでない（pivot していない対象・`/` へ別のマウントが重ねられた対象。この状態で
+    /// 制限を適用するとルールが別の木に付き、コマンドも rootfs の外で動く。SEC-1・TASK-163.3）。
+    ExecRootNotContainerRootfs,
 }
 
 impl ViolationReason {
@@ -204,6 +210,7 @@ impl ViolationReason {
             Self::ExecTargetCgroupMismatch => "exec_target_cgroup_mismatch",
             Self::ExecTargetSharesPidNamespace => "exec_target_shares_pid_namespace",
             Self::ExecTargetSharesMountNamespace => "exec_target_shares_mount_namespace",
+            Self::ExecRootNotContainerRootfs => "exec_root_not_container_rootfs",
         }
     }
 
@@ -248,7 +255,8 @@ impl ViolationReason {
             Self::ExecTargetNotNestedPid1
             | Self::ExecTargetCgroupMismatch
             | Self::ExecTargetSharesPidNamespace
-            | Self::ExecTargetSharesMountNamespace => ViolationKind::ExecTarget,
+            | Self::ExecTargetSharesMountNamespace
+            | Self::ExecRootNotContainerRootfs => ViolationKind::ExecTarget,
         }
     }
 
@@ -258,7 +266,7 @@ impl ViolationReason {
             Self::UserNamespaceRequired | Self::HostRootIdentityMapping | Self::IdentityChanged => {
                 "SEC-5"
             }
-            Self::ExecTargetCgroupMismatch => "SEC-1",
+            Self::ExecTargetCgroupMismatch | Self::ExecRootNotContainerRootfs => "SEC-1",
             Self::ExecTargetNotNestedPid1
             | Self::ExecTargetSharesPidNamespace
             | Self::ExecTargetSharesMountNamespace => "SUP-6",
@@ -306,7 +314,8 @@ impl ViolationReason {
             | Self::ExecTargetNotNestedPid1
             | Self::ExecTargetCgroupMismatch
             | Self::ExecTargetSharesPidNamespace
-            | Self::ExecTargetSharesMountNamespace => ErrorCode::FailedPrecondition,
+            | Self::ExecTargetSharesMountNamespace
+            | Self::ExecRootNotContainerRootfs => ErrorCode::FailedPrecondition,
             Self::EntrypointIsRuntimeBinary => ErrorCode::PermissionDenied,
         }
     }
@@ -413,6 +422,9 @@ impl ViolationReason {
             }
             Self::ExecTargetSharesMountNamespace => {
                 "the exec target shares the mount namespace with the caller; refusing to join"
+            }
+            Self::ExecRootNotContainerRootfs => {
+                "the root directory after joining is not the recorded container rootfs"
             }
         }
     }
@@ -638,6 +650,12 @@ mod tests {
                 "exec_target_shares_mount_namespace",
                 "SUP-6",
                 "the exec target shares the mount namespace with the caller; refusing to join",
+            ),
+            (
+                ViolationReason::ExecRootNotContainerRootfs,
+                "exec_root_not_container_rootfs",
+                "SEC-1",
+                "the root directory after joining is not the recorded container rootfs",
             ),
         ];
         for (r, code, behavior, message) in cases {

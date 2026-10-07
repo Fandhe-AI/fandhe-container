@@ -119,7 +119,7 @@ fn reject_unapplied(config: &OciConfig) -> Result<(), TraitError> {
 
 /// `root.path` が bundle 配下に収まり（bundle 外の絶対指定は拒否）、bundle 配下の全要素が
 /// symlink でない存在するディレクトリであることを確認する。
-fn check_rootfs(bundle: &Path, root_path: &Path) -> Result<PathBuf, TraitError> {
+pub(super) fn check_rootfs(bundle: &Path, root_path: &Path) -> Result<PathBuf, TraitError> {
     if root_path
         .components()
         .any(|c| matches!(c, Component::ParentDir))

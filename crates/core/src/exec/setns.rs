@@ -51,6 +51,12 @@
 //!   （`CLONE_NEWNS` はスレッドが複数あると拒否され、他 namespace もスレッドごとに食い違うため fail-closed で
 //!   拒否する）。呼び出すのは exec 専用の単一スレッドプロセスで、logs 捕捉スレッドを持つ supervisor 本体から
 //!   直接呼ばない（#503）。pid namespace への参加は **以後に fork した子** にだけ効く（2 段目の fork は #503）
+//! - **参加後の root と cwd**: `setns(CLONE_NEWNS)` は呼び出しプロセスの root と cwd を、参加先 mount namespace の
+//!   ルート（`mnt_ns->root` に積まれた最上位のマウント）へ付け替える（カーネルの `mntns_install`。pidfd で複数
+//!   namespace を一括指定した場合も `commit_nsset` が同じ結果を反映する）。これは対象（pid1）自身の root では
+//!   なく、両者が一致するのは launcher が `pivot_root` 済みで、以後 `/` にマウントが重ねられていない場合に
+//!   限る。本関数はこの一致を検証しない。参加後の `/` が記録したコンテナの rootfs であることの照合は、制限の
+//!   再適用（`exec/reapply.rs`。#502）が何も適用する前に行い、不一致なら拒否する
 //! - **違反記録（SEC-4）**: 対象が分離の前提を満たさない拒否（入れ子の PID 1 でない・cgroup 不一致・呼び出し側と
 //!   同じ pid / mnt namespace）には `IsolationViolation`（種別 `exec_target`）を付ける。cgroup 不一致の対象
 //!   には期待 cgroup パスを、既存のエスケープ・切り詰め（`ViolationSubject`）を通して載せる。対象の終了・
@@ -391,7 +397,7 @@ fn read_bounded(path: &str) -> std::io::Result<String> {
 
 /// `limit` バイトまでのテキストを読む。`limit` を超える内容は切り詰めずに `InvalidData` で失敗させる
 /// （途中で切れた行が照合に使われることを防ぐ。無制限確保もしない）。
-fn read_bounded_from(reader: impl Read, limit: u64) -> std::io::Result<String> {
+pub(super) fn read_bounded_from(reader: impl Read, limit: u64) -> std::io::Result<String> {
     let mut buf = String::new();
     reader
         .take(limit.saturating_add(1))

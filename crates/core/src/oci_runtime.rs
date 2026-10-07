@@ -51,7 +51,7 @@ pub use kill::{KillTimeout, ProcessSignaler, kill};
 pub use launch::ContainerChildProcess;
 pub use launch::{
     LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher, RootfsDir, START_TIMEOUT_MAX,
-    StartTimeouts,
+    StartTimeouts, pin_bundle_rootfs,
 };
 pub use mount_destination::{MountDestination, audit_mount_config_error};
 pub use start::{

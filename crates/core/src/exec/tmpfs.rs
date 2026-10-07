@@ -24,9 +24,12 @@
 //!   （型付きフィールドのみ）で、利用者文字列は渡さない
 //! - **事後条件**: マウント後に同じ要素を開き直し（作成はしない）、`statfs` が tmpfs であることを
 //!   確かめる（fail-closed）
-//! - **失敗時はプロセスを破棄する**: 途中のマウントは巻き戻さない（`crate::exec` のモジュール doc の契約）。
-//!   マウントは呼び出しスレッド専用の mount namespace に閉じ、プロセスの破棄で消える。自動作成した
-//!   マウント先ディレクトリ（0755・空）は rootfs に残る（後段の検査で拒否した場合も削除しない）
+//! - **失敗時の後始末**: rootfs はホスト上のディレクトリの bind mount のため、自動作成したマウント先
+//!   ディレクトリはプロセスを破棄しても残る。失敗時は、この呼び出しでマウントした tmpfs を逆順に
+//!   `umount2(MNT_DETACH)` で外し、この呼び出しの `mkdirat` が成功した要素だけを逆順に `unlinkat(AT_REMOVEDIR)`
+//!   で削除する（空ディレクトリしか消えないため、既存の内容は消さない）。後始末は最善努力で、失敗しても
+//!   元のエラーを返す。fd 固定後に第三者が改名した要素は追跡しない。呼び出し後もプロセスは破棄する
+//!   （`crate::exec` のモジュール doc の契約）
 //! - **同一スレッド**: `MountIsolation::establish` と同じスレッドで呼ぶ
 //!
 //! # 未対応（REPAIR-3: 実装済みを装わない）
@@ -100,9 +103,27 @@ fn mount_tmpfs_at(
     is_shared: &dyn Fn(&OwnedFd) -> Result<bool, ExecError>,
 ) -> Result<TmpfsReport, ExecError> {
     let rootfs = root_display(root);
+    // 件数は `TmpfsMountSet`（`TMPFS_MAX_MOUNTS` 以下）で上限が決まっている。
     let mut mounts = Vec::with_capacity(set.mounts().len());
+    let mut applied: Vec<Applied<'_>> = Vec::with_capacity(set.mounts().len());
     for spec in set.mounts() {
-        apply_one(root, &rootfs, spec, is_shared)?;
+        let mut state = Applied {
+            names: spec
+                .destination
+                .as_str()
+                .split('/')
+                .filter(|e| !e.is_empty())
+                .map(OsStr::new)
+                .collect(),
+            created: Vec::new(),
+            mounted: false,
+        };
+        let result = apply_one(root, &rootfs, spec, &mut state, is_shared);
+        applied.push(state);
+        if let Err(e) = result {
+            roll_back(root, &rootfs, &applied);
+            return Err(e);
+        }
         mounts.push(TmpfsMountOutcome {
             destination: spec.destination.as_str().to_owned(),
             size: spec.size.map(|s| s.bytes()),
@@ -113,20 +134,63 @@ fn mount_tmpfs_at(
     Ok(TmpfsReport { mounts })
 }
 
+/// 1 件の適用で rootfs・mount namespace に加えた変更の記録（失敗時の [`roll_back`] が使う）。
+struct Applied<'a> {
+    /// マウント先の要素列（正規化済み）。
+    names: Vec<&'a OsStr>,
+    /// この呼び出しの `mkdirat` が成功した要素の添字（昇順。既存・競合で先に作られた要素は含めない）。
+    created: Vec<usize>,
+    /// `mount(2)` が成功したか。
+    mounted: bool,
+}
+
+/// 失敗時の後始末（最善努力）。新しい順に、マウントした tmpfs を外してから、作成した要素を深い順に消す。
+///
+/// 要素は `root` から名前で開き直して辿る（symlink は辿らない）。`unlinkat(AT_REMOVEDIR)` は空ディレクトリ
+/// しか消さず、`umount2` はマウントのルート以外を `EINVAL` で拒否するため、対象が差し替わっていても
+/// 既存の内容や他のマウントは壊さない。途中で失敗した件はそこで打ち切り、残りの件は続ける。
+fn roll_back(root: BorrowedFd<'_>, rootfs: &std::path::Path, applied: &[Applied<'_>]) {
+    use std::os::unix::ffi::OsStrExt as _;
+    for state in applied.iter().rev() {
+        if state.mounted
+            && let Ok(dir) = open_chain(root, rootfs, &state.names, None)
+            && let Ok(target) = CString::new(format!("/proc/thread-self/fd/{}", dir.as_raw_fd()))
+        {
+            let _ = umount_tmpfs_syscall(&target);
+        }
+        for &index in state.created.iter().rev() {
+            let (Some(name), Some(prefix)) = (state.names.get(index), state.names.get(..index))
+            else {
+                break;
+            };
+            let Ok(c_name) = CString::new(name.as_bytes()) else {
+                break;
+            };
+            let parent_fd = if prefix.is_empty() {
+                None
+            } else {
+                match open_chain(root, rootfs, prefix, None) {
+                    Ok(fd) => Some(fd),
+                    Err(_) => break,
+                }
+            };
+            let parent = parent_fd.as_ref().map_or(root, |f| f.as_fd());
+            if sys::remove_dir_at(parent, &c_name).is_err() {
+                break;
+            }
+        }
+    }
+}
+
 fn apply_one(
     root: BorrowedFd<'_>,
     rootfs: &std::path::Path,
     spec: &TmpfsMountSpec,
+    state: &mut Applied<'_>,
     is_shared: &dyn Fn(&OwnedFd) -> Result<bool, ExecError>,
 ) -> Result<(), ExecError> {
-    let names: Vec<&OsStr> = spec
-        .destination
-        .as_str()
-        .split('/')
-        .filter(|e| !e.is_empty())
-        .map(OsStr::new)
-        .collect();
-    let dir = open_chain(root, rootfs, &names, Missing::Create)?;
+    let names = state.names.clone();
+    let dir = open_chain(root, rootfs, &names, Some(&mut state.created))?;
     let subject = names.iter().fold(rootfs.to_path_buf(), |p, n| p.join(n));
     if is_shared(&dir)? {
         return Err(ExecError::from_violation_at(
@@ -172,37 +236,38 @@ fn apply_one(
             &format!("mount(tmpfs on {})", spec.destination.as_str()),
         )
     })?;
+    state.mounted = true;
     verify_mounted(root, rootfs, &names, spec)
 }
 
-/// [`open_chain`] が存在しない要素をどう扱うか。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Missing {
-    /// 0755 で作ってから同じ方法で開き直す（マウント先の準備）。
-    Create,
-    /// 作らずに `path_missing` の違反記録付きで拒否する（事後検証。副作用を持たせない）。
-    Reject,
-}
-
-/// `root` から `names` を 1 要素ずつ `O_PATH|O_DIRECTORY|O_NOFOLLOW` で開く。無い要素の扱いは `missing`。
+/// `root` から `names` を 1 要素ずつ `O_PATH|O_DIRECTORY|O_NOFOLLOW` で開く。
+///
+/// `created` が `Some` なら、無い要素を 0755 で作ってから同じ方法で開き直し、`mkdirat` が成功した要素の
+/// 添字を追記する（途中で失敗しても、それまでに作った分は残る。マウント先の準備）。`None` なら作らずに
+/// `path_missing` の違反記録付きで拒否する（事後検証・後始末。副作用を持たせない）。
 fn open_chain(
     root: BorrowedFd<'_>,
     rootfs: &std::path::Path,
     names: &[&OsStr],
-    missing: Missing,
+    mut created: Option<&mut Vec<usize>>,
 ) -> Result<OwnedFd, ExecError> {
     use std::os::unix::ffi::OsStrExt as _;
     let mut cur: Option<OwnedFd> = None;
-    for name in names {
+    for (index, name) in names.iter().enumerate() {
         let c = CString::new(name.as_bytes()).map_err(|_| {
             ExecError::from_violation_at(ViolationReason::PathContainsNul, Some(rootfs), STAGE)
         })?;
         let parent = cur.as_ref().map_or(root, |f| f.as_fd());
         let next = match sys::open_dir_path_nofollow(Some(parent), &c) {
             Ok(fd) => fd,
-            Err(SysError::Os(sys::ENOENT)) if missing == Missing::Create => {
+            Err(SysError::Os(sys::ENOENT)) if created.is_some() => {
                 match sys::mkdir_at(parent, &c, DIR_MODE) {
-                    Ok(()) | Err(SysError::Os(sys::EEXIST)) => {}
+                    Ok(()) => {
+                        if let Some(list) = created.as_deref_mut() {
+                            list.push(index);
+                        }
+                    }
+                    Err(SysError::Os(sys::EEXIST)) => {}
                     Err(e) => return Err(ExecError::from_sys(e, STAGE, "mkdirat(mount target)")),
                 }
                 // 競合で先に作られた場合も、開き直しで種別（symlink・非ディレクトリ）を検証する。
@@ -240,7 +305,7 @@ fn fstatfs_magic_at(
     rootfs: &std::path::Path,
     names: &[&OsStr],
 ) -> Result<i64, ExecError> {
-    let dir = open_chain(root, rootfs, names, Missing::Reject)?;
+    let dir = open_chain(root, rootfs, names, None)?;
     sys::fs_type(dir.as_fd())
         .map_err(|e| ExecError::from_sys(e, STAGE, "fstatfs(tmpfs mount target)"))
 }
@@ -299,6 +364,21 @@ fn mount_tmpfs_syscall(
     Ok(())
 }
 
+#[cfg(not(test))]
+fn umount_tmpfs_syscall(target: &std::ffi::CStr) -> Result<(), SysError> {
+    sys::umount_detach_at(target)
+}
+
+/// dry-run: `umount2(2)` を呼ばず、解決した対象を記録する。
+#[cfg(test)]
+fn umount_tmpfs_syscall(target: &std::ffi::CStr) -> Result<(), SysError> {
+    let resolved = std::fs::read_link(target.to_string_lossy().as_ref())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    tests::UMOUNTS.with(|c| c.borrow_mut().push(resolved));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,6 +388,15 @@ mod tests {
     thread_local! {
         pub(super) static CALLS: std::cell::RefCell<Vec<(String, u64, String)>> =
             const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    thread_local! {
+        pub(super) static UMOUNTS: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn take_umounts() -> Vec<String> {
+        UMOUNTS.with(|c| std::mem::take(&mut *c.borrow_mut()))
     }
 
     fn take_calls() -> Vec<(String, u64, String)> {
@@ -419,6 +508,9 @@ mod tests {
             Some(ViolationReason::TargetOnSharedMount)
         );
         assert!(take_calls().is_empty());
+        // マウント前に拒否した件も、自動作成したマウント先を残さない（外す対象は無い）。
+        assert!(!tmp.0.join("run").exists());
+        assert_eq!(take_umounts(), Vec::<String>::new());
     }
 
     /// SUP-12・TASK-169.2: fd 固定後にマウント先が改名されたら、移動後の実体へ mount せず
@@ -449,15 +541,51 @@ mod tests {
         let tmp = Tmp::new("nocreate");
         let fd = tmp.fd();
         let names = [OsStr::new("a"), OsStr::new("b")];
-        let err = open_chain(fd.as_fd(), &tmp.0, &names, Missing::Reject).expect_err("missing");
+        let err = open_chain(fd.as_fd(), &tmp.0, &names, None).expect_err("missing");
         assert_eq!(err.stage, IsolationStage::MountTmpfs);
         assert_eq!(
             err.violation.as_ref().map(|v| v.reason),
             Some(ViolationReason::PathMissing)
         );
         assert!(!tmp.0.join("a").exists());
-        open_chain(fd.as_fd(), &tmp.0, &names, Missing::Create).expect("create");
+        std::fs::create_dir(tmp.0.join("a")).expect("pre-existing a");
+        let mut created = Vec::new();
+        open_chain(fd.as_fd(), &tmp.0, &names, Some(&mut created)).expect("create");
         assert!(tmp.0.join("a/b").is_dir());
+        // 既存の `a` は含めず、自分で作った `b`（添字 1）だけを記録する。
+        assert_eq!(created, vec![1]);
+    }
+
+    /// SUP-12・TASK-169.2: 後続の件が失敗したら、先にマウントした tmpfs を外し、自動作成した
+    /// ディレクトリだけを消す（既存ディレクトリと中身は残す）。
+    #[test]
+    fn sup12_task169_2_failure_rolls_back_mounts_and_created_dirs() {
+        let tmp = Tmp::new("rollback");
+        let _ = (take_calls(), take_umounts());
+        std::fs::create_dir_all(tmp.0.join("pre")).expect("pre");
+        std::fs::write(tmp.0.join("pre/keep"), b"x").expect("keep");
+        std::fs::create_dir_all(tmp.0.join("outside")).expect("outside");
+        symlink(tmp.0.join("outside"), tmp.0.join("link")).expect("symlink");
+        let fd = tmp.fd();
+        let s = set(&[("/scratch/a", None), ("/pre/new", None), ("/link/x", None)]);
+        let err = mount_tmpfs_at(fd.as_fd(), &s, &not_shared).expect_err("third fails");
+        assert_eq!(
+            err.violation.as_ref().map(|v| v.reason),
+            Some(ViolationReason::PathSymlinkOrNotDirectory)
+        );
+        assert_eq!(take_calls().len(), 2);
+        // 新しい順に外す。
+        assert_eq!(
+            take_umounts(),
+            vec![
+                tmp.0.join("pre/new").to_string_lossy().into_owned(),
+                tmp.0.join("scratch/a").to_string_lossy().into_owned(),
+            ]
+        );
+        assert!(!tmp.0.join("scratch").exists());
+        assert!(!tmp.0.join("pre/new").exists());
+        assert_eq!(std::fs::read(tmp.0.join("pre/keep")).expect("keep"), b"x");
+        assert!(tmp.0.join("outside").is_dir());
     }
 
     /// SUP-12・TASK-169.2: 読み取り専用・exec 許可のフラグが反映される。

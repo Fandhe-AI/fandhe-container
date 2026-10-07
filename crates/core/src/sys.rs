@@ -988,6 +988,23 @@ pub(crate) fn mount_tmpfs_at(
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// `target` のマウントを `MNT_DETACH` で切り離す（`umount2(target, MNT_DETACH)`）。
+///
+/// `crate::exec::mount_tmpfs` の失敗時の後始末が、自分でマウントした tmpfs のルートを開き直した
+/// O_PATH fd を指す `/proc/thread-self/fd/N` を渡す（magic link を fd の実体へ解決させるため
+/// `UMOUNT_NOFOLLOW` は付けない）。`target` がマウントのルートでなければカーネルが `EINVAL` で拒否する。
+// テストビルドでは `crate::exec` の dry-run 差し込み点が本関数を呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn umount_detach_at(target: &CStr) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `target` は `&CStr` の借用で NUL 終端かつ呼び出しの間生存し、カーネルはポインタを
+    // 保持しない。flags は定数。副作用は呼び出しスレッドの mount namespace からのマウント 1 件の切り離しのみ。
+    let rc = unsafe { umount2(target.as_ptr(), consts::MNT_DETACH) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
 /// `target` を自分自身へ再帰 bind mount し（`MS_BIND|MS_REC`）、`target` をマウントポイントにする。
 ///
 /// `pivot_root(2)` の new_root は「マウントポイントであること」が要件で、rootfs が単なる

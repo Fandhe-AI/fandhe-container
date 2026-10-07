@@ -1295,6 +1295,9 @@ mod tests {
     struct Store {
         rec: Mutex<StateRecord>,
         conflicts: Mutex<u32>,
+        /// `restart_count` を進める書き込み（再起動の `Running` 記録）の成功直前に停止要求を立てる。
+        /// `true` なら、その書き込みの直後に別の supervisor（pid 999）が監視権を取った状態にする。
+        stop_on_restart_write: Mutex<Option<(StopToken, bool)>>,
     }
 
     impl StateStore for Store {
@@ -1329,8 +1332,21 @@ mod tests {
                 return Err(TraitError::new(ErrorCode::FailedPrecondition, "stale"));
             }
             let s = req.supervision().unwrap_or_else(|| g.supervision());
+            let hook = if s.restart_count() > g.restart_count() {
+                self.stop_on_restart_write.lock().unwrap().clone()
+            } else {
+                None
+            };
             let next = bump(&g, s, req.status().clone());
             *g = next.clone();
+            if let Some((stop, foreign_claim)) = hook {
+                stop.request_stop();
+                if foreign_claim {
+                    let claimed =
+                        SupervisionState::new(Some(pidn(999)), s.health(), s.restart_count());
+                    *g = bump(&g, claimed, g.status().clone());
+                }
+            }
             Ok(next)
         }
         fn get(&self, _: &GetStateRequest) -> Result<StateRecord, TraitError> {
@@ -1359,6 +1375,7 @@ mod tests {
         Arc::new(Store {
             rec: Mutex::new(rec),
             conflicts: Mutex::new(0),
+            stop_on_restart_write: Mutex::new(None),
         })
     }
 
@@ -2186,6 +2203,77 @@ mod tests {
         let rec = st.rec.lock().unwrap();
         assert_eq!(rec.restart_count(), 0);
         assert_eq!(rec.status().state(), ContainerState::Stopped);
+    }
+
+    /// SUP-3・TASK-159.3: 最終確認と `Running` 記録の間に届いた停止要求では、記録を元の終了記録へ戻して
+    /// 新プロセスを terminate する。restart_count == 0・状態は Stopped（終了コード 1）・監視権なしで、
+    /// 再起動は数えず（restarts == 0・Restart 通知 0 件）、以後の再 launch もしない（relaunch は 1 回のまま）。
+    #[test]
+    fn sup3_task159_3_stop_racing_running_record_reverts_and_terminates() {
+        let st = store(0, 42);
+        let stop = StopToken::new();
+        *st.stop_on_restart_write.lock().unwrap() = Some((stop.clone(), false));
+        let q = Arc::new(Queue::new(&[(43, FAIL), (44, FAIL)]));
+        let obs = Events::default();
+        let out = run(&st, "always", FAIL, &q, &stop, &obs);
+        let SuperviseOutcome::Stopped {
+            process,
+            late,
+            restarts,
+            ..
+        } = out
+        else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert!(process.is_none());
+        assert_eq!(restarts, 0);
+        assert!(late.wait_settled(Duration::from_secs(5)));
+        assert!(late.take().is_empty());
+        assert_eq!(q.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(q.terminated.load(Ordering::SeqCst), 1);
+        assert_eq!(obs.count(MonitorOperation::Restart), 0);
+        let rec = st.rec.lock().unwrap();
+        assert_eq!(rec.restart_count(), 0);
+        assert_eq!(rec.status().state(), ContainerState::Stopped);
+        assert_eq!(rec.status().exit_code(), Some(1));
+        assert_eq!(rec.status().pid(), None);
+        assert_eq!(rec.supervision().supervisor_pid(), None);
+        assert_eq!(rec.health(), Some(HealthStatus::Healthy));
+    }
+
+    /// SUP-3・REPAIR-5・TASK-159.3: 停止要求と競合した `Running` 記録を、別の supervisor（pid 999）が監視権を
+    /// 取ったため戻せない場合は、新プロセスを terminate せずハンドル（pid 43）を返す。記録は Running(43)・
+    /// restart_count == 1・監視権 999 のまま（他者の遷移を上書きしない）で、再起動 1 回として数える。
+    #[test]
+    fn sup3_task159_3_stop_racing_running_record_keeps_foreign_claim() {
+        let st = store(0, 42);
+        let stop = StopToken::new();
+        *st.stop_on_restart_write.lock().unwrap() = Some((stop.clone(), true));
+        let q = Arc::new(Queue::new(&[(43, FAIL), (44, FAIL)]));
+        let obs = Events::default();
+        let out = run(&st, "always", FAIL, &q, &stop, &obs);
+        let SuperviseOutcome::MonitorError {
+            error,
+            process,
+            restarts,
+        } = out
+        else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert_eq!(error.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(process.pid().get(), 43);
+        assert_eq!(restarts, 1);
+        assert_eq!(q.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(q.terminated.load(Ordering::SeqCst), 0);
+        assert_eq!(obs.count(MonitorOperation::Restart), 1);
+        let rec = st.rec.lock().unwrap();
+        assert_eq!(rec.restart_count(), 1);
+        assert_eq!(rec.status().state(), ContainerState::Running);
+        assert_eq!(rec.status().pid().map(NonZeroU32::get), Some(43));
+        assert_eq!(
+            rec.supervision().supervisor_pid().map(NonZeroU32::get),
+            Some(999)
+        );
     }
 
     /// SUP-3・REPAIR-5・TASK-159.3: 停止要求後の新プロセスの terminate が失敗したらハンドルを返す。

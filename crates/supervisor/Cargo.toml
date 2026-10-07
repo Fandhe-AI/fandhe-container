@@ -21,6 +21,7 @@
 # TASK-164.4（#508）で 100 万行規模の欠落 0・重複 0 の結合テストを追加した（依存は不変）。
 # TASK-163.3（#502）で exec に seccomp / Landlock 再適用の配線を追加した（core の安全 API を呼ぶだけ。依存は不変）。
 # TASK-163.4（#503）で exec にコマンド実行（run_command）と実コンテナへの通し結合試験 tests/exec.rs を追加した（依存は不変）。
+# TASK-163 追補（#1465）で exec::run_command に監査の記録先を必須の引数として追加した（依存は不変）。
 # 外部クレート（crates.io）の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 
 [package]
@@ -92,6 +93,14 @@ harness = false
 [[test]]
 name = "exec_timeout"
 path = "tests/exec_timeout.rs"
+harness = false
+
+# exec の対象の拒否が層 exec_target の監査レコードとして 1 拒否 1 件記録されることの結合試験（SEC-4・SUP-6・
+# TASK-163 追補・#1465）。fork は単一スレッドの呼び出し元を要求するため harness = false。root・実コンテナ不要で、
+# 既定のテスト集合で実行する（依存は不変）。
+[[test]]
+name = "exec_audit"
+path = "tests/exec_audit.rs"
 harness = false
 
 # exec の対象を起動時から保持する pidfd で固定する経路の結合試験（SUP-6・SEC-1・CORE-1・TASK-163 追補・#1461）。

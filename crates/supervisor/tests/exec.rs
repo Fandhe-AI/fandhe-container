@@ -97,6 +97,7 @@ mod linux {
     use std::process::{Child, ChildStdin, Command, Stdio};
     use std::time::{Duration, Instant};
 
+    use fandhe_container_core::audit_log::{AuditDelivery, AuditRecord, AuditSink};
     use fandhe_container_core::cgroups::CgroupName;
     use fandhe_container_core::exec::{
         ChildExit, ContainerEnv, ExecExit, IsolationConfig, MountIsolation, Namespace,
@@ -106,6 +107,7 @@ mod linux {
     use fandhe_container_core::oci_runtime::load_config;
     use fandhe_container_core::traits::{
         CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, StateRecord, StateRevision,
+        TraitError,
     };
     use fandhe_container_supervisor::container_options::env::EnvVar;
     use fandhe_container_supervisor::exec::{
@@ -512,7 +514,7 @@ mod linux {
     // ---------------------------------------------------------------- joiner（再入）
 
     /// `--joiner <mode> <bundle> <scope> <instance> <pid1> [<pid1_b> <instance_b> | <expected cgroup path>]`。
-    /// 単一スレッドの exec 専用プロセス。結果は標準出力 1 行（成功 `outcome ...`・拒否 `error: <message>`）と
+    /// 単一スレッドの exec 専用プロセス。結果は標準出力（成功 `outcome ...` 1 行・拒否 `error: <message>` と監査記録の要約 `audit: ...` の 2 行）と
     /// 終了コード（成功 0・拒否 3）で返す。
     fn joiner(args: &[String]) {
         let arg = |i: usize| args.get(i).map(String::as_str).expect("joiner argument");
@@ -532,9 +534,11 @@ mod linux {
             .expect("request")
             .with_env(&explicit_env())
             .expect("explicit env");
+        // 拒否の監査記録（SEC-4・SUP-6・#1465）を受けるメモリ上の sink。拒否の行の次に記録の要約を 1 行出す。
+        let sink = CountingSink::default();
         let result = match mode {
-            "run" | "run-script" => run_command(&record, &entry, timeout()),
-            "run-in" => run_command_in(&record, arg(5), &entry, timeout()),
+            "run" | "run-script" => run_command(&record, &entry, timeout(), &sink),
+            "run-in" => run_command_in(&record, arg(5), &entry, timeout(), &sink),
             "mismatch" => return joiner_mismatch(bundle, scope, &record, args),
             other => panic!("unknown joiner mode {other}"),
         };
@@ -550,10 +554,47 @@ mod linux {
                     o.supplementary_groups.as_str()
                 );
             }
-            Err(e) => {
-                println!("error: {}", e.message());
+            Err(rejected) => {
+                println!("error: {}", rejected.error.message());
+                println!("audit: {}", sink.summary(&rejected.delivery));
                 std::process::exit(3);
             }
+        }
+    }
+
+    /// 拒否の監査記録を数えるだけの sink（実機試験の joiner 用）。
+    #[derive(Default)]
+    struct CountingSink {
+        records: std::sync::Mutex<Vec<AuditRecord>>,
+    }
+
+    impl AuditSink for CountingSink {
+        fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+            if let Ok(mut g) = self.records.lock() {
+                g.push(record.clone());
+            }
+            Ok(())
+        }
+    }
+
+    impl CountingSink {
+        /// `delivery=<結果> records=<件数> layer=<層> reason=<理由> path=<none|some>`（先頭の 1 件）。
+        fn summary(&self, delivery: &AuditDelivery) -> String {
+            let g = self.records.lock().expect("sink lock");
+            let first = g.first();
+            format!(
+                "delivery={delivery:?} records={} layer={} reason={} path={}",
+                g.len(),
+                first.map_or("-", |r| r.layer().as_str()),
+                first
+                    .and_then(AuditRecord::reason)
+                    .map_or("-", |r| r.as_str()),
+                if first.is_some_and(|r| r.path().is_some()) {
+                    "some"
+                } else {
+                    "none"
+                },
+            )
         }
     }
 
@@ -925,7 +966,9 @@ mod linux {
         assert_eq!(
             out.trim_end(),
             "error: exec stage SetNs: the root directory after joining is not the recorded container \
-             rootfs (violation: exec_target/exec_root_not_container_rootfs, SEC-1)"
+             rootfs (violation: exec_target/exec_root_not_container_rootfs, SEC-1)\n\
+             audit: delivery=Recorded records=1 layer=exec_target \
+             reason=exec_root_not_container_rootfs path=none"
         );
         assert!(
             !bundle.rootfs().join("data/ok").exists(),

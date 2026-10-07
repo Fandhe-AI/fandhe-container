@@ -451,21 +451,34 @@ mod tests {
     fn sup6_task163_concurrent_waiters_share_one_exec_status() {
         use std::os::fd::AsRawFd as _;
         let exit = ChildExit::Exited(126);
+        let mut classified = 0usize;
         for _ in 0..50 {
             let (child, writer) = exec_child_with_status(b"R\n");
             assert!(child.status.as_raw_fd() > 2 && writer.as_raw_fd() > 2);
             drop(writer);
-            let results: Vec<ExecExit> = std::thread::scope(|scope| {
+            let results: Vec<Option<ExecExit>> = std::thread::scope(|scope| {
                 let handles: Vec<_> = (0..8)
-                    .map(|_| scope.spawn(|| child.classify(exit).expect("classified")))
+                    .map(|_| scope.spawn(|| child.classify(exit).ok()))
                     .collect();
                 handles
                     .into_iter()
                     .map(|h| h.join().expect("join"))
                     .collect()
             });
-            assert_eq!(results, vec![ExecExit::Command(exit); 8]);
+            // 全員が同じ判定を受け取る。libtest では他のテストスレッドが子プロセスを fork し得て、その子が
+            // `execve` までの間 pipe の書き込み側の複製を持つと「書き込み側が開いたまま」（判定不能 = `None`）に
+            // なる（本番の exec 専用プロセスは単一スレッドで、この重なりは起きない）。その回も全員が判定不能で
+            // 揃い、誰も「起動していない」とは判定しない。
+            let first = results.first().copied().flatten();
+            assert_eq!(results, vec![first; 8]);
+            assert!(
+                first.is_none() || first == Some(ExecExit::Command(exit)),
+                "{first:?}"
+            );
+            classified += usize::from(first.is_some());
         }
+        // 判定不能は他スレッドの fork と重なった回だけで、「起動した」と判定される回が必ずある。
+        assert!(classified > 0, "no round was classified");
     }
 
     /// SUP-6・REPAIR-5・TASK-163 追補（#1460）: 状態を読めなかった判定は記録され、読み直さない（書き込み側が

@@ -2375,11 +2375,18 @@ mod tests {
     #[test]
     fn sup6_task163_read_exec_status_never_blocks() {
         let exit = ChildExit::Exited(127);
+        // libtest では他のテストスレッドが子プロセスを fork し得て、その子が `execve` までの間 pipe の書き込み側の
+        // 複製を持つと「書き込み側が開いたまま」（判定不能）になる。その回は pipe を作り直して読み直す
+        // （本番の exec 専用プロセスは単一スレッドで、この重なりは起きない）。
         let read = |content: &[u8]| {
-            let (reader, mut writer) = std::io::pipe().unwrap();
-            writer.write_all(content).unwrap();
-            drop(writer);
-            read_exec_status(&std::fs::File::from(OwnedFd::from(reader)), exit).unwrap()
+            (0..200)
+                .find_map(|_| {
+                    let (reader, mut writer) = std::io::pipe().unwrap();
+                    writer.write_all(content).unwrap();
+                    drop(writer);
+                    read_exec_status(&std::fs::File::from(OwnedFd::from(reader)), exit).ok()
+                })
+                .expect("the status pipe must become readable")
         };
         assert_eq!(read(b"R\n"), ExecExit::Command(exit));
         assert_eq!(

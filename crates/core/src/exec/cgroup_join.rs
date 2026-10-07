@@ -195,6 +195,24 @@ pub struct ExecChildCgroup {
 }
 
 impl ExecChildCgroup {
+    /// 記録（`id`・`placement`）から導いたコンテナ cgroup の直下に子 cgroup `name` を **呼び出しプロセスで** 作る
+    /// （worker を fork する前。#1466）。
+    ///
+    /// 作成に成功した呼び出し側だけがこの cgroup の所有者で、後始末（[`remove_exec_child_cgroup`]）の対象にしてよい。
+    /// 同名が既に存在すれば `mkdirat` が失敗して `Err` になる（既存は採用しない）ため、失敗時は後始末を呼んではならない
+    /// （他者・残骸の同名 cgroup を止めない）。fd は fork で worker へ継承される。
+    pub fn create(
+        id: &ContainerId,
+        placement: &CgroupPlacement,
+        name: &ExecCgroupName,
+    ) -> Result<Self, ExecError> {
+        let path = container_cgroup_path_for(id, placement)?;
+        let dir = open_cgroup_by_path(&path).map_err(ExecError::from_cgroup)?;
+        let fds = ExecChildCgroupFds::create(dir.as_fd(), name.as_str())
+            .map_err(ExecError::from_cgroup)?;
+        Ok(Self { fds })
+    }
+
     /// この cgroup の全プロセス（コマンドの子孫を含む）を `cgroup.kill` で `SIGKILL` する。冪等。
     pub fn kill_all(&self) -> Result<(), ExecError> {
         self.fds.kill().map_err(ExecError::from_cgroup)

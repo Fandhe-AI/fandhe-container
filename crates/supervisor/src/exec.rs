@@ -567,13 +567,13 @@ pub fn run_command(
     // 稼働中でない記録は、fork せず呼び出しプロセスで拒否する（副作用なし。記録の対象外）。
     running_pid(record).map_err(AuditedRejection::not_applicable)?;
     let name = ExecCgroupName::unique();
-    let result = run_in_worker_with(
+    let result = run_owning_child_cgroup(
         deadline,
-        WORKER_GRACE,
+        || create_child_cgroup(record, &name),
         || cleanup_child_cgroup(record, &name),
-        || {
+        |child| {
             let target = identify_pid1(record)?;
-            run_with_target(&target, request, deadline, &name)
+            run_with_target(&target, request, deadline, child)
         },
     );
     audit_worker_result(result, audit)
@@ -610,13 +610,13 @@ pub fn run_command_with_pidfd(
     let deadline = Deadline::after(timeout);
     running_pid(record).map_err(AuditedRejection::not_applicable)?;
     let name = ExecCgroupName::unique();
-    let result = run_in_worker_with(
+    let result = run_owning_child_cgroup(
         deadline,
-        WORKER_GRACE,
+        || create_child_cgroup(record, &name),
         || cleanup_child_cgroup(record, &name),
-        || {
+        |child| {
             let target = identify_pid1_with_pidfd(record, pidfd)?;
-            run_with_target(&target, request, deadline, &name)
+            run_with_target(&target, request, deadline, child)
         },
     );
     audit_worker_result(result, audit)
@@ -636,9 +636,13 @@ pub fn run_command_in(
     let deadline = Deadline::after(timeout);
     running_pid(record).map_err(AuditedRejection::not_applicable)?;
     let name = ExecCgroupName::unique();
-    let result = run_in_worker_with(
+    let result = run_owning_child_cgroup(
         deadline,
-        WORKER_GRACE,
+        || {
+            ExecChildCgroup::create_in_path_for_test(expected_cgroup_path, &name)
+                .map(Some)
+                .map_err(from_exec_error)
+        },
         || {
             fandhe_container_core::exec::remove_exec_child_cgroup_in(
                 expected_cgroup_path,
@@ -648,9 +652,9 @@ pub fn run_command_in(
             .map(|_| ())
             .map_err(from_exec_error)
         },
-        || {
+        |child| {
             let target = identify_pid1_in(record, expected_cgroup_path)?;
-            run_with_target(&target, request, deadline, &name)
+            run_with_target(&target, request, deadline, child)
         },
     );
     audit_worker_result(result, audit)
@@ -715,8 +719,8 @@ fn run_in_worker_with(
     // 親は書き込み側を閉じる（worker の終了後に読み取りが EOF で終わるようにする）。
     drop(writer);
     // worker を fork した後は、結果の取得がどう終わっても（正常・期限切れ・異常終了・結果行の不正）worker の
-    // 停止・回収の後に exec 用の子 cgroup の後始末を必ず行う（worker が作った cgroup の削除は制限の掛かっていない
-    // ここでしかできない。冪等で、worker が作る前に失敗していれば何もしない。#1466）。
+    // 停止・回収の後に exec 用の子 cgroup の後始末を必ず行う（cgroup は呼び出しプロセスが fork 前に作って
+    // 所有しており、削除は制限の掛かっていないここでしかできない。作成できなかった場合は呼ばれない。#1466）。
     let result = collect_worker_result(&child, &mut reader, deadline, grace);
     let cleaned = cleanup();
     match (result, cleaned) {
@@ -783,6 +787,72 @@ fn collect_worker_result(
             )
         })?;
     decode_worker_result(&line)
+}
+
+/// exec 用の子 cgroup を呼び出しプロセスで作り、作成できた場合だけ所有者として後始末する（#1466）。
+///
+/// `create` は worker の fork 前に呼ぶ。失敗（同名の既存・残骸との衝突を含む）なら何も所有していないため
+/// 後始末は呼ばない（他者・残骸の同名 cgroup を止めない）。作成後は、worker を fork できた場合は
+/// [`run_in_worker_with`] が worker 回収後に、fork 前に失敗した場合はここで `remove` を呼ぶ。`create` が
+/// `Ok(None)` を返すのは cgroup 配置の記録が無い場合で、`work` が対象特定で拒否する（作成物なし）。
+fn run_owning_child_cgroup(
+    deadline: Deadline,
+    create: impl FnOnce() -> Result<Option<ExecChildCgroup>, TraitError>,
+    remove: impl Fn() -> Result<(), TraitError>,
+    work: impl FnOnce(Option<&ExecChildCgroup>) -> Result<ExecOutcome, TraitError>,
+) -> Result<ExecOutcome, WorkerFailure> {
+    let child = create()?;
+    let owned = child.is_some();
+    let cleanup_ran = std::cell::Cell::new(false);
+    let result = run_in_worker_with(
+        deadline,
+        WORKER_GRACE,
+        || {
+            cleanup_ran.set(true);
+            if owned { remove() } else { Ok(()) }
+        },
+        || work(child.as_ref()),
+    );
+    let mut result = result;
+    if owned && !cleanup_ran.get() {
+        // worker を fork できなかった（期限切れ・pipe 失敗等）。作成した cgroup は空だが残さない。
+        if let Err(cleanup_err) = remove() {
+            result = match result {
+                Ok(_) => Err(cleanup_err.into()),
+                Err(f) => Err(WorkerFailure {
+                    error: TraitError::new(
+                        f.error.code(),
+                        format!(
+                            "{}; cleanup also failed: {}",
+                            f.error.message(),
+                            cleanup_err.message()
+                        ),
+                    ),
+                    violation: f.violation,
+                }),
+            };
+        }
+    }
+    drop(child);
+    result
+}
+
+/// 記録から導いたコンテナ cgroup の直下に exec 用の子 cgroup を作る。cgroup 配置の記録が無ければ `None`
+/// （worker の `identify_pid1` が拒否する）。
+fn create_child_cgroup(
+    record: &StateRecord,
+    name: &ExecCgroupName,
+) -> Result<Option<ExecChildCgroup>, TraitError> {
+    let Some(placement) = record.cgroup() else {
+        return Ok(None);
+    };
+    match ExecChildCgroup::create(record.status().id(), placement, name) {
+        Ok(child) => Ok(Some(child)),
+        // コンテナ cgroup が存在しない記録は、worker の `identify_pid1` が対象の拒否（監査記録の対象）として
+        // 返す。ここでは何も作っていない（所有なし）ため `None` にして拒否の経路を保つ。
+        Err(e) if e.code == ErrorCode::NotFound => Ok(None),
+        Err(e) => Err(from_exec_error(e)),
+    }
 }
 
 /// 呼び出しプロセスでの exec 用の子 cgroup の後始末（記録から導いたコンテナ cgroup 直下の `name` を
@@ -990,13 +1060,18 @@ fn run_with_target(
     target: &ExecTarget,
     request: &ExecRequest,
     deadline: Deadline,
-    name: &ExecCgroupName,
+    child_cgroup: Option<&ExecChildCgroup>,
 ) -> Result<ExecOutcome, TraitError> {
+    // コマンドだけを入れる子 cgroup は、呼び出しプロセスが fork 前に作って所有する（worker は fd を継承して使う。
+    // 同名の既存を後始末で止めないため。#1466）。配置の記録が無ければ `identify_pid1` が先に拒否しここへ来ない。
+    let child_cgroup = child_cgroup.ok_or_else(|| {
+        TraitError::new(
+            ErrorCode::Internal,
+            "exec stage CgroupJoin: the exec child cgroup was not created",
+        )
+    })?;
     let cgroup = prepare_cgroup_join(target)?;
-    // コマンドだけを入れる子 cgroup を、`enter_namespaces` と制限の再適用の前（cgroupfs を開ける間）に作る。
-    // 作れなければ（`cgroup.kill` が無い等）exec しない（fail-closed）。worker はコンテナ cgroup に留まる。
-    let child_cgroup = cgroup.create_child_cgroup(name).map_err(from_exec_error)?;
-    let result = run_in_child_cgroup(target, request, deadline, cgroup, &child_cgroup);
+    let result = run_in_child_cgroup(target, request, deadline, cgroup, child_cgroup);
     // 成否によらず、コマンドの子孫を子 cgroup ごと止める（exec の終了後に子孫を残さない。削除は呼び出しプロセスが行う）。
     // 失敗しても呼び出しプロセスの後始末が改めて `cgroup.kill` する。
     let _ = child_cgroup.kill_all();
@@ -1594,6 +1669,19 @@ mod tests {
     }
 
     /// SUP-6・TASK-163.4: pipe 容量を超える長さのエラーメッセージは上限で切り詰められ、改行で終わり往復できる。
+    #[test]
+    fn sup6_task163_create_failure_does_not_run_cleanup() {
+        // 作成に失敗（同名の既存との衝突）したら、後始末（既存 cgroup の kill / 削除）を呼ばず fork もしない。
+        let err = run_owning_child_cgroup(
+            Deadline::after(Duration::from_secs(5)),
+            || Err(TraitError::new(ErrorCode::AlreadyExists, "exists")),
+            || panic!("cleanup must not run for a cgroup we did not create"),
+            |_| panic!("worker must not run"),
+        )
+        .unwrap_err();
+        assert_eq!(err.error.code(), ErrorCode::AlreadyExists);
+    }
+
     #[test]
     fn sup6_task163_4_oversized_worker_message_is_truncated() {
         let err = TraitError::new(ErrorCode::Internal, "あ".repeat(100_000));

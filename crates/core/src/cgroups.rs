@@ -36,7 +36,8 @@
 //!
 //! # 実装済みの資源制限
 //! - `cpu.max`（TASK-32.3・#160）: [`ContainerCgroup::set_cpu_max`]（`cpu` サブモジュール。起動フローからは
-//!   未呼び出しで、本番 launcher〔TASK-29 / TASK-157 系〕で結線する）
+//!   未呼び出しで、本番 launcher〔TASK-29 / TASK-157 系〕で結線する）。`--cpus` 相当値の変換
+//!   [`CpuMax::parse_cpus`]（TASK-170.1・SUP-13）を含む
 //! - `memory.max` / `memory.swap.max`（TASK-32.2・#159）: [`ContainerCgroup::set_memory_limits`]
 //!   （同上。未結線）
 //! - `pids.max` / `io.max`（SUP-13・TASK-170.2・#533）: [`ContainerCgroup::set_pids_max`]（`pids` サブモジュール）・
@@ -73,7 +74,7 @@ use crate::sys::{self, SysError};
 use crate::traits::{CgroupScope, ContainerId, ErrorCode, StateRevision, TraitError};
 
 mod cpu;
-pub use cpu::{CpuMax, CpuQuota};
+pub use cpu::{CpuMax, CpuQuota, NANO_CPUS_PER_CPU};
 mod io_max;
 pub use io_max::{BlockDevice, IoLimit, IoMax};
 mod pids;

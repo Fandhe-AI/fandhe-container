@@ -907,11 +907,8 @@ mod tests {
     #[test]
     fn sup6_launch_pidfd_rejects_recorded_pid_mismatch() {
         let mut child = spawn_sleeper();
-        let Ok(pidfd) = sys::pidfd_open(child.id()) else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return; // pidfd 未対応のカーネルでは検証対象外
-        };
+        let pidfd = sys::pidfd_open(child.id())
+            .expect("pidfd_open は Linux 5.3 以降が前提（pidfd 非対応環境では失敗させる）");
         let id = ContainerId::new("x").unwrap();
         let other = NonZeroU32::new(child.id() + 1).unwrap();
         let err =
@@ -930,11 +927,8 @@ mod tests {
     #[test]
     fn sup6_launch_pidfd_match_proceeds_to_nested_pid1_check() {
         let mut child = spawn_sleeper();
-        let Ok(pidfd) = sys::pidfd_open(child.id()) else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return;
-        };
+        let pidfd = sys::pidfd_open(child.id())
+            .expect("pidfd_open は Linux 5.3 以降が前提（pidfd 非対応環境では失敗させる）");
         let id = ContainerId::new("x").unwrap();
         let pid = NonZeroU32::new(child.id()).unwrap();
         let err =
@@ -963,11 +957,8 @@ mod tests {
     #[test]
     fn sup6_launch_pidfd_rejects_exited_process() {
         let mut child = spawn_sleeper();
-        let Ok(pidfd) = sys::pidfd_open(child.id()) else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return;
-        };
+        let pidfd = sys::pidfd_open(child.id())
+            .expect("pidfd_open は Linux 5.3 以降が前提（pidfd 非対応環境では失敗させる）");
         let pid = NonZeroU32::new(child.id()).unwrap();
         child.kill().unwrap();
         child.wait().unwrap();

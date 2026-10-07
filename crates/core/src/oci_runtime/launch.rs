@@ -628,13 +628,14 @@ mod tests {
         let process =
             ContainerChildProcess::new(crate::exec::ContainerChild::from_pid_for_test(pid))
                 .expect("wrap");
-        if let Some(fd) = process.launch_pidfd() {
-            use std::os::fd::AsRawFd as _;
-            let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd()))
-                .expect("fdinfo");
-            let line = info.lines().find(|l| l.starts_with("Pid:")).expect("Pid:");
-            assert_eq!(line.trim_start_matches("Pid:").trim(), pid.to_string());
-        }
+        let fd = process
+            .launch_pidfd()
+            .expect("pidfd は Linux 5.3 以降が前提（pidfd 非対応環境では失敗させる）");
+        use std::os::fd::AsRawFd as _;
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd()))
+            .expect("fdinfo");
+        let line = info.lines().find(|l| l.starts_with("Pid:")).expect("Pid:");
+        assert_eq!(line.trim_start_matches("Pid:").trim(), pid.to_string());
         child.kill().expect("kill");
         child.wait().expect("wait");
     }

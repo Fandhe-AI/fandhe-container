@@ -63,78 +63,129 @@ mod linux {
         Str(String),
     }
 
-    /// `{"k":v,...}` 形式（値は文字列・整数・null のみ）を厳密にパースする。余剰・不足は panic。
-    fn parse_flat_object(text: &str) -> BTreeMap<String, V> {
+    /// `{"k":v,...}` 形式（値は文字列・整数・null のみ）を RFC 8259 の文法どおり厳密にパースする。
+    ///
+    /// 空白・入れ子・小数は `inspect` の出力契約に無いため受け付けない。不正な入力は理由つきの `Err` にし、
+    /// 添字の範囲外も panic させず `Err` にする（パーサ自体の厳密さを下の試験で具体値照合するため）。
+    fn parse_flat_object(text: &str) -> Result<BTreeMap<String, V>, String> {
         let b = text.as_bytes();
         let mut i = 0;
-        assert_eq!(b[i], b'{', "must start with an object");
-        i += 1;
+        expect(b, &mut i, b'{')?;
         let mut map = BTreeMap::new();
         loop {
-            let key = parse_str(b, &mut i);
-            assert_eq!(b[i], b':');
-            i += 1;
-            let v = match b[i] {
-                b'"' => V::Str(parse_str(b, &mut i)),
+            let key = parse_str(b, &mut i)?;
+            expect(b, &mut i, b':')?;
+            let v = match peek(b, i)? {
+                b'"' => V::Str(parse_str(b, &mut i)?),
                 b'n' => {
-                    assert_eq!(&b[i..i + 4], b"null");
+                    if b.get(i..i + 4) != Some(b"null".as_slice()) {
+                        return Err(format!("invalid literal at {i}"));
+                    }
                     i += 4;
                     V::Null
                 }
-                _ => {
-                    let s = i;
-                    if b[i] == b'-' {
-                        i += 1;
-                    }
-                    while b[i].is_ascii_digit() {
-                        i += 1;
-                    }
-                    V::Num(text[s..i].parse().unwrap())
-                }
+                _ => V::Num(parse_int(b, &mut i)?),
             };
-            assert!(map.insert(key, v).is_none(), "duplicate key");
-            match b[i] {
+            if map.insert(key.clone(), v).is_some() {
+                return Err(format!("duplicate key {key}"));
+            }
+            match peek(b, i)? {
                 b',' => i += 1,
                 b'}' => {
                     i += 1;
                     break;
                 }
-                c => panic!("unexpected byte {c}"),
+                c => return Err(format!("unexpected byte 0x{c:02x} at {i}")),
             }
         }
-        assert_eq!(i, b.len(), "trailing bytes after object");
-        map
+        if i != b.len() {
+            return Err(format!("trailing bytes at {i}"));
+        }
+        Ok(map)
     }
 
-    /// `"` から始まる JSON 文字列を読む（`\"` `\\` `\n` `\r` `\t` `\uXXXX` のみ対応）。
-    fn parse_str(b: &[u8], i: &mut usize) -> String {
-        assert_eq!(b[*i], b'"');
+    fn peek(b: &[u8], i: usize) -> Result<u8, String> {
+        b.get(i)
+            .copied()
+            .ok_or_else(|| format!("unexpected end at {i}"))
+    }
+
+    fn expect(b: &[u8], i: &mut usize, want: u8) -> Result<(), String> {
+        let c = peek(b, *i)?;
+        if c != want {
+            return Err(format!("unexpected byte 0x{c:02x} at {i}", i = *i));
+        }
         *i += 1;
+        Ok(())
+    }
+
+    /// JSON の整数（`-?(0|[1-9][0-9]*)`）を読む。先頭ゼロ・符号のみ・`+` は不正として拒否する。
+    fn parse_int(b: &[u8], i: &mut usize) -> Result<i64, String> {
+        let start = *i;
+        if peek(b, *i)? == b'-' {
+            *i += 1;
+        }
+        let digits = *i;
+        while b.get(*i).is_some_and(u8::is_ascii_digit) {
+            *i += 1;
+        }
+        let d = b.get(digits..*i).unwrap_or_default();
+        if d.is_empty() || (d.len() > 1 && d.first() == Some(&b'0')) {
+            return Err(format!("invalid number at {start}"));
+        }
+        std::str::from_utf8(b.get(start..*i).unwrap_or_default())
+            .map_err(|e| e.to_string())?
+            .parse()
+            .map_err(|e| format!("invalid number at {start}: {e}"))
+    }
+
+    /// `"` から始まる JSON 文字列を読む。
+    ///
+    /// RFC 8259 が文字列内で禁じる未エスケープの制御文字（U+0000〜U+001F。タブ・CR・LF を含む）と、
+    /// 未定義のエスケープ・16 進 4 桁でない `\u`・単独サロゲートを拒否する。
+    fn parse_str(b: &[u8], i: &mut usize) -> Result<String, String> {
+        expect(b, i, b'"')?;
         let mut out = Vec::new();
         loop {
-            match b[*i] {
+            let c = peek(b, *i)?;
+            match c {
                 b'"' => {
                     *i += 1;
-                    return String::from_utf8(out).unwrap();
+                    return String::from_utf8(out).map_err(|e| e.to_string());
                 }
                 b'\\' => {
                     *i += 1;
-                    match b[*i] {
+                    match peek(b, *i)? {
                         b'"' => out.push(b'"'),
                         b'\\' => out.push(b'\\'),
+                        b'/' => out.push(b'/'),
+                        b'b' => out.push(0x08),
+                        b'f' => out.push(0x0c),
                         b'n' => out.push(b'\n'),
                         b'r' => out.push(b'\r'),
                         b't' => out.push(b'\t'),
                         b'u' => {
-                            let hex = std::str::from_utf8(&b[*i + 1..*i + 5]).unwrap();
-                            let c = char::from_u32(u32::from_str_radix(hex, 16).unwrap()).unwrap();
+                            let hex = b
+                                .get(*i + 1..*i + 5)
+                                .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
+                                .ok_or_else(|| format!("invalid \\u escape at {i}", i = *i))?;
+                            let hex = std::str::from_utf8(hex).map_err(|e| e.to_string())?;
+                            let n = u32::from_str_radix(hex, 16).map_err(|e| e.to_string())?;
+                            let ch = char::from_u32(n)
+                                .ok_or_else(|| format!("lone surrogate at {i}", i = *i))?;
                             let mut buf = [0u8; 4];
-                            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
                             *i += 4;
                         }
-                        c => panic!("unsupported escape {c}"),
+                        e => return Err(format!("unsupported escape 0x{e:02x} at {i}", i = *i)),
                     }
                     *i += 1;
+                }
+                c if c < 0x20 => {
+                    return Err(format!(
+                        "unescaped control character 0x{c:02x} at {i}",
+                        i = *i
+                    ));
                 }
                 c => {
                     out.push(c);
@@ -170,11 +221,97 @@ mod linux {
         let text = String::from_utf8(buf).unwrap();
         let body = text.strip_suffix('\n').expect("trailing LF");
         assert!(!body.contains('\n'), "must be a single line");
-        parse_flat_object(body)
+        parse_flat_object(body).unwrap()
     }
 
     fn s(v: &str) -> V {
         V::Str(v.to_string())
+    }
+
+    /// 検証用パーサが不正な JSON を見逃さない（SUP-11・REPAIR-12）。
+    ///
+    /// 機械照合の根拠になるパーサ自体を具体値で確認する: 文字列内の未エスケープ制御文字（タブ・CR・LF・
+    /// U+0001・U+001F）・未定義エスケープ・不正な `\u`・先頭ゼロの数値・末尾の余剰・途中終端を拒否する。
+    #[test]
+    fn sup11_task168_1_test_parser_rejects_malformed_json() {
+        for (c, hex) in [
+            ('\t', "09"),
+            ('\r', "0d"),
+            ('\n', "0a"),
+            ('\u{1}', "01"),
+            ('\u{1f}', "1f"),
+        ] {
+            assert_eq!(
+                parse_flat_object(&format!("{{\"k\":\"a{c}b\"}}")),
+                Err(format!("unescaped control character 0x{hex} at 7")),
+            );
+            assert_eq!(
+                parse_flat_object(&format!("{{\"k{c}\":1}}")),
+                Err(format!("unescaped control character 0x{hex} at 3")),
+            );
+        }
+        let cases = [
+            (r#"{"k":"\x"}"#, "unsupported escape 0x78 at 7"),
+            (r#"{"k":"\u12"}"#, "invalid \\u escape at 7"),
+            (r#"{"k":"\u+123"}"#, "invalid \\u escape at 7"),
+            (r#"{"k":"\ud800"}"#, "lone surrogate at 7"),
+            (r#"{"k":01}"#, "invalid number at 5"),
+            (r#"{"k":-}"#, "invalid number at 5"),
+            (r#"{"k":+1}"#, "invalid number at 5"),
+            (r#"{"k":nul}"#, "invalid literal at 5"),
+            (r#"{"k":1,"k":2}"#, "duplicate key k"),
+            (r#"{"k": 1}"#, "invalid number at 5"),
+            (r#"{"k":1}x"#, "trailing bytes at 7"),
+            (r#"{"k":1"#, "unexpected end at 6"),
+            (r#"{"k":"a"#, "unexpected end at 7"),
+            (r#"["k"]"#, "unexpected byte 0x5b at 0"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                parse_flat_object(input),
+                Err(want.to_string()),
+                "input: {input}"
+            );
+        }
+        // 正しくエスケープされた制御文字は元の文字へ復号される。
+        let ok =
+            parse_flat_object(r#"{"a":"x\ty\r\n\u0001\u001f\"\\\/\b\f","b":-12,"c":0,"d":null}"#)
+                .unwrap();
+        assert_eq!(ok["a"], s("x\ty\r\n\u{1}\u{1f}\"\\/\u{8}\u{c}"));
+        assert_eq!(ok["b"], V::Num(-12));
+        assert_eq!(ok["c"], V::Num(0));
+        assert_eq!(ok["d"], V::Null);
+    }
+
+    /// bundle パスに制御文字・`"`・`\` が含まれても、出力は妥当な JSON 1 行で、パース結果が元のパスに戻る
+    /// （SUP-11。untrusted 値のエスケープを実ストア経由で照合する）。
+    #[test]
+    fn sup11_task168_1_real_store_control_characters_in_bundle_are_escaped() {
+        let t = TmpDir::new("ctrl");
+        let store = open_default_store(Some(t.path().to_path_buf())).unwrap();
+        let bundle = t.path().join("b\tu\rn\nd\u{1}l\u{1f}e\"q\\s");
+        let req =
+            CreateStateRequest::new(ContainerStatus::created(cid("c1"), None), bundle.clone())
+                .unwrap();
+        store.create(&req).unwrap();
+
+        let mut buf = Vec::new();
+        inspect(store.as_ref(), &cid("c1"))
+            .unwrap()
+            .write_json(&mut buf)
+            .unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains(r#"b\tu\rn\nd\u0001l\u001fe\"q\\s"#),
+            "escaped bundle not found: {text}"
+        );
+        assert_eq!(
+            text.bytes().filter(|c| *c < 0x20).collect::<Vec<_>>(),
+            vec![b'\n'],
+            "only the trailing LF may be a raw control byte"
+        );
+        let m = render(store.as_ref(), "c1");
+        assert_eq!(m["bundle"], s(bundle.to_str().unwrap()));
     }
 
     /// 実ストアの `created` レコードが、null を含む全キー・具体値で出力される。

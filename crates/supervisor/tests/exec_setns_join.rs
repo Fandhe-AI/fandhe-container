@@ -6,6 +6,12 @@
 //! pid1 を特定して参加し、参加後の namespace 識別子（`/proc/thread-self/ns/*` のリンク先）が対象の
 //! 値と具体値で一致することを照合する。参加前は対象と異なることも確認する。
 //!
+//! # 試験専用の入口（`exec-test-support` feature）
+//! 試験環境ではコンテナ用 cgroup（`<scope>/fc-<id>@<instance>`）を作れないため、期待 cgroup パスを
+//! 呼び出し側から渡す `identify_pid1_in` を使う。この入口は `exec-test-support` feature を付けたビルドにだけ
+//! 存在し（本 target は `required-features` で要求する）、既定のビルドの公開 API は記録から期待値を導く
+//! `identify_pid1` だけである（SEC-1）。
+//!
 //! # 単一スレッドの独自 main（harness = false）
 //! `setns(CLONE_NEWNS)` は複数スレッドのプロセスから拒否されるため、libtest ではなく独自 `main` で動かす。
 //! 非 Linux では対象外（OS 非該当であり skip ではない）。

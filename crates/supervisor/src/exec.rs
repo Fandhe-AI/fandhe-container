@@ -78,7 +78,7 @@ pub fn identify_pid1(record: &StateRecord) -> Result<ExecTarget, TraitError> {
     let name = CgroupName::for_instance(status.id(), placement.instance()).map_err(|_| {
         TraitError::new(ErrorCode::InvalidArgument, "invalid container cgroup name")
     })?;
-    identify_pid1_in(
+    identify_pid1_at(
         record,
         &container_cgroup_path(placement.scope().as_str(), name.as_str()),
     )
@@ -94,13 +94,25 @@ fn container_cgroup_path(scope: &str, name: &str) -> String {
     }
 }
 
-/// [`identify_pid1`] と同じ検証を、呼び出し側が解決済みの cgroup 絶対パス（`<scope>/fc-<id>@<instance>`）で行う。
+/// 実機結合試験専用の入口: 期待 cgroup 絶対パスを呼び出し側から受け取って pid1 を特定する。
 ///
-/// 記録の cgroup 配置を介さずパスを直接渡す呼び出し元（コンテナ用 cgroup を作れない実機結合試験）向け。
-/// パスは必須で、対象の所属 cgroup と完全一致しなければ `FailedPrecondition`（SEC-1）。本番経路は
-/// 記録から期待値を導く [`identify_pid1`] を使うこと（ここへ対象自身の `/proc/<pid>/cgroup` から読んだ値を
-/// 渡すと同一性の照合にならない）。
+/// `exec-test-support` feature を付けたビルドにだけ存在し、既定のビルド（リリース成果物を含む）の公開 API には
+/// 含まれない。コンテナ用 cgroup を作れない試験環境で `Pid1Target::open` 以降の成功経路を通すためのもので、
+/// 期待値を記録から導かないため「記録したコンテナのプロセスであること」（SEC-1）の照合にはならない。
+/// 本番経路は必ず [`identify_pid1`] を使う。
+#[cfg(feature = "exec-test-support")]
 pub fn identify_pid1_in(
+    record: &StateRecord,
+    expected_cgroup_path: &str,
+) -> Result<ExecTarget, TraitError> {
+    identify_pid1_at(record, expected_cgroup_path)
+}
+
+/// 期待 cgroup 絶対パス（`<scope>/fc-<id>@<instance>`）を与えて pid1 を特定する本体。
+///
+/// 期待値の出所を呼び出し側に委ねるため非公開にしている。[`identify_pid1`] は記録の cgroup 配置から導いた
+/// パスだけを渡す。対象の所属 cgroup と完全一致しなければ `FailedPrecondition`（SEC-1）。
+fn identify_pid1_at(
     record: &StateRecord,
     expected_cgroup_path: &str,
 ) -> Result<ExecTarget, TraitError> {
@@ -216,7 +228,7 @@ mod tests {
     fn sup6_identify_in_rejects_non_absolute_cgroup_path() {
         let pid = NonZeroU32::new(std::process::id());
         let rec = record(ContainerStatus::running(cid(), pid));
-        let err = identify_pid1_in(&rec, "fc-c1@1").unwrap_err();
+        let err = identify_pid1_at(&rec, "fc-c1@1").unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
     }
 
@@ -225,7 +237,7 @@ mod tests {
     fn sup6_identify_rejects_self_pid() {
         let pid = NonZeroU32::new(std::process::id());
         let rec = record(ContainerStatus::running(cid(), pid));
-        let err = identify_pid1_in(&rec, "/fc-c1@1").unwrap_err();
+        let err = identify_pid1_at(&rec, "/fc-c1@1").unwrap_err();
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert!(err.message().contains("SetNs"), "{}", err.message());
     }

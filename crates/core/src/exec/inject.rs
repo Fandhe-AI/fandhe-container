@@ -63,6 +63,13 @@ use super::{
 
 const STAGE: IsolationStage = IsolationStage::InjectFiles;
 
+/// 注入用 tmpfs の新マウント API 失敗を `InjectFiles` 段のエラーにする。`tmpfs_mount_error` は段を
+/// `MountTmpfs` に固定するため、ここで付け替える（後続の `open_chain`・`verify_mounted` と同じ扱い。
+/// SUP-12・TASK-169 追補・#1472）。
+fn inject_mount_error(e: SysError, destination: &str) -> ExecError {
+    tmpfs_mount_error(e, destination).at_stage(STAGE)
+}
+
 /// 注入したファイル 1 件の結果（内容は含めない）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -182,7 +189,7 @@ fn apply_group(
     };
     // 付け替え直後に自分のマウントの fd を保持する（事後検証に通らなくても後始末が外せる）。
     let mount_fd = mount_tmpfs_syscall(dir.as_fd(), create)
-        .map_err(|e| tmpfs_mount_error(e, group.directory))?;
+        .map_err(|e| inject_mount_error(e, group.directory))?;
     let tmpfs_root = &*state.mounted.insert(mount_fd);
     verify_mounted(root, rootfs, &names, group.directory, &dir, tmpfs_root)
         .map_err(|e| e.at_stage(STAGE))?;
@@ -622,5 +629,15 @@ mod tests {
             "the injected files directory /d\\nlevel=error is not empty"
         );
         assert!(!err.message.contains("SENTINEL"));
+    }
+
+    /// SUP-12・TASK-169 追補: 新マウント API の失敗は段が InjectFiles で返る（MountTmpfs ではない）。
+    #[test]
+    fn sup12_task169_mount_failure_reports_inject_files_stage() {
+        let unsupported = inject_mount_error(SysError::Unsupported, "/d");
+        assert_eq!(unsupported.stage, IsolationStage::InjectFiles);
+        assert_eq!(unsupported.code, ErrorCode::Unimplemented);
+        let denied = inject_mount_error(SysError::Os(sys::EPERM), "/d");
+        assert_eq!(denied.stage, IsolationStage::InjectFiles);
     }
 }

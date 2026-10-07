@@ -948,8 +948,12 @@ mod tests {
             let prm = status_value("CapPrm:");
             let eff = status_value("CapEff:");
             let bnd_has_extra = bnd & !DEFAULT_MASK & ((1u64 << 41) - 1) != 0;
+            // TASK-163 追補（#1457）: 補助グループの消去が先に走る。`CAP_SETGID` を持たず補助グループが残る
+            // 非特権のスレッドは、bounding set に触れる前にそこで拒否される（どちらの拒否かを文言で区別する）。
+            let groups = sys::supplementary_group_count().unwrap();
+            let groups_refused = groups > 0 && eff & (1 << CAP_SETGID_INDEX) == 0;
             if eff & (1 << 8) == 0 {
-                if bnd_has_extra {
+                if groups_refused || bnd_has_extra {
                     let mut threads = ThreadCountSource::ProcSelf;
                     let e = apply_capabilities(
                         CapabilitySet::oci_default(),
@@ -960,6 +964,21 @@ mod tests {
                     .unwrap_err();
                     assert_eq!(e.code, ErrorCode::PermissionDenied);
                     assert_eq!(e.stage, IsolationStage::CapabilityDrop);
+                    if groups_refused {
+                        assert_eq!(
+                            e.message,
+                            "cannot clear the supplementary groups: CAP_SETGID is missing"
+                        );
+                        // 何も変わっていない（補助グループも bounding set も元のまま）。
+                        assert_eq!(sys::supplementary_group_count(), Ok(groups));
+                        assert_eq!(status_value("CapBnd:"), bnd);
+                    } else {
+                        assert!(
+                            e.message.starts_with("prctl(PR_CAPBSET_DROP) failed"),
+                            "{}",
+                            e.message
+                        );
+                    }
                 }
             } else {
                 let mut threads = ThreadCountSource::ProcSelf;

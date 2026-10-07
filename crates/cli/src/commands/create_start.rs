@@ -13,9 +13,9 @@
 //!   非 Linux では core 側が `Unimplemented` を返す（fail-closed）。
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use fandhe_container_core::observability::OpRecorder;
+use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
 use fandhe_container_core::oci_runtime::{
     LaunchSpec, LaunchedProcess, LifecycleOp, OciRuntimeError, ProcessLauncher, StartTimeouts,
     StartedContainer, create, start,
@@ -55,29 +55,25 @@ impl ProcessLauncher for UnavailableLauncher {
     }
 }
 
-/// `create` の要求を組み立てて core の `create` を呼ぶ。
+/// 構築済みの要求で core の `create` を呼ぶ。
 pub(super) fn create_container(
     rt: &Runtime,
-    args: &CreateArgs,
+    req: &CreateRequest,
 ) -> Result<StateRecord, OciRuntimeError> {
-    let req = build_create_request(args)
-        .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Create, e))?;
-    create(rt.store.as_ref(), &rt.recorder, &req)
+    create(rt.store.as_ref(), &rt.recorder, req)
 }
 
-/// `start` の要求を組み立てて core の `start` を呼ぶ。起動済みプロセスのハンドルは呼び出し元へ返す
+/// 構築済みの要求で core の `start` を呼ぶ。起動済みプロセスのハンドルは呼び出し元へ返す
 /// （監視・回収は呼び出し元の責務。CORE-1）。
 pub(super) fn start_container(
     rt: &Runtime,
-    args: &StartArgs,
+    req: &StartRequest,
 ) -> Result<StartedContainer, OciRuntimeError> {
-    let req = build_start_request(args)
-        .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Start, e))?;
     start(
         rt.store.as_ref(),
         &rt.recorder,
         &rt.launcher,
-        &req,
+        req,
         &rt.timeouts,
     )
 }
@@ -92,20 +88,47 @@ fn build_start_request(args: &StartArgs) -> Result<StartRequest, TraitError> {
     Ok(StartRequest::new(ContainerId::new(args.id.as_str())?))
 }
 
-/// 状態ルートを解決して本番の依存を組む。失敗は `op` の `OciRuntimeError` に写す。
-fn production_runtime(global: &GlobalArgs, op: LifecycleOp) -> Result<Runtime, OciRuntimeError> {
-    let to_err = |e: TraitError| OciRuntimeError::from_trait_error(op, e);
-    let root = StateRoot::resolve(global.root.clone()).map_err(to_err)?;
-    let store = FileStateStore::open(root).map_err(to_err)?;
-    Ok(Runtime {
-        store: Box::new(store),
-        launcher: Arc::new(UnavailableLauncher),
-        recorder: OpRecorder::new(),
-        timeouts: StartTimeouts::default(),
-    })
+/// 要求を構築し、状態ルートを解決して本番の依存を組む。要求構築が先なので、不正な入力では状態ルートを作らない。
+/// いずれかの失敗は core に到達していないため、ここで `op_name` の失敗として記録する（REPAIR-4）。
+fn production_runtime<R>(
+    global: &GlobalArgs,
+    recorder: OpRecorder,
+    op_name: &str,
+    started: Instant,
+    build: impl FnOnce() -> Result<R, TraitError>,
+) -> Result<(Runtime, R), TraitError> {
+    let prepared = build().and_then(|req| {
+        let root = StateRoot::resolve(global.root.clone())?;
+        let store = FileStateStore::open(root)?;
+        Ok((req, store))
+    });
+    match prepared {
+        Ok((req, store)) => Ok((
+            Runtime {
+                store: Box::new(store),
+                launcher: Arc::new(UnavailableLauncher),
+                recorder,
+                timeouts: StartTimeouts::default(),
+            },
+            req,
+        )),
+        Err(e) => {
+            record_pre_core_failure(&recorder, op_name, started);
+            export_ops(&recorder, std::env::var_os(OP_LOG_ENV).as_deref());
+            Err(e)
+        }
+    }
 }
 
-/// 操作計測（`OpRecorder`）の JSON Lines 出力先を指す環境変数（REPAIR-4）。
+/// core に到達する前の失敗を操作名 `op_name` の失敗として記録する（REPAIR-4）。
+/// core に到達した操作は core 自身が記録するため、ここで二重には記録しない。
+fn record_pre_core_failure(recorder: &OpRecorder, op_name: &str, started: Instant) {
+    if let Ok(name) = OpName::new(op_name) {
+        let _ = recorder.record(&name, OpOutcome::Failure, started.elapsed());
+    }
+}
+
+/// 計測（`OpRecorder`）の JSON Lines 出力先を指す環境変数（REPAIR-4）。
 ///
 /// OCI の stdout 契約（create / start は成功時に何も出さない）と stderr の 1 行エラー JSON を保つため、
 /// 計測は stdout / stderr へ混ぜず、この環境変数が指すファイルへ追記する。未設定なら出力しない。
@@ -118,17 +141,88 @@ const O_NONBLOCK: i32 = 0o4000;
 #[cfg(all(unix, not(target_os = "linux")))]
 const O_NONBLOCK: i32 = 0x4;
 
+/// 最終要素が symlink なら open を失敗させる O_NOFOLLOW（SEC-1）。値は ABI ごとに異なる
+/// （Linux の arm / arm64 は 0o100000、他の Linux アーキは 0o400000、BSD 系・macOS は 0x100）。
+#[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
+const O_NOFOLLOW: i32 = 0o100_000;
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "aarch64", target_arch = "arm"))
+))]
+const O_NOFOLLOW: i32 = 0o400_000;
+#[cfg(all(unix, not(target_os = "linux")))]
+const O_NOFOLLOW: i32 = 0x100;
+
+/// 呼び出しプロセスの実効 UID（Linux のみ。`/proc/self` の所有者で代用し、取得できなければ None）。
+#[cfg(target_os = "linux")]
+fn effective_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").ok().map(|m| m.uid())
+}
+#[cfg(all(unix, not(target_os = "linux")))]
+fn effective_uid() -> Option<u32> {
+    None
+}
+
+/// 計測出力先の祖先ディレクトリが、他ユーザーに差し替えられない状態かを検査する（SEC-1）。
+/// group / other 書き込み可のディレクトリは sticky bit が無ければ拒否し、所有者は root か自分に限る。
+#[cfg(unix)]
+fn ancestors_trusted(dir: &std::path::Path, euid: Option<u32>) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    dir.ancestors().all(|a| {
+        let Ok(m) = std::fs::metadata(a) else {
+            return false;
+        };
+        let mode = m.mode();
+        let writable_by_others = mode & 0o022 != 0;
+        let sticky = mode & 0o1000 != 0;
+        let owner_ok = m.uid() == 0 || euid.is_none_or(|e| m.uid() == e);
+        owner_ok && (!writable_by_others || sticky)
+    })
+}
+
 /// 計測出力先を非ブロッキングで開く。通常ファイル以外（FIFO・デバイス等）は拒否する。
+///
+/// unix では、親ディレクトリを正規化して祖先の所有者・書き込み権限を検査し（他ユーザーが
+/// 差し替えられるディレクトリ経由の symlink を拒否）、最終要素は O_NOFOLLOW で開き、開いたファイルの
+/// 種別・ハードリンク数（1 のみ許可）・所有者を fd から検証する（root 実行時に別ファイルへ
+/// 追記させる攻撃の防止。SEC-1）。
+#[cfg(unix)]
 fn open_op_log(path: &std::ffi::OsStr) -> Option<std::fs::File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(O_NONBLOCK);
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let path = std::path::Path::new(path);
+    let name = path.file_name()?;
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    let parent = std::fs::canonicalize(parent).ok()?;
+    let euid = effective_uid();
+    if !ancestors_trusted(&parent, euid) {
+        return None;
     }
-    let f = opts.open(path).ok()?;
-    // open 後のハンドルで種別を検証する（パスの事前検査による TOCTOU を避ける）。
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true)
+        .append(true)
+        .custom_flags(O_NONBLOCK | O_NOFOLLOW);
+    let f = opts.open(parent.join(name)).ok()?;
+    // open 後のハンドルで検証する（パスの事前検査による TOCTOU を避ける）。
+    let m = f.metadata().ok()?;
+    if m.is_file() && m.nlink() == 1 && euid.is_none_or(|e| m.uid() == e) {
+        Some(f)
+    } else {
+        None
+    }
+}
+
+/// 非 unix（Windows）は通常ファイルのみ許可する。
+#[cfg(not(unix))]
+fn open_op_log(path: &std::ffi::OsStr) -> Option<std::fs::File> {
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()?;
     if f.metadata().ok()?.is_file() {
         Some(f)
     } else {
@@ -151,13 +245,20 @@ pub(super) fn export_ops(recorder: &OpRecorder, path: Option<&std::ffi::OsStr>) 
 }
 
 /// 本番入口の `create`。成功時は何も出さない（OCI の create 互換）。
+///
+/// 要求構築・状態ストア初期化の失敗も操作名 `create` の失敗として計測する（REPAIR-4）。
 pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
-    let rt = match production_runtime(global, LifecycleOp::Create) {
-        Ok(rt) => rt,
-        Err(e) => return CliExit::Runtime(e),
-    };
-    let result = create_container(&rt, args);
-    export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
+    let started = Instant::now();
+    let recorder = OpRecorder::new();
+    let result = production_runtime(global, recorder, "create", started, || {
+        build_create_request(args)
+    })
+    .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Create, e))
+    .and_then(|(rt, req)| {
+        let r = create_container(&rt, &req);
+        export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
+        r
+    });
     match result {
         Ok(_) => CliExit::Success,
         Err(e) => CliExit::Runtime(e),
@@ -166,11 +267,17 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
 
 /// 本番入口の `start`。
 pub(super) fn run_start(global: &GlobalArgs, args: &StartArgs) -> CliExit {
-    let rt = match production_runtime(global, LifecycleOp::Start) {
-        Ok(rt) => rt,
+    let started = Instant::now();
+    let recorder = OpRecorder::new();
+    let prepared = production_runtime(global, recorder, "start", started, || {
+        build_start_request(args)
+    })
+    .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Start, e));
+    let (rt, req) = match prepared {
+        Ok(v) => v,
         Err(e) => return CliExit::Runtime(e),
     };
-    let result = start_container(&rt, args);
+    let result = start_container(&rt, &req);
     export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
     match result {
         // 本番 launcher（UnavailableLauncher）では到達しない。将来 launcher が差し替わっても、
@@ -321,6 +428,43 @@ mod tests {
         let _ = std::fs::remove_file(&p2);
     }
 
+    /// SEC-1: 最終要素が symlink なら辿らず拒否し、リンク先は書き換えない。
+    #[cfg(unix)]
+    #[test]
+    fn sec1_open_op_log_rejects_symlink_and_hardlink() {
+        let dir = std::env::temp_dir().join(format!("fc-cli-oplog-sec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "keep").expect("victim");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&victim, &link).expect("symlink");
+        assert!(open_op_log(link.as_os_str()).is_none());
+        let hard = dir.join("hard");
+        std::fs::hard_link(&victim, &hard).expect("hardlink");
+        assert!(open_op_log(hard.as_os_str()).is_none());
+        assert_eq!(std::fs::read_to_string(&victim).expect("read"), "keep");
+        let fresh = dir.join("fresh");
+        assert!(open_op_log(fresh.as_os_str()).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REPAIR-4: 不正 ID（core 到達前の失敗）も操作名 create の失敗として 1 件計測される。
+    #[test]
+    fn repair4_pre_core_failure_is_recorded_once() {
+        let rec = OpRecorder::new();
+        record_pre_core_failure(&rec, "create", Instant::now());
+        let snap = rec
+            .snapshot_op(&OpName::new("create").expect("name"))
+            .expect("snap");
+        assert_eq!(snap.failure(), 1);
+        assert_eq!(snap.success(), 0);
+    }
+
     #[cfg(target_os = "linux")]
     mod linux {
         use super::*;
@@ -417,10 +561,12 @@ mod tests {
                 bundle: bundle.clone(),
                 id: "c1".into(),
             };
-            let rec = create_container(&rt, &args).expect("create");
+            let rec =
+                create_container(&rt, &build_create_request(&args).expect("req")).expect("create");
             assert_eq!(rec.status().state(), ContainerState::Created);
             assert_eq!(rec.status().pid(), None);
-            let e = create_container(&rt, &args).expect_err("dup");
+            let e =
+                create_container(&rt, &build_create_request(&args).expect("req")).expect_err("dup");
             assert_eq!(e.code(), ErrorCode::AlreadyExists);
             assert_eq!(e.exit_code().get(), 4);
             assert_eq!(e.op(), LifecycleOp::Create);
@@ -432,7 +578,11 @@ mod tests {
             let base = TmpDir::new("notfound");
             let launcher = Arc::new(FakeLauncher(AtomicUsize::new(0)));
             let rt = runtime(&base, launcher.clone());
-            let e = start_container(&rt, &StartArgs { id: "nope".into() }).expect_err("nf");
+            let e = start_container(
+                &rt,
+                &build_start_request(&StartArgs { id: "nope".into() }).expect("req"),
+            )
+            .expect_err("nf");
             assert_eq!(e.code(), ErrorCode::NotFound);
             assert_eq!(e.exit_code().get(), 3);
             assert_eq!(launcher.0.load(Ordering::SeqCst), 0);
@@ -447,17 +597,19 @@ mod tests {
             let rt = runtime(&base, launcher.clone());
             create_container(
                 &rt,
-                &CreateArgs {
+                &build_create_request(&CreateArgs {
                     bundle,
                     id: "start-ok".into(),
-                },
+                })
+                .expect("req"),
             )
             .expect("create");
             let started = start_container(
                 &rt,
-                &StartArgs {
+                &build_start_request(&StartArgs {
                     id: "start-ok".into(),
-                },
+                })
+                .expect("req"),
             )
             .expect("start");
             assert_eq!(started.record().status().state(), ContainerState::Running);
@@ -474,17 +626,19 @@ mod tests {
             let rt = runtime(&base, Arc::new(UnavailableLauncher));
             create_container(
                 &rt,
-                &CreateArgs {
+                &build_create_request(&CreateArgs {
                     bundle,
                     id: "unavail".into(),
-                },
+                })
+                .expect("req"),
             )
             .expect("create");
             let e = start_container(
                 &rt,
-                &StartArgs {
+                &build_start_request(&StartArgs {
                     id: "unavail".into(),
-                },
+                })
+                .expect("req"),
             )
             .expect_err("unimpl");
             assert_eq!(e.code(), ErrorCode::Unimplemented);

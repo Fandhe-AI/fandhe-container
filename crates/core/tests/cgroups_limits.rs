@@ -112,7 +112,13 @@ mod linux {
         assert_eq!(child.set_pids_max(&pids), Ok(pids));
         assert_eq!(child.set_io_max(&io), Ok(io));
         let weight = IoWeight::from_blkio_weight(500).unwrap();
-        assert_eq!(child.set_io_weight(&weight), Ok(weight));
+        assert_eq!(
+            child.set_io_weight(
+                &fandhe_container_core::observability::OpRecorder::new(),
+                &weight
+            ),
+            Ok(weight)
+        );
 
         // 4 つすべてを書いた後に照合し、後続の書き込みが先の制限を壊していないことを確認する。
         let io_line = format!("{token} rbps=1048576 wbps=max riops=max wiops=max");
@@ -137,7 +143,13 @@ mod linux {
             Some("default 4950")
         );
         let default_weight = IoWeight::default();
-        assert_eq!(child.set_io_weight(&default_weight), Ok(default_weight));
+        assert_eq!(
+            child.set_io_weight(
+                &fandhe_container_core::observability::OpRecorder::new(),
+                &default_weight
+            ),
+            Ok(default_weight)
+        );
         assert_eq!(
             read("io.weight").lines().next().map(str::trim_end),
             Some("default 100")

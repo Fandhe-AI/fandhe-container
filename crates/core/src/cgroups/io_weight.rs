@@ -41,6 +41,7 @@ use super::{
     CgroupError, CgroupStep, ContainerCgroup, SMALL_FILE_LIMIT, cstring, io_error, read_iface,
     sys_error,
 };
+use crate::observability::{OpName, OpRecorder};
 use crate::sys::{self, SysError};
 use crate::traits::ErrorCode;
 
@@ -160,9 +161,33 @@ impl ContainerCgroup {
     ///
     /// `io` controller が親で有効化されていない、またはカーネルが `io.weight` を提供しない場合は
     /// `FailedPrecondition`。
-    pub fn set_io_weight(&self, weight: &IoWeight) -> Result<IoWeight, CgroupError> {
-        write_io_weight_at(self.fd.as_fd(), weight)
+    ///
+    /// open・write・読み戻しのどこで失敗しても、成功・失敗の件数と所要時間を `recorder` へ
+    /// 操作名 `cgroup.set_io_weight` で記録する（REPAIR-4。全終了経路）。
+    pub fn set_io_weight(
+        &self,
+        recorder: &OpRecorder,
+        weight: &IoWeight,
+    ) -> Result<IoWeight, CgroupError> {
+        write_io_weight_recorded(self.fd.as_fd(), recorder, weight)
     }
+}
+
+/// [`OpRecorder`] に記録する操作名（REPAIR-4）。
+const SET_IO_WEIGHT_OP_NAME: &str = "cgroup.set_io_weight";
+
+/// [`write_io_weight_at`] を計測つきで実行する（テスト可能な実体）。
+fn write_io_weight_recorded(
+    dir: BorrowedFd<'_>,
+    recorder: &OpRecorder,
+    weight: &IoWeight,
+) -> Result<IoWeight, CgroupError> {
+    let name = OpName::new(SET_IO_WEIGHT_OP_NAME).map_err(|e| CgroupError {
+        code: e.code(),
+        step: CgroupStep::SetIoWeight,
+        message: e.message().to_string(),
+    })?;
+    recorder.record_op(&name, || write_io_weight_at(dir, weight))
 }
 
 /// `dir` 直下の `io.weight` へ書き、読み戻して要求値との一致を確認する（テスト可能な実体）。
@@ -297,6 +322,25 @@ mod tests {
             "default 250"
         );
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// SUP-13・TASK-170.4・REPAIR-4: 成功と失敗（open 失敗）の双方が件数として記録される。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sup13_task170_4_io_weight_operations_are_recorded() {
+        let name = OpName::new(SET_IO_WEIGHT_OP_NAME).unwrap();
+        let rec = OpRecorder::new();
+        let ok = scratch("rec-ok");
+        std::fs::write(ok.join("io.weight"), b"").unwrap();
+        let dir = File::open(&ok).unwrap();
+        write_io_weight_recorded(dir.as_fd(), &rec, &IoWeight::new(250).unwrap()).unwrap();
+        let ng = scratch("rec-ng");
+        let dir2 = File::open(&ng).unwrap();
+        write_io_weight_recorded(dir2.as_fd(), &rec, &IoWeight::default()).unwrap_err();
+        let stats = rec.snapshot_op(&name).expect("recorded");
+        assert_eq!((stats.success(), stats.failure()), (1, 1));
+        std::fs::remove_dir_all(&ok).unwrap();
+        std::fs::remove_dir_all(&ng).unwrap();
     }
 
     /// SUP-13・TASK-170.4: `io.weight` が無い（controller 未有効等）場合は `FailedPrecondition`。

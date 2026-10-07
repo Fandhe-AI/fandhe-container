@@ -336,7 +336,7 @@ fn denied(reason: PrivilegeErrorReason, message: &str) -> PrivilegeError {
 /// 縮退後のスナップショットが期待集合ちょうどであることを fail-closed で検証する。
 ///
 /// 判定順: `no_new_privs` → uid 0 残存 → 過剰（permitted・effective・bounding・inheritable・ambient。未知ビット含む）
-/// → 不足（permitted・effective）→ ambient 一致（ambient == 期待、inheritable ⊇ ambient）。
+/// → 不足（permitted・effective・bounding）→ ambient 一致（ambient == 期待、inheritable ⊇ ambient）。
 /// ambient 一致は方式によらず要求する（設計書 5 章 4 は (c)(a) とも ambient へ載せるため）。
 pub fn verify_elevation(
     snapshot: &CredentialSnapshot,
@@ -372,7 +372,11 @@ pub fn verify_elevation(
             "capabilities exceed the required minimum set",
         ));
     }
-    if !snapshot.permitted.is_superset_of(exp) || !snapshot.effective.is_superset_of(exp) {
+    // bounding が期待集合を欠くと、後から ambient / 再取得で必要 capability を保持できない（不足も拒否）。
+    if !snapshot.permitted.is_superset_of(exp)
+        || !snapshot.effective.is_superset_of(exp)
+        || !snapshot.bounding.is_superset_of(exp)
+    {
         return Err(denied(
             PrivilegeErrorReason::MissingCapabilities,
             "required capabilities are missing; no elevation mechanism is available",
@@ -409,16 +413,16 @@ pub struct ReductionPlan {
 
 /// 現在の資格情報から期待集合への縮退計画を算出する（純関数。何も適用しない）。
 ///
-/// 期待集合が現在の permitted に含まれない場合は昇格手段が無いものとして `MissingCapabilities`。
+/// 期待集合が現在の permitted または bounding に含まれない場合は昇格手段が無いものとして `MissingCapabilities`。
 pub fn plan_reduction(
     current: &CredentialSnapshot,
     expected: CapabilitySet,
 ) -> Result<ReductionPlan, PrivilegeError> {
     let exp = CapMask::from_set(expected);
-    if !current.permitted.is_superset_of(exp) {
+    if !current.permitted.is_superset_of(exp) || !current.bounding.is_superset_of(exp) {
         return Err(denied(
             PrivilegeErrorReason::MissingCapabilities,
-            "required capabilities are not in the permitted set",
+            "required capabilities are not in the permitted or bounding set",
         ));
     }
     let bounding_drop = (0u8..64)
@@ -584,6 +588,23 @@ mod tests {
         let t = status("0", "0", "0", FULL, "0", "0", UID);
         let e = plan_reduction(&parse_proc_status(&t).unwrap(), exp).unwrap_err();
         assert_eq!(e.reason, PrivilegeErrorReason::MissingCapabilities);
+        // permitted は足りても bounding が空なら計画できない。
+        let t = status("0", FULL, FULL, "0", "0", "0", UID);
+        let e = plan_reduction(&parse_proc_status(&t).unwrap(), exp).unwrap_err();
+        assert_eq!(e.reason, PrivilegeErrorReason::MissingCapabilities);
+    }
+
+    #[test]
+    fn sup14_task171_1_2_verify_rejects_missing_bounding() {
+        let m = mask_hex();
+        let e = verify(&status(&m, &m, &m, "0", &m, "0", UID)).unwrap_err();
+        assert_eq!(
+            (e.code, e.reason),
+            (
+                ErrorCode::PermissionDenied,
+                PrivilegeErrorReason::MissingCapabilities
+            )
+        );
     }
 
     #[test]

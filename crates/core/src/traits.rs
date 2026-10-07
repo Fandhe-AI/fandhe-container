@@ -41,7 +41,7 @@ pub use state_store::{
     MAX_PAGE_SIZE, StateList, StateListCursor, StateRecord, StateRevision, StateStore,
     SupervisionState, UpdateStateRequest,
 };
-pub use types::{ContainerId, ErrorCode, TraitError};
+pub use types::{ContainerId, ErrorCode, TRAIT_ERROR_MESSAGE_MAX_BYTES, TraitError};
 pub use volume_provider::{
     AccessMode, GuestPath, HostBindPath, VolumeAttachRequest, VolumeAttachment,
     VolumeCreateRequest, VolumeDetachRequest, VolumeDetachResponse, VolumeInfo,

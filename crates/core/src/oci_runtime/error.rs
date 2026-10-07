@@ -464,9 +464,10 @@ mod tests {
 
         let huge_err = TraitError::new(ErrorCode::Unavailable, "\u{202E}".repeat(1024 * 1024));
         let e = OciRuntimeError::from_trait_error(LifecycleOp::Kill, huge_err);
-        assert_eq!(e.message.len(), 4096);
-        assert_eq!(e.message.capacity(), 4096);
-        assert_eq!(e.message, " ".repeat(4096));
+        // TraitError::new が 4096 バイト以下（3 バイト文字の境界で 4095）に切り詰め済み。
+        assert_eq!(e.message.len(), 1365);
+        assert_eq!(e.message.capacity(), 4095);
+        assert_eq!(e.message, " ".repeat(1365));
 
         // U+202E・U+2028（各 3 バイト）を 1 バイトの空白へ置換しても入力長 8 の確保を超えない。
         let e = OciRuntimeError::new(

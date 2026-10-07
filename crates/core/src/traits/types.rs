@@ -134,23 +134,56 @@ impl ErrorCode {
 /// 拡張点トレイト（`ContainerRuntime` 等）が返す構造化エラー。
 ///
 /// `code` は機械可読な分類、`message` は人間可読な説明（ERR-1）。plugin からの応答は
-/// untrusted な外部入力であるため、proxy 実装（G8・TASK-107/114）は `message` の長さを
-/// 上限検証してから `TraitError` を組み立てる。レジストリ資格情報等の秘密情報を
+/// untrusted な外部入力であるため、[`TraitError::new`] が `message` を
+/// [`TRAIT_ERROR_MESSAGE_MAX_BYTES`] バイト以下に UTF-8 文字境界で切り詰めて保持する
+/// （呼び出し側での上限検証は不要）。切り詰めの有無は [`TraitError::message_truncated`] で
+/// 分かり、`message` 自体には `...` 等の印を足さない。レジストリ資格情報等の秘密情報を
 /// `message` に含めない（security.md）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct TraitError {
     code: ErrorCode,
     message: String,
+    message_truncated: bool,
 }
+
+/// [`TraitError`] が保持する `message` の最大バイト数（ERR-2・REPAIR-4・TASK-96.1・MS-6）。
+///
+/// OCI Runtime エラー応答の上限（`oci_runtime::OCI_ERROR_MESSAGE_MAX_BYTES`）と同値で、
+/// `OciRuntimeError::from_trait_error` で再度切り詰められない大きさに揃える。
+pub const TRAIT_ERROR_MESSAGE_MAX_BYTES: usize = 4096;
 
 impl TraitError {
     /// エラーコードとメッセージから構造化エラーを作る。
+    ///
+    /// `message` が [`TRAIT_ERROR_MESSAGE_MAX_BYTES`] を超える場合は UTF-8 文字境界で
+    /// 切り詰め、[`TraitError::message_truncated`] を `true` にする。
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        let mut message = message.into();
+        let message_truncated = message.len() > TRAIT_ERROR_MESSAGE_MAX_BYTES;
+        if message_truncated {
+            let mut end = TRAIT_ERROR_MESSAGE_MAX_BYTES;
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+        }
+        // `truncate` は容量を縮めず、`String::with_capacity(大) + 短い文字列` のように
+        // 長さが上限以下でも巨大な確保が残り得る。切り詰めの有無と独立に、確保量が上限を
+        // 超えていれば縮めて、error の寿命の間に保持する確保量を上限内に収める。
+        if message.capacity() > TRAIT_ERROR_MESSAGE_MAX_BYTES {
+            message.shrink_to_fit();
+        }
         Self {
             code,
-            message: message.into(),
+            message,
+            message_truncated,
         }
+    }
+
+    /// `new` に渡されたメッセージが上限を超え、切り詰められたかを返す。
+    pub fn message_truncated(&self) -> bool {
+        self.message_truncated
     }
 
     /// 機械可読なエラーコードを返す。
@@ -233,6 +266,55 @@ mod tests {
     fn cri7_trait_error_display_format() {
         let err = TraitError::new(ErrorCode::NotFound, "container not found");
         assert_eq!(err.to_string(), "NOT_FOUND: container not found");
+    }
+
+    /// ERR-2・REPAIR-4・TASK-96.1・MS-6: 上限ちょうどは保持、1 バイト超は切り詰め、マルチバイト文字の途中は境界まで戻す。
+    #[test]
+    fn err2_trait_error_message_is_capped_at_char_boundary() {
+        let max = TRAIT_ERROR_MESSAGE_MAX_BYTES;
+        assert_eq!(max, 4096);
+
+        let exact = TraitError::new(ErrorCode::Internal, "a".repeat(max));
+        assert_eq!(exact.message().len(), 4096);
+        assert!(!exact.message_truncated());
+
+        let over = TraitError::new(ErrorCode::Internal, "a".repeat(max + 1));
+        assert_eq!(over.message().len(), 4096);
+        assert!(over.message_truncated());
+
+        // 3 バイト文字が 4095 バイト目から始まる: 途中で切らず 4095 バイトへ戻す。
+        let mut s = "a".repeat(max - 1);
+        s.push('あ');
+        let mb = TraitError::new(ErrorCode::Internal, s);
+        assert_eq!(mb.message().len(), 4095);
+        assert!(mb.message_truncated());
+
+        let huge = TraitError::new(ErrorCode::Internal, "あ".repeat(100_000));
+        assert_eq!(huge.message().len(), 4095);
+        assert!(
+            huge.message.capacity() <= max,
+            "stored allocation must stay within the cap"
+        );
+        assert!(huge.to_string().len() <= max + "INTERNAL: ".len());
+    }
+
+    /// ERR-2・REPAIR-4・TASK-96.1・MS-6: 長さが上限以下でも過大な確保量は上限内へ縮める。
+    #[test]
+    fn err2_trait_error_shrinks_oversized_capacity_without_truncation() {
+        let mut s = String::with_capacity(1_000_000);
+        s.push_str("short");
+        let err = TraitError::new(ErrorCode::Internal, s);
+        assert_eq!(err.message(), "short");
+        assert!(!err.message_truncated());
+        assert!(err.message.capacity() <= TRAIT_ERROR_MESSAGE_MAX_BYTES);
+
+        // 呼び出し側が事前に truncate 済みで容量だけ巨大なケース。
+        let mut pre = "a".repeat(100_000);
+        pre.truncate(10);
+        let err = TraitError::new(ErrorCode::Internal, pre);
+        assert_eq!(err.message().len(), 10);
+        assert!(!err.message_truncated());
+        assert!(err.message.capacity() <= TRAIT_ERROR_MESSAGE_MAX_BYTES);
     }
 
     /// CRI-7: `TryFrom<&str>` は `ContainerId::new` と同じ検証結果を返す。

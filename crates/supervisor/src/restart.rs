@@ -962,7 +962,7 @@ pub fn supervise_with_restart(
                         && rec.supervision().supervisor_pid().is_none()
                         && rec.restart_count() == recorded
                 };
-                if stop.is_stop_requested() && state.refresh().is_ok_and(|rec| is_own_record(rec)) {
+                if stop.is_stop_requested() && state.refresh().is_ok_and(&is_own_record) {
                     // 終了を確認できるまで `Running` の記録は動かさない（生存し得るのに `Stopped` と書かない。REPAIR-5）。
                     // 上限を呼び出し境界で強制する。終了未確認のハンドルは `cleanup_late` に積まれる。
                     if terminate_bounded(

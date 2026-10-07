@@ -1404,8 +1404,7 @@ mod tests {
         assert_eq!(w.supervision(), second);
     }
 
-    /// TASK-30.3・OCI-6: `CgroupScope` はルート `/` と `/a/b` 形式だけを受理し、相対・空要素・`.`・`..`・
-    /// NUL・要素長 / 深さ / 全体長の超過を `INVALID_ARGUMENT` で拒否する。
+    /// テスト用: `&str` ペア列を `(String, String)` 列へ変換する。
     fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
         v.iter()
             .map(|(k, x)| (k.to_string(), x.to_string()))
@@ -1490,6 +1489,8 @@ mod tests {
         assert_eq!(updated.annotations(), &labels);
     }
 
+    /// TASK-30.3・OCI-6: `CgroupScope` はルート `/` と `/a/b` 形式だけを受理し、相対・空要素・`.`・`..`・
+    /// NUL・要素長 / 深さ / 全体長の超過を `INVALID_ARGUMENT` で拒否する。
     #[test]
     fn oci6_task30_3_cgroup_scope_validation() {
         for ok in ["/", "/user.slice", "/user.slice/user-1000.slice/x.scope"] {

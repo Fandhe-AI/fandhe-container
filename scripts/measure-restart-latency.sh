@@ -213,8 +213,8 @@ nap() { read -r -t "$1" -u "$napfd" || true; }
 now_us() { local t="$EPOCHREALTIME"; t="${t/[.,]/}"; REPLY_US=$((10#$t)); }
 up_cs() { local up; read -r up _ </proc/uptime; up="${up/[.,]/}"; REPLY_CS=$((10#$up)); }
 
-# /proc/<pid>/stat から ppid と起動時刻（field 22）を得る。comm に空白・括弧を含んでもよいよう最後の ) 以降を使う。
-proc_info() { # <pid> → REPLY_PPID / REPLY_START（失敗時は return 1）
+# /proc/<pid>/stat から ppid・session・起動時刻（field 22）を得る。comm に空白・括弧を含んでもよいよう最後の ) 以降を使う。
+proc_info() { # <pid> → REPLY_PPID / REPLY_SID / REPLY_START（失敗時は return 1）
   local s rest
   local -a f
   [ -r "/proc/$1/stat" ] || return 1
@@ -223,6 +223,7 @@ proc_info() { # <pid> → REPLY_PPID / REPLY_START（失敗時は return 1）
   read -ra f <<<"$rest"
   [ "${#f[@]}" -ge 20 ] || return 1
   REPLY_PPID="${f[1]}"
+  REPLY_SID="${f[3]}"
   REPLY_START="${f[19]}"
 }
 
@@ -234,13 +235,15 @@ alive() { # <pid>
   [[ "$s" != *") Z "* ]]
 }
 
-# pid が launcher の子孫か（PPid 連鎖を 64 段まで辿る）。
+# pid が launcher の子孫か（PPid 連鎖を 64 段まで辿る）。成功時の REPLY_START は対象 pid 自身の起動時刻
+# （祖先の起動時刻で上書きしない。孫以降の子孫でも同一性照合が成立するように先頭で退避する）。
 is_descendant() { # <pid>
-  local p="$1" depth=0
+  local p="$1" depth=0 target_start=""
   while [ "$depth" -lt 64 ]; do
     proc_info "$p" || return 1
+    [ "$depth" -gt 0 ] || target_start="$REPLY_START"
     p="$REPLY_PPID"
-    [ "$p" = "$launcher_pid" ] && return 0
+    if [ "$p" = "$launcher_pid" ]; then REPLY_START="$target_start"; return 0; fi
     { [ "$p" -le 1 ] 2>/dev/null; } && return 1
     depth=$((depth + 1))
   done
@@ -264,10 +267,12 @@ read_state() {
   return 0
 }
 
-# 観測が終わった後に jq で state.json を厳密検証する（id 一致・型）。
-validate_state_strict() {
-  jq -e --arg id "$container_id" \
-    '.id == $id and (.status|type=="string") and (.pid|type=="number" and .>0) and (.restartCount|type=="number" and .>=0)' \
+# 観測が終わった後に jq で state.json を再読込して厳密検証する。id 一致・status=running・観測した新 pid・
+# restartCount == 旧 + 1 のすべてを満たさなければ失敗（ポーリング後に状態が変わった試行は採用しない）。
+validate_state_strict() { # <観測した新 pid> <期待 restartCount>
+  [ -L "$state_file" ] && return 1
+  jq -e --arg id "$container_id" --argjson pid "$1" --argjson cnt "$2" \
+    '.id == $id and .status == "running" and (.pid|type=="number") and .pid == $pid and (.restartCount|type=="number") and .restartCount == $cnt' \
     "$state_file" >/dev/null 2>&1
 }
 
@@ -310,6 +315,13 @@ do_cleanup() {
         if alive "$p"; then rc=4; fi
       done
     fi
+  fi
+  # launcher 停止後に state.json の pid を再読込する。記録済み pid と異なる（launcher が最後に起動した）
+  # コンテナは、session が launcher（setsid の leader）と一致するものだけを同一性確認済みとして回収対象にする。
+  if [ -n "$state_file" ] && [ -n "$launcher_pid" ] && read_state && [ -n "$ST_PID" ] && [ "$ST_PID" != "$last_cpid" ] \
+    && alive "$ST_PID" && proc_info "$ST_PID" && [ "$REPLY_SID" = "$launcher_pid" ]; then
+    last_cpid="$ST_PID"
+    last_cstart="$REPLY_START"
   fi
   # 環境変数を継承しないコンテナ側プロセスは、記録した pid・起動時刻の同一性で回収する。
   if [ -n "$last_cpid" ] && proc_info "$last_cpid" && [ "$REPLY_START" = "$last_cstart" ]; then
@@ -429,7 +441,7 @@ for ((n = 1; n <= total; n++)); do
   d_up=$(((up1 - up0) * 10000))
   diff=$((d_wall - d_up))
   [ "${diff#-}" -le 50000 ] || fail "clock changed during trial $n (wall and monotonic clocks disagree)"
-  validate_state_strict || fail "state.json failed strict validation in trial $n"
+  validate_state_strict "$ST_PID" "$((old_count + 1))" || fail "state.json failed strict validation in trial $n"
   new_pid="$ST_PID"
   last_cpid="$new_pid"
   if proc_info "$new_pid"; then last_cstart="$REPLY_START"; else last_cstart=""; fi

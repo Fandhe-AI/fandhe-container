@@ -40,7 +40,10 @@ mkdir "$root/bundle"
 
 # スタブ launcher。`run --id <id> --bundle <dir> --restart <p> --restart-backoff-ms 0` を受ける。
 # STUB_MODE: normal / no_ready / early_exit / no_restart / same_pid / count_jump / foreign_pid /
-# error_line / log_missing / log_short / log_garbage。ログの elapsed_us は STUB_ELAPSED（空白区切り）を順に使う。
+# error_line / log_missing / log_short / log_garbage / deep（state.json の pid が孫プロセス）/
+# late_start（SIGTERM 時に環境変数を継承しない新コンテナを起動して state.json へ書く）。
+# ログの elapsed_us は STUB_ELAPSED（空白区切り）を順に使う。STUB_DELAY（秒・空白区切り）は kill 検知後から
+# 新コンテナ起動までの待ちを順に与える時間制御入力（observed の下限が決定的になる）。
 cat >"${root}/launcher.sh" <<'STUB'
 #!/usr/bin/env bash
 id="$3"
@@ -49,12 +52,31 @@ mkdir -p "$sd"
 count=0
 idx=0
 read -ra elapsed <<<"${STUB_ELAPSED:-}"
+read -ra delays <<<"${STUB_DELAY:-}"
+didx=0
 child=""
 shown=""
+grand=""
 start_child() {
-  sleep 300 &
+  if [ "$STUB_MODE" = deep ]; then
+    gf="${STUB_DIR}/gc.${RANDOM}"
+    bash -c 'sleep 300 & echo $! >"$1"; wait' _ "$gf" &
+    child=$!
+    while [ ! -s "$gf" ]; do sleep 0.01; done
+    grand="$(<"$gf")"
+    echo "$grand" >>"${STUB_DIR}/pids"
+  else
+    sleep 300 &
+    child=$!
+  fi
+  echo "$child" >>"${STUB_DIR}/pids"
+}
+late_term() {
+  env -u FANDHE_BENCH_OWNER sleep 300 &
   child=$!
   echo "$child" >>"${STUB_DIR}/pids"
+  write_state "$child"
+  exit 0
 }
 write_state() {
   local shown_pid="$1"
@@ -62,9 +84,14 @@ write_state() {
     "$id" "$shown_pid" "$count" >"${sd}/state.tmp"
   mv "${sd}/state.tmp" "${sd}/state.json"
 }
-trap 'kill "$child" 2>/dev/null; exit 0' TERM
+if [ "$STUB_MODE" = late_start ]; then
+  trap late_term TERM
+else
+  trap 'kill "$child" 2>/dev/null; exit 0' TERM
+fi
 start_child
 shown="$child"
+[ "$STUB_MODE" != deep ] || shown="$grand"
 [ "$STUB_MODE" != foreign_pid ] || shown="$(<"${STUB_FOREIGN}")"
 write_state "$shown"
 [ "$STUB_MODE" = no_ready ] || echo READY
@@ -74,12 +101,16 @@ while :; do
   if [ "$STUB_MODE" = no_restart ]; then
     while :; do sleep 0.2; done
   fi
+  d="${delays[$didx]:-}"
+  didx=$((didx + 1))
+  [ -z "$d" ] || sleep "$d"
   start_child
   case "$STUB_MODE" in
     count_jump) count=$((count + 2)) ;;
     *) count=$((count + 1)) ;;
   esac
   shown="$child"
+  [ "$STUB_MODE" != deep ] || shown="$grand"
   [ "$STUB_MODE" != same_pid ] || shown="$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "${sd}/state.json")"
   write_state "$shown"
   e="${elapsed[$idx]:-1000}"
@@ -119,7 +150,7 @@ run_case() {
   local name="$1" want="$2" mode="$3" elapsed="$4" rc=0
   shift 4
   mkdir -p "${root}/d-${name}"
-  STUB_MODE="$mode" STUB_ELAPSED="$elapsed" STUB_DIR="${root}/d-${name}" STUB_FOREIGN="${root}/foreign.pid" \
+  STUB_MODE="$mode" STUB_ELAPSED="$elapsed" STUB_DELAY="${STUB_DELAY:-}" STUB_DIR="${root}/d-${name}" STUB_FOREIGN="${root}/foreign.pid" \
     bash "$target" --launcher "${root}/launcher.sh" --bundle "${root}/bundle" --settle-ms 5 "$@" \
     >"${root}/${name}.out" 2>"${root}/${name}.err" </dev/null || rc=$?
   if [ "$rc" -ne "$want" ]; then
@@ -150,6 +181,26 @@ if run_case normal 0 normal "100000 1000 2000 3000 4000 5000" --trials 5 --warmu
   jq_eq normal "$o" '[has("pass"), has("verdict"), has("ok")]' '[false,false,false]'
   if grep -qF "$root" "$o"; then fail "normal: output contains a path"; else pass "normal: output has no paths"; fi
 fi
+
+# --- observed 系列の具体値: 時間制御入力（kill 検知後の待ち 0.1〜0.3 秒）で下限が決まる。warmup 0.8 秒は除外される ---
+# delay は新コンテナ起動前の sleep なので observed >= delay（上限はポーリング・fork の余裕 0.2 秒）。
+# 試行値（昇順）の期待下限 [100,150,200,250,300]ms・中央値 200..400ms・p95（5 番目）300..550ms・warmup 除外なら最大 < 700ms。
+STUB_DELAY="0.8 0.1 0.15 0.2 0.25 0.3"
+if run_case observed_vals 0 normal "9 1000 2000 3000 4000 5000" --trials 5 --warmup 1 --timeout 20; then
+  o="${root}/observed_vals.out"
+  jq_eq observed_vals "$o" '.observed.samples' '5'
+  jq_eq observed_vals "$o" '(.observed.values | sort) as $v | [$v[0] >= 100, $v[1] >= 150, $v[2] >= 200, $v[3] >= 250, $v[4] >= 300, $v[4] < 700]' '[true,true,true,true,true,true]'
+  jq_eq observed_vals "$o" '[.observed.median >= 200, .observed.median <= 400]' '[true,true]'
+  jq_eq observed_vals "$o" '[.observed.p95 >= 300, .observed.p95 <= 550, .observed.p95 == .observed.max]' '[true,true,true]'
+  jq_eq observed_vals "$o" '[.observed.min >= 100, .observed.max < 700]' '[true,true]'
+fi
+STUB_DELAY=""
+
+# state.json の pid が launcher の孫プロセスでも同一性確認が成立する（祖先の起動時刻と取り違えない）
+run_case deep 0 deep "1000 1000" --trials 2 --warmup 0 --timeout 10 || true
+
+# launcher が SIGTERM 時に環境変数を継承しない新コンテナを起動しても、state.json の pid から回収される
+run_case late_start 0 late_start "" --trials 1 --warmup 0 --timeout 10 || true
 
 # 偶数個: 1000..4000 → 中央値 2.5・p95 は ceil(3.8)-1=3 番目で 4.000
 if run_case even 0 normal "9 1000 2000 3000 4000" --trials 4 --warmup 1 --timeout 10; then

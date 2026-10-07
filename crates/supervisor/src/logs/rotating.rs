@@ -8,37 +8,56 @@
 //! - `generations` は現在ログを含む総ファイル数。ディスク使用量の上限は `max_file_bytes × generations`。
 //! - 全ファイルは常に `len <= max_file_bytes`。現在ログは必ず空から始まり、空ファイルには最大レコードが
 //!   収まる（[`MIN_LOG_FILE_BYTES`] 以上を要求する）ので、1 レコードが世代をまたいで分断されることもない。
-//! - 1 レコード = `<stream 名> ` + 行バイト列 + LF。LF 区切りで一意に復元できるよう、[`LogSink::append`] は
-//!   LF を含む行を `InvalidArgument` で拒否する（sink は失敗状態にしない）。それ以外の内容は不透明バイト列のまま
-//!   書き、解釈・エスケープをしない。
+//! - 1 レコード = `<stream 名> ` + 行バイト列 + LF。[`LogSink::append`] は行を先に [`MAX_LINE_BYTES`] へ
+//!   切り詰め、記録する範囲に LF を含む行だけを `InvalidArgument` で拒否する（LF 区切りで一意に復元する
+//!   ため。sink は失敗状態にしない）。それ以外の内容は不透明バイト列のまま書き、解釈・エスケープをしない。
+//!   書き込み失敗で失敗状態になった sink のファイルは、末尾レコードが途中で切れていることがある。
 //! - 同じ ID のログは同時に 1 つの sink だけが開ける。[`RotatingFileSink::open`] は `<id>.log.lock` への排他
 //!   ロック（unix は flock、Windows は LockFileEx 相当。sink の生存中保持し、プロセス終了で OS が解放する）を
 //!   取り、取れなければ（別の sink が使用中）既存ログを動かさず `FailedPrecondition` で拒否する。
+//!   ロックファイルは空のまま残す（open が検査で失敗した場合も残る）。消すと排他が崩れるため、sink の
+//!   生存中は消さないこと（コンテナ削除時の掃除は配線側の責務）。
 //! - 1 つの sink は supervisor プロセスにつき 1 回作り、再起動・再捕捉では同じものを使い回す。
 //!   [`RotatingFileSink::open`] は既存の `<id>.log` を開かず世代へ退避してから新規作成するため、
-//!   open するたびに 1 世代を消費する。
-//! - [`RotatingFileSink::open`] は既存の現在ログ・各世代が上限を超えていれば `InvalidArgument` で拒否し、
-//!   `<id>.log.<n>` が NAME_MAX を超える長さの ID も拒否する（いずれも既存ファイルは動かさない）。
-//! - 設定の世代数以上の番号の旧世代（`<id>.log.<n>`、`n >= generations`）が残っていれば、世代数を減らした
-//!   開き直しとして `InvalidArgument` で拒否する（上限契約を守るため。既存ファイルは動かさず、手動整理を求める）。
+//!   open するたびに 1 世代を消費する（既存の `<id>.log` が空なら退避せず作り直し、世代を消費しない）。
+//! - sink が使う名前空間は `<id>.log`・`<id>.log.lock`・`<id>.log.<10 進数字>` で、他の ID の名前とは
+//!   重ならない。[`RotatingFileSink::open`] はディレクトリを列挙し、この名前空間のエントリを 1 つでも
+//!   受理できなければ、既存ファイルを動かさず `InvalidArgument` で拒否する（手動整理を求める）。
+//!   受理するのは、通常ファイルで `len <= max_file_bytes` の `<id>.log` と `<id>.log.<n>`
+//!   （`1 <= n < generations`、先頭 0 なし）だけである。したがって世代番号 0・先頭 0 つき・世代数以上の
+//!   番号（世代数を減らした開き直し）・上限超過・ディレクトリ・symlink・ASCII 大文字小文字だけが違う別名
+//!   （大文字小文字非区別 FS では同じファイルを指す）は拒否する。これらはローテーションの対象外のまま
+//!   残り、ディスク使用量の上限を破るためである。
+//! - `<id>.log.<n>` が NAME_MAX を超える長さの ID も `InvalidArgument` で拒否する。
 //! - ローテーション・書き込みの失敗は握りつぶさず `Internal` で返し、sink を失敗状態に固定する（fail-closed）。
 //!   以後の `append` は両ストリームとも `Err` になる。エラーメッセージにパス・行内容・errno は含めない（ERR-1）。
 //!
 //! # 安全性
 //! - 現在ログは `create_new`（`O_CREAT|O_EXCL`）でのみ開く。最終要素が symlink でも辿らないため、
-//!   symlink 先への追記を防ぐ。既存エントリは種別を問わず rename / remove（symlink を辿らない）で退避する。
-//! - `dir` が symlink・非ディレクトリなら拒否し、unix では group / other 書き込み可も拒否する。
-//!   経路上の親要素の symlink・`..` 要素も拒否し（unix は root 所有の symlink のみ許容）、検証後は解決済みパスへ固定する。
-//!   新規ファイルは unix で 0600。ファイル名は検証済み [`ContainerId`] を小文字のみへ可逆変換（大文字 `X` → `_x`、`_` → `__`。
-//!   大文字小文字非区別 FS での衝突回避。IO-5）した値と固定接尾辞から `Path::join` で組み立てる。
+//!   symlink 先への追記を防ぐ。既存ファイルは開かず、rename / remove（symlink を辿らない）だけで動かす。
+//! - 既存のロックファイルは、開く前後の種別（unix は dev / inode も）が一致する通常ファイルのときだけ使い、
+//!   読み取りでしか開かない（検査後に symlink へ差し替えられても、その先へ書かない）。
+//! - `dir` は絶対パスに限る（相対パスは CWD より上の要素を検査できない）。末尾の区切り文字・`.` は要素から
+//!   組み直して除く（`link/` は lstat が symlink を辿り、最終要素の検査をすり抜けるため）。`dir` が symlink・
+//!   非ディレクトリなら拒否し、unix では group / other 書き込み可も拒否する。経路上の親要素の symlink・`..` 要素も
+//!   拒否し（unix は root 所有の symlink のみ許容）、検証後は解決済みパスへ固定する。
+//! - 新規ファイルは unix で 0600。ファイル名は検証済み [`ContainerId`] を小文字のみへ可逆変換（大文字 `X` → `_x`、
+//!   `_` → `__`。大文字小文字非区別 FS での衝突回避。IO-5）した値と固定接尾辞から `Path::join` で組み立てる。
+//!   Windows の予約デバイス名（`con`・`nul`・`com1` 等。拡張子つきでもデバイスとして開かれ得る）で始まる
+//!   名前には、先頭に `_0` を付けて避ける（全 OS で同じ名前にする）。
 //!
 //! # 未実装・制限（REPAIR-3）
 //! - ローテーション境界の欠落・重複防止のバッファリング、フラッシュ / fsync 制御: #507（TASK-164.3）。
 //!   本実装は `File` へ直接 `write_all` するだけで、クラッシュ時の耐久性は保証しない。
 //! - 100 万行規模の欠落 0・重複 0 の検証: #508（TASK-164.4）。
-//! - `logs` コマンドからの読み出し経路。退避した世代が symlink の可能性があるため、読み出し側は symlink を辿らず開くこと。
+//! - `logs` コマンドからの読み出し経路。open 後に差し替えられた世代が symlink の可能性は残るため、
+//!   読み出し側は symlink を辿らず開くこと。
 //! - 親ディレクトリ経路の検証後の差し替え（TOCTOU）は完全には防げない（dirfd 基準の固定には core の安全 open の公開が必要）。
 //!   所有者（uid）の照合もしない。Windows では権限（ACL）を検査しない。
+//! - 名前空間の別名検査は ASCII の大文字小文字だけを見る。FS 固有の Unicode 畳み込み（APFS の `K` U+212A 等）
+//!   による別名は検出しない。
+//! - Windows では、他プロセスが世代ファイルを削除共有なしで開いていると rename が失敗し、sink は失敗状態に
+//!   固定される（再試行しない）。読み出し側は削除共有つきで開くこと。
 //! - `dir`（状態ルート配下のどこか）の決定は配線側の責務で、本モジュールは決めない。
 
 use std::fs::{self, File, OpenOptions};
@@ -153,8 +172,16 @@ pub struct RotatingFileSink {
 /// 既定の大文字小文字非区別 FS では同じファイルを指しログが混在・消去される。そのため大文字 `X` は
 /// `_x`、`_` は `__` へ写し、出力を小文字・数字・`.`・`-`・`_` のみにする。`_` が常にエスケープの
 /// 開始なので単射であり、異なる ID は（大文字小文字を無視しても）異なるファイル名になる。
+///
+/// ID の最初の `.` より前が Windows の予約デバイス名（[`is_reserved_device_name`]）なら、先頭に `_0` を
+/// 付ける（`con.log` はコンソールデバイスとして開かれ得る）。`_` の直後が数字になる出力は他に無いので、
+/// 単射性は保たれる。
 fn encode_file_stem(id: &str) -> String {
-    let mut out = String::with_capacity(id.len().saturating_mul(2));
+    let mut out = String::with_capacity(id.len().saturating_mul(2).saturating_add(2));
+    let first = id.split('.').next().unwrap_or(id);
+    if is_reserved_device_name(first) {
+        out.push_str("_0");
+    }
     for c in id.chars() {
         if c == '_' {
             out.push_str("__");
@@ -168,6 +195,22 @@ fn encode_file_stem(id: &str) -> String {
     out
 }
 
+/// Windows が拡張子の有無によらずデバイスとして扱う名前か（小文字で比較する。大文字を含む ID は
+/// 変換で `_x` になり予約名と一致しなくなるため、小文字の一致だけを見ればよい）。
+fn is_reserved_device_name(s: &str) -> bool {
+    if matches!(s, "con" | "prn" | "aux" | "nul") {
+        return true;
+    }
+    match s.as_bytes() {
+        [a, b, c, d] => matches!(&[*a, *b, *c], b"com" | b"lpt") && d.is_ascii_digit(),
+        _ => false,
+    }
+}
+
+fn invalid(msg: &'static str) -> TraitError {
+    TraitError::new(ErrorCode::InvalidArgument, msg)
+}
+
 fn internal(msg: &'static str) -> TraitError {
     TraitError::new(ErrorCode::Internal, msg)
 }
@@ -175,8 +218,9 @@ fn internal(msg: &'static str) -> TraitError {
 impl RotatingFileSink {
     /// `dir` 直下に `<id>.log` を作って sink を開く。
     ///
-    /// `dir` は既存のディレクトリで、symlink でなく（unix では）group / other 書き込み不可であること。
-    /// 既存の `<id>.log` は開かず、世代へ退避してから新規作成する（symlink 先への追記を防ぐ）。
+    /// `dir` は絶対パスで指す既存のディレクトリで、symlink でなく（unix では）group / other 書き込み不可で
+    /// あること。既存の `<id>.log` は開かず、世代へ退避してから新規作成する（symlink 先への追記を防ぐ）。
+    /// 名前空間（モジュール doc「契約」）に受理できないエントリがあれば、既存ファイルを動かさず拒否する。
     pub fn open(dir: &Path, id: &ContainerId, config: RotationConfig) -> Result<Self, TraitError> {
         let dir = check_dir(dir)?;
         // `<id>.log.<n>` の最長名が NAME_MAX を超えると open / 初回ローテーションが失敗して
@@ -209,13 +253,19 @@ impl RotatingFileSink {
                 rotations: 0,
             }),
         };
-        // 既存の現在ログ・各世代が上限を超えていたら、何も動かさずに拒否する（契約:
-        // 全ファイル len <= max_file_bytes）。上限を下げて開き直した場合は手動で整理させる。
-        sink.check_existing_sizes()?;
-        sink.check_stale_generations()?;
-        // 既存エントリ（種別不問）があれば、辿らずに世代へ送ってから作り直す。
-        if fs::symlink_metadata(sink.path(0)).is_ok() {
-            sink.shift_generations()?;
+        // 名前空間のエントリを 1 つでも受理できなければ、何も動かさずに拒否する（契約: 全ファイルが
+        // 通常ファイルで len <= max_file_bytes、総数は generations 以内）。手動で整理させる。
+        sink.check_namespace()?;
+        sink.check_existing_files()?;
+        // 既存の現在ログは開かず、世代へ送ってから作り直す。空なら世代を消費せず消すだけにする
+        // （出力の無い再起動が続いても、保持している世代を押し出さない）。
+        match fs::symlink_metadata(sink.path(0)) {
+            Ok(m) if m.len() == 0 => {
+                fs::remove_file(sink.path(0)).map_err(|_| internal("log rotation failed"))?;
+            }
+            Ok(_) => sink.shift_generations()?,
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(_) => return Err(internal("log file inspection failed")),
         }
         let file = sink.create_active()?;
         sink.lock()?.state = State::Active { file, size: 0 };
@@ -264,24 +314,18 @@ impl RotatingFileSink {
 
     /// 既存の現在ログ・各世代（`0..generations`）が通常ファイルで、サイズが上限以内であることを確認する。
     ///
-    /// ディレクトリ等の通常ファイル・symlink 以外は、`max_file_bytes × generations` の
-    /// 契約に収まらずローテーションも失敗し得るため、ファイルを変更する前に拒否する（SUP-7・TASK-164.2）。
-    /// symlink はリンク自体が rename / 削除されるだけで参照先を変更しないため許容する
-    /// （`symlink_log_target_is_not_modified` テスト参照）。
-    fn check_existing_sizes(&self) -> Result<(), TraitError> {
+    /// ディレクトリ・symlink 等は `max_file_bytes × generations` の契約に収まらない（symlink の長さは
+    /// 参照先のサイズではなく、ディレクトリはローテーションも失敗させる）ため、ファイルを変更する前に
+    /// 拒否する（SUP-7・TASK-164.2）。現在ログは `create_new` でしか開かないので、検査後に symlink へ
+    /// 差し替えられても参照先へは書かない。
+    fn check_existing_files(&self) -> Result<(), TraitError> {
         for i in 0..self.config.generations {
             match fs::symlink_metadata(self.path(i)) {
-                Ok(m) if !m.file_type().is_file() && !m.file_type().is_symlink() => {
-                    return Err(TraitError::new(
-                        ErrorCode::InvalidArgument,
-                        "existing log path is not a regular file",
-                    ));
+                Ok(m) if !m.file_type().is_file() => {
+                    return Err(invalid("existing log path is not a regular file"));
                 }
                 Ok(m) if m.len() > self.config.max_file_bytes => {
-                    return Err(TraitError::new(
-                        ErrorCode::InvalidArgument,
-                        "existing log file exceeds the size limit",
-                    ));
+                    return Err(invalid("existing log file exceeds the size limit"));
                 }
                 Ok(_) => {}
                 Err(e) if e.kind() == ErrorKind::NotFound => {}
@@ -291,44 +335,56 @@ impl RotatingFileSink {
         Ok(())
     }
 
-    /// 設定の世代数以上の番号を持つ旧世代（`<id>.log.<n>`、`n >= generations`）が残っていないことを確認する。
+    /// `dir` を列挙し、この sink の名前空間に受理できない名前のエントリが無いことを確認する。
     ///
-    /// 世代数を減らして開き直すと、範囲外の旧世代はローテーションの対象外のまま残り、
-    /// ディスク使用量の上限 `max_file_bytes × generations` の契約を破る。利用者のログを黙って
-    /// 消さないため、ファイルを変更する前に `InvalidArgument` で拒否し、手動で整理させる（SUP-7・TASK-164.2）。
-    fn check_stale_generations(&self) -> Result<(), TraitError> {
+    /// 名前空間は `<base>`・`<base>.lock`・`<base>.<10 進数字>`（ASCII の大文字小文字を無視して比較）。
+    /// 他の ID の名前は `.log` / `.lock` / `<別の base>.<数字>` で終わるので、ここには入らない。
+    /// 受理するのは、小文字の正確な綴りの `<base>`・`<base>.lock` と、先頭 0 なしで `1 <= n < generations`
+    /// の `<base>.<n>` だけである。世代番号 0・先頭 0 つき・世代数以上の番号・大文字小文字違いの別名は、
+    /// ローテーションの対象外のまま残って上限 `max_file_bytes × generations` を破るため、ファイルを
+    /// 変更する前に `InvalidArgument` で拒否する（利用者のログを黙って消さない。SUP-7・TASK-164.2）。
+    /// 種別とサイズは [`Self::check_existing_files`] が見る。
+    fn check_namespace(&self) -> Result<(), TraitError> {
+        let unexpected = || invalid("unexpected entry exists in the log file namespace");
+        let lock_name = format!("{}{LOCK_SUFFIX}", self.base);
         let prefix = format!("{}.", self.base);
         let rd = fs::read_dir(&self.dir).map_err(|_| internal("log directory scan failed"))?;
-        // 番号の上限では打ち切らず、ディレクトリを列挙して対象 ID の世代ファイルを全て検査する。
+        // 番号の上限では打ち切らず、ディレクトリを列挙して対象 ID の名前を全て検査する。
         // 走査件数には上限を設け（超過は fail-closed）、確保はエントリ単位の一時値のみに留める。
         let mut scanned = 0usize;
         for entry in rd {
-            scanned += 1;
+            scanned = scanned.saturating_add(1);
             if scanned > MAX_SCAN_ENTRIES {
-                return Err(TraitError::new(
-                    ErrorCode::InvalidArgument,
-                    "log directory has too many entries to verify",
-                ));
+                return Err(invalid("log directory has too many entries to verify"));
             }
             let entry = entry.map_err(|_| internal("log directory scan failed"))?;
             let name = entry.file_name();
-            let Some(num) = name.to_str().and_then(|n| n.strip_prefix(prefix.as_str())) else {
+            // sink の名前は ASCII のみ。UTF-8 でない名前は名前空間に入らない。
+            let Some(name) = name.to_str() else {
                 continue;
             };
-            // 正規形（先頭 0 なしの 10 進数）だけが世代番号。桁あふれは十分大きい番号として扱う。
-            if num.is_empty()
-                || !num.bytes().all(|b| b.is_ascii_digit())
-                || (num.len() > 1 && num.starts_with('0'))
-            {
+            let lower = name.to_ascii_lowercase();
+            if lower == self.base || lower == lock_name {
+                if name != lower {
+                    return Err(unexpected());
+                }
                 continue;
             }
-            let stale = num
+            let Some(num) = lower.strip_prefix(prefix.as_str()) else {
+                continue;
+            };
+            if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            // ここからは世代番号の名前空間。正規形（先頭 0 なし）で 1..generations の範囲だけを受理する。
+            // 桁あふれは範囲外として扱う。
+            let in_range = num
                 .parse::<u64>()
-                .map_or(true, |n| n >= u64::from(self.config.generations));
-            if stale {
+                .is_ok_and(|n| n >= 1 && n < u64::from(self.config.generations));
+            if name != lower || num.starts_with('0') || !in_range {
                 return Err(TraitError::new(
                     ErrorCode::InvalidArgument,
-                    "stale log generation exists beyond the configured generation count",
+                    "stale or malformed log generation exists outside the configured generations",
                 ));
             }
         }
@@ -354,7 +410,9 @@ const LOCK_SUFFIX: &str = ".lock";
 /// `<base>.lock` を開き排他ロックを取る。取れなければ（別の sink が使用中）`FailedPrecondition`。
 ///
 /// ロックファイルは内容を持たず、書き込みもしない。新規作成は `create_new`（symlink を辿らない）、
-/// 既存は通常ファイル（symlink・FIFO 等は拒否）のときだけ読み取りで開く。
+/// 既存は通常ファイル（symlink・FIFO 等は拒否）のときだけ読み取りで開く。std には `O_NOFOLLOW` 相当が
+/// 無いため、開いた実体が検査したものと同じ通常ファイルであることを開いた後にも確かめる
+/// （検査と open の間の差し替え対策。unix は dev / inode も照合する）。
 fn acquire_lock(dir: &Path, base: &str) -> Result<File, TraitError> {
     let path = dir.join(format!("{base}{LOCK_SUFFIX}"));
     let mut create = OpenOptions::new();
@@ -366,22 +424,36 @@ fn acquire_lock(dir: &Path, base: &str) -> Result<File, TraitError> {
     }
     let file = match create.open(&path) {
         Ok(f) => f,
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-            match fs::symlink_metadata(&path) {
-                Ok(m) if m.file_type().is_file() => {}
-                _ => {
-                    return Err(TraitError::new(
-                        ErrorCode::InvalidArgument,
-                        "log lock path is not a regular file",
-                    ));
-                }
-            }
-            OpenOptions::new()
+        // 作れなかったときは、既存エントリの種別で分ける（既存がディレクトリのときの create_new の
+        // エラー種別は OS で異なるため、種別は lstat で判定する）。
+        Err(_) => {
+            let not_regular = || invalid("log lock path is not a regular file");
+            let before = match fs::symlink_metadata(&path) {
+                Ok(m) if m.file_type().is_file() => m,
+                Ok(_) => return Err(not_regular()),
+                Err(_) => return Err(internal("log lock create failed")),
+            };
+            let file = OpenOptions::new()
                 .read(true)
                 .open(&path)
-                .map_err(|_| internal("log lock open failed"))?
+                .map_err(|_| internal("log lock open failed"))?;
+            let after = file
+                .metadata()
+                .map_err(|_| internal("log lock open failed"))?;
+            if !after.file_type().is_file() {
+                return Err(not_regular());
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if before.dev() != after.dev() || before.ino() != after.ino() {
+                    return Err(not_regular());
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = before;
+            file
         }
-        Err(_) => return Err(internal("log lock create failed")),
     };
     match file.try_lock() {
         Ok(()) => Ok(file),
@@ -399,14 +471,22 @@ fn acquire_lock(dir: &Path, base: &str) -> Result<File, TraitError> {
 /// 親要素の symlink は、リンク先が状態ルート外でも最終要素の検査を通ってしまうため、全祖先を検査する。
 /// `..` 要素は拒否する。unix では root 所有の symlink（`/var` -> `/private/var` 等の OS 標準）のみ許容する
 /// （一般ユーザーは root 所有の symlink を作れない）。他 OS では symlink を一律拒否する。
+///
+/// 相対パスは拒否する（CWD より上の要素を検査できない）。検査の前に要素から組み直して、末尾の区切り文字と
+/// `.` を除く（`link/` のような末尾の区切り文字があると `lstat` が最終要素の symlink を辿り、symlink 検査を
+/// すり抜けるため。core の `StateRoot::from_override` と同じ扱い）。
 fn check_dir(dir: &Path) -> Result<PathBuf, TraitError> {
-    let invalid = |msg: &'static str| TraitError::new(ErrorCode::InvalidArgument, msg);
+    if !dir.is_absolute() {
+        return Err(invalid("log directory must be an absolute path"));
+    }
     if dir
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir))
     {
         return Err(invalid("log directory path contains a parent reference"));
     }
+    let dir: PathBuf = dir.components().collect();
+    let dir = dir.as_path();
     let meta = fs::symlink_metadata(dir).map_err(|_| invalid("log directory is not accessible"))?;
     if !meta.is_dir() {
         return Err(invalid("log directory is not a directory"));
@@ -444,15 +524,13 @@ fn check_dir(dir: &Path) -> Result<PathBuf, TraitError> {
 
 impl LogSink for RotatingFileSink {
     fn append(&self, stream: StreamKind, line: &[u8]) -> Result<(), TraitError> {
-        // LF を含むと 1 追記が複数レコードに見え、LF 区切りで一意に復元できなくなるため拒否する（SUP-7）。
-        if line.contains(&b'\n') {
-            return Err(TraitError::new(
-                ErrorCode::InvalidArgument,
-                "log line must not contain a line feed",
-            ));
-        }
         // 直接呼び出しでも確保量を抑えるため、確保前に MAX_LINE_BYTES へ切り詰める。
         let line = line.get(..MAX_LINE_BYTES).unwrap_or(line);
+        // LF を含むと 1 追記が複数レコードに見え、LF 区切りで一意に復元できなくなるため拒否する（SUP-7）。
+        // 検査は記録する範囲（切り詰め後）に対して行う。捨てる部分の LF は記録に現れない。
+        if line.contains(&b'\n') {
+            return Err(invalid("log line must not contain a line feed"));
+        }
         let tag = stream.as_str();
         let mut rec = Vec::with_capacity(tag.len() + 1 + line.len() + 1);
         rec.extend_from_slice(tag.as_bytes());
@@ -460,6 +538,11 @@ impl LogSink for RotatingFileSink {
         rec.extend_from_slice(line);
         rec.push(b'\n');
         let rec_len = u64::try_from(rec.len()).map_err(|_| internal("log record too large"))?;
+        // 空ファイルにも収まらないレコードは書かない（全ファイル len <= max_file_bytes の不変条件を、
+        // stream 名が将来長くなっても破らないための防御。現状は MIN_LOG_FILE_BYTES の下限により到達しない）。
+        if rec_len > self.config.max_file_bytes {
+            return Err(internal("log record too large"));
+        }
 
         let mut g = self.lock()?;
         let size = match &g.state {

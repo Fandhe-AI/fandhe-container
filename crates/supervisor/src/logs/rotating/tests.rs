@@ -199,16 +199,40 @@ fn sup7_task164_2_open_rejects_missing_or_non_directory() {
     assert_eq!(e.code(), ErrorCode::InvalidArgument);
 }
 
+/// 現在ログ・世代が symlink なら、リンクも参照先も変更せずに拒否する（参照先への追記・サイズ上限の
+/// すり抜けを防ぐ）。
 #[cfg(unix)]
 #[test]
-fn sup7_task164_2_symlink_log_target_is_not_modified() {
-    let t = TmpDir::new("symlink");
+fn sup7_task164_2_open_rejects_symlink_logs_without_touching_target() {
+    for name in ["c1.log", "c1.log.1"] {
+        let t = TmpDir::new("symlink");
+        let target = t.0.join("target");
+        fs::write(&target, b"keep\n").unwrap();
+        std::os::unix::fs::symlink(&target, t.0.join(name)).unwrap();
+        let e = RotatingFileSink::open(&t.0, &id(), small()).err().unwrap();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument, "{name}");
+        assert_eq!(fs::read(&target).unwrap(), b"keep\n");
+        assert_eq!(fs::read_link(t.0.join(name)).unwrap(), target);
+        assert_eq!(files(&t.0), [name, "target"]);
+    }
+}
+
+/// open 後に現在ログが symlink へ差し替えられても、ローテーションはリンクを動かすだけで参照先へ書かない
+/// （現在ログは create_new でしか開かない）。
+#[cfg(unix)]
+#[test]
+fn sup7_task164_2_rotation_does_not_write_through_swapped_symlink() {
+    let t = TmpDir::new("swap");
     let target = t.0.join("target");
     fs::write(&target, b"keep\n").unwrap();
-    std::os::unix::fs::symlink(&target, t.0.join("c1.log")).unwrap();
     let s = RotatingFileSink::open(&t.0, &id(), small()).unwrap();
+    s.append(StreamKind::Stdout, &vec![b'a'; MAX_LINE_BYTES])
+        .unwrap();
+    fs::remove_file(t.0.join("c1.log")).unwrap();
+    std::os::unix::fs::symlink(&target, t.0.join("c1.log")).unwrap();
     s.append(StreamKind::Stdout, b"x").unwrap();
     assert_eq!(fs::read(&target).unwrap(), b"keep\n");
+    assert_eq!(fs::read_link(t.0.join("c1.log.1")).unwrap(), target);
     assert_eq!(fs::read(t.0.join("c1.log")).unwrap(), b"stdout x\n");
 }
 
@@ -381,12 +405,113 @@ fn sup7_task164_2_open_rejects_stale_generations_at_or_above_max() {
         let e = RotatingFileSink::open(&t.0, &id(), cfg).err().unwrap();
         assert_eq!(e.code(), ErrorCode::InvalidArgument, "{stale}");
     }
+    // 名前空間（`c1.log`・`c1.log.lock`・`c1.log.<数字>`）の外の名前は無視する。`c1.log.log*` は
+    // ID `c1.log` の sink の名前で、`c1.log.15` は 16 世代の範囲内。
     let t = TmpDir::new("stale-other");
-    for other in ["c1.log.x", "c1.log.01", "c1.log.", "c2.log.20", "c1.log.15"] {
+    let others = [
+        "c1.log.x",
+        "c1.log.1x",
+        "c1.log.-1",
+        "c1.log.1.bak",
+        "c1.log.log",
+        "c1.log.log.20",
+        "c1.log.log.lock",
+        "c2.log.20",
+        "c1.log.15",
+    ];
+    for other in others {
         fs::write(t.0.join(other), b"o").unwrap();
     }
     let cfg = RotationConfig::new(MIN_LOG_FILE_BYTES, 16).unwrap();
     assert!(RotatingFileSink::open(&t.0, &id(), cfg).is_ok());
+    // `files` はロックファイル（`.lock`）を除いて返す。
+    let mut expect: Vec<&str> = others.to_vec();
+    expect.retain(|n| !n.ends_with(".lock"));
+    expect.push("c1.log");
+    expect.sort_unstable();
+    assert_eq!(files(&t.0), expect);
+}
+
+/// SUP-7: `.` を含む ID（`c1` と `c1.log`）は名前空間が重ならず、同じディレクトリで互いの世代を
+/// 旧世代と誤認せずにローテーションできる。
+#[test]
+fn sup7_task164_2_dotted_sibling_ids_do_not_share_namespace() {
+    let t = TmpDir::new("sibling");
+    let cfg = RotationConfig::new(MIN_LOG_FILE_BYTES, 2).unwrap();
+    let sibling = ContainerId::new("c1.log").unwrap();
+    for round in 0..3 {
+        let a = RotatingFileSink::open(&t.0, &id(), cfg).unwrap();
+        let b = RotatingFileSink::open(&t.0, &sibling, cfg).unwrap();
+        for s in [&a, &b] {
+            s.append(StreamKind::Stdout, &vec![b'a'; MAX_LINE_BYTES])
+                .unwrap();
+            s.append(StreamKind::Stdout, b"x").unwrap();
+            assert_eq!(s.rotations().unwrap(), 1, "round {round}");
+        }
+    }
+    assert_eq!(
+        files(&t.0),
+        ["c1.log", "c1.log.1", "c1.log.log", "c1.log.log.1"]
+    );
+    assert_eq!(fs::read(t.0.join("c1.log")).unwrap(), b"stdout x\n");
+    assert_eq!(fs::read(t.0.join("c1.log.log")).unwrap(), b"stdout x\n");
+}
+
+/// SUP-7: 世代番号 0・先頭 0 つきの番号は、ローテーションが送らないまま残って上限
+/// `max_file_bytes × generations` を破るため、世代数によらず拒否する（何も動かさない）。
+#[test]
+fn sup7_task164_2_open_rejects_zero_and_non_canonical_generation_numbers() {
+    for bad in ["c1.log.0", "c1.log.00", "c1.log.01", "c1.log.002"] {
+        for generations in [1, 3, 16] {
+            let t = TmpDir::new("gen-zero");
+            fs::write(t.0.join(bad), b"old").unwrap();
+            let cfg = RotationConfig::new(MIN_LOG_FILE_BYTES, generations).unwrap();
+            let e = RotatingFileSink::open(&t.0, &id(), cfg).err().unwrap();
+            assert_eq!(
+                e.code(),
+                ErrorCode::InvalidArgument,
+                "{bad} / {generations}"
+            );
+            assert_eq!(files(&t.0), [bad]);
+            assert_eq!(fs::read(t.0.join(bad)).unwrap(), b"old");
+        }
+    }
+}
+
+/// SUP-7・IO-5: ASCII の大文字小文字だけが違う名前は、大文字小文字非区別 FS では sink のファイルと同じ
+/// 実体を指す（区別する FS ではローテーションが送らない余分なファイルになる）ため拒否する。
+#[test]
+fn sup7_task164_2_open_rejects_case_variant_names_in_namespace() {
+    for bad in ["C1.log", "c1.LOG.1", "C1.LOG.7", "c1.log.LOCK"] {
+        let t = TmpDir::new("case-variant");
+        fs::write(t.0.join(bad), b"old").unwrap();
+        let e = RotatingFileSink::open(&t.0, &id(), small()).err().unwrap();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument, "{bad}");
+        assert_eq!(fs::read(t.0.join(bad)).unwrap(), b"old");
+    }
+}
+
+/// SUP-7: 既存の現在ログが空なら世代を消費しない（出力の無い開き直しで保持中の世代を押し出さない）。
+#[test]
+fn sup7_task164_2_reopen_with_empty_current_log_keeps_generations() {
+    let t = TmpDir::new("empty-reopen");
+    fs::write(t.0.join("c1.log.1"), b"g1\n").unwrap();
+    fs::write(t.0.join("c1.log.2"), b"g2\n").unwrap();
+    for _ in 0..4 {
+        let s = RotatingFileSink::open(&t.0, &id(), small()).unwrap();
+        assert_eq!(s.rotations().unwrap(), 0);
+    }
+    assert_eq!(files(&t.0), ["c1.log", "c1.log.1", "c1.log.2"]);
+    assert_eq!(fs::read(t.0.join("c1.log.1")).unwrap(), b"g1\n");
+    assert_eq!(fs::read(t.0.join("c1.log.2")).unwrap(), b"g2\n");
+    // 1 行でも書いてあれば、次の open で世代 1 へ送る。
+    let s = RotatingFileSink::open(&t.0, &id(), small()).unwrap();
+    s.append(StreamKind::Stdout, b"new").unwrap();
+    drop(s);
+    RotatingFileSink::open(&t.0, &id(), small()).unwrap();
+    assert_eq!(fs::read(t.0.join("c1.log")).unwrap(), b"");
+    assert_eq!(fs::read(t.0.join("c1.log.1")).unwrap(), b"stdout new\n");
+    assert_eq!(fs::read(t.0.join("c1.log.2")).unwrap(), b"g1\n");
 }
 
 /// 親要素が symlink の経路は、リンク先が正当なディレクトリでも拒否する（状態ルート外への逸脱防止）。
@@ -410,6 +535,19 @@ fn sup7_task164_2_open_rejects_symlinked_parent_component() {
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
         assert!(!sub.join("c1.log").exists());
     }
+    // 末尾の区切り文字つきの symlink（lstat が辿る）も、最終要素の symlink として拒否する。
+    let leaf = t.0.join("leaf");
+    std::os::unix::fs::symlink(&sub, &leaf).unwrap();
+    for tail in ["/", "/.", "//"] {
+        let mut p = leaf.clone().into_os_string();
+        p.push(tail);
+        let e = RotatingFileSink::open(Path::new(&p), &id(), small())
+            .err()
+            .unwrap();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument, "{tail}");
+    }
+    assert!(!sub.join("c1.log").exists());
+    assert!(!sub.join("c1.log.lock").exists());
     // `..` 要素は拒否する。
     let dotdot = real.join("..").join("real").join("logs");
     let e = RotatingFileSink::open(&dotdot, &id(), small())
@@ -475,4 +613,150 @@ fn sup7_task164_2_append_rejects_line_feed_without_failing_sink() {
     // 拒否は sink を失敗状態にせず、何も書かない。
     sink.append(StreamKind::Stderr, b"ok").unwrap();
     assert_eq!(fs::read(d.0.join("c1.log")).unwrap(), b"stderr ok\n");
+}
+
+/// SUP-7: 切り詰めで捨てる範囲（MAX_LINE_BYTES より後ろ）の LF は記録されないので拒否しない。
+/// 記録する範囲の LF は末尾 1 バイトでも拒否する。
+#[test]
+fn sup7_task164_2_line_feed_is_checked_on_the_truncated_range() {
+    let d = TmpDir::new("lf-trunc");
+    let sink = RotatingFileSink::open(&d.0, &id(), small()).unwrap();
+    let mut beyond = vec![b'x'; MAX_LINE_BYTES + 10];
+    *beyond.get_mut(MAX_LINE_BYTES).unwrap() = b'\n';
+    *beyond.last_mut().unwrap() = b'\n';
+    sink.append(StreamKind::Stdout, &beyond).unwrap();
+    let got = fs::read(d.0.join("c1.log")).unwrap();
+    let mut expect = b"stdout ".to_vec();
+    expect.extend(std::iter::repeat_n(b'x', MAX_LINE_BYTES));
+    expect.push(b'\n');
+    assert_eq!(got, expect);
+
+    let mut inside = vec![b'x'; MAX_LINE_BYTES + 10];
+    *inside.get_mut(MAX_LINE_BYTES - 1).unwrap() = b'\n';
+    let err = sink.append(StreamKind::Stdout, &inside).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidArgument);
+    // 拒否では何も書かず、ローテーションもしない。
+    assert_eq!(fs::read(d.0.join("c1.log")).unwrap(), expect);
+    assert_eq!(sink.rotations().unwrap(), 0);
+}
+
+/// SUP-7: stream 名 + 区切りは MAX_TAG_BYTES 以内（MIN_LOG_FILE_BYTES が最大 1 レコード長である前提）。
+#[test]
+fn sup7_task164_2_stream_tags_fit_in_max_tag_bytes() {
+    assert_eq!(StreamKind::Stdout.as_str(), "stdout");
+    assert_eq!(StreamKind::Stderr.as_str(), "stderr");
+    for kind in [StreamKind::Stdout, StreamKind::Stderr] {
+        assert_eq!(kind.as_str().len() + 1, MAX_TAG_BYTES);
+    }
+}
+
+/// SUP-7: ロックファイルは空の通常ファイル（unix は 0600）で、sink を閉じても残る。
+#[test]
+fn sup7_task164_2_lock_file_is_empty_regular_file() {
+    let d = TmpDir::new("lockfile");
+    let sink = RotatingFileSink::open(&d.0, &id(), small()).unwrap();
+    sink.append(StreamKind::Stdout, b"x").unwrap();
+    drop(sink);
+    let m = fs::symlink_metadata(d.0.join("c1.log.lock")).unwrap();
+    assert!(m.file_type().is_file());
+    assert_eq!(m.len(), 0);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(m.permissions().mode() & 0o777, 0o600);
+    }
+    let mut all: Vec<String> = fs::read_dir(&d.0)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    all.sort();
+    assert_eq!(all, ["c1.log", "c1.log.lock"]);
+}
+
+/// SUP-7: ロックファイルの位置にある symlink・ディレクトリは辿らず拒否し、参照先もログも変更しない。
+#[test]
+fn sup7_task164_2_open_rejects_non_regular_lock_path() {
+    let d = TmpDir::new("lock-dir");
+    fs::create_dir(d.0.join("c1.log.lock")).unwrap();
+    fs::write(d.0.join("c1.log"), b"old\n").unwrap();
+    let e = RotatingFileSink::open(&d.0, &id(), small()).err().unwrap();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    assert_eq!(fs::read(d.0.join("c1.log")).unwrap(), b"old\n");
+    assert!(!d.0.join("c1.log.1").exists());
+
+    #[cfg(unix)]
+    {
+        let d = TmpDir::new("lock-link");
+        let target = d.0.join("target");
+        fs::write(&target, b"keep\n").unwrap();
+        std::os::unix::fs::symlink(&target, d.0.join("c1.log.lock")).unwrap();
+        fs::write(d.0.join("c1.log"), b"old\n").unwrap();
+        let e = RotatingFileSink::open(&d.0, &id(), small()).err().unwrap();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert_eq!(fs::read(&target).unwrap(), b"keep\n");
+        assert_eq!(fs::read(d.0.join("c1.log")).unwrap(), b"old\n");
+        assert!(!d.0.join("c1.log.1").exists());
+    }
+}
+
+/// SUP-7: 相対パスの dir は拒否する（CWD より上の要素を検査できない）。
+#[test]
+fn sup7_task164_2_open_rejects_relative_dir() {
+    for rel in ["logs", ".", "./logs"] {
+        let e = RotatingFileSink::open(Path::new(rel), &id(), small())
+            .err()
+            .unwrap();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument, "{rel}");
+        assert_eq!(e.message(), "log directory must be an absolute path");
+    }
+}
+
+/// SUP-7: 末尾の区切り文字・`.` つきの実ディレクトリは、組み直した同じディレクトリとして開ける。
+#[test]
+fn sup7_task164_2_open_normalizes_trailing_separator() {
+    let d = TmpDir::new("trail");
+    let mut p = d.0.clone().into_os_string();
+    p.push(std::path::MAIN_SEPARATOR_STR);
+    p.push(".");
+    p.push(std::path::MAIN_SEPARATOR_STR);
+    let s = RotatingFileSink::open(Path::new(&p), &id(), small()).unwrap();
+    s.append(StreamKind::Stdout, b"x").unwrap();
+    assert_eq!(fs::read(d.0.join("c1.log")).unwrap(), b"stdout x\n");
+}
+
+/// IO-5: Windows の予約デバイス名で始まる ID は `_0` を前置した名前へ写し、他の ID の名前と衝突しない。
+#[test]
+fn sup7_task164_2_reserved_device_names_are_escaped() {
+    let cases = [
+        ("con", "_0con"),
+        ("nul", "_0nul"),
+        ("prn", "_0prn"),
+        ("aux", "_0aux"),
+        ("com1", "_0com1"),
+        ("lpt0", "_0lpt0"),
+        ("nul.v2", "_0nul.v2"),
+        ("con-1", "con-1"),
+        ("console", "console"),
+        ("com10", "com10"),
+        ("com", "com"),
+        ("x.con", "x.con"),
+        ("CON", "_c_o_n"),
+        ("Nul", "_nul"),
+        ("_0con", "__0con"),
+        ("a_B.c", "a___b.c"),
+    ];
+    for (id, stem) in cases {
+        assert_eq!(encode_file_stem(id), stem, "{id}");
+    }
+    let mut stems: Vec<&str> = cases.iter().map(|c| c.1).collect();
+    stems.sort_unstable();
+    stems.dedup();
+    assert_eq!(stems.len(), cases.len());
+
+    let d = TmpDir::new("reserved");
+    let nul = ContainerId::new("nul").unwrap();
+    let s = RotatingFileSink::open(&d.0, &nul, small()).unwrap();
+    s.append(StreamKind::Stdout, b"x").unwrap();
+    assert_eq!(files(&d.0), ["_0nul.log"]);
+    assert_eq!(fs::read(d.0.join("_0nul.log")).unwrap(), b"stdout x\n");
 }

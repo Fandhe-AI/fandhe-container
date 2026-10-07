@@ -2,7 +2,7 @@
 
 sudo＋pty に頼らない権限昇格方式（setuid バイナリ・capability ベース）の選択肢と、本リポが rootful で必要とする最小権限を整理する（SUP-14）。
 
-> **位置づけ**: 本書はドラフトであり、採否を確定しない。9 章の採用方式案は推奨にすぎず、ユーザーの承認は未取得である。承認が記録されるまで後続の TASK-171.1.2（#858）には着手しない。`docs/design/rootless-network.md` と同じ扱いで、本書は判断材料である。
+> **位置づけ**: 本書はドラフトであり、採否を確定しない。9 章の採用方式案は推奨にすぎず、ユーザーの承認は未取得である。方式の承認が記録されるまで、TASK-171.1.2（#858）のうち昇格を実際に行う syscall 経路には着手しない（方式非依存の純ロジック〔必要最小集合・`/proc/<pid>/status` の検証・縮退計画〕は実装済みで、境界は 10 章末尾の補足を参照）。`docs/design/rootless-network.md` と同じ扱いで、本書は判断材料である。
 
 - 対象ビヘイビア: SUP-14（Must・確定。関連: SUP-1・CORE-1・CORE-5・CORE-6・SEC-1・SEC-5・PLUG-11・ERR-1・REPAIR-5・D-19）
 - タスク: TASK-171（MS-9・G12・担当: 共同）。本書は TASK-171.1.1（#857。親 #536・#535）
@@ -146,6 +146,7 @@ TASK-171 の成果物は `crates/supervisor/src/privilege.rs`（仮称）だが�
 
 補足:
 
+- 方式非依存の純ロジック（必要最小集合・`/proc/<pid>/status` のパースと昇格結果の fail-closed 検証・縮退計画の算出。縮退後は uid・gid 0 と補助グループの残存も拒否し、補助グループは空のみ許可する。縮退計画は 5 章 4 のとおり uid 遷移がある場合に `PR_SET_KEEPCAPS` の設定と解除を対で含み、解除を最終手順とする。検証は `PR_GET_KEEPCAPS` の読み戻し結果を入力に取り、残存・未確認を拒否する）は `crates/supervisor/src/privilege.rs` に実装済み（TASK-171.1.2・#858）。昇格を実際に行う syscall 経路（ambient 載せ・`capset`・bounding 削除・setuid フォールバック・`PR_SET_KEEPCAPS` の設定 / 解除 / 読み戻し・fd 検証付き exec）は方式の承認待ちで未実装であり、`elevate` は `UNIMPLEMENTED` を返すスタブである
 - setuid ビット・`setcap` の付与はインストール時の操作でコード外である
 - 事前承認の範囲は各 crate の `sys` モジュール内の syscall ラッパーに限られる
 - 実機検証（sudo の `SIGKILL` 再現・昇格の実動作）は #538・#539 で扱い、本書の範囲外とする

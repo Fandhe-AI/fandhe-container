@@ -85,6 +85,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
+use std::time::Instant;
 
 use fandhe_container_core::traits::{ContainerId, ErrorCode, TraitError};
 
@@ -325,7 +326,28 @@ impl RotatingFileSink {
     /// 別名・不正な世代番号・ディレクトリがあれば `InvalidArgument` で拒否し、ログを 1 つも消さない
     /// （利用者のデータを黙って消さない）。削除は `remove_file` のみで symlink は辿らずリンク自体を消す。
     /// 何も無い状態で呼んでも成功する（冪等）。ロックファイルは、成功・失敗を問わずロック取得後は消す。
+    ///
+    /// 全結果（成功・ロック競合・入力拒否・途中削除失敗・ロックファイル掃除失敗）で、成否・エラー code・
+    /// 削除数・所要時間を構造化 1 行（JSON）で stderr へ出す（REPAIR-4。パス・errno は含めない。ERR-1）。
     pub fn remove_all(dir: &Path, id: &ContainerId) -> Result<RemovedLogs, TraitError> {
+        let started = Instant::now();
+        let result = Self::remove_all_inner(dir, id);
+        let (outcome, code, removed) = match &result {
+            Ok(r) => ("ok", "", r.log_files()),
+            Err(e) => ("error", e.code().as_str(), 0),
+        };
+        eprintln!(
+            "{{\"component\":\"supervisor.logs\",\"operation\":\"remove_all\",\"result\":\"{}\",\"code\":\"{}\",\"removed_log_files\":{},\"elapsed_us\":{}}}",
+            outcome,
+            code,
+            removed,
+            started.elapsed().as_micros()
+        );
+        result
+    }
+
+    /// [`Self::remove_all`] の本体（観測は呼び出し側が全結果で行う）。
+    fn remove_all_inner(dir: &Path, id: &ContainerId) -> Result<RemovedLogs, TraitError> {
         let dir = check_dir(dir)?;
         let base = format!("{}.log", encode_file_stem(id.as_str()));
         if base.len().saturating_add(LOCK_SUFFIX.len()) > MAX_FILE_NAME_BYTES {

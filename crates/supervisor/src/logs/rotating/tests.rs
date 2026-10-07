@@ -491,7 +491,15 @@ fn sup7_task164_2_open_rejects_case_variant_names_in_namespace() {
         fs::write(t.0.join(bad), b"old").unwrap();
         let e = RotatingFileSink::open(&t.0, &id(), small()).err().unwrap();
         assert_eq!(e.code(), ErrorCode::InvalidArgument, "{bad}");
-        assert_eq!(fs::read(t.0.join(bad)).unwrap(), b"old");
+        match fs::read(t.0.join(bad)) {
+            Ok(bytes) => assert_eq!(bytes, b"old", "{bad}"),
+            // 大文字小文字非区別 FS では `c1.log.LOCK` が sink 自身のロックファイルと同じ実体になり、
+            // open 失敗時のロックファイル掃除で消える（SUP-7・#1469）。他の名前は必ず残る。
+            Err(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{bad}");
+                assert_eq!(bad, "c1.log.LOCK");
+            }
+        }
     }
 }
 

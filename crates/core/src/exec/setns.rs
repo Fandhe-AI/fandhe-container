@@ -77,15 +77,17 @@
 //!   `/proc` の読み取り失敗・syscall 失敗・呼び出し側がマルチスレッドであることはシステムエラー / 呼び出し
 //!   文脈の誤りで、違反記録を付けない
 //!
-//! # 後続（#502〜#503）への必須前提
+//! # 参加の前後で必要な処理（#501〜#503 で実装済み）
 //!
-//! - 順序: ホスト側 fd の確保（cgroup.procs。#501・実装済みの `exec::cgroup_join`）は [`join_namespaces`] の **前**、seccomp / Landlock の
-//!   再適用（#502）は **後**（`setns` は seccomp の禁止 syscall に含まれ、適用後は参加できない）
+//! - 順序: ホスト側 fd の確保（cgroup.procs。#501 の `exec::cgroup_join`）は [`join_namespaces`] の **前**、制限の
+//!   再適用（#502・#503 の `exec/reapply.rs`）は **後**（`setns` は seccomp の禁止 syscall に含まれ、適用後は
+//!   参加できない）
 //! - `setns` は uid / gid・capability・補助グループ・`no_new_privs` を **変えない**。rootful では参加後も
-//!   全 capability を持つホスト root のままである。`execve` の前に capability 削減と `no_new_privs` の設定が
-//!   必要（#502・SEC-1）
+//!   全 capability を持つホスト root のままである。`execve` の前に、再適用が rlimit・capability 削減・
+//!   `no_new_privs`・Landlock・seccomp を載せる（SEC-1）
 //! - 継承した fd は参加後も開いたままである。ホスト側の fd（cgroup.procs・state・ログ等）をコンテナ内の
-//!   プロセスへ渡さないよう、`execve` の前に閉じる必要がある（#503。`close_range`）
+//!   プロセスへ渡さないよう、子が `execve` の前に `close_range` で閉じる。fork から `close_range` までの間に
+//!   子がコンテナ側から見える窓は、exec 専用 worker を non-dumpable にして閉じる（`exec/exec_command.rs`。#503）
 //!
 //! # 未実装（REPAIR-3）
 //!

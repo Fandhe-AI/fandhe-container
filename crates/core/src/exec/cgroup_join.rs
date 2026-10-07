@@ -11,7 +11,7 @@
 //!
 //! - 二段階 API: [`prepare_cgroup_join`] は **`join_namespaces` の前** に呼び、ホスト側の cgroup 関連 fd
 //!   （`cgroup.procs` の書き込み fd・自プロセスの所属確認用の `/proc/self/cgroup`）を確保する。
-//!   [`join_cgroup`] は準備の後ならいつでも呼べる（#503 は `setns` の後・seccomp の前に呼ぶ想定）。
+//!   [`join_cgroup`] は準備の後ならいつでも呼べる（supervisor の `run_command` は `setns` の後・制限の再適用の前に呼ぶ）。
 //!   参加は fd 相対で完結するため、`setns(CLONE_NEWNS)` の後でも成立する
 //! - 公開入口は検証済みの [`Pid1Target`] だけを受ける。期待 cgroup パスは `Pid1Target::open` が記録の型
 //!   （`ContainerId`・`CgroupPlacement`）から組み立てたものを使い、文字列で受ける入口は無い（SEC-1）
@@ -25,7 +25,8 @@
 //!   巻き戻しはしない）
 //! - 期待 cgroup パスはレポート・エラーメッセージに載せない（違反記録の対象は `ViolationSubject` の
 //!   エスケープ・切り詰めを通す）
-//! - 保持 fd はすべて `O_CLOEXEC` だが、`execve` の前の `close_range` は #503 の責務
+//! - 保持 fd はすべて `O_CLOEXEC`。参加で消費して閉じ、`execve` の前には子が `close_range` で fd 3 以上を
+//!   閉じる（`exec/exec_command.rs`。#503）
 //!
 //! # 前提
 //!
@@ -39,7 +40,9 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! seccomp / Landlock 再適用（#502）、fork・execve・`close_range`・統合テスト（#503）、user namespace 参加。
+//! user namespace 参加（対象が呼び出し側と別の user namespace にいれば `Pid1Target::open` が拒否する）。
+//! 制限の再適用は `exec/reapply.rs`（#502・#503）、fork・`close_range`・`execveat` は `exec/exec_command.rs`
+//! （#503）で実装済み。
 
 use std::num::NonZeroU32;
 use std::path::Path;

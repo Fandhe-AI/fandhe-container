@@ -8,8 +8,8 @@
 //! のうち `PR_SET_NO_NEW_PRIVS` は組み込みの固定ステージとして実装済み（#833・TASK-27.4.3。
 //! `exec/no_new_privs.rs`）、capability 削減（#173）と seccomp（#178・TASK-38.3）も同様に組み込み済み。
 //! cgroup 参加は `cgroups::CgroupJoin`（TASK-32.4・#161）が `StageHook` として実装済み（登録は呼び出し側）。
-//! exec 経路（SUP-6）の seccomp / Landlock 再適用は [`prepare_exec_restrictions`] / [`reapply_restrictions`]
-//! （TASK-163.3・#502。`exec/reapply.rs`。`setns` の後に使えるよう status fd と rootfs の固定を事前に保持する二段階 API。参加後の `/` を rootfs と照合してから適用する。capability 削減・rlimit は適用しない）。制限適用の証跡は未実装（Landlock は `StagePipeline::with_landlock` で差し込み可能。#184）で、後続の sub-issue（#137、TASK-39・40）が追記する（REPAIR-3: 実装済みを装わない）。
+//! exec 経路（SUP-6）の制限の再適用は [`prepare_exec_restrictions`] / [`reapply_restrictions`]
+//! （TASK-163.3・TASK-163.4・#502・#503。`exec/reapply.rs`。`setns` の後に使えるよう status fd と rootfs の固定を事前に保持する二段階 API。参加後の対象束縛と `/` を照合してから、rlimit・capability 削減・`NO_NEW_PRIVS`・Landlock・seccomp を launch と同じ順で適用する）。稼働中コンテナでのコマンド実行は、再適用の完了の証跡 [`ExecReady`] だけを受け取る [`spawn_exec_command`]（`exec/exec_command.rs`。fork → `close_range` → `execveat`。TASK-163.4・#503）が担う。launch 経路の制限適用の証跡は未実装（Landlock は `StagePipeline::with_landlock` で差し込み可能。#184）で、後続の sub-issue（#137、TASK-39・40）が追記する（REPAIR-3: 実装済みを装わない）。
 //!
 //! # 目指すフロー（Linux 専用）
 //!

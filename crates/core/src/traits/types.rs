@@ -147,7 +147,7 @@ pub struct TraitError {
     message_truncated: bool,
 }
 
-/// [`TraitError`] が保持する `message` の最大バイト数（ERR-2・REPAIR-4）。
+/// [`TraitError`] が保持する `message` の最大バイト数（ERR-2・REPAIR-4・TASK-96.1・MS-6）。
 ///
 /// OCI Runtime エラー応答の上限（`oci_runtime::OCI_ERROR_MESSAGE_MAX_BYTES`）と同値で、
 /// `OciRuntimeError::from_trait_error` で再度切り詰められない大きさに揃える。
@@ -167,6 +167,9 @@ impl TraitError {
                 end -= 1;
             }
             message.truncate(end);
+            // `truncate` は容量を縮めないため、巨大な入力バッファを error の寿命の間
+            // 保持しないよう確保量を上限以下へ縮める（保持する確保量も上限内に収める）。
+            message.shrink_to_fit();
         }
         Self {
             code,
@@ -262,7 +265,7 @@ mod tests {
         assert_eq!(err.to_string(), "NOT_FOUND: container not found");
     }
 
-    /// ERR-2: 上限ちょうどは保持、1 バイト超は切り詰め、マルチバイト文字の途中は境界まで戻す。
+    /// ERR-2・REPAIR-4・TASK-96.1・MS-6: 上限ちょうどは保持、1 バイト超は切り詰め、マルチバイト文字の途中は境界まで戻す。
     #[test]
     fn err2_trait_error_message_is_capped_at_char_boundary() {
         let max = TRAIT_ERROR_MESSAGE_MAX_BYTES;
@@ -285,6 +288,10 @@ mod tests {
 
         let huge = TraitError::new(ErrorCode::Internal, "あ".repeat(100_000));
         assert_eq!(huge.message().len(), 4095);
+        assert!(
+            huge.message.capacity() <= max,
+            "stored allocation must stay within the cap"
+        );
         assert!(huge.to_string().len() <= max + "INTERNAL: ".len());
     }
 

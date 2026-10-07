@@ -41,8 +41,11 @@
 //! - **確認できなければ進まない（fail-closed）**: インタープリタを開けない・`fstat` できない・通常ファイルでない・
 //!   読めない（実行専用）場合は、ランタイムでないことを確認できないため拒否する（カーネルの `execve` も
 //!   同じ理由か別の理由で失敗する入力である）
-//! - **fork 後の子から呼ぶ**: 成功経路はスタック上の固定長バッファと syscall だけで、アロケーション・ロックを
-//!   伴わない（エラーの組み立てだけがアロケーションする。`exec/process.rs` の既存の規約と同じ）
+//! - **fork 後の子から呼ぶ**: 本モジュールが足す処理の成功経路は、スタック上の固定長バッファと syscall だけで
+//!   ヒープを確保しない（エラーの組み立ては確保する）。呼び出し元の `prepare_exec_child` 全体は確保を含む
+//!   （継承した標準入出力の同一性の `Vec`・std の標準ストリームの初期化・シェバン付きスクリプトの `/dev/fd/N` の
+//!   パス組み立て等。いずれも変更前からある）。fork は `Threads: 1` を強制した単一スレッドのプロセスから行うため、
+//!   他スレッドが保持したままのアロケータのロックを子が引き継ぐことはない
 //!
 //! # 限界（REPAIR-3）
 //!
@@ -52,6 +55,10 @@
 //!   競合しないが、インタープリタはカーネルがパスで開くため固定できない。この窓は Landlock（ルール外の
 //!   バイナリの `EXECUTE` を拒否する）が塞ぐ前提で、Landlock に依存しない形で塞ぐには方式 B（封印した複製から
 //!   の実行）が要る。launch 経路は pivot 直後で他のプロセスが居ないため、差し替える主体が無い
+//! - **検査の後にファイルの中身を書き換える競合も残る**: エントリポイント本体は fd に固定するが、固定するのは
+//!   inode で内容ではない。コンテナ側がそのファイルへの書き込み権限を持てば、検査の後・`execve` の前に 1 行目
+//!   （シェバン）や `PT_INTERP` を `/proc/self/exe` へ書き換えられる（カーネルは `execve` の中で内容を読み直す）。
+//!   インタープリタのファイルについても同じ。上と同じく Landlock が塞ぐ前提で、方式 B が要る
 //! - **`binfmt_misc` は対象外**: ホスト側に登録された `binfmt_misc` のインタープリタ（拡張子・マジックで選ばれる）
 //!   は解釈しない。登録はホストの管理者の操作で、コンテナからは変えられない前提とする
 //! - ランタイムの同一性の基準は、検証済みの procfs の `self/exe`（`fstatfs` で procfs と確認したディレクトリから
@@ -292,9 +299,18 @@ impl Inspection<'_> {
             let Some(offset) = offset else {
                 return Ok(());
             };
-            // 表が途中で終わるファイルは、カーネルも読み取りに失敗してロードしない。
-            if file.read_exact_at(phdr, offset).is_err() {
-                return Ok(());
+            match file.read_exact_at(phdr, offset) {
+                Ok(()) => {}
+                // 表が途中で終わるファイルは、カーネルも読み取りに失敗してロードしない。
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                // それ以外（`EIO` 等）は「`PT_INTERP` が無い」ことを確認できていない。カーネルの読み取りは
+                // 成功し得るため、通さずに拒否する（fail-closed）。
+                Err(_) => {
+                    return Err(self.error(
+                        ErrorCode::PermissionDenied,
+                        "cannot read the ELF program headers",
+                    ));
+                }
             }
             let Some((interp_offset, interp_len)) = elf_interp_segment(phdr, layout) else {
                 continue;
@@ -736,6 +752,21 @@ mod tests {
         inspect(&dir.file("data", b"plain text\n")).unwrap();
         inspect(&dir.file("empty", b"")).unwrap();
         inspect(&dir.file("noname", b"#!\n")).unwrap();
+    }
+
+    /// SUP-6・TASK-163 追補（#1458）: プログラムヘッダの表が途中で終わる ELF（カーネルもロードしない）は、EOF として
+    /// 検査を終える（拒否の理由にしない）。EOF 以外の読み取り失敗は拒否する（実装側。入出力エラーは再現しない）。
+    #[test]
+    fn sup6_task163_truncated_program_header_table_ends_the_check() {
+        let dir = TempDir::create("trunc");
+        let mut elf = elf_with_interp(ElfLayout::Elf64, 2, b"/proc/self/exe\0");
+        // ヘッダ（64 バイト）と 1 件目の途中までを残す。
+        elf.truncate(64 + 20);
+        inspect(&dir.file("truncated", &elf)).unwrap();
+        // 1 件目（PT_LOAD）は読めるが 2 件目（PT_INTERP）が切れている。
+        let mut elf = elf_with_interp(ElfLayout::Elf64, 2, b"/proc/self/exe\0");
+        elf.truncate(64 + 56 + 10);
+        inspect(&dir.file("truncated2", &elf)).unwrap();
     }
 
     /// SUP-6・SEC-1・TASK-163 追補（#1458）: インタープリタを確認できない入力は進めない（fail-closed）。

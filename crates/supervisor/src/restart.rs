@@ -774,6 +774,8 @@ fn relaunch_bounded(
 /// 将来の supervisor 入口（コンテナごとの別プロセス）が [`crate::state::SupervisedState::attach`] 後に呼ぶ。
 /// 1 周: `monitor`（監視権取得・終了検知・`Stopped` 記録）→ [`evaluate_restart`]（`restart_count` は state.json の値）→
 /// バックオフ → [`Relauncher::relaunch`] → `Running(新 pid)` と `restart_count + 1` を 1 回の書き込みで記録。
+/// この書き込みは `monitor` が書いた終了記録と同じ revision に対してだけ行い、その後に別の書き込み（同じ ID の
+/// 削除・再作成、別処理の再起動、health の更新）があれば再試行せず [`SuperviseOutcome::RestartUnrecorded`] で中止する。
 /// `Running` 再記録では `supervisor_pid` は `None` のままで、次周の `monitor` が監視権を取り直す。
 ///
 /// [`MonitorOperation::Restart`] を再起動 1 回ごとに通知する。`elapsed` は終了検知（`Stopped` 記録の前）から `Running` 記録完了までで、
@@ -821,7 +823,7 @@ pub fn supervise_with_restart(
                 });
             }
         };
-        let (exit, restart_count, detected, exited_status) = match &last {
+        let (exit, restart_count, detected, exited_status, exit_revision) = match &last {
             MonitorOutcome::Exited {
                 exit,
                 record,
@@ -831,6 +833,7 @@ pub fn supervise_with_restart(
                 record.restart_count(),
                 *detected_at,
                 record.status().clone(),
+                record.revision(),
             ),
             MonitorOutcome::StopRequested { .. } => {
                 return Ok(SuperviseOutcome::Stopped {
@@ -930,28 +933,24 @@ pub fn supervise_with_restart(
         }
         let new_pid = new_process.pid();
         let id = state.id().clone();
-        // 自分が監視して記録した終了記録（同一の `Stopped` 状態・監視権なし・同じ `restart_count`）のままであることを確かめて書く。
-        // 別処理が再起動して同じ終了で再び `Stopped` になっても `restart_count` が進むため、別の終了記録と取り違えない。
-        // 競合後に stop / delete / 再作成など別の遷移が入っていれば書かない（health 更新による revision 変化は許容）。
-        let written = write_with_retry_when(
-            state,
-            |rec| {
-                rec.status() == &exited_status
-                    && rec.supervision().supervisor_pid().is_none()
-                    && rec.restart_count() == restart_count
-            },
-            |rec| {
-                // 競合後の refresh で他者の更新を消さないよう、書き込みごとに最新値から加算する（上限で頭打ち）。
-                Ok((
-                    ContainerStatus::running(id.clone(), Some(new_pid)),
-                    SupervisionState::new(
-                        None,
-                        rec.health(),
-                        rec.restart_count().saturating_add(1),
-                    ),
-                ))
-            },
-        );
+        // 自分が監視して記録した終了記録そのもの（同じ revision）に対してだけ書く。revision はストア全体の単調採番で
+        // 再利用されない（core `StateStore::create`）ため、同じ ID の削除・再作成や、別処理の再起動を経て同じ内容
+        // （`Stopped`・終了コード・`restart_count`）に戻った記録とも取り違えない。終了記録の後に何かが書かれていたら
+        // （health の更新だけでも）再試行せず中止する（fail-closed。内容の比較では世代を区別できないため）。
+        let written = if state.record().revision() == exit_revision {
+            let supervision = SupervisionState::new(
+                None,
+                state.record().health(),
+                state.record().restart_count().saturating_add(1),
+            );
+            state
+                .write(ContainerStatus::running(id, Some(new_pid)), supervision)
+                .map(drop)
+        } else {
+            Err(precondition(
+                "exit record changed before recording the restart",
+            ))
+        };
         match written {
             Ok(_) => {
                 // 最終確認から書き込みまでの間に停止要求が届いていたら、停止後に再起動した状態を残さない（SUP-3）。
@@ -960,26 +959,18 @@ pub fn supervise_with_restart(
                 // 監視権を取れなければ別の処理が状態を動かしているので terminate せず、次周の `monitor` に委ねる。
                 let recorded = restart_count.saturating_add(1);
                 let self_pid = NonZeroU32::new(std::process::id());
+                // 監視権の取得は、いま書いた `Running` の記録そのもの（同じ revision）への 1 回の書き込みで行う。
                 let claimed = match self_pid {
                     Some(self_pid) if stop.is_stop_requested() => {
-                        let is_unowned = |rec: &StateRecord| {
-                            is_running_with_pid(rec, new_pid)
-                                && rec.supervision().supervisor_pid().is_none()
-                                && rec.restart_count() == recorded
-                        };
-                        write_with_retry_when(state, is_unowned, |rec| {
-                            if !is_unowned(rec) {
-                                return Err(precondition(
-                                    "container state changed before cancelling the restart",
-                                ));
-                            }
-                            Ok((
-                                rec.status().clone(),
-                                SupervisionState::new(Some(self_pid), rec.health(), recorded),
-                            ))
-                        })
-                        .is_ok()
-                        .then_some(self_pid)
+                        let supervision = SupervisionState::new(
+                            Some(self_pid),
+                            state.record().health(),
+                            recorded,
+                        );
+                        state
+                            .write_supervision(supervision)
+                            .is_ok()
+                            .then_some(self_pid)
                     }
                     _ => None,
                 };
@@ -1735,9 +1726,11 @@ mod tests {
         assert_eq!(g.restart_count(), 0);
     }
 
-    /// SUP-3・TASK-159.3: 競合 1 回（外部が health を更新）の後も外部の更新を消さず、自分の +1 が載る（1 -> 2）。
+    /// SUP-3・TASK-159.3: 終了記録の後に別の書き込み（外部の health 更新 1 回）があれば、内容が同じでも
+    /// 再試行せず中止する（fail-closed）。restart_count は 1 のまま・状態は Stopped・外部の更新（Unhealthy）は
+    /// 残り、新プロセスは terminate 1 回で後始末する。
     #[test]
-    fn sup3_task159_3_increment_survives_revision_conflict() {
+    fn sup3_task159_3_foreign_write_after_exit_record_aborts_restart() {
         let st = store(1, 42);
         // 競合は再 launch 直後の書き込みで 1 回だけ起こす。
         struct OneConflict(Queue, Arc<Store>);
@@ -1762,10 +1755,20 @@ mod tests {
             &Events::default(),
         )
         .unwrap();
-        // 2 周目の終了後は再 launch が尽きて失敗する。
-        assert!(matches!(out, SuperviseOutcome::RelaunchFailed { .. }));
-        // 初期 1 + 自分の再起動 1 = 2（競合は health のみで、再 launch 失敗は数えない）。
-        assert_eq!(st.rec.lock().unwrap().restart_count(), 2);
+        let SuperviseOutcome::RestartUnrecorded {
+            error, restarts, ..
+        } = out
+        else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert_eq!(error.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(restarts, 0);
+        assert_eq!(q.0.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(q.0.terminated.load(Ordering::SeqCst), 1);
+        let g = st.rec.lock().unwrap();
+        assert_eq!(g.restart_count(), 1);
+        assert_eq!(g.status().state(), ContainerState::Stopped);
+        assert_eq!(g.health(), Some(HealthStatus::Unhealthy));
     }
 
     /// SUP-3・TASK-159.3: 競合後に別の遷移（別の終了コードの Stopped）が入っていたら Running で上書きせず、

@@ -87,7 +87,7 @@ rootful 時に、本リポのコードが行う特権操作と、それに要す
 1. ランチャーが `setsid` し、制御端末・標準入出力が pty でないことを確認する（(B)。#537）
 2. 環境変数をサニタイズ（`LD_*`・`PATH` 等を信用しない）し、引数・cwd・継承 fd を検証する
 3. 必要最小集合以外を bounding set から落とす（`CAP_SETPCAP` が要る）
-4. 必要最小集合だけを inheritable・ambient に載せ、supervisor を exec する（(c)）。(a) の場合は uid を非特権へ戻したうえで同じ集合のみ保持する
+4. 必要最小集合だけを inheritable・ambient に載せ、supervisor を exec する（(c)）。(a) の場合は uid を非特権へ戻す前に `PR_SET_KEEPCAPS` を 1 にして、setuid 遷移で permitted が失われないようにする。`setresuid` で非特権 UID へ戻した直後は effective が落ちるため、`capset` で permitted・effective・inheritable を必要最小集合に再設定し、ambient へ載せたうえで `PR_SET_KEEPCAPS` を 0 に戻す。`capget`・`/proc/self/status` の `CapPrm`・`CapEff`・`CapAmb` が期待集合と一致することを exec 前に検証し、不一致なら 6 章に従い fail-closed とする
 5. supervisor はヘルスチェック exec・ログ処理などの子で ambient を落としてから exec する
 6. コンテナ子プロセスは既存の制限段（`exec/stages.rs`）で capability 削減 → `no_new_privs` → Landlock → seccomp を適用する。昇格経路を `no_new_privs` より後に使わない
 

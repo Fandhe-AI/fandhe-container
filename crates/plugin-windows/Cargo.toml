@@ -23,3 +23,7 @@ path = "src/main.rs"
 [dependencies]
 fandhe-container-plugin = { workspace = true }
 fandhe-container-platform-windows = { path = "../platform-windows" }
+
+# workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
+[lints]
+workspace = true

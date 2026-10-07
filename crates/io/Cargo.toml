@@ -30,3 +30,7 @@ doc = false
 name = "crash_safety"
 path = "tests/crash_safety.rs"
 required-features = ["crash-test-server"]
+
+# workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
+[lints]
+workspace = true

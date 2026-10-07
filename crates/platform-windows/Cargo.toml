@@ -59,3 +59,7 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_SystemInformation",
 ] }
+
+# workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
+[lints]
+workspace = true

@@ -111,3 +111,7 @@ harness = false
 name = "exec_launch_pidfd"
 path = "tests/exec_launch_pidfd.rs"
 harness = false
+
+# workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
+[lints]
+workspace = true

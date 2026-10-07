@@ -950,6 +950,43 @@ supervisor-independence: ## 監視プロセス 1 個を kill して他の継続�
 		*) echo "error: verification-failed: unexpected exit status $$rc" >&2; exit 1 ;; \
 	esac
 
+# restart レイテンシ実機実測スクリプト（TASK-160・SUP-3。実測・合否判定は #491 で人間が行う）。
+# `restart-latency-selftest` はスタブ launcher だけで照合する自己テスト（CI の bench-regression ジョブでも実行）、
+# `restart-latency` はバックオフ 0 でコンテナを繰り返し SIGKILL して再起動レイテンシの中央値・p95 を JSON 出力する
+# 実機前提ターゲット（make ci には含めない。合否は出さない。スクリプト内で sudo は呼ばない。契約はスクリプト冒頭を参照）。
+# スクリプトの終了コード 0〜4 はそのまま返し、timeout 超過（124・137）と想定外の値は 1、起動不能（125〜127）は 2。
+RESTART_LATENCY_TIMEOUT ?= 600
+RESTART_LATENCY_SCRIPT ?= scripts/measure-restart-latency.sh
+
+.PHONY: restart-latency-selftest
+restart-latency-selftest: ## restart レイテンシ計測スクリプトの自己テスト（SUP-3・REPAIR-12。スタブ launcher のみ）
+	bash scripts/measure-restart-latency-selftest.sh
+
+.PHONY: restart-latency
+restart-latency: ## バックオフ 0 の restart レイテンシを計測する（実機前提・timeout 付き。LAUNCHER=<絶対パス> BUNDLE=<dir> 必須。[TRIALS= WARMUP= OUTPUT=]。SUP-3）
+	@if [ -z $(call fio_bench_sq,$(LAUNCHER)) ] || [ -z $(call fio_bench_sq,$(BUNDLE)) ]; then \
+		echo "usage: make restart-latency LAUNCHER=<abs-path> BUNDLE=<dir> [TRIALS=<n, default 20>] [WARMUP=<n, default 1>] [OUTPUT=<new file>] [RESTART_LATENCY_TIMEOUT=<secs, default 600>]" >&2; \
+		exit 2; \
+	fi; \
+	t=$(call fio_bench_sq,$(RESTART_LATENCY_TIMEOUT)); \
+	case "$$t" in ''|*[!0-9]*|???????*) t=invalid ;; esac; \
+	if [ "$$t" = invalid ] || [ "$$t" -eq 0 ]; then \
+		echo "error: invalid-argument: RESTART_LATENCY_TIMEOUT must be an integer from 1 to 999999 (seconds)" >&2; \
+		exit 2; \
+	fi; \
+	if ! command -v timeout >/dev/null 2>&1; then \
+		echo "error: unsupported-os: timeout (coreutils) is required" >&2; \
+		exit 2; \
+	fi; \
+	rc=0; \
+	timeout --kill-after=60 "$$t" bash $(call fio_bench_sq,$(RESTART_LATENCY_SCRIPT)) --launcher $(call fio_bench_sq,$(LAUNCHER)) --bundle $(call fio_bench_sq,$(BUNDLE))$(if $(TRIALS), --trials $(call fio_bench_sq,$(TRIALS)))$(if $(WARMUP), --warmup $(call fio_bench_sq,$(WARMUP)))$(if $(OUTPUT), --output $(call fio_bench_sq,$(OUTPUT))) || rc=$$?; \
+	case "$$rc" in \
+		0|1|2|3|4) exit "$$rc" ;; \
+		124|137) echo "error: timeout: measurement or cleanup stalled for $${t}s" >&2; exit 1 ;; \
+		125|126|127) echo "error: invalid-input: cannot run the measurement under timeout (exit $$rc)" >&2; exit 2 ;; \
+		*) echo "error: measurement-failed: unexpected exit status $$rc" >&2; exit 1 ;; \
+	esac
+
 # --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）
 # --------------------------------------------------

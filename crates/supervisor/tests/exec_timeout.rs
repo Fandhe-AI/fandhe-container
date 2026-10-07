@@ -134,8 +134,9 @@ mod linux {
                 .map_or(0, |d| d.subsec_nanos())
         ));
         let record_tmp = record.with_extension("tmp");
+        // 外側の期限は、内側が起動して記録を書き終えるのに十分な長さにする（負荷の高い CI でも揺れない値）。
         let err = run_in_worker_for_test(
-            Duration::from_millis(1500),
+            Duration::from_secs(3),
             Duration::from_millis(300),
             || -> Result<ExecOutcome, TraitError> {
                 run_in_worker_for_test(

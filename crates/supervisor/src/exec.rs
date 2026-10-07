@@ -335,6 +335,10 @@ const WORKER_GRACE: Duration = Duration::from_secs(7);
 /// worker の結果 1 行の上限バイト数（pipe から読む量の上限。無制限確保の防止）。
 const WORKER_RESULT_MAX: u64 = 4096;
 
+/// worker が書く 1 行の上限バイト数（改行込み）。pipe の最小容量（1 ページ = 4096）未満に収め、親が終了待ちの間は
+/// 読まなくても worker の `write_all` が詰まらないようにする。`WORKER_RESULT_MAX` 以下であること。
+const WORKER_LINE_MAX: usize = 2048;
+
 /// `work` を worker プロセスで実行し、`deadline + grace` までに終わらなければ worker を `SIGKILL` して回収し
 /// `Timeout` を返す（REPAIR-5・SUP-6・TASK-163.4）。契約はモジュール doc「全体の上限時間」。
 ///
@@ -345,6 +349,8 @@ fn run_in_worker_with(
     grace: Duration,
     work: impl FnOnce() -> Result<ExecOutcome, TraitError>,
 ) -> Result<ExecOutcome, TraitError> {
+    // fork 前に期限を確かめる（切れていれば worker を作らない。fork 後の早期 return で worker を残さないため）。
+    deadline.remaining("starting the exec worker")?;
     let (mut reader, writer) = std::io::pipe().map_err(|e| {
         TraitError::new(
             ErrorCode::Internal,
@@ -360,19 +366,25 @@ fn run_in_worker_with(
     .map_err(from_exec_error)?;
     // 親は書き込み側を閉じる（worker の終了後に読み取りが EOF で終わるようにする）。
     drop(writer);
-    let left = deadline.remaining("starting the exec worker")?;
-    let exit = child
-        .wait_timeout(left.saturating_add(grace))
-        .map_err(|e| {
-            if e.code == ErrorCode::Timeout {
-                TraitError::new(
-                    ErrorCode::Timeout,
-                    "exec timed out; the exec worker was killed",
-                )
-            } else {
-                from_exec_error(e)
-            }
-        })?;
+    // fork 後はどの経路でも worker を停止・回収してから返す（`wait_or_stop`。期限切れなら待たずに SIGKILL）。
+    let wait_deadline = Deadline {
+        at: deadline.at.checked_add(grace).unwrap_or(deadline.at),
+    };
+    let exit = wait_or_stop(
+        &wait_deadline,
+        |left| child.wait_timeout(left),
+        |reap| child.kill_and_reap(reap),
+    )
+    .map_err(|e| {
+        if e.code() == ErrorCode::Timeout {
+            TraitError::new(
+                ErrorCode::Timeout,
+                "exec timed out; the exec worker was killed",
+            )
+        } else {
+            e
+        }
+    })?;
     if exit != ChildExit::Exited(0) {
         return Err(TraitError::new(
             ErrorCode::Internal,
@@ -429,6 +441,16 @@ fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
             e.message().replace(['\n', '\r'], " ")
         ),
     };
+    let mut line = line;
+    if line.len() > WORKER_LINE_MAX {
+        // 長すぎるメッセージは UTF-8 の文字境界で切り詰め、改行で終える（切れた行は親が拒否するため）。
+        let mut cut = WORKER_LINE_MAX - 1;
+        while cut > 0 && !line.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        line.truncate(cut);
+        line.push('\n');
+    }
     line.into_bytes()
 }
 
@@ -793,6 +815,34 @@ mod tests {
                 "exec stage Spawn: the exec worker returned a malformed result"
             );
         }
+    }
+
+    /// SUP-6・REPAIR-5・TASK-163.4: 期限が既に切れていれば worker を fork せず `Timeout`（`work` は実行されない）。
+    #[test]
+    fn sup6_task163_4_expired_deadline_does_not_fork_worker() {
+        let err = run_in_worker_with(
+            Deadline::after(Duration::ZERO),
+            Duration::from_secs(1),
+            || panic!("work must not run when the deadline has expired"),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert_eq!(
+            err.message(),
+            "exec timed out before starting the exec worker"
+        );
+    }
+
+    /// SUP-6・TASK-163.4: pipe 容量を超える長さのエラーメッセージは上限で切り詰められ、改行で終わり往復できる。
+    #[test]
+    fn sup6_task163_4_oversized_worker_message_is_truncated() {
+        let err = TraitError::new(ErrorCode::Internal, "あ".repeat(100_000));
+        let line = encode_worker_result(&Err(err));
+        assert!(line.len() <= WORKER_LINE_MAX);
+        assert_eq!(line.last(), Some(&b'\n'));
+        let back = decode_worker_result(&line).unwrap_err();
+        assert_eq!(back.code(), ErrorCode::Internal);
+        assert!(back.message().starts_with("あ"));
     }
 
     /// 祖先に symlink を含まない使い捨ての bundle ディレクトリ（rootfs の固定は symlink を辿らない）。

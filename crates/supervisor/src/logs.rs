@@ -21,7 +21,7 @@
 //!   `drain` は `Err` を返す全経路（期限切れ・溢れる timeout・リーダーの異常終了）で、返る前に捕捉を取り消す。
 //!   取消しの要求後に新しい追記は始まらない。EOF は `timeout` いっぱいまで待ち、期限内に届いた EOF は成功として扱う。
 //!   期限切れでは実行中の追記の完了を待たずに返る（`drain` は sink が止まっていても `timeout` 以内に返る）。
-//!   したがって `drain` が `Err` を返した後に sink へ届き得るのは、返る時点で実行中だった追記
+//!   したがって `drain` が `Err` を返した後に sink へ届き得るのは（期限切れ後の flush を含む。flush は期限内に終わらなければ別スレッドで完了する）、返る時点で実行中だった追記
 //!   （ストリームあたり高々 1 件）だけである。完了を待ってから止めたい場合は [`LogCapture::cancel`] を使う
 //!   （[`CANCEL_SETTLE_TIMEOUT`] まで待つ）。
 //!   リーダーは現在の `read` が戻った時点でスレッドとストリームを解放して終了する。
@@ -639,10 +639,9 @@ impl LogCapture {
             let settled = self.cancel.cancel(deadline);
             if settled {
                 // 受理済みの行を書き出す（リーダーは取消し後に flush しないため、ここで行わないと sink 内バッファに残る。SUP-7）。
-                // flush の失敗は元のエラーを優先するため捨てる。flush にも固定の猶予で期限を設ける（REPAIR-5）。
-                let now = Instant::now();
-                let until = now.checked_add(CANCEL_SETTLE_TIMEOUT).unwrap_or(now);
-                let _ = flush_bounded(&self.sink, until);
+                // flush の失敗は元のエラーを優先するため捨てる。追加の猶予は設けず、drain の期限（deadline）
+                // までに限る（REPAIR-5）。期限が尽きていれば待たずに戻り、flush は別スレッドで完了し得る。
+                let _ = flush_bounded(&self.sink, deadline);
             }
         }
         result
@@ -2077,6 +2076,11 @@ mod tests {
         let before = sink.calls().len();
         let err = cap.drain(Duration::from_millis(50)).unwrap_err();
         assert_eq!(err.code(), ErrorCode::Timeout);
+        // 期限切れ後の flush は追加の猶予を持たず別スレッドで完了するため、記録されるまで待つ。
+        let t1 = Instant::now();
+        while sink.calls().len() < before + 1 && t1.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let calls = sink.calls();
         assert_eq!(calls.len(), before + 1);
         assert_eq!(calls.last().map(String::as_str), Some("flush"));

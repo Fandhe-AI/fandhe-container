@@ -457,8 +457,13 @@ impl RotatingFileSink {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        opts.open(self.path(0))
-            .map_err(|_| internal("log file create failed"))
+        let file = opts
+            .open(self.path(0))
+            .map_err(|_| internal("log file create failed"))?;
+        // 新規作成したディレクトリエントリを永続化する。これが無いと `sync`（`sync_data`）成功後でも
+        // クラッシュでログファイル名自体が失われ得る（SUP-7・TASK-164.3）。unix のみ（他 OS は sync_dir が no-op）。
+        sync_dir(&self.dir).map_err(|_| internal("log file create failed"))?;
+        Ok(file)
     }
 }
 

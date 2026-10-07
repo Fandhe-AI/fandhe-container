@@ -29,11 +29,11 @@ use std::num::NonZeroU32;
 
 mod apply;
 mod rules;
-pub(crate) use apply::apply_landlock_ruleset;
 pub use apply::{
     LandlockApplyError, LandlockApplyErrorKind, LandlockApplyReport,
     LandlockEnforcementObservation, observe_landlock_enforcement,
 };
+pub(crate) use apply::{apply_landlock_ruleset, apply_landlock_ruleset_with};
 pub use rules::{
     AccessFs, LandlockRuleError, LandlockRuleErrorKind, LandlockRuleset, MAX_LANDLOCK_RULES,
     PathRule, RuleOrigin, RulePath, ShadowedRestriction, build_path_rules, path_rules_from_config,

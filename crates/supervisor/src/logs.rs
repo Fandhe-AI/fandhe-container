@@ -36,16 +36,23 @@
 //!   [`LogCapture::drain`] する（取っ手を破棄すると止める手段が無くなる）。
 //! - OS 固有型（fd / HANDLE）は公開せず `Read` のみを受ける（CLI-1）。グローバル状態は持たない（CORE-1・D-19）。
 //!
+//! # 実装済み（TASK-164.2・#506）
+//! ファイルへの永続化とローテーション（1MiB × 3 世代等。権限・symlink 検証・ERR-1 形式のエラー込み）は
+//! [`rotating::RotatingFileSink`] が担う（SUP-7）。
+//!
 //! # 未実装（将来仕様。REPAIR-3）
-//! 本モジュールは捕捉経路の土台だけで、次は未実装である。
-//! - ファイルへの永続化、ローテーション（1MiB × 3 世代等）、ローテーション下で欠落・重複 0 行の保証: SUP-7・TASK-164。
-//!   ログファイルの権限・配置・symlink 検証も TASK-164 で扱う。
-//! - ローテーション失敗時のエラー形式: ERR-1（TASK-164）。
+//! 本モジュールは捕捉経路とファイル sink までで、次は未実装である。
+//! - ローテーション境界の欠落・重複防止のバッファ・フラッシュ / fsync 制御: SUP-7・TASK-164.3（#507）。
+//! - 100 万行規模でローテーション下の欠落 0・重複 0 行を機械照合する検証: SUP-7・TASK-164.4（#508）。
 //! - `logs` コマンドからの読み出し経路: TASK-164 以降 / CLI 側。
 //! - 実パイプの取得: core の本番 launcher が子の stdio をパイプへ接続して渡す経路は未提供
 //!   （現状 core は子の標準入出力を null へ向けている）。そのため入力は注入式である。
 //!
-//! 既定の [`MemoryLogSink`] はメモリ保持のみ（上限付き）で、supervisor 終了時に失われる。
+//! 既定の [`MemoryLogSink`] はメモリ保持のみ（上限付き）で、supervisor 終了時に失われる。永続化には [`rotating::RotatingFileSink`] を注入する。
+
+pub mod rotating;
+
+pub use rotating::{RotatingFileSink, RotationConfig};
 
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read};
@@ -211,7 +218,7 @@ impl OutputStreams {
     }
 }
 
-/// 捕捉した行の記録先。TASK-164（SUP-7）がファイル・ローテーション実装へ差し替える拡張点。
+/// 捕捉した行の記録先の拡張点。ファイル・ローテーション実装は [`rotating::RotatingFileSink`]（SUP-7・TASK-164.2）。
 pub trait LogSink: Send + Sync {
     /// 1 行（LF 抜き・[`MAX_LINE_BYTES`] 以下）を追記する。失敗は構造化エラーで返す（panic しない）。
     /// `Err` を返すと、そのストリームでは以後呼ばれない（残りの行は読み捨てられる）。
@@ -246,7 +253,7 @@ struct MemoryInner {
 }
 
 /// 上限付きメモリ保持のスタブ sink。永続化・ローテーションは行わずプロセス終了で失われる
-/// （SUP-7・TASK-164 で置き換える。REPAIR-3）。上限超過時は古い行から捨て、件数を数える。
+/// （永続化には [`rotating::RotatingFileSink`] を使う。SUP-7・TASK-164）。上限超過時は古い行から捨て、件数を数える。
 pub struct MemoryLogSink {
     capacity: usize,
     inner: Mutex<MemoryInner>,

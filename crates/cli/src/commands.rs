@@ -59,14 +59,32 @@ pub const EXIT_UNIMPLEMENTED: u8 = 3;
 
 /// [`run`] の結果。終了コードと機械可読なエラー（`code` / `message`。固定の英語文言のみ）を持つ。
 #[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// フィールドは非公開で、この module 内の固定文言からのみ構築できる。
+/// そのため [`CliExit::to_json_line`] はエスケープなしで常に妥当な JSON を返す。
 pub struct CliExit {
-    pub exit_code: u8,
-    pub code: &'static str,
-    pub message: &'static str,
+    exit_code: u8,
+    code: &'static str,
+    message: &'static str,
 }
 
 impl CliExit {
-    /// stderr へ出す 1 行 JSON。値は固定文言のみでエスケープ不要。
+    /// プロセスの終了コード。
+    pub fn exit_code(&self) -> u8 {
+        self.exit_code
+    }
+
+    /// 機械可読なエラーコード。
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    /// 英語の固定メッセージ。
+    pub fn message(&self) -> &'static str {
+        self.message
+    }
+
+    /// stderr へ出す 1 行 JSON。値は固定文言のみ（構築経路が module 内に限られる）でエスケープ不要。
     pub fn to_json_line(&self) -> String {
         format!(
             "{{\"code\":\"{}\",\"message\":\"{}\"}}",
@@ -140,8 +158,8 @@ mod tests {
     fn cli1_run_usage_errors() {
         for a in [args(&[]), args(&["run"]), args(&[""])] {
             let r = run(a);
-            assert_eq!(r.exit_code, 2);
-            assert_eq!(r.code, "INVALID_ARGUMENT");
+            assert_eq!(r.exit_code(), 2);
+            assert_eq!(r.code(), "INVALID_ARGUMENT");
         }
     }
 
@@ -150,8 +168,8 @@ mod tests {
     fn cli1_run_known_is_unimplemented() {
         for c in Command::ALL {
             let r = run(args(&[c.as_str()]));
-            assert_eq!(r.exit_code, 3);
-            assert_eq!(r.code, "UNIMPLEMENTED");
+            assert_eq!(r.exit_code(), 3);
+            assert_eq!(r.code(), "UNIMPLEMENTED");
         }
     }
 

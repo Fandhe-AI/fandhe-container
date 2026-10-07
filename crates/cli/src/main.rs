@@ -10,5 +10,5 @@ fn main() -> ExitCode {
     let exit = fandhe_container_cli::commands::run(std::env::args_os().skip(1));
     // stderr 書き込み失敗では panic しない。
     let _ = writeln!(std::io::stderr(), "{}", exit.to_json_line());
-    ExitCode::from(exit.exit_code)
+    ExitCode::from(exit.exit_code())
 }

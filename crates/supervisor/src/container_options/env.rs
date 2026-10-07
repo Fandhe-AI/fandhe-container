@@ -63,7 +63,7 @@ pub const ENV_FILE_MAX_BYTES: usize = ENV_MAX_TOTAL_BYTES;
         target_arch = "loongarch64"
     )
 ))]
-const O_NONBLOCK: i32 = 0o4000;
+pub(crate) const O_NONBLOCK: i32 = 0o4000;
 #[cfg(any(
     target_os = "macos",
     target_os = "ios",
@@ -72,7 +72,7 @@ const O_NONBLOCK: i32 = 0o4000;
     target_os = "openbsd",
     target_os = "dragonfly"
 ))]
-const O_NONBLOCK: i32 = 0x4;
+pub(crate) const O_NONBLOCK: i32 = 0x4;
 #[cfg(not(any(
     all(
         any(target_os = "linux", target_os = "android"),
@@ -97,10 +97,10 @@ const O_NONBLOCK: i32 = 0x4;
     target_os = "dragonfly"
 )))]
 #[cfg_attr(not(unix), allow(dead_code))]
-const O_NONBLOCK: i32 = 0;
+pub(crate) const O_NONBLOCK: i32 = 0;
 
 /// 読み取り専用・非ブロッキング（unix）で env ファイルを開く。
-pub(super) fn open_nonblocking(path: &Path) -> std::io::Result<File> {
+pub(crate) fn open_nonblocking(path: &Path) -> std::io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]

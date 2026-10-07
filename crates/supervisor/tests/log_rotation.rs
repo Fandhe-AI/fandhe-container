@@ -11,9 +11,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fandhe_container_core::traits::ContainerId;
-use fandhe_container_supervisor::logs::rotating::MIN_LOG_FILE_BYTES;
+use fandhe_container_supervisor::logs::rotating::{MIN_LOG_FILE_BYTES, open_for_read};
 use fandhe_container_supervisor::logs::{
-    LogCapture, MAX_DRAIN_TIMEOUT, OutputStreams, ReaderBudget, RotatingFileSink, RotationConfig,
+    LogCapture, LogSink, MAX_DRAIN_TIMEOUT, MAX_LINE_BYTES, OutputStreams, ReaderBudget,
+    RotatingFileSink, RotationConfig, StreamKind,
 };
 
 struct TmpDir(PathBuf);
@@ -321,4 +322,83 @@ fn sup7_task164_1469_remove_all_cleans_logs_and_lock_file() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     assert_eq!(left, Vec::<String>::new());
+}
+
+// ---- TASK-164 追補（#1470）・SUP-7・WIN-4: 公開入口 open_for_read と読み手保持中のローテーション ----
+
+/// 現在ログを満たし、次の append でローテーションが起きる状態の sink を作る。
+fn full_sink(dir: &std::path::Path, id: &ContainerId) -> RotatingFileSink {
+    let cfg = RotationConfig::new(MIN_LOG_FILE_BYTES, 3).unwrap();
+    let sink = RotatingFileSink::open(dir, id, cfg).unwrap();
+    sink.append(StreamKind::Stdout, &vec![b'a'; MAX_LINE_BYTES])
+        .unwrap();
+    sink.flush().unwrap();
+    sink
+}
+
+fn private_dir(prefix: &str) -> (PathBuf, TmpDir) {
+    let (dir, guard) = make_unique_dir(prefix);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    (dir, guard)
+}
+
+/// SUP-7・WIN-4: `open_for_read` で現在ログを開いたまま（3 OS 共通）でも世代 rename は成功し、
+/// 読み手は rotate 前の内容を読み続けられ、新しい現在ログへ書き込める。
+#[test]
+fn sup7_task164_1470_rotation_succeeds_while_open_for_read_reader_held() {
+    use std::io::Read;
+    let (dir, _guard) = private_dir("fc-sup7-ofr");
+    let id = ContainerId::new("r1").unwrap();
+    let sink = full_sink(&dir, &id);
+    let mut reader = open_for_read(&dir.join("r1.log")).unwrap();
+
+    sink.append(StreamKind::Stdout, b"next").unwrap();
+    assert_eq!(sink.rotations().unwrap(), 1);
+
+    let mut old = Vec::new();
+    reader.read_to_end(&mut old).unwrap();
+    // 読み手が握っていた実体は世代 1 へ移っており、その全内容を読める。
+    assert_eq!(
+        u64::try_from(old.len()).unwrap(),
+        fs::metadata(dir.join("r1.log.1")).unwrap().len()
+    );
+    assert!(old.len() > MAX_LINE_BYTES);
+    let mut names: Vec<String> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| !n.ends_with(".lock"))
+        .collect();
+    names.sort();
+    assert_eq!(names, ["r1.log", "r1.log.1"]);
+    // 新しい現在ログに rotate 後の行が入っている（バッファ済みの行を書き出してから読む）。
+    sink.flush().unwrap();
+    assert!(String::from_utf8_lossy(&fs::read(dir.join("r1.log")).unwrap()).contains("next"));
+}
+
+/// SUP-7・REPAIR-5・WIN-4（Windows 限定。windows-latest の CI で実行）: 削除共有なしで開いた読み手が
+/// 居座ると、有界時間で `Internal` として失敗し、sink は失敗状態に固定される（fail-closed）。
+#[cfg(windows)]
+#[test]
+fn sup7_task164_1470_windows_rotation_fails_with_non_sharing_reader() {
+    use fandhe_container_core::traits::ErrorCode;
+    use std::os::windows::fs::OpenOptionsExt;
+    let (dir, _guard) = private_dir("fc-sup7-noshare");
+    let id = ContainerId::new("w1").unwrap();
+    let sink = full_sink(&dir, &id);
+    // READ | WRITE のみ（FILE_SHARE_DELETE なし）。
+    let _reader = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x1 | 0x2)
+        .open(dir.join("w1.log"))
+        .unwrap();
+    let start = std::time::Instant::now();
+    let e = sink.append(StreamKind::Stdout, b"next").unwrap_err();
+    assert_eq!(e.code(), ErrorCode::Internal);
+    assert!(start.elapsed() < Duration::from_secs(5));
+    let e2 = sink.append(StreamKind::Stderr, b"other").unwrap_err();
+    assert_eq!(e2.code(), ErrorCode::Internal);
 }

@@ -48,7 +48,8 @@
 # 新プロセスの検証: 観測時と確定時に、新 pid が生存し（ゾンビ除外）launcher の子孫で、起動時刻が一致することを
 #   確認する（SUP-3。state.json だけ残って新プロセスが終了した試行は採用しない）。
 # 後始末: 試行中に観測した全コンテナ pid を起動時刻の同一性で回収し、launcher 停止後に state.json に現れた
-#   別 pid も session または起動時刻（launcher 以降）で所有確認して回収する。restart ログの副系列は
+#   別 pid は session（launcher と一致）または所有トークン（環境変数）で帰属を確認できたものだけ回収し、
+#   確認できない pid は kill せず警告だけを出す（起動時刻だけを根拠にしない）。restart ログの副系列は
 #   launcher 停止後に集計する（最後の restart ログが状態更新より遅れても欠損にしない）。
 # 安全策: kill の送信先は「state.json の pid」かつ「launcher の子孫」かつ「起動時刻が記録と一致」の
 #   3 条件を満たすものだけ（偽造 state.json・pid 再利用で無関係プロセスを kill しない）。
@@ -344,19 +345,18 @@ do_cleanup() {
     fi
   fi
   # launcher 停止後に state.json の pid を再読込する。追跡済みでない生存 pid（回収中に launcher が最後に
-  # 起動したコンテナ）は、session が launcher（setsid の leader）と一致するか、起動時刻が launcher 以降
-  # （=本計測中に起動された）であるものだけを所有確認済みとして追跡へ加える。確認できない生存 pid は
-  # kill せず後始末失敗（4）とする。
+  # 起動したコンテナ）は、本計測への帰属を証明できる場合だけ追跡へ加える。帰属の根拠は (1) session が
+  # launcher（setsid の leader）と一致する、(2) 環境変数に本実行の所有トークンを持つ、のいずれか。
+  # 起動時刻が launcher 以降という条件だけでは本計測の生成物と言えない（無関係な新規 pid の可能性）ため
+  # 根拠にしない。帰属を確認できない pid は kill せず警告ログだけを出す（権限付きシェルでの誤殺防止）。
   if [ -n "$state_file" ] && [ -n "$launcher_pid" ] && read_state && [ -n "$ST_PID" ] \
     && [ -z "${tracked[$ST_PID]+x}" ] && [ "$ST_PID" != "$$" ] && alive "$ST_PID"; then
     if proc_info "$ST_PID"; then
-      if [ "$REPLY_SID" = "$launcher_pid" ]; then
+      if [ "$REPLY_SID" = "$launcher_pid" ] \
+        || grep -q -a -F -s "FANDHE_BENCH_OWNER=$owner_tok" "/proc/$ST_PID/environ" 2>/dev/null; then
         track_pid "$ST_PID" "$REPLY_START"
-      elif [ -n "$launcher_start" ]; then
-        # launcher より前に起動していた pid は本計測の生成物ではない（偽造 state.json 等）ので触れない。
-        if [ "$REPLY_START" -ge "$launcher_start" ]; then track_pid "$ST_PID" "$REPLY_START"; fi
       else
-        rc=4 # launcher の起動時刻が不明で所有を確認できない生存 pid
+        printf 'warning: pid %s in state.json cannot be attributed to this run; not signaling it\n' "$ST_PID" >&2 || true
       fi
     fi
   fi

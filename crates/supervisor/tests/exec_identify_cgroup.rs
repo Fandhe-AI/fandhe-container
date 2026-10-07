@@ -36,8 +36,10 @@
 //!
 //! ```text
 //! cargo test -p fandhe-container-supervisor --test exec_identify_cgroup --no-run
-//! systemd-run --user --scope -p Delegate=yes <target/debug/deps/exec_identify_cgroup-XXXX> --ignored
+//! timeout 120 systemd-run --user --scope -p Delegate=yes <target/debug/deps/exec_identify_cgroup-XXXX> --ignored
 //! ```
+//!
+//! 外側の `timeout` は、試験内の各待機の上限（REPAIR-5）が万一効かない場合の最終的な打ち切り。
 //!
 //! 実行された場合は、環境不備を含むあらゆる失敗を失敗として扱う（検証せずに成功する分岐を持たない）。
 
@@ -167,22 +169,80 @@ mod linux {
         delegated: DelegatedCgroup,
         container: ContainerCgroup,
         procs: PathBuf,
+        finished: bool,
+    }
+
+    /// 子プロセスを強制終了し、有限の猶予（`timeout()`）内に回収する（REPAIR-5）。
+    ///
+    /// `Child::wait()` は無期限に待ち得る（kill の送信失敗・割り込み不能状態）ため使わず、`try_wait` で
+    /// 上限まで確認する。kill の送信失敗と回収期限超過は、どちらも明示的な `Err` にする。
+    fn kill_and_reap(child: &mut Child, what: &str) -> Result<(), String> {
+        if let Err(e) = child.kill() {
+            // 既に終了済みなら try_wait が即座に回収できるため、送信失敗はその確認後に失敗として扱う。
+            if !matches!(child.try_wait(), Ok(Some(_))) {
+                return Err(format!("failed to kill {what}: {e}"));
+            }
+            return Ok(());
+        }
+        let deadline = Instant::now() + timeout();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => {}
+                Err(e) => return Err(format!("try_wait on {what} failed: {e}")),
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("{what} was not reaped within {:?}", timeout()));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    impl Cleanup {
+        /// 後始末を実行し、失敗（回収期限超過・cgroup が空にならない・削除失敗）を `Err` で返す。
+        /// 通常経路はこれを呼んで失敗を非ゼロ終了へ反映する。2 回目以降は何もしない。
+        fn finish(&mut self) -> Result<(), String> {
+            if self.finished {
+                return Ok(());
+            }
+            self.finished = true;
+            let mut errors = Vec::new();
+            if let Some(mut unshare) = self.unshare.take()
+                && let Err(e) = kill_and_reap(&mut unshare, "unshare")
+            {
+                errors.push(e);
+            }
+            let deadline = Instant::now() + timeout();
+            let mut emptied = false;
+            while Instant::now() < deadline {
+                if fs::read_to_string(&self.procs).is_ok_and(|s| s.trim().is_empty()) {
+                    emptied = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if !emptied {
+                errors.push(format!(
+                    "the container cgroup did not become empty within {:?}",
+                    timeout()
+                ));
+            }
+            if let Err(e) = self.delegated.remove_child(&self.container) {
+                errors.push(format!("cleanup of the container cgroup failed: {e}"));
+            }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            }
+        }
     }
 
     impl Drop for Cleanup {
+        /// 検証の panic による巻き戻し時の回収用。失敗は表示のみ（通常経路は `finish` で失敗を返す）。
         fn drop(&mut self) {
-            if let Some(mut unshare) = self.unshare.take() {
-                let _ = unshare.kill();
-                let _ = unshare.wait();
-            }
-            let deadline = Instant::now() + timeout();
-            while fs::read_to_string(&self.procs).is_ok_and(|s| !s.trim().is_empty())
-                && Instant::now() < deadline
-            {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            if let Err(e) = self.delegated.remove_child(&self.container) {
-                eprintln!("exec_identify_cgroup: cleanup of the container cgroup failed: {e}");
+            if let Err(e) = self.finish() {
+                eprintln!("exec_identify_cgroup: cleanup failed: {e}");
             }
         }
     }
@@ -248,6 +308,7 @@ mod linux {
             delegated,
             container,
             procs: procs.clone(),
+            finished: false,
         };
 
         // 3. pid1 を作って子 cgroup へ入れる。
@@ -341,7 +402,10 @@ mod linux {
         );
 
         // 後始末は drop で行う（pid1 を止め、子 cgroup が空になってから削除する）。
-        drop(cleanup);
+        // 失敗（回収期限超過・cgroup が空にならない・削除失敗）は panic で非ゼロ終了にする。
+        if let Err(e) = cleanup.finish() {
+            panic!("cleanup failed: {e}");
+        }
         println!("exec_identify_cgroup: identify_pid1 against a real container cgroup verified");
     }
 
@@ -388,9 +452,11 @@ mod linux {
                 break s;
             }
             if Instant::now() >= deadline {
-                let _ = joiner.kill();
-                let _ = joiner.wait();
-                panic!("joiner {flag} did not exit within {:?}", timeout());
+                let reaped = kill_and_reap(joiner, "joiner");
+                panic!(
+                    "joiner {flag} did not exit within {:?} (reap: {reaped:?})",
+                    timeout()
+                );
             }
             std::thread::sleep(Duration::from_millis(20));
         };

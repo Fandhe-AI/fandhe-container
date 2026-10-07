@@ -45,6 +45,7 @@ use std::path::Path;
 use crate::oci_runtime::OciConfig;
 use crate::traits::types::ErrorCode;
 
+use super::process::{ENTRYPOINT_MAX_ENV, ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES};
 use super::{Entrypoint, ExecError, IsolationStage};
 
 /// コンテナ定義に由来する環境変数の集合（順序つき・KEY で重複排除。契約はモジュール doc）。
@@ -52,6 +53,13 @@ use super::{Entrypoint, ExecError, IsolationStage};
 pub struct ContainerEnv {
     /// `(KEY, VALUE)`。KEY は一意で、最初に現れた位置を保つ。
     vars: Vec<(String, String)>,
+    /// 全要素の `KEY=VALUE` と NUL 終端ぶんの合計バイト数（上限検証用。`vars` と常に一致する）。
+    total: usize,
+}
+
+/// 1 要素（`KEY=VALUE` と NUL 終端）のバイト数。
+fn element_bytes(key: &str, value: &str) -> usize {
+    key.len().saturating_add(value.len()).saturating_add(2)
 }
 
 impl std::fmt::Debug for ContainerEnv {
@@ -66,7 +74,10 @@ impl std::fmt::Debug for ContainerEnv {
 impl ContainerEnv {
     /// 環境変数を 1 つも持たない集合。
     pub fn empty() -> Self {
-        Self { vars: Vec::new() }
+        Self {
+            vars: Vec::new(),
+            total: 0,
+        }
     }
 
     /// コンテナ定義（bundle の `config.json`）の `process.env` から作る。`process` が無ければ空。
@@ -86,7 +97,8 @@ impl ContainerEnv {
     /// `key` = `value` を 1 件、明示的に上書き・追加する（同じ KEY は置き換え、無ければ末尾へ足す）。
     ///
     /// 渡してよいのは、利用者がその exec に対して明示した値だけ（モジュール doc）。KEY が空・`=` か NUL を
-    /// 含む・VALUE が NUL を含む場合は `InvalidArgument`（段 `Validate`。メッセージに値を載せない）。
+    /// 含む・VALUE が NUL を含む場合と、件数（[`ENTRYPOINT_MAX_ENV`]）・1 要素・合計のバイト数の上限を超える場合は
+    /// `InvalidArgument`（段 `Validate`。メッセージに値を載せない）。上限は値を複製する前に検証する。
     pub fn with_var(mut self, key: &str, value: &str) -> Result<Self, ExecError> {
         if key.is_empty() || key.contains(['=', '\0']) {
             return Err(invalid(
@@ -96,10 +108,28 @@ impl ContainerEnv {
         if value.contains('\0') {
             return Err(invalid("an env value must not contain NUL"));
         }
-        match self.vars.iter_mut().find(|(k, _)| k == key) {
+        // 件数・1 要素・合計の上限は、値を複製する **前** に確かめる（上限を超える入力で確保しない。上限は
+        // launch と同じ `Entrypoint` の値で、argv・パスを含めた合計は `ExecCommand::new` が改めて検証する）。
+        let size = element_bytes(key, value);
+        if size > ENTRYPOINT_MAX_STRING_BYTES {
+            return Err(invalid("an env element exceeds the size limit"));
+        }
+        let existing = self.vars.iter().position(|(k, _)| k == key);
+        let replaced = existing
+            .and_then(|i| self.vars.get(i))
+            .map_or(0, |(k, v)| element_bytes(k, v));
+        if existing.is_none() && self.vars.len() >= ENTRYPOINT_MAX_ENV {
+            return Err(invalid("too many env elements"));
+        }
+        let total = self.total.saturating_sub(replaced).saturating_add(size);
+        if total > ENTRYPOINT_MAX_TOTAL_BYTES {
+            return Err(invalid("the env exceeds the total size limit"));
+        }
+        match existing.and_then(|i| self.vars.get_mut(i)) {
             Some((_, slot)) => value.clone_into(slot),
             None => self.vars.push((key.to_owned(), value.to_owned())),
         }
+        self.total = total;
         Ok(self)
     }
 
@@ -257,6 +287,56 @@ mod tests {
             .with_var("TOKEN", "s3cr3t-value")
             .unwrap();
         assert_eq!(format!("{env:?}"), r#"["TOKEN"]"#);
+    }
+
+    /// SUP-6・TASK-163 追補（#1457）: 件数・1 要素・合計のバイト数の上限は、値を保持する前に検証する
+    /// （上限を超える入力で確保しない）。上書きは置き換える要素のぶんを差し引いて数える。
+    #[test]
+    fn sup6_task163_container_env_enforces_limits_before_storing() {
+        let invalid = |r: Result<ContainerEnv, ExecError>, message: &str| {
+            let err = r.unwrap_err();
+            assert_eq!(
+                (err.code, err.stage),
+                (ErrorCode::InvalidArgument, IsolationStage::Validate)
+            );
+            assert_eq!(err.message, message);
+        };
+        // 1 要素: `K=` + 値 + NUL がちょうど上限なら通り、1 バイト超えると拒否する。
+        let fits = "v".repeat(ENTRYPOINT_MAX_STRING_BYTES - 3);
+        let env = ContainerEnv::empty().with_var("K", &fits).unwrap();
+        assert_eq!(env.total, ENTRYPOINT_MAX_STRING_BYTES);
+        invalid(
+            ContainerEnv::empty().with_var("K", &format!("{fits}v")),
+            "an env element exceeds the size limit",
+        );
+        // 件数: 上限までは通り、新しい KEY の追加だけを拒否する（既存の KEY の上書きは通る）。
+        let full = (0..ENTRYPOINT_MAX_ENV).fold(ContainerEnv::empty(), |env, i| {
+            env.with_var(&format!("K{i}"), "v").unwrap()
+        });
+        assert_eq!(full.len(), ENTRYPOINT_MAX_ENV);
+        let full = full.with_var("K0", "replaced").unwrap();
+        assert_eq!(full.get("K0"), Some("replaced"));
+        invalid(full.with_var("ONE_MORE", "v"), "too many env elements");
+        // 合計: 上限ちょうどまで通り、超えると拒否する。上書きは置き換えるぶんを差し引く。
+        let chunk = "v".repeat(ENTRYPOINT_MAX_STRING_BYTES - 4);
+        let count = ENTRYPOINT_MAX_TOTAL_BYTES / ENTRYPOINT_MAX_STRING_BYTES;
+        let env = (0..count).fold(ContainerEnv::empty(), |env, i| {
+            env.with_var(&format!("K{i}"), &chunk).unwrap()
+        });
+        assert_eq!(env.total, ENTRYPOINT_MAX_TOTAL_BYTES);
+        invalid(
+            env.clone().with_var("X", ""),
+            "the env exceeds the total size limit",
+        );
+        let env = env.with_var("K0", "").unwrap().with_var("X", "").unwrap();
+        assert_eq!(
+            env.total,
+            ENTRYPOINT_MAX_TOTAL_BYTES - (ENTRYPOINT_MAX_STRING_BYTES - 4) + 3
+        );
+        assert_eq!(
+            env.total,
+            env.iter().map(|(k, v)| element_bytes(k, v)).sum::<usize>()
+        );
     }
 
     /// SUP-6・SEC-1・TASK-163 追補（#1457）: コマンドの検証は launch と同じ（絶対パス・argv 1 件以上）。

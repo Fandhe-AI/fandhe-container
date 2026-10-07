@@ -524,7 +524,8 @@ mod linux {
         };
         let entry = ExecRequest::new(format!("/{program}"), [format!("/{program}")])
             .expect("request")
-            .with_env(&explicit_env());
+            .with_env(&explicit_env())
+            .expect("explicit env");
         let result = match mode {
             "run" | "run-script" => run_command(&record, &entry, timeout()),
             "run-in" => run_command_in(&record, arg(5), &entry, timeout()),

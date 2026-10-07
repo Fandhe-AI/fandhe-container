@@ -135,7 +135,8 @@ use std::io::{BufRead as _, Read as _, Write as _};
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::exec::{
-    ChildExit, ContainerEnv, ExecCgroupJoin, ExecCgroupJoinReport, ExecCommand, ExecError,
+    ChildExit, ContainerEnv, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV, ENTRYPOINT_MAX_STRING_BYTES,
+    ENTRYPOINT_MAX_TOTAL_BYTES, ExecCgroupJoin, ExecCgroupJoinReport, ExecCommand, ExecError,
     ExecExit, ExecReady, ExecRestrictionReport, ExecRestrictions, NamespaceJoinReport, Pid1Target,
     SupplementaryGroups, ViolationReason, join_cgroup as core_join_cgroup, join_namespaces,
     prepare_cgroup_join as core_prepare_cgroup_join,
@@ -272,6 +273,8 @@ pub struct ExecRequest {
     path: std::path::PathBuf,
     args: Vec<String>,
     env: Vec<EnvVar>,
+    /// `env` の `KEY=VALUE` と NUL 終端ぶんの合計バイト数（上限検証用）。
+    env_bytes: usize,
 }
 
 impl ExecRequest {
@@ -283,20 +286,65 @@ impl ExecRequest {
         A: IntoIterator,
         A::Item: Into<String>,
     {
+        let invalid = |message: &str| {
+            TraitError::new(
+                ErrorCode::InvalidArgument,
+                format!("exec stage Validate: {message}"),
+            )
+        };
+        // 件数・1 要素・合計の上限は、集めながら確かめる（上限を超えた時点で打ち切り、無制限のイテレータからも
+        // 確保し続けない）。上限は core の `Entrypoint` と同じ値で、環境を含めた合計は worker が改めて検証する。
+        let mut collected: Vec<String> = Vec::new();
+        let mut total = 0usize;
+        for arg in args {
+            if collected.len() >= ENTRYPOINT_MAX_ARGS {
+                return Err(invalid("argv has too many elements"));
+            }
+            let arg: String = arg.into();
+            let size = arg.len().saturating_add(1);
+            total = total.saturating_add(size);
+            if size > ENTRYPOINT_MAX_STRING_BYTES || total > ENTRYPOINT_MAX_TOTAL_BYTES {
+                return Err(invalid("argv exceeds the size limit"));
+            }
+            collected.push(arg);
+        }
         let request = Self {
             path: path.into(),
-            args: args.into_iter().map(Into::into).collect(),
+            args: collected,
             env: Vec::new(),
+            env_bytes: 0,
         };
-        // パス・argv の書式は、環境を足す前の時点で確かめられる（件数・合計長は worker が環境込みで検証する）。
+        // パス・argv の書式は、環境を足す前の時点で確かめられる。
         request.command(&ContainerEnv::empty())?;
         Ok(request)
     }
 
     /// 利用者がこの exec に対して明示した環境変数を足す（コンテナ定義の同じ KEY を上書きする。指定順で後勝ち）。
-    pub fn with_env(mut self, vars: &[EnvVar]) -> Self {
+    ///
+    /// 件数（`ENTRYPOINT_MAX_ENV`）・合計のバイト数の上限を、複製する前に確かめる（超える場合は `InvalidArgument` で、
+    /// 何も足さない）。コンテナ定義の環境・argv を含めた合計は worker が改めて検証する。
+    pub fn with_env(mut self, vars: &[EnvVar]) -> Result<Self, TraitError> {
+        let invalid = |message: &str| {
+            TraitError::new(
+                ErrorCode::InvalidArgument,
+                format!("exec stage Validate: {message}"),
+            )
+        };
+        if self.env.len().saturating_add(vars.len()) > ENTRYPOINT_MAX_ENV {
+            return Err(invalid("too many env elements"));
+        }
+        let added = vars.iter().fold(0usize, |acc, var| {
+            acc.saturating_add(var.key().len())
+                .saturating_add(var.value().len())
+                .saturating_add(2)
+        });
+        let total = self.env_bytes.saturating_add(added);
+        if total > ENTRYPOINT_MAX_TOTAL_BYTES {
+            return Err(invalid("the env exceeds the total size limit"));
+        }
         self.env.extend_from_slice(vars);
-        self
+        self.env_bytes = total;
+        Ok(self)
     }
 
     /// コンテナ内の絶対パス。
@@ -923,6 +971,31 @@ mod tests {
             assert_eq!(bad.code(), ErrorCode::InvalidArgument);
             assert!(bad.message().starts_with("exec stage Validate: "));
         }
+        // 上限は集めながら確かめ、超えた時点で打ち切る（無限のイテレータでも確保し続けず拒否する）。
+        let endless = ExecRequest::new("/bin/true", std::iter::repeat("x")).unwrap_err();
+        assert_eq!(endless.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            endless.message(),
+            "exec stage Validate: argv has too many elements"
+        );
+        let huge = "x".repeat(ENTRYPOINT_MAX_STRING_BYTES);
+        let oversized = ExecRequest::new("/bin/true", [huge.as_str()]).unwrap_err();
+        assert_eq!(
+            oversized.message(),
+            "exec stage Validate: argv exceeds the size limit"
+        );
+        let var = EnvVar::parse("K=V").unwrap();
+        let many = vec![var.clone(); ENTRYPOINT_MAX_ENV];
+        let request = ExecRequest::new("/bin/true", ["true"])
+            .unwrap()
+            .with_env(&many)
+            .unwrap();
+        let too_many = request.with_env(&[var]).unwrap_err();
+        assert_eq!(too_many.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            too_many.message(),
+            "exec stage Validate: too many env elements"
+        );
         // 対照: テストプロセス自身は環境変数を持つ。
         assert!(std::env::vars_os().next().is_some());
         let base = ContainerEnv::empty()
@@ -935,7 +1008,8 @@ mod tests {
             .with_env(&[
                 EnvVar::parse("B=explicit").unwrap(),
                 EnvVar::parse("C=explicit").unwrap(),
-            ]);
+            ])
+            .unwrap();
         assert_eq!(request.path(), std::path::Path::new("/bin/app"));
         let expected_env = ContainerEnv::empty()
             .with_var("A", "definition")

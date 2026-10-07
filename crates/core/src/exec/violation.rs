@@ -212,7 +212,7 @@ impl ViolationReason {
     /// 種別 [`ViolationKind::ExecTarget`] の理由の全一覧（exec の対象の拒否。SUP-6・SEC-1）。
     ///
     /// supervisor の worker が返す理由コードを許可リストとして引き直すための SSOT（#1465）。
-    pub const EXEC_TARGET_REASONS: [ViolationReason; 9] = [
+    pub const EXEC_TARGET_REASONS: [ViolationReason; 10] = [
         Self::ExecTargetNotNestedPid1,
         Self::ExecTargetCgroupMismatch,
         Self::ExecTargetSharesPidNamespace,
@@ -222,6 +222,7 @@ impl ViolationReason {
         Self::ExecJoinedNamespaceMismatch,
         Self::ExecJoinedPidNamespaceMismatch,
         Self::ExecJoinedCgroupMismatch,
+        Self::ExecTargetPidfdMismatch,
     ];
 
     /// exec 対象の理由コード文字列から理由を引き直す（許可リスト照合。未知の文字列は `None`）。
@@ -936,10 +937,10 @@ mod tests {
         );
     }
 
-    /// SEC-4・SUP-6・TASK-163 追補: exec 対象の 9 理由は許可リスト往復でき、対象外・未知は引けない。
+    /// SEC-4・SUP-6・TASK-163 追補: exec 対象の 10 理由は許可リスト往復でき、対象外・未知は引けない。
     #[test]
     fn sec4_sup6_task163_exec_target_token_allowlist() {
-        assert_eq!(ViolationReason::EXEC_TARGET_REASONS.len(), 9);
+        assert_eq!(ViolationReason::EXEC_TARGET_REASONS.len(), 10);
         for r in ViolationReason::EXEC_TARGET_REASONS {
             assert_eq!(r.kind(), ViolationKind::ExecTarget);
             assert_eq!(ViolationReason::from_exec_target_token(r.as_str()), Some(r));

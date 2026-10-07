@@ -573,7 +573,8 @@ fn audit_worker_result(
 }
 
 /// [`run_command`] の対象特定だけを [`identify_pid1_with_pidfd`]（起動時から保持する pidfd で対象を固定）に
-/// 替えたもの（SUP-6・SEC-1・CORE-1・TASK-163 追補・#1461）。契約は [`run_command`] と同じだが、監査の記録先は受け取らない。
+/// 替えたもの（SUP-6・SEC-1・CORE-1・TASK-163 追補・#1461）。契約（`audit` の扱いと `Err` の
+/// [`AuditedRejection`] を含む）は [`run_command`] と同じ。exec の対象の拒否は必ず `audit` へ記録する（SEC-4・#1465）。
 ///
 /// worker は fork で親の fd を継承するため、pidfd は呼び出しプロセスが保持するものをそのまま worker が使う
 /// （追加の syscall なし。呼び出しプロセスは単一スレッドであること）。pidfd はコンテナ内コマンドへ渡らない
@@ -584,16 +585,15 @@ pub fn run_command_with_pidfd(
     pidfd: BorrowedFd<'_>,
     request: &ExecRequest,
     timeout: Duration,
-) -> Result<ExecOutcome, TraitError> {
+    audit: &dyn AuditSink,
+) -> Result<ExecOutcome, AuditedRejection<TraitError>> {
     let deadline = Deadline::after(timeout);
-    running_pid(record)?;
-    run_in_worker_with(deadline, WORKER_GRACE, || {
+    running_pid(record).map_err(AuditedRejection::not_applicable)?;
+    let result = run_in_worker_with(deadline, WORKER_GRACE, || {
         let target = identify_pid1_with_pidfd(record, pidfd)?;
         run_with_target(&target, request, deadline)
-    })
-    // 監査の記録先を受け取らないため、違反の理由は記録せず元の拒否だけを返す。pidfd 経路への監査の配線は未実装
-    // （本番の入口は記録する `run_command`。SEC-4・#1465）。
-    .map_err(|failure| failure.error)
+    });
+    audit_worker_result(result, audit)
 }
 
 /// 実機結合試験専用の入口: [`run_command`] の対象特定だけを [`identify_pid1_in`]（期待 cgroup パスを呼び出し側

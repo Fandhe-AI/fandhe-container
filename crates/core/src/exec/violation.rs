@@ -162,6 +162,11 @@ pub enum ViolationReason {
     ExecTargetSharesPidNamespace,
     /// exec の対象が呼び出し側と同じ mount namespace にいる（同上）。
     ExecTargetSharesMountNamespace,
+    /// exec の対象が呼び出し側と別の user namespace にいる（SUP-6・SEC-5・TASK-163.4）。user namespace への
+    /// 参加は未実装のため、参加すると exec したコマンドは呼び出し側の user namespace の資格情報のまま対象の
+    /// mount / PID namespace で動く。呼び出し側がホスト root なら、capability が自分の user namespace に閉じた
+    /// コンテナ内プロセスより強い権限を持つことになるため、`setns` が成功する場合でも参加の前に拒否する。
+    ExecTargetInOtherUserNamespace,
     /// `setns` 参加後の呼び出しプロセスの `/` が、記録（bundle の `config.json`）から固定したコンテナの
     /// rootfs と同じディレクトリでない（pivot していない対象・`/` へ別のマウントが重ねられた対象。この状態で
     /// 制限を適用するとルールが別の木に付き、コマンドも rootfs の外で動く。SEC-1・TASK-163.3）。
@@ -221,6 +226,7 @@ impl ViolationReason {
             Self::ExecTargetCgroupMismatch => "exec_target_cgroup_mismatch",
             Self::ExecTargetSharesPidNamespace => "exec_target_shares_pid_namespace",
             Self::ExecTargetSharesMountNamespace => "exec_target_shares_mount_namespace",
+            Self::ExecTargetInOtherUserNamespace => "exec_target_in_other_user_namespace",
             Self::ExecRootNotContainerRootfs => "exec_root_not_container_rootfs",
             Self::ExecJoinedNamespaceMismatch => "exec_joined_namespace_mismatch",
             Self::ExecJoinedPidNamespaceMismatch => "exec_joined_pid_namespace_mismatch",
@@ -270,6 +276,7 @@ impl ViolationReason {
             | Self::ExecTargetCgroupMismatch
             | Self::ExecTargetSharesPidNamespace
             | Self::ExecTargetSharesMountNamespace
+            | Self::ExecTargetInOtherUserNamespace
             | Self::ExecRootNotContainerRootfs
             | Self::ExecJoinedNamespaceMismatch
             | Self::ExecJoinedPidNamespaceMismatch
@@ -290,7 +297,8 @@ impl ViolationReason {
             | Self::ExecJoinedCgroupMismatch => "SEC-1",
             Self::ExecTargetNotNestedPid1
             | Self::ExecTargetSharesPidNamespace
-            | Self::ExecTargetSharesMountNamespace => "SUP-6",
+            | Self::ExecTargetSharesMountNamespace
+            | Self::ExecTargetInOtherUserNamespace => "SUP-6",
             _ => "CORE-1",
         }
     }
@@ -336,6 +344,7 @@ impl ViolationReason {
             | Self::ExecTargetCgroupMismatch
             | Self::ExecTargetSharesPidNamespace
             | Self::ExecTargetSharesMountNamespace
+            | Self::ExecTargetInOtherUserNamespace
             | Self::ExecRootNotContainerRootfs
             | Self::ExecJoinedNamespaceMismatch
             | Self::ExecJoinedPidNamespaceMismatch
@@ -446,6 +455,9 @@ impl ViolationReason {
             }
             Self::ExecTargetSharesMountNamespace => {
                 "the exec target shares the mount namespace with the caller; refusing to join"
+            }
+            Self::ExecTargetInOtherUserNamespace => {
+                "the exec target is in another user namespace than the caller; refusing to join"
             }
             Self::ExecRootNotContainerRootfs => {
                 "the root directory after joining is not the recorded container rootfs"
@@ -683,6 +695,12 @@ mod tests {
                 "exec_target_shares_mount_namespace",
                 "SUP-6",
                 "the exec target shares the mount namespace with the caller; refusing to join",
+            ),
+            (
+                ViolationReason::ExecTargetInOtherUserNamespace,
+                "exec_target_in_other_user_namespace",
+                "SUP-6",
+                "the exec target is in another user namespace than the caller; refusing to join",
             ),
             (
                 ViolationReason::ExecRootNotContainerRootfs,

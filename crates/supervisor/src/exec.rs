@@ -113,6 +113,8 @@
 //! 4. `setns` を伴う通し試験: `tests/exec.rs`（実機前提。AGENTS.md。root を要し、CI ではビルドのみで実行して
 //!    いない）。pivot 済みの対象へ参加した後の `/` が固定した rootfs と一致することだけは、CI で実行する
 //!    `tests/exec_setns_join.rs` が非特権の user namespace で照合する
+//!    （既定の入口 [`identify_pid1`] が実 cgroup の記録から成功すること・別 instance と特定後の cgroup 移動を拒否
+//!    することは、委譲 cgroup を要する実機前提の `tests/exec_identify_cgroup.rs` が照合する。#1464）
 //! 5. exec 専用プロセス全体のタイムアウトと、`execve` 前の `close_range`（[`run_command`] と core の
 //!    `exec/exec_command.rs`）
 //!

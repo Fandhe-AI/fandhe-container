@@ -32,6 +32,8 @@
 //! 試験環境ではコンテナ用 cgroup（`<scope>/fc-<id>@<instance>`）を作れないため、期待 cgroup パスを
 //! 呼び出し側から渡す `identify_pid1_in` を使う。この入口は `exec-test-support` feature を付けたビルドにだけ
 //! 存在し、既定のビルドの公開 API は記録から期待値を導く `identify_pid1` だけである（SEC-1）。
+//! 既定の入口 `identify_pid1` の成功経路と拒否経路は、実 cgroup を作れる `tests/exec_identify_cgroup.rs`
+//! （実機前提。TASK-163 追補・#1464）が別に照合する。
 //! feature なしのビルドでは本体をコンパイルせず、`-- --ignored` で実行を求められたら「検証していない」
 //! ことを非ゼロ終了で知らせる（検証せずに成功しない。fail-closed）。`required-features` にしないのは、
 //! `cargo test --workspace --test '*'`（`make test-integration`）が feature なしで本 target を選ぶと

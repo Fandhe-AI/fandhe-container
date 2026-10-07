@@ -13,7 +13,9 @@
 //! | #855（TASK-169.5.1） | label（`--label`。[`labels`]） | state.json の `annotations`（core の `StateRecord`） |
 //! | #856（TASK-169.5.2） | 全オプション同時指定の結合テスト（`tests/container_options.rs`）。`--ipc=host` と `--shm-size` の併用を拒否 | — |
 //!
-//! secrets / configs の tmpfs 注入（#529 の後半）は未実装（REPAIR-3。tmpfs 機構〔#527〕は導入済みだが注入の結線が無い）。
+//! | #1473（TASK-169.4.2） | secrets / configs（[`secrets`]）。[`ContainerOptions::injected_files`] で core の注入仕様型へ変換 | core の `exec::inject_files`（専用 tmpfs へ書き込み後に read-only 化） |
+//!
+//! secrets / configs の指定モデルと core 側の注入は実装済みだが、launcher・CLI・stack（TOML）からの結線は未実装（REPAIR-3）。
 //!
 //! 変換先の [`Rlimits`] は `fandhe_container_core::exec::StagePipeline::with_rlimits`（fork 後・capability
 //! 削減の前に `prlimit(2)` で適用。Linux 限定）が消費する。
@@ -39,12 +41,15 @@ pub mod env;
 pub mod ipc;
 pub mod labels;
 pub mod mounts;
+pub mod secrets;
 
 pub use ipc::IpcMode;
 pub use labels::{Label, Labels};
 pub use mounts::{DEFAULT_SHM_SIZE_BYTES, MountOptions, ShmSize, TmpfsOption};
+pub use secrets::{InjectedFileOption, InjectedFileOptions, InjectedKind, InjectedSource};
 
 use self::env::EnvSet;
+use fandhe_container_core::injected_files::InjectedFileSet;
 use fandhe_container_core::rlimits::{RLIMIT_INFINITY, Rlimit, RlimitKind, Rlimits};
 use fandhe_container_core::tmpfs::TmpfsMountSet;
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
@@ -90,7 +95,7 @@ impl Ulimit {
     }
 }
 
-/// コンテナ起動オプション（現状は ulimit・`--ipc`・env・label・`--shm-size` / `--tmpfs`。後続 issue が拡張する）。
+/// コンテナ起動オプション（現状は ulimit・`--ipc`・env・label・`--shm-size` / `--tmpfs`・secrets / configs。後続 issue が拡張する）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ContainerOptions {
@@ -99,6 +104,7 @@ pub struct ContainerOptions {
     env: EnvSet,
     labels: Labels,
     mounts: MountOptions,
+    injected: InjectedFileOptions,
 }
 
 impl ContainerOptions {
@@ -165,6 +171,28 @@ impl ContainerOptions {
     /// 検証は消費時点で行い、builder の呼び出し順で迂回できないようにする。
     pub fn tmpfs_set(&self) -> Result<TmpfsMountSet, TraitError> {
         self.mounts.to_tmpfs_set(self.ipc)
+    }
+
+    /// secrets / configs を設定する（SUP-12・TASK-169.4.2）。
+    pub fn with_injected_files(mut self, injected: InjectedFileOptions) -> Self {
+        self.injected = injected;
+        self
+    }
+
+    /// 保持している secrets / configs の指定そのもの。
+    pub fn injected(&self) -> &InjectedFileOptions {
+        &self.injected
+    }
+
+    /// core の `exec::inject_files` へ渡す注入ファイル集合へ変換する（SUP-12・TASK-169.4.2）。
+    ///
+    /// ホスト上のファイルはこの呼び出しで読む。注入ディレクトリが `--tmpfs` / `--shm-size` の tmpfs と
+    /// 同一・祖先・子孫になる指定は拒否する（どちらかが他方を覆い隠すため。fail-closed）。検証は消費時点で
+    /// 行い、builder の呼び出し順で迂回できないようにする。
+    pub fn injected_files(&self) -> Result<InjectedFileSet, TraitError> {
+        let set = self.injected.to_file_set()?;
+        set.check_against_tmpfs(&self.tmpfs_set()?)?;
+        Ok(set)
     }
 
     /// core の `StagePipeline::with_rlimits` へ渡す集合。
@@ -332,6 +360,38 @@ mod tests {
         assert_eq!(
             opts.labels().iter().collect::<Vec<_>>(),
             [("app", "web"), ("tier", "")]
+        );
+    }
+
+    /// SUP-12・TASK-169.4.2: secrets / configs は core の注入仕様へ変換され、tmpfs との重なりは順序によらず拒否する。
+    #[test]
+    fn sup12_task169_4_2_injected_files_conflict_with_tmpfs() {
+        let secret = InjectedFileOption::new(
+            InjectedKind::Secret,
+            "db",
+            InjectedSource::Inline(
+                fandhe_container_core::injected_files::InjectedContent::from_bytes(b"x".to_vec())
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+        let injected = InjectedFileOptions::default()
+            .with_secrets(vec![secret])
+            .unwrap();
+        let ok = ContainerOptions::new()
+            .with_injected_files(injected.clone())
+            .with_mounts(MountOptions::default().with_shm_size(ShmSize::parse("64m").unwrap()));
+        assert_eq!(ok.injected_files().unwrap().files().len(), 1);
+        assert!(ContainerOptions::new().injected_files().unwrap().is_empty());
+        let tmpfs_run = MountOptions::default()
+            .with_tmpfs(TmpfsOption::parse("/run").unwrap())
+            .unwrap();
+        let clash = ContainerOptions::new()
+            .with_mounts(tmpfs_run)
+            .with_injected_files(injected);
+        assert_eq!(
+            clash.injected_files().unwrap_err().message(),
+            "injected file directory overlaps a tmpfs mount"
         );
     }
 

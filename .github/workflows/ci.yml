@@ -583,6 +583,29 @@ jobs:
           echo "tmpfs_mount: mounts, flags and rollback verified (root=false)" >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::tmpfs_mount verified"
 
+      # inject_files（`crates/core/tests/inject_files.rs`。SUP-12・TASK-169.4.2・#1473）:
+      # secrets / configs の専用 tmpfs への注入・read-only 再マウント・EROFS による書き込み拒否・
+      # 失敗時の後始末・内容がホストのディスクへ出ないことを検証する実機前提テスト（harness = false）。
+      # tmpfs_mount と同じく上で緩和した sysctl を再利用し、新しい check-run・sudo・permissions は
+      # 追加しない（rootless 経路のみ。rootful 経路は未検証）。成功行を grep で照合する。
+      - name: inject_files のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        run: cargo test -p fandhe-container-core --test inject_files --no-run
+
+      - name: inject_files の実行（実機前提テスト・--ignored。SUP-12・TASK-169.4.2）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/inject_files.log"
+          cargo test -p fandhe-container-core --test inject_files -- --ignored 2>&1 | tee "${log}"
+          if ! grep -Fq 'inject_files: content, read-only and rollback verified (root=false)' "${log}"; then
+            echo "::error::inject_files did not report verification (possibly not executed)" >&2
+            exit 1
+          fi
+          echo "inject_files: content, read-only and rollback verified (root=false)" >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::inject_files verified"
+
   # --------------------------------------------------
   # bench-regression（ベンチ回帰「比較の仕組み」導入: TASK-86.3・REPAIR-7 第 4 段階・REPAIR-8）
   # --------------------------------------------------

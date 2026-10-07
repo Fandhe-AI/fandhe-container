@@ -63,7 +63,7 @@ use super::{
 const STAGE: IsolationStage = IsolationStage::MountTmpfs;
 
 /// 作成するマウント先ディレクトリのモード。
-const DIR_MODE: u32 = 0o755;
+pub(super) const DIR_MODE: u32 = 0o755;
 
 /// 適用した tmpfs 1 件の結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,13 +140,13 @@ fn mount_tmpfs_at(
 }
 
 /// 1 件の適用で rootfs・mount namespace に加えた変更の記録（失敗時の [`roll_back`] が使う）。
-struct Applied<'a> {
+pub(super) struct Applied<'a> {
     /// マウント先の要素列（正規化済み）。
-    names: Vec<&'a OsStr>,
+    pub(super) names: Vec<&'a OsStr>,
     /// この呼び出しの `mkdirat` が成功した要素の添字（昇順。既存・競合で先に作られた要素は含めない）。
-    created: Vec<usize>,
+    pub(super) created: Vec<usize>,
     /// 事後検証で「自分がマウントした tmpfs のルート」と確かめた fd（検証に通るまでは `None`）。
-    mounted: Option<OwnedFd>,
+    pub(super) mounted: Option<OwnedFd>,
 }
 
 /// 失敗時の後始末（最善努力）。新しい順に、マウントした tmpfs を外してから、作成した要素を深い順に消す。
@@ -157,7 +157,7 @@ struct Applied<'a> {
 /// 専用の mount namespace に閉じ、プロセスの破棄で消える）。作成した要素は `root` から名前で辿り
 /// （symlink は辿らない）、`unlinkat(AT_REMOVEDIR)` は空ディレクトリしか消さないため既存の内容は壊さない。
 /// 途中で失敗した件はそこで打ち切り、残りの件は続ける。
-fn roll_back(root: BorrowedFd<'_>, rootfs: &std::path::Path, applied: &[Applied<'_>]) {
+pub(super) fn roll_back(root: BorrowedFd<'_>, rootfs: &std::path::Path, applied: &[Applied<'_>]) {
     use std::os::unix::ffi::OsStrExt as _;
     for state in applied.iter().rev() {
         if let Some(dir) = &state.mounted
@@ -246,7 +246,13 @@ fn apply_one(
             ),
         )
     })?;
-    state.mounted = Some(verify_mounted(root, rootfs, &names, spec, &dir)?);
+    state.mounted = Some(verify_mounted(
+        root,
+        rootfs,
+        &names,
+        spec.destination.as_str(),
+        &dir,
+    )?);
     Ok(())
 }
 
@@ -255,7 +261,7 @@ fn apply_one(
 /// `created` が `Some` なら、無い要素を 0755 で作ってから同じ方法で開き直し、`mkdirat` が成功した要素の
 /// 添字を追記する（途中で失敗しても、それまでに作った分は残る。マウント先の準備）。`None` なら作らずに
 /// `path_missing` の違反記録付きで拒否する（事後検証・後始末。副作用を持たせない）。
-fn open_chain(
+pub(super) fn open_chain(
     root: BorrowedFd<'_>,
     rootfs: &std::path::Path,
     names: &[&OsStr],
@@ -302,16 +308,16 @@ fn open_chain(
 ///
 /// 観測は cfg で差し替わる [`observe_mount`] を介すだけで、`cfg(test)` の分岐は持たない（判定本体
 /// [`check_new_tmpfs`] は単体で試験する）。返した fd は失敗時の [`roll_back`] が解除対象の特定に使う。
-fn verify_mounted(
+pub(super) fn verify_mounted(
     root: BorrowedFd<'_>,
     rootfs: &std::path::Path,
     names: &[&OsStr],
-    spec: &TmpfsMountSpec,
+    destination: &str,
     before: &OwnedFd,
 ) -> Result<OwnedFd, ExecError> {
     let after = open_chain(root, rootfs, names, None)?;
     let observed = observe_mount(before, &after)?;
-    check_new_tmpfs(observed, spec.destination.as_str())?;
+    check_new_tmpfs(observed, destination)?;
     Ok(after)
 }
 
@@ -349,7 +355,7 @@ fn observe_mount(_before: &OwnedFd, _after: &OwnedFd) -> Result<MountObservation
 /// エラー message に入れるマウント先の表示形。違反記録と同じ `ViolationSubject` のエスケープ（制御文字・
 /// `\\` を `char::escape_default` 形式へ）と切り詰め（`VIOLATION_SUBJECT_MAX_CHARS` 文字）を通す。
 /// マウント先は NUL と `\\` 以外の制御文字（改行・ESC 等）を含み得るため、そのまま入れるとログ注入になる。
-fn display_destination(destination: &str) -> String {
+pub(super) fn display_destination(destination: &str) -> String {
     ViolationSubject::from_path(std::path::Path::new(destination))
         .as_str()
         .to_owned()
@@ -377,13 +383,13 @@ fn check_new_tmpfs(observed: MountObservation, destination: &str) -> Result<(), 
 }
 
 /// 違反記録の対象表示用に rootfs の実パスを得る（取れなければ固定文字列）。
-fn root_display(root: BorrowedFd<'_>) -> PathBuf {
+pub(super) fn root_display(root: BorrowedFd<'_>) -> PathBuf {
     std::fs::read_link(format!("/proc/thread-self/fd/{}", root.as_raw_fd()))
         .unwrap_or_else(|_| PathBuf::from("<rootfs>"))
 }
 
 #[cfg(not(test))]
-fn mount_tmpfs_syscall(
+pub(super) fn mount_tmpfs_syscall(
     target: &std::ffi::CStr,
     flags: sys::TmpfsMountFlags,
     data: &std::ffi::CStr,
@@ -393,7 +399,7 @@ fn mount_tmpfs_syscall(
 
 /// dry-run: `mount(2)` を呼ばず、(解決したマウント先・フラグ・data) を記録する。
 #[cfg(test)]
-fn mount_tmpfs_syscall(
+pub(super) fn mount_tmpfs_syscall(
     target: &std::ffi::CStr,
     flags: sys::TmpfsMountFlags,
     data: &std::ffi::CStr,
@@ -424,32 +430,32 @@ fn umount_tmpfs_syscall(target: &std::ffi::CStr) -> Result<(), SysError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::os::fd::OwnedFd;
     use std::os::unix::fs::symlink;
 
     thread_local! {
-        pub(super) static CALLS: std::cell::RefCell<Vec<(String, u64, String)>> =
+        pub(in crate::exec) static CALLS: std::cell::RefCell<Vec<(String, u64, String)>> =
             const { std::cell::RefCell::new(Vec::new()) };
     }
 
     thread_local! {
-        pub(super) static UMOUNTS: std::cell::RefCell<Vec<String>> =
+        pub(in crate::exec) static UMOUNTS: std::cell::RefCell<Vec<String>> =
             const { std::cell::RefCell::new(Vec::new()) };
     }
 
-    fn take_umounts() -> Vec<String> {
+    pub(in crate::exec) fn take_umounts() -> Vec<String> {
         UMOUNTS.with(|c| std::mem::take(&mut *c.borrow_mut()))
     }
 
-    fn take_calls() -> Vec<(String, u64, String)> {
+    pub(in crate::exec) fn take_calls() -> Vec<(String, u64, String)> {
         CALLS.with(|c| std::mem::take(&mut *c.borrow_mut()))
     }
 
-    struct Tmp(PathBuf);
+    pub(in crate::exec) struct Tmp(pub(in crate::exec) PathBuf);
     impl Tmp {
-        fn new(tag: &str) -> Self {
+        pub(in crate::exec) fn new(tag: &str) -> Self {
             let p = std::fs::canonicalize(std::env::temp_dir())
                 .expect("tmp")
                 .join(format!("fandhe-tmpfs-{tag}-{}", std::process::id()));
@@ -457,7 +463,7 @@ mod tests {
             std::fs::create_dir_all(&p).expect("mkdir");
             Self(p)
         }
-        fn fd(&self) -> OwnedFd {
+        pub(in crate::exec) fn fd(&self) -> OwnedFd {
             sys::open_dir_path_nofollow(
                 None,
                 &CString::new(self.0.to_str().expect("utf8")).expect("c"),

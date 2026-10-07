@@ -6,7 +6,7 @@
 //! 現状は状態配線（[`state`]。TASK-157.3）・監視ループ基本（[`run`]。TASK-157.4）・restart の土台（TASK-157.5。`restart_count` の加算は TASK-159.3 で再 launch 成功時へ移設）・healthcheck フック（[`health`]。TASK-157.6。コマンド実行は未実装）・logs 捕捉の土台（[`logs`]。TASK-157.7。ファイルへのローテーション書き込みは TASK-164.2・#506 で実装済み、フラッシュ制御・大規模検証は SUP-7・TASK-164.3/4 で未実装）が実装済みで、終了分類と restart ポリシー評価（[`restart`]。TASK-159.1・#487／TASK-159.2・#488。呼び出し側への配線は未実装）と、再起動ループ（バックオフ・注入式の再 launch・`restart_count` 管理・state.json 反映。#489・TASK-159.3）も実装済みで、本番 launcher による再 launch・明示的 stop の検知（SUP-9）等は未実装（TASK-1.3・TASK-157.1〔#235〕・REPAIR-1。スタブの明示は REPAIR-3）。
 //! inspect 相当の機械可読出力（[`inspect`]。TASK-168.1・#523・SUP-11）も実装済みで、出力をパースして型・値域・キー順・値を照合する結合テスト（TASK-168.2・#524。メモリ上のフェイクは 3 OS、実ストアは Linux）（`tests/inspect_output.rs`）も併置済み（CLI 配線は未実装）。
 //! cgroup 統計の読み取り・パース（[`stats`]。SUP-10・TASK-167.1・#520）と機械可読形式（JSON Lines）での出力（TASK-167.2・#521）も実装済みで、`stats` の CLI 配線は未実装。
-//! `--shm-size` / `--tmpfs` の解析と core の仕様型への変換（[`container_options`]。SUP-12・TASK-169.2・#527）も実装済みで、launcher・CLI 配線は未実装。
+//! `--shm-size` / `--tmpfs` の解析と core の仕様型への変換（[`container_options`]。SUP-12・TASK-169.2・#527）と secrets / configs の指定モデル（TASK-169.4.2・#1473）も実装済みで、launcher・CLI 配線は未実装。
 //! 本体は G12（TASK-157〜171）で、次の分割に沿って実装する。
 //!
 //! | issue | TASK | 内容 |
@@ -29,7 +29,8 @@
 //! | #487 | TASK-159.1 | 終了検知・終了コード分類（実装済み） |
 //! | #526 | TASK-169.1 | ulimit の指定モデル（[`container_options`]。適用は core の exec ステージ `Rlimits`。launcher 未結線のため消費者は無い。REPAIR-3） |
 //! | #528 | TASK-169.3 | `--ipc`（host / shareable）の指定モデル（[`container_options::ipc`]。Linux では core の `NamespaceSet` へ反映。他コンテナからの join は未実装。REPAIR-3） |
-//! | #529 | TASK-169.4 | env / env ファイル（[`container_options::env`]。実装済み。secrets / configs 注入は tmpfs 機構〔#527〕のマージ待ちで未実装。REPAIR-3） |
+//! | #529 | TASK-169.4 | env / env ファイル（[`container_options::env`]。実装済み。secrets / configs 注入は #1473 で実装） |
+//! | #1473 | TASK-169.4.2 | secrets / configs の指定モデル（[`container_options::secrets`]。`ContainerOptions::injected_files` で core の注入仕様型へ変換し、core の `exec::inject_files` が専用 tmpfs へ書き込み後に read-only 化する。launcher・CLI・stack 未結線。REPAIR-3） |
 //! | #855 | TASK-169.5.1 | label（`--label`。[`container_options::labels`]。core の `StateRecord::annotations` 経由で state.json へ反映。CLI・launcher 未結線。REPAIR-3） |
 //! | #856 | TASK-169.5.2 | 全オプション同時指定の結合テスト（`tests/container_options.rs`）。`--ipc=host` と `--shm-size` の併用は `ContainerOptions::tmpfs_set` が拒否 |
 //! | #488 | TASK-159.2 | restart ポリシー評価（実装済み） |

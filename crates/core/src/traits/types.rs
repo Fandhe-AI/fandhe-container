@@ -167,8 +167,11 @@ impl TraitError {
                 end -= 1;
             }
             message.truncate(end);
-            // `truncate` は容量を縮めないため、巨大な入力バッファを error の寿命の間
-            // 保持しないよう確保量を上限以下へ縮める（保持する確保量も上限内に収める）。
+        }
+        // `truncate` は容量を縮めず、`String::with_capacity(大) + 短い文字列` のように
+        // 長さが上限以下でも巨大な確保が残り得る。切り詰めの有無と独立に、確保量が上限を
+        // 超えていれば縮めて、error の寿命の間に保持する確保量を上限内に収める。
+        if message.capacity() > TRAIT_ERROR_MESSAGE_MAX_BYTES {
             message.shrink_to_fit();
         }
         Self {
@@ -293,6 +296,25 @@ mod tests {
             "stored allocation must stay within the cap"
         );
         assert!(huge.to_string().len() <= max + "INTERNAL: ".len());
+    }
+
+    /// ERR-2・REPAIR-4・TASK-96.1・MS-6: 長さが上限以下でも過大な確保量は上限内へ縮める。
+    #[test]
+    fn err2_trait_error_shrinks_oversized_capacity_without_truncation() {
+        let mut s = String::with_capacity(1_000_000);
+        s.push_str("short");
+        let err = TraitError::new(ErrorCode::Internal, s);
+        assert_eq!(err.message(), "short");
+        assert!(!err.message_truncated());
+        assert!(err.message.capacity() <= TRAIT_ERROR_MESSAGE_MAX_BYTES);
+
+        // 呼び出し側が事前に truncate 済みで容量だけ巨大なケース。
+        let mut pre = "a".repeat(100_000);
+        pre.truncate(10);
+        let err = TraitError::new(ErrorCode::Internal, pre);
+        assert_eq!(err.message().len(), 10);
+        assert!(!err.message_truncated());
+        assert!(err.message.capacity() <= TRAIT_ERROR_MESSAGE_MAX_BYTES);
     }
 
     /// CRI-7: `TryFrom<&str>` は `ContainerId::new` と同じ検証結果を返す。

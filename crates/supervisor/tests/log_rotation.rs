@@ -260,3 +260,65 @@ fn sup7_task164_4_million_lines_default_rotation_retained_range_is_contiguous() 
     let cfg = RotationConfig::default();
     run_million("def", cfg, &["m1.log.2", "m1.log.1", "m1.log"], 838_860);
 }
+// ---- TASK-164 追補（#1469）・SUP-7: ロックファイルの掃除経路 ----
+
+/// SUP-7: 実パイプ捕捉でローテーション → ログ名の列挙にロックファイルが含まれず、sink 生存中の
+/// `remove_all` は拒否され、sink を閉じた後の `remove_all` でログ・ロックが全て消える。
+#[test]
+fn sup7_task164_1469_remove_all_cleans_logs_and_lock_file() {
+    use fandhe_container_core::traits::ErrorCode;
+    use fandhe_container_supervisor::logs::log_file_paths;
+
+    let (dir, _guard) = make_unique_dir("fc-sup7-clean");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let id = ContainerId::new("cl1").unwrap();
+    let cfg = RotationConfig::new(MIN_LOG_FILE_BYTES, 3).unwrap();
+    let sink = Arc::new(RotatingFileSink::open(&dir, &id, cfg).unwrap());
+    let (out_r, mut out_w) = std::io::pipe().unwrap();
+    let cap = LogCapture::start(
+        OutputStreams::new(&ReaderBudget::with_max_limit(), Some(Box::new(out_r)), None),
+        sink.clone(),
+    )
+    .unwrap();
+    let line = format!("{}\n", "a".repeat(999));
+    for _ in 0..500 {
+        out_w.write_all(line.as_bytes()).unwrap();
+    }
+    drop(out_w);
+    cap.drain(Duration::from_secs(10)).unwrap();
+
+    // 生存中は削除を拒否し、何も消さない。
+    let err = RotatingFileSink::remove_all(&dir, &id).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+
+    let names = |paths: Vec<PathBuf>| -> Vec<String> {
+        paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    };
+    assert_eq!(
+        names(log_file_paths(&dir, &id).unwrap()),
+        ["cl1.log.2", "cl1.log.1", "cl1.log"]
+    );
+
+    // drain 完了後も、リーダースレッドが sink の Arc を手放すのはスレッド終了時で、drain の戻りより遅れ得る。
+    // 強参照が自分の 1 本になるまで待ってから落とし、ロック解放前の remove_all による不安定さを避ける。
+    let wait_until = std::time::Instant::now() + Duration::from_secs(10);
+    while Arc::strong_count(&sink) > 1 && std::time::Instant::now() < wait_until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(Arc::strong_count(&sink), 1);
+    drop(sink);
+    let removed = RotatingFileSink::remove_all(&dir, &id).unwrap();
+    assert_eq!(removed.log_files(), 3);
+    let left: Vec<String> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, Vec::<String>::new());
+}

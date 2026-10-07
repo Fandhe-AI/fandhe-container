@@ -491,7 +491,15 @@ fn sup7_task164_2_open_rejects_case_variant_names_in_namespace() {
         fs::write(t.0.join(bad), b"old").unwrap();
         let e = RotatingFileSink::open(&t.0, &id(), small()).err().unwrap();
         assert_eq!(e.code(), ErrorCode::InvalidArgument, "{bad}");
-        assert_eq!(fs::read(t.0.join(bad)).unwrap(), b"old");
+        match fs::read(t.0.join(bad)) {
+            Ok(bytes) => assert_eq!(bytes, b"old", "{bad}"),
+            // 大文字小文字非区別 FS では `c1.log.LOCK` が sink 自身のロックファイルと同じ実体になり、
+            // open 失敗時のロックファイル掃除で消える（SUP-7・#1469）。他の名前は必ず残る。
+            Err(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{bad}");
+                assert_eq!(bad, "c1.log.LOCK");
+            }
+        }
     }
 }
 
@@ -942,6 +950,7 @@ fn sup7_task164_3_reopen_after_gap_in_generations_has_no_duplication() {
     }
     assert_eq!(all, b"stdout old\nstdout cur\nstdout new\n");
 }
+
 // ---- TASK-164 追補（#1470）: Windows のログローテーション失敗時の扱いとロック検査 ----
 
 /// IO-5: 畳み込みで ASCII へ写る非 ASCII 文字だけを写し、それ以外はそのまま返す（FS 非依存・全 OS）。
@@ -1224,4 +1233,288 @@ mod windows_share {
         assert_eq!(e.code(), ErrorCode::FailedPrecondition);
         drop(s);
     }
+}
+
+// ---- ロックファイルの掃除経路（SUP-7・TASK-164 追補・#1469）----
+
+/// `.lock` を除外しない全エントリ名（ソート済み）。
+fn all_files(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+/// 3 世代（`c1.log`・`.1`・`.2`）が揃うまで書いてから閉じる。
+fn fill_three_generations(dir: &Path, id: &ContainerId) {
+    let s = RotatingFileSink::open(dir, id, small()).unwrap();
+    let line = vec![b'a'; 992];
+    for _ in 0..400 {
+        s.append(StreamKind::Stdout, &line).unwrap();
+    }
+}
+
+/// SUP-7: 名前の分類は表のとおり（open・削除・列挙が同じ判定を使う）。
+#[test]
+fn sup7_task164_1469_classify_name_table() {
+    let b = "c1.log";
+    assert_eq!(classify_name(b, "c1.log"), NameClass::Current);
+    assert_eq!(classify_name(b, "c1.log.lock"), NameClass::Lock);
+    assert_eq!(classify_name(b, "c1.log.1"), NameClass::Generation(1));
+    assert_eq!(classify_name(b, "c1.log.16"), NameClass::Generation(16));
+    for rejected in [
+        "c1.log.0",
+        "c1.log.01",
+        "C1.LOG",
+        "c1.log.LOCK",
+        "c1.log.99999999999999999999",
+    ] {
+        assert!(
+            matches!(classify_name(b, rejected), NameClass::Rejected(_)),
+            "{rejected}"
+        );
+    }
+    for other in [
+        "c2.log",
+        "c1.log.log",
+        "c1.log.lock.1",
+        "c1.log.x",
+        "c1.logx",
+    ] {
+        assert_eq!(classify_name(b, other), NameClass::Other, "{other}");
+    }
+}
+
+/// SUP-7: 上限超過の既存ログで open が失敗しても、ロックファイルを残さない。
+#[test]
+fn sup7_task164_1469_open_failure_removes_lock_file() {
+    let t = TmpDir::new("openfail");
+    let big = vec![b'z'; usize::try_from(MIN_LOG_FILE_BYTES).unwrap() + 1];
+    fs::write(t.0.join("c1.log"), &big).unwrap();
+    let e = RotatingFileSink::open(&t.0, &id(), small()).err().unwrap();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    assert_eq!(all_files(&t.0), ["c1.log"]);
+    assert_eq!(fs::read(t.0.join("c1.log")).unwrap(), big);
+}
+
+/// SUP-7: 名前空間違反（世代数以上・世代 0・大文字別名・ディレクトリ世代）でもロックを残さない。
+#[test]
+fn sup7_task164_1469_namespace_rejection_removes_lock_file() {
+    for bad in ["c1.log.3", "c1.log.0", "C1.LOG.1"] {
+        let t = TmpDir::new("nsfail");
+        fs::write(t.0.join(bad), b"x\n").unwrap();
+        let e = RotatingFileSink::open(&t.0, &id(), small()).err().unwrap();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument, "{bad}");
+        assert_eq!(all_files(&t.0), [bad], "{bad}");
+    }
+    let t = TmpDir::new("nsdir");
+    fs::create_dir(t.0.join("c1.log.1")).unwrap();
+    let e = RotatingFileSink::open(&t.0, &id(), small()).err().unwrap();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    assert_eq!(all_files(&t.0), ["c1.log.1"]);
+}
+
+/// SUP-7: 既存の空ロックファイルがあっても、検査失敗後に消える。
+#[test]
+fn sup7_task164_1469_open_failure_removes_preexisting_lock_file() {
+    let t = TmpDir::new("prelock");
+    fs::write(t.0.join("c1.log.lock"), b"").unwrap();
+    fs::write(t.0.join("c1.log.5"), b"x\n").unwrap();
+    assert!(RotatingFileSink::open(&t.0, &id(), small()).is_err());
+    assert_eq!(all_files(&t.0), ["c1.log.5"]);
+}
+
+/// SUP-7: 競合した open（FailedPrecondition）は先行 sink のロックファイルを消さない。
+#[test]
+fn sup7_task164_1469_contended_open_keeps_lock_file() {
+    let t = TmpDir::new("contend");
+    let s = RotatingFileSink::open(&t.0, &id(), small()).unwrap();
+    let e = RotatingFileSink::open(&t.0, &id(), small()).err().unwrap();
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    assert_eq!(all_files(&t.0), ["c1.log", "c1.log.lock"]);
+    s.append(StreamKind::Stdout, b"ok").unwrap();
+    s.flush().unwrap();
+    assert_eq!(fs::read(t.0.join("c1.log")).unwrap(), b"stdout ok\n");
+}
+
+/// SUP-7: sink 生存中の remove_all は拒否し、何も消さない。
+#[test]
+fn sup7_task164_1469_remove_all_refused_while_sink_alive() {
+    let t = TmpDir::new("alive");
+    let s = RotatingFileSink::open(&t.0, &id(), small()).unwrap();
+    s.append(StreamKind::Stdout, b"keep").unwrap();
+    let e = RotatingFileSink::remove_all(&t.0, &id()).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    assert_eq!(all_files(&t.0), ["c1.log", "c1.log.lock"]);
+    s.append(StreamKind::Stdout, b"more").unwrap();
+    s.flush().unwrap();
+    assert_eq!(
+        fs::read(t.0.join("c1.log")).unwrap(),
+        b"stdout keep\nstdout more\n"
+    );
+}
+
+/// SUP-7: remove_all は現在ログ・全世代・ロックファイルを消し、別 ID・無関係なファイルは残す。
+#[test]
+fn sup7_task164_1469_remove_all_removes_logs_and_lock_only_for_the_id() {
+    let t = TmpDir::new("removeall");
+    fill_three_generations(&t.0, &id());
+    let other = ContainerId::new("c2").unwrap();
+    let keep = RotatingFileSink::open(&t.0, &other, small()).unwrap();
+    fs::write(t.0.join("note.txt"), b"n").unwrap();
+    assert_eq!(
+        all_files(&t.0),
+        [
+            "c1.log",
+            "c1.log.1",
+            "c1.log.2",
+            "c1.log.lock",
+            "c2.log",
+            "c2.log.lock",
+            "note.txt"
+        ]
+    );
+    let r = RotatingFileSink::remove_all(&t.0, &id()).unwrap();
+    assert_eq!(r.log_files(), 3);
+    assert_eq!(all_files(&t.0), ["c2.log", "c2.log.lock", "note.txt"]);
+    drop(keep);
+}
+
+/// SUP-7: 何も無い状態の remove_all は成功し（冪等）、ロックファイルも残さない。
+#[test]
+fn sup7_task164_1469_remove_all_is_idempotent() {
+    let t = TmpDir::new("idem");
+    for _ in 0..2 {
+        let r = RotatingFileSink::remove_all(&t.0, &id()).unwrap();
+        assert_eq!(r.log_files(), 0);
+        assert_eq!(all_files(&t.0), Vec::<String>::new());
+    }
+}
+
+/// SUP-7: 設定世代数を超える番号の世代も消す。
+#[test]
+fn sup7_task164_1469_remove_all_removes_generations_beyond_config() {
+    let t = TmpDir::new("beyond");
+    fs::write(t.0.join("c1.log"), b"a\n").unwrap();
+    fs::write(t.0.join("c1.log.7"), b"b\n").unwrap();
+    let r = RotatingFileSink::remove_all(&t.0, &id()).unwrap();
+    assert_eq!(r.log_files(), 2);
+    assert_eq!(all_files(&t.0), Vec::<String>::new());
+}
+
+/// SUP-7: 削除後に同じ ID で開き直せ、世代を消費しない。
+#[test]
+fn sup7_task164_1469_reopen_after_remove_all() {
+    let t = TmpDir::new("reopen");
+    fill_three_generations(&t.0, &id());
+    RotatingFileSink::remove_all(&t.0, &id()).unwrap();
+    let s = RotatingFileSink::open(&t.0, &id(), small()).unwrap();
+    s.append(StreamKind::Stdout, b"x").unwrap();
+    s.flush().unwrap();
+    assert_eq!(all_files(&t.0), ["c1.log", "c1.log.lock"]);
+    assert_eq!(fs::read(t.0.join("c1.log")).unwrap(), b"stdout x\n");
+}
+
+/// SUP-7: 受理できない名前・ディレクトリがあれば何も消さず拒否する（ロックファイルは残さない）。
+#[test]
+fn sup7_task164_1469_remove_all_rejection_removes_nothing() {
+    let t = TmpDir::new("reject");
+    fs::write(t.0.join("c1.log"), b"keep\n").unwrap();
+    fs::write(t.0.join("c1.log.0"), b"bad\n").unwrap();
+    let e = RotatingFileSink::remove_all(&t.0, &id()).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    assert_eq!(all_files(&t.0), ["c1.log", "c1.log.0"]);
+    assert_eq!(fs::read(t.0.join("c1.log")).unwrap(), b"keep\n");
+
+    let t = TmpDir::new("rejectdir");
+    fs::write(t.0.join("c1.log"), b"keep\n").unwrap();
+    fs::create_dir(t.0.join("c1.log.2")).unwrap();
+    let e = RotatingFileSink::remove_all(&t.0, &id()).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    assert_eq!(all_files(&t.0), ["c1.log", "c1.log.2"]);
+}
+
+/// SUP-7: symlink の世代は辿らず、リンク自体だけを消す。
+#[cfg(unix)]
+#[test]
+fn sup7_task164_1469_remove_all_does_not_follow_symlinks() {
+    let t = TmpDir::new("symlink");
+    let outside = TmpDir::new("symlink-out");
+    fs::write(outside.0.join("target.txt"), b"keep\n").unwrap();
+    std::os::unix::fs::symlink(outside.0.join("target.txt"), t.0.join("c1.log.1")).unwrap();
+    let r = RotatingFileSink::remove_all(&t.0, &id()).unwrap();
+    assert_eq!(r.log_files(), 1);
+    assert_eq!(all_files(&t.0), Vec::<String>::new());
+    assert_eq!(fs::read(outside.0.join("target.txt")).unwrap(), b"keep\n");
+}
+
+/// SUP-7: dir 検証は open と同じ（相対パス・存在しないディレクトリは拒否）。
+#[test]
+fn sup7_task164_1469_remove_all_validates_dir() {
+    let e = RotatingFileSink::remove_all(Path::new("relative"), &id()).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    let t = TmpDir::new("nodir");
+    let e = RotatingFileSink::remove_all(&t.0.join("missing"), &id()).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
+}
+
+/// SUP-7: 読み出し側の列挙はロックファイル・別 ID・無関係なファイルを含めない。
+#[test]
+fn sup7_task164_1469_log_file_paths_excludes_lock_file() {
+    let t = TmpDir::new("list");
+    let s = RotatingFileSink::open(&t.0, &id(), small()).unwrap();
+    let line = vec![b'a'; 992];
+    for _ in 0..400 {
+        s.append(StreamKind::Stdout, &line).unwrap();
+    }
+    let other = ContainerId::new("c2").unwrap();
+    let _o = RotatingFileSink::open(&t.0, &other, small()).unwrap();
+    fs::write(t.0.join("note.txt"), b"n").unwrap();
+    let names: Vec<String> = log_file_paths(&t.0, &id())
+        .unwrap()
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["c1.log.2", "c1.log.1", "c1.log"]);
+}
+
+/// SUP-7: 列挙は受理できないエントリを拒否し、ログが無ければ空を返す。
+#[test]
+fn sup7_task164_1469_log_file_paths_rejects_and_empty() {
+    let t = TmpDir::new("listrej");
+    assert_eq!(log_file_paths(&t.0, &id()).unwrap(), Vec::<PathBuf>::new());
+    fs::create_dir(t.0.join("c1.log.1")).unwrap();
+    let e = log_file_paths(&t.0, &id()).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    #[cfg(unix)]
+    {
+        let t = TmpDir::new("listlink");
+        std::os::unix::fs::symlink(t.0.join("nowhere"), t.0.join("c1.log.1")).unwrap();
+        let e = log_file_paths(&t.0, &id()).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    }
+}
+
+/// SUP-7: 取得中にロックファイルが差し替えられた場合（孤立 inode）は成功扱いにしない（unix）。
+#[cfg(unix)]
+#[test]
+fn sup7_task164_1469_replaced_lock_file_is_not_accepted() {
+    let t = TmpDir::new("replaced");
+    let path = t.0.join("c1.log.lock");
+    let held = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    // パスを消して別の実体で作り直す。held は孤立 inode になる。
+    fs::remove_file(&path).unwrap();
+    fs::write(&path, b"").unwrap();
+    let e = verify_lock_is_current(&held, &path).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    // パスが無い場合も同様。
+    fs::remove_file(&path).unwrap();
+    let e = verify_lock_is_current(&held, &path).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
 }

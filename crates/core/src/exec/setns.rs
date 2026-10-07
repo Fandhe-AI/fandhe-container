@@ -457,6 +457,32 @@ fn container_cgroup_path(scope: &CgroupScope, name: &CgroupName) -> String {
     }
 }
 
+/// 記録（ID と cgroup 配置）から、コンテナ固有の cgroup 絶対パスを導く（[`Pid1Target::open`] と同じ導出）。
+///
+/// exec 用の子 cgroup の後始末（`exec::cgroup_join`）が、呼び出しプロセスで記録だけからコンテナ cgroup を
+/// 開き直すために使う。名前を作れない ID は `InvalidArgument`。
+pub(super) fn container_cgroup_path_for(
+    id: &ContainerId,
+    placement: &CgroupPlacement,
+) -> Result<String, ExecError> {
+    let name = CgroupName::for_instance(id, placement.instance()).map_err(|_| {
+        ExecError::new(
+            ErrorCode::InvalidArgument,
+            IsolationStage::SetNs,
+            "container id and instance do not form a valid cgroup name",
+        )
+    })?;
+    let path = container_cgroup_path(placement.scope(), &name);
+    if !is_valid_cgroup_path(&path) {
+        return Err(ExecError::new(
+            ErrorCode::InvalidArgument,
+            IsolationStage::SetNs,
+            "expected cgroup path must be an absolute, normalized, non-root cgroup path",
+        ));
+    }
+    Ok(path)
+}
+
 /// 対象 `pid` の所属 cgroup（`/proc/<pid>/cgroup` の v2 行）が `expected` と完全一致することを確かめる。
 ///
 /// 不一致は `FailedPrecondition`（違反記録 `ExecTargetCgroupMismatch`。対象に期待パスを載せる）。読み取りの

@@ -9,8 +9,8 @@
 //! ```text
 //! reapply_restrictions(..) -> ExecRestrictionReport      // rlimit・capability・NO_NEW_PRIVS・Landlock・seccomp
 //!   .into_complete()       -> ExecReady                  // 唯一の証跡（値で渡る）
-//! spawn_exec_command(ready, &entry)                      // 親: non-dumpable を確認 → cwd を照合済み root へ → fork
-//!   子: close_range(3..) -> setsid -> エントリポイントを fd で検査 -> 標準入出力を /dev/null へ -> execveat
+//! spawn_exec_command(ready, &entry, &child_cgroup)       // 親: non-dumpable を確認 → cwd を照合済み root へ → fork
+//!   子: 子 cgroup へ参加 -> close_range(3..) -> setsid -> エントリポイントを fd で検査 -> 標準入出力を /dev/null へ -> execveat
 //! 親: ContainerChild::wait_timeout(timeout)              // 期限超過は SIGKILL + 回収（REPAIR-5）
 //! ```
 //!
@@ -45,7 +45,15 @@
 //!   親が既に終了していれば子は何もせず終了する。これで「呼び出しプロセスの終了 → worker の停止 →
 //!   コマンドの停止」が連鎖する。設定は資格情報の変わらない `execve` を越えて保持されるが、実行された
 //!   コマンド自身は `prctl` で解除できる（解除したコマンドと、コマンドがコンテナ内で作った子孫は、コンテナの
-//!   cgroup と制限の内側に残る。確実に止めるには exec 用の子 cgroup と `cgroup.kill` が要る。未実装）
+//!   cgroup と制限の内側に残る。確実に止めるのは次項の exec 用の子 cgroup と `cgroup.kill`）
+//! - **exec 用の子 cgroup と `cgroup.kill`**（SUP-6・SUP-4・REPAIR-5・CORE-4・TASK-163 追補・#1466）: コマンドだけを
+//!   コンテナ cgroup 直下の子 cgroup（[`ExecChildCgroup`]。`exec-<nonce>`）へ入れて実行する。fork した子は
+//!   `execve` の前（`close_range` の前）に自分を `cgroup.procs` へ `0` で移す。この時点で子孫は存在しないため、
+//!   コマンドが `prctl` で親死亡シグナルを解除しても、二重 fork しても、子孫はすべてこの cgroup に入る。
+//!   移せなければコマンドを起動しない（fail-closed）。停止は [`ExecChildCgroup::kill_all`]（`cgroup.kill`。子孫ごと
+//!   `SIGKILL`）。親 cgroup の `memory.max`・`pids.max` 等は階層的に子孫へ掛かる（この cgroup に controller は
+//!   有効化しない）。cgroup の作成・削除はこのモジュールではなく `exec::cgroup_join`（作成は `enter_namespaces` と再適用の前、
+//!   削除は制限の掛かっていない呼び出しプロセスが名前から）
 //! - **fork の前に cwd を照合済みの root へ置く**: `setns(CLONE_NEWNS)` が付け替えた cwd は検証していないため、
 //!   `ExecReady` が持つ照合済みの `/` の fd へ `fchdir` する。コマンドの cwd はコンテナの rootfs の根になる
 //! - **fork の健全性**: 子を fork する直前に、`setns` 前に開いた status fd から `Threads: 1` を確認する
@@ -89,7 +97,8 @@ use crate::traits::types::ErrorCode;
 use super::process::{EXIT_SETUP_FAILED, exec_child_main, exec_status_pipe, read_exec_status};
 use super::reapply::ExecReadyParts;
 use super::{
-    ChildExit, ContainerChild, ExecCommand, ExecError, ExecExit, ExecReady, IsolationStage,
+    ChildExit, ContainerChild, ExecChildCgroup, ExecCommand, ExecError, ExecExit, ExecReady,
+    IsolationStage,
 };
 
 /// [`spawn_exec_command`] が fork した、稼働中コンテナ内のコマンドの子（SUP-6・TASK-163 追補・#1460）。
@@ -168,8 +177,9 @@ impl ExecChild {
 /// fn f(
 ///     report: fandhe_container_core::exec::ExecRestrictionReport,
 ///     command: &fandhe_container_core::exec::ExecCommand,
+///     cgroup: &fandhe_container_core::exec::ExecChildCgroup,
 /// ) {
-///     let _ = fandhe_container_core::exec::spawn_exec_command(report, command);
+///     let _ = fandhe_container_core::exec::spawn_exec_command(report, command, cgroup);
 /// }
 /// ```
 ///
@@ -180,11 +190,16 @@ impl ExecChild {
 /// fn f(
 ///     ready: fandhe_container_core::exec::ExecReady,
 ///     entry: &fandhe_container_core::exec::Entrypoint,
+///     cgroup: &fandhe_container_core::exec::ExecChildCgroup,
 /// ) {
-///     let _ = fandhe_container_core::exec::spawn_exec_command(ready, entry);
+///     let _ = fandhe_container_core::exec::spawn_exec_command(ready, entry, cgroup);
 /// }
 /// ```
-pub fn spawn_exec_command(ready: ExecReady, command: &ExecCommand) -> Result<ExecChild, ExecError> {
+pub fn spawn_exec_command(
+    ready: ExecReady,
+    command: &ExecCommand,
+    cgroup: &ExecChildCgroup,
+) -> Result<ExecChild, ExecError> {
     let entry = command.entrypoint();
     let ExecReadyParts {
         root,
@@ -206,7 +221,7 @@ pub fn spawn_exec_command(ready: ExecReady, command: &ExecCommand) -> Result<Exe
     let (status_read, status_write) = exec_status_pipe()?;
     let pid = sys::fork_single_threaded_with(
         || threads.count() == Some(1),
-        || match bind_to_parent_lifetime(own.as_fd()) {
+        || match bind_to_parent_lifetime(own.as_fd()).and_then(|()| join_exec_cgroup(cgroup)) {
             Ok(()) => exec_child_main(entry, &status_write),
             // 何も書かずに終わる（親は「手順の途中で終了した」= コマンドは起動していない、と判定する）。
             Err(code) => code,
@@ -220,6 +235,22 @@ pub fn spawn_exec_command(ready: ExecReady, command: &ExecCommand) -> Result<Exe
         child: ContainerChild::new(pid),
         status: status_read,
         outcome: std::sync::Mutex::new(None),
+    })
+}
+
+/// fork した子（コマンド）を exec 用の子 cgroup へ移す（#1466。契約はモジュール doc「exec 用の子 cgroup」）。
+///
+/// `bind_to_parent_lifetime` の後・`close_range` の前（cgroup の書き込み fd が残っている間）に呼ぶ。この時点で
+/// 子孫は存在しないため、移した後に作られる子孫はすべて子 cgroup に入る。失敗したら stderr に英語 1 行を出し
+/// `EXIT_SETUP_FAILED` を返す（何も書かずに終了 = 親は「コマンドは起動していない」と判定する。fail-closed）。
+fn join_exec_cgroup(cgroup: &ExecChildCgroup) -> Result<(), i32> {
+    use std::io::Write as _;
+    cgroup.join_self().map_err(|_| {
+        let _ = writeln!(
+            std::io::stderr(),
+            "fandhe-container: the exec command could not join its child cgroup; refusing to continue"
+        );
+        EXIT_SETUP_FAILED
     })
 }
 
@@ -386,6 +417,23 @@ mod tests {
         ThreadCountSource::PreOpened(f)
     }
 
+    /// `cgroup.procs` / `cgroup.kill` を置いた使い捨てのディレクトリから作った子 cgroup（fork 前に失敗する試験用）。
+    fn child_cgroup() -> ExecChildCgroup {
+        let dir = std::env::temp_dir().join(format!(
+            "fandhe-exec-command-cg-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("cgroup.procs"), "").expect("procs");
+        std::fs::write(dir.join("cgroup.kill"), "").expect("kill");
+        let fd = OwnedFd::from(std::fs::File::open(&dir).expect("open dir"));
+        let cgroup = ExecChildCgroup::from_dir_for_test(fd);
+        let _ = std::fs::remove_dir_all(&dir);
+        cgroup
+    }
+
     fn entry() -> ExecCommand {
         ExecCommand::new("/bin/true", ["true"], &crate::exec::ContainerEnv::empty()).expect("entry")
     }
@@ -399,7 +447,7 @@ mod tests {
             status_with_threads(1),
             std::process::id().wrapping_add(1),
         );
-        let e = spawn_exec_command(ready, &entry()).expect_err("other process");
+        let e = spawn_exec_command(ready, &entry(), &child_cgroup()).expect_err("other process");
         assert_eq!(e.code, ErrorCode::FailedPrecondition);
         assert_eq!(e.stage, IsolationStage::Spawn);
         assert_eq!(
@@ -417,7 +465,7 @@ mod tests {
         take_calls();
         DUMPABLE.with(|d| d.set(true));
         let ready = ExecReady::for_test(root_fd(), status_with_threads(1), std::process::id());
-        let result = spawn_exec_command(ready, &entry());
+        let result = spawn_exec_command(ready, &entry(), &child_cgroup());
         DUMPABLE.with(|d| d.set(false));
         let e = result.expect_err("dumpable");
         assert_eq!(e.code, ErrorCode::FailedPrecondition);
@@ -522,7 +570,8 @@ mod tests {
         ] {
             take_calls();
             let ready = ExecReady::for_test(root_fd(), source, std::process::id());
-            let e = spawn_exec_command(ready, &entry()).expect_err("multi-threaded");
+            let e =
+                spawn_exec_command(ready, &entry(), &child_cgroup()).expect_err("multi-threaded");
             assert_eq!(e.code, ErrorCode::FailedPrecondition);
             assert_eq!(e.stage, IsolationStage::Spawn);
             assert_eq!(take_calls(), vec!["prctl(PR_GET_DUMPABLE)", "fchdir(root)"]);

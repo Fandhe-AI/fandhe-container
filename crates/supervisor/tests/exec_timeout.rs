@@ -35,6 +35,7 @@ mod linux {
         killed_worker_takes_its_child_down();
         failing_step_error_is_returned_as_is();
         panicking_worker_is_reported_as_internal();
+        child_cgroup_cleanup_runs_once_on_every_path();
         println!("exec_timeout: all scenarios passed");
     }
 
@@ -70,6 +71,7 @@ mod linux {
         let err = run_in_worker_for_test(
             Duration::from_secs(10),
             Duration::from_secs(10),
+            || Ok(()),
             || -> Result<ExecOutcome, TraitError> {
                 Err(TraitError::new(
                     ErrorCode::Unavailable,
@@ -90,6 +92,7 @@ mod linux {
         let err = run_in_worker_for_test(
             Duration::from_millis(500),
             Duration::from_millis(500),
+            || Ok(()),
             || -> Result<ExecOutcome, TraitError> {
                 loop {
                     std::thread::sleep(Duration::from_secs(3600));
@@ -138,10 +141,12 @@ mod linux {
         let err = run_in_worker_for_test(
             Duration::from_secs(3),
             Duration::from_millis(300),
+            || Ok(()),
             || -> Result<ExecOutcome, TraitError> {
                 run_in_worker_for_test(
                     Duration::from_secs(600),
                     Duration::from_secs(1),
+                    || Ok(()),
                     || -> Result<ExecOutcome, TraitError> {
                         let pid = std::process::id();
                         let start = proc_state_and_start(pid).map_or_else(String::new, |s| s.1);
@@ -185,6 +190,7 @@ mod linux {
         let err = run_in_worker_for_test(
             Duration::from_secs(10),
             Duration::from_secs(10),
+            || Ok(()),
             || -> Result<ExecOutcome, TraitError> {
                 Err(TraitError::new(
                     ErrorCode::PermissionDenied,
@@ -202,6 +208,7 @@ mod linux {
         let err = run_in_worker_for_test(
             Duration::from_secs(10),
             Duration::from_secs(10),
+            || Ok(()),
             || -> Result<ExecOutcome, TraitError> { panic!("stub step panicked") },
         )
         .unwrap_err();
@@ -211,6 +218,58 @@ mod linux {
                 .starts_with("exec stage Spawn: the exec worker ended abnormally"),
             "{}",
             err.message()
+        );
+    }
+
+    /// SUP-6・REPAIR-5・TASK-163 追補（#1466）: worker を fork した後は、期限切れ・エラー返却・異常終了（panic）の
+    /// どの経路でも、呼び出し側の exec 用子 cgroup の後始末がちょうど 1 回実行される。後始末の失敗は元のエラーへ
+    /// 併記される。
+    fn child_cgroup_cleanup_runs_once_on_every_path() {
+        let runs = std::cell::Cell::new(0u32);
+        let count = || {
+            runs.set(runs.get() + 1);
+            Ok(())
+        };
+        let err = run_in_worker_for_test(
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+            count,
+            || -> Result<ExecOutcome, TraitError> {
+                loop {
+                    std::thread::sleep(Duration::from_secs(3600));
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert_eq!(runs.get(), 1, "timeout path");
+
+        let err = run_in_worker_for_test(
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            || {
+                runs.set(runs.get() + 1);
+                Ok(())
+            },
+            || -> Result<ExecOutcome, TraitError> { panic!("stub step panicked") },
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert_eq!(runs.get(), 2, "abnormal worker exit path");
+
+        let err = run_in_worker_for_test(
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            || Err(TraitError::new(ErrorCode::Timeout, "still populated")),
+            || -> Result<ExecOutcome, TraitError> {
+                Err(TraitError::new(ErrorCode::PermissionDenied, "denied"))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
+        assert_eq!(
+            err.message(),
+            "denied; cleanup also failed: still populated"
         );
     }
 }

@@ -41,7 +41,10 @@ mkdir "$root/bundle"
 # スタブ launcher。`run --id <id> --bundle <dir> --restart <p> --restart-backoff-ms 0` を受ける。
 # STUB_MODE: normal / no_ready / early_exit / no_restart / same_pid / count_jump / foreign_pid /
 # error_line / log_missing / log_short / log_garbage / deep（state.json の pid が孫プロセス）/
-# late_start（SIGTERM 時に環境変数を継承しない新コンテナを起動して state.json へ書く）。
+# late_start（SIGTERM 時に環境変数を継承しない新コンテナを起動して state.json へ書く）/
+# late_two（全コンテナが環境変数を継承せず、SIGTERM 時にさらに新コンテナを起動。追跡済み pid も回収されること）/
+# late_session（late_start と同じだが新コンテナが別 session）/ dead_new（再起動後の新 pid が既に終了）/
+# log_late（restart ログを state.json 更新より後、最後の 1 行は SIGTERM 時に出す）。
 # ログの elapsed_us は STUB_ELAPSED（空白区切り）を順に使う。STUB_DELAY（秒・空白区切り）は kill 検知後から
 # 新コンテナ起動までの待ちを順に与える時間制御入力（observed の下限が決定的になる）。
 cat >"${root}/launcher.sh" <<'STUB'
@@ -57,6 +60,7 @@ didx=0
 child=""
 shown=""
 grand=""
+pending=""
 start_child() {
   if [ "$STUB_MODE" = deep ]; then
     gf="${STUB_DIR}/gc.${RANDOM}"
@@ -65,6 +69,9 @@ start_child() {
     while [ ! -s "$gf" ]; do sleep 0.01; done
     grand="$(<"$gf")"
     echo "$grand" >>"${STUB_DIR}/pids"
+  elif [ "$STUB_MODE" = late_two ]; then
+    env -u FANDHE_BENCH_OWNER sleep 300 &
+    child=$!
   else
     sleep 300 &
     child=$!
@@ -72,7 +79,11 @@ start_child() {
   echo "$child" >>"${STUB_DIR}/pids"
 }
 late_term() {
-  env -u FANDHE_BENCH_OWNER sleep 300 &
+  if [ "$STUB_MODE" = late_session ]; then
+    setsid env -u FANDHE_BENCH_OWNER sleep 300 &
+  else
+    env -u FANDHE_BENCH_OWNER sleep 300 &
+  fi
   child=$!
   echo "$child" >>"${STUB_DIR}/pids"
   write_state "$child"
@@ -84,11 +95,15 @@ write_state() {
     "$id" "$shown_pid" "$count" >"${sd}/state.tmp"
   mv "${sd}/state.tmp" "${sd}/state.json"
 }
-if [ "$STUB_MODE" = late_start ]; then
-  trap late_term TERM
-else
-  trap 'kill "$child" 2>/dev/null; exit 0' TERM
-fi
+term_handler() {
+  [ -z "$pending" ] || echo "$pending" >&2
+  kill "$child" 2>/dev/null
+  exit 0
+}
+case "$STUB_MODE" in
+  late_start | late_two | late_session) trap late_term TERM ;;
+  *) trap term_handler TERM ;;
+esac
 start_child
 shown="$child"
 [ "$STUB_MODE" != deep ] || shown="$grand"
@@ -105,6 +120,14 @@ while :; do
   didx=$((didx + 1))
   [ -z "$d" ] || sleep "$d"
   start_child
+  if [ "$STUB_MODE" = dead_new ]; then
+    true &
+    dp=$!
+    wait "$dp"
+    count=$((count + 1))
+    write_state "$dp"
+    while :; do sleep 0.2; done
+  fi
   case "$STUB_MODE" in
     count_jump) count=$((count + 2)) ;;
     *) count=$((count + 1)) ;;
@@ -118,6 +141,7 @@ while :; do
   line="{\"component\":\"supervisor.monitor\",\"operation\":\"restart\",\"result\":\"ok\",\"elapsed_us\":${e}}"
   case "$STUB_MODE" in
     log_missing) ;;
+    log_late) [ -z "$pending" ] || echo "$pending" >&2; pending="$line" ;;
     log_short) if [ "$idx" -ge 2 ]; then echo "$line" >&2; fi ;;
     log_garbage) echo "not json" >&2; echo '{"component":"supervisor.monitor","operation":"restart","result":"ok","elapsed_us":"x"}' >&2 ;;
     error_line) echo "{\"component\":\"supervisor.monitor\",\"operation\":\"restart\",\"result\":\"error\",\"code\":\"x\",\"elapsed_us\":${e}}" >&2 ;;
@@ -202,6 +226,15 @@ run_case deep 0 deep "1000 1000" --trials 2 --warmup 0 --timeout 10 || true
 # launcher が SIGTERM 時に環境変数を継承しない新コンテナを起動しても、state.json の pid から回収される
 run_case late_start 0 late_start "" --trials 1 --warmup 0 --timeout 10 || true
 
+# 全コンテナが環境変数を継承しない場合も、追跡した全 pid（再起動後の生存コンテナ）と SIGTERM 時の新コンテナを回収する
+run_case late_two 0 late_two "1000" --trials 1 --warmup 0 --timeout 10 || true
+# SIGTERM 時に別 session で起動された新コンテナも、起動時刻で所有確認して回収する
+run_case late_session 0 late_session "" --trials 1 --warmup 0 --timeout 10 || true
+# restart ログが state.json 更新より後（最後の 1 行は停止時）でも、launcher 停止後に集計して副系列が欠損しない
+if run_case log_late 0 log_late "9 1000 2000 3000" --trials 3 --warmup 1 --timeout 10; then
+  jq_eq log_late "${root}/log_late.out" '.supervisor_reported | [.samples, .median, .p95]' '[3,2,3]'
+fi
+
 # 偶数個: 1000..4000 → 中央値 2.5・p95 は ceil(3.8)-1=3 番目で 4.000
 if run_case even 0 normal "9 1000 2000 3000 4000" --trials 4 --warmup 1 --timeout 10; then
   jq_eq even "${root}/even.out" '.supervisor_reported | [.samples, .median, .p95]' '[4,2.5,4]'
@@ -225,8 +258,9 @@ run_case early_exit 1 early_exit "" --trials 1 --warmup 0 --timeout 2 || true
 run_case no_restart 1 no_restart "" --trials 1 --warmup 0 --timeout 2 || true
 run_case same_pid 1 same_pid "" --trials 1 --warmup 0 --timeout 2 || true
 run_case count_jump 1 count_jump "" --trials 1 --warmup 0 --timeout 2 || true
+run_case dead_new 1 dead_new "" --trials 1 --warmup 0 --timeout 3 || true
 run_case error_line 1 error_line "1000 1000" --trials 1 --warmup 0 --timeout 2 || true
-for m in no_ready early_exit no_restart same_pid count_jump error_line; do
+for m in no_ready early_exit no_restart same_pid count_jump dead_new error_line; do
   if [ -s "${root}/${m}.out" ]; then fail "${m}: stdout must be empty on failure"; else pass "${m}: no result published"; fi
 done
 

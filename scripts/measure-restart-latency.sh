@@ -45,6 +45,11 @@
 # 終了コード: 0 = 成功 / 1 = 計測失敗（READY なし・期限切れ・再起動未観測・時計変更・launcher 異常終了）/
 #   2 = 引数・入力・出力先エラー / 3 = 前提欠如（非 Linux・bash 5 未満・jq・/proc。0 で合格に見せない）/
 #   4 = 後始末失敗（残存プロセス。最優先）/ 129・130・143 = HUP・INT・TERM による中断（後始末の完了後）。
+# 新プロセスの検証: 観測時と確定時に、新 pid が生存し（ゾンビ除外）launcher の子孫で、起動時刻が一致することを
+#   確認する（SUP-3。state.json だけ残って新プロセスが終了した試行は採用しない）。
+# 後始末: 試行中に観測した全コンテナ pid を起動時刻の同一性で回収し、launcher 停止後に state.json に現れた
+#   別 pid も session または起動時刻（launcher 以降）で所有確認して回収する。restart ログの副系列は
+#   launcher 停止後に集計する（最後の restart ログが状態更新より遅れても欠損にしない）。
 # 安全策: kill の送信先は「state.json の pid」かつ「launcher の子孫」かつ「起動時刻が記録と一致」の
 #   3 条件を満たすものだけ（偽造 state.json・pid 再利用で無関係プロセスを kill しない）。
 set -euo pipefail
@@ -197,9 +202,13 @@ done
 workdir=""
 owner_tok=""
 launcher_pid=""
-last_cpid=""
-last_cstart=""
+launcher_start=""
 final_rc=0
+reported="null"
+reported_err=0
+collect_log=0
+# 試行中に観測したコンテナ側プロセスの「pid → 起動時刻」。後始末で全件を同一性照合のうえ回収する。
+declare -A tracked=()
 cleaned=0
 napfd=""
 out_tmp=""
@@ -267,6 +276,9 @@ read_state() {
   return 0
 }
 
+# 追跡対象へ追加（同一 pid は起動時刻を更新。pid 再利用後の古い記録は死んでいるので無害）。
+track_pid() { tracked["$1"]="$2"; }
+
 # 観測が終わった後に jq で state.json を再読込して厳密検証する。id 一致・status=running・観測した新 pid・
 # restartCount == 旧 + 1 のすべてを満たさなければ失敗（ポーリング後に状態が変わった試行は採用しない）。
 validate_state_strict() { # <観測した新 pid> <期待 restartCount>
@@ -281,6 +293,21 @@ build_launch_cmd() {
   local pol="$policy"
   [ "$policy" = "always" ] || pol="on-failure:$((trials + warmup))"
   LAUNCH_CMD=("$launcher" run --id "$container_id" --bundle "$bundle" --restart "$pol" --restart-backoff-ms 0)
+}
+
+# launcher ログから副系列を集計する（launcher 停止後に do_cleanup から呼ぶ。非信頼入力として値域を検証し、
+# 数値のみ採用する）。結果は reported（null または改行区切り数値）・reported_err（失敗した restart 行の有無）。
+collect_reported() {
+  local -a rep=()
+  [ -s "$workdir/err.log" ] || return 0
+  if jq -Rre 'fromjson? | select(type=="object" and .component=="supervisor.monitor" and .operation=="restart" and .result=="error") | "x"' "$workdir/err.log" 2>/dev/null | grep -q x; then
+    reported_err=1
+    return 0
+  fi
+  mapfile -t rep < <(jq -Rre 'fromjson? | select(type=="object" and .component=="supervisor.monitor" and .operation=="restart" and .result=="ok") | .elapsed_us | select(type=="number" and .>=0 and .==floor and .<=3600000000)' "$workdir/err.log" 2>/dev/null || true)
+  if [ "${#rep[@]}" -eq "$total" ]; then
+    reported="$(printf '%s\n' "${rep[@]:$warmup}")"
+  fi
 }
 
 # 回収。終了コード 4（残存）を最優先にするため、戻り値 0 = 回収確認済み。
@@ -316,18 +343,38 @@ do_cleanup() {
       done
     fi
   fi
-  # launcher 停止後に state.json の pid を再読込する。記録済み pid と異なる（launcher が最後に起動した）
-  # コンテナは、session が launcher（setsid の leader）と一致するものだけを同一性確認済みとして回収対象にする。
-  if [ -n "$state_file" ] && [ -n "$launcher_pid" ] && read_state && [ -n "$ST_PID" ] && [ "$ST_PID" != "$last_cpid" ] \
-    && alive "$ST_PID" && proc_info "$ST_PID" && [ "$REPLY_SID" = "$launcher_pid" ]; then
-    last_cpid="$ST_PID"
-    last_cstart="$REPLY_START"
+  # launcher 停止後に state.json の pid を再読込する。追跡済みでない生存 pid（回収中に launcher が最後に
+  # 起動したコンテナ）は、session が launcher（setsid の leader）と一致するか、起動時刻が launcher 以降
+  # （=本計測中に起動された）であるものだけを所有確認済みとして追跡へ加える。確認できない生存 pid は
+  # kill せず後始末失敗（4）とする。
+  if [ -n "$state_file" ] && [ -n "$launcher_pid" ] && read_state && [ -n "$ST_PID" ] \
+    && [ -z "${tracked[$ST_PID]+x}" ] && [ "$ST_PID" != "$$" ] && alive "$ST_PID"; then
+    if proc_info "$ST_PID"; then
+      if [ "$REPLY_SID" = "$launcher_pid" ]; then
+        track_pid "$ST_PID" "$REPLY_START"
+      elif [ -n "$launcher_start" ]; then
+        # launcher より前に起動していた pid は本計測の生成物ではない（偽造 state.json 等）ので触れない。
+        if [ "$REPLY_START" -ge "$launcher_start" ]; then track_pid "$ST_PID" "$REPLY_START"; fi
+      else
+        rc=4 # launcher の起動時刻が不明で所有を確認できない生存 pid
+      fi
+    fi
   fi
-  # 環境変数を継承しないコンテナ側プロセスは、記録した pid・起動時刻の同一性で回収する。
-  if [ -n "$last_cpid" ] && proc_info "$last_cpid" && [ "$REPLY_START" = "$last_cstart" ]; then
-    kill -KILL "$last_cpid" 2>/dev/null || true
+  # launcher 停止後なので restart ログは出尽くしている。副系列はここで集計する（状態更新後にログを出す契約でも欠損にしない）。
+  if [ "$collect_log" -eq 1 ]; then collect_reported; fi
+  # 環境変数を継承しないコンテナ側プロセスは、追跡した全 pid を起動時刻の同一性で回収する。
+  local -a victims=()
+  for p in "${!tracked[@]}"; do
+    if proc_info "$p" && [ "$REPLY_START" = "${tracked[$p]}" ]; then
+      victims+=("$p")
+      kill -KILL "$p" 2>/dev/null || true
+    fi
+  done
+  if [ "${#victims[@]}" -gt 0 ]; then
     nap 0.1
-    if alive "$last_cpid" && proc_info "$last_cpid" && [ "$REPLY_START" = "$last_cstart" ]; then rc=4; fi
+    for p in "${victims[@]}"; do
+      if alive "$p" && proc_info "$p" && [ "$REPLY_START" = "${tracked[$p]}" ]; then rc=4; fi
+    done
   fi
   if [ -n "$launcher_pid" ]; then
     if alive "$launcher_pid"; then rc=4; else wait "$launcher_pid" 2>/dev/null || true; fi
@@ -387,6 +434,7 @@ build_launch_cmd
     >"$workdir/out.log" 2>"$workdir/err.log" </dev/null
 ) &
 launcher_pid=$!
+if proc_info "$launcher_pid"; then launcher_start="$REPLY_START"; fi
 
 deadline_wait() { # <説明> : 条件関数 "$@" が真になるまで --timeout まで待つ
   local what="$1" end
@@ -417,8 +465,7 @@ for ((n = 1; n <= total; n++)); do
   # kill 前の 3 条件: 子孫・起動時刻の記録・直前再照合（無関係プロセスへ送信しない）。
   is_descendant "$old_pid" || fail "pid in state.json is not a descendant of the launcher; refusing to send a signal"
   start1="$REPLY_START"
-  last_cpid="$old_pid"
-  last_cstart="$start1"
+  track_pid "$old_pid" "$start1"
   proc_info "$old_pid" && [ "$REPLY_START" = "$start1" ] || fail "container process changed before the signal"
   up_cs; up0="$REPLY_CS"
   now_us; t0="$REPLY_US"
@@ -441,27 +488,26 @@ for ((n = 1; n <= total; n++)); do
   d_up=$(((up1 - up0) * 10000))
   diff=$((d_wall - d_up))
   [ "${diff#-}" -le 50000 ] || fail "clock changed during trial $n (wall and monotonic clocks disagree)"
-  validate_state_strict "$ST_PID" "$((old_count + 1))" || fail "state.json failed strict validation in trial $n"
   new_pid="$ST_PID"
-  last_cpid="$new_pid"
-  if proc_info "$new_pid"; then last_cstart="$REPLY_START"; else last_cstart=""; fi
+  # 観測時: 新 pid が生存し launcher の子孫であること（SUP-3。state.json だけ残って新プロセスが既に終了した試行は採用しない）。
+  # 計測区間（t1）の外で行うのでレイテンシには含まれない。起動時刻を控えて確定時に再照合する。
+  alive "$new_pid" && is_descendant "$new_pid" || fail "new container process is not alive as a launcher descendant at observation in trial $n"
+  new_start="$REPLY_START"
+  track_pid "$new_pid" "$new_start"
+  validate_state_strict "$new_pid" "$((old_count + 1))" || fail "state.json failed strict validation in trial $n"
+  # 確定時: 同じ新 pid・起動時刻のプロセスがまだ生存していること。
+  alive "$new_pid" && proc_info "$new_pid" && [ "$REPLY_START" = "$new_start" ] || fail "new container process exited before the trial $n result was confirmed"
   [ "$n" -le "$warmup" ] || vals+=("$d_wall")
   nap "$settle_s"
 done
 
-# --- 副系列（launcher ログ。非信頼入力として値域を検証し、数値のみ採用する） ---
-reported='null'
-if [ -s "$workdir/err.log" ]; then
-  if grep -q '' "$workdir/err.log" 2>/dev/null; then
-    if jq -Rre 'fromjson? | select(type=="object" and .component=="supervisor.monitor" and .operation=="restart" and .result=="error") | "x"' "$workdir/err.log" 2>/dev/null | grep -q x; then
-      fail "launcher reported a failed restart"
-    fi
-    mapfile -t rep < <(jq -Rre 'fromjson? | select(type=="object" and .component=="supervisor.monitor" and .operation=="restart" and .result=="ok") | .elapsed_us | select(type=="number" and .>=0 and .==floor and .<=3600000000)' "$workdir/err.log" 2>/dev/null || true)
-    if [ "${#rep[@]}" -eq "$total" ]; then
-      reported="$(printf '%s\n' "${rep[@]:$warmup}")"
-    fi
-  fi
+# --- 副系列は launcher 停止後（do_cleanup 内の collect_reported）に集計する。ここで停止・回収を先に行う ---
+collect_log=1
+if ! do_cleanup; then
+  err "cleanup-failed" "processes may remain after the run; inspect and kill them manually"
+  exit 4
 fi
+[ "$reported_err" -eq 0 ] || fail "launcher reported a failed restart"
 
 # 集計（jq）。中央値は偶数個で中央 2 値の平均、p95 は昇順の ceil(n*95/100)-1 番目。単位は ms（小数 3 桁）。
 stats_filter='
@@ -494,11 +540,7 @@ result="$(jq -n \
       poc17_difference: "PoC-17 measured the next start time minus the previous end time recorded by a self-exiting workload, which is a different interval; do not compare the numbers directly",
       percentile: "nearest-rank ceil(n*95/100)-1 on sorted samples; median averages the two middle values for an even count" } }')"
 
-# 後始末を完了してから結果を公開する（残存があれば 4 で結果を出さない）。
-if ! do_cleanup; then
-  err "cleanup-failed" "processes may remain after the run; inspect and kill them manually"
-  exit 4
-fi
+# 後始末は上で完了済み（残存があれば 4 で結果を出さない）。結果を公開する。
 if [ -n "$output" ]; then
   out_tmp="$(mktemp "${output}.XXXXXX")"
   printf '%s\n' "$result" >"$out_tmp"

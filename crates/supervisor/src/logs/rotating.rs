@@ -15,8 +15,13 @@
 //! - 同じ ID のログは同時に 1 つの sink だけが開ける。[`RotatingFileSink::open`] は `<id>.log.lock` への排他
 //!   ロック（unix は flock、Windows は LockFileEx 相当。sink の生存中保持し、プロセス終了で OS が解放する）を
 //!   取り、取れなければ（別の sink が使用中）既存ログを動かさず `FailedPrecondition` で拒否する。
-//!   ロックファイルは空のまま残す（open が検査で失敗した場合も残る）。消すと排他が崩れるため、sink の
-//!   生存中は消さないこと（コンテナ削除時の掃除は配線側の責務）。
+//!   ロックファイルは空のままで、sink を閉じただけでは残る。消すのは次の 2 経路だけで、どちらもロックを
+//!   取得した状態で行う（SUP-7・TASK-164 追補・#1469）: (1) [`RotatingFileSink::open`] がロック取得後の検査・
+//!   初期化で失敗したとき（元のエラーを返す）、(2) [`RotatingFileSink::remove_all`]（現在ログ・全世代と
+//!   一括。sink 生存中は `FailedPrecondition` で何も消さない）。ロック競合・ロックパスが通常ファイルでない
+//!   ときの失敗では消さない（他の sink のものであるため）。sink の生存中に外から消してはならない。
+//!   消すと排他が崩れ得るため、取得後にパスの実体を再照合し（unix は dev / inode）、Windows は削除共有なしで
+//!   開く。コンテナ削除経路からの呼び出し配線は未実装（REPAIR-3）。
 //! - 1 つの sink は supervisor プロセスにつき 1 回作り、再起動・再捕捉では同じものを使い回す。
 //!   [`RotatingFileSink::open`] は既存の `<id>.log` を開かず世代へ退避してから新規作成するため、
 //!   open するたびに 1 世代を消費する（既存の `<id>.log` が空なら退避せず作り直し、世代を消費しない）。
@@ -63,7 +68,8 @@
 //! - flush ごとの fsync・設定可能な同期ポリシー・タイマーによる定期 flush（短い read を契機とする flush で代替）。
 //!   [`RotatingFileSink::sync`] をコンテナ終了時などに呼ぶ配線も未実装（配線側の責務）。
 //! - 両ストリーム混在での大規模検証（stdout 単独の 100 万行検証は `tests/log_rotation.rs`〔TASK-164.4・#508〕で実装済み）。
-//! - `logs` コマンドからの読み出し経路。open 後に差し替えられた世代が symlink の可能性は残るため、
+//! - `logs` コマンドからの読み出し経路（ログ名の列挙 [`log_file_paths`] は実装済みでロックファイルを含めない。
+//!   内容の読み出し・CLI 配線は未実装）。open 後に差し替えられた世代が symlink の可能性は残るため、
 //!   読み出し側は symlink を辿らず開くこと。
 //! - 親ディレクトリ経路の検証後の差し替え（TOCTOU）は完全には防げない（dirfd 基準の固定には core の安全 open の公開が必要）。
 //!   所有者（uid）の照合もしない。Windows では権限（ACL）を検査しない。
@@ -71,12 +77,15 @@
 //!   による別名は検出しない。
 //! - Windows では、他プロセスが世代ファイルを削除共有なしで開いていると rename が失敗し、sink は失敗状態に
 //!   固定される（再試行しない）。読み出し側は削除共有つきで開くこと。
+//! - Windows のロックファイル削除は、自分のハンドルを閉じてから消すため、その間に別の sink が開くと
+//!   削除が失敗してロックファイルが残る（排他は保たれる）。
 //! - `dir`（状態ルート配下のどこか）の決定は配線側の責務で、本モジュールは決めない。
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
+use std::time::Instant;
 
 use fandhe_container_core::traits::{ContainerId, ErrorCode, TraitError};
 
@@ -177,7 +186,9 @@ struct Inner {
 /// ファイルへ追記し、上限超過の前に世代を送る [`LogSink`]。
 pub struct RotatingFileSink {
     /// 同一 ID の同時使用を排他するロックファイル（生存中保持。ドロップで解放。SUP-7）。
-    _lock: File,
+    /// `Option` なのは、`open` が取得後の検査で失敗したときに取り出してロックファイルを消すため
+    /// （TASK-164 追補・#1469）。`open` が成功して返した sink では常に `Some`。
+    lock: Option<File>,
     dir: PathBuf,
     base: String,
     config: RotationConfig,
@@ -261,8 +272,8 @@ impl RotatingFileSink {
         // 他の sink が同じ ID のログを使用中なら、何も動かさずに拒否する（先に開いた sink が
         // 退避済み世代へ書き続け、世代のサイズ上限・順序が崩れるのを防ぐ。SUP-7）。
         let lock = acquire_lock(&dir, &base)?;
-        let sink = Self {
-            _lock: lock,
+        let mut sink = Self {
+            lock: Some(lock),
             dir,
             base,
             config,
@@ -271,26 +282,99 @@ impl RotatingFileSink {
                 rotations: 0,
             }),
         };
+        // ロック取得後の検査・初期化に失敗したら、ロックファイルを残さず元のエラーを返す
+        // （排他ロック保持中なので消しても他の sink と競合しない。掃除の失敗は握って元のエラーを優先する。
+        // SUP-7・TASK-164 追補・#1469）。
+        if let Err(e) = sink.initialize() {
+            if let Some(lock) = sink.lock.take() {
+                let _ = remove_lock_file(lock, &lock_path(&sink.dir, &sink.base), &sink.dir);
+            }
+            return Err(e);
+        }
+        Ok(sink)
+    }
+
+    /// ロック取得後の本体: 名前空間・既存ファイルの検査 → 現在ログの退避 → 新しい現在ログの作成。
+    fn initialize(&self) -> Result<(), TraitError> {
         // 名前空間のエントリを 1 つでも受理できなければ、何も動かさずに拒否する（契約: 全ファイルが
         // 通常ファイルで len <= max_file_bytes、総数は generations 以内）。手動で整理させる。
-        sink.check_namespace()?;
-        sink.check_existing_files()?;
+        self.check_namespace()?;
+        self.check_existing_files()?;
         // 既存の現在ログは開かず、世代へ送ってから作り直す。空なら世代を消費せず消すだけにする
         // （出力の無い再起動が続いても、保持している世代を押し出さない）。
-        match fs::symlink_metadata(sink.path(0)) {
+        match fs::symlink_metadata(self.path(0)) {
             Ok(m) if m.len() == 0 => {
-                fs::remove_file(sink.path(0)).map_err(|_| internal("log rotation failed"))?;
+                fs::remove_file(self.path(0)).map_err(|_| internal("log rotation failed"))?;
             }
-            Ok(_) => sink.shift_generations()?,
+            Ok(_) => self.shift_generations()?,
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(_) => return Err(internal("log file inspection failed")),
         }
-        let file = sink.create_active()?;
-        sink.lock()?.state = State::Active {
+        let file = self.create_active()?;
+        self.lock()?.state = State::Active {
             writer: BufWriter::with_capacity(WRITE_BUFFER_BYTES, file),
             size: 0,
         };
-        Ok(sink)
+        Ok(())
+    }
+
+    /// コンテナ削除時に、この ID の現在ログ・全世代・ロックファイルをまとめて消す
+    /// （SUP-7・TASK-164 追補・#1469。コンテナ削除経路の配線は未実装〔REPAIR-3〕。配線側が呼ぶ）。
+    ///
+    /// 同じ ID の sink が生存中なら、ロックを取れず `FailedPrecondition` で拒否し、何も消さない。
+    /// `RotationConfig` は受け取らず、設定世代数を超える番号の世代も消す。名前空間に受理できない
+    /// 別名・不正な世代番号・ディレクトリがあれば `InvalidArgument` で拒否し、ログを 1 つも消さない
+    /// （利用者のデータを黙って消さない）。削除は `remove_file` のみで symlink は辿らずリンク自体を消す。
+    /// 何も無い状態で呼んでも成功する（冪等）。ロックファイルは、成功・失敗を問わずロック取得後は消す。
+    ///
+    /// 全結果（成功・ロック競合・入力拒否・途中削除失敗・ロックファイル掃除失敗）で、成否・エラー code・
+    /// 削除数・所要時間を構造化 1 行（JSON）で stderr へ出す（REPAIR-4。パス・errno は含めない。ERR-1）。
+    pub fn remove_all(dir: &Path, id: &ContainerId) -> Result<RemovedLogs, TraitError> {
+        let started = Instant::now();
+        let (removed, result) = Self::remove_all_inner(dir, id);
+        let (outcome, code) = match &result {
+            Ok(_) => ("ok", ""),
+            Err(e) => ("error", e.code().as_str()),
+        };
+        // eprintln! は stderr 書き込み失敗で panic するため、結果を無視する writeln! で出す（panic しない）。
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "{{\"component\":\"supervisor.logs\",\"operation\":\"remove_all\",\"result\":\"{}\",\"code\":\"{}\",\"removed_log_files\":{},\"elapsed_us\":{}}}",
+            outcome,
+            code,
+            removed,
+            started.elapsed().as_micros()
+        );
+        result
+    }
+
+    /// [`Self::remove_all`] の本体。実際に消せた数と結果を別々に返す（失敗時も削除数を観測に出すため）。
+    fn remove_all_inner(dir: &Path, id: &ContainerId) -> (u32, Result<RemovedLogs, TraitError>) {
+        let dir = match check_dir(dir) {
+            Ok(d) => d,
+            Err(e) => return (0, Err(e)),
+        };
+        let base = format!("{}.log", encode_file_stem(id.as_str()));
+        if base.len().saturating_add(LOCK_SUFFIX.len()) > MAX_FILE_NAME_BYTES {
+            return (
+                0,
+                Err(invalid("container id is too long for log file names")),
+            );
+        }
+        let lock = match acquire_lock(&dir, &base) {
+            Ok(l) => l,
+            Err(e) => return (0, Err(e)),
+        };
+        let (removed, log_result) = remove_log_files(&dir, &base);
+        let lock_removed = remove_lock_file(lock, &lock_path(&dir, &base), &dir);
+        // ログ削除側の失敗を優先して返す。
+        if let Err(e) = log_result {
+            return (removed, Err(e));
+        }
+        if lock_removed.is_err() {
+            return (removed, Err(internal("log lock removal failed")));
+        }
+        (removed, Ok(RemovedLogs { log_files: removed }))
     }
 
     /// これまでのローテーション回数（観測用。REPAIR-4）。open 時の退避は数えない。
@@ -403,50 +487,12 @@ impl RotatingFileSink {
     /// 変更する前に `InvalidArgument` で拒否する（利用者のログを黙って消さない。SUP-7・TASK-164.2）。
     /// 種別とサイズは [`Self::check_existing_files`] が見る。
     fn check_namespace(&self) -> Result<(), TraitError> {
-        let unexpected = || invalid("unexpected entry exists in the log file namespace");
-        let lock_name = format!("{}{LOCK_SUFFIX}", self.base);
-        let prefix = format!("{}.", self.base);
-        let rd = fs::read_dir(&self.dir).map_err(|_| internal("log directory scan failed"))?;
-        // 番号の上限では打ち切らず、ディレクトリを列挙して対象 ID の名前を全て検査する。
-        // 走査件数には上限を設け（超過は fail-closed）、確保はエントリ単位の一時値のみに留める。
-        let mut scanned = 0usize;
-        for entry in rd {
-            scanned = scanned.saturating_add(1);
-            if scanned > MAX_SCAN_ENTRIES {
-                return Err(invalid("log directory has too many entries to verify"));
-            }
-            let entry = entry.map_err(|_| internal("log directory scan failed"))?;
-            let name = entry.file_name();
-            // sink の名前は ASCII のみ。UTF-8 でない名前は名前空間に入らない。
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            let lower = name.to_ascii_lowercase();
-            if lower == self.base || lower == lock_name {
-                if name != lower {
-                    return Err(unexpected());
-                }
-                continue;
-            }
-            let Some(num) = lower.strip_prefix(prefix.as_str()) else {
-                continue;
-            };
-            if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
-                continue;
-            }
-            // ここからは世代番号の名前空間。正規形（先頭 0 なし）で 1..generations の範囲だけを受理する。
-            // 桁あふれは範囲外として扱う。
-            let in_range = num
-                .parse::<u64>()
-                .is_ok_and(|n| n >= 1 && n < u64::from(self.config.generations));
-            if name != lower || num.starts_with('0') || !in_range {
-                return Err(TraitError::new(
-                    ErrorCode::InvalidArgument,
-                    "stale or malformed log generation exists outside the configured generations",
-                ));
-            }
-        }
-        Ok(())
+        let generations = u64::from(self.config.generations);
+        for_each_entry(&self.dir, &self.base, |_, class| match class {
+            NameClass::Rejected(msg) => Err(invalid(msg)),
+            NameClass::Generation(n) if n >= generations => Err(invalid(MSG_BAD_GENERATION)),
+            _ => Ok(()),
+        })
     }
 
     fn create_active(&self) -> Result<File, TraitError> {
@@ -477,13 +523,18 @@ const LOCK_SUFFIX: &str = ".lock";
 /// 無いため、開いた実体が検査したものと同じ通常ファイルであることを開いた後にも確かめる
 /// （検査と open の間の差し替え対策。unix は dev / inode も照合する）。
 fn acquire_lock(dir: &Path, base: &str) -> Result<File, TraitError> {
-    let path = dir.join(format!("{base}{LOCK_SUFFIX}"));
+    let path = lock_path(dir, base);
     let mut create = OpenOptions::new();
     create.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         create.mode(0o600);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        create.share_mode(WINDOWS_SHARE_NO_DELETE);
     }
     let file = match create.open(&path) {
         Ok(f) => f,
@@ -496,8 +547,14 @@ fn acquire_lock(dir: &Path, base: &str) -> Result<File, TraitError> {
                 Ok(_) => return Err(not_regular()),
                 Err(_) => return Err(internal("log lock create failed")),
             };
-            let file = OpenOptions::new()
-                .read(true)
+            let mut open = OpenOptions::new();
+            open.read(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                open.share_mode(WINDOWS_SHARE_NO_DELETE);
+            }
+            let file = open
                 .open(&path)
                 .map_err(|_| internal("log lock open failed"))?;
             let after = file
@@ -519,13 +576,250 @@ fn acquire_lock(dir: &Path, base: &str) -> Result<File, TraitError> {
         }
     };
     match file.try_lock() {
-        Ok(()) => Ok(file),
+        Ok(()) => {
+            // ロックを取れた実体が、いまのパスの実体と同じであることを確かめる（unix）。別の掃除が
+            // 取得の前後でロックファイルを消し、別の sink が作り直していた場合、孤立した inode の
+            // ロックを持っても排他にならない（TASK-164 追補・#1469）。
+            verify_lock_is_current(&file, &path)?;
+            Ok(file)
+        }
         Err(std::fs::TryLockError::WouldBlock) => Err(TraitError::new(
             ErrorCode::FailedPrecondition,
             "log is in use by another sink",
         )),
         Err(std::fs::TryLockError::Error(_)) => Err(internal("log lock failed")),
     }
+}
+
+/// Windows でロックファイルを開くときの共有モード（`FILE_SHARE_READ | FILE_SHARE_WRITE`）。
+/// `FILE_SHARE_DELETE` を含めないので、誰かが開いている間は他者による削除が共有違反で失敗する
+/// （TASK-164 追補・#1469。Windows には stable std で使える dev / inode 照合が無いための代替）。
+#[cfg(windows)]
+const WINDOWS_SHARE_NO_DELETE: u32 = 0x1 | 0x2;
+
+/// ロックファイルのパス（`<dir>/<base>.lock`）。
+fn lock_path(dir: &Path, base: &str) -> PathBuf {
+    dir.join(format!("{base}{LOCK_SUFFIX}"))
+}
+
+/// 保持中のロックの実体が `path` の現在の実体と同じ通常ファイルか確認する（unix は dev / inode）。
+/// 違えば、取得中に並行する掃除・open と競合したとみなし、再試行せず `FailedPrecondition` で拒否する。
+#[cfg(unix)]
+fn verify_lock_is_current(file: &File, path: &Path) -> Result<(), TraitError> {
+    use std::os::unix::fs::MetadataExt;
+    let busy = || {
+        TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "log is in use by another sink",
+        )
+    };
+    let held = file
+        .metadata()
+        .map_err(|_| internal("log lock open failed"))?;
+    match fs::symlink_metadata(path) {
+        Ok(now)
+            if now.file_type().is_file() && now.dev() == held.dev() && now.ino() == held.ino() =>
+        {
+            Ok(())
+        }
+        _ => Err(busy()),
+    }
+}
+
+#[cfg(not(unix))]
+fn verify_lock_is_current(_file: &File, _path: &Path) -> Result<(), TraitError> {
+    Ok(())
+}
+
+/// 保持中のロックファイルを消して解放する（`NotFound` は成功扱い）。
+///
+/// unix は排他ロックを保持したまま unlink する（削除する側は全員ロック保持者なので、取得時の同一性照合
+/// と合わせ、孤立 inode への二重ロックを防ぐ）。その後ディレクトリを fsync してから解放する。
+/// 他 OS は自分のハンドルが削除を拒むため、閉じてから消す。閉じてから消すまでの間に別の sink が
+/// 開いた場合、削除は共有違反で失敗するだけで、その sink の排他は保たれる（ロックファイルが残る）。
+fn remove_lock_file(lock: File, path: &Path, dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let res = match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        };
+        let res = res.and_then(|()| sync_dir(dir).map_err(|_| std::io::Error::other("fsync")));
+        drop(lock);
+        res
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        drop(lock);
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// 収集・削除する対象ファイル数の上限（無制限確保の防止。超過は fail-closed で `InvalidArgument`）。
+const MAX_LOG_ENTRIES: usize = 1024;
+
+const MSG_ALIAS: &str = "unexpected entry exists in the log file namespace";
+const MSG_BAD_GENERATION: &str =
+    "stale or malformed log generation exists outside the configured generations";
+
+/// `dir` 内の名前の、ある ID（`base`）の名前空間における分類。
+/// `open`・[`RotatingFileSink::remove_all`]・[`log_file_paths`] が同じ判定を使う（二重管理の防止）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NameClass {
+    /// 名前空間の外（他 ID・無関係なファイル）。
+    Other,
+    /// 現在ログ `<base>`。
+    Current,
+    /// ロックファイル `<base>.lock`。ログではない。
+    Lock,
+    /// 世代 `<base>.<n>`（先頭 0 なしの `n >= 1`。上限は呼び出し側が見る）。
+    Generation(u64),
+    /// 名前空間内だが受理できない名前（別名・世代 0・先頭 0 つき・桁あふれ）。メッセージは英語固定。
+    Rejected(&'static str),
+}
+
+fn classify_name(base: &str, name: &str) -> NameClass {
+    let lower = name.to_ascii_lowercase();
+    let is_lock = lower.strip_prefix(base) == Some(LOCK_SUFFIX);
+    if lower == base || is_lock {
+        if name != lower {
+            return NameClass::Rejected(MSG_ALIAS);
+        }
+        return if is_lock {
+            NameClass::Lock
+        } else {
+            NameClass::Current
+        };
+    }
+    let Some(num) = lower.strip_prefix(base).and_then(|r| r.strip_prefix('.')) else {
+        return NameClass::Other;
+    };
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return NameClass::Other;
+    }
+    match num.parse::<u64>() {
+        Ok(n) if n >= 1 && name == lower && !num.starts_with('0') => NameClass::Generation(n),
+        _ => NameClass::Rejected(MSG_BAD_GENERATION),
+    }
+}
+
+/// `dir` を [`MAX_SCAN_ENTRIES`] 件を上限に列挙し、名前空間内のエントリ（`Other` 以外）ごとに `f` を呼ぶ。
+/// UTF-8 でない名前は名前空間に入らない（sink の名前は ASCII のみ）。
+fn for_each_entry(
+    dir: &Path,
+    base: &str,
+    mut f: impl FnMut(&str, NameClass) -> Result<(), TraitError>,
+) -> Result<(), TraitError> {
+    let rd = fs::read_dir(dir).map_err(|_| internal("log directory scan failed"))?;
+    let mut scanned = 0usize;
+    for entry in rd {
+        scanned = scanned.saturating_add(1);
+        if scanned > MAX_SCAN_ENTRIES {
+            return Err(invalid("log directory has too many entries to verify"));
+        }
+        let entry = entry.map_err(|_| internal("log directory scan failed"))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        match classify_name(base, name) {
+            NameClass::Other => {}
+            class => f(name, class)?,
+        }
+    }
+    Ok(())
+}
+
+/// ログ（現在ログ・世代）の名前を集める。受理できない名前・ディレクトリ（`require_regular` なら通常
+/// ファイル以外）があれば `InvalidArgument`。返すのは（世代番号、名前）で、現在ログは番号 0。
+/// 古い順（番号の大きい順）に並べる。
+fn collect_log_names(
+    dir: &Path,
+    base: &str,
+    require_regular: bool,
+) -> Result<Vec<(u64, String)>, TraitError> {
+    let mut out: Vec<(u64, String)> = Vec::new();
+    for_each_entry(dir, base, |name, class| {
+        let n = match class {
+            NameClass::Rejected(msg) => return Err(invalid(msg)),
+            NameClass::Current => 0,
+            NameClass::Generation(n) => n,
+            NameClass::Lock | NameClass::Other => return Ok(()),
+        };
+        // 列挙後に並行ローテーションの rename で消えたエントリは、正常動作なので除外する（SUP-7）。
+        // それ以外の検査エラーは維持する。
+        let meta = match fs::symlink_metadata(dir.join(name)) {
+            Ok(m) => m,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(internal("log file inspection failed")),
+        };
+        let ft = meta.file_type();
+        if ft.is_dir() || (require_regular && !ft.is_file()) {
+            return Err(invalid("existing log path is not a regular file"));
+        }
+        if out.len() >= MAX_LOG_ENTRIES {
+            return Err(invalid("too many log files"));
+        }
+        out.push((n, name.to_owned()));
+        Ok(())
+    })?;
+    out.sort_by_key(|b| std::cmp::Reverse(b.0));
+    Ok(out)
+}
+
+/// [`RotatingFileSink::remove_all`] の削除結果（将来の拡張に備えた構造体）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemovedLogs {
+    log_files: u32,
+}
+
+impl RemovedLogs {
+    /// 消した現在ログ + 世代ファイルの数（ロックファイルは含まない）。
+    pub fn log_files(&self) -> u32 {
+        self.log_files
+    }
+}
+
+/// ロック保持中に、検証してから現在ログ・世代を消す。検証で拒否したときは 1 つも消さない。
+///
+/// 実際に消せた数と結果を別々に返す（途中で失敗しても削除済みの数を観測に出すため）。
+fn remove_log_files(dir: &Path, base: &str) -> (u32, Result<(), TraitError>) {
+    // symlink は辿らずリンク自体を消すので検証では許容する（ディレクトリだけ拒否）。
+    let names = match collect_log_names(dir, base, false) {
+        Ok(n) => n,
+        Err(e) => return (0, Err(e)),
+    };
+    let mut removed = 0u32;
+    for (_, name) in &names {
+        match fs::remove_file(dir.join(name)) {
+            Ok(()) => removed = removed.saturating_add(1),
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(_) => return (removed, Err(internal("log removal failed"))),
+        }
+    }
+    if removed > 0 && sync_dir(dir).is_err() {
+        return (removed, Err(internal("log removal failed")));
+    }
+    (removed, Ok(()))
+}
+
+/// この ID のログファイルのパスを古い順（世代番号の大きい順 → 現在ログ）に列挙する。
+/// ロックファイル・他 ID・無関係なファイルは含めない（`logs` 読み出し側が使う契約。SUP-7・TASK-164 追補・#1469）。
+///
+/// ロックは取らない（sink の生存中も呼べる）。ローテーションと並行すると、列挙後に世代の名前がずれ得る
+/// （読み出し側の責務。REPAIR-3: 内容の読み出し・`logs` コマンドへの配線は未実装）。名前空間に受理できない名前・
+/// ディレクトリ・symlink があれば `InvalidArgument`（読み出し側が symlink を辿らない入口）。
+pub fn log_file_paths(dir: &Path, id: &ContainerId) -> Result<Vec<PathBuf>, TraitError> {
+    let dir = check_dir(dir)?;
+    let base = format!("{}.log", encode_file_stem(id.as_str()));
+    let names = collect_log_names(&dir, &base, true)?;
+    Ok(names.into_iter().map(|(_, n)| dir.join(n)).collect())
 }
 
 /// `dir` が実在するディレクトリで、経路上に（信頼できない）symlink を含まず、（unix では）他者書き込み不可で

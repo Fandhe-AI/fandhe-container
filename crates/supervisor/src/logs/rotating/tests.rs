@@ -1120,20 +1120,19 @@ fn sup7_task164_open_for_read_rejects_fifo_without_blocking() {
     assert!(!f.metadata().unwrap().file_type().is_file());
 }
 
-/// SUP-7: ロックファイルを作れない（書き込み不可ディレクトリ）ときは `NotFound` でなく `Internal`。
-#[cfg(unix)]
+/// SUP-7: ロックファイルを作れない（親ディレクトリが存在しない）ときは `NotFound` でなく `Internal`。
+///
+/// 権限に依存しない失敗注入（root・Windows でも成立する）。`create_new` が失敗し、フォールバックの
+/// 既存オープンも `NotFound` になる経路が `Internal` へ正規化されることを具体値で照合する。
 #[test]
 fn sup7_task164_acquire_lock_create_failure_is_internal() {
-    use std::os::unix::fs::PermissionsExt;
-    let t = TmpDir::new("lock-ro");
-    fs::set_permissions(&t.0, fs::Permissions::from_mode(0o500)).unwrap();
-    let probe = fs::File::create(t.0.join("probe"));
-    let result = acquire_lock(&t.0, "c1.log");
-    fs::set_permissions(&t.0, fs::Permissions::from_mode(0o700)).unwrap();
-    if probe.is_ok() {
-        return; // root 等で権限が効かない環境では検証できない
-    }
-    assert_eq!(result.err().unwrap().code(), ErrorCode::Internal);
+    let t = TmpDir::new("lock-nodir");
+    let missing = t.0.join("no-such-dir");
+    assert!(!missing.exists());
+    let err = acquire_lock(&missing, "c1.log").err().unwrap();
+    assert_eq!(err.code(), ErrorCode::Internal);
+    // 作成失敗でロックファイルが生えていない。
+    assert!(!missing.exists());
 }
 
 /// SUP-7: 既存のロックファイルは再利用され、ディレクトリは `InvalidArgument`。

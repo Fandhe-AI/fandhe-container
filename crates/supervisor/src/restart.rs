@@ -432,6 +432,45 @@ impl Drop for WorkerGuard {
     }
 }
 
+/// 実行スレッドの生成関数（名前と本体を受け取る）。本番は [`spawn_os_thread`] で、テストは失敗する関数を渡す。
+type SpawnFn = fn(&str, Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()>;
+
+/// OS スレッドを生成する（[`SpawnFn`] の本番実装。join はせず、終了は [`LateOrphans`] の実行スレッド数で追う）。
+fn spawn_os_thread(name: &str, run: Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(run)
+        .map(drop)
+}
+
+/// `late` の実行スレッド数に数えたスレッドを起動する（REPAIR-5）。
+///
+/// [`terminate_bounded`]・[`relaunch_bounded`] の実行スレッドはここからだけ起動する。数の増減を 1 か所で対にする:
+/// 起動前に 1 増やし（起動直後に [`LateOrphans::is_settled`] が 0 を観測しないため）、`body` の終了時
+/// （panic を含む）にスレッド上のガードで 1 減らす。スレッドを生成できなかった場合はここで 1 減らしてから
+/// `Err` を返すので、起動失敗で `late` が未完了のまま残ることはない。ガードはスレッドの中で作るため、
+/// 未実行の `body` が破棄されても数は動かない（二重に減らさない）。
+fn spawn_tracked(
+    spawn: SpawnFn,
+    name: &str,
+    late: &LateOrphans,
+    body: impl FnOnce() + Send + 'static,
+) -> std::io::Result<()> {
+    late.worker_started();
+    let worker_late = late.clone();
+    let spawned = spawn(
+        name,
+        Box::new(move || {
+            let _guard = WorkerGuard(worker_late);
+            body();
+        }),
+    );
+    if spawned.is_err() {
+        late.worker_finished();
+    }
+    spawned
+}
+
 impl fmt::Debug for LateOrphans {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let g = self.lock();
@@ -612,33 +651,29 @@ fn terminate_bounded(
     process: Box<dyn LaunchedProcess>,
     timeout: Duration,
     late: &LateOrphans,
+    spawn: SpawnFn,
 ) -> Result<(), TraitError> {
     let cell = Arc::new(Mutex::new(Some(process)));
     let result: Arc<TerminateSlot> = Arc::new((Mutex::new(None), Condvar::new()));
     let (worker_cell, worker_result, worker_late) =
         (Arc::clone(&cell), Arc::clone(&result), late.clone());
-    late.worker_started();
-    let guard = WorkerGuard(late.clone());
-    let spawned = std::thread::Builder::new()
-        .name("fandhe-terminate".to_owned())
-        .spawn(move || {
-            // 全経路で終了を通知する。`Err` のハンドルの push は通知より先に行う。
-            let _guard = guard;
-            let taken = worker_cell
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take();
-            let Some(proc) = taken else {
-                return;
-            };
-            let r = proc.terminate(timeout);
-            if let Err(e) = &r {
-                worker_late.push(proc, e.clone());
-            }
-            let (lock, cvar) = &*worker_result;
-            *lock.lock().unwrap_or_else(PoisonError::into_inner) = Some(r);
-            cvar.notify_all();
-        });
+    // `Err` のハンドルの push は、実行スレッド終了の通知（[`spawn_tracked`] のガード）より先に行う。
+    let spawned = spawn_tracked(spawn, "fandhe-terminate", late, move || {
+        let taken = worker_cell
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let Some(proc) = taken else {
+            return;
+        };
+        let r = proc.terminate(timeout);
+        if let Err(e) = &r {
+            worker_late.push(proc, e.clone());
+        }
+        let (lock, cvar) = &*worker_result;
+        *lock.lock().unwrap_or_else(PoisonError::into_inner) = Some(r);
+        cvar.notify_all();
+    });
     if spawned.is_err() {
         let left = cell.lock().unwrap_or_else(PoisonError::into_inner).take();
         let error = TraitError::new(ErrorCode::Unavailable, "failed to spawn terminate thread");
@@ -683,34 +718,30 @@ fn relaunch_bounded(
     timeout: Duration,
     terminate_timeout: Duration,
     late: &LateOrphans,
+    spawn: SpawnFn,
 ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
     let shared = Arc::new((Mutex::new(Slot::Pending), Condvar::new()));
     let worker = Arc::clone(&shared);
     let r = Arc::clone(relauncher);
-    let late = late.clone();
-    late.worker_started();
-    let guard = WorkerGuard(late.clone());
-    std::thread::Builder::new()
-        .name("fandhe-relaunch".to_owned())
-        .spawn(move || {
-            // 全経路（panic を含む）で終了を通知する。terminate 失敗の push は通知より先に行う。
-            let _guard = guard;
-            let value = r.relaunch(timeout);
-            let (lock, cvar) = &*worker;
-            let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
-            if matches!(*slot, Slot::Abandoned) {
-                drop(slot);
-                if let Ok(proc) = value {
-                    // 期限後に戻った生存プロセスを残さない（記録も回収手段も無いため）。
-                    // terminate にも呼び出し境界で上限を強制する。失敗・超過したハンドルは `late` に積まれる。
-                    let _ = terminate_bounded(proc, terminate_timeout, &late);
-                }
-                return;
+    // terminate 失敗の push は、実行スレッド終了の通知（[`spawn_tracked`] のガード。panic を含む）より先に行う。
+    let worker_late = late.clone();
+    spawn_tracked(spawn, "fandhe-relaunch", late, move || {
+        let value = r.relaunch(timeout);
+        let (lock, cvar) = &*worker;
+        let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        if matches!(*slot, Slot::Abandoned) {
+            drop(slot);
+            if let Ok(proc) = value {
+                // 期限後に戻った生存プロセスを残さない（記録も回収手段も無いため）。
+                // terminate にも呼び出し境界で上限を強制する。失敗・超過したハンドルは `late` に積まれる。
+                let _ = terminate_bounded(proc, terminate_timeout, &worker_late, spawn);
             }
-            *slot = Slot::Done(value);
-            cvar.notify_all();
-        })
-        .map_err(|_| TraitError::new(ErrorCode::Unavailable, "failed to spawn relaunch thread"))?;
+            return;
+        }
+        *slot = Slot::Done(value);
+        cvar.notify_all();
+    })
+    .map_err(|_| TraitError::new(ErrorCode::Unavailable, "failed to spawn relaunch thread"))?;
     let deadline = Instant::now().checked_add(timeout.saturating_add(RELAUNCH_REPLY_GRACE));
     let (lock, cvar) = &*shared;
     let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -849,6 +880,7 @@ pub fn supervise_with_restart(
             restart_config.relaunch_timeout,
             restart_config.terminate_timeout,
             &late,
+            spawn_os_thread,
         ) {
             Ok(p) => p,
             Err(error) => {
@@ -864,7 +896,12 @@ pub fn supervise_with_restart(
         // 再 launch 中に停止要求が来ていたら、Running を記録せず新プロセスを終了・回収する（SUP-3）。
         if stop.is_stop_requested() {
             // 上限を呼び出し境界で強制する。終了未確認のハンドルは `cleanup_late` に積まれる（REPAIR-5）。
-            let _ = terminate_bounded(new_process, restart_config.terminate_timeout, &cleanup_late);
+            let _ = terminate_bounded(
+                new_process,
+                restart_config.terminate_timeout,
+                &cleanup_late,
+                spawn_os_thread,
+            );
             return Ok(SuperviseOutcome::Stopped {
                 last,
                 process: None,
@@ -906,9 +943,13 @@ pub fn supervise_with_restart(
                 observe(Some(error.code()));
                 // 記録できない生存プロセスを残さない（core `start` の後始末と同じ方針）。
                 // 上限を呼び出し境界で強制し、終了未確認のハンドルは `cleanup_late` から回収できる（REPAIR-5）。
-                let terminate_error =
-                    terminate_bounded(new_process, restart_config.terminate_timeout, &cleanup_late)
-                        .err();
+                let terminate_error = terminate_bounded(
+                    new_process,
+                    restart_config.terminate_timeout,
+                    &cleanup_late,
+                    spawn_os_thread,
+                )
+                .err();
                 return Ok(SuperviseOutcome::RestartUnrecorded {
                     error,
                     terminate_error,

@@ -128,6 +128,10 @@ impl TmpfsOption {
                         if std::mem::replace(&mut mode_seen, true) {
                             return Err(invalid("duplicate tmpfs option: mode"));
                         }
+                        // `from_str_radix` は先頭の `+` を受理するため、8 進数字だけに限ってから解釈する。
+                        if v.is_empty() || !v.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+                            return Err(invalid("tmpfs mode must be an octal number"));
+                        }
                         let bits = u32::from_str_radix(v, 8)
                             .map_err(|_| invalid("tmpfs mode must be an octal number"))?;
                         spec.mode = TmpfsMode::new(bits)?;
@@ -270,6 +274,8 @@ mod tests {
             "/x:size=1m,size=2m",
             "/x:mode=1777,mode=755",
             "/x:mode=9",
+            "/x:mode=+777",
+            "/x:mode=",
             "/x:mode=17777",
             "/x:size=0",
             "/x:size=50%",

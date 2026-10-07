@@ -15,6 +15,7 @@
 # TASK-169.5.1（#855）で container_options::labels（label の指定モデル。state.json の annotations へ反映）を追加した（依存は不変）。
 # TASK-171.1.2（#858）で privilege（権限昇格の必要最小集合と検証。純ロジック・unsafe なし）を追加した（依存は不変）。
 # TASK-163.3（#502）で exec に seccomp / Landlock 再適用の配線を追加した（core の安全 API を呼ぶだけ。依存は不変）。
+# TASK-163.4（#503）で exec にコマンド実行（run_command）と実コンテナへの通し結合試験 tests/exec.rs を追加した（依存は不変）。
 # 外部クレート（crates.io）の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 
 [package]
@@ -50,4 +51,13 @@ exec-test-support = ["fandhe-container-core/exec-test-support"]
 [[test]]
 name = "exec_setns_join"
 path = "tests/exec_setns_join.rs"
+harness = false
+
+# 稼働中コンテナへのコマンド実行の通し結合試験（TASK-163.4・#503・SUP-6）。setns は複数スレッドのプロセスから
+# 拒否されるため、単一スレッドの独自 main（harness = false）で動かす。root・委譲 cgroup v2・Landlock・x86_64 を要する
+# 実機前提テストで、`-- --ignored` 指定時のみ実行する（AGENTS.md）。本体は exec-test-support feature を付けたときだけ
+# コンパイルする（exec_setns_join と同じ理由で required-features にしない）。
+[[test]]
+name = "exec"
+path = "tests/exec.rs"
 harness = false

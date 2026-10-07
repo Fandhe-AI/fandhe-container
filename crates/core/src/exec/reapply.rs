@@ -1,12 +1,14 @@
-//! exec プロセスへの seccomp / Landlock 再適用（SUP-6・TASK-163.3・#502・CORE-5・MS-9）。
+//! exec プロセスへの制限の再適用（rlimit・capability 削減・`NO_NEW_PRIVS`・Landlock・seccomp。
+//! SUP-6・TASK-163.3・TASK-163.4・#502・#503・CORE-5・MS-9）。
 //!
 //! # 役割と呼び出し文脈
 //!
-//! SUP-6 の exec は「pid1 の namespace へ `setns` → cgroup join → seccomp / Landlock 再適用 → コマンド実行」。
+//! SUP-6 の exec は「pid1 の namespace へ `setns` → cgroup join → 制限の再適用 → コマンド実行」。
 //! `setns` と cgroup join だけを済ませたプロセスは、コンテナ本体（launch 経路のステージ列
-//! `NoNewPrivs → Landlock → Seccomp`。`exec/stages.rs`）より弱い制限で動いてしまう。本モジュールは
-//! 3 段目の再適用を担い、`fandhe-container-supervisor` の `exec`（`prepare_restrictions` /
-//! `reapply_restrictions`）が薄く配線する。#503（TASK-163.4）の exec 専用プロセスが呼ぶ想定。
+//! `Rlimits → CapabilityDrop → NoNewPrivs → Landlock → Seccomp`。`exec/stages.rs`）より弱い制限で動いてしまう。
+//! 本モジュールは 3 段目の再適用を担い、`fandhe-container-supervisor` の `exec`（`prepare_restrictions` /
+//! `reapply_restrictions` / `run_command`）が薄く配線する。結果から作る [`ExecReady`] が、`exec/exec_command.rs` の
+//! `spawn_exec_command`（fork → `close_range` → execve）の唯一の入口になる。
 //!
 //! # 契約
 //!
@@ -14,15 +16,30 @@
 //!   [`prepare_exec_restrictions`] は **`join_namespaces` の前**、[`reapply_restrictions`] は
 //!   `join_namespaces` と `join_cgroup` の **後** に呼ぶ。seccomp の既定フィルタは `setns` を拒否するため、
 //!   再適用を `setns` の前に置くと namespace 参加が失敗する（cgroup join を seccomp の前に置く既存の順序と一致）。
-//!   [`reapply_restrictions`] の内部は「準備したプロセスの確認 → 参加後の `/` の照合 → 適用」の順で、
-//!   確認・照合で拒否したときは何も適用していない
-//! - 全体の順序（#503 が守る。exec 専用プロセス内）: `identify_pid1` → `prepare_cgroup_join` →
-//!   [`prepare_exec_restrictions`] → `join_namespaces` → `join_cgroup` → [`reapply_restrictions`] →
-//!   （#503: fork → `close_range` → execve）。制限（`NO_NEW_PRIVS`・Landlock・seccomp）は fork / execve を
-//!   越えて継承されるため、#503 は「適用 → fork → execve」の順にする
-//! - 内部の適用順は `PR_SET_NO_NEW_PRIVS` → Landlock → seccomp で固定（`StageKind::ORDER` の相対順と同じ）。
-//!   最初の失敗で打ち切り、後続は呼ばない。エラーの `stage` は `NoNewPrivs` / `Landlock` / `Seccomp`
-//!   （適用前の拒否は、準備したプロセスの不一致が `Validate`、参加後の `/` の不一致が `SetNs`）
+//!   [`reapply_restrictions`] の内部は「準備したプロセスの確認 → 参加後の mount namespace が準備時の対象のもの
+//!   であることの照合 → 参加後の `/` の照合 → 適用」の順で、確認・照合で拒否したときは何も適用していない
+//! - 全体の順序（exec 専用プロセス内。supervisor の `run_command` が固定する）: `identify_pid1` →
+//!   `prepare_cgroup_join` → [`prepare_exec_restrictions`] → `join_namespaces` → `join_cgroup` →
+//!   [`reapply_restrictions`] → [`ExecRestrictionReport::into_complete`] → `spawn_exec_command`（fork →
+//!   `close_range` → execve）。制限は fork / execve を越えて継承されるため「適用 → fork → execve」の順にする
+//! - 内部の適用順は rlimit → capability 削減 → `PR_SET_NO_NEW_PRIVS` → Landlock → seccomp で固定
+//!   （`StageKind::ORDER` の相対順と同じ。rlimit は capability 削減の後だと hard の引き上げができず、seccomp の
+//!   後だと `prlimit64` を許す必要が生じるため前に置く）。最初の失敗で打ち切り、後続は呼ばない。エラーの
+//!   `stage` は `Rlimits` / `CapabilityDrop` / `NoNewPrivs` / `Landlock` / `Seccomp`
+//!   （適用前の拒否は、準備したプロセスの不一致が `Validate`、参加後の namespace・`/` の不一致が `SetNs`）
+//! - **rlimit は対象（pid1）の実効値を写す**: コンテナの rlimit（`--ulimit`）は `state.json` に記録されないため、
+//!   [`prepare_exec_restrictions`] が `setns` の前に対象の `limits`（procfs）を上限つきで読み、全 16 種の
+//!   (soft, hard) を exec プロセスへ適用して読み戻す（黙ってクランプしない。`apply_rlimits`）。解釈できない
+//!   内容は空集合へ落とさず拒否する（緩い制限のまま exec しない）。rootless で hard の引き上げが必要な
+//!   場合は `EPERM` で拒否する（launch と同じ fail-closed）。他プロセスへの `prlimit` 経路は作らない
+//! - **capability は OCI 既定集合へ削減する**（SEC-1）: launch と同じ `CapabilitySet::oci_default`。spec（SUP-6）が
+//!   exec での capability 削減に言及しない点は確認事項で、「launch より弱くしない」側に倒している
+//! - **制限を exec の対象へ束縛する**: [`prepare_exec_restrictions`] が対象の mount namespace の識別子（nsfs の
+//!   `st_dev`・`st_ino`）と自プロセスの procfs ディレクトリの fd（`setns` 後は `/proc/self` を解決できないため）を
+//!   保持し、[`reapply_restrictions`] が参加後の自プロセスの識別子と照合する。不一致は違反記録
+//!   `exec_joined_namespace_mismatch`（何も適用しない）。同じ rootfs を共有する別コンテナへ参加した場合は `/` の
+//!   照合だけでは検出できないため、`/` の照合より先に行う。[`ExecReady`] の作成後に対象が変わらないのは、
+//!   seccomp が `setns`・`unshare` を拒否するため
 //! - **準備したプロセス自身が適用する**: 保持する `/proc/self/status` の fd は開いたプロセスの情報を返す。
 //!   `setns(CLONE_NEWNS)` の後は `/proc` がコンテナ側の procfs になり自プロセスを `/proc/self` で解決できない
 //!   ため、事前に開いた fd で適用前後の `Threads: 1` 検査（seccomp・Landlock の既存検査）を行う。fork した
@@ -58,75 +75,64 @@
 //!   保存されていない）。Landlock の適用は存在しない・開けないルールパスを拒否するため、config の mount
 //!   destination が稼働中の rootfs に無ければ [`reapply_restrictions`] は失敗し exec は拒否される
 //!   （fail-closed として正しい挙動）。bundle は supervisor と同じ信頼境界（コンテナから書けない）にある前提
-//! - **再適用だけでは exec してよい状態にならない（完了は型で表す）**: 本モジュールが載せるのは
-//!   `NO_NEW_PRIVS`・Landlock・seccomp の 3 つだけで、launch 経路が同じ位置で行う rlimit 適用と capability 削減
-//!   （`StageKind::ORDER` の `Rlimits`・`CapabilityDrop`）は行わない。`setns` は資格情報を変えないため、rootful の
-//!   exec では成功後も全 capability を持つ。成功結果 [`ExecRestrictionReport`] のフィールドは非公開で、未適用の
-//!   制限は [`ExecRestrictionReport::unapplied`] で読むだけ（crate の外から書き換え・構築できない）。
-//!   「launch 経路と同じ制限がすべて載った」ことの証跡は [`ExecReady`] で、
-//!   [`ExecRestrictionReport::into_complete`] だけが作る（未適用が残る間は必ず `Err`。現在の実装では常に `Err`）。
-//!   **fork / execve の入口（#503 が追加する）は [`ExecReady`] を値で受け取ること**。`ExecRestrictionReport` や
-//!   真偽値を受け取る入口、[`ExecReady`] を経由しない入口を作らない
+//! - **完了は型で表す**: 成功結果 [`ExecRestrictionReport`] のフィールドは非公開で、未適用の制限は
+//!   [`ExecRestrictionReport::unapplied`] で読むだけ（crate の外から書き換え・構築できない）。TASK-163.4 で
+//!   rlimit と capability 削減を実装したため通常の一覧は空で、「launch 経路と同じ制限がすべて載った」ことの
+//!   証跡は [`ExecReady`]（[`ExecRestrictionReport::into_complete`] だけが作る。未適用が残る間は `Err`）。
+//!   launch の段が増えて exec 側が追従しない場合は、一覧への追加（機械照合する単体テストが失敗する）で exec を
+//!   拒否に倒す。**fork / execve の入口（`spawn_exec_command`）は [`ExecReady`] を値で受け取る**。
+//!   `ExecRestrictionReport` や真偽値を受け取る入口、[`ExecReady`] を経由しない入口はない
 //! - エラーメッセージ・`Debug` 出力にホスト側パス・ルール内容を載せない
 //!
-//! # #503（TASK-163.4）が `execve` を結線する前の条件
+//! # `execve` を結線する前の 5 条件（TASK-163.3 が残し、TASK-163.4・#503 で満たした）
 //!
-//! 次の 5 点をすべて満たすまで、exec 専用プロセスはコマンドを実行してはならない（SUP-6・SEC-1）。
+//! 1. **完了を型で強制する**: 入口 `spawn_exec_command` は [`ExecReady`] だけを値で受け取る。[`ExecReady`] を
+//!    作る別経路・`Clone`・公開コンストラクタはない（単体テスト専用の作成は `cfg(test)` のみ）
+//! 2. **capability 削減と rlimit 適用**: 上記の順序で適用し、未適用の一覧は空
+//! 3. **制限を exec の対象へ束縛する**: mount namespace の識別子の照合（上記）
+//! 4. **`setns` を伴う通し試験**: supervisor の `tests/exec.rs`（実機前提）が、実コンテナへ参加した後の `/` と
+//!    rootfs の一致・保持 status fd からのスレッド数の読み取り・pivot していない対象の拒否・別コンテナへの
+//!    参加の拒否を具体値で照合する。ルールパスの解決の起点が照合済みの fd であること（プロセスの `/` を引き直して
+//!    いないこと）は、`open_verified_root` が返した fd を Landlock の適用と cwd の設定の両方へ渡す実装で担保し、
+//!    プロセスの `/` と起点が食い違う状況を作る専用の試験は未実装（下記）
+//! 5. **全体のタイムアウトと fd の後始末**: supervisor の `run_command` が段の間と子の待機で上限時間を課し
+//!    （REPAIR-5）、子は `execve` の前に `close_range` でホスト側の fd を閉じる（`exec/process.rs`）
 //!
-//! 1. **完了を型で強制する**: fork / execve の入口は [`ExecReady`] だけを受け取る（上記）。[`ExecReady`] を
-//!    作る別経路・`Clone`・公開コンストラクタを足さない
-//! 2. **capability 削減と rlimit 適用を実装し、未適用を空にする**: launch 経路と同じ規則（`Rlimits` →
-//!    `CapabilityDrop` → `NoNewPrivs` → Landlock → seccomp の順。capability 削減の後は hard の引き上げが
-//!    できない）で exec プロセスへ適用し、実装したものを [`ExecRestrictionReport::UNAPPLIED`] から外す。
-//!    一覧が空になって初めて [`ExecRestrictionReport::into_complete`] が `Ok` を返す。exec での要否そのものは
-//!    spec（SUP-6）の確認事項で、「適用しない」と決まった場合も一覧から外す変更としてレビューを通す
-//! 3. **制限を exec の対象へ束縛する**: 現在の [`ExecRestrictions`] は「どの対象（`Pid1Target`）のために
-//!    準備したか」を持たず、[`reapply_restrictions`] は参加先を確かめない。参加後の `/` の照合は rootfs の
-//!    ディレクトリの同一性だけを見るため、**同じ rootfs を共有する 2 つのコンテナ**では、コンテナ A 用に
-//!    準備した制限をコンテナ B へ参加したプロセスに適用しても照合を通過する（config の異なるルールが載る）。
-//!    準備時に対象の mount namespace の識別子（nsfs の `st_dev`・`st_ino`）を記録し、参加後の自プロセスの
-//!    mount namespace と一致することを適用前に確かめる等で束縛する。[`ExecReady`] も同じ対象に束縛し、
-//!    別の対象向けの証跡で実行できないようにする
-//! 4. **`setns` を伴う通し試験**: 実コンテナ（pivot 済み）へ参加した後に、(a) `/` が固定した rootfs と一致して
-//!    照合を通ること、(b) 保持した status fd からスレッド数を読めること、(c) ルールパスの解決の起点が
-//!    **照合済みの fd** であること（呼び出しプロセスの `/` を引き直していないことを区別できる検査。例:
-//!    照合の後に起点とプロセスの `/` が食い違う状況を作り、ルールが照合済みの側に付くことを確かめる）、
-//!    (d) pivot していない対象・`/` へマウントを重ねた対象が拒否されること、を具体値で照合する
-//! 5. **exec 専用プロセス全体のタイムアウトと fd の後始末**: 準備から `execve` までの全体に上限時間を設け
-//!    （REPAIR-5。pid1 の停止・procfs の応答待ちでハングしない）、`execve` の前に `close_range` でホスト側の
-//!    fd（cgroup・state・ログ・固定した rootfs 等）を閉じる
-//!
-//! このほか #503 で扱う既知の点: 準備時の pid との照合は best-effort で、`setns` で PID namespace に参加した
-//! 後に fork した子の pid は数値が衝突し得る（「適用 → fork → execve」の順を守り、子で適用しない）。参加後の
-//! cwd は `setns` が root と同じ場所へ付け替えるが検証していない（コマンドの cwd は `execve` の前に明示的に
-//! 設定する）。
+//! 準備時の pid との照合は best-effort で、`setns` で PID namespace に参加した後に fork した子の pid は数値が
+//! 衝突し得る。「適用 → fork → execve」の順を守り、子で適用しないことで避ける。
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - fork・execve・`close_range`・`setns` を伴う通し試験は #503（TASK-163.4）。**`setns` の後に保持 fd から
-//!   スレッド数が実際に読めること** の実機確認もそこで行う（本モジュールのテストは `setns` をしない）
-//! - user namespace への参加、exec プロセスの capability 削減・rlimit 適用は未実装（後 2 つは
-//!   [`UnappliedExecRestriction`] として成功結果に載る。TASK-163 の内容は seccomp / Landlock のみで、exec での
-//!   扱いは spec〔SUP-6〕の確認事項）
+//! - user namespace への参加（rootless の exec に必須。現状は `setns` が `EPERM` で fail-closed）
+//! - ルールパスの解決の起点とプロセスの `/` が食い違う状況での照合専用の試験（上記 4）
 //! - 本番 launcher（`oci_runtime` の `ProcessLauncher` 実装）は未結線で、launch 経路の Landlock も本番では
 //!   まだ適用されない（`exec/landlock.rs`）。exec と launch の一致は「同じ `config.json` から同じ関数で導いた
-//!   ルールを、同じ rootfs のディレクトリを起点に同じ規則で辿る」ことで担保し、実コンテナでの突き合わせは #503
+//!   ルールを、同じ rootfs のディレクトリを起点に同じ規則で辿る」ことで担保する
 //! - 拒否の監査ログ保存の配線（#839・SEC-4）
+//! - `--ulimit` の指定値の記録（`state.json`）。現状は pid1 の実効値を写して代替する
 
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
 use super::landlock::{LandlockAccessProbe, landlock_ruleset_from_config, run_probe};
+use super::rlimits::{apply_rlimits, parse_proc_limits};
+use super::setns::NsIdentity;
 use super::{
-    ExecError, IsolationStage, StageKind, ThreadCountSource, ViolationReason, no_new_privs,
+    ExecError, IsolationStage, Pid1Target, StageKind, ThreadCountSource, ViolationReason,
+    no_new_privs,
 };
 use crate::landlock::LandlockRuleset;
 use crate::oci_runtime::{OciConfig, RootfsDir};
+use crate::rlimits::Rlimits;
 use crate::sys;
 use crate::traits::types::ErrorCode;
 
 // テストでは本物（`Threads: 1` と実 syscall を要する）の代わりに偽物へ差し替える（`stages.rs` と同じ）。
+#[cfg(not(test))]
+use super::capabilities::apply_default_capabilities_with;
+#[cfg(test)]
+use super::capabilities::testing::apply_default_capabilities_with;
 #[cfg(not(test))]
 use super::landlock::apply_landlock_stage_with;
 #[cfg(test)]
@@ -145,6 +151,21 @@ pub struct ExecRestrictions {
     /// `setns` の前にホスト側で固定したコンテナの rootfs（`O_PATH`）。参加後の `/` と照合する基準。
     /// 適用が終わるまで保持し、inode 番号が再利用されないようにする。
     rootfs: OwnedFd,
+    /// 対象（pid1）の実効 rlimit（対象の `limits`。`setns` の前に読む）。exec プロセスへ同じ値を載せる。
+    rlimits: Rlimits,
+    /// 制限を準備した対象への束縛（参加後に別の対象へ適用させない）。
+    binding: TargetBinding,
+}
+
+/// 制限を exec の対象（pid1）へ束縛する材料（SUP-6・SEC-1・TASK-163.4）。
+///
+/// `setns(CLONE_NEWNS)` の後はホスト側の procfs が見えず自プロセスを `/proc/self` で解決できないため、
+/// `setns` の前に開いた自プロセスの procfs ディレクトリの fd（`proc_dir`）から `ns/mnt` を引き、参加後の
+/// 自プロセスの mount namespace の識別子を読む。これが準備時に記録した対象の識別子と一致しなければ、
+/// 同じ rootfs を共有する別コンテナへ参加していても何も適用しない。
+struct TargetBinding {
+    proc_dir: OwnedFd,
+    target_mnt_ns: NsIdentity,
 }
 
 impl std::fmt::Debug for ExecRestrictions {
@@ -158,14 +179,16 @@ impl std::fmt::Debug for ExecRestrictions {
 
 /// launch 経路は適用するが、exec の再適用（本モジュール）は **適用しない** 制限（SUP-6・SEC-1・REPAIR-3）。
 ///
-/// [`ExecRestrictionReport::unapplied`] に載る。実装されたものから列挙を外す。
+/// [`ExecRestrictionReport::unapplied`] に載る。TASK-163.4（#503）で rlimit 適用と capability 削減を実装した
+/// ため、現在の [`ExecRestrictionReport::UNAPPLIED`] は空。launch 経路に段が増えて exec 側が追従しない場合に
+/// 備え、列挙自体は残す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum UnappliedExecRestriction {
     /// rlimit 適用（launch 経路の `StageKind::Rlimits`。SUP-12）。
     Rlimits,
     /// capability 削減（launch 経路の `StageKind::CapabilityDrop`。SEC-1）。`setns` は資格情報を変えないため、
-    /// rootful の exec プロセスは再適用の後も全 capability を持つ。
+    /// 適用しなければ rootful の exec プロセスは全 capability を持つ。
     CapabilityDrop,
 }
 
@@ -187,13 +210,33 @@ impl UnappliedExecRestriction {
     }
 }
 
+/// 適用を終えたプロセスが exec の入口へ持ち越す材料（非公開。[`ExecReady`] だけが保持する）。
+struct ExecCarry {
+    /// 参加後に照合した `/`（`O_PATH`）。コマンドの cwd を照合済みの root へ置く起点。
+    root: OwnedFd,
+    /// fork 前の `Threads: 1` 確認に使う、`setns` 前に開いた status fd。
+    threads: ThreadCountSource,
+    /// 適用したプロセス。別プロセス（fork した子等）が exec の入口を呼べないようにする。
+    owner_pid: u32,
+}
+
+impl std::fmt::Debug for ExecCarry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // fd は出さない。
+        f.debug_struct("ExecCarry")
+            .field("owner_pid", &self.owner_pid)
+            .finish_non_exhaustive()
+    }
+}
+
 /// [`reapply_restrictions`] の成功結果（将来拡張できる構造。制限適用の証跡ではない。REPAIR-3）。
 ///
-/// 成功は「`NO_NEW_PRIVS`・Landlock・seccomp を載せた」ことだけを表す。**exec してよい状態になったことは
-/// 表さない**。exec してよいことの証跡は [`ExecReady`] で、[`into_complete`](Self::into_complete) だけが作る。
+/// 成功は「rlimit・capability 削減・`NO_NEW_PRIVS`・Landlock・seccomp を載せた」ことを表す。exec してよい
+/// ことの証跡は [`ExecReady`] で、[`into_complete`](Self::into_complete) だけが作る（未適用の一覧
+/// [`unapplied`](Self::unapplied) が空のときのみ）。
 ///
 /// フィールドは非公開で、crate の外からは構築も書き換えもできない（未適用の一覧を空に書き換えて完了を
-/// 装えない。SEC-1）。読み取りは getter で行う。
+/// 装えない。SEC-1）。読み取りは getter で行う。`Clone` ではない（照合済みの root の fd を持ち越すため）。
 ///
 /// ```
 /// # #[cfg(target_os = "linux")]
@@ -216,23 +259,26 @@ impl UnappliedExecRestriction {
 /// let _ = fandhe_container_core::exec::ExecRestrictionReport {
 ///     landlock_rules: 0,
 ///     seccomp_instructions: 0,
+///     rlimits_applied: 0,
+///     capability_bounding_dropped: 0,
 ///     unapplied: &[],
+///     carry: todo!(),
 /// };
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 #[must_use = "a successful reapply does not make the process ready to exec; call `into_complete`"]
 pub struct ExecRestrictionReport {
     landlock_rules: usize,
     seccomp_instructions: usize,
+    rlimits_applied: usize,
+    capability_bounding_dropped: usize,
     unapplied: &'static [UnappliedExecRestriction],
+    carry: ExecCarry,
 }
 
 impl ExecRestrictionReport {
-    /// 現在の実装が適用しない制限の一覧（唯一の定義元。launch 経路の段の順）。
-    pub const UNAPPLIED: &'static [UnappliedExecRestriction] = &[
-        UnappliedExecRestriction::Rlimits,
-        UnappliedExecRestriction::CapabilityDrop,
-    ];
+    /// 現在の実装が適用しない制限の一覧（唯一の定義元。launch 経路の段の順）。TASK-163.4 で空になった。
+    pub const UNAPPLIED: &'static [UnappliedExecRestriction] = &[];
 
     /// 追加した Landlock ルール数。
     pub fn landlock_rules(&self) -> usize {
@@ -244,12 +290,22 @@ impl ExecRestrictionReport {
         self.seccomp_instructions
     }
 
+    /// 適用した rlimit の種別数（対象の `limits` から読んだ全 16 種）。
+    pub fn rlimits_applied(&self) -> usize {
+        self.rlimits_applied
+    }
+
+    /// capability 削減で bounding set から落とした capability の数。
+    pub fn capability_bounding_dropped(&self) -> usize {
+        self.capability_bounding_dropped
+    }
+
     /// launch 経路は適用するが、この再適用では適用していない制限（[`ExecRestrictionReport::UNAPPLIED`]）。
     pub fn unapplied(&self) -> &'static [UnappliedExecRestriction] {
         self.unapplied
     }
 
-    /// launch 経路と同じ制限がすべて載ったか（未適用が残る間は `false`。現在の実装では常に `false`）。
+    /// launch 経路と同じ制限がすべて載ったか（未適用が残る間は `false`）。
     /// 判定を見るだけの補助で、exec の許可には [`into_complete`](Self::into_complete) の証跡を使うこと。
     pub fn is_complete(&self) -> bool {
         self.unapplied.is_empty()
@@ -258,11 +314,9 @@ impl ExecRestrictionReport {
     /// 未適用の制限が無ければ、exec へ進んでよいことの証跡 [`ExecReady`] に変える（SEC-1）。
     ///
     /// 未適用が 1 つでも残っていれば `FailedPrecondition`（段 `Exec`。メッセージに未適用の名前を並べる）。
-    /// 現在の実装は capability 削減と rlimit を適用しないため、**必ず `Err` を返す**（#503 が両者を実装して
-    /// [`Self::UNAPPLIED`] を空にするまで、exec の入口へ渡せる値は作れない）。
     pub fn into_complete(self) -> Result<ExecReady, ExecError> {
         if self.unapplied.is_empty() {
-            return Ok(ExecReady { _sealed: () });
+            return Ok(ExecReady { carry: self.carry });
         }
         let names: Vec<&str> = self.unapplied.iter().map(|u| u.as_str()).collect();
         Err(ExecError::new(
@@ -279,65 +333,158 @@ impl ExecRestrictionReport {
 /// 「launch 経路と同じ制限がすべて exec プロセスへ載った」ことの証跡（SUP-6・SEC-1）。
 ///
 /// [`ExecRestrictionReport::into_complete`] だけが作る。フィールドは非公開で、公開コンストラクタ・`Clone`・
-/// `Default` を持たないため、crate の外では構築も複製もできない。
+/// `Default` を持たないため、crate の外では構築も複製もできない。照合済みの `/` の fd と、`setns` 前に
+/// 開いた status fd を持ち、exec の入口（`spawn_exec_command`）が cwd の設定と fork 前の単一スレッド確認に使う。
 ///
-/// # 契約（#503・TASK-163.4）
+/// # 契約（TASK-163.4）
 ///
-/// exec 専用プロセスの fork / execve の入口は、この型を **値で** 受け取ること（消費して二重実行を防ぐ）。
-/// `ExecRestrictionReport`・真偽値・`is_complete()` の結果を受け取る入口や、この型を経由しない入口を作らない。
-/// この型を作る別経路（テスト用を含む公開コンストラクタ・feature による抜け道）を足さない。対象（どの
-/// コンテナへの exec か）への束縛は未実装で、#503 の条件（モジュール doc）に含まれる。
+/// exec 専用プロセスの fork / execve の入口（`spawn_exec_command`）は、この型を **値で** 受け取る（消費して
+/// 二重実行を防ぐ）。`ExecRestrictionReport`・真偽値・`is_complete()` の結果を受け取る入口や、この型を
+/// 経由しない入口はない。この型を作る別経路（テスト用を含む公開コンストラクタ・feature による抜け道）を
+/// 足さない。対象（どのコンテナへの exec か）への束縛は [`reapply_restrictions`] が適用の前に行い、
+/// その後は seccomp が `setns`・`unshare` を拒否するため、証跡が作られた後に対象が変わることはない。
 ///
 /// ```compile_fail,E0451
-/// let _ = fandhe_container_core::exec::ExecReady { _sealed: () };
+/// let _ = fandhe_container_core::exec::ExecReady { carry: todo!() };
 /// ```
 #[derive(Debug)]
 #[must_use = "ExecReady is the only evidence that permits exec; pass it to the exec entry point"]
 pub struct ExecReady {
-    _sealed: (),
+    carry: ExecCarry,
 }
 
-/// `config`（コンテナの `config.json`）から Landlock ruleset を作り、参加後の `/` と照合する rootfs と
-/// 自プロセスの status fd を確保する。
+impl ExecReady {
+    /// 持ち越した材料を取り出す（exec の入口だけが呼ぶ。`ExecReady` を消費する）。
+    pub(super) fn into_parts(self) -> ExecReadyParts {
+        let ExecCarry {
+            root,
+            threads,
+            owner_pid,
+        } = self.carry;
+        ExecReadyParts {
+            root,
+            threads,
+            owner_pid,
+        }
+    }
+
+    /// 単体テスト専用: 任意の材料から証跡を作る。本番ビルドには存在しない（crate 内の `cfg(test)` のみ）。
+    #[cfg(test)]
+    pub(super) fn for_test(root: OwnedFd, threads: ThreadCountSource, owner_pid: u32) -> Self {
+        Self {
+            carry: ExecCarry {
+                root,
+                threads,
+                owner_pid,
+            },
+        }
+    }
+}
+
+/// [`ExecReady::into_parts`] が返す持ち越し材料（exec の入口が使う）。
+pub(super) struct ExecReadyParts {
+    pub(super) root: OwnedFd,
+    pub(super) threads: ThreadCountSource,
+    pub(super) owner_pid: u32,
+}
+
+/// `config`（コンテナの `config.json`）から Landlock ruleset を作り、参加後の `/` と照合する rootfs・
+/// 対象への束縛の材料・自プロセスの status fd を確保する。
 ///
 /// `join_namespaces` の **前** に、再適用を行うプロセス自身が呼ぶ。`rootfs` は稼働中コンテナの bundle から
-/// `oci_runtime::pin_bundle_rootfs` で固定したもの（`config` と同じ bundle のもの）を渡す。ABI 検出・ルール
-/// 生成の失敗（Landlock 未対応カーネルを含む）は `stage = Landlock` で拒否する（fail-closed。CORE-5）。
-/// `rootfs` が呼び出しプロセス自身の `/` と同じディレクトリなら、参加後の照合が意味を持たないため
-/// 違反記録 `rootfs_is_host_root` つきで拒否する（SEC-1）。
+/// `oci_runtime::pin_bundle_rootfs` で固定したもの（`config` と同じ bundle のもの）を渡す。`target` は
+/// `join_namespaces` へ渡すのと同じ対象で、その mount namespace の識別子と実効 rlimit（対象の `limits`）を
+/// ここで記録する（参加後に別の対象へ適用させない。rlimit は launch と同じ値を exec プロセスへ載せる）。
+/// ABI 検出・ルール生成の失敗（Landlock 未対応カーネルを含む）は `stage = Landlock` で拒否する
+/// （fail-closed。CORE-5）。`rootfs` が呼び出しプロセス自身の `/` と同じディレクトリなら、参加後の照合が
+/// 意味を持たないため違反記録 `rootfs_is_host_root` つきで拒否する（SEC-1）。
 pub fn prepare_exec_restrictions(
+    target: &Pid1Target,
     config: &OciConfig,
     rootfs: &RootfsDir,
 ) -> Result<ExecRestrictions, ExecError> {
     let rootfs = rootfs.as_fd().try_clone_to_owned().map_err(|e| {
         ExecError::from_io(&e, IsolationStage::Validate, "duplicate the rootfs handle")
     })?;
-    prepare_distinct_from_own_root(config, rootfs)
-}
-
-/// `rootfs` が呼び出しプロセス自身の `/` と別のディレクトリであることを確かめてから準備する
-/// （[`prepare_exec_restrictions`] の本体。Landlock の検出より先に判定する）。
-fn prepare_distinct_from_own_root(
-    config: &OciConfig,
-    rootfs: OwnedFd,
-) -> Result<ExecRestrictions, ExecError> {
     let own_root = sys::open_dir_path_nofollow(None, c"/")
         .map_err(|e| ExecError::from_sys(e, IsolationStage::Validate, "open own root"))?;
-    let is_own_root = same_directory(rootfs.as_fd(), own_root.as_fd())
-        .map_err(|e| e.at_stage(IsolationStage::Validate))?;
-    if is_own_root {
+    reject_own_root(rootfs.as_fd(), own_root.as_fd())?;
+    let target_mnt_ns = target.mnt_ns_identity()?;
+    let rlimits = parse_proc_limits(&target.read_limits()?)?;
+    let binding = TargetBinding {
+        proc_dir: open_own_proc_dir()?,
+        target_mnt_ns,
+    };
+    prepare_with_rootfs(config, rootfs, rlimits, binding)
+}
+
+/// `rootfs` が呼び出しプロセス自身の `/` と別のディレクトリであることを確かめる
+/// （Landlock の検出より先に判定する）。
+fn reject_own_root(rootfs: BorrowedFd<'_>, own_root: BorrowedFd<'_>) -> Result<(), ExecError> {
+    if same_directory(rootfs, own_root).map_err(|e| e.at_stage(IsolationStage::Validate))? {
         return Err(ExecError::from_violation_at(
             ViolationReason::RootfsIsHostRoot,
             None,
             IsolationStage::Validate,
         ));
     }
-    prepare_with_rootfs(config, rootfs)
+    Ok(())
+}
+
+/// 自プロセスの procfs ディレクトリ（pid 指定。`O_PATH`）を開き、本物の procfs であることを確かめる。
+///
+/// `setns` の後は `/proc` がコンテナ側の procfs になるため、参加前に開いた fd を保持して `ns/mnt` を引く
+/// 起点にする（`/proc/self` は symlink で `O_NOFOLLOW` では開けないため pid で開く）。
+fn open_own_proc_dir() -> Result<OwnedFd, ExecError> {
+    let stage = IsolationStage::SetNs;
+    let path = std::ffi::CString::new(format!("/proc/{}", std::process::id()))
+        .map_err(|_| ExecError::new(ErrorCode::Internal, stage, "invalid own procfs path"))?;
+    let dir = sys::open_dir_path_nofollow(None, &path)
+        .map_err(|e| ExecError::from_sys(e, stage, "open own procfs directory"))?;
+    if sys::fs_type(dir.as_fd()) != Ok(sys::PROC_MAGIC) {
+        return Err(ExecError::new(
+            ErrorCode::Internal,
+            stage,
+            "own procfs directory is not on procfs",
+        ));
+    }
+    Ok(dir)
+}
+
+/// 保持した procfs ディレクトリ `proc_dir` から、呼び出しプロセスの現在の mount namespace の識別子を読む。
+///
+/// `ns/mnt` は参照のたびにタスクの現在の namespace へ解決されるため、`setns` の後は参加先を返す。
+fn current_mnt_ns_identity(proc_dir: BorrowedFd<'_>) -> Result<NsIdentity, ExecError> {
+    let stage = IsolationStage::SetNs;
+    let ns = sys::open_path_follow_at(proc_dir, c"ns/mnt")
+        .map_err(|e| ExecError::from_sys(e, stage, "open own mount namespace"))?;
+    // `O_PATH` の fd への fstat（パスを再解決しない）。
+    let meta = std::fs::File::from(ns)
+        .metadata()
+        .map_err(|e| ExecError::from_io(&e, stage, "inspect own mount namespace"))?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+/// 参加後の mount namespace が、準備時に記録した対象のものと一致することを確かめる（SEC-1）。
+/// 不一致は違反記録 `exec_joined_namespace_mismatch`（何も適用しない）。
+fn verify_target_binding(binding: &TargetBinding) -> Result<(), ExecError> {
+    if current_mnt_ns_identity(binding.proc_dir.as_fd())? != binding.target_mnt_ns {
+        return Err(ExecError::from_violation(
+            ViolationReason::ExecJoinedNamespaceMismatch,
+            None,
+        ));
+    }
+    Ok(())
 }
 
 /// [`prepare_exec_restrictions`] の本体（`rootfs` が自分の `/` でないことの検査を除く）。
-/// 結合試験用の観測関数は `setns` をしないため、自分の `/` を基準にしてここから入る。
-fn prepare_with_rootfs(config: &OciConfig, rootfs: OwnedFd) -> Result<ExecRestrictions, ExecError> {
+/// 結合試験用の観測関数は `setns` をしないため、自分の `/`・自分の namespace を基準にしてここから入る。
+fn prepare_with_rootfs(
+    config: &OciConfig,
+    rootfs: OwnedFd,
+    rlimits: Rlimits,
+    binding: TargetBinding,
+) -> Result<ExecRestrictions, ExecError> {
     let landlock = landlock_ruleset_from_config(config)?;
     let status_error =
         |what: &'static str| ExecError::new(ErrorCode::Internal, IsolationStage::Landlock, what);
@@ -353,6 +500,8 @@ fn prepare_with_rootfs(config: &OciConfig, rootfs: OwnedFd) -> Result<ExecRestri
         threads: ThreadCountSource::PreOpened(file),
         owner_pid: std::process::id(),
         rootfs,
+        rlimits,
+        binding,
     })
 }
 
@@ -379,7 +528,8 @@ fn same_directory(a: BorrowedFd<'_>, b: BorrowedFd<'_>) -> Result<bool, ExecErro
 /// 参加後の呼び出しプロセスの `/` を開き、`rootfs`（`setns` の前に固定したコンテナの rootfs）と同じ
 /// ディレクトリであることを確かめて返す（SEC-1）。不一致は違反記録 `exec_root_not_container_rootfs`。
 ///
-/// 返す fd は Landlock のルールパスを辿る起点に使う（照合した実体と起点を同じ fd にする）。
+/// 返す fd は Landlock のルールパスを辿る起点と、コマンドの cwd の起点に使う（照合した実体と起点を
+/// 同じ fd にする）。
 fn open_verified_root(rootfs: BorrowedFd<'_>) -> Result<OwnedFd, ExecError> {
     let root = sys::open_dir_path_nofollow(None, c"/")
         .map_err(|e| ExecError::from_sys(e, IsolationStage::SetNs, "open / after joining"))?;
@@ -392,23 +542,38 @@ fn open_verified_root(rootfs: BorrowedFd<'_>) -> Result<OwnedFd, ExecError> {
     Ok(root)
 }
 
-/// `NO_NEW_PRIVS` → Landlock → seccomp を呼び出しプロセスへ不可逆に適用する。
+/// rlimit → capability 削減 → `NO_NEW_PRIVS` → Landlock → seccomp を呼び出しプロセスへ不可逆に適用する。
 ///
 /// `join_namespaces` と `join_cgroup` の **後**、準備したプロセス自身から単一スレッドで呼ぶ。
-/// 適用の前に、参加後の `/` が準備時に固定したコンテナの rootfs であることを照合し、不一致なら何も適用せず
-/// 拒否する（違反記録つき。SEC-1）。Landlock のルールパスは照合済みの `/` を起点に辿る。
-/// 最初の失敗で打ち切る。失敗後の制限は部分的に載った不定状態のため、呼び出し側は続行せず終了すること。
+/// 適用の前に、参加後の mount namespace が準備時に記録した対象のものであること、参加後の `/` が準備時に
+/// 固定したコンテナの rootfs であることをこの順で照合し、不一致なら何も適用せず拒否する（違反記録つき。
+/// SEC-1）。適用順は launch 経路（`StageKind::ORDER`）の相対順と同じで、rlimit は capability 削減（hard の
+/// 引き上げができなくなる）と seccomp（`prlimit64` を許す必要が生じない）の前に置く。Landlock のルールパスは
+/// 照合済みの `/` を起点に辿る。最初の失敗で打ち切る。失敗後の制限は部分的に載った不定状態のため、
+/// 呼び出し側は続行せず終了すること。
 ///
-/// 成功しても capability 削減と rlimit 適用は行われていない（[`ExecRestrictionReport::unapplied`]）。
-/// `execve` へ進んでよいことの証跡は [`ExecRestrictionReport::into_complete`] が返す [`ExecReady`] だけ。
+/// 成功した結果から [`ExecRestrictionReport::into_complete`] が返す [`ExecReady`] が、`execve` へ進んでよい
+/// ことの唯一の証跡。
 pub fn reapply_restrictions(
     restrictions: ExecRestrictions,
+) -> Result<ExecRestrictionReport, ExecError> {
+    reapply_inner(restrictions, true)
+}
+
+/// [`reapply_restrictions`] の本体。`drop_capabilities` が偽のときだけ capability 削減を省き、結果の
+/// 未適用の一覧へ `CapabilityDrop` を載せる（完了を装わない。結合試験用の観測関数が、`CAP_SETPCAP` を持たない
+/// 非特権の使い捨て子で seccomp / Landlock の遮断だけを観測するために使う。本番の入口は常に真）。
+fn reapply_inner(
+    restrictions: ExecRestrictions,
+    drop_capabilities: bool,
 ) -> Result<ExecRestrictionReport, ExecError> {
     let ExecRestrictions {
         landlock,
         mut threads,
         owner_pid,
         rootfs,
+        rlimits,
+        binding,
     } = restrictions;
     if owner_pid != std::process::id() {
         return Err(ExecError::new(
@@ -417,7 +582,20 @@ pub fn reapply_restrictions(
             "restrictions must be reapplied by the process that prepared them",
         ));
     }
+    verify_target_binding(&binding)?;
     let root = open_verified_root(rootfs.as_fd())?;
+    // 空集合なら syscall を呼ばない（launch の組み込み段と同じ）。通常は全 16 種が入る。
+    if !rlimits.is_empty() {
+        apply_rlimits(&rlimits).map_err(|e| e.at_stage(IsolationStage::Rlimits))?;
+    }
+    let capability_bounding_dropped = if drop_capabilities {
+        apply_default_capabilities_with(&mut threads)
+            .map_err(|e| e.at_stage(IsolationStage::CapabilityDrop))?
+            .bounding_dropped
+            .len()
+    } else {
+        0
+    };
     no_new_privs::apply_no_new_privs()?;
     let landlock = apply_landlock_stage_with(&landlock, &mut threads, root.as_fd())
         .map_err(|e| e.at_stage(IsolationStage::Landlock))?;
@@ -426,13 +604,24 @@ pub fn reapply_restrictions(
     Ok(ExecRestrictionReport {
         landlock_rules: landlock.rules_added,
         seccomp_instructions: seccomp.instructions,
-        unapplied: ExecRestrictionReport::UNAPPLIED,
+        rlimits_applied: rlimits.len(),
+        capability_bounding_dropped,
+        unapplied: if drop_capabilities {
+            ExecRestrictionReport::UNAPPLIED
+        } else {
+            &[UnappliedExecRestriction::CapabilityDrop]
+        },
+        carry: ExecCarry {
+            root,
+            threads,
+            owner_pid,
+        },
     })
 }
 
 /// [`observe_exec_restriction_reapply`] の観測結果。errno は成功を `None`、失敗を `Some(errno)`（不明は `-1`）。
 #[doc(hidden)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub struct ExecReapplyObservation {
     /// 準備（ABI 検出・ルール生成）の失敗。`Some` なら適用もプローブもしていない（fail-closed）。
@@ -470,11 +659,12 @@ const MAX_REAPPLY_PROBES: usize = 32;
 /// 拒否（違反記録 `exec_root_not_container_rootfs`。何も適用しない）を観測できる。本番の入口
 /// [`prepare_exec_restrictions`] が行う「rootfs が自分の `/` でないこと」の検査だけは通さない。
 /// 準備・再適用のいずれかが失敗したらプローブは実行しない。`unsafe` は追加せず、syscall は既存の
-/// `crate::sys` ラッパーに限る。
+/// `crate::sys` ラッパーに限る。対象への束縛は自プロセスの mount namespace に対して行うため常に一致し、
+/// rlimit は変更しない（空集合）。`CAP_SETPCAP` を持たない非特権の子でも観測できるよう capability 削減は
+/// 省き、結果の未適用の一覧に `CapabilityDrop` が残る（capability 削減の実機確認は supervisor の
+/// `tests/exec.rs`）。
 ///
-/// # 将来仕様（記録のみ）
-///
-/// `setns` を伴う通し確認は #503（TASK-163.4）の統合テストで行う（REPAIR-3）。
+/// `setns` を伴う通し確認は `fandhe-container-supervisor` の `tests/exec.rs`（TASK-163.4・#503）が行う。
 #[doc(hidden)]
 pub fn observe_exec_restriction_reapply(
     config: &OciConfig,
@@ -508,9 +698,17 @@ pub fn observe_exec_restriction_reapply(
     let expected = OwnedFd::from(
         std::fs::File::open(expected_root).map_err(|_| internal("cannot open expected root"))?,
     );
-    match prepare_with_rootfs(config, expected) {
+    // `setns` をしないため、対象の mount namespace は自分自身（束縛は常に一致する）。rlimit は変えない。
+    let proc_dir = open_own_proc_dir().map_err(|_| internal("cannot open own procfs directory"))?;
+    let target_mnt_ns = current_mnt_ns_identity(proc_dir.as_fd())
+        .map_err(|_| internal("cannot read own mount namespace"))?;
+    let binding = TargetBinding {
+        proc_dir,
+        target_mnt_ns,
+    };
+    match prepare_with_rootfs(config, expected, Rlimits::default(), binding) {
         Err(e) => obs.prepare_error = Some(e),
-        Ok(prepared) => match reapply_restrictions(prepared) {
+        Ok(prepared) => match reapply_inner(prepared, false) {
             Ok(report) => obs.report = Some(report),
             Err(e) => obs.reapply_error = Some(e),
         },
@@ -565,6 +763,43 @@ mod tests {
             threads: ThreadCountSource::ProcSelf,
             owner_pid,
             rootfs: dir_fd(rootfs),
+            rlimits: one_rlimit(),
+            binding: own_binding(),
+        }
+    }
+
+    /// 対象の mount namespace を自分自身にした束縛（単体テストは `setns` をしないため照合が通る）。
+    fn own_binding() -> TargetBinding {
+        let proc_dir = open_own_proc_dir().expect("own procfs dir");
+        let target_mnt_ns = current_mnt_ns_identity(proc_dir.as_fd()).expect("own mnt ns");
+        TargetBinding {
+            proc_dir,
+            target_mnt_ns,
+        }
+    }
+
+    /// 適用の呼び出し順を確かめるための 1 件だけの rlimit 集合（偽の `prlimit` が記録する）。
+    fn one_rlimit() -> Rlimits {
+        use crate::rlimits::{Rlimit, RlimitKind};
+        Rlimits::new(vec![
+            Rlimit::new(RlimitKind::Nofile, 256, 512).expect("rlimit"),
+        ])
+        .expect("set")
+    }
+
+    /// 持ち越し材料つきの結果（`unapplied` を差し替えて `into_complete` の分岐を試す）。
+    fn report_with(unapplied: &'static [UnappliedExecRestriction]) -> ExecRestrictionReport {
+        ExecRestrictionReport {
+            landlock_rules: 1,
+            seccomp_instructions: 2,
+            rlimits_applied: 3,
+            capability_bounding_dropped: 4,
+            unapplied,
+            carry: ExecCarry {
+                root: dir_fd(Path::new("/")),
+                threads: ThreadCountSource::ProcSelf,
+                owner_pid: std::process::id(),
+            },
         }
     }
 
@@ -585,38 +820,132 @@ mod tests {
         ExecError::new(code, stage, "fake")
     }
 
-    /// SUP-6・TASK-163.3: 適用順は NO_NEW_PRIVS → Landlock → seccomp で固定。
+    /// SUP-6・TASK-163.4: 適用順は rlimit → capability 削減 → NO_NEW_PRIVS → Landlock → seccomp で固定
+    /// （launch 経路の `StageKind::ORDER` の相対順）。成功すれば未適用は空で `ExecReady` に変えられる。
     #[test]
-    fn sup6_task163_3_reapply_order_is_nnp_landlock_seccomp() {
+    fn sup6_task163_4_reapply_order_is_rlimits_caps_nnp_landlock_seccomp() {
         let _ = take();
         let report = reapply_restrictions(restrictions(std::process::id())).expect("ok");
-        assert_eq!(take(), vec!["no_new_privs", "landlock", "seccomp"]);
         assert_eq!(
-            report,
-            ExecRestrictionReport {
-                landlock_rules: 0,
-                seccomp_instructions: 0,
-                unapplied: &[
-                    UnappliedExecRestriction::Rlimits,
-                    UnappliedExecRestriction::CapabilityDrop,
-                ],
-            }
+            take(),
+            vec![
+                "rlimits",
+                "capability_drop",
+                "no_new_privs",
+                "landlock",
+                "seccomp"
+            ]
         );
-        // SEC-1: 再適用の成功は「exec してよい」を意味しない（capability 削減・rlimit が未適用）。
         assert_eq!(report.landlock_rules(), 0);
         assert_eq!(report.seccomp_instructions(), 0);
+        assert_eq!(report.rlimits_applied(), 1);
+        // SEC-1: TASK-163.4 で capability 削減・rlimit を実装し、未適用の一覧は空になった。
         assert_eq!(report.unapplied(), ExecRestrictionReport::UNAPPLIED);
-        assert!(!report.is_complete());
-        let e = report
-            .into_complete()
-            .expect_err("must not be ready to exec");
+        assert!(report.unapplied().is_empty());
+        assert!(report.is_complete());
+        let ready = report.into_complete().expect("ready to exec");
+        // `Debug` は fd を出さず、適用したプロセスの pid だけを示す。
+        assert_eq!(
+            format!("{ready:?}"),
+            format!(
+                "ExecReady {{ carry: ExecCarry {{ owner_pid: {}, .. }} }}",
+                std::process::id()
+            )
+        );
+    }
+
+    /// SUP-6・TASK-163.4: 対象に rlimit が無い（空集合）なら `prlimit` を呼ばず、残りの段を同じ順で適用する。
+    #[test]
+    fn sup6_task163_4_empty_rlimits_skip_the_rlimit_stage() {
+        let _ = take();
+        let mut r = restrictions(std::process::id());
+        r.rlimits = Rlimits::default();
+        let report = reapply_restrictions(r).expect("ok");
+        assert_eq!(report.rlimits_applied(), 0);
+        assert_eq!(
+            take(),
+            vec!["capability_drop", "no_new_privs", "landlock", "seccomp"]
+        );
+    }
+
+    /// SUP-6・SEC-1・TASK-163.4: rlimit の適用失敗（hard の引き上げ不可等）で、以降の段を呼ばない（段は
+    /// `Rlimits`）。黙って緩い制限のまま進まない。
+    #[test]
+    fn sup6_task163_4_rlimit_failure_stops_before_capability_drop() {
+        let _ = take();
+        crate::exec::rlimits::testing::fake(Err(SysError::Os(crate::sys::EPERM)), None);
+        let e = reapply_restrictions(restrictions(std::process::id())).expect_err("rlimit");
+        assert_eq!(e.stage, IsolationStage::Rlimits);
+        assert_eq!(e.code, ErrorCode::PermissionDenied);
+        assert_eq!(take(), vec!["rlimits"]);
+        let _ = crate::exec::rlimits::testing::take_sets();
+    }
+
+    /// SUP-6・SEC-1・TASK-163.4: capability 削減の失敗で、NO_NEW_PRIVS 以降を呼ばない（段は `CapabilityDrop`）。
+    #[test]
+    fn sup6_task163_4_capability_failure_stops_before_nnp() {
+        let _ = take();
+        crate::exec::capabilities::testing::fake_capability_drop_err(SysError::Os(
+            crate::sys::EPERM,
+        ));
+        let e = reapply_restrictions(restrictions(std::process::id())).expect_err("capability");
+        assert_eq!(e.stage, IsolationStage::CapabilityDrop);
+        assert_eq!(e.code, ErrorCode::PermissionDenied);
+        assert_eq!(take(), vec!["rlimits", "capability_drop"]);
+        let _ = crate::exec::rlimits::testing::take_sets();
+    }
+
+    /// SUP-6・SEC-1・SEC-4・TASK-163.4: 参加後の mount namespace が準備時に記録した対象のものと違えば、何も
+    /// 適用せず違反記録つきの `FailedPrecondition`（理由 `exec_joined_namespace_mismatch`・段 `SetNs`）。
+    /// 同じ rootfs を共有する別コンテナへ参加した場合を想定し、`/` の照合には到達しない（束縛が先）。
+    #[test]
+    fn sup6_task163_4_other_target_namespace_applies_nothing() {
+        let _ = take();
+        let mut r = restrictions(std::process::id());
+        let (dev, ino) = r.binding.target_mnt_ns;
+        r.binding.target_mnt_ns = (dev, ino.wrapping_add(1));
+        let e = reapply_restrictions(r).expect_err("other target");
         assert_eq!(e.code, ErrorCode::FailedPrecondition);
-        assert_eq!(e.stage, IsolationStage::Exec);
+        assert_eq!(e.stage, IsolationStage::SetNs);
         assert_eq!(
             e.message,
-            "exec restrictions are incomplete; not applied: rlimits, capability_drop"
+            "the mount namespace after joining is not the one of the prepared exec target"
         );
-        assert!(e.violation.is_none());
+        let v = e.violation.expect("violation recorded");
+        assert_eq!(v.reason, ViolationReason::ExecJoinedNamespaceMismatch);
+        assert_eq!(v.reason.as_str(), "exec_joined_namespace_mismatch");
+        assert_eq!(v.kind.as_str(), "exec_target");
+        assert_eq!(v.behavior_id, "SEC-1");
+        assert_eq!(take(), Vec::<&str>::new());
+        let _ = crate::exec::rlimits::testing::take_sets();
+    }
+
+    /// SUP-6・TASK-163.4: 束縛の照合は `/` の照合より先（両方不一致なら束縛の違反を返す）。
+    #[test]
+    fn sup6_task163_4_binding_check_precedes_root_check() {
+        let _ = take();
+        let dir = temp_dir("binding-first");
+        let mut r = restrictions_rooted_at(std::process::id(), &dir);
+        let (dev, ino) = r.binding.target_mnt_ns;
+        r.binding.target_mnt_ns = (dev, ino.wrapping_add(1));
+        let e = reapply_restrictions(r).expect_err("both mismatch");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            e.violation.expect("violation").reason,
+            ViolationReason::ExecJoinedNamespaceMismatch
+        );
+        assert_eq!(take(), Vec::<&str>::new());
+    }
+
+    /// SUP-6・TASK-163.4: 自プロセスの mount namespace の識別子は、`/proc/self/ns/mnt` の `stat` と一致する
+    /// （保持した procfs ディレクトリ経由の読み取りが、パス経由と同じ nsfs の inode を返す）。
+    #[test]
+    fn sup6_task163_4_current_mnt_ns_identity_matches_stat() {
+        use std::os::unix::fs::MetadataExt as _;
+        let proc_dir = open_own_proc_dir().expect("own procfs dir");
+        let via_fd = current_mnt_ns_identity(proc_dir.as_fd()).expect("identity");
+        let meta = std::fs::metadata("/proc/self/ns/mnt").expect("stat");
+        assert_eq!(via_fd, (meta.dev(), meta.ino()));
     }
 
     /// SUP-6・SEC-1・TASK-163.3: `ExecReady` は未適用が空のときだけ作れる（空の一覧は crate 内でしか
@@ -624,33 +953,32 @@ mod tests {
     /// 未適用が 1 つでも残れば `Err` で、名前を launch 経路の段の順に並べる。
     #[test]
     fn sup6_task163_3_exec_ready_requires_empty_unapplied() {
-        let report = |unapplied: &'static [UnappliedExecRestriction]| ExecRestrictionReport {
-            landlock_rules: 1,
-            seccomp_instructions: 2,
-            unapplied,
-        };
-        assert!(report(&[]).is_complete());
-        assert!(report(&[]).into_complete().is_ok());
+        assert!(report_with(&[]).is_complete());
+        assert!(report_with(&[]).into_complete().is_ok());
+        const RLIMITS: &[UnappliedExecRestriction] = &[UnappliedExecRestriction::Rlimits];
+        const CAPS: &[UnappliedExecRestriction] = &[UnappliedExecRestriction::CapabilityDrop];
         for (unapplied, message) in [
             (
-                &[UnappliedExecRestriction::Rlimits][..],
+                RLIMITS,
                 "exec restrictions are incomplete; not applied: rlimits",
             ),
             (
-                &[UnappliedExecRestriction::CapabilityDrop][..],
+                CAPS,
                 "exec restrictions are incomplete; not applied: capability_drop",
             ),
         ] {
-            assert!(!report(unapplied).is_complete());
-            let e = report(unapplied).into_complete().expect_err("incomplete");
+            assert!(!report_with(unapplied).is_complete());
+            let e = report_with(unapplied)
+                .into_complete()
+                .expect_err("incomplete");
             assert_eq!(e.code, ErrorCode::FailedPrecondition);
             assert_eq!(e.message, message);
         }
-        // 現在の実装が返す一覧は空でない（#503 が capability 削減・rlimit を実装するまで exec へ進めない）。
+        // TASK-163.4: 現在の実装が返す一覧は空（capability 削減・rlimit を適用するため）。
         assert!(
-            report(ExecRestrictionReport::UNAPPLIED)
+            report_with(ExecRestrictionReport::UNAPPLIED)
                 .into_complete()
-                .is_err()
+                .is_ok()
         );
     }
 
@@ -660,8 +988,10 @@ mod tests {
     /// 状態（黙って弱い制限で動く）を、このテストの失敗として検出する。
     #[test]
     fn sup6_task163_3_unapplied_matches_launch_stages_not_reapplied() {
-        const APPLIED_ON_EXEC: [StageKind; 4] = [
+        const APPLIED_ON_EXEC: [StageKind; 6] = [
             StageKind::CgroupJoin,
+            StageKind::Rlimits,
+            StageKind::CapabilityDrop,
             StageKind::NoNewPrivs,
             StageKind::Landlock,
             StageKind::Seccomp,
@@ -675,15 +1005,17 @@ mod tests {
             .map(|u| u.launch_stage())
             .collect();
         assert_eq!(unapplied, remaining);
+        // TASK-163.4: launch 経路の全段（cgroup 参加を含む）を exec 経路が適用するため、残りは空。
+        assert_eq!(unapplied, Vec::<StageKind>::new());
+        assert_eq!(UnappliedExecRestriction::Rlimits.as_str(), "rlimits");
         assert_eq!(
-            unapplied,
-            vec![StageKind::Rlimits, StageKind::CapabilityDrop]
+            UnappliedExecRestriction::CapabilityDrop.as_str(),
+            "capability_drop"
         );
-        let names: Vec<&str> = ExecRestrictionReport::UNAPPLIED
-            .iter()
-            .map(|u| u.as_str())
-            .collect();
-        assert_eq!(names, vec!["rlimits", "capability_drop"]);
+        assert_eq!(
+            UnappliedExecRestriction::CapabilityDrop.launch_stage(),
+            StageKind::CapabilityDrop
+        );
     }
 
     /// SUP-6・TASK-163.3・REPAIR-5: 事前に開いた status が読み取り上限を超える場合は、切り詰めて解釈せず
@@ -724,6 +1056,7 @@ mod tests {
         assert_eq!(v.kind.as_str(), "exec_target");
         assert_eq!(v.behavior_id, "SEC-1");
         assert_eq!(take(), Vec::<&str>::new());
+        let _ = crate::exec::rlimits::testing::take_sets();
     }
 
     /// SUP-6・SEC-1・TASK-163.3: 準備したプロセスの確認は root の照合より先（別プロセスからは root が
@@ -764,8 +1097,8 @@ mod tests {
     /// 意味を持たないため）。Landlock の検出より先に判定するので、カーネル版数に依存しない。
     #[test]
     fn sup6_task163_3_prepare_rejects_rootfs_equal_to_own_root() {
-        let c = config(true, "[]");
-        let e = prepare_distinct_from_own_root(&c, dir_fd(Path::new("/"))).expect_err("own root");
+        let root = dir_fd(Path::new("/"));
+        let e = reject_own_root(root.as_fd(), root.as_fd()).expect_err("own root");
         assert_eq!(e.code, ErrorCode::InvalidArgument);
         assert_eq!(e.stage, IsolationStage::Validate);
         assert_eq!(e.message, "rootfs must not be the host root '/'");
@@ -781,7 +1114,8 @@ mod tests {
         let e = reapply_restrictions(restrictions(std::process::id())).expect_err("nnp fails");
         assert_eq!(e.stage, IsolationStage::NoNewPrivs);
         assert_eq!(e.code, ErrorCode::PermissionDenied);
-        assert_eq!(take(), vec!["no_new_privs"]);
+        assert_eq!(take(), vec!["rlimits", "capability_drop", "no_new_privs"]);
+        let _ = crate::exec::rlimits::testing::take_sets();
     }
 
     /// SUP-6・TASK-163.3: Landlock の失敗で seccomp を呼ばない（段と code を保つ）。
@@ -795,7 +1129,11 @@ mod tests {
         let e = reapply_restrictions(restrictions(std::process::id())).expect_err("landlock");
         assert_eq!(e.stage, IsolationStage::Landlock);
         assert_eq!(e.code, ErrorCode::FailedPrecondition);
-        assert_eq!(take(), vec!["no_new_privs", "landlock"]);
+        assert_eq!(
+            take(),
+            vec!["rlimits", "capability_drop", "no_new_privs", "landlock"]
+        );
+        let _ = crate::exec::rlimits::testing::take_sets();
     }
 
     /// SUP-6・TASK-163.3: seccomp の失敗は段 Seccomp・code を保って返る（Landlock までは適用済み）。
@@ -809,7 +1147,17 @@ mod tests {
         let e = reapply_restrictions(restrictions(std::process::id())).expect_err("seccomp");
         assert_eq!(e.stage, IsolationStage::Seccomp);
         assert_eq!(e.code, ErrorCode::Internal);
-        assert_eq!(take(), vec!["no_new_privs", "landlock", "seccomp"]);
+        assert_eq!(
+            take(),
+            vec![
+                "rlimits",
+                "capability_drop",
+                "no_new_privs",
+                "landlock",
+                "seccomp"
+            ]
+        );
+        let _ = crate::exec::rlimits::testing::take_sets();
     }
 
     /// SUP-6・TASK-163.3: 準備したのと別のプロセスからは何も適用せず FailedPrecondition。
@@ -846,6 +1194,14 @@ mod tests {
         (bundle, rootfs)
     }
 
+    /// 固定済みの rootfs の複製（`prepare_exec_restrictions` が行うのと同じ）。
+    fn pinned_fd(rootfs: &RootfsDir) -> OwnedFd {
+        rootfs
+            .as_fd()
+            .try_clone_to_owned()
+            .expect("duplicate rootfs")
+    }
+
     fn config(readonly: bool, mounts: &str) -> OciConfig {
         let json = format!(
             r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":{readonly}}},"mounts":{mounts}}}"#
@@ -859,7 +1215,9 @@ mod tests {
     fn sup6_task163_3_prepare_rejects_shadowed_write_restriction() {
         let c = config(false, r#"[{"destination":"/etc","options":["ro"]}]"#);
         let (bundle, rootfs) = pinned_rootfs("shadowed", &c);
-        let e = prepare_exec_restrictions(&c, &rootfs).expect_err("must be rejected");
+        let e = prepare_with_rootfs(&c, pinned_fd(&rootfs), Rlimits::default(), own_binding())
+            .map(|_| ())
+            .expect_err("must be rejected");
         let _ = std::fs::remove_dir_all(&bundle);
         assert_eq!(e.stage, IsolationStage::Landlock);
         const DETECT: [&str; 6] = [
@@ -886,7 +1244,8 @@ mod tests {
     fn sup6_task163_3_prepare_records_pid_and_reads_threads() {
         let c = config(true, "[]");
         let (bundle, rootfs) = pinned_rootfs("records", &c);
-        let prepared = prepare_exec_restrictions(&c, &rootfs);
+        let prepared =
+            prepare_with_rootfs(&c, pinned_fd(&rootfs), Rlimits::default(), own_binding());
         let _ = std::fs::remove_dir_all(&bundle);
         match prepared {
             Ok(mut r) => {
@@ -910,7 +1269,8 @@ mod tests {
             &format!(r#"[{{"destination":"{dest}","options":["ro"]}}]"#),
         );
         let (bundle, rootfs) = pinned_rootfs("unresolved", &c);
-        let prepared = prepare_exec_restrictions(&c, &rootfs);
+        let prepared =
+            prepare_with_rootfs(&c, pinned_fd(&rootfs), Rlimits::default(), own_binding());
         let _ = std::fs::remove_dir_all(&bundle);
         match prepared {
             Ok(r) => {

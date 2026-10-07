@@ -173,6 +173,27 @@ impl Pid1Target {
         &self.expected_cgroup_path
     }
 
+    /// 対象の mount namespace の識別子（nsfs の `st_dev`・`st_ino`）。制限を exec の対象へ束縛するために
+    /// `exec::reapply` が参加の前に記録し、参加後の自プロセスの識別子と照合する（SUP-6・SEC-1・TASK-163.4）。
+    ///
+    /// 読み取りの後に pidfd の未終了を確認し、読んだ識別子が pidfd の指すプロセスのものであることを保証する。
+    pub(super) fn mnt_ns_identity(&self) -> Result<NsIdentity, ExecError> {
+        let id = ns_identity(&format!("/proc/{}/ns/mnt", self.pid))
+            .map_err(|e| target_proc_error(&e, "read target mount namespace"))?;
+        ensure_not_exited(self, "refusing to bind restrictions to it")?;
+        Ok(id)
+    }
+
+    /// 対象の `/proc/<pid>/limits` の内容（上限つきで読む）。コンテナの rlimit の記録上の出所が無いため、
+    /// exec プロセスへ同じ値を適用する材料にする（SUP-6・SUP-12・TASK-163.4）。読み取りの後に pidfd の
+    /// 未終了を確認する。
+    pub(super) fn read_limits(&self) -> Result<String, ExecError> {
+        let text = read_bounded(&format!("/proc/{}/limits", self.pid))
+            .map_err(|e| target_proc_error(&e, "read target limits"))?;
+        ensure_not_exited(self, "refusing to copy its limits")?;
+        Ok(text)
+    }
+
     /// `pid` を候補として pid1 を特定し、検証を通ったものだけを対象にする。
     ///
     /// 期待 cgroup パスは、記録のコンテナ ID と cgroup 配置から `<scope>/fc-<id>@<instance>` として
@@ -258,7 +279,7 @@ impl Pid1Target {
 const CALLER_DISTINCT: [JoinNamespace; 2] = [JoinNamespace::Pid, JoinNamespace::Mount];
 
 /// namespace の識別子（nsfs の dev, ino）。
-type NsIdentity = (u64, u64);
+pub(super) type NsIdentity = (u64, u64);
 
 /// `(種別, 対象の識別子, 呼び出し側の識別子)` の並びから、呼び出し側と同じ namespace があれば最初の 1 件の
 /// 違反理由を返す（副作用の前に判定するテスト可能な純関数）。pid / mnt 以外の種別は判定対象にしない。

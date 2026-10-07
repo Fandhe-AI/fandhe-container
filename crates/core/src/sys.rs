@@ -1135,12 +1135,30 @@ pub(crate) fn fork_single_threaded<F: FnOnce() -> i32>(
     child: F,
     panic_exit: i32,
 ) -> Result<u32, SysError> {
+    fork_single_threaded_with(
+        || std::fs::read_to_string("/proc/self/status").is_ok_and(|status| threads_is_one(&status)),
+        child,
+        panic_exit,
+    )
+}
+
+/// [`fork_single_threaded`] の本体。`is_single_threaded` が「呼び出しプロセスのスレッド数が 1 である」ことを
+/// 返したときだけ fork する（SUP-6・TASK-163.4・#503）。
+///
+/// exec 専用プロセスは `setns(CLONE_NEWNS)` の後に `/proc` がコンテナ側の procfs になり、自プロセスを
+/// `/proc/self` で解決できない。そのため `setns` の前に開いた自プロセスの status fd からスレッド数を読む
+/// 判定（`ThreadCountSource::PreOpened`）を呼び出し側が渡す。判定の出所が変わるだけで「fork の直前に
+/// `Threads: 1` を確認する」という強制は同じ関数の内側に残る。判定が偽（読めない場合を含む）なら fork せず
+/// [`SysError::MultiThreaded`]（fail-closed）。
+pub(crate) fn fork_single_threaded_with<F: FnOnce() -> i32>(
+    is_single_threaded: impl FnOnce() -> bool,
+    child: F,
+    panic_exit: i32,
+) -> Result<u32, SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
-    let status =
-        std::fs::read_to_string("/proc/self/status").map_err(|_| SysError::MultiThreaded)?;
-    if !threads_is_one(&status) {
+    if !is_single_threaded() {
         return Err(SysError::MultiThreaded);
     }
     {
@@ -1148,7 +1166,7 @@ pub(crate) fn fork_single_threaded<F: FnOnce() -> i32>(
         let _ = io::stdout().flush();
         let _ = io::stderr().flush();
     }
-    // SAFETY: 直前に `Threads: 1` を確認済みで、fork した子には呼び出しスレッドだけが複製される
+    // SAFETY: 直前に呼び出し側の判定で `Threads: 1` を確認済みで、fork した子には呼び出しスレッドだけが複製される
     // ため、他スレッドが保持していたロック・ヒープの不整合を子が引き継がない。子は下の分岐で
     // `child` を実行して `_exit` し、呼び出し元のフレームへ戻らない。親は戻り値の pid だけを使う。
     let pid = unsafe { fork() };
@@ -2571,6 +2589,24 @@ mod tests {
         assert_eq!(err, SysError::MultiThreaded);
         tx.send(()).unwrap();
         helper.join().unwrap();
+    }
+
+    /// SUP-6（TASK-163.4）: 呼び出し側が渡す判定が偽なら、スレッド数によらず fork せず `MultiThreaded` で拒否する
+    /// （子のクロージャは実行されない）。判定の出所が変わっても「確認が偽なら fork しない」強制は同じ。
+    #[test]
+    fn sup6_task163_4_fork_with_refuses_when_predicate_is_false() {
+        let ran = std::cell::Cell::new(false);
+        let err = fork_single_threaded_with(
+            || false,
+            || {
+                ran.set(true);
+                0
+            },
+            125,
+        )
+        .unwrap_err();
+        assert_eq!(err, SysError::MultiThreaded);
+        assert!(!ran.get());
     }
 
     /// CORE-1（TASK-27.4.1）: `execve` の引数配列は要素数 + 1 の NULL 終端。

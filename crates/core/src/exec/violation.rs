@@ -166,6 +166,10 @@ pub enum ViolationReason {
     /// rootfs と同じディレクトリでない（pivot していない対象・`/` へ別のマウントが重ねられた対象。この状態で
     /// 制限を適用するとルールが別の木に付き、コマンドも rootfs の外で動く。SEC-1・TASK-163.3）。
     ExecRootNotContainerRootfs,
+    /// `setns` 参加後の呼び出しプロセスの mount namespace が、制限を準備した時点の exec の対象（pid1）の
+    /// mount namespace と一致しない（A 用に準備した制限を、同じ rootfs を共有する別コンテナ B へ参加した
+    /// プロセスへ適用させない。rootfs のディレクトリ照合だけでは取り違えを検出できない。SEC-1・TASK-163.4）。
+    ExecJoinedNamespaceMismatch,
 }
 
 impl ViolationReason {
@@ -211,6 +215,7 @@ impl ViolationReason {
             Self::ExecTargetSharesPidNamespace => "exec_target_shares_pid_namespace",
             Self::ExecTargetSharesMountNamespace => "exec_target_shares_mount_namespace",
             Self::ExecRootNotContainerRootfs => "exec_root_not_container_rootfs",
+            Self::ExecJoinedNamespaceMismatch => "exec_joined_namespace_mismatch",
         }
     }
 
@@ -256,7 +261,8 @@ impl ViolationReason {
             | Self::ExecTargetCgroupMismatch
             | Self::ExecTargetSharesPidNamespace
             | Self::ExecTargetSharesMountNamespace
-            | Self::ExecRootNotContainerRootfs => ViolationKind::ExecTarget,
+            | Self::ExecRootNotContainerRootfs
+            | Self::ExecJoinedNamespaceMismatch => ViolationKind::ExecTarget,
         }
     }
 
@@ -266,7 +272,9 @@ impl ViolationReason {
             Self::UserNamespaceRequired | Self::HostRootIdentityMapping | Self::IdentityChanged => {
                 "SEC-5"
             }
-            Self::ExecTargetCgroupMismatch | Self::ExecRootNotContainerRootfs => "SEC-1",
+            Self::ExecTargetCgroupMismatch
+            | Self::ExecRootNotContainerRootfs
+            | Self::ExecJoinedNamespaceMismatch => "SEC-1",
             Self::ExecTargetNotNestedPid1
             | Self::ExecTargetSharesPidNamespace
             | Self::ExecTargetSharesMountNamespace => "SUP-6",
@@ -315,7 +323,8 @@ impl ViolationReason {
             | Self::ExecTargetCgroupMismatch
             | Self::ExecTargetSharesPidNamespace
             | Self::ExecTargetSharesMountNamespace
-            | Self::ExecRootNotContainerRootfs => ErrorCode::FailedPrecondition,
+            | Self::ExecRootNotContainerRootfs
+            | Self::ExecJoinedNamespaceMismatch => ErrorCode::FailedPrecondition,
             Self::EntrypointIsRuntimeBinary => ErrorCode::PermissionDenied,
         }
     }
@@ -425,6 +434,9 @@ impl ViolationReason {
             }
             Self::ExecRootNotContainerRootfs => {
                 "the root directory after joining is not the recorded container rootfs"
+            }
+            Self::ExecJoinedNamespaceMismatch => {
+                "the mount namespace after joining is not the one of the prepared exec target"
             }
         }
     }
@@ -656,6 +668,12 @@ mod tests {
                 "exec_root_not_container_rootfs",
                 "SEC-1",
                 "the root directory after joining is not the recorded container rootfs",
+            ),
+            (
+                ViolationReason::ExecJoinedNamespaceMismatch,
+                "exec_joined_namespace_mismatch",
+                "SEC-1",
+                "the mount namespace after joining is not the one of the prepared exec target",
             ),
         ];
         for (r, code, behavior, message) in cases {

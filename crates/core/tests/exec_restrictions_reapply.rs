@@ -13,7 +13,8 @@
 //! `exec_root_not_container_rootfs`。`NoNewPrivs`・`Seccomp` とも変化なし = 何も適用していない）を、カーネル
 //! 版数に依存せず具体値で照合する（SEC-1・SEC-4）。
 //! 「`setns` の後に保持 fd 経由でスレッド数を読める」「実コンテナへ参加した後の `/` が rootfs と一致する」
-//! ことの実機確認は #503（TASK-163.4）の統合テストで行う（REPAIR-3）。
+//! 「capability 削減・rlimit 適用」の実機確認は supervisor の `tests/exec.rs`（TASK-163.4・#503）で行う。
+//! 本テストは非特権で動かすため、観測関数は capability 削減を省く（未適用に `CapabilityDrop` が残る）。
 //!
 //! # 実行モード（ci.md「実機前提テスト」）
 //!
@@ -157,29 +158,26 @@ fn main() {
             return;
         }
         assert!(o.reapply_error.is_none(), "{:?}", o.reapply_error);
-        let report = o.report.as_ref().expect("report");
+        let report = o.report.expect("report");
         // root（`/`）と `allowed` の 2 ルール。
         assert_eq!(report.landlock_rules(), 2, "{report:?}");
         assert!(report.seccomp_instructions() > 0, "{report:?}");
-        // SEC-1: 再適用の成功は exec してよい状態を意味しない（capability 削減・rlimit は未適用）。
+        // SEC-1: 観測関数は `CAP_SETPCAP` を持たない非特権の子でも動くよう capability 削減を省くため、未適用に
+        // `CapabilityDrop` が残り、exec へ進むための証跡（`ExecReady`）は作れない（完了を装わない）。
+        // rlimit は空集合（TASK-163.4 で本番の入口は rlimit・capability とも適用する）。
+        assert_eq!(report.rlimits_applied(), 0);
+        assert_eq!(report.capability_bounding_dropped(), 0);
         assert_eq!(
             report.unapplied(),
-            &[
-                UnappliedExecRestriction::Rlimits,
-                UnappliedExecRestriction::CapabilityDrop
-            ]
+            &[UnappliedExecRestriction::CapabilityDrop]
         );
         assert!(!report.is_complete());
-        // exec へ進むための証跡（`ExecReady`）は作れない。
-        let incomplete = report
-            .clone()
-            .into_complete()
-            .expect_err("not ready to exec");
+        let incomplete = report.into_complete().expect_err("not ready to exec");
         assert_eq!(incomplete.code, ErrorCode::FailedPrecondition);
         assert_eq!(incomplete.stage, IsolationStage::Exec);
         assert_eq!(
             incomplete.message,
-            "exec restrictions are incomplete; not applied: rlimits, capability_drop"
+            "exec restrictions are incomplete; not applied: capability_drop"
         );
         assert_eq!(o.seccomp_before, "0");
         assert_eq!(o.seccomp_after, "2");

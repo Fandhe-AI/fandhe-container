@@ -1,11 +1,11 @@
-//! exec の入口: 稼働中コンテナの pid1 を特定し、その namespace と cgroup へ参加して制限を再適用する（SUP-6・TASK-163.1〜163.3・#500〜#502・MS-9）。
+//! exec の入口: 稼働中コンテナの pid1 を特定し、その namespace と cgroup へ参加して制限を再適用し、コマンドを実行する（SUP-6・TASK-163.1〜163.4・#500〜#503・MS-9）。
 //!
 //! # 役割と呼び出し文脈
 //!
 //! `state.json` のレコードから対象を決め、`fandhe_container_core::exec` の安全 API（`Pid1Target` /
 //! `join_namespaces` / `prepare_cgroup_join` / `join_cgroup` / `prepare_exec_restrictions` /
 //! `reapply_restrictions`）へ配線するだけの薄い層で、`unsafe` も OS 分岐も持たない（OS 局所化は core。CLI-1）。
-//! 将来 #503 の exec 専用プロセスと TASK-161（SUP-4）の healthcheck が同じ関数を使う
+//! 通しの入口は [`run_command`]（#503）。exec 専用プロセスと TASK-161（SUP-4）の healthcheck が同じ関数を使う
 //! （`health.rs` の `HealthProbe` が期待する共通コードパス）。
 //!
 //! # 契約
@@ -21,81 +21,74 @@
 //! - 既定のビルドの公開 API に、期待 cgroup パスを文字列で受ける入口は無い（core・supervisor とも
 //!   `exec-test-support` feature を付けたビルドに限る）
 //! - [`enter_namespaces`] は呼び出しスレッドの namespace を不可逆に変える。単一スレッドのプロセスから
-//!   のみ呼べる。logs 捕捉スレッドを持つ supervisor 本体からは呼ばず、exec 専用プロセスから呼ぶ（#503）
+//!   のみ呼べる。logs 捕捉スレッドを持つ supervisor 本体からは呼ばず、exec 専用プロセスから呼ぶ（[`run_command`]。#503）
 //! - 順序: [`prepare_cgroup_join`]（cgroup.procs の fd 確保。#501）は [`enter_namespaces`] の **前**、
-//!   [`join_cgroup`] は準備の後（#503 は `enter_namespaces` の後・seccomp の前に呼ぶ想定）。
+//!   [`join_cgroup`] は準備の後（`enter_namespaces` の後・seccomp の前。[`run_command`] が固定する）。
 //!   `/proc/self/cgroup` の fd も準備で確保する（`setns` 後は自プロセスを procfs から解決できないため）
-//! - seccomp / Landlock の再適用（#502）: [`prepare_restrictions`]（ホスト側の `config.json` を読み、
+//! - 制限の再適用（#502・#503）: [`prepare_restrictions`]（ホスト側の `config.json` を読み、
 //!   コンテナの rootfs を固定し、自プロセスの `/proc/self/status` の fd を確保）は [`enter_namespaces`] の **前**、
 //!   [`reapply_restrictions`] は [`enter_namespaces`] と [`join_cgroup`] の **後**（seccomp が `setns` を
 //!   拒否するため）。**準備したプロセス自身** が単一スレッドで呼ぶ（fork した子から呼ぶと別プロセスの
 //!   スレッド数を読むため、core が準備時の pid との不一致を拒否する）。適用は不可逆で、失敗時は制限が
-//!   部分的に載った不定状態のため、呼び出し側は続行せず終了する。#503 は「適用 → fork → execve」の順にする
+//!   部分的に載った不定状態のため、呼び出し側は続行せず終了する。「適用 → fork → execve」の順にする
 //!   （制限は fork / execve を越えて継承される）。順序の全体:
 //!   `identify_pid1` → `prepare_cgroup_join` → `prepare_restrictions` → `enter_namespaces` → `join_cgroup` →
-//!   `reapply_restrictions`
+//!   `reapply_restrictions` → `require_exec_ready` → `spawn_exec_command`
 //! - 再適用は、参加後の自プロセスの `/` が **記録したコンテナの rootfs**（[`identify_pid1`] に渡した記録の
 //!   bundle から、start と同じ検査・固定で得たディレクトリ）であることを照合してから適用する。不一致
 //!   （pivot していない対象・`/` へ別のマウントが重ねられた対象）は違反 `exec_root_not_container_rootfs` で
 //!   拒否し、何も適用しない（SEC-1。根拠は core の `exec/reapply.rs` のモジュール doc）。bundle は
 //!   [`ExecTarget`] が特定時の記録から保持するため、別の記録の `config.json`・rootfs を取り違えない
-//! - **再適用の成功は exec してよい状態を意味しない（完了は型で表す）**: 載るのは `NO_NEW_PRIVS`・Landlock・
-//!   seccomp だけで、capability 削減と rlimit 適用は行わない。`setns` は資格情報を変えないため、rootful の exec
-//!   プロセスは再適用の後も全 capability を持つ。`ExecRestrictionReport` のフィールドは非公開で、crate の外から
-//!   未適用の一覧を書き換えたり値を構築したりできない。exec へ進んでよいことの証跡は core の `ExecReady` で、
-//!   [`require_exec_ready`]（core の `ExecRestrictionReport::into_complete`）だけが作る。未適用が残る間は必ず
-//!   `FailedPrecondition` になり、現在の実装では常に失敗する。**fork / execve の入口（#503 が追加する）は
-//!   `ExecReady` を値で受け取ること**（`ExecRestrictionReport`・真偽値を受け取る入口を作らない。SEC-1）
+//! - **完了は型で表す**: 再適用は rlimit（対象 pid1 の実効値）・capability 削減（OCI 既定集合）・`NO_NEW_PRIVS`・
+//!   Landlock・seccomp を載せる（launch 経路と同じ順序。#503）。`ExecRestrictionReport` のフィールドは非公開で、
+//!   crate の外から未適用の一覧を書き換えたり値を構築したりできない。exec へ進んでよいことの証跡は core の
+//!   `ExecReady` で、[`require_exec_ready`]（core の `ExecRestrictionReport::into_complete`）だけが作る。
+//!   core の `spawn_exec_command`（fork → `close_range` → `execveat`）は `ExecReady` を値で受け取り、
+//!   `ExecRestrictionReport`・真偽値を受け取る入口はない（SEC-1）
+//! - **制限は対象へ束縛される**: [`prepare_restrictions`] が対象 pid1 の mount namespace の識別子を記録し、
+//!   [`reapply_restrictions`] が参加後の自プロセスのものと照合する。同じ rootfs を共有する別コンテナへ参加した
+//!   場合は違反 `exec_joined_namespace_mismatch` で拒否し、何も適用しない（`/` の照合だけでは検出できない）
+//! - **全体の上限時間**: [`run_command`] は準備から終了待ちまでの全体に上限時間を課す（REPAIR-5）。段の間で
+//!   残りを確かめ、fork 後は残りで `wait_timeout` する（超過は子を `SIGKILL` して回収し `Timeout`）。単一スレッド
+//!   のため、procfs・cgroupfs の個々の読み書きの途中でのハングを割り込んで止める手段は持たない（それらは
+//!   ブロックしない通常ファイルで、対象の終了は pidfd で確認する）
 //! - 再適用の Landlock ルールは、launcher が実際にマウントした結果ではなく bundle の `config.json` から
 //!   再導出する（launch 時の ruleset は保存されていない）。launch 後に `config.json` が書き換えられると
 //!   追従してしまうが、bundle は supervisor と同じ信頼境界（コンテナから書けない場所）にある前提とする。
 //!   config の mount destination が稼働中の rootfs に無ければ Landlock の適用が失敗し、exec は拒否される
 //!   （fail-closed）
 //! - [`join_cgroup`] は呼び出しプロセスをコンテナの cgroup へ移す（`cgroup.procs` はスレッドグループ全体を
-//!   移す）。supervisor 本体から呼ばず、委譲スコープの内側で動く exec 専用プロセスからのみ呼ぶ（#503）。
-//!   失敗時は所属が不定のため、呼び出し側は続行せず終了する（fail-closed）。保持 fd は `execve` の前に
-//!   `close_range` で閉じる必要がある（#503）
+//!   移す）。supervisor 本体から呼ばず、委譲スコープの内側で動く exec 専用プロセスからのみ呼ぶ。
+//!   失敗時は所属が不定のため、呼び出し側は続行せず終了する（fail-closed）。保持 fd は子が `execve` の前に
+//!   `close_range` で閉じる（core の `exec/process.rs`）
 //!
-//! # #503（TASK-163.4）が `execve` を結線する前の条件
+//! # `execve` を結線する前の 5 条件（#502 が残し、#503 で満たした）
 //!
-//! 次の 5 点をすべて満たすまで、exec 専用プロセスはコマンドを実行してはならない（SUP-6・SEC-1。詳細は core の
-//! `exec/reapply.rs` のモジュール doc の同名の節）。
-//!
-//! 1. **完了を型で強制する**: fork / execve の入口は `ExecReady` だけを受け取る。本モジュールにも core にも、
-//!    `ExecReady` を作る別経路（テスト用の公開コンストラクタ・feature による抜け道を含む）を足さない
-//! 2. **capability 削減と rlimit 適用を実装し、未適用を空にする**: 実装したものを core の
-//!    `ExecRestrictionReport::UNAPPLIED` から外す。空になって初めて [`require_exec_ready`] が成功する
-//! 3. **制限を exec の対象へ束縛する**: 現在の `ExecRestrictions` は準備時の [`ExecTarget`] を覚えておらず、
-//!    [`reapply_restrictions`] は「[`enter_namespaces`] で参加した対象」と「[`prepare_restrictions`] に渡した
-//!    対象」が同じであることを確かめない。参加後の `/` の照合は rootfs のディレクトリの同一性だけを見るため、
-//!    同じ rootfs を共有する 2 つのコンテナでは取り違えても照合を通過する。対象の mount namespace の識別子を
-//!    準備時に記録して参加後に照合する等で束縛し、`ExecReady` も同じ対象に束縛する
-//! 4. **`setns` を伴う通し試験**: 実コンテナへ参加した後の `/` と rootfs の一致、保持した status fd からの
-//!    スレッド数の読み取り、ルールパスの解決の起点が照合済みの fd であること（プロセスの `/` を引き直して
-//!    いないことを区別できる検査）、pivot していない対象の拒否を具体値で照合する
-//! 5. **exec 専用プロセス全体のタイムアウトと fd の後始末**: 準備から `execve` までの全体に上限時間を設け
-//!    （REPAIR-5）、`execve` の前に `close_range` でホスト側の fd を閉じる
+//! 1. 完了を型で強制する: core の `spawn_exec_command` は `ExecReady` だけを値で受け取る
+//! 2. capability 削減と rlimit 適用を実装し、未適用の一覧は空
+//! 3. 制限を exec の対象へ束縛する（mount namespace の識別子の照合）
+//! 4. `setns` を伴う通し試験: `tests/exec.rs`（実機前提。AGENTS.md）
+//! 5. exec 専用プロセス全体のタイムアウトと、`execve` 前の `close_range`（[`run_command`] と core の
+//!    `exec/exec_command.rs`）
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! namespace 参加・cgroup join・seccomp / Landlock 再適用までで、コマンド実行は未実装。fork・execve・
-//! `close_range` と統合テスト（#503・TASK-163.4）は未実装（SUP-6）。`setns` の後に保持 fd からスレッド数が
-//! 読めることの実機確認（再適用の通し試験）も #503 の統合テストで扱う（#502 のテストは `setns` をしない）。
-//! exec プロセスの capability 削減・rlimit 適用も未実装（TASK-163 の内容は seccomp / Landlock のみ。要確認）。
-//! 未実装である間、[`reapply_restrictions`] の成功結果は未適用の制限を列挙し、[`require_exec_ready`] は
-//! 必ず失敗する（完了を装わない）。
-//! 実 cgroup への参加の実機結合試験も #503 の統合テストで扱う（本 Issue では core の既定集合のユニットテストで
-//! `cgroup.procs` への書き込みと読み戻しを照合）。
-//! user namespace への参加も未実装で、既定の rootless（コンテナが user namespace を持つ）では
-//! [`enter_namespaces`] が `EPERM` で失敗する（fail-closed。rootless の exec には必須）。
-//! 違反記録（SEC-4）の監査ログへの保存の配線も未実装（#839・#503）。
+//! - user namespace への参加。既定の rootless（コンテナが user namespace を持つ）では [`enter_namespaces`] が
+//!   `EPERM` で失敗する（fail-closed。rootless の exec には必須。通しの結合試験は rootful のみ）
+//! - コマンドの標準入出力の受け渡し（CLI の exec・TASK-161 / SUP-4 の healthcheck の出力取得）。現状は launch と
+//!   同じく `/dev/null` へ固定し、環境変数・cwd・ユーザーの指定も未対応（cwd はコンテナの rootfs の根）
+//! - 違反記録（SEC-4）の監査ログへの保存の配線（#839）
+//! - `--ulimit` の指定値の `state.json` への記録。現状は pid1 の実効値を写して代替する
+
+use std::time::{Duration, Instant};
 
 use fandhe_container_core::exec::{
-    ExecCgroupJoin, ExecCgroupJoinReport, ExecError, ExecReady, ExecRestrictionReport,
-    ExecRestrictions, NamespaceJoinReport, Pid1Target, join_cgroup as core_join_cgroup,
-    join_namespaces, prepare_cgroup_join as core_prepare_cgroup_join,
+    ChildExit, Entrypoint, ExecCgroupJoin, ExecCgroupJoinReport, ExecError, ExecReady,
+    ExecRestrictionReport, ExecRestrictions, NamespaceJoinReport, Pid1Target,
+    join_cgroup as core_join_cgroup, join_namespaces,
+    prepare_cgroup_join as core_prepare_cgroup_join,
     prepare_exec_restrictions as core_prepare_exec_restrictions,
-    reapply_restrictions as core_reapply_restrictions,
+    reapply_restrictions as core_reapply_restrictions, spawn_exec_command,
 };
 use fandhe_container_core::oci_runtime::{OciConfig, RootfsDir, load_config, pin_bundle_rootfs};
 use fandhe_container_core::traits::{
@@ -199,24 +192,26 @@ pub fn join_cgroup(join: ExecCgroupJoin) -> Result<ExecCgroupJoinReport, TraitEr
     core_join_cgroup(join).map_err(from_exec_error)
 }
 
-/// コンテナの `config.json` から Landlock ruleset を作り、コンテナの rootfs を固定し、自プロセスの status fd を
-/// 確保する。[`enter_namespaces`] の **前** に、再適用を行うプロセス自身が呼ぶ（SUP-6・#502。契約はモジュール doc）。
+/// コンテナの `config.json` から Landlock ruleset を作り、コンテナの rootfs を固定し、自プロセスの status fd・
+/// 対象の mount namespace の識別子・対象の実効 rlimit を確保する。[`enter_namespaces`] の **前** に、再適用を
+/// 行うプロセス自身が呼ぶ（SUP-6・#502・#503。契約はモジュール doc）。
 ///
 /// `config.json` と rootfs は、`target` を特定した記録の bundle から取る（呼び出し側は記録を渡し直さない）。
 /// rootfs は start と同じ検査（bundle 配下・symlink なし）で固定し、参加後の `/` と照合する基準にする。
 /// Landlock 未対応カーネル・ルール生成失敗・rootfs を固定できない場合は拒否する（fail-closed。CORE-5・SEC-1）。
 pub fn prepare_restrictions(target: &ExecTarget) -> Result<ExecRestrictions, TraitError> {
     let (config, rootfs) = load_exec_bundle(&target.bundle)?;
-    core_prepare_exec_restrictions(&config, &rootfs).map_err(from_exec_error)
+    core_prepare_exec_restrictions(&target.pid1, &config, &rootfs).map_err(from_exec_error)
 }
 
-/// `NO_NEW_PRIVS` → Landlock → seccomp を自プロセスへ不可逆に適用する。[`enter_namespaces`] と
-/// [`join_cgroup`] の **後**、準備したプロセス自身から単一スレッドで呼ぶ（SUP-6・#502）。
-/// 適用の前に、参加後の `/` が記録したコンテナの rootfs であることを照合し、不一致なら何も適用せず拒否する。
-/// 失敗時は制限が部分的に載った不定状態のため、続行せず終了すること。
+/// rlimit → capability 削減 → `NO_NEW_PRIVS` → Landlock → seccomp を自プロセスへ不可逆に適用する。
+/// [`enter_namespaces`] と [`join_cgroup`] の **後**、準備したプロセス自身から単一スレッドで呼ぶ（SUP-6・#502・#503）。
+/// 適用の前に、参加後の mount namespace が準備時の対象のものであること・参加後の `/` が記録したコンテナの
+/// rootfs であることを照合し、不一致なら何も適用せず拒否する。失敗時は制限が部分的に載った不定状態のため、
+/// 続行せず終了すること。
 ///
-/// 成功しても capability 削減と rlimit 適用は行われていない。`execve` へ進んでよいことの証跡は
-/// [`require_exec_ready`] が返す `ExecReady` だけで、戻り値そのものは exec の許可に使えない（SEC-1）。
+/// `execve` へ進んでよいことの証跡は [`require_exec_ready`] が返す `ExecReady` だけで、戻り値そのものは
+/// exec の許可に使えない（SEC-1）。
 pub fn reapply_restrictions(
     restrictions: ExecRestrictions,
 ) -> Result<ExecRestrictionReport, TraitError> {
@@ -225,11 +220,131 @@ pub fn reapply_restrictions(
 
 /// 再適用の結果を、exec へ進んでよいことの証跡 `ExecReady` に変える（SUP-6・SEC-1・#502）。
 ///
-/// launch 経路と同じ制限のうち未適用のものが 1 つでも残っていれば `FailedPrecondition`。現在の実装は
-/// capability 削減と rlimit を適用しないため **必ず失敗する**（#503 が実装するまで exec へ進めない）。
-/// #503 の fork / execve の入口は、この関数が返す `ExecReady` を値で受け取ること（契約はモジュール doc）。
+/// launch 経路と同じ制限のうち未適用のものが 1 つでも残っていれば `FailedPrecondition`。#503 で capability 削減と
+/// rlimit 適用を実装したため、通常の再適用の結果は成功する。fork / execve の入口（[`run_command`] が呼ぶ
+/// core の `spawn_exec_command`）は、この関数が返す `ExecReady` を値で受け取る（契約はモジュール doc）。
 pub fn require_exec_ready(report: ExecRestrictionReport) -> Result<ExecReady, TraitError> {
     report.into_complete().map_err(from_exec_error)
+}
+
+/// [`run_command`] の結果（将来拡張できる構造。REPAIR-3）。
+///
+/// コマンドの終了状態と、exec プロセスへ載せた制限の件数（実行前に確認した証跡の要約）を持つ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExecOutcome {
+    /// コマンドの終了状態（子が `execve` 前に失敗した場合は 125 / 126 / 127 の `Exited`。core の
+    /// `exec/exec_command.rs` を参照）。
+    pub exit: ChildExit,
+    /// 適用した rlimit の種別数（対象 pid1 の実効値。通常は 16）。
+    pub rlimits_applied: usize,
+    /// bounding set から落とした capability の数。
+    pub capability_bounding_dropped: usize,
+    /// 追加した Landlock ルール数。
+    pub landlock_rules: usize,
+    /// 適用した seccomp の BPF 命令数。
+    pub seccomp_instructions: usize,
+}
+
+/// 準備から fork までの全体の期限（REPAIR-5）。各段の間で残りを確かめ、超過したら次の段へ進まず `Timeout`。
+#[derive(Debug, Clone, Copy)]
+struct Deadline {
+    at: Instant,
+}
+
+impl Deadline {
+    /// `timeout` 後を期限にする（`Instant` の加算が溢れる極端に長い指定は、7 日に丸める）。
+    fn after(timeout: Duration) -> Self {
+        const MAX: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+        let now = Instant::now();
+        let at = now
+            .checked_add(timeout.min(MAX))
+            .unwrap_or_else(|| now + MAX);
+        Self { at }
+    }
+
+    /// 期限内なら残り時間、超過なら `Timeout`（`step` は失敗した段の名前。メッセージへ載せる）。
+    fn remaining(&self, step: &'static str) -> Result<Duration, TraitError> {
+        let remaining = self.at.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(TraitError::new(
+                ErrorCode::Timeout,
+                format!("exec timed out before {step}"),
+            ));
+        }
+        Ok(remaining)
+    }
+}
+
+/// 稼働中コンテナ `record` の中で `entry` を実行し、終了を待つ（SUP-6・TASK-163.4・#503）。
+///
+/// 順序は固定: [`identify_pid1`] → [`prepare_cgroup_join`] → [`prepare_restrictions`] → [`enter_namespaces`] →
+/// [`join_cgroup`] → [`reapply_restrictions`] → [`require_exec_ready`] → core の `spawn_exec_command`
+/// （cwd を照合済み root へ → fork → 子で `close_range` → `execveat`）→ `wait_timeout`。
+/// 制限は fork / execve を越えて子へ継承される（「適用 → fork → execve」）。
+///
+/// `timeout` は準備から終了待ちまでの全体の上限（REPAIR-5）。段の間で期限を確かめ、fork 後は残り時間で
+/// `wait_timeout` する（期限超過は子を `SIGKILL` して回収し `Timeout`）。**不可逆な `setns` を行うため、
+/// 単一スレッドの exec 専用プロセスからのみ呼ぶこと**（logs 捕捉スレッドを持つ supervisor 本体からは呼ばない。
+/// 呼べば `setns` が拒否される）。失敗時は状態を戻せないため、呼び出し側は続行せずプロセスを終了する。
+/// エラーメッセージへホスト側パス・ルール内容・期待 cgroup パスを載せない。
+pub fn run_command(
+    record: &StateRecord,
+    entry: &Entrypoint,
+    timeout: Duration,
+) -> Result<ExecOutcome, TraitError> {
+    let deadline = Deadline::after(timeout);
+    let target = identify_pid1(record)?;
+    run_with_target(&target, entry, deadline)
+}
+
+/// 実機結合試験専用の入口: [`run_command`] の対象特定だけを [`identify_pid1_in`]（期待 cgroup パスを呼び出し側
+/// から受け取る）に替えたもの。`exec-test-support` feature を付けたビルドにだけ存在し、既定のビルドの公開
+/// API には含まれない。本番経路は必ず [`run_command`] を使う（SEC-1）。
+#[cfg(feature = "exec-test-support")]
+pub fn run_command_in(
+    record: &StateRecord,
+    expected_cgroup_path: &str,
+    entry: &Entrypoint,
+    timeout: Duration,
+) -> Result<ExecOutcome, TraitError> {
+    let deadline = Deadline::after(timeout);
+    let target = identify_pid1_in(record, expected_cgroup_path)?;
+    run_with_target(&target, entry, deadline)
+}
+
+/// 特定済みの対象に対して、参加 → 制限の再適用 → 実行 → 待機を順に行う（[`run_command`] の本体）。
+fn run_with_target(
+    target: &ExecTarget,
+    entry: &Entrypoint,
+    deadline: Deadline,
+) -> Result<ExecOutcome, TraitError> {
+    let cgroup = prepare_cgroup_join(target)?;
+    let restrictions = prepare_restrictions(target)?;
+    deadline.remaining("joining namespaces")?;
+    enter_namespaces(target)?;
+    deadline.remaining("joining the cgroup")?;
+    join_cgroup(cgroup)?;
+    deadline.remaining("reapplying restrictions")?;
+    let report = reapply_restrictions(restrictions)?;
+    let (rlimits_applied, capability_bounding_dropped) = (
+        report.rlimits_applied(),
+        report.capability_bounding_dropped(),
+    );
+    let (landlock_rules, seccomp_instructions) =
+        (report.landlock_rules(), report.seccomp_instructions());
+    let ready = require_exec_ready(report)?;
+    deadline.remaining("starting the command")?;
+    let child = spawn_exec_command(ready, entry).map_err(from_exec_error)?;
+    let remaining = deadline.remaining("waiting for the command")?;
+    let exit = child.wait_timeout(remaining).map_err(from_exec_error)?;
+    Ok(ExecOutcome {
+        exit,
+        rlimits_applied,
+        capability_bounding_dropped,
+        landlock_rules,
+        seccomp_instructions,
+    })
 }
 
 /// `bundle` の `config.json` を読み、その `root.path` が指す rootfs を固定する。
@@ -247,7 +362,7 @@ fn load_exec_bundle(bundle: &std::path::Path) -> Result<(OciConfig, RootfsDir), 
 ///
 /// 分離違反による拒否（`ExecError::violation`。SEC-4）は、種別・理由コード・ビヘイビア ID をメッセージの
 /// 末尾に機械可読な形で残す（`TraitError` は違反記録を運べないため）。違反の対象（期待 cgroup パス）は
-/// メッセージへ含めない。監査ログへの保存の配線は未実装（#839・#503。REPAIR-3）。
+/// メッセージへ含めない。監査ログへの保存の配線は未実装（#839。REPAIR-3）。
 fn from_exec_error(err: ExecError) -> TraitError {
     let violation = err.violation.as_ref().map_or_else(String::new, |v| {
         format!(
@@ -349,8 +464,8 @@ mod tests {
     }
 
     /// SUP-6・TASK-163.2: cgroup join の公開入口の型（検証済みの `ExecTarget` だけから準備でき、参加は準備の結果を
-    /// 消費する）。実 pid1 を要する成功経路は core のユニットテスト（`sup6_task163_2_*`）と #503 の統合
-    /// テストが担い、ここでは配線の型が保たれていることだけを機械照合する。
+    /// 消費する）。実 pid1 を要する成功経路は core のユニットテスト（`sup6_task163_2_*`）と結合試験
+    /// `tests/exec.rs` が担い、ここでは配線の型が保たれていることだけを機械照合する。
     #[test]
     fn sup6_task163_2_cgroup_join_entry_points_have_expected_shape() {
         let _prepare: fn(&ExecTarget) -> Result<ExecCgroupJoin, TraitError> = prepare_cgroup_join;
@@ -359,7 +474,7 @@ mod tests {
 
     /// SUP-6・TASK-163.3: seccomp / Landlock 再適用の公開入口の型（検証済みの `ExecTarget` と記録から準備でき、
     /// 適用は準備の結果を消費する）。実 pid1 を要する成功経路は core のユニットテスト・結合試験
-    /// （`exec_restrictions_reapply`）と #503 の統合テストが担い、ここでは配線の型だけを機械照合する。
+    /// （`exec_restrictions_reapply`）と `tests/exec.rs` が担い、ここでは配線の型だけを機械照合する。
     #[test]
     fn sup6_task163_3_restrictions_entry_points_have_expected_shape() {
         let _prepare: fn(&ExecTarget) -> Result<ExecRestrictions, TraitError> =
@@ -368,6 +483,52 @@ mod tests {
             reapply_restrictions;
         // exec の許可は証跡 `ExecReady` だけ（結果そのもの・真偽値では表さない。SEC-1）。
         let _ready: fn(ExecRestrictionReport) -> Result<ExecReady, TraitError> = require_exec_ready;
+    }
+
+    /// SUP-6・TASK-163.4: 通しの入口の型（記録・エントリポイント・全体の上限時間を受け、終了状態を含む構造を返す）。
+    /// 実 pid1 を要する成功経路は結合試験 `tests/exec.rs`（`-- --ignored`）が担う。
+    #[test]
+    fn sup6_task163_4_run_command_entry_point_has_expected_shape() {
+        let _run: fn(&StateRecord, &Entrypoint, Duration) -> Result<ExecOutcome, TraitError> =
+            run_command;
+    }
+
+    /// SUP-6・TASK-163.4: 稼働中でない記録・pid の無い記録は、参加も fork もせず対象の特定で拒否する。
+    #[test]
+    fn sup6_task163_4_run_command_rejects_non_running_record() {
+        let entry = Entrypoint::new("/bin/true", ["true"], Vec::<String>::new()).unwrap();
+        let pid = NonZeroU32::new(std::process::id());
+        for st in [
+            ContainerStatus::created(cid(), pid),
+            ContainerStatus::stopped(cid(), Some(0)),
+            ContainerStatus::running(cid(), None),
+        ] {
+            let err = run_command(&record(st), &entry, Duration::from_secs(1)).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(
+                err.message(),
+                "container is not running or has no recorded pid; cannot identify pid1"
+            );
+        }
+    }
+
+    /// SUP-6・REPAIR-5・TASK-163.4: 期限が 0 なら残り時間が無く、段の名前を含む `Timeout` で打ち切る。
+    /// 十分長い期限は残り時間を返し、`Duration::MAX` でも溢れず 7 日に丸める。
+    #[test]
+    fn sup6_task163_4_deadline_expires_and_clamps() {
+        let expired = Deadline::after(Duration::ZERO);
+        let err = expired.remaining("joining namespaces").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert_eq!(err.message(), "exec timed out before joining namespaces");
+
+        let left = Deadline::after(Duration::from_secs(60))
+            .remaining("x")
+            .unwrap();
+        assert!(left > Duration::from_secs(50) && left <= Duration::from_secs(60));
+
+        let max = Deadline::after(Duration::MAX).remaining("x").unwrap();
+        assert!(max <= Duration::from_secs(7 * 24 * 60 * 60));
+        assert!(max > Duration::from_secs(6 * 24 * 60 * 60));
     }
 
     /// 祖先に symlink を含まない使い捨ての bundle ディレクトリ（rootfs の固定は symlink を辿らない）。

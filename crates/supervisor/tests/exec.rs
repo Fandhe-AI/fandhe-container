@@ -491,9 +491,15 @@ mod linux {
             .arg("--pid")
             .arg(pid1.to_string())
             .arg("--nofile=700:1500")
-            .status()
+            .stdin(Stdio::null())
+            .spawn()
             .expect("run prlimit (util-linux)");
-        assert!(prlimit.success(), "prlimit must lower pid1's NOFILE");
+        // 期限つきで待つ（REPAIR-5）。
+        assert_eq!(
+            finish_joiner(prlimit).0,
+            Some(0),
+            "prlimit must lower pid1's NOFILE"
+        );
         Container {
             stdin,
             a,
@@ -821,9 +827,11 @@ mod linux {
         let killed = Command::new("kill")
             .arg("-TERM")
             .arg(pid.to_string())
-            .status()
+            .stdin(Stdio::null())
+            .spawn()
             .expect("run kill");
-        assert!(killed.success(), "{ctx}");
+        // 期限つきで待つ（REPAIR-5）。
+        assert_eq!(finish_joiner(killed).0, Some(0), "{ctx}");
         let (code, out) = finish_joiner(joiner);
         assert_eq!(code, Some(0), "joiner output: {out}; {ctx}");
         assert_eq!(
@@ -971,11 +979,13 @@ mod linux {
             fs::rename(&null, &saved).expect("move the real /dev/null aside");
             let replaced = match kind {
                 "symlink" => std::os::unix::fs::symlink("zero", &null).is_ok(),
+                // 期限つきで待つ（外部コマンドの待ちで固まらない。REPAIR-5）。
                 _ => Command::new("mknod")
                     .arg(&null)
                     .args(["c", "1", "5"])
-                    .status()
-                    .is_ok_and(|s| s.success()),
+                    .stdin(Stdio::null())
+                    .spawn()
+                    .is_ok_and(|child| finish_joiner(child).0 == Some(0)),
             };
             let joiner = replaced.then(|| {
                 spawn_joiner(&[

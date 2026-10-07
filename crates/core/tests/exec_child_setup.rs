@@ -424,13 +424,31 @@ mod linux {
     /// - `CAP_SETGID` があり禁じられていない（root）→ 消去され、適用後の件数は 0
     fn supplementary_groups_are_cleared_or_refused() {
         let (groups, has_setgid, denied) = own_group_state();
-        let output = Command::new(std::env::current_exe().expect("current_exe"))
+        // 出力は一時ファイルへ書かせ、終了を期限つきで待つ（pipe の EOF 待ちで固まらない。REPAIR-5）。
+        let work = WorkDir::create("groups");
+        let out_path = work.0.join("stdout");
+        let stdout = fs::File::create_new(&out_path).expect("create the output file");
+        let mut child = Command::new(std::env::current_exe().expect("current_exe"))
             .arg(GROUPS_CHILD)
             .stdin(Stdio::null())
-            .output()
+            .stdout(stdout)
+            .spawn()
             .expect("run the groups child");
-        assert!(output.status.success(), "the groups child must exit with 0");
-        let line = String::from_utf8_lossy(&output.stdout)
+        let deadline = Instant::now() + timeout();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the groups child did not exit within {:?}", timeout());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(status.code(), Some(0), "the groups child must exit with 0");
+        let line = fs::read_to_string(&out_path)
+            .expect("read the groups child output")
             .trim_end()
             .to_owned();
         let expected = match (groups, has_setgid, denied) {

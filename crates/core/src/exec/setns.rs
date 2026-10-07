@@ -13,7 +13,8 @@
 //!   入らない（pid 再利用対策。SEC-1）。さらに [`join_namespaces`] は `setns` の直前に pidfd の終了状態を
 //!   再確認し、終了済みなら `FailedPrecondition` で拒否する（カーネルが終了済みの対象を `ESRCH` で拒否する
 //!   挙動には依存しない。fail-closed）。残る隙間は確認から `setns` までの極小の窓で、その間に終了した
-//!   場合も pidfd は元のプロセスを指すため別プロセスへは入らない
+//!   場合も pidfd は元のプロセスを指すため別プロセスへは入らない。[`join_namespaces`] は同じ時点で所属 cgroup も
+//!   期待パスと再照合し、`open` の後に対象が別の cgroup へ移されていれば拒否する
 //! - pidfd は「呼び出した時点でその pid にいたプロセス」を固定するだけで、`state.json` に記録された
 //!   元のコンテナのプロセスであることまでは証明しない（元のコンテナが終了し、その pid が別コンテナの
 //!   PID 1 に再利用されると、NSpid や namespace 差異の検査は通ってしまう）。そこで [`Pid1Target::open`] は
@@ -111,6 +112,8 @@ impl JoinNamespace {
 pub struct Pid1Target {
     pid: NonZeroU32,
     pidfd: OwnedFd,
+    /// `open` で照合した期待 cgroup パス。[`join_namespaces`] が参加の直前に再照合する。
+    expected_cgroup_path: String,
 }
 
 impl Pid1Target {
@@ -147,15 +150,7 @@ impl Pid1Target {
                 format!("process {pid} is not PID 1 of a nested PID namespace"),
             ));
         }
-        let cgroup = read_bounded(&format!("/proc/{pid}/cgroup"))
-            .map_err(|e| target_proc_error(&e, "read target cgroup"))?;
-        if !cgroup_path_matches(&cgroup, expected_cgroup_path) {
-            return Err(ExecError::new(
-                ErrorCode::FailedPrecondition,
-                stage,
-                format!("process {pid} does not belong to the expected container cgroup"),
-            ));
-        }
+        verify_cgroup_membership(pid, expected_cgroup_path)?;
         for ns in [JoinNamespace::Pid, JoinNamespace::Mount] {
             let target = ns_identity(&format!("/proc/{pid}/ns/{}", ns.proc_name()))
                 .map_err(|e| target_proc_error(&e, "read target namespace"))?;
@@ -183,8 +178,52 @@ impl Pid1Target {
                 format!("process {pid} has already exited"),
             ));
         }
-        Ok(Self { pid, pidfd })
+        Ok(Self {
+            pid,
+            pidfd,
+            expected_cgroup_path: expected_cgroup_path.to_owned(),
+        })
     }
+}
+
+/// 対象 `pid` の所属 cgroup（`/proc/<pid>/cgroup` の v2 行）が `expected` と完全一致することを確かめる。
+///
+/// 不一致は `FailedPrecondition`。読み取りの結果が pidfd の指すプロセスのものであることは、呼び出し側が
+/// この後に pidfd の未終了を確認することで保証する（終了していなければ pid は再利用されていない）。
+fn verify_cgroup_membership(pid: NonZeroU32, expected: &str) -> Result<(), ExecError> {
+    let cgroup = read_bounded(&format!("/proc/{pid}/cgroup"))
+        .map_err(|e| target_proc_error(&e, "read target cgroup"))?;
+    if !cgroup_path_matches(&cgroup, expected) {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::SetNs,
+            format!("process {pid} does not belong to the expected container cgroup"),
+        ));
+    }
+    Ok(())
+}
+
+/// pidfd の指すプロセスが終了済みなら `FailedPrecondition`（`what` はメッセージの末尾に付ける）。
+fn ensure_not_exited(target: &Pid1Target, what: &str) -> Result<(), ExecError> {
+    let exited = sys::poll_readable(target.pidfd.as_fd(), 0)
+        .map_err(|e| setns_error(e, "poll target pidfd"))?;
+    if exited {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::SetNs,
+            format!("process {} has already exited; {what}", target.pid),
+        ));
+    }
+    Ok(())
+}
+
+/// 参加の直前に、対象が `open` のときと同じ期待 cgroup に属していることを再照合する（SEC-1）。
+///
+/// `open` から参加までの間に対象が別の cgroup へ移されていれば `FailedPrecondition`。cgroup の読み取りの後に
+/// pidfd の未終了を確認し、読んだ内容が pidfd の指すプロセスのものであることを保証する。
+fn recheck_cgroup_membership(target: &Pid1Target) -> Result<(), ExecError> {
+    verify_cgroup_membership(target.pid, &target.expected_cgroup_path)?;
+    ensure_not_exited(target, "refusing to setns")
 }
 
 /// [`join_namespaces`] の成功結果（将来拡張できる構造）。
@@ -199,7 +238,8 @@ pub struct NamespaceJoinReport {
 
 /// 検証済みの対象 `target` の namespace 群へ、1 回の `setns(2)` で参加する。
 ///
-/// 参加の直前に対象の終了を再確認し、終了済みなら `FailedPrecondition`。
+/// 参加の直前に対象の終了と所属 cgroup（`open` で照合した期待パスとの完全一致）を再確認し、終了済み・
+/// 別 cgroup へ移動済みなら `FailedPrecondition`。
 /// 呼び出しスレッドの namespace を不可逆に変える。単一スレッドでなければ `FailedPrecondition`、
 /// `set` が空なら `InvalidArgument`。契約全体はモジュール doc を参照（SUP-6・TASK-163.1）。
 pub fn join_namespaces(
@@ -215,18 +255,7 @@ pub fn join_namespaces(
         ));
     }
     // 検証（`open`）から参加までの間に対象が終了していないか、参加の直前に再確認する。
-    let exited = sys::poll_readable(target.pidfd.as_fd(), 0)
-        .map_err(|e| setns_error(e, "poll target pidfd"))?;
-    if exited {
-        return Err(ExecError::new(
-            ErrorCode::FailedPrecondition,
-            stage,
-            format!(
-                "process {} has already exited; refusing to setns",
-                target.pid
-            ),
-        ));
-    }
+    ensure_not_exited(target, "refusing to setns")?;
     let own = read_bounded("/proc/self/status")
         .map_err(|e| ExecError::from_io(&e, stage, "read own status"))?;
     if status_threads(&own) != Some(1) {
@@ -236,6 +265,8 @@ pub fn join_namespaces(
             "the caller is multi-threaded or its thread count is unknown; refusing to setns",
         ));
     }
+    // 所属 cgroup の再照合は `setns` の直前に置く（残る窓を最小にする）。
+    recheck_cgroup_membership(target)?;
     let flags: Vec<NsFlag> = set.iter().map(|n| n.flag()).collect();
     sys::setns_pidfd(target.pidfd.as_fd(), &flags).map_err(|e| setns_error(e, "setns"))?;
     Ok(NamespaceJoinReport {
@@ -451,6 +482,7 @@ mod tests {
         let target = Pid1Target {
             pid: NonZeroU32::new(std::process::id()).unwrap(),
             pidfd,
+            expected_cgroup_path: "/fc-x@1".to_owned(),
         };
         let err = join_namespaces(&target, &[]).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
@@ -466,6 +498,36 @@ mod tests {
         let _ = helper.join();
     }
 
+    /// SUP-6・SEC-1: 参加直前の再照合は、対象の現在の所属 cgroup が `open` 時の期待パスと完全一致する
+    /// ときだけ通る。別の cgroup（移動後を想定）なら FailedPrecondition。
+    #[test]
+    fn sup6_recheck_cgroup_membership_rejects_moved_target() {
+        let me = NonZeroU32::new(std::process::id()).unwrap();
+        let own = read_bounded("/proc/self/cgroup").unwrap();
+        let own_path = own
+            .lines()
+            .find_map(|l| l.strip_prefix("0::"))
+            .expect("cgroup v2 line")
+            .to_owned();
+        let target = |path: &str| Pid1Target {
+            pid: me,
+            pidfd: sys::pidfd_open(me.get()).unwrap(),
+            expected_cgroup_path: path.to_owned(),
+        };
+        assert_eq!(
+            recheck_cgroup_membership(&target(&own_path)).map_err(|e| e.code),
+            Ok(())
+        );
+        let moved = format!("{}/fc-x@1", own_path.trim_end_matches('/'));
+        let err = recheck_cgroup_membership(&target(&moved)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(err.stage, IsolationStage::SetNs);
+        assert_eq!(
+            err.message,
+            format!("process {me} does not belong to the expected container cgroup")
+        );
+    }
+
     /// SUP-6: 検証後に終了した対象への参加は、setns の前に FailedPrecondition で拒否される。
     #[test]
     fn sup6_join_rejects_exited_target() {
@@ -476,6 +538,7 @@ mod tests {
         let target = Pid1Target {
             pid: NonZeroU32::new(pid).unwrap(),
             pidfd,
+            expected_cgroup_path: "/fc-x@1".to_owned(),
         };
         let err = join_namespaces(&target, &JoinNamespace::SUP6_SET).unwrap_err();
         assert_eq!(err.code, ErrorCode::FailedPrecondition);

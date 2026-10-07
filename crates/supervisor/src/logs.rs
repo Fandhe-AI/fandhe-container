@@ -55,7 +55,8 @@
 //! 本モジュールは捕捉経路とファイル sink までで、次は未実装である。
 //! - flush ごとの fsync・同期ポリシーの設定化・タイマーによる定期 flush（read ごとの flush で代替している）: SUP-7。
 //! - stdout / stderr 混在での大規模な欠落 0・重複 0 の検証（stdout 単独の 100 万行検証は `tests/log_rotation.rs` に実装済み）: SUP-7・TASK-164.4（#508）。
-//! - `logs` コマンドからの読み出し経路: TASK-164 以降 / CLI 側。
+//! - `logs` コマンドからの読み出し経路: TASK-164 以降 / CLI 側（ログ名の列挙は [`log_file_paths`] が実装済みで、ロックファイルを含めない。内容の読み出し・CLI 配線は未実装。TASK-164 追補・#1469）。
+//! - コンテナ削除経路からの [`RotatingFileSink::remove_all`]（ログ・ロックファイルの一括削除）の呼び出し配線: SUP-7・TASK-164 追補（#1469）。
 //! - 実パイプの取得: core の本番 launcher が子の stdio をパイプへ接続して渡す経路は未提供
 //!   （現状 core は子の標準入出力を null へ向けている）。そのため入力は注入式である。
 //!
@@ -63,7 +64,7 @@
 
 pub mod rotating;
 
-pub use rotating::{RotatingFileSink, RotationConfig};
+pub use rotating::{RemovedLogs, RotatingFileSink, RotationConfig, log_file_paths};
 
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read};

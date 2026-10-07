@@ -17,10 +17,16 @@
 //!   symlink・非ディレクトリは `path_symlink_or_not_directory` の違反記録付きで拒否する（rootfs の外へ
 //!   マウントしない）。パス文字列で `mount(2)` しない（`/proc/thread-self/fd/N` 経由）
 //! - **ホストへ伝播させない**: マウント直前に対象マウントが shared propagation でないことを確認する
+//! - **移動検査**: fd 固定後にマウント先（または祖先）が改名・移動・削除されていないことを、マウント
+//!   直前に fd の現在の位置で確かめる（`mount_proc` と同じ `fd_still_at`。`target_moved` の違反記録付きで
+//!   拒否）。移動後の実体へマウントして rootfs 内の別の場所を覆わないようにする
 //! - **フラグ・data**: `nosuid`・`nodev` は常に付与し外せない。data は [`TmpfsMountSpec::data_string`]
 //!   （型付きフィールドのみ）で、利用者文字列は渡さない
-//! - **事後条件**: マウント後に同じ要素を開き直し、`statfs` が tmpfs であることを確かめる（fail-closed）
-//! - **失敗時はプロセスを破棄する**: 途中のマウントは巻き戻さない（`crate::exec` のモジュール doc の契約）
+//! - **事後条件**: マウント後に同じ要素を開き直し（作成はしない）、`statfs` が tmpfs であることを
+//!   確かめる（fail-closed）
+//! - **失敗時はプロセスを破棄する**: 途中のマウントは巻き戻さない（`crate::exec` のモジュール doc の契約）。
+//!   マウントは呼び出しスレッド専用の mount namespace に閉じ、プロセスの破棄で消える。自動作成した
+//!   マウント先ディレクトリ（0755・空）は rootfs に残る（後段の検査で拒否した場合も削除しない）
 //! - **同一スレッド**: `MountIsolation::establish` と同じスレッドで呼ぶ
 //!
 //! # 未対応（REPAIR-3: 実装済みを装わない）
@@ -42,8 +48,8 @@ use crate::tmpfs::{TmpfsMountSet, TmpfsMountSpec};
 use crate::traits::types::ErrorCode;
 
 use super::{
-    ExecError, IsolationStage, MountIsolation, PreparedRootfs, ViolationReason, mount_is_shared,
-    open_error,
+    ExecError, IsolationStage, MountIsolation, PreparedRootfs, ViolationReason, fd_still_at,
+    mount_is_shared, open_error,
 };
 
 const STAGE: IsolationStage = IsolationStage::MountTmpfs;
@@ -120,11 +126,23 @@ fn apply_one(
         .filter(|e| !e.is_empty())
         .map(OsStr::new)
         .collect();
-    let dir = open_or_create_chain(root, rootfs, &names)?;
+    let dir = open_chain(root, rootfs, &names, Missing::Create)?;
+    let subject = names.iter().fold(rootfs.to_path_buf(), |p, n| p.join(n));
     if is_shared(&dir)? {
         return Err(ExecError::from_violation_at(
             ViolationReason::TargetOnSharedMount,
-            Some(&names.iter().fold(rootfs.to_path_buf(), |p, n| p.join(n))),
+            Some(&subject),
+            STAGE,
+        ));
+    }
+    // fd 固定後に別プロセスがマウント先（または祖先）を改名・移動・削除していれば拒否する
+    // （`mount_proc_at_dir` と同じ検査）。この確認から mount(2) までに移動された場合も、マウントは
+    // 呼び出しスレッド専用の mount namespace に閉じ、事後条件（`verify_mounted`）が名前の位置に
+    // tmpfs が無いことを検出して失敗させる。
+    if !fd_still_at(&dir, &subject) {
+        return Err(ExecError::from_violation_at(
+            ViolationReason::TargetMoved,
+            Some(&subject),
             STAGE,
         ));
     }
@@ -157,11 +175,21 @@ fn apply_one(
     verify_mounted(root, rootfs, &names, spec)
 }
 
-/// `root` から `names` を 1 要素ずつ開く。無い要素は作ってから同じ方法で開き直す。
-fn open_or_create_chain(
+/// [`open_chain`] が存在しない要素をどう扱うか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Missing {
+    /// 0755 で作ってから同じ方法で開き直す（マウント先の準備）。
+    Create,
+    /// 作らずに `path_missing` の違反記録付きで拒否する（事後検証。副作用を持たせない）。
+    Reject,
+}
+
+/// `root` から `names` を 1 要素ずつ `O_PATH|O_DIRECTORY|O_NOFOLLOW` で開く。無い要素の扱いは `missing`。
+fn open_chain(
     root: BorrowedFd<'_>,
     rootfs: &std::path::Path,
     names: &[&OsStr],
+    missing: Missing,
 ) -> Result<OwnedFd, ExecError> {
     use std::os::unix::ffi::OsStrExt as _;
     let mut cur: Option<OwnedFd> = None;
@@ -172,7 +200,7 @@ fn open_or_create_chain(
         let parent = cur.as_ref().map_or(root, |f| f.as_fd());
         let next = match sys::open_dir_path_nofollow(Some(parent), &c) {
             Ok(fd) => fd,
-            Err(SysError::Os(sys::ENOENT)) => {
+            Err(SysError::Os(sys::ENOENT)) if missing == Missing::Create => {
                 match sys::mkdir_at(parent, &c, DIR_MODE) {
                     Ok(()) | Err(SysError::Os(sys::EEXIST)) => {}
                     Err(e) => return Err(ExecError::from_sys(e, STAGE, "mkdirat(mount target)")),
@@ -212,7 +240,7 @@ fn fstatfs_magic_at(
     rootfs: &std::path::Path,
     names: &[&OsStr],
 ) -> Result<i64, ExecError> {
-    let dir = open_or_create_chain(root, rootfs, names)?;
+    let dir = open_chain(root, rootfs, names, Missing::Reject)?;
     sys::fs_type(dir.as_fd())
         .map_err(|e| ExecError::from_sys(e, STAGE, "fstatfs(tmpfs mount target)"))
 }
@@ -254,8 +282,7 @@ fn mount_tmpfs_syscall(
     sys::mount_tmpfs_at(target, flags, data)
 }
 
-/// dry-run: `mount(2)` を呼ばず、(解決したマウント先・フラグ・data) を記録する（`MOUNT_SCRIPT` に
-/// エラーを積めば先頭から返す）。
+/// dry-run: `mount(2)` を呼ばず、(解決したマウント先・フラグ・data) を記録する。
 #[cfg(test)]
 fn mount_tmpfs_syscall(
     target: &std::ffi::CStr,
@@ -392,6 +419,45 @@ mod tests {
             Some(ViolationReason::TargetOnSharedMount)
         );
         assert!(take_calls().is_empty());
+    }
+
+    /// SUP-12・TASK-169.2: fd 固定後にマウント先が改名されたら、移動後の実体へ mount せず
+    /// `target_moved` の違反記録付きで拒否する（propagation 判定の差し込み点で改名して窓を再現する）。
+    #[test]
+    fn sup12_task169_2_rejects_target_moved_after_pin() {
+        let tmp = Tmp::new("moved");
+        let _ = take_calls();
+        let fd = tmp.fd();
+        let (from, to) = (tmp.0.join("run"), tmp.0.join("elsewhere"));
+        let err = mount_tmpfs_at(fd.as_fd(), &set(&[("/run", None)]), &|_| {
+            std::fs::rename(&from, &to).expect("rename");
+            Ok(false)
+        })
+        .expect_err("moved");
+        assert_eq!(err.stage, IsolationStage::MountTmpfs);
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.violation.as_ref().map(|v| v.reason),
+            Some(ViolationReason::TargetMoved)
+        );
+        assert_eq!(take_calls(), Vec::new());
+    }
+
+    /// SUP-12・TASK-169.2: 事後検証の開き直しは無い要素を作らず `path_missing` で拒否する。
+    #[test]
+    fn sup12_task169_2_reject_mode_does_not_create_missing() {
+        let tmp = Tmp::new("nocreate");
+        let fd = tmp.fd();
+        let names = [OsStr::new("a"), OsStr::new("b")];
+        let err = open_chain(fd.as_fd(), &tmp.0, &names, Missing::Reject).expect_err("missing");
+        assert_eq!(err.stage, IsolationStage::MountTmpfs);
+        assert_eq!(
+            err.violation.as_ref().map(|v| v.reason),
+            Some(ViolationReason::PathMissing)
+        );
+        assert!(!tmp.0.join("a").exists());
+        open_chain(fd.as_fd(), &tmp.0, &names, Missing::Create).expect("create");
+        assert!(tmp.0.join("a/b").is_dir());
     }
 
     /// SUP-12・TASK-169.2: 読み取り専用・exec 許可のフラグが反映される。

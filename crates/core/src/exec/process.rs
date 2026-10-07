@@ -414,25 +414,9 @@ fn prepare_exec_child(
         .and_then(keep_above_stdio)?;
     let procfs = open_root_procfs(root.as_fd()).and_then(keep_above_stdio)?;
     // 検査と実行を同じ fd に固定する（パスを再解決する execve では、検査後に差し替えられうる）。
-    let file = open_entrypoint(entry)?;
-    let meta = file.metadata().map_err(|e| io_exec_error(&e, entry))?;
-    if matches_any_identity((meta.dev(), meta.ino()), &inherited_stdio_identities()?) {
-        return Err(ExecError::new(
-            ErrorCode::PermissionDenied,
-            STAGE,
-            format!(
-                "the entrypoint {:?} resolves to an inherited standard stream",
-                entry.path()
-            ),
-        ));
-    }
-    if !meta.is_file() {
-        return Err(ExecError::new(
-            ErrorCode::PermissionDenied,
-            STAGE,
-            format!("the entrypoint {:?} is not a regular file", entry.path()),
-        ));
-    }
+    // 種別（通常ファイル・標準入出力と別の実体）は開く前に確かめる（`setsid` の後は、端末を開くと制御端末に
+    // なるため。#1456）。
+    let (file, meta) = open_entrypoint(entry, root.as_fd(), procfs.as_fd())?;
     let runtime = runtime_identity(procfs.as_fd())?;
     if (meta.dev(), meta.ino()) == runtime {
         return Err(ExecError::from_violation_at(
@@ -646,16 +630,22 @@ fn redirect_stdio_to_null(root: BorrowedFd<'_>, procfs: BorrowedFd<'_>) -> Resul
 /// 5. 開いた fd をもう一度 `fstat` し、文字デバイス 1:3 であることを確かめる（開き直しの経路の多層防御）
 ///
 /// `/proc` が procfs でない rootfs は開き直せないため、呼び出し元が先に拒否する（launch 経路は `prepare_rootfs` が
-/// マウント済み、exec 経路はコンテナの procfs。fail-closed）。fork 後の子から呼ぶため、成功経路はアロケーションを
-/// 伴わない。
+/// マウント済み、exec 経路はコンテナの procfs。fail-closed）。fork 後の子から呼ぶため、この関数の成功経路は
+/// ヒープを確保しない（エラーの組み立ては確保する）。
 fn open_verified_null(root: BorrowedFd<'_>, procfs: BorrowedFd<'_>) -> Result<OwnedFd, ExecError> {
     const STAGE: IsolationStage = IsolationStage::Exec;
-    let dev = sys::open_dir_path_nofollow(Some(root), c"dev").map_err(|e| {
-        ExecError::new(
+    let dev = sys::open_dir_path_nofollow(Some(root), c"dev").map_err(|e| match e {
+        // 存在するがディレクトリでない（symlink・通常ファイル等）のは差し替えで、違反として記録する（SEC-4）。
+        SysError::Os(errno) if errno == sys::ENOTDIR => ExecError::from_violation_at(
+            ViolationReason::ExecDevNotDirectory,
+            Some(Path::new("/dev")),
+            STAGE,
+        ),
+        _ => ExecError::new(
             ErrorCode::FailedPrecondition,
             STAGE,
             format!("cannot open /dev as a directory: {}", describe(e)),
-        )
+        ),
     })?;
     let pinned = pin_null_device(dev.as_fd(), c"null")?;
     reopen_null_device(procfs, pinned.as_fd())
@@ -664,16 +654,28 @@ fn open_verified_null(root: BorrowedFd<'_>, procfs: BorrowedFd<'_>) -> Result<Ow
 /// `root` 配下の `proc` を開き、本物の procfs であることを確かめる（`fstatfs`。symlink・非ディレクトリ・別の
 /// ファイルシステムは `FailedPrecondition`）。固定した fd の開き直し（magic link）の起点にする。
 fn open_root_procfs(root: BorrowedFd<'_>) -> Result<OwnedFd, ExecError> {
-    sys::open_dir_path_nofollow(Some(root), c"proc")
-        .ok()
-        .filter(|dir| sys::fs_type(dir.as_fd()) == Ok(sys::PROC_MAGIC))
-        .ok_or_else(|| {
-            ExecError::new(
-                ErrorCode::FailedPrecondition,
-                IsolationStage::Exec,
-                "/proc in the new root is not procfs; cannot reopen a verified file",
-            )
-        })
+    const STAGE: IsolationStage = IsolationStage::Exec;
+    // 存在するのに procfs でない（symlink・非ディレクトリ・別のファイルシステム）のは差し替えで、違反として
+    // 記録する（SEC-4）。不在・その他の失敗は前提の不足として拒否する。
+    let not_procfs = || {
+        ExecError::from_violation_at(
+            ViolationReason::ExecProcNotProcfs,
+            Some(Path::new("/proc")),
+            STAGE,
+        )
+    };
+    let dir = sys::open_dir_path_nofollow(Some(root), c"proc").map_err(|e| match e {
+        SysError::Os(errno) if errno == sys::ENOTDIR => not_procfs(),
+        _ => ExecError::new(
+            ErrorCode::FailedPrecondition,
+            STAGE,
+            format!("cannot open /proc in the new root: {}", describe(e)),
+        ),
+    })?;
+    if sys::fs_type(dir.as_fd()) != Ok(sys::PROC_MAGIC) {
+        return Err(not_procfs());
+    }
+    Ok(dir)
 }
 
 /// `dev`（ディレクトリの fd）配下の `name` を開かずに固定し、文字デバイス 1:3 であることを確かめる
@@ -758,23 +760,82 @@ fn reset_sigpipe() -> Result<(), ExecError> {
     Ok(())
 }
 
-/// エントリポイントを開く。失敗は errno を `ErrorCode` に写す（不在 → `NotFound`）。
+/// エントリポイントを **開く前に** 固定して種別を確かめ、通常ファイルだけを読み取り専用で開く
+/// （SUP-6・SEC-1・TASK-163 追補・#1456）。失敗は errno を `ErrorCode` に写す（不在 → `NotFound`）。
 ///
-/// 返す fd は必ず 3 以上（[`keep_above_stdio`]）。呼び出し元の fd 0〜2 が閉じていると `openat` は
-/// その番号を返し、後段の標準入出力の置換（`dup2`）で実行用の fd が潰されるため。
-fn open_entrypoint(entry: &Entrypoint) -> Result<std::fs::File, ExecError> {
-    let fd = sys::open_file_read(&entry.path).map_err(|e| {
+/// 直前の `setsid` で子は制御端末を持たないセッションのリーダーになっている。その状態で端末を `O_NOCTTY` なしで
+/// 開くと、その端末を制御端末として取得してしまう（コンテナ側が用意した端末・端末を指す symlink を
+/// エントリポイントに指定されると、切り離した直後に取得し直す）。パスを直接 `open` してから種別を調べる方式では
+/// 遅いため、`/dev/null` と同じ順序にする。
+///
+/// 1. `root` を起点に `O_PATH`（最終要素の symlink は辿る。`execve` と同じ解決）で固定する（`O_PATH` はドライバの
+///    `open` を呼ばず、制御端末も取得しない）
+/// 2. `fstat` で、継承した標準入出力と同一の実体・通常ファイル以外（端末・デバイス・FIFO・ディレクトリ）を、
+///    開かずに拒否する
+/// 3. `procfs` の magic link 経由で `O_RDONLY|O_NONBLOCK|O_NOCTTY` に開き直す（パスを再解決しない）。読み取り権限の
+///    無い実行専用バイナリはここで `EACCES`
+///
+/// 返す fd は必ず 3 以上（[`keep_above_stdio`]。後段の標準入出力の置換〔`dup2`〕で実行用の fd が潰されないように）。
+/// 戻り値のメタデータは固定した inode のもの。
+fn open_entrypoint(
+    entry: &Entrypoint,
+    root: BorrowedFd<'_>,
+    procfs: BorrowedFd<'_>,
+) -> Result<(std::fs::File, std::fs::Metadata), ExecError> {
+    const STAGE: IsolationStage = IsolationStage::Exec;
+    let open_error = |e: SysError| {
         ExecError::new(
             exec_errno_to_code(e),
-            IsolationStage::Exec,
+            STAGE,
             format!(
                 "open of the entrypoint {:?} failed: {}",
                 entry.path(),
                 describe(e)
             ),
         )
-    })?;
-    keep_above_stdio(fd).map(std::fs::File::from)
+    };
+    // 絶対パスなので解決は呼び出しプロセスの root（= 照合済みの `root`）から始まる。
+    let pinned = sys::open_path_follow_at(root, &entry.path).map_err(open_error)?;
+    let meta = pinned
+        .try_clone()
+        .and_then(|fd| std::fs::File::from(fd).metadata())
+        .map_err(|e| io_exec_error(&e, entry))?;
+    if matches_any_identity((meta.dev(), meta.ino()), &inherited_stdio_identities()?) {
+        return Err(ExecError::new(
+            ErrorCode::PermissionDenied,
+            STAGE,
+            format!(
+                "the entrypoint {:?} resolves to an inherited standard stream",
+                entry.path()
+            ),
+        ));
+    }
+    if !meta.is_file() {
+        return Err(ExecError::new(
+            ErrorCode::PermissionDenied,
+            STAGE,
+            format!("the entrypoint {:?} is not a regular file", entry.path()),
+        ));
+    }
+    #[cfg(test)]
+    tests::record("reopen(entrypoint)".to_string());
+    let file = sys::reopen_pinned_read(procfs, pinned.as_fd())
+        .map_err(open_error)
+        .and_then(keep_above_stdio)
+        .map(std::fs::File::from)?;
+    // 開き直した実体が、固定して検査した inode そのものであること（開き直しの経路の多層防御）。
+    let reopened = file.metadata().map_err(|e| io_exec_error(&e, entry))?;
+    if (reopened.dev(), reopened.ino()) != (meta.dev(), meta.ino()) {
+        return Err(ExecError::new(
+            ErrorCode::PermissionDenied,
+            STAGE,
+            format!(
+                "the entrypoint {:?} changed while it was being opened",
+                entry.path()
+            ),
+        ));
+    }
+    Ok((file, meta))
 }
 
 /// fd が 0〜2 なら 3 以上へ複製して元を閉じる（3 以上ならそのまま返す）。
@@ -873,10 +934,12 @@ const EXEC_STATUS_READY: &[u8] = b"R\n";
 const EXEC_STATUS_MAX: usize = 256;
 
 /// 子が違反として報告し得る理由（`execveat` 前の手順が返す違反。[`read_exec_status`] が名前から引き直す）。
-const EXEC_CHILD_VIOLATIONS: [ViolationReason; 3] = [
+pub(super) const EXEC_CHILD_VIOLATIONS: [ViolationReason; 5] = [
     ViolationReason::EntrypointIsRuntimeBinary,
     ViolationReason::EntrypointInterpreterIsRuntimeBinary,
     ViolationReason::StdioNullNotNullDevice,
+    ViolationReason::ExecDevNotDirectory,
+    ViolationReason::ExecProcNotProcfs,
 ];
 
 /// 稼働中コンテナへの exec の子の本体（SUP-6・TASK-163.4。launch の `child_main` と同じ規約: 失敗したら stderr に
@@ -893,10 +956,10 @@ const EXEC_CHILD_VIOLATIONS: [ViolationReason; 3] = [
 /// 終了した」= 未起動と判定する。`R` を書けなければ `execveat` へ進まない（親へ知らせられない状態で実行しない）。
 fn run_exec_child(
     entry: &Entrypoint,
-    status: BorrowedFd<'_>,
+    status: &std::fs::File,
     terminal: impl FnOnce(&Entrypoint, &std::fs::File) -> Result<i32, ExecError>,
 ) -> i32 {
-    let result = prepare_exec_child(entry, Some(status)).and_then(|file| {
+    let result = prepare_exec_child(entry, Some(status.as_fd())).and_then(|file| {
         write_exec_status(status, EXEC_STATUS_READY)?;
         terminal(entry, &file)
     });
@@ -906,7 +969,16 @@ fn run_exec_child(
             let code = exit_code_for(&err);
             let _ = writeln!(std::io::stderr(), "fandhe-container: {err}");
             let reason = err.violation.as_ref().map_or("-", |v| v.reason.as_str());
-            let _ = write_exec_status(status, format!("{code} {reason}\n").as_bytes());
+            // 失敗の行を書けなかった場合（`R` を書いた後の `execveat` の失敗で起き得る）、親は「起動した」と
+            // 誤判定する。書き込みは fd を複製せず 1 回の `write` で行い（複製の失敗という要因を持たない）、
+            // それでも書けなければ stderr に残す（stderr は既に `/dev/null` の場合がある。限界は
+            // `exec/exec_command.rs`）。
+            if write_exec_status(status, format!("{code} {reason}\n").as_bytes()).is_err() {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "fandhe-container: the exec status could not be reported"
+                );
+            }
             code
         }
     }
@@ -917,25 +989,24 @@ fn run_exec_child(
 /// 両端を 3 以上の番号へ置く: 呼び出しプロセスの fd 0〜2 が閉じていると pipe がその番号を取り、子の標準入出力の
 /// 置換（`dup2`）で書き込み側が `/dev/null` に潰される（状態が親へ届かず、起動したコマンドを「起動していない」と
 /// 判定してしまう）。
-pub(super) fn exec_status_pipe() -> Result<(std::fs::File, OwnedFd), ExecError> {
+pub(super) fn exec_status_pipe() -> Result<(std::fs::File, std::fs::File), ExecError> {
     let (reader, writer) = std::io::pipe()
         .map_err(|e| ExecError::from_io(&e, IsolationStage::Spawn, "create the status pipe"))?;
     let reader = keep_above_stdio(OwnedFd::from(reader))?;
     let writer = keep_above_stdio(OwnedFd::from(writer))?;
-    Ok((std::fs::File::from(reader), writer))
+    Ok((std::fs::File::from(reader), std::fs::File::from(writer)))
 }
 
 /// `status`（pipe の書き込み側）へ `line` を書く。失敗は `Internal`（段 `Exec`）。
-fn write_exec_status(status: BorrowedFd<'_>, line: &[u8]) -> Result<(), ExecError> {
-    // 借用した fd を複製して書く（複製は同じ pipe を指し、ここで閉じても元の fd は残る）。
+fn write_exec_status(mut status: &std::fs::File, line: &[u8]) -> Result<(), ExecError> {
+    // fd を複製せずに直接書く（`&File` は `Write`。失敗要因を `write` だけにする）。
     status
-        .try_clone_to_owned()
-        .and_then(|owned| std::fs::File::from(owned).write_all(line))
+        .write_all(line)
         .map_err(|e| ExecError::from_io(&e, IsolationStage::Exec, "report the exec status"))
 }
 
 /// 稼働中コンテナへの exec の子のメイン（[`run_exec_child`] の終端を `execveat` にしたもの）。
-pub(super) fn exec_child_main(entry: &Entrypoint, status: BorrowedFd<'_>) -> i32 {
+pub(super) fn exec_child_main(entry: &Entrypoint, status: &std::fs::File) -> i32 {
     run_exec_child(entry, status, |entry, file| {
         Err(execve_checked(entry, file))
     })
@@ -1061,7 +1132,7 @@ pub fn observe_exec_child_setup(
     let (status_read, status_write) = exec_status_pipe()?;
     let pid = sys::fork_single_threaded(
         || {
-            run_exec_child(entry, status_write.as_fd(), |entry, _file| {
+            run_exec_child(entry, &status_write, |entry, _file| {
                 write_setup_report(entry, report).map(|()| 0)
             })
         },
@@ -2152,8 +2223,25 @@ mod tests {
         // `/dev` が symlink（本物の `/dev` を指していても辿らない）。
         std::os::unix::fs::symlink("/dev", dir.0.join("dev")).unwrap();
         let err = open_verified_null(dir_fd(&dir.0).as_fd(), real_procfs().as_fd()).unwrap_err();
-        assert_eq!(err.code, ErrorCode::FailedPrecondition);
-        assert!(err.message.starts_with("cannot open /dev as a directory"));
+        // 存在するのにディレクトリでない `/dev` は差し替えで、違反として記録する（SEC-4）。
+        let violation = |err: &ExecError, reason: ViolationReason| {
+            assert_eq!(
+                (err.code, err.stage),
+                (ErrorCode::FailedPrecondition, IsolationStage::Exec)
+            );
+            let v = err.violation.as_ref().expect("violation record");
+            assert_eq!((v.reason, v.behavior_id), (reason, "SEC-1"));
+        };
+        violation(&err, ViolationReason::ExecDevNotDirectory);
+        assert_eq!(
+            err.violation.as_ref().map(|v| v.reason.as_str()),
+            Some("exec_dev_not_directory")
+        );
+        std::fs::remove_file(dir.0.join("dev")).unwrap();
+        // `/dev` が通常ファイル。
+        std::fs::write(dir.0.join("dev"), b"").unwrap();
+        let err = open_verified_null(dir_fd(&dir.0).as_fd(), real_procfs().as_fd()).unwrap_err();
+        violation(&err, ViolationReason::ExecDevNotDirectory);
         std::fs::remove_file(dir.0.join("dev")).unwrap();
         // `/dev/null` が不在。
         std::fs::create_dir(dir.0.join("dev")).unwrap();
@@ -2162,24 +2250,32 @@ mod tests {
         assert!(err.message.starts_with("cannot find /dev/null"));
         assert_eq!(take_calls(), Vec::<String>::new());
 
-        // `/proc` が無い・procfs でない（通常のディレクトリ）・symlink の rootfs は、開き直しの起点にしない。
-        let rejected = |root: &Path| {
-            let err = open_root_procfs(dir_fd(root).as_fd()).unwrap_err();
-            assert_eq!(
-                (err.code, err.stage),
-                (ErrorCode::FailedPrecondition, IsolationStage::Exec)
-            );
-            assert_eq!(
-                err.message,
-                "/proc in the new root is not procfs; cannot reopen a verified file"
-            );
-        };
-        rejected(&dir.0);
-        std::fs::create_dir(dir.0.join("proc")).unwrap();
-        rejected(&dir.0);
-        std::fs::remove_dir(dir.0.join("proc")).unwrap();
-        std::os::unix::fs::symlink("/proc", dir.0.join("proc")).unwrap();
-        rejected(&dir.0);
+        // `/proc` が無い rootfs は前提の不足（違反ではない）。
+        let err = open_root_procfs(dir_fd(&dir.0).as_fd()).unwrap_err();
+        assert_eq!(
+            (err.code, err.stage),
+            (ErrorCode::FailedPrecondition, IsolationStage::Exec)
+        );
+        assert_eq!(err.violation, None);
+        assert!(err.message.starts_with("cannot open /proc in the new root"));
+        // procfs でない（通常のディレクトリ）・symlink（本物の `/proc` を指していても辿らない）・通常ファイルは
+        // 差し替えで、違反 `exec_proc_not_procfs` として記録する（SEC-4）。
+        let proc = dir.0.join("proc");
+        std::fs::create_dir(&proc).unwrap();
+        let err = open_root_procfs(dir_fd(&dir.0).as_fd()).unwrap_err();
+        violation(&err, ViolationReason::ExecProcNotProcfs);
+        assert_eq!(
+            err.message,
+            "/proc in the new root is not procfs; cannot reopen a verified file"
+        );
+        std::fs::remove_dir(&proc).unwrap();
+        std::os::unix::fs::symlink("/proc", &proc).unwrap();
+        let err = open_root_procfs(dir_fd(&dir.0).as_fd()).unwrap_err();
+        violation(&err, ViolationReason::ExecProcNotProcfs);
+        std::fs::remove_file(&proc).unwrap();
+        std::fs::write(&proc, b"").unwrap();
+        let err = open_root_procfs(dir_fd(&dir.0).as_fd()).unwrap_err();
+        violation(&err, ViolationReason::ExecProcNotProcfs);
         // 対照: 本物の procfs は起点にでき、固定した fd を開き直せる。
         let procfs = open_root_procfs(dir_fd(Path::new("/")).as_fd()).unwrap();
         let pinned = pin_null_device(dir_fd(Path::new("/dev")).as_fd(), c"null").unwrap();
@@ -2250,6 +2346,7 @@ mod tests {
             vec![
                 "close_range(3,close)".to_string(),
                 "setsid".to_string(),
+                "reopen(entrypoint)".to_string(),
                 "close_range(3)".to_string(),
                 "signal(SIGPIPE,SIG_DFL)".to_string(),
                 "stdio->/dev/null".to_string(),
@@ -2287,7 +2384,11 @@ mod tests {
             assert_eq!(v.behavior_id, "CORE-1");
             assert_eq!(
                 take_calls(),
-                vec!["close_range(3,close)".to_string(), "setsid".to_string()],
+                vec![
+                    "close_range(3,close)".to_string(),
+                    "setsid".to_string(),
+                    "reopen(entrypoint)".to_string()
+                ],
                 "{path:?}"
             );
         }
@@ -2323,7 +2424,11 @@ mod tests {
         assert_eq!(v.behavior_id, "SEC-1");
         assert_eq!(
             take_calls(),
-            vec!["close_range(3,close)".to_string(), "setsid".to_string()]
+            vec![
+                "close_range(3,close)".to_string(),
+                "setsid".to_string(),
+                "reopen(entrypoint)".to_string()
+            ]
         );
     }
 
@@ -2460,6 +2565,67 @@ mod tests {
         let shown = format!("{command:?}");
         assert!(!shown.contains("s3cr3t"), "{shown}");
         assert!(shown.contains(r#"env_keys: ["TOKEN"]"#), "{shown}");
+    }
+
+    /// SUP-6・SEC-1・TASK-163 追補（#1456）: `setsid` の後は、端末を `O_NOCTTY` なしで開くと制御端末として取得して
+    /// しまう。エントリポイントが端末・デバイス・ディレクトリ・それらを指す symlink のときは、開き直しに進まずに
+    /// （対象を開かずに）拒否する。通常ファイルを指す symlink は従来どおり辿って開く。
+    #[test]
+    fn sup6_sec1_task163_non_regular_entrypoint_is_rejected_without_opening_it() {
+        let dir = TempDir::create("entry-kind");
+        for (i, target) in ["/dev/tty", "/dev/ptmx", "/dev/null", "/proc"]
+            .iter()
+            .enumerate()
+        {
+            let link = dir.0.join(format!("link{i}"));
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            for path in [Path::new(target), link.as_path()] {
+                let entry = Entrypoint::new(path, ["x"], [] as [&str; 0]).unwrap();
+                let _ = take_calls();
+                let err = exec_entrypoint_verified(current_root_mnt_id(), &entry).unwrap_err();
+                assert_eq!(
+                    (err.code, err.stage),
+                    (ErrorCode::PermissionDenied, IsolationStage::Exec),
+                    "{path:?}"
+                );
+                assert!(
+                    err.message.ends_with("is not a regular file")
+                        || err
+                            .message
+                            .ends_with("resolves to an inherited standard stream"),
+                    "{path:?}: {}",
+                    err.message
+                );
+                assert_eq!(exit_code_for(&err), EXIT_EXEC_NOT_EXECUTABLE);
+                // 開き直し（= 実際の open）には進んでいない。
+                assert_eq!(
+                    take_calls(),
+                    vec!["close_range(3,close)".to_string(), "setsid".to_string()],
+                    "{path:?}"
+                );
+            }
+        }
+        // 対照: 通常ファイルを指す symlink は辿って開く（`/bin/sh` 等の symlink を拒否しない）。
+        let file = dir.0.join("regular");
+        std::fs::write(&file, b"data").unwrap();
+        let link = dir.0.join("link-regular");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let root = dir_fd(Path::new("/"));
+        let _ = take_calls();
+        let (opened, meta) = open_entrypoint(
+            &Entrypoint::new(&link, ["x"], [] as [&str; 0]).unwrap(),
+            root.as_fd(),
+            real_procfs().as_fd(),
+        )
+        .unwrap();
+        assert_eq!(take_calls(), vec!["reopen(entrypoint)".to_string()]);
+        let want = std::fs::metadata(&file).unwrap();
+        assert_eq!((meta.dev(), meta.ino()), (want.dev(), want.ino()));
+        let mut head = [0u8; 4];
+        assert_eq!(opened.read_at(&mut head, 0).unwrap(), 4);
+        assert_eq!(&head, b"data");
+        use std::os::fd::AsRawFd as _;
+        assert!(opened.as_raw_fd() > 2);
     }
 
     /// CORE-1（TASK-27.4.1）: 不在のエントリポイントは `NotFound`（終了コード 127 に対応）。

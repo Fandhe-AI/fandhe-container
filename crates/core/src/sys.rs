@@ -1239,27 +1239,6 @@ fn null_terminated_ptrs(items: &[CString]) -> Vec<*const core::ffi::c_char> {
         .collect()
 }
 
-/// 絶対パス `path` を読み取り専用で開く（`O_RDONLY|O_CLOEXEC|O_NONBLOCK`。最終要素の symlink は辿る）。
-///
-/// エントリポイントの検査と実行を同じ実体に固定するための fd を得る（[`exec_fd`] と組で使う）。
-/// `O_NONBLOCK` は FIFO 等の open が相手待ちでハングするのを避けるため（REPAIR-5）。
-#[cfg_attr(test, allow(dead_code))]
-pub(crate) fn open_file_read(path: &CStr) -> Result<OwnedFd, SysError> {
-    if !consts::SUPPORTED {
-        return Err(SysError::Unsupported);
-    }
-    let flags = consts::O_CLOEXEC | consts::O_NONBLOCK;
-    // SAFETY: `path` は借用した NUL 終端文字列で呼び出しの間生存する。flags に O_CREAT / O_TMPFILE を
-    // 含まないため可変長引数（mode）は渡さず、カーネルも読まない。成功時の戻り値は新規 fd で、
-    // 直後に `OwnedFd` が唯一の所有者となる（二重 close なし）。
-    let fd = unsafe { openat(AT_FDCWD, path.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(last_error());
-    }
-    // SAFETY: `fd` は上で成功した openat が返した、他に所有者のいない有効な fd。
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
 /// `fd` の close-on-exec を `on` に設定する（`fcntl(F_SETFD)`）。
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn set_cloexec(fd: BorrowedFd<'_>, on: bool) -> Result<(), SysError> {

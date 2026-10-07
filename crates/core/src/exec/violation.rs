@@ -163,6 +163,13 @@ pub enum ViolationReason {
     /// #1458）。カーネルはインタープリタを exec するプロセス自身の文脈で開くため、本体の照合
     /// （[`Self::EntrypointIsRuntimeBinary`]）だけでは通ってしまう。
     EntrypointInterpreterIsRuntimeBinary,
+    /// 新 root の `/dev` が実ディレクトリでない（symlink・通常ファイル等へ差し替えられている。SUP-6・SEC-1・
+    /// SEC-4・TASK-163 追補・#1459）。`/dev/null` を別の木から引かせないため、symlink を辿らずに拒否する。
+    ExecDevNotDirectory,
+    /// 新 root の `/proc` が procfs でない（symlink・非ディレクトリ・別のファイルシステムが置かれている。SUP-6・
+    /// SEC-1・SEC-4・TASK-163 追補・#1459）。ランタイムの同一性の基準と、検証済みの fd の開き直しの起点を
+    /// すり替えさせないために拒否する。
+    ExecProcNotProcfs,
     /// exec の対象が入れ子の PID namespace の PID 1 でない（`NSpid` が 2 要素・末尾 1 でない。SUP-6）。
     ExecTargetNotNestedPid1,
     /// exec の対象の所属 cgroup が、記録から導いた期待パスと一致しない（pid 再利用・移動。SEC-1）。
@@ -235,6 +242,8 @@ impl ViolationReason {
             Self::EntrypointInterpreterIsRuntimeBinary => {
                 "entrypoint_interpreter_is_runtime_binary"
             }
+            Self::ExecDevNotDirectory => "exec_dev_not_directory",
+            Self::ExecProcNotProcfs => "exec_proc_not_procfs",
             Self::ExecTargetNotNestedPid1 => "exec_target_not_nested_pid1",
             Self::ExecTargetCgroupMismatch => "exec_target_cgroup_mismatch",
             Self::ExecTargetSharesPidNamespace => "exec_target_shares_pid_namespace",
@@ -286,7 +295,9 @@ impl ViolationReason {
             | Self::RootfsHasExternalHardlink => ViolationKind::RootfsPivot,
             Self::EntrypointIsRuntimeBinary
             | Self::StdioNullNotNullDevice
-            | Self::EntrypointInterpreterIsRuntimeBinary => ViolationKind::Entrypoint,
+            | Self::EntrypointInterpreterIsRuntimeBinary
+            | Self::ExecDevNotDirectory
+            | Self::ExecProcNotProcfs => ViolationKind::Entrypoint,
             Self::ExecTargetNotNestedPid1
             | Self::ExecTargetCgroupMismatch
             | Self::ExecTargetSharesPidNamespace
@@ -308,6 +319,8 @@ impl ViolationReason {
             Self::ExecTargetCgroupMismatch
             | Self::StdioNullNotNullDevice
             | Self::EntrypointInterpreterIsRuntimeBinary
+            | Self::ExecDevNotDirectory
+            | Self::ExecProcNotProcfs
             | Self::ExecRootNotContainerRootfs
             | Self::ExecJoinedNamespaceMismatch
             | Self::ExecJoinedPidNamespaceMismatch
@@ -365,7 +378,9 @@ impl ViolationReason {
             | Self::ExecRootNotContainerRootfs
             | Self::ExecJoinedNamespaceMismatch
             | Self::ExecJoinedPidNamespaceMismatch
-            | Self::ExecJoinedCgroupMismatch => ErrorCode::FailedPrecondition,
+            | Self::ExecJoinedCgroupMismatch
+            | Self::ExecDevNotDirectory
+            | Self::ExecProcNotProcfs => ErrorCode::FailedPrecondition,
             Self::EntrypointIsRuntimeBinary
             | Self::StdioNullNotNullDevice
             | Self::EntrypointInterpreterIsRuntimeBinary => ErrorCode::PermissionDenied,
@@ -466,6 +481,10 @@ impl ViolationReason {
             Self::EntrypointInterpreterIsRuntimeBinary => {
                 "the interpreter of the entrypoint resolves to the runtime's own executable; \
                  refusing to exec it"
+            }
+            Self::ExecDevNotDirectory => "/dev in the new root is not a directory",
+            Self::ExecProcNotProcfs => {
+                "/proc in the new root is not procfs; cannot reopen a verified file"
             }
             Self::StdioNullNotNullDevice => {
                 "/dev/null in the new root is not the null device (1:3); refusing to open it"
@@ -711,6 +730,32 @@ mod tests {
         );
         let v = IsolationViolation::new(r, Some(Path::new("/script")));
         assert_eq!(v.mount_audit_event(), None);
+    }
+
+    /// SUP-6・SEC-1・SEC-4（TASK-163 追補・#1459）: `/dev`・`/proc` の差し替えの理由コード・種別・ビヘイビア ID・
+    /// `ErrorCode`・段・メッセージの具体値。
+    #[test]
+    fn sec4_sup6_task163_dev_and_proc_reason_metadata_is_exact() {
+        for (r, code, message) in [
+            (
+                ViolationReason::ExecDevNotDirectory,
+                "exec_dev_not_directory",
+                "/dev in the new root is not a directory",
+            ),
+            (
+                ViolationReason::ExecProcNotProcfs,
+                "exec_proc_not_procfs",
+                "/proc in the new root is not procfs; cannot reopen a verified file",
+            ),
+        ] {
+            assert_eq!(r.as_str(), code);
+            assert_eq!(r.kind().as_str(), "entrypoint");
+            assert_eq!(r.behavior_id(), "SEC-1");
+            assert_eq!(r.error_code(), ErrorCode::FailedPrecondition);
+            assert_eq!(r.stage(), IsolationStage::Exec);
+            assert_eq!(r.message(), message);
+            assert_eq!(IsolationViolation::new(r, None).mount_audit_event(), None);
+        }
     }
 
     /// SUP-6・SEC-1・SEC-4（TASK-163 追補・#1459）: `/dev/null` 差し替えの理由コード・種別・ビヘイビア ID・

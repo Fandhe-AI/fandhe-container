@@ -849,6 +849,10 @@ mod linux {
 
     /// 補助グループの扱いの期待値。joiner は本プロセス（root）と同じ補助グループを持つため、本プロセスが
     /// 補助グループを持てば `cleared`（`setgroups(0)` で消去）、持たなければ `already_empty`。
+    ///
+    /// 消去は namespace へ参加する **前**（準備の最後）に行われ、参加後の capability 削減は「元から空」になるが、
+    /// 結果には参加前の消去（`cleared`）が残る（root 起動の exec が起動者のホスト側の補助グループをコンテナへ
+    /// 持ち込まないことの照合。TASK-163 追補・#1457。プローブの `Groups:` が空であることは `one_round` が照合する）。
     fn expected_groups_outcome() -> &'static str {
         let status = fs::read_to_string("/proc/self/status").expect("own status");
         if status_field(&status, "Groups:").is_empty() {

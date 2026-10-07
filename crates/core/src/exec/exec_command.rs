@@ -207,7 +207,7 @@ pub fn spawn_exec_command(ready: ExecReady, command: &ExecCommand) -> Result<Exe
     let pid = sys::fork_single_threaded_with(
         || threads.count() == Some(1),
         || match bind_to_parent_lifetime(own.as_fd()) {
-            Ok(()) => exec_child_main(entry, status_write.as_fd()),
+            Ok(()) => exec_child_main(entry, &status_write),
             // 何も書かずに終わる（親は「手順の途中で終了した」= コマンドは起動していない、と判定する）。
             Err(code) => code,
         },
@@ -431,11 +431,9 @@ mod tests {
     }
 
     /// 子が `content` を書いて終了した後の状態を模した `ExecChild`（pid は待機に使わない）。
-    fn exec_child_with_status(content: &[u8]) -> (ExecChild, OwnedFd) {
+    fn exec_child_with_status(content: &[u8]) -> (ExecChild, std::fs::File) {
         let (status, writer) = exec_status_pipe().expect("status pipe");
-        (&std::fs::File::from(writer.try_clone().expect("dup")))
-            .write_all(content)
-            .expect("write status");
+        (&writer).write_all(content).expect("write status");
         let child = ExecChild {
             child: ContainerChild::from_pid_for_test(std::process::id()),
             status,

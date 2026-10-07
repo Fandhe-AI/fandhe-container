@@ -57,8 +57,12 @@
 //!   起動したプロセス（CLI・supervisor）の環境は 1 つも渡らず、既定値の補完もしない（入口が `std::env::vars()` を
 //!   渡す形は型で書けない。core の `exec/container_env.rs`）。補助グループは launch と同じく空にする（core の
 //!   capability 削減が `setgroups(0)` を呼ぶ。exec を起動したプロセスのホスト側の補助グループを持ち越さない）。
-//!   `setgroups` が `deny` の user namespace（rootless）では消去できないため残し、[`ExecOutcome`] の
-//!   `supplementary_groups` に記録する。uid / gid は変更しない（launch も同じ）
+//!   **消去は namespace へ参加する前にも行う**（[`prepare_restrictions`]・[`run_command`] の準備の最後。不可逆）:
+//!   対象の user namespace へ入った後は `setgroups` が `deny` で消せなくなり、exec を起動したプロセス（root・
+//!   `sudo` 経由・別のグループ集合のセッション）のグループをコンテナへ持ち込むため。消去できず `deny` も確認
+//!   できなければ、参加せずに拒否する。起動者自身が既に `setgroups` を禁じた user namespace の中にいる場合
+//!   （rootless）だけは残し、[`ExecOutcome`] の `supplementary_groups` に記録する（残るのは **exec を起動した
+//!   プロセスの** 補助グループで、user namespace の作成者と同じとは限らない）。uid / gid は変更しない（launch も同じ）
 //! - **`execve` 前の失敗とコマンドの終了を区別する**（REPAIR-3・TASK-163 追補・#1460）: [`ExecOutcome`] の `exit` は
 //!   core の `ExecExit` で、`Command`（コマンドが起動して終了した）と `SetupFailed`（コマンドは起動していない。
 //!   子が `execve` より前の手順か `execve` 自体で失敗した）を分ける。子の終了コード 125 / 126 / 127 は実行された
@@ -248,7 +252,8 @@ pub fn join_cgroup(join: ExecCgroupJoin) -> Result<ExecCgroupJoinReport, TraitEr
 }
 
 /// コンテナの `config.json` から Landlock ruleset を作り、コンテナの rootfs を固定し、自プロセスの status fd・
-/// 対象の mount namespace の識別子・対象の実効 rlimit を確保する。[`enter_namespaces`] の **前** に、再適用を
+/// 対象の mount namespace の識別子・対象の実効 rlimit を確保し、**最後に自プロセスの補助グループを空にする**
+/// （不可逆。namespace へ参加する前に消去するため。TASK-163 追補・#1457。契約はモジュール doc）。[`enter_namespaces`] の **前** に、再適用を
 /// 行うプロセス自身が呼ぶ（SUP-6・#502・#503。契約はモジュール doc）。
 ///
 /// `config.json` と rootfs は、`target` を特定した記録の bundle から取る（呼び出し側は記録を渡し直さない）。
@@ -634,10 +639,12 @@ fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
 }
 
 /// worker が返し得る違反の理由（`execve` 前の手順が返すもの。[`decode_worker_result`] が名前から引き直す）。
-const SETUP_VIOLATIONS: [ViolationReason; 3] = [
+const SETUP_VIOLATIONS: [ViolationReason; 5] = [
     ViolationReason::EntrypointIsRuntimeBinary,
     ViolationReason::EntrypointInterpreterIsRuntimeBinary,
     ViolationReason::StdioNullNotNullDevice,
+    ViolationReason::ExecDevNotDirectory,
+    ViolationReason::ExecProcNotProcfs,
 ];
 
 /// [`encode_worker_result`] の逆変換。形式に合わない入力（空・切れた行・未知の種別）は `Internal`（fail-closed）。
@@ -1204,6 +1211,20 @@ mod tests {
                     violation: Some(ViolationReason::EntrypointIsRuntimeBinary),
                 },
                 "setup entrypoint_is_runtime_binary exited 126",
+            ),
+            (
+                ExecExit::SetupFailed {
+                    exit: ChildExit::Exited(126),
+                    violation: Some(ViolationReason::ExecDevNotDirectory),
+                },
+                "setup exec_dev_not_directory exited 126",
+            ),
+            (
+                ExecExit::SetupFailed {
+                    exit: ChildExit::Exited(126),
+                    violation: Some(ViolationReason::ExecProcNotProcfs),
+                },
+                "setup exec_proc_not_procfs exited 126",
             ),
             (
                 ExecExit::SetupFailed {

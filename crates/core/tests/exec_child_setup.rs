@@ -12,6 +12,8 @@
 //!   呼び出し側のセッション ID と異なる。制御端末を持たない（`tty_nr` = 0・`/dev/tty` が `ENXIO`）。
 //!   呼び出し側が制御端末を持つ状況は util-linux の `script`（疑似端末を割り当てる）の下で本バイナリを
 //!   再実行して作り、「制御端末を持つ呼び出し側から起動しても子は持たない」ことを照合する
+//!   同じ疑似端末の下で、端末そのもの・端末を指す symlink をエントリポイントにしても、子が開かずに拒否する
+//!   （`setsid` の後に端末を `O_NOCTTY` なしで開くと制御端末として取得し直すため。終了コード 126）ことも照合する
 //! - **標準入出力**: fd 0〜2 がすべて文字デバイス 1:3（`/dev/null`）
 //! - **インタープリタ経由の拒否（#1458・SEC-4）**: `#!/proc/self/exe`・`#!/proc/<pid>/exe`・スクリプトの連鎖の
 //!   先がランタイム自身（ここでは試験バイナリ自身）に解決されるスクリプトは、子が `execveat` の前に終了コード 126 で
@@ -465,6 +467,50 @@ mod linux {
         assert_eq!(own_group_state().0, groups);
     }
 
+    /// SUP-6・SEC-1・TASK-163 追補（#1456）: 端末（呼び出し側の疑似端末・`/dev/tty`・`/dev/ptmx`）や、端末を指す
+    /// symlink をエントリポイントにしても、子は開かずに拒否する（終了コード 126・コマンドは起動していない）。
+    ///
+    /// `setsid` 直後の子はセッションリーダーで制御端末を持たないため、端末を `O_NOCTTY` なしで開くと、その端末を
+    /// 制御端末として取得し直してしまう。種別は `O_PATH` で固定して確かめ、通常ファイルだけを `O_NOCTTY` つきで
+    /// 開き直す。
+    fn terminal_entrypoint_is_refused_without_opening_it(work: &Path) {
+        // 呼び出し側の疑似端末（`script` が割り当てたもの。fd 0 のリンク先）。
+        let pty = fs::read_link("/proc/self/fd/0").expect("read the terminal path");
+        assert!(
+            pty.starts_with("/dev/pts"),
+            "stdin must be the pseudo terminal: {pty:?}"
+        );
+        let link = work.join("tty-link");
+        std::os::unix::fs::symlink(&pty, &link).expect("symlink to the terminal");
+        let ptmx_link = work.join("ptmx-link");
+        std::os::unix::fs::symlink("/dev/ptmx", &ptmx_link).expect("symlink to ptmx");
+        let cases = [
+            ("pty", pty.clone()),
+            ("pty-link", link),
+            ("dev-tty", PathBuf::from("/dev/tty")),
+            ("ptmx", PathBuf::from("/dev/ptmx")),
+            ("ptmx-link", ptmx_link),
+        ];
+        for (name, path) in cases {
+            let command = ExecCommand::new(&path, ["x"], &ContainerEnv::empty()).expect("command");
+            let report = work.join(format!("report-tty-{name}"));
+            let observation = observe_exec_child_setup(&command, &report, timeout())
+                .expect("observe the exec child setup");
+            assert_eq!(
+                observation.exit,
+                ExecExit::SetupFailed {
+                    exit: ChildExit::Exited(126),
+                    violation: None,
+                },
+                "{name}"
+            );
+            assert_eq!(observation.report, None, "{name}");
+        }
+        // 拒否の後も、通常のエントリポイントの子は制御端末を持たない（端末を取得する経路が残っていない）。
+        let report = observe_ok(&shell_entry(), work, "report-after-tty");
+        assert_eq!((report.tty_nr, report.dev_tty_errno), (0, Some(ENXIO)));
+    }
+
     /// `--pty-child`: 疑似端末を制御端末に持つ状態で、子が制御端末を持たないことを照合する。
     pub fn pty_child(work: &Path) {
         let (_, caller_tty) = own_session_and_tty();
@@ -474,6 +520,7 @@ mod linux {
         );
         fs::File::open("/dev/tty").expect("the caller can open its controlling terminal");
         session_is_detached_from_the_caller(work, "report-pty");
+        terminal_entrypoint_is_refused_without_opening_it(work);
         fs::write(work.join(PTY_OK), PTY_OK).expect("write the pty marker");
     }
 }

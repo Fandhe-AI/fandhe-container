@@ -92,3 +92,11 @@ harness = false
 name = "exec_audit"
 path = "tests/exec_audit.rs"
 harness = false
+
+# exec の対象を起動時から保持する pidfd で固定する経路の結合試験（SUP-6・SEC-1・CORE-1・TASK-163 追補・#1461）。
+# fork は単一スレッドの呼び出し元を要求するため、単一スレッドの独自 main（harness = false）で動かす。
+# root・実コンテナは不要で、既定のテスト集合で実行する。
+[[test]]
+name = "exec_launch_pidfd"
+path = "tests/exec_launch_pidfd.rs"
+harness = false

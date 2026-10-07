@@ -36,9 +36,14 @@
 //!   cgroupfs に書ける構成では、コンテナ内のプロセスが兄弟の `fc-*` cgroup の `cgroup.procs` へ自分を移し、
 //!   別コンテナの期待パスに一致させ得る。現在これが成り立たないのは、cgroupfs / sysfs をコンテナへマウント
 //!   しておらず、cgroup namespace も導入していないからである。cgroupfs のマウント・`CLONE_NEWCGROUP`・
-//!   `/sys/fs/cgroup` の bind mount を導入する変更では、本照合を必ず見直すこと。恒久策は、supervisor が
-//!   コンテナの起動時から pidfd を保持し、exec 専用プロセスへ継承または `SCM_RIGHTS` で渡す方式で、本実装の
-//!   対象外（未実装）
+//!   `/sys/fs/cgroup` の bind mount を導入する変更では、本照合に同一性を依存させず、[`Pid1Target::open`]
+//!   （記録 pid から開く縮退経路）を拒否へ切り替えること。恒久策は、supervisor がコンテナの起動時（fork 直後・
+//!   回収前）から保持する pidfd で対象を固定する [`Pid1Target::open_with_launch_pidfd`]（#1461）で、pidfd の
+//!   `Pid:`（`/proc/self/fdinfo`）と記録 pid の一致を同一性の根拠にする。この入口でも期待 cgroup の照合は
+//!   多層防御として残るが、同一性の根拠ではない。pidfd を得られない場合は縮退せず拒否する。supervisor 不在
+//!   （孤児化・再起動後で起動時の pidfd を失った）の場合の明示された縮退経路が [`Pid1Target::open`] で、
+//!   上記の前提が成り立つ間だけ使う。supervisor から別プロセスの exec 専用プロセスへ pidfd を渡す 1 段目
+//!   （execve 越しの継承・`SCM_RIGHTS`）は未実装（下記）
 //! - **対象の限定**: 対象は、呼び出し側の PID namespace に **直接** 入れ子になった PID namespace の PID 1
 //!   （`NSpid:` がちょうど 2 要素で末尾が 1）に限り、呼び出し側と同じ pid / mnt namespace へは参加しない。
 //!   任意プロセスの namespace へ入る汎用手段にしない。入れ子の PID namespace の取り違え（コンテナの中で
@@ -101,7 +106,8 @@
 //! - 違反記録の監査ログ（SEC-4）への保存のうち、本番の sink の実体の生成と CLI からの受け渡し。記録の層
 //!   `AuditLayer::ExecTarget` と、通しの入口 supervisor `run_command` が親プロセス側で 1 拒否 1 件を記録する
 //!   経路は実装済み（#1465）。この段関数単体は記録せず、`ExecError::violation` に載せて返すところまで
-//! - supervisor が起動時から保持する pidfd による同一性の保証（上記「同一性照合の前提」の恒久策）
+//! - supervisor が起動時から保持する pidfd の、別プロセスの exec 専用プロセスへの受け渡し（execve 越しの継承・
+//!   `SCM_RIGHTS`。fork 継承は supervisor `exec::run_command_with_pidfd` で実装済み。#1461）
 //! - 記録 pid が入れ子の PID 1 でない起動経路（rootless の代役 init 等の中間プロセス）の pid1 特定
 
 use std::fs;
@@ -271,6 +277,98 @@ impl Pid1Target {
             ));
         }
         let pidfd = sys::pidfd_open(pid.get()).map_err(|e| setns_error(e, "pidfd_open"))?;
+        Self::verify_pinned(pid, pidfd, expected_cgroup_path)
+    }
+
+    /// supervisor が起動時（fork 直後・回収前）から保持する pidfd で対象を固定して検証する（SUP-6・SEC-1・
+    /// CORE-1・TASK-163 追補・#1461）。
+    ///
+    /// [`Self::open`] が記録 pid から `pidfd_open` し cgroup の所属で「記録したコンテナのプロセスか」を
+    /// 照合するのに対し、こちらは起動時に開いた pidfd が指すプロセスの pid（`/proc/self/fdinfo/<fd>` の
+    /// `Pid:`）を記録 pid（`recorded_pid`）と照合する。pidfd は回収前に開いたため pid 再利用の影響を受けず、
+    /// 同一性が cgroup の所属（コンテナ内から cgroupfs に書ける構成では偽装され得る）に依存しない。
+    /// 不一致は `FailedPrecondition`（違反記録 `ExecTargetPidfdMismatch`）、pidfd でない fd は
+    /// `InvalidArgument`、終了済みは `FailedPrecondition`（違反記録なし）。照合後の検証は [`Self::open`] と
+    /// 同じ順序で行い、期待 cgroup の照合は同一性の根拠ではなく多層防御として残す。
+    ///
+    /// `pidfd` の所有権を受け取る（呼び出し側が保持する pidfd は複製して渡す）。
+    pub fn open_with_launch_pidfd(
+        pidfd: OwnedFd,
+        recorded_pid: NonZeroU32,
+        id: &ContainerId,
+        placement: &CgroupPlacement,
+    ) -> Result<Self, ExecError> {
+        let name = CgroupName::for_instance(id, placement.instance()).map_err(|_| {
+            ExecError::new(
+                ErrorCode::InvalidArgument,
+                IsolationStage::SetNs,
+                "container id and instance do not form a valid cgroup name",
+            )
+        })?;
+        let expected_cgroup_path = container_cgroup_path(placement.scope(), &name);
+        if !is_valid_cgroup_path(&expected_cgroup_path) {
+            return Err(ExecError::new(
+                ErrorCode::InvalidArgument,
+                IsolationStage::SetNs,
+                "expected cgroup path must be an absolute, normalized, non-root cgroup path",
+            ));
+        }
+        use std::os::fd::AsRawFd as _;
+        let info = read_bounded(&format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd()))
+            .map_err(|e| target_proc_error(&e, "read pidfd info"))?;
+        match parse_fdinfo_pid(&info) {
+            FdinfoPid::NotPidfd => {
+                return Err(ExecError::new(
+                    ErrorCode::InvalidArgument,
+                    IsolationStage::SetNs,
+                    "the given descriptor is not a pidfd",
+                ));
+            }
+            FdinfoPid::Exited => {
+                return Err(ExecError::new(
+                    ErrorCode::FailedPrecondition,
+                    IsolationStage::SetNs,
+                    "the process held by the launch pidfd has already exited",
+                ));
+            }
+            // 呼び出し側の PID namespace から見えない（0）。同一性を示せないため拒否する。
+            FdinfoPid::Pid(None) => {
+                return Err(ExecError::from_violation(
+                    ViolationReason::ExecTargetPidfdMismatch,
+                    None,
+                ));
+            }
+            FdinfoPid::Pid(Some(pid)) if pid != recorded_pid => {
+                return Err(ExecError::from_violation(
+                    ViolationReason::ExecTargetPidfdMismatch,
+                    None,
+                ));
+            }
+            FdinfoPid::Pid(Some(_)) => {}
+        }
+        // pidfd を保持している間 fdinfo の `Pid:` は終了後も元の pid を示し続け（`-1` にならない）、終了を
+        // 検出できない。終了済み（zombie 含む）の pidfd は poll で readable になるため、pidfd と確認できた
+        // 後にここで終了を拒否する（非 pidfd の fd は poll が常に readable になるため、判定は後段に置く）。
+        let exited = sys::poll_readable(pidfd.as_fd(), 0)
+            .map_err(|e| setns_error(e, "poll launch pidfd"))?;
+        if exited {
+            return Err(ExecError::new(
+                ErrorCode::FailedPrecondition,
+                IsolationStage::SetNs,
+                "the process held by the launch pidfd has already exited",
+            ));
+        }
+        Self::verify_pinned(recorded_pid, pidfd, expected_cgroup_path)
+    }
+
+    /// pidfd で固定済みの `pid` を検証して対象にする共通の後段（[`Self::open`]・
+    /// [`Self::open_with_launch_pidfd`] の両方が通る）。
+    fn verify_pinned(
+        pid: NonZeroU32,
+        pidfd: OwnedFd,
+        expected_cgroup_path: String,
+    ) -> Result<Self, ExecError> {
+        let stage = IsolationStage::SetNs;
         let status = read_bounded(&format!("/proc/{pid}/status"))
             .map_err(|e| target_proc_error(&e, "read target status"))?;
         if !nspid_is_nested_pid1(&status) {
@@ -472,6 +570,42 @@ fn target_proc_error(err: &std::io::Error, what: &str) -> ExecError {
         e.code = ErrorCode::NotFound;
     }
     e
+}
+
+/// `/proc/self/fdinfo/<fd>` の `Pid:` 行の解釈結果。
+///
+/// `pidfd_open(2)` によれば `Pid:` は pidfd の指すプロセスの pid（読み手の PID namespace での値）で、
+/// プロセスが終了していれば `-1`、読み手の PID namespace から見えなければ `0`。pidfd でない fd の
+/// fdinfo には `Pid:` 行が無い（あっても複数・非数値なら pidfd と見なさない）。
+#[derive(Debug, PartialEq, Eq)]
+enum FdinfoPid {
+    /// `Pid:` 行が 1 つだけで、正の pid（`Some`）または 0（`None`。名前空間外）。
+    Pid(Option<NonZeroU32>),
+    /// `Pid: -1`（終了済み。pidfd 保持中は通常現れないため、終了の主たる検出は poll）。
+    Exited,
+    /// pidfd の fdinfo として解釈できない。
+    NotPidfd,
+}
+
+/// fdinfo のテキストから `Pid:` を取り出す。`NSpid:` 等の別行は読まない。
+fn parse_fdinfo_pid(info: &str) -> FdinfoPid {
+    let mut found = None;
+    for line in info.lines() {
+        if let Some(rest) = line.strip_prefix("Pid:") {
+            if found.is_some() {
+                return FdinfoPid::NotPidfd;
+            }
+            found = Some(rest.trim());
+        }
+    }
+    match found {
+        Some("-1") => FdinfoPid::Exited,
+        Some(v) => match v.parse::<u32>() {
+            Ok(n) => FdinfoPid::Pid(NonZeroU32::new(n)),
+            Err(_) => FdinfoPid::NotPidfd,
+        },
+        None => FdinfoPid::NotPidfd,
+    }
 }
 
 /// `/proc` のテキストを上限つきで読む（[`read_bounded_from`]）。
@@ -749,6 +883,106 @@ mod tests {
         assert_eq!(v.reason.as_str(), "exec_target_not_nested_pid1");
         assert_eq!(v.behavior_id, "SUP-6");
         assert_eq!(v.subject, None);
+    }
+
+    /// SUP-6（#1461）: fdinfo の `Pid:` の解釈（具体値）。
+    #[test]
+    fn sup6_parse_fdinfo_pid_concrete_values() {
+        let n = |v: u32| FdinfoPid::Pid(NonZeroU32::new(v));
+        assert_eq!(
+            parse_fdinfo_pid("pos:\t0\nPid:\t1234\nNSpid:\t1234\n"),
+            n(1234)
+        );
+        assert_eq!(
+            parse_fdinfo_pid("Pid:\t-1\nNSpid:\t-1\n"),
+            FdinfoPid::Exited
+        );
+        assert_eq!(parse_fdinfo_pid("Pid:\t0\n"), FdinfoPid::Pid(None));
+        assert_eq!(
+            parse_fdinfo_pid("pos:\t0\nflags:\t02\n"),
+            FdinfoPid::NotPidfd
+        );
+        assert_eq!(parse_fdinfo_pid("Pid:\tabc\n"), FdinfoPid::NotPidfd);
+        assert_eq!(parse_fdinfo_pid("Pid:\t-5\n"), FdinfoPid::NotPidfd);
+        assert_eq!(parse_fdinfo_pid("Pid:\t1\nPid:\t2\n"), FdinfoPid::NotPidfd);
+        assert_eq!(parse_fdinfo_pid("NSpid:\t7\n"), FdinfoPid::NotPidfd);
+    }
+
+    fn spawn_sleeper() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    /// SUP-6・SEC-4（#1461）: 記録 pid と pidfd の指すプロセスが違えば `exec_target_pidfd_mismatch`。
+    #[test]
+    fn sup6_launch_pidfd_rejects_recorded_pid_mismatch() {
+        let mut child = spawn_sleeper();
+        let pidfd = sys::pidfd_open(child.id())
+            .expect("pidfd_open は Linux 5.3 以降が前提（pidfd 非対応環境では失敗させる）");
+        let id = ContainerId::new("x").unwrap();
+        let other = NonZeroU32::new(child.id() + 1).unwrap();
+        let err =
+            Pid1Target::open_with_launch_pidfd(pidfd, other, &id, &placement("/", 1)).unwrap_err();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        let v = err.violation.expect("violation");
+        assert_eq!(v.kind, ViolationKind::ExecTarget);
+        assert_eq!(v.reason, ViolationReason::ExecTargetPidfdMismatch);
+        assert_eq!(v.reason.as_str(), "exec_target_pidfd_mismatch");
+        assert_eq!(v.behavior_id, "SUP-6");
+    }
+
+    /// SUP-6（#1461）: pidfd 照合を通ると次段（入れ子の PID 1 の検査）へ進む（順序の証明）。
+    #[test]
+    fn sup6_launch_pidfd_match_proceeds_to_nested_pid1_check() {
+        let mut child = spawn_sleeper();
+        let pidfd = sys::pidfd_open(child.id())
+            .expect("pidfd_open は Linux 5.3 以降が前提（pidfd 非対応環境では失敗させる）");
+        let id = ContainerId::new("x").unwrap();
+        let pid = NonZeroU32::new(child.id()).unwrap();
+        let err =
+            Pid1Target::open_with_launch_pidfd(pidfd, pid, &id, &placement("/", 1)).unwrap_err();
+        let _ = child.kill();
+        let _ = child.wait();
+        let v = err.violation.expect("violation");
+        assert_eq!(v.reason, ViolationReason::ExecTargetNotNestedPid1);
+        assert_eq!(v.reason.as_str(), "exec_target_not_nested_pid1");
+    }
+
+    /// SUP-6（#1461）: pidfd でない fd は `InvalidArgument`（違反記録なし）。
+    #[test]
+    fn sup6_launch_pidfd_rejects_non_pidfd() {
+        let file = std::fs::File::open("/proc/self/status").unwrap();
+        let id = ContainerId::new("x").unwrap();
+        let err =
+            Pid1Target::open_with_launch_pidfd(OwnedFd::from(file), me(), &id, &placement("/", 1))
+                .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert_eq!(err.message, "the given descriptor is not a pidfd");
+        assert!(err.violation.is_none());
+    }
+
+    /// SUP-6（#1461）: 終了・回収済みの子の pidfd は `FailedPrecondition`（違反記録なし）。
+    #[test]
+    fn sup6_launch_pidfd_rejects_exited_process() {
+        let mut child = spawn_sleeper();
+        let pidfd = sys::pidfd_open(child.id())
+            .expect("pidfd_open は Linux 5.3 以降が前提（pidfd 非対応環境では失敗させる）");
+        let pid = NonZeroU32::new(child.id()).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let id = ContainerId::new("x").unwrap();
+        let err =
+            Pid1Target::open_with_launch_pidfd(pidfd, pid, &id, &placement("/", 1)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message,
+            "the process held by the launch pidfd has already exited"
+        );
+        assert!(err.violation.is_none());
     }
 
     /// SUP-6: PID_MAX_LIMIT 超の pid は存在しない（NotFound。違反記録なし）。

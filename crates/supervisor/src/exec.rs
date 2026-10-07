@@ -26,7 +26,7 @@
 //!   [`join_cgroup`] は準備の後（#503 は `enter_namespaces` の後・seccomp の前に呼ぶ想定）。
 //!   `/proc/self/cgroup` の fd も準備で確保する（`setns` 後は自プロセスを procfs から解決できないため）
 //! - seccomp / Landlock の再適用（#502）: [`prepare_restrictions`]（ホスト側の `config.json` を読み、
-//!   自プロセスの `/proc/self/status` の fd を確保）は [`enter_namespaces`] の **前**、
+//!   コンテナの rootfs を固定し、自プロセスの `/proc/self/status` の fd を確保）は [`enter_namespaces`] の **前**、
 //!   [`reapply_restrictions`] は [`enter_namespaces`] と [`join_cgroup`] の **後**（seccomp が `setns` を
 //!   拒否するため）。**準備したプロセス自身** が単一スレッドで呼ぶ（fork した子から呼ぶと別プロセスの
 //!   スレッド数を読むため、core が準備時の pid との不一致を拒否する）。適用は不可逆で、失敗時は制限が
@@ -34,6 +34,15 @@
 //!   （制限は fork / execve を越えて継承される）。順序の全体:
 //!   `identify_pid1` → `prepare_cgroup_join` → `prepare_restrictions` → `enter_namespaces` → `join_cgroup` →
 //!   `reapply_restrictions`
+//! - 再適用は、参加後の自プロセスの `/` が **記録したコンテナの rootfs**（[`identify_pid1`] に渡した記録の
+//!   bundle から、start と同じ検査・固定で得たディレクトリ）であることを照合してから適用する。不一致
+//!   （pivot していない対象・`/` へ別のマウントが重ねられた対象）は違反 `exec_root_not_container_rootfs` で
+//!   拒否し、何も適用しない（SEC-1。根拠は core の `exec/reapply.rs` のモジュール doc）。bundle は
+//!   [`ExecTarget`] が特定時の記録から保持するため、別の記録の `config.json`・rootfs を取り違えない
+//! - **再適用の成功は exec してよい状態を意味しない**: 載るのは `NO_NEW_PRIVS`・Landlock・seccomp だけで、
+//!   capability 削減と rlimit 適用は行わない（`ExecRestrictionReport::unapplied` に列挙され、
+//!   `is_complete()` は `false`）。`setns` は資格情報を変えないため、rootful の exec プロセスは再適用の後も
+//!   全 capability を持つ。#503 は未適用が空になるまで `execve` しないこと（SEC-1）
 //! - 再適用の Landlock ルールは、launcher が実際にマウントした結果ではなく bundle の `config.json` から
 //!   再導出する（launch 時の ruleset は保存されていない）。launch 後に `config.json` が書き換えられると
 //!   追従してしまうが、bundle は supervisor と同じ信頼境界（コンテナから書けない場所）にある前提とする。
@@ -50,6 +59,7 @@
 //! `close_range` と統合テスト（#503・TASK-163.4）は未実装（SUP-6）。`setns` の後に保持 fd からスレッド数が
 //! 読めることの実機確認（再適用の通し試験）も #503 の統合テストで扱う（#502 のテストは `setns` をしない）。
 //! exec プロセスの capability 削減・rlimit 適用も未実装（TASK-163 の内容は seccomp / Landlock のみ。要確認）。
+//! 未実装である間、[`reapply_restrictions`] の成功結果は未適用の制限を列挙して返す（完了を装わない）。
 //! 実 cgroup への参加の実機結合試験も #503 の統合テストで扱う（本 Issue では core の既定集合のユニットテストで
 //! `cgroup.procs` への書き込みと読み戻しを照合）。
 //! user namespace への参加も未実装で、既定の rootless（コンテナが user namespace を持つ）では
@@ -63,16 +73,19 @@ use fandhe_container_core::exec::{
     prepare_exec_restrictions as core_prepare_exec_restrictions,
     reapply_restrictions as core_reapply_restrictions,
 };
-use fandhe_container_core::oci_runtime::{OciConfig, load_config};
+use fandhe_container_core::oci_runtime::{OciConfig, RootfsDir, load_config, pin_bundle_rootfs};
 use fandhe_container_core::traits::{
     ContainerId, ContainerState, ErrorCode, StateRecord, TraitError,
 };
 
-/// 検証済みの exec 対象（コンテナ ID と、pidfd で固定した pid1）。
+/// 検証済みの exec 対象（コンテナ ID と、pidfd で固定した pid1、特定に使った記録の bundle）。
 #[derive(Debug)]
 pub struct ExecTarget {
     id: ContainerId,
     pid1: Pid1Target,
+    /// pid1 の特定に使った記録の bundle。[`prepare_restrictions`] が `config.json` と rootfs をここから
+    /// 取るため、pid1 を照合した記録と別の記録の設定で制限を組み立てることがない。
+    bundle: std::path::PathBuf,
 }
 
 impl ExecTarget {
@@ -121,6 +134,7 @@ pub fn identify_pid1(record: &StateRecord) -> Result<ExecTarget, TraitError> {
     Ok(ExecTarget {
         id: id.clone(),
         pid1,
+        bundle: record.bundle().to_path_buf(),
     })
 }
 
@@ -141,6 +155,7 @@ pub fn identify_pid1_in(
     Ok(ExecTarget {
         id: record.status().id().clone(),
         pid1,
+        bundle: record.bundle().to_path_buf(),
     })
 }
 
@@ -160,40 +175,39 @@ pub fn join_cgroup(join: ExecCgroupJoin) -> Result<ExecCgroupJoinReport, TraitEr
     core_join_cgroup(join).map_err(from_exec_error)
 }
 
-/// コンテナの `config.json` から Landlock ruleset を作り、自プロセスの status fd を確保する。
-/// [`enter_namespaces`] の **前** に、再適用を行うプロセス自身が呼ぶ（SUP-6・#502。契約はモジュール doc）。
+/// コンテナの `config.json` から Landlock ruleset を作り、コンテナの rootfs を固定し、自プロセスの status fd を
+/// 確保する。[`enter_namespaces`] の **前** に、再適用を行うプロセス自身が呼ぶ（SUP-6・#502。契約はモジュール doc）。
 ///
-/// `target` は別コンテナの `record` を取り違えないための照合に使う（ID 不一致は `InvalidArgument`）。
-/// Landlock 未対応カーネル・ルール生成失敗は拒否する（fail-closed。CORE-5）。
-pub fn prepare_restrictions(
-    record: &StateRecord,
-    target: &ExecTarget,
-) -> Result<ExecRestrictions, TraitError> {
-    let config = load_exec_config(record, &target.id)?;
-    core_prepare_exec_restrictions(&config).map_err(from_exec_error)
+/// `config.json` と rootfs は、`target` を特定した記録の bundle から取る（呼び出し側は記録を渡し直さない）。
+/// rootfs は start と同じ検査（bundle 配下・symlink なし）で固定し、参加後の `/` と照合する基準にする。
+/// Landlock 未対応カーネル・ルール生成失敗・rootfs を固定できない場合は拒否する（fail-closed。CORE-5・SEC-1）。
+pub fn prepare_restrictions(target: &ExecTarget) -> Result<ExecRestrictions, TraitError> {
+    let (config, rootfs) = load_exec_bundle(&target.bundle)?;
+    core_prepare_exec_restrictions(&config, &rootfs).map_err(from_exec_error)
 }
 
 /// `NO_NEW_PRIVS` → Landlock → seccomp を自プロセスへ不可逆に適用する。[`enter_namespaces`] と
 /// [`join_cgroup`] の **後**、準備したプロセス自身から単一スレッドで呼ぶ（SUP-6・#502）。
+/// 適用の前に、参加後の `/` が記録したコンテナの rootfs であることを照合し、不一致なら何も適用せず拒否する。
 /// 失敗時は制限が部分的に載った不定状態のため、続行せず終了すること。
+///
+/// 成功しても capability 削減と rlimit 適用は行われていない。戻り値の `unapplied` が空でない間
+/// （`is_complete()` が `false` の間）は `execve` へ進まないこと（SEC-1）。
 pub fn reapply_restrictions(
     restrictions: ExecRestrictions,
 ) -> Result<ExecRestrictionReport, TraitError> {
     core_reapply_restrictions(restrictions).map_err(from_exec_error)
 }
 
-/// `record` の bundle から `config.json` を読む。`record` が `expected` と別のコンテナなら拒否する。
+/// `bundle` の `config.json` を読み、その `root.path` が指す rootfs を固定する。
 ///
-/// エラーメッセージに bundle のパスを含めない（core の `OciConfigError` は固定文言）。
-fn load_exec_config(record: &StateRecord, expected: &ContainerId) -> Result<OciConfig, TraitError> {
-    if record.status().id() != expected {
-        return Err(TraitError::new(
-            ErrorCode::InvalidArgument,
-            "state record does not belong to the exec target container",
-        ));
-    }
-    load_config(&record.bundle().join("config.json"))
-        .map_err(|e| TraitError::new(e.code(), format!("exec stage Landlock: {e}")))
+/// エラーメッセージに bundle のパスを含めない（core の `OciConfigError`・rootfs の検査は固定文言）。
+fn load_exec_bundle(bundle: &std::path::Path) -> Result<(OciConfig, RootfsDir), TraitError> {
+    let config = load_config(&bundle.join("config.json"))
+        .map_err(|e| TraitError::new(e.code(), format!("exec stage Landlock: {e}")))?;
+    let rootfs = pin_bundle_rootfs(bundle, &config)
+        .map_err(|e| TraitError::new(e.code(), format!("exec stage Validate: {}", e.message())))?;
+    Ok((config, rootfs))
 }
 
 /// `ExecError` を `code` を保ったまま `TraitError` へ写す（段名はメッセージへ含める）。
@@ -315,14 +329,16 @@ mod tests {
     /// （`exec_restrictions_reapply`）と #503 の統合テストが担い、ここでは配線の型だけを機械照合する。
     #[test]
     fn sup6_task163_3_restrictions_entry_points_have_expected_shape() {
-        let _prepare: fn(&StateRecord, &ExecTarget) -> Result<ExecRestrictions, TraitError> =
+        let _prepare: fn(&ExecTarget) -> Result<ExecRestrictions, TraitError> =
             prepare_restrictions;
         let _reapply: fn(ExecRestrictions) -> Result<ExecRestrictionReport, TraitError> =
             reapply_restrictions;
     }
 
+    /// 祖先に symlink を含まない使い捨ての bundle ディレクトリ（rootfs の固定は symlink を辿らない）。
     fn bundle_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let dir = base.join(format!(
             "fandhe-sup-exec-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -333,24 +349,13 @@ mod tests {
         dir
     }
 
-    fn record_in(bundle: &std::path::Path, id: &str) -> StateRecord {
-        StateRecord::new(
-            ContainerStatus::running(
-                ContainerId::new(id).unwrap(),
-                NonZeroU32::new(std::process::id()),
-            ),
-            bundle.to_path_buf(),
-            StateRevision::from_raw(1),
-        )
-        .unwrap()
-    }
+    const MINIMAL_CONFIG: &[u8] = br#"{"ociVersion":"1.2.0","root":{"path":"rootfs"}}"#;
 
     /// SUP-6・TASK-163.3: `config.json` が無い bundle は `NotFound` で拒否し、メッセージに bundle のパスを出さない。
     #[test]
     fn sup6_task163_3_missing_config_is_not_found_without_path() {
         let dir = bundle_dir("missing");
-        let rec = record_in(&dir, "c1");
-        let err = load_exec_config(&rec, &cid()).unwrap_err();
+        let err = load_exec_bundle(&dir).unwrap_err();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(err.code(), ErrorCode::NotFound);
         assert_eq!(
@@ -364,8 +369,7 @@ mod tests {
     fn sup6_task163_3_invalid_config_is_invalid_argument() {
         let dir = bundle_dir("invalid");
         std::fs::write(dir.join("config.json"), b"{not json").unwrap();
-        let rec = record_in(&dir, "c1");
-        let err = load_exec_config(&rec, &cid()).unwrap_err();
+        let err = load_exec_bundle(&dir).unwrap_err();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert!(
@@ -375,24 +379,57 @@ mod tests {
         );
     }
 
-    /// SUP-6・TASK-163.3: 正しい `config.json` は読め、別コンテナの記録は読む前に拒否する。
+    /// SUP-6・SEC-1・TASK-163.3: 正しい `config.json` と rootfs ディレクトリがあれば、設定を読み rootfs を
+    /// 固定できる。固定した fd は bundle 配下の `rootfs` ディレクトリそのもの（`st_dev`・`st_ino` が一致）。
     #[test]
-    fn sup6_task163_3_loads_config_and_rejects_other_container() {
+    fn sup6_task163_3_loads_config_and_pins_bundle_rootfs() {
+        use std::os::unix::fs::MetadataExt as _;
         let dir = bundle_dir("ok");
+        std::fs::write(dir.join("config.json"), MINIMAL_CONFIG).unwrap();
+        std::fs::create_dir(dir.join("rootfs")).unwrap();
+        let want = std::fs::metadata(dir.join("rootfs")).unwrap();
+        let (config, rootfs) = load_exec_bundle(&dir).unwrap();
+        let pinned = std::fs::File::from(rootfs.as_fd().try_clone_to_owned().unwrap())
+            .metadata()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(config.root().path(), std::path::Path::new("rootfs"));
+        assert_eq!((pinned.dev(), pinned.ino()), (want.dev(), want.ino()));
+    }
+
+    /// SUP-6・SEC-1・TASK-163.3: rootfs を固定できない bundle（不在・symlink・bundle の外を指す `root.path`）は
+    /// 拒否する（照合の基準を作れないまま再適用へ進まない。fail-closed）。メッセージにパスを出さない。
+    #[test]
+    fn sup6_task163_3_unpinnable_rootfs_is_rejected() {
+        let dir = bundle_dir("norootfs");
+        std::fs::write(dir.join("config.json"), MINIMAL_CONFIG).unwrap();
+        let err = load_exec_bundle(&dir).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(
+            err.message(),
+            "exec stage Validate: rootfs directory not found"
+        );
+
+        std::fs::create_dir(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("rootfs")).unwrap();
+        let err = load_exec_bundle(&dir).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "exec stage Validate: rootfs must not contain a symlink"
+        );
+
         std::fs::write(
             dir.join("config.json"),
-            br#"{"ociVersion":"1.2.0","root":{"path":"rootfs"}}"#,
+            br#"{"ociVersion":"1.2.0","root":{"path":"/"}}"#,
         )
         .unwrap();
-        let rec = record_in(&dir, "c1");
-        assert!(load_exec_config(&rec, &cid()).is_ok());
-        let other = ContainerId::new("c2").unwrap();
-        let err = load_exec_config(&rec, &other).unwrap_err();
+        let err = load_exec_bundle(&dir).unwrap_err();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(
             err.message(),
-            "state record does not belong to the exec target container"
+            "exec stage Validate: rootfs must not be the filesystem root"
         );
     }
 }

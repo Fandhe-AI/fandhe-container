@@ -51,15 +51,18 @@ pub(crate) fn apply_landlock_stage(
     crate::landlock::apply_landlock_ruleset(ruleset).map_err(from_landlock_apply)
 }
 
-/// [`apply_landlock_stage`] のスレッド数取得元を差し替える版（SUP-6・TASK-163.3・#502）。
+/// [`apply_landlock_stage`] のスレッド数取得元とルールパスの起点を差し替える版（SUP-6・TASK-163.3・#502）。
 ///
-/// exec の再適用（`exec/reapply.rs`）から、`setns` の前に開いた status fd を渡して呼ぶ。
+/// exec の再適用（`exec/reapply.rs`）から、`setns` の前に開いた status fd と、`setns` の後にコンテナの
+/// rootfs と照合した `/` の fd（`root`）を渡して呼ぶ。ルールのパスは `root` を起点に辿る。
 #[cfg_attr(test, allow(dead_code))]
 pub(super) fn apply_landlock_stage_with(
     ruleset: &LandlockRuleset,
     threads: &mut ThreadCountSource,
+    root: std::os::fd::BorrowedFd<'_>,
 ) -> Result<LandlockApplyReport, ExecError> {
-    crate::landlock::apply_landlock_ruleset_with(ruleset, threads).map_err(from_landlock_apply)
+    crate::landlock::apply_landlock_ruleset_with(ruleset, threads, Some(root))
+        .map_err(from_landlock_apply)
 }
 
 /// `OciConfig` から Landlock ruleset を作る（ABI 検出 → ルール生成。CORE-5・TASK-39.4）。
@@ -295,10 +298,11 @@ pub(super) mod testing {
         }
     }
 
-    /// `exec/reapply.rs` が `cfg(test)` で呼ぶ偽物（取得元は読まない）。
+    /// `exec/reapply.rs` が `cfg(test)` で呼ぶ偽物（取得元・起点は読まない）。
     pub(in crate::exec) fn apply_landlock_stage_with(
         ruleset: &LandlockRuleset,
         _threads: &mut ThreadCountSource,
+        _root: std::os::fd::BorrowedFd<'_>,
     ) -> Result<LandlockApplyReport, ExecError> {
         apply_landlock_stage(ruleset)
     }

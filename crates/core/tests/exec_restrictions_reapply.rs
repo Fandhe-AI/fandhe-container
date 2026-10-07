@@ -7,8 +7,13 @@
 //! 適用は不可逆・単一スレッド前提のため libtest ではなく `harness = false` の `main` で動かし、
 //! 親は子をタイムアウト付きで待つ（REPAIR-5）。
 //!
-//! このテストは `setns` を行わないため、ルールのパスはホストの `/` に対して解決される。「`setns` の後に
-//! 保持 fd 経由でスレッド数を読める」ことの実機確認は #503（TASK-163.4）の統合テストで行う（REPAIR-3）。
+//! このテストは `setns` を行わないため、「コンテナの rootfs」の代わりに自プロセスの `/` を照合の基準に渡し、
+//! ルールのパスは自プロセスの `/` に対して解決される。加えて、基準を `/` 以外のディレクトリにした子
+//! （`--child-root-mismatch`）で、参加後の `/` が rootfs でない場合の拒否（違反記録
+//! `exec_root_not_container_rootfs`。`NoNewPrivs`・`Seccomp` とも変化なし = 何も適用していない）を、カーネル
+//! 版数に依存せず具体値で照合する（SEC-1・SEC-4）。
+//! 「`setns` の後に保持 fd 経由でスレッド数を読める」「実コンテナへ参加した後の `/` が rootfs と一致する」
+//! ことの実機確認は #503（TASK-163.4）の統合テストで行う（REPAIR-3）。
 //!
 //! # 実行モード（ci.md「実機前提テスト」）
 //!
@@ -37,7 +42,7 @@ fn main() {
 ))]
 fn main() {
     use fandhe_container_core::exec::{
-        IsolationStage, LandlockAccessKind as K, LandlockAccessProbe,
+        IsolationStage, LandlockAccessKind as K, LandlockAccessProbe, UnappliedExecRestriction,
         observe_exec_restriction_reapply,
     };
     use fandhe_container_core::oci_runtime::parse_config_bytes;
@@ -119,7 +124,8 @@ fn main() {
             probe(K::ReadFile, allowed.join("readable")),
             probe(K::RemoveFile, allowed.join("new")),
         ];
-        let o = observe_exec_restriction_reapply(&config, &probes).expect("observe");
+        let o =
+            observe_exec_restriction_reapply(&config, Path::new("/"), &probes).expect("observe");
         assert_eq!(o.unshare_before, None, "control: unshare(0) must succeed");
 
         if let Some(e) = &o.prepare_error {
@@ -155,6 +161,15 @@ fn main() {
         // root（`/`）と `allowed` の 2 ルール。
         assert_eq!(report.landlock_rules, 2, "{report:?}");
         assert!(report.seccomp_instructions > 0, "{report:?}");
+        // SEC-1: 再適用の成功は exec してよい状態を意味しない（capability 削減・rlimit は未適用）。
+        assert_eq!(
+            report.unapplied,
+            &[
+                UnappliedExecRestriction::CapabilityDrop,
+                UnappliedExecRestriction::Rlimits
+            ]
+        );
+        assert!(!report.is_complete());
         assert_eq!(o.seccomp_before, "0");
         assert_eq!(o.seccomp_after, "2");
         assert_eq!(o.no_new_privs_after, "1");
@@ -184,15 +199,92 @@ fn main() {
         println!("exec_restrictions_reapply child: ok");
     }
 
+    /// 照合の基準を `/` 以外（`dir`）にした再適用: 参加後の `/` が rootfs でない場合と同じ拒否になる。
+    fn run_child_root_mismatch(dir: &Path) {
+        let json = br#"{"ociVersion":"1.2.0","root":{"path":"rootfs","readonly":true}}"#;
+        let config = parse_config_bytes(json).expect("valid config");
+        let probes = vec![probe(K::ReadDir, dir.to_path_buf())];
+        let o = observe_exec_restriction_reapply(&config, dir, &probes).expect("observe");
+        if let Some(e) = &o.prepare_error {
+            // Landlock 未対応カーネル: 準備の段階で拒否され、照合まで進まない（fail-closed）。
+            assert_eq!(e.stage, IsolationStage::Landlock);
+            assert_eq!(o.seccomp_after, o.seccomp_before);
+            assert_eq!(o.no_new_privs_after, o.no_new_privs_before);
+            println!(
+                "exec_restrictions_reapply mismatch child: detect-refused ({})",
+                e.message
+            );
+            return;
+        }
+        let e = o.reapply_error.as_ref().expect("reapply must be refused");
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.stage, IsolationStage::SetNs);
+        assert_eq!(
+            e.message,
+            "the root directory after joining is not the recorded container rootfs"
+        );
+        let v = e.violation.as_ref().expect("violation recorded");
+        assert_eq!(v.kind.as_str(), "exec_target");
+        assert_eq!(v.reason.as_str(), "exec_root_not_container_rootfs");
+        assert_eq!(v.behavior_id, "SEC-1");
+        assert!(o.report.is_none());
+        // 何も適用していない: NO_NEW_PRIVS・seccomp とも変化なし（seccomp は無制限の `0` のまま）。
+        assert_eq!(o.no_new_privs_after, o.no_new_privs_before);
+        assert_eq!(o.seccomp_after, o.seccomp_before);
+        assert_eq!(o.seccomp_after, "0");
+        assert!(o.results.is_empty(), "probes must not run");
+        println!("exec_restrictions_reapply mismatch child: ok");
+    }
+
+    /// 子（テストバイナリ自身の再実行）を `mode` で起動し、タイムアウト付きで待って標準出力を返す。
+    fn spawn_and_wait(exe: &Path, mode: &str, dir: &Path) -> String {
+        let mut child = Command::new(exe)
+            .arg(mode)
+            .arg("--probe-dir")
+            .arg(dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn child");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(s) = child.try_wait().expect("try_wait") {
+                break s;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_dir_all(dir);
+                panic!("exec_restrictions_reapply child ({mode}) timed out");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let out = child.wait_with_output().expect("wait_with_output");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        if !status.success() {
+            let _ = std::fs::remove_dir_all(dir);
+            panic!(
+                "child ({mode}) failed ({status}): {stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        stdout
+    }
+
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--child") {
-        let dir = args
-            .iter()
+    let probe_dir = || {
+        args.iter()
             .position(|a| a == "--probe-dir")
             .and_then(|i| args.get(i + 1))
             .map(PathBuf::from)
-            .expect("--probe-dir");
-        run_child(&dir);
+            .expect("--probe-dir")
+    };
+    if args.iter().any(|a| a == "--child-root-mismatch") {
+        run_child_root_mismatch(&probe_dir());
+        return;
+    }
+    if args.iter().any(|a| a == "--child") {
+        run_child(&probe_dir());
         return;
     }
 
@@ -207,45 +299,33 @@ fn main() {
             std::fs::write(dir.join(sub).join(f), b"probe").expect("create fixture");
         }
     }
-    let mut child = Command::new(&exe)
-        .arg("--child")
-        .arg("--probe-dir")
-        .arg(&dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn child");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let status = loop {
-        if let Some(s) = child.try_wait().expect("try_wait") {
-            break s;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = std::fs::remove_dir_all(&dir);
-            panic!("exec_restrictions_reapply child timed out");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let out = child.wait_with_output().expect("wait_with_output");
+    let stdout = spawn_and_wait(&exe, "--child", &dir);
+    let mismatch = spawn_and_wait(&exe, "--child-root-mismatch", &dir);
     let _ = std::fs::remove_dir_all(&dir);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        status.success(),
-        "child failed ({status}): {stdout}\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
     let full = stdout.contains("exec_restrictions_reapply child: ok");
     let refused = stdout.contains("exec_restrictions_reapply child: detect-refused");
+    let mismatch_full = mismatch.contains("exec_restrictions_reapply mismatch child: ok");
+    let mismatch_refused =
+        mismatch.contains("exec_restrictions_reapply mismatch child: detect-refused");
     if require_full {
         assert!(
             full,
             "child did not fully verify on this host (needs Linux 6.12+/ABI 6+): {stdout}"
         );
+        assert!(
+            mismatch_full,
+            "mismatch child did not fully verify on this host: {mismatch}"
+        );
     } else {
         assert!(full || refused, "child printed no result: {stdout}");
+        assert!(
+            mismatch_full || mismatch_refused,
+            "mismatch child printed no result: {mismatch}"
+        );
+        // 2 つの子は同じカーネルで動くため、Landlock 検出の成否は一致する。
+        assert_eq!(full, mismatch_full, "{stdout}\n{mismatch}");
     }
     println!("{}", stdout.trim());
+    println!("{}", mismatch.trim());
     println!("exec_restrictions_reapply: ok");
 }

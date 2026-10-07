@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::config::NamespaceKind;
+use super::config::{NamespaceKind, OciConfig};
 use crate::traits::{ContainerId, ErrorCode, Signal, TraitError};
 
 /// [`StartTimeouts`] の各上限が取れる最大値（無期限相当の値を型で拒否する。REPAIR-5）。
@@ -193,6 +193,21 @@ impl RootfsDir {
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
+}
+
+/// 稼働中コンテナの `bundle` と読み込み済みの `config` から、コンテナの rootfs ディレクトリを固定する
+/// （SUP-6・SEC-1・TASK-163.3・#502）。
+///
+/// exec の制限再適用（`exec::prepare_exec_restrictions`）が、`setns` 参加後の `/` が「記録したコンテナの
+/// rootfs」であることを照合する基準に使う。start と同じ検査（`root.path` が bundle 配下・`..` なし・
+/// symlink なしのディレクトリ）と同じ固定（`/` から全要素を symlink 非追従で辿る。[`RootfsDir`]）を通すため、
+/// start が launcher へ渡す rootfs と同じ実体を指す。`process` の有無・未解釈フィールドは検査しない
+/// （起動可否の判定ではなく、稼働中コンテナの rootfs の特定だけを行う）。
+///
+/// エラーは start と同じ固定文言で、パスを含めない。Linux 以外は `Unimplemented`（fail-closed。CLI-1）。
+pub fn pin_bundle_rootfs(bundle: &Path, config: &OciConfig) -> Result<RootfsDir, TraitError> {
+    let rootfs = super::create::check_rootfs(bundle, config.root().path())?;
+    RootfsDir::pin(bundle, &rootfs)
 }
 
 impl PartialEq for RootfsDir {

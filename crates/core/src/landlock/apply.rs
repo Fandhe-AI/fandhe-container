@@ -18,7 +18,11 @@
 //!   （seccomp の適用と同じ根拠）
 //! - 適用は呼び出したスレッドにしか効かず不可逆。そのため `Threads: 1` を適用の前後で確認する
 //! - ルールのパスは pivot 後の `/` 起点で 1 要素ずつ `O_NOFOLLOW` の fd で辿って固定する（TOCTOU・
-//!   symlink 対策）。symlink・不在・開けないパスはスキップせず拒否する
+//!   symlink 対策）。symlink・不在・開けないパスはスキップせず拒否する。exec の再適用（SUP-6・
+//!   TASK-163.3）は、`setns` 参加後に開いてコンテナの rootfs と照合済みの `/` の fd を起点として渡す
+//!   （[`apply_landlock_ruleset_with`]。照合した実体と辿る起点を同じ fd にする）。ルールのパスは
+//!   `..` を含まない正規化済みの要素列（`RulePath`）で、各要素を symlink 非追従で開くため、起点の
+//!   ディレクトリの外へは解決されない
 //! - syscall は `crate::sys` の安全なラッパーのみを使い、`unsafe` を持たない。実カーネルは
 //!   [`LandlockKernel`] の差し込み点で隔離し、単体テストは偽カーネルで呼び出し順を照合する
 //! - 分離違反の試行の監査ログ記録（SEC-4）は TASK-41 の範囲で、本モジュールは記録しない
@@ -30,7 +34,7 @@
 
 use std::ffi::CString;
 use std::fmt;
-use std::os::fd::{AsFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::path::Path;
 
 use super::rules::{AccessFs, LandlockRuleset, PathRule, RuleOrigin, RulePath};
@@ -219,6 +223,9 @@ pub(crate) trait LandlockKernel {
 struct RealKernel<'a> {
     // `thread_count` は `&self` のため内部可変性で取得元（seek を伴う）を持つ。単一スレッド前提。
     threads: std::cell::RefCell<&'a mut ThreadCountSource>,
+    /// ルールのパスを辿る起点。`None` は呼び出しプロセスの `/`（launch 経路。pivot 後）。`Some` は
+    /// 呼び出し側が検証済みのディレクトリの fd（exec 経路。`setns` 後にコンテナの rootfs と照合した `/`）。
+    root: Option<BorrowedFd<'a>>,
 }
 
 impl LandlockKernel for RealKernel<'_> {
@@ -238,7 +245,11 @@ impl LandlockKernel for RealKernel<'_> {
     }
 
     fn open_rule_path(&self, path: &RulePath) -> Result<(OwnedFd, PathKind), OpenError> {
-        let root = sys::open_dir_path_nofollow(None, c"/").map_err(OpenError::Sys)?;
+        let root = match self.root {
+            // 検証済みの fd を複製して起点にする（同じ open file description。再解決しない）。
+            Some(fd) => fd.try_clone_to_owned().map_err(|_| OpenError::Invalid)?,
+            None => sys::open_dir_path_nofollow(None, c"/").map_err(OpenError::Sys)?,
+        };
         let comps: Vec<&str> = match path {
             RulePath::Root => Vec::new(),
             other => other
@@ -298,20 +309,24 @@ impl LandlockKernel for RealKernel<'_> {
 pub(crate) fn apply_landlock_ruleset(
     ruleset: &LandlockRuleset,
 ) -> Result<LandlockApplyReport, LandlockApplyError> {
-    apply_landlock_ruleset_with(ruleset, &mut ThreadCountSource::ProcSelf)
+    apply_landlock_ruleset_with(ruleset, &mut ThreadCountSource::ProcSelf, None)
 }
 
-/// [`apply_landlock_ruleset`] のスレッド数取得元を差し替える版（SUP-6・TASK-163.3・#502）。
+/// [`apply_landlock_ruleset`] のスレッド数取得元とルールパスの起点を差し替える版（SUP-6・TASK-163.3・#502）。
 ///
-/// exec の再適用が、`setns` の前に開いた status fd を渡すために使う。前提検査（NNP・
-/// 適用前後の `Threads: 1`）は [`apply_landlock_ruleset`] と同一。
+/// exec の再適用が、`setns` の前に開いた status fd と、`setns` の後に開いてコンテナの rootfs と照合した
+/// `/` の fd（`root`）を渡すために使う。`root` が `None` なら呼び出しプロセスの `/` を起点にする
+/// （[`apply_landlock_ruleset`] と同じ）。前提検査（NNP・適用前後の `Threads: 1`）と、パスの辿り方
+/// （1 要素ずつ symlink 非追従・解決できないパスは拒否）は [`apply_landlock_ruleset`] と同一。
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn apply_landlock_ruleset_with(
     ruleset: &LandlockRuleset,
     threads: &mut ThreadCountSource,
+    root: Option<BorrowedFd<'_>>,
 ) -> Result<LandlockApplyReport, LandlockApplyError> {
     let kernel = RealKernel {
         threads: std::cell::RefCell::new(threads),
+        root,
     };
     apply_with(&kernel, ruleset)
 }
@@ -602,6 +617,102 @@ mod tests {
             })
             .collect();
         LandlockRuleset::for_observation(6, rules)
+    }
+
+    /// config の mount destination から実物の `RulePath` を作る（`Beneath` は外から直接組み立てられない）。
+    fn rule_path(dest: &str) -> RulePath {
+        let json = format!(
+            r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":true}},"mounts":[{{"destination":"{dest}","options":["rw"]}}]}}"#
+        );
+        let config = crate::oci_runtime::parse_config_bytes(json.as_bytes()).expect("config");
+        let support = crate::landlock::evaluate_abi(6).expect("abi6");
+        let set = super::super::rules::path_rules_from_config(&support, &config).expect("rules");
+        set.rules()
+            .iter()
+            .map(|r| r.path.clone())
+            .find(|p| p.as_str() == dest)
+            .expect("rule for the destination")
+    }
+
+    fn identity(fd: &OwnedFd) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt as _;
+        let m = std::fs::File::from(fd.try_clone().expect("dup"))
+            .metadata()
+            .expect("fstat");
+        (m.dev(), m.ino())
+    }
+
+    /// SUP-6・SEC-1・CORE-5・TASK-163.3: 起点の fd を渡すと、ルールのパスは呼び出しプロセスの `/` ではなく
+    /// その fd のディレクトリを基準に解決される。起点の外を指す symlink はまたがず拒否し、起点の配下に無い
+    /// パスは（同名のパスがプロセスの `/` 側に実在しても）拒否する。黙って別の対象へ解決しない。
+    #[test]
+    fn sup6_task163_3_rule_paths_resolve_beneath_the_given_root() {
+        use std::os::unix::fs::MetadataExt as _;
+        let base = std::env::temp_dir().join(format!(
+            "fandhe-landlock-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(root.join("data/inner")).expect("tree");
+        std::fs::create_dir_all(outside.join("inner")).expect("outside");
+        std::fs::write(root.join("data/file"), b"x").expect("file");
+        std::os::unix::fs::symlink(&outside, root.join("link")).expect("symlink");
+        std::os::unix::fs::symlink("data", root.join("rel")).expect("relative symlink");
+
+        let root_fd = OwnedFd::from(std::fs::File::open(&root).expect("open root"));
+        let mut threads = ThreadCountSource::ProcSelf;
+        let kernel = RealKernel {
+            threads: std::cell::RefCell::new(&mut threads),
+            root: Some(root_fd.as_fd()),
+        };
+        let meta = |p: &std::path::Path| {
+            let m = std::fs::metadata(p).expect("metadata");
+            (m.dev(), m.ino())
+        };
+
+        // `/` は起点そのもの（プロセスの `/` ではない）。
+        let (fd, kind) = kernel.open_rule_path(&RulePath::Root).expect("root");
+        assert_eq!(kind, PathKind::Dir);
+        assert_eq!(identity(&fd), meta(&root));
+        assert_ne!(identity(&fd), meta(std::path::Path::new("/")));
+
+        // 起点配下のディレクトリ・ファイル。
+        let (fd, kind) = kernel
+            .open_rule_path(&rule_path("/data/inner"))
+            .expect("dir");
+        assert_eq!(kind, PathKind::Dir);
+        assert_eq!(identity(&fd), meta(&root.join("data/inner")));
+        let (fd, kind) = kernel
+            .open_rule_path(&rule_path("/data/file"))
+            .expect("file");
+        assert_eq!(kind, PathKind::File);
+        assert_eq!(identity(&fd), meta(&root.join("data/file")));
+
+        // 途中・末尾の symlink（起点の外を指す絶対 symlink、起点内を指す相対 symlink）は辿らない。
+        assert_eq!(
+            kernel.open_rule_path(&rule_path("/link/inner")).err(),
+            Some(OpenError::Sys(SysError::Os(sys::ENOTDIR)))
+        );
+        assert_eq!(
+            kernel.open_rule_path(&rule_path("/link")).err(),
+            Some(OpenError::Symlink)
+        );
+        assert_eq!(
+            kernel.open_rule_path(&rule_path("/rel")).err(),
+            Some(OpenError::Symlink)
+        );
+
+        // プロセスの `/` 側には実在するが起点の配下に無いパスは、不在として拒否する。
+        assert!(std::path::Path::new("/proc").is_dir());
+        assert_eq!(
+            kernel.open_rule_path(&rule_path("/proc")).err(),
+            Some(OpenError::Sys(SysError::Os(sys::ENOENT)))
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// CORE-5・TASK-39.3: NNP 未設定は何も呼ばずに `FailedPrecondition`（受入条件）。

@@ -16,7 +16,7 @@
 //!   [`prepare_exec_restrictions`] は **`join_namespaces` の前**、[`reapply_restrictions`] は
 //!   `join_namespaces` と `join_cgroup` の **後** に呼ぶ。seccomp の既定フィルタは `setns` を拒否するため、
 //!   再適用を `setns` の前に置くと namespace 参加が失敗する（cgroup join を seccomp の前に置く既存の順序と一致）。
-//!   [`reapply_restrictions`] の内部は「準備したプロセスの確認 → 参加後の mount namespace が準備時の対象のもの
+//!   [`reapply_restrictions`] の内部は「準備したプロセスの確認 → 参加後の mount namespace・子が入る PID namespace・所属 cgroup が準備時の対象のもの
 //!   であることの照合 → 参加後の `/` の照合 → 適用」の順で、確認・照合で拒否したときは何も適用していない
 //! - 全体の順序（exec 専用プロセス内。supervisor の `run_command` が固定する）: `identify_pid1` →
 //!   `prepare_cgroup_join` → [`prepare_exec_restrictions`] → `join_namespaces` → `join_cgroup` →
@@ -117,7 +117,7 @@ use std::path::Path;
 
 use super::landlock::{LandlockAccessProbe, landlock_ruleset_from_config, run_probe};
 use super::rlimits::{apply_rlimits, parse_proc_limits};
-use super::setns::NsIdentity;
+use super::setns::{NsIdentity, cgroup_path_matches, read_bounded_from};
 use super::{
     ExecError, IsolationStage, Pid1Target, StageKind, ThreadCountSource, ViolationReason,
     no_new_privs,
@@ -166,6 +166,11 @@ pub struct ExecRestrictions {
 struct TargetBinding {
     proc_dir: OwnedFd,
     target_mnt_ns: NsIdentity,
+    /// 対象の PID namespace の識別子。参加後に子が入る PID namespace（`ns/pid_for_children`）と照合する。
+    target_pid_ns: NsIdentity,
+    /// 対象のコンテナ cgroup（`Pid1Target::open` が記録から組み立てた期待パス）。cgroup 参加後の自プロセスの
+    /// 所属と完全一致を照合する。
+    expected_cgroup: String,
 }
 
 impl std::fmt::Debug for ExecRestrictions {
@@ -410,10 +415,13 @@ pub fn prepare_exec_restrictions(
         .map_err(|e| ExecError::from_sys(e, IsolationStage::Validate, "open own root"))?;
     reject_own_root(rootfs.as_fd(), own_root.as_fd())?;
     let target_mnt_ns = target.mnt_ns_identity()?;
+    let target_pid_ns = target.pid_ns_identity()?;
     let rlimits = parse_proc_limits(&target.read_limits()?)?;
     let binding = TargetBinding {
         proc_dir: open_own_proc_dir()?,
         target_mnt_ns,
+        target_pid_ns,
+        expected_cgroup: target.expected_cgroup_path().to_owned(),
     };
     prepare_with_rootfs(config, rootfs, rlimits, binding)
 }
@@ -455,23 +463,82 @@ fn open_own_proc_dir() -> Result<OwnedFd, ExecError> {
 ///
 /// `ns/mnt` は参照のたびにタスクの現在の namespace へ解決されるため、`setns` の後は参加先を返す。
 fn current_mnt_ns_identity(proc_dir: BorrowedFd<'_>) -> Result<NsIdentity, ExecError> {
+    own_ns_identity(proc_dir, c"ns/mnt", "mount")
+}
+
+/// 保持した procfs ディレクトリ `proc_dir` から、呼び出しプロセスの子が入る PID namespace の識別子を読む。
+///
+/// `setns(CLONE_NEWPID)` は呼び出しプロセス自身の PID namespace を変えず、以後の子だけを移す。コマンドは
+/// fork した子で実行するため、`ns/pid`（自分自身）ではなく `ns/pid_for_children` を照合する。
+fn current_pid_ns_for_children_identity(proc_dir: BorrowedFd<'_>) -> Result<NsIdentity, ExecError> {
+    own_ns_identity(proc_dir, c"ns/pid_for_children", "PID")
+}
+
+/// `proc_dir` 配下の namespace エントリ `entry` の識別子（nsfs の `st_dev`・`st_ino`）。
+fn own_ns_identity(
+    proc_dir: BorrowedFd<'_>,
+    entry: &std::ffi::CStr,
+    what: &'static str,
+) -> Result<NsIdentity, ExecError> {
     let stage = IsolationStage::SetNs;
-    let ns = sys::open_path_follow_at(proc_dir, c"ns/mnt")
-        .map_err(|e| ExecError::from_sys(e, stage, "open own mount namespace"))?;
+    let ns = sys::open_path_follow_at(proc_dir, entry)
+        .map_err(|e| ExecError::from_sys(e, stage, &format!("open own {what} namespace")))?;
     // `O_PATH` の fd への fstat（パスを再解決しない）。
     let meta = std::fs::File::from(ns)
         .metadata()
-        .map_err(|e| ExecError::from_io(&e, stage, "inspect own mount namespace"))?;
+        .map_err(|e| ExecError::from_io(&e, stage, &format!("inspect own {what} namespace")))?;
     Ok((meta.dev(), meta.ino()))
 }
 
-/// 参加後の mount namespace が、準備時に記録した対象のものと一致することを確かめる（SEC-1）。
-/// 不一致は違反記録 `exec_joined_namespace_mismatch`（何も適用しない）。
+/// 保持した procfs ディレクトリ `proc_dir` から、呼び出しプロセスの所属 cgroup が `expected`（cgroup v2 の
+/// 絶対パス）と完全一致するかを返す。`/proc` は参加後にコンテナ側の procfs になるため、参加前に開いた fd から読む。
+fn own_cgroup_matches(proc_dir: BorrowedFd<'_>, expected: &str) -> Result<bool, ExecError> {
+    let stage = IsolationStage::CgroupJoin;
+    let fd = sys::open_read_at(proc_dir, c"cgroup")
+        .map_err(|e| ExecError::from_sys(e, stage, "open own cgroup"))?;
+    let text = read_bounded_from(std::fs::File::from(fd), OWN_CGROUP_READ_LIMIT)
+        .map_err(|e| ExecError::from_io(&e, stage, "read own cgroup"))?;
+    Ok(cgroup_path_matches(&text, expected))
+}
+
+/// 自プロセスの cgroup v2 パス（`0::<path>`）。観測関数・単体テストが「対象は自分自身」の束縛を作るために使う。
+fn own_cgroup_path(proc_dir: BorrowedFd<'_>) -> Result<String, ExecError> {
+    let stage = IsolationStage::CgroupJoin;
+    let fd = sys::open_read_at(proc_dir, c"cgroup")
+        .map_err(|e| ExecError::from_sys(e, stage, "open own cgroup"))?;
+    let text = read_bounded_from(std::fs::File::from(fd), OWN_CGROUP_READ_LIMIT)
+        .map_err(|e| ExecError::from_io(&e, stage, "read own cgroup"))?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .map(str::to_owned)
+        .ok_or_else(|| ExecError::new(ErrorCode::Internal, stage, "own cgroup v2 entry missing"))
+}
+
+/// 自プロセスの `cgroup` の読み取り上限（バイト）。
+const OWN_CGROUP_READ_LIMIT: u64 = 64 * 1024;
+
+/// 参加後の mount namespace・子が入る PID namespace・所属 cgroup が、準備時に記録した対象のものと一致する
+/// ことをこの順で確かめる（SEC-1）。不一致は違反記録（`exec_joined_namespace_mismatch` /
+/// `exec_joined_pid_namespace_mismatch` / `exec_joined_cgroup_mismatch`。何も適用しない）。
 fn verify_target_binding(binding: &TargetBinding) -> Result<(), ExecError> {
-    if current_mnt_ns_identity(binding.proc_dir.as_fd())? != binding.target_mnt_ns {
+    let proc_dir = binding.proc_dir.as_fd();
+    if current_mnt_ns_identity(proc_dir)? != binding.target_mnt_ns {
         return Err(ExecError::from_violation(
             ViolationReason::ExecJoinedNamespaceMismatch,
             None,
+        ));
+    }
+    if current_pid_ns_for_children_identity(proc_dir)? != binding.target_pid_ns {
+        return Err(ExecError::from_violation(
+            ViolationReason::ExecJoinedPidNamespaceMismatch,
+            None,
+        ));
+    }
+    if !own_cgroup_matches(proc_dir, &binding.expected_cgroup)? {
+        return Err(ExecError::from_violation_at(
+            ViolationReason::ExecJoinedCgroupMismatch,
+            Some(Path::new(&binding.expected_cgroup)),
+            IsolationStage::SetNs,
         ));
     }
     Ok(())
@@ -702,9 +769,15 @@ pub fn observe_exec_restriction_reapply(
     let proc_dir = open_own_proc_dir().map_err(|_| internal("cannot open own procfs directory"))?;
     let target_mnt_ns = current_mnt_ns_identity(proc_dir.as_fd())
         .map_err(|_| internal("cannot read own mount namespace"))?;
+    let target_pid_ns = current_pid_ns_for_children_identity(proc_dir.as_fd())
+        .map_err(|_| internal("cannot read own PID namespace"))?;
+    let expected_cgroup =
+        own_cgroup_path(proc_dir.as_fd()).map_err(|_| internal("cannot read own cgroup"))?;
     let binding = TargetBinding {
         proc_dir,
         target_mnt_ns,
+        target_pid_ns,
+        expected_cgroup,
     };
     match prepare_with_rootfs(config, expected, Rlimits::default(), binding) {
         Err(e) => obs.prepare_error = Some(e),
@@ -772,9 +845,14 @@ mod tests {
     fn own_binding() -> TargetBinding {
         let proc_dir = open_own_proc_dir().expect("own procfs dir");
         let target_mnt_ns = current_mnt_ns_identity(proc_dir.as_fd()).expect("own mnt ns");
+        let target_pid_ns =
+            current_pid_ns_for_children_identity(proc_dir.as_fd()).expect("own pid ns");
+        let expected_cgroup = own_cgroup_path(proc_dir.as_fd()).expect("own cgroup");
         TargetBinding {
             proc_dir,
             target_mnt_ns,
+            target_pid_ns,
+            expected_cgroup,
         }
     }
 
@@ -915,6 +993,49 @@ mod tests {
         assert_eq!(v.reason, ViolationReason::ExecJoinedNamespaceMismatch);
         assert_eq!(v.reason.as_str(), "exec_joined_namespace_mismatch");
         assert_eq!(v.kind.as_str(), "exec_target");
+        assert_eq!(v.behavior_id, "SEC-1");
+        assert_eq!(take(), Vec::<&str>::new());
+        let _ = crate::exec::rlimits::testing::take_sets();
+    }
+
+    /// SUP-6・SEC-1・SEC-4・TASK-163.4: mount namespace が同じでも、参加後に子が入る PID namespace が準備時の
+    /// 対象のものと違えば、何も適用せず違反記録つきで拒否する（`exec_joined_pid_namespace_mismatch`）。
+    #[test]
+    fn sup6_task163_4_other_pid_namespace_applies_nothing() {
+        let _ = take();
+        let mut r = restrictions(std::process::id());
+        let (dev, ino) = r.binding.target_pid_ns;
+        r.binding.target_pid_ns = (dev, ino.wrapping_add(1));
+        let e = reapply_restrictions(r).expect_err("other pid ns");
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.stage, IsolationStage::SetNs);
+        assert_eq!(
+            e.message,
+            "the PID namespace after joining is not the one of the prepared exec target"
+        );
+        let v = e.violation.expect("violation recorded");
+        assert_eq!(v.reason, ViolationReason::ExecJoinedPidNamespaceMismatch);
+        assert_eq!(v.behavior_id, "SEC-1");
+        assert_eq!(take(), Vec::<&str>::new());
+        let _ = crate::exec::rlimits::testing::take_sets();
+    }
+
+    /// SUP-6・SEC-1・SEC-4・TASK-163.4: mount・PID namespace が同じでも、参加後の所属 cgroup が準備時の対象の
+    /// ものと違えば、何も適用せず違反記録つきで拒否する（`exec_joined_cgroup_mismatch`）。
+    #[test]
+    fn sup6_task163_4_other_cgroup_applies_nothing() {
+        let _ = take();
+        let mut r = restrictions(std::process::id());
+        r.binding.expected_cgroup = "/other/container-cgroup".to_owned();
+        let e = reapply_restrictions(r).expect_err("other cgroup");
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.stage, IsolationStage::SetNs);
+        assert_eq!(
+            e.message,
+            "the cgroup after joining is not the one of the prepared exec target"
+        );
+        let v = e.violation.expect("violation recorded");
+        assert_eq!(v.reason, ViolationReason::ExecJoinedCgroupMismatch);
         assert_eq!(v.behavior_id, "SEC-1");
         assert_eq!(take(), Vec::<&str>::new());
         let _ = crate::exec::rlimits::testing::take_sets();

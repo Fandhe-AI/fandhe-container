@@ -184,6 +184,15 @@ impl Pid1Target {
         Ok(id)
     }
 
+    /// 対象の PID namespace の識別子（nsfs の `st_dev`・`st_ino`）。参加後に子が入る PID namespace
+    /// （`ns/pid_for_children`）との照合に使う（SUP-6・SEC-1・TASK-163.4）。読み取りの後に pidfd の未終了を確認する。
+    pub(super) fn pid_ns_identity(&self) -> Result<NsIdentity, ExecError> {
+        let id = ns_identity(&format!("/proc/{}/ns/pid", self.pid))
+            .map_err(|e| target_proc_error(&e, "read target PID namespace"))?;
+        ensure_not_exited(self, "refusing to bind restrictions to it")?;
+        Ok(id)
+    }
+
     /// 対象の `/proc/<pid>/limits` の内容（上限つきで読む）。コンテナの rlimit の記録上の出所が無いため、
     /// exec プロセスへ同じ値を適用する材料にする（SUP-6・SUP-12・TASK-163.4）。読み取りの後に pidfd の
     /// 未終了を確認する。

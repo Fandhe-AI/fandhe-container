@@ -170,6 +170,13 @@ pub enum ViolationReason {
     /// mount namespace と一致しない（A 用に準備した制限を、同じ rootfs を共有する別コンテナ B へ参加した
     /// プロセスへ適用させない。rootfs のディレクトリ照合だけでは取り違えを検出できない。SEC-1・TASK-163.4）。
     ExecJoinedNamespaceMismatch,
+    /// `setns` 参加後に子が入る PID namespace（`ns/pid_for_children`）が、制限を準備した時点の exec の対象
+    /// （pid1）の PID namespace と一致しない（同じ mount namespace を共有する別の参加先へ、準備済みの制限を
+    /// 適用させない。SEC-1・TASK-163.4）。
+    ExecJoinedPidNamespaceMismatch,
+    /// cgroup 参加後の呼び出しプロセスの所属 cgroup が、制限を準備した時点の exec の対象のコンテナ cgroup と
+    /// 一致しない（同上。SEC-1・TASK-163.4）。
+    ExecJoinedCgroupMismatch,
 }
 
 impl ViolationReason {
@@ -216,6 +223,8 @@ impl ViolationReason {
             Self::ExecTargetSharesMountNamespace => "exec_target_shares_mount_namespace",
             Self::ExecRootNotContainerRootfs => "exec_root_not_container_rootfs",
             Self::ExecJoinedNamespaceMismatch => "exec_joined_namespace_mismatch",
+            Self::ExecJoinedPidNamespaceMismatch => "exec_joined_pid_namespace_mismatch",
+            Self::ExecJoinedCgroupMismatch => "exec_joined_cgroup_mismatch",
         }
     }
 
@@ -262,7 +271,9 @@ impl ViolationReason {
             | Self::ExecTargetSharesPidNamespace
             | Self::ExecTargetSharesMountNamespace
             | Self::ExecRootNotContainerRootfs
-            | Self::ExecJoinedNamespaceMismatch => ViolationKind::ExecTarget,
+            | Self::ExecJoinedNamespaceMismatch
+            | Self::ExecJoinedPidNamespaceMismatch
+            | Self::ExecJoinedCgroupMismatch => ViolationKind::ExecTarget,
         }
     }
 
@@ -274,7 +285,9 @@ impl ViolationReason {
             }
             Self::ExecTargetCgroupMismatch
             | Self::ExecRootNotContainerRootfs
-            | Self::ExecJoinedNamespaceMismatch => "SEC-1",
+            | Self::ExecJoinedNamespaceMismatch
+            | Self::ExecJoinedPidNamespaceMismatch
+            | Self::ExecJoinedCgroupMismatch => "SEC-1",
             Self::ExecTargetNotNestedPid1
             | Self::ExecTargetSharesPidNamespace
             | Self::ExecTargetSharesMountNamespace => "SUP-6",
@@ -324,7 +337,9 @@ impl ViolationReason {
             | Self::ExecTargetSharesPidNamespace
             | Self::ExecTargetSharesMountNamespace
             | Self::ExecRootNotContainerRootfs
-            | Self::ExecJoinedNamespaceMismatch => ErrorCode::FailedPrecondition,
+            | Self::ExecJoinedNamespaceMismatch
+            | Self::ExecJoinedPidNamespaceMismatch
+            | Self::ExecJoinedCgroupMismatch => ErrorCode::FailedPrecondition,
             Self::EntrypointIsRuntimeBinary => ErrorCode::PermissionDenied,
         }
     }
@@ -437,6 +452,12 @@ impl ViolationReason {
             }
             Self::ExecJoinedNamespaceMismatch => {
                 "the mount namespace after joining is not the one of the prepared exec target"
+            }
+            Self::ExecJoinedPidNamespaceMismatch => {
+                "the PID namespace after joining is not the one of the prepared exec target"
+            }
+            Self::ExecJoinedCgroupMismatch => {
+                "the cgroup after joining is not the one of the prepared exec target"
             }
         }
     }
@@ -674,6 +695,18 @@ mod tests {
                 "exec_joined_namespace_mismatch",
                 "SEC-1",
                 "the mount namespace after joining is not the one of the prepared exec target",
+            ),
+            (
+                ViolationReason::ExecJoinedPidNamespaceMismatch,
+                "exec_joined_pid_namespace_mismatch",
+                "SEC-1",
+                "the PID namespace after joining is not the one of the prepared exec target",
+            ),
+            (
+                ViolationReason::ExecJoinedCgroupMismatch,
+                "exec_joined_cgroup_mismatch",
+                "SEC-1",
+                "the cgroup after joining is not the one of the prepared exec target",
             ),
         ];
         for (r, code, behavior, message) in cases {

@@ -80,6 +80,15 @@
 //! 実行層本体（namespace・cgroups v2・seccomp/Landlock・rootless 等）は G3（TASK-27〜50）で
 //! 実装する未実装のままである（REPAIR-3: 実装済みを装わず、未実装であることも隠さない）。
 
+// `exec-test-support` は試験専用の入口（期待 cgroup パスを呼び出し側から受け取る対象特定・`execveat` を伴わない
+// 観測・worker 機構の直接呼び出し）を公開する feature で、リリースビルドで有効にすると SEC-1 の同一性照合を
+// 迂回できる。最適化ビルド（`debug_assertions` が無効）で有効になっていたらコンパイルを止める
+// （SUP-6・SEC-1・REPAIR-3・TASK-163 追補・#1460。テスト・clippy は dev プロファイルのため影響しない）。
+#[cfg(all(feature = "exec-test-support", not(debug_assertions)))]
+compile_error!(
+    "the `exec-test-support` feature exposes test-only exec entry points and must not be enabled in release builds"
+);
+
 pub mod audit_log;
 pub mod capabilities;
 #[cfg(target_os = "linux")]

@@ -189,6 +189,7 @@ name = "fandhe-container-supervisor"
 version = "0.0.0"
 dependencies = [
  "fandhe-container-core",
+ "fandhe-container-supervisor",
 ]
 
 [[package]]

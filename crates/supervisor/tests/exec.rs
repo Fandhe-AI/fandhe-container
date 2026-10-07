@@ -12,10 +12,19 @@
 //! - cgroup: `/proc/<pid>/cgroup` がコンテナ用 cgroup（`<scope>/fc-<id>@<instance>`）の絶対パスと完全一致し、
 //!   joiner が元いた cgroup と異なる
 //! - namespace: `NSpid` が入れ子で、`ns/{mnt,uts,ipc,net,pid}` が pid1 と一致（pid は参加後に fork した子の値）
+//! - 環境変数・補助グループ（TASK-163 追補・#1457）: コマンドの `/proc/<pid>/environ` が、コンテナ定義
+//!   （`config.json` の `process.env`）へ明示の上書きを重ねたものと完全一致し、joiner だけが持つ環境変数を含まない。
+//!   `Groups:` が空（launch と同じ扱い）
+//! - セッション（TASK-163 追補・#1456）: コマンドが新しいセッションのリーダーで、制御端末を持たず、joiner の
+//!   セッションに残らない
 //!
 //! 条件 3・4 の拒否経路（#502 が #503 へ残した条件。`exec/reapply.rs` のモジュール doc）も照合する:
 //! pivot していない pid1（`/` が記録した rootfs でない）の拒否（コマンドが起動しない）と、同じ rootfs を共有する
 //! 別コンテナへ参加した場合の拒否（`exec_joined_namespace_mismatch`。何も適用しない）。
+//!
+//! TASK-163 追補の拒否経路: コンテナの `/dev/null` が symlink・別のデバイスノードへ差し替えられている場合に、
+//! exec の子が差し替え先を開かずに拒否し、コマンドが起動しないこと（#1459）。`#!/proc/self/exe` のスクリプトを
+//! エントリポイントにした exec が `execveat` の前に拒否されること（#1458）。
 //!
 //! 通しは 5 回繰り返し、1 回でも不一致なら失敗する（リトライで隠さない）。
 //!
@@ -90,16 +99,18 @@ mod linux {
 
     use fandhe_container_core::cgroups::CgroupName;
     use fandhe_container_core::exec::{
-        ChildExit, Entrypoint, IsolationConfig, MountIsolation, Namespace, NamespaceSet,
-        create_default_devices, isolate_rootful_host_root, pivot_root, plan_rootful_host_root,
-        prepare_rootfs,
+        ChildExit, ContainerEnv, ExecExit, IsolationConfig, MountIsolation, Namespace,
+        NamespaceSet, ViolationReason, create_default_devices, isolate_rootful_host_root,
+        pivot_root, plan_rootful_host_root, prepare_rootfs,
     };
+    use fandhe_container_core::oci_runtime::load_config;
     use fandhe_container_core::traits::{
         CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, StateRecord, StateRevision,
     };
+    use fandhe_container_supervisor::container_options::env::EnvVar;
     use fandhe_container_supervisor::exec::{
-        enter_namespaces, identify_pid1, join_cgroup, prepare_cgroup_join, prepare_restrictions,
-        reapply_restrictions, run_command, run_command_in,
+        ExecRequest, enter_namespaces, identify_pid1, join_cgroup, prepare_cgroup_join,
+        prepare_restrictions, reapply_restrictions, run_command, run_command_in,
     };
 
     /// 5 回の通し（受入条件: 5 回中 5 回成功）。
@@ -108,6 +119,13 @@ mod linux {
     const OCI_DEFAULT_CAPS: &str = "00000000a80425fb";
     /// プローブの bundle 内の名前。
     const PROBE: &str = "probe";
+    /// インタープリタにランタイム自身（`/proc/self/exe`）を指定したスクリプトの bundle 内の名前（#1458）。
+    const RUNTIME_SCRIPT: &str = "runtime-script";
+    /// exec を起動する側（joiner）だけが持つ環境変数。exec されたコマンドへ渡ってはならない（#1457）。
+    const HOST_ONLY_ENV: &str = "FANDHE_EXEC_TEST_HOST_ONLY";
+    /// exec されたコマンドの環境（`/proc/<pid>/environ`）の期待値: コンテナ定義（`config.json` の `process.env`）へ
+    /// joiner の明示の上書き（`OVERRIDDEN`・`EXTRA`）を重ねたもの。
+    const EXPECTED_ENVIRON: &[u8] = b"FANDHE_EXEC_ENV=from-config\0OVERRIDDEN=explicit\0EXTRA=1\0";
     /// コンテナ ID（cgroup 名 `fc-<id>@<instance>` に使う）。
     const CONTAINER_ID: &str = "exec-test";
 
@@ -144,7 +162,9 @@ mod linux {
             Some("--joiner") => joiner(&args[2..]),
             // root 不要の補助: 手組みのプローブだけをホスト上で自己検証する（`orchestrate` も最初に行う）。
             Some("--selfcheck-probe") => {
-                verify_probe_on_host(&make_bundle());
+                let bundle = make_bundle();
+                verify_bundle_definition(&bundle);
+                verify_probe_on_host(&bundle);
                 println!("exec: probe self-check ok");
             }
             _ if args.iter().any(|a| a == "--ignored") => orchestrate(),
@@ -282,9 +302,15 @@ mod linux {
         fs::write(rootfs.join(PROBE), probe_elf()).expect("write probe");
         fs::set_permissions(rootfs.join(PROBE), fs::Permissions::from_mode(0o755))
             .expect("chmod probe");
+        fs::write(rootfs.join(RUNTIME_SCRIPT), b"#!/proc/self/exe\n").expect("write script");
+        fs::set_permissions(
+            rootfs.join(RUNTIME_SCRIPT),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod script");
         fs::write(
             bundle.dir.join("config.json"),
-            br#"{"ociVersion":"1.2.0","root":{"path":"rootfs","readonly":true},"mounts":[{"destination":"/dev","options":["rw"]},{"destination":"/data","options":["rw"]}]}"#,
+            br#"{"ociVersion":"1.2.0","root":{"path":"rootfs","readonly":true},"process":{"user":{"uid":0,"gid":0},"cwd":"/","args":["/probe"],"env":["FANDHE_EXEC_ENV=from-config","OVERRIDDEN=config"]},"mounts":[{"destination":"/dev","options":["rw"]},{"destination":"/data","options":["rw"]}]}"#,
         )
         .expect("write config.json");
         bundle
@@ -465,9 +491,15 @@ mod linux {
             .arg("--pid")
             .arg(pid1.to_string())
             .arg("--nofile=700:1500")
-            .status()
+            .stdin(Stdio::null())
+            .spawn()
             .expect("run prlimit (util-linux)");
-        assert!(prlimit.success(), "prlimit must lower pid1's NOFILE");
+        // 期限つきで待つ（REPAIR-5）。
+        assert_eq!(
+            finish_joiner(prlimit).0,
+            Some(0),
+            "prlimit must lower pid1's NOFILE"
+        );
         Container {
             stdin,
             a,
@@ -490,10 +522,18 @@ mod linux {
         let instance: u64 = arg(3).parse().expect("instance");
         let pid1: u32 = arg(4).parse().expect("pid1");
         let record = make_record(pid1, bundle, scope, instance);
-        let entry = Entrypoint::new(format!("/{PROBE}"), [format!("/{PROBE}")], [] as [&str; 0])
-            .expect("entrypoint");
+        // `run-script` だけは、インタープリタがランタイム自身を指すスクリプトをエントリポイントにする（#1458）。
+        let program = if mode == "run-script" {
+            RUNTIME_SCRIPT
+        } else {
+            PROBE
+        };
+        let entry = ExecRequest::new(format!("/{program}"), [format!("/{program}")])
+            .expect("request")
+            .with_env(&explicit_env())
+            .expect("explicit env");
         let result = match mode {
-            "run" => run_command(&record, &entry, timeout()),
+            "run" | "run-script" => run_command(&record, &entry, timeout()),
             "run-in" => run_command_in(&record, arg(5), &entry, timeout()),
             "mismatch" => return joiner_mismatch(bundle, scope, &record, args),
             other => panic!("unknown joiner mode {other}"),
@@ -501,12 +541,13 @@ mod linux {
         match result {
             Ok(o) => {
                 println!(
-                    "outcome exit={:?} rlimits={} caps_dropped={} landlock_rules={} seccomp_instructions={}",
+                    "outcome exit={:?} rlimits={} caps_dropped={} landlock_rules={} seccomp_instructions={} groups={}",
                     o.exit,
                     o.rlimits_applied,
                     o.capability_bounding_dropped,
                     o.landlock_rules,
-                    o.seccomp_instructions
+                    o.seccomp_instructions,
+                    o.supplementary_groups.as_str()
                 );
             }
             Err(e) => {
@@ -514,6 +555,33 @@ mod linux {
                 std::process::exit(3);
             }
         }
+    }
+
+    /// joiner が exec に対して明示する環境変数（CLI の `-e` 相当）。コンテナ定義の `OVERRIDDEN` を上書きし、
+    /// `EXTRA` を足す。
+    fn explicit_env() -> Vec<EnvVar> {
+        ["OVERRIDDEN=explicit", "EXTRA=1"]
+            .into_iter()
+            .map(|v| EnvVar::parse(v).expect("env var"))
+            .collect()
+    }
+
+    /// 自己検証（root 不要）: bundle の `config.json` が解釈でき、コンテナ定義の環境へ明示の上書きを重ねた結果が
+    /// [`EXPECTED_ENVIRON`] と一致する（期待値の誤りをランタイムの不具合と取り違えない）。
+    fn verify_bundle_definition(bundle: &Bundle) {
+        let config = load_config(&bundle.dir.join("config.json")).expect("load config.json");
+        let env = explicit_env()
+            .iter()
+            .try_fold(
+                ContainerEnv::from_config(&config).expect("container env"),
+                |env, var| env.with_var(var.key(), var.value()),
+            )
+            .expect("explicit overrides");
+        let environ: Vec<u8> = env
+            .iter()
+            .flat_map(|(k, v)| format!("{k}={v}\0").into_bytes())
+            .collect();
+        assert_eq!(environ, EXPECTED_ENVIRON);
     }
 
     /// 同じ rootfs を共有する別コンテナ B へ、A 用に準備した制限を持って参加する（条件 3）。再適用が
@@ -577,6 +645,16 @@ mod linux {
             .collect()
     }
 
+    /// `pid` の `(セッション ID, tty_nr)`（`/proc/<pid>/stat`。`comm` は括弧を含み得るため最後の `)` より後ろを読む）。
+    fn session_and_tty(pid: u32) -> (u32, i64) {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).expect("read stat");
+        let rest = &stat[stat.rfind(')').expect("comm terminator") + 1..];
+        let mut fields = rest.split_whitespace().skip(3);
+        let session = fields.next().expect("session").parse().expect("session");
+        let tty_nr = fields.next().expect("tty_nr").parse().expect("tty_nr");
+        (session, tty_nr)
+    }
+
     /// `pid` の直接の子（`/proc/<pid>/task/<pid>/children`）。
     fn children_of(pid: u32) -> Vec<u32> {
         fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
@@ -607,6 +685,8 @@ mod linux {
         Command::new(exe)
             .arg("--joiner")
             .args(args)
+            // exec を起動する側だけが持つ環境変数（exec されたコマンドへ渡らないことを照合する。#1457）。
+            .env(HOST_ONLY_ENV, "must-not-leak")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .spawn()
@@ -686,6 +766,27 @@ mod linux {
             Some(pid.to_string().as_str()),
             "{ctx}"
         );
+        // TASK-163 追補（#1456）: コマンドは新しいセッションのリーダーで、制御端末を持たず、joiner のセッションに
+        // 残らない（host 側の pid 番号で照合する）。
+        let (session, tty_nr) = session_and_tty(pid);
+        assert_eq!(session, pid, "the command must lead its session; {ctx}");
+        assert_eq!(tty_nr, 0, "the command must have no controlling tty; {ctx}");
+        assert_ne!(session, session_and_tty(jpid).0, "{ctx}");
+        // TASK-163 追補（#1457）: コマンドの環境はコンテナ定義と明示の上書きだけで、joiner の環境（対照として
+        // joiner 自身は `HOST_ONLY_ENV` を持つ）は 1 つも渡らない。補助グループは空（launch と同じ扱い）。
+        let joiner_environ = fs::read(format!("/proc/{jpid}/environ")).expect("joiner environ");
+        assert!(
+            joiner_environ
+                .split(|b| *b == 0)
+                .any(|v| v.starts_with(HOST_ONLY_ENV.as_bytes())),
+            "the joiner must carry the host-only variable; {ctx}"
+        );
+        assert_eq!(
+            fs::read(format!("/proc/{pid}/environ")).expect("probe environ"),
+            EXPECTED_ENVIRON,
+            "{ctx}"
+        );
+        assert_eq!(status_field(&status, "Groups:"), "", "{ctx}");
         // namespace は pid1 と一致する（pid は参加後に fork した子の値）。
         for ns in ["mnt", "uts", "ipc", "net", "pid"] {
             assert_eq!(
@@ -726,21 +827,39 @@ mod linux {
         let killed = Command::new("kill")
             .arg("-TERM")
             .arg(pid.to_string())
-            .status()
+            .stdin(Stdio::null())
+            .spawn()
             .expect("run kill");
-        assert!(killed.success(), "{ctx}");
+        // 期限つきで待つ（REPAIR-5）。
+        assert_eq!(finish_joiner(killed).0, Some(0), "{ctx}");
         let (code, out) = finish_joiner(joiner);
         assert_eq!(code, Some(0), "joiner output: {out}; {ctx}");
         assert_eq!(
             out.trim_end(),
             format!(
-                "outcome exit={:?} rlimits=16 caps_dropped={} landlock_rules=3 seccomp_instructions={}",
-                ChildExit::Signaled(15),
+                "outcome exit={:?} rlimits=16 caps_dropped={} landlock_rules=3 seccomp_instructions={} groups={}",
+                ExecExit::Command(ChildExit::Signaled(15)),
                 parse_after(&out, "caps_dropped="),
                 parse_after(&out, "seccomp_instructions="),
+                expected_groups_outcome(),
             ),
             "{ctx}"
         );
+    }
+
+    /// 補助グループの扱いの期待値。joiner は本プロセス（root）と同じ補助グループを持つため、本プロセスが
+    /// 補助グループを持てば `cleared`（`setgroups(0)` で消去）、持たなければ `already_empty`。
+    ///
+    /// 消去は namespace へ参加する **前**（準備の最後）に行われ、参加後の capability 削減は「元から空」になるが、
+    /// 結果には参加前の消去（`cleared`）が残る（root 起動の exec が起動者のホスト側の補助グループをコンテナへ
+    /// 持ち込まないことの照合。TASK-163 追補・#1457。プローブの `Groups:` が空であることは `one_round` が照合する）。
+    fn expected_groups_outcome() -> &'static str {
+        let status = fs::read_to_string("/proc/self/status").expect("own status");
+        if status_field(&status, "Groups:").is_empty() {
+            "already_empty"
+        } else {
+            "cleared"
+        }
     }
 
     /// `key` の直後の数値トークン（観測できる範囲で具体値を組み立てるため。0 より大きいことも照合する）。
@@ -814,6 +933,97 @@ mod linux {
         );
     }
 
+    /// TASK-163 追補（#1458・SEC-1・SEC-4・CORE-5）: `#!/proc/self/exe` のスクリプトをエントリポイントにした exec は、
+    /// 子が `execveat` の前に拒否する（終了コード 126）。ホスト側のランタイムのバイナリ（ここでは試験バイナリ）は
+    /// コンテナ内で実行されない。
+    ///
+    /// 拒否が Landlock（ルール外のバイナリの実行拒否）ではなくインタープリタの照合によることは、結果に付く違反の
+    /// 理由で確かめる（非特権で動く core の `tests/exec_child_setup.rs` も、Landlock を適用しない子で同じ入力の
+    /// 拒否を照合している）。
+    fn runtime_interpreter_script_is_rejected(bundle: &Bundle, c: &Container) {
+        clean_probe_files(bundle);
+        let joiner = spawn_joiner(&[
+            "run-script".into(),
+            bundle.dir.display().to_string(),
+            own_cgroup_path(),
+            "1000".into(),
+            c.pid1.to_string(),
+        ]);
+        let jpid = joiner.id();
+        let (code, out) = finish_joiner(joiner);
+        assert_eq!(code, Some(0), "joiner output: {out}");
+        // 拒否の理由がインタープリタの照合（違反 `entrypoint_interpreter_is_runtime_binary`）であること。Landlock が
+        // `execveat` を拒否した場合は違反の理由が付かない（`violation: None`）ため、ここで区別できる（#1460）。
+        assert!(
+            out.starts_with(&format!(
+                "outcome exit={:?} ",
+                ExecExit::SetupFailed {
+                    exit: ChildExit::Exited(126),
+                    violation: Some(ViolationReason::EntrypointInterpreterIsRuntimeBinary),
+                }
+            )),
+            "the exec child must refuse the runtime-interpreted script: {out}"
+        );
+        assert!(
+            probe_child(jpid, &std::env::current_exe().expect("current_exe")).is_none(),
+            "the runtime binary must not be running as the script interpreter"
+        );
+    }
+
+    /// TASK-163 追補（#1459・SEC-1・SEC-4）: コンテナの `/dev/null` が symlink・別のデバイスノード（1:5）へ
+    /// 差し替えられていたら、exec の子は差し替え先を開かずに拒否し、コマンドは起動しない（終了コード 126）。
+    ///
+    /// rootfs の `dev/` は pid1 が `create_default_devices` で作ったホスト側のディレクトリそのものなので、
+    /// ホスト側から差し替える（コンテナが `CAP_MKNOD` で行う差し替えと同じ結果になる）。照合の前に必ず元へ戻す。
+    fn replaced_dev_null_is_rejected(bundle: &Bundle, c: &Container) {
+        let null = bundle.rootfs().join("dev/null");
+        let saved = bundle.rootfs().join("dev/null.saved");
+        for kind in ["symlink", "device"] {
+            clean_probe_files(bundle);
+            fs::rename(&null, &saved).expect("move the real /dev/null aside");
+            let replaced = match kind {
+                "symlink" => std::os::unix::fs::symlink("zero", &null).is_ok(),
+                // 期限つきで待つ（外部コマンドの待ちで固まらない。REPAIR-5）。
+                _ => Command::new("mknod")
+                    .arg(&null)
+                    .args(["c", "1", "5"])
+                    .stdin(Stdio::null())
+                    .spawn()
+                    .is_ok_and(|child| finish_joiner(child).0 == Some(0)),
+            };
+            let joiner = replaced.then(|| {
+                spawn_joiner(&[
+                    "run".into(),
+                    bundle.dir.display().to_string(),
+                    own_cgroup_path(),
+                    "1000".into(),
+                    c.pid1.to_string(),
+                ])
+            });
+            let result = joiner.map(finish_joiner);
+            // 元へ戻してから照合する（失敗しても後続のシナリオと後始末を壊さない）。
+            let _ = fs::remove_file(&null);
+            fs::rename(&saved, &null).expect("restore the real /dev/null");
+            let (code, out) = result.unwrap_or_else(|| panic!("replace /dev/null with a {kind}"));
+            assert_eq!(code, Some(0), "joiner output: {out}; {kind}");
+            // コマンドは起動しておらず（終了コードではなく pipe の報告で区別する。#1460）、違反の理由が届く。
+            assert!(
+                out.starts_with(&format!(
+                    "outcome exit={:?} ",
+                    ExecExit::SetupFailed {
+                        exit: ChildExit::Exited(126),
+                        violation: Some(ViolationReason::StdioNullNotNullDevice),
+                    }
+                )),
+                "the exec child must refuse the replaced /dev/null ({kind}): {out}"
+            );
+            assert!(
+                !bundle.rootfs().join("data/ok").exists(),
+                "the command must not have started ({kind})"
+            );
+        }
+    }
+
     /// `unshare_pid` の子のうち、入れ子の PID namespace の PID 1（`NSpid` が 2 要素以上で末尾 1）のもの。
     fn nested_pid1_child(unshare_pid: u32) -> Option<u32> {
         let children =
@@ -861,6 +1071,7 @@ mod linux {
             "this test needs root (rootful pivot_root, cgroup v2 writes); rootless exec is not implemented"
         );
         let bundle = make_bundle();
+        verify_bundle_definition(&bundle);
         verify_probe_on_host(&bundle);
         let original_cgroup = own_cgroup_path();
 
@@ -869,6 +1080,9 @@ mod linux {
         for round in 1..=ROUNDS {
             one_round(&bundle, &a, round, &original_cgroup);
         }
+        // 拒否経路（TASK-163 追補）: `/dev/null` の差し替え（#1459）・インタープリタ経由のランタイム実行（#1458）。
+        replaced_dev_null_is_rejected(&bundle, &a);
+        runtime_interpreter_script_is_rejected(&bundle, &a);
         // 拒否経路（条件 3・4(d)）。
         let b = start_container(&bundle, "b", 2000);
         other_container_is_rejected(&bundle, &a, &b);

@@ -21,6 +21,13 @@
 //!   launcher 契約どおりの対象では通ることの根拠になる。制限の再適用以降は Landlock ABI 6 以上を要し、
 //!   hosted runner では実行できないため、ここでは照合しない（`tests/exec.rs`。実機前提）
 //!
+//! TASK-163 追補（#1457）で次を足した（同じく非特権の user namespace に閉じる）。
+//!
+//! - **`setgroups` が `deny` の user namespace での補助グループ（SEC-5）**: launch・exec が共有する補助グループの
+//!   消去を、`unshare --map-root-user` の user namespace（`setgroups` は `deny`）の中で実 syscall により通し、
+//!   `CAP_SETGID` を持っていても消去できない場合に「現状維持の記録」（`KeptSetgroupsDenied`）になること・
+//!   補助グループが実際に変わらないことを照合する
+//!
 //! # 試験専用の入口（`exec-test-support` feature）
 //! 試験環境ではコンテナ用 cgroup（`<scope>/fc-<id>@<instance>`）を作れないため、期待 cgroup パスを
 //! 呼び出し側から渡す `identify_pid1_in` を使う。この入口は `exec-test-support` feature を付けたビルドにだけ
@@ -82,6 +89,8 @@ fn main() {
             .expect("flag position");
         let rootfs = args.get(i + 2).expect("joiner requires the rootfs path");
         linux::joiner_pivoted(pid, std::path::Path::new(rootfs));
+    } else if pid_after(linux::JOINER_GROUPS).is_some() {
+        linux::joiner_groups();
     } else if let Some(i) = args.iter().position(|a| a == linux::PID1_PIVOT) {
         let rootfs = args.get(i + 1).expect("pid1 requires the rootfs path");
         linux::pid1_pivot(std::path::Path::new(rootfs));
@@ -104,7 +113,10 @@ mod linux {
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use fandhe_container_core::exec::{JoinNamespace, MountIsolation, pivot_root, prepare_rootfs};
+    use fandhe_container_core::exec::{
+        JoinNamespace, MountIsolation, SupplementaryGroups, clear_supplementary_groups_for_test,
+        pivot_root, prepare_rootfs,
+    };
     use fandhe_container_core::traits::{
         ContainerId, ContainerStatus, ErrorCode, StateRecord, StateRevision,
     };
@@ -153,6 +165,8 @@ mod linux {
     pub const JOINER_OTHER_USERNS: &str = "--joiner-other-userns";
     /// `pivot_root` 済みの pid1 へ参加し、参加後の `/` を照合する joiner の再入フラグ（引数: pid・rootfs）。
     pub const JOINER_PIVOTED: &str = "--joiner-pivoted";
+    /// `setgroups` が `deny` の user namespace で補助グループの扱いを照合する joiner の再入フラグ（引数: pid。未使用）。
+    pub const JOINER_GROUPS: &str = "--joiner-groups";
     /// launcher と同じ手順で `pivot_root` まで進んで待機する pid1 の再入フラグ（引数: rootfs）。
     pub const PID1_PIVOT: &str = "--pid1-pivot";
     /// pid1 が pivot の後に新しい `/` へ置く合図ファイルの名前と内容。
@@ -201,6 +215,13 @@ mod linux {
             &[rootfs_arg],
         );
         println!("exec_setns_join: root after joining a pivoted target equals the pinned rootfs");
+        // TASK-163 追補（#1457）: `setgroups` が `deny` の user namespace（rootless。`--map-root-user`）では、
+        // `CAP_SETGID` を持っていても補助グループを消去できない。launch・exec が共有する関数は拒否にも成功の偽装にも
+        // せず、現状維持として記録する（SEC-5。rootless の launch を壊さない）。
+        run_scenario(&ALL_NS, sleep(), None, true, JOINER_GROUPS, &[]);
+        println!(
+            "exec_setns_join: supplementary groups kept and recorded where setgroups is denied"
+        );
         println!("exec_setns_join: namespace join verified");
     }
 
@@ -394,6 +415,44 @@ mod linux {
             "exec stage SetNs: the exec target is in another user namespace than the caller; \
              refusing to join (violation: exec_target/exec_target_in_other_user_namespace, SUP-6)"
         );
+    }
+
+    /// 対象の user namespace（`unshare --map-root-user` が作る。`setgroups` は `deny`）に入った単一スレッドで、
+    /// 本番と同じ関数・実 syscall により補助グループの消去を試み、「現状維持の記録」になることを具体値で照合する
+    /// （SUP-6・SEC-5・TASK-163 追補・#1457）。
+    ///
+    /// この user namespace の中では uid 0 で全 capability（`CAP_SETGID` を含む）を持つが、`setgroups(2)` は
+    /// `EPERM` になる。呼び出したユーザーの補助グループが写像されないまま残っていること（1 件以上）が前提。
+    pub fn joiner_groups() {
+        let status = || fs::read_to_string("/proc/self/status").expect("read own status");
+        let field = |status: &str, name: &str| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(name))
+                .unwrap_or_else(|| panic!("{name} missing in status"))
+                .trim()
+                .to_owned()
+        };
+        let before = status();
+        assert_eq!(
+            fs::read_to_string("/proc/self/setgroups").expect("read setgroups"),
+            "deny\n",
+            "setgroups must be denied in this user namespace"
+        );
+        let effective = u64::from_str_radix(&field(&before, "CapEff:"), 16).expect("CapEff");
+        assert_ne!(effective & (1 << 6), 0, "the joiner must hold CAP_SETGID");
+        let groups = field(&before, "Groups:");
+        let count = groups.split_whitespace().count();
+        assert!(
+            count > 0,
+            "the joiner must carry supplementary groups for this scenario to be meaningful"
+        );
+        assert_eq!(
+            clear_supplementary_groups_for_test().expect("handle supplementary groups"),
+            SupplementaryGroups::KeptSetgroupsDenied { kept: count }
+        );
+        // 何も変わっていない（消去を装わない）。
+        assert_eq!(field(&status(), "Groups:"), groups);
     }
 
     /// `--pid1-pivot`: 新しい PID namespace の PID 1 として、launcher と同じ手順（`establish` →

@@ -10,7 +10,7 @@
 //! reapply_restrictions(..) -> ExecRestrictionReport      // rlimit・capability・NO_NEW_PRIVS・Landlock・seccomp
 //!   .into_complete()       -> ExecReady                  // 唯一の証跡（値で渡る）
 //! spawn_exec_command(ready, &entry)                      // 親: non-dumpable を確認 → cwd を照合済み root へ → fork
-//!   子: close_range(3..) -> エントリポイントを fd で検査 -> 標準入出力を /dev/null へ -> execveat
+//!   子: close_range(3..) -> setsid -> エントリポイントを fd で検査 -> 標準入出力を /dev/null へ -> execveat
 //! 親: ContainerChild::wait_timeout(timeout)              // 期限超過は SIGKILL + 回収（REPAIR-5）
 //! ```
 //!
@@ -19,6 +19,11 @@
 //!
 //! # 契約
 //!
+//! - **コマンドの環境と補助グループ**（SEC-1・SEC-5・TASK-163 追補・#1457）: コマンドは [`ExecCommand`] で受け取り、
+//!   環境変数はコンテナ定義由来の `ContainerEnv` の中身だけが `execveat` の envp になる（呼び出しプロセスの環境は
+//!   渡らない）。補助グループは `reapply_restrictions` の capability 削減が launch と同じ関数で空にする
+//!   （`setgroups(0)`。fork の前に済み、子へ継承される。`setgroups` が `deny` の user namespace では残して記録する）。
+//!   uid / gid は変更しない
 //! - **入口は [`ExecReady`] だけを値で受け取る**（SEC-1）。`ExecRestrictionReport`・真偽値を受け取る入口、
 //!   `ExecReady` を作る別経路は無い。制限（`NO_NEW_PRIVS`・Landlock・seccomp・capability の bounding set・
 //!   rlimit）は fork / execve を越えて継承されるため、「適用 → fork → execve」の順で子へ載る
@@ -49,28 +54,106 @@
 //! - **別プロセスからは呼べない**: `ExecReady` を作ったプロセスと異なる pid からの呼び出しは何もせず拒否する
 //!   （fork した子の pid は数値が衝突し得るため、best-effort の誤用検知）
 //! - **子は launch 経路と同じ手順で exec する**: エントリポイントを開く前に fd 3 以上を `close_range` で閉じ
-//!   （cgroup・状態・固定した rootfs・status の fd をコンテナへ渡さない。CVE-2024-21626 型の対策）、標準 fd と同一
-//!   実体・ランタイム自身のバイナリを拒否し、シェバンを検証し、標準入出力を新 root の `/dev/null`（1:3 を検証）へ
-//!   置換して `execveat` する（`process::exec_checked_entrypoint`）。エントリポイントは絶対パスのみで PATH
-//!   探索はしない。子の失敗は stderr の英語 1 行と終了コード（125 / 126 / 127）で伝える
-//! - **親の待ちには必ずタイムアウトを設ける**（REPAIR-5）: 戻り値の [`ContainerChild`] は
+//!   （cgroup・状態・固定した rootfs・status の fd をコンテナへ渡さない。CVE-2024-21626 型の対策）、`setsid` で
+//!   呼び出し側のセッション・制御端末を切り離し（端末から起動した CLI の exec で、コマンドが `/dev/tty` 経由で
+//!   ホスト側の端末へ届かない。失敗したら実行しない。TASK-163 追補・#1456）、標準 fd と同一
+//!   実体・ランタイム自身のバイナリ（本体に加えて、シェバンの連鎖・`PT_INTERP` の解決先。`#!/proc/self/exe` 等。
+//!   #1458）を拒否し、シェバンを検証し、標準入出力を新 root の `/dev/null`（開く前に 1:3 を検証し、`O_NOCTTY`
+//!   つきで開き直す。#1459）へ置換して `execveat` する（`process::exec_checked_entrypoint`）。エントリポイントは絶対パスのみで PATH
+//!   探索はしない。子の失敗は stderr の英語 1 行・終了コード（125 / 126 / 127）・親への pipe（下記）で伝える
+//! - **親の待ちには必ずタイムアウトを設ける**（REPAIR-5）: 戻り値の [`ExecChild`] は
 //!   `wait_timeout` のみを提供する。`Drop` では kill / wait しない
+//! - **`execve` 前の失敗とコマンドの終了を区別する**（REPAIR-3・TASK-163 追補・#1460）: 子の終了コード 125 / 126 /
+//!   127 は実行されたコマンド自身も返し得るため、終了コードでは区別できない。親は fork の前に close-on-exec の
+//!   pipe を作り、子は fd の後始末でその書き込み側だけを残して、「手順を終えた（`R`）」「失敗した（終了コードと
+//!   違反の理由）」を 1 行で書く。`execveat` が成功すれば pipe は閉じるので、親は子の終了後に「`R` だけ」=
+//!   起動した、「失敗の行」または「何も無い」= 起動していない、と判定する（[`ExecExit`]）。**限界**: `R` を
+//!   書いた後・`execveat` の完了前にシグナルで終了した子は「起動した」と判定される（窓は syscall 1 回ぶん）。
+//!   pipe の書き込み側はコンテナ内の PID namespace から見える子が持つが、子は non-dumpable で、`execveat` の後は
+//!   存在しない
 //!
 //! # 未実装（REPAIR-3）
 //!
 //! - 標準入出力の受け渡し（CLI の exec・TASK-161 / SUP-4 の healthcheck の出力取得）。現状は launch と同じく
 //!   `/dev/null` へ固定する（ホスト側の端末・ファイルをコンテナへ渡さない。fail-closed）
-//! - 環境変数・作業ディレクトリ・ユーザーの指定（OCI `process` からの組み立て）。cwd は rootfs の根で固定
-//! - 子の失敗を構造のまま親へ返す同期パイプ（現状は終了コードと stderr）
+//! - 作業ディレクトリ・ユーザーの指定（OCI `process` からの組み立て）。cwd は rootfs の根で固定。環境変数は
+//!   コンテナ定義（`config.json` の `process.env`）と明示の上書きだけを [`ExecCommand`] の `ContainerEnv` で受け取り、
+//!   exec を起動したプロセスの環境は引き継がない（TASK-163 追補・#1457。`exec/container_env.rs`）
+//! - 子の失敗を構造のまま親へ返すこと（現状は終了コード・違反の理由コード・stderr。段とメッセージは親へ返らない）
 
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 
 use crate::sys;
 use crate::traits::types::ErrorCode;
 
-use super::process::{EXIT_SETUP_FAILED, exec_child_main};
+use super::process::{EXIT_SETUP_FAILED, exec_child_main, exec_status_pipe, read_exec_status};
 use super::reapply::ExecReadyParts;
-use super::{ContainerChild, Entrypoint, ExecError, ExecReady, IsolationStage};
+use super::{
+    ChildExit, ContainerChild, ExecCommand, ExecError, ExecExit, ExecReady, IsolationStage,
+};
+
+/// [`spawn_exec_command`] が fork した、稼働中コンテナ内のコマンドの子（SUP-6・TASK-163 追補・#1460）。
+///
+/// [`ContainerChild`]（期限つきの待機・`SIGKILL` と回収）に、子が `execve` 前の失敗を知らせる pipe の読み取り側を
+/// 足したもの。[`Self::wait_timeout`] は終了状態を [`ExecExit`] で返し、「コマンドが起動して終了した」のか
+/// 「コマンドは起動していない（`execve` より前で失敗した）」のかを区別する。`Drop` では kill / wait しない
+/// （回収の責任は呼び出し元にある。`ContainerChild` と同じ）。
+#[derive(Debug)]
+pub struct ExecChild {
+    child: ContainerChild,
+    /// 子が状態を書く pipe の読み取り側。
+    status: std::fs::File,
+    /// 判定済みの結果（pipe は 1 回しか読めないため、2 回目以降の待機は記録を返す）。pipe の読み取りから
+    /// 記録までをこのロックの下で行い、並行に待つ呼び出しが pipe を取り合わないようにする（一方が `R` を読み、
+    /// 他方が EOF を読んで「起動していない」と記録することがない）。
+    /// 読み取りに失敗した場合も「判定できなかった」ことを記録する（`Some(None)`。部分的に読んだ後の再読み取りは
+    /// EOF になり、起動したコマンドを「起動していない」と誤判定し得るため、読み直さない）。
+    outcome: std::sync::Mutex<Option<Option<ExecExit>>>,
+}
+
+impl ExecChild {
+    /// 子の pid（呼び出しプロセスの PID namespace での値）。
+    pub fn pid(&self) -> u32 {
+        self.child.pid()
+    }
+
+    /// 子の終了を `timeout` まで待ち、コマンドが起動したかどうかを添えて返す（REPAIR-5）。
+    ///
+    /// 期限を過ぎたら未回収に限り `SIGKILL` して回収し `Timeout`（[`ContainerChild::wait_timeout`] と同じ）。
+    /// 終了後に子が残した状態を読めなければ、起動したかどうかを推測せず `Internal` で返す。
+    pub fn wait_timeout(&self, timeout: std::time::Duration) -> Result<ExecExit, ExecError> {
+        let exit = self.child.wait_timeout(timeout)?;
+        self.classify(exit)
+    }
+
+    /// 未回収なら `SIGKILL` して回収する（[`ContainerChild::kill_and_reap`]。期限切れ・待機エラー後の後始末用）。
+    pub fn kill_and_reap(&self, timeout: std::time::Duration) -> Result<ChildExit, ExecError> {
+        self.child.kill_and_reap(timeout)
+    }
+
+    fn classify(&self, exit: ChildExit) -> Result<ExecExit, ExecError> {
+        // 毒化していても中身は判定の記録だけ（途中状態を持たない）ため、そのまま使う。
+        let mut recorded = self
+            .outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outcome = match *recorded {
+            Some(outcome) => outcome,
+            None => {
+                let outcome = read_exec_status(&self.status, exit);
+                *recorded = Some(outcome.as_ref().ok().copied());
+                Some(outcome?)
+            }
+        };
+        outcome.ok_or_else(|| {
+            ExecError::new(
+                ErrorCode::Internal,
+                IsolationStage::Wait,
+                "the exec status could not be read; cannot tell whether the command started",
+            )
+        })
+    }
+}
 
 /// 証跡 `ready` を消費し、`entry` を稼働中コンテナの namespace・cgroup・制限の下で実行する子を fork する。
 ///
@@ -84,15 +167,25 @@ use super::{ContainerChild, Entrypoint, ExecError, ExecReady, IsolationStage};
 /// ```compile_fail,E0308
 /// fn f(
 ///     report: fandhe_container_core::exec::ExecRestrictionReport,
-///     entry: &fandhe_container_core::exec::Entrypoint,
+///     command: &fandhe_container_core::exec::ExecCommand,
 /// ) {
-///     let _ = fandhe_container_core::exec::spawn_exec_command(report, entry);
+///     let _ = fandhe_container_core::exec::spawn_exec_command(report, command);
 /// }
 /// ```
-pub fn spawn_exec_command(
-    ready: ExecReady,
-    entry: &Entrypoint,
-) -> Result<ContainerChild, ExecError> {
+///
+/// コマンドは [`ExecCommand`] でしか渡せない（環境変数を任意の文字列の列で渡せる launch 用の `Entrypoint` は
+/// 受け取らない。TASK-163 追補・#1457。契約は `exec/container_env.rs`）:
+///
+/// ```compile_fail,E0308
+/// fn f(
+///     ready: fandhe_container_core::exec::ExecReady,
+///     entry: &fandhe_container_core::exec::Entrypoint,
+/// ) {
+///     let _ = fandhe_container_core::exec::spawn_exec_command(ready, entry);
+/// }
+/// ```
+pub fn spawn_exec_command(ready: ExecReady, command: &ExecCommand) -> Result<ExecChild, ExecError> {
+    let entry = command.entrypoint();
     let ExecReadyParts {
         root,
         mut threads,
@@ -109,16 +202,25 @@ pub fn spawn_exec_command(
     // 子が「親（この worker）の生存」を確かめるための、自プロセスの pidfd（fork で子へ継承される）。
     let own = own_pidfd()?;
     change_dir_to_verified_root(root.as_fd())?;
+    // 子が `execve` 前の失敗を知らせる pipe（両端とも close-on-exec。`execveat` が成功すれば書き込み側は閉じる）。
+    let (status_read, status_write) = exec_status_pipe()?;
     let pid = sys::fork_single_threaded_with(
         || threads.count() == Some(1),
         || match bind_to_parent_lifetime(own.as_fd()) {
-            Ok(()) => exec_child_main(entry),
+            Ok(()) => exec_child_main(entry, &status_write),
+            // 何も書かずに終わる（親は「手順の途中で終了した」= コマンドは起動していない、と判定する）。
             Err(code) => code,
         },
         EXIT_SETUP_FAILED,
     )
     .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
-    Ok(ContainerChild::new(pid))
+    // 親の書き込み側を閉じる（子の終了後に読み取りが EOF で終わるようにする）。
+    drop(status_write);
+    Ok(ExecChild {
+        child: ContainerChild::new(pid),
+        status: status_read,
+        outcome: std::sync::Mutex::new(None),
+    })
 }
 
 /// 呼び出しプロセス自身を指す pidfd を開く（fork する子へ継承させ、親の生存確認に使う。REPAIR-5）。
@@ -284,8 +386,8 @@ mod tests {
         ThreadCountSource::PreOpened(f)
     }
 
-    fn entry() -> Entrypoint {
-        Entrypoint::new("/bin/true", ["true"], Vec::<String>::new()).expect("entry")
+    fn entry() -> ExecCommand {
+        ExecCommand::new("/bin/true", ["true"], &crate::exec::ContainerEnv::empty()).expect("entry")
     }
 
     /// SUP-6・SEC-1・TASK-163.4: `ExecReady` を作ったのと別のプロセスからは、cwd も変えず fork もせずに拒否する。
@@ -326,6 +428,79 @@ mod tests {
         );
         assert_eq!(e.violation, None);
         assert_eq!(take_calls(), vec!["prctl(PR_GET_DUMPABLE)"]);
+    }
+
+    /// 子が `content` を書いて終了した後の状態を模した `ExecChild`（pid は待機に使わない）。
+    fn exec_child_with_status(content: &[u8]) -> (ExecChild, std::fs::File) {
+        let (status, writer) = exec_status_pipe().expect("status pipe");
+        (&writer).write_all(content).expect("write status");
+        let child = ExecChild {
+            child: ContainerChild::from_pid_for_test(std::process::id()),
+            status,
+            outcome: std::sync::Mutex::new(None),
+        };
+        (child, writer)
+    }
+
+    /// SUP-6・REPAIR-3・TASK-163 追補（#1460）: 並行に待つ呼び出しが状態の pipe を取り合っても、全員が同じ判定を
+    /// 受け取る（一方が `R` を読み、他方が EOF を読んで「起動していない」と記録することがない）。pipe の両端は
+    /// 標準入出力の番号（0〜2）に置かれない。
+    #[test]
+    fn sup6_task163_concurrent_waiters_share_one_exec_status() {
+        use std::os::fd::AsRawFd as _;
+        let exit = ChildExit::Exited(126);
+        let mut classified = 0usize;
+        for _ in 0..50 {
+            let (child, writer) = exec_child_with_status(b"R\n");
+            assert!(child.status.as_raw_fd() > 2 && writer.as_raw_fd() > 2);
+            drop(writer);
+            let results: Vec<Option<ExecExit>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|_| scope.spawn(|| child.classify(exit).ok()))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("join"))
+                    .collect()
+            });
+            // 全員が同じ判定を受け取る。libtest では他のテストスレッドが子プロセスを fork し得て、その子が
+            // `execve` までの間 pipe の書き込み側の複製を持つと「書き込み側が開いたまま」（判定不能 = `None`）に
+            // なる（本番の exec 専用プロセスは単一スレッドで、この重なりは起きない）。その回も全員が判定不能で
+            // 揃い、誰も「起動していない」とは判定しない。
+            let first = results.first().copied().flatten();
+            assert_eq!(results, vec![first; 8]);
+            assert!(
+                first.is_none() || first == Some(ExecExit::Command(exit)),
+                "{first:?}"
+            );
+            classified += usize::from(first.is_some());
+        }
+        // 判定不能は他スレッドの fork と重なった回だけで、「起動した」と判定される回が必ずある。
+        assert!(classified > 0, "no round was classified");
+    }
+
+    /// SUP-6・REPAIR-5・TASK-163 追補（#1460）: 状態を読めなかった判定は記録され、読み直さない（書き込み側が
+    /// 後から閉じても、EOF を「起動していない」と解釈し直さない）。
+    #[test]
+    fn sup6_task163_unreadable_exec_status_is_not_reinterpreted() {
+        let exit = ChildExit::Exited(0);
+        let (child, writer) = exec_child_with_status(b"");
+        // 書き込み側が開いたまま（データなし）: 待たずに `Internal`。
+        let first = child.classify(exit).expect_err("still open");
+        assert_eq!(
+            first.message,
+            "the exec status pipe is still open after exit"
+        );
+        drop(writer);
+        let second = child.classify(exit).expect_err("recorded as unreadable");
+        assert_eq!(
+            (second.code, second.stage),
+            (ErrorCode::Internal, IsolationStage::Wait)
+        );
+        assert_eq!(
+            second.message,
+            "the exec status could not be read; cannot tell whether the command started"
+        );
     }
 
     /// SUP-6・SEC-1・TASK-163.4: 判定の本体は dumpable のときだけ拒否する。

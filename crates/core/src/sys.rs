@@ -34,6 +34,9 @@
 //! 稼働中コンテナへの exec（`exec/exec_command.rs`。SUP-6・TASK-163.4・#503）は、exec 専用 worker を
 //! non-dumpable にし、子を親の生存に結び付けるために `prctl(2)`（`PR_SET_DUMPABLE` / `PR_GET_DUMPABLE` /
 //! `PR_SET_PDEATHSIG`）を呼ぶ。
+//! exec 入口の前提（TASK-163 追補・#1456〜#1460）は、exec 直前の子でセッションを切り離す `setsid(2)`、補助グループを
+//! 空にする `getgroups(2)` / `setgroups(2)`、`/dev/null` とインタープリタを検証済みの `O_PATH` fd から開き直す
+//! `openat(2)`（`O_NOCTTY`）、状態を返す pipe だけを残して fd を閉じる `close_range(2)` を呼ぶ。
 //! さらに `crate::audit_log` のカーネル監査フォールバック（SEC-4・TASK-41.5.2・#840）が、
 //! `socket(2)`（NETLINK_AUDIT）・`sendto(2)`・`recvfrom(2)`・`poll(2)` を呼ぶ。
 //! std だけでは提供されない syscall のみを持ち、検証（hostname の文字種・パス形式等）は呼び出し側の型
@@ -136,6 +139,8 @@ mod consts {
     // include/uapi/asm-generic/fcntl.h の `O_NONBLOCK`（x86_64 は上書きしない）。
     pub const O_NONBLOCK: i32 = 0o4_000;
     pub const O_RDWR: i32 = 2;
+    // include/uapi/asm-generic/fcntl.h の `O_NOCTTY`（x86_64 は上書きしない。TASK-163 追補・#1459）。
+    pub const O_NOCTTY: i32 = 0o400;
     // include/uapi/asm-generic/fcntl.h の `O_RDONLY`・`O_WRONLY`（全アーキテクチャ共通）。
     pub const O_RDONLY: i32 = 0;
     pub const O_WRONLY: i32 = 1;
@@ -230,6 +235,11 @@ mod consts {
     // aarch64 は include/uapi/asm-generic/unistd.h。
     pub const SYS_CAPGET: i64 = 125;
     pub const SYS_CAPSET: i64 = 126;
+    // arch/x86/entry/syscalls/syscall_64.tbl の `getgroups`（115）・`setgroups`（116）。補助グループの
+    // 消去（SUP-6・SEC-1・SEC-5・TASK-163 追補・#1457）。glibc の `setgroups` は全スレッドへ反映する仕組み
+    // （setxid のシグナル配送）を持つため、capability と同じく呼び出しスレッドだけに効く生の syscall を使う。
+    pub const SYS_GETGROUPS: i64 = 115;
+    pub const SYS_SETGROUPS: i64 = 116;
     // 禁止 syscall 遮断の結合試験用プローブ（CORE-5・TASK-38.4・#179）。番号は `crate::seccomp` の
     // テーブルとは独立に、x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h から取る。
     // `PTRACE_CONT`（include/uapi/linux/ptrace.h）は attach を伴わない要求で、`KEXEC_SEGMENT_MAX`
@@ -305,6 +315,9 @@ mod consts {
     // include/uapi/asm-generic/fcntl.h の `O_NONBLOCK`（arm64 も上書きしない）。
     pub const O_NONBLOCK: i32 = 0o4_000;
     pub const O_RDWR: i32 = 2;
+    // include/uapi/asm-generic/fcntl.h の `O_NOCTTY`（arm64 の arch/arm64/include/uapi/asm/fcntl.h は
+    // `O_DIRECTORY`・`O_NOFOLLOW`・`O_DIRECT`・`O_LARGEFILE` だけを上書きし、`O_NOCTTY` は上書きしない）。
+    pub const O_NOCTTY: i32 = 0o400;
     // include/uapi/asm-generic/fcntl.h の `O_RDONLY`・`O_WRONLY`（全アーキテクチャ共通）。
     pub const O_RDONLY: i32 = 0;
     pub const O_WRONLY: i32 = 1;
@@ -400,6 +413,9 @@ mod consts {
     // aarch64 は include/uapi/asm-generic/unistd.h。
     pub const SYS_CAPGET: i64 = 90;
     pub const SYS_CAPSET: i64 = 91;
+    // include/uapi/asm-generic/unistd.h の `getgroups`（158）・`setgroups`（159）。TASK-163 追補・#1457。
+    pub const SYS_GETGROUPS: i64 = 158;
+    pub const SYS_SETGROUPS: i64 = 159;
     // 禁止 syscall 遮断の結合試験用プローブ（CORE-5・TASK-38.4・#179）。番号は `crate::seccomp` の
     // テーブルとは独立に、x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h から取る。
     // `PTRACE_CONT`（include/uapi/linux/ptrace.h）は attach を伴わない要求で、`KEXEC_SEGMENT_MAX`
@@ -463,6 +479,7 @@ mod consts {
     pub const O_PATH: i32 = 0;
     pub const O_NONBLOCK: i32 = 0;
     pub const O_RDWR: i32 = 0;
+    pub const O_NOCTTY: i32 = 0;
     pub const O_RDONLY: i32 = 0;
     pub const O_WRONLY: i32 = 0;
     pub const AT_REMOVEDIR: i32 = 0;
@@ -530,6 +547,8 @@ mod consts {
     // aarch64 は include/uapi/asm-generic/unistd.h。
     pub const SYS_CAPGET: i64 = 0;
     pub const SYS_CAPSET: i64 = 0;
+    pub const SYS_GETGROUPS: i64 = 0;
+    pub const SYS_SETGROUPS: i64 = 0;
     // 禁止 syscall 遮断の結合試験用プローブ（CORE-5・TASK-38.4・#179）。番号は `crate::seccomp` の
     // テーブルとは独立に、x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h から取る。
     // `PTRACE_CONT`（include/uapi/linux/ptrace.h）は attach を伴わない要求で、`KEXEC_SEGMENT_MAX`
@@ -642,6 +661,9 @@ unsafe extern "C" {
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int dup2(int oldfd, int newfd)`。
     fn dup2(oldfd: i32, newfd: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `pid_t setsid(void)`（Linux の `pid_t` は i32。失敗は `(pid_t)-1`）。
+    // libc のラッパーを使い、arch 別の syscall 番号を増やさない（SUP-6・TASK-163 追補・#1456）。
+    fn setsid() -> i32;
     // SAFETY（宣言そのものの妥当性）: `int prctl(int option, ...)`（glibc / musl）。可変長引数として
     // 宣言する（非可変長で宣言して呼ぶと、可変長引数の渡し方が異なる ABI で未定義動作になる）。
     // 可変長部は `unsigned long`（LP64 で u64）なので呼び出し側は u64 で渡す。
@@ -1217,27 +1239,6 @@ fn null_terminated_ptrs(items: &[CString]) -> Vec<*const core::ffi::c_char> {
         .collect()
 }
 
-/// 絶対パス `path` を読み取り専用で開く（`O_RDONLY|O_CLOEXEC|O_NONBLOCK`。最終要素の symlink は辿る）。
-///
-/// エントリポイントの検査と実行を同じ実体に固定するための fd を得る（[`exec_fd`] と組で使う）。
-/// `O_NONBLOCK` は FIFO 等の open が相手待ちでハングするのを避けるため（REPAIR-5）。
-#[cfg_attr(test, allow(dead_code))]
-pub(crate) fn open_file_read(path: &CStr) -> Result<OwnedFd, SysError> {
-    if !consts::SUPPORTED {
-        return Err(SysError::Unsupported);
-    }
-    let flags = consts::O_CLOEXEC | consts::O_NONBLOCK;
-    // SAFETY: `path` は借用した NUL 終端文字列で呼び出しの間生存する。flags に O_CREAT / O_TMPFILE を
-    // 含まないため可変長引数（mode）は渡さず、カーネルも読まない。成功時の戻り値は新規 fd で、
-    // 直後に `OwnedFd` が唯一の所有者となる（二重 close なし）。
-    let fd = unsafe { openat(AT_FDCWD, path.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(last_error());
-    }
-    // SAFETY: `fd` は上で成功した openat が返した、他に所有者のいない有効な fd。
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
 /// `fd` の close-on-exec を `on` に設定する（`fcntl(F_SETFD)`）。
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn set_cloexec(fd: BorrowedFd<'_>, on: bool) -> Result<(), SysError> {
@@ -1270,25 +1271,6 @@ pub(crate) fn dup_fd_at_least(fd: BorrowedFd<'_>, min: i32) -> Result<OwnedFd, S
     }
     // SAFETY: `new` は上で成功した fcntl が返した、他に所有者のいない有効な fd。
     Ok(unsafe { OwnedFd::from_raw_fd(new) })
-}
-
-/// 絶対パス `path` を読み書きで開く（`O_RDWR|O_CLOEXEC|O_NONBLOCK`。最終要素の symlink は辿る）。
-/// 呼び出し側が開いた実体の種別を検証する前提（[`redirect_stdio_to`] と組で使う）。
-#[cfg_attr(test, allow(dead_code))]
-pub(crate) fn open_file_rdwr(path: &CStr) -> Result<OwnedFd, SysError> {
-    if !consts::SUPPORTED {
-        return Err(SysError::Unsupported);
-    }
-    let flags = consts::O_RDWR | consts::O_CLOEXEC | consts::O_NONBLOCK;
-    // SAFETY: `path` は借用した NUL 終端文字列で呼び出しの間生存する。flags に O_CREAT / O_TMPFILE を
-    // 含まないため可変長引数（mode）は渡さない。成功時の戻り値は新規 fd で、直後に `OwnedFd` が
-    // 唯一の所有者となる（二重 close なし）。
-    let fd = unsafe { openat(AT_FDCWD, path.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(last_error());
-    }
-    // SAFETY: `fd` は上で成功した openat が返した、他に所有者のいない有効な fd。
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// fd 0・1・2 を `fd` の実体で置き換える（`dup2`。置換先は close-on-exec が外れる）。呼び出し元が
@@ -1348,27 +1330,33 @@ pub(crate) fn exec_fd(fd: BorrowedFd<'_>, argv: &[CString], envp: &[CString]) ->
     last_error()
 }
 
+/// `close_range(first, last, flags)` を呼ぶ（Linux 5.11 以降。glibc 2.34 未満にラッパーが無いため `syscall(2)` 経由）。
+/// 未対応カーネルは `ENOSYS`/`EINVAL` を返す（呼び出し側が fail-closed にする）。
+fn close_range_raw(first: u32, last: u32, flags: i64) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数のみでポインタを取らない（unsigned int 引数は register 幅に拡張して渡され、カーネルは
+    // 下位 32 bit を読む）。`flags` は 0（閉じる）か `CLOSE_RANGE_CLOEXEC`（閉じずに close-on-exec を立てる）で、
+    // 対象は `first`〜`last` の fd だけ。閉じる場合、呼び出し側（exec 直前の子）はそれらの fd をこの後使わない前提。
+    let rc = unsafe {
+        syscall(
+            consts::SYS_CLOSE_RANGE,
+            i64::from(first),
+            i64::from(last),
+            flags,
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
 /// fd `first` 以上のすべてを close-on-exec にする（`close_range(first, ~0, CLOSE_RANGE_CLOEXEC)`。
 /// Linux 5.11 以降）。exec 後のコンテナへホスト側の fd を漏らさない（CVE-2024-21626 型）。
 /// 未対応カーネルは `ENOSYS`/`EINVAL` を返す（呼び出し側が fail-closed にする）。
 // テストビルドでは dry-run 差し込み点が本関数を呼ばないため dead_code を許可する。
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn mark_fds_cloexec_from(first: u32) -> Result<(), SysError> {
-    if !consts::SUPPORTED {
-        return Err(SysError::Unsupported);
-    }
-    // SAFETY: 引数は整数のみでポインタを取らない（`close_range` は glibc 2.34 未満に無いため
-    // `syscall(2)` 経由。unsigned int 引数は register 幅に拡張して渡され、カーネルは下位 32 bit を
-    // 読む）。CLOEXEC 指定のため fd は閉じず、exec までの間は引き続き使える。
-    let rc = unsafe {
-        syscall(
-            consts::SYS_CLOSE_RANGE,
-            i64::from(first),
-            i64::from(u32::MAX),
-            consts::CLOSE_RANGE_CLOEXEC,
-        )
-    };
-    if rc == -1 { Err(last_error()) } else { Ok(()) }
+    close_range_raw(first, u32::MAX, consts::CLOSE_RANGE_CLOEXEC)
 }
 
 /// fd `first` 以上のすべてを閉じる（`close_range(first, ~0, 0)`。Linux 5.11 以降）。
@@ -1377,21 +1365,29 @@ pub(crate) fn mark_fds_cloexec_from(first: u32) -> Result<(), SysError> {
 /// 未対応カーネルは `ENOSYS`/`EINVAL` を返す（呼び出し側が fail-closed にする）。
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn close_fds_from(first: u32) -> Result<(), SysError> {
-    if !consts::SUPPORTED {
-        return Err(SysError::Unsupported);
-    }
-    // SAFETY: 引数は整数のみでポインタを取らない（`syscall(2)` 経由。unsigned int 引数は register
-    // 幅に拡張して渡され、カーネルは下位 32 bit を読む）。閉じる対象は `first` 以上の fd だけで、
-    // 呼び出し側（exec 直前の子）はそれらの fd をこの後使わない前提。
-    let rc = unsafe {
-        syscall(
-            consts::SYS_CLOSE_RANGE,
-            i64::from(first),
-            i64::from(u32::MAX),
-            0i64,
-        )
+    close_range_raw(first, u32::MAX, 0)
+}
+
+/// fd `first` 以上のうち、`keep` の 1 本だけを残してすべて閉じる（TASK-163 追補・#1460）。
+///
+/// 稼働中コンテナへの exec の子が、`execve` 前の失敗を親へ知らせる pipe の書き込み側（close-on-exec）だけを
+/// 残すために使う。`keep` の番号を動かさず、その前後の範囲を 2 回の `close_range` で閉じる（`dup2` で番号を
+/// 付け替えると、同じ番号を指す別の所有者と衝突し得るため）。`keep` が `first` 未満なら [`close_fds_from`] と同じ。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn close_fds_from_except(first: u32, keep: BorrowedFd<'_>) -> Result<(), SysError> {
+    let Ok(keep) = u32::try_from(keep.as_raw_fd()) else {
+        return Err(SysError::Os(EBADF));
     };
-    if rc == -1 { Err(last_error()) } else { Ok(()) }
+    if keep < first {
+        return close_range_raw(first, u32::MAX, 0);
+    }
+    if keep > first {
+        close_range_raw(first, keep - 1, 0)?;
+    }
+    match keep.checked_add(1) {
+        Some(next) => close_range_raw(next, u32::MAX, 0),
+        None => Ok(()),
+    }
 }
 
 /// [`open_path_nofollow`] が渡す `openat(2)` のフラグ（`O_PATH|O_NOFOLLOW|O_CLOEXEC`）。
@@ -1521,6 +1517,73 @@ pub(crate) fn reopen_pinned_read_nonblock(pinned: BorrowedFd<'_>) -> Result<Owne
     open_follow_at(pinned, &path, consts::O_RDONLY | consts::O_NONBLOCK)
 }
 
+/// procfs の fd エントリ名 `thread-self/fd/<fd>` を、NUL 終端つきで `buf` に組み立てる（アロケーションなし）。
+///
+/// fork 後・`execve` 前の子（`crate::exec` の `/dev/null` の開き直し。TASK-163 追補・#1459）から呼ぶため、
+/// `format!` を使わずスタック上のバッファへ書く。`fd` が負なら `None`。
+fn proc_fd_entry(fd: i32, buf: &mut [u8; 32]) -> Option<&CStr> {
+    const PREFIX: &[u8] = b"thread-self/fd/";
+    let mut value = u32::try_from(fd).ok()?;
+    // 10 進の桁を下位から取り出す（u32 は最大 10 桁）。
+    let mut digits = [0u8; 10];
+    let mut count = 0usize;
+    loop {
+        *digits.get_mut(count)? = b'0'.checked_add(u8::try_from(value % 10).ok()?)?;
+        count += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    let mut len = 0usize;
+    for byte in PREFIX
+        .iter()
+        .chain(digits.get(..count)?.iter().rev())
+        .chain(std::iter::once(&0u8))
+    {
+        *buf.get_mut(len)? = *byte;
+        len += 1;
+    }
+    CStr::from_bytes_with_nul(buf.get(..len)?).ok()
+}
+
+/// 保持中の `O_PATH` fd `pinned` が指す inode を、procfs のディレクトリ fd `proc_dir` 配下の
+/// `thread-self/fd/N`（magic link）経由で `O_RDWR|O_NOCTTY|O_CLOEXEC` に開き直す（TASK-163 追補・#1459）。
+///
+/// パスを再解決せず `pinned` が固定した inode そのものを開くため、呼び出し側が `pinned` への `fstat` で
+/// 確かめた種別・デバイス番号と、開く実体が食い違わない（検査の後に名前を差し替えられても影響しない）。
+/// `O_NOCTTY` は、開いた端末を呼び出しプロセスの制御端末にしないため（検証済みの実体が端末でなくても常に付ける）。
+/// 呼び出し側の前提: `proc_dir` が本物の procfs であること（[`fs_type`] で [`PROC_MAGIC`] と照合済み）と、
+/// `pinned` の種別を確認済みであること。アロケーションを伴わない（fork 後の子から呼べる）。
+pub(crate) fn reopen_pinned_rdwr_noctty(
+    proc_dir: BorrowedFd<'_>,
+    pinned: BorrowedFd<'_>,
+) -> Result<OwnedFd, SysError> {
+    let mut buf = [0u8; 32];
+    let name = proc_fd_entry(pinned.as_raw_fd(), &mut buf).ok_or(SysError::Os(EBADF))?;
+    open_follow_at(proc_dir, name, consts::O_RDWR | consts::O_NOCTTY)
+}
+
+/// 保持中の `O_PATH` fd `pinned` が指す inode を、procfs のディレクトリ fd `proc_dir` 配下の
+/// `thread-self/fd/N`（magic link）経由で `O_RDONLY|O_NONBLOCK|O_NOCTTY|O_CLOEXEC` に開き直す
+/// （TASK-163 追補・#1458）。
+///
+/// `crate::exec` のインタープリタ検査が、ランタイムのバイナリでないことを `O_PATH` の fd で確かめた通常ファイルの
+/// 先頭を読むために使う。[`reopen_pinned_read_nonblock`] と違い `format!` を使わず（fork 後の子から呼ぶ）、
+/// 起点の procfs を呼び出し側が検証して渡す。前提は [`reopen_pinned_rdwr_noctty`] と同じ。
+pub(crate) fn reopen_pinned_read(
+    proc_dir: BorrowedFd<'_>,
+    pinned: BorrowedFd<'_>,
+) -> Result<OwnedFd, SysError> {
+    let mut buf = [0u8; 32];
+    let name = proc_fd_entry(pinned.as_raw_fd(), &mut buf).ok_or(SysError::Os(EBADF))?;
+    open_follow_at(
+        proc_dir,
+        name,
+        consts::O_RDONLY | consts::O_NONBLOCK | consts::O_NOCTTY,
+    )
+}
+
 /// `parent` 配下の既存ファイル `name` を書き込み専用（`O_NOFOLLOW`）で開く。
 /// `cgroup.procs`・`cgroup.subtree_control` への書き込みに使う（CORE-3）。
 pub(crate) fn open_write_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<OwnedFd, SysError> {
@@ -1604,6 +1667,67 @@ pub(crate) fn reset_sigpipe_default() -> Result<(), SysError> {
     } else {
         Ok(())
     }
+}
+
+/// 呼び出しプロセスを新しいセッションのリーダーにし、制御端末から切り離す（`setsid(2)`。
+/// SUP-6・SEC-1・TASK-163 追補・#1456）。戻り値は新しいセッション ID（= 呼び出しプロセスの pid）。
+///
+/// `crate::exec` の exec 直前の子（launch の PID 1・稼働中コンテナへの exec の子）が、呼び出し側の
+/// セッションと制御端末をコンテナ内のコマンドへ引き継がせないために呼ぶ。新しいセッションは制御端末を
+/// 持たないため、以後 `/dev/tty` は `ENXIO` になる（端末を `O_NOCTTY` なしで開けば取得し得るため、
+/// 呼び出し側は以後の open に `O_NOCTTY` を付ける）。呼び出しプロセスがプロセスグループのリーダーだと
+/// `EPERM`（fork 直後の子はリーダーでないため成立しない。失敗時は呼び出し側が fail-closed にする）。
+/// 引数・ポインタを取らず、アロケーション・ロックを伴わない（fork 後の子から呼べる）。
+// テストビルドでは dry-run 差し込み点が本関数を呼ばない（libtest のプロセスのセッションを変えないため）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn new_session() -> Result<u32, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数を取らずポインタも渡さない。効果は呼び出しプロセスのセッション・プロセスグループの
+    // 付け替えのみで、メモリには触れない。戻り値が -1 のときは直後に errno を確保する。
+    let sid = unsafe { setsid() };
+    if sid < 0 {
+        return Err(last_error());
+    }
+    u32::try_from(sid).map_err(|_| SysError::Os(EINVAL))
+}
+
+/// 呼び出しスレッドの補助グループの件数を返す（`getgroups(0, NULL)`。SUP-6・SEC-1・TASK-163 追補・#1457）。
+///
+/// `crate::exec` の capability 削減段が、補助グループを消去する前後に件数を確かめるために使う。サイズ 0 の
+/// 呼び出しはリストを書き込まず件数だけを返すため、バッファを渡さない。
+pub(crate) fn supplementary_group_count() -> Result<usize, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `getgroups(int size, gid_t *list)` に size = 0 と NULL を渡す。size が 0 のときカーネルは `list` を
+    // 参照せず件数だけを返す（getgroups(2)）ため、ポインタは読み書きされない。引数は register 幅の整数として渡す。
+    let count = unsafe { syscall(consts::SYS_GETGROUPS, 0i64, core::ptr::null_mut::<u32>()) };
+    if count < 0 {
+        return Err(last_error());
+    }
+    usize::try_from(count).map_err(|_| SysError::Os(EINVAL))
+}
+
+/// 呼び出しスレッドの補助グループをすべて消去する（`setgroups(0, NULL)`。SUP-6・SEC-1・SEC-5・TASK-163 追補・
+/// #1457）。
+///
+/// 自分の user namespace の `CAP_SETGID` を要し、user namespace が `setgroups` を `deny` にしている場合
+/// （非特権で作った user namespace。`/proc/<pid>/setgroups`）は権限があっても `EPERM` になる。生の syscall のため
+/// 効果は呼び出しスレッドだけに及ぶ（呼び出し側が単一スレッドであることを確かめる）。
+// テストビルドでは capability 削減段が偽のカーネルを使い、本関数を呼ばない（libtest のプロセスの資格情報を
+// 変えないため）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn clear_supplementary_groups() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `setgroups(size_t size, const gid_t *list)` に size = 0 と NULL を渡す。size が 0 のときカーネルは
+    // `list` を読まない（空のグループ集合を設定する）ため、ポインタは参照されない。効果は呼び出しスレッドの
+    // 資格情報（補助グループ）の変更のみで、メモリには触れない。
+    let rc = unsafe { syscall(consts::SYS_SETGROUPS, 0i64, core::ptr::null::<u32>()) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
 /// `signal(2)` の `SIG_DFL`（既定動作）と `SIG_ERR`（失敗）。`sighandler_t` はポインタ幅。
@@ -2448,6 +2572,24 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
+    /// SUP-6・SEC-1・TASK-163 追補（#1457）: `getgroups` / `setgroups` の syscall 番号（x86_64 は
+    /// syscall_64.tbl、aarch64 は asm-generic/unistd.h）と、件数の取得が実プロセスの `Groups:` と一致すること。
+    #[test]
+    fn sup6_task163_group_syscall_numbers_and_count_are_exact() {
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!((consts::SYS_GETGROUPS, consts::SYS_SETGROUPS), (115, 116));
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!((consts::SYS_GETGROUPS, consts::SYS_SETGROUPS), (158, 159));
+        let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+        let groups = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Groups:"))
+            .unwrap()
+            .split_whitespace()
+            .count();
+        assert_eq!(supplementary_group_count(), Ok(groups));
+    }
+
     /// SEC-1・TASK-37.1: capability 関連の定数の具体値。
     #[cfg(target_arch = "x86_64")]
     #[test]
@@ -2657,6 +2799,46 @@ mod tests {
         assert_eq!(
             (EPERM, ENOENT, EACCES, ENOTDIR, EINVAL, ELOOP),
             (1, 2, 13, 20, 22, 40)
+        );
+    }
+
+    /// SUP-6・TASK-163 追補（#1459）: `O_NOCTTY` の値（x86_64・aarch64 とも asm-generic の 0o400）と、
+    /// procfs の fd エントリ名の組み立て（アロケーションなし）の具体値。
+    #[test]
+    fn sup6_task163_noctty_const_and_proc_fd_entry_are_exact() {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        assert_eq!(consts::O_NOCTTY, 0o400);
+        let mut buf = [0u8; 32];
+        assert_eq!(proc_fd_entry(0, &mut buf), Some(c"thread-self/fd/0"));
+        assert_eq!(proc_fd_entry(7, &mut buf), Some(c"thread-self/fd/7"));
+        assert_eq!(proc_fd_entry(1048, &mut buf), Some(c"thread-self/fd/1048"));
+        assert_eq!(
+            proc_fd_entry(i32::MAX, &mut buf),
+            Some(c"thread-self/fd/2147483647")
+        );
+        assert_eq!(proc_fd_entry(-1, &mut buf), None);
+    }
+
+    /// SUP-6・SEC-1・TASK-163 追補（#1459）: 固定した `O_PATH` fd を procfs の magic link 経由で読み書きに
+    /// 開き直すと、パスを再解決せず同じ inode（`/dev/null` = 文字デバイス 1:3）が開く。
+    #[test]
+    fn sup6_task163_reopen_pinned_rdwr_opens_the_pinned_inode() {
+        use std::io::Write as _;
+        use std::os::fd::AsFd as _;
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+        let proc_dir = open_dir_path_nofollow(None, c"/proc").unwrap();
+        let dev = open_dir_path_nofollow(None, c"/dev").unwrap();
+        let pinned = open_path_nofollow(dev.as_fd(), c"null").unwrap();
+        let reopened = reopen_pinned_rdwr_noctty(proc_dir.as_fd(), pinned.as_fd()).unwrap();
+        let mut file = std::fs::File::from(reopened);
+        let meta = file.metadata().unwrap();
+        assert!(meta.file_type().is_char_device());
+        assert_eq!(meta.rdev(), makedev(1, 3));
+        assert_eq!(file.write(b"x").unwrap(), 1);
+        // procfs でないディレクトリを起点にすると、エントリが無く開けない（ENOENT）。
+        assert_eq!(
+            reopen_pinned_rdwr_noctty(dev.as_fd(), pinned.as_fd()).unwrap_err(),
+            SysError::Os(ENOENT)
         );
     }
 

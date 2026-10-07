@@ -1,7 +1,10 @@
+#![cfg(target_os = "linux")]
 //! `--cpus` 相当値から `cpu.max` への変換の結合試験（SUP-13・TASK-170.1・#532）。
 //!
 //! 公開 API（`fandhe_container_core::cgroups`）のみを経由し、変換結果の具体値と拒否ケースを
-//! 照合する。cgroup 実機は不要で既定のテスト集合で動く。変換値を実 cgroup の `set_cpu_max` へ
+//! 照合する。cgroup 実機は不要で既定のテスト集合で動く。
+//! `cgroups` モジュールは `lib.rs` で `cfg(target_os = "linux")` に限定されるため、本試験も Linux 限定とし、
+//! macOS / Windows ではコンパイル対象外（skip）となる（SUP-13・3 OS CI を壊さない）。変換値を実 cgroup の `set_cpu_max` へ
 //! 渡す実機確認は `cgroup_cpu_max.rs`（`#[ignore]`・委譲 cgroup 前提）が担う。
 
 use fandhe_container_core::cgroups::{CpuMax, CpuQuota, NANO_CPUS_PER_CPU};

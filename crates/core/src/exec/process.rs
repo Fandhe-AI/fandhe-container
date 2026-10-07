@@ -69,6 +69,17 @@
 //!   待機が `Err` で戻ってもハンドルは残り、再試行で kill・回収できる
 //! - **exec は絶対パスのみ**: PATH 探索・cwd・OCI `process` からの組み立て・`preserve_fds`・
 //!   `LISTEN_FDS` の受け渡しは TASK-29/30 の範囲
+//! - **環境変数と補助グループ**（SUP-6・SEC-1・SEC-5・TASK-163 追補・#1457）: `execveat` へは [`Entrypoint`] が持つ
+//!   env だけを envp として明示的に渡し、呼び出しプロセスの環境は引き継がない（既定値の補完もしない）。launch は
+//!   `config.json` の `process.env` から [`Entrypoint`] を組み立て、稼働中コンテナへの exec は同じ出所と 1 件ずつの
+//!   明示の上書きだけから作る型（`ExecCommand` / `ContainerEnv`。ホスト環境の列をまとめて渡す式は書けない。
+//!   `exec/container_env.rs`）でしか受け取らない。補助グループは、launch（組み込みの capability 削減段）・exec
+//!   （`reapply_restrictions`）とも同じ関数が空にする（`setgroups(0)`。`exec/capabilities.rs` の
+//!   `SupplementaryGroups`）。本モジュールの子の手順は資格情報を変更しない（uid / gid は呼び出しプロセスのもの）
+//! - **`execve` 前の失敗を親へ知らせる**（REPAIR-3・TASK-163 追補・#1460）: 稼働中コンテナへの exec の子は、
+//!   close-on-exec の pipe で「手順を終えた」「失敗した（終了コードと違反の理由）」を親へ返し、親は
+//!   「コマンドが起動して終了した」のか「起動していない」のかを [`ExecExit`] で区別する（終了コード 125〜127 は
+//!   コマンド自身も返し得るため）。launch 経路は従来どおり終了コードと stderr のみ（下記）
 //!
 //! # 単体テストの安全策
 //!

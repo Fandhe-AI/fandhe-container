@@ -91,6 +91,9 @@ mod linux {
                 "--user",
                 "--map-root-user",
                 "--pid",
+                // `--kill-child` は `--fork` を含意する（util-linux）が、新しい PID namespace の PID 1 は
+                // fork した子であることを引数の上でも明示する。
+                "--fork",
                 "--kill-child",
                 "--mount",
                 "--uts",

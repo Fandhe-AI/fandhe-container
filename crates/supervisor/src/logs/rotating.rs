@@ -25,7 +25,8 @@
 //!   symlink 先への追記を防ぐ。既存エントリは種別を問わず rename / remove（symlink を辿らない）で退避する。
 //! - `dir` が symlink・非ディレクトリなら拒否し、unix では group / other 書き込み可も拒否する。
 //!   経路上の親要素の symlink・`..` 要素も拒否し（unix は root 所有の symlink のみ許容）、検証後は解決済みパスへ固定する。
-//!   新規ファイルは unix で 0600。ファイル名は検証済み [`ContainerId`] と固定接尾辞から `Path::join` で組み立てる。
+//!   新規ファイルは unix で 0600。ファイル名は検証済み [`ContainerId`] を小文字のみへ可逆変換（大文字 `X` → `_x`、`_` → `__`。
+//!   大文字小文字非区別 FS での衝突回避。IO-5）した値と固定接尾辞から `Path::join` で組み立てる。
 //!
 //! # 未実装・制限（REPAIR-3）
 //! - ローテーション境界の欠落・重複防止のバッファリング、フラッシュ / fsync 制御: #507（TASK-164.3）。
@@ -140,6 +141,27 @@ pub struct RotatingFileSink {
     inner: Mutex<Inner>,
 }
 
+/// ID をファイル名用の小文字のみの可逆表現へ変換する（IO-5）。
+///
+/// [`ContainerId`] は大文字小文字だけが異なる ID（`A` と `a`）を別物として許すが、Windows / macOS の
+/// 既定の大文字小文字非区別 FS では同じファイルを指しログが混在・消去される。そのため大文字 `X` は
+/// `_x`、`_` は `__` へ写し、出力を小文字・数字・`.`・`-`・`_` のみにする。`_` が常にエスケープの
+/// 開始なので単射であり、異なる ID は（大文字小文字を無視しても）異なるファイル名になる。
+fn encode_file_stem(id: &str) -> String {
+    let mut out = String::with_capacity(id.len().saturating_mul(2));
+    for c in id.chars() {
+        if c == '_' {
+            out.push_str("__");
+        } else if c.is_ascii_uppercase() {
+            out.push('_');
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn internal(msg: &'static str) -> TraitError {
     TraitError::new(ErrorCode::Internal, msg)
 }
@@ -153,7 +175,7 @@ impl RotatingFileSink {
         let dir = check_dir(dir)?;
         // `<id>.log.<n>` の最長名が NAME_MAX を超えると open / 初回ローテーションが失敗して
         // sink が failed のままになるため、ここで早期に拒否する。
-        let base = format!("{}.log", id.as_str());
+        let base = format!("{}.log", encode_file_stem(id.as_str()));
         let max_suffix = if config.generations > 1 {
             // "." + 最大世代番号の 10 進桁数
             1 + (config.generations - 1).to_string().len()

@@ -416,3 +416,24 @@ fn sup7_task164_2_open_rejects_symlinked_parent_component() {
     // 実体パスなら開ける。
     assert!(RotatingFileSink::open(&sub, &id(), small()).is_ok());
 }
+
+/// 大文字小文字だけが異なる ID でも、ファイル名が小文字のみへ可逆変換され衝突しない（IO-5。
+/// 大文字小文字非区別 FS を想定）。
+#[test]
+fn sup7_task164_2_case_only_different_ids_do_not_collide() {
+    let t = TmpDir::new("case");
+    let upper = ContainerId::new("A").unwrap();
+    let lower = ContainerId::new("a").unwrap();
+    let under = ContainerId::new("_a").unwrap();
+    let sa = RotatingFileSink::open(&t.0, &upper, small()).unwrap();
+    sa.append(StreamKind::Stdout, b"upper").unwrap();
+    let sb = RotatingFileSink::open(&t.0, &lower, small()).unwrap();
+    sb.append(StreamKind::Stdout, b"lower").unwrap();
+    let sc = RotatingFileSink::open(&t.0, &under, small()).unwrap();
+    sc.append(StreamKind::Stdout, b"under").unwrap();
+    // 世代へ退避されたファイルはなく、全ファイル名が小文字のみ。
+    assert_eq!(files(&t.0), ["__a.log", "_a.log", "a.log"]);
+    assert!(fs::read(t.0.join("_a.log")).unwrap().ends_with(b"upper\n"));
+    assert!(fs::read(t.0.join("a.log")).unwrap().ends_with(b"lower\n"));
+    assert!(fs::read(t.0.join("__a.log")).unwrap().ends_with(b"under\n"));
+}

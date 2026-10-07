@@ -41,7 +41,7 @@ use fandhe_container_core::traits::{
 
 use crate::run::{
     MonitorConfig, MonitorEvent, MonitorObserver, MonitorOperation, MonitorOutcome, StopToken,
-    is_running_with_pid, monitor_with_observer, write_with_retry_when,
+    ensure_owner, is_running_with_pid, monitor_with_observer, precondition, write_with_retry_when,
 };
 use crate::state::SupervisedState;
 
@@ -520,8 +520,8 @@ pub enum SuperviseOutcome {
         restarts: u32,
     },
     /// 再 launch には成功したが `Running` の記録に失敗したため、新プロセスを terminate した。
-    /// 停止要求で取り消した再起動（新プロセスは終了確認済み）の記録を `Stopped` へ戻せなかった場合もこれを返す
-    /// （状態は終了済みの pid で `Running` のまま残り得る）。
+    /// 停止要求で取り消した再起動の記録の書き戻し（`Stopped` へ戻す・監視権を返す）に失敗した場合もこれを返す
+    /// （状態は `Running(新 pid)` のまま残り得る。[`supervise_with_restart`] 参照）。
     RestartUnrecorded {
         /// 記録の失敗理由。
         error: TraitError,
@@ -785,13 +785,15 @@ fn relaunch_bounded(
 /// 再 launch の待ちは境界で強制する（[`Relauncher`]）。
 ///
 /// `Running` 記録の直後に停止要求が立っていた場合（最終確認と書き込みの間に届いた停止要求）は、記録が自分の書き込みの
-/// ままであることを読み直して確かめ、新プロセスを terminate する。結果は次のとおり。
-/// - 終了を確認でき、元の終了記録（`Stopped`・元の `restart_count`）へ戻せた: 記録前に届いた場合と同じ
+/// ままであることを条件に監視権（`supervisor_pid` = 自 pid）を取り、他の supervisor を排他してから新プロセスを
+/// terminate する。結果は次のとおり。
+/// - 終了を確認でき、元の終了記録（`Stopped`・元の `restart_count`・監視権なし）へ戻せた: 記録前に届いた場合と同じ
 ///   [`SuperviseOutcome::Stopped`]（`process` は `None`・`restarts` は進まない）。
-/// - 終了を確認できない（terminate の失敗・超過）: 記録は `Running(新 pid)` のまま動かさず、ハンドルを `late` に積んで
-///   [`SuperviseOutcome::Stopped`] を返す（`restarts` は記録済みの 1 回を含む。回収責任は呼び出し側。REPAIR-5）。
-/// - 終了は確認できたが記録を戻せない: [`SuperviseOutcome::RestartUnrecorded`]（`terminate_error` は `None`）。
-/// - 記録が自分の書き込みでない（別の処理が監視権を取った・状態を遷移させた）: terminate せず、記録済みの再起動として
+/// - 終了を確認できない（terminate の失敗・超過）: 記録は `Running(新 pid)` のまま監視権だけ返し、ハンドルを `late` に
+///   積んで [`SuperviseOutcome::Stopped`] を返す（`restarts` は記録済みの 1 回を含む。回収責任は呼び出し側。REPAIR-5）。
+/// - 上記の書き戻し・監視権の返却に失敗した: [`SuperviseOutcome::RestartUnrecorded`]（記録は `Running(新 pid)` のまま
+///   残り得る。terminate も失敗していれば `terminate_error` が `Some` で、ハンドルは `late` にある）。
+/// - 監視権を取れない（別の処理が監視権を取った・状態を遷移させた）: terminate せず、記録済みの再起動として
 ///   次周の `monitor` に委ねる（別の処理が所有し得るプロセスを kill しない。ハンドルは呼び出し側へ返る）。
 ///
 /// この確認より後に届いた停止要求は、次周の `monitor` が「稼働中の停止要求」として扱う。
@@ -953,36 +955,81 @@ pub fn supervise_with_restart(
         match written {
             Ok(_) => {
                 // 最終確認から書き込みまでの間に停止要求が届いていたら、停止後に再起動した状態を残さない（SUP-3）。
-                // 記録が自分の書き込み（`Running(新 pid)`・監視権なし・加算後の回数）のままなら新プロセスを
-                // terminate し、終了を確認できてから元の終了記録へ戻す。別の処理が状態を動かしていれば
-                // terminate せず、次周の `monitor` に委ねる（関数 doc 参照）。
+                // 記録が自分の書き込み（`Running(新 pid)`・監視権なし・加算後の回数）のままなら、まず監視権を取って
+                // 他の supervisor を排他し、新プロセスを terminate し、終了を確認できてから元の終了記録へ戻す。
+                // 監視権を取れなければ別の処理が状態を動かしているので terminate せず、次周の `monitor` に委ねる。
                 let recorded = restart_count.saturating_add(1);
-                let is_own_record = |rec: &StateRecord| {
-                    is_running_with_pid(rec, new_pid)
-                        && rec.supervision().supervisor_pid().is_none()
-                        && rec.restart_count() == recorded
+                let self_pid = NonZeroU32::new(std::process::id());
+                let claimed = match self_pid {
+                    Some(self_pid) if stop.is_stop_requested() => {
+                        let is_unowned = |rec: &StateRecord| {
+                            is_running_with_pid(rec, new_pid)
+                                && rec.supervision().supervisor_pid().is_none()
+                                && rec.restart_count() == recorded
+                        };
+                        write_with_retry_when(state, is_unowned, |rec| {
+                            if !is_unowned(rec) {
+                                return Err(precondition(
+                                    "container state changed before cancelling the restart",
+                                ));
+                            }
+                            Ok((
+                                rec.status().clone(),
+                                SupervisionState::new(Some(self_pid), rec.health(), recorded),
+                            ))
+                        })
+                        .is_ok()
+                        .then_some(self_pid)
+                    }
+                    _ => None,
                 };
-                if stop.is_stop_requested() && state.refresh().is_ok_and(&is_own_record) {
+                if let Some(self_pid) = claimed {
+                    // 以後は自分が監視権を持つ記録（他の supervisor は監視権を取れない）だけを書き換える。
+                    let is_claimed = |rec: &StateRecord| {
+                        is_running_with_pid(rec, new_pid)
+                            && rec.supervision().supervisor_pid() == Some(self_pid)
+                            && rec.restart_count() == recorded
+                    };
                     // 終了を確認できるまで `Running` の記録は動かさない（生存し得るのに `Stopped` と書かない。REPAIR-5）。
                     // 上限を呼び出し境界で強制する。終了未確認のハンドルは `cleanup_late` に積まれる。
-                    if terminate_bounded(
+                    if let Err(terminate_error) = terminate_bounded(
                         new_process,
                         restart_config.terminate_timeout,
                         &cleanup_late,
                         spawn_os_thread,
-                    )
-                    .is_err()
-                    {
-                        // 記録は `Running(新 pid)` のまま残す。再起動 1 回は記録済みとして数える。
-                        observe(None);
-                        return Ok(SuperviseOutcome::Stopped {
-                            last,
-                            process: None,
-                            late: cleanup_late,
-                            restarts: restarts.saturating_add(1),
+                    ) {
+                        // 記録は `Running(新 pid)` のまま、監視をやめるので監視権だけ返す（`monitor` の停止と同じ形）。
+                        let released = write_with_retry_when(state, is_claimed, |rec| {
+                            ensure_owner(rec, self_pid)?;
+                            Ok((
+                                rec.status().clone(),
+                                SupervisionState::new(None, rec.health(), rec.restart_count()),
+                            ))
+                        });
+                        return Ok(match released {
+                            Ok(_) => {
+                                // 再起動 1 回は記録済みとして数える。
+                                observe(None);
+                                SuperviseOutcome::Stopped {
+                                    last,
+                                    process: None,
+                                    late: cleanup_late,
+                                    restarts: restarts.saturating_add(1),
+                                }
+                            }
+                            Err(error) => {
+                                observe(Some(error.code()));
+                                SuperviseOutcome::RestartUnrecorded {
+                                    error,
+                                    terminate_error: Some(terminate_error),
+                                    late: cleanup_late,
+                                    restarts,
+                                }
+                            }
                         });
                     }
-                    let reverted = write_with_retry_when(state, is_own_record, |rec| {
+                    let reverted = write_with_retry_when(state, is_claimed, |rec| {
+                        ensure_owner(rec, self_pid)?;
                         Ok((
                             exited_status.clone(),
                             SupervisionState::new(None, rec.health(), restart_count),

@@ -7,9 +7,12 @@
 //! - 親: `proc/` と `dev/` を持つ rootfs を作る → 分離（root は rootful、非 root は rootless）
 //!   → 自身を `--child <rootfs>` で起動（新しい PID namespace の PID 1）→ タイムアウト付きで終了
 //!   コード 0 を待つ（REPAIR-5）
-//! - 子: `establish` → `prepare_rootfs` → `mount_tmpfs`（`/dev/shm` 64 KiB・`/scratch` 16 KiB 相当）
+//! - 子: `establish` → `prepare_rootfs` → `mount_tmpfs`（`/dev/shm` 64 KiB・`/scratch` 128 KiB）
 //!   → `pivot_root` の後、`/proc/self/mountinfo` で 2 件が fstype `tmpfs`・`nosuid,nodev,noexec`・
-//!   指定サイズ・mode 1777 でマウントされていることを具体値で照合する。rootless でも tmpfs は
+//!   指定サイズでマウントされていること、マウント先の `stat` のモードが 1777 であることを具体値で
+//!   照合する。カーネルは既定値と同じ `mode=1777` を mountinfo に表示しないため（`shmem_show_options`）、
+//!   モードは `stat` で確かめる。サイズはページ単位へ切り上げて表示されるため、4K / 16K / 64K ページの
+//!   いずれでも表示が変わらない 64 KiB の倍数を使う。rootless でも tmpfs は
 //!   user namespace 内で作れるため両経路とも成功を要求する（`create_default_devices` には依存しない）
 //!
 //! # 実機前提テストとしての分離
@@ -37,6 +40,7 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -179,7 +183,7 @@ mod linux {
         let prepared = prepare_rootfs(&isolation, rootfs).expect("prepare rootfs");
         let mut set = TmpfsMountSet::new();
         let shm = TmpfsSize::from_bytes(64 * 1024).expect("shm size");
-        let scratch = TmpfsSize::from_bytes(16 * 1024).expect("scratch size");
+        let scratch = TmpfsSize::from_bytes(128 * 1024).expect("scratch size");
         set.push(TmpfsMountSpec::dev_shm(shm).expect("shm spec"))
             .expect("push shm");
         set.push(TmpfsMountSpec::new("/scratch", Some(scratch)).expect("scratch spec"))
@@ -189,12 +193,12 @@ mod linux {
         assert_eq!(report.mounts[0].destination, "/dev/shm");
         assert_eq!(report.mounts[0].size, Some(65536));
         assert_eq!(report.mounts[1].destination, "/scratch");
-        assert_eq!(report.mounts[1].size, Some(16384));
+        assert_eq!(report.mounts[1].size, Some(131_072));
 
         pivot_root(&isolation, prepared).expect("pivot_root");
 
         let info = std::fs::read_to_string("/proc/self/mountinfo").expect("mountinfo");
-        for (point, size) in [("/dev/shm", "size=64k"), ("/scratch", "size=16k")] {
+        for (point, size) in [("/dev/shm", "size=64k"), ("/scratch", "size=128k")] {
             let (_, opts, fstype, sup) = info
                 .lines()
                 .filter_map(parse_line)
@@ -207,7 +211,13 @@ mod linux {
             }
             let sup: Vec<&str> = sup.split(',').collect();
             assert!(sup.contains(&size), "{point} must have {size}: {sup:?}");
-            assert!(sup.contains(&"mode=1777"), "{point} mode: {sup:?}");
+            // 既定値 1777 は mountinfo に出ないため、マウント先そのもののモードで照合する。
+            let mode = std::fs::metadata(point)
+                .unwrap_or_else(|e| panic!("stat {point}: {e}"))
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, 0o1777, "{point} mode");
         }
     }
 }

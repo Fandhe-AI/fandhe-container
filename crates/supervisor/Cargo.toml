@@ -6,6 +6,7 @@
 # crate-naming.md 決定 6）を導入した。状態のファイルベース実装は core に一本化し、supervisor は配線のみを持つ。
 # TASK-157.7（#241）で logs 捕捉の土台（src/logs.rs）を追加した（std のみ。依存は不変）。
 # TASK-168.1（#523）で inspect 出力（src/inspect.rs）を追加した（std のみ。依存は不変）。
+# TASK-168.2（#524）で inspect 出力の型・キー順・値域の照合テストを追加した（依存は不変）。
 # TASK-164.1（#505）で行単位捕捉のバッファ境界跨ぎの照合テストを追加した（依存は不変）。
 # TASK-164.2（#506）でローテーション sink（src/logs/rotating.rs）を追加した（std のみ。依存は不変）。
 # TASK-169.1（#526）で container_options（ulimit の指定モデル。core の rlimits 型へ変換）を追加した（依存は不変）。

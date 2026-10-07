@@ -104,29 +104,96 @@ impl fmt::Display for IoErrorCode {
     }
 }
 
+/// [`IoError`] が保持する `message` の最大バイト数（UTF-8 バイト単位。#1116・
+/// ERR-1・IO-1・REPAIR-4）。
+///
+/// 相手由来の値や OS のエラー文字列を含むメッセージが、ログ・エラー応答へ無制限に
+/// 流れることを防ぐ（security.md「不安全な設計」観点）。値を 1024 とした根拠:
+/// - 大文字小文字衝突のメッセージ（`fs_normalize`）が約 615 バイトになるため、
+///   正当なメッセージを削らない余裕が要る
+/// - 観測ログ側の [`crate::MAX_SEND_LOG_MESSAGE_BYTES`]（512）より大きく保つことで、
+///   本上限で切られたメッセージは観測ログでも必ず `message_truncated: true` になる
+///   （`observe.rs` の `const` アサートで固定する）
+pub const MAX_IO_ERROR_MESSAGE_BYTES: usize = 1024;
+
+/// `message` を `max_bytes` バイト以内へ UTF-8 の文字境界で切り詰める。
+///
+/// 戻り値は `(切り詰め後の文字列, 切り詰めが発生したか)`。外部入力起点の文字列を
+/// 添字アクセスせず `get` で切り出す。[`IoError::new`] と
+/// `observe::truncate_message_bytes` から呼ばれる。
+pub(crate) fn truncate_str_to_bytes(message: &str, max_bytes: usize) -> (&str, bool) {
+    let end = truncation_end(message, max_bytes);
+    if end == message.len() {
+        return (message, false);
+    }
+    (message.get(..end).unwrap_or(""), true)
+}
+
+/// `max_bytes` 以下で最大の文字境界のバイト位置を返す（`message.len()` 以下）。
+fn truncation_end(message: &str, max_bytes: usize) -> usize {
+    if message.len() <= max_bytes {
+        return message.len();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 /// `transport` の送受信トレイトが返す構造化エラー（ERR-1: 機械可読な `code` /
 /// 人間可読な `message`）。
 ///
 /// # 契約
 /// - `message` にペイロード内容・レジストリ資格情報等の秘密情報を含めない
 ///   （security.md）。
-/// - 相手側（untrusted なトランスポートの先）由来の文字列を `message` に載せる場合、
-///   その長さの上限検証は受信実装（TASK-12・TASK-13）の責務であり、本型はそれを
-///   前提とせず任意長の `String` をそのまま保持する。
+/// - `message` は常に [`MAX_IO_ERROR_MESSAGE_BYTES`] バイト以下で、[`IoError::new`] が
+///   超過分を UTF-8 の文字境界で切り捨てる（#1116）。保持・[`fmt::Display`]・
+///   [`fmt::Debug`]・上位 crate への伝播のすべてがこの上限で有界になる。切り捨ての
+///   有無は [`IoError::message_truncated`] で分かる。切り捨てには `...` 等の印を足さない。
+/// - 上限は保持量の境界であり、呼び出し元が `new` へ渡す前に巨大な `String` を作る
+///   こと自体は防げない（相手由来の長さの検証は受信実装の責務）。
+/// - 制御文字のエスケープは本型では行わない（出力側の責務）。
+/// - `PartialEq` は切り捨てフラグも比較する（切り捨てた結果と、同じ内容を最初から
+///   渡したものは不一致になる）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct IoError {
     code: IoErrorCode,
     message: String,
+    message_truncated: bool,
 }
 
 impl IoError {
     /// エラーコードとメッセージから構造化エラーを作る。
+    ///
+    /// `message` が [`MAX_IO_ERROR_MESSAGE_BYTES`] を超える場合は文字境界で切り捨てる。
+    /// 切り捨ての有無にかかわらず、capacity が上限を超えている場合は余剰容量を解放する
+    /// （`message_truncated` は内容の切り捨てだけを表す）。
     pub fn new(code: IoErrorCode, message: impl Into<String>) -> Self {
+        let mut message: String = message.into();
+        let end = truncation_end(&message, MAX_IO_ERROR_MESSAGE_BYTES);
+        let message_truncated = end < message.len();
+        if message_truncated {
+            message.truncate(end);
+        }
+        // 切り捨ての有無とは独立に、必要長に対して過大な capacity は解放する
+        // （受信バッファを短縮して渡された場合などに巨大な確保を保持し続けない）。
+        // 通常の `format!` 由来の小さな余剰（上限以下）では再確保しない。
+        if message.capacity() > MAX_IO_ERROR_MESSAGE_BYTES {
+            message.shrink_to_fit();
+        }
         Self {
             code,
-            message: message.into(),
+            message,
+            message_truncated,
         }
+    }
+
+    /// `new` に渡されたメッセージが [`MAX_IO_ERROR_MESSAGE_BYTES`] を超え、切り捨てられた
+    /// かを返す。
+    pub fn message_truncated(&self) -> bool {
+        self.message_truncated
     }
 
     /// 機械可読なエラーコードを返す。
@@ -175,5 +242,85 @@ mod tests {
         assert_eq!(err.to_string(), "TIMEOUT: ack not received within timeout");
         assert_eq!(err.code(), IoErrorCode::Timeout);
         assert_eq!(err.message(), "ack not received within timeout");
+    }
+
+    /// ERR-1・IO-1（#1116）: 上限ちょうどは切り捨てず、1 バイト超は上限まで切る。
+    #[test]
+    fn err1_message_limit_boundaries() {
+        let exact = IoError::new(IoErrorCode::Timeout, "a".repeat(1024));
+        assert_eq!(exact.message().len(), 1024);
+        assert!(!exact.message_truncated());
+
+        let over = IoError::new(IoErrorCode::Timeout, "a".repeat(1025));
+        assert_eq!(over.message(), "a".repeat(1024));
+        assert!(over.message_truncated());
+    }
+
+    /// ERR-1・REPAIR-4（#1116）: 巨大入力でも Display / Debug が有界になる。
+    #[test]
+    fn err1_huge_message_is_bounded_in_display_and_debug() {
+        let err = IoError::new(IoErrorCode::Timeout, "a".repeat(1024 * 1024));
+        assert_eq!(err.message().len(), 1024);
+        assert!(err.message_truncated());
+        assert_eq!(err.to_string().len(), "TIMEOUT: ".len() + 1024);
+        let debug = format!("{err:?}");
+        assert!(!debug.contains(&"a".repeat(1025)));
+        assert!(debug.contains("message_truncated: true"));
+    }
+
+    /// ERR-1（#1116）: マルチバイト文字の途中では文字の手前で切る。
+    #[test]
+    fn err1_message_limit_respects_char_boundaries() {
+        let three = IoError::new(IoErrorCode::Internal, format!("{}あ", "a".repeat(1023)));
+        assert_eq!(three.message().len(), 1023);
+        assert!(three.message_truncated());
+
+        let four = IoError::new(
+            IoErrorCode::Internal,
+            format!("{}\u{1F600}", "a".repeat(1022)),
+        );
+        assert_eq!(four.message().len(), 1022);
+        assert!(four.message_truncated());
+
+        let fits = IoError::new(IoErrorCode::Internal, format!("{}あ", "a".repeat(1021)));
+        assert_eq!(fits.message().len(), 1024);
+        assert!(!fits.message_truncated());
+
+        let only = IoError::new(IoErrorCode::Internal, "あ".repeat(400));
+        assert_eq!(only.message().len(), 1023);
+        assert_eq!(only.message().chars().count(), 341);
+        assert!(only.message_truncated());
+    }
+
+    /// ERR-1（#1116）: 空文字列と短文は不変。
+    #[test]
+    fn err1_short_and_empty_messages_are_unchanged() {
+        let empty = IoError::new(IoErrorCode::Internal, "");
+        assert_eq!(empty.message(), "");
+        assert!(!empty.message_truncated());
+        let short = IoError::new(IoErrorCode::Internal, "short");
+        assert_eq!(short.message(), "short");
+        assert!(!short.message_truncated());
+    }
+
+    /// ERR-1（#1116）: 短文でも過大な capacity は解放される。
+    #[test]
+    fn err1_short_message_releases_excess_capacity() {
+        let mut big = String::with_capacity(1024 * 1024);
+        big.push_str("short");
+        let err = IoError::new(IoErrorCode::Internal, big);
+        assert_eq!(err.message(), "short");
+        assert!(!err.message_truncated());
+        assert!(err.message.capacity() <= MAX_IO_ERROR_MESSAGE_BYTES);
+    }
+
+    /// ERR-1（#1116）: ヘルパー単体の具体値。
+    #[test]
+    fn err1_truncate_str_to_bytes_concrete_values() {
+        assert_eq!(truncate_str_to_bytes("abc", 0), ("", true));
+        assert_eq!(truncate_str_to_bytes("abc", 1), ("a", true));
+        assert_eq!(truncate_str_to_bytes("abc", 3), ("abc", false));
+        assert_eq!(truncate_str_to_bytes("あい", 4), ("あ", true));
+        assert_eq!(truncate_str_to_bytes("あ", 2), ("", true));
     }
 }

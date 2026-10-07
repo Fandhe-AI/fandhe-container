@@ -12,6 +12,8 @@
 //! - cgroup: `/proc/<pid>/cgroup` がコンテナ用 cgroup（`<scope>/fc-<id>@<instance>`）の絶対パスと完全一致し、
 //!   joiner が元いた cgroup と異なる
 //! - namespace: `NSpid` が入れ子で、`ns/{mnt,uts,ipc,net,pid}` が pid1 と一致（pid は参加後に fork した子の値）
+//! - セッション（TASK-163 追補・#1456）: コマンドが新しいセッションのリーダーで、制御端末を持たず、joiner の
+//!   セッションに残らない
 //!
 //! 条件 3・4 の拒否経路（#502 が #503 へ残した条件。`exec/reapply.rs` のモジュール doc）も照合する:
 //! pivot していない pid1（`/` が記録した rootfs でない）の拒否（コマンドが起動しない）と、同じ rootfs を共有する
@@ -577,6 +579,16 @@ mod linux {
             .collect()
     }
 
+    /// `pid` の `(セッション ID, tty_nr)`（`/proc/<pid>/stat`。`comm` は括弧を含み得るため最後の `)` より後ろを読む）。
+    fn session_and_tty(pid: u32) -> (u32, i64) {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).expect("read stat");
+        let rest = &stat[stat.rfind(')').expect("comm terminator") + 1..];
+        let mut fields = rest.split_whitespace().skip(3);
+        let session = fields.next().expect("session").parse().expect("session");
+        let tty_nr = fields.next().expect("tty_nr").parse().expect("tty_nr");
+        (session, tty_nr)
+    }
+
     /// `pid` の直接の子（`/proc/<pid>/task/<pid>/children`）。
     fn children_of(pid: u32) -> Vec<u32> {
         fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
@@ -686,6 +698,12 @@ mod linux {
             Some(pid.to_string().as_str()),
             "{ctx}"
         );
+        // TASK-163 追補（#1456）: コマンドは新しいセッションのリーダーで、制御端末を持たず、joiner のセッションに
+        // 残らない（host 側の pid 番号で照合する）。
+        let (session, tty_nr) = session_and_tty(pid);
+        assert_eq!(session, pid, "the command must lead its session; {ctx}");
+        assert_eq!(tty_nr, 0, "the command must have no controlling tty; {ctx}");
+        assert_ne!(session, session_and_tty(jpid).0, "{ctx}");
         // namespace は pid1 と一致する（pid は参加後に fork した子の値）。
         for ns in ["mnt", "uts", "ipc", "net", "pid"] {
             assert_eq!(

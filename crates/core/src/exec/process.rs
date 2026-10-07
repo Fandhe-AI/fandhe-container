@@ -32,6 +32,12 @@
 //! - **継承 fd は開く前に閉じる**: エントリポイントを開く前に fd 3 以上をすべて閉じ、fd 0〜2 と同一の
 //!   実体（rootfs 内の `/proc/self/fd/N` 経由）は拒否する（fd 0〜2 の実体を確認できなければ拒否）。
 //!   継承したホスト fd の実体を開く経路を断つ
+//! - **セッションと制御端末を切り離す**（SUP-6・SEC-1・TASK-163 追補・#1456）: 子は継承 fd を閉じた直後に
+//!   `setsid` で新しいセッションのリーダーになり、呼び出し側のセッション・制御端末を引き継がない（端末から
+//!   起動された場合に、コンテナ内のコマンドが `/dev/tty` 経由でホスト側の端末へ読み書き・`ioctl` できない）。
+//!   失敗したら `execve` へ進まない。launch 経路の子（新しい PID namespace の PID 1）と稼働中コンテナへの exec の子の
+//!   両方に掛かる（`exec_checked_entrypoint` を共有する。変更前はどちらも `setsid` していなかった）。実プロセスでの
+//!   照合は `tests/exec_child_setup.rs`（既定のテスト集合）
 //! - **標準入出力は `/dev/null` へ置換する**: 呼び出し元の fd 0〜2 の実体は渡さない。`/dev/null` が
 //!   無い rootfs は拒否する。端末・パイプの受け渡しは TASK-29/30 の範囲
 //! - **エントリポイントは fd に固定して `execveat` する**: 検査（`/proc/self/exe` との同一性）と実行の
@@ -289,7 +295,8 @@ pub fn exec_entrypoint(
 /// dry-run（単体テストは証跡を偽造せずに直接呼ぶ）。手順（順序固定）:
 ///
 /// 1. `/` のマウント ID が pivot 直後の新 root と一致する（pivot 後に root が入れ替わっていない）
-/// 2. fd 3 以上をすべて閉じ（継承 fd の実体を `/proc/self/fd/N` 経由で開かれない）、エントリポイントを新 root 内で `open` し、その fd を `fstat` する（不在なら `NotFound`）。`/proc/self/exe`
+/// 2. fd 3 以上をすべて閉じ（継承 fd の実体を `/proc/self/fd/N` 経由で開かれない）、`setsid` で呼び出し側の
+///    セッション・制御端末を切り離し（#1456。以後に開くファイルを制御端末にしない順序）、エントリポイントを新 root 内で `open` し、その fd を `fstat` する（不在なら `NotFound`）。`/proc/self/exe`
 ///    （ランタイム自身のホスト側バイナリ）と `(st_dev, st_ino)` が同じなら拒否する
 ///    （CVE-2019-5736 型の多層防御。検査した fd をそのまま `execveat(AT_EMPTY_PATH)` で実行し、
 ///    検査から実行までの間のパス差し替え〔TOCTOU〕を防ぐ。memfd による自己複製は後続の課題）
@@ -324,9 +331,25 @@ fn exec_entrypoint_verified(
 /// （`exec_command::spawn_exec_command` の子。参加後の `/` の照合は `reapply_restrictions` が済ませている。
 /// SUP-6・TASK-163.4）が共有する。呼び出し元は「`/` が正しい root であること」を事前に保証すること。
 pub(super) fn exec_checked_entrypoint(entry: &Entrypoint) -> Result<Infallible, ExecError> {
+    let file = prepare_exec_child(entry)?;
+    let err = do_execve(entry, &file);
+    Err(ExecError::new(
+        exec_errno_to_code(err),
+        IsolationStage::Exec,
+        format!("execve({:?}) failed: {}", entry.path(), describe(err)),
+    ))
+}
+
+/// [`exec_checked_entrypoint`] の `execveat` より前の全手順。戻り値は検査済みで実行に使う fd。
+///
+/// 手順を 1 か所に置くことで、本番の子（直後に `execveat`）と、結合試験用の観測
+/// （`observe_exec_child_setup`。`execveat` の代わりに子自身の状態を報告する）が同じ処理を通る。
+fn prepare_exec_child(entry: &Entrypoint) -> Result<std::fs::File, ExecError> {
     const STAGE: IsolationStage = IsolationStage::Exec;
     // 継承したホスト側の fd 3 以上を開く前に閉じる（rootfs 内の /proc/self/fd/N 経由で実体を開かれない）。
     close_inherited_fds()?;
+    // 呼び出し側のセッション・制御端末を切り離す（以後に開くファイルを制御端末にしない順序。#1456）。
+    detach_session()?;
     // 検査と実行を同じ fd に固定する（パスを再解決する execve では、検査後に差し替えられうる）。
     let file = open_entrypoint(entry)?;
     let meta = file.metadata().map_err(|e| io_exec_error(&e, entry))?;
@@ -372,12 +395,7 @@ pub(super) fn exec_checked_entrypoint(entry: &Entrypoint) -> Result<Infallible, 
     }
     // 最後に標準入出力を置換する（以降の execve 失敗の診断は stderr へ出せず、終了コードのみで通知）。
     redirect_stdio_to_null()?;
-    let err = do_execve(entry, &file);
-    Err(ExecError::new(
-        exec_errno_to_code(err),
-        STAGE,
-        format!("execve({:?}) failed: {}", entry.path(), describe(err)),
-    ))
+    Ok(file)
 }
 
 /// シェバン付きスクリプトを `execveat(AT_EMPTY_PATH)` で実行するときの前提を確認する。
@@ -426,6 +444,28 @@ fn close_inherited_fds() -> Result<(), ExecError> {
 #[cfg(test)]
 fn close_inherited_fds() -> Result<(), ExecError> {
     tests::record("close_range(3,close)".to_string());
+    Ok(())
+}
+
+/// 新しいセッションを作り、呼び出し側のセッションと制御端末から切り離す（SUP-6・SEC-1・TASK-163 追補・#1456）。
+/// 本番ビルドの実装。
+///
+/// `setsid` をしないと、コンテナ内のコマンドは呼び出し側（端末から起動した CLI 等）のセッションに残り、
+/// `/dev/tty` 経由でホスト側の端末を読み書き・`ioctl`（`TIOCSTI` による入力の注入等）できる。Landlock の
+/// ルールで塞がる場合もあるが、それに依存しない。fork 後の子でしか意味を持たないため子で呼ぶ（syscall 1 回。
+/// アロケーション・ロックなし）。失敗は段 `Spawn`（終了コード [`EXIT_SETUP_FAILED`]）で、`execve` へ進まない
+/// （fail-closed）。launch 経路の子（新しい PID namespace の PID 1）と exec の子が同じ扱いになる。
+#[cfg(not(test))]
+fn detach_session() -> Result<(), ExecError> {
+    sys::new_session()
+        .map(drop)
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "setsid"))
+}
+
+/// テストビルドの dry-run 差し込み点（libtest のプロセスのセッションは変えない）。呼ばれたことだけを記録する。
+#[cfg(test)]
+fn detach_session() -> Result<(), ExecError> {
+    tests::record("setsid".to_string());
     Ok(())
 }
 
@@ -623,6 +663,166 @@ pub(super) fn exec_child_main(entry: &Entrypoint) -> i32 {
             exit_code_for(&err)
         }
     }
+}
+
+/// [`observe_exec_child_setup`] の観測結果（結合試験専用。SUP-6・SEC-1・TASK-163 追補・#1456）。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExecChildSetupObservation {
+    /// 子の終了状態。`execveat` 前の手順が通れば `Exited(0)`、拒否されれば 125 / 126 / 127。
+    pub exit: ChildExit,
+    /// 手順が通った子が、`execveat` の直前の自分の状態を書いた報告。拒否された場合は `None`。
+    pub report: Option<ExecChildSetupReport>,
+}
+
+/// `execveat` の直前の子の状態（結合試験専用）。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExecChildSetupReport {
+    /// 子の pid。
+    pub pid: u32,
+    /// 子のセッション ID（`/proc/self/stat` の `session`）。`setsid` 後は `pid` と一致する。
+    pub session_id: u32,
+    /// 子のプロセスグループ ID（`pgrp`）。`setsid` 後は `pid` と一致する。
+    pub process_group: u32,
+    /// 子の制御端末のデバイス番号（`tty_nr`）。制御端末なしは 0。
+    pub tty_nr: i64,
+    /// `/dev/tty` を開いた結果の errno（制御端末なしは `ENXIO` = 6。開けた場合は `None`）。
+    pub dev_tty_errno: Option<i32>,
+    /// fd 0〜2 の実体の `(文字デバイスか, st_rdev)`。`/dev/null` は `(true, makedev(1, 3))`。
+    pub stdio: [(bool, u64); 3],
+    /// `execveat` に渡す環境変数（`KEY=VALUE`。[`Entrypoint`] が持つ値そのもの）。
+    pub env: Vec<String>,
+}
+
+/// 結合試験専用: exec の子の `execveat` より前の全手順を実プロセスで通し、`execveat` の代わりに子自身の状態を
+/// 報告させる（SUP-6・SEC-1・TASK-163 追補・#1456）。
+///
+/// 呼び出し文脈は `tests/exec_child_setup.rs`（単一スレッドの `main`。root・実コンテナ不要で、既定のテスト集合で
+/// 動く）。本番の子（`exec_checked_entrypoint`）と同じ `prepare_exec_child` を fork した子で実行するため、
+/// `setsid`・fd の後始末・エントリポイントの検査・`/dev/null` の検証と置換が、dry-run ではなく実 syscall で走る。
+///
+/// - **`execveat` は呼ばない**。エントリポイントは開いて検査するだけで実行しない。したがって制限適用の証跡
+///   （`ExecReady`・`require_restriction_evidence`）を迂回してコマンドを実行する経路にはならない（SEC-1）。
+///   namespace への参加・制限の適用も行わず、呼び出しプロセス自身の namespace と `/` に対して手順を通す
+/// - 子は手順が通れば `report`（呼び出し側が用意した、存在しないパス）へ状態を `create_new` で書いて 0 で終わる。
+///   拒否された場合は本番と同じ規約（stderr の英語 1 行と終了コード 125 / 126 / 127）で終わり、報告は無い
+/// - 呼び出し元は単一スレッドであること（満たさなければ fork せず `FailedPrecondition`）。`timeout` を過ぎたら子を
+///   `SIGKILL` して回収し `Timeout`（REPAIR-5）
+/// - `exec-test-support` feature を付けたビルドにだけ存在し、既定のビルドの公開 API には含まれない
+#[cfg(all(feature = "exec-test-support", not(test)))]
+#[doc(hidden)]
+pub fn observe_exec_child_setup(
+    entry: &Entrypoint,
+    report: &Path,
+    timeout: Duration,
+) -> Result<ExecChildSetupObservation, ExecError> {
+    let pid = sys::fork_single_threaded(
+        || match prepare_exec_child(entry).and_then(|_file| write_setup_report(entry, report)) {
+            Ok(()) => 0,
+            Err(err) => {
+                let _ = writeln!(std::io::stderr(), "fandhe-container: {err}");
+                exit_code_for(&err)
+            }
+        },
+        EXIT_SETUP_FAILED,
+    )
+    .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
+    let exit = ContainerChild::new(pid).wait_timeout(timeout)?;
+    let report = match std::fs::read_to_string(report) {
+        Ok(text) => Some(parse_setup_report(&text).ok_or_else(|| {
+            ExecError::new(
+                ErrorCode::Internal,
+                IsolationStage::Wait,
+                "the exec child wrote a malformed setup report",
+            )
+        })?),
+        Err(_) => None,
+    };
+    Ok(ExecChildSetupObservation { exit, report })
+}
+
+/// 観測の子: `execveat` の直前の自分の状態を `report` へ 1 行ずつ書く（[`observe_exec_child_setup`] 専用）。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+fn write_setup_report(entry: &Entrypoint, report: &Path) -> Result<(), ExecError> {
+    use std::os::unix::fs::FileTypeExt as _;
+    let fail = |what: &str| ExecError::new(ErrorCode::Internal, IsolationStage::Exec, what);
+    let stat = std::fs::read_to_string("/proc/self/stat").map_err(|_| fail("read own stat"))?;
+    // `comm` は括弧・空白を含み得るため、最後の `)` より後ろを読む（state ppid pgrp session tty_nr ...）。
+    let rest = stat
+        .rfind(')')
+        .and_then(|i| stat.get(i + 1..))
+        .ok_or_else(|| fail("parse own stat"))?;
+    let mut fields = rest.split_whitespace().skip(2);
+    let mut next = || fields.next().ok_or_else(|| fail("own stat is too short"));
+    let (pgrp, session, tty_nr) = (next()?, next()?, next()?);
+    let dev_tty = match std::fs::File::open("/dev/tty") {
+        Ok(_) => "open".to_owned(),
+        Err(e) => e.raw_os_error().unwrap_or(-1).to_string(),
+    };
+    let mut text = format!(
+        "pid={}\nsession={session}\npgrp={pgrp}\ntty_nr={tty_nr}\ndev_tty={dev_tty}\n",
+        std::process::id()
+    );
+    let (stdin, stdout, stderr) = (std::io::stdin(), std::io::stdout(), std::io::stderr());
+    for fd in [stdin.as_fd(), stdout.as_fd(), stderr.as_fd()] {
+        let meta = fd
+            .try_clone_to_owned()
+            .and_then(|owned| std::fs::File::from(owned).metadata())
+            .map_err(|_| fail("stat a standard stream"))?;
+        text.push_str(&format!(
+            "stdio={} {}\n",
+            u8::from(meta.file_type().is_char_device()),
+            meta.rdev()
+        ));
+    }
+    for var in &entry.env {
+        text.push_str(&format!("env={}\n", var.to_string_lossy()));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(report)
+        .map_err(|_| fail("create the setup report"))?;
+    file.write_all(text.as_bytes())
+        .map_err(|_| fail("write the setup report"))
+}
+
+/// [`write_setup_report`] の逆変換。形式に合わなければ `None`（呼び出し側が失敗にする）。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+fn parse_setup_report(text: &str) -> Option<ExecChildSetupReport> {
+    let single = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+    };
+    let stdio: Vec<(bool, u64)> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("stdio="))
+        .map(|v| {
+            let (kind, rdev) = v.split_once(' ')?;
+            Some((kind == "1", rdev.parse().ok()?))
+        })
+        .collect::<Option<_>>()?;
+    Some(ExecChildSetupReport {
+        pid: single("pid")?.parse().ok()?,
+        session_id: single("session")?.parse().ok()?,
+        process_group: single("pgrp")?.parse().ok()?,
+        tty_nr: single("tty_nr")?.parse().ok()?,
+        dev_tty_errno: match single("dev_tty")? {
+            "open" => None,
+            errno => Some(errno.parse().ok()?),
+        },
+        stdio: stdio.try_into().ok()?,
+        env: text
+            .lines()
+            .filter_map(|l| l.strip_prefix("env="))
+            .map(str::to_owned)
+            .collect(),
+    })
 }
 
 /// 子のメイン。`establish` → `prepare_rootfs` → `pivot_root` → `exec_entrypoint` を通し、失敗したら
@@ -1557,6 +1757,7 @@ mod tests {
             calls,
             vec![
                 "close_range(3,close)".to_string(),
+                "setsid".to_string(),
                 "close_range(3)".to_string(),
                 "signal(SIGPIPE,SIG_DFL)".to_string(),
                 "stdio->/dev/null".to_string(),
@@ -1594,7 +1795,7 @@ mod tests {
             assert_eq!(v.behavior_id, "CORE-1");
             assert_eq!(
                 take_calls(),
-                vec!["close_range(3,close)".to_string()],
+                vec!["close_range(3,close)".to_string(), "setsid".to_string()],
                 "{path:?}"
             );
         }
@@ -1609,7 +1810,10 @@ mod tests {
         assert_eq!(err.code, ErrorCode::NotFound);
         assert_eq!(err.stage, IsolationStage::Exec);
         assert_eq!(exit_code_for(&err), EXIT_EXEC_NOT_FOUND);
-        assert_eq!(take_calls(), vec!["close_range(3,close)".to_string()]);
+        assert_eq!(
+            take_calls(),
+            vec!["close_range(3,close)".to_string(), "setsid".to_string()]
+        );
     }
 
     /// `sh -c script` を起動してその pid を返す。std の `Child` は wait せず、回収は被試験対象の

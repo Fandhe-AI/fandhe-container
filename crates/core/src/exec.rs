@@ -132,6 +132,10 @@ pub use process::{
     EXIT_EXEC_NOT_FOUND, EXIT_SETUP_FAILED, Entrypoint, SignalDelivery, exec_entrypoint,
     spawn_container, spawn_container_with_stages,
 };
+/// 結合試験 `tests/exec_child_setup.rs` 専用の再公開（SUP-6・TASK-163 追補・#1456。通常の利用者は呼ばない。詳細は定義側）。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+#[doc(hidden)]
+pub use process::{ExecChildSetupObservation, ExecChildSetupReport, observe_exec_child_setup};
 pub use reapply::{
     ExecReady, ExecRestrictionReport, ExecRestrictions, UnappliedExecRestriction,
     prepare_exec_restrictions, reapply_restrictions,

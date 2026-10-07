@@ -642,6 +642,9 @@ unsafe extern "C" {
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int dup2(int oldfd, int newfd)`。
     fn dup2(oldfd: i32, newfd: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `pid_t setsid(void)`（Linux の `pid_t` は i32。失敗は `(pid_t)-1`）。
+    // libc のラッパーを使い、arch 別の syscall 番号を増やさない（SUP-6・TASK-163 追補・#1456）。
+    fn setsid() -> i32;
     // SAFETY（宣言そのものの妥当性）: `int prctl(int option, ...)`（glibc / musl）。可変長引数として
     // 宣言する（非可変長で宣言して呼ぶと、可変長引数の渡し方が異なる ABI で未定義動作になる）。
     // 可変長部は `unsigned long`（LP64 で u64）なので呼び出し側は u64 で渡す。
@@ -1604,6 +1607,30 @@ pub(crate) fn reset_sigpipe_default() -> Result<(), SysError> {
     } else {
         Ok(())
     }
+}
+
+/// 呼び出しプロセスを新しいセッションのリーダーにし、制御端末から切り離す（`setsid(2)`。
+/// SUP-6・SEC-1・TASK-163 追補・#1456）。戻り値は新しいセッション ID（= 呼び出しプロセスの pid）。
+///
+/// `crate::exec` の exec 直前の子（launch の PID 1・稼働中コンテナへの exec の子）が、呼び出し側の
+/// セッションと制御端末をコンテナ内のコマンドへ引き継がせないために呼ぶ。新しいセッションは制御端末を
+/// 持たないため、以後 `/dev/tty` は `ENXIO` になる（端末を `O_NOCTTY` なしで開けば取得し得るため、
+/// 呼び出し側は以後の open に `O_NOCTTY` を付ける）。呼び出しプロセスがプロセスグループのリーダーだと
+/// `EPERM`（fork 直後の子はリーダーでないため成立しない。失敗時は呼び出し側が fail-closed にする）。
+/// 引数・ポインタを取らず、アロケーション・ロックを伴わない（fork 後の子から呼べる）。
+// テストビルドでは dry-run 差し込み点が本関数を呼ばない（libtest のプロセスのセッションを変えないため）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn new_session() -> Result<u32, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数を取らずポインタも渡さない。効果は呼び出しプロセスのセッション・プロセスグループの
+    // 付け替えのみで、メモリには触れない。戻り値が -1 のときは直後に errno を確保する。
+    let sid = unsafe { setsid() };
+    if sid < 0 {
+        return Err(last_error());
+    }
+    u32::try_from(sid).map_err(|_| SysError::Os(EINVAL))
 }
 
 /// `signal(2)` の `SIG_DFL`（既定動作）と `SIG_ERR`（失敗）。`sighandler_t` はポインタ幅。

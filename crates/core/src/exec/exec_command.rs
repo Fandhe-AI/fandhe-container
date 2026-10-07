@@ -10,7 +10,7 @@
 //! reapply_restrictions(..) -> ExecRestrictionReport      // rlimit・capability・NO_NEW_PRIVS・Landlock・seccomp
 //!   .into_complete()       -> ExecReady                  // 唯一の証跡（値で渡る）
 //! spawn_exec_command(ready, &entry)                      // 親: non-dumpable を確認 → cwd を照合済み root へ → fork
-//!   子: close_range(3..) -> エントリポイントを fd で検査 -> 標準入出力を /dev/null へ -> execveat
+//!   子: close_range(3..) -> setsid -> エントリポイントを fd で検査 -> 標準入出力を /dev/null へ -> execveat
 //! 親: ContainerChild::wait_timeout(timeout)              // 期限超過は SIGKILL + 回収（REPAIR-5）
 //! ```
 //!
@@ -49,7 +49,9 @@
 //! - **別プロセスからは呼べない**: `ExecReady` を作ったプロセスと異なる pid からの呼び出しは何もせず拒否する
 //!   （fork した子の pid は数値が衝突し得るため、best-effort の誤用検知）
 //! - **子は launch 経路と同じ手順で exec する**: エントリポイントを開く前に fd 3 以上を `close_range` で閉じ
-//!   （cgroup・状態・固定した rootfs・status の fd をコンテナへ渡さない。CVE-2024-21626 型の対策）、標準 fd と同一
+//!   （cgroup・状態・固定した rootfs・status の fd をコンテナへ渡さない。CVE-2024-21626 型の対策）、`setsid` で
+//!   呼び出し側のセッション・制御端末を切り離し（端末から起動した CLI の exec で、コマンドが `/dev/tty` 経由で
+//!   ホスト側の端末へ届かない。失敗したら実行しない。TASK-163 追補・#1456）、標準 fd と同一
 //!   実体・ランタイム自身のバイナリを拒否し、シェバンを検証し、標準入出力を新 root の `/dev/null`（1:3 を検証）へ
 //!   置換して `execveat` する（`process::exec_checked_entrypoint`）。エントリポイントは絶対パスのみで PATH
 //!   探索はしない。子の失敗は stderr の英語 1 行と終了コード（125 / 126 / 127）で伝える

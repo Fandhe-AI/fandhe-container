@@ -76,7 +76,7 @@ rootful 時に、本リポのコードが行う特権操作と、それに要す
 | `no_new_privs`・seccomp・Landlock | 同 `set_no_new_privs`・`seccomp_set_filter`・`landlock_*`（`exec/no_new_privs.rs` ほか） | 不要（`no_new_privs` を先に立てるため） | コンテナ側 |
 | cgroups v2 の作成・参加 | `crates/core/src/cgroups.rs` | cgroup ディレクトリ・ファイルの書き込み権限（所有者 root を前提にした場合 `CAP_DAC_OVERRIDE` か uid 0。委譲方式は未確認） | コンテナ作成時・削除時 |
 | ネットワーク（netns pin・veth・bridge・nftables） | `crates/net/src/netns.rs`・`netlink_route`・`nftables_*` | `CAP_NET_ADMIN`（netns の bind マウントに `CAP_SYS_ADMIN`） | ネットワーク作成・接続・削除時 |
-| 監査ログ用 netlink | `sys.rs` の `netlink_audit_socket` | 要否は未確認（`CAP_AUDIT_*` の想定） | 未確認 |
+| 監査ログ用 netlink（主経路失敗時のカーネル監査フォールバック。SEC-4） | `sys.rs` の `netlink_audit_socket`・`KernelAuditFallback`（`crates/core/src/audit_log/kernel_audit.rs`） | `CAP_AUDIT_WRITE`（欠如時は `KernelAuditFallback` が `KernelAuditPermissionDenied` を返し何も書き込まない。`crates/core/tests/audit_kernel_fallback.rs`。初期 user namespace が前提で、その外では `KernelAuditUnavailable`） | 監査ログの書き込み（フォールバック発火）が起きうる期間。restart ループ（SUP-1）を担う長寿命の supervisor では稼働中ずっと必要。ランチャーへ縮退する場合は、フォールバックを担うプロセスがこの権限を保持し続ける必要がある |
 | シグナル送信（他 UID のプロセス） | `sys.rs` の `kill_pid`・`pidfd_send_signal` | 対象が同一 UID なら不要。他 UID は `CAP_KILL`（想定） | 停止時 |
 | uid/gid マップ書き込み | `crates/core/src/rootless.rs`（setuid の `newuidmap`/`newgidmap`） | rootless 用（本書の昇格経路とは別） | - |
 
@@ -157,7 +157,7 @@ TASK-171 の成果物は `crates/supervisor/src/privilege.rs`（仮称）だが�
 | 項目 | 状態 |
 | ---- | ---- |
 | `prctl(2)`・`execve(2)`・`setsid(2)`・`mount(8)` の `nosuid`・sudoers `use_pty` の原文照合 | 未確認 |
-| `CAP_SYS_CHROOT`・`CAP_AUDIT_*`・UTS namespace・cgroup 書き込み権限の要否 | 未確認（4 章の「想定」） |
+| `CAP_SYS_CHROOT`・UTS namespace・cgroup 書き込み権限の要否 | 未確認（4 章の「想定」） |
 | file capabilities 付きバイナリの AppArmor 等の LSM 下の挙動 | 未確認 |
 | macOS・Windows（VM 内）で本方式が不要であること | 要確認（MAC・WIN 系ビヘイビア） |
 | rootless（CORE-6）経路との関係 | PoC 未検証 |

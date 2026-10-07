@@ -8,6 +8,7 @@
 # TASK-164.1（#505）で行単位捕捉のバッファ境界跨ぎの照合テストを追加した（依存は不変）。
 # TASK-169.1（#526）で container_options（ulimit の指定モデル。core の rlimits 型へ変換）を追加した（依存は不変）。
 # TASK-169.4（#529）で container_options::env（env / env ファイルの指定モデル）を追加した（依存は不変）。
+# TASK-171.1.2（#858）で privilege（権限昇格の必要最小集合と検証。純ロジック・unsafe なし）を追加した（依存は不変）。
 # 外部クレート（crates.io）の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 
 [package]

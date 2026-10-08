@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const USAGE_JSON: &str = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs>\"}\n";
+const USAGE_JSON: &str = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|setup>\"}\n";
 #[cfg(target_os = "linux")]
 const UNIMPLEMENTED_JSON: &str =
     "{\"code\":\"UNIMPLEMENTED\",\"message\":\"command is not implemented yet\"}\n";
@@ -600,4 +600,34 @@ fn plug11_path_search_env_warns_and_rejects_off_linux() {
     assert_eq!(out.status.code(), Some(8));
     assert_eq!(path_warning_lines(&out), 2);
     assert!(out.stdout.is_empty());
+}
+
+/// CLI-2: setup は引数を受け付けない（使い方エラー 2）。
+#[test]
+fn cli2_setup_usage_errors() {
+    for a in [&["setup", "extra"][..], &["setup", "--x"][..]] {
+        assert_failure(&run(a), 2, USAGE_JSON);
+    }
+}
+
+/// CLI-2: Linux の setup は要求ステップがなく、終了コード 0・出力なし。
+#[cfg(target_os = "linux")]
+#[test]
+fn cli2_setup_on_linux_is_noop() {
+    assert_failure_free(&run(&["setup"]));
+}
+
+/// CLI-2・REPAIR-3: macOS / Windows の setup は要求ステップを stdout へ出し、自動適用未実装のため 8 で失敗する。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[test]
+fn cli2_setup_on_non_linux_lists_steps_and_fails() {
+    let out = run(&["setup"]);
+    assert_eq!(out.status.code(), Some(8));
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    assert!(stdout.lines().count() >= 2, "{stdout:?}");
+    assert!(stdout.lines().all(|l| l.starts_with("{\"step\":\"")));
+    assert_eq!(
+        String::from_utf8(out.stderr).expect("utf8"),
+        "{\"code\":\"UNIMPLEMENTED\",\"message\":\"not implemented on this platform\"}\n"
+    );
 }

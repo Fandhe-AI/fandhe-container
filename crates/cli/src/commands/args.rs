@@ -51,6 +51,10 @@ pub(super) struct DeleteArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ListArgs;
 
+/// `setup` の引数（オプションなし。TASK-80.1・CLI-2）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SetupArgs;
+
 /// `logs` の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LogsArgs {
@@ -162,6 +166,16 @@ pub(super) fn parse_list(args: Vec<OsString>) -> Result<ListArgs, UsageError> {
     match it.next() {
         None => Ok(ListArgs),
         Some(a) if a == "--" && it.next().is_none() => Ok(ListArgs),
+        Some(_) => Err(UsageError),
+    }
+}
+
+/// `setup` を解析する（位置引数・オプションとも受け付けない。`--` 単独のみ許容）。
+pub(super) fn parse_setup(args: Vec<OsString>) -> Result<SetupArgs, UsageError> {
+    let mut it = args.into_iter();
+    match it.next() {
+        None => Ok(SetupArgs),
+        Some(a) if a == "--" && it.next().is_none() => Ok(SetupArgs),
         Some(_) => Err(UsageError),
     }
 }
@@ -385,6 +399,16 @@ mod tests {
         assert_eq!(parse_list(v(&["--"])), Ok(ListArgs));
         for a in [v(&["x"]), v(&["--all"]), v(&["--", "x"]), v(&["-a"])] {
             assert_eq!(parse_list(a), Err(UsageError));
+        }
+    }
+
+    /// CLI-2: setup は引数なし（または `--` のみ）だけ受理する。
+    #[test]
+    fn cli2_parse_setup() {
+        assert_eq!(parse_setup(v(&[])), Ok(SetupArgs));
+        assert_eq!(parse_setup(v(&["--"])), Ok(SetupArgs));
+        for a in [v(&["x"]), v(&["--all"]), v(&["--", "x"])] {
+            assert_eq!(parse_setup(a), Err(UsageError));
         }
     }
 

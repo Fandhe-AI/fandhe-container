@@ -126,6 +126,7 @@ pub(super) fn production_runtime<R>(
 
 /// 状態ストアを開く。Linux は core を直接使い、非 Linux は plugin 発見機構経由（TASK-79.4・PLUG-4）で
 /// 解決を試みて、現状は必ず失敗する（`plugin_backend` の未実装範囲を参照。REPAIR-3）。
+/// これは OS 別のバックエンド振り分けであり OS 固有設定（CLI-2）ではない。setup module は参照しない。
 #[cfg(target_os = "linux")]
 fn open_store(global: &GlobalArgs) -> Result<FileStateStore, TraitError> {
     use fandhe_container_core::state_store::StateRoot;

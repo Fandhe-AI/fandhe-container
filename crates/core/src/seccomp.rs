@@ -22,7 +22,8 @@
 //!   `io_setup`）で埋めない
 //! - **ランタイム自身が使う syscall を含めない**: seccomp 段は `execveat` の前に適用される予定
 //!   （TASK-38.3）のため、`execve`・`execveat`・`prctl`・`capget`・`capset`・`close_range`・
-//!   `exit`・`exit_group`・`pidfd_open`・`pidfd_send_signal`・`rt_sigreturn` は禁止対象にしない
+//!   `exit`・`exit_group`・`pidfd_open`・`pidfd_send_signal`・`rt_sigreturn` と、封印した複製からの
+//!   実行（TASK-163 追補・#1530・SUP-6）が使う `memfd_create`・`fcntl` は禁止対象にしない
 //!   （テストで機械照合）。適用前に完了する `unshare`・`mount`・`pivot_root`・`umount2` は禁止してよい
 //! - **x32 ABI は BPF 構築側（[`build_deny_filter`]）が明示的に拒否する**: x86_64 の `AUDIT_ARCH_X86_64` は x32 ABI の
 //!   syscall でも同じ値になり、`arch` の照合だけでは x32 を区別できない。x32 の syscall 番号には
@@ -877,11 +878,12 @@ mod tests {
     #[test]
     fn core5_task38_1_1_runtime_required_syscalls_not_denied() {
         // execve・execveat・prctl・capget・capset・close_range・exit・exit_group・
-        // pidfd_open・pidfd_send_signal・rt_sigreturn
+        // pidfd_open・pidfd_send_signal・rt_sigreturn・memfd_create・fcntl
+        // （最後の 2 件は封印した複製からの実行。TASK-163 追補・#1530・SUP-6）
         #[cfg(target_arch = "x86_64")]
-        let required: [u32; 11] = [59, 322, 157, 125, 126, 436, 60, 231, 434, 424, 15];
+        let required: [u32; 13] = [59, 322, 157, 125, 126, 436, 60, 231, 434, 424, 15, 319, 72];
         #[cfg(target_arch = "aarch64")]
-        let required: [u32; 11] = [221, 281, 167, 90, 91, 436, 93, 94, 434, 424, 139];
+        let required: [u32; 13] = [221, 281, 167, 90, 91, 436, 93, 94, 434, 424, 139, 279, 25];
         let t = native();
         for (d, n) in t.entries() {
             assert!(!required.contains(&n.get()), "{} is required", d.name());

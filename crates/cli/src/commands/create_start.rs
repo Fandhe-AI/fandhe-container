@@ -135,14 +135,12 @@ fn record_pre_core_failure(recorder: &OpRecorder, op_name: &str, started: Instan
 pub(super) const OP_LOG_ENV: &str = "FANDHE_CONTAINER_OP_LOG";
 
 /// 計測出力の open に付ける O_NONBLOCK（REPAIR-5）。読み手のいない FIFO の open が無期限に
-/// ブロックして CLI が結果を返せなくなるのを防ぐ。libc 非依存のため OS ごとの値を直書きする。
+/// ブロックして CLI が結果を返せなくなるのを防ぐ。libc 非依存のため値を直書きする（Linux 限定）。
 #[cfg(target_os = "linux")]
 const O_NONBLOCK: i32 = 0o4000;
-#[cfg(all(unix, not(target_os = "linux")))]
-const O_NONBLOCK: i32 = 0x4;
 
 /// 最終要素が symlink なら open を失敗させる O_NOFOLLOW（SEC-1）。値は ABI ごとに異なる
-/// （Linux の arm / arm64 は 0o100000、他の Linux アーキは 0o400000、BSD 系・macOS は 0x100）。
+/// （Linux の arm / arm64 は 0o100000、他の Linux アーキは 0o400000）。
 #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
 const O_NOFOLLOW: i32 = 0o100_000;
 #[cfg(all(
@@ -150,24 +148,19 @@ const O_NOFOLLOW: i32 = 0o100_000;
     not(any(target_arch = "aarch64", target_arch = "arm"))
 ))]
 const O_NOFOLLOW: i32 = 0o400_000;
-#[cfg(all(unix, not(target_os = "linux")))]
-const O_NOFOLLOW: i32 = 0x100;
 
-/// 呼び出しプロセスの実効 UID（Linux のみ。`/proc/self` の所有者で代用し、取得できなければ None）。
+/// 呼び出しプロセスの実効 UID（`/proc/self` の所有者で代用し、取得できなければ None）。
+/// None のときは呼び出し側が計測出力を拒否する（fail-closed。SEC-1）。
 #[cfg(target_os = "linux")]
 fn effective_uid() -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata("/proc/self").ok().map(|m| m.uid())
 }
-#[cfg(all(unix, not(target_os = "linux")))]
-fn effective_uid() -> Option<u32> {
-    None
-}
 
 /// 計測出力先の祖先ディレクトリが、他ユーザーに差し替えられない状態かを検査する（SEC-1）。
 /// group / other 書き込み可のディレクトリは sticky bit が無ければ拒否し、所有者は root か自分に限る。
-#[cfg(unix)]
-fn ancestors_trusted(dir: &std::path::Path, euid: Option<u32>) -> bool {
+#[cfg(target_os = "linux")]
+fn ancestors_trusted(dir: &std::path::Path, euid: u32) -> bool {
     use std::os::unix::fs::MetadataExt;
     dir.ancestors().all(|a| {
         let Ok(m) = std::fs::metadata(a) else {
@@ -176,18 +169,45 @@ fn ancestors_trusted(dir: &std::path::Path, euid: Option<u32>) -> bool {
         let mode = m.mode();
         let writable_by_others = mode & 0o022 != 0;
         let sticky = mode & 0o1000 != 0;
-        let owner_ok = m.uid() == 0 || euid.is_none_or(|e| m.uid() == e);
+        let owner_ok = m.uid() == 0 || m.uid() == euid;
         owner_ok && (!writable_by_others || sticky)
     })
 }
 
+/// 親ディレクトリを字面どおり（`..` 不可）に絶対化し、各祖先が symlink でないことを検査する。
+/// root 所有の symlink（システム標準の `/var/run` 等）のみ許可する。信頼できない親 symlink は
+/// canonicalize で先に解決せず、辿らずに拒否する（SEC-1）。
+#[cfg(target_os = "linux")]
+fn reject_untrusted_symlink_ancestors(parent: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+    let abs = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(parent)
+    };
+    let mut cur = std::path::PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::ParentDir => return None,
+            Component::CurDir => continue,
+            _ => cur.push(c),
+        }
+        let m = std::fs::symlink_metadata(&cur).ok()?;
+        if m.file_type().is_symlink() && m.uid() != 0 {
+            return None;
+        }
+    }
+    Some(cur)
+}
+
 /// 計測出力先を非ブロッキングで開く。通常ファイル以外（FIFO・デバイス等）は拒否する。
 ///
-/// unix では、親ディレクトリを正規化して祖先の所有者・書き込み権限を検査し（他ユーザーが
-/// 差し替えられるディレクトリ経由の symlink を拒否）、最終要素は O_NOFOLLOW で開き、開いたファイルの
+/// Linux では、親ディレクトリに信頼できない symlink が無いことを先に検査し、その後に正規化して
+/// 祖先の所有者・書き込み権限を検査し、最終要素は O_NOFOLLOW で開き、開いたファイルの
 /// 種別・ハードリンク数（1 のみ許可）・所有者を fd から検証する（root 実行時に別ファイルへ
 /// 追記させる攻撃の防止。SEC-1）。
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn open_op_log(path: &std::ffi::OsStr) -> Option<std::fs::File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let path = std::path::Path::new(path);
@@ -196,8 +216,9 @@ fn open_op_log(path: &std::ffi::OsStr) -> Option<std::fs::File> {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => std::path::Path::new("."),
     };
-    let parent = std::fs::canonicalize(parent).ok()?;
-    let euid = effective_uid();
+    let lexical = reject_untrusted_symlink_ancestors(parent)?;
+    let parent = std::fs::canonicalize(lexical).ok()?;
+    let euid = effective_uid()?;
     if !ancestors_trusted(&parent, euid) {
         return None;
     }
@@ -208,26 +229,19 @@ fn open_op_log(path: &std::ffi::OsStr) -> Option<std::fs::File> {
     let f = opts.open(parent.join(name)).ok()?;
     // open 後のハンドルで検証する（パスの事前検査による TOCTOU を避ける）。
     let m = f.metadata().ok()?;
-    if m.is_file() && m.nlink() == 1 && euid.is_none_or(|e| m.uid() == e) {
+    if m.is_file() && m.nlink() == 1 && m.uid() == euid {
         Some(f)
     } else {
         None
     }
 }
 
-/// 非 unix（Windows）は通常ファイルのみ許可する。
-#[cfg(not(unix))]
-fn open_op_log(path: &std::ffi::OsStr) -> Option<std::fs::File> {
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .ok()?;
-    if f.metadata().ok()?.is_file() {
-        Some(f)
-    } else {
-        None
-    }
+/// Linux 以外（macOS・Windows）は、実効 UID の取得・symlink / junction / reparse point の
+/// 安全な検査が未実装のため計測のファイル出力を拒否する（fail-closed。SEC-1・REPAIR-4）。
+/// 将来は各 OS の安全な open 実装を `sys` モジュールに追加して対応する。
+#[cfg(not(target_os = "linux"))]
+fn open_op_log(_path: &std::ffi::OsStr) -> Option<std::fs::File> {
+    None
 }
 
 /// 計測を `path` の通常ファイルへ追記する（best effort。失敗しても終了コード・エラー出力は変えない）。
@@ -348,6 +362,8 @@ mod tests {
     }
 
     /// REPAIR-4: 計測は指定ファイルへ JSON Lines で追記され、未指定なら何も書かない。
+    /// Linux 以外は計測のファイル出力を拒否するため対象外（SEC-1）。
+    #[cfg(target_os = "linux")]
     #[test]
     fn repair4_export_ops_appends_json_lines() {
         use fandhe_container_core::observability::{OpName, OpOutcome};
@@ -373,7 +389,7 @@ mod tests {
 
     /// REPAIR-5: 計測出力先が FIFO でも `export_ops` がブロックせず、何も書き込まない。
     /// 読み手がいない場合と、読み手が open しただけで読まない場合の両方を具体値で検証する。
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn repair5_export_ops_rejects_fifo_without_blocking() {
         use fandhe_container_core::observability::{OpName, OpOutcome};
@@ -429,7 +445,7 @@ mod tests {
     }
 
     /// SEC-1: 最終要素が symlink なら辿らず拒否し、リンク先は書き換えない。
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn sec1_open_op_log_rejects_symlink_and_hardlink() {
         let dir = std::env::temp_dir().join(format!("fc-cli-oplog-sec-{}", std::process::id()));
@@ -451,6 +467,35 @@ mod tests {
         let fresh = dir.join("fresh");
         assert!(open_op_log(fresh.as_os_str()).is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-1: 信頼できない（非 root 所有の）親 symlink は辿らず拒否し、リンク先へ書かない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_open_op_log_rejects_parent_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fc-cli-oplog-psym-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let link = dir.join("linkdir");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        assert!(open_op_log(link.join("log").as_os_str()).is_none());
+        assert!(!real.join("log").exists());
+        assert!(open_op_log(real.join("log").as_os_str()).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-1: Linux 以外は計測のファイル出力を拒否し、ファイルを作らない（fail-closed）。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn sec1_open_op_log_refused_on_non_linux() {
+        let path = std::env::temp_dir().join(format!("fc-cli-oplog-nl-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(open_op_log(path.as_os_str()).is_none());
+        assert!(!path.exists());
     }
 
     /// REPAIR-4: 不正 ID（core 到達前の失敗）も操作名 create の失敗として 1 件計測される。

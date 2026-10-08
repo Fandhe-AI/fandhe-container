@@ -80,3 +80,12 @@ pub fn install_recording_handler_for_test(sig: i32) -> std::io::Result<()> {
 pub fn recorded_signal_for_test() -> i32 {
     sys::recorded_signal()
 }
+
+/// 結合試験専用: 自プロセスの SIGCHLD を `SIG_IGN` にする（起動元から `SIG_IGN` を継承した状態の再現。
+/// feature `signal-test-support` のときだけ存在する）。隔離した子プロセスの役からだけ呼ぶこと（同じ
+/// プロセスの子は自動回収されるようになる）。[`install_signal_forwarding`] が `SIG_DFL` へ戻す。
+#[cfg(feature = "signal-test-support")]
+#[doc(hidden)]
+pub fn ignore_child_signal_for_test() -> std::io::Result<()> {
+    sys::ignore_child_signal_for_test()
+}

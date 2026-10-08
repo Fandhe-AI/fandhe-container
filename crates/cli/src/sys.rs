@@ -30,8 +30,9 @@
 //!     atomic の load と `kill(2)` のみ）と `raise(3)` だけを呼ぶ
 //!   - `record_for_test`（feature `signal-test-support` のときだけ存在する。結合試験の plugin 役用）:
 //!     受信番号を `AtomicI32` へ store するだけ
-//! - 公開するのは安全な `pub(crate)` の [`install_forwarding_handler`] と、feature `signal-test-support` の
-//!   ときだけの `install_recording_handler`・`recorded_signal` のみ
+//! - 公開するのは安全な `pub(crate)` の [`install_forwarding_handler`]・[`reset_child_signal_if_ignored`] と、
+//!   feature `signal-test-support` のときだけの `install_recording_handler`・`recorded_signal`・
+//!   `ignore_child_signal_for_test`（SIGCHLD を `SIG_IGN` にする。ハンドラ関数は登録しない）のみ
 
 #![cfg(unix)]
 
@@ -234,8 +235,9 @@ mod imp {
         Ok(ChildSignal::ResetFromIgnored)
     }
 
-    /// テスト専用: `sig` を `SIG_IGN` にする（[`reset_if_ignored`] の照合用。SIGCHLD には使わない）。
-    #[cfg(test)]
+    /// テスト専用: `sig` を `SIG_IGN` にする（[`reset_if_ignored`] の照合用と、feature `signal-test-support` の
+    /// 結合試験で隔離した子プロセスの SIGCHLD を無視にするため。ユニットテストからは SIGCHLD に使わない）。
+    #[cfg(any(test, feature = "signal-test-support"))]
     pub(super) fn set_ignored_for_test(sig: i32) -> io::Result<()> {
         let mut act = layout::empty();
         act.handler = SIG_IGN;
@@ -268,6 +270,13 @@ mod imp {
     #[cfg(test)]
     pub(super) fn forwarding_handler_value() -> usize {
         forward_and_reraise as extern "C" fn(i32) as usize
+    }
+
+    /// 結合試験専用（feature `signal-test-support`）: 自プロセスの SIGCHLD を `SIG_IGN` にする（継承した
+    /// `SIG_IGN` の再現。隔離した子プロセスの役からだけ呼ぶ）。
+    #[cfg(feature = "signal-test-support")]
+    pub(crate) fn ignore_child_signal_for_test() -> io::Result<()> {
+        set_ignored_for_test(layout::SIGCHLD)
     }
 }
 
@@ -304,11 +313,17 @@ mod imp {
     pub(crate) fn recorded_signal() -> i32 {
         0
     }
+
+    /// 構造体レイアウトを確認していない OS・アーキテクチャでは変更しない（fail-closed）。
+    #[cfg(feature = "signal-test-support")]
+    pub(crate) fn ignore_child_signal_for_test() -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
 }
 
-pub(crate) use imp::{install_forwarding_handler, reset_child_signal_if_ignored};
 #[cfg(feature = "signal-test-support")]
-pub(crate) use imp::{install_recording_handler, recorded_signal};
+pub(crate) use imp::{ignore_child_signal_for_test, install_recording_handler, recorded_signal};
+pub(crate) use imp::{install_forwarding_handler, reset_child_signal_if_ignored};
 
 // 対象は構造体レイアウトを確認済みの `imp`（実装側）と同じ cfg に揃える（musl 等の fail-closed 側を
 // 実装側の試験で検証したことにしない。PR #1572 事後監査の P3）。

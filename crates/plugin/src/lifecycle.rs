@@ -1045,6 +1045,12 @@ fn call_once_inner(
 /// 後者は fork 時のグループ設定で干渉しない）。
 /// Windows にプロセスグループ単位の kill は無く（Job Object は別タスク）、unix transport も無いため対象外。
 ///
+/// pgid 確立の同期性: `Command::spawn` は子の `exec` 成功（または失敗の報告）を CLOEXEC パイプで待ってから
+/// 返り、`process_group(0)` の `setpgid(0, 0)` は `pre_exec` フックより前に子の `exec` 前で完了する。
+/// このため `spawn` 復帰時点で pgid == 子の pid は確立済みで、`kill_and_reap` の `killpg(pid)` が
+/// 親のグループや無関係なグループへ届くことはない（`PR_SET_PDEATHSIG` の fork 経路でも同じ。
+/// 回帰テスト `plug7_spawn_registered_establishes_own_process_group`）。
+///
 /// 確保を spawn より前に行うので、表が満杯のときは子を一切起動せず `ResourceExhausted` で拒否する
 /// （fail-closed。追跡できない子を作らない）。spawn の失敗・pid の範囲外ではスロットを解放し、
 /// 起動済みの子は kill・回収する。`registry` は本番では [`PLUGIN_REGISTRY`]（テストは局所の表）。
@@ -1384,6 +1390,26 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         assert!(other.try_wait().unwrap().is_none());
         assert!(other.kill_and_reap().is_reaped());
+    }
+
+    /// #1311・PLUG-7: `spawn_registered` の復帰時点で子は自分専用のプロセスグループ（pgid == pid）に
+    /// いる。`kill_and_reap` の `killpg(pid)` が親や他のグループへ届かないことの前提を固定する。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_spawn_registered_establishes_own_process_group() {
+        let reg = local_registry(2);
+        let mut g = spawn_registered(&mut sh("exec sleep 30"), reg).unwrap();
+        let pid = g.child.as_ref().unwrap().id();
+        let out = Command::new("ps")
+            .args(["-o", "pgid=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let pgid: u32 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("pgid");
+        assert_eq!(pgid, pid);
+        assert!(g.kill_and_reap().is_reaped());
     }
 
     /// PLUG-7・#1513: 登録中の子へ転送するとシグナルで終了する。

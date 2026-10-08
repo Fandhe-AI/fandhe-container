@@ -257,6 +257,16 @@ pub(super) struct BundleLock {
     _never: std::convert::Infallible,
 }
 
+/// 予約の解放と同時にロックを外す。`flock` は open file description に付くため、コンテナの子が fork から
+/// exec までの間にこの fd を引き継ぐと close だけではロックが残り、別プロセスの `start` / `recover` が
+/// 誤って拒否される。`LOCK_UN` で fd の参照数に関係なく明示的に解放する（CORE-2・#1537）。
+impl Drop for BundleLock {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        let _ = self._file.unlock();
+    }
+}
+
 impl BundleLock {
     /// `bundle`（絶対パス）の所有ロックを待たずに取得する。
     ///
@@ -566,6 +576,50 @@ pub trait ProcessLauncher: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CORE-2・#1537: fork で継承された fd（同じ open file description）が残っていても、`BundleLock` の
+    /// drop でロックが外れて再取得できる。素の `File` は close だけでは外れない（仕組みの照合）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core2_bundle_lock_release_survives_inherited_fd() {
+        use std::process::{Command, Stdio};
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir =
+            std::env::temp_dir().join(format!("fandhe-bundle-lock-inherit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let lock = BundleLock::acquire(&dir).expect("acquire");
+        // 子の stdin へ同じ OFD の dup を渡し、fork 継承で fd が残る状況を模す。
+        let dup = lock._file.try_clone().expect("dup");
+        let _child = Child(
+            Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::from(dup))
+                .spawn()
+                .expect("spawn sleep"),
+        );
+        drop(lock);
+        let again = BundleLock::acquire(&dir).expect("reacquire after drop");
+        drop(again);
+
+        // 対照: unlock なしの close ではロックが残る。
+        let plain = std::fs::File::open(&dir).expect("open");
+        plain.try_lock().expect("lock");
+        let dup = plain.try_clone().expect("dup");
+        drop(plain);
+        let probe = std::fs::File::open(&dir).expect("open");
+        assert!(matches!(
+            probe.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(dup);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// REPAIR-5: 上限は 0 と `START_TIMEOUT_MAX` 超過を拒否し、境界値は受理する。
     #[test]

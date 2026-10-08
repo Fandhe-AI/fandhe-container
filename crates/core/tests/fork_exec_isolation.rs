@@ -47,6 +47,12 @@
 //!   `landlock_open_path_failed`）になる。いずれも Landlock の前段（cgroup 参加）は制限前に実行済み。
 //!   ABI 6 未満のホストでは検出失敗で panic する（実機前提）
 //!
+//! - シナリオ `stdio-closed-one` / `stdio-closed-many` / `stdio-closed-all`（#1299・CORE-1・TASK-27.4.1。
+//!   `exec-test-support` の `close_standard_fds_for_test`）: 分離後・起動直前に自プロセスの fd `{0}`・`{0,1}`・`{0,1,2}`
+//!   を閉じてから `spawn_container` する。閉じた親からでも exec は fail-closed（`Exited(126)`・フックのログは空）で、
+//!   `all` は stderr も閉じるため marker を空にし、panic の診断だけを退避した複製へ出す。実行用 fd が 3 以上へ移る
+//!   具体値は launch 経路では観測できず（証跡未配線のため `execveat` の手前で拒否）、`tests/exec_child_setup.rs` で照合する
+//!
 //! # 実機前提テストとしての分離
 //! 実行には root もしくは非特権 user namespace を許可するホストが必要（AppArmor の
 //! `kernel.apparmor_restrict_unprivileged_userns=1` 等の環境では `PermissionDenied` になる）。
@@ -111,7 +117,7 @@ mod linux {
     /// 子が pivot 後の `/` に追記するステージ実行ログ（親からは `<rootfs>/stage-log`）。
     const STAGE_LOG: &str = "stage-log";
     /// (シナリオ名, stderr に含まれるべき文字列)。
-    const SCENARIOS: [(&str, &str); 10] = [
+    const SCENARIOS: [(&str, &str); 13] = [
         ("ok", "PERMISSION_DENIED"),
         ("missing", "PERMISSION_DENIED"),
         ("not-executable", "PERMISSION_DENIED"),
@@ -122,6 +128,10 @@ mod linux {
         ("landlock-apply-ro", "Permission denied"),
         ("landlock-apply-rw", ""),
         ("landlock-fail", "landlock_open_path_failed"),
+        // 標準 fd を閉じた親からの起動（#1299）。fd 2 を閉じると子の診断が届かないため、`all` の marker は空。
+        ("stdio-closed-one", "PERMISSION_DENIED"),
+        ("stdio-closed-many", "PERMISSION_DENIED"),
+        ("stdio-closed-all", ""),
     ];
 
     fn timeout() -> Duration {
@@ -375,13 +385,15 @@ mod linux {
             "missing" => "/no-such-entrypoint".to_string(),
             "not-executable" => format!("/{NOT_EXEC}"),
             "stages-order" | "stage-fail" | "landlock-apply-ro" | "landlock-apply-rw"
-            | "landlock-fail" | "rlimits-apply" | "rlimit-fail" => format!("/{PROBE}"),
+            | "landlock-fail" | "rlimits-apply" | "rlimit-fail" | "stdio-closed-one"
+            | "stdio-closed-many" | "stdio-closed-all" => format!("/{PROBE}"),
             other => panic!("unknown scenario {other}"),
         };
         // SEC-1・CORE-5: Landlock が未適用の間は、root / 非 root を問わず
         // exec が拒否される（終了コード 126・PERMISSION_DENIED）。適用後は "ok" が Exited(PROBE_EXIT)、
         // "missing" が Exited(127) に戻る。
         let mut want = ChildExit::Exited(126);
+        close_standard_fds_for_scenario(name);
         let entry = Entrypoint::new(&path, [path.as_str()], [] as [&str; 0]).expect("entrypoint");
         let child = match name {
             "stages-order" => {
@@ -517,6 +529,61 @@ mod linux {
                 );
             }
             _ => assert_eq!(log, "", "no hook is registered"),
+        }
+    }
+
+    /// `stdio-closed-*` シナリオ（#1299・CORE-1・SEC-1）: 起動直前に自プロセスの標準 fd を閉じる。
+    ///
+    /// 閉じた親から `spawn_container` しても、実行用の fd が 0〜2 に入り込まず fail-closed のまま
+    /// （`Exited(126)`）であることを固定する。fd 移動そのものの具体値（実行用 fd が 3 以上・標準入出力が 1:3）は、
+    /// launch 経路が制限適用の証跡未配線で `prepare_exec_child` の手前で拒否されるため観測できず、
+    /// `tests/exec_child_setup.rs` の観測用の入口で照合している。証跡が配線されたら、本シナリオの期待を
+    /// プローブの `Exited(42)` へ戻す（他シナリオと同じ扱い）。他のシナリオでは何もしない。
+    #[cfg(feature = "exec-test-support")]
+    fn close_standard_fds_for_scenario(name: &str) {
+        use std::os::fd::AsFd as _;
+
+        use fandhe_container_core::exec::{StandardFd, close_standard_fds_for_test};
+        let fds: &[StandardFd] = match name {
+            "stdio-closed-one" => &[StandardFd::Stdin],
+            "stdio-closed-many" => &[StandardFd::Stdin, StandardFd::Stdout],
+            "stdio-closed-all" => &[StandardFd::Stdin, StandardFd::Stdout, StandardFd::Stderr],
+            _ => return,
+        };
+        if fds.contains(&StandardFd::Stderr) {
+            // stderr を閉じると panic の診断が親へ届かない。close-on-exec の複製（3 以上）へ診断を逃がす。
+            let saved = std::io::stderr()
+                .as_fd()
+                .try_clone_to_owned()
+                .map(std::fs::File::from)
+                .expect("save stderr");
+            let saved = std::sync::Mutex::new(saved);
+            std::panic::set_hook(Box::new(move |info| {
+                use std::io::Write as _;
+                if let Ok(mut file) = saved.lock() {
+                    let _ = writeln!(file, "{info}");
+                }
+            }));
+        }
+        close_standard_fds_for_test(fds).unwrap_or_else(|e| panic!("close standard fds: {e}"));
+        for (n, std_fd) in [StandardFd::Stdin, StandardFd::Stdout, StandardFd::Stderr]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                Path::new(&format!("/proc/self/fd/{n}")).exists(),
+                !fds.contains(std_fd),
+                "fd {n} state after closing {name}"
+            );
+        }
+    }
+
+    /// feature なしのビルドでは閉じる入口が無い。検証せずに成功しない（fail-closed）。core の dev-dependency
+    /// （自己参照）が `exec-test-support` を有効にするため、通常の `cargo test` ではこの分岐にならない。
+    #[cfg(not(feature = "exec-test-support"))]
+    fn close_standard_fds_for_scenario(name: &str) {
+        if name.starts_with("stdio-closed-") {
+            panic!("not verified; the exec-test-support feature is not enabled ({name})");
         }
     }
 

@@ -153,6 +153,11 @@ pub use process::{
 #[cfg(all(feature = "exec-test-support", not(test)))]
 #[doc(hidden)]
 pub use process::{ExecChildSetupObservation, ExecChildSetupReport, observe_exec_child_setup};
+/// 結合試験 `tests/exec_child_setup.rs`・`tests/fork_exec_isolation.rs` 専用の再公開（SEC-1・CORE-1・TASK-27.4.1・#1299。
+/// 通常の利用者は呼ばない。詳細は定義側）。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+#[doc(hidden)]
+pub use process::{StandardFd, close_standard_fds_for_test};
 pub use reapply::{
     ExecReady, ExecRestrictionReport, ExecRestrictions, UnappliedExecRestriction,
     prepare_exec_restrictions, reapply_restrictions,

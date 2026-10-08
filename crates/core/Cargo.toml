@@ -34,7 +34,8 @@ escape-probe = []
 # （期待 cgroup パスを文字列で受ける）を公開する feature（SUP-6・SEC-1・TASK-163.1・#500）。既定のビルドでは無効で、
 # 公開 API は記録の型から期待パスを組み立てる `Pid1Target::open` だけになる。依存は増えない。
 # exec の子の `execveat` 前の手順を実プロセスで観測する `exec::observe_exec_child_setup`（tests/exec_child_setup.rs。
-# TASK-163 追補・#1456）も同じ feature の下に置く。core 自身のテストでは下の dev-dependency（自己参照）で有効にし、
+# TASK-163 追補・#1456）と、標準 fd を閉じた呼び出し側を作る `exec::close_standard_fds_for_test`（tests/exec_child_setup.rs・
+# tests/fork_exec_isolation.rs。#1299）も同じ feature の下に置く。core 自身のテストでは下の dev-dependency（自己参照）で有効にし、
 # `cargo test --workspace`・`make test-integration` の既定のテスト集合から外れないようにする。
 exec-test-support = []
 

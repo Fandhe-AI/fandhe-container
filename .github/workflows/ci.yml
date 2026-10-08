@@ -489,6 +489,18 @@ jobs:
         timeout-minutes: 5
         run: bash scripts/cli-parity-check-selftest.sh
 
+      # virtio-gpu ゲスト側確認スクリプト（poc/vz-custom-virtio-gpu/guest/check-virtio-gpu.sh）の自己テスト
+      # （TASK-172.6・GPU-6・REPAIR-12・#1056）。合成 fixture（testdata/）と偽の dmesg だけを使い、
+      # 実機・ゲスト VM・root・ネットワーク・secrets は使わない。本体はゲスト Linux 内で実行するが、
+      # 自己テストは README のとおり開発者が macOS でも回すため、README が前提とする BSD 系ツール
+      # （head -c・dd・mktemp・sed -E 等）で動くことを macOS runner で確かめる。Windows（Git Bash）も
+      # 自己テストの実行環境として 3 OS で回す。新ジョブは check-run 名が増えるため既存ジョブの
+      # ステップとする（check-run 件数は不変）
+      - name: virtio-gpu ゲスト側確認スクリプトの自己テスト（TASK-172.6・GPU-6。ubuntu・macos・windows）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make vz-virtio-gpu-guest-check-selftest
+
       - name: AppArmor の非特権 user namespace 制限を緩和（unshare_isolation 用・Linux のみ。CORE-1・SEC-5）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 2

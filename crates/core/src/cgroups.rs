@@ -724,7 +724,7 @@ impl ContainerCgroup {
 /// [`ContainerCgroup::join_hook`] が親で作り、`exec::StagePipeline` の `CgroupJoin` 段へ登録する。
 /// 検証済みの O_PATH ディレクトリ fd（`O_CLOEXEC`）だけを保持し、パス文字列では再解決しない
 /// （pivot 後はホストの `/sys/fs/cgroup` が見えないため。symlink・TOCTOU 対策）。
-/// 契約: fork 後の子でのみ [`CgroupJoin::join_current_process`] が呼ばれる。親で呼ぶと runtime 自身が
+/// 契約: fork 後の子でのみ `CgroupJoin::join_current_process` が呼ばれる。親で呼ぶと runtime 自身が
 /// コンテナ cgroup へ移るため `pub(crate)` に留める。cgroup namespace（`CLONE_NEWCGROUP`）導入時は
 /// 親で `cgroup.procs` を書き込み用に事前 open する方式へ切り替える（未導入のため現状は不要）。
 pub struct CgroupJoin {
@@ -915,7 +915,7 @@ impl DelegatedCgroup {
     /// 退避リーフを指す・コンテナ用子 cgroup の `cgroup.procs` が空。既存の同名子 cgroup は採用せず
     /// `AlreadyExists`。途中失敗時は、自プロセスを移していれば元の親へ戻して所属を読み戻しで検証し、
     /// 本処理が作った子 cgroup・退避リーフを作成直後に固定した fd との同一性を確認してから best-effort で
-    /// 削除する（[`Self::remove_verified`]。巻き戻しの失敗・fd が無く名前指定で消した事実はエラー文に併記）。
+    /// 削除する（`Self::remove_verified`。巻き戻しの失敗・fd が無く名前指定で消した事実はエラー文に併記）。
     ///
     /// 呼び出し元は、本関数で子 cgroup を作る前にこの委譲スコープ（`ContainerCgroupRemover::scope`）を
     /// 状態記録へ記録し（`CreateStateRequest::with_cgroup_scope`。TASK-30.3・OCI-6）、返された配置の instance
@@ -1175,7 +1175,7 @@ impl DelegatedCgroup {
     /// コンテナ用子 cgroup を削除する（空であること。残りがあれば `FailedPrecondition`）。
     ///
     /// `child` は借用で受けるため、`EBUSY` 等で失敗しても呼び出し側がハンドルを保持したまま再試行できる。
-    /// `child` がこの親の配下で作られたものであることを確認したうえで、[`Self::remove_verified`] で
+    /// `child` がこの親の配下で作られたものであることを確認したうえで、`Self::remove_verified` で
     /// 同一性確認・削除・削除済み確認を行う。
     pub fn remove_child(&self, child: &ContainerCgroup) -> Result<(), CgroupError> {
         let step = CgroupStep::Cleanup;

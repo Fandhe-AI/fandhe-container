@@ -158,7 +158,7 @@ pub enum SupplementaryGroups {
     /// 非特権ユーザー自身のグループであり、そのユーザーが元から持つ権限を超えない。稼働中コンテナへの exec では
     /// **exec を起動したプロセスのグループ** で、user namespace の作成者と同じとは限らない（照合していない）。
     /// そのため exec は、`setns` で user namespace へ入る **前**（初期 user namespace で `CAP_SETGID` を持つ間）に
-    /// [`clear_supplementary_groups_before_join`] で消去を試み、root・`sudo` 経由の起動者のグループを持ち込まない。
+    /// `clear_supplementary_groups_before_join` で消去を試み、root・`sudo` 経由の起動者のグループを持ち込まない。
     /// exec でこの値になるのは、起動者自身が既に `setgroups` を禁じた user namespace の中にいる場合だけである。
     KeptSetgroupsDenied {
         /// 残した件数。

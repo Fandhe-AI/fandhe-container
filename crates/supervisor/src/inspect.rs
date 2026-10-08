@@ -43,7 +43,7 @@ impl InspectReport {
     /// レコードから出力内容を作る。
     ///
     /// 公開 API 経由の任意の [`StateRecord`] でも出力サイズを有界に保つため、bundle・cgroupScope が
-    /// 各 [`MAX_FIELD_BYTES`] バイトを超えるレコードは [`ErrorCode::InvalidArgument`] で拒否する
+    /// 各 `MAX_FIELD_BYTES` バイトを超えるレコードは [`ErrorCode::InvalidArgument`] で拒否する
     /// （`StateRecord::new` は絶対パスしか検証しない。無制限確保の防止。SUP-11・TASK-168.1）。
     /// また bundle が UTF-8 でない場合も拒否する（`to_string_lossy` が不正バイトを置換文字へ変え、
     /// 元のパスと一致しない値を黙って出力するのを防ぐ。core の state.json も同入力を拒否する）。

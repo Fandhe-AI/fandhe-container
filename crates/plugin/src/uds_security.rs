@@ -139,7 +139,7 @@
 //! - OCI-5 の state store は別仕様で、未設定時にフォールバックしない（`crates/core`）。
 //!
 //! # peer credential 検証（TASK-124.1・#292。Linux は SO_PEERCRED。PLUG-12）
-//! `transport` の accept / connect が接続直後に [`verify_peer`] を呼ぶ。契約:
+//! `transport` の accept / connect が接続直後に `verify_peer` を呼ぶ。契約:
 //! - 順序: accept（connect）の直後、フレームの read・write より前に検証する。
 //! - fail-closed: 取得失敗も UID 不一致も `Err` を返し、呼び出し側は stream を drop して切断する。
 //! - 比較する UID は接続時点の peer の実効 uid と、listener bind 時（client は connect 時）の自 euid。

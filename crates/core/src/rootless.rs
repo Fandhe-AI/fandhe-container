@@ -528,7 +528,7 @@ struct FileIdentity {
 /// （symlink 不可）・所有者 root・group/other 書き込み不可（差し替えられた実行ファイルを拒否。
 /// PLUG-11 と同じ思想）。さらに全祖先ディレクトリも root 所有・group/other 書き込み不可を要求し
 /// （非 root がディレクトリエントリを差し替えられない状態を保証して TOCTOU を塞ぐ）、検証時の
-/// dev/ino を保持して [`run_helper`] の exec 直前に再検証・同一性比較する。
+/// dev/ino を保持して `run_helper` の exec 直前に再検証・同一性比較する。
 /// setuid ビットは要求しない（file capability 方式の配布があるため）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelperPaths {

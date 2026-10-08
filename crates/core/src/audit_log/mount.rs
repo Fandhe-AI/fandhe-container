@@ -4,7 +4,7 @@
 //!
 //! - `exec::audit_mount_violation`（Linux のマウント検証層。`IsolationViolation` の写像）と
 //!   `oci_runtime` の `audit_mount_config_error` / `MountDestination::resolve_in_audited`
-//!   （API 層）が、拒否を返す直前に [`deliver`] / [`record_mount_rejection`] を呼ぶ
+//!   （API 層）が、拒否を返す直前に `deliver` / [`record_mount_rejection`] を呼ぶ
 //! - 時刻と PID は拒否を返した直後に同じプロセスで取得する（「拒否と同時」の意味）
 //! - OS 非依存（3 OS でコンパイルされる）
 //!

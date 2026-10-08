@@ -238,7 +238,8 @@ else
 endif
 
 # venus 試験治具（workspace 外の独立 PoC パッケージ。GPU-6・TASK-172.4・#888）の fmt / clippy / test。
-# `make ci` には含めない（CI ジョブへの組み込みは別 issue）。実機前提テストは #[ignore] で分離済み。
+# `make ci` には含めない。CI は rust-ci-default-features ジョブ（3 OS）が本ターゲットを実行し、
+# plugin-macos 側の変更で治具が壊れたことを検出する。実機前提テストは #[ignore] で分離済み。
 .PHONY: poc-venus-jig-check
 poc-venus-jig-check: ## venus 試験治具（poc/venus-decoder/jig）の fmt-check・clippy・test を実行する（GPU-6・TASK-172.4）
 	cargo fmt --manifest-path poc/venus-decoder/jig/Cargo.toml --check

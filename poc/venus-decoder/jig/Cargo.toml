@@ -2,7 +2,8 @@
 # 確定 19 crate＋benches の crate 境界（docs/design/crate-naming.md）を変えないため、空の [workspace] を持たせて
 # ルート workspace の外に置く（ルート Cargo.toml の members には加えない）。製品 crate から本パッケージへは依存しない（一方向）。
 # 依存は workspace 内の path 依存（自前 venus デコーダ）のみで、外部クレートの追加はない。
-# ルートの `make ci` には入らないため、`make poc-venus-jig-check` で test / clippy / fmt-check を回す。
+# ルートの `make ci` には入らないため、`make poc-venus-jig-check` で test / clippy / fmt-check を回す
+# （CI は .github/workflows/ci.yml の rust-ci-default-features ジョブが 3 OS で同ターゲットを実行する）。
 
 [package]
 name = "fandhe-container-poc-venus-jig"

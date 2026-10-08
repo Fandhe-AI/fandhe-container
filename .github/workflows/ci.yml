@@ -195,11 +195,12 @@ jobs:
             echo "::error::required file(s) for cargo deny stage are missing:${missing}"
             exit 1
           fi
-      # stable（rust-toolchain.toml の channel = "stable" を単一真実源として追従）
+      # stable（rust-toolchain.toml の channel = "stable" を単一真実源として追従）。
+      # rustfmt は下の venus 試験治具の fmt-check（make poc-venus-jig-check）が使う
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
-          components: clippy
+          components: clippy, rustfmt
       # crates/supervisor の workspace members 登録を検証する（TASK-157.1・#235・SUP-1）。
       # members から外れると cargo test --workspace が機械照合テストごと実行しなくなるため、
       # workspace 外の make ターゲットで検出する。既存ジョブへの追加（新ジョブは必須チェック名が増える）
@@ -221,6 +222,19 @@ jobs:
       - name: cli のバックエンド直接依存なしの検証
         shell: bash
         run: make check-cli-backend-deps
+      # venus 試験治具（poc/venus-decoder/jig。GPU-6・TASK-172.4・#888）の fmt-check・clippy・test。
+      # 治具はルート workspace 外の独立パッケージで cargo build/test --workspace の対象に入らないが、
+      # crates/plugin-macos（gpu::venus）へ path 依存するため、plugin-macos 側の変更で治具が壊れても
+      # 他のステップでは検出できない。依存先の plugin-macos・platform-macos は上の cargo build
+      # --workspace が 3 OS でビルドしており、治具自身にも OS 分岐（cfg(target_os)）が無いため、
+      # 本ジョブの 3 OS matrix でそのまま実行する（特定 OS の skip はしない）。実機前提テスト
+      # （tests/real_machine_capset_log.rs）は #[ignore] で既定集合から分離済みで、ここでは走らない。
+      # 治具は独自の Cargo.lock を持ち、target は治具ディレクトリ配下（.gitignore 済み）に作る。
+      # 新ジョブは check-run 名が増えるため既存ジョブのステップとする（check-run 件数は不変）
+      - name: venus 試験治具の fmt-check・clippy・test（GPU-6・TASK-172.4）
+        shell: bash
+        timeout-minutes: 15
+        run: make poc-venus-jig-check
 
   # --------------------------------------------------
   # integration-test（REPAIR-7 ステージ 3: タイムアウト保護された結合試験）

@@ -220,7 +220,7 @@ GPU-6 の決定（ヘッドレス compute のみ・2D スキャンアウト非�
 
 macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なしの最小 virtio-gpu を TASK-64（#350。完了済み）の最小 VM に登録できるかの確認ハーネス（GPU-6・MAC-5）。配置は `poc/vz-custom-virtio-gpu/`（製品 crate 外・workspace 外）。判定は #1057（TASK-172.h5。人間担当）。
 
-- 実装したもの: ゲスト側確認スクリプト `poc/vz-custom-virtio-gpu/guest/check-virtio-gpu.sh`（dmesg の virtio_gpu 行から probe・feature・KMS・capset・host memory window を判定）、自己テスト（合成 fixture。`make vz-virtio-gpu-guest-check-selftest`）、README（デバイス契約・実機手順）
+- 実装したもの: ゲスト側確認スクリプト `poc/vz-custom-virtio-gpu/guest/check-virtio-gpu.sh`（dmesg の virtio_gpu 行から probe・feature・KMS・capset・host memory window を判定）、自己テスト（合成 fixture。`make vz-virtio-gpu-guest-check-selftest`。CI の `integration-test` ジョブが 3 OS で実行）、README（デバイス契約・実機手順）
 - **ホスト側のデバイス登録コードは未実装（REPAIR-3）**。計画フェーズの調査（確認日 2026-10-08）で、受け入れ条件の「新規依存・`unsafe` が要る場合は止めて承認事項として報告」に当たったため
 - 調査結果:
   - 採用済み `objc2-virtualization =0.3.2`（承認 #356）は `VZCustomVirtioDevice`・`VZVirtioQueue`・`VZVirtioSharedMemoryRegion*` を含まない。crates.io の最新も 0.3.2（2025-10-04）で、macOS 27 対応版は未リリース
@@ -241,7 +241,7 @@ macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なし�
 | 2. host visible 共有メモリ領域を提示できる | API 上は提示できる見込み。ゲストで host visible が有効になるかは未確認（#1057） |
 | 3. 新規依存・`unsafe` が要る場合は止めて報告 | ゲートに当たり停止。上記の承認事項 A〜D として報告済み |
 
-- 先送り: ホスト側の登録ハーネス本体（承認事項の決定後に別 issue）、selftest の CI 組み込み（`.claude/rules/ci.md` の更新を伴うため別途承認）、`num_scanouts=0` が古いカーネルで通らない場合の受け入れ条件見直し（#1057 へ申し送り）
+- 先送り: ホスト側の登録ハーネス本体（承認事項の決定後に別 issue）、`num_scanouts=0` が古いカーネルで通らない場合の受け入れ条件見直し（#1057 へ申し送り）
 - セキュリティ: host visible 共有メモリと virtqueue 経由の ctrl コマンドはゲストからの untrusted 入力。ホスト側実装時は security-auditor を必須とし、境界検査・サイズ上限・fail-closed（#723 の方針）を適用する
 
 ## 10. 試験治具 VMM と外部バックエンド接続（TASK-172.4・#888）
@@ -252,7 +252,8 @@ macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なし�
 
 - 実装済み: 候補比較（本章）、ctrl の `GET_CAPSET_INFO` / `GET_CAPSET` の復号・応答符号化・構造化ログ 1 行（`adapter`）、治具が広告する feature と config の定数（`device`）、ログ照合器と実機前提テストの枠（`log`・`tests/real_machine_capset_log.rs`）。socket は開かない
 - **受入基準 2（ゲストの Mesa venus の capset クエリが自前デコーダに届いたことをログで確認）は未達**。トランスポート（後続 F1）と実機実行（F3・#725。人間担当）が必要なため
-- 後続（issue 起票は未実施・承認待ち）: F1 vhost-user トランスポート（メッセージ codec・fd 受け渡しと `mmap` の `sys` ラッパー・split virtqueue・kick / call。rust-vmm 系クレートは MVM-4 で使えないため自作）、F2 残りの ctrl 応答（`GET_DISPLAY_INFO`・`CTX_CREATE` 等）、F3 実機疎通（#725）、治具の CI ジョブ組み込み
+- 後続（issue 起票は未実施・承認待ち）: F1 vhost-user トランスポート（メッセージ codec・fd 受け渡しと `mmap` の `sys` ラッパー・split virtqueue・kick / call。rust-vmm 系クレートは MVM-4 で使えないため自作）、F2 残りの ctrl 応答（`GET_DISPLAY_INFO`・`CTX_CREATE` 等）、F3 実機疎通（#725）
+- CI: `make poc-venus-jig-check`（fmt-check・clippy・test）は CI の `rust-ci-default-features` ジョブが 3 OS で実行し、`crates/plugin-macos` 側の変更による治具の破損を検出する（実機前提テストは `#[ignore]` で分離済みで CI では走らない）
 
 ### 10.2 候補比較
 

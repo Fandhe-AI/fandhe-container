@@ -195,11 +195,12 @@ jobs:
             echo "::error::required file(s) for cargo deny stage are missing:${missing}"
             exit 1
           fi
-      # stable（rust-toolchain.toml の channel = "stable" を単一真実源として追従）
+      # stable（rust-toolchain.toml の channel = "stable" を単一真実源として追従）。
+      # rustfmt は下の venus 試験治具の fmt-check（make poc-venus-jig-check）が使う
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
-          components: clippy
+          components: clippy, rustfmt
       # crates/supervisor の workspace members 登録を検証する（TASK-157.1・#235・SUP-1）。
       # members から外れると cargo test --workspace が機械照合テストごと実行しなくなるため、
       # workspace 外の make ターゲットで検出する。既存ジョブへの追加（新ジョブは必須チェック名が増える）
@@ -221,6 +222,33 @@ jobs:
       - name: cli のバックエンド直接依存なしの検証
         shell: bash
         run: make check-cli-backend-deps
+      # venus 試験治具（poc/venus-decoder/jig。GPU-6・TASK-172.4・#888）の fmt-check・clippy・test。
+      # 治具はルート workspace 外の独立パッケージで cargo build/test --workspace の対象に入らないが、
+      # crates/plugin-macos（gpu::venus）へ path 依存するため、plugin-macos 側の変更で治具が壊れても
+      # 他のステップでは検出できない。依存先の plugin-macos・platform-macos は上の cargo build
+      # --workspace が 3 OS でビルドしており、治具自身にも OS 分岐（cfg(target_os)）が無いため、
+      # 本ジョブの 3 OS matrix でそのまま実行する（特定 OS の skip はしない）。実機前提テスト
+      # （tests/real_machine_capset_log.rs）は #[ignore] で既定集合から分離済みで、ここでは走らない。
+      # 治具は独自の Cargo.lock を持ち、clippy / test は --locked で lock を固定する（lock が黙って再解決
+      # されない）。target は治具ディレクトリ配下（.gitignore 済み）に作る。
+      # 新ジョブは check-run 名が増えるため既存ジョブのステップとする（check-run 件数は不変）
+      - name: venus 試験治具の fmt-check・clippy・test（GPU-6・TASK-172.4）
+        shell: bash
+        timeout-minutes: 15
+        run: make poc-venus-jig-check
+      # 治具の Cargo.lock の依存監査（REPAIR-7 ステージ 5・REPAIR-9・OSS-4・MVM-4）。rust-ci の deny
+      # （reusable workflow）はルート workspace だけを見るため、治具の lock は別に検査する。ルートの
+      # deny.toml を共有し、ルートと同じ 4 種（advisories・bans・licenses・sources）を --locked で実行する。
+      # cargo-deny は Makefile の CARGO_DENY_VERSION（rust-ci の cargo-deny-version と同じ 0.20.2）を
+      # cargo install --locked で導入する（action は追加しない）。deny.toml に targets の指定が無く、
+      # cargo-deny は実行ホストに関係なく全ターゲットの依存グラフを検査するため、結果は OS に依らない。
+      # 導入のビルド時間を 3 重に払わないよう ubuntu のみで実行する（ビルド・テストのゲートではなく
+      # 依存監査のため、ci.md の 3 OS 必須の対象外。bench-regression と同じ扱い）
+      - name: venus 試験治具の Cargo.lock の依存監査（cargo deny。ubuntu のみ）
+        if: runner.os == 'Linux'
+        shell: bash
+        timeout-minutes: 20
+        run: make deny-poc-venus-jig
 
   # --------------------------------------------------
   # integration-test（REPAIR-7 ステージ 3: タイムアウト保護された結合試験）
@@ -454,26 +482,41 @@ jobs:
           cargo test -p fandhe-container-io --bins --features crash-test-server
 
       # PLUG-4 判定スクリプト（scripts/check-plug4-core-invariance.sh）の自己テスト（TASK-109.4・REPAIR-12）。
-      # 判定本体は bench-regression（ubuntu 単独）で走るが、`make plug4-core-invariance` は開発者が macOS でも
-      # 実行するため、GNU / BSD 双方のツールで動くことを ubuntu・macos の実行で確かめる。fixture の最小
-      # workspace（依存 0 件）だけを使い、ネットワーク・secrets・`${{ }}` の埋め込みは使わない。
-      # Windows は判定スクリプトの対象外（Git Bash での動作は未検証）のため除く。新ジョブは check-run 名が
-      # 増えるため既存ジョブのステップとする（check-run 件数は不変）
-      - name: PLUG-4 判定スクリプトの自己テスト（TASK-109.4・REPAIR-12。ubuntu・macos）
-        if: runner.os != 'Windows' && env.HANG_PROBE != 'true'
+      # 判定本体は bench-regression（ubuntu 単独）で走るが、`make plug4-core-invariance` は開発者が各 OS で
+      # 実行するため、GNU / BSD 双方のツールと Windows の Git Bash（本ジョブ既定の shell: bash）で動くことを
+      # 3 OS の実行で確かめる。fixture の最小 workspace（依存 0 件）だけを使い、ネットワーク・secrets・
+      # `${{ }}` の埋め込みは使わない。symlink を辿らず symlink のまま複製することは、ubuntu・macos で fixture の
+      # build.rs が判定スクリプトの一時 workspace を検査して確かめる。Windows の Git Bash では fixture の
+      # `ln -s` が複製になるため、空白を含むパスと複製の経路だけを確かめる（詳細は自己テスト冒頭のコメント）。
+      # 新ジョブは check-run 名が増えるため既存ジョブのステップとする（check-run 件数は不変）
+      - name: PLUG-4 判定スクリプトの自己テスト（TASK-109.4・REPAIR-12。ubuntu・macos・windows）
+        if: env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: make plug4-core-invariance-selftest
 
       # CLI 3 OS 比較スクリプト（scripts/cli-parity-check.sh）の自己テスト（TASK-125.1・CLI-1・REPAIR-12）。
       # スタブ CLI だけを使い、製品バイナリ・root・ネットワーク・secrets は使わない。3 OS すべてで実行し、
       # macOS の BSD ツール（timeout 不在・sed / mktemp の差）と Windows の Git Bash（本ジョブ既定の
-      # shell: bash）で動くことを確かめる。`make cli-parity-selftest` と同じ 1 コマンドを直接起動する
-      # （Windows runner の make とその既定シェルの差に依存しないため）。
+      # shell: bash）で動くことを確かめる。本ジョブの自己テスト 3 件（PLUG-4・CLI・virtio-gpu）はいずれも
+      # make ターゲット経由で起動する（Makefile は SHELL := /bin/bash で、windows runner の make は Git Bash の
+      # bash でレシピを実行する。rust-ci-default-features も windows で make を使う）。
       # 新ジョブは check-run 名が増えるため既存ジョブのステップとする（check-run 件数は不変）
       - name: CLI 3 OS 比較スクリプトの自己テスト（TASK-125.1・CLI-1。ubuntu・macos・windows）
         if: env.HANG_PROBE != 'true'
         timeout-minutes: 5
-        run: bash scripts/cli-parity-check-selftest.sh
+        run: make cli-parity-selftest
+
+      # virtio-gpu ゲスト側確認スクリプト（poc/vz-custom-virtio-gpu/guest/check-virtio-gpu.sh）の自己テスト
+      # （TASK-172.6・GPU-6・REPAIR-12・#1056）。合成 fixture（testdata/）と偽の dmesg だけを使い、
+      # 実機・ゲスト VM・root・ネットワーク・secrets は使わない。本体はゲスト Linux 内で実行するが、
+      # 自己テストは README のとおり開発者が macOS でも回すため、README が前提とする BSD 系ツール
+      # （head -c・dd・mktemp・sed -E 等）で動くことを macOS runner で確かめる。Windows（Git Bash）も
+      # 自己テストの実行環境として 3 OS で回す。新ジョブは check-run 名が増えるため既存ジョブの
+      # ステップとする（check-run 件数は不変）
+      - name: virtio-gpu ゲスト側確認スクリプトの自己テスト（TASK-172.6・GPU-6。ubuntu・macos・windows）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make vz-virtio-gpu-guest-check-selftest
 
       - name: AppArmor の非特権 user namespace 制限を緩和（unshare_isolation 用・Linux のみ。CORE-1・SEC-5）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
@@ -708,7 +751,7 @@ jobs:
           make plugin-feature-size | tee -a "${GITHUB_STEP_SUMMARY}"
 
       # PLUG-4（TASK-109.4）: plugin 追加前後の別ビルドで core の指紋（ソース一覧・依存木・rlib sha256）を比較する。
-      # スクリプトの自己テストは integration-test ジョブ（ubuntu・macos）で実行する。
+      # スクリプトの自己テストは integration-test ジョブ（ubuntu・macos・windows の 3 OS）で実行する。
       # 既存ジョブのステップとして追加（check-run 件数は不変）
       - name: plugin 追加前後の core 不変性（PLUG-4・TASK-109.4）
         shell: bash

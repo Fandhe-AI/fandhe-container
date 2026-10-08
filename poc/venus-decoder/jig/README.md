@@ -14,7 +14,7 @@ virtio-gpu 外部バックエンドの仕組みへ、自前の最小 venus デ�
 ## 実行
 
 ```bash
-make poc-venus-jig-check
+make poc-venus-jig-check   # CI は rust-ci-default-features ジョブが 3 OS で実行
 # 実機前提テスト（既定の集合から分離。GPU 付き Linux・治具 VMM・Mesa venus ゲストが必要）
 FANDHE_VENUS_JIG_LOG=<ログファイル> cargo test --manifest-path poc/venus-decoder/jig/Cargo.toml \
   --test real_machine_capset_log -- --ignored

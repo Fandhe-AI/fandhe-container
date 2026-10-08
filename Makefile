@@ -238,12 +238,16 @@ else
 endif
 
 # venus 試験治具（workspace 外の独立 PoC パッケージ。GPU-6・TASK-172.4・#888）の fmt / clippy / test。
-# `make ci` には含めない（CI ジョブへの組み込みは別 issue）。実機前提テストは #[ignore] で分離済み。
+# `make ci` には含めない。CI は rust-ci-default-features ジョブ（3 OS）が本ターゲットを実行し、
+# plugin-macos 側の変更で治具が壊れたことを検出する。実機前提テストは #[ignore] で分離済み。
+# clippy / test は --locked で治具の Cargo.lock を固定する（ルート側の依存変更で lock が黙って再解決され、
+# 監査していない版でビルドされるのを防ぐ。lock の更新が要る変更は lock の差分として PR に現れる）。
+POC_VENUS_JIG_MANIFEST := poc/venus-decoder/jig/Cargo.toml
 .PHONY: poc-venus-jig-check
 poc-venus-jig-check: ## venus 試験治具（poc/venus-decoder/jig）の fmt-check・clippy・test を実行する（GPU-6・TASK-172.4）
-	cargo fmt --manifest-path poc/venus-decoder/jig/Cargo.toml --check
-	cargo clippy --manifest-path poc/venus-decoder/jig/Cargo.toml --all-targets -- -D warnings
-	cargo test --manifest-path poc/venus-decoder/jig/Cargo.toml
+	cargo fmt --manifest-path $(POC_VENUS_JIG_MANIFEST) --check
+	cargo clippy --manifest-path $(POC_VENUS_JIG_MANIFEST) --locked --all-targets -- -D warnings
+	cargo test --manifest-path $(POC_VENUS_JIG_MANIFEST) --locked
 
 # CLI が macOS / Windows のバックエンド実装へ直接依存しないことの機械判定（CLI-1・PLUG-4・TASK-79.4）。
 # macOS / Windows は core の plugin 発見・登録機構経由で呼ぶ。`cargo tree` の通常依存に
@@ -361,7 +365,8 @@ endif
 # 判定スクリプトの自己テスト（PLUG-4・TASK-109.4・REPAIR-12）。依存 0 件の最小 workspace を一時 git
 # リポジトリとして作って判定スクリプトを走らせるため、実リポの workspace には依存しない（HAS_CARGO では
 # 判定しない）。cargo・git 未導入時は黙ってスキップせず fail-closed で止める。CI の integration-test
-# ジョブ（ubuntu・macos）が実行し、GNU / BSD 双方のツールで動くことを確かめる。
+# ジョブ（ubuntu・macos・windows の 3 OS。Windows は Git Bash）が実行し、GNU / BSD 双方のツールと
+# Git Bash で動くことを確かめる。
 .PHONY: plug4-core-invariance-selftest
 plug4-core-invariance-selftest: ## PLUG-4 判定スクリプトの自己テスト（TASK-109.4・REPAIR-12。fixture workspace）
 	@for c in cargo git; do \
@@ -374,7 +379,7 @@ plug4-core-invariance-selftest: ## PLUG-4 判定スクリプトの自己テス�
 
 # CLI 基本 6 コマンドの 3 OS 同一構文・挙動の比較（TASK-125.1・CLI-1・MS-6）。
 # 自己テストはスタブ CLI のみを使い、製品バイナリ・root は使わない（REPAIR-12）。CI の integration-test
-# ジョブ（ubuntu・macos・windows の 3 OS）が同じコマンドを直接実行する。make ci には含めない。
+# ジョブ（ubuntu・macos・windows の 3 OS）が本ターゲットを実行する。make ci には含めない。
 .PHONY: cli-parity-selftest
 cli-parity-selftest: ## CLI 3 OS 比較スクリプトの自己テスト（TASK-125.1・REPAIR-12。スタブ CLI のみ）
 	bash scripts/cli-parity-check-selftest.sh
@@ -430,7 +435,7 @@ else
 endif
 
 .PHONY: deny
-deny: ## cargo deny check advisories bans licenses sources（依存監査。cargo-deny 未導入なら自動導入）
+deny: ## cargo deny check advisories bans licenses sources（ルート workspace と venus 試験治具の依存監査。cargo-deny 未導入なら自動導入）
 ifneq ($(and $(HAS_CARGO),$(HAS_DENY),$(HAS_MEMBERS)),)
 	@export PATH="$$HOME/.cargo/bin:$$PATH"; \
 	command -v cargo-deny >/dev/null 2>&1 || { \
@@ -438,9 +443,27 @@ ifneq ($(and $(HAS_CARGO),$(HAS_DENY),$(HAS_MEMBERS)),)
 		cargo install cargo-deny@$(CARGO_DENY_VERSION) --locked; \
 	}; \
 	cargo deny --locked check advisories bans licenses sources
+	@$(MAKE) --no-print-directory deny-poc-venus-jig
 else
 	@echo "skip: Cargo.toml・deny.toml のいずれか未追加、または workspace にメンバー crate が無いため deny をスキップ"
 endif
+
+# venus 試験治具（ルート workspace 外。独自の Cargo.lock を持つ。GPU-6・TASK-172.4）の依存監査。
+# ルートの deny.toml を共有し（--config）、ルートと同じ 4 種を --locked で検査する。CI の rust-ci
+# （reusable workflow）の deny はルート workspace だけを見るため、CI では rust-ci-default-features
+# ジョブ（ubuntu）が本ターゲットを実行する。cargo-deny 未導入なら deny と同じ版を自動導入する。
+# 引数の位置: cargo-deny 0.20.2 では --manifest-path・--config・--locked は `cargo deny` 直下の大域
+# オプションで、`check` の後ろに置くと「unexpected argument '--config'」で失敗する（`cargo deny --help`
+# と `cargo deny check --help` で確認済み）。--show-stats で 4 種それぞれの ok / 件数を必ずログに出す。
+.PHONY: deny-poc-venus-jig
+deny-poc-venus-jig: ## venus 試験治具（poc/venus-decoder/jig）の Cargo.lock を cargo deny で検査する（ルートの deny.toml を共有）
+	@export PATH="$$HOME/.cargo/bin:$$PATH"; \
+	command -v cargo-deny >/dev/null 2>&1 || { \
+		echo "cargo-deny を導入します"; \
+		cargo install cargo-deny@$(CARGO_DENY_VERSION) --locked; \
+	} && \
+	cargo deny --manifest-path $(POC_VENUS_JIG_MANIFEST) --config deny.toml --locked \
+		check --show-stats advisories bans licenses sources
 
 .PHONY: ci
 ci: lint-docs check-workspace-manifest fmt-check lint test deny ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
@@ -619,7 +642,8 @@ fio-bench-selftest: ## fio ベンチスクリプトの自己テスト（REPAIR-1
 	bash scripts/fio-randwrite-4k-selftest.sh
 
 # virtio-gpu ゲスト側確認スクリプトの自己テスト（TASK-172.6・GPU-6・REPAIR-12）。
-# 合成 fixture のみで完結し、macOS 27・ゲスト VM は不要。make ci・CI には組み込まない。
+# 合成 fixture のみで完結し、macOS 27・ゲスト VM は不要。make ci には含めない。CI は integration-test
+# ジョブ（ubuntu・macos・windows の 3 OS）が本ターゲットを実行し、BSD 系ツールでの移植性も確かめる。
 .PHONY: vz-virtio-gpu-guest-check-selftest
 vz-virtio-gpu-guest-check-selftest: ## virtio-gpu ゲスト側確認スクリプトの自己テスト（TASK-172.6・GPU-6・REPAIR-12。fixture のみ）
 	bash poc/vz-custom-virtio-gpu/guest/check-virtio-gpu-selftest.sh

@@ -497,13 +497,14 @@ jobs:
       # CLI 3 OS 比較スクリプト（scripts/cli-parity-check.sh）の自己テスト（TASK-125.1・CLI-1・REPAIR-12）。
       # スタブ CLI だけを使い、製品バイナリ・root・ネットワーク・secrets は使わない。3 OS すべてで実行し、
       # macOS の BSD ツール（timeout 不在・sed / mktemp の差）と Windows の Git Bash（本ジョブ既定の
-      # shell: bash）で動くことを確かめる。`make cli-parity-selftest` と同じ 1 コマンドを直接起動する
-      # （Windows runner の make とその既定シェルの差に依存しないため）。
+      # shell: bash）で動くことを確かめる。本ジョブの自己テスト 3 件（PLUG-4・CLI・virtio-gpu）はいずれも
+      # make ターゲット経由で起動する（Makefile は SHELL := /bin/bash で、windows runner の make は Git Bash の
+      # bash でレシピを実行する。rust-ci-default-features も windows で make を使う）。
       # 新ジョブは check-run 名が増えるため既存ジョブのステップとする（check-run 件数は不変）
       - name: CLI 3 OS 比較スクリプトの自己テスト（TASK-125.1・CLI-1。ubuntu・macos・windows）
         if: env.HANG_PROBE != 'true'
         timeout-minutes: 5
-        run: bash scripts/cli-parity-check-selftest.sh
+        run: make cli-parity-selftest
 
       # virtio-gpu ゲスト側確認スクリプト（poc/vz-custom-virtio-gpu/guest/check-virtio-gpu.sh）の自己テスト
       # （TASK-172.6・GPU-6・REPAIR-12・#1056）。合成 fixture（testdata/）と偽の dmesg だけを使い、

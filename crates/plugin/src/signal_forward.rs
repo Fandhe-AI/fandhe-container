@@ -34,6 +34,12 @@
 //!   残留し得る。macOS では plugin 本体も孫も残留し得る（kqueue `NOTE_EXIT` による監視は将来課題。
 //!   #1403 判断 3）。Windows は対象外。
 //! - spawn から登録（`activate`）までの間は転送対象外。
+//! - 他所での回収（継承した `SIGCHLD` の `SIG_IGN`・`SA_NOCLDWAIT`・利用側の `waitpid(-1)` 等）は契約外。
+//!   その場合カーネルや利用側が子を回収しても、登録は `ChildGuard::try_wait` が `ECHILD` を受けるまで
+//!   残り、その間に pid が再利用されると転送が無関係なプロセス（グループ）へ届き得る。`ECHILD`（および
+//!   他の `waitpid` の失敗）を受けた時点で終端として登録を外し、以後 kill もしない（`Reap::Lost`。
+//!   プロセスグループ宛ての SIGKILL も送らない）。窓を閉じるのは利用側の責務で、`SIGCHLD` を `SIG_DFL` に
+//!   保ち、plugin の子を `waitpid(-1)` で回収しないこと。
 //! - plugin は独立したプロセスグループで起動される（#1311。`lifecycle::spawn_registered`）。端末の Ctrl-C は
 //!   カーネルのグループ配送では plugin に届かず、本転送（`kill(-pid)`）だけが孫まで届く。
 

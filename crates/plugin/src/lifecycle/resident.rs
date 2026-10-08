@@ -115,6 +115,7 @@ pub enum ResidentState {
     /// 子が稼働中で、接続を保持している。
     Running,
     /// 子が自発的に終了し、回収済み。`code` はシグナル終了などで取得できない場合 `None`。
+    /// 他所で回収され終了状態が不明な場合（`code: None`）を含む。
     Exited { code: Option<i32> },
     /// 往復の失敗等でこちらが強制終了し、回収まで確認した。
     Killed,
@@ -518,6 +519,11 @@ impl ResidentPlugin {
                 self.state = ResidentState::GroupKillFailed;
                 group_kill_failed_error("a failed call")
             }
+            // 他所で回収された（ECHILD 等。#1513）。終了状態が失われたため終了コード不明の終了として扱う。
+            Reap::Lost => {
+                self.state = ResidentState::Exited { code: None };
+                exited_error(None)
+            }
             Reap::Unreaped => {
                 self.state = ResidentState::Unreaped;
                 unreaped_error(&mut self.guard, "a failed call")
@@ -583,7 +589,8 @@ fn not_running_error() -> PluginError {
 /// 起動失敗経路で子を kill・回収する。回収を確認できなければ元のエラーに代えて `Internal`。
 fn reap_after_failure(guard: &mut ChildGuard, error: PluginError) -> PluginError {
     match guard.kill_and_reap() {
-        Reap::Reaped(_) | Reap::AlreadyReaped => error,
+        // 他所で回収された（`Lost`。#1513）子は自プロセスの子として残っていないため、元のエラーを返す。
+        Reap::Reaped(_) | Reap::AlreadyReaped | Reap::Lost => error,
         Reap::GroupKillFailed => group_kill_failed_error("a failed start"),
         Reap::Unreaped => unreaped_error(guard, "a failed start"),
     }
@@ -680,6 +687,7 @@ mod tests {
                 child: None,
                 reported_unreaped: false,
                 leader_reaped: true,
+                lost: false,
                 slot: None,
             },
             capture: None,
@@ -706,6 +714,7 @@ mod tests {
                 child: None,
                 reported_unreaped: false,
                 leader_reaped: true,
+                lost: false,
                 slot: None,
             },
             capture: None,

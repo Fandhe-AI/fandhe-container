@@ -11,6 +11,15 @@
 //! 本体は G6（TASK-79〜98 の一部。crate の中核成果物は TASK-79〔基本コマンド〕・TASK-95〔エラー形式〕）で
 //! 実装する。PLUG-1 区分は core（crate-naming.md）。
 
+// `signal-test-support` は試験専用の入口（固定の記録ハンドラの登録と読み出し）を公開する feature で、製品の
+// バイナリに含める理由がない。最適化ビルド（`debug_assertions` が無効）で有効になっていたらコンパイルを止める
+// （#1513・PLUG-7・REPAIR-3。supervisor・core の `exec-test-support` と同じ方式。テスト・clippy は dev プロファイル
+// のため影響しない）。
+#[cfg(all(feature = "signal-test-support", not(debug_assertions)))]
+compile_error!(
+    "the `signal-test-support` feature exposes test-only signal handler entry points and must not be enabled in release builds"
+);
+
 pub mod commands;
 pub mod doctor;
 pub mod error;

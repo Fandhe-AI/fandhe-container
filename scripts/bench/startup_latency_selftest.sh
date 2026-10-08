@@ -138,6 +138,8 @@ cat >>"$stub" <<'STUB'
 #   exec-after-1s: start 後 1 秒間は state が即座に created を返し、その後 running を返す
 #   log-holder: create・start・delete がそれぞれ、ログ（stdout / stderr）を開いたまま 3 秒残る
 #               子プロセスを起こしてから正常終了する（子の PID を $STUB_STATE/holders に記録）
+#   state-pad: state が有効な JSON の後に 1.1 MiB の空白と別の JSON を出す（ログ上限で切り詰められる）
+#   holder-long: create が 20 秒残る子プロセスにログを継承させ、delete が常に失敗する
 #   id-in-use: create 前から同じ ID のコンテナが存在する
 mode="${STUB_MODE:-ok}"
 cmd="$1"
@@ -153,6 +155,16 @@ if [ "$mode" = log-holder ] && { [ "$cmd" = create ] || [ "$cmd" = start ] || [ 
   echo "$!" >>"$STUB_STATE/holders"
 fi
 m="$STUB_STATE/$id"
+if [ "$mode" = holder-long ] && [ "$cmd" = create ]; then
+  sleep 20 &
+  echo "$!" >>"$STUB_STATE/holders"
+fi
+if [ "$mode" = state-pad ] && [ "$cmd" = state ]; then
+  printf '{"ociVersion":"1.0.2","id":"%s","status":"stopped","pid":0,"bundle":"/x"}\n' "$id"
+  head -c 1153434 /dev/zero | tr '\0' ' '
+  printf '{"ociVersion":"1.0.2","id":"%s","status":"stopped","pid":0,"bundle":"/x"}\n' "$id"
+  exit 0
+fi
 # bundle は create が受け取った --bundle を返す（OCI state の bundle は絶対パス）。
 state_json() {
   printf '{"ociVersion":"1.0.2","id":"%s","status":"%s","pid":0,"bundle":"%s"}\n' \
@@ -273,7 +285,7 @@ case "$cmd" in
     [ -e "$m.created" ] || not_exist
     case "$mode" in
       cleanup-hang) exec sleep 30 ;;
-      delete-fail | create-fail-delete-fail) echo "stub: delete failed" >&2; exit 1 ;;
+      delete-fail | holder-long | create-fail-delete-fail) echo "stub: delete failed" >&2; exit 1 ;;
       never-stops) [ -e "$m.started" ] && { echo "stub: cannot delete running container" >&2; exit 1; } ;;
       running-race)
         if [ -e "$m.started" ]; then
@@ -621,6 +633,28 @@ reset_log
 STUB_MODE=fsize-probe expect_rc "fsize-probe" 0 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
 expect_eq "fsize-not-inherited" "$(ulimit -f)" "$(cat "$stub_state/fsize" 2>/dev/null)"
 expect_eq "fsize-flood-rc" "0" "$(cat "$stub_state/flood-rc" 2>/dev/null)"
+
+# --- 7c2. 切り詰められた state 応答は有効な単一 JSON として受理しない（状態不明で計測失敗） ---
+reset_log
+pad_tmp="$work/pad-tmp"
+mkdir -p "$pad_tmp"
+TMPDIR="$pad_tmp" STUB_MODE=state-pad expect_rc "state-truncated-rejected" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 3
+
+# --- 7c3. 後始末は収集プロセスの子孫（読み取り中の head / wc）も回収する ---
+reset_log
+hold_tmp="$work/hold-tmp"
+mkdir -p "$hold_tmp"
+rm -f "$stub_state/holders"
+TMPDIR="$hold_tmp" STUB_MODE=holder-long "$bash_bin" "$target_script" --target own --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1 >/dev/null 2>&1 || true
+left=0
+for p in $(pgrep -x head 2>/dev/null); do
+  case "$(readlink "/proc/$p/fd/1" 2>/dev/null)" in "$hold_tmp"/*) left=$((left + 1)) ;; esac
+done
+expect_eq "collector-descendants-reaped" "0" "$left"
+if [ -r "$stub_state/holders" ]; then
+  # shellcheck disable=SC2046
+  kill $(cat "$stub_state/holders") 2>/dev/null || true
+fi
 
 # --- 7d. 後始末中の 2 回目のシグナルで後始末が中断されない（終了コード 4 を保つ） ---
 for sig in INT TERM HUP; do

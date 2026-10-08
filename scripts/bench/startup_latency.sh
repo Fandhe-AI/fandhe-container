@@ -464,8 +464,16 @@ log_collect() {
   extra="$(wc -c)" || extra=0
   extra="${extra//[!0-9]/}"
   if [ "${extra:-0}" -gt 0 ]; then
+    # 解析側が不完全な出力を受理しないよう、切り詰めた事実を目印ファイルで親へ伝える（log_truncated）。
+    : >"$1.truncated" 2>/dev/null || true
     echo "warning: runtime-log-truncated: ${1##*/} limit_kib=$LOG_MAX_KIB" >&2
   fi
+}
+
+# 記録先ファイルが上限超過で切り詰められたか（log_collect が置く目印）。解析する呼び出しだけが
+# 参照し、切り詰められた出力は判定不能として扱う（診断用ログの読み捨ては維持する）。引数: <記録先ファイル>
+log_truncated() {
+  [ -e "$1.truncated" ]
 }
 
 # pid が本スクリプトの生きている直接の子か（pid の再利用による誤爆を避けるため /proc の親 pid で確かめる）。
@@ -533,6 +541,7 @@ run_rt() {
   shift 2
   local status=0 limit="$timeout_secs" grace="$KILL_AFTER_SECS" ofd efd
   last_collector_pids=()
+  rm -f -- "$out.truncated" "$errf.truncated"
   if [ -n "$rt_deadline_us" ]; then
     local rem g
     rem=$((rt_deadline_us - $(mono_us)))
@@ -613,6 +622,10 @@ query_state() {
   if ! flush_last_call && [ "$state_rc" -ne 124 ]; then
     state_rc=125
   fi
+  # 切り詰められた応答は不完全なので解析しない（先頭が有効でも後続が捨てられている）。
+  if log_truncated "$out" && [ "$state_rc" -ne 124 ]; then
+    state_rc=125
+  fi
   state_status=""
   if [ "$state_rc" -eq 0 ]; then
     state_status="$(jq -rs --arg id "$id" \
@@ -630,6 +643,8 @@ is_runtime_error() {
 # 直前の query_state が明確な不存在応答だったか（ランタイム自身のエラー終了かつ
 # rt_is_not_found）。タイムアウト・権限エラー・自由文だけのエラーは不明として偽になる。
 state_not_found() {
+  # stderr が切り詰められていれば NOT_FOUND の後ろの別エラーが捨てられ得るので不明とする。
+  ! log_truncated "$tmpdir/state.err" || return 1
   is_runtime_error "$state_rc" && rt_is_not_found "$tmpdir/state.err"
 }
 
@@ -732,6 +747,8 @@ list_run_containers() {
   # 出力を読む前に収集の完了を待つ（上限内に終わらなければ不完全として失敗。fail-closed）。
   flush_last_call || return 1
   [ "$rc" -eq 0 ] || return 1
+  # 切り詰められた一覧は不完全（未作成を誤って確定し得る）なので失敗として扱う。
+  ! log_truncated "$out" || return 1
   while IFS= read -r line || [ -n "$line" ]; do
     [ -z "$line" ] && continue
     [[ "$line" =~ ^[0-9a-f]{64}$ ]] || return 1
@@ -798,6 +815,31 @@ finish_container_docker_within_deadline() {
   return 1
 }
 
+# pid の子孫（再帰）を /proc の親 pid から列挙して標準出力へ 1 行 1 pid で出す。
+# 収集プロセスは head / wc（コマンド置換内）を子に持つので、親を殺す前に列挙する。引数: <pid>
+descendant_pids() {
+  local f line ppid p q
+  local -a pids=() ppids=() queue=("$1")
+  for f in /proc/[0-9]*/stat; do
+    { read -r line <"$f"; } 2>/dev/null || continue
+    p="${f#/proc/}"
+    p="${p%/stat}"
+    read -r _ ppid _ <<<"${line##*) }"
+    pids+=("$p")
+    ppids+=("$ppid")
+  done
+  while [ "${#queue[@]}" -gt 0 ]; do
+    q="${queue[0]}"
+    queue=("${queue[@]:1}")
+    for f in "${!pids[@]}"; do
+      if [ "${ppids[$f]}" = "$q" ]; then
+        echo "${pids[$f]}"
+        queue+=("${pids[$f]}")
+      fi
+    done
+  done
+}
+
 # 収集プロセスを回収する。コンテナの処理を終えた後（削除済みなら出力の書き手が閉じて自然に
 # 終わる）に呼び、LOG_REAP_WAIT_US 待って残るものを SIGKILL する。コンテナの削除前には
 # 呼ばない（ワークロードが SIGPIPE を受けるため）。pid は child_alive で自分の子と確かめてから
@@ -808,7 +850,13 @@ reap_collectors() {
   wait_children "$LOG_REAP_WAIT_US" "${collector_pids[@]}" || true
   for p in "${collector_pids[@]}"; do
     if child_alive "$p"; then
+      # 子孫（読み取り中の head / wc）は親の死後に孤児として残るので、先に列挙してから親→子孫の順に KILL する。
+      local desc d
+      desc="$(descendant_pids "$p")"
       kill -KILL "$p" 2>/dev/null || true
+      for d in $desc; do
+        kill -KILL "$d" 2>/dev/null || true
+      done
     fi
   done
   wait "${collector_pids[@]}" 2>/dev/null || true

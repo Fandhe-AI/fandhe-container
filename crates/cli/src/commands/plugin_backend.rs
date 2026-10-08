@@ -18,9 +18,6 @@
 //!
 //! したがって [`backend_failure`] は現状必ず失敗を返す。
 
-// Linux では本番経路から呼ばれず、単体テストだけが使う（OS 非依存ロジックを Linux CI で検証するため）。
-#![cfg_attr(target_os = "linux", allow(dead_code))]
-
 use std::io::Write;
 
 use fandhe_container_core::plugin_discovery::{
@@ -30,6 +27,7 @@ use fandhe_container_core::plugin_discovery::{
 use fandhe_container_core::plugin_trust::{
     PluginTrustErrorKind, PluginVerificationMethod, verify_candidate,
 };
+use fandhe_container_core::state_store::StateRoot;
 use fandhe_container_core::traits::{ErrorCode, TraitError};
 
 use super::args::GlobalArgs;
@@ -58,6 +56,9 @@ impl BackendPlugin {
 }
 
 /// ホスト OS に対応するバックエンド（macOS / Windows 以外は `None`）。CLI-1 の OS 分岐はここに局所化する。
+///
+/// Linux では module が単体テスト時だけコンパイルされ、本番経路（[`unavailable`]）は呼ばれないため dead_code を許す。
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(super) fn host_backend() -> Option<BackendPlugin> {
     if cfg!(target_os = "macos") {
         Some(BackendPlugin::Macos)
@@ -99,8 +100,17 @@ pub(super) fn backend_failure(backend: BackendPlugin, report: DiscoveryReport) -
     TraitError::new(ErrorCode::Unimplemented, MSG_NOT_INVOKABLE)
 }
 
-/// 非 Linux の本番経路。発見（`PATH` 警告は stderr へ）→ [`backend_failure`]。
+/// 非 Linux の本番経路。`--root` 検証 → 発見（`PATH` 警告は stderr へ）→ [`backend_failure`]。
+///
+/// Linux では module が単体テスト時だけコンパイルされ、本番経路からは呼ばれないため dead_code を許す。
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(super) fn unavailable(global: &GlobalArgs) -> TraitError {
+    // Linux の `open_store` と揃え、不正な `--root`（相対パス・`..`）は plugin 解決より先に INVALID_ARGUMENT で拒否する。
+    if let Some(root) = global.root.clone()
+        && let Err(e) = StateRoot::from_override(root)
+    {
+        return e;
+    }
     let Some(backend) = host_backend() else {
         return TraitError::new(ErrorCode::Unimplemented, MSG_NO_BACKEND);
     };
@@ -233,6 +243,19 @@ mod tests {
         assert_eq!(host_backend(), expected);
         assert_eq!(BackendPlugin::Macos.name(), "macos");
         assert_eq!(BackendPlugin::Windows.name(), "windows");
+    }
+
+    /// CLI-1・ERR-2: 不正な `--root`（相対パス・`..`）は plugin 解決より先に INVALID_ARGUMENT で拒否される。
+    #[test]
+    fn err2_unavailable_rejects_invalid_root_first() {
+        for root in ["rel/root", "../x"] {
+            let global = GlobalArgs {
+                root: Some(PathBuf::from(root)),
+                ..GlobalArgs::default()
+            };
+            let e = unavailable(&global);
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "root={root}");
+        }
     }
 
     /// 固定文言は引用符・バックスラッシュ・改行を含まない（出力への反射・エスケープ不要）。

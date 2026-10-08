@@ -32,6 +32,8 @@ use fandhe_container_core::traits::ErrorCode;
 mod args;
 mod create_start;
 mod list_logs;
+// Linux は plugin を介さず core を直接呼ぶため、本番ビルドでは除外する（単体テストは OS 非依存ロジックの検証に使う）。
+#[cfg(any(not(target_os = "linux"), test))]
 mod plugin_backend;
 mod stop_delete;
 

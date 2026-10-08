@@ -36,10 +36,11 @@
 use super::{
     ChildGuard, ONE_SHOT_EXIT_TIMEOUT, ONE_SHOT_STDERR_DRAIN_TIMEOUT, OneShotPlugin, OneShotStderr,
     OneShotTermination, PLUGIN_SOCKET_ENV, Reap, StderrCapture, classify_reaped, rpc_timeout,
-    spawn_error, stderr_channel, unreaped_error,
+    spawn_registered, stderr_channel, unreaped_error,
 };
 use crate::error::{PluginError, PluginErrorCode};
 use crate::frame::Frame;
+use crate::signal_forward::{PLUGIN_REGISTRY, Registry};
 use crate::transport::{RpcTimeout, UdsListener, UdsStream};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -285,6 +286,16 @@ impl ResidentPlugin {
         timeout: ResidentStartTimeout,
         audit: &mut dyn crate::audit::PeerAuthObserver,
     ) -> Result<Self, PluginError> {
+        Self::start_in(plugin, timeout, audit, &PLUGIN_REGISTRY)
+    }
+
+    /// [`Self::start`] の本体。シグナル転送の登録表を引数に取る（テストが局所の表を渡すため）。
+    pub(crate) fn start_in(
+        plugin: &OneShotPlugin,
+        timeout: ResidentStartTimeout,
+        audit: &mut dyn crate::audit::PeerAuthObserver,
+        registry: &'static Registry,
+    ) -> Result<Self, PluginError> {
         static SEQ: AtomicU64 = AtomicU64::new(0);
 
         let deadline = Instant::now()
@@ -304,18 +315,16 @@ impl ResidentPlugin {
             )
         })?;
         // `Command` は文の終わりで drop され、親側に書き込み端は残らない。
-        let spawned = Command::new(&plugin.program)
-            .args(&plugin.args)
-            .env_clear()
-            .env(PLUGIN_SOCKET_ENV, listener.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(child_stderr)
-            .spawn();
-        let mut guard = match spawned {
-            Ok(child) => ChildGuard::new(child),
-            Err(e) => return Err(spawn_error(&e)),
-        };
+        let mut guard = spawn_registered(
+            Command::new(&plugin.program)
+                .args(&plugin.args)
+                .env_clear()
+                .env(PLUGIN_SOCKET_ENV, listener.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(child_stderr),
+            registry,
+        )?;
 
         // 接続待ちより前に読み取りを始める（子が接続前に大量に書いても詰まらせない）。
         let capture = match StderrCapture::attach(reader) {

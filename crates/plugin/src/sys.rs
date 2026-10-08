@@ -31,6 +31,8 @@
 //! - client connect（#249）: `socket(2)` / `connect(2)`（macOS は `fcntl(F_SETFD)` も）で非ブロッキング接続を期限までリトライする（REPAIR-5）。
 //!   対応外の OS・アーキテクチャは `Unsupported`
 //! - macOS の RSS 取得（TASK-112.1・#265）: `proc_pidinfo(PROC_PIDTASKINFO)`（`resident_size_bytes`。`crate::rss` から呼ばれる）
+//! - いずれの unix: `kill(2)` で起動中の plugin へ SIGINT・SIGTERM・SIGHUP を転送する（`send_signal`。
+//!   `crate::signal_forward` が CLI バイナリのシグナルハンドラ上から呼ぶため async-signal-safe であること。#1513・PLUG-7）
 //! - それ以外の OS・アーキテクチャ: peer credential を取得できないため `Unimplemented`（fail-closed）
 //!
 //! # 限界（残存リスク。対策は未実装。PLUG-12・#1390）
@@ -44,7 +46,7 @@
 //!   （pidfd 等による緩和は将来課題）。
 //!
 //! # 契約
-//! - `unsafe fn` は公開しない。公開するのは安全な [`peer_uid`]・[`effective_uid`]・[`fchmodat_nofollow`]・
+//! - `unsafe fn` は公開しない。公開するのは安全な [`send_signal`]・[`peer_uid`]・[`effective_uid`]・[`fchmodat_nofollow`]・
 //!   [`unlinkat`]・[`mkdirat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・[`DirStream`]（`open_at`・`next_entry`・`position`）・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
 //! - fd は `&UnixStream` の借用中のみ渡す（呼び出し中にクローズされない）
 //! - SOL_SOCKET / SO_PEERCRED の定数は `cfg(target_arch)` ごとに個別定義し、流用しない
@@ -2030,6 +2032,27 @@ mod dir_stream_tests {
         );
         std::fs::remove_dir_all(&d).unwrap();
     }
+}
+
+unsafe extern "C" {
+    // SAFETY（宣言そのものの妥当性）: POSIX の `int kill(pid_t pid, int sig)` と同じ引数・戻り値の幅
+    // （`pid_t` は Linux・macOS とも `i32`）。出典: `man 2 kill`・`man 7 signal-safety`。
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+/// `pid`（負値はプロセスグループ宛て）へ `sig` を送る。送れたら true、失敗（`ESRCH` 等）は false。
+///
+/// `crate::signal_forward` のシグナルハンドラ（CLI バイナリ。#1513）から呼ばれるため、割り当て・ロック・
+/// errno の取得をしない（`kill` は POSIX の async-signal-safe 関数）。`0`（自プロセスグループ）と
+/// `-1`（権限の及ぶ全プロセス）は事故を防ぐため送らず false を返す（防御。登録表は 1 より大きい pid
+/// だけを保持する）。
+pub(crate) fn send_signal(pid: i32, sig: i32) -> bool {
+    if pid == 0 || pid == -1 {
+        return false;
+    }
+    // SAFETY: 引数は値渡しの整数のみでメモリ安全上の前提を持たない。`kill` は async-signal-safe。
+    // 送り先の妥当性（直接の子の pid またはそのグループ）は呼び出し側の登録表が保証する。
+    unsafe { kill(pid, sig) == 0 }
 }
 
 /// PLUG-12・#1308: Linux・macOS 以外の OS 向けに他 OS の値を流用した仮置きの `const` / `type` を

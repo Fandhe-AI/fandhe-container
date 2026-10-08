@@ -12,6 +12,12 @@
 //! `setup` は OS 固有設定のステップ提示で `setup` module にのみ委譲する（日常操作コマンドは OS 固有設定を持たない。TASK-80.1・CLI-2）。
 //! 終了コードは core の ERR-2 表（`OCI_EXIT_*`）に揃える。
 //!
+//! OS 固有設定の分離規則（CLI-2・TASK-80.2）:
+//! - `crate::setup` を参照してよいのは [`run_setup`] のみ。`commands/` 配下の module は setup の型・関数を import しない。
+//! - 日常操作側の `cfg(target_os)`（`create_start::open_store`・`plugin_backend`）は CLI-1・PLUG-4 のバックエンド振り分けで、
+//!   OS 固有設定ではないため CLI-2 の対象外。非 Linux の失敗文言は plugin 前提の不成立であり、OS 設定や setup 実行を要求しない。
+//! - 分離の単体テストは TASK-80.3。
+//!
 //! 将来仕様（本実装の範囲外）:
 //! - start の実プロセス起動: supervisor 経由の launcher（TASK-157・TASK-37〜39）。
 //! - stop の猶予 → SIGKILL・本番 signaler / cgroup remover の結線: supervisor 経由（TASK-157）。
@@ -43,7 +49,16 @@ use args::{
     parse_stop,
 };
 
-/// 基本コマンド（CLI-1）。
+/// コマンドの区分（CLI-2・TASK-80.2）。日常操作は OS 固有設定を持たず、OS 固有設定は `setup` にのみ置く。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandKind {
+    /// 日常操作（create / start / stop / delete / list / logs）。`crate::setup` を参照しない。
+    Daily,
+    /// OS 固有設定のセットアップ（`setup`）。
+    Setup,
+}
+
+/// 基本コマンド（CLI-1）と setup（CLI-2）。日常操作か否かの区分は [`Command::kind`] で判定する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Create,
@@ -67,6 +82,29 @@ impl Command {
         Command::Logs,
         Command::Setup,
     ];
+
+    /// 日常操作コマンドのみ（`ALL` から `Setup` を除いたもの。分離の照合の列挙元。TASK-80.2・TASK-80.3）。
+    pub const DAILY: [Command; 6] = [
+        Command::Create,
+        Command::Start,
+        Command::Stop,
+        Command::Delete,
+        Command::List,
+        Command::Logs,
+    ];
+
+    /// コマンドの区分。ワイルドカードを使わず、コマンド追加時に分類漏れをコンパイルエラーにする。
+    pub fn kind(self) -> CommandKind {
+        match self {
+            Command::Create
+            | Command::Start
+            | Command::Stop
+            | Command::Delete
+            | Command::List
+            | Command::Logs => CommandKind::Daily,
+            Command::Setup => CommandKind::Setup,
+        }
+    }
 
     /// CLI 上のコマンド名。
     pub fn as_str(self) -> &'static str {
@@ -238,11 +276,17 @@ pub fn run_to<I: IntoIterator<Item = OsString>>(args: I, stdout: &mut dyn Write)
             Ok(a) => list_logs::run_logs(&global, &a),
             Err(_) => usage(),
         },
-        // OS 固有設定は setup の実行時にのみここから到達する（CLI-2）。global は使わず受理して無視する。
-        Command::Setup => match parse_setup(tail) {
-            Ok(_) => crate::setup::run(stdout),
-            Err(_) => usage(),
-        },
+        Command::Setup => run_setup(tail, stdout),
+    }
+}
+
+/// `setup` の実行。`crate::setup` を参照する唯一の箇所（CLI-2・TASK-80.2）。
+///
+/// `GlobalArgs` を受け取らない（setup は状態ルート・plugin 探索設定を使わず、グローバルオプションは受理して無視する）。
+fn run_setup(tail: Vec<OsString>, stdout: &mut dyn Write) -> CliExit {
+    match parse_setup(tail) {
+        Ok(_) => crate::setup::run(stdout),
+        Err(_) => usage(),
     }
 }
 
@@ -270,6 +314,30 @@ mod tests {
         assert_eq!(Command::parse("list"), Some(Command::List));
         assert_eq!(Command::parse("logs"), Some(Command::Logs));
         assert_eq!(Command::parse("setup"), Some(Command::Setup));
+    }
+
+    /// CLI-2: `setup` だけが `Setup` 区分で、他 6 件は日常操作。
+    #[test]
+    fn cli2_command_kind_classification() {
+        let daily: Vec<&str> = Command::ALL
+            .iter()
+            .filter(|c| c.kind() == CommandKind::Daily)
+            .map(|c| c.as_str())
+            .collect();
+        assert_eq!(daily, ["create", "start", "stop", "delete", "list", "logs"]);
+        assert_eq!(Command::Setup.kind(), CommandKind::Setup);
+    }
+
+    /// CLI-2: `DAILY` は `ALL` から `Setup` を除いたものと一致する。
+    #[test]
+    fn cli2_daily_is_all_minus_setup() {
+        let names: Vec<&str> = Command::DAILY.iter().map(|c| c.as_str()).collect();
+        assert_eq!(names, ["create", "start", "stop", "delete", "list", "logs"]);
+        let rest: Vec<Command> = Command::ALL
+            .into_iter()
+            .filter(|c| *c != Command::Setup)
+            .collect();
+        assert_eq!(rest, Command::DAILY.to_vec());
     }
 
     /// CLI-1: 全コマンド名の並び。

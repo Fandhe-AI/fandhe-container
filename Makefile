@@ -554,8 +554,10 @@ bench-baseline-selftest: ## baseline.json 生成スクリプトの自己テス�
 	bash scripts/bench/generate_baseline_selftest.sh
 
 # 登録済みベンチを実行し、benches/metrics.json（direction・unit の SSOT）と合わせて
-# baseline.json を再生成する（TASK-88.1・REPAIR-8）。BENCH_NAMES は TASK-113 で実ベンチ
-# （files/s・起動 p95 等）を足す場所。実測値の記録は TASK-88.2（#229）が行う。
+# baseline.json を再生成する（TASK-88.1・REPAIR-8）。BENCH_NAMES は実ベンチを追加するときに
+# 足す場所（plugin 境界ベンチ〔TASK-113〕は登録済み。files/s・起動 p95 のベンチは担当タスク未定で、
+# docs/design/bench-calibration.md「既知の欠落」）。校正記録は同ファイル（TASK-88.2・#229）にあり、
+# 実測と基準値の確定は TASK-88.h1・TASK-113.h1。
 # BENCH_METRICS / BENCH_BASELINE_OUT / BENCH_ENVIRONMENT は Make 変数展開でシェル文字列へ
 # 埋め込まず、export した環境変数として二重引用符付きで参照する（値に ' 等が含まれても
 # 引用が壊れず、インジェクションにならない）。

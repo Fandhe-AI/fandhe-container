@@ -2170,6 +2170,36 @@ mod tests {
         let _b = reg.reserve().unwrap();
     }
 
+    /// #1311・#1513・PLUG-7: `try_wait` が `ECHILD`（他所での回収）を観測した後は終端になり、`kill_and_reap` は
+    /// プロセスグループ宛ての SIGKILL も送らない（pgid が再利用され得るため）。生存中の孫が止まらないことを
+    /// pid で確かめる。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_kill_and_reap_skips_group_after_try_wait_echild() {
+        // ECHILD は Linux（asm-generic/errno-base.h）・macOS（sys/errno.h）とも 10。
+        const ECHILD: i32 = 10;
+        let (mut guard, gc) = spawn_group_with_grandchild(GRANDCHILD_SCRIPT_EXIT);
+        let pid = guard.pid().unwrap();
+        let start = Instant::now();
+        while !crate::sys::reap_child_for_test(pid).unwrap() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "leader did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let e = guard.try_wait().unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(ECHILD));
+        assert!(guard.lost && guard.leader_reaped);
+        assert_eq!(guard.kill_and_reap(), Reap::Lost);
+        let still_running = is_running(gc);
+        force_kill(gc);
+        assert!(
+            still_running,
+            "group was signalled after waitpid failed with ECHILD"
+        );
+    }
+
     /// PLUG-7・#1513: `kill_and_reap` の kill 前の確認で `ECHILD` を受けたら kill を送らず `Lost` で終える
     /// （再利用され得る pid へ SIGKILL を送らない）。`Drop` も再び kill しない。
     #[cfg(unix)]

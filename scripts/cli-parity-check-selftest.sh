@@ -37,6 +37,7 @@ expect_rc() {
 #   hang     = 未知コマンド（bogus）だけ止まる（子孫の sleep を残し得る構成）
 #   nl       = create 成功時に改行のみを stdout へ出す
 #   blank    = list の末尾に余分な空行を出す
+#   big      = list が検査上限（64 KiB）を超える出力を返す
 #   nul      = create 成功時に NUL を含む出力を stdout へ出す
 # --------------------------------------------------
 stub="$work/stub-cli"
@@ -110,6 +111,10 @@ case "$cmd" in
       if [ -f "$root/$b.pid" ]; then printf '%s\tcreated\t4242\n' "$b"; else printf '%s\tcreated\t-\n' "$b"; fi
     done
     [ "$mode" = "blank" ] && printf '\n'
+    if [ "$mode" = "big" ]; then
+      i=0
+      while [ "$i" -lt 8000 ]; do printf 'x%s\tcreated\t-\n' "$i"; i=$((i + 1)); done
+    fi
     [ "$mode" = "diff" ] && [ -e "$root/c1.c" ] && exit 7
     ;;
   create)
@@ -227,7 +232,9 @@ expect_rc "unexpected-stdout captures pass format validation" 1 $?
 "$target" compare --baseline "$work/noisy.txt" --candidate "$work/noisy.txt" >"$work/cmp.txt" 2>&1
 expect_rc "identical <unexpected> records are rc 1" 1 $?
 grep -q '^B02 UNVERIFIED' "$work/cmp.txt" && pass "B02 <unexpected> reported as UNVERIFIED" || fail "B02 <unexpected> reported as UNVERIFIED"
-sed 's/^A02\tA\t2\tINVALID_ARGUMENT/A02\tA\t2\t<unparsed>/' "$work/ok.txt" >"$work/unparsed.txt"
+# BSD sed（macOS）は \t をタブとして解釈しないため、実際のタブ文字を渡す。
+tab=$'\t'
+sed "s/^A02${tab}A${tab}2${tab}INVALID_ARGUMENT/A02${tab}A${tab}2${tab}<unparsed>/" "$work/ok.txt" >"$work/unparsed.txt"
 "$target" compare --baseline "$work/unparsed.txt" --candidate "$work/unparsed.txt" >"$work/cmp.txt" 2>&1
 expect_rc "identical <unparsed> records are rc 1" 1 $?
 grep -q '^A02 UNVERIFIED' "$work/cmp.txt" && pass "A02 <unparsed> reported as UNVERIFIED" || fail "A02 <unparsed> reported as UNVERIFIED"
@@ -237,6 +244,12 @@ run_capture blank "$work/blank.txt"
 [ "$(line_of "$work/blank.txt" B03)" = $'B03\tB\t0\t-\t<unexpected>:3' ] && pass "trailing blank line in list is unexpected" || fail "trailing blank line in list is unexpected: $(line_of "$work/blank.txt" B03)"
 "$target" compare --baseline "$work/ok.txt" --candidate "$work/blank.txt" >/dev/null 2>&1
 expect_rc "list with trailing blank line differs from ok (rc 1)" 1 $?
+
+# --- 検査上限（64 KiB）を超える list 出力は先頭が正常でも異常にする ---
+run_capture big "$work/big.txt"
+line_of "$work/big.txt" B03 | grep -q $'\t<unexpected>:big$' && pass "oversized list is unexpected" || fail "oversized list is unexpected: $(line_of "$work/big.txt" B03)"
+"$target" compare --baseline "$work/ok.txt" --candidate "$work/big.txt" >/dev/null 2>&1
+expect_rc "oversized list differs from ok (rc 1)" 1 $?
 
 # --- タイムアウト時に子孫プロセス（スタブの sleep）が残らない ---
 : >"$work/pids.txt"

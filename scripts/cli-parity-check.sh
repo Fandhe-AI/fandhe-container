@@ -222,6 +222,11 @@ norm_stdout() {
     printf '<unexpected>:nul'
     return 0
   fi
+  # 検査上限を超える出力は先頭が正常でも後続を検査できないため、一致扱いにせず異常として記録する。
+  if [ "$raw" -gt 65536 ]; then
+    printf '<unexpected>:big'
+    return 0
+  fi
   o="$(LC_ALL=C head -c 65536 "$tmp_dir/out")"
   n="$(wc -l <"$tmp_dir/out" | tr -d ' ')"
   if [ -z "$o" ]; then

@@ -93,10 +93,42 @@ mod linux {
         format!("{tag}-{}-{n}-{t}", std::process::id())
     }
 
+    /// `ESRCH`（No such process）。`include/uapi/asm-generic/errno-base.h` の値で、全 Linux アーキテクチャが
+    /// このファイルを変更なしで取り込むため arch 差が無い。core 本体の `sys` モジュールにも同値があるが
+    /// `pub(crate)` で結合テストから届かないため、ここで定義する。std は ESRCH を `ErrorKind` に対応付けず
+    /// （不安定な `Uncategorized`）`kind()` では判定できないので、`raw_os_error()` で照合する。
+    const ESRCH: i32 = 3;
+
+    /// `/proc` 走査中の I/O エラーのうち、読み飛ばしてよいものの理由。
+    #[derive(Debug, PartialEq, Eq)]
+    enum SkipReason {
+        /// 走査中に終了したプロセス（ENOENT または ESRCH）。
+        Vanished,
+        /// 他ユーザーのプロセスで environ を読む権限が無い（EACCES / EPERM）。
+        Foreign,
+    }
+
+    /// 読み飛ばしてよいエラーなら理由を返し、それ以外（fail-closed で panic すべきもの）は `None`。
+    ///
+    /// `scan_marked` の open / read 両方から呼ばれ、分類を一箇所に集約する（#1305）。
+    fn skip_reason(e: &std::io::Error) -> Option<SkipReason> {
+        if e.raw_os_error() == Some(ESRCH) || e.kind() == std::io::ErrorKind::NotFound {
+            return Some(SkipReason::Vanished);
+        }
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            return Some(SkipReason::Foreign);
+        }
+        None
+    }
+
     /// `/proc` を全走査し、nonce つきの環境を持つ pid を昇順で返す。
     ///
     /// 走査中に消えたプロセス（NotFound・ESRCH）・他ユーザーのプロセス（PermissionDenied）は対象外として
-    /// 読み飛ばす。それ以外の I/O エラーは握りつぶさず panic する。出力へ環境内容は含めない。
+    /// 読み飛ばす。判定は `skip_reason` に集約し、open と read の両方に適用する（open 時の ESRCH は
+    /// `proc_mem_open` の競合窓で起こりうる。#1305）。それ以外の I/O エラーは握りつぶさず panic する。
+    /// `read_dir` / `DirEntry` は `/proc` の getdents が消えた pid を返さないだけでエラーにならず、
+    /// `file_name()` / `path()` は syscall を発行しないため、fail-closed のまま `expect` を残す。
+    /// 出力へ環境内容は含めない。
     fn scan_marked(nonce: &str) -> Vec<u32> {
         let mut pids = Vec::new();
         for ent in fs::read_dir("/proc").expect("read /proc") {
@@ -106,21 +138,13 @@ mod linux {
             };
             let f = match fs::File::open(ent.path().join("environ")) {
                 Ok(f) => f,
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                    ) =>
-                {
-                    continue;
-                }
+                Err(e) if skip_reason(&e).is_some() => continue,
                 Err(e) => panic!("open environ of pid {pid}: {e}"),
             };
             let mut buf = Vec::new();
             match f.take(ENVIRON_LIMIT).read_to_end(&mut buf) {
                 Ok(_) => {}
-                Err(e) if e.raw_os_error() == Some(3) => continue, // ESRCH
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => continue,
+                Err(e) if skip_reason(&e).is_some() => continue,
                 Err(e) => panic!("read environ of pid {pid}: {e}"),
             }
             if environ_has_marker(&buf, PROBE, nonce) {
@@ -129,6 +153,33 @@ mod linux {
         }
         pids.sort_unstable();
         pids
+    }
+
+    /// CORE-1・TASK-28.2・#1305: 走査エラーの分類。消えたプロセス（ESRCH・ENOENT）と他ユーザー
+    /// （EACCES・EPERM）は読み飛ばし、それ以外（EIO 等）は fail-closed で `None`。
+    /// open 時の ESRCH はカーネルの競合窓で、安全な std だけでは決定的に再現できないため、
+    /// 分類関数の単体テストで代える。
+    #[test]
+    fn core1_task28_2_scan_error_classification_skips_vanished_and_foreign() {
+        use std::io::Error;
+        assert_eq!(
+            skip_reason(&Error::from_raw_os_error(ESRCH)),
+            Some(SkipReason::Vanished)
+        );
+        assert_eq!(
+            skip_reason(&Error::from_raw_os_error(2)),
+            Some(SkipReason::Vanished)
+        );
+        assert_eq!(
+            skip_reason(&Error::from_raw_os_error(13)),
+            Some(SkipReason::Foreign)
+        );
+        assert_eq!(
+            skip_reason(&Error::from_raw_os_error(1)),
+            Some(SkipReason::Foreign)
+        );
+        assert_eq!(skip_reason(&Error::from_raw_os_error(5)), None);
+        assert_eq!(skip_reason(&Error::other("x")), None);
     }
 
     /// 期限つきで `scan_marked` が空になるのを待つ（ゾンビ回収の揺らぎを吸収。REPAIR-5）。

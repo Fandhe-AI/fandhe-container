@@ -1603,6 +1603,16 @@ pub(crate) fn close_fds_from(first: u32) -> Result<(), SysError> {
     close_range_raw(first, u32::MAX, 0)
 }
 
+/// fd 1 本（`fd`）だけを閉じる（`close_range(fd, fd, 0)`。結合試験専用。#1299・SEC-1・CORE-1）。
+///
+/// `exec::close_standard_fds_for_test` が、標準 fd（0〜2）を閉じた呼び出し側を作るために使う。既に閉じている
+/// 番号は `EBADF` ではなく成功になる（`close_range` の仕様）ため、閉じる前後の状態は呼び出し側が照合する。
+/// 呼び出し側は閉じた番号をこの後使わないこと。未対応カーネルは `ENOSYS`/`EINVAL`（呼び出し側が失敗にする）。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+pub(crate) fn close_fd_number(fd: u32) -> Result<(), SysError> {
+    close_range_raw(fd, fd, 0)
+}
+
 /// fd `first` 以上のうち、`keep` の 1 本だけを残してすべて閉じる（TASK-163 追補・#1460）。
 ///
 /// 稼働中コンテナへの exec の子が、`execve` 前の失敗を親へ知らせる pipe の書き込み側（close-on-exec）だけを

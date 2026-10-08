@@ -25,6 +25,10 @@
 //!   その pipe と検査済みのエントリポイントの 2 本だけであること（継承 fd の後始末）も照合する
 //! - **環境変数（#1457）**: `execveat` に渡る環境変数が、コンテナ定義（`config.json` の `process.env`）と明示の
 //!   上書きだけで、試験プロセスの環境を含まない
+//! - **標準 fd を閉じた呼び出し側（#1299・CORE-1・TASK-27.4.1）**: fd `{0}`・`{0,1}`・`{0,1,2}` を閉じた使い捨ての
+//!   子から起動しても、実行用の fd（状態 pipe の両端・検査済みのエントリポイント）が 3 以上へ移り、標準入出力が
+//!   すべて 1:3 に置き換わる。残る fd は 3 以上の 2 本だけ（launch 経路は制限適用の証跡が未配線で `execveat` の
+//!   手前で拒否されるため、fd の移動はこの観測用の入口で具体値を照合し、拒否は `fork_exec_isolation` で固定する）
 //! - **補助グループ（#1457）**: launch・exec が共有する補助グループの消去を、使い捨ての子で実 syscall により通す
 //!   （非特権では `CAP_SETGID` が無いため拒否されること、root では消去されること）
 //!
@@ -53,6 +57,10 @@ fn main() {
             linux::pty_child(std::path::Path::new(args.get(2).expect("work directory")));
         }
         Some(linux::GROUPS_CHILD) => linux::groups_child(),
+        Some(linux::CLOSED_STDIO_CHILD) => linux::closed_stdio_child(
+            std::path::Path::new(args.get(2).expect("work directory")),
+            args.get(3).expect("closed fd list"),
+        ),
         _ => linux::run(),
     }
 }
@@ -65,8 +73,9 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::exec::{
-        ChildExit, ContainerEnv, ExecChildSetupReport, ExecCommand, ExecExit, SupplementaryGroups,
-        ViolationReason, clear_supplementary_groups_for_test, observe_exec_child_setup,
+        ChildExit, ContainerEnv, ExecChildSetupReport, ExecCommand, ExecExit, StandardFd,
+        SupplementaryGroups, ViolationReason, clear_supplementary_groups_for_test,
+        close_standard_fds_for_test, observe_exec_child_setup,
     };
     use fandhe_container_core::oci_runtime::parse_config_bytes;
     use fandhe_container_core::traits::ErrorCode;
@@ -75,6 +84,8 @@ mod linux {
     pub const PTY_CHILD: &str = "--pty-child";
     /// 補助グループを実 syscall で消去する使い捨ての子の再入フラグ。
     pub const GROUPS_CHILD: &str = "--groups-child";
+    /// 標準 fd を閉じた呼び出し側を作る使い捨ての子の再入フラグ（引数: 作業ディレクトリ・閉じる番号のコンマ区切り）。
+    pub const CLOSED_STDIO_CHILD: &str = "--closed-stdio-child";
     /// 疑似端末の下の子が、照合を終えたことを知らせる合図ファイルの名前と内容。
     const PTY_OK: &str = "pty-ok";
     /// `ENXIO`（制御端末を持たないプロセスが `/dev/tty` を開いたときの errno。全アーキテクチャ共通の 6）。
@@ -153,6 +164,7 @@ mod linux {
         inherited_fds_are_closed_except_the_status_pipe(&work.0);
         environment_comes_only_from_the_container_definition(&work.0);
         supplementary_groups_are_cleared_or_refused();
+        exec_fd_moves_above_closed_stdio(&work.0);
         println!("exec_child_setup: all scenarios passed");
     }
 
@@ -614,5 +626,121 @@ mod linux {
         session_is_detached_from_the_caller(work, "report-pty");
         terminal_entrypoint_is_refused_without_opening_it(work);
         fs::write(work.join(PTY_OK), PTY_OK).expect("write the pty marker");
+    }
+
+    /// 標準 fd を閉じた呼び出し側として再実行する子（使い捨て）の結果ファイル名。
+    fn closed_stdio_result(work: &Path, label: &str) -> PathBuf {
+        work.join(format!("closed-stdio-{label}.result"))
+    }
+
+    /// CORE-1・SEC-1・TASK-27.4.1（#1299）: 呼び出し側の標準 fd の一部または全部が閉じていても、`/`・エントリポイント・
+    /// 状態 pipe の fd が 0〜2 に入り込まず、置換した `/dev/null` が壊れない。閉じた番号が 1 つの場合と複数の場合を、
+    /// fd を閉じた使い捨ての子（`--closed-stdio-child`）で通す。
+    ///
+    /// シェルの `<&-` では閉じられない（Rust std が起動時に閉じた fd 0〜2 を `/dev/null` で埋め直す）ため、
+    /// 起動後に子自身が閉じる。結果は閉じた stdout/stderr では届かないため、結果ファイルで受け取る。
+    fn exec_fd_moves_above_closed_stdio(work: &Path) {
+        for closed in ["0", "0,1", "0,1,2"] {
+            let label = closed.replace(',', "");
+            let exe = std::env::current_exe().expect("current exe");
+            let mut child = Command::new(exe)
+                .arg(CLOSED_STDIO_CHILD)
+                .arg(work)
+                .arg(closed)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn the closed-stdio child");
+            let deadline = Instant::now() + timeout();
+            let status = loop {
+                if let Some(status) = child.try_wait().expect("poll the child") {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("closed {closed}: the child timed out");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let output = child.wait_with_output().expect("collect the child output");
+            let result = fs::read_to_string(closed_stdio_result(work, &label)).unwrap_or_default();
+            assert!(
+                status.success() && result == "ok\n",
+                "closed {closed}: status {status:?}, result {result:?}, stderr {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            println!("exec_child_setup: closed standard fds {{{closed}}}: ok");
+        }
+    }
+
+    /// `--closed-stdio-child`: 指定の標準 fd を閉じてから観測用の入口を通し、具体値を照合して結果ファイルへ書く。
+    pub fn closed_stdio_child(work: &Path, closed: &str) {
+        let label = closed.replace(',', "");
+        let outcome = check_closed_stdio(work, closed, &label);
+        let text = match &outcome {
+            Ok(()) => "ok\n".to_owned(),
+            Err(why) => format!("{why}\n"),
+        };
+        let wrote = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(closed_stdio_result(work, &label))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()));
+        std::process::exit(i32::from(wrote.is_err() || outcome.is_err()));
+    }
+
+    fn check_closed_stdio(work: &Path, closed: &str, label: &str) -> Result<(), String> {
+        let numbers: Vec<u8> = closed
+            .split(',')
+            .map(|n| n.parse::<u8>().map_err(|e| format!("bad fd list: {e}")))
+            .collect::<Result<_, _>>()?;
+        let fds: Vec<StandardFd> = numbers
+            .iter()
+            .map(|n| match n {
+                0 => Ok(StandardFd::Stdin),
+                1 => Ok(StandardFd::Stdout),
+                2 => Ok(StandardFd::Stderr),
+                other => Err(format!("not a standard fd: {other}")),
+            })
+            .collect::<Result<_, _>>()?;
+        close_standard_fds_for_test(&fds).map_err(|e| format!("close failed: {}", e.message))?;
+        // 前提の照合: 閉じた番号だけが無く、残した番号は開いている（設定ミスによる偽の成功を防ぐ）。
+        for n in 0u8..3 {
+            let open = Path::new(&format!("/proc/self/fd/{n}")).exists();
+            if open == numbers.contains(&n) {
+                return Err(format!(
+                    "precondition: fd {n} open={open}, closed list {closed}"
+                ));
+            }
+        }
+        let observation = observe_exec_child_setup(
+            &shell_entry(),
+            &work.join(format!("report-closed-{label}")),
+            timeout(),
+        )
+        .map_err(|e| format!("observe failed: {}", e.message))?;
+        if observation.exit != ExecExit::Command(ChildExit::Exited(0)) {
+            return Err(format!("unexpected exit: {:?}", observation.exit));
+        }
+        let report = observation.report.ok_or("no report")?;
+        if report.stdio != [(true, NULL_RDEV); 3] {
+            return Err(format!("stdio is not /dev/null: {:?}", report.stdio));
+        }
+        let fds = &report.open_fds;
+        if fds.len() != 2 || fds.iter().any(|(fd, _)| *fd < 3) {
+            return Err(format!("expected 2 fds all >= 3: {fds:?}"));
+        }
+        let shell = fs::canonicalize("/bin/sh").map_err(|e| e.to_string())?;
+        let shell = shell.to_string_lossy();
+        let has_pipe = fds.iter().any(|(_, t)| t.starts_with("pipe:["));
+        let has_shell = fds.iter().any(|(_, t)| *t == shell);
+        if !(has_pipe && has_shell) {
+            return Err(format!(
+                "expected the status pipe and the entrypoint: {fds:?}"
+            ));
+        }
+        Ok(())
     }
 }

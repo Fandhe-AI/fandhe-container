@@ -1161,6 +1161,50 @@ pub fn observe_exec_child_setup(
     Ok(ExecChildSetupObservation { exit, report })
 }
 
+/// [`close_standard_fds_for_test`] が閉じる標準 fd（結合試験専用。0〜2 に限る型で、任意の fd は閉じられない）。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StandardFd {
+    /// fd 0。
+    Stdin,
+    /// fd 1。
+    Stdout,
+    /// fd 2。
+    Stderr,
+}
+
+/// 結合試験専用: 呼び出しプロセスの標準 fd を閉じる（SEC-1・CORE-1・TASK-27.4.1・#1299）。
+///
+/// 呼び出し文脈は `tests/exec_child_setup.rs` の使い捨ての子と `tests/fork_exec_isolation.rs` のシナリオ
+/// プロセス。fd 0〜2 を閉じた呼び出し側から [`observe_exec_child_setup`]・`spawn_container` を起動して、exec の
+/// 直前の手順（`keep_above_stdio`）が実行用の fd を 3 以上へ移し、標準入出力を `/dev/null` へ置換することを確かめる。
+/// 呼び出しプロセスの fd を不可逆に閉じるため、以後その番号の入出力（panic の診断を含む）は使えない。
+/// すでに閉じている番号は前提違反として失敗にする（fail-closed）。`exec-test-support` feature を付けたビルドに
+/// だけ存在し、既定のビルドの公開 API には含まれない。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+#[doc(hidden)]
+pub fn close_standard_fds_for_test(fds: &[StandardFd]) -> Result<(), ExecError> {
+    for fd in fds {
+        let number: u32 = match fd {
+            StandardFd::Stdin => 0,
+            StandardFd::Stdout => 1,
+            StandardFd::Stderr => 2,
+        };
+        let proc_fd = format!("/proc/self/fd/{number}");
+        if !Path::new(&proc_fd).exists() {
+            return Err(ExecError::new(
+                ErrorCode::FailedPrecondition,
+                IsolationStage::Spawn,
+                "the standard fd is already closed",
+            ));
+        }
+        sys::close_fd_number(number)
+            .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "close a standard fd"))?;
+    }
+    Ok(())
+}
+
 /// 観測の子: `execveat` の直前の自分の状態を `report` へ 1 行ずつ書く（[`observe_exec_child_setup`] 専用）。
 #[cfg(all(feature = "exec-test-support", not(test)))]
 fn write_setup_report(entry: &Entrypoint, report: &Path) -> Result<(), ExecError> {
@@ -2133,7 +2177,8 @@ mod tests {
     }
 
     /// CORE-1（TASK-27.4.1）: 3 以上の fd は番号を変えずに返す。0〜2 の fd の移動は、テストプロセスの
-    /// 標準 fd を閉じられないため結合試験の範囲。
+    /// 標準 fd を閉じられないため結合試験の範囲（`tests/exec_child_setup.rs` の `exec_fd_moves_above_closed_stdio`、
+    /// #1299）。
     #[test]
     fn core1_keep_above_stdio_keeps_high_fd() {
         use std::os::fd::AsRawFd as _;

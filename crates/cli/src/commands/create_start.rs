@@ -586,6 +586,183 @@ mod tests {
         assert!(lines[1].contains("\"op_stats_meta\""));
     }
 
+    /// write の呼び出しごとの引数長を記録し、台本どおりの結果を返す出力先（台本が尽きたら全量を受理）。
+    struct ScriptedSink {
+        calls: Vec<usize>,
+        data: Vec<u8>,
+        script: std::collections::VecDeque<std::io::Result<usize>>,
+    }
+
+    impl ScriptedSink {
+        fn new(script: Vec<std::io::Result<usize>>) -> Self {
+            Self {
+                calls: Vec::new(),
+                data: Vec::new(),
+                script: script.into(),
+            }
+        }
+    }
+
+    impl std::io::Write for ScriptedSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls.push(buf.len());
+            let n = match self.script.pop_front() {
+                Some(r) => r?.min(buf.len()),
+                None => buf.len(),
+            };
+            self.data.extend_from_slice(buf.get(..n).unwrap_or(buf));
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `name` を成功 1 件（1 ms）だけ記録した計測器。
+    fn recorder_with(name: &str) -> OpRecorder {
+        let rec = OpRecorder::new();
+        rec.record(
+            &OpName::new(name).expect("name"),
+            OpOutcome::Success,
+            Duration::from_millis(1),
+        )
+        .expect("record");
+        rec
+    }
+
+    const CREATE_ONCE_LINES: &str = concat!(
+        "{\"event\":\"op_stats\",\"op\":\"create\",\"success\":1,\"failure\":0,\"count\":1,",
+        "\"min_us\":1000,\"mean_us\":1000,\"p95_us\":1000,\"max_us\":1000}\n",
+        "{\"event\":\"op_stats_meta\",\"ops\":1,\"dropped_records\":0}\n",
+    );
+
+    /// REPAIR-4: 計測の全行（op_stats 行 + メタ行。各行 LF 終端）を 1 回の write で書く。
+    /// 行本体と改行を別の write に分けない（並行追記で JSON 行が混ざらないための前提）。
+    #[test]
+    fn repair4_write_ops_once_emits_all_lines_in_single_write() {
+        let mut sink = ScriptedSink::new(Vec::new());
+        let n = write_ops_once(&recorder_with("create"), &mut sink).expect("write");
+        assert_eq!(n, CREATE_ONCE_LINES.len());
+        assert_eq!(sink.calls, vec![CREATE_ONCE_LINES.len()]);
+        assert_eq!(
+            String::from_utf8(sink.data).expect("utf8"),
+            CREATE_ONCE_LINES
+        );
+    }
+
+    /// REPAIR-4: 部分書き込みは残りを継ぎ足さず失敗にする（継ぎ足しの間に他プロセスの行が入るため）。
+    #[test]
+    fn repair4_write_ops_once_does_not_continue_partial_write() {
+        let mut sink = ScriptedSink::new(vec![Ok(10)]);
+        let e = write_ops_once(&recorder_with("create"), &mut sink).expect_err("partial");
+        assert_eq!(e.kind(), std::io::ErrorKind::WriteZero);
+        assert_eq!(sink.calls, vec![CREATE_ONCE_LINES.len()]);
+        assert_eq!(sink.data.len(), 10);
+    }
+
+    /// REPAIR-4・REPAIR-5: 1 バイトも書けない EINTR は有限回だけやり直し、やり直しも全量 1 回の write。
+    #[test]
+    fn repair5_write_ops_once_retries_interrupted_bounded() {
+        let interrupted = || Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+        let mut sink = ScriptedSink::new(vec![interrupted()]);
+        let n = write_ops_once(&recorder_with("create"), &mut sink).expect("write");
+        assert_eq!(n, CREATE_ONCE_LINES.len());
+        assert_eq!(sink.calls, vec![CREATE_ONCE_LINES.len(); 2]);
+        assert_eq!(
+            String::from_utf8(sink.data).expect("utf8"),
+            CREATE_ONCE_LINES
+        );
+
+        let mut sink = ScriptedSink::new((0..8).map(|_| interrupted()).collect());
+        let e = write_ops_once(&recorder_with("create"), &mut sink).expect_err("interrupted");
+        assert_eq!(e.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(sink.calls.len(), 4);
+        assert!(sink.data.is_empty());
+
+        let mut sink = ScriptedSink::new(vec![Err(std::io::Error::other("disk"))]);
+        let e = write_ops_once(&recorder_with("create"), &mut sink).expect_err("error");
+        assert_eq!(e.kind(), std::io::ErrorKind::Other);
+        assert_eq!(sink.calls.len(), 1);
+    }
+
+    /// REPAIR-4: 操作名の種類数が core の上限（64）でも 1 回の出力は上限（64 KiB）に収まり、1 回の write で出る。
+    #[test]
+    fn repair4_write_ops_once_fits_limit_at_max_tracked_ops() {
+        use fandhe_container_core::observability::{MAX_TRACKED_OPS, OP_NAME_MAX_LEN};
+        let rec = OpRecorder::new();
+        for i in 0..MAX_TRACKED_OPS {
+            let name = format!("{i:0>width$}", width = OP_NAME_MAX_LEN);
+            rec.record(
+                &OpName::new(name).expect("name"),
+                OpOutcome::Failure,
+                Duration::MAX,
+            )
+            .expect("record");
+        }
+        let mut sink = ScriptedSink::new(Vec::new());
+        let n = write_ops_once(&rec, &mut sink).expect("write");
+        assert_eq!(sink.calls, vec![n]);
+        assert!(n <= OP_LOG_MAX_BYTES, "{n}");
+        let text = String::from_utf8(sink.data).expect("utf8");
+        assert_eq!(text.lines().count(), MAX_TRACKED_OPS + 1);
+        assert!(text.lines().all(|l| l.len() <= 512), "line too long");
+    }
+
+    /// REPAIR-4: 複数スレッドが別々の fd で同じ計測ログへ並行に追記しても、JSON 行が混ざらない。
+    /// 未存在からの同時作成でも出力を落とさず、各出力の 2 行（op_stats・メタ）は連続して並ぶ。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair4_export_ops_concurrent_appends_keep_lines_intact() {
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 50;
+        let path =
+            std::env::temp_dir().join(format!("fc-cli-oplog-concurrent-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let rec = recorder_with(&format!("op{t}"));
+                    barrier.wait();
+                    for _ in 0..ROUNDS {
+                        export_ops(&rec, Some(path.as_os_str()));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("join");
+        }
+        let text = std::fs::read_to_string(&path).expect("read");
+        let _ = std::fs::remove_file(&path);
+        assert!(text.ends_with('\n'));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), THREADS * ROUNDS * 2);
+        let meta = "{\"event\":\"op_stats_meta\",\"ops\":1,\"dropped_records\":0}";
+        let mut per_thread = vec![0usize; THREADS];
+        for pair in lines.chunks(2) {
+            let t = (0..THREADS)
+                .find(|t| {
+                    pair.first().copied()
+                        == Some(
+                            format!(
+                                "{{\"event\":\"op_stats\",\"op\":\"op{t}\",\"success\":1,\"failure\":0,\"count\":1,\"min_us\":1000,\"mean_us\":1000,\"p95_us\":1000,\"max_us\":1000}}"
+                            )
+                            .as_str(),
+                        )
+                })
+                .unwrap_or_else(|| panic!("mixed or unknown line: {pair:?}"));
+            assert_eq!(pair.get(1).copied(), Some(meta), "{pair:?}");
+            if let Some(c) = per_thread.get_mut(t) {
+                *c += 1;
+            }
+        }
+        assert_eq!(per_thread, vec![ROUNDS; THREADS]);
+    }
+
     /// REPAIR-5: 計測出力先が FIFO でも `export_ops` がブロックせず、何も書き込まない。
     /// 読み手がいない場合と、読み手が open しただけで読まない場合の両方を具体値で検証する。
     #[cfg(target_os = "linux")]

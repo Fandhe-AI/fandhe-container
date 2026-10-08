@@ -35,8 +35,14 @@ fn spawn_reader<R: Read + Send + 'static>(mut pipe: R) -> mpsc::Receiver<Vec<u8>
 /// 回収・出力収集のいずれも期限付きで、期限超過時は読み取りを打ち切って panic で失敗させる
 /// （stdout を継承した子孫が残って EOF が来ない場合も無期限に待たない）。
 fn run(args: &[&str]) -> Output {
+    run_env(args, &[])
+}
+
+/// [`run`] と同じ手順で、環境変数 `envs` を追加して起動する。
+fn run_env(args: &[&str], envs: &[(&str, &std::ffi::OsStr)]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_fandhe-container"))
         .args(args)
+        .envs(envs.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -202,6 +208,67 @@ fn cli1_create_start_flow_on_linux() {
     assert_eq!(out.status.code(), Some(8));
     assert_eq!(op_and_code(&out), ("start".into(), "UNIMPLEMENTED".into()));
     assert!(out.stdout.is_empty());
+}
+
+/// REPAIR-4: 複数の CLI プロセスが同じ `FANDHE_CONTAINER_OP_LOG` へ並行に追記しても JSON 行が混ざらない。
+///
+/// 相対 bundle の create は core へ到達する前に失敗し（終了コード 2）、失敗 1 件の計測を追記する。
+/// 16 スレッド × 4 回 = 64 プロセスを同時に走らせ、ログが「op_stats 行 + メタ行」の 64 組だけで
+/// 構成されること（1 行に JSON が 2 つ並ばない・行が途切れない・未存在からの同時作成で落とさない）を照合する。
+#[cfg(target_os = "linux")]
+#[test]
+fn repair4_concurrent_processes_keep_op_log_lines_intact() {
+    const WORKERS: usize = 16;
+    const ROUNDS: usize = 4;
+    const STATS_HEAD: &str = "{\"event\":\"op_stats\",\"op\":\"create\",\"success\":0,\"failure\":1,\"count\":1,\"min_us\":";
+    const META: &str = "{\"event\":\"op_stats_meta\",\"ops\":1,\"dropped_records\":0}";
+
+    let tmp = TmpDir::new("oplog");
+    let log = tmp.0.join("ops.jsonl");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(WORKERS));
+    let handles: Vec<_> = (0..WORKERS)
+        .map(|_| {
+            let log = log.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                (0..ROUNDS)
+                    .map(|_| {
+                        run_env(
+                            &["create", "--bundle", "rel/b", "c1"],
+                            &[("FANDHE_CONTAINER_OP_LOG", log.as_os_str())],
+                        )
+                    })
+                    .collect::<Vec<Output>>()
+            })
+        })
+        .collect();
+    for h in handles {
+        for out in h.join().expect("join") {
+            assert_eq!(out.status.code(), Some(2));
+            assert_eq!(
+                op_and_code(&out),
+                ("create".into(), "INVALID_ARGUMENT".into())
+            );
+            assert!(out.stdout.is_empty(), "stdout must be empty");
+        }
+    }
+
+    let text = std::fs::read_to_string(&log).expect("read op log");
+    assert!(text.ends_with('\n'), "{text:?}");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), WORKERS * ROUNDS * 2, "{text}");
+    for pair in lines.chunks(2) {
+        let stats = pair.first().copied().unwrap_or_default();
+        assert!(stats.starts_with(STATS_HEAD), "mixed line: {stats:?}");
+        assert!(stats.ends_with('}'), "truncated line: {stats:?}");
+        assert_eq!(stats.matches('{').count(), 1, "mixed line: {stats:?}");
+        assert_eq!(stats.matches('}').count(), 1, "mixed line: {stats:?}");
+        for key in ["\"mean_us\":", "\"p95_us\":", "\"max_us\":"] {
+            assert_eq!(stats.matches(key).count(), 1, "mixed line: {stats:?}");
+        }
+        assert_eq!(pair.get(1).copied(), Some(META), "{pair:?}");
+    }
 }
 
 /// 終了コード 0・stdout / stderr とも空。

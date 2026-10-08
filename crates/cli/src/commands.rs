@@ -235,6 +235,35 @@ mod tests {
         }
     }
 
+    /// ERR-1: 固定文言の失敗は行本体と LF を 1 回の write で書く（他の出力が行の途中へ入らない）。
+    #[test]
+    fn err1_write_stderr_emits_fixed_line_in_single_write() {
+        struct Counting(Vec<Vec<u8>>);
+        impl Write for Counting {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.push(buf.to_vec());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for (exit, line) in [
+            (
+                CliExit::Usage,
+                "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs>\"}\n",
+            ),
+            (
+                CliExit::Unimplemented,
+                "{\"code\":\"UNIMPLEMENTED\",\"message\":\"command is not implemented yet\"}\n",
+            ),
+        ] {
+            let mut out = Counting(Vec::new());
+            exit.write_stderr(&mut out).expect("write");
+            assert_eq!(out.0, vec![line.as_bytes().to_vec()]);
+        }
+    }
+
     /// 出力: 成功は 0 バイト、固定文言は 1 行 JSON、core 由来は op 付き 1 行 JSON。
     #[test]
     fn err2_write_stderr_formats() {

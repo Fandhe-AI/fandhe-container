@@ -164,7 +164,10 @@ mod linux {
 
         // (3) 親（コンテナ cgroup）の pids.max が子 cgroup のプロセスにも掛かり、親の pids.current に計上される。
         container
-            .set_pids_max(&PidsMax::count(3).unwrap())
+            .set_pids_max(
+                &fandhe_container_core::observability::OpRecorder::new(),
+                &PidsMax::count(3).unwrap(),
+            )
             .expect("set pids.max on the container cgroup");
         let limited = ExecCgroupName::unique();
         let _limited_cg = ExecChildCgroup::create_in_path_for_test(&container_path, &limited)

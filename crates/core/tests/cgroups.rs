@@ -178,6 +178,7 @@ mod linux {
                 .expect("enable memory and cpu controllers");
             let applied = container
                 .set_memory_limits(
+                    &fandhe_container_core::observability::OpRecorder::new(),
                     &enabled,
                     &MemoryLimits {
                         memory_max: MemoryLimit::parse("64M").expect("memory limit"),
@@ -185,7 +186,12 @@ mod linux {
                     },
                 )
                 .expect("set memory limits");
-            let applied_cpu = container.set_cpu_max(&cpu).expect("set cpu.max");
+            let applied_cpu = container
+                .set_cpu_max(
+                    &fandhe_container_core::observability::OpRecorder::new(),
+                    &cpu,
+                )
+                .expect("set cpu.max");
             let join = container.join_hook().expect("join hook");
             let (observed, record, pid, exit) = launch(&rootfs.0, join, &dir);
             (applied, applied_cpu, observed, record, pid, exit)

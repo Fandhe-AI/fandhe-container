@@ -119,9 +119,27 @@ mod linux {
         let cpu = CpuMax::parse_cpus("1.5", CpuMax::DEFAULT_PERIOD_US).unwrap();
         let pids = PidsMax::from_pids_limit(100).unwrap();
         let io = IoMax::new(device, IoLimit::Value(1_048_576), u, u, u).unwrap();
-        assert_eq!(child.set_cpu_max(&cpu), Ok(cpu));
-        assert_eq!(child.set_pids_max(&pids), Ok(pids));
-        assert_eq!(child.set_io_max(&io), Ok(io));
+        assert_eq!(
+            child.set_cpu_max(
+                &fandhe_container_core::observability::OpRecorder::new(),
+                &cpu
+            ),
+            Ok(cpu)
+        );
+        assert_eq!(
+            child.set_pids_max(
+                &fandhe_container_core::observability::OpRecorder::new(),
+                &pids
+            ),
+            Ok(pids)
+        );
+        assert_eq!(
+            child.set_io_max(
+                &fandhe_container_core::observability::OpRecorder::new(),
+                &io
+            ),
+            Ok(io)
+        );
         let weight = IoWeight::from_blkio_weight(500).unwrap();
         assert_eq!(
             child.set_io_weight(
@@ -175,8 +193,20 @@ mod linux {
         // 無制限側: pids と io を戻しても cpu.max は変化しない。
         let unlimited = PidsMax::from_pids_limit(-1).unwrap();
         let reset = IoMax::new(device, u, u, u, u).unwrap();
-        assert_eq!(child.set_pids_max(&unlimited), Ok(unlimited));
-        assert_eq!(child.set_io_max(&reset), Ok(reset));
+        assert_eq!(
+            child.set_pids_max(
+                &fandhe_container_core::observability::OpRecorder::new(),
+                &unlimited
+            ),
+            Ok(unlimited)
+        );
+        assert_eq!(
+            child.set_io_max(
+                &fandhe_container_core::observability::OpRecorder::new(),
+                &reset
+            ),
+            Ok(reset)
+        );
         assert_eq!(read("cpu.max").trim_end(), "150000 100000");
         assert_eq!(read("pids.max").trim_end(), "max");
         assert_eq!(read("io.max").trim_end(), "");

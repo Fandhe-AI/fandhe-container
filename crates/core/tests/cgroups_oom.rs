@@ -217,6 +217,7 @@ mod linux {
                 .expect("enable memory controller");
             let applied = container
                 .set_memory_limits(
+                    &fandhe_container_core::observability::OpRecorder::new(),
                     &enabled,
                     &MemoryLimits {
                         memory_max: MemoryLimit::parse("64M").expect("memory limit"),

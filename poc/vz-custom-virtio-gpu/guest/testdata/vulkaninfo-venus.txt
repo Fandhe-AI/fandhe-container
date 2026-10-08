@@ -1,0 +1,3 @@
+GPU0:
+  deviceName = Virtio-GPU Venus (synthetic)
+  driverName = venus

@@ -121,7 +121,11 @@ cat >>"$stub" <<'STUB'
 #     以後の state が NOT_FOUND に加えて自由文・不正な JSON・code が文字列でない行を返す
 #   create-fail-nf-badmsg: create 未作成で失敗し、以後の state が message が文字列でない
 #     NOT_FOUND を返す
-#   start-fail / start-hang / start-flood: start が失敗 / ハング / 大量出力
+#   start-fail / start-hang / start-flood: start が失敗 / ハング / 無限の大量出力
+#               （start-flood は delete 時に、収集プロセスが記録した start ログの大きさを
+#                $STUB_STATE/flood-size へ残す）
+#   fsize-probe: create が自身の RLIMIT_FSIZE（ulimit -f）を $STUB_STATE/fsize へ記録し、
+#                継承したログへ 2 MiB を書いて、その終了ステータスを $STUB_STATE/flood-rc へ記録する
 #   delete-fail: 計測は成功するが delete が常に失敗
 #   exec-delayed: start 後の state が created を 2 回返してから stopped
 #   exec-never: start 後の state が created のまま
@@ -201,6 +205,12 @@ case "$cmd" in
       create-fail-delete-fail) touch "$m.created"; echo "stub: create failed" >&2; exit 1 ;;
     esac
     touch "$m.created"
+    if [ "$mode" = fsize-probe ]; then
+      ulimit -f >"$STUB_STATE/fsize"
+      rc=0
+      head -c 2097152 /dev/zero || rc=$?
+      echo "$rc" >"$STUB_STATE/flood-rc"
+    fi
     ;;
   start)
     [ -e "$m.created" ] || not_exist
@@ -274,6 +284,9 @@ case "$cmd" in
         fi
         ;;
     esac
+    if [ "$mode" = start-flood ]; then
+      cat "$TMPDIR"/*/start-*.log 2>/dev/null | wc -c >"$STUB_STATE/flood-size"
+    fi
     rm -f -- "$m".*
     ;;
 esac
@@ -590,10 +603,67 @@ elapsed=$((SECONDS - started))
 if [ "$elapsed" -lt 15 ]; then pass "start-hang-elapsed (${elapsed}s < 15s)"; else fail "start-hang-elapsed (${elapsed}s)"; fi
 if grep -q '^delete ' "$stub_log"; then pass "start-hang-delete-called"; else fail "start-hang-delete-called"; fi
 
-# --- 7b. ログ出力の無制限書き込み（ulimit -f 上限超過）は計測失敗になる ---
+# --- 7b. ログ出力の無制限書き込み: 書き手は止めず、収集側が先頭 LOG_MAX_KIB（1024 KiB）だけを記録する
+#         （ランタイムに rlimit を掛けない）。書き手は --timeout で打ち切られ計測失敗（exit 1） ---
 reset_log
-STUB_MODE=start-flood expect_rc "start-flood" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 5
+flood_tmp="$work/flood-tmp"
+mkdir -p "$flood_tmp"
+started="$SECONDS"
+TMPDIR="$flood_tmp" STUB_MODE=start-flood expect_rc "start-flood" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1
+elapsed=$((SECONDS - started))
+if [ "$elapsed" -lt 15 ]; then pass "start-flood-elapsed (${elapsed}s < 15s)"; else fail "start-flood-elapsed (${elapsed}s)"; fi
 if grep -q '^delete ' "$stub_log"; then pass "start-flood-delete-called"; else fail "start-flood-delete-called"; fi
+expect_contains "start-flood-truncated-warning" "runtime-log-truncated: start-1.log limit_kib=1024"
+expect_eq "start-flood-log-size" "1048576" "$(tr -d ' \n' <"$stub_state/flood-size" 2>/dev/null)"
+
+# --- 7c. ランタイムとその子孫は RLIMIT_FSIZE を継承しない（ulimit -f を掛けない） ---
+reset_log
+STUB_MODE=fsize-probe expect_rc "fsize-probe" 0 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
+expect_eq "fsize-not-inherited" "$(ulimit -f)" "$(cat "$stub_state/fsize" 2>/dev/null)"
+expect_eq "fsize-flood-rc" "0" "$(cat "$stub_state/flood-rc" 2>/dev/null)"
+
+# --- 7d. 後始末中の 2 回目のシグナルで後始末が中断されない（終了コード 4 を保つ） ---
+for sig in INT TERM HUP; do
+  reset_log
+  started="$SECONDS"
+  STARTUP_LATENCY_TEST_SIGNAL_IN_CLEANUP="$sig" STUB_MODE=never-stops expect_rc "signal-in-cleanup-$sig" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1
+  elapsed=$((SECONDS - started))
+  if [ "$elapsed" -lt 15 ]; then pass "signal-in-cleanup-$sig-bounded (${elapsed}s < 15s)"; else fail "signal-in-cleanup-$sig-bounded (${elapsed}s)"; fi
+  expect_contains "signal-in-cleanup-$sig-leftover-id" "containers left behind: fandhe-startup-"
+done
+
+# --- 7e. 計測中の HUP でも後始末が走り、最初のシグナルの終了コード 129 を返す ---
+# 対象を背景で起動し、start 後の state ポーリング区間（exec-after-1s は約 1 秒続く）で HUP を送る。
+# 引数: <名前> <後始末中に送る 2 回目のシグナル（空なら送らない）>
+run_hup_case() {
+  local name="$1" second="$2" i=0 bg_pid rc=0 t0 ms
+  reset_log
+  t0="${EPOCHREALTIME/./}"
+  STARTUP_LATENCY_TEST_SIGNAL_IN_CLEANUP="$second" STUB_MODE=exec-after-1s \
+    "$bash_bin" "$target_script" "${default_args[@]}" --runtime "$stub" --bundle "$work/bundle" \
+    --iterations 1 --warmup 0 --timeout 3 >"$tmp_root/bg.out" 2>"$tmp_root/bg.err" </dev/null &
+  bg_pid=$!
+  while ! grep -q '^start ' "$stub_log" && [ "$i" -lt 100 ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  if ! grep -q '^start ' "$stub_log"; then
+    fail "$name (start was not observed)"
+  fi
+  kill -HUP "$bg_pid" 2>/dev/null || true
+  wait "$bg_pid" || rc=$?
+  ms=$(((${EPOCHREALTIME/./} - t0) / 1000))
+  last_output="$(cat "$tmp_root/bg.out")"$'\n'"$(cat "$tmp_root/bg.err")"
+  expect_eq "$name-rc" "129" "$rc"
+  expect_eq "$name-stdout-empty" "" "$(cat "$tmp_root/bg.out")"
+  expect_contains "$name-interrupted" "interrupted"
+  if grep -q '^delete ' "$stub_log"; then pass "$name-delete-called"; else fail "$name-delete-called"; fi
+  expect_eq "$name-no-container-left" "" "$(ls -A "$stub_state")"
+  if [ "$ms" -lt 6000 ]; then pass "$name-bounded (${ms}ms < 6000ms)"; else fail "$name-bounded (${ms}ms)"; fi
+}
+run_hup_case "hup-cleanup" ""
+# 残存なしで後始末中に INT が重なっても、最初のシグナル（HUP=129）の終了コードを返す。
+run_hup_case "hup-then-int-in-cleanup" "INT"
 
 # --- 8. delete 失敗: 計測成功でも exit 4、残存 ID を出力 ---
 reset_log

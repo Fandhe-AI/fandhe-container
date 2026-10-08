@@ -82,6 +82,15 @@ host_memory_window=present" --dmesg-file "$fx/drm-prefix-ok.log"
 expect_case drm-prefix-zero-scanouts 1 "kms=probe_failed_zero_scanouts
 host_memory_window=present" --dmesg-file "$fx/drm-prefix-zero-scanouts.log"
 expect_case drm-prefix-multi-section 1 "probe=multiple_sections" --dmesg-file "$fx/drm-prefix-multi-section.log"
+# 再 probe が features 行だけで止まり number of cap sets に到達しないログでも、先行区間の
+# capset・共有メモリ情報と組み合わせて成功にしない（features 行の重複で複数区間と判定）。
+expect_case reprobe-features-conflict 1 "probe=multiple_sections" --dmesg-file "$fx/reprobe-features-conflict.log"
+expect_case reprobe-host-window 1 "probe=multiple_sections" --dmesg-file "$fx/reprobe-host-window.log"
+# 同じ features 行に +host_visible と -host_visible が並ぶ矛盾した記録は enabled にしない。
+expect_case feature-conflict-same-line 1 "probe=ok
+host_visible=conflicting
+capset_info=venus
+host_memory_window=present" --dmesg-file "$fx/feature-conflict-same-line.log"
 expect_case capset-version-nonzero 1 "capset_max_version=3" --dmesg-file "$fx/capset-version-nonzero.log"
 # サイズ 0 の窓は zero_size だけを出し、present を併記しない（key 重複検査と併せて照合）。
 expect_case host-window-zero 1 "probe=ok

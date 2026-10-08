@@ -2153,7 +2153,7 @@ mod pdeathsig_tests {
     use std::process::{Child, Command, ExitStatus};
     use std::time::{Duration, Instant};
 
-    /// 子の回収を `try_wait` のポーリングと期限で行う（REPAIR-5。期限超過時は kill してから回収し失敗にする）。
+    /// 子の回収を `try_wait` のポーリングと期限で行う（REPAIR-5。期限超過時は kill 後も有限期限で回収を試み失敗にする）。
     fn wait_bounded(mut child: Child) -> ExitStatus {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -2162,7 +2162,14 @@ mod pdeathsig_tests {
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
-                let _ = child.wait();
+                // kill 後の回収にも有限の期限を設ける（無期限の `wait` は残さない）。
+                let reap_deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < reap_deadline {
+                    if !matches!(child.try_wait(), Ok(None)) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
                 panic!("child did not exit within the deadline");
             }
             std::thread::sleep(Duration::from_millis(10));

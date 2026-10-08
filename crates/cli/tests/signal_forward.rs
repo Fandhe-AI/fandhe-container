@@ -8,6 +8,11 @@
 //! - plugin 役（`plugin_entry`。`PLUGIN_SOCKET_ENV` 設定時）: 接続後に pid をファイルへ書き、応答せず待つ
 //!   （EOF を読まないので、停止は転送されたシグナルによる）
 //!
+//! 親が受けたシグナルでの終了検証（`run_case`）では、Linux の plugin が `PR_SET_PDEATHSIG(SIGKILL)` で
+//! 親の死に追従するため、plugin の停止だけでは転送の有無を区別できない。そこで転送の受信は、親を
+//! 生かしたまま `forward_to_running_plugins` を直接呼ぶ `run_direct_case` で、plugin 役が記録した
+//! シグナル番号の具体値として検証する。
+//!
 //! 待ちはすべて有限の期限付き（REPAIR-5）。
 
 #![cfg(unix)]
@@ -21,12 +26,22 @@ use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 const WAIT: Duration = Duration::from_secs(20);
 const ROLE_ENV: &str = "FCSF_ROLE";
 const DIR_ENV: &str = "FCSF_DIR";
+/// 設定時、親役はシグナルを受けず、トリガーファイルの指示で転送関数を直接呼ぶ（親は生存し続ける）。
+const DIRECT_ENV: &str = "FCSF_DIRECT";
+const TRIGGER_FILE: &str = "trigger";
+
+/// plugin 役のハンドラが受信シグナル番号を残す先（async-signal-safe な原子変数）。
+static RECEIVED: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn record_signal(sig: i32) {
+    RECEIVED.store(sig, Ordering::SeqCst);
+}
 
 /// 親役の入口。通常のテスト実行（`FCSF_ROLE` 未設定）では何もしない。
 #[test]
@@ -35,7 +50,10 @@ fn parent_entry() {
         return;
     }
     let dir = PathBuf::from(std::env::var_os(DIR_ENV).unwrap());
-    fandhe_container_cli::signals::install_signal_forwarding().unwrap();
+    let direct = std::env::var_os(DIRECT_ENV).is_some();
+    if !direct {
+        fandhe_container_cli::signals::install_signal_forwarding().unwrap();
+    }
     let plugin = plugin_spec(&dir);
     let _resident = ResidentPlugin::start(
         &plugin,
@@ -54,6 +72,24 @@ fn parent_entry() {
             &mut JsonLinesPeerAuthObserver::new(),
         );
     });
+    if direct {
+        // トリガーが書かれたら、その番号のシグナルを登録済み plugin へ転送する。親は終了しない。
+        let start = Instant::now();
+        let sig = loop {
+            if let Some(n) = std::fs::read_to_string(dir.join(TRIGGER_FILE))
+                .ok()
+                .and_then(|t| t.trim().parse::<i32>().ok())
+            {
+                break n;
+            }
+            assert!(start.elapsed() < WAIT, "trigger did not arrive");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let forward = fandhe_container_plugin::ForwardSignal::from_raw(sig).unwrap();
+        let _ = fandhe_container_plugin::forward_to_running_plugins(forward);
+        std::thread::sleep(Duration::from_secs(40));
+        std::process::exit(98);
+    }
     // シグナルで終了するまで待つ（上限つき。期限を過ぎたら異常終了させる）。
     std::thread::sleep(Duration::from_secs(40));
     std::process::exit(99);
@@ -78,8 +114,22 @@ fn plugin_entry() {
         std::process::id().to_string(),
     )
     .unwrap();
-    // 応答も読み取りもしない。転送されたシグナルで終了する。
-    std::thread::sleep(Duration::from_secs(40));
+    // 応答も読み取りもしない。受信したシグナル番号を記録して終了する（記録はハンドラ外で行う）。
+    for sig in [1, 2, 15] {
+        fandhe_container_cli::signals::install_recording_handler_for_test(sig, record_signal)
+            .unwrap();
+    }
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(40) {
+        let sig = RECEIVED.load(Ordering::SeqCst);
+        if sig != 0 {
+            let tmp = sock.with_file_name(format!("{name}.sig.tmp"));
+            std::fs::write(&tmp, sig.to_string()).unwrap();
+            std::fs::rename(&tmp, sock.with_file_name(format!("{name}.sig"))).unwrap();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn plugin_spec(dir: &Path) -> OneShotPlugin {
@@ -167,19 +217,18 @@ fn is_alive(pid: u32) -> bool {
     )
 }
 
-/// 失敗時にも親役と plugin 役を残さない。
+/// 失敗時にも親役を残さない。
+///
+/// plugin 役へは SIGKILL を送らない。plugin 役は終了済みで pid が再利用され得るうえ、Linux では親役の
+/// kill で `PR_SET_PDEATHSIG` により停止し、その他でも自前の期限（40 秒）で終了するため。
 struct Cleanup {
     parent: Child,
-    plugins: Vec<u32>,
 }
 impl Drop for Cleanup {
     fn drop(&mut self) {
         let _ = self.parent.kill();
         // kill が失敗しても有限時間で戻る（REPAIR-5）。
         let _ = wait_bounded(&mut self.parent, HELPER_TIMEOUT);
-        for pid in &self.plugins {
-            send("KILL", *pid);
-        }
     }
 }
 
@@ -223,12 +272,8 @@ fn run_case(sig_name: &str, sig_num: i32) {
         .spawn()
         .unwrap();
     let parent_pid = parent.id();
-    let mut cleanup = Cleanup {
-        parent,
-        plugins: Vec::new(),
-    };
+    let mut cleanup = Cleanup { parent };
     let (resident, one_shot) = wait_plugin_pids(&dir.0);
-    cleanup.plugins = vec![resident, one_shot];
     assert!(is_alive(resident) && is_alive(one_shot));
 
     // 親だけへ送る。plugin の停止は転送の結果になる。
@@ -259,6 +304,57 @@ fn run_case(sig_name: &str, sig_num: i32) {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+}
+
+/// 転送の受信検証。親を生かしたまま転送関数を直接呼び、各 plugin 役が記録した番号が `sig_num` と
+/// 一致することを具体値で確認する（PDEATHSIG による停止とは区別される。REPAIR-12）。
+fn run_direct_case(sig_num: i32) {
+    let dir = TempDir::new();
+    let parent = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "parent_entry", "--test-threads=1", "--nocapture"])
+        .env(ROLE_ENV, "parent")
+        .env(DIRECT_ENV, "1")
+        .env(DIR_ENV, &dir.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut cleanup = Cleanup { parent };
+    let _ = wait_plugin_pids(&dir.0);
+    std::fs::write(dir.0.join(TRIGGER_FILE), sig_num.to_string()).unwrap();
+
+    let start = Instant::now();
+    let records = loop {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(&dir.0).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".sock.sig") {
+                found.push((name, std::fs::read_to_string(entry.path()).unwrap()));
+            }
+        }
+        if found.len() == 2 {
+            break found;
+        }
+        assert!(
+            start.elapsed() < WAIT,
+            "plugins did not record the signal: {found:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    for (name, content) in &records {
+        assert_eq!(content.trim(), sig_num.to_string(), "{name}");
+    }
+    // 親は生存したまま（停止は親の死ではなく転送によるもの）。
+    assert!(cleanup.parent.try_wait().unwrap().is_none());
+}
+
+/// PLUG-7・#1513: 転送された SIGINT・SIGTERM・SIGHUP の番号が、都度起動・常駐の両 plugin に届く。
+#[test]
+fn plug7_forwarded_signal_number_reaches_both_plugins() {
+    run_direct_case(2);
+    run_direct_case(15);
+    run_direct_case(1);
 }
 
 /// PLUG-7・#1513: SIGINT を転送し、親は SIGINT で終了する。
@@ -297,12 +393,8 @@ fn plug7_sighup_ignored_at_startup_is_kept_and_not_forwarded() {
         .spawn()
         .unwrap();
     let parent_pid = parent.id();
-    let mut cleanup = Cleanup {
-        parent,
-        plugins: Vec::new(),
-    };
+    let mut cleanup = Cleanup { parent };
     let (resident, one_shot) = wait_plugin_pids(&dir.0);
-    cleanup.plugins = vec![resident, one_shot];
 
     send("HUP", parent_pid);
 

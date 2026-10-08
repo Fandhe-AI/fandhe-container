@@ -10,13 +10,14 @@
 //! ため、`crates/plugin/src/sys.rs` と同じ流儀で必要最小限の `extern "C"` 宣言と構造体を自前で持つ。
 //!
 //! # 構造体レイアウトと定数（一次情報）
-//! - Linux（glibc。x86_64 / aarch64 とも同一）: `bits/sigaction.h` の `struct sigaction` は
+//! - Linux（`target_env = "gnu"` の glibc のみ。x86_64 / aarch64 とも同一）: `bits/sigaction.h` の `struct sigaction` は
 //!   `{ sa_handler(8), sa_mask(__sigset_t = unsigned long[16] = 128), sa_flags(int, 後ろに 4 パディング), sa_restorer(8) }`
 //!   で 152 バイト。`SA_RESTART` = 0x10000000・`SA_RESETHAND` = 0x80000000（`asm-generic/signal-defs.h`）。
 //! - macOS: xnu の `sys/signal.h` の `struct sigaction` は `{ __sigaction_u(8), sa_mask(sigset_t = u32), sa_flags(int) }`
 //!   で 16 バイト。`SA_RESTART` = 0x0002・`SA_RESETHAND` = 0x0004。
 //! - `SIG_IGN` = 1（いずれの OS も）。
-//! - 上記以外の OS・アーキテクチャは構造体を持たず `Unsupported` を返す（他 OS の値を流用しない。fail-closed）。
+//! - musl は `struct sigaction` の並びが異なる（handler・flags・restorer・mask の順）ため対象外。
+//! - 上記以外の OS・アーキテクチャ・libc は構造体を持たず `Unsupported` を返す（他 OS の値を流用しない。fail-closed）。
 //!
 //! # 契約
 //! - `unsafe fn` は公開しない。公開するのは安全な [`install_handler`]・[`raise_signal`]（`pub(crate)`）のみ
@@ -36,6 +37,7 @@ pub(crate) enum Disposition {
 
 #[cfg(all(
     target_os = "linux",
+    target_env = "gnu",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 mod layout {
@@ -90,6 +92,7 @@ mod layout {
     target_os = "macos",
     all(
         target_os = "linux",
+        target_env = "gnu",
         any(target_arch = "x86_64", target_arch = "aarch64")
     )
 ))]
@@ -144,6 +147,7 @@ mod imp {
     target_os = "macos",
     all(
         target_os = "linux",
+        target_env = "gnu",
         any(target_arch = "x86_64", target_arch = "aarch64")
     )
 )))]

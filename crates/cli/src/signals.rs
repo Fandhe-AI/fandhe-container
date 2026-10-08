@@ -14,8 +14,8 @@
 //!   当該シグナルがブロックされるため保留となり、ハンドラから戻った時点で配送されて親は
 //!   シグナル終了（`ExitStatus::signal()` がそのシグナル）になる。errno は再送で終了するため退避しない。
 //! - 起動時に `SIG_IGN` を継承したシグナルは上書きしない（nohup・バックグラウンドジョブの慣行を壊さない）。
-//! - シグナルハンドラの構造体レイアウトを確認済みでない unix（Linux の x86_64・aarch64 と macOS
-//!   以外。例: riscv64 の Linux、FreeBSD）では登録が失敗し、`main` は構造化エラー（`INTERNAL`）で
+//! - シグナルハンドラの構造体レイアウトを確認済みでない unix（Linux の glibc〔x86_64・aarch64〕と macOS
+//!   以外。例: musl の Linux、riscv64 の Linux、FreeBSD）では登録が失敗し、`main` は構造化エラー（`INTERNAL`）で
 //!   起動を拒否する（fail-closed。転送なしで継続する方針は採らない）。対象は 3 OS 一級対応の範囲外。
 //! - プロセス全体の設定のため、バイナリから 1 回だけ呼ぶこと。
 //! - SIGKILL・`panic = abort` では転送されない。Linux は #1514（`PR_SET_PDEATHSIG`）で補う予定、
@@ -50,4 +50,16 @@ pub fn install_signal_forwarding() -> Result<(), CliError> {
         })?;
     }
     Ok(())
+}
+
+/// 結合試験の plugin 役が受信シグナルを記録するためのハンドラ登録（#1513・PLUG-7。テスト専用）。
+///
+/// `handler` は async-signal-safe であること（原子変数への書き込みのみ等）。登録は
+/// [`install_signal_forwarding`] と同じ `sys::install_handler` を使う（起動時 `SIG_IGN` は尊重）。
+#[doc(hidden)]
+pub fn install_recording_handler_for_test(
+    sig: i32,
+    handler: extern "C" fn(i32),
+) -> std::io::Result<()> {
+    sys::install_handler(sig, handler).map(|_| ())
 }

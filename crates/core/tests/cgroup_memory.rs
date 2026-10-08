@@ -42,7 +42,11 @@ mod linux {
             swap_max: Some(MemoryLimit::Bytes(0)),
         };
         let applied = child
-            .set_memory_limits(&enabled, &limits)
+            .set_memory_limits(
+                &fandhe_container_core::observability::OpRecorder::new(),
+                &enabled,
+                &limits,
+            )
             .expect("set memory limits");
         let dir = parent.join(name.as_str());
         assert_eq!(read(&dir.join("memory.max")).trim(), "67108864");
@@ -66,7 +70,11 @@ mod linux {
         ];
         for bad in &invalid_requests {
             let err = child
-                .set_memory_limits(&enabled, bad)
+                .set_memory_limits(
+                    &fandhe_container_core::observability::OpRecorder::new(),
+                    &enabled,
+                    bad,
+                )
                 .expect_err("out-of-range limit must be rejected");
             assert_eq!(err.code, ErrorCode::InvalidArgument);
             assert_eq!(read(&dir.join("memory.max")).trim(), "67108864");

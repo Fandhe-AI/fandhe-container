@@ -36,11 +36,23 @@ mod linux {
         let read = || fs::read_to_string(&file).expect("read pids.max");
 
         let limited = PidsMax::count(100).unwrap();
-        assert_eq!(child.set_pids_max(&limited), Ok(limited));
+        assert_eq!(
+            child.set_pids_max(
+                &fandhe_container_core::observability::OpRecorder::new(),
+                &limited
+            ),
+            Ok(limited)
+        );
         assert_eq!(read().trim_end(), "100");
 
         let unlimited = PidsMax::unlimited();
-        assert_eq!(child.set_pids_max(&unlimited), Ok(unlimited));
+        assert_eq!(
+            child.set_pids_max(
+                &fandhe_container_core::observability::OpRecorder::new(),
+                &unlimited
+            ),
+            Ok(unlimited)
+        );
         assert_eq!(read().trim_end(), "max");
 
         // 不正値は構築で拒否され、ファイルは変化しない。

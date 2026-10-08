@@ -230,6 +230,11 @@ printf '{"code":"INVALID_ARGUMENT","message":"%s%s%s"}\n' "$q4096" "$q4096" "$q4
 printf '{"code":"INVALID_ARGUMENT"\n' >"$errmax/err.3"
 printf '{"code":"INVALID_ARGUMENT","message":"a"}\n{"code":"INVALID_ARGUMENT","message":"b"}\n' >"$errmax/err.4"
 printf '{"code":"INVALID_ARGUMENT","message":"a\000b"}\n' >"$errmax/err.5"
+# err.6 / err.7 = op / code に非 ASCII（UTF-8 として妥当）を含む。message 以外の非 ASCII は受理しない。
+printf '{"op":"cr\303\251ate","code":"NOT_FOUND","message":"m"}\n' >"$errmax/err.6"
+printf '{"code":"NOT_\303\251FOUND","message":"m"}\n' >"$errmax/err.7"
+# err.8 = 同じ非 ASCII が message にあれば受理する（対照）。
+printf '{"op":"create","code":"NOT_FOUND","message":"cr\303\251ate"}\n' >"$errmax/err.8"
 # 同じ capture の stdout fixture: PID 列が数値の list 行（<pid> へ置換されること）。
 # カウンタ（count）が stderr fixture と混ざらないよう別ディレクトリに置く。
 pidout="$work/pidout"
@@ -348,8 +353,35 @@ expect_rc "capture with missing CLI is rc 3" 3 $?
 if [ ! -e "$work/none.txt" ]; then pass "no output file for missing CLI"; else fail "no output file for missing CLI"; fi
 
 # --- compare ---
+# compare は「基準 = Linux の capture、候補 = 別 OS の capture」だけを受け付ける。自己テストは 1 つの OS
+# でしか capture を取れないため、fixture の os 行（2 行目）だけを書き換えた写しを作って渡す
+# （基準は linux、候補は macos）。判定ロジックには手を入れず、製品と同じ経路を通す。
+with_os() { # <名前> <os>。$work/<名前>.<os>.txt を作る
+  local l2=""
+  [ -f "$work/$1.txt" ] || return 0
+  {
+    IFS= read -r _
+    IFS= read -r l2
+  } <"$work/$1.txt"
+  case "$l2" in
+    '# os='*)
+      # 1 行目と 3 行目以降はバイト列のまま写す（NUL・余分なタブ・LF 終端なし等の壊れ方を保つ）。
+      {
+        head -n 1 "$work/$1.txt"
+        printf '# os=%s\n' "$2"
+        tail -n +3 "$work/$1.txt"
+      } >"$work/$1.$2.txt"
+      ;;
+    *) cp "$work/$1.txt" "$work/$1.$2.txt" ;; # os 行を持たない壊れた入力はそのまま渡す
+  esac
+}
+compare_raw() { # <baseline ファイル名> <candidate ファイル名>（$work からの相対）。os 行は書き換えない
+  "$target" compare --baseline "$work/$1" --candidate "$work/$2" >"$work/cmp.txt" 2>&1
+}
 compare() { # <baseline 名> <candidate 名>。出力は $work/cmp.txt、終了コードを返す
-  "$target" compare --baseline "$work/$1.txt" --candidate "$work/$2.txt" >"$work/cmp.txt" 2>&1
+  with_os "$1" linux
+  with_os "$2" macos
+  compare_raw "$1.linux.txt" "$2.macos.txt"
 }
 cmp_has() { # <表示名> <cmp.txt に完全一致で現れるべき行>
   local line hit=0
@@ -392,6 +424,42 @@ compare missing missing
 expect_rc "case missing on both sides is rc 1" 1 $?
 cmp_has_prefix "B05 missing on both sides reported" 'B05 MISSING'
 
+# 環境に結果変数と同名の変数があっても、ファイルに無いケースを読み込んだことにしない。
+base_B05="0/-/-" cand_B05="0/-/-" base_ids="B05" cand_os="macos" compare missing missing
+expect_rc "inherited env vars do not hide a missing case (rc 1)" 1 $?
+cmp_has "B05 still MISSING with base_B05/cand_B05 in env" 'B05 MISSING (baseline=absent candidate=absent)'
+cmp_has "layer B counts the missing case" 'layer B (behavior): match=14 mismatch=0 missing=1'
+# 想定外 ID（B99）と同名の環境変数があっても重複扱いにならず、片側だけにある ID は MISSING になる。
+{
+  cat "$work/ok.txt"
+  printf 'B99\tB\t0\t-\t-\n'
+} >"$work/extra.txt"
+base_B99="0/-/-" cand_B99="0/-/-" compare extra ok
+expect_rc "inherited env var for an unexpected id is ignored (rc 1)" 1 $?
+cmp_has "B99 MISSING on candidate side" 'B99 MISSING (baseline=0/-/- candidate=absent)'
+
+# --- compare の前提: 基準は Linux の capture、候補は別 OS の capture（それ以外は rc 3） ---
+with_os ok linux
+with_os ok macos
+with_os ok windows
+compare_raw ok.linux.txt ok.windows.txt
+expect_rc "linux baseline vs windows candidate is compared (rc 0)" 0 $?
+cmp_has "os line is reported" 'baseline os=linux candidate os=windows'
+compare_raw ok.macos.txt ok.macos.txt
+expect_rc "macos vs macos is rc 3" 3 $?
+cmp_has "non-linux baseline message" 'error: missing-prerequisite: --baseline must be a capture taken on linux'
+compare_raw ok.macos.txt ok.linux.txt
+expect_rc "macos baseline vs linux candidate is rc 3" 3 $?
+compare_raw ok.windows.txt ok.macos.txt
+expect_rc "windows baseline vs macos candidate is rc 3" 3 $?
+compare_raw ok.linux.txt ok.linux.txt
+expect_rc "linux vs linux is rc 3" 3 $?
+cmp_has "same-os candidate message" 'error: missing-prerequisite: --candidate must be a capture taken on an OS other than linux'
+if grep -q 'MATCH' "$work/cmp.txt"; then fail "rejected compare printed verdicts"; else pass "rejected compare prints no verdicts"; fi
+# 入力の書式エラー（rc 2）は OS の前提（rc 3）より先に判定する。
+compare_raw ok.macos.txt broken-not-there.txt
+expect_rc "invalid input wins over os precondition (rc 2)" 2 $?
+
 # --- タイムアウト ---
 expect_rc "hanging CLI is rc 1" 1 "$(rc_of hang)"
 # 終了コード欄は強制終了のシグナル（TERM = 143 / KILL = 137）で変わるため、タイムアウトの印だけを照合する。
@@ -425,7 +493,7 @@ expect_rc "compare with broken capture is rc 2" 2 $?
 sed "s/^A02${tab}A${tab}2/A02${tab}A${tab}999/" "$work/ok.txt" >"$work/badexit.txt"
 compare ok badexit
 expect_rc "compare with malformed exit field is rc 2" 2 $?
-"$target" compare --baseline "$work/ok.txt" >/dev/null 2>&1
+"$target" compare --baseline "$work/ok.linux.txt" >/dev/null 2>&1
 expect_rc "compare without --candidate is rc 2" 2 $?
 
 # stdout 欄が正規化形式でない capture は拒否する（garbage / list:garbage / 種別 n の list 形式）
@@ -490,6 +558,9 @@ expect_line "oversized stderr is unparsed" errmax "A02${tab}A${tab}2${tab}<unpar
 expect_line "truncated JSON stderr is unparsed" errmax "A03${tab}A${tab}2${tab}<unparsed>${tab}-"
 expect_line "multi-line stderr is unparsed" errmax "A04${tab}A${tab}2${tab}<unparsed>${tab}-"
 expect_line "NUL in stderr is unparsed" errmax "A05${tab}A${tab}2${tab}<unparsed>${tab}-"
+expect_line "non-ASCII in op is unparsed" errmax "A06${tab}A${tab}2${tab}<unparsed>${tab}-"
+expect_line "non-ASCII in code is unparsed" errmax "A07${tab}A${tab}2${tab}<unparsed>${tab}-"
+expect_line "non-ASCII in message is accepted" errmax "A08${tab}A${tab}2${tab}NOT_FOUND${tab}-"
 expect_line "numeric PID column is replaced" errmax "B01${tab}B${tab}0${tab}-${tab}list:H;c1,running,<pid>;c2,created,-"
 expect_line "CRLF-terminated list is unexpected" errmax "B03${tab}B${tab}0${tab}-${tab}<unexpected>:2"
 

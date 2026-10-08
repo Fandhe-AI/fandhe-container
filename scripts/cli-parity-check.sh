@@ -193,11 +193,30 @@ run_cli() {
   fi
 }
 
-# stderr から機械可読な code だけを取り出す（文言・パスは写さない）。
-# 構造（4096 バイト以内・NUL なし・高々 1 行・`{"code":"X","message":"..."}` 形式）を検証できない出力は
-# 先頭に code らしき文字列があっても一致扱いにせず <unparsed> とする（ERR 系）。
+# stderr から機械可読な code だけを取り出す（文言・パス・op は写さない）。
+#
+# 受理する形は製品 CLI が出す次の 2 つだけで、どちらも 1 行・LF 終端・空白なし・キー順固定（ERR-1・ERR-2）:
+#   固定文言: {"code":"X","message":"..."}          （使い方エラー・未実装・状態ルート不在など）
+#   core 由来: {"op":"O","code":"X","message":"..."}  （OciRuntimeError::write_json_line。O は
+#              create / start / kill / delete。stop は kill になる）
+# op の有無と値は記録・比較の対象にしない（機械可読契約は code。op は core の付加情報で、TASK-95 の
+# エラー形式確定で CLI 出力から外れる見込みのため、形の差を OS 差として数えない）。
+#
+# message は JSON 文字列として検証する: 未エスケープの `"`・`\`・制御文字（U+0000〜U+001F）を拒否し、
+# エスケープは \" \\ \/ \b \f \n \r \t \uXXXX だけを受理する。非 ASCII バイトは UTF-8 として妥当な
+# ときだけ受理する（iconv で検証。iconv が無ければ検証できないので受理しない）。
+# 検証できない出力（上限超過・NUL・LF が行末の 1 個でない・キーの欠落 / 追加 / 順序違い・不正な文字列）は、
+# code らしき文字列を含んでいても一致扱いにせず <unparsed> とする。
+#
+# 上限 MAX_ERR_BYTES は core の message 上限（OCI_ERROR_MESSAGE_MAX_BYTES = 4096 バイト）が全バイト
+# 2 バイトへエスケープされた場合（8192）と外枠を収める値にしている（正規の出力を上限で落とさない）。
+readonly MAX_ERR_BYTES=16384
+readonly JSON_STR_BODY='([^"\\[:cntrl:]]|\\["\\/bfnrt]|\\u[0-9a-fA-F]{4})*'
+readonly ERR_LINE_RE='^\{("op":"[a-z_]{1,32}",)?"code":"([A-Z_]{1,40})","message":"'"$JSON_STR_BODY"'"\}$'
 norm_code() {
-  local e raw stripped nl
+  # 文字クラス・範囲の解釈を実行環境のロケールに依存させない（OS 間で判定が変わるのを防ぐ）。
+  local LC_ALL=C
+  local e raw stripped nl high
   raw="$(wc -c <"$tmp_dir/err" | tr -d ' ')"
   if [ "$raw" -eq 0 ]; then
     printf -- '-'
@@ -205,14 +224,24 @@ norm_code() {
   fi
   stripped="$(LC_ALL=C tr -d '\000' <"$tmp_dir/err" | wc -c | tr -d ' ')"
   nl="$(LC_ALL=C tr -cd '\n' <"$tmp_dir/err" | wc -c | tr -d ' ')"
-  if [ "$raw" -gt 4096 ] || [ "$stripped" -ne "$raw" ] || [ "$nl" -gt 1 ]; then
+  if [ "$raw" -gt "$MAX_ERR_BYTES" ] || [ "$stripped" -ne "$raw" ] || [ "$nl" -ne 1 ]; then
     printf '<unparsed>'
     return 0
   fi
-  # コマンド置換は末尾の改行を落とす。改行が行末以外にある場合は下の検査で弾く。
-  e="$(LC_ALL=C cat "$tmp_dir/err")"
-  if [[ $e != *$'\n'* && $e =~ ^\{\"code\":\"([A-Z_]{1,40})\",\"message\":\".*\"\}$ ]]; then
-    printf '%s' "${BASH_REMATCH[1]}"
+  high="$(LC_ALL=C tr -d '\000-\177' <"$tmp_dir/err" | wc -c | tr -d ' ')"
+  if [ "$high" -gt 0 ]; then
+    if ! command -v iconv >/dev/null 2>&1 || ! iconv -f UTF-8 -t UTF-8 <"$tmp_dir/err" >/dev/null 2>&1; then
+      printf '<unparsed>'
+      return 0
+    fi
+  fi
+  # DEL と非 ASCII バイト（上で UTF-8 として検証済み）は JSON 文字列内でそのまま書ける文字なので、
+  # 照合前に ASCII の 1 文字へ写す。正規表現が ASCII だけを見るようにし、OS ごとの正規表現実装の
+  # 多バイト・高位バイトの扱いの差を避ける。code / op の字句は ASCII 限定なので写像の影響を受けない。
+  # コマンド置換は末尾の LF を落とす。LF は 1 個と確認済みなので、残っていれば行末以外にある。
+  e="$(LC_ALL=C tr '\177-\377' '[x*]' <"$tmp_dir/err")"
+  if [[ $e != *$'\n'* && $e =~ $ERR_LINE_RE ]]; then
+    printf '%s' "${BASH_REMATCH[2]}"
   else
     printf '<unparsed>'
   fi

@@ -16,7 +16,7 @@
 //! - `crate::setup` を参照してよいのは [`run_setup`] のみ。`commands/` 配下の module は setup の型・関数を import しない。
 //! - 日常操作側の `cfg(target_os)`（`create_start::open_store`・`plugin_backend`）は CLI-1・PLUG-4 のバックエンド振り分けで、
 //!   OS 固有設定ではないため CLI-2 の対象外。非 Linux の失敗文言は plugin 前提の不成立であり、OS 設定や setup 実行を要求しない。
-//! - 分離の単体テストは TASK-80.3。
+//! - 分離の単体テストは `setup::tests::cli2_daily_commands_do_not_request_os_setup`（TASK-80.3）。
 //!
 //! 将来仕様（本実装の範囲外）:
 //! - start の実プロセス起動: supervisor 経由の launcher（TASK-157・TASK-37〜39）。

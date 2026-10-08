@@ -531,10 +531,17 @@ impl ChildGuard {
         let Some(c) = self.child.as_mut() else {
             return Reap::AlreadyReaped;
         };
-        // 直後に SIGKILL するため転送は不要。以後の回収で pid が再利用され得るので、先に登録を解放する
-        // （ハンドラが走査中でも `suspend` と同様に完了を待つ。待ちきれなくても解放を優先する）。
-        if let Some(slot) = self.slot.take() {
-            let _ = slot.suspend();
+        // 直後に SIGKILL するため転送は不要。以後の回収で pid が再利用され得るので、先に登録を外し、
+        // 進行中の転送の完了を待つ。上限内に確認できなければ回収しない（ロード済みの pid へ送信中の
+        // 転送スレッドが、回収後に再利用された pid へ送る誤配送を防ぐ。PLUG-7・fail-closed）。
+        // この場合も kill は安全（未回収の子の pid は再利用されない）なので送り、`Unreaped` を返す。
+        // `Child` は保持し続け、回収は行わない（pid を回収前に手放さない）。
+        if let Some(slot) = self.slot.take()
+            && !slot.suspend()
+        {
+            let _ = c.kill();
+            self.slot = Some(slot);
+            return Reap::Unreaped;
         }
         // kill の前に終了済みかを確認し、自発終了の状態をそのまま拾う（kill との競合窓を狭める）。
         if let Ok(Some(status)) = c.try_wait() {

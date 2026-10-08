@@ -109,12 +109,41 @@ impl Drop for TempDir {
     }
 }
 
+/// 補助コマンド（`kill`）の待ち上限（REPAIR-5）。
+const HELPER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 子の終了を `limit` まで `try_wait` で待つ。上限超過なら kill して回収を再試行し、None を返す。
+fn wait_bounded(child: &mut Child, limit: Duration) -> Option<std::process::ExitStatus> {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return Some(st),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        if start.elapsed() >= limit {
+            let _ = child.kill();
+            return child.try_wait().ok().flatten();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// 期限付きでコマンドを実行し、成功終了なら true（期限超過・起動失敗は false）。
+fn run_bounded(cmd: &mut Command) -> bool {
+    match cmd.spawn() {
+        Ok(mut c) => wait_bounded(&mut c, HELPER_TIMEOUT).is_some_and(|s| s.success()),
+        Err(_) => false,
+    }
+}
+
 fn send(sig: &str, pid: u32) {
-    let _ = Command::new("kill")
-        .arg(format!("-{sig}"))
-        .arg(pid.to_string())
-        .stderr(Stdio::null())
-        .status();
+    let _ = run_bounded(
+        Command::new("kill")
+            .arg(format!("-{sig}"))
+            .arg(pid.to_string())
+            .stderr(Stdio::null()),
+    );
 }
 
 /// 生存確認。Linux ではゾンビ（回収待ち）を終了済みとして扱う（init が回収しない環境でも判定できる）。
@@ -131,11 +160,11 @@ fn is_alive(pid: u32) -> bool {
 /// 生存確認（`kill -0`）。
 #[cfg(not(target_os = "linux"))]
 fn is_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    run_bounded(
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null()),
+    )
 }
 
 /// 失敗時にも親役と plugin 役を残さない。
@@ -146,7 +175,8 @@ struct Cleanup {
 impl Drop for Cleanup {
     fn drop(&mut self) {
         let _ = self.parent.kill();
-        let _ = self.parent.wait();
+        // kill が失敗しても有限時間で戻る（REPAIR-5）。
+        let _ = wait_bounded(&mut self.parent, HELPER_TIMEOUT);
         for pid in &self.plugins {
             send("KILL", *pid);
         }

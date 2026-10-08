@@ -21,7 +21,7 @@
 //!   `RESOURCE_EXHAUSTED`（[`crate::PluginErrorCode::ResourceExhausted`]）で拒否する（fail-closed）。
 //! - 回収の前に登録を外す。外してから回収する窓は `waitpid(WNOHANG)` 1 回分で、その間に届いた
 //!   シグナルは転送されない（取りこぼす側に倒す。回収後に再利用された pid へ送る窓は作らない）。
-//!   登録表の待ち（シグナル送信中の走査の完了待ち）には上限がある（[`REGISTRY_QUIESCE_TIMEOUT`]）。
+//!   登録表の待ち（シグナル送信中の走査の完了待ち）には上限がある（`REGISTRY_QUIESCE_TIMEOUT`）。
 //!
 //! # plugin 作者向けの推奨規約
 //! 継承した pipe・接続（UDS）の EOF で親の終了を検知し、自ら終了すること。plugin は untrusted で

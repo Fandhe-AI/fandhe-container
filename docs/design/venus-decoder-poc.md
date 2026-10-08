@@ -1,12 +1,12 @@
 # Venus デコーダ最小サブセット PoC（設計ドラフト）
 
-macOS の virtio-gpu Venus 自前実装（ヘッドレス Vulkan compute のみ）で、最小 venus デコーダが扱う Vulkan コマンドの候補を記録する（GPU-6）。TASK-172 全体の PoC 文書で、本版は候補抽出（TASK-172.1）・wire パース骨格（TASK-172.2）・記録と再生ハーネス（TASK-172.5）・capset 応答（TASK-172.3）の章を埋める。
+macOS の virtio-gpu Venus 自前実装（ヘッドレス Vulkan compute のみ）で、最小 venus デコーダが扱う Vulkan コマンドの候補を記録する（GPU-6）。TASK-172 全体の PoC 文書で、本版は候補抽出（TASK-172.1）・wire パース骨格（TASK-172.2）・記録と再生ハーネス（TASK-172.5）・capset 応答（TASK-172.3）・試験治具 VMM の選定と capset アダプタ（TASK-172.4）の章を埋める。
 
 > **位置づけ**: 本書はドラフトであり、候補を列挙するだけで対象サブセットを確定しない。最終確定は #726（TASK-172.h2。人間担当）で行う。優先度（必須・推奨・保留）は抽出時点の見立てで、確定扱いにしない。
 
 - 対象ビヘイビア: GPU-6（関連: MAC-5・MVM-4）
-- タスク: TASK-172（MS-13・G-別枠）。本版は TASK-172.1（#722。親 #721）・TASK-172.2（#723）・TASK-172.3（#724）。前提 TASK-7（#25。完了済み）
-- 後続・関連: #723（wire パース骨格）・#724（capset 応答。実装済み）・#889（コマンドストリーム記録）・#725（1〜3 段目の結果）・#726（確定）・#776 / #777（対象範囲判断・工数再確定）・#781（サブセットのフィルタ機構）。ディスパッチ・ハンドラ群は TASK-177.x（#765・#769・#771・#773・#774）
+- タスク: TASK-172（MS-13・G-別枠）。本版は TASK-172.1（#722。親 #721）・TASK-172.2（#723）・TASK-172.3（#724）・TASK-172.4（#888）。前提 TASK-7（#25。完了済み）
+- 後続・関連: #723（wire パース骨格）・#724（capset 応答。実装済み）・#889（コマンドストリーム記録）・#888（試験治具。アダプタまで実装済み・トランスポート未実装）・#725（1〜3 段目の結果）・#726（確定）・#776 / #777（対象範囲判断・工数再確定）・#781（サブセットのフィルタ機構）。ディスパッチ・ハンドラ群は TASK-177.x（#765・#769・#771・#773・#774）
 - 出典（spec）: GPU-6・TASK-172・D-15・PoC-14（submodule リビジョン `984f8a2`）。作業環境で `docs/spec` を取得できなかったため、spec 本文は参照せず ID のみで辿れるようにしている
 - 出典（外部。確認日 2026-10-08）:
   - Vulkan レジストリ `vk.xml`: KhronosGroup/Vulkan-Headers のタグ `vulkan-sdk-1.4.363.0`（`registry/vk.xml`。`VK_HEADER_VERSION` 363。SHA-256 `55ec60950cfb18c3575dcf5fd52741b2bb70eb1e466408f803a91049973ee6fb`）
@@ -216,9 +216,50 @@ GPU-6 の決定（ヘッドレス compute のみ・2D スキャンアウト非�
   - `use_guest_vram` は VMM の共有メモリ方式に依存し、3 段目（#1057）の判定まで未決
   - flag 3 件を 1 にするのは対応機能（blob id 0・待機系コマンド・複数タイムライン。TASK-176・177）を後続が実装する前提の宣言で、現時点では未実装（REPAIR-3）
 
-## 9. 以降の章（未着手）
+## 9. 以降の章（未着手。10 章は #888 の範囲）
 
 | 章 | 内容 | 担当 issue |
 | -- | ---- | ---------- |
 | 1〜3 段目の結果 | 段階的な再検証の結果 | #725 |
 | 最終確定 | 対象サブセットの確定 | #726（TASK-172.h2。人間担当） |
+
+## 10. 試験治具 VMM と外部バックエンド接続（TASK-172.4・#888）
+
+1 段目（GPU 付き Linux 実機）で、既存 OSS の VMM が持つ「virtio-gpu をプロセス外のバックエンドへ出す仕組み」に自前デコーダをつなぐための治具。実装は `poc/venus-decoder/jig/`（ルート workspace の外の独立 PoC パッケージ。確定 19 crate＋benches の crate 境界を変えないため。製品 crate は依存しない）。
+
+### 10.1 本 PR の範囲と未達（実装済みを装わない。REPAIR-3）
+
+- 実装済み: 候補比較（本章）、ctrl の `GET_CAPSET_INFO` / `GET_CAPSET` の復号・応答符号化・構造化ログ 1 行（`adapter`）、治具が広告する feature と config の定数（`device`）、ログ照合器と実機前提テストの枠（`log`・`tests/real_machine_capset_log.rs`）。socket は開かない
+- **受入基準 2（ゲストの Mesa venus の capset クエリが自前デコーダに届いたことをログで確認）は未達**。トランスポート（後続 F1）と実機実行（F3・#725。人間担当）が必要なため
+- 後続（issue 起票は未実施・承認待ち）: F1 vhost-user トランスポート（メッセージ codec・fd 受け渡しと `mmap` の `sys` ラッパー・split virtqueue・kick / call。rust-vmm 系クレートは MVM-4 で使えないため自作）、F2 残りの ctrl 応答（`GET_DISPLAY_INFO`・`CTX_CREATE` 等）、F3 実機疎通（#725）、治具の CI ジョブ組み込み
+
+### 10.2 候補比較
+
+計画フェーズの調査結果。出典タグとファイルは下記のとおりで、crosvm の CLI 構文・render server の capset 転送の有無は**未確認**（実装フェーズでは取得できなかった。F1 着手時に確認する）。
+
+| 候補 | 外部バックエンド接続 | ゲストへ BLOB・CONTEXT_INIT が届くか | venus capset の扱い | ライセンス | 改変の要否 |
+| ---- | -------------------- | ------------------------------------ | ------------------- | ---------- | ---------- |
+| QEMU `vhost-user-gpu-pci`（`hw/display/vhost-user-gpu.c`。タグ `v10.1.0`） | vhost-user | 届かない（realize が立てるのは VIRGL・EDID・RESOURCE_UUID のみ） | Mesa が capset 取得前に中止するため到達しない | GPL-2.0 | 標準では不適 |
+| QEMU 汎用 `vhost-user-device(-pci)`（`hw/virtio/vhost-user-base.c`） | vhost-user。バックエンドの feature を素通し | 届く | バックエンド次第 | GPL-2.0 | 必要（`user_creatable = false` のため標準ビルドでは `-device` で作れない） |
+| crosvm vhost-user frontend（`devices/src/virtio/vhost_user_frontend/mod.rs`。コミット `044c3e3fc53d`） | vhost-user。GPU 向け共有メモリ領域（SHMEM）にも対応 | 届く（デバイス固有 feature とバックエンド feature の積） | バックエンド次第 | BSD-3-Clause | 不要の見込み（`--vhost-user` の CLI 構文と最小カーネル版数は未確認） |
+| virglrenderer の render server（`virgl_render_server`） | virglrenderer 利用側が必要。単体では VMM ではない | VMM 次第 | capset を server へ転送するか未確認 | MIT | — |
+| Cloud Hypervisor・Firecracker | — | — | — | — | 比較対象外（GPU デバイスを持たず、依存・流用は禁止。dependency-policy） |
+
+決め手: Mesa venus（`mesa-25.0.0` の `src/virtio/vulkan/vn_renderer_virtgpu.c`。`required_params`）は capset 取得より前に 3D 機能・`CAPSET_QUERY_FIX`・`RESOURCE_BLOB`・`CONTEXT_INIT` を必須として検査し、欠けると初期化を中止する。治具 VMM がゲストへ `VIRGL`・`RESOURCE_BLOB`・`CONTEXT_INIT` を見せられることが capset クエリ発行の前提になる。
+
+選定（暫定）: **crosvm の vhost-user frontend**。BSD-3-Clause で改変不要の見込みであり、feature が素通しされる。QEMU を使う場合は GPL の VMM バイナリを外部プロセスとして実行するだけでリンクせず、汎用デバイスの有効化には GPL の改変ビルドが要る。この扱いは**要確認（ユーザー判断。licensing.md）**。`use_guest_vram`（8 章）は選定した VMM の共有メモリ方式に従属し、3 段目（#1057）まで未決。
+
+### 10.3 ctrl の値と広告 feature
+
+出典: Linux `include/uapi/linux/virtio_gpu.h` タグ `v6.12`（確認日 2026-10-08。SHA-256 `7c9e2f7d47fa0b1a2c737fc5a741f57c5cf25303dd5c68c2c9738e9bb761eee6`）。値のみ転記。
+
+| 項目 | 値 |
+| ---- | -- |
+| `virtio_gpu_ctrl_hdr` | 24 バイト（type・flags・fence_id・ctx_id・ring_idx・padding[3]） |
+| `GET_CAPSET_INFO` / `OK_CAPSET_INFO` | 0x0108（capset_index・padding）/ 0x1102（capset_id・max_version・max_size・padding） |
+| `GET_CAPSET` / `OK_CAPSET` | 0x0109（capset_id・capset_version）/ 0x1103（capset データ 160 バイト） |
+| エラー | `ERR_UNSPEC` 0x1200（未知の種別）・`ERR_INVALID_PARAMETER` 0x1205（長さ・値の不正） |
+| fence | `FLAG_FENCE` が立つ要求では応答ヘッダへ flags・fence_id・ctx_id・ring_idx を引き継ぐ |
+| 広告 feature | VIRGL（bit 0）・RESOURCE_BLOB（3）・CONTEXT_INIT（4）・VERSION_1（32）。`num_capsets` = 1、`num_scanouts` = 0（カーネルが 0 を受け付けるかは未確認。F1 の実機で確認） |
+
+ログ形式（数値と固定語彙のみ。ゲストのバイト列はエコーしない）: `venus_jig event=capset_query cmd=GET_CAPSET capset_id=4 version=0 result=ok max_size=160`。要求長はヘッダ 24 + 本体 8 バイトちょうどのみ受理する（PoC）。

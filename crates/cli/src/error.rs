@@ -16,10 +16,11 @@
 //! # 契約
 //!
 //! - `message` に資格情報・トークンを含めない（security.md）。
-//! - `message` は untrusted な値（plugin 応答・OS エラー等）が混ざり得るため、構築時に制御文字と
-//!   行区切り（U+2028 / U+2029）を空白へ置換し、[`CLI_ERROR_MESSAGE_MAX_BYTES`] で打ち切る。
-//!   core の `OciRuntimeError` はさらに書式制御文字（Cf）も置換するが、その判定は core の
-//!   private 実装のため、本型は制御文字（Cc）と行区切りに限る。
+//! - `message` は untrusted な値（plugin 応答・OS エラー等）が混ざり得るため、構築時に core の
+//!   `OciRuntimeError` と同じ規則でサニタイズする: Unicode 一般カテゴリ Cc（制御）・Cf（書式。
+//!   双方向制御 U+202A〜U+202E・ゼロ幅文字等）・Zl / Zp（行区切り U+2028 / U+2029）を空白へ
+//!   置換し、[`CLI_ERROR_MESSAGE_MAX_BYTES`] で打ち切る（行注入・端末制御・表示順の偽装を防ぐ）。
+//!   判定表は core が SSOT で、cli に写しを持たない（`sanitize_bounded`）。
 //! - 依存を増やさないため JSON は手で組む。キーは `code` → `message` の固定順・固定 2 個で、
 //!   エスケープ関数は本モジュールの 1 か所に限る（`doctor.rs` の同種関数との共通化は後続課題）。
 
@@ -28,7 +29,7 @@ use std::io::Write;
 use std::num::NonZeroU8;
 
 use fandhe_container_core::oci_runtime::{
-    OCI_ERROR_MESSAGE_MAX_BYTES, OciRuntimeError, exit_code_for,
+    LifecycleOp, OCI_ERROR_MESSAGE_MAX_BYTES, OciRuntimeError, exit_code_for,
 };
 use fandhe_container_core::traits::{ErrorCode, TraitError};
 
@@ -117,22 +118,18 @@ impl From<&OciRuntimeError> for CliError {
     }
 }
 
-/// 制御文字・行区切りを空白へ置換しつつ、UTF-8 文字境界で上限バイトに打ち切る。
-/// 上限以降は走査せず、確保量も上限以内に収まる。
+/// 表示・行構造を乱す文字（Cc・Cf・Zl・Zp）を空白へ置換しつつ、UTF-8 文字境界で上限バイトに打ち切る。
+///
+/// 判定（Cf の範囲表を含む）は core の private 実装で、cli から直接は呼べない。写しを持つと
+/// Unicode 版の更新で乖離するため、同じ規則を適用する公開入口 `OciRuntimeError::new` を通して
+/// サニタイズ結果だけを取り出す。`op` は出力に使わないダミーで、`code` も結果に影響しない。
+/// core 側は入力を借用のまま走査して上限で読み取りを止めるため、巨大な入力でも確保・走査は
+/// [`CLI_ERROR_MESSAGE_MAX_BYTES`]（core の上限と同値）で頭打ちになる。
+/// core がサニタイズ関数を公開したら直接呼び出しへ置き換える（runtime-builder 担当の後続課題）。
 fn sanitize_bounded(input: &str) -> String {
-    let mut out = String::with_capacity(input.len().min(CLI_ERROR_MESSAGE_MAX_BYTES));
-    for ch in input.chars() {
-        let ch = if ch.is_control() || ch == '\u{2028}' || ch == '\u{2029}' {
-            ' '
-        } else {
-            ch
-        };
-        match out.len().checked_add(ch.len_utf8()) {
-            Some(n) if n <= CLI_ERROR_MESSAGE_MAX_BYTES => out.push(ch),
-            _ => break,
-        }
-    }
-    out
+    OciRuntimeError::new(LifecycleOp::Create, ErrorCode::Internal, input)
+        .message()
+        .to_owned()
 }
 
 /// JSON 文字列の中身として `s` を `out` へ追記する（`"`・`\`・0x20 未満をエスケープ）。
@@ -156,7 +153,6 @@ fn json_escape_into(out: &mut String, s: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fandhe_container_core::oci_runtime::LifecycleOp;
 
     #[test]
     fn err1_fields_are_kept() {
@@ -209,6 +205,23 @@ mod tests {
         let line = e.to_json_line();
         assert_eq!(line.matches('\n').count(), 1);
         assert!(line.ends_with("\"}\n"));
+    }
+
+    /// ERR-1: 双方向制御・ゼロ幅等の書式文字（Cf）も空白へ置換される（表示順の偽装を防ぐ）。
+    #[test]
+    fn err1_format_chars_become_spaces() {
+        let e = CliError::new(
+            ErrorCode::Internal,
+            "a\u{202E}b\u{2066}c\u{2069}d\u{200F}e\u{061C}f\u{FEFF}g\u{200B}h",
+        );
+        assert_eq!(e.message(), "a b c d e f g h");
+        assert_eq!(
+            e.to_json_line(),
+            "{\"code\":\"INTERNAL\",\"message\":\"a b c d e f g h\"}\n"
+        );
+        // 変換経路（untrusted な TraitError の message）でも同じ規則になる。
+        let t = CliError::from(TraitError::new(ErrorCode::NotFound, "x\u{202E}gpj.exe"));
+        assert_eq!(t.message(), "x gpj.exe");
     }
 
     #[test]

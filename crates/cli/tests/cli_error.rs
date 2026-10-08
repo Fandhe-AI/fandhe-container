@@ -59,3 +59,19 @@ fn err1_write_stderr_emits_exact_line() {
         "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"bad value\"}\n"
     );
 }
+
+/// ERR-1: untrusted な message の双方向制御文字（Cf）は空白になり、`code` と JSON の形は保たれる。
+#[test]
+fn err1_bidi_control_is_replaced_in_output() {
+    let e = CliError::from(TraitError::new(
+        ErrorCode::PermissionDenied,
+        "open \u{202E}txt.exe\u{202C} denied",
+    ));
+    let mut out: Vec<u8> = Vec::new();
+    e.write_stderr(&mut out).unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "{\"code\":\"PERMISSION_DENIED\",\"message\":\"open  txt.exe  denied\"}\n"
+    );
+    assert_eq!(e.exit_code().get(), 6);
+}

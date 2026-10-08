@@ -229,12 +229,26 @@ jobs:
       # --workspace が 3 OS でビルドしており、治具自身にも OS 分岐（cfg(target_os)）が無いため、
       # 本ジョブの 3 OS matrix でそのまま実行する（特定 OS の skip はしない）。実機前提テスト
       # （tests/real_machine_capset_log.rs）は #[ignore] で既定集合から分離済みで、ここでは走らない。
-      # 治具は独自の Cargo.lock を持ち、target は治具ディレクトリ配下（.gitignore 済み）に作る。
+      # 治具は独自の Cargo.lock を持ち、clippy / test は --locked で lock を固定する（lock が黙って再解決
+      # されない）。target は治具ディレクトリ配下（.gitignore 済み）に作る。
       # 新ジョブは check-run 名が増えるため既存ジョブのステップとする（check-run 件数は不変）
       - name: venus 試験治具の fmt-check・clippy・test（GPU-6・TASK-172.4）
         shell: bash
         timeout-minutes: 15
         run: make poc-venus-jig-check
+      # 治具の Cargo.lock の依存監査（REPAIR-7 ステージ 5・REPAIR-9・OSS-4・MVM-4）。rust-ci の deny
+      # （reusable workflow）はルート workspace だけを見るため、治具の lock は別に検査する。ルートの
+      # deny.toml を共有し、ルートと同じ 4 種（advisories・bans・licenses・sources）を --locked で実行する。
+      # cargo-deny は Makefile の CARGO_DENY_VERSION（rust-ci の cargo-deny-version と同じ 0.20.2）を
+      # cargo install --locked で導入する（action は追加しない）。deny.toml に targets の指定が無く、
+      # cargo-deny は実行ホストに関係なく全ターゲットの依存グラフを検査するため、結果は OS に依らない。
+      # 導入のビルド時間を 3 重に払わないよう ubuntu のみで実行する（ビルド・テストのゲートではなく
+      # 依存監査のため、ci.md の 3 OS 必須の対象外。bench-regression と同じ扱い）
+      - name: venus 試験治具の Cargo.lock の依存監査（cargo deny。ubuntu のみ）
+        if: runner.os == 'Linux'
+        shell: bash
+        timeout-minutes: 20
+        run: make deny-poc-venus-jig
 
   # --------------------------------------------------
   # integration-test（REPAIR-7 ステージ 3: タイムアウト保護された結合試験）

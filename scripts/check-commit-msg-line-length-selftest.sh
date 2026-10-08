@@ -68,7 +68,14 @@ rc=$?
 
 # 出力に行の中身を含めない
 printf 'chore: test\n\nSECRETWORD%s\n' "$(rep a 100)" >"$work/leak"
-if sh "$target" "$work/leak" 2>&1 | grep -q SECRETWORD; then
+# 出力を一度ファイルへ取り込み、終了コードと grep を分離する（pipeline + pipefail だと
+# checker の rc=1 が grep の結果を覆い、漏洩しても検出できない）。
+leak_rc=0
+sh "$target" "$work/leak" >"$work/leak.out" 2>&1 || leak_rc=$?
+if [ "$leak_rc" -ne 1 ]; then
+  echo "FAIL: leak fixture expected rc=1, got $leak_rc"
+  fails=$((fails + 1))
+elif grep -q SECRETWORD "$work/leak.out"; then
   echo "FAIL: output leaks line content"
   fails=$((fails + 1))
 else

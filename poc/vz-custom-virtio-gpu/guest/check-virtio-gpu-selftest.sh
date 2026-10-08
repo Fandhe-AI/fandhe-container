@@ -65,6 +65,12 @@ expect_case scanout-present 1 "kms=scanouts_present" --dmesg-file "$fx/scanout-p
 expect_case kms-disabled-with-scanout 1 "kms=scanouts_present" --dmesg-file "$fx/kms-disabled-with-scanout.log"
 expect_case capset-size-zero 1 "capset_info=venus
 capset_max_size=0" --dmesg-file "$fx/capset-size-zero.log"
+# 同じデバイスの cap set 0 情報が 2 回（max-size 160 と 0）出る記録は先行行を採用せず拒否する。
+expect_case capset-info-duplicate 1 "probe=multiple_sections" --dmesg-file "$fx/capset-info-duplicate.log"
+# num_capsets=1 なのに index 1 の情報行がある記録は件数と矛盾するため拒否する。
+expect_case capset-index-mismatch 1 "capset_count=1
+capset_info=inconsistent
+host_memory_window=present" --dmesg-file "$fx/capset-index-mismatch.log"
 expect_case capset-timeout 1 "capset_info=timeout" --dmesg-file "$fx/capset-timeout.log"
 expect_case old-kernel-zero-scanouts 1 "kms=probe_failed_zero_scanouts" --dmesg-file "$fx/old-kernel-zero-scanouts.log"
 expect_case no-virtio-gpu 1 "probe=missing

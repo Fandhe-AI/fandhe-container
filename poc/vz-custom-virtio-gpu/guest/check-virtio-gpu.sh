@@ -120,11 +120,21 @@ elif [ "$dev_count" -eq 1 ]; then
   grep -E "virtio.?gpu ${devs}:|\[drm\]" "$tmp" >"$tmpdev" || true
   mv -f -- "$tmpdev" "$tmp"
 fi
-sections="$(grep -c 'number of cap sets: ' "$tmp" || true)"
-if [ "$sections" -gt 1 ]; then
-  echo "probe=multiple_sections"
-  exit 1
-fi
+# probe 区間の識別: 1 回の probe で 1 回だけ出る行（features の virgl 行・context_init 行・
+# number of cap sets・number of scanouts・Host memory window）のどれかが複数あれば、再 probe
+# 等で複数区間が混在している。後続 probe が途中（例: features 行だけ）で止まったログでも、
+# 先行区間の capset・共有メモリ情報と組み合わせて成功にしないよう fail-closed で打ち切る。
+for marker in \
+  'features: .*[+-]virgl( |$)' \
+  'features: .*[+-]context_init( |$)' \
+  'number of cap sets: ' \
+  'number of scanouts: ' \
+  'Host memory window: '; do
+  if [ "$(grep -cE -- "$marker" "$tmp" || true)" -gt 1 ]; then
+    echo "probe=multiple_sections"
+    exit 1
+  fi
+done
 
 # features 行（例: virtio_gpu virtio0: features: +virgl -edid +resource_blob +host_visible）
 # context_init は別行（features: +context_init）に出る。両行を結合して照合する。
@@ -141,15 +151,21 @@ else
 fi
 
 # 1 つの feature トークンが features 行で +（有効）/ -（無効）/ 不在のどれかを出力し、
-# 期待（+ は有効必須、- は有効だと不可）と照合する。
+# 期待（+ は有効必須、- は有効だと不可）と照合する。+ と - が両方ある矛盾した記録は
+# conflicting として期待に関わらず拒否する（fail-closed）。
 feature() { # $1=name $2=expect
-  local name="$1" expect="$2" got="unknown"
-  if printf '%s\n' "$feats" | grep -qE "[ :]\\+$name( |\$)"; then
+  local name="$1" expect="$2" got="unknown" plus=0 minus=0
+  if printf '%s\n' "$feats" | grep -qE "[ :]\\+$name( |\$)"; then plus=1; fi
+  if printf '%s\n' "$feats" | grep -qE "[ :]-$name( |\$)"; then minus=1; fi
+  if [ "$plus" -eq 1 ] && [ "$minus" -eq 1 ]; then
+    got="conflicting"
+  elif [ "$plus" -eq 1 ]; then
     got="enabled"
-  elif printf '%s\n' "$feats" | grep -qE "[ :]-$name( |\$)"; then
+  elif [ "$minus" -eq 1 ]; then
     got="disabled"
   fi
   echo "$name=$got"
+  if [ "$got" = "conflicting" ]; then fail; fi
   if [ "$expect" = "+" ] && [ "$got" != "enabled" ]; then fail; fi
   if [ "$expect" = "-" ] && [ "$got" = "enabled" ]; then fail; fi
 }

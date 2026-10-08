@@ -220,6 +220,10 @@ pub enum OneShotTermination {
     /// 直接の子は回収済み（pid は解放済み）だが、子のプロセスグループ宛ての kill が失敗し、孫プロセスの
     /// 停止を保証できない（#1311・PLUG-7・REPAIR-5）。未回収の子（[`Self::Unreaped`]）とは別の結果で、
     /// 成功した呼び出しの結果には現れない（呼び出しは `Internal` で失敗する）。
+    ///
+    /// 契約の限界: 送信自体が失敗した場合だけを表す。Linux の `killpg` は 1 プロセスにでも送れれば成功する
+    /// ため、setuid 実行ファイル等で UID を変えた孫には SIGKILL が届かず残り得る。この部分配送による
+    /// 残留は検出できず保証対象外（全数停止は cgroup・pidfd 等を要する別課題）。
     GroupKillFailed,
 }
 
@@ -1323,9 +1327,27 @@ mod tests {
         let reg = local_registry(4);
         let targets = |r: &Registry| r.forward(ForwardSignal::Hangup).targets;
         // 登録の有無（targets）だけを見る。確認用の転送（SIGHUP）で死なないよう HUP を無視する子を使う。
-        let ignoring = "trap '' HUP; exec sleep 30";
+        // trap 設定前の HUP で sh が死ぬ競合（macOS ではゾンビのみのグループへの killpg が EPERM になる）を
+        // 避けるため、trap 後にマーカーを作らせ、確認してから転送する。
+        let marker_dir = std::env::temp_dir();
+        let make_ignoring = |tag: &str| {
+            let marker = marker_dir.join(format!("fcos-trap-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_file(&marker);
+            let script = format!("trap '' HUP; touch '{}'; exec sleep 30", marker.display());
+            (script, marker)
+        };
+        let wait_marker = |m: &std::path::Path| {
+            let start = Instant::now();
+            while !m.exists() {
+                assert!(start.elapsed() < Duration::from_secs(10), "trap marker");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let _ = std::fs::remove_file(m);
+        };
         // kill_and_reap
-        let mut g = spawn_registered(&mut sh(ignoring), reg).unwrap();
+        let (script, marker) = make_ignoring("a");
+        let mut g = spawn_registered(&mut sh(&script), reg).unwrap();
+        wait_marker(&marker);
         assert_eq!(targets(reg), 1);
         assert!(g.kill_and_reap().is_reaped());
         assert_eq!(targets(reg), 0);
@@ -1338,7 +1360,9 @@ mod tests {
         }
         assert_eq!(targets(reg), 0);
         // 生存中の try_wait は登録を保つ
-        let mut live = spawn_registered(&mut sh(ignoring), reg).unwrap();
+        let (script, marker) = make_ignoring("b");
+        let mut live = spawn_registered(&mut sh(&script), reg).unwrap();
+        wait_marker(&marker);
         assert!(live.try_wait().unwrap().is_none());
         assert_eq!(targets(reg), 1);
         // 未回収の報告でスロットを解放する

@@ -353,22 +353,17 @@ mod tests {
         MKNOD_CALLS.with(|c| std::mem::take(&mut *c.borrow_mut()))
     }
 
-    struct Tmp(PathBuf);
+    /// `.0` は guard と同じパス（`t.0.join(..)` 用）。削除は guard の drop が行う（#1298）。
+    struct Tmp(
+        PathBuf,
+        #[allow(dead_code)] crate::test_support::TestTempDir,
+    );
 
     impl Tmp {
         fn new(label: &str) -> Self {
-            let base = std::fs::canonicalize(std::env::temp_dir())
-                .unwrap()
-                .join(format!("fandhe-devices-{label}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&base);
-            std::fs::create_dir_all(&base).unwrap();
-            Self(base)
-        }
-    }
-
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            let guard = crate::test_support::TestTempDir::new(&format!("devices-{label}"))
+                .expect("create exclusive temp dir");
+            Self(guard.path().to_path_buf(), guard)
         }
     }
 

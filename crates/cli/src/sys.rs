@@ -5,8 +5,9 @@
 //!
 //! # 呼び出し文脈
 //! `crate::signals` が、バイナリ `fandhe-container` の起動時に SIGINT・SIGTERM・SIGHUP のハンドラを
-//! 登録し（`install_handler`）、ハンドラ内で plugin へ転送した後に既定動作へ戻して自分へ再送する
-//! （`raise_signal`）ために呼ぶ（#1513・PLUG-7・#1403 判断 2）。`libc` は依存追加が禁止（dependency-policy）の
+//! 登録するために呼ぶ（[`install_forwarding_handler`]。#1513・PLUG-7・#1403 判断 2）。ハンドラ本体
+//! （plugin へ転送した後、既定動作へ戻った同じシグナルを自分へ再送する `forward_and_reraise`）は
+//! 本モジュールが持つ。`libc` は依存追加が禁止（dependency-policy）の
 //! ため、`crates/plugin/src/sys.rs` と同じ流儀で必要最小限の `extern "C"` 宣言と構造体を自前で持つ。
 //!
 //! # 構造体レイアウトと定数（一次情報）
@@ -20,8 +21,15 @@
 //! - 上記以外の OS・アーキテクチャ・libc は構造体を持たず `Unsupported` を返す（他 OS の値を流用しない。fail-closed）。
 //!
 //! # 契約
-//! - `unsafe fn` は公開しない。公開するのは安全な [`install_handler`]・[`raise_signal`]（`pub(crate)`）のみ
-//! - ハンドラとして渡す関数は async-signal-safe であること（割り当て・ロック・panic をしない）は呼び出し側の責務
+//! - `unsafe fn` も、任意の関数ポインタをハンドラとして受け取る API も公開しない（PR #1572 事後監査の P2）。
+//!   登録できるハンドラは本モジュール内の固定の `extern "C" fn` に限り、その本体が async-signal-safe
+//!   （割り当て・ロック・panic・添字アクセスをしない）であることを本モジュールで保証する:
+//!   - `forward_and_reraise`: `fandhe_container_plugin::forward_to_running_plugins`（同 crate の契約で
+//!     atomic の load と `kill(2)` のみ）と `raise(3)` だけを呼ぶ
+//!   - `record_for_test`（feature `signal-test-support` のときだけ存在する。結合試験の plugin 役用）:
+//!     受信番号を `AtomicI32` へ store するだけ
+//! - 公開するのは安全な `pub(crate)` の [`install_forwarding_handler`] と、feature `signal-test-support` の
+//!   ときだけの `install_recording_handler`・`recorded_signal` のみ
 
 #![cfg(unix)]
 
@@ -98,6 +106,7 @@ mod layout {
 ))]
 mod imp {
     use super::{Disposition, layout};
+    use fandhe_container_plugin::{ForwardSignal, forward_to_running_plugins};
     use std::io;
 
     const SIG_IGN: usize = 1;
@@ -110,12 +119,50 @@ mod imp {
         fn raise(sig: i32) -> i32;
     }
 
+    /// 受けたシグナルを plugin へ転送し、既定動作へ戻った同じシグナルを自分へ再送する固定ハンドラ
+    /// （#1513・PLUG-7）。`SA_RESETHAND` で進入時に既定動作へ戻っており、ハンドラ中は当該シグナルが
+    /// ブロックされるため、再送は保留され、戻った時点で配送されて既定動作（終了）になる。errno は
+    /// 再送で終了するため退避しない。async-signal-safe な操作（atomic・`kill`・`raise`）だけを行う。
+    extern "C" fn forward_and_reraise(sig: i32) {
+        if let Some(forward) = ForwardSignal::from_raw(sig) {
+            let _ = forward_to_running_plugins(forward);
+        }
+        // SAFETY: 値渡しの整数のみでメモリ安全上の前提を持たない。`raise` は async-signal-safe。戻り値は
+        // 使わない（終了に向かう経路で、失敗しても呼び出し側にできることがない）。
+        let _ = unsafe { raise(sig) };
+    }
+
+    /// 固定の記録ハンドラが受信番号を残す先（feature `signal-test-support`。結合試験の plugin 役用）。
+    #[cfg(feature = "signal-test-support")]
+    static RECORDED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+    /// 受信したシグナル番号を [`RECORDED`] へ store するだけの固定ハンドラ（async-signal-safe）。
+    #[cfg(feature = "signal-test-support")]
+    extern "C" fn record_for_test(sig: i32) {
+        RECORDED.store(sig, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// `sig` に転送用の固定ハンドラ（`forward_and_reraise`）を登録する（[`install`] の規則に従う）。
+    pub(crate) fn install_forwarding_handler(sig: i32) -> io::Result<Disposition> {
+        install(sig, forward_and_reraise)
+    }
+
+    /// `sig` に記録用の固定ハンドラ（`record_for_test`）を登録する（[`install`] の規則に従う）。
+    #[cfg(feature = "signal-test-support")]
+    pub(crate) fn install_recording_handler(sig: i32) -> io::Result<Disposition> {
+        install(sig, record_for_test)
+    }
+
+    /// 記録用ハンドラが最後に受けたシグナル番号（未受信は 0）。
+    #[cfg(feature = "signal-test-support")]
+    pub(crate) fn recorded_signal() -> i32 {
+        RECORDED.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// `sig` に `handler` を登録する。起動時に `SIG_IGN` なら上書きしない。登録は `SA_RESETHAND`
-    /// （ハンドラ進入時に既定動作へ戻す）と `SA_RESTART`・空のマスク。
-    pub(crate) fn install_handler(
-        sig: i32,
-        handler: extern "C" fn(i32),
-    ) -> io::Result<Disposition> {
+    /// （ハンドラ進入時に既定動作へ戻す）と `SA_RESTART`・空のマスク。`handler` は本モジュール内の固定
+    /// ハンドラに限る（非公開。外から任意の関数を渡せないようにする）。
+    fn install(sig: i32, handler: extern "C" fn(i32)) -> io::Result<Disposition> {
         let mut old = layout::empty();
         // SAFETY: `act` は NULL（取得のみ）、`old` は呼び出し中有効なスタック上の書き込み可能な領域。
         if unsafe { sigaction(sig, std::ptr::null(), &mut old) } != 0 {
@@ -128,18 +175,16 @@ mod imp {
         act.handler = handler as usize;
         act.flags = layout::SA_RESETHAND | layout::SA_RESTART;
         // SAFETY: `act` は初期化済みで呼び出し中有効、`old` の取得は不要なため NULL。`handler` は
-        // `extern "C" fn(i32)` で、シグナルハンドラの ABI と一致する。
+        // `extern "C" fn(i32)` で、シグナルハンドラの ABI と一致する。登録したハンドラは任意の時点で
+        // 任意のスレッドに割り込んで実行されるため、async-signal-safe であることが不変条件になる。
+        // `handler` は非公開の本関数へ本モジュール内から渡す固定の関数（`forward_and_reraise`・
+        // `record_for_test`）に限られ、いずれも割り当て・ロック・panic・添字アクセスをせず、atomic・
+        // `kill`・`raise` だけを使う（モジュール冒頭の契約）。固定ハンドラを追加・変更するときは
+        // この条件を保つこと。
         if unsafe { sigaction(sig, &act, std::ptr::null_mut()) } != 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(Disposition::Installed)
-    }
-
-    /// 自プロセス（呼び出しスレッド）へ `sig` を送る。ハンドラ内から呼べる（`raise` は async-signal-safe）。
-    pub(crate) fn raise_signal(sig: i32) {
-        // SAFETY: 値渡しの整数のみでメモリ安全上の前提を持たない。戻り値は使わない
-        // （終了に向かう経路で、失敗しても呼び出し側にできることがない）。
-        let _ = unsafe { raise(sig) };
     }
 }
 
@@ -156,17 +201,26 @@ mod imp {
     use std::io;
 
     /// 構造体レイアウトを確認していない OS・アーキテクチャでは登録しない（fail-closed）。
-    pub(crate) fn install_handler(
-        _sig: i32,
-        _handler: extern "C" fn(i32),
-    ) -> io::Result<Disposition> {
+    pub(crate) fn install_forwarding_handler(_sig: i32) -> io::Result<Disposition> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 
-    pub(crate) fn raise_signal(_sig: i32) {}
+    /// 構造体レイアウトを確認していない OS・アーキテクチャでは登録しない（fail-closed）。
+    #[cfg(feature = "signal-test-support")]
+    pub(crate) fn install_recording_handler(_sig: i32) -> io::Result<Disposition> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    /// 登録できないため常に 0（未受信）。
+    #[cfg(feature = "signal-test-support")]
+    pub(crate) fn recorded_signal() -> i32 {
+        0
+    }
 }
 
-pub(crate) use imp::{install_handler, raise_signal};
+pub(crate) use imp::install_forwarding_handler;
+#[cfg(feature = "signal-test-support")]
+pub(crate) use imp::{install_recording_handler, recorded_signal};
 
 #[cfg(all(
     test,
@@ -181,11 +235,9 @@ pub(crate) use imp::{install_handler, raise_signal};
 mod tests {
     use super::*;
 
-    extern "C" fn noop(_sig: i32) {}
-
     /// 範囲外のシグナル番号は OS のエラー（EINVAL）で失敗する。
     #[test]
     fn install_handler_rejects_invalid_signal_number() {
-        assert!(install_handler(100_000, noop).is_err());
+        assert!(install_forwarding_handler(100_000).is_err());
     }
 }

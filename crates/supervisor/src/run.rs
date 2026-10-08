@@ -1575,14 +1575,17 @@ mod tests {
         let live = e.take_live_capture().unwrap();
         assert!(e.take_live_capture().is_none());
         assert_eq!(live.cancel(), Ok(()));
-        // リーダーが取消しを見て先に終了していると BrokenPipe になる（どちらでも追記されないことを確認する）。
-        let _ = std::io::Write::write_all(&mut writer, b"late\n");
+        // リーダーが取消しを見て先に終了していると BrokenPipe になる（BrokenPipe だけを許容し、どちらでも追記されないことを確認する）。
+        let outcome = crate::logs::write_after_cancel(&mut writer, b"late\n");
         let start = Instant::now();
         while budget.live() != 0 && start.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(budget.live(), 0);
-        assert!(sink.snapshot().unwrap().is_empty());
+        assert!(
+            sink.snapshot().unwrap().is_empty(),
+            "write outcome: {outcome:?}"
+        );
         drop(writer);
     }
 

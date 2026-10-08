@@ -935,6 +935,31 @@ fn pump(
     sp.summary
 }
 
+/// 取消し後の書き込みの結果（[`write_after_cancel`] の戻り値）。
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AfterCancelWrite {
+    /// pipe に書き込めた（リーダーが read 前に取消しを見ていなければ読み端はまだ開いている）。
+    Written,
+    /// 読み端が既に閉じていて `BrokenPipe` になった。
+    BrokenPipe,
+}
+
+/// テスト用: 取消し後の pipe 書き込みの成否を、「捕捉されないこと」の検証から切り離して扱う補助関数
+/// （REPAIR-5・TASK-157.7・SUP-1・#1304。`logs.rs` と `run.rs` のテストから呼ばれる）。
+///
+/// `pump` は read の前に取消しを確認するため、リーダーが read に入る前に取消すと読み端が閉じ、
+/// その後の書き込みは `BrokenPipe` になる（SUT として正しい挙動）。`BrokenPipe` だけを許容し、
+/// それ以外のエラーは握りつぶさず panic させる。
+#[cfg(test)]
+pub(crate) fn write_after_cancel(w: &mut impl std::io::Write, bytes: &[u8]) -> AfterCancelWrite {
+    match w.write_all(bytes) {
+        Ok(()) => AfterCancelWrite::Written,
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => AfterCancelWrite::BrokenPipe,
+        Err(e) => panic!("unexpected write error after cancel: {e:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1016,10 +1041,14 @@ mod tests {
         assert_eq!(budget.live(), 1);
         let err = cap.drain(Duration::MAX).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
-        // 取消し後の flush に時間がかかると、リーダーが先に終了して読み側が閉じる場合がある（BrokenPipe は許容）。
-        let _ = writer.write_all(b"late1\nlate2\n");
+        // リーダーが先に終了して読み側が閉じると BrokenPipe になる。BrokenPipe だけを許容し、他のエラーは失敗にする。
+        let outcome = write_after_cancel(&mut writer, b"late1\nlate2\n");
         assert_eq!(wait_live(&budget, 0), 0);
-        assert_eq!(sink.snapshot().unwrap(), Vec::<CapturedLine>::new());
+        assert_eq!(
+            sink.snapshot().unwrap(),
+            Vec::<CapturedLine>::new(),
+            "write outcome: {outcome:?}"
+        );
         drop(writer);
     }
 
@@ -1049,11 +1078,13 @@ mod tests {
             err.message(),
             "timed out waiting for log streams to reach EOF"
         );
-        writer.write_all(b"after1\nafter2\n").unwrap();
+        // 取消し後の書き込み。リーダーが既に終了していれば BrokenPipe（許容）。他のエラーは失敗にする。
+        let outcome = write_after_cancel(&mut writer, b"after1\nafter2\n");
         assert_eq!(wait_live(&budget, 0), 0);
         assert_eq!(
             sink.snapshot().unwrap(),
-            vec![line(StreamKind::Stdout, b"before")]
+            vec![line(StreamKind::Stdout, b"before")],
+            "write outcome: {outcome:?}"
         );
         drop(writer);
     }
@@ -1172,10 +1203,14 @@ mod tests {
             "LogCapture { streams: 1, cancelled: false }"
         );
         assert_eq!(cap.cancel(), Ok(()));
-        // リーダーが取消しを見て先に終了していると BrokenPipe になる（どちらでも追記されないことを確認する）。
-        let _ = writer.write_all(b"late\n");
+        // リーダーが取消しを見て先に終了していると BrokenPipe になる（BrokenPipe だけを許容し、どちらでも追記されないことを確認する）。
+        let outcome = write_after_cancel(&mut writer, b"late\n");
         assert_eq!(wait_live(&budget, 0), 0);
-        assert_eq!(sink.snapshot().unwrap(), Vec::<CapturedLine>::new());
+        assert_eq!(
+            sink.snapshot().unwrap(),
+            Vec::<CapturedLine>::new(),
+            "write outcome: {outcome:?}"
+        );
         drop(writer);
     }
 
@@ -1309,30 +1344,46 @@ mod tests {
         drop(writer);
     }
 
-    /// 追記に 20ms かかる sink。追記に入ったことを `entered` で知らせ、完了した行だけを `done` に残す。
-    struct SlowSink {
+    /// 取消しの要求を観測するまで追記が戻らない sink。追記に入ったことを `entered` で知らせ、完了した行だけを
+    /// `done` に残す。固定 sleep を使わないので、取消し要求と追記完了の前後関係がスケジューリングに左右されない
+    /// （#1304）。`CancelGate::cancel` は待機中に mutex を手放すため、ここからの `is_cancelled()` はデッドロックしない。
+    struct CancelAwareSink {
         entered: Mutex<mpsc::Sender<()>>,
+        gate: Mutex<Option<Arc<CancelGate>>>,
         done: Mutex<Vec<Vec<u8>>>,
     }
-    impl LogSink for SlowSink {
+    impl LogSink for CancelAwareSink {
         fn append(&self, _: StreamKind, line: &[u8]) -> Result<(), TraitError> {
             let _ = self.entered.lock().unwrap().send(());
-            std::thread::sleep(Duration::from_millis(20));
+            let gate = self.gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                // 上限 10 秒（REPAIR-5）。超えたらハングさせず失敗にする。
+                let start = Instant::now();
+                while !gate.is_cancelled() {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(10),
+                        "cancel was never requested"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
             self.done.lock().unwrap().push(line.to_vec());
             Ok(())
         }
     }
 
-    /// REPAIR-5・TASK-157.7: 溢れる timeout で取り消した時点で追記が実行中（20ms）なら、猶予（100ms）内の完了を待って
-    /// から返る。返った時点で実行中だった 1 行（"a"）は完了済みで、次の行（"b"）は追記されず、以後も変わらない。
+    /// REPAIR-5・TASK-157.7: 溢れる timeout で取り消した時点で追記が実行中なら、猶予（100ms）内の完了を待ってから
+    /// 返る。追記は取消しの要求を観測してから完了するので、"a" の完了は必ず取消し要求より後になる。返った時点で
+    /// 実行中だった 1 行（"a"）は完了済みで、次の行（"b"）は追記されず、以後も変わらない（#1304）。
     #[test]
     fn sup1_task157_7_drain_error_waits_for_in_flight_append_and_stops_the_rest() {
         assert_eq!(CANCEL_SETTLE_TIMEOUT, Duration::from_millis(100));
         let budget = ReaderBudget::new(1).unwrap();
         let (reader, mut writer) = std::io::pipe().unwrap();
         let (entered_tx, entered_rx) = mpsc::channel::<()>();
-        let sink = Arc::new(SlowSink {
+        let sink = Arc::new(CancelAwareSink {
             entered: Mutex::new(entered_tx),
+            gate: Mutex::new(None),
             done: Mutex::new(Vec::new()),
         });
         let cap = LogCapture::start(
@@ -1340,11 +1391,26 @@ mod tests {
             sink.clone(),
         )
         .unwrap();
+        // append は下の書き込み後にしか呼ばれないので、gate の設定は書き込みより先に済ませる。
+        *sink.gate.lock().unwrap() = Some(Arc::clone(&cap.cancel));
         writer.write_all(b"a\nb\n").unwrap();
         entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let drain_started = Instant::now();
         let err = cap.drain(Duration::MAX).unwrap_err();
+        let elapsed = drain_started.elapsed();
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
-        assert_eq!(*sink.done.lock().unwrap(), vec![b"a".to_vec()]);
+        assert_eq!(
+            *sink.done.lock().unwrap(),
+            vec![b"a".to_vec()],
+            "drain elapsed: {elapsed:?}, live: {}, cancelled: {}",
+            budget.live(),
+            sink.gate
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|g| g.is_cancelled())
+                .unwrap_or(false)
+        );
         // 同じチャンクの残りを処理せずに終了するため、パイプを閉じなくても枠が戻る。
         assert_eq!(wait_live(&budget, 0), 0);
         assert_eq!(*sink.done.lock().unwrap(), vec![b"a".to_vec()]);
@@ -1678,10 +1744,14 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5));
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(err.message(), "drain timeout is too large");
-        // 取消し後の flush に時間がかかると、リーダーが先に終了して読み側が閉じる場合がある（BrokenPipe は許容）。
-        let _ = writer.write_all(b"late\n");
+        // リーダーが先に終了して読み側が閉じると BrokenPipe になる。BrokenPipe だけを許容し、他のエラーは失敗にする。
+        let outcome = write_after_cancel(&mut writer, b"late\n");
         assert_eq!(wait_live(&budget, 0), 0);
-        assert_eq!(sink.snapshot().unwrap(), Vec::<CapturedLine>::new());
+        assert_eq!(
+            sink.snapshot().unwrap(),
+            Vec::<CapturedLine>::new(),
+            "write outcome: {outcome:?}"
+        );
         drop(writer);
     }
 
@@ -1754,9 +1824,13 @@ mod tests {
         assert_eq!(budget.live(), 1);
         let err = cap.drain(Duration::from_millis(50)).unwrap_err();
         assert_eq!(err.code(), ErrorCode::Timeout);
-        writer.write_all(b"late\n").unwrap();
+        // 開始から 50ms 以内にリーダーが read に入れないと読み端が閉じて BrokenPipe になる（許容）。
+        let outcome = write_after_cancel(&mut writer, b"late\n");
         assert_eq!(wait_live(&budget, 0), 0);
-        assert!(sink.snapshot().unwrap().is_empty());
+        assert!(
+            sink.snapshot().unwrap().is_empty(),
+            "write outcome: {outcome:?}"
+        );
         drop(writer);
     }
 

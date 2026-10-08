@@ -34,7 +34,9 @@ expect_rc() {
 #   nonlinux = 引数解析は同じで、解析後の全コマンドが FAILED_PRECONDITION（5）
 #   diff     = ok と同じだが B03 相当（create 後の list）の終了コードだけ変える
 #   noisy    = ok と同じ終了コードで、stderr / stdout にパス風文字列・制御文字を流す
-#   hang     = 未知コマンド（bogus）だけ止まる
+#   hang     = 未知コマンド（bogus）だけ止まる（子孫の sleep を残し得る構成）
+#   nl       = create 成功時に改行のみを stdout へ出す
+#   nul      = create 成功時に NUL を含む出力を stdout へ出す
 # --------------------------------------------------
 stub="$work/stub-cli"
 cat >"$stub" <<'STUB'
@@ -63,7 +65,14 @@ done
 cmd="$1"; shift
 valid_id() { [[ "$1" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; }
 case "$cmd" in
-  bogus) [ "$mode" = "hang" ] && sleep 30; bad ;;
+  bogus)
+    if [ "$mode" = "hang" ]; then
+      # 子孫プロセスを作る（pid を記録して、回収されたか自己テストで確認する）。
+      sleep 30 &
+      [ -z "${STUB_PIDFILE:-}" ] || echo $! >>"$STUB_PIDFILE"
+      wait
+    fi
+    bad ;;
   create)
     bundle=""; id=""; n=0
     while [ $# -gt 0 ]; do
@@ -106,6 +115,8 @@ case "$cmd" in
     [ -e "$root/$id.c" ] && fail_with 4 ALREADY_EXISTS
     : >"$root/$id.c"
     [ "$mode" = "noisy" ] && printf '/home/secret-user/out\n'
+    [ "$mode" = "nl" ] && printf '\n'
+    [ "$mode" = "nul" ] && printf 'a\000b'
     ;;
   start | logs) [ -e "$root/$id.c" ] || fail_with 3 NOT_FOUND; fail_with 8 UNIMPLEMENTED ;;
   stop) [ -e "$root/$id.c" ] || fail_with 3 NOT_FOUND; fail_with 5 FAILED_PRECONDITION ;;
@@ -201,6 +212,23 @@ if LC_ALL=C grep -q "$(printf '\001')" "$work/noisy.txt"; then fail "control cha
 run_capture hang "$work/hang.txt" --timeout 1
 expect_rc "hanging CLI is rc 1" 1 $?
 line_of "$work/hang.txt" A02 | grep -q '<timeout>' && pass "A02 recorded as timeout" || fail "A02 recorded as timeout"
+
+# --- 改行のみ・NUL 含みの stdout は空出力 '-' と区別して異常として記録する ---
+run_capture nl "$work/nl2.txt"
+[ "$(line_of "$work/nl2.txt" B02)" = $'B02\tB\t0\t-\t<unexpected>:1' ] && pass "newline-only stdout is unexpected" || fail "newline-only stdout is unexpected: $(line_of "$work/nl2.txt" B02)"
+run_capture nul "$work/nul.txt"
+[ "$(line_of "$work/nul.txt" B02)" = $'B02\tB\t0\t-\t<unexpected>:nul' ] && pass "NUL stdout is unexpected" || fail "NUL stdout is unexpected: $(line_of "$work/nul.txt" B02)"
+"$target" compare --baseline "$work/nl2.txt" --candidate "$work/nul.txt" >/dev/null 2>&1
+expect_rc "unexpected-stdout captures pass format validation" 1 $?
+
+# --- タイムアウト時に子孫プロセス（スタブの sleep）が残らない ---
+: >"$work/pids.txt"
+STUB_PIDFILE="$work/pids.txt" run_capture hang "$work/hang3.txt" --timeout 1
+alive=0
+for p in $(cat "$work/pids.txt"); do
+  kill -0 "$p" 2>/dev/null && alive=$((alive + 1))
+done
+[ -s "$work/pids.txt" ] && [ "$alive" = "0" ] && pass "no descendant left after timeout" || fail "descendants left after timeout (alive=$alive)"
 
 # --- 後始末: capture 自身の mktemp -d が残らない（TMPDIR を専用ディレクトリにして空を確認） ---
 mkdir -p "$work/tmpdir"

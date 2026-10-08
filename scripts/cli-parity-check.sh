@@ -98,20 +98,32 @@ CASES=(
 tmp_dir=""
 watchdog_pid=""
 run_pid=""
+# プロセスグループ（pgid = $1）ごと TERM → KILL し、最大 5 秒（0.1 秒 x 50）で全員の消滅を確かめる。
+# CLI を set -m の別グループで起動しているため、子孫（スタブの sleep 等）も同時に回収できる（REPAIR-5）。
+kill_group() {
+  local pg="$1" w=0
+  kill -TERM -- "-$pg" 2>/dev/null || true
+  while kill -0 -- "-$pg" 2>/dev/null && [ "$w" -lt 5 ]; do
+    sleep 0.1
+    w=$((w + 1))
+  done
+  kill -KILL -- "-$pg" 2>/dev/null || true
+  kill -KILL "$pg" 2>/dev/null || true
+  w=0
+  while kill -0 -- "-$pg" 2>/dev/null && [ "$w" -lt 50 ]; do
+    sleep 0.1
+    w=$((w + 1))
+  done
+}
+
 cleanup() {
-  local w
   if [ -n "$watchdog_pid" ]; then
     kill "$watchdog_pid" 2>/dev/null || true
     watchdog_pid=""
   fi
-  # 中断時に実行中の CLI を残さない。KILL して最大 5 秒（0.1 秒 x 50）だけ回収を待ってから一時ディレクトリを消す（REPAIR-5）。
+  # 中断時に実行中の CLI とその子孫を残さない。グループごと回収を待ってから一時ディレクトリを消す。
   if [ -n "$run_pid" ]; then
-    kill -KILL "$run_pid" 2>/dev/null || true
-    w=0
-    while kill -0 "$run_pid" 2>/dev/null && [ "$w" -lt 50 ]; do
-      sleep 0.1
-      w=$((w + 1))
-    done
+    kill_group "$run_pid"
     wait "$run_pid" 2>/dev/null || true
     run_pid=""
   fi
@@ -142,11 +154,15 @@ run_cli() {
   : >"$tmp_dir/out"
   : >"$tmp_dir/err"
   rm -f -- "$tmp_dir/timed_out"
+  # set -m でバックグラウンドジョブを独立したプロセスグループ（pgid = pid）にする。setsid が無い
+  # macOS でも使える。タイムアウト・中断時はグループ単位で子孫ごと回収する。
+  set -m
   (
     ulimit -f 256 2>/dev/null || true
     exec "$cli" "$@" </dev/null >"$tmp_dir/out" 2>"$tmp_dir/err"
   ) &
   pid=$!
+  set +m
   run_pid="$pid"
   ticks=$((limit * 10))
   (
@@ -158,12 +174,14 @@ run_cli() {
     done
     if kill -0 "$pid" 2>/dev/null; then
       : >"$tmp_dir/timed_out"
-      kill -KILL "$pid" 2>/dev/null || true
+      kill_group "$pid"
     fi
   ) &
   watchdog_pid=$!
   run_exit=0
   wait "$pid" || run_exit=$?
+  # 正常終了後に残った子孫（バックグラウンド起動の残り等）もグループごと回収する。
+  kill_group "$pid"
   kill "$watchdog_pid" 2>/dev/null || true
   wait "$watchdog_pid" 2>/dev/null || true
   watchdog_pid=""
@@ -177,9 +195,10 @@ run_cli() {
 
 # stderr から機械可読な code だけを取り出す（文言・パスは写さない）。
 norm_code() {
-  local e
+  local e raw
+  raw="$(wc -c <"$tmp_dir/err" | tr -d ' ')"
   e="$(LC_ALL=C tr -d '\000' <"$tmp_dir/err" | head -c 4096)"
-  if [ -z "$e" ]; then
+  if [ "$raw" -eq 0 ]; then
     printf -- '-'
   elif [[ $e =~ \"code\":\"([A-Z_]{1,40})\" ]]; then
     printf '%s' "${BASH_REMATCH[1]}"
@@ -190,13 +209,25 @@ norm_code() {
 
 # stdout を正規化する。種別 l は list 形式（ヘッダ + 行）を厳格に検査し PID 列を <pid> へ置換する。
 norm_stdout() {
-  local kind="$1" o line n header_expected row_re joined first ok
-  o="$(LC_ALL=C tr -d '\000' <"$tmp_dir/out" | head -c 65536)"
-  if [ -z "$o" ]; then
+  local kind="$1" o line n header_expected row_re joined first ok raw stripped
+  # 空判定は元ファイルのバイト数で行う（コマンド置換は末尾改行を落とし、tr は NUL を落とすため、
+  # 改行のみ・NUL 含みの出力が空出力と同じ '-' になるのを防ぐ）。内容は写さず異常として記録する。
+  raw="$(wc -c <"$tmp_dir/out" | tr -d ' ')"
+  if [ "$raw" -eq 0 ]; then
     printf -- '-'
     return 0
   fi
-  n="$(printf '%s\n' "$o" | wc -l | tr -d ' ')"
+  stripped="$(LC_ALL=C tr -d '\000' <"$tmp_dir/out" | wc -c | tr -d ' ')"
+  if [ "$stripped" -ne "$raw" ]; then
+    printf '<unexpected>:nul'
+    return 0
+  fi
+  o="$(LC_ALL=C head -c 65536 "$tmp_dir/out")"
+  n="$(wc -l <"$tmp_dir/out" | tr -d ' ')"
+  if [ -z "$o" ]; then
+    printf '<unexpected>:%s' "$n"
+    return 0
+  fi
   if [ "$kind" != "l" ]; then
     printf '<unexpected>:%s' "$n"
     return 0

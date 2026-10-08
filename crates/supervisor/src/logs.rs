@@ -9,6 +9,8 @@
 //! - 行は LF を除いたバイト列で渡す（UTF-8 を仮定しない。CR は除去しない）。EOF 時の LF なし末尾行も 1 行として渡す。
 //!   読み取りがエラーで終わった場合、LF にも EOF にも達していない未完了の末尾は sink へ渡さず破棄する
 //!   （途中で欠けた内容を正常な行として残さない）。破棄は [`StreamSummary::discarded_lines`] に数える。
+//! - 行の内容は `read` の戻りサイズ・チャンク境界の位置に依らず同一（行の分断・結合・欠落なし）。
+//!   行単位捕捉は TASK-164.1（#505・SUP-7）で境界跨ぎを機械照合済み。
 //! - 1 行は [`MAX_LINE_BYTES`] で切り捨てる（超過ぶんは捨て、[`StreamSummary::truncated_lines`] へ数える。無制限確保の防止）。
 //! - [`LogSink::append`] が失敗したら、そのストリームでは以後 sink を呼ばない（故障した sink へ出力行数ぶんの
 //!   失敗処理を繰り返さない）。読み取りは EOF まで続けて破棄する（読みを止めるとパイプが詰まり、コンテナ側の write が
@@ -19,7 +21,7 @@
 //!   `drain` は `Err` を返す全経路（期限切れ・溢れる timeout・リーダーの異常終了）で、返る前に捕捉を取り消す。
 //!   取消しの要求後に新しい追記は始まらない。EOF は `timeout` いっぱいまで待ち、期限内に届いた EOF は成功として扱う。
 //!   期限切れでは実行中の追記の完了を待たずに返る（`drain` は sink が止まっていても `timeout` 以内に返る）。
-//!   したがって `drain` が `Err` を返した後に sink へ届き得るのは、返る時点で実行中だった追記
+//!   したがって `drain` が `Err` を返した後に sink へ届き得るのは（期限切れ後の flush を含む。flush は期限内に終わらなければ別スレッドで完了する）、返る時点で実行中だった追記
 //!   （ストリームあたり高々 1 件）だけである。完了を待ってから止めたい場合は [`LogCapture::cancel`] を使う
 //!   （[`CANCEL_SETTLE_TIMEOUT`] まで待つ）。
 //!   リーダーは現在の `read` が戻った時点でスレッドとストリームを解放して終了する。
@@ -28,22 +30,41 @@
 //!   予算は省略できない: [`OutputStreams`] は [`ReaderBudget`] を渡さないと作れず、既定の予算を暗黙に作る経路は無い。
 //!   呼び出し側（supervisor プロセス）は予算を 1 つだけ作り、再起動・再捕捉をまたいで同じものを渡す
 //!   （捕捉ごとに作り直すと残存リーダーが数えられない）。
+//! - 期限切れで切り離される flush スレッドも同じ [`ReaderBudget`] が計数し（上限 [`MAX_LIVE_FLUSHERS`]）、超える flush は
+//!   スレッドを起動せず `Unavailable` で拒否する（戻らない [`LogSink::flush`] でのスレッド・sink 参照の蓄積防止。REPAIR-5）。
 //! - ストリームの所有権は捕捉側へ移る。監視の引き継ぎ時に再注入はできない（引き継ぎは #239・TASK-164 で扱う）。
 //!   代わりに取っ手（[`LogCapture`]）が捕捉の継続を表す。[`crate::run::monitor_with_capture`] は終端待ちを
 //!   しなかった全経路で取っ手を返すので、呼び出し側は [`LogCapture::cancel`] で止めるか、保持して後で
 //!   [`LogCapture::drain`] する（取っ手を破棄すると止める手段が無くなる）。
 //! - OS 固有型（fd / HANDLE）は公開せず `Read` のみを受ける（CLI-1）。グローバル状態は持たない（CORE-1・D-19）。
 //!
+//! # 実装済み（TASK-164.2・#506、TASK-164.3・#507）
+//! ファイルへの永続化とローテーション（1MiB × 3 世代等。権限・symlink 検証・ERR-1 形式のエラー込み）は
+//! [`rotating::RotatingFileSink`] が担う（SUP-7）。
+//!
+//! 書き込みバッファとフラッシュ制御（TASK-164.3）: [`LogSink::append`] の `Ok` は「sink が行を受理した」ことを表し、
+//! ディスクへの到達は保証しない。リーダーは (a) read のたびに（次の read がブロックしても受理済みの行が滞留しない）
+//! と (b) EOF・読み取りエラーでの終了前に [`LogSink::flush`] を呼ぶ（取消し後はリーダーからは呼ばない）。
+//! 取消しでは [`LogCapture::cancel`] が実行中の追記の完了後に flush する。まとめ書きは sink 内のバッファが担う。
+//! ローテーション境界でのバッファの書き切りと fsync は sink 側の責務
+//! （[`rotating::RotatingFileSink`] のモジュール doc 参照）。flush が失敗すると、直前に受理済みの行が記録されて
+//! いない可能性があり、その行は [`StreamSummary::lines`] に数えたままで [`StreamSummary::discarded_lines`] には
+//! 計上されない（遡って数え直せないため。`error_code` が設定されることで失敗を知らせる）。
+//!
 //! # 未実装（将来仕様。REPAIR-3）
-//! 本モジュールは捕捉経路の土台だけで、次は未実装である。
-//! - ファイルへの永続化、ローテーション（1MiB × 3 世代等）、ローテーション下で欠落・重複 0 行の保証: SUP-7・TASK-164。
-//!   ログファイルの権限・配置・symlink 検証も TASK-164 で扱う。
-//! - ローテーション失敗時のエラー形式: ERR-1（TASK-164）。
-//! - `logs` コマンドからの読み出し経路: TASK-164 以降 / CLI 側。
+//! 本モジュールは捕捉経路とファイル sink までで、次は未実装である。
+//! - flush ごとの fsync・同期ポリシーの設定化・タイマーによる定期 flush（read ごとの flush で代替している）: SUP-7。
+//! - stdout / stderr 混在での大規模な欠落 0・重複 0 の検証（stdout 単独の 100 万行検証は `tests/log_rotation.rs` に実装済み）: SUP-7・TASK-164.4（#508）。
+//! - `logs` コマンドからの読み出し経路: TASK-164 以降 / CLI 側（ログ名の列挙は [`log_file_paths`] が実装済みで、ロックファイルを含めない。内容の読み出し・CLI 配線は未実装。TASK-164 追補・#1469）。
+//! - コンテナ削除経路からの [`RotatingFileSink::remove_all`]（ログ・ロックファイルの一括削除）の呼び出し配線: SUP-7・TASK-164 追補（#1469）。
 //! - 実パイプの取得: core の本番 launcher が子の stdio をパイプへ接続して渡す経路は未提供
 //!   （現状 core は子の標準入出力を null へ向けている）。そのため入力は注入式である。
 //!
-//! 既定の [`MemoryLogSink`] はメモリ保持のみ（上限付き）で、supervisor 終了時に失われる。
+//! 既定の [`MemoryLogSink`] はメモリ保持のみ（上限付き）で、supervisor 終了時に失われる。永続化には [`rotating::RotatingFileSink`] を注入する。
+
+pub mod rotating;
+
+pub use rotating::{RemovedLogs, RotatingFileSink, RotationConfig, log_file_paths};
 
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read};
@@ -64,6 +85,10 @@ pub const READ_CHUNK_BYTES: usize = 8 * 1024;
 /// [`ReaderBudget`] の上限はこの値を超えられない。
 pub const MAX_LIVE_READERS: usize = 64;
 
+/// 期限切れで切り離された flush スレッド（[`LogSink::flush`] が戻らない間残る）の同時生存数の上限（REPAIR-5）。
+/// [`ReaderBudget`] が捕捉をまたいで共有して計数し、超える flush の開始は `Unavailable` で拒否する。
+pub const MAX_LIVE_FLUSHERS: usize = 4;
+
 /// 生存中のリーダースレッド数の予算（REPAIR-5）。
 ///
 /// [`OutputStreams`] を作るのに必須で、同じ予算から作ったストリームは捕捉をまたいで同じカウンタを共有する
@@ -74,6 +99,8 @@ pub const MAX_LIVE_READERS: usize = 64;
 #[derive(Debug, Clone)]
 pub struct ReaderBudget {
     live: Arc<AtomicUsize>,
+    /// 生存中の flush スレッド数（上限 [`MAX_LIVE_FLUSHERS`]。捕捉をまたいで共有）。
+    flushers: Arc<AtomicUsize>,
     limit: usize,
 }
 
@@ -89,6 +116,7 @@ impl ReaderBudget {
         }
         Ok(Self {
             live: Arc::new(AtomicUsize::new(0)),
+            flushers: Arc::new(AtomicUsize::new(0)),
             limit,
         })
     }
@@ -97,6 +125,7 @@ impl ReaderBudget {
     pub fn with_max_limit() -> Self {
         Self {
             live: Arc::new(AtomicUsize::new(0)),
+            flushers: Arc::new(AtomicUsize::new(0)),
             limit: MAX_LIVE_READERS,
         }
     }
@@ -109,6 +138,26 @@ impl ReaderBudget {
     /// 現在生存中のリーダー数。
     pub fn live(&self) -> usize {
         self.live.load(Ordering::SeqCst)
+    }
+
+    /// 現在生存中の flush スレッド数。
+    pub fn live_flushers(&self) -> usize {
+        self.flushers.load(Ordering::SeqCst)
+    }
+
+    /// flush スレッド 1 本ぶんの枠を確保する。上限 [`MAX_LIVE_FLUSHERS`] なら `None`。
+    fn reserve_flusher(&self) -> Option<ReaderSlot> {
+        let mut cur = self.flushers.load(Ordering::SeqCst);
+        loop {
+            let next = cur.checked_add(1).filter(|v| *v <= MAX_LIVE_FLUSHERS)?;
+            match self
+                .flushers
+                .compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return Some(ReaderSlot(Arc::clone(&self.flushers))),
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
     /// `n` 本ぶんの枠を確保する。上限を超えるなら何も確保せず `None`。
@@ -209,7 +258,7 @@ impl OutputStreams {
     }
 }
 
-/// 捕捉した行の記録先。TASK-164（SUP-7）がファイル・ローテーション実装へ差し替える拡張点。
+/// 捕捉した行の記録先の拡張点。ファイル・ローテーション実装は [`rotating::RotatingFileSink`]（SUP-7・TASK-164.2）。
 pub trait LogSink: Send + Sync {
     /// 1 行（LF 抜き・[`MAX_LINE_BYTES`] 以下）を追記する。失敗は構造化エラーで返す（panic しない）。
     /// `Err` を返すと、そのストリームでは以後呼ばれない（残りの行は読み捨てられる）。
@@ -217,6 +266,14 @@ pub trait LogSink: Send + Sync {
     /// 有限時間で戻ること。戻らない `append` はリーダースレッドとその枠（[`ReaderBudget`]）を占有し続け、
     /// パイプが詰まってコンテナ側の write を止める。[`LogCapture::drain`] は `append` の完了を期限を超えて待たない。
     fn append(&self, stream: StreamKind, line: &[u8]) -> Result<(), TraitError>;
+
+    /// `append` が `Ok` を返した行を記録先へ書き出す（TASK-164.3・SUP-7）。既定は何もしない（バッファを持たない sink 用）。
+    ///
+    /// リーダーが read のたびと終了前に呼ぶ（[`LogCapture::cancel`] も取消し後に 1 回呼ぶ）。有限時間で戻ること。`Err` を返すと `append` と同様、
+    /// そのストリームでは以後 sink を呼ばない。
+    fn flush(&self) -> Result<(), TraitError> {
+        Ok(())
+    }
 }
 
 /// [`MemoryLogSink`] が保持する 1 行。
@@ -244,7 +301,7 @@ struct MemoryInner {
 }
 
 /// 上限付きメモリ保持のスタブ sink。永続化・ローテーションは行わずプロセス終了で失われる
-/// （SUP-7・TASK-164 で置き換える。REPAIR-3）。上限超過時は古い行から捨て、件数を数える。
+/// （永続化には [`rotating::RotatingFileSink`] を使う。SUP-7・TASK-164）。上限超過時は古い行から捨て、件数を数える。
 pub struct MemoryLogSink {
     capacity: usize,
     inner: Mutex<MemoryInner>,
@@ -462,6 +519,10 @@ pub struct LogCapture {
     rx: mpsc::Receiver<(StreamKind, StreamSummary)>,
     expected: usize,
     cancel: Arc<CancelGate>,
+    /// [`LogCapture::cancel`] が、取消し後に受理済みの行を書き出すために保持する（TASK-164.3・SUP-7）。
+    sink: Arc<dyn LogSink>,
+    /// flush スレッドの同時生存数を制限するための予算（[`OutputStreams`] の予算と同じカウンタを共有する）。
+    budget: ReaderBudget,
 }
 
 impl std::fmt::Debug for LogCapture {
@@ -573,6 +634,8 @@ impl LogCapture {
             rx,
             expected,
             cancel,
+            sink,
+            budget: streams.budget.clone(),
         })
     }
 
@@ -598,7 +661,13 @@ impl LogCapture {
             let until = started
                 .checked_add(CANCEL_SETTLE_TIMEOUT)
                 .unwrap_or(started);
-            self.cancel.cancel(until);
+            if self.cancel.cancel(until) {
+                // 取消しが収束したら、受理済みの行を書き出す（SUP-7。リーダーは取消し後に flush しない）。
+                // flush の失敗は InvalidArgument を優先するため捨てる。待つのは固定の猶予まで（REPAIR-5）。
+                let now = Instant::now();
+                let until = now.checked_add(CANCEL_SETTLE_TIMEOUT).unwrap_or(now);
+                let _ = flush_bounded(&self.sink, &self.budget, until);
+            }
             return Err(TraitError::new(
                 ErrorCode::InvalidArgument,
                 "drain timeout is too large",
@@ -607,7 +676,13 @@ impl LogCapture {
         let result = self.wait_all(deadline);
         if result.is_err() {
             // 期限（deadline）を超えては待たない。期限切れの場合は取消しを要求するだけで返る。
-            self.cancel.cancel(deadline);
+            let settled = self.cancel.cancel(deadline);
+            if settled {
+                // 受理済みの行を書き出す（リーダーは取消し後に flush しないため、ここで行わないと sink 内バッファに残る。SUP-7）。
+                // flush の失敗は元のエラーを優先するため捨てる。追加の猶予は設けず、drain の期限（deadline）
+                // までに限る（REPAIR-5）。期限が尽きていれば待たずに戻り、flush は別スレッドで完了し得る。
+                let _ = flush_bounded(&self.sink, &self.budget, deadline);
+            }
         }
         result
     }
@@ -617,11 +692,20 @@ impl LogCapture {
     /// 取消しの要求後に新しい追記は始まらず、リーダーは次に `read` が戻った時点で終了する。実行中の追記の完了は
     /// [`CANCEL_SETTLE_TIMEOUT`] まで待つ。待ち切れなかった場合は `Timeout`（取消し自体は成立しており、
     /// 実行中だった追記〔ストリームあたり高々 1 件〕だけが後から完了し得る）。ストリームは取り戻せない。
+    ///
+    /// 契約（SUP-7）: 実行中の追記が終わった（`Ok` を返す）場合、返る前に [`LogSink::flush`] を呼び、受理済みの行を
+    /// 書き出す（リーダーは取消し後に flush しないため、ここで行わないと sink 内バッファの行が見えないまま失われる）。
+    /// この時点でリーダーによる sink 呼び出しは無いので競合しない。flush の失敗はその `Err` を返す。
+    /// flush は別スレッドで実行し、さらに [`CANCEL_SETTLE_TIMEOUT`] まで待つ（超過は `Timeout`。最大でも合計 2 倍の猶予で戻る。
+    /// 超過した flush は別スレッドで完了し得る）。
     pub fn cancel(self) -> Result<(), TraitError> {
         let now = Instant::now();
         let until = now.checked_add(CANCEL_SETTLE_TIMEOUT).unwrap_or(now);
         if self.cancel.cancel(until) {
-            Ok(())
+            // flush にも固定の猶予で期限を設ける（止まった sink で呼び出しスレッドが戻らなくならないように。REPAIR-5）。
+            let now = Instant::now();
+            let until = now.checked_add(CANCEL_SETTLE_TIMEOUT).unwrap_or(now);
+            flush_bounded(&self.sink, &self.budget, until)
         } else {
             Err(TraitError::new(
                 ErrorCode::Timeout,
@@ -705,6 +789,22 @@ impl LineSplitter<'_> {
         self.cut = false;
     }
 
+    /// sink のバッファを書き出す。取消し・失敗の扱いは [`Self::emit`] と同じ（取消し後・失敗後は呼ばない）。
+    /// 失敗は `error_code` に載せる（受理済みの行は遡って数え直さない。モジュール doc 参照）。
+    fn flush_sink(&mut self) {
+        if self.cancelled || self.sink_failed {
+            return;
+        }
+        match self.cancel.run_unless_cancelled(|| self.sink.flush()) {
+            None => self.cancelled = true,
+            Some(Err(e)) => {
+                self.summary.error_code.get_or_insert(e.code());
+                self.sink_failed = true;
+            }
+            Some(Ok(())) => {}
+        }
+    }
+
     fn emit(&mut self) {
         if self.sink_failed {
             // 故障した sink は再度呼ばない。行としては数え、届かなかった行数に計上する。
@@ -732,6 +832,49 @@ impl LineSplitter<'_> {
         }
         self.buf.clear();
         self.cut = false;
+    }
+}
+
+/// `sink.flush()` を別スレッドで実行し、`until` まで結果を待つ。超過は `Timeout`、スレッド起動失敗は `Internal`。
+/// 超過した flush はスレッド側で完了し得る（呼び出しスレッドは止まらない。REPAIR-5）。
+/// 戻らない flush が溜まらないよう、`budget` の flush 枠（[`MAX_LIVE_FLUSHERS`]）を確保できなければ
+/// スレッドを起動せず `Unavailable` を返す。枠はスレッド終了時に戻る。
+fn flush_bounded(
+    sink: &Arc<dyn LogSink>,
+    budget: &ReaderBudget,
+    until: Instant,
+) -> Result<(), TraitError> {
+    let Some(flush_slot) = budget.reserve_flusher() else {
+        return Err(TraitError::new(
+            ErrorCode::Unavailable,
+            "too many log flush threads are still alive",
+        ));
+    };
+    let (tx, rx) = mpsc::channel();
+    let sink = Arc::clone(sink);
+    let spawned = std::thread::Builder::new()
+        .name("supervisor-log-flush".to_string())
+        .spawn(move || {
+            let _flush_slot = flush_slot;
+            // 受信側が待ち切れず破棄済みなら送信失敗は無視してよい。
+            let _ = tx.send(sink.flush());
+        });
+    if spawned.is_err() {
+        return Err(TraitError::new(
+            ErrorCode::Internal,
+            "failed to spawn log flush thread",
+        ));
+    }
+    match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+        Ok(r) => r,
+        Err(RecvTimeoutError::Timeout) => Err(TraitError::new(
+            ErrorCode::Timeout,
+            "timed out waiting for log sink flush",
+        )),
+        Err(RecvTimeoutError::Disconnected) => Err(TraitError::new(
+            ErrorCode::Internal,
+            "log flush thread terminated unexpectedly",
+        )),
     }
 }
 
@@ -771,6 +914,9 @@ fn pump(
                 if let Some(data) = chunk.get(..n) {
                     sp.feed(data);
                 }
+                // 読むたびに書き出す。満杯の read の直後に書き手が止まっても、次の read（ブロックし得る）の前に
+                // 受理済みの行が必ず書き出される（時間上限の無い滞留を作らない）。まとめ書きは sink 内のバッファが担う。
+                sp.flush_sink();
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(_) => {
@@ -784,7 +930,53 @@ fn pump(
     if !sp.buf.is_empty() && !sp.cancelled {
         sp.emit();
     }
+    // EOF・読み取りエラーの単一出口。summary を返す（＝ drain 側が完了を観測する）前に書き出す。
+    sp.flush_sink();
     sp.summary
+}
+
+/// テスト用: `read` に入るたびに通知する Read ラッパー（#1416・SUP-1・TASK-157.7・REPAIR-5。`logs.rs` と
+/// `run.rs` のテストから呼ばれる）。
+///
+/// `pump` は read の前に取消しを確認し、取消し済みなら読まずに終了して読み端を閉じる。リーダースレッドが
+/// 最初の read に入る前にテストが取消すと、その後の書き込みは `BrokenPipe` になり「取消し後に届いたデータを
+/// 追記しない」検証が空振りする。この通知を待ってから取消せば、リーダーは read でブロックしたまま読み端を
+/// 保持するので、遅れた書き込みは必ず成功し、取消し後の経路を毎回通る。
+#[cfg(test)]
+pub(crate) struct NotifyingRead {
+    inner: Box<dyn Read + Send>,
+    entered: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(test)]
+impl Read for NotifyingRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // 受信側が既に落ちていても読み込み自体は続ける。
+        let _ = self.entered.send(());
+        self.inner.read(buf)
+    }
+}
+
+/// `reader` を包み、read 進入の通知を受ける受信側と合わせて返す（[`NotifyingRead`]）。
+#[cfg(test)]
+pub(crate) fn notify_on_read(
+    reader: impl Read + Send + 'static,
+) -> (Box<dyn Read + Send>, std::sync::mpsc::Receiver<()>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    (
+        Box::new(NotifyingRead {
+            inner: Box::new(reader),
+            entered: tx,
+        }),
+        rx,
+    )
+}
+
+/// テスト用: read 進入の通知を最大 10 秒待つ（REPAIR-5。超過はハングさせず失敗にする）。
+#[cfg(test)]
+pub(crate) fn wait_read_entered(rx: &std::sync::mpsc::Receiver<()>) {
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("reader never entered read");
 }
 
 #[cfg(test)]
@@ -859,13 +1051,16 @@ mod tests {
     fn sup1_task157_7_drain_overflowing_timeout_cancels_capture() {
         let budget = ReaderBudget::new(1).unwrap();
         let (reader, mut writer) = std::io::pipe().unwrap();
+        let (reader, entered_rx) = notify_on_read(reader);
         let sink = Arc::new(MemoryLogSink::default());
         let cap = LogCapture::start(
-            OutputStreams::new(&budget, Some(Box::new(reader)), None),
+            OutputStreams::new(&budget, Some(reader), None),
             sink.clone(),
         )
         .unwrap();
         assert_eq!(budget.live(), 1);
+        // read 進入前の取消しは読み端を閉じて BrokenPipe を招くので、進入を待ってから取消す（#1416）。
+        wait_read_entered(&entered_rx);
         let err = cap.drain(Duration::MAX).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         writer.write_all(b"late1\nlate2\n").unwrap();
@@ -879,9 +1074,10 @@ mod tests {
     fn sup1_task157_7_no_append_after_drain_timeout() {
         let budget = ReaderBudget::new(1).unwrap();
         let (reader, mut writer) = std::io::pipe().unwrap();
+        let (reader, entered_rx) = notify_on_read(reader);
         let sink = Arc::new(MemoryLogSink::default());
         let cap = LogCapture::start(
-            OutputStreams::new(&budget, Some(Box::new(reader)), None),
+            OutputStreams::new(&budget, Some(reader), None),
             sink.clone(),
         )
         .unwrap();
@@ -890,6 +1086,10 @@ mod tests {
         while sink.snapshot().unwrap().is_empty() && start.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(5));
         }
+        // 1 回目の read は "before" を返した read。2 回目の進入でリーダーが次の read でブロックし、読み端を
+        // 保持し続けることが確定する（#1416）。
+        wait_read_entered(&entered_rx);
+        wait_read_entered(&entered_rx);
         // EOF は timeout（200ms）いっぱいまで待つ（手前で打ち切らない）。
         let drain_started = Instant::now();
         let err = cap.drain(Duration::from_millis(200)).unwrap_err();
@@ -900,11 +1100,12 @@ mod tests {
             err.message(),
             "timed out waiting for log streams to reach EOF"
         );
+        // 取消し後の書き込み。リーダーは read でブロック中で読み端が開いているので必ず成功する。
         writer.write_all(b"after1\nafter2\n").unwrap();
         assert_eq!(wait_live(&budget, 0), 0);
         assert_eq!(
             sink.snapshot().unwrap(),
-            vec![line(StreamKind::Stdout, b"before")]
+            vec![line(StreamKind::Stdout, b"before")],
         );
         drop(writer);
     }
@@ -1012,9 +1213,10 @@ mod tests {
     fn sup1_task157_7_cancel_stops_capture_without_eof() {
         let budget = ReaderBudget::new(1).unwrap();
         let (reader, mut writer) = std::io::pipe().unwrap();
+        let (reader, entered_rx) = notify_on_read(reader);
         let sink = Arc::new(MemoryLogSink::default());
         let cap = LogCapture::start(
-            OutputStreams::new(&budget, Some(Box::new(reader)), None),
+            OutputStreams::new(&budget, Some(reader), None),
             sink.clone(),
         )
         .unwrap();
@@ -1022,6 +1224,8 @@ mod tests {
             format!("{cap:?}"),
             "LogCapture { streams: 1, cancelled: false }"
         );
+        // read 進入前の取消しは読み端を閉じて BrokenPipe を招くので、進入を待ってから取消す（#1416）。
+        wait_read_entered(&entered_rx);
         assert_eq!(cap.cancel(), Ok(()));
         writer.write_all(b"late\n").unwrap();
         assert_eq!(wait_live(&budget, 0), 0);
@@ -1159,30 +1363,46 @@ mod tests {
         drop(writer);
     }
 
-    /// 追記に 20ms かかる sink。追記に入ったことを `entered` で知らせ、完了した行だけを `done` に残す。
-    struct SlowSink {
+    /// 取消しの要求を観測するまで追記が戻らない sink。追記に入ったことを `entered` で知らせ、完了した行だけを
+    /// `done` に残す。固定 sleep を使わないので、取消し要求と追記完了の前後関係がスケジューリングに左右されない
+    /// （#1304）。`CancelGate::cancel` は待機中に mutex を手放すため、ここからの `is_cancelled()` はデッドロックしない。
+    struct CancelAwareSink {
         entered: Mutex<mpsc::Sender<()>>,
+        gate: Mutex<Option<Arc<CancelGate>>>,
         done: Mutex<Vec<Vec<u8>>>,
     }
-    impl LogSink for SlowSink {
+    impl LogSink for CancelAwareSink {
         fn append(&self, _: StreamKind, line: &[u8]) -> Result<(), TraitError> {
             let _ = self.entered.lock().unwrap().send(());
-            std::thread::sleep(Duration::from_millis(20));
+            let gate = self.gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                // 上限 10 秒（REPAIR-5）。超えたらハングさせず失敗にする。
+                let start = Instant::now();
+                while !gate.is_cancelled() {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(10),
+                        "cancel was never requested"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
             self.done.lock().unwrap().push(line.to_vec());
             Ok(())
         }
     }
 
-    /// REPAIR-5・TASK-157.7: 溢れる timeout で取り消した時点で追記が実行中（20ms）なら、猶予（100ms）内の完了を待って
-    /// から返る。返った時点で実行中だった 1 行（"a"）は完了済みで、次の行（"b"）は追記されず、以後も変わらない。
+    /// REPAIR-5・TASK-157.7: 溢れる timeout で取り消した時点で追記が実行中なら、猶予（100ms）内の完了を待ってから
+    /// 返る。追記は取消しの要求を観測してから完了するので、"a" の完了は必ず取消し要求より後になる。返った時点で
+    /// 実行中だった 1 行（"a"）は完了済みで、次の行（"b"）は追記されず、以後も変わらない（#1304）。
     #[test]
     fn sup1_task157_7_drain_error_waits_for_in_flight_append_and_stops_the_rest() {
         assert_eq!(CANCEL_SETTLE_TIMEOUT, Duration::from_millis(100));
         let budget = ReaderBudget::new(1).unwrap();
         let (reader, mut writer) = std::io::pipe().unwrap();
         let (entered_tx, entered_rx) = mpsc::channel::<()>();
-        let sink = Arc::new(SlowSink {
+        let sink = Arc::new(CancelAwareSink {
             entered: Mutex::new(entered_tx),
+            gate: Mutex::new(None),
             done: Mutex::new(Vec::new()),
         });
         let cap = LogCapture::start(
@@ -1190,11 +1410,26 @@ mod tests {
             sink.clone(),
         )
         .unwrap();
+        // append は下の書き込み後にしか呼ばれないので、gate の設定は書き込みより先に済ませる。
+        *sink.gate.lock().unwrap() = Some(Arc::clone(&cap.cancel));
         writer.write_all(b"a\nb\n").unwrap();
         entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let drain_started = Instant::now();
         let err = cap.drain(Duration::MAX).unwrap_err();
+        let elapsed = drain_started.elapsed();
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
-        assert_eq!(*sink.done.lock().unwrap(), vec![b"a".to_vec()]);
+        assert_eq!(
+            *sink.done.lock().unwrap(),
+            vec![b"a".to_vec()],
+            "drain elapsed: {elapsed:?}, live: {}, cancelled: {}",
+            budget.live(),
+            sink.gate
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|g| g.is_cancelled())
+                .unwrap_or(false)
+        );
         // 同じチャンクの残りを処理せずに終了するため、パイプを閉じなくても枠が戻る。
         assert_eq!(wait_live(&budget, 0), 0);
         assert_eq!(*sink.done.lock().unwrap(), vec![b"a".to_vec()]);
@@ -1515,12 +1750,15 @@ mod tests {
         assert_eq!(MAX_DRAIN_TIMEOUT, Duration::from_secs(60));
         let budget = ReaderBudget::new(1).unwrap();
         let (reader, mut writer) = std::io::pipe().unwrap();
+        let (reader, entered_rx) = notify_on_read(reader);
         let sink = Arc::new(MemoryLogSink::default());
         let cap = LogCapture::start(
-            OutputStreams::new(&budget, Some(Box::new(reader)), None),
+            OutputStreams::new(&budget, Some(reader), None),
             sink.clone(),
         )
         .unwrap();
+        // read 進入前の取消しは読み端を閉じて BrokenPipe を招くので、進入を待ってから取消す（#1416）。
+        wait_read_entered(&entered_rx);
         let start = Instant::now();
         let err = cap
             .drain(MAX_DRAIN_TIMEOUT + Duration::from_nanos(1))
@@ -1597,10 +1835,13 @@ mod tests {
     fn sup1_task157_7_cancelled_reader_exits_without_appending() {
         let budget = ReaderBudget::new(4).unwrap();
         let (reader, mut writer) = std::io::pipe().unwrap();
+        let (reader, entered_rx) = notify_on_read(reader);
         let sink = Arc::new(MemoryLogSink::default());
-        let mut streams = OutputStreams::new(&budget, Some(Box::new(reader)), None);
+        let mut streams = OutputStreams::new(&budget, Some(reader), None);
         let cap = LogCapture::start_from(&mut streams, sink.clone()).unwrap();
         assert_eq!(budget.live(), 1);
+        // read 進入前の期限切れは読み端を閉じて BrokenPipe を招くので、進入を待ってから drain する（#1416）。
+        wait_read_entered(&entered_rx);
         let err = cap.drain(Duration::from_millis(50)).unwrap_err();
         assert_eq!(err.code(), ErrorCode::Timeout);
         writer.write_all(b"late\n").unwrap();
@@ -1662,5 +1903,425 @@ mod tests {
         let (sink, sum) = run(None, None);
         assert_eq!(sum, CaptureSummary::default());
         assert!(sink.snapshot().unwrap().is_empty());
+    }
+
+    /// 1 回の `read` で最大 `step` バイトだけ返すリーダー。実パイプの短い read（バッファ境界を跨ぐ到着）を決定的に再現する
+    /// （TASK-164.1・#505・SUP-7）。`LineSplitter` が read 戻りサイズに依存しないことの照合専用。
+    struct StepRead {
+        data: Cursor<Vec<u8>>,
+        step: usize,
+    }
+    impl Read for StepRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.step);
+            let head = buf.get_mut(..n).unwrap_or(&mut []);
+            self.data.read(head)
+        }
+    }
+
+    /// あらかじめ切ったチャンク列を 1 回の `read` につき 1 個ずつ返すリーダー（任意の境界位置を明示する用）。
+    /// 各チャンクは `READ_CHUNK_BYTES` 以下であること。
+    struct ChunkRead {
+        chunks: VecDeque<Vec<u8>>,
+    }
+    impl Read for ChunkRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let Some(c) = self.chunks.pop_front() else {
+                return Ok(0);
+            };
+            assert!(c.len() <= buf.len());
+            let dst = buf.get_mut(..c.len()).unwrap_or(&mut []);
+            dst.copy_from_slice(&c);
+            Ok(c.len())
+        }
+    }
+
+    fn chunked(chunks: &[&[u8]]) -> Option<Box<dyn Read + Send>> {
+        Some(Box::new(ChunkRead {
+            chunks: chunks.iter().map(|c| c.to_vec()).collect(),
+        }))
+    }
+
+    fn stepped(data: &[u8], step: usize) -> Option<Box<dyn Read + Send>> {
+        Some(Box::new(StepRead {
+            data: Cursor::new(data.to_vec()),
+            step,
+        }))
+    }
+
+    fn out_lines(sink: &MemoryLogSink) -> Vec<Vec<u8>> {
+        sink.snapshot()
+            .unwrap()
+            .into_iter()
+            .map(|l| l.bytes)
+            .collect()
+    }
+
+    /// TASK-164.1・SUP-7: チャンク境界が行内（単語途中）・LF 直前 / 直後・行をまたぐ位置にあっても行が壊れない。
+    #[test]
+    fn sup7_task164_1_chunk_boundaries_do_not_split_or_merge_lines() {
+        type Case<'a> = (Vec<&'a [u8]>, Vec<&'a [u8]>);
+        let cases: Vec<Case> = vec![
+            (vec![b"hel", b"lo\nwor", b"ld\n"], vec![b"hello", b"world"]),
+            (vec![b"abc\n", b"def\n"], vec![b"abc", b"def"]),
+            (vec![b"abc", b"\ndef\n"], vec![b"abc", b"def"]),
+            (vec![b"ab", b"c\nde", b"f"], vec![b"abc", b"def"]),
+            (vec![b"a\n", b"\n", b"b\n"], vec![b"a", b"", b"b"]),
+            (vec![b"x\r", b"\ny\n"], vec![b"x\r", b"y"]),
+        ];
+        for (chunks, want) in cases {
+            let (sink, sum) = run(chunked(&chunks), None);
+            let want: Vec<Vec<u8>> = want.iter().map(|w| w.to_vec()).collect();
+            assert_eq!(out_lines(&sink), want, "chunks={chunks:?}");
+            let s = sum.stdout().unwrap();
+            assert_eq!(s.lines(), want.len() as u64);
+            assert_eq!(s.truncated_lines(), 0);
+            assert_eq!(s.discarded_lines(), 0);
+            assert_eq!(s.error_code(), None);
+        }
+    }
+
+    /// TASK-164.1・SUP-7: マルチバイト UTF-8・非 UTF-8 の途中で分断されてもバイト列は同一。
+    #[test]
+    fn sup7_task164_1_multibyte_and_invalid_utf8_split_is_byte_exact() {
+        let (sink, _) = run(
+            chunked(&[&[0xe3], &[0x81], &[0x82, b'\n', 0xff], &[0xfe, b'\n']]),
+            None,
+        );
+        assert_eq!(
+            out_lines(&sink),
+            vec![vec![0xe3, 0x81, 0x82], vec![0xff, 0xfe]]
+        );
+    }
+
+    /// TASK-164.1・SUP-7: read の戻りサイズ（1・2・3・7・READ_CHUNK_BYTES-1・READ_CHUNK_BYTES）に依らず、
+    /// 一括入力と完全に同一の行列・集計になる。
+    #[test]
+    fn sup7_task164_1_result_is_independent_of_read_size() {
+        let mut data: Vec<u8> = Vec::new();
+        for i in 0..14u8 {
+            match i % 4 {
+                0 => data.extend_from_slice(format!("line-{i}\n").as_bytes()),
+                1 => data.extend_from_slice(b"\n"),
+                2 => data.extend_from_slice(format!("crlf-{i}\r\n").as_bytes()),
+                _ => data.extend_from_slice(&[0xff, 0xfe, b'a' + i, b'\n']),
+            }
+        }
+        data.extend_from_slice(b"tail-no-lf");
+        let (base_sink, base) = run(boxed(&data), None);
+        let want = out_lines(&base_sink);
+        assert_eq!(want.len(), 15);
+        assert_eq!(want.last().unwrap(), b"tail-no-lf");
+        for step in [1, 2, 3, 7, READ_CHUNK_BYTES - 1, READ_CHUNK_BYTES] {
+            let (sink, sum) = run(stepped(&data, step), None);
+            assert_eq!(out_lines(&sink), want, "step={step}");
+            assert_eq!(sum, base, "step={step}");
+            let s = sum.stdout().unwrap();
+            assert_eq!(s.lines(), 15);
+            assert_eq!(s.truncated_lines(), 0);
+            assert_eq!(s.discarded_lines(), 0);
+            assert_eq!(s.error_code(), None);
+        }
+    }
+
+    /// TASK-164.1・SUP-7: READ_CHUNK_BYTES（8KiB）境界を通常長の行が跨いでも内容・長さが一致する。
+    #[test]
+    fn sup7_task164_1_line_spanning_read_chunk_boundary_is_intact() {
+        let mut data = vec![b'p'; READ_CHUNK_BYTES - 3];
+        data.push(b'\n');
+        data.extend_from_slice(b"0123456789\n");
+        let (sink, sum) = run(boxed(&data), None);
+        assert_eq!(
+            out_lines(&sink),
+            vec![vec![b'p'; READ_CHUNK_BYTES - 3], b"0123456789".to_vec()]
+        );
+        assert_eq!(sum.stdout().unwrap().truncated_lines(), 0);
+    }
+
+    /// TASK-164.1・SUP-7: 上限（MAX_LINE_BYTES）ちょうどの行は細切れでも切り捨てない。+1 は 1 件切り捨てて次行は無傷。
+    #[test]
+    fn sup7_task164_1_max_line_boundary_values() {
+        let mut exact = vec![b'm'; MAX_LINE_BYTES];
+        exact.extend_from_slice(b"\nnext\n");
+        let (sink, sum) = run(stepped(&exact, 1000), None);
+        assert_eq!(
+            out_lines(&sink),
+            vec![vec![b'm'; MAX_LINE_BYTES], b"next".to_vec()]
+        );
+        assert_eq!(sum.stdout().unwrap().truncated_lines(), 0);
+
+        let mut over = vec![b'm'; MAX_LINE_BYTES + 1];
+        over.extend_from_slice(b"\nnext\n");
+        let (sink, sum) = run(stepped(&over, 1000), None);
+        assert_eq!(
+            out_lines(&sink),
+            vec![vec![b'm'; MAX_LINE_BYTES], b"next".to_vec()]
+        );
+        assert_eq!(sum.stdout().unwrap().truncated_lines(), 1);
+    }
+
+    /// TASK-164.1・SUP-7: stdout と stderr を異なる分割幅で流しても、行バッファはストリーム別で混ざらない。
+    #[test]
+    fn sup7_task164_1_streams_do_not_mix_partial_lines() {
+        let (sink, sum) = run(stepped(b"out-1\nout-2\n", 2), stepped(b"err-1\nerr-2\n", 5));
+        let all = sink.snapshot().unwrap();
+        let of = |k: StreamKind| -> Vec<Vec<u8>> {
+            all.iter()
+                .filter(|l| l.stream == k)
+                .map(|l| l.bytes.clone())
+                .collect()
+        };
+        assert_eq!(
+            of(StreamKind::Stdout),
+            vec![b"out-1".to_vec(), b"out-2".to_vec()]
+        );
+        assert_eq!(
+            of(StreamKind::Stderr),
+            vec![b"err-1".to_vec(), b"err-2".to_vec()]
+        );
+        assert_eq!(sum.stdout().unwrap().lines(), 2);
+        assert_eq!(sum.stderr().unwrap().lines(), 2);
+    }
+
+    /// `append` / `flush` の呼び出し列を記録する sink（TASK-164.3・SUP-7）。`flush_err` が真なら flush が失敗する。
+    #[derive(Default)]
+    struct CallLog {
+        calls: Mutex<Vec<String>>,
+        flush_err: bool,
+    }
+    impl CallLog {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+    impl LogSink for CallLog {
+        fn append(&self, _stream: StreamKind, line: &[u8]) -> Result<(), TraitError> {
+            let l = String::from_utf8_lossy(line).into_owned();
+            self.calls.lock().unwrap().push(format!("append {l}"));
+            Ok(())
+        }
+        fn flush(&self) -> Result<(), TraitError> {
+            self.calls.lock().unwrap().push("flush".to_string());
+            if self.flush_err {
+                return Err(TraitError::new(ErrorCode::Internal, "flush failed"));
+            }
+            Ok(())
+        }
+    }
+
+    fn pump_chunks(chunks: &[&[u8]], sink: &CallLog) -> StreamSummary {
+        let gate = CancelGate::default();
+        pump(chunked(chunks).unwrap(), StreamKind::Stdout, sink, &gate)
+    }
+
+    /// 短い read の後と EOF で flush される。
+    #[test]
+    fn sup7_task164_3_flush_after_short_read_and_at_eof() {
+        let sink = CallLog::default();
+        let sum = pump_chunks(&[b"a\nb\n", b"c\n"], &sink);
+        assert_eq!(
+            sink.calls(),
+            [
+                "append a", "append b", "flush", "append c", "flush", "flush"
+            ]
+        );
+        assert_eq!(sum.lines(), 3);
+        assert_eq!(sum.error_code(), None);
+    }
+
+    /// 満杯の read でも、次の read（ブロックし得る）の前に flush する。末尾の未完了行は EOF で渡し、その後に flush する。
+    #[test]
+    fn sup7_task164_3_full_reads_are_flushed_before_next_read() {
+        let sink = CallLog::default();
+        let mut c1 = vec![b'x'; READ_CHUNK_BYTES - 1];
+        c1.push(b'\n');
+        let c2 = vec![b'y'; READ_CHUNK_BYTES];
+        let _ = pump_chunks(&[&c1, &c2], &sink);
+        let expected = vec![
+            format!("append {}", "x".repeat(READ_CHUNK_BYTES - 1)),
+            "flush".to_string(),
+            "flush".to_string(),
+            format!("append {}", "y".repeat(READ_CHUNK_BYTES)),
+            "flush".to_string(),
+        ];
+        assert_eq!(sink.calls(), expected);
+    }
+
+    /// 取消しは、受理済みの行を flush してから戻る（SUP-7）。リーダーは取消し後に flush しない。
+    #[test]
+    fn sup7_task164_3_cancel_flushes_accepted_lines() {
+        let sink = Arc::new(CallLog::default());
+        let (r, mut w) = std::io::pipe().unwrap();
+        let budget = ReaderBudget::new(1).unwrap();
+        let cap = LogCapture::start(
+            OutputStreams::new(&budget, Some(Box::new(r)), None),
+            sink.clone(),
+        )
+        .unwrap();
+        w.write_all(b"a\n").unwrap();
+        let t0 = Instant::now();
+        while sink.calls().len() < 2 && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let before = sink.calls().len();
+        assert_eq!(cap.cancel(), Ok(()));
+        let calls = sink.calls();
+        assert_eq!(calls.first().map(String::as_str), Some("append a"));
+        assert_eq!(calls.len(), before + 1);
+        assert_eq!(calls.last().map(String::as_str), Some("flush"));
+        drop(w);
+    }
+
+    /// flush が戻らない sink でも cancel は猶予内に `Timeout` で戻る（REPAIR-5・SUP-7）。
+    #[test]
+    fn sup7_task164_3_cancel_returns_timeout_when_flush_hangs() {
+        struct HangFlush(Mutex<mpsc::Receiver<()>>);
+        impl LogSink for HangFlush {
+            fn append(&self, _s: StreamKind, _l: &[u8]) -> Result<(), TraitError> {
+                Ok(())
+            }
+            fn flush(&self) -> Result<(), TraitError> {
+                // 送信側が drop されるまで戻らない。
+                let _ = self.0.lock().unwrap().recv();
+                Ok(())
+            }
+        }
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (r, w) = std::io::pipe().unwrap();
+        let budget = ReaderBudget::new(1).unwrap();
+        let cap = LogCapture::start(
+            OutputStreams::new(&budget, Some(Box::new(r)), None),
+            Arc::new(HangFlush(Mutex::new(release_rx))),
+        )
+        .unwrap();
+        let t0 = Instant::now();
+        let err = cap.cancel().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        drop(release_tx);
+        drop(w);
+    }
+
+    /// drain の timeout が上限超（InvalidArgument）の経路でも、取消し後に受理済みの行を flush する（SUP-7）。
+    #[test]
+    fn sup7_task164_3_drain_invalid_timeout_flushes_accepted_lines() {
+        let sink = Arc::new(CallLog::default());
+        let (r, mut w) = std::io::pipe().unwrap();
+        let budget = ReaderBudget::new(1).unwrap();
+        let cap = LogCapture::start(
+            OutputStreams::new(&budget, Some(Box::new(r)), None),
+            sink.clone(),
+        )
+        .unwrap();
+        w.write_all(b"a\n").unwrap();
+        let t0 = Instant::now();
+        while sink.calls().len() < 2 && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let before = sink.calls().len();
+        let err = cap
+            .drain(MAX_DRAIN_TIMEOUT + Duration::from_nanos(1))
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        let calls = sink.calls();
+        assert_eq!(calls.first().map(String::as_str), Some("append a"));
+        assert_eq!(calls.len(), before + 1);
+        assert_eq!(calls.last().map(String::as_str), Some("flush"));
+        drop(w);
+    }
+
+    /// 戻らない flush を繰り返しても、切り離される flush スレッドは [`MAX_LIVE_FLUSHERS`] 本まで。
+    /// 超える開始は `Unavailable` で拒否し、解放後は枠が戻る（REPAIR-5・SUP-7）。
+    #[test]
+    fn sup7_task164_3_stuck_flush_threads_are_bounded() {
+        struct HangFlush(Mutex<mpsc::Receiver<()>>);
+        impl LogSink for HangFlush {
+            fn append(&self, _s: StreamKind, _l: &[u8]) -> Result<(), TraitError> {
+                Ok(())
+            }
+            fn flush(&self) -> Result<(), TraitError> {
+                let _ = self.0.lock().unwrap().recv();
+                Ok(())
+            }
+        }
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let sink: Arc<dyn LogSink> = Arc::new(HangFlush(Mutex::new(release_rx)));
+        let budget = ReaderBudget::new(1).unwrap();
+        for _ in 0..MAX_LIVE_FLUSHERS {
+            let until = Instant::now() + Duration::from_millis(10);
+            let err = flush_bounded(&sink, &budget, until).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::Timeout);
+        }
+        assert_eq!(budget.live_flushers(), MAX_LIVE_FLUSHERS);
+        let err =
+            flush_bounded(&sink, &budget, Instant::now() + Duration::from_millis(10)).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Unavailable);
+        assert_eq!(budget.live_flushers(), MAX_LIVE_FLUSHERS);
+        drop(release_tx);
+        let t0 = Instant::now();
+        while budget.live_flushers() > 0 && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(budget.live_flushers(), 0);
+    }
+
+    /// drain が期限切れで失敗しても、受理済みの行を flush してから戻る（SUP-7）。元のエラーは `Timeout` のまま。
+    #[test]
+    fn sup7_task164_3_drain_timeout_flushes_accepted_lines() {
+        let sink = Arc::new(CallLog::default());
+        let (r, mut w) = std::io::pipe().unwrap();
+        let budget = ReaderBudget::new(1).unwrap();
+        let cap = LogCapture::start(
+            OutputStreams::new(&budget, Some(Box::new(r)), None),
+            sink.clone(),
+        )
+        .unwrap();
+        w.write_all(b"a\n").unwrap();
+        let t0 = Instant::now();
+        while sink.calls().len() < 2 && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let before = sink.calls().len();
+        let err = cap.drain(Duration::from_millis(50)).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        // 期限切れ後の flush は追加の猶予を持たず別スレッドで完了するため、記録されるまで待つ。
+        let t1 = Instant::now();
+        while sink.calls().len() < before + 1 && t1.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let calls = sink.calls();
+        assert_eq!(calls.len(), before + 1);
+        assert_eq!(calls.last().map(String::as_str), Some("flush"));
+        drop(w);
+    }
+
+    /// 取消し済みなら sink を一切呼ばない（flush も呼ばない）。
+    #[test]
+    fn sup7_task164_3_no_flush_after_cancel() {
+        let sink = CallLog::default();
+        let gate = CancelGate::default();
+        assert!(gate.cancel(far()));
+        let sum = pump(
+            chunked(&[b"a\n"]).unwrap(),
+            StreamKind::Stdout,
+            &sink,
+            &gate,
+        );
+        assert!(sink.calls().is_empty());
+        assert_eq!(sum.lines(), 0);
+    }
+
+    /// flush の失敗は error_code に載り、以後 sink は呼ばれない。受け入れ済みの行は lines に残り discarded には載らない。
+    #[test]
+    fn sup7_task164_3_flush_error_is_reported_and_stops_sink_calls() {
+        let sink = CallLog {
+            flush_err: true,
+            ..CallLog::default()
+        };
+        let sum = pump_chunks(&[b"a\n", b"b\n"], &sink);
+        assert_eq!(sink.calls(), ["append a", "flush"]);
+        assert_eq!(sum.error_code(), Some(ErrorCode::Internal));
+        assert_eq!(sum.lines(), 2);
+        assert_eq!(sum.discarded_lines(), 1);
     }
 }

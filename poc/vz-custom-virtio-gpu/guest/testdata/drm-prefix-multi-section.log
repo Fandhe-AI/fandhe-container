@@ -1,0 +1,7 @@
+[    1.000000] virtio_gpu virtio0: [drm] pci: virtio-gpu-pci detected at 0000:00:01.0
+[    1.100000] [drm] features: +virgl -edid +resource_blob +host_visible
+[    1.100200] [drm] number of cap sets: 1
+[    1.100500] [drm] KMS disabled
+[    2.100000] [drm] features: +virgl -edid +resource_blob +host_visible
+[    2.100200] [drm] number of cap sets: 1
+[    2.100500] [drm] KMS disabled

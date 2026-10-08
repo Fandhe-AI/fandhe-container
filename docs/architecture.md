@@ -111,6 +111,8 @@ TASK-4（CRI-7）で定義した 4 つの拡張点トレイトは、いずれも
 
 plugin 境界のワイヤー形式（別プロセス＋長さ接頭辞フレーム、ペイロード serde_json、wire 互換が要る場面のみ gRPC）は PLUG-2 として ID のみ参照する。詳細な実装は TASK-107 系（`plugin` crate 本体）で行う。
 
+plugin プロセスのライフサイクル（PLUG-7）では、親（core 側の proxy 等）が SIGKILL・abort で落ちた場合も plugin 本体が孤児で残らないよう、Linux では `PR_SET_PDEATHSIG`（SIGKILL）を spawn 時に設定する（#1514・#1403 の方式 B。REPAIR-5・CORE-1）。効くのは直接の子だけで、発火条件は子を fork したスレッドの終了のため、常駐 plugin はセッションより長く生きるスレッドから起動する契約とする。孫プロセスは PR #1397・#1513（プロセスグループ回収・シグナル転送）で扱う。macOS には同等の機構がなく残留し得る（kqueue `NOTE_EXIT` は将来課題）。Windows は対象外。
+
 ## 依存関係グラフ
 
 ### 現状（Cargo.toml の実測）
@@ -139,10 +141,11 @@ flowchart LR
     plugin_microvm["plugin-microvm"] -->|確定| microvm
 
     core -.->|想定| io
-    cli -.->|想定| core
+    cli -->|確定| core
     cli -.->|想定| oci
     cli -.->|想定| stack
     cli -->|確定| net
+    cli -->|確定| plugin
     platform_macos -->|確定| io
     plugin_star["plugin-*（バイナリ群）"] -.->|想定| core
     core -.->|optional・plugin feature| plugin["plugin（境界基盤）"]
@@ -159,10 +162,11 @@ flowchart LR
 | `plugin-microvm` → `microvm` | crate-naming.md 表 #18（TASK-117） | 確定 |
 | `plugin`（境界基盤） | crate-naming.md 表 #10（core 側・plugin 側双方が依存する境界基盤） | 確定（依存の向きは双方向的な基盤利用であり、上記フローチャートでは個別の辺として描かない） |
 | `core` → `io` | `VolumeProvider`（core 実装）がデータパスで I/O 共有層を使う想定（D-14。G2/G3 で確定） | 想定 |
-| `cli` → `core` | 統一 CLI が実行層を呼ぶ想定（G6・TASK-79） | 想定 |
+| `cli` → `core` | 統一 CLI が実行層を呼ぶ。Linux は core を直接、macOS / Windows は core の plugin 発見・登録機構（PLUG-4）経由で、platform-* へは直接依存しない（`make check-cli-backend-deps` で機械判定。TASK-79.2〜79.4） | 確定 |
 | `cli` → `oci` | 統一 CLI がイメージ管理を呼ぶ想定（G6・TASK-79） | 想定 |
 | `platform-macos` → `io` | virtiofs 共有の I/O 共有プロトコルクライアント（`PipelineClient`）を使う（MAC-1・TASK-65.2。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。向きはバックエンド → core 側で、規則 2 の逆向きのため抵触しない | 確定 |
 | `cli` → `net` | `doctor` が br_netfilter・ホストの `ip filter FORWARD` policy の判定材料を net の読み取り照会（GETCHAIN）で取得する（NET-10・TASK-148.1。workspace 内 path 依存で実装済み。組み合わせ判定・警告・DOCKER-USER 案内・終了コードの評価層は TASK-148.2 で実装済み。CLI 配線は TASK-79） | 確定 |
+| `cli` → `plugin`（境界基盤） | バイナリ `fandhe-container` が受けた SIGINT・SIGTERM・SIGHUP を、起動中の plugin へ転送する API（`signal_forward`）を呼ぶ。シグナルハンドラの登録はバイナリの責務（PLUG-7・#1513・#1403。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。`plugin` は境界基盤で `plugin-*` バイナリ crate ではないため規則 2 に抵触しない | 確定 |
 | `cli` → `stack` | 統一 CLI が TOML スキーマを呼ぶ想定（G6・TASK-155） | 想定 |
 | `plugin-*`（バイナリ群） → `core` | トレイト型（`ContainerRuntime` 等の共通型）を参照する想定（TASK-114〜118） | 想定 |
 | `core` → `plugin`（境界基盤） | core の `plugin` feature（既定で有効）で optional 依存。`--no-default-features` で除外できる（PLUG-3・TASK-111.1・#262）。plugin 候補の探索は core 側の `crates/core/src/plugin_discovery.rs` に実装済み。登録の成果物も core 側に置く想定（TASK-109） | 確定（optional 辺。探索は実装済み・登録は未実装） |

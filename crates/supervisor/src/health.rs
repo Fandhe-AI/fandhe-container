@@ -9,7 +9,8 @@
 //! - **未実装**: healthcheck コマンドの実行、周期実行、`monitor` ループからの呼び出し。
 //!   将来は TASK-161（SUP-4）が exec と共通のコードパス（TASK-163・SUP-6）で [`HealthProbe`] を実装し、
 //!   監視ループの生存確認の周回（`crate::run::monitor` の手順 3）から周期的に [`probe_and_record`] を呼ぶ。
-//!   その際、healthcheck 引数の検証・シェル連結の禁止・コマンド出力のログ出力の扱いも TASK-161 で決める。
+//!   healthcheck 定義の検証・シェル連結の禁止は [`crate::healthcheck`]（TASK-161.1）で決定済み。
+//!   コマンド出力のログ出力の扱いは TASK-161 の後続で決める。
 //! - スタブは `Healthy` を返さない。未検査のコンテナを healthy と公開すると `depends_on` の待ち合わせを
 //!   誤って通すため、常に `Unimplemented` を返す（fail-closed）。
 //! - probe の失敗（`Err`・期限超過）は元のエラーを返す。ただし記録済みの `Healthy` が残ると `depends_on` の

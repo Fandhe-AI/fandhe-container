@@ -20,14 +20,16 @@
 //! # モジュール構成
 //!
 //! - `traits`: 拡張点トレイト（実装済み。TASK-4 系）
-//! - `exec`: 最小実行フロー（Linux 限定。namespace 分離〔TASK-27.2〕と `pivot_root` による
+//! - `sanitize`: 表示を乱す文字（Cc・Cf・Zl・Zp）の判定と有界追記の共通実装（非公開。ERR-2・SEC-4・TASK-96.1）
+//! - `exec`: 最小実行フロー（Linux 限定。稼働中コンテナへの exec〔SUP-6・TASK-163.1〜163.4。pid1 特定と `setns(2)` 参加は `exec/setns.rs`、cgroup join は `exec/cgroup_join.rs`、制限の再適用は `exec/reapply.rs`、fork・`close_range`・`execveat` は `exec/exec_command.rs`。user namespace への参加は未実装で、対象が別の user namespace にいれば拒否する。実コンテナへの通し試験は実機前提で、CI では実行していない〕も持つ。namespace 分離〔TASK-27.2〕と `pivot_root` による
 //!   rootfs 切替〔TASK-27.3〕、基本デバイスノード作成〔TASK-27.6。`exec/devices.rs`。
 //!   Issue 表記の `src/devices.rs` ではなく `exec` 配下に置く: 段の型 `ExecError`・`MountIsolation`
 //!   の検証が `exec` の非公開項目のため〕、fork / exec による子プロセス起動〔TASK-27.4.1。最小構成でフック無し〕、順序固定のステージ列の枠〔TASK-27.4.2。`exec/stages.rs`。`NO_NEW_PRIVS`〔TASK-27.4.3〕と capability 削減〔TASK-37.2〕のみ固定ステージとして実装済み〕が
 //!   実装済みで、Landlock は `with_landlock` で差し込み可能・cgroup 参加は未実装（seccomp は #178 で組み込み済み）。非 Linux ではビルド対象外のため本 doc からは
 //!   リンクしない）
 //! - `audit_log`: 分離違反の監査レコード型 `AuditRecord` 等（SEC-4・TASK-41.1・#192。OS 非依存で
-//!   型定義・マウント検証/API の記録ヘルパ〔TASK-41.4〕・seccomp フック〔TASK-41.2・#193。拒否報告→レコード→`AuditSink`〕・ローカルファイル書き込み主経路〔TASK-41.5.1・#839〕は実装済み。Landlock のフック〔TASK-41.3・#194。`landlock_denial_record` / `landlock_denial_record_now` と
+//!   型定義・マウント検証/API の記録ヘルパ〔TASK-41.4〕・seccomp フック〔TASK-41.2・#193。拒否報告→レコード→`AuditSink`〕・ローカルファイル書き込み主経路〔TASK-41.5.1・#839〕・exec の対象の拒否の記録ヘルパ〔`exec::audit_exec_violation`・
+//!   `exec::record_exec_target_rejection`。層 `exec_target`。#1465〕は実装済み。Landlock のフック〔TASK-41.3・#194。`landlock_denial_record` / `landlock_denial_record_now` と
 //!   `exec::observe_landlock_path_access` による適用後プローブの拒否記録〕も実装済み。配送経路〔TRAP / USER_NOTIF /
 //!   カーネル監査〕・ワークロードプロセスが受けた Landlock 拒否の捕捉は未実装。主経路失敗時のカーネル監査フォールバック〔#840 `KernelAuditFallback`〕は実装済み・本番経路への配線は未実装）
 //! - `capabilities`: capability 集合の型 `Capability`・`CapabilitySet`・OCI 既定集合（SEC-1・
@@ -37,6 +39,7 @@
 //! - `observability`: メトリクス集計型 `OpStats` 等（TASK-84.1）と記録 API `OpRecorder`
 //!   （TASK-84.2）は実装済み（REPAIR-4）。JSON Lines 出力（TASK-84.3）も実装済み。create / start / kill の計装は実装済み（TASK-84.4）、delete も TASK-30.2 で同じパターンにより計装済み。io 向け連携点は io 側に定義済み（TASK-84.5）
 //! - `landlock`: Landlock ABI 検出（TASK-39.1・#181）とパスルール生成（TASK-39.2・#182）と ruleset 適用（TASK-39.3・#183）を実装済み（Linux 限定。CORE-5）。ステージ列への組み込み口（`StagePipeline::with_landlock`・TASK-39.4・#184）は実装済みで、本番 launcher からの呼び出しと制限適用の証跡配線は後続作業。
+//! - `rlimits`: rlimit（`process.rlimits`・`--ulimit`）の検証済み型 `Rlimit`・`Rlimits`（SUP-12・TASK-169.1・#526。OS 非依存）。適用は `exec::StagePipeline::with_rlimits`（Linux 限定）で、OCI config からの結線は未実装（REPAIR-3）
 //! - `rootless`: user namespace の UID/GID 写像の設定・読み戻し検証（Linux 限定。CORE-6・SEC-5・
 //!   TASK-40.1）。検証済み写像型・subuid/subgid 解析・`Direct` / `newuidmap` 経由の書き込みが実装済みで、
 //!   `exec::isolate_rootless_subordinate` による起動フローへの組み込みも実装済み（TASK-40.2）。
@@ -50,6 +53,10 @@
 //!   start（TASK-29.3）は実装済みだが起動は `ProcessLauncher` の依存注入で、本番 launcher と実 exec は未提供。
 //!   kill（TASK-30.1）も実装済みで、送信は `ProcessSignaler` の依存注入（本番実装は supervisor 待ち）。delete（TASK-30.2・TASK-30.3）は cgroup（`ContainerCgroupRemover` の依存注入）と `StateStore` のレコードの削除を実装済みで、OCI-7 の参照解除は TASK-183 で未実装。
 //!   失敗のエラー型 `OciRuntimeError`（ERR-2・TASK-96.1）は定義済みで、4 操作（create / start / kill / delete）は結線済み・`write_json_line` で stderr 向け 1 行を出せる（TASK-96.2・TASK-96.3）。実 stderr 出力・終了は CLI 側で未実装
+//! - `tmpfs`: tmpfs マウントの検証済み仕様型（`--shm-size` / `--tmpfs`。SUP-12・TASK-169.2）。OS 非依存で、
+//!   Linux 限定の適用は `exec::mount_tmpfs`。launcher・CLI への配線は未実装（REPAIR-3）
+//! - `injected_files`: secrets / configs 注入の検証済み仕様型（SUP-12・TASK-169.4.2）。OS 非依存で、
+//!   Linux 限定の適用は `exec::inject_files`（専用 tmpfs へ書き込み後に read-only 化）。配線は未実装（REPAIR-3）
 //! - `state_store`: ファイルベース `StateStore`（TASK-31.1・OCI-5）は実装済み。3 OS でコンパイルされるが
 //!   使えるのは Linux のみで、他 OS の `FileStateStore::open` は状態ルートの信頼境界（所有者・ACL）を
 //!   検査できないため `Unimplemented`（fail-closed。start の `BundleLock` と同じ扱い）。
@@ -77,12 +84,22 @@
 //! 実行層本体（namespace・cgroups v2・seccomp/Landlock・rootless 等）は G3（TASK-27〜50）で
 //! 実装する未実装のままである（REPAIR-3: 実装済みを装わず、未実装であることも隠さない）。
 
+// `exec-test-support` は試験専用の入口（期待 cgroup パスを呼び出し側から受け取る対象特定・`execveat` を伴わない
+// 観測・worker 機構の直接呼び出し）を公開する feature で、リリースビルドで有効にすると SEC-1 の同一性照合を
+// 迂回できる。最適化ビルド（`debug_assertions` が無効）で有効になっていたらコンパイルを止める
+// （SUP-6・SEC-1・REPAIR-3・TASK-163 追補・#1460。テスト・clippy は dev プロファイルのため影響しない）。
+#[cfg(all(feature = "exec-test-support", not(debug_assertions)))]
+compile_error!(
+    "the `exec-test-support` feature exposes test-only exec entry points and must not be enabled in release builds"
+);
+
 pub mod audit_log;
 pub mod capabilities;
 #[cfg(target_os = "linux")]
 pub mod cgroups;
 #[cfg(target_os = "linux")]
 pub mod exec;
+pub mod injected_files;
 #[cfg(target_os = "linux")]
 pub mod landlock;
 pub mod observability;
@@ -91,12 +108,17 @@ pub mod oci_runtime;
 pub mod plugin;
 pub mod plugin_discovery;
 pub mod plugin_trust;
+pub mod rlimits;
 #[cfg(target_os = "linux")]
 pub mod rootless;
+mod sanitize;
 pub mod seccomp;
 pub mod state_store;
 #[cfg(target_os = "linux")]
 mod sys;
+#[cfg(test)]
+mod test_support;
+pub mod tmpfs;
 pub mod traits;
 
 /// 非 Linux ビルドの確認（CORE-1・TASK-27.5）。

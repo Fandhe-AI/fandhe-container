@@ -10,7 +10,7 @@ MVP のリソース制限が cgroups v2 単独対応であることと、非対�
 ## 対応範囲
 
 - cgroups v2（unified hierarchy）単独に対応する
-- 非特権ユーザーに委譲された cgroup v2 サブツリー上で子 cgroup を作成し、controller（`memory`・`cpu`）でリソースを制限する（CORE-3）
+- 非特権ユーザーに委譲された cgroup v2 サブツリー上で子 cgroup を作成し、controller（`memory`・`cpu`・`pids`・`io`）でリソースを制限する（CORE-3・SUP-13・TASK-170）
 
 ## 非対応
 
@@ -43,6 +43,15 @@ MVP のリソース制限が cgroups v2 単独対応であることと、非対�
 - `parse_self_cgroup_v2`: `/proc/self/cgroup` に v1 の行が混在する場合、または `0::` 行が無い場合は `FailedPrecondition`（段 `CgroupStep::ReadSelfCgroup`）で拒否する
 - `verify_cgroup2`: `/sys/fs/cgroup` と対象 cgroup が cgroup2 ファイルシステム（`CGROUP2_SUPER_MAGIC`）であることを `fstatfs` で確認する（段 `CgroupStep::VerifyCgroup2`）
 - 対応するユニットテスト: `core4_sec6_task32_1_parse_self_cgroup_v2_rejects_hybrid`
+
+## exec 用の子 cgroup と `cgroup.kill`（SUP-6・SUP-4・TASK-163 追補・#1466）
+
+exec のコマンドは、コンテナ cgroup（`<scope>/fc-<id>@<instance>`）の直下に exec ごとに作る子 cgroup `exec-<nonce>` へ入れて実行し、期限切れ・中断・worker 異常終了のいずれでも `cgroup.kill` で子孫ごと停止して削除する。
+
+- `cgroup.kill` は Linux 5.14 以降。開けなければ exec を拒否する（fail-closed。親死亡シグナルだけへ縮退しない）
+- 内部プロセス禁止規則: `fc-<id>@<instance>` は pid1 を直接持つため、その `cgroup.subtree_control` は空のままにし、`exec-*` にも controller を有効化しない。`memory.max`・`pids.max` 等は親から階層的に子孫へ掛かる
+- 名前は `exec-` 接頭辞で、コンテナ用の `fc-` と衝突しない（`Pid1Target` の cgroup 完全一致照合に影響しない）
+- 実装は `crates/core/src/cgroups/exec_kill.rs`・`crates/core/src/exec/cgroup_join.rs`。実機前提テストは `crates/core/tests/exec_cgroup_kill.rs`（AGENTS.md）
 
 ## 関連・後続
 

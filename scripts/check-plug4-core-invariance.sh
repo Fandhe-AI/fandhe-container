@@ -21,7 +21,8 @@
 # 加えて PLUG4_BASE_REF 指定時は、plugin crate を新規追加する PR が core（crates/core 配下全体）を変更して
 # いないかを git diff でも検査する。plugin crate を追加しない PR の core 変更は対象外（通常の開発）。
 # 移植性: Linux（GNU）と macOS（BSD）の両方で動かすため、GNU 専用の機能（tar --null・sed 置換内の \n・
-# grep -z 等）を使わない。自己テストは scripts/check-plug4-core-invariance-selftest.sh（CI は ubuntu・macos で実行）。
+# grep -z 等）を使わない。自己テストは scripts/check-plug4-core-invariance-selftest.sh（CI は ubuntu・macos・
+# windows〔Git Bash〕の 3 OS で実行）。
 # 失敗（ビルド失敗・指紋不一致・空の指紋）は非ゼロ終了（fail-closed）。リポ内のファイルは変更しない。
 set -euo pipefail
 

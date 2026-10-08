@@ -32,7 +32,7 @@
 //!
 //! # 畳み込み方式と、これが近似であること（REPAIR-3）
 //! 大文字小文字の畳み込みは各文字へ lower → upper → lower を順に適用する方式
-//! （[`fold_component`] 参照）で、Unicode の case folding の近似に過ぎない。
+//! （`fold_component` 参照）で、Unicode の case folding の近似に過ぎない。
 //! APFS の `casefold` 正規化表・NTFS の upcase table と厳密に一致することは
 //! 主張しない。方式は「衝突の見逃しより過検出を選ぶ」よう選んでいる: 見逃しは
 //! ホスト側での黙った上書き（データ損失）に直結するが、過検出はゲストに見える
@@ -56,7 +56,7 @@
 //! 適用されない。
 //!
 //! # 検証の位置づけ（多層防御の 1 枚）
-//! [`validate_guest_relative_path`] は先頭 `/`・`.`・`..`・空コンポーネント・
+//! `validate_guest_relative_path` は先頭 `/`・`.`・`..`・空コンポーネント・
 //! NUL を拒否するが、これはパストラバーサルを主目的として防ぐ層ではない。
 //! rootfs 配下への閉じ込めを保証する本来の検証は、サーバー側の書き込み経路
 //! （[`crate::guest_files`] のコンポーネント検証・祖先確認・`create_new`。#100）の
@@ -109,13 +109,26 @@ use std::path::Path;
 
 use crate::error::{IoError, IoErrorCode};
 
-/// [`quote_for_message`] がエラーメッセージへ埋め込む 1 パスあたりの最大文字数
+/// `quote_for_message` がエラーメッセージへ埋め込む 1 パスあたりの最大文字数
 /// （公開定数。呼び出し側がメッセージ全体の見積もりに使えるようにする）。
 ///
 /// ゲスト由来の任意長パスをそのままログ・エラーメッセージへ載せると、巨大な
 /// メッセージによる資源浪費（security.md「不安全な設計」観点）につながる
 /// ため、char 境界で切り詰める。
 pub const MAX_COLLISION_MESSAGE_PATH_CHARS: usize = 128;
+
+/// `quote_for_message` がエスケープ後に 1 パスへ割り当てる最大バイト数（引用符・
+/// 切り詰めの `...` を除く）。マルチバイト文字・エスケープ展開（`\u{..}`）を含む
+/// 最悪ケースでも、衝突メッセージ（パス 4 つ埋め込み）が
+/// [`crate::MAX_IO_ERROR_MESSAGE_BYTES`] に収まり末尾の要素名が失われないようにする
+/// （#1116・IO-5）。
+pub const MAX_COLLISION_MESSAGE_PATH_BYTES: usize = 200;
+
+// 4 パス × (上限 + 引用符 2 + `...` 3) + 固定文言（約 100 バイト）が IoError の上限に
+// 収まることを固定する。
+const _: () = assert!(
+    4 * (MAX_COLLISION_MESSAGE_PATH_BYTES + 5) + 128 <= crate::error::MAX_IO_ERROR_MESSAGE_BYTES
+);
 
 /// ホストパスの長さ上限（UTF-16 コード単位。IO-5・WIN-4・TASK-20.1）。
 /// この値ちょうどは許容し、超えると [`check_host_path_length`] がエラーにする。
@@ -175,7 +188,7 @@ pub fn measure_host_path_length(path: &Path) -> HostPathLength {
 /// ホストパスが [`MAX_HOST_PATH_CHARS`] 以内か検証する（エラーとして扱う経路。IO-5）。
 ///
 /// 超過時は `IoErrorCode::InvalidArgument`（メッセージに計測値と上限を含み、
-/// パスは [`quote_for_message`] で衛生化・切り詰めて埋め込む）。
+/// パスは `quote_for_message` で衛生化・切り詰めて埋め込む）。
 ///
 /// # WIN-4 との関係（TASK-20.2・#797）
 /// - `system.wsl_case_sensitive`（WIN-4。NTFS のディレクトリ単位の case-sensitive
@@ -354,20 +367,31 @@ fn validate_guest_relative_path(path: &str) -> Result<Vec<&str>, IoError> {
 /// エラーメッセージへ埋め込むためにパスを衛生化する（改行・制御文字による
 /// ログ注入の防止・巨大メッセージの防止。security.md「インジェクション」観点）。
 ///
-/// `{:?}`（`Debug` によるエスケープ）でパスを整形したうえで、char 境界で
-/// [`MAX_COLLISION_MESSAGE_PATH_CHARS`] 文字までに切り詰める。切り詰めた
-/// 場合は末尾に `...` を付ける。添字アクセス（`[]`）ではなく `chars().take`
-/// を使い、マルチバイト文字の境界を壊さない。
+/// `{:?}`（`Debug` によるエスケープ）でパスを整形する。char 境界で
+/// [`MAX_COLLISION_MESSAGE_PATH_CHARS`] 文字、かつエスケープ後
+/// [`MAX_COLLISION_MESSAGE_PATH_BYTES`] バイトまでに切り詰め、切り詰めた場合は
+/// 末尾に `...` を付ける。添字アクセス（`[]`）は使わず、マルチバイト文字の境界を
+/// 壊さない。
 pub(crate) fn quote_for_message(path: &str) -> String {
-    let mut truncated: String = path
-        .chars()
-        .take(MAX_COLLISION_MESSAGE_PATH_CHARS)
-        .collect();
-    let was_truncated = path.chars().count() > MAX_COLLISION_MESSAGE_PATH_CHARS;
-    if was_truncated {
-        truncated.push_str("...");
+    let mut kept = String::new();
+    let mut escaped_bytes = 0usize;
+    let mut was_truncated = false;
+    for (index, c) in path.chars().enumerate() {
+        // 1 文字を `Debug` エスケープした後のバイト数（前後の引用符 2 バイトを除く）。
+        let cost = format!("{:?}", c.to_string()).len().saturating_sub(2);
+        if index >= MAX_COLLISION_MESSAGE_PATH_CHARS
+            || escaped_bytes.saturating_add(cost) > MAX_COLLISION_MESSAGE_PATH_BYTES
+        {
+            was_truncated = true;
+            break;
+        }
+        kept.push(c);
+        escaped_bytes += cost;
     }
-    format!("{truncated:?}")
+    if was_truncated {
+        kept.push_str("...");
+    }
+    format!("{kept:?}")
 }
 
 /// 衝突を表す構造化エラーを組み立てる。パス・コンポーネントはすべて
@@ -476,15 +500,15 @@ impl CaseCollisionSet {
     /// `path` を検証・畳み込みしたうえで索引へ登録する。
     ///
     /// # 挙動
-    /// 1. [`validate_guest_relative_path`] で形式を検証する（不正なら
+    /// 1. `validate_guest_relative_path` で形式を検証する（不正なら
     ///    [`IoErrorCode::InvalidArgument`]）
-    /// 2. 根から順に各コンポーネントを [`CaseFoldKey`]（親ノード＋畳み込み結果）
+    /// 2. 根から順に各コンポーネントを `CaseFoldKey`（親ノード＋畳み込み結果）
     ///    で引く
     /// 3. 既存ノードがあり、元の表記も完全一致するならそのノードへ降りる
     ///    （同一ディレクトリの共有・同一ファイルへの複数回書き込みは正常な処理）
     /// 4. 既存ノードがあり、元の表記が大文字小文字の違いだけで異なるなら
     ///    [`IoErrorCode::AlreadyExists`] を返す。`message` には両方のパスと
-    ///    衝突したコンポーネントを [`quote_for_message`] で衛生化して含める
+    ///    衝突したコンポーネントを `quote_for_message` で衛生化して含める
     /// 5. 既存ノードが無ければ新設して降りる
     ///
     /// 4 のエラーは 5 の新設より前にしか起こらない（新設したノードには子が
@@ -568,6 +592,39 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// IO-5・ERR-1（#1116）: マルチバイト・エスケープ展開の最悪ケースでも衝突メッセージが
+    /// `IoError` の上限に収まり、末尾の要素名（existing component）が失われない。
+    #[test]
+    fn io5_collision_error_fits_limit_for_worst_case_paths() {
+        let fillers = ["あ", "\u{1F600}", "\u{1b}", "a"];
+        for filler in fillers {
+            let long = filler.repeat(300);
+            let err = collision_error(&long, &long, &long, &long);
+            assert!(
+                !err.message_truncated(),
+                "filler {filler:?}: len={}",
+                err.message().len()
+            );
+            assert!(err.message().ends_with("differ only by case)"));
+            assert!(err.message().len() <= crate::MAX_IO_ERROR_MESSAGE_BYTES);
+        }
+    }
+
+    /// IO-5（#1116）: 短いパスの引用は従来どおり（切り詰めなし）。
+    #[test]
+    fn io5_quote_for_message_short_path_unchanged() {
+        assert_eq!(quote_for_message("a/b"), "\"a/b\"");
+        assert_eq!(quote_for_message("あ"), "\"あ\"");
+        assert_eq!(
+            quote_for_message(&"a".repeat(128)),
+            format!("\"{}\"", "a".repeat(128))
+        );
+        assert_eq!(
+            quote_for_message(&"a".repeat(129)),
+            format!("\"{}...\"", "a".repeat(128))
+        );
+    }
     use std::path::PathBuf;
 
     /// IO-5: 巨大パスでもエラーメッセージ用の変換は先頭のみ（有界）で、切り詰め表示になる。

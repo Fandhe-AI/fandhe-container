@@ -36,9 +36,12 @@
 //! 呼び出し順・エラー写像・読み戻し不一致を再現し、本物の syscall は `sys.rs` のテストと、使い捨て
 //! スレッドを使う `sec1_apply_default_capabilities_real_thread` で確認する。
 
-use super::{ExecError, IsolationStage};
+use std::os::fd::{AsFd as _, BorrowedFd};
+
+use super::setns::read_bounded_from;
+use super::{ExecError, IsolationStage, ThreadCountSource};
 use crate::capabilities::CapabilitySet;
-use crate::sys::{self, EINVAL, SysError, ThreadCaps};
+use crate::sys::{self, EINVAL, EPERM, SysError, ThreadCaps};
 use crate::traits::types::ErrorCode;
 
 /// カーネルへの capability 操作の境界。本番は [`RealKernel`]（`sys` の薄いラッパー）、
@@ -51,12 +54,55 @@ trait CapKernel {
     fn set(&mut self, caps: ThreadCaps) -> Result<(), SysError>;
     /// 呼び出したプロセスのスレッド数（`/proc/self/status` の `Threads:`）。読めない・解釈できない場合は `None`。
     fn thread_count(&mut self) -> Option<u64>;
+    /// 補助グループの件数（`getgroups(0, NULL)`）。
+    fn supplementary_group_count(&mut self) -> Result<usize, SysError>;
+    /// 補助グループをすべて消去する（`setgroups(0, NULL)`）。
+    fn clear_supplementary_groups(&mut self) -> Result<(), SysError>;
+    /// 呼び出しプロセスの user namespace が `setgroups` を禁じているか（procfs の `setgroups` が `deny`）。
+    /// 確認できない（procfs でない・読めない・`allow` / `deny` 以外の内容）場合は `None`。
+    fn setgroups_denied(&mut self) -> Option<bool>;
 }
 
-/// 本物の syscall を呼ぶ実装。
-struct RealKernel;
+/// 本物の syscall を呼ぶ実装。スレッド数の取得元（`/proc/self/status` か、`setns` 前に開いた fd）を持つ。
+struct RealKernel<'a> {
+    threads: &'a mut ThreadCountSource,
+    /// 呼び出しプロセス自身の procfs ディレクトリ（`/proc/<pid>`。procfs と確認済みの fd）。exec 専用プロセスは
+    /// `setns` の後に `/proc/self` を解決できないため、`setns` の前に開いた fd を渡す。`None` なら `/proc` を
+    /// procfs と確認したうえで `self` を引く（launch 経路。pivot 後の `/proc` は `prepare_rootfs` がマウント済み）。
+    own_proc_dir: Option<BorrowedFd<'a>>,
+}
 
-impl CapKernel for RealKernel {
+/// procfs の `setgroups` の読み取り上限（本物は `allow\n` / `deny\n` の 5〜6 バイト）。
+const SETGROUPS_READ_LIMIT: u64 = 16;
+
+/// 呼び出しプロセスの user namespace が `setgroups` を禁じているかを、信頼できる procfs から読む。
+///
+/// `own_proc_dir` があればその `setgroups`、無ければ `fstatfs` で procfs と確認した `/proc` の `self/setgroups`。
+/// `deny` なら `Some(true)`、`allow` なら `Some(false)`、それ以外・確認できない場合は `None`。
+fn read_setgroups_denied(own_proc_dir: Option<BorrowedFd<'_>>) -> Option<bool> {
+    let file = match own_proc_dir {
+        Some(dir) => sys::open_read_at(dir, c"setgroups").ok()?,
+        None => {
+            let proc_dir = sys::open_dir_path_nofollow(None, c"/proc").ok()?;
+            if sys::fs_type(proc_dir.as_fd()) != Ok(sys::PROC_MAGIC) {
+                return None;
+            }
+            sys::open_read_at(proc_dir.as_fd(), c"self/setgroups").ok()?
+        }
+    };
+    // 開いたファイル自体も procfs 上にあること（別のファイルシステムの同名ファイルを信用しない）。
+    if sys::fs_type(file.as_fd()) != Ok(sys::PROC_MAGIC) {
+        return None;
+    }
+    let text = read_bounded_from(std::fs::File::from(file), SETGROUPS_READ_LIMIT).ok()?;
+    match text.trim_end_matches('\n') {
+        "deny" => Some(true),
+        "allow" => Some(false),
+        _ => None,
+    }
+}
+
+impl CapKernel for RealKernel<'_> {
     fn bounding_contains(&mut self, cap: u8) -> Result<bool, SysError> {
         sys::cap_bounding_contains(cap)
     }
@@ -73,8 +119,69 @@ impl CapKernel for RealKernel {
         sys::cap_set_thread(caps)
     }
     fn thread_count(&mut self) -> Option<u64> {
-        let status = std::fs::read_to_string("/proc/self/status").ok()?;
-        super::status_threads(&status)
+        self.threads.count()
+    }
+    fn supplementary_group_count(&mut self) -> Result<usize, SysError> {
+        sys::supplementary_group_count()
+    }
+    fn clear_supplementary_groups(&mut self) -> Result<(), SysError> {
+        sys::clear_supplementary_groups()
+    }
+    fn setgroups_denied(&mut self) -> Option<bool> {
+        read_setgroups_denied(self.own_proc_dir)
+    }
+}
+
+/// 補助グループの扱いの結果（SUP-6・SEC-1・SEC-5・TASK-163 追補・#1457）。
+///
+/// launch 経路（組み込みの capability 削減段）と稼働中コンテナへの exec（`reapply_restrictions`）が同じ関数で
+/// 同じ扱いをする: コンテナのプロセスは補助グループを **持たない**（`config.json` の
+/// `process.user.additionalGids` は launch が非空を拒否するため、空が唯一の指定）。起動したプロセス（supervisor・
+/// exec を起動した CLI。`sudo` 経由なら呼び出しユーザーのもの）のホスト側の補助グループを持ち越さない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SupplementaryGroups {
+    /// 元から空だった（syscall を呼んでいない）。
+    AlreadyEmpty,
+    /// `setgroups(0)` で消去し、読み戻して空であることを確かめた（`cleared` は消去前の件数）。
+    Cleared {
+        /// 消去前の件数。
+        cleared: usize,
+    },
+    /// 消去できず、**現状のまま残した**（`kept` 件）。`setgroups` が `EPERM` になり、かつ procfs の
+    /// `/proc/<pid>/setgroups` で user namespace が `setgroups` を `deny` にしている（非特権で作った user
+    /// namespace = rootless）と確認できた場合に限る。カーネルが意図して禁じている操作
+    /// （グループを落として「グループによる拒否」の ACL を回避させない）。
+    ///
+    /// **残るのは「このプロセスが持ち込んだ」補助グループ**（user namespace の中からは写像されず overflow gid に
+    /// 見える）で、誰のものかは経路で違う。launch の子は supervisor から fork されるため、user namespace を作った
+    /// 非特権ユーザー自身のグループであり、そのユーザーが元から持つ権限を超えない。稼働中コンテナへの exec では
+    /// **exec を起動したプロセスのグループ** で、user namespace の作成者と同じとは限らない（照合していない）。
+    /// そのため exec は、`setns` で user namespace へ入る **前**（初期 user namespace で `CAP_SETGID` を持つ間）に
+    /// `clear_supplementary_groups_before_join` で消去を試み、root・`sudo` 経由の起動者のグループを持ち込まない。
+    /// exec でこの値になるのは、起動者自身が既に `setgroups` を禁じた user namespace の中にいる場合だけである。
+    KeptSetgroupsDenied {
+        /// 残した件数。
+        kept: usize,
+    },
+}
+
+impl SupplementaryGroups {
+    /// 機械可読な名前（ログ・worker の結果行用）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AlreadyEmpty => "already_empty",
+            Self::Cleared { .. } => "cleared",
+            Self::KeptSetgroupsDenied { .. } => "kept_setgroups_denied",
+        }
+    }
+
+    /// 適用後に残っている補助グループの件数（消去済み・元から空は 0）。
+    pub fn remaining(self) -> usize {
+        match self {
+            Self::AlreadyEmpty | Self::Cleared { .. } => 0,
+            Self::KeptSetgroupsDenied { kept } => kept,
+        }
     }
 }
 
@@ -97,6 +204,8 @@ pub struct CapabilityReport {
     pub unavailable: CapabilitySet,
     /// 調べて分かったカーネルの最後の capability 番号。
     pub last_cap: u8,
+    /// 補助グループの扱いの結果（capability の削減より前に行う。TASK-163 追補・#1457）。
+    pub supplementary_groups: SupplementaryGroups,
 }
 
 /// 呼び出したスレッドの capability を OCI 既定集合（SEC-1）へ絞り込む。
@@ -114,7 +223,27 @@ pub struct CapabilityReport {
 /// - 事後確認: 適用後にもう一度 `Threads: 1` を確認する。万一増えていれば（呼び出し側の
 ///   別経路の不具合等）`Ok` を返さず `Internal` で失敗し、権限が残った可能性を呼び出し側へ伝える
 pub(crate) fn apply_default_capabilities() -> Result<CapabilityReport, ExecError> {
-    apply_capabilities_single_threaded(CapabilitySet::oci_default(), &mut RealKernel)
+    apply_default_capabilities_with(&mut ThreadCountSource::ProcSelf, None)
+}
+
+/// [`apply_default_capabilities`] の、スレッド数の取得元を差し替えられる版（SUP-6・TASK-163.4・#503）。
+///
+/// exec 専用プロセスは `setns` の後に自プロセスを `/proc/self` で解決できないため、`setns` の前に開いた
+/// status fd（`ThreadCountSource::PreOpened`）で `Threads: 1` を適用の前後に確認する。検査自体は弱めない。
+///
+/// `own_proc_dir` は呼び出しプロセス自身の procfs ディレクトリ（`setns` の前に開き、procfs と確認した fd）で、
+/// 補助グループを消去できなかったときに user namespace の `setgroups` の設定を読むために使う（#1457）。
+pub(crate) fn apply_default_capabilities_with(
+    threads: &mut ThreadCountSource,
+    own_proc_dir: Option<BorrowedFd<'_>>,
+) -> Result<CapabilityReport, ExecError> {
+    apply_capabilities_single_threaded(
+        CapabilitySet::oci_default(),
+        &mut RealKernel {
+            threads,
+            own_proc_dir,
+        },
+    )
 }
 
 /// 単一スレッド条件を適用の前後で検査して [`apply_capabilities`] を呼ぶ。事前検査は副作用の前に行う。
@@ -149,6 +278,9 @@ fn apply_capabilities(
 ) -> Result<CapabilityReport, ExecError> {
     let stage = IsolationStage::CapabilityDrop;
     let fail = |e: SysError, what: &str| ExecError::from_sys(e, stage, what);
+
+    // 0. 補助グループの消去（`CAP_SETGID` を落とす前に行う。失敗したら何も削減しないまま拒否する）。
+    let supplementary_groups = drop_supplementary_groups(kernel)?;
 
     // 1. bounding set の削減（許可集合に無い番号を、カーネルが知る最後の番号まですべて drop する）。
     let mut dropped = Vec::new();
@@ -257,7 +389,125 @@ fn apply_capabilities(
         retained_after_exec,
         unavailable,
         last_cap,
+        supplementary_groups,
     })
+}
+
+/// 稼働中コンテナへの exec が、namespace へ参加する **前** に補助グループを空にする
+/// （SUP-6・SEC-1・SEC-5・TASK-163 追補・#1457）。本番ビルドの実装。
+///
+/// `reapply::prepare_exec_restrictions` が準備の最後に呼ぶ。exec 専用プロセスは、対象の user namespace へ
+/// `setns` した後では（その user namespace が `setgroups` を `deny` にしていれば）補助グループを消せず、exec を
+/// 起動したプロセス（root・`sudo` 経由・別のグループ集合のセッション）のホスト側の補助グループを持ち込んだまま
+/// コンテナ内でコマンドを動かすことになる。参加の前、まだ自分の user namespace で `CAP_SETGID` を持つ間に
+/// 消去しておけば、参加後の capability 削減は「元から空」になる。
+///
+/// 契約は [`drop_supplementary_groups`] と同じ（消去できず `deny` も確認できなければ拒否 = 準備の失敗で、
+/// 参加しない）。スレッド単位の syscall のため、前後で `Threads: 1` を確かめる。capability は変更しない。
+#[cfg(not(test))]
+pub(super) fn clear_supplementary_groups_before_join(
+    threads: &mut ThreadCountSource,
+    own_proc_dir: BorrowedFd<'_>,
+) -> Result<SupplementaryGroups, ExecError> {
+    clear_groups_single_threaded(&mut RealKernel {
+        threads,
+        own_proc_dir: Some(own_proc_dir),
+    })
+}
+
+/// 単一スレッド条件を前後で検査して [`drop_supplementary_groups`] を呼ぶ（事前検査は副作用の前）。
+fn clear_groups_single_threaded(
+    kernel: &mut impl CapKernel,
+) -> Result<SupplementaryGroups, ExecError> {
+    let stage = IsolationStage::CapabilityDrop;
+    if kernel.thread_count() != Some(1) {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            stage,
+            "clearing the supplementary groups requires a single-threaded process (Threads: 1)",
+        ));
+    }
+    let outcome = drop_supplementary_groups(kernel)?;
+    if kernel.thread_count() != Some(1) {
+        return Err(ExecError::new(
+            ErrorCode::Internal,
+            stage,
+            "process became multi-threaded while clearing the supplementary groups",
+        ));
+    }
+    Ok(outcome)
+}
+
+/// 結合試験専用: 呼び出したスレッドの補助グループを、本番と同じ関数・本物の syscall で空にする
+/// （SUP-6・SEC-1・SEC-5・TASK-163 追補・#1457）。
+///
+/// 呼び出し文脈は core の `tests/exec_child_setup.rs` と supervisor の `tests/exec_setns_join.rs` の **使い捨ての
+/// 子プロセス**（単一スレッドの `main`。呼び出しプロセス自身の資格情報を不可逆に変えるため）。capability は
+/// 削減しない。非特権のプロセス（`CAP_SETGID` なし）での拒否と、`setgroups` が `deny` の user namespace での
+/// 「現状維持の記録」を実 syscall で照合するために使う。権限を増やす操作ではない。`exec-test-support` feature を
+/// 付けたビルドにだけ存在し、既定のビルドの公開 API には含まれない。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+#[doc(hidden)]
+pub fn clear_supplementary_groups_for_test() -> Result<SupplementaryGroups, ExecError> {
+    drop_supplementary_groups(&mut RealKernel {
+        threads: &mut ThreadCountSource::ProcSelf,
+        own_proc_dir: None,
+    })
+}
+
+/// 呼び出したスレッドの補助グループを空にする（SUP-6・SEC-1・SEC-5・TASK-163 追補・#1457）。
+///
+/// launch・exec の両経路で、capability の削減より前に呼ぶ。契約:
+///
+/// - 元から空なら何も呼ばない（[`SupplementaryGroups::AlreadyEmpty`]）
+/// - `setgroups(0)` が成功したら、読み戻して空であることを確かめる（[`SupplementaryGroups::Cleared`]。空で
+///   なければ `Internal`）
+/// - `EPERM` で、かつ **procfs の `setgroups` が `deny` と確認できた** 場合だけ、現状のまま残して結果に記録する
+///   （[`SupplementaryGroups::KeptSetgroupsDenied`]）。`EPERM` は `CAP_SETGID` の不足・継承した seccomp フィルタ・
+///   LSM でも返るため、errno と capability からは理由を特定しない。読むのは呼び出しプロセス自身の procfs の
+///   `setgroups`（user namespace ごとの設定。初期 user namespace は常に `allow`）で、exec 専用プロセスは `setns` の
+///   後に `/proc/self` を解決できないため `setns` の前に開いた自分の procfs ディレクトリの fd から、launch の子は
+///   `fstatfs` で procfs と確認した `/proc` から読む。開いたファイルが procfs 上に無い・内容が `allow` / `deny` で
+///   ない場合は確認できなかったものとして扱う
+/// - それ以外（`deny` と確認できない `EPERM`・その他の errno）は、ホスト側の補助グループを持ち越したまま
+///   進めないため拒否する（fail-closed）
+fn drop_supplementary_groups(
+    kernel: &mut impl CapKernel,
+) -> Result<SupplementaryGroups, ExecError> {
+    let stage = IsolationStage::CapabilityDrop;
+    let fail = |e: SysError, what: &str| ExecError::from_sys(e, stage, what);
+    let before = kernel
+        .supplementary_group_count()
+        .map_err(|e| fail(e, "getgroups"))?;
+    if before == 0 {
+        return Ok(SupplementaryGroups::AlreadyEmpty);
+    }
+    match kernel.clear_supplementary_groups() {
+        Ok(()) => {
+            let after = kernel
+                .supplementary_group_count()
+                .map_err(|e| fail(e, "getgroups"))?;
+            if after != 0 {
+                return Err(ExecError::new(
+                    ErrorCode::Internal,
+                    stage,
+                    "supplementary groups remain after setgroups(0)",
+                ));
+            }
+            Ok(SupplementaryGroups::Cleared { cleared: before })
+        }
+        // `EPERM` だけでは理由を特定できない（`CAP_SETGID` が無い・継承した seccomp フィルタ・LSM でも `EPERM` に
+        // なる）。信頼できる procfs で user namespace の `setgroups` が `deny` と確認できた場合だけ残す。
+        Err(SysError::Os(e)) if e == EPERM => match kernel.setgroups_denied() {
+            Some(true) => Ok(SupplementaryGroups::KeptSetgroupsDenied { kept: before }),
+            _ => Err(ExecError::new(
+                ErrorCode::PermissionDenied,
+                stage,
+                "cannot clear the supplementary groups: setgroups(0) was refused and the user namespace is not confirmed to deny setgroups",
+            )),
+        },
+        Err(e) => Err(fail(e, "setgroups(0)")),
+    }
 }
 
 /// `set` から `minus` の要素を除いた集合。
@@ -294,6 +544,35 @@ pub(super) mod testing {
         apply_capabilities_single_threaded(CapabilitySet::oci_default(), &mut k)
     }
 
+    thread_local! {
+        static GROUPS_BEFORE_JOIN: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// 次の 1 回だけ、参加前の補助グループの偽物が持つ件数を設定する（使うと 0 へ戻る）。
+    pub(in crate::exec) fn fake_groups_before_join(count: usize) {
+        GROUPS_BEFORE_JOIN.with(|c| c.set(count));
+    }
+
+    /// `reapply.rs` が `cfg(test)` で呼ぶ偽物（libtest のプロセスの資格情報は変えない）。本物の判定ロジックを
+    /// 偽カーネルで走らせ、呼ばれたことを記録する。
+    pub(in crate::exec) fn clear_supplementary_groups_before_join(
+        _threads: &mut super::ThreadCountSource,
+        _own_proc_dir: std::os::fd::BorrowedFd<'_>,
+    ) -> Result<super::SupplementaryGroups, ExecError> {
+        crate::exec::no_new_privs::testing::rec("setgroups_before_join");
+        let mut k = Fake::new();
+        k.groups = GROUPS_BEFORE_JOIN.with(Cell::take);
+        super::clear_groups_single_threaded(&mut k)
+    }
+
+    /// `reapply.rs` が `cfg(test)` で呼ぶ偽物（スレッド数の取得元は偽カーネルが持つため無視する）。
+    pub(in crate::exec) fn apply_default_capabilities_with(
+        _threads: &mut super::ThreadCountSource,
+        _own_proc_dir: Option<std::os::fd::BorrowedFd<'_>>,
+    ) -> Result<CapabilityReport, ExecError> {
+        apply_default_capabilities()
+    }
+
     /// 偽カーネルの状態と、呼び出し記録・注入するエラー。
     pub(super) struct Fake {
         pub(super) bounding: u64,
@@ -311,6 +590,14 @@ pub(super) mod testing {
         /// 2 回目以降の `thread_count` の戻り値（適用中にスレッドが増えた状況を作る）。`None` なら `threads` のまま。
         pub(super) threads_later: Option<Option<u64>>,
         pub(super) thread_queries: u32,
+        /// 補助グループの件数（既定は 0 = 元から空）。
+        pub(super) groups: usize,
+        /// `setgroups(0)` に返させるエラー。
+        pub(super) setgroups_err: Option<SysError>,
+        /// `setgroups(0)` が成功を返すが消去しない（読み戻し検証の不一致を作る）。
+        pub(super) setgroups_noop: bool,
+        /// procfs の `setgroups` の確認結果（既定は `allow` = `Some(false)`）。
+        pub(super) setgroups_denied: Option<bool>,
     }
 
     impl Fake {
@@ -332,6 +619,10 @@ pub(super) mod testing {
                 threads: Some(1),
                 threads_later: None,
                 thread_queries: 0,
+                groups: 0,
+                setgroups_err: None,
+                setgroups_noop: false,
+                setgroups_denied: Some(false),
             }
         }
     }
@@ -375,6 +666,26 @@ pub(super) mod testing {
                 Some(later) if self.thread_queries > 1 => later,
                 _ => self.threads,
             }
+        }
+
+        fn supplementary_group_count(&mut self) -> Result<usize, SysError> {
+            Ok(self.groups)
+        }
+
+        fn setgroups_denied(&mut self) -> Option<bool> {
+            self.calls.push("read_setgroups");
+            self.setgroups_denied
+        }
+
+        fn clear_supplementary_groups(&mut self) -> Result<(), SysError> {
+            self.calls.push("setgroups");
+            if let Some(e) = self.setgroups_err {
+                return Err(e);
+            }
+            if !self.setgroups_noop {
+                self.groups = 0;
+            }
+            Ok(())
         }
 
         fn set(&mut self, caps: ThreadCaps) -> Result<(), SysError> {
@@ -467,6 +778,193 @@ mod tests {
         k.bounding = 0xFF; // 既定外の番号 2 が drop 対象になる
         run(&mut k).unwrap();
         assert_eq!(k.calls, ["drop", "ambient", "capget", "capset", "capget"]);
+    }
+
+    /// SUP-6・SEC-1・TASK-163 追補（#1457）: 補助グループが元から空なら `setgroups` を呼ばず、結果に
+    /// `AlreadyEmpty` を記録する（既存の呼び出し順は変わらない）。
+    #[test]
+    fn sup6_sec1_task163_empty_supplementary_groups_need_no_syscall() {
+        let mut k = Fake::new();
+        let report = run(&mut k).unwrap();
+        assert_eq!(
+            report.supplementary_groups,
+            SupplementaryGroups::AlreadyEmpty
+        );
+        assert_eq!(report.supplementary_groups.as_str(), "already_empty");
+        assert_eq!(report.supplementary_groups.remaining(), 0);
+        assert!(!k.calls.contains(&"setgroups"));
+    }
+
+    /// SUP-6・SEC-1・TASK-163 追補（#1457）: 補助グループは capability の削減より前に `setgroups(0)` で消去し、
+    /// 読み戻して空であることを確かめる（launch・exec が同じ関数を通る）。
+    #[test]
+    fn sup6_sec1_task163_supplementary_groups_are_cleared_before_capability_drop() {
+        let mut k = Fake::new();
+        k.bounding = 0xFF;
+        k.groups = 3;
+        let report = run(&mut k).unwrap();
+        assert_eq!(
+            report.supplementary_groups,
+            SupplementaryGroups::Cleared { cleared: 3 }
+        );
+        assert_eq!(report.supplementary_groups.as_str(), "cleared");
+        assert_eq!(report.supplementary_groups.remaining(), 0);
+        assert_eq!(k.groups, 0);
+        assert_eq!(
+            k.calls,
+            ["setgroups", "drop", "ambient", "capget", "capset", "capget"]
+        );
+    }
+
+    /// SUP-6・SEC-5・TASK-163 追補（#1457）: `setgroups` が `EPERM` で、procfs で user namespace の `deny` を確認
+    /// できた場合（rootless）は、現状のまま残して結果に記録し、capability の削減は続ける（rootless の launch を
+    /// 壊さない）。`CAP_SETGID` の有無は判定に使わない。
+    #[test]
+    fn sup6_sec5_task163_setgroups_denied_in_user_namespace_is_recorded() {
+        for effective in [[u32::MAX, 0x1FF], [!(1 << 6), 0x1FF]] {
+            let mut k = Fake::new();
+            k.groups = 4;
+            k.setgroups_err = Some(SysError::Os(EPERM));
+            k.setgroups_denied = Some(true);
+            k.caps.effective = effective;
+            let report = run(&mut k).unwrap();
+            assert_eq!(
+                report.supplementary_groups,
+                SupplementaryGroups::KeptSetgroupsDenied { kept: 4 }
+            );
+            assert_eq!(
+                report.supplementary_groups.as_str(),
+                "kept_setgroups_denied"
+            );
+            assert_eq!(report.supplementary_groups.remaining(), 4);
+            assert_eq!(k.groups, 4);
+            assert_eq!(report.bounding, CapabilitySet::oci_default());
+            assert_eq!(k.calls.first().copied(), Some("setgroups"));
+            assert_eq!(k.calls.get(1).copied(), Some("read_setgroups"));
+        }
+    }
+
+    /// SUP-6・SEC-1・TASK-163 追補（#1457）: 補助グループを消去できず、user namespace の `deny` を確認できない
+    /// 場合は、何も削減せずに拒否する（fail-closed。ホスト側の補助グループを持ち越したまま進めない）。
+    /// `CAP_SETGID` を持っていても、`EPERM` だけでは `deny` とみなさない（継承した seccomp フィルタ等でも
+    /// `EPERM` になるため）。
+    #[test]
+    fn sup6_sec1_task163_uncleared_supplementary_groups_fail_closed() {
+        // `setgroups` は `allow`（初期 user namespace 等）・確認できない、のどちらでも拒否する。
+        for denied in [Some(false), None] {
+            let mut k = Fake::new();
+            k.groups = 2;
+            k.setgroups_err = Some(SysError::Os(EPERM));
+            k.setgroups_denied = denied;
+            let e = run(&mut k).unwrap_err();
+            assert_eq!(
+                (e.code, e.stage),
+                (ErrorCode::PermissionDenied, IsolationStage::CapabilityDrop)
+            );
+            assert_eq!(
+                e.message,
+                "cannot clear the supplementary groups: setgroups(0) was refused and the user \
+                 namespace is not confirmed to deny setgroups"
+            );
+            assert_eq!(k.calls, ["setgroups", "read_setgroups"]);
+            assert_eq!(k.groups, 2);
+        }
+
+        // その他の errno は、`deny` であっても残す理由にしない。
+        let mut k = Fake::new();
+        k.groups = 2;
+        k.setgroups_err = Some(SysError::Os(EINVAL));
+        k.setgroups_denied = Some(true);
+        let e = run(&mut k).unwrap_err();
+        assert_eq!(e.stage, IsolationStage::CapabilityDrop);
+        assert_eq!(k.calls, ["setgroups"]);
+
+        // 成功を返したのに残っている（読み戻しの不一致）。
+        let mut k = Fake::new();
+        k.groups = 2;
+        k.setgroups_noop = true;
+        let e = run(&mut k).unwrap_err();
+        assert_eq!(
+            (e.code, e.stage),
+            (ErrorCode::Internal, IsolationStage::CapabilityDrop)
+        );
+        assert_eq!(e.message, "supplementary groups remain after setgroups(0)");
+        assert_eq!(k.calls, ["setgroups"]);
+    }
+
+    /// SUP-6・SEC-5・TASK-163 追補（#1457）: `setgroups` の設定は procfs からだけ読む。テストプロセス自身の値は
+    /// `/proc/self/setgroups` と一致し、自分の procfs ディレクトリの fd からも同じ値が得られる。procfs でない
+    /// ディレクトリの同名ファイルは信用しない。
+    #[test]
+    fn sup6_sec5_task163_setgroups_policy_is_read_from_procfs_only() {
+        let expected = match std::fs::read_to_string("/proc/self/setgroups")
+            .unwrap()
+            .as_str()
+        {
+            "deny\n" => Some(true),
+            "allow\n" => Some(false),
+            other => panic!("unexpected setgroups content: {other:?}"),
+        };
+        assert_eq!(read_setgroups_denied(None), expected);
+        let own = std::ffi::CString::new(format!("/proc/{}", std::process::id())).unwrap();
+        let own = sys::open_dir_path_nofollow(None, &own).unwrap();
+        assert_eq!(read_setgroups_denied(Some(own.as_fd())), expected);
+
+        let dir = std::env::temp_dir().join(format!(
+            "fandhe-setgroups-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos())
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("setgroups"), "deny\n").unwrap();
+        let fake = std::os::fd::OwnedFd::from(std::fs::File::open(&dir).unwrap());
+        assert_eq!(read_setgroups_denied(Some(fake.as_fd())), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// SUP-6・SEC-1・SEC-5・TASK-163 追補（#1457）: 参加前の消去は単一スレッドでだけ行い、capability には触れない。
+    /// 初期 user namespace の root 相当（`setgroups` が通る）は消去され、非特権で消せず `deny` も確認できなければ
+    /// 準備の時点で拒否する（exec を起動した側のグループをコンテナへ持ち込まない）。
+    #[test]
+    fn sup6_sec1_task163_groups_are_cleared_before_joining_namespaces() {
+        let mut k = Fake::new();
+        k.groups = 5;
+        assert_eq!(
+            clear_groups_single_threaded(&mut k).unwrap(),
+            SupplementaryGroups::Cleared { cleared: 5 }
+        );
+        assert_eq!(k.calls, ["setgroups"]);
+        assert_eq!(k.bounding, (1u64 << 41) - 1);
+
+        // 起動者が既に `deny` の user namespace の中にいる場合だけ、残して記録する。
+        let mut k = Fake::new();
+        k.groups = 5;
+        k.setgroups_err = Some(SysError::Os(EPERM));
+        k.setgroups_denied = Some(true);
+        assert_eq!(
+            clear_groups_single_threaded(&mut k).unwrap(),
+            SupplementaryGroups::KeptSetgroupsDenied { kept: 5 }
+        );
+
+        let mut k = Fake::new();
+        k.groups = 5;
+        k.setgroups_err = Some(SysError::Os(EPERM));
+        let e = clear_groups_single_threaded(&mut k).unwrap_err();
+        assert_eq!(
+            (e.code, e.stage),
+            (ErrorCode::PermissionDenied, IsolationStage::CapabilityDrop)
+        );
+
+        // 単一スレッドでなければ何も呼ばない。
+        let mut k = Fake::new();
+        k.groups = 5;
+        k.threads = Some(2);
+        let e = clear_groups_single_threaded(&mut k).unwrap_err();
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(k.calls, Vec::<&str>::new());
+        assert_eq!(k.groups, 5);
     }
 
     /// SEC-1: capset に渡る値は effective = permitted = 既定集合、inheritable = 空。
@@ -570,6 +1068,40 @@ mod tests {
         helper.join().unwrap();
     }
 
+    /// SUP-6・SEC-1・TASK-163.4: スレッド数の取得元を `setns` 前に開いた status fd に替えても、`Threads:` が 1 で
+    /// なければ何も変更せず `FailedPrecondition`（検査は弱まらない）。読めない取得元も同じ（fail-closed）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sup6_task163_4_pre_opened_thread_source_is_enforced() {
+        use std::io::{Seek as _, Write as _};
+        let before = status_value("CapBnd:");
+        let path = std::env::temp_dir().join(format!("fandhe-cap-threads-{}", std::process::id()));
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("create");
+        std::fs::remove_file(&path).expect("unlink");
+        writeln!(f, "Threads:\t2").expect("write");
+        f.seek(std::io::SeekFrom::Start(0)).expect("seek");
+        let mut sources = [
+            ThreadCountSource::PreOpened(f),
+            ThreadCountSource::PreOpened(std::fs::File::open("/dev/null").expect("null")),
+        ];
+        for source in &mut sources {
+            let e = apply_default_capabilities_with(source, None).unwrap_err();
+            assert_eq!(e.code, ErrorCode::FailedPrecondition);
+            assert_eq!(e.stage, IsolationStage::CapabilityDrop);
+            assert_eq!(
+                e.message,
+                "capability drop requires a single-threaded process (Threads: 1)"
+            );
+        }
+        assert_eq!(status_value("CapBnd:"), before);
+    }
+
     /// SEC-1: drop の EPERM は PermissionDenied・段は CapabilityDrop・後続を呼ばない。
     #[test]
     fn sec1_drop_eperm_maps_permission_denied_and_stops() {
@@ -635,16 +1167,53 @@ mod tests {
             let prm = status_value("CapPrm:");
             let eff = status_value("CapEff:");
             let bnd_has_extra = bnd & !DEFAULT_MASK & ((1u64 << 41) - 1) != 0;
+            // TASK-163 追補（#1457）: 補助グループの消去が先に走る。`CAP_SETGID` を持たず補助グループが残る
+            // 非特権のスレッドは、bounding set に触れる前にそこで拒否される（どちらの拒否かを文言で区別する）。
+            let groups = sys::supplementary_group_count().unwrap();
+            // `CAP_SETGID`（番号 6）が無ければ `setgroups` は `EPERM`。`deny` の user namespace の中なら残して進む。
+            let groups_refused = groups > 0
+                && eff & (1 << 6) == 0
+                && read_setgroups_denied(None) != Some(true);
             if eff & (1 << 8) == 0 {
-                if bnd_has_extra {
-                    let e = apply_capabilities(CapabilitySet::oci_default(), &mut RealKernel)
-                        .unwrap_err();
+                if groups_refused || bnd_has_extra {
+                    let mut threads = ThreadCountSource::ProcSelf;
+                    let e = apply_capabilities(
+                        CapabilitySet::oci_default(),
+                        &mut RealKernel {
+                            threads: &mut threads,
+                            own_proc_dir: None,
+                        },
+                    )
+                    .unwrap_err();
                     assert_eq!(e.code, ErrorCode::PermissionDenied);
                     assert_eq!(e.stage, IsolationStage::CapabilityDrop);
+                    if groups_refused {
+                        assert_eq!(
+                            e.message,
+                            "cannot clear the supplementary groups: setgroups(0) was refused and the \
+                             user namespace is not confirmed to deny setgroups"
+                        );
+                        // 何も変わっていない（補助グループも bounding set も元のまま）。
+                        assert_eq!(sys::supplementary_group_count(), Ok(groups));
+                        assert_eq!(status_value("CapBnd:"), bnd);
+                    } else {
+                        assert!(
+                            e.message.starts_with("prctl(PR_CAPBSET_DROP) failed"),
+                            "{}",
+                            e.message
+                        );
+                    }
                 }
             } else {
-                let report =
-                    apply_capabilities(CapabilitySet::oci_default(), &mut RealKernel).unwrap();
+                let mut threads = ThreadCountSource::ProcSelf;
+                let report = apply_capabilities(
+                    CapabilitySet::oci_default(),
+                    &mut RealKernel {
+                        threads: &mut threads,
+                        own_proc_dir: None,
+                    },
+                )
+                .unwrap();
                 assert_eq!(status_value("CapBnd:"), bnd & DEFAULT_MASK);
                 assert_eq!(status_value("CapEff:"), prm & DEFAULT_MASK);
                 assert_eq!(status_value("CapPrm:"), prm & DEFAULT_MASK);

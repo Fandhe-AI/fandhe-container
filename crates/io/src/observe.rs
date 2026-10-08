@@ -51,7 +51,7 @@ use crate::protocol::FrameKind;
 /// # 借用型である理由（#73 P0 再指摘対応。REPAIR-5「不安全な設計」観点）
 ///
 /// `error` の `message`（[`SendEventError::message`]）は呼び出し元
-/// （[`crate::client::PipelineClient::notify`]）がすでに保持している
+/// （`crate::client::PipelineClient::notify`）がすでに保持している
 /// [`crate::error::IoError`] の内部文字列を借用するだけで、複製しない。
 /// [`SendObserver::on_send`] は `&SendEvent<'_>` を受け取る間だけ有効な借用で、
 /// 呼び出しが終われば無効になる（`'static` としてどこかへ保持できない）。
@@ -95,8 +95,9 @@ impl fmt::Debug for SendEvent<'_> {
 /// # 借用は呼び出し中のみ有効（#73 P0 再指摘対応。REPAIR-5）
 ///
 /// `message` は [`crate::error::IoError::message`] を複製せず借用する。
-/// untrusted な相手側（トランスポートの先）由来の文字列で、長さの上限はこの型
-/// 自体では設けていない。[`SendObserver::on_send`] の呼び出しが終わると
+/// untrusted な相手側（トランスポートの先）由来の文字列を含みうる。`IoError` 由来
+/// なら [`crate::MAX_IO_ERROR_MESSAGE_BYTES`] 以下だが、イベント型を直接組み立てる
+/// 経路があるため、この型自体では長さの上限を設けていない。[`SendObserver::on_send`] の呼び出しが終わると
 /// この借用は無効になるため、`on_send` の実装が `message` を保持したい場合は、
 /// 呼び出し中に上限（[`MAX_SEND_LOG_MESSAGE_BYTES`] 等）を適用してからコピーする
 /// こと（[`JsonLinesSendObserver`] の実装を参照）。
@@ -113,7 +114,7 @@ pub struct SendEventError<'a> {
 
 /// ためた `message` を無制限に出さないよう、長さと切り詰め済みの先頭のみを出す
 /// 手書きの `Debug`（#73 P0 再指摘対応。`{:?}` 経由で全量が出力される経路を防ぐ。
-/// [`truncate_message_bytes`] を再利用する）。
+/// `truncate_message_bytes` を再利用する）。
 impl fmt::Debug for SendEventError<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (prefix, truncated) = truncate_message_bytes(self.message);
@@ -136,7 +137,7 @@ impl fmt::Debug for SendEventError<'_> {
 /// # 借用型である理由
 ///
 /// [`SendEvent`] のドキュメント参照。`error`（[`AckEventError::message`]）は
-/// 呼び出し元（[`crate::client::PipelineClient::notify_ack`]）が保持する
+/// 呼び出し元（`crate::client::PipelineClient::notify_ack`）が保持する
 /// [`crate::error::IoError`] の内部文字列を借用するだけで、複製しない。
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -285,8 +286,15 @@ const _: () = assert!(
 ///
 /// `capacity`（行数上限）だけでは、1 行あたりのメッセージが巨大な場合に
 /// キュー全体のメモリ使用量が無制限に膨らみうる。エンコード前にこの長さで
-/// 切り詰め、UTF-8 の文字境界を跨がないよう調整する（[`truncate_message_bytes`]）。
+/// 切り詰め、UTF-8 の文字境界を跨がないよう調整する（`truncate_message_bytes`）。
 pub const MAX_SEND_LOG_MESSAGE_BYTES: usize = 512;
+
+// `IoError` 側の上限で切られたメッセージ（文字境界調整で最大 3 バイト減る）が観測ログでも
+// 必ず `message_truncated: true` になるよう、観測ログ側の上限より大きく保つ（#1116）。
+const _: () = assert!(
+    crate::error::MAX_IO_ERROR_MESSAGE_BYTES - 3 > MAX_SEND_LOG_MESSAGE_BYTES,
+    "MAX_IO_ERROR_MESSAGE_BYTES は MAX_SEND_LOG_MESSAGE_BYTES より大きくなければならない"
+);
 
 /// [`JsonLinesSendObserver`] がためる JSON 行の合計バイト数の上限
 /// （codex P0 再指摘対応。security.md「不安全な設計」観点）。
@@ -490,7 +498,7 @@ impl BoundedJsonLines {
 /// 本 crate は `serde_json` 等へ依存しない（dependency-policy）。JSON は手書きで
 /// 組み立てるため、固定語彙のフィールド（`event`・`kind`・`outcome`・`reason`・
 /// `code`）はエスケープ不要な既知の値のみを書き込み、`message` のような任意文字列
-/// （untrusted なトランスポート由来を含みうる）だけを [`escape_json_string`] で
+/// （untrusted なトランスポート由来を含みうる）だけを `escape_json_string` で
 /// エスケープする。
 ///
 /// # `on_send` は I/O をしない（REPAIR-5。codex 再指摘対応）
@@ -647,21 +655,7 @@ fn escape_json_string(input: &str) -> String {
 /// 添字アクセスで不正境界を指すと panic するため、`char_indices` で安全に判定
 /// する）。戻り値は `(切り詰め後の文字列, 切り詰めが発生したか)`。
 pub(crate) fn truncate_message_bytes(message: &str) -> (&str, bool) {
-    if message.len() <= MAX_SEND_LOG_MESSAGE_BYTES {
-        return (message, false);
-    }
-    let mut end = 0;
-    for (idx, ch) in message.char_indices() {
-        let next = idx + ch.len_utf8();
-        if next > MAX_SEND_LOG_MESSAGE_BYTES {
-            break;
-        }
-        end = next;
-    }
-    // `get` で境界を確認してから切り出す（外部入力起点の文字列を添字アクセス
-    // しない。coding-rust.md「外部入力」観点）。`end` は上のループで確定した
-    // 文字境界のため必ず `Some` になるが、フォールバックとして空文字列にする。
-    (message.get(..end).unwrap_or(""), true)
+    crate::error::truncate_str_to_bytes(message, MAX_SEND_LOG_MESSAGE_BYTES)
 }
 
 /// [`SendEvent`] を 1 行の JSON Lines 文字列へエンコードする（改行は含まない）。
@@ -1713,6 +1707,25 @@ mod tests {
                  \"latency_us\":0}}"
             )]
         );
+    }
+
+    /// ERR-1・REPAIR-4（#1116）: `IoError` の上限で切られたメッセージは、観測ログでも
+    /// `message_truncated: true` になる。
+    #[test]
+    fn err1_io_error_truncated_message_is_also_truncated_in_send_log() {
+        let err = crate::IoError::new(IoErrorCode::Timeout, "a".repeat(2000));
+        assert!(err.message_truncated());
+        let mut observer = JsonLinesSendObserver::new();
+        observer.on_send(&failure_event(
+            FrameKind::Write,
+            SendOutcome::TransportFailure,
+            IoErrorCode::Timeout,
+            err.message(),
+            0,
+        ));
+        let lines = observer.drain_lines();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("\"message_truncated\":true"), "{lines:?}");
     }
 
     /// REPAIR-4・REPAIR-5（codex P0 再指摘対応）: マルチバイト文字（3 バイトの

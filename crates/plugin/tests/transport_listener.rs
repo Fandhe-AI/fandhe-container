@@ -60,7 +60,12 @@ mod unix {
         let dir = TempDir::new();
         let l = UdsListener::bind(&dir.sock()).unwrap();
         let h = connect_and_ping(l.path());
-        let mut s = l.accept(WAIT).unwrap();
+        let mut s = l
+            .accept(
+                WAIT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
         let mut buf = [0u8; 4];
         s.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"ping");
@@ -90,7 +95,12 @@ mod unix {
         let l = UdsListener::bind(&dir.sock()).unwrap();
         for _ in 0..2 {
             let h = connect_and_ping(l.path());
-            let mut s = l.accept(WAIT).unwrap();
+            let mut s = l
+                .accept(
+                    WAIT,
+                    &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+                )
+                .unwrap();
             let mut buf = [0u8; 4];
             s.read_exact(&mut buf).unwrap();
             assert_eq!(&buf, b"ping");
@@ -104,7 +114,12 @@ mod unix {
         let dir = TempDir::new();
         let l = UdsListener::bind(&dir.sock()).unwrap();
         let t = Instant::now();
-        let err = l.accept(Duration::from_millis(200)).unwrap_err();
+        let err = l
+            .accept(
+                Duration::from_millis(200),
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap_err();
         let el = t.elapsed();
         assert_eq!(err.code(), PluginErrorCode::Timeout);
         assert!(el >= Duration::from_millis(200), "{el:?}");
@@ -115,10 +130,18 @@ mod unix {
     fn repair5_accept_rejects_invalid_timeout() {
         let dir = TempDir::new();
         let l = UdsListener::bind(&dir.sock()).unwrap();
-        let e = l.accept(Duration::ZERO).unwrap_err();
+        let e = l
+            .accept(
+                Duration::ZERO,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
         let e = l
-            .accept(UDS_ACCEPT_TIMEOUT_MAX + Duration::from_secs(1))
+            .accept(
+                UDS_ACCEPT_TIMEOUT_MAX + Duration::from_secs(1),
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
             .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
     }
@@ -138,7 +161,12 @@ mod unix {
         // 生存判定は flock のため、拒否された bind は既存 listener の accept queue に何も残さない
         // （TASK-123.2）。最初の accept が実クライアントの接続になる。
         let h = connect_and_ping(l.path());
-        let mut s = l.accept(WAIT).unwrap();
+        let mut s = l
+            .accept(
+                WAIT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
         let mut buf = [0u8; 4];
         s.read_exact(&mut buf).unwrap();
         s.write_all(b"pong").unwrap();
@@ -228,7 +256,12 @@ mod unix {
         assert_eq!(l.path(), expected.as_path());
         assert_ne!(l.path(), requested.as_path());
         let h = connect_and_ping(&inner.join("s.sock"));
-        let mut s = l.accept(WAIT).unwrap();
+        let mut s = l
+            .accept(
+                WAIT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
         let mut buf = [0u8; 4];
         s.read_exact(&mut buf).unwrap();
         s.write_all(&buf).unwrap();
@@ -268,7 +301,12 @@ mod unix {
             .join("s.sock");
         assert_eq!(l.path(), expected.as_path());
         let h = connect_and_ping(l.path());
-        let mut s = l.accept(WAIT).unwrap();
+        let mut s = l
+            .accept(
+                WAIT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
         let mut buf = [0u8; 4];
         s.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"ping");
@@ -323,7 +361,12 @@ mod unix {
         let dir = TempDir::new();
         let l = UdsListener::bind(&dir.sock()).unwrap();
         let _c = UnixStream::connect(l.path()).unwrap();
-        let mut s = l.accept(WAIT).unwrap();
+        let mut s = l
+            .accept(
+                WAIT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
         let e = s.set_io_timeout(Duration::ZERO).unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
         s.set_io_timeout(Duration::from_millis(100)).unwrap();

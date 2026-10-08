@@ -27,9 +27,10 @@
 //! | `hang` | 60 秒眠る | 60 秒眠る |
 //! | `flood` | 128 KiB を出力（0） | 同左（0） |
 //!
-//! # マウント系モード（`mount_ok` / `mount_9p` / `mount_9p_unset` / `mount_9p_applied` / `mount_9p_launch` / `mount_launch` / `mount_unset`）
+//! # マウント系モード（`mount_ok` / `mount_9p` / `mount_9p_unset` / `mount_9p_applied` / `mount_9p_launch` / `mount_launch` / `mount_unset` / `mount_slow`）
 //!
-//! `--version` / `-l -v` は `ok` と同じ。加えて `--distribution Ubuntu --user root --exec <コマンド>` を受け付け、
+//! `--version` / `-l -v` は `ok` と同じ。`mount_slow` だけは `--version` と、共有マウントが 1 件も無い状態での
+//! `cat /proc/self/mountinfo`（準備の最初の読み取り）の応答前に [`SLOW_STEP`] だけ眠る（検出と準備が 1 つの合計期限を共有することの確認用。REPAIR-5）。加えて `--distribution Ubuntu --user root --exec <コマンド>` を受け付け、
 //! ゲストのマウント表を実行ファイルと同じ場所の `<実行ファイル名>.state`（行ごとに `ID<TAB>マウント先<TAB>
 //! オプション<TAB>fstype`）に保持して、呼び出しをまたいで状態を持つ。状態ファイルが無ければ `/`（ID 1・ext4）
 //! だけの表から始める。結合試験はモードごとに別の状態ファイルを使い、開始時に削除して初期化する。
@@ -55,6 +56,10 @@ const V1_LIST: &str = "  NAME      STATE      VERSION\r\n* Legacy    Running    
 const NO_DISTRO: &str = "Windows Subsystem for Linux has no installed distributions.\r\nUse 'wsl.exe --list --online' to list available distributions\r\nand 'wsl.exe --install <Distro>' to install.\r\nError code: Wsl/WSL_E_DEFAULT_DISTRO_NOT_FOUND\r\n";
 const DISABLED: &str = "The Windows Subsystem for Linux optional component is not enabled.\r\nError code: Wsl/WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED\r\n";
 const DENIED: &str = "Access is denied.\r\nError code: Wsl/Service/E_ACCESSDENIED\r\n";
+
+/// `mount_slow` モードが `--version` と最初の mountinfo の応答前に眠る時間（`tests/wsl2_mount.rs` の期限はこの値を
+/// 前提にしている）。
+const SLOW_STEP: Duration = Duration::from_millis(600);
 
 /// 呼び出された引数の種類。
 enum Call {
@@ -104,6 +109,10 @@ fn guest_exec(mode: &str, cmd: &[&str]) -> ExitCode {
     };
     match cmd {
         ["cat", "/proc/self/mountinfo"] => {
+            // 共有マウントがまだ無いとき（準備の最初の読み取り）だけ遅らせる。
+            if mode == "mount_slow" && rows.len() <= 1 {
+                std::thread::sleep(SLOW_STEP);
+            }
             let text: String = rows
                 .iter()
                 .enumerate()
@@ -209,6 +218,7 @@ fn main() -> ExitCode {
             | "mount_9p_launch"
             | "mount_launch"
             | "mount_unset"
+            | "mount_slow"
     );
     match (mode.as_str(), call) {
         (_, Call::Exec(cmd)) if mount_mode => {
@@ -216,6 +226,10 @@ fn main() -> ExitCode {
             guest_exec(&mode, &cmd)
         }
         (_, Call::Exec(_)) => ExitCode::from(64),
+        ("mount_slow", Call::Version) => {
+            std::thread::sleep(SLOW_STEP);
+            emit(EN_VERSION.as_bytes(), 0)
+        }
         (_, Call::Version) if mount_mode => emit(EN_VERSION.as_bytes(), 0),
         (_, Call::List) if mount_mode => emit(EN_LIST.as_bytes(), 0),
         ("ok" | "nodistro" | "v1only", Call::Version) => emit(EN_VERSION.as_bytes(), 0),

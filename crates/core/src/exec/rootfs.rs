@@ -596,23 +596,17 @@ mod tests {
         (binds, mounts, switches)
     }
 
-    /// テスト用の一時ディレクトリ（drop で削除）。
-    struct Tmp(PathBuf);
+    /// テスト用の一時ディレクトリ。`.0` は guard と同じパスで、削除は guard の drop が行う（#1298）。
+    struct Tmp(
+        PathBuf,
+        #[allow(dead_code)] crate::test_support::TestTempDir,
+    );
 
     impl Tmp {
         fn new(label: &str) -> Self {
-            let base = std::fs::canonicalize(std::env::temp_dir())
-                .unwrap()
-                .join(format!("fandhe-rootfs-{label}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&base);
-            std::fs::create_dir_all(&base).unwrap();
-            Self(base)
-        }
-    }
-
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            let guard = crate::test_support::TestTempDir::new(&format!("rootfs-{label}"))
+                .expect("create exclusive temp dir");
+            Self(guard.path().to_path_buf(), guard)
         }
     }
 

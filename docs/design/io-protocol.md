@@ -197,7 +197,7 @@ serde 等の外部クレートを使わず、std のみでヘッダ・チェッ�
 6. `header.body_len()`（検証済みの `payload_len + CHECKSUM_LEN`。失敗しない）を期待される本体長とし、実際の本体長と比較。不一致なら `IoErrorCode::InvalidArgument`（チェックサム不一致とは別コード）
 7. `prefix_bytes()`（ヘッダの意味あるフィールド。6 バイト。`header_crc` を含まない）＋ペイロードから再計算した CRC-32C とトレーラの値を比較。不一致なら `IoErrorCode::DataLoss`
 
-申告長に比例するペイロード用バッファの確保（`copy_validated_payload`。非公開関数）は上記 1〜7 をすべて通過した後の 1 か所だけで行い（所有権を受け取る変種 `Frame::decode_body_owned` は呼び出し元が確保済みの本体を再利用し、新たに確保しない）、これをユニットテスト（`repair2_decode_rejects_over_max_len_before_allocation` 等。TASK-83.2・#117）で確かめる。「アロケーション」はここでは申告長に比例するペイロード用バッファの確保を指し、`IoError` の message（`String`）の確保はサイズが一定の上限に収まるため対象外とする。
+申告長に比例するペイロード用バッファの確保（`copy_validated_payload`。非公開関数）は上記 1〜7 をすべて通過した後の 1 か所だけで行い（所有権を受け取る変種 `Frame::decode_body_owned` は呼び出し元が確保済みの本体を再利用し、新たに確保しない）、これをユニットテスト（`repair2_decode_rejects_over_max_len_before_allocation` 等。TASK-83.2・#117）で確かめる。「アロケーション」はここでは申告長に比例するペイロード用バッファの確保を指し、`IoError` の message（`String`）の確保は `IoError::new` が `MAX_IO_ERROR_MESSAGE_BYTES`（1024 バイト。UTF-8 の文字境界で切り捨て、`message_truncated()` で判別できる。#1116）へ切り詰めるため対象外とする。観測ログの `message`（512 バイト）より大きい値にしてあり、`IoError` 側で切られたメッセージは観測ログでも必ず `message_truncated: true` になる。
 
 ### ストリーム読みの手順（TASK-12・TASK-13 が実装する想定。REPAIR-5・REPAIR-6）
 

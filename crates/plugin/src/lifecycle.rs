@@ -28,6 +28,14 @@
 //!   読み捨てて件数だけ数える）。親の stderr・構造化ログへ内容を転記しない（量の上限なしの出力・
 //!   ログ行の偽装を防ぐ）。子から見た stderr は端末でも pipe でもなくソケットで、書き込みは pipe と
 //!   同様に扱える（`/dev/stderr` の開き直しは Linux では失敗する）。
+//! - 親の強制終了時の停止（#1514・#1403 の方式 B・PLUG-7・REPAIR-5・CORE-1）: Linux では spawn 直前に
+//!   `prctl(PR_SET_PDEATHSIG, SIGKILL)` を子へ設定し、親が SIGKILL・abort で落ちても plugin 本体が
+//!   孤児で残らないようにする（fork から prctl までに親が先に終わった競合は `getppid` の照合で exec を
+//!   中止して拾う）。効くのは直接の子だけで、孫には届かない（未実装節の孫の項目と #1397・#1513 を参照）。
+//!   発火条件は子を fork した**スレッド**の終了で、都度起動は呼び出しスレッド上で完結するため影響しない
+//!   （常駐モードの契約は `resident` を参照）。setuid・ファイル capability つき実行ファイルでは設定が
+//!   解除される。macOS には同等の機構がなく親の強制終了で残留し得る（kqueue `NOTE_EXIT` は将来課題）。
+//!   Windows は対象外。
 //! - stderr の読み取りスレッドは呼び出しごとに 1 本で、[`call_once`] が戻るまでに停止させる
 //!   （呼び出しを繰り返してもスレッドが増え続けない）。子の回収後 [`ONE_SHOT_STDERR_DRAIN_TIMEOUT`]
 //!   以内に終端へ達しなければ、ソケットを shutdown して読み取りを打ち切る。
@@ -43,8 +51,11 @@
 //!   （プロセスグループ単位の kill が無く、相当する Job Object は別タスク）では孫が残る。孫が stderr の
 //!   書き込み端を保持し続けた場合、収集は [`ONE_SHOT_STDERR_DRAIN_TIMEOUT`] で打ち切り、
 //!   [`OneShotStderr::is_complete`] が false になる。打ち切り後は読み取り側を閉じるため、孫の以後の
-//!   書き込みは `EPIPE` になる。子は親と別のプロセスグループになるため、端末由来のシグナル（Ctrl-C 等）を
-//!   親と同時には受けず、停止は親側の kill（タイムアウト・shutdown・`Drop`）のみに依る。
+//!   書き込みは `EPIPE` になる。子は親と別のプロセスグループになるため、端末由来のシグナル（Ctrl-C 等）は
+//!   カーネルからは届かない。親が受けた SIGINT・SIGTERM・SIGHUP は CLI バイナリのハンドラが
+//!   `signal_forward` 経由でグループ宛て（`kill(-pid)`）に転送し、孫まで届く（#1513）。親が SIGKILL・
+//!   abort で落ちた場合は転送されず、Linux の `PR_SET_PDEATHSIG` が止めるのは plugin 本体だけで孫は
+//!   残留し得る。macOS では plugin 本体も孫も残留し得る（kqueue `NOTE_EXIT` は将来課題）。
 //! - 要求 ID と応答 ID の対応づけ（TASK-114）。
 
 mod mode;
@@ -63,6 +74,7 @@ pub use resident::{
 
 use crate::error::{PluginError, PluginErrorCode};
 use crate::frame::Frame;
+use crate::signal_forward::{PLUGIN_REGISTRY, Registry, SlotToken};
 use crate::transport::{RpcTimeout, UdsListener};
 use std::ffi::OsString;
 use std::io::{self, Read};
@@ -482,8 +494,12 @@ struct ChildGuard {
     child: Option<Child>,
     /// 未回収として pid を報告済みか。true なら `Drop` で回収しない。
     reported_unreaped: bool,
+    /// シグナル転送の登録表のスロット（#1513）。子を回収し得る `waitpid` の前に登録を外し、回収した時点で
+    /// 解放する。回収後に再利用された pid へシグナルを送らないための構造で、回収は必ず
+    /// [`Self::try_wait`] / [`Self::kill_and_reap`] を経由する。
+    slot: Option<SlotToken>,
     /// 直接の子（プロセスグループのリーダー）を wait 済みか。true ならグループ宛ての送信をしない。
-    /// 回収後は pid（= pgid）が再利用され得るため、別プロセスのグループへ誤送信しないための印
+    /// 回収後は pid（= pgid）が再利用され得るため、別プロセスのグループへ誤送信しないための印。
     /// `try_wait` が `Some` を返した時点で立てる。`Err`（状態確認の失敗）は回収済みの証明にならない
     /// ため立てず、グループ宛ての SIGKILL を省略しない（孫が残り得る。#1311・PLUG-7・REPAIR-5）。
     leader_reaped: bool,
@@ -494,23 +510,48 @@ impl ChildGuard {
         Self {
             child: Some(child),
             reported_unreaped: false,
+            slot: None,
             leader_reaped: false,
         }
+    }
+
+    /// 登録表のスロットを持たせる（[`spawn_registered`] が使う）。
+    fn with_slot(mut self, slot: SlotToken) -> Self {
+        self.slot = Some(slot);
+        self
     }
 
     fn pid(&self) -> Option<u32> {
         self.child.as_ref().map(Child::id)
     }
 
+    /// 終了を非ブロックで確認する。回収し得るため、直前に登録表から外し（進行中の転送の完了を待つ）、
+    /// まだ動いていれば戻す。外した窓の間に届いたシグナルは転送されない（取りこぼす側）。進行中の転送の
+    /// 完了を確認できないときは回収せず `Ok(None)`（まだ動いている扱い）を返し、次の周回に委ねる。
+    /// 将来 `suspend` を使わず pidfd 等で回収と転送の競合を除く案がある（現状は #1514 の `PR_SET_PDEATHSIG` で補完する）。
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        let result = match self.child.as_mut() {
-            Some(c) => c.try_wait(),
-            None => Ok(None),
+        let Some(c) = self.child.as_mut() else {
+            return Ok(None);
         };
-        // 回収済みが確定した（Some）場合だけ以後グループへ送らない。Err は状態不明のため、
-        // 立てずにグループ停止を試みられるようにする（fail-closed）。
-        if matches!(result, Ok(Some(_))) {
-            self.leader_reaped = true;
+        if let Some(slot) = &self.slot
+            && !slot.suspend()
+        {
+            slot.resume();
+            return Ok(None);
+        }
+        let result = c.try_wait();
+        match result {
+            // 回収した。pid は再利用され得るため、登録を戻さず解放する。グループ宛ての送信も止める。
+            Ok(Some(_)) => {
+                self.slot = None;
+                self.leader_reaped = true;
+            }
+            // Err は状態不明のため leader_reaped を立てない（グループ停止を試みられるようにする。fail-closed）。
+            _ => {
+                if let Some(slot) = &self.slot {
+                    slot.resume();
+                }
+            }
         }
         result
     }
@@ -518,6 +559,7 @@ impl ChildGuard {
     /// 子を回収済みとして手放す。以後 `kill_and_reap` は何も送らない。
     fn release_reaped(&mut self) {
         self.child = None;
+        self.slot = None;
         self.leader_reaped = true;
     }
 
@@ -534,6 +576,23 @@ impl ChildGuard {
         let Some(c) = self.child.as_mut() else {
             return Reap::AlreadyReaped;
         };
+        // 直後に SIGKILL するため転送は不要。以後の回収で pid が再利用され得るので、先に登録を外し、
+        // 進行中の転送の完了を待つ。上限内に確認できなければ回収しない（ロード済みの pid へ送信中の
+        // 転送スレッドが、回収後に再利用された pid へ送る誤配送を防ぐ。PLUG-7・fail-closed）。
+        // この場合も kill は安全（未回収の子の pid は再利用されない）なので送り、`Unreaped` を返す。
+        // `Child` は保持し続け、回収は行わない（pid を回収前に手放さない）。
+        if let Some(slot) = self.slot.take()
+            && !slot.suspend()
+        {
+            // 直接の子は未回収なので pid（= pgid）は再利用されず、グループへの送信は安全。
+            #[cfg(unix)]
+            if !self.leader_reaped {
+                let _ = crate::sys::kill_process_group(c.id());
+            }
+            let _ = c.kill();
+            self.slot = Some(slot);
+            return Reap::Unreaped;
+        }
         // 子のプロセスグループ全体（孫を含む）へ SIGKILL を 1 回送る（#1311）。リーダーを自分がまだ
         // wait していない間に限る。ゾンビでも未回収の間は pid（= pgid）が再利用されないため、送信先は
         // 自分が起動したグループに限られる。最初の `try_wait` より前に送るのは、自発終了済み（ゾンビ）の
@@ -748,12 +807,17 @@ fn spawn_error(e: &io::Error) -> PluginError {
 /// plugin の stderr は親へ継承させず [`OneShotOutcome::stderr`] で返す。本関数が親の stderr へ出す
 /// 構造化ログには、plugin の stderr の内容は含めず件数のみ載せる。失敗時の内容が必要な呼び出し側は
 /// [`call_once_observed`] の [`OneShotRecord::stderr`] を使う。
+///
+/// `audit` は受付で拒否した接続（UID・pid の不一致・取得失敗）の監査イベントの受け手で、拒否 1 件に
+/// つき 1 回、同期で呼ばれる（PLUG-12・SEC-4・TASK-124.5）。必須で、既定の出力先は無い（出力・永続化は
+/// 呼び出し側の責務。`crate::audit` のモジュール doc）。
 pub fn call_once(
     plugin: &OneShotPlugin,
     request: &Frame,
     timeout: OneShotTimeout,
+    audit: &mut dyn crate::audit::PeerAuthObserver,
 ) -> Result<OneShotOutcome, PluginError> {
-    call_once_observed(plugin, request, timeout, &mut |record| {
+    call_once_observed(plugin, request, timeout, audit, &mut |record| {
         use std::io::Write;
         // 構造化ログ（JSON Lines）を stderr へ 1 行出す。書き込み失敗は呼び出し結果に影響させない。
         let _ = writeln!(io::stderr(), "{}", record.to_json_line());
@@ -809,15 +873,17 @@ impl OneShotRecord {
 /// [`call_once`] と同じ処理を行い、終了時に 1 件の [`OneShotRecord`] を `observer` へ渡す（REPAIR-4）。
 ///
 /// 成功・失敗のどの終了経路でも必ず 1 回だけ呼ばれる。`observer` は呼び出しスレッド上で同期的に
-/// 実行されるため、長時間ブロックしないこと。
+/// 実行されるため、長時間ブロックしないこと。`audit` は [`call_once`] と同じ（peer 認証の拒否イベントの
+/// 受け手。必須）。
 pub fn call_once_observed(
     plugin: &OneShotPlugin,
     request: &Frame,
     timeout: OneShotTimeout,
+    audit: &mut dyn crate::audit::PeerAuthObserver,
     observer: &mut dyn FnMut(&OneShotRecord),
 ) -> Result<OneShotOutcome, PluginError> {
     let start = Instant::now();
-    let (result, stderr) = call_once_inner(plugin, request, timeout);
+    let (result, stderr) = call_once_inner(plugin, request, timeout, audit, &PLUGIN_REGISTRY);
     observer(&OneShotRecord {
         operation: "plugin.call_once",
         success: result.is_ok(),
@@ -832,12 +898,33 @@ pub fn call_once_observed(
     })
 }
 
+/// plugin 本体（直接の子）を親の生存に結び付ける（Linux のみ。`PR_SET_PDEATHSIG`。#1514・#1403 の方式 B・
+/// PLUG-7・REPAIR-5・CORE-1）。都度起動 / 常駐の spawn 直前に呼び、spawn 箇所へ cfg を持ち込まない。
+/// Linux 以外では何もしない（macOS に同等の機構はなく残留し得る。Windows は対象外）。
+#[cfg(target_os = "linux")]
+fn bind_to_parent_lifetime(cmd: &mut Command) -> Result<(), PluginError> {
+    crate::sys::set_parent_death_sigkill(cmd, std::process::id()).map_err(|_| {
+        PluginError::new(
+            PluginErrorCode::Internal,
+            "failed to configure plugin parent-death signal",
+        )
+    })
+}
+
+/// Linux 以外では親死亡シグナルを設定しない（従来どおり起動する）。
+#[cfg(not(target_os = "linux"))]
+fn bind_to_parent_lifetime(_cmd: &mut Command) -> Result<(), PluginError> {
+    Ok(())
+}
+
 /// listener の bind・子の spawn・stderr の収集・往復・回収までを行う。戻り値の第 2 要素は、
 /// 成功・失敗のどちらでも子の回収後に確定した stderr の収集結果（spawn 前の失敗は空）。
 fn call_once_inner(
     plugin: &OneShotPlugin,
     request: &Frame,
     timeout: OneShotTimeout,
+    audit: &mut dyn crate::audit::PeerAuthObserver,
+    registry: &'static Registry,
 ) -> (
     Result<(Frame, OneShotTermination), PluginError>,
     OneShotStderr,
@@ -848,6 +935,8 @@ fn call_once_inner(
         return (Err(timeout_error()), OneShotStderr::empty());
     };
 
+    // 異常終了で残るこの名前の socket とロックファイルは、runtime directory の初期化時に掃除される
+    // （`RuntimeDir::sweep_one_shot_leftovers`。#1310）。呼び出しごとの列挙で境界レイテンシを増やさない。
     let name = format!(
         "oneshot-{}-{}.sock",
         std::process::id(),
@@ -871,10 +960,23 @@ fn call_once_inner(
             );
         }
     };
-    let spawned = spawn_plugin(&plugin.program, &plugin.args, listener.path(), child_stderr);
+    // `Command` は文の終わりで drop され、親側に書き込み端は残らない（終端の検出を妨げない）。
+    let spawned = {
+        let mut cmd = Command::new(&plugin.program);
+        cmd.args(&plugin.args)
+            .env_clear()
+            .env(PLUGIN_SOCKET_ENV, listener.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(child_stderr);
+        if let Err(e) = bind_to_parent_lifetime(&mut cmd) {
+            return (Err(e), OneShotStderr::empty());
+        }
+        spawn_registered(&mut cmd, registry)
+    };
     let mut guard = match spawned {
-        Ok(child) => ChildGuard::new(child),
-        Err(e) => return (Err(spawn_error(&e)), OneShotStderr::empty()),
+        Ok(g) => g,
+        Err(e) => return (Err(e), OneShotStderr::empty()),
     };
 
     // 接続待ちより前に読み取りを始める（子が接続前に大量に書いても詰まらせない）。
@@ -893,52 +995,41 @@ fn call_once_inner(
             return (Err(error), OneShotStderr::empty());
         }
     };
-    let result = exchange_and_reap(&mut guard, listener, request, deadline);
+    let result = exchange_and_reap(&mut guard, listener, request, deadline, audit);
     // 子の回収後に収集結果を受け取る。子が終了していれば書き込み端は閉じており即座に完了する。
     // 戻る時点で読み取りスレッドは停止している（停止を確認できなければ結果に記録する）。
     let stderr = capture.finish(ONE_SHOT_STDERR_DRAIN_TIMEOUT);
     (result, stderr)
 }
 
-/// plugin の子プロセスを起動する（都度起動・常駐の両モードが共用し、2 か所の起動条件を食い違わせない）。
+/// 登録表のスロットを確保してから子を spawn し、pid を登録したガードを返す（#1513・PLUG-7）。
 ///
-/// unix では子を新しいプロセスグループ（pgid == 子の pid）で起動する。`ChildGuard::kill_and_reap` が
-/// グループ全体へ SIGKILL を送り、plugin が起動した孫プロセスを残さないため（PLUG-7・REPAIR-5・#1311）。
-/// Windows にプロセスグループ単位の kill は無く、相当する Job Object は別タスクで、そもそも unix
-/// transport が無く子を spawn しないため対象外（現状維持）。
+/// unix では子を新しいプロセスグループ（pgid == 子の pid）で起動する（`process_group(0)`。#1311）。
+/// 都度起動・常駐の両モードがこの関数を共用するので 2 か所の起動条件は食い違わない。`ChildGuard::kill_and_reap` が
+/// グループ全体へ SIGKILL を送って plugin の孫を残さず、登録表のシグナル転送（#1513）も `kill(-pid)` で
+/// 孫まで届く。`PR_SET_PDEATHSIG`（#1514。`bind_to_parent_lifetime`）とは独立に併用できる（前者は `pre_exec`、
+/// 後者は fork 時のグループ設定で干渉しない）。
+/// Windows にプロセスグループ単位の kill は無く（Job Object は別タスク）、unix transport も無いため対象外。
 ///
-/// # 制限（未実装。REPAIR-3・#1311 の対象外）
-///
-/// 子は親と別のプロセスグループになるため、端末由来のシグナル（Ctrl-C の `SIGINT` 等。フォアグラウンドの
-/// プロセスグループ宛て）を親と同時には受けない。親が既定のシグナル処理や `SIGKILL` で `Drop` を経ずに
-/// 終了すると、plugin は接続の EOF を見て自発終了しない限り残り、孫も残る。親の異常終了時にグループを
-/// 止めるには、親より長く生きる監視役（ヘルパープロセス等）か、プロセス全体のシグナル処理方針（本 crate を
-/// 使う実行ファイル側でハンドラからグループへ転送する等）が必要で、crate 境界をまたぐ設計事項として本関数
-/// では扱わない。Linux の `PR_SET_PDEATHSIG` は採らない: 直接の子にしか届かずグループを止められず、
-/// 起動したスレッドの終了でも発火するため常駐セッションを別スレッドへ移すと誤って kill され、macOS に
-/// 相当する仕組みも無い。
-///
-/// `Command` は戻る前に drop する。stderr の書き込み端（`child_stderr`）を `Command` が保持し続けると
-/// 親側に書き込み端が残り、stderr の終端検出を妨げるため。
-fn spawn_plugin(
-    program: &Path,
-    args: &[OsString],
-    socket_path: &Path,
-    child_stderr: Stdio,
-) -> io::Result<Child> {
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .env_clear()
-        .env(PLUGIN_SOCKET_ENV, socket_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(child_stderr);
+/// 確保を spawn より前に行うので、表が満杯のときは子を一切起動せず `ResourceExhausted` で拒否する
+/// （fail-closed。追跡できない子を作らない）。spawn の失敗・pid の範囲外ではスロットを解放し、
+/// 起動済みの子は kill・回収する。`registry` は本番では [`PLUGIN_REGISTRY`]（テストは局所の表）。
+fn spawn_registered(
+    cmd: &mut Command,
+    registry: &'static Registry,
+) -> Result<ChildGuard, PluginError> {
+    let mut slot = registry.reserve()?;
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    cmd.spawn()
+    let child = cmd.spawn().map_err(|e| spawn_error(&e))?;
+    let pid = child.id();
+    // activate が失敗した場合は guard の Drop が子を kill・回収する。
+    let guard = ChildGuard::new(child);
+    slot.activate(pid)?;
+    Ok(guard.with_slot(slot))
 }
 
 /// 応答前の失敗経路で子を明示的に kill・回収する。回収を確認できなければ、元のエラーではなく
@@ -971,6 +1062,8 @@ fn unreaped_error(guard: &mut ChildGuard, phase: &str) -> PluginError {
     let message = match guard.pid() {
         Some(pid) => {
             guard.reported_unreaped = true;
+            // 以後は回収しないが、SIGKILL は送信済み。スロットのリークを防ぐため解放する。
+            guard.slot = None;
             format!("plugin process (pid {pid}) could not be reaped after {phase}")
         }
         None => format!("plugin process could not be reaped after {phase}"),
@@ -986,6 +1079,7 @@ fn exchange_and_reap(
     listener: UdsListener,
     request: &Frame,
     deadline: Instant,
+    audit: &mut dyn crate::audit::PeerAuthObserver,
 ) -> Result<(Frame, OneShotTermination), PluginError> {
     // 受付・往復はブロック内で完結させ、抜けた時点で接続を閉じて子に EOF を見せる
     // （続けて listener を drop して socket を unlink してから終了を待つ）。
@@ -1007,7 +1101,7 @@ fn exchange_and_reap(
                     "plugin exited before connecting",
                 )),
             };
-            listener.accept_peer_pid(left, child_pid, &mut check_child)?
+            listener.accept_peer_pid(left, child_pid, &mut check_child, audit)?
         };
         stream.write_frame(request, rpc_timeout(remaining(deadline)?)?)?;
         stream.read_frame(rpc_timeout(remaining(deadline)?)?)
@@ -1087,9 +1181,13 @@ mod tests {
         let plugin = OneShotPlugin::new(abs.into(), vec![], dir).unwrap();
         let req = Frame::new(Vec::new()).unwrap();
         let mut records = Vec::new();
-        let r = call_once_observed(&plugin, &req, OneShotTimeout::default(), &mut |rec| {
-            records.push(rec.clone())
-        });
+        let r = call_once_observed(
+            &plugin,
+            &req,
+            OneShotTimeout::default(),
+            &mut crate::audit::NoopPeerAuthObserver,
+            &mut |rec| records.push(rec.clone()),
+        );
         assert!(r.is_err());
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].operation, "plugin.call_once");
@@ -1146,6 +1244,149 @@ mod tests {
             classify_reaped(ExitStatus::from_raw(11)),
             OneShotTermination::Exited { code: None }
         );
+    }
+
+    /// テスト用の局所の登録表（グローバル表を汚さない）。
+    #[cfg(unix)]
+    fn local_registry(n: usize) -> &'static Registry {
+        use std::sync::atomic::AtomicI32;
+        let slots: &'static [AtomicI32] = Box::leak(
+            (0..n)
+                .map(|_| AtomicI32::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        Box::leak(Box::new(Registry::over(slots)))
+    }
+
+    #[cfg(unix)]
+    fn sh(script: &str) -> Command {
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        c
+    }
+
+    /// PLUG-7・#1513 (A3): 表が満杯なら子を起動せず `RESOURCE_EXHAUSTED` で拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_spawn_registered_rejects_when_table_full_without_spawning() {
+        let reg = local_registry(1);
+        let _held = reg.reserve().unwrap();
+        let marker = std::env::temp_dir().join(format!("fcos-spawn-marker-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!("touch '{}'", marker.display());
+        let e = spawn_registered(&mut sh(&script), reg).err().unwrap();
+        assert_eq!(e.code(), PluginErrorCode::ResourceExhausted);
+        assert_eq!(e.code().as_str(), "RESOURCE_EXHAUSTED");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!marker.exists(), "child must not be spawned");
+    }
+
+    /// PLUG-7・#1513 (A2): 登録は spawn 成功で載り、kill・回収・自発終了の回収・未回収報告のいずれでも外れる。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_registration_is_released_on_every_reap_path() {
+        use crate::signal_forward::ForwardSignal;
+        let reg = local_registry(4);
+        let targets = |r: &Registry| r.forward(ForwardSignal::Hangup).targets;
+        // 登録の有無（targets）だけを見る。確認用の転送（SIGHUP）で死なないよう HUP を無視する子を使う。
+        let ignoring = "trap '' HUP; exec sleep 30";
+        // kill_and_reap
+        let mut g = spawn_registered(&mut sh(ignoring), reg).unwrap();
+        assert_eq!(targets(reg), 1);
+        assert!(g.kill_and_reap().is_reaped());
+        assert_eq!(targets(reg), 0);
+        // 自発終了を try_wait で回収
+        let mut g = spawn_registered(&mut sh("exit 0"), reg).unwrap();
+        let start = Instant::now();
+        while g.try_wait().unwrap().is_none() {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(targets(reg), 0);
+        // 生存中の try_wait は登録を保つ
+        let mut live = spawn_registered(&mut sh(ignoring), reg).unwrap();
+        assert!(live.try_wait().unwrap().is_none());
+        assert_eq!(targets(reg), 1);
+        // 未回収の報告でスロットを解放する
+        let _ = unreaped_error(&mut live, "test");
+        assert_eq!(targets(reg), 0);
+        // 後始末（報告済みの子は Drop で回収されない）
+        live.reported_unreaped = false;
+        assert!(live.kill_and_reap().is_reaped());
+    }
+
+    /// PLUG-7・#1513 (A2): 登録していない生存中の子には転送しない。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_forward_does_not_touch_unregistered_children() {
+        use crate::signal_forward::ForwardSignal;
+        let reg = local_registry(2);
+        let mut other = ChildGuard::new(sh("exec sleep 30").spawn().unwrap());
+        assert_eq!(reg.forward(ForwardSignal::Terminate).targets, 0);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(other.try_wait().unwrap().is_none());
+        assert!(other.kill_and_reap().is_reaped());
+    }
+
+    /// PLUG-7・#1513: 登録中の子へ転送するとシグナルで終了する。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_forward_terminates_registered_child() {
+        use crate::signal_forward::ForwardSignal;
+        use std::os::unix::process::ExitStatusExt;
+        let reg = local_registry(2);
+        let mut g = spawn_registered(&mut sh("exec sleep 30"), reg).unwrap();
+        assert_eq!(reg.forward(ForwardSignal::Terminate).targets, 1);
+        let start = Instant::now();
+        let status = loop {
+            if let Some(st) = g.try_wait().unwrap() {
+                break st;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(status.signal(), Some(15));
+        assert_eq!(reg.forward(ForwardSignal::Terminate).targets, 0);
+    }
+
+    /// #1311・#1513・PLUG-7: 登録中の plugin へ転送した SIGTERM・SIGHUP は、`spawn_registered` が作る
+    /// プロセスグループ宛て（`kill(-pid)`）で孫にも届き、plugin 本体と孫の両方が止まる。
+    /// SIGINT は非対話 sh が非同期起動の孫で無視するため、孫の停止は SIGTERM・SIGHUP で確かめる。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_forward_stops_plugin_and_grandchild_via_group() {
+        use crate::signal_forward::ForwardSignal;
+        for sig in [ForwardSignal::Terminate, ForwardSignal::Hangup] {
+            let reg = local_registry(2);
+            let mut cmd = sh("/bin/sleep 30 >/dev/null 2>&1 & echo $!; wait");
+            cmd.stdout(Stdio::piped());
+            let mut g = spawn_registered(&mut cmd, reg).unwrap();
+            let out = g.child.as_mut().unwrap().stdout.take().unwrap();
+            let mut line = String::new();
+            io::BufRead::read_line(&mut io::BufReader::new(out), &mut line).unwrap();
+            let gc: u32 = line.trim().parse().unwrap();
+            assert!(is_running(gc));
+            assert_eq!(reg.forward(sig).targets, 1);
+            let start = Instant::now();
+            while g.try_wait().unwrap().is_none() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "{sig:?}: leader alive"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            while is_running(gc) {
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "{sig:?}: grandchild {gc} alive"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
     }
 
     /// PLUG-7: kill の前に自発終了していた子は、その終了状態のまま回収される（`Killed` にしない）。
@@ -1582,15 +1823,35 @@ mod tests {
         let listener = UdsListener::bind(&dir.join("a.sock")).unwrap();
         let path = listener.path().to_path_buf();
         let me = std::process::id();
-        let _c = UdsStream::connect(&path, Duration::from_secs(2)).unwrap();
+        let _c = UdsStream::connect(
+            &path,
+            Duration::from_secs(2),
+            &mut crate::audit::NoopPeerAuthObserver,
+        )
+        .unwrap();
         let e = listener
-            .accept_peer_pid(Duration::from_millis(300), me.wrapping_add(1), &mut || None)
+            .accept_peer_pid(
+                Duration::from_millis(300),
+                me.wrapping_add(1),
+                &mut || None,
+                &mut crate::audit::NoopPeerAuthObserver,
+            )
             .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::Timeout);
-        let _c2 = UdsStream::connect(&path, Duration::from_secs(2)).unwrap();
+        let _c2 = UdsStream::connect(
+            &path,
+            Duration::from_secs(2),
+            &mut crate::audit::NoopPeerAuthObserver,
+        )
+        .unwrap();
         assert!(
             listener
-                .accept_peer_pid(Duration::from_secs(2), me, &mut || None)
+                .accept_peer_pid(
+                    Duration::from_secs(2),
+                    me,
+                    &mut || None,
+                    &mut crate::audit::NoopPeerAuthObserver,
+                )
                 .is_ok()
         );
         drop(listener);
@@ -1608,17 +1869,27 @@ mod tests {
         let listener = UdsListener::bind(&dir.join("a.sock")).unwrap();
         let path = listener.path().to_path_buf();
         let me = std::process::id();
-        let _c = UdsStream::connect(&path, Duration::from_secs(2)).unwrap();
+        let _c = UdsStream::connect(
+            &path,
+            Duration::from_secs(2),
+            &mut crate::audit::NoopPeerAuthObserver,
+        )
+        .unwrap();
         let mut calls = 0u32;
         let started = std::time::Instant::now();
         let e = listener
-            .accept_peer_pid(Duration::from_secs(10), me.wrapping_add(1), &mut || {
-                calls += 1;
-                Some(PluginError::new(
-                    PluginErrorCode::Unavailable,
-                    "child exited early",
-                ))
-            })
+            .accept_peer_pid(
+                Duration::from_secs(10),
+                me.wrapping_add(1),
+                &mut || {
+                    calls += 1;
+                    Some(PluginError::new(
+                        PluginErrorCode::Unavailable,
+                        "child exited early",
+                    ))
+                },
+                &mut crate::audit::NoopPeerAuthObserver,
+            )
             .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::Unavailable);
         assert_eq!(calls, 1);

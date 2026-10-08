@@ -14,7 +14,12 @@ fn plug7_resident_requires_unix_transport() {
     let exe = std::env::current_exe().unwrap();
     let dir = std::env::temp_dir();
     let plugin = OneShotPlugin::new(exe, vec![], dir).unwrap();
-    let err = ResidentPlugin::start(&plugin, ResidentStartTimeout::default()).unwrap_err();
+    let err = ResidentPlugin::start(
+        &plugin,
+        ResidentStartTimeout::default(),
+        &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+    )
+    .unwrap_err();
     assert_eq!(err.code(), PluginErrorCode::Unimplemented);
 }
 
@@ -101,7 +106,12 @@ mod unix {
                 let dir = sock.parent().unwrap();
                 std::fs::write(dir.join("gc.tmp"), gc.id().to_string()).unwrap();
                 std::fs::rename(dir.join("gc.tmp"), dir.join("grandchild.pid")).unwrap();
-                let _s = UdsStream::connect(&sock, Duration::from_secs(5)).unwrap();
+                let _s = UdsStream::connect(
+                    &sock,
+                    Duration::from_secs(5),
+                    &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+                )
+                .unwrap();
                 std::thread::sleep(Duration::from_secs(60));
             }
             "silent_no_connect" => std::thread::sleep(Duration::from_secs(60)),
@@ -109,7 +119,12 @@ mod unix {
                 if mode == "stderr_small" || mode == "stderr_exit3_after_first" {
                     write_stderr(b"plugin-diagnostic\n");
                 }
-                let mut s = UdsStream::connect(&sock, Duration::from_secs(5)).unwrap();
+                let mut s = UdsStream::connect(
+                    &sock,
+                    Duration::from_secs(5),
+                    &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+                )
+                .unwrap();
                 if mode == "silent_after_connect" {
                     std::thread::sleep(Duration::from_secs(60));
                     return;
@@ -155,12 +170,27 @@ mod unix {
         ms: u64,
     ) -> Result<ResidentPlugin, fandhe_container_plugin::PluginError> {
         let plugin = plugin_for(dir);
-        with_watchdog("ResidentPlugin::start", move || {
-            ResidentPlugin::start(
-                &plugin,
-                ResidentStartTimeout::new(Duration::from_millis(ms)).unwrap(),
-            )
-        })
+        // Linux では plugin が PR_SET_PDEATHSIG で start を呼んだスレッドに結び付く（#1514・PLUG-7）。
+        // セッションを返す都合上、start は別スレッドではなくテストスレッド上で呼び、ハング検出だけを
+        // 監視スレッドに任せる（監視スレッドは完了通知を待ち、期限超過ならプロセスごと中断する）。
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let watcher = std::thread::spawn(move || {
+            if let Err(mpsc::RecvTimeoutError::Timeout) = done_rx.recv_timeout(WAIT) {
+                eprintln!("ResidentPlugin::start hung: no result within {WAIT:?}");
+                std::process::abort();
+            }
+        });
+        let mut audit = fandhe_container_plugin::JsonLinesPeerAuthObserver::new();
+        let r = ResidentPlugin::start(
+            &plugin,
+            ResidentStartTimeout::new(Duration::from_millis(ms)).unwrap(),
+            &mut audit,
+        );
+        drop(done_tx);
+        watcher.join().unwrap();
+        // 接続するのは spawn した子だけなので、peer 認証の拒否イベントは 0 件（PLUG-12・SEC-4）。
+        assert_eq!(audit.drain_lines(), Vec::<String>::new());
+        r
     }
 
     fn ping() -> Frame {
@@ -461,7 +491,12 @@ mod unix {
         let dir = TempDir::new("respond");
         let missing = dir.0.join("no-such-plugin");
         let plugin = OneShotPlugin::new(missing, vec![], dir.0.clone()).unwrap();
-        let e = ResidentPlugin::start(&plugin, ResidentStartTimeout::default()).unwrap_err();
+        let e = ResidentPlugin::start(
+            &plugin,
+            ResidentStartTimeout::default(),
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        )
+        .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::NotFound);
         no_socket_left(&dir);
     }

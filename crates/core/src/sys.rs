@@ -30,6 +30,15 @@
 //! 基本デバイスノード作成は、`mknodat(2)`・`O_PATH` での `openat(2)` を呼ぶために使う。
 //! 委譲 cgroup の検出と子 cgroup 作成（`crate::cgroups`。CORE-3・TASK-32.1・#158）は、
 //! `mkdirat(2)`・`unlinkat(2)`・`fstatfs(2)`（cgroup2 判定）と `O_NOFOLLOW` 付きの `openat(2)` を呼ぶために使う。
+//! rlimit の適用（`exec/rlimits.rs` の `apply_rlimits`。SUP-12・TASK-169.1・#526）は、fork 後の子で `prlimit(2)` を呼ぶために使う。
+//! 稼働中コンテナへの exec（`exec/exec_command.rs`。SUP-6・TASK-163.4・#503）は、exec 専用 worker を
+//! non-dumpable にし、子を親の生存に結び付けるために `prctl(2)`（`PR_SET_DUMPABLE` / `PR_GET_DUMPABLE` /
+//! `PR_SET_PDEATHSIG`）を呼ぶ。
+//! tmpfs のマウント（`crate::exec::mount_tmpfs`。SUP-12・TASK-169 追補・#1472）は、新マウント API（`fsopen(2)`・`fsconfig(2)`・
+//! `fsmount(2)`・`move_mount(2)`。Linux 5.2 以降）で検証済みの O_PATH fd の上へ直接載せる。未対応カーネルは拒否する（縮退しない）。
+//! exec 入口の前提（TASK-163 追補・#1456〜#1460）は、exec 直前の子でセッションを切り離す `setsid(2)`、補助グループを
+//! 空にする `getgroups(2)` / `setgroups(2)`、`/dev/null` とインタープリタを検証済みの `O_PATH` fd から開き直す
+//! `openat(2)`（`O_NOCTTY`）、状態を返す pipe だけを残して fd を閉じる `close_range(2)` を呼ぶ。
 //! さらに `crate::audit_log` のカーネル監査フォールバック（SEC-4・TASK-41.5.2・#840）が、
 //! `socket(2)`（NETLINK_AUDIT）・`sendto(2)`・`recvfrom(2)`・`poll(2)` を呼ぶ。
 //! std だけでは提供されない syscall のみを持ち、検証（hostname の文字種・パス形式等）は呼び出し側の型
@@ -100,9 +109,13 @@ mod consts {
     pub const CLONE_NEWIPC: i32 = 0x0800_0000;
     pub const CLONE_NEWUSER: i32 = 0x1000_0000;
     pub const CLONE_NEWPID: i32 = 0x2000_0000;
+    pub const CLONE_NEWNET: i32 = 0x4000_0000;
+    pub const MS_RDONLY: u64 = 1;
     pub const MS_NOSUID: u64 = 2;
     pub const MS_NODEV: u64 = 4;
     pub const MS_NOEXEC: u64 = 8;
+    // include/uapi/linux/mount.h の `MS_REMOUNT`（全アーキテクチャ共通）。
+    pub const MS_REMOUNT: u64 = 0x20;
     pub const MS_BIND: u64 = 0x1000;
     pub const MS_REC: u64 = 0x4000;
     pub const MS_PRIVATE: u64 = 0x4_0000;
@@ -112,6 +125,23 @@ mod consts {
     pub const SYS_PIVOT_ROOT: i64 = 155;
     // arch/x86/entry/syscalls/syscall_64.tbl の `close_range`（436）。
     pub const SYS_CLOSE_RANGE: i64 = 436;
+    // arch/x86/entry/syscalls/syscall_64.tbl の `move_mount`・`fsopen`・`fsconfig`・`fsmount`（新マウント API。Linux 5.2 以降。SUP-12・TASK-169 追補・#1472）。
+    pub const SYS_MOVE_MOUNT: i64 = 429;
+    pub const SYS_FSOPEN: i64 = 430;
+    pub const SYS_FSCONFIG: i64 = 431;
+    pub const SYS_FSMOUNT: i64 = 432;
+    // include/uapi/linux/mount.h の `FSOPEN_CLOEXEC`・`FSMOUNT_CLOEXEC`・`fsconfig_command`・`MOUNT_ATTR_*`・`MOVE_MOUNT_*`（全アーキテクチャ共通）。
+    pub const FSOPEN_CLOEXEC: u32 = 1;
+    pub const FSMOUNT_CLOEXEC: u32 = 1;
+    pub const FSCONFIG_SET_FLAG: u32 = 0;
+    pub const FSCONFIG_SET_STRING: u32 = 1;
+    pub const FSCONFIG_CMD_CREATE: u32 = 6;
+    pub const MOUNT_ATTR_RDONLY: u32 = 1;
+    pub const MOUNT_ATTR_NOSUID: u32 = 2;
+    pub const MOUNT_ATTR_NODEV: u32 = 4;
+    pub const MOUNT_ATTR_NOEXEC: u32 = 8;
+    pub const MOVE_MOUNT_F_EMPTY_PATH: u32 = 4;
+    pub const MOVE_MOUNT_T_EMPTY_PATH: u32 = 64;
     // arch/x86/entry/syscalls/syscall_64.tbl の `pidfd_send_signal`（424）・`pidfd_open`（434）。
     pub const SYS_PIDFD_SEND_SIGNAL: i64 = 424;
     pub const SYS_PIDFD_OPEN: i64 = 434;
@@ -130,9 +160,14 @@ mod consts {
     // include/uapi/asm-generic/fcntl.h の `O_NONBLOCK`（x86_64 は上書きしない）。
     pub const O_NONBLOCK: i32 = 0o4_000;
     pub const O_RDWR: i32 = 2;
+    // include/uapi/asm-generic/fcntl.h の `O_NOCTTY`（x86_64 は上書きしない。TASK-163 追補・#1459）。
+    pub const O_NOCTTY: i32 = 0o400;
     // include/uapi/asm-generic/fcntl.h の `O_RDONLY`・`O_WRONLY`（全アーキテクチャ共通）。
     pub const O_RDONLY: i32 = 0;
     pub const O_WRONLY: i32 = 1;
+    // include/uapi/asm-generic/fcntl.h の `O_CREAT`・`O_EXCL`（x86_64・arm64 とも上書きしない）。
+    pub const O_CREAT: i32 = 0o100;
+    pub const O_EXCL: i32 = 0o200;
     // include/uapi/linux/fcntl.h の `AT_REMOVEDIR`（全アーキテクチャ共通）。
     pub const AT_REMOVEDIR: i32 = 0x200;
     // include/uapi/asm-generic/errno-base.h・errno.h の EBUSY・ENOTEMPTY（cgroup 操作の分類用）。
@@ -185,6 +220,34 @@ mod consts {
     pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
     pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
 
+    // include/uapi/linux/prctl.h の `PR_GET_DUMPABLE`（3）・`PR_SET_DUMPABLE`（4）。SUP-6・TASK-163.4。
+    // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const PR_GET_DUMPABLE: i32 = 3;
+    pub const PR_SET_DUMPABLE: i32 = 4;
+
+    // include/uapi/linux/prctl.h の `PR_SET_PDEATHSIG`（1）。SUP-6・REPAIR-5・TASK-163.4。
+    // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const PR_SET_PDEATHSIG: i32 = 1;
+
+    // include/uapi/asm-generic/resource.h の `RLIMIT_*`（0〜15。SUP-12・TASK-169.1）。
+    // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const RLIMIT_CPU: i32 = 0;
+    pub const RLIMIT_FSIZE: i32 = 1;
+    pub const RLIMIT_DATA: i32 = 2;
+    pub const RLIMIT_STACK: i32 = 3;
+    pub const RLIMIT_CORE: i32 = 4;
+    pub const RLIMIT_RSS: i32 = 5;
+    pub const RLIMIT_NPROC: i32 = 6;
+    pub const RLIMIT_NOFILE: i32 = 7;
+    pub const RLIMIT_MEMLOCK: i32 = 8;
+    pub const RLIMIT_AS: i32 = 9;
+    pub const RLIMIT_LOCKS: i32 = 10;
+    pub const RLIMIT_SIGPENDING: i32 = 11;
+    pub const RLIMIT_MSGQUEUE: i32 = 12;
+    pub const RLIMIT_NICE: i32 = 13;
+    pub const RLIMIT_RTPRIO: i32 = 14;
+    pub const RLIMIT_RTTIME: i32 = 15;
+
     // include/uapi/linux/prctl.h の `PR_GET_SECCOMP`（21）・`PR_SET_SECCOMP`（22）と
     // include/uapi/linux/seccomp.h の `SECCOMP_MODE_FILTER`（2。可変長引数で渡すため u64）。
     pub const PR_GET_SECCOMP: i32 = 21;
@@ -196,6 +259,11 @@ mod consts {
     // aarch64 は include/uapi/asm-generic/unistd.h。
     pub const SYS_CAPGET: i64 = 125;
     pub const SYS_CAPSET: i64 = 126;
+    // arch/x86/entry/syscalls/syscall_64.tbl の `getgroups`（115）・`setgroups`（116）。補助グループの
+    // 消去（SUP-6・SEC-1・SEC-5・TASK-163 追補・#1457）。glibc の `setgroups` は全スレッドへ反映する仕組み
+    // （setxid のシグナル配送）を持つため、capability と同じく呼び出しスレッドだけに効く生の syscall を使う。
+    pub const SYS_GETGROUPS: i64 = 115;
+    pub const SYS_SETGROUPS: i64 = 116;
     // 禁止 syscall 遮断の結合試験用プローブ（CORE-5・TASK-38.4・#179）。番号は `crate::seccomp` の
     // テーブルとは独立に、x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h から取る。
     // `PTRACE_CONT`（include/uapi/linux/ptrace.h）は attach を伴わない要求で、`KEXEC_SEGMENT_MAX`
@@ -234,9 +302,13 @@ mod consts {
     pub const CLONE_NEWIPC: i32 = 0x0800_0000;
     pub const CLONE_NEWUSER: i32 = 0x1000_0000;
     pub const CLONE_NEWPID: i32 = 0x2000_0000;
+    pub const CLONE_NEWNET: i32 = 0x4000_0000;
+    pub const MS_RDONLY: u64 = 1;
     pub const MS_NOSUID: u64 = 2;
     pub const MS_NODEV: u64 = 4;
     pub const MS_NOEXEC: u64 = 8;
+    // include/uapi/linux/mount.h の `MS_REMOUNT`（全アーキテクチャ共通）。
+    pub const MS_REMOUNT: u64 = 0x20;
     pub const MS_BIND: u64 = 0x1000;
     pub const MS_REC: u64 = 0x4000;
     pub const MS_PRIVATE: u64 = 0x4_0000;
@@ -248,6 +320,23 @@ mod consts {
     // include/uapi/asm-generic/unistd.h の `__NR_close_range`（arm64 は asm-generic の表。
     // x86_64 と値が同じでも流用せず個別に定義する）。
     pub const SYS_CLOSE_RANGE: i64 = 436;
+    // include/uapi/asm-generic/unistd.h（aarch64） の `move_mount`・`fsopen`・`fsconfig`・`fsmount`（新マウント API。Linux 5.2 以降。SUP-12・TASK-169 追補・#1472）。
+    pub const SYS_MOVE_MOUNT: i64 = 429;
+    pub const SYS_FSOPEN: i64 = 430;
+    pub const SYS_FSCONFIG: i64 = 431;
+    pub const SYS_FSMOUNT: i64 = 432;
+    // include/uapi/linux/mount.h の `FSOPEN_CLOEXEC`・`FSMOUNT_CLOEXEC`・`fsconfig_command`・`MOUNT_ATTR_*`・`MOVE_MOUNT_*`（全アーキテクチャ共通）。
+    pub const FSOPEN_CLOEXEC: u32 = 1;
+    pub const FSMOUNT_CLOEXEC: u32 = 1;
+    pub const FSCONFIG_SET_FLAG: u32 = 0;
+    pub const FSCONFIG_SET_STRING: u32 = 1;
+    pub const FSCONFIG_CMD_CREATE: u32 = 6;
+    pub const MOUNT_ATTR_RDONLY: u32 = 1;
+    pub const MOUNT_ATTR_NOSUID: u32 = 2;
+    pub const MOUNT_ATTR_NODEV: u32 = 4;
+    pub const MOUNT_ATTR_NOEXEC: u32 = 8;
+    pub const MOVE_MOUNT_F_EMPTY_PATH: u32 = 4;
+    pub const MOVE_MOUNT_T_EMPTY_PATH: u32 = 64;
     // include/uapi/asm-generic/unistd.h の `__NR_pidfd_send_signal`・`__NR_pidfd_open`（arm64 は
     // asm-generic の表。x86_64 と値が同じでも流用せず個別に定義する）。
     pub const SYS_PIDFD_SEND_SIGNAL: i64 = 424;
@@ -269,9 +358,15 @@ mod consts {
     // include/uapi/asm-generic/fcntl.h の `O_NONBLOCK`（arm64 も上書きしない）。
     pub const O_NONBLOCK: i32 = 0o4_000;
     pub const O_RDWR: i32 = 2;
+    // include/uapi/asm-generic/fcntl.h の `O_NOCTTY`（arm64 の arch/arm64/include/uapi/asm/fcntl.h は
+    // `O_DIRECTORY`・`O_NOFOLLOW`・`O_DIRECT`・`O_LARGEFILE` だけを上書きし、`O_NOCTTY` は上書きしない）。
+    pub const O_NOCTTY: i32 = 0o400;
     // include/uapi/asm-generic/fcntl.h の `O_RDONLY`・`O_WRONLY`（全アーキテクチャ共通）。
     pub const O_RDONLY: i32 = 0;
     pub const O_WRONLY: i32 = 1;
+    // include/uapi/asm-generic/fcntl.h の `O_CREAT`・`O_EXCL`（x86_64・arm64 とも上書きしない）。
+    pub const O_CREAT: i32 = 0o100;
+    pub const O_EXCL: i32 = 0o200;
     // include/uapi/linux/fcntl.h の `AT_REMOVEDIR`（全アーキテクチャ共通）。
     pub const AT_REMOVEDIR: i32 = 0x200;
     // include/uapi/asm-generic/errno-base.h・errno.h の EBUSY・ENOTEMPTY（cgroup 操作の分類用）。
@@ -325,6 +420,34 @@ mod consts {
     pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
     pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
 
+    // include/uapi/linux/prctl.h の `PR_GET_DUMPABLE`（3）・`PR_SET_DUMPABLE`（4）。SUP-6・TASK-163.4。
+    // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const PR_GET_DUMPABLE: i32 = 3;
+    pub const PR_SET_DUMPABLE: i32 = 4;
+
+    // include/uapi/linux/prctl.h の `PR_SET_PDEATHSIG`（1）。SUP-6・REPAIR-5・TASK-163.4。
+    // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const PR_SET_PDEATHSIG: i32 = 1;
+
+    // include/uapi/asm-generic/resource.h の `RLIMIT_*`（0〜15。SUP-12・TASK-169.1）。
+    // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const RLIMIT_CPU: i32 = 0;
+    pub const RLIMIT_FSIZE: i32 = 1;
+    pub const RLIMIT_DATA: i32 = 2;
+    pub const RLIMIT_STACK: i32 = 3;
+    pub const RLIMIT_CORE: i32 = 4;
+    pub const RLIMIT_RSS: i32 = 5;
+    pub const RLIMIT_NPROC: i32 = 6;
+    pub const RLIMIT_NOFILE: i32 = 7;
+    pub const RLIMIT_MEMLOCK: i32 = 8;
+    pub const RLIMIT_AS: i32 = 9;
+    pub const RLIMIT_LOCKS: i32 = 10;
+    pub const RLIMIT_SIGPENDING: i32 = 11;
+    pub const RLIMIT_MSGQUEUE: i32 = 12;
+    pub const RLIMIT_NICE: i32 = 13;
+    pub const RLIMIT_RTPRIO: i32 = 14;
+    pub const RLIMIT_RTTIME: i32 = 15;
+
     // include/uapi/linux/prctl.h の `PR_GET_SECCOMP`（21）・`PR_SET_SECCOMP`（22）と
     // include/uapi/linux/seccomp.h の `SECCOMP_MODE_FILTER`（2。可変長引数で渡すため u64）。
     pub const PR_GET_SECCOMP: i32 = 21;
@@ -336,6 +459,9 @@ mod consts {
     // aarch64 は include/uapi/asm-generic/unistd.h。
     pub const SYS_CAPGET: i64 = 90;
     pub const SYS_CAPSET: i64 = 91;
+    // include/uapi/asm-generic/unistd.h の `getgroups`（158）・`setgroups`（159）。TASK-163 追補・#1457。
+    pub const SYS_GETGROUPS: i64 = 158;
+    pub const SYS_SETGROUPS: i64 = 159;
     // 禁止 syscall 遮断の結合試験用プローブ（CORE-5・TASK-38.4・#179）。番号は `crate::seccomp` の
     // テーブルとは独立に、x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h から取る。
     // `PTRACE_CONT`（include/uapi/linux/ptrace.h）は attach を伴わない要求で、`KEXEC_SEGMENT_MAX`
@@ -376,15 +502,35 @@ mod consts {
     pub const CLONE_NEWIPC: i32 = 0;
     pub const CLONE_NEWUSER: i32 = 0;
     pub const CLONE_NEWPID: i32 = 0;
+    pub const CLONE_NEWNET: i32 = 0;
+    pub const MS_RDONLY: u64 = 0;
     pub const MS_NOSUID: u64 = 0;
     pub const MS_NODEV: u64 = 0;
     pub const MS_NOEXEC: u64 = 0;
+    pub const MS_REMOUNT: u64 = 0;
     pub const MS_BIND: u64 = 0;
     pub const MS_REC: u64 = 0;
     pub const MS_PRIVATE: u64 = 0;
     pub const MNT_DETACH: i32 = 0;
     pub const SYS_PIVOT_ROOT: i64 = 0;
     pub const SYS_CLOSE_RANGE: i64 = 0;
+    // 対応外アーキテクチャ（各ラッパーが SUPPORTED で弾く） の `move_mount`・`fsopen`・`fsconfig`・`fsmount`（新マウント API。Linux 5.2 以降。SUP-12・TASK-169 追補・#1472）。
+    pub const SYS_MOVE_MOUNT: i64 = 0;
+    pub const SYS_FSOPEN: i64 = 0;
+    pub const SYS_FSCONFIG: i64 = 0;
+    pub const SYS_FSMOUNT: i64 = 0;
+    // include/uapi/linux/mount.h の `FSOPEN_CLOEXEC`・`FSMOUNT_CLOEXEC`・`fsconfig_command`・`MOUNT_ATTR_*`・`MOVE_MOUNT_*`（全アーキテクチャ共通）。
+    pub const FSOPEN_CLOEXEC: u32 = 0;
+    pub const FSMOUNT_CLOEXEC: u32 = 0;
+    pub const FSCONFIG_SET_FLAG: u32 = 0;
+    pub const FSCONFIG_SET_STRING: u32 = 0;
+    pub const FSCONFIG_CMD_CREATE: u32 = 0;
+    pub const MOUNT_ATTR_RDONLY: u32 = 0;
+    pub const MOUNT_ATTR_NOSUID: u32 = 0;
+    pub const MOUNT_ATTR_NODEV: u32 = 0;
+    pub const MOUNT_ATTR_NOEXEC: u32 = 0;
+    pub const MOVE_MOUNT_F_EMPTY_PATH: u32 = 0;
+    pub const MOVE_MOUNT_T_EMPTY_PATH: u32 = 0;
     pub const SYS_PIDFD_SEND_SIGNAL: i64 = 0;
     pub const SYS_PIDFD_OPEN: i64 = 0;
     pub const CLOSE_RANGE_CLOEXEC: i64 = 0;
@@ -397,8 +543,11 @@ mod consts {
     pub const O_PATH: i32 = 0;
     pub const O_NONBLOCK: i32 = 0;
     pub const O_RDWR: i32 = 0;
+    pub const O_NOCTTY: i32 = 0;
     pub const O_RDONLY: i32 = 0;
     pub const O_WRONLY: i32 = 0;
+    pub const O_CREAT: i32 = 0;
+    pub const O_EXCL: i32 = 0;
     pub const AT_REMOVEDIR: i32 = 0;
     pub const EBUSY: i32 = -16;
     pub const ENOTEMPTY: i32 = -17;
@@ -432,6 +581,27 @@ mod consts {
 
     pub const PR_SET_NO_NEW_PRIVS: i32 = 0;
     pub const PR_GET_NO_NEW_PRIVS: i32 = 0;
+    pub const PR_GET_DUMPABLE: i32 = 0;
+    pub const PR_SET_DUMPABLE: i32 = 0;
+    pub const PR_SET_PDEATHSIG: i32 = 0;
+
+    // rlimit の定数（対応外アーキテクチャでは各ラッパーが SUPPORTED で弾くため未使用）。
+    pub const RLIMIT_CPU: i32 = 0;
+    pub const RLIMIT_FSIZE: i32 = 0;
+    pub const RLIMIT_DATA: i32 = 0;
+    pub const RLIMIT_STACK: i32 = 0;
+    pub const RLIMIT_CORE: i32 = 0;
+    pub const RLIMIT_RSS: i32 = 0;
+    pub const RLIMIT_NPROC: i32 = 0;
+    pub const RLIMIT_NOFILE: i32 = 0;
+    pub const RLIMIT_MEMLOCK: i32 = 0;
+    pub const RLIMIT_AS: i32 = 0;
+    pub const RLIMIT_LOCKS: i32 = 0;
+    pub const RLIMIT_SIGPENDING: i32 = 0;
+    pub const RLIMIT_MSGQUEUE: i32 = 0;
+    pub const RLIMIT_NICE: i32 = 0;
+    pub const RLIMIT_RTPRIO: i32 = 0;
+    pub const RLIMIT_RTTIME: i32 = 0;
 
     // seccomp 適用の定数（対応外アーキテクチャでは各ラッパーが SUPPORTED で弾くため未使用）。
     pub const PR_GET_SECCOMP: i32 = 0;
@@ -443,6 +613,8 @@ mod consts {
     // aarch64 は include/uapi/asm-generic/unistd.h。
     pub const SYS_CAPGET: i64 = 0;
     pub const SYS_CAPSET: i64 = 0;
+    pub const SYS_GETGROUPS: i64 = 0;
+    pub const SYS_SETGROUPS: i64 = 0;
     // 禁止 syscall 遮断の結合試験用プローブ（CORE-5・TASK-38.4・#179）。番号は `crate::seccomp` の
     // テーブルとは独立に、x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h から取る。
     // `PTRACE_CONT`（include/uapi/linux/ptrace.h）は attach を伴わない要求で、`KEXEC_SEGMENT_MAX`
@@ -482,6 +654,8 @@ pub(crate) enum NsFlag {
     Ipc,
     User,
     Pid,
+    /// network namespace。`setns(2)` による参加（SUP-6・TASK-163.1）専用で、`unshare` 経路は使わない。
+    Net,
 }
 
 impl NsFlag {
@@ -493,11 +667,15 @@ impl NsFlag {
             Self::Ipc => consts::CLONE_NEWIPC,
             Self::User => consts::CLONE_NEWUSER,
             Self::Pid => consts::CLONE_NEWPID,
+            Self::Net => consts::CLONE_NEWNET,
         }
     }
 }
 
 unsafe extern "C" {
+    // SAFETY（宣言そのものの妥当性）: glibc 2.14+ / musl の `int setns(int fd, int nstype)` と同じ型幅
+    // （SUP-6・TASK-163.1）。`syscall(2)` 経由にせず arch 別の syscall 番号を増やさない。
+    fn setns(fd: i32, nstype: i32) -> i32;
     // SAFETY（宣言そのものの妥当性）: glibc / musl の `int unshare(int flags)` と同じ型幅。
     fn unshare(flags: i32) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int sethostname(const char *name, size_t len)`。
@@ -549,6 +727,9 @@ unsafe extern "C" {
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int dup2(int oldfd, int newfd)`。
     fn dup2(oldfd: i32, newfd: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `pid_t setsid(void)`（Linux の `pid_t` は i32。失敗は `(pid_t)-1`）。
+    // libc のラッパーを使い、arch 別の syscall 番号を増やさない（SUP-6・TASK-163 追補・#1456）。
+    fn setsid() -> i32;
     // SAFETY（宣言そのものの妥当性）: `int prctl(int option, ...)`（glibc / musl）。可変長引数として
     // 宣言する（非可変長で宣言して呼ぶと、可変長引数の渡し方が異なる ABI で未定義動作になる）。
     // 可変長部は `unsigned long`（LP64 で u64）なので呼び出し側は u64 で渡す。
@@ -586,6 +767,23 @@ unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: `int poll(struct pollfd *fds, nfds_t nfds, int timeout)`
     // （`nfds_t` は `unsigned long`＝LP64 で u64）。
     fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int prlimit(pid_t pid, int resource, const struct rlimit64 *new_limit,
+    // struct rlimit64 *old_limit)`（glibc 2.13 以降・musl。LP64 の `pid_t` は i32、`resource` は
+    // `enum __rlimit_resource` 相当で `int` 幅）。構造体は下の [`RLimit64`]（`rlim64_t` = u64 × 2）。
+    fn prlimit(
+        pid: i32,
+        resource: i32,
+        new_limit: *const RLimit64,
+        old_limit: *mut RLimit64,
+    ) -> i32;
+}
+
+/// `struct rlimit64`（`rlim_cur` / `rlim_max` ともに 64 ビット。全アーキテクチャ共通の 16 バイト）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RLimit64 {
+    cur: u64,
+    max: u64,
 }
 
 /// `struct sockaddr_nl`（include/uapi/linux/netlink.h。全アーキテクチャ共通の 12 バイト）。
@@ -738,6 +936,27 @@ pub(crate) fn poll_readable(fd: BorrowedFd<'_>, timeout_ms: i32) -> Result<bool,
     Ok(r > 0)
 }
 
+/// 稼働中プロセスの pidfd 経由で、指定 namespace 群へ 1 回の `setns(2)` で参加する（Linux 5.8 以降。
+/// SUP-6・TASK-163.1）。
+///
+/// 呼び出し元は `crate::exec::join_namespaces` のみで、単一スレッドであることを確認済みの前提で呼ぶ。
+/// 1 回の syscall なので全 namespace が all-or-nothing で切り替わり、途中まで参加した状態を作らない。
+/// 空の集合と `NsFlag::User`（user namespace 参加は未対応。fail-closed）は `EINVAL` で拒否する。
+pub(crate) fn setns_pidfd(pidfd: BorrowedFd<'_>, flags: &[NsFlag]) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    if flags.is_empty() || flags.contains(&NsFlag::User) {
+        return Err(SysError::Os(EINVAL));
+    }
+    let bits = flags.iter().fold(0i32, |acc, f| acc | f.bits());
+    // SAFETY: 引数は整数のみでポインタを取らない。`pidfd` は呼び出しの間有効な `BorrowedFd`。
+    // 副作用は呼び出しスレッドの namespace 所属の変更で、呼び出し側が単一スレッドであることを
+    // 確認済み。失敗時（-1）はカーネルが namespace を変更しない。
+    let rc = unsafe { setns(pidfd.as_raw_fd(), bits) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
 /// 直前の失敗した syscall の errno を `SysError` にする（失敗直後に呼ぶこと）。
 fn last_error() -> SysError {
     SysError::Os(io::Error::last_os_error().raw_os_error().unwrap_or(0))
@@ -857,6 +1076,252 @@ pub(crate) fn mount_proc_at(target: &CStr) -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// tmpfs の `statfs.f_type`（include/uapi/linux/magic.h の `TMPFS_MAGIC`。アーキテクチャ非依存）。
+pub(crate) const TMPFS_MAGIC: i64 = 0x0102_1994;
+
+/// procfs の `statfs.f_type`（include/uapi/linux/magic.h の `PROC_SUPER_MAGIC`。アーキテクチャ非依存）。
+/// `crate::exec` の exec 再適用が、スレッド数の取得元が本物の procfs であることを確かめるのに使う（SUP-6）。
+pub(crate) const PROC_MAGIC: i64 = 0x9fa0;
+
+/// [`mount_tmpfs_on`]・[`remount_read_only_at`] に渡せるフラグ。可変なのは読み取り専用と実行許可の 2 値だけで、
+/// `nosuid`・`nodev` は常に付与する（任意のビットを渡せない型にして SEC-1 の fail-closed を保つ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TmpfsMountFlags {
+    pub(crate) read_only: bool,
+    pub(crate) exec: bool,
+}
+
+impl TmpfsMountFlags {
+    /// `mount(2)`（`MS_REMOUNT` による再マウント）の flags 値（`MS_NOSUID|MS_NODEV` は固定）。
+    /// 最初のマウントは新マウント API で [`Self::attr_bits`] を使う。
+    pub(crate) fn bits(self) -> u64 {
+        let mut f = consts::MS_NOSUID | consts::MS_NODEV;
+        if self.read_only {
+            f |= consts::MS_RDONLY;
+        }
+        if !self.exec {
+            f |= consts::MS_NOEXEC;
+        }
+        f
+    }
+
+    /// `fsmount(2)` の `attr_flags` 値（`MOUNT_ATTR_NOSUID|MOUNT_ATTR_NODEV` は固定）。
+    /// `MS_*` と数値が同じでも別の名前つき定数から組む（流用しない）。
+    pub(crate) fn attr_bits(self) -> u32 {
+        let mut f = consts::MOUNT_ATTR_NOSUID | consts::MOUNT_ATTR_NODEV;
+        if self.read_only {
+            f |= consts::MOUNT_ATTR_RDONLY;
+        }
+        if !self.exec {
+            f |= consts::MOUNT_ATTR_NOEXEC;
+        }
+        f
+    }
+}
+
+/// [`mount_tmpfs_on`] の作成パラメータ。値はすべて整数・真偽値で、カーネルへ渡す文字列は
+/// 本モジュール内で整数から生成する（利用者文字列・カンマ区切りの data を渡す経路を持たない。SEC-1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TmpfsCreate {
+    /// ルートディレクトリのモード（8 進で `mode=` に渡す）。
+    pub(crate) mode: u32,
+    /// サイズ（バイト）。`None` はカーネル既定。
+    pub(crate) size: Option<u64>,
+    pub(crate) flags: TmpfsMountFlags,
+}
+
+/// 新マウント API 失敗時の errno。`ENOSYS`（Linux 5.2 未満）は縮退せず [`SysError::Unsupported`] に写す。
+// テストビルドでは `crate::exec` の dry-run 差し込み点が呼ぶ側を差し替えるため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+fn new_mount_api_error() -> SysError {
+    match last_error() {
+        SysError::Os(e) if e == ENOSYS => SysError::Unsupported,
+        other => other,
+    }
+}
+
+/// `fsconfig(2)` の戻り値を `Result` にする。
+#[cfg_attr(test, allow(dead_code))]
+fn fsconfig_result(rc: i64) -> Result<(), SysError> {
+    if rc == -1 {
+        Err(new_mount_api_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// fd を返す新マウント API の戻り値（`fsopen` / `fsmount`）を検証して `OwnedFd` にする。
+#[cfg_attr(test, allow(dead_code))]
+fn new_mount_api_fd(rc: i64) -> Result<OwnedFd, SysError> {
+    if rc == -1 {
+        return Err(new_mount_api_error());
+    }
+    let fd = i32::try_from(rc).map_err(|_| SysError::Os(EINVAL))?;
+    if fd < 0 {
+        return Err(SysError::Os(EINVAL));
+    }
+    // SAFETY: `fd` は直前に成功した新マウント API の syscall が返した、他に所有者のいない有効な fd
+    // （`fsopen` / `fsmount` の戻り値）。`OwnedFd` が唯一の所有者になる（二重 close なし）。
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// `target_dir`（検証済みのマウント先ディレクトリの O_PATH fd）の上へ、新マウント API で tmpfs を載せ、
+/// 載せたマウントのルートを指す fd（close-on-exec）を返す。
+///
+/// `fsopen("tmpfs")` → `fsconfig`（`source`・`mode`・`size`・`ro` をキー単位で指定）→ `fsconfig(CMD_CREATE)`
+/// → `fsmount` → `move_mount(.., target_dir, "", T_EMPTY_PATH)`。マウント先は fd のまま `move_mount` へ渡すため、
+/// パス文字列の再解決・symlink 追従が起きず、`mount(2)` の `data` 文字列も使わない。返す fd は自分のマウントを
+/// 一意に指し、`crate::exec::mount_tmpfs` が事後検証と失敗時の後始末（解除対象の特定）に使う
+/// （SUP-12・TASK-169 追補・#1472）。
+///
+/// 必要なカーネルは Linux 5.2 以降。未対応（`ENOSYS`）は [`SysError::Unsupported`] で返し、`mount(2)` へは
+/// 縮退しない（fail-closed）。途中で失敗した場合、未接続の中間 fd は drop で閉じ、マウントは破棄される。
+// テストビルドでは `crate::exec` の dry-run 差し込み点が本関数を呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn mount_tmpfs_on(
+    target_dir: BorrowedFd<'_>,
+    create: TmpfsCreate,
+) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 静的な NUL 終端文字列のポインタと定数フラグのみ。カーネルは呼び出し中に文字列を複写するだけで
+    // ポインタを保持しない。可変長引数は register 幅（`i64` / ポインタ）で渡す。成功時の戻り値は新規 fd で、
+    // 直後に `new_mount_api_fd` が唯一の所有者にする。
+    let fs_fd = new_mount_api_fd(unsafe {
+        syscall(
+            consts::SYS_FSOPEN,
+            c"tmpfs".as_ptr(),
+            i64::from(consts::FSOPEN_CLOEXEC),
+        )
+    })?;
+    let set_string = |key: &CStr, value: &CStr| -> Result<(), SysError> {
+        // SAFETY: `fs_fd` は生存中の fsopen の fd。`key`・`value` は借用した NUL 終端文字列で呼び出しの間
+        // 生存し、カーネルは保持しない。aux は 0。副作用はこの fs コンテキストへのパラメータ設定に限る。
+        fsconfig_result(unsafe {
+            syscall(
+                consts::SYS_FSCONFIG,
+                i64::from(fs_fd.as_raw_fd()),
+                i64::from(consts::FSCONFIG_SET_STRING),
+                key.as_ptr(),
+                value.as_ptr(),
+                0i64,
+            )
+        })
+    };
+    set_string(c"source", c"tmpfs")?;
+    // 値は整数から生成した数字のみで、NUL・カンマを含み得ない。
+    let mode = CString::new(format!("{:o}", create.mode)).map_err(|_| SysError::Os(EINVAL))?;
+    set_string(c"mode", &mode)?;
+    if let Some(size) = create.size {
+        let size = CString::new(size.to_string()).map_err(|_| SysError::Os(EINVAL))?;
+        set_string(c"size", &size)?;
+    }
+    if create.flags.read_only {
+        // SAFETY: `fs_fd` は生存中の fsopen の fd。key は静的な NUL 終端文字列、value は NULL（フラグ形式）、
+        // aux は 0。副作用はこの fs コンテキストへのフラグ設定に限る。
+        fsconfig_result(unsafe {
+            syscall(
+                consts::SYS_FSCONFIG,
+                i64::from(fs_fd.as_raw_fd()),
+                i64::from(consts::FSCONFIG_SET_FLAG),
+                c"ro".as_ptr(),
+                core::ptr::null::<core::ffi::c_char>(),
+                0i64,
+            )
+        })?;
+    }
+    // SAFETY: `fs_fd` は生存中の fsopen の fd。key・value は NULL、aux は 0（`FSCONFIG_CMD_CREATE` の仕様）。
+    // 副作用は superblock の作成（まだどこにも接続されない）に限る。
+    fsconfig_result(unsafe {
+        syscall(
+            consts::SYS_FSCONFIG,
+            i64::from(fs_fd.as_raw_fd()),
+            i64::from(consts::FSCONFIG_CMD_CREATE),
+            core::ptr::null::<core::ffi::c_char>(),
+            core::ptr::null::<core::ffi::c_char>(),
+            0i64,
+        )
+    })?;
+    // SAFETY: `fs_fd` は生存中の fd。flags・attr は定数と `attr_bits`（nosuid・nodev 固定）のみ。
+    // 成功時の戻り値は新規 fd で、直後に `new_mount_api_fd` が唯一の所有者にする。副作用は未接続の
+    // マウントの作成に限る（fd を閉じればカーネルが破棄する）。
+    let mnt_fd = new_mount_api_fd(unsafe {
+        syscall(
+            consts::SYS_FSMOUNT,
+            i64::from(fs_fd.as_raw_fd()),
+            i64::from(consts::FSMOUNT_CLOEXEC),
+            i64::from(create.flags.attr_bits()),
+        )
+    })?;
+    // SAFETY: `mnt_fd`・`target_dir` は生存中の fd（`OwnedFd` と `BorrowedFd`）。パスは静的な空文字列で、
+    // `*_EMPTY_PATH` により fd 自身が対象になる（パス解決なし）。副作用は呼び出しスレッドの mount namespace への
+    // マウント 1 件の追加に限る。
+    let rc = unsafe {
+        syscall(
+            consts::SYS_MOVE_MOUNT,
+            i64::from(mnt_fd.as_raw_fd()),
+            c"".as_ptr(),
+            i64::from(target_dir.as_raw_fd()),
+            c"".as_ptr(),
+            i64::from(consts::MOVE_MOUNT_F_EMPTY_PATH | consts::MOVE_MOUNT_T_EMPTY_PATH),
+        )
+    };
+    if rc == -1 {
+        return Err(new_mount_api_error());
+    }
+    Ok(mnt_fd)
+}
+/// `target`（マウントのルート）の tmpfs を、読み取り専用へ再マウントする（`MS_REMOUNT`）。
+///
+/// `crate::exec::inject_files` が、secrets / configs を書き終えた tmpfs を read-only にするために呼ぶ
+/// （SUP-12・TASK-169.4.2）。`flags` は最初のマウントと同じ [`TmpfsMountFlags`] を渡し、`read_only` は
+/// 本関数が強制的に真にする。user namespace 内ではロックされたフラグ（`nosuid`・`nodev`・`noexec`）を
+/// 落とす再マウントが `EPERM` になるため、最初のマウントと同じビットを必ず併せて渡す。data は NULL
+/// （既存の size / mode を保持する）。`target` は検証済みの fd を指す `/proc/thread-self/fd/N`。
+// テストビルドでは `crate::exec` の dry-run 差し込み点が本関数を呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn remount_read_only_at(target: &CStr, flags: TmpfsMountFlags) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let flags = TmpfsMountFlags {
+        read_only: true,
+        ..flags
+    };
+    // SAFETY: `target` は `&CStr` の借用で NUL 終端かつ呼び出しの間生存する。source / fstype / data は
+    // NULL（`MS_REMOUNT` ではカーネルが参照しない。data が NULL のため既存のマウントオプションを保つ）。
+    // flags は `TmpfsMountFlags::bits` で組んだ値に `MS_REMOUNT` を足したのみ。副作用は呼び出しスレッドの
+    // mount namespace 内の 1 マウントのフラグ変更に限る。
+    let rc = unsafe {
+        mount(
+            core::ptr::null(),
+            target.as_ptr(),
+            core::ptr::null(),
+            consts::MS_REMOUNT | flags.bits(),
+            core::ptr::null(),
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `target` のマウントを `MNT_DETACH` で切り離す（`umount2(target, MNT_DETACH)`）。
+///
+/// `crate::exec::mount_tmpfs` の失敗時の後始末が、自分でマウントした tmpfs のルートを開き直した
+/// O_PATH fd を指す `/proc/thread-self/fd/N` を渡す（magic link を fd の実体へ解決させるため
+/// `UMOUNT_NOFOLLOW` は付けない）。`target` がマウントのルートでなければカーネルが `EINVAL` で拒否する。
+// テストビルドでは `crate::exec` の dry-run 差し込み点が本関数を呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn umount_detach_at(target: &CStr) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `target` は `&CStr` の借用で NUL 終端かつ呼び出しの間生存し、カーネルはポインタを
+    // 保持しない。flags は定数。副作用は呼び出しスレッドの mount namespace からのマウント 1 件の切り離しのみ。
+    let rc = unsafe { umount2(target.as_ptr(), consts::MNT_DETACH) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
 /// `target` を自分自身へ再帰 bind mount し（`MS_BIND|MS_REC`）、`target` をマウントポイントにする。
 ///
 /// `pivot_root(2)` の new_root は「マウントポイントであること」が要件で、rootfs が単なる
@@ -951,12 +1416,30 @@ pub(crate) fn fork_single_threaded<F: FnOnce() -> i32>(
     child: F,
     panic_exit: i32,
 ) -> Result<u32, SysError> {
+    fork_single_threaded_with(
+        || std::fs::read_to_string("/proc/self/status").is_ok_and(|status| threads_is_one(&status)),
+        child,
+        panic_exit,
+    )
+}
+
+/// [`fork_single_threaded`] の本体。`is_single_threaded` が「呼び出しプロセスのスレッド数が 1 である」ことを
+/// 返したときだけ fork する（SUP-6・TASK-163.4・#503）。
+///
+/// exec 専用プロセスは `setns(CLONE_NEWNS)` の後に `/proc` がコンテナ側の procfs になり、自プロセスを
+/// `/proc/self` で解決できない。そのため `setns` の前に開いた自プロセスの status fd からスレッド数を読む
+/// 判定（`ThreadCountSource::PreOpened`）を呼び出し側が渡す。判定の出所が変わるだけで「fork の直前に
+/// `Threads: 1` を確認する」という強制は同じ関数の内側に残る。判定が偽（読めない場合を含む）なら fork せず
+/// [`SysError::MultiThreaded`]（fail-closed）。
+pub(crate) fn fork_single_threaded_with<F: FnOnce() -> i32>(
+    is_single_threaded: impl FnOnce() -> bool,
+    child: F,
+    panic_exit: i32,
+) -> Result<u32, SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
-    let status =
-        std::fs::read_to_string("/proc/self/status").map_err(|_| SysError::MultiThreaded)?;
-    if !threads_is_one(&status) {
+    if !is_single_threaded() {
         return Err(SysError::MultiThreaded);
     }
     {
@@ -964,7 +1447,7 @@ pub(crate) fn fork_single_threaded<F: FnOnce() -> i32>(
         let _ = io::stdout().flush();
         let _ = io::stderr().flush();
     }
-    // SAFETY: 直前に `Threads: 1` を確認済みで、fork した子には呼び出しスレッドだけが複製される
+    // SAFETY: 直前に呼び出し側の判定で `Threads: 1` を確認済みで、fork した子には呼び出しスレッドだけが複製される
     // ため、他スレッドが保持していたロック・ヒープの不整合を子が引き継がない。子は下の分岐で
     // `child` を実行して `_exit` し、呼び出し元のフレームへ戻らない。親は戻り値の pid だけを使う。
     let pid = unsafe { fork() };
@@ -989,27 +1472,6 @@ fn null_terminated_ptrs(items: &[CString]) -> Vec<*const core::ffi::c_char> {
         .map(|c| c.as_ptr())
         .chain(std::iter::once(core::ptr::null()))
         .collect()
-}
-
-/// 絶対パス `path` を読み取り専用で開く（`O_RDONLY|O_CLOEXEC|O_NONBLOCK`。最終要素の symlink は辿る）。
-///
-/// エントリポイントの検査と実行を同じ実体に固定するための fd を得る（[`exec_fd`] と組で使う）。
-/// `O_NONBLOCK` は FIFO 等の open が相手待ちでハングするのを避けるため（REPAIR-5）。
-#[cfg_attr(test, allow(dead_code))]
-pub(crate) fn open_file_read(path: &CStr) -> Result<OwnedFd, SysError> {
-    if !consts::SUPPORTED {
-        return Err(SysError::Unsupported);
-    }
-    let flags = consts::O_CLOEXEC | consts::O_NONBLOCK;
-    // SAFETY: `path` は借用した NUL 終端文字列で呼び出しの間生存する。flags に O_CREAT / O_TMPFILE を
-    // 含まないため可変長引数（mode）は渡さず、カーネルも読まない。成功時の戻り値は新規 fd で、
-    // 直後に `OwnedFd` が唯一の所有者となる（二重 close なし）。
-    let fd = unsafe { openat(AT_FDCWD, path.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(last_error());
-    }
-    // SAFETY: `fd` は上で成功した openat が返した、他に所有者のいない有効な fd。
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// `fd` の close-on-exec を `on` に設定する（`fcntl(F_SETFD)`）。
@@ -1044,25 +1506,6 @@ pub(crate) fn dup_fd_at_least(fd: BorrowedFd<'_>, min: i32) -> Result<OwnedFd, S
     }
     // SAFETY: `new` は上で成功した fcntl が返した、他に所有者のいない有効な fd。
     Ok(unsafe { OwnedFd::from_raw_fd(new) })
-}
-
-/// 絶対パス `path` を読み書きで開く（`O_RDWR|O_CLOEXEC|O_NONBLOCK`。最終要素の symlink は辿る）。
-/// 呼び出し側が開いた実体の種別を検証する前提（[`redirect_stdio_to`] と組で使う）。
-#[cfg_attr(test, allow(dead_code))]
-pub(crate) fn open_file_rdwr(path: &CStr) -> Result<OwnedFd, SysError> {
-    if !consts::SUPPORTED {
-        return Err(SysError::Unsupported);
-    }
-    let flags = consts::O_RDWR | consts::O_CLOEXEC | consts::O_NONBLOCK;
-    // SAFETY: `path` は借用した NUL 終端文字列で呼び出しの間生存する。flags に O_CREAT / O_TMPFILE を
-    // 含まないため可変長引数（mode）は渡さない。成功時の戻り値は新規 fd で、直後に `OwnedFd` が
-    // 唯一の所有者となる（二重 close なし）。
-    let fd = unsafe { openat(AT_FDCWD, path.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(last_error());
-    }
-    // SAFETY: `fd` は上で成功した openat が返した、他に所有者のいない有効な fd。
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// fd 0・1・2 を `fd` の実体で置き換える（`dup2`。置換先は close-on-exec が外れる）。呼び出し元が
@@ -1122,27 +1565,33 @@ pub(crate) fn exec_fd(fd: BorrowedFd<'_>, argv: &[CString], envp: &[CString]) ->
     last_error()
 }
 
+/// `close_range(first, last, flags)` を呼ぶ（Linux 5.11 以降。glibc 2.34 未満にラッパーが無いため `syscall(2)` 経由）。
+/// 未対応カーネルは `ENOSYS`/`EINVAL` を返す（呼び出し側が fail-closed にする）。
+fn close_range_raw(first: u32, last: u32, flags: i64) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数のみでポインタを取らない（unsigned int 引数は register 幅に拡張して渡され、カーネルは
+    // 下位 32 bit を読む）。`flags` は 0（閉じる）か `CLOSE_RANGE_CLOEXEC`（閉じずに close-on-exec を立てる）で、
+    // 対象は `first`〜`last` の fd だけ。閉じる場合、呼び出し側（exec 直前の子）はそれらの fd をこの後使わない前提。
+    let rc = unsafe {
+        syscall(
+            consts::SYS_CLOSE_RANGE,
+            i64::from(first),
+            i64::from(last),
+            flags,
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
 /// fd `first` 以上のすべてを close-on-exec にする（`close_range(first, ~0, CLOSE_RANGE_CLOEXEC)`。
 /// Linux 5.11 以降）。exec 後のコンテナへホスト側の fd を漏らさない（CVE-2024-21626 型）。
 /// 未対応カーネルは `ENOSYS`/`EINVAL` を返す（呼び出し側が fail-closed にする）。
 // テストビルドでは dry-run 差し込み点が本関数を呼ばないため dead_code を許可する。
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn mark_fds_cloexec_from(first: u32) -> Result<(), SysError> {
-    if !consts::SUPPORTED {
-        return Err(SysError::Unsupported);
-    }
-    // SAFETY: 引数は整数のみでポインタを取らない（`close_range` は glibc 2.34 未満に無いため
-    // `syscall(2)` 経由。unsigned int 引数は register 幅に拡張して渡され、カーネルは下位 32 bit を
-    // 読む）。CLOEXEC 指定のため fd は閉じず、exec までの間は引き続き使える。
-    let rc = unsafe {
-        syscall(
-            consts::SYS_CLOSE_RANGE,
-            i64::from(first),
-            i64::from(u32::MAX),
-            consts::CLOSE_RANGE_CLOEXEC,
-        )
-    };
-    if rc == -1 { Err(last_error()) } else { Ok(()) }
+    close_range_raw(first, u32::MAX, consts::CLOSE_RANGE_CLOEXEC)
 }
 
 /// fd `first` 以上のすべてを閉じる（`close_range(first, ~0, 0)`。Linux 5.11 以降）。
@@ -1151,21 +1600,39 @@ pub(crate) fn mark_fds_cloexec_from(first: u32) -> Result<(), SysError> {
 /// 未対応カーネルは `ENOSYS`/`EINVAL` を返す（呼び出し側が fail-closed にする）。
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn close_fds_from(first: u32) -> Result<(), SysError> {
-    if !consts::SUPPORTED {
-        return Err(SysError::Unsupported);
-    }
-    // SAFETY: 引数は整数のみでポインタを取らない（`syscall(2)` 経由。unsigned int 引数は register
-    // 幅に拡張して渡され、カーネルは下位 32 bit を読む）。閉じる対象は `first` 以上の fd だけで、
-    // 呼び出し側（exec 直前の子）はそれらの fd をこの後使わない前提。
-    let rc = unsafe {
-        syscall(
-            consts::SYS_CLOSE_RANGE,
-            i64::from(first),
-            i64::from(u32::MAX),
-            0i64,
-        )
+    close_range_raw(first, u32::MAX, 0)
+}
+
+/// fd 1 本（`fd`）だけを閉じる（`close_range(fd, fd, 0)`。結合試験専用。#1299・SEC-1・CORE-1）。
+///
+/// `exec::close_standard_fds_for_test` が、標準 fd（0〜2）を閉じた呼び出し側を作るために使う。既に閉じている
+/// 番号は `EBADF` ではなく成功になる（`close_range` の仕様）ため、閉じる前後の状態は呼び出し側が照合する。
+/// 呼び出し側は閉じた番号をこの後使わないこと。未対応カーネルは `ENOSYS`/`EINVAL`（呼び出し側が失敗にする）。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+pub(crate) fn close_fd_number(fd: u32) -> Result<(), SysError> {
+    close_range_raw(fd, fd, 0)
+}
+
+/// fd `first` 以上のうち、`keep` の 1 本だけを残してすべて閉じる（TASK-163 追補・#1460）。
+///
+/// 稼働中コンテナへの exec の子が、`execve` 前の失敗を親へ知らせる pipe の書き込み側（close-on-exec）だけを
+/// 残すために使う。`keep` の番号を動かさず、その前後の範囲を 2 回の `close_range` で閉じる（`dup2` で番号を
+/// 付け替えると、同じ番号を指す別の所有者と衝突し得るため）。`keep` が `first` 未満なら [`close_fds_from`] と同じ。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn close_fds_from_except(first: u32, keep: BorrowedFd<'_>) -> Result<(), SysError> {
+    let Ok(keep) = u32::try_from(keep.as_raw_fd()) else {
+        return Err(SysError::Os(EBADF));
     };
-    if rc == -1 { Err(last_error()) } else { Ok(()) }
+    if keep < first {
+        return close_range_raw(first, u32::MAX, 0);
+    }
+    if keep > first {
+        close_range_raw(first, keep - 1, 0)?;
+    }
+    match keep.checked_add(1) {
+        Some(next) => close_range_raw(next, u32::MAX, 0),
+        None => Ok(()),
+    }
 }
 
 /// [`open_path_nofollow`] が渡す `openat(2)` のフラグ（`O_PATH|O_NOFOLLOW|O_CLOEXEC`）。
@@ -1238,6 +1705,44 @@ fn open_file_at(parent: BorrowedFd<'_>, name: &CStr, access: i32) -> Result<Owne
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// `parent` 配下に新規ファイル `name` を `O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC` で作って開く。
+///
+/// `crate::exec::inject_files` が、検証済みの tmpfs ルート fd の直下へ secrets / configs を作るために
+/// 使う（SUP-12・TASK-169.4.2）。`O_EXCL` により既存名（既存 symlink を含む。`O_EXCL` の `O_CREAT` は
+/// symlink を辿らず `EEXIST`）を拒否する。`mode` は `0o777` 以下に切り詰め、umask の影響を受けるため
+/// 呼び出し側が作成後に `fchmod` 相当で最終モードへ設定する。`name` は 1 要素に検証済みの前提。
+pub(crate) fn create_file_excl_at(
+    parent: BorrowedFd<'_>,
+    name: &CStr,
+    mode: u32,
+) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let flags = consts::O_WRONLY
+        | consts::O_CREAT
+        | consts::O_EXCL
+        | consts::O_NOFOLLOW
+        | consts::O_CLOEXEC;
+    // SAFETY: `name` は借用した NUL 終端文字列で呼び出しの間生存する。`parent` は生存中の
+    // `BorrowedFd`。flags に O_CREAT を含むため、可変長引数として mode を `c_uint` で渡す（`openat` の
+    // 宣言は可変長で、整数昇格後の `unsigned int` を読むのが C ABI）。成功時の戻り値は新規 fd で、
+    // 直後に `OwnedFd` が唯一の所有者となる（二重 close なし）。
+    let fd = unsafe {
+        openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            flags,
+            (mode & 0o777) as core::ffi::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: `fd` は上で成功した openat が返した、他に所有者のいない有効な fd。
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 /// `parent` 配下の既存ファイル `name` を読み取り専用（`O_NOFOLLOW`）で開く。
 pub(crate) fn open_read_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<OwnedFd, SysError> {
     open_file_at(parent, name, consts::O_RDONLY)
@@ -1293,6 +1798,73 @@ pub(crate) fn reopen_pinned_read_nonblock(pinned: BorrowedFd<'_>) -> Result<Owne
         .map_err(|_| SysError::Unsupported)?;
     // 絶対パスのため dirfd は無視される（`pinned` を渡しても解決に影響しない）。
     open_follow_at(pinned, &path, consts::O_RDONLY | consts::O_NONBLOCK)
+}
+
+/// procfs の fd エントリ名 `thread-self/fd/<fd>` を、NUL 終端つきで `buf` に組み立てる（アロケーションなし）。
+///
+/// fork 後・`execve` 前の子（`crate::exec` の `/dev/null` の開き直し。TASK-163 追補・#1459）から呼ぶため、
+/// `format!` を使わずスタック上のバッファへ書く。`fd` が負なら `None`。
+fn proc_fd_entry(fd: i32, buf: &mut [u8; 32]) -> Option<&CStr> {
+    const PREFIX: &[u8] = b"thread-self/fd/";
+    let mut value = u32::try_from(fd).ok()?;
+    // 10 進の桁を下位から取り出す（u32 は最大 10 桁）。
+    let mut digits = [0u8; 10];
+    let mut count = 0usize;
+    loop {
+        *digits.get_mut(count)? = b'0'.checked_add(u8::try_from(value % 10).ok()?)?;
+        count += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    let mut len = 0usize;
+    for byte in PREFIX
+        .iter()
+        .chain(digits.get(..count)?.iter().rev())
+        .chain(std::iter::once(&0u8))
+    {
+        *buf.get_mut(len)? = *byte;
+        len += 1;
+    }
+    CStr::from_bytes_with_nul(buf.get(..len)?).ok()
+}
+
+/// 保持中の `O_PATH` fd `pinned` が指す inode を、procfs のディレクトリ fd `proc_dir` 配下の
+/// `thread-self/fd/N`（magic link）経由で `O_RDWR|O_NOCTTY|O_CLOEXEC` に開き直す（TASK-163 追補・#1459）。
+///
+/// パスを再解決せず `pinned` が固定した inode そのものを開くため、呼び出し側が `pinned` への `fstat` で
+/// 確かめた種別・デバイス番号と、開く実体が食い違わない（検査の後に名前を差し替えられても影響しない）。
+/// `O_NOCTTY` は、開いた端末を呼び出しプロセスの制御端末にしないため（検証済みの実体が端末でなくても常に付ける）。
+/// 呼び出し側の前提: `proc_dir` が本物の procfs であること（[`fs_type`] で [`PROC_MAGIC`] と照合済み）と、
+/// `pinned` の種別を確認済みであること。アロケーションを伴わない（fork 後の子から呼べる）。
+pub(crate) fn reopen_pinned_rdwr_noctty(
+    proc_dir: BorrowedFd<'_>,
+    pinned: BorrowedFd<'_>,
+) -> Result<OwnedFd, SysError> {
+    let mut buf = [0u8; 32];
+    let name = proc_fd_entry(pinned.as_raw_fd(), &mut buf).ok_or(SysError::Os(EBADF))?;
+    open_follow_at(proc_dir, name, consts::O_RDWR | consts::O_NOCTTY)
+}
+
+/// 保持中の `O_PATH` fd `pinned` が指す inode を、procfs のディレクトリ fd `proc_dir` 配下の
+/// `thread-self/fd/N`（magic link）経由で `O_RDONLY|O_NONBLOCK|O_NOCTTY|O_CLOEXEC` に開き直す
+/// （TASK-163 追補・#1458）。
+///
+/// `crate::exec` のインタープリタ検査が、ランタイムのバイナリでないことを `O_PATH` の fd で確かめた通常ファイルの
+/// 先頭を読むために使う。[`reopen_pinned_read_nonblock`] と違い `format!` を使わず（fork 後の子から呼ぶ）、
+/// 起点の procfs を呼び出し側が検証して渡す。前提は [`reopen_pinned_rdwr_noctty`] と同じ。
+pub(crate) fn reopen_pinned_read(
+    proc_dir: BorrowedFd<'_>,
+    pinned: BorrowedFd<'_>,
+) -> Result<OwnedFd, SysError> {
+    let mut buf = [0u8; 32];
+    let name = proc_fd_entry(pinned.as_raw_fd(), &mut buf).ok_or(SysError::Os(EBADF))?;
+    open_follow_at(
+        proc_dir,
+        name,
+        consts::O_RDONLY | consts::O_NONBLOCK | consts::O_NOCTTY,
+    )
 }
 
 /// `parent` 配下の既存ファイル `name` を書き込み専用（`O_NOFOLLOW`）で開く。
@@ -1378,6 +1950,67 @@ pub(crate) fn reset_sigpipe_default() -> Result<(), SysError> {
     } else {
         Ok(())
     }
+}
+
+/// 呼び出しプロセスを新しいセッションのリーダーにし、制御端末から切り離す（`setsid(2)`。
+/// SUP-6・SEC-1・TASK-163 追補・#1456）。戻り値は新しいセッション ID（= 呼び出しプロセスの pid）。
+///
+/// `crate::exec` の exec 直前の子（launch の PID 1・稼働中コンテナへの exec の子）が、呼び出し側の
+/// セッションと制御端末をコンテナ内のコマンドへ引き継がせないために呼ぶ。新しいセッションは制御端末を
+/// 持たないため、以後 `/dev/tty` は `ENXIO` になる（端末を `O_NOCTTY` なしで開けば取得し得るため、
+/// 呼び出し側は以後の open に `O_NOCTTY` を付ける）。呼び出しプロセスがプロセスグループのリーダーだと
+/// `EPERM`（fork 直後の子はリーダーでないため成立しない。失敗時は呼び出し側が fail-closed にする）。
+/// 引数・ポインタを取らず、アロケーション・ロックを伴わない（fork 後の子から呼べる）。
+// テストビルドでは dry-run 差し込み点が本関数を呼ばない（libtest のプロセスのセッションを変えないため）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn new_session() -> Result<u32, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数を取らずポインタも渡さない。効果は呼び出しプロセスのセッション・プロセスグループの
+    // 付け替えのみで、メモリには触れない。戻り値が -1 のときは直後に errno を確保する。
+    let sid = unsafe { setsid() };
+    if sid < 0 {
+        return Err(last_error());
+    }
+    u32::try_from(sid).map_err(|_| SysError::Os(EINVAL))
+}
+
+/// 呼び出しスレッドの補助グループの件数を返す（`getgroups(0, NULL)`。SUP-6・SEC-1・TASK-163 追補・#1457）。
+///
+/// `crate::exec` の capability 削減段が、補助グループを消去する前後に件数を確かめるために使う。サイズ 0 の
+/// 呼び出しはリストを書き込まず件数だけを返すため、バッファを渡さない。
+pub(crate) fn supplementary_group_count() -> Result<usize, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `getgroups(int size, gid_t *list)` に size = 0 と NULL を渡す。size が 0 のときカーネルは `list` を
+    // 参照せず件数だけを返す（getgroups(2)）ため、ポインタは読み書きされない。引数は register 幅の整数として渡す。
+    let count = unsafe { syscall(consts::SYS_GETGROUPS, 0i64, core::ptr::null_mut::<u32>()) };
+    if count < 0 {
+        return Err(last_error());
+    }
+    usize::try_from(count).map_err(|_| SysError::Os(EINVAL))
+}
+
+/// 呼び出しスレッドの補助グループをすべて消去する（`setgroups(0, NULL)`。SUP-6・SEC-1・SEC-5・TASK-163 追補・
+/// #1457）。
+///
+/// 自分の user namespace の `CAP_SETGID` を要し、user namespace が `setgroups` を `deny` にしている場合
+/// （非特権で作った user namespace。`/proc/<pid>/setgroups`）は権限があっても `EPERM` になる。生の syscall のため
+/// 効果は呼び出しスレッドだけに及ぶ（呼び出し側が単一スレッドであることを確かめる）。
+// テストビルドでは capability 削減段が偽のカーネルを使い、本関数を呼ばない（libtest のプロセスの資格情報を
+// 変えないため）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn clear_supplementary_groups() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `setgroups(size_t size, const gid_t *list)` に size = 0 と NULL を渡す。size が 0 のときカーネルは
+    // `list` を読まない（空のグループ集合を設定する）ため、ポインタは参照されない。効果は呼び出しスレッドの
+    // 資格情報（補助グループ）の変更のみで、メモリには触れない。
+    let rc = unsafe { syscall(consts::SYS_SETGROUPS, 0i64, core::ptr::null::<u32>()) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
 /// `signal(2)` の `SIG_DFL`（既定動作）と `SIG_ERR`（失敗）。`sighandler_t` はポインタ幅。
@@ -1511,6 +2144,97 @@ pub(crate) fn set_no_new_privs() -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// `RlimitKind` を `RLIMIT_*` の番号へ写す（網羅 match。アーキテクチャ別の値は `consts`）。
+fn rlimit_resource(kind: crate::rlimits::RlimitKind) -> i32 {
+    use crate::rlimits::RlimitKind as K;
+    match kind {
+        K::Cpu => consts::RLIMIT_CPU,
+        K::Fsize => consts::RLIMIT_FSIZE,
+        K::Data => consts::RLIMIT_DATA,
+        K::Stack => consts::RLIMIT_STACK,
+        K::Core => consts::RLIMIT_CORE,
+        K::Rss => consts::RLIMIT_RSS,
+        K::Nproc => consts::RLIMIT_NPROC,
+        K::Nofile => consts::RLIMIT_NOFILE,
+        K::Memlock => consts::RLIMIT_MEMLOCK,
+        K::As => consts::RLIMIT_AS,
+        K::Locks => consts::RLIMIT_LOCKS,
+        K::Sigpending => consts::RLIMIT_SIGPENDING,
+        K::Msgqueue => consts::RLIMIT_MSGQUEUE,
+        K::Nice => consts::RLIMIT_NICE,
+        K::Rtprio => consts::RLIMIT_RTPRIO,
+        K::Rttime => consts::RLIMIT_RTTIME,
+    }
+}
+
+/// `prlimit(2)` の薄い共通実装。`new` が `Some` なら設定、`None` なら読み取りだけ。旧値を返す。
+///
+/// `pid` は 0 で呼び出しプロセス自身。他プロセスを対象にする経路は `cfg(test)` の関数だけが使う。
+fn prlimit_raw(
+    pid: i32,
+    kind: crate::rlimits::RlimitKind,
+    new: Option<(u64, u64)>,
+) -> Result<(u64, u64), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let new_limit = new.map(|(cur, max)| RLimit64 { cur, max });
+    let mut old = RLimit64 { cur: 0, max: 0 };
+    let new_ptr = new_limit
+        .as_ref()
+        .map_or(core::ptr::null(), |r| r as *const RLimit64);
+    // SAFETY: `new_ptr` は NULL か、このスタックフレームの有効な `RLimit64`（呼び出しの間生存）を指し、
+    // カーネルは 16 バイトを読むだけ。`old` は書き込み可能な有効な `RLimit64` で、カーネルは 16 バイトだけ
+    // 書く。`resource` は網羅 match 由来の定数、`pid` は 0（自身）か呼び出し側が検査済みの値。
+    let rc = unsafe { prlimit(pid, rlimit_resource(kind), new_ptr, &mut old) };
+    if rc == -1 {
+        Err(last_error())
+    } else {
+        Ok((old.cur, old.max))
+    }
+}
+
+/// 呼び出しプロセス自身の rlimit を設定する（SUP-12・TASK-169.1・#526）。
+///
+/// `crate::exec` の `rlimits` ステージだけが fork 後の子から呼ぶ。`soft <= hard` は
+/// `crate::rlimits::Rlimit` が検証済み。hard の引き上げは `CAP_SYS_RESOURCE` が無いと `EPERM`。
+// `cfg(test)` では `exec/rlimits.rs` が偽物へ差し替えるため、テストビルドでは未使用になる。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn set_rlimit_self(
+    kind: crate::rlimits::RlimitKind,
+    soft: u64,
+    hard: u64,
+) -> Result<(), SysError> {
+    prlimit_raw(0, kind, Some((soft, hard))).map(|_old| ())
+}
+
+/// 呼び出しプロセス自身の rlimit `(soft, hard)` を読む。
+pub(crate) fn get_rlimit_self(kind: crate::rlimits::RlimitKind) -> Result<(u64, u64), SysError> {
+    prlimit_raw(0, kind, None)
+}
+
+/// 他プロセスの rlimit を読む（テスト専用。本番コードへ他プロセス操作の経路を増やさない）。
+#[cfg(test)]
+pub(crate) fn get_rlimit_of(
+    pid: u32,
+    kind: crate::rlimits::RlimitKind,
+) -> Result<(u64, u64), SysError> {
+    let pid = i32::try_from(pid).map_err(|_| SysError::Os(EINVAL))?;
+    prlimit_raw(pid, kind, None)
+}
+
+/// 他プロセスの rlimit を設定する（テスト専用）。
+#[cfg(test)]
+pub(crate) fn set_rlimit_of(
+    pid: u32,
+    kind: crate::rlimits::RlimitKind,
+    soft: u64,
+    hard: u64,
+) -> Result<(), SysError> {
+    let pid = i32::try_from(pid).map_err(|_| SysError::Os(EINVAL))?;
+    prlimit_raw(pid, kind, Some((soft, hard))).map(|_old| ())
+}
+
 /// 呼び出したスレッドの `NO_NEW_PRIVS` が立っているかを返す（`PR_GET_NO_NEW_PRIVS`）。
 pub(crate) fn no_new_privs_enabled() -> Result<bool, SysError> {
     if !consts::SUPPORTED {
@@ -1523,6 +2247,76 @@ pub(crate) fn no_new_privs_enabled() -> Result<bool, SysError> {
         -1 => Err(last_error()),
         0 => Ok(false),
         1 => Ok(true),
+        _ => Err(SysError::Os(EINVAL)),
+    }
+}
+
+/// 呼び出したプロセスを non-dumpable にする（`PR_SET_DUMPABLE` = 0。SUP-6・SEC-1・TASK-163.4・#503）。
+///
+/// `crate::exec` の exec 専用 worker（`spawn_exec_worker` の子）が、稼働中コンテナの namespace へ参加する前に
+/// 呼ぶ。exec の子は fork した時点でコンテナの PID namespace に入り、`close_range` と `execve` までの間
+/// コンテナ側の procfs から見える。dumpable のままだと、同じ uid のコンテナ内プロセスが `/proc/<pid>/fd` 等
+/// （`PTRACE_MODE_READ_FSCREDS`）や `ptrace` の attach を通じて、ホスト側の fd・メモリへ届く
+/// （CVE-2016-9962 型）。non-dumpable にすると、これらは対象の user namespace の `CAP_SYS_PTRACE` を持たない
+/// プロセスから拒否される。
+///
+/// フラグはプロセス（`mm`）単位で全スレッドに効き、fork で子へ継承される。`execve` は資格情報が変わらない
+/// 限り dumpable を 1 へ戻すため、コンテナ内で実行されるコマンド自身は launch 経路のプロセスと同じ扱いに
+/// なる。capability の削減（`capset`・bounding set の drop）は dumpable を変えない（カーネルが dumpable を
+/// 落とすのは uid / gid の変化か capability の増加のときだけ）。
+pub(crate) fn set_non_dumpable() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す
+    // （arg2 = 0 が `SUID_DUMP_DISABLE`。arg3〜5 はカーネルが参照しないが 0 に揃える）。呼び出した
+    // プロセスの `mm` のフラグを下げるだけで、メモリの内容・fd には触れない。
+    let rc = unsafe { prctl(consts::PR_SET_DUMPABLE, 0u64, 0u64, 0u64, 0u64) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 親が終了したら呼び出しプロセスへ `SIGKILL` が届くようにする（`PR_SET_PDEATHSIG`。SUP-6・REPAIR-5・
+/// TASK-163.4・#503）。
+///
+/// `crate::exec` の exec 経路（`exec/exec_command.rs`）で、fork した子（worker・コマンド）が最初に呼ぶ。
+/// worker が全体の期限で強制終了されたとき、worker が待っていたコマンドを孤児として残さないために使う。
+///
+/// - 対象は「このプロセスを作ったスレッド」の終了。設定より前に親が終了していた場合はシグナルが届かない
+///   ため、呼び出し側は設定の **後** に親の生存を別の手段（親の pidfd）で確かめること
+/// - 設定はプロセス（スレッド）単位で、fork した子へは継承されない。資格情報が変わらない `execve` では
+///   保持される（set-uid / capability 付きの実行ファイルではカーネルが解除するが、`NO_NEW_PRIVS` の下では
+///   資格情報が変わらない）。実行されたプログラム自身は `prctl` で解除できる
+/// - 親が別の PID namespace にいてもカーネルは届ける（`forget_original_parent` が子の `pdeath_signal` を送る）
+pub(crate) fn set_parent_death_sigkill() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let Ok(signal) = u64::try_from(consts::SIGKILL) else {
+        return Err(SysError::Os(EINVAL));
+    };
+    // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す
+    // （arg2 がシグナル番号。`SIGKILL` の定数だけを渡す。arg3〜5 はカーネルが参照しないが 0 に揃える）。
+    // 呼び出したスレッドの `pdeath_signal` を設定するだけで、メモリ・fd には触れない。
+    let rc = unsafe { prctl(consts::PR_SET_PDEATHSIG, signal, 0u64, 0u64, 0u64) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 呼び出したプロセスが dumpable か（`PR_GET_DUMPABLE`。SUP-6・SEC-1・TASK-163.4・#503）。
+///
+/// `0`（`SUID_DUMP_DISABLE`）だけを non-dumpable として `Ok(false)` を返す。`1`（`SUID_DUMP_USER`）と
+/// `2`（`SUID_DUMP_ROOT`。`fs.suid_dumpable=2` のホストで資格情報が変わったプロセス）は、コンテナ側から
+/// procfs 経由で読める・core が書かれる状態を含むため `Ok(true)`。想定外の値は `EINVAL`（fail-closed）。
+pub(crate) fn is_dumpable() -> Result<bool, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は u64 の 0 を 4 つ渡す（カーネルは参照しない）。
+    // 読み取りだけで状態を変えない。
+    let rc = unsafe { prctl(consts::PR_GET_DUMPABLE, 0u64, 0u64, 0u64, 0u64) };
+    match rc {
+        -1 => Err(last_error()),
+        0 => Ok(false),
+        1 | 2 => Ok(true),
         _ => Err(SysError::Os(EINVAL)),
     }
 }
@@ -2028,7 +2822,8 @@ mod tests {
     fn core3_task32_1_fs_type_identifies_procfs_not_cgroup2() {
         let proc_dir = std::fs::File::open("/proc").unwrap();
         // procfs の PROC_SUPER_MAGIC（include/uapi/linux/magic.h）。
-        assert_eq!(fs_type(proc_dir.as_fd()), Ok(0x9fa0));
+        assert_eq!(PROC_MAGIC, 0x9fa0);
+        assert_eq!(fs_type(proc_dir.as_fd()), Ok(PROC_MAGIC));
         assert_ne!(fs_type(proc_dir.as_fd()), Ok(CGROUP2_MAGIC));
     }
 
@@ -2037,8 +2832,8 @@ mod tests {
     #[test]
     fn core3_task32_1_mkdir_open_remove_roundtrip() {
         use std::io::Write as _;
-        let base = std::env::temp_dir().join(format!("fc-sys-test-{}", std::process::id()));
-        std::fs::create_dir_all(&base).unwrap();
+        let guard = crate::test_support::TestTempDir::new("sys-roundtrip").unwrap();
+        let base = guard.path().to_path_buf();
         let dir = std::fs::File::open(&base).unwrap();
         let name = CString::new("child").unwrap();
         assert_eq!(mkdir_at(dir.as_fd(), &name, 0o755), Ok(()));
@@ -2057,7 +2852,24 @@ mod tests {
         );
         assert_eq!(remove_dir_at(dir.as_fd(), &name), Ok(()));
         assert_eq!(remove_dir_at(dir.as_fd(), &name), Err(SysError::Os(ENOENT)));
-        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// SUP-6・SEC-1・TASK-163 追補（#1457）: `getgroups` / `setgroups` の syscall 番号（x86_64 は
+    /// syscall_64.tbl、aarch64 は asm-generic/unistd.h）と、件数の取得が実プロセスの `Groups:` と一致すること。
+    #[test]
+    fn sup6_task163_group_syscall_numbers_and_count_are_exact() {
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!((consts::SYS_GETGROUPS, consts::SYS_SETGROUPS), (115, 116));
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!((consts::SYS_GETGROUPS, consts::SYS_SETGROUPS), (158, 159));
+        let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+        let groups = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Groups:"))
+            .unwrap()
+            .split_whitespace()
+            .count();
+        assert_eq!(supplementary_group_count(), Ok(groups));
     }
 
     /// SEC-1・TASK-37.1: capability 関連の定数の具体値。
@@ -2140,6 +2952,31 @@ mod tests {
         assert_eq!(consts::PR_GET_NO_NEW_PRIVS, 39);
     }
 
+    /// SUP-6・TASK-163.4: `prctl` の dumpable・親死亡シグナルのオプションの具体値（include/uapi/linux/prctl.h）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sup6_task163_4_prctl_dumpable_consts_are_exact() {
+        assert_eq!(consts::PR_GET_DUMPABLE, 3);
+        assert_eq!(consts::PR_SET_DUMPABLE, 4);
+        assert_eq!(consts::PR_SET_PDEATHSIG, 1);
+        // 親死亡シグナルの実 syscall は単体テストでは呼ばない（設定はスレッド単位で、テストプロセスを起動した
+        // スレッドが先に終わるとテストプロセス全体へ SIGKILL が届く）。実プロセスでの照合は supervisor の
+        // 結合試験 `exec_timeout` が行う。
+    }
+
+    /// SUP-6・SEC-1・TASK-163.4: テストプロセス自身は dumpable（`PR_GET_DUMPABLE` が 1）で、`/proc/self` 配下の
+    /// 所有者は自分の euid。dumpable はプロセス単位で元へ戻すと他のテストと競合するため、ここでは読み取り
+    /// だけを確かめる。`set_non_dumpable` の実 syscall と読み戻しは、単一スレッドの使い捨て worker で行う
+    /// supervisor の結合試験 `exec_timeout`（既定のテスト集合）が照合する。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sup6_task163_4_test_process_is_dumpable() {
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!(is_dumpable(), Ok(true));
+        let owner = std::fs::metadata("/proc/self/fd").unwrap().uid();
+        assert_eq!(owner, effective_uid());
+    }
+
     /// CORE-1・TASK-27.4.3: 専用スレッドで set し、GET と /proc の値で確認する（冪等）。
     /// フラグはスレッド単位なので、libtest の他スレッドに影響を残さないよう使い捨てスレッドで行う。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -2168,6 +3005,25 @@ mod tests {
         assert_eq!(NsFlag::Pid.bits(), 0x2000_0000);
     }
 
+    /// SUP-6・TASK-163.1: network namespace のビット値。
+    #[test]
+    fn sup6_ns_flag_net_bits_are_exact() {
+        assert_eq!(NsFlag::Net.bits(), 0x4000_0000);
+    }
+
+    /// SUP-6・TASK-163.1: 空集合・user namespace は拒否し、namespace でない fd は EINVAL（副作用なし）。
+    #[test]
+    fn sup6_setns_pidfd_rejects_invalid_input() {
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let fd = std::os::fd::AsFd::as_fd(&null);
+        assert_eq!(setns_pidfd(fd, &[]), Err(SysError::Os(EINVAL)));
+        assert_eq!(setns_pidfd(fd, &[NsFlag::User]), Err(SysError::Os(EINVAL)));
+        assert_eq!(
+            setns_pidfd(fd, &[NsFlag::Mount, NsFlag::Net]),
+            Err(SysError::Os(EINVAL))
+        );
+    }
+
     /// x86_64: open フラグ・errno は asm-generic の値（include/uapi/asm-generic/fcntl.h・
     /// errno-base.h・errno.h）。
     #[cfg(target_arch = "x86_64")]
@@ -2184,6 +3040,123 @@ mod tests {
             (EPERM, ENOENT, EACCES, ENOTDIR, EINVAL, ELOOP),
             (1, 2, 13, 20, 22, 40)
         );
+    }
+
+    /// SUP-12（TASK-169.2）: tmpfs のフラグは nosuid・nodev を常に含み、可変なのは ro / exec だけ。
+    #[test]
+    fn sup12_task169_2_tmpfs_flags_are_exact() {
+        let f = |read_only, exec| TmpfsMountFlags { read_only, exec }.bits();
+        assert_eq!(f(false, false), 2 | 4 | 8);
+        assert_eq!(f(true, false), 1 | 2 | 4 | 8);
+        assert_eq!(f(false, true), 2 | 4);
+        assert_eq!(f(true, true), 1 | 2 | 4);
+        assert_eq!(TMPFS_MAGIC, 0x0102_1994);
+    }
+
+    /// SUP-12（TASK-169 追補・#1472）: `fsmount` の attr フラグは nosuid・nodev を常に含み、可変なのは
+    /// ro / exec だけ（`MOUNT_ATTR_*` は `MS_*` と別の名前つき定数から組む）。
+    #[test]
+    fn sup12_task169_tmpfs_attr_bits_are_exact() {
+        let f = |read_only, exec| TmpfsMountFlags { read_only, exec }.attr_bits();
+        assert_eq!(f(false, false), 2 | 4 | 8);
+        assert_eq!(f(true, false), 1 | 2 | 4 | 8);
+        assert_eq!(f(false, true), 2 | 4);
+        assert_eq!(f(true, true), 1 | 2 | 4);
+    }
+
+    /// SUP-12（TASK-169 追補・#1472）: 新マウント API の syscall 番号・フラグの具体値。番号は x86_64 と
+    /// aarch64（asm-generic）で個別に定義し、どちらも 429〜432。
+    #[test]
+    fn sup12_task169_new_mount_api_consts_are_exact() {
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            (
+                consts::SYS_MOVE_MOUNT,
+                consts::SYS_FSOPEN,
+                consts::SYS_FSCONFIG,
+                consts::SYS_FSMOUNT
+            ),
+            (429, 430, 431, 432)
+        );
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(
+            (
+                consts::SYS_MOVE_MOUNT,
+                consts::SYS_FSOPEN,
+                consts::SYS_FSCONFIG,
+                consts::SYS_FSMOUNT
+            ),
+            (429, 430, 431, 432)
+        );
+        assert_eq!(
+            (
+                consts::FSOPEN_CLOEXEC,
+                consts::FSMOUNT_CLOEXEC,
+                consts::FSCONFIG_SET_FLAG,
+                consts::FSCONFIG_SET_STRING,
+                consts::FSCONFIG_CMD_CREATE
+            ),
+            (1, 1, 0, 1, 6)
+        );
+        assert_eq!(
+            (
+                consts::MOUNT_ATTR_RDONLY,
+                consts::MOUNT_ATTR_NOSUID,
+                consts::MOUNT_ATTR_NODEV,
+                consts::MOUNT_ATTR_NOEXEC
+            ),
+            (1, 2, 4, 8)
+        );
+        assert_eq!(
+            (
+                consts::MOVE_MOUNT_F_EMPTY_PATH,
+                consts::MOVE_MOUNT_T_EMPTY_PATH
+            ),
+            (0x4, 0x40)
+        );
+    }
+
+    /// SUP-12（TASK-169.4.2）: 再マウント・作成系フラグの定数値（x86_64・aarch64 共通）。
+    #[test]
+    fn sup12_task169_4_2_inject_consts_are_exact() {
+        assert_eq!(consts::MS_REMOUNT, 0x20);
+        assert_eq!(
+            (consts::O_CREAT, consts::O_EXCL, consts::O_WRONLY),
+            (0o100, 0o200, 1)
+        );
+    }
+
+    /// SUP-12（TASK-169.4.2）: `create_file_excl_at` は新規作成でき、既存名・既存 symlink 名は
+    /// `EEXIST`（辿らない）。
+    #[test]
+    fn sup12_task169_4_2_create_file_excl_at_refuses_existing_names() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let dir = std::env::temp_dir().join(format!("fandhe-sys-excl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let parent =
+            open_dir_path_nofollow(None, &CString::new(dir.to_str().expect("utf8")).expect("c"))
+                .expect("open dir");
+        let name = CString::new("new").expect("c");
+        let fd = create_file_excl_at(parent.as_fd(), &name, 0o600).expect("create");
+        drop(fd);
+        let mode = std::fs::metadata(dir.join("new"))
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777 & !0o077, 0o600 & !0o077);
+        assert_eq!(
+            create_file_excl_at(parent.as_fd(), &name, 0o600).expect_err("exists"),
+            SysError::Os(EEXIST)
+        );
+        symlink(dir.join("target-not-created"), dir.join("link")).expect("symlink");
+        let link = CString::new("link").expect("c");
+        assert_eq!(
+            create_file_excl_at(parent.as_fd(), &link, 0o600).expect_err("symlink"),
+            SysError::Os(EEXIST)
+        );
+        assert!(!dir.join("target-not-created").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// CORE-1（TASK-27.3）: mount 系フラグ・pivot_root の syscall 番号の具体値。番号は arch ごとに
@@ -2214,6 +3187,46 @@ mod tests {
         assert_eq!(
             (EPERM, ENOENT, EACCES, ENOTDIR, EINVAL, ELOOP),
             (1, 2, 13, 20, 22, 40)
+        );
+    }
+
+    /// SUP-6・TASK-163 追補（#1459）: `O_NOCTTY` の値（x86_64・aarch64 とも asm-generic の 0o400）と、
+    /// procfs の fd エントリ名の組み立て（アロケーションなし）の具体値。
+    #[test]
+    fn sup6_task163_noctty_const_and_proc_fd_entry_are_exact() {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        assert_eq!(consts::O_NOCTTY, 0o400);
+        let mut buf = [0u8; 32];
+        assert_eq!(proc_fd_entry(0, &mut buf), Some(c"thread-self/fd/0"));
+        assert_eq!(proc_fd_entry(7, &mut buf), Some(c"thread-self/fd/7"));
+        assert_eq!(proc_fd_entry(1048, &mut buf), Some(c"thread-self/fd/1048"));
+        assert_eq!(
+            proc_fd_entry(i32::MAX, &mut buf),
+            Some(c"thread-self/fd/2147483647")
+        );
+        assert_eq!(proc_fd_entry(-1, &mut buf), None);
+    }
+
+    /// SUP-6・SEC-1・TASK-163 追補（#1459）: 固定した `O_PATH` fd を procfs の magic link 経由で読み書きに
+    /// 開き直すと、パスを再解決せず同じ inode（`/dev/null` = 文字デバイス 1:3）が開く。
+    #[test]
+    fn sup6_task163_reopen_pinned_rdwr_opens_the_pinned_inode() {
+        use std::io::Write as _;
+        use std::os::fd::AsFd as _;
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+        let proc_dir = open_dir_path_nofollow(None, c"/proc").unwrap();
+        let dev = open_dir_path_nofollow(None, c"/dev").unwrap();
+        let pinned = open_path_nofollow(dev.as_fd(), c"null").unwrap();
+        let reopened = reopen_pinned_rdwr_noctty(proc_dir.as_fd(), pinned.as_fd()).unwrap();
+        let mut file = std::fs::File::from(reopened);
+        let meta = file.metadata().unwrap();
+        assert!(meta.file_type().is_char_device());
+        assert_eq!(meta.rdev(), makedev(1, 3));
+        assert_eq!(file.write(b"x").unwrap(), 1);
+        // procfs でないディレクトリを起点にすると、エントリが無く開けない（ENOENT）。
+        assert_eq!(
+            reopen_pinned_rdwr_noctty(dev.as_fd(), pinned.as_fd()).unwrap_err(),
+            SysError::Os(ENOENT)
         );
     }
 
@@ -2265,6 +3278,24 @@ mod tests {
         assert_eq!(err, SysError::MultiThreaded);
         tx.send(()).unwrap();
         helper.join().unwrap();
+    }
+
+    /// SUP-6（TASK-163.4）: 呼び出し側が渡す判定が偽なら、スレッド数によらず fork せず `MultiThreaded` で拒否する
+    /// （子のクロージャは実行されない）。判定の出所が変わっても「確認が偽なら fork しない」強制は同じ。
+    #[test]
+    fn sup6_task163_4_fork_with_refuses_when_predicate_is_false() {
+        let ran = std::cell::Cell::new(false);
+        let err = fork_single_threaded_with(
+            || false,
+            || {
+                ran.set(true);
+                0
+            },
+            125,
+        )
+        .unwrap_err();
+        assert_eq!(err, SysError::MultiThreaded);
+        assert!(!ran.get());
     }
 
     /// CORE-1（TASK-27.4.1）: `execve` の引数配列は要素数 + 1 の NULL 終端。
@@ -2350,22 +3381,86 @@ mod tests {
         assert_eq!(status & 0x7f, 15);
     }
 
+    /// SUP-12・TASK-169.1: RLIMIT_* の番号を固定値で照合する（asm-generic/resource.h）。
+    #[test]
+    fn sup12_rlimit_constants_are_fixed() {
+        use crate::rlimits::RlimitKind;
+        let got: Vec<i32> = RlimitKind::ALL
+            .iter()
+            .map(|k| rlimit_resource(*k))
+            .collect();
+        assert_eq!(got, (0..16).collect::<Vec<i32>>());
+        assert_eq!(consts::RLIMIT_NOFILE, 7);
+        assert_eq!(consts::RLIMIT_CORE, 4);
+    }
+
+    /// SUP-12・TASK-169.1: 自プロセスの rlimit が soft <= hard で読める（変更はしない）。
+    #[test]
+    fn sup12_get_rlimit_self_is_consistent() {
+        let (soft, hard) = get_rlimit_self(crate::rlimits::RlimitKind::Nofile).unwrap();
+        assert!(soft <= hard, "soft={soft} hard={hard}");
+    }
+
+    /// SUP-12・TASK-169.1: 別プロセス（sleep の子）へ設定した値が読み戻しと `/proc/<pid>/limits` の
+    /// 両方で具体値として一致する（テストプロセス自身の制限は変えない）。
+    #[test]
+    fn sup12_set_rlimit_of_child_is_reflected() {
+        use crate::rlimits::RlimitKind;
+        /// テストが失敗しても子を残さない。
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = KillOnDrop(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        let (_, hard) = get_rlimit_of(pid, RlimitKind::Nofile).unwrap();
+        let soft = 64u64;
+        let hard = hard.min(4096).max(soft);
+        set_rlimit_of(pid, RlimitKind::Nofile, soft, hard).unwrap();
+        assert_eq!(
+            get_rlimit_of(pid, RlimitKind::Nofile).unwrap(),
+            (soft, hard)
+        );
+        let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).unwrap();
+        let line = limits
+            .lines()
+            .find(|l| l.starts_with("Max open files"))
+            .unwrap()
+            .to_owned();
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        // "Max open files <soft> <hard> files"
+        assert_eq!(cols.get(3).copied(), Some("64"), "{line}");
+        assert_eq!(
+            cols.get(4).copied(),
+            Some(hard.to_string().as_str()),
+            "{line}"
+        );
+    }
+
     /// テスト用の一時ディレクトリ（`chmod` で絞ったディレクトリを戻してから削除する）。
     struct TempTree {
         base: std::path::PathBuf,
         restore: Vec<std::path::PathBuf>,
+        /// 排他作成した本体（#1298）。`Drop::drop`（chmod 復元）の後にフィールドとして drop され削除する。
+        _guard: crate::test_support::TestTempDir,
     }
 
     impl TempTree {
         fn new(label: &str) -> Self {
-            let base = std::fs::canonicalize(std::env::temp_dir())
-                .unwrap()
-                .join(format!("fandhe-sys-{label}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&base);
-            std::fs::create_dir_all(&base).unwrap();
+            let guard = crate::test_support::TestTempDir::new(&format!("sys-{label}")).unwrap();
             Self {
-                base,
+                base: guard.path().to_path_buf(),
                 restore: Vec::new(),
+                _guard: guard,
             }
         }
     }
@@ -2376,7 +3471,6 @@ mod tests {
             for p in &self.restore {
                 let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700));
             }
-            let _ = std::fs::remove_dir_all(&self.base);
         }
     }
 

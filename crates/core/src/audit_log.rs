@@ -2,7 +2,7 @@
 //!
 //! # 役割
 //!
-//! seccomp・Landlock・マウント検証/API・plugin 信頼検証（TASK-122.5）の 4 レイヤーで起きた分離違反の試行を、原因特定に必要な情報
+//! seccomp・Landlock・マウント検証/API・plugin 信頼検証（TASK-122.5）・exec 対象（#1465）の 5 レイヤーで起きた分離違反の試行を、原因特定に必要な情報
 //! （syscall 番号・対象パス・プロセス ID・タイムスタンプ）付きで表す固定スキーマの型を定義する。
 //! 本モジュールは型のみで、syscall も I/O も持たない（OS 非依存。3 OS でコンパイルされる）。
 //!
@@ -10,7 +10,10 @@
 //!
 //! - マウント検証/API レイヤーの記録ヘルパと記録先トレイトは [`mount`]・[`AuditSink`]（TASK-41.4・#195。
 //!   `exec::audit_mount_violation` と `oci_runtime::audit_mount_config_error` がここを使う。
-//!   本番経路への配線・永続化は未実装）
+//!   ファイルへの永続化は実装済みで、本番経路への sink の配線は未実装）
+//! - exec の対象の拒否（層 `exec_target`）は `exec::audit_exec_violation` / `exec::record_exec_target_rejection`
+//!   が [`AuditEvent::ExecTarget`] として記録する。supervisor の通しの入口 `run_command` が親プロセス側で
+//!   1 拒否 1 件を記録する（#1465）。パスは持たない（型で保証）
 //! - TASK-41.3（#194）の Landlock フックは [`landlock_denial_record`] で実装済み（プロセス内で観測した
 //!   `EACCES` の写像まで。ワークロードの拒否のカーネル側監査〔Linux 6.15+ の `AUDIT_LANDLOCK_*`〕による
 //!   捕捉は未実装）
@@ -247,7 +250,7 @@ impl AuditTimestamp {
 /// UTF-8 文字境界で切り詰めて保持し（`ViolationSubject::from_path` と同じ方針）、
 /// 元のバイト長を [`AuditPath::original_len`] で残す。
 ///
-/// 改行・制御文字・NUL を含みうるため、出力時は書き込み側（#839）が必ずエスケープすること
+/// 改行・制御文字・NUL を含みうるため、出力時は書き込み側（`file_writer`・実装済み）が必ずエスケープすること
 /// （ログ注入対策）。相対パスも要求しない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditPath {
@@ -335,6 +338,8 @@ pub enum AuditLayer {
     Mount,
     /// plugin 信頼検証（所有者・モード・ハッシュ。PLUG-11・SEC-4・TASK-122.5）。
     PluginTrust,
+    /// 稼働中コンテナへの exec の対象の拒否（SEC-4・SUP-6・TASK-163 追補・#1465）。
+    ExecTarget,
 }
 
 impl AuditLayer {
@@ -345,6 +350,7 @@ impl AuditLayer {
             AuditLayer::Landlock => "landlock",
             AuditLayer::Mount => "mount",
             AuditLayer::PluginTrust => "plugin_trust",
+            AuditLayer::ExecTarget => "exec_target",
         }
     }
 }
@@ -386,6 +392,15 @@ pub enum AuditEvent {
         /// 拒否理由トークン（静的トークン。[`AuditReason`] 参照）。
         reason: AuditReason,
     },
+    /// 稼働中コンテナへの exec の対象の拒否（SEC-4・SUP-6・TASK-163 追補・#1465）。
+    ///
+    /// 理由トークンだけを持ち、**パスは持たない**（型で保証する。REPAIR-2）。期待 cgroup パス・
+    /// ホスト側パス・namespace 識別子はコンテナ ID と cgroup 配置の記録から再導出でき原因特定に不要で、
+    /// システム共通の監査ログ（カーネル監査フォールバック）へホスト構成を露出させないため。
+    ExecTarget {
+        /// 拒否理由トークン（`exec_target_*` 等の静的トークン。[`AuditReason`] 参照）。
+        reason: AuditReason,
+    },
 }
 
 impl AuditEvent {
@@ -396,6 +411,7 @@ impl AuditEvent {
             AuditEvent::Landlock { .. } => AuditLayer::Landlock,
             AuditEvent::Mount { .. } => AuditLayer::Mount,
             AuditEvent::PluginTrust { .. } => AuditLayer::PluginTrust,
+            AuditEvent::ExecTarget { .. } => AuditLayer::ExecTarget,
         }
     }
 }
@@ -444,7 +460,9 @@ impl AuditRecord {
         match &self.event {
             AuditEvent::Seccomp { syscall, .. } => Some(*syscall),
             AuditEvent::Landlock { syscall, .. } => *syscall,
-            AuditEvent::Mount { .. } | AuditEvent::PluginTrust { .. } => None,
+            AuditEvent::Mount { .. }
+            | AuditEvent::PluginTrust { .. }
+            | AuditEvent::ExecTarget { .. } => None,
         }
     }
 
@@ -459,17 +477,19 @@ impl AuditRecord {
     /// 対象パスがあれば返す。
     pub fn path(&self) -> Option<&Path> {
         match &self.event {
-            AuditEvent::Seccomp { .. } => None,
+            AuditEvent::Seccomp { .. } | AuditEvent::ExecTarget { .. } => None,
             AuditEvent::Landlock { path, .. } => Some(path.as_path()),
             AuditEvent::Mount { path } => path.as_ref().map(AuditPath::as_path),
             AuditEvent::PluginTrust { path, .. } => Some(path.as_path()),
         }
     }
 
-    /// 拒否理由トークン（plugin 信頼検証レコードのみ。他レイヤーは `None`）。
+    /// 拒否理由トークン（plugin 信頼検証・exec 対象のレコードのみ。他レイヤーは `None`）。
     pub fn reason(&self) -> Option<AuditReason> {
         match &self.event {
-            AuditEvent::PluginTrust { reason, .. } => Some(*reason),
+            AuditEvent::PluginTrust { reason, .. } | AuditEvent::ExecTarget { reason } => {
+                Some(*reason)
+            }
             _ => None,
         }
     }
@@ -559,6 +579,28 @@ mod tests {
         assert_eq!(AuditLayer::Seccomp.as_str(), "seccomp");
         assert_eq!(AuditLayer::Landlock.as_str(), "landlock");
         assert_eq!(AuditLayer::Mount.as_str(), "mount");
+        assert_eq!(AuditLayer::ExecTarget.as_str(), "exec_target");
+    }
+
+    /// SEC-4・SUP-6・TASK-163 追補: exec 対象レコードは理由だけを持ち、パス・syscall は持たない。
+    #[test]
+    fn sec4_sup6_task163_exec_target_record_accessors() {
+        let r = AuditRecord::new(
+            ts(),
+            pid(11),
+            AuditEvent::ExecTarget {
+                reason: AuditReason::new("exec_target_cgroup_mismatch"),
+            },
+        );
+        assert_eq!(r.layer(), AuditLayer::ExecTarget);
+        assert_eq!(
+            r.reason().map(AuditReason::as_str),
+            Some("exec_target_cgroup_mismatch")
+        );
+        assert_eq!(r.path(), None);
+        assert_eq!(r.syscall(), None);
+        assert_eq!(r.seccomp_arch(), None);
+        assert_eq!(r.pid().get(), 11);
     }
 
     #[test]

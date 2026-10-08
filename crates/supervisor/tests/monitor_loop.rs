@@ -34,9 +34,11 @@ fn sup1_task157_4_run_rs_has_no_global_state_or_raw_pid_access() {
 fn sup1_task157_4_manifest_has_only_core_dependency() {
     const MANIFEST: &str = include_str!("../Cargo.toml");
     let deps = MANIFEST.split("[dependencies]").nth(1).unwrap_or("");
+    // `[dependencies]` 節のみを対象にする（後続の `[[test]]` 等のテーブルは依存ではない）。
     let entries: Vec<&str> = deps
         .lines()
         .map(str::trim)
+        .take_while(|l| !l.starts_with('['))
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect();
     assert_eq!(entries, ["fandhe-container-core = { path = \"../core\" }"]);
@@ -60,16 +62,22 @@ fn sup1_task157_5_run_rs_documents_unimplemented_restart_policy() {
     }
 }
 
-/// TASK-157.5 AC1: 異常終了時の restart_count 更新は最新レコードからの飽和加算で行う。
+/// TASK-159.3 AC1: `restart_count` の加算は再 launch 成功時（restart.rs）だけが最新レコードからの飽和加算で行い、
+/// 終了記録（run.rs）は加算しない。
 #[test]
-fn sup1_task157_5_run_rs_updates_restart_count_with_saturation() {
-    const RUN_RS: &str = include_str!("../src/run.rs");
-    let body = RUN_RS.split("#[cfg(test)]").next().unwrap_or(RUN_RS);
-    let code: String = body
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(code.contains("restart_count().saturating_add(1)"));
-    assert!(!code.contains("restart_count() + 1"));
+fn sup3_task159_3_restart_count_is_incremented_only_on_relaunch() {
+    fn code_of(src: &str) -> String {
+        let body = src.split("#[cfg(test)]").next().unwrap_or(src);
+        body.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    let run_rs = code_of(include_str!("../src/run.rs"));
+    let restart_rs = code_of(include_str!("../src/restart.rs"));
+    assert!(restart_rs.contains("restart_count().saturating_add(1)"));
+    assert!(!restart_rs.contains("restart_count() + 1"));
+    assert!(!run_rs.contains("saturating_add"));
+    assert!(!run_rs.contains("restart_count() + 1"));
+    assert!(!run_rs.contains("is_abnormal_exit"));
 }

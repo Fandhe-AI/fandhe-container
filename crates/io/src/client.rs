@@ -135,7 +135,7 @@ impl Default for InFlightLimit {
 /// [`RequestId`] へ埋め込み、id の発行元キューが自分自身と一致するかを検証してから
 /// 解放できるようにする。
 ///
-/// [`Self::allocate`] は `counter`（[`SendQueue::new`] からは
+/// `Self::allocate` は `counter`（[`SendQueue::new`] からは
 /// プロセス全体で共有する `static` を渡す）を `checked_add` 相当
 /// （[`AtomicU64::try_update`]）で進め、`u64` の範囲を超える採番を
 /// [`IoErrorCode::ResourceExhausted`] として検出する。`u64::MAX` 個の
@@ -265,7 +265,7 @@ pub struct SendQueue {
 
 impl SendQueue {
     /// 上限件数を指定してキューを作る。発行元識別子はプロセス全体で共有する
-    /// `static` カウンタ（[`NEXT_QUEUE_ID`]）から採番する。
+    /// `static` カウンタ（`NEXT_QUEUE_ID`）から採番する。
     pub fn new(limit: InFlightLimit) -> Self {
         Self::with_queue_id_counter(limit, &NEXT_QUEUE_ID)
     }
@@ -381,7 +381,7 @@ impl SendQueue {
     /// `kind` が [`FrameKind::Write`] / [`FrameKind::Flush`] 以外
     /// （[`FrameKind::Ack`] / [`FrameKind::FlushAck`]）の場合は
     /// [`IoErrorCode::InvalidArgument`] を返し、キューの状態を変更しない
-    /// （[`ensure_trackable_frame_kind`]。codex レビュー指摘: これらは応答フレームで
+    /// （`ensure_trackable_frame_kind`。codex レビュー指摘: これらは応答フレームで
     /// 対応する ACK が来ず、登録すると未 ACK キューの枠が解放されないまま残る）。
     /// 上限に達している場合、または id の採番が `u64` の範囲を超える場合は
     /// [`IoErrorCode::ResourceExhausted`] を返し、キューの状態を変更しない。
@@ -515,7 +515,7 @@ pub enum SendOutcome {
 /// 表し、バケット `0` は `0µs` 以上 `1µs` 未満を表す。最後のバケット
 /// （`LATENCY_HISTOGRAM_BUCKETS - 1`）は上限なしで
 /// `2^(LATENCY_HISTOGRAM_BUCKETS - 2)` マイクロ秒以上のすべてを受け持つ
-/// （[`latency_bucket_index`]）。`25` は、最後のバケットの下限
+/// （`latency_bucket_index`）。`25` は、最後のバケットの下限
 /// （`2^23 = 8_388_608µs` ≒ 8.39 秒）が [`crate::transport::MAX_IO_TIMEOUT`]
 /// （10 秒）以下になるよう選んだ値で、`MAX_IO_TIMEOUT` を超える所要時間は必ず
 /// 最後のバケットに入る（下記の `const` assert で保証する）。
@@ -1011,7 +1011,7 @@ where
         &mut self.observer
     }
 
-    /// このクライアントが失効済み（[`Self::poisoned`] 参照）かどうかを返す。
+    /// このクライアントが失効済み（`Self::poisoned` 参照）かどうかを返す。
     ///
     /// `true` の場合、[`Self::send`] は常に [`IoErrorCode::Unavailable`] を返す。
     /// [`Self::into_inner`] も同様に `Err` を返してトランスポートを drop するため
@@ -1090,12 +1090,12 @@ where
     ///    （[`FrameKind::Ack`] / [`FrameKind::FlushAck`] は応答フレームであり
     ///    対応する ACK が来ないため、未 ACK キューに載せると枠が解放されない。
     ///    IO-1 の未 ACK リクエスト追跡契約の対象外）なら
-    ///    [`IoErrorCode::InvalidArgument`] を返す（[`ensure_trackable_frame_kind`]。
+    ///    [`IoErrorCode::InvalidArgument`] を返す（`ensure_trackable_frame_kind`。
     ///    [`SendQueue::register`] も同じ検証を共有する）
-    /// 3. [`SendQueue::ensure_can_register`] で未 ACK 件数の上限到達・id 採番の
+    /// 3. `SendQueue::ensure_can_register` で未 ACK 件数の上限到達・id 採番の
     ///    溢れを検証する。不可なら [`IoErrorCode::ResourceExhausted`] を返す
     ///    （この時点ではトランスポートへ書き込まない）
-    /// 4. [`SendQueue::peek_next_id`] で次に採番されるであろう id を覗き見て、
+    /// 4. `SendQueue::peek_next_id` で次に採番されるであろう id を覗き見て、
     ///    [`crate::payload::encode_request`] でフレームを組み立てる。この時点では
     ///    まだキューへ登録せず、トランスポートへも書き込まない。ペイロード形式の
     ///    検証（`Write` の body 長超過・`Flush` に body がある等）が失敗した場合は
@@ -1109,7 +1109,7 @@ where
     /// 6. `sender.send_frame` でトランスポートへ書き出す。失敗した場合、
     ///    [`FrameSender::send_frame`] は「相手に届いていないことを保証しない」
     ///    契約であるため、届いた可能性を残したまま id を回収せず（キューの
-    ///    エントリはそのまま残す）、[`Self::poisoned`] を立てて以降の送信を
+    ///    エントリはそのまま残す）、`Self::poisoned` を立てて以降の送信を
     ///    すべて拒否し、エラーを返す
     ///
     /// `timeout` は 1 回の書き込みにそのまま渡す（ACK を待つものではない。
@@ -1347,7 +1347,7 @@ where
     ///    返す（`self.sender.recv_frame` は呼ばない。待つ対象がない呼び出しの
     ///    誤りであり、プロトコル違反ではないため接続は失効させない）
     /// 3. `self.sender.recv_frame(timeout)` を呼ぶ。`Err` なら本メソッドが
-    ///    [`Self::poisoned`] を立ててから、そのエラー（[`IoErrorCode::Timeout`] を
+    ///    `Self::poisoned` を立ててから、そのエラー（[`IoErrorCode::Timeout`] を
     ///    含む）をそのまま返す。[`FrameReceiver::recv_frame`] の契約
     ///    （P1-3・`crate::transport` モジュールドキュメント）により、エラーを
     ///    返した接続は以後使用不可であり、「まだ ACK が来ていないので再試行」
@@ -2491,7 +2491,7 @@ mod tests {
     /// が `SendObserver::on_send` へ渡す `SendEventError::message` は、
     /// `PipelineClient::send` が最終的に返す `IoError::message()` と同じヒープ
     /// バッファを指す借用であり、複製されていないことを `ptr::eq` とアドレス・
-    /// 長さの一致で照合する。複製が起きていれば、1 MiB のメッセージに対して
+    /// 長さの一致で照合する。複製が起きていれば、`IoError` の上限（1024 バイト）を超える 1 MiB の入力に対して
     /// このアドレス一致は成立しない。
     #[test]
     fn repair5_repair12_notify_borrows_error_message_without_copying_huge_message() {
@@ -2502,7 +2502,9 @@ mod tests {
         let err = client
             .send(FrameKind::Write, &[1], test_timeout())
             .expect_err("the mock sender always fails");
-        assert_eq!(err.message().len(), HUGE_MESSAGE_LEN);
+        // #1116: `IoError::new` が 1 MiB を上限へ切り詰める。
+        assert_eq!(err.message().len(), crate::MAX_IO_ERROR_MESSAGE_BYTES);
+        assert!(err.message_truncated());
 
         let (captured_addr, captured_len) = client
             .observer()

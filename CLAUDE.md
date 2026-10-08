@@ -18,14 +18,14 @@ Rust でフルスクラッチ開発する軽量なコンテナ実行基盤の実
 fandhe-container/
 ├── CLAUDE.md                      # Claude 運用方針（本ファイル）
 ├── AGENTS.md                      # AI PR レビュー観点集 / ビルド・回帰確認コマンド（REPAIR-10）
-├── README.md                      # 概要・実装方針（要点）・開発環境構築
+├── README.md                      # 概要・実装方針（要点）・クイックスタート・開発環境構築
 ├── CONTRIBUTING.md                # コントリビュータ向け最小骨子（TASK-2・OSS-1/OSS-2・MS-0。PR フロー詳細は TASK-99・OSS-6・MS-6 で後日整備）
 ├── MAINTAINERS.md                 # メンテナンス体制・コアチーム（TASK-100・OSS-6）
 ├── LICENSE                        # Apache License 2.0
 ├── rust-toolchain.toml            # stable + rustfmt/clippy（単一真実源）
 ├── .editorconfig / .gitattributes # インデント・改行（LF 固定）・文字コード規約
 ├── skills-lock.json               # 導入スキルのロックファイル
-├── Makefile                       # 開発タスク集約（lint-docs・fmt・clippy・test・deny・docker-*。`make help`）
+├── Makefile                       # 開発タスク集約（lint-docs・fmt・clippy・test・doc・deny・docker-*。`make help`）
 ├── lefthook.yml                   # git hooks（整形・秘密情報検査・commit-msg・pre-push）
 ├── commitlint.config.mjs          # commitlint 設定（type を 9 種に限定）
 ├── Dockerfile / compose.yaml      # 開発コンテナ（環境非依存の `make docker-ci`）
@@ -37,14 +37,18 @@ fandhe-container/
 │   ├── core/                      #   実行層（namespace・cgroups v2・seccomp/Landlock・rootless）
 │   ├── supervisor/                #   コンテナごとの軽量監視プロセス
 │   ├── oci/ / cri/                #   OCI イメージ・ライフサイクル / CRI
+│   │   └── cri/proto/             #     cri-api の .proto（kubernetes/cri-api v0.37.1 無改変）と出典 README（TASK-56.2・CRI-3）
 │   ├── platform-macos/ / platform-windows/ / microvm/  # プラットフォーム層
 │   ├── gpu/ / net/                #   GPU パススルー（CDI）/ network
 │   ├── plugin/                    #   plugin 境界機構（UDS＋長さ接頭辞フレーム。fandhe-container-plugin）
 │   ├── cli/ / stack/              #   統一 CLI / 複数コンテナ定義（TOML スキーマ・起動順）
 │   ├── compose-convert/           #   compose.yaml → TOML 片方向変換ツール（fandhe-container-compose-convert）
 │   └── plugin-*/                  #   fandhe-container-plugin-cri / -macos / -windows / -microvm / -mcp
-├── scripts/                       # ベンチ回帰比較スクリプト（TASK-86.3・REPAIR-8）・baseline.json 生成スクリプト（scripts/bench/。TASK-88.1）・アイドル時常駐メモリ計測（scripts/bench/idle_memory.sh。TASK-45.1・CORE-7）・50 コンテナ同時起動の集約メモリ計測（scripts/bench/concurrent_50_memory.sh。own 側 TASK-50.1・Docker 側と統合レポート TASK-50.2・CORE-9・SUP-1）・ネットワーク作成/接続/削除の所要時間計測（scripts/bench/net_setup_timing.sh。TASK-139.5・NET-1／NET-4）・DNS ヘルパーの正答率・レイテンシ・常駐 PSS 計測（scripts/bench/dns_helper_measure.sh。TASK-141.3・NET-5）・fio 4K ランダム write ベンチスクリプト（TASK-25.1・IO-8）・fio ベースライン比の算出（TASK-25.2・IO-8。scripts/testdata/ に fixture）。依存禁止判定等は（予定）
-├── benches/                       # crate をまたぐベンチ回帰（REPAIR-8。root の workspace メンバー crate fandhe-container-benches、publish = false。benches/benches/regression_placeholder.rs は TASK-86.3 のプレースホルダベンチ、baseline.json は暫定基準値。benches/benches/plugin_boundary.rs は TASK-113.1 の代表操作 A ベンチでゲート未接続、benches/benches/plugin_boundary_list_images.rs は TASK-113.2 の代表操作 B〔イメージ一覧〕計測ハーネス（ゲート未接続）、benches/benches/plugin_boundary_macos_cold_start.rs と benches/tests/macos_cold_start.rs は TASK-113.4 の macOS cold start 上乗せ確認（macOS のみ・ゲート未接続）、その他の実ベンチ本体は TASK-113、基準値の校正は TASK-88）
+├── scripts/                       # ベンチ回帰比較スクリプト（TASK-86.3・REPAIR-8）・baseline.json 生成スクリプト（scripts/bench/。TASK-88.1）・アイドル時常駐メモリ計測（scripts/bench/idle_memory.sh。TASK-45.1・CORE-7）・50 コンテナ同時起動の集約メモリ計測（scripts/bench/concurrent_50_memory.sh。own 側 TASK-50.1・Docker 側と統合レポート TASK-50.2・CORE-9・SUP-1）・監視プロセス常駐メモリ（PSS）計測（scripts/bench/supervisor_pss.sh。TASK-158・SUP-2）・ネットワーク作成/接続/削除の所要時間計測（scripts/bench/net_setup_timing.sh。TASK-139.5・NET-1／NET-4）・DNS ヘルパーの正答率・レイテンシ・常駐 PSS 計測（scripts/bench/dns_helper_measure.sh。TASK-141.3・NET-5）・監視プロセス独立性の実証スクリプト（scripts/verify-supervisor-independence.sh。TASK-162・SUP-5。実機実証は #499）・restart レイテンシ実機実測スクリプト（scripts/measure-restart-latency.sh。TASK-160・SUP-3。実測は #491）・fio 4K ランダム write ベンチスクリプト（TASK-25.1・IO-8）・fio ベースライン比の算出（TASK-25.2・IO-8。scripts/testdata/ に fixture）・PLUG-4 の core 不変性判定スクリプト（scripts/check-plug4-core-invariance.sh と自己テスト。TASK-109.4・PLUG-4）・CLI 基本 6 コマンドの 3 OS 比較スクリプト（scripts/cli-parity-check.sh。TASK-125.1・CLI-1。実機確認は #661）・commit-msg フックの本文行長検査（scripts/check-commit-msg-line-length.sh。Issue #1295）。依存禁止判定等は（予定）
+├── benches/                       # crate をまたぐベンチ回帰（REPAIR-8。root の workspace メンバー crate fandhe-container-benches、publish = false。benches/benches/regression_placeholder.rs は TASK-86.3 のプレースホルダベンチ、baseline.json は暫定基準値。benches/benches/plugin_boundary.rs は TASK-113.1 の代表操作 A ベンチでゲート未接続、benches/benches/plugin_boundary_list_images.rs は TASK-113.2 の代表操作 B〔イメージ一覧〕計測ハーネス（ゲート未接続）、benches/benches/plugin_boundary_macos_cold_start.rs と benches/tests/macos_cold_start.rs は TASK-113.4 の macOS cold start 上乗せ確認（macOS のみ・ゲート未接続）、plugin 境界ベンチ〔TASK-113〕は実装済みで baseline 未登録のため bench-check の比較対象外、files/s・起動 p95 のベンチは担当タスク未定〔bench-calibration.md「既知の欠落」〕、基準値の校正記録は TASK-88.2、基準値の確定は TASK-88.h1・TASK-113.h1）
+├── poc/                           # 製品外の PoC パッケージ（ルート workspace の外。crate 境界の確定一覧に含めない）
+│   ├── venus-decoder/jig/         #   venus 試験治具の capset アダプタ（独立 Cargo パッケージ。TASK-172.4・GPU-6。`make poc-venus-jig-check`。CI は rust-ci-default-features が 3 OS で実行）
+│   └── vz-custom-virtio-gpu/      #   VZCustomVirtioDevice による最小 virtio-gpu 登録の可否確認（TASK-172.6・GPU-6。ゲスト側確認スクリプトのみ、ホスト側は承認待ち。自己テストは CI の integration-test が 3 OS で実行）
 ├── docs/
 │   ├── architecture.md            # crate 境界・依存関係グラフ・確定済み設計判断の索引（TASK-6・REPAIR-3・PLUG-1）
 │   ├── api/                       # 利用者向け API 契約
@@ -64,9 +68,11 @@ fandhe-container/
 │   │   │   └── idle-memory-local.md  # アイドル時常駐メモリのローカル実測レポート（TASK-45.2・CORE-7。root 権限での確定計測は TASK-47）
 │   │   ├── macos-vm-strategy.md   # macOS の VM 利用方式（既定: 常駐 VM 共用＋軽量プロセス分離／オプション: 1 コンテナ = 1 VM。TASK-66・MAC-4）
 │   │   ├── crate-naming.md        # crate 短縮名・plugin crate 配置の確定内容（TASK-1・REPAIR-1）
-│   │   └── rootless-network.md    # rootless ネットワーク外部ヘルパー選択肢の設計ドラフト（TASK-147・NET-9。採否未決）
+│   │   ├── rootless-network.md    # rootless ネットワーク外部ヘルパー選択肢の設計ドラフト（TASK-147・NET-9。採否未決）
+│   │   └── privilege-separation.md  # 権限分離方式の比較と必要最小権限の設計ドラフト（TASK-171.1.1・SUP-14。採否未決）
 │   ├── setup/                     # 利用者向けセットアップ手順
 │   │   └── windows.md             # Windows セットアップ前提条件（WSL2・Developer Mode・`.wslconfig` の virtiofs。TASK-69・WIN-5。NTFS セマンティクス差異への対応〔TASK-68・WIN-4〕を統合）
+│   ├── verification/              # 実機確認の記録雛形（cli-cross-platform-parity.md: CLI 基本 6 コマンドの 3 OS 同一構文・挙動チェックリスト。TASK-125.1・CLI-1。結果記入は #661）
 │   └── spec/                      # fandhe-container-spec submodule（private・要アクセス権）
 ├── .github/workflows/             # ai-review・update-external・ci（稼働）/ release（発火条件無効化中）
 ├── .agents/skills/                # npx skills add の導入実体
@@ -156,7 +162,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 
 ## Conventions
 
-- **ローカル検証**: `make fmt-check`・`make lint`・`make test`（まとめて `make ci`）を通してからコミットする（[ci](.claude/rules/ci.md)）。ビルド・テストは `docs/spec` 抜きで成立させる
+- **ローカル検証**: `make fmt-check`・`make lint`・`make test`・`make doc`（まとめて `make ci`）を通してからコミットする（[ci](.claude/rules/ci.md)）。ビルド・テストは `docs/spec` 抜きで成立させる
 - **日本語**: やりとり・報告・コミット説明文・コード内コメントは日本語（プログラム出力文字列は英語）
 - **Conventional Commits**: `--no-verify` 禁止
 - **セキュリティレビュー**: PR 作成前に OWASP Top 10＋コンテナ分離・plugin 信頼境界を確認

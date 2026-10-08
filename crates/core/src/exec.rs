@@ -7,7 +7,9 @@
 //! （[`StagePipeline`]。#832・TASK-27.4.2。`exec/stages.rs`）まで実装済み。各段の実体
 //! のうち `PR_SET_NO_NEW_PRIVS` は組み込みの固定ステージとして実装済み（#833・TASK-27.4.3。
 //! `exec/no_new_privs.rs`）、capability 削減（#173）と seccomp（#178・TASK-38.3）も同様に組み込み済み。
-//! cgroup 参加は `cgroups::CgroupJoin`（TASK-32.4・#161）が `StageHook` として実装済み（登録は呼び出し側）。制限適用の証跡は未実装（Landlock は `StagePipeline::with_landlock` で差し込み可能。#184）で、後続の sub-issue（#137、TASK-39・40）が追記する（REPAIR-3: 実装済みを装わない）。
+//! cgroup 参加は `cgroups::CgroupJoin`（TASK-32.4・#161）が `StageHook` として実装済み（登録は呼び出し側）。
+//! exec 経路（SUP-6）の制限の再適用は [`prepare_exec_restrictions`] / [`reapply_restrictions`]
+//! （TASK-163.3・TASK-163.4・#502・#503。`exec/reapply.rs`。`setns` の後に使えるよう status fd と rootfs の固定を事前に保持する二段階 API。参加後の対象束縛と `/` を照合してから、rlimit・capability 削減・`NO_NEW_PRIVS`・Landlock・seccomp を launch と同じ順で適用する）。稼働中コンテナでのコマンド実行は、再適用の完了の証跡 [`ExecReady`] だけを受け取る [`spawn_exec_command`]（`exec/exec_command.rs`。fork → `close_range` → `execveat`。TASK-163.4・#503）が担う。launch 経路の制限適用の証跡は未実装（Landlock は `StagePipeline::with_landlock` で差し込み可能。#184）で、後続の sub-issue（#137、TASK-39・40）が追記する（REPAIR-3: 実装済みを装わない）。
 //!
 //! # 目指すフロー（Linux 専用）
 //!
@@ -48,8 +50,10 @@
 //! - 常駐デーモンを前提にしない（CORE-1・D-19）
 //! - 分離違反の試行を拒否したエラーは `ExecError::violation` に構造化された違反記録
 //!   （[`IsolationViolation`]: 種別・理由コード・ビヘイビア ID・対象）を持つ。**記録の経路のみ**で、
-//!   マウント層の監査レコード化は [`audit_mount_violation`]（TASK-41.4）、保存・集約・出力先は
-//!   TASK-41.5 系（#839。SEC-4）が担う。システムエラーには付かない
+//!   マウント層の監査レコード化は [`audit_mount_violation`]（TASK-41.4）、exec の対象の拒否の監査レコード化
+//!   （層 `exec_target`）は [`audit_exec_violation`]・[`record_exec_target_rejection`]（#1465）が担う。
+//!   ファイルへの保存は `audit_log::AuditFileWriter`（#839）で実装済みで、本番経路への sink の配線は未実装
+//!   （REPAIR-3）。システムエラーには付かない
 //!
 //! # namespace 分離の契約（[`isolate`]・[`isolate_rootful_host_root`]）
 //!
@@ -92,17 +96,43 @@ use crate::sys::{self, NsFlag, SysError};
 use crate::traits::types::ErrorCode;
 
 mod capabilities;
+mod cgroup_join;
+mod container_env;
 mod devices;
+mod exec_command;
+mod inject;
+mod interpreter;
 mod landlock;
 mod no_new_privs;
 mod process;
+mod reapply;
+mod rlimits;
 mod rootfs;
 mod seccomp;
+mod setns;
 mod stages;
+mod tmpfs;
 mod violation;
 
-pub use capabilities::CapabilityReport;
-pub use devices::{DeviceNodeOutcome, DeviceNodeStatus, DeviceReport, create_default_devices};
+/// 結合試験 `tests/exec_child_setup.rs`・supervisor の `tests/exec_setns_join.rs` 専用の再公開
+/// （SUP-6・TASK-163 追補・#1457。通常の利用者は呼ばない。詳細は定義側）。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+#[doc(hidden)]
+pub use capabilities::clear_supplementary_groups_for_test;
+pub use capabilities::{CapabilityReport, SupplementaryGroups};
+#[cfg(feature = "exec-test-support")]
+pub use cgroup_join::remove_exec_child_cgroup_in;
+pub use cgroup_join::{
+    ExecCgroupJoin, ExecCgroupJoinReport, ExecCgroupName, ExecCgroupRemoval, ExecChildCgroup,
+    join_cgroup, prepare_cgroup_join, remove_exec_child_cgroup,
+};
+pub use container_env::{ContainerEnv, ExecCommand};
+pub use devices::{
+    DeviceLinkOutcome, DeviceLinkStatus, DeviceNodeOutcome, DeviceNodeStatus, DeviceReport,
+    create_default_devices,
+};
+pub use exec_command::{ExecChild, spawn_exec_command, spawn_exec_worker};
+pub use inject::{InjectReport, InjectedDirectoryOutcome, InjectedFileOutcome, inject_files};
 /// 結合試験 `tests/landlock.rs` 専用の再公開（CORE-5・TASK-39.5・#185。通常の利用者は呼ばない。詳細は定義側）。
 #[doc(hidden)]
 pub use landlock::{
@@ -119,9 +149,27 @@ pub use process::spawn_container_seccomp_probe;
 pub use process::{
     ChildExit, ContainerChild, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV,
     ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES, EXIT_EXEC_NOT_EXECUTABLE,
-    EXIT_EXEC_NOT_FOUND, EXIT_SETUP_FAILED, Entrypoint, SignalDelivery, exec_entrypoint,
+    EXIT_EXEC_NOT_FOUND, EXIT_SETUP_FAILED, Entrypoint, ExecExit, SignalDelivery, exec_entrypoint,
     spawn_container, spawn_container_with_stages,
 };
+/// 結合試験 `tests/exec_child_setup.rs` 専用の再公開（SUP-6・TASK-163 追補・#1456。通常の利用者は呼ばない。詳細は定義側）。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+#[doc(hidden)]
+pub use process::{ExecChildSetupObservation, ExecChildSetupReport, observe_exec_child_setup};
+/// 結合試験 `tests/exec_child_setup.rs`・`tests/fork_exec_isolation.rs` 専用の再公開（SEC-1・CORE-1・TASK-27.4.1・#1299。
+/// 通常の利用者は呼ばない。詳細は定義側）。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+#[doc(hidden)]
+pub use process::{StandardFd, close_standard_fds_for_test};
+pub use reapply::{
+    ExecReady, ExecRestrictionReport, ExecRestrictions, UnappliedExecRestriction,
+    prepare_exec_restrictions, reapply_restrictions,
+};
+/// 結合試験 `tests/exec_restrictions_reapply.rs` 専用の再公開（SUP-6・TASK-163.3・#502。通常の利用者は呼ばない。詳細は定義側）。
+/// `exec-test-support` feature を付けたビルドにだけ存在する（TASK-163 追補・#1460）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use reapply::{ExecReapplyObservation, observe_exec_restriction_reapply};
 pub use rootfs::{PivotReport, PreparedRootfs, pivot_root, prepare_rootfs};
 pub use seccomp::SeccompReport;
 /// 結合試験 `tests/escape_suite.rs` の ESC-03 専用の再公開（SEC-2・TASK-42.2・#200。通常の利用者は呼ばない。詳細は定義側）。
@@ -137,7 +185,26 @@ pub use seccomp::{ProbeOutcome, SeccompProbeRecord};
 /// 結合試験 `tests/seccomp_enforcement.rs` 専用の再公開（通常の利用者は呼ばない。詳細は定義側）。`unsafe` を `sys` の外へ出さないための観測専用の入口。
 #[doc(hidden)]
 pub use seccomp::{SeccompEnforcementObservation, observe_default_seccomp_enforcement};
+pub use setns::{JoinNamespace, NamespaceJoinReport, Pid1Target, join_namespaces};
 pub use stages::{StageHook, StageKind, StagePipeline, StageReport, StageStatus};
+/// 結合試験 `tests/tmpfs_mount.rs` 専用の再公開（SUP-12・TASK-169 追補・#1472。通常の利用者は呼ばない。詳細は定義側）。
+/// `exec-test-support` feature を付けたビルドにだけ存在する。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use tmpfs::mount_tmpfs_with_attach_hook;
+pub use tmpfs::{TmpfsMountOutcome, TmpfsReport, mount_tmpfs};
+
+/// 結合試験 `tests/sanitize_integration.rs` 専用の入口: パス検証の拒否（対象パス付きの違反記録）を
+/// 作る（SEC-4・TASK-96.1・REPAIR-12。通常の利用者は呼ばない）。
+///
+/// 実際の拒否は `mount_proc` 等が特権（mount namespace の分離）を要する経路でしか得られないため、
+/// それらが拒否時に通るのと同じ `ExecError::from_violation` を公開する。`exec-test-support` feature
+/// を付けたビルドにだけ存在する。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn path_violation_error_for_test(reason: ViolationReason, subject: &Path) -> ExecError {
+    ExecError::from_violation(reason, Some(subject))
+}
 
 pub use violation::{
     IsolationViolation, VIOLATION_SUBJECT_MAX_CHARS, ViolationKind, ViolationReason,
@@ -151,7 +218,7 @@ pub use violation::{
 /// 記録せず `NotApplicable`。`err` は常にそのまま返り、記録の失敗で拒否は覆らない（fail-closed）。
 ///
 /// 本番の `spawn_container` 子プロセス・launcher への配線は未実装（`AuditSink` を fork 後へ渡す設計が
-/// 未決定。TASK-29 / TASK-157 系。REPAIR-3）。永続化は TASK-41.5 系（#839）。
+/// 未決定。TASK-29 / TASK-157 系。REPAIR-3）。ファイル永続化は `audit_log::AuditFileWriter`（#839）で実装済み。
 pub fn audit_mount_violation(
     err: ExecError,
     sink: &dyn crate::audit_log::AuditSink,
@@ -169,6 +236,51 @@ pub fn audit_mount_violation(
             }
         }
         None => crate::audit_log::AuditedRejection::not_applicable(err),
+    }
+}
+
+/// exec の対象の違反を `ExecTarget` 監査レコードとして記録する（SEC-4・SUP-6・TASK-163 追補・#1465）。
+///
+/// `err.violation` が種別 `ExecTarget` のときだけ 1 件 `sink` へ渡す。それ以外（マウント層の違反・
+/// システムエラー）は `NotApplicable`。`err` は常にそのまま返り、記録の失敗で拒否は覆らない（fail-closed）。
+/// プロセス内で `ExecError` を直接扱う呼び出し側向けで、supervisor の通しの入口は
+/// [`record_exec_target_rejection`] を使う。
+pub fn audit_exec_violation(
+    err: ExecError,
+    sink: &dyn crate::audit_log::AuditSink,
+) -> crate::audit_log::AuditedRejection<ExecError> {
+    let event = err
+        .violation
+        .as_ref()
+        .and_then(IsolationViolation::exec_audit_event);
+    match event {
+        Some(event) => {
+            let delivery = crate::audit_log::mount::deliver(event, sink);
+            crate::audit_log::AuditedRejection {
+                error: err,
+                delivery,
+            }
+        }
+        None => crate::audit_log::AuditedRejection::not_applicable(err),
+    }
+}
+
+/// 理由コードだけを持つ呼び出し側（supervisor が worker の結果行を復号した親プロセス）向けに、
+/// exec の対象の拒否 `error` を 1 件記録して返す（SEC-4・SUP-6・TASK-163 追補・#1465）。
+///
+/// `reason` が exec 対象の理由でなければ記録せず `NotApplicable`。時刻と PID は呼び出したプロセスのもの。
+/// 記録の成否で `error` は変わらない（fail-closed）。
+pub fn record_exec_target_rejection<E>(
+    error: E,
+    reason: ViolationReason,
+    sink: &dyn crate::audit_log::AuditSink,
+) -> crate::audit_log::AuditedRejection<E> {
+    match reason.exec_target_audit_event() {
+        Some(event) => {
+            let delivery = crate::audit_log::mount::deliver(event, sink);
+            crate::audit_log::AuditedRejection { error, delivery }
+        }
+        None => crate::audit_log::AuditedRejection::not_applicable(error),
     }
 }
 
@@ -389,21 +501,29 @@ pub enum IsolationStage {
     CreateDevices,
     /// cgroup 参加ステージ（TASK-32。#832 のステージ列の第 1 段）。
     CgroupJoin,
-    /// capability 削減ステージ（TASK-37。#832 のステージ列の第 2 段）。
+    /// rlimit 適用ステージ（SUP-12・TASK-169.1・#526。ステージ列の第 2 段。組み込み段）。
+    Rlimits,
+    /// capability 削減ステージ（TASK-37。#832 のステージ列の第 3 段）。
     CapabilityDrop,
-    /// `PR_SET_NO_NEW_PRIVS` ステージ（#833。#832 のステージ列の第 3 段）。
+    /// `PR_SET_NO_NEW_PRIVS` ステージ（#833。#832 のステージ列の第 4 段）。
     NoNewPrivs,
-    /// Landlock ステージ（TASK-39。#832 のステージ列の第 4 段）。
+    /// Landlock ステージ（TASK-39。#832 のステージ列の第 5 段）。
     Landlock,
-    /// seccomp ステージ（TASK-38。#832 のステージ列の第 5 段。#178 で組み込み段）。
+    /// seccomp ステージ（TASK-38。#832 のステージ列の第 6 段。#178 で組み込み段）。
     Seccomp,
+    /// 稼働中コンテナの pid1 の特定と `setns(2)` による namespace 参加（SUP-6・TASK-163.1）。
+    SetNs,
+    /// rootfs 配下への tmpfs マウント（SUP-12・TASK-169.2。`--shm-size` / `--tmpfs`）。
+    MountTmpfs,
+    /// secrets / configs の注入（専用 tmpfs への書き込みと read-only 再マウント。SUP-12・TASK-169.4.2）。
+    InjectFiles,
 }
 
 /// 実行層の構造化エラー（`code` は `traits::types::ErrorCode` を再利用）。
 ///
 /// 分離違反の試行を拒否した場合は `violation` に構造化された違反記録が入り、システム
-/// エラー（syscall 失敗・procfs の読み取り失敗等）では `None`。区別の定義と、記録の保存が
-/// 永続化が未実装（TASK-41.5 系・#839）であることは [`IsolationViolation`] を参照（SEC-4）。
+/// エラー（syscall 失敗・procfs の読み取り失敗等）では `None`。区別の定義と、記録の保存経路の
+/// 現状（ファイル書き込みは実装済み・本番経路への配線は未実装）は [`IsolationViolation`] を参照（SEC-4）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ExecError {
@@ -571,7 +691,7 @@ pub struct IsolationReport {
 /// [`mount_proc`] を呼べる状態（新しい PID namespace の PID 1 で、そのスレッドだけが属する
 /// 新しい mount namespace にいる）を、PID 1 自身が作って確かめた証跡（CORE-1）。前提を
 /// 満たさない呼び出しは fail-closed で拒否し、`ExecError::violation` に違反記録を載せる
-/// （SEC-4 の記録経路。保存は TASK-41.5 系・#839 で未実装。REPAIR-3）。
+/// （SEC-4 の記録経路。ファイル保存は実装済み、本番経路への sink の配線は未実装。REPAIR-3）。
 ///
 /// 生成は [`MountIsolation::establish`] のみで、呼び出し側の申告では作れない。証跡は作成時の
 /// mount namespace・PID namespace に束縛され、[`mount_proc`] は呼び出し直前に「PID 1 である
@@ -633,6 +753,47 @@ pub(crate) fn status_threads(status: &str) -> Option<u64> {
         .lines()
         .find_map(|l| l.strip_prefix("Threads:"))
         .and_then(|v| v.trim().parse().ok())
+}
+
+/// 適用前後の単一スレッド検査（`Threads: 1`）が読む `status` の取得元（SUP-6・TASK-163.3・#502）。
+///
+/// 通常は呼び出しプロセスの `/proc/self/status`（[`ProcSelf`](Self::ProcSelf)）。exec 経路では
+/// `setns(CLONE_NEWNS)` の後に `/proc` がコンテナ側の procfs になり、自プロセスを `/proc/self` で
+/// 解決できないため、`setns` の前に開いた fd を保持して読む（[`PreOpened`](Self::PreOpened)。
+/// `cgroups::ExecJoinFds` が `/proc/self/cgroup` を事前に開くのと同じ理由）。
+/// 取得元を替えても「適用の前後で `Threads: 1`」という検査自体は弱めない。
+#[derive(Debug)]
+pub(crate) enum ThreadCountSource {
+    /// `/proc/self/status` をそのつど開く（launch 経路。挙動は従来どおり）。
+    ProcSelf,
+    /// 事前に開いた `/proc/self/status` の fd。開いたプロセス自身のスレッド数を返す。
+    PreOpened(std::fs::File),
+}
+
+/// `status` 1 回分の読み取り上限（本物は数 KiB。無制限確保を避ける。REPAIR-5 の入力上限方針）。
+/// 超過は切り詰めずに読み取り失敗として扱う（`setns::read_bounded_from`）。
+const STATUS_READ_LIMIT: u64 = 64 * 1024;
+
+impl ThreadCountSource {
+    /// 現在のスレッド数。読めない・パースできない場合は `None`（呼び出し側は適用を拒否する）。
+    pub(crate) fn count(&mut self) -> Option<u64> {
+        use std::io::{Seek as _, SeekFrom};
+        match self {
+            ThreadCountSource::ProcSelf => {
+                let status = std::fs::read_to_string("/proc/self/status").ok()?;
+                status_threads(&status)
+            }
+            ThreadCountSource::PreOpened(file) => {
+                // procfs のファイルは read のたびに再生成される。先頭へ戻して読み直す。
+                // 上限を超える内容は切り詰めずに失敗させる（途中で切れた内容から判定しない。fail-closed）。
+                file.seek(SeekFrom::Start(0)).ok()?;
+                let status =
+                    setns::read_bounded_from(std::io::Read::by_ref(file), STATUS_READ_LIMIT)
+                        .ok()?;
+                status_threads(&status)
+            }
+        }
+    }
 }
 
 /// [`MountIsolation::establish`] の前提（副作用の前に判定するテスト可能な純関数）。
@@ -1560,6 +1721,32 @@ const MOUNTINFO_FIXED_FIELDS: usize = 6;
 /// 区切り `-` の後ろの必須フィールド数（`fstype source super_options`）。
 const MOUNTINFO_TAIL_FIELDS: usize = 3;
 
+/// `mnt_id` のマウントが read-only（mountinfo の per-mount options に `ro`）か判定する純関数。
+/// `inject_files` が read-only 再マウントの事後検証に使う（SUP-12・TASK-169.4.2）。書式に反する行・
+/// 該当行なし・複数行はエラー（fail-closed。`mount_is_shared_in` と同じ姿勢）。
+fn mount_is_read_only_in(info: &str, mnt_id: u64) -> Result<bool, ExecError> {
+    let malformed = || mountinfo_error("malformed line in /proc/thread-self/mountinfo");
+    let mut found: Option<bool> = None;
+    for line in info.lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        let id: u64 = fields
+            .first()
+            .and_then(|f| f.parse().ok())
+            .ok_or_else(malformed)?;
+        if id != mnt_id {
+            continue;
+        }
+        if found.is_some() {
+            return Err(mountinfo_error(
+                "duplicate mount ID in /proc/thread-self/mountinfo",
+            ));
+        }
+        let options = fields.get(5).ok_or_else(malformed)?;
+        found = Some(options.split(',').any(|o| o == "ro"));
+    }
+    found.ok_or_else(|| mountinfo_error("no mount entry found for the injected files mount"))
+}
+
 /// [`mount_is_shared`] の解析部（テスト可能な純関数）。先頭フィールド（mount ID）が
 /// `mnt_id` の行の optional fields に `shared:` があるかを返す。書式に反する行は 1 行でも
 /// あれば候補行かどうかに関わらずエラーにする（fail-closed。壊れた行を黙って飛ばして
@@ -2185,6 +2372,25 @@ mod tests {
     /// 走査で固定した `/` の fd の mnt_id は、mountinfo で最後に現れる（最上位の）
     /// マウントポイント `/` の mount ID と一致し、その行の shared 判定を返す。
     #[test]
+    fn sup12_task169_4_2_mount_is_read_only_in_parses_per_mount_options() {
+        let info = "30 20 0:25 / /a ro,nosuid,nodev,noexec - tmpfs tmpfs rw,size=64k\n\
+                    31 20 0:26 / /b rw,nosuid,nodev,noexec shared:3 - tmpfs tmpfs ro\n";
+        assert!(mount_is_read_only_in(info, 30).expect("30"));
+        // super block 側の `ro`（末尾）ではなく per-mount options を見る。
+        assert!(!mount_is_read_only_in(info, 31).expect("31"));
+        assert!(mount_is_read_only_in(info, 99).is_err());
+        assert!(mount_is_read_only_in("x y z\n", 30).is_err());
+        assert!(mount_is_read_only_in("30 20 0:25 / /a\n", 30).is_err());
+        assert!(
+            mount_is_read_only_in(
+                "30 20 0:25 / /a ro - tmpfs t r\n30 1 0:1 / /b rw - tmpfs t r\n",
+                30
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn mount_is_shared_uses_mount_id_of_fd() {
         let fd = open_dir_beneath(Path::new("/"), &[]).unwrap();
         let fdinfo =
@@ -2542,7 +2748,7 @@ mod tests {
         assert_eq!(err.stage, IsolationStage::MountProc);
         assert_eq!(
             err.message,
-            "proc mount target was moved or removed after validation"
+            "mount target was moved or removed after validation"
         );
         assert_eq!(
             violation_of(&err),

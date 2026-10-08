@@ -25,6 +25,11 @@
 //! - 子の環境は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ。stdin / stdout は null、stderr は
 //!   セッション全期間で 1 本の読み取りスレッドが上限つきで収集し、[`ResidentPlugin::shutdown`] の結果
 //!   （失敗時も [`ResidentShutdownError`] に載せる）でのみ返す（untrusted）。[`ResidentPlugin`] の破棄（panic 等を含む）でも子の kill・回収とスレッド停止を行う。
+//! - 親の強制終了時の停止（#1514・PLUG-7・REPAIR-5・CORE-1）: Linux では plugin に `PR_SET_PDEATHSIG`
+//!   （SIGKILL）を設定する（詳細は `lifecycle` の契約）。発火条件は子を fork したスレッドの終了のため、
+//!   **Linux では [`ResidentPlugin::start`] を呼んだスレッドが終了すると plugin は SIGKILL される**。
+//!   常駐 plugin はセッションより長く生きるスレッドから起動すること。[`ResidentPlugin`] を起動スレッドの
+//!   外へ渡して起動スレッドだけを先に終わらせる使い方は契約違反とする。
 //! - 応答は untrusted。フレームの長さ上限・チェックサムは transport 側で検証済みで、内容は解釈しない。
 //!
 //! # 孫プロセス（#1311）
@@ -42,12 +47,15 @@
 
 use super::{
     ChildGuard, ONE_SHOT_EXIT_TIMEOUT, ONE_SHOT_STDERR_DRAIN_TIMEOUT, OneShotPlugin, OneShotStderr,
-    OneShotTermination, Reap, StderrCapture, classify_reaped, group_kill_failed_error, rpc_timeout,
-    spawn_error, stderr_channel, unreaped_error,
+    OneShotTermination, PLUGIN_SOCKET_ENV, Reap, StderrCapture, bind_to_parent_lifetime,
+    classify_reaped, group_kill_failed_error, rpc_timeout, spawn_registered, stderr_channel,
+    unreaped_error,
 };
 use crate::error::{PluginError, PluginErrorCode};
 use crate::frame::Frame;
+use crate::signal_forward::{PLUGIN_REGISTRY, Registry};
 use crate::transport::{RpcTimeout, UdsListener, UdsStream};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -285,9 +293,28 @@ impl ResidentPlugin {
     /// 終了した場合は期限を待たず `Unavailable`。失敗経路ではいずれも子を kill・回収してから返し、
     /// 回収を確認できない場合は `Internal`（pid つき）を返す。非 unix では bind が `Unimplemented` を
     /// 返し、子は spawn されない。
+    ///
+    /// スレッド寿命の契約（Linux。#1514・PLUG-7）: plugin は本関数を呼んだスレッドの終了で SIGKILL される
+    /// （`PR_SET_PDEATHSIG` の発火条件）。セッションより長く生きるスレッドから呼ぶこと。
+    ///
+    /// `audit` は受付で拒否した接続（UID・pid の不一致・取得失敗）の監査イベントの受け手で、拒否 1 件に
+    /// つき 1 回、同期で呼ばれる（PLUG-12・SEC-4・TASK-124.5）。必須で、既定の出力先は無い（出力・永続化は
+    /// 呼び出し側の責務。`crate::audit` のモジュール doc）。
+    /// 接続の確立後（`call` 系）は peer 認証を行わないため、受け手は起動時にのみ使う。
     pub fn start(
         plugin: &OneShotPlugin,
         timeout: ResidentStartTimeout,
+        audit: &mut dyn crate::audit::PeerAuthObserver,
+    ) -> Result<Self, PluginError> {
+        Self::start_in(plugin, timeout, audit, &PLUGIN_REGISTRY)
+    }
+
+    /// [`Self::start`] の本体。シグナル転送の登録表を引数に取る（テストが局所の表を渡すため）。
+    pub(crate) fn start_in(
+        plugin: &OneShotPlugin,
+        timeout: ResidentStartTimeout,
+        audit: &mut dyn crate::audit::PeerAuthObserver,
+        registry: &'static Registry,
     ) -> Result<Self, PluginError> {
         static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -307,11 +334,18 @@ impl ResidentPlugin {
                 "failed to prepare capturing plugin stderr",
             )
         })?;
-        let spawned =
-            super::spawn_plugin(&plugin.program, &plugin.args, listener.path(), child_stderr);
-        let mut guard = match spawned {
-            Ok(child) => ChildGuard::new(child),
-            Err(e) => return Err(spawn_error(&e)),
+        // `Command` はこのブロックの終わりで drop され、親側に書き込み端は残らない。
+        let mut guard = {
+            let mut cmd = Command::new(&plugin.program);
+            cmd.args(&plugin.args)
+                .env_clear()
+                .env(PLUGIN_SOCKET_ENV, listener.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(child_stderr);
+            // spawn 前の失敗なので子は存在しない。
+            bind_to_parent_lifetime(&mut cmd)?;
+            spawn_registered(&mut cmd, registry)?
         };
 
         // 接続待ちより前に読み取りを始める（子が接続前に大量に書いても詰まらせない）。
@@ -345,7 +379,7 @@ impl ResidentPlugin {
                     "plugin exited before connecting",
                 )),
             };
-            listener.accept_peer_pid(left, child_pid, &mut check_child)
+            listener.accept_peer_pid(left, child_pid, &mut check_child, audit)
         })();
         // 接続後は入口を残さない（socket を unlink する）。
         drop(listener);
@@ -646,6 +680,7 @@ mod tests {
                 child: None,
                 reported_unreaped: false,
                 leader_reaped: true,
+                slot: None,
             },
             capture: None,
             state: ResidentState::GroupKillFailed,
@@ -671,6 +706,7 @@ mod tests {
                 child: None,
                 reported_unreaped: false,
                 leader_reaped: true,
+                slot: None,
             },
             capture: None,
             state: ResidentState::Unreaped,
@@ -690,7 +726,12 @@ mod tests {
         let abs = if cfg!(windows) { "C:\\p" } else { "/bin/p" };
         let dir = std::env::temp_dir().join("fcos-nonexistent-resident-dir");
         let plugin = OneShotPlugin::new(abs.into(), vec![], dir).unwrap();
-        let e = ResidentPlugin::start(&plugin, ResidentStartTimeout::default()).unwrap_err();
+        let e = ResidentPlugin::start(
+            &plugin,
+            ResidentStartTimeout::default(),
+            &mut crate::audit::NoopPeerAuthObserver,
+        )
+        .unwrap_err();
         assert_ne!(e.message(), "plugin program not found");
     }
 }

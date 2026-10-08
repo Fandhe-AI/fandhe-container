@@ -11,6 +11,7 @@ fn plug2_connect_is_unimplemented_on_non_unix() {
     let err = UdsStream::connect(
         std::path::Path::new("s.sock"),
         std::time::Duration::from_secs(1),
+        &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
     )
     .unwrap_err();
     assert_eq!(err.code(), PluginErrorCode::Unimplemented);
@@ -92,11 +93,21 @@ mod unix {
         let l = UdsListener::bind(&dir.sock()).unwrap();
         let path = l.path().to_path_buf();
         let h = std::thread::spawn(move || {
-            let mut c = UdsStream::connect(&path, WAIT).unwrap();
+            let mut c = UdsStream::connect(
+                &path,
+                WAIT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
             send(&mut c, &request(1, "hello"));
             recv(&mut c)
         });
-        let mut s = l.accept(WAIT).unwrap();
+        let mut s = l
+            .accept(
+                WAIT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
         assert_eq!(recv(&mut s), request(1, "hello"));
         send(&mut s, &response(1, "world"));
         assert_eq!(h.join().unwrap(), response(1, "world"));
@@ -108,7 +119,12 @@ mod unix {
         let l = UdsListener::bind(&dir.sock()).unwrap();
         let path = l.path().to_path_buf();
         let h = std::thread::spawn(move || {
-            let mut c = UdsStream::connect(&path, WAIT).unwrap();
+            let mut c = UdsStream::connect(
+                &path,
+                WAIT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
             let mut got = Vec::new();
             for i in 0..3u64 {
                 send(&mut c, &request(i, &format!("req-{i}")));
@@ -116,7 +132,12 @@ mod unix {
             }
             got
         });
-        let mut s = l.accept(WAIT).unwrap();
+        let mut s = l
+            .accept(
+                WAIT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
         for i in 0..3u64 {
             assert_eq!(recv(&mut s), request(i, &format!("req-{i}")));
             send(&mut s, &response(i, &format!("res-{i}")));
@@ -135,7 +156,12 @@ mod unix {
     #[test]
     fn plug2_connect_missing_socket_returns_not_found() {
         let dir = TempDir::new();
-        let e = UdsStream::connect(&dir.sock(), WAIT).unwrap_err();
+        let e = UdsStream::connect(
+            &dir.sock(),
+            WAIT,
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        )
+        .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::NotFound);
     }
 
@@ -144,18 +170,29 @@ mod unix {
         let dir = TempDir::new();
         drop(std::os::unix::net::UnixListener::bind(dir.sock()).unwrap());
         assert!(dir.sock().exists());
-        let e = UdsStream::connect(&dir.sock(), WAIT).unwrap_err();
+        let e = UdsStream::connect(
+            &dir.sock(),
+            WAIT,
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        )
+        .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::Unavailable);
     }
 
     #[test]
     fn repair5_connect_rejects_invalid_timeout() {
         let dir = TempDir::new();
-        let e = UdsStream::connect(&dir.sock(), Duration::ZERO).unwrap_err();
+        let e = UdsStream::connect(
+            &dir.sock(),
+            Duration::ZERO,
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        )
+        .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
         let e = UdsStream::connect(
             &dir.sock(),
             UDS_CONNECT_TIMEOUT_MAX + Duration::from_secs(1),
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
         )
         .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
@@ -164,7 +201,12 @@ mod unix {
     #[test]
     fn plug2_connect_rejects_too_long_path() {
         let long = PathBuf::from(format!("/{}", "a".repeat(300)));
-        let e = UdsStream::connect(&long, WAIT).unwrap_err();
+        let e = UdsStream::connect(
+            &long,
+            WAIT,
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        )
+        .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
         assert_eq!(e.message(), "socket path is too long");
     }
@@ -175,14 +217,24 @@ mod unix {
         let l = UdsListener::bind(&dir.sock()).unwrap();
         let path = l.path().to_path_buf();
         let h = std::thread::spawn(move || {
-            let mut c = UdsStream::connect(&path, WAIT).unwrap();
+            let mut c = UdsStream::connect(
+                &path,
+                WAIT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
             c.set_io_timeout(Duration::from_millis(200)).unwrap();
             let t = Instant::now();
             let mut b = [0u8; 1];
             let r = c.read(&mut b);
             (r, t.elapsed())
         });
-        let _s = l.accept(WAIT).unwrap();
+        let _s = l
+            .accept(
+                WAIT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
         let (r, el) = h.join().unwrap();
         let kind = r.unwrap_err().kind();
         assert!(

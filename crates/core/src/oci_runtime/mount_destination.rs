@@ -22,7 +22,7 @@
 //! # 監査記録（SEC-4・TASK-41.4・#195）
 //!
 //! 拒否を `Mount` 監査レコードにする [`MountDestination::resolve_in_audited`]・[`audit_mount_config_error`]
-//! を持つ。本番経路への配線・永続化は未実装（TASK-41.5 系・#839）。
+//! を持つ。ファイル永続化（TASK-41.5.1・#839）は実装済みで、本番経路への sink の配線は未実装。
 //!
 //! # スコープ外（REPAIR-3）
 //!
@@ -48,7 +48,7 @@ pub struct MountDestination(String);
 
 impl MountDestination {
     /// destination 文字列を検証・正規化する（段 A）。
-    pub(super) fn parse(value: &str) -> Result<Self, OciConfigError> {
+    pub(crate) fn parse(value: &str) -> Result<Self, OciConfigError> {
         if value.is_empty() || value.contains('\0') || value.contains('\\') {
             return Err(OciConfigError::invalid(DEST_FIELD));
         }

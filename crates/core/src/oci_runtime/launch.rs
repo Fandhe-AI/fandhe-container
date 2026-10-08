@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::config::NamespaceKind;
+use super::config::{NamespaceKind, OciConfig};
 use crate::traits::{ContainerId, ErrorCode, Signal, TraitError};
 
 /// [`StartTimeouts`] の各上限が取れる最大値（無期限相当の値を型で拒否する。REPAIR-5）。
@@ -195,6 +195,21 @@ impl RootfsDir {
     }
 }
 
+/// 稼働中コンテナの `bundle` と読み込み済みの `config` から、コンテナの rootfs ディレクトリを固定する
+/// （SUP-6・SEC-1・TASK-163.3・#502）。
+///
+/// exec の制限再適用（`exec::prepare_exec_restrictions`）が、`setns` 参加後の `/` が「記録したコンテナの
+/// rootfs」であることを照合する基準に使う。start と同じ検査（`root.path` が bundle 配下・`..` なし・
+/// symlink なしのディレクトリ）と同じ固定（`/` から全要素を symlink 非追従で辿る。[`RootfsDir`]）を通すため、
+/// start が launcher へ渡す rootfs と同じ実体を指す。`process` の有無・未解釈フィールドは検査しない
+/// （起動可否の判定ではなく、稼働中コンテナの rootfs の特定だけを行う）。
+///
+/// エラーは start と同じ固定文言で、パスを含めない。Linux 以外は `Unimplemented`（fail-closed。CLI-1）。
+pub fn pin_bundle_rootfs(bundle: &Path, config: &OciConfig) -> Result<RootfsDir, TraitError> {
+    let rootfs = super::create::check_rootfs(bundle, config.root().path())?;
+    RootfsDir::pin(bundle, &rootfs)
+}
+
 impl PartialEq for RootfsDir {
     fn eq(&self, other: &Self) -> bool {
         #[cfg(target_os = "linux")]
@@ -240,6 +255,16 @@ pub(super) struct BundleLock {
     _file: std::fs::File,
     #[cfg(not(target_os = "linux"))]
     _never: std::convert::Infallible,
+}
+
+/// 予約の解放と同時にロックを外す。`flock` は open file description に付くため、コンテナの子が fork から
+/// exec までの間にこの fd を引き継ぐと close だけではロックが残り、別プロセスの `start` / `recover` が
+/// 誤って拒否される。`LOCK_UN` で fd の参照数に関係なく明示的に解放する（CORE-2・#1537）。
+impl Drop for BundleLock {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        let _ = self._file.unlock();
+    }
 }
 
 impl BundleLock {
@@ -405,6 +430,14 @@ pub trait LaunchedProcess: Send {
             "the launched process cannot be signaled",
         ))
     }
+
+    /// 起動時（fork 直後・回収前）に開いた pidfd の借用。exec の対象（pid1）をこの pidfd で固定するために
+    /// supervisor が参照する（記録 pid や cgroup の所属に同一性を依存させない。SUP-6・SEC-1・CORE-1・
+    /// TASK-163 追補・#1461）。既定は `None`（pidfd を保持しない実装。呼び出し側は fail-closed にする）。
+    #[cfg(target_os = "linux")]
+    fn launch_pidfd(&self) -> Option<BorrowedFd<'_>> {
+        None
+    }
 }
 
 /// `exec::ContainerChild`（fork した子）を [`LaunchedProcess`] として扱うアダプタ（Linux。CORE-1・REPAIR-5）。
@@ -443,6 +476,10 @@ impl ContainerChildProcess {
 impl LaunchedProcess for ContainerChildProcess {
     fn pid(&self) -> NonZeroU32 {
         self.pid
+    }
+
+    fn launch_pidfd(&self) -> Option<BorrowedFd<'_>> {
+        self.child.pidfd()
     }
 
     fn wait(&self, timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
@@ -540,6 +577,50 @@ pub trait ProcessLauncher: Send + Sync {
 mod tests {
     use super::*;
 
+    /// CORE-2・#1537: fork で継承された fd（同じ open file description）が残っていても、`BundleLock` の
+    /// drop でロックが外れて再取得できる。素の `File` は close だけでは外れない（仕組みの照合）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core2_bundle_lock_release_survives_inherited_fd() {
+        use std::process::{Command, Stdio};
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir =
+            std::env::temp_dir().join(format!("fandhe-bundle-lock-inherit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let lock = BundleLock::acquire(&dir).expect("acquire");
+        // 子の stdin へ同じ OFD の dup を渡し、fork 継承で fd が残る状況を模す。
+        let dup = lock._file.try_clone().expect("dup");
+        let _child = Child(
+            Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::from(dup))
+                .spawn()
+                .expect("spawn sleep"),
+        );
+        drop(lock);
+        let again = BundleLock::acquire(&dir).expect("reacquire after drop");
+        drop(again);
+
+        // 対照: unlock なしの close ではロックが残る。
+        let plain = std::fs::File::open(&dir).expect("open");
+        plain.try_lock().expect("lock");
+        let dup = plain.try_clone().expect("dup");
+        drop(plain);
+        let probe = std::fs::File::open(&dir).expect("open");
+        assert!(matches!(
+            probe.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(dup);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// REPAIR-5: 上限は 0 と `START_TIMEOUT_MAX` 超過を拒否し、境界値は受理する。
     #[test]
     fn repair5_start_timeouts_reject_zero_and_unbounded() {
@@ -572,6 +653,45 @@ mod tests {
                 Duration::from_secs(10)
             )
         );
+    }
+
+    /// CORE-1・SUP-6（#1461）: `launch_pidfd` の既定は `None`、`ContainerChildProcess` は起動時の pidfd を返し、
+    /// その fdinfo の `Pid:` が子の pid と一致する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core1_launch_pidfd_default_none_and_child_process_returns_pidfd() {
+        struct NoPidfd;
+        impl LaunchedProcess for NoPidfd {
+            fn pid(&self) -> NonZeroU32 {
+                NonZeroU32::new(1).unwrap()
+            }
+            fn wait(&self, _: Duration) -> Result<Option<ProcessExit>, TraitError> {
+                Ok(None)
+            }
+            fn terminate(&self, _: Duration) -> Result<(), TraitError> {
+                Ok(())
+            }
+        }
+        assert!(NoPidfd.launch_pidfd().is_none());
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        let process =
+            ContainerChildProcess::new(crate::exec::ContainerChild::from_pid_for_test(pid))
+                .expect("wrap");
+        let fd = process
+            .launch_pidfd()
+            .expect("pidfd は Linux 5.3 以降が前提（pidfd 非対応環境では失敗させる）");
+        use std::os::fd::AsRawFd as _;
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd()))
+            .expect("fdinfo");
+        let line = info.lines().find(|l| l.starts_with("Pid:")).expect("Pid:");
+        assert_eq!(line.trim_start_matches("Pid:").trim(), pid.to_string());
+        child.kill().expect("kill");
+        child.wait().expect("wait");
     }
 
     /// CORE-2・OCI-6（TASK-30.1）: `ContainerChildProcess::signal` は実プロセスへ SIGKILL を送り、

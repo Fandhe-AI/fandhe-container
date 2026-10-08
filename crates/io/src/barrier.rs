@@ -298,7 +298,7 @@ pub(crate) const MAX_PERSIST_THREADS: usize = 64;
 ///   ごとに報告されるため、他の sink の結果を流用すると未報告のエラーを見逃す）
 /// - 頻度（間隔）の制限は行わない
 ///
-/// 値は 1 以上 [`MAX_PERSIST_THREADS`]（64）以下。0 は FLUSH が永久に進まない
+/// 値は 1 以上 `MAX_PERSIST_THREADS`（64）以下。0 は FLUSH が永久に進まない
 /// ため、64 超は helper スレッドの絶対上限と矛盾するため拒否する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaxConcurrentPersist(usize);

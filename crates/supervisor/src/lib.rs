@@ -3,7 +3,10 @@
 //! 常駐デーモンを持たない設計（CORE-1・D-19）の実装主体で、コンテナ 1 つにつき 1 プロセスで監視する（SUP-1）。
 //! PLUG-1 区分は core（plugin 境界〔PLUG-2〕を経由せず実行層コアの一部。crate-naming.md）。
 //!
-//! 現状は状態配線（[`state`]。TASK-157.3）・監視ループ基本（[`run`]。TASK-157.4）・restart の土台（異常終了時の `restart_count` 更新。TASK-157.5）・healthcheck フック（[`health`]。TASK-157.6。コマンド実行は未実装）・logs 捕捉の土台（[`logs`]。TASK-157.7。永続化・ローテーションは SUP-7・TASK-164 で未実装）が実装済みで、restart ポリシー本体（SUP-3）等は未実装（TASK-1.3・TASK-157.1〔#235〕・REPAIR-1。スタブの明示は REPAIR-3）。
+//! 現状は状態配線（[`state`]。TASK-157.3）・監視ループ基本（[`run`]。TASK-157.4）・restart の土台（TASK-157.5。`restart_count` の加算は TASK-159.3 で再 launch 成功時へ移設）・healthcheck フック（[`health`]。TASK-157.6。コマンド実行は未実装）・logs 捕捉の土台（[`logs`]。TASK-157.7。ファイルへのローテーション書き込みは TASK-164.2・#506 で実装済み、フラッシュ制御・大規模検証は SUP-7・TASK-164.3/4 で未実装）が実装済みで、終了分類と restart ポリシー評価（[`restart`]。TASK-159.1・#487／TASK-159.2・#488。呼び出し側への配線は未実装）と、再起動ループ（バックオフ・注入式の再 launch・`restart_count` 管理・state.json 反映。#489・TASK-159.3）も実装済みで、本番 launcher による再 launch・明示的 stop の検知（SUP-9）等は未実装（TASK-1.3・TASK-157.1〔#235〕・REPAIR-1。スタブの明示は REPAIR-3）。
+//! inspect 相当の機械可読出力（[`inspect`]。TASK-168.1・#523・SUP-11）も実装済みで、出力をパースして型・値域・キー順・値を照合する結合テスト（TASK-168.2・#524。メモリ上のフェイクは 3 OS、実ストアは Linux）（`tests/inspect_output.rs`）も併置済み（CLI 配線は未実装）。
+//! cgroup 統計の読み取り・パース（[`stats`]。SUP-10・TASK-167.1・#520）と機械可読形式（JSON Lines）での出力（TASK-167.2・#521）も実装済みで、`stats` の CLI 配線は未実装。
+//! `--shm-size` / `--tmpfs` の解析と core の仕様型への変換（[`container_options`]。SUP-12・TASK-169.2・#527）と secrets / configs の指定モデル（TASK-169.4.2・#1473）も実装済みで、launcher・CLI 配線は未実装。
 //! 本体は G12（TASK-157〜171）で、次の分割に沿って実装する。
 //!
 //! | issue | TASK | 内容 |
@@ -11,16 +14,54 @@
 //! | #236 | TASK-157.2 | core への状態型追加 |
 //! | #237 | TASK-157.3 | core の `StateStore` 配線（supervisor から使う） |
 //! | #238 | TASK-157.4 | 監視ループ基本（実装済み） |
-//! | #239 | TASK-157.5 | restart の土台（実装済み。ポリシー本体は SUP-3 で未実装） |
+//! | #239 | TASK-157.5 | restart の土台（実装済み。ポリシーと加算は #487〜#489 で実装） |
 //! | #240 | TASK-157.6 | healthcheck フックの土台（実装済み。コマンド実行・周期実行は TASK-161） |
-//! | #241 | TASK-157.7 | logs 捕捉の土台（実装済み。永続化・ローテーションは SUP-7・TASK-164 で未実装） |
+//! | #493 | TASK-161.1 | healthcheck 定義パース（[`healthcheck`]。実装済み。実行・周期は #495、`health` 反映は #496 で未実装） |
+//! | #241 | TASK-157.7 | logs 捕捉の土台（実装済み。永続化・ローテーションは #506 で実装） |
+//! | #505 | TASK-164.1 | 行単位捕捉（実装は #241。バッファ境界跨ぎを検証済み。ローテーション書き込みは #506） |
+//! | #506 | TASK-164.2 | ローテーションログ書き込み（[`logs::rotating`]。実装済み。Windows の世代 rename の共有違反は有界再試行・ロックのファイル ID 照合・読み出し入口 `open_for_read` は #1470 で追補。フラッシュ制御は #507、100 万行規模の欠落 0・重複 0 検証は #508 で `tests/log_rotation.rs` に実装済み。ロックファイルの掃除は #1469 で `remove_all`・`open` 失敗時の削除を追加。`logs` 読み出し〔ログ名の列挙 `log_file_paths` のみ実装済み〕・実パイプ取得も未実装） |
 //! | #242 | TASK-157.8 | 結合テスト |
+//! | #500 | TASK-163.1 | exec: pid1 特定・setns（`exec`。実装済み。コマンド実行は未実装） |
+//! | #501 | TASK-163.2 | exec: cgroup join（`exec`。実装済み。コマンド実行は未実装） |
+//! | #502 | TASK-163.3 | exec: seccomp / Landlock 再適用（`exec`。実装済み。コマンド実行は未実装） |
+//! | #503 | TASK-163.4 | exec: fork・execve と統合テスト（未実装） |
 //! | #1069 | TASK-157.9 | state.json 書き込み排他 |
+//! | #487 | TASK-159.1 | 終了検知・終了コード分類（実装済み） |
+//! | #526 | TASK-169.1 | ulimit の指定モデル（[`container_options`]。適用は core の exec ステージ `Rlimits`。launcher 未結線のため消費者は無い。REPAIR-3） |
+//! | #528 | TASK-169.3 | `--ipc`（host / shareable）の指定モデル（[`container_options::ipc`]。Linux では core の `NamespaceSet` へ反映。他コンテナからの join は未実装。REPAIR-3） |
+//! | #529 | TASK-169.4 | env / env ファイル（[`container_options::env`]。実装済み。secrets / configs 注入は #1473 で実装） |
+//! | #1473 | TASK-169.4.2 | secrets / configs の指定モデル（[`container_options::secrets`]。`ContainerOptions::injected_files` で core の注入仕様型へ変換し、core の `exec::inject_files` が専用 tmpfs へ書き込み後に read-only 化する。launcher・CLI・stack 未結線。REPAIR-3） |
+//! | #855 | TASK-169.5.1 | label（`--label`。[`container_options::labels`]。core の `StateRecord::annotations` 経由で state.json へ反映。CLI・launcher 未結線。REPAIR-3） |
+//! | #856 | TASK-169.5.2 | 全オプション同時指定の結合テスト（`tests/container_options.rs`）。`--ipc=host` と `--shm-size` の併用は `ContainerOptions::tmpfs_set` が拒否 |
+//! | #488 | TASK-159.2 | restart ポリシー評価（実装済み） |
+//! | #858 | TASK-171.1.2 | 権限昇格の必要最小集合と検証ロジック（[`privilege`]。実装済み。昇格 syscall 経路・setuid・fd 検証付き exec は方式承認待ちで未実装。REPAIR-3） |
+//! | #489 | TASK-159.3 | restart_count 管理・state.json 反映・結合テスト（実装済み。本番 launcher は未実装） |
+//! | #523 | TASK-168.1 | state.json 読み取り・inspect 出力フォーマット（実装済み） |
+//! | #524 | TASK-168.2 | inspect 出力のパース検証結合テスト（`tests/inspect_output.rs`。#523 で先行追加し、#524 でキー順・型・値域・列挙値の照合を追加。実装済み） |
 //!
 //! supervisor から `fandhe-container-core` への一方向依存は導入済み（TASK-157.3・#237）。
 //! `StateStore` は core の既定実装を使い、2 つ目の実装は持たない（決定 6）。
 
+// `exec-test-support` は試験専用の入口（期待 cgroup パスを呼び出し側から受け取る対象特定・`execveat` を伴わない
+// 観測・worker 機構の直接呼び出し）を公開する feature で、リリースビルドで有効にすると SEC-1 の同一性照合を
+// 迂回できる。最適化ビルド（`debug_assertions` が無効）で有効になっていたらコンパイルを止める
+// （SUP-6・SEC-1・REPAIR-3・TASK-163 追補・#1460。テスト・clippy は dev プロファイルのため影響しない）。
+#[cfg(all(feature = "exec-test-support", not(debug_assertions)))]
+compile_error!(
+    "the `exec-test-support` feature exposes test-only exec entry points and must not be enabled in release builds"
+);
+
+pub mod container_options;
+#[cfg(target_os = "linux")]
+pub mod exec;
 pub mod health;
+pub mod healthcheck;
+pub mod inspect;
 pub mod logs;
+pub mod privilege;
+pub mod restart;
 pub mod run;
 pub mod state;
+pub mod stats;
+#[cfg(windows)]
+mod sys;

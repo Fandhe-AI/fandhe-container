@@ -30,11 +30,19 @@ fandhe-container-plugin = { workspace = true, optional = true }
 default = ["plugin"]
 plugin = ["dep:fandhe-container-plugin"]
 escape-probe = []
+# 実機結合試験（crates/supervisor/tests/exec_setns_join.rs）専用の入口 `exec::Pid1Target::open_with_cgroup_path`
+# （期待 cgroup パスを文字列で受ける）を公開する feature（SUP-6・SEC-1・TASK-163.1・#500）。既定のビルドでは無効で、
+# 公開 API は記録の型から期待パスを組み立てる `Pid1Target::open` だけになる。依存は増えない。
+# exec の子の `execveat` 前の手順を実プロセスで観測する `exec::observe_exec_child_setup`（tests/exec_child_setup.rs。
+# TASK-163 追補・#1456）と、標準 fd を閉じた呼び出し側を作る `exec::close_standard_fds_for_test`（tests/exec_child_setup.rs・
+# tests/fork_exec_isolation.rs。#1299）も同じ feature の下に置く。core 自身のテストでは下の dev-dependency（自己参照）で有効にし、
+# `cargo test --workspace`・`make test-integration` の既定のテスト集合から外れないようにする。
+exec-test-support = []
 
 # default-features = false は、`--no-default-features` のテスト時に自己参照経由で default が
 # 統合されて feature 無効構成を検証できなくなるのを防ぐ（既定の `cargo test` では影響しない）。
 [dev-dependencies]
-fandhe-container-core = { path = ".", default-features = false, features = ["escape-probe"] }
+fandhe-container-core = { path = ".", default-features = false, features = ["escape-probe", "exec-test-support"] }
 
 # namespace 分離の結合試験（CORE-1・TASK-27.2）。libtest はテストをスレッドで実行し
 # CLONE_NEWUSER が EINVAL になるため、単一スレッドの独自 main（harness = false）で動かす。
@@ -67,6 +75,12 @@ harness = false
 
 # 起動フローへの cgroup 参加（CgroupJoin 段）の結合試験（CORE-3・TASK-32.4）。上と同じ理由で harness = false。
 # 委譲 cgroup v2 が必要な実機前提テストのため `-- --ignored` 指定時のみ実行する（AGENTS.md）。
+# exec 用の子 cgroup と `cgroup.kill`（SUP-6・TASK-163 追補・#1466）の結合試験。委譲 cgroup を要する実機前提
+# テストで、`-- --ignored` 指定時のみ実行する（AGENTS.md）。`exec-test-support` の入口を使う（上の自己参照で有効）。
+[[test]]
+name = "exec_cgroup_kill"
+path = "tests/exec_cgroup_kill.rs"
+
 [[test]]
 name = "cgroup_join"
 path = "tests/cgroup_join.rs"
@@ -103,9 +117,38 @@ name = "seccomp_enforcement"
 path = "tests/seccomp_enforcement.rs"
 harness = false
 
+# exec プロセスへの seccomp / Landlock 再適用の結合試験（SUP-6・TASK-163.3・#502）。不可逆の制限適用と単一スレッド
+# 前提のため harness = false。`-- --ignored` で Landlock ABI 6+ を必須にする実機前提モード（AGENTS.md）。
+[[test]]
+name = "exec_restrictions_reapply"
+path = "tests/exec_restrictions_reapply.rs"
+harness = false
+
+# exec の子の `execveat` 前の手順（`setsid`・`/dev/null` の検証と置換・エントリポイントの検査）を実プロセスで
+# 照合する結合試験（SUP-6・SEC-1・TASK-163 追補・#1456）。fork は単一スレッドの呼び出し元を要求するため
+# harness = false。root・実コンテナは不要で、既定のテスト集合で実行する（`exec-test-support` は上の自己参照で有効）。
+[[test]]
+name = "exec_child_setup"
+path = "tests/exec_child_setup.rs"
+harness = false
+
 [[test]]
 name = "default_devices"
 path = "tests/default_devices.rs"
+harness = false
+
+# tmpfs マウント（mount_tmpfs。--shm-size / --tmpfs）の結合試験（SUP-12・TASK-169.2）。上と同じ理由で
+# harness = false。`-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
+[[test]]
+name = "tmpfs_mount"
+path = "tests/tmpfs_mount.rs"
+harness = false
+
+# secrets / configs 注入（read-only tmpfs）の結合試験（SUP-12・TASK-169.4.2）。上と同じ理由で
+# harness = false。`-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
+[[test]]
+name = "inject_files"
+path = "tests/inject_files.rs"
 harness = false
 
 # user namespace UID/GID 写像（rootless）の結合試験（CORE-6・SEC-5・TASK-40.1）。上と同じ理由で
@@ -183,3 +226,7 @@ harness = false
 name = "namespace_isolation"
 path = "tests/namespace_isolation.rs"
 harness = false
+
+# workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
+[lints]
+workspace = true

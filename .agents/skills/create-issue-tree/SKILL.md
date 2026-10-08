@@ -211,6 +211,8 @@ MILESTONE_COUNT=$(gh api "repos/{owner}/{repo}/milestones?state=all" --jq 'lengt
 そのまま再利用する（ここで再代入・再検証しない）。
 
 `--root` 未指定の場合のみ、以下でルート issue を新規作成する。
+表のプレースホルダー行は `scripts/merge-root-body.sh`（Step 6 の `--root` 経路）が追記位置として読む。
+文言を変えるときは同スクリプトの awk とテスト (n) を合わせて直す。
 
 ```bash
 # MILESTONE が空でなければ --milestone を付与する（Step 2.5 で決定済み）
@@ -390,56 +392,106 @@ done
 
 **`--root` での部分起票では本文を全置換しない。** 既存ルートの本文には先行 Phase の表が
 含まれるため、現在の本文を取得し、今回起票した Phase の行・セクションのみを追記・更新した
-本文で `gh issue edit` する。以下の全置換テンプレートは新規作成（`--root` 未指定）時のみ使う。
+本文で `gh issue edit` する。全置換は新規作成（`--root` 未指定）時のみ行い、その生成は `scripts/create-root-body.sh` に、
+`--root` 時のマージは `scripts/merge-root-body.sh` に任せる（本文生成ロジックを SKILL.md へ書かない）。
+Step 3 の雛形のままのルート（Step 6 到達前に中断した起票の再実行）でも、表のプレースホルダー行
+`| (作成後に更新) |` を今回の Phase 行へ置き換えて完走する。
+
+`--root` 指定時は `scripts/merge-root-body.sh` が既存本文を取得し、今回の Phase 行・セクションを
+実ツリーから生成してマージする（Issue #556）。各コードフェンスは独立したシェルで実行され得るため、
+このフェンスは Step 3 / Step 4 と同形にスクリプトを 3 レイアウトから自己完結的に解決する。
+ROOT_NUMBER（ルート issue 番号）・GRANULARITY（Step 1 で確定した粒度）・PHASE（Step 4 で確定した
+Phase 番号 N）・PHASE_NUMBER（その Phase 親 issue 番号）が未設定なら起動前に停止する。
 
 ```bash
-# --root 指定時: 既存本文を取得し、今回の Phase 分をマージしてから編集する
-CURRENT_BODY=$(gh issue view "${ROOT_NUMBER}" --json body --jq '.body') \
-  || { echo "エラー: ルート issue #${ROOT_NUMBER} の本文を取得できません。中止します。"; exit 1; }
+: "${ROOT_NUMBER:?ROOT_NUMBER 未設定}" "${GRANULARITY:?GRANULARITY 未設定}" \
+  "${PHASE:?PHASE 未設定}" "${PHASE_NUMBER:?PHASE_NUMBER 未設定}"
 
-# <!-- granularity: Nh --> マーカーは常に Step 1 で確定した GRANULARITY で先頭へ 1 行だけ
-# 書き直す（明示・未指定を問わず常に反映する。GRANULARITY 自体が Step 1 の優先順位
-# 「明示 > 既存マーカー > 既定 2h」を既に反映済みのため、ここで条件分岐しない）。
-# 既存本文に旧マーカー行があれば重複させないため、先に取り除いてから先頭へ再出力する。
-CURRENT_BODY=$(printf '%s\n' "${CURRENT_BODY}" | grep -vE '^<!-- granularity: [1-9][0-9]*h -->$')
-NEW_BODY="$(printf '<!-- granularity: %s -->\n' "${GRANULARITY}"; printf '%s\n' "${CURRENT_BODY}")"
+MERGE_ROOT_BODY=""
+for CANDIDATE in \
+  "skills/create-issue-tree/scripts/merge-root-body.sh" \
+  ".agents/skills/create-issue-tree/scripts/merge-root-body.sh" \
+  ".claude/skills/create-issue-tree/scripts/merge-root-body.sh"; do
+  # 存在確認は -f のみ（vendoring で実行ビットが落ちても bash 経由で起動できる）
+  if [[ -f "${CANDIDATE}" ]]; then
+    MERGE_ROOT_BODY="${CANDIDATE}"
+    break
+  fi
+done
+if [[ -z "${MERGE_ROOT_BODY}" ]]; then
+  echo "エラー: merge-root-body.sh が見つからない（3 レイアウトいずれにも存在しない）" >&2
+  exit 1
+fi
 
-# NEW_BODY の「Phase 別実装計画」表へ今回の Phase 行を追記し、
-# 「### Phase N」セクションを追加した本文を組み立てて gh issue edit --body に渡す。
-# 既存ツリーの棚卸しを伴う場合は update-issue-tree への委譲でもよい
+# echo を最終コマンドにしない。非ゼロ終了はそのままフェンスの終了ステータスにする
+status=0
+bash "${MERGE_ROOT_BODY}" --root "${ROOT_NUMBER}" --granularity "${GRANULARITY}" \
+  --phase "${PHASE}" --phase-number "${PHASE_NUMBER}" || status=$?
+if (( status != 0 )); then
+  echo "exit=${status}" >&2
+  exit "${status}"
+fi
 ```
 
-`--root` 未指定（新規作成）の場合は以下で全体を更新する。
+**終了コード**（成功時の stdout 最終行は `result=merged root=<n> phase=<N>`。エラーメッセージは stderr）
+
+| exit | 意味 | 本文の更新 |
+|------|------|-----------|
+| 0 | 既存本文へ今回の Phase 分をマージし `gh issue edit` が成功 | あり |
+| 1 | 引数不正（`--root`・`--phase-number` は正整数、`--phase` は数字、`--granularity` は `^[1-9][0-9]*h$`）、既存本文・Phase 親・sub_issues・子孫の取得失敗、追記位置なし・Phase 行を出力不可、プレースホルダー残り・検査失敗、一時ファイル作成失敗 | なし |
+| 2 | 前提不備（`tree-lib.sh` を読み込めない、`gh`・`jq` が無い） | なし |
+| その他 | `gh issue edit` 自身の終了コード | 不明（実状態を確認する） |
+
+マージの不変条件: Phase 行・セクションは実ツリー（sub_issues API）からのみ作り、先行 Phase の表・自由記述は保持する /
+issue タイトルは非信頼データとして `|`・改行・バックスラッシュを無害化する / プレースホルダーが残る本文では
+`gh issue edit` しない（fail-closed）/ 一時ファイルは成否によらず削除する / granularity マーカーは常に
+GRANULARITY で書き直す。詳細は `scripts/merge-root-body.sh` 冒頭コメントを参照。
+
+`--root` 未指定（新規作成）の場合は `scripts/create-root-body.sh` が実ツリーから本文を生成して更新する
+（Issue #555）。ヘルパー（`list_subs` 等）は両経路とも `scripts/tree-lib.sh` を共用する。
+
+同じ形式で、ROOT_NUMBER と GRANULARITY が未設定なら起動前に停止する。
 
 ```bash
-gh issue edit "${ROOT_NUMBER}" --body "$(printf '<!-- granularity: %s -->\n' "${GRANULARITY}"; cat <<'EOF'
-## 概要
+: "${ROOT_NUMBER:?ROOT_NUMBER 未設定}" "${GRANULARITY:?GRANULARITY 未設定}"
 
-全 open issue を Phase 別に 1 ツリーへ整理する。各 Phase 親 issue を sub-issues として紐付け。
+CREATE_ROOT_BODY=""
+for CANDIDATE in \
+  "skills/create-issue-tree/scripts/create-root-body.sh" \
+  ".agents/skills/create-issue-tree/scripts/create-root-body.sh" \
+  ".claude/skills/create-issue-tree/scripts/create-root-body.sh"; do
+  # 存在確認は -f のみ（vendoring で実行ビットが落ちても bash 経由で起動できる）
+  if [[ -f "${CANDIDATE}" ]]; then
+    CREATE_ROOT_BODY="${CANDIDATE}"
+    break
+  fi
+done
+if [[ -z "${CREATE_ROOT_BODY}" ]]; then
+  echo "エラー: create-root-body.sh が見つからない（3 レイアウトいずれにも存在しない）" >&2
+  exit 1
+fi
 
-## Phase 別実装計画
-
-| Phase | 親 issue | 直下 | 総 open 件数 |
-|-------|----------|------|-------------|
-| Phase 1 | #<phase1_number> タイトル | N | N |
-| Phase 2 | #<phase2_number> タイトル | N | N |
-
-### Phase 1: 基盤整備
-
-| Issue | タイトル | 分解 |
-|-------|---------|------|
-| #N | タイトル | - |
-| #N | タイトル | sub-issue あり |
-
-## 運用
-
-- 新規 issue は起票時に Phase 親へ紐付ける
-- 実行順は sub-issues リスト順が正
-- closed 親の下に open issue を残置しない
-- implement-issue-tree が post-order DFS で消化可能な構造を維持する
-EOF
-)"
+# echo を最終コマンドにしない。非ゼロ終了はそのままフェンスの終了ステータスにする
+status=0
+bash "${CREATE_ROOT_BODY}" --root "${ROOT_NUMBER}" --granularity "${GRANULARITY}" || status=$?
+if (( status != 0 )); then
+  echo "exit=${status}" >&2
+  exit "${status}"
+fi
 ```
+
+**終了コード**（成功時の stdout 最終行は `result=updated root=<n> phases=<k>`。エラーメッセージは stderr）
+
+| exit | 意味 | 本文の更新 |
+|------|------|-----------|
+| 0 | 本文を生成し `gh issue edit` が成功 | あり |
+| 1 | 引数不正（`--root` は正整数・`--granularity` は `^[1-9][0-9]*h$`）、sub_issues 取得失敗、Phase 親 0 件、Phase 番号決定不可、子孫取得失敗、プレースホルダー残り・検査失敗、Phase 行数不一致、一時ファイル作成失敗 | なし |
+| 2 | 前提不備（`tree-lib.sh` を読み込めない、`gh`・`jq` が無い） | なし |
+| その他 | `gh issue edit` 自身の終了コード | 不明（実状態を確認する） |
+
+生成の不変条件: 表は実ツリー（sub_issues API）からのみ作る / issue タイトルは非信頼データとして
+`|`・改行・バックスラッシュを無害化する / プレースホルダーが残る本文では `gh issue edit` しない
+（fail-closed）/ 一時ファイルは成否によらず削除する。詳細は `scripts/create-root-body.sh` 冒頭コメントを参照。
 
 ### Step 7: 作成結果を報告する
 
@@ -468,6 +520,7 @@ EOF
 - ルート issue の sub-issues に各 Phase 親 issue が列挙されていることを確認する
 - 各 Phase 親 issue の sub-issues に子 issue が列挙されていることを確認する
 - `gh issue view "${ROOT_NUMBER}"` でルート issue 本文の Phase 別表が正しく生成されていることを確認する
+- `gh issue view "${ROOT_NUMBER}" --json body --jq .body` に `<phaseN_number>`・`#N`・`(作成後に更新)`・素の `N` セルが残っていないことを確認する（残っていれば Step 6 を再実行する）
 - `MILESTONE` を割り当てた場合、`gh issue view <N> --json milestone --jq '.milestone.title'`
   でルート・Phase 親・子いずれも `${MILESTONE}` と一致することを確認する
 
@@ -495,6 +548,8 @@ gh api "repos/{owner}/{repo}/issues/${PHASE_NUMBER}/sub_issues?per_page=100" \
 | phase ラベルが存在しないリポジトリで issue 作成が失敗する | Step 4 冒頭の `gh label create "phase:${PHASE}"` を必ず先に実行する |
 | `--root` 追記時に既存ルートの milestone が未設定なのに気づかず milestone なしで起票してしまう | リポジトリに milestone が存在する場合、Step 2.5 は継承結果が空ならユーザー確認フローへ自動的に合流する（確認で milestone を選ぶとルート issue にも反映される）。milestone が 1 件もない非運用リポジトリでは非運用ガードによる milestone なし起票が正常動作 |
 | closed 親の下に open issue が残置される | Phase 親を close する前に全子 issue の close を確認する |
+| Step 6 の本文を手書きのプレースホルダーのまま `gh issue edit` してルート本文が雛形で上書きされる | 実ツリーから表を生成する `scripts/create-root-body.sh`（新規作成）・`scripts/merge-root-body.sh`（`--root`）を使う。検査ガードに引っかかったら本文を送らず中止される |
+| Step 6 到達前に中断し、雛形のままのルートが残った | `--root <ルート番号>` を付けて再実行する。プレースホルダー行は今回の Phase 行へ置き換わる |
 | `--granularity` に `2 h`・`2`・`0h` 等を渡して中断される | 正整数+h 形式（`^[1-9][0-9]*h$`。例: `2h`・`4h`）で指定する |
 
 ## 注意事項
@@ -503,6 +558,7 @@ gh api "repos/{owner}/{repo}/issues/${PHASE_NUMBER}/sub_issues?per_page=100" \
 - issue タイトルは Conventional Commits 形式を推奨（`feat:`・`fix:`・`chore:` 等）
 - `--phase` 指定で部分起票した場合、別 Phase の追加起票では **必ず `--root <既存ルートissue番号>` を渡す**（Step 3 の新規作成をスキップして既存ツリーへ継ぎ足し、Step 6 も全置換せず既存本文へ差分追記する）。起票後は update-issue-tree に同じルート issue 番号を渡して棚卸しする
 - ページネーション: sub-issues が 100 件を超える場合は `per_page=100&page=N` でページングして全件取得する
+- Step 6 の本文生成は新規作成が `scripts/create-root-body.sh`、`--root` マージが `scripts/merge-root-body.sh`。本文生成ロジックを SKILL.md へ書き戻さない（肥大とヘルパー重複の再発防止）
 - シェルコマンドの変数は必ず `"${var}"` でクォートする（コマンドインジェクション対策）
 - **`gh issue create` は `--json` 非対応**。issue URL を stdout に出力するため、`| grep -oE '[0-9]+$'` で末尾の番号を抽出して変数に保持する
 - **sub_issues API の `sub_issue_id` は issue 番号ではなく database id**（GitHub 仕様）。`gh api "repos/{owner}/{repo}/issues/<number>" --jq '.id'` で id を取得してから POST する。番号をそのまま渡すと誤った issue を紐付ける／404 になる

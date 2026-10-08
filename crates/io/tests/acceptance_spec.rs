@@ -1721,3 +1721,18 @@ fn repair_12_io5_case_collision_returns_structured_error() {
         "message: {message}"
     );
 }
+
+/// REPAIR-12・ERR-1（#1116）: 公開 API 経由で `IoError` のメッセージ長が
+/// `MAX_IO_ERROR_MESSAGE_BYTES`（1024）で有界になることを具体値で照合する。
+#[test]
+fn err1_io_error_message_is_bounded_via_public_api() {
+    use fandhe_container_io::{IoError, IoErrorCode, MAX_IO_ERROR_MESSAGE_BYTES};
+    assert_eq!(MAX_IO_ERROR_MESSAGE_BYTES, 1024);
+    let err = IoError::new(
+        IoErrorCode::Timeout,
+        "x".repeat(MAX_IO_ERROR_MESSAGE_BYTES + 1),
+    );
+    assert_eq!(err.message().len(), 1024);
+    assert_eq!(err.to_string().len(), "TIMEOUT: ".len() + 1024);
+    assert!(err.message_truncated());
+}

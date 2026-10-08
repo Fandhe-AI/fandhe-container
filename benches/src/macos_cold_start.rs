@@ -328,9 +328,14 @@ mod proc {
         }
     }
 
-    /// 子プロセス（plugin 役。`--plugin-serve`）の本体。`socket` へ接続して [`serve`] を回す。
+    /// 子プロセス（plugin 役。`--plugin-serve`）の本体。`socket` へ接続して `serve` を回す。
     pub fn serve_plugin_socket(socket: &Path) -> Result<(), BenchError> {
-        let mut stream = UdsStream::connect(socket, SETUP_TIMEOUT).map_err(pe)?;
+        let mut stream = UdsStream::connect(
+            socket,
+            SETUP_TIMEOUT,
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        )
+        .map_err(pe)?;
         serve(&mut stream)
     }
 
@@ -371,7 +376,12 @@ mod proc {
         let listener = UdsListener::bind(&dir.0.join("s")).map_err(pe)?;
         let start = Instant::now();
         let child = Guard::spawn(exe, ARG_PLUGIN_SERVE, listener.path())?;
-        let mut stream = listener.accept(SETUP_TIMEOUT).map_err(pe)?;
+        let mut stream = listener
+            .accept(
+                SETUP_TIMEOUT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .map_err(pe)?;
         // accept は接続成立のみを示すため、子の `Model::new()` 完了を示す準備完了通知まで含めて測る。
         wait_ready(&mut stream)?;
         let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -396,7 +406,12 @@ mod proc {
         let dir = TempDir::new()?;
         let listener = UdsListener::bind(&dir.0.join("s")).map_err(pe)?;
         let child = Guard::spawn(exe, ARG_PLUGIN_SERVE, listener.path())?;
-        let mut stream = listener.accept(SETUP_TIMEOUT).map_err(pe)?;
+        let mut stream = listener
+            .accept(
+                SETUP_TIMEOUT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .map_err(pe)?;
         // 子の準備完了（Model::new() 済み・サーバーループ直前）を待ってから計測を始める。
         wait_ready(&mut stream)?;
         let start = Instant::now();

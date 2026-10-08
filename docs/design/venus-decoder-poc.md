@@ -1,0 +1,295 @@
+# Venus デコーダ最小サブセット PoC（設計ドラフト）
+
+macOS の virtio-gpu Venus 自前実装（ヘッドレス Vulkan compute のみ）で、最小 venus デコーダが扱う Vulkan コマンドの候補を記録する（GPU-6）。TASK-172 全体の PoC 文書で、本版は候補抽出（TASK-172.1）・wire パース骨格（TASK-172.2）・記録と再生ハーネス（TASK-172.5）・capset 応答（TASK-172.3）・試験治具 VMM の選定と capset アダプタ（TASK-172.4）・VZCustomVirtioDevice 登録可否確認ハーネス（TASK-172.6）の章を埋める。
+
+> **位置づけ**: 本書はドラフトであり、候補を列挙するだけで対象サブセットを確定しない。最終確定は #726（TASK-172.h2。人間担当）で行う。優先度（必須・推奨・保留）は抽出時点の見立てで、確定扱いにしない。
+
+- 対象ビヘイビア: GPU-6（関連: MAC-5・MVM-4）
+- タスク: TASK-172（MS-13・G-別枠）。本版は TASK-172.1（#722。親 #721）・TASK-172.2（#723）・TASK-172.3（#724）・TASK-172.4（#888）・TASK-172.6（#1056）。前提 TASK-7（#25。完了済み）
+- 後続・関連: #723（wire パース骨格）・#724（capset 応答。実装済み）・#889（コマンドストリーム記録）・#888（試験治具。アダプタまで実装済み・トランスポート未実装）・#725（1〜3 段目の結果）・#726（確定）・#776 / #777（対象範囲判断・工数再確定）・#781（サブセットのフィルタ機構）。ディスパッチ・ハンドラ群は TASK-177.x（#765・#769・#771・#773・#774）
+- 出典（spec）: GPU-6・TASK-172・D-15・PoC-14（submodule リビジョン `984f8a2`）。作業環境で `docs/spec` を取得できなかったため、spec 本文は参照せず ID のみで辿れるようにしている
+- 出典（外部。確認日 2026-10-08）:
+  - Vulkan レジストリ `vk.xml`: KhronosGroup/Vulkan-Headers のタグ `vulkan-sdk-1.4.363.0`（`registry/vk.xml`。`VK_HEADER_VERSION` 363。SHA-256 `55ec60950cfb18c3575dcf5fd52741b2bb70eb1e466408f803a91049973ee6fb`）
+  - venus 固有コマンド: virgl/venus-protocol（freedesktop.org の GitLab）のタグ `v1.1.3`（コミット `ca19b6358d7c`）の `xmls/VK_MESA_venus_protocol.xml`（SHA-256 `d92839bc728fa9ad9a7decdc6b91df6fa1a0fb26cffae4009865f18a789e0535`）
+  - Mesa Venus ドキュメント（docs.mesa3d.org/drivers/venus.html）・MoltenVK Runtime User Guide（KhronosGroup/MoltenVK の `Docs/MoltenVK_Runtime_UserGuide.md`）
+
+## 1. 前提と範囲
+
+- 用途はヘッドレスの Vulkan compute のみ。2D スキャンアウトは対象外（GPU-6）
+- ゲスト側ドライバは Mesa venus 専用。他のドライバ向けのプロトコルは扱わない（GPU-6）
+- CUDA は対象外（本書は Vulkan のみ）
+- ゲストから届くコマンドストリームは untrusted 入力として扱う。候補を最小に保つことが攻撃面の縮小になる。候補にないコマンドの受信は、黙って無視せずエラー応答する（fail-closed）方針を #723・#769 への申し送りとする
+- Mesa のドキュメントによると、venus ホスト側は Vulkan 1.1 と `VK_KHR_external_memory_fd`（Linux）を要求する。本書の `*2` 系中心の構成はこの前提に沿う
+
+## 2. 候補の抽出方法
+
+推測の列挙にしないため、次の手順で導出した。
+
+1. **基準ワークロードを定義**する。(a) 物理デバイス列挙と各種プロパティ取得（`vulkaninfo` 相当）、(b) 最小のヘッドレス compute（入力バッファ → compute dispatch → 出力バッファ → 読み戻し）、(c) バッファ・イメージ間の転送
+2. ワークロードが発行するコマンドを列挙し、**`vk.xml` と突き合わせて**正確なコマンド名と導入元を確定する。導入元は `vk.xml` の `<feature>` / `<extension>` の `require` から機械的に引いた（`VK_BASE_VERSION_x_y`・`VK_COMPUTE_VERSION_x_y` は Vulkan x.y core の機能分割名で、表では `x.y` と略記する）。alias のみの名前は採用していない
+3. **venus 固有コマンド**は `VK_MESA_venus_protocol.xml` から全件（18 件）を取り出し、同 XML の `SPEC_VERSION` コメントでプロトコル版（v1〜v4）を付した
+4. 本書の全コマンド名（`vk*`）が、上記 2 つの XML のコマンド名集合に存在することを一時スクリプトで機械照合した（不一致 0 件）。XML とスクリプトはリポジトリに含めない
+5. **MoltenVK 対応**: MoltenVK は Vulkan 1.4 の graphics / compute 実装を謳っており、2 段目で再生する core 1.0〜1.3 の compute・転送系は対応範囲に入る見込みである。ただしコマンド単位の対応状況は未確認で、断定しない（5 章）
+
+## 3. 候補コマンド一覧
+
+優先度の意味は次のとおり。
+
+- **必須**: 基準ワークロードが必ず発行する
+- **推奨**: 基準ワークロードの周辺で発行されうる、または互換上あると望ましい
+- **保留**: 最小構成では不要と見込むが、実コマンドストリームの記録（#725・#889）の結果次第で昇格しうる
+
+件数の集計（#777 の工数再確定の入力）:
+
+| カテゴリ | 必須 | 推奨 | 保留 | 計 |
+| -------- | ---- | ---- | ---- | -- |
+| 1 プロトコル制御（venus 固有） | 7 | 2 | 9 | 18 |
+| 2 インスタンス・物理デバイス | 11 | 1 | 1 | 13 |
+| 3 デバイス・キュー | 6 | 1 | 1 | 8 |
+| 4 メモリ | 6 | 0 | 4 | 10 |
+| 5 バッファ・イメージ・サンプラ | 2 | 6 | 3 | 11 |
+| 6 シェーダ・パイプライン・ディスクリプタ | 12 | 2 | 2 | 16 |
+| 7 コマンドバッファ（記録・実行） | 11 | 3 | 2 | 16 |
+| 8 転送 | 2 | 5 | 1 | 8 |
+| 9 同期 | 5 | 2 | 9 | 16 |
+| **合計** | **62** | **22** | **32** | **116** |
+
+### 3.1 プロトコル制御（venus 固有）
+
+| 優先度 | コマンド（導入元） | 必要理由 | 備考 |
+| ------ | ------------------ | -------- | ---- |
+| 必須 | `vkSetReplyCommandStreamMESA`（MESA venus v1）<br>`vkSeekReplyCommandStreamMESA`（MESA venus v1）<br>`vkExecuteCommandStreamsMESA`（MESA venus v1）<br>`vkCreateRingMESA`（MESA venus v1）<br>`vkDestroyRingMESA`（MESA venus v1）<br>`vkNotifyRingMESA`（MESA venus v1）<br>`vkWriteRingExtraMESA`（MESA venus v1） | 全コマンドの入口。reply ストリームの設定と、コマンドストリームの実行・ring の生成/通知がないと他のコマンドが到達しない | wire パース骨格 #723 と ring 実装 #765 の対象 |
+| 推奨 | `vkGetMemoryResourcePropertiesMESA`（MESA venus v1）<br>`vkResetFenceResourceMESA`（MESA venus v1） | リソース（blob）とメモリ・fence の対応づけ。ホスト可視メモリを使う構成で必要になる見込み | blob 経路の要否は未検証（要確認） |
+| 保留 | `vkWaitSemaphoreResourceMESA`（MESA venus v1）<br>`vkImportSemaphoreResourceMESA`（MESA venus v1）<br>`vkSubmitVirtqueueSeqnoMESA`（MESA venus v1）<br>`vkWaitVirtqueueSeqnoMESA`（MESA venus v1）<br>`vkWaitRingSeqnoMESA`（MESA venus v1） | セマフォのリソース共有・virtqueue / ring の seqno 待ち。単一ゲスト・単一 ring の最小構成で不要かは未検証 | 1 段目の記録（#725・#889）で実際に現れるかを見て採否を決める |
+| 保留 | `vkCopyImageToMemoryMESA`（MESA venus v3）<br>`vkCopyMemoryToImageMESA`（MESA venus v3）<br>`vkWriteSamplerDescriptorMESA`（MESA venus v4）<br>`vkWriteResourceDescriptorMESA`（MESA venus v4） | イメージ⇔メモリの直接コピーとディスクリプタの直接書き込み（プロトコル v3・v4 の最適化用）。最小構成では通常経路で代替できる見込み | ゲスト側 Mesa が発行するかは未検証（要確認） |
+
+### 3.2 インスタンス・物理デバイス
+
+| 優先度 | コマンド（導入元） | 必要理由 | 備考 |
+| ------ | ------------------ | -------- | ---- |
+| 必須 | `vkEnumerateInstanceVersion`（1.1）<br>`vkEnumerateInstanceExtensionProperties`（1.0）<br>`vkCreateInstance`（1.0）<br>`vkDestroyInstance`（1.0）<br>`vkEnumeratePhysicalDevices`（1.0）<br>`vkEnumerateDeviceExtensionProperties`（1.0）<br>`vkGetPhysicalDeviceFeatures2`（1.1）<br>`vkGetPhysicalDeviceProperties2`（1.1）<br>`vkGetPhysicalDeviceQueueFamilyProperties2`（1.1）<br>`vkGetPhysicalDeviceMemoryProperties2`（1.1）<br>`vkGetPhysicalDeviceFormatProperties2`（1.1） | 基準ワークロード (a)。デバイス列挙とプロパティ取得（`vulkaninfo` 相当）。Mesa venus は Vulkan 1.1 以上を要求するため `*2` 系が主 | 後続 #769 |
+| 推奨 | `vkGetPhysicalDeviceImageFormatProperties2`（1.1） | (b) のバッファ・イメージ作成前のフォーマット/用途の可否判定 | 後続 #769 |
+| 保留 | `vkEnumeratePhysicalDeviceGroups`（1.1） | 複数物理デバイスのグループ化。単一デバイス前提の最小構成では不要 | デバイスグループは対象外とする案（要判断） |
+
+### 3.3 デバイス・キュー
+
+| 優先度 | コマンド（導入元） | 必要理由 | 備考 |
+| ------ | ------------------ | -------- | ---- |
+| 必須 | `vkCreateDevice`（1.0）<br>`vkDestroyDevice`（1.0）<br>`vkGetDeviceQueue2`（1.1）<br>`vkDeviceWaitIdle`（1.0）<br>`vkQueueWaitIdle`（1.0）<br>`vkQueueSubmit`（1.0） | 基準ワークロード (b)。論理デバイスとキューの取得、submit と完了待ち | 後続 #769 |
+| 推奨 | `vkGetDeviceQueue`（1.0） | ゲストのローダ／アプリが 1.0 形式でキューを取得する場合の互換 | `vkGetDeviceQueue2` と重複。発行有無は 1 段目の記録で確認 |
+| 保留 | `vkQueueSubmit2`（1.3） | Vulkan 1.3 の submit。timeline semaphore（同期カテゴリ）の採否と連動 | 採否は同期カテゴリと一括で判断 |
+
+### 3.4 メモリ
+
+| 優先度 | コマンド（導入元） | 必要理由 | 備考 |
+| ------ | ------------------ | -------- | ---- |
+| 必須 | `vkAllocateMemory`（1.0）<br>`vkFreeMemory`（1.0）<br>`vkBindBufferMemory2`（1.1）<br>`vkBindImageMemory2`（1.1）<br>`vkGetBufferMemoryRequirements2`（1.1）<br>`vkGetImageMemoryRequirements2`（1.1） | 基準ワークロード (b)。バッファ・イメージ用メモリの確保・束縛と要件問い合わせ | 後続 #771 |
+| 保留 | `vkMapMemory`（1.0）<br>`vkFlushMappedMemoryRanges`（1.0）<br>`vkInvalidateMappedMemoryRanges`（1.0） | ホスト可視メモリの読み戻し。venus ではゲスト側で blob をマップするため wire に載らない可能性がある | wire に載るかは未検証（要確認）。Mesa docs は vkMapMemory が実装依存の挙動に依存すると記す |
+| 保留 | `vkGetDeviceBufferMemoryRequirements`（1.3） | デバイス作成情報からのバッファ要件問い合わせ（Vulkan 1.3）。作成前の見積りに使われうる | 発行有無は未検証 |
+
+### 3.5 バッファ・イメージ・サンプラ
+
+| 優先度 | コマンド（導入元） | 必要理由 | 備考 |
+| ------ | ------------------ | -------- | ---- |
+| 必須 | `vkCreateBuffer`（1.0）<br>`vkDestroyBuffer`（1.0） | 基準ワークロード (b)。入出力バッファ | 後続 #769 |
+| 推奨 | `vkCreateBufferView`（1.0）<br>`vkDestroyBufferView`（1.0）<br>`vkCreateImage`（1.0）<br>`vkDestroyImage`（1.0）<br>`vkCreateImageView`（1.0）<br>`vkDestroyImageView`（1.0） | storage texel buffer・画像を扱う compute と転送 (c) | 画像対応の範囲は #726 で判断 |
+| 保留 | `vkCreateSampler`（1.0）<br>`vkDestroySampler`（1.0）<br>`vkGetImageSubresourceLayout`（1.0） | サンプラ付き画像アクセスや tiling 依存のレイアウト取得。基準ワークロードの範囲外 | 採否は #726 |
+
+### 3.6 シェーダ・パイプライン・ディスクリプタ
+
+| 優先度 | コマンド（導入元） | 必要理由 | 備考 |
+| ------ | ------------------ | -------- | ---- |
+| 必須 | `vkCreateShaderModule`（1.0）<br>`vkDestroyShaderModule`（1.0）<br>`vkCreatePipelineLayout`（1.0）<br>`vkDestroyPipelineLayout`（1.0）<br>`vkCreateComputePipelines`（1.0）<br>`vkDestroyPipeline`（1.0）<br>`vkCreateDescriptorSetLayout`（1.0）<br>`vkDestroyDescriptorSetLayout`（1.0）<br>`vkCreateDescriptorPool`（1.0）<br>`vkDestroyDescriptorPool`（1.0）<br>`vkAllocateDescriptorSets`（1.0）<br>`vkUpdateDescriptorSets`（1.0） | 基準ワークロード (b)。compute シェーダ（SPIR-V）の登録、compute パイプライン、バッファ束縛 | 後続 #769。SPIR-V の受け渡しは untrusted 入力のため検証方針を #723 以降で定める |
+| 推奨 | `vkResetDescriptorPool`（1.0）<br>`vkFreeDescriptorSets`（1.0） | ディスクリプタの再利用（プール単位のリセットと個別解放） | 後続 #769 |
+| 保留 | `vkCreatePipelineCache`（1.0）<br>`vkDestroyPipelineCache`（1.0） | パイプラインキャッシュ。性能最適化用で機能上は不要 | 採否は #726 |
+
+### 3.7 コマンドバッファ（記録・実行）
+
+| 優先度 | コマンド（導入元） | 必要理由 | 備考 |
+| ------ | ------------------ | -------- | ---- |
+| 必須 | `vkCreateCommandPool`（1.0）<br>`vkDestroyCommandPool`（1.0）<br>`vkAllocateCommandBuffers`（1.0）<br>`vkFreeCommandBuffers`（1.0）<br>`vkBeginCommandBuffer`（1.0）<br>`vkEndCommandBuffer`（1.0）<br>`vkCmdBindPipeline`（1.0）<br>`vkCmdBindDescriptorSets`（1.0）<br>`vkCmdPushConstants`（1.0）<br>`vkCmdDispatch`（1.0）<br>`vkCmdPipelineBarrier`（1.0） | 基準ワークロード (b)。コマンドの記録と compute dispatch | 後続 #773 |
+| 推奨 | `vkResetCommandBuffer`（1.0）<br>`vkResetCommandPool`（1.0）<br>`vkCmdDispatchIndirect`（1.0） | コマンドバッファ・プールの再利用と indirect dispatch | 後続 #773 |
+| 保留 | `vkCmdPipelineBarrier2`（1.3）<br>`vkCmdDispatchBase`（1.1） | Vulkan 1.3 の同期 2 系のバリア・ベース指定 dispatch。`vkQueueSubmit2` と連動して採否を判断 | 採否は #726 |
+
+### 3.8 転送
+
+| 優先度 | コマンド（導入元） | 必要理由 | 備考 |
+| ------ | ------------------ | -------- | ---- |
+| 必須 | `vkCmdCopyBuffer`（1.0）<br>`vkCmdFillBuffer`（1.0） | 基準ワークロード (c)。バッファ間コピーとバッファのクリア | 後続 #773 |
+| 推奨 | `vkCmdCopyImage`（1.0）<br>`vkCmdCopyBufferToImage`（1.0）<br>`vkCmdCopyImageToBuffer`（1.0）<br>`vkCmdUpdateBuffer`（1.0）<br>`vkCmdClearColorImage`（1.0） | 画像を扱う場合の転送・クリア、インライン更新 | 画像対応の範囲は #726 で判断 |
+| 保留 | `vkCmdCopyBuffer2`（1.3） | Vulkan 1.3 の `*2` 系コピー。1.1 要件の venus では通常発行されない見込み | 発行有無は未検証 |
+
+### 3.9 同期
+
+| 優先度 | コマンド（導入元） | 必要理由 | 備考 |
+| ------ | ------------------ | -------- | ---- |
+| 必須 | `vkCreateFence`（1.0）<br>`vkDestroyFence`（1.0）<br>`vkWaitForFences`（1.0）<br>`vkResetFences`（1.0）<br>`vkGetFenceStatus`（1.0） | 基準ワークロード (b)。submit 完了の待機（fence） | 後続 #774 |
+| 推奨 | `vkCreateSemaphore`（1.0）<br>`vkDestroySemaphore`（1.0） | キュー間・submit 間の依存（バイナリセマフォ） | 後続 #774 |
+| 保留 | `vkWaitSemaphores`（1.2）<br>`vkSignalSemaphore`（1.2）<br>`vkGetSemaphoreCounterValue`（1.2）<br>`vkCreateEvent`（1.0）<br>`vkDestroyEvent`（1.0）<br>`vkCmdSetEvent`（1.0）<br>`vkCreateQueryPool`（1.0）<br>`vkDestroyQueryPool`（1.0）<br>`vkCmdWriteTimestamp`（1.0） | timeline semaphore（Vulkan 1.2）・event・query（timestamp）。最小構成では不要の見込み | 採否は #726・#776 |
+
+## 4. 対象外とするコマンド群
+
+GPU-6 の決定（ヘッドレス compute のみ・2D スキャンアウト非対応・venus 専用）に紐づけて、vk.xml 上の拡張名・機能群の単位で除外する。個々のコマンドは列挙しない。
+
+| 除外群 | 例（拡張名・機能群） | 理由 |
+| ------ | -------------------- | ---- |
+| WSI（表示系） | `VK_KHR_surface`・`VK_KHR_swapchain`・`VK_KHR_display` | 2D スキャンアウト非対応（GPU-6） |
+| グラフィックスパイプライン | graphics pipeline・render pass・framebuffer・draw 系・`VK_KHR_dynamic_rendering` | compute のみ（GPU-6） |
+| ray tracing | `VK_KHR_acceleration_structure`・`VK_KHR_ray_tracing_pipeline` | 用途外 |
+| video | `VK_KHR_video_*` | 用途外 |
+| sparse リソース | sparse binding / residency 関連 | 最小構成に不要 |
+| デバッグ・ツール拡張 | `VK_EXT_debug_utils`・`VK_EXT_debug_report` | 機能上不要。ゲストからの入力面を増やさない |
+| 他ドライバ向けプロトコル | venus 以外の virtio-gpu 3D プロトコル | venus 専用（GPU-6） |
+
+## 5. 未決事項・確定時の判断材料
+
+判断は #726・#776（人間担当）で行い、本書では決めない。
+
+- 「保留」優先度の採否（`vkQueueSubmit2`・timeline semaphore・event・query・サンプラ・パイプラインキャッシュ・メモリ map 系）
+- 1 段目で記録する実コマンドストリーム（#725・#889）との差分で候補を増減する手順
+- メモリ map（`vkMapMemory`）が wire に載るか、blob 経由でゲスト側に閉じるか（Mesa docs は実装依存の挙動に依存すると記す。未確認）
+- venus 固有コマンドのうち保留・推奨としたもの（resource / seqno 系・v3・v4 の最適化系）が、ゲスト側 Mesa の実際の発行に含まれるか（未確認）
+- MoltenVK のコマンド単位の対応状況（未確認）。特に compute シェーダが使う機能・拡張の可否
+- 画像（image / image view / 画像転送）を compute の範囲に含めるか
+
+## 6. wire パース骨格（TASK-172.2・#723）
+
+実装は `crates/plugin-macos/src/gpu/venus/`（`fandhe_container_plugin_macos::gpu::venus`）。
+
+- 確認した wire 規則（venus-protocol `v1.1.3`・コミット `ca19b6358d7c` の `docs/VK_EXT_command_serialization.txt`）: リトルエンディアン。コマンドは DW0 = `VkCommandTypeEXT`、DW1 = `VkCommandFlagsEXT`、DW2.. = 引数。長さは種別から暗黙に決まり、未知の種別は読み飛ばせない。ポインタ・配列は 64bit 件数＋値列で、末尾を 32bit にパディングする。ハンドルは 64bit。enum は `int32_t`。フラグで定義済みのビットは `VK_COMMAND_GENERATE_REPLY_BIT_EXT`（bit 0）のみ
+- ID の出典: 同タグの `xmls/VK_EXT_command_serialization.xml`（SHA-256 `2451e5dcc5306f604c52da48a8cc883a24de708dd86f38bbb035d29a753a0474`）。`xmls/VK_MESA_venus_protocol.xml`（SHA-256 は前掲）の記載と一致することを確認した。3 章の候補 116 件（必須 62・推奨 22・保留 32）すべてについてコマンド名から ID を機械抽出し、欠落 0 件、ID 重複なしを確認した。同じ対応表をテスト（`task172_2_gpu6_candidate_table_matches_command_type`）で照合している
+- パース済み: 境界検査つきカーソル（`WireReader`）、候補コマンド種別（`CommandType`）、フラグ（`CommandFlags`。定義外ビットは拒否）、ヘッダ（`parse_command_header`）、構造化エラー（`VenusWireError`。`venus_wire.*`）
+- fail-closed: 候補外・未知の種別は `unsupported_command` でストリームを拒否する。配列件数は `MAX_ARRAY_LEN` で確保前に検証する
+- 先送り: コマンドごとの引数パース・ディスパッチ（TASK-177.x: #765・#769・#771・#773・#774）、reply の符号化、ring、frame_loop／adapter への配線。優先度は確定扱いにしない
+
+## 7. コマンドストリームの記録と再生ハーネス（TASK-172.5・#889）
+
+実装は `crates/plugin-macos/src/gpu/venus/replay/`（`fandhe_container_plugin_macos::gpu::venus::replay`）。1 段目（GPU 付き Linux 実機＋治具 VMM）でゲストの Mesa venus が提出したバッファを保存し、2 段目（Apple Silicon Mac）で VMM なしに自前デコーダへ流し込むための道具（GPU-6。形式は REPAIR-2・REPAIR-12）。
+
+- 記録単位: ゲストが 1 回に提出したコマンドストリームのバッファ 1 個。venus wire はコマンド長を持たず、引数パーサ（TASK-177.x）なしには境界を切れないため、長さはレコード側で持つ
+- 形式（リトルエンディアン）:
+
+| 部分 | フィールド | 長さ | 備考 |
+| ---- | ---------- | ---- | ---- |
+| ファイルヘッダ | magic `FCVNSREC` | 8 B | 不一致は拒否 |
+| | format version | 2 B | 現行 1。未知は拒否 |
+| | flags | 2 B | 現行 0 のみ許可 |
+| | record_count | 4 B | 上限 65,536 |
+| | header_crc | 4 B | CRC-32C（先行 16 B） |
+| レコード（繰り返し） | kind | 1 B | 1 = ゲスト提出バッファ。他は未対応として拒否 |
+| | 予約 | 3 B | 0 のみ許可 |
+| | seqno | 4 B | 0 起点の連番 |
+| | payload_len | 4 B | 上限 16 MiB |
+| | payload | N B | |
+| | checksum | 4 B | CRC-32C（kind から payload まで） |
+
+- 保証範囲: `validate` が全レコードのチェックサム・seqno 連続・余剰バイト無しまで確認し、`ValidatedRecording` を返す。`replay` はこの型しか受け取らず、さらに全レコードの先頭がコマンドヘッダとして有効かを提出前に検査する。長さ・件数・ファイル全体長（256 MiB）は確保前に検証する。CRC-32C は偶発的な破損の検出用で、改ざん耐性はない（署名・ハッシュ照合は将来課題）
+- 配置の逸脱: issue 記載の `poc/venus-decoder/replay/` ではなく既存骨格の隣に置いた。`poc/` は存在せず、新設には workspace メンバー追加（ルート `Cargo.toml` の変更）が要る。再生器は同モジュールの `parse_command_header` を直接使う
+- 取り扱い: 実機で採取したストリームにはワークロード由来のデータが含まれうる。テストの fixture は合成データのみで、実ストリームはリポジトリにコミットしない
+- **未達（実装済みを装わない。REPAIR-3）**: 受け入れ条件「lavapipe 上で記録を再生し、最小 compute の結果が記録時と一致する」は本書時点で未達。理由は (1) コマンド引数のパース・Vulkan ディスパッチが未実装（TASK-177.x）、(2) lavapipe 実行に Vulkan バインディング（外部クレートまたは自前 FFI。依存追加・`unsafe` の承認が必要）が要る、(3) 実ストリームの採取は #725（人間担当）。再生先は `ReplayBackend` トレイトの差し替え点として定義し、`CollectingBackend`（提出内容を保持する模擬）でのみ検証している
+- 先送り: reply ストリーム・期待出力レコード（kind の番号のみ未割当）、実機側の記録フック配線（#888・#725）
+
+## 8. capset 応答（TASK-172.3・#724）
+
+実装は `crates/plugin-macos/src/gpu/venus/capset.rs`（`capset_info`・`respond_capset_query`）。PoC-14 で既存 OSS 構成が venus capset（id 4）を `max-size=0` で返し、ゲストの Mesa venus が物理デバイス 0 件と判定した問題への対処として、`max_size` が 0 でない（160）応答を返す最小実装を置いた。トランスポート非依存で、virtio-gpu の ctrl 枠は TASK-175 のデバイスモデルが包む。疎通の成否は #725 で確認する。本章は実装の存在のみを示す。
+
+- 出典（確認日 2026-10-08。値のみ転記。SHA-256 は計画フェーズで照合した値）: virglrenderer `virglrenderer-1.1.0` の `src/venus_hw.h`（`7bc1a8195294d681f4081719e7c4dfea396765e82b5583a2471fad9705aab64e`）、mesa `mesa-25.0.0` の `src/virtio/virtio-gpu/venus_hw.h`（`fa736817518a9c94bf50788a404cae8282987e2e82bcee6436370b2cc6a5988b`）・`src/virtio/vulkan/vn_renderer_virtgpu.c`（`a7a0f1a395d006bfb1ef4aea4d3b2c6a44c30c50ede855416e1183442e1e03aa`）、venus-protocol `v1.1.3` の `xmls/vk.xml`（`264d0d7350e37d70c82407fb430d085040fc01a9a961d43dec8c2d6ed1dfd183`）
+- レイアウト（全て `u32` リトルエンディアン、計 160 バイト）:
+
+| offset | フィールド | 広告値 |
+| ------ | ---------- | ------ |
+| 0 | `wire_format_version` | 1（Mesa が完全一致を要求） |
+| 4 | `vk_xml_version` | `VK_MAKE_API_VERSION(0,1,4,357)` = `0x0040_4165`（ゲスト側で上限クランプ） |
+| 8 | `vk_ext_command_serialization_spec_version` | 1 |
+| 12 | `vk_mesa_venus_protocol_spec_version` | 4（ゲスト側で上限クランプ） |
+| 16 | `supports_blob_id_0` | 1（Mesa が非 0 を前提） |
+| 20〜147 | `vk_extension_mask1[32]` | `[0]` = 0x1（マスク有効）、`[12]` = 0x3（拡張 384・385）、他 0 |
+| 148 | `allow_vk_wait_syncs` | 1（Mesa が非 0 を前提） |
+| 152 | `supports_multiple_timelines` | 1（Mesa が非 0 を前提） |
+| 156 | `use_guest_vram` | 0 |
+
+- ゲスト（Mesa 25.0.0）の受理条件: capset id 4・version 0 で要求する。`wire_format_version` は完全一致必須。`vk_xml_version` は Vulkan 1.1 未満なら拒否。拡張マスクは bit 0 が立っていないと「全拡張対応」とみなされるため、最小集合を明示した（fail-closed）
+- エラー方針: id 4・version 0・index 0 以外は `venus_capset.*` のエラーで拒否する（`VenusCapsetError`）
+- 先送り・未決事項（値は暫定で確定扱いにしない）:
+  - protocol spec version 4 を広告すると v3・v4 のコマンドがゲストから発行されうる（3 章では保留扱い）。下げるかは #725 の実ストリームと #726 で判断
+  - 拡張マスクを最小にしてゲストの物理デバイス列挙が通るかは未確認（#725）。デバイス拡張の広告は #726・TASK-176
+  - `use_guest_vram` は VMM の共有メモリ方式に依存し、3 段目（#1057）の判定まで未決
+  - flag 3 件を 1 にするのは対応機能（blob id 0・待機系コマンド・複数タイムライン。TASK-176・177）を後続が実装する前提の宣言で、現時点では未実装（REPAIR-3）
+
+## 9. VZCustomVirtioDevice 登録可否確認ハーネス（TASK-172.6・#1056）
+
+macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なしの最小 virtio-gpu を TASK-64（#350。完了済み）の最小 VM に登録できるかの確認ハーネス（GPU-6・MAC-5）。配置は `poc/vz-custom-virtio-gpu/`（製品 crate 外・workspace 外）。判定は #1057（TASK-172.h5。人間担当）。
+
+- 実装したもの: ゲスト側確認スクリプト `poc/vz-custom-virtio-gpu/guest/check-virtio-gpu.sh`（dmesg の virtio_gpu 行から probe・feature・KMS・capset・host memory window を判定）、自己テスト（合成 fixture。`make vz-virtio-gpu-guest-check-selftest`。CI の `integration-test` ジョブが 3 OS で実行）、README（デバイス契約・実機手順）
+- **ホスト側のデバイス登録コードは未実装（REPAIR-3）**。計画フェーズの調査（確認日 2026-10-08）で、受け入れ条件の「新規依存・`unsafe` が要る場合は止めて承認事項として報告」に当たったため
+- 調査結果:
+  - 採用済み `objc2-virtualization =0.3.2`（承認 #356）は `VZCustomVirtioDevice`・`VZVirtioQueue`・`VZVirtioSharedMemoryRegion*` を含まない。crates.io の最新も 0.3.2（2025-10-04）で、macOS 27 対応版は未リリース
+  - upstream `madsmtm/objc2` main のコミット `b735fb4d6b9c`（2026-09-24「Update to Xcode 27.0 beta 1」）には対応 feature がある（生成コードは `madsmtm/objc2-generated`）。Xcode 27 beta 1 基準で、正式版で変わりうる
+  - 生成バインディング上は `VZCustomVirtioDeviceConfiguration` に `deviceID`・`virtioQueueCount`・`mandatoryFeatures` / `optionalFeatures`・`deviceSpecificConfiguration`・`sharedMemoryRegions` があり、`VZVirtioSharedMemoryRegionConfiguration` は `initWithRegionID:size:`。API 上は共有メモリ領域を提示できる見込みだが実機では未確認
+  - `deny.toml` の `[sources]` は `unknown-git = "deny"` で、git 依存は現設定では入れられない
+  - ゲスト Linux driver は mainline で `num_scanouts == 0` を `KMS disabled` として受理する。古いカーネルは `num_scanouts is zero` で probe が失敗しうる（受理される版数は未確認）
+- 承認事項（ユーザー承認が必要。Agent は実行していない）:
+  - A. バインディングの入手経路。A1（推奨）: macOS 27 対応の `objc2-virtualization` の crates.io リリースを待ち `=x.y.z` で更新（`objc2`・`objc2-foundation`・`block2`・`dispatch2` の連鎖更新も判断）。A2: 上記コミットを git 依存で固定（`deny.toml` の変更が要りサプライチェーン上非推奨）。A3: 自前 `extern_class!` / `define_class!`（`unsafe` の新規追加。セレクタ・型を macOS 27 SDK と照合する必要がある）
+  - B. ホスト側ハーネスの配置（ルート `Cargo.toml` の `members` 追加・`exclude`・入れ子 workspace のいずれか。7 章の「配置の逸脱」と同じ論点）
+  - C. `unsafe` の扱い（delegate 実装と `unsafe fn` バインディング呼び出し。事前承認の範囲は `sys` モジュールで、PoC crate が対象かは不明確なため個別承認）
+  - D. 実行環境（macOS 27＋Xcode 27 SDK の Apple Silicon 実機。CI に macOS 27 ランナーは無く、ホスト側コードは CI でビルド検証できない見込み）
+- 受け入れ条件の状態:
+
+| 条件 | 状態 |
+| ---- | ---- |
+| 1. VENUS capset のみ・scanout なしの virtio-gpu をゲストが probe する | 実機前提で未確認（#1057）。ゲスト側確認スクリプトは用意済み |
+| 2. host visible 共有メモリ領域を提示できる | API 上は提示できる見込み。ゲストで host visible が有効になるかは未確認（#1057） |
+| 3. 新規依存・`unsafe` が要る場合は止めて報告 | ゲートに当たり停止。上記の承認事項 A〜D として報告済み |
+
+- 先送り: ホスト側の登録ハーネス本体（承認事項の決定後に別 issue）、`num_scanouts=0` が古いカーネルで通らない場合の受け入れ条件見直し（#1057 へ申し送り）
+- セキュリティ: host visible 共有メモリと virtqueue 経由の ctrl コマンドはゲストからの untrusted 入力。ホスト側実装時は security-auditor を必須とし、境界検査・サイズ上限・fail-closed（#723 の方針）を適用する
+
+## 10. 試験治具 VMM と外部バックエンド接続（TASK-172.4・#888）
+
+1 段目（GPU 付き Linux 実機）で、既存 OSS の VMM が持つ「virtio-gpu をプロセス外のバックエンドへ出す仕組み」に自前デコーダをつなぐための治具。実装は `poc/venus-decoder/jig/`（ルート workspace の外の独立 PoC パッケージ。確定 19 crate＋benches の crate 境界を変えないため。製品 crate は依存しない）。
+
+### 10.1 本 PR の範囲と未達（実装済みを装わない。REPAIR-3）
+
+- 実装済み: 候補比較（本章）、ctrl の `GET_CAPSET_INFO` / `GET_CAPSET` の復号・応答符号化・構造化ログ 1 行（`adapter`）、治具が広告する feature と config の定数（`device`）、ログ照合器と実機前提テストの枠（`log`・`tests/real_machine_capset_log.rs`）。socket は開かない
+- **受入基準 2（ゲストの Mesa venus の capset クエリが自前デコーダに届いたことをログで確認）は未達**。トランスポート（後続 F1）と実機実行（F3・#725。人間担当）が必要なため
+- 後続（issue 起票は未実施・承認待ち）: F1 vhost-user トランスポート（メッセージ codec・fd 受け渡しと `mmap` の `sys` ラッパー・split virtqueue・kick / call。rust-vmm 系クレートは MVM-4 で使えないため自作）、F2 残りの ctrl 応答（`GET_DISPLAY_INFO`・`CTX_CREATE` 等）、F3 実機疎通（#725）
+- CI: `make poc-venus-jig-check`（fmt-check・clippy・test）は CI の `rust-ci-default-features` ジョブが 3 OS で実行し、`crates/plugin-macos` 側の変更による治具の破損を検出する（実機前提テストは `#[ignore]` で分離済みで CI では走らない）
+
+### 10.2 候補比較
+
+計画フェーズの調査結果。出典タグとファイルは下記のとおりで、crosvm の CLI 構文・render server の capset 転送の有無は**未確認**（実装フェーズでは取得できなかった。F1 着手時に確認する）。
+
+| 候補 | 外部バックエンド接続 | ゲストへ BLOB・CONTEXT_INIT が届くか | venus capset の扱い | ライセンス | 改変の要否 |
+| ---- | -------------------- | ------------------------------------ | ------------------- | ---------- | ---------- |
+| QEMU `vhost-user-gpu-pci`（`hw/display/vhost-user-gpu.c`。タグ `v10.1.0`） | vhost-user | 届かない（realize が立てるのは VIRGL・EDID・RESOURCE_UUID のみ） | Mesa が capset 取得前に中止するため到達しない | GPL-2.0 | 標準では不適 |
+| QEMU 汎用 `vhost-user-device(-pci)`（`hw/virtio/vhost-user-base.c`） | vhost-user。バックエンドの feature を素通し | 届く | バックエンド次第 | GPL-2.0 | 必要（`user_creatable = false` のため標準ビルドでは `-device` で作れない） |
+| crosvm vhost-user frontend（`devices/src/virtio/vhost_user_frontend/mod.rs`。コミット `044c3e3fc53d`） | vhost-user。GPU 向け共有メモリ領域（SHMEM）にも対応 | 届く（デバイス固有 feature とバックエンド feature の積） | バックエンド次第 | BSD-3-Clause | 不要の見込み（`--vhost-user` の CLI 構文と最小カーネル版数は未確認） |
+| virglrenderer の render server（`virgl_render_server`） | virglrenderer 利用側が必要。単体では VMM ではない | VMM 次第 | capset を server へ転送するか未確認 | MIT | — |
+| Cloud Hypervisor・Firecracker | — | — | — | — | 比較対象外（GPU デバイスを持たず、依存・流用は禁止。dependency-policy） |
+
+決め手: Mesa venus（`mesa-25.0.0` の `src/virtio/vulkan/vn_renderer_virtgpu.c`。`required_params`）は capset 取得より前に 3D 機能・`CAPSET_QUERY_FIX`・`RESOURCE_BLOB`・`CONTEXT_INIT` を必須として検査し、欠けると初期化を中止する。治具 VMM がゲストへ `VIRGL`・`RESOURCE_BLOB`・`CONTEXT_INIT` を見せられることが capset クエリ発行の前提になる。
+
+選定（暫定）: **crosvm の vhost-user frontend**。BSD-3-Clause で改変不要の見込みであり、feature が素通しされる。QEMU を使う場合は GPL の VMM バイナリを外部プロセスとして実行するだけでリンクせず、汎用デバイスの有効化には GPL の改変ビルドが要る。この扱いは**要確認（ユーザー判断。licensing.md）**。`use_guest_vram`（8 章）は選定した VMM の共有メモリ方式に従属し、3 段目（#1057）まで未決。
+
+### 10.3 ctrl の値と広告 feature
+
+出典: Linux `include/uapi/linux/virtio_gpu.h` タグ `v6.12`（確認日 2026-10-08。SHA-256 `7c9e2f7d47fa0b1a2c737fc5a741f57c5cf25303dd5c68c2c9738e9bb761eee6`）。値のみ転記。
+
+| 項目 | 値 |
+| ---- | -- |
+| `virtio_gpu_ctrl_hdr` | 24 バイト（type・flags・fence_id・ctx_id・ring_idx・padding[3]） |
+| `GET_CAPSET_INFO` / `OK_CAPSET_INFO` | 0x0108（capset_index・padding）/ 0x1102（capset_id・max_version・max_size・padding） |
+| `GET_CAPSET` / `OK_CAPSET` | 0x0109（capset_id・capset_version）/ 0x1103（capset データ 160 バイト） |
+| エラー | `ERR_UNSPEC` 0x1200（未知の種別）・`ERR_INVALID_PARAMETER` 0x1205（長さ・値の不正） |
+| fence | `FLAG_FENCE` が立つ要求では応答ヘッダへ flags・fence_id・ctx_id・ring_idx を引き継ぐ |
+| 広告 feature | VIRGL（bit 0）・RESOURCE_BLOB（3）・CONTEXT_INIT（4）・VERSION_1（32）。`num_capsets` = 1、`num_scanouts` = 0（カーネルが 0 を受け付けるかは未確認。F1 の実機で確認） |
+
+ログ形式（数値と固定語彙のみ。ゲストのバイト列はエコーしない）: `venus_jig event=capset_query cmd=GET_CAPSET capset_id=4 version=0 result=ok max_size=160`。要求長はヘッダ 24 + 本体 8 バイトちょうどのみ受理する（PoC）。
+
+## 11. 以降の章（未着手。10 章は #888 の範囲）
+
+| 章 | 内容 | 担当 issue |
+| -- | ---- | ---------- |
+| 1〜3 段目の結果 | 段階的な再検証の結果 | #725 |
+| 3 段目の実機判定 | VZCustomVirtioDevice 登録の実機結果と VMM 方式の判定 | #1057（TASK-172.h5。人間担当） |
+| 最終確定 | 対象サブセットの確定 | #726（TASK-172.h2。人間担当） |

@@ -8,6 +8,7 @@ fn plug5_framed_path_is_unimplemented_on_non_unix() {
     let err = UdsStream::connect(
         std::path::Path::new("s.sock"),
         std::time::Duration::from_secs(1),
+        &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
     )
     .unwrap_err();
     assert_eq!(err.code(), PluginErrorCode::Unimplemented);
@@ -55,10 +56,20 @@ mod unix {
         let listener = UdsListener::bind(&dir.0.join("s.sock")).unwrap();
         let path = listener.path().to_path_buf();
         let h = thread::spawn(move || {
-            let mut s = UdsStream::connect(&path, WAIT).unwrap();
+            let mut s = UdsStream::connect(
+                &path,
+                WAIT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
             serve(&mut s).unwrap();
         });
-        let core_side = listener.accept(WAIT).unwrap();
+        let core_side = listener
+            .accept(
+                WAIT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
         (dir, core_side, h)
     }
 
@@ -97,11 +108,21 @@ mod unix {
         // accept が完了するまで client を生かし、その後に切断して「相手が消えた」状態を作る。
         let (go_tx, go_rx) = mpsc::channel::<()>();
         let client = thread::spawn(move || {
-            let s = UdsStream::connect(&path, WAIT).unwrap();
+            let s = UdsStream::connect(
+                &path,
+                WAIT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
             let _ = go_rx.recv_timeout(Duration::from_secs(15));
             drop(s);
         });
-        let mut stream = listener.accept(WAIT).unwrap();
+        let mut stream = listener
+            .accept(
+                WAIT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
         go_tx.send(()).unwrap();
         client.join().unwrap();
 

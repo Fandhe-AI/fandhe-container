@@ -171,7 +171,11 @@ mod unix {
         // inode は tmpfs で再利用され得るため同一性比較に使わない。新 listener への接続成功で置換を確認する。
         assert_eq!(m.mode() & 0o777, 0o600);
         let _c = std::os::unix::net::UnixStream::connect(l.path()).unwrap();
-        l.accept(Duration::from_secs(2)).unwrap();
+        l.accept(
+            Duration::from_secs(2),
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        )
+        .unwrap();
     }
 
     /// symlink は削除せず PermissionDenied。リンクもリンク先も不変（TASK-123.2・AC1。TASK-123.5・#290 の「symlink 既存パスの bind 拒否」受入基準に対応）。
@@ -224,11 +228,20 @@ mod unix {
         }
         assert!(std::fs::symlink_metadata(&p).is_ok());
         // 拒否された bind が probe 接続を残していないため、accept は接続なしで Timeout になる。
-        let e = live.accept(Duration::from_millis(200)).unwrap_err();
+        let e = live
+            .accept(
+                Duration::from_millis(200),
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::Timeout);
         // 実クライアントは通常どおり接続できる。
         let _c = std::os::unix::net::UnixStream::connect(&p).unwrap();
-        live.accept(Duration::from_secs(2)).unwrap();
+        live.accept(
+            Duration::from_secs(2),
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        )
+        .unwrap();
     }
 
     /// 記録の無い socket（他実装・旧版）は生存中か判別できないため削除しない。失敗した bind は
@@ -301,7 +314,11 @@ mod unix {
                                 assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
                                 // 保持中は自分の listener へ接続できる（パスを奪われていない）。
                                 let _c = std::os::unix::net::UnixStream::connect(l.path()).unwrap();
-                                l.accept(std::time::Duration::from_secs(5)).unwrap();
+                                l.accept(
+                                    std::time::Duration::from_secs(5),
+                                    &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+                                )
+                                .unwrap();
                                 bound.fetch_add(1, Ordering::SeqCst);
                                 assert_eq!(active.fetch_sub(1, Ordering::SeqCst), 1);
                                 drop(l);
@@ -422,7 +439,11 @@ mod unix {
         assert_eq!(std::fs::read_to_string(&lock).unwrap(), record);
         let l = UdsListener::bind(&p).unwrap();
         let _c = std::os::unix::net::UnixStream::connect(l.path()).unwrap();
-        l.accept(std::time::Duration::from_secs(2)).unwrap();
+        l.accept(
+            std::time::Duration::from_secs(2),
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        )
+        .unwrap();
     }
 
     /// 記録の無いロックファイルが残っていても（旧版・外部で作られた空ファイル）管理下の証拠に

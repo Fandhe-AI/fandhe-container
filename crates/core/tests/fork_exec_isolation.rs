@@ -32,6 +32,11 @@
 //!   `exec/stages.rs` の順序テスト（`core1_no_new_privs_runs_after_capability_drop_and_before_landlock`・
 //!   `core1_empty_pipeline_applies_builtin_stages`）と、本物の `prctl` を別スレッドで確認する
 //!   `sys.rs` の `core1_set_no_new_privs_sets_calling_thread_flag`。継承値 0 の環境では本シナリオが設定操作も検証する
+//! - シナリオ `rlimits-apply`（SUP-12・TASK-169.1・#526。`with_rlimits`）: 組み込みの `Rlimits` 段が NOFILE
+//!   （soft 256 / hard 512。継承 hard が低ければそれ以下）と CORE（0 / 0）を子へ適用することを、Landlock スロットのフックが
+//!   記録した `/proc/self/limits` との完全一致で照合する。exec は証跡不在で `Exited(126)`・`PERMISSION_DENIED`
+//! - シナリオ `rlimit-fail`（同上）: `fs.nr_open` を超える NOFILE の hard 指定は root でも rootless でも `EPERM` となり、
+//!   `Exited(125)`・stderr に `at Rlimits` と `PERMISSION_DENIED`、後段のフックが実行されないことを照合する
 //! - シナリオ `stage-fail`（同上）: 途中の段のフック失敗で後続段と exec に進まず `Exited(125)`
 //!   （setup 失敗）、stderr に失敗した段（`at Landlock`。#173 以降 capability 削減は組み込みのためフック失敗の対象外）
 //!
@@ -41,6 +46,12 @@
 //!   許可され（`Exited(0)`）、存在しない mount 先は適用失敗で起動拒否（`Exited(125)`・
 //!   `landlock_open_path_failed`）になる。いずれも Landlock の前段（cgroup 参加）は制限前に実行済み。
 //!   ABI 6 未満のホストでは検出失敗で panic する（実機前提）
+//!
+//! - シナリオ `stdio-closed-one` / `stdio-closed-many` / `stdio-closed-all`（#1299・CORE-1・TASK-27.4.1。
+//!   `exec-test-support` の `close_standard_fds_for_test`）: 分離後・起動直前に自プロセスの fd `{0}`・`{0,1}`・`{0,1,2}`
+//!   を閉じてから `spawn_container` する。閉じた親からでも exec は fail-closed（`Exited(126)`・フックのログは空）で、
+//!   `all` は stderr も閉じるため marker を空にし、panic の診断だけを退避した複製へ出す。実行用 fd が 3 以上へ移る
+//!   具体値は launch 経路では観測できず（証跡未配線のため `execveat` の手前で拒否）、`tests/exec_child_setup.rs` で照合する
 //!
 //! # 実機前提テストとしての分離
 //! 実行には root もしくは非特権 user namespace を許可するホストが必要（AppArmor の
@@ -98,6 +109,7 @@ mod linux {
         LandlockRuleset, detect_landlock_abi, path_rules_from_config,
     };
     use fandhe_container_core::oci_runtime::parse_config_bytes;
+    use fandhe_container_core::rlimits::{Rlimit, RlimitKind, Rlimits};
 
     const PROBE: &str = "fandhe-exec-probe";
     const PROBE_EXIT: i32 = 42;
@@ -105,15 +117,21 @@ mod linux {
     /// 子が pivot 後の `/` に追記するステージ実行ログ（親からは `<rootfs>/stage-log`）。
     const STAGE_LOG: &str = "stage-log";
     /// (シナリオ名, stderr に含まれるべき文字列)。
-    const SCENARIOS: [(&str, &str); 8] = [
+    const SCENARIOS: [(&str, &str); 13] = [
         ("ok", "PERMISSION_DENIED"),
         ("missing", "PERMISSION_DENIED"),
         ("not-executable", "PERMISSION_DENIED"),
         ("stages-order", "PERMISSION_DENIED"),
         ("stage-fail", "at Landlock"),
+        ("rlimits-apply", "PERMISSION_DENIED"),
+        ("rlimit-fail", "at Rlimits"),
         ("landlock-apply-ro", "Permission denied"),
         ("landlock-apply-rw", ""),
         ("landlock-fail", "landlock_open_path_failed"),
+        // 標準 fd を閉じた親からの起動（#1299）。fd 2 を閉じると子の診断が届かないため、`all` の marker は空。
+        ("stdio-closed-one", "PERMISSION_DENIED"),
+        ("stdio-closed-many", "PERMISSION_DENIED"),
+        ("stdio-closed-all", ""),
     ];
 
     fn timeout() -> Duration {
@@ -367,13 +385,15 @@ mod linux {
             "missing" => "/no-such-entrypoint".to_string(),
             "not-executable" => format!("/{NOT_EXEC}"),
             "stages-order" | "stage-fail" | "landlock-apply-ro" | "landlock-apply-rw"
-            | "landlock-fail" => format!("/{PROBE}"),
+            | "landlock-fail" | "rlimits-apply" | "rlimit-fail" | "stdio-closed-one"
+            | "stdio-closed-many" | "stdio-closed-all" => format!("/{PROBE}"),
             other => panic!("unknown scenario {other}"),
         };
         // SEC-1・CORE-5: Landlock が未適用の間は、root / 非 root を問わず
         // exec が拒否される（終了コード 126・PERMISSION_DENIED）。適用後は "ok" が Exited(PROBE_EXIT)、
         // "missing" が Exited(127) に戻る。
         let mut want = ChildExit::Exited(126);
+        close_standard_fds_for_scenario(name);
         let entry = Entrypoint::new(&path, [path.as_str()], [] as [&str; 0]).expect("entrypoint");
         let child = match name {
             "stages-order" => {
@@ -386,6 +406,38 @@ mod linux {
                         p.with_hook(StageKind::CgroupJoin, logging_hook(StageKind::CgroupJoin))
                     })
                     .unwrap_or_else(|e| panic!("register hooks: {e}"));
+                spawn_container_with_stages(rootfs, &entry, stages)
+            }
+            "rlimits-apply" => {
+                // SUP-12・TASK-169.1・#526: 組み込みの Rlimits 段が pivot 後・exec 前に子へ適用する。
+                // Landlock スロットのフックが子自身の `/proc/self/limits` を記録し、指定値との完全一致を親が照合する。
+                // exec は証跡不在のため従来どおり拒否される（`Exited(126)`・`PERMISSION_DENIED`）。
+                let (soft, hard) = rlimits_apply_nofile(inherited_nofile_hard());
+                let set = Rlimits::new(vec![
+                    Rlimit::new(RlimitKind::Nofile, soft, hard).expect("nofile"),
+                    Rlimit::new(RlimitKind::Core, 0, 0).expect("core"),
+                ])
+                .expect("rlimits");
+                let stages = StagePipeline::new()
+                    .with_rlimits(set)
+                    .and_then(|p| p.with_hook(StageKind::Landlock, limits_hook))
+                    .unwrap_or_else(|e| panic!("register rlimits: {e}"));
+                spawn_container_with_stages(rootfs, &entry, stages)
+            }
+            "rlimit-fail" => {
+                // SUP-12・TASK-169.1・#526: `fs.nr_open` を超える NOFILE の hard は root でも rootless でも
+                // `EPERM` になるため、起動拒否（`Exited(125)`・`PermissionDenied`）を euid 分岐なしで確認できる。
+                // 失敗した段より後（Landlock のフック・seccomp・exec）は実行されない。
+                let set = Rlimits::new(vec![
+                    Rlimit::new(RlimitKind::Nofile, 1, 1 << 40).expect("nofile"),
+                ])
+                .expect("rlimits");
+                let stages = StagePipeline::new()
+                    .with_hook(StageKind::CgroupJoin, logging_hook(StageKind::CgroupJoin))
+                    .and_then(|p| p.with_rlimits(set))
+                    .and_then(|p| p.with_hook(StageKind::Landlock, limits_hook))
+                    .unwrap_or_else(|e| panic!("register rlimits: {e}"));
+                want = ChildExit::Exited(125);
                 spawn_container_with_stages(rootfs, &entry, stages)
             }
             "stage-fail" => {
@@ -443,6 +495,19 @@ mod linux {
                 format!("cgroup_join root=1 nnp={inherited_nnp}\nlandlock root=1 nnp=1\n"),
                 "hooks must run in fixed order after pivot_root, with the built-in capability drop and NO_NEW_PRIVS applied before landlock"
             ),
+            "rlimits-apply" => {
+                let (soft, hard) = rlimits_apply_nofile(inherited_nofile_hard());
+                assert_eq!(
+                    log,
+                    format!("limits nofile={soft}/{hard} core=0/0\n"),
+                    "the built-in Rlimits stage must apply the requested values before the landlock slot"
+                );
+            }
+            "rlimit-fail" => assert_eq!(
+                log,
+                format!("cgroup_join root=1 nnp={inherited_nnp}\n"),
+                "no stage after the failed Rlimits stage may run"
+            ),
             "stage-fail" => assert_eq!(
                 log,
                 format!("cgroup_join root=1 nnp={inherited_nnp}\n"),
@@ -464,6 +529,61 @@ mod linux {
                 );
             }
             _ => assert_eq!(log, "", "no hook is registered"),
+        }
+    }
+
+    /// `stdio-closed-*` シナリオ（#1299・CORE-1・SEC-1）: 起動直前に自プロセスの標準 fd を閉じる。
+    ///
+    /// 閉じた親から `spawn_container` しても、実行用の fd が 0〜2 に入り込まず fail-closed のまま
+    /// （`Exited(126)`）であることを固定する。fd 移動そのものの具体値（実行用 fd が 3 以上・標準入出力が 1:3）は、
+    /// launch 経路が制限適用の証跡未配線で `prepare_exec_child` の手前で拒否されるため観測できず、
+    /// `tests/exec_child_setup.rs` の観測用の入口で照合している。証跡が配線されたら、本シナリオの期待を
+    /// プローブの `Exited(42)` へ戻す（他シナリオと同じ扱い）。他のシナリオでは何もしない。
+    #[cfg(feature = "exec-test-support")]
+    fn close_standard_fds_for_scenario(name: &str) {
+        use std::os::fd::AsFd as _;
+
+        use fandhe_container_core::exec::{StandardFd, close_standard_fds_for_test};
+        let fds: &[StandardFd] = match name {
+            "stdio-closed-one" => &[StandardFd::Stdin],
+            "stdio-closed-many" => &[StandardFd::Stdin, StandardFd::Stdout],
+            "stdio-closed-all" => &[StandardFd::Stdin, StandardFd::Stdout, StandardFd::Stderr],
+            _ => return,
+        };
+        if fds.contains(&StandardFd::Stderr) {
+            // stderr を閉じると panic の診断が親へ届かない。close-on-exec の複製（3 以上）へ診断を逃がす。
+            let saved = std::io::stderr()
+                .as_fd()
+                .try_clone_to_owned()
+                .map(std::fs::File::from)
+                .expect("save stderr");
+            let saved = std::sync::Mutex::new(saved);
+            std::panic::set_hook(Box::new(move |info| {
+                use std::io::Write as _;
+                if let Ok(mut file) = saved.lock() {
+                    let _ = writeln!(file, "{info}");
+                }
+            }));
+        }
+        close_standard_fds_for_test(fds).unwrap_or_else(|e| panic!("close standard fds: {e}"));
+        for (n, std_fd) in [StandardFd::Stdin, StandardFd::Stdout, StandardFd::Stderr]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                Path::new(&format!("/proc/self/fd/{n}")).exists(),
+                !fds.contains(std_fd),
+                "fd {n} state after closing {name}"
+            );
+        }
+    }
+
+    /// feature なしのビルドでは閉じる入口が無い。検証せずに成功しない（fail-closed）。core の dev-dependency
+    /// （自己参照）が `exec-test-support` を有効にするため、通常の `cargo test` ではこの分岐にならない。
+    #[cfg(not(feature = "exec-test-support"))]
+    fn close_standard_fds_for_scenario(name: &str) {
+        if name.starts_with("stdio-closed-") {
+            panic!("not verified; the exec-test-support feature is not enabled ({name})");
         }
     }
 
@@ -509,6 +629,49 @@ mod linux {
                 .unwrap_or_else(|e| panic!("write stage log in the child: {e}"));
             Ok(())
         }
+    }
+
+    /// `/proc/self/limits` の `<label>` 行の (soft, hard)（`unlimited` はそのまま文字列で返す）。
+    fn limits_row(label: &str) -> (String, String) {
+        let text = std::fs::read_to_string("/proc/self/limits")
+            .unwrap_or_else(|e| panic!("read /proc/self/limits: {e}"));
+        let rest = text
+            .lines()
+            .find_map(|l| l.strip_prefix(label))
+            .unwrap_or_else(|| panic!("limits row missing: {label}"));
+        let mut cols = rest.split_whitespace();
+        let soft = cols.next().unwrap_or_else(|| panic!("soft missing"));
+        let hard = cols.next().unwrap_or_else(|| panic!("hard missing"));
+        (soft.to_string(), hard.to_string())
+    }
+
+    /// 継承している NOFILE の hard（無制限は `u64::MAX`）。
+    fn inherited_nofile_hard() -> u64 {
+        match limits_row("Max open files").1.as_str() {
+            "unlimited" => u64::MAX,
+            n => n.parse().unwrap_or_else(|e| panic!("parse hard: {e}")),
+        }
+    }
+
+    /// 継承 hard を超えない NOFILE の (soft, hard)。通常は (256, 512)。
+    fn rlimits_apply_nofile(inherited_hard: u64) -> (u64, u64) {
+        let hard = inherited_hard.min(512);
+        (hard.min(256), hard)
+    }
+
+    /// 子の NOFILE と CORE の (soft, hard) を pivot 後の `/` に追記するフック。
+    fn limits_hook() -> Result<(), ExecError> {
+        use std::io::Write as _;
+        let (ns, nh) = limits_row("Max open files");
+        let (cs, ch) = limits_row("Max core file size");
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("/{STAGE_LOG}"))
+            .unwrap_or_else(|e| panic!("open stage log in the child: {e}"));
+        writeln!(f, "limits nofile={ns}/{nh} core={cs}/{ch}")
+            .unwrap_or_else(|e| panic!("write stage log in the child: {e}"));
+        Ok(())
     }
 
     /// 必ず失敗するフック（公開 API で作れる `ExecError` として不正なホスト名の検証エラーを流用する）。

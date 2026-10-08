@@ -237,6 +237,49 @@ else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため test をスキップ"
 endif
 
+# rustdoc の警告（壊れた intra-doc リンク・private 項目へのリンク等）を -D warnings で fail させる
+# （REPAIR-3・REPAIR-7・#1300）。既定 feature・--no-deps（依存の doc は生成しない）。CI は
+# rust-ci-default-features ジョブ（3 OS）が本ターゲットを実行する。cfg(target_os) 限定の項目への
+# リンクは他 OS で解決できず fail するため、doc コメントではリンクにせずコード表記にする。
+.PHONY: doc
+doc: ## cargo doc -D warnings（既定 feature・--no-deps。rustdoc 警告のゲート）
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+else
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため doc をスキップ"
+endif
+
+# venus 試験治具（workspace 外の独立 PoC パッケージ。GPU-6・TASK-172.4・#888）の fmt / clippy / test。
+# `make ci` には含めない。CI は rust-ci-default-features ジョブ（3 OS）が本ターゲットを実行し、
+# plugin-macos 側の変更で治具が壊れたことを検出する。実機前提テストは #[ignore] で分離済み。
+# clippy / test は --locked で治具の Cargo.lock を固定する（ルート側の依存変更で lock が黙って再解決され、
+# 監査していない版でビルドされるのを防ぐ。lock の更新が要る変更は lock の差分として PR に現れる）。
+POC_VENUS_JIG_MANIFEST := poc/venus-decoder/jig/Cargo.toml
+.PHONY: poc-venus-jig-check
+poc-venus-jig-check: ## venus 試験治具（poc/venus-decoder/jig）の fmt-check・clippy・test を実行する（GPU-6・TASK-172.4）
+	cargo fmt --manifest-path $(POC_VENUS_JIG_MANIFEST) --check
+	cargo clippy --manifest-path $(POC_VENUS_JIG_MANIFEST) --locked --all-targets -- -D warnings
+	cargo test --manifest-path $(POC_VENUS_JIG_MANIFEST) --locked
+
+# CLI が macOS / Windows のバックエンド実装へ直接依存しないことの機械判定（CLI-1・PLUG-4・TASK-79.4）。
+# macOS / Windows は core の plugin 発見・登録機構経由で呼ぶ。`cargo tree` の通常依存に
+# platform-* / plugin-macos / plugin-windows が現れたら NG（cargo tree の失敗も NG）。
+.PHONY: check-cli-backend-deps
+check-cli-backend-deps: ## cli の依存ツリーに platform-* / plugin-macos / plugin-windows が含まれないことを検証する
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	@tree=$$(cargo tree -p fandhe-container-cli -e normal --locked) || { \
+		echo "NG: cargo tree の実行に失敗しました" >&2; \
+		exit 1; \
+	}; \
+	if printf '%s\n' "$$tree" | grep -Eq 'fandhe-container-(platform|plugin)-(macos|windows)'; then \
+		echo "NG: cli の依存ツリーに macOS / Windows のバックエンド crate が含まれています" >&2; \
+		exit 1; \
+	fi; \
+	echo "OK: cli は platform-macos / platform-windows / plugin-macos / plugin-windows に依存しません"
+else
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため check-cli-backend-deps をスキップ"
+endif
+
 # core の plugin 無効構成の検証（PLUG-3・TASK-111.1・#262。REPAIR-10 (d)）。
 # `--no-default-features` で core がビルド・テストでき、依存ツリーに plugin 境界基盤
 # （fandhe-container-plugin）が入らないことを確認する。`make ci` には含めない
@@ -334,7 +377,8 @@ endif
 # 判定スクリプトの自己テスト（PLUG-4・TASK-109.4・REPAIR-12）。依存 0 件の最小 workspace を一時 git
 # リポジトリとして作って判定スクリプトを走らせるため、実リポの workspace には依存しない（HAS_CARGO では
 # 判定しない）。cargo・git 未導入時は黙ってスキップせず fail-closed で止める。CI の integration-test
-# ジョブ（ubuntu・macos）が実行し、GNU / BSD 双方のツールで動くことを確かめる。
+# ジョブ（ubuntu・macos・windows の 3 OS。Windows は Git Bash）が実行し、GNU / BSD 双方のツールと
+# Git Bash で動くことを確かめる。
 .PHONY: plug4-core-invariance-selftest
 plug4-core-invariance-selftest: ## PLUG-4 判定スクリプトの自己テスト（TASK-109.4・REPAIR-12。fixture workspace）
 	@for c in cargo git; do \
@@ -344,6 +388,32 @@ plug4-core-invariance-selftest: ## PLUG-4 判定スクリプトの自己テス�
 		fi; \
 	done
 	bash scripts/check-plug4-core-invariance-selftest.sh
+
+# CLI 基本 6 コマンドの 3 OS 同一構文・挙動の比較（TASK-125.1・CLI-1・MS-6）。
+# 自己テストはスタブ CLI のみを使い、製品バイナリ・root は使わない（REPAIR-12）。CI の integration-test
+# ジョブ（ubuntu・macos・windows の 3 OS）が本ターゲットを実行する。make ci には含めない。
+.PHONY: cli-parity-selftest
+cli-parity-selftest: ## CLI 3 OS 比較スクリプトの自己テスト（TASK-125.1・REPAIR-12。スタブ CLI のみ）
+	bash scripts/cli-parity-check-selftest.sh
+
+# commit-msg フックの本文行長検査（Issue #1295）。一時ファイルのみで完結する。make ci には含めない。
+.PHONY: commit-msg-line-length-selftest
+commit-msg-line-length-selftest: ## commit-msg 行長検査スクリプトの自己テスト（Issue #1295・REPAIR-12）
+	bash scripts/check-commit-msg-line-length-selftest.sh
+
+# 実機での記録・突き合わせ（実機前提・make ci 対象外。判定は #661〔TASK-125.h1〕で人間が行う）。
+# CLI/OUTPUT を指定すると capture、BASELINE/CANDIDATE を指定すると compare を実行する。
+# 変数は単一引用符で囲んでシェルへ渡す（fio_bench_sq。値の検証はスクリプト側が担う）。
+.PHONY: cli-parity
+cli-parity: ## CLI 3 OS 比較の capture（CLI/OUTPUT）または compare（BASELINE/CANDIDATE）を実行する
+	@if [ -n $(call fio_bench_sq,$(CLI)) ] && [ -n $(call fio_bench_sq,$(OUTPUT)) ]; then \
+		bash scripts/cli-parity-check.sh capture --cli $(call fio_bench_sq,$(CLI)) --output $(call fio_bench_sq,$(OUTPUT)); \
+	elif [ -n $(call fio_bench_sq,$(BASELINE)) ] && [ -n $(call fio_bench_sq,$(CANDIDATE)) ]; then \
+		bash scripts/cli-parity-check.sh compare --baseline $(call fio_bench_sq,$(BASELINE)) --candidate $(call fio_bench_sq,$(CANDIDATE)); \
+	else \
+		echo "usage: make cli-parity CLI=<abs-path> OUTPUT=<new-file>  |  make cli-parity BASELINE=<capture> CANDIDATE=<capture>" >&2; \
+		exit 2; \
+	fi
 
 # REPAIR-7 ステージ 3（タイムアウト保護された結合試験。TASK-86.2・#36）。
 # CI（ci.yml の integration-test ジョブ）と同じ判定を行う: integration test
@@ -382,7 +452,7 @@ else
 endif
 
 .PHONY: deny
-deny: ## cargo deny check advisories bans licenses sources（依存監査。cargo-deny 未導入なら自動導入）
+deny: ## cargo deny check advisories bans licenses sources（ルート workspace と venus 試験治具の依存監査。cargo-deny 未導入なら自動導入）
 ifneq ($(and $(HAS_CARGO),$(HAS_DENY),$(HAS_MEMBERS)),)
 	@export PATH="$$HOME/.cargo/bin:$$PATH"; \
 	command -v cargo-deny >/dev/null 2>&1 || { \
@@ -390,17 +460,35 @@ ifneq ($(and $(HAS_CARGO),$(HAS_DENY),$(HAS_MEMBERS)),)
 		cargo install cargo-deny@$(CARGO_DENY_VERSION) --locked; \
 	}; \
 	cargo deny --locked check advisories bans licenses sources
+	@$(MAKE) --no-print-directory deny-poc-venus-jig
 else
 	@echo "skip: Cargo.toml・deny.toml のいずれか未追加、または workspace にメンバー crate が無いため deny をスキップ"
 endif
 
+# venus 試験治具（ルート workspace 外。独自の Cargo.lock を持つ。GPU-6・TASK-172.4）の依存監査。
+# ルートの deny.toml を共有し（--config）、ルートと同じ 4 種を --locked で検査する。CI の rust-ci
+# （reusable workflow）の deny はルート workspace だけを見るため、CI では rust-ci-default-features
+# ジョブ（ubuntu）が本ターゲットを実行する。cargo-deny 未導入なら deny と同じ版を自動導入する。
+# 引数の位置: cargo-deny 0.20.2 では --manifest-path・--config・--locked は `cargo deny` 直下の大域
+# オプションで、`check` の後ろに置くと「unexpected argument '--config'」で失敗する（`cargo deny --help`
+# と `cargo deny check --help` で確認済み）。--show-stats で 4 種それぞれの ok / 件数を必ずログに出す。
+.PHONY: deny-poc-venus-jig
+deny-poc-venus-jig: ## venus 試験治具（poc/venus-decoder/jig）の Cargo.lock を cargo deny で検査する（ルートの deny.toml を共有）
+	@export PATH="$$HOME/.cargo/bin:$$PATH"; \
+	command -v cargo-deny >/dev/null 2>&1 || { \
+		echo "cargo-deny を導入します"; \
+		cargo install cargo-deny@$(CARGO_DENY_VERSION) --locked; \
+	} && \
+	cargo deny --manifest-path $(POC_VENUS_JIG_MANIFEST) --config deny.toml --locked \
+		check --show-stats advisories bans licenses sources
+
 .PHONY: ci
-ci: lint-docs check-workspace-manifest fmt-check lint test deny ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
+ci: lint-docs check-workspace-manifest fmt-check lint test doc deny ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8）
 # --------------------------------------------------
-# `make ci` には含めない: (1) ci.md のローカルゲート定義（fmt-check/lint/test/deny）を
+# `make ci` には含めない: (1) ci.md のローカルゲート定義（fmt-check/lint/test/doc/deny）を
 # 変えないため、(2) 実ベンチの実行は時間がかかるため。CI 側は `.github/workflows/ci.yml`
 # の `bench-regression` 専用ジョブが必ず実行するため、`make ci` に無くてもゲートは
 # 抜けない。
@@ -506,8 +594,10 @@ bench-baseline-selftest: ## baseline.json 生成スクリプトの自己テス�
 	bash scripts/bench/generate_baseline_selftest.sh
 
 # 登録済みベンチを実行し、benches/metrics.json（direction・unit の SSOT）と合わせて
-# baseline.json を再生成する（TASK-88.1・REPAIR-8）。BENCH_NAMES は TASK-113 で実ベンチ
-# （files/s・起動 p95 等）を足す場所。実測値の記録は TASK-88.2（#229）が行う。
+# baseline.json を再生成する（TASK-88.1・REPAIR-8）。BENCH_NAMES は実ベンチを追加するときに
+# 足す場所（plugin 境界ベンチ〔TASK-113〕は登録済み。files/s・起動 p95 のベンチは担当タスク未定で、
+# docs/design/bench-calibration.md「既知の欠落」）。校正記録は同ファイル（TASK-88.2・#229）にあり、
+# 実測と基準値の確定は TASK-88.h1・TASK-113.h1。
 # BENCH_METRICS / BENCH_BASELINE_OUT / BENCH_ENVIRONMENT は Make 変数展開でシェル文字列へ
 # 埋め込まず、export した環境変数として二重引用符付きで参照する（値に ' 等が含まれても
 # 引用が壊れず、インジェクションにならない）。
@@ -567,6 +657,13 @@ fio-bench-selftest: ## fio ベンチスクリプトの自己テスト（REPAIR-1
 		exit 1; \
 	fi
 	bash scripts/fio-randwrite-4k-selftest.sh
+
+# virtio-gpu ゲスト側確認スクリプトの自己テスト（TASK-172.6・GPU-6・REPAIR-12）。
+# 合成 fixture のみで完結し、macOS 27・ゲスト VM は不要。make ci には含めない。CI は integration-test
+# ジョブ（ubuntu・macos・windows の 3 OS）が本ターゲットを実行し、BSD 系ツールでの移植性も確かめる。
+.PHONY: vz-virtio-gpu-guest-check-selftest
+vz-virtio-gpu-guest-check-selftest: ## virtio-gpu ゲスト側確認スクリプトの自己テスト（TASK-172.6・GPU-6・REPAIR-12。fixture のみ）
+	bash poc/vz-custom-virtio-gpu/guest/check-virtio-gpu-selftest.sh
 
 # 実機での run モード実行（fio・GNU coreutils の timeout が必要。root 権限・
 # /dev/kvm は不要）。TARGET_DIR 未指定時は案内を出して止める。
@@ -785,6 +882,55 @@ idle-memory-supervised: ## 監視プロセス込みのアイドル常駐メモ�
 	esac
 
 # --------------------------------------------------
+# 監視プロセス常駐メモリ（PSS）計測（TASK-158・SUP-2。Linux 限定。bash のみで完結）
+# --------------------------------------------------
+# 実測は製品バイナリ（fandhe-container-supervisor）提供後に人間が #485（TASK-158.h1）で行う。`make ci` には含めない（実機前提）。
+# PID=<pid ...>（空白区切りで複数可）または COUNT=<N> のどちらか必須。起動は操作者が事前に行う（スクリプトは起動しない・sudo を呼ばない）。
+# /proc の読み取りがハングし得るため timeout で包む（REPAIR-5）。秒数は SUPERVISOR_PSS_TIMEOUT（1〜999999・既定 300）。
+# スクリプトの終了コード 0〜3 はそのまま返し、timeout 超過（124・137）と想定外の値は 3、起動不能（125〜127）は 2。
+# SUPERVISOR_PSS_SCRIPT は selftest が配線を stub で照合するための差し替え口。
+SUPERVISOR_PSS_TIMEOUT ?= 300
+SUPERVISOR_PSS_SCRIPT ?= scripts/bench/supervisor_pss.sh
+
+.PHONY: supervisor-pss-selftest
+supervisor-pss-selftest: ## 監視プロセス常駐メモリ計測スクリプトの自己テスト（TASK-158・SUP-2・REPAIR-12）
+	bash scripts/bench/supervisor_pss_selftest.sh
+
+.PHONY: supervisor-pss
+supervisor-pss: ## 監視プロセスの PSS を計測（PID="<pid>..." または COUNT=<N>。[SAMPLES= INTERVAL= EXE_NAME= EXPECTED_DIR= OUTPUT=]。SUP-2・Linux・実機前提）
+	@t=$(call fio_bench_sq,$(SUPERVISOR_PSS_TIMEOUT)); \
+	case "$$t" in ''|*[!0-9]*|???????*) t=invalid ;; esac; \
+	if [ "$$t" = invalid ] || [ "$$t" -eq 0 ]; then \
+		echo "error: invalid-argument: SUPERVISOR_PSS_TIMEOUT must be an integer from 1 to 999999 (seconds)" >&2; \
+		exit 2; \
+	fi; \
+	if [ -z $(call fio_bench_sq,$(PID)) ] && [ -z $(call fio_bench_sq,$(COUNT)) ]; then \
+		echo "error: invalid-argument: PID=\"<pid> ...\" or COUNT=<N> is required (see scripts/bench/supervisor_pss.sh --help)" >&2; \
+		exit 2; \
+	fi; \
+	if ! command -v timeout >/dev/null 2>&1; then \
+		echo "error: unsupported-os: timeout (coreutils) is required" >&2; \
+		exit 2; \
+	fi; \
+	pids=$(call fio_bench_sq,$(PID)); \
+	set --; \
+	for p in $$pids; do set -- "$$@" --pid "$$p"; done; \
+	if [ -n $(call fio_bench_sq,$(COUNT)) ]; then set -- "$$@" --count $(call fio_bench_sq,$(COUNT)); fi; \
+	if [ -n $(call fio_bench_sq,$(SAMPLES)) ]; then set -- "$$@" --samples $(call fio_bench_sq,$(SAMPLES)); fi; \
+	if [ -n $(call fio_bench_sq,$(INTERVAL)) ]; then set -- "$$@" --interval $(call fio_bench_sq,$(INTERVAL)); fi; \
+	if [ -n $(call fio_bench_sq,$(EXE_NAME)) ]; then set -- "$$@" --exe-name $(call fio_bench_sq,$(EXE_NAME)); fi; \
+	if [ -n $(call fio_bench_sq,$(EXPECTED_DIR)) ]; then set -- "$$@" --expected-dir $(call fio_bench_sq,$(EXPECTED_DIR)); fi; \
+	if [ -n $(call fio_bench_sq,$(OUTPUT)) ]; then set -- "$$@" --output $(call fio_bench_sq,$(OUTPUT)); fi; \
+	rc=0; \
+	timeout --kill-after=10 "$$t" bash $(call fio_bench_sq,$(SUPERVISOR_PSS_SCRIPT)) --format json "$$@" || rc=$$?; \
+	case "$$rc" in \
+		0|1|2|3) exit "$$rc" ;; \
+		124|137) echo "error: measurement-failed: timed out after $${t}s reading /proc" >&2; exit 3 ;; \
+		125|126|127) echo "error: invalid-input: cannot run the measurement under timeout (exit $$rc)" >&2; exit 2 ;; \
+		*) echo "error: measurement-failed: unexpected exit status $$rc" >&2; exit 3 ;; \
+	esac
+
+# --------------------------------------------------
 # 50 コンテナ同時起動の集約メモリ計測（TASK-50.1 own 側・TASK-50.2 Docker 側と統合レポート・CORE-9・SUP-1。Linux 限定。bash のみで完結）
 # --------------------------------------------------
 # 実測は own の CLI・本番 launcher 提供後に人間が #219（TASK-50.h1）で行う。`make ci` には含めない（実機前提）。
@@ -860,6 +1006,99 @@ concurrent-memory: ## 50 コンテナ同時起動時の集約 PSS を計測す�
 	case "$$rc" in \
 		0|1|2|3|4) exit "$$rc" ;; \
 		124|137) echo "error: measurement-failed: timed out after $${t}s (measurement or cleanup stalled)" >&2; exit 1 ;; \
+		125|126|127) echo "error: invalid-input: cannot run the measurement under timeout (exit $$rc)" >&2; exit 2 ;; \
+		*) echo "error: measurement-failed: unexpected exit status $$rc" >&2; exit 1 ;; \
+	esac
+
+# 監視プロセス独立性の実証スクリプト（TASK-162・SUP-5。実証・判定は #499 で人間が実機実行する）。
+# `supervisor-independence-selftest` はスタブ launcher だけで照合する自己テスト（CI の bench-regression ジョブでも実行）、
+# `supervisor-independence` は N（既定 50）個の監視プロセスのうち 1 個を SIGKILL して残りの継続と孤児の稼働継続を確認する
+# 実機前提ターゲット（make ci には含めない。スクリプト内で sudo は呼ばない。launcher 契約はスクリプト冒頭を参照）。
+# スクリプトの終了コード 0〜4 はそのまま返し、timeout 超過（124・137）と想定外の値は 1、起動不能（125〜127）は 2。
+SUPERVISOR_INDEPENDENCE_TIMEOUT ?= 600
+SUPERVISOR_INDEPENDENCE_SCRIPT ?= scripts/verify-supervisor-independence.sh
+
+.PHONY: supervisor-independence-selftest
+supervisor-independence-selftest: ## 監視プロセス独立性実証スクリプトの自己テスト（SUP-5・REPAIR-12。スタブ launcher のみ）
+	bash scripts/verify-supervisor-independence-selftest.sh
+
+.PHONY: supervisor-independence
+supervisor-independence: ## 監視プロセス 1 個を kill して他の継続と孤児の稼働継続を確認する（実機前提・timeout 付き。LAUNCHER=<絶対パス> BUNDLE=<dir> 必須。SUP-5）
+	@if [ -z $(call fio_bench_sq,$(LAUNCHER)) ] || [ -z $(call fio_bench_sq,$(BUNDLE)) ]; then \
+		echo "usage: make supervisor-independence LAUNCHER=<abs-path> BUNDLE=<dir> [COUNT=<n, default 50>] [TARGET_INDEX=<k, default count/2 rounded up>] [OUTPUT=<new file>] [SUPERVISOR_INDEPENDENCE_TIMEOUT=<secs, default 600>]" >&2; \
+		exit 2; \
+	fi; \
+	t=$(call fio_bench_sq,$(SUPERVISOR_INDEPENDENCE_TIMEOUT)); \
+	case "$$t" in ''|*[!0-9]*|???????*) t=invalid ;; esac; \
+	if [ "$$t" = invalid ] || [ "$$t" -eq 0 ]; then \
+		echo "error: invalid-argument: SUPERVISOR_INDEPENDENCE_TIMEOUT must be an integer from 1 to 999999 (seconds)" >&2; \
+		exit 2; \
+	fi; \
+	if ! command -v timeout >/dev/null 2>&1; then \
+		echo "error: unsupported-os: timeout (coreutils) is required" >&2; \
+		exit 2; \
+	fi; \
+	rc=0; \
+	timeout --kill-after=60 "$$t" bash $(call fio_bench_sq,$(SUPERVISOR_INDEPENDENCE_SCRIPT)) --launcher $(call fio_bench_sq,$(LAUNCHER)) --bundle $(call fio_bench_sq,$(BUNDLE))$(if $(COUNT), --count $(call fio_bench_sq,$(COUNT)))$(if $(TARGET_INDEX), --target-index $(call fio_bench_sq,$(TARGET_INDEX)))$(if $(OUTPUT), --output $(call fio_bench_sq,$(OUTPUT))) || rc=$$?; \
+	case "$$rc" in \
+		0|1|2|3|4) exit "$$rc" ;; \
+		124|137) echo "error: timeout: verification or cleanup stalled for $${t}s" >&2; exit 1 ;; \
+		125|126|127) echo "error: invalid-input: cannot run the verification under timeout (exit $$rc)" >&2; exit 2 ;; \
+		*) echo "error: verification-failed: unexpected exit status $$rc" >&2; exit 1 ;; \
+	esac
+
+# restart レイテンシ実機実測スクリプト（TASK-160・SUP-3。実測・合否判定は #491 で人間が行う）。
+# `restart-latency-selftest` はスタブ launcher だけで照合する自己テスト（CI の bench-regression ジョブでも実行）、
+# `restart-latency` はバックオフ 0 でコンテナを繰り返し SIGKILL して再起動レイテンシの中央値・p95 を JSON 出力する
+# 実機前提ターゲット（make ci には含めない。合否は出さない。スクリプト内で sudo は呼ばない。契約はスクリプト冒頭を参照）。
+# 全体期限 RESTART_LATENCY_TIMEOUT（秒・1〜999999）は未指定ならスクリプトの --print-budget の値を使う
+# （(試行数 + 2) × 各待機の上限 ＋ 試行ごとの余裕 ＋ 後始末 60 秒。既定の 20 試行・warmup 1・待機 30 秒で 813 秒）。
+# 固定値にしないのは、TRIALS・WARMUP・RESTART_LATENCY_WAIT_TIMEOUT を変えたときに正常な計測を途中で打ち切らないため
+# （REPAIR-5）。明示した値が上限より短い場合は警告を出してそのまま使う。
+# timeout は --preserve-status で使い、スクリプトの終了コードを保つ（期限切れの TERM でも後始末失敗の 4 を隠さない）。
+# スクリプトの終了コード 0〜4 はそのまま返す。期限切れ・中断（後始末は完了。129・130・143）と想定外の値は 1、
+# 後始末の完了前に SIGKILL された場合（137。--kill-after 60 秒の超過を含む）は残存を否定できないため 4、
+# 起動不能（125〜127）は 2。
+RESTART_LATENCY_TIMEOUT ?=
+RESTART_LATENCY_SCRIPT ?= scripts/measure-restart-latency.sh
+
+.PHONY: restart-latency-selftest
+restart-latency-selftest: ## restart レイテンシ計測スクリプトの自己テスト（SUP-3・REPAIR-12。スタブ launcher のみ）
+	bash scripts/measure-restart-latency-selftest.sh
+
+.PHONY: restart-latency
+restart-latency: ## バックオフ 0 の restart レイテンシを計測する（実機前提・timeout 付き。LAUNCHER=<絶対パス> BUNDLE=<dir> 必須。[TRIALS= WARMUP= OUTPUT= RESTART_LATENCY_WAIT_TIMEOUT=]。SUP-3）
+	@if [ -z $(call fio_bench_sq,$(LAUNCHER)) ] || [ -z $(call fio_bench_sq,$(BUNDLE)) ]; then \
+		echo "usage: make restart-latency LAUNCHER=<abs-path> BUNDLE=<dir> [TRIALS=<n, default 20>] [WARMUP=<n, default 1>] [OUTPUT=<new file>] [RESTART_LATENCY_WAIT_TIMEOUT=<secs per wait, default 30>] [RESTART_LATENCY_TIMEOUT=<secs for the whole run, default: computed from the above>]" >&2; \
+		exit 2; \
+	fi; \
+	if ! command -v timeout >/dev/null 2>&1; then \
+		echo "error: unsupported-os: timeout (coreutils) is required" >&2; \
+		exit 2; \
+	fi; \
+	set --; \
+	if [ -n $(call fio_bench_sq,$(TRIALS)) ]; then set -- "$$@" --trials $(call fio_bench_sq,$(TRIALS)); fi; \
+	if [ -n $(call fio_bench_sq,$(WARMUP)) ]; then set -- "$$@" --warmup $(call fio_bench_sq,$(WARMUP)); fi; \
+	if [ -n $(call fio_bench_sq,$(RESTART_LATENCY_WAIT_TIMEOUT)) ]; then set -- "$$@" --timeout $(call fio_bench_sq,$(RESTART_LATENCY_WAIT_TIMEOUT)); fi; \
+	budget="$$(bash $(call fio_bench_sq,$(RESTART_LATENCY_SCRIPT)) --print-budget "$$@")" || exit 2; \
+	case "$$budget" in ''|*[!0-9]*|???????*) echo "error: invalid-input: cannot compute the time budget" >&2; exit 2 ;; esac; \
+	t=$(call fio_bench_sq,$(RESTART_LATENCY_TIMEOUT)); \
+	if [ -z "$$t" ]; then t="$$budget"; fi; \
+	case "$$t" in ''|*[!0-9]*|???????*) t=invalid ;; esac; \
+	if [ "$$t" = invalid ] || [ "$$t" -eq 0 ]; then \
+		echo "error: invalid-argument: RESTART_LATENCY_TIMEOUT must be an integer from 1 to 999999 (seconds)" >&2; \
+		exit 2; \
+	fi; \
+	if [ "$$t" -lt "$$budget" ]; then \
+		echo "warning: RESTART_LATENCY_TIMEOUT=$${t}s is shorter than the worst-case duration $${budget}s; a slow but valid run may be cut off" >&2; \
+	fi; \
+	if [ -n $(call fio_bench_sq,$(OUTPUT)) ]; then set -- "$$@" --output $(call fio_bench_sq,$(OUTPUT)); fi; \
+	rc=0; \
+	timeout --preserve-status --kill-after=60 "$$t" bash $(call fio_bench_sq,$(RESTART_LATENCY_SCRIPT)) --launcher $(call fio_bench_sq,$(LAUNCHER)) --bundle $(call fio_bench_sq,$(BUNDLE)) "$$@" || rc=$$?; \
+	case "$$rc" in \
+		0|1|2|3|4) exit "$$rc" ;; \
+		129|130|143) echo "error: timeout: the measurement was stopped by a signal (time limit $${t}s or an interrupt); cleanup completed and no result is published" >&2; exit 1 ;; \
+		137) echo "error: cleanup-failed: the measurement was killed before cleanup finished; processes may remain, inspect and kill them manually" >&2; exit 4 ;; \
 		125|126|127) echo "error: invalid-input: cannot run the measurement under timeout (exit $$rc)" >&2; exit 2 ;; \
 		*) echo "error: measurement-failed: unexpected exit status $$rc" >&2; exit 1 ;; \
 	esac

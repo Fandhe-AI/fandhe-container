@@ -36,11 +36,19 @@
 //!
 //! # 実装済みの資源制限
 //! - `cpu.max`（TASK-32.3・#160）: [`ContainerCgroup::set_cpu_max`]（`cpu` サブモジュール。起動フローからは
-//!   未呼び出しで、本番 launcher〔TASK-29 / TASK-157 系〕で結線する）
+//!   未呼び出しで、本番 launcher〔TASK-29 / TASK-157 系〕で結線する）。`--cpus` 相当値の変換
+//!   [`CpuMax::parse_cpus`]（TASK-170.1・SUP-13）を含む
 //! - `memory.max` / `memory.swap.max`（TASK-32.2・#159）: [`ContainerCgroup::set_memory_limits`]
 //!   （同上。未結線）
+//! - `pids.max` / `io.max`（SUP-13・TASK-170.2・#533）: [`ContainerCgroup::set_pids_max`]（`pids` サブモジュール）・
+//!   [`ContainerCgroup::set_io_max`]（`io_max` サブモジュール。1 デバイス分の絶対値スロットル）（同上。未結線）
+//! - `io.weight`（SUP-13・TASK-170.4・#1474）: [`ContainerCgroup::set_io_weight`]（`io_weight` サブモジュール）と
+//!   `--blkio-weight` の変換 [`IoWeight::from_blkio_weight`]（同上。未結線）
 //! - fork 後の子の `cgroup.procs` 参加（TASK-32.4・#161）: [`ContainerCgroup::join_hook`] が返す
 //!   [`CgroupJoin`] を `exec::StagePipeline` の `CgroupJoin` 段へ登録する（`exec::StageHook` 実装済み）
+//! - exec 経路の cgroup 参加（SUP-6・TASK-163.2・#501）: 記録した cgroup パスから fd で開いて `cgroup.procs` へ
+//!   書く `exec_join` サブモジュール（`exec::prepare_cgroup_join` / `join_cgroup` の実体。起動経路の
+//!   [`CgroupJoin`] とは別の入口）
 //!
 //! - delete 時の cgroup 削除（TASK-30.3・OCI-6）: [`DelegatedCgroup::open_child`] で名前から既存の子 cgroup を
 //!   検証つきで開き、`oci_runtime::ContainerCgroupRemover` の実装として [`DelegatedCgroup::remove_child`] へ渡す
@@ -54,6 +62,8 @@
 //!   `detect` → `prepare` → `join_hook` の結線（TASK-29 / TASK-157 系）
 //! - OCI `linux.cgroupsPath` の反映・create での委譲スコープの記録（`CreateStateRequest::with_cgroup_scope`）と
 //!   delete への本番の呼び出し元（CLI / plugin / supervisor）からの結線
+//! - OCI `linux.resources.pids` / `blockIO`（weight を含む）からの `set_pids_max` / `set_io_max` /
+//!   `set_io_weight` への反映（TASK-170.3 ほか）
 //! - cgroup v1 / hybrid は非対応（CORE-4。v2 以外は fail-closed）
 
 use std::collections::BTreeSet;
@@ -69,7 +79,21 @@ use crate::sys::{self, SysError};
 use crate::traits::{CgroupScope, ContainerId, ErrorCode, StateRevision, TraitError};
 
 mod cpu;
-pub use cpu::{CpuMax, CpuQuota};
+pub use cpu::{CpuMax, CpuQuota, NANO_CPUS_PER_CPU};
+mod io_max;
+pub use io_max::{BlockDevice, IoLimit, IoMax};
+mod io_weight;
+pub use io_weight::{
+    BLKIO_WEIGHT_MAX, BLKIO_WEIGHT_MIN, IO_WEIGHT_DEFAULT, IO_WEIGHT_MAX, IO_WEIGHT_MIN, IoWeight,
+};
+mod pids;
+pub use pids::{PIDS_MAX_LIMIT, PidsMax};
+mod exec_join;
+mod exec_kill;
+pub(crate) use exec_join::{ExecJoinFds, contains_pid, open_cgroup_by_path};
+pub(crate) use exec_kill::{
+    ExecChildCgroupFds, ExecChildRemoval, remove_exec_child_cgroup_at, validate_exec_child_name,
+};
 
 /// 退避リーフ cgroup の名前。自プロセスの移動先（レイアウトは本モジュール冒頭を参照）。
 const EVACUATION_LEAF: &str = "fc-runtime";
@@ -85,6 +109,8 @@ const SELF_CGROUP_LIMIT: u64 = 64 * 1024;
 const PROCS_LIMIT: u64 = 1024 * 1024;
 /// `cgroup.controllers` / `cgroup.subtree_control` / `cgroup.type` の読み取り上限。
 const SMALL_FILE_LIMIT: u64 = 4 * 1024;
+/// `io.stat` の読み取り上限。デバイス数に比例して伸びるため他の小さなファイルより大きく取る。
+const IO_STAT_LIMIT: u64 = 256 * 1024;
 /// cgroup パスの要素数の上限。
 const MAX_PATH_DEPTH: usize = 64;
 /// 子 cgroup ディレクトリのモード（umask 適用前。cgroup の所有者のみ書き込み可）。
@@ -118,8 +144,16 @@ pub enum CgroupStep {
     SetMemoryLimit,
     /// `cpu.max` の検証・書き込み・読み戻し。
     SetCpuMax,
+    /// `pids.max` の検証・書き込み・読み戻し（SUP-13・TASK-170.2）。
+    SetPidsMax,
+    /// `io.max` の検証・書き込み・読み戻し（SUP-13・TASK-170.2）。
+    SetIoMax,
+    /// `io.weight` の検証・書き込み・読み戻し（SUP-13・TASK-170.4）。
+    SetIoWeight,
     /// fork 後の子プロセスの `cgroup.procs` への参加（TASK-32.4）。
     JoinContainer,
+    /// `memory.current` / `cpu.stat` / `io.stat` の読み取り（SUP-10・TASK-167.1）。
+    ReadStats,
 }
 
 /// cgroup 操作のエラー。`code` は ERR 系の機械可読コード、`message` は英語の説明。
@@ -622,6 +656,25 @@ fn open_cgroup_dir(
     Ok(fd)
 }
 
+/// `/sys/fs/cgroup`（cgroup v2 ルート）を O_PATH で開き、cgroup2 であることを確認する。
+///
+/// `DelegatedCgroup::detect`（自プロセスの cgroup を辿る起点）と `exec_join`（記録した cgroup パスを辿る
+/// 起点。SUP-6・TASK-163.2）が共用する。各要素は `O_NOFOLLOW` で開く。
+fn open_cgroup_root() -> Result<OwnedFd, CgroupError> {
+    let open_step = CgroupStep::OpenRoot;
+    let mut cur = {
+        let slash = cstring(open_step, "/")?;
+        sys::open_dir_path_nofollow(None, &slash).map_err(|e| sys_error(open_step, "/", e))?
+    };
+    for comp in ["sys", "fs", "cgroup"] {
+        let c = cstring(open_step, comp)?;
+        cur = sys::open_dir_path_nofollow(Some(cur.as_fd()), &c)
+            .map_err(|e| sys_error(open_step, comp, e))?;
+    }
+    verify_cgroup2(cur.as_fd(), "/sys/fs/cgroup")?;
+    Ok(cur)
+}
+
 /// 委譲された cgroup（検出結果）。
 #[derive(Debug)]
 pub struct DelegatedCgroup {
@@ -671,7 +724,7 @@ impl ContainerCgroup {
 /// [`ContainerCgroup::join_hook`] が親で作り、`exec::StagePipeline` の `CgroupJoin` 段へ登録する。
 /// 検証済みの O_PATH ディレクトリ fd（`O_CLOEXEC`）だけを保持し、パス文字列では再解決しない
 /// （pivot 後はホストの `/sys/fs/cgroup` が見えないため。symlink・TOCTOU 対策）。
-/// 契約: fork 後の子でのみ [`CgroupJoin::join_current_process`] が呼ばれる。親で呼ぶと runtime 自身が
+/// 契約: fork 後の子でのみ `CgroupJoin::join_current_process` が呼ばれる。親で呼ぶと runtime 自身が
 /// コンテナ cgroup へ移るため `pub(crate)` に留める。cgroup namespace（`CLONE_NEWCGROUP`）導入時は
 /// 親で `cgroup.procs` を書き込み用に事前 open する方式へ切り替える（未導入のため現状は不要）。
 pub struct CgroupJoin {
@@ -799,16 +852,7 @@ impl DelegatedCgroup {
             ));
         }
         let open_step = CgroupStep::OpenRoot;
-        let mut cur = {
-            let slash = cstring(open_step, "/")?;
-            sys::open_dir_path_nofollow(None, &slash).map_err(|e| sys_error(open_step, "/", e))?
-        };
-        for comp in ["sys", "fs", "cgroup"] {
-            let c = cstring(open_step, comp)?;
-            cur = sys::open_dir_path_nofollow(Some(cur.as_fd()), &c)
-                .map_err(|e| sys_error(open_step, comp, e))?;
-        }
-        verify_cgroup2(cur.as_fd(), "/sys/fs/cgroup")?;
+        let mut cur = open_cgroup_root()?;
         for comp in &path.components {
             cur = open_cgroup_dir(open_step, cur.as_fd(), comp)?;
         }
@@ -871,7 +915,7 @@ impl DelegatedCgroup {
     /// 退避リーフを指す・コンテナ用子 cgroup の `cgroup.procs` が空。既存の同名子 cgroup は採用せず
     /// `AlreadyExists`。途中失敗時は、自プロセスを移していれば元の親へ戻して所属を読み戻しで検証し、
     /// 本処理が作った子 cgroup・退避リーフを作成直後に固定した fd との同一性を確認してから best-effort で
-    /// 削除する（[`Self::remove_verified`]。巻き戻しの失敗・fd が無く名前指定で消した事実はエラー文に併記）。
+    /// 削除する（`Self::remove_verified`。巻き戻しの失敗・fd が無く名前指定で消した事実はエラー文に併記）。
     ///
     /// 呼び出し元は、本関数で子 cgroup を作る前にこの委譲スコープ（`ContainerCgroupRemover::scope`）を
     /// 状態記録へ記録し（`CreateStateRequest::with_cgroup_scope`。TASK-30.3・OCI-6）、返された配置の instance
@@ -1131,7 +1175,7 @@ impl DelegatedCgroup {
     /// コンテナ用子 cgroup を削除する（空であること。残りがあれば `FailedPrecondition`）。
     ///
     /// `child` は借用で受けるため、`EBUSY` 等で失敗しても呼び出し側がハンドルを保持したまま再試行できる。
-    /// `child` がこの親の配下で作られたものであることを確認したうえで、[`Self::remove_verified`] で
+    /// `child` がこの親の配下で作られたものであることを確認したうえで、`Self::remove_verified` で
     /// 同一性確認・削除・削除済み確認を行う。
     pub fn remove_child(&self, child: &ContainerCgroup) -> Result<(), CgroupError> {
         let step = CgroupStep::Cleanup;
@@ -1190,29 +1234,39 @@ impl DelegatedCgroup {
     /// `ENOENT`（[`removal_confirmed`]）のときだけ成功とする。開けた場合は別の cgroup を消したとして
     /// `Internal`、その他の失敗は保持していた cgroup が残っている可能性を否定できないためエラーを返す。
     fn remove_verified(&self, name: &str, held: BorrowedFd<'_>) -> Result<(), CgroupError> {
-        let step = CgroupStep::Cleanup;
-        let entry = open_cgroup_dir(step, self.fd.as_fd(), name)?;
-        if dir_identity(step, entry.as_fd(), "stat cgroup entry")?
-            != dir_identity(step, held, "stat held cgroup")?
-        {
-            return Err(CgroupError::precondition(
-                step,
-                "cgroup entry no longer matches the held handle",
-            ));
-        }
-        drop(entry);
-        let c = cstring(step, name)?;
-        sys::remove_dir_at(self.fd.as_fd(), &c).map_err(|e| sys_error(step, name, e))?;
-        let events = cstring(step, "cgroup.events")?;
-        match sys::open_read_at(held, &events) {
-            Err(e) if removal_confirmed(&e) => Ok(()),
-            Ok(_) => Err(CgroupError::new(
-                ErrorCode::Internal,
-                step,
-                "removed cgroup entry was not the held cgroup (concurrent replacement)",
-            )),
-            Err(e) => Err(sys_error(step, "confirm removal via held cgroup.events", e)),
-        }
+        remove_verified_at(self.fd.as_fd(), name, held)
+    }
+}
+
+/// `parent` 直下の `name` を、保持 fd `held` と同一の cgroup であることを確かめてから削除し、削除済みを確認する
+/// （[`DelegatedCgroup::remove_verified`] の実体。exec 用の子 cgroup の削除〔`exec_kill`〕も共用する）。
+fn remove_verified_at(
+    parent: BorrowedFd<'_>,
+    name: &str,
+    held: BorrowedFd<'_>,
+) -> Result<(), CgroupError> {
+    let step = CgroupStep::Cleanup;
+    let entry = open_cgroup_dir(step, parent, name)?;
+    if dir_identity(step, entry.as_fd(), "stat cgroup entry")?
+        != dir_identity(step, held, "stat held cgroup")?
+    {
+        return Err(CgroupError::precondition(
+            step,
+            "cgroup entry no longer matches the held handle",
+        ));
+    }
+    drop(entry);
+    let c = cstring(step, name)?;
+    sys::remove_dir_at(parent, &c).map_err(|e| sys_error(step, name, e))?;
+    let events = cstring(step, "cgroup.events")?;
+    match sys::open_read_at(held, &events) {
+        Err(e) if removal_confirmed(&e) => Ok(()),
+        Ok(_) => Err(CgroupError::new(
+            ErrorCode::Internal,
+            step,
+            "removed cgroup entry was not the held cgroup (concurrent replacement)",
+        )),
+        Err(e) => Err(sys_error(step, "confirm removal via held cgroup.events", e)),
     }
 }
 
@@ -1524,6 +1578,63 @@ impl ContainerCgroup {
         verify_effective(requested, effective)
     }
 }
+/// 読み取れる統計ファイルの閉じた列挙（SUP-10・TASK-167.1）。
+///
+/// ファイル名と読み取り上限は本 crate 側で固定し、呼び出し側（supervisor の `stats`）から
+/// 任意のパス要素を注入できないようにする（パストラバーサル対策）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StatFile {
+    /// `memory.current`（現在のメモリ使用量。バイト）。
+    MemoryCurrent,
+    /// `cpu.stat`（CPU 使用時間・スロットリング）。
+    CpuStat,
+    /// `io.stat`（デバイスごとの I/O 量）。
+    IoStat,
+}
+
+impl StatFile {
+    /// cgroup ディレクトリ直下のファイル名。
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::MemoryCurrent => "memory.current",
+            Self::CpuStat => "cpu.stat",
+            Self::IoStat => "io.stat",
+        }
+    }
+
+    /// 読み取り上限（バイト）。
+    fn limit(self) -> u64 {
+        match self {
+            Self::MemoryCurrent | Self::CpuStat => SMALL_FILE_LIMIT,
+            Self::IoStat => IO_STAT_LIMIT,
+        }
+    }
+}
+
+impl ContainerCgroup {
+    /// 統計ファイルを上限付きで読む（SUP-10・TASK-167.1）。
+    ///
+    /// 呼び出し文脈: supervisor の `stats`（`fandhe-container-supervisor`）が自コンテナの cgroup に対し
+    /// 3 ファイルを順に読み、パースする。保持している cgroup ディレクトリ fd 起点の `openat` で開き、
+    /// パス文字列から cgroup を再解決しない。ファイル不在（controller 未有効）は `Ok(None)`、
+    /// 上限超過・非 UTF-8 は `FailedPrecondition`。読み取り専用で cgroup へは書き込まない。
+    pub fn read_stat_file(&self, file: StatFile) -> Result<Option<String>, CgroupError> {
+        read_stat_file_at(self.fd.as_fd(), file)
+    }
+}
+
+/// `dir` 起点で統計ファイルを読む。`ENOENT` のみ `None` に写し、他のエラーは伝える。
+fn read_stat_file_at(dir: BorrowedFd<'_>, file: StatFile) -> Result<Option<String>, CgroupError> {
+    let step = CgroupStep::ReadStats;
+    let name = cstring(step, file.file_name())?;
+    match sys::open_read_at(dir, &name) {
+        Ok(fd) => read_limited(step, fd, file.limit()).map(Some),
+        Err(SysError::Os(errno)) if errno == sys::ENOENT => Ok(None),
+        Err(e) => Err(sys_error(step, file.file_name(), e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2131,5 +2242,52 @@ mod tests {
         let over = ContainerId::new("a".repeat(252)).unwrap();
         let err = CgroupName::for_instance(&over, StateRevision::from_raw(0)).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    /// SUP-10・TASK-167.1: 統計ファイルが具体値で読め、不在は None になる。
+    #[test]
+    fn sup10_task167_1_read_stat_file_reads_and_maps_missing_to_none() {
+        let tmp = TmpDir::new("t1671-ok");
+        std::fs::write(tmp.0.join("memory.current"), "12345678\n").unwrap();
+        std::fs::write(
+            tmp.0.join("cpu.stat"),
+            "usage_usec 10\nuser_usec 6\nsystem_usec 4\n",
+        )
+        .unwrap();
+        let cg = limits_for(&tmp.0);
+        assert_eq!(
+            cg.read_stat_file(StatFile::MemoryCurrent),
+            Ok(Some("12345678\n".to_string()))
+        );
+        assert_eq!(
+            cg.read_stat_file(StatFile::CpuStat),
+            Ok(Some(
+                "usage_usec 10\nuser_usec 6\nsystem_usec 4\n".to_string()
+            ))
+        );
+        assert_eq!(cg.read_stat_file(StatFile::IoStat), Ok(None));
+    }
+
+    /// SUP-10・TASK-167.1: 上限超過と非 UTF-8 は FailedPrecondition・ReadStats。
+    #[test]
+    fn sup10_task167_1_read_stat_file_rejects_oversize_and_non_utf8() {
+        let tmp = TmpDir::new("t1671-bad");
+        std::fs::write(tmp.0.join("memory.current"), vec![b'1'; 4097]).unwrap();
+        std::fs::write(tmp.0.join("cpu.stat"), [0xff, 0xfe]).unwrap();
+        std::fs::write(tmp.0.join("io.stat"), vec![b'x'; 256 * 1024 + 1]).unwrap();
+        let cg = limits_for(&tmp.0);
+        for f in [StatFile::MemoryCurrent, StatFile::CpuStat, StatFile::IoStat] {
+            let e = cg.read_stat_file(f).unwrap_err();
+            assert_eq!(e.code, ErrorCode::FailedPrecondition, "{f:?}");
+            assert_eq!(e.step, CgroupStep::ReadStats, "{f:?}");
+        }
+        // 上限ちょうどは読める。
+        std::fs::write(tmp.0.join("memory.current"), vec![b'1'; 4096]).unwrap();
+        assert_eq!(
+            cg.read_stat_file(StatFile::MemoryCurrent)
+                .unwrap()
+                .map(|s| s.len()),
+            Some(4096)
+        );
     }
 }

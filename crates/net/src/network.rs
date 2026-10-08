@@ -35,7 +35,7 @@
 //!
 //! # コンテナ接続（TASK-139.2.1・#847）
 //!
-//! [`attach_container`] はコンテナ単位の接続処理で、netns の作成と pin（`crate::netns`）→ veth ペア作成 →
+//! `attach_container`（Linux のみ）はコンテナ単位の接続処理で、netns の作成と pin（`crate::netns`）→ veth ペア作成 →
 //! host 側の bridge 接続（`IFLA_MASTER`）と up → peer 側の netns 移動までを行い、途中で失敗したら
 //! 自分が作った veth と netns だけを戻す。veth は host 側 `fcvh` / peer 側 `fcvp` + [`EndpointId`] の
 //! FNV-1a 下位 44bit hex 11 桁（[`VethNames`]。互換性に関わる契約）。veth には所有トークンを付けられない
@@ -833,7 +833,7 @@ pub struct ContainerAttachSpec {
 }
 
 impl ContainerAttachSpec {
-    /// `network` は [`create_network`] が返したネットワーク。`netns_dir` は netns の pin を置く
+    /// `network` は `create_network`（Linux のみ）が返したネットワーク。`netns_dir` は netns の pin を置く
     /// ディレクトリの絶対パス（所有者・権限の検査は作成時に行う。`crate::netns`）。
     /// 相対パスは `InvalidArgument`。
     pub fn new(
@@ -860,7 +860,7 @@ impl ContainerAttachSpec {
     /// ポート公開の指定を加える（既定は公開なし）。件数が [`MAX_PORT_PUBLISHES`] を超える、または
     /// 同じ受け口（プロトコル・host アドレス・host ポート）が重複していれば `InvalidArgument`
     /// （上限を検証してから保持する）。他コンテナ・他ネットワークとの受け口の競合は
-    /// [`attach_container`] が [`PortRegistry`] で投入前に検出して接続を失敗させる。
+    /// `attach_container` が [`PortRegistry`] で投入前に検出して接続を失敗させる。
     pub fn with_port_publishes(mut self, ports: Vec<PortPublish>) -> Result<Self, NetError> {
         if ports.len() > MAX_PORT_PUBLISHES {
             return Err(invalid("too many port publishes"));

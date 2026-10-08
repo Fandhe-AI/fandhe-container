@@ -85,8 +85,10 @@ pre-commit:
 commit-msg:
   jobs:
     # Conventional Commits 形式の検証（.claude/rules/conventional-commits.md）。
-    # オフラインで完結する軽量な正規表現検査とし、正式な commitlint（config-conventional +
-    # commitlint.config.mjs）は CI（lint-docs の commitlint ジョブ）・make lint-commits が担う。
+    # オフラインで完結する軽量な検査とする。1 行目は正規表現、2 行目以降は行長（100 文字。
+    # scripts/check-commit-msg-line-length.sh。commitlint の body/footer-max-line-length と同じ判定）。
+    # 正式な commitlint（config-conventional + commitlint.config.mjs）は CI（lint-docs の
+    # commitlint ジョブ）・make lint-commits が担う。
     # Merge / Revert / fixup コミットは対象外とする
     - name: conventional-commits
       run: |
@@ -99,6 +101,7 @@ commit-msg:
           echo "形式: <type>(<scope>): <説明>  （type: feat|fix|perf|refactor|test|docs|build|ci|chore）" >&2
           exit 1
         fi
+        sh scripts/check-commit-msg-line-length.sh {1}
 
 pre-push:
   jobs:

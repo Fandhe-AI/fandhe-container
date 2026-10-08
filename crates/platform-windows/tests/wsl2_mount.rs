@@ -27,7 +27,7 @@ use fandhe_container_platform_windows::wslconfig::VirtiofsState;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 偽 `wsl.exe` のマウント系モード（テストごとに別の状態ファイルを使うため 1 テスト 1 モード）。
-const MODES: [&str; 7] = [
+const MODES: [&str; 8] = [
     "mount_ok",
     "mount_9p",
     "mount_9p_unset",
@@ -35,6 +35,7 @@ const MODES: [&str; 7] = [
     "mount_9p_launch",
     "mount_launch",
     "mount_unset",
+    "mount_slow",
 ];
 
 /// モードごとの名前で偽 `wsl.exe` を置いたディレクトリ（`tests/wsl2_detect.rs` と同じ用意の仕方。
@@ -207,5 +208,59 @@ fn launch_continues_on_9p_fallback() {
     assert_eq!(n.value, 2);
     assert_eq!(n.prepared.transport(), Some(SharedTransport::NineP));
     release_virtiofs_launch_with_program(&exe, &n.prepared, TIMEOUT).unwrap();
+    assert!(mounted(&exe).is_empty());
+}
+
+/// REPAIR-5・WIN-2: 検出とマウント準備は 1 つの合計期限を共有する。偽 `wsl.exe`（`mount_slow`）は
+/// `--version` と準備の最初の mountinfo の応答前に 600 ms ずつ眠るため、合計期限 1 秒では検出（600 ms 以上）の
+/// 後に残る 400 ms 未満で mountinfo を読み切れず、マウント前に `TIMEOUT` で止まる（起動ステップは呼ばれず、
+/// マウントも残らない。検出と準備が別々に 1 秒ずつ持つ実装では、どちらも期限内に終わって止まらない）。期限が十分なら同じ偽 `wsl.exe` で準備・起動・解除が通る。
+#[test]
+fn launch_shares_one_deadline_between_detect_and_prepare() {
+    let exe = fresh_fake("mount_slow");
+    let mut started = false;
+    let e = launch_with_program(
+        &exe,
+        VirtiofsState::Enabled,
+        &request(),
+        Duration::from_secs(1),
+        |_| {
+            started = true;
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        (e.code(), e.message()),
+        (
+            Wsl2ErrorCode::Timeout,
+            "wsl.exe did not finish before the deadline"
+        )
+    );
+    assert!(!started);
+    assert!(e.unreleased().is_none());
+    assert!(mounted(&exe).is_empty());
+
+    // 準備単体（`prepare_virtiofs_launch` の経路）も同じ配分で止まる。
+    let e = prepare_virtiofs_launch_with_program(
+        &exe,
+        VirtiofsState::Enabled,
+        &request(),
+        Duration::from_secs(1),
+    )
+    .unwrap_err();
+    assert_eq!(e.code(), Wsl2ErrorCode::Timeout);
+    assert!(mounted(&exe).is_empty());
+
+    let n = launch_with_program(
+        &exe,
+        VirtiofsState::Enabled,
+        &request(),
+        Duration::from_secs(30),
+        |p| Ok(p.mounts().len()),
+    )
+    .unwrap();
+    assert_eq!(n.value, 2);
+    release_virtiofs_launch_with_program(&exe, &n.prepared, Duration::from_secs(30)).unwrap();
     assert!(mounted(&exe).is_empty());
 }

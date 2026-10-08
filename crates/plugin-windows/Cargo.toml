@@ -1,9 +1,13 @@
 # Windows バックエンド plugin バイナリ（fandhe-container-platform-windows の実装を別プロセス化。
 # crate-naming.md の表 #17）。
 # 雛形は TASK-1.3（#11・REPAIR-1・MS-0）。本体は G8（TASK-116）で実装する。
-# バイナリ名は `fandhe-container-plugin-windows`（発見対象。PLUG-4・PLUG-11）。本雛形では `[[bin]]`/`main.rs` は未定義。
+# バイナリ名は `fandhe-container-plugin-windows`（発見対象。PLUG-4・PLUG-11）。`[[bin]]`（src/main.rs）は TASK-116.1（#392）で定義し、UDS フレーム送受信ループ（src/frame_loop.rs）は TASK-116.2（#393）で追加した。
+# SIGTERM グレースフルシャットダウンと ping 応答（src/sys.rs ほか）は TASK-116.5（#396）で追加した（依存の追加なし）。
+# E2E 結合試験（tests/e2e.rs）は TASK-116.6（#397）で追加した（依存の追加なし）。
 # version は未指定（Cargo の既定で 0.0.0）。公開方針は未決定のため publish = false を明記する。
-# 依存の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
+# 依存は `fandhe-container-plugin`（境界機構）の workspace path 依存と、`fandhe-container-platform-windows` の path 依存
+# （TASK-116.3・#394。architecture.md・crate-naming.md 表 #17 で確定済みの内部辺）のみで、外部クレートの追加はない。
+# 外部クレートの追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 
 [package]
 name = "fandhe-container-plugin-windows"
@@ -11,3 +15,15 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+
+[[bin]]
+name = "fandhe-container-plugin-windows"
+path = "src/main.rs"
+
+[dependencies]
+fandhe-container-plugin = { workspace = true }
+fandhe-container-platform-windows = { path = "../platform-windows" }
+
+# workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
+[lints]
+workspace = true

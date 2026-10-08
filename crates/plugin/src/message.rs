@@ -460,6 +460,7 @@ mod tests {
         for (code, message) in [
             (PluginErrorCode::NotFound, "no such container"),
             (PluginErrorCode::DataLoss, ""),
+            (PluginErrorCode::ResourceExhausted, ""),
         ] {
             roundtrip(ControlMessage::Error {
                 id: MessageId::new(3),

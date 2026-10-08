@@ -78,7 +78,10 @@ mod imp {
             .map_err(|_| BenchError::new("spawn-failed", "failed to spawn plugin process"))?;
         guard.child = Some(child);
 
-        let mut stream = listener.accept(CONNECT_TIMEOUT)?;
+        let mut stream = listener.accept(
+            CONNECT_TIMEOUT,
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        )?;
         let framed = measure_framed(plan, &mut stream)?;
         drop(stream);
         // Δp50 と CORE-10 比は stderr へ出す（stdout は結果 JSON のみ。TASK-113.3・PLUG-5）。
@@ -87,7 +90,11 @@ mod imp {
     }
 
     fn run_child(socket: &str) -> Result<(), BenchError> {
-        let mut stream = UdsStream::connect(std::path::Path::new(socket), CONNECT_TIMEOUT)?;
+        let mut stream = UdsStream::connect(
+            std::path::Path::new(socket),
+            CONNECT_TIMEOUT,
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        )?;
         serve(&mut stream)
     }
 

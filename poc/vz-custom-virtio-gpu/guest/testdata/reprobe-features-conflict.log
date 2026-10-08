@@ -1,0 +1,7 @@
+[    1.100000] virtio_gpu virtio0: features: +virgl -edid +resource_blob +host_visible
+[    1.100100] virtio_gpu virtio0: features: +context_init
+[    1.100200] virtio_gpu virtio0: number of cap sets: 1
+[    1.100300] virtio_gpu virtio0: cap set 0: id 4, max-version 0, max-size 160
+[    1.100400] virtio_gpu virtio0: Host memory window: 0x0000000200000000 +0x0000000100000000
+[    1.100500] virtio_gpu virtio0: KMS disabled
+[    2.100000] virtio_gpu virtio0: features: +virgl -edid +resource_blob -host_visible

@@ -2,7 +2,7 @@
 //!
 //! supervisor は `state.json` を CLI（`oci_runtime::create` 等）と共有する。状態のファイルベース実装は
 //! core に一本化されており（TASK-31・crate-naming.md 決定 6）、本モジュールは 2 つ目の実装・独自の状態型・
-//! シリアライズ処理を持たない。型は core の [`StateRecord`]・[`SupervisionState`]・[`HealthStatus`]・
+//! シリアライズ処理を持たない。型は core の [`StateRecord`]・[`SupervisionState`]・[`HealthStatus`](fandhe_container_core::traits::HealthStatus)・
 //! [`TraitError`] をそのまま使う（ファイル名 `state.rs` は spec の成果物名を維持したもので、中身は配線のみ）。
 //!
 //! 呼び出し元: 監視ループ（`run.rs`。TASK-157.4・#238）が起動時に [`open_default_store`] と

@@ -4,7 +4,7 @@
 //!
 //! - `exec::audit_mount_violation`（Linux のマウント検証層。`IsolationViolation` の写像）と
 //!   `oci_runtime` の `audit_mount_config_error` / `MountDestination::resolve_in_audited`
-//!   （API 層）が、拒否を返す直前に [`deliver`] / [`record_mount_rejection`] を呼ぶ
+//!   （API 層）が、拒否を返す直前に `deliver` / [`record_mount_rejection`] を呼ぶ
 //! - 時刻と PID は拒否を返した直後に同じプロセスで取得する（「拒否と同時」の意味）
 //! - OS 非依存（3 OS でコンパイルされる）
 //!
@@ -17,7 +17,7 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! 永続化は TASK-41.5 系（#839）、本番 launcher・fork 後の子プロセスへの `AuditSink` の引き回しは
+//! ファイル永続化は実装済み（`AuditFileWriter`・#839）。本番 launcher・fork 後の子プロセスへの `AuditSink` の引き回しは
 //! 後続（TASK-29 / TASK-157 系）。現時点で本番経路からは呼ばれない。
 
 use std::path::Path;

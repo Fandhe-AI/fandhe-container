@@ -1,10 +1,28 @@
 # コンテナごとの軽量監視プロセス（restart・healthcheck・exec・logs・stats。crate-naming.md の表 #3）。
 # 雛形は TASK-1.3（#11・REPAIR-1・MS-0）。本体は G12（TASK-157〜171）で実装する。
 # version は未指定（Cargo の既定で 0.0.0）。公開方針は未決定のため publish = false を明記する。
+# TASK-164 追補（#1469）でロックファイルの掃除経路（remove_all・open 失敗時の削除）を追加した（依存は不変）。
 # TASK-157.1（#235・SUP-1）で雛形を確認し、受け入れ基準の照合テスト（tests/skeleton.rs）を追加した。
+# TASK-164.3（#507・SUP-7）でログ sink の書き込みバッファ・flush 制御を追加した（依存の追加なし）。
 # TASK-157.3（#237）で fandhe-container-core への workspace 内 path 依存（supervisor -> core の一方向。
 # crate-naming.md 決定 6）を導入した。状態のファイルベース実装は core に一本化し、supervisor は配線のみを持つ。
 # TASK-157.7（#241）で logs 捕捉の土台（src/logs.rs）を追加した（std のみ。依存は不変）。
+# TASK-168.1（#523）で inspect 出力（src/inspect.rs）を追加した（std のみ。依存は不変）。
+# TASK-168.2（#524）で inspect 出力の型・キー順・値域の照合テストを追加した（依存は不変）。
+# TASK-164.1（#505）で行単位捕捉のバッファ境界跨ぎの照合テストを追加した（依存は不変）。
+# TASK-164.2（#506）でローテーション sink（src/logs/rotating.rs）を追加した（std のみ。依存は不変）。
+# TASK-169.1（#526）で container_options（ulimit の指定モデル。core の rlimits 型へ変換）を追加した（依存は不変）。
+# TASK-169.3（#528）で --ipc の指定モデルと実機前提の結合試験 container_options_ipc を追加した（依存は不変）。
+# TASK-169.4（#529）で container_options::env（env / env ファイルの指定モデル）を追加した（依存は不変）。
+# TASK-169.5.1（#855）で container_options::labels（label の指定モデル。state.json の annotations へ反映）を追加した（依存は不変）。
+# TASK-169.5.2（#856）で ContainerOptions に --shm-size / --tmpfs を結線し全オプション組み合わせの結合テストを追加した（依存は不変）。
+# TASK-169.4.2（#1473）で container_options::secrets（secrets / configs の指定モデル。core の注入仕様型へ変換）を追加した（依存は不変）。
+# TASK-171.1.2（#858）で privilege（権限昇格の必要最小集合と検証。純ロジック・unsafe なし）を追加した（依存は不変）。
+# TASK-164.4（#508）で 100 万行規模の欠落 0・重複 0 の結合テストを追加した（依存は不変）。
+# TASK-163.3（#502）で exec に seccomp / Landlock 再適用の配線を追加した（core の安全 API を呼ぶだけ。依存は不変）。
+# TASK-163.4（#503）で exec にコマンド実行（run_command）と実コンテナへの通し結合試験 tests/exec.rs を追加した（依存は不変）。
+# TASK-163 追補（#1465）で exec::run_command に監査の記録先を必須の引数として追加した（依存は不変）。
+# TASK-164 追補（#1470）で Windows の世代 rename 再試行・ロックファイル ID 照合（src/sys.rs。自前 FFI 宣言）を追加した（依存は不変）。
 # 外部クレート（crates.io）の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 
 [package]
@@ -14,5 +32,86 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+# --ipc=host / shareable の IPC namespace 共有・分離の結合試験（SUP-12・TASK-169.3）。
+# CLONE_NEWUSER はマルチスレッドから EINVAL になるため harness = false（core の unshare_isolation と同じ理由）。
+# `-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
+[[test]]
+name = "container_options_ipc"
+path = "tests/container_options_ipc.rs"
+harness = false
+
 [dependencies]
 fandhe-container-core = { path = "../core" }
+
+# exec-test-support: 実機結合試験（tests/exec_setns_join.rs）専用の入口 `exec::identify_pid1_in`（期待 cgroup
+# パスを呼び出し側から受け取る）を公開する。既定のビルドには含めず、記録から期待値を導く `identify_pid1` だけを
+# 公開 API にする（SEC-1。crates/io の crash-test-server と同じ仕組み。依存は増えない）。core 側の同名 feature
+# （`Pid1Target::open_with_cgroup_path`）を連動して有効にする。
+# worker 機構を任意の `work` で直接呼ぶ `exec::run_in_worker_for_test`（tests/exec_timeout.rs）も同じ feature の下に
+# 置く（TASK-163 追補・#1460）。リリースビルドで有効にするとコンパイルが止まる（src/lib.rs の `compile_error!`）。
+[features]
+exec-test-support = ["fandhe-container-core/exec-test-support"]
+
+# 自己参照の dev-dependency（core の escape-probe と同じ仕組み。外部クレートの追加ではない）: supervisor 自身の
+# テストでは `exec-test-support` を常に有効にし、試験専用の入口を使う結合試験（exec_timeout・exec_setns_join・exec）が
+# `cargo test --workspace`・`make test-integration` の既定のテスト集合から外れないようにする（TASK-163 追補・#1460）。
+# 通常のビルド（`cargo build`・リリース成果物）は dev-dependency を解決しないため、feature は無効のまま。
+[dev-dependencies]
+fandhe-container-supervisor = { path = ".", features = ["exec-test-support"] }
+
+# 実 pid1 の 5 種 namespace への setns 参加の結合試験（TASK-163.1・#500・SUP-6）。
+# setns(CLONE_NEWNS) は複数スレッドのプロセスから拒否されるため、単一スレッドの独自 main（harness = false）で動かす。
+# `-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。本体は exec-test-support feature を付けたときだけ
+# コンパイルする（上の自己参照の dev-dependency で常に有効になる。テスト側の cfg は、feature が外れた構成で
+# 検証せずに成功しないための分岐で、feature なしの `--ignored` 実行は非ゼロ終了にする）。
+[[test]]
+name = "exec_setns_join"
+path = "tests/exec_setns_join.rs"
+harness = false
+
+# 実 cgroup に対する `identify_pid1`（既定ビルドの公開入口）の成功経路・拒否経路の結合試験（TASK-163 追補・#1464・
+# SUP-6・SEC-1）。`DelegatedCgroup::prepare`（自プロセスの退避）と `setns` が単一スレッド・単一プロセスを要するため、
+# 独自 main（harness = false）で動かす。非特権ユーザーに委譲された cgroup v2 サブツリーと非特権 user namespace を
+# 要する実機前提テストで、`-- --ignored` 指定時のみ実行する（AGENTS.md）。`exec-test-support` の入口は使わない。
+[[test]]
+name = "exec_identify_cgroup"
+path = "tests/exec_identify_cgroup.rs"
+harness = false
+
+# 稼働中コンテナへのコマンド実行の通し結合試験（TASK-163.4・#503・SUP-6）。setns は複数スレッドのプロセスから
+# 拒否されるため、単一スレッドの独自 main（harness = false）で動かす。root・委譲 cgroup v2・Landlock・x86_64 を要する
+# 実機前提テストで、`-- --ignored` 指定時のみ実行する（AGENTS.md）。本体は exec-test-support feature を付けたときだけ
+# コンパイルする（exec_setns_join と同じ理由で required-features にしない）。
+[[test]]
+name = "exec"
+path = "tests/exec.rs"
+harness = false
+
+# exec の全体上限時間（worker プロセス隔離）の結合試験（REPAIR-5・TASK-163.4・#503・SUP-6）。fork は単一スレッドの
+# 呼び出し元を要求するため、単一スレッドの独自 main（harness = false）で動かす。root・実コンテナは不要で、
+# 既定のテスト集合で実行する（試験専用の入口 `run_in_worker_for_test` は exec-test-support の下にあり、上の
+# 自己参照の dev-dependency で有効になる。TASK-163 追補・#1460）。
+[[test]]
+name = "exec_timeout"
+path = "tests/exec_timeout.rs"
+harness = false
+
+# exec の対象の拒否が層 exec_target の監査レコードとして 1 拒否 1 件記録されることの結合試験（SEC-4・SUP-6・
+# TASK-163 追補・#1465）。fork は単一スレッドの呼び出し元を要求するため harness = false。root・実コンテナ不要で、
+# 既定のテスト集合で実行する（依存は不変）。
+[[test]]
+name = "exec_audit"
+path = "tests/exec_audit.rs"
+harness = false
+
+# exec の対象を起動時から保持する pidfd で固定する経路の結合試験（SUP-6・SEC-1・CORE-1・TASK-163 追補・#1461）。
+# fork は単一スレッドの呼び出し元を要求するため、単一スレッドの独自 main（harness = false）で動かす。
+# root・実コンテナは不要で、既定のテスト集合で実行する。
+[[test]]
+name = "exec_launch_pidfd"
+path = "tests/exec_launch_pidfd.rs"
+harness = false
+
+# workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
+[lints]
+workspace = true

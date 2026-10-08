@@ -379,6 +379,11 @@ plug4-core-invariance-selftest: ## PLUG-4 判定スクリプトの自己テス�
 cli-parity-selftest: ## CLI 3 OS 比較スクリプトの自己テスト（TASK-125.1・REPAIR-12。スタブ CLI のみ）
 	bash scripts/cli-parity-check-selftest.sh
 
+# commit-msg フックの本文行長検査（Issue #1295）。一時ファイルのみで完結する。make ci には含めない。
+.PHONY: commit-msg-line-length-selftest
+commit-msg-line-length-selftest: ## commit-msg 行長検査スクリプトの自己テスト（Issue #1295・REPAIR-12）
+	bash scripts/check-commit-msg-line-length-selftest.sh
+
 # 実機での記録・突き合わせ（実機前提・make ci 対象外。判定は #661〔TASK-125.h1〕で人間が行う）。
 # CLI/OUTPUT を指定すると capture、BASELINE/CANDIDATE を指定すると compare を実行する。
 # 変数は単一引用符で囲んでシェルへ渡す（fio_bench_sq。値の検証はスクリプト側が担う）。

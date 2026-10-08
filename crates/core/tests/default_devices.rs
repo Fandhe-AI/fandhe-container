@@ -10,7 +10,8 @@
 //!   コード 0 を待つ（REPAIR-5）
 //! - 子（root）: `establish` → `prepare_rootfs` → `create_default_devices` → 再度
 //!   `create_default_devices`（既存ノードは上書きせず `AlreadyPresent`）→ `pivot_root` の後、
-//!   6 種の種別・`rdev`・モードを具体値で照合する
+//!   6 種の種別・`rdev`・モードと、symlink 4 本（#1297。1 回目 `Created`・2 回目 `AlreadyPresent`）の
+//!   参照先を具体値で照合する
 //! - 子（非 root）: 非特権 user namespace では文字デバイスの `mknod(2)` が `EPERM` になるため、
 //!   `PermissionDenied`・段 `CreateDevices` で fail-closed することを照合する
 //!
@@ -45,9 +46,9 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::exec::{
-        DeviceNodeStatus, IsolationConfig, IsolationStage, MountIsolation, Namespace, NamespaceSet,
-        create_default_devices, isolate, isolate_rootful_host_root, pivot_root, plan,
-        plan_rootful_host_root, prepare_rootfs,
+        DeviceLinkStatus, DeviceNodeStatus, IsolationConfig, IsolationStage, MountIsolation,
+        Namespace, NamespaceSet, create_default_devices, isolate, isolate_rootful_host_root,
+        pivot_root, plan, plan_rootful_host_root, prepare_rootfs,
     };
     use fandhe_container_core::traits::types::ErrorCode;
 
@@ -213,6 +214,19 @@ mod linux {
                 .iter()
                 .all(|n| n.status == DeviceNodeStatus::AlreadyPresent)
         );
+        assert_eq!(first.links.len(), 4);
+        assert!(
+            first
+                .links
+                .iter()
+                .all(|l| l.status == DeviceLinkStatus::Created)
+        );
+        assert!(
+            second
+                .links
+                .iter()
+                .all(|l| l.status == DeviceLinkStatus::AlreadyPresent)
+        );
 
         pivot_root(&isolation, prepared).expect("pivot_root");
 
@@ -225,6 +239,19 @@ mod linux {
             );
             assert_eq!(meta.rdev(), makedev(major, minor), "{path} rdev");
             assert_eq!(meta.mode() & 0o7777, 0o666, "{path} mode");
+        }
+        for (name, target) in [
+            ("fd", "/proc/self/fd"),
+            ("stdin", "/proc/self/fd/0"),
+            ("stdout", "/proc/self/fd/1"),
+            ("stderr", "/proc/self/fd/2"),
+        ] {
+            let path = format!("/dev/{name}");
+            assert_eq!(
+                std::fs::read_link(&path).expect("readlink"),
+                std::path::PathBuf::from(target),
+                "{path} target"
+            );
         }
     }
 }

@@ -15,8 +15,9 @@
 //!   状態ストアへ書くため、状態は Created のままでも `state.json` の revision は進む（ファイルは不変ではない）。
 //! - 計測（REPAIR-4）のファイル出力は Linux の x86_64 / aarch64 のみ（`op_log_file`）。本バイナリを
 //!   setuid / setgid・file capability つきで導入しない前提で、権限分離（TASK-171・SUP-14）で見直す。
-//! - macOS / Windows は plugin 発見機構経由（TASK-79.4・PLUG-4）。ここでは core を呼ぶだけで、
-//!   非 Linux では core 側が `Unimplemented` を返す（fail-closed）。
+//! - macOS / Windows は plugin 発見機構経由（TASK-79.4・PLUG-4。`plugin_backend` module）。非 Linux では
+//!   `production_runtime` が状態ストアの代わりに plugin の発見・信頼性検証を試み、現状は必ず fail-closed で
+//!   失敗する（起動と RPC は TASK-114・TASK-125）。
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,7 +27,7 @@ use fandhe_container_core::oci_runtime::{
     LaunchSpec, LaunchedProcess, LifecycleOp, OciRuntimeError, ProcessLauncher, StartTimeouts,
     StartedContainer, create, start,
 };
-use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+use fandhe_container_core::state_store::FileStateStore;
 use fandhe_container_core::traits::{
     ContainerId, CreateRequest, ErrorCode, StartRequest, StateRecord, StateStore, TraitError,
 };
@@ -104,11 +105,7 @@ pub(super) fn production_runtime<R>(
     started: Instant,
     build: impl FnOnce() -> Result<R, TraitError>,
 ) -> Result<(Runtime, R), TraitError> {
-    let prepared = build().and_then(|req| {
-        let root = StateRoot::resolve(global.root.clone())?;
-        let store = FileStateStore::open(root)?;
-        Ok((req, store))
-    });
+    let prepared = build().and_then(|req| Ok((req, open_store(global)?)));
     match prepared {
         Ok((req, store)) => Ok((
             Runtime {
@@ -125,6 +122,20 @@ pub(super) fn production_runtime<R>(
             Err(e)
         }
     }
+}
+
+/// 状態ストアを開く。Linux は core を直接使い、非 Linux は plugin 発見機構経由（TASK-79.4・PLUG-4）で
+/// 解決を試みて、現状は必ず失敗する（`plugin_backend` の未実装範囲を参照。REPAIR-3）。
+#[cfg(target_os = "linux")]
+fn open_store(global: &GlobalArgs) -> Result<FileStateStore, TraitError> {
+    use fandhe_container_core::state_store::StateRoot;
+    let root = StateRoot::resolve(global.root.clone())?;
+    FileStateStore::open(root)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_store(global: &GlobalArgs) -> Result<FileStateStore, TraitError> {
+    Err(super::plugin_backend::unavailable(global))
 }
 
 /// core に到達する前の失敗を操作名 `op_name` の失敗として記録する（REPAIR-4）。
@@ -1248,7 +1259,9 @@ mod tests {
         }
 
         fn runtime(base: &TmpDir, launcher: Arc<dyn ProcessLauncher>) -> Runtime {
-            let root = StateRoot::from_override(base.0.join("state")).expect("root");
+            let root =
+                fandhe_container_core::state_store::StateRoot::from_override(base.0.join("state"))
+                    .expect("root");
             Runtime {
                 store: Box::new(FileStateStore::open(root).expect("open")),
                 launcher,

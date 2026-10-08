@@ -15,7 +15,10 @@
 //! - start の実プロセス起動: supervisor 経由の launcher（TASK-157・TASK-37〜39）。
 //! - stop の猶予 → SIGKILL・本番 signaler / cgroup remover の結線: supervisor 経由（TASK-157）。
 //! - logs の内容読み出し・list の JSON 出力: ログ契約と crate 境界の決定後（`list_logs` module の doc 参照。TASK-95・TASK-98）。
-//! - macOS / Windows は plugin 発見機構経由で呼び、platform-* へは直接依存しない: TASK-79.4（#641・PLUG-4）。
+//! - macOS / Windows は plugin 発見機構経由（TASK-79.4・#641・PLUG-4。`plugin_backend` module）。発見 → 登録 → 信頼性検証までを
+//!   配線済みで、platform-* へは直接依存しない（`make check-cli-backend-deps`）。非 Linux の信頼性検証（PLUG-11）・plugin の
+//!   起動と RPC（TASK-114・TASK-125）は未実装のため、非 Linux の全コマンドは候補なしで `FAILED_PRECONDITION`（5）、
+//!   候補ありでも `UNIMPLEMENTED`（8）か `PERMISSION_DENIED`（6）で fail-closed に失敗する。
 //! - エラー形式（`code` / `message`）の確定: TASK-95（ERR 系）。ここの [`CliExit`] は最小の先取り。
 
 use std::ffi::OsString;
@@ -29,6 +32,7 @@ use fandhe_container_core::traits::ErrorCode;
 mod args;
 mod create_start;
 mod list_logs;
+mod plugin_backend;
 mod stop_delete;
 
 use args::{

@@ -217,6 +217,10 @@ jobs:
       - name: core plugin 無効構成の検証
         shell: bash
         run: make test-core-no-plugin
+      # CLI がバックエンド実装 crate へ直接依存しない（CLI-1・PLUG-4・TASK-79.4）。既存ジョブへのステップ追加
+      - name: cli のバックエンド直接依存なしの検証
+        shell: bash
+        run: make check-cli-backend-deps
 
   # --------------------------------------------------
   # integration-test（REPAIR-7 ステージ 3: タイムアウト保護された結合試験）

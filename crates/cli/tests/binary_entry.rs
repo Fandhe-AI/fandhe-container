@@ -43,6 +43,8 @@ fn run(args: &[&str]) -> Output {
 fn run_env(args: &[&str], envs: &[(&str, &std::ffi::OsStr)]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_fandhe-container"))
         .args(args)
+        // PATH 探索の opt-in を環境から持ち込まず、結果を決定的にする（PLUG-11）。
+        .env_remove("FANDHE_CONTAINER_PLUGIN_PATH_SEARCH")
         .envs(envs.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -390,7 +392,8 @@ fn err2_create_rejects_relative_bundle() {
     );
 }
 
-/// SEC-1: Linux 以外では状態ストアを開けず fail-closed の UNIMPLEMENTED（8）。
+/// SEC-1・PLUG-4: Linux 以外では plugin 発見機構経由になり、候補なし（既定探索先が空）の fail-closed で
+/// FAILED_PRECONDITION（5）。状態ルートは作らない。
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn sec1_create_fails_closed_off_linux() {
@@ -405,12 +408,19 @@ fn sec1_create_fails_closed_off_linux() {
         abs_bundle.to_str().expect("utf8"),
         "c1",
     ]);
-    assert_eq!(out.status.code(), Some(8));
-    assert_eq!(op_and_code(&out), ("create".into(), "UNIMPLEMENTED".into()));
+    assert_eq!(out.status.code(), Some(5));
+    assert_eq!(
+        op_and_code(&out),
+        ("create".into(), "FAILED_PRECONDITION".into())
+    );
     assert!(out.stdout.is_empty());
+    assert!(!root.exists());
+    // 引数不正は plugin 解決より先に 2 で弾く（3 OS 同一）。
+    let out = run(&["create", "--bundle", "relative", "c1"]);
+    assert_eq!(out.status.code(), Some(2));
 }
 
-/// SEC-1: Linux 以外では状態ストアを開けず stop / delete も fail-closed の UNIMPLEMENTED（8）。
+/// SEC-1・PLUG-4: Linux 以外では stop / delete も plugin 候補なしの fail-closed で FAILED_PRECONDITION（5）。
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn sec1_stop_delete_fail_closed_off_linux() {
@@ -418,8 +428,8 @@ fn sec1_stop_delete_fail_closed_off_linux() {
     let root = tmp.0.join("state");
     for (cmd, op) in [("stop", "kill"), ("delete", "delete")] {
         let out = run(&["--root", root.to_str().expect("utf8"), cmd, "c1"]);
-        assert_eq!(out.status.code(), Some(8));
-        assert_eq!(op_and_code(&out), (op.into(), "UNIMPLEMENTED".into()));
+        assert_eq!(out.status.code(), Some(5));
+        assert_eq!(op_and_code(&out), (op.into(), "FAILED_PRECONDITION".into()));
         assert!(out.stdout.is_empty());
     }
 }
@@ -476,7 +486,8 @@ fn cli1_list_logs_flow_on_linux() {
     );
 }
 
-/// SEC-1: Linux 以外では状態ストアを開けず list / logs も fail-closed の UNIMPLEMENTED（8）。
+/// SEC-1・PLUG-4: Linux 以外では list / logs も plugin 候補なしの fail-closed で FAILED_PRECONDITION（5）。
+/// logs の ID 不正は plugin 解決より先に 2 で弾く。
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn sec1_list_logs_fail_closed_off_linux() {
@@ -488,11 +499,13 @@ fn sec1_list_logs_fail_closed_off_linux() {
         &["--root", root_s, "logs", "c1"],
     ] {
         let out = run(args);
-        assert_eq!(out.status.code(), Some(8));
+        assert_eq!(out.status.code(), Some(5));
         assert_eq!(
             String::from_utf8_lossy(&out.stderr),
-            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"not implemented on this platform\"}\n"
+            "{\"code\":\"FAILED_PRECONDITION\",\"message\":\"failed precondition\"}\n"
         );
         assert!(out.stdout.is_empty());
     }
+    let out = run(&["--root", root_s, "logs", "bad/id"]);
+    assert_eq!(out.status.code(), Some(2));
 }

@@ -121,7 +121,11 @@ cat >>"$stub" <<'STUB'
 #     以後の state が NOT_FOUND に加えて自由文・不正な JSON・code が文字列でない行を返す
 #   create-fail-nf-badmsg: create 未作成で失敗し、以後の state が message が文字列でない
 #     NOT_FOUND を返す
-#   start-fail / start-hang / start-flood: start が失敗 / ハング / 大量出力
+#   start-fail / start-hang / start-flood: start が失敗 / ハング / 無限の大量出力
+#               （start-flood は delete 時に、収集プロセスが記録した start ログの大きさを
+#                $STUB_STATE/flood-size へ残す）
+#   fsize-probe: create が自身の RLIMIT_FSIZE（ulimit -f）を $STUB_STATE/fsize へ記録し、
+#                継承したログへ 2 MiB を書いて、その終了ステータスを $STUB_STATE/flood-rc へ記録する
 #   delete-fail: 計測は成功するが delete が常に失敗
 #   exec-delayed: start 後の state が created を 2 回返してから stopped
 #   exec-never: start 後の state が created のまま
@@ -134,6 +138,8 @@ cat >>"$stub" <<'STUB'
 #   exec-after-1s: start 後 1 秒間は state が即座に created を返し、その後 running を返す
 #   log-holder: create・start・delete がそれぞれ、ログ（stdout / stderr）を開いたまま 3 秒残る
 #               子プロセスを起こしてから正常終了する（子の PID を $STUB_STATE/holders に記録）
+#   state-pad: create 後の state が有効な JSON の後に 1.1 MiB の空白を出す（ログ上限で切り詰められる）
+#   holder-long: create が 20 秒残る子プロセスにログを継承させ、delete が常に失敗する
 #   id-in-use: create 前から同じ ID のコンテナが存在する
 mode="${STUB_MODE:-ok}"
 cmd="$1"
@@ -149,6 +155,17 @@ if [ "$mode" = log-holder ] && { [ "$cmd" = create ] || [ "$cmd" = start ] || [ 
   echo "$!" >>"$STUB_STATE/holders"
 fi
 m="$STUB_STATE/$id"
+if [ "$mode" = holder-long ] && [ "$cmd" = create ]; then
+  sleep 20 &
+  echo "$!" >>"$STUB_STATE/holders"
+fi
+# create 前の事前確認（不存在応答）は通常経路に任せ、create 後の state だけを切り詰め対象にする。
+# 切り詰め後に残る先頭は単一の有効な state JSON なので、log_truncated を無視すると受理されてしまう。
+if [ "$mode" = state-pad ] && [ "$cmd" = state ] && [ -e "$m.bundle" ]; then
+  printf '{"ociVersion":"1.0.2","id":"%s","status":"stopped","pid":0,"bundle":"/x"}\n' "$id"
+  head -c 1153434 /dev/zero | tr '\0' ' '
+  exit 0
+fi
 # bundle は create が受け取った --bundle を返す（OCI state の bundle は絶対パス）。
 state_json() {
   printf '{"ociVersion":"1.0.2","id":"%s","status":"%s","pid":0,"bundle":"%s"}\n' \
@@ -201,6 +218,12 @@ case "$cmd" in
       create-fail-delete-fail) touch "$m.created"; echo "stub: create failed" >&2; exit 1 ;;
     esac
     touch "$m.created"
+    if [ "$mode" = fsize-probe ]; then
+      ulimit -f >"$STUB_STATE/fsize"
+      rc=0
+      head -c 2097152 /dev/zero || rc=$?
+      echo "$rc" >"$STUB_STATE/flood-rc"
+    fi
     ;;
   start)
     [ -e "$m.created" ] || not_exist
@@ -263,7 +286,7 @@ case "$cmd" in
     [ -e "$m.created" ] || not_exist
     case "$mode" in
       cleanup-hang) exec sleep 30 ;;
-      delete-fail | create-fail-delete-fail) echo "stub: delete failed" >&2; exit 1 ;;
+      delete-fail | holder-long | create-fail-delete-fail) echo "stub: delete failed" >&2; exit 1 ;;
       never-stops) [ -e "$m.started" ] && { echo "stub: cannot delete running container" >&2; exit 1; } ;;
       running-race)
         if [ -e "$m.started" ]; then
@@ -274,6 +297,9 @@ case "$cmd" in
         fi
         ;;
     esac
+    if [ "$mode" = start-flood ]; then
+      cat "$TMPDIR"/*/start-*.log 2>/dev/null | wc -c >"$STUB_STATE/flood-size"
+    fi
     rm -f -- "$m".*
     ;;
 esac
@@ -388,6 +414,7 @@ expect_eq "output-fifo-race-no-staging" "" "$(find "$work" -maxdepth 1 -name '.s
 mkdir -p "$work/faildd" "$work/partial"
 cat >"$work/faildd/dd" <<'FAILDD'
 #!/usr/bin/env bash
+for a in "$@"; do case "$a" in iflag=count_bytes) exec "$(PATH=/usr/bin:/bin command -v dd)" "$@" ;; esac; done
 for a in "$@"; do
   case "$a" in of=*) printf '{"partial' >"${a#of=}" ;; esac
 done
@@ -590,10 +617,114 @@ elapsed=$((SECONDS - started))
 if [ "$elapsed" -lt 15 ]; then pass "start-hang-elapsed (${elapsed}s < 15s)"; else fail "start-hang-elapsed (${elapsed}s)"; fi
 if grep -q '^delete ' "$stub_log"; then pass "start-hang-delete-called"; else fail "start-hang-delete-called"; fi
 
-# --- 7b. ログ出力の無制限書き込み（ulimit -f 上限超過）は計測失敗になる ---
+# --- 7b. ログ出力の無制限書き込み: 書き手は止めず、収集側が先頭 LOG_MAX_KIB（1024 KiB）だけを記録する
+#         （ランタイムに rlimit を掛けない）。書き手は --timeout で打ち切られ計測失敗（exit 1） ---
 reset_log
-STUB_MODE=start-flood expect_rc "start-flood" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 5
+flood_tmp="$work/flood-tmp"
+mkdir -p "$flood_tmp"
+started="$SECONDS"
+TMPDIR="$flood_tmp" STUB_MODE=start-flood expect_rc "start-flood" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1
+elapsed=$((SECONDS - started))
+if [ "$elapsed" -lt 15 ]; then pass "start-flood-elapsed (${elapsed}s < 15s)"; else fail "start-flood-elapsed (${elapsed}s)"; fi
 if grep -q '^delete ' "$stub_log"; then pass "start-flood-delete-called"; else fail "start-flood-delete-called"; fi
+expect_contains "start-flood-truncated-warning" "runtime-log-truncated: start-1.log limit_kib=1024"
+expect_eq "start-flood-log-size" "1048576" "$(tr -d ' \n' <"$stub_state/flood-size" 2>/dev/null)"
+
+# --- 7c. ランタイムとその子孫は RLIMIT_FSIZE を継承しない（ulimit -f を掛けない） ---
+reset_log
+STUB_MODE=fsize-probe expect_rc "fsize-probe" 0 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
+expect_eq "fsize-not-inherited" "$(ulimit -f)" "$(cat "$stub_state/fsize" 2>/dev/null)"
+expect_eq "fsize-flood-rc" "0" "$(cat "$stub_state/flood-rc" 2>/dev/null)"
+
+# --- 7c2. 切り詰められた state 応答は有効な単一 JSON として受理しない（状態不明で計測失敗） ---
+reset_log
+pad_tmp="$work/pad-tmp"
+mkdir -p "$pad_tmp"
+TMPDIR="$pad_tmp" STUB_MODE=state-pad expect_rc "state-truncated-rejected" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 3
+
+# --- 7c4. 子孫への KILL は起動時刻が列挙時と一致するときだけ送る（PID 再利用・同一性不明では送らない） ---
+fn_src="$(sed -n '/^proc_starttime() {/,/^}/p;/^kill_if_same() {/,/^}/p' "$target_script")"
+# 生存の判定はゾンビ（kill 済みで wait 前）を生存とみなさない /proc の状態で行う（kill -0 はゾンビにも成功する）。
+proc_alive() {
+  local line st
+  { read -r line </proc/"$1"/stat; } 2>/dev/null || return 1
+  st="${line##*) }"
+  [ "${st%% *}" != "Z" ]
+}
+sleep 600 &
+victim="$!"
+real_st="$(bash -c "$fn_src"$'\n'"proc_starttime $victim")"
+if [ -n "$real_st" ]; then pass "proc-starttime-readable"; else fail "proc-starttime-readable"; fi
+bash -c "$fn_src"$'\n'"kill_if_same $victim:$((real_st + 1))"
+if proc_alive "$victim"; then pass "kill-skipped-on-starttime-mismatch"; else fail "kill-skipped-on-starttime-mismatch"; fi
+bash -c "$fn_src"$'\n'"kill_if_same $victim"
+if proc_alive "$victim"; then pass "kill-skipped-without-starttime"; else fail "kill-skipped-without-starttime"; fi
+bash -c "$fn_src"$'\n'"kill_if_same $victim:"
+if proc_alive "$victim"; then pass "kill-skipped-with-empty-starttime"; else fail "kill-skipped-with-empty-starttime"; fi
+bash -c "$fn_src"$'\n'"kill_if_same $victim:$real_st"
+# SIGKILL で終了した子の wait ステータスは 137。自然終了や未送信では 137 にならない。
+victim_rc=0
+wait "$victim" 2>/dev/null || victim_rc=$?
+expect_eq "kill-sent-on-starttime-match" "137" "$victim_rc"
+
+# --- 7c3. 後始末は収集プロセスの子孫（読み取り中の dd / wc）も回収する ---
+reset_log
+hold_tmp="$work/hold-tmp"
+mkdir -p "$hold_tmp"
+rm -f "$stub_state/holders"
+TMPDIR="$hold_tmp" STUB_MODE=holder-long "$bash_bin" "$target_script" --target own --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1 >/dev/null 2>&1 || true
+left=0
+for p in $(pgrep -x dd 2>/dev/null); do
+  case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in *"of=$hold_tmp"/*) left=$((left + 1)) ;; esac
+done
+expect_eq "collector-descendants-reaped" "0" "$left"
+if [ -r "$stub_state/holders" ]; then
+  # shellcheck disable=SC2046
+  kill $(cat "$stub_state/holders") 2>/dev/null || true
+fi
+
+# --- 7d. 後始末中の 2 回目のシグナルで後始末が中断されない（終了コード 4 を保つ） ---
+for sig in INT TERM HUP; do
+  reset_log
+  started="$SECONDS"
+  STARTUP_LATENCY_TEST_SIGNAL_IN_CLEANUP="$sig" STUB_MODE=never-stops expect_rc "signal-in-cleanup-$sig" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1
+  elapsed=$((SECONDS - started))
+  if [ "$elapsed" -lt 15 ]; then pass "signal-in-cleanup-$sig-bounded (${elapsed}s < 15s)"; else fail "signal-in-cleanup-$sig-bounded (${elapsed}s)"; fi
+  expect_contains "signal-in-cleanup-$sig-leftover-id" "containers left behind: fandhe-startup-"
+done
+
+# --- 7e. 計測中の HUP でも後始末が走り、最初のシグナルの終了コード 129 を返す ---
+# 対象を背景で起動し、start 後の state ポーリング区間（exec-after-1s は約 1 秒続く）で HUP を送る。
+# 引数: <名前> <後始末中に送る 2 回目のシグナル（空なら送らない）>
+run_hup_case() {
+  local name="$1" second="$2" i=0 bg_pid rc=0 t0 ms
+  reset_log
+  t0="${EPOCHREALTIME/./}"
+  STARTUP_LATENCY_TEST_SIGNAL_IN_CLEANUP="$second" STUB_MODE=exec-after-1s \
+    "$bash_bin" "$target_script" "${default_args[@]}" --runtime "$stub" --bundle "$work/bundle" \
+    --iterations 1 --warmup 0 --timeout 3 >"$tmp_root/bg.out" 2>"$tmp_root/bg.err" </dev/null &
+  bg_pid=$!
+  while ! grep -q '^start ' "$stub_log" && [ "$i" -lt 100 ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  if ! grep -q '^start ' "$stub_log"; then
+    fail "$name (start was not observed)"
+  fi
+  kill -HUP "$bg_pid" 2>/dev/null || true
+  wait "$bg_pid" || rc=$?
+  ms=$(((${EPOCHREALTIME/./} - t0) / 1000))
+  last_output="$(cat "$tmp_root/bg.out")"$'\n'"$(cat "$tmp_root/bg.err")"
+  expect_eq "$name-rc" "129" "$rc"
+  expect_eq "$name-stdout-empty" "" "$(cat "$tmp_root/bg.out")"
+  expect_contains "$name-interrupted" "interrupted"
+  if grep -q '^delete ' "$stub_log"; then pass "$name-delete-called"; else fail "$name-delete-called"; fi
+  expect_eq "$name-no-container-left" "" "$(ls -A "$stub_state")"
+  if [ "$ms" -lt 6000 ]; then pass "$name-bounded (${ms}ms < 6000ms)"; else fail "$name-bounded (${ms}ms)"; fi
+}
+run_hup_case "hup-cleanup" ""
+# 残存なしで後始末中に INT が重なっても、最初のシグナル（HUP=129）の終了コードを返す。
+run_hup_case "hup-then-int-in-cleanup" "INT"
 
 # --- 8. delete 失敗: 計測成功でも exit 4、残存 ID を出力 ---
 reset_log
@@ -872,6 +1003,14 @@ reset_dlog
 DSTUB_MODE=leftover-after-rm expect_rc "docker-leftover-after-rm" 0 --runtime "$dstub" --iterations 1 --warmup 0
 expect_eq "docker-leftover-after-rm-rm" "rm -f $(printf '%064x' 1)" "$(grep '^rm ' "$dstub_log")"
 expect_eq "docker-leftover-after-rm-cleaned" "" "$(find "$dstub_state/containers" -type f -print)"
+
+# 収集の書き込み失敗（ENOSPC 相当）で一覧が空になっても「コンテナなし」と確定しない（fail-closed）。
+# コンテナは残っているので、成功（0）にせず残存として exit 4 にする。
+reset_dlog
+STARTUP_LATENCY_TEST_COLLECT_FULL=list.out DSTUB_MODE=rm-fail expect_rc "docker-list-write-fail" 4 --runtime "$dstub" --iterations 1 --warmup 0 --timeout 1
+expect_contains "docker-list-write-fail-leftover" "containers left behind: $(printf '%064x' 1)"
+reset_dlog
+STARTUP_LATENCY_TEST_COLLECT_FULL=list.out DSTUB_MODE=leftover-after-rm expect_rc "docker-list-write-fail-leftover-after-rm" 4 --runtime "$dstub" --iterations 1 --warmup 0 --timeout 1
 
 # --- D4. 入力エラー（exit 2） ---
 reset_dlog

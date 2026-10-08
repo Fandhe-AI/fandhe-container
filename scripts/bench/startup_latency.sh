@@ -86,7 +86,15 @@
 #
 # セキュリティ: 引数は許可リストで検証し、ランタイムは配列で直接 exec する（eval・
 # sh -c・文字列連結なし）。sudo は内部で呼ばない（root を要する実測は人間が明示実行する）。
-# 各ランタイム呼び出しは timeout で上限を掛け、ログ出力量にも上限（ulimit -f）を掛ける。
+# 各ランタイム呼び出しは timeout で上限を掛ける。ログ出力量の上限は収集側（本スクリプトの
+# 直接の子の収集プロセスが先頭 LOG_MAX_KIB KiB だけ記録し、超過分は読み捨てる）で掛け、
+# ランタイムとその子孫（コンテナのワークロード）には rlimit を一切掛けない（RLIMIT_FSIZE は
+# exec で継承され、ワークロードの書き込みが失敗して計測条件が変わるため）。
+# 後始末（EXIT・INT・TERM・HUP で起動）の間は INT・TERM・HUP を無処理にして後始末を最後まで
+# 行う。終了コードは後始末の後に決め、残存があれば 4 を優先し、なければ最初に受けた
+# シグナルの 128+N（INT=130・TERM=143・HUP=129）を返す。bash は前景の子（timeout＋ランタイム）が
+# 戻るまで trap を実行しないため、1 回目のシグナルは進行中のランタイム呼び出しが戻ってから効く
+# （最大で期限まで。背景起動＋wait による即応化は範囲外）。
 # 実行開始の観測と後始末は、複数回の呼び出し・待機をまとめて --timeout 秒の期限で縛る
 # （後始末の delete 再試行には回数の上限も設ける。REPAIR-5）。
 # docker モードの後始末は「所有の証明」で分ける。今回の docker client が cidfile に書いた
@@ -108,9 +116,14 @@ readonly EXIT_CLEANUP=4
 readonly KILL_AFTER_SECS=5
 # 失敗時に stderr へ出すログ末尾の行数上限。
 readonly LOG_TAIL_LINES=20
-# ランタイム 1 呼び出しがログファイルへ書ける最大サイズ（KiB。ulimit -f の単位）。
-# 超過した呼び出しは SIGXFSZ で打ち切られ計測失敗になる（ディスク枯渇防止。REPAIR-5）。
+# 収集プロセスがランタイム 1 呼び出しあたりログファイルへ記録する最大サイズ（KiB）。
+# 超過分は読み捨てる（ディスク枯渇防止。REPAIR-5）。書き手は止めない。
 readonly LOG_MAX_KIB=1024
+# 状態・一覧など出力を解析する呼び出しの後に、その出力の収集プロセスの終了を待つ上限（マイクロ秒）。
+# 超えたら出力が不完全になり得るので、その呼び出しを失敗として扱う（fail-closed）。
+readonly LOG_FLUSH_WAIT_US=200000
+# 後始末で収集プロセスの自然終了を待つ上限（マイクロ秒）。超えたら SIGKILL で回収する。
+readonly LOG_REAP_WAIT_US=500000
 # start 復帰後に state で実行開始（running / stopped）を観測する照会の間隔（秒）。
 # 打ち切りは --timeout 秒の観測期限だけで判定し（REPAIR-5）、照会回数は間隔により
 # 期限 / 間隔 程度に収まる。観測点の上側推定は最大でこの間隔＋state 1 回分だけ遅れる。
@@ -430,22 +443,119 @@ rt_deadline_us=""
 # query_state の結果（終了コード・status）。
 state_rc=0
 state_status=""
+# run_rt が起動した収集プロセスの pid（全件は cleanup が回収する。直前の 1 呼び出し分は flush_last_call が待つ）。
+collector_pids=()
+last_collector_pids=()
+# query_state で state の復帰直後（収集の完了待ちの前）に取った時刻。実行開始の観測点に使う。
+state_wall_us=0
+state_mono_us=0
 
-# ランタイム呼び出し本体。stdout/stderr はファイルへ逃がす（コンテナ側がパイプを
-# 保持して create が戻らないランタイムへの対策）。stdin は /dev/null。
-# 待つのは timeout（直接の子）の終了だけで、ランタイムの子孫がログファイルを開いたまま
-# 残っても EOF や子孫の終了は待たない（パイプ・コマンド置換で出力を受けない）。期限切れ時は
-# GNU timeout が自身のプロセスグループ（ランタイムと、別グループへ移っていない子孫）へ
-# シグナルを送る。create が起動したコンテナのプロセスの後始末は delete / kill が担う。
+# 収集プロセス（run_rt が起動する、本スクリプトの直接の子）。ランタイムの出力をパイプで受け、
+# 先頭 LOG_MAX_KIB KiB だけをファイルへ書き、残りは EOF まで読み捨てる。書き手（ランタイムと
+# コンテナのワークロード）の書き込みを止めず SIGPIPE も起こさないので、ランタイム側に rlimit
+# （RLIMIT_FSIZE）を掛ける必要がない。端末の Ctrl+C・外側 timeout のプロセスグループ宛て
+# シグナルで死ぬとワークロードが SIGPIPE を受けるため INT / TERM / HUP は無視する
+# （GNU timeout は自身のプロセスグループを作るので、期限切れのシグナルの対象にもならない）。
+# 超過時は stderr へ警告を 1 行出す。引数: <記録先ファイル>
+log_collect() {
+  trap '' INT TERM HUP
+  local extra dd_target="$1" ok=1
+  # 自己テストだけが、指定ファイル名の記録先を /dev/full へ差し替えて ENOSPC を再現する。
+  [ -n "${STARTUP_LATENCY_TEST_COLLECT_FULL:-}" ] && [ "${1##*/}" = "$STARTUP_LATENCY_TEST_COLLECT_FULL" ] && dd_target=/dev/full
+  # dd は読めた分をその都度 write するので、書き手が EOF にならなくても到着済みの出力をファイルで読める
+  # （head -c は stdout を stdio 経由でバッファし、終了時まで書き出さない。REPAIR-4）。
+  # 書き込み失敗（ENOSPC 等）は完了目印を置かないことで親へ伝える（log_incomplete。fail-closed）。
+  dd of="$dd_target" bs=4096 iflag=count_bytes count="$((LOG_MAX_KIB * 1024))" status=none 2>/dev/null || ok=0
+  extra="$(wc -c)" || extra=0
+  extra="${extra//[!0-9]/}"
+  if [ "${extra:-0}" -gt 0 ]; then
+    # 解析側が不完全な出力を受理しないよう、切り詰めた事実を目印ファイルで親へ伝える（log_truncated）。
+    : >"$1.truncated" 2>/dev/null || ok=0
+    echo "warning: runtime-log-truncated: ${1##*/} limit_kib=$LOG_MAX_KIB" >&2
+  fi
+  # 完了目印は記録に成功したときだけ置く。置けなければ未完了として扱われる。
+  if [ "$ok" -eq 1 ]; then : >"$1.done" 2>/dev/null || true; fi
+}
+
+# 記録先ファイルの収集が正常に完了していないか（書き込み失敗・収集プロセスの異常終了・未終了）。
+# 解析する呼び出しは flush_last_call の後にこれを見て、完了目印がなければ出力を受理しない
+# （空に見える出力を「正常な空」と誤認して不存在を確定しない。fail-closed）。引数: <記録先ファイル>
+log_incomplete() {
+  [ ! -e "$1.done" ]
+}
+
+# 記録先ファイルが上限超過で切り詰められたか（log_collect が置く目印）。解析する呼び出しだけが
+# 参照し、切り詰められた出力は判定不能として扱う（診断用ログの読み捨ては維持する）。引数: <記録先ファイル>
+log_truncated() {
+  [ -e "$1.truncated" ]
+}
+
+# pid が本スクリプトの生きている直接の子か（pid の再利用による誤爆を避けるため /proc の親 pid で確かめる）。
+child_alive() {
+  local line st ppid
+  { read -r line </proc/"$1"/stat; } 2>/dev/null || return 1
+  read -r st ppid _ <<<"${line##*) }"
+  [ "$ppid" = "$$" ] && [ "$st" != "Z" ]
+}
+
+# 引数の pid がすべて終了するのを最大 <budget_us> 待つ（時計に依存せず、回数で上限を掛ける）。
+# 終了していれば 0、時間切れなら 1。引数: <budget_us> <pid...>
+wait_children() {
+  local budget="$1" p alive spins=0 sleeps
+  shift
+  [ "$#" -gt 0 ] || return 0
+  [ "$budget" -gt 0 ] || budget=0
+  sleeps=$((budget / 5000))
+  while :; do
+    alive=0
+    for p in "$@"; do
+      if child_alive "$p"; then alive=1; break; fi
+    done
+    [ "$alive" -eq 0 ] && return 0
+    # 最初の数百回は組み込みだけで確認し、起動直後の終了を待つために fork しない。
+    if [ "$spins" -lt 300 ]; then
+      spins=$((spins + 1))
+      continue
+    fi
+    [ "$sleeps" -gt 0 ] || return 1
+    sleeps=$((sleeps - 1))
+    sleep 0.005
+  done
+}
+
+# 直前の run_rt の収集プロセスの終了を待つ。出力を解析する呼び出しの直後にだけ使う。
+# 待機の上限は LOG_FLUSH_WAIT_US と、期限（rt_deadline_us）までの残りの小さい方。
+# create / start / delete 等の直後には使わない: runc 系の create は init がランタイムの stdio を
+# 保持するため収集プロセスがコンテナの終了まで EOF にならず、待つと create_us が待機上限分だけ
+# 水増しされる（それらの出力は失敗時の診断にしか使わない）。
+flush_last_call() {
+  local budget="$LOG_FLUSH_WAIT_US" rem
+  if [ -n "$rt_deadline_us" ]; then
+    rem=$((rt_deadline_us - $(mono_us)))
+    [ "$rem" -lt "$budget" ] && budget="$rem"
+  fi
+  wait_children "$budget" "${last_collector_pids[@]}"
+}
+
+# ランタイム呼び出し本体。stdout/stderr は収集プロセス（log_collect）経由でファイルへ記録する
+# （コンテナ側がパイプを保持して create が戻らないランタイムへの対策。ログ量は収集側で制限）。
+# stdin は /dev/null。待つのは timeout（直接の子）の終了だけで、ランタイムの子孫が出力を開いたまま
+# 残っても EOF や子孫の終了は待たない（出力が必要な呼び出しだけ flush_last_call で待つ）。
+# 期限切れ時は GNU timeout が自身のプロセスグループ（ランタイムと、別グループへ移っていない
+# 子孫）へシグナルを送る。create が起動したコンテナのプロセスの後始末は delete / kill が担う。
 # 引数: <stdout ファイル> <stderr ファイル（stdout と同じパスなら併合）> <ランタイム引数...>
 # 時間上限: 通常は 1 呼び出しにつき --timeout 秒（TERM 後の KILL 猶予 KILL_AFTER_SECS 秒）。
 # rt_deadline_us が設定されている間（実行開始の観測中・後始末中）は、TERM までの時間と KILL 猶予の合計が
 # 期限までの残り時間に収まるよう配分し、残りが MIN_CALL_BUDGET_US 未満なら呼ばずに
-# 124（timeout と同じ値）を返す。
+# 124（timeout と同じ値）を返す。収集プロセスは cleanup が回収する（collector_pids）。
+# 計測区間への影響: 収集プロセスの fork は計時点の内側で行われ、oci・docker の両モードに
+# 一律に上乗せされる（process substitution の fork 1〜2 回分）。
 run_rt() {
   local out="$1" errf="$2"
   shift 2
-  local status=0 limit="$timeout_secs" grace="$KILL_AFTER_SECS"
+  local status=0 limit="$timeout_secs" grace="$KILL_AFTER_SECS" ofd efd
+  last_collector_pids=()
+  rm -f -- "$out.truncated" "$errf.truncated" "$out.done" "$errf.done"
   if [ -n "$rt_deadline_us" ]; then
     local rem g
     rem=$((rt_deadline_us - $(mono_us)))
@@ -459,15 +569,19 @@ run_rt() {
     limit="$(us_to_secs $((rem - g)))"
     grace="$(us_to_secs "$g")"
   fi
-  # サブシェルで ulimit -f を掛け、出力量が上限を超えたら SIGXFSZ で失敗させる
-  # （--timeout は出力量を制限しないため）。上限はサブシェル内に閉じる。
-  (
-    ulimit -f "$LOG_MAX_KIB"
-    if [ "$out" = "$errf" ]; then
-      exec timeout --kill-after="$grace" "$limit" "$runtime" "$@" </dev/null >"$out" 2>&1
-    fi
-    exec timeout --kill-after="$grace" "$limit" "$runtime" "$@" </dev/null >"$out" 2>"$errf"
-  ) || status=$?
+  exec {ofd}> >(log_collect "$out" >/dev/null)
+  last_collector_pids+=("$!")
+  collector_pids+=("$!")
+  if [ "$out" = "$errf" ]; then
+    timeout --kill-after="$grace" "$limit" "$runtime" "$@" </dev/null >&"$ofd" 2>&1 {ofd}>&- || status=$?
+  else
+    exec {efd}> >(log_collect "$errf" >/dev/null)
+    last_collector_pids+=("$!")
+    collector_pids+=("$!")
+    timeout --kill-after="$grace" "$limit" "$runtime" "$@" </dev/null >&"$ofd" 2>&"$efd" {ofd}>&- {efd}>&- || status=$?
+    exec {efd}>&-
+  fi
+  exec {ofd}>&-
   return "$status"
 }
 
@@ -514,6 +628,18 @@ query_state() {
   local id="$1" out="$tmpdir/state.out"
   state_rc=0
   rt_state "$out" "$tmpdir/state.err" "$id" || state_rc=$?
+  # 観測点は state の復帰直後に取る（下の収集の完了待ちを区間に含めない）。
+  state_wall_us="$(wall_us)"
+  state_mono_us="$(mono_us)"
+  # 出力（stdout の JSON と、不存在判定に使う stderr）を読む前に収集の完了を待つ。上限内に
+  # 終わらなければ出力が不完全になり得るので失敗として扱う（fail-closed。124 は維持する）。
+  if ! flush_last_call && [ "$state_rc" -ne 124 ]; then
+    state_rc=125
+  fi
+  # 切り詰められた応答は不完全なので解析しない（先頭が有効でも後続が捨てられている）。
+  if { log_truncated "$out" || log_incomplete "$out" || log_incomplete "$tmpdir/state.err"; } && [ "$state_rc" -ne 124 ]; then
+    state_rc=125
+  fi
   state_status=""
   if [ "$state_rc" -eq 0 ]; then
     state_status="$(jq -rs --arg id "$id" \
@@ -531,6 +657,8 @@ is_runtime_error() {
 # 直前の query_state が明確な不存在応答だったか（ランタイム自身のエラー終了かつ
 # rt_is_not_found）。タイムアウト・権限エラー・自由文だけのエラーは不明として偽になる。
 state_not_found() {
+  # stderr が切り詰められていれば NOT_FOUND の後ろの別エラーが捨てられ得るので不明とする。
+  ! log_truncated "$tmpdir/state.err" || return 1
   is_runtime_error "$state_rc" && rt_is_not_found "$tmpdir/state.err"
 }
 
@@ -630,7 +758,13 @@ list_run_containers() {
   local out="$tmpdir/list.out" line rc=0
   listed_ids=()
   dk_list_by_label "$out" "$tmpdir/list.err" || rc=$?
+  # 出力を読む前に収集の完了を待つ（上限内に終わらなければ不完全として失敗。fail-closed）。
+  flush_last_call || return 1
   [ "$rc" -eq 0 ] || return 1
+  # 切り詰められた一覧は不完全（未作成を誤って確定し得る）なので失敗として扱う。
+  ! log_truncated "$out" || return 1
+  # 記録に失敗した（ENOSPC 等）出力は空でも「コンテナなし」を意味しない。
+  ! log_incomplete "$out" || return 1
   while IFS= read -r line || [ -n "$line" ]; do
     [ -z "$line" ] && continue
     [[ "$line" =~ ^[0-9a-f]{64}$ ]] || return 1
@@ -697,11 +831,100 @@ finish_container_docker_within_deadline() {
   return 1
 }
 
-# EXIT / INT / TERM で呼ばれる後始末。未削除のコンテナを削除し、一時ディレクトリを消す。
-# 後始末に失敗した場合は他の終了コードより優先して exit 4 にする。
+# pid の起動時刻（/proc/<pid>/stat の starttime。clock tick 単位）を標準出力へ出す。読めなければ
+# 非 0 で何も出さない。stat の comm 欄は空白や ')' を含み得るため、最後の ') ' より後ろで区切る
+# （その後ろの先頭が state=3 欄目なので starttime=22 欄目は 20 番目）。引数: <pid>
+proc_starttime() {
+  local line rest
+  { read -r line <"/proc/$1/stat"; } 2>/dev/null || return 1
+  rest="${line##*) }"
+  # shellcheck disable=SC2086
+  set -- $rest
+  [ -n "${20:-}" ] || return 1
+  echo "${20}"
+}
+
+# pid の起動時刻が列挙時のもの（<pid>:<starttime> 形式の引数）と一致するときだけ SIGKILL を送る。
+# 列挙後に pid が終了して再利用された場合や、起動時刻を確認できない場合は何も送らない（無関係な
+# プロセスを kill しない）。引数: <pid:starttime>
+kill_if_same() {
+  local p="${1%%:*}" st="${1#*:}" now
+  case "$p" in '' | *[!0-9]*) return 0 ;; esac
+  { [ -n "$st" ] && [ "$st" != "$1" ]; } || return 0
+  now="$(proc_starttime "$p")" || return 0
+  [ "$now" = "$st" ] || return 0
+  kill -KILL "$p" 2>/dev/null || true
+}
+
+# pid の子孫（再帰）を /proc の親 pid から列挙して標準出力へ 1 行 1 件（<pid>:<starttime>）で出す。
+# 収集プロセスは dd / wc（コマンド置換内）を子に持つので、親を殺す前に列挙する。起動時刻は
+# kill_if_same が送信直前に照合する。引数: <pid>
+descendant_pids() {
+  local f line ppid p q rest
+  local -a pids=() ppids=() starts=() queue=("$1")
+  for f in /proc/[0-9]*/stat; do
+    { read -r line <"$f"; } 2>/dev/null || continue
+    p="${f#/proc/}"
+    p="${p%/stat}"
+    rest="${line##*) }"
+    # shellcheck disable=SC2086
+    set -- $rest
+    [ -n "${20:-}" ] || continue
+    pids+=("$p")
+    ppids+=("$2")
+    starts+=("${20}")
+  done
+  while [ "${#queue[@]}" -gt 0 ]; do
+    q="${queue[0]}"
+    queue=("${queue[@]:1}")
+    for f in "${!pids[@]}"; do
+      if [ "${ppids[$f]}" = "$q" ]; then
+        echo "${pids[$f]}:${starts[$f]}"
+        queue+=("${pids[$f]}")
+      fi
+    done
+  done
+}
+
+# 収集プロセスを回収する。コンテナの処理を終えた後（削除済みなら出力の書き手が閉じて自然に
+# 終わる）に呼び、LOG_REAP_WAIT_US 待って残るものを SIGKILL する。コンテナの削除前には
+# 呼ばない（ワークロードが SIGPIPE を受けるため）。pid は child_alive で自分の子と確かめてから
+# 送る。残存は終了コードに影響させない（計測対象ではなく、本スクリプトの直接の子のため）。
+reap_collectors() {
+  local p
+  [ "${#collector_pids[@]}" -gt 0 ] || return 0
+  wait_children "$LOG_REAP_WAIT_US" "${collector_pids[@]}" || true
+  for p in "${collector_pids[@]}"; do
+    if child_alive "$p"; then
+      # 子孫（読み取り中の dd / wc）は親の死後に孤児として残るので、先に列挙してから親→子孫の順に KILL する。
+      local desc d
+      desc="$(descendant_pids "$p")"
+      kill -KILL "$p" 2>/dev/null || true
+      for d in $desc; do
+        kill_if_same "$d"
+      done
+    fi
+  done
+  wait "${collector_pids[@]}" 2>/dev/null || true
+  collector_pids=()
+}
+
+# EXIT で呼ばれる後始末（INT / TERM / HUP は on_signal が exit して EXIT 経由で入る）。未削除の
+# コンテナを削除し、収集プロセスを回収して一時ディレクトリを消す。後始末の間に届く INT / TERM /
+# HUP は無処理（':'）にして中断させず、終了コードは後始末の後に決める（最初のシグナルの 128+N か
+# 本来の終了コード。後始末に失敗した場合は他の終了コードより優先して 4。concurrent_50_memory.sh と同じ方式）。
 cleanup() {
   local final="$?"
-  trap - EXIT INT TERM
+  # 先にシグナルを無処理にしてから EXIT trap を外す（逆順だと、その間に届いたシグナルの既定動作で
+  # 後始末を通らずに終了する）。'' ではなく ':' を使うのは、'' の無視が子へ継承され、後始末中に
+  # 起動するランタイムが TERM を無視してしまうため（':' は子では既定動作に戻る）。
+  trap ':' TERM INT HUP
+  trap - EXIT
+  # 自己テスト専用: 後始末中の 2 回目のシグナルを決定的に再現する（許可リストで検証）。
+  case "${STARTUP_LATENCY_TEST_SIGNAL_IN_CLEANUP:-}" in
+    INT | TERM | HUP) kill -s "$STARTUP_LATENCY_TEST_SIGNAL_IN_CLEANUP" "$$" || true ;;
+    *) ;;
+  esac
   if [ -n "$live_id" ]; then
     # live_id は create 試行の直前に設定される（create 失敗で中途半端に残った場合も対象）。
     # 削除できない・create 未成功で未作成を確定できない場合は finish_container が
@@ -715,6 +938,7 @@ cleanup() {
     live_created=0
     live_cidfile=""
   fi
+  reap_collectors
   if ! rm -rf -- "$tmpdir"; then
     echo "error: cleanup-failed: could not remove temporary directory" >&2
     final="$EXIT_CLEANUP"
@@ -726,8 +950,17 @@ cleanup() {
   exit "$final"
 }
 trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+
+# INT / TERM / HUP を受けたら 128+N で exit し、EXIT trap の cleanup を必ず通す。以降のシグナルは
+# 無処理にして、後始末へ入るまでの間に 2 回目のシグナルで exit し直さないようにする。
+on_signal() { # <終了コード>
+  trap ':' TERM INT HUP
+  err "interrupted" "received signal (exit $1); running cleanup"
+  exit "$1"
+}
+trap 'on_signal 143' TERM
+trap 'on_signal 130' INT
+trap 'on_signal 129' HUP
 
 # 1 回分の計測。成功すると create_us・start_us・observe_us・total_us・state_polls を
 # グローバルへ設定する。引数: <id>。失敗時は非ゼロを返す（呼び出し側が exit 1 に変換する）。
@@ -758,17 +991,17 @@ measure_once() {
   live_id="$id"
   live_created=0
   create_rc=0
-  rt_create "$tmpdir/create.log" "$id" || create_rc=$?
+  rt_create "$tmpdir/create-$seq_no.log" "$id" || create_rc=$?
   if [ "$create_rc" -ne 0 ]; then
     err "runtime-create-failed" "create failed or timed out for $id"
-    show_log "$tmpdir/create.log"
+    show_log "$tmpdir/create-$seq_no.log"
     return 1
   fi
   live_created=1
   t1="$(wall_us)"
-  if ! rt_start "$tmpdir/start.log" "$id"; then
+  if ! rt_start "$tmpdir/start-$seq_no.log" "$id"; then
     err "runtime-start-failed" "start failed or timed out for $id"
-    show_log "$tmpdir/start.log"
+    show_log "$tmpdir/start-$seq_no.log"
     return 1
   fi
   ts="$(wall_us)"
@@ -781,8 +1014,8 @@ measure_once() {
     rt_deadline_us="$deadline"
     query_state "$id"
     rt_deadline_us=""
-    t2="$(wall_us)"
-    m2="$(mono_us)"
+    t2="$state_wall_us"
+    m2="$state_mono_us"
     # 期限は照会完了時刻で判定する。running / stopped を観測した照会でも、完了が期限を
     # 過ぎていれば --timeout 内に観測できなかった計測として失敗にする（成功結果に混ぜない）。
     # 照会が時間切れ（124）になった場合も同じ扱いにする。
@@ -832,12 +1065,12 @@ measure_once_docker() {
   local id="$1" cidfile="$2" m0 m1 t0 t1 wall_total mono_total diff run_rc=0
   m0="$(mono_us)"
   t0="$(wall_us)"
-  dk_run "$tmpdir/run.log" "$cidfile" "$id" || run_rc=$?
+  dk_run "$tmpdir/run-$seq_no.log" "$cidfile" "$id" || run_rc=$?
   t1="$(wall_us)"
   m1="$(mono_us)"
   if [ "$run_rc" -ne 0 ]; then
     err "docker-run-failed" "docker run failed or timed out for $id (exit $run_rc)"
-    show_log "$tmpdir/run.log"
+    show_log "$tmpdir/run-$seq_no.log"
     return 1
   fi
   wall_total=$((t1 - t0))

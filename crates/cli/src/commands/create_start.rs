@@ -96,7 +96,8 @@ fn build_start_request(args: &StartArgs) -> Result<StartRequest, TraitError> {
 
 /// 要求を構築し、状態ルートを解決して本番の依存を組む。要求構築が先なので、不正な入力では状態ルートを作らない。
 /// いずれかの失敗は core に到達していないため、ここで `op_name` の失敗として記録する（REPAIR-4）。
-fn production_runtime<R>(
+/// stop / delete（`stop_delete` module）からも呼ばれる。その場合 `launcher`・`timeouts` は使われない。
+pub(super) fn production_runtime<R>(
     global: &GlobalArgs,
     recorder: OpRecorder,
     op_name: &str,

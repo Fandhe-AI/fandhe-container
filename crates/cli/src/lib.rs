@@ -4,9 +4,11 @@
 //! バイナリ `fandhe-container` の入口と [`commands`] の骨格は TASK-79.1（#638・CLI-1・MS-6）で追加した。
 //! `create` / `start` は core を直接呼ぶ（TASK-79.2.1・#866。ただし本番 launcher 未提供のため `start` は `UNIMPLEMENTED`）。
 //! `stop` / `delete` は TASK-79.2.2、`list` は状態ストアから一覧を出し、`logs` は存在確認までで内容は `UNIMPLEMENTED`（TASK-79.3・#640。REPAIR-3）。
+//! [`error`] は ERR-1 の構造化エラー型と stderr 出力（TASK-95.1・#649）。各コマンドへの配線は TASK-95.2（#650）。
 //! それ以外は雛形のまま実装がない（TASK-1.3・REPAIR-1）。
 //! 本体は G6（TASK-79〜98 の一部。crate の中核成果物は TASK-79〔基本コマンド〕・TASK-95〔エラー形式〕）で
 //! 実装する。PLUG-1 区分は core（crate-naming.md）。
 
 pub mod commands;
 pub mod doctor;
+pub mod error;

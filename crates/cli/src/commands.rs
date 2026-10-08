@@ -9,6 +9,7 @@
 //! `list` は core の状態ストアを読んで stdout へタブ区切りで一覧を出し、`logs` は引数・ID・存在確認までを行う
 //! （TASK-79.3・#640。`list_logs` module）。ログ内容の読み出しは未実装で、対象が存在しても `UNIMPLEMENTED`（8）で
 //! 失敗する（REPAIR-3）。
+//! `setup` は OS 固有設定のステップ提示で `setup` module にのみ委譲する（日常操作コマンドは OS 固有設定を持たない。TASK-80.1・CLI-2）。
 //! 終了コードは core の ERR-2 表（`OCI_EXIT_*`）に揃える。
 //!
 //! 将来仕様（本実装の範囲外）:
@@ -38,7 +39,8 @@ mod plugin_backend;
 mod stop_delete;
 
 use args::{
-    parse_create, parse_delete, parse_global, parse_list, parse_logs, parse_start, parse_stop,
+    parse_create, parse_delete, parse_global, parse_list, parse_logs, parse_setup, parse_start,
+    parse_stop,
 };
 
 /// 基本コマンド（CLI-1）。
@@ -50,17 +52,20 @@ pub enum Command {
     Delete,
     List,
     Logs,
+    /// OS 固有設定のセットアップ（TASK-80.1・CLI-2。日常操作ではない）。
+    Setup,
 }
 
 impl Command {
-    /// 全基本コマンド（コマンド名の列挙順の SSOT）。
-    pub const ALL: [Command; 6] = [
+    /// 全コマンド（コマンド名の列挙順の SSOT）。
+    pub const ALL: [Command; 7] = [
         Command::Create,
         Command::Start,
         Command::Stop,
         Command::Delete,
         Command::List,
         Command::Logs,
+        Command::Setup,
     ];
 
     /// CLI 上のコマンド名。
@@ -72,6 +77,7 @@ impl Command {
             Command::Delete => "delete",
             Command::List => "list",
             Command::Logs => "logs",
+            Command::Setup => "setup",
         }
     }
 
@@ -162,7 +168,7 @@ impl CliExit {
     }
 }
 
-const USAGE_MESSAGE: &str = "usage: fandhe-container <create|start|stop|delete|list|logs>";
+const USAGE_MESSAGE: &str = "usage: fandhe-container <create|start|stop|delete|list|logs|setup>";
 const STATE_ROOT_NOT_FOUND_MESSAGE: &str = "state root not found";
 const UNIMPLEMENTED_MESSAGE: &str = "command is not implemented yet";
 
@@ -232,6 +238,11 @@ pub fn run_to<I: IntoIterator<Item = OsString>>(args: I, stdout: &mut dyn Write)
             Ok(a) => list_logs::run_logs(&global, &a),
             Err(_) => usage(),
         },
+        // OS 固有設定は setup の実行時にのみここから到達する（CLI-2）。global は使わず受理して無視する。
+        Command::Setup => match parse_setup(tail) {
+            Ok(_) => crate::setup::run(stdout),
+            Err(_) => usage(),
+        },
     }
 }
 
@@ -258,13 +269,17 @@ mod tests {
         assert_eq!(Command::parse("delete"), Some(Command::Delete));
         assert_eq!(Command::parse("list"), Some(Command::List));
         assert_eq!(Command::parse("logs"), Some(Command::Logs));
+        assert_eq!(Command::parse("setup"), Some(Command::Setup));
     }
 
     /// CLI-1: 全コマンド名の並び。
     #[test]
     fn cli1_all_names_order() {
         let names: Vec<&str> = Command::ALL.iter().map(|c| c.as_str()).collect();
-        assert_eq!(names, ["create", "start", "stop", "delete", "list", "logs"]);
+        assert_eq!(
+            names,
+            ["create", "start", "stop", "delete", "list", "logs", "setup"]
+        );
     }
 
     /// CLI-1: 未知名・大文字小文字違い・空は None。
@@ -294,6 +309,8 @@ mod tests {
             args(&["logs", "--x", "a"]),
             args(&["list", "x"]),
             args(&["list", "--all"]),
+            args(&["setup", "x"]),
+            args(&["setup", "--x"]),
         ] {
             let r = run(a);
             assert_eq!(r.exit_code(), 2);
@@ -353,7 +370,7 @@ mod tests {
         for (exit, line) in [
             (
                 CliExit::Usage,
-                "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs>\"}\n",
+                "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|setup>\"}\n",
             ),
             (
                 CliExit::Unimplemented,
@@ -723,6 +740,7 @@ mod tests {
                     Command::Delete => (vec!["delete", "none"], 3, Some("NOT_FOUND"), ""),
                     Command::List => (vec!["list"], 0, None, "ID\tSTATUS\tPID\nm1\tcreated\t-\n"),
                     Command::Logs => (vec!["logs", "none"], 3, Some("NOT_FOUND"), ""),
+                    Command::Setup => (vec!["setup"], 0, None, ""),
                 };
                 assert_eq!(argv[0], command.as_str());
                 let o = invoke(&root, &argv);
@@ -733,7 +751,7 @@ mod tests {
             }
             assert_eq!(
                 covered,
-                ["create", "start", "stop", "delete", "list", "logs"]
+                ["create", "start", "stop", "delete", "list", "logs", "setup"]
             );
         }
     }

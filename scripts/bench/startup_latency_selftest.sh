@@ -642,6 +642,22 @@ pad_tmp="$work/pad-tmp"
 mkdir -p "$pad_tmp"
 TMPDIR="$pad_tmp" STUB_MODE=state-pad expect_rc "state-truncated-rejected" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 3
 
+# --- 7c4. 子孫への KILL は起動時刻が列挙時と一致するときだけ送る（PID 再利用・同一性不明では送らない） ---
+fn_src="$(sed -n '/^proc_starttime() {/,/^}/p;/^kill_if_same() {/,/^}/p' "$target_script")"
+sleep 60 &
+victim="$!"
+real_st="$(bash -c "$fn_src"$'\n'"proc_starttime $victim")"
+if [ -n "$real_st" ]; then pass "proc-starttime-readable"; else fail "proc-starttime-readable"; fi
+bash -c "$fn_src"$'\n'"kill_if_same $victim:$((real_st + 1))"
+if kill -0 "$victim" 2>/dev/null; then pass "kill-skipped-on-starttime-mismatch"; else fail "kill-skipped-on-starttime-mismatch"; fi
+bash -c "$fn_src"$'\n'"kill_if_same $victim"
+if kill -0 "$victim" 2>/dev/null; then pass "kill-skipped-without-starttime"; else fail "kill-skipped-without-starttime"; fi
+bash -c "$fn_src"$'\n'"kill_if_same $victim:"
+if kill -0 "$victim" 2>/dev/null; then pass "kill-skipped-with-empty-starttime"; else fail "kill-skipped-with-empty-starttime"; fi
+bash -c "$fn_src"$'\n'"kill_if_same $victim:$real_st"
+wait "$victim" 2>/dev/null || true
+if kill -0 "$victim" 2>/dev/null; then fail "kill-sent-on-starttime-match"; else pass "kill-sent-on-starttime-match"; fi
+
 # --- 7c3. 後始末は収集プロセスの子孫（読み取り中の dd / wc）も回収する ---
 reset_log
 hold_tmp="$work/hold-tmp"

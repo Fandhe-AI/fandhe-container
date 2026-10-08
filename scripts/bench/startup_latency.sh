@@ -817,25 +817,55 @@ finish_container_docker_within_deadline() {
   return 1
 }
 
-# pid の子孫（再帰）を /proc の親 pid から列挙して標準出力へ 1 行 1 pid で出す。
-# 収集プロセスは dd / wc（コマンド置換内）を子に持つので、親を殺す前に列挙する。引数: <pid>
+# pid の起動時刻（/proc/<pid>/stat の starttime。clock tick 単位）を標準出力へ出す。読めなければ
+# 非 0 で何も出さない。stat の comm 欄は空白や ')' を含み得るため、最後の ') ' より後ろで区切る
+# （その後ろの先頭が state=3 欄目なので starttime=22 欄目は 20 番目）。引数: <pid>
+proc_starttime() {
+  local line rest
+  { read -r line <"/proc/$1/stat"; } 2>/dev/null || return 1
+  rest="${line##*) }"
+  # shellcheck disable=SC2086
+  set -- $rest
+  [ -n "${20:-}" ] || return 1
+  echo "${20}"
+}
+
+# pid の起動時刻が列挙時のもの（<pid>:<starttime> 形式の引数）と一致するときだけ SIGKILL を送る。
+# 列挙後に pid が終了して再利用された場合や、起動時刻を確認できない場合は何も送らない（無関係な
+# プロセスを kill しない）。引数: <pid:starttime>
+kill_if_same() {
+  local p="${1%%:*}" st="${1#*:}" now
+  case "$p" in '' | *[!0-9]*) return 0 ;; esac
+  { [ -n "$st" ] && [ "$st" != "$1" ]; } || return 0
+  now="$(proc_starttime "$p")" || return 0
+  [ "$now" = "$st" ] || return 0
+  kill -KILL "$p" 2>/dev/null || true
+}
+
+# pid の子孫（再帰）を /proc の親 pid から列挙して標準出力へ 1 行 1 件（<pid>:<starttime>）で出す。
+# 収集プロセスは dd / wc（コマンド置換内）を子に持つので、親を殺す前に列挙する。起動時刻は
+# kill_if_same が送信直前に照合する。引数: <pid>
 descendant_pids() {
-  local f line ppid p q
-  local -a pids=() ppids=() queue=("$1")
+  local f line ppid p q rest
+  local -a pids=() ppids=() starts=() queue=("$1")
   for f in /proc/[0-9]*/stat; do
     { read -r line <"$f"; } 2>/dev/null || continue
     p="${f#/proc/}"
     p="${p%/stat}"
-    read -r _ ppid _ <<<"${line##*) }"
+    rest="${line##*) }"
+    # shellcheck disable=SC2086
+    set -- $rest
+    [ -n "${20:-}" ] || continue
     pids+=("$p")
-    ppids+=("$ppid")
+    ppids+=("$2")
+    starts+=("${20}")
   done
   while [ "${#queue[@]}" -gt 0 ]; do
     q="${queue[0]}"
     queue=("${queue[@]:1}")
     for f in "${!pids[@]}"; do
       if [ "${ppids[$f]}" = "$q" ]; then
-        echo "${pids[$f]}"
+        echo "${pids[$f]}:${starts[$f]}"
         queue+=("${pids[$f]}")
       fi
     done
@@ -857,7 +887,7 @@ reap_collectors() {
       desc="$(descendant_pids "$p")"
       kill -KILL "$p" 2>/dev/null || true
       for d in $desc; do
-        kill -KILL "$d" 2>/dev/null || true
+        kill_if_same "$d"
       done
     fi
   done

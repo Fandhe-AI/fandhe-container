@@ -9,6 +9,7 @@
 //! 既存 socket パスの lstat 検証・stale socket 再 bind（`uds_security`。TASK-123.2・#287）と
 //! 都度起動モード（`lifecycle`。TASK-110.1・#258）と
 //! OS 別 RSS サンプラー（`rss`。TASK-112.1・#265）と
+//! 起動中 plugin の登録表と親が受けたシグナルの転送 API（`signal_forward`。#1513・PLUG-7）と
 //! XDG 未設定時のフォールバック（TASK-123.4・#289）と常駐モード（`lifecycle`。TASK-110.2・#259）のみ実装済み。
 //! モード選択 API（`lifecycle`。TASK-110.3・#260）は実装済み。gRPC と
 //! PLUG-12 の peer 認証（TASK-124）は Linux の SO_PEERCRED（`uds_security::verify_peer`。TASK-124.1・#292）と
@@ -26,6 +27,7 @@ pub mod frame;
 pub mod lifecycle;
 pub mod message;
 pub mod rss;
+pub mod signal_forward;
 #[cfg(unix)]
 pub(crate) mod sys;
 pub mod transport;
@@ -52,6 +54,10 @@ pub use lifecycle::{
 };
 pub use message::{ControlMessage, MessageId, decode_message, encode_message};
 pub use rss::{RssSample, RssSource};
+pub use signal_forward::{
+    ForwardReport, ForwardSignal, PLUGIN_SIGNAL_TABLE_CAPACITY, forward_to_running_plugins,
+    registered_plugin_pids,
+};
 pub use transport::{
     RpcTimeout, UDS_ACCEPT_TIMEOUT_MAX, UDS_CONNECT_TIMEOUT_MAX, UDS_DEFAULT_IO_TIMEOUT,
     UDS_RPC_TIMEOUT_DEFAULT, UDS_RPC_TIMEOUT_MAX, UdsListener, UdsStream,

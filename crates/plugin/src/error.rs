@@ -45,6 +45,9 @@ pub enum PluginErrorCode {
     Unavailable,
     /// フレームのチェックサム不一致など、偶発的なデータ破損を検出した（TASK-107.2）。
     DataLoss,
+    /// 資源の上限に達した（起動中 plugin の追跡表が満杯。#1513・PLUG-7・REPAIR-5）。
+    /// core 側 `ErrorCode` への写像は `DataLoss` と同じく core 側 proxy 実装（TASK-114）の責務。
+    ResourceExhausted,
 }
 
 impl PluginErrorCode {
@@ -61,6 +64,7 @@ impl PluginErrorCode {
             Self::Timeout => "TIMEOUT",
             Self::Unavailable => "UNAVAILABLE",
             Self::DataLoss => "DATA_LOSS",
+            Self::ResourceExhausted => "RESOURCE_EXHAUSTED",
         }
     }
 }
@@ -81,6 +85,7 @@ impl PluginErrorCode {
             "TIMEOUT" => Self::Timeout,
             "UNAVAILABLE" => Self::Unavailable,
             "DATA_LOSS" => Self::DataLoss,
+            "RESOURCE_EXHAUSTED" => Self::ResourceExhausted,
             _ => return None,
         })
     }
@@ -157,6 +162,7 @@ mod tests {
             (PluginErrorCode::Timeout, "TIMEOUT"),
             (PluginErrorCode::Unavailable, "UNAVAILABLE"),
             (PluginErrorCode::DataLoss, "DATA_LOSS"),
+            (PluginErrorCode::ResourceExhausted, "RESOURCE_EXHAUSTED"),
         ];
         for (code, s) in cases {
             assert_eq!(code.as_str(), s);
@@ -176,6 +182,7 @@ mod tests {
             PluginErrorCode::Timeout,
             PluginErrorCode::Unavailable,
             PluginErrorCode::DataLoss,
+            PluginErrorCode::ResourceExhausted,
         ];
         for code in all {
             assert_eq!(PluginErrorCode::from_code_str(code.as_str()), Some(code));

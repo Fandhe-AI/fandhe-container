@@ -62,6 +62,7 @@ pub use resident::{
 
 use crate::error::{PluginError, PluginErrorCode};
 use crate::frame::Frame;
+use crate::signal_forward::{PLUGIN_REGISTRY, Registry, SlotToken};
 use crate::transport::{RpcTimeout, UdsListener};
 use std::ffi::OsString;
 use std::io::{self, Read};
@@ -475,6 +476,10 @@ struct ChildGuard {
     child: Option<Child>,
     /// 未回収として pid を報告済みか。true なら `Drop` で回収しない。
     reported_unreaped: bool,
+    /// シグナル転送の登録表のスロット（#1513）。子を回収し得る `waitpid` の前に登録を外し、回収した時点で
+    /// 解放する。回収後に再利用された pid へシグナルを送らないための構造で、回収は必ず
+    /// [`Self::try_wait`] / [`Self::kill_and_reap`] を経由する。
+    slot: Option<SlotToken>,
 }
 
 impl ChildGuard {
@@ -482,18 +487,45 @@ impl ChildGuard {
         Self {
             child: Some(child),
             reported_unreaped: false,
+            slot: None,
         }
+    }
+
+    /// 登録表のスロットを持たせる（[`spawn_registered`] が使う）。
+    fn with_slot(mut self, slot: SlotToken) -> Self {
+        self.slot = Some(slot);
+        self
     }
 
     fn pid(&self) -> Option<u32> {
         self.child.as_ref().map(Child::id)
     }
 
+    /// 終了を非ブロックで確認する。回収し得るため、直前に登録表から外し（進行中の転送の完了を待つ）、
+    /// まだ動いていれば戻す。外した窓の間に届いたシグナルは転送されない（取りこぼす側）。進行中の転送の
+    /// 完了を確認できないときは回収せず `Ok(None)`（まだ動いている扱い）を返し、次の周回に委ねる。
+    /// 将来 `suspend` を使わず pidfd 等で回収と転送の競合を除く案がある（現状は #1514 の `PR_SET_PDEATHSIG` で補完する）。
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        match self.child.as_mut() {
-            Some(c) => c.try_wait(),
-            None => Ok(None),
+        let Some(c) = self.child.as_mut() else {
+            return Ok(None);
+        };
+        if let Some(slot) = &self.slot
+            && !slot.suspend()
+        {
+            slot.resume();
+            return Ok(None);
         }
+        let result = c.try_wait();
+        match result {
+            // 回収した。pid は再利用され得るため、登録を戻さず解放する。
+            Ok(Some(_)) => self.slot = None,
+            _ => {
+                if let Some(slot) = &self.slot {
+                    slot.resume();
+                }
+            }
+        }
+        result
     }
 
     /// kill して回収を `ONE_SHOT_REAP_TIMEOUT` まで待つ。
@@ -507,6 +539,18 @@ impl ChildGuard {
         let Some(c) = self.child.as_mut() else {
             return Reap::AlreadyReaped;
         };
+        // 直後に SIGKILL するため転送は不要。以後の回収で pid が再利用され得るので、先に登録を外し、
+        // 進行中の転送の完了を待つ。上限内に確認できなければ回収しない（ロード済みの pid へ送信中の
+        // 転送スレッドが、回収後に再利用された pid へ送る誤配送を防ぐ。PLUG-7・fail-closed）。
+        // この場合も kill は安全（未回収の子の pid は再利用されない）なので送り、`Unreaped` を返す。
+        // `Child` は保持し続け、回収は行わない（pid を回収前に手放さない）。
+        if let Some(slot) = self.slot.take()
+            && !slot.suspend()
+        {
+            let _ = c.kill();
+            self.slot = Some(slot);
+            return Reap::Unreaped;
+        }
         // kill の前に終了済みかを確認し、自発終了の状態をそのまま拾う（kill との競合窓を狭める）。
         if let Ok(Some(status)) = c.try_wait() {
             self.child = None;
@@ -745,7 +789,7 @@ pub fn call_once_observed(
     observer: &mut dyn FnMut(&OneShotRecord),
 ) -> Result<OneShotOutcome, PluginError> {
     let start = Instant::now();
-    let (result, stderr) = call_once_inner(plugin, request, timeout, audit);
+    let (result, stderr) = call_once_inner(plugin, request, timeout, audit, &PLUGIN_REGISTRY);
     observer(&OneShotRecord {
         operation: "plugin.call_once",
         success: result.is_ok(),
@@ -786,6 +830,7 @@ fn call_once_inner(
     request: &Frame,
     timeout: OneShotTimeout,
     audit: &mut dyn crate::audit::PeerAuthObserver,
+    registry: &'static Registry,
 ) -> (
     Result<(Frame, OneShotTermination), PluginError>,
     OneShotStderr,
@@ -821,7 +866,7 @@ fn call_once_inner(
             );
         }
     };
-    // `Command` はこのブロックの終わりで drop され、親側に書き込み端は残らない（終端の検出を妨げない）。
+    // `Command` は文の終わりで drop され、親側に書き込み端は残らない（終端の検出を妨げない）。
     let spawned = {
         let mut cmd = Command::new(&plugin.program);
         cmd.args(&plugin.args)
@@ -833,11 +878,11 @@ fn call_once_inner(
         if let Err(e) = bind_to_parent_lifetime(&mut cmd) {
             return (Err(e), OneShotStderr::empty());
         }
-        cmd.spawn()
+        spawn_registered(&mut cmd, registry)
     };
     let mut guard = match spawned {
-        Ok(child) => ChildGuard::new(child),
-        Err(e) => return (Err(spawn_error(&e)), OneShotStderr::empty()),
+        Ok(g) => g,
+        Err(e) => return (Err(e), OneShotStderr::empty()),
     };
 
     // 接続待ちより前に読み取りを始める（子が接続前に大量に書いても詰まらせない）。
@@ -863,6 +908,24 @@ fn call_once_inner(
     (result, stderr)
 }
 
+/// 登録表のスロットを確保してから子を spawn し、pid を登録したガードを返す（#1513・PLUG-7）。
+///
+/// 確保を spawn より前に行うので、表が満杯のときは子を一切起動せず `ResourceExhausted` で拒否する
+/// （fail-closed。追跡できない子を作らない）。spawn の失敗・pid の範囲外ではスロットを解放し、
+/// 起動済みの子は kill・回収する。`registry` は本番では [`PLUGIN_REGISTRY`]（テストは局所の表）。
+fn spawn_registered(
+    cmd: &mut Command,
+    registry: &'static Registry,
+) -> Result<ChildGuard, PluginError> {
+    let mut slot = registry.reserve()?;
+    let child = cmd.spawn().map_err(|e| spawn_error(&e))?;
+    let pid = child.id();
+    // activate が失敗した場合は guard の Drop が子を kill・回収する。
+    let guard = ChildGuard::new(child);
+    slot.activate(pid)?;
+    Ok(guard.with_slot(slot))
+}
+
 /// 応答前の失敗経路で子を明示的に kill・回収する。回収を確認できなければ、元のエラーではなく
 /// 回収失敗（`Internal`）を返す（孤児の可能性を呼び出し側へ伝える。REPAIR-5・PLUG-7）。
 fn reap_after_failure(guard: &mut ChildGuard, error: PluginError) -> PluginError {
@@ -881,6 +944,8 @@ fn unreaped_error(guard: &mut ChildGuard, phase: &str) -> PluginError {
     let message = match guard.pid() {
         Some(pid) => {
             guard.reported_unreaped = true;
+            // 以後は回収しないが、SIGKILL は送信済み。スロットのリークを防ぐため解放する。
+            guard.slot = None;
             format!("plugin process (pid {pid}) could not be reaped after {phase}")
         }
         None => format!("plugin process could not be reaped after {phase}"),
@@ -1033,6 +1098,113 @@ mod tests {
             classify_reaped(ExitStatus::from_raw(11)),
             OneShotTermination::Exited { code: None }
         );
+    }
+
+    /// テスト用の局所の登録表（グローバル表を汚さない）。
+    #[cfg(unix)]
+    fn local_registry(n: usize) -> &'static Registry {
+        use std::sync::atomic::AtomicI32;
+        let slots: &'static [AtomicI32] = Box::leak(
+            (0..n)
+                .map(|_| AtomicI32::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        Box::leak(Box::new(Registry::over(slots)))
+    }
+
+    #[cfg(unix)]
+    fn sh(script: &str) -> Command {
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        c
+    }
+
+    /// PLUG-7・#1513 (A3): 表が満杯なら子を起動せず `RESOURCE_EXHAUSTED` で拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_spawn_registered_rejects_when_table_full_without_spawning() {
+        let reg = local_registry(1);
+        let _held = reg.reserve().unwrap();
+        let marker = std::env::temp_dir().join(format!("fcos-spawn-marker-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!("touch '{}'", marker.display());
+        let e = spawn_registered(&mut sh(&script), reg).err().unwrap();
+        assert_eq!(e.code(), PluginErrorCode::ResourceExhausted);
+        assert_eq!(e.code().as_str(), "RESOURCE_EXHAUSTED");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!marker.exists(), "child must not be spawned");
+    }
+
+    /// PLUG-7・#1513 (A2): 登録は spawn 成功で載り、kill・回収・自発終了の回収・未回収報告のいずれでも外れる。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_registration_is_released_on_every_reap_path() {
+        use crate::signal_forward::ForwardSignal;
+        let reg = local_registry(4);
+        let targets = |r: &Registry| r.forward(ForwardSignal::Hangup).targets;
+        // 登録の有無（targets）だけを見る。確認用の転送（SIGHUP）で死なないよう HUP を無視する子を使う。
+        let ignoring = "trap '' HUP; exec sleep 30";
+        // kill_and_reap
+        let mut g = spawn_registered(&mut sh(ignoring), reg).unwrap();
+        assert_eq!(targets(reg), 1);
+        assert!(g.kill_and_reap().is_reaped());
+        assert_eq!(targets(reg), 0);
+        // 自発終了を try_wait で回収
+        let mut g = spawn_registered(&mut sh("exit 0"), reg).unwrap();
+        let start = Instant::now();
+        while g.try_wait().unwrap().is_none() {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(targets(reg), 0);
+        // 生存中の try_wait は登録を保つ
+        let mut live = spawn_registered(&mut sh(ignoring), reg).unwrap();
+        assert!(live.try_wait().unwrap().is_none());
+        assert_eq!(targets(reg), 1);
+        // 未回収の報告でスロットを解放する
+        let _ = unreaped_error(&mut live, "test");
+        assert_eq!(targets(reg), 0);
+        // 後始末（報告済みの子は Drop で回収されない）
+        live.reported_unreaped = false;
+        assert!(live.kill_and_reap().is_reaped());
+    }
+
+    /// PLUG-7・#1513 (A2): 登録していない生存中の子には転送しない。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_forward_does_not_touch_unregistered_children() {
+        use crate::signal_forward::ForwardSignal;
+        let reg = local_registry(2);
+        let mut other = ChildGuard::new(sh("exec sleep 30").spawn().unwrap());
+        assert_eq!(reg.forward(ForwardSignal::Terminate).targets, 0);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(other.try_wait().unwrap().is_none());
+        assert!(other.kill_and_reap().is_reaped());
+    }
+
+    /// PLUG-7・#1513: 登録中の子へ転送するとシグナルで終了する。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_forward_terminates_registered_child() {
+        use crate::signal_forward::ForwardSignal;
+        use std::os::unix::process::ExitStatusExt;
+        let reg = local_registry(2);
+        let mut g = spawn_registered(&mut sh("exec sleep 30"), reg).unwrap();
+        assert_eq!(reg.forward(ForwardSignal::Terminate).targets, 1);
+        let start = Instant::now();
+        let status = loop {
+            if let Some(st) = g.try_wait().unwrap() {
+                break st;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(status.signal(), Some(15));
+        assert_eq!(reg.forward(ForwardSignal::Terminate).targets, 0);
     }
 
     /// PLUG-7: kill の前に自発終了していた子は、その終了状態のまま回収される（`Killed` にしない）。

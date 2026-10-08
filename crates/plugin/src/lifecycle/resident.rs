@@ -41,10 +41,11 @@
 use super::{
     ChildGuard, ONE_SHOT_EXIT_TIMEOUT, ONE_SHOT_STDERR_DRAIN_TIMEOUT, OneShotPlugin, OneShotStderr,
     OneShotTermination, PLUGIN_SOCKET_ENV, Reap, StderrCapture, bind_to_parent_lifetime,
-    classify_reaped, rpc_timeout, spawn_error, stderr_channel, unreaped_error,
+    classify_reaped, rpc_timeout, spawn_registered, stderr_channel, unreaped_error,
 };
 use crate::error::{PluginError, PluginErrorCode};
 use crate::frame::Frame;
+use crate::signal_forward::{PLUGIN_REGISTRY, Registry};
 use crate::transport::{RpcTimeout, UdsListener, UdsStream};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -293,6 +294,16 @@ impl ResidentPlugin {
         timeout: ResidentStartTimeout,
         audit: &mut dyn crate::audit::PeerAuthObserver,
     ) -> Result<Self, PluginError> {
+        Self::start_in(plugin, timeout, audit, &PLUGIN_REGISTRY)
+    }
+
+    /// [`Self::start`] の本体。シグナル転送の登録表を引数に取る（テストが局所の表を渡すため）。
+    pub(crate) fn start_in(
+        plugin: &OneShotPlugin,
+        timeout: ResidentStartTimeout,
+        audit: &mut dyn crate::audit::PeerAuthObserver,
+        registry: &'static Registry,
+    ) -> Result<Self, PluginError> {
         static SEQ: AtomicU64 = AtomicU64::new(0);
 
         let deadline = Instant::now()
@@ -312,7 +323,7 @@ impl ResidentPlugin {
             )
         })?;
         // `Command` はこのブロックの終わりで drop され、親側に書き込み端は残らない。
-        let spawned = {
+        let mut guard = {
             let mut cmd = Command::new(&plugin.program);
             cmd.args(&plugin.args)
                 .env_clear()
@@ -322,11 +333,7 @@ impl ResidentPlugin {
                 .stderr(child_stderr);
             // spawn 前の失敗なので子は存在しない。
             bind_to_parent_lifetime(&mut cmd)?;
-            cmd.spawn()
-        };
-        let mut guard = match spawned {
-            Ok(child) => ChildGuard::new(child),
-            Err(e) => return Err(spawn_error(&e)),
+            spawn_registered(&mut cmd, registry)?
         };
 
         // 接続待ちより前に読み取りを始める（子が接続前に大量に書いても詰まらせない）。

@@ -31,8 +31,19 @@
 #   2 = 引数・入力・出力先エラー / 3 = 前提欠如（CLI 不在・実行不可・未対応 OS。0 で合格に見せない）。
 #
 # 動作環境: bash 3.2 以上（macOS 標準）。GNU / BSD 双方のツールで動く書き方にしている。
-# Windows は Git Bash での実行を想定するが CI では未検証（手動手順は検証ドキュメントを参照）。
+# Windows は Git Bash で実行する。自己テスト（スタブ CLI）は CI の windows runner でも実行するが、
+# 製品バイナリ（ネイティブ exe）に対する動作は実機確認（#661）の範囲で、CI では確かめていない。
+# Git Bash はプロセス生成が遅いため、判定は可能な限り bash の組み込みで行い外部コマンドを減らしている。
 set -euo pipefail
+
+# 文字クラス・範囲・文字列長（${#var} はバイト数になる）の解釈を実行環境のロケールに依存させない
+# （OS 間で判定が変わるのを防ぐ）。検査対象の CLI には元の値を戻して渡す（run_cli。CLI の実行環境は変えない）。
+if [ -n "${LC_ALL+x}" ]; then
+  readonly ORIG_LC_ALL_SET=1 ORIG_LC_ALL="$LC_ALL"
+else
+  readonly ORIG_LC_ALL_SET=0 ORIG_LC_ALL=""
+fi
+export LC_ALL=C
 
 readonly FORMAT_HEADER='# fandhe-container-cli-parity v1'
 readonly COLUMNS_LINE=$'case\tlayer\texit\tcode\tstdout'
@@ -118,7 +129,7 @@ kill_group() {
 
 cleanup() {
   if [ -n "$watchdog_pid" ]; then
-    kill "$watchdog_pid" 2>/dev/null || true
+    kill -KILL "$watchdog_pid" 2>/dev/null || true
     watchdog_pid=""
   fi
   # 中断時に実行中の CLI とその子孫を残さない。グループごと回収を待ってから一時ディレクトリを消す。
@@ -147,18 +158,22 @@ detect_os() {
 # （macOS に timeout が標準で無いため。黙って無期限待ちにしない。REPAIR-5）。
 run_exit=0
 run_timed_out=0
+run_seq=0
 run_cli() {
   local cli="$1" limit="$2"
   shift 2
-  local pid ticks i
+  local pid ticks i marker
   : >"$tmp_dir/out"
   : >"$tmp_dir/err"
-  rm -f -- "$tmp_dir/timed_out"
+  # 期限切れの印は実行ごとに別名にする（前回の印を消す外部コマンドを不要にする）。
+  run_seq=$((run_seq + 1))
+  marker="$tmp_dir/timed_out.$run_seq"
   # set -m でバックグラウンドジョブを独立したプロセスグループ（pgid = pid）にする。setsid が無い
   # macOS でも使える。タイムアウト・中断時はグループ単位で子孫ごと回収する。
   set -m
   (
     ulimit -f 256 2>/dev/null || true
+    if [ "$ORIG_LC_ALL_SET" -eq 1 ]; then LC_ALL="$ORIG_LC_ALL"; else unset LC_ALL; fi
     exec "$cli" "$@" </dev/null >"$tmp_dir/out" 2>"$tmp_dir/err"
   ) &
   pid=$!
@@ -173,7 +188,7 @@ run_cli() {
       i=$((i + 1))
     done
     if kill -0 "$pid" 2>/dev/null; then
-      : >"$tmp_dir/timed_out"
+      : >"$marker"
       kill_group "$pid"
     fi
   ) &
@@ -182,11 +197,14 @@ run_cli() {
   wait "$pid" || run_exit=$?
   # 正常終了後に残った子孫（バックグラウンド起動の残り等）もグループごと回収する。
   kill_group "$pid"
-  kill "$watchdog_pid" 2>/dev/null || true
+  # 監視サブシェルは KILL で止める。TERM だと、fork 直後でまだ親の trap を引き継いだままの監視
+  # サブシェルが「cleanup; exit 143」を実行し、実行中の一時ディレクトリを消してしまう（CLI が即座に
+  # 終わる場合に高負荷で起きる競合）。KILL は trap を通らない。監視が残す子は sleep 0.1 だけである。
+  kill -KILL "$watchdog_pid" 2>/dev/null || true
   wait "$watchdog_pid" 2>/dev/null || true
   watchdog_pid=""
   run_pid=""
-  if [ -e "$tmp_dir/timed_out" ]; then
+  if [ -e "$marker" ]; then
     run_timed_out=1
   else
     run_timed_out=0
@@ -199,8 +217,9 @@ run_cli() {
 #   固定文言: {"code":"X","message":"..."}          （使い方エラー・未実装・状態ルート不在など）
 #   core 由来: {"op":"O","code":"X","message":"..."}  （OciRuntimeError::write_json_line。O は
 #              create / start / kill / delete。stop は kill になる）
-# op の有無と値は記録・比較の対象にしない（機械可読契約は code。op は core の付加情報で、TASK-95 の
-# エラー形式確定で CLI 出力から外れる見込みのため、形の差を OS 差として数えない）。
+# op の有無と値は記録・比較の対象にしない（機械可読契約は code。op は core の付加情報で、CLI の
+# エラー形式は TASK-95〔ERR 系〕で確定するため、op の有無を OS 差として数えない）。
+# キーの追加など形式が変わった場合は ERR_LINE_RE を追従させる（追従前は <unparsed> になり合格に見えない）。
 #
 # message は JSON 文字列として検証する: 未エスケープの `"`・`\`・制御文字（U+0000〜U+001F）を拒否し、
 # エスケープは \" \\ \/ \b \f \n \r \t \uXXXX だけを受理する。非 ASCII バイトは UTF-8 として妥当な
@@ -213,99 +232,103 @@ run_cli() {
 readonly MAX_ERR_BYTES=16384
 readonly JSON_STR_BODY='([^"\\[:cntrl:]]|\\["\\/bfnrt]|\\u[0-9a-fA-F]{4})*'
 readonly ERR_LINE_RE='^\{("op":"[a-z_]{1,32}",)?"code":"([A-Z_]{1,40})","message":"'"$JSON_STR_BODY"'"\}$'
+# 結果は norm_code_out に入れる（コマンド置換のサブシェルを作らない。Git Bash はプロセス生成が遅い）。
+norm_code_out=""
 norm_code() {
-  # 文字クラス・範囲の解釈を実行環境のロケールに依存させない（OS 間で判定が変わるのを防ぐ）。
-  local LC_ALL=C
-  local e raw stripped nl high
-  raw="$(wc -c <"$tmp_dir/err" | tr -d ' ')"
-  if [ "$raw" -eq 0 ]; then
-    printf -- '-'
+  local e rest size
+  if [ ! -s "$tmp_dir/err" ]; then
+    norm_code_out='-'
     return 0
   fi
-  stripped="$(LC_ALL=C tr -d '\000' <"$tmp_dir/err" | wc -c | tr -d ' ')"
-  nl="$(LC_ALL=C tr -cd '\n' <"$tmp_dir/err" | wc -c | tr -d ' ')"
-  if [ "$raw" -gt "$MAX_ERR_BYTES" ] || [ "$stripped" -ne "$raw" ] || [ "$nl" -ne 1 ]; then
-    printf '<unparsed>'
-    return 0
+  norm_code_out='<unparsed>'
+  # wc の出力は実装により前後に空白が付く。算術展開で数値だけにする。
+  size=$(($(wc -c <"$tmp_dir/err")))
+  [ "$size" -le "$MAX_ERR_BYTES" ] || return 0
+  # 1 行目を組み込みの read で読む。read の成功は LF 終端を意味する。read は NUL を黙って落とすので、
+  # 「読めたバイト数 + LF 1 個 = ファイルのバイト数」の一致で、NUL が無いこと・LF が行末の 1 個だけで
+  # あること・2 行目が無いことをまとめて確かめる（LC_ALL=C なので ${#e} はバイト数）。
+  e=""
+  IFS= read -r e <"$tmp_dir/err" || return 0
+  [ $((${#e} + 1)) -eq "$size" ] || return 0
+  # 印字可能 ASCII（0x20〜0x7E）以外のバイトを含む場合だけ外部コマンドで検証する（製品の固定文言は
+  # ASCII のみなので通常は通らない）。
+  rest="${e//[ -~]/}"
+  if [ -n "$rest" ]; then
+    command -v iconv >/dev/null 2>&1 || return 0
+    iconv -f UTF-8 -t UTF-8 <"$tmp_dir/err" >/dev/null 2>&1 || return 0
+    # DEL と非 ASCII バイト（上で UTF-8 として検証済み）は JSON 文字列内でそのまま書ける文字なので、
+    # 照合前に ASCII の 1 文字へ写す。正規表現が ASCII だけを見るようにし、OS ごとの正規表現実装の
+    # 高位バイトの扱いの差を避ける。code / op の字句は ASCII 限定なので写像の影響を受けない。
+    # U+0000〜U+001F の制御文字（CR を含む）は写さず残し、正規表現で拒否する。
+    e="$(tr '\177-\377' '[x*]' <"$tmp_dir/err")"
   fi
-  high="$(LC_ALL=C tr -d '\000-\177' <"$tmp_dir/err" | wc -c | tr -d ' ')"
-  if [ "$high" -gt 0 ]; then
-    if ! command -v iconv >/dev/null 2>&1 || ! iconv -f UTF-8 -t UTF-8 <"$tmp_dir/err" >/dev/null 2>&1; then
-      printf '<unparsed>'
-      return 0
-    fi
+  if [[ $e =~ $ERR_LINE_RE ]]; then
+    norm_code_out="${BASH_REMATCH[2]}"
   fi
-  # DEL と非 ASCII バイト（上で UTF-8 として検証済み）は JSON 文字列内でそのまま書ける文字なので、
-  # 照合前に ASCII の 1 文字へ写す。正規表現が ASCII だけを見るようにし、OS ごとの正規表現実装の
-  # 多バイト・高位バイトの扱いの差を避ける。code / op の字句は ASCII 限定なので写像の影響を受けない。
-  # コマンド置換は末尾の LF を落とす。LF は 1 個と確認済みなので、残っていれば行末以外にある。
-  e="$(LC_ALL=C tr '\177-\377' '[x*]' <"$tmp_dir/err")"
-  if [[ $e != *$'\n'* && $e =~ $ERR_LINE_RE ]]; then
-    printf '%s' "${BASH_REMATCH[2]}"
-  else
-    printf '<unparsed>'
-  fi
+  return 0
 }
 
 # stdout を正規化する。種別 l は list 形式（ヘッダ + 行）を厳格に検査し PID 列を <pid> へ置換する。
+# 結果は norm_stdout_out に入れる。
+norm_stdout_out=""
 norm_stdout() {
-  local kind="$1" o line n header_expected row_re joined first ok raw stripped
-  # 空判定は元ファイルのバイト数で行う（コマンド置換は末尾改行を落とし、tr は NUL を落とすため、
-  # 改行のみ・NUL 含みの出力が空出力と同じ '-' になるのを防ぐ）。内容は写さず異常として記録する。
-  raw="$(wc -c <"$tmp_dir/out" | tr -d ' ')"
-  if [ "$raw" -eq 0 ]; then
-    printf -- '-'
+  local kind="$1" line header_expected row_re joined first ok raw stripped pidcol
+  # 空判定は元ファイルのバイト数で行う（改行のみ・NUL 含みの出力が空出力と同じ '-' になるのを防ぐ）。
+  # 内容は写さず異常として記録する。
+  if [ ! -s "$tmp_dir/out" ]; then
+    norm_stdout_out='-'
     return 0
   fi
-  stripped="$(LC_ALL=C tr -d '\000' <"$tmp_dir/out" | wc -c | tr -d ' ')"
+  raw=$(($(wc -c <"$tmp_dir/out")))
+  stripped=$(($(tr -d '\000' <"$tmp_dir/out" | wc -c)))
   if [ "$stripped" -ne "$raw" ]; then
-    printf '<unexpected>:nul'
+    norm_stdout_out='<unexpected>:nul'
     return 0
   fi
   # 検査上限を超える出力は先頭が正常でも後続を検査できないため、一致扱いにせず異常として記録する。
   if [ "$raw" -gt 65536 ]; then
-    printf '<unexpected>:big'
+    norm_stdout_out='<unexpected>:big'
     return 0
   fi
-  o="$(LC_ALL=C head -c 65536 "$tmp_dir/out")"
-  n="$(wc -l <"$tmp_dir/out" | tr -d ' ')"
-  if [ -z "$o" ]; then
-    printf '<unexpected>:%s' "$n"
-    return 0
-  fi
-  if [ "$kind" != "l" ]; then
-    printf '<unexpected>:%s' "$n"
-    return 0
-  fi
-  # 行単位検査は元ファイルから直接読む（コマンド置換は末尾の空行を落とし、余分な空行を見逃すため）。
-  LC_ALL=C head -c 65536 "$tmp_dir/out" >"$tmp_dir/out.cut"
-  header_expected="ID${TAB}STATUS${TAB}PID"
-  row_re="^([A-Za-z0-9_-]{1,64})${TAB}([a-z]{1,16})${TAB}([0-9]{1,10}|-)$"
-  first=1
-  ok=1
+  ok=0
   joined=""
-  while IFS= read -r line || [ -n "$line" ]; do
-    if [ "$first" -eq 1 ]; then
-      first=0
-      if [ "$line" != "$header_expected" ]; then
+  if [ "$kind" = "l" ]; then
+    # 行単位検査は元ファイルから直接読む（コマンド置換は末尾の空行を落とし、余分な空行を見逃すため）。
+    header_expected="ID${TAB}STATUS${TAB}PID"
+    row_re="^([A-Za-z0-9_-]{1,64})${TAB}([a-z]{1,16})${TAB}([0-9]{1,10}|-)$"
+    first=1
+    ok=1
+    line=""
+    # read は LF で終わらない最終行を「失敗 + 非空の line」で返す。それを行として扱うと、LF 終端の
+    # 無い出力が正規の出力と同じ記録になるため、ループでは LF 終端の行だけを処理し、残りは下で異常にする。
+    while IFS= read -r line; do
+      if [ "$first" -eq 1 ]; then
+        first=0
+        if [ "$line" != "$header_expected" ]; then
+          ok=0
+          break
+        fi
+        joined="H"
+      elif [[ $line =~ $row_re ]]; then
+        pidcol="${BASH_REMATCH[3]}"
+        [ "$pidcol" = "-" ] || pidcol="<pid>"
+        joined="${joined};${BASH_REMATCH[1]},${BASH_REMATCH[2]},${pidcol}"
+      else
         ok=0
         break
       fi
-      joined="H"
-    elif [[ $line =~ $row_re ]]; then
-      local pidcol="${BASH_REMATCH[3]}"
-      [ "$pidcol" = "-" ] || pidcol="<pid>"
-      joined="${joined};${BASH_REMATCH[1]},${BASH_REMATCH[2]},${pidcol}"
-    else
+    done <"$tmp_dir/out"
+    # 最終行が LF で終わっていない（出力の改行は LF 固定。CLI-1）、またはヘッダ行が無い。
+    if [ -n "$line" ] || [ "$first" -eq 1 ]; then
       ok=0
-      break
     fi
-  done <"$tmp_dir/out.cut"
-  if [ "$ok" -eq 1 ]; then
-    printf 'list:%s' "$joined"
-  else
-    printf '<unexpected>:%s' "$n"
   fi
+  if [ "$ok" -eq 1 ]; then
+    norm_stdout_out="list:${joined}"
+  else
+    norm_stdout_out="<unexpected>:$(($(wc -l <"$tmp_dir/out")))"
+  fi
+  return 0
 }
 
 do_capture() {
@@ -376,7 +399,9 @@ do_capture() {
       lines+=("${id}${TAB}${layer}${TAB}${run_exit}${TAB}<timeout>${TAB}<timeout>")
       continue
     fi
-    lines+=("${id}${TAB}${layer}${TAB}${run_exit}${TAB}$(norm_code)${TAB}$(norm_stdout "$kind")")
+    norm_code
+    norm_stdout "$kind"
+    lines+=("${id}${TAB}${layer}${TAB}${run_exit}${TAB}${norm_code_out}${TAB}${norm_stdout_out}")
   done
 
   (
@@ -401,13 +426,16 @@ load_capture() {
   local ids=()
   [ -f "$file" ] && [ ! -L "$file" ] || { err invalid-input "capture file is not a regular file"; exit 2; }
   local size
-  size="$(wc -c <"$file" | tr -d ' ')"
+  size=$(($(wc -c <"$file")))
   [ "$size" -le $((MAX_LINES * MAX_LINE_LEN)) ] || { err invalid-input "capture file is too large"; exit 2; }
+  # bash の read は NUL を黙って落とすため、行単位の検証の前に元のバイト列で NUL を拒否する。
+  [ "$(($(LC_ALL=C tr -d '\000' <"$file" | wc -c)))" -eq "$size" ] || { err invalid-input "capture file contains NUL"; exit 2; }
   local id_re='^[AB][0-9]{2}$' ex_re='^[0-9]{1,3}$' code_re='^([A-Z_]{1,40}|-|<unparsed>|<timeout>)$'
   local so_unexp_re='^<unexpected>:(nul|big|[0-9]{1,10})$'
   local so_list_re='^list:H(;[A-Za-z0-9_-]{1,64},[a-z]{1,16},(<pid>|-))*$'
   local k entry_id so_ok
-  while IFS= read -r line || [ -n "$line" ]; do
+  line=""
+  while IFS= read -r line; do
     n=$((n + 1))
     [ "$n" -le "$MAX_LINES" ] || { err invalid-input "capture file has too many lines"; exit 2; }
     [ "${#line}" -le "$MAX_LINE_LEN" ] || { err invalid-input "capture line is too long"; exit 2; }
@@ -423,6 +451,10 @@ load_capture() {
         IFS="$TAB" read -r id layer ex code so <<<"$line"
         [[ $id =~ $id_re ]] && [ "$layer" = "${id:0:1}" ] && [[ $ex =~ $ex_re ]] && [ "$((10#$ex))" -le 255 ] \
           && [[ $code =~ $code_re ]] || { err invalid-input "malformed case line $n"; exit 2; }
+        # タブを IFS にした read は連続するタブ・先頭や末尾のタブを 1 個の区切りとして畳む。分解した
+        # 5 欄をタブ 1 個ずつで組み直した結果が元の行と一致することを確かめ、余分な空欄を持つ行を拒否する。
+        [ "$line" = "${id}${TAB}${layer}${TAB}${ex}${TAB}${code}${TAB}${so}" ] \
+          || { err invalid-input "malformed case line $n"; exit 2; }
         # stdout 欄は固定の正規化形式（空 / 異常マーカー / list:H とレコード列）だけを受理し、
         # 種別 n（成功時は空出力）のケースの list 形式は拒否する。種別は固定ケース表から引く。
         k=""
@@ -449,6 +481,8 @@ load_capture() {
         ;;
     esac
   done <"$file"
+  # read が LF 終端の無い最終行を残した場合（capture は全行を LF 終端で書く）。
+  [ -z "$line" ] || { err invalid-input "capture file does not end with a newline"; exit 2; }
   [ "$n" -ge 4 ] || { err invalid-input "capture file has no cases"; exit 2; }
   printf -v "${prefix}_ids" '%s' "${ids[*]}"
 }

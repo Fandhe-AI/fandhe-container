@@ -452,6 +452,9 @@ endif
 # ルートの deny.toml を共有し（--config）、ルートと同じ 4 種を --locked で検査する。CI の rust-ci
 # （reusable workflow）の deny はルート workspace だけを見るため、CI では rust-ci-default-features
 # ジョブ（ubuntu）が本ターゲットを実行する。cargo-deny 未導入なら deny と同じ版を自動導入する。
+# 引数の位置: cargo-deny 0.20.2 では --manifest-path・--config・--locked は `cargo deny` 直下の大域
+# オプションで、`check` の後ろに置くと「unexpected argument '--config'」で失敗する（`cargo deny --help`
+# と `cargo deny check --help` で確認済み）。--show-stats で 4 種それぞれの ok / 件数を必ずログに出す。
 .PHONY: deny-poc-venus-jig
 deny-poc-venus-jig: ## venus 試験治具（poc/venus-decoder/jig）の Cargo.lock を cargo deny で検査する（ルートの deny.toml を共有）
 	@export PATH="$$HOME/.cargo/bin:$$PATH"; \
@@ -460,7 +463,7 @@ deny-poc-venus-jig: ## venus 試験治具（poc/venus-decoder/jig）の Cargo.lo
 		cargo install cargo-deny@$(CARGO_DENY_VERSION) --locked; \
 	} && \
 	cargo deny --manifest-path $(POC_VENUS_JIG_MANIFEST) --config deny.toml --locked \
-		check advisories bans licenses sources
+		check --show-stats advisories bans licenses sources
 
 .PHONY: ci
 ci: lint-docs check-workspace-manifest fmt-check lint test deny ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する

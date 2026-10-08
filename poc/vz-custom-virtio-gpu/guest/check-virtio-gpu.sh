@@ -121,6 +121,12 @@ elif [ "$dev_count" -eq 1 ]; then
   trap 'rm -f "$tmp" "$tmpvk" "$tmpdev"' EXIT
   grep -E "virtio.?gpu ${devs}:|\[drm\]" "$tmp" >"$tmpdev" || true
   mv -f -- "$tmpdev" "$tmp"
+elif grep -qE '(virtio.?gpu|\[drm\]).*features: ' "$tmp"; then
+  # デバイス識別行（"virtio_gpu virtioN:"）が 1 行も無いのに features 行がある場合、単一
+  # デバイスであることも各行が対象デバイスに属することも確認できないため、帰属不明として
+  # fail-closed で打ち切る（features 行が無いログは下の probe=missing で拒否される）。
+  echo "probe=unattributed"
+  exit 1
 fi
 # probe 区間の識別: 1 回の probe で 1 回だけ出る行（features の virgl 行・context_init 行・
 # number of cap sets・cap set 0 の情報・number of scanouts・Host memory window）のどれかが

@@ -283,6 +283,58 @@ fn bind_to_parent_lifetime(parent: BorrowedFd<'_>) -> Result<(), i32> {
     Err(EXIT_SETUP_FAILED)
 }
 
+/// 「exec 専用の使い捨て worker の中にいる」ことの証跡（ゼロサイズ。#1532・SUP-6・SEC-1）。
+///
+/// [`prepare_exec_restrictions`](super::prepare_exec_restrictions) は準備の最後に呼び出しプロセスの補助グループを
+/// `setgroups(0)` で消す（不可逆。#1457）。常駐側（supervisor 本体・CLI）が誤って呼ぶとそのプロセスの補助グループが
+/// 戻らず失われるため、呼び出しを [`spawn_exec_worker`] の worker の中だけに型で絞る。証跡は [`spawn_exec_worker`] が
+/// fork した子の中で、親の死亡シグナルの設定と non-dumpable の確認が成功した **後** にだけ作られ、閉包の引数として
+/// 渡される。
+///
+/// - フィールドは非公開で、crate の外から構造体リテラルでは作れない
+/// - `PhantomData<*const ()>` により `!Send` / `!Sync`（別スレッド・別プロセスへ持ち出せない）。`Clone` / `Copy` /
+///   `Default` は実装しない
+/// - 採用理由: 準備関数は別 crate（supervisor）からも呼ぶため `pub(crate)` への縮小は成立しない。既存の証跡型
+///   （`ExecReady`・`MountIsolation`）と同じ流儀で型に委ねる
+///
+/// ```compile_fail,E0451
+/// use fandhe_container_core::exec::ExecWorkerProof;
+/// let _forged = ExecWorkerProof { _not_send: std::marker::PhantomData };
+/// ```
+///
+/// ```compile_fail
+/// use fandhe_container_core::exec::ExecWorkerProof;
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ExecWorkerProof>();
+/// ```
+///
+/// 注意: compile_fail は失敗の理由までは確かめない。非 Linux では型が無いため常に通る。
+#[must_use]
+#[derive(Debug)]
+pub struct ExecWorkerProof {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl ExecWorkerProof {
+    /// [`spawn_exec_worker`] の fork 子の中だけで呼ぶ。
+    fn new() -> Self {
+        Self {
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    /// 試験専用: worker の外で証跡を作る（`exec-test-support` feature の下のみ。リリースビルドでは feature の
+    /// 有効化が `compile_error!` で止まる）。
+    ///
+    /// 使い捨ての子プロセス専用。これで得た証跡を [`prepare_exec_restrictions`](super::prepare_exec_restrictions)
+    /// へ渡すと **呼び出しプロセスの補助グループが不可逆に消える**。
+    #[cfg(all(feature = "exec-test-support", not(test)))]
+    #[doc(hidden)]
+    pub fn assume_for_test() -> Self {
+        Self::new()
+    }
+}
+
 /// 準備から実行までを担う使い捨ての worker プロセスを fork する（REPAIR-5・SUP-6・TASK-163.4・#503）。
 ///
 /// `fandhe-container-supervisor` の `exec::run_command` が、`setns`・cgroup join・制限の再適用といった
@@ -292,7 +344,7 @@ fn bind_to_parent_lifetime(parent: BorrowedFd<'_>) -> Result<(), i32> {
 ///
 /// - 呼び出し元は単一スレッドでなければならない（満たさなければ fork せず `FailedPrecondition`。
 ///   `sys::fork_single_threaded` が強制する）
-/// - `worker` は fork した子で実行され、戻り値（0〜255 に丸められる）で `_exit` する。panic は
+/// - `worker` は fork した子で実行され、証跡 [`ExecWorkerProof`] を引数に受け取る。戻り値（0〜255 に丸められる）で `_exit` する。panic は
 ///   `EXIT_SETUP_FAILED`。呼び出し元のフレームへは戻らない。結果の受け渡しは呼び出し側が fork 前に用意した
 ///   fd（pipe 等）で行う
 /// - worker は `worker` を実行する **前** に、自分を呼び出し元の生存に結び付け（呼び出し元が終了したら
@@ -302,11 +354,15 @@ fn bind_to_parent_lifetime(parent: BorrowedFd<'_>) -> Result<(), i32> {
 ///   `reapply_restrictions` で作った [`ExecReady`] 経由でしか exec へ進めない（`ExecReady` は別プロセスへ
 ///   渡せない。SEC-1）
 /// - 戻り値の [`ContainerChild`] は `wait_timeout` で待つこと（`Drop` では kill / wait しない）
-pub fn spawn_exec_worker<F: FnOnce() -> i32>(worker: F) -> Result<ContainerChild, ExecError> {
+pub fn spawn_exec_worker<F: FnOnce(ExecWorkerProof) -> i32>(
+    worker: F,
+) -> Result<ContainerChild, ExecError> {
     let own = own_pidfd()?;
     let pid = sys::fork_single_threaded(
         || match bind_to_parent_lifetime(own.as_fd()).and_then(|()| make_worker_non_dumpable()) {
-            Ok(()) => worker(),
+            // 上の 2 つが成功した後にだけ証跡を作る（証跡の意味を「親の生存に結合済みで non-dumpable な
+            // worker の中にいる」に固定する。#1532）。
+            Ok(()) => worker(ExecWorkerProof::new()),
             Err(code) => code,
         },
         EXIT_SETUP_FAILED,

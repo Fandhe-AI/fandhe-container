@@ -1,9 +1,9 @@
-//! `create` / `start` の argv 解析（TASK-79.2.1・CLI-1・MS-6）。
+//! `create` / `start` / `stop` / `delete` の argv 解析（TASK-79.2.1・TASK-79.2.2・CLI-1・MS-6）。
 //!
 //! `commands::run` が先頭のグローバルオプション（`--root`）とサブコマンド名の後ろを渡して呼ぶ純粋関数群。
 //! ファイルシステムにも環境にも触れず、値の意味検証（絶対パス・ID の文字種）は core の型
 //! （`ContainerId`・`CreateRequest`・`StateRoot`）に委ねる（検査の二重実装を避ける。SEC-1）。
-//! 構文は runc 互換: `fandhe-container [--root <dir>] create --bundle <dir> <id>` / `... start <id>`。
+//! 構文は runc 互換: `fandhe-container [--root <dir>] create --bundle <dir> <id>` / `... start <id>` / `... stop <id>` / `... delete [--force] <id>`。
 //! 解析失敗の理由は呼び出し元で固定文言に落とし、引数値を出力へ埋め込まない（インジェクション回避）。
 
 use std::ffi::OsString;
@@ -27,6 +27,20 @@ pub(super) struct CreateArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StartArgs {
     pub(super) id: String,
+}
+
+/// `stop` の引数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StopArgs {
+    pub(super) id: String,
+}
+
+/// `delete` の引数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DeleteArgs {
+    pub(super) id: String,
+    /// `--force`（core の `DeleteRequest::with_force` へ素通しする。生存中コンテナへは core が拒否する）。
+    pub(super) force: bool,
 }
 
 /// 解析失敗（使い方エラー）。理由は呼び出し元で固定文言に写す。
@@ -80,6 +94,46 @@ pub(super) fn parse_create(args: Vec<OsString>) -> Result<CreateArgs, UsageError
 
 /// `start <id>` を解析する。
 pub(super) fn parse_start(args: Vec<OsString>) -> Result<StartArgs, UsageError> {
+    Ok(StartArgs {
+        id: single_positional(args)?,
+    })
+}
+
+/// `stop <id>` を解析する（オプションは受け付けない）。
+pub(super) fn parse_stop(args: Vec<OsString>) -> Result<StopArgs, UsageError> {
+    Ok(StopArgs {
+        id: single_positional(args)?,
+    })
+}
+
+/// `delete [--force] <id>` を解析する（`--force` は 1 回だけ・順不同・`--` 以降は位置引数）。
+pub(super) fn parse_delete(args: Vec<OsString>) -> Result<DeleteArgs, UsageError> {
+    let mut force = false;
+    let mut positional: Vec<OsString> = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        if a == "--" {
+            positional.extend(it.by_ref());
+            break;
+        } else if a == "--force" {
+            if force {
+                return Err(UsageError);
+            }
+            force = true;
+        } else if is_option_like(&a) {
+            return Err(UsageError);
+        } else {
+            positional.push(a);
+        }
+    }
+    Ok(DeleteArgs {
+        id: single_id(positional)?,
+        force,
+    })
+}
+
+/// オプションを持たないコマンドの位置引数 1 個を取り出す（`--` 以降は位置引数、`-` 始まりは拒否）。
+fn single_positional(args: Vec<OsString>) -> Result<String, UsageError> {
     let mut positional: Vec<OsString> = Vec::new();
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
@@ -92,9 +146,7 @@ pub(super) fn parse_start(args: Vec<OsString>) -> Result<StartArgs, UsageError> 
             positional.push(a);
         }
     }
-    Ok(StartArgs {
-        id: single_id(positional)?,
-    })
+    single_id(positional)
 }
 
 /// `-` で始まる UTF-8 引数はオプションとして扱う（未知オプションを ID と取り違えない）。
@@ -203,5 +255,66 @@ mod tests {
             parse_start(vec![OsString::from_vec(vec![0x66, 0xff])]),
             Err(UsageError)
         );
+    }
+
+    /// CLI-1: stop は位置引数 1 個のみ。
+    #[test]
+    fn cli1_parse_stop() {
+        assert_eq!(parse_stop(v(&["c1"])), Ok(StopArgs { id: "c1".into() }));
+        assert_eq!(
+            parse_stop(v(&["--", "-c"])),
+            Ok(StopArgs { id: "-c".into() })
+        );
+        for a in [v(&[]), v(&["a", "b"]), v(&["--force", "a"]), v(&["-a"])] {
+            assert_eq!(parse_stop(a), Err(UsageError));
+        }
+    }
+
+    /// CLI-1: delete の正常系（`--force` は前後どちらでも・`--` 以降は位置引数）。
+    #[test]
+    fn cli1_parse_delete_ok() {
+        let plain = DeleteArgs {
+            id: "c1".into(),
+            force: false,
+        };
+        let forced = DeleteArgs {
+            id: "c1".into(),
+            force: true,
+        };
+        assert_eq!(parse_delete(v(&["c1"])), Ok(plain));
+        assert_eq!(parse_delete(v(&["--force", "c1"])), Ok(forced.clone()));
+        assert_eq!(parse_delete(v(&["c1", "--force"])), Ok(forced));
+        assert_eq!(
+            parse_delete(v(&["--force", "--", "-x"])),
+            Ok(DeleteArgs {
+                id: "-x".into(),
+                force: true
+            })
+        );
+    }
+
+    /// CLI-1: delete の異常系（空・2 個・未知オプション・`--force` 重複・短縮形）。
+    #[test]
+    fn cli1_parse_delete_rejects_invalid() {
+        for a in [
+            v(&[]),
+            v(&["a", "b"]),
+            v(&["--x", "a"]),
+            v(&["-f", "a"]),
+            v(&["--force", "--force", "a"]),
+            v(&["--force"]),
+        ] {
+            assert_eq!(parse_delete(a), Err(UsageError));
+        }
+    }
+
+    /// CLI-1: 非 UTF-8 の ID は stop / delete でも使い方エラー。
+    #[cfg(unix)]
+    #[test]
+    fn cli1_parse_stop_delete_reject_non_utf8_id() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = || vec![OsString::from_vec(vec![0x66, 0xff])];
+        assert_eq!(parse_stop(bad()), Err(UsageError));
+        assert_eq!(parse_delete(bad()), Err(UsageError));
     }
 }

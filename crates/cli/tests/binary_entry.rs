@@ -105,10 +105,10 @@ fn cli1_unknown_command_is_usage_error() {
     }
 }
 
-/// CLI-1: create / start 以外の既知コマンドは未実装として終了コード 8（core の ERR-2 表）。余分な引数があっても同じ。
+/// CLI-1: list / logs は未実装として終了コード 8（core の ERR-2 表）。余分な引数があっても同じ。
 #[test]
 fn cli1_other_commands_are_unimplemented() {
-    for c in ["stop", "delete", "list", "logs"] {
+    for c in ["list", "logs"] {
         assert_failure(&run(&[c]), 8, UNIMPLEMENTED_JSON);
         assert_failure(&run(&[c, "extra"]), 8, UNIMPLEMENTED_JSON);
     }
@@ -125,6 +125,22 @@ fn cli1_create_start_usage_errors() {
         &["start"],
         &["start", "a", "b"],
         &["--root"],
+    ] {
+        assert_failure(&run(a), 2, USAGE_JSON);
+    }
+}
+
+/// CLI-1: stop / delete は引数の過不足・未知オプション・`--force` 重複で使い方エラー（2）。
+#[test]
+fn cli1_stop_delete_usage_errors() {
+    for a in [
+        &["stop"][..],
+        &["stop", "a", "b"],
+        &["stop", "--force", "c1"],
+        &["delete"],
+        &["delete", "--x", "c1"],
+        &["delete", "--force", "--force", "c1"],
+        &["delete", "a", "b"],
     ] {
         assert_failure(&run(a), 2, USAGE_JSON);
     }
@@ -208,6 +224,61 @@ fn cli1_create_start_flow_on_linux() {
     assert_eq!(out.status.code(), Some(8));
     assert_eq!(op_and_code(&out), ("start".into(), "UNIMPLEMENTED".into()));
     assert!(out.stdout.is_empty());
+}
+
+/// CLI-1・OCI-6・ERR-2: Linux で stop / delete が core を呼ぶ。未 create は 3、Created の stop は 5、
+/// delete は 0 で状態ファイルを消し、2 回目は 3。不正 ID は core 到達前に 2（op は kill / delete）。
+#[cfg(target_os = "linux")]
+#[test]
+fn cli1_stop_delete_flow_on_linux() {
+    let tmp = TmpDir::new("stopdel");
+    let bundle = tmp.0.join("bundle");
+    std::fs::create_dir_all(bundle.join("rootfs")).expect("rootfs");
+    std::fs::write(
+        bundle.join("config.json"),
+        r#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"process":{"user":{"uid":0,"gid":0},"args":["/bin/echo","it"],"cwd":"/"},"linux":{"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"user"},{"type":"uts"},{"type":"ipc"}]}}"#,
+    )
+    .expect("config");
+    let root = tmp.0.join("state");
+    let root_s = root.to_str().expect("utf8");
+    let bundle_s = bundle.to_str().expect("utf8");
+
+    let out = run(&["--root", root_s, "stop", "nope"]);
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(op_and_code(&out), ("kill".into(), "NOT_FOUND".into()));
+    let out = run(&["--root", root_s, "delete", "nope"]);
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(op_and_code(&out), ("delete".into(), "NOT_FOUND".into()));
+
+    for (cmd, op) in [("stop", "kill"), ("delete", "delete")] {
+        let out = run(&["--root", root_s, cmd, "a/b"]);
+        assert_eq!(out.status.code(), Some(2));
+        assert_eq!(op_and_code(&out), (op.into(), "INVALID_ARGUMENT".into()));
+    }
+
+    assert_failure_free(&run(&[
+        "--root", root_s, "create", "--bundle", bundle_s, "c1",
+    ]));
+    let out = run(&["--root", root_s, "stop", "c1"]);
+    assert_eq!(out.status.code(), Some(5));
+    assert_eq!(
+        op_and_code(&out),
+        ("kill".into(), "FAILED_PRECONDITION".into())
+    );
+    assert!(root.join("c1").join("state.json").exists());
+
+    assert_failure_free(&run(&["--root", root_s, "delete", "c1"]));
+    assert!(!root.join("c1").join("state.json").exists());
+    let out = run(&["--root", root_s, "delete", "c1"]);
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(op_and_code(&out), ("delete".into(), "NOT_FOUND".into()));
+
+    // pid なしの Created は force でも削除できる。
+    assert_failure_free(&run(&[
+        "--root", root_s, "create", "--bundle", bundle_s, "c1",
+    ]));
+    assert_failure_free(&run(&["--root", root_s, "delete", "--force", "c1"]));
+    assert!(!root.join("c1").join("state.json").exists());
 }
 
 /// REPAIR-4: 複数の CLI プロセスが同じ `FANDHE_CONTAINER_OP_LOG` へ並行に追記しても JSON 行が混ざらない。
@@ -331,4 +402,18 @@ fn sec1_create_fails_closed_off_linux() {
     assert_eq!(out.status.code(), Some(8));
     assert_eq!(op_and_code(&out), ("create".into(), "UNIMPLEMENTED".into()));
     assert!(out.stdout.is_empty());
+}
+
+/// SEC-1: Linux 以外では状態ストアを開けず stop / delete も fail-closed の UNIMPLEMENTED（8）。
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn sec1_stop_delete_fail_closed_off_linux() {
+    let tmp = TmpDir::new("offlinux-sd");
+    let root = tmp.0.join("state");
+    for (cmd, op) in [("stop", "kill"), ("delete", "delete")] {
+        let out = run(&["--root", root.to_str().expect("utf8"), cmd, "c1"]);
+        assert_eq!(out.status.code(), Some(8));
+        assert_eq!(op_and_code(&out), (op.into(), "UNIMPLEMENTED".into()));
+        assert!(out.stdout.is_empty());
+    }
 }

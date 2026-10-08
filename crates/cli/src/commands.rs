@@ -1,14 +1,17 @@
-//! 統一 CLI の基本コマンド（create / start / stop / delete / list / logs）の入口（TASK-79.1・TASK-79.2.1・CLI-1・MS-6）。
+//! 統一 CLI の基本コマンド（create / start / stop / delete / list / logs）の入口（TASK-79.1・TASK-79.2.1・TASK-79.2.2・CLI-1・MS-6）。
 //!
 //! `main.rs`（bin `fandhe-container`）から [`run`] が呼ばれ、argv の先頭（グローバル `--root` の後）をコマンド名として判定する。
 //! `create` / `start` は core の `oci_runtime::create` / `start` を直接呼ぶ（TASK-79.2.1・#866。`create_start` module）。
 //! ただし本番の `ProcessLauncher` が未提供のため、`start` は `UNIMPLEMENTED`（終了コード 8）で失敗する（REPAIR-3）。
+//! `stop` / `delete` は core の `oci_runtime::kill`（SIGTERM）/ `delete` を直接呼ぶ（TASK-79.2.2・#867。`stop_delete` module）。
+//! 本番の `ProcessSignaler`・cgroup remover が未提供のため、pid ありの対象への `stop` や cgroup 配置つきの `delete` は
+//! `UNIMPLEMENTED`（8）で失敗する（REPAIR-3）。
 //! 他のコマンドは未実装で、`UNIMPLEMENTED` を返して非ゼロ終了する（実装済みを装わない）。
 //! 終了コードは core の ERR-2 表（`OCI_EXIT_*`）に揃える。
 //!
 //! 将来仕様（本実装の範囲外）:
 //! - start の実プロセス起動: supervisor 経由の launcher（TASK-157・TASK-37〜39）。
-//! - stop / delete: TASK-79.2.2（#867）。
+//! - stop の猶予 → SIGKILL・本番 signaler / cgroup remover の結線: supervisor 経由（TASK-157）。
 //! - list / logs: TASK-79.3（#640）。
 //! - macOS / Windows は plugin 発見機構経由で呼び、platform-* へは直接依存しない: TASK-79.4（#641・PLUG-4）。
 //! - エラー形式（`code` / `message`）の確定: TASK-95（ERR 系）。ここの [`CliExit`] は最小の先取り。
@@ -22,8 +25,9 @@ use fandhe_container_core::oci_runtime::{
 
 mod args;
 mod create_start;
+mod stop_delete;
 
-use args::{parse_create, parse_global, parse_start};
+use args::{parse_create, parse_delete, parse_global, parse_start, parse_stop};
 
 /// 基本コマンド（CLI-1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,7 +145,7 @@ fn unimplemented_command() -> CliExit {
 
 /// argv（プログラム名を除く）を解釈して実行する。
 ///
-/// `create` / `start` は core を呼ぶ（TASK-79.2.1）。他のコマンドは未実装として失敗を返す。
+/// `create` / `start` / `stop` / `delete` は core を呼ぶ（TASK-79.2.1・TASK-79.2.2）。他のコマンドは未実装として失敗を返す。
 /// 引数値は出力へ埋め込まない（インジェクション回避）。
 pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> CliExit {
     let Ok((global, rest)) = parse_global(args.into_iter().collect()) else {
@@ -164,7 +168,15 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> CliExit {
             Ok(a) => create_start::run_start(&global, &a),
             Err(_) => usage(),
         },
-        Command::Stop | Command::Delete | Command::List | Command::Logs => unimplemented_command(),
+        Command::Stop => match parse_stop(tail) {
+            Ok(a) => stop_delete::run_stop(&global, &a),
+            Err(_) => usage(),
+        },
+        Command::Delete => match parse_delete(tail) {
+            Ok(a) => stop_delete::run_delete(&global, &a),
+            Err(_) => usage(),
+        },
+        Command::List | Command::Logs => unimplemented_command(),
     }
 }
 
@@ -218,6 +230,10 @@ mod tests {
             args(&["--root", "/r"]),
             args(&["create"]),
             args(&["start"]),
+            args(&["stop"]),
+            args(&["delete"]),
+            args(&["stop", "a", "b"]),
+            args(&["delete", "--x", "a"]),
         ] {
             let r = run(a);
             assert_eq!(r.exit_code(), 2);
@@ -225,10 +241,10 @@ mod tests {
         }
     }
 
-    /// CLI-1: create / start 以外の既知コマンドは未実装として終了コード 8。
+    /// CLI-1: list / logs は未実装として終了コード 8。
     #[test]
     fn cli1_run_other_commands_are_unimplemented() {
-        for c in [Command::Stop, Command::Delete, Command::List, Command::Logs] {
+        for c in [Command::List, Command::Logs] {
             let r = run(args(&[c.as_str()]));
             assert_eq!(r.exit_code(), 8);
             assert_eq!(r.code(), Some("UNIMPLEMENTED"));
@@ -270,7 +286,7 @@ mod tests {
         assert_eq!(stderr_of(&CliExit::Success), "");
         assert_eq!(CliExit::Success.exit_code(), 0);
         assert_eq!(
-            stderr_of(&run(args(&["stop"]))),
+            stderr_of(&run(args(&["list"]))),
             "{\"code\":\"UNIMPLEMENTED\",\"message\":\"command is not implemented yet\"}\n"
         );
         let e = OciRuntimeError::new(

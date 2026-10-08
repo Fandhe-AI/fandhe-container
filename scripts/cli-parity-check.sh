@@ -254,13 +254,19 @@ norm_code() {
   # ASCII のみなので通常は通らない）。
   rest="${e//[ -~]/}"
   if [ -n "$rest" ]; then
+    # U+0001〜U+001F の制御文字（CR を含む）は JSON 文字列に生では書けない。先に拒否する。
+    case "$e" in
+      *[$'\001'-$'\037']*) return 0 ;;
+    esac
     command -v iconv >/dev/null 2>&1 || return 0
     iconv -f UTF-8 -t UTF-8 <"$tmp_dir/err" >/dev/null 2>&1 || return 0
-    # DEL と非 ASCII バイト（上で UTF-8 として検証済み）は JSON 文字列内でそのまま書ける文字なので、
-    # 照合前に ASCII の 1 文字へ写す。正規表現が ASCII だけを見るようにし、OS ごとの正規表現実装の
-    # 高位バイトの扱いの差を避ける。code / op の字句は ASCII 限定なので写像の影響を受けない。
-    # U+0000〜U+001F の制御文字（CR を含む）は写さず残し、正規表現で拒否する。
-    e="$(tr '\177-\377' '[x*]' <"$tmp_dir/err")"
+    # 残るのは DEL と非 ASCII バイト（上で UTF-8 として検証済み）で、JSON 文字列内にそのまま書ける。
+    # 照合前に ASCII の 1 文字へ写し、正規表現が ASCII だけを見るようにする（OS ごとの正規表現実装の
+    # 高位バイトの扱いの差を避ける）。code / op の字句は ASCII 限定なので写像の影響を受けない。
+    # 写像は read 済みの値に対して組み込みで行う。ファイルをコマンド置換で読み直してはならない
+    # （Git Bash の bash はコマンド置換の結果から CR を落とすため、CRLF 終端の出力が LF 終端と
+    # 区別できなくなる。自己テストの CRLF fixture が windows runner で検出した）。
+    e="${e//[! -~]/x}"
   fi
   if [[ $e =~ $ERR_LINE_RE ]]; then
     norm_code_out="${BASH_REMATCH[2]}"

@@ -235,6 +235,8 @@ printf '{"code":"INVALID_ARGUMENT","message":"a\000b"}\n' >"$errmax/err.5"
 pidout="$work/pidout"
 mkdir -p "$pidout"
 printf 'ID\tSTATUS\tPID\nc1\trunning\t4242\nc2\tcreated\t-\n' >"$pidout/out.1"
+# out.3 = B03 list: CRLF 終端（LF 固定の出力と区別する。Git Bash でも CR を見落とさないこと）
+printf 'ID\tSTATUS\tPID\r\nc1\tcreated\t-\r\n' >"$pidout/out.3"
 
 # stdout fixture（成功するコマンドの順）。
 #   out.1 = B01 list: ヘッダだけで LF 終端なし
@@ -489,6 +491,7 @@ expect_line "truncated JSON stderr is unparsed" errmax "A03${tab}A${tab}2${tab}<
 expect_line "multi-line stderr is unparsed" errmax "A04${tab}A${tab}2${tab}<unparsed>${tab}-"
 expect_line "NUL in stderr is unparsed" errmax "A05${tab}A${tab}2${tab}<unparsed>${tab}-"
 expect_line "numeric PID column is replaced" errmax "B01${tab}B${tab}0${tab}-${tab}list:H;c1,running,<pid>;c2,created,-"
+expect_line "CRLF-terminated list is unexpected" errmax "B03${tab}B${tab}0${tab}-${tab}<unexpected>:2"
 
 # 片側だけ壊れた stderr は、正常な baseline と MATCH にならない（A08 = 未エスケープの引用符）。
 compare ok errtable

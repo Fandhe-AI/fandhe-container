@@ -109,16 +109,18 @@ fn plugin_entry() {
     )
     .unwrap();
     let name = sock.file_name().unwrap().to_string_lossy().into_owned();
-    std::fs::write(
-        sock.with_file_name(format!("{name}.pid")),
-        std::process::id().to_string(),
-    )
-    .unwrap();
     // 応答も読み取りもしない。受信したシグナル番号を記録して終了する（記録はハンドラ外で行う）。
     for sig in [1, 2, 15] {
         fandhe_container_cli::signals::install_recording_handler_for_test(sig, record_signal)
             .unwrap();
     }
+    // 全ハンドラの登録後に PID ファイル（準備完了の合図）を公開する。先に公開すると、転送が先に届いて
+    // 既定動作で終了し得る。
+    std::fs::write(
+        sock.with_file_name(format!("{name}.pid")),
+        std::process::id().to_string(),
+    )
+    .unwrap();
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(40) {
         let sig = RECEIVED.load(Ordering::SeqCst);

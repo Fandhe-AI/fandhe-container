@@ -15,8 +15,8 @@
 //! # 契約
 //! - [`forward_to_running_plugins`] はシグナルハンドラから呼べる（async-signal-safe）。atomic の load・
 //!   `kill(2)`・[`ForwardReport`] の構築だけを行い、割り当て・ロック・panic・I/O をしない。
-//! - 送り先は登録中の直接の子（`kill(pid)`）と、そのグループ宛て（`kill(-pid)`。ベストエフォート。
-//!   子が自グループのリーダーでなければ `ESRCH` で無害）。送れるシグナルは [`ForwardSignal`] の 3 種のみ。
+//! - 送り先は登録中の子のグループ宛て（`kill(-pid)`）を優先し、グループが無い（子が自グループの
+//!   リーダーでなく `ESRCH`）ときだけ直接の子（`kill(pid)`）へ送る。リーダーへの二重配送はしない。送れるシグナルは [`ForwardSignal`] の 3 種のみ。
 //! - 登録表は [`PLUGIN_SIGNAL_TABLE_CAPACITY`] 件の固定長。満杯のとき plugin の spawn は子を起動せず
 //!   `RESOURCE_EXHAUSTED`（[`crate::PluginErrorCode::ResourceExhausted`]）で拒否する（fail-closed）。
 //! - 回収の前に登録を外す。外してから回収する窓は `waitpid(WNOHANG)` 1 回分で、その間に届いた
@@ -168,9 +168,12 @@ impl Registry {
         for slot in self.slots {
             let pid = slot.load(Ordering::SeqCst);
             if pid > 1 {
-                // 失敗（ESRCH 等）は許容する。結果は使わない。
-                let _ = crate::sys::send_signal(pid, sig.number());
-                let _ = crate::sys::send_signal(-pid, sig.number());
+                // グループ宛てが届いたなら（子がグループリーダー）、リーダー自身にも含めて配送済みのため
+                // 直接送信はしない（二重配送で SA_RESETHAND の plugin が 2 回目に既定動作で死ぬのを防ぐ）。
+                // グループが無い（ESRCH 等）ときだけ直接の子へ送る。失敗は許容し結果は使わない。
+                if !crate::sys::send_signal(-pid, sig.number()) {
+                    let _ = crate::sys::send_signal(pid, sig.number());
+                }
                 targets += 1;
             }
         }

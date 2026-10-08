@@ -496,6 +496,7 @@ impl ChildGuard {
     /// 終了を非ブロックで確認する。回収し得るため、直前に登録表から外し（進行中の転送の完了を待つ）、
     /// まだ動いていれば戻す。外した窓の間に届いたシグナルは転送されない（取りこぼす側）。進行中の転送の
     /// 完了を確認できないときは回収せず `Ok(None)`（まだ動いている扱い）を返し、次の周回に委ねる。
+    /// 将来 `suspend` を使わず pidfd 等で回収と転送の競合を除く案がある（現状は #1514 の `PR_SET_PDEATHSIG` で補完する）。
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         let Some(c) = self.child.as_mut() else {
             return Ok(None);

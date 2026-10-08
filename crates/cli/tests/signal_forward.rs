@@ -248,3 +248,42 @@ fn plug7_sigterm_is_forwarded_and_parent_exits_by_signal() {
 fn plug7_sighup_is_forwarded_and_parent_exits_by_signal() {
     run_case("HUP", 1);
 }
+
+/// PLUG-7・#1513: 起動時に SIGHUP が無視されていた（nohup 相当）場合はハンドラを上書きせず、
+/// SIGHUP を受けても親も plugin も終了しない（転送もしない）。
+#[test]
+fn plug7_sighup_ignored_at_startup_is_kept_and_not_forwarded() {
+    let dir = TempDir::new();
+    // `sh` で SIGHUP を無視してから exec することで、親役は SIG_IGN を継承した状態で起動する。
+    let parent = Command::new("sh")
+        .args(["-c", "trap '' HUP; exec \"$0\" \"$@\""])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", "parent_entry", "--test-threads=1", "--nocapture"])
+        .env(ROLE_ENV, "parent")
+        .env(DIR_ENV, &dir.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let parent_pid = parent.id();
+    let mut cleanup = Cleanup {
+        parent,
+        plugins: Vec::new(),
+    };
+    let (resident, one_shot) = wait_plugin_pids(&dir.0);
+    cleanup.plugins = vec![resident, one_shot];
+
+    send("HUP", parent_pid);
+
+    // 取りこぼしを検出できる程度の有限の猶予の間、親も plugin も生存し続ける。
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(1) {
+        assert!(
+            cleanup.parent.try_wait().unwrap().is_none(),
+            "parent exited although SIGHUP was ignored at startup"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(is_alive(resident) && is_alive(one_shot));
+}

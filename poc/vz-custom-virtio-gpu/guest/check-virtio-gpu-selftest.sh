@@ -87,6 +87,8 @@ capset_max_size=160
 host_memory_window=present" --dmesg-file "$fx/drm-prefix-ok.log"
 expect_case drm-prefix-zero-scanouts 1 "kms=probe_failed_zero_scanouts
 host_memory_window=present" --dmesg-file "$fx/drm-prefix-zero-scanouts.log"
+# デバイス識別行（virtio_gpu virtioN:）が無い [drm] 行だけのログは帰属不明として拒否する。
+expect_case drm-prefix-unattributed 1 "probe=unattributed" --dmesg-file "$fx/drm-prefix-unattributed.log"
 expect_case drm-prefix-multi-section 1 "probe=multiple_sections" --dmesg-file "$fx/drm-prefix-multi-section.log"
 # 再 probe が features 行だけで止まり number of cap sets に到達しないログでも、先行区間の
 # capset・共有メモリ情報と組み合わせて成功にしない（features 行の重複で複数区間と判定）。

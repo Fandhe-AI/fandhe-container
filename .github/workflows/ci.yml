@@ -464,6 +464,15 @@ jobs:
         timeout-minutes: 5
         run: make plug4-core-invariance-selftest
 
+      # CLI 3 OS 比較スクリプト（scripts/cli-parity-check.sh）の自己テスト（TASK-125.1・CLI-1・REPAIR-12）。
+      # スタブ CLI だけを使い、製品バイナリ・root・ネットワーク・secrets は使わない。macOS では BSD ツール
+      # （timeout 不在・sed / mktemp の差）で動くことを確かめる。Windows（Git Bash）は未検証のため除く。
+      # 新ジョブは check-run 名が増えるため既存ジョブのステップとする
+      - name: CLI 3 OS 比較スクリプトの自己テスト（TASK-125.1・CLI-1。ubuntu・macos）
+        if: runner.os != 'Windows' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make cli-parity-selftest
+
       - name: AppArmor の非特権 user namespace 制限を緩和（unshare_isolation 用・Linux のみ。CORE-1・SEC-5）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 2

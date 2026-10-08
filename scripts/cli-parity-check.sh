@@ -232,6 +232,8 @@ norm_stdout() {
     printf '<unexpected>:%s' "$n"
     return 0
   fi
+  # 行単位検査は元ファイルから直接読む（コマンド置換は末尾の空行を落とし、余分な空行を見逃すため）。
+  LC_ALL=C head -c 65536 "$tmp_dir/out" >"$tmp_dir/out.cut"
   header_expected="ID${TAB}STATUS${TAB}PID"
   row_re="^([A-Za-z0-9_-]{1,64})${TAB}([a-z]{1,16})${TAB}([0-9]{1,10}|-)$"
   first=1
@@ -253,7 +255,7 @@ norm_stdout() {
       ok=0
       break
     fi
-  done <<<"$o"
+  done <"$tmp_dir/out.cut"
   if [ "$ok" -eq 1 ]; then
     printf 'list:%s' "$joined"
   else
@@ -425,6 +427,10 @@ do_compare() {
       # タイムアウト記録は値が一致しても成功にしない（ハングした事実を合格に見せない。REPAIR-5）。
       verdict="MISMATCH"
       printf '%s TIMEOUT (baseline=%s candidate=%s)\n' "$id" "$bv" "$cv"
+    elif [[ $bv == *'<unexpected>'* || $cv == *'<unexpected>'* || $bv == *'<unparsed>'* || $cv == *'<unparsed>'* ]]; then
+      # 解析不能マーカーは内容を記録しないため、同形でも同一性を確認できていない。一致扱いにしない。
+      verdict="MISMATCH"
+      printf '%s UNVERIFIED (baseline=%s candidate=%s)\n' "$id" "$bv" "$cv"
     elif [ "$bv" = "$cv" ]; then
       verdict="MATCH"
       printf '%s MATCH\n' "$id"

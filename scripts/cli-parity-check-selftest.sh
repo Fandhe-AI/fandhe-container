@@ -36,6 +36,7 @@ expect_rc() {
 #   noisy    = ok と同じ終了コードで、stderr / stdout にパス風文字列・制御文字を流す
 #   hang     = 未知コマンド（bogus）だけ止まる（子孫の sleep を残し得る構成）
 #   nl       = create 成功時に改行のみを stdout へ出す
+#   blank    = list の末尾に余分な空行を出す
 #   nul      = create 成功時に NUL を含む出力を stdout へ出す
 # --------------------------------------------------
 stub="$work/stub-cli"
@@ -108,6 +109,7 @@ case "$cmd" in
       b="$(basename "$f" .c)"
       if [ -f "$root/$b.pid" ]; then printf '%s\tcreated\t4242\n' "$b"; else printf '%s\tcreated\t-\n' "$b"; fi
     done
+    [ "$mode" = "blank" ] && printf '\n'
     [ "$mode" = "diff" ] && [ -e "$root/c1.c" ] && exit 7
     ;;
   create)
@@ -220,6 +222,21 @@ run_capture nul "$work/nul.txt"
 [ "$(line_of "$work/nul.txt" B02)" = $'B02\tB\t0\t-\t<unexpected>:nul' ] && pass "NUL stdout is unexpected" || fail "NUL stdout is unexpected: $(line_of "$work/nul.txt" B02)"
 "$target" compare --baseline "$work/nl2.txt" --candidate "$work/nul.txt" >/dev/null 2>&1
 expect_rc "unexpected-stdout captures pass format validation" 1 $?
+
+# --- 解析不能な出力同士は一致扱いにしない（UNVERIFIED・rc 1） ---
+"$target" compare --baseline "$work/noisy.txt" --candidate "$work/noisy.txt" >"$work/cmp.txt" 2>&1
+expect_rc "identical <unexpected> records are rc 1" 1 $?
+grep -q '^B02 UNVERIFIED' "$work/cmp.txt" && pass "B02 <unexpected> reported as UNVERIFIED" || fail "B02 <unexpected> reported as UNVERIFIED"
+sed 's/^A02\tA\t2\tINVALID_ARGUMENT/A02\tA\t2\t<unparsed>/' "$work/ok.txt" >"$work/unparsed.txt"
+"$target" compare --baseline "$work/unparsed.txt" --candidate "$work/unparsed.txt" >"$work/cmp.txt" 2>&1
+expect_rc "identical <unparsed> records are rc 1" 1 $?
+grep -q '^A02 UNVERIFIED' "$work/cmp.txt" && pass "A02 <unparsed> reported as UNVERIFIED" || fail "A02 <unparsed> reported as UNVERIFIED"
+
+# --- list 出力の末尾の余分な空行は正常出力と区別して異常にする ---
+run_capture blank "$work/blank.txt"
+[ "$(line_of "$work/blank.txt" B03)" = $'B03\tB\t0\t-\t<unexpected>:3' ] && pass "trailing blank line in list is unexpected" || fail "trailing blank line in list is unexpected: $(line_of "$work/blank.txt" B03)"
+"$target" compare --baseline "$work/ok.txt" --candidate "$work/blank.txt" >/dev/null 2>&1
+expect_rc "list with trailing blank line differs from ok (rc 1)" 1 $?
 
 # --- タイムアウト時に子孫プロセス（スタブの sleep）が残らない ---
 : >"$work/pids.txt"

@@ -441,7 +441,9 @@ mod unix {
     }
 }
 
-/// `kill -0` による生存確認。外部コマンドの待機にも期限を設ける（REPAIR-5・#1311）。
+/// `kill -0` による生存確認。外部コマンドの待機にも期限を設ける（REPAIR-5・#1311）。呼び出し元は
+/// `mod unix` のみのため unix に限定する（Windows で未使用の関数にしない）。
+#[cfg(unix)]
 fn kill_probe(pid: u32) -> bool {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};

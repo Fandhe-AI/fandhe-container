@@ -215,7 +215,11 @@ fn cli1_create_start_flow_on_linux() {
 /// 相対 bundle の create は core へ到達する前に失敗し（終了コード 2）、失敗 1 件の計測を追記する。
 /// 16 スレッド × 4 回 = 64 プロセスを同時に走らせ、ログが「op_stats 行 + メタ行」の 64 組だけで
 /// 構成されること（1 行に JSON が 2 つ並ばない・行が途切れない・未存在からの同時作成で落とさない）を照合する。
-#[cfg(target_os = "linux")]
+/// 計測のファイル出力は Linux の x86_64 / aarch64 のみ（他は出力しない。SEC-1）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[test]
 fn repair4_concurrent_processes_keep_op_log_lines_intact() {
     const WORKERS: usize = 16;

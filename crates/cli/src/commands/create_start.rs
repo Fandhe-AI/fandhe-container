@@ -191,6 +191,12 @@ mod op_log_file {
         pub(super) const O_PATH: i32 = 0o10_000_000;
     }
 
+    /// 固定値テスト用に [O_NONBLOCK, O_DIRECTORY, O_NOFOLLOW, O_PATH] を返す。
+    #[cfg(test)]
+    pub(super) fn flag_values_for_test() -> [i32; 4] {
+        [O_NONBLOCK, O_DIRECTORY, O_NOFOLLOW, O_PATH]
+    }
+
     /// 新規作成する計測ログの mode（所有者のみ読み書き。umask に任せて group / other へ開かない）。
     const OP_LOG_CREATE_MODE: u32 = 0o600;
 
@@ -1006,7 +1012,149 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// SEC-1: Linux 以外は計測のファイル出力を拒否し、ファイルを作らない（fail-closed）。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    mod op_log_file_tests {
+        use super::super::op_log_file::{
+            O_NONBLOCK, open_op_log, unelevated_euid, unelevated_euid_from_status,
+        };
+
+        /// `/proc/<pid>/status` を模した本文（前後に実物と同じ並びの行を置く）。
+        fn status(uid: &str, gid: &str) -> String {
+            format!(
+                "Name:\tfandhe-container\nUmask:\t0022\nState:\tR (running)\nPid:\t42\n\
+                 Uid:\t{uid}\nGid:\t{gid}\nFDSize:\t64\nGroups:\t1000 \n"
+            )
+        }
+
+        /// SEC-1: real・effective・saved・fs の UID / GID がすべて一致する実行だけ実効 UID を返す。
+        #[test]
+        fn sec1_unelevated_euid_accepts_matching_ids() {
+            let s = status("1000\t1000\t1000\t1000", "1000\t1000\t1000\t1000");
+            assert_eq!(unelevated_euid_from_status(&s), Some(1000));
+            let s = status("0\t0\t0\t0", "0\t0\t0\t0");
+            assert_eq!(unelevated_euid_from_status(&s), Some(0));
+            let s = status("1000\t1000\t1000\t1000", "100\t100\t100\t100");
+            assert_eq!(unelevated_euid_from_status(&s), Some(1000));
+        }
+
+        /// SEC-1: setuid / setgid 相当（real と effective の不一致）や saved・fs の不一致は拒否する。
+        #[test]
+        fn sec1_unelevated_euid_rejects_mismatched_ids() {
+            let same = "1000\t1000\t1000\t1000";
+            for uid in [
+                "1000\t0\t0\t0",
+                "1000\t0\t1000\t1000",
+                "1000\t1000\t0\t1000",
+                "1000\t1000\t1000\t0",
+                "0\t1000\t1000\t1000",
+            ] {
+                assert_eq!(
+                    unelevated_euid_from_status(&status(uid, same)),
+                    None,
+                    "{uid:?}"
+                );
+            }
+            for gid in [
+                "1000\t0\t0\t0",
+                "1000\t0\t1000\t1000",
+                "1000\t1000\t0\t1000",
+                "1000\t1000\t1000\t0",
+            ] {
+                assert_eq!(
+                    unelevated_euid_from_status(&status(same, gid)),
+                    None,
+                    "{gid:?}"
+                );
+            }
+        }
+
+        /// SEC-1: 形式を解釈できない status は拒否する（行の欠落・重複・個数違い・非数値・範囲外）。
+        #[test]
+        fn sec1_unelevated_euid_rejects_malformed_status() {
+            let same = "1000\t1000\t1000\t1000";
+            for bad in [
+                "",
+                "1000",
+                "1000\t1000\t1000",
+                "1000\t1000\t1000\t1000\t1000",
+                "1000\t1000\t1000\tx",
+                "+1000\t+1000\t+1000\t+1000",
+                "-1\t-1\t-1\t-1",
+                "4294967296\t4294967296\t4294967296\t4294967296",
+            ] {
+                assert_eq!(
+                    unelevated_euid_from_status(&status(bad, same)),
+                    None,
+                    "{bad:?}"
+                );
+                assert_eq!(
+                    unelevated_euid_from_status(&status(same, bad)),
+                    None,
+                    "{bad:?}"
+                );
+            }
+            assert_eq!(unelevated_euid_from_status(""), None);
+            assert_eq!(unelevated_euid_from_status("Name:\tx\n"), None);
+            let no_gid = format!("Uid:\t{same}\n");
+            assert_eq!(unelevated_euid_from_status(&no_gid), None);
+            let no_uid = format!("Gid:\t{same}\n");
+            assert_eq!(unelevated_euid_from_status(&no_uid), None);
+            let dup = format!("Uid:\t{same}\nUid:\t{same}\nGid:\t{same}\n");
+            assert_eq!(unelevated_euid_from_status(&dup), None);
+            // 行頭以外に現れる `Uid:` は拾わない（プロセス名に紛れ込ませても判定を変えられない）。
+            let in_name = format!("Name:\tUid:\t0\t0\t0\t0\nUid:\t{same}\nGid:\t{same}\n");
+            assert_eq!(unelevated_euid_from_status(&in_name), Some(1000));
+        }
+
+        /// SEC-1: テストプロセス自身（setuid ではない）の実効 UID は `/proc/self` の所有者と一致する。
+        #[test]
+        fn sec1_unelevated_euid_reads_own_status() {
+            use std::os::unix::fs::MetadataExt;
+            let owner = std::fs::metadata("/proc/self").expect("stat").uid();
+            assert_eq!(unelevated_euid(), Some(owner));
+        }
+
+        /// SEC-1: open フラグはアーキテクチャごとの固定値（Linux の UAPI ヘッダの値）。
+        #[test]
+        fn sec1_open_flags_have_fixed_values_per_arch() {
+            use super::super::op_log_file::flag_values_for_test;
+            #[cfg(target_arch = "x86_64")]
+            let want = [0o4000, 0o200_000, 0o400_000, 0o10_000_000];
+            #[cfg(target_arch = "aarch64")]
+            let want = [0o4000, 0o40_000, 0o100_000, 0o10_000_000];
+            assert_eq!(flag_values_for_test(), want);
+            assert_eq!(O_NONBLOCK, 0o4000);
+        }
+
+        /// SEC-1: 新規作成する計測ログは mode 0600（group / other へ開かない）。既存ファイルの mode は変えない。
+        #[test]
+        fn sec1_open_op_log_creates_file_with_mode_0600() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir =
+                std::env::temp_dir().join(format!("fc-cli-oplog-mode-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+            let mode = |p: &std::path::Path| {
+                std::fs::metadata(p).expect("stat").permissions().mode() & 0o7777
+            };
+            let fresh = dir.join("fresh");
+            drop(open_op_log(fresh.as_os_str()).expect("create"));
+            assert_eq!(mode(&fresh), 0o600);
+            let existing = dir.join("existing");
+            std::fs::write(&existing, "").expect("write");
+            std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o640))
+                .expect("chmod");
+            drop(open_op_log(existing.as_os_str()).expect("open"));
+            assert_eq!(mode(&existing), 0o640);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// SEC-1: 対応外の OS・アーキテクチャは計測のファイル出力を拒否し、ファイルを作らない（fail-closed）。
     #[cfg(not(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")

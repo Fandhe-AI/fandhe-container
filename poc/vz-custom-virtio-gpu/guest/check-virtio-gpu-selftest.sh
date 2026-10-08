@@ -126,9 +126,16 @@ expect_case unknown-arg 2 "" --bogus
 expect_case missing-value 2 "" --dmesg-file
 
 # 上限超過（16 MiB + 1 バイト）。sparse なファイルを scratch に作って検査する。
+# truncate(1) は標準の macOS に無いため、BSD / GNU の両方にある dd の seek で作る
+# （count=0 で書き込まずに末尾位置だけ伸ばす。3 OS 一級対応）。
 big="$(mktemp)"
 trap 'rm -f "$big"' EXIT
-truncate -s $((16 * 1024 * 1024 + 1)) "$big"
+dd if=/dev/zero of="$big" bs=1 count=0 seek=$((16 * 1024 * 1024 + 1)) 2>/dev/null
+big_size="$(wc -c <"$big" | tr -d ' ')"
+if [ "$big_size" -ne $((16 * 1024 * 1024 + 1)) ]; then
+  echo "FAIL oversize: fixture size $big_size, want $((16 * 1024 * 1024 + 1))" >&2
+  failures=$((failures + 1))
+fi
 expect_case oversize 2 "" --dmesg-file "$big"
 
 if [ "$failures" -ne 0 ]; then

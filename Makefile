@@ -237,6 +237,14 @@ else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため test をスキップ"
 endif
 
+# venus 試験治具（workspace 外の独立 PoC パッケージ。GPU-6・TASK-172.4・#888）の fmt / clippy / test。
+# `make ci` には含めない（CI ジョブへの組み込みは別 issue）。実機前提テストは #[ignore] で分離済み。
+.PHONY: poc-venus-jig-check
+poc-venus-jig-check: ## venus 試験治具（poc/venus-decoder/jig）の fmt-check・clippy・test を実行する（GPU-6・TASK-172.4）
+	cargo fmt --manifest-path poc/venus-decoder/jig/Cargo.toml --check
+	cargo clippy --manifest-path poc/venus-decoder/jig/Cargo.toml --all-targets -- -D warnings
+	cargo test --manifest-path poc/venus-decoder/jig/Cargo.toml
+
 # CLI が macOS / Windows のバックエンド実装へ直接依存しないことの機械判定（CLI-1・PLUG-4・TASK-79.4）。
 # macOS / Windows は core の plugin 発見・登録機構経由で呼ぶ。`cargo tree` の通常依存に
 # platform-* / plugin-macos / plugin-windows が現れたら NG（cargo tree の失敗も NG）。

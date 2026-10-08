@@ -1,12 +1,12 @@
 # Venus デコーダ最小サブセット PoC（設計ドラフト）
 
-macOS の virtio-gpu Venus 自前実装（ヘッドレス Vulkan compute のみ）で、最小 venus デコーダが扱う Vulkan コマンドの候補を記録する（GPU-6）。TASK-172 全体の PoC 文書で、本版は候補抽出（TASK-172.1）・wire パース骨格（TASK-172.2）・記録と再生ハーネス（TASK-172.5）の章を埋める。
+macOS の virtio-gpu Venus 自前実装（ヘッドレス Vulkan compute のみ）で、最小 venus デコーダが扱う Vulkan コマンドの候補を記録する（GPU-6）。TASK-172 全体の PoC 文書で、本版は候補抽出（TASK-172.1）・wire パース骨格（TASK-172.2）・記録と再生ハーネス（TASK-172.5）・capset 応答（TASK-172.3）の章を埋める。
 
 > **位置づけ**: 本書はドラフトであり、候補を列挙するだけで対象サブセットを確定しない。最終確定は #726（TASK-172.h2。人間担当）で行う。優先度（必須・推奨・保留）は抽出時点の見立てで、確定扱いにしない。
 
 - 対象ビヘイビア: GPU-6（関連: MAC-5・MVM-4）
-- タスク: TASK-172（MS-13・G-別枠）。本版は TASK-172.1（#722。親 #721）と TASK-172.2（#723）。前提 TASK-7（#25。完了済み）
-- 後続・関連: #723（wire パース骨格）・#724（capset 応答）・#889（コマンドストリーム記録）・#725（1〜3 段目の結果）・#726（確定）・#776 / #777（対象範囲判断・工数再確定）・#781（サブセットのフィルタ機構）。ディスパッチ・ハンドラ群は TASK-177.x（#765・#769・#771・#773・#774）
+- タスク: TASK-172（MS-13・G-別枠）。本版は TASK-172.1（#722。親 #721）・TASK-172.2（#723）・TASK-172.3（#724）。前提 TASK-7（#25。完了済み）
+- 後続・関連: #723（wire パース骨格）・#724（capset 応答。実装済み）・#889（コマンドストリーム記録）・#725（1〜3 段目の結果）・#726（確定）・#776 / #777（対象範囲判断・工数再確定）・#781（サブセットのフィルタ機構）。ディスパッチ・ハンドラ群は TASK-177.x（#765・#769・#771・#773・#774）
 - 出典（spec）: GPU-6・TASK-172・D-15・PoC-14（submodule リビジョン `984f8a2`）。作業環境で `docs/spec` を取得できなかったため、spec 本文は参照せず ID のみで辿れるようにしている
 - 出典（外部。確認日 2026-10-08）:
   - Vulkan レジストリ `vk.xml`: KhronosGroup/Vulkan-Headers のタグ `vulkan-sdk-1.4.363.0`（`registry/vk.xml`。`VK_HEADER_VERSION` 363。SHA-256 `55ec60950cfb18c3575dcf5fd52741b2bb70eb1e466408f803a91049973ee6fb`）
@@ -189,10 +189,36 @@ GPU-6 の決定（ヘッドレス compute のみ・2D スキャンアウト非�
 - **未達（実装済みを装わない。REPAIR-3）**: 受け入れ条件「lavapipe 上で記録を再生し、最小 compute の結果が記録時と一致する」は本書時点で未達。理由は (1) コマンド引数のパース・Vulkan ディスパッチが未実装（TASK-177.x）、(2) lavapipe 実行に Vulkan バインディング（外部クレートまたは自前 FFI。依存追加・`unsafe` の承認が必要）が要る、(3) 実ストリームの採取は #725（人間担当）。再生先は `ReplayBackend` トレイトの差し替え点として定義し、`CollectingBackend`（提出内容を保持する模擬）でのみ検証している
 - 先送り: reply ストリーム・期待出力レコード（kind の番号のみ未割当）、実機側の記録フック配線（#888・#725）
 
-## 8. 以降の章（未着手）
+## 8. capset 応答（TASK-172.3・#724）
+
+実装は `crates/plugin-macos/src/gpu/venus/capset.rs`（`capset_info`・`respond_capset_query`）。PoC-14 で既存 OSS 構成が venus capset（id 4）を `max-size=0` で返し、ゲストの Mesa venus が物理デバイス 0 件と判定した問題への対処として、`max_size` が 0 でない（160）応答を返す最小実装を置いた。トランスポート非依存で、virtio-gpu の ctrl 枠は TASK-175 のデバイスモデルが包む。疎通の成否は #725 で確認する。本章は実装の存在のみを示す。
+
+- 出典（確認日 2026-10-08。値のみ転記。SHA-256 は計画フェーズで照合した値）: virglrenderer `virglrenderer-1.1.0` の `src/venus_hw.h`（`7bc1a8195294d681f4081719e7c4dfea396765e82b5583a2471fad9705aab64e`）、mesa `mesa-25.0.0` の `src/virtio/virtio-gpu/venus_hw.h`（`fa736817518a9c94bf50788a404cae8282987e2e82bcee6436370b2cc6a5988b`）・`src/virtio/vulkan/vn_renderer_virtgpu.c`（`a7a0f1a395d006bfb1ef4aea4d3b2c6a44c30c50ede855416e1183442e1e03aa`）、venus-protocol `v1.1.3` の `xmls/vk.xml`（`264d0d7350e37d70c82407fb430d085040fc01a9a961d43dec8c2d6ed1dfd183`）
+- レイアウト（全て `u32` リトルエンディアン、計 160 バイト）:
+
+| offset | フィールド | 広告値 |
+| ------ | ---------- | ------ |
+| 0 | `wire_format_version` | 1（Mesa が完全一致を要求） |
+| 4 | `vk_xml_version` | `VK_MAKE_API_VERSION(0,1,4,357)` = `0x0040_4165`（ゲスト側で上限クランプ） |
+| 8 | `vk_ext_command_serialization_spec_version` | 1 |
+| 12 | `vk_mesa_venus_protocol_spec_version` | 4（ゲスト側で上限クランプ） |
+| 16 | `supports_blob_id_0` | 1（Mesa が非 0 を前提） |
+| 20〜147 | `vk_extension_mask1[32]` | `[0]` = 0x1（マスク有効）、`[12]` = 0x3（拡張 384・385）、他 0 |
+| 148 | `allow_vk_wait_syncs` | 1（Mesa が非 0 を前提） |
+| 152 | `supports_multiple_timelines` | 1（Mesa が非 0 を前提） |
+| 156 | `use_guest_vram` | 0 |
+
+- ゲスト（Mesa 25.0.0）の受理条件: capset id 4・version 0 で要求する。`wire_format_version` は完全一致必須。`vk_xml_version` は Vulkan 1.1 未満なら拒否。拡張マスクは bit 0 が立っていないと「全拡張対応」とみなされるため、最小集合を明示した（fail-closed）
+- エラー方針: id 4・version 0・index 0 以外は `venus_capset.*` のエラーで拒否する（`VenusCapsetError`）
+- 先送り・未決事項（値は暫定で確定扱いにしない）:
+  - protocol spec version 4 を広告すると v3・v4 のコマンドがゲストから発行されうる（3 章では保留扱い）。下げるかは #725 の実ストリームと #726 で判断
+  - 拡張マスクを最小にしてゲストの物理デバイス列挙が通るかは未確認（#725）。デバイス拡張の広告は #726・TASK-176
+  - `use_guest_vram` は VMM の共有メモリ方式に依存し、3 段目（#1057）の判定まで未決
+  - flag 3 件を 1 にするのは対応機能（blob id 0・待機系コマンド・複数タイムライン。TASK-176・177）を後続が実装する前提の宣言で、現時点では未実装（REPAIR-3）
+
+## 9. 以降の章（未着手）
 
 | 章 | 内容 | 担当 issue |
 | -- | ---- | ---------- |
-| capset 応答 | venus capset の応答仕様 | #724 |
 | 1〜3 段目の結果 | 段階的な再検証の結果 | #725 |
 | 最終確定 | 対象サブセットの確定 | #726（TASK-172.h2。人間担当） |

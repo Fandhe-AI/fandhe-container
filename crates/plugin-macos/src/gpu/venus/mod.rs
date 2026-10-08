@@ -15,19 +15,25 @@
 //!
 //! 未実装（実装済みを装わない。REPAIR-3）: コマンドごとの引数パース（構造体・pNext・ハンドル表）と
 //! Vulkan へのディスパッチ（TASK-177.x: #765・#769・#771・#773・#774）、reply ストリームの符号化、
-//! ring・共有メモリ、capset 応答（#724）、対象サブセットの確定（#726）。現時点でどこからも
+//! ring・共有メモリ、virtio-gpu の ctrl 枠（`GET_CAPSET_INFO` / `GET_CAPSET`。TASK-175）、対象サブセットの確定（#726）。
+//! capset の中身の応答は [`capset_info`]・[`respond_capset_query`] に最小実装がある（TASK-172.3・#724。暫定値・実ゲスト未検証）。現時点でどこからも
 //! 呼ばれない独立モジュールで、frame_loop・adapter へは配線していない。
 
+mod capset;
 mod command;
 mod error;
 mod reader;
 pub mod replay;
 
+pub use capset::{
+    CapsetInfo, CapsetResponse, VENUS_CAPSET_ID, VENUS_CAPSET_LEN, VENUS_CAPSET_MAX_VERSION,
+    VenusCapset, capset_info, respond_capset_query,
+};
 pub use command::{
     COMMAND_HEADER_LEN, CommandFlags, CommandHeader, CommandPriority, CommandType,
     parse_command_header,
 };
-pub use error::VenusWireError;
+pub use error::{VenusCapsetError, VenusWireError};
 pub use reader::{MAX_ARRAY_LEN, WireReader};
 
 #[cfg(test)]

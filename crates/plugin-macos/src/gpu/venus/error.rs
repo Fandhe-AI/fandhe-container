@@ -64,3 +64,52 @@ impl fmt::Display for VenusWireError {
 }
 
 impl std::error::Error for VenusWireError {}
+
+/// venus capset 応答の構造化エラー（GPU-6・TASK-172.3・ERR-1）。
+///
+/// [`super::respond_capset_query`]・[`super::capset_info`] が返す。ゲスト由来の `u32`
+/// （capset index・id・version）が未対応のときの fail-closed な拒否を表す。メッセージには
+/// 数値のみを含める。`code()` は機械可読な `venus_capset.*` 形式、`message()` は英語。
+/// virtio-gpu の ctrl エラー応答への写像は TASK-175 のデバイスモデル側（REPAIR-3: 未実装）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VenusCapsetError {
+    /// VENUS 以外の capset id が要求された。
+    UnsupportedCapset { id: u32 },
+    /// 対応する最大 version を超える version が要求された。
+    UnsupportedVersion { requested: u32, max: u32 },
+    /// capset info の index が範囲外（`count` 個のみ広告している）。
+    IndexOutOfRange { index: u32, count: u32 },
+}
+
+impl VenusCapsetError {
+    /// 機械可読なエラーコード（`venus_capset.*`）。
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::UnsupportedCapset { .. } => "venus_capset.unsupported_capset",
+            Self::UnsupportedVersion { .. } => "venus_capset.unsupported_version",
+            Self::IndexOutOfRange { .. } => "venus_capset.index_out_of_range",
+        }
+    }
+
+    /// 人間可読の英語メッセージ（数値のみ。入力由来の文字列は含めない）。
+    pub fn message(&self) -> String {
+        match self {
+            Self::UnsupportedCapset { id } => format!("unsupported capset id {id}"),
+            Self::UnsupportedVersion { requested, max } => {
+                format!("unsupported capset version {requested}, max {max}")
+            }
+            Self::IndexOutOfRange { index, count } => {
+                format!("capset index {index} out of range, count {count}")
+            }
+        }
+    }
+}
+
+impl fmt::Display for VenusCapsetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.code(), self.message())
+    }
+}
+
+impl std::error::Error for VenusCapsetError {}

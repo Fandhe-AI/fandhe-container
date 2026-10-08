@@ -460,7 +460,9 @@ state_mono_us=0
 log_collect() {
   trap '' INT TERM HUP
   local extra
-  head -c "$((LOG_MAX_KIB * 1024))" >"$1" || true
+  # dd は読めた分をその都度 write するので、書き手が EOF にならなくても到着済みの出力をファイルで読める
+  # （head -c は stdout を stdio 経由でバッファし、終了時まで書き出さない。REPAIR-4）。
+  dd of="$1" bs=4096 iflag=count_bytes count="$((LOG_MAX_KIB * 1024))" status=none 2>/dev/null || true
   extra="$(wc -c)" || extra=0
   extra="${extra//[!0-9]/}"
   if [ "${extra:-0}" -gt 0 ]; then
@@ -816,7 +818,7 @@ finish_container_docker_within_deadline() {
 }
 
 # pid の子孫（再帰）を /proc の親 pid から列挙して標準出力へ 1 行 1 pid で出す。
-# 収集プロセスは head / wc（コマンド置換内）を子に持つので、親を殺す前に列挙する。引数: <pid>
+# 収集プロセスは dd / wc（コマンド置換内）を子に持つので、親を殺す前に列挙する。引数: <pid>
 descendant_pids() {
   local f line ppid p q
   local -a pids=() ppids=() queue=("$1")
@@ -850,7 +852,7 @@ reap_collectors() {
   wait_children "$LOG_REAP_WAIT_US" "${collector_pids[@]}" || true
   for p in "${collector_pids[@]}"; do
     if child_alive "$p"; then
-      # 子孫（読み取り中の head / wc）は親の死後に孤児として残るので、先に列挙してから親→子孫の順に KILL する。
+      # 子孫（読み取り中の dd / wc）は親の死後に孤児として残るので、先に列挙してから親→子孫の順に KILL する。
       local desc d
       desc="$(descendant_pids "$p")"
       kill -KILL "$p" 2>/dev/null || true

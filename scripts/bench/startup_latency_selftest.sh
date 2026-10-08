@@ -138,7 +138,7 @@ cat >>"$stub" <<'STUB'
 #   exec-after-1s: start 後 1 秒間は state が即座に created を返し、その後 running を返す
 #   log-holder: create・start・delete がそれぞれ、ログ（stdout / stderr）を開いたまま 3 秒残る
 #               子プロセスを起こしてから正常終了する（子の PID を $STUB_STATE/holders に記録）
-#   state-pad: state が有効な JSON の後に 1.1 MiB の空白と別の JSON を出す（ログ上限で切り詰められる）
+#   state-pad: create 後の state が有効な JSON の後に 1.1 MiB の空白を出す（ログ上限で切り詰められる）
 #   holder-long: create が 20 秒残る子プロセスにログを継承させ、delete が常に失敗する
 #   id-in-use: create 前から同じ ID のコンテナが存在する
 mode="${STUB_MODE:-ok}"
@@ -159,10 +159,11 @@ if [ "$mode" = holder-long ] && [ "$cmd" = create ]; then
   sleep 20 &
   echo "$!" >>"$STUB_STATE/holders"
 fi
-if [ "$mode" = state-pad ] && [ "$cmd" = state ]; then
+# create 前の事前確認（不存在応答）は通常経路に任せ、create 後の state だけを切り詰め対象にする。
+# 切り詰め後に残る先頭は単一の有効な state JSON なので、log_truncated を無視すると受理されてしまう。
+if [ "$mode" = state-pad ] && [ "$cmd" = state ] && [ -e "$m.bundle" ]; then
   printf '{"ociVersion":"1.0.2","id":"%s","status":"stopped","pid":0,"bundle":"/x"}\n' "$id"
   head -c 1153434 /dev/zero | tr '\0' ' '
-  printf '{"ociVersion":"1.0.2","id":"%s","status":"stopped","pid":0,"bundle":"/x"}\n' "$id"
   exit 0
 fi
 # bundle は create が受け取った --bundle を返す（OCI state の bundle は絶対パス）。
@@ -413,6 +414,7 @@ expect_eq "output-fifo-race-no-staging" "" "$(find "$work" -maxdepth 1 -name '.s
 mkdir -p "$work/faildd" "$work/partial"
 cat >"$work/faildd/dd" <<'FAILDD'
 #!/usr/bin/env bash
+for a in "$@"; do case "$a" in iflag=count_bytes) exec "$(PATH=/usr/bin:/bin command -v dd)" "$@" ;; esac; done
 for a in "$@"; do
   case "$a" in of=*) printf '{"partial' >"${a#of=}" ;; esac
 done
@@ -640,15 +642,15 @@ pad_tmp="$work/pad-tmp"
 mkdir -p "$pad_tmp"
 TMPDIR="$pad_tmp" STUB_MODE=state-pad expect_rc "state-truncated-rejected" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 3
 
-# --- 7c3. 後始末は収集プロセスの子孫（読み取り中の head / wc）も回収する ---
+# --- 7c3. 後始末は収集プロセスの子孫（読み取り中の dd / wc）も回収する ---
 reset_log
 hold_tmp="$work/hold-tmp"
 mkdir -p "$hold_tmp"
 rm -f "$stub_state/holders"
 TMPDIR="$hold_tmp" STUB_MODE=holder-long "$bash_bin" "$target_script" --target own --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1 >/dev/null 2>&1 || true
 left=0
-for p in $(pgrep -x head 2>/dev/null); do
-  case "$(readlink "/proc/$p/fd/1" 2>/dev/null)" in "$hold_tmp"/*) left=$((left + 1)) ;; esac
+for p in $(pgrep -x dd 2>/dev/null); do
+  case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in *"of=$hold_tmp"/*) left=$((left + 1)) ;; esac
 done
 expect_eq "collector-descendants-reaped" "0" "$left"
 if [ -r "$stub_state/holders" ]; then

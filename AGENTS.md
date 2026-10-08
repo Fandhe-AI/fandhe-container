@@ -35,7 +35,7 @@
 | `make fmt-check` | `cargo fmt --all --check` | 終了コード 0。整形差分（`Diff in ...`）を出力しない。差分がある場合は `make fmt` で整形してから再実行する |
 | `make lint` | `cargo clippy --workspace --all-targets -- -D warnings`（既定 feature） | 終了コード 0 かつ clippy 警告 0 件（`-D warnings` により警告はエラー扱いになる）。理由なしの `#[allow]` での抑止は上記のとおり P1・外部入力系 lint の抑止は P0 |
 | `make test` | `cargo test --workspace`（既定 feature） | 終了コード 0。すべての `test result:` 行が `0 failed`。`ignored` の増加で通していないこと（skip/ignore は P0） |
-| `make deny` | `cargo deny --locked check advisories bans licenses sources` | 終了コード 0 かつ advisories・bans・licenses・sources の 4 チェックすべて ok（`--locked` により `Cargo.lock` の更新が必要な状態も失敗として検出する） |
+| `make deny` | `cargo deny --locked check advisories bans licenses sources`（続けて `make deny-poc-venus-jig` で venus 試験治具の `Cargo.lock` も同じ 4 種で検査する） | 終了コード 0 かつ advisories・bans・licenses・sources の 4 チェックすべて ok（`--locked` により `Cargo.lock` の更新が必要な状態も失敗として検出する） |
 | `make ci` | `lint-docs` → `check-workspace-manifest` → `fmt-check` → `lint` → `test` → `deny` の順に実行 | 6 サブターゲットすべてが終了コード 0（make は最初の失敗で停止する）。`lint-docs` は markdownlint・yamllint・editorconfig-checker・commitlint（`origin/main` からの分岐点以降のコミット）を含む |
 
 **`make ci` の合格はローカルゲート（[ci](.claude/rules/ci.md)）であり、PR のマージゲートである CI 全体と同一ではない。** `make ci` は `--all-features` での検証・`test-integration`・`bench-check`・3 OS matrix を含まない。PR のマージゲートは `ci.yml` の集約ジョブ `ci-complete` が `lint-docs`・`rust-ci`・`rust-ci-default-features`・`integration-test`・`bench-regression`・`aarch64-linux-check` の全ジョブの成功を fail-closed で検証した上で成功することである。
@@ -122,7 +122,8 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 | `lint`・`test`（既定 feature） | `rust-ci-default-features`（`--all-features` 側は `rust-ci`） |
 | `test-integration` | `integration-test` |
 | `poc-venus-jig-check` | `rust-ci-default-features`（3 OS） |
-| `plug4-core-invariance-selftest`・`cli-parity-selftest`（CI はスクリプトを直接起動）・`vz-virtio-gpu-guest-check-selftest` | `integration-test`（3 OS。Windows は Git Bash） |
+| `deny-poc-venus-jig`（`deny` からも呼ぶ） | `rust-ci-default-features`（ubuntu のみ。結果が OS に依らない依存監査のため） |
+| `plug4-core-invariance-selftest`・`cli-parity-selftest`・`vz-virtio-gpu-guest-check-selftest` | `integration-test`（3 OS。Windows は Git Bash） |
 | `bench-check-selftest`・`bench-baseline-selftest`・`bench-check`・`bench-plugin-boundary`・`plugin-feature-size` | `bench-regression` |
 | （対応 target なし。`rustup target add aarch64-unknown-linux-gnu` の後に `cargo check --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu` と `cargo clippy --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu -- -D warnings`） | `aarch64-linux-check` |
 | `lint-docs` | `lint-docs` |

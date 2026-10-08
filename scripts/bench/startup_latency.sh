@@ -459,17 +459,29 @@ state_mono_us=0
 # 超過時は stderr へ警告を 1 行出す。引数: <記録先ファイル>
 log_collect() {
   trap '' INT TERM HUP
-  local extra
+  local extra dd_target="$1" ok=1
+  # 自己テストだけが、指定ファイル名の記録先を /dev/full へ差し替えて ENOSPC を再現する。
+  [ -n "${STARTUP_LATENCY_TEST_COLLECT_FULL:-}" ] && [ "${1##*/}" = "$STARTUP_LATENCY_TEST_COLLECT_FULL" ] && dd_target=/dev/full
   # dd は読めた分をその都度 write するので、書き手が EOF にならなくても到着済みの出力をファイルで読める
   # （head -c は stdout を stdio 経由でバッファし、終了時まで書き出さない。REPAIR-4）。
-  dd of="$1" bs=4096 iflag=count_bytes count="$((LOG_MAX_KIB * 1024))" status=none 2>/dev/null || true
+  # 書き込み失敗（ENOSPC 等）は完了目印を置かないことで親へ伝える（log_incomplete。fail-closed）。
+  dd of="$dd_target" bs=4096 iflag=count_bytes count="$((LOG_MAX_KIB * 1024))" status=none 2>/dev/null || ok=0
   extra="$(wc -c)" || extra=0
   extra="${extra//[!0-9]/}"
   if [ "${extra:-0}" -gt 0 ]; then
     # 解析側が不完全な出力を受理しないよう、切り詰めた事実を目印ファイルで親へ伝える（log_truncated）。
-    : >"$1.truncated" 2>/dev/null || true
+    : >"$1.truncated" 2>/dev/null || ok=0
     echo "warning: runtime-log-truncated: ${1##*/} limit_kib=$LOG_MAX_KIB" >&2
   fi
+  # 完了目印は記録に成功したときだけ置く。置けなければ未完了として扱われる。
+  if [ "$ok" -eq 1 ]; then : >"$1.done" 2>/dev/null || true; fi
+}
+
+# 記録先ファイルの収集が正常に完了していないか（書き込み失敗・収集プロセスの異常終了・未終了）。
+# 解析する呼び出しは flush_last_call の後にこれを見て、完了目印がなければ出力を受理しない
+# （空に見える出力を「正常な空」と誤認して不存在を確定しない。fail-closed）。引数: <記録先ファイル>
+log_incomplete() {
+  [ ! -e "$1.done" ]
 }
 
 # 記録先ファイルが上限超過で切り詰められたか（log_collect が置く目印）。解析する呼び出しだけが
@@ -543,7 +555,7 @@ run_rt() {
   shift 2
   local status=0 limit="$timeout_secs" grace="$KILL_AFTER_SECS" ofd efd
   last_collector_pids=()
-  rm -f -- "$out.truncated" "$errf.truncated"
+  rm -f -- "$out.truncated" "$errf.truncated" "$out.done" "$errf.done"
   if [ -n "$rt_deadline_us" ]; then
     local rem g
     rem=$((rt_deadline_us - $(mono_us)))
@@ -625,7 +637,7 @@ query_state() {
     state_rc=125
   fi
   # 切り詰められた応答は不完全なので解析しない（先頭が有効でも後続が捨てられている）。
-  if log_truncated "$out" && [ "$state_rc" -ne 124 ]; then
+  if { log_truncated "$out" || log_incomplete "$out" || log_incomplete "$tmpdir/state.err"; } && [ "$state_rc" -ne 124 ]; then
     state_rc=125
   fi
   state_status=""
@@ -751,6 +763,8 @@ list_run_containers() {
   [ "$rc" -eq 0 ] || return 1
   # 切り詰められた一覧は不完全（未作成を誤って確定し得る）なので失敗として扱う。
   ! log_truncated "$out" || return 1
+  # 記録に失敗した（ENOSPC 等）出力は空でも「コンテナなし」を意味しない。
+  ! log_incomplete "$out" || return 1
   while IFS= read -r line || [ -n "$line" ]; do
     [ -z "$line" ] && continue
     [[ "$line" =~ ^[0-9a-f]{64}$ ]] || return 1

@@ -644,19 +644,28 @@ TMPDIR="$pad_tmp" STUB_MODE=state-pad expect_rc "state-truncated-rejected" 1 --r
 
 # --- 7c4. 子孫への KILL は起動時刻が列挙時と一致するときだけ送る（PID 再利用・同一性不明では送らない） ---
 fn_src="$(sed -n '/^proc_starttime() {/,/^}/p;/^kill_if_same() {/,/^}/p' "$target_script")"
-sleep 60 &
+# 生存の判定はゾンビ（kill 済みで wait 前）を生存とみなさない /proc の状態で行う（kill -0 はゾンビにも成功する）。
+proc_alive() {
+  local line st
+  { read -r line </proc/"$1"/stat; } 2>/dev/null || return 1
+  st="${line##*) }"
+  [ "${st%% *}" != "Z" ]
+}
+sleep 600 &
 victim="$!"
 real_st="$(bash -c "$fn_src"$'\n'"proc_starttime $victim")"
 if [ -n "$real_st" ]; then pass "proc-starttime-readable"; else fail "proc-starttime-readable"; fi
 bash -c "$fn_src"$'\n'"kill_if_same $victim:$((real_st + 1))"
-if kill -0 "$victim" 2>/dev/null; then pass "kill-skipped-on-starttime-mismatch"; else fail "kill-skipped-on-starttime-mismatch"; fi
+if proc_alive "$victim"; then pass "kill-skipped-on-starttime-mismatch"; else fail "kill-skipped-on-starttime-mismatch"; fi
 bash -c "$fn_src"$'\n'"kill_if_same $victim"
-if kill -0 "$victim" 2>/dev/null; then pass "kill-skipped-without-starttime"; else fail "kill-skipped-without-starttime"; fi
+if proc_alive "$victim"; then pass "kill-skipped-without-starttime"; else fail "kill-skipped-without-starttime"; fi
 bash -c "$fn_src"$'\n'"kill_if_same $victim:"
-if kill -0 "$victim" 2>/dev/null; then pass "kill-skipped-with-empty-starttime"; else fail "kill-skipped-with-empty-starttime"; fi
+if proc_alive "$victim"; then pass "kill-skipped-with-empty-starttime"; else fail "kill-skipped-with-empty-starttime"; fi
 bash -c "$fn_src"$'\n'"kill_if_same $victim:$real_st"
-wait "$victim" 2>/dev/null || true
-if kill -0 "$victim" 2>/dev/null; then fail "kill-sent-on-starttime-match"; else pass "kill-sent-on-starttime-match"; fi
+# SIGKILL で終了した子の wait ステータスは 137。自然終了や未送信では 137 にならない。
+victim_rc=0
+wait "$victim" 2>/dev/null || victim_rc=$?
+expect_eq "kill-sent-on-starttime-match" "137" "$victim_rc"
 
 # --- 7c3. 後始末は収集プロセスの子孫（読み取り中の dd / wc）も回収する ---
 reset_log
@@ -994,6 +1003,14 @@ reset_dlog
 DSTUB_MODE=leftover-after-rm expect_rc "docker-leftover-after-rm" 0 --runtime "$dstub" --iterations 1 --warmup 0
 expect_eq "docker-leftover-after-rm-rm" "rm -f $(printf '%064x' 1)" "$(grep '^rm ' "$dstub_log")"
 expect_eq "docker-leftover-after-rm-cleaned" "" "$(find "$dstub_state/containers" -type f -print)"
+
+# 収集の書き込み失敗（ENOSPC 相当）で一覧が空になっても「コンテナなし」と確定しない（fail-closed）。
+# コンテナは残っているので、成功（0）にせず残存として exit 4 にする。
+reset_dlog
+STARTUP_LATENCY_TEST_COLLECT_FULL=list.out DSTUB_MODE=rm-fail expect_rc "docker-list-write-fail" 4 --runtime "$dstub" --iterations 1 --warmup 0 --timeout 1
+expect_contains "docker-list-write-fail-leftover" "containers left behind: $(printf '%064x' 1)"
+reset_dlog
+STARTUP_LATENCY_TEST_COLLECT_FULL=list.out DSTUB_MODE=leftover-after-rm expect_rc "docker-list-write-fail-leftover-after-rm" 4 --runtime "$dstub" --iterations 1 --warmup 0 --timeout 1
 
 # --- D4. 入力エラー（exit 2） ---
 reset_dlog

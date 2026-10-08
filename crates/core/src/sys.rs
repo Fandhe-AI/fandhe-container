@@ -2832,8 +2832,8 @@ mod tests {
     #[test]
     fn core3_task32_1_mkdir_open_remove_roundtrip() {
         use std::io::Write as _;
-        let base = std::env::temp_dir().join(format!("fc-sys-test-{}", std::process::id()));
-        std::fs::create_dir_all(&base).unwrap();
+        let guard = crate::test_support::TestTempDir::new("sys-roundtrip").unwrap();
+        let base = guard.path().to_path_buf();
         let dir = std::fs::File::open(&base).unwrap();
         let name = CString::new("child").unwrap();
         assert_eq!(mkdir_at(dir.as_fd(), &name, 0o755), Ok(()));
@@ -2852,7 +2852,6 @@ mod tests {
         );
         assert_eq!(remove_dir_at(dir.as_fd(), &name), Ok(()));
         assert_eq!(remove_dir_at(dir.as_fd(), &name), Err(SysError::Os(ENOENT)));
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// SUP-6・SEC-1・TASK-163 追補（#1457）: `getgroups` / `setgroups` の syscall 番号（x86_64 は
@@ -3451,18 +3450,17 @@ mod tests {
     struct TempTree {
         base: std::path::PathBuf,
         restore: Vec<std::path::PathBuf>,
+        /// 排他作成した本体（#1298）。`Drop::drop`（chmod 復元）の後にフィールドとして drop され削除する。
+        _guard: crate::test_support::TestTempDir,
     }
 
     impl TempTree {
         fn new(label: &str) -> Self {
-            let base = std::fs::canonicalize(std::env::temp_dir())
-                .unwrap()
-                .join(format!("fandhe-sys-{label}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&base);
-            std::fs::create_dir_all(&base).unwrap();
+            let guard = crate::test_support::TestTempDir::new(&format!("sys-{label}")).unwrap();
             Self {
-                base,
+                base: guard.path().to_path_buf(),
                 restore: Vec::new(),
+                _guard: guard,
             }
         }
     }
@@ -3473,7 +3471,6 @@ mod tests {
             for p in &self.restore {
                 let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700));
             }
-            let _ = std::fs::remove_dir_all(&self.base);
         }
     }
 

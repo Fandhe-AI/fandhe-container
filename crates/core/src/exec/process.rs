@@ -52,7 +52,7 @@
 //! - **エントリポイントは fd に固定して `execveat` する**: 検査（`/proc/self/exe` との同一性）と実行の
 //!   間にパスが差し替わる TOCTOU を防ぐ。読み取り権限のない実行専用バイナリは開けず拒否される。
 //!   fd は 3 以上に置く。シェバン付きスクリプトは、インタープリタが開き直す新 root の `/dev/fd/N` が
-//!   同じ実体を指さなければ `FailedPrecondition` で拒否する（`/dev/fd` の用意は #834 の範囲）
+//!   同じ実体を指さなければ `FailedPrecondition` で拒否する（`/dev/fd` は `create_default_devices`〔#834・#1297〕が用意する。`spawn_container` の最小構成はまだ呼ばない）
 //! - **fork の健全性は `sys::fork_single_threaded` が強制する**: 呼び出し元が `Threads: 1`
 //!   でなければ fork せず `FailedPrecondition` で返す。子はクロージャの結果で必ず `_exit(2)` し、
 //!   呼び出し元のスタックへ戻らない
@@ -467,7 +467,7 @@ fn runtime_identity(proc_dir: BorrowedFd<'_>) -> Result<(u64, u64), ExecError> {
 /// インタープリタはそれを開き直す。`dev_fd_dir`（本番は新 root の `/dev/fd`）の下の `N` が開いた fd と
 /// 同じ `(st_dev, st_ino)` に解決できなければ、スクリプトは起動できないため `FailedPrecondition`
 /// （段は `Exec`・終了コード 126）で明示的に拒否する。`/dev/fd`（`/proc/self/fd` への symlink）を
-/// rootfs に用意するのはデバイス準備の範囲（#834・TASK-27.6）で、本関数は作らず検証だけを行う。
+/// rootfs に用意するのはデバイス準備の範囲（`create_default_devices`。#834・#1297）で、本関数は作らず検証だけを行う。
 fn verify_script_fd_path(
     dev_fd_dir: &Path,
     file: &std::fs::File,

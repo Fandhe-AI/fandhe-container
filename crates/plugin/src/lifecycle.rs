@@ -760,8 +760,6 @@ pub fn call_once_observed(
     })
 }
 
-/// listener の bind・子の spawn・stderr の収集・往復・回収までを行う。戻り値の第 2 要素は、
-/// 成功・失敗のどちらでも子の回収後に確定した stderr の収集結果（spawn 前の失敗は空）。
 /// plugin 本体（直接の子）を親の生存に結び付ける（Linux のみ。`PR_SET_PDEATHSIG`。#1514・#1403 の方式 B・
 /// PLUG-7・REPAIR-5・CORE-1）。都度起動 / 常駐の spawn 直前に呼び、spawn 箇所へ cfg を持ち込まない。
 /// Linux 以外では何もしない（macOS に同等の機構はなく残留し得る。Windows は対象外）。
@@ -781,6 +779,8 @@ fn bind_to_parent_lifetime(_cmd: &mut Command) -> Result<(), PluginError> {
     Ok(())
 }
 
+/// listener の bind・子の spawn・stderr の収集・往復・回収までを行う。戻り値の第 2 要素は、
+/// 成功・失敗のどちらでも子の回収後に確定した stderr の収集結果（spawn 前の失敗は空）。
 fn call_once_inner(
     plugin: &OneShotPlugin,
     request: &Frame,

@@ -1,4 +1,4 @@
-# ツールチェーン単一真実源（vector-db・rust-ai-library と同一方針）。
+# ツールチェーン単一真実源（fandhe-db・rust-ai-library と同一方針）。
 # rustup show が本ファイルを検出して未導入なら自動インストールする。
 # channel は stable 追従とし、rustfmt / clippy を必須 component として列挙する。
 [toolchain]

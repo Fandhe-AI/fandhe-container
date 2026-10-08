@@ -395,4 +395,346 @@ mod tests {
             "{\"op\":\"start\",\"code\":\"NOT_FOUND\",\"message\":\"missing\"}\n"
         );
     }
+
+    /// Linux 経路の `run_to` 境界の単体テスト（TASK-79.5・#642・CLI-1）。
+    ///
+    /// 本番入口（引数解析 → 状態ストア open → core 呼び出し → `CliExit` への写像 → `write_stderr`）を
+    /// 6 コマンドそれぞれ直接呼んで検証する。本番 launcher / signaler は fail-closed のため
+    /// プロセス起動・シグナル送信は発生しない。全呼び出しは `invoke` が `--root <TmpDir>` を強制し、
+    /// 利用者の実状態ルートへ触れない。環境変数は変更しない（並列テストとの競合回避）。
+    #[cfg(target_os = "linux")]
+    mod linux {
+        use super::*;
+        use std::path::{Path, PathBuf};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct TmpDir(PathBuf);
+
+        impl TmpDir {
+            fn new(tag: &str) -> Self {
+                static SEQ: AtomicUsize = AtomicUsize::new(0);
+                let n = SEQ.fetch_add(1, Ordering::SeqCst);
+                let p = std::env::temp_dir()
+                    .join(format!("fc-cli-cmd-{tag}-{}-{n}", std::process::id()));
+                std::fs::create_dir_all(&p).expect("mkdir");
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
+                        .expect("chmod");
+                }
+                Self(p)
+            }
+
+            fn state_root(&self) -> PathBuf {
+                self.0.join("state")
+            }
+        }
+
+        impl Drop for TmpDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        /// 状態ルートを 0700 で先に作る（ストアは他者に開かれた権限のルートを PERMISSION_DENIED で拒否する）。
+        fn make_state_root(root: &Path) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::create_dir_all(root).expect("root");
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
+
+        fn make_bundle(base: &TmpDir) -> PathBuf {
+            let b = base.0.join("bundle");
+            std::fs::create_dir_all(b.join("rootfs")).expect("rootfs");
+            std::fs::write(
+                b.join("config.json"),
+                r#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"process":{"user":{"uid":0,"gid":0},"args":["/bin/echo","it"],"cwd":"/"},"linux":{"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"user"},{"type":"uts"},{"type":"ipc"}]}}"#,
+            )
+            .expect("config");
+            b
+        }
+
+        /// `run_to` の観測結果（終了コード・エラーコード・stdout・stderr）。
+        struct Outcome {
+            exit: u8,
+            code: Option<&'static str>,
+            stdout: String,
+            stderr: String,
+        }
+
+        /// 先頭に `--root <root>` を必ず付けて `run_to` を呼ぶ（実状態ルートを汚さないための強制）。
+        fn invoke(root: &Path, argv: &[&str]) -> Outcome {
+            let mut full: Vec<OsString> = vec![OsString::from("--root"), root.into()];
+            full.extend(argv.iter().map(OsString::from));
+            let mut out = Vec::new();
+            let r = run_to(full, &mut out);
+            Outcome {
+                exit: r.exit_code(),
+                code: r.code(),
+                stdout: String::from_utf8(out).expect("utf8"),
+                stderr: stderr_of(&r),
+            }
+        }
+
+        /// 失敗 JSON が LF 終端の 1 行であることを確認し、`op` / `code` を取り出す（`message` は core 文言依存のため見ない）。
+        fn op_and_code(stderr: &str) -> (String, String) {
+            assert!(stderr.ends_with('\n'), "{stderr:?}");
+            assert_eq!(stderr.matches('\n').count(), 1, "{stderr:?}");
+            let field = |key: &str| -> String {
+                let pat = format!("\"{key}\":\"");
+                let start = stderr.find(&pat).map(|i| i + pat.len()).unwrap_or(0);
+                let tail = stderr.get(start..).unwrap_or("");
+                tail.split('"').next().unwrap_or("").to_owned()
+            };
+            (field("op"), field("code"))
+        }
+
+        fn create_ok(base: &TmpDir, id: &str) {
+            let bundle = make_bundle(base);
+            let o = invoke(
+                &base.state_root(),
+                &["create", "--bundle", bundle.to_str().expect("utf8"), id],
+            );
+            assert_eq!((o.exit, o.stderr.as_str()), (0, ""), "{}", o.stderr);
+        }
+
+        fn failure(op: &str, code: &str) -> (String, String) {
+            (op.to_owned(), code.to_owned())
+        }
+
+        /// CLI-1・OCI-4・ERR-2: create は成功で無出力、重複は ALREADY_EXISTS（4）、不正 ID は使い方エラー（2）。
+        #[test]
+        fn cli1_run_create_on_linux() {
+            let base = TmpDir::new("create");
+            let root = base.state_root();
+            let bundle = make_bundle(&base);
+            let b = bundle.to_str().expect("utf8");
+
+            let o = invoke(&root, &["create", "--bundle", b, "c1"]);
+            assert_eq!(o.exit, 0);
+            assert_eq!(o.code, None);
+            assert_eq!((o.stdout.as_str(), o.stderr.as_str()), ("", ""));
+            assert!(root.join("c1").join("state.json").is_file());
+
+            let o = invoke(&root, &["create", "--bundle", b, "c1"]);
+            assert_eq!(o.exit, 4);
+            assert_eq!(op_and_code(&o.stderr), failure("create", "ALREADY_EXISTS"));
+
+            let o = invoke(&root, &["create", "--bundle", b, "a/b"]);
+            assert_eq!((o.exit, o.code), (2, Some("INVALID_ARGUMENT")));
+        }
+
+        /// CLI-1・ERR-2・REPAIR-3: start は未作成で NOT_FOUND（3）、作成済みでも launcher 未提供のため UNIMPLEMENTED（8）で
+        /// 状態は Created のまま。
+        #[test]
+        fn cli1_run_start_on_linux() {
+            let base = TmpDir::new("start");
+            let root = base.state_root();
+
+            let o = invoke(&root, &["start", "c1"]);
+            assert_eq!(o.exit, 3);
+            assert_eq!(op_and_code(&o.stderr), failure("start", "NOT_FOUND"));
+
+            create_ok(&base, "c1");
+            let o = invoke(&root, &["start", "c1"]);
+            assert_eq!(o.exit, 8);
+            assert_eq!(op_and_code(&o.stderr), failure("start", "UNIMPLEMENTED"));
+
+            let o = invoke(&root, &["list"]);
+            assert_eq!(o.stdout, "ID\tSTATUS\tPID\nc1\tcreated\t-\n");
+
+            let o = invoke(&root, &["start", "a/b"]);
+            assert_eq!((o.exit, o.code), (2, Some("INVALID_ARGUMENT")));
+        }
+
+        /// CLI-1・OCI-6・ERR-2: stop は未作成で NOT_FOUND（3）、pid なしの Created は FAILED_PRECONDITION（5）。
+        /// 失敗 JSON の op は core に Stop が無いため `kill`。
+        #[test]
+        fn cli1_run_stop_on_linux() {
+            let base = TmpDir::new("stop");
+            let root = base.state_root();
+
+            let o = invoke(&root, &["stop", "c1"]);
+            assert_eq!(o.exit, 3);
+            assert_eq!(op_and_code(&o.stderr), failure("kill", "NOT_FOUND"));
+
+            create_ok(&base, "c1");
+            let o = invoke(&root, &["stop", "c1"]);
+            assert_eq!(o.exit, 5);
+            assert_eq!(
+                op_and_code(&o.stderr),
+                failure("kill", "FAILED_PRECONDITION")
+            );
+            assert!(root.join("c1").join("state.json").is_file());
+
+            let o = invoke(&root, &["stop", "a/b"]);
+            assert_eq!((o.exit, o.code), (2, Some("INVALID_ARGUMENT")));
+        }
+
+        /// CLI-1・OCI-6・ERR-2: delete は作成済みで成功し state.json が消え、再実行は NOT_FOUND（3）。`--force` も成功する。
+        #[test]
+        fn cli1_run_delete_on_linux() {
+            let base = TmpDir::new("delete");
+            let root = base.state_root();
+
+            let o = invoke(&root, &["delete", "c1"]);
+            assert_eq!(o.exit, 3);
+            assert_eq!(op_and_code(&o.stderr), failure("delete", "NOT_FOUND"));
+
+            create_ok(&base, "c1");
+            let o = invoke(&root, &["delete", "c1"]);
+            assert_eq!(o.exit, 0);
+            assert_eq!((o.stdout.as_str(), o.stderr.as_str()), ("", ""));
+            assert!(!root.join("c1").join("state.json").exists());
+
+            assert_eq!(invoke(&root, &["delete", "c1"]).exit, 3);
+
+            create_ok(&base, "c1");
+            let o = invoke(&root, &["delete", "--force", "c1"]);
+            assert_eq!(o.exit, 0);
+            assert!(!root.join("c1").join("state.json").exists());
+        }
+
+        /// CLI-1: list は空ストアでヘッダのみ、複数件は ID 昇順のタブ区切りで stdout へ出す。
+        #[test]
+        fn cli1_run_list_on_linux() {
+            let base = TmpDir::new("list");
+            let root = base.state_root();
+
+            make_state_root(&root);
+            let o = invoke(&root, &["list"]);
+            assert_eq!(o.exit, 0);
+            assert_eq!(o.stdout, "ID\tSTATUS\tPID\n");
+            assert_eq!(o.stderr, "");
+
+            create_ok(&base, "b2");
+            create_ok(&base, "a1");
+            let o = invoke(&root, &["list"]);
+            assert_eq!(o.exit, 0);
+            assert_eq!(
+                o.stdout,
+                "ID\tSTATUS\tPID\na1\tcreated\t-\nb2\tcreated\t-\n"
+            );
+            assert_eq!(o.stderr, "");
+        }
+
+        /// CLI-1・ERR-2・REPAIR-3: logs は未作成で NOT_FOUND（3）、作成済みでも内容読み出し未実装で UNIMPLEMENTED（8）。
+        #[test]
+        fn cli1_run_logs_on_linux() {
+            let base = TmpDir::new("logs");
+            let root = base.state_root();
+            make_state_root(&root);
+
+            let o = invoke(&root, &["logs", "c1"]);
+            assert_eq!(o.exit, 3);
+            assert_eq!(
+                o.stderr,
+                "{\"code\":\"NOT_FOUND\",\"message\":\"container not found\"}\n"
+            );
+
+            create_ok(&base, "c1");
+            let o = invoke(&root, &["logs", "c1"]);
+            assert_eq!(o.exit, 8);
+            assert_eq!(
+                o.stderr,
+                "{\"code\":\"UNIMPLEMENTED\",\"message\":\"command is not implemented yet\"}\n"
+            );
+            assert_eq!(o.stdout, "");
+
+            let o = invoke(&root, &["logs", "a/b"]);
+            assert_eq!(o.exit, 2);
+            assert_eq!(
+                o.stderr,
+                "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"invalid argument\"}\n"
+            );
+        }
+
+        /// ERR-2: 状態ルートの親が無いとき、list / logs は専用の NOT_FOUND、他 4 コマンドは op 付き NOT_FOUND になり、
+        /// 親ディレクトリは作られない。
+        #[test]
+        fn err2_state_root_parent_missing_on_linux() {
+            let base = TmpDir::new("noparent");
+            let parent = base.0.join("no-parent");
+            let root = parent.join("state");
+            let bundle = make_bundle(&base);
+            let b = bundle.to_str().expect("utf8");
+
+            for argv in [&["list"][..], &["logs", "c1"][..]] {
+                let o = invoke(&root, argv);
+                assert_eq!(o.exit, 3, "{argv:?}");
+                assert_eq!(
+                    o.stderr,
+                    "{\"code\":\"NOT_FOUND\",\"message\":\"state root not found\"}\n"
+                );
+            }
+
+            let cases: [(&[&str], &str); 4] = [
+                (&["create", "--bundle", b, "c1"], "create"),
+                (&["start", "c1"], "start"),
+                (&["stop", "c1"], "kill"),
+                (&["delete", "c1"], "delete"),
+            ];
+            for (argv, op) in cases {
+                let o = invoke(&root, argv);
+                assert_eq!(o.exit, 3, "{argv:?}");
+                assert_eq!(op_and_code(&o.stderr), failure(op, "NOT_FOUND"), "{argv:?}");
+            }
+            assert!(!parent.exists());
+        }
+
+        /// SEC-1: 引用符・バックスラッシュ・改行を含む入力値は出力へ反射されず、stderr は 1 行のまま。
+        #[test]
+        fn sec1_argument_values_are_not_reflected() {
+            let base = TmpDir::new("reflect");
+            let root = base.state_root();
+            make_state_root(&root);
+            let evil = "x\"\\\ninj";
+            for argv in [
+                vec!["start", evil],
+                vec!["stop", evil],
+                vec!["delete", evil],
+                vec!["logs", evil],
+                vec![evil],
+            ] {
+                let o = invoke(&root, &argv);
+                assert_eq!(o.exit, 2, "{argv:?}");
+                assert_eq!(o.stdout, "");
+                assert!(!o.stderr.contains("inj"), "{:?}", o.stderr);
+                assert_eq!(o.stderr.matches('\n').count(), 1, "{:?}", o.stderr);
+            }
+        }
+
+        /// REPAIR-12・CLI-1: `Command::ALL` の全コマンドに Linux 経路のシナリオがあることを、
+        /// ワイルドカード無しの match（コマンド追加でコンパイルエラーになる）で機械照合する。
+        #[test]
+        fn cli1_all_commands_have_linux_scenario() {
+            let base = TmpDir::new("all");
+            let root = base.state_root();
+            let bundle = make_bundle(&base);
+            let b = bundle.to_str().expect("utf8").to_owned();
+            let mut covered = Vec::new();
+            for command in Command::ALL {
+                // (argv, 期待終了コード, 期待 code(), 期待 stdout)
+                let (argv, exit, code, stdout): (Vec<&str>, u8, Option<&str>, &str) = match command
+                {
+                    Command::Create => (vec!["create", "--bundle", &b, "m1"], 0, None, ""),
+                    Command::Start => (vec!["start", "none"], 3, Some("NOT_FOUND"), ""),
+                    Command::Stop => (vec!["stop", "none"], 3, Some("NOT_FOUND"), ""),
+                    Command::Delete => (vec!["delete", "none"], 3, Some("NOT_FOUND"), ""),
+                    Command::List => (vec!["list"], 0, None, "ID\tSTATUS\tPID\nm1\tcreated\t-\n"),
+                    Command::Logs => (vec!["logs", "none"], 3, Some("NOT_FOUND"), ""),
+                };
+                assert_eq!(argv[0], command.as_str());
+                let o = invoke(&root, &argv);
+                assert_eq!(o.exit, exit, "{argv:?}");
+                assert_eq!(o.code, code, "{argv:?}");
+                assert_eq!(o.stdout, stdout, "{argv:?}");
+                covered.push(command.as_str());
+            }
+            assert_eq!(
+                covered,
+                ["create", "start", "stop", "delete", "list", "logs"]
+            );
+        }
+    }
 }

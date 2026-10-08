@@ -46,7 +46,7 @@ mod linux {
     }
 
     pub fn run() {
-        let child = spawn_exec_worker(|| {
+        let child = spawn_exec_worker(|_| {
             std::thread::sleep(Duration::from_secs(60));
             0
         })

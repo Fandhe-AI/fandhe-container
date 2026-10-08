@@ -349,7 +349,7 @@ impl<O: ServerObserver> BoundWriteback<O> {
         self.settings
     }
 
-    /// [`Self::bind`]（[`WritebackSettings::bind`]）で渡した観測フックを
+    /// `bind`（[`WritebackSettings::bind`]）で渡した観測フックを
     /// 参照する（[`crate::server::UdsServer::observer`] への委譲。#1115
     /// Bugbot レビュー指摘対応: `BoundWriteback` が `UdsServer` を包む前は
     /// 呼び出し側が `UdsServer::observer` を直接呼べたが、ラップしたことで
@@ -358,7 +358,7 @@ impl<O: ServerObserver> BoundWriteback<O> {
         self.server.observer()
     }
 
-    /// [`Self::bind`]（[`WritebackSettings::bind`]）で渡した観測フックを
+    /// `bind`（[`WritebackSettings::bind`]）で渡した観測フックを
     /// 可変参照で取り出す（[`crate::server::UdsServer::observer_mut`] への
     /// 委譲）。[`crate::observe::JsonLinesServerObserver::drain_lines`] 等、
     /// Accept イベントをためた行として取り出す操作に使う（#1115 Bugbot
@@ -414,14 +414,14 @@ impl<C: ServerObserver> BoundConnection<C> {
         self.settings
     }
 
-    /// [`Self::accept`]（[`BoundWriteback::accept`]）で渡した観測フックを
+    /// `accept`（[`BoundWriteback::accept`]）で渡した観測フックを
     /// 参照する（[`crate::server::UdsConnection::observer`] への委譲。#1115
     /// Bugbot レビュー指摘対応）。
     pub fn observer(&self) -> &C {
         self.conn.observer()
     }
 
-    /// [`Self::accept`]（[`BoundWriteback::accept`]）で渡した観測フックを
+    /// `accept`（[`BoundWriteback::accept`]）で渡した観測フックを
     /// 可変参照で取り出す（[`crate::server::UdsConnection::observer_mut`]
     /// への委譲。#1115 Bugbot レビュー指摘対応）。
     pub fn observer_mut(&mut self) -> &mut C {

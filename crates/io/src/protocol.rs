@@ -306,7 +306,7 @@ impl FrameHeader {
 
     /// ヘッダを `[version: u8][kind: u8][payload_len: u32 LE][header_crc: u32 LE]`
     /// の固定長配列へ変換する。`header_crc` は `[version][kind][payload_len]`
-    /// （[`Self::prefix_bytes`]）に対する CRC-32C を計算して埋める。
+    /// （`Self::prefix_bytes`）に対する CRC-32C を計算して埋める。
     /// 添字アクセスを避けるため分割代入で組み立てる（coding-rust「外部入力」節）。
     pub fn to_bytes(&self) -> [u8; FRAME_HEADER_LEN] {
         let prefix = self.prefix_bytes();
@@ -402,9 +402,9 @@ impl FrameChecksum {
 /// # 不変条件
 /// - `header.payload_len().get() as usize == payload.len()`
 /// - `checksum` はヘッダの意味あるフィールド（`[version][kind][payload_len]`。
-///   [`HEADER_PREFIX_LEN`] バイト。`header_crc` は含めない） ‖ `payload` に
+///   `HEADER_PREFIX_LEN` バイト。`header_crc` は含めない） ‖ `payload` に
 ///   対する CRC-32C と一致する（対象から `header_crc` を除く理由は
-///   [`Self::compute_checksum`] を参照）
+///   `Self::compute_checksum` を参照）
 ///
 /// フィールドは非公開で、[`Self::new`]・[`Self::decode`]・[`Self::decode_body`] を
 /// 経由しない限り値を作れない。ペイロードは不透明なバイト列として扱い、
@@ -524,7 +524,7 @@ impl Frame {
     ///    再計算した CRC-32C と比較。不一致なら [`IoErrorCode::DataLoss`]
     ///
     /// `body` は untrusted なトランスポート由来の入力を想定し、添字アクセスではなく
-    /// `split_last_chunk` で読む。申告長に比例するアロケーション（[`copy_validated_payload`]）
+    /// `split_last_chunk` で読む。申告長に比例するアロケーション（`copy_validated_payload`）
     /// は、上記 1〜3 の検証をすべて通過した後にしか呼ばれない（DoS 対策。security.md・
     /// TASK-83.2・#117）。
     ///

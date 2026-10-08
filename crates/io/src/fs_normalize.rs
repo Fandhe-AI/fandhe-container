@@ -32,7 +32,7 @@
 //!
 //! # 畳み込み方式と、これが近似であること（REPAIR-3）
 //! 大文字小文字の畳み込みは各文字へ lower → upper → lower を順に適用する方式
-//! （[`fold_component`] 参照）で、Unicode の case folding の近似に過ぎない。
+//! （`fold_component` 参照）で、Unicode の case folding の近似に過ぎない。
 //! APFS の `casefold` 正規化表・NTFS の upcase table と厳密に一致することは
 //! 主張しない。方式は「衝突の見逃しより過検出を選ぶ」よう選んでいる: 見逃しは
 //! ホスト側での黙った上書き（データ損失）に直結するが、過検出はゲストに見える
@@ -56,7 +56,7 @@
 //! 適用されない。
 //!
 //! # 検証の位置づけ（多層防御の 1 枚）
-//! [`validate_guest_relative_path`] は先頭 `/`・`.`・`..`・空コンポーネント・
+//! `validate_guest_relative_path` は先頭 `/`・`.`・`..`・空コンポーネント・
 //! NUL を拒否するが、これはパストラバーサルを主目的として防ぐ層ではない。
 //! rootfs 配下への閉じ込めを保証する本来の検証は、サーバー側の書き込み経路
 //! （[`crate::guest_files`] のコンポーネント検証・祖先確認・`create_new`。#100）の
@@ -109,7 +109,7 @@ use std::path::Path;
 
 use crate::error::{IoError, IoErrorCode};
 
-/// [`quote_for_message`] がエラーメッセージへ埋め込む 1 パスあたりの最大文字数
+/// `quote_for_message` がエラーメッセージへ埋め込む 1 パスあたりの最大文字数
 /// （公開定数。呼び出し側がメッセージ全体の見積もりに使えるようにする）。
 ///
 /// ゲスト由来の任意長パスをそのままログ・エラーメッセージへ載せると、巨大な
@@ -117,7 +117,7 @@ use crate::error::{IoError, IoErrorCode};
 /// ため、char 境界で切り詰める。
 pub const MAX_COLLISION_MESSAGE_PATH_CHARS: usize = 128;
 
-/// [`quote_for_message`] がエスケープ後に 1 パスへ割り当てる最大バイト数（引用符・
+/// `quote_for_message` がエスケープ後に 1 パスへ割り当てる最大バイト数（引用符・
 /// 切り詰めの `...` を除く）。マルチバイト文字・エスケープ展開（`\u{..}`）を含む
 /// 最悪ケースでも、衝突メッセージ（パス 4 つ埋め込み）が
 /// [`crate::MAX_IO_ERROR_MESSAGE_BYTES`] に収まり末尾の要素名が失われないようにする
@@ -188,7 +188,7 @@ pub fn measure_host_path_length(path: &Path) -> HostPathLength {
 /// ホストパスが [`MAX_HOST_PATH_CHARS`] 以内か検証する（エラーとして扱う経路。IO-5）。
 ///
 /// 超過時は `IoErrorCode::InvalidArgument`（メッセージに計測値と上限を含み、
-/// パスは [`quote_for_message`] で衛生化・切り詰めて埋め込む）。
+/// パスは `quote_for_message` で衛生化・切り詰めて埋め込む）。
 ///
 /// # WIN-4 との関係（TASK-20.2・#797）
 /// - `system.wsl_case_sensitive`（WIN-4。NTFS のディレクトリ単位の case-sensitive
@@ -500,15 +500,15 @@ impl CaseCollisionSet {
     /// `path` を検証・畳み込みしたうえで索引へ登録する。
     ///
     /// # 挙動
-    /// 1. [`validate_guest_relative_path`] で形式を検証する（不正なら
+    /// 1. `validate_guest_relative_path` で形式を検証する（不正なら
     ///    [`IoErrorCode::InvalidArgument`]）
-    /// 2. 根から順に各コンポーネントを [`CaseFoldKey`]（親ノード＋畳み込み結果）
+    /// 2. 根から順に各コンポーネントを `CaseFoldKey`（親ノード＋畳み込み結果）
     ///    で引く
     /// 3. 既存ノードがあり、元の表記も完全一致するならそのノードへ降りる
     ///    （同一ディレクトリの共有・同一ファイルへの複数回書き込みは正常な処理）
     /// 4. 既存ノードがあり、元の表記が大文字小文字の違いだけで異なるなら
     ///    [`IoErrorCode::AlreadyExists`] を返す。`message` には両方のパスと
-    ///    衝突したコンポーネントを [`quote_for_message`] で衛生化して含める
+    ///    衝突したコンポーネントを `quote_for_message` で衛生化して含める
     /// 5. 既存ノードが無ければ新設して降りる
     ///
     /// 4 のエラーは 5 の新設より前にしか起こらない（新設したノードには子が

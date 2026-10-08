@@ -51,7 +51,7 @@ use crate::protocol::FrameKind;
 /// # 借用型である理由（#73 P0 再指摘対応。REPAIR-5「不安全な設計」観点）
 ///
 /// `error` の `message`（[`SendEventError::message`]）は呼び出し元
-/// （[`crate::client::PipelineClient::notify`]）がすでに保持している
+/// （`crate::client::PipelineClient::notify`）がすでに保持している
 /// [`crate::error::IoError`] の内部文字列を借用するだけで、複製しない。
 /// [`SendObserver::on_send`] は `&SendEvent<'_>` を受け取る間だけ有効な借用で、
 /// 呼び出しが終われば無効になる（`'static` としてどこかへ保持できない）。
@@ -114,7 +114,7 @@ pub struct SendEventError<'a> {
 
 /// ためた `message` を無制限に出さないよう、長さと切り詰め済みの先頭のみを出す
 /// 手書きの `Debug`（#73 P0 再指摘対応。`{:?}` 経由で全量が出力される経路を防ぐ。
-/// [`truncate_message_bytes`] を再利用する）。
+/// `truncate_message_bytes` を再利用する）。
 impl fmt::Debug for SendEventError<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (prefix, truncated) = truncate_message_bytes(self.message);
@@ -137,7 +137,7 @@ impl fmt::Debug for SendEventError<'_> {
 /// # 借用型である理由
 ///
 /// [`SendEvent`] のドキュメント参照。`error`（[`AckEventError::message`]）は
-/// 呼び出し元（[`crate::client::PipelineClient::notify_ack`]）が保持する
+/// 呼び出し元（`crate::client::PipelineClient::notify_ack`）が保持する
 /// [`crate::error::IoError`] の内部文字列を借用するだけで、複製しない。
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -286,7 +286,7 @@ const _: () = assert!(
 ///
 /// `capacity`（行数上限）だけでは、1 行あたりのメッセージが巨大な場合に
 /// キュー全体のメモリ使用量が無制限に膨らみうる。エンコード前にこの長さで
-/// 切り詰め、UTF-8 の文字境界を跨がないよう調整する（[`truncate_message_bytes`]）。
+/// 切り詰め、UTF-8 の文字境界を跨がないよう調整する（`truncate_message_bytes`）。
 pub const MAX_SEND_LOG_MESSAGE_BYTES: usize = 512;
 
 // `IoError` 側の上限で切られたメッセージ（文字境界調整で最大 3 バイト減る）が観測ログでも
@@ -498,7 +498,7 @@ impl BoundedJsonLines {
 /// 本 crate は `serde_json` 等へ依存しない（dependency-policy）。JSON は手書きで
 /// 組み立てるため、固定語彙のフィールド（`event`・`kind`・`outcome`・`reason`・
 /// `code`）はエスケープ不要な既知の値のみを書き込み、`message` のような任意文字列
-/// （untrusted なトランスポート由来を含みうる）だけを [`escape_json_string`] で
+/// （untrusted なトランスポート由来を含みうる）だけを `escape_json_string` で
 /// エスケープする。
 ///
 /// # `on_send` は I/O をしない（REPAIR-5。codex 再指摘対応）

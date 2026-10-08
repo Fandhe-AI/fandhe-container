@@ -78,7 +78,7 @@
 //! credential 拒否は件数を分けて数え（H1・#820 security-auditor 指摘対応。
 //! SEC-4「分離違反の試行は監査ログに記録する」の対象になる事象を、単なる
 //! 相手都合の切断と混同しないため）、それぞれ独立に期限・
-//! [`imp::MAX_ACCEPT_ABORT_RETRIES`] の両方で有界に再試行する
+//! `imp::MAX_ACCEPT_ABORT_RETRIES` の両方で有界に再試行する
 //! （`AcceptAttempt` のドキュメンテーションコメント参照）。件数の加算と
 //! （peer credential 拒否の場合の）観測通知は、期限切れの判定より必ず先に
 //! 行う（H3・#820 security-auditor 指摘対応。期限の直前に起きた拒否も記録に

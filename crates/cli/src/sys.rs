@@ -345,7 +345,7 @@ mod tests {
 
     /// PLUG-7・#1513: 登録したハンドラ値とフラグ（`SA_RESETHAND | SA_RESTART`）を OS から読み戻して照合する
     /// （構造体レイアウト・定数の取り違えを検出する）。Linux はカーネルが `SA_RESTORER` を加えて返すため、
-    /// 期待するビットをマスクして照合する。
+    /// 期待するビットをマスクして照合する（macOS の差は本文のコメント）。
     #[test]
     fn plug7_installed_handler_reads_back_with_expected_flags() {
         let (before, _) = imp::current(SIGWINCH).unwrap();
@@ -356,7 +356,13 @@ mod tests {
         );
         let (handler, flags) = imp::current(SIGWINCH).unwrap();
         assert_eq!(handler, imp::forwarding_handler_value());
+        // macOS（xnu）は読み戻しの `sa_flags` に `SA_RESETHAND` を含めない（`SA_RESTART` 等だけを再構成する）
+        // ため、macOS では `SA_RESTART` だけを照合する。`SA_RESETHAND` が効くこと（ハンドラ後に既定動作で
+        // 終了すること）は結合試験 `tests/signal_forward.rs` の親のシグナル終了で確かめている。
+        #[cfg(target_os = "linux")]
         let want = layout::SA_RESETHAND | layout::SA_RESTART;
+        #[cfg(target_os = "macos")]
+        let want = layout::SA_RESTART;
         assert_eq!(flags & want, want);
     }
 

@@ -58,6 +58,7 @@ impl BackendPlugin {
 /// ホスト OS に対応するバックエンド（macOS / Windows 以外は `None`）。CLI-1 の OS 分岐はここに局所化する。
 ///
 /// Linux では module が単体テスト時だけコンパイルされ、本番経路（[`unavailable`]）は呼ばれないため dead_code を許す。
+/// OS 別のバックエンド振り分けであり OS 固有設定（CLI-2・TASK-80.2）ではない。setup module は参照しない。
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(super) fn host_backend() -> Option<BackendPlugin> {
     if cfg!(target_os = "macos") {

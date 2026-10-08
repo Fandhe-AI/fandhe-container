@@ -10,7 +10,7 @@
 //!   CLI からの昇格・シェル / 外部コマンド起動・設定ファイル / レジストリの変更は行わない。
 //!
 //! 将来仕様: ステップの検出・適用（Windows は WIN-1・WIN-2・WIN-4・WIN-5、macOS は MAC-1〔Virtualization.framework 経路〕。plugin 経由。TASK-114・TASK-125。本タスクは TASK-80.1・MS-6・CLI-2）。
-//! 日常操作コマンドの実行パスから OS 固有設定を除く整理は TASK-80.2、分離の単体テストは TASK-80.3。
+//! 日常操作コマンドからの切り離しは TASK-80.2 で確立済み（参照点は `commands::run_setup` のみ）。分離の単体テストは TASK-80.3。
 
 use std::io::Write;
 
@@ -61,7 +61,7 @@ pub enum SetupPlatform {
 }
 
 /// 実行中のホストの区分（`cfg!(target_os)` による分岐はここだけ）。
-pub fn host_platform() -> SetupPlatform {
+fn host_platform() -> SetupPlatform {
     if cfg!(target_os = "linux") {
         SetupPlatform::Linux
     } else if cfg!(target_os = "macos") {

@@ -114,6 +114,8 @@ pub mod seccomp;
 pub mod state_store;
 #[cfg(target_os = "linux")]
 mod sys;
+#[cfg(test)]
+mod test_support;
 pub mod tmpfs;
 pub mod traits;
 

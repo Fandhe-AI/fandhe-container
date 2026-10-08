@@ -186,6 +186,23 @@ mod imp {
         }
         Ok(Disposition::Installed)
     }
+
+    /// テスト専用: `sig` の現在の設定（ハンドラ値・フラグ）を読み出す（登録内容の読み戻し照合用）。
+    #[cfg(test)]
+    pub(super) fn current(sig: i32) -> io::Result<(usize, i32)> {
+        let mut old = layout::empty();
+        // SAFETY: `act` は NULL（取得のみ）、`old` は呼び出し中有効なスタック上の書き込み可能な領域。
+        if unsafe { sigaction(sig, std::ptr::null(), &mut old) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((old.handler, old.flags))
+    }
+
+    /// テスト専用: 転送用の固定ハンドラの値（読み戻し照合の期待値）。
+    #[cfg(test)]
+    pub(super) fn forwarding_handler_value() -> usize {
+        forward_and_reraise as extern "C" fn(i32) as usize
+    }
 }
 
 #[cfg(not(any(
@@ -222,12 +239,15 @@ pub(crate) use imp::install_forwarding_handler;
 #[cfg(feature = "signal-test-support")]
 pub(crate) use imp::{install_recording_handler, recorded_signal};
 
+// 対象は構造体レイアウトを確認済みの `imp`（実装側）と同じ cfg に揃える（musl 等の fail-closed 側を
+// 実装側の試験で検証したことにしない。PR #1572 事後監査の P3）。
 #[cfg(all(
     test,
     any(
         target_os = "macos",
         all(
             target_os = "linux",
+            target_env = "gnu",
             any(target_arch = "x86_64", target_arch = "aarch64")
         )
     )
@@ -235,9 +255,32 @@ pub(crate) use imp::{install_recording_handler, recorded_signal};
 mod tests {
     use super::*;
 
+    /// EINVAL は Linux（asm-generic/errno-base.h）・macOS（sys/errno.h）とも 22。
+    const EINVAL: i32 = 22;
+    /// SIGWINCH は Linux・macOS とも 28。既定動作は無視で、テストハーネスの動作を乱さない。
+    const SIGWINCH: i32 = 28;
+
     /// 範囲外のシグナル番号は OS のエラー（EINVAL）で失敗する。
     #[test]
     fn install_handler_rejects_invalid_signal_number() {
-        assert!(install_forwarding_handler(100_000).is_err());
+        let e = install_forwarding_handler(100_000).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(EINVAL));
+    }
+
+    /// PLUG-7・#1513: 登録したハンドラ値とフラグ（`SA_RESETHAND | SA_RESTART`）を OS から読み戻して照合する
+    /// （構造体レイアウト・定数の取り違えを検出する）。Linux はカーネルが `SA_RESTORER` を加えて返すため、
+    /// 期待するビットをマスクして照合する。
+    #[test]
+    fn plug7_installed_handler_reads_back_with_expected_flags() {
+        let (before, _) = imp::current(SIGWINCH).unwrap();
+        assert_eq!(before, 0, "SIGWINCH must start as SIG_DFL");
+        assert_eq!(
+            install_forwarding_handler(SIGWINCH).unwrap(),
+            Disposition::Installed
+        );
+        let (handler, flags) = imp::current(SIGWINCH).unwrap();
+        assert_eq!(handler, imp::forwarding_handler_value());
+        let want = layout::SA_RESETHAND | layout::SA_RESTART;
+        assert_eq!(flags & want, want);
     }
 }

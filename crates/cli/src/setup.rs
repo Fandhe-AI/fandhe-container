@@ -9,7 +9,7 @@
 //! - WSL2 有効化・Developer Mode は管理者権限を要し、macOS の entitlement はビルド / 署名時の属性で実行時には付与できない。
 //!   CLI からの昇格・シェル / 外部コマンド起動・設定ファイル / レジストリの変更は行わない。
 //!
-//! 将来仕様: ステップの検出・適用（Windows は WIN-1・WIN-2・WIN-4・WIN-5、macOS は MAC 系。plugin 経由。TASK-114・TASK-125）。
+//! 将来仕様: ステップの検出・適用（Windows は WIN-1・WIN-2・WIN-4・WIN-5、macOS は MAC-1〔Virtualization.framework 経路〕。plugin 経由。TASK-114・TASK-125。本タスクは TASK-80.1・MS-6・CLI-2）。
 //! 日常操作コマンドの実行パスから OS 固有設定を除く整理は TASK-80.2、分離の単体テストは TASK-80.3。
 
 use std::io::Write;
@@ -27,9 +27,9 @@ pub enum SetupStep {
     DeveloperMode,
     /// Windows: `.wslconfig` の `virtiofs=true`（管理者権限は不要。WIN-2・WIN-5）。
     WslconfigVirtiofs,
-    /// macOS: `com.apple.security.virtualization` entitlement とコード署名（MAC 系）。
+    /// macOS: `com.apple.security.virtualization` entitlement とコード署名（CLI-2・MAC-1。spec は entitlement の具体値を定義せず、Virtualization.framework 利用の前提として扱う）。
     VirtualizationEntitlement,
-    /// macOS: macOS 13 以上であること（MAC 系）。
+    /// macOS: macOS 13 以上であること（CLI-2・MAC-1。spec は最小 macOS 版数を定義していないため、13 以上は本実装の暫定要件で、版数が確定した時点で spec 側の更新をユーザーへ報告する）。
     MacosMinVersion,
 }
 
@@ -160,7 +160,7 @@ mod tests {
         );
     }
 
-    /// CLI-2: macOS のステップ（MAC 系）。
+    /// CLI-2: macOS のステップ（MAC-1）。
     #[test]
     fn cli2_required_steps_macos() {
         let got: Vec<(&str, bool)> = required_steps(SetupPlatform::Macos)

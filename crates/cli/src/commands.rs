@@ -100,6 +100,11 @@ pub enum CliExit {
     /// 終了コードは core の `exit_code_for`、`message` は本 module の固定文言表（[`failure_message`]）で、
     /// core の `TraitError::message` は出力へ流さない（エスケープ不要の定数のみ）。
     Failed(ErrorCode),
+    /// 状態ルート（ストアのディレクトリ）が存在しない（終了コード 3・`NOT_FOUND`）。
+    ///
+    /// コンテナ不在（[`CliExit::Failed`] の `NotFound`、文言 `container not found`）と区別するための専用値で、
+    /// `list` / `logs` が状態ストアを開く段階の `NotFound` だけに使う（コンテナ ID を参照していない失敗）。
+    StateRootNotFound,
 }
 
 impl CliExit {
@@ -111,6 +116,7 @@ impl CliExit {
             CliExit::Unimplemented => EXIT_UNIMPLEMENTED,
             CliExit::Runtime(e) => e.exit_code().get(),
             CliExit::Failed(c) => exit_code_for(*c).get(),
+            CliExit::StateRootNotFound => exit_code_for(ErrorCode::NotFound).get(),
         }
     }
 
@@ -122,6 +128,7 @@ impl CliExit {
             CliExit::Unimplemented => Some("UNIMPLEMENTED"),
             CliExit::Runtime(e) => Some(e.code().as_str()),
             CliExit::Failed(c) => Some(c.as_str()),
+            CliExit::StateRootNotFound => Some(ErrorCode::NotFound.as_str()),
         }
     }
 
@@ -142,11 +149,15 @@ impl CliExit {
             }
             CliExit::Runtime(e) => e.write_json_line(out),
             CliExit::Failed(c) => out.write_all(fixed(c.as_str(), failure_message(*c)).as_bytes()),
+            CliExit::StateRootNotFound => out.write_all(
+                fixed(ErrorCode::NotFound.as_str(), STATE_ROOT_NOT_FOUND_MESSAGE).as_bytes(),
+            ),
         }
     }
 }
 
 const USAGE_MESSAGE: &str = "usage: fandhe-container <create|start|stop|delete|list|logs>";
+const STATE_ROOT_NOT_FOUND_MESSAGE: &str = "state root not found";
 const UNIMPLEMENTED_MESSAGE: &str = "command is not implemented yet";
 
 /// [`CliExit::Failed`] の固定文言表。引用符・バックスラッシュ・制御文字を含まない定数のみ（テストで固定）。
@@ -345,6 +356,10 @@ mod tests {
             (
                 CliExit::Failed(ErrorCode::NotFound),
                 "{\"code\":\"NOT_FOUND\",\"message\":\"container not found\"}\n",
+            ),
+            (
+                CliExit::StateRootNotFound,
+                "{\"code\":\"NOT_FOUND\",\"message\":\"state root not found\"}\n",
             ),
         ] {
             let mut out = Counting(Vec::new());

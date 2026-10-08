@@ -113,13 +113,22 @@ fn record_op(recorder: &OpRecorder, op_name: &str, ok: bool, started: Instant) {
     }
 }
 
+/// 状態ストアを開く段階の失敗を終了値へ写す。コンテナ ID を参照していない段階の `NotFound` は
+/// 状態ルート不在であり、コンテナ不在（`container not found`）と誤報しない。
+fn store_open_failure(e: &TraitError) -> CliExit {
+    match e.code() {
+        ErrorCode::NotFound => CliExit::StateRootNotFound,
+        c => CliExit::Failed(c),
+    }
+}
+
 /// 本番入口の `list`。成功時は stdout に一覧を出す。
 pub(super) fn run_list(global: &GlobalArgs, _args: &ListArgs, stdout: &mut dyn Write) -> CliExit {
     let started = Instant::now();
     let rt = match production_runtime(global, OpRecorder::new(), "list", started, || Ok(())) {
         Ok((rt, ())) => rt,
         // core 到達前の失敗は production_runtime が記録・出力済み。
-        Err(e) => return CliExit::Failed(e.code()),
+        Err(e) => return store_open_failure(&e),
     };
     let page_size = NonZeroU32::new(MAX_PAGE_SIZE).unwrap_or(NonZeroU32::MIN);
     let result = list_containers(rt.store.as_ref(), stdout, page_size);
@@ -127,7 +136,8 @@ pub(super) fn run_list(global: &GlobalArgs, _args: &ListArgs, stdout: &mut dyn W
     export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
     match result {
         Ok(()) => CliExit::Success,
-        Err(e) => CliExit::Failed(e.code()),
+        // list はコンテナを参照しないため、NotFound はコンテナ不在ではない。
+        Err(e) => store_open_failure(&e),
     }
 }
 
@@ -139,15 +149,21 @@ pub(super) fn run_logs(global: &GlobalArgs, args: &LogsArgs) -> CliExit {
     });
     let (rt, id) = match prepared {
         Ok(v) => v,
-        Err(e) => return CliExit::Failed(e.code()),
+        Err(e) => return store_open_failure(&e),
     };
-    let result = container_exists(rt.store.as_ref(), &id);
-    record_op(&rt.recorder, "logs", result.is_ok(), started);
-    export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
-    match result {
+    // 計測は最終結果（未実装を含む）から 1 回だけ決める。存在確認が通っても未実装で終わるため Failure（REPAIR-4）。
+    let exit = match container_exists(rt.store.as_ref(), &id) {
         Ok(()) => CliExit::Unimplemented,
         Err(e) => CliExit::Failed(e.code()),
-    }
+    };
+    record_op(
+        &rt.recorder,
+        "logs",
+        matches!(exit, CliExit::Success),
+        started,
+    );
+    export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
+    exit
 }
 
 #[cfg(test)]
@@ -157,7 +173,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn record(status: ContainerStatus) -> StateRecord {
-        StateRecord::new(status, PathBuf::from("/b"), StateRevision::from_raw(1)).expect("rec")
+        StateRecord::new(status, std::env::temp_dir(), StateRevision::from_raw(1)).expect("rec")
     }
 
     fn cid(s: &str) -> ContainerId {
@@ -176,6 +192,21 @@ mod tests {
             &mut s,
         );
         assert_eq!(s, "a1\tcreated\t-\nb2\trunning\t4242\nc3\tstopped\t-\n");
+    }
+
+    /// CLI-1: ストアを開く段階の NotFound は状態ルート不在で、コンテナ不在と区別される。
+    #[test]
+    fn cli1_store_open_not_found_is_state_root() {
+        let nf = TraitError::new(ErrorCode::NotFound, "x");
+        assert!(matches!(
+            store_open_failure(&nf),
+            CliExit::StateRootNotFound
+        ));
+        let inv = TraitError::new(ErrorCode::InvalidArgument, "x");
+        assert!(matches!(
+            store_open_failure(&inv),
+            CliExit::Failed(ErrorCode::InvalidArgument)
+        ));
     }
 
     #[cfg(target_os = "linux")]

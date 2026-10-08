@@ -8,7 +8,7 @@
 <本文（任意・日本語）>
 ```
 
-commit-msg フック（lefthook の正規表現検査）と `make lint-commits`（commitlint・`commitlint.config.mjs`）で検証する。
+commit-msg フック（lefthook の正規表現検査と本文・フッターの行長検査〔100 文字〕）と `make lint-commits`（commitlint・`commitlint.config.mjs`）で検証する。
 
 ## type
 

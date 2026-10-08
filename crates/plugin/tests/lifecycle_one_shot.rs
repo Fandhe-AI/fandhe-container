@@ -99,6 +99,27 @@ mod unix {
         match behavior.as_str() {
             "exit_early" => {}
             "stderr_exit_early" => write_stderr(b"boom: cannot start\n"),
+            // 孫（`/bin/sleep 60`。stderr を引き継ぐ）を起動し、pid をファイルへ書いてから、接続後に
+            // 応答せず待つ（#1311。プロセスグループ単位の回収を確かめる）。
+            "grandchild_silent" => {
+                #[allow(clippy::zombie_processes)]
+                let gc = std::process::Command::new("/bin/sleep")
+                    .arg("60")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap();
+                let dir = sock.parent().unwrap();
+                std::fs::write(dir.join("gc.tmp"), gc.id().to_string()).unwrap();
+                std::fs::rename(dir.join("gc.tmp"), dir.join("grandchild.pid")).unwrap();
+                let _s = UdsStream::connect(
+                    &sock,
+                    Duration::from_secs(5),
+                    &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+                )
+                .unwrap();
+                std::thread::sleep(Duration::from_secs(60));
+            }
             "silent_no_connect" => std::thread::sleep(Duration::from_secs(60)),
             mode => {
                 // 接続前に書く。親が stderr を読み続けていなければバッファが埋まって子はここで止まる。
@@ -196,6 +217,34 @@ mod unix {
         );
         #[cfg(not(target_os = "linux"))]
         let _ = pid;
+    }
+
+    /// 孫が有限時間内に存在しなくなる（init に引き取られ回収されるまでの猶予を見る）ことを確かめる。
+    /// Linux ではゾンビ（`Z`）も消滅として扱う（pid 1 が回収しない開発コンテナ対応）。
+    fn assert_process_gone_within(pid: u32, limit: Duration) {
+        let start = Instant::now();
+        loop {
+            let alive = crate::is_alive(pid);
+            if !alive {
+                return;
+            }
+            assert!(start.elapsed() < limit, "grandchild {pid} still alive");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// #1311・PLUG-7・REPAIR-5: タイムアウト後始末の kill はプロセスグループ全体へ届き、孫も残らない。
+    #[test]
+    fn plug7_one_shot_timeout_kills_grandchild_process_group() {
+        let (res, elapsed, dir) = run("grandchild_silent", 2000);
+        assert_eq!(res.unwrap_err().code(), PluginErrorCode::Timeout);
+        assert!(elapsed < Duration::from_secs(8), "{elapsed:?}");
+        let pid: u32 = std::fs::read_to_string(dir.0.join("grandchild.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_process_gone_within(pid, Duration::from_secs(5));
     }
 
     fn no_socket_left(dir: &TempDir) {
@@ -378,5 +427,53 @@ mod unix {
         .unwrap_err();
         assert_eq!(err.code(), PluginErrorCode::NotFound);
         no_socket_left(&dir);
+    }
+}
+
+/// 孫の生存確認（#1311）。Linux は `/proc/<pid>/stat` を読み、ゾンビ（`Z`）を終了済みとして扱う（pid 1 が
+/// 回収しない開発コンテナ対応）。外部コマンド（procps の `kill`。開発コンテナの slim イメージに無い）に
+/// 依存しない。呼び出し元は `mod unix` のみ。
+#[cfg(target_os = "linux")]
+fn is_alive(pid: u32) -> bool {
+    // `pid (comm) state ...`。comm に空白や括弧を含み得るため、最後の ')' の後ろを見る。
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(')')
+            .and_then(|(_, rest)| rest.trim_start().chars().next())
+            .is_some_and(|state| state != 'Z')
+    })
+}
+
+/// 孫の生存確認（#1311）。`/proc` の無い unix（macOS）は OS 標準の `/bin/kill -0` で確かめ、外部コマンドの
+/// 待機にも期限を設ける（REPAIR-5）。呼び出し元は `mod unix` のみ。
+#[cfg(all(unix, not(target_os = "linux")))]
+fn is_alive(pid: u32) -> bool {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let mut child = Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn kill");
+    let start = Instant::now();
+    loop {
+        match child.try_wait().expect("try_wait") {
+            Some(st) => return st.success(),
+            None if start.elapsed() < Duration::from_secs(10) => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            None => {
+                let _ = child.kill();
+                let reap = Instant::now();
+                while reap.elapsed() < Duration::from_secs(2) {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                panic!("kill -0 timed out for pid {pid}");
+            }
+        }
     }
 }

@@ -102,6 +102,13 @@ fail() { rc=1; }
 # 実カーネルの DRM_INFO 系ログ（Host memory window・num_scanouts is zero・KMS disabled・
 # capset timeout 等）は "virtio_gpu virtioN:" ではなく "[drm]" 接頭辞だけで出るため、
 # 単一デバイス時は当該デバイス接頭辞の行に加えて "[drm]" 行も判定対象に残す。
+# probe 失敗行はデバイス接頭辞の有無に関わらず（例: "virtio_gpu: probe of virtio0 failed with
+# error -12"）下のデバイス単位フィルタで落ちるため、フィルタ前の全文で検出して拒否する。
+# 後続に失敗行がある限り、先行する features / capset 行があっても成功にしない。
+probe_failed=0
+if grep -qiE 'virtio.?gpu.*(probe .*failed|failed to (initialize|probe)|initialization failed)' "$tmp"; then
+  probe_failed=1
+fi
 devs="$(grep -oE 'virtio.?gpu virtio[0-9]+:' "$tmp" | grep -oE 'virtio[0-9]+' | sort -u || true)"
 dev_count="$(printf '%s' "$devs" | grep -c . || true)"
 if [ "$dev_count" -gt 1 ]; then
@@ -123,7 +130,10 @@ fi
 # context_init は別行（features: +context_init）に出る。両行を結合して照合する。
 feats="$(grep -E '(virtio.?gpu|\[drm\]).*features: ' "$tmp" || true)"
 
-if [ -n "$feats" ]; then
+if [ "$probe_failed" -eq 1 ]; then
+  echo "probe=failed"
+  fail
+elif [ -n "$feats" ]; then
   echo "probe=ok"
 else
   echo "probe=missing"

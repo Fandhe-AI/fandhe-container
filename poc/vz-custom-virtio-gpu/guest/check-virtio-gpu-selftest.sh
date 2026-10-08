@@ -76,6 +76,8 @@ host_memory_window=present" --dmesg-file "$fx/drm-prefix-zero-scanouts.log"
 expect_case drm-prefix-multi-section 1 "probe=multiple_sections" --dmesg-file "$fx/drm-prefix-multi-section.log"
 expect_case capset-version-nonzero 1 "capset_max_version=3" --dmesg-file "$fx/capset-version-nonzero.log"
 expect_case host-window-zero 1 "host_memory_window=zero_size" --dmesg-file "$fx/host-window-zero.log"
+expect_case probe-failed 1 "probe=failed" --dmesg-file "$fx/probe-failed.log"
+expect_case probe-failed-driver 1 "probe=failed" --dmesg-file "$fx/probe-failed-driver.log"
 expect_case venus-diagnostic-only 1 "venus_init=missing" --dmesg-file "$fx/ok.log" --vulkaninfo-file "$fx/vulkaninfo-diagnostic.txt"
 expect_case venus-no-devices 1 "venus_init=no_devices" --dmesg-file "$fx/ok.log" --vulkaninfo-file "$fx/vulkaninfo-nodevices.txt"
 

@@ -198,7 +198,7 @@ impl OneShotPlugin {
 #[non_exhaustive]
 pub enum OneShotTermination {
     /// 自発終了した（強制終了を試みる直前・直後に自発終了していた場合を含む）。`code` はシグナル
-    /// 終了などで取得できない場合 `None`。
+    /// 終了などで取得できない場合 `None`。他所で回収され終了状態が不明な場合（`code: None`）を含む。
     Exited { code: Option<i32> },
     /// 猶予内に終了せず強制終了し、回収まで確認した（回収した終了状態が強制終了によるもの）。
     Killed,
@@ -574,6 +574,9 @@ impl ChildGuard {
         // 進行中の転送の完了を待つ。上限内に確認できなければ回収しない（ロード済みの pid へ送信中の
         // 転送スレッドが、回収後に再利用された pid へ送る誤配送を防ぐ。PLUG-7・fail-closed）。
         // この場合も kill は安全（未回収の子の pid は再利用されない）なので送り、`Unreaped` を返す。
+        // ただし回収と転送の競合を避けるため `waitpid` で確認できず、契約外の他所での回収（`signal_forward`
+        // の「制限」）と重なった場合だけ再利用された pid へ届き得る（回収しない確認には `waitid` の
+        // `WNOWAIT` が要る。#1513）。
         // `Child` は保持し続け、回収は行わない（pid を回収前に手放さない）。
         if let Some(slot) = self.slot.take()
             && !slot.suspend()

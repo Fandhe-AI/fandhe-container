@@ -107,6 +107,7 @@ pub enum ResidentState {
     /// 子が稼働中で、接続を保持している。
     Running,
     /// 子が自発的に終了し、回収済み。`code` はシグナル終了などで取得できない場合 `None`。
+    /// 他所で回収され終了状態が不明な場合（`code: None`）を含む。
     Exited { code: Option<i32> },
     /// 往復の失敗等でこちらが強制終了し、回収まで確認した。
     Killed,

@@ -43,6 +43,8 @@ fn run(args: &[&str]) -> Output {
 fn run_env(args: &[&str], envs: &[(&str, &std::ffi::OsStr)]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_fandhe-container"))
         .args(args)
+        // PATH 探索の opt-in を環境から持ち込まず、結果を決定的にする（PLUG-11）。
+        .env_remove("FANDHE_CONTAINER_PLUGIN_PATH_SEARCH")
         .envs(envs.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -390,7 +392,8 @@ fn err2_create_rejects_relative_bundle() {
     );
 }
 
-/// SEC-1: Linux 以外では状態ストアを開けず fail-closed の UNIMPLEMENTED（8）。
+/// SEC-1・PLUG-4: Linux 以外では plugin 発見機構経由になり、候補なし（既定探索先が空）の fail-closed で
+/// FAILED_PRECONDITION（5）。状態ルートは作らない。
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn sec1_create_fails_closed_off_linux() {
@@ -405,12 +408,19 @@ fn sec1_create_fails_closed_off_linux() {
         abs_bundle.to_str().expect("utf8"),
         "c1",
     ]);
-    assert_eq!(out.status.code(), Some(8));
-    assert_eq!(op_and_code(&out), ("create".into(), "UNIMPLEMENTED".into()));
+    assert_eq!(out.status.code(), Some(5));
+    assert_eq!(
+        op_and_code(&out),
+        ("create".into(), "FAILED_PRECONDITION".into())
+    );
     assert!(out.stdout.is_empty());
+    assert!(!root.exists());
+    // 引数不正は plugin 解決より先に 2 で弾く（3 OS 同一）。
+    let out = run(&["create", "--bundle", "relative", "c1"]);
+    assert_eq!(out.status.code(), Some(2));
 }
 
-/// SEC-1: Linux 以外では状態ストアを開けず stop / delete も fail-closed の UNIMPLEMENTED（8）。
+/// SEC-1・PLUG-4: Linux 以外では stop / delete も plugin 候補なしの fail-closed で FAILED_PRECONDITION（5）。
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn sec1_stop_delete_fail_closed_off_linux() {
@@ -418,8 +428,8 @@ fn sec1_stop_delete_fail_closed_off_linux() {
     let root = tmp.0.join("state");
     for (cmd, op) in [("stop", "kill"), ("delete", "delete")] {
         let out = run(&["--root", root.to_str().expect("utf8"), cmd, "c1"]);
-        assert_eq!(out.status.code(), Some(8));
-        assert_eq!(op_and_code(&out), (op.into(), "UNIMPLEMENTED".into()));
+        assert_eq!(out.status.code(), Some(5));
+        assert_eq!(op_and_code(&out), (op.into(), "FAILED_PRECONDITION".into()));
         assert!(out.stdout.is_empty());
     }
 }
@@ -476,7 +486,8 @@ fn cli1_list_logs_flow_on_linux() {
     );
 }
 
-/// SEC-1: Linux 以外では状態ストアを開けず list / logs も fail-closed の UNIMPLEMENTED（8）。
+/// SEC-1・PLUG-4: Linux 以外では list / logs も plugin 候補なしの fail-closed で FAILED_PRECONDITION（5）。
+/// logs の ID 不正は plugin 解決より先に 2 で弾く。
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn sec1_list_logs_fail_closed_off_linux() {
@@ -488,11 +499,105 @@ fn sec1_list_logs_fail_closed_off_linux() {
         &["--root", root_s, "logs", "c1"],
     ] {
         let out = run(args);
-        assert_eq!(out.status.code(), Some(8));
+        assert_eq!(out.status.code(), Some(5));
         assert_eq!(
             String::from_utf8_lossy(&out.stderr),
-            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"not implemented on this platform\"}\n"
+            "{\"code\":\"FAILED_PRECONDITION\",\"message\":\"failed precondition\"}\n"
         );
         assert!(out.stdout.is_empty());
     }
+    let out = run(&["--root", root_s, "logs", "bad/id"]);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+/// `PATH` 探索の結合試験用に、ホスト OS が必要とする plugin 名のスタブ実行ファイルを置いた一時ディレクトリを作る。
+/// 内容は検証を通らないダミーで、実行されることはない。
+#[cfg(not(target_os = "linux"))]
+fn path_candidate_dir(tag: &str) -> TmpDir {
+    let tmp = TmpDir::new(tag);
+    let suffix = if cfg!(windows) { ".exe" } else { "" };
+    for name in ["macos", "windows"] {
+        std::fs::write(
+            tmp.0
+                .join(format!("fandhe-container-plugin-{name}{suffix}")),
+            b"stub",
+        )
+        .expect("write stub");
+    }
+    tmp
+}
+
+/// stderr の JSON 行のうち `PLUGIN_PATH_CANDIDATE` 警告行の数を数える。
+#[cfg(not(target_os = "linux"))]
+fn path_warning_lines(out: &Output) -> usize {
+    String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter(|l| l.contains("\"code\":\"PLUGIN_PATH_CANDIDATE\""))
+        .count()
+}
+
+/// PLUG-11・CLI-1・REPAIR-12: 既定（opt-in なし）では `PATH` 上の候補を探索せず、警告も出ない。
+/// 候補なしの FAILED_PRECONDITION（5）で、stderr は 1 行 JSON のみ。
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn plug11_path_search_is_off_by_default_off_linux() {
+    let tmp = path_candidate_dir("pathdef");
+    let state = tmp.0.join("state");
+    let out = run_env(
+        &["--root", state.to_str().expect("utf8"), "list"],
+        &[("PATH", tmp.0.as_os_str())],
+    );
+    assert_eq!(out.status.code(), Some(5));
+    assert_eq!(path_warning_lines(&out), 0);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "{\"code\":\"FAILED_PRECONDITION\",\"message\":\"failed precondition\"}\n"
+    );
+    assert!(out.stdout.is_empty());
+}
+
+/// PLUG-11・CLI-1・REPAIR-12: `--plugin-path-search` で opt-in すると候補ごとに警告が stderr へ出る
+/// （macOS / Windows の 2 候補で 2 行）。名前一致だけでは採用されず、信頼性検証の未実装で拒否される
+/// （UNIMPLEMENTED = 8）。
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn plug11_path_search_flag_warns_and_rejects_off_linux() {
+    let tmp = path_candidate_dir("pathflag");
+    let state = tmp.0.join("state");
+    let out = run_env(
+        &[
+            "--plugin-path-search",
+            "--root",
+            state.to_str().expect("utf8"),
+            "list",
+        ],
+        &[("PATH", tmp.0.as_os_str())],
+    );
+    assert_eq!(out.status.code(), Some(8));
+    assert_eq!(path_warning_lines(&out), 2);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let last = stderr.lines().last().expect("last line");
+    assert!(last.contains("\"code\":\"UNIMPLEMENTED\""), "{last}");
+    assert!(out.stdout.is_empty());
+}
+
+/// PLUG-11・CLI-1・REPAIR-12: 環境変数 `FANDHE_CONTAINER_PLUGIN_PATH_SEARCH=1` でもフラグと同じ結果になる。
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn plug11_path_search_env_warns_and_rejects_off_linux() {
+    let tmp = path_candidate_dir("pathenv");
+    let state = tmp.0.join("state");
+    let out = run_env(
+        &["--root", state.to_str().expect("utf8"), "list"],
+        &[
+            ("PATH", tmp.0.as_os_str()),
+            (
+                "FANDHE_CONTAINER_PLUGIN_PATH_SEARCH",
+                std::ffi::OsStr::new("1"),
+            ),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(8));
+    assert_eq!(path_warning_lines(&out), 2);
+    assert!(out.stdout.is_empty());
 }

@@ -1,6 +1,6 @@
 //! `create` / `start` / `stop` / `delete` / `list` / `logs` の argv 解析（TASK-79.2.1・TASK-79.2.2・TASK-79.3・CLI-1・MS-6）。
 //!
-//! `commands::run` が先頭のグローバルオプション（`--root`）とサブコマンド名の後ろを渡して呼ぶ純粋関数群。
+//! `commands::run` が先頭のグローバルオプション（`--root`・`--plugin-path-search`。順不同）とサブコマンド名の後ろを渡して呼ぶ純粋関数群。
 //! ファイルシステムにも環境にも触れず、値の意味検証（絶対パス・ID の文字種）は core の型
 //! （`ContainerId`・`CreateRequest`・`StateRoot`）に委ねる（検査の二重実装を避ける。SEC-1）。
 //! 構文は runc 互換: `fandhe-container [--root <dir>] create --bundle <dir> <id>` / `... start <id>` / `... stop <id>` / `... delete [--force] <id>` / `... list` / `... logs <id>`。
@@ -14,6 +14,10 @@ use std::path::PathBuf;
 pub(super) struct GlobalArgs {
     /// `--root`（状態ルートの上書き）。未指定は core の既定解決。
     pub(super) root: Option<PathBuf>,
+    /// `--plugin-path-search`（macOS / Windows の plugin 発見で `PATH` 探索を opt-in する。PLUG-11）。
+    ///
+    /// 3 OS で同一構文を受理する（CLI-1）が、Linux は plugin を介さず core を直接呼ぶため効果はない。
+    pub(super) plugin_path_search: bool,
 }
 
 /// `create` の引数。
@@ -63,13 +67,23 @@ pub(super) struct UsageError;
 pub(super) fn parse_global(args: Vec<OsString>) -> Result<(GlobalArgs, Vec<OsString>), UsageError> {
     let mut global = GlobalArgs::default();
     let mut it = args.into_iter().peekable();
-    while it.peek().is_some_and(|a| a == "--root") {
-        it.next();
-        let value = it.next().ok_or(UsageError)?;
-        if global.root.is_some() {
-            return Err(UsageError);
+    loop {
+        if it.peek().is_some_and(|a| a == "--root") {
+            it.next();
+            let value = it.next().ok_or(UsageError)?;
+            if global.root.is_some() {
+                return Err(UsageError);
+            }
+            global.root = Some(PathBuf::from(value));
+        } else if it.peek().is_some_and(|a| a == "--plugin-path-search") {
+            it.next();
+            if global.plugin_path_search {
+                return Err(UsageError);
+            }
+            global.plugin_path_search = true;
+        } else {
+            break;
         }
-        global.root = Some(PathBuf::from(value));
     }
     Ok((global, it.collect()))
 }
@@ -218,6 +232,25 @@ mod tests {
         assert_eq!(parse_global(v(&["--root"])), Err(UsageError));
         assert_eq!(
             parse_global(v(&["--root", "/a", "--root", "/b", "start"])),
+            Err(UsageError)
+        );
+    }
+
+    /// PLUG-11・CLI-1: `--plugin-path-search` は `--root` と順不同で受理し、重複は使い方エラー。
+    #[test]
+    fn plug11_parse_global_plugin_path_search() {
+        let (g, rest) =
+            parse_global(v(&["--plugin-path-search", "--root", "/r", "list"])).expect("ok");
+        assert!(g.plugin_path_search);
+        assert_eq!(g.root, Some(PathBuf::from("/r")));
+        assert_eq!(rest, v(&["list"]));
+        let (g, _) =
+            parse_global(v(&["--root", "/r", "--plugin-path-search", "list"])).expect("ok");
+        assert!(g.plugin_path_search);
+        let (g, _) = parse_global(v(&["list"])).expect("ok");
+        assert!(!g.plugin_path_search);
+        assert_eq!(
+            parse_global(v(&["--plugin-path-search", "--plugin-path-search", "list"])),
             Err(UsageError)
         );
     }

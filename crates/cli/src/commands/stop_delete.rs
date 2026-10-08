@@ -17,8 +17,8 @@
 //! - stop の失敗 JSON の `op` は `kill` になる（core に `LifecycleOp::Stop` が無いため。core 到達前の失敗も
 //!   `kill` に揃える）。猶予待ち → SIGKILL・Stopped への遷移確認・本番 signaler / cgroup remover
 //!   （`cgroups::DelegatedCgroup` の遅延検出）の結線は TASK-157 の範囲。
-//! - macOS / Windows は plugin 発見機構経由（TASK-79.4・PLUG-4）。ここでは core を呼ぶだけで、
-//!   非 Linux では状態ストアを開けず core 側が `Unimplemented` を返す（fail-closed）。
+//! - macOS / Windows は plugin 発見機構経由（TASK-79.4・PLUG-4）。非 Linux では `production_runtime` が
+//!   `plugin_backend` を呼び、現状は必ず fail-closed で失敗する（起動と RPC は TASK-114・TASK-125）。
 
 use std::sync::Arc;
 use std::time::Instant;

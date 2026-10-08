@@ -237,6 +237,25 @@ else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため test をスキップ"
 endif
 
+# CLI が macOS / Windows のバックエンド実装へ直接依存しないことの機械判定（CLI-1・PLUG-4・TASK-79.4）。
+# macOS / Windows は core の plugin 発見・登録機構経由で呼ぶ。`cargo tree` の通常依存に
+# platform-* / plugin-macos / plugin-windows が現れたら NG（cargo tree の失敗も NG）。
+.PHONY: check-cli-backend-deps
+check-cli-backend-deps: ## cli の依存ツリーに platform-* / plugin-macos / plugin-windows が含まれないことを検証する
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	@tree=$$(cargo tree -p fandhe-container-cli -e normal --locked) || { \
+		echo "NG: cargo tree の実行に失敗しました" >&2; \
+		exit 1; \
+	}; \
+	if printf '%s\n' "$$tree" | grep -Eq 'fandhe-container-(platform|plugin)-(macos|windows)'; then \
+		echo "NG: cli の依存ツリーに macOS / Windows のバックエンド crate が含まれています" >&2; \
+		exit 1; \
+	fi; \
+	echo "OK: cli は platform-macos / platform-windows / plugin-macos / plugin-windows に依存しません"
+else
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため check-cli-backend-deps をスキップ"
+endif
+
 # core の plugin 無効構成の検証（PLUG-3・TASK-111.1・#262。REPAIR-10 (d)）。
 # `--no-default-features` で core がビルド・テストでき、依存ツリーに plugin 境界基盤
 # （fandhe-container-plugin）が入らないことを確認する。`make ci` には含めない

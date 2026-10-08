@@ -17,6 +17,12 @@ name: CI
 # bench-regression 1 件を含む。aarch64-linux-check（#1120）は 2026-09-29 に
 # #4 の自律開発方針に基づき main セッションが登録済み。下の ci-complete・
 # integration-test・bench-regression・aarch64-linux-check ジョブのコメントを参照）。
+# 件数の範囲に注意: 29 件は本 workflow 分のみで、ruleset の必須チェック全体は
+# 計 33 件（2026-10-08 時点）。差の 4 件は本 workflow の外が生成するもので、
+# ai-review.yml の codex / preflight・codex / review・codex / post_feedback 3 件と、
+# 外部 GitHub App の Cursor Bugbot 1 件（いずれも登録済み）。数え方: 本 workflow 分は
+# PR の `gh pr checks <PR> --json name,workflow` を workflow 名 CI で絞った件数、
+# ruleset 全体は ruleset の required_status_checks の件数
 # ジョブの追加・改名・matrix 変更で check-run 名が変わる場合は ruleset 側も
 # 同時に更新する（リポジトリ設定の変更のためオーナー作業とする）
 on:
@@ -61,7 +67,7 @@ jobs:
   # 単一値として扱える。rust-ci・rust-ci-default-features は 3 OS matrix のため
   # OS ごとに別名のチェックが生成される。本 workflow 内の集約ジョブ
   # `ci-complete`（下部）は lint-docs・rust-ci・rust-ci-default-features・
-  # integration-test・bench-regression の結果をまとめて fail-closed 判定する
+  # integration-test・bench-regression・aarch64-linux-check の結果をまとめて fail-closed 判定する
   # ゲートとして残しつつ、ruleset（branch protection）の
   # 必須チェックには本 workflow が生成する check-run（`ci-complete` を含む全件）を
   # 個別に登録している（冒頭コメント参照。implement-issue-tree の自動マージ前ゲート
@@ -304,7 +310,7 @@ jobs:
   # - Linux 限定なのは本テストが Linux 専用（`exec` モジュールが非 Linux ではビルド
   #   対象外で OS 非該当）だからで、ポータブルなテストを特定 OS で飛ばすものではない。
   # - 新しい check-run を増やさないため別ジョブにせず本ジョブのステップとした
-  #   （ruleset への個別登録が要るため。check-run は 29 件のまま）。
+  #   （ruleset への個別登録が要るため。本 workflow の check-run は 29 件のまま）。
   # - ubuntu 24.04 以降のランナーは AppArmor の
   #   `kernel.apparmor_restrict_unprivileged_userns=1` で非特権 user namespace を
   #   制限する。sudo で rootful 実行する案ではなく、この sysctl を 0 に緩めて非 root
@@ -737,12 +743,12 @@ jobs:
       # 計測とログ出力のみ。baseline.json 未登録のため基準値比較はせず、Δp50 の 15% 回帰判定は
       # 上の bench-check-selftest（fixture）でのみ検証している（TASK-113.3・PLUG-5・REPAIR-8）。
       # 実測基準値の登録と bench-check 対象化は TASK-88.h1・TASK-113.h1 待ち。
-      # check-run 名は増やさず既存ジョブのステップとする（29 件は不変）
+      # check-run 名は増やさず既存ジョブのステップとする（本 workflow の check-run 29 件は不変）
       - name: plugin 境界 Δp50 と CORE-10 比の計測ログ（計測とログ出力のみ・性能回帰は未判定。TASK-113.3）
         run: make bench-plugin-boundary
       # core の既定 / plugin 除外（--no-default-features）release ビルドと成果物サイズの記録
       # （PLUG-3・TASK-111.2・#263）。新ジョブは check-run 名が増え ruleset 変更が要るため
-      # 既存ジョブのステップとする（check-run 29 件は不変）。計測対象は rlib（最終バイナリ未実装。
+      # 既存ジョブのステップとする（本 workflow の check-run 29 件は不変）。計測対象は rlib（最終バイナリ未実装。
       # TASK-79 後に実行ファイルへ切り替える）で、差は僅少のため軽量化効果の実測ではない
       - name: plugin feature 除外ビルドとサイズ記録（PLUG-3・TASK-111.2）
         shell: bash
@@ -780,20 +786,29 @@ jobs:
   # ため、aarch64 での実行時の正しさ（struct ucred のレイアウト等）は保証しない。
   # ネイティブ arm64 ランナーでのテスト実行は将来の課題（ci.md 参照）。
   #
-  # 現在は外部依存が 0 件のためクロスリンカ無しで成立する。cc 等ネイティブビルドを
+  # 外部依存は純 Rust のクレートのみ（serde / serde_json / sha2 と推移依存。
+  # aarch64 Linux では libc・cpufeatures も入る）でネイティブビルドを伴わないため、
+  # クロスリンカ無しで成立する。cc 等ネイティブビルドを
   # 伴う依存を承認・追加した場合は、cross toolchain かネイティブ arm64 ランナーへ
   # 切り替えること。--locked・cache を使わないのは rust-ci-default-features と
   # 条件をそろえるため。ビルド・テストのゲートではなく型検査ゲートのため、
   # 3 OS matrix・ネイティブランナー規則の対象外とする（bench-regression と同じ整理。
   # ci.md「3 OS CI」参照）。
   #
-  # --all-features を付けるのは、required-features を持つ target（crates/io の
-  # crash_test_server bin・crash_safety test。`crash-test-server` feature が必要）を
-  # --all-targets だけでは型検査できないため。現状の feature は
-  # fandhe-container-io の `crash-test-server` 1 件のみで相互排他の feature はなく、
-  # ソース中に cfg(feature) 分岐もないため、--all-features の検査は既定 feature 構成を
-  # 包含する。相互排他の feature や cfg(not(feature = ...)) 分岐を追加した場合は、
-  # 既定 feature での検査の追加か対象 feature の明示へ切り替えること。
+  # 実コマンドは `cargo check|clippy --workspace --all-targets --all-features
+  # --target aarch64-unknown-linux-gnu`（AGENTS.md と一致）。--all-features を付けるのは、
+  # required-features を持つ target（crates/io の crash_test_server bin・crash_safety test）、
+  # `#![cfg(feature = "wsl2-test-support")]` の結合試験、exec-test-support の入口を
+  # 型検査の対象に入れるため。feature は io の crash-test-server、core の
+  # default = ["plugin"]・plugin・escape-probe・exec-test-support、supervisor の
+  # exec-test-support、platform-windows の wsl2-test-support。exec-test-support は
+  # 最適化ビルドで compile_error! になるが、check / clippy は dev プロファイルなので影響しない。
+  # 未検査の範囲（REPAIR-3）: cfg(not(feature = "exec-test-support")) 分岐
+  # （supervisor/tests/exec_setns_join.rs・core/tests/exec_child_setup.rs・
+  # core/src/exec/reapply.rs の cfg_attr）と、plugin を無効にした構成
+  # （--no-default-features）は aarch64 では型検査されない。x86_64 では
+  # rust-ci-default-features が検査している。aarch64 での既定 feature 検査の追加は
+  # ジョブ構成の変更になるため別 Issue で扱う。
   aarch64-linux-check:
     runs-on: ubuntu-latest
     # ハングに対する多層防御（rust-ci-default-features と同じ値）
@@ -837,6 +852,8 @@ jobs:
   # integration-test 3 + bench-regression 1 + aarch64-linux-check 1 = 29〕と
   # 一致させる）。#1120 の aarch64-linux-check 1 件も 2026-09-29 に ruleset へ
   # 登録済み（#4 の自律開発方針に基づき main セッションが登録）。
+  # なお ruleset の必須チェック全体は 33 件で、29 件に ai-review.yml の codex 3 件と
+  # 外部 App の Cursor Bugbot 1 件（本 workflow の外）を足した値（冒頭コメント参照）。
   ci-complete:
     needs:
       [

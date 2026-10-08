@@ -33,6 +33,8 @@
 //! - macOS の RSS 取得（TASK-112.1・#265）: `proc_pidinfo(PROC_PIDTASKINFO)`（`resident_size_bytes`。`crate::rss` から呼ばれる）
 //! - いずれの unix: `kill(2)` で起動中の plugin へ SIGINT・SIGTERM・SIGHUP を転送する（`send_signal`。
 //!   `crate::signal_forward` が CLI バイナリのシグナルハンドラ上から呼ぶため async-signal-safe であること。#1513・PLUG-7）
+//! - Linux: `prctl(PR_SET_PDEATHSIG, SIGKILL)` と `getppid(2)` を `pre_exec` で呼び、親の強制終了時に plugin 本体を
+//!   止める（#1514・PLUG-7・REPAIR-5・CORE-1。x86_64 / aarch64 のみ。他アーキテクチャは設定しない）
 //! - それ以外の OS・アーキテクチャ: peer credential を取得できないため `Unimplemented`（fail-closed）
 //!
 //! # 限界（残存リスク。対策は未実装。PLUG-12・#1390）
@@ -47,7 +49,7 @@
 //!
 //! # 契約
 //! - `unsafe fn` は公開しない。公開するのは安全な [`send_signal`]・[`peer_uid`]・[`effective_uid`]・[`fchmodat_nofollow`]・
-//!   [`unlinkat`]・[`mkdirat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・[`DirStream`]（`open_at`・`next_entry`・`position`）・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
+//!   [`unlinkat`]・[`mkdirat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・（Linux のみ）`set_parent_death_sigkill`・[`DirStream`]（`open_at`・`next_entry`・`position`）・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
 //! - fd は `&UnixStream` の借用中のみ渡す（呼び出し中にクローズされない）
 //! - SOL_SOCKET / SO_PEERCRED の定数は `cfg(target_arch)` ごとに個別定義し、流用しない
 //! - OS ごとに値・幅が異なる定数・型（`ModeT`・`AT_SYMLINK_NOFOLLOW`・`O_*` 等）は対応 OS ごとに個別定義し、
@@ -59,7 +61,15 @@
 use std::ffi::CStr;
 use std::fs::File;
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::AsRawFd;
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixStream;
 
 use crate::error::{PluginError, PluginErrorCode};
@@ -74,6 +84,113 @@ unsafe extern "C" {
 pub(crate) fn effective_uid() -> u32 {
     // SAFETY: 引数を取らず、POSIX の規定上エラー条件を持たない。
     unsafe { geteuid() }
+}
+
+/// Linux（x86_64 / aarch64）の親死亡シグナル設定用の定数。アーキテクチャごとに個別定義し流用しない
+/// （値が同じでも他アーキテクチャの定義を借りない）。
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod pdeathsig_abi {
+    // include/uapi/linux/prctl.h の `PR_SET_PDEATHSIG`（1）。
+    pub const PR_SET_PDEATHSIG: i32 = 1;
+    // include/uapi/asm-generic/signal.h の `SIGKILL`（x86_64 は上書きしない）。
+    pub const SIGKILL: u64 = 9;
+    // include/uapi/asm-generic/errno-base.h の `ESRCH`（3）。
+    pub const ESRCH: i32 = 3;
+}
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+mod pdeathsig_abi {
+    // include/uapi/linux/prctl.h の `PR_SET_PDEATHSIG`（1）。
+    pub const PR_SET_PDEATHSIG: i32 = 1;
+    // include/uapi/asm-generic/signal.h の `SIGKILL`（arm64 は上書きしない）。
+    pub const SIGKILL: u64 = 9;
+    // include/uapi/asm-generic/errno-base.h の `ESRCH`（3）。
+    pub const ESRCH: i32 = 3;
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+unsafe extern "C" {
+    // SAFETY（宣言そのものの妥当性）: `int prctl(int option, ...)`（glibc / musl）。可変長部は
+    // `unsigned long` に合わせて `u64` で渡す（`crates/core/src/sys.rs` と同じ流儀）。
+    fn prctl(option: i32, ...) -> i32;
+    // SAFETY（宣言そのものの妥当性）: POSIX の `pid_t getppid(void)`（`pid_t` は `i32`）。
+    // 引数を取らず、エラー条件を持たない。
+    fn getppid() -> i32;
+}
+
+/// `cmd` で起動する子に「親（fork したスレッド）が終了したら SIGKILL を受ける」設定を足す
+/// （`prctl(PR_SET_PDEATHSIG, SIGKILL)`。#1514・#1403 の方式 B・PLUG-7・REPAIR-5・CORE-1）。
+///
+/// `crate::lifecycle` の都度起動 / 常駐の spawn 直前に、`bind_to_parent_lifetime` 経由で呼ばれる。
+/// 親が SIGKILL・abort で落ちるとシグナル転送（方式 A）が動かないため、直接の子である plugin 本体が
+/// 孤児として残ることをカーネル側の仕掛けで防ぐ。
+///
+/// - fork から `prctl` までの間に親が先に終了した競合は、`prctl` の後に `getppid()` が
+///   `expected_parent` と一致するか照合し、不一致なら exec せず `ESRCH` で spawn を失敗させる。
+/// - 制限（残存リスク）: 発火条件は「子を fork したスレッド」の終了である（プロセス全体ではない）。
+///   効くのは直接の子だけで、孫には届かない。setuid・ファイル capability つき実行ファイルの exec で
+///   設定は解除され、plugin 自身が `prctl` で解除することもできる。`getppid` の照合で拾えるのは
+///   親プロセスの終了だけで、fork したスレッドだけが `prctl` より前に終わった場合は拾えない。
+/// - `crates/core` の同種処理は pidfd で親を確かめるが、本 crate の `Command` は PID namespace を
+///   変えないため `getppid` で足りる。pidfd の継承や std の fd 管理との干渉を避けて採らない。
+/// - `pre_exec` を登録すると std は `posix_spawn` の高速経路から fork + exec の経路へ移る。境界
+///   レイテンシ（PLUG-5・CORE-10）への影響があり得る。
+///
+/// `expected_parent` が `i32` に収まらない場合は `InvalidInput`（spawn 前に親側で返す）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) fn set_parent_death_sigkill(
+    cmd: &mut std::process::Command,
+    expected_parent: u32,
+) -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let expected =
+        i32::try_from(expected_parent).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: クロージャは fork 後・exec 前の子（親のシングルスレッドの複製）で実行される。呼ぶのは
+    // async-signal-safe な `prctl(2)` と `getppid(2)` だけで、割り当て・ロック・panic をしない。
+    // 失敗は `io::Error`（`Repr::Os`。割り当てなし）で返し、std が errno を親へ渡して exec を行わない。
+    // 捕捉するのは `i32` の Copy 値のみで `Send + Sync + 'static` を満たす。
+    unsafe {
+        cmd.pre_exec(move || {
+            // SAFETY: 上記のとおり。引数は定数のみで、ポインタを渡さない。
+            if prctl(
+                pdeathsig_abi::PR_SET_PDEATHSIG,
+                pdeathsig_abi::SIGKILL,
+                0u64,
+                0u64,
+                0u64,
+            ) == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: 引数なし・エラーなしの `getppid(2)`。
+            if getppid() != expected {
+                return Err(io::Error::from_raw_os_error(pdeathsig_abi::ESRCH));
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+/// 未対応アーキテクチャ（Linux で x86_64 / aarch64 以外）では親死亡シグナルを設定しない。
+///
+/// 定数を他アーキテクチャから流用しないための縮退。親死亡シグナルは分離の境界ではなく後始末の補助で、
+/// spawn を失敗させると plugin が使えなくなるため、設定の省略を選ぶ（#1514）。
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+pub(crate) fn set_parent_death_sigkill(
+    _cmd: &mut std::process::Command,
+    _expected_parent: u32,
+) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -495,9 +612,16 @@ const O_NOFOLLOW: i32 = 0o400000;
 const O_DIRECTORY: i32 = 0o40000;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const O_NOFOLLOW: i32 = 0o100000;
-#[cfg(target_os = "linux")]
+// 対応アーキテクチャ（x86_64 / aarch64）以外の Linux では、使う側が fail-closed のため定義しない（#1538）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 const O_CLOEXEC: i32 = 0o2000000;
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 const AT_FDCWD: i32 = -100;
 #[cfg(target_os = "macos")]
 const O_DIRECTORY: i32 = 0x0010_0000;
@@ -720,6 +844,61 @@ pub(crate) mod lock_test_hook {
     }
 }
 
+/// [`open_lock_file`] の開き方（bool ではなく型で区別する）。
+#[derive(Clone, Copy)]
+enum LockFileOpen {
+    /// `O_CREAT | O_EXCL` で新規作成する。既にあれば `AlreadyExists`。
+    CreateNew,
+    /// `O_CREAT` なしで既存だけを開く。無ければ `NotFound`。
+    Existing,
+}
+
+/// [`lock_file_at`] の open(2) 呼び出し 1 回分。ロックファイルを開く FFI（`openat`）への依存を
+/// ここ 1 か所に閉じ込め、対応アーキテクチャ以外では呼び出し側の分岐を cfg で分けずに済ませる
+/// （未使用宣言の clippy 失敗を避ける。#1538）。`O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK`・0600 で開く。
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn open_lock_file(dir: &File, name: &CStr, how: LockFileOpen) -> io::Result<File> {
+    let flags = match how {
+        LockFileOpen::CreateNew => O_RDWR | O_CREAT | O_EXCL,
+        LockFileOpen::Existing => O_RDWR,
+    };
+    // SAFETY: `dir` は `&File` の借用中のため fd は有効。`name` は NUL 終端の有効な C 文字列。
+    // O_CREAT を含むため、可変長引数として mode（C の既定引数昇格後の `unsigned int` 幅）を
+    // 1 つ渡す。openat は渡したポインタを呼び出し中しか参照しない。
+    let fd = unsafe {
+        c_openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            flags | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK,
+            0o600u32,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` は直前の openat が返した、他に所有者のいない有効な fd（非負を確認済み）。
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// 対応アーキテクチャ以外では開けない（`Unsupported`。fail-closed）。
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+)))]
+fn open_lock_file(dir: &File, name: &CStr, how: LockFileOpen) -> io::Result<File> {
+    let _ = (dir, name, how);
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
 /// `dir` 基準で `name` のロックファイルを `O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK`・0600 で開き
 /// （`mode` に応じて無ければ作成）、非ブロッキングで排他ロックを取る。`O_NONBLOCK` は、既存の名前が FIFO・デバイス
 /// 等だった場合に open が相手を待って止まらないようにするため（通常ファイルの読み書きには影響しない。
@@ -747,104 +926,68 @@ pub(crate) fn lock_file_at(
     name: &CStr,
     mode: LockOpen,
 ) -> Result<LockHandle, LockError> {
-    #[cfg(any(
-        target_os = "macos",
-        all(
-            target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        )
-    ))]
-    {
-        let open = |flags: i32| -> io::Result<File> {
-            // SAFETY: `dir` は `&File` の借用中のため fd は有効。`name` は NUL 終端の有効な C 文字列。
-            // O_CREAT を含むため、可変長引数として mode（C の既定引数昇格後の `unsigned int` 幅）を
-            // 1 つ渡す。openat は渡したポインタを呼び出し中しか参照しない。
-            let fd = unsafe {
-                c_openat(
-                    dir.as_raw_fd(),
-                    name.as_ptr(),
-                    flags | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK,
-                    0o600u32,
-                )
-            };
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: `fd` は直前の openat が返した、他に所有者のいない有効な fd（非負を確認済み）。
-            Ok(unsafe { File::from_raw_fd(fd) })
-        };
-        // 新規作成（O_EXCL）を試し、既にあれば O_CREAT なしで既存を開く。その間に保持者が解放時の
-        // unlink をした場合は ENOENT になるため、上限つきで最初からやり直す（`created` を正確に保つ。
-        // 上限まで競合し続けた場合は `OpenContended` を返し、待ち続けない。REPAIR-5）。
-        const OPEN_ATTEMPTS: usize = 8;
-        let mut opened = None;
-        if mode == LockOpen::Existing {
-            opened = Some((open(O_RDWR)?, false));
+    // 新規作成（O_EXCL）を試し、既にあれば O_CREAT なしで既存を開く。その間に保持者が解放時の
+    // unlink をした場合は ENOENT になるため、上限つきで最初からやり直す（`created` を正確に保つ。
+    // 上限まで競合し続けた場合は `OpenContended` を返し、待ち続けない。REPAIR-5）。
+    const OPEN_ATTEMPTS: usize = 8;
+    let mut opened = None;
+    if mode == LockOpen::Existing {
+        opened = Some((open_lock_file(dir, name, LockFileOpen::Existing)?, false));
+    }
+    for _ in 0..OPEN_ATTEMPTS {
+        if opened.is_some() {
+            break;
         }
-        for _ in 0..OPEN_ATTEMPTS {
-            if opened.is_some() {
+        #[cfg(test)]
+        if lock_test_hook::take_contended_open() {
+            continue;
+        }
+        match open_lock_file(dir, name, LockFileOpen::CreateNew) {
+            Ok(f) => {
+                opened = Some((f, true));
                 break;
             }
-            #[cfg(test)]
-            if lock_test_hook::take_contended_open() {
-                continue;
-            }
-            match open(O_RDWR | O_CREAT | O_EXCL) {
-                Ok(f) => {
-                    opened = Some((f, true));
-                    break;
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => match open(O_RDWR) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                match open_lock_file(dir, name, LockFileOpen::Existing) {
                     Ok(f) => {
                         opened = Some((f, false));
                         break;
                     }
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e.into()),
-                },
-                Err(e) => return Err(e.into()),
-            }
-        }
-        let Some((file, created)) = opened else {
-            return Err(LockError::OpenContended);
-        };
-        // 通常ファイル以外（FIFO・デバイス等）はロックを試みる前に拒否する（flock 自体が失敗して
-        // 理由が分からなくなる OS があるため。内容にも触れない）。
-        if !file.metadata()?.is_file() {
-            return Err(io::Error::from(io::ErrorKind::PermissionDenied).into());
-        }
-        #[cfg(test)]
-        if created {
-            lock_test_hook::run(dir, name);
-        }
-        // 自分が作成した直後に他者（掃除）が先にロックを取っていた場合だけ、期限つきで待つ。
-        let mut waits_left = if created && mode == LockOpen::Bind {
-            CREATED_LOCK_WAIT_ATTEMPTS
-        } else {
-            0
-        };
-        loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(LockHandle { file, created }),
-                Err(std::fs::TryLockError::WouldBlock) if waits_left > 0 => {
-                    waits_left -= 1;
-                    std::thread::sleep(CREATED_LOCK_WAIT_INTERVAL);
                 }
-                Err(std::fs::TryLockError::WouldBlock) => return Err(LockError::Held),
-                Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
             }
+            Err(e) => return Err(e.into()),
         }
     }
-    #[cfg(not(any(
-        target_os = "macos",
-        all(
-            target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        )
-    )))]
-    {
-        let _ = (dir, name, mode);
-        Err(io::Error::from(io::ErrorKind::Unsupported).into())
+    let Some((file, created)) = opened else {
+        return Err(LockError::OpenContended);
+    };
+    // 通常ファイル以外（FIFO・デバイス等）はロックを試みる前に拒否する（flock 自体が失敗して
+    // 理由が分からなくなる OS があるため。内容にも触れない）。
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::from(io::ErrorKind::PermissionDenied).into());
+    }
+    #[cfg(test)]
+    if created {
+        lock_test_hook::run(dir, name);
+    }
+    // 自分が作成した直後に他者（掃除）が先にロックを取っていた場合だけ、期限つきで待つ。
+    let mut waits_left = if created && mode == LockOpen::Bind {
+        CREATED_LOCK_WAIT_ATTEMPTS
+    } else {
+        0
+    };
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(LockHandle { file, created }),
+            Err(std::fs::TryLockError::WouldBlock) if waits_left > 0 => {
+                waits_left -= 1;
+                std::thread::sleep(CREATED_LOCK_WAIT_INTERVAL);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => return Err(LockError::Held),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
     }
 }
 
@@ -1106,7 +1249,11 @@ impl DirStream {
     }
 }
 
-#[cfg(target_os = "linux")]
+// 使うのは `peer_ucred`（対応アーキテクチャのみ実装）だけのため、同じ cfg に揃える（#1538）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod linux {
     /// `struct ucred` と同じレイアウト。
     #[repr(C)]
@@ -2053,6 +2200,66 @@ pub(crate) fn send_signal(pid: i32, sig: i32) -> bool {
     // SAFETY: 引数は値渡しの整数のみでメモリ安全上の前提を持たない。`kill` は async-signal-safe。
     // 送り先の妥当性（直接の子の pid またはそのグループ）は呼び出し側の登録表が保証する。
     unsafe { kill(pid, sig) == 0 }
+}
+
+/// #1514・PLUG-7: `set_parent_death_sigkill` の親 pid 照合（fork から prctl までの窓そのものは、親を決定的に
+/// 割り込ませる手段がなく再現できないため、照合の分岐を不一致の pid で代替検証する）。
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod pdeathsig_tests {
+    use super::*;
+    use std::process::{Child, Command, ExitStatus};
+    use std::time::{Duration, Instant};
+
+    /// 子の回収を `try_wait` のポーリングと期限で行う（REPAIR-5。期限超過時は kill 後も有限期限で回収を試み失敗にする）。
+    fn wait_bounded(mut child: Child) -> ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                // kill 後の回収にも有限の期限を設ける（無期限の `wait` は残さない）。
+                let reap_deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < reap_deadline {
+                    if !matches!(child.try_wait(), Ok(None)) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                panic!("child did not exit within the deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn plug7_pdeathsig_mismatched_parent_pid_aborts_exec() {
+        let wrong = std::process::id().checked_add(1).unwrap();
+        let mut cmd = Command::new("/bin/true");
+        set_parent_death_sigkill(&mut cmd, wrong).unwrap();
+        let err = cmd.spawn().unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(3));
+    }
+
+    #[test]
+    fn plug7_pdeathsig_matching_parent_pid_spawns_normally() {
+        let mut cmd = Command::new("/bin/true");
+        set_parent_death_sigkill(&mut cmd, std::process::id()).unwrap();
+        let status = wait_bounded(cmd.spawn().unwrap());
+        assert_eq!(status.code(), Some(0));
+    }
+
+    #[test]
+    fn plug7_pdeathsig_rejects_pid_beyond_i32() {
+        let mut cmd = Command::new("/bin/true");
+        let err = set_parent_death_sigkill(&mut cmd, u32::MAX).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
 }
 
 /// PLUG-12・#1308: Linux・macOS 以外の OS 向けに他 OS の値を流用した仮置きの `const` / `type` を

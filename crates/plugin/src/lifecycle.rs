@@ -24,6 +24,14 @@
 //!   読み捨てて件数だけ数える）。親の stderr・構造化ログへ内容を転記しない（量の上限なしの出力・
 //!   ログ行の偽装を防ぐ）。子から見た stderr は端末でも pipe でもなくソケットで、書き込みは pipe と
 //!   同様に扱える（`/dev/stderr` の開き直しは Linux では失敗する）。
+//! - 親の強制終了時の停止（#1514・#1403 の方式 B・PLUG-7・REPAIR-5・CORE-1）: Linux では spawn 直前に
+//!   `prctl(PR_SET_PDEATHSIG, SIGKILL)` を子へ設定し、親が SIGKILL・abort で落ちても plugin 本体が
+//!   孤児で残らないようにする（fork から prctl までに親が先に終わった競合は `getppid` の照合で exec を
+//!   中止して拾う）。効くのは直接の子だけで、孫には届かない（未実装節の孫の項目と #1397・#1513 を参照）。
+//!   発火条件は子を fork した**スレッド**の終了で、都度起動は呼び出しスレッド上で完結するため影響しない
+//!   （常駐モードの契約は `resident` を参照）。setuid・ファイル capability つき実行ファイルでは設定が
+//!   解除される。macOS には同等の機構がなく親の強制終了で残留し得る（kqueue `NOTE_EXIT` は将来課題）。
+//!   Windows は対象外。
 //! - stderr の読み取りスレッドは呼び出しごとに 1 本で、[`call_once`] が戻るまでに停止させる
 //!   （呼び出しを繰り返してもスレッドが増え続けない）。子の回収後 [`ONE_SHOT_STDERR_DRAIN_TIMEOUT`]
 //!   以内に終端へ達しなければ、ソケットを shutdown して読み取りを打ち切る。
@@ -796,6 +804,25 @@ pub fn call_once_observed(
     })
 }
 
+/// plugin 本体（直接の子）を親の生存に結び付ける（Linux のみ。`PR_SET_PDEATHSIG`。#1514・#1403 の方式 B・
+/// PLUG-7・REPAIR-5・CORE-1）。都度起動 / 常駐の spawn 直前に呼び、spawn 箇所へ cfg を持ち込まない。
+/// Linux 以外では何もしない（macOS に同等の機構はなく残留し得る。Windows は対象外）。
+#[cfg(target_os = "linux")]
+fn bind_to_parent_lifetime(cmd: &mut Command) -> Result<(), PluginError> {
+    crate::sys::set_parent_death_sigkill(cmd, std::process::id()).map_err(|_| {
+        PluginError::new(
+            PluginErrorCode::Internal,
+            "failed to configure plugin parent-death signal",
+        )
+    })
+}
+
+/// Linux 以外では親死亡シグナルを設定しない（従来どおり起動する）。
+#[cfg(not(target_os = "linux"))]
+fn bind_to_parent_lifetime(_cmd: &mut Command) -> Result<(), PluginError> {
+    Ok(())
+}
+
 /// listener の bind・子の spawn・stderr の収集・往復・回収までを行う。戻り値の第 2 要素は、
 /// 成功・失敗のどちらでも子の回収後に確定した stderr の収集結果（spawn 前の失敗は空）。
 fn call_once_inner(
@@ -840,16 +867,20 @@ fn call_once_inner(
         }
     };
     // `Command` は文の終わりで drop され、親側に書き込み端は残らない（終端の検出を妨げない）。
-    let mut guard = match spawn_registered(
-        Command::new(&plugin.program)
-            .args(&plugin.args)
+    let spawned = {
+        let mut cmd = Command::new(&plugin.program);
+        cmd.args(&plugin.args)
             .env_clear()
             .env(PLUGIN_SOCKET_ENV, listener.path())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(child_stderr),
-        registry,
-    ) {
+            .stderr(child_stderr);
+        if let Err(e) = bind_to_parent_lifetime(&mut cmd) {
+            return (Err(e), OneShotStderr::empty());
+        }
+        spawn_registered(&mut cmd, registry)
+    };
+    let mut guard = match spawned {
         Ok(g) => g,
         Err(e) => return (Err(e), OneShotStderr::empty()),
     };

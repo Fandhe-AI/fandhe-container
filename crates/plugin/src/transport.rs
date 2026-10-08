@@ -705,7 +705,16 @@ mod imp {
 
         /// テスト用: 期待 UID を差し替える（拒否経路を同一 UID の実接続で再現するため。TASK-124.5）。
         /// 本番ビルドには存在しない。
-        #[cfg(test)]
+        #[cfg(all(
+            test,
+            any(
+                target_os = "macos",
+                all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )
+            )
+        ))]
         pub(super) fn set_expected_uid_for_test(&mut self, uid: u32) {
             self.euid = uid;
         }
@@ -747,7 +756,16 @@ mod imp {
 
         /// テスト専用: 期待 UID をずらして peer 認証を拒否させる入口（PLUG-12・TASK-124.6・#1389）。
         /// 検証（`verify_peer`）は必ず通る。検証を省く経路ではない。
-        #[cfg(test)]
+        #[cfg(all(
+            test,
+            any(
+                target_os = "macos",
+                all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )
+            )
+        ))]
         pub(super) fn accept_with_expected_uid(
             &self,
             timeout: Duration,
@@ -763,7 +781,16 @@ mod imp {
         }
 
         /// テスト専用: 拒否して退避した接続を取り出す。
-        #[cfg(test)]
+        #[cfg(all(
+            test,
+            any(
+                target_os = "macos",
+                all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )
+            )
+        ))]
         pub(super) fn take_rejected(&self) -> Option<UnixStream> {
             self.rejected
                 .lock()
@@ -1735,11 +1762,23 @@ mod tests {
     }
 
     /// 拒否イベントを所有コピーで積むテスト用の受け手。
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
     #[derive(Default)]
     struct Recorder(Vec<RecordedRejection>);
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
     #[derive(Debug, PartialEq, Eq)]
     struct RecordedRejection {
         op: PeerAuthOp,
@@ -1752,7 +1791,13 @@ mod tests {
         socket_path: std::path::PathBuf,
     }
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
     impl PeerAuthObserver for Recorder {
         fn on_rejection(&mut self, e: &PeerAuthRejection<'_>) {
             self.0.push(RecordedRejection {
@@ -1769,7 +1814,13 @@ mod tests {
     }
 
     /// 実 listener（0700 の一時ディレクトリ配下）を作る。
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
     fn audit_listener(tag: &str) -> (UdsListener, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("fc-audit-{}-{tag}", std::process::id()));
@@ -1780,7 +1831,13 @@ mod tests {
         (l, dir)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
     fn rejection(
         op: PeerAuthOp,
         reason: PeerAuthRejectReason,

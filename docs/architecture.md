@@ -111,6 +111,8 @@ TASK-4（CRI-7）で定義した 4 つの拡張点トレイトは、いずれも
 
 plugin 境界のワイヤー形式（別プロセス＋長さ接頭辞フレーム、ペイロード serde_json、wire 互換が要る場面のみ gRPC）は PLUG-2 として ID のみ参照する。詳細な実装は TASK-107 系（`plugin` crate 本体）で行う。
 
+plugin プロセスのライフサイクル（PLUG-7）では、親（core 側の proxy 等）が SIGKILL・abort で落ちた場合も plugin 本体が孤児で残らないよう、Linux では `PR_SET_PDEATHSIG`（SIGKILL）を spawn 時に設定する（#1514・#1403 の方式 B。REPAIR-5・CORE-1）。効くのは直接の子だけで、発火条件は子を fork したスレッドの終了のため、常駐 plugin はセッションより長く生きるスレッドから起動する契約とする。孫プロセスは PR #1397・#1513（プロセスグループ回収・シグナル転送）で扱う。macOS には同等の機構がなく残留し得る（kqueue `NOTE_EXIT` は将来課題）。Windows は対象外。
+
 ## 依存関係グラフ
 
 ### 現状（Cargo.toml の実測）

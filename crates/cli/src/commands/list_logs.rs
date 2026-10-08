@@ -117,8 +117,8 @@ fn record_op(recorder: &OpRecorder, op_name: &str, ok: bool, started: Instant) {
 /// 状態ルート不在であり、コンテナ不在（`container not found`）と誤報しない。
 fn store_open_failure(e: &TraitError) -> CliExit {
     match e.code() {
-        ErrorCode::NotFound => CliExit::StateRootNotFound,
-        c => CliExit::Failed(c),
+        ErrorCode::NotFound => CliExit::state_root_not_found(),
+        c => CliExit::failed(c),
     }
 }
 
@@ -153,8 +153,8 @@ pub(super) fn run_logs(global: &GlobalArgs, args: &LogsArgs) -> CliExit {
     };
     // 計測は最終結果（未実装を含む）から 1 回だけ決める。存在確認が通っても未実装で終わるため Failure（REPAIR-4）。
     let exit = match container_exists(rt.store.as_ref(), &id) {
-        Ok(()) => CliExit::Unimplemented,
-        Err(e) => CliExit::Failed(e.code()),
+        Ok(()) => CliExit::unimplemented(),
+        Err(e) => CliExit::failed(e.code()),
     };
     record_op(
         &rt.recorder,
@@ -193,19 +193,29 @@ mod tests {
         assert_eq!(s, "a1\tcreated\t-\nb2\trunning\t4242\nc3\tstopped\t-\n");
     }
 
+    fn stderr_line(e: &CliExit) -> String {
+        let mut buf = Vec::new();
+        e.write_stderr(&mut buf).expect("write");
+        String::from_utf8(buf).expect("utf8")
+    }
+
     /// CLI-1: ストアを開く段階の NotFound は状態ルート不在で、コンテナ不在と区別される。
     #[test]
     fn cli1_store_open_not_found_is_state_root() {
         let nf = TraitError::new(ErrorCode::NotFound, "x");
-        assert!(matches!(
-            store_open_failure(&nf),
-            CliExit::StateRootNotFound
-        ));
+        let e = store_open_failure(&nf);
+        assert_eq!(e.exit_code(), 3);
+        assert_eq!(
+            stderr_line(&e),
+            "{\"code\":\"NOT_FOUND\",\"message\":\"state root not found\"}\n"
+        );
         let inv = TraitError::new(ErrorCode::InvalidArgument, "x");
-        assert!(matches!(
-            store_open_failure(&inv),
-            CliExit::Failed(ErrorCode::InvalidArgument)
-        ));
+        let e = store_open_failure(&inv);
+        assert_eq!(e.exit_code(), 2);
+        assert_eq!(
+            stderr_line(&e),
+            "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"invalid argument\"}\n"
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -26,15 +26,18 @@
 //!   配線済みで、platform-* へは直接依存しない（`make check-cli-backend-deps`）。非 Linux の信頼性検証（PLUG-11）・plugin の
 //!   起動と RPC（TASK-114・TASK-125）は未実装のため、非 Linux の全コマンドは候補なしで `FAILED_PRECONDITION`（5）、
 //!   候補ありでも `UNIMPLEMENTED`（8）か `PERMISSION_DENIED`（6）で fail-closed に失敗する。
-//! - エラー形式（`code` / `message`）の確定: TASK-95（ERR 系）。ここの [`CliExit`] は最小の先取り。
+//! - エラー形式: 全コマンドの失敗は [`CliExit`] 経由で構造化エラー（`code` / `message`・非ゼロ終了コード）に統一済み（TASK-95.2・ERR-1）。
+//!   ライフサイクル操作の失敗のみ ERR-2 の `op` 付き形式を保つ。JSON Lines への統一は ERR-4（TASK-98）。
 
 use std::ffi::OsString;
 use std::io::Write;
 
 use fandhe_container_core::oci_runtime::{
-    OCI_EXIT_INVALID_ARGUMENT, OCI_EXIT_UNIMPLEMENTED, OciRuntimeError, exit_code_for,
+    OCI_EXIT_INVALID_ARGUMENT, OCI_EXIT_UNIMPLEMENTED, OciRuntimeError,
 };
 use fandhe_container_core::traits::ErrorCode;
+
+use crate::error::CliError;
 
 mod args;
 mod create_start;
@@ -132,41 +135,61 @@ pub const EXIT_UNIMPLEMENTED: u8 = OCI_EXIT_UNIMPLEMENTED.get();
 
 /// [`run`] の結果。終了コードと、失敗時の機械可読なエラー（`code` / `message`）を持つ。
 ///
-/// 固定文言の失敗（[`CliExit::Usage`]・[`CliExit::Unimplemented`]）は閉じた列挙で、文言は本 module の
-/// 定数のみ（外部から任意の文字列・終了コードを構築できないためエスケープ不要・失敗に 0 も指定できない）。
-/// core 由来の失敗は `OciRuntimeError::write_json_line`（serde_json）で出力する（JSON を手組みしない。REPAIR-2）。
+/// 失敗は構造化エラー型だけで表す（ERR-1・TASK-95.2）。ライフサイクル操作の失敗は `op` 付きの
+/// [`OciRuntimeError`]（ERR-2）、それ以外の全失敗は [`CliError`]（`code` / `message`）で、どちらも終了コードは
+/// `NonZeroU8` 由来のため「終了コード 0 の失敗」を表現できない。JSON は両型の出力処理に集約し、本 module では手組みしない（REPAIR-2）。
+/// `CliError` の固定文言は本 module の定数のみで、argv・パス・コンテナ ID を出力へ埋め込まない。
 #[derive(Debug)]
 pub enum CliExit {
     /// 成功（終了コード 0。OCI の create / start / stop / delete は成功時に何も出さない。`list` のみ stdout へ一覧を出す）。
     Success,
-    /// 使い方エラー（終了コード 2・`INVALID_ARGUMENT`）。
-    Usage,
-    /// 未実装コマンド（終了コード 8・`UNIMPLEMENTED`）。
-    Unimplemented,
-    /// core のライフサイクル操作の失敗（ERR-2。終了コードは `OciRuntimeError::exit_code`）。
+    /// core のライフサイクル操作の失敗（ERR-2。`op` 付き。終了コードは `OciRuntimeError::exit_code`）。
+    ///
+    /// `op` は観測側（結合テスト・parity スクリプト）が参照するため、`CliError` へ寄せず ERR-2 の形式を保つ。
     Runtime(OciRuntimeError),
-    /// core の状態ストア操作の失敗（`list` / `logs`。ライフサイクル操作ではないため `op` を持たない）。
-    ///
-    /// 終了コードは core の `exit_code_for`、`message` は本 module の固定文言表（[`failure_message`]）で、
-    /// core の `TraitError::message` は出力へ流さない（エスケープ不要の定数のみ）。
-    Failed(ErrorCode),
-    /// 状態ルート（ストアのディレクトリ）が存在しない（終了コード 3・`NOT_FOUND`）。
-    ///
-    /// コンテナ不在（[`CliExit::Failed`] の `NotFound`、文言 `container not found`）と区別するための専用値で、
-    /// `list` / `logs` が状態ストアを開く段階の `NotFound` だけに使う（コンテナ ID を参照していない失敗）。
-    StateRootNotFound,
+    /// それ以外の全失敗（使い方エラー・未実装・状態ストア操作・setup。ERR-1。`op` を持たない）。
+    Error(CliError),
 }
 
 impl CliExit {
+    /// 使い方エラー（終了コード 2・`INVALID_ARGUMENT`）。
+    pub(crate) fn usage() -> Self {
+        CliExit::Error(CliError::new(ErrorCode::InvalidArgument, USAGE_MESSAGE))
+    }
+
+    /// 未実装コマンド（終了コード 8・`UNIMPLEMENTED`）。
+    pub(crate) fn unimplemented() -> Self {
+        CliExit::Error(CliError::new(
+            ErrorCode::Unimplemented,
+            UNIMPLEMENTED_MESSAGE,
+        ))
+    }
+
+    /// core の状態ストア操作等の失敗（`list` / `logs` / `setup`。ライフサイクル操作ではないため `op` を持たない）。
+    ///
+    /// 終了コードは core の `exit_code_for`、`message` は本 module の固定文言表（[`failure_message`]）で、
+    /// core の `TraitError::message` は出力へ流さない（エスケープ不要の定数のみ）。
+    pub(crate) fn failed(code: ErrorCode) -> Self {
+        CliExit::Error(CliError::new(code, failure_message(code)))
+    }
+
+    /// 状態ルート（ストアのディレクトリ）が存在しない（終了コード 3・`NOT_FOUND`）。
+    ///
+    /// コンテナ不在（`failed(NotFound)`、文言 `container not found`）と区別するための専用値で、
+    /// `list` / `logs` が状態ストアを開く段階の `NotFound` だけに使う（コンテナ ID を参照していない失敗）。
+    pub(crate) fn state_root_not_found() -> Self {
+        CliExit::Error(CliError::new(
+            ErrorCode::NotFound,
+            STATE_ROOT_NOT_FOUND_MESSAGE,
+        ))
+    }
+
     /// プロセスの終了コード。
     pub fn exit_code(&self) -> u8 {
         match self {
             CliExit::Success => 0,
-            CliExit::Usage => EXIT_USAGE,
-            CliExit::Unimplemented => EXIT_UNIMPLEMENTED,
             CliExit::Runtime(e) => e.exit_code().get(),
-            CliExit::Failed(c) => exit_code_for(*c).get(),
-            CliExit::StateRootNotFound => exit_code_for(ErrorCode::NotFound).get(),
+            CliExit::Error(e) => e.exit_code().get(),
         }
     }
 
@@ -174,34 +197,21 @@ impl CliExit {
     pub fn code(&self) -> Option<&'static str> {
         match self {
             CliExit::Success => None,
-            CliExit::Usage => Some("INVALID_ARGUMENT"),
-            CliExit::Unimplemented => Some("UNIMPLEMENTED"),
             CliExit::Runtime(e) => Some(e.code().as_str()),
-            CliExit::Failed(c) => Some(c.as_str()),
-            CliExit::StateRootNotFound => Some(ErrorCode::NotFound.as_str()),
+            CliExit::Error(e) => Some(e.code_str()),
         }
     }
 
     /// stderr へ失敗の 1 行 JSON（LF 終端）を書く。成功では何も書かない。
     ///
-    /// 行本体と LF を 1 つのバッファにまとめ、1 回の `write_all` で書く。`writeln!` は書式の断片ごとに
-    /// write を分けうるため、stderr を共有する他プロセスの出力が行の途中へ入るのを避ける（ERR-1）。
+    /// 行本体と LF を 1 つのバッファにまとめ、1 回の `write_all` で書く（`CliError::write_stderr`・
+    /// `OciRuntimeError::write_json_line`）。`writeln!` は書式の断片ごとに write を分けうるため、
+    /// stderr を共有する他プロセスの出力が行の途中へ入るのを避ける（ERR-1）。
     pub fn write_stderr(&self, out: &mut dyn Write) -> std::io::Result<()> {
-        // 文言は引用符・バックスラッシュ・改行を含まない定数のみ（テストで固定）。
-        let fixed = |code: &str, message: &str| {
-            format!("{{\"code\":\"{code}\",\"message\":\"{message}\"}}\n")
-        };
         match self {
             CliExit::Success => Ok(()),
-            CliExit::Usage => out.write_all(fixed("INVALID_ARGUMENT", USAGE_MESSAGE).as_bytes()),
-            CliExit::Unimplemented => {
-                out.write_all(fixed("UNIMPLEMENTED", UNIMPLEMENTED_MESSAGE).as_bytes())
-            }
             CliExit::Runtime(e) => e.write_json_line(out),
-            CliExit::Failed(c) => out.write_all(fixed(c.as_str(), failure_message(*c)).as_bytes()),
-            CliExit::StateRootNotFound => out.write_all(
-                fixed(ErrorCode::NotFound.as_str(), STATE_ROOT_NOT_FOUND_MESSAGE).as_bytes(),
-            ),
+            CliExit::Error(e) => e.write_stderr(out),
         }
     }
 }
@@ -210,7 +220,7 @@ const USAGE_MESSAGE: &str = "usage: fandhe-container <create|start|stop|delete|l
 const STATE_ROOT_NOT_FOUND_MESSAGE: &str = "state root not found";
 const UNIMPLEMENTED_MESSAGE: &str = "command is not implemented yet";
 
-/// [`CliExit::Failed`] の固定文言表。引用符・バックスラッシュ・制御文字を含まない定数のみ（テストで固定）。
+/// [`CliExit::failed`] の固定文言表。引用符・バックスラッシュ・制御文字を含まない定数のみ（テストで固定）。
 /// `ErrorCode` は `#[non_exhaustive]` のため、未知のコードは汎用文言に落とす。
 fn failure_message(code: ErrorCode) -> &'static str {
     match code {
@@ -227,7 +237,7 @@ fn failure_message(code: ErrorCode) -> &'static str {
 }
 
 fn usage() -> CliExit {
-    CliExit::Usage
+    CliExit::usage()
 }
 
 /// argv（プログラム名を除く）を解釈して実行する。
@@ -386,6 +396,50 @@ mod tests {
         }
     }
 
+    /// 受け入れ検査（ERR-1）: 失敗が非ゼロ終了コード・LF 終端 1 行の `code` / `message` JSON であり、
+    /// `code()` と行内の `code` が一致する。
+    fn assert_structured_failure(exit: &CliExit, expected_exit: u8, expected_code: &str) {
+        assert_ne!(exit.exit_code(), 0);
+        assert_eq!(exit.exit_code(), expected_exit);
+        assert_eq!(exit.code(), Some(expected_code));
+        let line = stderr_of(exit);
+        assert!(line.ends_with("\"}\n"), "{line:?}");
+        assert_eq!(line.matches('\n').count(), 1, "{line:?}");
+        assert!(
+            line.starts_with(&format!("{{\"code\":\"{expected_code}\",\"message\":\"")),
+            "{line:?}"
+        );
+    }
+
+    /// ERR-1・TASK-95.2: 全コマンド（`Command::ALL`）の解析段階のエラー終了が、構造化エラー形式かつ非ゼロ終了コード（2）になる。
+    /// ワイルドカード無しの match で、コマンド追加時に argv の割り当て漏れをコンパイルエラーにする。
+    #[test]
+    fn err1_all_commands_error_exit_is_structured_and_nonzero() {
+        let usage_line = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|setup>\"}\n";
+        let mut covered = Vec::new();
+        for command in Command::ALL {
+            // 状態ストアを開く前（引数解析）で失敗する argv。OS に依存しない。
+            let argv: Vec<&str> = match command {
+                Command::Create => vec!["create"],
+                Command::Start => vec!["start"],
+                Command::Stop => vec!["stop", "a", "b"],
+                Command::Delete => vec!["delete", "--x", "a"],
+                Command::List => vec!["list", "x"],
+                Command::Logs => vec!["logs"],
+                Command::Setup => vec!["setup", "x"],
+            };
+            assert_eq!(argv[0], command.as_str());
+            let exit = run(args(&argv));
+            assert_structured_failure(&exit, 2, "INVALID_ARGUMENT");
+            assert_eq!(stderr_of(&exit), usage_line, "{argv:?}");
+            covered.push(command.as_str());
+        }
+        assert_eq!(
+            covered,
+            ["create", "start", "stop", "delete", "list", "logs", "setup"]
+        );
+    }
+
     /// ERR-2: logs の不正 ID は状態ルートを開く前に INVALID_ARGUMENT（2）で拒否される。
     #[test]
     fn err2_logs_rejects_invalid_id() {
@@ -417,8 +471,8 @@ mod tests {
                 m.chars().all(|c| !c.is_control() && c != '"' && c != '\\'),
                 "{m:?}"
             );
-            assert_eq!(CliExit::Failed(code).exit_code(), exit);
-            assert_eq!(CliExit::Failed(code).code(), Some(code.as_str()));
+            assert_eq!(CliExit::failed(code).exit_code(), exit);
+            assert_eq!(CliExit::failed(code).code(), Some(code.as_str()));
         }
     }
 
@@ -437,19 +491,19 @@ mod tests {
         }
         for (exit, line) in [
             (
-                CliExit::Usage,
+                CliExit::usage(),
                 "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|setup>\"}\n",
             ),
             (
-                CliExit::Unimplemented,
+                CliExit::unimplemented(),
                 "{\"code\":\"UNIMPLEMENTED\",\"message\":\"command is not implemented yet\"}\n",
             ),
             (
-                CliExit::Failed(ErrorCode::NotFound),
+                CliExit::failed(ErrorCode::NotFound),
                 "{\"code\":\"NOT_FOUND\",\"message\":\"container not found\"}\n",
             ),
             (
-                CliExit::StateRootNotFound,
+                CliExit::state_root_not_found(),
                 "{\"code\":\"NOT_FOUND\",\"message\":\"state root not found\"}\n",
             ),
         ] {
@@ -465,7 +519,7 @@ mod tests {
         assert_eq!(stderr_of(&CliExit::Success), "");
         assert_eq!(CliExit::Success.exit_code(), 0);
         assert_eq!(
-            stderr_of(&CliExit::Unimplemented),
+            stderr_of(&CliExit::unimplemented()),
             "{\"code\":\"UNIMPLEMENTED\",\"message\":\"command is not implemented yet\"}\n"
         );
         let e = OciRuntimeError::new(
@@ -787,6 +841,66 @@ mod tests {
                 assert!(!o.stderr.contains("inj"), "{:?}", o.stderr);
                 assert_eq!(o.stderr.matches('\n').count(), 1, "{:?}", o.stderr);
             }
+        }
+
+        /// ERR-1・TASK-95.2: 解析通過後の実行時エラーも全コマンドで構造化エラー形式かつ非ゼロ終了コードになる
+        /// （`setup` は Linux で失敗しないため、`run_for(Other)` の失敗を同じ検査に通す）。
+        #[test]
+        fn err1_all_commands_runtime_error_exit_is_structured_and_nonzero() {
+            let base = TmpDir::new("err1rt");
+            let root = base.state_root();
+            let missing_root = base.0.join("no-parent").join("state");
+            let bundle = make_bundle(&base);
+            let b = bundle.to_str().expect("utf8");
+
+            let check = |o: &Outcome, exit: u8, code: &str| {
+                assert_ne!(o.exit, 0, "{}", o.stderr);
+                assert_eq!(o.exit, exit, "{}", o.stderr);
+                assert_eq!(o.code, Some(code), "{}", o.stderr);
+                assert!(o.stderr.ends_with("\"}\n"), "{:?}", o.stderr);
+                assert_eq!(o.stderr.matches('\n').count(), 1, "{:?}", o.stderr);
+                assert!(
+                    o.stderr.contains(&format!("\"code\":\"{code}\"")),
+                    "{:?}",
+                    o.stderr
+                );
+                assert!(o.stderr.contains("\"message\":\""), "{:?}", o.stderr);
+            };
+
+            create_ok(&base, "c1");
+            // create: 重複。
+            let o = invoke(&root, &["create", "--bundle", b, "c1"]);
+            check(&o, 4, "ALREADY_EXISTS");
+            // start / stop / delete: 未作成。
+            for argv in [
+                &["start", "none"][..],
+                &["stop", "none"],
+                &["delete", "none"],
+            ] {
+                check(&invoke(&root, argv), 3, "NOT_FOUND");
+            }
+            // list: 状態ルート不在（固定文言で完全一致）。
+            let o = invoke(&missing_root, &["list"]);
+            check(&o, 3, "NOT_FOUND");
+            assert_eq!(
+                o.stderr,
+                "{\"code\":\"NOT_FOUND\",\"message\":\"state root not found\"}\n"
+            );
+            // logs: 未作成（固定文言で完全一致）。
+            let o = invoke(&root, &["logs", "none"]);
+            check(&o, 3, "NOT_FOUND");
+            assert_eq!(
+                o.stderr,
+                "{\"code\":\"NOT_FOUND\",\"message\":\"container not found\"}\n"
+            );
+            // setup: 対応外 OS 区分は UNIMPLEMENTED（8）。
+            let mut sink = Vec::new();
+            let exit = crate::setup::run_for(crate::setup::SetupPlatform::Other, &mut sink);
+            assert_structured_failure(&exit, 8, "UNIMPLEMENTED");
+            assert_eq!(
+                stderr_of(&exit),
+                "{\"code\":\"UNIMPLEMENTED\",\"message\":\"not implemented on this platform\"}\n"
+            );
         }
 
         /// REPAIR-12・CLI-1: `Command::ALL` の全コマンドに Linux 経路のシナリオがあることを、

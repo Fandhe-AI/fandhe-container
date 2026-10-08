@@ -3527,8 +3527,9 @@ mod tests {
         assert_eq!(status.expect("spawned").code(), Some(0));
     }
 
-    /// 子プロセスを起動し、期限付きの `try_wait` で終了を待つ（REPAIR-5）。期限超過時は kill して回収し、
-    /// `ErrorKind::TimedOut` を返す。起動失敗（`ETXTBSY` 等）はそのまま返す。
+    /// 子プロセスを起動し、期限付きの `try_wait` で終了を待つ（REPAIR-5）。期限超過時は kill し、
+    /// 有限の猶予内で回収して `ErrorKind::TimedOut` を返す。kill の失敗・回収猶予の超過は
+    /// 期限なしで待たず、明示的なエラーとして返す。起動失敗（`ETXTBSY` 等）はそのまま返す。
     fn run_with_deadline(
         mut cmd: std::process::Command,
         deadline: std::time::Duration,
@@ -3540,8 +3541,13 @@ mod tests {
                 return Ok(s);
             }
             if start.elapsed() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                if let Err(e) = child.kill() {
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!("failed to kill child after the deadline: {e}"),
+                    ));
+                }
+                reap_bounded(&mut child, std::time::Duration::from_secs(5))?;
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "child did not exit before the deadline",
@@ -3549,6 +3555,44 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    /// kill 後の子を `try_wait` のループで回収する。`grace` 内に回収できなければ無期限に待たず
+    /// `ErrorKind::TimedOut` を返す（REPAIR-5）。
+    fn reap_bounded(child: &mut std::process::Child, grace: std::time::Duration) -> io::Result<()> {
+        let start = std::time::Instant::now();
+        loop {
+            if child.try_wait()?.is_some() {
+                return Ok(());
+            }
+            if start.elapsed() >= grace {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "child was not reaped within the grace period",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// REPAIR-5: 回収猶予内に終了しない子（kill していないため生存）は無期限に待たず `TimedOut` を返す。
+    #[test]
+    fn repair5_reap_bounded_returns_timed_out_when_child_stays_alive() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let started = std::time::Instant::now();
+        let err = reap_bounded(&mut child, std::time::Duration::from_millis(100))
+            .expect_err("must time out");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            err.to_string(),
+            "child was not reaped within the grace period"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        child.kill().expect("kill");
+        child.wait().expect("wait");
     }
 
     /// REPAIR-5: 期限内に終了しない子は kill・回収され `TimedOut` の失敗が返る。

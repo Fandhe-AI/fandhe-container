@@ -940,6 +940,24 @@ const EXEC_STATUS_READY: &[u8] = b"R\n";
 const EXEC_STATUS_MAX: usize = 256;
 
 /// 子が違反として報告し得る理由（`execveat` 前の手順が返す違反。[`read_exec_status`] が名前から引き直す）。
+///
+/// 子が報告し得る違反の SSOT。親の [`classify_exec_status`] はこの一覧にある名前だけを違反として引き直し、
+/// 一覧に無い名前は `SetupFailed { violation: None }`（起動していない扱いは保たれるが SEC-4 の違反記録が
+/// 欠落する）に落ちる。そのため子の経路（本ファイルと `interpreter.rs` の `mod tests` より前）が作る
+/// `ViolationReason` とこの一覧は、テスト `sec4_sup6_task163_exec_child_violations_match_child_path_sources`
+/// がソース照合で双方向に突き合わせる（SEC-4・SUP-6・SEC-1・CORE-5。TASK-163 追補・#1533）。
+///
+/// 違反記録の対象外とする子の失敗（状態には `-` を書くか、何も書かずに終わる）と根拠:
+/// - `open_entrypoint` の `PermissionDenied`: 入力の種別不正（通常ファイルでない・継承した標準入出力と同一）や
+///   開き直しの間の競合による拒否で、分離境界の突破試行とは断定できない
+/// - `FailedPrecondition`（`/dev/null`・`/proc`・`/dev/fd` の不在や準備不足）: 差し替えではなく前提不足
+/// - `execveat` 自体の失敗（`R` の後）と状態書き込みの失敗: errno 由来のシステムエラー
+/// - `bind_to_parent_lifetime` / `join_exec_cgroup` の失敗（`exec_command.rs`。何も書かずに終了）: 親の生存確認と
+///   cgroup 参加のシステムエラー
+///
+/// 照合の限界: 対象は `process.rs` と `interpreter.rs` だけ。`prepare_exec_child` から別ファイルの違反生成
+/// ヘルパを呼ぶようになったら、そのファイルを照合対象に加えること（`rootfs.rs`・`setns.rs` 等は子の経路の外の
+/// 違反を多数作るため `exec/` 全体は走査しない）。
 pub(super) const EXEC_CHILD_VIOLATIONS: [ViolationReason; 5] = [
     ViolationReason::EntrypointIsRuntimeBinary,
     ViolationReason::EntrypointInterpreterIsRuntimeBinary,
@@ -3064,5 +3082,110 @@ mod tests {
             assert_eq!(err.code, ErrorCode::Internal);
             assert_eq!(reap_snapshot(&handle), (ReapState::Running, 0));
         }
+    }
+    /// `ViolationReason::<Name>` の `Name` を集めた集合（子の経路の違反理由の抽出。#1533）。
+    ///
+    /// `mod tests` 以降・コメント行・`EXEC_CHILD_VIOLATIONS` 自身の定義は数えない。拾いすぎは「失敗して判断を
+    /// 迫る」側に倒れるため許容する。
+    fn child_path_violation_names(src: &str) -> std::collections::BTreeSet<String> {
+        let body = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or(src);
+        let mut kept = String::new();
+        let mut in_list = false;
+        for line in body.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("pub(super) const EXEC_CHILD_VIOLATIONS") {
+                in_list = true;
+            }
+            if in_list {
+                if trimmed.starts_with("];") {
+                    in_list = false;
+                }
+                continue;
+            }
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            kept.push_str(line);
+            kept.push('\n');
+        }
+        const PREFIX: &str = "ViolationReason::";
+        kept.match_indices(PREFIX)
+            .filter_map(|(at, _)| {
+                let rest = kept.get(at + PREFIX.len()..)?;
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                (!name.is_empty()).then_some(name)
+            })
+            .collect()
+    }
+
+    /// 抽出した名前と一覧の差分 `(missing, stale)`。`missing` はコードにあって一覧に無い名前、`stale` は逆。
+    fn violation_list_gaps(
+        found: &std::collections::BTreeSet<String>,
+        list: &[ViolationReason],
+    ) -> (Vec<String>, Vec<String>) {
+        let listed: std::collections::BTreeSet<String> =
+            list.iter().map(|r| format!("{r:?}")).collect();
+        (
+            found.difference(&listed).cloned().collect(),
+            listed.difference(found).cloned().collect(),
+        )
+    }
+
+    /// 子の経路（`process.rs`・`interpreter.rs`）が作る違反理由と `EXEC_CHILD_VIOLATIONS` が一致する
+    /// （SEC-4・SUP-6・SEC-1・CORE-5。TASK-163 追補・#1533）。
+    ///
+    /// 照合対象は 2 ファイルだけ（別ファイルの違反生成ヘルパを子の経路から呼ぶ場合は加えること）。
+    #[test]
+    fn sec4_sup6_task163_exec_child_violations_match_child_path_sources() {
+        let mut found = child_path_violation_names(include_str!("process.rs"));
+        found.extend(child_path_violation_names(include_str!("interpreter.rs")));
+        let (missing, stale) = violation_list_gaps(&found, &EXEC_CHILD_VIOLATIONS);
+        assert!(
+            missing.is_empty(),
+            "child-path violations missing from EXEC_CHILD_VIOLATIONS: {missing:?}"
+        );
+        assert!(
+            stale.is_empty(),
+            "EXEC_CHILD_VIOLATIONS entries not produced by child-path sources: {stale:?}"
+        );
+        assert_eq!(found.len(), 5);
+    }
+
+    /// 足し忘れ・余剰・除外規則を合成入力で検出できる（上のテストが実際に失敗を報告する根拠。#1533）。
+    #[test]
+    fn sec4_sup6_task163_exec_child_violation_scan_detects_omission() {
+        let src = "fn f() {\n    ExecError::from_violation_at(ViolationReason::RootfsIsHostRoot, None, S);\n    ExecError::from_violation_at(\n        ViolationReason::ExecProcNotProcfs,\n        None,\n        S,\n    );\n}\n";
+        let found = child_path_violation_names(src);
+        let names: Vec<&str> = found.iter().map(String::as_str).collect();
+        assert_eq!(names, ["ExecProcNotProcfs", "RootfsIsHostRoot"]);
+
+        // 足し忘れ: コードにあって一覧に無い。
+        let (missing, stale) = violation_list_gaps(&found, &[ViolationReason::ExecProcNotProcfs]);
+        assert_eq!(missing, ["RootfsIsHostRoot"]);
+        assert!(stale.is_empty());
+
+        // 余剰: 一覧にあってコードに無い。
+        let (missing, stale) = violation_list_gaps(
+            &found,
+            &[
+                ViolationReason::ExecProcNotProcfs,
+                ViolationReason::RootfsIsHostRoot,
+                ViolationReason::ExecDevNotDirectory,
+            ],
+        );
+        assert!(missing.is_empty());
+        assert_eq!(stale, ["ExecDevNotDirectory"]);
+
+        // 除外規則: コメント行・一覧の定義・mod tests 以降は数えない。
+        let excluded = "// ViolationReason::InCommentLine\n/// ViolationReason::InDocLine\npub(super) const EXEC_CHILD_VIOLATIONS: [ViolationReason; 1] = [\n    ViolationReason::InList,\n];\nfn g() { let _ = ViolationReason::Real; }\n\n#[cfg(test)]\nmod tests {\n    fn t() { let _ = ViolationReason::InTests; }\n}\n";
+        let found = child_path_violation_names(excluded);
+        let names: Vec<&str> = found.iter().map(String::as_str).collect();
+        assert_eq!(names, ["Real"]);
     }
 }

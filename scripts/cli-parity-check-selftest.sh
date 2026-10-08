@@ -39,6 +39,13 @@ expect_rc() {
 #   blank    = list の末尾に余分な空行を出す
 #   big      = list が検査上限（64 KiB）を超える出力を返す
 #   nul      = create 成功時に NUL を含む出力を stdout へ出す
+#   errtable = 使い方エラーの n 回目に STUB_ERR_DIR/err.<n> の内容をそのまま stderr へ流す
+#              （A 層 18 ケースは全て使い方エラーで順に呼ばれるため、n 回目 = ケース A<n>）
+#
+# stderr の形は製品 CLI に合わせる（crates/cli/src/commands.rs の CliExit::write_stderr）:
+#   固定文言（使い方エラー・list の状態ルート不在・logs）= {"code":..,"message":..}
+#   core 由来（create / start / stop / delete の失敗。OciRuntimeError::write_json_line）
+#     = {"op":..,"code":..,"message":..}。stop の op は kill。
 # --------------------------------------------------
 stub="$work/stub-cli"
 cat >"$stub" <<'STUB'
@@ -48,6 +55,16 @@ seen_root=0
 seen_pps=0
 root=""
 bad() {
+  if [ "$mode" = "errtable" ]; then
+    n=0
+    [ -f "$STUB_ERR_DIR/count" ] && n="$(cat "$STUB_ERR_DIR/count")"
+    n=$((n + 1))
+    printf '%s\n' "$n" >"$STUB_ERR_DIR/count"
+    if [ -f "$STUB_ERR_DIR/err.$n" ]; then
+      cat "$STUB_ERR_DIR/err.$n" >&2
+      exit 2
+    fi
+  fi
   if [ "$mode" = "multierr" ]; then
     printf '{"code":"INVALID_ARGUMENT","message":"a"}\n{"code":"INVALID_ARGUMENT","message":"b"}\n' >&2
   elif [ "$mode" = "brokenerr" ]; then
@@ -60,6 +77,8 @@ bad() {
   exit 2
 }
 fail_with() { printf '{"code":"%s","message":"x"}\n' "$2" >&2; exit "$1"; }
+# core 由来の失敗（op 付き）。<終了コード> <code> <op>
+fail_op() { printf '{"op":"%s","code":"%s","message":"x"}\n' "$3" "$2" >&2; exit "$1"; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --root) [ $# -ge 2 ] || bad; [ "$seen_root" = 0 ] || bad; seen_root=1; root="$2"; shift 2 ;;
@@ -104,6 +123,7 @@ case "$cmd" in
   list) [ $# -eq 0 ] || bad ;;
   *) bad ;;
 esac
+# 非 Linux は plugin 未配線の固定文言（CliExit::Failed。op なし）。
 [ "$mode" = "nonlinux" ] && fail_with 5 FAILED_PRECONDITION
 case "$cmd" in
   list)
@@ -122,16 +142,17 @@ case "$cmd" in
     [ "$mode" = "diff" ] && [ -e "$root/c1.c" ] && exit 7
     ;;
   create)
-    [ -d "$root" ] || fail_with 3 NOT_FOUND
-    [ -e "$root/$id.c" ] && fail_with 4 ALREADY_EXISTS
+    [ -d "$root" ] || fail_op 3 NOT_FOUND create
+    [ -e "$root/$id.c" ] && fail_op 4 ALREADY_EXISTS create
     : >"$root/$id.c"
     [ "$mode" = "noisy" ] && printf '/home/secret-user/out\n'
     [ "$mode" = "nl" ] && printf '\n'
     [ "$mode" = "nul" ] && printf 'a\000b'
     ;;
-  start | logs) [ -e "$root/$id.c" ] || fail_with 3 NOT_FOUND; fail_with 8 UNIMPLEMENTED ;;
-  stop) [ -e "$root/$id.c" ] || fail_with 3 NOT_FOUND; fail_with 5 FAILED_PRECONDITION ;;
-  delete) [ -e "$root/$id.c" ] || fail_with 3 NOT_FOUND; rm -f "$root/$id.c" ;;
+  start) [ -e "$root/$id.c" ] || fail_op 3 NOT_FOUND start; fail_op 8 UNIMPLEMENTED start ;;
+  logs) [ -e "$root/$id.c" ] || fail_with 3 NOT_FOUND; fail_with 8 UNIMPLEMENTED ;;
+  stop) [ -e "$root/$id.c" ] || fail_op 3 NOT_FOUND kill; fail_op 5 FAILED_PRECONDITION kill ;;
+  delete) [ -e "$root/$id.c" ] || fail_op 3 NOT_FOUND delete; rm -f "$root/$id.c" ;;
 esac
 exit 0
 STUB
@@ -259,6 +280,71 @@ run_capture multierr "$work/me.txt"
 [ "$(line_of "$work/me.txt" A02)" = $'A02\tA\t2\t<unparsed>\t-' ] && pass "multi-line stderr is unparsed" || fail "multi-line stderr is unparsed: $(line_of "$work/me.txt" A02)"
 run_capture brokenerr "$work/be.txt"
 [ "$(line_of "$work/be.txt" A02)" = $'A02\tA\t2\t<unparsed>\t-' ] && pass "broken JSON stderr is unparsed" || fail "broken JSON stderr is unparsed: $(line_of "$work/be.txt" A02)"
+
+# --- stderr 1 行 JSON の 2 つの形（固定文言・core 由来の op 付き）の受理と、壊れた形の拒否（ERR-1・ERR-2） ---
+# スタブの create / start / stop / delete の失敗は製品と同じ op 付きで出している。code だけが記録に残る。
+[ "$(line_of "$work/ok.txt" B11)" = $'B11\tB\t3\tNOT_FOUND\t-' ] && pass "op form (start) yields code" || fail "op form (start) yields code: $(line_of "$work/ok.txt" B11)"
+[ "$(line_of "$work/ok.txt" B12)" = $'B12\tB\t3\tNOT_FOUND\t-' ] && pass "op form (stop = kill) yields code" || fail "op form (stop = kill) yields code: $(line_of "$work/ok.txt" B12)"
+[ "$(line_of "$work/ok.txt" B14)" = $'B14\tB\t3\tNOT_FOUND\t-' ] && pass "fixed form (logs) yields code" || fail "fixed form (logs) yields code: $(line_of "$work/ok.txt" B14)"
+if grep -qE '"op"|kill|start|delete' "$work/ok.txt"; then fail "op leaked into capture"; else pass "op is not recorded"; fi
+
+# fixture 表: err.<n> を A<n> の stderr として流し、記録の code 欄を具体値で照合する。
+errdir="$work/errtable"
+mkdir -p "$errdir"
+want_codes=()
+add_err() { # <期待する code 欄> <printf の書式（stderr の全バイト）>
+  local idx=$((${#want_codes[@]} + 1))
+  # shellcheck disable=SC2059 # 書式は本ファイル内の固定 fixture（バイト列を 8 進エスケープで書くため）
+  printf "$2" >"$errdir/err.$idx"
+  want_codes+=("$1")
+}
+# 受理（A01〜A06）
+add_err INVALID_ARGUMENT '{"code":"INVALID_ARGUMENT","message":"usage: fandhe-container <create|start>"}\n'
+add_err ALREADY_EXISTS '{"op":"create","code":"ALREADY_EXISTS","message":"container already exists"}\n'
+add_err NOT_FOUND '{"op":"kill","code":"NOT_FOUND","message":"a\\"b\\\\c \\u0041 \\/ \\n"}\n'
+add_err NOT_FOUND '{"op":"start","code":"NOT_FOUND","message":"\343\201\202 \303\251"}\n'
+add_err FAILED_PRECONDITION '{"code":"FAILED_PRECONDITION","message":""}\n'
+add_err INTERNAL '{"op":"delete","code":"INTERNAL","message":"del \177 ok"}\n'
+# 拒否（A07〜A18）: code らしき文字列を含んでいても <unparsed>
+add_err '<unparsed>' '{"op":"create","message":"x"}\n'
+add_err '<unparsed>' '{"code":"INVALID_ARGUMENT","message":"a"b"}\n'
+add_err '<unparsed>' '{"code":"INVALID_ARGUMENT","message":"a \001 b"}\n'
+add_err '<unparsed>' 'error: INVALID_ARGUMENT "code":"INVALID_ARGUMENT"\n'
+add_err '<unparsed>' '{"code":"NOT_FOUND","message":"a"}\n{"code":"NOT_FOUND","message":"b"}\n'
+add_err '<unparsed>' '{"code":"NOT_FOUND","message":"no trailing newline"}'
+add_err '<unparsed>' '{"code":"NOT_FOUND","message":"bad utf8 \377"}\n'
+add_err '<unparsed>' '{"code":"NOT_FOUND","message":"m","extra":"y"}\n'
+add_err '<unparsed>' '{"code":"NOT_FOUND","message":"bad escape \\x"}\n'
+add_err '<unparsed>' '{"code":"NOT_FOUND","op":"start","message":"key order"}\n'
+add_err '<unparsed>' '{"code":"NOT_FOUND","message":"short \\u12"}\n'
+add_err '<unparsed>' '{"code":"NOT_FOUND","message":"crlf"}\r\n'
+[ "${#want_codes[@]}" = "18" ] && pass "errtable has 18 fixtures" || fail "errtable has 18 fixtures (got ${#want_codes[@]})"
+STUB_ERR_DIR="$errdir" run_capture errtable "$work/errtable.txt"
+expect_rc "capture with stderr fixtures exits 0" 0 $?
+i=0
+for want in "${want_codes[@]}"; do
+  i=$((i + 1))
+  cid="$(printf 'A%02d' "$i")"
+  got="$(line_of "$work/errtable.txt" "$cid")"
+  [ "$got" = "${cid}${tab}A${tab}2${tab}${want}${tab}-" ] && pass "stderr fixture $cid -> $want" || fail "stderr fixture $cid -> $want: $got"
+done
+if grep -qE 'usage|exists|"message"' "$work/errtable.txt"; then fail "stderr message leaked into capture"; else pass "stderr message not recorded"; fi
+
+# core の message 上限（4096 バイト）が全バイト 2 バイトへエスケープされた正規の出力は受理し、
+# 検査上限（16384 バイト）を超える出力は先頭が正常でも拒否する。
+rm -f "$errdir"/err.* "$errdir/count"
+q4096="$(head -c 4096 /dev/zero | tr '\000' 'q' | sed 's/q/\\"/g')"
+printf '{"op":"create","code":"INVALID_ARGUMENT","message":"%s"}\n' "$q4096" >"$errdir/err.1"
+printf '{"code":"INVALID_ARGUMENT","message":"%s%s%s"}\n' "$q4096" "$q4096" "$q4096" >"$errdir/err.2"
+STUB_ERR_DIR="$errdir" run_capture errtable "$work/errmax.txt"
+[ "$(line_of "$work/errmax.txt" A01)" = $'A01\tA\t2\tINVALID_ARGUMENT\t-' ] && pass "max-length escaped message is accepted" || fail "max-length escaped message is accepted: $(line_of "$work/errmax.txt" A01)"
+[ "$(line_of "$work/errmax.txt" A02)" = $'A02\tA\t2\t<unparsed>\t-' ] && pass "oversized stderr is unparsed" || fail "oversized stderr is unparsed: $(line_of "$work/errmax.txt" A02)"
+
+# 片側だけ壊れた stderr は、正常な baseline と MATCH にならない（A08 = 未エスケープの引用符）。
+"$target" compare --baseline "$work/ok.txt" --candidate "$work/errtable.txt" >"$work/cmp.txt" 2>&1
+expect_rc "broken stderr on one side is rc 1" 1 $?
+grep -q '^A08 UNVERIFIED' "$work/cmp.txt" && pass "A08 broken JSON reported as UNVERIFIED" || fail "A08 broken JSON reported as UNVERIFIED"
+grep -q '^A01 MATCH' "$work/cmp.txt" && pass "A01 valid fixed form still MATCH" || fail "A01 valid fixed form still MATCH"
 
 # --- list 出力の末尾の余分な空行は正常出力と区別して異常にする ---
 run_capture blank "$work/blank.txt"

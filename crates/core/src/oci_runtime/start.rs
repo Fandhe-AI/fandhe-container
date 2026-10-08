@@ -1564,6 +1564,10 @@ mod tests {
 
     /// 別プロセスの所有者を模して bundle ディレクトリへ別の記述子で `flock` をかける（flock は同一
     /// プロセス内でも別に開いた記述子同士で競合する）。
+    ///
+    /// 解放は呼び出し側が `unlock()` で明示する。`flock` は open file description に付くため、並行する
+    /// テストの `Command::spawn` が fork から exec までの間この記述子を引き継ぐと、`drop`（close）だけでは
+    /// ロックが外れない（#1537）。
     #[cfg(target_os = "linux")]
     fn lock_bundle_as_other_owner(b: &Bundle) -> std::fs::File {
         let file = std::fs::File::open(&b.dir).expect("open bundle");
@@ -1591,6 +1595,7 @@ mod tests {
         assert_eq!(launcher.received_timeouts(), [] as [Duration; 0]);
         let got = store.get(&GetStateRequest::new(id.clone())).expect("get");
         assert_eq!(got.status().state(), ContainerState::Running);
+        other.unlock().expect("unlock other owner");
         drop(other);
         let got = recover(&store, &launcher, &id).expect("owner gone");
         assert_eq!(got.status().state(), ContainerState::Created);
@@ -1613,6 +1618,7 @@ mod tests {
         let id = ContainerId::new("owner-start").expect("id");
         let got = store.get(&GetStateRequest::new(id)).expect("get");
         assert_eq!(got.status().state(), ContainerState::Created);
+        other.unlock().expect("unlock other owner");
         drop(other);
         run(&store, &launcher, "owner-start").expect("start after unlock");
         assert_eq!(launcher.calls(), 1);
@@ -1838,6 +1844,7 @@ mod tests {
         assert!(eventually(Duration::from_secs(10), || probe
             .try_lock()
             .is_ok()));
+        probe.unlock().expect("unlock probe");
         drop(probe);
         let got = recover(&store, &launcher, &id).expect("recover after the launch ended");
         assert_eq!(got.status().state(), ContainerState::Created);

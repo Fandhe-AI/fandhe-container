@@ -11,6 +11,8 @@
 //! `xmls/VK_EXT_command_serialization.xml` SHA-256 `2451e5dcc5306f604c52da48a8cc883a24de708dd86f38bbb035d29a753a0474`。
 //! 値（事実情報）のみを転記し、コードや生成物は流用していない。
 //!
+//! コマンドストリームの記録と再生ハーネスは [`replay`]（TASK-172.5・#889）。
+//!
 //! 未実装（実装済みを装わない。REPAIR-3）: コマンドごとの引数パース（構造体・pNext・ハンドル表）と
 //! Vulkan へのディスパッチ（TASK-177.x: #765・#769・#771・#773・#774）、reply ストリームの符号化、
 //! ring・共有メモリ、virtio-gpu の ctrl 枠（`GET_CAPSET_INFO` / `GET_CAPSET`。TASK-175）、対象サブセットの確定（#726）。
@@ -21,6 +23,7 @@ mod capset;
 mod command;
 mod error;
 mod reader;
+pub mod replay;
 
 pub use capset::{
     CapsetInfo, CapsetResponse, VENUS_CAPSET_ID, VENUS_CAPSET_LEN, VENUS_CAPSET_MAX_VERSION,

@@ -1,6 +1,6 @@
 # Venus デコーダ最小サブセット PoC（設計ドラフト）
 
-macOS の virtio-gpu Venus 自前実装（ヘッドレス Vulkan compute のみ）で、最小 venus デコーダが扱う Vulkan コマンドの候補を記録する（GPU-6）。TASK-172 全体の PoC 文書で、本版は候補抽出（TASK-172.1）・wire パース骨格（TASK-172.2）・capset 応答（TASK-172.3）の章を埋める。
+macOS の virtio-gpu Venus 自前実装（ヘッドレス Vulkan compute のみ）で、最小 venus デコーダが扱う Vulkan コマンドの候補を記録する（GPU-6）。TASK-172 全体の PoC 文書で、本版は候補抽出（TASK-172.1）・wire パース骨格（TASK-172.2）・記録と再生ハーネス（TASK-172.5）・capset 応答（TASK-172.3）の章を埋める。
 
 > **位置づけ**: 本書はドラフトであり、候補を列挙するだけで対象サブセットを確定しない。最終確定は #726（TASK-172.h2。人間担当）で行う。優先度（必須・推奨・保留）は抽出時点の見立てで、確定扱いにしない。
 
@@ -162,7 +162,34 @@ GPU-6 の決定（ヘッドレス compute のみ・2D スキャンアウト非�
 - fail-closed: 候補外・未知の種別は `unsupported_command` でストリームを拒否する。配列件数は `MAX_ARRAY_LEN` で確保前に検証する
 - 先送り: コマンドごとの引数パース・ディスパッチ（TASK-177.x: #765・#769・#771・#773・#774）、reply の符号化、ring、frame_loop／adapter への配線。優先度は確定扱いにしない
 
-## 7. capset 応答（TASK-172.3・#724）
+## 7. コマンドストリームの記録と再生ハーネス（TASK-172.5・#889）
+
+実装は `crates/plugin-macos/src/gpu/venus/replay/`（`fandhe_container_plugin_macos::gpu::venus::replay`）。1 段目（GPU 付き Linux 実機＋治具 VMM）でゲストの Mesa venus が提出したバッファを保存し、2 段目（Apple Silicon Mac）で VMM なしに自前デコーダへ流し込むための道具（GPU-6。形式は REPAIR-2・REPAIR-12）。
+
+- 記録単位: ゲストが 1 回に提出したコマンドストリームのバッファ 1 個。venus wire はコマンド長を持たず、引数パーサ（TASK-177.x）なしには境界を切れないため、長さはレコード側で持つ
+- 形式（リトルエンディアン）:
+
+| 部分 | フィールド | 長さ | 備考 |
+| ---- | ---------- | ---- | ---- |
+| ファイルヘッダ | magic `FCVNSREC` | 8 B | 不一致は拒否 |
+| | format version | 2 B | 現行 1。未知は拒否 |
+| | flags | 2 B | 現行 0 のみ許可 |
+| | record_count | 4 B | 上限 65,536 |
+| | header_crc | 4 B | CRC-32C（先行 16 B） |
+| レコード（繰り返し） | kind | 1 B | 1 = ゲスト提出バッファ。他は未対応として拒否 |
+| | 予約 | 3 B | 0 のみ許可 |
+| | seqno | 4 B | 0 起点の連番 |
+| | payload_len | 4 B | 上限 16 MiB |
+| | payload | N B | |
+| | checksum | 4 B | CRC-32C（kind から payload まで） |
+
+- 保証範囲: `validate` が全レコードのチェックサム・seqno 連続・余剰バイト無しまで確認し、`ValidatedRecording` を返す。`replay` はこの型しか受け取らず、さらに全レコードの先頭がコマンドヘッダとして有効かを提出前に検査する。長さ・件数・ファイル全体長（256 MiB）は確保前に検証する。CRC-32C は偶発的な破損の検出用で、改ざん耐性はない（署名・ハッシュ照合は将来課題）
+- 配置の逸脱: issue 記載の `poc/venus-decoder/replay/` ではなく既存骨格の隣に置いた。`poc/` は存在せず、新設には workspace メンバー追加（ルート `Cargo.toml` の変更）が要る。再生器は同モジュールの `parse_command_header` を直接使う
+- 取り扱い: 実機で採取したストリームにはワークロード由来のデータが含まれうる。テストの fixture は合成データのみで、実ストリームはリポジトリにコミットしない
+- **未達（実装済みを装わない。REPAIR-3）**: 受け入れ条件「lavapipe 上で記録を再生し、最小 compute の結果が記録時と一致する」は本書時点で未達。理由は (1) コマンド引数のパース・Vulkan ディスパッチが未実装（TASK-177.x）、(2) lavapipe 実行に Vulkan バインディング（外部クレートまたは自前 FFI。依存追加・`unsafe` の承認が必要）が要る、(3) 実ストリームの採取は #725（人間担当）。再生先は `ReplayBackend` トレイトの差し替え点として定義し、`CollectingBackend`（提出内容を保持する模擬）でのみ検証している
+- 先送り: reply ストリーム・期待出力レコード（kind の番号のみ未割当）、実機側の記録フック配線（#888・#725）
+
+## 8. capset 応答（TASK-172.3・#724）
 
 実装は `crates/plugin-macos/src/gpu/venus/capset.rs`（`capset_info`・`respond_capset_query`）。PoC-14 で既存 OSS 構成が venus capset（id 4）を `max-size=0` で返し、ゲストの Mesa venus が物理デバイス 0 件と判定した問題への対処として、`max_size` が 0 でない（160）応答を返す最小実装を置いた。トランスポート非依存で、virtio-gpu の ctrl 枠は TASK-175 のデバイスモデルが包む。疎通の成否は #725 で確認する。本章は実装の存在のみを示す。
 
@@ -189,10 +216,9 @@ GPU-6 の決定（ヘッドレス compute のみ・2D スキャンアウト非�
   - `use_guest_vram` は VMM の共有メモリ方式に依存し、3 段目（#1057）の判定まで未決
   - flag 3 件を 1 にするのは対応機能（blob id 0・待機系コマンド・複数タイムライン。TASK-176・177）を後続が実装する前提の宣言で、現時点では未実装（REPAIR-3）
 
-## 8. 以降の章（未着手）
+## 9. 以降の章（未着手）
 
 | 章 | 内容 | 担当 issue |
 | -- | ---- | ---------- |
-| コマンドストリーム記録・再生 | 実ストリームの採取と差分検証 | #889 |
 | 1〜3 段目の結果 | 段階的な再検証の結果 | #725 |
 | 最終確定 | 対象サブセットの確定 | #726（TASK-172.h2。人間担当） |

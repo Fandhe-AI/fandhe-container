@@ -364,7 +364,7 @@ load_capture() {
   size="$(wc -c <"$file" | tr -d ' ')"
   [ "$size" -le $((MAX_LINES * MAX_LINE_LEN)) ] || { err invalid-input "capture file is too large"; exit 2; }
   local id_re='^[AB][0-9]{2}$' ex_re='^[0-9]{1,3}$' code_re='^([A-Z_]{1,40}|-|<unparsed>|<timeout>)$'
-  local so_re='^[-A-Za-z0-9_,;<>:]{1,300}$'
+  local so_re='^[-A-Za-z0-9_,;<>:]+$'
   while IFS= read -r line || [ -n "$line" ]; do
     n=$((n + 1))
     [ "$n" -le "$MAX_LINES" ] || { err invalid-input "capture file has too many lines"; exit 2; }
@@ -380,7 +380,7 @@ load_capture() {
       *)
         IFS="$TAB" read -r id layer ex code so <<<"$line"
         [[ $id =~ $id_re ]] && [ "$layer" = "${id:0:1}" ] && [[ $ex =~ $ex_re ]] && [ "$((10#$ex))" -le 255 ] \
-          && [[ $code =~ $code_re ]] && [[ $so =~ ^(-|'<timeout>')$ || $so =~ $so_re ]] \
+          && [[ $code =~ $code_re ]] && [[ $so =~ ^(-|'<timeout>')$ || $so =~ $so_re && "${#so}" -le 300 ]] \
           || { err invalid-input "malformed case line $n"; exit 2; }
         local var="${prefix}_${id}"
         [ -z "${!var+x}" ] || { err invalid-input "duplicate case id"; exit 2; }

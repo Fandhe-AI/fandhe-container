@@ -57,7 +57,15 @@
 use std::ffi::CStr;
 use std::fs::File;
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::AsRawFd;
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixStream;
 
 use crate::error::{PluginError, PluginErrorCode};
@@ -493,9 +501,16 @@ const O_NOFOLLOW: i32 = 0o400000;
 const O_DIRECTORY: i32 = 0o40000;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const O_NOFOLLOW: i32 = 0o100000;
-#[cfg(target_os = "linux")]
+// 対応アーキテクチャ（x86_64 / aarch64）以外の Linux では、使う側が fail-closed のため定義しない（#1538）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 const O_CLOEXEC: i32 = 0o2000000;
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 const AT_FDCWD: i32 = -100;
 #[cfg(target_os = "macos")]
 const O_DIRECTORY: i32 = 0x0010_0000;
@@ -718,6 +733,61 @@ pub(crate) mod lock_test_hook {
     }
 }
 
+/// [`open_lock_file`] の開き方（bool ではなく型で区別する）。
+#[derive(Clone, Copy)]
+enum LockFileOpen {
+    /// `O_CREAT | O_EXCL` で新規作成する。既にあれば `AlreadyExists`。
+    CreateNew,
+    /// `O_CREAT` なしで既存だけを開く。無ければ `NotFound`。
+    Existing,
+}
+
+/// [`lock_file_at`] の open(2) 呼び出し 1 回分。ロックファイルを開く FFI（`openat`）への依存を
+/// ここ 1 か所に閉じ込め、対応アーキテクチャ以外では呼び出し側の分岐を cfg で分けずに済ませる
+/// （未使用宣言の clippy 失敗を避ける。#1538）。`O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK`・0600 で開く。
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn open_lock_file(dir: &File, name: &CStr, how: LockFileOpen) -> io::Result<File> {
+    let flags = match how {
+        LockFileOpen::CreateNew => O_RDWR | O_CREAT | O_EXCL,
+        LockFileOpen::Existing => O_RDWR,
+    };
+    // SAFETY: `dir` は `&File` の借用中のため fd は有効。`name` は NUL 終端の有効な C 文字列。
+    // O_CREAT を含むため、可変長引数として mode（C の既定引数昇格後の `unsigned int` 幅）を
+    // 1 つ渡す。openat は渡したポインタを呼び出し中しか参照しない。
+    let fd = unsafe {
+        c_openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            flags | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK,
+            0o600u32,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` は直前の openat が返した、他に所有者のいない有効な fd（非負を確認済み）。
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// 対応アーキテクチャ以外では開けない（`Unsupported`。fail-closed）。
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+)))]
+fn open_lock_file(dir: &File, name: &CStr, how: LockFileOpen) -> io::Result<File> {
+    let _ = (dir, name, how);
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
 /// `dir` 基準で `name` のロックファイルを `O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK`・0600 で開き
 /// （`mode` に応じて無ければ作成）、非ブロッキングで排他ロックを取る。`O_NONBLOCK` は、既存の名前が FIFO・デバイス
 /// 等だった場合に open が相手を待って止まらないようにするため（通常ファイルの読み書きには影響しない。
@@ -745,104 +815,68 @@ pub(crate) fn lock_file_at(
     name: &CStr,
     mode: LockOpen,
 ) -> Result<LockHandle, LockError> {
-    #[cfg(any(
-        target_os = "macos",
-        all(
-            target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        )
-    ))]
-    {
-        let open = |flags: i32| -> io::Result<File> {
-            // SAFETY: `dir` は `&File` の借用中のため fd は有効。`name` は NUL 終端の有効な C 文字列。
-            // O_CREAT を含むため、可変長引数として mode（C の既定引数昇格後の `unsigned int` 幅）を
-            // 1 つ渡す。openat は渡したポインタを呼び出し中しか参照しない。
-            let fd = unsafe {
-                c_openat(
-                    dir.as_raw_fd(),
-                    name.as_ptr(),
-                    flags | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK,
-                    0o600u32,
-                )
-            };
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: `fd` は直前の openat が返した、他に所有者のいない有効な fd（非負を確認済み）。
-            Ok(unsafe { File::from_raw_fd(fd) })
-        };
-        // 新規作成（O_EXCL）を試し、既にあれば O_CREAT なしで既存を開く。その間に保持者が解放時の
-        // unlink をした場合は ENOENT になるため、上限つきで最初からやり直す（`created` を正確に保つ。
-        // 上限まで競合し続けた場合は `OpenContended` を返し、待ち続けない。REPAIR-5）。
-        const OPEN_ATTEMPTS: usize = 8;
-        let mut opened = None;
-        if mode == LockOpen::Existing {
-            opened = Some((open(O_RDWR)?, false));
+    // 新規作成（O_EXCL）を試し、既にあれば O_CREAT なしで既存を開く。その間に保持者が解放時の
+    // unlink をした場合は ENOENT になるため、上限つきで最初からやり直す（`created` を正確に保つ。
+    // 上限まで競合し続けた場合は `OpenContended` を返し、待ち続けない。REPAIR-5）。
+    const OPEN_ATTEMPTS: usize = 8;
+    let mut opened = None;
+    if mode == LockOpen::Existing {
+        opened = Some((open_lock_file(dir, name, LockFileOpen::Existing)?, false));
+    }
+    for _ in 0..OPEN_ATTEMPTS {
+        if opened.is_some() {
+            break;
         }
-        for _ in 0..OPEN_ATTEMPTS {
-            if opened.is_some() {
+        #[cfg(test)]
+        if lock_test_hook::take_contended_open() {
+            continue;
+        }
+        match open_lock_file(dir, name, LockFileOpen::CreateNew) {
+            Ok(f) => {
+                opened = Some((f, true));
                 break;
             }
-            #[cfg(test)]
-            if lock_test_hook::take_contended_open() {
-                continue;
-            }
-            match open(O_RDWR | O_CREAT | O_EXCL) {
-                Ok(f) => {
-                    opened = Some((f, true));
-                    break;
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => match open(O_RDWR) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                match open_lock_file(dir, name, LockFileOpen::Existing) {
                     Ok(f) => {
                         opened = Some((f, false));
                         break;
                     }
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e.into()),
-                },
-                Err(e) => return Err(e.into()),
-            }
-        }
-        let Some((file, created)) = opened else {
-            return Err(LockError::OpenContended);
-        };
-        // 通常ファイル以外（FIFO・デバイス等）はロックを試みる前に拒否する（flock 自体が失敗して
-        // 理由が分からなくなる OS があるため。内容にも触れない）。
-        if !file.metadata()?.is_file() {
-            return Err(io::Error::from(io::ErrorKind::PermissionDenied).into());
-        }
-        #[cfg(test)]
-        if created {
-            lock_test_hook::run(dir, name);
-        }
-        // 自分が作成した直後に他者（掃除）が先にロックを取っていた場合だけ、期限つきで待つ。
-        let mut waits_left = if created && mode == LockOpen::Bind {
-            CREATED_LOCK_WAIT_ATTEMPTS
-        } else {
-            0
-        };
-        loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(LockHandle { file, created }),
-                Err(std::fs::TryLockError::WouldBlock) if waits_left > 0 => {
-                    waits_left -= 1;
-                    std::thread::sleep(CREATED_LOCK_WAIT_INTERVAL);
                 }
-                Err(std::fs::TryLockError::WouldBlock) => return Err(LockError::Held),
-                Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
             }
+            Err(e) => return Err(e.into()),
         }
     }
-    #[cfg(not(any(
-        target_os = "macos",
-        all(
-            target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        )
-    )))]
-    {
-        let _ = (dir, name, mode);
-        Err(io::Error::from(io::ErrorKind::Unsupported).into())
+    let Some((file, created)) = opened else {
+        return Err(LockError::OpenContended);
+    };
+    // 通常ファイル以外（FIFO・デバイス等）はロックを試みる前に拒否する（flock 自体が失敗して
+    // 理由が分からなくなる OS があるため。内容にも触れない）。
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::from(io::ErrorKind::PermissionDenied).into());
+    }
+    #[cfg(test)]
+    if created {
+        lock_test_hook::run(dir, name);
+    }
+    // 自分が作成した直後に他者（掃除）が先にロックを取っていた場合だけ、期限つきで待つ。
+    let mut waits_left = if created && mode == LockOpen::Bind {
+        CREATED_LOCK_WAIT_ATTEMPTS
+    } else {
+        0
+    };
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(LockHandle { file, created }),
+            Err(std::fs::TryLockError::WouldBlock) if waits_left > 0 => {
+                waits_left -= 1;
+                std::thread::sleep(CREATED_LOCK_WAIT_INTERVAL);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => return Err(LockError::Held),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
     }
 }
 
@@ -1104,7 +1138,11 @@ impl DirStream {
     }
 }
 
-#[cfg(target_os = "linux")]
+// 使うのは `peer_ucred`（対応アーキテクチャのみ実装）だけのため、同じ cfg に揃える（#1538）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod linux {
     /// `struct ucred` と同じレイアウト。
     #[repr(C)]

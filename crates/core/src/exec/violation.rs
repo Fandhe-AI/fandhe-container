@@ -32,7 +32,7 @@
 //!
 //! 違反記録には namespace の識別子（`mnt:[inode]` 等）や正規化後のホスト側実パスを含めない。
 //! 対象（[`ViolationSubject`]）は呼び出し側が渡したパスだけで、長さを上限で切り詰め、
-//! 制御文字とバックスラッシュをエスケープして保持する。
+//! Cc・Cf・Zl・Zp の文字とバックスラッシュをエスケープして保持する。
 //!
 //! exec 対象の監査イベントは理由コード（静的トークン）だけを持ち、対象パス（期待 cgroup パス等）も
 //! 載せない（`AuditEvent::ExecTarget` がパスのフィールドを持たない型で保証する。#1465）。
@@ -40,6 +40,7 @@
 use std::path::Path;
 
 use crate::audit_log::{AuditEvent, AuditPath, AuditReason};
+use crate::sanitize::is_display_unsafe_char;
 use crate::traits::types::ErrorCode;
 
 use super::IsolationStage;
@@ -570,7 +571,7 @@ impl ViolationReason {
 /// 違反記録の対象として保持する文字列の上限（文字数。超過分は切り詰める）。
 pub const VIOLATION_SUBJECT_MAX_CHARS: usize = 256;
 
-/// 違反の対象（呼び出し側が渡したパス。exec の対象の cgroup 不一致では、記録から導いた期待 cgroup パス）。制御文字とバックスラッシュはエスケープ済みで、
+/// 違反の対象（呼び出し側が渡したパス。exec の対象の cgroup 不一致では、記録から導いた期待 cgroup パス）。Cc・Cf・Zl・Zp の文字とバックスラッシュはエスケープ済みで、
 /// 長さは [`VIOLATION_SUBJECT_MAX_CHARS`] 文字以下（ログ注入・無制限確保を防ぐ）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViolationSubject {
@@ -579,7 +580,7 @@ pub struct ViolationSubject {
 }
 
 impl ViolationSubject {
-    /// パスから作る。非 UTF-8 のバイトは U+FFFD に置き換え、制御文字（改行・ESC 等）と
+    /// パスから作る。非 UTF-8 のバイトは U+FFFD に置き換え、Unicode 一般カテゴリ Cc・Cf・Zl・Zp の文字（改行・ESC・双方向制御等。判定は `crate::sanitize`）と
     /// `\` は `char::escape_default` 形式でエスケープする。
     pub(super) fn from_path(path: &Path) -> Self {
         let lossy = path.to_string_lossy();
@@ -587,7 +588,7 @@ impl ViolationSubject {
         let mut count = 0usize;
         let mut truncated = false;
         for c in lossy.chars() {
-            let escaped: String = if c.is_control() || c == '\\' {
+            let escaped: String = if is_display_unsafe_char(c) || c == '\\' {
                 c.escape_default().collect()
             } else {
                 c.to_string()
@@ -694,6 +695,32 @@ mod tests {
         let s = ViolationSubject::from_path(Path::new("/a\nb\u{1b}[31m\\c/日本"));
         assert_eq!(s.as_str(), "/a\\nb\\u{1b}[31m\\\\c/日本");
         assert!(!s.is_truncated());
+    }
+
+    /// SEC-4: Cf（双方向制御・WORD JOINER）と Zl・Zp も `escape_default` 形式でエスケープする。
+    #[test]
+    fn sec4_subject_escapes_format_and_separator_chars() {
+        let s = ViolationSubject::from_path(Path::new("/a\u{202E}b\u{2060}c\u{2028}d\u{2029}e"));
+        assert_eq!(s.as_str(), "/a\\u{202e}b\\u{2060}c\\u{2028}d\\u{2029}e");
+        assert!(!s.is_truncated());
+    }
+
+    /// SEC-4: Cf のエスケープ列（8 文字）でも上限 256 文字を超えず、途中で切らない。
+    #[test]
+    fn sec4_subject_bound_holds_with_format_char_escapes() {
+        // 1 個 8 文字のエスケープ列が 32 個でちょうど 256 文字（33 個目で切り詰め）。
+        let many = "\u{202E}".repeat(33);
+        let s = ViolationSubject::from_path(Path::new(&many));
+        assert_eq!(s.as_str().chars().count(), 256);
+        assert!(s.is_truncated());
+        let fit = format!("/{}\u{202E}", "a".repeat(247));
+        let s = ViolationSubject::from_path(Path::new(&fit));
+        assert_eq!(s.as_str().chars().count(), 256);
+        assert!(!s.is_truncated());
+        let over = format!("/{}\u{202E}", "a".repeat(248));
+        let s = ViolationSubject::from_path(Path::new(&over));
+        assert_eq!(s.as_str().chars().count(), 249);
+        assert!(s.is_truncated());
     }
 
     /// 上限を超えるパスは上限の文字数で切り詰め、切り詰めたことを記録する。

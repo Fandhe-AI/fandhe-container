@@ -30,7 +30,7 @@
 //!   に固定した fd とは別のマウントであること、さらに **自分のマウント（`fsmount` の fd）と同じマウント ID**
 //!   であることを確かめる（fail-closed。固定後に名前の位置が差し替えられていれば検出する）
 //! - **エラー message**: マウント先を message に入れるときは、違反記録（`ViolationSubject`）と同じ
-//!   エスケープ（制御文字・`\\`）と切り詰め（256 文字）を通す（ログ注入の防止）
+//!   エスケープ（Cc・Cf・Zl・Zp の文字・`\\`）と切り詰め（256 文字）を通す（ログ注入の防止）
 //! - **失敗時の後始末**: rootfs はホスト上のディレクトリの bind mount のため、自動作成したマウント先
 //!   ディレクトリはプロセスを破棄しても残る。失敗時は、この呼び出しでマウントした tmpfs を逆順に
 //!   `umount2(MNT_DETACH)` で外し、この呼び出しの `mkdirat` が成功した要素だけを逆順に `unlinkat(AT_REMOVEDIR)`
@@ -401,7 +401,7 @@ fn observe_mount(
     })
 }
 
-/// エラー message に入れるマウント先の表示形。違反記録と同じ `ViolationSubject` のエスケープ（制御文字・
+/// エラー message に入れるマウント先の表示形。違反記録と同じ `ViolationSubject` のエスケープ（Cc・Cf・Zl・Zp の文字・
 /// `\\` を `char::escape_default` 形式へ）と切り詰め（`VIOLATION_SUBJECT_MAX_CHARS` 文字）を通す。
 /// マウント先は NUL と `\\` 以外の制御文字（改行・ESC 等）を含み得るため、そのまま入れるとログ注入になる。
 pub(super) fn display_destination(destination: &str) -> String {

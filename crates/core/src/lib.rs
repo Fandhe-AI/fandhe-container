@@ -20,6 +20,7 @@
 //! # モジュール構成
 //!
 //! - `traits`: 拡張点トレイト（実装済み。TASK-4 系）
+//! - `sanitize`: 表示を乱す文字（Cc・Cf・Zl・Zp）の判定と有界追記の共通実装（非公開。ERR-2・SEC-4・TASK-96.1）
 //! - `exec`: 最小実行フロー（Linux 限定。稼働中コンテナへの exec〔SUP-6・TASK-163.1〜163.4。pid1 特定と `setns(2)` 参加は `exec/setns.rs`、cgroup join は `exec/cgroup_join.rs`、制限の再適用は `exec/reapply.rs`、fork・`close_range`・`execveat` は `exec/exec_command.rs`。user namespace への参加は未実装で、対象が別の user namespace にいれば拒否する。実コンテナへの通し試験は実機前提で、CI では実行していない〕も持つ。namespace 分離〔TASK-27.2〕と `pivot_root` による
 //!   rootfs 切替〔TASK-27.3〕、基本デバイスノード作成〔TASK-27.6。`exec/devices.rs`。
 //!   Issue 表記の `src/devices.rs` ではなく `exec` 配下に置く: 段の型 `ExecError`・`MountIsolation`
@@ -110,6 +111,7 @@ pub mod plugin_trust;
 pub mod rlimits;
 #[cfg(target_os = "linux")]
 pub mod rootless;
+mod sanitize;
 pub mod seccomp;
 pub mod state_store;
 #[cfg(target_os = "linux")]

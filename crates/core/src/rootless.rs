@@ -59,6 +59,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::exec::IdMapping;
+use crate::sanitize::{is_display_unsafe_char, push_sanitized_bounded};
 use crate::sys::{self, NsFlag, SysError};
 use crate::traits::types::ErrorCode;
 
@@ -698,12 +699,21 @@ fn write_proc(path: &Path, content: &str, stage: RootlessStage) -> Result<(), Ro
         .map_err(|e| io_error(stage, "write proc file", &e))
 }
 
+/// newuidmap / newgidmap の stderr を、エラーメッセージへ入れられる形に整える（TASK-40・SEC-5・ERR-2）。
+///
+/// 表示を乱す文字（Cc・Cf・Zl・Zp。判定は `crate::sanitize` に一本化）は除去する（行区切りを
+/// 潰す既存の形）。出力は UTF-8 文字境界で `MAX_HELPER_STDERR_BYTES` バイト以下に収まる
+/// （不正バイトが U+FFFD へ膨らむ場合も含む）。
 fn sanitize_stderr(raw: &[u8]) -> String {
     let cut = raw.get(..MAX_HELPER_STDERR_BYTES).unwrap_or(raw);
-    String::from_utf8_lossy(cut)
-        .chars()
-        .filter(|c| !c.is_control() || *c == ' ')
-        .collect()
+    let lossy = String::from_utf8_lossy(cut);
+    let mut out = String::with_capacity(lossy.len().min(MAX_HELPER_STDERR_BYTES));
+    push_sanitized_bounded(
+        &mut out,
+        lossy.chars().filter(|&c| !is_display_unsafe_char(c)),
+        MAX_HELPER_STDERR_BYTES,
+    );
+    out
 }
 
 /// 検証済みヘルパーを実行する。exec 直前に所有者・権限・祖先ディレクトリ・dev/ino を再検証し、
@@ -1108,6 +1118,24 @@ fn mapper_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TASK-40・ERR-2: stderr から Cf・Zl・Zp・Cc を除去する。
+    #[test]
+    fn task40_sanitize_stderr_drops_format_and_separator_chars() {
+        let out = sanitize_stderr("a\u{202E}b\u{2060}c\u{2028}d\u{2029}e".as_bytes());
+        assert_eq!(out, "abcde");
+        let out = sanitize_stderr("x\u{1b}[31my\nz\tw".as_bytes());
+        assert_eq!(out, "x[31myzw");
+    }
+
+    /// TASK-40: 出力は 4096 バイトを超えない（不正バイトが U+FFFD へ膨らむ場合も）。
+    #[test]
+    fn task40_sanitize_stderr_output_is_bounded() {
+        let ascii = vec![b'a'; MAX_HELPER_STDERR_BYTES + 100];
+        assert_eq!(sanitize_stderr(&ascii).len(), MAX_HELPER_STDERR_BYTES);
+        let invalid = vec![0xFFu8; MAX_HELPER_STDERR_BYTES];
+        assert_eq!(sanitize_stderr(&invalid).len(), 4095);
+    }
 
     fn m(c: u32, h: u32, n: u32) -> IdMapping {
         IdMapping {

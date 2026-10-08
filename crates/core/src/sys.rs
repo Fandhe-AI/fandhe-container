@@ -27,6 +27,8 @@
 //! （restrict は呼び出したスレッドへの不可逆な適用）。
 //! さらに `crate::exec` の結合試験用プローブ（CORE-5・TASK-38.4・#179）が、副作用の無い引数に固定した
 //! `ptrace(2)`・`kexec_load(2)`（`syscall(2)` 経由）を呼ぶ。
+//! さらに封印した複製からの実行（TASK-163 追補・#1530・#1531）が、`memfd_create(2)`（`syscall(2)` 経由）と
+//! `fcntl(2)` の `F_ADD_SEALS` / `F_GET_SEALS` を呼ぶ。実行そのものは既存の `execveat(2)`（`exec_fd`）を使う。
 //! 基本デバイスノード作成は、`mknodat(2)`・`O_PATH` での `openat(2)` を呼ぶために使う。
 //! 委譲 cgroup の検出と子 cgroup 作成（`crate::cgroups`。CORE-3・TASK-32.1・#158）は、
 //! `mkdirat(2)`・`unlinkat(2)`・`fstatfs(2)`（cgroup2 判定）と `O_NOFOLLOW` 付きの `openat(2)` を呼ぶために使う。
@@ -179,6 +181,22 @@ mod consts {
     pub const SYS_EXECVEAT: i64 = 322;
     // include/uapi/linux/fcntl.h の `AT_EMPTY_PATH`（全アーキテクチャ共通）。
     pub const AT_EMPTY_PATH: i64 = 0x1000;
+    // arch/x86/entry/syscalls/syscall_64.tbl の `memfd_create`。
+    pub const SYS_MEMFD_CREATE: i64 = 319;
+    // include/uapi/linux/memfd.h の `MFD_CLOEXEC`・`MFD_ALLOW_SEALING`・`MFD_EXEC`（6.3+。全アーキテクチャ共通）。
+    pub const MFD_CLOEXEC: u32 = 0x1;
+    pub const MFD_ALLOW_SEALING: u32 = 0x2;
+    pub const MFD_EXEC: u32 = 0x10;
+    // include/uapi/linux/fcntl.h の `F_ADD_SEALS`・`F_GET_SEALS`（`F_LINUX_SPECIFIC_BASE` 1024 + 9・+ 10）。
+    pub const F_ADD_SEALS: i32 = 1033;
+    pub const F_GET_SEALS: i32 = 1034;
+    // include/uapi/linux/fcntl.h の `F_SEAL_SEAL`・`F_SEAL_SHRINK`・`F_SEAL_GROW`・`F_SEAL_WRITE`・`F_SEAL_EXEC`（6.3+）。
+    pub const F_SEAL_SEAL: u32 = 0x1;
+    pub const F_SEAL_SHRINK: u32 = 0x2;
+    pub const F_SEAL_GROW: u32 = 0x4;
+    pub const F_SEAL_WRITE: u32 = 0x8;
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const F_SEAL_EXEC: u32 = 0x20;
     // include/uapi/asm-generic/fcntl.h の `F_SETFD` と `FD_CLOEXEC`。
     pub const F_SETFD: i32 = 2;
     pub const FD_CLOEXEC: i32 = 1;
@@ -379,6 +397,22 @@ mod consts {
     pub const SYS_EXECVEAT: i64 = 281;
     // include/uapi/linux/fcntl.h の `AT_EMPTY_PATH`（全アーキテクチャ共通）。
     pub const AT_EMPTY_PATH: i64 = 0x1000;
+    // include/uapi/asm-generic/unistd.h の `__NR_memfd_create`（aarch64 は asm-generic 表を使う）。
+    pub const SYS_MEMFD_CREATE: i64 = 279;
+    // include/uapi/linux/memfd.h の `MFD_CLOEXEC`・`MFD_ALLOW_SEALING`・`MFD_EXEC`（6.3+。全アーキテクチャ共通）。
+    pub const MFD_CLOEXEC: u32 = 0x1;
+    pub const MFD_ALLOW_SEALING: u32 = 0x2;
+    pub const MFD_EXEC: u32 = 0x10;
+    // include/uapi/linux/fcntl.h の `F_ADD_SEALS`・`F_GET_SEALS`（`F_LINUX_SPECIFIC_BASE` 1024 + 9・+ 10）。
+    pub const F_ADD_SEALS: i32 = 1033;
+    pub const F_GET_SEALS: i32 = 1034;
+    // include/uapi/linux/fcntl.h の `F_SEAL_SEAL`・`F_SEAL_SHRINK`・`F_SEAL_GROW`・`F_SEAL_WRITE`・`F_SEAL_EXEC`（6.3+）。
+    pub const F_SEAL_SEAL: u32 = 0x1;
+    pub const F_SEAL_SHRINK: u32 = 0x2;
+    pub const F_SEAL_GROW: u32 = 0x4;
+    pub const F_SEAL_WRITE: u32 = 0x8;
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const F_SEAL_EXEC: u32 = 0x20;
     // include/uapi/asm-generic/fcntl.h の `F_SETFD` と `FD_CLOEXEC`。
     pub const F_SETFD: i32 = 2;
     pub const FD_CLOEXEC: i32 = 1;
@@ -554,6 +588,18 @@ mod consts {
     pub const CGROUP2_SUPER_MAGIC: i64 = 0;
     pub const SYS_EXECVEAT: i64 = 0;
     pub const AT_EMPTY_PATH: i64 = 0;
+    pub const SYS_MEMFD_CREATE: i64 = 0;
+    pub const MFD_CLOEXEC: u32 = 0;
+    pub const MFD_ALLOW_SEALING: u32 = 0;
+    pub const MFD_EXEC: u32 = 0;
+    pub const F_ADD_SEALS: i32 = 0;
+    pub const F_GET_SEALS: i32 = 0;
+    pub const F_SEAL_SEAL: u32 = 0;
+    pub const F_SEAL_SHRINK: u32 = 0;
+    pub const F_SEAL_GROW: u32 = 0;
+    pub const F_SEAL_WRITE: u32 = 0;
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const F_SEAL_EXEC: u32 = 0;
     pub const F_SETFD: i32 = 0;
     pub const FD_CLOEXEC: i32 = 0;
     pub const F_DUPFD_CLOEXEC: i32 = 0;
@@ -1563,6 +1609,140 @@ pub(crate) fn exec_fd(fd: BorrowedFd<'_>, argv: &[CString], envp: &[CString]) ->
         )
     };
     last_error()
+}
+/// memfd に付ける seal の集合（`F_SEAL_*` のビット和）。生の整数を `sys` の外へ出さないための newtype
+/// （REPAIR-2）。封印した複製からの実行（TASK-163 追補・#1530・#1531・SUP-6・SEC-1）で使う。
+///
+/// 未実装部分: exec の子からの呼び出し（組み込み）は #1531 で行うため、本番ビルドでは未使用。
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SealSet(u32);
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl SealSet {
+    /// 封印した複製に付ける seal の完全集合（`SEAL | SHRINK | GROW | WRITE` = 0x0F）。
+    /// 書き込み・伸長・縮小を拒否し、以後 seal の追加・変更もできなくする。
+    pub(crate) const EXEC_COPY: SealSet = SealSet(
+        consts::F_SEAL_SEAL | consts::F_SEAL_SHRINK | consts::F_SEAL_GROW | consts::F_SEAL_WRITE,
+    );
+
+    /// seal のビット値（診断・テスト用）。
+    pub(crate) fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// `other` の seal がすべて含まれるか。
+    pub(crate) fn contains(self, other: SealSet) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+/// 実行用 memfd を作る（`memfd_create(2)`。`MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_EXEC`）。
+///
+/// 封印した複製からの実行（#1530・#1531）の入口。`MFD_EXEC` を知らないカーネル（6.3 未満）は `EINVAL`
+/// を返すため、そのときだけ `MFD_EXEC` を外して 1 回再試行する（6.3 未満の memfd は実行できる）。
+/// `EACCES`（`vm.memfd_noexec=2`）・`EPERM`（seccomp）・`ENOSYS` などはそのまま返し、拒否（fail-closed）
+/// は呼び出し側が行う。`name` は固定値を渡す前提で、外部入力を混ぜない（`/` を含めない・249 バイト以下）。
+/// glibc 2.27・musl 1.1.20 の版前提を増やさないよう、`execveat`・`close_range` と同じく `syscall(2)` 経由で呼ぶ。
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn memfd_create_for_exec_copy(name: &CStr) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let base = consts::MFD_CLOEXEC | consts::MFD_ALLOW_SEALING;
+    match memfd_create_raw(name, base | consts::MFD_EXEC) {
+        Err(SysError::Os(e)) if e == EINVAL => memfd_create_raw(name, base),
+        other => other,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn memfd_create_raw(name: &CStr, flags: u32) -> Result<OwnedFd, SysError> {
+    // SAFETY: `name` は呼び出しの間生存する NUL 終端の借用で、カーネルは読み取るだけ。`flags` は整数
+    // （unsigned int 引数は register 幅に拡張して渡され、カーネルは下位 32 bit を読む）。
+    let rc = unsafe { syscall(consts::SYS_MEMFD_CREATE, name.as_ptr(), i64::from(flags)) };
+    if rc < 0 {
+        return Err(last_error());
+    }
+    let Ok(fd) = i32::try_from(rc) else {
+        return Err(SysError::Os(EINVAL));
+    };
+    // SAFETY: `fd` は直前に成功した memfd_create が返した、他に所有者のいない有効な fd。ここで 1 回だけ
+    // 所有権を `OwnedFd` へ移す（二重 close なし）。
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// `fd` に seal を追加する（`fcntl(F_ADD_SEALS)`）。`MFD_ALLOW_SEALING` なしの memfd・memfd でない fd は
+/// `EPERM` / `EINVAL`、`F_SEAL_SEAL` 済みなら `EPERM`。
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn add_seals(fd: BorrowedFd<'_>, seals: SealSet) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `fd` は生存中の `BorrowedFd`。F_ADD_SEALS は unsigned int の整数引数のみを取りポインタを渡さない。
+    let rc = unsafe { fcntl(fd.as_raw_fd(), consts::F_ADD_SEALS, seals.bits()) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `fd` に付いている seal を返す（`fcntl(F_GET_SEALS)`）。memfd でない fd は `EINVAL`。
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn get_seals(fd: BorrowedFd<'_>) -> Result<SealSet, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `fd` は生存中の `BorrowedFd`。F_GET_SEALS は追加引数を取らない。戻り値は seal のビット和か -1。
+    let rc = unsafe { fcntl(fd.as_raw_fd(), consts::F_GET_SEALS) };
+    if rc < 0 {
+        return Err(last_error());
+    }
+    // rc は非負の int なので u32 へ損失なく変換できる。
+    Ok(SealSet(u32::try_from(rc).unwrap_or(0)))
+}
+
+/// 封印の検証に失敗した理由（[`seal_for_exec`]）。`SysError` を拡張せず別の列挙にして、既存の
+/// `ExecError::from_sys` の分類へ波及させない。
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SealError {
+    /// seal の追加・取得の syscall が失敗した。
+    Sys(SysError),
+    /// 追加後の `F_GET_SEALS` が期待（`SealSet::EXEC_COPY` ちょうど）と一致しない。`F_SEAL_EXEC` など
+    /// 余分な seal が付いていた場合も含む。
+    Unexpected { actual: u32 },
+}
+
+/// 封印を検証済みの memfd。作れるのは [`seal_for_exec`] だけで、「封印を確認していない fd を実行する」
+/// 状態を型の上で表せなくする（REPAIR-2）。#1531 で exec の子が `as_fd()` を `exec_fd` へ渡す。
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct SealedMemfd(OwnedFd);
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl SealedMemfd {
+    /// 封印済み fd を貸す。
+    pub(crate) fn as_fd(&self) -> BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.0)
+    }
+
+    /// 所有権を取り出す（読み取り専用で開き直した後に元の書き込み用 fd を閉じる等）。
+    pub(crate) fn into_owned_fd(self) -> OwnedFd {
+        self.0
+    }
+}
+
+/// `fd` に `SealSet::EXEC_COPY` を付け、`F_GET_SEALS` がちょうど 0x0F であることを確かめて
+/// [`SealedMemfd`] にする。書き込みを終えた後に呼ぶ（以後の書き込み・伸長・縮小は `EPERM`）。
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn seal_for_exec(fd: OwnedFd) -> Result<SealedMemfd, SealError> {
+    let borrowed = std::os::fd::AsFd::as_fd(&fd);
+    add_seals(borrowed, SealSet::EXEC_COPY).map_err(SealError::Sys)?;
+    let actual = get_seals(borrowed).map_err(SealError::Sys)?;
+    if actual != SealSet::EXEC_COPY {
+        return Err(SealError::Unexpected {
+            actual: actual.bits(),
+        });
+    }
+    Ok(SealedMemfd(fd))
 }
 
 /// `close_range(first, last, flags)` を呼ぶ（Linux 5.11 以降。glibc 2.34 未満にラッパーが無いため `syscall(2)` 経由）。
@@ -3230,6 +3410,119 @@ mod tests {
         );
     }
 
+    /// SUP-6・SEC-1（TASK-163 追補・#1530）: 封印した複製の定数の具体値。memfd_create の syscall 番号は
+    /// arch ごとに個別定義する（x86_64 = syscall_64.tbl の 319、aarch64 = asm-generic/unistd.h の 279）。
+    #[test]
+    fn sup6_task163_sealed_copy_consts_are_exact() {
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(consts::SYS_MEMFD_CREATE, 319);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(consts::SYS_MEMFD_CREATE, 279);
+        assert_eq!(consts::MFD_CLOEXEC, 0x1);
+        assert_eq!(consts::MFD_ALLOW_SEALING, 0x2);
+        assert_eq!(consts::MFD_EXEC, 0x10);
+        assert_eq!(consts::F_ADD_SEALS, 1033);
+        assert_eq!(consts::F_GET_SEALS, 1034);
+        assert_eq!(consts::F_SEAL_SEAL, 0x1);
+        assert_eq!(consts::F_SEAL_SHRINK, 0x2);
+        assert_eq!(consts::F_SEAL_GROW, 0x4);
+        assert_eq!(consts::F_SEAL_WRITE, 0x8);
+        assert_eq!(consts::F_SEAL_EXEC, 0x20);
+    }
+
+    /// SUP-6: 封印に使う seal の完全集合は SEAL | SHRINK | GROW | WRITE の 0x0F（`F_SEAL_EXEC` を含まない）。
+    #[test]
+    fn sup6_task163_seal_set_exec_copy_is_0x0f() {
+        assert_eq!(SealSet::EXEC_COPY.bits(), 0x0F);
+        assert!(SealSet::EXEC_COPY.contains(SealSet(consts::F_SEAL_WRITE)));
+        assert!(!SealSet::EXEC_COPY.contains(SealSet(consts::F_SEAL_EXEC)));
+    }
+
+    /// SUP-6・SEC-1: 封印した memfd は書き込み・伸長・縮小・seal の追加がいずれも `EPERM` で拒否され、
+    /// `F_GET_SEALS` はちょうど 0x0F を返し、内容は封印前のまま変わらない。
+    #[test]
+    fn sup6_task163_memfd_seals_reject_write_grow_shrink() {
+        use std::os::fd::AsFd as _;
+        use std::os::unix::fs::FileExt as _;
+        let fd = memfd_create_for_exec_copy(c"fandhe-exec-test").expect("memfd_create");
+        // MFD_ALLOW_SEALING 付きで作った直後は seal が 1 つも付いていない。
+        assert_eq!(get_seals(fd.as_fd()).expect("get_seals").bits(), 0);
+        let mut content = b"#!/bin/sh\n".to_vec();
+        content.resize(4096, b'x');
+        let file = std::fs::File::from(fd);
+        file.write_all_at(&content, 0).expect("write before seal");
+        let sealed = seal_for_exec(file.into()).expect("seal_for_exec");
+        assert_eq!(get_seals(sealed.as_fd()).expect("get_seals").bits(), 0x0F);
+        let file = std::fs::File::from(sealed.into_owned_fd());
+        let eperm = Some(EPERM);
+        assert_eq!(file.write_at(b"y", 0).unwrap_err().raw_os_error(), eperm);
+        assert_eq!(file.write_at(b"y", 4096).unwrap_err().raw_os_error(), eperm);
+        assert_eq!(file.set_len(4097).unwrap_err().raw_os_error(), eperm);
+        assert_eq!(file.set_len(4095).unwrap_err().raw_os_error(), eperm);
+        assert_eq!(
+            add_seals(file.as_fd(), SealSet(consts::F_SEAL_WRITE)),
+            Err(SysError::Os(EPERM))
+        );
+        let mut after = vec![0u8; 4096];
+        file.read_exact_at(&mut after, 0).expect("read back");
+        assert_eq!(after, content);
+        assert_eq!(file.metadata().expect("metadata").len(), 4096);
+    }
+
+    /// SUP-6: memfd でない fd への `F_GET_SEALS` / `F_ADD_SEALS` は `EINVAL`（seal の概念が無い fd を
+    /// 「封印済み」と誤認しない）。
+    #[test]
+    fn sup6_task163_seals_on_regular_file_are_einval() {
+        use std::os::fd::AsFd as _;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("open /dev/null");
+        assert_eq!(get_seals(file.as_fd()), Err(SysError::Os(EINVAL)));
+        assert_eq!(
+            add_seals(file.as_fd(), SealSet::EXEC_COPY),
+            Err(SysError::Os(EINVAL))
+        );
+        let owned: OwnedFd = file.into();
+        assert_eq!(
+            seal_for_exec(owned).unwrap_err(),
+            SealError::Sys(SysError::Os(EINVAL))
+        );
+    }
+
+    /// SUP-6: 封印した複製を読み取り専用で開き直し、書き込み用 fd を閉じれば実行できる（`MFD_EXEC` と
+    /// `ETXTBSY` 回避の早期確認）。`vm.memfd_noexec=2` の環境では `memfd_create` が `EACCES` になり失敗する
+    /// （skip しない。fail-closed の設計どおり）。
+    #[test]
+    fn sup6_task163_sealed_memfd_is_executable_after_readonly_reopen() {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        use std::os::unix::fs::FileExt as _;
+        let src = std::fs::read("/bin/true").expect("read /bin/true");
+        let fd = memfd_create_for_exec_copy(c"fandhe-exec-test").expect("memfd_create");
+        let file = std::fs::File::from(fd);
+        file.write_all_at(&src, 0).expect("copy");
+        let sealed = seal_for_exec(file.into()).expect("seal_for_exec");
+        let n = sealed.as_fd().as_raw_fd();
+        let ro = std::fs::File::open(format!("/proc/self/fd/{n}")).expect("reopen read-only");
+        drop(sealed); // 書き込み用に開いた fd を閉じる。
+        set_cloexec(ro.as_fd(), false).expect("clear cloexec");
+        let path = format!("/proc/self/fd/{}", ro.as_raw_fd());
+        // 並列テストの fork が閉じる前の書き込み用 fd を一瞬保持すると ETXTBSY になり得るため、数回再試行する。
+        let mut status = None;
+        for _ in 0..20 {
+            match std::process::Command::new(&path).status() {
+                Ok(s) => {
+                    status = Some(s);
+                    break;
+                }
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => panic!("spawn failed: {e}"),
+            }
+        }
+        assert_eq!(status.expect("spawned").code(), Some(0));
+    }
     /// CORE-1（TASK-27.4.1）: fork / exec / wait 系の定数の具体値。syscall 番号・フラグ・シグナル番号は
     /// arch ごとに個別定義する（x86_64 = syscall_64.tbl、aarch64 = asm-generic/unistd.h）。
     #[test]

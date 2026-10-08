@@ -26,5 +26,17 @@ export default {
   // ignore にはしない。今後 subject 内容を問わず追加される任意の `merge: ...`
   // コミットまで恒久的に検証対象外にしてしまうため）。
   ignores: [
+    // PR #1397（#1311）の bd28ab01。本文 1 行が 100 文字を超え body-max-line-length に
+    // 違反するが、push 済みで force push（履歴の書き換え）を禁止しているため直せない。
+    // subject 行の完全一致に加え、違反した本文行の書き出しまで一致する場合だけ対象外にする
+    // （同じ subject の新しいコミットは引き続き検証する）。
+    (message) => {
+      const [subject, , body] = message.split('\n');
+      return (
+        subject === 'fix(plugin): 確認用の外部コマンド待機に期限を設ける' &&
+        typeof body === 'string' &&
+        body.startsWith('ps・kill の output()/status() が無期限に待つ問題を、')
+      );
+    },
   ],
 };

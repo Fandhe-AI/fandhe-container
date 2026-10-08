@@ -7,7 +7,9 @@
 //! `crate::signals` が、バイナリ `fandhe-container` の起動時に SIGINT・SIGTERM・SIGHUP のハンドラを
 //! 登録するために呼ぶ（[`install_forwarding_handler`]。#1513・PLUG-7・#1403 判断 2）。ハンドラ本体
 //! （plugin へ転送した後、既定動作へ戻った同じシグナルを自分へ再送する `forward_and_reraise`）は
-//! 本モジュールが持つ。`libc` は依存追加が禁止（dependency-policy）の
+//! 本モジュールが持つ。同じ起動時に、継承した `SIGCHLD` の `SIG_IGN` を `SIG_DFL` へ戻す
+//! （[`reset_child_signal_if_ignored`]。plugin の子が自動回収されて pid が再利用され、転送が無関係な
+//! プロセスへ届く窓を閉じる。#1513・PLUG-7・PR #1572 事後監査の P2）。`libc` は依存追加が禁止（dependency-policy）の
 //! ため、`crates/plugin/src/sys.rs` と同じ流儀で必要最小限の `extern "C"` 宣言と構造体を自前で持つ。
 //!
 //! # 構造体レイアウトと定数（一次情報）
@@ -16,7 +18,7 @@
 //!   で 152 バイト。`SA_RESTART` = 0x10000000・`SA_RESETHAND` = 0x80000000（`asm-generic/signal-defs.h`）。
 //! - macOS: xnu の `sys/signal.h` の `struct sigaction` は `{ __sigaction_u(8), sa_mask(sigset_t = u32), sa_flags(int) }`
 //!   で 16 バイト。`SA_RESTART` = 0x0002・`SA_RESETHAND` = 0x0004。
-//! - `SIG_IGN` = 1（いずれの OS も）。
+//! - `SIG_IGN` = 1・`SIG_DFL` = 0（いずれの OS も）。
 //! - musl は `struct sigaction` の並びが異なる（handler・flags・restorer・mask の順）ため対象外。
 //! - 上記以外の OS・アーキテクチャ・libc は構造体を持たず `Unsupported` を返す（他 OS の値を流用しない。fail-closed）。
 //!
@@ -32,6 +34,16 @@
 //!   ときだけの `install_recording_handler`・`recorded_signal` のみ
 
 #![cfg(unix)]
+
+/// [`reset_child_signal_if_ignored`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // 構造体レイアウト未確認の OS では構築されない（fail-closed の `Unsupported` 経路）
+pub(crate) enum ChildSignal {
+    /// 起動時に `SIG_IGN` だったため `SIG_DFL` へ戻した。
+    ResetFromIgnored,
+    /// `SIG_IGN` ではなかったため変更しなかった。
+    Kept,
+}
 
 /// 既存のシグナル設定を尊重したかどうか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +74,8 @@ mod layout {
     pub(super) const SA_RESTART: i32 = 0x1000_0000;
     // 0x80000000 は i32 では最上位ビットのみ（ビットパターンが同じ）。
     pub(super) const SA_RESETHAND: i32 = i32::MIN;
+    /// `SIGCHLD`（x86_64 / aarch64 とも 17。`asm-generic/signal.h`・`arch/x86/include/uapi/asm/signal.h`）。
+    pub(super) const SIGCHLD: i32 = 17;
 
     pub(super) fn empty() -> SigAction {
         SigAction {
@@ -86,6 +100,8 @@ mod layout {
 
     pub(super) const SA_RESTART: i32 = 0x0002;
     pub(super) const SA_RESETHAND: i32 = 0x0004;
+    /// `SIGCHLD`（xnu の `sys/signal.h` で 20）。
+    pub(super) const SIGCHLD: i32 = 20;
 
     pub(super) fn empty() -> SigAction {
         SigAction {
@@ -105,11 +121,12 @@ mod layout {
     )
 ))]
 mod imp {
-    use super::{Disposition, layout};
+    use super::{ChildSignal, Disposition, layout};
     use fandhe_container_plugin::{ForwardSignal, forward_to_running_plugins};
     use std::io;
 
     const SIG_IGN: usize = 1;
+    const SIG_DFL: usize = 0;
 
     unsafe extern "C" {
         // SAFETY（宣言そのものの妥当性）: POSIX の `int sigaction(int, const struct sigaction *, struct sigaction *)`。
@@ -187,6 +204,55 @@ mod imp {
         Ok(Disposition::Installed)
     }
 
+    /// 継承した `SIGCHLD` の `SIG_IGN` を `SIG_DFL` へ戻す（`SIG_IGN` 以外なら変更しない）。
+    ///
+    /// `SIGCHLD` が `SIG_IGN` だとカーネルが子を自動回収し、plugin の登録表に残った pid が回収後に再利用
+    /// され得る（`fandhe_container_plugin` の `signal_forward` の「制限」）。`SA_NOCLDWAIT` は execve で
+    /// フラグが消える（Linux の `flush_signal_handlers` は全シグナルの `sa_flags` を 0 にする）ため継承
+    /// されず、継承し得るのは `SIG_IGN` だけなので、`SIG_IGN` のときだけ戻す。
+    pub(crate) fn reset_child_signal_if_ignored() -> io::Result<ChildSignal> {
+        reset_if_ignored(layout::SIGCHLD)
+    }
+
+    /// `sig` が `SIG_IGN` なら `SIG_DFL`（フラグ 0・空のマスク）へ戻す。
+    fn reset_if_ignored(sig: i32) -> io::Result<ChildSignal> {
+        let mut old = layout::empty();
+        // SAFETY: `act` は NULL（取得のみ）、`old` は呼び出し中有効なスタック上の書き込み可能な領域。
+        if unsafe { sigaction(sig, std::ptr::null(), &mut old) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if old.handler != SIG_IGN {
+            return Ok(ChildSignal::Kept);
+        }
+        let mut act = layout::empty();
+        act.handler = SIG_DFL;
+        // SAFETY: `act` は初期化済み（`SIG_DFL`・フラグ 0・空のマスク）で呼び出し中有効、`old` の取得は
+        // 不要なため NULL。ハンドラ関数を登録しないため async-signal-safety の前提を持たない。
+        if unsafe { sigaction(sig, &act, std::ptr::null_mut()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(ChildSignal::ResetFromIgnored)
+    }
+
+    /// テスト専用: `sig` を `SIG_IGN` にする（[`reset_if_ignored`] の照合用。SIGCHLD には使わない）。
+    #[cfg(test)]
+    pub(super) fn set_ignored_for_test(sig: i32) -> io::Result<()> {
+        let mut act = layout::empty();
+        act.handler = SIG_IGN;
+        // SAFETY: `act` は初期化済みで呼び出し中有効、`old` の取得は不要なため NULL。ハンドラ関数を
+        // 登録しない。
+        if unsafe { sigaction(sig, &act, std::ptr::null_mut()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// テスト専用: [`reset_if_ignored`] を任意のシグナルで呼ぶ（プロセス全体の SIGCHLD を変えずに照合する）。
+    #[cfg(test)]
+    pub(super) fn reset_if_ignored_for_test(sig: i32) -> io::Result<ChildSignal> {
+        reset_if_ignored(sig)
+    }
+
     /// テスト専用: `sig` の現在の設定（ハンドラ値・フラグ）を読み出す（登録内容の読み戻し照合用）。
     #[cfg(test)]
     pub(super) fn current(sig: i32) -> io::Result<(usize, i32)> {
@@ -214,8 +280,13 @@ mod imp {
     )
 )))]
 mod imp {
-    use super::Disposition;
+    use super::{ChildSignal, Disposition};
     use std::io;
+
+    /// 構造体レイアウトを確認していない OS・アーキテクチャでは変更しない（fail-closed）。
+    pub(crate) fn reset_child_signal_if_ignored() -> io::Result<ChildSignal> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
 
     /// 構造体レイアウトを確認していない OS・アーキテクチャでは登録しない（fail-closed）。
     pub(crate) fn install_forwarding_handler(_sig: i32) -> io::Result<Disposition> {
@@ -235,7 +306,7 @@ mod imp {
     }
 }
 
-pub(crate) use imp::install_forwarding_handler;
+pub(crate) use imp::{install_forwarding_handler, reset_child_signal_if_ignored};
 #[cfg(feature = "signal-test-support")]
 pub(crate) use imp::{install_recording_handler, recorded_signal};
 
@@ -259,6 +330,11 @@ mod tests {
     const EINVAL: i32 = 22;
     /// SIGWINCH は Linux・macOS とも 28。既定動作は無視で、テストハーネスの動作を乱さない。
     const SIGWINCH: i32 = 28;
+    /// SIGURG（Linux 23・macOS 16）。既定動作は無視。プロセス全体の SIGCHLD を変えずに戻しの照合に使う。
+    #[cfg(target_os = "linux")]
+    const SIGURG: i32 = 23;
+    #[cfg(target_os = "macos")]
+    const SIGURG: i32 = 16;
 
     /// 範囲外のシグナル番号は OS のエラー（EINVAL）で失敗する。
     #[test]
@@ -282,5 +358,37 @@ mod tests {
         assert_eq!(handler, imp::forwarding_handler_value());
         let want = layout::SA_RESETHAND | layout::SA_RESTART;
         assert_eq!(flags & want, want);
+    }
+
+    /// PLUG-7・#1513: `SIG_IGN` のシグナルだけを `SIG_DFL`（フラグ 0）へ戻し、それ以外は変更しない。
+    /// SIGCHLD そのものはテストプロセスの他の試験の子の回収に影響するため、同じ処理を SIGURG で照合する。
+    #[test]
+    fn plug7_reset_if_ignored_restores_default_only_when_ignored() {
+        imp::set_ignored_for_test(SIGURG).unwrap();
+        // フラグは Linux で `SA_RESTORER` が加わるため照合しない（ハンドラ値 `SIG_IGN` = 1 のみ）。
+        assert_eq!(imp::current(SIGURG).unwrap().0, 1);
+        assert_eq!(
+            imp::reset_if_ignored_for_test(SIGURG).unwrap(),
+            ChildSignal::ResetFromIgnored
+        );
+        let (handler, flags) = imp::current(SIGURG).unwrap();
+        assert_eq!(handler, 0);
+        assert_eq!(flags & (layout::SA_RESETHAND | layout::SA_RESTART), 0);
+        assert_eq!(
+            imp::reset_if_ignored_for_test(SIGURG).unwrap(),
+            ChildSignal::Kept
+        );
+        // 範囲外の番号は OS のエラー（EINVAL）。
+        let e = imp::reset_if_ignored_for_test(100_000).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(EINVAL));
+    }
+
+    /// SIGCHLD の番号は OS ごとの一次情報の値（Linux 17・macOS 20）。
+    #[test]
+    fn plug7_sigchld_number_matches_platform() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(layout::SIGCHLD, 17);
+        #[cfg(target_os = "macos")]
+        assert_eq!(layout::SIGCHLD, 20);
     }
 }

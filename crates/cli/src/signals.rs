@@ -15,6 +15,12 @@
 //!   当該シグナルがブロックされるため保留となり、ハンドラから戻った時点で配送されて親は
 //!   シグナル終了（`ExitStatus::signal()` がそのシグナル）になる。errno は再送で終了するため退避しない。
 //! - 起動時に `SIG_IGN` を継承したシグナルは上書きしない（nohup・バックグラウンドジョブの慣行を壊さない）。
+//! - 例外として、継承した `SIGCHLD` の `SIG_IGN` は `SIG_DFL` へ戻す（PR #1572 事後監査の P2）。`SIG_IGN` の
+//!   ままだとカーネルが plugin の子を自動回収し、登録表に残った pid が再利用されて転送が無関係なプロセス
+//!   （グループ）へ届く窓ができる（`fandhe_container_plugin` の `signal_forward` の「制限」）。SIGHUP の
+//!   `SIG_IGN` は利用者の意図（nohup）だが、`SIGCHLD` の `SIG_IGN` を exec 越しに引き継ぐかは POSIX で未規定で
+//!   起動元が依存できる慣行ではなく、本バイナリは自分の子を wait する前提で動くため、戻しても起動元の意図を
+//!   壊さない（本バイナリの中の挙動だけが変わり、起動元の設定は変えない）。
 //! - シグナルハンドラの構造体レイアウトを確認済みでない unix（Linux の glibc〔x86_64・aarch64〕と macOS
 //!   以外。例: musl の Linux、riscv64 の Linux、FreeBSD）では登録が失敗し、`main` は構造化エラー（`INTERNAL`）で
 //!   起動を拒否する（fail-closed。転送なしで継続する方針は採らない）。対象は 3 OS 一級対応の範囲外。
@@ -31,9 +37,17 @@ const FORWARDED: [i32; 3] = [1, 2, 15];
 
 /// SIGINT・SIGTERM・SIGHUP のハンドラを登録する。失敗は構造化エラー（`INTERNAL`）で返す。
 ///
-/// 起動時に無視されていたシグナルは登録しない。1 回だけ、`main` から呼ぶこと。ハンドラ本体は
+/// 起動時に無視されていたシグナルは登録しない（`SIGCHLD` の `SIG_IGN` だけは `SIG_DFL` へ戻す）。
+/// 1 回だけ、`main` から呼ぶこと。ハンドラ本体は
 /// `sys` の固定ハンドラ（転送して再送する）で、呼び出し側は差し替えられない。
 pub fn install_signal_forwarding() -> Result<(), CliError> {
+    // 転送の前提（登録表の pid が回収前の子を指すこと）を保つため、先に SIGCHLD を既定へ戻す。
+    sys::reset_child_signal_if_ignored().map_err(|_| {
+        CliError::new(
+            ErrorCode::Internal,
+            "failed to reset the SIGCHLD disposition for plugin forwarding",
+        )
+    })?;
     for sig in FORWARDED {
         sys::install_forwarding_handler(sig).map_err(|_| {
             CliError::new(

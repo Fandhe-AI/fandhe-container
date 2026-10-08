@@ -237,7 +237,8 @@ impl<L: DnsHelperLauncher> DnsHelperRefCounts<L> {
     }
 
     /// `CreatedNetwork` を持つ呼び出し側の入口。ネットワークの名前解決方式が軽量運用
-    /// （[`NameResolution::StaticHosts`]。NET-8・TASK-146.1・#334）なら、ロックも launcher も触らず
+    /// （[`NameResolution::StaticHosts`](crate::etc_hosts::NameResolution::StaticHosts)。
+    /// NET-8・TASK-146.1・#334）なら、ロックも launcher も触らず
     /// [`JoinOutcome::HelperDisabled`] を返す（参照カウントによるオンデマンド起動を発動させない）。
     /// それ以外は gateway:53 を待受先として [`DnsHelperRefCounts::join`] へ委譲する。
     ///

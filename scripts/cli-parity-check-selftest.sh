@@ -168,6 +168,19 @@ grep -v '^B05	' "$work/ok.txt" >"$work/missing.txt"
 expect_rc "missing case is rc 1" 1 $?
 grep -q '^B05 MISSING' "$work/cmp.txt" && pass "B05 reported as MISSING" || fail "B05 reported as MISSING"
 
+# 両側から同じケースが欠落しても MISSING（期待 ID 集合は CASES から作る）
+grep -v '^B05	' "$work/ok.txt" >"$work/missing2.txt"
+"$target" compare --baseline "$work/missing.txt" --candidate "$work/missing2.txt" >"$work/cmp.txt" 2>&1
+expect_rc "case missing on both sides is rc 1" 1 $?
+grep -q '^B05 MISSING' "$work/cmp.txt" && pass "B05 missing on both sides reported" || fail "B05 missing on both sides reported"
+
+# タイムアウト記録同士は値が一致しても rc 1
+run_capture hang "$work/hang1.txt" --timeout 1
+run_capture hang "$work/hang2.txt" --timeout 1
+"$target" compare --baseline "$work/hang1.txt" --candidate "$work/hang2.txt" >"$work/cmp.txt" 2>&1
+expect_rc "matching timeout records are rc 1" 1 $?
+grep -q '^A02 TIMEOUT' "$work/cmp.txt" && pass "A02 timeout reported" || fail "A02 timeout reported"
+
 # 壊れた capture は rc 2
 printf 'garbage\n' >"$work/broken.txt"
 "$target" compare --baseline "$work/ok.txt" --candidate "$work/broken.txt" >/dev/null 2>&1

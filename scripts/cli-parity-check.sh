@@ -97,10 +97,23 @@ CASES=(
 # --------------------------------------------------
 tmp_dir=""
 watchdog_pid=""
+run_pid=""
 cleanup() {
+  local w
   if [ -n "$watchdog_pid" ]; then
     kill "$watchdog_pid" 2>/dev/null || true
     watchdog_pid=""
+  fi
+  # 中断時に実行中の CLI を残さない。KILL して最大 5 秒（0.1 秒 x 50）だけ回収を待ってから一時ディレクトリを消す（REPAIR-5）。
+  if [ -n "$run_pid" ]; then
+    kill -KILL "$run_pid" 2>/dev/null || true
+    w=0
+    while kill -0 "$run_pid" 2>/dev/null && [ "$w" -lt 50 ]; do
+      sleep 0.1
+      w=$((w + 1))
+    done
+    wait "$run_pid" 2>/dev/null || true
+    run_pid=""
   fi
   if [ -n "$tmp_dir" ] && [ -d "$tmp_dir" ]; then
     rm -rf -- "$tmp_dir"
@@ -134,6 +147,7 @@ run_cli() {
     exec "$cli" "$@" </dev/null >"$tmp_dir/out" 2>"$tmp_dir/err"
   ) &
   pid=$!
+  run_pid="$pid"
   ticks=$((limit * 10))
   (
     i=0
@@ -153,6 +167,7 @@ run_cli() {
   kill "$watchdog_pid" 2>/dev/null || true
   wait "$watchdog_pid" 2>/dev/null || true
   watchdog_pid=""
+  run_pid=""
   if [ -e "$tmp_dir/timed_out" ]; then
     run_timed_out=1
   else
@@ -257,7 +272,7 @@ do_capture() {
 
   local state="$tmp_dir/state" bundle="$tmp_dir/bundle" missing="$tmp_dir/nope/missing"
   mkdir -p -- "$state" "$bundle/rootfs"
-  chmod 700 -- "$state"
+  chmod 700 "$state"
   local fixture
   fixture="$(cd "$(dirname -- "$0")" && pwd)/testdata/cli-parity/config.json"
   [ -f "$fixture" ] || { err missing-prerequisite "fixture config.json not found"; exit 3; }
@@ -353,11 +368,15 @@ do_compare() {
   load_capture base "$base"
   load_capture cand "$cand"
 
-  local all_ids id bv cv bvar cvar layer
+  local all_ids id bv cv bvar cvar layer entry
   local a_match=0 a_mis=0 a_miss=0 b_match=0 b_mis=0 b_miss=0
-  # 基準の順序を保ち、候補のみにあるケースを末尾に足す。
-  all_ids="$base_ids"
-  for id in $cand_ids; do
+  # 比較対象は CASES から作る期待 ID 集合（固定ケース表）を基準とし、双方に無いケースも MISSING にする。
+  # 入力にだけある想定外 ID は末尾に足す（こちらも片側欠落として MISSING になる）。
+  all_ids=""
+  for entry in "${CASES[@]}"; do
+    all_ids="${all_ids:+$all_ids }${entry%%|*}"
+  done
+  for id in $base_ids $cand_ids; do
     case " $all_ids " in *" $id "*) ;; *) all_ids="$all_ids $id" ;; esac
   done
   printf 'baseline os=%s candidate os=%s\n' "$base_os" "$cand_os"
@@ -371,6 +390,10 @@ do_compare() {
     if [ -z "${!bvar+x}" ] || [ -z "${!cvar+x}" ]; then
       verdict="MISSING"
       printf '%s MISSING (baseline=%s candidate=%s)\n' "$id" "${bv:-absent}" "${cv:-absent}"
+    elif [[ $bv == *'<timeout>'* || $cv == *'<timeout>'* ]]; then
+      # タイムアウト記録は値が一致しても成功にしない（ハングした事実を合格に見せない。REPAIR-5）。
+      verdict="MISMATCH"
+      printf '%s TIMEOUT (baseline=%s candidate=%s)\n' "$id" "$bv" "$cv"
     elif [ "$bv" = "$cv" ]; then
       verdict="MATCH"
       printf '%s MATCH\n' "$id"

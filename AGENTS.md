@@ -35,8 +35,9 @@
 | `make fmt-check` | `cargo fmt --all --check` | 終了コード 0。整形差分（`Diff in ...`）を出力しない。差分がある場合は `make fmt` で整形してから再実行する |
 | `make lint` | `cargo clippy --workspace --all-targets -- -D warnings`（既定 feature） | 終了コード 0 かつ clippy 警告 0 件（`-D warnings` により警告はエラー扱いになる）。理由なしの `#[allow]` での抑止は上記のとおり P1・外部入力系 lint の抑止は P0 |
 | `make test` | `cargo test --workspace`（既定 feature） | 終了コード 0。すべての `test result:` 行が `0 failed`。`ignored` の増加で通していないこと（skip/ignore は P0） |
+| `make doc` | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`（既定 feature） | 終了コード 0 かつ rustdoc 警告 0 件（壊れた intra-doc リンク・private 項目へのリンク等はエラー扱い）。`cfg(target_os)` 限定の項目へは他 OS で解決できないためリンクせずコード表記にする（CI は 3 OS で実行。#1300） |
 | `make deny` | `cargo deny --locked check advisories bans licenses sources`（続けて `make deny-poc-venus-jig` で venus 試験治具の `Cargo.lock` も同じ 4 種で検査する） | 終了コード 0 かつ advisories・bans・licenses・sources の 4 チェックすべて ok（`--locked` により `Cargo.lock` の更新が必要な状態も失敗として検出する） |
-| `make ci` | `lint-docs` → `check-workspace-manifest` → `fmt-check` → `lint` → `test` → `deny` の順に実行 | 6 サブターゲットすべてが終了コード 0（make は最初の失敗で停止する）。`lint-docs` は markdownlint・yamllint・editorconfig-checker・commitlint（`origin/main` からの分岐点以降のコミット）を含む |
+| `make ci` | `lint-docs` → `check-workspace-manifest` → `fmt-check` → `lint` → `test` → `doc` → `deny` の順に実行 | 7 サブターゲットすべてが終了コード 0（make は最初の失敗で停止する）。`lint-docs` は markdownlint・yamllint・editorconfig-checker・commitlint（`origin/main` からの分岐点以降のコミット）を含む |
 
 **`make ci` の合格はローカルゲート（[ci](.claude/rules/ci.md)）であり、PR のマージゲートである CI 全体と同一ではない。** `make ci` は `--all-features` での検証・`test-integration`・`bench-check`・3 OS matrix を含まない。PR のマージゲートは `ci.yml` の集約ジョブ `ci-complete` が `lint-docs`・`rust-ci`・`rust-ci-default-features`・`integration-test`・`bench-regression`・`aarch64-linux-check` の全ジョブの成功を fail-closed で検証した上で成功することである。
 
@@ -46,9 +47,10 @@
 make fmt-check              # cargo fmt --all --check
 make lint                   # cargo clippy --workspace --all-targets -- -D warnings（既定 feature）
 make test                   # cargo test --workspace（既定 feature）
+make doc                    # RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps（既定 feature。rustdoc 警告のゲート）
 make test-integration       # cargo test --workspace --test '*' --features fandhe-container-io/crash-test-server ＋ --bins（結合試験。integration test target が 0 件なら notice を出して成功終了する）
 make deny                   # cargo deny --locked check advisories bans licenses sources
-make ci                     # lint-docs + check-workspace-manifest + fmt-check + lint + test + deny を一括実行
+make ci                     # lint-docs + check-workspace-manifest + fmt-check + lint + test + doc + deny を一括実行
 make bench-check-selftest   # ベンチ回帰比較スクリプトの自己テスト（REPAIR-8）
 make plugin-feature-size    # core の既定 / plugin 除外 release ビルドの rlib サイズ記録（PLUG-3・TASK-111.2。最終バイナリ未実装のため rlib 計測）
 make bench-check            # ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8。現状はプレースホルダベンチ）
@@ -115,13 +117,14 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 - `make fio-bench`: 実機前提（fio・GNU coreutils の `timeout`・Linux ホスト）。`TARGET_DIR`・`LABEL` 未指定時は案内を出して終了コード 2 で止まる。詳細は下記「実機前提テスト」節・[docs/design/io-fio-bench.md](docs/design/io-fio-bench.md) を参照
 - `make fio-baseline-ratio-selftest`: 終了コード 0 が成功基準。固定 fixture（`scripts/testdata/fio-baseline/`）で完結し、実 fio・Docker は使わない。CI の `bench-regression` ジョブにも組み込まれている
 - `make fio-baseline-ratio`: `BASELINE`・`CANDIDATE`（いずれも `fio-randwrite-4k.sh` の出力 JSON）未指定時は案内を出して終了コード 2 で止まる。fio・Docker を必要としないため実機前提テストではない
-- CI の `rust-ci`（3 OS matrix）は clippy/test を `--all-features` で実行し（fmt/deny は feature 非依存）、`rust-ci-default-features`（3 OS matrix）が `make lint`/`make test` と同一コマンド（既定 feature）を再現する。両者は別ジョブであり、既定 feature 側の回帰は `rust-ci-default-features` でのみ検出される
+- CI の `rust-ci`（3 OS matrix）は clippy/test を `--all-features` で実行し（fmt/deny は feature 非依存）、`rust-ci-default-features`（3 OS matrix）が `make lint`/`make test`/`make doc` と同一コマンド（既定 feature）を再現する。両者は別ジョブであり、既定 feature 側の回帰は `rust-ci-default-features` でのみ検出される
 - 各コマンドと CI ジョブの対応（TASK-94 の整合確認で参照する）:
 
 | コマンド | 対応する CI ジョブ |
 | ---- | ---- |
 | `fmt-check`・`deny` | `rust-ci` |
 | `lint`・`test`（既定 feature） | `rust-ci-default-features`（`--all-features` 側は `rust-ci`） |
+| `doc`（既定 feature） | `rust-ci-default-features`（3 OS） |
 | `test-integration` | `integration-test` |
 | `poc-venus-jig-check` | `rust-ci-default-features`（3 OS） |
 | `deny-poc-venus-jig`（`deny` からも呼ぶ） | `rust-ci-default-features`（ubuntu のみ。結果が OS に依らない依存監査のため） |

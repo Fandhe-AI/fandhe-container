@@ -61,9 +61,9 @@
 //!
 //! `host_dir` は要求の値をそのまま `SharedDirectoryPath::try_new` に渡して検証する（相対パス・`.`/`..`・
 //! symlink 経由・非実在を拒否。検証の実装は platform-macos に一本化し、本モジュールで事前に解決しない）。
-//! 例外は macOS の既知の祖先 symlink（[`KNOWN_ROOT_ALIASES`]。`/tmp`・`/var`）だけで、先頭がその別名に
+//! 例外は macOS の既知の祖先 symlink（`KNOWN_ROOT_ALIASES`。`/tmp`・`/var`）だけで、先頭がその別名に
 //! 一致する絶対パスに限り、別名が実際に既知の実体を指すことを確かめてから実体パスへ文字列置換する
-//! （[`rewrite_known_alias`]）。それ以外の symlink は辿らない。置換後のパスも `try_new` が全要素を検証する。
+//! （`rewrite_known_alias`）。それ以外の symlink は辿らない。置換後のパスも `try_new` が全要素を検証する。
 //! 共有配下の走査（範囲外 symlink・ハードリンク・マウント境界）は create と start（`Vm::launch` 内の再検査）の
 //! どちらも [`SHARE_SCAN_TIMEOUT`] で打ち切り、超過は `TIMEOUT`（`config.shared_dir_scan_timeout`）で返す（REPAIR-5）。
 //!
@@ -454,7 +454,7 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
     ///
     /// 残り予算が 1 回の停止待ち（[`MacosBackend::stop_timeout`]）に満たなければ以降の VM は試さず
     /// `remaining` に数える（core の終了猶予を超えて plugin が強制終了されるのを避ける。REPAIR-5）。
-    /// 同時に実行できる VM 数は [`Self::max_running`] で予算内に全件停止できる数へ抑えているため、
+    /// 同時に実行できる VM 数は `Self::max_running` で予算内に全件停止できる数へ抑えているため、
     /// 通常は `remaining` が 0 になる。起動に失敗して停止を確認できない VM（`LaunchFailed`）も `remaining` に数える。
     /// 停止できず残った VM は登録簿に残り、呼び出し側（`main.rs`）が
     /// `plugin.cleanup` の `remaining` と終了コードで報告する。以降の回収は `Vm` の drop による停止要求

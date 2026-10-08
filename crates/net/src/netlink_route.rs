@@ -1,7 +1,7 @@
 //! `NETLINK_ROUTE` 側の入口モジュール（TASK-136・NET-11・MS-8）。
 //!
 //! ファミリ非依存の nlmsghdr / rtattr コーデック（`crate::netlink`。TASK-136.1・#298）を再公開し、
-//! Linux では `NETLINK_ROUTE` ソケットの open / bind / send / recv（[`NetlinkRouteSocket`]。
+//! Linux では `NETLINK_ROUTE` ソケットの open / bind / send / recv（`NetlinkRouteSocket`。
 //! TASK-136.2.1・#843）を提供する。各操作の成功 / 失敗と所要時間は `crate::instrument` の
 //! `NetOpRecorder` へ渡す（REPAIR-4）。
 //!
@@ -12,7 +12,7 @@
 //! link 作成・設定の送信ラッパー（`NetlinkRouteSocket::create_link` / `set_link`。`RTM_SETLINK` の
 //! netns 移動・up は [`LinkSet`]。TASK-136.3.2・#846）も提供する。address / route 操作（`addr_route` モジュール。
 //! `AddressSpec`・`RouteSpec`・`add_address`・`add_route`。TASK-136.4・#301）も本層の上に載る。
-//! 自ソケットの `nl_pid` を bind 直後に `getsockname` で取得し（[`NetlinkRouteSocket::local_pid`]）、
+//! 自ソケットの `nl_pid` を bind 直後に `getsockname` で取得し（`NetlinkRouteSocket::local_pid`）、
 //! `request` は応答の `nlmsg_pid` が自ソケットと一致しないメッセージを破棄する（#1313。多層防御）。
 //! 実機前提の結合テスト（`tests/link_netns_privileged.rs`・`tests/netlink_route_addr_route.rs`。
 //! TASK-136.5・#302）と既定集合からの分離方式は `AGENTS.md`「実機前提テスト」節を参照。

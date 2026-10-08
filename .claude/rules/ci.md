@@ -6,6 +6,7 @@
 make fmt-check   # cargo fmt --all --check
 make lint        # cargo clippy --workspace --all-targets -- -D warnings
 make test        # cargo test --workspace
+make doc         # RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 make ci          # 上記 + lint-docs + deny を一括実行
 ```
 
@@ -27,6 +28,8 @@ make ci          # 上記 + lint-docs + deny を一括実行
 `integration-test` ジョブは結合試験に続けて、スクリプトの自己テストを 3 OS（Windows は Git Bash）で実行する: `make plug4-core-invariance-selftest`（PLUG-4 判定スクリプト。TASK-109.4）・`make cli-parity-selftest`（CLI 3 OS 比較。TASK-125.1・CLI-1）・`make vz-virtio-gpu-guest-check-selftest`（virtio-gpu ゲスト側確認スクリプト。合成 fixture のみ。TASK-172.6・GPU-6）。いずれもステップごとに timeout-minutes 5 を付け、新しいジョブ・check-run 名は増やさない。
 
 ルート workspace 外の PoC パッケージ `poc/venus-decoder/jig`（venus 試験治具。`crates/plugin-macos` へ path 依存。TASK-172.4・GPU-6）は `cargo build` / `cargo test --workspace` の対象に入らないため、`rust-ci-default-features` ジョブ（3 OS）の末尾で `make poc-venus-jig-check`（fmt-check・clippy・test。clippy / test は `--locked` で治具の `Cargo.lock` を固定。timeout-minutes 15）を実行し、plugin-macos 側の変更による治具の破損を検出する。実機前提テストは `#[ignore]` で分離済みで CI では走らない。治具の `Cargo.lock` は rust-ci の `cargo deny`（ルート workspace のみ）の対象外のため、同ジョブの ubuntu で `make deny-poc-venus-jig`（ルートの `deny.toml` を共有し 4 種を `--locked` で検査。timeout-minutes 20）を実行する（ステージ 5）。ローカルの `make deny`（`make ci`）も治具の検査を含む。
+
+rustdoc の警告（壊れた intra-doc リンク・private 項目へのリンク等。REPAIR-3）は `rust-ci-default-features` ジョブ（3 OS）の `make doc` ステップ（`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`。既定 feature。timeout-minutes 10）で fail させる（#1300）。新ジョブにせず既存ジョブのステップとしたのは check-run 件数を変えないため。3 OS で実行するのは、`cfg(target_os)` 限定の項目へのリンクが OS ごとに解決結果を変えるため。doc コメントでは他 OS で存在しない項目・private 項目へリンクせず、コード表記（バッククォートのみ）にする。
 
 macOS cold start 上乗せ確認（TASK-113.4・PLUG-6・MAC-2）は `benches/tests/macos_cold_start.rs` の結合試験（`cfg(target_os = "macos")`。他 OS は skip を明示）として 3 OS matrix の macos で実行する。`bench-regression`（ubuntu 単独）のジョブ構成は変えず、基準値比較にも接続しない（模擬制御コアの計測で、実バックエンドは TASK-115）。
 

@@ -5,13 +5,13 @@
 //!   メモリ量を「壊れた値を表現できない」検証済み型にし、[`VmConfigSpec`] にまとめる。不正値は
 //!   panic ではなく [`ConfigError`] で返す。
 //! - macOS 限定層: [`VmConfigSpec`] から Virtualization.framework の設定オブジェクトを組み立てる
-//!   [`build_vz_configuration`]。FFI は `sys` モジュールに閉じ込める。
+//!   `build_vz_configuration`。FFI は `sys` モジュールに閉じ込める。
 //!
 //! 最小デバイス構成（TASK-64.3）として virtio-blk のルートディスクと virtio-console のシリアル
 //! コンソール（ログファイル出力）を [`DeviceConfigSpec`] で表す。
 //!
 //! virtiofs 共有（TASK-65.1）は [`VmConfigSpec::shares`]（`crate::virtiofs`）で表し、
-//! [`build_vz_configuration`] が `VZVirtioFileSystemDeviceConfiguration` として VM 構成へ追加する。
+//! `build_vz_configuration`（macOS のみ）が `VZVirtioFileSystemDeviceConfiguration` として VM 構成へ追加する。
 //!
 //! 呼び出し文脈: TASK-64.4 が構築済み設定から `VZVirtualMachine` を生成して起動し、ゲストの
 //! `console=hvc0` 出力をコンソールログから確認する（TASK-64.6 の vm_boot 結合試験）。[`ConfigError`] は
@@ -1706,7 +1706,7 @@ impl VmConfigSpec {
     ///
     /// コンソールログが既存なら、kernel / initrd / ディスクイメージと同一ファイルでないことを検証する
     /// （initrd への追記は次回起動時の initramfs 注入になり得る。MAC-1）。フィールドは公開のため
-    /// 生成後に差し替えられ得るが、使用時点の照合は [`build_vz_configuration`] の open が必ず行う。
+    /// 生成後に差し替えられ得るが、使用時点の照合は `build_vz_configuration`（macOS のみ）の open が必ず行う。
     pub fn with_devices(mut self, devices: DeviceConfigSpec) -> Result<Self, ConfigError> {
         self.devices = devices;
         if let Some(SerialConsoleSink::LogFile(log)) = self.devices.serial_console() {
@@ -1856,7 +1856,7 @@ impl VmConfigSpec {
 
     /// シリアルコンソールの出力先を上限つきの書き出しとして開く（無ければ `None`）。
     ///
-    /// ログファイルを検証つきで開き（[`Self::open_serial_console_log`]）、ファイル長が
+    /// ログファイルを検証つきで開き（`Self::open_serial_console_log`）、ファイル長が
     /// [`crate::console_log::MAX_CONSOLE_LOG_BYTES`] に達するまでゲスト出力を書き出すスレッドへ渡す
     /// （超過分は区切り文 1 回と stderr の構造化ログを残して捨てる）。戻り値は pipe の書き込み端で、
     /// 生のログファイルは返さない（上限を迂回する経路を公開しない。#1366 の P1-3・MAC-1・TASK-64.3）。

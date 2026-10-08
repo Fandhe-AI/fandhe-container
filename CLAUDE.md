@@ -25,7 +25,7 @@ fandhe-container/
 ├── rust-toolchain.toml            # stable + rustfmt/clippy（単一真実源）
 ├── .editorconfig / .gitattributes # インデント・改行（LF 固定）・文字コード規約
 ├── skills-lock.json               # 導入スキルのロックファイル
-├── Makefile                       # 開発タスク集約（lint-docs・fmt・clippy・test・deny・docker-*。`make help`）
+├── Makefile                       # 開発タスク集約（lint-docs・fmt・clippy・test・doc・deny・docker-*。`make help`）
 ├── lefthook.yml                   # git hooks（整形・秘密情報検査・commit-msg・pre-push）
 ├── commitlint.config.mjs          # commitlint 設定（type を 9 種に限定）
 ├── Dockerfile / compose.yaml      # 開発コンテナ（環境非依存の `make docker-ci`）
@@ -162,7 +162,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 
 ## Conventions
 
-- **ローカル検証**: `make fmt-check`・`make lint`・`make test`（まとめて `make ci`）を通してからコミットする（[ci](.claude/rules/ci.md)）。ビルド・テストは `docs/spec` 抜きで成立させる
+- **ローカル検証**: `make fmt-check`・`make lint`・`make test`・`make doc`（まとめて `make ci`）を通してからコミットする（[ci](.claude/rules/ci.md)）。ビルド・テストは `docs/spec` 抜きで成立させる
 - **日本語**: やりとり・報告・コミット説明文・コード内コメントは日本語（プログラム出力文字列は英語）
 - **Conventional Commits**: `--no-verify` 禁止
 - **セキュリティレビュー**: PR 作成前に OWASP Top 10＋コンテナ分離・plugin 信頼境界を確認

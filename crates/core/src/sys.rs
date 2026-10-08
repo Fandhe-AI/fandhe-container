@@ -3510,7 +3510,10 @@ mod tests {
         // 並列テストの fork が閉じる前の書き込み用 fd を一瞬保持すると ETXTBSY になり得るため、数回再試行する。
         let mut status = None;
         for _ in 0..20 {
-            match std::process::Command::new(&path).status() {
+            match run_with_deadline(
+                std::process::Command::new(&path),
+                std::time::Duration::from_secs(30),
+            ) {
                 Ok(s) => {
                     status = Some(s);
                     break;
@@ -3523,6 +3526,44 @@ mod tests {
         }
         assert_eq!(status.expect("spawned").code(), Some(0));
     }
+
+    /// 子プロセスを起動し、期限付きの `try_wait` で終了を待つ（REPAIR-5）。期限超過時は kill して回収し、
+    /// `ErrorKind::TimedOut` を返す。起動失敗（`ETXTBSY` 等）はそのまま返す。
+    fn run_with_deadline(
+        mut cmd: std::process::Command,
+        deadline: std::time::Duration,
+    ) -> io::Result<std::process::ExitStatus> {
+        let mut child = cmd.spawn()?;
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(s) = child.try_wait()? {
+                return Ok(s);
+            }
+            if start.elapsed() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "child did not exit before the deadline",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// REPAIR-5: 期限内に終了しない子は kill・回収され `TimedOut` の失敗が返る。
+    #[test]
+    fn repair5_run_with_deadline_times_out_and_reaps_child() {
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        let started = std::time::Instant::now();
+        let err = run_with_deadline(cmd, std::time::Duration::from_millis(200))
+            .expect_err("must time out");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(err.to_string(), "child did not exit before the deadline");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
     /// CORE-1（TASK-27.4.1）: fork / exec / wait 系の定数の具体値。syscall 番号・フラグ・シグナル番号は
     /// arch ごとに個別定義する（x86_64 = syscall_64.tbl、aarch64 = asm-generic/unistd.h）。
     #[test]

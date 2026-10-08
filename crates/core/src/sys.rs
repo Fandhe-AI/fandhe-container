@@ -3592,7 +3592,7 @@ mod tests {
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
         child.kill().expect("kill");
-        child.wait().expect("wait");
+        reap_bounded(&mut child, std::time::Duration::from_secs(5)).expect("reap after kill");
     }
 
     /// REPAIR-5: 期限内に終了しない子は kill・回収され `TimedOut` の失敗が返る。

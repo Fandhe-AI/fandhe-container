@@ -362,7 +362,8 @@ endif
 # 判定スクリプトの自己テスト（PLUG-4・TASK-109.4・REPAIR-12）。依存 0 件の最小 workspace を一時 git
 # リポジトリとして作って判定スクリプトを走らせるため、実リポの workspace には依存しない（HAS_CARGO では
 # 判定しない）。cargo・git 未導入時は黙ってスキップせず fail-closed で止める。CI の integration-test
-# ジョブ（ubuntu・macos）が実行し、GNU / BSD 双方のツールで動くことを確かめる。
+# ジョブ（ubuntu・macos・windows の 3 OS。Windows は Git Bash）が実行し、GNU / BSD 双方のツールと
+# Git Bash で動くことを確かめる。
 .PHONY: plug4-core-invariance-selftest
 plug4-core-invariance-selftest: ## PLUG-4 判定スクリプトの自己テスト（TASK-109.4・REPAIR-12。fixture workspace）
 	@for c in cargo git; do \

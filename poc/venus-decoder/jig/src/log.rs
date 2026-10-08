@@ -116,12 +116,21 @@ fn classify(line: &str) -> Option<Class> {
         return None;
     }
     let (mut event, mut cmd, mut id, mut result) = (None, None, None, None);
+    let (mut version, mut max_size) = (None, None);
+    let mut seen: Vec<&str> = Vec::new();
     for t in tokens {
         let (k, v) = t.split_once('=')?;
+        // 重複キーは矛盾行（例: result=invalid_parameter result=ok）を成功扱いしないため壊れた行として拒否する。
+        if seen.contains(&k) {
+            return None;
+        }
+        seen.push(k);
         match k {
             "event" => event = Some(v),
             "cmd" => cmd = Some(v),
             "capset_id" => id = Some(v),
+            "version" => version = Some(v),
+            "max_size" => max_size = Some(v),
             "result" => result = Some(v),
             _ => {}
         }
@@ -130,9 +139,29 @@ fn classify(line: &str) -> Option<Class> {
         return Some(Class::Other);
     }
     let ok = result? == "ok";
+    // 成功行の出力契約: max_size は正の u32、GET_CAPSET の version は対応版の 0。
+    let size_ok = max_size
+        .and_then(|v| v.parse::<u32>().ok())
+        .is_some_and(|n| n > 0);
     match cmd? {
-        "GET_CAPSET" if ok && id == Some("4") => Some(Class::VenusGetCapsetOk),
-        "GET_CAPSET_INFO" if ok => Some(Class::InfoOk),
+        "GET_CAPSET" if ok => {
+            if size_ok && version == Some("0") && id.is_some_and(|v| v.parse::<u32>().is_ok()) {
+                if id == Some("4") {
+                    Some(Class::VenusGetCapsetOk)
+                } else {
+                    Some(Class::Other)
+                }
+            } else {
+                None
+            }
+        }
+        "GET_CAPSET_INFO" if ok => {
+            if size_ok {
+                Some(Class::InfoOk)
+            } else {
+                None
+            }
+        }
         "GET_CAPSET" | "GET_CAPSET_INFO" => Some(Class::Other),
         _ => None,
     }

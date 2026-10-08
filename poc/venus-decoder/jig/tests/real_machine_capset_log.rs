@@ -6,6 +6,7 @@
 //! 現時点ではトランスポート（後続 F1）が未実装のため、実行しても成功するログは得られない。
 
 use std::fs;
+use std::io::Read;
 
 use fandhe_container_poc_venus_jig::log::{MAX_LOG_BYTES, find_capset_queries};
 
@@ -14,13 +15,20 @@ use fandhe_container_poc_venus_jig::log::{MAX_LOG_BYTES, find_capset_queries};
 fn task172_4_gpu6_guest_capset_query_reached_decoder() {
     let path = std::env::var("FANDHE_VENUS_JIG_LOG")
         .expect("FANDHE_VENUS_JIG_LOG must point to the jig VMM log file");
-    let meta = fs::symlink_metadata(&path).expect("log file must exist");
+    // 開いたファイル自体の metadata を検証し、読み取りも上限 + 1 バイトで打ち切る（検査後の増大による メモリ枯渇を防ぐ）。
+    let file = fs::File::open(&path).expect("log file must exist");
+    let meta = file.metadata().expect("log metadata must be readable");
     assert!(meta.file_type().is_file(), "log must be a regular file");
     assert!(
         meta.len() <= MAX_LOG_BYTES as u64,
         "log exceeds the size limit"
     );
-    let log = fs::read_to_string(&path).expect("log must be valid UTF-8");
+    let mut bytes = Vec::new();
+    file.take(MAX_LOG_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .expect("log must be readable");
+    assert!(bytes.len() <= MAX_LOG_BYTES, "log exceeds the size limit");
+    let log = String::from_utf8(bytes).expect("log must be valid UTF-8");
     let report = find_capset_queries(&log).expect("log within limits");
     assert!(
         report.venus_get_capset_ok >= 1,

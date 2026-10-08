@@ -129,6 +129,20 @@ garbage line
 }
 
 #[test]
+fn task172_4_gpu6_checker_rejects_duplicate_and_bad_success_fields() {
+    let log = "\
+venus_jig event=capset_query cmd=GET_CAPSET capset_id=4 version=0 result=invalid_parameter result=ok max_size=160
+venus_jig event=capset_query cmd=GET_CAPSET capset_id=4 version=9 result=ok max_size=160
+venus_jig event=capset_query cmd=GET_CAPSET capset_id=4 version=0 result=ok max_size=0
+venus_jig event=capset_query cmd=GET_CAPSET_INFO capset_index=0 result=ok max_size=abc
+";
+    let r = find_capset_queries(log).unwrap();
+    assert_eq!(r.venus_get_capset_ok, 0);
+    assert_eq!(r.info_ok, 0);
+    assert_eq!(r.malformed_lines, 4);
+}
+
+#[test]
 fn task172_4_gpu6_checker_limits() {
     let long = format!("venus_jig {}", "a".repeat(600));
     assert_eq!(find_capset_queries(&long).unwrap().malformed_lines, 1);

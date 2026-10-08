@@ -806,9 +806,12 @@ jobs:
   # 未検査の範囲（REPAIR-3）: cfg(not(feature = "exec-test-support")) 分岐
   # （supervisor/tests/exec_setns_join.rs・core/tests/exec_child_setup.rs・
   # core/src/exec/reapply.rs の cfg_attr）と、plugin を無効にした構成
-  # （--no-default-features）は aarch64 では型検査されない。x86_64 では
-  # rust-ci-default-features が検査している。aarch64 での既定 feature 検査の追加は
-  # ジョブ構成の変更になるため別 Issue で扱う。
+  # （--no-default-features）は aarch64 では型検査されない。x86_64 でも、lib 側の
+  # cfg_attr（core/src/exec/reapply.rs）は cargo build --workspace が、plugin 無効構成は
+  # make test-core-no-plugin が検査するのみで、テスト側の cfg(not(feature)) 分岐は
+  # 自己参照 dev-dependency による feature 統一で常に有効になるため、どの CI ジョブでも
+  # 型検査されない。aarch64 での既定 feature 検査の追加はジョブ構成の変更になるため
+  # 別 Issue で扱う。
   aarch64-linux-check:
     runs-on: ubuntu-latest
     # ハングに対する多層防御（rust-ci-default-features と同じ値）

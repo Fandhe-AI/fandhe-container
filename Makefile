@@ -364,6 +364,27 @@ plug4-core-invariance-selftest: ## PLUG-4 判定スクリプトの自己テス�
 	done
 	bash scripts/check-plug4-core-invariance-selftest.sh
 
+# CLI 基本 6 コマンドの 3 OS 同一構文・挙動の比較（TASK-125.1・CLI-1・MS-6）。
+# 自己テストはスタブ CLI のみを使い、製品バイナリ・root は使わない（REPAIR-12）。CI の integration-test
+# ジョブ（ubuntu・macos・windows の 3 OS）が同じコマンドを直接実行する。make ci には含めない。
+.PHONY: cli-parity-selftest
+cli-parity-selftest: ## CLI 3 OS 比較スクリプトの自己テスト（TASK-125.1・REPAIR-12。スタブ CLI のみ）
+	bash scripts/cli-parity-check-selftest.sh
+
+# 実機での記録・突き合わせ（実機前提・make ci 対象外。判定は #661〔TASK-125.h1〕で人間が行う）。
+# CLI/OUTPUT を指定すると capture、BASELINE/CANDIDATE を指定すると compare を実行する。
+# 変数は単一引用符で囲んでシェルへ渡す（fio_bench_sq。値の検証はスクリプト側が担う）。
+.PHONY: cli-parity
+cli-parity: ## CLI 3 OS 比較の capture（CLI/OUTPUT）または compare（BASELINE/CANDIDATE）を実行する
+	@if [ -n $(call fio_bench_sq,$(CLI)) ] && [ -n $(call fio_bench_sq,$(OUTPUT)) ]; then \
+		bash scripts/cli-parity-check.sh capture --cli $(call fio_bench_sq,$(CLI)) --output $(call fio_bench_sq,$(OUTPUT)); \
+	elif [ -n $(call fio_bench_sq,$(BASELINE)) ] && [ -n $(call fio_bench_sq,$(CANDIDATE)) ]; then \
+		bash scripts/cli-parity-check.sh compare --baseline $(call fio_bench_sq,$(BASELINE)) --candidate $(call fio_bench_sq,$(CANDIDATE)); \
+	else \
+		echo "usage: make cli-parity CLI=<abs-path> OUTPUT=<new-file>  |  make cli-parity BASELINE=<capture> CANDIDATE=<capture>" >&2; \
+		exit 2; \
+	fi
+
 # REPAIR-7 ステージ 3（タイムアウト保護された結合試験。TASK-86.2・#36）。
 # CI（ci.yml の integration-test ジョブ）と同じ判定を行う: integration test
 # target（`tests/*.rs`。cargo metadata 上で kind が "test" のもの）が 0 件の

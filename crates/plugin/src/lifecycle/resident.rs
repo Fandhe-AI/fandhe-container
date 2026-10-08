@@ -499,6 +499,11 @@ impl ResidentPlugin {
                 self.state = ResidentState::Killed;
                 original
             }
+            // 他所で回収された（ECHILD 等。#1513）。終了状態が失われたため終了コード不明の終了として扱う。
+            Reap::Lost => {
+                self.state = ResidentState::Exited { code: None };
+                exited_error(None)
+            }
             Reap::Unreaped => {
                 self.state = ResidentState::Unreaped;
                 unreaped_error(&mut self.guard, "a failed call")

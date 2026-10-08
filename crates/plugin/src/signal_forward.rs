@@ -32,6 +32,11 @@
 //! - 親が SIGKILL された場合・`panic = abort` で異常終了した場合は転送されない。Linux は
 //!   `PR_SET_PDEATHSIG` で補う予定（#1514）。macOS では plugin が残留し得る。Windows は対象外。
 //! - spawn から登録（`activate`）までの間は転送対象外。
+//! - 他所での回収（継承した `SIGCHLD` の `SIG_IGN`・`SA_NOCLDWAIT`・利用側の `waitpid(-1)` 等）は契約外。
+//!   その場合カーネルや利用側が子を回収しても、登録は `ChildGuard::try_wait` が `ECHILD` を受けるまで
+//!   残り、その間に pid が再利用されると転送が無関係なプロセス（グループ）へ届き得る。`ECHILD`（および
+//!   他の `waitpid` の失敗）を受けた時点で終端として登録を外し、以後 kill もしない（`Reap::Lost`）。
+//!   窓を閉じるのは利用側の責務で、`SIGCHLD` を `SIG_DFL` に保ち、plugin の子を `waitpid(-1)` で回収しないこと。
 //! - plugin を独立したプロセスグループで起動する変更（#1311・PR #1397）の前は、端末の Ctrl-C が
 //!   カーネルのグループ配送と本転送の双方で plugin に届き得る（無害）。変更後は転送のみになり、
 //!   `kill(-pid)` が孫まで届く経路になる。

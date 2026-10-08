@@ -1,11 +1,11 @@
 # Venus デコーダ最小サブセット PoC（設計ドラフト）
 
-macOS の virtio-gpu Venus 自前実装（ヘッドレス Vulkan compute のみ）で、最小 venus デコーダが扱う Vulkan コマンドの候補を記録する（GPU-6）。TASK-172 全体の PoC 文書で、本版は候補抽出（TASK-172.1）の章だけを埋める。
+macOS の virtio-gpu Venus 自前実装（ヘッドレス Vulkan compute のみ）で、最小 venus デコーダが扱う Vulkan コマンドの候補を記録する（GPU-6）。TASK-172 全体の PoC 文書で、本版は候補抽出（TASK-172.1）と wire パース骨格（TASK-172.2）の章を埋める。
 
 > **位置づけ**: 本書はドラフトであり、候補を列挙するだけで対象サブセットを確定しない。最終確定は #726（TASK-172.h2。人間担当）で行う。優先度（必須・推奨・保留）は抽出時点の見立てで、確定扱いにしない。
 
 - 対象ビヘイビア: GPU-6（関連: MAC-5・MVM-4）
-- タスク: TASK-172（MS-13・G-別枠）。本版は TASK-172.1（#722。親 #721）。前提 TASK-7（#25。完了済み）
+- タスク: TASK-172（MS-13・G-別枠）。本版は TASK-172.1（#722。親 #721）と TASK-172.2（#723）。前提 TASK-7（#25。完了済み）
 - 後続・関連: #723（wire パース骨格）・#724（capset 応答）・#889（コマンドストリーム記録）・#725（1〜3 段目の結果）・#726（確定）・#776 / #777（対象範囲判断・工数再確定）・#781（サブセットのフィルタ機構）。ディスパッチ・ハンドラ群は TASK-177.x（#765・#769・#771・#773・#774）
 - 出典（spec）: GPU-6・TASK-172・D-15・PoC-14（submodule リビジョン `984f8a2`）。作業環境で `docs/spec` を取得できなかったため、spec 本文は参照せず ID のみで辿れるようにしている
 - 出典（外部。確認日 2026-10-08）:
@@ -152,11 +152,20 @@ GPU-6 の決定（ヘッドレス compute のみ・2D スキャンアウト非�
 - MoltenVK のコマンド単位の対応状況（未確認）。特に compute シェーダが使う機能・拡張の可否
 - 画像（image / image view / 画像転送）を compute の範囲に含めるか
 
-## 6. 以降の章（未着手）
+## 6. wire パース骨格（TASK-172.2・#723）
+
+実装は `crates/plugin-macos/src/gpu/venus/`（`fandhe_container_plugin_macos::gpu::venus`）。
+
+- 確認した wire 規則（venus-protocol `v1.1.3`・コミット `ca19b6358d7c` の `docs/VK_EXT_command_serialization.txt`）: リトルエンディアン。コマンドは DW0 = `VkCommandTypeEXT`、DW1 = `VkCommandFlagsEXT`、DW2.. = 引数。長さは種別から暗黙に決まり、未知の種別は読み飛ばせない。ポインタ・配列は 64bit 件数＋値列で、末尾を 32bit にパディングする。ハンドルは 64bit。enum は `int32_t`。フラグで定義済みのビットは `VK_COMMAND_GENERATE_REPLY_BIT_EXT`（bit 0）のみ
+- ID の出典: 同タグの `xmls/VK_EXT_command_serialization.xml`（SHA-256 `2451e5dcc5306f604c52da48a8cc883a24de708dd86f38bbb035d29a753a0474`）。`xmls/VK_MESA_venus_protocol.xml`（SHA-256 は前掲）の記載と一致することを確認した。3 章の候補 116 件（必須 62・推奨 22・保留 32）すべてについてコマンド名から ID を機械抽出し、欠落 0 件、ID 重複なしを確認した。同じ対応表をテスト（`task172_2_gpu6_candidate_table_matches_command_type`）で照合している
+- パース済み: 境界検査つきカーソル（`WireReader`）、候補コマンド種別（`CommandType`）、フラグ（`CommandFlags`。定義外ビットは拒否）、ヘッダ（`parse_command_header`）、構造化エラー（`VenusWireError`。`venus_wire.*`）
+- fail-closed: 候補外・未知の種別は `unsupported_command` でストリームを拒否する。配列件数は `MAX_ARRAY_LEN` で確保前に検証する
+- 先送り: コマンドごとの引数パース・ディスパッチ（TASK-177.x: #765・#769・#771・#773・#774）、reply の符号化、ring、frame_loop／adapter への配線。優先度は確定扱いにしない
+
+## 7. 以降の章（未着手）
 
 | 章 | 内容 | 担当 issue |
 | -- | ---- | ---------- |
-| wire パース骨格 | コマンド ID・ヘッダ・ペイロードの解釈 | #723（TASK-172.2） |
 | capset 応答 | venus capset の応答仕様 | #724 |
 | コマンドストリーム記録・再生 | 実ストリームの採取と差分検証 | #889 |
 | 1〜3 段目の結果 | 段階的な再検証の結果 | #725 |

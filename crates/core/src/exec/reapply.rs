@@ -165,8 +165,8 @@ use super::landlock::{LandlockAccessProbe, run_probe};
 use super::rlimits::{apply_rlimits, parse_proc_limits};
 use super::setns::{NsIdentity, cgroup_path_matches, read_bounded_from};
 use super::{
-    ExecError, IsolationStage, Pid1Target, StageKind, SupplementaryGroups, ThreadCountSource,
-    ViolationReason, no_new_privs,
+    ExecError, ExecWorkerProof, IsolationStage, Pid1Target, StageKind, SupplementaryGroups,
+    ThreadCountSource, ViolationReason, no_new_privs,
 };
 use crate::landlock::LandlockRuleset;
 use crate::oci_runtime::{OciConfig, RootfsDir};
@@ -467,11 +467,26 @@ pub(super) struct ExecReadyParts {
 /// ABI 検出・ルール生成の失敗（Landlock 未対応カーネルを含む）は `stage = Landlock` で拒否する
 /// （fail-closed。CORE-5）。`rootfs` が呼び出しプロセス自身の `/` と同じディレクトリなら、参加後の照合が
 /// 意味を持たないため違反記録 `rootfs_is_host_root` つきで拒否する（SEC-1）。
+///
+/// `worker` は [`spawn_exec_worker`](super::spawn_exec_worker) の worker の中でしか得られない証跡で、補助グループの
+/// 不可逆な消去を常駐プロセスで起こさないために要求する（#1532）。`reapply_restrictions` の capability 削減の中の
+/// 消去も、[`ExecRestrictions`] がこの関数からしか作れないため同じ証跡で間接的に守られる。
+///
+/// ```compile_fail,E0061
+/// use fandhe_container_core::exec::{Pid1Target, prepare_exec_restrictions};
+/// use fandhe_container_core::oci_runtime::{OciConfig, RootfsDir};
+/// fn without_proof(t: &Pid1Target, c: &OciConfig, r: &RootfsDir) {
+///     let _ = prepare_exec_restrictions(t, c, r);
+/// }
+/// ```
 pub fn prepare_exec_restrictions(
+    worker: &ExecWorkerProof,
     target: &Pid1Target,
     config: &OciConfig,
     rootfs: &RootfsDir,
 ) -> Result<ExecRestrictions, ExecError> {
+    // 証跡は型で呼び出し元を絞るためだけに要求する（値は使わない）。
+    let _ = worker;
     let rootfs = rootfs.as_fd().try_clone_to_owned().map_err(|e| {
         ExecError::from_io(&e, IsolationStage::Validate, "duplicate the rootfs handle")
     })?;

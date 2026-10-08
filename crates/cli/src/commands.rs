@@ -6,13 +6,15 @@
 //! `stop` / `delete` は core の `oci_runtime::kill`（SIGTERM）/ `delete` を直接呼ぶ（TASK-79.2.2・#867。`stop_delete` module）。
 //! 本番の `ProcessSignaler`・cgroup remover が未提供のため、pid ありの対象への `stop` や cgroup 配置つきの `delete` は
 //! `UNIMPLEMENTED`（8）で失敗する（REPAIR-3）。
-//! 他のコマンドは未実装で、`UNIMPLEMENTED` を返して非ゼロ終了する（実装済みを装わない）。
+//! `list` は core の状態ストアを読んで stdout へタブ区切りで一覧を出し、`logs` は引数・ID・存在確認までを行う
+//! （TASK-79.3・#640。`list_logs` module）。ログ内容の読み出しは未実装で、対象が存在しても `UNIMPLEMENTED`（8）で
+//! 失敗する（REPAIR-3）。
 //! 終了コードは core の ERR-2 表（`OCI_EXIT_*`）に揃える。
 //!
 //! 将来仕様（本実装の範囲外）:
 //! - start の実プロセス起動: supervisor 経由の launcher（TASK-157・TASK-37〜39）。
 //! - stop の猶予 → SIGKILL・本番 signaler / cgroup remover の結線: supervisor 経由（TASK-157）。
-//! - list / logs: TASK-79.3（#640）。
+//! - logs の内容読み出し・list の JSON 出力: ログ契約と crate 境界の決定後（`list_logs` module の doc 参照。TASK-95・TASK-98）。
 //! - macOS / Windows は plugin 発見機構経由で呼び、platform-* へは直接依存しない: TASK-79.4（#641・PLUG-4）。
 //! - エラー形式（`code` / `message`）の確定: TASK-95（ERR 系）。ここの [`CliExit`] は最小の先取り。
 
@@ -20,14 +22,18 @@ use std::ffi::OsString;
 use std::io::Write;
 
 use fandhe_container_core::oci_runtime::{
-    OCI_EXIT_INVALID_ARGUMENT, OCI_EXIT_UNIMPLEMENTED, OciRuntimeError,
+    OCI_EXIT_INVALID_ARGUMENT, OCI_EXIT_UNIMPLEMENTED, OciRuntimeError, exit_code_for,
 };
+use fandhe_container_core::traits::ErrorCode;
 
 mod args;
 mod create_start;
+mod list_logs;
 mod stop_delete;
 
-use args::{parse_create, parse_delete, parse_global, parse_start, parse_stop};
+use args::{
+    parse_create, parse_delete, parse_global, parse_list, parse_logs, parse_start, parse_stop,
+};
 
 /// 基本コマンド（CLI-1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,7 +87,7 @@ pub const EXIT_UNIMPLEMENTED: u8 = OCI_EXIT_UNIMPLEMENTED.get();
 /// core 由来の失敗は `OciRuntimeError::write_json_line`（serde_json）で出力する（JSON を手組みしない。REPAIR-2）。
 #[derive(Debug)]
 pub enum CliExit {
-    /// 成功（終了コード 0・出力なし。OCI の create / start は成功時に何も出さない）。
+    /// 成功（終了コード 0。OCI の create / start / stop / delete は成功時に何も出さない。`list` のみ stdout へ一覧を出す）。
     Success,
     /// 使い方エラー（終了コード 2・`INVALID_ARGUMENT`）。
     Usage,
@@ -89,6 +95,11 @@ pub enum CliExit {
     Unimplemented,
     /// core のライフサイクル操作の失敗（ERR-2。終了コードは `OciRuntimeError::exit_code`）。
     Runtime(OciRuntimeError),
+    /// core の状態ストア操作の失敗（`list` / `logs`。ライフサイクル操作ではないため `op` を持たない）。
+    ///
+    /// 終了コードは core の `exit_code_for`、`message` は本 module の固定文言表（[`failure_message`]）で、
+    /// core の `TraitError::message` は出力へ流さない（エスケープ不要の定数のみ）。
+    Failed(ErrorCode),
 }
 
 impl CliExit {
@@ -99,6 +110,7 @@ impl CliExit {
             CliExit::Usage => EXIT_USAGE,
             CliExit::Unimplemented => EXIT_UNIMPLEMENTED,
             CliExit::Runtime(e) => e.exit_code().get(),
+            CliExit::Failed(c) => exit_code_for(*c).get(),
         }
     }
 
@@ -109,6 +121,7 @@ impl CliExit {
             CliExit::Usage => Some("INVALID_ARGUMENT"),
             CliExit::Unimplemented => Some("UNIMPLEMENTED"),
             CliExit::Runtime(e) => Some(e.code().as_str()),
+            CliExit::Failed(c) => Some(c.as_str()),
         }
     }
 
@@ -128,6 +141,7 @@ impl CliExit {
                 out.write_all(fixed("UNIMPLEMENTED", UNIMPLEMENTED_MESSAGE).as_bytes())
             }
             CliExit::Runtime(e) => e.write_json_line(out),
+            CliExit::Failed(c) => out.write_all(fixed(c.as_str(), failure_message(*c)).as_bytes()),
         }
     }
 }
@@ -135,19 +149,36 @@ impl CliExit {
 const USAGE_MESSAGE: &str = "usage: fandhe-container <create|start|stop|delete|list|logs>";
 const UNIMPLEMENTED_MESSAGE: &str = "command is not implemented yet";
 
+/// [`CliExit::Failed`] の固定文言表。引用符・バックスラッシュ・制御文字を含まない定数のみ（テストで固定）。
+/// `ErrorCode` は `#[non_exhaustive]` のため、未知のコードは汎用文言に落とす。
+fn failure_message(code: ErrorCode) -> &'static str {
+    match code {
+        ErrorCode::InvalidArgument => "invalid argument",
+        ErrorCode::NotFound => "container not found",
+        ErrorCode::AlreadyExists => "already exists",
+        ErrorCode::FailedPrecondition => "failed precondition",
+        ErrorCode::Unimplemented => "not implemented on this platform",
+        ErrorCode::PermissionDenied => "permission denied",
+        ErrorCode::Timeout => "operation timed out",
+        ErrorCode::Unavailable => "unavailable",
+        _ => "operation failed",
+    }
+}
+
 fn usage() -> CliExit {
     CliExit::Usage
 }
 
-fn unimplemented_command() -> CliExit {
-    CliExit::Unimplemented
-}
-
 /// argv（プログラム名を除く）を解釈して実行する。
 ///
-/// `create` / `start` / `stop` / `delete` は core を呼ぶ（TASK-79.2.1・TASK-79.2.2）。他のコマンドは未実装として失敗を返す。
-/// 引数値は出力へ埋め込まない（インジェクション回避）。
+/// `create` / `start` / `stop` / `delete` / `list` / `logs` は core を呼ぶ（TASK-79.2.1・TASK-79.2.2・TASK-79.3）。
+/// `list` の一覧は process の stdout へ出す。引数値は出力へ埋め込まない（インジェクション回避）。
 pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> CliExit {
+    run_to(args, &mut std::io::stdout())
+}
+
+/// [`run`] と同じだが、`list` の出力先を `stdout` で指定する（テストと将来の出力先切替の入口）。
+pub fn run_to<I: IntoIterator<Item = OsString>>(args: I, stdout: &mut dyn Write) -> CliExit {
     let Ok((global, rest)) = parse_global(args.into_iter().collect()) else {
         return usage();
     };
@@ -176,7 +207,14 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> CliExit {
             Ok(a) => stop_delete::run_delete(&global, &a),
             Err(_) => usage(),
         },
-        Command::List | Command::Logs => unimplemented_command(),
+        Command::List => match parse_list(tail) {
+            Ok(a) => list_logs::run_list(&global, &a, stdout),
+            Err(_) => usage(),
+        },
+        Command::Logs => match parse_logs(tail) {
+            Ok(a) => list_logs::run_logs(&global, &a),
+            Err(_) => usage(),
+        },
     }
 }
 
@@ -234,6 +272,11 @@ mod tests {
             args(&["delete"]),
             args(&["stop", "a", "b"]),
             args(&["delete", "--x", "a"]),
+            args(&["logs"]),
+            args(&["logs", "a", "b"]),
+            args(&["logs", "--x", "a"]),
+            args(&["list", "x"]),
+            args(&["list", "--all"]),
         ] {
             let r = run(a);
             assert_eq!(r.exit_code(), 2);
@@ -241,13 +284,39 @@ mod tests {
         }
     }
 
-    /// CLI-1: list / logs は未実装として終了コード 8。
+    /// ERR-2: logs の不正 ID は状態ルートを開く前に INVALID_ARGUMENT（2）で拒否される。
     #[test]
-    fn cli1_run_other_commands_are_unimplemented() {
-        for c in [Command::List, Command::Logs] {
-            let r = run(args(&[c.as_str()]));
-            assert_eq!(r.exit_code(), 8);
-            assert_eq!(r.code(), Some("UNIMPLEMENTED"));
+    fn err2_logs_rejects_invalid_id() {
+        for id in ["a/b", "..", "a b"] {
+            let r = run(args(&["logs", id]));
+            assert_eq!(r.exit_code(), 2);
+            assert_eq!(r.code(), Some("INVALID_ARGUMENT"));
+        }
+    }
+
+    /// ERR-1・ERR-2: 固定文言表の全コードで、文言は JSON 安全で終了コードが core の表と一致する。
+    #[test]
+    fn err2_failed_messages_are_json_safe_and_exit_codes_match() {
+        let codes = [
+            (ErrorCode::InvalidArgument, 2),
+            (ErrorCode::NotFound, 3),
+            (ErrorCode::AlreadyExists, 4),
+            (ErrorCode::FailedPrecondition, 5),
+            (ErrorCode::Unimplemented, 8),
+            (ErrorCode::Internal, 1),
+            (ErrorCode::PermissionDenied, 6),
+            (ErrorCode::Timeout, 7),
+            (ErrorCode::Unavailable, 9),
+        ];
+        for (code, exit) in codes {
+            let m = failure_message(code);
+            assert!(!m.is_empty());
+            assert!(
+                m.chars().all(|c| !c.is_control() && c != '"' && c != '\\'),
+                "{m:?}"
+            );
+            assert_eq!(CliExit::Failed(code).exit_code(), exit);
+            assert_eq!(CliExit::Failed(code).code(), Some(code.as_str()));
         }
     }
 
@@ -273,6 +342,10 @@ mod tests {
                 CliExit::Unimplemented,
                 "{\"code\":\"UNIMPLEMENTED\",\"message\":\"command is not implemented yet\"}\n",
             ),
+            (
+                CliExit::Failed(ErrorCode::NotFound),
+                "{\"code\":\"NOT_FOUND\",\"message\":\"container not found\"}\n",
+            ),
         ] {
             let mut out = Counting(Vec::new());
             exit.write_stderr(&mut out).expect("write");
@@ -286,7 +359,7 @@ mod tests {
         assert_eq!(stderr_of(&CliExit::Success), "");
         assert_eq!(CliExit::Success.exit_code(), 0);
         assert_eq!(
-            stderr_of(&run(args(&["list"]))),
+            stderr_of(&CliExit::Unimplemented),
             "{\"code\":\"UNIMPLEMENTED\",\"message\":\"command is not implemented yet\"}\n"
         );
         let e = OciRuntimeError::new(

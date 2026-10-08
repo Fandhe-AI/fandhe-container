@@ -13,7 +13,7 @@
 //! 終了コードは core の ERR-2 表（`OCI_EXIT_*`）に揃える。
 //!
 //! OS 固有設定の分離規則（CLI-2・TASK-80.2）:
-//! - `crate::setup` を参照してよいのは [`run_setup`] のみ。`commands/` 配下の module は setup の型・関数を import しない。
+//! - `crate::setup` を参照してよいのは `run_setup` のみ。`commands/` 配下の module は setup の型・関数を import しない。
 //! - 日常操作側の `cfg(target_os)`（`create_start::open_store`・`plugin_backend`）は CLI-1・PLUG-4 のバックエンド振り分けで、
 //!   OS 固有設定ではないため CLI-2 の対象外。非 Linux の失敗文言は plugin 前提の不成立であり、OS 設定や setup 実行を要求しない。
 //! - 分離の単体テストは `setup::tests::cli2_daily_commands_do_not_request_os_setup`（TASK-80.3）。

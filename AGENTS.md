@@ -35,8 +35,9 @@
 | `make fmt-check` | `cargo fmt --all --check` | 終了コード 0。整形差分（`Diff in ...`）を出力しない。差分がある場合は `make fmt` で整形してから再実行する |
 | `make lint` | `cargo clippy --workspace --all-targets -- -D warnings`（既定 feature） | 終了コード 0 かつ clippy 警告 0 件（`-D warnings` により警告はエラー扱いになる）。理由なしの `#[allow]` での抑止は上記のとおり P1・外部入力系 lint の抑止は P0 |
 | `make test` | `cargo test --workspace`（既定 feature） | 終了コード 0。すべての `test result:` 行が `0 failed`。`ignored` の増加で通していないこと（skip/ignore は P0） |
+| `make doc` | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`（既定 feature） | 終了コード 0 かつ rustdoc 警告 0 件（壊れた intra-doc リンク・private 項目へのリンク等はエラー扱い）。`cfg(target_os)` 限定の項目へは他 OS で解決できないためリンクせずコード表記にする（CI は 3 OS で実行。#1300） |
 | `make deny` | `cargo deny --locked check advisories bans licenses sources`（続けて `make deny-poc-venus-jig` で venus 試験治具の `Cargo.lock` も同じ 4 種で検査する） | 終了コード 0 かつ advisories・bans・licenses・sources の 4 チェックすべて ok（`--locked` により `Cargo.lock` の更新が必要な状態も失敗として検出する） |
-| `make ci` | `lint-docs` → `check-workspace-manifest` → `fmt-check` → `lint` → `test` → `deny` の順に実行 | 6 サブターゲットすべてが終了コード 0（make は最初の失敗で停止する）。`lint-docs` は markdownlint・yamllint・editorconfig-checker・commitlint（`origin/main` からの分岐点以降のコミット）を含む |
+| `make ci` | `lint-docs` → `check-workspace-manifest` → `fmt-check` → `lint` → `test` → `doc` → `deny` の順に実行 | 7 サブターゲットすべてが終了コード 0（make は最初の失敗で停止する）。`lint-docs` は markdownlint・yamllint・editorconfig-checker・commitlint（`origin/main` からの分岐点以降のコミット）を含む |
 
 **`make ci` の合格はローカルゲート（[ci](.claude/rules/ci.md)）であり、PR のマージゲートである CI 全体と同一ではない。** `make ci` は `--all-features` での検証・`test-integration`・`bench-check`・3 OS matrix を含まない。PR のマージゲートは `ci.yml` の集約ジョブ `ci-complete` が `lint-docs`・`rust-ci`・`rust-ci-default-features`・`integration-test`・`bench-regression`・`aarch64-linux-check` の全ジョブの成功を fail-closed で検証した上で成功することである。
 
@@ -46,9 +47,10 @@
 make fmt-check              # cargo fmt --all --check
 make lint                   # cargo clippy --workspace --all-targets -- -D warnings（既定 feature）
 make test                   # cargo test --workspace（既定 feature）
+make doc                    # RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps（既定 feature。rustdoc 警告のゲート）
 make test-integration       # cargo test --workspace --test '*' --features fandhe-container-io/crash-test-server ＋ --bins（結合試験。integration test target が 0 件なら notice を出して成功終了する）
 make deny                   # cargo deny --locked check advisories bans licenses sources
-make ci                     # lint-docs + check-workspace-manifest + fmt-check + lint + test + deny を一括実行
+make ci                     # lint-docs + check-workspace-manifest + fmt-check + lint + test + doc + deny を一括実行
 make bench-check-selftest   # ベンチ回帰比較スクリプトの自己テスト（REPAIR-8）
 make plugin-feature-size    # core の既定 / plugin 除外 release ビルドの rlib サイズ記録（PLUG-3・TASK-111.2。最終バイナリ未実装のため rlib 計測）
 make bench-check            # ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8。現状はプレースホルダベンチ）
@@ -115,13 +117,14 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 - `make fio-bench`: 実機前提（fio・GNU coreutils の `timeout`・Linux ホスト）。`TARGET_DIR`・`LABEL` 未指定時は案内を出して終了コード 2 で止まる。詳細は下記「実機前提テスト」節・[docs/design/io-fio-bench.md](docs/design/io-fio-bench.md) を参照
 - `make fio-baseline-ratio-selftest`: 終了コード 0 が成功基準。固定 fixture（`scripts/testdata/fio-baseline/`）で完結し、実 fio・Docker は使わない。CI の `bench-regression` ジョブにも組み込まれている
 - `make fio-baseline-ratio`: `BASELINE`・`CANDIDATE`（いずれも `fio-randwrite-4k.sh` の出力 JSON）未指定時は案内を出して終了コード 2 で止まる。fio・Docker を必要としないため実機前提テストではない
-- CI の `rust-ci`（3 OS matrix）は clippy/test を `--all-features` で実行し（fmt/deny は feature 非依存）、`rust-ci-default-features`（3 OS matrix）が `make lint`/`make test` と同一コマンド（既定 feature）を再現する。両者は別ジョブであり、既定 feature 側の回帰は `rust-ci-default-features` でのみ検出される
+- CI の `rust-ci`（3 OS matrix）は clippy/test を `--all-features` で実行し（fmt/deny は feature 非依存）、`rust-ci-default-features`（3 OS matrix）が `make lint`/`make test`/`make doc` と同一コマンド（既定 feature）を再現する。両者は別ジョブであり、既定 feature 側の回帰は `rust-ci-default-features` でのみ検出される
 - 各コマンドと CI ジョブの対応（TASK-94 の整合確認で参照する）:
 
 | コマンド | 対応する CI ジョブ |
 | ---- | ---- |
 | `fmt-check`・`deny` | `rust-ci` |
 | `lint`・`test`（既定 feature） | `rust-ci-default-features`（`--all-features` 側は `rust-ci`） |
+| `doc`（既定 feature） | `rust-ci-default-features`（3 OS） |
 | `test-integration` | `integration-test` |
 | `poc-venus-jig-check` | `rust-ci-default-features`（3 OS） |
 | `deny-poc-venus-jig`（`deny` からも呼ぶ） | `rust-ci-default-features`（ubuntu のみ。結果が OS に依らない依存監査のため） |
@@ -411,8 +414,36 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
 - plugin 信頼性検証の別 UID 所有ファイル拒否（PLUG-11・TASK-122.6。`crates/core/tests/plugin_trust_rejection.rs` の `plug11_task122_6_rejects_symlink_to_other_uid_owned`）: 別の非 root UID 所有の通常ファイルは root の chown なしに作れないため `#[ignore]` で既定集合から分離している実機前提テスト（同一 UID・同一マシンで完結する拒否ケース 3 種は既定集合で実行する）。必要環境は Linux・非 root の実行ユーザー・事前に人間が用意した「別の非 root UID 所有・group/other 書き込み不可」の通常ファイル（実行ユーザーの `$HOME` 配下の 0755 ディレクトリ内に置き `sudo chown nobody <file>` する。`/tmp` 配下は祖先ディレクトリで別理由の拒否になるため不可）。実行は `FANDHE_CONTAINER_TEST_OTHER_UID_PLUGIN=<絶対パス> cargo test -p fandhe-container-core --test plugin_trust_rejection -- --ignored plug11_task122_6_rejects_symlink_to_other_uid_owned`（sudo 経由ではなく非 root で実行する。前提不備は skip せず失敗する）。実機での実行結果を PR に記録する
 - 常駐 plugin の RSS 計測（PLUG-9・TASK-112.3・#267。`crates/plugin/tests/rss_comparison.rs` の `plug9_resident_plugin_rss_is_measured`、通常の libtest harness）: 常駐モードの plugin 役プロセスを起動し、4 往復後の RSS を `rss::of_pid` で 5 回サンプルして 1 行 JSON を出力する実機前提テスト。RSS の絶対値が OS・ビルドプロファイル・アロケータ・ページサイズに依存し、妥当性は人間が #268 で判断するため `#[ignore]` で既定集合から分離している（CI 通過のための弱体化ではない。サンプラー自体の検証は既定集合で実行する）。必要環境は Linux または macOS（root 不要・特別な準備なし。Windows は RSS サンプラー・常駐モードとも未実装で対象外）。実行コマンドは `cargo test --release -p fandhe-container-plugin --test rss_comparison -- --ignored plug9_resident_plugin_rss_is_measured --nocapture`（`--nocapture` が無いと JSON 行が表示されない。debug でも実行できるが値は大きくなる）。値は健全性（4096 バイト以上・256 MiB 未満）のみ検査し、前提不備は skip せず失敗する。plugin 役はテストバイナリ自身の再実行（`child: libtest_reexec`）のため PLUG-9 の参考値に対する上限寄りの値で、gRPC 方式は gRPC 境界（TASK-108）未実装のため未計測。JSON 行を PR と #268 に記録する
 - UDS 境界の別 UID 所有ディレクトリ拒否（PLUG-12・TASK-123.5。`crates/plugin/tests/uds_security.rs` の `plug12_rejects_other_uid_owned_directory`）: 別の非 root UID 所有のディレクトリは root の chown なしに作れないため `#[ignore]` で既定集合から分離している実機前提テスト（CI 通過のための弱体化ではない。同一 UID で完結する symlink 拒否・stale socket 再 bind・所有者不一致の分岐照合は既定集合で実行する）。必要環境は Linux / macOS・非 root の実行ユーザー・事前に人間が用意した「別の非 root UID 所有・モード 0755・空」のディレクトリ（実行ユーザーの `$HOME` 配下の 0755 ディレクトリ内に作成し `sudo chown nobody <dir>` する）。実行は `FANDHE_CONTAINER_TEST_OTHER_UID_DIR=<絶対パス> cargo test -p fandhe-container-plugin --test uds_security -- --ignored plug12_rejects_other_uid_owned_directory`（sudo 経由ではなく非 root で実行する。前提不備は skip せず失敗する）。実機での実行結果を PR に記録する
-- UDS 境界の別 UID 接続拒否（PLUG-12・TASK-124.4。`crates/plugin/tests/peer_auth.rs` の `plug12_rejects_other_uid_connection`・`plug12_connect_rejects_other_uid_listener`）: 別 UID のプロセスは root 権限なしに用意できないため `#[ignore]` で既定集合から分離している実機前提テスト（CI 通過のための弱体化ではない。同一 UID の受理・peer 取得失敗の fail-closed は既定集合で実行する）。必要環境は Linux / macOS・非 root の実行ユーザー・sudo 可能な人間による準備。listener 側は 0700 の配置ディレクトリを越えられる root の connector が必要（非 root の別 UID は connect 前に遮断され peer 検証へ届かない）。人間が「socket パスを第 1 引数に取り、別 UID で接続して受信内容を stdout へ出す」実行ファイルを用意する（例: 中身が `exec sudo -n nc -U "$1" </dev/null` のスクリプト。事前に `sudo -v`。nc のオプションは OS 付属実装で差があり、macOS は未確認の例）。実行は `FANDHE_CONTAINER_TEST_OTHER_UID_CONNECT_CMD=<絶対パス> cargo test -p fandhe-container-plugin --test peer_auth -- --ignored plug12_rejects_other_uid_connection`。client 側は別 UID が listen 中で実行ユーザーから接続できる socket を人間が用意する（例: `sudo sh -c 'umask 000; exec nc -lU <絶対パス>'`）。実行は `FANDHE_CONTAINER_TEST_OTHER_UID_SOCKET=<絶対パス> cargo test -p fandhe-container-plugin --test peer_auth -- --ignored plug12_connect_rejects_other_uid_listener`。いずれも sudo 経由ではなく非 root で cargo を実行し、前提不備は skip せず失敗する。connector は env で渡した実行ファイルをテストが起動するため信頼できるファイルのみ指定する。実機での実行結果を PR に記録する
-- plugin-windows の別 UID listener 拒否（PLUG-12・TASK-116.4。`crates/plugin-windows/tests/peer_auth.rs` の `task116_4_plug12_rejects_other_uid_listener`）: 別 UID の listener は root 権限なしに用意できないため `#[ignore]` で既定集合から分離している実機前提テスト（同一 UID の受理は既定集合で実行する）。必要環境は Linux（WSL2 内を含む）/ macOS・非 root の実行ユーザー・別 UID が listen 中で実行ユーザーから接続できる socket を人間が用意すること。実行は `FANDHE_CONTAINER_TEST_OTHER_UID_SOCKET=<絶対パス> cargo test -p fandhe-container-plugin-windows --test peer_auth -- --ignored task116_4_plug12_rejects_other_uid_listener`。sudo 経由ではなく非 root で cargo を実行し、前提不備は skip せず失敗する。Ubuntu の AppArmor 下での fixture 例の注意は #1402 を参照する。実機での実行結果を PR に記録する
+- UDS 境界の別 UID 接続拒否（PLUG-12・TASK-124.4。`crates/plugin/tests/peer_auth.rs` の `plug12_rejects_other_uid_connection`・`plug12_connect_rejects_other_uid_listener`）: 別 UID のプロセスは root 権限なしに用意できないため `#[ignore]` で既定集合から分離している実機前提テスト（CI 通過のための弱体化ではない。同一 UID の受理・peer 取得失敗の fail-closed は既定集合で実行する）。必要環境は Linux / macOS・非 root の実行ユーザー・sudo 可能な人間による準備。いずれも sudo 経由ではなく非 root で cargo を実行し、前提不備は skip せず失敗する。実機での実行結果を PR に記録する
+  - sudo チケット: connector と listener は内部で `sudo -n`（非対話）を使う。cargo を実行するのと同じ対話端末で、直前に `sudo -v` を実行しておく。macOS では sudo チケットが端末ごとに分かれ、tty のないプロセスからはパスワードを読めないため、別の端末で `sudo -v` しても効かない（Ubuntu も既定は端末単位なので、同じ端末で行うのを共通の手順とする）
+  - `plug12_rejects_other_uid_connection` の connector: 0700 の配置ディレクトリを越えられる root の connector が必要（非 root の別 UID は connect 前に遮断され peer 検証へ届かない）。人間が「socket パスを第 1 引数に取り、root で接続して受信内容を stdout へ出す」実行ファイルを用意する。実行ユーザー所有の 0700 ディレクトリ（`$HOME` 配下など。root で動くため `/tmp` 直下の共有の場所には置かない）に、0700 で置く。connector は env で渡した実行ファイルをテストが起動するため、信頼できるファイルのみ指定する
+    - Linux（Ubuntu 26.04 で確認済み）: python3 を使う。Ubuntu の `nc`（`nc.openbsd`）には AppArmor プロファイル `/etc/apparmor.d/nc.openbsd` が付いており、capability を一切許可していない。root で動かしても 0700 のディレクトリを辿れず `connect(2)` が EACCES になり、テストは PLUG-12 の検証結果ではなく `Timeout` で失敗する。AppArmor プロファイルを complain / disable に変えて回避しない
+    - macOS（macOS 27.0 で確認済み）: 付属の nc で動く（`exec sudo -n nc -U "$1" </dev/null`）
+
+    ```sh
+    #!/bin/sh
+    # Linux 用 connector（python3 版）。$1 は socket の絶対パス
+    exec sudo -n /usr/bin/python3 -I -c '
+    import socket, sys
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(15)
+    s.connect(sys.argv[1])
+    while True:
+        b = s.recv(4096)
+        if not b:
+            break
+        sys.stdout.buffer.write(b)
+        sys.stdout.buffer.flush()
+    ' "$1" </dev/null
+    ```
+
+    実行は `FANDHE_CONTAINER_TEST_OTHER_UID_CONNECT_CMD=<絶対パス> cargo test -p fandhe-container-plugin --test peer_auth -- --ignored plug12_rejects_other_uid_connection`
+  - `plug12_connect_rejects_other_uid_listener` の listener: 別 UID が listen 中で、実行ユーザーから接続できる socket を人間が用意する。socket のパスは OS ごとに異なる
+    - Linux: root の nc は AppArmor の制限で、実行ユーザー所有のディレクトリ内には bind できない。socket は `/tmp` 直下に、推測されにくい名前で置く（例: `sudo -n sh -c 'umask 000; exec nc -lU /tmp/fcpeer.<乱数>.s'`）。root 所有の socket になるので、後始末は `sudo rm` する
+    - macOS: 実行ユーザー所有のディレクトリ内でもよい（例: `/tmp/fcpeer.<乱数>/s`。`sudo sh -c 'umask 000; exec nc -lU <絶対パス>'`）。後始末は親ディレクトリの所有者として sudo なしで削除できる
+
+    実行は `FANDHE_CONTAINER_TEST_OTHER_UID_SOCKET=<絶対パス> cargo test -p fandhe-container-plugin --test peer_auth -- --ignored plug12_connect_rejects_other_uid_listener`
+- plugin-windows の別 UID listener 拒否（PLUG-12・TASK-116.4。`crates/plugin-windows/tests/peer_auth.rs` の `task116_4_plug12_rejects_other_uid_listener`）: 別 UID の listener は root 権限なしに用意できないため `#[ignore]` で既定集合から分離している実機前提テスト（同一 UID の受理は既定集合で実行する）。必要環境は Linux（WSL2 内を含む）/ macOS・非 root の実行ユーザー・別 UID が listen 中で実行ユーザーから接続できる socket を人間が用意すること。実行は `FANDHE_CONTAINER_TEST_OTHER_UID_SOCKET=<絶対パス> cargo test -p fandhe-container-plugin-windows --test peer_auth -- --ignored task116_4_plug12_rejects_other_uid_listener`。sudo 経由ではなく非 root で cargo を実行し、前提不備は skip せず失敗する。Linux（Ubuntu）では root の nc が AppArmor の制限を受けるため、socket は `/tmp` 直下に置く（詳細は上の「UDS 境界の別 UID 接続拒否」項）。実機での実行結果を PR に記録する
 - plugin-macos E2E の実 VM 起動（PLUG-1・MAC-1・TASK-115.6・#390・MS-5。`crates/plugin-macos/tests/e2e.rs` の `#[ignore]` テスト `task115_6_plug1_mac1_real_vm_boots_and_stops_via_plugin_binary` 1 件、macOS のみ・通常の libtest harness）: 実バイナリ `fandhe-container-plugin-macos` を spawn し、UDS 越しの ping → create → start（`running`）→ stop（`stopped`）→ 切断を行い、期限内に終了コード 0・stderr の `plugin.op`（start / stop が `ok`）・`plugin.cleanup` が出ない（残留 VM なし）ことを検証する実機前提テスト。共有（virtiofs）は渡さない（ゲスト init 未実装では `guest_mount.timeout` になるため）。ブートマーカーはワイヤーに乗らないため照合しない（ゲストの起動完了確認は `vm_boot` の責務）。必要環境は実機の macOS 13 以上（Virtualization.framework をサポートするホスト。GitHub ホステッドの macOS runner は不可。root 不要）、自前ビルドのゲストカーネル（本リポには含めない）。`com.apple.security.virtualization` の ad-hoc 署名は**テストバイナリではなく plugin バイナリ**に必要（`vm_boot` との相違点）で、entitlements は `crates/platform-macos/tests/vm_boot.entitlements` を再利用する。環境変数は `FANDHE_CONTAINER_MACOS_VM_KERNEL`（必須・絶対パス。未設定は panic）・`FANDHE_CONTAINER_MACOS_VM_INITRD`（任意・絶対パス）・`FANDHE_CONTAINER_MACOS_VM_CMDLINE`（既定 `console=hvc0`）。署名後に再ビルドすると署名が外れるため、`--no-run` でビルド → 署名 → 実行の順を守る。バイナリの場所は `CARGO_TARGET_DIR` 設定時に変わる。adapter の起動期限は固定 7 秒（`vm_boot` の既定 60 秒より短い）で、失敗時はまず start の Error フレームのコード（`TIMEOUT` か）を確認する。結果は PR に記録する（Agent は実機未実施）
 
   ```bash
@@ -428,7 +459,7 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
   cargo test -p fandhe-container-plugin-windows --test e2e -- --ignored --nocapture task116_6_plug1_win1_real_wsl2_launch_and_stop_via_adapter
   ```
 
-- plugin-macos の別 UID listener 拒否（PLUG-12・TASK-115.4。`crates/plugin-macos/tests/peer_auth.rs` の `task115_4_plug12_rejects_other_uid_listener`）: 別 UID の listener は root 権限なしに用意できないため `#[ignore]` で既定集合から分離している実機前提テスト（同一 UID の受理は既定集合で実行する）。必要環境は Linux / macOS・非 root の実行ユーザー・別 UID が listen 中で実行ユーザーから接続できる socket と、その listener の受信バイトを書き出す空の記録ファイル（実行ユーザーが読めること。例: `sudo sh -c 'umask 000; : > <記録ファイル>; exec nc -lU <socket> > <記録ファイル>'`）を人間が用意すること。テストは plugin 終了後 2 秒間、記録ファイルのサイズが 0 バイトのままであること（認証前にデータを送らない）を監視して照合する（別プロセス listener の記録完了は直接同期できないため猶予つき。listener は受信を即時にファイルへ書く単発のものを使う）。実行は `FANDHE_CONTAINER_TEST_OTHER_UID_SOCKET=<絶対パス> FANDHE_CONTAINER_TEST_OTHER_UID_RECEIVED_FILE=<記録ファイルの絶対パス> cargo test -p fandhe-container-plugin-macos --test peer_auth -- --ignored task115_4_plug12_rejects_other_uid_listener`。sudo 経由ではなく非 root で cargo を実行し、前提不備は skip せず失敗する。Ubuntu の AppArmor 下での fixture 例の注意は #1402 を参照する。実機での実行結果を PR に記録する
+- plugin-macos の別 UID listener 拒否（PLUG-12・TASK-115.4。`crates/plugin-macos/tests/peer_auth.rs` の `task115_4_plug12_rejects_other_uid_listener`）: 別 UID の listener は root 権限なしに用意できないため `#[ignore]` で既定集合から分離している実機前提テスト（同一 UID の受理は既定集合で実行する）。必要環境は Linux / macOS・非 root の実行ユーザー・別 UID が listen 中で実行ユーザーから接続できる socket と、その listener の受信バイトを書き出す空の記録ファイル（実行ユーザーが読めること。例: `sudo sh -c 'umask 000; : > <記録ファイル>; exec nc -lU <socket> > <記録ファイル>'`）を人間が用意すること。テストは plugin 終了後 2 秒間、記録ファイルのサイズが 0 バイトのままであること（認証前にデータを送らない）を監視して照合する（別プロセス listener の記録完了は直接同期できないため猶予つき。listener は受信を即時にファイルへ書く単発のものを使う）。実行は `FANDHE_CONTAINER_TEST_OTHER_UID_SOCKET=<絶対パス> FANDHE_CONTAINER_TEST_OTHER_UID_RECEIVED_FILE=<記録ファイルの絶対パス> cargo test -p fandhe-container-plugin-macos --test peer_auth -- --ignored task115_4_plug12_rejects_other_uid_listener`。sudo 経由ではなく非 root で cargo を実行し、前提不備は skip せず失敗する。Linux（Ubuntu）では root の nc が AppArmor の制限を受けるため、socket は `/tmp` 直下に置く（詳細は上の「UDS 境界の別 UID 接続拒否」項）。実機での実行結果を PR に記録する
 
 - venus 試験治具の capset ログ照合（GPU-6・TASK-172.4・#888。`poc/venus-decoder/jig/tests/real_machine_capset_log.rs` の `task172_4_gpu6_guest_capset_query_reached_decoder`）: 治具 VMM のログに、ゲストの Mesa venus 由来の `GET_CAPSET`（`capset_id=4`）の成功行があることを照合する。必要環境は GPU 付き Linux ホスト・治具 VMM・Mesa venus を載せたゲスト。現時点ではトランスポート（後続 F1）が未実装のため成功するログは得られない。実行コマンド:
 

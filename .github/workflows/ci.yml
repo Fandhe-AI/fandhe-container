@@ -158,8 +158,9 @@ jobs:
   #   cargo build --workspace（REPAIR-7 ステージ 1: ビルド・型検査）
   #   cargo clippy --workspace --all-targets -- -D warnings
   #   cargo test --workspace（REPAIR-7 ステージ 2: ユニット / 統合テスト）
+  #   RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps（make doc。#1300）
   # （いずれも既定 feature）を本 workflow 内で直接実行し、既定 feature 側の回帰も
-  # CI で検出できるようにする。Makefile の `lint`/`test` ターゲット（既定 feature 用）と
+  # CI で検出できるようにする。Makefile の `lint`/`test`/`doc` ターゲット（既定 feature 用）と
   # 同一コマンドを実行する（`cargo build` は `--locked` を付けず、他ステップと条件を
   # そろえる）。rust-ci と同じ 3 OS matrix で実行する（既定 feature 構成の OS 依存回帰を
   # --all-features 側だけでは検出できないため）。
@@ -219,6 +220,16 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test（既定 feature）
         run: cargo test --workspace
+      # rustdoc の警告（壊れた intra-doc リンク・private 項目へのリンク等）を -D warnings で fail
+      # させる（REPAIR-3・REPAIR-7・#1300）。Makefile の `doc` ターゲット（既定 feature・--no-deps）を
+      # そのまま実行する。新ジョブは check-run 名が増えて ruleset の更新が要るため、既定 feature の
+      # ローカルゲートを再現する本ジョブへステップとして追加する（check-run 件数は不変）。
+      # 3 OS で実行する: cfg(target_os) 限定の項目へのリンクは OS ごとに解決結果が変わり、Linux
+      # では通るが macOS / Windows でだけ壊れる（またはその逆の）リンクがあるため
+      - name: cargo doc（既定 feature・-D warnings）
+        shell: bash
+        timeout-minutes: 10
+        run: make doc
       # core の plugin 無効構成（--no-default-features）の検証（PLUG-3・TASK-111.1・#262）。
       # 新ジョブは必須チェック名が増えるため既存ジョブへのステップとして追加する。
       - name: core plugin 無効構成の検証

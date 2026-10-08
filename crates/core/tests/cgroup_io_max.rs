@@ -53,7 +53,13 @@ mod linux {
 
         let u = IoLimit::Unlimited;
         let limited = IoMax::new(device, IoLimit::Value(1_048_576), u, u, u).unwrap();
-        assert_eq!(child.set_io_max(&limited), Ok(limited));
+        assert_eq!(
+            child.set_io_max(
+                &fandhe_container_core::observability::OpRecorder::new(),
+                &limited
+            ),
+            Ok(limited)
+        );
         assert_eq!(
             read().trim_end(),
             format!("{token} rbps=1048576 wbps=max riops=max wiops=max")
@@ -61,7 +67,13 @@ mod linux {
 
         // 全項目を既定へ戻すと、カーネルは該当デバイスの行を出力しない。
         let reset = IoMax::new(device, u, u, u, u).unwrap();
-        assert_eq!(child.set_io_max(&reset), Ok(reset));
+        assert_eq!(
+            child.set_io_max(
+                &fandhe_container_core::observability::OpRecorder::new(),
+                &reset
+            ),
+            Ok(reset)
+        );
         assert_eq!(read().trim_end(), "");
 
         // 不正値は構築で拒否され、ファイルは変化しない。

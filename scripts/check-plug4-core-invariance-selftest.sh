@@ -16,12 +16,18 @@
 #   - PLUG4_BASE_REF 指定時（PR 判定）は HEAD のコミット tree を見る（作業ツリーの未コミット変更を混ぜない）。
 #     未指定時（ローカル実行）は作業ツリーの未コミット変更を含めて複製する
 #   - PLUG4_BASE_REF が解決できなければ失敗する（fail-closed）
-#   - 空白を含むパス・symlink を含む作業ツリーを複製できる（symlink の保持を確かめられるのは ubuntu・macos のみ。
+#   - 空白を含むパスを含む作業ツリー・コミットを複製できる（全 OS）
+#   - symlink を辿らず symlink のまま複製する（Windows 以外）: fixture の core に build.rs を置き、判定
+#     スクリプトが作る一時 workspace（ws）の docs/link が symlink でなければビルドを失敗させる。ローカル
+#     実行（cp -RPp）・PR 判定（git archive | tar）の双方で、symlink が辿られて複製されると成功ケースが
+#     失敗に変わる。fixture の docs/link 自体が symlink にならない環境は前提欠如として失敗する。
 #     Windows の Git Bash は MSYS の既定で `ln -s` がディレクトリの複製になり、実リポの symlink も
-#     core.symlinks=false の checkout では通常ファイルになるため、Windows では空白を含むパスと複製の経路を
-#     確かめる。fixture がどちらになったかは実行ログに出す）
-#   - Windows runner（core.autocrlf=true）ではブランチ切り替えで fixture が CRLF に書き換わるため、
-#     ローカル実行（作業ツリー複製）のケースは CRLF の作業ツリーに対しても照合される
+#     core.symlinks=false の checkout では通常ファイルになるため、Windows では build.rs を置かず、
+#     空白を含むパスと複製の経路だけを確かめる（fixture がどちらになったかは実行ログに出す）
+#   - Windows runner（core.autocrlf=true）では、git archive が CRLF で展開するため PR 判定のケース 3〜8
+#     （成功・失敗の両経路）が CRLF の ws に対して照合される。ローカル実行（作業ツリー複製）で CRLF の
+#     作業ツリーを照合するのは、ブランチ切り替え後に走る失敗経路のケース 9 だけ（ケース 1 は
+#     ブランチ切り替え前で LF のまま）
 #
 # 期待と異なる結果が 1 件でもあれば非ゼロで終了する（fail-closed）。cargo と git が必要（ネットワークは不要）。
 
@@ -78,12 +84,34 @@ fn answer_is_42() {
 RS
   echo 'note' >"$fx/docs/with space/a b.txt"
   ln -s "with space" "$fx/docs/link"
-  # 判定ではなく診断出力（どの経路を確かめたかを実行ログで分かるようにする。上記の Windows の扱いを参照）
-  if [ -L "$fx/docs/link" ]; then
-    echo "fixture: docs/link is a symlink"
-  else
-    echo "fixture: docs/link is a copy (symlinks are not created on this platform)"
-  fi
+  case "$(uname -s)" in
+    MINGW* | MSYS* | CYGWIN*)
+      # 判定ではなく診断出力（どの経路を確かめたかを実行ログで分かるようにする。冒頭の Windows の扱いを参照）
+      if [ -L "$fx/docs/link" ]; then
+        echo "fixture: docs/link is a symlink (symlink preservation is not checked on this platform)"
+      else
+        echo "fixture: docs/link is a copy (symlinks are not created on this platform)"
+      fi
+      ;;
+    *)
+      if [ ! -L "$fx/docs/link" ]; then
+        echo "FAIL: fixture docs/link is not a symlink (ln -s did not create one)" >&2
+        exit 1
+      fi
+      echo "fixture: docs/link is a symlink (preservation in the copied workspace is checked by build.rs)"
+      # 判定スクリプトの ws で docs/link が symlink のまま複製されていなければ core のビルドを失敗させる
+      cat >"$fx/crates/core/build.rs" <<'RS'
+fn main() {
+    let dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let link = std::path::Path::new(&dir).join("../../docs/link");
+    match std::fs::symlink_metadata(&link) {
+        Ok(m) if m.file_type().is_symlink() => {}
+        _ => panic!("fixture symlink docs/link was not preserved as a symlink in the copied workspace"),
+    }
+}
+RS
+      ;;
+  esac
   printf 'target/\n' >"$fx/.gitignore"
   cp "$target" "$fx/scripts/check-plug4-core-invariance.sh"
   (cd "$fx" && cargo generate-lockfile --offline >/dev/null 2>&1)
@@ -155,7 +183,8 @@ ng_msg="but also changes core (PLUG-4):"
 
 init_fixture
 
-# 1. PLUG4_BASE_REF 未指定（probe 追加前後の比較のみ）。空白を含むパス・symlink の複製も通る
+# 1. PLUG4_BASE_REF 未指定（probe 追加前後の比較のみ）。空白を含むパスの複製と、Windows 以外では symlink の
+#    保持（build.rs）も通る
 run_case "no-base-ref" 0 "" "$ok_msg"
 
 # 2. PLUG4_BASE_REF が解決できない → 失敗（fail-closed）

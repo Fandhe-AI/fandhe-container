@@ -485,9 +485,10 @@ jobs:
       # 判定本体は bench-regression（ubuntu 単独）で走るが、`make plug4-core-invariance` は開発者が各 OS で
       # 実行するため、GNU / BSD 双方のツールと Windows の Git Bash（本ジョブ既定の shell: bash）で動くことを
       # 3 OS の実行で確かめる。fixture の最小 workspace（依存 0 件）だけを使い、ネットワーク・secrets・
-      # `${{ }}` の埋め込みは使わない。Windows の Git Bash では fixture の `ln -s` が複製になるため、symlink
-      # の保持は ubuntu・macos で確かめる（詳細は自己テスト冒頭のコメント）。新ジョブは check-run 名が増える
-      # ため既存ジョブのステップとする（check-run 件数は不変）
+      # `${{ }}` の埋め込みは使わない。symlink を辿らず symlink のまま複製することは、ubuntu・macos で fixture の
+      # build.rs が判定スクリプトの一時 workspace を検査して確かめる。Windows の Git Bash では fixture の
+      # `ln -s` が複製になるため、空白を含むパスと複製の経路だけを確かめる（詳細は自己テスト冒頭のコメント）。
+      # 新ジョブは check-run 名が増えるため既存ジョブのステップとする（check-run 件数は不変）
       - name: PLUG-4 判定スクリプトの自己テスト（TASK-109.4・REPAIR-12。ubuntu・macos・windows）
         if: env.HANG_PROBE != 'true'
         timeout-minutes: 5

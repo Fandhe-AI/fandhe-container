@@ -10,21 +10,33 @@
 //! テスト `oci5_temp_residue_does_not_affect_reads_and_is_swept_on_update` が担う。
 //! 子プロセスの待機には上限時間を設ける（REPAIR-5）。root 不要で既定のテスト集合で動く。
 //!
+//! 観測側は `@lock` を取らず `state.json` を直接読んで revision の前進を確認する（#1400）。子は
+//! sleep なしで `get`→`update` を繰り返し、`update` は fsync と rename を含めて `@lock` を保持する
+//! ため、`try_lock` の再試行（5ms 間隔・非公平）で待つ観測側は CI の fsync が遅いと取得に飢える。
+//! 一時ファイル→fsync→rename の書き方により、ロックなしの読み手も旧値か新値の完全な JSON だけを
+//! 見る（トレイト契約 4）ので、直接読みはロック非依存で契約 4 自体の検証にもなる。
+//!
+//! 失敗時の切り分け: 子の stderr は一時ログ（`child-<i>.log`）へ残し、期限切れ時は診断文字列に
+//! 子の終了状態・ログ末尾・観測回数を含める。(a) 子が終了済みでログに失敗理由がある、(b) 子が前進して
+//! いる（kill 後の `get` の revision が `last_seen` より大きい）のに直接読みで見えない、(c) 子は実行中で
+//! `child: started` はあるが前進が無い、または開始マーカーすら無い（runner 負荷での起動遅延）。
+//!
 //! `FileStateStore` は Linux 限定（他 OS の `open` は `Unimplemented`。非 Linux の fail-closed は
 //! `state_store_integration` の `oci5_open_is_unimplemented_outside_linux` で照合済み）のため、
 //! 本試験は Linux のみで実行する。
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::fs;
+    use std::fs::{self, File};
+    use std::io::{Read, Seek, SeekFrom};
     use std::num::NonZeroU32;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+    use fandhe_container_core::state_store::{FileStateStore, MAX_STATE_FILE_BYTES, StateRoot};
     use fandhe_container_core::traits::{
-        ContainerId, ContainerStatus, CreateStateRequest, ErrorCode, GetStateRequest, StateStore,
+        ContainerId, ContainerStatus, CreateStateRequest, GetStateRequest, StateStore,
         UpdateStateRequest,
     };
 
@@ -50,7 +62,11 @@ mod linux {
 
     impl TmpDir {
         fn new() -> Self {
-            let p = std::env::temp_dir().join(format!("fandhe-state-crash-{}", std::process::id()));
+            Self::named("fandhe-state-crash")
+        }
+
+        fn named(prefix: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&p);
             fs::create_dir_all(&p).unwrap();
             {
@@ -74,30 +90,41 @@ mod linux {
         let Some(root) = std::env::var_os(ROOT_ENV) else {
             return;
         };
+        // 親が stderr をログへ向けているので、開始・初回成功・失敗理由がそこへ残る（#1400 の切り分け用）。
+        eprintln!("child: started pid={}", std::process::id());
         let store = open(Path::new(&root));
-        let deadline = Instant::now() + CHILD_LIFETIME;
+        let begin = Instant::now();
+        let deadline = begin + CHILD_LIFETIME;
         let mut n: u32 = 1;
         while Instant::now() < deadline {
-            let Ok(cur) = store.get(&GetStateRequest::new(cid(ID))) else {
-                return;
+            let cur = match store.get(&GetStateRequest::new(cid(ID))) {
+                Ok(cur) => cur,
+                Err(e) => panic!("child get failed after {} updates: {e:?}", n - 1),
             };
             let status = ContainerStatus::running(cid(ID), NonZeroU32::new(n));
-            if store
-                .update(&UpdateStateRequest::new(status, cur.revision()))
-                .is_err()
-            {
-                return;
+            let updated = match store.update(&UpdateStateRequest::new(status, cur.revision())) {
+                Ok(u) => u,
+                Err(e) => panic!("child update failed after {} updates: {e:?}", n - 1),
+            };
+            if n == 1 {
+                eprintln!(
+                    "child: first update ok revision={} elapsed_ms={}",
+                    updated.revision().value(),
+                    begin.elapsed().as_millis()
+                );
             }
             n = n.wrapping_add(1).max(1);
         }
     }
 
-    fn spawn_child(root: &Path) -> Child {
+    /// 子の stderr をログファイルへ向けて起動する（パイプと違い詰まらず、SIGKILL 後も読める）。
+    fn spawn_child(root: &Path, log: &Path) -> Child {
+        let log_file = File::create(log).unwrap();
         Command::new(std::env::current_exe().unwrap())
             .args(["--exact", CHILD_TEST, "--test-threads=1", "--nocapture"])
             .env(ROOT_ENV, root)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(log_file)
             .spawn()
             .unwrap()
     }
@@ -112,6 +139,42 @@ mod linux {
             assert!(Instant::now() < deadline, "child did not exit after kill");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// `state.json` を `@lock` なしで直接読み、revision を返す。ファイル無しは `None`。
+    /// 一時ファイル→rename の書き方により、読めた内容は常に完全な JSON でなければならない
+    /// （トレイト契約 4）ので、壊れていたら契約違反として panic する。
+    fn read_revision_lock_free(root: &Path) -> Option<u64> {
+        let path = root.join(ID).join("state.json");
+        let mut f = File::open(&path).ok()?;
+        let len = f.metadata().unwrap().len();
+        assert!(len <= MAX_STATE_FILE_BYTES, "state.json too large: {len}");
+        let mut buf = Vec::new();
+        f.by_ref()
+            .take(MAX_STATE_FILE_BYTES)
+            .read_to_end(&mut buf)
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&buf)
+            .unwrap_or_else(|e| panic!("state.json unreadable by lock-free reader: {e}"));
+        assert_eq!(json["id"], ID, "state.json id mismatch");
+        Some(
+            json["revision"]
+                .as_u64()
+                .expect("state.json revision is not u64"),
+        )
+    }
+
+    /// ログ末尾（最大 4 KiB）。診断用で、読めなければ理由を返す。
+    fn log_tail(log: &Path) -> String {
+        const TAIL: u64 = 4096;
+        let Ok(mut f) = File::open(log) else {
+            return "<log unavailable>".to_string();
+        };
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let _ = f.seek(SeekFrom::Start(len.saturating_sub(TAIL)));
+        let mut buf = Vec::new();
+        let _ = f.take(TAIL).read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
     }
 
     /// `dir` 直下で名前に `.tmp` を含むエントリ数。
@@ -146,32 +209,46 @@ mod linux {
             .unwrap();
         let mut last_seen = created.revision().value();
         drop(store);
+        // 子のログは状態ルートの外に置く（`tmp_count` 等の走査に影響させない）。
+        let logs = TmpDir::named("fandhe-state-crash-logs");
 
         for i in 0..ITERATIONS {
-            let mut child = spawn_child(&root);
-            // 子が書き込みを始めた（revision が前進した）ことを上限時間つきで確認する。
-            let observer = open(&root);
+            let log = logs.0.join(format!("child-{i}.log"));
+            let mut child = spawn_child(&root, &log);
+            // 子が書き込みを始めた（revision が前進した）ことを、`@lock` を取らない直接読みで
+            // 上限時間つきで確認する。子が先に終了していたら待たずに失敗させる。
             let started = Instant::now();
-            loop {
-                // 子が `@lock` を連続取得している間は観測側の取得が期限切れ（Timeout）になり得る
-                // （flock は公平でない）。これは子が稼働中という前提の通常動作なので、全体の
-                // 上限時間内で再試行する。それ以外のエラーは失敗させる。
-                match observer.get(&GetStateRequest::new(cid(ID))) {
-                    Ok(rec) if rec.revision().value() > last_seen => break,
-                    Ok(_) => {}
-                    Err(e) if e.code() == ErrorCode::Timeout => {}
-                    Err(e) => panic!("observer get failed: {e:?}"),
+            let (mut stale, mut missing) = (0u64, 0u64);
+            let observed = loop {
+                match read_revision_lock_free(&root) {
+                    Some(r) if r > last_seen => break r,
+                    Some(_) => stale += 1,
+                    None => missing += 1,
                 }
-                assert!(started.elapsed() < WAIT_DEADLINE, "child made no progress");
+                let exited = child.try_wait().unwrap();
+                if exited.is_some() || started.elapsed() >= WAIT_DEADLINE {
+                    let _ = child.kill();
+                    let _ = reap(&mut child);
+                    let actual = open(&root).get(&GetStateRequest::new(cid(ID)));
+                    panic!(
+                        "child made no progress: iteration={i} elapsed_ms={} last_seen={last_seen} \
+                         stale_reads={stale} missing_reads={missing} child_exit_before_kill={exited:?} \
+                         locked_get_after_kill={:?}\n--- child log tail ---\n{}",
+                        started.elapsed().as_millis(),
+                        actual.map(|r| r.revision().value()),
+                        log_tail(&log)
+                    );
+                }
                 std::thread::sleep(Duration::from_millis(2));
-            }
+            };
             // 可変オフセットで待ってから kill する（書き込みの様々な局面を狙う）。
             std::thread::sleep(Duration::from_millis((i * 3) % 17));
             // 子は無限に更新を続けるため、kill 時点で稼働中でなければならない（先に終了していたら
             // 試験の前提が崩れているので失敗させる）。
             assert!(
                 child.try_wait().unwrap().is_none(),
-                "child exited before kill"
+                "child exited before kill: log:\n{}",
+                log_tail(&log)
             );
             child.kill().unwrap();
             let status = reap(&mut child);
@@ -185,7 +262,7 @@ mod linux {
             let reopened = open(&root);
             let rec = reopened.get(&GetStateRequest::new(cid(ID))).unwrap();
             assert_eq!(rec.id().as_str(), ID);
-            assert!(rec.revision().value() >= last_seen);
+            assert!(rec.revision().value() >= observed);
             let raw = fs::read(root.join(ID).join("state.json")).unwrap();
             let json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
             assert_eq!(json["id"], ID);

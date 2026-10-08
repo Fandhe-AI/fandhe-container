@@ -96,8 +96,12 @@ rc=0
 fail() { rc=1; }
 
 # 複数の virtio-gpu が混在すると別デバイスの行を組み合わせて合否が決まるため、デバイス
-# 識別子（virtioN）単位に限定する。デバイスが複数、または同一デバイスの probe 区間が
-# 複数（再 probe）ある場合は帰属を決められないので fail-closed で打ち切る。
+# 識別子（virtioN）単位に限定する。デバイスが複数、または probe 区間が複数（再 probe・
+# 接頭辞なしの [drm] 行が別デバイス由来の可能性）ある場合は帰属を決められないので
+# fail-closed で打ち切る。
+# 実カーネルの DRM_INFO 系ログ（Host memory window・num_scanouts is zero・KMS disabled・
+# capset timeout 等）は "virtio_gpu virtioN:" ではなく "[drm]" 接頭辞だけで出るため、
+# 単一デバイス時は当該デバイス接頭辞の行に加えて "[drm]" 行も判定対象に残す。
 devs="$(grep -oE 'virtio.?gpu virtio[0-9]+:' "$tmp" | grep -oE 'virtio[0-9]+' | sort -u || true)"
 dev_count="$(printf '%s' "$devs" | grep -c . || true)"
 if [ "$dev_count" -gt 1 ]; then
@@ -106,18 +110,18 @@ if [ "$dev_count" -gt 1 ]; then
 elif [ "$dev_count" -eq 1 ]; then
   tmpdev="$(mktemp)"
   trap 'rm -f "$tmp" "$tmpvk" "$tmpdev"' EXIT
-  grep -E "virtio.?gpu ${devs}:" "$tmp" >"$tmpdev" || true
+  grep -E "virtio.?gpu ${devs}:|\[drm\]" "$tmp" >"$tmpdev" || true
   mv -f -- "$tmpdev" "$tmp"
-  sections="$(grep -c 'number of cap sets: ' "$tmp" || true)"
-  if [ "$sections" -gt 1 ]; then
-    echo "probe=multiple_sections"
-    exit 1
-  fi
+fi
+sections="$(grep -c 'number of cap sets: ' "$tmp" || true)"
+if [ "$sections" -gt 1 ]; then
+  echo "probe=multiple_sections"
+  exit 1
 fi
 
 # features 行（例: virtio_gpu virtio0: features: +virgl -edid +resource_blob +host_visible）
 # context_init は別行（features: +context_init）に出る。両行を結合して照合する。
-feats="$(grep -E 'virtio.?gpu.*features: ' "$tmp" || true)"
+feats="$(grep -E '(virtio.?gpu|\[drm\]).*features: ' "$tmp" || true)"
 
 if [ -n "$feats" ]; then
   echo "probe=ok"

@@ -63,6 +63,17 @@ expect_case no-virtio-gpu 1 "probe=missing
 capset_info=missing" --dmesg-file "$fx/no-virtio-gpu.log"
 expect_case empty-input 1 "probe=missing" --dmesg-file "$fx/empty.log"
 expect_case multi-device 1 "probe=multiple_devices" --dmesg-file "$fx/multi-device.log"
+# 実カーネルの DRM_INFO 系ログは "[drm]" 接頭辞のみでデバイス識別子を持たない。
+expect_case drm-prefix-ok 0 "probe=ok
+virgl=enabled
+context_init=enabled
+kms=disabled
+capset_info=venus
+capset_max_size=160
+host_memory_window=present" --dmesg-file "$fx/drm-prefix-ok.log"
+expect_case drm-prefix-zero-scanouts 1 "kms=probe_failed_zero_scanouts
+host_memory_window=present" --dmesg-file "$fx/drm-prefix-zero-scanouts.log"
+expect_case drm-prefix-multi-section 1 "probe=multiple_sections" --dmesg-file "$fx/drm-prefix-multi-section.log"
 expect_case capset-version-nonzero 1 "capset_max_version=3" --dmesg-file "$fx/capset-version-nonzero.log"
 expect_case host-window-zero 1 "host_memory_window=zero_size" --dmesg-file "$fx/host-window-zero.log"
 expect_case venus-diagnostic-only 1 "venus_init=missing" --dmesg-file "$fx/ok.log" --vulkaninfo-file "$fx/vulkaninfo-diagnostic.txt"

@@ -139,6 +139,10 @@ pub(super) const OP_LOG_ENV: &str = "FANDHE_CONTAINER_OP_LOG";
 #[cfg(target_os = "linux")]
 const O_NONBLOCK: i32 = 0o4000;
 
+/// 副作用なく inode だけを固定する O_PATH（SEC-1）。値は Linux の全アーキで 0o10000000。
+#[cfg(target_os = "linux")]
+const O_PATH: i32 = 0o10_000_000;
+
 /// 最終要素が symlink なら open を失敗させる O_NOFOLLOW（SEC-1）。値は ABI ごとに異なる
 /// （Linux の arm / arm64 は 0o100000、他の Linux アーキは 0o400000）。
 #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
@@ -205,12 +209,20 @@ fn open_dir_at(dir: &std::fs::File, name: &std::ffi::OsStr) -> std::io::Result<s
 #[cfg(target_os = "linux")]
 const MAX_SYMLINK_HOPS: u32 = 8;
 
+/// 解決待ちの経路要素。`..` は物理的な親（開いた fd のスタックの 1 つ手前）へ戻る。
+#[cfg(target_os = "linux")]
+enum Step {
+    Name(std::ffi::OsString),
+    Parent,
+}
+
 /// 親ディレクトリを、ルートから 1 要素ずつディレクトリ fd で固定しながら開く（SEC-1）。
 ///
 /// 各要素は直前に開いた fd 経由で O_NOFOLLOW | O_DIRECTORY で開き、開いた fd ごとに所有者・権限を
 /// 検査する。パス全体を再解決しないため、検査と open の間に親を symlink へ差し替えられない。
-/// root 所有の symlink（システム標準の `/var/run` 等）のみ、その場で内容を読んで同じ手順で
-/// 辿る（root 所有のため一般ユーザーは差し替えられない）。`..` を含む経路は拒否する。
+/// root 所有の symlink（システム標準の `/var/run` -> `../run` 等）のみ、その場で内容を読んで同じ
+/// 手順で辿る（root 所有のため一般ユーザーは差し替えられない）。`..` は検査済みディレクトリ fd の
+/// スタックを 1 つ戻して解決し、ルートより上へ出る経路は拒否する。
 #[cfg(target_os = "linux")]
 fn open_trusted_parent(parent: &std::path::Path, euid: u32) -> Option<std::fs::File> {
     use std::collections::VecDeque;
@@ -218,22 +230,20 @@ fn open_trusted_parent(parent: &std::path::Path, euid: u32) -> Option<std::fs::F
     use std::path::Component;
 
     /// `path` の各要素を `queue` の先頭へ順序を保って積み、絶対パスだったかを返す。
-    fn push_components(
-        queue: &mut VecDeque<std::ffi::OsString>,
-        path: &std::path::Path,
-    ) -> Option<bool> {
+    fn push_components(queue: &mut VecDeque<Step>, path: &std::path::Path) -> Option<bool> {
         let mut absolute = false;
-        let mut names = Vec::new();
+        let mut steps = Vec::new();
         for c in path.components() {
             match c {
                 Component::RootDir => absolute = true,
-                Component::Normal(n) => names.push(n.to_os_string()),
+                Component::Normal(n) => steps.push(Step::Name(n.to_os_string())),
+                Component::ParentDir => steps.push(Step::Parent),
                 Component::CurDir => {}
-                Component::ParentDir | Component::Prefix(_) => return None,
+                Component::Prefix(_) => return None,
             }
         }
-        for n in names.into_iter().rev() {
-            queue.push_front(n);
+        for st in steps.into_iter().rev() {
+            queue.push_front(st);
         }
         Some(absolute)
     }
@@ -253,19 +263,32 @@ fn open_trusted_parent(parent: &std::path::Path, euid: u32) -> Option<std::fs::F
     };
     let mut queue = VecDeque::new();
     push_components(&mut queue, &abs)?;
-    let mut cur = open_root()?;
+    // 検査済みディレクトリ fd のスタック（先頭がルート、末尾が現在位置）。
+    let mut stack = vec![open_root()?];
     let mut hops = 0;
-    while let Some(name) = queue.pop_front() {
-        match open_dir_at(&cur, &name) {
+    while let Some(step) = queue.pop_front() {
+        let name = match step {
+            Step::Parent => {
+                // ルートより上へは出ない（escape-above-root は拒否）。
+                if stack.len() <= 1 {
+                    return None;
+                }
+                stack.pop();
+                continue;
+            }
+            Step::Name(n) => n,
+        };
+        let cur = stack.last()?;
+        match open_dir_at(cur, &name) {
             Ok(next) => {
                 if !dir_trusted(&next, euid) {
                     return None;
                 }
-                cur = next;
+                stack.push(next);
             }
             Err(_) => {
                 // symlink だった場合のみ、root 所有に限って辿る。それ以外は拒否する。
-                let link = child_via_fd(&cur, &name);
+                let link = child_via_fd(cur, &name);
                 let m = std::fs::symlink_metadata(&link).ok()?;
                 if !m.file_type().is_symlink() || m.uid() != 0 {
                     return None;
@@ -276,21 +299,24 @@ fn open_trusted_parent(parent: &std::path::Path, euid: u32) -> Option<std::fs::F
                 }
                 let target = std::fs::read_link(&link).ok()?;
                 if push_components(&mut queue, &target)? {
-                    cur = open_root()?;
+                    stack.truncate(1);
                 }
             }
         }
     }
-    Some(cur)
+    stack.pop()
 }
 
-/// 計測出力先を非ブロッキングで開く。通常ファイル以外（FIFO・デバイス等）は拒否する。
+/// 計測出力先を副作用なく固定して検証してから書き込み用に開く。通常ファイル以外は拒否する。
 ///
 /// Linux では、親ディレクトリをルートから fd で固定しながら開き（[`open_trusted_parent`]）、
-/// その親 fd 経由で最終要素を O_NOFOLLOW で開く。開いたファイルの種別・ハードリンク数
-/// （1 のみ許可）・所有者を fd から検証する（root 実行時に別ファイルへ追記させる攻撃の防止。SEC-1）。
+/// その親 fd 経由で最終要素を O_PATH | O_NOFOLLOW で固定する。O_PATH はデバイス・FIFO を開いても
+/// 副作用（`/dev/watchdog` の起動等）を起こさない。固定した fd で種別・ハードリンク数（1 のみ許可）・
+/// 所有者を検証した後に限り、`/proc/self/fd` 経由で同じ inode を追記用に開き直し、再度検証する。
+/// 未存在のときは O_EXCL（create_new）で排他的に作成し、既存対象の検査を迂回させない（SEC-1・REPAIR-5）。
 #[cfg(target_os = "linux")]
 fn open_op_log(path: &std::ffi::OsStr) -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let path = std::path::Path::new(path);
     let name = path.file_name()?;
@@ -300,18 +326,39 @@ fn open_op_log(path: &std::ffi::OsStr) -> Option<std::fs::File> {
     };
     let euid = effective_uid()?;
     let dir = open_trusted_parent(parent, euid)?;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true)
-        .append(true)
-        .custom_flags(O_NONBLOCK | O_NOFOLLOW);
-    let f = opts.open(child_via_fd(&dir, name)).ok()?;
-    // open 後のハンドルで検証する（パスの事前検査による TOCTOU を避ける）。
-    let m = f.metadata().ok()?;
-    if m.is_file() && m.nlink() == 1 && m.uid() == euid {
-        Some(f)
-    } else {
-        None
+    let target = child_via_fd(&dir, name);
+    let verify = |f: &std::fs::File| -> bool {
+        f.metadata()
+            .map(|m| m.is_file() && m.nlink() == 1 && m.uid() == euid)
+            .unwrap_or(false)
+    };
+    let pinned = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_PATH | O_NOFOLLOW)
+        .open(&target)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // 未存在: 排他的に作成する（既存・競合で現れた対象には O_EXCL で失敗する）。
+            let f = std::fs::OpenOptions::new()
+                .append(true)
+                .create_new(true)
+                .custom_flags(O_NONBLOCK | O_NOFOLLOW)
+                .open(&target)
+                .ok()?;
+            return verify(&f).then_some(f);
+        }
+        Err(_) => return None,
+    };
+    if !verify(&pinned) {
+        return None;
     }
+    let f = std::fs::OpenOptions::new()
+        .append(true)
+        .custom_flags(O_NONBLOCK)
+        .open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
+        .ok()?;
+    verify(&f).then_some(f)
 }
 
 /// Linux 以外（macOS・Windows）は、実効 UID の取得・symlink / junction / reparse point の
@@ -563,6 +610,33 @@ mod tests {
         assert!(open_op_log(link.join("log").as_os_str()).is_none());
         assert!(!real.join("log").exists());
         assert!(open_op_log(real.join("log").as_os_str()).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-1: デバイスノードは O_PATH で固定して種別検査で拒否し、書き込み用に開かない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_open_op_log_rejects_device_node() {
+        assert!(open_op_log(std::ffi::OsStr::new("/dev/null")).is_none());
+    }
+
+    /// SEC-1: 親の `..` は検査済み fd のスタックで解決でき、ルートより上へ出る経路は拒否する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_open_trusted_parent_resolves_parent_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fc-cli-oplog-dd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let via_dotdot = real.join("..").join("real").join("log");
+        assert!(open_op_log(via_dotdot.as_os_str()).is_some());
+        assert!(real.join("log").is_file());
+        let euid = effective_uid().expect("euid");
+        let above_root = std::path::Path::new("/..");
+        assert!(open_trusted_parent(above_root, euid).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

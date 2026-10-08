@@ -118,8 +118,13 @@ pub(crate) mod vsock;
 mod linux {
     //! Linux の `getsockopt(SOL_SOCKET, SO_PEERCRED)` 用の FFI 宣言・定数。
 
+    // ucred 関連の定義は、使う側の `peer_uid`（x86_64 / aarch64 のみ実装。
+    // 他アーキテクチャは fail-closed）と同じ cfg に揃え、対応外アーキテクチャで
+    // 未使用の宣言として clippy を落とさない（#1538・REPAIR-7）。
+
     /// `linux/socket.h` の `struct ucred` と同じレイアウト（`#[repr(C)]` で
     /// 固定）。フィールド名・型は glibc/musl と一致させる。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[repr(C)]
     pub(super) struct Ucred {
         pub pid: i32,
@@ -128,6 +133,7 @@ mod linux {
     }
 
     /// `struct ucred` のバイト長（コンパイル時定数）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub(super) const UCRED_SIZE: usize = core::mem::size_of::<Ucred>();
 
     // UCRED_SIZE は u32 に収まらなければならない不変条件をコンパイル時に
@@ -136,12 +142,14 @@ mod linux {
     // フィールドが増えても `optlen` に渡す `u32` の範囲を超えないことを
     // 明示し、`peer_uid` 側で実行時に panic しうる
     // `u32::try_from(...).expect(...)` を使わずに済むようにする）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     const _: () = assert!(UCRED_SIZE <= u32::MAX as usize);
 
     /// `getsockopt` の `optlen` に渡す `struct ucred` のバイト長（`u32`）。
     /// 上記の `const assert` により `as u32` での切り捨ては発生しない
     /// （コンパイル時に不変条件を保証済みのキャストであり、実行時に
     /// panic する経路を持たない。H5・#820 security-auditor 指摘対応）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub(super) const UCRED_LEN: u32 = UCRED_SIZE as u32;
 
     // SOL_SOCKET・SO_PEERCRED の値は asm-generic の socket.h 由来で x86_64・

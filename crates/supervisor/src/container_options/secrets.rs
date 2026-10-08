@@ -17,7 +17,7 @@
 //!   ディレクトリ配下として扱う）。`mode=` は 8 進数字のみ（`0777` 以下）で、未指定は `0444`
 //! - 内容の出所は [`InjectedSource`]: ホスト上のファイル（`File`）か、呼び出し側が組み立てた内容（`Inline`）。
 //!   ホストファイルは通常ファイルのみ・上限 [`INJECTED_FILE_MAX_BYTES`]・FIFO でブロックしない
-//!   （`EnvFile::read` と同じ手順。REPAIR-5）。読み取りは [`ContainerOptions::injected_files`] の消費時点で行い、
+//!   （`EnvFile::read` と同じ手順。REPAIR-5）。読み取りは [`ContainerOptions::injected_files`](super::ContainerOptions::injected_files) の消費時点で行い、
 //!   指定モデルは出所のパスだけを保持する
 //!
 //! # 契約

@@ -8,7 +8,7 @@
 //! | issue | 内容 | 反映先 |
 //! | ----- | ---- | ------ |
 //! | #526（TASK-169.1） | ulimit（`--ulimit <name>=<soft>[:<hard>]`）。core の [`Rlimits`] へ変換して保持 | exec ステージの `prlimit(2)` |
-//! | #529（TASK-169.4） | env・env ファイル（[`env`]） | `execve` の envp |
+//! | #529（TASK-169.4） | env・env ファイル（[`env`](mod@env)） | `execve` の envp |
 //! | #527（TASK-169.2） | `--shm-size` / `--tmpfs`（[`mounts`]）。[`ContainerOptions::tmpfs_set`] で core の tmpfs 仕様型へ変換 | core の `exec::mount_tmpfs` |
 //! | #855（TASK-169.5.1） | label（`--label`。[`labels`]） | state.json の `annotations`（core の `StateRecord`） |
 //! | #856（TASK-169.5.2） | 全オプション同時指定の結合テスト（`tests/container_options.rs`）。`--ipc=host` と `--shm-size` の併用を拒否 | — |

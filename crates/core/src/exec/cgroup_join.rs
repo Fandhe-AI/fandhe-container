@@ -186,7 +186,7 @@ impl ExecCgroupName {
 ///
 /// [`ExecCgroupJoin::create_child_cgroup`] が `enter_namespaces` と制限の再適用の **前** に作る。
 /// [`spawn_exec_command`](super::spawn_exec_command) は参照で受け取り、fork した子が `execve` の前に自分をここへ移す。
-/// 停止は [`Self::kill`]（`cgroup.kill`。制限の再適用後も保持 fd への write で成立する）。**削除は行わない**:
+/// 停止は [`Self::kill_all`]（`cgroup.kill`。制限の再適用後も保持 fd への write で成立する）。**削除は行わない**:
 /// 再適用後の worker は Landlock で `rmdir` できないため、制限の掛かっていない呼び出しプロセスが
 /// [`remove_exec_child_cgroup`] で名前から行う。
 #[derive(Debug)]

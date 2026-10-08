@@ -8,7 +8,7 @@
 //! 未実装（実装済みを装わない。REPAIR-3）: 型つき本体と core の `ContainerRuntime` への接続（TASK-114）・
 //! 永続的な監査ログへの配線（core 側 TASK-114）・macOS Venus（GPU-6、TASK-172〜181）の大半。
 //! virtio-gpu デバイスモデル等は `src/gpu/` 配下に置く定義（crate-naming.md）。実装済みは
-//! venus wire のパース骨格のみ（[`gpu::venus`]。TASK-172.2・#723。コマンド引数のパース・ディスパッチは未実装）。
+//! venus wire のパース骨格のみ（[`gpu::venus`]。TASK-172.2・#723。コマンド引数のパース・ディスパッチは未実装）と capset 応答の最小実装（TASK-172.3・#724。配線なし）。
 //!
 //! 接続方向の現行契約: socket は core 側が bind し、plugin が接続する（`fandhe-container-plugin` の
 //! `lifecycle` 冒頭「契約」）。TASK-115.4（#388）で、plugin 側 bind は導入せず connect 側を維持すると

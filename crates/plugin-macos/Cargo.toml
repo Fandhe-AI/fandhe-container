@@ -2,6 +2,7 @@
 # crate-naming.md の表 #16）。macOS Venus（GPU-6）の virtio-gpu デバイスモデルもここに置く定義。
 # 雛形は TASK-1.3（#11・REPAIR-1・MS-0）。本体は G8（TASK-115）・G-別枠（TASK-172〜181）で実装する。
 # バイナリ名は `fandhe-container-plugin-macos`（発見対象。PLUG-4・PLUG-11）。TASK-115.1（#385）で `[[bin]]`/`main.rs` を追加した（起動引数と socket パス解決）。TASK-115.2（#386）で UDS フレーム送受信ループを追加した（依存の追加なし）。TASK-115.3（#387）で platform-macos・io（テストのみ）への workspace 内 path 依存を追加した（外部クレートの追加なし）。TASK-115.4（#388）で peer 認証の結合試験 tests/peer_auth.rs を追加した（依存の追加なし）。TASK-115.5（#389）で SIGTERM 受信用の sys.rs とヘルスチェック ping を追加した（依存の追加なし。signal(3) は自前の extern 宣言）。TASK-115.6（#390）で E2E 結合試験 tests/e2e.rs を追加した（依存の追加なし）。
+# TASK-172.3（#724）で venus capset 応答の最小実装（src/gpu/venus/capset.rs・tests/venus_capset.rs）を追加した（依存の追加なし）。
 # version は未指定（Cargo の既定で 0.0.0）。公開方針は未決定のため publish = false を明記する。
 # 依存の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 

@@ -935,29 +935,48 @@ fn pump(
     sp.summary
 }
 
-/// 取消し後の書き込みの結果（[`write_after_cancel`] の戻り値）。
+/// テスト用: `read` に入るたびに通知する Read ラッパー（#1416・SUP-1・TASK-157.7・REPAIR-5。`logs.rs` と
+/// `run.rs` のテストから呼ばれる）。
+///
+/// `pump` は read の前に取消しを確認し、取消し済みなら読まずに終了して読み端を閉じる。リーダースレッドが
+/// 最初の read に入る前にテストが取消すと、その後の書き込みは `BrokenPipe` になり「取消し後に届いたデータを
+/// 追記しない」検証が空振りする。この通知を待ってから取消せば、リーダーは read でブロックしたまま読み端を
+/// 保持するので、遅れた書き込みは必ず成功し、取消し後の経路を毎回通る。
 #[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AfterCancelWrite {
-    /// pipe に書き込めた（リーダーが read 前に取消しを見ていなければ読み端はまだ開いている）。
-    Written,
-    /// 読み端が既に閉じていて `BrokenPipe` になった。
-    BrokenPipe,
+pub(crate) struct NotifyingRead {
+    inner: Box<dyn Read + Send>,
+    entered: std::sync::mpsc::Sender<()>,
 }
 
-/// テスト用: 取消し後の pipe 書き込みの成否を、「捕捉されないこと」の検証から切り離して扱う補助関数
-/// （REPAIR-5・TASK-157.7・SUP-1・#1304。`logs.rs` と `run.rs` のテストから呼ばれる）。
-///
-/// `pump` は read の前に取消しを確認するため、リーダーが read に入る前に取消すと読み端が閉じ、
-/// その後の書き込みは `BrokenPipe` になる（SUT として正しい挙動）。`BrokenPipe` だけを許容し、
-/// それ以外のエラーは握りつぶさず panic させる。
 #[cfg(test)]
-pub(crate) fn write_after_cancel(w: &mut impl std::io::Write, bytes: &[u8]) -> AfterCancelWrite {
-    match w.write_all(bytes) {
-        Ok(()) => AfterCancelWrite::Written,
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => AfterCancelWrite::BrokenPipe,
-        Err(e) => panic!("unexpected write error after cancel: {e:?}"),
+impl Read for NotifyingRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // 受信側が既に落ちていても読み込み自体は続ける。
+        let _ = self.entered.send(());
+        self.inner.read(buf)
     }
+}
+
+/// `reader` を包み、read 進入の通知を受ける受信側と合わせて返す（[`NotifyingRead`]）。
+#[cfg(test)]
+pub(crate) fn notify_on_read(
+    reader: impl Read + Send + 'static,
+) -> (Box<dyn Read + Send>, std::sync::mpsc::Receiver<()>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    (
+        Box::new(NotifyingRead {
+            inner: Box::new(reader),
+            entered: tx,
+        }),
+        rx,
+    )
+}
+
+/// テスト用: read 進入の通知を最大 10 秒待つ（REPAIR-5。超過はハングさせず失敗にする）。
+#[cfg(test)]
+pub(crate) fn wait_read_entered(rx: &std::sync::mpsc::Receiver<()>) {
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("reader never entered read");
 }
 
 #[cfg(test)]
@@ -1032,23 +1051,21 @@ mod tests {
     fn sup1_task157_7_drain_overflowing_timeout_cancels_capture() {
         let budget = ReaderBudget::new(1).unwrap();
         let (reader, mut writer) = std::io::pipe().unwrap();
+        let (reader, entered_rx) = notify_on_read(reader);
         let sink = Arc::new(MemoryLogSink::default());
         let cap = LogCapture::start(
-            OutputStreams::new(&budget, Some(Box::new(reader)), None),
+            OutputStreams::new(&budget, Some(reader), None),
             sink.clone(),
         )
         .unwrap();
         assert_eq!(budget.live(), 1);
+        // read 進入前の取消しは読み端を閉じて BrokenPipe を招くので、進入を待ってから取消す（#1416）。
+        wait_read_entered(&entered_rx);
         let err = cap.drain(Duration::MAX).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
-        // リーダーが先に終了して読み側が閉じると BrokenPipe になる。BrokenPipe だけを許容し、他のエラーは失敗にする。
-        let outcome = write_after_cancel(&mut writer, b"late1\nlate2\n");
+        writer.write_all(b"late1\nlate2\n").unwrap();
         assert_eq!(wait_live(&budget, 0), 0);
-        assert_eq!(
-            sink.snapshot().unwrap(),
-            Vec::<CapturedLine>::new(),
-            "write outcome: {outcome:?}"
-        );
+        assert_eq!(sink.snapshot().unwrap(), Vec::<CapturedLine>::new());
         drop(writer);
     }
 
@@ -1057,9 +1074,10 @@ mod tests {
     fn sup1_task157_7_no_append_after_drain_timeout() {
         let budget = ReaderBudget::new(1).unwrap();
         let (reader, mut writer) = std::io::pipe().unwrap();
+        let (reader, entered_rx) = notify_on_read(reader);
         let sink = Arc::new(MemoryLogSink::default());
         let cap = LogCapture::start(
-            OutputStreams::new(&budget, Some(Box::new(reader)), None),
+            OutputStreams::new(&budget, Some(reader), None),
             sink.clone(),
         )
         .unwrap();
@@ -1068,6 +1086,10 @@ mod tests {
         while sink.snapshot().unwrap().is_empty() && start.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(5));
         }
+        // 1 回目の read は "before" を返した read。2 回目の進入でリーダーが次の read でブロックし、読み端を
+        // 保持し続けることが確定する（#1416）。
+        wait_read_entered(&entered_rx);
+        wait_read_entered(&entered_rx);
         // EOF は timeout（200ms）いっぱいまで待つ（手前で打ち切らない）。
         let drain_started = Instant::now();
         let err = cap.drain(Duration::from_millis(200)).unwrap_err();
@@ -1078,13 +1100,12 @@ mod tests {
             err.message(),
             "timed out waiting for log streams to reach EOF"
         );
-        // 取消し後の書き込み。リーダーが既に終了していれば BrokenPipe（許容）。他のエラーは失敗にする。
-        let outcome = write_after_cancel(&mut writer, b"after1\nafter2\n");
+        // 取消し後の書き込み。リーダーは read でブロック中で読み端が開いているので必ず成功する。
+        writer.write_all(b"after1\nafter2\n").unwrap();
         assert_eq!(wait_live(&budget, 0), 0);
         assert_eq!(
             sink.snapshot().unwrap(),
             vec![line(StreamKind::Stdout, b"before")],
-            "write outcome: {outcome:?}"
         );
         drop(writer);
     }
@@ -1192,9 +1213,10 @@ mod tests {
     fn sup1_task157_7_cancel_stops_capture_without_eof() {
         let budget = ReaderBudget::new(1).unwrap();
         let (reader, mut writer) = std::io::pipe().unwrap();
+        let (reader, entered_rx) = notify_on_read(reader);
         let sink = Arc::new(MemoryLogSink::default());
         let cap = LogCapture::start(
-            OutputStreams::new(&budget, Some(Box::new(reader)), None),
+            OutputStreams::new(&budget, Some(reader), None),
             sink.clone(),
         )
         .unwrap();
@@ -1202,15 +1224,12 @@ mod tests {
             format!("{cap:?}"),
             "LogCapture { streams: 1, cancelled: false }"
         );
+        // read 進入前の取消しは読み端を閉じて BrokenPipe を招くので、進入を待ってから取消す（#1416）。
+        wait_read_entered(&entered_rx);
         assert_eq!(cap.cancel(), Ok(()));
-        // リーダーが取消しを見て先に終了していると BrokenPipe になる（BrokenPipe だけを許容し、どちらでも追記されないことを確認する）。
-        let outcome = write_after_cancel(&mut writer, b"late\n");
+        writer.write_all(b"late\n").unwrap();
         assert_eq!(wait_live(&budget, 0), 0);
-        assert_eq!(
-            sink.snapshot().unwrap(),
-            Vec::<CapturedLine>::new(),
-            "write outcome: {outcome:?}"
-        );
+        assert_eq!(sink.snapshot().unwrap(), Vec::<CapturedLine>::new());
         drop(writer);
     }
 
@@ -1731,12 +1750,15 @@ mod tests {
         assert_eq!(MAX_DRAIN_TIMEOUT, Duration::from_secs(60));
         let budget = ReaderBudget::new(1).unwrap();
         let (reader, mut writer) = std::io::pipe().unwrap();
+        let (reader, entered_rx) = notify_on_read(reader);
         let sink = Arc::new(MemoryLogSink::default());
         let cap = LogCapture::start(
-            OutputStreams::new(&budget, Some(Box::new(reader)), None),
+            OutputStreams::new(&budget, Some(reader), None),
             sink.clone(),
         )
         .unwrap();
+        // read 進入前の取消しは読み端を閉じて BrokenPipe を招くので、進入を待ってから取消す（#1416）。
+        wait_read_entered(&entered_rx);
         let start = Instant::now();
         let err = cap
             .drain(MAX_DRAIN_TIMEOUT + Duration::from_nanos(1))
@@ -1744,14 +1766,9 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5));
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(err.message(), "drain timeout is too large");
-        // リーダーが先に終了して読み側が閉じると BrokenPipe になる。BrokenPipe だけを許容し、他のエラーは失敗にする。
-        let outcome = write_after_cancel(&mut writer, b"late\n");
+        writer.write_all(b"late\n").unwrap();
         assert_eq!(wait_live(&budget, 0), 0);
-        assert_eq!(
-            sink.snapshot().unwrap(),
-            Vec::<CapturedLine>::new(),
-            "write outcome: {outcome:?}"
-        );
+        assert_eq!(sink.snapshot().unwrap(), Vec::<CapturedLine>::new());
         drop(writer);
     }
 
@@ -1818,19 +1835,18 @@ mod tests {
     fn sup1_task157_7_cancelled_reader_exits_without_appending() {
         let budget = ReaderBudget::new(4).unwrap();
         let (reader, mut writer) = std::io::pipe().unwrap();
+        let (reader, entered_rx) = notify_on_read(reader);
         let sink = Arc::new(MemoryLogSink::default());
-        let mut streams = OutputStreams::new(&budget, Some(Box::new(reader)), None);
+        let mut streams = OutputStreams::new(&budget, Some(reader), None);
         let cap = LogCapture::start_from(&mut streams, sink.clone()).unwrap();
         assert_eq!(budget.live(), 1);
+        // read 進入前の期限切れは読み端を閉じて BrokenPipe を招くので、進入を待ってから drain する（#1416）。
+        wait_read_entered(&entered_rx);
         let err = cap.drain(Duration::from_millis(50)).unwrap_err();
         assert_eq!(err.code(), ErrorCode::Timeout);
-        // 開始から 50ms 以内にリーダーが read に入れないと読み端が閉じて BrokenPipe になる（許容）。
-        let outcome = write_after_cancel(&mut writer, b"late\n");
+        writer.write_all(b"late\n").unwrap();
         assert_eq!(wait_live(&budget, 0), 0);
-        assert!(
-            sink.snapshot().unwrap().is_empty(),
-            "write outcome: {outcome:?}"
-        );
+        assert!(sink.snapshot().unwrap().is_empty());
         drop(writer);
     }
 

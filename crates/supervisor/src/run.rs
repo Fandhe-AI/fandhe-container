@@ -1549,7 +1549,8 @@ mod tests {
         let store = running_store(0);
         let mut s = attach(&store);
         let (reader, mut writer) = std::io::pipe().unwrap();
-        let mut streams = OutputStreams::new(&budget, Some(Box::new(reader)), None);
+        let (reader, entered_rx) = crate::logs::notify_on_read(reader);
+        let mut streams = OutputStreams::new(&budget, Some(reader), None);
         let sink = Arc::new(crate::logs::MemoryLogSink::default());
         let mut e = monitor_with_capture(
             &mut s,
@@ -1574,18 +1575,16 @@ mod tests {
 
         let live = e.take_live_capture().unwrap();
         assert!(e.take_live_capture().is_none());
+        // read 進入前の取消しは読み端を閉じて BrokenPipe を招くので、進入を待ってから取消す（#1416）。
+        crate::logs::wait_read_entered(&entered_rx);
         assert_eq!(live.cancel(), Ok(()));
-        // リーダーが取消しを見て先に終了していると BrokenPipe になる（BrokenPipe だけを許容し、どちらでも追記されないことを確認する）。
-        let outcome = crate::logs::write_after_cancel(&mut writer, b"late\n");
+        std::io::Write::write_all(&mut writer, b"late\n").unwrap();
         let start = Instant::now();
         while budget.live() != 0 && start.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(budget.live(), 0);
-        assert!(
-            sink.snapshot().unwrap().is_empty(),
-            "write outcome: {outcome:?}"
-        );
+        assert!(sink.snapshot().unwrap().is_empty());
         drop(writer);
     }
 

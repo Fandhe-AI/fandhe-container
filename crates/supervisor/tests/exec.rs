@@ -638,7 +638,10 @@ mod linux {
         // `setns` の後は自プロセスを `/proc/thread-self` で解決できないため、参加前に status を開いておく。
         let mut own_status = fs::File::open("/proc/thread-self/status").expect("open own status");
         let a = identify_pid1(record_a).expect("identify A");
-        let restrictions_for_a = prepare_restrictions(&a).expect("prepare restrictions for A");
+        // 試験専用の証跡: この joiner は使い捨ての再入プロセスなので、補助グループが消えてもよい（#1532）。
+        let proof = fandhe_container_core::exec::ExecWorkerProof::assume_for_test();
+        let restrictions_for_a =
+            prepare_restrictions(&proof, &a).expect("prepare restrictions for A");
         let b = identify_pid1(&record_b).expect("identify B");
         let cgroup_b = prepare_cgroup_join(&b).expect("prepare cgroup join for B");
         enter_namespaces(&b).expect("join B");

@@ -35,7 +35,8 @@
 //!   拒否するため）。**準備したプロセス自身** が単一スレッドで呼ぶ（fork した子から呼ぶと別プロセスの
 //!   スレッド数を読むため、core が準備時の pid との不一致を拒否する）。適用は不可逆で、失敗時は制限が
 //!   部分的に載った不定状態のため、呼び出し側は続行せず終了する。「適用 → fork → execve」の順にする
-//!   （制限は fork / execve を越えて継承される）。順序の全体:
+//!   （制限は fork / execve を越えて継承される）。準備は不可逆な補助グループ消去を含むため、core の
+//!   `spawn_exec_worker` の worker の中でしか得られない証跡 `ExecWorkerProof` を要求する（常駐側から呼べない。#1532）。順序の全体:
 //!   `identify_pid1` → `prepare_cgroup_join` → 子 cgroup の作成 → `prepare_restrictions` → `enter_namespaces` → `join_cgroup` →
 //!   `reapply_restrictions` → `require_exec_ready` → `spawn_exec_command`
 //! - 再適用は、参加後の自プロセスの `/` が **記録したコンテナの rootfs**（[`identify_pid1`] に渡した記録の
@@ -57,7 +58,8 @@
 //!   起動したプロセス（CLI・supervisor）の環境は 1 つも渡らず、既定値の補完もしない（入口が `std::env::vars()` を
 //!   渡す形は型で書けない。core の `exec/container_env.rs`）。補助グループは launch と同じく空にする（core の
 //!   capability 削減が `setgroups(0)` を呼ぶ。exec を起動したプロセスのホスト側の補助グループを持ち越さない）。
-//!   **消去は namespace へ参加する前にも行う**（[`prepare_restrictions`]・[`run_command`] の準備の最後。不可逆）:
+//!   **消去は namespace へ参加する前にも行う**（[`prepare_restrictions`]・[`run_command`] の準備の最後。不可逆。
+//!   worker の証跡 `ExecWorkerProof` がなければ呼べない。#1532）:
 //!   対象の user namespace へ入った後は `setgroups` が `deny` で消せなくなり、exec を起動したプロセス（root・
 //!   `sudo` 経由・別のグループ集合のセッション）のグループをコンテナへ持ち込むため。消去できず `deny` も確認
 //!   できなければ、参加せずに拒否する。起動者自身が既に `setgroups` を禁じた user namespace の中にいる場合
@@ -193,8 +195,8 @@ use fandhe_container_core::exec::{
     ChildExit, ContainerEnv, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV, ENTRYPOINT_MAX_STRING_BYTES,
     ENTRYPOINT_MAX_TOTAL_BYTES, ExecCgroupJoin, ExecCgroupJoinReport, ExecCgroupName,
     ExecChildCgroup, ExecCommand, ExecError, ExecExit, ExecReady, ExecRestrictionReport,
-    ExecRestrictions, NamespaceJoinReport, Pid1Target, SupplementaryGroups, ViolationReason,
-    join_cgroup as core_join_cgroup, join_namespaces,
+    ExecRestrictions, ExecWorkerProof, NamespaceJoinReport, Pid1Target, SupplementaryGroups,
+    ViolationReason, join_cgroup as core_join_cgroup, join_namespaces,
     prepare_cgroup_join as core_prepare_cgroup_join,
     prepare_exec_restrictions as core_prepare_exec_restrictions,
     reapply_restrictions as core_reapply_restrictions, record_exec_target_rejection,
@@ -348,9 +350,16 @@ pub fn join_cgroup(join: ExecCgroupJoin) -> Result<ExecCgroupJoinReport, TraitEr
 /// `config.json` と rootfs は、`target` を特定した記録の bundle から取る（呼び出し側は記録を渡し直さない）。
 /// rootfs は start と同じ検査（bundle 配下・symlink なし）で固定し、参加後の `/` と照合する基準にする。
 /// Landlock 未対応カーネル・ルール生成失敗・rootfs を固定できない場合は拒否する（fail-closed。CORE-5・SEC-1）。
-pub fn prepare_restrictions(target: &ExecTarget) -> Result<ExecRestrictions, TraitError> {
+///
+/// `worker` は core の `spawn_exec_worker` の worker の中でしか得られない証跡（[`ExecWorkerProof`]）。準備の最後に
+/// 呼び出しプロセスの補助グループを不可逆に消すため、常駐側（supervisor 本体・CLI）から呼べないよう型で絞る
+/// （#1532）。本番の `run_command` 系は worker の中で同じ core の関数を直接呼ぶ。
+pub fn prepare_restrictions(
+    worker: &ExecWorkerProof,
+    target: &ExecTarget,
+) -> Result<ExecRestrictions, TraitError> {
     let (config, rootfs) = load_exec_bundle(&target.bundle)?;
-    core_prepare_exec_restrictions(&target.pid1, &config, &rootfs).map_err(from_exec_error)
+    core_prepare_exec_restrictions(worker, &target.pid1, &config, &rootfs).map_err(from_exec_error)
 }
 
 /// 稼働中コンテナの中で実行するコマンドの要求（コンテナ内の絶対パス・argv・明示の環境変数。
@@ -571,9 +580,9 @@ pub fn run_command(
         deadline,
         || create_child_cgroup(record, &name),
         || cleanup_child_cgroup(record, &name),
-        |child| {
+        |proof, child| {
             let target = identify_pid1(record)?;
-            run_with_target(&target, request, deadline, child)
+            run_with_target(proof, &target, request, deadline, child)
         },
     );
     audit_worker_result(result, audit)
@@ -614,9 +623,9 @@ pub fn run_command_with_pidfd(
         deadline,
         || create_child_cgroup(record, &name),
         || cleanup_child_cgroup(record, &name),
-        |child| {
+        |proof, child| {
             let target = identify_pid1_with_pidfd(record, pidfd)?;
-            run_with_target(&target, request, deadline, child)
+            run_with_target(proof, &target, request, deadline, child)
         },
     );
     audit_worker_result(result, audit)
@@ -652,9 +661,9 @@ pub fn run_command_in(
             .map(|_| ())
             .map_err(from_exec_error)
         },
-        |child| {
+        |proof, child| {
             let target = identify_pid1_in(record, expected_cgroup_path)?;
-            run_with_target(&target, request, deadline, child)
+            run_with_target(proof, &target, request, deadline, child)
         },
     );
     audit_worker_result(result, audit)
@@ -699,7 +708,7 @@ fn run_in_worker_with(
     deadline: Deadline,
     grace: Duration,
     cleanup: impl FnOnce() -> Result<(), TraitError>,
-    work: impl FnOnce() -> Result<ExecOutcome, TraitError>,
+    work: impl FnOnce(&ExecWorkerProof) -> Result<ExecOutcome, TraitError>,
 ) -> Result<ExecOutcome, WorkerFailure> {
     // fork 前に期限を確かめる（切れていれば worker を作らない。fork 後の早期 return で worker を残さないため）。
     deadline.remaining("starting the exec worker")?;
@@ -709,8 +718,8 @@ fn run_in_worker_with(
             format!("exec stage Spawn: pipe failed: {}", e.kind()),
         )
     })?;
-    let child = spawn_exec_worker(|| {
-        let line = encode_worker_result(&work());
+    let child = spawn_exec_worker(|proof| {
+        let line = encode_worker_result(&work(&proof));
         // 書けなければ親は「結果なし」として失敗扱いにする（fail-closed）。
         let _ = (&writer).write_all(&line);
         0
@@ -799,7 +808,7 @@ fn run_owning_child_cgroup(
     deadline: Deadline,
     create: impl FnOnce() -> Result<Option<ExecChildCgroup>, TraitError>,
     remove: impl Fn() -> Result<(), TraitError>,
-    work: impl FnOnce(Option<&ExecChildCgroup>) -> Result<ExecOutcome, TraitError>,
+    work: impl FnOnce(&ExecWorkerProof, Option<&ExecChildCgroup>) -> Result<ExecOutcome, TraitError>,
 ) -> Result<ExecOutcome, WorkerFailure> {
     let child = create()?;
     let owned = child.is_some();
@@ -811,7 +820,7 @@ fn run_owning_child_cgroup(
             cleanup_ran.set(true);
             if owned { remove() } else { Ok(()) }
         },
-        || work(child.as_ref()),
+        |proof| work(proof, child.as_ref()),
     );
     let mut result = result;
     if owned && !cleanup_ran.get() {
@@ -886,7 +895,7 @@ pub fn run_in_worker_for_test(
     cleanup: impl FnOnce() -> Result<(), TraitError>,
     work: impl FnOnce() -> Result<ExecOutcome, TraitError>,
 ) -> Result<ExecOutcome, TraitError> {
-    run_in_worker_with(Deadline::after(timeout), grace, cleanup, work).map_err(|f| f.error)
+    run_in_worker_with(Deadline::after(timeout), grace, cleanup, |_| work()).map_err(|f| f.error)
 }
 
 /// worker の結果を pipe 用の 1 行へ符号化する。成功は `ok <command|setup> <違反の理由コードまたは -> <exited|signaled>
@@ -1057,6 +1066,7 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
 
 /// 特定済みの対象に対して、参加 → 制限の再適用 → 実行 → 待機を順に行う（[`run_command`] の本体）。
 fn run_with_target(
+    proof: &ExecWorkerProof,
     target: &ExecTarget,
     request: &ExecRequest,
     deadline: Deadline,
@@ -1071,7 +1081,7 @@ fn run_with_target(
         )
     })?;
     let cgroup = prepare_cgroup_join(target)?;
-    let result = run_in_child_cgroup(target, request, deadline, cgroup, child_cgroup);
+    let result = run_in_child_cgroup(proof, target, request, deadline, cgroup, child_cgroup);
     // 成否によらず、コマンドの子孫を子 cgroup ごと止める（exec の終了後に子孫を残さない。削除は呼び出しプロセスが行う）。
     // 失敗しても呼び出しプロセスの後始末が改めて `cgroup.kill` する。
     let _ = child_cgroup.kill_all();
@@ -1080,6 +1090,7 @@ fn run_with_target(
 
 /// [`run_with_target`] の本体: 準備 → 参加 → 再適用 → コマンドの起動と待機。
 fn run_in_child_cgroup(
+    proof: &ExecWorkerProof,
     target: &ExecTarget,
     request: &ExecRequest,
     deadline: Deadline,
@@ -1090,8 +1101,8 @@ fn run_in_child_cgroup(
     let (config, rootfs) = load_exec_bundle(&target.bundle)?;
     // コマンドの環境はコンテナ定義（`process.env`）が基底で、呼び出しプロセスの環境は使わない（#1457）。
     let command = request.command(&ContainerEnv::from_config(&config).map_err(from_exec_error)?)?;
-    let restrictions =
-        core_prepare_exec_restrictions(&target.pid1, &config, &rootfs).map_err(from_exec_error)?;
+    let restrictions = core_prepare_exec_restrictions(proof, &target.pid1, &config, &rootfs)
+        .map_err(from_exec_error)?;
     deadline.remaining("joining namespaces")?;
     enter_namespaces(target)?;
     deadline.remaining("joining the cgroup")?;
@@ -1300,7 +1311,7 @@ mod tests {
     /// （`exec_restrictions_reapply`）と `tests/exec.rs` が担い、ここでは配線の型だけを機械照合する。
     #[test]
     fn sup6_task163_3_restrictions_entry_points_have_expected_shape() {
-        let _prepare: fn(&ExecTarget) -> Result<ExecRestrictions, TraitError> =
+        let _prepare: fn(&ExecWorkerProof, &ExecTarget) -> Result<ExecRestrictions, TraitError> =
             prepare_restrictions;
         let _reapply: fn(ExecRestrictions) -> Result<ExecRestrictionReport, TraitError> =
             reapply_restrictions;
@@ -1657,7 +1668,7 @@ mod tests {
             Deadline::after(Duration::ZERO),
             Duration::from_secs(1),
             || panic!("cleanup must not run when no worker was forked"),
-            || panic!("work must not run when the deadline has expired"),
+            |_| panic!("work must not run when the deadline has expired"),
         )
         .unwrap_err()
         .error;
@@ -1676,7 +1687,7 @@ mod tests {
             Deadline::after(Duration::from_secs(5)),
             || Err(TraitError::new(ErrorCode::AlreadyExists, "exists")),
             || panic!("cleanup must not run for a cgroup we did not create"),
-            |_| panic!("worker must not run"),
+            |_, _| panic!("worker must not run"),
         )
         .unwrap_err();
         assert_eq!(err.error.code(), ErrorCode::AlreadyExists);

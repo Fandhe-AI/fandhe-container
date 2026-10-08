@@ -54,6 +54,7 @@ expect_case venus-missing 1 "venus_init=missing" --dmesg-file "$fx/ok.log" --vul
 expect_case no-host-visible 1 "host_visible=disabled
 host_memory_window=missing" --dmesg-file "$fx/no-host-visible.log"
 expect_case scanout-present 1 "kms=scanouts_present" --dmesg-file "$fx/scanout-present.log"
+expect_case kms-disabled-with-scanout 1 "kms=scanouts_present" --dmesg-file "$fx/kms-disabled-with-scanout.log"
 expect_case capset-size-zero 1 "capset_info=venus
 capset_max_size=0" --dmesg-file "$fx/capset-size-zero.log"
 expect_case capset-timeout 1 "capset_info=timeout" --dmesg-file "$fx/capset-timeout.log"

@@ -57,12 +57,17 @@ load_limited() { # $1=src $2=dest
     echo "error: input file not readable" >&2
     exit 2
   fi
-  size="$(wc -c <"$src")"
+  # 検査と取り込みの間に入力が増えても上限を超えないよう、最大 MAX_INPUT_BYTES+1 バイトだけ
+  # 取り込み、取り込んだ実サイズで超過を判定する（TOCTOU 回避）。
+  head -c "$((MAX_INPUT_BYTES + 1))" -- "$src" >"$dest" || {
+    echo "error: failed to read input" >&2
+    exit 2
+  }
+  size="$(wc -c <"$dest")"
   if [ "$size" -gt "$MAX_INPUT_BYTES" ]; then
     echo "error: input exceeds size limit" >&2
     exit 2
   fi
-  cat -- "$src" >"$dest"
 }
 
 if [ -n "$dmesg_file" ]; then
@@ -143,11 +148,12 @@ feature edid -
 if grep -qE 'num_scanouts is zero' "$tmp"; then
   echo "kms=probe_failed_zero_scanouts"
   fail
-elif grep -qE 'KMS disabled|number of scanouts: 0$' "$tmp"; then
-  echo "kms=disabled"
-elif grep -qE 'number of scanouts: [0-9]+' "$tmp"; then
+elif grep -qE 'number of scanouts: [1-9][0-9]*' "$tmp"; then
+  # 非ゼロ scanout の記録は KMS disabled 等と併存しても矛盾として先に拒否する。
   echo "kms=scanouts_present"
   fail
+elif grep -qE 'KMS disabled|number of scanouts: 0$' "$tmp"; then
+  echo "kms=disabled"
 else
   echo "kms=unknown"
   fail

@@ -616,6 +616,12 @@ fio-bench-selftest: ## fio ベンチスクリプトの自己テスト（REPAIR-1
 	fi
 	bash scripts/fio-randwrite-4k-selftest.sh
 
+# virtio-gpu ゲスト側確認スクリプトの自己テスト（TASK-172.6・GPU-6・REPAIR-12）。
+# 合成 fixture のみで完結し、macOS 27・ゲスト VM は不要。make ci・CI には組み込まない。
+.PHONY: vz-virtio-gpu-guest-check-selftest
+vz-virtio-gpu-guest-check-selftest: ## virtio-gpu ゲスト側確認スクリプトの自己テスト（TASK-172.6・GPU-6・REPAIR-12。fixture のみ）
+	bash poc/vz-custom-virtio-gpu/guest/check-virtio-gpu-selftest.sh
+
 # 実機での run モード実行（fio・GNU coreutils の timeout が必要。root 権限・
 # /dev/kvm は不要）。TARGET_DIR 未指定時は案内を出して止める。
 # make 変数はレシピのシェルへ文字列として展開されるため、二重引用符で囲むだけでは

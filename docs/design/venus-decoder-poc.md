@@ -1,11 +1,11 @@
 # Venus デコーダ最小サブセット PoC（設計ドラフト）
 
-macOS の virtio-gpu Venus 自前実装（ヘッドレス Vulkan compute のみ）で、最小 venus デコーダが扱う Vulkan コマンドの候補を記録する（GPU-6）。TASK-172 全体の PoC 文書で、本版は候補抽出（TASK-172.1）・wire パース骨格（TASK-172.2）・記録と再生ハーネス（TASK-172.5）・capset 応答（TASK-172.3）・試験治具 VMM の選定と capset アダプタ（TASK-172.4）の章を埋める。
+macOS の virtio-gpu Venus 自前実装（ヘッドレス Vulkan compute のみ）で、最小 venus デコーダが扱う Vulkan コマンドの候補を記録する（GPU-6）。TASK-172 全体の PoC 文書で、本版は候補抽出（TASK-172.1）・wire パース骨格（TASK-172.2）・記録と再生ハーネス（TASK-172.5）・capset 応答（TASK-172.3）・試験治具 VMM の選定と capset アダプタ（TASK-172.4）・VZCustomVirtioDevice 登録可否確認ハーネス（TASK-172.6）の章を埋める。
 
 > **位置づけ**: 本書はドラフトであり、候補を列挙するだけで対象サブセットを確定しない。最終確定は #726（TASK-172.h2。人間担当）で行う。優先度（必須・推奨・保留）は抽出時点の見立てで、確定扱いにしない。
 
 - 対象ビヘイビア: GPU-6（関連: MAC-5・MVM-4）
-- タスク: TASK-172（MS-13・G-別枠）。本版は TASK-172.1（#722。親 #721）・TASK-172.2（#723）・TASK-172.3（#724）・TASK-172.4（#888）。前提 TASK-7（#25。完了済み）
+- タスク: TASK-172（MS-13・G-別枠）。本版は TASK-172.1（#722。親 #721）・TASK-172.2（#723）・TASK-172.3（#724）・TASK-172.4（#888）・TASK-172.6（#1056）。前提 TASK-7（#25。完了済み）
 - 後続・関連: #723（wire パース骨格）・#724（capset 応答。実装済み）・#889（コマンドストリーム記録）・#888（試験治具。アダプタまで実装済み・トランスポート未実装）・#725（1〜3 段目の結果）・#726（確定）・#776 / #777（対象範囲判断・工数再確定）・#781（サブセットのフィルタ機構）。ディスパッチ・ハンドラ群は TASK-177.x（#765・#769・#771・#773・#774）
 - 出典（spec）: GPU-6・TASK-172・D-15・PoC-14（submodule リビジョン `984f8a2`）。作業環境で `docs/spec` を取得できなかったため、spec 本文は参照せず ID のみで辿れるようにしている
 - 出典（外部。確認日 2026-10-08）:
@@ -216,12 +216,33 @@ GPU-6 の決定（ヘッドレス compute のみ・2D スキャンアウト非�
   - `use_guest_vram` は VMM の共有メモリ方式に依存し、3 段目（#1057）の判定まで未決
   - flag 3 件を 1 にするのは対応機能（blob id 0・待機系コマンド・複数タイムライン。TASK-176・177）を後続が実装する前提の宣言で、現時点では未実装（REPAIR-3）
 
-## 9. 以降の章（未着手。10 章は #888 の範囲）
+## 9. VZCustomVirtioDevice 登録可否確認ハーネス（TASK-172.6・#1056）
 
-| 章 | 内容 | 担当 issue |
-| -- | ---- | ---------- |
-| 1〜3 段目の結果 | 段階的な再検証の結果 | #725 |
-| 最終確定 | 対象サブセットの確定 | #726（TASK-172.h2。人間担当） |
+macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なしの最小 virtio-gpu を TASK-64（#350。完了済み）の最小 VM に登録できるかの確認ハーネス（GPU-6・MAC-5）。配置は `poc/vz-custom-virtio-gpu/`（製品 crate 外・workspace 外）。判定は #1057（TASK-172.h5。人間担当）。
+
+- 実装したもの: ゲスト側確認スクリプト `poc/vz-custom-virtio-gpu/guest/check-virtio-gpu.sh`（dmesg の virtio_gpu 行から probe・feature・KMS・capset・host memory window を判定）、自己テスト（合成 fixture。`make vz-virtio-gpu-guest-check-selftest`）、README（デバイス契約・実機手順）
+- **ホスト側のデバイス登録コードは未実装（REPAIR-3）**。計画フェーズの調査（確認日 2026-10-08）で、受け入れ条件の「新規依存・`unsafe` が要る場合は止めて承認事項として報告」に当たったため
+- 調査結果:
+  - 採用済み `objc2-virtualization =0.3.2`（承認 #356）は `VZCustomVirtioDevice`・`VZVirtioQueue`・`VZVirtioSharedMemoryRegion*` を含まない。crates.io の最新も 0.3.2（2025-10-04）で、macOS 27 対応版は未リリース
+  - upstream `madsmtm/objc2` main のコミット `b735fb4d6b9c`（2026-09-24「Update to Xcode 27.0 beta 1」）には対応 feature がある（生成コードは `madsmtm/objc2-generated`）。Xcode 27 beta 1 基準で、正式版で変わりうる
+  - 生成バインディング上は `VZCustomVirtioDeviceConfiguration` に `deviceID`・`virtioQueueCount`・`mandatoryFeatures` / `optionalFeatures`・`deviceSpecificConfiguration`・`sharedMemoryRegions` があり、`VZVirtioSharedMemoryRegionConfiguration` は `initWithRegionID:size:`。API 上は共有メモリ領域を提示できる見込みだが実機では未確認
+  - `deny.toml` の `[sources]` は `unknown-git = "deny"` で、git 依存は現設定では入れられない
+  - ゲスト Linux driver は mainline で `num_scanouts == 0` を `KMS disabled` として受理する。古いカーネルは `num_scanouts is zero` で probe が失敗しうる（受理される版数は未確認）
+- 承認事項（ユーザー承認が必要。Agent は実行していない）:
+  - A. バインディングの入手経路。A1（推奨）: macOS 27 対応の `objc2-virtualization` の crates.io リリースを待ち `=x.y.z` で更新（`objc2`・`objc2-foundation`・`block2`・`dispatch2` の連鎖更新も判断）。A2: 上記コミットを git 依存で固定（`deny.toml` の変更が要りサプライチェーン上非推奨）。A3: 自前 `extern_class!` / `define_class!`（`unsafe` の新規追加。セレクタ・型を macOS 27 SDK と照合する必要がある）
+  - B. ホスト側ハーネスの配置（ルート `Cargo.toml` の `members` 追加・`exclude`・入れ子 workspace のいずれか。7 章の「配置の逸脱」と同じ論点）
+  - C. `unsafe` の扱い（delegate 実装と `unsafe fn` バインディング呼び出し。事前承認の範囲は `sys` モジュールで、PoC crate が対象かは不明確なため個別承認）
+  - D. 実行環境（macOS 27＋Xcode 27 SDK の Apple Silicon 実機。CI に macOS 27 ランナーは無く、ホスト側コードは CI でビルド検証できない見込み）
+- 受け入れ条件の状態:
+
+| 条件 | 状態 |
+| ---- | ---- |
+| 1. VENUS capset のみ・scanout なしの virtio-gpu をゲストが probe する | 実機前提で未確認（#1057）。ゲスト側確認スクリプトは用意済み |
+| 2. host visible 共有メモリ領域を提示できる | API 上は提示できる見込み。ゲストで host visible が有効になるかは未確認（#1057） |
+| 3. 新規依存・`unsafe` が要る場合は止めて報告 | ゲートに当たり停止。上記の承認事項 A〜D として報告済み |
+
+- 先送り: ホスト側の登録ハーネス本体（承認事項の決定後に別 issue）、selftest の CI 組み込み（`.claude/rules/ci.md` の更新を伴うため別途承認）、`num_scanouts=0` が古いカーネルで通らない場合の受け入れ条件見直し（#1057 へ申し送り）
+- セキュリティ: host visible 共有メモリと virtqueue 経由の ctrl コマンドはゲストからの untrusted 入力。ホスト側実装時は security-auditor を必須とし、境界検査・サイズ上限・fail-closed（#723 の方針）を適用する
 
 ## 10. 試験治具 VMM と外部バックエンド接続（TASK-172.4・#888）
 
@@ -263,3 +284,11 @@ GPU-6 の決定（ヘッドレス compute のみ・2D スキャンアウト非�
 | 広告 feature | VIRGL（bit 0）・RESOURCE_BLOB（3）・CONTEXT_INIT（4）・VERSION_1（32）。`num_capsets` = 1、`num_scanouts` = 0（カーネルが 0 を受け付けるかは未確認。F1 の実機で確認） |
 
 ログ形式（数値と固定語彙のみ。ゲストのバイト列はエコーしない）: `venus_jig event=capset_query cmd=GET_CAPSET capset_id=4 version=0 result=ok max_size=160`。要求長はヘッダ 24 + 本体 8 バイトちょうどのみ受理する（PoC）。
+
+## 11. 以降の章（未着手。10 章は #888 の範囲）
+
+| 章 | 内容 | 担当 issue |
+| -- | ---- | ---------- |
+| 1〜3 段目の結果 | 段階的な再検証の結果 | #725 |
+| 3 段目の実機判定 | VZCustomVirtioDevice 登録の実機結果と VMM 方式の判定 | #1057（TASK-172.h5。人間担当） |
+| 最終確定 | 対象サブセットの確定 | #726（TASK-172.h2。人間担当） |

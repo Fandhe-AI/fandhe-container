@@ -1,0 +1,4 @@
+GPU0:
+  deviceName = llvmpipe (synthetic)
+  driverName = llvmpipe
+venus initialization failed

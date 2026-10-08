@@ -26,7 +26,35 @@ make ci          # 上記 + lint-docs + deny を一括実行
 
 macOS cold start 上乗せ確認（TASK-113.4・PLUG-6・MAC-2）は `benches/tests/macos_cold_start.rs` の結合試験（`cfg(target_os = "macos")`。他 OS は skip を明示）として 3 OS matrix の macos で実行する。`bench-regression`（ubuntu 単独）のジョブ構成は変えず、基準値比較にも接続しない（模擬制御コアの計測で、実バックエンドは TASK-115）。
 
-`bench-regression` ジョブは `make bench-check-selftest`（比較スクリプトの自己テスト）→ `make bench-baseline-selftest`（baseline.json 生成スクリプト `scripts/bench/generate_baseline.sh` の自己テスト。TASK-88.1）→ `make idle-memory-selftest`（アイドル時常駐メモリ計測スクリプト `scripts/bench/idle_memory.sh` の自己テスト。疑似 /proc のみで照合し実計測はしない。TASK-45.1・CORE-7・SUP-1）→ `make idle-memory-supervised-selftest` → `make supervisor-pss-selftest`（監視プロセス常駐メモリ計測スクリプト `scripts/bench/supervisor_pss.sh` の自己テスト。疑似 /proc のみ。TASK-158・SUP-2）→ `make restart-latency-selftest`（restart レイテンシ計測スクリプト `scripts/measure-restart-latency.sh` の自己テスト。スタブ launcher のみ。TASK-160・SUP-3）→ `make bench-check`（ベンチ実行・基準値比較）→ `make plugin-feature-size`（core の plugin feature 除外 release ビルドと rlib サイズの記録。PLUG-3・TASK-111.2。最終バイナリ未実装のため rlib 計測で、サイズ差に閾値は設けない）の順に実行する。`make bench-baseline` は登録ベンチと `benches/metrics.json`（direction・unit の SSOT）から baseline.json を再生成する道具で、実測値の記録は TASK-88.2（#229）が行う。現時点では `benches/benches/regression_placeholder.rs`（決定的な固定値の stub）と `benches/baseline.json`（`placeholder: true` の暫定値）で動作確認する段階にあり、実測を伴う本物のベンチ・基準値への置き換えはそれぞれ TASK-113・TASK-88 で行う。計測対象がプレースホルダのため、現時点では実装の性能悪化を検出せず、性能回帰ゲートとして機能しない。plugin 境界ベンチの Δp50（`plugin_boundary_*_delta_p50`。TASK-113.3）は `make bench-plugin-boundary` ステップで計測と CORE-10 比のログ出力のみ行い（基準値比較なし）、15% 回帰判定は `make bench-check-selftest` の fixture で検証している。常時比較は実測基準値の登録と `bench-check` への組み込み（TASK-88.h1・TASK-113.h1）後に有効になる。
+`bench-regression` ジョブは次の 17 個の `make` を ci.yml の並びどおりに実行する（自己テストはスタブ・疑似 /proc・fixture のみで照合し、実機は使わない）。
+
+1. `make fio-bench-selftest`（fio 4K ランダム write ベンチスクリプトの自己テスト。TASK-25.1・IO-8）
+2. `make fio-baseline-ratio-selftest`（fio ベースライン比の算出の自己テスト。TASK-25.2・IO-8）
+3. `make bench-check-selftest`（比較スクリプトの自己テスト。REPAIR-8・REPAIR-12）
+4. `make bench-baseline-selftest`（baseline.json 生成スクリプト `scripts/bench/generate_baseline.sh` の自己テスト。TASK-88.1）
+5. `make startup-latency-selftest`（起動レイテンシ計測スクリプトの自己テスト。TASK-46.1・CORE-10）
+6. `make net-setup-timing-selftest`（ネットワーク作成/接続/削除の所要時間計測スクリプトの自己テスト。TASK-139.5・NET-4）
+7. `make dns-helper-measure-selftest`（DNS ヘルパー計測スクリプトの自己テスト。TASK-141.3・NET-5）
+8. `make idle-memory-selftest`（アイドル時常駐メモリ計測スクリプト `scripts/bench/idle_memory.sh` の自己テスト。疑似 /proc のみで照合し実計測はしない。TASK-45.1・CORE-7・SUP-1）
+9. `make concurrent-memory-selftest`（50 コンテナ同時起動の集約メモリ計測スクリプトの自己テスト。TASK-50.1・TASK-50.2・CORE-9・SUP-1）
+10. `make idle-memory-supervised-selftest`（監視プロセス付きのアイドル時常駐メモリ計測の自己テスト。TASK-47・CORE-7・SUP-1）
+11. `make supervisor-independence-selftest`（監視プロセス独立性の実証スクリプトの自己テスト。TASK-162・SUP-5）
+12. `make supervisor-pss-selftest`（監視プロセス常駐メモリ計測スクリプト `scripts/bench/supervisor_pss.sh` の自己テスト。疑似 /proc のみ。TASK-158・SUP-2）
+13. `make restart-latency-selftest`（restart レイテンシ計測スクリプト `scripts/measure-restart-latency.sh` の自己テスト。スタブ launcher のみ。TASK-160・SUP-3）
+14. `make bench-check`（ベンチ実行・基準値比較。現状はプレースホルダの配線確認のみ）
+15. `make bench-plugin-boundary`（plugin 境界ベンチの計測と CORE-10 比のログ出力のみ。基準値比較なし。TASK-113.3）
+16. `make plugin-feature-size`（core の plugin feature 除外 release ビルドと rlib サイズの記録。PLUG-3・TASK-111.2。最終バイナリ未実装のため rlib 計測で、サイズ差に閾値は設けない）
+17. `make plug4-core-invariance`（plugin の追加で core が変わらないことの判定。pull_request では base ブランチを fetch して比較する。自己テスト `make plug4-core-invariance-selftest` は `integration-test` ジョブ側で実行する。TASK-109.4・PLUG-4）
+
+`make bench-baseline` は登録ベンチと `benches/metrics.json`（direction・unit の SSOT）から baseline.json を再生成する道具である。ベンチ・基準値の現状は次のとおり（spec 側の判断は先取りしない）。
+
+- 現時点で基準値比較の対象は `benches/benches/regression_placeholder.rs`（決定的な固定値の stub）と `benches/baseline.json`（`placeholder: true` の暫定値）だけで、動作確認の段階にある。計測対象がプレースホルダのため、現時点では実装の性能悪化を検出せず、性能回帰ゲートとして機能しない
+- plugin 境界ベンチ（TASK-113〔#269〕・closed。`benches/benches/plugin_boundary*.rs`）は実装済みだが、baseline 未登録のため `bench-check` の比較対象外
+- files/s・起動 p95 のベンチを実装するタスクは未定（`docs/design/bench-calibration.md`「既知の欠落」）
+- 校正記録は TASK-88.2（#229）で `docs/design/bench-calibration.md` に整備済み。実測は前提ベンチが無いため保留している
+- 実測基準値の確定は TASK-88.h1（#230）・TASK-113.h1（#274）（どちらも open）
+
+plugin 境界ベンチの Δp50（`plugin_boundary_*_delta_p50`。TASK-113.3）は `make bench-plugin-boundary` ステップで計測と CORE-10 比のログ出力のみ行い（基準値比較なし）、15% 回帰判定は `make bench-check-selftest` の fixture で検証している。常時比較は実測基準値の登録と `bench-check` への組み込み（TASK-88.h1・TASK-113.h1）後に有効になる。
 
 ## 3 OS CI（macOS・Windows・Linux 一級対応）
 

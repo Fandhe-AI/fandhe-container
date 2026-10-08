@@ -376,12 +376,7 @@ mod unix {
             .unwrap();
         let t = Instant::now();
         loop {
-            let alive = std::process::Command::new("/bin/kill")
-                .args(["-0", &pid.to_string()])
-                .stderr(std::process::Stdio::null())
-                .status()
-                .unwrap()
-                .success();
+            let alive = crate::kill_probe(pid);
             #[cfg(target_os = "linux")]
             let alive = alive
                 && std::fs::read_to_string(format!("/proc/{pid}/stat"))
@@ -499,5 +494,38 @@ mod unix {
         .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::NotFound);
         no_socket_left(&dir);
+    }
+}
+
+/// `kill -0` による生存確認。外部コマンドの待機にも期限を設ける（REPAIR-5・#1311）。
+fn kill_probe(pid: u32) -> bool {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let mut child = Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn kill");
+    let start = Instant::now();
+    loop {
+        match child.try_wait().expect("try_wait") {
+            Some(st) => return st.success(),
+            None if start.elapsed() < Duration::from_secs(10) => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            None => {
+                let _ = child.kill();
+                let reap = Instant::now();
+                while reap.elapsed() < Duration::from_secs(2) {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                panic!("kill -0 timed out for pid {pid}");
+            }
+        }
     }
 }

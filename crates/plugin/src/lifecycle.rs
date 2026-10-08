@@ -1400,14 +1400,10 @@ mod tests {
         let reg = local_registry(2);
         let mut g = spawn_registered(&mut sh("exec sleep 30"), reg).unwrap();
         let pid = g.child.as_ref().unwrap().id();
-        let out = Command::new("ps")
-            .args(["-o", "pgid=", "-p", &pid.to_string()])
-            .output()
-            .unwrap();
-        let pgid: u32 = String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse()
-            .expect("pgid");
+        let mut ps = Command::new("ps");
+        ps.args(["-o", "pgid=", "-p", &pid.to_string()]);
+        let (_, stdout) = run_bounded(ps, Duration::from_secs(10)).expect("ps timed out");
+        let pgid: u32 = stdout.trim().parse().expect("pgid");
         assert_eq!(pgid, pid);
         assert!(g.kill_and_reap().is_reaped());
     }
@@ -1536,14 +1532,46 @@ mod tests {
         (guard, pid)
     }
 
+    /// 確認用の外部コマンド（`ps`・`kill`）を期限付きで実行する（REPAIR-5・#1311）。`output()` / `status()` は
+    /// 子の終了を無期限に待つため、spawn して `try_wait` を期限までポーリングし、超過時は kill して
+    /// 有限時間だけ回収を試みる。期限切れは `None`（呼び出し側が失敗として扱う）。
+    #[cfg(unix)]
+    fn run_bounded(mut cmd: Command, limit: Duration) -> Option<(ExitStatus, String)> {
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped());
+        let mut child = cmd.spawn().ok()?;
+        let start = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(st)) => {
+                    let mut s = String::new();
+                    if let Some(mut o) = child.stdout.take() {
+                        let _ = o.read_to_string(&mut s);
+                    }
+                    return Some((st, s));
+                }
+                Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(5)),
+                _ => break,
+            }
+        }
+        let _ = child.kill();
+        let reap = Instant::now();
+        while reap.elapsed() < Duration::from_secs(2) {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        None
+    }
+
     /// 孫が実行中か（Linux ではゾンビ `Z` を実行中に数えない）。
     #[cfg(unix)]
     fn is_running(pid: u32) -> bool {
-        let alive = Command::new("/bin/kill")
-            .args(["-0", &pid.to_string()])
-            .stderr(Stdio::null())
-            .status()
-            .unwrap()
+        let mut k = Command::new("/bin/kill");
+        k.args(["-0", &pid.to_string()]).stderr(Stdio::null());
+        let alive = run_bounded(k, Duration::from_secs(10))
+            .expect("kill -0 timed out")
+            .0
             .success();
         #[cfg(target_os = "linux")]
         let alive = alive
@@ -1561,9 +1589,9 @@ mod tests {
 
     #[cfg(unix)]
     fn force_kill(pid: u32) {
-        let _ = Command::new("/bin/kill")
-            .args(["-9", &pid.to_string()])
-            .status();
+        let mut k = Command::new("/bin/kill");
+        k.args(["-9", &pid.to_string()]);
+        let _ = run_bounded(k, Duration::from_secs(10));
     }
 
     #[cfg(unix)]

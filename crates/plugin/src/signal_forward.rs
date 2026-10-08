@@ -30,11 +30,12 @@
 //!
 //! # 制限
 //! - 親が SIGKILL された場合・`panic = abort` で異常終了した場合は転送されない。Linux は
-//!   `PR_SET_PDEATHSIG` で補う予定（#1514）。macOS では plugin が残留し得る。Windows は対象外。
+//!   `PR_SET_PDEATHSIG`（#1514。`lifecycle::bind_to_parent_lifetime`）で plugin 本体だけを止め、孫は
+//!   残留し得る。macOS では plugin 本体も孫も残留し得る（kqueue `NOTE_EXIT` による監視は将来課題。
+//!   #1403 判断 3）。Windows は対象外。
 //! - spawn から登録（`activate`）までの間は転送対象外。
 //! - plugin は独立したプロセスグループで起動される（#1311。`lifecycle::spawn_registered`）。端末の Ctrl-C は
 //!   カーネルのグループ配送では plugin に届かず、本転送（`kill(-pid)`）だけが孫まで届く。
-//!   親の SIGKILL 時は Linux でも plugin 本体のみ停止し孫は残留し得る。
 
 use crate::error::{PluginError, PluginErrorCode};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};

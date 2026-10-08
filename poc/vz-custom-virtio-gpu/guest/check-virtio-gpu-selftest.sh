@@ -11,8 +11,10 @@ fx="$here/testdata"
 failures=0
 
 # expect_case NAME EXPECTED_RC EXPECTED_LINES(改行区切り。出力に全行が含まれること) ARGS...
+# 全ケース共通で「各 key は 1 回だけ出る」ことも照合する（同一 key に矛盾する値を
+# 重ねて出すと、先頭行だけを読む利用側が誤判定するため。GPU-6・REPAIR-12）。
 expect_case() {
-  local name="$1" want_rc="$2" want_lines="$3" out rc line
+  local name="$1" want_rc="$2" want_lines="$3" out rc line dups
   shift 3
   set +e
   out="$(bash "$script" "$@" 2>/dev/null)"
@@ -20,6 +22,12 @@ expect_case() {
   set -e
   if [ "$rc" -ne "$want_rc" ]; then
     echo "FAIL $name: exit code $rc, want $want_rc" >&2
+    failures=$((failures + 1))
+    return
+  fi
+  dups="$(printf '%s\n' "$out" | grep -E '^[^=]+=' | cut -d= -f1 | sort | uniq -d || true)"
+  if [ -n "$dups" ]; then
+    echo "FAIL $name: duplicate key(s): $(printf '%s' "$dups" | tr '\n' ' ')" >&2
     failures=$((failures + 1))
     return
   fi
@@ -75,7 +83,13 @@ expect_case drm-prefix-zero-scanouts 1 "kms=probe_failed_zero_scanouts
 host_memory_window=present" --dmesg-file "$fx/drm-prefix-zero-scanouts.log"
 expect_case drm-prefix-multi-section 1 "probe=multiple_sections" --dmesg-file "$fx/drm-prefix-multi-section.log"
 expect_case capset-version-nonzero 1 "capset_max_version=3" --dmesg-file "$fx/capset-version-nonzero.log"
-expect_case host-window-zero 1 "host_memory_window=zero_size" --dmesg-file "$fx/host-window-zero.log"
+# サイズ 0 の窓は zero_size だけを出し、present を併記しない（key 重複検査と併せて照合）。
+expect_case host-window-zero 1 "probe=ok
+capset_info=venus
+capset_max_size=160
+host_memory_window=zero_size
+host_memory_window_size=0x0000000000000000
+venus_init=not_checked" --dmesg-file "$fx/host-window-zero.log"
 expect_case probe-failed 1 "probe=failed" --dmesg-file "$fx/probe-failed.log"
 expect_case probe-failed-driver 1 "probe=failed" --dmesg-file "$fx/probe-failed-driver.log"
 expect_case venus-diagnostic-only 1 "venus_init=missing" --dmesg-file "$fx/ok.log" --vulkaninfo-file "$fx/vulkaninfo-diagnostic.txt"

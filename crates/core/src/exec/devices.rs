@@ -1,4 +1,4 @@
-//! コンテナ起動時の基本デバイスノード 6 種の作成（CORE-1・TASK-27.6・#834・MS-2）。
+//! コンテナ起動時の基本デバイスノード 6 種と default symlink 4 本の作成（CORE-1・TASK-27.6・#834・#1297・MS-2）。
 //!
 //! # 役割と呼び出し文脈
 //!
@@ -6,6 +6,11 @@
 //! 異常終了する（PoC-15 で `iperf3 -s` が SIGSEGV する事象を確認）。OCI Runtime Spec の
 //! default devices に相当する 6 種（`null`・`zero`・`full`・`random`・`urandom`・`tty`）を、
 //! CDI の deviceNodes（GPU 系・TASK-127）とは独立した常設の責務として rootfs の `dev` 直下へ作る。
+//!
+//! あわせて OCI Runtime Spec の default symlink 4 本（`dev/fd` → `/proc/self/fd`、`dev/stdin`・
+//! `dev/stdout`・`dev/stderr` → `/proc/self/fd/{0,1,2}`。#1297）も同じ `dev` fd 起点で作る。これが
+//! 無いと `exec` 前検査（`process.rs` の `verify_script_fd_path`）が新 root の `/dev/fd/N` を解決できず、
+//! シェバン付きスクリプトを拒否する。参照先は pivot 後のコンテナ内で解決され、作成時にホスト側では辿らない。
 //!
 //! `crate::exec` の最小実行フロー第 3 段。呼び出し元は TASK-29 の `oci_runtime` と fork 段（#831）を
 //! 想定し、次の順で通す。
@@ -32,6 +37,10 @@
 //! - **モード補正**: `mknodat` のモードは umask で削られるため、作成に成功したノードだけを
 //!   `O_PATH|O_NOFOLLOW` で開き直し、文字デバイス・`rdev` の一致を検証した fd に対して magic link
 //!   経由で 0666 に補正する（作成直後の差し替えで別 inode の権限を変えない）
+//! - **default symlink は完全一致のみ受け入れる**: ノード 6 種の作成後に symlink 4 本を
+//!   `dev` fd の magic link 起点で `symlink(2)` する（最終要素は辿らない）。`EEXIST` は `readlink(2)`
+//!   の結果が期待する参照先と 1 バイトも違わず一致するときだけ [`DeviceLinkStatus::AlreadyPresent`]
+//!   とし、別の参照先・通常ファイル・ディレクトリは上書きせず `FailedPrecondition`（段 `CreateDevices`）で拒否する
 //! - **rootless は fail-closed**: 非特権 user namespace では文字デバイスの `mknod(2)` が `EPERM` になり、
 //!   `PermissionDenied`（段 `CreateDevices`）で拒否する。黙ってデバイス無しで起動させない
 //! - **失敗時はプロセスを破棄する**: 作成済みノードは片付けない（`crate::exec` のモジュール doc の契約）
@@ -42,13 +51,15 @@
 //! - rootless 向けのホスト `/dev/*` の bind mount による供給（runc 相当。CORE-6・SEC-5 と整理する
 //!   後続タスク）。本実装の rootless 経路は `PermissionDenied` で止まる
 //! - `nodev` マウント上の rootfs の検出（stat は通るがデバイスは開けない）
-//! - `/dev/console`・`/dev/ptmx`・`/dev/pts`・`/dev/shm`・`/dev/fd` 等の OCI default の残り
-//!   （TASK-127・TASK-29 の範囲）
+//! - `/dev/console`・`/dev/ptmx`・`/dev/pts`・`/dev/shm` 等の OCI default の残り（TASK-29 の範囲。
+//!   担当 Issue は未確定）
+//! - `spawn_container` の最小フローへの本関数の配線（TASK-29/30 の範囲）
 //!
 //! # 単体テストの安全策
 //!
 //! `mknodat(2)` は `cfg(test)` では dry-run に差し替わる（`mknod_syscall`）。root で `cargo test` を
-//! 実行してもホストへ実ノードを作らない。実機での挙動は結合試験 `tests/default_devices.rs`
+//! 実行してもホストへ実ノードを作らない。symlink は特権不要で一時ディレクトリ内にしか作られないため
+//! dry-run にせず実ファイルシステムで照合する。実機での挙動は結合試験 `tests/default_devices.rs`
 //! （`-- --ignored`）で確認する。
 
 use std::ffi::{CStr, OsStr};
@@ -115,6 +126,56 @@ const DEFAULT_DEVICES: [DefaultDevice; 6] = [
     },
 ];
 
+/// 作成する 1 本の default symlink の定義。
+struct DefaultLink {
+    /// `dev` 直下の名前（`/` を含まない静的な 1 要素）。
+    name: &'static CStr,
+    /// 期待する参照先（pivot 後のコンテナ内で解決される絶対パス）。
+    target: &'static str,
+}
+
+/// OCI Runtime Spec の default symlink。任意の名前・参照先を受け付ける経路は作らない。
+const DEFAULT_LINKS: [DefaultLink; 4] = [
+    DefaultLink {
+        name: c"fd",
+        target: "/proc/self/fd",
+    },
+    DefaultLink {
+        name: c"stdin",
+        target: "/proc/self/fd/0",
+    },
+    DefaultLink {
+        name: c"stdout",
+        target: "/proc/self/fd/1",
+    },
+    DefaultLink {
+        name: c"stderr",
+        target: "/proc/self/fd/2",
+    },
+];
+
+/// 1 symlink の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DeviceLinkStatus {
+    /// 今回作成した。
+    Created,
+    /// 既に存在し、参照先が期待と完全一致すると検証済みのため何も変更していない。
+    AlreadyPresent,
+}
+
+/// [`create_default_devices`] が処理した 1 本の symlink の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DeviceLinkOutcome {
+    /// `dev` 直下の名前。
+    pub name: &'static str,
+    /// 期待する参照先。
+    pub target: &'static str,
+    /// 作成したか、既存だったか。
+    pub status: DeviceLinkStatus,
+}
+
 /// 1 ノードの結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -147,9 +208,11 @@ pub struct DeviceNodeOutcome {
 pub struct DeviceReport {
     /// 6 種の結果（定義順: null・zero・full・random・urandom・tty）。
     pub nodes: Vec<DeviceNodeOutcome>,
+    /// default symlink 4 本の結果（定義順: fd・stdin・stdout・stderr。#1297）。
+    pub links: Vec<DeviceLinkOutcome>,
 }
 
-/// rootfs の `dev` 直下へ基本デバイスノード 6 種を作る。
+/// rootfs の `dev` 直下へ基本デバイスノード 6 種と default symlink 4 本を作る。
 ///
 /// [`prepare_rootfs`](super::prepare_rootfs) の後、[`pivot_root`](super::pivot_root) の前に呼ぶ。
 /// [`MountIsolation`] の証跡が現在の状態と一致しなければ副作用なしに拒否する（fail-closed）。
@@ -194,7 +257,64 @@ fn create_default_devices_at(root: BorrowedFd<'_>) -> Result<DeviceReport, ExecE
             status,
         });
     }
-    Ok(DeviceReport { nodes })
+    let mut links = Vec::with_capacity(DEFAULT_LINKS.len());
+    for l in &DEFAULT_LINKS {
+        let status = create_link(dev.as_fd(), l)?;
+        links.push(DeviceLinkOutcome {
+            name: l.name.to_str().unwrap_or("?"),
+            target: l.target,
+            status,
+        });
+    }
+    Ok(DeviceReport { nodes, links })
+}
+
+/// `dev` fd の magic link を起点に symlink 1 本を作る。`symlink(2)` は最終要素を辿らないため、
+/// 既存の悪性 symlink 経由で rootfs の外へ作らない。`EEXIST` は参照先を検証する。
+fn create_link(dev: BorrowedFd<'_>, l: &DefaultLink) -> Result<DeviceLinkStatus, ExecError> {
+    let name = l.name.to_string_lossy();
+    let path = fd_magic_path(dev.as_raw_fd()).join(&*name);
+    match std::os::unix::fs::symlink(l.target, &path) {
+        Ok(()) => Ok(DeviceLinkStatus::Created),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = match std::fs::read_link(&path) {
+                Ok(t) => Some(t),
+                // symlink でない（EINVAL）。
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => None,
+                Err(e) => {
+                    return Err(ExecError::from_io(
+                        &e,
+                        STAGE,
+                        &format!("readlink(dev/{name})"),
+                    ));
+                }
+            };
+            check_existing_link(existing.as_deref(), l)?;
+            Ok(DeviceLinkStatus::AlreadyPresent)
+        }
+        Err(e) => Err(ExecError::from_io(
+            &e,
+            STAGE,
+            &format!("symlinkat(dev/{name})"),
+        )),
+    }
+}
+
+/// 既存 symlink の検証本体（純粋関数）。`existing` は `readlink` の結果（symlink でなければ `None`）。
+/// 参照先が期待とバイト列で完全一致のときだけ通る（正規化しない）。
+fn check_existing_link(existing: Option<&Path>, l: &DefaultLink) -> Result<(), ExecError> {
+    if existing.is_some_and(|t| t.as_os_str() == OsStr::new(l.target)) {
+        return Ok(());
+    }
+    Err(ExecError::new(
+        ErrorCode::FailedPrecondition,
+        STAGE,
+        format!(
+            "the existing entry dev/{} is not a symlink to {}",
+            l.name.to_string_lossy(),
+            l.target
+        ),
+    ))
 }
 
 /// 違反記録の対象表示用に rootfs の実パスを得る（取れなければ固定文字列）。
@@ -398,6 +518,132 @@ mod tests {
         );
     }
 
+    /// CORE-1・#1297: default symlink は OCI の 4 本で、名前は `dev` 直下の 1 要素。
+    #[test]
+    fn core1_default_link_table_is_exact() {
+        let got: Vec<_> = DEFAULT_LINKS
+            .iter()
+            .map(|l| (l.name.to_str().unwrap(), l.target))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("fd", "/proc/self/fd"),
+                ("stdin", "/proc/self/fd/0"),
+                ("stdout", "/proc/self/fd/1"),
+                ("stderr", "/proc/self/fd/2"),
+            ]
+        );
+        for l in &DEFAULT_LINKS {
+            let n = l.name.to_str().unwrap();
+            assert!(!n.contains('/') && n != "." && n != "..", "{n}");
+        }
+    }
+
+    /// CORE-1・#1297: `dev` の無い rootfs に symlink 4 本が期待する参照先で作られる。
+    #[test]
+    fn core1_devices_create_default_links() {
+        take_calls();
+        let t = Tmp::new("links");
+        let report = create_default_devices_at(open_root(&t.0).as_fd()).unwrap();
+        assert_eq!(report.links.len(), 4);
+        for (o, (n, tg)) in report.links.iter().zip([
+            ("fd", "/proc/self/fd"),
+            ("stdin", "/proc/self/fd/0"),
+            ("stdout", "/proc/self/fd/1"),
+            ("stderr", "/proc/self/fd/2"),
+        ]) {
+            assert_eq!(
+                (o.name, o.target, o.status),
+                (n, tg, DeviceLinkStatus::Created)
+            );
+            let p = t.0.join("dev").join(n);
+            assert!(
+                std::fs::symlink_metadata(&p)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(std::fs::read_link(&p).unwrap(), PathBuf::from(tg));
+        }
+        take_calls();
+    }
+
+    /// CORE-1・#1297: 期待どおりの既存 symlink は `AlreadyPresent` で受け入れ、変更しない。
+    #[test]
+    fn core1_devices_links_already_present_are_accepted() {
+        take_calls();
+        let t = Tmp::new("links-present");
+        std::fs::create_dir(t.0.join("dev")).unwrap();
+        for l in &DEFAULT_LINKS {
+            let n = l.name.to_str().unwrap();
+            std::os::unix::fs::symlink(l.target, t.0.join("dev").join(n)).unwrap();
+        }
+        let report = create_default_devices_at(open_root(&t.0).as_fd()).unwrap();
+        assert!(
+            report
+                .links
+                .iter()
+                .all(|o| o.status == DeviceLinkStatus::AlreadyPresent)
+        );
+        assert_eq!(
+            std::fs::read_link(t.0.join("dev/stdout")).unwrap(),
+            PathBuf::from("/proc/self/fd/1")
+        );
+        take_calls();
+    }
+
+    /// CORE-1・#1297: 別の参照先・末尾 `/` 違い・外へ向かう相対参照は上書きせず拒否し、辿らない。
+    #[test]
+    fn core1_devices_link_with_other_target_is_rejected() {
+        for (label, target) in [
+            ("other", "/proc/1/fd"),
+            ("slash", "/proc/self/fd/"),
+            ("escape", "../../outside"),
+        ] {
+            take_calls();
+            let t = Tmp::new(&format!("link-{label}"));
+            let outside = t.0.join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            let rootfs = t.0.join("root");
+            std::fs::create_dir_all(rootfs.join("dev")).unwrap();
+            std::os::unix::fs::symlink(target, rootfs.join("dev/fd")).unwrap();
+            let err = create_default_devices_at(open_root(&rootfs).as_fd()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::FailedPrecondition);
+            assert_eq!(err.stage, IsolationStage::CreateDevices);
+            assert_eq!(
+                err.message,
+                "the existing entry dev/fd is not a symlink to /proc/self/fd"
+            );
+            assert_eq!(
+                std::fs::read_link(rootfs.join("dev/fd")).unwrap(),
+                PathBuf::from(target)
+            );
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+            take_calls();
+        }
+    }
+
+    /// CORE-1・#1297: 既存エントリが通常ファイル・ディレクトリなら拒否し、内容を変えない。
+    #[test]
+    fn core1_devices_link_non_symlink_is_rejected() {
+        take_calls();
+        let t = Tmp::new("link-file");
+        std::fs::create_dir_all(t.0.join("dev/fd")).unwrap();
+        let err = create_default_devices_at(open_root(&t.0).as_fd()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert!(t.0.join("dev/fd").is_dir());
+        std::fs::remove_dir(t.0.join("dev/fd")).unwrap();
+        std::fs::write(t.0.join("dev/stdin"), b"keep").unwrap();
+        let err = create_default_devices_at(open_root(&t.0).as_fd()).unwrap_err();
+        assert_eq!(
+            err.message,
+            "the existing entry dev/stdin is not a symlink to /proc/self/fd/0"
+        );
+        assert_eq!(std::fs::read(t.0.join("dev/stdin")).unwrap(), b"keep");
+        take_calls();
+    }
+
     /// CORE-1: `dev` が無ければ rootfs 配下に作り、6 種すべてを `dev` fd 起点の 1 要素名で作る。
     #[test]
     fn core1_devices_create_missing_dev_dir() {
@@ -407,6 +653,7 @@ mod tests {
         let report = create_default_devices_at(root.as_fd()).unwrap();
         assert!(t.0.join("dev").is_dir());
         assert_eq!(report.nodes.len(), 6);
+        assert_eq!(report.links.len(), 4);
         assert!(
             report
                 .nodes
@@ -444,6 +691,7 @@ mod tests {
             Some(format!("{}/dev", rootfs.display()))
         );
         assert_eq!(take_calls(), Vec::<Call>::new());
+        // dev 検証で失敗するため symlink 作成には進まず、外には 1 本も作られない。
         assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
     }
 

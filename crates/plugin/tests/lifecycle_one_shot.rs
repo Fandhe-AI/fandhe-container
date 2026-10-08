@@ -224,18 +224,7 @@ mod unix {
     fn assert_process_gone_within(pid: u32, limit: Duration) {
         let start = Instant::now();
         loop {
-            let alive = crate::kill_probe(pid);
-            #[cfg(target_os = "linux")]
-            let alive = alive
-                && std::fs::read_to_string(format!("/proc/{pid}/stat"))
-                    .map(|st| {
-                        !st.rsplit(')')
-                            .next()
-                            .unwrap_or("")
-                            .trim_start()
-                            .starts_with('Z')
-                    })
-                    .unwrap_or(false);
+            let alive = crate::is_alive(pid);
             if !alive {
                 return;
             }
@@ -441,10 +430,23 @@ mod unix {
     }
 }
 
-/// `kill -0` による生存確認。外部コマンドの待機にも期限を設ける（REPAIR-5・#1311）。呼び出し元は
-/// `mod unix` のみのため unix に限定する（Windows で未使用の関数にしない）。
-#[cfg(unix)]
-fn kill_probe(pid: u32) -> bool {
+/// 孫の生存確認（#1311）。Linux は `/proc/<pid>/stat` を読み、ゾンビ（`Z`）を終了済みとして扱う（pid 1 が
+/// 回収しない開発コンテナ対応）。外部コマンド（procps の `kill`。開発コンテナの slim イメージに無い）に
+/// 依存しない。呼び出し元は `mod unix` のみ。
+#[cfg(target_os = "linux")]
+fn is_alive(pid: u32) -> bool {
+    // `pid (comm) state ...`。comm に空白や括弧を含み得るため、最後の ')' の後ろを見る。
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(')')
+            .and_then(|(_, rest)| rest.trim_start().chars().next())
+            .is_some_and(|state| state != 'Z')
+    })
+}
+
+/// 孫の生存確認（#1311）。`/proc` の無い unix（macOS）は OS 標準の `/bin/kill -0` で確かめ、外部コマンドの
+/// 待機にも期限を設ける（REPAIR-5）。呼び出し元は `mod unix` のみ。
+#[cfg(all(unix, not(target_os = "linux")))]
+fn is_alive(pid: u32) -> bool {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
     let mut child = Command::new("/bin/kill")

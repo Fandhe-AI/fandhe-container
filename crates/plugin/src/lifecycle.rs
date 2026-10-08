@@ -1400,11 +1400,7 @@ mod tests {
         let reg = local_registry(2);
         let mut g = spawn_registered(&mut sh("exec sleep 30"), reg).unwrap();
         let pid = g.child.as_ref().unwrap().id();
-        let mut ps = Command::new("ps");
-        ps.args(["-o", "pgid=", "-p", &pid.to_string()]);
-        let (_, stdout) = run_bounded(ps, Duration::from_secs(10)).expect("ps timed out");
-        let pgid: u32 = stdout.trim().parse().expect("pgid");
-        assert_eq!(pgid, pid);
+        assert_eq!(process_group_of(pid), pid);
         assert!(g.kill_and_reap().is_reaped());
     }
 
@@ -1532,10 +1528,35 @@ mod tests {
         (guard, pid)
     }
 
-    /// 確認用の外部コマンド（`ps`・`kill`）を期限付きで実行する（REPAIR-5・#1311）。`output()` / `status()` は
+    /// `pid` のプロセスグループ ID（#1311 のテスト用）。Linux は `/proc/<pid>/stat` の pgrp 欄を読み、
+    /// 外部コマンドに依存しない（開発コンテナの slim イメージには procps〔`ps`・`kill`〕が無い）。
+    #[cfg(target_os = "linux")]
+    fn process_group_of(pid: u32) -> u32 {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read /proc stat");
+        // `pid (comm) state ppid pgrp ...`。comm に空白や括弧を含み得るため最後の ')' の後ろを見る。
+        let (_, rest) = stat.rsplit_once(')').expect("stat comm");
+        rest.split_whitespace()
+            .nth(2)
+            .expect("pgrp field")
+            .parse()
+            .expect("pgrp")
+    }
+
+    /// `pid` のプロセスグループ ID（#1311 のテスト用）。`/proc` の無い unix（macOS）は OS 標準の `/bin/ps` を
+    /// 期限付きで実行して読む。
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn process_group_of(pid: u32) -> u32 {
+        let mut ps = Command::new("/bin/ps");
+        ps.args(["-o", "pgid=", "-p", &pid.to_string()]);
+        let (_, stdout) =
+            run_bounded(ps, Duration::from_secs(10)).expect("ps failed to start or timed out");
+        stdout.trim().parse().expect("pgid")
+    }
+
+    /// 確認用の外部コマンド（`ps`）を期限付きで実行する（REPAIR-5・#1311）。`output()` / `status()` は
     /// 子の終了を無期限に待つため、spawn して `try_wait` を期限までポーリングし、超過時は kill して
-    /// 有限時間だけ回収を試みる。期限切れは `None`（呼び出し側が失敗として扱う）。
-    #[cfg(unix)]
+    /// 有限時間だけ回収を試みる。起動失敗・期限切れは `None`（呼び出し側が失敗として扱う）。
+    #[cfg(all(unix, not(target_os = "linux")))]
     fn run_bounded(mut cmd: Command, limit: Duration) -> Option<(ExitStatus, String)> {
         cmd.stdin(Stdio::null()).stdout(Stdio::piped());
         let mut child = cmd.spawn().ok()?;
@@ -1564,15 +1585,11 @@ mod tests {
         None
     }
 
-    /// 孫が実行中か（Linux ではゾンビ `Z` を実行中に数えない）。
+    /// 孫が実行中か（Linux ではゾンビ `Z` を実行中に数えない）。存在確認は `kill(pid, 0)`（`sys::send_signal`）で
+    /// 行い、外部コマンド（procps の `kill`。開発コンテナに無い）に依存しない。
     #[cfg(unix)]
     fn is_running(pid: u32) -> bool {
-        let mut k = Command::new("/bin/kill");
-        k.args(["-0", &pid.to_string()]).stderr(Stdio::null());
-        let alive = run_bounded(k, Duration::from_secs(10))
-            .expect("kill -0 timed out")
-            .0
-            .success();
+        let alive = crate::sys::send_signal(i32::try_from(pid).expect("pid fits in i32"), 0);
         #[cfg(target_os = "linux")]
         let alive = alive
             && std::fs::read_to_string(format!("/proc/{pid}/stat"))
@@ -1587,11 +1604,11 @@ mod tests {
         alive
     }
 
+    /// 試験の後始末で、生存を確認した直後の孫へ SIGKILL を送る（外部コマンドに依存しない）。
     #[cfg(unix)]
     fn force_kill(pid: u32) {
-        let mut k = Command::new("/bin/kill");
-        k.args(["-9", &pid.to_string()]);
-        let _ = run_bounded(k, Duration::from_secs(10));
+        let pid = i32::try_from(pid).expect("pid fits in i32");
+        let _ = crate::sys::send_signal(pid, crate::sys::SIGKILL);
     }
 
     #[cfg(unix)]

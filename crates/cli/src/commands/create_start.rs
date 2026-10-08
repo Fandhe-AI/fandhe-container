@@ -149,6 +149,16 @@ const O_NOFOLLOW: i32 = 0o100_000;
 ))]
 const O_NOFOLLOW: i32 = 0o400_000;
 
+/// ディレクトリ open に付ける O_DIRECTORY（SEC-1）。値は ABI ごとに異なる
+/// （Linux の arm / arm64 は 0o40000、他の Linux アーキは 0o200000）。
+#[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
+const O_DIRECTORY: i32 = 0o40_000;
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "aarch64", target_arch = "arm"))
+))]
+const O_DIRECTORY: i32 = 0o200_000;
+
 /// 呼び出しプロセスの実効 UID（`/proc/self` の所有者で代用し、取得できなければ None）。
 /// None のときは呼び出し側が計測出力を拒否する（fail-closed。SEC-1）。
 #[cfg(target_os = "linux")]
@@ -157,45 +167,118 @@ fn effective_uid() -> Option<u32> {
     std::fs::metadata("/proc/self").ok().map(|m| m.uid())
 }
 
-/// 計測出力先の祖先ディレクトリが、他ユーザーに差し替えられない状態かを検査する（SEC-1）。
-/// group / other 書き込み可のディレクトリは sticky bit が無ければ拒否し、所有者は root か自分に限る。
+/// 開いた fd に対する要素 `name` の `/proc/self/fd/<fd>/<name>` 経路を作る。
+/// この経路は親 fd が指すディレクトリ直下の 1 要素だけを解決するため、パス文字列の再解決で
+/// 親が差し替えられる競合（TOCTOU）が起きない。`openat` 相当を unsafe なしで実現する（SEC-1）。
 #[cfg(target_os = "linux")]
-fn ancestors_trusted(dir: &std::path::Path, euid: u32) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    dir.ancestors().all(|a| {
-        let Ok(m) = std::fs::metadata(a) else {
-            return false;
-        };
-        let mode = m.mode();
-        let writable_by_others = mode & 0o022 != 0;
-        let sticky = mode & 0o1000 != 0;
-        let owner_ok = m.uid() == 0 || m.uid() == euid;
-        owner_ok && (!writable_by_others || sticky)
-    })
+fn child_via_fd(parent: &std::fs::File, name: &std::ffi::OsStr) -> std::path::PathBuf {
+    use std::os::fd::AsRawFd;
+    std::path::PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(name)
 }
 
-/// 親ディレクトリを字面どおり（`..` 不可）に絶対化し、各祖先が symlink でないことを検査する。
-/// root 所有の symlink（システム標準の `/var/run` 等）のみ許可する。信頼できない親 symlink は
-/// canonicalize で先に解決せず、辿らずに拒否する（SEC-1）。
+/// 開いた fd のディレクトリが、他ユーザーに差し替えられない状態かを fd から検査する（SEC-1）。
+/// ディレクトリであり、所有者が root か自分で、group / other 書き込み可なら sticky bit を要する。
 #[cfg(target_os = "linux")]
-fn reject_untrusted_symlink_ancestors(parent: &std::path::Path) -> Option<std::path::PathBuf> {
+fn dir_trusted(dir: &std::fs::File, euid: u32) -> bool {
     use std::os::unix::fs::MetadataExt;
+    let Ok(m) = dir.metadata() else {
+        return false;
+    };
+    let mode = m.mode();
+    let writable_by_others = mode & 0o022 != 0;
+    let sticky = mode & 0o1000 != 0;
+    let owner_ok = m.uid() == 0 || m.uid() == euid;
+    m.is_dir() && owner_ok && (!writable_by_others || sticky)
+}
+
+/// `dir` 直下の要素 `name` を O_NOFOLLOW でディレクトリとして開く（親 fd 経由。SEC-1）。
+#[cfg(target_os = "linux")]
+fn open_dir_at(dir: &std::fs::File, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK | O_NOFOLLOW | O_DIRECTORY)
+        .open(child_via_fd(dir, name))
+}
+
+/// symlink を辿る回数の上限（ループ・過大な展開の防止）。
+#[cfg(target_os = "linux")]
+const MAX_SYMLINK_HOPS: u32 = 8;
+
+/// 親ディレクトリを、ルートから 1 要素ずつディレクトリ fd で固定しながら開く（SEC-1）。
+///
+/// 各要素は直前に開いた fd 経由で O_NOFOLLOW | O_DIRECTORY で開き、開いた fd ごとに所有者・権限を
+/// 検査する。パス全体を再解決しないため、検査と open の間に親を symlink へ差し替えられない。
+/// root 所有の symlink（システム標準の `/var/run` 等）のみ、その場で内容を読んで同じ手順で
+/// 辿る（root 所有のため一般ユーザーは差し替えられない）。`..` を含む経路は拒否する。
+#[cfg(target_os = "linux")]
+fn open_trusted_parent(parent: &std::path::Path, euid: u32) -> Option<std::fs::File> {
+    use std::collections::VecDeque;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::Component;
+
+    /// `path` の各要素を `queue` の先頭へ順序を保って積み、絶対パスだったかを返す。
+    fn push_components(
+        queue: &mut VecDeque<std::ffi::OsString>,
+        path: &std::path::Path,
+    ) -> Option<bool> {
+        let mut absolute = false;
+        let mut names = Vec::new();
+        for c in path.components() {
+            match c {
+                Component::RootDir => absolute = true,
+                Component::Normal(n) => names.push(n.to_os_string()),
+                Component::CurDir => {}
+                Component::ParentDir | Component::Prefix(_) => return None,
+            }
+        }
+        for n in names.into_iter().rev() {
+            queue.push_front(n);
+        }
+        Some(absolute)
+    }
+
     let abs = if parent.is_absolute() {
         parent.to_path_buf()
     } else {
         std::env::current_dir().ok()?.join(parent)
     };
-    let mut cur = std::path::PathBuf::new();
-    for c in abs.components() {
-        match c {
-            Component::ParentDir => return None,
-            Component::CurDir => continue,
-            _ => cur.push(c),
-        }
-        let m = std::fs::symlink_metadata(&cur).ok()?;
-        if m.file_type().is_symlink() && m.uid() != 0 {
-            return None;
+    let open_root = || -> Option<std::fs::File> {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK | O_NOFOLLOW | O_DIRECTORY)
+            .open("/")
+            .ok()?;
+        dir_trusted(&f, euid).then_some(f)
+    };
+    let mut queue = VecDeque::new();
+    push_components(&mut queue, &abs)?;
+    let mut cur = open_root()?;
+    let mut hops = 0;
+    while let Some(name) = queue.pop_front() {
+        match open_dir_at(&cur, &name) {
+            Ok(next) => {
+                if !dir_trusted(&next, euid) {
+                    return None;
+                }
+                cur = next;
+            }
+            Err(_) => {
+                // symlink だった場合のみ、root 所有に限って辿る。それ以外は拒否する。
+                let link = child_via_fd(&cur, &name);
+                let m = std::fs::symlink_metadata(&link).ok()?;
+                if !m.file_type().is_symlink() || m.uid() != 0 {
+                    return None;
+                }
+                hops += 1;
+                if hops > MAX_SYMLINK_HOPS {
+                    return None;
+                }
+                let target = std::fs::read_link(&link).ok()?;
+                if push_components(&mut queue, &target)? {
+                    cur = open_root()?;
+                }
+            }
         }
     }
     Some(cur)
@@ -203,10 +286,9 @@ fn reject_untrusted_symlink_ancestors(parent: &std::path::Path) -> Option<std::p
 
 /// 計測出力先を非ブロッキングで開く。通常ファイル以外（FIFO・デバイス等）は拒否する。
 ///
-/// Linux では、親ディレクトリに信頼できない symlink が無いことを先に検査し、その後に正規化して
-/// 祖先の所有者・書き込み権限を検査し、最終要素は O_NOFOLLOW で開き、開いたファイルの
-/// 種別・ハードリンク数（1 のみ許可）・所有者を fd から検証する（root 実行時に別ファイルへ
-/// 追記させる攻撃の防止。SEC-1）。
+/// Linux では、親ディレクトリをルートから fd で固定しながら開き（[`open_trusted_parent`]）、
+/// その親 fd 経由で最終要素を O_NOFOLLOW で開く。開いたファイルの種別・ハードリンク数
+/// （1 のみ許可）・所有者を fd から検証する（root 実行時に別ファイルへ追記させる攻撃の防止。SEC-1）。
 #[cfg(target_os = "linux")]
 fn open_op_log(path: &std::ffi::OsStr) -> Option<std::fs::File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -216,17 +298,13 @@ fn open_op_log(path: &std::ffi::OsStr) -> Option<std::fs::File> {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => std::path::Path::new("."),
     };
-    let lexical = reject_untrusted_symlink_ancestors(parent)?;
-    let parent = std::fs::canonicalize(lexical).ok()?;
     let euid = effective_uid()?;
-    if !ancestors_trusted(&parent, euid) {
-        return None;
-    }
+    let dir = open_trusted_parent(parent, euid)?;
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true)
         .append(true)
         .custom_flags(O_NONBLOCK | O_NOFOLLOW);
-    let f = opts.open(parent.join(name)).ok()?;
+    let f = opts.open(child_via_fd(&dir, name)).ok()?;
     // open 後のハンドルで検証する（パスの事前検査による TOCTOU を避ける）。
     let m = f.metadata().ok()?;
     if m.is_file() && m.nlink() == 1 && m.uid() == euid {

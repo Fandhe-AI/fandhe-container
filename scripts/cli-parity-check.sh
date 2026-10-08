@@ -194,13 +194,24 @@ run_cli() {
 }
 
 # stderr から機械可読な code だけを取り出す（文言・パスは写さない）。
+# 構造（4096 バイト以内・NUL なし・高々 1 行・`{"code":"X","message":"..."}` 形式）を検証できない出力は
+# 先頭に code らしき文字列があっても一致扱いにせず <unparsed> とする（ERR 系）。
 norm_code() {
-  local e raw
+  local e raw stripped nl
   raw="$(wc -c <"$tmp_dir/err" | tr -d ' ')"
-  e="$(LC_ALL=C tr -d '\000' <"$tmp_dir/err" | head -c 4096)"
   if [ "$raw" -eq 0 ]; then
     printf -- '-'
-  elif [[ $e =~ \"code\":\"([A-Z_]{1,40})\" ]]; then
+    return 0
+  fi
+  stripped="$(LC_ALL=C tr -d '\000' <"$tmp_dir/err" | wc -c | tr -d ' ')"
+  nl="$(LC_ALL=C tr -cd '\n' <"$tmp_dir/err" | wc -c | tr -d ' ')"
+  if [ "$raw" -gt 4096 ] || [ "$stripped" -ne "$raw" ] || [ "$nl" -gt 1 ]; then
+    printf '<unparsed>'
+    return 0
+  fi
+  # コマンド置換は末尾の改行を落とす。改行が行末以外にある場合は下の検査で弾く。
+  e="$(LC_ALL=C cat "$tmp_dir/err")"
+  if [[ $e != *$'\n'* && $e =~ ^\{\"code\":\"([A-Z_]{1,40})\",\"message\":\".*\"\}$ ]]; then
     printf '%s' "${BASH_REMATCH[1]}"
   else
     printf '<unparsed>'
@@ -364,7 +375,9 @@ load_capture() {
   size="$(wc -c <"$file" | tr -d ' ')"
   [ "$size" -le $((MAX_LINES * MAX_LINE_LEN)) ] || { err invalid-input "capture file is too large"; exit 2; }
   local id_re='^[AB][0-9]{2}$' ex_re='^[0-9]{1,3}$' code_re='^([A-Z_]{1,40}|-|<unparsed>|<timeout>)$'
-  local so_re='^[-A-Za-z0-9_,;<>:]+$'
+  local so_unexp_re='^<unexpected>:(nul|big|[0-9]{1,10})$'
+  local so_list_re='^list:H(;[A-Za-z0-9_-]{1,64},[a-z]{1,16},(<pid>|-))*$'
+  local k entry_id so_ok
   while IFS= read -r line || [ -n "$line" ]; do
     n=$((n + 1))
     [ "$n" -le "$MAX_LINES" ] || { err invalid-input "capture file has too many lines"; exit 2; }
@@ -380,8 +393,26 @@ load_capture() {
       *)
         IFS="$TAB" read -r id layer ex code so <<<"$line"
         [[ $id =~ $id_re ]] && [ "$layer" = "${id:0:1}" ] && [[ $ex =~ $ex_re ]] && [ "$((10#$ex))" -le 255 ] \
-          && [[ $code =~ $code_re ]] && [[ $so =~ ^(-|'<timeout>')$ || $so =~ $so_re && "${#so}" -le 300 ]] \
-          || { err invalid-input "malformed case line $n"; exit 2; }
+          && [[ $code =~ $code_re ]] || { err invalid-input "malformed case line $n"; exit 2; }
+        # stdout 欄は固定の正規化形式（空 / 異常マーカー / list:H とレコード列）だけを受理し、
+        # 種別 n（成功時は空出力）のケースの list 形式は拒否する。種別は固定ケース表から引く。
+        k=""
+        for entry_id in "${CASES[@]}"; do
+          if [ "${entry_id%%|*}" = "$id" ]; then
+            k="${entry_id#*|*|}"
+            k="${k%%|*}"
+            break
+          fi
+        done
+        so_ok=0
+        if [ "${#so}" -le 300 ]; then
+          if [ "$so" = "-" ] || [ "$so" = "<timeout>" ] || [[ $so =~ $so_unexp_re ]]; then
+            so_ok=1
+          elif [ "$k" != "n" ] && [[ $so =~ $so_list_re ]]; then
+            so_ok=1
+          fi
+        fi
+        [ "$so_ok" -eq 1 ] || { err invalid-input "malformed case line $n"; exit 2; }
         local var="${prefix}_${id}"
         [ -z "${!var+x}" ] || { err invalid-input "duplicate case id"; exit 2; }
         printf -v "$var" '%s' "${ex}/${code}/${so}"

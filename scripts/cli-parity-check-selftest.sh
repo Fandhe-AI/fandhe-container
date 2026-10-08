@@ -48,7 +48,11 @@ seen_root=0
 seen_pps=0
 root=""
 bad() {
-  if [ "$mode" = "noisy" ]; then
+  if [ "$mode" = "multierr" ]; then
+    printf '{"code":"INVALID_ARGUMENT","message":"a"}\n{"code":"INVALID_ARGUMENT","message":"b"}\n' >&2
+  elif [ "$mode" = "brokenerr" ]; then
+    printf '{"code":"INVALID_ARGUMENT"\n' >&2
+  elif [ "$mode" = "noisy" ]; then
     printf '{"code":"INVALID_ARGUMENT","message":"/home/secret-user/path \001 host-leak"}\n' >&2
   else
     printf '{"code":"INVALID_ARGUMENT","message":"usage"}\n' >&2
@@ -238,6 +242,23 @@ sed "s/^A02${tab}A${tab}2${tab}INVALID_ARGUMENT/A02${tab}A${tab}2${tab}<unparsed
 "$target" compare --baseline "$work/unparsed.txt" --candidate "$work/unparsed.txt" >"$work/cmp.txt" 2>&1
 expect_rc "identical <unparsed> records are rc 1" 1 $?
 grep -q '^A02 UNVERIFIED' "$work/cmp.txt" && pass "A02 <unparsed> reported as UNVERIFIED" || fail "A02 <unparsed> reported as UNVERIFIED"
+
+# --- stdout 欄が正規化形式でない capture は拒否する（garbage / list:garbage / 種別 n の list 形式） ---
+sed "s/^B03${tab}B${tab}0${tab}-${tab}.*/B03${tab}B${tab}0${tab}-${tab}garbage/" "$work/ok.txt" >"$work/g1.txt"
+"$target" compare --baseline "$work/g1.txt" --candidate "$work/g1.txt" >/dev/null 2>&1
+expect_rc "garbage stdout field is rejected" 2 $?
+sed "s/^B03${tab}B${tab}0${tab}-${tab}.*/B03${tab}B${tab}0${tab}-${tab}list:garbage/" "$work/ok.txt" >"$work/g2.txt"
+"$target" compare --baseline "$work/g2.txt" --candidate "$work/g2.txt" >/dev/null 2>&1
+expect_rc "list:garbage stdout field is rejected" 2 $?
+sed "s/^B02${tab}B${tab}0${tab}-${tab}.*/B02${tab}B${tab}0${tab}-${tab}list:H/" "$work/ok.txt" >"$work/g3.txt"
+"$target" compare --baseline "$work/g3.txt" --candidate "$work/g3.txt" >/dev/null 2>&1
+expect_rc "list form on a non-list case is rejected" 2 $?
+
+# --- stderr の構造を検証できない出力は code を拾わず <unparsed> にする ---
+run_capture multierr "$work/me.txt"
+[ "$(line_of "$work/me.txt" A02)" = $'A02\tA\t2\t<unparsed>\t-' ] && pass "multi-line stderr is unparsed" || fail "multi-line stderr is unparsed: $(line_of "$work/me.txt" A02)"
+run_capture brokenerr "$work/be.txt"
+[ "$(line_of "$work/be.txt" A02)" = $'A02\tA\t2\t<unparsed>\t-' ] && pass "broken JSON stderr is unparsed" || fail "broken JSON stderr is unparsed: $(line_of "$work/be.txt" A02)"
 
 # --- list 出力の末尾の余分な空行は正常出力と区別して異常にする ---
 run_capture blank "$work/blank.txt"

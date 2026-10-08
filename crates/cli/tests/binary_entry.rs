@@ -9,6 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const USAGE_JSON: &str = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs>\"}\n";
+#[cfg(target_os = "linux")]
 const UNIMPLEMENTED_JSON: &str =
     "{\"code\":\"UNIMPLEMENTED\",\"message\":\"command is not implemented yet\"}\n";
 
@@ -105,12 +106,17 @@ fn cli1_unknown_command_is_usage_error() {
     }
 }
 
-/// CLI-1: list / logs は未実装として終了コード 8（core の ERR-2 表）。余分な引数があっても同じ。
+/// CLI-1: list / logs は引数の過不足・未知オプションで使い方エラー（2）。stdout は空。
 #[test]
-fn cli1_other_commands_are_unimplemented() {
-    for c in ["list", "logs"] {
-        assert_failure(&run(&[c]), 8, UNIMPLEMENTED_JSON);
-        assert_failure(&run(&[c, "extra"]), 8, UNIMPLEMENTED_JSON);
+fn cli1_list_logs_usage_errors() {
+    for a in [
+        &["list", "extra"][..],
+        &["list", "--all"],
+        &["logs"],
+        &["logs", "a", "b"],
+        &["logs", "--x", "a"],
+    ] {
+        assert_failure(&run(a), 2, USAGE_JSON);
     }
 }
 
@@ -414,6 +420,79 @@ fn sec1_stop_delete_fail_closed_off_linux() {
         let out = run(&["--root", root.to_str().expect("utf8"), cmd, "c1"]);
         assert_eq!(out.status.code(), Some(8));
         assert_eq!(op_and_code(&out), (op.into(), "UNIMPLEMENTED".into()));
+        assert!(out.stdout.is_empty());
+    }
+}
+
+/// CLI-1・ERR-2: Linux で list は stdout にタブ区切りの一覧を出し（0 件はヘッダのみ・ID 昇順）、
+/// logs は不正 ID が 2、未作成が 3、存在する対象は内容未実装のため 8（stdout は空）。
+#[cfg(target_os = "linux")]
+#[test]
+fn cli1_list_logs_flow_on_linux() {
+    let tmp = TmpDir::new("listlogs");
+    let bundle = tmp.0.join("bundle");
+    std::fs::create_dir_all(bundle.join("rootfs")).expect("rootfs");
+    std::fs::write(
+        bundle.join("config.json"),
+        r#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"process":{"user":{"uid":0,"gid":0},"args":["/bin/echo","it"],"cwd":"/"},"linux":{"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"user"},{"type":"uts"},{"type":"ipc"}]}}"#,
+    )
+    .expect("config");
+    let root = tmp.0.join("state");
+    let root_s = root.to_str().expect("utf8");
+    let bundle_s = bundle.to_str().expect("utf8");
+
+    let out = run(&["--root", root_s, "list"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ID\tSTATUS\tPID\n");
+    assert!(out.stderr.is_empty());
+
+    for id in ["b2", "a1"] {
+        assert_failure_free(&run(&[
+            "--root", root_s, "create", "--bundle", bundle_s, id,
+        ]));
+    }
+    let out = run(&["--root", root_s, "list"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ID\tSTATUS\tPID\na1\tcreated\t-\nb2\tcreated\t-\n"
+    );
+    assert!(out.stderr.is_empty());
+
+    assert_failure(
+        &run(&["--root", root_s, "logs", "missing"]),
+        3,
+        "{\"code\":\"NOT_FOUND\",\"message\":\"container not found\"}\n",
+    );
+    assert_failure(
+        &run(&["--root", root_s, "logs", "a1"]),
+        8,
+        UNIMPLEMENTED_JSON,
+    );
+    assert_failure(
+        &run(&["--root", root_s, "logs", "a/b"]),
+        2,
+        "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"invalid argument\"}\n",
+    );
+}
+
+/// SEC-1: Linux 以外では状態ストアを開けず list / logs も fail-closed の UNIMPLEMENTED（8）。
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn sec1_list_logs_fail_closed_off_linux() {
+    let tmp = TmpDir::new("offlinux-ll");
+    let root = tmp.0.join("state");
+    let root_s = root.to_str().expect("utf8");
+    for args in [
+        &["--root", root_s, "list"][..],
+        &["--root", root_s, "logs", "c1"],
+    ] {
+        let out = run(args);
+        assert_eq!(out.status.code(), Some(8));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"not implemented on this platform\"}\n"
+        );
         assert!(out.stdout.is_empty());
     }
 }

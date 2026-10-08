@@ -1,9 +1,9 @@
-//! `create` / `start` / `stop` / `delete` の argv 解析（TASK-79.2.1・TASK-79.2.2・CLI-1・MS-6）。
+//! `create` / `start` / `stop` / `delete` / `list` / `logs` の argv 解析（TASK-79.2.1・TASK-79.2.2・TASK-79.3・CLI-1・MS-6）。
 //!
 //! `commands::run` が先頭のグローバルオプション（`--root`）とサブコマンド名の後ろを渡して呼ぶ純粋関数群。
 //! ファイルシステムにも環境にも触れず、値の意味検証（絶対パス・ID の文字種）は core の型
 //! （`ContainerId`・`CreateRequest`・`StateRoot`）に委ねる（検査の二重実装を避ける。SEC-1）。
-//! 構文は runc 互換: `fandhe-container [--root <dir>] create --bundle <dir> <id>` / `... start <id>` / `... stop <id>` / `... delete [--force] <id>`。
+//! 構文は runc 互換: `fandhe-container [--root <dir>] create --bundle <dir> <id>` / `... start <id>` / `... stop <id>` / `... delete [--force] <id>` / `... list` / `... logs <id>`。
 //! 解析失敗の理由は呼び出し元で固定文言に落とし、引数値を出力へ埋め込まない（インジェクション回避）。
 
 use std::ffi::OsString;
@@ -41,6 +41,16 @@ pub(super) struct DeleteArgs {
     pub(super) id: String,
     /// `--force`（core の `DeleteRequest::with_force` へ素通しする。生存中コンテナへは core が拒否する）。
     pub(super) force: bool,
+}
+
+/// `list` の引数（現状オプションなし。将来のオプション追加に備えて構造体にしておく。TASK-79.3）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ListArgs;
+
+/// `logs` の引数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LogsArgs {
+    pub(super) id: String,
 }
 
 /// 解析失敗（使い方エラー）。理由は呼び出し元で固定文言に写す。
@@ -129,6 +139,23 @@ pub(super) fn parse_delete(args: Vec<OsString>) -> Result<DeleteArgs, UsageError
     Ok(DeleteArgs {
         id: single_id(positional)?,
         force,
+    })
+}
+
+/// `list` を解析する（位置引数・オプションとも受け付けない。`--` 単独のみ許容）。
+pub(super) fn parse_list(args: Vec<OsString>) -> Result<ListArgs, UsageError> {
+    let mut it = args.into_iter();
+    match it.next() {
+        None => Ok(ListArgs),
+        Some(a) if a == "--" && it.next().is_none() => Ok(ListArgs),
+        Some(_) => Err(UsageError),
+    }
+}
+
+/// `logs <id>` を解析する（オプションは受け付けない）。
+pub(super) fn parse_logs(args: Vec<OsString>) -> Result<LogsArgs, UsageError> {
+    Ok(LogsArgs {
+        id: single_positional(args)?,
     })
 }
 
@@ -316,5 +343,39 @@ mod tests {
         let bad = || vec![OsString::from_vec(vec![0x66, 0xff])];
         assert_eq!(parse_stop(bad()), Err(UsageError));
         assert_eq!(parse_delete(bad()), Err(UsageError));
+    }
+
+    /// CLI-1: list は引数なし（または `--` のみ）だけ受理する。
+    #[test]
+    fn cli1_parse_list() {
+        assert_eq!(parse_list(v(&[])), Ok(ListArgs));
+        assert_eq!(parse_list(v(&["--"])), Ok(ListArgs));
+        for a in [v(&["x"]), v(&["--all"]), v(&["--", "x"]), v(&["-a"])] {
+            assert_eq!(parse_list(a), Err(UsageError));
+        }
+    }
+
+    /// CLI-1: logs は位置引数 1 個のみ。
+    #[test]
+    fn cli1_parse_logs() {
+        assert_eq!(parse_logs(v(&["c1"])), Ok(LogsArgs { id: "c1".into() }));
+        assert_eq!(
+            parse_logs(v(&["--", "-c"])),
+            Ok(LogsArgs { id: "-c".into() })
+        );
+        for a in [v(&[]), v(&["a", "b"]), v(&["--x", "a"]), v(&["-f"])] {
+            assert_eq!(parse_logs(a), Err(UsageError));
+        }
+    }
+
+    /// CLI-1: 非 UTF-8 の ID は logs でも使い方エラー。
+    #[cfg(unix)]
+    #[test]
+    fn cli1_parse_logs_rejects_non_utf8_id() {
+        use std::os::unix::ffi::OsStringExt;
+        assert_eq!(
+            parse_logs(vec![OsString::from_vec(vec![0x66, 0xff])]),
+            Err(UsageError)
+        );
     }
 }

@@ -95,7 +95,7 @@ pub(crate) mod sealed {
 /// パイプライン送信・バッチ ACK でやり取りする「壊れたフレームを表現できない」型の境界
 /// （REPAIR-2）。
 ///
-/// 実装できるのは本 crate 内で構築時に検証済みのフレーム型のみ（[`sealed::Sealed`] で
+/// 実装できるのは本 crate 内で構築時に検証済みのフレーム型のみ（`sealed::Sealed` で
 /// 封印）。長さ上限の検証・チェックサムの検証はフレーム型の構築時（TASK-11.2・
 /// TASK-11.3）に行われ、[`FrameReceiver::recv_frame`] は検証済みの値だけを返す契約と
 /// する。本 crate では [`crate::protocol::Frame`]（TASK-11.3・#70）がこのトレイトを

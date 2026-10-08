@@ -5,7 +5,7 @@
 //! トランスポートである。UDS 版（[`crate::server`]）と同じ [`FrameSender`] /
 //! [`FrameReceiver`] / [`SplitTransport`] の契約（フレーム単位の期限・poison・受信上限・
 //! 観測フック）を満たし、ストリーム上の期限付き read / write は
-//! [`crate::stream_io`] を UDS と共有する。
+//! `crate::stream_io` を UDS と共有する。
 //!
 //! # 呼び出し文脈
 //! - ホスト側: microVM 層（`fandhe-container-plugin-microvm`。MVM 系）が [`VsockServer`] で

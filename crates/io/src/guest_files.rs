@@ -32,8 +32,8 @@
 //!   （ホスト上でちょうど 1 個の `Normal`。`\` と `:` は 3 OS とも拒否して挙動を
 //!   揃える）だけを扱う。Linux / macOS では共有ルートのディレクトリ fd を起点に
 //!   `mkdirat` / `openat`（`O_DIRECTORY|O_NOFOLLOW`）で祖先を 1 個ずつ辿り、末端は
-//!   `O_CREAT|O_EXCL|O_NOFOLLOW` で作る（[`crate::sys::mkdir_beneath`]・
-//!   [`crate::sys::open_dir_beneath`]・[`crate::sys::create_leaf_beneath`]）。
+//!   `O_CREAT|O_EXCL|O_NOFOLLOW` で作る（`crate::sys::mkdir_beneath`・
+//!   `crate::sys::open_dir_beneath`・`crate::sys::create_leaf_beneath`）。
 //!   パスを再解決しないため、祖先の symlink すり替え（TOCTOU）でも共有ルート外へ
 //!   は出られない。
 //! - Windows は `NtCreateFile` のルート相対ハンドル作成が未実装のため、祖先を

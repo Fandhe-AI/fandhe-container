@@ -61,6 +61,27 @@ expect_case old-kernel-zero-scanouts 1 "kms=probe_failed_zero_scanouts" --dmesg-
 expect_case no-virtio-gpu 1 "probe=missing
 capset_info=missing" --dmesg-file "$fx/no-virtio-gpu.log"
 expect_case empty-input 1 "probe=missing" --dmesg-file "$fx/empty.log"
+expect_case multi-device 1 "probe=multiple_devices" --dmesg-file "$fx/multi-device.log"
+expect_case capset-version-nonzero 1 "capset_max_version=3" --dmesg-file "$fx/capset-version-nonzero.log"
+expect_case host-window-zero 1 "host_memory_window=zero_size" --dmesg-file "$fx/host-window-zero.log"
+expect_case venus-diagnostic-only 1 "venus_init=missing" --dmesg-file "$fx/ok.log" --vulkaninfo-file "$fx/vulkaninfo-diagnostic.txt"
+expect_case venus-no-devices 1 "venus_init=no_devices" --dmesg-file "$fx/ok.log" --vulkaninfo-file "$fx/vulkaninfo-nodevices.txt"
+
+# dmesg 取得失敗は終了コード 2（偽の dmesg を PATH 先頭に置く）
+fakebin="$(mktemp -d)"
+printf '#!/bin/sh\necho "dmesg: read kernel buffer failed: Operation not permitted" >&2\nexit 1\n' >"$fakebin/dmesg"
+chmod +x "$fakebin/dmesg"
+set +e
+PATH="$fakebin:$PATH" bash "$script" >/dev/null 2>&1
+dm_rc=$?
+set -e
+if [ "$dm_rc" -ne 2 ]; then
+  echo "FAIL dmesg-failure: exit code $dm_rc, want 2" >&2
+  failures=$((failures + 1))
+else
+  echo "ok   dmesg-failure"
+fi
+rm -rf "$fakebin"
 
 # 入力・引数エラー（終了コード 2）
 expect_case missing-file 2 "" --dmesg-file "$fx/does-not-exist.log"

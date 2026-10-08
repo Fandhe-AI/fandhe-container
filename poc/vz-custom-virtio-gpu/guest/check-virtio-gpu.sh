@@ -68,9 +68,18 @@ load_limited() { # $1=src $2=dest
 if [ -n "$dmesg_file" ]; then
   load_limited "$dmesg_file" "$tmp"
 else
-  dmesg 2>/dev/null | head -c "$((MAX_INPUT_BYTES + 1))" >"$tmp" || true
+  # 取得失敗（権限不足・dmesg 不在）は入力エラーとして終了コード 2 で返す。上限超過による
+  # head の早期終了（dmesg 側の SIGPIPE = 141）だけは意図的な打ち切りとして区別する。
+  set +e
+  dmesg 2>/dev/null | head -c "$((MAX_INPUT_BYTES + 1))" >"$tmp"
+  dmesg_status=("${PIPESTATUS[@]}")
+  set -e
   if [ "$(wc -c <"$tmp")" -gt "$MAX_INPUT_BYTES" ]; then
     echo "error: input exceeds size limit" >&2
+    exit 2
+  fi
+  if [ "${dmesg_status[0]}" -ne 0 ] || [ "${dmesg_status[1]}" -ne 0 ]; then
+    echo "error: failed to read dmesg" >&2
     exit 2
   fi
 fi
@@ -80,6 +89,26 @@ fi
 
 rc=0
 fail() { rc=1; }
+
+# 複数の virtio-gpu が混在すると別デバイスの行を組み合わせて合否が決まるため、デバイス
+# 識別子（virtioN）単位に限定する。デバイスが複数、または同一デバイスの probe 区間が
+# 複数（再 probe）ある場合は帰属を決められないので fail-closed で打ち切る。
+devs="$(grep -oE 'virtio.?gpu virtio[0-9]+:' "$tmp" | grep -oE 'virtio[0-9]+' | sort -u || true)"
+dev_count="$(printf '%s' "$devs" | grep -c . || true)"
+if [ "$dev_count" -gt 1 ]; then
+  echo "probe=multiple_devices"
+  exit 1
+elif [ "$dev_count" -eq 1 ]; then
+  tmpdev="$(mktemp)"
+  trap 'rm -f "$tmp" "$tmpvk" "$tmpdev"' EXIT
+  grep -E "virtio.?gpu ${devs}:" "$tmp" >"$tmpdev" || true
+  mv -f -- "$tmpdev" "$tmp"
+  sections="$(grep -c 'number of cap sets: ' "$tmp" || true)"
+  if [ "$sections" -gt 1 ]; then
+    echo "probe=multiple_sections"
+    exit 1
+  fi
+fi
 
 # features 行（例: virtio_gpu virtio0: features: +virgl -edid +resource_blob +host_visible）
 # context_init は別行（features: +context_init）に出る。両行を結合して照合する。
@@ -144,6 +173,7 @@ else
     echo "capset_info=venus"
     echo "capset_max_version=$ver"
     echo "capset_max_size=$sz"
+    [ "$ver" = "0" ] || fail
     # max-size 0 は PoC-14 の既知の失敗形（Mesa が物理デバイス 0 件と判定）。
     [ "$sz" = "160" ] || fail
   else
@@ -155,7 +185,13 @@ fi
 hm="$(grep -oE 'Host memory window: 0x[0-9a-fA-F]+ \+0x[0-9a-fA-F]+' "$tmp" | head -n 1 || true)"
 if [ -n "$hm" ]; then
   echo "host_memory_window=present"
-  echo "host_memory_window_size=${hm##*+}"
+  hm_size="${hm##*+}"
+  echo "host_memory_window_size=$hm_size"
+  # サイズ 0（+0x0）は共有メモリ窓として無効。
+  if [ -z "$(printf '%s' "${hm_size#0x}" | sed -E 's/^0+//')" ]; then
+    echo "host_memory_window=zero_size"
+    fail
+  fi
 else
   echo "host_memory_window=missing"
   fail
@@ -163,7 +199,11 @@ fi
 
 # venus 初期化（任意）。vulkaninfo --summary の出力に venus ドライバがあるか。
 if [ -n "$vk_file" ]; then
-  if grep -qiE 'venus' "$tmpvk"; then
+  # GPU の列挙と driverName = venus を構造に沿って確認する（診断文の出現では成功にしない）。
+  if ! grep -qE '^GPU[0-9]+:' "$tmpvk"; then
+    echo "venus_init=no_devices"
+    fail
+  elif grep -qiE '^[[:space:]]*driverName[[:space:]]*=[[:space:]]*venus[[:space:]]*$' "$tmpvk"; then
     echo "venus_init=ok"
   else
     echo "venus_init=missing"

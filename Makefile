@@ -237,10 +237,6 @@ else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため test をスキップ"
 endif
 
-# core の plugin 無効構成の検証（PLUG-3・TASK-111.1・#262。REPAIR-10 (d)）。
-# `--no-default-features` で core がビルド・テストでき、依存ツリーに plugin 境界基盤
-# （fandhe-container-plugin）が入らないことを確認する。`make ci` には含めない
-# （CI の rust-ci-default-features ジョブが同じターゲットを実行する）。
 # CLI が macOS / Windows のバックエンド実装へ直接依存しないことの機械判定（CLI-1・PLUG-4・TASK-79.4）。
 # macOS / Windows は core の plugin 発見・登録機構経由で呼ぶ。`cargo tree` の通常依存に
 # platform-* / plugin-macos / plugin-windows が現れたら NG（cargo tree の失敗も NG）。
@@ -260,6 +256,10 @@ else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため check-cli-backend-deps をスキップ"
 endif
 
+# core の plugin 無効構成の検証（PLUG-3・TASK-111.1・#262。REPAIR-10 (d)）。
+# `--no-default-features` で core がビルド・テストでき、依存ツリーに plugin 境界基盤
+# （fandhe-container-plugin）が入らないことを確認する。`make ci` には含めない
+# （CI の rust-ci-default-features ジョブが同じターゲットを実行する）。
 .PHONY: test-core-no-plugin
 test-core-no-plugin: ## core を --no-default-features でテストし plugin 依存が入らないことを検証する
 ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)

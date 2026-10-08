@@ -830,17 +830,22 @@ mod tests {
             .map(|t| {
                 let path = path.clone();
                 let barrier = Arc::clone(&barrier);
+                let (tx, rx) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
                     let rec = recorder_with(&format!("op{t}"));
                     barrier.wait();
                     for _ in 0..ROUNDS {
                         export_ops(&rec, Some(path.as_os_str()));
                     }
-                })
+                    let _ = tx.send(());
+                });
+                rx
             })
             .collect();
-        for h in handles {
-            h.join().expect("join");
+        // 各スレッドの完了は有限期限で待つ（REPAIR-5。panic で送信側が落ちた場合も即座に失敗する）。
+        for rx in handles {
+            rx.recv_timeout(Duration::from_secs(30))
+                .expect("export_ops threads must finish within 30s");
         }
         let text = std::fs::read_to_string(&path).expect("read");
         let _ = std::fs::remove_file(&path);
@@ -900,10 +905,27 @@ mod tests {
             let p =
                 std::env::temp_dir().join(format!("fc-cli-oplog-{name}-{}", std::process::id()));
             let _ = std::fs::remove_file(&p);
-            let st = std::process::Command::new("mkfifo")
+            // 子プロセスの終了は有限期限で待ち、超過時は kill して回収も期限つきで行う（REPAIR-5）。
+            let mut child = std::process::Command::new("mkfifo")
                 .arg(&p)
-                .status()
+                .stdin(std::process::Stdio::null())
+                .spawn()
                 .expect("mkfifo");
+            let poll = |child: &mut std::process::Child, limit: Duration| {
+                let deadline = Instant::now() + limit;
+                loop {
+                    match child.try_wait().expect("poll mkfifo") {
+                        Some(st) => return Some(st),
+                        None if Instant::now() >= deadline => return None,
+                        None => std::thread::sleep(Duration::from_millis(5)),
+                    }
+                }
+            };
+            let Some(st) = poll(&mut child, Duration::from_secs(10)) else {
+                let _ = child.kill();
+                let _ = poll(&mut child, Duration::from_secs(5));
+                panic!("mkfifo did not exit within 10s");
+            };
             assert!(st.success());
             p
         };

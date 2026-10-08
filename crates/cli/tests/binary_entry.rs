@@ -234,21 +234,30 @@ fn repair4_concurrent_processes_keep_op_log_lines_intact() {
         .map(|_| {
             let log = log.clone();
             let barrier = std::sync::Arc::clone(&barrier);
+            let (tx, rx) = mpsc::channel();
             thread::spawn(move || {
                 barrier.wait();
-                (0..ROUNDS)
+                let outs = (0..ROUNDS)
                     .map(|_| {
                         run_env(
                             &["create", "--bundle", "rel/b", "c1"],
                             &[("FANDHE_CONTAINER_OP_LOG", log.as_os_str())],
                         )
                     })
-                    .collect::<Vec<Output>>()
-            })
+                    .collect::<Vec<Output>>();
+                let _ = tx.send(outs);
+            });
+            rx
         })
         .collect();
-    for h in handles {
-        for out in h.join().expect("join") {
+    // 各 worker の完了は有限期限で待つ（REPAIR-5）。1 回の起動は `run_env` が CHILD_TIMEOUT + REAP_TIMEOUT で
+    // 打ち切るため、ROUNDS 回ぶんを上限とする。
+    let worker_limit = (CHILD_TIMEOUT + 2 * REAP_TIMEOUT) * ROUNDS as u32;
+    for rx in handles {
+        let outs = rx
+            .recv_timeout(worker_limit)
+            .expect("workers must finish within the deadline");
+        for out in outs {
             assert_eq!(out.status.code(), Some(2));
             assert_eq!(
                 op_and_code(&out),

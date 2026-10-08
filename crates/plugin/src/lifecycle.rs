@@ -603,7 +603,7 @@ impl ChildGuard {
         // 報告しない。PLUG-7・REPAIR-5）。直接の子も回収できなければ `Unreaped` が優先する。
         #[cfg(unix)]
         let group_failed = !self.leader_reaped
-            && crate::sys::kill_process_group(c.id())
+            && kill_group_retrying_eperm(c.id())
                 .err()
                 .is_some_and(|e| !group_kill_tolerated(&e));
         #[cfg(not(unix))]
@@ -684,6 +684,35 @@ impl Drop for ChildGuard {
     fn drop(&mut self) {
         if !self.reported_unreaped {
             let _ = self.kill_and_reap();
+        }
+    }
+}
+
+/// `EPERM` が出た間だけ短時間再送する上限（#1311・PLUG-7・REPAIR-5）。
+#[cfg(unix)]
+const GROUP_KILL_EPERM_RETRY: Duration = Duration::from_millis(200);
+
+/// プロセスグループへ `SIGKILL` を送る。`EPERM` のときだけ [`GROUP_KILL_EPERM_RETRY`] まで再送する。
+///
+/// macOS は spawn 直後で plugin 本体が `exec` 中の窓にも `kill(2)` が `EPERM` を返すことがあり、この一過性の
+/// 失敗を 1 回で確定すると生存中のグループを `GroupKillFailed` と誤報し、直後の `Child::kill` も同じ窓で
+/// 失敗して回収できなくなる。窓は短いので再送で解消する。ゾンビのみのグループの `EPERM` は解消しないため、
+/// 上限後は最後のエラーをそのまま返し、呼び出し側が `GroupKillFailed` として報告する（成功扱いにしない）。
+/// 呼び出し側の不変条件（リーダー未回収）は [`crate::sys::kill_process_group`] と同じ。
+#[cfg(unix)]
+fn kill_group_retrying_eperm(pgid: u32) -> io::Result<()> {
+    const EPERM: i32 = 1;
+    let start = Instant::now();
+    let mut interval = Duration::from_millis(1);
+    loop {
+        match crate::sys::kill_process_group(pgid) {
+            Err(e)
+                if e.raw_os_error() == Some(EPERM) && start.elapsed() < GROUP_KILL_EPERM_RETRY =>
+            {
+                std::thread::sleep(interval);
+                interval = (interval * 2).min(POLL_MAX);
+            }
+            other => return other,
         }
     }
 }

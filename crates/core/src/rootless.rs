@@ -804,11 +804,41 @@ fn run_helper(
     let err = stderr_rx
         .and_then(|rx| rx.recv_timeout(Duration::from_secs(1)).ok())
         .unwrap_or_default();
-    Err(RootlessError::new(
+    Err(helper_failure(stage, status, &err))
+}
+
+/// ヘルパーが非ゼロ終了したときのエラーを作る（stderr は [`sanitize_stderr`] を通して載せる）。
+///
+/// [`run_helper`] の失敗経路の本体。結合試験が実ヘルパー（root 所有の実行ファイルが要る）なしで
+/// メッセージの具体値を照合できるよう分離している（REPAIR-12）。
+fn helper_failure(
+    stage: RootlessStage,
+    status: std::process::ExitStatus,
+    stderr: &[u8],
+) -> RootlessError {
+    RootlessError::new(
         ErrorCode::PermissionDenied,
         stage,
-        format!("id map helper failed ({status}): {}", sanitize_stderr(&err)),
-    ))
+        format!(
+            "id map helper failed ({status}): {}",
+            sanitize_stderr(stderr)
+        ),
+    )
+}
+
+/// 結合試験 `tests/sanitize_integration.rs` 専用の入口: ヘルパー失敗のエラー生成経路を、終了状態と
+/// stderr の生バイトから直接呼ぶ（TASK-96.1・ERR-2・REPAIR-12。通常の利用者は呼ばない）。
+///
+/// 実ヘルパーの起動は root 所有の実行ファイルを要し既定のテスト集合で再現できないため、
+/// [`run_helper`] が失敗時に通るのと同じ `helper_failure` を公開する。`exec-test-support` feature を
+/// 付けたビルドにだけ存在する。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn helper_failure_error_for_test(
+    status: std::process::ExitStatus,
+    stderr: &[u8],
+) -> RootlessError {
+    helper_failure(RootlessStage::Helper, status, stderr)
 }
 
 /// `/proc/<pid>/{uid,gid}_map` の内容（空白区切り 3 数値の行）を解析する。

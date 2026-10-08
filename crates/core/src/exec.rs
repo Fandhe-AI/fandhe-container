@@ -186,6 +186,18 @@ pub use stages::{StageHook, StageKind, StagePipeline, StageReport, StageStatus};
 pub use tmpfs::mount_tmpfs_with_attach_hook;
 pub use tmpfs::{TmpfsMountOutcome, TmpfsReport, mount_tmpfs};
 
+/// 結合試験 `tests/sanitize_integration.rs` 専用の入口: パス検証の拒否（対象パス付きの違反記録）を
+/// 作る（SEC-4・TASK-96.1・REPAIR-12。通常の利用者は呼ばない）。
+///
+/// 実際の拒否は `mount_proc` 等が特権（mount namespace の分離）を要する経路でしか得られないため、
+/// それらが拒否時に通るのと同じ `ExecError::from_violation` を公開する。`exec-test-support` feature
+/// を付けたビルドにだけ存在する。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn path_violation_error_for_test(reason: ViolationReason, subject: &Path) -> ExecError {
+    ExecError::from_violation(reason, Some(subject))
+}
+
 pub use violation::{
     IsolationViolation, VIOLATION_SUBJECT_MAX_CHARS, ViolationKind, ViolationReason,
     ViolationSubject,

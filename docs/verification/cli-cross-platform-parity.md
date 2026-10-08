@@ -12,7 +12,7 @@ TASK-125（共同タスク）の確認記録の雛形。実機での実行・結
 | ---- | ---- |
 | 非 Linux の plugin 起動・RPC | 発見 → 登録 → 信頼性検証までは配線済みだが、plugin の起動と RPC は未実装（TASK-114）。macOS / Windows ではバックエンド解決が必ず失敗する。よって B 層（挙動）の非 Linux 欄は **前提未達** であり、合格として記入しない |
 | Linux 経路の未実装 | `start` の本番 launcher、`logs`、pid ありの `stop`、cgroup 配置つき `delete` は未実装（REPAIR-3）。Linux 側の現行値（`start` = 8 など）は「現行実装での参考値」で、launcher 提供後に変わる。固定の合格基準にしない |
-| Windows の自動化 | `scripts/cli-parity-check.sh` は Git Bash での実行を想定するが、CI では未検証（自己テストは ubuntu・macos のみ） |
+| Windows の自動化 | `scripts/cli-parity-check.sh` は Git Bash で実行する。スタブ CLI による自己テストは CI の 3 OS（ubuntu・macos・windows）で実行しているが、製品バイナリ（ネイティブ exe）に対する capture は CI で確かめていない（実機確認の範囲） |
 
 期待値の正は「Linux ネイティブ実行と同一」。Linux の capture を基準にして他 OS を突き合わせる。
 
@@ -44,7 +44,7 @@ TASK-125（共同タスク）の確認記録の雛形。実機での実行・結
 - 固定文言の失敗（使い方エラー・未実装・状態ルート不在など）: `{"code":"<CODE>","message":"<文字列>"}`
 - core 由来の失敗（`create` / `start` / `stop` / `delete`）: `{"op":"<操作>","code":"<CODE>","message":"<文字列>"}`（`stop` の `op` は `kill`）
 
-`message` は JSON 文字列として検証する（未エスケープの `"`・`\`・制御文字、不正なエスケープ、不正な UTF-8 は拒否）。記録と比較の対象は `code` だけで、`op` の有無と値・`message` の内容は記録しない。上記以外の出力（キーの追加・欠落・順序違い、複数行、LF 終端なし、16384 バイト超）は `<unparsed>` と記録し、compare は同じ `<unparsed>` 同士でも一致扱いにしない（UNVERIFIED）。
+`message` は JSON 文字列として検証する（未エスケープの `"`・`\`・制御文字、不正なエスケープ、不正な UTF-8 は拒否）。記録と比較の対象は `code` だけで、`op` の有無と値・`message` の内容は記録しない。上記以外の出力（キーの追加・欠落・順序違い、複数行、LF 終端なし、NUL、16384 バイト超）は `<unparsed>` と記録し、compare は同じ `<unparsed>` 同士でも一致扱いにしない（UNVERIFIED）。
 
 エラー形式は TASK-95（ERR 系）で確定する。キーの追加など形式が変わった場合は `scripts/cli-parity-check.sh` の受理形式を追従させる必要がある（追従前は該当ケースが `<unparsed>` になり、合格には見えない）。手動手順で転記する場合も、stderr が上の形式の 1 行であることを確かめてから `code` を書く。
 

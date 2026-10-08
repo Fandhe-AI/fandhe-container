@@ -3,7 +3,7 @@
 //! # 役割と呼び出し文脈
 //!
 //! `docker run --ipc=<mode>` 相当の指定を検証済みの [`IpcMode`] へ写し、`ContainerOptions` が保持する。
-//! Linux では [`IpcMode::apply_to`] が core の `exec::NamespaceSet` を組み替え、
+//! Linux では `IpcMode::apply_to` が core の `exec::NamespaceSet` を組み替え、
 //! `exec::plan` / `exec::isolate` が IPC namespace を作る（`Shareable`・`Private`）か作らない（`Host`）かを決める。
 //!
 //! # 分離の緩和（セキュリティ）

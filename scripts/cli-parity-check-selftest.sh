@@ -142,7 +142,7 @@ case "$cmd" in
   list) [ $# -eq 0 ] || bad ;;
   *) bad ;;
 esac
-# 非 Linux は plugin 未配線の固定文言（CliExit::Failed。op なし）。
+# 非 Linux は plugin 未配線の固定文言（CliExit::failed() が返す CliExit::Error。op なし）。
 [ "$mode" = "nonlinux" ] && fail_with 5 FAILED_PRECONDITION
 case "$cmd" in
   list)

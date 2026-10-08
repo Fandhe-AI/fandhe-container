@@ -14,6 +14,9 @@
 //! シグナル番号の具体値として検証する。
 //!
 //! 待ちはすべて有限の期限付き（REPAIR-5）。
+//!
+//! plugin 役の受信記録は feature `signal-test-support` の固定の記録ハンドラを使う（`Cargo.toml` の自己参照
+//! dev-dependency で常に有効。feature が無ければコンパイルが失敗し、検証せずに成功しない）。
 
 #![cfg(unix)]
 
@@ -26,7 +29,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 const WAIT: Duration = Duration::from_secs(20);
@@ -35,13 +38,6 @@ const DIR_ENV: &str = "FCSF_DIR";
 /// 設定時、親役はシグナルを受けず、トリガーファイルの指示で転送関数を直接呼ぶ（親は生存し続ける）。
 const DIRECT_ENV: &str = "FCSF_DIRECT";
 const TRIGGER_FILE: &str = "trigger";
-
-/// plugin 役のハンドラが受信シグナル番号を残す先（async-signal-safe な原子変数）。
-static RECEIVED: AtomicI32 = AtomicI32::new(0);
-
-extern "C" fn record_signal(sig: i32) {
-    RECEIVED.store(sig, Ordering::SeqCst);
-}
 
 /// 親役の入口。通常のテスト実行（`FCSF_ROLE` 未設定）では何もしない。
 #[test]
@@ -111,8 +107,7 @@ fn plugin_entry() {
     let name = sock.file_name().unwrap().to_string_lossy().into_owned();
     // 応答も読み取りもしない。受信したシグナル番号を記録して終了する（記録はハンドラ外で行う）。
     for sig in [1, 2, 15] {
-        fandhe_container_cli::signals::install_recording_handler_for_test(sig, record_signal)
-            .unwrap();
+        fandhe_container_cli::signals::install_recording_handler_for_test(sig).unwrap();
     }
     // 全ハンドラの登録後に PID ファイル（準備完了の合図）を公開する。先に公開すると、転送が先に届いて
     // 既定動作で終了し得る。
@@ -123,7 +118,7 @@ fn plugin_entry() {
     .unwrap();
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(40) {
-        let sig = RECEIVED.load(Ordering::SeqCst);
+        let sig = fandhe_container_cli::signals::recorded_signal_for_test();
         if sig != 0 {
             let tmp = sock.with_file_name(format!("{name}.sig.tmp"));
             std::fs::write(&tmp, sig.to_string()).unwrap();

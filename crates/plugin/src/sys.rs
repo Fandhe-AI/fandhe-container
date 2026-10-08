@@ -2202,6 +2202,36 @@ pub(crate) fn send_signal(pid: i32, sig: i32) -> bool {
     unsafe { kill(pid, sig) == 0 }
 }
 
+#[cfg(test)]
+unsafe extern "C" {
+    // SAFETY（宣言そのものの妥当性）: POSIX の `pid_t waitpid(pid_t pid, int *status, int options)`
+    // （`pid_t`・`int` は Linux・macOS とも `i32`）。出典: `man 2 waitpid`。テスト専用。
+    fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+}
+
+/// テスト専用: `pid` の子を `waitpid(pid, WNOHANG)` で 1 回だけ回収する。回収したら `Ok(true)`、まだ
+/// 動いていれば `Ok(false)`。`ChildGuard` の外の回収者（ライブラリ利用側の `waitpid` 等）を模し、
+/// `ECHILD` の経路（#1513・PLUG-7）を決定的に作るために `crate::lifecycle` のテストから呼ぶ。
+/// `pid` に負値・0 を渡さない（任意の子を回収しない）ため、呼び出し側は自分が起動した子の pid だけを渡す。
+#[cfg(test)]
+pub(crate) fn reap_child_for_test(pid: u32) -> std::io::Result<bool> {
+    // WNOHANG は Linux（`bits/waitflags.h`）・macOS（`sys/wait.h`）とも 1。
+    const WNOHANG: i32 = 1;
+    let pid = i32::try_from(pid)
+        .ok()
+        .filter(|p| *p > 0)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let mut status = 0i32;
+    // SAFETY: `status` は呼び出し中有効なスタック上の書き込み可能な `i32`。`pid` は正の値に限定済みで、
+    // 特定の 1 プロセスだけを対象にする（`-1`・`0` のグループ指定にならない）。
+    let r = unsafe { waitpid(pid, &mut status, WNOHANG) };
+    match r {
+        0 => Ok(false),
+        r if r == pid => Ok(true),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
 /// #1514・PLUG-7: `set_parent_death_sigkill` の親 pid 照合（fork から prctl までの窓そのものは、親を決定的に
 /// 割り込ませる手段がなく再現できないため、照合の分岐を不一致の pid で代替検証する）。
 #[cfg(all(

@@ -107,6 +107,7 @@ pub enum ResidentState {
     /// 子が稼働中で、接続を保持している。
     Running,
     /// 子が自発的に終了し、回収済み。`code` はシグナル終了などで取得できない場合 `None`。
+    /// 他所で回収され終了状態が不明な場合（`code: None`）を含む。
     Exited { code: Option<i32> },
     /// 往復の失敗等でこちらが強制終了し、回収まで確認した。
     Killed,
@@ -498,6 +499,11 @@ impl ResidentPlugin {
             Reap::AlreadyReaped => {
                 self.state = ResidentState::Killed;
                 original
+            }
+            // 他所で回収された（ECHILD 等。#1513）。終了状態が失われたため終了コード不明の終了として扱う。
+            Reap::Lost => {
+                self.state = ResidentState::Exited { code: None };
+                exited_error(None)
             }
             Reap::Unreaped => {
                 self.state = ResidentState::Unreaped;

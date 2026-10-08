@@ -23,6 +23,20 @@ fandhe-container-core = { path = "../core" }
 # 親が受けた SIGINT・SIGTERM・SIGHUP を起動中の plugin へ転送する API を使う workspace 内 path 依存（#1513・PLUG-7。外部クレートの追加ではない）。
 fandhe-container-plugin = { path = "../plugin" }
 
+# signal-test-support: 結合試験（tests/signal_forward.rs）の plugin 役が使う、固定の記録ハンドラ（受信番号を
+# 原子変数へ store するだけ）の登録と読み出し（`signals::install_recording_handler_for_test`・
+# `signals::recorded_signal_for_test`）を公開する（#1513・PLUG-7・PR #1572 事後監査の P2）。既定のビルドには
+# 含めない。リリースビルドで有効にするとコンパイルが止まる（src/lib.rs の `compile_error!`）。依存は増えない。
+[features]
+signal-test-support = []
+
+# 自己参照の dev-dependency（supervisor・core と同じ仕組み。外部クレートの追加ではない）: cli 自身のテストでは
+# `signal-test-support` を常に有効にし、試験専用の入口を使う結合試験（signal_forward）が `cargo test --workspace`
+# の既定のテスト集合から外れないようにする。通常のビルド（`cargo build`・リリース成果物）は dev-dependency を
+# 解決しないため、feature は無効のまま。
+[dev-dependencies]
+fandhe-container-cli = { path = ".", features = ["signal-test-support"] }
+
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]
 workspace = true

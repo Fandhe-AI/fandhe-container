@@ -198,7 +198,7 @@ impl OneShotPlugin {
 #[non_exhaustive]
 pub enum OneShotTermination {
     /// 自発終了した（強制終了を試みる直前・直後に自発終了していた場合を含む）。`code` はシグナル
-    /// 終了などで取得できない場合 `None`。
+    /// 終了などで取得できない場合 `None`。他所で回収され終了状態が不明な場合（`code: None`）を含む。
     Exited { code: Option<i32> },
     /// 猶予内に終了せず強制終了し、回収まで確認した（回収した終了状態が強制終了によるもの）。
     Killed,
@@ -480,6 +480,9 @@ struct ChildGuard {
     /// 解放する。回収後に再利用された pid へシグナルを送らないための構造で、回収は必ず
     /// [`Self::try_wait`] / [`Self::kill_and_reap`] を経由する。
     slot: Option<SlotToken>,
+    /// 子の状態を追跡できなくなったか（`waitpid` が失敗した。主に `ECHILD`＝契約外の回収者による回収）。
+    /// true なら `child` と `slot` は手放し済みで、以後 kill も回収も転送もしない終端状態（[`Reap::Lost`]）。
+    lost: bool,
 }
 
 impl ChildGuard {
@@ -488,6 +491,7 @@ impl ChildGuard {
             child: Some(child),
             reported_unreaped: false,
             slot: None,
+            lost: false,
         }
     }
 
@@ -505,8 +509,18 @@ impl ChildGuard {
     /// まだ動いていれば戻す。外した窓の間に届いたシグナルは転送されない（取りこぼす側）。進行中の転送の
     /// 完了を確認できないときは回収せず `Ok(None)`（まだ動いている扱い）を返し、次の周回に委ねる。
     /// 将来 `suspend` を使わず pidfd 等で回収と転送の競合を除く案がある（現状は #1514 の `PR_SET_PDEATHSIG` で補完する）。
+    ///
+    /// `waitpid` の失敗（`Err`）は終端として扱う（[`Self::mark_lost`]）。`ECHILD` は契約外の回収者
+    /// （継承した `SIGCHLD` の `SIG_IGN`・`SA_NOCLDWAIT`・ライブラリ利用側の `waitpid(-1)` 等）が子を回収
+    /// 済みであることを意味し、pid は既に再利用され得る。登録を戻すと転送が無関係なプロセス（グループ）へ
+    /// 届き得るため戻さず、以後 kill もしない（#1513・PLUG-7。core の `exec::process` の `Lost` と同じ扱い）。
+    /// `WNOHANG` の `waitpid` が返し得る他のエラー（`EINVAL` 等）は実質起きないが、状態を確認できない子へ
+    /// 送らない側（fail-closed）に倒して同じく終端にする。終端後の呼び出しは `Err` を返し続ける。
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         let Some(c) = self.child.as_mut() else {
+            if self.lost {
+                return Err(lost_error());
+            }
             return Ok(None);
         };
         if let Some(slot) = &self.slot
@@ -519,13 +533,24 @@ impl ChildGuard {
         match result {
             // 回収した。pid は再利用され得るため、登録を戻さず解放する。
             Ok(Some(_)) => self.slot = None,
-            _ => {
+            Ok(None) => {
                 if let Some(slot) = &self.slot {
                     slot.resume();
                 }
             }
+            // 他所で回収済み（ECHILD）または状態不明。登録を戻さず、子を手放す。
+            Err(_) => self.mark_lost(),
         }
         result
+    }
+
+    /// 子を追跡できない終端状態にする。登録表のスロットを解放し（以後転送しない）、`Child` を手放す
+    /// （以後 `kill` しない。std の `Child::kill` は回収済みを知らない限り `kill(pid)` を送るため、
+    /// 再利用された pid へ SIGKILL を送らないよう保持しない）。`Child` の破棄は kill も wait もしない。
+    fn mark_lost(&mut self) {
+        self.slot = None;
+        self.child = None;
+        self.lost = true;
     }
 
     /// kill して回収を `ONE_SHOT_REAP_TIMEOUT` まで待つ。
@@ -535,14 +560,23 @@ impl ChildGuard {
     /// 回収できた場合は終了状態を捨てずに返す。kill の直前・直後に子が自発終了していた場合、
     /// 回収される状態は「こちらの kill」ではなく子自身の終了状態になるため、呼び出し側が
     /// [`classify_reaped`] で区別する（異常終了を強制終了と取り違えて成功扱いしない。PLUG-7）。
+    ///
+    /// `waitpid` が失敗した場合（他所での回収の `ECHILD` 等）は kill せず [`Reap::Lost`] を返す
+    /// （[`Self::try_wait`] の終端の扱いと同じ。pid が再利用され得るため）。
     fn kill_and_reap(&mut self) -> Reap {
         let Some(c) = self.child.as_mut() else {
+            if self.lost {
+                return Reap::Lost;
+            }
             return Reap::AlreadyReaped;
         };
         // 直後に SIGKILL するため転送は不要。以後の回収で pid が再利用され得るので、先に登録を外し、
         // 進行中の転送の完了を待つ。上限内に確認できなければ回収しない（ロード済みの pid へ送信中の
         // 転送スレッドが、回収後に再利用された pid へ送る誤配送を防ぐ。PLUG-7・fail-closed）。
         // この場合も kill は安全（未回収の子の pid は再利用されない）なので送り、`Unreaped` を返す。
+        // ただし回収と転送の競合を避けるため `waitpid` で確認できず、契約外の他所での回収（`signal_forward`
+        // の「制限」）と重なった場合だけ再利用された pid へ届き得る（回収しない確認には `waitid` の
+        // `WNOWAIT` が要る。#1513）。
         // `Child` は保持し続け、回収は行わない（pid を回収前に手放さない）。
         if let Some(slot) = self.slot.take()
             && !slot.suspend()
@@ -552,9 +586,17 @@ impl ChildGuard {
             return Reap::Unreaped;
         }
         // kill の前に終了済みかを確認し、自発終了の状態をそのまま拾う（kill との競合窓を狭める）。
-        if let Ok(Some(status)) = c.try_wait() {
-            self.child = None;
-            return Reap::Reaped(status);
+        // 失敗（他所で回収済み等）なら kill を送らない（再利用された pid を撃たない。fail-closed）。
+        match c.try_wait() {
+            Ok(Some(status)) => {
+                self.child = None;
+                return Reap::Reaped(status);
+            }
+            Ok(None) => {}
+            Err(_) => {
+                self.mark_lost();
+                return Reap::Lost;
+            }
         }
         let _ = c.kill();
         let start = Instant::now();
@@ -566,7 +608,11 @@ impl ChildGuard {
                     return Reap::Reaped(status);
                 }
                 Ok(None) => {}
-                Err(_) => return Reap::Unreaped,
+                // kill の後に他所で回収された（ECHILD）等。`Child` を残すと `Drop` が再び kill するため手放す。
+                Err(_) => {
+                    self.mark_lost();
+                    return Reap::Lost;
+                }
             }
             if start.elapsed() >= ONE_SHOT_REAP_TIMEOUT {
                 return Reap::Unreaped;
@@ -600,6 +646,9 @@ impl ChildGuard {
         }
         match self.kill_and_reap() {
             Reap::Reaped(status) => classify_reaped(status),
+            // 他所で回収された。孤児ではないが終了状態は失われたため、終了コード不明の終了として返す
+            // （呼び出し側で成功扱いにならない。`call_once` は `Unavailable`、常駐の終了は `exited_error`）。
+            Reap::Lost => OneShotTermination::Exited { code: None },
             // 既に回収済みのガードに対して呼ばれることはないが、終了状態が不明なため成功扱いしない。
             Reap::AlreadyReaped | Reap::Unreaped => OneShotTermination::Unreaped,
         }
@@ -623,10 +672,14 @@ enum Reap {
     AlreadyReaped,
     /// kill 失敗または期限超過で回収を確認できなかった（孤児の可能性）。
     Unreaped,
+    /// `waitpid` が失敗した（主に `ECHILD`＝契約外の回収者による回収）。終了状態は失われ、pid は再利用
+    /// され得るため、以後 kill も回収もしない終端（[`ChildGuard::mark_lost`]）。自プロセスの子としては
+    /// 残っていないため孤児の報告（[`unreaped_error`]）はしない。
+    Lost,
 }
 
 impl Reap {
-    /// 子が残っていない（回収を確認できた）か。
+    /// 子が残っていない（回収を確認できた、または他所で回収済み）か。
     fn is_reaped(self) -> bool {
         !matches!(self, Self::Unreaped)
     }
@@ -664,6 +717,11 @@ fn classify_reaped(status: ExitStatus) -> OneShotTermination {
             _ => OneShotTermination::Killed,
         }
     }
+}
+
+/// 終端（[`ChildGuard::mark_lost`]）後の [`ChildGuard::try_wait`] が返すエラー（呼び出し側は内容を解釈しない）。
+fn lost_error() -> io::Error {
+    io::Error::other("plugin child process is no longer tracked")
 }
 
 fn remaining(deadline: Instant) -> Result<Duration, PluginError> {
@@ -1531,5 +1589,72 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         drop(listener);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 子を起動して登録し、ガードの外で（`waitpid(pid, WNOHANG)` を期限つきでポーリングして）回収する
+    /// （他所での回収を模す）。戻り値のガードの子は回収済みで、以後の `waitpid` は `ECHILD` になる。
+    /// 待ちはポーリングの期限（10 秒）で打ち切る（REPAIR-5。ブロッキングの読み取り・wait をしない）。
+    #[cfg(unix)]
+    fn spawn_then_reap_elsewhere(reg: &'static Registry) -> ChildGuard {
+        use crate::signal_forward::ForwardSignal;
+        let g = spawn_registered(&mut sh("exit 0"), reg).unwrap();
+        assert_eq!(reg.forward(ForwardSignal::Hangup).targets, 1);
+        let pid = g.pid().unwrap();
+        let start = Instant::now();
+        while !crate::sys::reap_child_for_test(pid).unwrap() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "child did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        g
+    }
+
+    /// PLUG-7・#1513: 他所で回収された子（`ECHILD`）は終端として扱い、登録を戻さず（転送しない）、
+    /// 以後 kill も回収もしない。終了状態は失われるため、終了コード不明の終了（成功扱いにならない）になる。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_try_wait_echild_releases_registration_and_stops_tracking() {
+        use crate::signal_forward::ForwardSignal;
+        // ECHILD は Linux（asm-generic/errno-base.h）・macOS（sys/errno.h）とも 10。
+        const ECHILD: i32 = 10;
+        let reg = local_registry(2);
+        let mut g = spawn_then_reap_elsewhere(reg);
+        let e = g.try_wait().unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(ECHILD));
+        // 登録は戻らない（pid が再利用されても転送が届かない）。子は手放し済み。
+        assert_eq!(reg.forward(ForwardSignal::Hangup).targets, 0);
+        assert_eq!(g.pid(), None);
+        assert!(g.lost);
+        // 終端後も Ok(None)（生存扱い）に戻らない。kill もしない。
+        assert!(g.try_wait().is_err());
+        assert_eq!(g.kill_and_reap(), Reap::Lost);
+        assert!(Reap::Lost.is_reaped());
+        assert_eq!(
+            g.wait_or_kill(Duration::from_millis(10)),
+            OneShotTermination::Exited { code: None }
+        );
+        // スロットは解放済みで、表の容量を消費し続けない。
+        let _a = reg.reserve().unwrap();
+        let _b = reg.reserve().unwrap();
+    }
+
+    /// PLUG-7・#1513: `kill_and_reap` の kill 前の確認で `ECHILD` を受けたら kill を送らず `Lost` で終える
+    /// （再利用され得る pid へ SIGKILL を送らない）。`Drop` も再び kill しない。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_kill_and_reap_echild_does_not_kill_and_is_terminal() {
+        use crate::signal_forward::ForwardSignal;
+        let reg = local_registry(1);
+        let mut g = spawn_then_reap_elsewhere(reg);
+        assert_eq!(g.kill_and_reap(), Reap::Lost);
+        assert_eq!(g.pid(), None);
+        assert!(g.child.is_none() && g.slot.is_none());
+        assert_eq!(reg.forward(ForwardSignal::Hangup).targets, 0);
+        assert_eq!(g.kill_and_reap(), Reap::Lost);
+        drop(g);
+        // 解放されたスロットは再び確保できる。
+        assert!(reg.reserve().is_ok());
     }
 }

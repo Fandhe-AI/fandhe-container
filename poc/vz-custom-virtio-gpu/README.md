@@ -34,3 +34,5 @@ macOS 27 の `VZCustomVirtioDevice` で、VENUS capset だけを広告する最�
 実機ログを貼る前に、ホスト名・アドレス等のホスト固有情報を伏せること。fixture には合成データのみを置き、実機ログはコミットしない。
 
 自己テスト: `make vz-virtio-gpu-guest-check-selftest`（macOS 27・VM 不要）。
+
+前提ツール: bash と、`head -c`・`dd`・`mktemp`・`sed -E`・`grep -E`・`wc`・`tr`・`cut`・`sort`・`uniq`。いずれも macOS 標準（BSD 系）と Linux（GNU coreutils・busybox）の双方にあり、GNU coreutils の追加導入は不要（`truncate` 等の GNU 専用コマンドは使わない）。

@@ -2,7 +2,7 @@
 //!
 //! # 役割
 //! `stats` コマンド（SUP-10）の入力側（パース・読み取り）と出力側（JSON Lines 直列化。TASK-167.2）。パース（`&str` → 型）は OS 非依存の純関数で、3 OS の CI で
-//! 具体値を照合する。cgroup からの読み取り（[`read_cgroup_stats`]）は Linux 限定で、core の
+//! 具体値を照合する。cgroup からの読み取り（`read_cgroup_stats`）は Linux 限定で、core の
 //! `ContainerCgroup::read_stat_file`（cgroup ディレクトリ fd 起点の上限付き `openat`）を使う。
 //!
 //! # 呼び出し文脈・契約

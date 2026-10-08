@@ -237,6 +237,18 @@ else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため test をスキップ"
 endif
 
+# rustdoc の警告（壊れた intra-doc リンク・private 項目へのリンク等）を -D warnings で fail させる
+# （REPAIR-3・REPAIR-7・#1300）。既定 feature・--no-deps（依存の doc は生成しない）。CI は
+# rust-ci-default-features ジョブ（3 OS）が本ターゲットを実行する。cfg(target_os) 限定の項目への
+# リンクは他 OS で解決できず fail するため、doc コメントではリンクにせずコード表記にする。
+.PHONY: doc
+doc: ## cargo doc -D warnings（既定 feature・--no-deps。rustdoc 警告のゲート）
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+else
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため doc をスキップ"
+endif
+
 # venus 試験治具（workspace 外の独立 PoC パッケージ。GPU-6・TASK-172.4・#888）の fmt / clippy / test。
 # `make ci` には含めない。CI は rust-ci-default-features ジョブ（3 OS）が本ターゲットを実行し、
 # plugin-macos 側の変更で治具が壊れたことを検出する。実機前提テストは #[ignore] で分離済み。
@@ -471,12 +483,12 @@ deny-poc-venus-jig: ## venus 試験治具（poc/venus-decoder/jig）の Cargo.lo
 		check --show-stats advisories bans licenses sources
 
 .PHONY: ci
-ci: lint-docs check-workspace-manifest fmt-check lint test deny ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
+ci: lint-docs check-workspace-manifest fmt-check lint test doc deny ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8）
 # --------------------------------------------------
-# `make ci` には含めない: (1) ci.md のローカルゲート定義（fmt-check/lint/test/deny）を
+# `make ci` には含めない: (1) ci.md のローカルゲート定義（fmt-check/lint/test/doc/deny）を
 # 変えないため、(2) 実ベンチの実行は時間がかかるため。CI 側は `.github/workflows/ci.yml`
 # の `bench-regression` 専用ジョブが必ず実行するため、`make ci` に無くてもゲートは
 # 抜けない。

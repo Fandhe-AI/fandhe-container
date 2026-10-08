@@ -10,7 +10,7 @@
 //!   `IpAddr::is_loopback()` が false のため fail-closed で拒否する。
 //! - bridge: [`ResolvConfPlan::for_mode`] / [`apply_dns`] は `UNIMPLEMENTED` のまま（モードだけでは名前解決方式を
 //!   判定できないため。REPAIR-3）。DNS ヘルパーの上流転送は TASK-185.3（#346）。軽量運用（`StaticHosts`。NET-8）の
-//!   直接書き込みは `etc_hosts::apply_static_dns`（TASK-146.2・#336）が [`ResolvConfPlan::for_static_bridge`] で扱う。
+//!   直接書き込みは `etc_hosts::apply_static_dns`（TASK-146.2・#336）が `ResolvConfPlan::for_static_bridge` で扱う。
 //!
 //! 検証は全件を終えてから書き込む all-or-nothing。ファイルへは `IpAddr` の表記のみを書き、利用者の
 //! 生文字列は到達しない（改行注入で `options` / `search` 行を差し込めない）。

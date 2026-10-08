@@ -2364,7 +2364,19 @@ mod killpg_tests {
             .spawn()
             .unwrap();
         kill_process_group(child.id()).unwrap();
-        let status = child.wait().unwrap();
+        // 無期限の `wait` を避け、`try_wait` のポーリングと有限の期限で回収する（REPAIR-5）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break st;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.try_wait();
+                panic!("child was not reaped within the deadline after SIGKILL");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         assert_eq!(status.signal(), Some(9));
     }
 }

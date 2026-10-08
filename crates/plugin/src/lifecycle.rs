@@ -719,9 +719,10 @@ fn kill_group_retrying_eperm(pgid: u32) -> io::Result<()> {
 
 /// プロセスグループへの `SIGKILL` 送信エラーのうち、グループに生存者がいないことを示すものか。
 ///
-/// `ESRCH`（グループが空）は正常。`EPERM` は macOS のみ許容する（再送後も残る `EPERM` は送れる生存者が
-/// いない = ゾンビのみを意味する）。Linux では権限不足と区別すべきため許容せず、孫の停止を保証できない失敗として
-/// 呼び出し側（`kill_and_reap`）が `GroupKillFailed` として報告する（PLUG-7・REPAIR-5）。`Unsupported` はグループ送信を持たない unix
+/// `ESRCH`（グループが空）は正常。`EPERM` はどの OS でも許容しない。macOS ではゾンビのみのグループでも
+/// 生存者への送信権限不足（setuid 実行ファイル経由で別 UID に変わった孫など）でも `EPERM` になり、再送後も
+/// 両者を区別できないため、生存者不在の証明として扱わず、孫の停止を保証できない失敗として呼び出し側
+/// （`kill_and_reap`）が `GroupKillFailed` として報告する（PLUG-7・REPAIR-5）。`Unsupported` はグループ送信を持たない unix
 /// （Linux・macOS 以外）で、送信自体ができないことと直接の子の回収成否は別問題のため許容し、
 /// `Child::kill` による直接の子の kill・回収だけにフォールバックする（孫の回収は保証しない。この環境では
 /// 回収済みの pid を未回収として報告しない。PLUG-7・#1311）。それ以外（`InvalidInput` 等）は孫の停止を
@@ -730,13 +731,6 @@ fn kill_group_retrying_eperm(pgid: u32) -> io::Result<()> {
 fn group_kill_tolerated(e: &io::Error) -> bool {
     const ESRCH: i32 = 3;
     if e.kind() == io::ErrorKind::Unsupported {
-        return true;
-    }
-    // macOS の BSD 系 kill(2) は、グループ内に 1 つでもシグナルを送れる同一 UID のプロセスがあれば成功する。
-    // 再送（`kill_group_retrying_eperm`）後も残る `EPERM` は、自分が起動した同一 UID のグループでは
-    // 送れる生存者がない（ゾンビのみ）ことを意味し、孫は生存していない（PLUG-7・REPAIR-5）。
-    #[cfg(target_os = "macos")]
-    if e.raw_os_error() == Some(1) {
         return true;
     }
     e.raw_os_error() == Some(ESRCH)
@@ -1189,11 +1183,8 @@ mod tests {
             io::ErrorKind::Unsupported
         )));
         assert!(!group_kill_tolerated(&io::Error::from_raw_os_error(22)));
-        // EPERM は macOS では「送れる生存者がない」ことを示し許容、Linux では権限不足として失敗扱い。
-        assert_eq!(
-            group_kill_tolerated(&io::Error::from_raw_os_error(1)),
-            cfg!(target_os = "macos")
-        );
+        // EPERM は生存者への権限不足と区別できないため、どの OS でも失敗として扱う。
+        assert!(!group_kill_tolerated(&io::Error::from_raw_os_error(1)));
     }
 
     #[test]

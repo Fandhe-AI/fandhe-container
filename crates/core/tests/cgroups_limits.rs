@@ -4,6 +4,10 @@
 //! 個別機能は `cgroup_cpus_conversion`・`cgroup_cpu_max`・`cgroup_pids_max`・`cgroup_io_max` が担い、
 //! 本試験は同一の子 cgroup 上で 4 制限（`cpu.max`・`pids.max`・`io.max`・`io.weight`。TASK-170.4・#1474）が併存し、後から書いた制限が先の制限を壊さないことだけを見る。
 //!
+//! `--blkio-weight` の書き込み先選択（`io.bfq.weight` があればそちら、無ければ変換して `io.weight`。#1534）も
+//! 同じ子 cgroup で `set_blkio_weight` を呼び、通った分岐ごとの具体値を照合する。実機での実行結果
+//! （どちらの分岐を通ったか）は #1477（TASK-170.h1・人間担当）に記録する。
+//!
 //! # 対象外（実装済みを装わない。REPAIR-3）
 //! - CLI 引数パーサ・launcher への結線は未実装のため、本試験は公開 API を直接呼ぶ（結線は TASK-29 / TASK-157 系）。
 //!
@@ -23,8 +27,8 @@
 #[cfg(target_os = "linux")]
 mod linux {
     use fandhe_container_core::cgroups::{
-        BlockDevice, CgroupName, Controller, ControllerSet, CpuMax, CpuQuota, DelegatedCgroup,
-        IoLimit, IoMax, IoWeight, PidsMax,
+        BlkioWeight, BlkioWeightTarget, BlockDevice, CgroupName, Controller, ControllerSet, CpuMax,
+        CpuQuota, DelegatedCgroup, IoLimit, IoMax, IoWeight, PidsMax,
     };
     use fandhe_container_core::traits::{ContainerId, ErrorCode};
     use std::fs;
@@ -59,6 +63,11 @@ mod linux {
         assert_eq!(IoWeight::from_blkio_weight(10).unwrap().weight(), 1);
         assert_eq!(IoWeight::from_blkio_weight(1000).unwrap().weight(), 10_000);
 
+        // --blkio-weight の型（io.bfq.weight があるときは無変換で書く。#1534）
+        assert_eq!(BlkioWeight::new(500).unwrap().weight(), 500);
+        assert_eq!(BlkioWeight::new(10).unwrap().weight(), 10);
+        assert_eq!(BlkioWeight::new(1000).unwrap().weight(), 1000);
+
         // 不正値はいずれも InvalidArgument
         let errs = [
             CpuMax::parse_cpus("0", CpuMax::DEFAULT_PERIOD_US).unwrap_err(),
@@ -67,6 +76,8 @@ mod linux {
             IoMax::new(dev, IoLimit::Value(0), u, u, u).unwrap_err(),
             IoWeight::from_blkio_weight(0).unwrap_err(),
             IoWeight::from_blkio_weight(1001).unwrap_err(),
+            BlkioWeight::new(0).unwrap_err(),
+            BlkioWeight::new(1001).unwrap_err(),
         ];
         for err in errs {
             assert_eq!(err.code, ErrorCode::InvalidArgument);
@@ -129,6 +140,37 @@ mod linux {
             read("io.weight").lines().next().map(str::trim_end),
             Some("default 4950")
         );
+
+        // --blkio-weight 500 の書き込み先選択（#1534）。通った分岐は #1477 の実行記録に残す。
+        let recorder = fandhe_container_core::observability::OpRecorder::new();
+        match child
+            .set_blkio_weight(&recorder, &BlkioWeight::new(500).unwrap())
+            .expect("set_blkio_weight")
+        {
+            BlkioWeightTarget::Bfq(w) => {
+                eprintln!("set_blkio_weight: wrote io.bfq.weight");
+                assert_eq!(w.weight(), 500);
+                let first = read("io.bfq.weight")
+                    .lines()
+                    .next()
+                    .map(|l| l.trim_end().to_string());
+                assert!(
+                    matches!(first.as_deref(), Some("default 500" | "500")),
+                    "{first:?}"
+                );
+                // io.weight は直前の set_io_weight の値のまま
+                assert_eq!(
+                    read("io.weight").lines().next().map(str::trim_end),
+                    Some("default 4950")
+                );
+            }
+            BlkioWeightTarget::IoWeight(w) => {
+                eprintln!("set_blkio_weight: wrote io.weight (no io.bfq.weight)");
+                assert_eq!(w.weight(), 4950);
+                assert!(!dir.join("io.bfq.weight").exists());
+            }
+            other => panic!("unexpected target: {other:?}"),
+        }
 
         // 無制限側: pids と io を戻しても cpu.max は変化しない。
         let unlimited = PidsMax::from_pids_limit(-1).unwrap();

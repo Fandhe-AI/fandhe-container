@@ -51,8 +51,10 @@
 //!   `exec/interpreter.rs`。launch・exec の両経路に掛かる
 //! - **エントリポイントは fd に固定して `execveat` する**: 検査（`/proc/self/exe` との同一性）と実行の
 //!   間にパスが差し替わる TOCTOU を防ぐ。読み取り権限のない実行専用バイナリは開けず拒否される。
-//!   fd は 3 以上に置く。シェバン付きスクリプトは、インタープリタが開き直す新 root の `/dev/fd/N` が
-//!   同じ実体を指さなければ `FailedPrecondition` で拒否する（`/dev/fd` は `create_default_devices`〔#834・#1297〕が用意する。`spawn_container` の最小構成はまだ呼ばない）
+//!   fd は 3 以上に置く。稼働中コンテナへの exec の子は、照合した本体を封印した memfd へ複製し
+//!   （`sealed_copy.rs`。TASK-163 追補・#1531）、解析・照合・実行を複製に対して行う（launch は複製しない。#1314 の後）。
+//!   上限超過・封印の検証失敗は違反で拒否する。シェバン付きスクリプトは、インタープリタが開き直す新 root の
+//!   `/dev/fd/N` が同じ実体を指さなければ `FailedPrecondition` で拒否する（`/dev/fd` は `create_default_devices`〔#834・#1297〕が用意する。`spawn_container` の最小構成はまだ呼ばない）
 //! - **fork の健全性は `sys::fork_single_threaded` が強制する**: 呼び出し元が `Threads: 1`
 //!   でなければ fork せず `FailedPrecondition` で返す。子はクロージャの結果で必ず `_exit(2)` し、
 //!   呼び出し元のスタックへ戻らない
@@ -102,6 +104,7 @@ use crate::sys::{self, Signal, SysError};
 use crate::traits::types::ErrorCode;
 
 use super::interpreter::reject_runtime_interpreter;
+use super::sealed_copy::seal_entrypoint_copy;
 use super::{
     CapabilityReport, ExecError, IsolationStage, MountIsolation, PivotReport, StagePipeline,
     ViolationReason, describe, fd_mount_id, pivot_root, prepare_rootfs,
@@ -341,7 +344,9 @@ pub fn exec_entrypoint(
 ///    セッション・制御端末を切り離し（#1456。以後に開くファイルを制御端末にしない順序）、エントリポイントを新 root 内で `open` し、その fd を `fstat` する（不在なら `NotFound`）。`/proc/self/exe`
 ///    （ランタイム自身のホスト側バイナリ）と `(st_dev, st_ino)` が同じなら拒否する
 ///    （CVE-2019-5736 型の多層防御。検査した fd をそのまま `execveat(AT_EMPTY_PATH)` で実行し、
-///    検査から実行までの間のパス差し替え〔TOCTOU〕を防ぐ。memfd による自己複製は後続の課題）。シェバンの連鎖・
+///    検査から実行までの間のパス差し替え〔TOCTOU〕を防ぐ。稼働中コンテナへの exec の子〔`EntrypointSource::SealedCopy`〕
+///    は、照合した本体を封印した memfd に複製し〔`sealed_copy.rs`。#1531〕、以降の解析・照合・実行を複製に対して行う。
+///    launch は複製しない〔#1314 の後〕。ランタイム自身の封印複製は後続の課題）。シェバンの連鎖・
 ///    `PT_INTERP` の解決先がランタイムのバイナリなら同じく拒否する（#1458。`interpreter.rs`）
 /// 3. 開いたエントリポイントが fd 0〜2 と同一 inode なら拒否する（`/proc/self/fd/{0,1,2}` 経由の参照対策。
 ///    fd 0〜2 の実体を確認できなければ拒否。エントリポイントの fd は 3 以上に置く）。
@@ -375,7 +380,7 @@ fn exec_entrypoint_verified(
 /// （`exec_command::spawn_exec_command` の子。参加後の `/` の照合は `reapply_restrictions` が済ませている。
 /// SUP-6・TASK-163.4）が共有する。呼び出し元は「`/` が正しい root であること」を事前に保証すること。
 pub(super) fn exec_checked_entrypoint(entry: &Entrypoint) -> Result<Infallible, ExecError> {
-    let file = prepare_exec_child(entry, None)?;
+    let file = prepare_exec_child(entry, None, EntrypointSource::Pinned)?;
     Err(execve_checked(entry, &file))
 }
 
@@ -394,11 +399,15 @@ fn execve_checked(entry: &Entrypoint, file: &std::fs::File) -> ExecError {
 /// 手順を 1 か所に置くことで、本番の子（直後に `execveat`）と、結合試験用の観測
 /// （`observe_exec_child_setup`。`execveat` の代わりに子自身の状態を報告する）が同じ処理を通る。
 ///
+/// `source` は実行に使う fd の作り方で、launch は [`EntrypointSource::Pinned`]、稼働中コンテナへの exec の子は
+/// [`EntrypointSource::SealedCopy`]（`keep` の有無で暗黙に判定しない）。
+///
 /// `keep` は、fd の後始末で 1 本だけ残す fd（稼働中コンテナへの exec の子が、`execve` 前の失敗を親へ知らせる
 /// pipe の書き込み側。close-on-exec で、`execveat` が成功すれば閉じる。#1460）。launch 経路は `None`。
 fn prepare_exec_child(
     entry: &Entrypoint,
     keep: Option<BorrowedFd<'_>>,
+    source: EntrypointSource,
 ) -> Result<std::fs::File, ExecError> {
     const STAGE: IsolationStage = IsolationStage::Exec;
     // 継承したホスト側の fd 3 以上を開く前に閉じる（rootfs 内の /proc/self/fd/N 経由で実体を開かれない）。
@@ -425,6 +434,15 @@ fn prepare_exec_child(
             STAGE,
         ));
     }
+    // 稼働中コンテナへの exec は、照合した本体を封印した複製に置き換える（TASK-163 追補・#1531）。以降の解析・
+    // 照合・実行はすべて複製に対して行い、照合した内容と実行する内容を一致させる。元の fd は（同名で束縛し直した
+    // 後は）この関数を抜けるときに閉じ、実行する子には残らない。
+    let (file, meta) = match source {
+        EntrypointSource::Pinned => (file, meta),
+        EntrypointSource::SealedCopy => {
+            seal_entrypoint_copy(&file, &meta, procfs.as_fd(), entry.path())?
+        }
+    };
     // シェバン・`PT_INTERP` の解決先がランタイム自身でないことも確かめる（本体の照合だけでは
     // `#!/proc/self/exe` を通してしまう。#1458。契約と限界は `interpreter.rs`）。
     reject_runtime_interpreter(&file, entry.path(), runtime, procfs.as_fd())?;
@@ -446,6 +464,16 @@ fn prepare_exec_child(
     // 最後に標準入出力を置換する（以降の execve 失敗の診断は stderr へ出せず、終了コードのみで通知）。
     redirect_stdio_to_null(root.as_fd(), procfs.as_fd())?;
     Ok(file)
+}
+
+/// 実行に使う fd の作り方（[`prepare_exec_child`] の呼び出し側が明示する。TASK-163 追補・#1531）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntrypointSource {
+    /// 照合した fd（元の inode）をそのまま `execveat` する。launch 経路（常駐するワークロードのメモリ増を避ける。
+    /// 封印した複製の適用は #1314 の後）。
+    Pinned,
+    /// 照合した本体を封印した memfd に複製し、その複製を解析・照合して `execveat` する。稼働中コンテナへの exec。
+    SealedCopy,
 }
 
 /// ランタイム自身のバイナリの `(st_dev, st_ino)`。検証済みの procfs（`proc_dir`）の `self/exe` を `O_PATH` で
@@ -948,6 +976,10 @@ const EXEC_STATUS_MAX: usize = 256;
 /// がソース照合で双方向に突き合わせる（SEC-4・SUP-6・SEC-1・CORE-5。TASK-163 追補・#1533）。
 ///
 /// 違反記録の対象外とする子の失敗（状態には `-` を書くか、何も書かずに終わる）と根拠:
+/// - 封印した複製の作成（`sealed_copy.rs`）の、元のファイルの実行権限なし（`EACCES`）・複製中の伸縮による
+///   `PermissionDenied`、`memfd_create`・`faccessat2` の前提不足（`ENOSYS`・`vm.memfd_noexec=2` の `EACCES`・
+///   seccomp の `EPERM`）による `FailedPrecondition`: 実行ビット・`noexec` の通常の拒否、競合、前提不足であり、
+///   分離境界の突破試行とは断定できない
 /// - `open_entrypoint` の `PermissionDenied`: 入力の種別不正（通常ファイルでない・継承した標準入出力と同一）や
 ///   開き直しの間の競合による拒否で、分離境界の突破試行とは断定できない
 /// - `FailedPrecondition`（`/dev/null`・`/proc`・`/dev/fd` の不在や準備不足）: 差し替えではなく前提不足
@@ -955,15 +987,17 @@ const EXEC_STATUS_MAX: usize = 256;
 /// - `bind_to_parent_lifetime` / `join_exec_cgroup` の失敗（`exec_command.rs`。何も書かずに終了）: 親の生存確認と
 ///   cgroup 参加のシステムエラー
 ///
-/// 照合の限界: 対象は `process.rs` と `interpreter.rs` だけ。`prepare_exec_child` から別ファイルの違反生成
+/// 照合の限界: 対象は `process.rs`・`interpreter.rs`・`sealed_copy.rs` だけ。`prepare_exec_child` から別ファイルの違反生成
 /// ヘルパを呼ぶようになったら、そのファイルを照合対象に加えること（`rootfs.rs`・`setns.rs` 等は子の経路の外の
 /// 違反を多数作るため `exec/` 全体は走査しない）。
-pub(super) const EXEC_CHILD_VIOLATIONS: [ViolationReason; 5] = [
+pub(super) const EXEC_CHILD_VIOLATIONS: [ViolationReason; 7] = [
     ViolationReason::EntrypointIsRuntimeBinary,
     ViolationReason::EntrypointInterpreterIsRuntimeBinary,
     ViolationReason::StdioNullNotNullDevice,
     ViolationReason::ExecDevNotDirectory,
     ViolationReason::ExecProcNotProcfs,
+    ViolationReason::EntrypointCopyTooLarge,
+    ViolationReason::EntrypointCopySealUnverified,
 ];
 
 /// 稼働中コンテナへの exec の子の本体（SUP-6・TASK-163.4。launch の `child_main` と同じ規約: 失敗したら stderr に
@@ -983,10 +1017,11 @@ fn run_exec_child(
     status: &std::fs::File,
     terminal: impl FnOnce(&Entrypoint, &std::fs::File) -> Result<i32, ExecError>,
 ) -> i32 {
-    let result = prepare_exec_child(entry, Some(status.as_fd())).and_then(|file| {
-        write_exec_status(status, EXEC_STATUS_READY)?;
-        terminal(entry, &file)
-    });
+    let result = prepare_exec_child(entry, Some(status.as_fd()), EntrypointSource::SealedCopy)
+        .and_then(|file| {
+            write_exec_status(status, EXEC_STATUS_READY)?;
+            terminal(entry, &file)
+        });
     match result {
         Ok(code) => code,
         Err(err) => {
@@ -1126,7 +1161,33 @@ pub struct ExecChildSetupReport {
     /// 子に残っている fd 3 以上の `(番号, /proc/self/fd のリンク先)`（一覧の読み取りに使った fd は除く）。
     /// 状態を返す pipe と、検査済みのエントリポイントの 2 本だけが残る。
     pub open_fds: Vec<(i32, String)>,
+    /// `execveat` に渡す fd（封印した複製。#1531）の状態。`after_prepare` の後に採取するため、手順の後に
+    /// 元のファイルが書き換えられても、この fd の内容が変わらないことを示す。
+    pub exec_fd: ExecFdReport,
 }
+
+/// `execveat` に渡す fd の状態（結合試験専用。TASK-163 追補・#1531）。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExecFdReport {
+    /// fd 番号。
+    pub fd: i32,
+    /// `F_GET_SEALS` の値（memfd でなければ `None`）。封印した複製は 0x0F ちょうど。
+    pub seals: Option<u32>,
+    /// `fstat` の `st_size`。
+    pub size: u64,
+    /// 先頭 [`EXEC_FD_HEAD_BYTES`] バイトまでの内容。
+    pub head: Vec<u8>,
+    /// `/proc/self/fd/N` のリンク先。封印した複製は `/memfd:fandhe-exec-entrypoint (deleted)`。
+    pub link: String,
+}
+
+/// [`ExecFdReport::head`] に載せる内容の最大バイト数。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+#[doc(hidden)]
+pub const EXEC_FD_HEAD_BYTES: usize = 4096;
 
 /// 結合試験専用: exec の子の `execveat` より前の全手順を実プロセスで通し、`execveat` の代わりに子自身の状態を
 /// 報告させる（SUP-6・SEC-1・TASK-163 追補・#1456）。
@@ -1152,12 +1213,33 @@ pub fn observe_exec_child_setup(
     report: &Path,
     timeout: Duration,
 ) -> Result<ExecChildSetupObservation, ExecError> {
+    observe_exec_child_setup_with(command, report, || {}, timeout)
+}
+
+/// [`observe_exec_child_setup`] に、`after_prepare` の差し込み点を足した版（結合試験専用。TASK-163 追補・#1531）。
+///
+/// `after_prepare` は子で、`prepare_exec_child` が返った直後（封印と照合をすべて終え、`execveat` の直前に当たる
+/// 位置）に 1 回呼ばれ、その後に報告を採取する。照合の後・実行の前にコンテナ側が元のファイルを書き換える
+/// 競合を試験が再現するための入口で、実行する fd（封印した複製）の内容がその書き換えの影響を受けないことを
+/// 報告の `exec_fd` で照合する。本番の `terminal`（`execveat`）には常時のフックを入れず、既存の `terminal`
+/// 引数の仕組みだけで差し込む。`execveat` は呼ばない（制限適用の証跡を迂回する実行経路を作らない）。
+/// `after_prepare` は fork した単一スレッドの子で動くため、async-signal-safe でない処理を避ける必要は
+/// ない一方、panic すると子が 125 で終わる（呼び出し側の試験が失敗として検出する）。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+#[doc(hidden)]
+pub fn observe_exec_child_setup_with(
+    command: &super::ExecCommand,
+    report: &Path,
+    after_prepare: impl FnOnce(),
+    timeout: Duration,
+) -> Result<ExecChildSetupObservation, ExecError> {
     let entry = command.entrypoint();
     let (status_read, status_write) = exec_status_pipe()?;
     let pid = sys::fork_single_threaded(
         || {
-            run_exec_child(entry, &status_write, |entry, _file| {
-                write_setup_report(entry, report).map(|()| 0)
+            run_exec_child(entry, &status_write, |entry, file| {
+                after_prepare();
+                write_setup_report(entry, report, file).map(|()| 0)
             })
         },
         EXIT_SETUP_FAILED,
@@ -1225,8 +1307,13 @@ pub fn close_standard_fds_for_test(fds: &[StandardFd]) -> Result<(), ExecError> 
 
 /// 観測の子: `execveat` の直前の自分の状態を `report` へ 1 行ずつ書く（[`observe_exec_child_setup`] 専用）。
 #[cfg(all(feature = "exec-test-support", not(test)))]
-fn write_setup_report(entry: &Entrypoint, report: &Path) -> Result<(), ExecError> {
-    use std::os::unix::fs::FileTypeExt as _;
+fn write_setup_report(
+    entry: &Entrypoint,
+    report: &Path,
+    exec_file: &std::fs::File,
+) -> Result<(), ExecError> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::{FileExt as _, FileTypeExt as _};
     let fail = |what: &str| ExecError::new(ErrorCode::Internal, IsolationStage::Exec, what);
     let stat = std::fs::read_to_string("/proc/self/stat").map_err(|_| fail("read own stat"))?;
     // `comm` は括弧・空白を含み得るため、最後の `)` より後ろを読む（state ppid pgrp session tty_nr ...）。
@@ -1276,6 +1363,31 @@ fn write_setup_report(entry: &Entrypoint, report: &Path) -> Result<(), ExecError
     for (fd, target) in open {
         text.push_str(&format!("fd={fd} {target}\n"));
     }
+    // `execveat` に渡す fd の状態（封印の値・サイズ・内容・リンク先）。
+    let exec_fd = exec_file.as_raw_fd();
+    let seals = sys::get_seals(exec_file.as_fd()).map_or(-1, |s| i64::from(s.bits()));
+    let size = exec_file
+        .metadata()
+        .map_err(|_| fail("stat the exec fd"))?
+        .len();
+    let mut head = vec![0u8; EXEC_FD_HEAD_BYTES];
+    let mut filled = 0usize;
+    while let Some(rest) = head.get_mut(filled..).filter(|r| !r.is_empty()) {
+        match exec_file.read_at(rest, u64::try_from(filled).unwrap_or(u64::MAX)) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(fail("read the exec fd")),
+        }
+    }
+    head.truncate(filled);
+    let head_hex: String = head.iter().map(|b| format!("{b:02x}")).collect();
+    let link = std::fs::read_link(format!("/proc/self/fd/{exec_fd}"))
+        .map_err(|_| fail("read the exec fd link"))?;
+    text.push_str(&format!(
+        "exec_fd={exec_fd} {seals} {size} {head_hex} {}\n",
+        link.to_string_lossy()
+    ));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1323,6 +1435,26 @@ fn parse_setup_report(text: &str) -> Option<ExecChildSetupReport> {
                 Some((fd.parse().ok()?, target.to_owned()))
             })
             .collect::<Option<_>>()?,
+        exec_fd: {
+            let v = text.lines().find_map(|l| l.strip_prefix("exec_fd="))?;
+            let mut parts = v.splitn(5, ' ');
+            let fd = parts.next()?.parse().ok()?;
+            let seals: i64 = parts.next()?.parse().ok()?;
+            let size = parts.next()?.parse().ok()?;
+            let head_hex = parts.next()?;
+            let link = parts.next()?.to_owned();
+            let head = (0..head_hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(head_hex.get(i..i + 2)?, 16).ok())
+                .collect::<Option<Vec<u8>>>()?;
+            ExecFdReport {
+                fd,
+                seals: u32::try_from(seals).ok(),
+                size,
+                head,
+                link,
+            }
+        },
     })
 }
 
@@ -2552,6 +2684,19 @@ mod tests {
                 Some(ViolationReason::EntrypointInterpreterIsRuntimeBinary)
             )
         );
+        // 封印した複製の拒否（#1531）の理由コードは、子から親へ違反として運ばれる。
+        for (line, reason) in [
+            (
+                &b"126 entrypoint_copy_too_large\n"[..],
+                ViolationReason::EntrypointCopyTooLarge,
+            ),
+            (
+                &b"126 entrypoint_copy_seal_unverified\n"[..],
+                ViolationReason::EntrypointCopySealUnverified,
+            ),
+        ] {
+            assert_eq!(classify_exec_status(line, exit), failed(exit, Some(reason)));
+        }
         // 解釈できない内容・子が返さないはずの理由コード・切れた行は、起動していない扱い（理由なし）。
         for garbage in [
             &b"R"[..],
@@ -3137,14 +3282,15 @@ mod tests {
         )
     }
 
-    /// 子の経路（`process.rs`・`interpreter.rs`）が作る違反理由と `EXEC_CHILD_VIOLATIONS` が一致する
+    /// 子の経路（`process.rs`・`interpreter.rs`・`sealed_copy.rs`）が作る違反理由と `EXEC_CHILD_VIOLATIONS` が一致する
     /// （SEC-4・SUP-6・SEC-1・CORE-5。TASK-163 追補・#1533）。
     ///
-    /// 照合対象は 2 ファイルだけ（別ファイルの違反生成ヘルパを子の経路から呼ぶ場合は加えること）。
+    /// 照合対象は 3 ファイルだけ（別ファイルの違反生成ヘルパを子の経路から呼ぶ場合は加えること）。
     #[test]
     fn sec4_sup6_task163_exec_child_violations_match_child_path_sources() {
         let mut found = child_path_violation_names(include_str!("process.rs"));
         found.extend(child_path_violation_names(include_str!("interpreter.rs")));
+        found.extend(child_path_violation_names(include_str!("sealed_copy.rs")));
         let (missing, stale) = violation_list_gaps(&found, &EXEC_CHILD_VIOLATIONS);
         assert!(
             missing.is_empty(),
@@ -3154,7 +3300,7 @@ mod tests {
             stale.is_empty(),
             "EXEC_CHILD_VIOLATIONS entries not produced by child-path sources: {stale:?}"
         );
-        assert_eq!(found.len(), 5);
+        assert_eq!(found.len(), 7);
     }
 
     /// 足し忘れ・余剰・除外規則を合成入力で検出できる（上のテストが実際に失敗を報告する根拠。#1533）。

@@ -108,6 +108,7 @@ mod process;
 mod reapply;
 mod rlimits;
 mod rootfs;
+mod sealed_copy;
 mod seccomp;
 mod setns;
 mod stages;
@@ -155,7 +156,10 @@ pub use process::{
 /// 結合試験 `tests/exec_child_setup.rs` 専用の再公開（SUP-6・TASK-163 追補・#1456。通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(all(feature = "exec-test-support", not(test)))]
 #[doc(hidden)]
-pub use process::{ExecChildSetupObservation, ExecChildSetupReport, observe_exec_child_setup};
+pub use process::{
+    EXEC_FD_HEAD_BYTES, ExecChildSetupObservation, ExecChildSetupReport, ExecFdReport,
+    observe_exec_child_setup, observe_exec_child_setup_with,
+};
 /// 結合試験 `tests/exec_child_setup.rs`・`tests/fork_exec_isolation.rs` 専用の再公開（SEC-1・CORE-1・TASK-27.4.1・#1299。
 /// 通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(all(feature = "exec-test-support", not(test)))]
@@ -171,6 +175,8 @@ pub use reapply::{
 #[doc(hidden)]
 pub use reapply::{ExecReapplyObservation, observe_exec_restriction_reapply};
 pub use rootfs::{PivotReport, PreparedRootfs, pivot_root, prepare_rootfs};
+/// 封印した複製の上限（結合試験が上限超過を再現するための再公開。TASK-163 追補・#1531）。
+pub use sealed_copy::MAX_SEALED_COPY_BYTES;
 pub use seccomp::SeccompReport;
 /// 結合試験 `tests/escape_suite.rs` の ESC-03 専用の再公開（SEC-2・TASK-42.2・#200。通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(feature = "escape-probe")]

@@ -176,6 +176,14 @@ pub enum ViolationReason {
     /// SEC-1・SEC-4・TASK-163 追補・#1459）。ランタイムの同一性の基準と、検証済みの fd の開き直しの起点を
     /// すり替えさせないために拒否する。
     ExecProcNotProcfs,
+    /// エントリポイントの封印した複製の元のサイズが上限（`MAX_SEALED_COPY_BYTES`）を超える（SUP-6・SEC-1・
+    /// SEC-4・TASK-163 追補・#1531）。照合した内容をそのまま実行するための複製をメモリ（memfd）に作るため、
+    /// 巨大なファイルは作らず拒否する（コンテナ側が巨大なファイルを置いて exec ごとの確保を強いる DoS を防ぐ）。
+    EntrypointCopyTooLarge,
+    /// エントリポイントの封印した複製の封印（`F_SEAL_SEAL|SHRINK|GROW|WRITE` = 0x0F ちょうど）を確認できない
+    /// （封印の追加・取得の失敗、開き直した fd の seal が 0x0F でない。SUP-6・SEC-1・SEC-4・TASK-163 追補・
+    /// #1531）。書き込み可能な複製を実行すると照合と実行の内容がずれるため、実行せず拒否する（fail-closed）。
+    EntrypointCopySealUnverified,
     /// exec の対象が入れ子の PID namespace の PID 1 でない（`NSpid` が 2 要素・末尾 1 でない。SUP-6）。
     ExecTargetNotNestedPid1,
     /// exec の対象の所属 cgroup が、記録から導いた期待パスと一致しない（pid 再利用・移動。SEC-1）。
@@ -285,6 +293,8 @@ impl ViolationReason {
             }
             Self::ExecDevNotDirectory => "exec_dev_not_directory",
             Self::ExecProcNotProcfs => "exec_proc_not_procfs",
+            Self::EntrypointCopyTooLarge => "entrypoint_copy_too_large",
+            Self::EntrypointCopySealUnverified => "entrypoint_copy_seal_unverified",
             Self::ExecTargetNotNestedPid1 => "exec_target_not_nested_pid1",
             Self::ExecTargetCgroupMismatch => "exec_target_cgroup_mismatch",
             Self::ExecTargetSharesPidNamespace => "exec_target_shares_pid_namespace",
@@ -339,7 +349,9 @@ impl ViolationReason {
             | Self::StdioNullNotNullDevice
             | Self::EntrypointInterpreterIsRuntimeBinary
             | Self::ExecDevNotDirectory
-            | Self::ExecProcNotProcfs => ViolationKind::Entrypoint,
+            | Self::ExecProcNotProcfs
+            | Self::EntrypointCopyTooLarge
+            | Self::EntrypointCopySealUnverified => ViolationKind::Entrypoint,
             Self::ExecTargetNotNestedPid1
             | Self::ExecTargetCgroupMismatch
             | Self::ExecTargetSharesPidNamespace
@@ -364,6 +376,8 @@ impl ViolationReason {
             | Self::EntrypointInterpreterIsRuntimeBinary
             | Self::ExecDevNotDirectory
             | Self::ExecProcNotProcfs
+            | Self::EntrypointCopyTooLarge
+            | Self::EntrypointCopySealUnverified
             | Self::ExecRootNotContainerRootfs
             | Self::ExecJoinedNamespaceMismatch
             | Self::ExecJoinedPidNamespaceMismatch
@@ -425,10 +439,12 @@ impl ViolationReason {
             | Self::ExecJoinedCgroupMismatch
             | Self::ExecTargetPidfdMismatch
             | Self::ExecDevNotDirectory
-            | Self::ExecProcNotProcfs => ErrorCode::FailedPrecondition,
+            | Self::ExecProcNotProcfs
+            | Self::EntrypointCopySealUnverified => ErrorCode::FailedPrecondition,
             Self::EntrypointIsRuntimeBinary
             | Self::StdioNullNotNullDevice
-            | Self::EntrypointInterpreterIsRuntimeBinary => ErrorCode::PermissionDenied,
+            | Self::EntrypointInterpreterIsRuntimeBinary
+            | Self::EntrypointCopyTooLarge => ErrorCode::PermissionDenied,
         }
     }
 
@@ -530,6 +546,12 @@ impl ViolationReason {
             Self::ExecDevNotDirectory => "/dev in the new root is not a directory",
             Self::ExecProcNotProcfs => {
                 "/proc in the new root is not procfs; cannot reopen a verified file"
+            }
+            Self::EntrypointCopyTooLarge => {
+                "the entrypoint is too large to copy into a sealed executable copy; refusing to exec it"
+            }
+            Self::EntrypointCopySealUnverified => {
+                "the seals of the entrypoint copy could not be verified; refusing to exec it"
             }
             Self::StdioNullNotNullDevice => {
                 "/dev/null in the new root is not the null device (1:3); refusing to open it"
@@ -811,6 +833,32 @@ mod tests {
         );
         let v = IsolationViolation::new(r, Some(Path::new("/script")));
         assert_eq!(v.mount_audit_event(), None);
+    }
+
+    /// SUP-6・SEC-1・SEC-4（TASK-163 追補・#1531）: 封印した複製の拒否理由の具体値。
+    #[test]
+    fn sec4_sup6_task163_sealed_copy_reason_metadata_is_exact() {
+        for (r, code, error_code, message) in [
+            (
+                ViolationReason::EntrypointCopyTooLarge,
+                "entrypoint_copy_too_large",
+                ErrorCode::PermissionDenied,
+                "the entrypoint is too large to copy into a sealed executable copy; refusing to exec it",
+            ),
+            (
+                ViolationReason::EntrypointCopySealUnverified,
+                "entrypoint_copy_seal_unverified",
+                ErrorCode::FailedPrecondition,
+                "the seals of the entrypoint copy could not be verified; refusing to exec it",
+            ),
+        ] {
+            assert_eq!(r.as_str(), code);
+            assert_eq!(r.kind().as_str(), "entrypoint");
+            assert_eq!(r.behavior_id(), "SEC-1");
+            assert_eq!(r.error_code(), error_code);
+            assert_eq!(r.stage(), IsolationStage::Exec);
+            assert_eq!(r.message(), message);
+        }
     }
 
     /// SUP-6・SEC-1・SEC-4（TASK-163 追補・#1459）: `/dev`・`/proc` の差し替えの理由コード・種別・ビヘイビア ID・

@@ -17,21 +17,25 @@
 //! | ---- | ---------- | -------- | ---- |
 //! | A. 解決先の照合（本モジュール） | 検査時点でインタープリタがランタイムに解決される静的な指定すべて（シェバンの連鎖・`PT_INTERP`・symlink 経由・`/proc/<pid>/exe`） | 検査と `execve` の間にパスを差し替える競合（TOCTOU）。`binfmt_misc` | core 内で完結 |
 //! | B. ランタイム自身の封印複製（memfd + `F_SEAL_*`。runc の方式。launcher・#1314 の範囲） | `/proc/self/exe` がホスト側のバイナリを指さなくなるため、経路によらず書き換えを防ぐ | 起動のたびの複製コスト（常駐メモリ。CORE-7〜9） | ランタイムの **バイナリの起動処理**（自分自身の再実行）に組み込む必要があり、ライブラリ crate の中では完結しない |
-//! | B'. 照合したエントリポイント本体の封印複製（#1529・#1530・#1531。「封印した複製からの実行」節） | **エントリポイント本体の内容の書き換え**（1 行目のシェバン・`PT_INTERP` の文字列が封印されて固定される） | **インタープリタのパスの差し替え**と、インタープリタ自身の内容の書き換え（カーネルが `execve` の中でパスを解決して開く）。A と Landlock に頼る | core 内で完結（`sys` のラッパーは #1530、組み込みは #1531） |
+//! | B'. 照合したエントリポイント本体の封印複製（#1529・#1530・#1531。「封印した複製からの実行」節） | **エントリポイント本体の内容の書き換え**（1 行目のシェバン・`PT_INTERP` の文字列が封印されて固定される） | **インタープリタのパスの差し替え**と、インタープリタ自身の内容の書き換え（カーネルが `execve` の中でパスを解決して開く）。A と Landlock に頼る | core 内で完結（`sys` のラッパーは #1530、組み込みは #1531。稼働中コンテナへの exec のみ。`sealed_copy.rs`） |
 //! | C. Landlock のみ（変更前） | ルール外のホスト側バイナリの `EXECUTE` を拒否する | Landlock の適用とルールの正しさに全面的に依存する | 実装済み |
 //!
 //! 本モジュールは **A** を実装する。B は最終的な対策だが、exec 専用プロセス・launcher のバイナリ（未結線）の
 //! 起動処理に入れるもので本 crate の関数だけでは実現できないため、別の課題とする（下記「限界」）。A は C と
 //! 独立に効く層で、Landlock が無くても静的な指定を拒否し、拒否を違反記録
 //! （`entrypoint_interpreter_is_runtime_binary`。SEC-4）として返す。B' は A の上に重ねて本体の書き換えの窓を
-//! 狭める方式で、設計は下記の節に決め、`sys` のラッパーまでが #1530 の範囲（組み込みは #1531）。
+//! 狭める方式で、設計は下記の節に決め、`sys` のラッパーが #1530、稼働中コンテナへの exec の子への組み込みが #1531
+//! （`sealed_copy.rs`・`process.rs` の `EntrypointSource::SealedCopy`）。
 //!
 //! # 封印した複製からの実行（B'。設計決定。#1529・#1530・#1531）
 //!
-//! **未実装**（REPAIR-3）: 本節は設計の決定で、`prepare_exec_child` への組み込み・違反記録（SEC-4）・差し替えの
-//! 結合試験は #1531 で行う。#1530 では `sys` に `memfd_create_for_exec_copy`・`add_seals`・`get_seals`・
-//! `seal_for_exec`（封印を検証した `SealedMemfd` だけを返す）を足した。実行は既存の `sys::exec_fd`
-//! （`execveat(AT_EMPTY_PATH)`）を使い、重複させない。
+//! **実装済み（稼働中コンテナへの exec のみ。#1531）**: `prepare_exec_child` の `EntrypointSource::SealedCopy`
+//! （`run_exec_child` 経由）が `sealed_copy.rs` の `seal_entrypoint_copy` を呼び、以降の解析・照合・実行を複製に
+//! 対して行う。launch 経路（`EntrypointSource::Pinned`）には掛けない（下記「サイズ上限」の理由。#1314 の後）。
+//! 拒否は違反 `entrypoint_copy_too_large`・`entrypoint_copy_seal_unverified`（SEC-4）で子から親へ届く。
+//! `sys` のラッパー（`memfd_create_for_exec_copy`・`add_seals`・`get_seals`・`seal_for_exec`〔封印を検証した
+//! `SealedMemfd` だけを返す〕）は #1530、元のファイルの実行権限の照合（`access_exec_via_proc`）は #1531 で足した。
+//! 実行は既存の `sys::exec_fd`（`execveat(AT_EMPTY_PATH)`）を使い、重複させない。
 //!
 //! - **複製する対象**: エントリポイント本体（ELF・スクリプトとも）だけ。照合に使ったのと同じ開いた fd から複製する。
 //!   - シェバンのインタープリタは複製しない: 閉じるには `binfmt_script` と同じ展開（argv を
@@ -41,8 +45,10 @@
 //!     （`ld.so /dev/fd/N`）か複製内の `PT_INTERP` を書き換えるしかなく、どちらも `/proc/self/exe`・`AT_EXECFN`・
 //!     `argv[0]` の意味を変えてコンテナのプログラムから見える挙動を壊すため採らない
 //!   - `binfmt_misc` は従来どおり対象外（`F` フラグ付きの登録を除き、カーネルは登録されたインタープリタをパスで開く）
-//! - **手順の順序（#1531 への契約）**: (1) 本体を fd で開き `(st_dev, st_ino)` をランタイムと照合する（複製は別の
-//!   inode になるため、この照合だけは元のファイルに対して行う）→ (2) `fstat` の `st_size` が上限以下であることを
+//! - **手順の順序（#1531 で実装）**: (1) 本体を fd で開き `(st_dev, st_ino)` をランタイムと照合する（複製は別の
+//!   inode になるため、この照合だけは元のファイルに対して行う）→ (1') 元のファイルの実行権限をカーネルに判定させる
+//!   （`faccessat2(X_OK, AT_EACCESS)`。実行ビット・`noexec`。memfd へ複製すると元のファイルの実行権限は効かなく
+//!   なり、0644 や `noexec` 上のファイルを実行できてしまう緩和になるため、複製の前に確かめる）→ (2) `fstat` の `st_size` が上限以下であることを
 //!   確かめて複製する → (3) 封印する → (4) `F_GET_SEALS` が 0x0F とちょうど一致することを確かめる（`SealedMemfd`
 //!   の生成条件）→ (5) シェバン・`PT_INTERP` の解析（[`reject_runtime_interpreter`] の先頭の読み取り）は
 //!   **封印した複製に対して** 行う（照合用と実行用で読み取りが 2 回あると、その間の書き換えで食い違う）→ (6) スクリプト
@@ -55,7 +61,7 @@
 //!   `/dev/fd/N` を渡し、procfs の magic link 経由で memfd に解決される）。memfd の名前は固定値で、外部入力を混ぜない
 //! - **サイズ上限**: 256 MiB（`MAX_SEALED_COPY_BYTES`。単体の大きいバイナリ〔node・Go の静的バイナリで 100〜150 MB
 //!   程度〕に余裕を持たせ、超えるものを拒否する）。複製の前に `st_size` を上限と比べ、コピーしたバイト数が
-//!   `st_size` と一致しなければ（途中で伸縮した）拒否する。定数の置き場所と強制は #1531。複製は exec の子が子 cgroup に
+//!   `st_size` と一致しなければ（途中で伸縮した）拒否する。定数は `sealed_copy.rs` の `MAX_SEALED_COPY_BYTES`、強制は #1531。複製は exec の子が子 cgroup に
 //!   参加した後に作るため、コンテナの `memory.max` に計上される（ホストのメモリを直接は奪わない）。一方、memfd の
 //!   ページは exec 先が生きている間残る（共有されない shmem）ため、exec 1 回ごとに本体の大きさぶん常駐メモリが
 //!   増える。exec は一時的なコマンド向けで、常駐するワークロード（launch）には掛けない（CORE-7〜9 との関係）
@@ -65,12 +71,16 @@
 //!   1 回だけ再試行する（6.3 未満の memfd は実行できる）。`vm.memfd_noexec=2` の下では `MFD_EXEC` が `EACCES`、
 //!   コンテナの seccomp が `memfd_create` を禁止していれば `EPERM` などになり、いずれも拒否する（`memfd_create`・
 //!   `fcntl` は deny-list に含めない契約を `seccomp` のテストで機械照合している）
-//! - **Landlock との関係（未確認・#1531 の最初の確認事項）**: exec の子は `EXECUTE` を扱う Landlock ruleset の下で
-//!   memfd を `execveat` する。memfd はカーネル内部の shmem マウント（`MNT_INTERNAL`）上にありルールの対象パスが無い。
-//!   `security/landlock/fs.c` は、内部マウントの根（nsfs 等）への到達を許可側で扱う実装と認識しているが、一次情報
-//!   （対応カーネルのソース）と実プロセスでの確認は #1530 では行っていない。#1531 の結合試験で Landlock 適用下の実行が
-//!   通ることを最初に確かめる。拒否される場合は、memfd を worker 側で `restrict_self` の前に作って子へ渡す、または
-//!   memfd を `parent_fd` にして `landlock_add_rule` する案があり、複製を作る場所が変わる（#1531 の設計の見直しになる）
+//! - **Landlock との関係（#1531 で実プロセスの確認。ソースでの照合は未実施）**: exec の子は `EXECUTE` を扱う Landlock
+//!   ruleset の下で memfd を `execveat` する。memfd はカーネル内部の shmem マウント上にありルールの対象パスが無い。
+//!   Linux 7.0 の検証環境で、`EXECUTE` を扱う ruleset を `/usr`・`/bin`・`/lib*` にだけ許可して適用した後に、
+//!   ルール外の memfd（封印・読み取り専用で開き直したもの）を `execveat(AT_EMPTY_PATH)` すると実行できた
+//!   （動的リンクの ELF なので、`PT_INTERP` の解決先は許可したルール内）。ルールを 1 つも許可しない場合は
+//!   `EACCES`（この拒否は memfd ではなく `PT_INTERP` の側の可能性があり、memfd 自体の判定とは切り分けていない）。
+//!   この確認はカーネル版に依存し得るため、本番相当の通し（root・Landlock ABI 6+ を要する supervisor の
+//!   `tests/exec.rs`）での実行確認は実機の記録に委ねる。`landlock/rules.rs` の `mount_rights` は `noexec` の
+//!   マウントから `EXECUTE` を外すが、Landlock は memfd の側を検査するため、複製を通る実行には効かない
+//!   （(1') の `faccessat2` が元のファイルの `noexec` を担う）
 //! - **`ETXTBSY`**: 本リポの検証環境（Linux 7.0）では、封印した memfd を読み取り専用で開き直して書き込み用 fd を閉じれば、
 //!   実行できることを `sys` のテスト（`sup6_task163_sealed_memfd_is_executable_after_readonly_reopen`）で確認した。
 //!   カーネルの版による `deny_write_access` の挙動差（6.11 前後の変更）は一次情報では未確認で、書き込み用 fd を
@@ -101,9 +111,16 @@
 //!
 //! # 限界（REPAIR-3）
 //!
-//! - **B' は組み込むまで未実装**: 本体の内容の書き換えは #1531 の組み込みで閉じる。B' でもインタープリタのパスの
-//!   差し替えとインタープリタ自身の内容の書き換えは閉じず、引き続き Landlock に頼る。launch 経路への適用は
+//! - **B' は稼働中コンテナへの exec のみ**: 本体の内容の書き換えは #1531 の組み込みで閉じる（複製の前の書き換えは
+//!   「解析と実行が同じバイトを見る」ことを保証するのであって、元の内容が実行されるとは限らない。複製したバイト列
+//!   をランタイムの照合に通すため、書き換えた内容はシェバン・`PT_INTERP` の照合に掛かる）。B' でもインタープリタの
+//!   パスの差し替えとインタープリタ自身の内容の書き換えは閉じず、引き続き Landlock に頼る。launch 経路への適用は
 //!   #1314（本番 launcher の構成）の後になる
+//! - **B' は LSM の exec 検査を再現しない**: 元のファイルに対する AppArmor・SELinux の exec 遷移・IMA の appraisal は、
+//!   memfd を実行する場合は元のファイルについて働かない。実行ビットと `noexec` だけを `faccessat2` で再現する。
+//!   setuid ビット・ファイル capability は `NO_NEW_PRIVS` が適用済みのため元々無効で、複製しても緩和にならない
+//! - **B' で `/proc/self/exe` の見え方が変わる**: exec 先の `/proc/self/exe` は `/memfd:fandhe-exec-entrypoint (deleted)`
+//!   を指す（元のパスではなくなる）。シェバンのスクリプトは従来どおり `/dev/fd/N` を渡される
 //! - **検査と実行の間の競合（TOCTOU）は残る**:カーネルは `execve` の中でインタープリタのパスを解決し直す。
 //!   稼働中のコンテナが、検査の後・`execve` の前にインタープリタのパス（途中の symlink 等）を
 //!   `/proc/self/exe` へ差し替えれば、本検査を通過し得る。エントリポイント本体は fd に固定して `execveat` するため

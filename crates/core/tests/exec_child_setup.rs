@@ -20,6 +20,9 @@
 //!   拒否し、報告は書かれない（symlink 経由・`/proc/thread-self/exe`・`PT_INTERP` がランタイム自身の ELF・
 //!   その ELF をインタープリタにするスクリプトも同様）。対照として、通常のシェルスクリプト（`#!/bin/sh`）は手順を通る
 //!
+//! - **封印した複製（#1531）**: 実行に使う fd は照合した本体の memfd 複製（seal 0x0F・リンク先 `/memfd:fandhe-exec-entrypoint
+//!   (deleted)`）で、照合の後に元のファイルを上書き・`rename` で差し替えても内容は変わらない（差し込み点
+//!   `observe_exec_child_setup_with`）。上限超過は違反 `entrypoint_copy_too_large`、実行ビットのないスクリプトは違反なしで拒否する
 //! - **`execve` 前の失敗の区別（#1460）**: 子が本番と同じ pipe で親へ知らせた内容から、「コマンドは起動して
 //!   いない」（終了コード 125〜127 と違反の理由）と「`execveat` の直前まで到達した」が区別される。子に残る fd が
 //!   その pipe と検査済みのエントリポイントの 2 本だけであること（継承 fd の後始末）も照合する
@@ -73,9 +76,10 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::exec::{
-        ChildExit, ContainerEnv, ExecChildSetupReport, ExecCommand, ExecExit, StandardFd,
-        SupplementaryGroups, ViolationReason, clear_supplementary_groups_for_test,
-        close_standard_fds_for_test, observe_exec_child_setup,
+        ChildExit, ContainerEnv, ExecChildSetupReport, ExecCommand, ExecExit,
+        MAX_SEALED_COPY_BYTES, StandardFd, SupplementaryGroups, ViolationReason,
+        clear_supplementary_groups_for_test, close_standard_fds_for_test, observe_exec_child_setup,
+        observe_exec_child_setup_with,
     };
     use fandhe_container_core::oci_runtime::parse_config_bytes;
     use fandhe_container_core::traits::ErrorCode;
@@ -90,6 +94,10 @@ mod linux {
     const PTY_OK: &str = "pty-ok";
     /// `ENXIO`（制御端末を持たないプロセスが `/dev/tty` を開いたときの errno。全アーキテクチャ共通の 6）。
     const ENXIO: i32 = 6;
+    /// 実行に使う fd（封印した複製）の `/proc/self/fd/N` のリンク先（#1531）。
+    const SEALED_COPY_LINK: &str = "/memfd:fandhe-exec-entrypoint (deleted)";
+    /// 封印した複製の `F_GET_SEALS`（`F_SEAL_SEAL|SHRINK|GROW|WRITE`）。
+    const SEALED_COPY_SEALS: u32 = 0x0F;
     /// `/dev/null` のデバイス番号 1:3 の `st_rdev`（glibc の `makedev(1, 3)`）。
     const NULL_RDEV: u64 = 0x103;
 
@@ -160,6 +168,8 @@ mod linux {
         session_is_detached_from_the_caller(&work.0, "report");
         child_has_no_controlling_terminal_under_a_pty(&work.0);
         runtime_interpreter_is_rejected_before_exec(&work.0);
+        executed_fd_is_a_sealed_copy_immune_to_replacement(&work.0);
+        sealed_copy_refusals_are_recorded(&work.0);
         setup_failures_are_distinguished_from_command_exits(&work.0);
         inherited_fds_are_closed_except_the_status_pipe(&work.0);
         environment_comes_only_from_the_container_definition(&work.0);
@@ -380,6 +390,102 @@ mod linux {
         assert_eq!(report.stdio, [(true, NULL_RDEV); 3]);
     }
 
+    /// SUP-6・SEC-1・TASK-163 追補（#1531）: 実行に使う fd は、照合した内容の封印した複製（memfd・seal 0x0F）で、
+    /// 照合の後・`execveat` の前に元のファイルが書き換えられても内容は変わらない。
+    ///
+    /// `after_prepare`（手順がすべて終わった直後の差し込み点）で、元のファイルの inode を上書きし、
+    /// さらに別の内容のファイルを同じパスへ `rename` する。複製が無ければ、実行する fd の内容は書き換え後に
+    /// なる（元の inode の fd を実行するため）。
+    fn executed_fd_is_a_sealed_copy_immune_to_replacement(work: &Path) {
+        let original = b"#!/bin/sh\n# original\nexit 0\n";
+        let target = work.join("swap-target");
+        write_bytes(&target, original);
+        let replacement = work.join("swap-replacement");
+        write_bytes(&replacement, b"#!/bin/sh\n# replaced by rename\nexit 7\n");
+        let entry = ExecCommand::new(&target, ["swap"], &ContainerEnv::empty()).expect("command");
+        let report_path = work.join("report-swap");
+        let (t, r) = (target.clone(), replacement.clone());
+        let observation = observe_exec_child_setup_with(
+            &entry,
+            &report_path,
+            move || {
+                // (i) 照合した inode そのものを上書きする（コンテナ側が書き込める元のファイルの書き換え）。
+                fs::write(&t, b"#!/bin/sh\n# overwritten in place\nexit 9\n")
+                    .expect("overwrite the original in place");
+                // (ii) 同じパスを別のファイルへ差し替える。
+                fs::rename(&r, &t).expect("replace the path");
+            },
+            timeout(),
+        )
+        .expect("observe the exec child setup");
+        assert_eq!(
+            observation.exit,
+            ExecExit::Command(ChildExit::Exited(0)),
+            "swap"
+        );
+        let exec_fd = observation.report.expect("report").exec_fd;
+        // 実行する fd は差し替え前の内容のまま（具体値で照合）。
+        assert_eq!(exec_fd.head, original.to_vec());
+        assert_eq!(exec_fd.size, original.len() as u64);
+        assert_eq!(exec_fd.seals, Some(SEALED_COPY_SEALS));
+        assert_eq!(exec_fd.link, SEALED_COPY_LINK);
+        // 対照: 差し替えは実際に起きていて、元のパスの内容は変わっている。
+        assert_eq!(
+            fs::read(&target).expect("read the swapped path"),
+            b"#!/bin/sh\n# replaced by rename\nexit 7\n".to_vec()
+        );
+        // 対照: ELF（動的リンクの実バイナリ）も同じ手順を通り、複製のサイズが元と一致する。
+        let truth = ExecCommand::new("/bin/true", ["true"], &ContainerEnv::empty()).expect("cmd");
+        let report = observe_ok(&truth, work, "report-elf-copy");
+        assert_eq!(report.exec_fd.seals, Some(SEALED_COPY_SEALS));
+        assert_eq!(report.exec_fd.link, SEALED_COPY_LINK);
+        assert_eq!(
+            report.exec_fd.size,
+            fs::metadata("/bin/true").expect("stat /bin/true").len()
+        );
+        assert_eq!(&report.exec_fd.head[..4], b"\x7fELF");
+    }
+
+    /// SEC-4・SEC-1・SUP-6・TASK-163 追補（#1531）: 封印した複製の拒否は、子から親へ届く。上限超過は違反
+    /// `entrypoint_copy_too_large`、実行ビットのないファイルは違反ではない `PermissionDenied`（126）。
+    fn sealed_copy_refusals_are_recorded(work: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let env = ContainerEnv::empty();
+        // 上限を 1 バイト超える疎なファイル（ディスクを消費しない。内容の確認前に `st_size` で拒否される）。
+        let huge = work.join("huge");
+        let file = fs::File::create(&huge).expect("create the huge file");
+        file.set_len(MAX_SEALED_COPY_BYTES + 1).expect("set_len");
+        file.set_permissions(fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        drop(file);
+        let command = ExecCommand::new(&huge, ["huge"], &env).expect("command");
+        let observation = observe_exec_child_setup(&command, &work.join("report-huge"), timeout())
+            .expect("observe the exec child setup");
+        assert_eq!(
+            observation.exit,
+            ExecExit::SetupFailed {
+                exit: ChildExit::Exited(126),
+                violation: Some(ViolationReason::EntrypointCopyTooLarge),
+            }
+        );
+        assert_eq!(observation.report, None);
+        // 実行ビットのないスクリプト: 複製（memfd は実行可能）に写すと実行できてしまうため、複製の前に拒否する。
+        let plain = work.join("not-executable");
+        write_script(&plain, "#!/bin/sh\nexit 0\n");
+        fs::set_permissions(&plain, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
+        let command = ExecCommand::new(&plain, ["plain"], &env).expect("command");
+        let observation = observe_exec_child_setup(&command, &work.join("report-plain"), timeout())
+            .expect("observe the exec child setup");
+        assert_eq!(
+            observation.exit,
+            ExecExit::SetupFailed {
+                exit: ChildExit::Exited(126),
+                violation: None,
+            }
+        );
+        assert_eq!(observation.report, None);
+    }
+
     /// SUP-6・REPAIR-3・TASK-163 追補（#1460）: `execveat` より前の失敗は、終了コード（125〜127。コマンド自身も
     /// 返し得る）ではなく、子が pipe で知らせた内容で「コマンドは起動していない」と判定される。
     fn setup_failures_are_distinguished_from_command_exits(work: &Path) {
@@ -438,10 +544,15 @@ mod linux {
             targets.iter().any(|t| t.starts_with("pipe:[")),
             "the status pipe must remain: {fds:?}"
         );
+        // 実行に使う fd は、照合したエントリポイントの封印した複製（#1531）。元のファイルの fd は残らない。
+        assert!(
+            targets.contains(&SEALED_COPY_LINK),
+            "the sealed copy of the entrypoint must remain: {fds:?}"
+        );
         let shell = fs::canonicalize("/bin/sh").expect("canonicalize /bin/sh");
         assert!(
-            targets.contains(&shell.to_str().expect("utf-8 path")),
-            "the verified entrypoint must remain: {fds:?}"
+            !targets.contains(&shell.to_str().expect("utf-8 path")),
+            "the original entrypoint fd must be closed: {fds:?}"
         );
         assert!(
             !targets.iter().any(|t| t.contains("/status")),
@@ -732,10 +843,8 @@ mod linux {
         if fds.len() != 2 || fds.iter().any(|(fd, _)| *fd < 3) {
             return Err(format!("expected 2 fds all >= 3: {fds:?}"));
         }
-        let shell = fs::canonicalize("/bin/sh").map_err(|e| e.to_string())?;
-        let shell = shell.to_string_lossy();
         let has_pipe = fds.iter().any(|(_, t)| t.starts_with("pipe:["));
-        let has_shell = fds.iter().any(|(_, t)| *t == shell);
+        let has_shell = fds.iter().any(|(_, t)| t == SEALED_COPY_LINK);
         if !(has_pipe && has_shell) {
             return Err(format!(
                 "expected the status pipe and the entrypoint: {fds:?}"

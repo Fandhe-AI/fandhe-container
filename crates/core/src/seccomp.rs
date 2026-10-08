@@ -879,11 +879,16 @@ mod tests {
     fn core5_task38_1_1_runtime_required_syscalls_not_denied() {
         // execve・execveat・prctl・capget・capset・close_range・exit・exit_group・
         // pidfd_open・pidfd_send_signal・rt_sigreturn・memfd_create・fcntl
-        // （最後の 2 件は封印した複製からの実行。TASK-163 追補・#1530・SUP-6）
+        // （memfd_create・fcntl は封印した複製からの実行。TASK-163 追補・#1530・SUP-6）、
+        // faccessat2・pread64・pwrite64（複製の前の実行権限の照合と複製の読み書き。TASK-163 追補・#1531・SEC-1）
         #[cfg(target_arch = "x86_64")]
-        let required: [u32; 13] = [59, 322, 157, 125, 126, 436, 60, 231, 434, 424, 15, 319, 72];
+        let required: [u32; 16] = [
+            59, 322, 157, 125, 126, 436, 60, 231, 434, 424, 15, 319, 72, 439, 17, 18,
+        ];
         #[cfg(target_arch = "aarch64")]
-        let required: [u32; 13] = [221, 281, 167, 90, 91, 436, 93, 94, 434, 424, 139, 279, 25];
+        let required: [u32; 16] = [
+            221, 281, 167, 90, 91, 436, 93, 94, 434, 424, 139, 279, 25, 439, 67, 68,
+        ];
         let t = native();
         for (d, n) in t.entries() {
             assert!(!required.contains(&n.get()), "{} is required", d.name());

@@ -28,17 +28,29 @@
 //! 線形写像の性質上、Docker 既定相当の 500 は 4950 へ写り cgroup v2 の既定 100 とは一致しない
 //! （未指定時は書き込まず既定 100 を保つ運用とする）。
 //!
+//! # `--blkio-weight` の書き込み先（#1534）
+//! [`ContainerCgroup::set_blkio_weight`] は runc（`fs2/io.go`）互換で書き込み先を 1 つに決める。
+//! `io.bfq.weight` があれば変換せずそこへだけ書き（BFQ の値域 `1..=1000` に Docker 値が収まる）、
+//! `ENOENT` のときだけ上の写像で `io.weight` へ書く。`ENOENT` 以外の open 失敗はフォールバックせず
+//! エラーにする（fail-closed）。実際の書き込み先は [`BlkioWeightTarget`] で返し、呼び出し側が
+//! 利用者へ示せる。`io.bfq.weight` の詳細は `io_bfq_weight` サブモジュールを参照。
+//!
+//! 設計判断: 両方のファイルへ書く案は、失敗面が倍になりどちらが効いているか示せず、runc / crun の
+//! 挙動からも外れるため採らない。`io.bfq.weight` があっても BFQ が使われているとは限らず、
+//! 配分に効くことは保証しない。
+//!
 //! # 未実装（REPAIR-3）
 //! - `io.weight` は I/O コスト制御が提供するファイルで、`io` を有効化してもカーネル構成によっては存在しない。
 //!   重みが実効を持つのは対象デバイスで比例配分が有効な場合に限られ、本 API は「値がファイルへ入ったこと」
 //!   までを保証する（配分の実効は保証しない）
-//! - デバイス別重み（`--blkio-weight-device` 相当）・`io.bfq.weight`
+//! - デバイス別重み（`--blkio-weight-device` 相当）
 //! - OCI `linux.resources.blockIO.weight` からの反映と launcher への結線（TASK-29 / TASK-157 系）
 
 use std::fs::File;
 use std::io::Write as _;
 use std::os::fd::{AsFd as _, BorrowedFd};
 
+use super::io_bfq_weight::{BfqWeight, write_bfq_weight_at};
 use super::{
     CgroupError, CgroupStep, ContainerCgroup, SMALL_FILE_LIMIT, cstring, io_error, read_iface,
     sys_error,
@@ -76,6 +88,40 @@ fn invalid(message: String) -> CgroupError {
     CgroupError::new(ErrorCode::InvalidArgument, CgroupStep::SetIoWeight, message)
 }
 
+/// 検証済みの Docker 流 `--blkio-weight` 値（`10..=1000`）。
+/// 書き込み先（`io.bfq.weight` か `io.weight`）の選択は [`ContainerCgroup::set_blkio_weight`] が行う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlkioWeight {
+    weight: u16,
+}
+
+impl BlkioWeight {
+    /// `10..=1000` の値。範囲外（`0` を含む）は `InvalidArgument`。
+    pub fn new(weight: u16) -> Result<Self, CgroupError> {
+        if !(BLKIO_WEIGHT_MIN..=BLKIO_WEIGHT_MAX).contains(&weight) {
+            return Err(invalid(format!(
+                "blkio weight {weight} is out of range [{BLKIO_WEIGHT_MIN}, {BLKIO_WEIGHT_MAX}]"
+            )));
+        }
+        Ok(Self { weight })
+    }
+
+    /// 重み。
+    pub fn weight(&self) -> u16 {
+        self.weight
+    }
+}
+
+/// [`ContainerCgroup::set_blkio_weight`] が実際に書いた先と、読み戻して確かめた値。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BlkioWeightTarget {
+    /// `io.bfq.weight` へ無変換で書いた。
+    Bfq(BfqWeight),
+    /// `io.bfq.weight` が無く、変換して `io.weight` へ書いた。
+    IoWeight(IoWeight),
+}
+
 impl IoWeight {
     /// `1..=`[`IO_WEIGHT_MAX`] の重み。範囲外は `InvalidArgument`（カーネルへは渡さない）。
     pub fn new(weight: u16) -> Result<Self, CgroupError> {
@@ -89,11 +135,12 @@ impl IoWeight {
 
     /// `--blkio-weight`（`10..=1000`）から `io.weight` への線形変換。範囲外は `InvalidArgument`。
     pub fn from_blkio_weight(weight: u16) -> Result<Self, CgroupError> {
-        if !(BLKIO_WEIGHT_MIN..=BLKIO_WEIGHT_MAX).contains(&weight) {
-            return Err(invalid(format!(
-                "blkio weight {weight} is out of range [{BLKIO_WEIGHT_MIN}, {BLKIO_WEIGHT_MAX}]"
-            )));
-        }
+        Self::from_blkio(BlkioWeight::new(weight)?)
+    }
+
+    /// 検証済みの [`BlkioWeight`] から `io.weight` への線形変換。
+    pub fn from_blkio(blkio: BlkioWeight) -> Result<Self, CgroupError> {
+        let weight = blkio.weight();
         let span_in = u32::from(BLKIO_WEIGHT_MAX - BLKIO_WEIGHT_MIN);
         let span_out = u32::from(IO_WEIGHT_MAX - IO_WEIGHT_MIN);
         let offset = u32::from(weight - BLKIO_WEIGHT_MIN);
@@ -173,6 +220,44 @@ impl ContainerCgroup {
     ) -> Result<IoWeight, CgroupError> {
         write_io_weight_recorded(self.fd.as_fd(), recorder, weight)
     }
+
+    /// `--blkio-weight` を書く（SUP-13・CORE-4・#1534）。runc 互換で書き込み先を 1 つに決める。
+    ///
+    /// - `io.bfq.weight` がある: 変換せずそこへだけ書く
+    /// - `io.bfq.weight` が無い（`ENOENT`）: 変換して `io.weight` へ書く
+    /// - `io.bfq.weight` の open が `ENOENT` 以外で失敗: エラー（`io.weight` へフォールバックしない）
+    ///
+    /// 保証するのは値がファイルへ入ったことまでで、配分に効くことは保証しない。
+    /// 操作名 `cgroup.set_blkio_weight` で全終了経路を記録する（REPAIR-4）。
+    pub fn set_blkio_weight(
+        &self,
+        recorder: &OpRecorder,
+        weight: &BlkioWeight,
+    ) -> Result<BlkioWeightTarget, CgroupError> {
+        let name = OpName::new(SET_BLKIO_WEIGHT_OP_NAME).map_err(|e| CgroupError {
+            code: e.code(),
+            step: CgroupStep::SetIoWeight,
+            message: e.message().to_string(),
+        })?;
+        let dir = self.fd.as_fd();
+        recorder.record_op(&name, || write_blkio_weight_at(dir, weight))
+    }
+}
+
+/// [`OpRecorder`] に記録する操作名（REPAIR-4）。
+const SET_BLKIO_WEIGHT_OP_NAME: &str = "cgroup.set_blkio_weight";
+
+/// 書き込み先の振り分けの実体（テスト可能）。フォールバック先は記録なしの内側関数を直接呼ぶ。
+fn write_blkio_weight_at(
+    dir: BorrowedFd<'_>,
+    weight: &BlkioWeight,
+) -> Result<BlkioWeightTarget, CgroupError> {
+    let bfq = BfqWeight::new(weight.weight())?;
+    if let Some(actual) = write_bfq_weight_at(dir, &bfq)? {
+        return Ok(BlkioWeightTarget::Bfq(actual));
+    }
+    let converted = IoWeight::from_blkio(*weight)?;
+    write_io_weight_at(dir, &converted).map(BlkioWeightTarget::IoWeight)
 }
 
 /// [`OpRecorder`] に記録する操作名（REPAIR-4）。
@@ -416,5 +501,157 @@ mod tests {
             "untouched"
         );
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    fn blkio(n: u16) -> BlkioWeight {
+        BlkioWeight::new(n).unwrap()
+    }
+
+    fn read(base: &std::path::Path, name: &str) -> String {
+        std::fs::read_to_string(base.join(name)).unwrap()
+    }
+
+    /// SUP-13・#1534: `--blkio-weight` の境界値。
+    #[test]
+    fn sup13_issue1534_blkio_weight_bounds() {
+        for bad in [0, 9, 1001, u16::MAX] {
+            let e = BlkioWeight::new(bad).unwrap_err();
+            assert_eq!(e.code, ErrorCode::InvalidArgument);
+            assert_eq!(e.step, CgroupStep::SetIoWeight);
+        }
+        assert_eq!(blkio(10).weight(), 10);
+        assert_eq!(blkio(1000).weight(), 1000);
+    }
+
+    /// SUP-13・#1534: `io.bfq.weight` があればそこへ無変換で書き、`io.weight` は触らない。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sup13_issue1534_bfq_present_writes_bfq_only() {
+        let base = scratch("bfq-ok");
+        std::fs::write(base.join("io.bfq.weight"), b"").unwrap();
+        std::fs::write(base.join("io.weight"), b"default 100\n").unwrap();
+        let dir = File::open(&base).unwrap();
+        let got = write_blkio_weight_at(dir.as_fd(), &blkio(500)).unwrap();
+        assert_eq!(got, BlkioWeightTarget::Bfq(BfqWeight::new(500).unwrap()));
+        assert_eq!(read(&base, "io.bfq.weight"), "500");
+        assert_eq!(read(&base, "io.weight"), "default 100\n");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// SUP-13・#1534: `io.bfq.weight` が無ければ変換して `io.weight` へ書く。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sup13_issue1534_bfq_absent_falls_back_to_io_weight() {
+        let base = scratch("bfq-absent");
+        std::fs::write(base.join("io.weight"), b"").unwrap();
+        let dir = File::open(&base).unwrap();
+        let got = write_blkio_weight_at(dir.as_fd(), &blkio(500)).unwrap();
+        assert_eq!(
+            got,
+            BlkioWeightTarget::IoWeight(IoWeight::new(4950).unwrap())
+        );
+        assert_eq!(read(&base, "io.weight"), "default 4950");
+        assert!(!base.join("io.bfq.weight").exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// SUP-13・#1534: 両方とも無ければ `io.weight` 側の `FailedPrecondition`。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sup13_issue1534_both_absent_is_failed_precondition() {
+        let base = scratch("both-absent");
+        let dir = File::open(&base).unwrap();
+        let e = write_blkio_weight_at(dir.as_fd(), &blkio(500)).unwrap_err();
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.step, CgroupStep::SetIoWeight);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// SUP-13・#1534: `io.bfq.weight` が ENOENT 以外（ここでは EISDIR）で開けないときは
+    /// `io.weight` へフォールバックせずエラーにする。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sup13_issue1534_bfq_open_failure_does_not_fall_back() {
+        let base = scratch("bfq-eisdir");
+        std::fs::create_dir(base.join("io.bfq.weight")).unwrap();
+        std::fs::write(base.join("io.weight"), b"default 100\n").unwrap();
+        let dir = File::open(&base).unwrap();
+        let e = write_blkio_weight_at(dir.as_fd(), &blkio(500)).unwrap_err();
+        assert_eq!(e.step, CgroupStep::SetIoBfqWeight);
+        assert_eq!(read(&base, "io.weight"), "default 100\n");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// SUP-13・#1534: `io.bfq.weight` が symlink なら拒否し、リンク先も `io.weight` も変えない。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sup13_issue1534_bfq_symlink_is_rejected_without_fallback() {
+        let base = scratch("bfq-symlink");
+        std::fs::write(base.join("target"), b"untouched").unwrap();
+        std::os::unix::fs::symlink(base.join("target"), base.join("io.bfq.weight")).unwrap();
+        std::fs::write(base.join("io.weight"), b"default 100\n").unwrap();
+        let dir = File::open(&base).unwrap();
+        let e = write_blkio_weight_at(dir.as_fd(), &blkio(500)).unwrap_err();
+        assert_eq!(e.step, CgroupStep::SetIoBfqWeight);
+        assert_eq!(read(&base, "target"), "untouched");
+        assert_eq!(read(&base, "io.weight"), "default 100\n");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// SUP-13・#1534: 読み戻しの不一致は成功扱いにせず、巻き戻さない。
+    /// `999\n` へ `10` を書くと `O_TRUNC` なしの上書きで `109\n` が残る。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sup13_issue1534_bfq_read_back_mismatch_fails() {
+        let base = scratch("bfq-mismatch");
+        std::fs::write(base.join("io.bfq.weight"), b"999\n").unwrap();
+        let dir = File::open(&base).unwrap();
+        let e = write_blkio_weight_at(dir.as_fd(), &blkio(10)).unwrap_err();
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.step, CgroupStep::SetIoBfqWeight);
+        assert_eq!(
+            e.message,
+            "io.bfq.weight read back as \"109\", expected \"10\""
+        );
+        assert_eq!(read(&base, "io.bfq.weight"), "109\n");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// SUP-13・#1534: 読み戻しが形式不正なら解析エラーで失敗する。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sup13_issue1534_bfq_read_back_malformed_fails() {
+        let base = scratch("bfq-malformed");
+        std::fs::write(base.join("io.bfq.weight"), b"999\nxxxxxx").unwrap();
+        let dir = File::open(&base).unwrap();
+        let e = write_blkio_weight_at(dir.as_fd(), &blkio(10)).unwrap_err();
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.step, CgroupStep::SetIoBfqWeight);
+        assert_eq!(
+            e.message,
+            "unexpected io.bfq.weight content (weight is not a decimal number): \"109\\nxxxxxx\""
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// SUP-13・#1534・REPAIR-4: `set_blkio_weight` の成功・失敗が `cgroup.set_blkio_weight` に記録される。
+    /// 記録はラッパー経由（record_op）で、ここでは同じ名前と実体で直接確かめる。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sup13_issue1534_blkio_weight_operations_are_recorded() {
+        let name = OpName::new(SET_BLKIO_WEIGHT_OP_NAME).unwrap();
+        let rec = OpRecorder::new();
+        let ok = scratch("rec-bfq-ok");
+        std::fs::write(ok.join("io.bfq.weight"), b"").unwrap();
+        let ng = scratch("rec-bfq-ng");
+        std::fs::create_dir(ng.join("io.bfq.weight")).unwrap();
+        for base in [&ok, &ng] {
+            let dir = File::open(base).unwrap();
+            let _ = rec.record_op(&name, || write_blkio_weight_at(dir.as_fd(), &blkio(500)));
+        }
+        let stats = rec.snapshot_op(&name).expect("recorded");
+        assert_eq!((stats.success(), stats.failure()), (1, 1));
+        std::fs::remove_dir_all(&ok).unwrap();
+        std::fs::remove_dir_all(&ng).unwrap();
     }
 }

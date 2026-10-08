@@ -44,6 +44,9 @@
 //!   [`ContainerCgroup::set_io_max`]（`io_max` サブモジュール。1 デバイス分の絶対値スロットル）（同上。未結線）
 //! - `io.weight`（SUP-13・TASK-170.4・#1474）: [`ContainerCgroup::set_io_weight`]（`io_weight` サブモジュール）と
 //!   `--blkio-weight` の変換 [`IoWeight::from_blkio_weight`]（同上。未結線）
+//! - `--blkio-weight` の書き込み先選択（SUP-13・#1534）: [`ContainerCgroup::set_blkio_weight`] は `io.bfq.weight` が
+//!   あれば無変換でそちらへ、無い（`ENOENT`）ときだけ変換して `io.weight` へ書く（runc 互換。`io_bfq_weight`
+//!   サブモジュール）。実際の書き込み先は [`BlkioWeightTarget`] で返す（未結線）
 //! - fork 後の子の `cgroup.procs` 参加（TASK-32.4・#161）: [`ContainerCgroup::join_hook`] が返す
 //!   [`CgroupJoin`] を `exec::StagePipeline` の `CgroupJoin` 段へ登録する（`exec::StageHook` 実装済み）
 //! - exec 経路の cgroup 参加（SUP-6・TASK-163.2・#501）: 記録した cgroup パスから fd で開いて `cgroup.procs` へ
@@ -82,9 +85,12 @@ mod cpu;
 pub use cpu::{CpuMax, CpuQuota, NANO_CPUS_PER_CPU};
 mod io_max;
 pub use io_max::{BlockDevice, IoLimit, IoMax};
+mod io_bfq_weight;
+pub use io_bfq_weight::{BFQ_WEIGHT_MAX, BFQ_WEIGHT_MIN, BfqWeight};
 mod io_weight;
 pub use io_weight::{
-    BLKIO_WEIGHT_MAX, BLKIO_WEIGHT_MIN, IO_WEIGHT_DEFAULT, IO_WEIGHT_MAX, IO_WEIGHT_MIN, IoWeight,
+    BLKIO_WEIGHT_MAX, BLKIO_WEIGHT_MIN, BlkioWeight, BlkioWeightTarget, IO_WEIGHT_DEFAULT,
+    IO_WEIGHT_MAX, IO_WEIGHT_MIN, IoWeight,
 };
 mod pids;
 pub use pids::{PIDS_MAX_LIMIT, PidsMax};
@@ -150,6 +156,8 @@ pub enum CgroupStep {
     SetIoMax,
     /// `io.weight` の検証・書き込み・読み戻し（SUP-13・TASK-170.4）。
     SetIoWeight,
+    /// `io.bfq.weight` の検証・書き込み・読み戻し（SUP-13・#1534）。
+    SetIoBfqWeight,
     /// fork 後の子プロセスの `cgroup.procs` への参加（TASK-32.4）。
     JoinContainer,
     /// `memory.current` / `cpu.stat` / `io.stat` の読み取り（SUP-10・TASK-167.1）。

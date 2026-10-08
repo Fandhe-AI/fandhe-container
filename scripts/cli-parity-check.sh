@@ -28,7 +28,11 @@
 #   cli-parity-check.sh compare --baseline <capture> --candidate <capture>
 #
 # 終了コード: 0 = 全ケース一致（capture は全ケース実行完了）/ 1 = 不一致・欠落・タイムアウト /
-#   2 = 引数・入力・出力先エラー / 3 = 前提欠如（CLI 不在・実行不可・未対応 OS。0 で合格に見せない）。
+#   2 = 引数・入力・出力先エラー / 3 = 前提欠如（CLI 不在・実行不可・未対応 OS、compare の基準が
+#   Linux の capture でない・候補が基準と同じ OS。0 で合格に見せない）。
+#
+# 後始末の限界: タイムアウト・中断時の回収は CLI を起動したプロセスグループ単位で行う。CLI の子孫が
+# setsid 等で別セッション / 別グループへ出た場合は回収できない（追跡手段が無い。REPAIR-5 の範囲外として残る）。
 #
 # 動作環境: bash 3.2 以上（macOS 標準）。GNU / BSD 双方のツールで動く書き方にしている。
 # Windows は Git Bash で実行する。自己テスト（スタブ CLI）は CI の windows runner でも実行するが、
@@ -111,20 +115,36 @@ watchdog_pid=""
 run_pid=""
 # プロセスグループ（pgid = $1）ごと TERM → KILL し、最大 5 秒（0.1 秒 x 50）で全員の消滅を確かめる。
 # CLI を set -m の別グループで起動しているため、子孫（スタブの sleep 等）も同時に回収できる（REPAIR-5）。
+#
+# シグナルはグループ宛て（負の pid）だけに送り、送る前に毎回グループの生存を確かめる。グループに
+# 生存メンバーがいる間、その pgid は別プロセスの pid として再利用されない。メンバーが居なくなれば
+# 生存確認が失敗して何も送らないため、回収済みの pid が再利用されていても無関係なプロセスを撃たない。
+# リーダー（pid = pgid）もグループ宛てのシグナルに含まれるので、pid 単体へは送らない。
 kill_group() {
   local pg="$1" w=0
+  kill -0 -- "-$pg" 2>/dev/null || return 0
   kill -TERM -- "-$pg" 2>/dev/null || true
   while kill -0 -- "-$pg" 2>/dev/null && [ "$w" -lt 5 ]; do
     sleep 0.1
     w=$((w + 1))
   done
-  kill -KILL -- "-$pg" 2>/dev/null || true
-  kill -KILL "$pg" 2>/dev/null || true
+  if kill -0 -- "-$pg" 2>/dev/null; then
+    kill -KILL -- "-$pg" 2>/dev/null || true
+  fi
   w=0
   while kill -0 -- "-$pg" 2>/dev/null && [ "$w" -lt 50 ]; do
     sleep 0.1
     w=$((w + 1))
   done
+}
+
+# 未回収（まだ wait していない）の子 $1 が、グループ宛ての回収の後も生きている場合に限り pid 単体へ
+# KILL を送る。set -m が効かずプロセスグループが分かれなかった環境で、ハングした CLI を残さないための
+# 保険。呼び出してよいのは親が wait する前だけ（未回収の子の pid は再利用されない）。
+kill_unreaped_child() {
+  if kill -0 "$1" 2>/dev/null; then
+    kill -KILL "$1" 2>/dev/null || true
+  fi
 }
 
 cleanup() {
@@ -133,8 +153,10 @@ cleanup() {
     watchdog_pid=""
   fi
   # 中断時に実行中の CLI とその子孫を残さない。グループごと回収を待ってから一時ディレクトリを消す。
+  # run_pid は run_cli が wait を終えた直後に空にするので、ここへ来る時点では未回収である。
   if [ -n "$run_pid" ]; then
     kill_group "$run_pid"
+    kill_unreaped_child "$run_pid"
     wait "$run_pid" 2>/dev/null || true
     run_pid=""
   fi
@@ -187,15 +209,22 @@ run_cli() {
       sleep 0.1
       i=$((i + 1))
     done
-    if kill -0 "$pid" 2>/dev/null; then
+    # 期限切れ。親はまだ wait 中で CLI は未回収なので、pid は CLI 自身を指している。親が wait を
+    # 終えていたら（done の印）何もしない（回収済みの pid を調べない・撃たない）。
+    if [ ! -e "$marker.done" ] && kill -0 "$pid" 2>/dev/null; then
       : >"$marker"
       kill_group "$pid"
+      [ -e "$marker.done" ] || kill_unreaped_child "$pid"
     fi
   ) &
   watchdog_pid=$!
   run_exit=0
   wait "$pid" || run_exit=$?
-  # 正常終了後に残った子孫（バックグラウンド起動の残り等）もグループごと回収する。
+  # ここから先、pid は回収済みで再利用され得る。pid 単体へは何も送らない。
+  run_pid=""
+  : >"$marker.done"
+  # 正常終了後に残った子孫（バックグラウンド起動の残り等）をグループごと回収する。kill_group は
+  # グループに生存メンバーがいる場合だけシグナルを送る。
   kill_group "$pid"
   # 監視サブシェルは KILL で止める。TERM だと、fork 直後でまだ親の trap を引き継いだままの監視
   # サブシェルが「cleanup; exit 143」を実行し、実行中の一時ディレクトリを消してしまう（CLI が即座に
@@ -203,7 +232,6 @@ run_cli() {
   kill -KILL "$watchdog_pid" 2>/dev/null || true
   wait "$watchdog_pid" 2>/dev/null || true
   watchdog_pid=""
-  run_pid=""
   if [ -e "$marker" ]; then
     run_timed_out=1
   else
@@ -262,11 +290,13 @@ norm_code() {
     iconv -f UTF-8 -t UTF-8 <"$tmp_dir/err" >/dev/null 2>&1 || return 0
     # 残るのは DEL と非 ASCII バイト（上で UTF-8 として検証済み）で、JSON 文字列内にそのまま書ける。
     # 照合前に ASCII の 1 文字へ写し、正規表現が ASCII だけを見るようにする（OS ごとの正規表現実装の
-    # 高位バイトの扱いの差を避ける）。code / op の字句は ASCII 限定なので写像の影響を受けない。
+    # 高位バイトの扱いの差を避ける）。写像先は `~` にする: op（[a-z_]）・code（[A-Z_]）・キー名・
+    # 構造文字のどれにも含まれず、message の文字列本体でだけ受理される。これで非 ASCII を含む op や
+    # code は写像後も字句の正規表現に合わず拒否される。
     # 写像は read 済みの値に対して組み込みで行う。ファイルをコマンド置換で読み直してはならない
     # （Git Bash の bash はコマンド置換の結果から CR を落とすため、CRLF 終端の出力が LF 終端と
     # 区別できなくなる。自己テストの CRLF fixture が windows runner で検出した）。
-    e="${e//[! -~]/x}"
+    e="${e//[! -~]/~}"
   fi
   if [[ $e =~ $ERR_LINE_RE ]]; then
     norm_code_out="${BASH_REMATCH[2]}"
@@ -430,6 +460,22 @@ do_capture() {
 load_capture() {
   local prefix="$1" file="$2" n=0 line id layer ex code so os_line
   local ids=()
+  # 結果を入れる変数を先に消す。同名の変数が環境から渡っていると（例: base_B05）、ファイルに無い
+  # ケースを「読み込んだ」と誤認し、欠落を MATCH にしてしまう。ID の書式（[AB][0-9]{2}）が取り得る
+  # 200 個すべてを対象にする（想定外 ID の重複判定も環境の値に影響されないようにする）。
+  local u_layer u_n
+  unset "${prefix}_os" "${prefix}_ids"
+  for u_layer in A B; do
+    u_n=0
+    while [ "$u_n" -lt 100 ]; do
+      if [ "$u_n" -lt 10 ]; then
+        unset "${prefix}_${u_layer}0${u_n}"
+      else
+        unset "${prefix}_${u_layer}${u_n}"
+      fi
+      u_n=$((u_n + 1))
+    done
+  done
   [ -f "$file" ] && [ ! -L "$file" ] || { err invalid-input "capture file is not a regular file"; exit 2; }
   local size
   size=$(($(wc -c <"$file")))
@@ -505,6 +551,17 @@ do_compare() {
   [ -n "$base" ] && [ -n "$cand" ] || { err invalid-argument "--baseline and --candidate are required"; exit 2; }
   load_capture base "$base"
   load_capture cand "$cand"
+  # 期待値は「Linux ネイティブ実行と同一」なので、基準は Linux の capture、候補は別 OS の capture で
+  # なければ比較が成立しない。同じ OS 同士・非 Linux 基準の全一致を合格に見せない（前提欠如）。
+  # shellcheck disable=SC2154 # base_os / cand_os は load_capture が printf -v で間接代入する
+  if [ "$base_os" != "linux" ]; then
+    err missing-prerequisite "--baseline must be a capture taken on linux"
+    exit 3
+  fi
+  if [ "$cand_os" = "$base_os" ]; then
+    err missing-prerequisite "--candidate must be a capture taken on an OS other than linux"
+    exit 3
+  fi
 
   local all_ids id bv cv bvar cvar layer entry
   local a_match=0 a_mis=0 a_miss=0 b_match=0 b_mis=0 b_miss=0

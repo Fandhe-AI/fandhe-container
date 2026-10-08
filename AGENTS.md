@@ -73,7 +73,7 @@ make supervisor-independence-selftest   # 監視プロセス独立性実証ス�
 make supervisor-independence LAUNCHER=<abs-path> BUNDLE=<dir> [COUNT=<n>] [TARGET_INDEX=<k>] [OUTPUT=<新規ファイル>] [SUPERVISOR_INDEPENDENCE_TIMEOUT=<秒>]  # N（既定 50）個の監視プロセスのうち 1 個を SIGKILL し、残りの生存・継続と孤児化したコンテナの稼働継続を確認する（実機前提・make ci 対象外。TASK-162・SUP-5。スクリプト内で sudo は呼ばない）
 make cli-parity-selftest   # CLI 3 OS 比較スクリプトの自己テスト（TASK-125.1・CLI-1・REPAIR-12。スタブ CLI のみで製品バイナリ・root は使わない。終了コード 0 かつ FAIL 行なし）
 make cli-parity CLI=<abs-path> OUTPUT=<新規ファイル>  # 基本 6 コマンドの終了コード・code・stdout 形式を正規化して記録する（実機前提・make ci 対象外。TASK-125.1。判定は #661）
-make cli-parity BASELINE=<capture> CANDIDATE=<capture>  # Linux の capture を基準に他 OS の capture を突き合わせる（終了コード 0 = 全一致、1 = 不一致・欠落、2 = 入力エラー、3 = 前提欠如）
+make cli-parity BASELINE=<capture> CANDIDATE=<capture>  # Linux の capture を基準に他 OS の capture を突き合わせる（終了コード 0 = 全一致、1 = 不一致・欠落、2 = 入力エラー、3 = 前提欠如〔基準が Linux の capture でない・候補が基準と同じ OS を含む〕）
 make restart-latency-selftest   # restart レイテンシ計測スクリプトの自己テスト（TASK-160・SUP-3・REPAIR-12。スタブ launcher のみで実コンテナ・root は使わない。終了コード 0 かつ FAIL 行なし。Linux・非 root 限定。CI の `bench-regression` ジョブでも実行）
 make restart-latency LAUNCHER=<abs-path> BUNDLE=<dir> [TRIALS=<n>] [WARMUP=<n>] [OUTPUT=<新規ファイル>] [RESTART_LATENCY_WAIT_TIMEOUT=<各待機の秒>] [RESTART_LATENCY_TIMEOUT=<全体の秒>]  # バックオフ 0 で SIGKILL→再起動完了のレイテンシを複数試行計測し、中央値・p95（ms）を JSON 出力（実機前提・make ci 対象外。TASK-160・SUP-3。スクリプト内で sudo は呼ばない。合否は出さない。全体期限は未指定なら試行数と待機上限から算出〔既定 813 秒〕）
 make supervisor-pss-selftest   # 監視プロセス常駐メモリ（PSS）計測スクリプトの自己テスト（TASK-158・SUP-2。疑似 /proc のみで実計測はしない。終了コード 0 かつ FAIL 行なし。Linux・非 root 限定。CI の `bench-regression` ジョブでも実行）

@@ -105,19 +105,19 @@ fn step_line(step: SetupStep) -> String {
 /// - その他 OS: 対応外のため `UNIMPLEMENTED`（8）。
 pub fn run_for(platform: SetupPlatform, stdout: &mut dyn Write) -> CliExit {
     if platform == SetupPlatform::Other {
-        return CliExit::Failed(ErrorCode::Unimplemented);
+        return CliExit::failed(ErrorCode::Unimplemented);
     }
     let steps = required_steps(platform);
     for step in steps {
         // 1 行を 1 回の write_all で書く（行の途中へ他の出力が入らないようにする）。
         if stdout.write_all(step_line(*step).as_bytes()).is_err() {
-            return CliExit::Failed(ErrorCode::Internal);
+            return CliExit::failed(ErrorCode::Internal);
         }
     }
     if steps.is_empty() {
         CliExit::Success
     } else {
-        CliExit::Failed(ErrorCode::Unimplemented)
+        CliExit::failed(ErrorCode::Unimplemented)
     }
 }
 

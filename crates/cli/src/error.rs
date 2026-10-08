@@ -87,7 +87,9 @@ impl CliError {
 
     /// 1 行 JSON を `out`（通常は stderr）へ書く。
     ///
-    /// 他プロセスの出力が行の途中に入らないよう `write_all` を 1 回だけ呼ぶ。書き込みに失敗しても
+    /// 行全体のバイト列を `write_all` で全量書き込もうとするだけで、他プロセスの出力が行の途中に
+    /// 混ざらない（不可分な書き込みである）ことは保証しない。部分書き込み時は複数回の write に
+    /// 分かれ、エスケープ後の行は `PIPE_BUF`（4096）を超え得る。書き込みに失敗しても
     /// 呼び出し側は [`CliError::exit_code`] で終了する（終了コードは書き込み成否に依存しない）。
     pub fn write_stderr(&self, out: &mut dyn Write) -> std::io::Result<()> {
         out.write_all(self.to_json_line().as_bytes())
@@ -220,28 +222,24 @@ mod tests {
     }
 
     #[test]
-    fn err1_write_stderr_is_single_write() {
-        struct Counting {
-            writes: usize,
+    fn err1_write_stderr_writes_all_bytes_even_when_partial() {
+        // 1 回の write で 3 バイトしか受け付けない出力先でも全バイトが書かれる。
+        struct Partial {
             buf: Vec<u8>,
         }
-        impl Write for Counting {
+        impl Write for Partial {
             fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.writes += 1;
-                self.buf.extend_from_slice(b);
-                Ok(b.len())
+                let n = b.len().min(3);
+                self.buf.extend_from_slice(&b[..n]);
+                Ok(n)
             }
             fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
             }
         }
         let e = CliError::new(ErrorCode::NotFound, "missing");
-        let mut w = Counting {
-            writes: 0,
-            buf: Vec::new(),
-        };
+        let mut w = Partial { buf: Vec::new() };
         e.write_stderr(&mut w).unwrap();
-        assert_eq!(w.writes, 1);
         assert_eq!(w.buf, e.to_json_line().into_bytes());
     }
 

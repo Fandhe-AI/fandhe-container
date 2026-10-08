@@ -1591,20 +1591,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 子を起動して登録し、終了（stdout の EOF）まで待ってから、ガードの外で回収する（他所での回収を模す）。
-    /// 戻り値のガードの子は回収済みで、以後の `waitpid` は `ECHILD` になる。
+    /// 子を起動して登録し、ガードの外で（`waitpid(pid, WNOHANG)` を期限つきでポーリングして）回収する
+    /// （他所での回収を模す）。戻り値のガードの子は回収済みで、以後の `waitpid` は `ECHILD` になる。
+    /// 待ちはポーリングの期限（10 秒）で打ち切る（REPAIR-5。ブロッキングの読み取り・wait をしない）。
     #[cfg(unix)]
     fn spawn_then_reap_elsewhere(reg: &'static Registry) -> ChildGuard {
         use crate::signal_forward::ForwardSignal;
-        let mut cmd = sh("exit 0");
-        cmd.stdout(Stdio::piped());
-        let mut g = spawn_registered(&mut cmd, reg).unwrap();
+        let g = spawn_registered(&mut sh("exit 0"), reg).unwrap();
         assert_eq!(reg.forward(ForwardSignal::Hangup).targets, 1);
         let pid = g.pid().unwrap();
-        let mut out = g.child.as_mut().unwrap().stdout.take().unwrap();
-        let mut sink = Vec::new();
-        io::Read::read_to_end(&mut out, &mut sink).unwrap();
-        assert_eq!(sink, b"");
         let start = Instant::now();
         while !crate::sys::reap_child_for_test(pid).unwrap() {
             assert!(

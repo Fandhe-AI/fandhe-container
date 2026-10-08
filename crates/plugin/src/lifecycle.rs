@@ -719,9 +719,9 @@ fn kill_group_retrying_eperm(pgid: u32) -> io::Result<()> {
 
 /// プロセスグループへの `SIGKILL` 送信エラーのうち、グループに生存者がいないことを示すものか。
 ///
-/// `ESRCH`（グループが空）は正常。`EPERM` は許容しない。macOS ではゾンビのみのグループでも
-/// 生存者への送信権限不足でも `EPERM` になり両者を区別できないため、孫の停止を保証できない失敗として
-/// 扱い、呼び出し側（`kill_and_reap`）が `GroupKillFailed` として報告する（PLUG-7・REPAIR-5）。`Unsupported` はグループ送信を持たない unix
+/// `ESRCH`（グループが空）は正常。`EPERM` は macOS のみ許容する（再送後も残る `EPERM` は送れる生存者が
+/// いない = ゾンビのみを意味する）。Linux では権限不足と区別すべきため許容せず、孫の停止を保証できない失敗として
+/// 呼び出し側（`kill_and_reap`）が `GroupKillFailed` として報告する（PLUG-7・REPAIR-5）。`Unsupported` はグループ送信を持たない unix
 /// （Linux・macOS 以外）で、送信自体ができないことと直接の子の回収成否は別問題のため許容し、
 /// `Child::kill` による直接の子の kill・回収だけにフォールバックする（孫の回収は保証しない。この環境では
 /// 回収済みの pid を未回収として報告しない。PLUG-7・#1311）。それ以外（`InvalidInput` 等）は孫の停止を
@@ -730,6 +730,13 @@ fn kill_group_retrying_eperm(pgid: u32) -> io::Result<()> {
 fn group_kill_tolerated(e: &io::Error) -> bool {
     const ESRCH: i32 = 3;
     if e.kind() == io::ErrorKind::Unsupported {
+        return true;
+    }
+    // macOS の BSD 系 kill(2) は、グループ内に 1 つでもシグナルを送れる同一 UID のプロセスがあれば成功する。
+    // 再送（`kill_group_retrying_eperm`）後も残る `EPERM` は、自分が起動した同一 UID のグループでは
+    // 送れる生存者がない（ゾンビのみ）ことを意味し、孫は生存していない（PLUG-7・REPAIR-5）。
+    #[cfg(target_os = "macos")]
+    if e.raw_os_error() == Some(1) {
         return true;
     }
     e.raw_os_error() == Some(ESRCH)
@@ -1182,8 +1189,11 @@ mod tests {
             io::ErrorKind::Unsupported
         )));
         assert!(!group_kill_tolerated(&io::Error::from_raw_os_error(22)));
-        // EPERM は生存者への権限不足と区別できないため、どの OS でも失敗として扱う。
-        assert!(!group_kill_tolerated(&io::Error::from_raw_os_error(1)));
+        // EPERM は macOS では「送れる生存者がない」ことを示し許容、Linux では権限不足として失敗扱い。
+        assert_eq!(
+            group_kill_tolerated(&io::Error::from_raw_os_error(1)),
+            cfg!(target_os = "macos")
+        );
     }
 
     #[test]
@@ -1395,9 +1405,7 @@ mod tests {
             cmd.stdout(Stdio::piped());
             let mut g = spawn_registered(&mut cmd, reg).unwrap();
             let out = g.child.as_mut().unwrap().stdout.take().unwrap();
-            let mut line = String::new();
-            io::BufRead::read_line(&mut io::BufReader::new(out), &mut line).unwrap();
-            let gc: u32 = line.trim().parse().unwrap();
+            let gc: u32 = read_grandchild_pid(&mut g, out);
             assert!(is_running(gc));
             assert_eq!(reg.forward(sig).targets, 1);
             let start = Instant::now();
@@ -1446,11 +1454,34 @@ mod tests {
         assert_eq!(guard.kill_and_reap(), Reap::AlreadyReaped);
     }
 
+    /// 子の標準出力 1 行目の孫 pid を有限の期限内に読む（REPAIR-5・#1311）。期限内に改行も EOF も来なければ
+    /// 起動したグループへ SIGKILL を送り、直接の子を回収してから panic する（`read_line` の無期限ブロック防止）。
+    #[cfg(unix)]
+    fn read_grandchild_pid(guard: &mut ChildGuard, out: std::process::ChildStdout) -> u32 {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let r = io::BufRead::read_line(&mut io::BufReader::new(out), &mut line).map(|_| line);
+            let _ = tx.send(r);
+        });
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(line)) => line.trim().parse().expect("grandchild pid line"),
+            Ok(Err(e)) => {
+                let _ = guard.kill_and_reap();
+                panic!("failed to read grandchild pid: {e}");
+            }
+            Err(_) => {
+                let reap = guard.kill_and_reap();
+                panic!("timed out reading grandchild pid (reap: {reap:?})");
+            }
+        }
+    }
+
     /// 新しいプロセスグループで `script` を起動し、標準出力 1 行目の孫 pid を返す（#1311 のテスト用）。
     #[cfg(unix)]
     fn spawn_group_with_grandchild(script: &str) -> (ChildGuard, u32) {
         use std::os::unix::process::CommandExt;
-        let mut child = Command::new("/bin/sh")
+        let child = Command::new("/bin/sh")
             .args(["-c", script])
             .process_group(0)
             .stdin(Stdio::null())
@@ -1458,11 +1489,10 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let out = child.stdout.take().unwrap();
-        let mut line = String::new();
-        io::BufRead::read_line(&mut io::BufReader::new(out), &mut line).unwrap();
-        let pid = line.trim().parse().unwrap();
-        (ChildGuard::new(child), pid)
+        let mut guard = ChildGuard::new(child);
+        let out = guard.child.as_mut().unwrap().stdout.take().unwrap();
+        let pid = read_grandchild_pid(&mut guard, out);
+        (guard, pid)
     }
 
     /// 孫が実行中か（Linux ではゾンビ `Z` を実行中に数えない）。

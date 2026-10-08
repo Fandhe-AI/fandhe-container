@@ -32,7 +32,7 @@
 //!   （`1 <= n < generations`、先頭 0 なし）だけである。したがって世代番号 0・先頭 0 つき・世代数以上の
 //!   番号（世代数を減らした開き直し）・上限超過・ディレクトリ・symlink・ASCII 大文字小文字だけが違う別名
 //!   （大文字小文字非区別 FS では同じファイルを指す）・Unicode の畳み込みで ASCII へ写る文字を含む別名
-//!   （U+212A `K` 等。[`fold_for_alias`] の 4 文字）は拒否する。これらはローテーションの対象外のまま
+//!   （U+212A `K` 等。`fold_for_alias` の 4 文字）は拒否する。これらはローテーションの対象外のまま
 //!   残り、ディスク使用量の上限を破るためである。
 //! - `<id>.log.<n>` が NAME_MAX を超える長さの ID も `InvalidArgument` で拒否する。
 //! - ローテーション・書き込みの失敗は握りつぶさず `Internal` で返し、sink を失敗状態に固定する（fail-closed）。
@@ -55,7 +55,7 @@
 //!   名前には、先頭に `_0` を付けて避ける（全 OS で同じ名前にする）。
 //!
 //! # バッファ・フラッシュ制御（TASK-164.3・#507）
-//! - 書き込みは固定 [`WRITE_BUFFER_BYTES`] のバッファ越しに行う。[`LogSink::append`] の `Ok` は受理を意味し、
+//! - 書き込みは固定 `WRITE_BUFFER_BYTES` のバッファ越しに行う。[`LogSink::append`] の `Ok` は受理を意味し、
 //!   ディスクへの到達は意味しない。読み出し側・リーダーは [`LogSink::flush`]（または drop）で書き出す。
 //! - `size` はバッファ内を含む論理バイト数で、ローテーション判定は論理サイズで行う（ディスク上の長さは常にそれ以下なので
 //!   「全ファイル `len <= max_file_bytes`」「1 レコードが世代をまたがない」は保たれる）。
@@ -87,7 +87,7 @@
 //!   から呼べず、3 OS で動く sink の経路を置き換えられない。公開には OS 非依存の「ディレクトリハンドル相対
 //!   open」を core の公開 API として設計する必要があり（crate 境界の設計変更）、本モジュールの範囲外。
 //!   Windows では権限（ACL）も検査しない。
-//! - 名前空間の別名検査は、ASCII の大文字小文字と、Unicode の畳み込みで ASCII へ写る 4 文字（[`fold_for_alias`]）を
+//! - 名前空間の別名検査は、ASCII の大文字小文字と、Unicode の畳み込みで ASCII へ写る 4 文字（`fold_for_alias`）を
 //!   見る。それ以外の FS 固有の畳み込みで名前空間に入る別名は、sink が作る名前が ASCII のみであるため生じない。
 //! - Windows の rename 再試行の対象外: 移動先が削除共有なしで開かれている場合などに `ERROR_ACCESS_DENIED` が
 //!   返るなら再試行せず失敗状態になる（恒久エラーとの区別がつかないため。実機の CI 結果で要判断）。
@@ -857,7 +857,7 @@ const READ_SHARE_MODE: u32 = 0x1 | 0x2 | 0x4;
 ///
 /// symlink / reparse point を辿らず通常ファイルだけを読み取りで開く。Windows では削除共有つき
 /// （`FILE_SHARE_DELETE`）で開くため、読み手が開いたままでも sink の rename を妨げない。読み出し側が独自に
-/// 削除共有なしで開くと、sink の世代 rename が有界の再試行（[`RenameRetry`]）のあと失敗し、sink は失敗状態に
+/// 削除共有なしで開くと、sink の世代 rename が有界の再試行（`RenameRetry`）のあと失敗し、sink は失敗状態に
 /// 固定される。`logs` コマンド本体は未実装（REPAIR-3）で、現状の呼び出し元は無い。
 /// 種別違反は `InvalidArgument`、存在しなければ `NotFound`。
 pub fn open_for_read(path: &Path) -> Result<File, TraitError> {

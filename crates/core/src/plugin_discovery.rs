@@ -503,7 +503,7 @@ fn effective_path_search(
 /// 既定の管理ディレクトリと、実効方針が `Enabled` のときだけ `PATH` 環境変数を使って探索する。
 ///
 /// 実効方針は `options` の明示指定と環境変数 [`PATH_SEARCH_ENV`]`=1` の opt-in の和
-/// （[`effective_path_search`]）。`Disabled` では `PATH` 環境変数を読まない。
+/// （`effective_path_search`）。`Disabled` では `PATH` 環境変数を読まない。
 pub fn discover_default_with_options(
     options: &DiscoveryOptions,
 ) -> Result<DiscoveryReport, TraitError> {

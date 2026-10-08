@@ -328,7 +328,7 @@ mod proc {
         }
     }
 
-    /// 子プロセス（plugin 役。`--plugin-serve`）の本体。`socket` へ接続して [`serve`] を回す。
+    /// 子プロセス（plugin 役。`--plugin-serve`）の本体。`socket` へ接続して `serve` を回す。
     pub fn serve_plugin_socket(socket: &Path) -> Result<(), BenchError> {
         let mut stream = UdsStream::connect(
             socket,

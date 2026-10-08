@@ -125,12 +125,13 @@ expect_case missing-file 2 "" --dmesg-file "$fx/does-not-exist.log"
 expect_case unknown-arg 2 "" --bogus
 expect_case missing-value 2 "" --dmesg-file
 
-# 上限超過（16 MiB + 1 バイト）。sparse なファイルを scratch に作って検査する。
-# truncate(1) は標準の macOS に無いため、BSD / GNU の両方にある dd の seek で作る
-# （count=0 で書き込まずに末尾位置だけ伸ばす。3 OS 一級対応）。
+# 上限超過（16 MiB + 1 バイト）のファイルを scratch に作って検査する。truncate(1) は標準の
+# macOS に無く、dd の seek による伸長も実装差に依存するため、実データを書き込んで作る
+# （dd の bs/count による 16 MiB の書き込みと 1 バイトの追記は BSD / GNU で同じ挙動）。
 big="$(mktemp)"
 trap 'rm -f "$big"' EXIT
-dd if=/dev/zero of="$big" bs=1 count=0 seek=$((16 * 1024 * 1024 + 1)) 2>/dev/null
+dd if=/dev/zero of="$big" bs=1048576 count=16 2>/dev/null
+printf 'x' >>"$big"
 big_size="$(wc -c <"$big" | tr -d ' ')"
 if [ "$big_size" -ne $((16 * 1024 * 1024 + 1)) ]; then
   echo "FAIL oversize: fixture size $big_size, want $((16 * 1024 * 1024 + 1))" >&2

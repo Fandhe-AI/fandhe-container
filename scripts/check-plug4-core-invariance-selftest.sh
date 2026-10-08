@@ -16,7 +16,12 @@
 #   - PLUG4_BASE_REF 指定時（PR 判定）は HEAD のコミット tree を見る（作業ツリーの未コミット変更を混ぜない）。
 #     未指定時（ローカル実行）は作業ツリーの未コミット変更を含めて複製する
 #   - PLUG4_BASE_REF が解決できなければ失敗する（fail-closed）
-#   - 空白を含むパス・symlink を含む作業ツリーを複製できる
+#   - 空白を含むパス・symlink を含む作業ツリーを複製できる（symlink の保持を確かめられるのは ubuntu・macos のみ。
+#     Windows の Git Bash は MSYS の既定で `ln -s` がディレクトリの複製になり、実リポの symlink も
+#     core.symlinks=false の checkout では通常ファイルになるため、Windows では空白を含むパスと複製の経路を
+#     確かめる。fixture がどちらになったかは実行ログに出す）
+#   - Windows runner（core.autocrlf=true）ではブランチ切り替えで fixture が CRLF に書き換わるため、
+#     ローカル実行（作業ツリー複製）のケースは CRLF の作業ツリーに対しても照合される
 #
 # 期待と異なる結果が 1 件でもあれば非ゼロで終了する（fail-closed）。cargo と git が必要（ネットワークは不要）。
 
@@ -73,6 +78,12 @@ fn answer_is_42() {
 RS
   echo 'note' >"$fx/docs/with space/a b.txt"
   ln -s "with space" "$fx/docs/link"
+  # 判定ではなく診断出力（どの経路を確かめたかを実行ログで分かるようにする。上記の Windows の扱いを参照）
+  if [ -L "$fx/docs/link" ]; then
+    echo "fixture: docs/link is a symlink"
+  else
+    echo "fixture: docs/link is a copy (symlinks are not created on this platform)"
+  fi
   printf 'target/\n' >"$fx/.gitignore"
   cp "$target" "$fx/scripts/check-plug4-core-invariance.sh"
   (cd "$fx" && cargo generate-lockfile --offline >/dev/null 2>&1)

@@ -13,7 +13,7 @@
 #
 # 使い方: check-virtio-gpu.sh [--dmesg-file PATH] [--vulkaninfo-file PATH]
 #   --dmesg-file 省略時は dmesg を実行する（root が必要な場合はゲスト内で人間が実行）
-# 出力: 英語の key=value 行。終了コード 0 = 必須項目がすべて期待どおり、
+# 出力: 英語の key=value 行（各 key は高々 1 回）。終了コード 0 = 必須項目がすべて期待どおり、
 #   1 = 期待外れの項目あり、2 = 入力・引数エラー
 set -euo pipefail
 export LC_ALL=C
@@ -204,14 +204,17 @@ fi
 
 hm="$(grep -oE 'Host memory window: 0x[0-9a-fA-F]+ \+0x[0-9a-fA-F]+' "$tmp" | head -n 1 || true)"
 if [ -n "$hm" ]; then
-  echo "host_memory_window=present"
+  # 各 key は 1 回だけ出力する契約のため、サイズを検査してから状態を 1 つに決めて出す
+  # （present の後に zero_size を重ねて矛盾する値を出さない）。
   hm_size="${hm##*+}"
-  echo "host_memory_window_size=$hm_size"
   # サイズ 0（+0x0）は共有メモリ窓として無効。
   if [ -z "$(printf '%s' "${hm_size#0x}" | sed -E 's/^0+//')" ]; then
     echo "host_memory_window=zero_size"
     fail
+  else
+    echo "host_memory_window=present"
   fi
+  echo "host_memory_window_size=$hm_size"
 else
   echo "host_memory_window=missing"
   fail

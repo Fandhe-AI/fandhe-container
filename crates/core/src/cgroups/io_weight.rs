@@ -53,9 +53,9 @@ use std::os::fd::{AsFd as _, BorrowedFd};
 use super::io_bfq_weight::{BfqWeight, write_bfq_weight_at};
 use super::{
     CgroupError, CgroupStep, ContainerCgroup, SMALL_FILE_LIMIT, cstring, io_error, read_iface,
-    sys_error,
+    record_cgroup_op, sys_error,
 };
-use crate::observability::{OpName, OpRecorder};
+use crate::observability::OpRecorder;
 use crate::sys::{self, SysError};
 use crate::traits::ErrorCode;
 
@@ -234,13 +234,13 @@ impl ContainerCgroup {
         recorder: &OpRecorder,
         weight: &BlkioWeight,
     ) -> Result<BlkioWeightTarget, CgroupError> {
-        let name = OpName::new(SET_BLKIO_WEIGHT_OP_NAME).map_err(|e| CgroupError {
-            code: e.code(),
-            step: CgroupStep::SetIoWeight,
-            message: e.message().to_string(),
-        })?;
         let dir = self.fd.as_fd();
-        recorder.record_op(&name, || write_blkio_weight_at(dir, weight))
+        record_cgroup_op(
+            recorder,
+            SET_BLKIO_WEIGHT_OP_NAME,
+            CgroupStep::SetIoWeight,
+            || write_blkio_weight_at(dir, weight),
+        )
     }
 }
 
@@ -269,12 +269,12 @@ fn write_io_weight_recorded(
     recorder: &OpRecorder,
     weight: &IoWeight,
 ) -> Result<IoWeight, CgroupError> {
-    let name = OpName::new(SET_IO_WEIGHT_OP_NAME).map_err(|e| CgroupError {
-        code: e.code(),
-        step: CgroupStep::SetIoWeight,
-        message: e.message().to_string(),
-    })?;
-    recorder.record_op(&name, || write_io_weight_at(dir, weight))
+    record_cgroup_op(
+        recorder,
+        SET_IO_WEIGHT_OP_NAME,
+        CgroupStep::SetIoWeight,
+        || write_io_weight_at(dir, weight),
+    )
 }
 
 /// `dir` 直下の `io.weight` へ書き、読み戻して要求値との一致を確認する（テスト可能な実体）。
@@ -311,6 +311,7 @@ fn write_io_weight_at(dir: BorrowedFd<'_>, weight: &IoWeight) -> Result<IoWeight
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observability::OpName;
 
     fn assert_invalid(r: Result<IoWeight, CgroupError>) {
         let e = r.unwrap_err();

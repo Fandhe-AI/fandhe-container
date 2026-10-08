@@ -36,8 +36,9 @@ use std::os::fd::{AsFd as _, BorrowedFd};
 
 use super::{
     CgroupError, CgroupStep, ContainerCgroup, SMALL_FILE_LIMIT, cstring, io_error, read_iface,
-    sys_error,
+    record_cgroup_op, sys_error,
 };
+use crate::observability::OpRecorder;
 use crate::sys::{self, SysError};
 use crate::traits::ErrorCode;
 
@@ -211,9 +212,30 @@ impl ContainerCgroup {
     /// 子 cgroup の `cpu.max` を書き込み、読み戻して検証した値を返す（CORE-3・TASK-32.3）。
     ///
     /// `cpu` controller が親で有効化されていない場合は `FailedPrecondition`。
-    pub fn set_cpu_max(&self, limit: &CpuMax) -> Result<CpuMax, CgroupError> {
-        write_cpu_max_at(self.fd.as_fd(), limit)
+    ///
+    /// open・write・読み戻し・事前検証のどこで失敗しても、成功・失敗の件数と所要時間を `recorder` へ
+    /// 操作名 `cgroup.set_cpu_max` で記録する（REPAIR-4。全終了経路。`set_io_weight` と同じ形）。
+    pub fn set_cpu_max(
+        &self,
+        recorder: &OpRecorder,
+        limit: &CpuMax,
+    ) -> Result<CpuMax, CgroupError> {
+        write_cpu_max_recorded(self.fd.as_fd(), recorder, limit)
     }
+}
+
+/// [`OpRecorder`] に記録する操作名（REPAIR-4）。
+const SET_CPU_MAX_OP_NAME: &str = "cgroup.set_cpu_max";
+
+/// [`write_cpu_max_at`] を計測つきで実行する（テスト可能な実体）。
+fn write_cpu_max_recorded(
+    dir: BorrowedFd<'_>,
+    recorder: &OpRecorder,
+    limit: &CpuMax,
+) -> Result<CpuMax, CgroupError> {
+    record_cgroup_op(recorder, SET_CPU_MAX_OP_NAME, CgroupStep::SetCpuMax, || {
+        write_cpu_max_at(dir, limit)
+    })
 }
 
 /// `dir` 直下の `cpu.max` へ書き、読み戻して要求値との一致を確認する（テスト可能な実体）。
@@ -412,6 +434,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         base
+    }
+
+    /// SUP-13・TASK-170 追補・REPAIR-4: `set_cpu_max` が成功と失敗（cpu.max 不在）を
+    /// 操作名 `cgroup.set_cpu_max` へ具体値で記録し、他 setter の名前は増えない。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sup13_task170_cpu_max_operations_are_recorded() {
+        use crate::observability::OpName;
+        let name = OpName::new(SET_CPU_MAX_OP_NAME).unwrap();
+        let rec = OpRecorder::new();
+        let ok = scratch("rec-ok");
+        std::fs::write(ok.join("cpu.max"), b"").unwrap();
+        let dir = File::open(&ok).unwrap();
+        write_cpu_max_recorded(dir.as_fd(), &rec, &micros(50_000, 100_000).unwrap()).unwrap();
+        let ng = scratch("rec-ng");
+        let dir2 = File::open(&ng).unwrap();
+        write_cpu_max_recorded(dir2.as_fd(), &rec, &micros(50_000, 100_000).unwrap()).unwrap_err();
+        let stats = rec.snapshot_op(&name).expect("recorded");
+        assert_eq!(stats.name().as_str(), "cgroup.set_cpu_max");
+        assert_eq!((stats.success(), stats.failure()), (1, 1));
+        assert!(
+            rec.snapshot_op(&OpName::new("cgroup.set_io_weight").unwrap())
+                .is_none()
+        );
+        std::fs::remove_dir_all(&ok).unwrap();
+        std::fs::remove_dir_all(&ng).unwrap();
     }
 
     /// CORE-3・TASK-32.3: 通常ファイル上で書き込みと読み戻しが具体値で一致する。

@@ -60,6 +60,16 @@
 //!   delete は状態に記録された配置（`StateRecord::cgroup`）のスコープと一致するときだけ、記録された instance の
 //!   名前（`fc-<id>@<n>`）で削除・不存在確認を行う
 //!
+//! # 資源制限 setter の計装（REPAIR-4・TASK-170 追補・#1535）
+//! 資源制限の各 setter は `recorder: &OpRecorder` を受け取り、setter の内部で全終了経路（controller 未有効・
+//! 事前検証・open / write 失敗・読み戻し不一致・成功）の成否とレイテンシを記録する。操作名は
+//! `cgroup.set_cpu_max` / `cgroup.set_pids_max` / `cgroup.set_io_max` / `cgroup.set_io_weight` /
+//! `cgroup.set_blkio_weight` / `cgroup.set_memory_limits`（1 setter = 1 操作。`memory.max` と
+//! `memory.swap.max` の 2 書き込みは 1 操作）。
+//! 呼び出し側で包まず setter 側で計装する理由: (a) `oci_runtime::kill` と同じ依存注入の形に揃う、
+//! (b) 本番 launcher が未実装で操作名の所有者が setter 側にしか置けず、呼び出し箇所ごとに名前と計装の
+//! 有無が分かれる非対称の再発を防ぐ、(c) 事前検証を含む全終了経路を漏れなく数えられる。
+//!
 //! # 未実装（REPAIR-3）
 //! - OCI `linux.resources` から `set_memory_limits` / `set_cpu_max` への反映、本番 launcher での
 //!   `detect` → `prepare` → `join_hook` の結線（TASK-29 / TASK-157 系）
@@ -77,6 +87,7 @@ use std::io::{Read as _, Write as _};
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::fs::MetadataExt as _;
 
+use crate::observability::{OpName, OpRecorder};
 use crate::oci_runtime::{CgroupRemoval, ContainerCgroupRemover};
 use crate::sys::{self, SysError};
 use crate::traits::{CgroupScope, ContainerId, ErrorCode, StateRevision, TraitError};
@@ -1526,6 +1537,29 @@ fn verify_effective(
     }
 }
 
+/// [`OpRecorder`] に記録する操作名（REPAIR-4）。
+const SET_MEMORY_LIMITS_OP_NAME: &str = "cgroup.set_memory_limits";
+
+/// 資源制限 setter の本体 `f` を操作名 `op` で計測して実行する共通ヘルパー。
+///
+/// 各 setter（`set_cpu_max` / `set_pids_max` / `set_io_max` / `set_io_weight` / `set_memory_limits` 等）が
+/// 自分の全終了経路を [`OpRecorder`] へ記録する形を 1 箇所に揃える（REPAIR-4・TASK-170 追補・#1535）。
+/// 操作名は各 setter が持つ固定の定数で、入力から生成しない。`OpName` の検証失敗（定数のため実際には
+/// 起きない）は `step` つきの [`CgroupError`] に写し、`f` は実行しない。
+pub(super) fn record_cgroup_op<T>(
+    recorder: &OpRecorder,
+    op: &'static str,
+    step: CgroupStep,
+    f: impl FnOnce() -> Result<T, CgroupError>,
+) -> Result<T, CgroupError> {
+    let name = OpName::new(op).map_err(|e| CgroupError {
+        code: e.code(),
+        step,
+        message: e.message().to_string(),
+    })?;
+    recorder.record_op(&name, f)
+}
+
 impl ContainerCgroup {
     /// 子 cgroup の `memory.max`（および要求があれば `memory.swap.max`）を設定し、読み戻した実効値を返す。
     ///
@@ -1533,7 +1567,26 @@ impl ContainerCgroup {
     /// 呼ぶ予定。`enabled` はその戻り値で、`memory` が含まれなければ書き込まず `FailedPrecondition`。
     /// 書き込み順は `memory.max` → `memory.swap.max`。途中で失敗しても巻き戻さない（子 cgroup は空で、
     /// 呼び出し側が `DelegatedCgroup::remove_child` で削除する前提）。値は検証済みの正規形のみ書く。
+    ///
+    /// 事前確認（controller 未有効）・再検証・2 ファイルの書き込みのどこで失敗しても、成功・失敗の件数と
+    /// 所要時間を `recorder` へ操作名 `cgroup.set_memory_limits` で 1 操作として記録する
+    /// （REPAIR-4。全終了経路。`set_io_weight` と同じ形）。
     pub fn set_memory_limits(
+        &self,
+        recorder: &OpRecorder,
+        enabled: &ControllerSet,
+        limits: &MemoryLimits,
+    ) -> Result<AppliedMemoryLimits, CgroupError> {
+        record_cgroup_op(
+            recorder,
+            SET_MEMORY_LIMITS_OP_NAME,
+            CgroupStep::SetMemoryLimit,
+            || self.set_memory_limits_inner(enabled, limits),
+        )
+    }
+
+    /// [`Self::set_memory_limits`] の記録なしの実体。
+    fn set_memory_limits_inner(
         &self,
         enabled: &ControllerSet,
         limits: &MemoryLimits,
@@ -2068,7 +2121,11 @@ mod tests {
         let cg = limits_for(&tmp.0);
         let enabled = ControllerSet::of(&[Controller::Memory, Controller::Cpu]);
         let applied = cg
-            .set_memory_limits(&enabled, &mem_limits("64M", Some(MemoryLimit::Bytes(0))))
+            .set_memory_limits(
+                &OpRecorder::new(),
+                &enabled,
+                &mem_limits("64M", Some(MemoryLimit::Bytes(0))),
+            )
             .unwrap();
         assert_eq!(
             applied,
@@ -2080,7 +2137,7 @@ mod tests {
         assert_eq!(read(&tmp, "memory.max"), "67108864");
         assert_eq!(read(&tmp, "memory.swap.max"), "0");
         let cpu = CpuMax::new(CpuQuota::Micros(50_000), 100_000).unwrap();
-        assert_eq!(cg.set_cpu_max(&cpu), Ok(cpu));
+        assert_eq!(cg.set_cpu_max(&OpRecorder::new(), &cpu), Ok(cpu));
         assert_eq!(read(&tmp, "cpu.max").trim_end(), "50000 100000");
     }
 
@@ -2093,12 +2150,50 @@ mod tests {
         let cg = limits_for(&tmp.0);
         let enabled = ControllerSet::of(&[Controller::Memory]);
         let applied = cg
-            .set_memory_limits(&enabled, &mem_limits("max", None))
+            .set_memory_limits(&OpRecorder::new(), &enabled, &mem_limits("max", None))
             .unwrap();
         assert_eq!(applied.memory_max, MemoryLimit::Max);
         assert_eq!(applied.swap_max, None);
         assert_eq!(read(&tmp, "memory.max"), "max");
         assert_eq!(read(&tmp, "memory.swap.max"), "sentinel");
+    }
+
+    /// SUP-13・TASK-170 追補・REPAIR-4: `set_memory_limits` が成功・事前確認失敗・書き込み失敗を
+    /// 操作名 `cgroup.set_memory_limits` へ具体値で記録する（事前確認の失敗も失敗に数える）。
+    #[test]
+    fn sup13_task170_memory_limits_operations_are_recorded() {
+        let rec = OpRecorder::new();
+        let name = OpName::new("cgroup.set_memory_limits").unwrap();
+        let ok = TmpDir::new("t170-mem-ok");
+        touch(&ok, &["memory.max"]);
+        limits_for(&ok.0)
+            .set_memory_limits(
+                &rec,
+                &ControllerSet::of(&[Controller::Memory]),
+                &mem_limits("64M", None),
+            )
+            .unwrap();
+        // controller 未有効（I/O 前の失敗）。
+        let noctl = TmpDir::new("t170-mem-noctl");
+        limits_for(&noctl.0)
+            .set_memory_limits(
+                &rec,
+                &ControllerSet::of(&[Controller::Cpu]),
+                &mem_limits("64M", None),
+            )
+            .unwrap_err();
+        // memory.max 不在（ENOENT）。
+        let missing = TmpDir::new("t170-mem-missing");
+        limits_for(&missing.0)
+            .set_memory_limits(
+                &rec,
+                &ControllerSet::of(&[Controller::Memory]),
+                &mem_limits("64M", None),
+            )
+            .unwrap_err();
+        let stats = rec.snapshot_op(&name).expect("recorded");
+        assert_eq!(stats.name().as_str(), "cgroup.set_memory_limits");
+        assert_eq!((stats.success(), stats.failure()), (1, 2));
     }
 
     /// CORE-3・TASK-32.5: memory controller 未有効なら何も書かず `FailedPrecondition`。
@@ -2109,6 +2204,7 @@ mod tests {
         let cg = limits_for(&tmp.0);
         let e = cg
             .set_memory_limits(
+                &OpRecorder::new(),
                 &ControllerSet::of(&[Controller::Cpu]),
                 &mem_limits("64M", Some(MemoryLimit::Bytes(0))),
             )
@@ -2127,6 +2223,7 @@ mod tests {
         let cg = limits_for(&tmp.0);
         let e = cg
             .set_memory_limits(
+                &OpRecorder::new(),
                 &ControllerSet::of(&[Controller::Memory]),
                 &mem_limits("64M", Some(MemoryLimit::Bytes(i64::MAX as u64 + 1))),
             )
@@ -2145,6 +2242,7 @@ mod tests {
         let cg = limits_for(&tmp.0);
         let e = cg
             .set_memory_limits(
+                &OpRecorder::new(),
                 &ControllerSet::of(&[Controller::Memory]),
                 &mem_limits("64M", Some(MemoryLimit::Bytes(0))),
             )
@@ -2163,6 +2261,7 @@ mod tests {
         let cg = limits_for(&tmp.0);
         let e = cg
             .set_memory_limits(
+                &OpRecorder::new(),
                 &ControllerSet::of(&[Controller::Memory]),
                 &mem_limits("64M", Some(MemoryLimit::Bytes(0))),
             )
@@ -2180,6 +2279,7 @@ mod tests {
         std::os::unix::fs::symlink(tmp.0.join("target"), tmp.0.join("memory.max")).unwrap();
         let cg = limits_for(&tmp.0);
         let r = cg.set_memory_limits(
+            &OpRecorder::new(),
             &ControllerSet::of(&[Controller::Memory]),
             &mem_limits("64M", None),
         );

@@ -28,7 +28,7 @@ readonly MAX_METRICS=256
 readonly MAX_RESULTS_FILES=32
 readonly MAX_ENV_CHARS=256
 
-script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null && pwd)"
+script_dir="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null && pwd)"
 check_script="${script_dir}/../check-bench-regression.sh"
 
 err() {
@@ -161,7 +161,7 @@ if [ ! -d "$out_dir_raw" ]; then
 fi
 # 親ディレクトリを物理パス（symlink 解決済み）へ固定する。以降の候補作成・置換はこの固定パスだけを
 # 基に行い、検証後に親ディレクトリの symlink が差し替えられても書き込み先が変わらないようにする（TOCTOU 対策）。
-if ! out_dir="$(CDPATH= cd -- "$out_dir_raw" >/dev/null && pwd -P)"; then
+if ! out_dir="$(CDPATH='' cd -- "$out_dir_raw" >/dev/null && pwd -P)"; then
   err "invalid-output" "cannot resolve parent directory of $output_file"
   exit 2
 fi

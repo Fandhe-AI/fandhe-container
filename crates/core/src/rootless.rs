@@ -59,6 +59,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::exec::IdMapping;
+use crate::sanitize::{is_display_unsafe_char, push_sanitized_bounded};
 use crate::sys::{self, NsFlag, SysError};
 use crate::traits::types::ErrorCode;
 
@@ -698,12 +699,21 @@ fn write_proc(path: &Path, content: &str, stage: RootlessStage) -> Result<(), Ro
         .map_err(|e| io_error(stage, "write proc file", &e))
 }
 
+/// newuidmap / newgidmap の stderr を、エラーメッセージへ入れられる形に整える（TASK-40・SEC-5・ERR-2）。
+///
+/// 表示を乱す文字（Cc・Cf・Zl・Zp。判定は `crate::sanitize` に一本化）は除去する（行区切りを
+/// 潰す既存の形）。出力は UTF-8 文字境界で `MAX_HELPER_STDERR_BYTES` バイト以下に収まる
+/// （不正バイトが U+FFFD へ膨らむ場合も含む）。
 fn sanitize_stderr(raw: &[u8]) -> String {
     let cut = raw.get(..MAX_HELPER_STDERR_BYTES).unwrap_or(raw);
-    String::from_utf8_lossy(cut)
-        .chars()
-        .filter(|c| !c.is_control() || *c == ' ')
-        .collect()
+    let lossy = String::from_utf8_lossy(cut);
+    let mut out = String::with_capacity(lossy.len().min(MAX_HELPER_STDERR_BYTES));
+    push_sanitized_bounded(
+        &mut out,
+        lossy.chars().filter(|&c| !is_display_unsafe_char(c)),
+        MAX_HELPER_STDERR_BYTES,
+    );
+    out
 }
 
 /// 検証済みヘルパーを実行する。exec 直前に所有者・権限・祖先ディレクトリ・dev/ino を再検証し、
@@ -794,11 +804,41 @@ fn run_helper(
     let err = stderr_rx
         .and_then(|rx| rx.recv_timeout(Duration::from_secs(1)).ok())
         .unwrap_or_default();
-    Err(RootlessError::new(
+    Err(helper_failure(stage, status, &err))
+}
+
+/// ヘルパーが非ゼロ終了したときのエラーを作る（stderr は [`sanitize_stderr`] を通して載せる）。
+///
+/// [`run_helper`] の失敗経路の本体。結合試験が実ヘルパー（root 所有の実行ファイルが要る）なしで
+/// メッセージの具体値を照合できるよう分離している（REPAIR-12）。
+fn helper_failure(
+    stage: RootlessStage,
+    status: std::process::ExitStatus,
+    stderr: &[u8],
+) -> RootlessError {
+    RootlessError::new(
         ErrorCode::PermissionDenied,
         stage,
-        format!("id map helper failed ({status}): {}", sanitize_stderr(&err)),
-    ))
+        format!(
+            "id map helper failed ({status}): {}",
+            sanitize_stderr(stderr)
+        ),
+    )
+}
+
+/// 結合試験 `tests/sanitize_integration.rs` 専用の入口: ヘルパー失敗のエラー生成経路を、終了状態と
+/// stderr の生バイトから直接呼ぶ（TASK-96.1・ERR-2・REPAIR-12。通常の利用者は呼ばない）。
+///
+/// 実ヘルパーの起動は root 所有の実行ファイルを要し既定のテスト集合で再現できないため、
+/// [`run_helper`] が失敗時に通るのと同じ `helper_failure` を公開する。`exec-test-support` feature を
+/// 付けたビルドにだけ存在する。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn helper_failure_error_for_test(
+    status: std::process::ExitStatus,
+    stderr: &[u8],
+) -> RootlessError {
+    helper_failure(RootlessStage::Helper, status, stderr)
 }
 
 /// `/proc/<pid>/{uid,gid}_map` の内容（空白区切り 3 数値の行）を解析する。
@@ -1108,6 +1148,24 @@ fn mapper_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TASK-40・ERR-2: stderr から Cf・Zl・Zp・Cc を除去する。
+    #[test]
+    fn task40_sanitize_stderr_drops_format_and_separator_chars() {
+        let out = sanitize_stderr("a\u{202E}b\u{2060}c\u{2028}d\u{2029}e".as_bytes());
+        assert_eq!(out, "abcde");
+        let out = sanitize_stderr("x\u{1b}[31my\nz\tw".as_bytes());
+        assert_eq!(out, "x[31myzw");
+    }
+
+    /// TASK-40: 出力は 4096 バイトを超えない（不正バイトが U+FFFD へ膨らむ場合も）。
+    #[test]
+    fn task40_sanitize_stderr_output_is_bounded() {
+        let ascii = vec![b'a'; MAX_HELPER_STDERR_BYTES + 100];
+        assert_eq!(sanitize_stderr(&ascii).len(), MAX_HELPER_STDERR_BYTES);
+        let invalid = vec![0xFFu8; MAX_HELPER_STDERR_BYTES];
+        assert_eq!(sanitize_stderr(&invalid).len(), 4095);
+    }
 
     fn m(c: u32, h: u32, n: u32) -> IdMapping {
         IdMapping {

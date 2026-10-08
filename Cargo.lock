@@ -84,6 +84,7 @@ version = "0.0.0"
 dependencies = [
  "fandhe-container-core",
  "fandhe-container-net",
+ "fandhe-container-plugin",
 ]
 
 [[package]]

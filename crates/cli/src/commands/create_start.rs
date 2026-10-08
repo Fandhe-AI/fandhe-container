@@ -2,13 +2,19 @@
 //!
 //! `commands::run` が argv を解析した後に [`run_create`] / [`run_start`] を呼ぶ。実処理は core の
 //! `oci_runtime::create` / `oci_runtime::start`（OCI-4・OCI-5・TASK-29）へ委ね、入力の意味検証
-//! （ID の文字種・bundle の絶対パス・bundle / rootfs の symlink 検査）も core の型と関数を唯一の判定とする。
+//! （ID の文字種・bundle の絶対パス・rootfs の symlink 検査）も core の型と関数を唯一の判定とする。
+//! `--bundle` 自体やその祖先が symlink でも create は受理し、渡されたパスのまま状態へ保存する
+//! （canonicalize しない）。bundle までの経路の symlink は start が起動前に検査して拒否する（SEC-1）。
 //! 依存（状態ストア・launcher・計測器）は [`Runtime`] で注入できるようにし、単体テストではフェイクを差せる。
 //!
 //! 未実装・簡易実装（REPAIR-3）:
 //! - 本番の [`ProcessLauncher`] はリポジトリ内に存在しない。そのため本番入口の `start` は
 //!   [`UnavailableLauncher`] により fail-closed で `UNIMPLEMENTED` を返す。将来は supervisor 経由の
 //!   起動（TASK-157・TASK-37〜39・CORE-1）に差し替え、起動済みプロセスの監視・回収を supervisor へ引き渡す。
+//!   失敗する `start` でも core は起動権の予約（Created → Running）と取り消し（Running → Created）を
+//!   状態ストアへ書くため、状態は Created のままでも `state.json` の revision は進む（ファイルは不変ではない）。
+//! - 計測（REPAIR-4）のファイル出力は Linux の x86_64 / aarch64 のみ（`op_log_file`）。本バイナリを
+//!   setuid / setgid・file capability つきで導入しない前提で、権限分離（TASK-171・SUP-14）で見直す。
 //! - macOS / Windows は plugin 発見機構経由（TASK-79.4・PLUG-4）。ここでは core を呼ぶだけで、
 //!   非 Linux では core 側が `Unimplemented` を返す（fail-closed）。
 
@@ -134,256 +140,341 @@ fn record_pre_core_failure(recorder: &OpRecorder, op_name: &str, started: Instan
 /// 計測は stdout / stderr へ混ぜず、この環境変数が指すファイルへ追記する。未設定なら出力しない。
 pub(super) const OP_LOG_ENV: &str = "FANDHE_CONTAINER_OP_LOG";
 
-/// 計測出力の open に付ける O_NONBLOCK（REPAIR-5）。読み手のいない FIFO の open が無期限に
-/// ブロックして CLI が結果を返せなくなるのを防ぐ。libc 非依存のため値を直書きする（Linux 限定）。
-#[cfg(target_os = "linux")]
-const O_NONBLOCK: i32 = 0o4000;
-
-/// 副作用なく inode だけを固定する O_PATH（SEC-1）。値は Linux の全アーキで 0o10000000。
-#[cfg(target_os = "linux")]
-const O_PATH: i32 = 0o10_000_000;
-
-/// 最終要素が symlink なら open を失敗させる O_NOFOLLOW（SEC-1）。値は ABI ごとに異なる
-/// （Linux の arm / arm64 は 0o100000、他の Linux アーキは 0o400000）。
-#[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
-const O_NOFOLLOW: i32 = 0o100_000;
-#[cfg(all(
-    target_os = "linux",
-    not(any(target_arch = "aarch64", target_arch = "arm"))
-))]
-const O_NOFOLLOW: i32 = 0o400_000;
-
-/// ディレクトリ open に付ける O_DIRECTORY（SEC-1）。値は ABI ごとに異なる
-/// （Linux の arm / arm64 は 0o40000、他の Linux アーキは 0o200000）。
-#[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
-const O_DIRECTORY: i32 = 0o40_000;
-#[cfg(all(
-    target_os = "linux",
-    not(any(target_arch = "aarch64", target_arch = "arm"))
-))]
-const O_DIRECTORY: i32 = 0o200_000;
-
-/// 呼び出しプロセスの実効 UID（`/proc/self` の所有者で代用し、取得できなければ None）。
-/// None のときは呼び出し側が計測出力を拒否する（fail-closed。SEC-1）。
-#[cfg(target_os = "linux")]
-fn effective_uid() -> Option<u32> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata("/proc/self").ok().map(|m| m.uid())
-}
-
-/// 開いた fd に対する要素 `name` の `/proc/self/fd/<fd>/<name>` 経路を作る。
-/// この経路は親 fd が指すディレクトリ直下の 1 要素だけを解決するため、パス文字列の再解決で
-/// 親が差し替えられる競合（TOCTOU）が起きない。`openat` 相当を unsafe なしで実現する（SEC-1）。
-#[cfg(target_os = "linux")]
-fn child_via_fd(parent: &std::fs::File, name: &std::ffi::OsStr) -> std::path::PathBuf {
-    use std::os::fd::AsRawFd;
-    std::path::PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(name)
-}
-
-/// 開いた fd のディレクトリが、他ユーザーに差し替えられない状態かを fd から検査する（SEC-1）。
-/// ディレクトリであり、所有者が root か自分で、group / other 書き込み可なら sticky bit を要する。
-#[cfg(target_os = "linux")]
-fn dir_trusted(dir: &std::fs::File, euid: u32) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(m) = dir.metadata() else {
-        return false;
-    };
-    let mode = m.mode();
-    let writable_by_others = mode & 0o022 != 0;
-    let sticky = mode & 0o1000 != 0;
-    let owner_ok = m.uid() == 0 || m.uid() == euid;
-    m.is_dir() && owner_ok && (!writable_by_others || sticky)
-}
-
-/// `dir` 直下の要素 `name` を O_NOFOLLOW でディレクトリとして開く（親 fd 経由。SEC-1）。
-#[cfg(target_os = "linux")]
-fn open_dir_at(dir: &std::fs::File, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NONBLOCK | O_NOFOLLOW | O_DIRECTORY)
-        .open(child_via_fd(dir, name))
-}
-
-/// symlink を辿る回数の上限（ループ・過大な展開の防止）。
-#[cfg(target_os = "linux")]
-const MAX_SYMLINK_HOPS: u32 = 8;
-
-/// 解決待ちの経路要素。`..` は物理的な親（開いた fd のスタックの 1 つ手前）へ戻る。
-#[cfg(target_os = "linux")]
-enum Step {
-    Name(std::ffi::OsString),
-    Parent,
-}
-
-/// 親ディレクトリを、ルートから 1 要素ずつディレクトリ fd で固定しながら開く（SEC-1）。
+/// 計測ログの出力先を安全に開く Linux（x86_64 / aarch64）実装（SEC-1・REPAIR-5）。
 ///
-/// 各要素は直前に開いた fd 経由で O_NOFOLLOW | O_DIRECTORY で開き、開いた fd ごとに所有者・権限を
-/// 検査する。パス全体を再解決しないため、検査と open の間に親を symlink へ差し替えられない。
-/// root 所有の symlink（システム標準の `/var/run` -> `../run` 等）のみ、その場で内容を読んで同じ
-/// 手順で辿る（root 所有のため一般ユーザーは差し替えられない）。`..` は検査済みディレクトリ fd の
-/// スタックを 1 つ戻して解決し、ルートより上へ出る経路は拒否する。
-#[cfg(target_os = "linux")]
-fn open_trusted_parent(parent: &std::path::Path, euid: u32) -> Option<std::fs::File> {
-    use std::collections::VecDeque;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    use std::path::Component;
+/// [`export_ops`] から [`open_op_log`] だけが呼ばれる。open フラグの値はアーキテクチャごとに異なるため
+/// （`flags`）、値を確認済みの x86_64 / aarch64 に限って有効にする。それ以外のアーキテクチャ・OS は
+/// 外側の `open_op_log` が常に `None` を返し、計測を出力しない（fail-closed。core の `sys` が対応外
+/// アーキテクチャで `Unsupported` を返すのと同じ判断）。
+///
+/// 前提（SEC-1）: 本バイナリを setuid / setgid・file capability つきで導入しない。出力先は環境変数で
+/// 指定でき、検査は「実効 UID から見て差し替えられない経路か」だけを見るため、呼び出し元より高い権限で
+/// 動くと、呼び出し元が本来書けないファイルへ追記させられる。この前提が破られた実行のうち、実 / 実効の
+/// UID・GID の食い違いとして観測できるものは [`unelevated_euid`] で検出して出力を拒否する
+/// （file capability だけが付いた実行は UID・GID に現れないため検出できない）。
+/// 権限分離の方式（TASK-171・SUP-14）が決まったら、この判定と出力先の扱いを見直す。
+///
+/// 将来仕様（REPAIR-3）: open フラグと fd 相対の open は、core に安全な公開 API を置いて再利用する形へ
+/// 寄せる（現状は cli 側の複製。core の変更を伴うため本 module では行っていない）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod op_log_file {
+    pub(super) use flags::O_NONBLOCK;
+    use flags::{O_DIRECTORY, O_NOFOLLOW, O_PATH};
 
-    /// `path` の各要素を `queue` の先頭へ順序を保って積み、絶対パスだったかを返す。
-    fn push_components(queue: &mut VecDeque<Step>, path: &std::path::Path) -> Option<bool> {
-        let mut absolute = false;
-        let mut steps = Vec::new();
-        for c in path.components() {
-            match c {
-                Component::RootDir => absolute = true,
-                Component::Normal(n) => steps.push(Step::Name(n.to_os_string())),
-                Component::ParentDir => steps.push(Step::Parent),
-                Component::CurDir => {}
-                Component::Prefix(_) => return None,
-            }
-        }
-        for st in steps.into_iter().rev() {
-            queue.push_front(st);
-        }
-        Some(absolute)
+    /// x86_64 の open フラグ（asm-generic の値）。libc 非依存のため値を直書きし、固定値テストで照合する。
+    /// 値が同じものも含め、アーキテクチャごとに個別定義する（他アーキテクチャの値を流用しない）。
+    #[cfg(target_arch = "x86_64")]
+    mod flags {
+        /// 読み手のいない FIFO の open で無期限にブロックしないための O_NONBLOCK（REPAIR-5）。
+        pub(in super::super) const O_NONBLOCK: i32 = 0o4000;
+        /// ディレクトリ以外の open を失敗させる O_DIRECTORY。
+        pub(super) const O_DIRECTORY: i32 = 0o200_000;
+        /// 最終要素が symlink なら open を失敗させる O_NOFOLLOW。
+        pub(super) const O_NOFOLLOW: i32 = 0o400_000;
+        /// 副作用なく inode だけを固定する O_PATH。
+        pub(super) const O_PATH: i32 = 0o10_000_000;
     }
 
-    let abs = if parent.is_absolute() {
-        parent.to_path_buf()
-    } else {
-        std::env::current_dir().ok()?.join(parent)
-    };
-    let open_root = || -> Option<std::fs::File> {
-        let f = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(O_NONBLOCK | O_NOFOLLOW | O_DIRECTORY)
-            .open("/")
-            .ok()?;
-        dir_trusted(&f, euid).then_some(f)
-    };
-    let mut queue = VecDeque::new();
-    push_components(&mut queue, &abs)?;
-    // 検査済みディレクトリ fd のスタック（先頭がルート、末尾が現在位置）。
-    let mut stack = vec![open_root()?];
-    let mut hops = 0;
-    while let Some(step) = queue.pop_front() {
-        let name = match step {
-            Step::Parent => {
-                // ルートより上へは出ない（escape-above-root は拒否）。
-                if stack.len() <= 1 {
-                    return None;
-                }
-                stack.pop();
+    /// aarch64 の open フラグ。O_DIRECTORY / O_NOFOLLOW は arm64 が asm-generic の値を上書きしている。
+    #[cfg(target_arch = "aarch64")]
+    mod flags {
+        /// 読み手のいない FIFO の open で無期限にブロックしないための O_NONBLOCK（REPAIR-5）。
+        pub(in super::super) const O_NONBLOCK: i32 = 0o4000;
+        /// ディレクトリ以外の open を失敗させる O_DIRECTORY。
+        pub(super) const O_DIRECTORY: i32 = 0o40_000;
+        /// 最終要素が symlink なら open を失敗させる O_NOFOLLOW。
+        pub(super) const O_NOFOLLOW: i32 = 0o100_000;
+        /// 副作用なく inode だけを固定する O_PATH。
+        pub(super) const O_PATH: i32 = 0o10_000_000;
+    }
+
+    /// 新規作成する計測ログの mode（所有者のみ読み書き。umask に任せて group / other へ開かない）。
+    const OP_LOG_CREATE_MODE: u32 = 0o600;
+
+    /// `/proc/self/status` を読む上限バイト数（無制限確保の防止。実際は 2 KiB 前後）。
+    const PROC_STATUS_MAX_BYTES: u64 = 64 * 1024;
+
+    /// `/proc/<pid>/status` の本文から `key`（`Uid:` / `Gid:`）の 4 値（real・effective・saved・fs）を取り出す。
+    /// 行が無い・複数ある・値が 4 個でない・10 進の `u32` でない場合は `None`。
+    fn status_ids(status: &str, key: &str) -> Option<[u32; 4]> {
+        let mut found = None;
+        for line in status.lines() {
+            let Some(rest) = line.strip_prefix(key) else {
                 continue;
+            };
+            if found.is_some() {
+                return None;
             }
-            Step::Name(n) => n,
-        };
-        let cur = stack.last()?;
-        match open_dir_at(cur, &name) {
-            Ok(next) => {
-                if !dir_trusted(&next, euid) {
+            let mut fields = rest.split_ascii_whitespace();
+            let mut ids = [0u32; 4];
+            for slot in &mut ids {
+                let field = fields.next()?;
+                if !field.bytes().all(|b| b.is_ascii_digit()) {
                     return None;
                 }
-                stack.push(next);
+                *slot = field.parse().ok()?;
             }
-            Err(_) => {
-                // symlink だった場合のみ、root 所有に限って辿る。それ以外は拒否する。
-                let link = child_via_fd(cur, &name);
-                let m = std::fs::symlink_metadata(&link).ok()?;
-                if !m.file_type().is_symlink() || m.uid() != 0 {
-                    return None;
-                }
-                hops += 1;
-                if hops > MAX_SYMLINK_HOPS {
-                    return None;
-                }
-                let target = std::fs::read_link(&link).ok()?;
-                if push_components(&mut queue, &target)? {
-                    stack.truncate(1);
-                }
+            if fields.next().is_some() {
+                return None;
             }
+            found = Some(ids);
         }
+        found
     }
-    stack.pop()
-}
 
-/// 計測出力先を副作用なく固定して検証してから書き込み用に開く。通常ファイル以外は拒否する。
-///
-/// Linux では、親ディレクトリをルートから fd で固定しながら開き（[`open_trusted_parent`]）、
-/// その親 fd 経由で最終要素を O_PATH | O_NOFOLLOW で固定する。O_PATH はデバイス・FIFO を開いても
-/// 副作用（`/dev/watchdog` の起動等）を起こさない。固定した fd で種別・ハードリンク数（1 のみ許可）・
-/// 所有者を検証した後に限り、`/proc/self/fd` 経由で同じ inode を追記用に開き直し、再度検証する。
-/// 未存在のときは O_EXCL（create_new）で排他的に作成し、既存対象の検査を迂回させない（SEC-1・REPAIR-5）。
-/// 排他作成が並行プロセスに負けた（AlreadyExists）ときは、既存対象として検証からやり直す
-/// （[`OP_LOG_OPEN_ATTEMPTS`] 回まで）。
-#[cfg(target_os = "linux")]
-fn open_op_log(path: &std::ffi::OsStr) -> Option<std::fs::File> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let path = std::path::Path::new(path);
-    let name = path.file_name()?;
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => std::path::Path::new("."),
-    };
-    let euid = effective_uid()?;
-    let dir = open_trusted_parent(parent, euid)?;
-    let target = child_via_fd(&dir, name);
-    let verify = |f: &std::fs::File| -> bool {
-        f.metadata()
-            .map(|m| m.is_file() && m.nlink() == 1 && m.uid() == euid)
-            .unwrap_or(false)
-    };
-    // 未存在 → 排他作成の間に別プロセスが同じファイルを作ると create_new は AlreadyExists で失敗する。
-    // その場合に限り、既存対象として検証からやり直す（並行起動した CLI の計測を落とさない。REPAIR-4）。
-    // やり直しは有限回で、ファイルの作成・削除を繰り返されても無期限には回らない（REPAIR-5）。
-    for _ in 0..OP_LOG_OPEN_ATTEMPTS {
-        let pinned = match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(O_PATH | O_NOFOLLOW)
-            .open(&target)
-        {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // 未存在: 排他的に作成する（既存・競合で現れた対象には O_EXCL で失敗する）。
-                match std::fs::OpenOptions::new()
-                    .append(true)
-                    .create_new(true)
-                    .custom_flags(O_NONBLOCK | O_NOFOLLOW)
-                    .open(&target)
-                {
-                    Ok(f) => return verify(&f).then_some(f),
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    Err(_) => return None,
-                }
-            }
-            Err(_) => return None,
-        };
-        if !verify(&pinned) {
+    /// `/proc/<pid>/status` の本文から、権限が持ち上がっていない実行の実効 UID を返す（SEC-1）。
+    ///
+    /// UID・GID それぞれの real・effective・saved・fs の 4 値がすべて一致するときだけ `Some(実効 UID)`。
+    /// 食い違い（setuid / setgid で起動された・途中で切り替えた）や、形式を解釈できない場合は `None` で、
+    /// 呼び出し側は計測を出力しない（fail-closed）。ファイル操作の権限は fs 値で決まるため、real と
+    /// effective だけでなく 4 値すべての一致を求める。
+    pub(super) fn unelevated_euid_from_status(status: &str) -> Option<u32> {
+        let [ruid, euid, suid, fsuid] = status_ids(status, "Uid:")?;
+        let [rgid, egid, sgid, fsgid] = status_ids(status, "Gid:")?;
+        let same_uid = ruid == euid && euid == suid && suid == fsuid;
+        let same_gid = rgid == egid && egid == sgid && sgid == fsgid;
+        (same_uid && same_gid).then_some(euid)
+    }
+
+    /// 呼び出しプロセスの実効 UID を `/proc/self/status` から得る（unsafe・libc なし）。
+    /// 読めない・上限超過・[`unelevated_euid_from_status`] が拒否した場合は `None`（計測を出力しない）。
+    pub(super) fn unelevated_euid() -> Option<u32> {
+        use std::io::Read;
+        let f = std::fs::File::open("/proc/self/status").ok()?;
+        let mut text = String::new();
+        f.take(PROC_STATUS_MAX_BYTES + 1)
+            .read_to_string(&mut text)
+            .ok()?;
+        if text.len() as u64 > PROC_STATUS_MAX_BYTES {
             return None;
         }
-        let f = std::fs::OpenOptions::new()
-            .append(true)
-            .custom_flags(O_NONBLOCK)
-            .open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
-            .ok()?;
-        return verify(&f).then_some(f);
+        unelevated_euid_from_status(&text)
     }
-    None
+
+    /// 開いた fd に対する要素 `name` の `/proc/self/fd/<fd>/<name>` 経路を作る。
+    /// この経路は親 fd が指すディレクトリ直下の 1 要素だけを解決するため、パス文字列の再解決で
+    /// 親が差し替えられる競合（TOCTOU）が起きない。`openat` 相当を unsafe なしで実現する（SEC-1）。
+    fn child_via_fd(parent: &std::fs::File, name: &std::ffi::OsStr) -> std::path::PathBuf {
+        use std::os::fd::AsRawFd;
+        std::path::PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(name)
+    }
+
+    /// 開いた fd のディレクトリが、他ユーザーに差し替えられない状態かを fd から検査する（SEC-1）。
+    /// ディレクトリであり、所有者が root か自分で、group / other 書き込み可なら sticky bit を要する。
+    fn dir_trusted(dir: &std::fs::File, euid: u32) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(m) = dir.metadata() else {
+            return false;
+        };
+        let mode = m.mode();
+        let writable_by_others = mode & 0o022 != 0;
+        let sticky = mode & 0o1000 != 0;
+        let owner_ok = m.uid() == 0 || m.uid() == euid;
+        m.is_dir() && owner_ok && (!writable_by_others || sticky)
+    }
+
+    /// `dir` 直下の要素 `name` を O_NOFOLLOW でディレクトリとして開く（親 fd 経由。SEC-1）。
+    fn open_dir_at(dir: &std::fs::File, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK | O_NOFOLLOW | O_DIRECTORY)
+            .open(child_via_fd(dir, name))
+    }
+
+    /// symlink を辿る回数の上限（ループ・過大な展開の防止）。
+    const MAX_SYMLINK_HOPS: u32 = 8;
+
+    /// 解決待ちの経路要素。`..` は物理的な親（開いた fd のスタックの 1 つ手前）へ戻る。
+    enum Step {
+        Name(std::ffi::OsString),
+        Parent,
+    }
+
+    /// 親ディレクトリを、ルートから 1 要素ずつディレクトリ fd で固定しながら開く（SEC-1）。
+    ///
+    /// 各要素は直前に開いた fd 経由で O_NOFOLLOW | O_DIRECTORY で開き、開いた fd ごとに所有者・権限を
+    /// 検査する。パス全体を再解決しないため、検査と open の間に親を symlink へ差し替えられない。
+    /// root 所有の symlink（システム標準の `/var/run` -> `../run` 等）のみ、その場で内容を読んで同じ
+    /// 手順で辿る（root 所有のため一般ユーザーは差し替えられない）。`..` は検査済みディレクトリ fd の
+    /// スタックを 1 つ戻して解決し、ルートより上へ出る経路は拒否する。
+    pub(super) fn open_trusted_parent(
+        parent: &std::path::Path,
+        euid: u32,
+    ) -> Option<std::fs::File> {
+        use std::collections::VecDeque;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        use std::path::Component;
+
+        /// `path` の各要素を `queue` の先頭へ順序を保って積み、絶対パスだったかを返す。
+        fn push_components(queue: &mut VecDeque<Step>, path: &std::path::Path) -> Option<bool> {
+            let mut absolute = false;
+            let mut steps = Vec::new();
+            for c in path.components() {
+                match c {
+                    Component::RootDir => absolute = true,
+                    Component::Normal(n) => steps.push(Step::Name(n.to_os_string())),
+                    Component::ParentDir => steps.push(Step::Parent),
+                    Component::CurDir => {}
+                    Component::Prefix(_) => return None,
+                }
+            }
+            for st in steps.into_iter().rev() {
+                queue.push_front(st);
+            }
+            Some(absolute)
+        }
+
+        let abs = if parent.is_absolute() {
+            parent.to_path_buf()
+        } else {
+            std::env::current_dir().ok()?.join(parent)
+        };
+        let open_root = || -> Option<std::fs::File> {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(O_NONBLOCK | O_NOFOLLOW | O_DIRECTORY)
+                .open("/")
+                .ok()?;
+            dir_trusted(&f, euid).then_some(f)
+        };
+        let mut queue = VecDeque::new();
+        push_components(&mut queue, &abs)?;
+        // 検査済みディレクトリ fd のスタック（先頭がルート、末尾が現在位置）。
+        let mut stack = vec![open_root()?];
+        let mut hops = 0;
+        while let Some(step) = queue.pop_front() {
+            let name = match step {
+                Step::Parent => {
+                    // ルートより上へは出ない（escape-above-root は拒否）。
+                    if stack.len() <= 1 {
+                        return None;
+                    }
+                    stack.pop();
+                    continue;
+                }
+                Step::Name(n) => n,
+            };
+            let cur = stack.last()?;
+            match open_dir_at(cur, &name) {
+                Ok(next) => {
+                    if !dir_trusted(&next, euid) {
+                        return None;
+                    }
+                    stack.push(next);
+                }
+                Err(_) => {
+                    // symlink だった場合のみ、root 所有に限って辿る。それ以外は拒否する。
+                    let link = child_via_fd(cur, &name);
+                    let m = std::fs::symlink_metadata(&link).ok()?;
+                    if !m.file_type().is_symlink() || m.uid() != 0 {
+                        return None;
+                    }
+                    hops += 1;
+                    if hops > MAX_SYMLINK_HOPS {
+                        return None;
+                    }
+                    let target = std::fs::read_link(&link).ok()?;
+                    if push_components(&mut queue, &target)? {
+                        stack.truncate(1);
+                    }
+                }
+            }
+        }
+        stack.pop()
+    }
+
+    /// 計測出力先を副作用なく固定して検証してから書き込み用に開く。通常ファイル以外は拒否する。
+    ///
+    /// 親ディレクトリをルートから fd で固定しながら開き（[`open_trusted_parent`]）、
+    /// その親 fd 経由で最終要素を O_PATH | O_NOFOLLOW で固定する。O_PATH はデバイス・FIFO を開いても
+    /// 副作用（`/dev/watchdog` の起動等）を起こさない。固定した fd で種別・ハードリンク数（1 のみ許可）・
+    /// 所有者を検証した後に限り、`/proc/self/fd` 経由で同じ inode を追記用に開き直し、再度検証する。
+    /// 未存在のときは O_EXCL（create_new）・mode 0600 で排他的に作成し、既存対象の検査を迂回させない
+    /// （SEC-1・REPAIR-5）。実 / 実効の UID・GID が食い違う実行（[`unelevated_euid`]）では開かない。
+    /// 排他作成が並行プロセスに負けた（AlreadyExists）ときは、既存対象として検証からやり直す
+    /// （[`OP_LOG_OPEN_ATTEMPTS`] 回まで）。
+    pub(super) fn open_op_log(path: &std::ffi::OsStr) -> Option<std::fs::File> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let path = std::path::Path::new(path);
+        let name = path.file_name()?;
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => std::path::Path::new("."),
+        };
+        let euid = unelevated_euid()?;
+        let dir = open_trusted_parent(parent, euid)?;
+        let target = child_via_fd(&dir, name);
+        let verify = |f: &std::fs::File| -> bool {
+            f.metadata()
+                .map(|m| m.is_file() && m.nlink() == 1 && m.uid() == euid)
+                .unwrap_or(false)
+        };
+        // 未存在 → 排他作成の間に別プロセスが同じファイルを作ると create_new は AlreadyExists で失敗する。
+        // その場合に限り、既存対象として検証からやり直す（並行起動した CLI の計測を落とさない。REPAIR-4）。
+        // やり直しは有限回で、ファイルの作成・削除を繰り返されても無期限には回らない（REPAIR-5）。
+        for _ in 0..OP_LOG_OPEN_ATTEMPTS {
+            let pinned = match std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(O_PATH | O_NOFOLLOW)
+                .open(&target)
+            {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // 未存在: 排他的に作成する（既存・競合で現れた対象には O_EXCL で失敗する）。
+                    match std::fs::OpenOptions::new()
+                        .append(true)
+                        .create_new(true)
+                        .mode(OP_LOG_CREATE_MODE)
+                        .custom_flags(O_NONBLOCK | O_NOFOLLOW)
+                        .open(&target)
+                    {
+                        Ok(f) => return verify(&f).then_some(f),
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                        Err(_) => return None,
+                    }
+                }
+                Err(_) => return None,
+            };
+            if !verify(&pinned) {
+                return None;
+            }
+            let f = std::fs::OpenOptions::new()
+                .append(true)
+                .custom_flags(O_NONBLOCK)
+                .open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
+                .ok()?;
+            return verify(&f).then_some(f);
+        }
+        None
+    }
+
+    /// [`open_op_log`] が「固定 → 検証 → 開く」を試す回数の上限。2 回目以降は、未存在からの排他作成が
+    /// 並行プロセスに負けたときだけ使う（REPAIR-5: 無期限に回らない）。
+    const OP_LOG_OPEN_ATTEMPTS: u32 = 4;
 }
 
-/// [`open_op_log`] が「固定 → 検証 → 開く」を試す回数の上限。2 回目以降は、未存在からの排他作成が
-/// 並行プロセスに負けたときだけ使う（REPAIR-5: 無期限に回らない）。
-#[cfg(target_os = "linux")]
-const OP_LOG_OPEN_ATTEMPTS: u32 = 4;
-
-/// Linux 以外（macOS・Windows）は、実効 UID の取得・symlink / junction / reparse point の
-/// 安全な検査が未実装のため計測のファイル出力を拒否する（fail-closed。SEC-1・REPAIR-4）。
+/// 対応外の環境（macOS・Windows、および x86_64 / aarch64 以外の Linux）は計測のファイル出力を拒否する
+/// （fail-closed。SEC-1・REPAIR-4）。macOS・Windows は実効 UID の取得と symlink / junction / reparse point の
+/// 安全な検査が未実装、他アーキテクチャの Linux は open フラグの値が未確認のため。
 /// 将来は各 OS の安全な open 実装を `sys` モジュールに追加して対応する。
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 fn open_op_log(_path: &std::ffi::OsStr) -> Option<std::fs::File> {
     None
 }
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use op_log_file::open_op_log;
 
 /// 1 回の計測出力（全 `op_stats` 行 + メタ行）の上限バイト数（REPAIR-4・REPAIR-5）。
 ///
@@ -496,6 +587,9 @@ pub(super) fn run_start(global: &GlobalArgs, args: &StartArgs) -> CliExit {
         // 本番 launcher（UnavailableLauncher）では到達しない。将来 launcher が差し替わっても、
         // 監視者へ引き渡せないまま CLI が終了して孤児プロセスを残さないよう、止めてから失敗を返す
         // （fail-closed）。supervisor への引き渡しは TASK-157。
+        // 注意: この枝はプロセスを止めるだけで、core が Running（pid あり）へ進めた状態は戻さない。
+        // TASK-157 で launcher を差し替えるときは、supervisor への引き渡しか、状態のロールバック
+        // （停止の記録）のどちらかをここへ必ず入れること（入れないと、プロセスのいない Running が残る）。
         Ok(started) => {
             let (_record, process) = started.into_parts();
             let _ = process.terminate(rt.timeouts.terminate());
@@ -562,7 +656,10 @@ mod tests {
 
     /// REPAIR-4: 計測は指定ファイルへ JSON Lines で追記され、未指定なら何も書かない。
     /// Linux 以外は計測のファイル出力を拒否するため対象外（SEC-1）。
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn repair4_export_ops_appends_json_lines() {
         use fandhe_container_core::observability::{OpName, OpOutcome};
@@ -711,7 +808,10 @@ mod tests {
 
     /// REPAIR-4: 複数スレッドが別々の fd で同じ計測ログへ並行に追記しても、JSON 行が混ざらない。
     /// 未存在からの同時作成でも出力を落とさず、各出力の 2 行（op_stats・メタ）は連続して並ぶ。
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn repair4_export_ops_concurrent_appends_keep_lines_intact() {
         const THREADS: usize = 8;
@@ -765,7 +865,10 @@ mod tests {
 
     /// REPAIR-5: 計測出力先が FIFO でも `export_ops` がブロックせず、何も書き込まない。
     /// 読み手がいない場合と、読み手が open しただけで読まない場合の両方を具体値で検証する。
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn repair5_export_ops_rejects_fifo_without_blocking() {
         use fandhe_container_core::observability::{OpName, OpOutcome};
@@ -806,7 +909,7 @@ mod tests {
         let p2 = mkfifo("idlereader");
         let reader = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(O_NONBLOCK)
+            .custom_flags(op_log_file::O_NONBLOCK)
             .open(&p2)
             .expect("open reader");
         run(p2.clone());
@@ -821,7 +924,10 @@ mod tests {
     }
 
     /// SEC-1: 最終要素が symlink なら辿らず拒否し、リンク先は書き換えない。
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sec1_open_op_log_rejects_symlink_and_hardlink() {
         let dir = std::env::temp_dir().join(format!("fc-cli-oplog-sec-{}", std::process::id()));
@@ -846,7 +952,10 @@ mod tests {
     }
 
     /// SEC-1: 信頼できない（非 root 所有の）親 symlink は辿らず拒否し、リンク先へ書かない。
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sec1_open_op_log_rejects_parent_symlink() {
         use std::os::unix::fs::PermissionsExt;
@@ -865,14 +974,20 @@ mod tests {
     }
 
     /// SEC-1: デバイスノードは O_PATH で固定して種別検査で拒否し、書き込み用に開かない。
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sec1_open_op_log_rejects_device_node() {
         assert!(open_op_log(std::ffi::OsStr::new("/dev/null")).is_none());
     }
 
     /// SEC-1: 親の `..` は検査済み fd のスタックで解決でき、ルートより上へ出る経路は拒否する。
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sec1_open_trusted_parent_resolves_parent_dir() {
         use std::os::unix::fs::PermissionsExt;
@@ -885,16 +1000,19 @@ mod tests {
         let via_dotdot = real.join("..").join("real").join("log");
         assert!(open_op_log(via_dotdot.as_os_str()).is_some());
         assert!(real.join("log").is_file());
-        let euid = effective_uid().expect("euid");
+        let euid = op_log_file::unelevated_euid().expect("euid");
         let above_root = std::path::Path::new("/..");
-        assert!(open_trusted_parent(above_root, euid).is_none());
+        assert!(op_log_file::open_trusted_parent(above_root, euid).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SEC-1: Linux 以外は計測のファイル出力を拒否し、ファイルを作らない（fail-closed）。
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
     #[test]
-    fn sec1_open_op_log_refused_on_non_linux() {
+    fn sec1_open_op_log_refused_on_unsupported_target() {
         let path = std::env::temp_dir().join(format!("fc-cli-oplog-nl-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
         assert!(open_op_log(path.as_os_str()).is_none());

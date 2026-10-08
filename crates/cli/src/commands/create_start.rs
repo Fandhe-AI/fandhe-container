@@ -314,6 +314,8 @@ fn open_trusted_parent(parent: &std::path::Path, euid: u32) -> Option<std::fs::F
 /// 副作用（`/dev/watchdog` の起動等）を起こさない。固定した fd で種別・ハードリンク数（1 のみ許可）・
 /// 所有者を検証した後に限り、`/proc/self/fd` 経由で同じ inode を追記用に開き直し、再度検証する。
 /// 未存在のときは O_EXCL（create_new）で排他的に作成し、既存対象の検査を迂回させない（SEC-1・REPAIR-5）。
+/// 排他作成が並行プロセスに負けた（AlreadyExists）ときは、既存対象として検証からやり直す
+/// （[`OP_LOG_OPEN_ATTEMPTS`] 回まで）。
 #[cfg(target_os = "linux")]
 fn open_op_log(path: &std::ffi::OsStr) -> Option<std::fs::File> {
     use std::os::fd::AsRawFd;
@@ -332,34 +334,48 @@ fn open_op_log(path: &std::ffi::OsStr) -> Option<std::fs::File> {
             .map(|m| m.is_file() && m.nlink() == 1 && m.uid() == euid)
             .unwrap_or(false)
     };
-    let pinned = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(O_PATH | O_NOFOLLOW)
-        .open(&target)
-    {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // 未存在: 排他的に作成する（既存・競合で現れた対象には O_EXCL で失敗する）。
-            let f = std::fs::OpenOptions::new()
-                .append(true)
-                .create_new(true)
-                .custom_flags(O_NONBLOCK | O_NOFOLLOW)
-                .open(&target)
-                .ok()?;
-            return verify(&f).then_some(f);
+    // 未存在 → 排他作成の間に別プロセスが同じファイルを作ると create_new は AlreadyExists で失敗する。
+    // その場合に限り、既存対象として検証からやり直す（並行起動した CLI の計測を落とさない。REPAIR-4）。
+    // やり直しは有限回で、ファイルの作成・削除を繰り返されても無期限には回らない（REPAIR-5）。
+    for _ in 0..OP_LOG_OPEN_ATTEMPTS {
+        let pinned = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_PATH | O_NOFOLLOW)
+            .open(&target)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 未存在: 排他的に作成する（既存・競合で現れた対象には O_EXCL で失敗する）。
+                match std::fs::OpenOptions::new()
+                    .append(true)
+                    .create_new(true)
+                    .custom_flags(O_NONBLOCK | O_NOFOLLOW)
+                    .open(&target)
+                {
+                    Ok(f) => return verify(&f).then_some(f),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(_) => return None,
+                }
+            }
+            Err(_) => return None,
+        };
+        if !verify(&pinned) {
+            return None;
         }
-        Err(_) => return None,
-    };
-    if !verify(&pinned) {
-        return None;
+        let f = std::fs::OpenOptions::new()
+            .append(true)
+            .custom_flags(O_NONBLOCK)
+            .open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
+            .ok()?;
+        return verify(&f).then_some(f);
     }
-    let f = std::fs::OpenOptions::new()
-        .append(true)
-        .custom_flags(O_NONBLOCK)
-        .open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
-        .ok()?;
-    verify(&f).then_some(f)
+    None
 }
+
+/// [`open_op_log`] が「固定 → 検証 → 開く」を試す回数の上限。2 回目以降は、未存在からの排他作成が
+/// 並行プロセスに負けたときだけ使う（REPAIR-5: 無期限に回らない）。
+#[cfg(target_os = "linux")]
+const OP_LOG_OPEN_ATTEMPTS: u32 = 4;
 
 /// Linux 以外（macOS・Windows）は、実効 UID の取得・symlink / junction / reparse point の
 /// 安全な検査が未実装のため計測のファイル出力を拒否する（fail-closed。SEC-1・REPAIR-4）。
@@ -369,10 +385,68 @@ fn open_op_log(_path: &std::ffi::OsStr) -> Option<std::fs::File> {
     None
 }
 
+/// 1 回の計測出力（全 `op_stats` 行 + メタ行）の上限バイト数（REPAIR-4・REPAIR-5）。
+///
+/// 出力は型で有界である。行数は core の `MAX_TRACKED_OPS`（64）+ メタ 1 行まで、1 行は固定キー・
+/// `OP_NAME_MAX_LEN`（64）バイト以下の操作名・整数値だけで 512 バイトに収まる。したがって通常は
+/// 33 KiB 未満で、この上限は core 側の形式が変わったときに巨大な 1 回書き込みをしないための歯止め。
+/// 超過した出力は書かずに捨てる（計測は best effort。操作の結果は変えない）。
+const OP_LOG_MAX_BYTES: usize = 64 * 1024;
+
+/// 割り込み（EINTR）で 1 バイトも書けなかった write をやり直す回数の上限（REPAIR-5）。
+const OP_LOG_WRITE_ATTEMPTS: u32 = 4;
+
+/// 計測スナップショット全体を 1 つのバッファへ組み立て、`w` へ **1 回の `write`** で書く（REPAIR-4）。
+///
+/// 複数の CLI プロセスが同じ計測ログへ並行に追記しても JSON 行が混ざらないようにするための入口。
+/// core の `OpRecorder::export_json_lines` は行本体と改行を別々の `write_all` で書くため、ファイルへ
+/// 直接渡すと「A の本体 → B の本体 → 改行」の順で 1 行に 2 つの JSON が並びうる。ここではメモリ上の
+/// バッファへ書かせ、全行（LF 終端）を 1 回の write(2) にまとめる。`O_APPEND` で開いた通常ファイルへの
+/// 1 回の write(2) は、追記位置の決定と書き込みを inode ロックの下で一括して行うため、他プロセスの
+/// 追記と行の途中で混ざらない（行単位ではなく 1 回の出力全体が連続する）。プロセス間ロックは使わない
+/// ため、ロック保持者を待って CLI が結果を返せなくなる経路も増えない（REPAIR-5）。
+///
+/// `write_all` は使わない。部分書き込みを残りの write で継ぎ足すと、その間に他プロセスの行が
+/// 入りうるため、書けたバイト数が全体に満たなければ継ぎ足さずに失敗を返す（容量不足・
+/// `RLIMIT_FSIZE` 等。このとき末尾に不完全な行が残りうる。読み手は解析できない行を捨てること）。
+/// 1 バイトも書かれない EINTR だけは [`OP_LOG_WRITE_ATTEMPTS`] 回までやり直す。
+/// 戻り値は書いたバイト数。[`OP_LOG_MAX_BYTES`] を超える出力は 1 バイトも書かずに失敗を返す。
+fn write_ops_once(recorder: &OpRecorder, w: &mut dyn std::io::Write) -> std::io::Result<usize> {
+    use std::io::{Error, ErrorKind};
+    let mut buf: Vec<u8> = Vec::new();
+    recorder
+        .export_json_lines(Some(&mut buf))
+        .map_err(|_| Error::other("failed to encode op stats"))?;
+    if buf.len() > OP_LOG_MAX_BYTES {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "op stats output exceeds the size limit",
+        ));
+    }
+    for _ in 0..OP_LOG_WRITE_ATTEMPTS {
+        match w.write(&buf) {
+            Ok(n) if n == buf.len() => return Ok(n),
+            Ok(_) => {
+                return Err(Error::new(
+                    ErrorKind::WriteZero,
+                    "op stats output was written partially",
+                ));
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Error::new(
+        ErrorKind::Interrupted,
+        "op stats output was interrupted repeatedly",
+    ))
+}
+
 /// 計測を `path` の通常ファイルへ追記する（best effort。失敗しても終了コード・エラー出力は変えない）。
 ///
 /// open は O_NONBLOCK で行い、通常ファイル以外は拒否して書き込まない（REPAIR-5: 読み手のいない
-/// FIFO 等で CLI が無期限にブロックしない）。
+/// FIFO 等で CLI が無期限にブロックしない）。書き込みは [`write_ops_once`] による 1 回の write で、
+/// 同じファイルへ並行に追記する他の CLI プロセスと JSON 行が混ざらない（REPAIR-4）。
 pub(super) fn export_ops(recorder: &OpRecorder, path: Option<&std::ffi::OsStr>) {
     let Some(path) = path.filter(|p| !p.is_empty()) else {
         return;
@@ -380,7 +454,7 @@ pub(super) fn export_ops(recorder: &OpRecorder, path: Option<&std::ffi::OsStr>) 
     let Some(mut f) = open_op_log(path) else {
         return;
     };
-    let _ = recorder.export_json_lines(Some(&mut f));
+    let _ = write_ops_once(recorder, &mut f);
 }
 
 /// 本番入口の `create`。成功時は何も出さない（OCI の create 互換）。

@@ -109,18 +109,20 @@ impl CliExit {
     }
 
     /// stderr へ失敗の 1 行 JSON（LF 終端）を書く。成功では何も書かない。
+    ///
+    /// 行本体と LF を 1 つのバッファにまとめ、1 回の `write_all` で書く。`writeln!` は書式の断片ごとに
+    /// write を分けうるため、stderr を共有する他プロセスの出力が行の途中へ入るのを避ける（ERR-1）。
     pub fn write_stderr(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        // 文言は引用符・バックスラッシュ・改行を含まない定数のみ（テストで固定）。
+        let fixed = |code: &str, message: &str| {
+            format!("{{\"code\":\"{code}\",\"message\":\"{message}\"}}\n")
+        };
         match self {
             CliExit::Success => Ok(()),
-            // 文言は引用符・バックスラッシュ・改行を含まない定数のみ（テストで固定）。
-            CliExit::Usage => writeln!(
-                out,
-                "{{\"code\":\"INVALID_ARGUMENT\",\"message\":\"{USAGE_MESSAGE}\"}}"
-            ),
-            CliExit::Unimplemented => writeln!(
-                out,
-                "{{\"code\":\"UNIMPLEMENTED\",\"message\":\"{UNIMPLEMENTED_MESSAGE}\"}}"
-            ),
+            CliExit::Usage => out.write_all(fixed("INVALID_ARGUMENT", USAGE_MESSAGE).as_bytes()),
+            CliExit::Unimplemented => {
+                out.write_all(fixed("UNIMPLEMENTED", UNIMPLEMENTED_MESSAGE).as_bytes())
+            }
             CliExit::Runtime(e) => e.write_json_line(out),
         }
     }

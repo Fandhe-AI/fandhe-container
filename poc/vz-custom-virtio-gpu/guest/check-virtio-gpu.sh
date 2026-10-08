@@ -58,7 +58,8 @@ load_limited() { # $1=src $2=dest
     exit 2
   fi
   # 検査と取り込みの間に入力が増えても上限を超えないよう、最大 MAX_INPUT_BYTES+1 バイトだけ
-  # 取り込み、取り込んだ実サイズで超過を判定する（TOCTOU 回避）。
+  # 取り込み、取り込んだ実サイズで超過を判定する（TOCTOU 回避）。head -c は GNU・busybox に
+  # 加え macOS 標準の BSD head（FreeBSD 由来。head [-n count | -c bytes]）にもある。
   head -c "$((MAX_INPUT_BYTES + 1))" -- "$src" >"$dest" || {
     echo "error: failed to read input" >&2
     exit 2
@@ -75,6 +76,7 @@ if [ -n "$dmesg_file" ]; then
 else
   # 取得失敗（権限不足・dmesg 不在）は入力エラーとして終了コード 2 で返す。上限超過による
   # head の早期終了（dmesg 側の SIGPIPE = 141）だけは意図的な打ち切りとして区別する。
+  # head -c は GNU・busybox・macOS 標準の BSD head のいずれにもある（バイト単位の上限を保つ）。
   set +e
   dmesg 2>/dev/null | head -c "$((MAX_INPUT_BYTES + 1))" >"$tmp"
   dmesg_status=("${PIPESTATUS[@]}")
@@ -121,13 +123,15 @@ elif [ "$dev_count" -eq 1 ]; then
   mv -f -- "$tmpdev" "$tmp"
 fi
 # probe 区間の識別: 1 回の probe で 1 回だけ出る行（features の virgl 行・context_init 行・
-# number of cap sets・number of scanouts・Host memory window）のどれかが複数あれば、再 probe
-# 等で複数区間が混在している。後続 probe が途中（例: features 行だけ）で止まったログでも、
+# number of cap sets・cap set 0 の情報・number of scanouts・Host memory window）のどれかが
+# 複数あれば、再 probe 等で複数区間が混在している。cap set は index 0 だけを数える（capset が
+# 複数あるデバイスを区間重複と誤認しない。その場合は capset_count で拒否する）。後続 probe が途中（例: features 行だけ）で止まったログでも、
 # 先行区間の capset・共有メモリ情報と組み合わせて成功にしないよう fail-closed で打ち切る。
 for marker in \
   'features: .*[+-]virgl( |$)' \
   'features: .*[+-]context_init( |$)' \
   'number of cap sets: ' \
+  'cap set 0: ' \
   'number of scanouts: ' \
   'Host memory window: '; do
   if [ "$(grep -cE -- "$marker" "$tmp" || true)" -gt 1 ]; then
@@ -202,8 +206,13 @@ if grep -qE 'timed out waiting for cap set' "$tmp"; then
   echo "capset_info=timeout"
   fail
 else
-  ci="$(grep -E 'cap set [0-9]+: id 4, max-version [0-9]+, max-size [0-9]+' "$tmp" | head -n 1 || true)"
-  if [ -n "$ci" ]; then
+  # num_capsets=1 で有効な index は 0 だけ。index 1 以上の情報行がある記録は件数と矛盾する
+  # ため inconsistent として拒否する（fail-closed）。
+  ci="$(grep -E 'cap set 0: id 4, max-version [0-9]+, max-size [0-9]+' "$tmp" | head -n 1 || true)"
+  if [ "${cs##*: }" = "1" ] && grep -qE 'cap set [1-9][0-9]*: id ' "$tmp"; then
+    echo "capset_info=inconsistent"
+    fail
+  elif [ -n "$ci" ]; then
     ver="$(printf '%s' "$ci" | sed -E 's/.*max-version ([0-9]+).*/\1/')"
     sz="$(printf '%s' "$ci" | sed -E 's/.*max-size ([0-9]+).*/\1/')"
     echo "capset_info=venus"

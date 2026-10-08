@@ -23,6 +23,11 @@
 //! - 子の環境は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ。stdin / stdout は null、stderr は
 //!   セッション全期間で 1 本の読み取りスレッドが上限つきで収集し、[`ResidentPlugin::shutdown`] の結果
 //!   （失敗時も [`ResidentShutdownError`] に載せる）でのみ返す（untrusted）。[`ResidentPlugin`] の破棄（panic 等を含む）でも子の kill・回収とスレッド停止を行う。
+//! - 親の強制終了時の停止（#1514・PLUG-7・REPAIR-5・CORE-1）: Linux では plugin に `PR_SET_PDEATHSIG`
+//!   （SIGKILL）を設定する（詳細は `lifecycle` の契約）。発火条件は子を fork したスレッドの終了のため、
+//!   **Linux では [`ResidentPlugin::start`] を呼んだスレッドが終了すると plugin は SIGKILL される**。
+//!   常駐 plugin はセッションより長く生きるスレッドから起動すること。[`ResidentPlugin`] を起動スレッドの
+//!   外へ渡して起動スレッドだけを先に終わらせる使い方は契約違反とする。
 //! - 応答は untrusted。フレームの長さ上限・チェックサムは transport 側で検証済みで、内容は解釈しない。
 //!
 //! # 未実装（REPAIR-3）
@@ -35,8 +40,8 @@
 
 use super::{
     ChildGuard, ONE_SHOT_EXIT_TIMEOUT, ONE_SHOT_STDERR_DRAIN_TIMEOUT, OneShotPlugin, OneShotStderr,
-    OneShotTermination, PLUGIN_SOCKET_ENV, Reap, StderrCapture, classify_reaped, rpc_timeout,
-    spawn_error, stderr_channel, unreaped_error,
+    OneShotTermination, PLUGIN_SOCKET_ENV, Reap, StderrCapture, bind_to_parent_lifetime,
+    classify_reaped, rpc_timeout, spawn_error, stderr_channel, unreaped_error,
 };
 use crate::error::{PluginError, PluginErrorCode};
 use crate::frame::Frame;
@@ -276,6 +281,9 @@ impl ResidentPlugin {
     /// 回収を確認できない場合は `Internal`（pid つき）を返す。非 unix では bind が `Unimplemented` を
     /// 返し、子は spawn されない。
     ///
+    /// スレッド寿命の契約（Linux。#1514・PLUG-7）: plugin は本関数を呼んだスレッドの終了で SIGKILL される
+    /// （`PR_SET_PDEATHSIG` の発火条件）。セッションより長く生きるスレッドから呼ぶこと。
+    ///
     /// `audit` は受付で拒否した接続（UID・pid の不一致・取得失敗）の監査イベントの受け手で、拒否 1 件に
     /// つき 1 回、同期で呼ばれる（PLUG-12・SEC-4・TASK-124.5）。必須で、既定の出力先は無い（出力・永続化は
     /// 呼び出し側の責務。`crate::audit` のモジュール doc）。
@@ -303,15 +311,19 @@ impl ResidentPlugin {
                 "failed to prepare capturing plugin stderr",
             )
         })?;
-        // `Command` は文の終わりで drop され、親側に書き込み端は残らない。
-        let spawned = Command::new(&plugin.program)
-            .args(&plugin.args)
-            .env_clear()
-            .env(PLUGIN_SOCKET_ENV, listener.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(child_stderr)
-            .spawn();
+        // `Command` はこのブロックの終わりで drop され、親側に書き込み端は残らない。
+        let spawned = {
+            let mut cmd = Command::new(&plugin.program);
+            cmd.args(&plugin.args)
+                .env_clear()
+                .env(PLUGIN_SOCKET_ENV, listener.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(child_stderr);
+            // spawn 前の失敗なので子は存在しない。
+            bind_to_parent_lifetime(&mut cmd)?;
+            cmd.spawn()
+        };
         let mut guard = match spawned {
             Ok(child) => ChildGuard::new(child),
             Err(e) => return Err(spawn_error(&e)),

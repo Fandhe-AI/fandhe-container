@@ -240,6 +240,8 @@ impl PluginSession {
     ///
     /// 都度起動は起動仕様と期限を保持するだけで spawn しない（spawn は [`call`](Self::call) ごと）。
     /// 常駐は [`ResidentPlugin::start`] で子を起動し接続を確立する（失敗はそのエラーを返す）。
+    /// 常駐の場合、Linux では呼んだスレッドの終了で plugin が SIGKILL される（スレッド寿命の契約。
+    /// [`ResidentPlugin::start`] を参照。#1514・PLUG-7）。
     ///
     /// `audit` は peer 認証で拒否した接続の監査イベントの受け手（PLUG-12・SEC-4・TASK-124.5。必須）。
     /// 常駐は起動時の受付でのみ使い、都度起動はここでは使わない（受付は `call` ごと）。

@@ -149,17 +149,27 @@ mod unix {
         ms: u64,
     ) -> Result<ResidentPlugin, fandhe_container_plugin::PluginError> {
         let plugin = plugin_for(dir);
-        with_watchdog("ResidentPlugin::start", move || {
-            let mut audit = fandhe_container_plugin::JsonLinesPeerAuthObserver::new();
-            let r = ResidentPlugin::start(
-                &plugin,
-                ResidentStartTimeout::new(Duration::from_millis(ms)).unwrap(),
-                &mut audit,
-            );
-            // 接続するのは spawn した子だけなので、peer 認証の拒否イベントは 0 件（PLUG-12・SEC-4）。
-            assert_eq!(audit.drain_lines(), Vec::<String>::new());
-            r
-        })
+        // Linux では plugin が PR_SET_PDEATHSIG で start を呼んだスレッドに結び付く（#1514・PLUG-7）。
+        // セッションを返す都合上、start は別スレッドではなくテストスレッド上で呼び、ハング検出だけを
+        // 監視スレッドに任せる（監視スレッドは完了通知を待ち、期限超過ならプロセスごと中断する）。
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let watcher = std::thread::spawn(move || {
+            if let Err(mpsc::RecvTimeoutError::Timeout) = done_rx.recv_timeout(WAIT) {
+                eprintln!("ResidentPlugin::start hung: no result within {WAIT:?}");
+                std::process::abort();
+            }
+        });
+        let mut audit = fandhe_container_plugin::JsonLinesPeerAuthObserver::new();
+        let r = ResidentPlugin::start(
+            &plugin,
+            ResidentStartTimeout::new(Duration::from_millis(ms)).unwrap(),
+            &mut audit,
+        );
+        drop(done_tx);
+        watcher.join().unwrap();
+        // 接続するのは spawn した子だけなので、peer 認証の拒否イベントは 0 件（PLUG-12・SEC-4）。
+        assert_eq!(audit.drain_lines(), Vec::<String>::new());
+        r
     }
 
     fn ping() -> Frame {

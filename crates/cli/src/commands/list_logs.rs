@@ -170,7 +170,6 @@ pub(super) fn run_logs(global: &GlobalArgs, args: &LogsArgs) -> CliExit {
 mod tests {
     use super::*;
     use fandhe_container_core::traits::{ContainerStatus, StateRevision};
-    use std::path::PathBuf;
 
     fn record(status: ContainerStatus) -> StateRecord {
         StateRecord::new(status, std::env::temp_dir(), StateRevision::from_raw(1)).expect("rec")
@@ -212,6 +211,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod linux {
         use super::*;
+        use std::path::PathBuf;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         use fandhe_container_core::oci_runtime::create;

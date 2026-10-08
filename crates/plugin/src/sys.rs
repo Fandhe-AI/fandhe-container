@@ -2150,7 +2150,24 @@ mod dir_stream_tests {
 ))]
 mod pdeathsig_tests {
     use super::*;
-    use std::process::Command;
+    use std::process::{Child, Command, ExitStatus};
+    use std::time::{Duration, Instant};
+
+    /// 子の回収を `try_wait` のポーリングと期限で行う（REPAIR-5。期限超過時は kill してから回収し失敗にする）。
+    fn wait_bounded(mut child: Child) -> ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child did not exit within the deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn plug7_pdeathsig_mismatched_parent_pid_aborts_exec() {
@@ -2165,7 +2182,7 @@ mod pdeathsig_tests {
     fn plug7_pdeathsig_matching_parent_pid_spawns_normally() {
         let mut cmd = Command::new("/bin/true");
         set_parent_death_sigkill(&mut cmd, std::process::id()).unwrap();
-        let status = cmd.spawn().unwrap().wait().unwrap();
+        let status = wait_bounded(cmd.spawn().unwrap());
         assert_eq!(status.code(), Some(0));
     }
 

@@ -44,12 +44,28 @@ impl Drop for TempDir {
     }
 }
 
-/// 失敗経路でも中間プロセスを残さない。
+/// 子の回収を `try_wait` のポーリングと期限で行う（REPAIR-5。無期限の `wait` を避ける）。
+/// 期限内に回収できなければ `false`（呼び出し側が kill 済みであることを前提に、ここでは待たない）。
+fn reap_bounded(child: &mut Child, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return true,
+            Ok(None) => {}
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 失敗経路でも中間プロセスを残さない（Drop の回収にも `WAIT` の上限を適用する）。
 struct KillOnDrop(Child);
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
         let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = reap_bounded(&mut self.0, WAIT);
     }
 }
 
@@ -153,7 +169,10 @@ fn run(role: &str) {
     assert_eq!(ppid, mid_pid);
 
     intermediate.0.kill().unwrap();
-    intermediate.0.wait().unwrap();
+    assert!(
+        reap_bounded(&mut intermediate.0, WAIT),
+        "timed out reaping the SIGKILLed intermediate process"
+    );
 
     wait_until("plugin to stop after parent SIGKILL", || {
         match stat(plugin_pid) {

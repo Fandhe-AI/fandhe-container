@@ -107,9 +107,14 @@
 //!   期限切れの停止。正常終了後も子孫を止める＝exec の終了後にコマンドの子孫を残さない。`sh -c 'daemon &'` 型の
 //!   バックグラウンド化は exec の終了で止まる）。**削除と最終の停止は呼び出しプロセス**が、worker の終了後（どの
 //!   経路でも）に記録から導いたコンテナ cgroup を開き直して行う（core の `remove_exec_child_cgroup`。冪等。
-//!   待機は 5 秒の上限つき）。後始末の失敗は元のエラーへ併記し、成功を装わない。**限界**: 呼び出しプロセス自身が
-//!   `SIGKILL` された場合は子 cgroup が残り得る（未実装: delete 前と次回 exec 開始時の `exec-*` の掃除。TASK-30.3・
-//!   OCI-6・SUP-6。残ると `delete` のコンテナ cgroup の `rmdir` が失敗する）
+//!   待機は 5 秒の上限つき）。後始末の失敗は元のエラーへ併記し、成功を装わない。**限界と掃除**（#1596）: 呼び出し
+//!   プロセス自身が `SIGKILL` された場合・後始末が上限を超えた場合は子 cgroup が残り得る。残骸は 2 つの時機で
+//!   掃除する。**exec 開始時**（自分の子 cgroup を作る前。core の `sweep_stale_exec_child_cgroups`）は、プロセスの居ない
+//!   空の `exec-*` のうち名前の pid の持ち主が居ないものだけを消し、プロセスの居るもの・持ち主が生きているものには
+//!   触れない（並行する別の exec を壊さないため。割り切り）。**delete 前**（core の `ContainerCgroupRemover`）は
+//!   コンテナが停止済みなので、直下の `exec-*` すべてを `cgroup.kill` で止めて消す（残るとコンテナ cgroup の
+//!   `rmdir` が `EBUSY` になるため）。開始時の掃除の結果は `ExecOutcome::stale_exec_cgroups` に載せ、失敗は exec を
+//!   止めずに記録する（exec 自体が失敗したときはエラーのメッセージへ併記する）
 //! - 再適用の Landlock ルールは、launcher が実際にマウントした結果ではなく bundle の `config.json` から
 //!   再導出する（launch 時の ruleset は保存されていない）。launch 後に `config.json` が書き換えられると
 //!   追従してしまうが、bundle は supervisor と同じ信頼境界（コンテナから書けない場所）にある前提とする。
@@ -198,13 +203,14 @@ use fandhe_container_core::audit_log::{AuditDelivery, AuditSink, AuditedRejectio
 use fandhe_container_core::exec::{
     ChildExit, ContainerEnv, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV, ENTRYPOINT_MAX_STRING_BYTES,
     ENTRYPOINT_MAX_TOTAL_BYTES, EntrypointExecMode, ExecCgroupJoin, ExecCgroupJoinReport,
-    ExecCgroupName, ExecChildCgroup, ExecCommand, ExecError, ExecExit, ExecReady,
+    ExecCgroupName, ExecCgroupSweep, ExecChildCgroup, ExecCommand, ExecError, ExecExit, ExecReady,
     ExecRestrictionReport, ExecRestrictions, ExecWorkerProof, NamespaceJoinReport, Pid1Target,
     SealedCopyUnavailable, SupplementaryGroups, ViolationReason, join_cgroup as core_join_cgroup,
     join_namespaces, prepare_cgroup_join as core_prepare_cgroup_join,
     prepare_exec_restrictions as core_prepare_exec_restrictions,
     reapply_restrictions as core_reapply_restrictions, record_entrypoint_rejection,
     record_exec_target_rejection, remove_exec_child_cgroup, spawn_exec_command, spawn_exec_worker,
+    sweep_stale_exec_child_cgroups,
 };
 use fandhe_container_core::oci_runtime::{OciConfig, RootfsDir, load_config, pin_bundle_rootfs};
 use fandhe_container_core::traits::{
@@ -524,6 +530,9 @@ pub struct ExecOutcome {
     /// エントリポイントの実行方式（封印した複製か現行方式と、現行方式を選んだ理由。オーナー判断 2026-10-09
     /// 「条件付き切り替え」・#1531・REPAIR-4）。同じ値を worker が構造化ログ（`supervisor.exec` の `entrypoint_mode`）に出す。
     pub entrypoint_mode: EntrypointExecMode,
+    /// exec 開始時に行った、残った `exec-*` 子 cgroup の掃除の結果（#1596・SUP-6）。呼び出しプロセスが worker の
+    /// 結果を受けた後で載せる値で、worker の結果行には含まれない。掃除を行わなかった場合は既定値（未実施）。
+    pub stale_exec_cgroups: ExecCgroupSweep,
 }
 
 /// [`run_command`] 系の成功側の戻り値: コマンドの結果と、`execve` 前の拒否の監査記録の結果（SEC-4・SUP-6・#1595）。
@@ -601,6 +610,7 @@ pub fn run_command(
     let deadline = Deadline::after(timeout);
     // 稼働中でない記録は、fork せず呼び出しプロセスで拒否する（副作用なし。記録の対象外）。
     running_pid(record).map_err(AuditedRejection::not_applicable)?;
+    let sweep = sweep_before_create(record);
     let name = ExecCgroupName::unique();
     let result = run_owning_child_cgroup(
         deadline,
@@ -611,7 +621,7 @@ pub fn run_command(
             run_with_target(proof, &target, request, deadline, child)
         },
     );
-    audit_worker_result(result, audit)
+    audit_worker_result(attach_sweep(result, sweep), audit)
 }
 
 /// worker の結果を受け、拒否なら 1 件記録して返す（親プロセス側の記録点。SEC-4・SUP-6・#1465・#1595）。
@@ -665,6 +675,7 @@ pub fn run_command_with_pidfd(
 ) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
     let deadline = Deadline::after(timeout);
     running_pid(record).map_err(AuditedRejection::not_applicable)?;
+    let sweep = sweep_before_create(record);
     let name = ExecCgroupName::unique();
     let result = run_owning_child_cgroup(
         deadline,
@@ -675,7 +686,7 @@ pub fn run_command_with_pidfd(
             run_with_target(proof, &target, request, deadline, child)
         },
     );
-    audit_worker_result(result, audit)
+    audit_worker_result(attach_sweep(result, sweep), audit)
 }
 
 /// 実機結合試験専用の入口: [`run_command`] の対象特定だけを [`identify_pid1_in`]（期待 cgroup パスを呼び出し側
@@ -691,6 +702,9 @@ pub fn run_command_in(
 ) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
     let deadline = Deadline::after(timeout);
     running_pid(record).map_err(AuditedRejection::not_applicable)?;
+    let sweep = sweep_note(
+        fandhe_container_core::exec::sweep_stale_exec_child_cgroups_in(expected_cgroup_path),
+    );
     let name = ExecCgroupName::unique();
     let result = run_owning_child_cgroup(
         deadline,
@@ -713,7 +727,76 @@ pub fn run_command_in(
             run_with_target(proof, &target, request, deadline, child)
         },
     );
-    audit_worker_result(result, audit)
+    audit_worker_result(attach_sweep(result, sweep), audit)
+}
+
+/// exec 開始時の掃除（自分の子 cgroup を作る前）の結果。失敗しても exec は止めない（#1596）。
+#[derive(Debug, Clone, Copy)]
+struct SweepNote {
+    sweep: ExecCgroupSweep,
+    /// 掃除自体がエラーを返した、または個々の失敗があった場合の `code`。
+    failure: Option<ErrorCode>,
+}
+
+/// 記録から導いたコンテナ cgroup の残った `exec-*` を掃除する。cgroup 配置の記録が無ければ未実施。
+fn sweep_before_create(record: &StateRecord) -> SweepNote {
+    let Some(placement) = record.cgroup() else {
+        return sweep_note(Ok(ExecCgroupSweep::default()));
+    };
+    sweep_note(sweep_stale_exec_child_cgroups(
+        record.status().id(),
+        placement,
+    ))
+}
+
+fn sweep_note(result: Result<ExecCgroupSweep, ExecError>) -> SweepNote {
+    match result {
+        Ok(sweep) => SweepNote {
+            sweep,
+            failure: if sweep.failed > 0 {
+                Some(sweep.first_error.unwrap_or(ErrorCode::Internal))
+            } else {
+                None
+            },
+        },
+        Err(e) => {
+            let code = e.code;
+            SweepNote {
+                sweep: ExecCgroupSweep::default(),
+                failure: Some(code),
+            }
+        }
+    }
+}
+
+/// 掃除の結果を exec の結果へ併記する。成功時は `ExecOutcome::stale_exec_cgroups` に載せ（掃除自体の
+/// エラーは `failed` 1 以上・`first_error` で表す）、失敗時はメッセージへ併記する。黙って捨てない。
+fn attach_sweep(
+    result: Result<ExecOutcome, WorkerFailure>,
+    note: SweepNote,
+) -> Result<ExecOutcome, WorkerFailure> {
+    match result {
+        Ok(mut outcome) => {
+            let mut sweep = note.sweep;
+            sweep.failed = sweep.failed.max(usize::from(note.failure.is_some()));
+            sweep.first_error = note.failure.or(sweep.first_error);
+            outcome.stale_exec_cgroups = sweep;
+            Ok(outcome)
+        }
+        Err(mut failure) => {
+            if let Some(code) = note.failure {
+                failure.error = TraitError::new(
+                    failure.error.code(),
+                    format!(
+                        "{}; stale exec cgroup sweep also failed: {}",
+                        failure.error.message(),
+                        code.as_str()
+                    ),
+                );
+            }
+            Err(failure)
+        }
+    }
 }
 
 /// worker の失敗。拒否のエラーと、exec の対象の違反だった場合のその理由（監査記録の入力。#1465）。
@@ -1111,6 +1194,7 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
         seccomp_instructions,
         supplementary_groups,
         entrypoint_mode,
+        stale_exec_cgroups: ExecCgroupSweep::default(),
     })
 }
 
@@ -1197,6 +1281,7 @@ fn run_in_child_cgroup(
         seccomp_instructions,
         supplementary_groups,
         entrypoint_mode,
+        stale_exec_cgroups: ExecCgroupSweep::default(),
     })
 }
 
@@ -1599,6 +1684,40 @@ mod tests {
         assert_eq!(exit, ChildExit::Exited(0));
     }
 
+    /// SUP-6・REPAIR-3・#1596: exec 開始時の掃除の失敗は、exec の失敗メッセージへ併記され、成功時は結果に残る
+    /// （黙って捨てない）。失敗が無ければメッセージを変えない。
+    #[test]
+    fn sup6_1596_sweep_failure_is_attached_not_dropped() {
+        let note = SweepNote {
+            sweep: ExecCgroupSweep::default(),
+            failure: Some(ErrorCode::PermissionDenied),
+        };
+        let failure = attach_sweep(
+            Err(WorkerFailure::from(TraitError::new(
+                ErrorCode::Timeout,
+                "exec timed out",
+            ))),
+            note,
+        )
+        .unwrap_err();
+        assert_eq!(failure.error.code(), ErrorCode::Timeout);
+        assert_eq!(
+            failure.error.message(),
+            "exec timed out; stale exec cgroup sweep also failed: PERMISSION_DENIED"
+        );
+
+        let clean = sweep_note(Ok(ExecCgroupSweep::default()));
+        let failure = attach_sweep(
+            Err(WorkerFailure::from(TraitError::new(
+                ErrorCode::Timeout,
+                "exec timed out",
+            ))),
+            clean,
+        )
+        .unwrap_err();
+        assert_eq!(failure.error.message(), "exec timed out");
+    }
+
     /// SUP-6・REPAIR-5・TASK-163.4: 待機が `Timeout` 以外のエラーで失敗しても、子を停止・回収してから
     /// 元のエラーを返す。回収にも失敗したら両方のメッセージを含めて返す。
     #[test]
@@ -1643,6 +1762,7 @@ mod tests {
             seccomp_instructions: 120,
             supplementary_groups: SupplementaryGroups::Cleared { cleared: 4 },
             entrypoint_mode: EntrypointExecMode::SealedCopy,
+            stale_exec_cgroups: ExecCgroupSweep::default(),
         };
         let line = encode_worker_result(&Ok(outcome));
         assert_eq!(
@@ -1683,6 +1803,7 @@ mod tests {
         ] {
             let outcome = ExecOutcome {
                 entrypoint_mode: EntrypointExecMode::PinnedInode { reason },
+                stale_exec_cgroups: ExecCgroupSweep::default(),
                 ..outcome
             };
             let line = encode_worker_result(&Ok(outcome));
@@ -2018,6 +2139,7 @@ mod tests {
             seccomp_instructions: 120,
             supplementary_groups: SupplementaryGroups::Cleared { cleared: 0 },
             entrypoint_mode: EntrypointExecMode::SealedCopy,
+            stale_exec_cgroups: ExecCgroupSweep::default(),
         }
     }
 

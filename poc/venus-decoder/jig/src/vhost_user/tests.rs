@@ -408,3 +408,36 @@ fn f1_1_gpu6_two_stage_decode_matches_one_shot() {
         CodecErrorCode::LengthMismatch
     );
 }
+
+/// GET_CONFIG のエラー応答はヘッダ size = 0 の空ペイロードで往復できる（GPU-6 F1.1）。
+#[test]
+fn f1_1_gpu6_get_config_error_reply_is_empty_payload() {
+    let bytes = msg(24, 5, &[]);
+    assert_eq!(bytes, vec![24, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(Reply::ConfigError.encode().unwrap().as_bytes(), &bytes[..]);
+    assert_eq!(
+        decode_reply(&bytes, RequestCode::GetConfig).unwrap(),
+        Reply::ConfigError
+    );
+}
+
+/// SET_VRING_KICK / CALL は値検証より先に期待長（8 バイト）を照合する（LENGTH_MISMATCH → INVALID_VALUE）。
+#[test]
+fn f1_1_gpu6_vring_fd_length_before_value() {
+    for code in [12u32, 13] {
+        // 0x200 は不正値だが、ペイロードが 9 バイトなので LENGTH_MISMATCH が先。
+        let mut p = 0x200u64.to_le_bytes().to_vec();
+        p.push(0);
+        assert_eq!(
+            decode_request(&msg(code, 1, &p)).unwrap_err().code,
+            CodecErrorCode::LengthMismatch
+        );
+        // 長さが一致した不正値は INVALID_VALUE。
+        assert_eq!(
+            decode_request(&msg(code, 1, &0x200u64.to_le_bytes()))
+                .unwrap_err()
+                .code,
+            CodecErrorCode::InvalidValue
+        );
+    }
+}

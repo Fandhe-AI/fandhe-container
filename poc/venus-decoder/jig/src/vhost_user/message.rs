@@ -267,8 +267,8 @@ pub fn decode_request_payload(header: &Header, payload: &[u8]) -> Result<Decoded
         RequestCode::GetQueueNum => Request::GetQueueNum,
         RequestCode::SetFeatures => Request::SetFeatures(r.u64()?),
         RequestCode::SetProtocolFeatures => Request::SetProtocolFeatures(r.u64()?),
-        RequestCode::SetVringKick => Request::SetVringKick(VringFd::from_u64(r.u64()?, code)?),
-        RequestCode::SetVringCall => Request::SetVringCall(VringFd::from_u64(r.u64()?, code)?),
+        RequestCode::SetVringKick => Request::SetVringKick(read_vring_fd(&mut r, code)?),
+        RequestCode::SetVringCall => Request::SetVringCall(read_vring_fd(&mut r, code)?),
         RequestCode::SetVringNum => Request::SetVringNum(read_state(&mut r)?),
         RequestCode::SetVringBase => Request::SetVringBase(read_state(&mut r)?),
         RequestCode::GetVringBase => Request::GetVringBase(read_state(&mut r)?),
@@ -290,6 +290,14 @@ pub fn decode_request_payload(header: &Header, payload: &[u8]) -> Result<Decoded
         request,
         need_reply: header.need_reply(),
     })
+}
+
+/// VRING fd 要求のペイロード（u64）を読む。値検証より先に長さ（8 バイトちょうど）を照合する（LENGTH_MISMATCH → INVALID_VALUE）。
+fn read_vring_fd(r: &mut Reader, code: RequestCode) -> Result<VringFd, CodecError> {
+    if r.remaining() != 8 {
+        return Err(err(CodecErrorCode::LengthMismatch, code));
+    }
+    VringFd::from_u64(r.u64()?, code)
 }
 
 fn read_state(r: &mut Reader) -> Result<VringState, CodecError> {
@@ -422,8 +430,10 @@ pub enum Reply {
     QueueNum(u64),
     /// `GET_VRING_BASE` の応答。
     VringBase(VringState),
-    /// `GET_CONFIG` の応答。データ長 0 はエラー応答（rst の定め）として受理する。
+    /// `GET_CONFIG` の応答。
     Config(ConfigPayload),
+    /// `GET_CONFIG` のエラー応答（仕様どおりヘッダ size = 0 の空ペイロード）。
+    ConfigError,
 }
 
 impl Reply {
@@ -434,7 +444,7 @@ impl Reply {
             Self::ProtocolFeatures(_) => RequestCode::GetProtocolFeatures,
             Self::QueueNum(_) => RequestCode::GetQueueNum,
             Self::VringBase(_) => RequestCode::GetVringBase,
-            Self::Config(_) => RequestCode::GetConfig,
+            Self::Config(_) | Self::ConfigError => RequestCode::GetConfig,
         }
     }
 
@@ -444,12 +454,14 @@ impl Reply {
             Self::Features(_) | Self::ProtocolFeatures(_) | Self::QueueNum(_) => 8,
             Self::VringBase(_) => 8,
             Self::Config(c) => c.payload_len(),
+            Self::ConfigError => 0,
         };
         let header = Header::new(self.code(), true, false, len)?;
         EncodedMessage::build(&header, |w| match self {
             Self::Features(v) | Self::ProtocolFeatures(v) | Self::QueueNum(v) => w.u64(*v),
             Self::VringBase(s) => write_state(w, s),
             Self::Config(c) => c.write(w),
+            Self::ConfigError => Ok(()),
         })
     }
 }
@@ -477,6 +489,8 @@ pub fn decode_reply(buf: &[u8], expected: RequestCode) -> Result<Reply, CodecErr
         RequestCode::GetProtocolFeatures => Reply::ProtocolFeatures(r.u64()?),
         RequestCode::GetQueueNum => Reply::QueueNum(r.u64()?),
         RequestCode::GetVringBase => Reply::VringBase(read_state(&mut r)?),
+        // ペイロード長 0 は GET_CONFIG のエラー応答（仕様）。
+        RequestCode::GetConfig if payload.is_empty() => Reply::ConfigError,
         RequestCode::GetConfig => Reply::Config(ConfigPayload::read(&mut r, code)?),
         // 応答を返さない要求（SET_* 等）への応答は最小集合に無い。
         _ => return Err(err(CodecErrorCode::UnknownRequest, code)),

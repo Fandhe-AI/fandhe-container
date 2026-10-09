@@ -34,6 +34,7 @@
 
 use std::ffi::CStr;
 use std::io;
+use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::ptr::NonNull;
@@ -491,10 +492,10 @@ pub(crate) fn fcntl_add_seals(fd: BorrowedFd<'_>, seals: u32) -> Result<(), SysE
     check(ret).map(|_| ())
 }
 
-/// `mmap` した共有マッピング。`Drop` で `munmap` する。アドレスを `NonNull<u8>` で持ち、`NonNull` 自体が `!Send` / `!Sync`
-/// なので、この型と包む側（`GuestMemoryRegion` / `GuestMemory`）も `!Send` / `!Sync` になる（`unsafe impl` で付け足さない）。
-/// `copy_in` / `copy_out` は `&self` から非アトミックにコピーするため、複数スレッドから同じマッピングを使えないことが前提。
-/// この性質は `GuestMemory` の `compile_fail` doctest で照合する。
+/// `mmap` した共有マッピング。`Drop` で `munmap` する。`!Send` / `!Sync` で、包む側（`GuestMemoryRegion` /
+/// `GuestMemory`）も同じになる（`unsafe impl` で付け足さない）。`copy_in` / `copy_out` は `&self` から非アトミックに
+/// コピーするため、複数スレッドから同じマッピングを使えないことが前提。`NonNull<u8>` も `!Send` / `!Sync` だが、その性質に
+/// 頼らず生ポインタの marker（`_not_send_sync`）で明示する。この性質は `guest_memory` の `compile_fail` doctest で照合する。
 ///
 /// マッピングへの `&[u8]` / `&mut [u8]` は作らない。frontend / ゲストが同時に書き換える共有メモリへの参照は
 /// エイリアシング規則に反するため、境界検査したコピー（[`Self::copy_out`] / [`Self::copy_in`]）だけで出し入れする。
@@ -502,6 +503,8 @@ pub(crate) fn fcntl_add_seals(fd: BorrowedFd<'_>, seals: u32) -> Result<(), SysE
 pub(crate) struct MmapRegion {
     ptr: NonNull<u8>,
     len: usize,
+    /// `!Send` / `!Sync` を型の上で明示する marker（`*mut u8` は `Send` でも `Sync` でもない）。
+    _not_send_sync: PhantomData<*mut u8>,
 }
 
 impl MmapRegion {
@@ -532,6 +535,7 @@ impl MmapRegion {
         Ok(Self {
             ptr,
             len: len.get(),
+            _not_send_sync: PhantomData,
         })
     }
 

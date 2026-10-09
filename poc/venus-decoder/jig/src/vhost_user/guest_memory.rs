@@ -173,7 +173,7 @@ impl GuestMemoryRegion {
 
 /// `SET_MEM_TABLE` 全体のゲストメモリ。GPA から領域を引いてアクセスする。
 ///
-/// `!Send` / `!Sync`（マッピングを `NonNull<u8>` で持つため）。`read_at` / `write_at` は `&self` から非アトミックに
+/// `!Send` / `!Sync`（内部の `sys::MmapRegion` が生ポインタの marker を持つため）。`read_at` / `write_at` は `&self` から非アトミックに
 /// コピーするので、スレッド間で共有・移動できないことをコンパイル時に保証する（GPU-6）。
 ///
 /// ```compile_fail,E0277

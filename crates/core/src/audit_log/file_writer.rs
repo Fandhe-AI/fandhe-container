@@ -88,6 +88,12 @@ pub enum AuditWriteErrorKind {
     KernelAuditRejected,
     /// カーネル監査との送受信が I/O エラーで失敗した、または ACK の形式が不正だった。
     KernelAuditIo,
+    /// 主経路のファイル書き込みを隔離した子プロセスが期限内に終わらなかった（ストレージ停止等。
+    /// 子は SIGKILL で止め、代替経路へ進む。REPAIR-5・`FileAuditSink`）。
+    IsolationTimeout,
+    /// 主経路を隔離するプロセスを作れなかった（呼び出しプロセスが複数スレッドで fork できない等）。
+    /// 期限を保証できないため主経路は試行せず、代替経路へ進む（fail-closed。`FileAuditSink`）。
+    IsolationUnavailable,
 }
 
 impl AuditWriteErrorKind {
@@ -111,6 +117,8 @@ impl AuditWriteErrorKind {
             Self::KernelAuditTimeout => "kernel_audit_timeout",
             Self::KernelAuditRejected => "kernel_audit_rejected",
             Self::KernelAuditIo => "kernel_audit_io",
+            Self::IsolationTimeout => "isolation_timeout",
+            Self::IsolationUnavailable => "isolation_unavailable",
         }
     }
 }
@@ -147,9 +155,10 @@ impl AuditWriteError {
             AuditWriteErrorKind::NotRegularFile | AuditWriteErrorKind::InsecureFile => {
                 ErrorCode::PermissionDenied
             }
-            AuditWriteErrorKind::Lock | AuditWriteErrorKind::KernelAuditTimeout => {
-                ErrorCode::Timeout
-            }
+            AuditWriteErrorKind::Lock
+            | AuditWriteErrorKind::KernelAuditTimeout
+            | AuditWriteErrorKind::IsolationTimeout => ErrorCode::Timeout,
+            AuditWriteErrorKind::IsolationUnavailable => ErrorCode::Unavailable,
             // 環境上カーネル監査へ到達できない状態（未実装ではない）。`Unimplemented` と区別する。
             AuditWriteErrorKind::KernelAuditUnavailable => ErrorCode::Unavailable,
             AuditWriteErrorKind::KernelAuditPermissionDenied => ErrorCode::PermissionDenied,
@@ -185,6 +194,12 @@ impl AuditWriteError {
             }
             AuditWriteErrorKind::KernelAuditRejected => "kernel audit rejected the message",
             AuditWriteErrorKind::KernelAuditIo => "kernel audit exchange failed",
+            AuditWriteErrorKind::IsolationTimeout => {
+                "isolated audit log write did not finish within the time limit"
+            }
+            AuditWriteErrorKind::IsolationUnavailable => {
+                "audit log write could not be isolated in a bounded child process"
+            }
         }
     }
 }

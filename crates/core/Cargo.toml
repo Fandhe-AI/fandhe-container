@@ -133,6 +133,14 @@ name = "exec_child_setup"
 path = "tests/exec_child_setup.rs"
 harness = false
 
+# FileAuditSink の主経路・失敗通知の子プロセス隔離の結合試験（REPAIR-5・SEC-4・TASK-163 追補・#1594）。fork は
+# 単一スレッドの呼び出し元を要求するため harness = false。root・実カーネル監査は不要で、既定のテスト集合で実行する
+# （`exec-test-support` は上の自己参照で有効）。
+[[test]]
+name = "audit_sink_isolation"
+path = "tests/audit_sink_isolation.rs"
+harness = false
+
 [[test]]
 name = "default_devices"
 path = "tests/default_devices.rs"

@@ -905,7 +905,8 @@ pub fn run_in_worker_for_test(
 }
 
 /// worker の結果を pipe 用の 1 行へ符号化する。成功は `ok <command|setup> <違反の理由コードまたは -> <exited|signaled>
-/// <値> <rlimit 数> <capability 数> <Landlock 数> <seccomp 命令数> <補助グループの扱い> <その件数>`、失敗は
+/// <値> <適用した rlimit 数> <子へ持ち越した rlimit 数（0 か 1）> <capability 数> <Landlock 数> <seccomp 命令数>
+/// <補助グループの扱い> <その件数> <実行方式（sealed_copy|pinned_inode）> <現行方式の理由コードまたは ->`、失敗は
 /// `err <ERR-1 コード> <exec 対象の違反の理由コードまたは -> <メッセージ>`（改行は空白へ置換）。
 fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
     let line = match result {
@@ -1053,6 +1054,10 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
         it.next().and_then(|v| v.parse().ok()).ok_or_else(malformed)
     };
     let (rlimits_applied, rlimits_deferred) = (count()?, count()?);
+    // 持ち越すのは `RLIMIT_FSIZE` だけ（契約は 0 か 1）。範囲外は壊れた行として拒否する。
+    if rlimits_deferred > 1 {
+        return Err(malformed());
+    }
     let capability_bounding_dropped = count()?;
     let (landlock_rules, seccomp_instructions) = (count()?, count()?);
     let groups_kind = it.next().ok_or_else(malformed)?;
@@ -1768,6 +1773,13 @@ mod tests {
         assert_eq!(back.error.code(), ErrorCode::Timeout);
         assert_eq!(back.error.message(), "exec timed out before x");
 
+        // 対照: 持ち越した rlimit 数が 0・1 なら同じ欄の並びで復号できる（下の値域外の行は値だけで拒否される）。
+        for deferred in [0usize, 1] {
+            let line =
+                format!("ok command - exited 0 1 {deferred} 2 3 4 cleared 1 sealed_copy -\n");
+            let o = decode_worker_result(line.as_bytes()).expect("well-formed");
+            assert_eq!((o.rlimits_applied, o.rlimits_deferred), (1, deferred));
+        }
         for bad in [
             &b""[..],
             b"ok command - exited 0 1 0 2 3 4 cleared 1",
@@ -1783,6 +1795,10 @@ mod tests {
             b"ok command - exited 0 1 0 2 3 4 cleared 1 pinned_inode -\n",
             b"ok command - exited 0 1 0 2 3 4 cleared 1 pinned_inode lsm_mystery\n",
             b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy - extra\n",
+            // 持ち越した rlimit 数の値域外（契約は 0 か 1。欄はすべて揃っている）。
+            b"ok command - exited 0 1 2 2 3 4 cleared 1 sealed_copy -\n",
+            // 持ち越した rlimit 数の欄が無い旧形式（#1579 以前の行。値域の検査で拒否される）。
+            b"ok command - exited 0 1 2 3 4 cleared 1 sealed_copy -\n",
             // 旧形式（起動の別が無い）・未知の起動の別・コマンドの終了に違反が付く・子が返さない理由コード。
             b"ok exited 0 1 0 2 3 4 cleared 1 sealed_copy -\n",
             b"ok started - exited 0 1 0 2 3 4 cleared 1 sealed_copy -\n",

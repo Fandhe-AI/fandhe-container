@@ -17,10 +17,24 @@
 //! seal は取り消せないので、確認後に縮むことは無い。長さの検査は seal の確認後に行う。
 //! 領域をまたぐアクセスは `OUT_OF_BOUNDS` で拒否する（PoC の割り切り）。`userspace_addr` は vring アドレスの変換
 //! （F1.3 / F1.4）で使うので [`GuestMemoryRegion::userspace_addr`] で保持だけし、ここでは使わない。
+//!
+//! # 排他性（プロセス内の並行アクセスの封じ込め）
+//! 読み書きは `copy_nonoverlapping`（非アトミック）なので、プロセス内で同じ backing memory へ並行にアクセスできると
+//! データ競合になる。これを safe API だけでは起こせないよう、次の 2 つを保証する。
+//! - 領域の型は `!Send` / `!Sync`（1 領域は 1 スレッドからしか使えない）
+//! - backing file（`st_dev`・`st_ino`）のアクセス範囲（ファイル上の `[mmap_offset, mmap_offset + memory_size)`）ごとに、
+//!   生きている領域は 1 個だけ。重なる範囲を別の領域で map しようとすると mmap より前に `BACKING_IN_USE` で拒否する。
+//!   fd を複製（`dup`・`try_clone`・`/proc/self/fd` の再オープン）しても同じ inode なので同じ判定になる。
+//!   同じ memfd の重ならない範囲を別領域にする frontend（4 GiB 境界の上下で分ける等）は受け付ける
+//!
+//! frontend プロセスが同時に書き換えることは vhost-user の前提で、プロセス外の書き込みとして扱う（値が不定になるだけ）。
+//! アトミックなコピーへの置き換えは `copy_nonoverlapping`（U8）と別の unsafe になるため、承認を得るまで行わない。
 
 use std::fs::File;
 use std::num::NonZeroUsize;
 use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use super::MemRegion;
 use super::MemTable;
@@ -42,7 +56,64 @@ fn map_sys_oob(_: sys::SysError) -> TransportError {
     err(TransportErrorCode::OutOfBounds)
 }
 
+/// backing file 上のアクセス範囲（`[start, end)`。ファイルのバイトオフセット）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LeaseKey {
+    dev: u64,
+    ino: u64,
+    start: u64,
+    end: u64,
+}
+
+impl LeaseKey {
+    fn overlaps(&self, other: &Self) -> bool {
+        self.dev == other.dev
+            && self.ino == other.ino
+            && self.start < other.end
+            && other.start < self.end
+    }
+}
+
+/// 生きている領域のアクセス範囲の一覧（プロセス全体で 1 個）。件数は生きている領域の数で、それぞれが mmap を伴う。
+static LEASES: Mutex<Vec<LeaseKey>> = Mutex::new(Vec::new());
+
+fn leases() -> MutexGuard<'static, Vec<LeaseKey>> {
+    // 保持中に panic する処理は無いが、poison しても一覧そのものは整合しているのでそのまま使う。
+    LEASES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// アクセス範囲の占有。`Drop` で一覧から外す。
+#[derive(Debug)]
+struct Lease {
+    key: LeaseKey,
+}
+
+impl Lease {
+    /// 重なる範囲が生きていれば `BACKING_IN_USE`。確認と登録は同じロックの中で行う（確認後の割り込みを許さない）。
+    fn acquire(key: LeaseKey) -> Result<Self, TransportError> {
+        let mut list = leases();
+        if list.iter().any(|k| k.overlaps(&key)) {
+            return Err(err(TransportErrorCode::BackingInUse));
+        }
+        list.push(key);
+        Ok(Self { key })
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let mut list = leases();
+        // 重なりを拒否して登録するので、同じ key は一覧に 1 個しか無い。
+        if let Some(i) = list.iter().position(|k| *k == self.key) {
+            list.swap_remove(i);
+        }
+    }
+}
+
 /// map 済みのゲストメモリ領域 1 個。
+///
+/// `!Send` / `!Sync`（内部の `sys::MmapRegion` が生ポインタの marker を持つため）。同じ backing file の重なる範囲を
+/// 別の領域で同時に map できない（モジュール doc の「排他性」）。
 #[derive(Debug)]
 pub struct GuestMemoryRegion {
     map: MmapRegion,
@@ -50,6 +121,8 @@ pub struct GuestMemoryRegion {
     size: u64,
     map_offset: usize,
     userspace_addr: u64,
+    /// 宣言順で最後に drop する（`map` の munmap の後に範囲を解放する）。
+    _lease: Lease,
 }
 
 impl GuestMemoryRegion {
@@ -59,6 +132,7 @@ impl GuestMemoryRegion {
     /// - `guest_phys_addr + memory_size` と `mmap_offset + memory_size` が overflow しない（`INVALID_REGION`）
     /// - fd が `F_SEAL_SHRINK` つきで縮まない（`SHRINK_NOT_SEALED`。seal 非対応の fd の `EINVAL` もこれに含める）
     /// - ファイル長が map 長以上（`FILE_TOO_SHORT`。seal の確認後に検査する）
+    /// - 同じ backing file の重なる範囲を map している領域が生きていない（`BACKING_IN_USE`。mmap の直前に占有する）
     ///
     /// 結果と所要時間は観測カウンタに計上する（REPAIR-4。検証の拒否も失敗として数える）。
     pub fn map(file: &File, region: &MemRegion) -> Result<Self, TransportError> {
@@ -90,14 +164,19 @@ impl GuestMemoryRegion {
             }
             Err(e) => return Err(TransportError::from_sys(e)),
         }
-        let file_len = file
-            .metadata()
-            .map_err(|e| TransportError::from_io(&e))?
-            .len();
-        if file_len < map_len {
+        let meta = file.metadata().map_err(|e| TransportError::from_io(&e))?;
+        if meta.len() < map_len {
             return Err(err(TransportErrorCode::FileTooShort));
         }
         let non_zero = NonZeroUsize::new(map_len_usize).ok_or_else(bad)?;
+        // アクセスするのはファイル上の [mmap_offset, map_len) だけなので、その範囲を占有する。mmap が失敗すれば
+        // `lease` の Drop で解放される。
+        let lease = Lease::acquire(LeaseKey {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            start: region.mmap_offset,
+            end: map_len,
+        })?;
         let map =
             MmapRegion::map_shared(file.as_fd(), non_zero).map_err(TransportError::from_sys)?;
         Ok(Self {
@@ -106,6 +185,7 @@ impl GuestMemoryRegion {
             size: region.memory_size,
             map_offset,
             userspace_addr: region.userspace_addr,
+            _lease: lease,
         })
     }
 

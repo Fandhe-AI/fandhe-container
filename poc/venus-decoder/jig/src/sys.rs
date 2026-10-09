@@ -551,8 +551,10 @@ impl MmapRegion {
             return Err(SysError::Os(EINVAL));
         }
         // SAFETY: 上で `off + dst.len() <= self.len` を検査済みで、読み取り元 `ptr + off` は生きているマッピングの
-        // 範囲内。`dst` は排他的な Rust の借用でマッピングと重ならない（マッピングへの参照は作らない）。他プロセスが
-        // 同時に書き換え得るが、バイト列のコピーに限り値が不定になるだけでメモリ安全性は損なわない。
+        // 範囲内。`dst` は排他的な Rust の借用でマッピングと重ならない（マッピングへの参照は作らない）。
+        // プロセス内の並行アクセスは起きない: `MmapRegion` は `!Send` / `!Sync` で 1 スレッドに閉じ、同じ backing file の
+        // 重なる範囲を map する領域は `guest_memory` の占有一覧で同時に 1 個に限る（`BACKING_IN_USE`）。残る並行書き込みは
+        // frontend プロセスによるもので、バイト列のコピーに限り値が不定になるだけでメモリ安全性は損なわない。
         unsafe {
             std::ptr::copy_nonoverlapping(self.ptr.as_ptr().add(off), dst.as_mut_ptr(), dst.len())
         };
@@ -566,7 +568,8 @@ impl MmapRegion {
             return Err(SysError::Os(EINVAL));
         }
         // SAFETY: 上で `off + src.len() <= self.len` を検査済みで、書き込み先 `ptr + off` は `PROT_WRITE` で map した
-        // 生きているマッピングの範囲内。`src` は Rust の借用でマッピングと重ならない。
+        // 生きているマッピングの範囲内。`src` は Rust の借用でマッピングと重ならない。プロセス内の並行アクセスが
+        // 起きないことは `copy_out` と同じ（`!Send` / `!Sync` と `guest_memory` の占有一覧）。
         unsafe {
             std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.as_ptr().add(off), src.len())
         };

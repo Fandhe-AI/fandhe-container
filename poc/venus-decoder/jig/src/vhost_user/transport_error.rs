@@ -43,11 +43,14 @@ pub enum TransportErrorCode {
     OsError,
     /// 対応外のアーキテクチャ。
     Unsupported,
+    /// 同じ backing file の同じバイト範囲が、このプロセスの別の領域で map 済み（共有マッピングへの非アトミックな
+    /// アクセスがプロセス内で並行しないよう、範囲ごとに 1 領域だけを許す）。
+    BackingInUse,
 }
 
 impl TransportErrorCode {
     /// 全 code（添字は `as usize` と一致する。観測カウンタの添字に使う。REPAIR-4）。
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::TooManyFds,
         Self::ControlTruncated,
         Self::DataTruncated,
@@ -64,6 +67,7 @@ impl TransportErrorCode {
         Self::OutOfBounds,
         Self::OsError,
         Self::Unsupported,
+        Self::BackingInUse,
     ];
 
     /// 外部へ出す固定の code 文字列。
@@ -85,6 +89,7 @@ impl TransportErrorCode {
             Self::OutOfBounds => "OUT_OF_BOUNDS",
             Self::OsError => "OS_ERROR",
             Self::Unsupported => "UNSUPPORTED",
+            Self::BackingInUse => "BACKING_IN_USE",
         }
     }
 }
@@ -146,6 +151,9 @@ impl TransportError {
             TransportErrorCode::OutOfBounds => "access is outside the memory region",
             TransportErrorCode::OsError => "operating system error",
             TransportErrorCode::Unsupported => "unsupported architecture",
+            TransportErrorCode::BackingInUse => {
+                "backing memory range is already mapped by another region"
+            }
         }
     }
 }

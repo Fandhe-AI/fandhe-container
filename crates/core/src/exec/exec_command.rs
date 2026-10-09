@@ -205,6 +205,8 @@ pub fn spawn_exec_command(
         root,
         mut threads,
         owner_pid,
+        deferred_fsize,
+        seal_policy,
     } = ready.into_parts();
     if owner_pid != std::process::id() {
         return Err(ExecError::new(
@@ -222,7 +224,7 @@ pub fn spawn_exec_command(
     let pid = sys::fork_single_threaded_with(
         || threads.count() == Some(1),
         || match bind_to_parent_lifetime(own.as_fd()).and_then(|()| join_exec_cgroup(cgroup)) {
-            Ok(()) => exec_child_main(entry, &status_write),
+            Ok(()) => exec_child_main(entry, &status_write, deferred_fsize, seal_policy),
             // 何も書かずに終わる（親は「手順の途中で終了した」= コマンドは起動していない、と判定する）。
             Err(code) => code,
         },

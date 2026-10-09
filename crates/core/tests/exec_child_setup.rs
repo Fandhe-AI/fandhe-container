@@ -20,6 +20,18 @@
 //!   拒否し、報告は書かれない（symlink 経由・`/proc/thread-self/exe`・`PT_INTERP` がランタイム自身の ELF・
 //!   その ELF をインタープリタにするスクリプトも同様）。対照として、通常のシェルスクリプト（`#!/bin/sh`）は手順を通る
 //!
+//! - **封印した複製（#1531）**: 実行に使う fd は照合した本体の memfd 複製（seal 0x0F・リンク先 `/memfd:fandhe-exec-entrypoint
+//!   (deleted)`）で、照合の後に元のファイルを上書き・`rename` で差し替えても内容は変わらない（差し込み点
+//!   `observe_exec_child_setup_with`）。上限超過は違反 `entrypoint_copy_too_large`、`noexec` のマウント（`/proc`）上の
+//!   ファイルはカーネル版に依らず違反 `entrypoint_on_noexec_mount`、実行ビットのないスクリプトは Linux 6.14 以降で
+//!   `AT_EXECVE_CHECK` により違反なしで拒否する（6.14 未満は観測の入口が判定を省くため手順を通る。分岐ごとに具体値で照合）。
+//!   `noexec` の tmpfs を user namespace の中でマウントする場面は実機前提で、`-- --ignored` 指定時のみ実行する
+//! - **方式の切り替え（#1531。オーナー判断 2026-10-09）**: 封印した複製を使わない判定（現行方式）では、照合した元の
+//!   fd がそのまま実行に使われ、`noexec` のマウント上のファイルは同じ違反 `entrypoint_on_noexec_mount` で拒否される
+//!   （差し込み点 `observe_exec_child_setup_pinned`）
+//! - **持ち越した `RLIMIT_FSIZE`（#1531・SUP-12）**: 封印した複製を作り終えた後に適用され、持ち越し値より大きい本体でも
+//!   複製が完成し、適用後の soft・hard が持ち越し値と一致する。適用に失敗した子はコマンドを起動しない
+//!   （util-linux の `prlimit` で hard を下げた子を再実行して作る）
 //! - **`execve` 前の失敗の区別（#1460）**: 子が本番と同じ pipe で親へ知らせた内容から、「コマンドは起動して
 //!   いない」（終了コード 125〜127 と違反の理由）と「`execveat` の直前まで到達した」が区別される。子に残る fd が
 //!   その pipe と検査済みのエントリポイントの 2 本だけであること（継承 fd の後始末）も照合する
@@ -32,7 +44,7 @@
 //! - **補助グループ（#1457）**: launch・exec が共有する補助グループの消去を、使い捨ての子で実 syscall により通す
 //!   （非特権では `CAP_SETGID` が無いため拒否されること、root では消去されること）
 //!
-//! root・実コンテナ・user namespace は不要で、既定のテスト集合（`cargo test --workspace`・
+//! 既定の場面は root・実コンテナ・user namespace が不要で、既定のテスト集合（`cargo test --workspace`・
 //! `make test-integration`）で実行する。fork は呼び出しプロセスが単一スレッドであることを要求するため、
 //! libtest ではなく `harness = false` の単一スレッド `main` で動かす。非 Linux では対象外（OS 非該当）。
 
@@ -57,11 +69,27 @@ fn main() {
             linux::pty_child(std::path::Path::new(args.get(2).expect("work directory")));
         }
         Some(linux::GROUPS_CHILD) => linux::groups_child(),
+        Some(linux::FSIZE_RAISE_CHILD) => {
+            linux::fsize_raise_child(std::path::Path::new(args.get(2).expect("work directory")))
+        }
+        Some(linux::NOEXEC_MOUNT_CHILD) => {
+            linux::noexec_mount_child(std::path::Path::new(args.get(2).expect("work directory")))
+        }
         Some(linux::CLOSED_STDIO_CHILD) => linux::closed_stdio_child(
             std::path::Path::new(args.get(2).expect("work directory")),
             args.get(3).expect("closed fd list"),
         ),
-        _ => linux::run(),
+        _ => {
+            linux::run();
+            // 実機前提の場面（user namespace の中で tmpfs を `noexec` でマウントする）は `-- --ignored` 指定時のみ。
+            if args.iter().any(|a| a == "--ignored") {
+                linux::noexec_tmpfs_is_refused_in_a_user_namespace();
+            } else {
+                println!(
+                    "exec_child_setup: noexec tmpfs scenario ignored (real-machine test; run with `-- --ignored`, see AGENTS.md)"
+                );
+            }
+        }
     }
 }
 
@@ -73,11 +101,14 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::exec::{
-        ChildExit, ContainerEnv, ExecChildSetupReport, ExecCommand, ExecExit, StandardFd,
-        SupplementaryGroups, ViolationReason, clear_supplementary_groups_for_test,
-        close_standard_fds_for_test, observe_exec_child_setup,
+        ChildExit, ContainerEnv, ExecChildSetupReport, ExecCommand, ExecExit,
+        MAX_SEALED_COPY_BYTES, SealedCopyUnavailable, StandardFd, SupplementaryGroups,
+        ViolationReason, clear_supplementary_groups_for_test, close_standard_fds_for_test,
+        observe_exec_child_setup, observe_exec_child_setup_pinned, observe_exec_child_setup_with,
+        observe_exec_child_setup_with_fsize,
     };
     use fandhe_container_core::oci_runtime::parse_config_bytes;
+    use fandhe_container_core::rlimits::{Rlimit, RlimitKind};
     use fandhe_container_core::traits::ErrorCode;
 
     /// 疑似端末の下で再実行される子の再入フラグ（引数: 作業ディレクトリ）。
@@ -86,10 +117,24 @@ mod linux {
     pub const GROUPS_CHILD: &str = "--groups-child";
     /// 標準 fd を閉じた呼び出し側を作る使い捨ての子の再入フラグ（引数: 作業ディレクトリ・閉じる番号のコンマ区切り）。
     pub const CLOSED_STDIO_CHILD: &str = "--closed-stdio-child";
+    /// user namespace の中で `noexec` の tmpfs 上のエントリポイントを照合する子の再入フラグ（引数: 作業ディレクトリ）。
+    pub const NOEXEC_MOUNT_CHILD: &str = "--noexec-mount-child";
+    /// `RLIMIT_FSIZE` の hard を引き下げた状態で、引き上げる持ち越し値を渡す子の再入フラグ（引数: 作業ディレクトリ）。
+    pub const FSIZE_RAISE_CHILD: &str = "--fsize-raise-child";
+    /// [`FSIZE_RAISE_CHILD`] の子が照合を終えたことを標準出力で知らせる合図。
+    const FSIZE_RAISE_OK: &str = "fsize-raise-ok";
+    /// [`FSIZE_RAISE_CHILD`] の子を起動するときに `prlimit` で設定する `RLIMIT_FSIZE`（soft = hard）。
+    const FSIZE_LOWERED: u64 = 1024 * 1024;
+    /// `noexec` の tmpfs の子が照合を終えたことを標準出力で知らせる合図。
+    const NOEXEC_MOUNT_OK: &str = "noexec-mount-ok";
     /// 疑似端末の下の子が、照合を終えたことを知らせる合図ファイルの名前と内容。
     const PTY_OK: &str = "pty-ok";
     /// `ENXIO`（制御端末を持たないプロセスが `/dev/tty` を開いたときの errno。全アーキテクチャ共通の 6）。
     const ENXIO: i32 = 6;
+    /// 実行に使う fd（封印した複製）の `/proc/self/fd/N` のリンク先（#1531）。
+    const SEALED_COPY_LINK: &str = "/memfd:fandhe-exec-entrypoint (deleted)";
+    /// 封印した複製の `F_GET_SEALS`（`F_SEAL_SEAL|SHRINK|GROW|WRITE`）。
+    const SEALED_COPY_SEALS: u32 = 0x0F;
     /// `/dev/null` のデバイス番号 1:3 の `st_rdev`（glibc の `makedev(1, 3)`）。
     const NULL_RDEV: u64 = 0x103;
 
@@ -160,6 +205,11 @@ mod linux {
         session_is_detached_from_the_caller(&work.0, "report");
         child_has_no_controlling_terminal_under_a_pty(&work.0);
         runtime_interpreter_is_rejected_before_exec(&work.0);
+        executed_fd_is_a_sealed_copy_immune_to_replacement(&work.0);
+        sealed_copy_refusals_are_recorded(&work.0);
+        pinned_mode_runs_the_verified_fd_and_refuses_noexec(&work.0);
+        deferred_fsize_is_applied_after_the_copy(&work.0);
+        deferred_fsize_failure_does_not_start_the_command(&work.0);
         setup_failures_are_distinguished_from_command_exits(&work.0);
         inherited_fds_are_closed_except_the_status_pipe(&work.0);
         environment_comes_only_from_the_container_definition(&work.0);
@@ -380,6 +430,417 @@ mod linux {
         assert_eq!(report.stdio, [(true, NULL_RDEV); 3]);
     }
 
+    /// SUP-6・SEC-1・TASK-163 追補（#1531）: 実行に使う fd は、照合した内容の封印した複製（memfd・seal 0x0F）で、
+    /// 照合の後・`execveat` の前に元のファイルが書き換えられても内容は変わらない。
+    ///
+    /// `after_prepare`（手順がすべて終わった直後の差し込み点）で、元のファイルの inode を上書きし、
+    /// さらに別の内容のファイルを同じパスへ `rename` する。複製が無ければ、実行する fd の内容は書き換え後に
+    /// なる（元の inode の fd を実行するため）。
+    fn executed_fd_is_a_sealed_copy_immune_to_replacement(work: &Path) {
+        let original = b"#!/bin/sh\n# original\nexit 0\n";
+        let target = work.join("swap-target");
+        write_bytes(&target, original);
+        let replacement = work.join("swap-replacement");
+        write_bytes(&replacement, b"#!/bin/sh\n# replaced by rename\nexit 7\n");
+        let entry = ExecCommand::new(&target, ["swap"], &ContainerEnv::empty()).expect("command");
+        let report_path = work.join("report-swap");
+        let (t, r) = (target.clone(), replacement.clone());
+        let observation = observe_exec_child_setup_with(
+            &entry,
+            &report_path,
+            move || {
+                // (i) 照合した inode そのものを上書きする（コンテナ側が書き込める元のファイルの書き換え）。
+                fs::write(&t, b"#!/bin/sh\n# overwritten in place\nexit 9\n")
+                    .expect("overwrite the original in place");
+                // (ii) 同じパスを別のファイルへ差し替える。
+                fs::rename(&r, &t).expect("replace the path");
+            },
+            timeout(),
+        )
+        .expect("observe the exec child setup");
+        assert_eq!(
+            observation.exit,
+            ExecExit::Command(ChildExit::Exited(0)),
+            "swap"
+        );
+        let exec_fd = observation.report.expect("report").exec_fd;
+        // 実行する fd は差し替え前の内容のまま（具体値で照合）。
+        assert_eq!(exec_fd.head, original.to_vec());
+        assert_eq!(exec_fd.size, original.len() as u64);
+        assert_eq!(exec_fd.seals, Some(SEALED_COPY_SEALS));
+        assert_eq!(exec_fd.link, SEALED_COPY_LINK);
+        // 対照: 差し替えは実際に起きていて、元のパスの内容は変わっている。
+        assert_eq!(
+            fs::read(&target).expect("read the swapped path"),
+            b"#!/bin/sh\n# replaced by rename\nexit 7\n".to_vec()
+        );
+        // 対照: ELF（動的リンクの実バイナリ）も同じ手順を通り、複製のサイズが元と一致する。
+        let truth = ExecCommand::new("/bin/true", ["true"], &ContainerEnv::empty()).expect("cmd");
+        let report = observe_ok(&truth, work, "report-elf-copy");
+        assert_eq!(report.exec_fd.seals, Some(SEALED_COPY_SEALS));
+        assert_eq!(report.exec_fd.link, SEALED_COPY_LINK);
+        assert_eq!(
+            report.exec_fd.size,
+            fs::metadata("/bin/true").expect("stat /bin/true").len()
+        );
+        assert_eq!(&report.exec_fd.head[..4], b"\x7fELF");
+    }
+
+    /// SEC-4・SEC-1・SUP-6・TASK-163 追補（#1531）: 封印した複製の拒否は、子から親へ届く。上限超過は違反
+    /// `entrypoint_copy_too_large`、実行ビットのないファイルは違反ではない `PermissionDenied`（126）。
+    fn sealed_copy_refusals_are_recorded(work: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let env = ContainerEnv::empty();
+        // 上限を 1 バイト超える疎なファイル（ディスクを消費しない。内容の確認前に `st_size` で拒否される）。
+        let huge = work.join("huge");
+        let file = fs::File::create(&huge).expect("create the huge file");
+        file.set_len(MAX_SEALED_COPY_BYTES + 1).expect("set_len");
+        file.set_permissions(fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        drop(file);
+        let command = ExecCommand::new(&huge, ["huge"], &env).expect("command");
+        let observation = observe_exec_child_setup(&command, &work.join("report-huge"), timeout())
+            .expect("observe the exec child setup");
+        assert_eq!(
+            observation.exit,
+            ExecExit::SetupFailed {
+                exit: ChildExit::Exited(126),
+                violation: Some(ViolationReason::EntrypointCopyTooLarge),
+            }
+        );
+        assert_eq!(observation.report, None);
+        // 実行ビットのないスクリプト: 複製（memfd は実行可能）に写すと実行できてしまうため、複製の前に
+        // `AT_EXECVE_CHECK`（Linux 6.14+）で拒否する。観測の入口は 6.14 未満では判定を省くため、結果はカーネル版で
+        // 分かれる。どちらの分岐も具体値で照合する（本番は 6.14 未満なら事前の判定が封印した複製を選ばず、理由
+        // `kernel_too_old` を記録して現行方式で元の fd を実行するため、実行ビットのないファイルは通常の `execveat` が
+        // 拒否する。封印した複製の手順を必須の方針で直接呼んだ場合は core の単体テスト
+        // `sec1_task163_kernel_exec_check_gates_the_copy` が照合する）。
+        let plain = work.join("not-executable");
+        write_script(&plain, "#!/bin/sh\nexit 0\n");
+        fs::set_permissions(&plain, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
+        let command = ExecCommand::new(&plain, ["plain"], &env).expect("command");
+        let observation = observe_exec_child_setup(&command, &work.join("report-plain"), timeout())
+            .expect("observe the exec child setup");
+        if kernel_at_least(6, 14) {
+            assert_eq!(
+                observation.exit,
+                ExecExit::SetupFailed {
+                    exit: ChildExit::Exited(126),
+                    violation: None,
+                }
+            );
+            assert_eq!(observation.report, None);
+        } else {
+            assert_eq!(observation.exit, ExecExit::Command(ChildExit::Exited(0)));
+            assert_eq!(
+                observation.report.expect("report").exec_fd.seals,
+                Some(SEALED_COPY_SEALS)
+            );
+        }
+        // `noexec` のマウント上のファイル（非特権で作れないため、既存の `noexec` マウントである `/proc` 上の通常ファイル）:
+        // カーネル版に依らず、複製の前に違反 `entrypoint_on_noexec_mount`（126）で拒否される（#1531・SEC-1・SEC-4）。
+        assert!(
+            proc_is_mounted_noexec(),
+            "/proc must be mounted noexec for this scenario"
+        );
+        let on_noexec = ExecCommand::new("/proc/self/status", ["status"], &env).expect("command");
+        let observation =
+            observe_exec_child_setup(&on_noexec, &work.join("report-noexec"), timeout())
+                .expect("observe the exec child setup");
+        assert_eq!(
+            observation.exit,
+            ExecExit::SetupFailed {
+                exit: ChildExit::Exited(126),
+                violation: Some(ViolationReason::EntrypointOnNoexecMount),
+            }
+        );
+        assert_eq!(observation.report, None);
+    }
+
+    /// SUP-6・SEC-1・SEC-4・#1531（オーナー判断 2026-10-09「条件付き切り替え」）: 封印した複製を使わない判定（現行方式）
+    /// では、照合した元の fd がそのまま実行に使われ（`exec_fd` のリンク先が元のファイル・seal なし）、`noexec` の
+    /// マウント上のファイルは封印した複製のときと同じく違反 `entrypoint_on_noexec_mount`（126）で拒否される。
+    fn pinned_mode_runs_the_verified_fd_and_refuses_noexec(work: &Path) {
+        let env = ContainerEnv::empty();
+        let reason = SealedCopyUnavailable::KernelTooOld;
+        let shell = shell_entry();
+        let observation =
+            observe_exec_child_setup_pinned(&shell, &work.join("report-pinned"), reason, timeout())
+                .expect("observe the exec child setup");
+        assert_eq!(observation.exit, ExecExit::Command(ChildExit::Exited(0)));
+        let report = observation.report.expect("report");
+        let real = fs::canonicalize("/bin/sh").expect("canonicalize /bin/sh");
+        assert_eq!(report.exec_fd.link, real.to_string_lossy());
+        assert_eq!(report.exec_fd.seals, None);
+        assert_eq!(
+            report.exec_fd.size,
+            fs::metadata(&real).expect("stat /bin/sh").len()
+        );
+        assert!(
+            proc_is_mounted_noexec(),
+            "/proc must be mounted noexec for this scenario"
+        );
+        let on_noexec = ExecCommand::new("/proc/self/status", ["status"], &env).expect("command");
+        let observation = observe_exec_child_setup_pinned(
+            &on_noexec,
+            &work.join("report-pinned-noexec"),
+            reason,
+            timeout(),
+        )
+        .expect("observe the exec child setup");
+        assert_eq!(
+            observation.exit,
+            ExecExit::SetupFailed {
+                exit: ChildExit::Exited(126),
+                violation: Some(ViolationReason::EntrypointOnNoexecMount),
+            }
+        );
+        assert_eq!(observation.report, None);
+    }
+
+    /// SUP-12・SEC-1・TASK-163 追補（#1531）: 子へ持ち越した `RLIMIT_FSIZE` は、封印した複製を作り終えた後に適用される。
+    /// 持ち越し値（64 KiB）より大きい本体（256 KiB）でも複製が完成し（`SIGXFSZ`・`EFBIG` で止まらない）、`execveat` の
+    /// 直前の子の soft・hard は持ち越し値と一致する。適用を複製の前へ戻すと、この場面は複製の書き込みで失敗する。
+    fn deferred_fsize_is_applied_after_the_copy(work: &Path) {
+        const LIMIT: u64 = 64 * 1024;
+        const BODY: usize = 256 * 1024;
+        let path = work.join("fsize-large");
+        let mut content = b"#!/bin/sh\nexit 0\n".to_vec();
+        content.resize(BODY, b'#');
+        write_bytes(&path, &content);
+        let command = ExecCommand::new(&path, ["large"], &ContainerEnv::empty()).expect("command");
+        let fsize = Rlimit::new(RlimitKind::Fsize, LIMIT, LIMIT).expect("rlimit");
+        let observation = observe_exec_child_setup_with_fsize(
+            &command,
+            &work.join("report-fsize"),
+            fsize,
+            timeout(),
+        )
+        .expect("observe the exec child setup");
+        assert_eq!(observation.exit, ExecExit::Command(ChildExit::Exited(0)));
+        let report = observation.report.expect("report");
+        assert_eq!(report.fsize, (LIMIT, LIMIT));
+        assert_eq!(report.exec_fd.size, BODY as u64);
+        assert_eq!(report.exec_fd.seals, Some(SEALED_COPY_SEALS));
+        assert_eq!(report.exec_fd.link, SEALED_COPY_LINK);
+    }
+
+    /// SUP-12・SEC-1・TASK-163 追補（#1531）: 持ち越した `RLIMIT_FSIZE` の適用に失敗したら、子はコマンドを起動しない。
+    /// util-linux の `prlimit` で hard を [`FSIZE_LOWERED`] へ下げた子を再実行し、その 2 倍の持ち越し値（hard の
+    /// 引き上げ。`CAP_SYS_RESOURCE` が要る）を渡す。`CAP_SYS_RESOURCE` を持たない子（hosted runner）では
+    /// `SetupFailed`（125・違反なし）で報告は書かれない。持つ子（root）では引き上げが成功し、適用後の値が一致する。
+    fn deferred_fsize_failure_does_not_start_the_command(work: &Path) {
+        let exe = std::env::current_exe().expect("current_exe");
+        let limit = format!("--fsize={FSIZE_LOWERED}:{FSIZE_LOWERED}");
+        let mut child = Command::new("prlimit")
+            .arg(&limit)
+            .arg("--")
+            .arg(&exe)
+            .arg(FSIZE_RAISE_CHILD)
+            .arg(work)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn prlimit (util-linux)");
+        let deadline = Instant::now() + timeout();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the fsize child did not exit within {:?}", timeout());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let (mut stdout, mut stderr) = (String::new(), String::new());
+        {
+            use std::io::Read as _;
+            if let Some(mut out) = child.stdout.take() {
+                let _ = out.read_to_string(&mut stdout);
+            }
+            if let Some(mut err) = child.stderr.take() {
+                let _ = err.read_to_string(&mut stderr);
+            }
+        }
+        assert!(
+            status.success() && stdout.lines().any(|l| l == FSIZE_RAISE_OK),
+            "fsize child failed: status {status:?}, stdout {stdout}, stderr {stderr}"
+        );
+    }
+
+    /// [`deferred_fsize_failure_does_not_start_the_command`] が `prlimit` の下で再実行する子。
+    pub fn fsize_raise_child(work: &Path) {
+        let limits = fs::read_to_string("/proc/self/limits").expect("read limits");
+        let lowered = limits
+            .lines()
+            .find(|l| l.starts_with("Max file size"))
+            .expect("Max file size line");
+        assert!(
+            lowered
+                .split_whitespace()
+                .filter(|v| *v == FSIZE_LOWERED.to_string())
+                .count()
+                == 2,
+            "prlimit must have lowered RLIMIT_FSIZE: {lowered}"
+        );
+        let raised = FSIZE_LOWERED * 2;
+        let command = shell_entry();
+        let fsize = Rlimit::new(RlimitKind::Fsize, raised, raised).expect("rlimit");
+        let observation = observe_exec_child_setup_with_fsize(
+            &command,
+            &work.join("report-fsize-raise"),
+            fsize,
+            timeout(),
+        )
+        .expect("observe the exec child setup");
+        if has_cap_sys_resource() {
+            assert_eq!(observation.exit, ExecExit::Command(ChildExit::Exited(0)));
+            assert_eq!(observation.report.expect("report").fsize, (raised, raised));
+        } else {
+            assert_eq!(
+                observation.exit,
+                ExecExit::SetupFailed {
+                    exit: ChildExit::Exited(125),
+                    violation: None,
+                }
+            );
+            assert_eq!(observation.report, None);
+        }
+        println!("{FSIZE_RAISE_OK}");
+    }
+
+    /// 自プロセスの実効 capability に `CAP_SYS_RESOURCE`（24）があるか（`/proc/self/status` の `CapEff`）。
+    fn has_cap_sys_resource() -> bool {
+        let status = fs::read_to_string("/proc/self/status").expect("read status");
+        let hex = status
+            .lines()
+            .find_map(|l| l.strip_prefix("CapEff:"))
+            .expect("CapEff")
+            .trim();
+        let caps = u64::from_str_radix(hex, 16).expect("CapEff hex");
+        caps & (1 << 24) != 0
+    }
+
+    /// `/proc/self/mountinfo` で、`/proc` のマウントが `noexec` か（最上位のマウントの 6 列目）。
+    fn proc_is_mounted_noexec() -> bool {
+        let text = fs::read_to_string("/proc/self/mountinfo").expect("read mountinfo");
+        text.lines()
+            .rev()
+            .find_map(|line| {
+                let mut cols = line.split(' ');
+                let point = cols.nth(4)?;
+                let opts = cols.next()?;
+                (point == "/proc").then(|| opts.split(',').any(|o| o == "noexec"))
+            })
+            .expect("/proc is mounted")
+    }
+
+    /// 実行中のカーネルが `major.minor` 以上か（`/proc/sys/kernel/osrelease`。判定対象の syscall とは独立の基準）。
+    fn kernel_at_least(major: u32, minor: u32) -> bool {
+        let text = fs::read_to_string("/proc/sys/kernel/osrelease").expect("read osrelease");
+        let mut parts = text.trim().split(['.', '-']);
+        let got_major: u32 = parts.next().and_then(|v| v.parse().ok()).expect("major");
+        let got_minor: u32 = parts.next().and_then(|v| v.parse().ok()).expect("minor");
+        (got_major, got_minor) >= (major, minor)
+    }
+
+    /// SEC-1・SEC-4・SUP-6・TASK-163 追補（#1531）の実機前提の場面: user namespace と mount namespace を作り
+    /// （util-linux の `unshare --user --map-root-user --mount`。root、または非特権 user namespace を許可するホストが要る）、
+    /// その中で tmpfs を `noexec` と通常の 2 つでマウントした子を再実行し、`noexec` の tmpfs 上の 0755 のスクリプトが
+    /// 違反 `entrypoint_on_noexec_mount` で拒否され、通常の tmpfs 上の同じスクリプトは封印した複製まで進むことを
+    /// 照合する。`-- --ignored` 指定時のみ実行する（ホストのマウントは変えない。namespace は子の終了で消える）。
+    pub fn noexec_tmpfs_is_refused_in_a_user_namespace() {
+        let work = WorkDir::create("noexec-mount");
+        for sub in ["noexec", "exec"] {
+            fs::create_dir(work.0.join(sub)).expect("mkdir mount point");
+        }
+        // `$1` は作業ディレクトリ、`$2` は本バイナリ、`$3` は再入フラグ（いずれも引数で渡し、シェルの文字列へ連結しない）。
+        let script = r#"set -e
+mount -t tmpfs -o noexec,mode=0755 tmpfs "$1/noexec"
+mount -t tmpfs -o mode=0755 tmpfs "$1/exec"
+exec "$2" "$3" "$1""#;
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut child = Command::new("unshare")
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--propagation",
+                "private",
+                "sh",
+                "-c",
+                script,
+                "sh",
+            ])
+            .arg(&work.0)
+            .arg(&exe)
+            .arg(NOEXEC_MOUNT_CHILD)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn unshare (util-linux)");
+        let deadline = Instant::now() + timeout();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the noexec mount child did not exit within {:?}", timeout());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        {
+            use std::io::Read as _;
+            if let Some(mut out) = child.stdout.take() {
+                let _ = out.read_to_string(&mut stdout);
+            }
+            if let Some(mut err) = child.stderr.take() {
+                let _ = err.read_to_string(&mut stderr);
+            }
+        }
+        assert!(
+            status.success() && stdout.lines().any(|l| l == NOEXEC_MOUNT_OK),
+            "noexec mount child failed: status {status:?}, stdout {stdout}, stderr {stderr}"
+        );
+        println!("exec_child_setup: noexec tmpfs scenario passed");
+    }
+
+    /// [`noexec_tmpfs_is_refused_in_a_user_namespace`] が namespace の中で再実行する子。
+    pub fn noexec_mount_child(work: &Path) {
+        let env = ContainerEnv::empty();
+        let body = "#!/bin/sh\nexit 0\n";
+        let on_noexec = work.join("noexec").join("script");
+        write_script(&on_noexec, body);
+        let command = ExecCommand::new(&on_noexec, ["script"], &env).expect("command");
+        let observation =
+            observe_exec_child_setup(&command, &work.join("report-noexec"), timeout())
+                .expect("observe the exec child setup");
+        assert_eq!(
+            observation.exit,
+            ExecExit::SetupFailed {
+                exit: ChildExit::Exited(126),
+                violation: Some(ViolationReason::EntrypointOnNoexecMount),
+            }
+        );
+        assert_eq!(observation.report, None);
+        // 対照: `noexec` でない tmpfs 上の同じスクリプトは手順を通り、封印した複製を実行する fd にする。
+        let on_exec = work.join("exec").join("script");
+        write_script(&on_exec, body);
+        let command = ExecCommand::new(&on_exec, ["script"], &env).expect("command");
+        let report = observe_ok(&command, work, "report-exec");
+        assert_eq!(report.exec_fd.seals, Some(SEALED_COPY_SEALS));
+        assert_eq!(report.exec_fd.link, SEALED_COPY_LINK);
+        println!("{NOEXEC_MOUNT_OK}");
+    }
+
     /// SUP-6・REPAIR-3・TASK-163 追補（#1460）: `execveat` より前の失敗は、終了コード（125〜127。コマンド自身も
     /// 返し得る）ではなく、子が pipe で知らせた内容で「コマンドは起動していない」と判定される。
     fn setup_failures_are_distinguished_from_command_exits(work: &Path) {
@@ -438,10 +899,15 @@ mod linux {
             targets.iter().any(|t| t.starts_with("pipe:[")),
             "the status pipe must remain: {fds:?}"
         );
+        // 実行に使う fd は、照合したエントリポイントの封印した複製（#1531）。元のファイルの fd は残らない。
+        assert!(
+            targets.contains(&SEALED_COPY_LINK),
+            "the sealed copy of the entrypoint must remain: {fds:?}"
+        );
         let shell = fs::canonicalize("/bin/sh").expect("canonicalize /bin/sh");
         assert!(
-            targets.contains(&shell.to_str().expect("utf-8 path")),
-            "the verified entrypoint must remain: {fds:?}"
+            !targets.contains(&shell.to_str().expect("utf-8 path")),
+            "the original entrypoint fd must be closed: {fds:?}"
         );
         assert!(
             !targets.iter().any(|t| t.contains("/status")),
@@ -732,10 +1198,8 @@ mod linux {
         if fds.len() != 2 || fds.iter().any(|(fd, _)| *fd < 3) {
             return Err(format!("expected 2 fds all >= 3: {fds:?}"));
         }
-        let shell = fs::canonicalize("/bin/sh").map_err(|e| e.to_string())?;
-        let shell = shell.to_string_lossy();
         let has_pipe = fds.iter().any(|(_, t)| t.starts_with("pipe:["));
-        let has_shell = fds.iter().any(|(_, t)| *t == shell);
+        let has_shell = fds.iter().any(|(_, t)| t == SEALED_COPY_LINK);
         if !(has_pipe && has_shell) {
             return Err(format!(
                 "expected the status pipe and the entrypoint: {fds:?}"

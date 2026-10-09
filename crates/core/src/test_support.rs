@@ -54,6 +54,27 @@ impl Drop for TestTempDir {
     }
 }
 
+/// 実行中のカーネルの版が `major.minor` 以上か（`/proc/sys/kernel/osrelease`。Linux のみ。TASK-163 追補・#1531）。
+///
+/// `AT_EXECVE_CHECK`（6.14+）のようにカーネル版で結果が分かれる試験が、両方の分岐で具体値を照合するための
+/// 独立した基準に使う（判定対象の syscall の結果からは導かない）。読めない・解釈できない版は panic する
+/// （試験の前提が崩れたことを黙って片方の分岐に倒さない）。
+#[cfg(target_os = "linux")]
+pub(crate) fn kernel_at_least(major: u32, minor: u32) -> bool {
+    let text =
+        std::fs::read_to_string("/proc/sys/kernel/osrelease").expect("read the kernel release");
+    let (got_major, got_minor) = parse_release(&text).expect("parse the kernel release");
+    (got_major, got_minor) >= (major, minor)
+}
+
+/// `6.14.0-1-generic` 形式の先頭 2 要素を数値で返す（純関数）。
+fn parse_release(text: &str) -> Option<(u32, u32)> {
+    let mut parts = text.trim().split(['.', '-']);
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
 /// 時刻と OS 乱数で初期化される `RandomState` から 64bit 値を作る（暗号強度は不要）。
 fn random_u64(seq: u64) -> u64 {
     let mut h = RandomState::new().build_hasher();
@@ -111,6 +132,16 @@ mod tests {
             .map(|s| s.to_string())
             .collect::<Vec<_>>()
             .into_iter()
+    }
+
+    /// SEC-1・#1531: カーネル版の解釈（先頭 2 要素）の具体値。解釈できない版は `None`。
+    #[test]
+    fn sec1_task163_parse_release_reads_major_and_minor() {
+        assert_eq!(parse_release("6.14.0-1-generic\n"), Some((6, 14)));
+        assert_eq!(parse_release("7.0.0-34-generic"), Some((7, 0)));
+        assert_eq!(parse_release("6.8-rc1"), Some((6, 8)));
+        assert_eq!(parse_release("garbage"), None);
+        assert_eq!(parse_release(""), None);
     }
 
     /// 先置きの名前を指す候補を先頭に流し、事前ディレクトリを消さず別名で作ることを照合する。

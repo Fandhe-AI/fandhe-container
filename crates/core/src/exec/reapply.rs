@@ -159,10 +159,12 @@ use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
+use super::entrypoint_mode::EntrypointExecMode;
 use super::landlock::landlock_ruleset_from_config;
 #[cfg(feature = "exec-test-support")]
 use super::landlock::{LandlockAccessProbe, run_probe};
-use super::rlimits::{apply_rlimits, parse_proc_limits};
+use super::rlimits::{apply_rlimits, parse_proc_limits, widen_fsize_for_copy};
+use super::sealed_copy::SealPolicy;
 use super::setns::{NsIdentity, cgroup_path_matches, read_bounded_from};
 use super::{
     ExecError, ExecWorkerProof, IsolationStage, Pid1Target, StageKind, SupplementaryGroups,
@@ -170,7 +172,7 @@ use super::{
 };
 use crate::landlock::LandlockRuleset;
 use crate::oci_runtime::{OciConfig, RootfsDir};
-use crate::rlimits::Rlimits;
+use crate::rlimits::{Rlimit, RlimitKind, Rlimits};
 use crate::sys;
 use crate::traits::types::ErrorCode;
 
@@ -208,6 +210,9 @@ pub struct ExecRestrictions {
     /// namespace へ参加する前に補助グループを空にした結果（[`prepare_exec_restrictions`] が行う。#1457）。
     /// 観測用の経路・単体テストが直接組み立てた値では `None`（参加前の消去をしていない）。
     groups_before_join: Option<SupplementaryGroups>,
+    /// 封印した複製が元のファイルの実行時ポリシー（複製では維持できない LSM・`AT_EXECVE_CHECK` の要否）を
+    /// 迂回しないかの判定材料。`setns` の前（ホスト側の securityfs が見えるうち）に作る（#1531）。
+    seal_policy: SealPolicy,
 }
 
 /// 制限を exec の対象（pid1）へ束縛する材料（SUP-6・SEC-1・TASK-163.4）。
@@ -224,6 +229,15 @@ struct TargetBinding {
     /// 対象のコンテナ cgroup（`Pid1Target::open` が記録から組み立てた期待パス）。cgroup 参加後の自プロセスの
     /// 所属と完全一致を照合する。
     expected_cgroup: String,
+}
+
+impl ExecRestrictions {
+    /// エントリポイントの実行方式の判定結果（`setns` の前に判定済み。封印した複製か現行方式と、その理由。
+    /// オーナー判断 2026-10-09「条件付き切り替え」・#1531・REPAIR-4）。supervisor が構造化ログと `ExecOutcome` に
+    /// 残すために読む。
+    pub fn entrypoint_mode(&self) -> EntrypointExecMode {
+        self.seal_policy.mode()
+    }
 }
 
 impl std::fmt::Debug for ExecRestrictions {
@@ -276,6 +290,11 @@ struct ExecCarry {
     threads: ThreadCountSource,
     /// 適用したプロセス。別プロセス（fork した子等）が exec の入口を呼べないようにする。
     owner_pid: u32,
+    /// 子へ持ち越す `RLIMIT_FSIZE`（#1531）。封印した複製の書き込みが `RLIMIT_FSIZE`（0 や小さい値）で失敗
+    /// しないよう、exec プロセスには載せず、子が複製を完成させた後・`execveat` の前に適用する。
+    deferred_fsize: Option<Rlimit>,
+    /// 子が封印した複製を作る前に参照する判定材料（[`ExecRestrictions`] から持ち越す。#1531）。
+    seal_policy: SealPolicy,
 }
 
 impl std::fmt::Debug for ExecCarry {
@@ -289,7 +308,9 @@ impl std::fmt::Debug for ExecCarry {
 
 /// [`reapply_restrictions`] の成功結果（将来拡張できる構造。制限適用の証跡ではない。REPAIR-3）。
 ///
-/// 成功は「rlimit・capability 削減・`NO_NEW_PRIVS`・Landlock・seccomp を載せた」ことを表す。exec してよい
+/// 成功は「rlimit・capability 削減・`NO_NEW_PRIVS`・Landlock・seccomp を載せた」ことを表す。ただし `RLIMIT_FSIZE` だけは
+/// この exec プロセスには載せず子へ持ち越す（[`rlimits_deferred`](Self::rlimits_deferred)。#1531）。持ち越した値は
+/// exec の子が `execveat` の前に必ず適用して読み戻し、失敗すればコマンドを起動しない（`SetupFailed`）。exec してよい
 /// ことの証跡は [`ExecReady`] で、[`into_complete`](Self::into_complete) だけが作る（未適用の一覧
 /// [`unapplied`](Self::unapplied) が空のときのみ）。
 ///
@@ -330,6 +351,7 @@ pub struct ExecRestrictionReport {
     landlock_rules: usize,
     seccomp_instructions: usize,
     rlimits_applied: usize,
+    rlimits_deferred: usize,
     capability_bounding_dropped: usize,
     supplementary_groups: Option<SupplementaryGroups>,
     unapplied: &'static [UnappliedExecRestriction],
@@ -345,14 +367,28 @@ impl ExecRestrictionReport {
         self.landlock_rules
     }
 
+    /// exec の子が使うエントリポイントの実行方式（[`ExecRestrictions::entrypoint_mode`] と同じ判定。#1531）。
+    pub fn entrypoint_mode(&self) -> EntrypointExecMode {
+        self.carry.seal_policy.mode()
+    }
+
     /// 適用した seccomp の BPF 命令数。
     pub fn seccomp_instructions(&self) -> usize {
         self.seccomp_instructions
     }
 
-    /// 適用した rlimit の種別数（対象の `limits` から読んだ全 16 種）。
+    /// この exec プロセスへ適用した rlimit の種別数（対象の `limits` から読んだ全 16 種のうち、子へ持ち越した
+    /// `RLIMIT_FSIZE` を除いたもの。通常は 15）。
     pub fn rlimits_applied(&self) -> usize {
         self.rlimits_applied
+    }
+
+    /// 子へ持ち越した rlimit の種別数（`RLIMIT_FSIZE`。0 か 1。#1531）。exec プロセスには載せず（封印した複製の書き込みを
+    /// 妨げないため。複製の期間だけ soft・hard を広げる）、exec の子が `execveat` の前（封印した複製を使うときはその
+    /// 完成後）に適用して読み戻す。子での適用に失敗すればコマンドは起動せず `SetupFailed` になる。
+    /// [`rlimits_applied`](Self::rlimits_applied) との和が対象の rlimit の種別数。
+    pub fn rlimits_deferred(&self) -> usize {
+        self.rlimits_deferred
     }
 
     /// capability 削減で bounding set から落とした capability の数。
@@ -371,7 +407,8 @@ impl ExecRestrictionReport {
         self.unapplied
     }
 
-    /// launch 経路と同じ制限がすべて載ったか（未適用が残る間は `false`）。
+    /// launch 経路と同じ制限がすべて載ったか（未適用が残る間は `false`）。持ち越した `RLIMIT_FSIZE`
+    /// （[`rlimits_deferred`](Self::rlimits_deferred)）は、exec の子が `execveat` の前に必ず適用する前提で完了に含める。
     /// 判定を見るだけの補助で、exec の許可には [`into_complete`](Self::into_complete) の証跡を使うこと。
     pub fn is_complete(&self) -> bool {
         self.unapplied.is_empty()
@@ -396,7 +433,8 @@ impl ExecRestrictionReport {
     }
 }
 
-/// 「launch 経路と同じ制限がすべて exec プロセスへ載った」ことの証跡（SUP-6・SEC-1）。
+/// 「launch 経路と同じ制限がすべて exec プロセスへ載った」ことの証跡（SUP-6・SEC-1）。`RLIMIT_FSIZE` だけは子へ持ち越して
+/// おり（[`ExecRestrictionReport::rlimits_deferred`]）、この証跡を受け取った exec の子が `execveat` の前に適用する。
 ///
 /// [`ExecRestrictionReport::into_complete`] だけが作る。フィールドは非公開で、公開コンストラクタ・`Clone`・
 /// `Default` を持たないため、crate の外では構築も複製もできない。照合済みの `/` の fd と、`setns` 前に
@@ -426,11 +464,15 @@ impl ExecReady {
             root,
             threads,
             owner_pid,
+            deferred_fsize,
+            seal_policy,
         } = self.carry;
         ExecReadyParts {
             root,
             threads,
             owner_pid,
+            deferred_fsize,
+            seal_policy,
         }
     }
 
@@ -442,6 +484,8 @@ impl ExecReady {
                 root,
                 threads,
                 owner_pid,
+                deferred_fsize: None,
+                seal_policy: SealPolicy::unrestricted(),
             },
         }
     }
@@ -452,6 +496,10 @@ pub(super) struct ExecReadyParts {
     pub(super) root: OwnedFd,
     pub(super) threads: ThreadCountSource,
     pub(super) owner_pid: u32,
+    /// 子が複製の完成後に適用する `RLIMIT_FSIZE`（[`ExecCarry::deferred_fsize`]）。
+    pub(super) deferred_fsize: Option<Rlimit>,
+    /// 子が封印した複製を作る前に参照する判定材料（[`ExecCarry::seal_policy`]）。
+    pub(super) seal_policy: SealPolicy,
 }
 
 /// `config`（コンテナの `config.json`）から Landlock ruleset を作り、参加後の `/` と照合する rootfs・
@@ -660,6 +708,7 @@ fn prepare_with_rootfs(
     binding: TargetBinding,
 ) -> Result<ExecRestrictions, ExecError> {
     let landlock = landlock_ruleset_from_config(config)?;
+    let seal_policy = SealPolicy::probe();
     let status_error =
         |what: &'static str| ExecError::new(ErrorCode::Internal, IsolationStage::Landlock, what);
     let file = std::fs::File::open("/proc/self/status")
@@ -677,6 +726,7 @@ fn prepare_with_rootfs(
         rlimits,
         binding,
         groups_before_join: None,
+        seal_policy,
     })
 }
 
@@ -780,6 +830,7 @@ fn reapply_inner(
         rlimits,
         binding,
         groups_before_join,
+        seal_policy,
     } = restrictions;
     if owner_pid != std::process::id() {
         return Err(ExecError::new(
@@ -796,8 +847,17 @@ fn reapply_inner(
     let root = open_verified_root(rootfs.as_fd())?;
     // 観測用の空集合では syscall を呼ばず、下で未適用の一覧へ `Rlimits` を載せる。通常は全 16 種が入る。
     let rlimits_skipped = rlimits.is_empty();
+    // `RLIMIT_FSIZE` だけは子へ持ち越す（封印した複製の書き込みを妨げない。#1531）。実効値は子が複製の完成後・
+    // `execveat` の前に適用し、読み戻して確認する。件数は適用済み（`rlimits_applied`）と持ち越し
+    // （`rlimits_deferred`）に分けて報告する。
+    let (immediate, deferred_fsize) = split_deferred_fsize(&rlimits)?;
     if !rlimits_skipped {
-        apply_rlimits(&rlimits).map_err(|e| e.at_stage(IsolationStage::Rlimits))?;
+        apply_rlimits(&immediate).map_err(|e| e.at_stage(IsolationStage::Rlimits))?;
+        // 複製の期間に必要な soft・hard を、`CAP_SYS_RESOURCE` を落とす前の今ここで確保する。子が複製の後に
+        // 適用する値は引き下げだけになり、特権を要さない（#1531）。
+        if let Some(fsize) = &deferred_fsize {
+            widen_fsize_for_copy(fsize).map_err(|e| e.at_stage(IsolationStage::Rlimits))?;
+        }
     }
     // capability 削減は、先頭で補助グループも空にする（launch 経路と同じ関数。#1457）。
     let capabilities = if drop_capabilities {
@@ -825,7 +885,8 @@ fn reapply_inner(
     Ok(ExecRestrictionReport {
         landlock_rules: landlock.rules_added,
         seccomp_instructions: seccomp.instructions,
-        rlimits_applied: rlimits.len(),
+        rlimits_applied: if rlimits_skipped { 0 } else { immediate.len() },
+        rlimits_deferred: usize::from(deferred_fsize.is_some()),
         capability_bounding_dropped,
         supplementary_groups,
         // launch 経路の段の順（`Rlimits` → `CapabilityDrop`）で並べる。
@@ -842,8 +903,31 @@ fn reapply_inner(
             root,
             threads,
             owner_pid,
+            deferred_fsize,
+            seal_policy,
         },
     })
+}
+
+/// `rlimits` を「いま適用する集合」と「子へ持ち越す `RLIMIT_FSIZE`」に分ける（#1531）。
+fn split_deferred_fsize(rlimits: &Rlimits) -> Result<(Rlimits, Option<Rlimit>), ExecError> {
+    let deferred = rlimits
+        .iter()
+        .find(|r| r.kind() == RlimitKind::Fsize)
+        .copied();
+    let rest = rlimits
+        .iter()
+        .filter(|r| r.kind() != RlimitKind::Fsize)
+        .copied()
+        .collect();
+    let rest = Rlimits::new(rest).map_err(|_| {
+        ExecError::new(
+            ErrorCode::Internal,
+            IsolationStage::Rlimits,
+            "failed to split the rlimits",
+        )
+    })?;
+    Ok((rest, deferred))
 }
 
 /// [`observe_exec_restriction_reapply`] の観測結果。errno は成功を `None`、失敗を `Some(errno)`（不明は `-1`）。
@@ -1010,6 +1094,7 @@ mod tests {
             rlimits: one_rlimit(),
             binding: own_binding(),
             groups_before_join: None,
+            seal_policy: SealPolicy::unrestricted(),
         }
     }
 
@@ -1043,6 +1128,7 @@ mod tests {
             landlock_rules: 1,
             seccomp_instructions: 2,
             rlimits_applied: 3,
+            rlimits_deferred: 0,
             capability_bounding_dropped: 4,
             supplementary_groups: Some(SupplementaryGroups::AlreadyEmpty),
             unapplied,
@@ -1050,6 +1136,8 @@ mod tests {
                 root: dir_fd(Path::new("/")),
                 threads: ThreadCountSource::ProcSelf,
                 owner_pid: std::process::id(),
+                deferred_fsize: None,
+                seal_policy: SealPolicy::unrestricted(),
             },
         }
     }
@@ -1071,6 +1159,31 @@ mod tests {
         ExecError::new(code, stage, "fake")
     }
 
+    /// SUP-12・SEC-1・#1531: `RLIMIT_FSIZE` は exec プロセスには対象の値を載せず子へ持ち越し、報告では適用済み
+    /// （`rlimits_applied`）と持ち越し（`rlimits_deferred`）を分ける。持ち越しを含めて完了扱いで `ExecReady` になり、
+    /// 持ち越した値は `ExecReady` の持ち越し材料に載る。
+    #[test]
+    fn sup12_deferred_fsize_is_reported_separately_from_applied_rlimits() {
+        let _ = take();
+        let mut r = restrictions(std::process::id());
+        r.rlimits = Rlimits::new(vec![
+            Rlimit::new(RlimitKind::Nofile, 256, 512).expect("nofile"),
+            Rlimit::new(RlimitKind::Fsize, 4096, 4096).expect("fsize"),
+        ])
+        .expect("set");
+        let report = reapply_restrictions(r).expect("ok");
+        assert_eq!(
+            (report.rlimits_applied(), report.rlimits_deferred()),
+            (1, 1)
+        );
+        assert!(report.is_complete());
+        let carry = report.into_complete().expect("ready").into_parts();
+        assert_eq!(
+            carry.deferred_fsize,
+            Some(Rlimit::new(RlimitKind::Fsize, 4096, 4096).expect("fsize"))
+        );
+    }
+
     /// SUP-6・TASK-163.4: 適用順は rlimit → capability 削減 → NO_NEW_PRIVS → Landlock → seccomp で固定
     /// （launch 経路の `StageKind::ORDER` の相対順）。成功すれば未適用は空で `ExecReady` に変えられる。
     #[test]
@@ -1090,6 +1203,7 @@ mod tests {
         assert_eq!(report.landlock_rules(), 0);
         assert_eq!(report.seccomp_instructions(), 0);
         assert_eq!(report.rlimits_applied(), 1);
+        assert_eq!(report.rlimits_deferred(), 0);
         // TASK-163 追補（#1457）: capability 削減が補助グループの扱いも済ませ、結果に載る（偽のカーネルは空）。
         assert_eq!(
             report.supplementary_groups(),

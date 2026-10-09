@@ -1,6 +1,6 @@
 //! fd 受け渡しとゲストメモリ I/O の観測レコード（GPU-6・REPAIR-4・TASK-172 F1.2・#1517）。
 //!
-//! 役割: `fd_passing`（`recvmsg` / `sendmsg`）と `guest_memory`（境界検査つき read / write）の各操作について、
+//! 役割: `fd_passing`（`recvmsg` / `sendmsg` / memfd 作成）と `guest_memory`（領域の map・`SET_MEM_TABLE` の検証・境界検査つき read / write）の各操作について、
 //! 成功数・失敗数・失敗 code 別の件数・所要時間の合計と分布（2 の冪の固定区画ヒストグラム）をプロセス内のカウンタに集計する。境界検査の拒否（`OUT_OF_BOUNDS` 等）と
 //! syscall の失敗（`OS_ERROR`）も失敗として数える。呼び出し元は F1.4（セッション。#1519）で、定期的に [`snapshot_lines`] を
 //! 構造化ログへ出す（`log` モジュールと同じ `venus_jig event=...` 形式）。
@@ -24,11 +24,25 @@ pub enum Op {
     MemRead,
     /// ゲストメモリの書き込み。
     MemWrite,
+    /// `create_memfd` / `create_memfd_unsealed`（memfd の作成と seal）。
+    MemfdCreate,
+    /// `GuestMemoryRegion::map`（領域 1 個の検証と mmap）。
+    MemMap,
+    /// `GuestMemory::from_table`（`SET_MEM_TABLE` 全体の検証と map。入口の検証失敗も含む）。
+    MemTable,
 }
 
 impl Op {
     /// 全操作（添字は `as usize` と一致する）。
-    pub const ALL: [Op; 4] = [Op::RecvFds, Op::SendFds, Op::MemRead, Op::MemWrite];
+    pub const ALL: [Op; 7] = [
+        Op::RecvFds,
+        Op::SendFds,
+        Op::MemRead,
+        Op::MemWrite,
+        Op::MemfdCreate,
+        Op::MemMap,
+        Op::MemTable,
+    ];
 
     /// ログに出す固定語彙。
     pub fn word(self) -> &'static str {
@@ -37,6 +51,9 @@ impl Op {
             Self::SendFds => "send_fds",
             Self::MemRead => "mem_read",
             Self::MemWrite => "mem_write",
+            Self::MemfdCreate => "memfd_create",
+            Self::MemMap => "mem_map",
+            Self::MemTable => "mem_table",
         }
     }
 }
@@ -307,6 +324,24 @@ mod tests {
         assert!(lines.contains(
             &"venus_jig event=vhost_user_io_latency op=mem_write lt_ns=inf count=1".to_string()
         ));
+    }
+
+    /// GPU-6・REPAIR-4: memfd 作成・map・table の成功と拒否が構造化ログ行に出る。
+    #[test]
+    fn gpu6_memfd_and_map_ops_are_listed_in_lines() {
+        let m = Metrics::new();
+        m.record(Op::MemMap, Err(TransportErrorCode::ShrinkNotSealed), 5);
+        m.record(Op::MemTable, Err(TransportErrorCode::FdCountMismatch), 6);
+        m.record(Op::MemfdCreate, Ok(()), 7);
+        let lines = m.lines();
+        for l in [
+            "venus_jig event=vhost_user_io op=mem_map ok=0 err=1 total_ns=5",
+            "venus_jig event=vhost_user_io_error op=mem_map code=SHRINK_NOT_SEALED count=1",
+            "venus_jig event=vhost_user_io_error op=mem_table code=FD_COUNT_MISMATCH count=1",
+            "venus_jig event=vhost_user_io op=memfd_create ok=1 err=0 total_ns=7",
+        ] {
+            assert!(lines.contains(&l.to_string()), "missing: {l}");
+        }
     }
 
     /// 添字と列挙順の対応（`as usize` で配列を引くため）。

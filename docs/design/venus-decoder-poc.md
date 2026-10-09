@@ -373,7 +373,7 @@ frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲスト
 
 設計判断:
 
-- `recvmsg` 等は `syscall(2)` 経由でカーネル ABI の `user_msghdr` / `cmsghdr` を直接使う（glibc / musl の `msghdr` のパディング差に依存しない）。`poll` / `sysconf` は使わず、タイムアウト（REPAIR-5）は std の `set_read_timeout` / `set_write_timeout`（`SO_RCVTIMEO` / `SO_SNDTIMEO`）で実現する
+- `recvmsg` 等は `syscall(2)` 経由でカーネル ABI の `user_msghdr` / `cmsghdr` を直接使う（glibc / musl の `msghdr` のパディング差に依存しない）。`sysconf` は使わない。タイムアウト（REPAIR-5）は呼び出しごとの期限を持ち、`MSG_DONTWAIT` の `recvmsg` / `sendmsg` と `ppoll`（U10）で待つ（共有ソケットの `SO_RCVTIMEO` に依存しない）
 - 受け取る fd は `MAX_FDS`（32）。受信した fd は検証より前にすべて `OwnedFd` にし、`MSG_CTRUNC`・上限超過・構造異常のどのエラー経路でも `Drop` で閉じる。`MSG_CMSG_CLOEXEC` で close-on-exec を原子的に付ける
 - map は file offset 0 から `mmap_offset + memory_size` バイトを `MAP_SHARED` で行い、領域の先頭をマップ内の `mmap_offset` の位置として扱う（ページ境界にそろっていない `mmap_offset` でも `EINVAL` にしない）。QEMU `vhost-user.rst` の `mmap_offset` の定義との照合は未実施で、F1.4 の結合で確認する
 - 上限は治具独自: 1 領域の map 長 64 GiB・合計 128 GiB。合計の上限は mmap より前に checked 演算で判定する（`INVALID_REGION`）。fd は `F_SEAL_SHRINK` が確認できなければ `SHRINK_NOT_SEALED` で拒否し（seal 非対応の fd も同様）、そのうえでファイル長が map 長に届かなければ `FILE_TOO_SHORT`。領域をまたぐアクセスは `OUT_OF_BOUNDS`（PoC の割り切り）

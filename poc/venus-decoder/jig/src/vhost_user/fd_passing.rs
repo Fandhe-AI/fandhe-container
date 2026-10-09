@@ -8,8 +8,9 @@
 //! peer credential の検証・eventfd の待機は F1.4（#1519）。ここは「1 回の `recvmsg` / `sendmsg`」までを担当する。
 //!
 //! 入力は frontend 由来の untrusted。fd は検証より前にすべて `OwnedFd` にし、どのエラー経路でも `Drop` で閉じる（fd 漏れ防止）。
-//! タイムアウトは `SO_RCVTIMEO` / `SO_SNDTIMEO`（std の `set_read_timeout` / `set_write_timeout`）で実現し、`poll` は使わない。
-//! ソケットは blocking 前提で、non-blocking のソケットでは即座に `TIMEOUT` になる。
+//! タイムアウトは呼び出しごとの期限（単調時計）で管理する。`recvmsg` / `sendmsg` は常に `MSG_DONTWAIT` で呼び、読み書きできない間は
+//! `ppoll`（`sys::wait_fd`）で残り時間だけ待つ。`SO_RCVTIMEO` / `SO_SNDTIMEO` はソケット全体の設定で、`&UnixStream` を共有する
+//! 別スレッドが長い値を設定すると待ち時間が伸びてしまうため使わない（REPAIR-5）。ソケットの blocking / non-blocking にも依存しない。
 
 use std::ffi::CStr;
 use std::fs::File;
@@ -129,7 +130,7 @@ pub fn recv_with_fds(
     })
 }
 
-/// 待ち時間の上限（1 時間）。`SO_RCVTIMEO` / `SO_SNDTIMEO` へ巨大な値を渡すと事実上の無期限待ちになり、
+/// 待ち時間の上限（1 時間）。巨大な値は事実上の無期限待ちになり、
 /// 期限（単調時計の加算）も作れなくなるため、入口で `INVALID_ARGUMENT` として拒否する（REPAIR-5）。
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(3600);
 
@@ -141,6 +142,33 @@ fn deadline_for(timeout: Duration) -> Result<Instant, TransportError> {
     Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| err(TransportErrorCode::InvalidArgument))
+}
+
+/// 期限に達していれば `TIMEOUT`（`EINTR` で再試行する前の確認）。
+fn check_deadline(deadline: Instant) -> Result<(), TransportError> {
+    if deadline <= Instant::now() {
+        return Err(err(TransportErrorCode::Timeout));
+    }
+    Ok(())
+}
+
+/// `deadline` まで `sock` が `interest` になるのを待つ。期限に達していれば `TIMEOUT`。シグナル中断（`EINTR`）は
+/// 呼び出し側のループが再試行するので成功として返す。ソケットのタイムアウト設定には依存しない（REPAIR-5）。
+fn wait_until(
+    sock: &UnixStream,
+    interest: sys::Interest,
+    deadline: Instant,
+) -> Result<(), TransportError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(err(TransportErrorCode::Timeout));
+    }
+    match sys::wait_fd(sock.as_fd(), interest, remaining) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(err(TransportErrorCode::Timeout)),
+        Err(sys::SysError::Os(n)) if n == sys::EINTR => Ok(()),
+        Err(e) => Err(TransportError::from_sys(e)),
+    }
 }
 
 /// [`recv_with_fds`] の本体。`ctrl_cap` は補助データの受付上限で、切り詰め検出の試験だけが `CMSG_BUF_LEN` 未満を渡す。
@@ -155,19 +183,13 @@ fn recv_impl(
         return Err(err(TransportErrorCode::InvalidArgument));
     }
     let deadline = deadline_for(timeout)?;
-    let mut remaining = timeout;
     let mut ctrl = CmsgBuf::new();
     let raw = loop {
-        sock.set_read_timeout(Some(remaining))
-            .map_err(|e| TransportError::from_io(&e))?;
         match sys::recvmsg_fds(sock.as_fd(), buf, &mut ctrl, ctrl_cap) {
             Ok(r) => break r,
-            Err(sys::SysError::Os(n)) if n == sys::EINTR => {
-                // 単調時計で残り時間を計算し直す。尽きていれば TIMEOUT。
-                remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(err(TransportErrorCode::Timeout));
-                }
+            Err(sys::SysError::Os(n)) if n == sys::EINTR => check_deadline(deadline)?,
+            Err(sys::SysError::Os(n)) if n == sys::EAGAIN => {
+                wait_until(sock, sys::Interest::Readable, deadline)?;
             }
             Err(e) => return Err(TransportError::from_sys(e)),
         }
@@ -211,17 +233,12 @@ pub fn send_with_fds(
             return Err(err(TransportErrorCode::InvalidArgument));
         }
         let deadline = deadline_for(timeout)?;
-        let mut remaining = timeout;
         loop {
-            sock.set_write_timeout(Some(remaining))
-                .map_err(|e| TransportError::from_io(&e))?;
             match sys::sendmsg_fds(sock.as_fd(), data, fds) {
                 Ok(n) => return Ok(n),
-                Err(sys::SysError::Os(n)) if n == sys::EINTR => {
-                    remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return Err(err(TransportErrorCode::Timeout));
-                    }
+                Err(sys::SysError::Os(n)) if n == sys::EINTR => check_deadline(deadline)?,
+                Err(sys::SysError::Os(n)) if n == sys::EAGAIN => {
+                    wait_until(sock, sys::Interest::Writable, deadline)?;
                 }
                 Err(e) => return Err(TransportError::from_sys(e)),
             }
@@ -232,21 +249,27 @@ pub fn send_with_fds(
 /// 長さ `len` の memfd（close-on-exec）を作り、縮小を禁じる `F_SEAL_SHRINK` を付ける。テストと F1.4 の偽 frontend が
 /// ゲストメモリ領域の代わりに使う（`GuestMemoryRegion::map` は縮小が封じられた fd だけを受け付ける）。
 /// `name` は `/proc/self/maps` に出る識別名で、秘密情報を入れない。
+/// 結果と所要時間は観測カウンタに計上する（REPAIR-4）。
 pub fn create_memfd(name: &CStr, len: u64) -> Result<File, TransportError> {
-    let fd = sys::memfd_create_cloexec(name, true).map_err(TransportError::from_sys)?;
-    let file = File::from(fd);
-    file.set_len(len).map_err(|e| TransportError::from_io(&e))?;
-    sys::fcntl_add_seals(file.as_fd(), sys::F_SEAL_SHRINK).map_err(TransportError::from_sys)?;
-    Ok(file)
+    observe::global().observe(Op::MemfdCreate, || {
+        let fd = sys::memfd_create_cloexec(name, true).map_err(TransportError::from_sys)?;
+        let file = File::from(fd);
+        file.set_len(len).map_err(|e| TransportError::from_io(&e))?;
+        sys::fcntl_add_seals(file.as_fd(), sys::F_SEAL_SHRINK).map_err(TransportError::from_sys)?;
+        Ok(file)
+    })
 }
 
 /// [`create_memfd`] の seal なし版。`GuestMemoryRegion::map` の拒否経路（`SHRINK_NOT_SEALED`）の試験専用で、
 /// `MFD_ALLOW_SEALING` を付けないため後から seal を足せない。
+/// [`create_memfd`] と同じ `MemfdCreate` として計上する。
 pub fn create_memfd_unsealed(name: &CStr, len: u64) -> Result<File, TransportError> {
-    let fd = sys::memfd_create_cloexec(name, false).map_err(TransportError::from_sys)?;
-    let file = File::from(fd);
-    file.set_len(len).map_err(|e| TransportError::from_io(&e))?;
-    Ok(file)
+    observe::global().observe(Op::MemfdCreate, || {
+        let fd = sys::memfd_create_cloexec(name, false).map_err(TransportError::from_sys)?;
+        let file = File::from(fd);
+        file.set_len(len).map_err(|e| TransportError::from_io(&e))?;
+        Ok(file)
+    })
 }
 
 #[cfg(test)]
@@ -305,6 +328,37 @@ mod tests {
         assert_eq!(send_with_fds(&a, b"x", &[], MAX_TIMEOUT).expect("send"), 1);
         let r = recv_with_fds(&b, &mut buf, 0, MAX_TIMEOUT).expect("recv");
         assert_eq!((r.len, r.fds.len()), (1, 0));
+    }
+
+    /// GPU-6・REPAIR-5: 別スレッドが共有ソケットへ長い `SO_RCVTIMEO` / `SO_SNDTIMEO` を設定しても、呼び出しごとの期限で `TIMEOUT` になる。
+    #[test]
+    fn gpu6_timeout_ignores_shared_socket_timeout() {
+        let (a, b) = UnixStream::pair().expect("pair");
+        let b2 = b.try_clone().expect("clone");
+        b2.set_read_timeout(Some(Duration::from_secs(3000)))
+            .expect("set");
+        let mut buf = [0u8; 4];
+        let t = Instant::now();
+        let e = recv_with_fds(&b, &mut buf, 0, Duration::from_millis(100)).expect_err("timeout");
+        assert_eq!(e.code, TransportErrorCode::Timeout);
+        assert!(t.elapsed() < Duration::from_secs(10));
+        // 送信側: バッファを埋めてから送ると期限で TIMEOUT になる。
+        a.set_write_timeout(Some(Duration::from_secs(3000)))
+            .expect("set");
+        let chunk = [0u8; 65536];
+        let mut last = None;
+        let t = Instant::now();
+        for _ in 0..4096 {
+            match send_with_fds(&a, &chunk, &[], Duration::from_millis(100)) {
+                Ok(_) => {}
+                Err(e) => {
+                    last = Some(e);
+                    break;
+                }
+            }
+        }
+        assert_eq!(last.expect("full").code, TransportErrorCode::Timeout);
+        assert!(t.elapsed() < Duration::from_secs(30));
     }
 
     /// GPU-6: `SCM_PIDFD` で導入された fd も所有してから拒否し、閉じ忘れない（解析の単体照合）。

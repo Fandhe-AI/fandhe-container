@@ -59,7 +59,13 @@ impl GuestMemoryRegion {
     /// - `guest_phys_addr + memory_size` と `mmap_offset + memory_size` が overflow しない（`INVALID_REGION`）
     /// - fd が `F_SEAL_SHRINK` つきで縮まない（`SHRINK_NOT_SEALED`。seal 非対応の fd の `EINVAL` もこれに含める）
     /// - ファイル長が map 長以上（`FILE_TOO_SHORT`。seal の確認後に検査する）
+    ///
+    /// 結果と所要時間は観測カウンタに計上する（REPAIR-4。検証の拒否も失敗として数える）。
     pub fn map(file: &File, region: &MemRegion) -> Result<Self, TransportError> {
+        observe::global().observe(Op::MemMap, || Self::map_raw(file, region))
+    }
+
+    fn map_raw(file: &File, region: &MemRegion) -> Result<Self, TransportError> {
         let bad = || err(TransportErrorCode::InvalidRegion);
         if region.memory_size == 0 {
             return Err(bad());
@@ -176,7 +182,12 @@ impl GuestMemory {
     ///
     /// 領域数と fd 数が違えば `FD_COUNT_MISMATCH`、GPA の範囲が重なれば `OVERLAPPING_REGIONS`、map 長の合計が
     /// [`MAX_TOTAL_MAP_LEN`] を超えれば（mmap より前に判定して）`INVALID_REGION`。途中で失敗しても map 済みの領域は `Drop` で解放される。
+    /// 結果と所要時間は観測カウンタに計上する（REPAIR-4。入口の検証失敗も含む。領域ごとの map は別に `MemMap` として計上する）。
     pub fn from_table(table: &MemTable, fds: Vec<OwnedFd>) -> Result<Self, TransportError> {
+        observe::global().observe(Op::MemTable, || Self::from_table_raw(table, fds))
+    }
+
+    fn from_table_raw(table: &MemTable, fds: Vec<OwnedFd>) -> Result<Self, TransportError> {
         let specs = table.regions();
         if specs.len() != fds.len() {
             return Err(err(TransportErrorCode::FdCountMismatch));

@@ -115,7 +115,7 @@ impl TransportError {
         }
     }
 
-    /// syscall ラッパーの失敗から作る。`EAGAIN`（`SO_RCVTIMEO` / `SO_SNDTIMEO` の満了）は `TIMEOUT`。
+    /// syscall ラッパーの失敗から作る。`EAGAIN`（待機の期限切れ。通常は `fd_passing` が期限を管理する）は `TIMEOUT`。
     pub(crate) fn from_sys(e: SysError) -> Self {
         match e {
             SysError::Unsupported => Self::new(TransportErrorCode::Unsupported),

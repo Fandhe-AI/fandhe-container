@@ -9,7 +9,8 @@
 //! 個別承認の記録: <https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6074351741>。
 //! 承認範囲は U1 `syscall(2)` の `extern` 宣言・U2 `recvmsg`・U3 受信 fd の `OwnedFd::from_raw_fd`・U4 `sendmsg`・
 //! U5 `memfd_create` と `from_raw_fd`・U6 `mmap`・U7 `Drop` での `munmap`・U8 境界検査後の `copy_nonoverlapping`。
-//! U9 `fcntl`（`F_GET_SEALS` / `F_ADD_SEALS`。`syscall(2)` 経由。メモリに触れない薄いラッパー。F1.2 のレビュー指摘で追加。
+//! U10 `ppoll`（期限つき待機。`syscall(2)` 経由。fd の状態を待つだけでメモリは `pollfd` の `revents` にしか書かない薄いラッパー。
+//! F1.2 のレビュー指摘で追加。事前承認の範囲に収まる）・U9 `fcntl`（`F_GET_SEALS` / `F_ADD_SEALS`。`syscall(2)` 経由。メモリに触れない薄いラッパー。F1.2 のレビュー指摘で追加。
 //! 各 crate の `sys` モジュールに置く syscall ラッパーの事前承認の範囲に収まる）。
 //! これを超える `unsafe`（`extern` 宣言の追加を含む）は書かない。`recvmsg` 等を直接 `extern` で宣言せず、すべて
 //! `syscall(2)` 経由にする。
@@ -57,6 +58,7 @@ mod consts {
     pub(crate) const NR_MUNMAP: i64 = 11;
     pub(crate) const NR_MEMFD_CREATE: i64 = 319;
     pub(crate) const NR_FCNTL: i64 = 72;
+    pub(crate) const NR_PPOLL: i64 = 271;
     // asm-generic/socket.h・linux/socket.h・bits/socket.h の MSG_*。
     pub(crate) const SOL_SOCKET: i32 = 1;
     pub(crate) const SCM_RIGHTS: i32 = 1;
@@ -91,6 +93,7 @@ mod consts {
     pub(crate) const NR_MUNMAP: i64 = 215;
     pub(crate) const NR_MEMFD_CREATE: i64 = 279;
     pub(crate) const NR_FCNTL: i64 = 25;
+    pub(crate) const NR_PPOLL: i64 = 73;
     pub(crate) const SOL_SOCKET: i32 = 1;
     pub(crate) const SCM_RIGHTS: i32 = 1;
     pub(crate) const MSG_TRUNC: u32 = 0x20;
@@ -120,6 +123,7 @@ mod consts {
     pub(crate) const NR_MUNMAP: i64 = 0;
     pub(crate) const NR_MEMFD_CREATE: i64 = 0;
     pub(crate) const NR_FCNTL: i64 = 0;
+    pub(crate) const NR_PPOLL: i64 = 0;
     pub(crate) const SOL_SOCKET: i32 = 0;
     pub(crate) const SCM_RIGHTS: i32 = 0;
     pub(crate) const MSG_TRUNC: u32 = 0;
@@ -145,10 +149,15 @@ pub(crate) use consts::{
 /// `SCM_PIDFD`（include/linux/socket.h。アーキ共通の 4）。受信側が `SO_PASSPIDFD` を有効にしているソケットでは、
 /// カーネルが送信元の pidfd をこの種別の補助データとして受信側の fd テーブルへ導入する（受け取った側が閉じる責務を負う）。
 pub(crate) const SCM_PIDFD: i32 = 4;
+/// `MSG_DONTWAIT`（アーキ共通の 0x40）。ソケット自体の `O_NONBLOCK` / `SO_RCVTIMEO` に依存せず、この 1 回の呼び出しだけを非ブロックにする。
+const MSG_DONTWAIT: usize = 0x40;
+/// `poll(2)` の `events` / `revents` ビット（アーキ共通）。
+const POLLIN: i16 = 0x1;
+const POLLOUT: i16 = 0x4;
 use consts::{
     F_ADD_SEALS, F_GET_SEALS, MAP_SHARED, MFD_ALLOW_SEALING, MFD_CLOEXEC, MSG_CMSG_CLOEXEC,
-    MSG_NOSIGNAL, NR_FCNTL, NR_MEMFD_CREATE, NR_MMAP, NR_MUNMAP, NR_RECVMSG, NR_SENDMSG, PROT_READ,
-    PROT_WRITE, SUPPORTED,
+    MSG_NOSIGNAL, NR_FCNTL, NR_MEMFD_CREATE, NR_MMAP, NR_MUNMAP, NR_PPOLL, NR_RECVMSG, NR_SENDMSG,
+    PROT_READ, PROT_WRITE, SUPPORTED,
 };
 
 unsafe extern "C" {
@@ -232,7 +241,8 @@ fn check(ret: i64) -> Result<i64, SysError> {
     }
 }
 
-/// 補助データ付きで受信する（U2）。`MSG_CMSG_CLOEXEC` を必ず付け、受け取った fd を原子的に close-on-exec にする。
+/// 補助データ付きで受信する（U2）。常に `MSG_DONTWAIT` で、読めなければ `EAGAIN`（待機は [`wait_fd`] で期限つきに行う）。
+///`MSG_CMSG_CLOEXEC` を必ず付け、受け取った fd を原子的に close-on-exec にする。
 /// 受け取った fd は `ctrl` の中に生の番号で入っているので、呼び出し側は直ちに [`owned_fd_from_received`] で所有する。
 ///
 /// `ctrl_cap` は補助データとして受け付ける最大長で、`CMSG_BUF_LEN` 以下に丸める。通常は `CMSG_BUF_LEN` を渡し、
@@ -268,7 +278,7 @@ pub(crate) fn recvmsg_fds(
             NR_RECVMSG,
             sock.as_raw_fd() as usize,
             &raw mut hdr as usize,
-            MSG_CMSG_CLOEXEC as usize,
+            (MSG_CMSG_CLOEXEC as usize) | MSG_DONTWAIT,
         )
     };
     let n = check(ret)?;
@@ -293,7 +303,7 @@ pub(crate) fn owned_fd_from_received(raw: i32) -> Option<OwnedFd> {
     Some(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
-/// データと fd を `SCM_RIGHTS` で送る（U4）。`MSG_NOSIGNAL` で SIGPIPE を避ける。fd 数は `MAX_SCM_FDS` 以下に限る。
+/// データと fd を `SCM_RIGHTS` で送る（U4）。常に `MSG_DONTWAIT` で、書けなければ `EAGAIN`（待機は [`wait_fd`]）。`MSG_NOSIGNAL` で SIGPIPE を避ける。fd 数は `MAX_SCM_FDS` 以下に限る。
 pub(crate) fn sendmsg_fds(
     sock: BorrowedFd<'_>,
     data: &[u8],
@@ -337,11 +347,74 @@ pub(crate) fn sendmsg_fds(
             NR_SENDMSG,
             sock.as_raw_fd() as usize,
             &raw const hdr as usize,
-            MSG_NOSIGNAL as usize,
+            (MSG_NOSIGNAL as usize) | MSG_DONTWAIT,
         )
     };
     let n = check(ret)?;
     usize::try_from(n).map_err(|_| SysError::Os(EINVAL))
+}
+
+/// [`wait_fd`] の待ち対象。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Interest {
+    /// 読み出し可能（`POLLIN`）。
+    Readable,
+    /// 書き込み可能（`POLLOUT`）。
+    Writable,
+}
+
+/// `struct pollfd`（`include/uapi/asm-generic/poll.h`）。8 バイト。
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+/// `struct timespec`（LP64 の 64 ビット `time_t` / `long`）。
+#[repr(C)]
+struct Timespec {
+    sec: i64,
+    nsec: i64,
+}
+
+/// `ppoll(2)` で `fd` が `interest` になるか `timeout` が尽きるまで待つ（U10）。真なら待ち対象が成立（`POLLERR` / `POLLHUP` も
+/// 成立として返し、結果は続く `recvmsg` / `sendmsg` のエラーで分かる）、偽ならタイムアウト。ソケット設定に依存しない期限つき待機。
+/// シグナルで中断されたときは `Os(EINTR)`（呼び出し側が残り時間を計算し直す）。
+pub(crate) fn wait_fd(
+    fd: BorrowedFd<'_>,
+    interest: Interest,
+    timeout: std::time::Duration,
+) -> Result<bool, SysError> {
+    if !SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut pfd = PollFd {
+        fd: fd.as_raw_fd(),
+        events: match interest {
+            Interest::Readable => POLLIN,
+            Interest::Writable => POLLOUT,
+        },
+        revents: 0,
+    };
+    let ts = Timespec {
+        sec: i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX),
+        nsec: i64::from(timeout.subsec_nanos()),
+    };
+    // SAFETY: `pfd`（1 要素）と `ts` はカーネル ABI の `struct pollfd` / `struct timespec` と同じレイアウトで、呼び出し中は
+    // 生きている。`ppoll(fds, 1, &ts, NULL, 0)` は `pfd.revents` にだけ書き、`ts` は読むだけ（sigmask は NULL・サイズ 0）。
+    // fd は `BorrowedFd` で有効。
+    let ret = unsafe {
+        syscall(
+            NR_PPOLL,
+            &raw mut pfd as usize,
+            1usize,
+            &raw const ts as usize,
+            0usize,
+            0usize,
+        )
+    };
+    Ok(check(ret)? > 0)
 }
 
 /// `SCM_RIGHTS` の cmsg（ヘッダ + fd 配列）を `buf` へ書く。safe コードで境界検査する。

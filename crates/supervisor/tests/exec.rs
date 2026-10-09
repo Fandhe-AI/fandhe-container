@@ -26,6 +26,12 @@
 //! exec の子が差し替え先を開かずに拒否し、コマンドが起動しないこと（#1459）。`#!/proc/self/exe` のスクリプトを
 //! エントリポイントにした exec が `execveat` の前に拒否されること（#1458）。
 //!
+//! エントリポイントの実行方式（#1531。オーナー判断 2026-10-09「条件付き切り替え」）: ホストの環境で封印した複製
+//! （`sealed_copy`）か現行方式（`pinned_inode`）が選ばれる。どちらでも exec は成功することを期待し、joiner の
+//! 構造化ログ（stderr の `supervisor.exec` / `entrypoint_mode` の 1 行）・`ExecOutcome::entrypoint_mode`・稼働中の
+//! プローブの `/proc/<pid>/exe`（封印した複製なら `/memfd:fandhe-exec-entrypoint (deleted)`、現行方式ならプローブの
+//! inode）の三つが同じ方式を示すことを照合する。
+//!
 //! 通しは 5 回繰り返し、1 回でも不一致なら失敗する（リトライで隠さない）。
 //!
 //! # 構成（再入）
@@ -545,13 +551,17 @@ mod linux {
         match result {
             Ok(o) => {
                 println!(
-                    "outcome exit={:?} rlimits={} caps_dropped={} landlock_rules={} seccomp_instructions={} groups={}",
+                    "outcome exit={:?} rlimits={} caps_dropped={} landlock_rules={} seccomp_instructions={} groups={} entrypoint_mode={} reason={}",
                     o.exit,
                     o.rlimits_applied,
                     o.capability_bounding_dropped,
                     o.landlock_rules,
                     o.seccomp_instructions,
-                    o.supplementary_groups.as_str()
+                    o.supplementary_groups.as_str(),
+                    o.entrypoint_mode.as_str(),
+                    o.entrypoint_mode
+                        .fallback_reason()
+                        .map_or("-", |r| r.as_str()),
                 );
             }
             Err(rejected) => {
@@ -711,16 +721,32 @@ mod linux {
     }
 
     /// `joiner` の子孫（`run_command` は準備を worker プロセスへ隔離するため、プローブは joiner の孫になる。
-    /// REPAIR-5）のうち、実行ファイルがプローブ（host 側の `rootfs/probe` と同じ inode）のものの pid。
+    /// REPAIR-5）のうち、実行ファイルがプローブのものの pid。現行方式ではプローブ（host 側の `rootfs/probe`）と同じ
+    /// inode、封印した複製では同じサイズの memfd（[`SEALED_COPY_EXE`]）を実行している（#1531）。
     fn probe_child(joiner: u32, probe: &Path) -> Option<u32> {
-        let want = fs::metadata(probe).ok()?;
         let mut candidates = children_of(joiner);
         let grandchildren: Vec<u32> = candidates.iter().flat_map(|c| children_of(*c)).collect();
         candidates.extend(grandchildren);
-        candidates.into_iter().find(|pid| {
-            fs::metadata(format!("/proc/{pid}/exe"))
-                .is_ok_and(|m| (m.dev(), m.ino()) == (want.dev(), want.ino()))
-        })
+        candidates
+            .into_iter()
+            .find(|pid| exe_mode(*pid, probe).is_some())
+    }
+
+    /// 封印した複製を実行しているプロセスの `/proc/<pid>/exe` のリンク先（#1531）。
+    const SEALED_COPY_EXE: &str = "/memfd:fandhe-exec-entrypoint (deleted)";
+
+    /// `pid` の実行ファイルが `probe` そのもの（`pinned_inode`）か、`probe` と同じサイズの封印した複製（`sealed_copy`）か。
+    /// どちらでもなければ `None`。
+    fn exe_mode(pid: u32, probe: &Path) -> Option<&'static str> {
+        let want = fs::metadata(probe).ok()?;
+        let exe = format!("/proc/{pid}/exe");
+        let got = fs::metadata(&exe).ok()?;
+        if (got.dev(), got.ino()) == (want.dev(), want.ino()) {
+            return Some("pinned_inode");
+        }
+        let link = fs::read_link(&exe).ok()?;
+        (link.to_string_lossy() == SEALED_COPY_EXE && got.len() == want.len())
+            .then_some("sealed_copy")
     }
 
     /// joiner を起動する（標準出力は 1 行を読むためパイプ）。
@@ -733,12 +759,20 @@ mod linux {
             .env(HOST_ONLY_ENV, "must-not-leak")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
+            // 構造化ログ（実行方式の 1 行。#1531）を照合するためパイプにする（数行で、パイプの容量を超えない）。
+            .stderr(Stdio::piped())
             .spawn()
             .expect("spawn joiner")
     }
 
     /// joiner の終了を待ち、`(終了コード, 標準出力)` を返す。期限超過は kill して panic（REPAIR-5）。
-    fn finish_joiner(mut joiner: Child) -> (Option<i32>, String) {
+    fn finish_joiner(joiner: Child) -> (Option<i32>, String) {
+        let (code, out, _) = finish_joiner_with_stderr(joiner);
+        (code, out)
+    }
+
+    /// [`finish_joiner`] に標準エラー出力（パイプにしていなければ空）を足したもの。
+    fn finish_joiner_with_stderr(mut joiner: Child) -> (Option<i32>, String, String) {
         let deadline = Instant::now() + timeout();
         let status = loop {
             if let Some(s) = joiner.try_wait().expect("try_wait") {
@@ -755,7 +789,28 @@ mod linux {
         if let Some(mut s) = joiner.stdout.take() {
             let _ = std::io::Read::read_to_string(&mut s, &mut out);
         }
-        (status.code(), out)
+        let mut err = String::new();
+        if let Some(mut s) = joiner.stderr.take() {
+            let _ = std::io::Read::read_to_string(&mut s, &mut err);
+        }
+        (status.code(), out, err)
+    }
+
+    /// joiner の stderr から実行方式の構造化ログを取り出し、`(mode, reason)` を返す（1 行ちょうどでなければ panic）。
+    /// 封印した複製の `reason` は空文字列。
+    fn logged_entrypoint_mode(stderr: &str) -> (String, String) {
+        const PREFIX: &str =
+            r#"{"component":"supervisor.exec","operation":"entrypoint_mode","mode":""#;
+        let lines: Vec<&str> = stderr.lines().filter(|l| l.starts_with(PREFIX)).collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly one entrypoint_mode log line: {stderr}"
+        );
+        let rest = lines[0].strip_prefix(PREFIX).expect("prefix");
+        let (mode, rest) = rest.split_once(r#"","reason":""#).expect("reason field");
+        let reason = rest.strip_suffix(r#""}"#).expect("closing");
+        (mode.to_owned(), reason.to_owned())
     }
 
     /// 1 回ぶんの通し: `run_command` で参加・制限・exec し、稼働中のプローブをホスト側の `/proc` から観測する。
@@ -778,6 +833,8 @@ mod linux {
             child.is_some() && denied.exists()
         });
         let pid = child.expect("probe child");
+        // 稼働中に、どちらの方式の実行ファイルかを記録する（joiner の結果と後で突き合わせる。#1531）。
+        let exe_seen = exe_mode(pid, &probe);
         let status = fs::read_to_string(format!("/proc/{pid}/status")).expect("probe status");
         let ctx = format!("round {round}, probe pid {pid}");
         // PoC-17: seccomp filter・NO_NEW_PRIVS。
@@ -883,12 +940,19 @@ mod linux {
             .expect("run kill");
         // 期限つきで待つ（REPAIR-5）。
         assert_eq!(finish_joiner(killed).0, Some(0), "{ctx}");
-        let (code, out) = finish_joiner(joiner);
-        assert_eq!(code, Some(0), "joiner output: {out}; {ctx}");
+        let (code, out, err) = finish_joiner_with_stderr(joiner);
+        assert_eq!(code, Some(0), "joiner output: {out}; stderr: {err}; {ctx}");
+        // 実行方式（#1531）: ログ・`ExecOutcome`・実行中のプローブの `exe` が同じ方式を示す。どちらの方式でも成功する。
+        let (mode, reason) = logged_entrypoint_mode(&err);
+        let outcome_reason = if reason.is_empty() {
+            "-"
+        } else {
+            reason.as_str()
+        };
         assert_eq!(
             out.trim_end(),
             format!(
-                "outcome exit={:?} rlimits=16 caps_dropped={} landlock_rules=3 seccomp_instructions={} groups={}",
+                "outcome exit={:?} rlimits=16 caps_dropped={} landlock_rules=3 seccomp_instructions={} groups={} entrypoint_mode={mode} reason={outcome_reason}",
                 ExecExit::Command(ChildExit::Signaled(15)),
                 parse_after(&out, "caps_dropped="),
                 parse_after(&out, "seccomp_instructions="),
@@ -896,6 +960,12 @@ mod linux {
             ),
             "{ctx}"
         );
+        assert_eq!(exe_seen, Some(mode.as_str()), "{ctx}");
+        match mode.as_str() {
+            "sealed_copy" => assert_eq!(reason, "", "{ctx}"),
+            "pinned_inode" => assert!(!reason.is_empty(), "pinned_inode needs a reason; {ctx}"),
+            other => panic!("unknown entrypoint mode {other}; {ctx}"),
+        }
     }
 
     /// 補助グループの扱いの期待値。joiner は本プロセス（root）と同じ補助グループを持つため、本プロセスが

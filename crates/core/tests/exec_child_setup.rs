@@ -26,6 +26,9 @@
 //!   ファイルはカーネル版に依らず違反 `entrypoint_on_noexec_mount`、実行ビットのないスクリプトは Linux 6.14 以降で
 //!   `AT_EXECVE_CHECK` により違反なしで拒否する（6.14 未満は観測の入口が判定を省くため手順を通る。分岐ごとに具体値で照合）。
 //!   `noexec` の tmpfs を user namespace の中でマウントする場面は実機前提で、`-- --ignored` 指定時のみ実行する
+//! - **方式の切り替え（#1531。オーナー判断 2026-10-09）**: 封印した複製を使わない判定（現行方式）では、照合した元の
+//!   fd がそのまま実行に使われ、`noexec` のマウント上のファイルは同じ違反 `entrypoint_on_noexec_mount` で拒否される
+//!   （差し込み点 `observe_exec_child_setup_pinned`）
 //! - **持ち越した `RLIMIT_FSIZE`（#1531・SUP-12）**: 封印した複製を作り終えた後に適用され、持ち越し値より大きい本体でも
 //!   複製が完成し、適用後の soft・hard が持ち越し値と一致する。適用に失敗した子はコマンドを起動しない
 //!   （util-linux の `prlimit` で hard を下げた子を再実行して作る）
@@ -99,9 +102,10 @@ mod linux {
 
     use fandhe_container_core::exec::{
         ChildExit, ContainerEnv, ExecChildSetupReport, ExecCommand, ExecExit,
-        MAX_SEALED_COPY_BYTES, StandardFd, SupplementaryGroups, ViolationReason,
-        clear_supplementary_groups_for_test, close_standard_fds_for_test, observe_exec_child_setup,
-        observe_exec_child_setup_with, observe_exec_child_setup_with_fsize,
+        MAX_SEALED_COPY_BYTES, SealedCopyUnavailable, StandardFd, SupplementaryGroups,
+        ViolationReason, clear_supplementary_groups_for_test, close_standard_fds_for_test,
+        observe_exec_child_setup, observe_exec_child_setup_pinned, observe_exec_child_setup_with,
+        observe_exec_child_setup_with_fsize,
     };
     use fandhe_container_core::oci_runtime::parse_config_bytes;
     use fandhe_container_core::rlimits::{Rlimit, RlimitKind};
@@ -203,6 +207,7 @@ mod linux {
         runtime_interpreter_is_rejected_before_exec(&work.0);
         executed_fd_is_a_sealed_copy_immune_to_replacement(&work.0);
         sealed_copy_refusals_are_recorded(&work.0);
+        pinned_mode_runs_the_verified_fd_and_refuses_noexec(&work.0);
         deferred_fsize_is_applied_after_the_copy(&work.0);
         deferred_fsize_failure_does_not_start_the_command(&work.0);
         setup_failures_are_distinguished_from_command_exits(&work.0);
@@ -540,6 +545,47 @@ mod linux {
         let observation =
             observe_exec_child_setup(&on_noexec, &work.join("report-noexec"), timeout())
                 .expect("observe the exec child setup");
+        assert_eq!(
+            observation.exit,
+            ExecExit::SetupFailed {
+                exit: ChildExit::Exited(126),
+                violation: Some(ViolationReason::EntrypointOnNoexecMount),
+            }
+        );
+        assert_eq!(observation.report, None);
+    }
+
+    /// SUP-6・SEC-1・SEC-4・#1531（オーナー判断 2026-10-09「条件付き切り替え」）: 封印した複製を使わない判定（現行方式）
+    /// では、照合した元の fd がそのまま実行に使われ（`exec_fd` のリンク先が元のファイル・seal なし）、`noexec` の
+    /// マウント上のファイルは封印した複製のときと同じく違反 `entrypoint_on_noexec_mount`（126）で拒否される。
+    fn pinned_mode_runs_the_verified_fd_and_refuses_noexec(work: &Path) {
+        let env = ContainerEnv::empty();
+        let reason = SealedCopyUnavailable::KernelTooOld;
+        let shell = shell_entry();
+        let observation =
+            observe_exec_child_setup_pinned(&shell, &work.join("report-pinned"), reason, timeout())
+                .expect("observe the exec child setup");
+        assert_eq!(observation.exit, ExecExit::Command(ChildExit::Exited(0)));
+        let report = observation.report.expect("report");
+        let real = fs::canonicalize("/bin/sh").expect("canonicalize /bin/sh");
+        assert_eq!(report.exec_fd.link, real.to_string_lossy());
+        assert_eq!(report.exec_fd.seals, None);
+        assert_eq!(
+            report.exec_fd.size,
+            fs::metadata(&real).expect("stat /bin/sh").len()
+        );
+        assert!(
+            proc_is_mounted_noexec(),
+            "/proc must be mounted noexec for this scenario"
+        );
+        let on_noexec = ExecCommand::new("/proc/self/status", ["status"], &env).expect("command");
+        let observation = observe_exec_child_setup_pinned(
+            &on_noexec,
+            &work.join("report-pinned-noexec"),
+            reason,
+            timeout(),
+        )
+        .expect("observe the exec child setup");
         assert_eq!(
             observation.exit,
             ExecExit::SetupFailed {

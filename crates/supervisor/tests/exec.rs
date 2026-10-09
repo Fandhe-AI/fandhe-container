@@ -551,9 +551,10 @@ mod linux {
         match result {
             Ok(o) => {
                 println!(
-                    "outcome exit={:?} rlimits={} caps_dropped={} landlock_rules={} seccomp_instructions={} groups={} entrypoint_mode={} reason={}",
+                    "outcome exit={:?} rlimits={} rlimits_deferred={} caps_dropped={} landlock_rules={} seccomp_instructions={} groups={} entrypoint_mode={} reason={}",
                     o.exit,
                     o.rlimits_applied,
+                    o.rlimits_deferred,
                     o.capability_bounding_dropped,
                     o.landlock_rules,
                     o.seccomp_instructions,
@@ -952,7 +953,7 @@ mod linux {
         assert_eq!(
             out.trim_end(),
             format!(
-                "outcome exit={:?} rlimits=16 caps_dropped={} landlock_rules=3 seccomp_instructions={} groups={} entrypoint_mode={mode} reason={outcome_reason}",
+                "outcome exit={:?} rlimits=15 rlimits_deferred=1 caps_dropped={} landlock_rules=3 seccomp_instructions={} groups={} entrypoint_mode={mode} reason={outcome_reason}",
                 ExecExit::Command(ChildExit::Signaled(15)),
                 parse_after(&out, "caps_dropped="),
                 parse_after(&out, "seccomp_instructions="),

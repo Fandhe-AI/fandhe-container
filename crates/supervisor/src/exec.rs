@@ -503,9 +503,11 @@ pub struct ExecOutcome {
     /// 判定すること（healthcheck は `Command` の非 0 を不健全、`SetupFailed` を実行基盤側の失敗として扱える）。
     /// 分離違反による拒否（ランタイム自身のバイナリ・インタープリタ経由・`/dev/null` の差し替え）は理由を持つ。
     pub exit: ExecExit,
-    /// 適用した rlimit の種別数（対象 pid1 の実効値。通常は 16）。`RLIMIT_FSIZE` は exec の子へ持ち越して子が
-    /// `execveat` の前に適用する（#1531）が、件数に含める（子での適用に失敗すれば `exit` は `SetupFailed`）。
+    /// exec プロセスへ適用した rlimit の種別数（対象 pid1 の実効値。子へ持ち越した `RLIMIT_FSIZE` を除き通常は 15）。
     pub rlimits_applied: usize,
+    /// 子へ持ち越した rlimit の種別数（`RLIMIT_FSIZE`。0 か 1。#1531）。exec の子が `execveat` の前に適用して読み戻し、
+    /// 失敗すればコマンドは起動しない（`exit` は `SetupFailed`）。`rlimits_applied` との和が対象の rlimit の種別数。
+    pub rlimits_deferred: usize,
     /// bounding set から落とした capability の数。
     pub capability_bounding_dropped: usize,
     /// 追加した Landlock ルール数。
@@ -925,8 +927,9 @@ fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
                 other => other.remaining(),
             };
             format!(
-                "ok {started} {violation} {kind} {value} {} {} {} {} {} {groups} {} {}\n",
+                "ok {started} {violation} {kind} {value} {} {} {} {} {} {} {groups} {} {}\n",
                 o.rlimits_applied,
+                o.rlimits_deferred,
                 o.capability_bounding_dropped,
                 o.landlock_rules,
                 o.seccomp_instructions,
@@ -1049,7 +1052,8 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
     let mut count = || -> Result<usize, WorkerFailure> {
         it.next().and_then(|v| v.parse().ok()).ok_or_else(malformed)
     };
-    let (rlimits_applied, capability_bounding_dropped) = (count()?, count()?);
+    let (rlimits_applied, rlimits_deferred) = (count()?, count()?);
+    let capability_bounding_dropped = count()?;
     let (landlock_rules, seccomp_instructions) = (count()?, count()?);
     let groups_kind = it.next().ok_or_else(malformed)?;
     let groups: usize = it
@@ -1071,6 +1075,7 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
     Ok(ExecOutcome {
         exit,
         rlimits_applied,
+        rlimits_deferred,
         capability_bounding_dropped,
         landlock_rules,
         seccomp_instructions,
@@ -1127,6 +1132,7 @@ fn run_in_child_cgroup(
     join_cgroup(cgroup)?;
     deadline.remaining("reapplying restrictions")?;
     let report = reapply_restrictions(restrictions)?;
+    let rlimits_deferred = report.rlimits_deferred();
     let (rlimits_applied, capability_bounding_dropped) = (
         report.rlimits_applied(),
         report.capability_bounding_dropped(),
@@ -1155,6 +1161,7 @@ fn run_in_child_cgroup(
     Ok(ExecOutcome {
         exit,
         rlimits_applied,
+        rlimits_deferred,
         capability_bounding_dropped,
         landlock_rules,
         seccomp_instructions,
@@ -1602,7 +1609,8 @@ mod tests {
     fn sup6_task163_4_worker_result_round_trips() {
         let outcome = ExecOutcome {
             exit: ExecExit::Command(ChildExit::Signaled(15)),
-            rlimits_applied: 16,
+            rlimits_applied: 15,
+            rlimits_deferred: 1,
             capability_bounding_dropped: 23,
             landlock_rules: 3,
             seccomp_instructions: 120,
@@ -1612,7 +1620,7 @@ mod tests {
         let line = encode_worker_result(&Ok(outcome));
         assert_eq!(
             line,
-            b"ok command - signaled 15 16 23 3 120 cleared 4 sealed_copy -\n"
+            b"ok command - signaled 15 15 1 23 3 120 cleared 4 sealed_copy -\n"
         );
         assert_eq!(decode_worker_result(&line).unwrap(), outcome);
         // 補助グループの扱いは 3 通りとも往復する（TASK-163 追補・#1457）。
@@ -1630,7 +1638,7 @@ mod tests {
             let line = encode_worker_result(&Ok(outcome));
             assert_eq!(
                 String::from_utf8(line.clone()).unwrap(),
-                format!("ok command - signaled 15 16 23 3 120 {text} sealed_copy -\n")
+                format!("ok command - signaled 15 15 1 23 3 120 {text} sealed_copy -\n")
             );
             assert_eq!(decode_worker_result(&line).unwrap(), outcome);
         }
@@ -1653,7 +1661,7 @@ mod tests {
             let line = encode_worker_result(&Ok(outcome));
             assert_eq!(
                 String::from_utf8(line.clone()).unwrap(),
-                format!("ok command - signaled 15 16 23 3 120 cleared 4 pinned_inode {code}\n")
+                format!("ok command - signaled 15 15 1 23 3 120 cleared 4 pinned_inode {code}\n")
             );
             assert_eq!(decode_worker_result(&line).unwrap(), outcome);
         }
@@ -1740,7 +1748,7 @@ mod tests {
             let line = encode_worker_result(&Ok(outcome));
             assert_eq!(
                 String::from_utf8(line.clone()).unwrap(),
-                format!("ok {text} 16 23 3 120 cleared 4 sealed_copy -\n")
+                format!("ok {text} 15 1 23 3 120 cleared 4 sealed_copy -\n")
             );
             assert_eq!(decode_worker_result(&line).unwrap(), outcome);
         }
@@ -1762,24 +1770,24 @@ mod tests {
 
         for bad in [
             &b""[..],
-            b"ok command - exited 0 1 2 3 4 cleared 1",
+            b"ok command - exited 0 1 0 2 3 4 cleared 1",
             b"ok command - exited 0 1 2 3\n",
-            b"ok command - exited 0 1 2 3 4\n",
-            b"ok command - exited 0 1 2 3 4 cleared\n",
-            b"ok command - exited 0 1 2 3 4 unknown 1 sealed_copy -\n",
-            b"ok command - exited 0 1 2 3 4 already_empty 2 sealed_copy -\n",
-            b"ok command - weird 0 1 2 3 4 cleared 1 sealed_copy -\n",
+            b"ok command - exited 0 1 0 2 3 4\n",
+            b"ok command - exited 0 1 0 2 3 4 cleared\n",
+            b"ok command - exited 0 1 0 2 3 4 unknown 1 sealed_copy -\n",
+            b"ok command - exited 0 1 0 2 3 4 already_empty 2 sealed_copy -\n",
+            b"ok command - weird 0 1 0 2 3 4 cleared 1 sealed_copy -\n",
             // 実行方式の欄: 欠落・不正な組み合わせ・未知の理由コード。
-            b"ok command - exited 0 1 2 3 4 cleared 1 sealed_copy\n",
-            b"ok command - exited 0 1 2 3 4 cleared 1 sealed_copy kernel_too_old\n",
-            b"ok command - exited 0 1 2 3 4 cleared 1 pinned_inode -\n",
-            b"ok command - exited 0 1 2 3 4 cleared 1 pinned_inode lsm_mystery\n",
-            b"ok command - exited 0 1 2 3 4 cleared 1 sealed_copy - extra\n",
+            b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy\n",
+            b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy kernel_too_old\n",
+            b"ok command - exited 0 1 0 2 3 4 cleared 1 pinned_inode -\n",
+            b"ok command - exited 0 1 0 2 3 4 cleared 1 pinned_inode lsm_mystery\n",
+            b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy - extra\n",
             // 旧形式（起動の別が無い）・未知の起動の別・コマンドの終了に違反が付く・子が返さない理由コード。
-            b"ok exited 0 1 2 3 4 cleared 1 sealed_copy -\n",
-            b"ok started - exited 0 1 2 3 4 cleared 1 sealed_copy -\n",
-            b"ok command entrypoint_is_runtime_binary exited 0 1 2 3 4 cleared 1 sealed_copy -\n",
-            b"ok setup rootfs_is_host_root exited 126 1 2 3 4 cleared 1 sealed_copy -\n",
+            b"ok exited 0 1 0 2 3 4 cleared 1 sealed_copy -\n",
+            b"ok started - exited 0 1 0 2 3 4 cleared 1 sealed_copy -\n",
+            b"ok command entrypoint_is_runtime_binary exited 0 1 0 2 3 4 cleared 1 sealed_copy -\n",
+            b"ok setup rootfs_is_host_root exited 126 1 0 2 3 4 cleared 1 sealed_copy -\n",
             b"hello\n",
             // 失敗行: 理由の欄が無い旧形式・未知の理由・exec 対象でない理由。
             b"err TIMEOUT\n",

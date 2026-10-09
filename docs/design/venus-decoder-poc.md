@@ -367,6 +367,7 @@ frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲスト
 | `mmap` / `munmap` | 9 / 11 | 222 / 215 |
 | `memfd_create` | 319 | 279 |
 | `fcntl` | 72 | 25 |
+| `ppoll` | 271 | 73 |
 | `F_ADD_SEALS` / `F_GET_SEALS` / `F_SEAL_SHRINK` / `MFD_ALLOW_SEALING` | 1033 / 1034 / 0x2 / 0x2 | 同左（個別に定義） |
 | `SOL_SOCKET` / `SCM_RIGHTS` | 1 / 1 | 1 / 1 |
 | `MSG_CTRUNC` / `MSG_TRUNC` / `MSG_NOSIGNAL` / `MSG_CMSG_CLOEXEC` | 0x8 / 0x20 / 0x4000 / 0x4000_0000 | 同左（個別に定義） |
@@ -377,7 +378,8 @@ frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲスト
 - 受け取る fd は `MAX_FDS`（32）。受信した fd は検証より前にすべて `OwnedFd` にし、`MSG_CTRUNC`・上限超過・構造異常のどのエラー経路でも `Drop` で閉じる。`MSG_CMSG_CLOEXEC` で close-on-exec を原子的に付ける
 - map は file offset 0 から `mmap_offset + memory_size` バイトを `MAP_SHARED` で行い、領域の先頭をマップ内の `mmap_offset` の位置として扱う（ページ境界にそろっていない `mmap_offset` でも `EINVAL` にしない）。QEMU `vhost-user.rst` の `mmap_offset` の定義との照合は未実施で、F1.4 の結合で確認する
 - 上限は治具独自: 1 領域の map 長 64 GiB・合計 128 GiB。合計の上限は mmap より前に checked 演算で判定する（`INVALID_REGION`）。fd は `F_SEAL_SHRINK` が確認できなければ `SHRINK_NOT_SEALED` で拒否し（seal 非対応の fd も同様）、そのうえでファイル長が map 長に届かなければ `FILE_TOO_SHORT`。領域をまたぐアクセスは `OUT_OF_BOUNDS`（PoC の割り切り）
-- マッピングへの参照は作らず、境界検査したコピーだけで出し入れする。`MmapRegion` は `!Send` / `!Sync`
+- マッピングへの参照は作らず、境界検査したコピーだけで出し入れする。`MmapRegion` は `!Send` / `!Sync`（`PhantomData<*mut u8>` で明示し、`compile_fail` の doctest で照合）
+- プロセス内の排他性: コピーは非アトミックなので、同じ backing file（`st_dev`・`st_ino`）のファイル上のアクセス範囲（`[mmap_offset, mmap_offset + memory_size)`）が重なる領域は、プロセス全体で同時に 1 個だけ map できる（重なれば mmap 前に `BACKING_IN_USE`。fd を複製しても同じ判定）。同じ memfd の重ならない範囲を別領域にするのは受け付ける。frontend プロセスの同時書き込みは vhost-user の前提として残る（値が不定になるだけ）。アトミックなコピーへの置き換えは U8 と別の unsafe になるため、承認を得るまで行わない
 - 縮小の封じ込め: frontend が後から `ftruncate` で縮めると `SIGBUS` になるため、`F_SEAL_SHRINK` つきの memfd だけを受け付ける。seal を付けない frontend は接続できない（PoC の割り切り。製品版の fd 要件は TASK-173 系で扱う）
 - aarch64 の定数と構造体は CI で型検査されない（治具はルート workspace 外で `aarch64-linux-check` の対象外）。固定値テストも実行アーキの分しか走らない。ローカルでは `cargo check --target aarch64-unknown-linux-gnu --all-targets` の型検査のみ通した（実行は未検証）
 - 範囲外: ヘッダ単位の読み書きの枠組み・セッション・UDS の bind と所有者・権限・peer credential の検証（PLUG-12 相当）・eventfd の待機は F1.4（#1519）、virtqueue と `userspace_addr` の変換は F1.3（#1518）

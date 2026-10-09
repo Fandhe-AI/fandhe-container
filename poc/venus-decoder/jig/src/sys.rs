@@ -5,7 +5,7 @@
 //! seal の確認と追加（`fcntl(2)`）・`mmap(2)` / `munmap(2)` と、マッピング領域へのコピー入出力を、安全な `pub(crate)`
 //! 関数と型だけで包む。呼び出し元は `vhost_user::fd_passing` と `vhost_user::guest_memory` で、`unsafe` はこのモジュールの外へ出さない。
 //!
-//! # unsafe の承認範囲（U1〜U10）
+//! # unsafe の承認範囲（U1〜U11）
 //! 根拠は #1517 の個別承認（U9・U10 は追加承認）。#4 の `sys` モジュールの事前承認は PoC パッケージに及ぶか
 //! 明確でないため根拠にしない。
 //! - U1〜U8: <https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6074351741>。
@@ -14,6 +14,8 @@
 //! - U9・U10（追加承認）: <https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6075711404>。
 //!   U9 `fcntl`（`F_GET_SEALS` / `F_ADD_SEALS`。`syscall(2)` 経由。メモリに触れない。受け取った memfd の縮小封じ込めの確認）・
 //!   U10 `ppoll`（`syscall(2)` 経由の期限つき待機。カーネルは `pollfd` の `revents` と、残り時間を `timespec` へ書き戻す）。
+//! - U11（PLUG-12 の peer credential 検証。PR #1611 のレビュー指摘 P0 への対応。coding-rust.md の `sys` モジュールの事前承認の
+//!   条件に沿って追加）: `getsockopt(SO_PEERCRED)`（`syscall(2)` 経由）。カーネルが `struct ucred` へ書くだけ。
 //! これを超える `unsafe`（`extern` 宣言の追加を含む）は書かない。`recvmsg` 等を直接 `extern` で宣言せず、すべて
 //! `syscall(2)` 経由にする。
 //!
@@ -142,6 +144,7 @@ mod imp {
         pub(crate) const NR_MEMFD_CREATE: i64 = 319;
         pub(crate) const NR_FCNTL: i64 = 72;
         pub(crate) const NR_PPOLL: i64 = 271;
+        pub(crate) const NR_GETSOCKOPT: i64 = 55;
         // asm-generic/socket.h・linux/socket.h・bits/socket.h の MSG_*。
         pub(crate) const SOL_SOCKET: i32 = 1;
         pub(crate) const SCM_RIGHTS: i32 = 1;
@@ -176,6 +179,8 @@ mod imp {
         // `struct cmsghdr` のヘッダ長（`cmsg_len: size_t`・`cmsg_level: int`・`cmsg_type: int`）と `CMSG_ALIGN` の境界（`size_t`）。
         pub(crate) const CMSG_HDR_LEN: usize = 16;
         pub(crate) const CMSG_ALIGN: usize = 8;
+        // asm-generic/socket.h の SO_PEERCRED（値 17。アーキ共通でもここで個別に定義する）。
+        pub(crate) const SO_PEERCRED: usize = 17;
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -188,6 +193,7 @@ mod imp {
         pub(crate) const NR_MEMFD_CREATE: i64 = 279;
         pub(crate) const NR_FCNTL: i64 = 25;
         pub(crate) const NR_PPOLL: i64 = 73;
+        pub(crate) const NR_GETSOCKOPT: i64 = 209;
         pub(crate) const SOL_SOCKET: i32 = 1;
         pub(crate) const SCM_RIGHTS: i32 = 1;
         pub(crate) const MSG_TRUNC: u32 = 0x20;
@@ -217,6 +223,8 @@ mod imp {
         // `struct cmsghdr` のヘッダ長（`cmsg_len: size_t`・`cmsg_level: int`・`cmsg_type: int`）と `CMSG_ALIGN` の境界（`size_t`）。
         pub(crate) const CMSG_HDR_LEN: usize = 16;
         pub(crate) const CMSG_ALIGN: usize = 8;
+        // asm-generic/socket.h の SO_PEERCRED（値 17。アーキ共通でもここで個別に定義する）。
+        pub(crate) const SO_PEERCRED: usize = 17;
     }
 
     use consts::*;
@@ -602,6 +610,41 @@ mod imp {
         check(ret).map(|_| ())
     }
 
+    /// カーネルの `struct ucred`（`include/linux/socket.h`）。12 バイト。
+    #[repr(C)]
+    #[derive(Default)]
+    struct Ucred {
+        pid: i32,
+        uid: u32,
+        gid: u32,
+    }
+
+    /// 接続済み UDS の相手（`connect(2)` を呼んだプロセス）の effective UID を返す（U11。`SO_PEERCRED`）。
+    /// PLUG-12 の peer credential 検証用。カーネルが `struct ucred` を書き込むだけで、`sock` の状態は変えない。
+    /// 返却長が `struct ucred` と一致しなければ `Invalid`（fail-closed）。
+    pub(crate) fn peer_uid(sock: BorrowedFd<'_>) -> Result<u32, SysError> {
+        let mut cred = Ucred::default();
+        let mut len: u32 = std::mem::size_of::<Ucred>() as u32;
+        // SAFETY: `sock` は `BorrowedFd` で呼び出し中有効。`optval` は `cred`（12 バイト・`repr(C)`）への有効な書き込み先、
+        // `optlen` は `len`（`u32` = `socklen_t`）への有効な読み書き先で、`len` の初期値は `cred` のサイズ。
+        // どちらもこの呼び出しの間だけ使われ、カーネルは `len` バイトを超えて書かない。他のメモリには触れない。
+        let ret = unsafe {
+            syscall(
+                NR_GETSOCKOPT,
+                sock.as_raw_fd() as usize,
+                SOL_SOCKET as usize,
+                SO_PEERCRED,
+                &mut cred as *mut Ucred as usize,
+                &mut len as *mut u32 as usize,
+            )
+        };
+        check(ret)?;
+        if len as usize != std::mem::size_of::<Ucred>() {
+            return Err(SysError::Invalid);
+        }
+        Ok(cred.uid)
+    }
+
     /// backing file 上のアクセス範囲（`[start, end)`。ファイルのバイトオフセット）。
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct LeaseKey {
@@ -828,6 +871,27 @@ mod imp {
         use std::mem::{align_of, offset_of, size_of};
 
         /// GPU-6: カーネル ABI の構造体レイアウト（LP64）。
+        /// PLUG-12: 同一プロセスの socketpair の相手 UID は自分の euid。
+        #[test]
+        fn plug12_peer_uid_of_socketpair_is_own_euid() {
+            let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+            let own = std::fs::metadata("/proc/self").expect("meta").uid();
+            assert_eq!(peer_uid(a.as_fd()), Ok(own));
+        }
+
+        /// PLUG-12: ソケットでない fd は `Os(ENOTSOCK = 88)` で失敗する（fail-closed）。
+        #[test]
+        fn plug12_peer_uid_of_non_socket_fails() {
+            let f = File::open("/proc/self/status").expect("open");
+            assert_eq!(peer_uid(f.as_fd()), Err(SysError::Os(88)));
+        }
+
+        /// PLUG-12: `struct ucred` のレイアウト。
+        #[test]
+        fn plug12_ucred_layout() {
+            assert_eq!(size_of::<Ucred>(), 12);
+        }
+
         #[test]
         fn gpu6_struct_layout_matches_kernel_abi() {
             assert_eq!(size_of::<Iovec>(), 16);
@@ -1086,6 +1150,10 @@ mod imp {
         Err(SysError::Unsupported)
     }
 
+    pub(crate) fn peer_uid(_sock: BorrowedFd<'_>) -> Result<u32, SysError> {
+        Err(SysError::Unsupported)
+    }
+
     /// 作れないマッピング（`map_shared` が常に `Unsupported`）。`!Send` / `!Sync` は対応アーキと同じにする。
     #[derive(Debug)]
     pub(crate) struct MmapRegion {
@@ -1117,5 +1185,5 @@ mod imp {
 }
 
 pub(crate) use imp::{
-    MmapRegion, add_shrink_seal, memfd_create_cloexec, recvmsg_fds, sendmsg_fds, wait_fd,
+    MmapRegion, add_shrink_seal, memfd_create_cloexec, peer_uid, recvmsg_fds, sendmsg_fds, wait_fd,
 };

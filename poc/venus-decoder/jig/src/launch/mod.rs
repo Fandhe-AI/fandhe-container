@@ -7,14 +7,14 @@
 //! 処理の順序: 引数解析 → パス検証 → UID 取得 → ソケットディレクトリの検証・作成 → 既存パスの検査 → ログファイル作成 →
 //! bind → 期限つき accept → `session::run` → 後始末。検証で拒否した場合はログファイルを作らず、既存のパスは消さない。
 //!
-//! 接続元の制限（PLUG-12 相当）: `SO_PEERCRED` による接続元 UID の検証は行わない（`getsockopt` の `unsafe` は承認が
-//! 得られておらず、std の `peer_cred` は stable でない）。代わりにソケットディレクトリを自 UID 所有・`0700` に限り、
-//! ソケットを `0600` にして、`/` までの祖先を全て検査する。ログの置き場所（親〜`/`）も同じ規則で検査する
+//! 接続元の制限（PLUG-12）: accept 直後、セッションに渡す前に `SO_PEERCRED`（`sys::peer_uid`）で接続元 UID を取得し、
+//! 実行ユーザーの effective UID と照合する。不一致・取得失敗は接続を閉じて拒否する（fail-closed。`PEER_UID_MISMATCH` /
+//! `PEER_CRED_UNAVAILABLE`）。加えて、ソケットディレクトリを自 UID 所有・`0700` に限り、ソケットを `0600` にして、
+//! `/` までの祖先を全て検査する。ログの置き場所（親〜`/`）も同じ規則で検査する
 //! （存在しない祖先・symlink・自 UID でも root でもない所有者・グループ／他者が書けて sticky でないディレクトリが
 //! あれば拒否。別 UID が祖先を rename や新規作成で差し替えて bind・chmod・削除・ログ作成を未検証の場所へ向けるのを
 //! 防ぐ。新規作成を許すのは検証済みの既存の親の直下にあるソケットディレクトリ 1 段だけ。祖先に symlink がある環境、
-//! 例えば `/var/run` 経由は拒否される）。限界: (1) 同じ UID の別プロセスと root は接続できる。別 UID の接続は、
-//! 0700 のディレクトリにより到達できないことだけで防ぐ（接続時の UID 照合はしない）。
+//! 例えば `/var/run` 経由は拒否される）。限界: (1) 同じ UID の別プロセスは接続できる（UID 照合の対象外）。
 //! (2) 検査と bind の間の TOCTOU は、祖先が他 UID に差し替え不能であることと、所有者が自分で `0700` のディレクトリで
 //! あることで抑える（同じ UID と root は差し替えられる）。
 //!
@@ -26,6 +26,7 @@ mod error;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{ErrorKind, Read};
+use std::os::fd::AsFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Component, Path, PathBuf};
@@ -36,6 +37,7 @@ pub use error::{LaunchError, LaunchErrorCode};
 
 use crate::log::LogSink;
 use crate::session::{SessionEnd, SessionLimits, run as run_session};
+use crate::sys;
 
 /// `sun_path` に入るバイト数の上限（`UNIX_PATH_MAX` = 108 から終端 NUL を除いた値）。
 /// 出典: Linux の `linux/un.h`（`#define UNIX_PATH_MAX 108`。2026-10-09 にローカルのヘッダで確認）。
@@ -257,6 +259,15 @@ fn check_path_collision(config_socket: &Path, config_log: &Path) -> Result<(), L
     Ok(())
 }
 
+/// 接続元 UID の照合結果を判定する（PLUG-12）。取得失敗と不一致はどちらも拒否（fail-closed）。
+fn verify_peer(peer: Result<u32, sys::SysError>, expected: u32) -> Result<(), LaunchError> {
+    match peer {
+        Ok(u) if u == expected => Ok(()),
+        Ok(_) => Err(LaunchError::new(LaunchErrorCode::PeerUidMismatch)),
+        Err(_) => Err(LaunchError::new(LaunchErrorCode::PeerCredUnavailable)),
+    }
+}
+
 /// 自分で bind したソケットだけを終了時に消す。既存のパスは消さない。
 struct SocketGuard(PathBuf);
 
@@ -324,7 +335,7 @@ pub fn run(config: &Config) -> Result<SessionEnd, LaunchError> {
     }
     let file = open_log(&config.log)?;
     let mut sink = LogSink::new(file);
-    let result = serve(config, &mut sink);
+    let result = serve(config, uid, &mut sink);
     if let Err(e) = &result {
         sink.write_line(&format!(
             "venus_jig event=launch_error code={}",
@@ -339,7 +350,7 @@ pub fn run(config: &Config) -> Result<SessionEnd, LaunchError> {
     result
 }
 
-fn serve(config: &Config, sink: &mut LogSink<File>) -> Result<SessionEnd, LaunchError> {
+fn serve(config: &Config, uid: u32, sink: &mut LogSink<File>) -> Result<SessionEnd, LaunchError> {
     let listener = UnixListener::bind(&config.socket)
         .map_err(|_| LaunchError::new(LaunchErrorCode::BindFailed))?;
     let guard = SocketGuard(config.socket.clone());
@@ -349,6 +360,8 @@ fn serve(config: &Config, sink: &mut LogSink<File>) -> Result<SessionEnd, Launch
     // 2 本目の接続は受けない（PoC の割り切り）。listener を閉じてソケットファイルを消す。
     drop(listener);
     drop(guard);
+    // 接続元 UID を照合してからセッションを始める。拒否時は `stream` を Drop して閉じる。
+    verify_peer(sys::peer_uid(stream.as_fd()), uid)?;
     stream
         .set_nonblocking(false)
         .map_err(|_| LaunchError::new(LaunchErrorCode::AcceptFailed))?;

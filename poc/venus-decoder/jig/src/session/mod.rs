@@ -7,8 +7,8 @@
 //! クエリが自前デコーダへ届いたことをログで確認）の前提で、実機での実行は F3（#725。人間担当）。
 //!
 //! 呼び出し元: `launch`（UDS を bind して `accept` した接続を渡す。F4・#1598）と結合試験。bind・所有者 / 権限 / symlink の検証は
-//! `launch` が行う。peer credential の検証（PLUG-12 相当。`SO_PEERCRED` は承認された `unsafe` の範囲外）は未実装で、ソケットディレクトリを `0700` に限る代替で割り切る
-//! （既知の穴。`launch` の doc と設計書 10.9）。
+//! `launch` が行う。peer credential の検証（PLUG-12。`SO_PEERCRED`）は `launch` が accept 直後に行い、この関数に渡る接続は照合済み
+//! （`launch` の doc と設計書 10.9）。
 //!
 //! 待機はすべて期限つき（REPAIR-5）。単一 fd 用の `sys::wait_fd` を socket と ctrl の kick で交互に短く待つ方式のため、
 //! kick への反応には最大 [`SessionLimits::poll_slice`] の遅延が乗る（複数 fd の ppoll 化は unsafe の承認範囲外）。

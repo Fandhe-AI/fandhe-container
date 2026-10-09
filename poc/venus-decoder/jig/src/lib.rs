@@ -6,7 +6,7 @@
 //! TASK-175 の製品版 ctrl 枠とは別物の PoC 実装で、製品 crate はこのパッケージに依存しない。
 //!
 //! vhost-user のメッセージ codec は実装済み（`vhost_user`。F1.1・#1516）。fd の受け渡し（`SCM_RIGHTS`）と
-//! ゲストメモリの mmap の安全なラッパーも実装済み（Linux 限定。F1.2・#1517）。`unsafe` は `sys` モジュール（#1517 の個別承認 U1〜U10）にだけ置く。
+//! ゲストメモリの mmap の安全なラッパーも実装済み（Linux 限定。F1.2・#1517）。`unsafe` は `sys` モジュール（#1517 の個別承認 U1〜U10 と、PLUG-12 の peer credential 用 U11）にだけ置く。
 //!
 //! split virtqueue（記述子チェーンの走査と used への書き戻し。F1.3・#1518）は `virtqueue` に実装済み（トランスポートに依存しない）。
 //!
@@ -14,8 +14,7 @@
 //!
 //! 起動入口（UDS の bind・期限つき accept・ログのファイル出力。F4・#1598）は `launch` と bin `venus-jig` に実装済み（Linux 限定）。
 //!
-//! 未実装（実装済みを装わない。REPAIR-3）: peer credential（`SO_PEERCRED`）の検証（`unsafe` の承認範囲外。ソケットディレクトリを
-//! 自 UID 所有・`0700` に限る代替で割り切り。`launch` の doc と設計書 10.9）、cursorq の処理、
+//! 未実装（実装済みを装わない。REPAIR-3）: cursorq の処理、
 //! `observe::snapshot_lines` の定期出力（終了時の集計出力は実装済み）と virtqueue 個別の観測カウンタ、上記以外の ctrl 応答（F2 の残り。未対応は `ERR_UNSPEC`）、
 //! 実機での疎通（F3・#725）。
 

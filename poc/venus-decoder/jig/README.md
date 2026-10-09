@@ -14,7 +14,8 @@ virtio-gpu 外部バックエンドの仕組みへ、自前の最小 venus デ�
 - 実装済み（F1.3・#1518）: split virtqueue（`virtqueue`。記述子チェーンの走査・`INDIRECT` 拒否・循環と上限の検出・used への書き戻し・vring アドレスの検証と user アドレスから GPA への変換。全 OS で合成メモリのテストが動く）。出典と前提は `docs/design/venus-decoder-poc.md` 10.7。
 - 実装済み（F1.4・#1519。Linux 限定）: vhost-user のセッションと ctrl キューの応答ループ（`session`。ネゴシエーションの状態遷移と順序違反の拒否・kick の待機・要求の取り出し・`adapter` への受け渡し・used への書き戻し・call での通知。待機はすべて期限つき）。設計は `docs/design/venus-decoder-poc.md` 10.8。
 - 実装済み（F4・#1598。Linux 限定）: 起動入口（`launch` と bin `venus-jig`。UDS の bind・ソケットディレクトリの検証・期限つき accept・ログのファイル出力）。設計は `docs/design/venus-decoder-poc.md` 10.9。
-- 未実装: peer credential（`SO_PEERCRED`）の検証（`unsafe` の承認範囲外。ソケットディレクトリを自 UID 所有・`0700` に限る代替。下記）・cursorq の処理・`observe` の定期出力。
+- 実装済み: accept 直後の peer credential（`SO_PEERCRED`）による接続元 UID の照合（PLUG-12。不一致・取得失敗は拒否。`sys::peer_uid`＝U11）。
+- 未実装: cursorq の処理・`observe` の定期出力。
 - 未達: 「Linux ゲストの Mesa venus の capset クエリが自前デコーダに届いたことをログで確認」は
   実機実行（#725。人間担当）の完了まで満たせない。
 

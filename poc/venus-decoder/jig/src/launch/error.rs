@@ -45,6 +45,10 @@ pub enum LaunchErrorCode {
     AcceptFailed,
     /// 期限内に接続が来なかった。
     AcceptTimeout,
+    /// 接続元の UID が実行ユーザーと異なる（PLUG-12。接続を閉じて拒否した）。
+    PeerUidMismatch,
+    /// 接続元の UID を取得できない（PLUG-12。fail-closed で接続を閉じた）。
+    PeerCredUnavailable,
     /// セッションがエラーで終わった（`cause` にセッションの code）。
     SessionFailed,
     /// Linux 以外では実行できない。
@@ -74,6 +78,8 @@ impl LaunchErrorCode {
             Self::BindFailed => "BIND_FAILED",
             Self::AcceptFailed => "ACCEPT_FAILED",
             Self::AcceptTimeout => "ACCEPT_TIMEOUT",
+            Self::PeerUidMismatch => "PEER_UID_MISMATCH",
+            Self::PeerCredUnavailable => "PEER_CRED_UNAVAILABLE",
             Self::SessionFailed => "SESSION_FAILED",
             Self::Unsupported => "UNSUPPORTED",
         }
@@ -105,6 +111,8 @@ impl LaunchErrorCode {
             Self::BindFailed => "cannot bind the unix socket",
             Self::AcceptFailed => "accept failed",
             Self::AcceptTimeout => "no connection before the accept deadline",
+            Self::PeerUidMismatch => "peer uid differs from the current user; connection rejected",
+            Self::PeerCredUnavailable => "cannot determine the peer uid; connection rejected",
             Self::SessionFailed => "vhost-user session ended with an error",
             Self::Unsupported => "venus-jig requires Linux",
         }

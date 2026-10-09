@@ -396,3 +396,35 @@ fn gpu6_missing_log_dir_is_rejected_without_creating_anything() {
     assert!(fs::symlink_metadata(base.join("s.sock")).is_err());
     fs::remove_dir_all(&base).unwrap();
 }
+/// PLUG-12: 接続元 UID が実行ユーザーと一致すれば受理する（実際の socketpair の `SO_PEERCRED` で照合）。
+#[test]
+fn plug12_peer_with_same_uid_is_accepted() {
+    use std::os::fd::AsFd;
+    let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+    let uid = effective_uid().expect("uid");
+    assert!(verify_peer(sys::peer_uid(a.as_fd()), uid).is_ok());
+}
+
+/// PLUG-12: 接続元 UID が異なれば `PEER_UID_MISMATCH` で拒否する（別 UID を用意できないので期待 UID をずらして照合）。
+#[test]
+fn plug12_peer_with_other_uid_is_rejected() {
+    use std::os::fd::AsFd;
+    let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+    let uid = effective_uid().expect("uid");
+    let r = verify_peer(sys::peer_uid(a.as_fd()), uid.wrapping_add(1));
+    assert_eq!(r.expect_err("reject").code.as_str(), "PEER_UID_MISMATCH");
+    assert_eq!(
+        verify_peer(Ok(0), 1000).expect_err("reject").code.as_str(),
+        "PEER_UID_MISMATCH"
+    );
+}
+
+/// PLUG-12: UID を取得できなければ `PEER_CRED_UNAVAILABLE` で拒否する（fail-closed）。
+#[test]
+fn plug12_peer_cred_failure_is_rejected() {
+    use std::os::fd::AsFd;
+    let f = File::open("/proc/self/status").expect("open");
+    let e = verify_peer(sys::peer_uid(f.as_fd()), 0).expect_err("reject");
+    assert_eq!(e.code.as_str(), "PEER_CRED_UNAVAILABLE");
+    assert_eq!(e.exit_code(), 1);
+}

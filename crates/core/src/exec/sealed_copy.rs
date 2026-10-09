@@ -22,9 +22,10 @@
 //!      （か判定できない）なら `FailedPrecondition`（[`LsmEnvironment::Refuse`]）
 //!    - SELinux が有効なら `FailedPrecondition`（元のファイルのラベルに対する `execute`・ドメイン遷移を memfd は
 //!      迂回するため、ドメインだけを根拠に通さない。[`LsmEnvironment::Refuse`]）
-//!    - Landlock が有効なら `FailedPrecondition`（実行プロセスが起動前から継承した domain の `EXECUTE` 制限は
-//!      カーネルに問い合わせられず、内部マウント上の memfd は継承した制限を受けないため、維持を保証できない）
-//!    - Landlock が `EXECUTE` を扱う場合、元のファイルの実パスに `EXECUTE` を与えるルールの配下になければ
+//!    - Landlock は有効でも一律には拒否しない（exec の子は自前のルールセットを必ず適用するため、一律拒否は
+//!      本番の exec を成立させなくする）。起動前から継承した domain の `EXECUTE` 制限は問い合わせられず memfd
+//!      には及ばないが、残余リスクとして許容する
+//!    - 自前の Landlock ルールセットが `EXECUTE` を扱う場合、元のファイルの実パスに `EXECUTE` を与えるルールの配下になければ
 //!      `PermissionDenied`（`execveat` が元のファイルで返していた `EACCES` と同じ扱い）
 //! 1. 元のファイルの実行権限をカーネルに判定させる（`sys::access_exec_via_proc`。実行ビット・`noexec`）。
 //!    memfd へ複製すると元のファイルの実行権限はカーネルから見えなくなるため、複製の前に確かめる。
@@ -43,7 +44,7 @@
 //! エラーで、違反にはせず `FailedPrecondition` で拒否する（照合だけの方式 A へ黙って戻さない）。
 //!
 //! 限界: 環境の判定（[`SealPolicy::probe`]）はホスト側の securityfs と `/proc/cmdline` に依る。判定できない
-//! 入力はすべて拒否に倒す。帰結として、AppArmor・SELinux・Landlock のいずれかが有効なホストでは封印した複製を
+//! 入力はすべて拒否に倒す。帰結として、AppArmor・SELinux が有効なホストでは封印した複製を
 //! 使えず exec は拒否される（照合だけの方式 A へは戻さない。採否は所有者の判断事項）。詳細は `interpreter.rs` の
 //! 「限界」。
 
@@ -194,13 +195,11 @@ pub(super) fn assess_lsm_environment(input: LsmProbeInput) -> LsmEnvironment {
             "SELinux is active; the exec-time permission and transition for the original file label cannot be reproduced for a sealed copy",
         );
     }
-    if names.contains(&"landlock") {
-        // 起動前から継承した Landlock domain の `EXECUTE` 制限は問い合わせられず、内部マウント上の memfd は
-        // その制限を受けない。継承 domain がないと保証できないため拒否する（CORE-5・SEC-1）。
-        return LsmEnvironment::Refuse(
-            "Landlock is active; an inherited EXECUTE restriction cannot be ruled out and would not apply to a sealed copy",
-        );
-    }
+    // Landlock はここで拒否しない。exec の子は自前の Landlock ルールセットを必ず適用してから `ExecReady` を返す
+    // （SUP-6）ため、有効な環境を一律に拒否すると本番の exec が成立しない。自前ルールの `EXECUTE` は
+    // `check_landlock_execute` が元のファイルの実パスで照合する。起動前から継承した domain の `EXECUTE` は
+    // 問い合わせられず memfd には及ばないが、継承 domain は呼び出し側（ホスト側のパス階層）への制限で、
+    // コンテナの mount namespace 内のエントリポイントには元々対応しない残余リスクとして許容する（CORE-5・SEC-1）。
     LsmEnvironment::Unrestricted
 }
 
@@ -515,18 +514,19 @@ mod tests {
     }
 
     /// SUP-6・SEC-1・CORE-5・TASK-163 追補・#1531: 対象外の LSM のみの環境は制約なし。SELinux・Landlock が有効な
-    /// 環境は（ドメインや自前のルールセットを根拠に通さず）拒否する。
+    /// 環境は（ドメインを根拠に通さず）拒否する。Landlock のみ有効な環境は拒否しない（#1579 の P1。本番 exec が成立する）。
     #[test]
-    fn sup6_sec1_unrelated_environment_is_unrestricted_and_selinux_landlock_are_refused() {
+    fn sup6_sec1_unrelated_environment_is_unrestricted_and_selinux_is_refused_but_landlock_is_not()
+    {
         let none = assess_lsm_environment(probe_input("lockdown,capability,yama", "", None));
         assert_eq!(none, LsmEnvironment::Unrestricted);
-        for lsm in [
-            "capability,landlock,selinux",
-            "capability,selinux",
-            "capability,landlock",
-        ] {
+        for lsm in ["capability,landlock,selinux", "capability,selinux"] {
             let got = assess_lsm_environment(probe_input(lsm, "", None));
             assert!(matches!(got, LsmEnvironment::Refuse(_)), "{lsm}: {got:?}");
+        }
+        for lsm in ["capability,landlock", "lockdown,capability,landlock,yama"] {
+            let got = assess_lsm_environment(probe_input(lsm, "", None));
+            assert_eq!(got, LsmEnvironment::Unrestricted, "{lsm}");
         }
     }
 

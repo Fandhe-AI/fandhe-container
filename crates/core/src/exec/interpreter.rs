@@ -124,9 +124,10 @@
 //!   Landlock ルールセットから判定し、維持できない（または判定できない）なら複製せずに拒否する: パス結び付きの LSM
 //!   （AppArmor・TOMOYO・Smack・BPF LSM・IPE）が有効なら `FailedPrecondition`、IMA は appraisal が有効か無効と
 //!   判定できないとき `FailedPrecondition`、SELinux が有効なら（ドメインを根拠に通さず）
-//!   `FailedPrecondition`、Landlock が有効なら（起動前から継承した domain の `EXECUTE` 制限をカーネルに問い合わせる
-//!   手段がなく、維持を保証できないため）`FailedPrecondition`、多重防御として exec 用ルールセットが `EXECUTE` を扱う場合は元のファイルの実パスが
-//!   `EXECUTE` を与えるルールの配下になければ `PermissionDenied`。**帰結**: AppArmor・SELinux・Landlock のいずれかを
+//!   `FailedPrecondition`。Landlock は有効でも一律には拒否しない（exec の子は自前のルールセットを必ず適用するため、
+//!   一律拒否は本番の exec を成立させない。起動前から継承した domain の `EXECUTE` 制限は問い合わせられず memfd
+//!   には及ばないが、残余リスクとして許容する）。exec 用ルールセットが `EXECUTE` を扱う場合は元のファイルの実パスが
+//!   `EXECUTE` を与えるルールの配下になければ `PermissionDenied`。**帰結**: AppArmor・SELinux のいずれかを
 //!   有効にしたホスト（Ubuntu・Fedora の既定等）では、稼働中コンテナへの exec は封印した複製を使えず拒否される
 //!   （照合だけの方式 A へは戻さない）。この環境での採否は所有者の判断事項。実行ビットと `noexec` は `faccessat2` で再現する。
 //!   setuid ビット・ファイル capability は `NO_NEW_PRIVS` が適用済みのため元々無効で、複製しても緩和にならない

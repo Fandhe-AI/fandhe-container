@@ -31,8 +31,16 @@
 //!   fd を複製（`dup`・`try_clone`・`/proc/self/fd` の再オープン）しても同じ inode なので同じ判定になる。
 //!   同じ memfd の重ならない範囲を別領域にする frontend（4 GiB 境界の上下で分ける等）は受け付ける
 //!
-//! frontend プロセスが同時に書き換えることは vhost-user の前提で、プロセス外の書き込みとして扱う（値が不定になるだけ）。
-//! アトミックなコピーへの置き換えは `copy_nonoverlapping`（U8）と別の unsafe になるため、承認を得るまで行わない。
+//!
+//! # 残っている前提
+//! - frontend プロセスによる同時書き込みは、Rust の抽象機械の外にある非アトミックなコピー（`copy_nonoverlapping`）として
+//!   扱う（コピーした値が不定になるだけで、マッピング外は触らない）。アトミックなコピーへの置き換えは
+//!   `copy_nonoverlapping`（U8）と別の unsafe になり U1〜U10 の承認範囲外のため、承認を得るまで行わない
+//! - 後続の F1.3（virtqueue。#1518）は、[`GuestMemory::read_at`] でコピーした後のバッファだけを解析する。共有メモリから
+//!   同じ値を二度読むと、その間に frontend が書き換えて検査済みの値と使う値が食い違い得る（二度読み・TOCTOU）
+//! - `SET_MEM_TABLE` の送り直し（F1.4・#1519）では、古い [`GuestMemory`] を drop してから新しい表を map する
+//!   （生かしたままだと同じ memfd の重なる範囲が `BACKING_IN_USE` になる）。合計上限は `GuestMemory` 1 個の中だけで、
+//!   セッション単位の上限は F1.4 で決める
 
 use std::fs::File;
 use std::num::NonZeroUsize;

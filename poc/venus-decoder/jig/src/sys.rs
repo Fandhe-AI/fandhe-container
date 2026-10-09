@@ -38,8 +38,9 @@
 //! 出典（確認日 2026-10-09）: Linux UAPI ヘッダ（ローカルの `linux-libc-dev`）の `asm-generic/socket.h`
 //! （SHA-256 `e833d32d3d8d03732021da6968665431d693ab4effdd4d39965ff05115a4ed21`）・`linux/socket.h`
 //! （`f4331fd201269894f63242a2521b3d5b3290ca556969011d7858908d5fe658c4`）・`asm-generic/mman-common.h`・`linux/memfd.h`、
+//! `linux/fcntl.h`（`F_ADD_SEALS` / `F_GET_SEALS` / `F_SEAL_*`）・`asm-generic/poll.h`（`POLLIN` / `POLLOUT`）、
 //! syscall 番号は x86_64 の `asm/unistd_64.h` と asm-generic の `unistd.h`、man `recvmsg(2)`・`unix(7)`・`cmsg(3)`・`mmap(2)`・
-//! `memfd_create(2)`・`fcntl(2)`・`linux/fcntl.h`（`F_ADD_SEALS` / `F_GET_SEALS` / `F_SEAL_*`）。値だけを転記し、コードは流用していない。
+//! `memfd_create(2)`・`fcntl(2)`・`ppoll(2)`。値だけを転記し、コードは流用していない。
 
 use std::ffi::CStr;
 use std::fs::File;

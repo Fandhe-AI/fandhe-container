@@ -100,10 +100,12 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::rlimits::{Rlimit, Rlimits};
 use crate::sys::{self, Signal, SysError};
 use crate::traits::types::ErrorCode;
 
 use super::interpreter::reject_runtime_interpreter;
+use super::rlimits::apply_rlimits;
 use super::sealed_copy::seal_entrypoint_copy;
 use super::{
     CapabilityReport, ExecError, IsolationStage, MountIsolation, PivotReport, StagePipeline,
@@ -380,7 +382,7 @@ fn exec_entrypoint_verified(
 /// （`exec_command::spawn_exec_command` の子。参加後の `/` の照合は `reapply_restrictions` が済ませている。
 /// SUP-6・TASK-163.4）が共有する。呼び出し元は「`/` が正しい root であること」を事前に保証すること。
 pub(super) fn exec_checked_entrypoint(entry: &Entrypoint) -> Result<Infallible, ExecError> {
-    let file = prepare_exec_child(entry, None, EntrypointSource::Pinned)?;
+    let file = prepare_exec_child(entry, None, EntrypointSource::Pinned, None)?;
     Err(execve_checked(entry, &file))
 }
 
@@ -408,6 +410,7 @@ fn prepare_exec_child(
     entry: &Entrypoint,
     keep: Option<BorrowedFd<'_>>,
     source: EntrypointSource,
+    deferred_fsize: Option<Rlimit>,
 ) -> Result<std::fs::File, ExecError> {
     const STAGE: IsolationStage = IsolationStage::Exec;
     // 継承したホスト側の fd 3 以上を開く前に閉じる（rootfs 内の /proc/self/fd/N 経由で実体を開かれない）。
@@ -443,6 +446,19 @@ fn prepare_exec_child(
             seal_entrypoint_copy(&file, &meta, procfs.as_fd(), entry.path())?
         }
     };
+    // 複製の書き込みが済んだので、持ち越した `RLIMIT_FSIZE` を適用する（複製の前に載せると `RLIMIT_FSIZE` が 0 や
+    // バイナリより小さい構成で `SIGXFSZ`・`EFBIG` により起動できない。SUP-12。#1531）。複製の上限と cgroup の
+    // メモリ制限は維持される。capability 削減後でも、rlimit を下げる `prlimit` は特権を要さない。
+    if let Some(fsize) = deferred_fsize {
+        let set = Rlimits::new(vec![fsize]).map_err(|_| {
+            ExecError::new(
+                ErrorCode::Internal,
+                IsolationStage::Rlimits,
+                "failed to build the deferred RLIMIT_FSIZE",
+            )
+        })?;
+        apply_rlimits(&set)?;
+    }
     // シェバン・`PT_INTERP` の解決先がランタイム自身でないことも確かめる（本体の照合だけでは
     // `#!/proc/self/exe` を通してしまう。#1458。契約と限界は `interpreter.rs`）。
     reject_runtime_interpreter(&file, entry.path(), runtime, procfs.as_fd())?;
@@ -1015,13 +1031,19 @@ pub(super) const EXEC_CHILD_VIOLATIONS: [ViolationReason; 7] = [
 fn run_exec_child(
     entry: &Entrypoint,
     status: &std::fs::File,
+    deferred_fsize: Option<Rlimit>,
     terminal: impl FnOnce(&Entrypoint, &std::fs::File) -> Result<i32, ExecError>,
 ) -> i32 {
-    let result = prepare_exec_child(entry, Some(status.as_fd()), EntrypointSource::SealedCopy)
-        .and_then(|file| {
-            write_exec_status(status, EXEC_STATUS_READY)?;
-            terminal(entry, &file)
-        });
+    let result = prepare_exec_child(
+        entry,
+        Some(status.as_fd()),
+        EntrypointSource::SealedCopy,
+        deferred_fsize,
+    )
+    .and_then(|file| {
+        write_exec_status(status, EXEC_STATUS_READY)?;
+        terminal(entry, &file)
+    });
     match result {
         Ok(code) => code,
         Err(err) => {
@@ -1065,8 +1087,12 @@ fn write_exec_status(mut status: &std::fs::File, line: &[u8]) -> Result<(), Exec
 }
 
 /// 稼働中コンテナへの exec の子のメイン（[`run_exec_child`] の終端を `execveat` にしたもの）。
-pub(super) fn exec_child_main(entry: &Entrypoint, status: &std::fs::File) -> i32 {
-    run_exec_child(entry, status, |entry, file| {
+pub(super) fn exec_child_main(
+    entry: &Entrypoint,
+    status: &std::fs::File,
+    deferred_fsize: Option<Rlimit>,
+) -> i32 {
+    run_exec_child(entry, status, deferred_fsize, |entry, file| {
         Err(execve_checked(entry, file))
     })
 }
@@ -1237,7 +1263,7 @@ pub fn observe_exec_child_setup_with(
     let (status_read, status_write) = exec_status_pipe()?;
     let pid = sys::fork_single_threaded(
         || {
-            run_exec_child(entry, &status_write, |entry, file| {
+            run_exec_child(entry, &status_write, None, |entry, file| {
                 after_prepare();
                 write_setup_report(entry, report, file).map(|()| 0)
             })

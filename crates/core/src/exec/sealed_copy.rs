@@ -14,6 +14,8 @@
 //!
 //! 手順（順序固定。いずれかの失敗は fail-closed で exec しない）:
 //!
+//! 0. 自プロセスが LSM（AppArmor・SELinux）に閉じ込められていれば拒否する（`FailedPrecondition`。元のファイルの
+//!    exec 遷移を memfd では再現できないため。#1531）
 //! 1. 元のファイルの実行権限をカーネルに判定させる（`sys::access_exec_via_proc`。実行ビット・`noexec`）。
 //!    memfd へ複製すると元のファイルの実行権限はカーネルから見えなくなるため、複製の前に確かめる。
 //!    `EACCES` は `PermissionDenied`（違反にしない。今の `execve` の `EACCES` と同じ扱い）
@@ -30,8 +32,8 @@
 //! memfd の作成失敗（`ENOSYS`・`EACCES` = `vm.memfd_noexec=2`・`EPERM` = seccomp）は前提不足のシステム
 //! エラーで、違反にはせず `FailedPrecondition` で拒否する（照合だけの方式 A へ黙って戻さない）。
 //!
-//! 限界: LSM（AppArmor・SELinux・IMA）の exec 検査は元のファイルについて再現しない。詳細は
-//! `interpreter.rs` の「限界」。
+//! 限界: 手順 0 は子のラベルで判定する。`unconfined` の子に対するパス結び付きの AppArmor プロファイルと IMA の
+//! appraisal は検出できず、元のファイルについて再現しない。詳細は `interpreter.rs` の「限界」。
 
 use std::ffi::CStr;
 use std::fs::{File, Metadata};
@@ -78,6 +80,7 @@ pub(super) fn seal_copy_bounded(
     procfs: BorrowedFd<'_>,
     subject: &std::path::Path,
 ) -> Result<(File, Metadata), ExecError> {
+    reject_if_lsm_confined(read_lsm_attr_current(), subject)?;
     check_executable(file, procfs, subject)?;
     if size > limit {
         return Err(ExecError::from_violation_at(
@@ -124,6 +127,54 @@ pub(super) fn seal_copy_bounded(
         return Err(changed_while_copying(subject));
     }
     Ok((reopened, meta))
+}
+
+/// 手順 0: 自プロセスが LSM（AppArmor・SELinux）に閉じ込められていないか（`/proc/thread-self/attr/current` の読み取り結果）。
+///
+/// 元のファイルに対する LSM の exec 遷移（AppArmor のパスによるプロファイル選択・SELinux のファイルラベルによる
+/// ドメイン遷移）は、memfd を実行すると働かない。遷移を再現できないため、LSM の制約下（`unconfined` 以外の
+/// ラベル）の子は複製の前に拒否する（fail-closed。照合だけの方式 A へ黙って戻さない）。属性が存在しない・
+/// 読めない種類のエラー（`NotFound`・`InvalidInput` = LSM が属性を持たない）は LSM なしとして通し、それ以外の
+/// 読み取り失敗は確認できないため拒否する。残る限界: AppArmor が `unconfined` の子に対し、パスで結び付く
+/// プロファイルが元のファイルに存在する場合は検出できない（`interpreter.rs` の「限界」）。
+fn reject_if_lsm_confined(
+    attr: std::io::Result<String>,
+    subject: &std::path::Path,
+) -> Result<(), ExecError> {
+    match attr {
+        Ok(text) => {
+            let label = text.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+            if label.is_empty() || label == "unconfined" {
+                Ok(())
+            } else {
+                Err(ExecError::new(
+                    ErrorCode::FailedPrecondition,
+                    STAGE,
+                    format!(
+                        "the process is confined by a Linux security module; refusing to run {subject:?} from a sealed copy, which would bypass its exec transition"
+                    ),
+                ))
+            }
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(ExecError::from_io(
+            &e,
+            STAGE,
+            "read of the security module attribute",
+        )),
+    }
+}
+
+/// 自プロセス（スレッド）の LSM 属性（`attr/current`）を読む。
+fn read_lsm_attr_current() -> std::io::Result<String> {
+    std::fs::read_to_string("/proc/thread-self/attr/current")
 }
 
 /// 手順 1: 元のファイルをカーネルが実行できると判定するか。
@@ -214,6 +265,36 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
+
+    /// SUP-6・SEC-1・CORE-5・TASK-163 追補・#1531: LSM の制約下の子は複製の前に拒否し、`unconfined`・属性なしは通す。
+    #[test]
+    fn sup6_sec1_lsm_confined_child_is_rejected_before_copy() {
+        let subject = Path::new("/bin/true");
+        for ok in ["unconfined\n", "unconfined", "", "\0"] {
+            assert!(
+                reject_if_lsm_confined(Ok(ok.to_owned()), subject).is_ok(),
+                "{ok:?}"
+            );
+        }
+        for confined in [
+            "docker-default (enforce)\n",
+            "system_u:system_r:container_t:s0:c1,c2\0",
+            "unconfined_u:unconfined_r:unconfined_t:s0",
+        ] {
+            let e = reject_if_lsm_confined(Ok(confined.to_owned()), subject).unwrap_err();
+            assert_eq!(e.code, ErrorCode::FailedPrecondition, "{confined:?}");
+        }
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::InvalidInput,
+        ] {
+            assert!(reject_if_lsm_confined(Err(kind.into()), subject).is_ok());
+        }
+        let e =
+            reject_if_lsm_confined(Err(std::io::Error::from_raw_os_error(sys::EACCES)), subject)
+                .unwrap_err();
+        assert_eq!(e.code, ErrorCode::PermissionDenied);
+    }
 
     /// 試験ごとの作業ディレクトリ（pid とラベルで一意。drop で削除）。
     struct Scratch(PathBuf);

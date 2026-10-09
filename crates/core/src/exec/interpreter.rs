@@ -117,7 +117,9 @@
 //!   パスの差し替えとインタープリタ自身の内容の書き換えは閉じず、引き続き Landlock に頼る。launch 経路への適用は
 //!   #1314（本番 launcher の構成）の後になる
 //! - **B' は LSM の exec 検査を再現しない**: 元のファイルに対する AppArmor・SELinux の exec 遷移・IMA の appraisal は、
-//!   memfd を実行する場合は元のファイルについて働かない。実行ビットと `noexec` だけを `faccessat2` で再現する。
+//!   memfd を実行する場合は元のファイルについて働かない。子が LSM の制約下（`attr/current` が `unconfined` 以外）なら
+//!   複製の前に `FailedPrecondition` で拒否する（`sealed_copy.rs` の手順 0）。`unconfined` の子へのパス結び付きの
+//!   AppArmor プロファイルと IMA は検出できない。実行ビットと `noexec` だけを `faccessat2` で再現する。
 //!   setuid ビット・ファイル capability は `NO_NEW_PRIVS` が適用済みのため元々無効で、複製しても緩和にならない
 //! - **B' で `/proc/self/exe` の見え方が変わる**: exec 先の `/proc/self/exe` は `/memfd:fandhe-exec-entrypoint (deleted)`
 //!   を指す（元のパスではなくなる）。シェバンのスクリプトは従来どおり `/dev/fd/N` を渡される

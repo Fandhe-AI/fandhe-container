@@ -170,7 +170,7 @@ use super::{
 };
 use crate::landlock::LandlockRuleset;
 use crate::oci_runtime::{OciConfig, RootfsDir};
-use crate::rlimits::Rlimits;
+use crate::rlimits::{Rlimit, RlimitKind, Rlimits};
 use crate::sys;
 use crate::traits::types::ErrorCode;
 
@@ -276,6 +276,9 @@ struct ExecCarry {
     threads: ThreadCountSource,
     /// 適用したプロセス。別プロセス（fork した子等）が exec の入口を呼べないようにする。
     owner_pid: u32,
+    /// 子へ持ち越す `RLIMIT_FSIZE`（#1531）。封印した複製の書き込みが `RLIMIT_FSIZE`（0 や小さい値）で失敗
+    /// しないよう、exec プロセスには載せず、子が複製を完成させた後・`execveat` の前に適用する。
+    deferred_fsize: Option<Rlimit>,
 }
 
 impl std::fmt::Debug for ExecCarry {
@@ -426,11 +429,13 @@ impl ExecReady {
             root,
             threads,
             owner_pid,
+            deferred_fsize,
         } = self.carry;
         ExecReadyParts {
             root,
             threads,
             owner_pid,
+            deferred_fsize,
         }
     }
 
@@ -442,6 +447,7 @@ impl ExecReady {
                 root,
                 threads,
                 owner_pid,
+                deferred_fsize: None,
             },
         }
     }
@@ -452,6 +458,8 @@ pub(super) struct ExecReadyParts {
     pub(super) root: OwnedFd,
     pub(super) threads: ThreadCountSource,
     pub(super) owner_pid: u32,
+    /// 子が複製の完成後に適用する `RLIMIT_FSIZE`（[`ExecCarry::deferred_fsize`]）。
+    pub(super) deferred_fsize: Option<Rlimit>,
 }
 
 /// `config`（コンテナの `config.json`）から Landlock ruleset を作り、参加後の `/` と照合する rootfs・
@@ -796,8 +804,11 @@ fn reapply_inner(
     let root = open_verified_root(rootfs.as_fd())?;
     // 観測用の空集合では syscall を呼ばず、下で未適用の一覧へ `Rlimits` を載せる。通常は全 16 種が入る。
     let rlimits_skipped = rlimits.is_empty();
+    // `RLIMIT_FSIZE` だけは子へ持ち越す（封印した複製の書き込みを妨げない。#1531）。実効値は子が複製の完成後・
+    // `execveat` の前に適用し、読み戻して確認する。件数（`rlimits_applied`）には含める。
+    let (immediate, deferred_fsize) = split_deferred_fsize(&rlimits)?;
     if !rlimits_skipped {
-        apply_rlimits(&rlimits).map_err(|e| e.at_stage(IsolationStage::Rlimits))?;
+        apply_rlimits(&immediate).map_err(|e| e.at_stage(IsolationStage::Rlimits))?;
     }
     // capability 削減は、先頭で補助グループも空にする（launch 経路と同じ関数。#1457）。
     let capabilities = if drop_capabilities {
@@ -842,8 +853,30 @@ fn reapply_inner(
             root,
             threads,
             owner_pid,
+            deferred_fsize,
         },
     })
+}
+
+/// `rlimits` を「いま適用する集合」と「子へ持ち越す `RLIMIT_FSIZE`」に分ける（#1531）。
+fn split_deferred_fsize(rlimits: &Rlimits) -> Result<(Rlimits, Option<Rlimit>), ExecError> {
+    let deferred = rlimits
+        .iter()
+        .find(|r| r.kind() == RlimitKind::Fsize)
+        .copied();
+    let rest = rlimits
+        .iter()
+        .filter(|r| r.kind() != RlimitKind::Fsize)
+        .copied()
+        .collect();
+    let rest = Rlimits::new(rest).map_err(|_| {
+        ExecError::new(
+            ErrorCode::Internal,
+            IsolationStage::Rlimits,
+            "failed to split the rlimits",
+        )
+    })?;
+    Ok((rest, deferred))
 }
 
 /// [`observe_exec_restriction_reapply`] の観測結果。errno は成功を `None`、失敗を `Some(errno)`（不明は `-1`）。
@@ -1050,6 +1083,7 @@ mod tests {
                 root: dir_fd(Path::new("/")),
                 threads: ThreadCountSource::ProcSelf,
                 owner_pid: std::process::id(),
+                deferred_fsize: None,
             },
         }
     }

@@ -104,6 +104,7 @@ pub mod injected_files;
 pub mod landlock;
 pub mod observability;
 pub mod oci_runtime;
+pub mod open_flags;
 #[cfg(feature = "plugin")]
 pub mod plugin;
 pub mod plugin_discovery;

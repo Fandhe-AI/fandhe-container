@@ -13,7 +13,7 @@
 //!   起動（TASK-157・TASK-37〜39・CORE-1）に差し替え、起動済みプロセスの監視・回収を supervisor へ引き渡す。
 //!   失敗する `start` でも core は起動権の予約（Created → Running）と取り消し（Running → Created）を
 //!   状態ストアへ書くため、状態は Created のままでも `state.json` の revision は進む（ファイルは不変ではない）。
-//! - 計測（REPAIR-4）のファイル出力は Linux の x86_64 / aarch64 のみ（`op_log_file`）。本バイナリを
+//! - 計測（REPAIR-4）のファイル出力は core の `open_flags` が対応するアーキテクチャの Linux のみ（`op_log_file`。対応外は出力しない）。本バイナリを
 //!   setuid / setgid・file capability つきで導入しない前提で、権限分離（TASK-171・SUP-14）で見直す。
 //! - macOS / Windows は plugin 発見機構経由（TASK-79.4・PLUG-4。`plugin_backend` module）。非 Linux では
 //!   `production_runtime` が状態ストアの代わりに plugin の発見・信頼性検証を試み、現状は必ず fail-closed で
@@ -153,12 +153,12 @@ fn record_pre_core_failure(recorder: &OpRecorder, op_name: &str, started: Instan
 /// 計測は stdout / stderr へ混ぜず、この環境変数が指すファイルへ追記する。未設定なら出力しない。
 pub(super) const OP_LOG_ENV: &str = "FANDHE_CONTAINER_OP_LOG";
 
-/// 計測ログの出力先を安全に開く Linux（x86_64 / aarch64）実装（SEC-1・REPAIR-5）。
+/// 計測ログの出力先を安全に開く Linux 実装（SEC-1・REPAIR-5）。
 ///
-/// [`export_ops`] から [`open_op_log`] だけが呼ばれる。open フラグの値はアーキテクチャごとに異なるため
-/// （`flags`）、値を確認済みの x86_64 / aarch64 に限って有効にする。それ以外のアーキテクチャ・OS は
-/// 外側の `open_op_log` が常に `None` を返し、計測を出力しない（fail-closed。core の `sys` が対応外
-/// アーキテクチャで `Unsupported` を返すのと同じ判断）。
+/// [`export_ops`] から [`open_op_log`] だけが呼ばれる。open フラグの値はアーキテクチャごとに異なるため、
+/// 値は core の `open_flags::NofollowOpenFlags` から得る（SSOT は core の `sys`）。対応外アーキテクチャでは
+/// `NofollowOpenFlags::current()` が `None` を返し、`open_op_log` は何も開かず `None` を返す。非 Linux は
+/// 外側の `open_op_log` が常に `None` を返す（いずれも計測を出力しない fail-closed）。
 ///
 /// 前提（SEC-1）: 本バイナリを setuid / setgid・file capability つきで導入しない。出力先は環境変数で
 /// 指定でき、検査は「実効 UID から見て差し替えられない経路か」だけを見るため、呼び出し元より高い権限で
@@ -167,48 +167,11 @@ pub(super) const OP_LOG_ENV: &str = "FANDHE_CONTAINER_OP_LOG";
 /// （file capability だけが付いた実行は UID・GID に現れないため検出できない）。
 /// 権限分離の方式（TASK-171・SUP-14）が決まったら、この判定と出力先の扱いを見直す。
 ///
-/// 将来仕様（REPAIR-3）: open フラグと fd 相対の open は、core に安全な公開 API を置いて再利用する形へ
-/// 寄せる（現状は cli 側の複製。core の変更を伴うため本 module では行っていない）。
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+/// open フラグは core が SSOT（#1540）。fd 相対の open 処理は意味（既存ファイルの権限の扱い等）が
+/// core の監査ログと異なるため、引き続き cli 側に持つ。
+#[cfg(target_os = "linux")]
 mod op_log_file {
-    pub(super) use flags::O_NONBLOCK;
-    use flags::{O_DIRECTORY, O_NOFOLLOW, O_PATH};
-
-    /// x86_64 の open フラグ（asm-generic の値）。libc 非依存のため値を直書きし、固定値テストで照合する。
-    /// 値が同じものも含め、アーキテクチャごとに個別定義する（他アーキテクチャの値を流用しない）。
-    #[cfg(target_arch = "x86_64")]
-    mod flags {
-        /// 読み手のいない FIFO の open で無期限にブロックしないための O_NONBLOCK（REPAIR-5）。
-        pub(in super::super) const O_NONBLOCK: i32 = 0o4000;
-        /// ディレクトリ以外の open を失敗させる O_DIRECTORY。
-        pub(super) const O_DIRECTORY: i32 = 0o200_000;
-        /// 最終要素が symlink なら open を失敗させる O_NOFOLLOW。
-        pub(super) const O_NOFOLLOW: i32 = 0o400_000;
-        /// 副作用なく inode だけを固定する O_PATH。
-        pub(super) const O_PATH: i32 = 0o10_000_000;
-    }
-
-    /// aarch64 の open フラグ。O_DIRECTORY / O_NOFOLLOW は arm64 が asm-generic の値を上書きしている。
-    #[cfg(target_arch = "aarch64")]
-    mod flags {
-        /// 読み手のいない FIFO の open で無期限にブロックしないための O_NONBLOCK（REPAIR-5）。
-        pub(in super::super) const O_NONBLOCK: i32 = 0o4000;
-        /// ディレクトリ以外の open を失敗させる O_DIRECTORY。
-        pub(super) const O_DIRECTORY: i32 = 0o40_000;
-        /// 最終要素が symlink なら open を失敗させる O_NOFOLLOW。
-        pub(super) const O_NOFOLLOW: i32 = 0o100_000;
-        /// 副作用なく inode だけを固定する O_PATH。
-        pub(super) const O_PATH: i32 = 0o10_000_000;
-    }
-
-    /// 固定値テスト用に [O_NONBLOCK, O_DIRECTORY, O_NOFOLLOW, O_PATH] を返す。
-    #[cfg(test)]
-    pub(super) fn flag_values_for_test() -> [i32; 4] {
-        [O_NONBLOCK, O_DIRECTORY, O_NOFOLLOW, O_PATH]
-    }
+    use fandhe_container_core::open_flags::NofollowOpenFlags;
 
     /// 新規作成する計測ログの mode（所有者のみ読み書き。umask に任せて group / other へ開かない）。
     const OP_LOG_CREATE_MODE: u32 = 0o600;
@@ -296,11 +259,15 @@ mod op_log_file {
     }
 
     /// `dir` 直下の要素 `name` を O_NOFOLLOW でディレクトリとして開く（親 fd 経由。SEC-1）。
-    fn open_dir_at(dir: &std::fs::File, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+    fn open_dir_at(
+        dir: &std::fs::File,
+        name: &std::ffi::OsStr,
+        flags: NofollowOpenFlags,
+    ) -> std::io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(O_NONBLOCK | O_NOFOLLOW | O_DIRECTORY)
+            .custom_flags(flags.directory_nofollow_nonblock())
             .open(child_via_fd(dir, name))
     }
 
@@ -323,6 +290,7 @@ mod op_log_file {
     pub(super) fn open_trusted_parent(
         parent: &std::path::Path,
         euid: u32,
+        flags: NofollowOpenFlags,
     ) -> Option<std::fs::File> {
         use std::collections::VecDeque;
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -355,7 +323,7 @@ mod op_log_file {
         let open_root = || -> Option<std::fs::File> {
             let f = std::fs::OpenOptions::new()
                 .read(true)
-                .custom_flags(O_NONBLOCK | O_NOFOLLOW | O_DIRECTORY)
+                .custom_flags(flags.directory_nofollow_nonblock())
                 .open("/")
                 .ok()?;
             dir_trusted(&f, euid).then_some(f)
@@ -378,7 +346,7 @@ mod op_log_file {
                 Step::Name(n) => n,
             };
             let cur = stack.last()?;
-            match open_dir_at(cur, &name) {
+            match open_dir_at(cur, &name, flags) {
                 Ok(next) => {
                     if !dir_trusted(&next, euid) {
                         return None;
@@ -425,8 +393,9 @@ mod op_log_file {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => std::path::Path::new("."),
         };
+        let flags = NofollowOpenFlags::current()?;
         let euid = unelevated_euid()?;
-        let dir = open_trusted_parent(parent, euid)?;
+        let dir = open_trusted_parent(parent, euid, flags)?;
         let target = child_via_fd(&dir, name);
         let verify = |f: &std::fs::File| -> bool {
             f.metadata()
@@ -439,7 +408,7 @@ mod op_log_file {
         for _ in 0..OP_LOG_OPEN_ATTEMPTS {
             let pinned = match std::fs::OpenOptions::new()
                 .read(true)
-                .custom_flags(O_PATH | O_NOFOLLOW)
+                .custom_flags(flags.path_nofollow())
                 .open(&target)
             {
                 Ok(f) => f,
@@ -449,7 +418,7 @@ mod op_log_file {
                         .append(true)
                         .create_new(true)
                         .mode(OP_LOG_CREATE_MODE)
-                        .custom_flags(O_NONBLOCK | O_NOFOLLOW)
+                        .custom_flags(flags.file_nofollow_nonblock())
                         .open(&target)
                     {
                         Ok(f) => return verify(&f).then_some(f),
@@ -464,7 +433,7 @@ mod op_log_file {
             }
             let f = std::fs::OpenOptions::new()
                 .append(true)
-                .custom_flags(O_NONBLOCK)
+                .custom_flags(flags.nonblock())
                 .open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
                 .ok()?;
             return verify(&f).then_some(f);
@@ -477,22 +446,17 @@ mod op_log_file {
     const OP_LOG_OPEN_ATTEMPTS: u32 = 4;
 }
 
-/// 対応外の環境（macOS・Windows、および x86_64 / aarch64 以外の Linux）は計測のファイル出力を拒否する
+/// 対応外の環境（macOS・Windows）は計測のファイル出力を拒否する
 /// （fail-closed。SEC-1・REPAIR-4）。macOS・Windows は実効 UID の取得と symlink / junction / reparse point の
-/// 安全な検査が未実装、他アーキテクチャの Linux は open フラグの値が未確認のため。
+/// 安全な検査が未実装のため。x86_64 / aarch64 以外の Linux は core の `NofollowOpenFlags::current()` が
+/// `None` を返すことで `op_log_file` 内部で拒否される。
 /// 将来は各 OS の安全な open 実装を `sys` モジュールに追加して対応する。
-#[cfg(not(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-)))]
+#[cfg(not(target_os = "linux"))]
 fn open_op_log(_path: &std::ffi::OsStr) -> Option<std::fs::File> {
     None
 }
 
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(target_os = "linux")]
 use op_log_file::open_op_log;
 
 /// 1 回の計測出力（全 `op_stats` 行 + メタ行）の上限バイト数（REPAIR-4・REPAIR-5）。
@@ -950,7 +914,11 @@ mod tests {
         let p2 = mkfifo("idlereader");
         let reader = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(op_log_file::O_NONBLOCK)
+            .custom_flags(
+                fandhe_container_core::open_flags::NofollowOpenFlags::current()
+                    .expect("supported arch")
+                    .nonblock(),
+            )
             .open(&p2)
             .expect("open reader");
         run(p2.clone());
@@ -1043,7 +1011,8 @@ mod tests {
         assert!(real.join("log").is_file());
         let euid = op_log_file::unelevated_euid().expect("euid");
         let above_root = std::path::Path::new("/..");
-        assert!(op_log_file::open_trusted_parent(above_root, euid).is_none());
+        let flags = fandhe_container_core::open_flags::NofollowOpenFlags::current().expect("flags");
+        assert!(op_log_file::open_trusted_parent(above_root, euid, flags).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1053,7 +1022,7 @@ mod tests {
     ))]
     mod op_log_file_tests {
         use super::super::op_log_file::{
-            O_NONBLOCK, open_op_log, unelevated_euid, unelevated_euid_from_status,
+            open_op_log, unelevated_euid, unelevated_euid_from_status,
         };
 
         /// `/proc/<pid>/status` を模した本文（前後に実物と同じ並びの行を置く）。
@@ -1155,13 +1124,22 @@ mod tests {
         /// SEC-1: open フラグはアーキテクチャごとの固定値（Linux の UAPI ヘッダの値）。
         #[test]
         fn sec1_open_flags_have_fixed_values_per_arch() {
-            use super::super::op_log_file::flag_values_for_test;
+            use fandhe_container_core::open_flags::NofollowOpenFlags;
+            let f = NofollowOpenFlags::current().expect("supported arch");
+            // [nonblock, directory|nofollow|nonblock, path|nofollow, file nofollow|nonblock]
             #[cfg(target_arch = "x86_64")]
-            let want = [0o4000, 0o200_000, 0o400_000, 0o10_000_000];
+            let want = [0o4000, 0o604_000, 0o10_400_000, 0o404_000];
             #[cfg(target_arch = "aarch64")]
-            let want = [0o4000, 0o40_000, 0o100_000, 0o10_000_000];
-            assert_eq!(flag_values_for_test(), want);
-            assert_eq!(O_NONBLOCK, 0o4000);
+            let want = [0o4000, 0o144_000, 0o10_100_000, 0o104_000];
+            assert_eq!(
+                [
+                    f.nonblock(),
+                    f.directory_nofollow_nonblock(),
+                    f.path_nofollow(),
+                    f.file_nofollow_nonblock()
+                ],
+                want
+            );
         }
 
         /// SEC-1: 新規作成する計測ログは mode 0600（group / other へ開かない）。既存ファイルの mode は変えない。

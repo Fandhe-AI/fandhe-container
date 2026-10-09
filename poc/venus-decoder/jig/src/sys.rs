@@ -397,19 +397,22 @@ pub(crate) fn wait_fd(
         },
         revents: 0,
     };
-    let ts = Timespec {
+    // 生の `ppoll` syscall はカーネルが残り時間を timespec へ書き戻すため、可変な領域として渡す（libc の
+    // ラッパーと違い書き戻しを隠さない）。書き戻された値は使わず、呼び出し側が期限から残り時間を計算し直す。
+    let mut ts = Timespec {
         sec: i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX),
         nsec: i64::from(timeout.subsec_nanos()),
     };
-    // SAFETY: `pfd`（1 要素）と `ts` はカーネル ABI の `struct pollfd` / `struct timespec` と同じレイアウトで、呼び出し中は
-    // 生きている。`ppoll(fds, 1, &ts, NULL, 0)` は `pfd.revents` にだけ書き、`ts` は読むだけ（sigmask は NULL・サイズ 0）。
-    // fd は `BorrowedFd` で有効。
+    // SAFETY: `pfd`（1 要素）と `ts` はカーネル ABI の `struct pollfd` / `struct timespec` と同じレイアウト（固定値テストで
+    // 照合）で、どちらもこの関数のローカル変数として呼び出し中は生きており、他から参照されない排他的な可変領域。
+    // `ppoll(fds, 1, &ts, NULL, 0)` はカーネルが `pfd.revents` と `ts`（残り時間の書き戻し）の範囲内にだけ書く
+    // （sigmask は NULL・サイズ 0 で読まない）。fd は `BorrowedFd` で有効。
     let ret = unsafe {
         syscall(
             NR_PPOLL,
             &raw mut pfd as usize,
             1usize,
-            &raw const ts as usize,
+            &raw mut ts as usize,
             0usize,
             0usize,
         )
@@ -588,6 +591,11 @@ mod tests {
         assert_eq!(offset_of!(UserMsghdr, controllen), 40);
         assert_eq!(offset_of!(UserMsghdr, flags), 48);
         assert_eq!(CMSG_HDR_LEN, 16);
+        assert_eq!(size_of::<PollFd>(), 8);
+        assert_eq!(offset_of!(PollFd, events), 4);
+        assert_eq!(offset_of!(PollFd, revents), 6);
+        assert_eq!(size_of::<Timespec>(), 16);
+        assert_eq!(offset_of!(Timespec, nsec), 8);
     }
 
     /// GPU-6: `CMSG_SPACE` と補助データバッファの長さ。
@@ -620,6 +628,7 @@ mod tests {
             (2, 1033, 1034, 2)
         );
         assert_eq!((EINTR, EAGAIN, EINVAL), (4, 11, 22));
+        assert_eq!((MSG_DONTWAIT, POLLIN, POLLOUT), (0x40, 0x1, 0x4));
         #[cfg(target_arch = "x86_64")]
         assert_eq!(
             (
@@ -628,9 +637,10 @@ mod tests {
                 NR_MMAP,
                 NR_MUNMAP,
                 NR_MEMFD_CREATE,
-                NR_FCNTL
+                NR_FCNTL,
+                NR_PPOLL
             ),
-            (46, 47, 9, 11, 319, 72)
+            (46, 47, 9, 11, 319, 72, 271)
         );
         #[cfg(target_arch = "aarch64")]
         assert_eq!(
@@ -640,9 +650,10 @@ mod tests {
                 NR_MMAP,
                 NR_MUNMAP,
                 NR_MEMFD_CREATE,
-                NR_FCNTL
+                NR_FCNTL,
+                NR_PPOLL
             ),
-            (211, 212, 222, 215, 279, 25)
+            (211, 212, 222, 215, 279, 25, 73)
         );
     }
 }

@@ -118,6 +118,8 @@ impl Drop for Lease {
 pub struct GuestMemoryRegion {
     map: MmapRegion,
     gpa: u64,
+    /// 領域の末尾（`gpa + size`。map 時に checked 演算で求めて保持し、以降の判定で加減算しない）。
+    gpa_end: u64,
     size: u64,
     map_offset: usize,
     userspace_addr: u64,
@@ -144,7 +146,7 @@ impl GuestMemoryRegion {
         if region.memory_size == 0 {
             return Err(bad());
         }
-        region
+        let gpa_end = region
             .guest_phys_addr
             .checked_add(region.memory_size)
             .ok_or_else(bad)?;
@@ -182,6 +184,7 @@ impl GuestMemoryRegion {
         Ok(Self {
             map,
             gpa: region.guest_phys_addr,
+            gpa_end,
             size: region.memory_size,
             map_offset,
             userspace_addr: region.userspace_addr,
@@ -246,8 +249,7 @@ impl GuestMemoryRegion {
     }
 
     fn contains(&self, gpa: u64) -> bool {
-        // gpa + size の overflow は map 時に検証済み。
-        gpa >= self.gpa && gpa - self.gpa < self.size
+        self.gpa <= gpa && gpa < self.gpa_end
     }
 }
 
@@ -301,12 +303,8 @@ impl GuestMemory {
         for (spec, fd) in specs.iter().zip(fds) {
             let file = File::from(fd);
             let region = GuestMemoryRegion::map(&file, spec)?;
-            // gpa + size の overflow は map 時に検証済み。
-            let (start, end) = (region.gpa, region.gpa + region.size);
-            if regions
-                .iter()
-                .any(|r| start < r.gpa + r.size && r.gpa < end)
-            {
+            let (start, end) = (region.gpa, region.gpa_end);
+            if regions.iter().any(|r| start < r.gpa_end && r.gpa < end) {
                 return Err(err(TransportErrorCode::OverlappingRegions));
             }
             regions.push(region);
@@ -467,6 +465,29 @@ mod tests {
             dev: 8,
             ..k(1, 0, 0x1000)
         }));
+    }
+
+    /// GPU-6・REPAIR-12: 領域の末尾は map 時の値を使う。GPA 空間の末尾（`u64::MAX`）に接する領域でも加減算で
+    /// overflow せず、末尾ちょうどは領域外、接するだけの 2 領域は重ならない。
+    #[test]
+    fn gpu6_region_end_is_kept_without_arithmetic() {
+        let f = create_memfd(c"jig-gm-end", 0x1000).expect("memfd");
+        let top = u64::MAX - 0x1000;
+        let r = GuestMemoryRegion::map(&f, &region(top, 0x1000, 0)).expect("map");
+        assert_eq!(r.gpa_end, u64::MAX);
+        assert!(r.contains(u64::MAX - 1));
+        assert!(!r.contains(u64::MAX));
+        assert!(!r.contains(top - 1));
+        drop(r);
+        let (a, b) = (
+            create_memfd(c"jig-gm-adj-a", 0x1000).expect("memfd"),
+            create_memfd(c"jig-gm-adj-b", 0x1000).expect("memfd"),
+        );
+        let table = MemTable::new(&[region(top - 0x1000, 0x1000, 0), region(top, 0x1000, 0)])
+            .expect("table");
+        let gm = GuestMemory::from_table(&table, vec![OwnedFd::from(a), OwnedFd::from(b)])
+            .expect("adjacent regions do not overlap");
+        assert_eq!(gm.regions().len(), 2);
     }
 
     /// GPU-6・REPAIR-4: 境界検査の拒否が観測カウンタに失敗として計上される（増分で照合する）。

@@ -36,6 +36,7 @@ mod linux {
     pub fn run() {
         rejection_is_recorded_once_with_reason_and_no_path();
         rejection_reaches_the_audit_file_one_line_per_rejection();
+        failing_sink_keeps_the_process_single_threaded_for_repeated_exec();
         sink_failure_does_not_overturn_the_rejection();
         non_running_record_is_not_audited();
         println!("exec_audit: all scenarios passed");
@@ -143,6 +144,40 @@ mod linux {
     fn rejection_reaches_the_audit_file_one_line_per_rejection() {
         let dir = private_dir();
         let result = std::panic::catch_unwind(|| audit_file_scenario(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// 現在のプロセスのスレッド数（`/proc/self/status` の `Threads:`）。
+    fn thread_count() -> u32 {
+        std::fs::read_to_string("/proc/self/status")
+            .expect("read status")
+            .lines()
+            .find_map(|l| l.strip_prefix("Threads:"))
+            .and_then(|v| v.trim().parse().ok())
+            .expect("Threads line")
+    }
+
+    /// SEC-4・SUP-6・REPAIR-5: 記録が失敗する sink（主経路が symlink で拒否される）でも、sink 生成後・失敗通知後の
+    /// どの時点でも通知用スレッドが残らず、同一 sink での複数回の exec が単一スレッド検証（fork 前）を通る。
+    fn failing_sink_keeps_the_process_single_threaded_for_repeated_exec() {
+        let dir = private_dir();
+        let result = std::panic::catch_unwind(|| {
+            let sink = default_audit_sink(Some(dir.clone())).expect("production audit sink");
+            std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("@audit.log"))
+                .expect("symlink");
+            assert_eq!(thread_count(), 1, "sink creation must not spawn threads");
+            let record = running_record_of_self();
+            let req = request();
+            for _ in 0..3 {
+                let rejected = run_command(&record, &req, Duration::from_secs(30), &sink)
+                    .expect_err("rejected");
+                assert_eq!(rejected.error.message(), REJECTION);
+                assert_eq!(thread_count(), 1, "no notifier thread may remain");
+            }
+        });
         let _ = std::fs::remove_dir_all(&dir);
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);

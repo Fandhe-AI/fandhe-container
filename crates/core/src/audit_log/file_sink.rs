@@ -57,6 +57,7 @@
 use std::fmt;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -74,20 +75,23 @@ pub const AUDIT_LOG_FILE_NAME: &str = "@audit.log";
 type FallbackFactory = Arc<dyn Fn() -> Box<dyn AuditFallback> + Send + Sync>;
 type FailureNotifier = Arc<dyn Fn(&AuditWriteFailure) + Send + Sync>;
 
-/// 通知待ちキューの上限。満杯時は通知を捨てる（拒否経路を止めない）。
+/// 同時に未完了でいられる通知スレッド数の上限。超過時は通知を捨てる（拒否経路を止めない）。
 const NOTIFY_QUEUE_CAP: usize = 8;
 /// 通知の完了を呼び出し側が待つ上限。stderr が詰まっていても `record` はこの時間内に戻る（REPAIR-5）。
 const NOTIFY_WAIT: Duration = Duration::from_millis(200);
 
-/// 専用スレッドへ渡して出力する通知器を作る。
+/// 通知ごとに短命スレッドへ渡して出力する通知器を作る。
 ///
 /// stderr のロック取得・書き込みは満杯パイプで無期限に停止し得るため、呼び出し側のスレッドでは行わない。
-/// 呼び出し側は行を渡し、最大 [`NOTIFY_WAIT`] だけ完了を待って戻る（プロセス終了直前でも通常は出力が間に合う）。
+/// スレッドは通知時にだけ起動し、出力後すぐ終了する。sink の生成時や平常時にスレッドを常駐させないのは、
+/// supervisor の exec が worker を `fork_single_threaded`（`Threads: 1` 必須）で作るため。
+/// 呼び出し側は最大 [`NOTIFY_WAIT`] だけ完了を待って戻る（プロセス終了直前でも通常は出力が間に合う）。
+/// **限界**: 出力先が詰まり続けると、そのスレッドは残る（以降の fork は単一スレッド検証で拒否され得る）。
 fn stderr_notifier() -> FailureNotifier {
     notifier_to(|| Box::new(StderrLine), NOTIFY_QUEUE_CAP, NOTIFY_WAIT)
 }
 
-/// 書き込み時に毎回 stderr をロックする `Write`（ロック取得も専用スレッド側で行う）。
+/// 書き込み時に毎回 stderr をロックする `Write`（ロック取得も通知スレッド側で行う）。
 struct StderrLine;
 
 impl Write for StderrLine {
@@ -99,37 +103,50 @@ impl Write for StderrLine {
     }
 }
 
-/// 出力先を生成する関数から、非同期・有限待ちの通知器を作る。出力先の生成も専用スレッド側で行う。
+/// 出力先を生成する関数から、非同期・有限待ちの通知器を作る。出力先の生成も通知スレッド側で行う。
+///
+/// 生成時にはスレッドを起動しない（遅延起動）。未完了スレッドが `cap` 件に達していれば通知を捨てる。
 fn notifier_to(
-    make: impl FnOnce() -> Box<dyn Write> + Send + 'static,
+    make: impl Fn() -> Box<dyn Write> + Send + Sync + 'static,
     cap: usize,
     wait: Duration,
 ) -> FailureNotifier {
-    let (tx, rx) = mpsc::sync_channel::<(Vec<u8>, mpsc::SyncSender<()>)>(cap);
-    let spawned = std::thread::Builder::new()
-        .name("audit-notify".into())
-        .spawn(move || {
-            let mut out = make();
-            while let Ok((line, ack)) = rx.recv() {
-                // 書き込み失敗は握りつぶす（拒否経路を止めない）。
-                let _ = out.write_all(&line);
-                let _ = out.flush();
-                let _ = ack.try_send(());
-            }
-        })
-        .is_ok();
+    let make = Arc::new(make);
+    let in_flight = Arc::new(AtomicUsize::new(0));
     Arc::new(move |failure| {
-        if !spawned {
-            return;
-        }
         let mut line = Vec::new();
         if failure.write_json_line(&mut line).is_err() {
             return;
         }
-        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
         // 満杯なら待たずに捨てる。
-        if tx.try_send((line, ack_tx)).is_ok() {
-            let _ = ack_rx.recv_timeout(wait);
+        if in_flight.fetch_add(1, Ordering::AcqRel) >= cap {
+            in_flight.fetch_sub(1, Ordering::AcqRel);
+            return;
+        }
+        let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(1);
+        let make = Arc::clone(&make);
+        let counter = Arc::clone(&in_flight);
+        let spawned = std::thread::Builder::new()
+            .name("audit-notify".into())
+            .spawn(move || {
+                let mut out = make();
+                // 書き込み失敗は握りつぶす（拒否経路を止めない）。
+                let _ = out.write_all(&line);
+                let _ = out.flush();
+                counter.fetch_sub(1, Ordering::AcqRel);
+                let _ = ack_tx.try_send(());
+            });
+        match spawned {
+            Ok(handle) => {
+                // 完了を確認できたら join してスレッドを確実に消す（直後の fork が単一スレッド検証を通るように）。
+                // 時間切れなら切り離す。
+                if ack_rx.recv_timeout(wait).is_ok() {
+                    let _ = handle.join();
+                }
+            }
+            Err(_) => {
+                in_flight.fetch_sub(1, Ordering::AcqRel);
+            }
         }
     })
 }
@@ -383,11 +400,11 @@ mod tests {
     }
 
     /// 書き込みが戻らない出力先（満杯パイプ相当）。
-    struct Stuck(mpsc::Receiver<()>);
+    struct Stuck(Arc<Mutex<mpsc::Receiver<()>>>);
 
     impl Write for Stuck {
         fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-            let _ = self.0.recv();
+            let _ = self.0.lock().map(|r| r.recv());
             Ok(0)
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -399,8 +416,9 @@ mod tests {
     #[test]
     fn repair5_task163_stuck_notifier_does_not_block_record() {
         let (hold_tx, hold_rx) = mpsc::channel::<()>();
+        let hold_rx = Arc::new(Mutex::new(hold_rx));
         let notify = notifier_to(
-            move || Box::new(Stuck(hold_rx)),
+            move || Box::new(Stuck(Arc::clone(&hold_rx))),
             2,
             Duration::from_millis(50),
         );
@@ -418,5 +436,29 @@ mod tests {
             start.elapsed()
         );
         drop(hold_tx);
+    }
+
+    /// REPAIR-5・SUP-6・TASK-163: 通知器は生成時にスレッドを起動せず（出力先も作らず）、通知のたびに短命スレッドを
+    /// 起動して完了後に残さない（exec の fork 前単一スレッド要件の維持）。
+    #[test]
+    fn repair5_task163_notifier_spawns_lazily_and_leaves_no_thread() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let made = Arc::new(AtomicUsize::new(0));
+        let m = made.clone();
+        let notify = notifier_to(
+            move || {
+                m.fetch_add(1, Ordering::SeqCst);
+                Box::new(std::io::sink())
+            },
+            2,
+            Duration::from_secs(5),
+        );
+        assert_eq!(made.load(Ordering::SeqCst), 0);
+        let f: FallbackFactory = Arc::new(|| Box::new(NoAuditFallback));
+        let sink = FileAuditSink::with_parts(missing_path(), f, notify);
+        for n in 1..=3 {
+            sink.record(&sample()).unwrap_err();
+            assert_eq!(made.load(Ordering::SeqCst), n);
+        }
     }
 }

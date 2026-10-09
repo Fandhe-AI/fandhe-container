@@ -20,3 +20,8 @@ fandhe-container-plugin-macos = { path = "../../../crates/plugin-macos" }
 # ルート workspace の [workspace.lints] と同等（unsafe の SAFETY コメント欠落を機械検出）。
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
+
+# 起動入口（UDS の bind・期限つき accept・ログのファイル出力。F4・#1598）。Linux 以外では UNSUPPORTED を出して終わる。
+[[bin]]
+name = "venus-jig"
+path = "src/bin/venus-jig.rs"

@@ -1492,6 +1492,20 @@ mod tests {
         assert_eq!(flags & 0o4000, 0);
     }
 
+    /// REPAIR-5・PLUG-7・#1605: 通常ファイルは待たない保証がないため書かず `Unsupported`（診断は捨てる）。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn repair5_drop_log_discards_on_regular_file() {
+        let path = std::env::temp_dir().join(format!("fc-droplog-{}", std::process::id()));
+        let f = std::fs::File::create(&path).unwrap();
+        let r = crate::sys::write_nonblocking(&f, b"x\n");
+        drop(f);
+        let len = std::fs::metadata(&path).unwrap().len();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::Unsupported);
+        assert_eq!(len, 0);
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn repair4_drop_log_writes_line_when_fd_ready() {

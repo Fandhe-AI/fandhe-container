@@ -167,15 +167,15 @@ const O_NONBLOCK_NOCTTY: i32 = 0o4000 | 0o400;
 /// open file description（親・他プロセスと共有される）の状態は変えない。`poll(POLLOUT)` は空き容量を
 /// 予約せず poll と write の間に他者が満たし得るため使わず、fd の種別ごとに次のとおり扱う。
 /// - ソケット（journald 等への stderr）: `send(MSG_DONTWAIT)`。この呼び出しだけ非ブロッキング
-/// - 通常ファイル: 無期限には待たないので通常の書き込み
+/// - 通常ファイル: 応答しない FUSE / NFS・FS freeze で同期 write が止まり得て `O_NONBLOCK` でも防げないため
+///   書かず `Unsupported`（診断は捨てる）
 /// - Linux の FIFO・キャラクタデバイス: `/proc/self/fd/N` を `O_NONBLOCK` で開き直した別 description へ書く
 ///   （共有側のフラグは変わらない。満杯なら `WouldBlock`）
-/// - 上記以外（macOS の pipe 等）: ブロックしない保証がないため書かず `Unsupported`（診断は捨てる）
+/// - 上記以外（macOS の pipe・通常ファイル等）: ブロックしない保証がないため書かず `Unsupported`（診断は捨てる）
 ///
 /// 満杯なら `WouldBlock`。部分書き込みも有り得るため書けたバイト数を返す。std の stderr ロックは取らない。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn write_nonblocking(fd: &impl AsFd, buf: &[u8]) -> io::Result<usize> {
-    use std::io::Write;
     use std::os::unix::fs::FileTypeExt;
 
     let owned = fd.as_fd().try_clone_to_owned()?;
@@ -188,14 +188,14 @@ pub(crate) fn write_nonblocking(fd: &impl AsFd, buf: &[u8]) -> io::Result<usize>
         let w = unsafe { c_send(file.as_raw_fd(), buf.as_ptr(), buf.len(), MSG_DONTWAIT) };
         return usize::try_from(w).map_err(|_| io::Error::last_os_error());
     }
-    if ft.is_file() {
-        return (&file).write(buf);
-    }
+    // 通常ファイルは書かない: 応答しない FUSE / NFS・freeze された FS では同期 write が無期限に止まり得て、
+    // `O_NONBLOCK` でも防げない。保証できないので下の `Unsupported` に落として診断を捨てる。
     #[cfg(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     if ft.is_fifo() || ft.is_char_device() {
+        use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let path = format!("/proc/self/fd/{}", file.as_raw_fd());
         let mut private = std::fs::OpenOptions::new()

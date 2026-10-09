@@ -14,6 +14,8 @@
 //! - U9・U10（追加承認）: <https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6075711404>。
 //!   U9 `fcntl`（`F_GET_SEALS` / `F_ADD_SEALS`。`syscall(2)` 経由。メモリに触れない。受け取った memfd の縮小封じ込めの確認）・
 //!   U10 `ppoll`（`syscall(2)` 経由の期限つき待機。カーネルは `pollfd` の `revents` と、残り時間を `timespec` へ書き戻す）。
+//! - U11（本 PR で追加。**個別承認は未取得**で、レビュー指摘 P0〔PLUG-12 の接続元検証〕への対応として追加した）: `getsockopt(SO_PEERCRED)`
+//!   （`syscall(2)` 経由。接続相手の uid の取得のみ。`ucred` への書き込みだけ）。承認が得られなければこの項と `peer_uid` を外す。
 //! これを超える `unsafe`（`extern` 宣言の追加を含む）は書かない。`recvmsg` 等を直接 `extern` で宣言せず、すべて
 //! `syscall(2)` 経由にする。
 //!
@@ -142,8 +144,12 @@ mod imp {
         pub(crate) const NR_MEMFD_CREATE: i64 = 319;
         pub(crate) const NR_FCNTL: i64 = 72;
         pub(crate) const NR_PPOLL: i64 = 271;
+        // asm/unistd_64.h の getsockopt。
+        pub(crate) const NR_GETSOCKOPT: i64 = 55;
         // asm-generic/socket.h・linux/socket.h・bits/socket.h の MSG_*。
         pub(crate) const SOL_SOCKET: i32 = 1;
+        // asm-generic/socket.h の SO_PEERCRED。
+        pub(crate) const SO_PEERCRED: usize = 17;
         pub(crate) const SCM_RIGHTS: i32 = 1;
         pub(crate) const MSG_TRUNC: u32 = 0x20;
         pub(crate) const MSG_CTRUNC: u32 = 0x8;
@@ -188,7 +194,11 @@ mod imp {
         pub(crate) const NR_MEMFD_CREATE: i64 = 279;
         pub(crate) const NR_FCNTL: i64 = 25;
         pub(crate) const NR_PPOLL: i64 = 73;
+        // asm-generic/unistd.h の getsockopt。
+        pub(crate) const NR_GETSOCKOPT: i64 = 209;
         pub(crate) const SOL_SOCKET: i32 = 1;
+        // asm-generic/socket.h の SO_PEERCRED（aarch64 で個別に定義する）。
+        pub(crate) const SO_PEERCRED: usize = 17;
         pub(crate) const SCM_RIGHTS: i32 = 1;
         pub(crate) const MSG_TRUNC: u32 = 0x20;
         pub(crate) const MSG_CTRUNC: u32 = 0x8;
@@ -539,6 +549,44 @@ mod imp {
         Ok(check(ret)? > 0)
     }
 
+    /// `struct ucred`（`SO_PEERCRED` の結果。`include/linux/socket.h`）。12 バイト。
+    #[repr(C)]
+    struct Ucred {
+        pid: i32,
+        uid: u32,
+        gid: u32,
+    }
+
+    /// 接続相手の資格情報（`SO_PEERCRED`）の uid を返す（U11。PLUG-12 相当の接続元検証用）。
+    /// `getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &ucred, &len)` を `syscall(2)` 経由で呼ぶ。カーネルは `connect` 時点の
+    /// 相手プロセスの euid を記録しており、後から変えられない。返却長が `ucred` と違えば `Invalid`（fail-closed）。
+    pub(crate) fn peer_uid(sock: BorrowedFd<'_>) -> Result<u32, SysError> {
+        let mut cred = Ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len: u32 = size_of::<Ucred>() as u32;
+        // SAFETY: `cred`（12 バイト）と `len` はこの関数のローカル変数で呼び出し中は生きており、他から参照されない排他的な
+        // 可変領域。`optlen` に `size_of::<Ucred>()` を渡すので、カーネルは `cred` の範囲内にだけ書き、`len` に実際の長さを
+        // 書き戻す。`Ucred` はカーネル ABI の `struct ucred` と同じレイアウト（固定値テストで照合）。fd は `BorrowedFd` で有効。
+        let ret = unsafe {
+            syscall(
+                NR_GETSOCKOPT,
+                sock.as_raw_fd() as usize,
+                SOL_SOCKET as usize,
+                SO_PEERCRED,
+                &raw mut cred as usize,
+                &raw mut len as usize,
+            )
+        };
+        check(ret)?;
+        if len as usize != size_of::<Ucred>() {
+            return Err(SysError::Invalid);
+        }
+        Ok(cred.uid)
+    }
+
     /// `SCM_RIGHTS` の cmsg（ヘッダ + fd 配列）を `buf` へ書く。safe コードで境界検査する。
     fn write_scm_rights(buf: &mut [u8], fds: &[BorrowedFd<'_>]) -> Result<(), SysError> {
         let bad = || SysError::Invalid;
@@ -843,6 +891,9 @@ mod imp {
             assert_eq!(offset_of!(PollFd, events), 4);
             assert_eq!(offset_of!(PollFd, revents), 6);
             assert_eq!(size_of::<Timespec>(), 16);
+            assert_eq!(size_of::<Ucred>(), 12);
+            assert_eq!(offset_of!(Ucred, uid), 4);
+            assert_eq!(SO_PEERCRED, 17);
             assert_eq!(offset_of!(Timespec, nsec), 8);
         }
 
@@ -1024,6 +1075,10 @@ mod imp {
                 ),
                 (46, 47, 9, 11, 319, 72, 271)
             );
+            #[cfg(target_arch = "x86_64")]
+            assert_eq!(NR_GETSOCKOPT, 55);
+            #[cfg(target_arch = "aarch64")]
+            assert_eq!(NR_GETSOCKOPT, 209);
             #[cfg(target_arch = "aarch64")]
             assert_eq!(
                 (
@@ -1075,6 +1130,10 @@ mod imp {
         Err(SysError::Unsupported)
     }
 
+    pub(crate) fn peer_uid(_sock: BorrowedFd<'_>) -> Result<u32, SysError> {
+        Err(SysError::Unsupported)
+    }
+
     pub(crate) fn memfd_create_cloexec(
         _name: &CStr,
         _allow_sealing: bool,
@@ -1117,5 +1176,5 @@ mod imp {
 }
 
 pub(crate) use imp::{
-    MmapRegion, add_shrink_seal, memfd_create_cloexec, recvmsg_fds, sendmsg_fds, wait_fd,
+    MmapRegion, add_shrink_seal, memfd_create_cloexec, peer_uid, recvmsg_fds, sendmsg_fds, wait_fd,
 };

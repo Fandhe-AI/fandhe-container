@@ -133,14 +133,16 @@ fn gpu6_dotdot_and_same_path_are_invalid() {
 fn gpu6_world_writable_dir_is_rejected_without_bind() {
     let dir = scratch("ww");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+    let logdir = scratch("wwlog");
     let sock = dir.join("s.sock");
-    let log = dir.join("j.log");
+    let log = logdir.join("j.log");
     let c = cfg(&sock, &log, &[]).unwrap();
     assert_eq!(code_of(run(&c)), "SOCKET_DIR_NOT_PRIVATE");
     assert!(fs::symlink_metadata(&sock).is_err(), "must not bind");
     assert!(fs::symlink_metadata(&log).is_err(), "must not create log");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
     fs::remove_dir_all(&dir).unwrap();
+    fs::remove_dir_all(&logdir).unwrap();
 }
 
 #[test]
@@ -319,4 +321,94 @@ fn repair4_error_json_line_escapes_cause() {
         "{}",
         e.to_json_line()
     );
+}
+
+#[test]
+fn gpu6_run_rejects_same_socket_and_log_paths_without_side_effects() {
+    // PLUG-12 周辺: `Config` は公開フィールドなので `parse_args` を経ない同一パスも `run` が副作用の前に拒否する。
+    let base = scratch("col");
+    let p = base.join("sub").join("x");
+    let mut c = cfg(&base.join("s.sock"), &base.join("j.log"), &[]).unwrap();
+    c.socket = p.clone();
+    c.log = p;
+    assert_eq!(code_of(run(&c)), "PATH_INVALID");
+    assert!(fs::symlink_metadata(base.join("sub")).is_err(), "no dir");
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn gpu6_unsafe_log_ancestor_is_rejected_without_creating_log() {
+    let top = scratch("lanc");
+    let mid = top.join("mid");
+    DirBuilder::new().mode(0o700).create(&mid).unwrap();
+    let logdir = mid.join("logs");
+    DirBuilder::new().mode(0o700).create(&logdir).unwrap();
+    fs::set_permissions(&mid, fs::Permissions::from_mode(0o777)).unwrap();
+    let c = cfg(&top.join("s.sock"), &logdir.join("j.log"), &[]).unwrap();
+    assert_eq!(code_of(run(&c)), "LOG_DIR_UNSAFE");
+    assert!(fs::symlink_metadata(logdir.join("j.log")).is_err());
+    assert!(fs::symlink_metadata(top.join("s.sock")).is_err());
+    fs::set_permissions(&mid, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::remove_dir_all(&top).unwrap();
+}
+
+#[test]
+fn gpu6_symlinked_log_ancestor_is_rejected() {
+    let real = scratch("lreal");
+    let holder = scratch("lhold");
+    let link = holder.join("link");
+    symlink(&real, &link).unwrap();
+    let c = cfg(&holder.join("s.sock"), &link.join("j.log"), &[]).unwrap();
+    assert_eq!(code_of(run(&c)), "LOG_DIR_UNSAFE");
+    assert!(fs::symlink_metadata(real.join("j.log")).is_err());
+    fs::remove_dir_all(&real).unwrap();
+    fs::remove_dir_all(&holder).unwrap();
+}
+
+#[test]
+fn gpu6_missing_socket_dir_parent_reports_create_failed_not_ancestor_unsafe() {
+    // 親も無いとき: 祖先検査が NotFound を unsafe に写さず、作成失敗（終了コード 1）に到達する。
+    let base = scratch("nopar");
+    let c = cfg(
+        &base.join("a").join("b").join("s.sock"),
+        &base.join("j.log"),
+        &[],
+    )
+    .unwrap();
+    let e = run(&c).expect_err("must fail");
+    assert_eq!(e.code.as_str(), "SOCKET_DIR_CREATE_FAILED");
+    assert_eq!(e.exit_code(), 1);
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn gpu6_peer_uid_matches_effective_uid() {
+    let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+    assert_eq!(sys::peer_uid(a.as_fd()).unwrap(), effective_uid().unwrap());
+}
+
+#[test]
+fn gpu6_peer_with_other_uid_is_rejected_before_session() {
+    // 実行ユーザーと別の UID を期待値として渡し、接続元不一致で PEER_REJECTED になりセッションに入らないことを照合する。
+    let dir = scratch("peer");
+    let sock = dir.join("s.sock");
+    let log = dir.join("j.log");
+    let c = cfg(&sock, &log, &["--accept-timeout-ms", "5000"]).unwrap();
+    let uid = effective_uid().unwrap();
+    let client_sock = sock.clone();
+    let client = thread::spawn(move || {
+        for _ in 0..500 {
+            if let Ok(s) = std::os::unix::net::UnixStream::connect(&client_sock) {
+                return Some(s);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        None
+    });
+    let file = open_log(&c.log).unwrap();
+    let mut sink = LogSink::new(file);
+    let r = serve(&c, uid.wrapping_add(1), &mut sink);
+    assert_eq!(code_of(r), "PEER_REJECTED");
+    let _ = client.join();
+    fs::remove_dir_all(&dir).unwrap();
 }

@@ -9,9 +9,10 @@ macOS の virtio-gpu Venus 自前実装（ヘッドレス Vulkan compute のみ�
 - 後続・関連: #723（wire パース骨格）・#724（capset 応答。実装済み）・#889（コマンドストリーム記録）・#888（試験治具。アダプタまで実装済み・トランスポート未実装）・#725（1〜3 段目の結果）・#726（確定）・#776 / #777（対象範囲判断・工数再確定）・#781（サブセットのフィルタ機構）。ディスパッチ・ハンドラ群は TASK-177.x（#765・#769・#771・#773・#774）
 - 出典（spec）: GPU-6・TASK-172・D-15・PoC-14（submodule リビジョン `984f8a2`）。作業環境で `docs/spec` を取得できなかったため、spec 本文は参照せず ID のみで辿れるようにしている
 - 出典（外部。確認日 2026-10-08）:
-  - Vulkan レジストリ `vk.xml`: KhronosGroup/Vulkan-Headers のタグ `vulkan-sdk-1.4.363.0`（`registry/vk.xml`。`VK_HEADER_VERSION` 363。SHA-256 `55ec60950cfb18c3575dcf5fd52741b2bb70eb1e466408f803a91049973ee6fb`）
-  - venus 固有コマンド: virgl/venus-protocol（freedesktop.org の GitLab）のタグ `v1.1.3`（コミット `ca19b6358d7c`）の `xmls/VK_MESA_venus_protocol.xml`（SHA-256 `d92839bc728fa9ad9a7decdc6b91df6fa1a0fb26cffae4009865f18a789e0535`）
-  - Mesa Venus ドキュメント（docs.mesa3d.org/drivers/venus.html）・MoltenVK Runtime User Guide（KhronosGroup/MoltenVK の `Docs/MoltenVK_Runtime_UserGuide.md`）
+  - Vulkan レジストリ `vk.xml`: KhronosGroup/Vulkan-Headers のタグ `vulkan-sdk-1.4.363.0`（`registry/vk.xml`。`VK_HEADER_VERSION` 363。SHA-256 `55ec60950cfb18c3575dcf5fd52741b2bb70eb1e466408f803a91049973ee6fb`）。ライセンス: ファイル内 SPDX `Apache-2.0 OR MIT`（Copyright 2015-2026 The Khronos Group Inc.）
+  - venus 固有コマンド: virgl/venus-protocol（freedesktop.org の GitLab）のタグ `v1.1.3`（コミット `ca19b6358d7c`）の `xmls/VK_MESA_venus_protocol.xml`（SHA-256 `d92839bc728fa9ad9a7decdc6b91df6fa1a0fb26cffae4009865f18a789e0535`）。ライセンス: ファイル内 SPDX `Apache-2.0 OR MIT`（Copyright 2020 Google LLC）。同タグの `xmls/VK_EXT_command_serialization.xml` も同じ SPDX・著作権者
+  - Mesa Venus ドキュメント（docs.mesa3d.org/drivers/venus.html）（ページ自体に SPDX は無い。Mesa の `docs/license.rst`〔`mesa-25.0.0`〕は「コアは MIT、個別ファイルは固有ライセンスがありうる」とし、`docs/drivers/venus.rst` に個別のライセンス表記は無い。ドキュメントの個別ライセンスは未確認）・MoltenVK Runtime User Guide（KhronosGroup/MoltenVK の `Docs/MoltenVK_Runtime_UserGuide.md`。`main` のコミット `67b2682699d7` で確認、SHA-256 `6939c675f01e20acd5fcff05a586530055c31a0d0bf94d3813d9eab93763f769`。同コミットの `LICENSE` は Apache License 2.0 の標準全文で SPDX 行は無く、著作権者の記載も無い）
+  - 帰属表示（NOTICE 等）の要否: **未決**（ユーザー判断待ち。#1603 で報告）。転記は値（事実情報）のみでコードは流用していない
 
 ## 1. 前提と範囲
 
@@ -159,7 +160,7 @@ GPU-6 の決定（ヘッドレス compute のみ・2D スキャンアウト非�
 - 確認した wire 規則（venus-protocol `v1.1.3`・コミット `ca19b6358d7c` の `docs/VK_EXT_command_serialization.txt`）: リトルエンディアン。コマンドは DW0 = `VkCommandTypeEXT`、DW1 = `VkCommandFlagsEXT`、DW2.. = 引数。長さは種別から暗黙に決まり、未知の種別は読み飛ばせない。ポインタ・配列は 64bit 件数＋値列で、末尾を 32bit にパディングする。ハンドルは 64bit。enum は `int32_t`。フラグで定義済みのビットは `VK_COMMAND_GENERATE_REPLY_BIT_EXT`（bit 0）のみ
 - ID の出典: 同タグの `xmls/VK_EXT_command_serialization.xml`（SHA-256 `2451e5dcc5306f604c52da48a8cc883a24de708dd86f38bbb035d29a753a0474`）。`xmls/VK_MESA_venus_protocol.xml`（SHA-256 は前掲）の記載と一致することを確認した。3 章の候補 116 件（必須 62・推奨 22・保留 32）すべてについてコマンド名から ID を機械抽出し、欠落 0 件、ID 重複なしを確認した。同じ対応表をテスト（`task172_2_gpu6_candidate_table_matches_command_type`）で照合している
 - パース済み: 境界検査つきカーソル（`WireReader`）、候補コマンド種別（`CommandType`）、フラグ（`CommandFlags`。定義外ビットは拒否）、ヘッダ（`parse_command_header`）、構造化エラー（`VenusWireError`。`venus_wire.*`）
-- fail-closed: 候補外・未知の種別は `unsupported_command` でストリームを拒否する。配列件数は `MAX_ARRAY_LEN` で確保前に検証する
+- fail-closed: 候補外・未知の種別は `unsupported_command` でストリームを拒否する。配列件数は `MAX_ARRAY_LEN` と、要素の最小 wire サイズ × 件数 ≤ 残りバイト数（`read_array_len_sized`）で確保前に検証する。入れ子の配列では呼び出し側が累積の予算を持つ
 - 先送り: コマンドごとの引数パース・ディスパッチ（TASK-177.x: #765・#769・#771・#773・#774）、reply の符号化、ring、frame_loop／adapter への配線。優先度は確定扱いにしない
 
 ## 7. コマンドストリームの記録と再生ハーネス（TASK-172.5・#889）
@@ -183,11 +184,11 @@ GPU-6 の決定（ヘッドレス compute のみ・2D スキャンアウト非�
 | | payload | N B | |
 | | checksum | 4 B | CRC-32C（kind から payload まで） |
 
-- 保証範囲: `validate` が全レコードのチェックサム・seqno 連続・余剰バイト無しまで確認し、`ValidatedRecording` を返す。`replay` はこの型しか受け取らず、さらに全レコードの先頭がコマンドヘッダとして有効かを提出前に検査する。長さ・件数・ファイル全体長（256 MiB）は確保前に検証する。CRC-32C は偶発的な破損の検出用で、改ざん耐性はない（署名・ハッシュ照合は将来課題）
+- 保証範囲: `validate` が全レコードのチェックサム・seqno 連続・余剰バイト無しまで確認し、`ValidatedRecording` を返す。`replay` はこの型しか受け取らず、さらに全レコードの先頭がコマンドヘッダとして有効かを提出前に検査する。ファイルは `read_recording_file` が読む。開く前（`symlink_metadata`）と開いた後（fd の `metadata`）に通常ファイルであることを確かめ（symlink・ディレクトリ・FIFO・デバイスは `not_regular_file`。FIFO の open によるブロックを避ける）、全体長（256 MiB）を読み込み前に検証し、読み込みは上限 + 1 バイトで打ち切る。`validate` は受け取り済みの `&[u8]` の長さと件数を検査するだけで、件数による `Vec` 確保は残りバイト数 / 16 で頭打ちにする。残存リスク: 検査から open までの間の差し替え（TOCTOU）は塞いでいない（`O_NOFOLLOW | O_NONBLOCK` の `sys` ラッパーは未導入）。CRC-32C は偶発的な破損の検出用で、改ざん耐性はない（署名・ハッシュ照合は将来課題）
 - 配置の逸脱: issue 記載の `poc/venus-decoder/replay/` ではなく既存骨格の隣に置いた。`poc/` は存在せず、新設には workspace メンバー追加（ルート `Cargo.toml` の変更）が要る。再生器は同モジュールの `parse_command_header` を直接使う
 - 取り扱い: 実機で採取したストリームにはワークロード由来のデータが含まれうる。テストの fixture は合成データのみで、実ストリームはリポジトリにコミットしない
 - **未達（実装済みを装わない。REPAIR-3）**: 受け入れ条件「lavapipe 上で記録を再生し、最小 compute の結果が記録時と一致する」は本書時点で未達。理由は (1) コマンド引数のパース・Vulkan ディスパッチが未実装（TASK-177.x）、(2) lavapipe 実行に Vulkan バインディング（外部クレートまたは自前 FFI。依存追加・`unsafe` の承認が必要）が要る、(3) 実ストリームの採取は #725（人間担当）。再生先は `ReplayBackend` トレイトの差し替え点として定義し、`CollectingBackend`（提出内容を保持する模擬）でのみ検証している
-- 先送り: reply ストリーム・期待出力レコード（kind の番号のみ未割当）、実機側の記録フック配線（#888・#725）
+- 先送り: reply ストリーム・期待出力レコード（kind の番号は未割当。REPAIR-3）、実機側の記録フック配線（#888・#725）
 
 ## 8. capset 応答（TASK-172.3・#724）
 
@@ -286,7 +287,7 @@ macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なし�
 
 ### 10.3 ctrl の値と広告 feature
 
-出典: Linux `include/uapi/linux/virtio_gpu.h` タグ `v6.12`（確認日 2026-10-08。SHA-256 `7c9e2f7d47fa0b1a2c737fc5a741f57c5cf25303dd5c68c2c9738e9bb761eee6`）。値のみ転記。
+出典: Linux `include/uapi/linux/virtio_gpu.h` タグ `v6.12`（確認日 2026-10-08。SHA-256 `7c9e2f7d47fa0b1a2c737fc5a741f57c5cf25303dd5c68c2c9738e9bb761eee6`）。値のみ転記。ライセンス: ファイル先頭に SPDX 行は無く、BSD 系の許諾文（3 条項。「This header is BSD licensed」、Copyright Red Hat, Inc. 2013-2014、3 条項目の名指しは IBM）が書かれている。SPDX 表記は `BSD-3-Clause` 相当だが、ファイルに SPDX は無いため断定せず原文を正とする。帰属表示の要否は未決（#1603 で報告）。
 
 | 項目 | 値 |
 | ---- | -- |

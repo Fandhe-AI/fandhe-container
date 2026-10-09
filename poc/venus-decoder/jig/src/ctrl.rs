@@ -6,6 +6,8 @@
 //!
 //! 出典: Linux `include/uapi/linux/virtio_gpu.h`（タグ `v6.12`、確認日 2026-10-08。取得時 SHA-256
 //! `7c9e2f7d47fa0b1a2c737fc5a741f57c5cf25303dd5c68c2c9738e9bb761eee6`）。値（事実情報）のみ転記しコードは流用していない。
+//! ライセンス: ファイル先頭に SPDX 行は無く、BSD 系の許諾文（3 条項。Copyright Red Hat, Inc. 2013-2014）が
+//! 書かれている。帰属表示の要否は未決（#1603）。
 
 use fandhe_container_plugin_macos::gpu::venus::{VENUS_CAPSET_ID, VENUS_CAPSET_LEN};
 

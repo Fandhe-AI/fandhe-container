@@ -1,6 +1,6 @@
 //! ctrl 要求を自前 venus デコーダの capset 応答へ橋渡しするアダプタ（GPU-6・TASK-172.4・#888）。
 //!
-//! 将来のトランスポート層（後続 F1。vhost-user の ctrl キュー）から要求 1 件ごとに [`CtrlAdapter::handle_ctrl`] が
+//! `session`（F1.4・#1519。vhost-user の ctrl キューの応答ループ）から要求 1 件ごとに [`CtrlAdapter::handle_ctrl`] が
 //! 呼ばれ、`GET_CAPSET_INFO` は `capset_info`、`GET_CAPSET` は `respond_capset_query` へ渡す。
 //! #1520 で `GET_DISPLAY_INFO`（scanout なし）・`CTX_CREATE`（venus の context_init）・`CTX_DESTROY` を追加した。
 //! CTX の重複・未知を判定するため、作成済み ctx_id の表（上限 [`MAX_CONTEXTS`]）を [`CtrlAdapter`] が所有する。

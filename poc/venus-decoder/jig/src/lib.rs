@@ -2,7 +2,7 @@
 //!
 //! 役割: 治具 VMM が受けた virtio-gpu ctrl 要求のうち ctrl 要求（capset クエリ・`GET_DISPLAY_INFO`・`CTX_CREATE` / `CTX_DESTROY`。#1520）を
 //! 復号して `fandhe_container_plugin_macos::gpu::venus` へ渡し、応答を ctrl 形式に符号化して構造化ログを 1 行出す。
-//! 呼び出し元は将来のトランスポート層（vhost-user。後続 F1.2〜F1.4）で、現時点でどこからも呼ばれない。
+//! 呼び出し元は `session`（vhost-user のセッションと ctrl キューの応答ループ。F1.4・#1519。Linux 限定）。
 //! TASK-175 の製品版 ctrl 枠とは別物の PoC 実装で、製品 crate はこのパッケージに依存しない。
 //!
 //! vhost-user のメッセージ codec は実装済み（`vhost_user`。F1.1・#1516）。fd の受け渡し（`SCM_RIGHTS`）と
@@ -10,8 +10,10 @@
 //!
 //! split virtqueue（記述子チェーンの走査と used への書き戻し。F1.3・#1518）は `virtqueue` に実装済み（トランスポートに依存しない）。
 //!
-//! 未実装（実装済みを装わない。REPAIR-3）: トランスポートのヘッダ単位のソケット I/O の枠組み（F1.4）、
-//! セッション状態と応答ループ（F1.4・#1519）、上記以外の ctrl 応答（F2 の残り。未対応は `ERR_UNSPEC`）、
+//! セッションと ctrl キューの応答ループ（kick / call・used への書き戻し）は `session` に実装済み（F1.4・#1519。Linux 限定）。
+//!
+//! 未実装（実装済みを装わない。REPAIR-3）: UDS の bind と peer credential の検証（呼び出し側の責務。設計書 10.8）、cursorq の処理、
+//! `observe::snapshot_lines` の定期出力、上記以外の ctrl 応答（F2 の残り。未対応は `ERR_UNSPEC`）、
 //! 実機での疎通（F3・#725）。
 
 // unsafe の配置制約（#1517 の個別承認の条件）: crate 全体で unsafe を禁止し、syscall の薄いラッパーを置く `sys`
@@ -22,6 +24,8 @@ pub mod adapter;
 pub mod ctrl;
 pub mod device;
 pub mod log;
+#[cfg(target_os = "linux")]
+pub mod session;
 pub mod vhost_user;
 pub mod virtqueue;
 

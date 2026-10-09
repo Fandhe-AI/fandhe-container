@@ -2,8 +2,8 @@
 //!
 //! 役割: `fd_passing`（`recvmsg` / `sendmsg` / memfd 作成）と `guest_memory`（領域の map・`SET_MEM_TABLE` の検証・境界検査つき read / write）の各操作について、
 //! 成功数・失敗数・失敗 code 別の件数・所要時間の合計と分布（2 の冪の固定区画ヒストグラム）をプロセス内のカウンタに集計する。境界検査の拒否（`OUT_OF_BOUNDS` 等）と
-//! syscall の失敗（`OS_ERROR`）も失敗として数える。呼び出し元は F1.4（セッション。#1519）で、定期的に [`snapshot_lines`] を
-//! 構造化ログへ出す（`log` モジュールと同じ `venus_jig event=...` 形式）。
+//! syscall の失敗（`OS_ERROR`）も失敗として数える。呼び出し元は計測する各操作で、[`snapshot_lines`] の定期的な構造化ログ出力は未実装（REPAIR-3・REPAIR-4。後続。セッション〔F1.4・#1519〕は未接続）。
+//! 出す場合の形式は `log` モジュールと同じ `venus_jig event=...`。
 //!
 //! ログは固定語彙と数値だけを出し、frontend 由来のバイト列・fd 番号・GPA をエコーしない（ログ注入の防止）。
 //! 集計はロックを持たない原子カウンタで、ホットパス（virtqueue の走査）の待ちを増やさない。

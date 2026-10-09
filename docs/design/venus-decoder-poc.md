@@ -260,16 +260,17 @@ macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なし�
 ### 10.1 本 PR の範囲と未達（実装済みを装わない。REPAIR-3）
 
 - 実装済み: 候補比較（本章）、ctrl の `GET_CAPSET_INFO` / `GET_CAPSET` の復号・応答符号化・構造化ログ 1 行（`adapter`）、#1520 で `GET_DISPLAY_INFO`（scanout なし）・`CTX_CREATE`（venus の context_init）・`CTX_DESTROY` を追加（ctx 表は上限 64）、治具が広告する feature と config の定数（`device`）、ログ照合器と実機前提テストの枠（`log`・`tests/real_machine_capset_log.rs`）。socket は開かない
-- 実装済み（F1.1・#1516）: vhost-user メッセージの codec（`vhost_user`。10.5）。virtqueue・セッションは未実装（F1.3・F1.4）
+- 実装済み（F1.1・#1516）: vhost-user メッセージの codec（`vhost_user`。10.5）。virtqueue・セッションは F1.3・F1.4 で実装
 - 実装済み（F1.2・#1517）: `SCM_RIGHTS` の fd 送受信とゲストメモリの mmap のラッパー（`vhost_user::fd_passing` / `guest_memory`・`src/sys.rs`。Linux 限定。10.6）
 - **受入基準 2（ゲストの Mesa venus の capset クエリが自前デコーダに届いたことをログで確認）は未達**。トランスポート（後続 F1）と実機実行（F3・#725。人間担当）が必要なため
 - 後続（issue 起票は未実施・承認待ち）: F1 vhost-user トランスポート（メッセージ codec・fd 受け渡しと `mmap` の `sys` ラッパー・split virtqueue・kick / call。rust-vmm 系クレートは MVM-4 で使えないため自作）、F2 残りの ctrl 応答（10.4 節。`RESOURCE_CREATE_BLOB`・`SUBMIT_3D` 等）、F3 実機疎通（#725）
 - 実装済み（F1.3・#1518）: split virtqueue（`virtqueue`。10.7）
+- 実装済み（F1.4・#1519）: vhost-user のセッションと ctrl キューの応答ループ（`session`。Linux 限定。10.8）。受入基準 2 は F3（#725）の実機待ちのまま
 - CI: `make poc-venus-jig-check`（fmt-check・clippy・test）は CI の `rust-ci-default-features` ジョブが 3 OS で実行し、`crates/plugin-macos` 側の変更による治具の破損を検出する（実機前提テストは `#[ignore]` で分離済みで CI では走らない）
 
 ### 10.2 候補比較
 
-計画フェーズの調査結果。出典タグとファイルは下記のとおりで、crosvm の CLI 構文・render server の capset 転送の有無は**未確認**（実装フェーズでは取得できなかった。F1 着手時に確認する）。
+計画フェーズの調査結果。出典タグとファイルは下記のとおりで、crosvm の CLI 構文・最小カーネル版数・render server の capset 転送の有無は**未確認**（F1.4〔#1519〕でも取得できなかった。2026-10-09 に `book/src/devices/vhost_user.md` の取得を試みたが 404 で、記憶では埋めない。F3〔#725〕の着手時に crosvm の版を固定して確認する）。
 
 | 候補 | 外部バックエンド接続 | ゲストへ BLOB・CONTEXT_INIT が届くか | venus capset の扱い | ライセンス | 改変の要否 |
 | ---- | -------------------- | ------------------------------------ | ------------------- | ---------- | ---------- |
@@ -414,6 +415,38 @@ frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲスト
 - 順序: `pop` は `avail.idx` の後に Acquire、`add_used` は used 要素の後に Release の fence を置いてから `used.idx` を書く。コピーは非アトミックなので、fence が実機のバリアになることに頼る前提が残る（アトミックなコピーは U1〜U10 の承認範囲外）
 - 扱わない: `INDIRECT`・`EVENT_IDX`（`device::FEATURES` が広告しない。`used_event` / `avail_event` は読み書きしない）、packed virtqueue。`unsafe` と依存は追加していない
 - F1.4（#1519）への申し送り: kick / call の eventfd、`SET_VRING_ENABLE`、`GET_VRING_BASE` での `last_avail` の返却、キュー番号と ctrl / cursor の対応づけ、エラー後のキューの扱い（リセットか切断）、virtqueue の観測カウンタ
+
+### 10.8 セッションと応答ループ（F1.4・#1519）
+
+実装は `poc/venus-decoder/jig/src/session/`（Linux 限定。`unsafe` は追加せず `sys.rs` も変更していない。依存の追加なし）。入口は `session::run(&UnixStream, &SessionLimits, sink)`。接続 1 本分を最後まで処理し、ログ（1 要求 1 行）を `sink` へ流す。
+
+- 広告値: `GET_FEATURES` は `0x0000_0001_4000_0019`（VIRGL・RESOURCE_BLOB・CONTEXT_INIT・VERSION_1・PROTOCOL_FEATURES）、`GET_PROTOCOL_FEATURES` は `0x201`（MQ・CONFIG）、`GET_QUEUE_NUM` は 2（controlq・cursorq）。`GET_CONFIG` は 16 バイトの config（`num_capsets` = 1）の `offset + size <= 16` を返し、範囲外は空ペイロードのエラー応答でセッションは続ける
+- `SET_FEATURES`: 広告外のビットは `FEATURE_NOT_OFFERED`、広告した 5 ビットのどれかが欠ければ `REQUIRED_FEATURE_MISSING`（Mesa venus が capset 取得前に中止するため、PoC では fail-closed）
+- 順序のゲート（違反は `OUT_OF_ORDER` で要求 ID を載せる）。本当の依存関係だけを判定し、一本道は強制しない（QEMU と crosvm で `SET_OWNER` / `GET_PROTOCOL_FEATURES` の位置が違うため）。根拠は 10.5 で固定済みの crosvm コミット `044c3e3fc53d` の `backend_client.rs` / `vhost_user_frontend/mod.rs` と QEMU `vhost-user.rst`（v10.1.0）だが、**この節の表は PR 作成時点で両者の再取得による照合を行っていない（未照合）**。F3 で食い違えばここを直す
+
+| 要求 | 前提 |
+| ---- | ---- |
+| `GET_FEATURES`・`GET_PROTOCOL_FEATURES` | なし |
+| `SET_OWNER` | 2 回目は拒否 |
+| `SET_PROTOCOL_FEATURES` | `GET_PROTOCOL_FEATURES` の後。広告外のビットは `FEATURE_NOT_OFFERED` |
+| `GET_QUEUE_NUM` / `GET_CONFIG` | 確定した protocol feature に MQ / CONFIG がある |
+| `SET_FEATURES` | owner の後。どの ring も実行中でない |
+| `SET_MEM_TABLE` | owner と `SET_FEATURES` の後。どの ring も実行中でない。送り直しでは古い `GuestMemory` を先に drop し、ring のアドレス検証結果を無効にして `SET_VRING_ADDR` からやり直させる |
+| `SET_VRING_NUM` / `SET_VRING_BASE` | owner の後。番号 < 2。その ring が実行中でない。base は u16 に収まる（収まらなければ `INVALID_VALUE`） |
+| `SET_VRING_ADDR` | `SET_MEM_TABLE` と `SET_VRING_NUM` の後。`QueueConfig::new` で検証 |
+| `SET_VRING_KICK` / `SET_VRING_CALL` | `SET_MEM_TABLE` の後。`VRING_NOFD`（polling）は `NOFD_UNSUPPORTED` |
+| `SET_VRING_ENABLE` | bit 30 が確定済みで ADDR が設定済み。値は 0 / 1 |
+| `GET_VRING_BASE` | ring を停止し kick / call を閉じて `last_avail` を返す |
+| `SET_CONFIG` | 未対応として `UNSUPPORTED_REQUEST` |
+
+- ring の起動: ADDR・KICK・CALL・ENABLE(1) がそろった時点で `SplitQueue::new(cfg, base, base)`。初期の used_idx は base とする（新規開始では 0。inflight は扱わない割り切り）
+- fd の個数: `SET_MEM_TABLE` は領域数、NOFD でない kick / call は 1、それ以外は 0。復号の後に照合し、合わなければ `FD_COUNT_MISMATCH` / `UNEXPECTED_FDS`。受け取った fd は `OwnedFd` で、どのエラー経路でも `Drop` で閉じる。fd は各メッセージの最初の受信でだけ受け付ける
+- タイムアウト（REPAIR-5）: `SessionLimits` の `message_timeout`（1 メッセージの受信・応答送信・call の書き込み。超過は `TIMEOUT`）と `idle_timeout`（無通信。超過は `IDLE_TIMEOUT`）。どちらも 0 より大きく 1 時間以下
+- 応答ループ: socket と ctrl キューの kick を、単一 fd 用の `sys::wait_fd` で `poll_slice`（既定 10ms）ずつ交互に待つ。1 回の kick で最大 `num` 件を処理して used へ書き、1 件以上なら call へ 1 を書く。`pop` / `add_used` の失敗はセッションを終了する（壊れたキューを黙って続けない）。writable が応答に足りない要求は応答を捨てて len=0 で返し、`response_dropped` の行を出してセッションは続ける。readable が 4 KiB を超える要求はアダプタへ渡さず `ERR_INVALID_PARAMETER`
+- ログ: 既存の `venus_jig event=...` 形式を保つ。追加は `session_error`（`code`・`request`）・`need_reply_ignored`・`response_dropped`・`session_end`。固定語彙と数値だけで、frontend やゲスト由来のバイト列・fd 番号・GPA は出さない
+- 扱わない（REPAIR-3）: `NEED_REPLY`（REPLY_ACK を広告しないので `SET_*` には応答せず、ログに 1 行出す）、cursorq（ring 1）の要求処理、`SET_CONFIG`、`VRING_NOFD`、inflight、`INDIRECT` / `EVENT_IDX`、`observe::snapshot_lines` の定期出力と session / virtqueue の観測カウンタ
+- 既知の穴: UDS の bind と所有者・権限・symlink の検証、peer credential の検証（PLUG-12 相当）は範囲外。`UnixStream::peer_cred` が unstable で、`SO_PEERCRED` の取得は #1517 の承認範囲外の `unsafe` を要するため、`UnixStream` を受け取る API に留め、bind は F3 の起動側に委ねる。治具は PoC で、実機の実行は人間が担当する閉じた環境という前提
+- 承認事項: socket と kick を同時に待つ複数 fd の `ppoll` は `sys.rs` の `unsafe`（U10）の変更になるため行っていない。kick への反応に最大 `poll_slice` の遅延が乗る
 
 ## 11. 以降の章（未着手。10 章は #888 の範囲）
 

@@ -12,13 +12,19 @@
 //! 待機はすべて期限つき（REPAIR-5）。単一 fd 用の `sys::wait_fd` を socket と ctrl の kick で交互に短く待つ方式のため、
 //! kick への反応には最大 [`SessionLimits::poll_slice`] の遅延が乗る（複数 fd の ppoll 化は unsafe の承認範囲外）。
 //! 未実装（REPAIR-3）: cursorq（ring 1）の要求処理・`SET_CONFIG`・`VRING_NOFD`・REPLY_ACK・inflight・
-//! `observe::snapshot_lines` の定期出力。
+//! `observe::snapshot_lines` の定期出力（セッション終了時に 1 回だけ出す）。
+//!
+//! kick / call の fd は frontend が複製を持ち得るため、poll の後に相手が eventfd を読み書きして状態を変えられる。
+//! そこで受け取った fd と I/O の直前に `O_NONBLOCK` を立て直し、`EAGAIN` は「まだ無い」「まだ書けない」として期限内で扱う
+//! （blocking の read / write で `message_timeout` / `idle_timeout` が評価されなくなるのを防ぐ。REPAIR-5）。
+//! 立て直しと I/O の間に相手がフラグを落とす窓は残る（safe な std だけでは塞げない。unsafe の承認範囲外）。
 
 mod error;
+mod metrics;
 mod negotiation;
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
@@ -30,12 +36,14 @@ use crate::ctrl::{CtrlResponse, RESP_ERR_INVALID_PARAMETER};
 use crate::log::{self, QueryResult};
 use crate::sys;
 use crate::vhost_user::fd_passing::{MAX_FDS, MAX_TIMEOUT, recv_with_fds, send_with_fds};
+use crate::vhost_user::observe;
 use crate::vhost_user::{
     Decoded, HEADER_LEN, Header, MAX_PAYLOAD_LEN, TransportError, TransportErrorCode,
     decode_request_payload,
 };
 use crate::virtqueue::VirtqueueErrorCode;
-use negotiation::{State, expected_fds};
+use metrics::{SessionMetrics, SessionOp};
+use negotiation::{State, expected_fds, force_nonblocking};
 
 /// ctrl 要求として受け付ける readable の最大長（固定長のスタックバッファの大きさ）。`CTX_CREATE`（96 バイト）より十分大きい。
 pub const MAX_CTRL_REQ_LEN: usize = 4096;
@@ -108,8 +116,18 @@ pub fn run(
         state: State::new(),
         adapter: CtrlAdapter::default(),
         limits: *limits,
+        metrics: SessionMetrics::default(),
     };
     let result = session.serve(sock, sink);
+    // REPAIR-4: 操作ごとの成功 / 失敗件数と所要時間、fd 受け渡し・ゲストメモリ I/O の集計を終了時に出す。
+    for line in session
+        .metrics
+        .lines()
+        .into_iter()
+        .chain(observe::snapshot_lines())
+    {
+        sink(&line);
+    }
     match &result {
         Ok(_) => sink(&log::session_end_line()),
         Err(e) => sink(&log::session_error_line(e.code.as_str(), e.request)),
@@ -121,6 +139,7 @@ struct Session {
     state: State,
     adapter: CtrlAdapter,
     limits: SessionLimits,
+    metrics: SessionMetrics,
 }
 
 /// 受信した要求と添付 fd。
@@ -194,13 +213,24 @@ impl Session {
                 sys::Interest::Readable,
                 self.limits.poll_slice,
             )? {
-                let Some(incoming) = self.read_message(sock)? else {
-                    return Ok(SessionEnd::PeerClosed);
+                let started = Instant::now();
+                let handled = match self.read_message(sock) {
+                    Ok(None) => return Ok(SessionEnd::PeerClosed),
+                    Ok(Some(incoming)) => self.dispatch(sock, incoming, sink),
+                    Err(e) => Err(e),
                 };
-                self.dispatch(sock, incoming, sink)?;
+                self.metrics
+                    .record(SessionOp::Message, handled.is_ok(), started.elapsed());
+                handled?;
                 last_activity = Instant::now();
             }
-            if self.service_ctrl(sink)? {
+            let started = Instant::now();
+            let serviced = self.service_ctrl(sink);
+            if !matches!(serviced, Ok(false)) {
+                self.metrics
+                    .record(SessionOp::CtrlKick, serviced.is_ok(), started.elapsed());
+            }
+            if serviced? {
                 last_activity = Instant::now();
             }
         }
@@ -274,6 +304,7 @@ impl Session {
             state,
             adapter,
             limits,
+            metrics,
         } = self;
         let Some((ring, mem)) = state.ctrl_parts() else {
             return Ok(false);
@@ -285,11 +316,9 @@ impl Session {
         )? {
             return Ok(false);
         }
-        let mut counter = [0u8; 8];
-        match (&ring.kick).read(&mut counter) {
-            Ok(0) => return Err(SessionError::new(SessionErrorCode::KickClosed, None)),
-            Ok(8) => {}
-            _ => return Err(SessionError::new(SessionErrorCode::InvalidKick, None)),
+        // 相手が poll の後に counter を読み切っていれば処理するものが無い（次の kick を待つ）。
+        if !read_kick(&ring.kick)? {
+            return Ok(false);
         }
         let mut done = 0usize;
         for _ in 0..ring.depth() {
@@ -331,20 +360,49 @@ impl Session {
             done += 1;
         }
         if done > 0 {
-            notify(&ring.call, limits.message_timeout)?;
+            let started = Instant::now();
+            let notified = notify(&ring.call, limits.message_timeout);
+            metrics.record(SessionOp::Notify, notified.is_ok(), started.elapsed());
+            notified?;
         }
         Ok(true)
     }
 }
 
-/// call の eventfd へ 1 を書いてゲストへ通知する（書き込み可能になるのを期限つきで待つ）。
-fn notify(call: &File, timeout: Duration) -> Result<(), SessionError> {
-    if !wait(call.as_fd(), sys::Interest::Writable, timeout)? {
-        return Err(SessionError::new(SessionErrorCode::Timeout, None));
+/// kick の eventfd から counter（8 バイト）を読む。読めたら真、相手が先に読み切っていて無ければ偽（待たない）。
+fn read_kick(kick: &File) -> Result<bool, SessionError> {
+    force_nonblocking(kick)?;
+    let mut counter = [0u8; 8];
+    match (&*kick).read(&mut counter) {
+        Ok(0) => Err(SessionError::new(SessionErrorCode::KickClosed, None)),
+        Ok(8) => Ok(true),
+        Ok(_) => Err(SessionError::new(SessionErrorCode::InvalidKick, None)),
+        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => Ok(false),
+        Err(_) => Err(SessionError::new(SessionErrorCode::InvalidKick, None)),
     }
-    match (&*call).write(&1u64.to_le_bytes()) {
-        Ok(8) => Ok(()),
-        _ => Err(SessionError::new(SessionErrorCode::CallFailed, None)),
+}
+
+/// call の eventfd へ 1 を書いてゲストへ通知する。書き込み可能になるのを待ち、`EAGAIN`（相手が counter を満たした等）は
+/// `timeout` の期限まで再試行する（期限切れは `TIMEOUT`）。
+fn notify(call: &File, timeout: Duration) -> Result<(), SessionError> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| SessionError::new(SessionErrorCode::InvalidArgument, None))?;
+    loop {
+        let left = remaining(deadline)?;
+        if !wait(call.as_fd(), sys::Interest::Writable, left)? {
+            continue;
+        }
+        force_nonblocking(call)?;
+        match (&*call).write(&1u64.to_le_bytes()) {
+            Ok(8) => return Ok(()),
+            Ok(_) => return Err(SessionError::new(SessionErrorCode::CallFailed, None)),
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
+                // poll では書けると言われたが直後に埋まった。busy loop を避けて短く待ってから期限内で再試行する。
+                std::thread::sleep(left.min(Duration::from_millis(1)));
+            }
+            Err(_) => return Err(SessionError::new(SessionErrorCode::CallFailed, None)),
+        }
     }
 }
 

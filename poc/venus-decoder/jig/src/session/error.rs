@@ -20,7 +20,7 @@ pub enum SessionErrorCode {
     RequiredFeatureMissing,
     /// ring の番号が 0・1 以外。
     InvalidVringIndex,
-    /// 値が範囲外（base が u16 に収まらない・enable が 0 / 1 以外）。
+    /// 値が範囲外（キューサイズが 0・2 の冪でない・上限超、base が u16 に収まらない・enable が 0 / 1 以外）。
     InvalidValue,
     /// 添付 fd の個数が要求の種別と合わない。
     FdCountMismatch,
@@ -36,6 +36,8 @@ pub enum SessionErrorCode {
     InvalidKick,
     /// call への書き込みが 8 バイトに満たなかった。
     CallFailed,
+    /// kick / call の fd を非ブロックにできなかった。
+    FdSetupFailed,
     /// 無通信のまま idle タイムアウトに達した。
     IdleTimeout,
     /// 1 メッセージの受信・応答送信・call の書き込みが期限内に終わらなかった。
@@ -66,6 +68,7 @@ impl SessionErrorCode {
             Self::KickClosed => "KICK_CLOSED",
             Self::InvalidKick => "INVALID_KICK",
             Self::CallFailed => "CALL_FAILED",
+            Self::FdSetupFailed => "FD_SETUP_FAILED",
             Self::IdleTimeout => "IDLE_TIMEOUT",
             Self::Timeout => "TIMEOUT",
             Self::Codec => "CODEC",
@@ -90,6 +93,7 @@ impl SessionErrorCode {
             Self::KickClosed => "kick fd was closed",
             Self::InvalidKick => "kick fd did not yield 8 bytes",
             Self::CallFailed => "call fd write was short",
+            Self::FdSetupFailed => "kick or call fd could not be set non-blocking",
             Self::IdleTimeout => "no activity before the idle timeout",
             Self::Timeout => "operation did not finish before its deadline",
             Self::Codec => "vhost-user codec error",

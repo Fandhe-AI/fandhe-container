@@ -3,7 +3,11 @@
 //! I/O を伴わない状態機械（ゲート表・feature 照合・`GET_CONFIG` のスライス）と時間制限の境界を具体値で照合する。
 //! socket を使う一連の流れは `tests/vhost_user_session.rs` が担当する。
 
-use std::time::Duration;
+use std::fs::File;
+use std::io::Write;
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
 
 use super::negotiation::{OFFERED_FEATURES, State, check_features};
 use super::*;
@@ -153,4 +157,119 @@ fn gpu6_error_display_is_fixed_vocabulary() {
         e.to_string(),
         "OUT_OF_ORDER (request=12): request is not allowed in the current session state"
     );
+}
+/// 試験用の memfd（1 領域のメモリ表）で、メモリ表の設定まで済ませた状態を作る。
+fn state_with_mem() -> State {
+    use crate::vhost_user::fd_passing::create_memfd;
+    use std::ffi::CString;
+
+    const UVA: u64 = 0x7f00_0000_0000;
+    const LEN: u64 = 0x1_0000;
+    let mut s = State::new();
+    s.handle(Request::SetOwner, Vec::new()).expect("owner");
+    s.handle(Request::GetProtocolFeatures, Vec::new())
+        .expect("q");
+    s.handle(Request::SetProtocolFeatures(0x201), Vec::new())
+        .expect("proto");
+    s.handle(Request::SetFeatures(OFFERED_FEATURES), Vec::new())
+        .expect("features");
+    let table = MemTable::new(&[MemRegion {
+        guest_phys_addr: 0,
+        memory_size: LEN,
+        userspace_addr: UVA,
+        mmap_offset: 0,
+    }])
+    .expect("table");
+    let file = create_memfd(&CString::new("jig-sess-unit").expect("name"), LEN).expect("memfd");
+    s.handle(Request::SetMemTable(table), vec![OwnedFd::from(file)])
+        .expect("mem table");
+    s
+}
+
+fn vring_addr() -> crate::vhost_user::VringAddr {
+    const UVA: u64 = 0x7f00_0000_0000;
+    crate::vhost_user::VringAddr {
+        index: 0,
+        flags: 0,
+        descriptor: UVA,
+        used: UVA + 0x2000,
+        available: UVA + 0x1000,
+        log: 0,
+    }
+}
+
+/// GPU-6・REPAIR-5: キューサイズは 0・2 の冪でない値・上限超を `INVALID_VALUE`（要求 ID 8）で拒否する。
+#[test]
+fn gpu6_set_vring_num_rejects_invalid_sizes() {
+    let mut s = state_with_mem();
+    let num = |n| Request::SetVringNum(VringState { index: 0, num: n });
+    for bad in [0u32, 3, 12, 32769, 65536] {
+        assert_eq!(
+            code_of(s.handle(num(bad), Vec::new())),
+            (SessionErrorCode::InvalidValue, Some(8)),
+            "num={bad}"
+        );
+    }
+    for good in [1u32, 8, 32768] {
+        assert!(s.handle(num(good), Vec::new()).is_ok(), "num={good}");
+    }
+}
+
+/// GPU-6: `SET_VRING_NUM` は旧 ring アドレスの検証結果を捨てる。ENABLE(0) → NUM → ENABLE(1) では
+/// ADDR を送り直すまで有効化できない（旧 cfg のまま別サイズで起動しない）。
+#[test]
+fn gpu6_set_vring_num_invalidates_ring_address() {
+    let mut s = state_with_mem();
+    let st = |num| VringState { index: 0, num };
+    s.handle(Request::SetVringNum(st(8)), Vec::new())
+        .expect("num");
+    s.handle(Request::SetVringAddr(vring_addr()), Vec::new())
+        .expect("addr");
+    s.handle(Request::SetVringEnable(st(0)), Vec::new())
+        .expect("disable");
+    s.handle(Request::SetVringNum(st(16)), Vec::new())
+        .expect("renum");
+    assert_eq!(
+        code_of(s.handle(Request::SetVringEnable(st(1)), Vec::new())),
+        (SessionErrorCode::OutOfOrder, Some(18))
+    );
+    // ADDR の再送で検証し直せば有効化できる。
+    s.handle(Request::SetVringAddr(vring_addr()), Vec::new())
+        .expect("addr again");
+    assert!(s.handle(Request::SetVringEnable(st(1)), Vec::new()).is_ok());
+}
+
+fn file_pair() -> (File, UnixStream) {
+    let (a, b) = UnixStream::pair().expect("pair");
+    (File::from(OwnedFd::from(a)), b)
+}
+
+/// REPAIR-5: poll の後に相手が読み切っていても kick の読み取りは待たず偽を返す
+/// （fd が blocking のまま渡されても `O_NONBLOCK` を立て直す）。
+#[test]
+fn repair5_read_kick_does_not_block_on_drained_counter() {
+    let (kick, mut peer) = file_pair();
+    assert!(!read_kick(&kick).expect("empty"));
+    peer.write_all(&1u64.to_le_bytes()).expect("kick");
+    assert!(read_kick(&kick).expect("one"));
+    assert!(!read_kick(&kick).expect("drained"));
+    drop(peer);
+    assert_eq!(
+        read_kick(&kick).expect_err("closed").code,
+        SessionErrorCode::KickClosed
+    );
+}
+
+/// REPAIR-5: call の書き込み先が埋まっていれば期限で `TIMEOUT` になり、無期限に止まらない。
+#[test]
+fn repair5_notify_times_out_when_call_is_full() {
+    let (call, _peer) = file_pair();
+    // call 側の送信バッファを満杯にする（peer は読まないので埋まったままになる）。
+    negotiation::force_nonblocking(&call).expect("nb");
+    let mut writer = &call;
+    while writer.write(&[0u8; 4096]).is_ok() {}
+    let started = Instant::now();
+    let e = notify(&call, Duration::from_millis(100)).expect_err("full");
+    assert_eq!(e.code, SessionErrorCode::Timeout);
+    assert!(started.elapsed() < Duration::from_secs(5));
 }

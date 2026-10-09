@@ -9,6 +9,7 @@
 
 use std::fs::File;
 use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 
 use super::error::{SessionError, SessionErrorCode};
 use crate::device;
@@ -17,7 +18,7 @@ use crate::vhost_user::{
     ConfigPayload, F_PROTOCOL_FEATURES, PROTOCOL_F_CONFIG, PROTOCOL_F_MQ, Reply, Request,
     RequestCode, VringAddr, VringState,
 };
-use crate::virtqueue::{QueueConfig, SplitQueue};
+use crate::virtqueue::{MAX_QUEUE_SIZE, QueueConfig, SplitQueue};
 
 /// `GET_FEATURES` で広告する値（治具の virtio feature と `PROTOCOL_FEATURES`）。
 pub(crate) const OFFERED_FEATURES: u64 = device::FEATURES | F_PROTOCOL_FEATURES;
@@ -106,6 +107,17 @@ fn ooo(code: RequestCode) -> SessionError {
 
 fn fail(c: SessionErrorCode, code: RequestCode) -> SessionError {
     SessionError::new(c, Some(code.as_u32()))
+}
+
+/// fd の `O_NONBLOCK` を立てる。フラグは open file description に属し、frontend が複製を持てば相手側からも落とせるため、
+/// 受け取り時と I/O の直前に呼ぶ。`UnixStream::set_nonblocking` は `ioctl(FIONBIO)` で fd の種別に依らず効く
+/// （eventfd でも使える）ので、複製を一時的に `UnixStream` として包んで呼ぶ（unsafe を増やさない）。
+pub(super) fn force_nonblocking(f: &File) -> Result<(), SessionError> {
+    let failed = || SessionError::new(SessionErrorCode::FdSetupFailed, None);
+    let dup = f.try_clone().map_err(|_| failed())?;
+    UnixStream::from(OwnedFd::from(dup))
+        .set_nonblocking(true)
+        .map_err(|_| failed())
 }
 
 fn ring_index(index: u32, code: RequestCode) -> Result<usize, SessionError> {
@@ -271,7 +283,15 @@ impl State {
                 if !self.owner {
                     return Err(ooo(code));
                 }
-                self.setup_mut(idx, code)?.num = Some(num);
+                // virtqueue と同じ条件（0 以外・2 の冪・上限以下）。ここで弾き、後段の `QueueConfig::new` に頼らない。
+                if num == 0 || num > MAX_QUEUE_SIZE || !num.is_power_of_two() {
+                    return Err(fail(SessionErrorCode::InvalidValue, code));
+                }
+                let setup = self.setup_mut(idx, code)?;
+                setup.num = Some(num);
+                // サイズを変えたら旧アドレスの検証結果は無効。SET_VRING_ADDR の再送と ENABLE をやり直させる。
+                setup.cfg = None;
+                setup.enabled = false;
                 Ok(None)
             }
             Request::SetVringBase(VringState { index, num }) => {
@@ -303,6 +323,10 @@ impl State {
                     return Err(fail(SessionErrorCode::FdCountMismatch, code));
                 };
                 let file = File::from(fd);
+                force_nonblocking(&file).map_err(|mut e| {
+                    e.request = Some(code.as_u32());
+                    e
+                })?;
                 let setup = self.setup_mut(idx, code)?;
                 if code == RequestCode::SetVringKick {
                     setup.kick = Some(file);

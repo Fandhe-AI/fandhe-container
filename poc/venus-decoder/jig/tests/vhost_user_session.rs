@@ -267,6 +267,18 @@ mod linux {
         assert!(lines.iter().any(|l| l == want), "log: {lines:?}");
         let report = find_capset_queries(&lines.join("\n")).expect("report");
         assert_eq!(report.venus_get_capset_ok, 1);
+        // REPAIR-4: 終了時に操作別の件数・時間と fd / メモリ I/O の集計が出る（壊れた行は増えない）。
+        assert_eq!(report.malformed_lines, 0, "log: {lines:?}");
+        for op in ["ctrl_kick", "notify"] {
+            let want = format!("venus_jig event=session_op op={op} ok=1 err=0 ");
+            assert!(lines.iter().any(|l| l.starts_with(&want)), "log: {lines:?}");
+        }
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("venus_jig event=vhost_user_io op=recv_fds ")),
+            "log: {lines:?}"
+        );
     }
 
     #[test]

@@ -140,6 +140,9 @@ pub use landlock::{
     LANDLOCK_PROBE_CONTENT_MISMATCH, LandlockAccessKind, LandlockAccessObservation,
     LandlockAccessProbe, observe_landlock_path_access,
 };
+/// supervisor の `SETUP_VIOLATIONS` との突き合わせ試験専用の再公開（SEC-4・SUP-6・#1579。通常の利用者は呼ばない）。
+#[doc(hidden)]
+pub use process::exec_child_violation_reasons;
 /// 結合試験 `tests/escape_suite.rs` 専用の再公開（SEC-2・TASK-42.1・#199。通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(feature = "escape-probe")]
 #[doc(hidden)]

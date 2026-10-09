@@ -1218,6 +1218,7 @@ fn from_exec_error(err: ExecError) -> TraitError {
 mod tests {
     use super::*;
     use fandhe_container_core::audit_log::{AuditDelivery, AuditLayer, AuditRecord};
+    use fandhe_container_core::exec::exec_child_violation_reasons;
     use fandhe_container_core::traits::{
         CgroupPlacement, CgroupScope, ContainerStatus, StateRevision,
     };
@@ -1234,6 +1235,22 @@ mod tests {
 
     fn cid() -> ContainerId {
         ContainerId::new("c1").unwrap()
+    }
+
+    /// SEC-4・SUP-6・#1579: worker 結果の復号が引き直す違反の一覧（`SETUP_VIOLATIONS`）は、core の exec の子が
+    /// 報告し得る一覧（`exec_child_violation_reasons`）と同じ集合である（片方だけに足すと、子が送った違反を
+    /// supervisor が `None` に落として SEC-4 の記録が欠ける）。
+    #[test]
+    fn sec4_sup6_setup_violations_match_core_exec_child_violations() {
+        let ours: std::collections::BTreeSet<&str> =
+            SETUP_VIOLATIONS.iter().map(|r| r.as_str()).collect();
+        let core: std::collections::BTreeSet<&str> = exec_child_violation_reasons()
+            .iter()
+            .map(|r| r.as_str())
+            .collect();
+        assert_eq!(ours, core);
+        assert_eq!(SETUP_VIOLATIONS.len(), exec_child_violation_reasons().len());
+        assert_eq!(SETUP_VIOLATIONS.len(), 8);
     }
 
     /// SUP-6: Running 以外・pid なしは FailedPrecondition。

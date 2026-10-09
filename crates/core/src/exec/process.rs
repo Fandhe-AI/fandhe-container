@@ -1047,6 +1047,15 @@ pub(super) const EXEC_CHILD_VIOLATIONS: [ViolationReason; 8] = [
     ViolationReason::EntrypointOnNoexecMount,
 ];
 
+/// 子が親へ違反として報告し得る理由の一覧（[`EXEC_CHILD_VIOLATIONS`] の読み取り専用の参照。SEC-4・SUP-6・#1579）。
+///
+/// supervisor の worker 結果の復号（`SETUP_VIOLATIONS`）が同じ一覧を持つことを、supervisor 側の単体テストが突き合わせる
+/// ために公開する（二重管理の一本化までの暫定。通常の利用者は呼ばない）。
+#[doc(hidden)]
+pub fn exec_child_violation_reasons() -> &'static [ViolationReason] {
+    &EXEC_CHILD_VIOLATIONS
+}
+
 /// 稼働中コンテナへの exec の子の本体（SUP-6・TASK-163.4。launch の `child_main` と同じ規約: 失敗したら stderr に
 /// 英語 1 行を出して終了コードを返す。戻り値は `_exit` に渡される）。
 ///

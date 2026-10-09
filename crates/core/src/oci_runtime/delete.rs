@@ -20,7 +20,8 @@
 //!    `ContainerCgroupRemover::scope` が記録のスコープと一致することを確かめ（不一致は `FailedPrecondition` で、
 //!    cgroup にもレコードにも触れない）、revision を再確認してから、記録された instance で
 //!    `ContainerCgroupRemover::remove` を呼ぶ。`Removed` / `NotPresent` は成功として次へ進み、エラーはそのまま
-//!    返してレコードを削除しない
+//!    返してレコードを削除しない（実装は削除の直前に、直下に残った exec 用の子 cgroup を上限つきの待機で
+//!    掃除してよい。#1596）
 //! 5. `StateStore::delete` を get で得た revision つきで呼ぶ（楽観的排他）。revision 不一致
 //!    （`FailedPrecondition`）なら get を 1 回だけやり直し、`NotFound` なら並行する delete が先に削除
 //!    したとみなして `NotFound`、レコードが残っていれば再試行を促す `FailedPrecondition` を返す
@@ -123,8 +124,9 @@ pub enum CgroupRemoval {
 /// - 存在しなければ [`CgroupRemoval::NotPresent`] を返す（成功扱い。再実行の冪等性のため）。`NotPresent` は
 ///   [`Self::scope`] の配下に無いことだけを意味する
 /// - プロセスが残っていて空でない場合は [`ErrorCode::FailedPrecondition`] を返す
-/// - 待機を伴わないファイル I/O（`openat` / `unlinkat` / `fstat`）だけで完結する。そのため
-///   タイムアウトは持たない（REPAIR-5 の対象外）
+/// - 直下に残った exec 用の子 cgroup（`exec-*`）は、実装が上限つきの待機（`cgroup.kill` の後に空になるまで。
+///   全体で 5 秒）で止めて消してから、コンテナ cgroup を削除してよい（#1596・SUP-6）。待機の超過は
+///   [`ErrorCode::Timeout`]、掃除が完了しなければ `remove` はエラーを返し、コンテナ cgroup には触れない
 /// - エラーのメッセージにパス・errno を含めない（`code` だけを機械可読な判定に使う）
 pub trait ContainerCgroupRemover: Send + Sync {
     /// `remove` が対象とする委譲スコープ（コンテナ用子 cgroup の親）を返す。

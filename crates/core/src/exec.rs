@@ -122,12 +122,13 @@ mod violation;
 #[doc(hidden)]
 pub use capabilities::clear_supplementary_groups_for_test;
 pub use capabilities::{CapabilityReport, SupplementaryGroups};
-#[cfg(feature = "exec-test-support")]
-pub use cgroup_join::remove_exec_child_cgroup_in;
 pub use cgroup_join::{
-    ExecCgroupJoin, ExecCgroupJoinReport, ExecCgroupName, ExecCgroupRemoval, ExecChildCgroup,
-    join_cgroup, prepare_cgroup_join, remove_exec_child_cgroup,
+    ExecCgroupJoin, ExecCgroupJoinReport, ExecCgroupName, ExecCgroupRemoval, ExecCgroupSweep,
+    ExecChildCgroup, join_cgroup, prepare_cgroup_join, remove_exec_child_cgroup,
+    sweep_stale_exec_child_cgroups,
 };
+#[cfg(feature = "exec-test-support")]
+pub use cgroup_join::{remove_exec_child_cgroup_in, sweep_stale_exec_child_cgroups_in};
 pub use container_env::{ContainerEnv, ExecCommand};
 pub use devices::{
     DeviceLinkOutcome, DeviceLinkStatus, DeviceNodeOutcome, DeviceNodeStatus, DeviceReport,

@@ -58,7 +58,10 @@
 //!   （`oci_runtime::delete` が状態記録の削除の前に呼ぶ。本番の呼び出し元による結線は未実装）。
 //!   `ContainerCgroupRemover::scope` は検出した委譲パス（[`DelegatedCgroup::path`] と同じ文字列）を返し、
 //!   delete は状態に記録された配置（`StateRecord::cgroup`）のスコープと一致するときだけ、記録された instance の
-//!   名前（`fc-<id>@<n>`）で削除・不存在確認を行う
+//!   名前（`fc-<id>@<n>`）で削除・不存在確認を行う。削除の直前に、コンテナ cgroup 直下に残った exec 用の
+//!   子 cgroup（`exec-*`）を `cgroup.kill` で止めて消す（全体で 5 秒の期限つき。失敗・件数上限の超過は
+//!   `Err` で返し、コンテナ cgroup の `rmdir` は試みない。#1596・SUP-6。コンテナ cgroup 自体には `cgroup.kill`
+//!   を書かない）
 //!
 //! # 資源制限 setter の計装（REPAIR-4・TASK-170 追補・#1535）
 //! 資源制限の各 setter は `recorder: &OpRecorder` を受け取り、setter の内部で全終了経路（controller 未有効・
@@ -109,7 +112,8 @@ mod exec_join;
 mod exec_kill;
 pub(crate) use exec_join::{ExecJoinFds, contains_pid, open_cgroup_by_path};
 pub(crate) use exec_kill::{
-    ExecChildCgroupFds, ExecChildRemoval, remove_exec_child_cgroup_at, validate_exec_child_name,
+    EXEC_SWEEP_DELETE_TIMEOUT, ExecChildCgroupFds, ExecChildRemoval, ExecChildSweep, SweepMode,
+    remove_exec_child_cgroup_at, sweep_exec_children_at, validate_exec_child_name,
 };
 
 /// 退避リーフ cgroup の名前。自プロセスの移動先（レイアウトは本モジュール冒頭を参照）。
@@ -1291,7 +1295,8 @@ fn remove_verified_at(
 
 /// `oci_runtime::delete` が使う cgroup 削除（TASK-30.3・OCI-6）。対象は `fc-<id>@<instance>`（CORE-3 で作った子）だけ。
 ///
-/// 待機を伴わないファイル I/O のみのためタイムアウトは持たない（REPAIR-5 の対象外）。
+/// 削除の直前に、直下の残留 `exec-*` を `cgroup.kill` で止めて消す。その待機は掃除全体で
+/// `EXEC_SWEEP_DELETE_TIMEOUT`（5 秒）の上限つき（REPAIR-5。超過は `Timeout`。#1596）。
 impl ContainerCgroupRemover for DelegatedCgroup {
     /// 検出した委譲パス（[`DelegatedCgroup::path`]。ルートは `"/"`）を [`CgroupScope`] にして返す。
     ///
@@ -1315,6 +1320,14 @@ impl ContainerCgroupRemover for DelegatedCgroup {
         match self.open_child(&name).map_err(removal_error)? {
             None => Ok(CgroupRemoval::NotPresent),
             Some(child) => {
+                // コンテナは停止済みなので、残った exec 用の子 cgroup はすべて止めて消す。残すと下の
+                // `rmdir` が EBUSY になり、何度再試行しても成功しない。
+                let deadline = std::time::Instant::now() + EXEC_SWEEP_DELETE_TIMEOUT;
+                let swept = sweep_exec_children_at(child.fd.as_fd(), SweepMode::KillAll, deadline)
+                    .map_err(removal_error)?;
+                if swept.failed > 0 || swept.truncated {
+                    return Err(sweep_removal_error(&swept));
+                }
                 match self.remove_child(&child) {
                     Ok(()) => Ok(CgroupRemoval::Removed),
                     // open_child の後に並行 delete 等で既に消えた。目的の状態（cgroup 無し）に
@@ -1325,6 +1338,16 @@ impl ContainerCgroupRemover for DelegatedCgroup {
             }
         }
     }
+}
+
+/// 残留 `exec-*` の掃除が完了しなかったことを `TraitError` にする（#1596）。`code` は最初の失敗のものを保ち
+/// （件数上限の超過のみなら `FailedPrecondition`。再実行のたびに前進する）、メッセージは固定文言にする。
+fn sweep_removal_error(swept: &ExecChildSweep) -> TraitError {
+    let code = swept.first_error.unwrap_or(ErrorCode::FailedPrecondition);
+    TraitError::new(
+        code,
+        "exec child cgroups of the container could not be removed; retry",
+    )
 }
 
 /// `CgroupError` を `TraitError` へ写す。`code` だけを保ち、メッセージは固定文言にする

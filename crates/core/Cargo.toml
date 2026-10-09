@@ -81,6 +81,11 @@ harness = false
 name = "exec_cgroup_kill"
 path = "tests/exec_cgroup_kill.rs"
 
+# 残った exec 用の子 cgroup の掃除（SUP-6・OCI-6・#1596）の結合試験。上と同じ理由の実機前提テスト。
+[[test]]
+name = "exec_cgroup_sweep"
+path = "tests/exec_cgroup_sweep.rs"
+
 [[test]]
 name = "cgroup_join"
 path = "tests/cgroup_join.rs"

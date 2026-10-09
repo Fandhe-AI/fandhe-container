@@ -201,6 +201,14 @@ impl Header {
         })
     }
 
+    /// 先頭 12 バイトを「frontend から backend への要求」として検査して復号する公開入口。
+    /// 方向を要求に固定するため、crate 外の呼び出し元（F1.2）は「ヘッダ検証 → `payload_len` 確認 →
+    /// ペイロード読み → `decode_request_payload`」の 2 段復号を公開 API だけで行える（REPAIR-2・GPU-6）。
+    /// `buf` は 12 バイト以上であればよく、ペイロードには触れない。
+    pub fn decode_request(buf: &[u8]) -> Result<Self, CodecError> {
+        Self::decode(buf, Direction::Request)
+    }
+
     /// 要求種別。
     pub fn request(&self) -> RequestCode {
         self.request

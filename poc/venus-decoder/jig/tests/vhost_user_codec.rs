@@ -3,8 +3,8 @@
 //! 要求・応答の具体バイト列の照合と、不正入力の拒否（検査順を含む）を確認する。ソケット I/O は含まない（F1.2）。
 
 use fandhe_container_poc_venus_jig::vhost_user::{
-    CodecErrorCode, ConfigPayload, MemRegion, MemTable, Reply, Request, RequestCode, VringFd,
-    VringState, decode_reply, decode_request,
+    CodecErrorCode, ConfigPayload, HEADER_LEN, Header, MemRegion, MemTable, Reply, Request,
+    RequestCode, VringFd, VringState, decode_reply, decode_request, decode_request_payload,
 };
 
 fn hdr(request: u32, flags: u32, payload: &[u8]) -> Vec<u8> {
@@ -61,6 +61,29 @@ fn f1_1_gpu6_decode_requests_from_exact_bytes() {
         d.request,
         Request::SetMemTable(MemTable::new(&[region]).unwrap())
     );
+}
+
+#[test]
+fn f1_1_gpu6_two_stage_decode_via_public_api() {
+    // 公開 API のみで「ヘッダ検証 → payload_len 確認 → ペイロード復号」を通す（REPAIR-2）。
+    let msg = hdr(8, 0x9, &u32s(&[1, 256]));
+    let header = Header::decode_request(&msg[..HEADER_LEN]).unwrap();
+    assert_eq!(header.request(), RequestCode::SetVringNum);
+    assert!(header.need_reply());
+    assert!(!header.is_reply());
+    assert_eq!(header.payload_len(), 8);
+    let d = decode_request_payload(&header, &msg[HEADER_LEN..]).unwrap();
+    assert_eq!(
+        d.request,
+        Request::SetVringNum(VringState { index: 1, num: 256 })
+    );
+    assert!(d.need_reply);
+    // 応答方向（REPLY ビット）のヘッダは要求として拒否される。
+    let err = Header::decode_request(&hdr(1, 0x5, &[])[..HEADER_LEN]).unwrap_err();
+    assert_eq!(err.code, CodecErrorCode::InvalidFlags);
+    // 12 バイト未満は ShortHeader。
+    let err = Header::decode_request(&msg[..11]).unwrap_err();
+    assert_eq!(err.code, CodecErrorCode::ShortHeader);
 }
 
 #[test]

@@ -10,7 +10,9 @@ use crate::ctrl::{
     RESP_OK_DISPLAY_INFO, RESP_OK_NODATA,
 };
 use crate::device;
-use crate::log::{LogError, MAX_LINES, MAX_LOG_BYTES, find_capset_queries};
+use crate::log::{
+    LogError, LogFileError, LogSink, MAX_LINES, MAX_LOG_BYTES, find_capset_queries, read_log_file,
+};
 
 /// 状態を持たない単発要求用（ctx 表は毎回空）。
 fn handle_ctrl(req: &[u8]) -> Handled {
@@ -365,4 +367,130 @@ fn task1520_gpu6_new_log_lines_do_not_disturb_checker() {
         (rep.venus_get_capset_ok, rep.info_ok, rep.malformed_lines),
         (0, 0, 0)
     );
+}
+
+const OK_LINE: &str =
+    "venus_jig event=capset_query cmd=GET_CAPSET capset_id=4 version=0 result=ok max_size=160";
+
+#[test]
+fn gpu6_log_sink_writes_lines_within_limits() {
+    let mut sink = LogSink::new(Vec::new());
+    sink.write_line(OK_LINE);
+    assert!(!sink.truncated());
+    let (out, err) = sink.into_inner();
+    assert_eq!(err, None);
+    assert_eq!(String::from_utf8(out).unwrap(), format!("{OK_LINE}\n"));
+}
+
+#[test]
+fn gpu6_log_sink_truncates_once_at_line_count_limit_and_matcher_accepts() {
+    let mut sink = LogSink::new(Vec::new());
+    sink.write_line(OK_LINE);
+    for _ in 0..(MAX_LINES + 10) {
+        sink.write_line("venus_jig event=tick");
+    }
+    assert!(sink.truncated());
+    let (out, _) = sink.into_inner();
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(text.lines().count(), MAX_LINES);
+    assert_eq!(text.matches("event=log_truncated").count(), 1);
+    assert_eq!(
+        text.lines().last(),
+        Some("venus_jig event=log_truncated reason=limit")
+    );
+    let report = find_capset_queries(&text).expect("within limits");
+    assert_eq!(report.venus_get_capset_ok, 1);
+    assert_eq!(report.malformed_lines, 0);
+}
+
+#[test]
+fn gpu6_log_sink_truncates_at_byte_limit_and_over_long_line() {
+    let mut sink = LogSink::new(Vec::new());
+    let long = "venus_jig event=need_reply_ignored request=1 ".repeat(30);
+    assert!(long.len() > 512);
+    sink.write_line(&long);
+    sink.write_line(OK_LINE);
+    let (out, _) = sink.into_inner();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "venus_jig event=log_truncated reason=limit\n"
+    );
+
+    // 総量: 1 行 500 バイト前後を詰め続けても 4 MiB を超えない。
+    let mut sink = LogSink::new(Vec::new());
+    let filler = format!(
+        "venus_jig event=need_reply_ignored request={}",
+        "9".repeat(450)
+    );
+    for _ in 0..9000 {
+        sink.write_line(&filler);
+    }
+    assert!(sink.truncated());
+    let (out, _) = sink.into_inner();
+    assert!(out.len() <= MAX_LOG_BYTES, "len={}", out.len());
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(find_capset_queries(&text).unwrap().malformed_lines, 0);
+}
+
+struct FailingWriter(usize);
+impl std::io::Write for FailingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.0 == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        }
+        self.0 -= 1;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn repair5_log_sink_keeps_first_write_error_and_stops() {
+    let mut sink = LogSink::new(FailingWriter(1));
+    sink.write_line(OK_LINE);
+    sink.write_line(OK_LINE);
+    sink.write_line(OK_LINE);
+    let (w, err) = sink.into_inner();
+    assert_eq!(err, Some(std::io::ErrorKind::StorageFull));
+    assert_eq!(w.0, 0);
+}
+
+fn scratch_dir(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let p = std::env::temp_dir().join(format!(
+        "venus-jig-{tag}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&p).expect("scratch dir");
+    p
+}
+
+#[test]
+fn d2_read_log_file_rejects_non_regular_without_opening() {
+    let dir = scratch_dir("rd");
+    assert_eq!(read_log_file(&dir), Err(LogFileError::NotRegularFile));
+    let file = dir.join("ok.log");
+    std::fs::write(&file, format!("{OK_LINE}\n")).unwrap();
+    assert_eq!(read_log_file(&file).unwrap(), format!("{OK_LINE}\n"));
+    assert_eq!(
+        read_log_file(&dir.join("missing.log")),
+        Err(LogFileError::Open)
+    );
+    #[cfg(unix)]
+    {
+        let link = dir.join("link.log");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert_eq!(read_log_file(&link), Err(LogFileError::NotRegularFile));
+    }
+    let big = dir.join("big.log");
+    std::fs::write(&big, vec![b'a'; MAX_LOG_BYTES + 1]).unwrap();
+    assert_eq!(read_log_file(&big), Err(LogFileError::TooLarge));
+    let bad = dir.join("bad.log");
+    std::fs::write(&bad, [0xff, 0xfe]).unwrap();
+    assert_eq!(read_log_file(&bad), Err(LogFileError::NotUtf8));
+    std::fs::remove_dir_all(&dir).unwrap();
 }

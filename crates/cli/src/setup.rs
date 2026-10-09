@@ -109,7 +109,7 @@ pub fn run_for(platform: SetupPlatform, stdout: &mut dyn Write) -> CliExit {
     }
     let steps = required_steps(platform);
     for step in steps {
-        // 1 行を 1 回の write_all で書く（行の途中へ他の出力が入らないようにする）。
+        // 1 行を 1 つのバッファで `write_all` する（断片ごとの write を避ける。他プロセスとの不可分性は保証しない）。
         if stdout.write_all(step_line(*step).as_bytes()).is_err() {
             return CliExit::failed(ErrorCode::Internal);
         }

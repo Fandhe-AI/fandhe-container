@@ -23,6 +23,7 @@ compile_error!(
 pub mod commands;
 pub mod doctor;
 pub mod error;
+mod json;
 pub mod setup;
 #[cfg(unix)]
 pub mod signals;

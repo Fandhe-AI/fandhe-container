@@ -194,7 +194,9 @@ fn encode_payload(record: &AuditRecord) -> Result<String, AuditWriteError> {
         None => out.push_str(" arch=?"),
     }
     let path = match record.event() {
-        AuditEvent::Seccomp { .. } | AuditEvent::ExecTarget { .. } => None,
+        AuditEvent::Seccomp { .. }
+        | AuditEvent::ExecTarget { .. }
+        | AuditEvent::Entrypoint { .. } => None,
         AuditEvent::Landlock { path, .. } => Some(path),
         AuditEvent::Mount { path } => path.as_ref(),
         AuditEvent::PluginTrust { path, .. } => Some(path),
@@ -559,6 +561,18 @@ mod tests {
             encode_payload(&r).unwrap(),
             "op=fandhe-audit layer=exec_target ts=1700000000.000000005 pid=1234 syscall=? arch=? \
              path=? path_truncated=? path_original_len=? reason=exec_target_cgroup_mismatch"
+        );
+    }
+
+    #[test]
+    fn sec4_sup6_task163_payload_entrypoint_without_path() {
+        let r = rec(AuditEvent::Entrypoint {
+            reason: crate::audit_log::AuditReason::new("entrypoint_is_runtime_binary"),
+        });
+        assert_eq!(
+            encode_payload(&r).unwrap(),
+            "op=fandhe-audit layer=entrypoint ts=1700000000.000000005 pid=1234 syscall=? arch=? \
+             path=? path_truncated=? path_original_len=? reason=entrypoint_is_runtime_binary"
         );
     }
 

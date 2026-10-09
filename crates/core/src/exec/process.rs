@@ -1063,8 +1063,9 @@ pub(super) const EXEC_CHILD_VIOLATIONS: [ViolationReason; 8] = [
 
 /// 子が親へ違反として報告し得る理由の一覧（[`EXEC_CHILD_VIOLATIONS`] の読み取り専用の参照。SEC-4・SUP-6・#1579）。
 ///
-/// supervisor の worker 結果の復号（`SETUP_VIOLATIONS`）が同じ一覧を持つことを、supervisor 側の単体テストが突き合わせる
-/// ために公開する（二重管理の一本化までの暫定。通常の利用者は呼ばない）。
+/// 監査ログへ記録する対象の SSOT は `ViolationReason::ENTRYPOINT_REASONS` で、この一覧はその部分集合
+/// （本ファイルの単体テストが固定する。#1595）。supervisor の worker 結果の復号は `ENTRYPOINT_REASONS` で引き直し、
+/// supervisor 側の単体テストがこの一覧の全要素が往復できることを確かめるために公開する（通常の利用者は呼ばない）。
 #[doc(hidden)]
 pub fn exec_child_violation_reasons() -> &'static [ViolationReason] {
     &EXEC_CHILD_VIOLATIONS
@@ -3467,6 +3468,25 @@ mod tests {
             found.difference(&listed).cloned().collect(),
             listed.difference(found).cloned().collect(),
         )
+    }
+
+    /// 子が返し得る違反はすべて `Entrypoint` 監査イベントに写せる（足し忘れの検出。SEC-4・SUP-6・SEC-1・#1595）。
+    #[test]
+    fn sec4_sup6_task163_exec_child_violations_are_all_audited() {
+        for r in EXEC_CHILD_VIOLATIONS {
+            assert!(
+                ViolationReason::ENTRYPOINT_REASONS.contains(&r),
+                "{} is not in ENTRYPOINT_REASONS",
+                r.as_str()
+            );
+            assert_eq!(
+                r.entrypoint_audit_event(),
+                Some(crate::audit_log::AuditEvent::Entrypoint {
+                    reason: crate::audit_log::AuditReason::new(r.as_str())
+                })
+            );
+            assert_eq!(ViolationReason::from_entrypoint_token(r.as_str()), Some(r));
+        }
     }
 
     /// 子の経路（`process.rs`・`interpreter.rs`・`sealed_copy.rs`）が作る違反理由と `EXEC_CHILD_VIOLATIONS` が一致する

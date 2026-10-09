@@ -2,7 +2,7 @@
 //!
 //! # 役割
 //!
-//! seccomp・Landlock・マウント検証/API・plugin 信頼検証（TASK-122.5）・exec 対象（#1465）の 5 レイヤーで起きた分離違反の試行を、原因特定に必要な情報
+//! seccomp・Landlock・マウント検証/API・plugin 信頼検証（TASK-122.5）・exec 対象（#1465）・エントリポイント検証（#1595）の 6 レイヤーで起きた分離違反の試行を、原因特定に必要な情報
 //! （syscall 番号・対象パス・プロセス ID・タイムスタンプ）付きで表す固定スキーマの型を定義する。
 //! 本モジュールは型のみで、syscall も I/O も持たない（OS 非依存。3 OS でコンパイルされる）。
 //!
@@ -14,6 +14,13 @@
 //! - exec の対象の拒否（層 `exec_target`）は `exec::audit_exec_violation` / `exec::record_exec_target_rejection`
 //!   が [`AuditEvent::ExecTarget`] として記録する。supervisor の通しの入口 `run_command` が親プロセス側で
 //!   1 拒否 1 件を記録する（#1465）。パスは持たない（型で保証）
+//! - エントリポイント検証の拒否（層 `entrypoint`。#1595）は `exec::audit_entrypoint_violation` /
+//!   `exec::record_entrypoint_rejection` が [`AuditEvent::Entrypoint`] として記録する。launch と exec の
+//!   子が共有する検証（`exec_checked_entrypoint` 等）の拒否理由 8 種を載せる層で、exec の
+//!   `SetupFailed` は supervisor の `run_command*` が親側で 1 拒否 1 件を記録する。パスは持たない
+//!   （型で保証）。記録の PID と時刻は記録を行った親プロセスのもので、時刻は拒否から最大で exec の
+//!   上限時間ぶん遅れ得る。ワイヤー形式には安定値 `entrypoint` が `layer` に増える（既存の層の行は不変。
+//!   `reason` を持つ層は plugin_trust・exec_target・entrypoint の 3 つ）。launch 経路の本番配線は #1314
 //! - TASK-41.3（#194）の Landlock フックは [`landlock_denial_record`] で実装済み（プロセス内で観測した
 //!   `EACCES` の写像まで。ワークロードの拒否のカーネル側監査〔Linux 6.15+ の `AUDIT_LANDLOCK_*`〕による
 //!   捕捉は未実装）
@@ -340,6 +347,8 @@ pub enum AuditLayer {
     PluginTrust,
     /// 稼働中コンテナへの exec の対象の拒否（SEC-4・SUP-6・TASK-163 追補・#1465）。
     ExecTarget,
+    /// エントリポイント検証の拒否（launch と exec の子で共有。SEC-4・SUP-6・TASK-163 追補・#1595）。
+    Entrypoint,
 }
 
 impl AuditLayer {
@@ -351,6 +360,7 @@ impl AuditLayer {
             AuditLayer::Mount => "mount",
             AuditLayer::PluginTrust => "plugin_trust",
             AuditLayer::ExecTarget => "exec_target",
+            AuditLayer::Entrypoint => "entrypoint",
         }
     }
 }
@@ -401,6 +411,15 @@ pub enum AuditEvent {
         /// 拒否理由トークン（`exec_target_*` 等の静的トークン。[`AuditReason`] 参照）。
         reason: AuditReason,
     },
+    /// エントリポイント検証の拒否（SEC-4・SUP-6・SEC-1・TASK-163 追補・#1595）。
+    ///
+    /// 理由トークンだけを持ち、**パスは持たない**（型で保証する。REPAIR-2）。対象は常にそのコンテナの
+    /// エントリポイントか新 root の `/dev`・`/proc`・`/dev/null` で理由コードだけで原因を特定でき、
+    /// システム共通の監査ログへコンテナ内パスやホスト構成を出さないため。
+    Entrypoint {
+        /// 拒否理由トークン（`entrypoint_*` 等の静的トークン。[`AuditReason`] 参照）。
+        reason: AuditReason,
+    },
 }
 
 impl AuditEvent {
@@ -412,6 +431,7 @@ impl AuditEvent {
             AuditEvent::Mount { .. } => AuditLayer::Mount,
             AuditEvent::PluginTrust { .. } => AuditLayer::PluginTrust,
             AuditEvent::ExecTarget { .. } => AuditLayer::ExecTarget,
+            AuditEvent::Entrypoint { .. } => AuditLayer::Entrypoint,
         }
     }
 }
@@ -462,7 +482,8 @@ impl AuditRecord {
             AuditEvent::Landlock { syscall, .. } => *syscall,
             AuditEvent::Mount { .. }
             | AuditEvent::PluginTrust { .. }
-            | AuditEvent::ExecTarget { .. } => None,
+            | AuditEvent::ExecTarget { .. }
+            | AuditEvent::Entrypoint { .. } => None,
         }
     }
 
@@ -477,19 +498,21 @@ impl AuditRecord {
     /// 対象パスがあれば返す。
     pub fn path(&self) -> Option<&Path> {
         match &self.event {
-            AuditEvent::Seccomp { .. } | AuditEvent::ExecTarget { .. } => None,
+            AuditEvent::Seccomp { .. }
+            | AuditEvent::ExecTarget { .. }
+            | AuditEvent::Entrypoint { .. } => None,
             AuditEvent::Landlock { path, .. } => Some(path.as_path()),
             AuditEvent::Mount { path } => path.as_ref().map(AuditPath::as_path),
             AuditEvent::PluginTrust { path, .. } => Some(path.as_path()),
         }
     }
 
-    /// 拒否理由トークン（plugin 信頼検証・exec 対象のレコードのみ。他レイヤーは `None`）。
+    /// 拒否理由トークン（plugin 信頼検証・exec 対象・エントリポイントのレコードのみ。他レイヤーは `None`）。
     pub fn reason(&self) -> Option<AuditReason> {
         match &self.event {
-            AuditEvent::PluginTrust { reason, .. } | AuditEvent::ExecTarget { reason } => {
-                Some(*reason)
-            }
+            AuditEvent::PluginTrust { reason, .. }
+            | AuditEvent::ExecTarget { reason }
+            | AuditEvent::Entrypoint { reason } => Some(*reason),
             _ => None,
         }
     }
@@ -580,6 +603,28 @@ mod tests {
         assert_eq!(AuditLayer::Landlock.as_str(), "landlock");
         assert_eq!(AuditLayer::Mount.as_str(), "mount");
         assert_eq!(AuditLayer::ExecTarget.as_str(), "exec_target");
+        assert_eq!(AuditLayer::Entrypoint.as_str(), "entrypoint");
+    }
+
+    /// SEC-4・SUP-6・TASK-163 追補・#1595: entrypoint レコードは理由だけを持ち、パス・syscall は持たない。
+    #[test]
+    fn sec4_sup6_task163_entrypoint_record_accessors() {
+        let r = AuditRecord::new(
+            ts(),
+            pid(12),
+            AuditEvent::Entrypoint {
+                reason: AuditReason::new("entrypoint_is_runtime_binary"),
+            },
+        );
+        assert_eq!(r.layer(), AuditLayer::Entrypoint);
+        assert_eq!(
+            r.reason().map(AuditReason::as_str),
+            Some("entrypoint_is_runtime_binary")
+        );
+        assert_eq!(r.path(), None);
+        assert_eq!(r.syscall(), None);
+        assert_eq!(r.seccomp_arch(), None);
+        assert_eq!(r.pid().get(), 12);
     }
 
     /// SEC-4・SUP-6・TASK-163 追補: exec 対象レコードは理由だけを持ち、パス・syscall は持たない。

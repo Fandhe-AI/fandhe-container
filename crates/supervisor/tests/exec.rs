@@ -117,8 +117,9 @@ mod linux {
     };
     use fandhe_container_supervisor::container_options::env::EnvVar;
     use fandhe_container_supervisor::exec::{
-        ExecRequest, enter_namespaces, identify_pid1, join_cgroup, prepare_cgroup_join,
-        prepare_restrictions, reapply_restrictions, run_command, run_command_in,
+        AuditedOutcome, ExecRequest, enter_namespaces, identify_pid1, join_cgroup,
+        prepare_cgroup_join, prepare_restrictions, reapply_restrictions, run_command,
+        run_command_in,
     };
 
     /// 5 回の通し（受入条件: 5 回中 5 回成功）。
@@ -549,7 +550,9 @@ mod linux {
             other => panic!("unknown joiner mode {other}"),
         };
         match result {
-            Ok(o) => {
+            Ok(AuditedOutcome {
+                outcome: o, audit, ..
+            }) => {
                 println!(
                     "outcome exit={:?} rlimits={} rlimits_deferred={} caps_dropped={} landlock_rules={} seccomp_instructions={} groups={} entrypoint_mode={} reason={}",
                     o.exit,
@@ -564,6 +567,11 @@ mod linux {
                         .fallback_reason()
                         .map_or("-", |r| r.as_str()),
                 );
+                // `execve` 前の拒否（`SetupFailed` の違反）だけ、層 `entrypoint` の記録の要約を 2 行目に出す（#1595）。
+                // コマンドが起動した成功経路は 1 行のまま（既存の厳密一致の照合を保つ）。
+                if audit != AuditDelivery::NotApplicable {
+                    println!("audit: {}", sink.summary(&audit));
+                }
             }
             Err(rejected) => {
                 println!("error: {}", rejected.error.message());
@@ -1088,6 +1096,14 @@ mod linux {
             )),
             "the exec child must refuse the runtime-interpreted script: {out}"
         );
+        // 拒否は層 `entrypoint` で 1 件記録され、パスは載らない（#1595）。
+        assert!(
+            out.contains(
+                "audit: delivery=Recorded records=1 layer=entrypoint \
+                 reason=entrypoint_interpreter_is_runtime_binary path=none"
+            ),
+            "the setup rejection must be audited once: {out}"
+        );
         assert!(
             probe_child(jpid, &std::env::current_exe().expect("current_exe")).is_none(),
             "the runtime binary must not be running as the script interpreter"
@@ -1140,6 +1156,13 @@ mod linux {
                     }
                 )),
                 "the exec child must refuse the replaced /dev/null ({kind}): {out}"
+            );
+            assert!(
+                out.contains(
+                    "audit: delivery=Recorded records=1 layer=entrypoint \
+                     reason=stdio_null_not_null_device path=none"
+                ),
+                "the setup rejection must be audited once ({kind}): {out}"
             );
             assert!(
                 !bundle.rootfs().join("data/ok").exists(),

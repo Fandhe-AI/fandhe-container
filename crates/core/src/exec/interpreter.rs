@@ -37,7 +37,7 @@
 //! **方式の切り替え（オーナー判断 2026-10-09「条件付き切り替え」）**: 封印した複製を使える環境（下記「限界」の
 //! (a)〜(c)）では B' で実行し、それ以外では A（O_PATH での固定 + inode 照合をした元の fd をそのまま `execveat` する
 //! 現行方式。#1478）で実行する。切り替えは黙って行わない: 判定結果は `EntrypointExecMode`（方式と、A を選んだ理由の
-//! 機械可読なコード `kernel_too_old`・`lsm_apparmor`・`ima_policy_unreadable` 等）で表し、supervisor が構造化ログ
+//! 機械可読なコード `kernel_too_old`・`lsm_apparmor`・`lsm_ima` 等。一覧は `entrypoint_mode.rs`）で表し、supervisor が構造化ログ
 //! （`{"component":"supervisor.exec","operation":"entrypoint_mode",...}`）と `ExecOutcome` に残す（REPAIR-4）。A でも
 //! 元のファイルのマウントの `noexec` は `fstatfs` で判定して違反 `entrypoint_on_noexec_mount` で拒否する（B' と判定・
 //! 違反記録を揃える）。A では照合した元の fd を実行するため、照合の後・`execveat` の前に元のファイルの内容（シェバン・
@@ -139,22 +139,21 @@
 //!   （実行ビット・`noexec`・Landlock の `EXECUTE`・`security_bprm_creds_for_exec`）は、複製の前に元のファイルの fd へ
 //!   `AT_EXECVE_CHECK`（Linux 6.14+）で問い合わせる（6.14 未満は B' を使わない）。一方、AppArmor のパス結び付きプロファイル・
 //!   SELinux の exec 遷移は、実行した後にどのプロファイル・ドメインで動くかを実行したファイルについて決めるため、
-//!   memfd を実行すると元のファイルについては働かない。IMA の appraisal が `AT_EXECVE_CHECK` で評価されるかは一次情報で
-//!   確かめていない。`sealed_copy.rs` の手順 0（`SealPolicy`）が、`prepare_exec_restrictions` が `setns` の前にホスト側で
-//!   読んだ環境（`/sys/kernel/security/lsm`・`/proc/cmdline`・IMA の policy）から許可リスト方式で判定し、維持できない
-//!   （または判定できない）なら複製せず、理由を記録して A（現行方式）で実行する（オーナー判断 2026-10-09）: 安全と分かっている LSM（`capability`・
-//!   `lockdown`・`yama`・`landlock`・`loadpin`・`safesetid`）と、IMA の appraisal が無いと確かめられた場合の IMA 系
-//!   （`ima`・`evm`・`integrity`）以外が有効なら B' を使わない（AppArmor・TOMOYO・Smack・BPF LSM・IPE・SELinux と未知の名前）。
+//!   memfd を実行すると元のファイルについては働かない。IMA・EVM の計測・appraisal も、memfd からの実行が計測されない・
+//!   元のパスで記録されないおそれがあり、`AT_EXECVE_CHECK` で評価されるかも一次情報で確かめていない。`sealed_copy.rs` の
+//!   手順 0（`SealPolicy`）が、`prepare_exec_restrictions` が `setns` の前にホスト側で読んだ有効な LSM の一覧
+//!   （`/sys/kernel/security/lsm`。securityfs と確かめてから読む）から許可リスト方式で判定し、維持できない（または判定
+//!   できない）なら複製せず、理由を記録して A（現行方式）で実行する（オーナー判断 2026-10-09）: 安全と分かっている LSM
+//!   （`capability`・`lockdown`・`yama`・`landlock`・`loadpin`・`safesetid`）以外が有効なら B' を使わない（AppArmor・
+//!   TOMOYO・Smack・BPF LSM・IPE・SELinux・IMA・EVM・integrity と未知の名前。IMA 系は計測専用のポリシーでも使わない。
+//!   独立監査 P2-1。IMA の memfd に対する挙動を一次情報で確かめられれば、計測専用の環境などは将来緩められる）。
 //!   Landlock は有効でも一律には拒否しない（exec の子は自前のルールセットを必ず適用するため、一律拒否は本番の exec を
 //!   成立させない。`EXECUTE` は `AT_EXECVE_CHECK` が判定する）。
-//!   **帰結**: 封印した複製を使える（B' で実行する）のは、(a) Linux 6.14 以上、(b) 有効な LSM が
-//!   上の許可リストに収まる（`apparmor`・`selinux`・`tomoyo`・`smack`・`bpf`・`ipe` や未知の LSM が無い）、(c) IMA 系が
-//!   有効なら `/proc/cmdline` に appraisal の指定が無く、`/sys/kernel/security/ima/policy` を読めて appraise 行が無いと
-//!   確かめられる、をすべて満たすホストだけ。(c) は `CONFIG_IMA_READ_POLICY` なしのカーネル（policy が書き込み専用）
-//!   では満たせない。例えば Ubuntu の既定（LSM が `lockdown,capability,landlock,yama,apparmor,ima,evm`・`CONFIG_IMA=y`・
-//!   `CONFIG_IMA_READ_POLICY` 未設定・`ima/policy` が `--w-------`）では、AppArmor を外しても IMA の判定で常に B' を
-//!   使えない（独立監査が Linux 7.0 の実機で確認）。Fedora 等の SELinux 既定のホストも同じ。これらのホストでは A で
-//!   実行し、理由コード（`lsm_apparmor`・`ima_policy_unreadable`・`lsm_selinux` 等）を記録する。A では照合と `execveat`
+//!   **帰結**: 封印した複製を使える（B' で実行する）のは、(a) Linux 6.14 以上、かつ (b) 有効な LSM が上の許可リストに
+//!   収まる（`apparmor`・`selinux`・`tomoyo`・`smack`・`bpf`・`ipe`・`ima`・`evm`・`integrity` や未知の LSM が無い）
+//!   ホストだけ。例えば Ubuntu の既定（LSM が `lockdown,capability,landlock,yama,apparmor,ima,evm`）は一覧の順で
+//!   `lsm_apparmor`、AppArmor を外しても `lsm_ima` で B' を使えない（独立監査が Linux 7.0 の実機で LSM 一覧を確認）。
+//!   Fedora 等の SELinux 既定のホストは `lsm_selinux`。これらのホストでは A で実行し、理由コードを記録する。A では照合と `execveat`
 //!   の間の書き換え（下の 2 項目。#1458 の論点）が残余のリスクとして残る。setuid ビット・ファイル capability は `NO_NEW_PRIVS` が適用済みの
 //!   ため元々無効で、複製しても緩和にならない
 //! - **B' で `/proc/self/exe` の見え方が変わる**: exec 先の `/proc/self/exe` は `/memfd:fandhe-exec-entrypoint (deleted)`

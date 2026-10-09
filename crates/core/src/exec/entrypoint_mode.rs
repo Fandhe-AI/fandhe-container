@@ -14,6 +14,10 @@
 //! - 方式の切り替えは黙って行わない: 現行方式を選んだときは、封印した複製を使わなかった理由を
 //!   [`SealedCopyUnavailable`] の機械可読なコード（[`SealedCopyUnavailable::as_str`]）で必ず持つ。真偽値や自由文字列で
 //!   方式を表さない（REPAIR-2・REPAIR-4）
+//! - 理由コードの全体: `kernel_too_old`・`exec_check_probe_failed`・`lsm_list_unreadable`・`lsm_apparmor`・`lsm_tomoyo`・
+//!   `lsm_smack`・`lsm_bpf`・`lsm_ipe`・`lsm_selinux`・`lsm_unrecognized`・`lsm_ima`・`lsm_evm`・`lsm_integrity`
+//!   （[`SealedCopyUnavailable::ALL`]）。判定の順序はカーネル（`AT_EXECVE_CHECK`）→ LSM 一覧の妥当性 → LSM 一覧の順で
+//!   最初に見つかった許可リスト外の LSM
 //! - コードは固定の語彙（英小文字・数字・`_`）で、ホスト側の入力（LSM 名の生文字列・パス）を含めない。未知の LSM は
 //!   名前を載せず [`SealedCopyUnavailable::UnrecognizedLsm`]（`lsm_unrecognized`）にまとめる
 //! - どちらの方式でも、元のファイルのマウントの `noexec` は `fstatfs` で判定して違反 `entrypoint_on_noexec_mount` で
@@ -102,6 +106,37 @@ impl PathBoundLsm {
     }
 }
 
+/// 完全性検査（integrity）系の LSM。実行したファイルについて計測・appraisal（`evm` は security xattr の検証）を行うが、
+/// memfd の複製では元のファイルの inode・パス・xattr について働かない、または元のパスで記録されないおそれがある
+/// （#1579 の独立監査 P2-1）。一次情報（`security/integrity/ima`・`evm`）で memfd からの実行時の挙動と
+/// `AT_EXECVE_CHECK` での評価を確かめられれば、計測専用の環境などは将来緩められる。それまでは有効なら封印した複製を
+/// 使わない（fail-closed）。`evm`・`integrity` は IMA の appraisal と組で働く層（`integrity` は IMA・EVM の共通基盤）で、
+/// 単独で載っていても元の inode の xattr に依る検査を持つため、`ima` と同じく扱う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IntegrityLsm {
+    /// IMA。
+    Ima,
+    /// EVM。
+    Evm,
+    /// integrity（IMA・EVM の共通基盤）。
+    Integrity,
+}
+
+impl IntegrityLsm {
+    /// 全値。
+    pub const ALL: [Self; 3] = [Self::Ima, Self::Evm, Self::Integrity];
+
+    /// `/sys/kernel/security/lsm` に現れる名前。
+    pub fn lsm_name(self) -> &'static str {
+        match self {
+            Self::Ima => "ima",
+            Self::Evm => "evm",
+            Self::Integrity => "integrity",
+        }
+    }
+}
+
 /// 封印した複製を使わなかった理由（[`EntrypointExecMode::PinnedInode`] の値）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -110,7 +145,8 @@ pub enum SealedCopyUnavailable {
     KernelTooOld,
     /// `AT_EXECVE_CHECK` の有無を判定できなかった（判定用の問い合わせが想定外の結果を返した）。
     ExecCheckProbeFailed,
-    /// 有効な LSM の一覧（`/sys/kernel/security/lsm`）を読めなかった。
+    /// 有効な LSM の一覧（`/sys/kernel/security/lsm`）を読めなかった・securityfs 上に無い・空・`capability` を含まない
+    /// （一覧として信用できない）。
     LsmListUnreadable,
     /// パス結び付きの LSM が有効。
     PathBoundLsm(PathBoundLsm),
@@ -118,14 +154,8 @@ pub enum SealedCopyUnavailable {
     Selinux,
     /// 許可リストに無い LSM が有効。
     UnrecognizedLsm,
-    /// IMA 系が有効で、`/proc/cmdline` を読めなかった。
-    CmdlineUnreadable,
-    /// `/proc/cmdline` が IMA の appraisal を有効にし得る（`ima_appraise=`・未知の `ima_policy=`）。
-    ImaAppraiseCmdline,
-    /// IMA の現行 policy に appraise 行がある。
-    ImaAppraisePolicy,
-    /// IMA の現行 policy を読めない（`CONFIG_IMA_READ_POLICY` なし等。appraisal が無いと確かめられない）。
-    ImaPolicyUnreadable,
+    /// 完全性検査系の LSM（IMA・EVM・integrity）が有効。
+    IntegrityLsm(IntegrityLsm),
 }
 
 impl SealedCopyUnavailable {
@@ -142,10 +172,9 @@ impl SealedCopyUnavailable {
             Self::PathBoundLsm(PathBoundLsm::Ipe) => "lsm_ipe",
             Self::Selinux => "lsm_selinux",
             Self::UnrecognizedLsm => "lsm_unrecognized",
-            Self::CmdlineUnreadable => "cmdline_unreadable",
-            Self::ImaAppraiseCmdline => "ima_appraise_cmdline",
-            Self::ImaAppraisePolicy => "ima_appraise_policy",
-            Self::ImaPolicyUnreadable => "ima_policy_unreadable",
+            Self::IntegrityLsm(IntegrityLsm::Ima) => "lsm_ima",
+            Self::IntegrityLsm(IntegrityLsm::Evm) => "lsm_evm",
+            Self::IntegrityLsm(IntegrityLsm::Integrity) => "lsm_integrity",
         }
     }
 
@@ -158,7 +187,9 @@ impl SealedCopyUnavailable {
             Self::ExecCheckProbeFailed => {
                 "whether AT_EXECVE_CHECK is available could not be determined"
             }
-            Self::LsmListUnreadable => "the active security modules could not be read",
+            Self::LsmListUnreadable => {
+                "the active security modules could not be read or did not form a valid list"
+            }
             Self::PathBoundLsm(_) => {
                 "a path-bound security module is active; its exec-time checks cannot be reproduced for a sealed copy"
             }
@@ -168,21 +199,14 @@ impl SealedCopyUnavailable {
             Self::UnrecognizedLsm => {
                 "an unrecognized security module is active; its exec-time checks cannot be ruled out for a sealed copy"
             }
-            Self::CmdlineUnreadable => "the kernel command line could not be read",
-            Self::ImaAppraiseCmdline => {
-                "IMA appraisal may be active; its exec-time check cannot be reproduced for a sealed copy"
-            }
-            Self::ImaAppraisePolicy => {
-                "IMA appraisal is active; its exec-time check cannot be reproduced for a sealed copy"
-            }
-            Self::ImaPolicyUnreadable => {
-                "the IMA policy could not be read; appraisal cannot be ruled out"
+            Self::IntegrityLsm(_) => {
+                "an integrity security module (IMA/EVM) is active; its measurement and appraisal of the original file cannot be guaranteed for a sealed copy"
             }
         }
     }
 
     /// 全値（復号と単体テストの対応表）。
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 13] = [
         Self::KernelTooOld,
         Self::ExecCheckProbeFailed,
         Self::LsmListUnreadable,
@@ -193,10 +217,9 @@ impl SealedCopyUnavailable {
         Self::PathBoundLsm(PathBoundLsm::Ipe),
         Self::Selinux,
         Self::UnrecognizedLsm,
-        Self::CmdlineUnreadable,
-        Self::ImaAppraiseCmdline,
-        Self::ImaAppraisePolicy,
-        Self::ImaPolicyUnreadable,
+        Self::IntegrityLsm(IntegrityLsm::Ima),
+        Self::IntegrityLsm(IntegrityLsm::Evm),
+        Self::IntegrityLsm(IntegrityLsm::Integrity),
     ];
 
     /// [`Self::as_str`] の逆変換。未知のコードは `None`。
@@ -230,10 +253,9 @@ mod tests {
                 "lsm_ipe",
                 "lsm_selinux",
                 "lsm_unrecognized",
-                "cmdline_unreadable",
-                "ima_appraise_cmdline",
-                "ima_appraise_policy",
-                "ima_policy_unreadable",
+                "lsm_ima",
+                "lsm_evm",
+                "lsm_integrity",
             ]
         );
         for r in SealedCopyUnavailable::ALL {
@@ -269,5 +291,7 @@ mod tests {
         assert_eq!(SealedCopyUnavailable::from_token("unknown"), None);
         let names: Vec<&str> = PathBoundLsm::ALL.iter().map(|l| l.lsm_name()).collect();
         assert_eq!(names, ["apparmor", "tomoyo", "smack", "bpf", "ipe"]);
+        let names: Vec<&str> = IntegrityLsm::ALL.iter().map(|l| l.lsm_name()).collect();
+        assert_eq!(names, ["ima", "evm", "integrity"]);
     }
 }

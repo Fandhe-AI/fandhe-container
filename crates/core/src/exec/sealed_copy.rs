@@ -35,13 +35,14 @@
 //!    （[`SealPolicy::probe`]・[`decide_entrypoint_mode`]）が封印した複製を選ばず、理由を記録して現行方式（照合した元の
 //!    fd をそのまま実行する。#1478）で実行する（オーナー判断 2026-10-09「条件付き切り替え」。`entrypoint_mode.rs`）。
 //!    本関数は封印した複製の判定のときだけ呼ばれ、現行方式の判定で呼ばれたら複製せずに `FailedPrecondition` で拒否する。
-//!    判定は許可リスト方式で、安全と分かっている LSM（`capability`・`lockdown`・
-//!    `yama`・`landlock`・`loadpin`・`safesetid`）と、条件付きで通す IMA 系（`ima`・`evm`・`integrity`）以外が有効なら
-//!    封印した複製を使わない（未知の名前も同じ）:
-//!    - パス結び付きの LSM（AppArmor・TOMOYO・Smack・BPF LSM・IPE）が有効、または IMA の appraisal が有効
-//!      （か判定できない）。IMA の `BPRM_CHECK` が `AT_EXECVE_CHECK` で評価されるかは一次情報で確かめていないため、
-//!      判定に含めず従来どおり拒否に倒す
+//!    判定は許可リスト方式で、安全と分かっている LSM（`capability`・`lockdown`・`yama`・`landlock`・`loadpin`・
+//!    `safesetid`）以外が有効なら封印した複製を使わない（未知の名前も同じ。一覧が空・`capability` を含まない・securityfs
+//!    上に無い場合は一覧として信用せず `lsm_list_unreadable`）:
+//!    - パス結び付きの LSM（AppArmor・TOMOYO・Smack・BPF LSM・IPE）が有効
 //!    - SELinux が有効（元のファイルのラベルに対するドメイン遷移を memfd は迂回するため）
+//!    - 完全性検査系（IMA・EVM・integrity）が有効。計測専用のポリシー（`ima_policy=tcb` 等）でも、memfd からの実行が
+//!      計測されない・元のパスで記録されないおそれがあり、`BPRM_CHECK` が `AT_EXECVE_CHECK` で評価されるかも一次情報で
+//!      確かめていないため、`/proc/cmdline`・policy の内容に依らず使わない（独立監査 P2-1。一次照合が済めば緩められる）
 //!    - Landlock は対象外（手順 2 がカーネルに判定させる）
 //! 1. 元のファイルの fd が開かれているマウントが `noexec` なら違反 [`ViolationReason::EntrypointOnNoexecMount`]
 //!    （`sys::mount_flags` = `fstatfs` の `ST_NOEXEC`。パスを再解決せず fd のマウントそのものを見る）。memfd は
@@ -74,16 +75,15 @@
 //! シェバンのインタープリタ・`PT_INTERP` の動的リンカは複製しない（カーネルが元のファイルとして開く）ため、
 //! それらの `noexec`・実行権限・Landlock・LSM の検査はカーネルがそのまま行う（本モジュールの対象は本体の複製だけ）。
 //!
-//! 限界: 手順 0 の環境の判定（[`SealPolicy::probe`]）はホスト側の securityfs と `/proc/cmdline` に依る。判定できない
-//! 入力はすべて封印した複製を使わない側に倒す。封印した複製を使える（それ以外は現行方式）のは、次をすべて満たすホストだけ:
-//! (a) Linux 6.14 以上（`AT_EXECVE_CHECK`）、(b) 有効な LSM が許可リスト（`capability`・`lockdown`・`yama`・`landlock`・
-//! `loadpin`・`safesetid`・`ima`・`evm`・`integrity`）に収まる（`apparmor`・`selinux`・`tomoyo`・`smack`・`bpf`・`ipe` や
-//! 未知の LSM が無い）、(c) IMA 系が有効なら、`/proc/cmdline` に appraisal の指定が無く、かつ `ima/policy` を読めて
-//! appraise 行が無いと確かめられる。(c) は `CONFIG_IMA_READ_POLICY` なしのカーネル（policy が書き込み専用）では
-//! 満たせない: 例えば Ubuntu の既定（LSM が `lockdown,capability,landlock,yama,apparmor,ima,evm`・`CONFIG_IMA=y`・
-//! `CONFIG_IMA_READ_POLICY` 未設定）では、AppArmor を外しても IMA の判定で常に封印した複製を使えない。これらの
-//! ホストでは現行方式で実行し、照合と `execveat` の間の書き換え（#1458 の論点）が残余のリスクとして残る。詳細は
-//! `interpreter.rs` の「方式の切り替え」と「限界」。
+//! 限界: 手順 0 の環境の判定（[`SealPolicy::probe`]）はホスト側の securityfs（`/sys/kernel/security/lsm`。`fstatfs` で
+//! securityfs と確かめてから読む）に依る。判定できない入力はすべて封印した複製を使わない側に倒す。封印した複製を使える
+//! （それ以外は現行方式）のは、(a) Linux 6.14 以上（`AT_EXECVE_CHECK`）、かつ (b) 有効な LSM が許可リスト（`capability`・
+//! `lockdown`・`yama`・`landlock`・`loadpin`・`safesetid`）に収まる（`apparmor`・`selinux`・`tomoyo`・`smack`・`bpf`・
+//! `ipe`・`ima`・`evm`・`integrity` や未知の LSM が無い）ホストだけ。例えば Ubuntu の既定（LSM が
+//! `lockdown,capability,landlock,yama,apparmor,ima,evm`）は `lsm_apparmor`、AppArmor を外しても `lsm_ima` で現行方式に
+//! なる。これらのホストでは照合と `execveat` の間の書き換え（#1458 の論点）が残余のリスクとして残る。IMA の memfd に
+//! 対する挙動を一次情報で確かめられれば、計測専用の環境などは将来緩められる。詳細は `interpreter.rs` の
+//! 「方式の切り替え」と「限界」。
 
 use std::ffi::CStr;
 use std::fs::{File, FileType, Metadata};
@@ -95,7 +95,9 @@ use std::path::Path;
 use crate::sys::{self, SealError, SealedReadOnlyCopy, SysError};
 use crate::traits::types::ErrorCode;
 
-use super::entrypoint_mode::{EntrypointExecMode, PathBoundLsm, SealedCopyUnavailable};
+use super::entrypoint_mode::{
+    EntrypointExecMode, IntegrityLsm, PathBoundLsm, SealedCopyUnavailable,
+};
 use super::process::keep_above_stdio;
 use super::{ExecError, IsolationStage, ViolationReason, describe};
 
@@ -157,22 +159,19 @@ pub(super) enum LsmEnvironment {
     Refuse(SealedCopyUnavailable),
 }
 
-/// [`LsmEnvironment`] の判定に使う、ホスト側で読んだ入力（読み取りの失敗は `Err` のまま渡す）。
-pub(super) struct LsmProbeInput {
-    /// `/sys/kernel/security/lsm`（有効な LSM のカンマ区切り一覧）。
-    pub(super) lsm_list: std::io::Result<String>,
-    /// `/proc/cmdline`。
-    pub(super) cmdline: std::io::Result<String>,
-    /// `/sys/kernel/security/ima/policy`（読めた場合の現行ポリシー）。
-    pub(super) ima_policy: std::io::Result<String>,
-}
-
-/// 読み取った入力から LSM の環境を判定する（純粋関数。単体テストが具体値で確かめる）。
+/// 有効な LSM の一覧（`/sys/kernel/security/lsm` の内容。読み取りの失敗は `Err` のまま渡す）から LSM の環境を判定する
+/// （純粋関数。単体テストが具体値で確かめる）。
 ///
-/// 判定できない入力は拒否に倒す（fail-closed）。パス・ラベルに結び付いて実行後の拘束を決める LSM は、複製の
-/// 実行では元のファイルについて働かない。
-pub(super) fn assess_lsm_environment(input: LsmProbeInput) -> LsmEnvironment {
-    let list = match input.lsm_list {
+/// 許可リスト方式（fail-closed）: 複製しても exec 後の拘束が変わらないと分かっている名前（[`LSM_SAFE`]）だけを通す。
+/// 一覧の順に見て、最初に見つかった許可リスト外の LSM を理由にする（既知のパス・ラベル結び付きの LSM・SELinux・
+/// 完全性検査系〔IMA・EVM・integrity〕は理由を区別し、それ以外の未知の名前は `lsm_unrecognized`）。一覧を読めない・
+/// 空・`capability`（常に有効な LSM）を含まない場合は、一覧として信用できないため `lsm_list_unreadable`。
+///
+/// 完全性検査系は、計測専用のポリシー（`ima_policy=tcb` 等）でも、memfd からの実行が計測されない、または元のパスで
+/// 記録されないおそれがあるため、`/proc/cmdline`・IMA の policy の内容に依らず封印した複製を使わない（#1579 の独立
+/// 監査 P2-1。一次照合が済めば緩められる。[`IntegrityLsm`] の doc）。
+pub(super) fn assess_lsm_environment(lsm_list: std::io::Result<String>) -> LsmEnvironment {
+    let list = match lsm_list {
         Ok(list) => list,
         Err(_) => return LsmEnvironment::Refuse(SealedCopyUnavailable::LsmListUnreadable),
     };
@@ -182,9 +181,10 @@ pub(super) fn assess_lsm_environment(input: LsmProbeInput) -> LsmEnvironment {
         .map(str::trim)
         .filter(|n| !n.is_empty())
         .collect();
-    // 許可リスト方式（fail-closed）: 複製しても exec 後の拘束が変わらないと分かっている名前（[`LSM_SAFE`]）と、
-    // IMA の appraisal の有無で判定する名前（[`LSM_IMA_FAMILY`]）だけを通す。既知のパス・ラベル結び付きの LSM は
-    // 理由を区別して拒否し、それ以外（未知の名前・将来追加される LSM）もすべて拒否する。
+    if !names.contains(&"capability") {
+        // 空・空白のみ・`capability` を含まない一覧は、securityfs の正しい内容ではない。
+        return LsmEnvironment::Refuse(SealedCopyUnavailable::LsmListUnreadable);
+    }
     for name in &names {
         if let Some(lsm) = PathBoundLsm::ALL
             .into_iter()
@@ -195,33 +195,14 @@ pub(super) fn assess_lsm_environment(input: LsmProbeInput) -> LsmEnvironment {
         if *name == "selinux" {
             return LsmEnvironment::Refuse(SealedCopyUnavailable::Selinux);
         }
-        if !LSM_SAFE.contains(name) && !LSM_IMA_FAMILY.contains(name) {
+        if let Some(lsm) = IntegrityLsm::ALL
+            .into_iter()
+            .find(|l| l.lsm_name() == *name)
+        {
+            return LsmEnvironment::Refuse(SealedCopyUnavailable::IntegrityLsm(lsm));
+        }
+        if !LSM_SAFE.contains(name) {
             return LsmEnvironment::Refuse(SealedCopyUnavailable::UnrecognizedLsm);
-        }
-    }
-    if names.iter().any(|n| LSM_IMA_FAMILY.contains(n)) {
-        let cmdline = match &input.cmdline {
-            Ok(text) => text,
-            Err(_) => return LsmEnvironment::Refuse(SealedCopyUnavailable::CmdlineUnreadable),
-        };
-        for token in cmdline.split_whitespace() {
-            let appraise_on = token
-                .strip_prefix("ima_appraise=")
-                .is_some_and(|v| v != "off");
-            // `ima_policy=` は、計測専用と分かっている組み込みポリシー（`tcb`・`critical_data`）だけを
-            // 通し、後続の現行 policy ファイルの判定へ進める。appraise 系・未知の値は拒否する。
-            let policy_unknown = token
-                .strip_prefix("ima_policy=")
-                .is_some_and(|v| !v.split('|').all(is_measure_only_ima_policy));
-            if appraise_on || policy_unknown {
-                return LsmEnvironment::Refuse(SealedCopyUnavailable::ImaAppraiseCmdline);
-            }
-        }
-        match &input.ima_policy {
-            Ok(text) if !text.to_ascii_lowercase().contains("appraise") => {}
-            Ok(_) => return LsmEnvironment::Refuse(SealedCopyUnavailable::ImaAppraisePolicy),
-            // `CONFIG_IMA_READ_POLICY` なしのカーネル（Ubuntu の既定等）は policy が書き込み専用で読めず、ここで拒否する。
-            Err(_) => return LsmEnvironment::Refuse(SealedCopyUnavailable::ImaPolicyUnreadable),
         }
     }
     // Landlock はここで拒否しない。exec の子は自前の Landlock ルールセットを必ず適用してから `ExecReady` を返す
@@ -241,8 +222,6 @@ const LSM_SAFE: [&str; 6] = [
     "loadpin",
     "safesetid",
 ];
-/// IMA の appraisal が無いと確かめられた場合だけ通す LSM（`evm`・`integrity` は IMA の appraisal と組で働く）。
-const LSM_IMA_FAMILY: [&str; 3] = ["ima", "evm", "integrity"];
 
 /// `AT_EXECVE_CHECK` の有無を、実行され得ないディレクトリ（`/`）の fd への問い合わせで判定する（`setns` の前に呼ぶ）。
 ///
@@ -283,19 +262,26 @@ pub(super) fn decide_entrypoint_mode(
     EntrypointExecMode::PinnedInode { reason }
 }
 
-/// カーネル組み込みの IMA ポリシー名のうち、appraisal を含まない計測専用のもの。
-/// `|` 区切りで複数指定できる（`ima_policy=tcb|critical_data`）。
-fn is_measure_only_ima_policy(name: &str) -> bool {
-    matches!(name, "tcb" | "critical_data")
+/// securityfs の `statfs.f_type`（include/uapi/linux/magic.h の `SECURITYFS_MAGIC`。アーキテクチャ非依存）。
+const SECURITYFS_MAGIC: i64 = 0x7363_6673;
+
+/// `path` を開き、開いた fd のファイルシステムが `magic`（`sys::fs_type`）であることを確かめてから `cap` バイトまで
+/// 読む（#1579 の独立監査 P3-2。`/sys/kernel/security` に別の FS が載った環境で、固定の内容を読んで判定を誤らない。
+/// 既存の procfs の検証と同じ流儀）。種別が違えば `InvalidData`（呼び出し側は読めなかった入力として拒否に倒す）。
+fn read_capped_on(path: &str, magic: i64, cap: u64) -> std::io::Result<String> {
+    let file = File::open(path)?;
+    if sys::fs_type(file.as_fd()) != Ok(magic) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "security configuration input is not on the expected filesystem",
+        ));
+    }
+    read_capped_from(file, cap)
 }
 
-/// ファイルを `cap` バイトまで読む（巨大ファイルの確保を避ける）。`cap` を超えて続く場合は切り詰めず
-/// `InvalidData` で失敗させる（先頭だけを見て判定すると、後続の appraise ルール等を見落として誤って
-/// 通すため。呼び出し側は読めなかった入力を拒否に倒す。fail-closed）。
-fn read_capped(path: &str, cap: u64) -> std::io::Result<String> {
-    read_capped_from(File::open(path)?, cap)
-}
-
+/// `reader` を `cap` バイトまで読む（巨大ファイルの確保を避ける）。`cap` を超えて続く場合は切り詰めず
+/// `InvalidData` で失敗させる（先頭だけを見て判定すると、後続の名前を見落として誤って通すため。呼び出し側は
+/// 読めなかった入力を拒否に倒す。fail-closed）。
 fn read_capped_from(reader: impl std::io::Read, cap: u64) -> std::io::Result<String> {
     let mut bytes = Vec::new();
     reader.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
@@ -312,11 +298,11 @@ fn read_capped_from(reader: impl std::io::Read, cap: u64) -> std::io::Result<Str
 impl SealPolicy {
     /// ホスト側の実環境から方式を判定して作る（封印した複製の手順 2 の `AT_EXECVE_CHECK` は必須）。`setns` の前に呼ぶこと。
     pub(super) fn probe() -> Self {
-        let lsm = assess_lsm_environment(LsmProbeInput {
-            lsm_list: read_capped("/sys/kernel/security/lsm", 4096),
-            cmdline: read_capped("/proc/cmdline", 64 * 1024),
-            ima_policy: read_capped("/sys/kernel/security/ima/policy", 1024 * 1024),
-        });
+        let lsm = assess_lsm_environment(read_capped_on(
+            "/sys/kernel/security/lsm",
+            SECURITYFS_MAGIC,
+            4096,
+        ));
         Self {
             mode: decide_entrypoint_mode(probe_exec_check_support(), lsm),
             exec_check: ExecCheck::Required,
@@ -598,19 +584,12 @@ mod tests {
     use crate::landlock::AccessFs;
     use crate::test_support::{TestTempDir, kernel_at_least};
 
-    fn probe_input(lsm: &str, cmdline: &str, ima: Option<&str>) -> LsmProbeInput {
-        LsmProbeInput {
-            lsm_list: Ok(lsm.to_owned()),
-            cmdline: Ok(cmdline.to_owned()),
-            ima_policy: ima.map_or_else(
-                || Err(std::io::ErrorKind::PermissionDenied.into()),
-                |t| Ok(t.to_owned()),
-            ),
-        }
+    fn assess(lsm: &str) -> LsmEnvironment {
+        assess_lsm_environment(Ok(lsm.to_owned()))
     }
 
-    /// SUP-6・SEC-1・CORE-5・TASK-163 追補・#1531: パス結び付きの LSM（AppArmor 等）が有効な環境は、複製せずに
-    /// 拒否する。LSM 一覧を読めない場合も拒否する（fail-closed）。
+    /// SUP-6・SEC-1・CORE-5・TASK-163 追補・#1531: パス結び付きの LSM（AppArmor 等）が有効な環境は、封印した複製を
+    /// 使わない。LSM 一覧を読めない場合も同じ（fail-closed）。理由コード・文言は具体値。
     #[test]
     fn sup6_sec1_path_bound_lsm_environment_is_refused() {
         for (lsm, which, code) in [
@@ -624,32 +603,40 @@ mod tests {
             ("capability,bpf", PathBoundLsm::Bpf, "lsm_bpf"),
             ("capability,ipe", PathBoundLsm::Ipe, "lsm_ipe"),
         ] {
-            let got = assess_lsm_environment(probe_input(lsm, "quiet", None));
             let reason = SealedCopyUnavailable::PathBoundLsm(which);
-            assert_eq!(got, LsmEnvironment::Refuse(reason), "{lsm}");
+            assert_eq!(assess(lsm), LsmEnvironment::Refuse(reason), "{lsm}");
             assert_eq!(reason.as_str(), code);
             assert_eq!(
                 reason.message(),
                 "a path-bound security module is active; its exec-time checks cannot be reproduced for a sealed copy"
             );
         }
-        let unreadable = LsmProbeInput {
-            lsm_list: Err(std::io::ErrorKind::NotFound.into()),
-            cmdline: Ok(String::new()),
-            ima_policy: Ok(String::new()),
-        };
         assert_eq!(
-            assess_lsm_environment(unreadable),
+            assess_lsm_environment(Err(std::io::ErrorKind::NotFound.into())),
             LsmEnvironment::Refuse(SealedCopyUnavailable::LsmListUnreadable)
         );
         assert_eq!(
             SealedCopyUnavailable::LsmListUnreadable.message(),
-            "the active security modules could not be read"
+            "the active security modules could not be read or did not form a valid list"
         );
     }
 
+    /// SEC-1・CORE-5・#1579（独立監査 P3-1）: 空・空白のみ・`capability` を含まない一覧は、securityfs の正しい内容では
+    /// ないため `lsm_list_unreadable`（許可リストの名前だけでも `capability` が無ければ通さない）。
+    #[test]
+    fn sec1_core5_invalid_lsm_list_is_refused() {
+        for lsm in ["", " ", "\n", ",,", "landlock,yama", "lockdown,landlock"] {
+            assert_eq!(
+                assess(lsm),
+                LsmEnvironment::Refuse(SealedCopyUnavailable::LsmListUnreadable),
+                "{lsm:?}"
+            );
+        }
+        assert_eq!(assess("capability"), LsmEnvironment::Unrestricted);
+    }
+
     /// SEC-1・CORE-5・#1579（独立監査 P2-1）: 許可リストに無い LSM（未知の名前・将来追加される LSM）が 1 つでも
-    /// 有効なら、拒否リストに載っていなくても拒否する（fail-closed）。許可リストだけの環境は通す。
+    /// 有効なら、拒否リストに載っていなくても封印した複製を使わない（fail-closed）。許可リストだけの環境は通す。
     #[test]
     fn sec1_core5_unknown_lsm_is_refused() {
         for lsm in [
@@ -658,9 +645,8 @@ mod tests {
             "capability,LANDLOCK",
             "capability,landlock2",
         ] {
-            let got = assess_lsm_environment(probe_input(lsm, "", None));
             assert_eq!(
-                got,
+                assess(lsm),
                 LsmEnvironment::Refuse(SealedCopyUnavailable::UnrecognizedLsm),
                 "{lsm}"
             );
@@ -673,112 +659,63 @@ mod tests {
             SealedCopyUnavailable::UnrecognizedLsm.message(),
             "an unrecognized security module is active; its exec-time checks cannot be ruled out for a sealed copy"
         );
-        let all_safe = "capability,lockdown,yama,landlock,loadpin,safesetid";
         assert_eq!(
-            assess_lsm_environment(probe_input(all_safe, "", None)),
+            assess("capability,lockdown,yama,landlock,loadpin,safesetid"),
             LsmEnvironment::Unrestricted
         );
         // 末尾の改行・空要素は名前として扱わない。
         assert_eq!(
-            assess_lsm_environment(probe_input("capability,landlock,\n", "", None)),
+            assess("capability,landlock,\n"),
             LsmEnvironment::Unrestricted
         );
     }
 
-    /// SUP-6・SEC-1・TASK-163 追補・#1531: IMA は appraisal が有効、または無効と判定できないときに拒否する。
+    /// SEC-1・CORE-5・#1579（独立監査 P2-1）: 完全性検査系の LSM（IMA・EVM・integrity）が有効なら、計測専用の
+    /// ポリシーかどうかに依らず封印した複製を使わない（理由 `lsm_ima`・`lsm_evm`・`lsm_integrity`）。一覧の順で最初の
+    /// 許可リスト外の LSM が理由になる（Ubuntu の既定は AppArmor が先に現れて `lsm_apparmor`）。
     #[test]
-    fn sup6_sec1_ima_appraisal_is_refused_unless_ruled_out() {
-        let lsm = "capability,ima,evm";
-        const MAY: SealedCopyUnavailable = SealedCopyUnavailable::ImaAppraiseCmdline;
-        const ACTIVE: SealedCopyUnavailable = SealedCopyUnavailable::ImaAppraisePolicy;
-        const UNREADABLE: SealedCopyUnavailable = SealedCopyUnavailable::ImaPolicyUnreadable;
-        for (reason, code, message) in [
+    fn sec1_core5_integrity_lsm_is_refused() {
+        for (lsm, which, code) in [
+            ("capability,ima", IntegrityLsm::Ima, "lsm_ima"),
             (
-                MAY,
-                "ima_appraise_cmdline",
-                "IMA appraisal may be active; its exec-time check cannot be reproduced for a sealed copy",
-            ),
-            (
-                ACTIVE,
-                "ima_appraise_policy",
-                "IMA appraisal is active; its exec-time check cannot be reproduced for a sealed copy",
-            ),
-            (
-                UNREADABLE,
-                "ima_policy_unreadable",
-                "the IMA policy could not be read; appraisal cannot be ruled out",
-            ),
-        ] {
-            assert_eq!((reason.as_str(), reason.message()), (code, message));
-        }
-        for (cmdline, policy, expected) in [
-            ("ima_appraise=enforce", Some(""), MAY),
-            ("ima_appraise=fix", Some(""), MAY),
-            ("ima_policy=appraise_tcb", Some(""), MAY),
-            ("ima_policy=tcb|appraise_tcb", Some(""), MAY),
-            ("ima_policy=unknown_policy", Some(""), MAY),
-            (
-                "quiet",
-                Some("appraise func=BPRM_CHECK appraise_type=imasig\n"),
-                ACTIVE,
-            ),
-            ("quiet", None, UNREADABLE),
-            ("ima_policy=tcb", Some("appraise func=BPRM_CHECK\n"), ACTIVE),
-            ("ima_policy=tcb", None, UNREADABLE),
-        ] {
-            let got = assess_lsm_environment(probe_input(lsm, cmdline, policy));
-            assert_eq!(
-                got,
-                LsmEnvironment::Refuse(expected),
-                "{cmdline} {policy:?}"
-            );
-        }
-        // `evm`・`integrity` だけでも IMA の判定に掛ける（policy を読めなければ拒否）。
-        for family in ["capability,evm", "capability,integrity"] {
-            assert_eq!(
-                assess_lsm_environment(probe_input(family, "quiet", None)),
-                LsmEnvironment::Refuse(UNREADABLE),
-                "{family}"
-            );
-        }
-        // 監査環境（Ubuntu・CONFIG_IMA_READ_POLICY なしで policy が読めない）は、AppArmor が無くても IMA で拒否される。
-        assert_eq!(
-            assess_lsm_environment(probe_input(
                 "lockdown,capability,landlock,yama,ima,evm",
-                "BOOT_IMAGE=/vmlinuz quiet splash",
-                None
-            )),
-            LsmEnvironment::Refuse(UNREADABLE)
-        );
-        // appraisal がないことを確かめられる（`off`・policy に appraise 行なし）なら通す。
-        // 計測専用の組み込みポリシーは後続の policy ファイル判定へ進み、appraise 行がなければ通す（#1579）。
-        for cmdline in [
-            "quiet",
-            "ima_appraise=off",
-            "ima_policy=tcb",
-            "ima_policy=tcb|critical_data",
+                IntegrityLsm::Ima,
+                "lsm_ima",
+            ),
+            ("capability,evm", IntegrityLsm::Evm, "lsm_evm"),
+            (
+                "capability,integrity",
+                IntegrityLsm::Integrity,
+                "lsm_integrity",
+            ),
         ] {
-            let got = assess_lsm_environment(probe_input(
-                lsm,
-                cmdline,
-                Some("measure func=BPRM_CHECK\n"),
-            ));
-            assert_eq!(got, LsmEnvironment::Unrestricted, "{cmdline}");
+            let reason = SealedCopyUnavailable::IntegrityLsm(which);
+            assert_eq!(assess(lsm), LsmEnvironment::Refuse(reason), "{lsm}");
+            assert_eq!(reason.as_str(), code);
+            assert_eq!(
+                reason.message(),
+                "an integrity security module (IMA/EVM) is active; its measurement and appraisal of the original file cannot be guaranteed for a sealed copy"
+            );
         }
+        assert_eq!(
+            assess("lockdown,capability,landlock,yama,apparmor,ima,evm"),
+            LsmEnvironment::Refuse(SealedCopyUnavailable::PathBoundLsm(PathBoundLsm::AppArmor))
+        );
     }
 
     /// SUP-6・SEC-1・CORE-5・TASK-163 追補・#1531: 対象外の LSM のみの環境は制約なし。SELinux が有効な環境は
-    /// （ドメインを根拠に通さず）拒否する。Landlock のみ有効な環境は拒否しない（#1579 の P1。本番 exec が成立する。
-    /// `EXECUTE` は `AT_EXECVE_CHECK` がカーネルの規則で判定する）。
+    /// （ドメインを根拠に通さず）封印した複製を使わない。Landlock のみ有効な環境は通す（#1579 の P1。`EXECUTE` は
+    /// `AT_EXECVE_CHECK` がカーネルの規則で判定する）。
     #[test]
     fn sup6_sec1_unrelated_environment_is_unrestricted_and_selinux_is_refused_but_landlock_is_not()
     {
-        let none = assess_lsm_environment(probe_input("lockdown,capability,yama", "", None));
-        assert_eq!(none, LsmEnvironment::Unrestricted);
+        assert_eq!(
+            assess("lockdown,capability,yama"),
+            LsmEnvironment::Unrestricted
+        );
         for lsm in ["capability,landlock,selinux", "capability,selinux"] {
-            let got = assess_lsm_environment(probe_input(lsm, "", None));
             assert_eq!(
-                got,
+                assess(lsm),
                 LsmEnvironment::Refuse(SealedCopyUnavailable::Selinux),
                 "{lsm}"
             );
@@ -789,31 +726,40 @@ mod tests {
             "SELinux is active; the exec-time permission and transition for the original file label cannot be reproduced for a sealed copy"
         );
         for lsm in ["capability,landlock", "lockdown,capability,landlock,yama"] {
-            let got = assess_lsm_environment(probe_input(lsm, "", None));
-            assert_eq!(got, LsmEnvironment::Unrestricted, "{lsm}");
+            assert_eq!(assess(lsm), LsmEnvironment::Unrestricted, "{lsm}");
         }
     }
 
-    /// SEC-1・CORE-5・#1531: 上限を超えて続く入力は切り詰めず失敗させる（先頭だけで判定して後続の appraise
-    /// ルールを見落とさない）。上限ちょうどは読める。
+    /// SEC-1・CORE-5・#1531: 上限を超えて続く入力は切り詰めず失敗させる（先頭だけで判定して後続の名前を見落とさない）。
+    /// 上限ちょうどは読める。上限を超えた一覧は `lsm_list_unreadable` に倒れる。
     #[test]
     fn sec1_core5_read_capped_rejects_input_over_the_cap() {
         assert_eq!(read_capped_from(&b"abcd"[..], 4).expect("at cap"), "abcd");
         let err = read_capped_from(&b"abcde"[..], 4).expect_err("over cap");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        // 先頭が上限内でも、後続に appraise があれば読めない = 拒否に倒れる。
-        let mut policy = b"measure func=BPRM_CHECK\n".to_vec();
-        policy.resize(1024, b' ');
-        policy.extend_from_slice(b"appraise func=BPRM_CHECK\n");
-        assert!(read_capped_from(&policy[..], 1024).is_err());
-        let refused = assess_lsm_environment(LsmProbeInput {
-            lsm_list: Ok("capability,ima".to_owned()),
-            cmdline: Ok(String::new()),
-            ima_policy: read_capped_from(&policy[..], 1024),
-        });
+        // 先頭が上限内でも、後続にパス結び付きの LSM があれば読めない = 拒否に倒れる。
+        let mut list = b"capability,landlock".to_vec();
+        list.resize(1024, b' ');
+        list.extend_from_slice(b",apparmor");
         assert_eq!(
-            refused,
-            LsmEnvironment::Refuse(SealedCopyUnavailable::ImaPolicyUnreadable)
+            assess_lsm_environment(read_capped_from(&list[..], 1024)),
+            LsmEnvironment::Refuse(SealedCopyUnavailable::LsmListUnreadable)
+        );
+    }
+
+    /// SEC-1・#1579（独立監査 P3-2）: 判定の入力は、期待するファイルシステム上にあることを確かめてから読む。procfs の
+    /// `/proc/self/status` は procfs の magic なら読め、securityfs の magic を期待すると `InvalidData` で拒否される。
+    #[test]
+    fn sec1_read_capped_on_checks_the_filesystem() {
+        assert_eq!(SECURITYFS_MAGIC, 0x7363_6673);
+        let text = read_capped_on("/proc/self/status", sys::PROC_MAGIC, 64 * 1024).expect("procfs");
+        assert!(text.starts_with("Name:"), "{text}");
+        let err = read_capped_on("/proc/self/status", SECURITYFS_MAGIC, 64 * 1024)
+            .expect_err("not securityfs");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            assess_lsm_environment(read_capped_on("/proc/self/status", SECURITYFS_MAGIC, 4096)),
+            LsmEnvironment::Refuse(SealedCopyUnavailable::LsmListUnreadable)
         );
     }
 
@@ -891,12 +837,6 @@ mod tests {
     /// 現行方式と理由（カーネルの判定を LSM より先に見る）。
     #[test]
     fn sup6_repair4_entrypoint_mode_decision_per_environment() {
-        let mode = |support, lsm: &str, cmdline: &str, ima: Option<&str>| {
-            decide_entrypoint_mode(
-                support,
-                assess_lsm_environment(probe_input(lsm, cmdline, ima)),
-            )
-        };
         let code = |m: EntrypointExecMode| {
             (
                 m.as_str(),
@@ -905,103 +845,73 @@ mod tests {
             )
         };
         use ExecCheckSupport::{Supported, Unknown, Unsupported};
-        for (support, lsm, cmdline, ima, expected) in [
+        for (support, lsm, expected) in [
             (
                 Supported,
                 "lockdown,capability,landlock,yama",
-                "quiet",
-                None,
                 ("sealed_copy", "-"),
             ),
             (
                 Supported,
-                "capability,landlock,ima,evm",
-                "quiet",
-                Some("measure func=BPRM_CHECK\n"),
+                "capability,lockdown,yama,landlock,loadpin,safesetid",
                 ("sealed_copy", "-"),
             ),
-            // Ubuntu の既定（監査環境）: AppArmor が先に拒否する。
+            // Ubuntu の既定（監査環境）: 一覧の順で AppArmor が先に現れる。
             (
                 Supported,
                 "lockdown,capability,landlock,yama,apparmor,ima,evm",
-                "quiet splash",
-                None,
                 ("pinned_inode", "lsm_apparmor"),
             ),
-            // AppArmor を外しても IMA の policy を読めず現行方式になる。
+            // AppArmor を外しても IMA が有効なら現行方式（計測専用でも。独立監査 P2-1）。
             (
                 Supported,
                 "lockdown,capability,landlock,yama,ima,evm",
-                "quiet splash",
-                None,
-                ("pinned_inode", "ima_policy_unreadable"),
+                ("pinned_inode", "lsm_ima"),
             ),
-            (
-                Supported,
-                "capability,ima",
-                "quiet",
-                Some("appraise func=BPRM_CHECK\n"),
-                ("pinned_inode", "ima_appraise_policy"),
-            ),
-            (
-                Supported,
-                "capability,ima",
-                "ima_appraise=enforce",
-                Some(""),
-                ("pinned_inode", "ima_appraise_cmdline"),
-            ),
+            (Supported, "capability,evm", ("pinned_inode", "lsm_evm")),
             (
                 Supported,
                 "capability,selinux",
-                "",
-                None,
                 ("pinned_inode", "lsm_selinux"),
             ),
             (
                 Supported,
                 "capability,mystery",
-                "",
-                None,
                 ("pinned_inode", "lsm_unrecognized"),
             ),
-            // 6.14 未満は LSM に依らず kernel_too_old。
+            (Supported, "", ("pinned_inode", "lsm_list_unreadable")),
+            (
+                Supported,
+                "landlock,yama",
+                ("pinned_inode", "lsm_list_unreadable"),
+            ),
+            // 6.14 未満は LSM に依らず kernel_too_old（カーネルの判定を先に見る）。
             (
                 Unsupported,
                 "lockdown,capability,landlock,yama",
-                "",
-                None,
                 ("pinned_inode", "kernel_too_old"),
             ),
             (
                 Unsupported,
                 "capability,apparmor",
-                "",
-                None,
                 ("pinned_inode", "kernel_too_old"),
             ),
             (
                 Unknown,
                 "capability",
-                "",
-                None,
                 ("pinned_inode", "exec_check_probe_failed"),
             ),
         ] {
             assert_eq!(
-                code(mode(support, lsm, cmdline, ima)),
+                code(decide_entrypoint_mode(support, assess(lsm))),
                 expected,
-                "{support:?} {lsm}"
+                "{support:?} {lsm:?}"
             );
         }
-        let unreadable = LsmProbeInput {
-            lsm_list: Err(std::io::ErrorKind::PermissionDenied.into()),
-            cmdline: Ok(String::new()),
-            ima_policy: Ok(String::new()),
-        };
         assert_eq!(
             code(decide_entrypoint_mode(
                 Supported,
-                assess_lsm_environment(unreadable)
+                assess_lsm_environment(Err(std::io::ErrorKind::PermissionDenied.into()))
             )),
             ("pinned_inode", "lsm_list_unreadable")
         );

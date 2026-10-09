@@ -1256,7 +1256,7 @@ fn from_exec_error(err: ExecError) -> TraitError {
 mod tests {
     use super::*;
     use fandhe_container_core::audit_log::{AuditDelivery, AuditLayer, AuditRecord};
-    use fandhe_container_core::exec::{PathBoundLsm, exec_child_violation_reasons};
+    use fandhe_container_core::exec::{IntegrityLsm, PathBoundLsm, exec_child_violation_reasons};
     use fandhe_container_core::traits::{
         CgroupPlacement, CgroupScope, ContainerStatus, StateRevision,
     };
@@ -1641,8 +1641,8 @@ mod tests {
                 "lsm_apparmor",
             ),
             (
-                SealedCopyUnavailable::ImaPolicyUnreadable,
-                "ima_policy_unreadable",
+                SealedCopyUnavailable::IntegrityLsm(IntegrityLsm::Ima),
+                "lsm_ima",
             ),
         ] {
             let outcome = ExecOutcome {

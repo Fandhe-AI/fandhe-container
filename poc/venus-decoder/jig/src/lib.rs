@@ -12,18 +12,23 @@
 //! virtqueue（F1.3・#1518）、セッション状態と応答ループ（F1.4・#1519）、上記以外の ctrl 応答（F2 の残り。未対応は `ERR_UNSPEC`）、
 //! 実機での疎通（F3・#725）。
 
-#![deny(unsafe_code)]
-
+// crate 全体への deny/allow ではなく、安全なモジュールごとに deny(unsafe_code) を置く。
+// `sys` だけが unsafe を持てる（既定の unsafe_code は allow のため `sys` 側に広範な allow 属性は不要）。
+#[deny(unsafe_code)]
 pub mod adapter;
+#[deny(unsafe_code)]
 pub mod ctrl;
+#[deny(unsafe_code)]
 pub mod device;
+#[deny(unsafe_code)]
 pub mod log;
+#[deny(unsafe_code)]
 pub mod vhost_user;
 
 /// syscall の薄いラッパー。`unsafe` はここにだけ置く（#1517 の個別承認の範囲）。Linux 限定。
 #[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
 mod sys;
 
 #[cfg(test)]
+#[deny(unsafe_code)]
 mod tests;

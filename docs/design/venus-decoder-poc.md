@@ -445,8 +445,20 @@ frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲスト
 - 応答ループ: socket と ctrl キューの kick を、単一 fd 用の `sys::wait_fd` で `poll_slice`（既定 10ms）ずつ交互に待つ。1 回の kick で最大 `num` 件を処理して used へ書き、1 件以上なら call へ 1 を書く。`pop` / `add_used` の失敗はセッションを終了する（壊れたキューを黙って続けない）。writable が応答に足りない要求は応答を捨てて len=0 で返し、`response_dropped` の行を出してセッションは続ける。readable が 4 KiB を超える要求はアダプタへ渡さず `ERR_INVALID_PARAMETER`
 - ログ: 既存の `venus_jig event=...` 形式を保つ。追加は `session_error`（`code`・`request`）・`need_reply_ignored`・`response_dropped`・`session_end`。固定語彙と数値だけで、frontend やゲスト由来のバイト列・fd 番号・GPA は出さない
 - 扱わない（REPAIR-3）: `NEED_REPLY`（REPLY_ACK を広告しないので `SET_*` には応答せず、ログに 1 行出す）、cursorq（ring 1）の要求処理、`SET_CONFIG`、`VRING_NOFD`、inflight、`INDIRECT` / `EVENT_IDX`、`observe::snapshot_lines` の定期出力と virtqueue 個別の観測カウンタ（終了時の集計出力は `session::run` で実装済み）
-- 既知の穴: UDS の bind と所有者・権限・symlink の検証、peer credential の検証（PLUG-12 相当）は範囲外。`UnixStream::peer_cred` が unstable で、`SO_PEERCRED` の取得は #1517 の承認範囲外の `unsafe` を要するため、`UnixStream` を受け取る API に留め、bind は F3 の起動側に委ねる。治具は PoC で、実機の実行は人間が担当する閉じた環境という前提
+- 既知の穴: peer credential の検証（PLUG-12 相当）は未実装。`UnixStream::peer_cred` が unstable で、`SO_PEERCRED` の取得は #1517 の承認範囲外の `unsafe` を要するため、`session::run` は `UnixStream` を受け取る API に留める。UDS の bind と所有者・権限・symlink の検証は起動入口（10.9）が行う。治具は PoC で、実機の実行は人間が担当する閉じた環境という前提
 - 承認事項: socket と kick を同時に待つ複数 fd の `ppoll` は `sys.rs` の `unsafe`（U10）の変更になるため行っていない。kick への反応に最大 `poll_slice` の遅延が乗る
+
+### 10.9 起動入口（F4・#1598）
+
+`launch`（lib）と bin `venus-jig` が、UDS の bind・期限つき accept・ログのファイル出力を担う。Linux 限定。1 接続を `session::run` で最後まで処理して終わる（実機の疎通は #725）。
+
+- 引数: `--socket <絶対パス>`・`--log <絶対パス>`（必須）、`--message-timeout-ms`（既定 5000）・`--idle-timeout-ms`（既定 60000）・`--poll-slice-ms`・`--accept-timeout-ms`（既定 60000、0 より大きく 1 時間以下）。VMM 側から指定するのは `--socket` に渡した絶対パス。記録ファイルのパスは #1602 で足す
+- bind 前の検証（拒否時は何も作らず、既存のパスは消さない）: 絶対パス・成分に `.` / `..` / 空がない・NUL なし・ソケットとログが別パス（`PATH_NOT_ABSOLUTE` / `PATH_INVALID`）、ソケットパスが `sun_path` の 107 バイト以下（`PATH_TOO_LONG`。`linux/un.h` の `UNIX_PATH_MAX` 108 から NUL を除く）、ソケットの親ディレクトリが symlink でない・ディレクトリ・実行ユーザー（`/proc/self/status` の effective UID）の所有・モード `0700`（`SOCKET_DIR_SYMLINK` / `SOCKET_DIR_NOT_DIRECTORY` / `SOCKET_DIR_NOT_OWNED` / `SOCKET_DIR_NOT_PRIVATE`）、ソケットパスに何もない（`SOCKET_PATH_EXISTS`）。親ディレクトリが無ければ 1 段だけ `DirBuilder` の mode `0700` で作る
+- ログ: `create_new` + `0600`（既存は `LOG_PATH_EXISTS`、symlink も `O_EXCL` で失敗）。`log::LogSink` が総量 4 MiB・1 行 512 バイト・10 万行の照合器の上限に収め、超えたら `venus_jig event=log_truncated reason=limit` を 1 回だけ書いて以降を捨てる。パス文字列・ゲスト由来のバイト列は出さない
+- 実行時エラーは stderr に 1 行の JSON `{"code","message"}`（`SESSION_FAILED` のみ `cause` にセッションの code）。終了コードは検証エラー 2、それ以外の失敗 1、正常終了 0
+- accept は非ブロックの sleep ループ（10ms 刻み、期限切れは `ACCEPT_TIMEOUT`）。`sys::wait_fd`（ppoll）の listener fd への別用途の呼び出しは承認範囲外のため採らなかった（承認されれば置き換え可能な改善案）。1 接続を受けたら listener を閉じてソケットファイルを消す
+- peer credential（PLUG-12 相当）: 未実装。代わりにソケットディレクトリを自 UID 所有・`0700` に限り、接続できるのを同じ UID と root に絞る。限界は、同じ UID の別プロセスと root は接続できること、検証は直接の親ディレクトリだけで祖先は見ないこと、検査と bind の間の TOCTOU は所有者が自分で `0700` のディレクトリであることで抑えるに留まること。承認事項: `sys.rs` に `getsockopt(SO_PEERCRED)` の薄いラッパー（案 U11。出力バッファ長は `struct ucred` の固定長、カーネルが書いた長さを検証、fd は借用のみ）を足せば accept 直後に UID を照合できる。承認後に別 PR で扱う
+- ログ読み取り側（事後監査 #1528 D2）: `log::read_log_file` が open 前に `symlink_metadata` で通常ファイル以外（FIFO・symlink・ディレクトリ）を拒否し、open 後も `metadata` で確かめ直し、上限つきで読む。(1) と open の間に FIFO へ差し替える競合は残る。実機前提テストは読み取りを補助スレッドで動かし 30 秒の `recv_timeout` で待つ
 
 ## 11. 以降の章（未着手。10 章は #888 の範囲）
 

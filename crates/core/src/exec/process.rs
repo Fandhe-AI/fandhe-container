@@ -1223,6 +1223,8 @@ pub struct ExecChildSetupReport {
     /// `execveat` に渡す fd（封印した複製。#1531）の状態。`after_prepare` の後に採取するため、手順の後に
     /// 元のファイルが書き換えられても、この fd の内容が変わらないことを示す。
     pub exec_fd: ExecFdReport,
+    /// `execveat` の直前の子の `RLIMIT_FSIZE` の `(soft, hard)`（`getrlimit`。持ち越した値の適用後。SUP-12・#1531）。
+    pub fsize: (u64, u64),
 }
 
 /// `execveat` に渡す fd の状態（結合試験専用。TASK-163 追補・#1531）。
@@ -1295,6 +1297,44 @@ pub fn observe_exec_child_setup_with(
     after_prepare: impl FnOnce(),
     timeout: Duration,
 ) -> Result<ExecChildSetupObservation, ExecError> {
+    observe_exec_child_setup_inner(command, report, after_prepare, None, timeout)
+}
+
+/// [`observe_exec_child_setup`] に、子へ持ち越す `RLIMIT_FSIZE`（本番の `reapply_restrictions` が worker に載せず
+/// 子へ渡す値）を足した版（結合試験専用。SUP-12・SEC-1・TASK-163 追補・#1531）。
+///
+/// 子は本番と同じ順序で、封印した複製を作り終えた後・`execveat` の前に `fsize` を適用して読み戻す。報告の
+/// [`ExecChildSetupReport::fsize`] で適用後の soft・hard を、`exec_fd` で複製の完成（`fsize` より大きい本体でも
+/// 複製できること）を照合する。適用に失敗すると子は報告を書かず `SetupFailed`（終了コード 125）で終わる。
+/// `fsize` の種別が `RLIMIT_FSIZE` でなければ `InvalidArgument`。報告の書き込みも `fsize` の対象になるため、
+/// 報告（先頭 [`EXEC_FD_HEAD_BYTES`] バイトの 16 進表記を含む）より大きい値を渡すこと。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+#[doc(hidden)]
+pub fn observe_exec_child_setup_with_fsize(
+    command: &super::ExecCommand,
+    report: &Path,
+    fsize: Rlimit,
+    timeout: Duration,
+) -> Result<ExecChildSetupObservation, ExecError> {
+    if fsize.kind() != crate::rlimits::RlimitKind::Fsize {
+        return Err(ExecError::new(
+            ErrorCode::InvalidArgument,
+            IsolationStage::Rlimits,
+            "the deferred rlimit must be RLIMIT_FSIZE",
+        ));
+    }
+    observe_exec_child_setup_inner(command, report, || {}, Some(fsize), timeout)
+}
+
+/// [`observe_exec_child_setup_with`]・[`observe_exec_child_setup_with_fsize`] の本体。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+fn observe_exec_child_setup_inner(
+    command: &super::ExecCommand,
+    report: &Path,
+    after_prepare: impl FnOnce(),
+    deferred_fsize: Option<Rlimit>,
+    timeout: Duration,
+) -> Result<ExecChildSetupObservation, ExecError> {
     let entry = command.entrypoint();
     let (status_read, status_write) = exec_status_pipe()?;
     let pid = sys::fork_single_threaded(
@@ -1305,7 +1345,7 @@ pub fn observe_exec_child_setup_with(
             run_exec_child(
                 entry,
                 &status_write,
-                None,
+                deferred_fsize,
                 SealPolicy::unrestricted(),
                 |entry, exe| {
                     after_prepare();
@@ -1459,6 +1499,9 @@ fn write_setup_report(
         "exec_fd={exec_fd} {seals} {size} {head_hex} {}\n",
         link.to_string_lossy()
     ));
+    let (fsize_soft, fsize_hard) = sys::get_rlimit_self(crate::rlimits::RlimitKind::Fsize)
+        .map_err(|_| fail("read own RLIMIT_FSIZE"))?;
+    text.push_str(&format!("fsize={fsize_soft} {fsize_hard}\n"));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1525,6 +1568,10 @@ fn parse_setup_report(text: &str) -> Option<ExecChildSetupReport> {
                 head,
                 link,
             }
+        },
+        fsize: {
+            let (soft, hard) = single("fsize")?.split_once(' ')?;
+            (soft.parse().ok()?, hard.parse().ok()?)
         },
     })
 }

@@ -495,6 +495,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::landlock::AccessFs;
     use crate::test_support::{TestTempDir, kernel_at_least};
 
     fn probe_input(lsm: &str, cmdline: &str, ima: Option<&str>) -> LsmProbeInput {
@@ -869,6 +870,61 @@ mod tests {
                 allowed.expect_err("unsupported kernel").code,
                 ErrorCode::FailedPrecondition
             );
+        }
+    }
+
+    /// SEC-1・CORE-5・TASK-163 追補（#1531）: 実カーネルの Landlock の下で、読み取りはできるが `EXECUTE` を許されない
+    /// 元のファイルは、`AT_EXECVE_CHECK` により複製の前に `PermissionDenied`（違反なし）で拒否され、`EXECUTE` を許された
+    /// 対照は複製できる（memfd 自体は Landlock のルール外で実行できるため、元のファイルへの判定が `EXECUTE` の拒否を
+    /// 維持する境界になる）。呼び出し側から継承した domain の拒否も維持されることを、「`allowed/` だけに `EXECUTE` を
+    /// 許す層」の上に「`/` 全体に `EXECUTE` を許す層」（exec の子が自前で積む層に相当）を重ねて確かめる。
+    ///
+    /// Landlock の適用は呼び出したスレッドだけに効き不可逆なため、専用のスレッドを作って適用し、試験の後に捨てる
+    /// （`NO_NEW_PRIVS` もスレッド単位）。Linux 6.14 未満（`/proc/sys/kernel/osrelease`）では `AT_EXECVE_CHECK` が
+    /// 無く、必須の判定では両方とも `FailedPrecondition` になる（Landlock は適用しない）。6.14 以降で Landlock を
+    /// 使えない環境は skip せず失敗する。
+    #[test]
+    fn sec1_core5_landlock_execute_denial_survives_the_copy() {
+        let scratch = Scratch::new("landlock");
+        let root = scratch.0.path().to_path_buf();
+        for sub in ["allowed", "denied"] {
+            std::fs::create_dir(root.join(sub)).expect("mkdir");
+            let path = root.join(sub).join("script");
+            std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let supported = kernel_at_least(6, 14);
+        let worker = std::thread::spawn(move || {
+            if supported {
+                let execute = AccessFs::EXECUTE.bits();
+                let layer = |beneath: &Path| {
+                    let ruleset = sys::landlock_create_ruleset_fs(execute).expect("create ruleset");
+                    let dir = File::open(beneath).expect("open rule dir");
+                    sys::landlock_add_path_beneath(ruleset.as_fd(), execute, dir.as_fd())
+                        .expect("add rule");
+                    sys::landlock_restrict_self(ruleset.as_fd()).expect("restrict self");
+                };
+                sys::set_no_new_privs().expect("no_new_privs");
+                // 継承した層（呼び出し側の制限に相当）: `allowed/` の配下だけ `EXECUTE` を許す。
+                layer(&root.join("allowed"));
+                // 自前の層に相当: `/` 全体に `EXECUTE` を許す（継承した層の拒否を緩められないことを確かめる）。
+                layer(Path::new("/"));
+            }
+            let outcome = |sub: &str| {
+                let file = File::open(root.join(sub).join("script")).expect("open script");
+                seal(&file, 17, MAX_SEALED_COPY_BYTES, &required())
+                    .map(|copy| copy.metadata().len())
+                    .map_err(|e| (e.code, violation_of(&e)))
+            };
+            (outcome("allowed"), outcome("denied"))
+        });
+        let (allowed, denied) = worker.join().expect("landlock worker thread");
+        if supported {
+            assert_eq!(allowed, Ok(17));
+            assert_eq!(denied, Err((ErrorCode::PermissionDenied, None)));
+        } else {
+            assert_eq!(allowed, Err((ErrorCode::FailedPrecondition, None)));
+            assert_eq!(denied, Err((ErrorCode::FailedPrecondition, None)));
         }
     }
 

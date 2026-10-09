@@ -158,7 +158,7 @@ pub use process::{
 #[doc(hidden)]
 pub use process::{
     EXEC_FD_HEAD_BYTES, ExecChildSetupObservation, ExecChildSetupReport, ExecFdReport,
-    observe_exec_child_setup, observe_exec_child_setup_with,
+    observe_exec_child_setup, observe_exec_child_setup_with, observe_exec_child_setup_with_fsize,
 };
 /// 結合試験 `tests/exec_child_setup.rs`・`tests/fork_exec_isolation.rs` 専用の再公開（SEC-1・CORE-1・TASK-27.4.1・#1299。
 /// 通常の利用者は呼ばない。詳細は定義側）。

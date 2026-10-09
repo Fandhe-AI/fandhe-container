@@ -26,6 +26,9 @@
 //!   ファイルはカーネル版に依らず違反 `entrypoint_on_noexec_mount`、実行ビットのないスクリプトは Linux 6.14 以降で
 //!   `AT_EXECVE_CHECK` により違反なしで拒否する（6.14 未満は観測の入口が判定を省くため手順を通る。分岐ごとに具体値で照合）。
 //!   `noexec` の tmpfs を user namespace の中でマウントする場面は実機前提で、`-- --ignored` 指定時のみ実行する
+//! - **持ち越した `RLIMIT_FSIZE`（#1531・SUP-12）**: 封印した複製を作り終えた後に適用され、持ち越し値より大きい本体でも
+//!   複製が完成し、適用後の soft・hard が持ち越し値と一致する。適用に失敗した子はコマンドを起動しない
+//!   （util-linux の `prlimit` で hard を下げた子を再実行して作る）
 //! - **`execve` 前の失敗の区別（#1460）**: 子が本番と同じ pipe で親へ知らせた内容から、「コマンドは起動して
 //!   いない」（終了コード 125〜127 と違反の理由）と「`execveat` の直前まで到達した」が区別される。子に残る fd が
 //!   その pipe と検査済みのエントリポイントの 2 本だけであること（継承 fd の後始末）も照合する
@@ -63,6 +66,9 @@ fn main() {
             linux::pty_child(std::path::Path::new(args.get(2).expect("work directory")));
         }
         Some(linux::GROUPS_CHILD) => linux::groups_child(),
+        Some(linux::FSIZE_RAISE_CHILD) => {
+            linux::fsize_raise_child(std::path::Path::new(args.get(2).expect("work directory")))
+        }
         Some(linux::NOEXEC_MOUNT_CHILD) => {
             linux::noexec_mount_child(std::path::Path::new(args.get(2).expect("work directory")))
         }
@@ -95,9 +101,10 @@ mod linux {
         ChildExit, ContainerEnv, ExecChildSetupReport, ExecCommand, ExecExit,
         MAX_SEALED_COPY_BYTES, StandardFd, SupplementaryGroups, ViolationReason,
         clear_supplementary_groups_for_test, close_standard_fds_for_test, observe_exec_child_setup,
-        observe_exec_child_setup_with,
+        observe_exec_child_setup_with, observe_exec_child_setup_with_fsize,
     };
     use fandhe_container_core::oci_runtime::parse_config_bytes;
+    use fandhe_container_core::rlimits::{Rlimit, RlimitKind};
     use fandhe_container_core::traits::ErrorCode;
 
     /// 疑似端末の下で再実行される子の再入フラグ（引数: 作業ディレクトリ）。
@@ -108,6 +115,12 @@ mod linux {
     pub const CLOSED_STDIO_CHILD: &str = "--closed-stdio-child";
     /// user namespace の中で `noexec` の tmpfs 上のエントリポイントを照合する子の再入フラグ（引数: 作業ディレクトリ）。
     pub const NOEXEC_MOUNT_CHILD: &str = "--noexec-mount-child";
+    /// `RLIMIT_FSIZE` の hard を引き下げた状態で、引き上げる持ち越し値を渡す子の再入フラグ（引数: 作業ディレクトリ）。
+    pub const FSIZE_RAISE_CHILD: &str = "--fsize-raise-child";
+    /// [`FSIZE_RAISE_CHILD`] の子が照合を終えたことを標準出力で知らせる合図。
+    const FSIZE_RAISE_OK: &str = "fsize-raise-ok";
+    /// [`FSIZE_RAISE_CHILD`] の子を起動するときに `prlimit` で設定する `RLIMIT_FSIZE`（soft = hard）。
+    const FSIZE_LOWERED: u64 = 1024 * 1024;
     /// `noexec` の tmpfs の子が照合を終えたことを標準出力で知らせる合図。
     const NOEXEC_MOUNT_OK: &str = "noexec-mount-ok";
     /// 疑似端末の下の子が、照合を終えたことを知らせる合図ファイルの名前と内容。
@@ -190,6 +203,8 @@ mod linux {
         runtime_interpreter_is_rejected_before_exec(&work.0);
         executed_fd_is_a_sealed_copy_immune_to_replacement(&work.0);
         sealed_copy_refusals_are_recorded(&work.0);
+        deferred_fsize_is_applied_after_the_copy(&work.0);
+        deferred_fsize_failure_does_not_start_the_command(&work.0);
         setup_failures_are_distinguished_from_command_exits(&work.0);
         inherited_fds_are_closed_except_the_status_pipe(&work.0);
         environment_comes_only_from_the_container_definition(&work.0);
@@ -533,6 +548,132 @@ mod linux {
             }
         );
         assert_eq!(observation.report, None);
+    }
+
+    /// SUP-12・SEC-1・TASK-163 追補（#1531）: 子へ持ち越した `RLIMIT_FSIZE` は、封印した複製を作り終えた後に適用される。
+    /// 持ち越し値（64 KiB）より大きい本体（256 KiB）でも複製が完成し（`SIGXFSZ`・`EFBIG` で止まらない）、`execveat` の
+    /// 直前の子の soft・hard は持ち越し値と一致する。適用を複製の前へ戻すと、この場面は複製の書き込みで失敗する。
+    fn deferred_fsize_is_applied_after_the_copy(work: &Path) {
+        const LIMIT: u64 = 64 * 1024;
+        const BODY: usize = 256 * 1024;
+        let path = work.join("fsize-large");
+        let mut content = b"#!/bin/sh\nexit 0\n".to_vec();
+        content.resize(BODY, b'#');
+        write_bytes(&path, &content);
+        let command = ExecCommand::new(&path, ["large"], &ContainerEnv::empty()).expect("command");
+        let fsize = Rlimit::new(RlimitKind::Fsize, LIMIT, LIMIT).expect("rlimit");
+        let observation = observe_exec_child_setup_with_fsize(
+            &command,
+            &work.join("report-fsize"),
+            fsize,
+            timeout(),
+        )
+        .expect("observe the exec child setup");
+        assert_eq!(observation.exit, ExecExit::Command(ChildExit::Exited(0)));
+        let report = observation.report.expect("report");
+        assert_eq!(report.fsize, (LIMIT, LIMIT));
+        assert_eq!(report.exec_fd.size, BODY as u64);
+        assert_eq!(report.exec_fd.seals, Some(SEALED_COPY_SEALS));
+        assert_eq!(report.exec_fd.link, SEALED_COPY_LINK);
+    }
+
+    /// SUP-12・SEC-1・TASK-163 追補（#1531）: 持ち越した `RLIMIT_FSIZE` の適用に失敗したら、子はコマンドを起動しない。
+    /// util-linux の `prlimit` で hard を [`FSIZE_LOWERED`] へ下げた子を再実行し、その 2 倍の持ち越し値（hard の
+    /// 引き上げ。`CAP_SYS_RESOURCE` が要る）を渡す。`CAP_SYS_RESOURCE` を持たない子（hosted runner）では
+    /// `SetupFailed`（125・違反なし）で報告は書かれない。持つ子（root）では引き上げが成功し、適用後の値が一致する。
+    fn deferred_fsize_failure_does_not_start_the_command(work: &Path) {
+        let exe = std::env::current_exe().expect("current_exe");
+        let limit = format!("--fsize={FSIZE_LOWERED}:{FSIZE_LOWERED}");
+        let mut child = Command::new("prlimit")
+            .arg(&limit)
+            .arg("--")
+            .arg(&exe)
+            .arg(FSIZE_RAISE_CHILD)
+            .arg(work)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn prlimit (util-linux)");
+        let deadline = Instant::now() + timeout();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the fsize child did not exit within {:?}", timeout());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let (mut stdout, mut stderr) = (String::new(), String::new());
+        {
+            use std::io::Read as _;
+            if let Some(mut out) = child.stdout.take() {
+                let _ = out.read_to_string(&mut stdout);
+            }
+            if let Some(mut err) = child.stderr.take() {
+                let _ = err.read_to_string(&mut stderr);
+            }
+        }
+        assert!(
+            status.success() && stdout.lines().any(|l| l == FSIZE_RAISE_OK),
+            "fsize child failed: status {status:?}, stdout {stdout}, stderr {stderr}"
+        );
+    }
+
+    /// [`deferred_fsize_failure_does_not_start_the_command`] が `prlimit` の下で再実行する子。
+    pub fn fsize_raise_child(work: &Path) {
+        let limits = fs::read_to_string("/proc/self/limits").expect("read limits");
+        let lowered = limits
+            .lines()
+            .find(|l| l.starts_with("Max file size"))
+            .expect("Max file size line");
+        assert!(
+            lowered
+                .split_whitespace()
+                .filter(|v| *v == FSIZE_LOWERED.to_string())
+                .count()
+                == 2,
+            "prlimit must have lowered RLIMIT_FSIZE: {lowered}"
+        );
+        let raised = FSIZE_LOWERED * 2;
+        let command = shell_entry();
+        let fsize = Rlimit::new(RlimitKind::Fsize, raised, raised).expect("rlimit");
+        let observation = observe_exec_child_setup_with_fsize(
+            &command,
+            &work.join("report-fsize-raise"),
+            fsize,
+            timeout(),
+        )
+        .expect("observe the exec child setup");
+        if has_cap_sys_resource() {
+            assert_eq!(observation.exit, ExecExit::Command(ChildExit::Exited(0)));
+            assert_eq!(observation.report.expect("report").fsize, (raised, raised));
+        } else {
+            assert_eq!(
+                observation.exit,
+                ExecExit::SetupFailed {
+                    exit: ChildExit::Exited(125),
+                    violation: None,
+                }
+            );
+            assert_eq!(observation.report, None);
+        }
+        println!("{FSIZE_RAISE_OK}");
+    }
+
+    /// 自プロセスの実効 capability に `CAP_SYS_RESOURCE`（24）があるか（`/proc/self/status` の `CapEff`）。
+    fn has_cap_sys_resource() -> bool {
+        let status = fs::read_to_string("/proc/self/status").expect("read status");
+        let hex = status
+            .lines()
+            .find_map(|l| l.strip_prefix("CapEff:"))
+            .expect("CapEff")
+            .trim();
+        let caps = u64::from_str_radix(hex, 16).expect("CapEff hex");
+        caps & (1 << 24) != 0
     }
 
     /// `/proc/self/mountinfo` で、`/proc` のマウントが `noexec` か（最上位のマウントの 6 列目）。

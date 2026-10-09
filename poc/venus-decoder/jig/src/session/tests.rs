@@ -244,30 +244,56 @@ fn file_pair() -> (File, UnixStream) {
     (File::from(OwnedFd::from(a)), b)
 }
 
-/// REPAIR-5: poll の後に相手が読み切っていても kick の読み取りは待たず偽を返す
-/// （fd が blocking のまま渡されても `O_NONBLOCK` を立て直す）。
+/// REPAIR-5: poll の後に相手が読み切っていても kick の読み取りは `wait_for` で打ち切る
+/// （`O_NONBLOCK` に依存しない。blocking のままの空の fd でも期限で `Lost` になり、呼び出し元は止まらない）。
 #[test]
 fn repair5_read_kick_does_not_block_on_drained_counter() {
+    let (kick, _peer) = file_pair();
+    let started = Instant::now();
+    assert_eq!(
+        read_kick(&kick, Duration::from_millis(50)).expect("empty"),
+        KickRead::Lost
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// REPAIR-5: kick の読み取りの具体値（読めた・切断）。
+#[test]
+fn repair5_read_kick_reads_counter_and_detects_close() {
+    let slice = Duration::from_secs(5);
     let (kick, mut peer) = file_pair();
-    assert!(!read_kick(&kick).expect("empty"));
     peer.write_all(&1u64.to_le_bytes()).expect("kick");
-    assert!(read_kick(&kick).expect("one"));
-    assert!(!read_kick(&kick).expect("drained"));
+    assert_eq!(read_kick(&kick, slice).expect("one"), KickRead::Read);
     drop(peer);
     assert_eq!(
-        read_kick(&kick).expect_err("closed").code,
+        read_kick(&kick, slice).expect_err("closed").code,
         SessionErrorCode::KickClosed
     );
 }
 
-/// REPAIR-5: call の書き込み先が埋まっていれば期限で `TIMEOUT` になり、無期限に止まらない。
+/// REPAIR-5: `O_NONBLOCK` が立っていて空なら `Drained`（相手が先に読み切った場合）。
+#[test]
+fn repair5_read_kick_drained_when_nonblocking() {
+    let (kick, _peer) = file_pair();
+    let sock = UnixStream::from(OwnedFd::from(kick.try_clone().expect("dup")));
+    sock.set_nonblocking(true).expect("nb");
+    assert_eq!(
+        read_kick(&kick, Duration::from_secs(5)).expect("drained"),
+        KickRead::Drained
+    );
+}
+
+/// REPAIR-5: 相手が `O_NONBLOCK` を落としていても（blocking の fd でも）call の書き込み先が埋まっていれば
+/// 期限で `TIMEOUT` になり、無期限に止まらない。
 #[test]
 fn repair5_notify_times_out_when_call_is_full() {
     let (call, _peer) = file_pair();
     // call 側の送信バッファを満杯にする（peer は読まないので埋まったままになる）。
-    negotiation::force_nonblocking(&call).expect("nb");
+    let sock = UnixStream::from(OwnedFd::from(call.try_clone().expect("dup")));
+    sock.set_nonblocking(true).expect("nb");
     let mut writer = &call;
     while writer.write(&[0u8; 4096]).is_ok() {}
+    sock.set_nonblocking(false).expect("blocking");
     let started = Instant::now();
     let e = notify(&call, Duration::from_millis(100)).expect_err("full");
     assert_eq!(e.code, SessionErrorCode::Timeout);

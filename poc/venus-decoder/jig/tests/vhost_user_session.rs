@@ -281,6 +281,49 @@ mod linux {
         );
     }
 
+    /// GPU-6・REPAIR-3: 応答を書き戻せず捨てた `CTX_CREATE` は adapter の状態を残さない。
+    /// 同じ ctx_id の再送が重複エラー（`ERR_INVALID_CONTEXT_ID` 0x1203）にならず `OK_NODATA`（0x1100）になる。
+    #[test]
+    fn gpu6_dropped_ctx_create_response_rolls_back_adapter_state() {
+        let (front, backend) = pair(limits(5000, 5000));
+        let fe = setup_ring0(front, 8, "rb");
+        // readable を CTX_CREATE（96 バイト）の長さへ広げる。
+        let mut d0 = Vec::new();
+        d0.extend_from_slice(&0x4000u64.to_le_bytes());
+        d0.extend_from_slice(&96u32.to_le_bytes());
+        d0.extend_from_slice(&1u16.to_le_bytes());
+        d0.extend_from_slice(&1u16.to_le_bytes());
+        fe.mem.write_at(&d0, 0).expect("desc0");
+        let mut req = vec![0u8; 96];
+        req[..4].copy_from_slice(&0x0200u32.to_le_bytes());
+        req[16..20].copy_from_slice(&3u32.to_le_bytes());
+        req[28..32].copy_from_slice(&4u32.to_le_bytes());
+        fe.mem.write_at(&req, 0x4000).expect("req");
+        fe.mem.write_at(&[0, 0], 0x1004).expect("ring[0]");
+        fe.mem.write_at(&[1, 0], 0x1002).expect("idx");
+        (&fe.kick).write_all(&1u64.to_le_bytes()).expect("kick");
+        wait_call(&fe);
+        // 8 バイトの writable には 24 バイトの応答が入らず len=0。
+        assert_eq!(used(&fe), [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // writable を広げて同じ要求を再送する。
+        let mut d1 = Vec::new();
+        d1.extend_from_slice(&0x5000u64.to_le_bytes());
+        d1.extend_from_slice(&408u32.to_le_bytes());
+        d1.extend_from_slice(&2u16.to_le_bytes());
+        d1.extend_from_slice(&0u16.to_le_bytes());
+        fe.mem.write_at(&d1, 16).expect("desc1");
+        fe.mem.write_at(&[0, 0], 0x1006).expect("ring[1]");
+        fe.mem.write_at(&[2, 0], 0x1002).expect("idx");
+        (&fe.kick).write_all(&1u64.to_le_bytes()).expect("kick");
+        wait_call(&fe);
+        let mut resp = [0u8; 4];
+        fe.mem.read_at(&mut resp, 0x5000).expect("resp");
+        assert_eq!(resp, 0x1100u32.to_le_bytes());
+        drop(fe);
+        let (end, _lines) = backend.join().expect("join");
+        assert_eq!(end, Ok(SessionEnd::PeerClosed));
+    }
+
     #[test]
     fn gpu6_writable_too_small_returns_len_zero_and_continues() {
         let (front, backend) = pair(limits(5000, 5000));

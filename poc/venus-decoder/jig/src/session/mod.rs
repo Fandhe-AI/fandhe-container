@@ -14,19 +14,23 @@
 //! 未実装（REPAIR-3）: cursorq（ring 1）の要求処理・`SET_CONFIG`・`VRING_NOFD`・REPLY_ACK・inflight・
 //! `observe::snapshot_lines` の定期出力（セッション終了時に 1 回だけ出す）。
 //!
-//! kick / call の fd は frontend が複製を持ち得るため、poll の後に相手が eventfd を読み書きして状態を変えられる。
-//! そこで受け取った fd と I/O の直前に `O_NONBLOCK` を立て直し、`EAGAIN` は「まだ無い」「まだ書けない」として期限内で扱う
-//! （blocking の read / write で `message_timeout` / `idle_timeout` が評価されなくなるのを防ぐ。REPAIR-5）。
-//! 立て直しと I/O の間に相手がフラグを落とす窓は残る（safe な std だけでは塞げない。unsafe の承認範囲外）。
+//! kick / call の fd は frontend が複製を持ち得るため、`O_NONBLOCK` を含む open file description のフラグと counter は
+//! 相手と共有され、poll の後に相手が eventfd を読み書きして状態を変えたり、フラグを落としたりできる。そこでセッションの
+//! スレッドは eventfd を直接 read / write せず、使い捨ての補助スレッドへ I/O を任せ、`recv_timeout` で期限を評価する
+//! （共有フラグに依存しない。REPAIR-5）。期限を超えたら補助スレッドを起こす逆向きの操作（kick は 1 を書く、call は読み出して
+//! counter を空ける）を別の切り離したスレッドで試み、セッションのスレッドは決して eventfd の I/O で止まらない。
+//! 逆向きの操作が間に合わなければ補助スレッドが残り得るが、それはプロセス終了で回収される（セッション 1 本につき高々数本）。
+//! 補助スレッドを使うぶん kick 1 回あたり数十 us の上乗せがあり、`ctrl_kick` のヒストグラムに現れる。
 
 mod error;
 mod metrics;
 mod negotiation;
 
 use std::fs::File;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 pub use error::{Cause, SessionError, SessionErrorCode};
@@ -43,7 +47,7 @@ use crate::vhost_user::{
 };
 use crate::virtqueue::VirtqueueErrorCode;
 use metrics::{SessionMetrics, SessionOp};
-use negotiation::{State, expected_fds, force_nonblocking};
+use negotiation::{State, expected_fds};
 
 /// ctrl 要求として受け付ける readable の最大長（固定長のスタックバッファの大きさ）。`CTX_CREATE`（96 バイト）より十分大きい。
 pub const MAX_CTRL_REQ_LEN: usize = 4096;
@@ -317,7 +321,8 @@ impl Session {
             return Ok(false);
         }
         // 相手が poll の後に counter を読み切っていれば処理するものが無い（次の kick を待つ）。
-        if !read_kick(&ring.kick)? {
+        let kick = read_kick(&ring.kick, limits.poll_slice)?;
+        if kick == KickRead::Drained {
             return Ok(false);
         }
         let mut done = 0usize;
@@ -328,6 +333,8 @@ impl Session {
                 Err(e) => return Err(SessionError::virtqueue(e, None)),
             };
             let vq = |e| SessionError::virtqueue(e, None);
+            // 応答を書き戻せず捨てる場合に adapter の状態変更（CTX の作成・破棄）を取り消すための控え。
+            let adapter_before = adapter.clone();
             let (response, log_line) = if chain.readable_len() > MAX_CTRL_REQ_LEN as u64 {
                 (
                     CtrlResponse::new(None, RESP_ERR_INVALID_PARAMETER, &[]),
@@ -346,8 +353,11 @@ impl Session {
             let len = match chain.write_writable(mem, response.as_bytes()) {
                 Ok(n) => n,
                 // 書き戻し先が足りない要求は応答を捨て（len=0）、セッションは続ける。
+                // frontend が結果を確認できないため、この要求による adapter の状態変更も取り消す
+                // （取り消さないと同じ ID の再送が重複エラーになる）。
                 Err(e) if e.code == VirtqueueErrorCode::UsedLenExceedsWritable => {
                     dropped = true;
+                    *adapter = adapter_before;
                     0
                 }
                 Err(e) => return Err(vq(e)),
@@ -365,46 +375,133 @@ impl Session {
             metrics.record(SessionOp::Notify, notified.is_ok(), started.elapsed());
             notified?;
         }
-        Ok(true)
+        // `Lost` では kick を読めたか不明なので ring は走査済み。処理が無ければ偽。
+        Ok(done > 0 || kick == KickRead::Read)
     }
 }
 
-/// kick の eventfd から counter（8 バイト）を読む。読めたら真、相手が先に読み切っていて無ければ偽（待たない）。
-fn read_kick(kick: &File) -> Result<bool, SessionError> {
-    force_nonblocking(kick)?;
-    let mut counter = [0u8; 8];
-    match (&*kick).read(&mut counter) {
-        Ok(0) => Err(SessionError::new(SessionErrorCode::KickClosed, None)),
-        Ok(8) => Ok(true),
-        Ok(_) => Err(SessionError::new(SessionErrorCode::InvalidKick, None)),
-        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => Ok(false),
-        Err(_) => Err(SessionError::new(SessionErrorCode::InvalidKick, None)),
+/// [`read_kick`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KickRead {
+    /// counter を読めた。
+    Read,
+    /// 相手が先に読み切っていて counter が無かった（`O_NONBLOCK` が立っている場合）。
+    Drained,
+    /// 補助スレッドが期限内に終わらなかった（相手が読み切ってフラグも落としている等）。読めたか不明なので、
+    /// 呼び出し側は ring を走査する（空なら何も起きない）。
+    Lost,
+}
+
+/// 補助スレッドで `op` を実行し、`wait_for` 以内の結果を返す。期限切れは `Ok(None)`（補助スレッドは切り離す）。
+fn run_bounded<T: Send + 'static>(
+    file: &File,
+    wait_for: Duration,
+    op: impl FnOnce(&File) -> io::Result<T> + Send + 'static,
+) -> Result<Option<io::Result<T>>, SessionError> {
+    let failed = || SessionError::new(SessionErrorCode::FdSetupFailed, None);
+    let dup = file.try_clone().map_err(|_| failed())?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("venus-jig-fd-io".into())
+        .spawn(move || {
+            // 受け側が期限切れで捨てていれば送信は失敗するが、結果が要らないので無視する。
+            let _ = tx.send(op(&dup));
+        })
+        .map_err(|_| failed())?;
+    match rx.recv_timeout(wait_for) {
+        Ok(r) => Ok(Some(r)),
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(failed()),
     }
 }
 
-/// call の eventfd へ 1 を書いてゲストへ通知する。書き込み可能になるのを待ち、`EAGAIN`（相手が counter を満たした等）は
-/// `timeout` の期限まで再試行する（期限切れは `TIMEOUT`）。
+/// `op` を切り離したスレッドで実行する（結果は捨てる。失敗しても何もしない）。
+fn detach(file: &File, op: impl FnOnce(&File) + Send + 'static) {
+    if let Ok(dup) = file.try_clone() {
+        let _ = std::thread::Builder::new()
+            .name("venus-jig-fd-unblock".into())
+            .spawn(move || op(&dup));
+    }
+}
+
+/// kick の eventfd から counter（8 バイト）を読む。読み取りは補助スレッドに任せ、`wait_for` 以内に終わらなければ
+/// 読み取りを起こすために 1 を書いて（別の切り離したスレッドで）`Lost` を返す。
+fn read_kick(kick: &File, wait_for: Duration) -> Result<KickRead, SessionError> {
+    let result = run_bounded(kick, wait_for, |f| {
+        let mut counter = [0u8; 8];
+        let mut r = f;
+        r.read(&mut counter).map(|n| (n, counter))
+    })?;
+    match result {
+        None => {
+            // 補助スレッドは counter 0 の read で止まっている。1 を足して起こす（余分な kick は空走査で無害）。
+            detach(kick, |f| {
+                let mut w = f;
+                let _ = w.write(&1u64.to_le_bytes());
+            });
+            Ok(KickRead::Lost)
+        }
+        Some(Ok((0, _))) => Err(SessionError::new(SessionErrorCode::KickClosed, None)),
+        Some(Ok((8, _))) => Ok(KickRead::Read),
+        Some(Ok(_)) => Err(SessionError::new(SessionErrorCode::InvalidKick, None)),
+        Some(Err(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
+            Ok(KickRead::Drained)
+        }
+        Some(Err(_)) => Err(SessionError::new(SessionErrorCode::InvalidKick, None)),
+    }
+}
+
+/// call の eventfd へ 1 を書いてゲストへ通知する。書き込みは補助スレッドに任せて `timeout` の期限まで待ち、`EAGAIN`
+/// （相手が counter を満たし `O_NONBLOCK` が立っている等）は期限内で再試行する。期限切れは `TIMEOUT`
+/// （書き込みを起こすため、別の切り離したスレッドで call を読み出して counter を空ける）。
 fn notify(call: &File, timeout: Duration) -> Result<(), SessionError> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| SessionError::new(SessionErrorCode::InvalidArgument, None))?;
     loop {
-        let left = remaining(deadline)?;
-        if !wait(call.as_fd(), sys::Interest::Writable, left)? {
-            continue;
-        }
-        force_nonblocking(call)?;
-        match (&*call).write(&1u64.to_le_bytes()) {
-            Ok(8) => return Ok(()),
-            Ok(_) => return Err(SessionError::new(SessionErrorCode::CallFailed, None)),
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
-                // poll では書けると言われたが直後に埋まった。busy loop を避けて短く待ってから期限内で再試行する。
+        let left = match remaining(deadline) {
+            Ok(left) => left,
+            Err(e) => {
+                unblock_call(call);
+                return Err(e);
+            }
+        };
+        let result = run_bounded(call, left, |f| {
+            let mut w = f;
+            w.write(&1u64.to_le_bytes())
+        })?;
+        match result {
+            None => {
+                unblock_call(call);
+                return Err(SessionError::new(SessionErrorCode::Timeout, None));
+            }
+            Some(Ok(8)) => return Ok(()),
+            Some(Ok(_)) => return Err(SessionError::new(SessionErrorCode::CallFailed, None)),
+            Some(Err(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
+                // busy loop を避けて短く待ってから期限内で再試行する。
                 std::thread::sleep(left.min(Duration::from_millis(1)));
             }
-            Err(_) => return Err(SessionError::new(SessionErrorCode::CallFailed, None)),
+            Some(Err(_)) => return Err(SessionError::new(SessionErrorCode::CallFailed, None)),
         }
     }
 }
+
+/// 止まっている call の書き込みを起こすため、読める状態を確認してから 1 回読み出す（切り離したスレッドで実行）。
+fn unblock_call(call: &File) {
+    detach(call, |f| {
+        if matches!(
+            sys::wait_fd(f.as_fd(), sys::Interest::Readable, MAX_UNBLOCK_WAIT),
+            Ok(true)
+        ) {
+            let mut buf = [0u8; 8];
+            let mut r = f;
+            let _ = r.read(&mut buf);
+        }
+    });
+}
+
+/// [`unblock_call`] が読み出せるようになるのを待つ上限。
+const MAX_UNBLOCK_WAIT: Duration = Duration::from_millis(100);
 
 #[cfg(test)]
 mod tests;

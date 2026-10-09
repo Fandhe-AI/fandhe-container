@@ -9,7 +9,6 @@
 
 use std::fs::File;
 use std::os::fd::OwnedFd;
-use std::os::unix::net::UnixStream;
 
 use super::error::{SessionError, SessionErrorCode};
 use crate::device;
@@ -107,17 +106,6 @@ fn ooo(code: RequestCode) -> SessionError {
 
 fn fail(c: SessionErrorCode, code: RequestCode) -> SessionError {
     SessionError::new(c, Some(code.as_u32()))
-}
-
-/// fd の `O_NONBLOCK` を立てる。フラグは open file description に属し、frontend が複製を持てば相手側からも落とせるため、
-/// 受け取り時と I/O の直前に呼ぶ。`UnixStream::set_nonblocking` は `ioctl(FIONBIO)` で fd の種別に依らず効く
-/// （eventfd でも使える）ので、複製を一時的に `UnixStream` として包んで呼ぶ（unsafe を増やさない）。
-pub(super) fn force_nonblocking(f: &File) -> Result<(), SessionError> {
-    let failed = || SessionError::new(SessionErrorCode::FdSetupFailed, None);
-    let dup = f.try_clone().map_err(|_| failed())?;
-    UnixStream::from(OwnedFd::from(dup))
-        .set_nonblocking(true)
-        .map_err(|_| failed())
 }
 
 fn ring_index(index: u32, code: RequestCode) -> Result<usize, SessionError> {
@@ -323,10 +311,6 @@ impl State {
                     return Err(fail(SessionErrorCode::FdCountMismatch, code));
                 };
                 let file = File::from(fd);
-                force_nonblocking(&file).map_err(|mut e| {
-                    e.request = Some(code.as_u32());
-                    e
-                })?;
                 let setup = self.setup_mut(idx, code)?;
                 if code == RequestCode::SetVringKick {
                     setup.kick = Some(file);

@@ -35,7 +35,7 @@
 //! （`EntrypointSource::Pinned`）には掛けない（下記「サイズ上限」の理由。#1314 の後）。
 //!
 //! **方式の切り替え（オーナー判断 2026-10-09「条件付き切り替え」）**: 封印した複製を使える環境（下記「限界」の
-//! (a)〜(c)）では B' で実行し、それ以外では A（O_PATH での固定 + inode 照合をした元の fd をそのまま `execveat` する
+//! (a)・(b)）では B' で実行し、それ以外では A（O_PATH での固定 + inode 照合をした元の fd をそのまま `execveat` する
 //! 現行方式。#1478）で実行する。切り替えは黙って行わない: 判定結果は `EntrypointExecMode`（方式と、A を選んだ理由の
 //! 機械可読なコード `kernel_too_old`・`lsm_apparmor`・`lsm_ima` 等。一覧は `entrypoint_mode.rs`）で表し、supervisor が構造化ログ
 //! （`{"component":"supervisor.exec","operation":"entrypoint_mode",...}`）と `ExecOutcome` に残す（REPAIR-4）。A でも

@@ -264,6 +264,7 @@ macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なし�
 - 実装済み（F1.2・#1517）: `SCM_RIGHTS` の fd 送受信とゲストメモリの mmap のラッパー（`vhost_user::fd_passing` / `guest_memory`・`src/sys.rs`。Linux 限定。10.6）
 - **受入基準 2（ゲストの Mesa venus の capset クエリが自前デコーダに届いたことをログで確認）は未達**。トランスポート（後続 F1）と実機実行（F3・#725。人間担当）が必要なため
 - 後続（issue 起票は未実施・承認待ち）: F1 vhost-user トランスポート（メッセージ codec・fd 受け渡しと `mmap` の `sys` ラッパー・split virtqueue・kick / call。rust-vmm 系クレートは MVM-4 で使えないため自作）、F2 残りの ctrl 応答（10.4 節。`RESOURCE_CREATE_BLOB`・`SUBMIT_3D` 等）、F3 実機疎通（#725）
+- 実装済み（F1.3・#1518）: split virtqueue（`virtqueue`。10.7）
 - CI: `make poc-venus-jig-check`（fmt-check・clippy・test）は CI の `rust-ci-default-features` ジョブが 3 OS で実行し、`crates/plugin-macos` 側の変更による治具の破損を検出する（実機前提テストは `#[ignore]` で分離済みで CI では走らない）
 
 ### 10.2 候補比較
@@ -394,6 +395,25 @@ frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲスト
 - frontend プロセスによる同時書き込みは、Rust の抽象機械の外にある非アトミックなコピー（`copy_nonoverlapping`）として扱っている。プロセス内の並行アクセスは `!Send` / `!Sync` と範囲の占有で封じたが、frontend の書き込みと backend のコピーの競合は vhost-user の前提として残る（コピーした値が不定になるだけで、マッピング外は触らない）。アトミックなアクセスへの置き換えは U1〜U10 の承認範囲外
 - 後続の F1.3（#1518）は、共有メモリから `read_at` でコピーした後のバッファだけを解析する。同じ値を共有メモリから二度読むと、frontend がその間に書き換えて検査済みの値と使う値が食い違い得る（二度読み・TOCTOU）ため、検査と使用は同じコピーに対して行う
 - `vm.overcommit_memory=2`（厳格な課金）の環境では、長さだけを `ftruncate` で伸ばした shmem の memfd（ページ未割り当ての疎なファイル）への初回の書き込みで、ページの課金に失敗すると `SIGBUS` になり得る（環境に依存する DoS）。治具は seal と長さを検査するが、ページが実際に確保済みかは確かめない。製品版の fd 要件（TASK-173 系）への申し送り: frontend 側での事前確保（`fallocate` 等）を要件にするか、backend 側で確保を確かめる方法を決める
+
+### 10.7 split virtqueue（F1.3・#1518）
+
+実装は `poc/venus-decoder/jig/src/virtqueue/`。トランスポートに依存しないので `vhost_user` の外に置き、全 OS で合成メモリのテストが動く（Linux では `GuestMemory` が `QueueMemory` を実装）。呼び出し元は F1.4（#1519）。
+
+出典（確認日 2026-10-09。値だけを転記）: OASIS VIRTIO 1.2 の 2.7 系（レイアウト・アラインメント・記述子 flags・avail / used ring・要素を書いてから idx を更新する順序・readable を writable より前に置く driver 要件）、Linux `virtio_ring.h`（`INDIRECT_DESC`=28・`EVENT_IDX`=29）、QEMU `vhost-user.rst`（`SET_VRING_ADDR` の flags bit 0 が log）。節番号は記憶に基づく転記で、仕様本文の再取得による照合は未実施（F1.4 の結合か実機で食い違いが出たら直す）。
+
+| 項目 | 値 |
+| ---- | -- |
+| アラインメント | desc 16・avail 2・used 4（user アドレスと GPA の両方を検査） |
+| Queue Size | 2 の冪、1〜32768 |
+| 記述子 flags | NEXT=1・WRITE=2・INDIRECT=4（他のビットは `INVALID_DESC_FLAGS`） |
+| 治具独自の上限 | チェーン長 `min(64, num)`・総バイト長 1 MiB |
+
+- 検査: `num`、`SET_VRING_ADDR.flags == 0`（log は未ネゴシエーション）、リング全体が 1 領域に収まること、avail の未処理数 <= num、head / next < num、循環（`CHAIN_LOOP`）、上限（`CHAIN_TOO_LONG`）、readable が writable の後ろにないこと、総バイト長・`addr + len` の溢れ。すべて fail-closed で、失敗した `pop` は `last_avail` を進めない
+- TOCTOU: avail の idx・ring 要素・記述子 16 バイトは共有メモリから 1 回だけコピーし、そのコピーだけを解析する（テストで読み出し回数を照合）
+- 順序: `pop` は `avail.idx` の後に Acquire、`add_used` は used 要素の後に Release の fence を置いてから `used.idx` を書く。コピーは非アトミックなので、fence が実機のバリアになることに頼る前提が残る（アトミックなコピーは U1〜U10 の承認範囲外）
+- 扱わない: `INDIRECT`・`EVENT_IDX`（`device::FEATURES` が広告しない。`used_event` / `avail_event` は読み書きしない）、packed virtqueue。`unsafe` と依存は追加していない
+- F1.4（#1519）への申し送り: kick / call の eventfd、`SET_VRING_ENABLE`、`GET_VRING_BASE` での `last_avail` の返却、キュー番号と ctrl / cursor の対応づけ、エラー後のキューの扱い（リセットか切断）、virtqueue の観測カウンタ
 
 ## 11. 以降の章（未着手。10 章は #888 の範囲）
 

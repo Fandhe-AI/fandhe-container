@@ -27,12 +27,12 @@ pub struct VringState {
     pub num: u32,
 }
 
-/// `SET_VRING_ADDR` のペイロード（40 バイト）。値の意味（アラインメント・log ビット）は検査しない（F1.3）。
+/// `SET_VRING_ADDR` のペイロード（40 バイト）。値の意味（アラインメント・log ビット）はここでは検査せず、`crate::virtqueue::QueueConfig::new`（F1.3・#1518）が検査する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VringAddr {
     /// vring index。
     pub index: u32,
-    /// フラグ（log ビット等。意味は F1.3 で検査する）。
+    /// フラグ（log ビット等。意味は `crate::virtqueue::QueueConfig::new` が検査する）。
     pub flags: u32,
     /// descriptor table の user アドレス。
     pub descriptor: u64,

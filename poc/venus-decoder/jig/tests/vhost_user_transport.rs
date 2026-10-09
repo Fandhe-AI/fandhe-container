@@ -1,15 +1,24 @@
 //! vhost-user の fd 受け渡しとゲストメモリ mmap の結合試験（GPU-6・TASK-172 F1.2・#1517）。
 //!
-//! memfd・`SCM_RIGHTS`・`/proc/self` は Linux 固有なので、Linux 以外では skip を明示するテスト 1 本だけを走らせる
-//! （`benches/tests/macos_cold_start.rs` と同じ流儀）。root・KVM・GPU は要らない。期待値は具体値で照合する。
+//! memfd・`SCM_RIGHTS`・`/proc/self` は Linux 固有で、syscall の定数は x86_64 / aarch64 にだけ定義している。それ以外では
+//! skip を明示するテスト 1 本だけを走らせる（`benches/tests/macos_cold_start.rs` と同じ流儀。対応外アーキの Linux では
+//! API が `UNSUPPORTED` を返す）。root・KVM・GPU は要らない。期待値は具体値で照合する。
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 #[test]
 fn gpu6_transport_is_linux_only() {
-    eprintln!("skip: fd passing and guest memory mmap are Linux-only (memfd, MSG_CMSG_CLOEXEC)");
+    eprintln!(
+        "skip: fd passing and guest memory mmap are Linux x86_64 / aarch64 only (memfd, MSG_CMSG_CLOEXEC)"
+    );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod linux {
     use std::ffi::CString;
     use std::fs::File;

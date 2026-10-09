@@ -257,7 +257,8 @@ impl GuestMemory {
     }
 }
 
-#[cfg(test)]
+// 実際の syscall を使うので、定数を定義している x86_64 / aarch64 でだけ走らせる（他アーキは `UNSUPPORTED` を返す）。
+#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod tests {
     use super::*;
     use crate::vhost_user::fd_passing::create_memfd;

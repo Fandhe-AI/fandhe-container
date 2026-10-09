@@ -103,7 +103,7 @@ fn wait_until(
     match sys::wait_fd(sock.as_fd(), interest, remaining) {
         Ok(true) => Ok(()),
         Ok(false) => Err(err(TransportErrorCode::Timeout)),
-        Err(sys::SysError::Os(n)) if n == sys::EINTR => Ok(()),
+        Err(sys::SysError::Interrupted) => Ok(()),
         Err(e) => Err(TransportError::from_sys(e)),
     }
 }
@@ -125,8 +125,8 @@ fn recv_impl(
     let raw = loop {
         match sys::recvmsg_fds(sock.as_fd(), buf, ctrl_fds) {
             Ok(r) => break r,
-            Err(sys::SysError::Os(n)) if n == sys::EINTR => check_deadline(deadline)?,
-            Err(sys::SysError::Os(n)) if n == sys::EAGAIN => {
+            Err(sys::SysError::Interrupted) => check_deadline(deadline)?,
+            Err(sys::SysError::WouldBlock) => {
                 wait_until(sock, sys::Interest::Readable, deadline)?;
             }
             Err(e) => return Err(TransportError::from_sys(e)),
@@ -174,8 +174,8 @@ pub fn send_with_fds(
         loop {
             match sys::sendmsg_fds(sock.as_fd(), data, fds) {
                 Ok(len) => return Ok(Sent { len }),
-                Err(sys::SysError::Os(n)) if n == sys::EINTR => check_deadline(deadline)?,
-                Err(sys::SysError::Os(n)) if n == sys::EAGAIN => {
+                Err(sys::SysError::Interrupted) => check_deadline(deadline)?,
+                Err(sys::SysError::WouldBlock) => {
                     wait_until(sock, sys::Interest::Writable, deadline)?;
                 }
                 Err(e) => return Err(TransportError::from_sys(e)),
@@ -193,7 +193,7 @@ pub fn create_memfd(name: &CStr, len: u64) -> Result<File, TransportError> {
         let fd = sys::memfd_create_cloexec(name, true).map_err(TransportError::from_sys)?;
         let file = File::from(fd);
         file.set_len(len).map_err(|e| TransportError::from_io(&e))?;
-        sys::fcntl_add_seals(file.as_fd(), sys::F_SEAL_SHRINK).map_err(TransportError::from_sys)?;
+        sys::add_shrink_seal(file.as_fd()).map_err(TransportError::from_sys)?;
         Ok(file)
     })
 }
@@ -210,7 +210,8 @@ pub fn create_memfd_unsealed(name: &CStr, len: u64) -> Result<File, TransportErr
     })
 }
 
-#[cfg(test)]
+// 実際の syscall を使うので、定数を定義している x86_64 / aarch64 でだけ走らせる（他アーキは `UNSUPPORTED` を返す）。
+#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;

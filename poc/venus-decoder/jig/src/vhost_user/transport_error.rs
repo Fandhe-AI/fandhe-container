@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use crate::sys::{self, SysError};
+use crate::sys::SysError;
 
 /// 機械可読なエラー種別。`as_str` の大文字スネーク表記が外部に出す code。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,8 +114,10 @@ impl TransportError {
 
     /// `io::Error`（std の setsockopt・fstat・set_len 等）から作る。タイムアウト系は `TIMEOUT` に写す。
     pub(crate) fn from_io(e: &std::io::Error) -> Self {
+        if e.kind() == std::io::ErrorKind::WouldBlock {
+            return Self::new(TransportErrorCode::Timeout);
+        }
         match e.raw_os_error() {
-            Some(n) if n == sys::EAGAIN => Self::new(TransportErrorCode::Timeout),
             Some(n) => Self {
                 code: TransportErrorCode::OsError,
                 errno: Some(n),
@@ -127,14 +129,19 @@ impl TransportError {
     /// syscall ラッパーの失敗から作る。`EAGAIN`（待機の期限切れ。通常は `fd_passing` が期限を管理する）は `TIMEOUT`。
     pub(crate) fn from_sys(e: SysError) -> Self {
         match e {
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             SysError::Unsupported => Self::new(TransportErrorCode::Unsupported),
+            // 期限つきで待つ側（`fd_passing`）が通常は吸収する。外へ出るのは期限切れ扱い。
+            SysError::WouldBlock => Self::new(TransportErrorCode::Timeout),
+            // 再試行の側で吸収する。外へ出た場合は OS のエラーとして扱う。
+            SysError::Interrupted => Self::new(TransportErrorCode::OsError),
+            SysError::Invalid => Self::new(TransportErrorCode::InvalidArgument),
             SysError::ForeignBacking => Self::new(TransportErrorCode::UnsupportedBacking),
             SysError::NotSealed => Self::new(TransportErrorCode::ShrinkNotSealed),
             SysError::TooShort => Self::new(TransportErrorCode::FileTooShort),
             SysError::InUse => Self::new(TransportErrorCode::BackingInUse),
             // sys 側の境界の再検査（多層防御）に掛かった場合。上位の検査をすり抜けたので範囲外として拒否する。
             SysError::OutOfRange => Self::new(TransportErrorCode::OutOfBounds),
-            SysError::Os(n) if n == sys::EAGAIN => Self::new(TransportErrorCode::Timeout),
             SysError::Os(n) => Self {
                 code: TransportErrorCode::OsError,
                 errno: Some(n),

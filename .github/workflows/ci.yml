@@ -523,6 +523,13 @@ jobs:
         timeout-minutes: 5
         run: make cli-parity-selftest
 
+      # capture のタイムアウトでネイティブ exe の子孫が回収されるかの実測（#1548・TASK-125・CLI-1・REPAIR-5）。
+      # ログの `cli-parity native reclaim:` 行が Windows での確認結果。既存ジョブのステップ（check-run 件数は不変）
+      - name: CLI 比較スクリプトのタイムアウト回収確認（ネイティブ exe・#1548）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make cli-parity-native-reclaim-check
+
       # virtio-gpu ゲスト側確認スクリプト（poc/vz-custom-virtio-gpu/guest/check-virtio-gpu.sh）の自己テスト
       # （TASK-172.6・GPU-6・REPAIR-12・#1056）。合成 fixture（testdata/）と偽の dmesg だけを使い、
       # 実機・ゲスト VM・root・ネットワーク・secrets は使わない。本体はゲスト Linux 内で実行するが、

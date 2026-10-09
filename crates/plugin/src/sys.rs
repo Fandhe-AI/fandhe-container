@@ -177,8 +177,9 @@ mod waitid_abi {
     /// 先頭が `si_signo`・`si_errno`・`si_code`、64 bit では union が 8 バイト境界に置かれ、
     /// `_sigchld.si_pid` はオフセット 16。x86_64 と aarch64 は同じ asm-generic レイアウトだが、
     /// アーキテクチャごとに個別に定義する。
+    /// C の `siginfo_t` は union に 8 バイト整列の要素を含むため `align(8)` を明示する（`MaybeUninit` で確保した領域を `waitid` に渡すための整列保証）。
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    #[repr(C)]
+    #[repr(C, align(8))]
     #[allow(dead_code)] // カーネルが書く領域を写すだけで、読むのは `si_pid` のみ
     pub(super) struct SigInfo {
         pub(super) si_signo: i32,
@@ -193,11 +194,12 @@ mod waitid_abi {
     const _: () = {
         assert!(size_of::<SigInfo>() == 128);
         assert!(std::mem::offset_of!(SigInfo, si_pid) == 16);
+        assert!(align_of::<SigInfo>() == 8);
     };
 
     /// Linux aarch64 の `siginfo_t`（x86_64 と同じ 128 バイト・`si_pid` はオフセット 16）。
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    #[repr(C)]
+    #[repr(C, align(8))]
     #[allow(dead_code)] // カーネルが書く領域を写すだけで、読むのは `si_pid` のみ
     pub(super) struct SigInfo {
         pub(super) si_signo: i32,
@@ -212,6 +214,7 @@ mod waitid_abi {
     const _: () = {
         assert!(size_of::<SigInfo>() == 128);
         assert!(std::mem::offset_of!(SigInfo, si_pid) == 16);
+        assert!(align_of::<SigInfo>() == 8);
     };
 
     /// macOS の `siginfo_t`（`sys/signal.h` の `struct __siginfo`。LP64 で 104 バイト）。

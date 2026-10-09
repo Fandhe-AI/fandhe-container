@@ -1,6 +1,7 @@
 # コンテナごとの軽量監視プロセス（restart・healthcheck・exec・logs・stats。crate-naming.md の表 #3）。
 # 雛形は TASK-1.3（#11・REPAIR-1・MS-0）。本体は G12（TASK-157〜171）で実装する。
 # version は未指定（Cargo の既定で 0.0.0）。公開方針は未決定のため publish = false を明記する。
+# TASK-163 追補（#1594）で exec の本番用 AuditSink の構築入口 default_audit_sink を追加した（依存は不変）。
 # TASK-164 追補（#1469）でロックファイルの掃除経路（remove_all・open 失敗時の削除）を追加した（依存は不変）。
 # TASK-157.1（#235・SUP-1）で雛形を確認し、受け入れ基準の照合テスト（tests/skeleton.rs）を追加した。
 # TASK-164.3（#507・SUP-7）でログ sink の書き込みバッファ・flush 制御を追加した（依存の追加なし）。

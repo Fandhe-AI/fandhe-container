@@ -39,7 +39,7 @@
 //! # 未実装（REPAIR-3）
 //!
 //! 常時の二重記録（tee）によるクラッシュ・改ざん時の記録保持、Linux 6.15+ の Landlock カーネル側監査
-//! （`AUDIT_LANDLOCK_*`）によるワークロード拒否の捕捉、supervisor / CLI への配線は後続タスク。
+//! （`AUDIT_LANDLOCK_*`）によるワークロード拒否の捕捉、supervisor の exec への配線は `FileAuditSink`〔#1594〕で実装済み、CLI への配線は後続タスク。
 
 use std::time::{Duration, Instant};
 

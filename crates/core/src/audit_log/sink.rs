@@ -5,9 +5,11 @@
 //! seccomp・Landlock・マウント検証/API・plugin 信頼検証・exec 対象の各フックが、組み立てた [`AuditRecord`]
 //! を渡す先の抽象（全レイヤー共有の境界）。
 //!
-//! - ファイル追記（`AuditFileWriter`・#839）とカーネル監査フォールバック（`KernelAuditFallback`・#840）の
-//!   書き込み部品は実装済みだが、本トレイトを実装して両者を束ねる本番用 sink の実体は無い
-//!   （本 crate には既定実装を置かない。REPAIR-3: 実装済みを装わない）
+//! - 本番用 sink は core の `FileAuditSink`（#1594）。ファイル追記（`AuditFileWriter`・#839）とカーネル監査
+//!   フォールバック（`KernelAuditFallback`・#840）を束ねる。利用者が supervisor に限られず、`StateStore` の既定実装も
+//!   core に置く前例（TASK-31）に揃えて core に置く。別の記録先は本トレイトの別実装として差し替える。
+//!   両経路が失敗したときの stderr 通知は、失敗の詳細を持つ本番 sink が 1 回だけ出す（`AuditDelivery::SinkFailed` から
+//!   は再構成できないため、呼び出し側は出さない）。本番以外の sink の通知は各実装の責務
 //! - `record` が `Err` を返しても、呼び出し側は拒否の判定を覆さない（fail-closed）
 //! - 実装は拒否経路を止めないこと。ブロックし得る I/O はタイムアウトまたは非同期化する
 //!   （REPAIR-5。実装側の責務）

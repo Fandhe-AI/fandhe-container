@@ -31,7 +31,7 @@
 //!   型定義・マウント検証/API の記録ヘルパ〔TASK-41.4〕・seccomp フック〔TASK-41.2・#193。拒否報告→レコード→`AuditSink`〕・ローカルファイル書き込み主経路〔TASK-41.5.1・#839〕・exec の対象の拒否の記録ヘルパ〔`exec::audit_exec_violation`・
 //!   `exec::record_exec_target_rejection`。層 `exec_target`。#1465〕は実装済み。Landlock のフック〔TASK-41.3・#194。`landlock_denial_record` / `landlock_denial_record_now` と
 //!   `exec::observe_landlock_path_access` による適用後プローブの拒否記録〕も実装済み。配送経路〔TRAP / USER_NOTIF /
-//!   カーネル監査〕・ワークロードプロセスが受けた Landlock 拒否の捕捉は未実装。主経路失敗時のカーネル監査フォールバック〔#840 `KernelAuditFallback`〕は実装済み・本番経路への配線は未実装）
+//!   カーネル監査〕・ワークロードプロセスが受けた Landlock 拒否の捕捉は未実装。主経路失敗時のカーネル監査フォールバック〔#840 `KernelAuditFallback`〕と両者を束ねる本番 sink〔#1594 `FileAuditSink`〕は実装済み・supervisor の exec への構築入口あり・その他の本番経路への配線は未実装）
 //! - `capabilities`: capability 集合の型 `Capability`・`CapabilitySet`・OCI 既定集合（SEC-1・
 //!   TASK-37.1）。OS 非依存で syscall を持たない。適用関数 `apply_default_capabilities` は
 //!   `exec/capabilities.rs`（Linux 限定）に置く: 段の型 `ExecError` の非公開コンストラクタと
@@ -68,7 +68,7 @@
 //!   発見・登録は未実装
 //! - `plugin_discovery`: 管理ディレクトリ（system / user）からの plugin 候補探索（TASK-109.1・PLUG-4・PLUG-11）と `PATH` 探索の opt-in・警告ログ（TASK-109.2）、同名重複を解決する候補レジストリ（TASK-109.3。登録は未検証）は実装済み・OS 非依存。
 //!   候補は未検証。opt-in の CLI フラグ配線（TASK-79）・信頼性検証（TASK-122）は未実装
-//! - `plugin_trust`: plugin 候補の所有者・モード・symlink 実体解決・sha256 許可済みハッシュ検証・検証方式の切替点（TASK-122.1〜122.4・PLUG-11。既定はハッシュ一覧、署名検証は未実装で指定時は拒否）。fd 経由の fstat・ハッシュ計算で判定し検証済み fd を返す。非 Linux は常に拒否。拒否の構造化エラー（code / reason / message）と `PluginTrust` 監査レコード化は TASK-122.5 で実装済み。レジストリ・本番 sink への配線は未実装
+//! - `plugin_trust`: plugin 候補の所有者・モード・symlink 実体解決・sha256 許可済みハッシュ検証・検証方式の切替点（TASK-122.1〜122.4・PLUG-11。既定はハッシュ一覧、署名検証は未実装で指定時は拒否）。fd 経由の fstat・ハッシュ計算で判定し検証済み fd を返す。非 Linux は常に拒否。拒否の構造化エラー（code / reason / message）と `PluginTrust` 監査レコード化は TASK-122.5 で実装済み。レジストリ・本番 sink（実装済み `FileAuditSink`）への配線は未実装
 //!
 //! # プラットフォーム対応（TASK-27.5・CORE-1）
 //!

@@ -9,7 +9,7 @@
 //! # 呼び出し元・契約
 //!
 //! - 各レイヤーのフック（seccomp / Landlock / マウント。TASK-41.2〜41.4）が組み立てた [`AuditRecord`] を
-//!   supervisor / CLI の配線が [`write_with_fallback`] へ渡す想定（配線と `AuditSink` への適合は後続）
+//!   supervisor / CLI の配線が [`write_with_fallback`] へ渡す想定（`AuditSink` への適合は `FileAuditSink`〔#1594〕で実装済み）
 //! - [`encode_json_line`] はワイヤースキーマの単一の定義点。#840・#652（TASK-98.1・ERR-4 の共通ログ型）が再利用する
 //! - 全キー常在の固定スキーマ。値が無いものは `null`。`path` は lossy UTF-8 で、制御文字・改行・NUL は
 //!   JSON エスケープされる（ログ注入対策: 生の LF は行末の 1 個だけ）
@@ -507,8 +507,8 @@ pub enum AuditWriteOutcome {
 ///   [`Self::fallback`] で保持する
 /// - 記録の成否で分離違反の拒否判定を覆さない（fail-closed。`AuditSink` の契約と同じ）。拒否は維持したまま、
 ///   記録が欠落した事実だけを呼び出し側へ返す
-/// - 黙って捨てない。呼び出し側（supervisor / CLI の配線。後続）は [`Self::write_json_line`] の固定スキーマ
-///   1 行を stderr へ出力する責務を持つ（レコード内容・パス・errno は含まない）
+/// - 黙って捨てない。通知の責務は `FileAuditSink`（#1594）が持ち、[`Self::write_json_line`] の固定スキーマ
+///   1 行を stderr へ 1 回出力する（レコード内容・パス・errno は含まない）
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct AuditWriteFailure {
@@ -517,6 +517,12 @@ pub struct AuditWriteFailure {
 }
 
 impl AuditWriteFailure {
+    /// 主経路の open 自体が失敗し、代替経路も失敗した場合など、crate 内で両エラーから組み立てる
+    /// （`FileAuditSink`。#1594）。
+    pub(crate) fn new(primary: AuditWriteError, fallback: AuditWriteError) -> Self {
+        Self { primary, fallback }
+    }
+
     /// 主経路のエラー。
     pub fn primary(&self) -> &AuditWriteError {
         &self.primary

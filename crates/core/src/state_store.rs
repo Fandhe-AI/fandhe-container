@@ -14,6 +14,7 @@
 //!                         $XDG_RUNTIME_DIR/fandhe-container（未設定なら fail-closed）
 //! ├── @lock               ストア全体の排他用ロックファイル
 //! ├── @revision           次に払い出す revision（10 進 ASCII）
+//! ├── @audit.log          監査ログ（`FileAuditSink` が追記。TASK-163 追補・#1594。open 後にのみ作られる）
 //! └── <id>/state.json     ContainerId をそのままパス要素に使う
 //! ```
 //!
@@ -342,6 +343,11 @@ impl FileStateStore {
             root,
             process_lock: Mutex::new(LockedState::default()),
         })
+    }
+
+    /// `open` が検査・正規化した状態ルート（`FileAuditSink::in_state_store` 専用。#1594）。
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
     }
 
     fn lock(&self) -> Result<StoreGuard<'_>, TraitError> {

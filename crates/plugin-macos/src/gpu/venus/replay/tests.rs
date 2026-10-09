@@ -391,11 +391,12 @@ fn c1_rejects_symlink() {
 #[test]
 fn c1_rejects_fifo_without_blocking() {
     let p = tmp_path("fifo");
-    let made = std::process::Command::new("mkfifo").arg(&p).status();
-    if !matches!(made, Ok(s) if s.success()) {
-        eprintln!("skip: mkfifo unavailable");
-        return;
-    }
+    // 前提（mkfifo の起動と成功）が満たせない環境ではテストを失敗させる（skip で成功扱いにしない）。
+    let made = std::process::Command::new("mkfifo")
+        .arg(&p)
+        .status()
+        .expect("mkfifo must be runnable to verify FIFO rejection");
+    assert!(made.success(), "mkfifo must succeed: {made:?}");
     let (tx, rx) = std::sync::mpsc::channel();
     let p2 = p.clone();
     std::thread::spawn(move || {

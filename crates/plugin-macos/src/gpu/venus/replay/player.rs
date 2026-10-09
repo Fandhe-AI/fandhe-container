@@ -101,18 +101,25 @@ pub(crate) fn read_bounded_with_limit<R: Read>(
 
 /// 記録ファイルを上限つきで読む（2 段目の入口。続けて [`validate`] に渡す）。
 ///
-/// 開く前に `symlink_metadata` で通常ファイルであることを確かめ（FIFO の open は書き手が現れるまで
-/// ブロックするため）、開いた後も fd の `metadata` で再確認し、長さを読み込み前に検証する。
-/// 残存リスク: 検査から open までの間に FIFO や symlink へ差し替えられると open がブロックしたり
-/// symlink の先を読んだりしうる（`O_NOFOLLOW | O_NONBLOCK` の `sys` ラッパーは未導入。TOCTOU を
-/// 塞いだとは主張しない）。運用者が自分で指定したパスを読む PoC の道具としての前提。
+/// 開く前に `symlink_metadata` で通常ファイルであることを確かめ、unix では `sys::open_nofollow_nonblock`
+/// （`O_NOFOLLOW | O_NONBLOCK`）で開く。検査後に FIFO へ差し替えられても open はブロックせず、symlink へ
+/// 差し替えられても `ELOOP` で失敗して `NotRegularFile` を返す。開いた後も fd の `metadata` で種別を
+/// 再確認し、長さを読み込み前に検証する（REPAIR-5）。
+/// フラグ値が未確認の OS では通常の open にフォールバックし、検査と open の間の差し替えは塞がらない。
 pub fn read_recording_file(path: &Path) -> Result<Vec<u8>, VenusReplayError> {
     let io = |e: std::io::Error| VenusReplayError::Io { kind: e.kind() };
     let before = std::fs::symlink_metadata(path).map_err(io)?;
     if !before.file_type().is_file() {
         return Err(VenusReplayError::NotRegularFile);
     }
-    let file = std::fs::File::open(path).map_err(io)?;
+    let file = match crate::sys::open_nofollow_nonblock(path) {
+        Ok(f) => f,
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(crate::sys::ELOOP) => {
+            return Err(VenusReplayError::NotRegularFile);
+        }
+        Err(e) => return Err(io(e)),
+    };
     let meta = file.metadata().map_err(io)?;
     if !meta.is_file() {
         return Err(VenusReplayError::NotRegularFile);

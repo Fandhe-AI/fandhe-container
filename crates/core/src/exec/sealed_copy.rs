@@ -22,9 +22,10 @@
 //!      （か判定できない）なら `FailedPrecondition`（[`LsmEnvironment::Refuse`]）
 //!    - SELinux が有効なら `FailedPrecondition`（元のファイルのラベルに対する `execute`・ドメイン遷移を memfd は
 //!      迂回するため、ドメインだけを根拠に通さない。[`LsmEnvironment::Refuse`]）
-//!    - Landlock は有効でも一律には拒否しない（exec の子は自前のルールセットを必ず適用するため、一律拒否は
-//!      本番の exec を成立させなくする）。起動前から継承した domain の `EXECUTE` 制限は問い合わせられず memfd
-//!      には及ばないが、残余リスクとして許容する
+//!    - Landlock 自体が有効でも一律には拒否しない（exec の子は自前のルールセットを必ず適用するため、一律拒否は
+//!      本番の exec を成立させなくする）。ただし起動前から継承した domain（呼び出し側が掛けた制限）がある、
+//!      または有無を判定できないときは `FailedPrecondition`（[`InheritedLandlock`]）。継承 domain の `EXECUTE`
+//!      制限は問い合わせられず memfd には及ばないため、保証できない環境は拒否する（fail-closed。SEC-1・CORE-5）
 //!    - 自前の Landlock ルールセットが `EXECUTE` を扱う場合、元のファイルの実パスに `EXECUTE` を与えるルールの配下になければ
 //!      `PermissionDenied`（`execveat` が元のファイルで返していた `EACCES` と同じ扱い）
 //! 1. 元のファイルの実行権限をカーネルに判定させる（`sys::access_exec_via_proc`。実行ビット・`noexec`）。
@@ -85,6 +86,21 @@ const STAGE: IsolationStage = IsolationStage::Exec;
 pub(super) struct SealPolicy {
     lsm: LsmEnvironment,
     landlock: LandlockExec,
+    inherited: InheritedLandlock,
+}
+
+/// 起動前から継承した Landlock domain の有無（#1531・SEC-1・CORE-5）。
+///
+/// 継承 domain が元のファイルの `EXECUTE` を拒否していても、memfd の `execveat` はその制限を受けない。
+/// 継承 domain の許可は問い合わせられないため、「ない」と確かめられた場合だけ複製を許す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum InheritedLandlock {
+    /// 継承した domain はない（または Landlock が無効で、自前のルールセットも適用されない）。
+    None,
+    /// 継承した domain がある。値は積まれている層数。
+    Present(u32),
+    /// 判定できなかった。値は静的な理由。
+    Unknown(&'static str),
 }
 
 /// LSM の環境の判定結果。
@@ -197,17 +213,103 @@ pub(super) fn assess_lsm_environment(input: LsmProbeInput) -> LsmEnvironment {
     }
     // Landlock はここで拒否しない。exec の子は自前の Landlock ルールセットを必ず適用してから `ExecReady` を返す
     // （SUP-6）ため、有効な環境を一律に拒否すると本番の exec が成立しない。自前ルールの `EXECUTE` は
-    // `check_landlock_execute` が元のファイルの実パスで照合する。起動前から継承した domain の `EXECUTE` は
-    // 問い合わせられず memfd には及ばないが、継承 domain は呼び出し側（ホスト側のパス階層）への制限で、
-    // コンテナの mount namespace 内のエントリポイントには元々対応しない残余リスクとして許容する（CORE-5・SEC-1）。
+    // `check_landlock_execute` が元のファイルの実パスで照合する。起動前から継承した domain の有無は
+    // `probe_inherited_landlock` が別に判定し、あれば `check_exec_policy_preserved` が拒否する（CORE-5・SEC-1）。
     LsmEnvironment::Unrestricted
 }
 
-/// ファイルを `cap` バイトまで読む（巨大ファイルの確保を避ける）。
+/// ファイルを `cap` バイトまで読む（巨大ファイルの確保を避ける）。`cap` を超えて続く場合は切り詰めず
+/// `InvalidData` で失敗させる（先頭だけを見て判定すると、後続の appraise ルール等を見落として誤って
+/// 通すため。呼び出し側は読めなかった入力を拒否に倒す。fail-closed）。
 fn read_capped(path: &str, cap: u64) -> std::io::Result<String> {
-    let mut text = String::new();
-    File::open(path)?.take(cap).read_to_string(&mut text)?;
-    Ok(text)
+    read_capped_from(File::open(path)?, cap)
+}
+
+fn read_capped_from(reader: impl std::io::Read, cap: u64) -> std::io::Result<String> {
+    let mut bytes = Vec::new();
+    reader.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).map_or(true, |n| n > cap) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "security configuration input exceeds the size limit",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.utf8_error()))
+}
+
+/// 継承 domain の判定の上限時間。
+const INHERITED_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Landlock が 1 プロセスに積める層数（`LANDLOCK_MAX_NUM_LAYERS`）。
+const LANDLOCK_MAX_LAYERS: i32 = 16;
+const PROBE_EXIT_UNAVAILABLE: i32 = 100;
+const PROBE_EXIT_FAILED: i32 = 101;
+
+/// 使い捨ての子で Landlock の層を上限まで積み、積めた数から継承 domain の有無を判定する。
+///
+/// 層数の上限は 16 で、`landlock_restrict_self` は超えると `E2BIG` になる。何も継承していなければ 16 層積め、
+/// 継承していれば（上限 − 継承層数）しか積めない。`EXECUTE` を扱うだけの空ルールセットで積むため、親の状態は
+/// 変えない（子は `_exit` する）。`setns` の前に、単一スレッドの exec 専用プロセスから呼ぶこと。
+fn probe_inherited_landlock() -> InheritedLandlock {
+    let child = || -> i32 {
+        let ruleset = match sys::landlock_create_ruleset_fs(AccessFs::EXECUTE.bits()) {
+            Ok(fd) => fd,
+            Err(SysError::Unsupported) => return PROBE_EXIT_UNAVAILABLE,
+            Err(SysError::Os(e)) if e == sys::ENOSYS || e == sys::EOPNOTSUPP => {
+                return PROBE_EXIT_UNAVAILABLE;
+            }
+            Err(_) => return PROBE_EXIT_FAILED,
+        };
+        if sys::set_no_new_privs().is_err() {
+            return PROBE_EXIT_FAILED;
+        }
+        let mut stacked = 0;
+        // 上限 + 1 回目の失敗（E2BIG）まで試す。
+        for _ in 0..=LANDLOCK_MAX_LAYERS {
+            match sys::landlock_restrict_self(ruleset.as_fd()) {
+                Ok(()) => stacked += 1,
+                Err(SysError::Os(e)) if e == sys::E2BIG => return stacked,
+                Err(_) => return PROBE_EXIT_FAILED,
+            }
+        }
+        PROBE_EXIT_FAILED
+    };
+    let Ok(pid) = sys::fork_single_threaded(child, PROBE_EXIT_FAILED) else {
+        return InheritedLandlock::Unknown("the inherited Landlock domain could not be probed");
+    };
+    let deadline = std::time::Instant::now() + INHERITED_PROBE_TIMEOUT;
+    loop {
+        match sys::wait_pid_nohang(pid) {
+            Ok(Some(status)) => return classify_probe_status(status),
+            Ok(None) => {}
+            Err(SysError::Os(e)) if e == sys::EINTR => {}
+            Err(_) => {
+                return InheritedLandlock::Unknown("waiting for the Landlock probe failed");
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            // 子は自分の層を積むだけの使い捨て。固まったら止めて回収し、判定不能として拒否に倒す。
+            let _ = sys::kill_pid(pid, sys::Signal::Kill);
+            let _ = sys::wait_pid_nohang(pid);
+            return InheritedLandlock::Unknown("the Landlock probe timed out");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// 使い捨ての子の wait status から継承 domain の有無を決める（純関数）。
+fn classify_probe_status(status: i32) -> InheritedLandlock {
+    if status & 0x7f != 0 {
+        return InheritedLandlock::Unknown("the Landlock probe was killed by a signal");
+    }
+    match (status >> 8) & 0xff {
+        PROBE_EXIT_UNAVAILABLE => InheritedLandlock::None,
+        n if n == LANDLOCK_MAX_LAYERS => InheritedLandlock::None,
+        n if (0..LANDLOCK_MAX_LAYERS).contains(&n) => {
+            InheritedLandlock::Present(u32::try_from(LANDLOCK_MAX_LAYERS - n).unwrap_or(u32::MAX))
+        }
+        _ => InheritedLandlock::Unknown("the Landlock probe failed"),
+    }
 }
 
 impl SealPolicy {
@@ -221,13 +323,25 @@ impl SealPolicy {
         Self {
             lsm,
             landlock: LandlockExec::from_ruleset(ruleset),
+            inherited: probe_inherited_landlock(),
         }
     }
 
     /// 判定材料を直接指定する。
     #[cfg(any(test, feature = "exec-test-support"))]
     pub(super) fn new(lsm: LsmEnvironment, landlock: LandlockExec) -> Self {
-        Self { lsm, landlock }
+        Self {
+            lsm,
+            landlock,
+            inherited: InheritedLandlock::None,
+        }
+    }
+
+    /// 継承 domain の判定結果を差し替える。
+    #[cfg(test)]
+    pub(super) fn with_inherited(mut self, inherited: InheritedLandlock) -> Self {
+        self.inherited = inherited;
+        self
     }
 
     /// 制約なし（`execveat` を行わない観測・単体テスト専用。本番の入口は [`SealPolicy::probe`] だけ）。
@@ -330,6 +444,27 @@ fn check_exec_policy_preserved(
                 ErrorCode::FailedPrecondition,
                 STAGE,
                 format!("refusing to run {subject:?} from a sealed copy: {reason}"),
+            ));
+        }
+    }
+    match policy.inherited {
+        InheritedLandlock::None => {}
+        InheritedLandlock::Present(layers) => {
+            return Err(ExecError::new(
+                ErrorCode::FailedPrecondition,
+                STAGE,
+                format!(
+                    "refusing to run {subject:?} from a sealed copy: {layers} inherited Landlock layer(s) may deny EXECUTE for the original file, which a sealed copy would bypass"
+                ),
+            ));
+        }
+        InheritedLandlock::Unknown(reason) => {
+            return Err(ExecError::new(
+                ErrorCode::FailedPrecondition,
+                STAGE,
+                format!(
+                    "refusing to run {subject:?} from a sealed copy: {reason}; an inherited Landlock EXECUTE restriction cannot be ruled out"
+                ),
             ));
         }
     }
@@ -617,6 +752,85 @@ mod tests {
         .expect_err("refused");
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
         assert_eq!(violation_of(&err), None);
+    }
+
+    /// SEC-1・CORE-5・#1531: 上限を超えて続く入力は切り詰めず失敗させる（先頭だけで判定して後続の appraise
+    /// ルールを見落とさない）。上限ちょうどは読める。
+    #[test]
+    fn sec1_core5_read_capped_rejects_input_over_the_cap() {
+        assert_eq!(read_capped_from(&b"abcd"[..], 4).expect("at cap"), "abcd");
+        let err = read_capped_from(&b"abcde"[..], 4).expect_err("over cap");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        // 先頭が上限内でも、後続に appraise があれば読めない = 拒否に倒れる。
+        let mut policy = b"measure func=BPRM_CHECK\n".to_vec();
+        policy.resize(1024, b' ');
+        policy.extend_from_slice(b"appraise func=BPRM_CHECK\n");
+        assert!(read_capped_from(&policy[..], 1024).is_err());
+        let refused = assess_lsm_environment(LsmProbeInput {
+            lsm_list: Ok("capability,ima".to_owned()),
+            cmdline: Ok(String::new()),
+            ima_policy: read_capped_from(&policy[..], 1024),
+        });
+        assert!(matches!(refused, LsmEnvironment::Refuse(_)), "{refused:?}");
+    }
+
+    /// SEC-1・CORE-5・#1531: 使い捨ての子の終了コードから継承 domain の有無を具体値で決める。
+    #[test]
+    fn sec1_core5_inherited_landlock_probe_status_classification() {
+        let exited = |code: i32| code << 8;
+        assert_eq!(classify_probe_status(exited(16)), InheritedLandlock::None);
+        assert_eq!(classify_probe_status(exited(100)), InheritedLandlock::None);
+        assert_eq!(
+            classify_probe_status(exited(15)),
+            InheritedLandlock::Present(1)
+        );
+        assert_eq!(
+            classify_probe_status(exited(0)),
+            InheritedLandlock::Present(16)
+        );
+        assert!(matches!(
+            classify_probe_status(exited(101)),
+            InheritedLandlock::Unknown(_)
+        ));
+        assert!(matches!(
+            classify_probe_status(9),
+            InheritedLandlock::Unknown(_)
+        ));
+    }
+
+    /// SEC-1・CORE-5・#1531: 継承 domain がある・判定できないときは、複製の手順に入らず `FailedPrecondition`
+    /// （違反にしない）で拒否する。ないと確かめられたときは通る。
+    #[test]
+    fn sec1_core5_inherited_landlock_refuses_the_copy_unless_ruled_out() {
+        let scratch = Scratch::new("inherited");
+        let file = scratch.file("script", b"#!/bin/sh\n", 0o755);
+        let procfs = procfs();
+        for inherited in [
+            InheritedLandlock::Present(1),
+            InheritedLandlock::Unknown("test"),
+        ] {
+            let policy = SealPolicy::unrestricted().with_inherited(inherited);
+            let err = seal_copy_bounded(
+                &file,
+                10,
+                MAX_SEALED_COPY_BYTES,
+                procfs.as_fd(),
+                Path::new("/script"),
+                &policy,
+            )
+            .expect_err("inherited domain");
+            assert_eq!(err.code, ErrorCode::FailedPrecondition, "{inherited:?}");
+            assert_eq!(violation_of(&err), None);
+        }
+        let ok = seal_copy_bounded(
+            &file,
+            10,
+            MAX_SEALED_COPY_BYTES,
+            procfs.as_fd(),
+            Path::new("/script"),
+            &SealPolicy::unrestricted().with_inherited(InheritedLandlock::None),
+        );
+        assert_eq!(ok.expect("no inherited domain").1.len(), 10);
     }
 
     /// 試験ごとの作業ディレクトリ（pid とラベルで一意。drop で削除）。

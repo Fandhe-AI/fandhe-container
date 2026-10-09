@@ -125,8 +125,9 @@
 //!   （AppArmor・TOMOYO・Smack・BPF LSM・IPE）が有効なら `FailedPrecondition`、IMA は appraisal が有効か無効と
 //!   判定できないとき `FailedPrecondition`、SELinux が有効なら（ドメインを根拠に通さず）
 //!   `FailedPrecondition`。Landlock は有効でも一律には拒否しない（exec の子は自前のルールセットを必ず適用するため、
-//!   一律拒否は本番の exec を成立させない。起動前から継承した domain の `EXECUTE` 制限は問い合わせられず memfd
-//!   には及ばないが、残余リスクとして許容する）。exec 用ルールセットが `EXECUTE` を扱う場合は元のファイルの実パスが
+//!   一律拒否は本番の exec を成立させない）。ただし起動前から継承した domain の `EXECUTE` 制限は問い合わせられず
+//!   memfd には及ばないため、使い捨ての子で Landlock の層を上限（16）まで積めるかで継承 domain の有無を判定し、
+//!   ある・判定できないなら `FailedPrecondition` で拒否する（fail-closed。`InheritedLandlock`）。exec 用ルールセットが `EXECUTE` を扱う場合は元のファイルの実パスが
 //!   `EXECUTE` を与えるルールの配下になければ `PermissionDenied`。**帰結**: AppArmor・SELinux のいずれかを
 //!   有効にしたホスト（Ubuntu・Fedora の既定等）では、稼働中コンテナへの exec は封印した複製を使えず拒否される
 //!   （照合だけの方式 A へは戻さない）。この環境での採否は所有者の判断事項。実行ビットと `noexec` は `faccessat2` で再現する。

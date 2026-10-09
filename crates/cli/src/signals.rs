@@ -25,8 +25,11 @@
 //!   以外。例: musl の Linux、riscv64 の Linux、FreeBSD）では登録が失敗し、`main` は構造化エラー（`INTERNAL`）で
 //!   起動を拒否する（fail-closed。転送なしで継続する方針は採らない）。対象は 3 OS 一級対応の範囲外。
 //! - プロセス全体の設定のため、バイナリから 1 回だけ呼ぶこと。
-//! - SIGKILL・`panic = abort` では転送されない。Linux は #1514（`PR_SET_PDEATHSIG`）で補う予定、
-//!   macOS は plugin が残留し得る、Windows は対象外（モジュールごと `cfg(unix)`）。
+//! - 転送先は plugin のプロセスグループ（plugin は独立したグループの先頭として起動される。#1311）で、
+//!   plugin が起動した孫まで届く。
+//! - SIGKILL・`panic = abort` では転送されない。Linux は #1514（`PR_SET_PDEATHSIG`）で plugin 本体だけが止まり
+//!   孫は残留し得る。macOS は plugin 本体も孫も残留し得る（kqueue `NOTE_EXIT` による監視は将来課題。
+//!   #1403 判断 3）。Windows は対象外（モジュールごと `cfg(unix)`）。
 
 use crate::error::CliError;
 use crate::sys;

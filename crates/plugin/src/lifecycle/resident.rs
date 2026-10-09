@@ -19,7 +19,10 @@
 //!   プロセスの終了として同様に `Unavailable` とする。
 //! - 失敗した接続は再利用しない。往復が失敗した時点で接続を閉じ、子を kill・回収してセッションを終了
 //!   状態にする。以後の [`ResidentPlugin::call`] は I/O せず `FailedPrecondition`。回収を確認できない
-//!   場合は `Internal`（pid つき）を返し、その子は以後回収しない（都度起動モードと同じ契約）。
+//!   場合は `Internal`（pid つき）を返し、その子は以後回収しない（都度起動モードと同じ契約）。子は回収
+//!   できたがプロセスグループを停止できなかった場合は、元のエラーの code を保ち message に
+//!   `process group could not be killed` の付記（pid なし）を加えて返し、状態は
+//!   [`ResidentState::GroupKillFailed`] になる（shutdown は未回収とは別の `Internal` を返す）。
 //! - 子の環境は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ。stdin / stdout は null、stderr は
 //!   セッション全期間で 1 本の読み取りスレッドが上限つきで収集し、[`ResidentPlugin::shutdown`] の結果
 //!   （失敗時も [`ResidentShutdownError`] に載せる）でのみ返す（untrusted）。[`ResidentPlugin`] の破棄（panic 等を含む）でも子の kill・回収とスレッド停止を行う。
@@ -30,18 +33,24 @@
 //!   外へ渡して起動スレッドだけを先に終わらせる使い方は契約違反とする。
 //! - 応答は untrusted。フレームの長さ上限・チェックサムは transport 側で検証済みで、内容は解釈しない。
 //!
+//! # 孫プロセス（#1311）
+//!
+//! 呼び出しタイムアウト・shutdown・`Drop` の kill は子のプロセスグループ全体へ送り、孫も止める。
+//! plugin の自発終了後に先に回収した場合・グループを抜けた孫・Windows は対象外（`super` のモジュール doc を参照）。
+//!
 //! # 未実装（REPAIR-3）
 //!
 //! - core の別プロセス起動をまたいで外部管理の常駐 plugin へ再接続する経路（attach）。plugin 発見・
 //!   登録（TASK-109）と proxy（TASK-114）側の責務とする。PLUG-7 は「呼び出しごとに接続のみ行う」と
 //!   記すが、本実装は起動後に接続を保持する形である（spec 側の表現との差は PR で報告）。
 //! - 起動対象の信頼性検証（TASK-122・PLUG-11。検証から spawn までの
-//!   差し替え〔TOCTOU〕も本タスクでは解決しない）、孫プロセスの回収、要求 ID と応答 ID の対応づけ（TASK-114）。
+//!   差し替え〔TOCTOU〕も本タスクでは解決しない）、要求 ID と応答 ID の対応づけ（TASK-114）。
 
 use super::{
     ChildGuard, ONE_SHOT_EXIT_TIMEOUT, ONE_SHOT_STDERR_DRAIN_TIMEOUT, OneShotPlugin, OneShotStderr,
     OneShotTermination, PLUGIN_SOCKET_ENV, Reap, StderrCapture, bind_to_parent_lifetime,
-    classify_reaped, rpc_timeout, spawn_registered, stderr_channel, unreaped_error,
+    classify_reaped, group_kill_failed_error, rpc_timeout, spawn_registered, stderr_channel,
+    unreaped_error, with_group_kill_failure,
 };
 use crate::error::{PluginError, PluginErrorCode};
 use crate::frame::Frame;
@@ -113,6 +122,10 @@ pub enum ResidentState {
     Killed,
     /// 強制終了を試みたが回収を確認できなかった（孤児の可能性。pid はエラーで報告済み）。
     Unreaped,
+    /// 直接の子は回収済み（pid は解放済みで報告しない）だが、子のプロセスグループ宛ての kill が失敗し、
+    /// 孫プロセスの停止を保証できない（#1311・PLUG-7・REPAIR-5）。未回収の子（[`Self::Unreaped`]）とは
+    /// 別の状態で、[`ResidentPlugin::shutdown`] も後始末の失敗（`Internal`）を返す。
+    GroupKillFailed,
 }
 
 /// [`ResidentPlugin::shutdown`] の結果。
@@ -406,7 +419,7 @@ impl ResidentPlugin {
         match self.guard.try_wait() {
             Ok(None) => {}
             Ok(Some(status)) => {
-                self.guard.child = None;
+                self.guard.release_reaped();
                 self.stream = None;
                 let code = status.code();
                 self.state = ResidentState::Exited { code };
@@ -462,7 +475,7 @@ impl ResidentPlugin {
         loop {
             match self.guard.try_wait() {
                 Ok(Some(status)) => {
-                    self.guard.child = None;
+                    self.guard.release_reaped();
                     let code = status.code();
                     self.state = ResidentState::Exited { code };
                     // 終了コード 0 の後始末（EOF を受けた正常終了）は通信失敗の原因ではないため、
@@ -500,6 +513,13 @@ impl ResidentPlugin {
                 self.state = ResidentState::Killed;
                 original
             }
+            // 直接の子は回収済み（pid は解放済みで報告しない）だが、孫の停止を保証できない。
+            // 元のエラーの code を保ち、孫が残り得ることを付記する。状態は未回収の子（`Unreaped`）と区別して
+            // `GroupKillFailed` にし、shutdown でも同じ種類の失敗を報告する（#1311・PLUG-7・REPAIR-5）。
+            Reap::GroupKillFailed => {
+                self.state = ResidentState::GroupKillFailed;
+                with_group_kill_failure(original, "a failed call")
+            }
             // 他所で回収された（ECHILD 等。#1513）。終了状態が失われたため終了コード不明の終了として扱う。
             Reap::Lost => {
                 self.state = ResidentState::Exited { code: None };
@@ -515,7 +535,8 @@ impl ResidentPlugin {
     /// セッションを終了させる。接続を閉じて EOF を見せ、[`ONE_SHOT_EXIT_TIMEOUT`] まで自発終了を待ち、
     /// 超過で強制終了・回収する。既に終了済みのセッションでは、その終了状況をそのまま使う。
     ///
-    /// 自発終了が非ゼロ・取得不能なら `Unavailable`、回収を確認できなければ `Internal`（pid つき）を
+    /// 自発終了が非ゼロ・取得不能なら `Unavailable`、回収を確認できなければ `Internal`（pid つき）、子は
+    /// 回収できたがプロセスグループを停止できなければ `Internal`（pid なし。未回収とは別のメッセージ）を
     /// [`ResidentShutdownError`] で返す。いずれの経路でも、エラーを返す前に stderr の収集結果を
     /// 期限つき（[`ONE_SHOT_STDERR_DRAIN_TIMEOUT`]）で受け取って読み取りスレッドの停止を確認し、
     /// 診断情報（クラッシュ時の plugin の stderr 等）を [`ResidentShutdownError::stderr`] で渡す。
@@ -526,11 +547,16 @@ impl ResidentPlugin {
             ResidentState::Exited { code } => OneShotTermination::Exited { code },
             ResidentState::Killed => OneShotTermination::Killed,
             ResidentState::Unreaped => OneShotTermination::Unreaped,
+            ResidentState::GroupKillFailed => OneShotTermination::GroupKillFailed,
         };
         // 失敗の判定を先に済ませ（報告済みの印は `unreaped_error` が付ける）、stderr は必ず回収する。
         let failure = if termination == OneShotTermination::Unreaped {
             self.state = ResidentState::Unreaped;
             Some(unreaped_error(&mut self.guard, "shutdown"))
+        } else if termination == OneShotTermination::GroupKillFailed {
+            // 直接の子は回収済みのため未回収としては報告しない（pid も報告済みの印も付けない）。
+            self.state = ResidentState::GroupKillFailed;
+            Some(group_kill_failed_error("shutdown"))
         } else if let OneShotTermination::Exited { code } = termination
             && code != Some(0)
         {
@@ -562,11 +588,14 @@ fn not_running_error() -> PluginError {
 }
 
 /// 起動失敗経路で子を kill・回収する。回収を確認できなければ元のエラーに代えて `Internal`。
+/// プロセスグループの停止失敗は元のエラーの code を保って付記する（`super::reap_after_failure` と同じ。
+/// macOS のゾンビだけのグループの `EPERM` もその doc を参照）。
 fn reap_after_failure(guard: &mut ChildGuard, error: PluginError) -> PluginError {
-    if guard.kill_and_reap().is_reaped() {
-        error
-    } else {
-        unreaped_error(guard, "a failed start")
+    match guard.kill_and_reap() {
+        // 他所で回収された（`Lost`。#1513）子は自プロセスの子として残っていないため、元のエラーを返す。
+        Reap::Reaped(_) | Reap::AlreadyReaped | Reap::Lost => error,
+        Reap::GroupKillFailed => with_group_kill_failure(error, "a failed start"),
+        Reap::Unreaped => unreaped_error(guard, "a failed start"),
     }
 }
 
@@ -647,6 +676,58 @@ mod tests {
         assert_eq!(
             exited_error(None).message(),
             "resident plugin process exited unexpectedly without an exit code"
+        );
+    }
+
+    /// #1311・PLUG-7・REPAIR-5: グループ停止に失敗したセッションの shutdown は、回収済みの子を
+    /// 「回収できなかった」と報告せず、グループ停止の失敗として報告する（pid を含めない）。
+    #[test]
+    fn plug7_resident_shutdown_reports_group_kill_failure_not_unreaped() {
+        // 子は回収済みで手放した状態（`fail_session` が `Reap::GroupKillFailed` を受けた後と同じ）。
+        let session = ResidentPlugin {
+            stream: None,
+            guard: ChildGuard {
+                child: None,
+                reported_unreaped: false,
+                leader_reaped: true,
+                lost: false,
+                slot: None,
+            },
+            capture: None,
+            state: ResidentState::GroupKillFailed,
+        };
+        assert_eq!(session.pid(), None);
+        let failure = session.shutdown().unwrap_err();
+        assert_eq!(failure.error().code(), PluginErrorCode::Internal);
+        assert_eq!(
+            failure.error().message(),
+            "plugin process group could not be killed after shutdown; \
+             the direct child was reaped but descendant processes may remain"
+        );
+        assert_eq!(failure.stderr(), &OneShotStderr::empty());
+    }
+
+    /// PLUG-7・REPAIR-5: 未回収（`Unreaped`）状態のセッションの shutdown は、従来どおり未回収として報告する
+    /// （グループ停止の失敗と取り違えない）。
+    #[test]
+    fn plug7_resident_shutdown_keeps_unreaped_report_distinct() {
+        let session = ResidentPlugin {
+            stream: None,
+            guard: ChildGuard {
+                child: None,
+                reported_unreaped: false,
+                leader_reaped: true,
+                lost: false,
+                slot: None,
+            },
+            capture: None,
+            state: ResidentState::Unreaped,
+        };
+        let failure = session.shutdown().unwrap_err();
+        assert_eq!(failure.error().code(), PluginErrorCode::Internal);
+        assert_eq!(
+            failure.error().message(),
+            "plugin process could not be reaped after shutdown"
         );
     }
 

@@ -8,8 +8,10 @@
 //! vhost-user のメッセージ codec は実装済み（`vhost_user`。F1.1・#1516）。fd の受け渡し（`SCM_RIGHTS`）と
 //! ゲストメモリの mmap の安全なラッパーも実装済み（Linux 限定。F1.2・#1517）。`unsafe` は `sys` モジュール（#1517 の個別承認 U1〜U10）にだけ置く。
 //!
+//! split virtqueue（記述子チェーンの走査と used への書き戻し。F1.3・#1518）は `virtqueue` に実装済み（トランスポートに依存しない）。
+//!
 //! 未実装（実装済みを装わない。REPAIR-3）: トランスポートのヘッダ単位のソケット I/O の枠組み（F1.4）、
-//! virtqueue（F1.3・#1518）、セッション状態と応答ループ（F1.4・#1519）、上記以外の ctrl 応答（F2 の残り。未対応は `ERR_UNSPEC`）、
+//! セッション状態と応答ループ（F1.4・#1519）、上記以外の ctrl 応答（F2 の残り。未対応は `ERR_UNSPEC`）、
 //! 実機での疎通（F3・#725）。
 
 // unsafe の配置制約（#1517 の個別承認の条件）: crate 全体で unsafe を禁止し、syscall の薄いラッパーを置く `sys`
@@ -21,6 +23,7 @@ pub mod ctrl;
 pub mod device;
 pub mod log;
 pub mod vhost_user;
+pub mod virtqueue;
 
 /// syscall の薄いラッパー。`unsafe` はここにだけ置く（Linux 限定）。
 // 理由: `sys` は #1517 の個別承認 U1〜U10 の unsafe（syscall・fd 所有・mmap・境界検査後のコピー）を持つ唯一の

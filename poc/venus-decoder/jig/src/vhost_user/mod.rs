@@ -6,8 +6,8 @@
 //!
 //! fd（`SCM_RIGHTS`）の送受信と共有メモリの mmap は `fd_passing` / `guest_memory`（Linux 限定。F1.2・#1517）が担当する。
 //!
-//! 範囲外（実装済みを装わない。REPAIR-3）: ヘッダ単位のソケット読み書きの枠組み（F1.4）、virtqueue と値の意味の検証
-//! （アラインメント・index の範囲。F1.3・#1518）、セッション状態とネゴシエーション済み feature の照合（F1.4）。
+//! 範囲外（実装済みを装わない。REPAIR-3）: ヘッダ単位のソケット読み書きの枠組み（F1.4）、セッション状態とネゴシエーション済み feature の照合（F1.4）。
+//! virtqueue と vring アドレスの値の意味の検証（アラインメント・log ビット）は `crate::virtqueue`（F1.3・#1518）が実装済み。
 //! ここで検査するのはワイヤー上の予約ビット・長さ・個数の上限だけ。
 //!
 //! 入力は frontend 由来の untrusted。検査順は固定で、復号は 12 バイト未満（`SHORT_HEADER`）、version（`UNSUPPORTED_VERSION`）、

@@ -178,6 +178,19 @@ mod linux {
         Arc::new(|_, _| AuditFileWriter::open(Path::new("relative/audit.log")).map(|_| ()))
     }
 
+    /// 出し直しのスレッドを join した後、`/proc/self/status` の `Threads:` が 1 に戻るまで待つ（join の完了
+    /// からスレッドの解放までの短い間は 2 と読める）。戻らなければ失敗する。
+    fn wait_single_threaded() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while threads() != 1 {
+            assert!(
+                Instant::now() < deadline,
+                "a notifier thread was left behind"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// 未回収の子が 0 件になるまで待つ（解放した子は EOF で終了する）。
     fn wait_unreaped_cleared() {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -365,7 +378,7 @@ mod linux {
             std::fs::read_to_string(&notice).unwrap(),
             UNAVAILABLE_NOTICE
         );
-        assert_eq!(threads(), 1);
+        wait_single_threaded();
         drop(release);
         wait_unreaped_cleared();
         // fork が再開し、主経路が子で書く（代替経路へは回らない）。
@@ -397,7 +410,7 @@ mod linux {
             vec![AuditWriteErrorKind::RelativePath]
         );
         assert_eq!(std::fs::read_to_string(&notice).unwrap(), RELATIVE_NOTICE);
-        assert_eq!(threads(), 1);
+        wait_single_threaded();
         let _ = std::fs::remove_file(&notice);
     }
 

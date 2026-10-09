@@ -1224,7 +1224,9 @@ mod tests {
     /// SEC-1（#1531）: 実行ビットのないファイルは複製の前に拒否する（memfd は元の mode を引き継がないため、
     /// 照合しないと実行できてしまう）。Linux 6.14 以降（`AT_EXECVE_CHECK` が判定する）では `PermissionDenied`、
     /// 6.14 未満では必須の判定ができないため `FailedPrecondition`。どちらも違反にはしない。0755 のファイルは 6.14 以降で
-    /// 通り、6.14 未満では同じく `FailedPrecondition`（判定できないまま複製しない）。
+    /// 通り、6.14 未満では同じく `FailedPrecondition`（判定できないまま複製しない）。本試験は封印した複製の手順を直接
+    /// 呼ぶ。本番は 6.14 未満なら事前の判定（`decide_entrypoint_mode`）が現行方式を選び（理由 `kernel_too_old`）、
+    /// 元の fd の `execveat` が実行ビットのないファイルを拒否するため、この手順には来ない。
     #[test]
     fn sec1_task163_kernel_exec_check_gates_the_copy() {
         let scratch = Scratch::new("exec-check");
@@ -1254,8 +1256,9 @@ mod tests {
     ///
     /// Landlock の適用は呼び出したスレッドだけに効き不可逆なため、専用のスレッドを作って適用し、試験の後に捨てる
     /// （`NO_NEW_PRIVS` もスレッド単位）。Linux 6.14 未満（`/proc/sys/kernel/osrelease`）では `AT_EXECVE_CHECK` が
-    /// 無く、必須の判定では両方とも `FailedPrecondition` になる（Landlock は適用しない）。6.14 以降で Landlock を
-    /// 使えない環境は skip せず失敗する。
+    /// 無く、封印した複製の手順を必須の方針で直接呼ぶ本試験では両方とも `FailedPrecondition` になる（Landlock は
+    /// 適用しない。本番は事前の判定で現行方式になり、元の fd の `execveat` がカーネルの規則のまま `EXECUTE` を判定する）。
+    /// 6.14 以降で Landlock を使えない環境は skip せず失敗する。
     #[test]
     fn sec1_core5_landlock_execute_denial_survives_the_copy() {
         let scratch = Scratch::new("landlock");

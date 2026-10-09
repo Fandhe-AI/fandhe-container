@@ -510,9 +510,11 @@ mod linux {
         );
         assert_eq!(observation.report, None);
         // 実行ビットのないスクリプト: 複製（memfd は実行可能）に写すと実行できてしまうため、複製の前に
-        // `AT_EXECVE_CHECK`（Linux 6.14+）で拒否する。観測の入口は 6.14 未満では判定を省く（本番は 6.14 未満なら
-        // 複製せず拒否する。core の単体テスト `sec1_task163_kernel_exec_check_gates_the_copy` が照合する）ため、
-        // 結果はカーネル版で分かれる。どちらの分岐も具体値で照合する。
+        // `AT_EXECVE_CHECK`（Linux 6.14+）で拒否する。観測の入口は 6.14 未満では判定を省くため、結果はカーネル版で
+        // 分かれる。どちらの分岐も具体値で照合する（本番は 6.14 未満なら事前の判定が封印した複製を選ばず、理由
+        // `kernel_too_old` を記録して現行方式で元の fd を実行するため、実行ビットのないファイルは通常の `execveat` が
+        // 拒否する。封印した複製の手順を必須の方針で直接呼んだ場合は core の単体テスト
+        // `sec1_task163_kernel_exec_check_gates_the_copy` が照合する）。
         let plain = work.join("not-executable");
         write_script(&plain, "#!/bin/sh\nexit 0\n");
         fs::set_permissions(&plain, fs::Permissions::from_mode(0o644)).expect("chmod 0644");

@@ -1036,7 +1036,7 @@ const EXEC_STATUS_MAX: usize = 256;
 /// 違反記録の対象外とする子の失敗（状態には `-` を書くか、何も書かずに終わる）と根拠:
 /// - 封印した複製の作成（`sealed_copy.rs`）の、`AT_EXECVE_CHECK` の拒否（`EACCES`・`EPERM`。実行ビット・Landlock の
 ///   `EXECUTE` 等）・通常ファイルでない複製元・複製中の伸縮による `PermissionDenied`、LSM の環境・`AT_EXECVE_CHECK`
-///   未対応（6.14 未満の `EINVAL`）・`fstatfs` の失敗・`memfd_create` の前提不足（`ENOSYS`・`vm.memfd_noexec=2` の
+///   未対応（封印した複製を選んだ後の 6.14 未満の `EINVAL`。本番は事前の判定で現行方式になるため通常は起きない）・`fstatfs` の失敗・`memfd_create` の前提不足（`ENOSYS`・`vm.memfd_noexec=2` の
 ///   `EACCES`・seccomp の `EPERM`）による `FailedPrecondition`: `execve` が元のファイルで返していた通常の拒否、競合、
 ///   前提不足であり、分離境界の突破試行とは断定できない。マウントの `noexec` は複製が迂回し得る境界のため違反
 ///   （`entrypoint_on_noexec_mount`）として記録する

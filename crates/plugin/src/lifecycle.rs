@@ -828,27 +828,25 @@ impl ChildGuard {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         // 書き込み失敗は無視する（`Drop`・panic の unwinding 中でも panic しない）。
-        // stderr が満杯の pipe 等でブロックしても後始末を止めないため、書き込みは別スレッドに任せ、
-        // 待つのは短い上限まで（超えたら記録を打ち切る。REPAIR-5・PLUG-7）。
+        // stderr が満杯の pipe 等でも後始末を止めないため、書き込み可を確認できたときだけ 1 回 `write` し、
+        // 書けなければ記録を捨てる（スレッドもロックも残さない。REPAIR-5・PLUG-7）。
         self.finish_on_drop(&mut |rec| {
-            let line = rec.to_json_line();
-            let (tx, rx) = std::sync::mpsc::channel::<()>();
-            let spawned = std::thread::Builder::new()
-                .name("child-guard-drop-log".into())
-                .spawn(move || {
-                    use std::io::Write;
-                    let _ = writeln!(io::stderr(), "{line}");
-                    let _ = tx.send(());
-                });
-            if spawned.is_ok() {
-                let _ = rx.recv_timeout(DROP_LOG_LIMIT);
-            }
+            let mut line = rec.to_json_line();
+            line.push('\n');
+            write_drop_log(&io::stderr(), line.as_bytes());
         });
     }
 }
 
-/// `Drop` の診断出力を待つ上限（stderr が詰まっても後始末を止めない。#1605・REPAIR-5）。
-const DROP_LOG_LIMIT: Duration = Duration::from_millis(200);
+/// `Drop` の診断 1 行を `fd` へ非ブロッキングで書く。書けなければ捨てる（#1605・REPAIR-5）。
+#[cfg(unix)]
+fn write_drop_log(fd: &impl std::os::unix::io::AsRawFd, line: &[u8]) {
+    let _ = crate::sys::write_if_ready(fd, line);
+}
+
+/// 非 unix ではブロックしない書き込み手段を持たないため診断出力を捨てる（fail-closed）。
+#[cfg(not(unix))]
+fn write_drop_log(_fd: &io::Stderr, _line: &[u8]) {}
 
 /// `EPERM` が出た間だけ短時間再送する上限（#1311・PLUG-7・REPAIR-5）。
 #[cfg(unix)]
@@ -1428,6 +1426,49 @@ mod tests {
         guard.finish_on_drop(&mut |rec| lines.push(rec.to_json_line()));
         assert!(lines.is_empty());
         assert_eq!(guard.pid(), None);
+    }
+
+    /// REPAIR-5・PLUG-7・#1605: 満杯の fd でも診断出力が期限内に戻る。
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn repair4_drop_log_does_not_block_on_full_fd_and_leaves_no_thread() {
+        // 満杯のソケットを stderr に見立てる。書き込み可でなければ書かず即座に戻り、スレッドを作らない
+        // （#1605・REPAIR-5・PLUG-7）。
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        let (a, _b) = UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        let chunk = [0u8; 4096];
+        loop {
+            match (&a).write(&chunk) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("fill failed: {e}"),
+            }
+        }
+        // 非ブロッキングに戻さない（ブロッキング fd なら無条件 write は永久に止まる状況）。
+        a.set_nonblocking(false).unwrap();
+        let start = Instant::now();
+        let r = crate::sys::write_if_ready(&a, GROUP_KILL_FAILED_LINE.as_bytes());
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        // `Drop` 経路の入口も同様に期限内に戻る。
+        let start = Instant::now();
+        write_drop_log(&a, GROUP_KILL_FAILED_LINE.as_bytes());
+        assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn repair4_drop_log_writes_line_when_fd_ready() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let line = b"{\"event\":\"x\"}\n";
+        assert_eq!(crate::sys::write_if_ready(&a, line).unwrap(), line.len());
+        let mut got = vec![0u8; line.len()];
+        b.read_exact(&mut got).unwrap();
+        assert_eq!(got, line);
     }
 
     /// REPAIR-4・#1605: `Reap` から記録への写像と JSON 行の全文。

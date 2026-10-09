@@ -53,7 +53,8 @@ impl CliError {
     pub fn new(code: ErrorCode, message: impl AsRef<str>) -> Self {
         Self {
             code,
-            message: sanitize_display_bounded(message.as_ref(), CLI_ERROR_MESSAGE_MAX_BYTES),
+            message: sanitize_display_bounded(message.as_ref(), CLI_ERROR_MESSAGE_MAX_BYTES)
+                .into_string(),
         }
     }
 

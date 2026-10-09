@@ -142,7 +142,8 @@ impl OciRuntimeError {
     pub fn new(op: LifecycleOp, code: ErrorCode, message: impl AsRef<str>) -> Self {
         // `AsRef<str>` で借用のまま受け取り、入力全体を複製しない。確保量・走査は上限で頭打ち
         // （詳細は `sanitize_display_bounded`。cli の `CliError` も同じ入口を通る）。
-        let message = sanitize_display_bounded(message.as_ref(), OCI_ERROR_MESSAGE_MAX_BYTES);
+        let message =
+            sanitize_display_bounded(message.as_ref(), OCI_ERROR_MESSAGE_MAX_BYTES).into_string();
         Self { op, code, message }
     }
 

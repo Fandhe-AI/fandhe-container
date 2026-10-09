@@ -88,17 +88,47 @@ pub(crate) fn push_sanitized_bounded(
     }
 }
 
+/// [`sanitize_display_bounded`] の結果。サニタイズ済み文字列と、上限で打ち切ったかどうかを保持する。
+///
+/// 戻り値を生の `String` にせず構造化型にすることで、将来の付加情報（打ち切りバイト数等）を
+/// 戻り値型を変えずに足せる（AGENTS.md の構造化戻り値規約・REPAIR-3・ERR-2）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SanitizedDisplay {
+    text: String,
+    truncated: bool,
+}
+
+impl SanitizedDisplay {
+    /// サニタイズ済みの文字列を借用で返す。
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    /// サニタイズ済みの文字列を所有権ごと取り出す。
+    pub fn into_string(self) -> String {
+        self.text
+    }
+
+    /// 入力が `max_bytes` の上限で打ち切られたとき true。
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+}
+
 /// 表示を乱す文字（Cc・Cf・Zl・Zp と U+2065）を空白へ置換し、UTF-8 文字境界で `max_bytes` に
-/// 打ち切った文字列を返す公開入口。
+/// 打ち切った結果（[`SanitizedDisplay`]）を返す公開入口。
 ///
 /// `OciRuntimeError::new`（core）と cli の `CliError::new` が同じ規則を共有するための単一の入口で、
 /// 判定表は公開しない。`input` は借用のまま走査し上限で読み取りを止めるため、巨大な入力でも
 /// 確保・走査は `max_bytes` で頭打ちになる（untrusted 入力の DoS 防止）。置換後の空白は元の文字
 /// 以下のバイト長なので、確保は `min(入力長, max_bytes)` の 1 回で済む（ERR-1・ERR-2・SEC-4・TASK-96.1）。
-pub fn sanitize_display_bounded(input: &str, max_bytes: usize) -> String {
-    let mut out = String::with_capacity(input.len().min(max_bytes));
-    push_sanitized_bounded(&mut out, input.chars(), max_bytes);
-    out
+pub fn sanitize_display_bounded(input: &str, max_bytes: usize) -> SanitizedDisplay {
+    let mut text = String::with_capacity(input.len().min(max_bytes));
+    push_sanitized_bounded(&mut text, input.chars(), max_bytes);
+    // 置換は 1 文字対 1 文字なので、出力の文字数番目に入力文字が残っていれば打ち切られている。
+    // 走査は出力の文字数までで頭打ち（入力全体は読まない）。
+    let truncated = input.chars().nth(text.chars().count()).is_some();
+    SanitizedDisplay { text, truncated }
 }
 
 #[cfg(test)]
@@ -109,7 +139,7 @@ mod tests {
     #[test]
     fn err2_sanitize_display_bounded_replaces_unsafe_chars() {
         assert_eq!(
-            sanitize_display_bounded("a\u{202E}b\nc\u{2028}d", 4096),
+            sanitize_display_bounded("a\u{202E}b\nc\u{2028}d", 4096).as_str(),
             "a b c d"
         );
     }
@@ -118,20 +148,38 @@ mod tests {
     #[test]
     fn err2_sanitize_display_bounded_truncates_at_char_boundary() {
         let s = sanitize_display_bounded(&"あ".repeat(5000), 4096);
-        assert_eq!((s.len(), s.chars().count()), (4095, 1365));
         assert_eq!(
-            sanitize_display_bounded(&"a".repeat(10_000), 4096).len(),
-            4096
+            (
+                s.as_str().len(),
+                s.as_str().chars().count(),
+                s.is_truncated()
+            ),
+            (4095, 1365, true)
         );
-        assert_eq!(sanitize_display_bounded("abc", 0), "");
+        let a = sanitize_display_bounded(&"a".repeat(10_000), 4096);
+        assert_eq!((a.as_str().len(), a.is_truncated()), (4096, true));
+        let z = sanitize_display_bounded("abc", 0);
+        assert_eq!((z.as_str(), z.is_truncated()), ("", true));
+        let ok = sanitize_display_bounded("abc", 3);
+        assert_eq!((ok.as_str(), ok.is_truncated()), ("abc", false));
     }
 
     /// ERR-2: 確保量は上限で頭打ちになる。
     #[test]
     fn err2_sanitize_display_bounded_capacity_is_capped() {
         let big = "a".repeat(1 << 20);
-        assert_eq!(sanitize_display_bounded(&big, 4096).capacity(), 4096);
-        assert_eq!(sanitize_display_bounded("abc", 4096).capacity(), 3);
+        assert_eq!(
+            sanitize_display_bounded(&big, 4096)
+                .into_string()
+                .capacity(),
+            4096
+        );
+        assert_eq!(
+            sanitize_display_bounded("abc", 4096)
+                .into_string()
+                .capacity(),
+            3
+        );
     }
 
     /// ERR-2: Cf の範囲表は昇順・重複なしで、Unicode 16.0.0 の Cf 全 170 符号位置と一致する。

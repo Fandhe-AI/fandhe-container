@@ -20,12 +20,12 @@
 //!   ゾンビとして残り、親プロセスの終了時に OS が引き取る。呼び出し側はその pid を未回収として扱う。
 //! - プロセスグループの停止失敗（#1311）: 直接の子は回収できたが、子のプロセスグループ宛ての kill が
 //!   失敗して孫の停止を保証できない場合、応答前の失敗経路では元のエラーの `code` と `message` を保ち、
-//!   `message` に `process group could not be killed` の付記を加えて返す（[`with_group_kill_failure`]。
+//!   `message` に `process group could not be killed` の付記を加えて返す（`with_group_kill_failure`。
 //!   元の失敗の分類を失わず、孫が残り得ることも黙らない）。元のエラーが無い経路（応答後・常駐の
 //!   shutdown）は未回収の子とは別の `Internal`（同じ文言を含み、解放済みの子の pid は含めない）を返す。
 //!   いずれも `could not be reaped` とは報告しない（PLUG-7・REPAIR-5）。macOS はゾンビだけのグループへの
 //!   `killpg` にも `EPERM` を返すため、接続後・応答前に plugin が終了した場合は孫がいなくても付記が付き得る
-//!   （`EPERM` を許容しない理由は [`group_kill_tolerated`]）。
+//!   （`EPERM` を許容しない理由は `group_kill_tolerated` の doc）。
 //! - 子の環境変数は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ設定する（資格情報を継承させない）。
 //!   stdin / stdout は null。stderr は親へ継承させず、専用の UNIX ソケット対で受けて
 //!   [`OneShotStderr`] として返す（untrusted。保持は [`ONE_SHOT_STDERR_MAX_BYTES`] まで。超過分は

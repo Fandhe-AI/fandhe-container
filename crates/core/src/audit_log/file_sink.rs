@@ -33,7 +33,8 @@
 //!   スレッドが残って以後の fork（exec の worker は `Threads: 1` 必須）を妨げるため、プロセスで隔離する。
 //!   時間切れの子は SIGKILL で止め、親は `isolation_timeout` を主経路の失敗として代替経路（カーネル監査）へ進む
 //!   （代替経路はストレージに触れず、ACK は [`KERNEL_AUDIT_ACK_TIMEOUT`] が上限）。D 状態で SIGKILL が
-//!   効かない子はゾンビとして残り得るが、スレッドではないので親の `Threads` は増えない
+//!   効かない子は PID を追跡して後続の呼び出しで回収し、未回収が上限に達したら fork せず代替経路へ進む
+//!   （スレッドではないので親の `Threads` は増えない）。非 Linux は隔離を提供せず常に代替経路へ進む（CLI-1）
 //! - 子は `fork_single_threaded` で作る。呼び出しプロセスが複数スレッドだと fork できないため、その場合は
 //!   主経路を試行せず `isolation_unavailable` で代替経路へ進む（期限を保証できない I/O を呼び出しスレッドで
 //!   実行しない。fail-closed）。supervisor の exec は単一スレッドのプロセスから呼ぶ契約
@@ -69,9 +70,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 use crate::state_store::FileStateStore;
+#[cfg(target_os = "linux")]
 use crate::sys;
 use crate::traits::TraitError;
 
@@ -91,9 +95,11 @@ pub const PRIMARY_WRITE_TIMEOUT: Duration = Duration::from_secs(8);
 /// 失敗通知（stderr 出力）を隔離した子プロセスの待ち時間の上限。超過した子は SIGKILL する。
 pub const NOTIFY_WAIT: Duration = Duration::from_millis(200);
 
-/// kill 後に子の回収を待つ上限。SIGKILL が効かない子（D 状態）はゾンビのまま諦める。
+/// kill 後に子の回収を待つ上限。SIGKILL が効かない子（D 状態）は PID を [`pending`] に保持して諦める。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const KILL_REAP_WAIT: Duration = Duration::from_secs(1);
 /// 子の終了を確認するポーリング間隔。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// 同時に未完了でいられる通知スレッド数の上限（複数スレッドのプロセスでの退避経路のみ）。
@@ -106,8 +112,13 @@ type PrimaryStep = Arc<dyn Fn(&Path, &AuditRecord) -> Result<(), AuditWriteError
 /// 通知の出力先の生成関数（隔離した子の中で呼ぶ）。
 type NotifyOut = Arc<dyn Fn() -> Box<dyn Write> + Send + Sync>;
 
+/// 未回収の子（SIGKILL 後も回収できなかった D 状態等）を保持する上限。到達したら新規 fork を避ける。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const MAX_UNREAPED: usize = 4;
+
 /// 隔離した子プロセスの結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 enum IsolatedOutcome {
     /// 子が終了コード付きで終了した。
     Exited(i32),
@@ -117,14 +128,49 @@ enum IsolatedOutcome {
     MultiThreaded,
     /// fork・待機に失敗した、または子がシグナルで死んだ（非対応 OS を含む）。
     Failed,
+    /// 未回収の子が [`MAX_UNREAPED`] に達しているため fork しなかった（代替経路へ進む）。
+    TooManyUnreaped,
+}
+
+/// 回収できなかった子の PID の追跡（Linux のみ）。後続の呼び出しで回収を再試行する。
+#[cfg(target_os = "linux")]
+mod pending {
+    use super::{MAX_UNREAPED, sys};
+    use std::sync::Mutex;
+
+    static UNREAPED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+    /// 追跡中の PID を回収し、まだ残っている件数を返す。`wait` 失敗（`ECHILD` 等）は回収済みとみなす。
+    pub(super) fn reap_and_count() -> usize {
+        let Ok(mut list) = UNREAPED.lock() else {
+            // poison 時は安全側（上限到達扱い）に倒す。
+            return MAX_UNREAPED;
+        };
+        list.retain(|pid| matches!(sys::wait_pid_nohang(*pid), Ok(None)));
+        list.len()
+    }
+
+    /// 回収できなかった子の PID を追跡に加える。
+    pub(super) fn track(pid: u32) {
+        if let Ok(mut list) = UNREAPED.lock() {
+            list.push(pid);
+        }
+    }
 }
 
 /// `child` を fork した子プロセスで実行し、`timeout` まで終了を待つ（REPAIR-5）。
 ///
 /// 親にはスレッドも fd も残さない。子は `_exit` するため、終了コードは 0〜255。panic は 2。
-/// 期限超過は SIGKILL して回収を [`KILL_REAP_WAIT`] まで待つ。
+/// fork 前に親で stdio を flush しない（出力先が詰まると期限前に停止するため。
+/// `sys::fork_single_threaded_no_flush`）。期限超過は SIGKILL して回収を [`KILL_REAP_WAIT`] まで待ち、
+/// それでも回収できなければ PID を追跡して後続の呼び出しで回収する。未回収が [`MAX_UNREAPED`] 件に
+/// 達していれば fork せず [`IsolatedOutcome::TooManyUnreaped`]（ゾンビの無制限な蓄積を防ぐ）。
+#[cfg(target_os = "linux")]
 fn run_isolated(timeout: Duration, child: impl FnOnce() -> i32) -> IsolatedOutcome {
-    let pid = match sys::fork_single_threaded(child, 2) {
+    if pending::reap_and_count() >= MAX_UNREAPED {
+        return IsolatedOutcome::TooManyUnreaped;
+    }
+    let pid = match sys::fork_single_threaded_no_flush(child, 2) {
         Ok(pid) => pid,
         Err(sys::SysError::MultiThreaded) => return IsolatedOutcome::MultiThreaded,
         Err(_) => return IsolatedOutcome::Failed,
@@ -149,14 +195,24 @@ fn run_isolated(timeout: Duration, child: impl FnOnce() -> i32) -> IsolatedOutco
     let reap_deadline = Instant::now() + KILL_REAP_WAIT;
     while Instant::now() < reap_deadline {
         if !matches!(sys::wait_pid_nohang(pid), Ok(None)) {
-            break;
+            return IsolatedOutcome::TimedOut;
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+    // SIGKILL でも回収できない子（D 状態等）。PID を保持して後続の呼び出しで回収する。
+    pending::track(pid);
     IsolatedOutcome::TimedOut
 }
 
+/// 非 Linux では子プロセス隔離を提供しない（`crate::sys` が Linux 専用。CLI-1）。常に `Failed` を返し、
+/// 呼び出し側は主経路を `IsolationUnavailable` として代替経路へ進む。
+#[cfg(not(target_os = "linux"))]
+fn run_isolated(_timeout: Duration, _child: impl FnOnce() -> i32) -> IsolatedOutcome {
+    IsolatedOutcome::Failed
+}
+
 /// `waitpid` の status を解釈する。正常終了以外（シグナル死）は `Failed`。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn decode_status(status: i32) -> IsolatedOutcome {
     if status & 0x7f == 0 {
         IsolatedOutcome::Exited((status >> 8) & 0xff)
@@ -381,9 +437,11 @@ impl FileAuditSink {
                     IsolatedOutcome::TimedOut => {
                         Err(AuditWriteError::new(AuditWriteErrorKind::IsolationTimeout))
                     }
-                    IsolatedOutcome::MultiThreaded | IsolatedOutcome::Failed => Err(
-                        AuditWriteError::new(AuditWriteErrorKind::IsolationUnavailable),
-                    ),
+                    IsolatedOutcome::MultiThreaded
+                    | IsolatedOutcome::Failed
+                    | IsolatedOutcome::TooManyUnreaped => Err(AuditWriteError::new(
+                        AuditWriteErrorKind::IsolationUnavailable,
+                    )),
                 }
             }
         }

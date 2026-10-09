@@ -1507,10 +1507,42 @@ pub(crate) fn fork_single_threaded_with<F: FnOnce() -> i32>(
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
+    fork_checked(is_single_threaded, child, panic_exit, true)
+}
+
+/// [`fork_single_threaded`] と同じ強制（`Threads: 1` の確認・子は `_exit`）だが、**fork 前に親で
+/// stdout / stderr を flush しない**（REPAIR-5・SEC-4・TASK-163 追補・#1594）。
+///
+/// 親の flush は出力先（パイプ満杯など）で無期限に止まり得て、呼び出し側の期限（監査の
+/// `PRIMARY_WRITE_TIMEOUT` 等）は fork の後に始まるため効かない。子は `child` の後に `_exit` するだけで
+/// 親の stdio バッファを flush しない（`exit` / atexit を通らない）ので、flush を省いても二重出力は起きない。
+/// ただし子の `child` が親から継承した stdout のバッファを書き出す処理を呼んではならない。
+pub(crate) fn fork_single_threaded_no_flush<F: FnOnce() -> i32>(
+    child: F,
+    panic_exit: i32,
+) -> Result<u32, SysError> {
+    fork_checked(
+        || std::fs::read_to_string("/proc/self/status").is_ok_and(|status| threads_is_one(&status)),
+        child,
+        panic_exit,
+        false,
+    )
+}
+
+/// fork の共通本体。`flush_stdio` が真のときだけ fork 前に stdout / stderr を flush する。
+fn fork_checked<F: FnOnce() -> i32>(
+    is_single_threaded: impl FnOnce() -> bool,
+    child: F,
+    panic_exit: i32,
+    flush_stdio: bool,
+) -> Result<u32, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
     if !is_single_threaded() {
         return Err(SysError::MultiThreaded);
     }
-    {
+    if flush_stdio {
         use std::io::Write as _;
         let _ = io::stdout().flush();
         let _ = io::stderr().flush();

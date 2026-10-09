@@ -42,6 +42,24 @@ const DIR_ENV: &str = "FCSF_DIR";
 /// 設定時、親役はシグナルを受けず、トリガーファイルの指示で転送関数を直接呼ぶ（親は生存し続ける）。
 const DIRECT_ENV: &str = "FCSF_DIRECT";
 const TRIGGER_FILE: &str = "trigger";
+/// 設定時、親役はハンドラを登録したまま、トリガー `fork` で fork した子に SIGTERM を送らせ（#1605）、
+/// その後トリガー `direct` で転送関数を直接呼ぶ（陽性対照）。
+const FORK_ENV: &str = "FCSF_FORK";
+const FORK_TRIGGER: &str = "fork";
+const FORK_RESULT: &str = "fork-result";
+const DIRECT_TRIGGER: &str = "direct";
+
+/// `dir` の `name` ファイルが現れるまで待つ（上限つき。REPAIR-5）。
+fn wait_for_file(dir: &Path, name: &str) -> String {
+    let start = Instant::now();
+    loop {
+        if let Ok(t) = std::fs::read_to_string(dir.join(name)) {
+            return t;
+        }
+        assert!(start.elapsed() < WAIT, "{name} did not arrive");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 
 /// 親役の入口。通常のテスト実行（`FCSF_ROLE` 未設定）では何もしない。
 #[test]
@@ -51,6 +69,7 @@ fn parent_entry() {
     }
     let dir = PathBuf::from(std::env::var_os(DIR_ENV).unwrap());
     let direct = std::env::var_os(DIRECT_ENV).is_some();
+    let fork_mode = std::env::var_os(FORK_ENV).is_some();
     if !direct {
         fandhe_container_cli::signals::install_signal_forwarding().unwrap();
     }
@@ -72,6 +91,20 @@ fn parent_entry() {
             &mut JsonLinesPeerAuthObserver::new(),
         );
     });
+    if fork_mode {
+        // fork した子（exec 前）がシグナルを受けても、親の登録表のコピーで plugin へ転送しない（#1605）。
+        wait_for_file(&dir, FORK_TRIGGER);
+        let ended = fandhe_container_cli::signals::fork_and_raise_for_test(15).unwrap();
+        let tmp = dir.join("fork-result.tmp");
+        std::fs::write(&tmp, format!("{ended:?}")).unwrap();
+        std::fs::rename(&tmp, dir.join(FORK_RESULT)).unwrap();
+        // 陽性対照: 親自身が転送関数を呼べば同じ構成で plugin に届く。
+        wait_for_file(&dir, DIRECT_TRIGGER);
+        let forward = fandhe_container_plugin::ForwardSignal::from_raw(15).unwrap();
+        let _ = fandhe_container_plugin::forward_to_running_plugins(forward);
+        std::thread::sleep(Duration::from_secs(40));
+        std::process::exit(98);
+    }
     if direct {
         // トリガーが書かれたら、その番号のシグナルを登録済み plugin へ転送する。親は終了しない。
         let start = Instant::now();
@@ -120,8 +153,11 @@ fn plugin_entry() {
         .spawn()
         .unwrap();
     // 応答も読み取りもしない。受信したシグナル番号を記録して終了する（記録はハンドラ外で行う）。
+    // 親から継承した `SIG_IGN`（SIGHUP を無視して起動した親の試験）も上書きして登録する。そうしないと、
+    // 転送された SIGHUP が届いても記録されず、転送の有無を観測できない（#1605）。
     for sig in [1, 2, 15] {
-        fandhe_container_cli::signals::install_recording_handler_for_test(sig).unwrap();
+        fandhe_container_cli::signals::install_recording_handler_overriding_ignore_for_test(sig)
+            .unwrap();
     }
     // 全ハンドラの登録後に PID ファイル（準備完了の合図。1 行目が自分、2 行目が孫）を公開する。先に公開すると、
     // 転送が先に届いて既定動作で終了し得る。読み手が書きかけを読まないよう一時ファイルから rename する。
@@ -366,8 +402,22 @@ fn assert_grandchildren_stop(pids: &PluginPids, what: &str) {
 /// 転送の受信検証。親を生かしたまま転送関数を直接呼び、各 plugin 役が記録した番号が `sig_num` と
 /// 一致することを具体値で確認する（PDEATHSIG による停止とは区別される。REPAIR-12）。
 fn run_direct_case(sig_num: i32) {
+    run_direct_case_with(sig_num, false);
+}
+
+/// `ignore_hup` が真なら SIGHUP を `SIG_IGN` にして起動した親役（nohup 相当）で同じ検証をする（陽性対照。
+/// #1605）。孫も `SIG_IGN` を継承するため、孫の停止は照合しない。
+fn run_direct_case_with(sig_num: i32, ignore_hup: bool) {
     let dir = TempDir::new();
-    let parent = Command::new(std::env::current_exe().unwrap())
+    let mut cmd = if ignore_hup {
+        let mut c = Command::new("sh");
+        c.args(["-c", "trap '' HUP; exec \"$0\" \"$@\""])
+            .arg(std::env::current_exe().unwrap());
+        c
+    } else {
+        Command::new(std::env::current_exe().unwrap())
+    };
+    let parent = cmd
         .args(["--exact", "parent_entry", "--test-threads=1", "--nocapture"])
         .env(ROLE_ENV, "parent")
         .env(DIRECT_ENV, "1")
@@ -403,7 +453,9 @@ fn run_direct_case(sig_num: i32) {
         assert_eq!(content.trim(), sig_num.to_string(), "{name}");
     }
     // #1311: 親が生存したままでも孫が止まる（PDEATHSIG ではなくグループ宛ての転送による）。
-    assert_grandchildren_stop(&pids, &format!("forwarded signal {sig_num}"));
+    if !ignore_hup {
+        assert_grandchildren_stop(&pids, &format!("forwarded signal {sig_num}"));
+    }
     // 親は生存したまま（停止は親の死ではなく転送によるもの）。
     assert!(cleanup.parent.try_wait().unwrap().is_none());
 }
@@ -468,4 +520,77 @@ fn plug7_sighup_ignored_at_startup_is_kept_and_not_forwarded() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(is_alive(pids.resident) && is_alive(pids.one_shot));
+    // 転送が起きていれば plugin 役は（`SIG_IGN` を上書きした記録ハンドラで）`.sig` を書く。無いこと（#1605）。
+    assert_eq!(sig_records(&dir.0), Vec::<String>::new());
+}
+
+/// `dir` にある plugin 役の受信記録（`*.sock.sig`）のファイル名の一覧。
+fn sig_records(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".sock.sig"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// PLUG-7・#1605: 陽性対照。SIGHUP を無視して起動した構成でも、転送が起きれば plugin 役が SIGHUP（1）を
+/// 記録できる。これにより `plug7_sighup_ignored_at_startup_is_kept_and_not_forwarded` の「記録なし」が
+/// 転送の不在を意味する（記録ハンドラが `SIG_IGN` に阻まれて見えないだけ、ではない）。
+#[test]
+fn plug7_sighup_forward_is_observable_when_ignored_at_startup() {
+    run_direct_case_with(1, true);
+}
+
+/// PLUG-7・#1605: fork した子（exec 前）がシグナルを受けても plugin へ転送せず、再送で終了する。
+/// 親役は fork 子に SIGTERM を送らせ、子が SIGTERM で終了したこと・plugin に記録が無いこと・全員が生存
+/// していることを確かめる。同じ構成で親自身が転送関数を呼ぶと両 plugin に SIGTERM が届く（陽性対照）。
+#[test]
+fn plug7_forked_child_before_exec_does_not_forward() {
+    let dir = TempDir::new();
+    let parent = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "parent_entry", "--test-threads=1", "--nocapture"])
+        .env(ROLE_ENV, "parent")
+        .env(FORK_ENV, "1")
+        .env(DIR_ENV, &dir.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut cleanup = Cleanup { parent };
+    let pids = wait_plugin_pids(&dir.0);
+    std::fs::write(dir.0.join(FORK_TRIGGER), "").unwrap();
+    // 子は再送で SIGTERM 終了する（再送は保たれる）。
+    assert_eq!(wait_for_file(&dir.0, FORK_RESULT), "Some(15)");
+
+    // 有限の猶予の間、記録が無く、plugin・孫・親が生存し続ける。
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(1) {
+        assert_eq!(sig_records(&dir.0), Vec::<String>::new());
+        assert!(cleanup.parent.try_wait().unwrap().is_none());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(is_alive(pids.resident) && is_alive(pids.one_shot));
+    for gc in pids.grandchildren {
+        assert!(is_alive(gc), "grandchild {gc} stopped");
+    }
+
+    // 陽性対照: 親自身が転送すれば同じ構成で 2 件の記録が SIGTERM（15）で現れる。
+    std::fs::write(dir.0.join(DIRECT_TRIGGER), "").unwrap();
+    let start = Instant::now();
+    let records = loop {
+        let names = sig_records(&dir.0);
+        if names.len() == 2 {
+            break names;
+        }
+        assert!(start.elapsed() < WAIT, "no forwarded signal: {names:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    for name in records {
+        let content = std::fs::read_to_string(dir.0.join(&name)).unwrap();
+        assert_eq!(content.trim(), "15", "{name}");
+    }
 }

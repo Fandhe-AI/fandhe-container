@@ -366,8 +366,8 @@ fn gpu6_symlinked_log_ancestor_is_rejected() {
 }
 
 #[test]
-fn gpu6_missing_socket_dir_parent_reports_create_failed_not_ancestor_unsafe() {
-    // 親も無いとき: 祖先検査が NotFound を unsafe に写さず、作成失敗（終了コード 1）に到達する。
+fn gpu6_missing_socket_dir_parent_is_rejected_as_ancestor_unsafe() {
+    // 親（検証できない祖先）が無いとき: NotFound を通さず拒否する。検査後に別 UID が作って差し替えるのを防ぐ。
     let base = scratch("nopar");
     let c = cfg(
         &base.join("a").join("b").join("s.sock"),
@@ -376,39 +376,23 @@ fn gpu6_missing_socket_dir_parent_reports_create_failed_not_ancestor_unsafe() {
     )
     .unwrap();
     let e = run(&c).expect_err("must fail");
-    assert_eq!(e.code.as_str(), "SOCKET_DIR_CREATE_FAILED");
-    assert_eq!(e.exit_code(), 1);
+    assert_eq!(e.code.as_str(), "SOCKET_DIR_ANCESTOR_UNSAFE");
+    assert!(fs::symlink_metadata(base.join("a")).is_err(), "no dir");
+    assert!(fs::symlink_metadata(base.join("j.log")).is_err(), "no log");
     fs::remove_dir_all(&base).unwrap();
 }
 
 #[test]
-fn gpu6_peer_uid_matches_effective_uid() {
-    let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
-    assert_eq!(sys::peer_uid(a.as_fd()).unwrap(), effective_uid().unwrap());
-}
-
-#[test]
-fn gpu6_peer_with_other_uid_is_rejected_before_session() {
-    // 実行ユーザーと別の UID を期待値として渡し、接続元不一致で PEER_REJECTED になりセッションに入らないことを照合する。
-    let dir = scratch("peer");
-    let sock = dir.join("s.sock");
-    let log = dir.join("j.log");
-    let c = cfg(&sock, &log, &["--accept-timeout-ms", "5000"]).unwrap();
-    let uid = effective_uid().unwrap();
-    let client_sock = sock.clone();
-    let client = thread::spawn(move || {
-        for _ in 0..500 {
-            if let Ok(s) = std::os::unix::net::UnixStream::connect(&client_sock) {
-                return Some(s);
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        None
-    });
-    let file = open_log(&c.log).unwrap();
-    let mut sink = LogSink::new(file);
-    let r = serve(&c, uid.wrapping_add(1), &mut sink);
-    assert_eq!(code_of(r), "PEER_REJECTED");
-    let _ = client.join();
-    fs::remove_dir_all(&dir).unwrap();
+fn gpu6_missing_log_dir_is_rejected_without_creating_anything() {
+    let base = scratch("nolog");
+    let c = cfg(
+        &base.join("s.sock"),
+        &base.join("missing").join("j.log"),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(code_of(run(&c)), "LOG_DIR_UNSAFE");
+    assert!(fs::symlink_metadata(base.join("missing")).is_err());
+    assert!(fs::symlink_metadata(base.join("s.sock")).is_err());
+    fs::remove_dir_all(&base).unwrap();
 }

@@ -31,8 +31,6 @@ pub enum LaunchErrorCode {
     SocketDirCreateFailed,
     /// ログファイルの親〜`/` に symlink・他ユーザー所有・他ユーザーが差し替えられるディレクトリがある。
     LogDirUnsafe,
-    /// 接続元の UID が実行ユーザーと違う、または取得できない（PLUG-12 相当）。
-    PeerRejected,
     /// ソケットパスに既に何かある（消さずに拒否する）。
     SocketPathExists,
     /// ログファイルのパスに既に何かある（上書きしない）。
@@ -69,7 +67,6 @@ impl LaunchErrorCode {
             Self::SocketDirAncestorUnsafe => "SOCKET_DIR_ANCESTOR_UNSAFE",
             Self::SocketDirCreateFailed => "SOCKET_DIR_CREATE_FAILED",
             Self::LogDirUnsafe => "LOG_DIR_UNSAFE",
-            Self::PeerRejected => "PEER_REJECTED",
             Self::SocketPathExists => "SOCKET_PATH_EXISTS",
             Self::LogPathExists => "LOG_PATH_EXISTS",
             Self::LogOpenFailed => "LOG_OPEN_FAILED",
@@ -101,7 +98,6 @@ impl LaunchErrorCode {
             Self::LogDirUnsafe => {
                 "the log directory or an ancestor is a symlink or can be replaced by another user"
             }
-            Self::PeerRejected => "peer uid does not match the effective uid or is unavailable",
             Self::SocketPathExists => "socket path already exists; remove it manually",
             Self::LogPathExists => "log path already exists; it is never overwritten",
             Self::LogOpenFailed => "cannot create the log file",

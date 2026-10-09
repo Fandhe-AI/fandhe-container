@@ -7,12 +7,14 @@
 //! 処理の順序: 引数解析 → パス検証 → UID 取得 → ソケットディレクトリの検証・作成 → 既存パスの検査 → ログファイル作成 →
 //! bind → 期限つき accept → `session::run` → 後始末。検証で拒否した場合はログファイルを作らず、既存のパスは消さない。
 //!
-//! 接続元の認証（PLUG-12 相当）: accept 直後、セッションに入る前に `sys::peer_uid`（`SO_PEERCRED`）で接続元 UID を
-//! effective UID と照合し、不一致・取得失敗は `PEER_REJECTED` で拒否する（`session::run` を呼ばない）。加えてソケット
-//! ディレクトリを自 UID 所有・`0700` に限り、`/` までの祖先を全て検査する。ログの置き場所（親〜`/`）も同じ規則で検査する
-//! （symlink・自 UID でも root でもない所有者・グループ／他者が書けて sticky でないディレクトリがあれば拒否。別 UID が
-//! 祖先を rename で差し替えて bind・chmod・削除・ログ作成を未検証の場所へ向けるのを防ぐ。祖先に symlink がある環境、
-//! 例えば `/var/run` 経由は拒否される）。限界: (1) 同じ UID の別プロセスと root は接続できる（UID 一致のため）。
+//! 接続元の制限（PLUG-12 相当）: `SO_PEERCRED` による接続元 UID の検証は行わない（`getsockopt` の `unsafe` は承認が
+//! 得られておらず、std の `peer_cred` は stable でない）。代わりにソケットディレクトリを自 UID 所有・`0700` に限り、
+//! ソケットを `0600` にして、`/` までの祖先を全て検査する。ログの置き場所（親〜`/`）も同じ規則で検査する
+//! （存在しない祖先・symlink・自 UID でも root でもない所有者・グループ／他者が書けて sticky でないディレクトリが
+//! あれば拒否。別 UID が祖先を rename や新規作成で差し替えて bind・chmod・削除・ログ作成を未検証の場所へ向けるのを
+//! 防ぐ。新規作成を許すのは検証済みの既存の親の直下にあるソケットディレクトリ 1 段だけ。祖先に symlink がある環境、
+//! 例えば `/var/run` 経由は拒否される）。限界: (1) 同じ UID の別プロセスと root は接続できる。別 UID の接続は、
+//! 0700 のディレクトリにより到達できないことだけで防ぐ（接続時の UID 照合はしない）。
 //! (2) 検査と bind の間の TOCTOU は、祖先が他 UID に差し替え不能であることと、所有者が自分で `0700` のディレクトリで
 //! あることで抑える（同じ UID と root は差し替えられる）。
 //!
@@ -24,7 +26,6 @@ mod error;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{ErrorKind, Read};
-use std::os::fd::AsFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Component, Path, PathBuf};
@@ -35,7 +36,6 @@ pub use error::{LaunchError, LaunchErrorCode};
 
 use crate::log::LogSink;
 use crate::session::{SessionEnd, SessionLimits, run as run_session};
-use crate::sys;
 
 /// `sun_path` に入るバイト数の上限（`UNIX_PATH_MAX` = 108 から終端 NUL を除いた値）。
 /// 出典: Linux の `linux/un.h`（`#define UNIX_PATH_MAX 108`。2026-10-09 にローカルのヘッダで確認）。
@@ -187,10 +187,6 @@ fn check_socket_dir(socket: &Path, uid: u32) -> Result<(), LaunchError> {
     check_ancestors(dir, uid, false, LaunchErrorCode::SocketDirAncestorUnsafe)?;
     let mut meta = fs::symlink_metadata(dir);
     if matches!(&meta, Err(e) if e.kind() == ErrorKind::NotFound) {
-        let grand_ok = dir.parent().is_some_and(|g| g.is_dir());
-        if !grand_ok {
-            return Err(LaunchError::new(LaunchErrorCode::SocketDirCreateFailed));
-        }
         DirBuilder::new()
             .mode(0o700)
             .create(dir)
@@ -216,8 +212,9 @@ fn check_socket_dir(socket: &Path, uid: u32) -> Result<(), LaunchError> {
 /// `dir` の祖先（`/` まで。`include_self` が真なら `dir` 自身も）が、別 UID に差し替えられないことを検査する。
 ///
 /// 各祖先は symlink でなく、自 UID または root 所有で、グループ／他者が書ける場合は sticky が立っていること
-/// （sticky なら他ユーザーは自分の所有でない子を rename・削除できない）。存在しない祖先（`NotFound`）は差し替え対象が
-/// 無いので飛ばす（作成の可否は呼び出し側が判断する）。それ以外の取得失敗は `unsafe_code` で拒否する。
+/// （sticky なら他ユーザーは自分の所有でない子を rename・削除できない）。検査対象はすべて存在が必須で、存在しない
+/// 祖先（`NotFound`）を含む取得失敗は `unsafe_code` で拒否する（検査後に別 UID が symlink やディレクトリを作って
+/// 未検証の場所へ向けるのを防ぐ）。新規作成を許すのはソケットディレクトリ自身の 1 段だけで、呼び出し側が行う。
 fn check_ancestors(
     dir: &Path,
     uid: u32,
@@ -228,7 +225,6 @@ fn check_ancestors(
     for anc in dir.ancestors().skip(usize::from(!include_self)) {
         let meta = match fs::symlink_metadata(anc) {
             Ok(m) => m,
-            Err(e) if e.kind() == ErrorKind::NotFound => continue,
             Err(_) => return Err(bad()),
         };
         if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
@@ -328,7 +324,7 @@ pub fn run(config: &Config) -> Result<SessionEnd, LaunchError> {
     }
     let file = open_log(&config.log)?;
     let mut sink = LogSink::new(file);
-    let result = serve(config, uid, &mut sink);
+    let result = serve(config, &mut sink);
     if let Err(e) = &result {
         sink.write_line(&format!(
             "venus_jig event=launch_error code={}",
@@ -343,7 +339,7 @@ pub fn run(config: &Config) -> Result<SessionEnd, LaunchError> {
     result
 }
 
-fn serve(config: &Config, uid: u32, sink: &mut LogSink<File>) -> Result<SessionEnd, LaunchError> {
+fn serve(config: &Config, sink: &mut LogSink<File>) -> Result<SessionEnd, LaunchError> {
     let listener = UnixListener::bind(&config.socket)
         .map_err(|_| LaunchError::new(LaunchErrorCode::BindFailed))?;
     let guard = SocketGuard(config.socket.clone());
@@ -356,11 +352,6 @@ fn serve(config: &Config, uid: u32, sink: &mut LogSink<File>) -> Result<SessionE
     stream
         .set_nonblocking(false)
         .map_err(|_| LaunchError::new(LaunchErrorCode::AcceptFailed))?;
-    // 接続元の認証（PLUG-12 相当）: セッションに入る前に peer の UID を effective UID と照合する。不一致・取得失敗は拒否。
-    match sys::peer_uid(stream.as_fd()) {
-        Ok(peer) if peer == uid => {}
-        _ => return Err(LaunchError::new(LaunchErrorCode::PeerRejected)),
-    }
     sink.write_line("venus_jig event=accepted");
     let outcome = run_session(&stream, &config.limits, &mut |l| sink.write_line(l));
     outcome.map_err(|e| LaunchError {

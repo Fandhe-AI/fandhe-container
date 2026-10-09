@@ -374,7 +374,9 @@ impl ExecRestrictionReport {
         self.seccomp_instructions
     }
 
-    /// 適用した rlimit の種別数（対象の `limits` から読んだ全 16 種）。
+    /// 適用した rlimit の種別数（対象の `limits` から読んだ全 16 種）。`RLIMIT_FSIZE` は exec プロセスには載せず子へ
+    /// 持ち越し、exec の子が `execveat` の前（封印した複製を使うときはその完成後）に適用して読み戻す（#1531）が、件数には含める
+    /// （この時点では子での適用は済んでいない。子での適用に失敗すればコマンドは起動せず `SetupFailed` になる）。
     pub fn rlimits_applied(&self) -> usize {
         self.rlimits_applied
     }

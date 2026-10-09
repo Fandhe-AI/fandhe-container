@@ -503,7 +503,8 @@ pub struct ExecOutcome {
     /// 判定すること（healthcheck は `Command` の非 0 を不健全、`SetupFailed` を実行基盤側の失敗として扱える）。
     /// 分離違反による拒否（ランタイム自身のバイナリ・インタープリタ経由・`/dev/null` の差し替え）は理由を持つ。
     pub exit: ExecExit,
-    /// 適用した rlimit の種別数（対象 pid1 の実効値。通常は 16）。
+    /// 適用した rlimit の種別数（対象 pid1 の実効値。通常は 16）。`RLIMIT_FSIZE` は exec の子へ持ち越して子が
+    /// `execveat` の前に適用する（#1531）が、件数に含める（子での適用に失敗すれば `exit` は `SetupFailed`）。
     pub rlimits_applied: usize,
     /// bounding set から落とした capability の数。
     pub capability_bounding_dropped: usize,

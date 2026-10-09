@@ -55,7 +55,9 @@
 //!    `noexec`・実行ビット（`MAY_EXEC`）・Landlock の `EXECUTE`（継承 domain を含む全層。inode に結び付いた規則のまま）・
 //!    `security_bprm_creds_for_exec` まで評価される。`EACCES`・`EPERM` は `PermissionDenied`（違反にしない。今の
 //!    `execve` の `EACCES` と同じ扱い）。`AT_EXECVE_CHECK` を知らないカーネル（`EINVAL`）は `FailedPrecondition`
-//!    （判定できないまま複製しない）
+//!    （判定できないまま複製しない）。この判定はカーネルが未知のフラグを `EINVAL` で拒否する挙動（`do_open_execat` のフラグ検査）に依る: フラグを
+//!    無視するカーネルでは通常ファイルの元の fd がそのまま実行されてしまうため、方式の判定（`setns` の前）が
+//!    ディレクトリへの問い合わせで `EACCES`（対応）を確かめた場合にだけ封印した複製を選ぶ
 //! 3. `st_size` が [`MAX_SEALED_COPY_BYTES`] を超えたら違反 [`ViolationReason::EntrypointCopyTooLarge`]
 //!    （確保の前に判定する。疎なファイルでも `st_size` の段階で拒否される）
 //! 4. memfd を作り（名前は固定値）、固定長バッファの `pread`・`pwrite` で `st_size` バイトちょうどを複製し、終端の先を
@@ -226,8 +228,10 @@ const LSM_SAFE: [&str; 6] = [
 /// `AT_EXECVE_CHECK` の有無を、実行され得ないディレクトリ（`/`）の fd への問い合わせで判定する（`setns` の前に呼ぶ）。
 ///
 /// 対応カーネルはディレクトリを実行対象にできず `EACCES`、6.14 未満はフラグを `EINVAL` で拒否する（どちらも何も
-/// 実行しない。ディレクトリを渡すため、仮にフラグが無視されても実行は起きない）。カーネル版の文字列は解釈しない
-/// （ディストリビューションの backport に依らず、実際の挙動で決める）。
+/// 実行しない。この問い合わせはディレクトリを渡すため、仮にフラグが無視されても実行は起きない。これはこの問い合わせに
+/// だけ成り立つ性質で、exec の子の手順 2 が通常ファイルへ掛ける `AT_EXECVE_CHECK` は、カーネルが未知のフラグを
+/// `EINVAL` で拒否する挙動〔`do_open_execat` のフラグ検査〕に依る。手順 2 の doc を参照）。カーネル版の文字列は
+/// 解釈しない（ディストリビューションの backport に依らず、実際の挙動で決める）。
 fn probe_exec_check_support() -> ExecCheckSupport {
     match File::open("/") {
         Ok(dir) => classify_exec_check_probe(sys::exec_check_fd(dir.as_fd())),

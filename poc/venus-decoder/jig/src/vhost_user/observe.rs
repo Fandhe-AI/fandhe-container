@@ -1,7 +1,7 @@
 //! fd 受け渡しとゲストメモリ I/O の観測レコード（GPU-6・REPAIR-4・TASK-172 F1.2・#1517）。
 //!
 //! 役割: `fd_passing`（`recvmsg` / `sendmsg`）と `guest_memory`（境界検査つき read / write）の各操作について、
-//! 成功数・失敗数・失敗 code 別の件数・所要時間の合計をプロセス内のカウンタに集計する。境界検査の拒否（`OUT_OF_BOUNDS` 等）と
+//! 成功数・失敗数・失敗 code 別の件数・所要時間の合計と分布（2 の冪の固定区画ヒストグラム）をプロセス内のカウンタに集計する。境界検査の拒否（`OUT_OF_BOUNDS` 等）と
 //! syscall の失敗（`OS_ERROR`）も失敗として数える。呼び出し元は F1.4（セッション。#1519）で、定期的に [`snapshot_lines`] を
 //! 構造化ログへ出す（`log` モジュールと同じ `venus_jig event=...` 形式）。
 //!
@@ -44,11 +44,22 @@ impl Op {
 const OPS: usize = Op::ALL.len();
 const CODES: usize = TransportErrorCode::ALL.len();
 
+/// 所要時間ヒストグラムの区画数。区画 `i`（`1 <= i < LAT_BUCKETS - 1`）は `2^(i-1) <= ns < 2^i`、
+/// 区画 0 は 0ns、末尾の区画は残り（約 2^38 ns = 275 秒以上）を受ける。操作ごとの固定サイズで、無制限に増えない。
+pub const LAT_BUCKETS: usize = 40;
+
+/// 所要時間（ナノ秒）の区画番号。
+fn lat_bucket(nanos: u64) -> usize {
+    let i = (u64::BITS - nanos.leading_zeros()) as usize;
+    i.min(LAT_BUCKETS - 1)
+}
+
 struct OpCounters {
     ok: AtomicU64,
     err: AtomicU64,
     nanos: AtomicU64,
     by_code: [AtomicU64; CODES],
+    lat: [AtomicU64; LAT_BUCKETS],
 }
 
 impl OpCounters {
@@ -58,6 +69,7 @@ impl OpCounters {
             err: AtomicU64::new(0),
             nanos: AtomicU64::new(0),
             by_code: [const { AtomicU64::new(0) }; CODES],
+            lat: [const { AtomicU64::new(0) }; LAT_BUCKETS],
         }
     }
 }
@@ -78,6 +90,8 @@ pub struct OpSnapshot {
     pub total_nanos: u64,
     /// 失敗 code 別の件数（添字は [`TransportErrorCode::ALL`] と対応）。
     pub by_code: [u64; CODES],
+    /// 所要時間ヒストグラム（添字は区画番号。成功・失敗の両方を含む。REPAIR-4）。
+    pub latency: [u64; LAT_BUCKETS],
 }
 
 impl Metrics {
@@ -105,11 +119,19 @@ impl Metrics {
             }
         }
         // 合計は飽和させる（巻き戻りを避ける）。
-        let _ = c
-            .nanos
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_add(nanos))
-            });
+        // `fetch_update` は toolchain 間で名前が変わる（`try_update`）ため、`compare_exchange_weak` のループで書く。
+        let mut cur = c.nanos.load(Ordering::Relaxed);
+        while let Err(seen) = c.nanos.compare_exchange_weak(
+            cur,
+            cur.saturating_add(nanos),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            cur = seen;
+        }
+        if let Some(b) = c.lat.get(lat_bucket(nanos)) {
+            b.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// `f` を実行して結果と所要時間を記録し、結果をそのまま返す。
@@ -132,12 +154,16 @@ impl Metrics {
             err: 0,
             total_nanos: 0,
             by_code: [0; CODES],
+            latency: [0; LAT_BUCKETS],
         };
         if let Some(c) = self.ops.get(op as usize) {
             s.ok = c.ok.load(Ordering::Relaxed);
             s.err = c.err.load(Ordering::Relaxed);
             s.total_nanos = c.nanos.load(Ordering::Relaxed);
             for (dst, src) in s.by_code.iter_mut().zip(c.by_code.iter()) {
+                *dst = src.load(Ordering::Relaxed);
+            }
+            for (dst, src) in s.latency.iter_mut().zip(c.lat.iter()) {
                 *dst = src.load(Ordering::Relaxed);
             }
         }
@@ -156,6 +182,21 @@ impl Metrics {
                 s.err,
                 s.total_nanos
             ));
+            // 所要時間の分布（件数 0 の区画は出さない。lt_ns は区画の上限（排他）、末尾の区画は inf）。
+            for (i, n) in s.latency.iter().enumerate() {
+                if *n == 0 {
+                    continue;
+                }
+                let lt = if i + 1 >= LAT_BUCKETS {
+                    "inf".to_string()
+                } else {
+                    (1u64 << i).to_string()
+                };
+                out.push(format!(
+                    "venus_jig event=vhost_user_io_latency op={} lt_ns={lt} count={n}",
+                    op.word()
+                ));
+            }
             for (code, n) in TransportErrorCode::ALL.iter().zip(s.by_code) {
                 if n > 0 {
                     out.push(format!(
@@ -236,6 +277,36 @@ mod tests {
         let s = m.snapshot(Op::RecvFds);
         assert_eq!((s.ok, s.err), (1, 1));
         assert_eq!(s.by_code[TransportErrorCode::Timeout as usize], 1);
+    }
+
+    /// REPAIR-4: 所要時間が 2 の冪の区画に分類され、分布がログ行に出る（具体値）。
+    #[test]
+    fn gpu6_latency_histogram_buckets_and_lines() {
+        assert_eq!(lat_bucket(0), 0);
+        assert_eq!(lat_bucket(1), 1);
+        assert_eq!(lat_bucket(3), 2);
+        assert_eq!(lat_bucket(4), 3);
+        assert_eq!(lat_bucket(u64::MAX), LAT_BUCKETS - 1);
+        let m = Metrics::new();
+        m.record(Op::MemWrite, Ok(()), 3);
+        m.record(Op::MemWrite, Ok(()), 2);
+        m.record(Op::MemWrite, Err(TransportErrorCode::OsError), 1000);
+        m.record(Op::MemWrite, Ok(()), u64::MAX);
+        let s = m.snapshot(Op::MemWrite);
+        assert_eq!(s.latency[2], 2);
+        assert_eq!(s.latency[10], 1);
+        assert_eq!(s.latency[LAT_BUCKETS - 1], 1);
+        assert_eq!(s.latency.iter().sum::<u64>(), 4);
+        let lines = m.lines();
+        assert!(lines.contains(
+            &"venus_jig event=vhost_user_io_latency op=mem_write lt_ns=4 count=2".to_string()
+        ));
+        assert!(lines.contains(
+            &"venus_jig event=vhost_user_io_latency op=mem_write lt_ns=1024 count=1".to_string()
+        ));
+        assert!(lines.contains(
+            &"venus_jig event=vhost_user_io_latency op=mem_write lt_ns=inf count=1".to_string()
+        ));
     }
 
     /// 添字と列挙順の対応（`as usize` で配列を引くため）。

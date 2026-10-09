@@ -2,6 +2,13 @@
 //!
 //! ログは数値と固定語彙だけを出し、ゲストのバイト列や文字列をエコーしない（ログ注入の防止）。
 //! 照合器は実機前提テスト（`tests/real_machine_capset_log.rs`）が使い、入力の行長・行数・総量に上限を設ける。
+//!
+//! 書き出し側の [`LogSink`] は起動 bin（`launch`。#1598）が使い、照合器の上限に収まるよう総量・行長・行数を抑える（REPAIR-5）。
+//! 読み取り側の [`read_log_file`] は通常ファイル以外を open 前に拒否する（FIFO で open が止まるのを防ぐ。事後監査 #1528 D2）。
+
+use std::fs;
+use std::io::{self, Read, Write};
+use std::path::Path;
 
 /// ログ全体の上限（バイト）。
 pub const MAX_LOG_BYTES: usize = 4 * 1024 * 1024;
@@ -21,8 +28,10 @@ pub enum QueryResult {
     Unspec,
     /// ctx_id が 0・重複・未作成（`ERR_INVALID_CONTEXT_ID`）。
     InvalidContextId,
-    /// ctx 表が上限（`ERR_OUT_OF_MEMORY`）。
+    /// 資源表または ctx 表が上限（`ERR_OUT_OF_MEMORY`）。
     OutOfMemory,
+    /// resource_id が 0・重複・未作成（`ERR_INVALID_RESOURCE_ID`）。
+    InvalidResourceId,
 }
 
 impl QueryResult {
@@ -33,6 +42,7 @@ impl QueryResult {
             Self::Unspec => "unspec",
             Self::InvalidContextId => "invalid_context_id",
             Self::OutOfMemory => "out_of_memory",
+            Self::InvalidResourceId => "invalid_resource_id",
         }
     }
 }
@@ -83,6 +93,75 @@ pub fn ctx_destroy_line(ctx_id: u32, result: QueryResult) -> String {
     format!(
         "venus_jig event=ctx cmd=CTX_DESTROY ctx_id={ctx_id} result={}",
         result.word()
+    )
+}
+
+/// `RESOURCE_CREATE_BLOB` のログ行。復号できなかった値は -1。`blob_id` は出さない。
+pub fn resource_create_blob_line(
+    ctx_id: u32,
+    req: Option<&crate::ctrl::ResourceCreateBlob>,
+    result: QueryResult,
+) -> String {
+    format!(
+        "venus_jig event=resource cmd=RESOURCE_CREATE_BLOB ctx_id={ctx_id} res_id={} blob_mem={} blob_flags={} size={} result={}",
+        req.map_or(-1, |c| i128::from(c.res_id)),
+        req.map_or(-1, |c| i128::from(c.blob_mem)),
+        req.map_or(-1, |c| i128::from(c.blob_flags)),
+        req.map_or(-1, |c| i128::from(c.size)),
+        result.word()
+    )
+}
+
+/// `CTX_ATTACH_RESOURCE` / `CTX_DETACH_RESOURCE` のログ行（`cmd` は呼び出し側の固定語彙）。
+pub fn ctx_resource_line(
+    cmd: &'static str,
+    ctx_id: u32,
+    res_id: Option<u32>,
+    result: QueryResult,
+) -> String {
+    format!(
+        "venus_jig event=resource cmd={cmd} ctx_id={ctx_id} res_id={} result={}",
+        res_id.map_or(-1, i64::from),
+        result.word()
+    )
+}
+
+/// `RESOURCE_UNREF` のログ行。
+pub fn resource_unref_line(res_id: Option<u32>, result: QueryResult) -> String {
+    format!(
+        "venus_jig event=resource cmd=RESOURCE_UNREF res_id={} result={}",
+        res_id.map_or(-1, i64::from),
+        result.word()
+    )
+}
+
+/// `SUBMIT_3D` のログ行の材料。本体のバイト列は含めない（数値と固定語彙のみ）。
+#[derive(Debug, Clone, Copy)]
+pub struct Submit3dLog {
+    /// ヘッダの ctx_id。
+    pub ctx_id: u32,
+    /// `INFO_RING_IDX` が立つときだけ入る ring_idx（無ければ -1 で出す）。
+    pub ring_idx: Option<u8>,
+    /// `size` フィールド（復号できなければ -1）。
+    pub size: Option<u32>,
+    /// 本体先頭の venus コマンド種別の生値（解析できなければ -1）。
+    pub venus_cmd: Option<u32>,
+    /// 本体ヘッダ検査の結果の固定語彙（`ok` / `empty` / `none` / `venus_wire.*`）。
+    pub wire: &'static str,
+    /// 応答の結果。
+    pub result: QueryResult,
+}
+
+/// `SUBMIT_3D` のログ行。
+pub fn submit_3d_line(l: &Submit3dLog) -> String {
+    format!(
+        "venus_jig event=submit_3d cmd=SUBMIT_3D ctx_id={} ring_idx={} size={} venus_cmd={} wire={} result={}",
+        l.ctx_id,
+        l.ring_idx.map_or(-1, i64::from),
+        l.size.map_or(-1, i64::from),
+        l.venus_cmd.map_or(-1, i64::from),
+        l.wire,
+        l.result.word()
     )
 }
 
@@ -225,4 +304,125 @@ fn classify(line: &str) -> Option<Class> {
         "GET_CAPSET" | "GET_CAPSET_INFO" => Some(Class::Other),
         _ => None,
     }
+}
+
+/// 上限に達してログの書き込みを止めたことを示す行。照合器では `Other` に分類され、壊れた行に数えられない。
+pub fn log_truncated_line() -> String {
+    "venus_jig event=log_truncated reason=limit".to_string()
+}
+
+/// 上限つきのログ書き出し先（GPU-6・REPAIR-5・#1598）。1 行ずつ `write_all` し、バッファリングしない。
+///
+/// 総量が [`MAX_LOG_BYTES`]・行数が [`MAX_LINES`]・1 行が [`MAX_LINE_BYTES`] を超える行は書かず、打ち切り行
+/// （[`log_truncated_line`]）を 1 回だけ書いて以降は捨てる。打ち切り行の分は常に予約するので、書いたログ全体が
+/// 照合器（[`find_capset_queries`]）の上限に収まる。`session::run` の sink は `Result` を返さないため、最初の書き込み
+/// エラーはここに保持して以降の書き込みを止め、呼び出し側が [`LogSink::into_inner`] で取り出す。
+#[derive(Debug)]
+pub struct LogSink<W: Write> {
+    out: W,
+    bytes: usize,
+    lines: usize,
+    truncated: bool,
+    error: Option<io::ErrorKind>,
+}
+
+impl<W: Write> LogSink<W> {
+    /// 空のログとして `out` を包む。
+    pub fn new(out: W) -> Self {
+        Self {
+            out,
+            bytes: 0,
+            lines: 0,
+            truncated: false,
+            error: None,
+        }
+    }
+
+    /// 1 行を書く（末尾の改行は付与する）。上限を超える場合は打ち切り行を 1 回だけ書いて以降を捨てる。
+    pub fn write_line(&mut self, line: &str) {
+        if self.truncated || self.error.is_some() {
+            return;
+        }
+        let reserve = log_truncated_line().len() + 1;
+        let need = line.len() + 1;
+        let fits = line.len() <= MAX_LINE_BYTES
+            && !line.contains(['\n', '\r'])
+            && self.bytes + need + reserve <= MAX_LOG_BYTES
+            && self.lines + 2 <= MAX_LINES;
+        if fits {
+            self.put(line, need);
+        } else {
+            self.truncated = true;
+            let t = log_truncated_line();
+            let n = t.len() + 1;
+            self.put(&t, n);
+        }
+    }
+
+    fn put(&mut self, line: &str, need: usize) {
+        let mut buf = String::with_capacity(need);
+        buf.push_str(line);
+        buf.push('\n');
+        match self.out.write_all(buf.as_bytes()) {
+            Ok(()) => {
+                self.bytes += need;
+                self.lines += 1;
+            }
+            Err(e) => self.error = Some(e.kind()),
+        }
+    }
+
+    /// 打ち切りが起きたか。
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// 書き出し先と、保持した最初の書き込みエラーを返す。
+    pub fn into_inner(self) -> (W, Option<io::ErrorKind>) {
+        (self.out, self.error)
+    }
+}
+
+/// [`read_log_file`] の失敗。固定語彙のみ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFileError {
+    /// 通常ファイルでない（symlink・FIFO・ディレクトリ等）。open する前に拒否する。
+    NotRegularFile,
+    /// 状態の取得または open に失敗した。
+    Open,
+    /// 読み取りに失敗した。
+    Read,
+    /// `MAX_LOG_BYTES` を超えている。
+    TooLarge,
+    /// UTF-8 でない。
+    NotUtf8,
+}
+
+/// 治具のログファイルを上限つきで読む（事後監査 #1528 D2。実機前提テストが使う）。
+///
+/// 手順: (1) `symlink_metadata` で通常ファイル以外を open 前に拒否する（FIFO は書き手が現れるまで open が止まるため）。
+/// (2) open する。(3) 開いた fd の `metadata` で通常ファイルとサイズ上限を確かめ直す。(4) `MAX_LOG_BYTES + 1` で打ち切って読む。
+/// 限界: (1) と (2) の間に FIFO へ差し替えられる競合は残る（`O_NONBLOCK` / `O_NOFOLLOW` の値はアーキごとに異なり、
+/// ここでは扱わない）。呼び出し側は読み取りを期限つきで待つこと（REPAIR-5）。
+pub fn read_log_file(path: &Path) -> Result<String, LogFileError> {
+    let before = fs::symlink_metadata(path).map_err(|_| LogFileError::Open)?;
+    if !before.file_type().is_file() {
+        return Err(LogFileError::NotRegularFile);
+    }
+    let file = fs::File::open(path).map_err(|_| LogFileError::Open)?;
+    let meta = file.metadata().map_err(|_| LogFileError::Open)?;
+    if !meta.file_type().is_file() {
+        return Err(LogFileError::NotRegularFile);
+    }
+    if meta.len() > MAX_LOG_BYTES as u64 {
+        return Err(LogFileError::TooLarge);
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_LOG_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| LogFileError::Read)?;
+    if bytes.len() > MAX_LOG_BYTES {
+        return Err(LogFileError::TooLarge);
+    }
+    String::from_utf8(bytes).map_err(|_| LogFileError::NotUtf8)
 }

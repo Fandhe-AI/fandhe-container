@@ -264,9 +264,10 @@ macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なし�
 - 実装済み（F1.1・#1516）: vhost-user メッセージの codec（`vhost_user`。10.5）。virtqueue・セッションは F1.3・F1.4 で実装
 - 実装済み（F1.2・#1517）: `SCM_RIGHTS` の fd 送受信とゲストメモリの mmap のラッパー（`vhost_user::fd_passing` / `guest_memory`・`src/sys.rs`。Linux 限定。10.6）
 - **受入基準 2（ゲストの Mesa venus の capset クエリが自前デコーダに届いたことをログで確認）は未達**。トランスポート（後続 F1）と実機実行（F3・#725。人間担当）が必要なため
-- 後続（issue 起票は未実施・承認待ち）: F1 vhost-user トランスポート（メッセージ codec・fd 受け渡しと `mmap` の `sys` ラッパー・split virtqueue・kick / call。rust-vmm 系クレートは MVM-4 で使えないため自作）、F2 残りの ctrl 応答（10.4 節。`RESOURCE_CREATE_BLOB`・`SUBMIT_3D` 等）、F3 実機疎通（#725）
+- 後続（issue 起票は未実施・承認待ち）: F1 vhost-user トランスポート（メッセージ codec・fd 受け渡しと `mmap` の `sys` ラッパー・split virtqueue・kick / call。rust-vmm 系クレートは MVM-4 で使えないため自作）、F2 残りの ctrl 応答（10.4 節。`RESOURCE_CREATE_BLOB`・`SUBMIT_3D` 等は F5.2・#1601 で実装済み。`MAP_BLOB` / `UNMAP_BLOB` は F5.2b）、F3 実機疎通（#725）
 - 実装済み（F1.3・#1518）: split virtqueue（`virtqueue`。10.7）
 - 実装済み（F1.4・#1519）: vhost-user のセッションと ctrl キューの応答ループ（`session`。Linux 限定。10.8）。受入基準 2 は F3（#725）の実機待ちのまま
+- 実装済み（F5.2・#1601）: `RESOURCE_CREATE_BLOB`・`CTX_ATTACH_RESOURCE` / `DETACH_RESOURCE`・`RESOURCE_UNREF`（資源表 `resource`。計上のみで実メモリは確保しない）と `SUBMIT_3D` の最小応答（受理して受け渡し点 `Handled::submit` へ渡す。dispatch はしない）。10.3・10.4.3
 - 後続（F5。#1599）: F5.1（#1600）で capset 以降の ctrl の列と治具の応答範囲を一次情報で確かめて 10.4 節に記録した。F5.2（#1601）は ctrl の応答（共有メモリを要しない部分）、F6（#1602）は記録、共有メモリの対応（F5.2b。issue 起票は未実施・承認待ち）は 10.4.4 節
 - CI: `make poc-venus-jig-check`（fmt-check・clippy・test）は CI の `rust-ci-default-features` ジョブが 3 OS で実行し、`crates/plugin-macos` 側の変更による治具の破損を検出する（実機前提テストは `#[ignore]` で分離済みで CI では走らない）
 
@@ -317,6 +318,24 @@ issue #1520（GPU-6・TASK-172 後続 F2）で追加した ctrl:
 - `venus_jig event=ctx cmd=CTX_DESTROY ctx_id=1 result=ok`
 
 要求長はコマンドごとにちょうどの値のみ受理する（PoC。余剰バイトも拒否）。
+
+issue #1601（GPU-6・TASK-172 後続 F5.2）で追加した ctrl（値は同じ `v6.12` の `virtio_gpu.h` を再取得して確認。SHA-256 一致）:
+
+| 項目 | 値 |
+| ---- | -- |
+| `RESOURCE_CREATE_BLOB` | 0x010c。要求長 56（ヘッダ + resource_id 4 + blob_mem 4 + blob_flags 4 + nr_entries 4 + blob_id 8 + size 8）。`blob_mem` = HOST3D（2）・`blob_flags` = MAPPABLE（1）・`blob_id` = 0・`nr_entries` = 0 だけ受理。size は 0 でなく 4096 の倍数で 16 MiB 以下。件数 256・合計 64 MiB の上限（案） |
+| `CTX_ATTACH_RESOURCE` / `CTX_DETACH_RESOURCE` | 0x0202 / 0x0203。要求長 32（ヘッダ + resource_id 4 + padding 4）。ヘッダの `ctx_id` が作成済みで、res が作成済みの組だけ成功 |
+| `RESOURCE_UNREF` | 0x0102。要求長 32。attach 中は `ERR_INVALID_PARAMETER`。ヘッダの ctx は問わない |
+| `SUBMIT_3D` | 0x0207。固定部 32（ヘッダ + size 4 + padding 4）+ 本体。`size` = 本体の実長、要求全体 4096 以下。`INFO_RING_IDX` が立つときだけ ring_idx < 64。本体 0 バイトも受理 |
+| 追加エラー | `ERR_INVALID_RESOURCE_ID` 0x1203（res_id 0・重複・未作成）。件数・合計の上限は `ERR_OUT_OF_MEMORY` 0x1201 |
+| 未実装のまま | `RESOURCE_MAP_BLOB` 0x0208 / `UNMAP_BLOB` 0x0209（`ERR_UNSPEC`。F5.2b） |
+
+ログ形式（数値と固定語彙のみ。復号できなかった値は -1。`blob_id` と本体のバイト列は出さない）:
+
+- `venus_jig event=resource cmd=RESOURCE_CREATE_BLOB ctx_id=1 res_id=1 blob_mem=2 blob_flags=1 size=135168 result=ok`
+- `venus_jig event=resource cmd=CTX_ATTACH_RESOURCE ctx_id=1 res_id=1 result=ok`（`CTX_DETACH_RESOURCE` も同形）
+- `venus_jig event=resource cmd=RESOURCE_UNREF res_id=1 result=ok`
+- `venus_jig event=submit_3d cmd=SUBMIT_3D ctx_id=1 ring_idx=0 size=256 venus_cmd=188 wire=ok result=ok`（`wire` は `ok` / `empty` / `none`〔拒否〕/ `venus_wire.*`）
 
 ### 10.4 capset 以降の ctrl の列と治具の応答範囲（F5.1・#1600）
 
@@ -385,6 +404,13 @@ Mesa は 2 層で読む。Mesa は ctrl を直接出さず、DRM ioctl を呼ぶ
 | `RESOURCE_MAP_BLOB` / `UNMAP_BLOB`（0x0208 / 0x0209） | **#1601 では未実装のまま**（`ERR_UNSPEC`）。ゲストカーネルが作成直後に出すので、実装するとき F5.2b | — | `offset` が共有メモリ領域の内側で、`offset + size` が領域内、他の map と重ならないこと（F5.2b への申し送り） | 要る。protocol feature `SHMEM` と `BACKEND_REQ`、`GET_SHMEM_CONFIG`、バックエンド要求 `SHMEM_MAP` / `SHMEM_UNMAP`。10.4.4 |
 | `SUBMIT_3D`（0x0207） | #1601: 受理して、ペイロードを記録の受け渡し点へ渡す。dispatch はしない（応答は `OK_NODATA` で、`FLAG_FENCE` なら fence を引き継ぐ） | ペイロードは上限つきの固定長（10.4.6） | ctx が作成済みか、`ring_idx` < 64（`INFO_RING_IDX` が立つときだけ見る。`NUM_RINGS`=64）、`size` とペイロード実長の一致。本体 0 バイトも受理 | 不要（既存の `SplitQueue` で連結できる範囲。10.4.6） |
 
+本 issue（#1601）で実装した内容（実装済み。上の表の「#1601:」の記述どおり）の補足:
+
+- `CTX_DESTROY` は、その ctx に attach 中の res を暗黙に detach する（本表に定めが無かったため #1601 で決めた）。ゲストのカーネルは GEM close（detach → unref）を先に出すが、順序が崩れても後続の `RESOURCE_UNREF` が拒否され続けないように、またスロット再利用時に古い所属が新しい ctx へ化けないようにするため。応答とログ行は変えない
+- `SUBMIT_3D` の本体が空でなければ先頭 8 バイトを `parse_command_header` で読むが、結果は応答の種別を変えない（ヘッダ不正・候補外の種別でも `OK_NODATA`）。治具は受け取りまでで実行しないので OK は「受け取った」の意味に留まり、検査結果はログ（`wire=`）と受け渡し点で #1602 / 解析側へ渡す
+- 受け渡し点は `adapter::Handled::submit`（`Submit3d`: ctx_id・ring_idx・fence_id・header・payload）。`session` は応答を書き戻せず adapter を巻き戻した要求の `submit` を捨てる契約で、ゲストが ACK を見ていない提出を記録しない。配線は #1602
+- 資源表は `CtrlAdapter` が所有する固定長配列（所属 ctx は ctx 表のスロット番号のビット集合）で、巻き戻しの対象に含まれる
+
 上限の根拠: Mesa が確保する共有メモリは、ring が 128 KiB に extra 4 バイトを足した大きさ（`vn_instance.c` 128〜140 行、`vn_ring.c` 262〜270 行付近のレイアウト。行番号は付近）、cs pool が 8 MiB、reply pool が 1 MiB（`vn_instance.c` 300〜312 行）。1 件 16 MiB は最大の cs pool の 2 倍、合計 64 MiB は同時に持つ ring・cs・reply の合計に余裕を足した値で、いずれも**案**（実機でプール拡張の挙動を確かめて#725 で見直す）。cs pool の拡張は `vn_cs.c` の `next_buffer_size` が倍々に増やすため、16 MiB を超える要求は拒否して Mesa に失敗を返す（`VK_ERROR_OUT_OF_DEVICE_MEMORY` で止まる見込みで、挙動は未確認）。
 
 #### 10.4.4 共有メモリの前提（F5.2b の要件）
@@ -426,7 +452,7 @@ Mesa は 2 層で読む。Mesa は ctrl を直接出さず、DRM ioctl を呼ぶ
 | `RESOURCE_CREATE_BLOB` の `GUEST` / `HOST3D_GUEST`・`USE_SHAREABLE` / `USE_CROSS_DEVICE` | ring・cs・reply の用途は HOST3D・MAPPABLE・`blob_id` 0 だけ。sg を要する経路は範囲外 |
 | `ERR_INVALID_SCANOUT_ID`（0x1202） | scanout を持たないため使わない |
 
-10.3 の表との対応: 既存の `GET_CAPSET_INFO` / `GET_CAPSET`・`GET_DISPLAY_INFO`・`CTX_CREATE` / `CTX_DESTROY` は変更しない。追加するのは上の表の `RESOURCE_CREATE_BLOB`・`CTX_ATTACH_RESOURCE` / `DETACH_RESOURCE`・`RESOURCE_UNREF`・`SUBMIT_3D` の応答で、`MAP_BLOB` / `UNMAP_BLOB` は引き続き未実装（`ERR_UNSPEC`）。製品版の ctrl 枠は TASK-175.1.3（#915）・TASK-176.1（#749）。
+10.3 の表との対応: 既存の `GET_CAPSET_INFO` / `GET_CAPSET`・`GET_DISPLAY_INFO`・`CTX_CREATE` / `CTX_DESTROY` は変更しない。追加するのは上の表の `RESOURCE_CREATE_BLOB`・`CTX_ATTACH_RESOURCE` / `DETACH_RESOURCE`・`RESOURCE_UNREF`・`SUBMIT_3D` の応答で、`MAP_BLOB` / `UNMAP_BLOB` は引き続き未実装（`ERR_UNSPEC`）。上の 5 種の応答は #1601 で実装済み。製品版の ctrl 枠は TASK-175.1.3（#915）・TASK-176.1（#749）。
 
 ### 10.5 vhost-user メッセージの値（F1.1・#1516）
 
@@ -553,8 +579,20 @@ frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲスト
 - 応答ループ: socket と ctrl キューの kick を、単一 fd 用の `sys::wait_fd` で `poll_slice`（既定 10ms）ずつ交互に待つ。1 回の kick で最大 `num` 件を処理して used へ書き、1 件以上なら call へ 1 を書く。`pop` / `add_used` の失敗はセッションを終了する（壊れたキューを黙って続けない）。writable が応答に足りない要求は応答を捨てて len=0 で返し、`response_dropped` の行を出してセッションは続ける。readable が 4 KiB を超える要求はアダプタへ渡さず `ERR_INVALID_PARAMETER`
 - ログ: 既存の `venus_jig event=...` 形式を保つ。追加は `session_error`（`code`・`request`）・`need_reply_ignored`・`response_dropped`・`session_end`。固定語彙と数値だけで、frontend やゲスト由来のバイト列・fd 番号・GPA は出さない
 - 扱わない（REPAIR-3）: `NEED_REPLY`（REPLY_ACK を広告しないので `SET_*` には応答せず、ログに 1 行出す）、cursorq（ring 1）の要求処理、`SET_CONFIG`、`VRING_NOFD`、inflight、`INDIRECT` / `EVENT_IDX`、`observe::snapshot_lines` の定期出力と virtqueue 個別の観測カウンタ（終了時の集計出力は `session::run` で実装済み）
-- 既知の穴: UDS の bind と所有者・権限・symlink の検証、peer credential の検証（PLUG-12 相当）は範囲外。`UnixStream::peer_cred` が unstable で、`SO_PEERCRED` の取得は #1517 の承認範囲外の `unsafe` を要するため、`UnixStream` を受け取る API に留め、bind は F3 の起動側に委ねる。治具は PoC で、実機の実行は人間が担当する閉じた環境という前提
+- peer credential の検証（PLUG-12）は起動入口が accept 直後に `SO_PEERCRED`（`sys::peer_uid`＝U11）で行い、`session::run` は照合済みの `UnixStream` を受け取る API に留める。UDS の bind と所有者・権限・symlink の検証は起動入口（10.9）が行う。治具は PoC で、実機の実行は人間が担当する閉じた環境という前提
 - 承認事項: socket と kick を同時に待つ複数 fd の `ppoll` は `sys.rs` の `unsafe`（U10）の変更になるため行っていない。kick への反応に最大 `poll_slice` の遅延が乗る
+
+### 10.9 起動入口（F4・#1598）
+
+`launch`（lib）と bin `venus-jig` が、UDS の bind・期限つき accept・ログのファイル出力を担う。Linux 限定。1 接続を `session::run` で最後まで処理して終わる（実機の疎通は #725）。
+
+- 引数: `--socket <絶対パス>`・`--log <絶対パス>`（必須）、`--message-timeout-ms`（既定 5000）・`--idle-timeout-ms`（既定 60000）・`--poll-slice-ms`・`--accept-timeout-ms`（既定 60000、0 より大きく 1 時間以下）。VMM 側から指定するのは `--socket` に渡した絶対パス。記録ファイルのパスは #1602 で足す
+- bind 前の検証（拒否時は何も作らず、既存のパスは消さない）: 絶対パス・成分に `.` / `..` / 空がない・NUL なし・ソケットとログが別パス（`PATH_NOT_ABSOLUTE` / `PATH_INVALID`）、ソケットパスが `sun_path` の 107 バイト以下（`PATH_TOO_LONG`。`linux/un.h` の `UNIX_PATH_MAX` 108 から NUL を除く）、ソケットの親ディレクトリが symlink でない・ディレクトリ・実行ユーザー（`/proc/self/status` の effective UID）の所有・モード `0700`（`SOCKET_DIR_SYMLINK` / `SOCKET_DIR_NOT_DIRECTORY` / `SOCKET_DIR_NOT_OWNED` / `SOCKET_DIR_NOT_PRIVATE`）、`/` までの祖先が存在し（無ければ拒否。検査後に別 UID が作って差し替えるのを防ぐ。ログの置き場所も同じ規則で `LOG_DIR_UNSAFE`）、symlink でなく自 UID か root の所有で、グループ／他者が書ける場合は sticky が立っている（`SOCKET_DIR_ANCESTOR_UNSAFE`。別 UID の rename 差し替えを防ぐ）、ソケットパスに何もない（`SOCKET_PATH_EXISTS`）。ソケットディレクトリ自身が無ければ（その親は検証済みで存在が必須）1 段だけ `DirBuilder` の mode `0700` で作る
+- ログ: `create_new` + `0600`（既存は `LOG_PATH_EXISTS`、symlink も `O_EXCL` で失敗）。`log::LogSink` が総量 4 MiB・1 行 512 バイト・10 万行の照合器の上限に収め、超えたら `venus_jig event=log_truncated reason=limit` を 1 回だけ書いて以降を捨てる。パス文字列・ゲスト由来のバイト列は出さない
+- 実行時エラーは stderr に 1 行の JSON `{"code","message"}`（`SESSION_FAILED` のみ `cause` にセッションの code）。終了コードは検証エラー 2、それ以外の失敗 1、正常終了 0
+- accept は非ブロックの sleep ループ（10ms 刻み、期限切れは `ACCEPT_TIMEOUT`）。`sys::wait_fd`（ppoll）の listener fd への別用途の呼び出しは承認範囲外のため採らなかった（承認されれば置き換え可能な改善案）。1 接続を受けたら listener を閉じてソケットファイルを消す
+- peer credential（PLUG-12）: accept 直後に `sys::peer_uid`（`getsockopt(SO_PEERCRED)`。U11）で接続元 UID を取得し、実行ユーザーの effective UID と照合する。不一致（`PEER_UID_MISMATCH`）・取得失敗（`PEER_CRED_UNAVAILABLE`）は接続を閉じて拒否する（fail-closed）。加えてソケットディレクトリを自 UID 所有・`0700` に限る。限界は、同じ UID の別プロセスは接続できること、検査と bind の間の TOCTOU は、祖先が他 UID に差し替え不能であることと所有者が自分で `0700` のディレクトリであることで抑えるに留まること（同じ UID と root は差し替えられる。祖先に symlink がある環境は拒否される）。別 UID の接続拒否は別 UID を用意できないため実機前提で、単体試験は期待 UID をずらして照合関数を検証する。U11 は `sys` モジュールの事前承認（coding-rust.md）の条件で追加した。
+- ログ読み取り側（事後監査 #1528 D2）: `log::read_log_file` が open 前に `symlink_metadata` で通常ファイル以外（FIFO・symlink・ディレクトリ）を拒否し、open 後も `metadata` で確かめ直し、上限つきで読む。(1) と open の間に FIFO へ差し替える競合は残る。実機前提テストは読み取りを補助スレッドで動かし 30 秒の `recv_timeout` で待つ
 
 ## 11. 以降の章（未着手。10 章は #888 の範囲）
 

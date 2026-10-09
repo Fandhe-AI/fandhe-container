@@ -6,8 +6,9 @@
 //! `CtrlAdapter::handle_ctrl` → 応答を used ring へ書く → call で通知する。受入基準 2（ゲストの Mesa venus の capset
 //! クエリが自前デコーダへ届いたことをログで確認）の前提で、実機での実行は F3（#725。人間担当）。
 //!
-//! 呼び出し元: F3 の起動側（UDS を bind して `accept` した接続を渡す）と結合試験。bind・所有者 / 権限 / symlink の検証・
-//! peer credential の検証（PLUG-12 相当）は本層の範囲外で、呼び出し側が行う（既知の穴。設計書 10.8）。
+//! 呼び出し元: `launch`（UDS を bind して `accept` した接続を渡す。F4・#1598）と結合試験。bind・所有者 / 権限 / symlink の検証は
+//! `launch` が行う。peer credential の検証（PLUG-12。`SO_PEERCRED`）は `launch` が accept 直後に行い、この関数に渡る接続は照合済み
+//! （`launch` の doc と設計書 10.9）。
 //!
 //! 待機はすべて期限つき（REPAIR-5）。単一 fd 用の `sys::wait_fd` を socket と ctrl の kick で交互に短く待つ方式のため、
 //! kick への反応には最大 [`SessionLimits::poll_slice`] の遅延が乗る（複数 fd の ppoll 化は unsafe の承認範囲外）。
@@ -55,6 +56,8 @@ use negotiation::{State, expected_fds};
 
 /// ctrl 要求として受け付ける readable の最大長（固定長のスタックバッファの大きさ）。`CTX_CREATE`（96 バイト）より十分大きい。
 pub const MAX_CTRL_REQ_LEN: usize = 4096;
+// 3 OS でビルドされる `ctrl` の上限（`SUBMIT_3D` の検査）と同じ値に保つ。
+const _: () = assert!(MAX_CTRL_REQ_LEN == crate::ctrl::MAX_REQ_LEN);
 
 const DEFAULT_POLL_SLICE: Duration = Duration::from_millis(10);
 
@@ -351,6 +354,9 @@ impl Session {
                     .get(..n)
                     .ok_or_else(|| SessionError::new(SessionErrorCode::InvalidValue, None))?;
                 let h = adapter.handle_ctrl(req);
+                // `h.submit`（受理した SUBMIT_3D の受け渡し点）は、応答を書き戻せた場合だけ記録へ渡す契約
+                // （`dropped` で adapter を巻き戻した要求の提出は、ゲストが ACK を見ていないので捨てる）。
+                // 配線は #1602（F6）で行うため、ここでは消費しない。
                 (h.response, h.log_line)
             };
             let mut dropped = false;

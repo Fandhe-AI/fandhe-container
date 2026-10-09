@@ -310,10 +310,16 @@ mod linux {
         assert_eq!(e.code, TransportErrorCode::ShrinkNotSealed);
         assert_eq!(e.code.as_str(), "SHRINK_NOT_SEALED");
         assert_eq!(count_maps(&name), 0);
-        // seal 非対応の通常ファイル（F_GET_SEALS が EINVAL）も拒否する。長さが足りる場合でも同じ。
+        // 通常ファイルは治具の memfd と st_dev が違うので、seal を調べる前に `UNSUPPORTED_BACKING` で拒否する
+        // （hugetlb の memfd も同じ経路。長さが足りる場合でも同じ）。
         let exe = File::open("/proc/self/exe").expect("open exe");
         let e = GuestMemoryRegion::map(&exe, &region(0, 1, 0)).expect_err("regular file");
-        assert_eq!(e.code, TransportErrorCode::ShrinkNotSealed);
+        assert_eq!(e.code, TransportErrorCode::UnsupportedBacking);
+        assert_eq!(e.code.as_str(), "UNSUPPORTED_BACKING");
+        assert_eq!(
+            e.to_string(),
+            "UNSUPPORTED_BACKING: backing file is not a shmem memfd supported by the jig"
+        );
         // GuestMemory 経由でも同じ。
         let g = create_memfd_unsealed(&c, 0x1000).expect("memfd");
         let t = table(&[region(0, 0x1000, 0)]);

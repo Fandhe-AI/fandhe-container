@@ -42,7 +42,7 @@ use std::num::NonZeroUsize;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::ptr::NonNull;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 /// 1 回の受信・送信で扱う fd 数の上限。補助データバッファの固定長を決める（`MAX_MEM_REGIONS` と同じ 32）。
 pub(crate) const MAX_SCM_FDS: usize = 32;
@@ -52,6 +52,9 @@ pub(crate) const MAX_SCM_FDS: usize = 32;
 pub(crate) enum SysError {
     /// 対応外のアーキテクチャ（定数が未定義。fail-closed）。
     Unsupported,
+    /// map しようとした fd が、治具自身が作る memfd と同じ shmem のファイルシステム（`st_dev`）に無い（hugetlb の memfd・
+    /// 通常ファイル等）。hole punch 後の SIGBUS や、huge page に揃わない長さの munmap 失敗を避けるため受け付けない。
+    ForeignBacking,
     /// map しようとした fd に縮小を封じる `F_SEAL_SHRINK` が無い（seal 非対応の fd を含む）。
     NotSealed,
     /// ファイルが map 長に届かない（EOF を超えるアクセスは SIGBUS になる）。
@@ -645,6 +648,22 @@ impl Drop for Lease {
     }
 }
 
+/// 治具自身が作る memfd（`MFD_HUGETLB` なし。カーネル内部の shmem のマウント）の `st_dev`。初回に作って調べ、以後は
+/// 使い回す。調べられなかったときは記録せずエラーを返す（次回に再試行。fail-closed）。
+static SHMEM_DEV: OnceLock<u64> = OnceLock::new();
+
+fn shmem_dev() -> Result<u64, SysError> {
+    if let Some(dev) = SHMEM_DEV.get() {
+        return Ok(*dev);
+    }
+    let probe = File::from(memfd_create_cloexec(c"venus-jig-dev-probe", false)?);
+    let dev = probe
+        .metadata()
+        .map_err(|e| SysError::Os(e.raw_os_error().unwrap_or(EINVAL)))?
+        .dev();
+    Ok(*SHMEM_DEV.get_or_init(|| dev))
+}
+
 /// `mmap` した共有マッピング。`Drop` で `munmap` する。`!Send` / `!Sync` で、包む側（`GuestMemoryRegion` /
 /// `GuestMemory`）も同じになる（`unsafe impl` で付け足さない）。`copy_in` / `copy_out` は `&self` から非アトミックに
 /// コピーするため、複数スレッドから同じマッピングを使えないことが前提。`NonNull<u8>` も `!Send` / `!Sync` だが、その性質に
@@ -667,6 +686,8 @@ impl MmapRegion {
     /// `[access_start, len)` だけで、その範囲をプロセス内で占有する。
     ///
     /// 安全性に要る検証はすべてここで map と不可分に行い、呼び出し側に頼らない（呼び出し元は `guest_memory` だけ）:
+    /// 0. backing file が治具自身の作る memfd と同じ shmem のファイルシステム（`st_dev`）にある（違えば `ForeignBacking`。
+    ///    hugetlb の memfd は hole punch 後に SIGBUS になり得て、huge page に揃わない長さの munmap が失敗してマッピングが残る）
     /// 1. `F_SEAL_SHRINK` があり縮まない（無ければ・seal 非対応の fd は `NotSealed`。後から縮むと SIGBUS になる）
     /// 2. seal の確認後に取り直したファイル長が `len` 以上（`TooShort`。seal は取り消せないので以後も縮まない）
     /// 3. 同じ backing file（`st_dev`・`st_ino`）の重なるアクセス範囲を別のマッピングが占有していない（`InUse`。
@@ -687,10 +708,13 @@ impl MmapRegion {
         }
         let io_err = |e: io::Error| SysError::Os(e.raw_os_error().unwrap_or(EINVAL));
         let id = file.metadata().map_err(io_err)?;
+        if id.dev() != shmem_dev()? {
+            return Err(SysError::ForeignBacking);
+        }
         match fcntl_get_seals(file.as_fd()) {
             Ok(seals) if seals & F_SEAL_SHRINK != 0 => {}
             Ok(_) => return Err(SysError::NotSealed),
-            // seal 非対応の fd（通常ファイル等）。縮まない保証を確認できないので拒否する。
+            // seal 非対応の fd（通常ファイル等は上の st_dev で先に拒否するが、多層防御として残す）。縮まない保証を確認できない。
             Err(SysError::Os(n)) if n == EINVAL => return Err(SysError::NotSealed),
             Err(e) => return Err(e),
         }
@@ -873,6 +897,24 @@ mod tests {
             dev: 8,
             ..k(1, 0, 0x1000)
         }));
+    }
+
+    /// GPU-6: 治具の memfd と違う `st_dev` の fd（通常ファイル）は seal を調べる前に `ForeignBacking`。基準の `st_dev` は
+    /// 治具が作る memfd どうしで一致する。
+    #[test]
+    fn gpu6_map_shared_rejects_foreign_backing_device() {
+        let exe = File::open("/proc/self/exe").expect("open exe");
+        let len = NonZeroUsize::new(1).expect("nz");
+        assert_eq!(
+            MmapRegion::map_shared(&exe, 0, len).expect_err("regular file"),
+            SysError::ForeignBacking
+        );
+        let a = File::from(memfd_create_cloexec(c"jig-sys-dev-a", true).expect("memfd"));
+        let b = File::from(memfd_create_cloexec(c"jig-sys-dev-b", false).expect("memfd"));
+        let dev = shmem_dev().expect("dev");
+        assert_eq!(a.metadata().expect("meta").dev(), dev);
+        assert_eq!(b.metadata().expect("meta").dev(), dev);
+        assert_ne!(exe.metadata().expect("meta").dev(), dev);
     }
 
     /// GPU-6: `map_shared` は呼び出し側に頼らず、seal・ファイル長・占有・空の範囲を map 前に自分で検証する。

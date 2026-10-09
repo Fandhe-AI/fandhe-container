@@ -46,11 +46,13 @@ pub enum TransportErrorCode {
     /// 同じ backing file の同じバイト範囲が、このプロセスの別の領域で map 済み（共有マッピングへの非アトミックな
     /// アクセスがプロセス内で並行しないよう、範囲ごとに 1 領域だけを許す）。
     BackingInUse,
+    /// fd の backing が治具の扱える種類でない（治具自身が作る memfd と `st_dev` が違う。hugetlb の memfd・通常ファイル等）。
+    UnsupportedBacking,
 }
 
 impl TransportErrorCode {
     /// 全 code（添字は `as usize` と一致する。観測カウンタの添字に使う。REPAIR-4）。
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::TooManyFds,
         Self::ControlTruncated,
         Self::DataTruncated,
@@ -68,6 +70,7 @@ impl TransportErrorCode {
         Self::OsError,
         Self::Unsupported,
         Self::BackingInUse,
+        Self::UnsupportedBacking,
     ];
 
     /// 外部へ出す固定の code 文字列。
@@ -90,6 +93,7 @@ impl TransportErrorCode {
             Self::OsError => "OS_ERROR",
             Self::Unsupported => "UNSUPPORTED",
             Self::BackingInUse => "BACKING_IN_USE",
+            Self::UnsupportedBacking => "UNSUPPORTED_BACKING",
         }
     }
 }
@@ -124,6 +128,7 @@ impl TransportError {
     pub(crate) fn from_sys(e: SysError) -> Self {
         match e {
             SysError::Unsupported => Self::new(TransportErrorCode::Unsupported),
+            SysError::ForeignBacking => Self::new(TransportErrorCode::UnsupportedBacking),
             SysError::NotSealed => Self::new(TransportErrorCode::ShrinkNotSealed),
             SysError::TooShort => Self::new(TransportErrorCode::FileTooShort),
             SysError::InUse => Self::new(TransportErrorCode::BackingInUse),
@@ -158,6 +163,9 @@ impl TransportError {
             TransportErrorCode::Unsupported => "unsupported architecture",
             TransportErrorCode::BackingInUse => {
                 "backing memory range is already mapped by another region"
+            }
+            TransportErrorCode::UnsupportedBacking => {
+                "backing file is not a shmem memfd supported by the jig"
             }
         }
     }

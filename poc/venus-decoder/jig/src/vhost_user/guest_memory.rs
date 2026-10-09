@@ -13,8 +13,11 @@
 //! # 縮小の封じ込め（SIGBUS 対策）
 //! map 前のファイル長検査だけでは、frontend が後から `ftruncate` で縮めると EOF を超えたアクセスが `SIGBUS` になり
 //! backend 全体が落ちる。このため `fcntl(F_GET_SEALS)` で `F_SEAL_SHRINK` を確認し、縮まないと確認できない fd
-//! （seal なしの memfd・seal 非対応の通常ファイル等）は `SHRINK_NOT_SEALED` で map せず拒否する（fail-closed）。
+//! （seal なしの memfd 等）は `SHRINK_NOT_SEALED` で map せず拒否する（fail-closed）。
 //! seal は取り消せないので、確認後に縮むことは無い。長さの検査は seal の確認後に行う。
+//! それより前に、backing file が治具自身の作る memfd と同じ shmem のファイルシステム（`st_dev`）にあることを確かめ、
+//! 違う fd（hugetlb の memfd・通常ファイル等）は `UNSUPPORTED_BACKING` で拒否する。hugetlb の memfd は hole punch の後に
+//! SIGBUS になり得て、huge page に揃わない長さの munmap が失敗してマッピングが残るため。
 //! 領域をまたぐアクセスは `OUT_OF_BOUNDS` で拒否する（PoC の割り切り）。`userspace_addr` は vring アドレスの変換
 //! （F1.3 / F1.4）で使うので [`GuestMemoryRegion::userspace_addr`] で保持だけし、ここでは使わない。
 //!
@@ -70,6 +73,7 @@ impl GuestMemoryRegion {
     ///
     /// - `memory_size` は 0 より大きく、`mmap_offset + memory_size`（map 長）は [`MAX_REGION_SIZE`] 以下（`INVALID_REGION`）
     /// - `guest_phys_addr + memory_size` と `mmap_offset + memory_size` が overflow しない（`INVALID_REGION`）
+    /// - fd が治具自身の作る memfd と同じ `st_dev`（shmem）にある（`UNSUPPORTED_BACKING`。hugetlb の memfd・通常ファイル等）
     /// - fd が `F_SEAL_SHRINK` つきで縮まない（`SHRINK_NOT_SEALED`。seal 非対応の fd の `EINVAL` もこれに含める）
     /// - ファイル長が map 長以上（`FILE_TOO_SHORT`。seal の確認後に検査する）
     /// - 同じ backing file の重なる範囲を map している領域が生きていない（`BACKING_IN_USE`。mmap の直前に占有する）

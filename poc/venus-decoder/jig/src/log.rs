@@ -10,7 +10,7 @@ pub const MAX_LINE_BYTES: usize = 512;
 /// 行数の上限。
 pub const MAX_LINES: usize = 100_000;
 
-/// capset クエリの結果語彙。
+/// ctrl 応答の結果語彙（capset クエリ・display info・ctx 操作で共用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryResult {
     /// 成功。
@@ -19,6 +19,10 @@ pub enum QueryResult {
     InvalidParameter,
     /// 未対応コマンド（`ERR_UNSPEC`）。
     Unspec,
+    /// ctx_id が 0・重複・未作成（`ERR_INVALID_CONTEXT_ID`）。
+    InvalidContextId,
+    /// ctx 表が上限（`ERR_OUT_OF_MEMORY`）。
+    OutOfMemory,
 }
 
 impl QueryResult {
@@ -27,6 +31,8 @@ impl QueryResult {
             Self::Ok => "ok",
             Self::InvalidParameter => "invalid_parameter",
             Self::Unspec => "unspec",
+            Self::InvalidContextId => "invalid_context_id",
+            Self::OutOfMemory => "out_of_memory",
         }
     }
 }
@@ -45,6 +51,37 @@ pub fn query_line(id: Option<u32>, version: u32, result: QueryResult, max_size: 
     format!(
         "venus_jig event=capset_query cmd=GET_CAPSET capset_id={} version={version} result={} max_size={max_size}",
         id.map_or(-1, i64::from),
+        result.word()
+    )
+}
+
+/// `GET_DISPLAY_INFO` のログ行（scanout なし構成のため `num_scanouts=0` 固定）。
+pub fn display_info_line(result: QueryResult) -> String {
+    format!(
+        "venus_jig event=display_info cmd=GET_DISPLAY_INFO num_scanouts=0 result={}",
+        result.word()
+    )
+}
+
+/// `CTX_CREATE` のログ行。復号できなかった値は -1。debug_name は出さず `nlen` の数値のみ出す（ログ注入の防止）。
+pub fn ctx_create_line(
+    ctx_id: u32,
+    capset_id: Option<u8>,
+    nlen: Option<u32>,
+    result: QueryResult,
+) -> String {
+    format!(
+        "venus_jig event=ctx cmd=CTX_CREATE ctx_id={ctx_id} capset_id={} nlen={} result={}",
+        capset_id.map_or(-1, i64::from),
+        nlen.map_or(-1, i64::from),
+        result.word()
+    )
+}
+
+/// `CTX_DESTROY` のログ行。
+pub fn ctx_destroy_line(ctx_id: u32, result: QueryResult) -> String {
+    format!(
+        "venus_jig event=ctx cmd=CTX_DESTROY ctx_id={ctx_id} result={}",
         result.word()
     )
 }

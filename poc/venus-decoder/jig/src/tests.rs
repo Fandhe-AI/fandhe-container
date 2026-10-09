@@ -2,13 +2,20 @@
 
 use fandhe_container_plugin_macos::gpu::venus::VenusCapset;
 
-use crate::adapter::handle_ctrl;
+use crate::adapter::{CtrlAdapter, Handled, MAX_CONTEXTS};
 use crate::ctrl::{
-    CMD_GET_CAPSET, CMD_GET_CAPSET_INFO, FLAG_FENCE, HDR_LEN, RESP_ERR_INVALID_PARAMETER,
-    RESP_ERR_UNSPEC, RESP_OK_CAPSET, RESP_OK_CAPSET_INFO,
+    CMD_CTX_CREATE, CMD_CTX_DESTROY, CMD_GET_CAPSET, CMD_GET_CAPSET_INFO, CMD_GET_DISPLAY_INFO,
+    FLAG_FENCE, HDR_LEN, RESP_ERR_INVALID_CONTEXT_ID, RESP_ERR_INVALID_PARAMETER,
+    RESP_ERR_OUT_OF_MEMORY, RESP_ERR_UNSPEC, RESP_OK_CAPSET, RESP_OK_CAPSET_INFO,
+    RESP_OK_DISPLAY_INFO, RESP_OK_NODATA,
 };
 use crate::device;
 use crate::log::{LogError, MAX_LINES, MAX_LOG_BYTES, find_capset_queries};
+
+/// 状態を持たない単発要求用（ctx 表は毎回空）。
+fn handle_ctrl(req: &[u8]) -> Handled {
+    CtrlAdapter::default().handle_ctrl(req)
+}
 
 fn req(cmd: u32, flags: u32, fence: u64, a: u32, b: u32) -> Vec<u8> {
     let mut v = Vec::new();
@@ -84,12 +91,15 @@ fn task172_4_gpu6_bad_lengths_rejected() {
 
 #[test]
 fn task172_4_gpu6_unknown_type_is_unspec() {
-    let h = handle_ctrl(&req(0x0100, 0, 0, 0, 0));
-    assert_eq!(h.response.resp_type(), RESP_ERR_UNSPEC);
-    assert_eq!(
-        h.log_line,
-        "venus_jig event=ctrl_rejected cmd_type=256 result=unspec"
-    );
+    // 0x0101 = RESOURCE_CREATE_2D、0x010c = RESOURCE_CREATE_BLOB、0x0207 = SUBMIT_3D（いずれも未実装）。
+    for (cmd, dec) in [(0x0101u32, 257), (0x010c, 268), (0x0207, 519)] {
+        let h = handle_ctrl(&req(cmd, 0, 0, 0, 0));
+        assert_eq!(h.response.resp_type(), RESP_ERR_UNSPEC);
+        assert_eq!(
+            h.log_line,
+            format!("venus_jig event=ctrl_rejected cmd_type={dec} result=unspec")
+        );
+    }
 }
 
 #[test]
@@ -153,5 +163,206 @@ fn task172_4_gpu6_checker_limits() {
     assert_eq!(
         find_capset_queries(&"\n".repeat(MAX_LINES + 1)),
         Err(LogError::TooManyLines)
+    );
+}
+
+fn hdr_req(cmd: u32, flags: u32, ctx_id: u32, total: usize) -> Vec<u8> {
+    let mut v = vec![0u8; total.max(HDR_LEN)];
+    v[..4].copy_from_slice(&cmd.to_le_bytes());
+    v[4..8].copy_from_slice(&flags.to_le_bytes());
+    v[8..16].copy_from_slice(&0x55u64.to_le_bytes());
+    v[16..20].copy_from_slice(&ctx_id.to_le_bytes());
+    v[20] = 2;
+    v.truncate(total);
+    v
+}
+
+fn create_req(ctx_id: u32, nlen: u32, init: u32, total: usize) -> Vec<u8> {
+    let mut v = hdr_req(CMD_CTX_CREATE, 0, ctx_id, total.max(HDR_LEN + 8));
+    v[HDR_LEN..HDR_LEN + 4].copy_from_slice(&nlen.to_le_bytes());
+    v[HDR_LEN + 4..HDR_LEN + 8].copy_from_slice(&init.to_le_bytes());
+    v.truncate(total);
+    v
+}
+
+fn destroy_req(ctx_id: u32, total: usize) -> Vec<u8> {
+    hdr_req(CMD_CTX_DESTROY, 0, ctx_id, total)
+}
+
+#[test]
+fn task1520_gpu6_display_info_all_scanouts_disabled() {
+    let h = handle_ctrl(&hdr_req(CMD_GET_DISPLAY_INFO, 0, 0, 24));
+    let b = h.response.as_bytes();
+    assert_eq!(h.response.resp_type(), RESP_OK_DISPLAY_INFO);
+    assert_eq!(b.len(), 408);
+    assert_eq!(&b[HDR_LEN..], &[0u8; 384][..]);
+    assert_eq!(
+        h.log_line,
+        "venus_jig event=display_info cmd=GET_DISPLAY_INFO num_scanouts=0 result=ok"
+    );
+}
+
+#[test]
+fn task1520_gpu6_display_info_bad_length() {
+    for n in [23usize, 25, 32] {
+        let h = handle_ctrl(&hdr_req(CMD_GET_DISPLAY_INFO, 0, 0, n));
+        if n < HDR_LEN {
+            assert_eq!(h.response.resp_type(), RESP_ERR_INVALID_PARAMETER);
+            continue;
+        }
+        assert_eq!(h.response.resp_type(), RESP_ERR_INVALID_PARAMETER);
+        assert_eq!(h.response.as_bytes().len(), HDR_LEN);
+        assert_eq!(
+            h.log_line,
+            "venus_jig event=display_info cmd=GET_DISPLAY_INFO num_scanouts=0 result=invalid_parameter"
+        );
+    }
+}
+
+#[test]
+fn task1520_gpu6_ctx_create_ok_and_log_has_no_name_bytes() {
+    let mut a = CtrlAdapter::default();
+    let mut r = create_req(1, 5, 4, 96);
+    r[HDR_LEN + 8..HDR_LEN + 13].copy_from_slice(b"a\nb\xc3\xa9");
+    let h = a.handle_ctrl(&r);
+    assert_eq!(h.response.resp_type(), RESP_OK_NODATA);
+    assert_eq!(h.response.as_bytes().len(), HDR_LEN);
+    assert_eq!(
+        h.log_line,
+        "venus_jig event=ctx cmd=CTX_CREATE ctx_id=1 capset_id=4 nlen=5 result=ok"
+    );
+    assert!(!h.log_line.contains('\n'));
+}
+
+#[test]
+fn task1520_gpu6_ctx_create_rejects() {
+    let mut a = CtrlAdapter::default();
+    for (init, cap) in [(3u32, 3), (0, 0), (0x104, 4)] {
+        let h = a.handle_ctrl(&create_req(1, 5, init, 96));
+        assert_eq!(h.response.resp_type(), RESP_ERR_INVALID_PARAMETER);
+        assert_eq!(
+            h.log_line,
+            format!(
+                "venus_jig event=ctx cmd=CTX_CREATE ctx_id=1 capset_id={cap} nlen=5 result=invalid_parameter"
+            )
+        );
+    }
+    let h = a.handle_ctrl(&create_req(1, 65, 4, 96));
+    assert_eq!(h.response.resp_type(), RESP_ERR_INVALID_PARAMETER);
+    assert_eq!(
+        h.log_line,
+        "venus_jig event=ctx cmd=CTX_CREATE ctx_id=1 capset_id=-1 nlen=65 result=invalid_parameter"
+    );
+    for n in [95usize, 97, 24] {
+        let h = a.handle_ctrl(&create_req(1, 5, 4, n));
+        assert_eq!(h.response.resp_type(), RESP_ERR_INVALID_PARAMETER);
+        assert_eq!(
+            h.log_line,
+            "venus_jig event=ctx cmd=CTX_CREATE ctx_id=1 capset_id=-1 nlen=-1 result=invalid_parameter"
+        );
+    }
+    // 拒否では表が変わらない: ctx 1 は未作成のまま。
+    assert_eq!(
+        a.handle_ctrl(&destroy_req(1, 24)).response.resp_type(),
+        RESP_ERR_INVALID_CONTEXT_ID
+    );
+}
+
+#[test]
+fn task1520_gpu6_ctx_duplicate_zero_and_destroy() {
+    let mut a = CtrlAdapter::default();
+    assert_eq!(
+        a.handle_ctrl(&create_req(1, 5, 4, 96)).response.resp_type(),
+        RESP_OK_NODATA
+    );
+    let dup = a.handle_ctrl(&create_req(1, 5, 4, 96));
+    assert_eq!(dup.response.resp_type(), RESP_ERR_INVALID_CONTEXT_ID);
+    assert_eq!(
+        dup.log_line,
+        "venus_jig event=ctx cmd=CTX_CREATE ctx_id=1 capset_id=4 nlen=5 result=invalid_context_id"
+    );
+    let zero = a.handle_ctrl(&create_req(0, 5, 4, 96));
+    assert_eq!(zero.response.resp_type(), RESP_ERR_INVALID_CONTEXT_ID);
+    let bad_len = a.handle_ctrl(&destroy_req(1, 25));
+    assert_eq!(bad_len.response.resp_type(), RESP_ERR_INVALID_PARAMETER);
+    assert_eq!(
+        bad_len.log_line,
+        "venus_jig event=ctx cmd=CTX_DESTROY ctx_id=1 result=invalid_parameter"
+    );
+    let ok = a.handle_ctrl(&destroy_req(1, 24));
+    assert_eq!(ok.response.resp_type(), RESP_OK_NODATA);
+    assert_eq!(
+        ok.log_line,
+        "venus_jig event=ctx cmd=CTX_DESTROY ctx_id=1 result=ok"
+    );
+    for id in [1, 9] {
+        let h = a.handle_ctrl(&destroy_req(id, 24));
+        assert_eq!(h.response.resp_type(), RESP_ERR_INVALID_CONTEXT_ID);
+        assert_eq!(
+            h.log_line,
+            format!("venus_jig event=ctx cmd=CTX_DESTROY ctx_id={id} result=invalid_context_id")
+        );
+    }
+}
+
+#[test]
+fn task1520_gpu6_ctx_table_limit() {
+    let mut a = CtrlAdapter::default();
+    for id in 1..=MAX_CONTEXTS as u32 {
+        assert_eq!(
+            a.handle_ctrl(&create_req(id, 0, 4, 96))
+                .response
+                .resp_type(),
+            RESP_OK_NODATA
+        );
+    }
+    let over = a.handle_ctrl(&create_req(1000, 0, 4, 96));
+    assert_eq!(over.response.resp_type(), RESP_ERR_OUT_OF_MEMORY);
+    assert_eq!(
+        over.log_line,
+        "venus_jig event=ctx cmd=CTX_CREATE ctx_id=1000 capset_id=4 nlen=0 result=out_of_memory"
+    );
+    // 破棄で空きができれば再び作れる。
+    a.handle_ctrl(&destroy_req(5, 24));
+    assert_eq!(
+        a.handle_ctrl(&create_req(1000, 0, 4, 96))
+            .response
+            .resp_type(),
+        RESP_OK_NODATA
+    );
+}
+
+#[test]
+fn task1520_gpu6_ctx_fence_is_carried_over() {
+    let mut r = create_req(7, 0, 4, 96);
+    r[4..8].copy_from_slice(&FLAG_FENCE.to_le_bytes());
+    r[8..16].copy_from_slice(&0xabcdu64.to_le_bytes());
+    r[20] = 3;
+    let h = CtrlAdapter::default().handle_ctrl(&r);
+    let b = h.response.as_bytes();
+    assert_eq!(word(b, 4), FLAG_FENCE);
+    assert_eq!(&b[8..16], &0xabcdu64.to_le_bytes());
+    assert_eq!(word(b, 16), 7);
+    assert_eq!(b[20], 3);
+}
+
+#[test]
+fn task1520_gpu6_new_log_lines_do_not_disturb_checker() {
+    let mut a = CtrlAdapter::default();
+    let mut log = String::new();
+    for r in [
+        hdr_req(CMD_GET_DISPLAY_INFO, 0, 0, 24),
+        create_req(1, 3, 4, 96),
+        destroy_req(1, 24),
+        destroy_req(1, 24),
+        req(0x0101, 0, 0, 0, 0),
+    ] {
+        log.push_str(&a.handle_ctrl(&r).log_line);
+        log.push('\n');
+    }
+    let rep = find_capset_queries(&log).unwrap();
+    assert_eq!(
+        (rep.venus_get_capset_ok, rep.info_ok, rep.malformed_lines),
+        (0, 0, 0)
     );
 }

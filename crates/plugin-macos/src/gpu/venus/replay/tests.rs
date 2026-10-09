@@ -358,6 +358,34 @@ fn c1_read_recording_file_roundtrip() {
     assert_eq!(s.records, 2);
 }
 
+/// REPAIR-4: 成功・早期拒否・I/O エラーの全経路で観測結果が返る。
+#[test]
+fn c1_read_recording_file_observed_all_paths() {
+    let bytes = record(&[stream_a()]);
+    let p = tmp_path("obs_ok");
+    std::fs::write(&p, &bytes).expect("write");
+    let (r, obs) = read_recording_file_observed(&p);
+    let _ = std::fs::remove_file(&p);
+    assert_eq!(r.expect("read"), bytes);
+    assert_eq!(obs.outcome, "ok");
+    assert_eq!(obs.stage, ReadStage::Done);
+    assert_eq!(obs.bytes, bytes.len() as u64);
+
+    let d = tmp_path("obs_dir");
+    std::fs::create_dir_all(&d).expect("mkdir");
+    let (r, obs) = read_recording_file_observed(&d);
+    let _ = std::fs::remove_dir(&d);
+    assert_eq!(r, Err(VenusReplayError::NotRegularFile));
+    assert_eq!(obs.outcome, "venus_replay.not_regular_file");
+    assert_eq!(obs.stage, ReadStage::Metadata);
+    assert_eq!(obs.bytes, 0);
+
+    let (r, obs) = read_recording_file_observed(&tmp_path("obs_missing"));
+    assert!(matches!(r, Err(VenusReplayError::Io { .. })));
+    assert_eq!(obs.outcome, "venus_replay.io");
+    assert_eq!(obs.stage, ReadStage::Metadata);
+}
+
 #[test]
 fn c1_rejects_directory_and_missing_path() {
     let d = tmp_path("dir");

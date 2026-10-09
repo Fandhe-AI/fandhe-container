@@ -12,6 +12,7 @@
 
 use std::io::Read;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use super::super::{CommandType, WireReader, parse_command_header};
 use super::error::VenusReplayError;
@@ -99,32 +100,94 @@ pub(crate) fn read_bounded_with_limit<R: Read>(
     Ok(buf)
 }
 
+/// 記録ファイル読み込みの観測結果（REPAIR-4）。全終了経路で 1 件作られ、呼び出し側が構造化ログ /
+/// メトリクスへ流す。入力内容と path は含めない（機微情報を出さない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadObservation {
+    /// 結果。成功は `"ok"`、失敗は [`VenusReplayError::code`]（機械可読）。
+    pub outcome: &'static str,
+    /// 終了した段階（失敗時は失敗した段階）。
+    pub stage: ReadStage,
+    /// 読み込んだバイト数（失敗時は 0）。
+    pub bytes: u64,
+    /// 開始から終了までの所要時間。
+    pub elapsed: Duration,
+}
+
+/// [`read_recording_file_observed`] の終了段階。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadStage {
+    /// 開く前の `symlink_metadata`。
+    Metadata,
+    /// `open`。
+    Open,
+    /// 開いた fd の `metadata` 再確認。
+    FdMetadata,
+    /// 上限つき読み込み。
+    Read,
+    /// 完了（成功）。
+    Done,
+}
+
 /// 記録ファイルを上限つきで読む（2 段目の入口。続けて [`validate`] に渡す）。
+/// 観測結果が不要な呼び出し側向けの薄い入口で、[`read_recording_file_observed`] の結果だけを返す。
+pub fn read_recording_file(path: &Path) -> Result<Vec<u8>, VenusReplayError> {
+    read_recording_file_observed(path).0
+}
+
+/// [`read_recording_file`] の本体。早期拒否・I/O エラーを含む全終了経路で [`ReadObservation`] を返す。
 ///
 /// 開く前に `symlink_metadata` で通常ファイルであることを確かめ、unix では `sys::open_nofollow_nonblock`
 /// （`O_NOFOLLOW | O_NONBLOCK`）で開く。検査後に FIFO へ差し替えられても open はブロックせず、symlink へ
 /// 差し替えられても `ELOOP` で失敗して `NotRegularFile` を返す。開いた後も fd の `metadata` で種別を
 /// 再確認し、長さを読み込み前に検証する（REPAIR-5）。
 /// フラグ値が未確認の OS では通常の open にフォールバックし、検査と open の間の差し替えは塞がらない。
-pub fn read_recording_file(path: &Path) -> Result<Vec<u8>, VenusReplayError> {
+pub fn read_recording_file_observed(
+    path: &Path,
+) -> (Result<Vec<u8>, VenusReplayError>, ReadObservation) {
+    let start = Instant::now();
+    let (result, stage) = read_recording_file_inner(path);
+    let (outcome, bytes) = match &result {
+        Ok(buf) => ("ok", u64::try_from(buf.len()).unwrap_or(u64::MAX)),
+        Err(e) => (e.code(), 0),
+    };
+    let obs = ReadObservation {
+        outcome,
+        stage,
+        bytes,
+        elapsed: start.elapsed(),
+    };
+    (result, obs)
+}
+
+fn read_recording_file_inner(path: &Path) -> (Result<Vec<u8>, VenusReplayError>, ReadStage) {
     let io = |e: std::io::Error| VenusReplayError::Io { kind: e.kind() };
-    let before = std::fs::symlink_metadata(path).map_err(io)?;
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) => return (Err(io(e)), ReadStage::Metadata),
+    };
     if !before.file_type().is_file() {
-        return Err(VenusReplayError::NotRegularFile);
+        return (Err(VenusReplayError::NotRegularFile), ReadStage::Metadata);
     }
     let file = match crate::sys::open_nofollow_nonblock(path) {
         Ok(f) => f,
         #[cfg(unix)]
         Err(e) if e.raw_os_error() == Some(crate::sys::ELOOP) => {
-            return Err(VenusReplayError::NotRegularFile);
+            return (Err(VenusReplayError::NotRegularFile), ReadStage::Open);
         }
-        Err(e) => return Err(io(e)),
+        Err(e) => return (Err(io(e)), ReadStage::Open),
     };
-    let meta = file.metadata().map_err(io)?;
+    let meta = match file.metadata() {
+        Ok(m) => m,
+        Err(e) => return (Err(io(e)), ReadStage::FdMetadata),
+    };
     if !meta.is_file() {
-        return Err(VenusReplayError::NotRegularFile);
+        return (Err(VenusReplayError::NotRegularFile), ReadStage::FdMetadata);
     }
-    read_bounded(file, meta.len())
+    match read_bounded(file, meta.len()) {
+        Ok(buf) => (Ok(buf), ReadStage::Done),
+        Err(e) => (Err(e), ReadStage::Read),
+    }
 }
 
 /// 再生先。将来の lavapipe / MoltenVK 実行バックエンドの差し替え点（未実装。TASK-177.x）。

@@ -30,8 +30,8 @@ pub use format::{
     RecordView, RecordingHeader,
 };
 pub use player::{
-    CollectingBackend, ReplayBackend, ReplaySummary, ValidatedRecording, read_recording_file,
-    replay, validate,
+    CollectingBackend, ReadObservation, ReadStage, ReplayBackend, ReplaySummary,
+    ValidatedRecording, read_recording_file, read_recording_file_observed, replay, validate,
 };
 pub use recorder::RecordingWriter;
 

@@ -41,6 +41,10 @@
 //! - `SET_MEM_TABLE` の送り直し（F1.4・#1519）では、古い [`GuestMemory`] を drop してから新しい表を map する
 //!   （生かしたままだと同じ memfd の重なる範囲が `BACKING_IN_USE` になる）。合計上限は `GuestMemory` 1 個の中だけで、
 //!   セッション単位の上限は F1.4 で決める
+//! - `vm.overcommit_memory=2`（厳格な課金）の環境では、長さだけを `ftruncate` で伸ばした shmem の memfd（ページ未割り当ての
+//!   疎なファイル）への初回の書き込みで、ページの課金に失敗すると `SIGBUS` になり得る（環境に依存する DoS）。治具は
+//!   seal と長さを検査するが、ページが実際に確保済みかは確かめない。製品版の fd 要件（TASK-173 系）への申し送りとして、
+//!   frontend 側での事前確保（`fallocate` 等）を要件にするか、backend 側で確保を確かめる方法を決める
 
 use std::fs::File;
 use std::num::NonZeroUsize;

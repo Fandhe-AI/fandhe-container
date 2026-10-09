@@ -133,8 +133,11 @@ impl TransportError {
             SysError::Unsupported => Self::new(TransportErrorCode::Unsupported),
             // 期限つきで待つ側（`fd_passing`）が通常は吸収する。外へ出るのは期限切れ扱い。
             SysError::WouldBlock => Self::new(TransportErrorCode::Timeout),
-            // 再試行の側で吸収する。外へ出た場合は OS のエラーとして扱う。
-            SysError::Interrupted => Self::new(TransportErrorCode::OsError),
+            // 再試行の側で吸収する。外へ出た場合は OS のエラーとして扱い、errno（EINTR）を残す。
+            SysError::Interrupted(n) => Self {
+                code: TransportErrorCode::OsError,
+                errno: Some(n),
+            },
             SysError::Invalid => Self::new(TransportErrorCode::InvalidArgument),
             SysError::ForeignBacking => Self::new(TransportErrorCode::UnsupportedBacking),
             SysError::NotSealed => Self::new(TransportErrorCode::ShrinkNotSealed),
@@ -188,3 +191,27 @@ impl fmt::Display for TransportError {
 }
 
 impl std::error::Error for TransportError {}
+
+#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod tests {
+    use super::*;
+
+    /// GPU-6・REPAIR-4: 再試行で吸収されずに外へ出た `Interrupted` は `OS_ERROR` で、imp が写した errno（x86_64 /
+    /// aarch64 の EINTR = 4）を失わない。`WouldBlock` は期限切れの `TIMEOUT`。
+    #[test]
+    fn gpu6_from_sys_keeps_interrupted_errno() {
+        let e = TransportError::from_sys(SysError::Interrupted(4));
+        assert_eq!(
+            e,
+            TransportError {
+                code: TransportErrorCode::OsError,
+                errno: Some(4),
+            }
+        );
+        assert_eq!(e.to_string(), "OS_ERROR (errno=4): operating system error");
+        assert_eq!(
+            TransportError::from_sys(SysError::WouldBlock),
+            TransportError::new(TransportErrorCode::Timeout)
+        );
+    }
+}

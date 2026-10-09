@@ -28,7 +28,7 @@
 //! - 構造体はカーネル ABI（`struct user_msghdr`・`struct cmsghdr`・`struct iovec`）に合わせる。syscall を直接呼ぶので
 //!   glibc / musl の `msghdr` のパディング差に依存しない
 //! - 戻り値が -1 のときは直後に `io::Error::last_os_error()` で errno を確保する。`EINTR` / `EAGAIN` は
-//!   `Interrupted` / `WouldBlock` に写し、呼び出し側がアーキ固有の errno 定数を持たずに済むようにする
+//!   `Interrupted`（errno を保持）/ `WouldBlock` に写し、呼び出し側がアーキ固有の errno 定数を持たずに済むようにする
 //! - `MmapRegion::map_shared` は安全性に要る検証（backing の `st_dev`・`F_SEAL_SHRINK`・ファイル長・アクセス範囲の占有）を
 //!   map と不可分に自分で行い、呼び出し側に頼らない（呼び出し元は `vhost_user::guest_memory` だけ）
 //! - 受信した補助データの fd は、このモジュールの中で受信と同じ呼び出しのうちに所有する（`recvmsg_fds` の戻り値は
@@ -64,8 +64,9 @@ pub(crate) enum SysError {
     /// 対応外のアーキテクチャ（定数・syscall を定義しない。fail-closed）。対応アーキには存在しない。
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     Unsupported,
-    /// シグナルで中断された（`EINTR`）。呼び出し側が期限を確かめて再試行する。
-    Interrupted,
+    /// シグナルで中断された（`EINTR`）。呼び出し側が期限を確かめて再試行する。値はカーネルが返した errno そのもので、
+    /// `imp` が写す（呼び出し側がアーキ固有の errno 定数を持たずに、構造化エラーへ errno を載せられるようにする）。
+    Interrupted(i32),
     /// 今は読み書きできない（`EAGAIN`。`MSG_DONTWAIT` の送受信）。呼び出し側が期限つきで待つ。
     WouldBlock,
     /// ラッパー内部の検証に掛かった（fd 数の上限超過・空の範囲・値の変換失敗等。カーネルを呼ぶ前の拒否を含む）。
@@ -359,7 +360,7 @@ mod imp {
         if ret < 0 {
             // 直後に errno を確保する（間に他の libc 呼び出しを挟まない）。
             Err(match io::Error::last_os_error().raw_os_error() {
-                Some(EINTR) => SysError::Interrupted,
+                Some(EINTR) => SysError::Interrupted(EINTR),
                 Some(EAGAIN) => SysError::WouldBlock,
                 Some(n) => SysError::Os(n),
                 None => SysError::Invalid,
@@ -501,7 +502,7 @@ mod imp {
 
     /// `ppoll(2)` で `fd` が `interest` になるか `timeout` が尽きるまで待つ（U10）。真なら待ち対象が成立（`POLLERR` / `POLLHUP` も
     /// 成立として返し、結果は続く `recvmsg` / `sendmsg` のエラーで分かる）、偽ならタイムアウト。ソケット設定に依存しない期限つき待機。
-    /// シグナルで中断されたときは `Os(EINTR)`（呼び出し側が残り時間を計算し直す）。
+    /// シグナルで中断されたときは `Interrupted`（呼び出し側が残り時間を計算し直す）。
     pub(crate) fn wait_fd(
         fd: BorrowedFd<'_>,
         interest: Interest,
@@ -684,6 +685,9 @@ mod imp {
     pub(crate) struct MmapRegion {
         ptr: NonNull<u8>,
         len: usize,
+        /// 占有したアクセス範囲の下限（`[access_start, len)`）。コピーはこの範囲の中だけを許す（`map_shared` で `len` 未満と
+        /// 検証済み）。
+        access_start: usize,
         /// `!Send` / `!Sync` を型の上で明示する marker（`*mut u8` は `Send` でも `Sync` でもない）。
         _not_send_sync: PhantomData<*mut u8>,
         /// アクセス範囲の占有。`Drop` の本体（munmap）の後にフィールドとして drop されるので、範囲は unmap の後に解放される。
@@ -712,6 +716,9 @@ mod imp {
             if access_start >= len_u64 {
                 return Err(SysError::Invalid);
             }
+            // `access_start < len`（usize）なので変換は失敗しない。
+            let access_start_usize =
+                usize::try_from(access_start).map_err(|_| SysError::Invalid)?;
             let id = file.metadata().map_err(|e| io_err(&e))?;
             if id.dev() != shmem_dev()? {
                 return Err(SysError::ForeignBacking);
@@ -752,6 +759,7 @@ mod imp {
             Ok(Self {
                 ptr,
                 len: len.get(),
+                access_start: access_start_usize,
                 _not_send_sync: PhantomData,
                 _lease: lease,
             })
@@ -762,14 +770,22 @@ mod imp {
             self.len
         }
 
-        /// `off` から `dst.len()` バイトを `dst` へコピーする（U8）。範囲外は `Err`。
-        pub(crate) fn copy_out(&self, off: usize, dst: &mut [u8]) -> Result<(), SysError> {
-            let end = off.checked_add(dst.len()).ok_or(SysError::OutOfRange)?;
-            if end > self.len {
+        /// `[off, off + n)` が占有したアクセス範囲 `[access_start, len)` に収まるかを確かめる。外れたら `OutOfRange`。
+        /// 呼び出し側（`guest_memory::locate`）の検査に頼らず、占有範囲の外（下限側を含む）へのアクセスをここで拒否する。
+        fn check_range(&self, off: usize, n: usize) -> Result<(), SysError> {
+            let end = off.checked_add(n).ok_or(SysError::OutOfRange)?;
+            if off < self.access_start || end > self.len {
                 return Err(SysError::OutOfRange);
             }
-            // SAFETY: 上で `off + dst.len() <= self.len` を検査済みで、読み取り元 `ptr + off` は生きているマッピングの
-            // 範囲内。`dst` は排他的な Rust の借用でマッピングと重ならない（マッピングへの参照は作らない）。
+            Ok(())
+        }
+
+        /// `off` から `dst.len()` バイトを `dst` へコピーする（U8）。占有したアクセス範囲の外は `OutOfRange`。
+        pub(crate) fn copy_out(&self, off: usize, dst: &mut [u8]) -> Result<(), SysError> {
+            self.check_range(off, dst.len())?;
+            // SAFETY: 上の `check_range` で `access_start <= off` かつ `off + dst.len() <= self.len` を検査済みで、読み取り元
+            // `ptr + off` は生きているマッピングのうち、このマッピングが占有したアクセス範囲の中。`dst` は排他的な Rust の
+            // 借用でマッピングと重ならない（マッピングへの参照は作らない）。
             // プロセス内の並行アクセスは起きない: `MmapRegion` は `!Send` / `!Sync` で 1 スレッドに閉じ、同じ backing file の
             // 重なるアクセス範囲を map するマッピングは占有一覧（`Lease`）で同時に 1 個に限る（`map_shared` の `InUse`）。残る並行書き込みは
             // frontend プロセスによるもので、バイト列のコピーに限り値が不定になるだけでメモリ安全性は損なわない。
@@ -783,15 +799,13 @@ mod imp {
             Ok(())
         }
 
-        /// `src` を `off` へコピーする（U8）。範囲外は `Err`。
+        /// `src` を `off` へコピーする（U8）。占有したアクセス範囲の外は `OutOfRange`。
         pub(crate) fn copy_in(&self, off: usize, src: &[u8]) -> Result<(), SysError> {
-            let end = off.checked_add(src.len()).ok_or(SysError::OutOfRange)?;
-            if end > self.len {
-                return Err(SysError::OutOfRange);
-            }
-            // SAFETY: 上で `off + src.len() <= self.len` を検査済みで、書き込み先 `ptr + off` は `PROT_WRITE` で map した
-            // 生きているマッピングの範囲内。`src` は Rust の借用でマッピングと重ならない。プロセス内の並行アクセスが
-            // 起きないことは `copy_out` と同じ（`!Send` / `!Sync` と占有一覧）。
+            self.check_range(off, src.len())?;
+            // SAFETY: 上の `check_range` で `access_start <= off` かつ `off + src.len() <= self.len` を検査済みで、書き込み先
+            // `ptr + off` は `PROT_WRITE` で map した生きているマッピングのうち、このマッピングが占有したアクセス範囲の中。
+            // `src` は Rust の借用でマッピングと重ならない。プロセス内の並行アクセスが起きないことは `copy_out` と同じ
+            // （`!Send` / `!Sync` と占有一覧。占有の外へは書かないので、隣の範囲を占有する別マッピングとも競合しない）。
             unsafe {
                 std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.as_ptr().add(off), src.len())
             };
@@ -955,6 +969,13 @@ mod imp {
                 .expect("disjoint head");
             let mut b = [0u8; 2];
             assert_eq!(m.copy_out(0x1fff, &mut b), Err(SysError::OutOfRange));
+            // 下限側: 0x1000 から占有した範囲の外（0..0x1000）は、マッピングの中でもコピーしない。
+            assert_eq!(m.copy_out(0, &mut b), Err(SysError::OutOfRange));
+            assert_eq!(m.copy_out(0xfff, &mut b), Err(SysError::OutOfRange));
+            assert_eq!(m.copy_in(0, &[1, 2]), Err(SysError::OutOfRange));
+            assert_eq!(m.copy_in(0x1000, &[1, 2]), Ok(()));
+            assert_eq!(m.copy_out(0x1000, &mut b), Ok(()));
+            assert_eq!(b, [1, 2]);
             drop((m, head));
             MmapRegion::map_shared(&ok, 0x1fff, len).expect("after release");
         }

@@ -324,6 +324,119 @@ mod linux {
         assert_eq!(end, Ok(SessionEnd::PeerClosed));
     }
 
+    /// n 番目（0..4）の要求を ring 0 へ積んで kick し、call を待つ。descriptor は 2n（readable・NEXT）と 2n+1（writable）。
+    fn post(fe: &Frontend, n: u16, req: &[u8], writable_len: u32) {
+        let desc = |addr: u64, len: u32, flags: u16, next: u16| {
+            let mut d = Vec::new();
+            d.extend_from_slice(&addr.to_le_bytes());
+            d.extend_from_slice(&len.to_le_bytes());
+            d.extend_from_slice(&flags.to_le_bytes());
+            d.extend_from_slice(&next.to_le_bytes());
+            d
+        };
+        let req_addr = 0x4000 + u64::from(n) * 0x400;
+        let resp_addr = 0x5000 + u64::from(n) * 0x400;
+        let head = 2 * n;
+        let readable = u32::try_from(req.len()).expect("len");
+        fe.mem
+            .write_at(&desc(req_addr, readable, 1, head + 1), u64::from(head) * 16)
+            .expect("desc r");
+        fe.mem
+            .write_at(
+                &desc(resp_addr, writable_len, 2, 0),
+                u64::from(head + 1) * 16,
+            )
+            .expect("desc w");
+        fe.mem.write_at(req, req_addr).expect("req");
+        fe.mem
+            .write_at(&head.to_le_bytes(), 0x1004 + u64::from(n) * 2)
+            .expect("ring");
+        fe.mem
+            .write_at(&(n + 1).to_le_bytes(), 0x1002)
+            .expect("idx");
+        (&fe.kick).write_all(&1u64.to_le_bytes()).expect("kick");
+        wait_call(fe);
+    }
+
+    fn resp_type(fe: &Frontend, n: u16) -> u32 {
+        let mut b = [0u8; 4];
+        fe.mem
+            .read_at(&mut b, 0x5000 + u64::from(n) * 0x400)
+            .expect("resp");
+        u32::from_le_bytes(b)
+    }
+
+    fn used_len(fe: &Frontend, n: u16) -> u32 {
+        let mut b = [0u8; 4];
+        fe.mem
+            .read_at(&mut b, 0x2000 + 4 + u64::from(n) * 8 + 4)
+            .expect("used len");
+        u32::from_le_bytes(b)
+    }
+
+    fn ctrl_req(cmd: u32, ctx: u32, total: usize, words: &[(usize, u32)]) -> Vec<u8> {
+        let mut v = vec![0u8; total];
+        v[..4].copy_from_slice(&cmd.to_le_bytes());
+        v[16..20].copy_from_slice(&ctx.to_le_bytes());
+        for (off, x) in words {
+            v[*off..*off + 4].copy_from_slice(&x.to_le_bytes());
+        }
+        v
+    }
+
+    /// GPU-6・TASK-172.4・#1601: 応答を書き戻せず捨てた `RESOURCE_CREATE_BLOB` は資源表を残さない。
+    /// 同じ resource_id の再送が `ERR_INVALID_RESOURCE_ID`（0x1203）にならず `OK_NODATA`（0x1100）になり、
+    /// 続く `CTX_ATTACH_RESOURCE` も成功する。
+    #[test]
+    fn task1601_gpu6_dropped_blob_response_rolls_back_resource_table() {
+        let (front, backend) = pair(limits(5000, 5000));
+        let fe = setup_ring0(front, 408, "blobrb");
+        post(&fe, 0, &ctrl_req(0x0200, 1, 96, &[(24, 3), (28, 4)]), 408);
+        assert_eq!(resp_type(&fe, 0), 0x1100);
+        let mut blob = ctrl_req(0x010c, 1, 56, &[(24, 7), (28, 2), (32, 1)]);
+        blob[48..56].copy_from_slice(&8192u64.to_le_bytes());
+        // writable が 8 バイトで 24 バイトの応答が入らない -> len=0 で捨てられる。
+        post(&fe, 1, &blob, 8);
+        assert_eq!(used_len(&fe, 1), 0);
+        // 同じ要求の再送は成功する（巻き戻されていなければ 0x1203）。
+        post(&fe, 2, &blob, 408);
+        assert_eq!(resp_type(&fe, 2), 0x1100);
+        assert_eq!(used_len(&fe, 2), 24);
+        post(&fe, 3, &ctrl_req(0x0202, 1, 32, &[(24, 7)]), 408);
+        assert_eq!(resp_type(&fe, 3), 0x1100);
+        drop(fe);
+        let (end, lines) = backend.join().expect("join");
+        assert_eq!(end, Ok(SessionEnd::PeerClosed));
+        assert!(
+            lines.contains(
+                &"venus_jig event=response_dropped reason=writable_too_small".to_string()
+            ),
+            "log: {lines:?}"
+        );
+    }
+
+    /// GPU-6・TASK-172.4・#1601: session 経由の `SUBMIT_3D` は `OK_NODATA`（24 バイト）で応答し、ログ行が出る。
+    #[test]
+    fn task1601_gpu6_submit_3d_over_session_is_acked() {
+        let (front, backend) = pair(limits(5000, 5000));
+        let fe = setup_ring0(front, 408, "submit");
+        post(&fe, 0, &ctrl_req(0x0200, 1, 96, &[(24, 3), (28, 4)]), 408);
+        let mut req = ctrl_req(0x0207, 1, 32, &[(24, 256)]);
+        req[4..8].copy_from_slice(&2u32.to_le_bytes());
+        req[20] = 0;
+        let mut body = vec![0u8; 256];
+        body[..4].copy_from_slice(&188u32.to_le_bytes());
+        req.extend_from_slice(&body);
+        post(&fe, 1, &req, 408);
+        assert_eq!(resp_type(&fe, 1), 0x1100);
+        assert_eq!(used_len(&fe, 1), 24);
+        drop(fe);
+        let (end, lines) = backend.join().expect("join");
+        assert_eq!(end, Ok(SessionEnd::PeerClosed));
+        let want = "venus_jig event=submit_3d cmd=SUBMIT_3D ctx_id=1 ring_idx=0 size=256 venus_cmd=188 wire=ok result=ok";
+        assert!(lines.iter().any(|l| l == want), "log: {lines:?}");
+    }
+
     #[test]
     fn gpu6_writable_too_small_returns_len_zero_and_continues() {
         let (front, backend) = pair(limits(5000, 5000));

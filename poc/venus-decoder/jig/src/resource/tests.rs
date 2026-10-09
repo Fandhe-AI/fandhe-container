@@ -331,15 +331,8 @@ fn task1601_gpu6_map_unmap_blob_stay_unspec() {
     }
 }
 
-#[test]
-fn task1601_gpu6_rollback_restores_resource_table() {
-    let mut a = with_ctx(1);
-    let before = a.clone();
-    assert_eq!(ty(&mut a, &blob_req(&blob(1, 1, 4096))), OK);
-    assert_ne!(a, before);
-    a = before;
-    assert_eq!(ty(&mut a, &blob_req(&blob(1, 1, 4096))), OK);
-}
+// 応答を書き戻せず捨てた場合の巻き戻しは session の失敗経路を通す結合試験
+// （tests/vhost_user_session.rs の `task1601_gpu6_dropped_blob_response_rolls_back_resource_table`）で検証する。
 
 // ---- SUBMIT_3D ----
 

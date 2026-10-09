@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::negotiation::{OFFERED_FEATURES, State, check_features};
@@ -271,15 +272,16 @@ fn repair5_read_kick_reads_counter_and_detects_close() {
     );
 }
 
-/// REPAIR-5: `O_NONBLOCK` が立っていて空なら `Drained`（相手が先に読み切った場合）。
+/// REPAIR-5: `O_NONBLOCK` が立っていて空なら、補助スレッドは readiness を待ち切れず期限で終わり `Lost`
+/// （`Drained` は poll の後に相手が読み切った競合でだけ返る）。
 #[test]
 fn repair5_read_kick_drained_when_nonblocking() {
     let (kick, _peer) = file_pair();
     let sock = UnixStream::from(OwnedFd::from(kick.try_clone().expect("dup")));
     sock.set_nonblocking(true).expect("nb");
     assert_eq!(
-        read_kick(&kick, Duration::from_secs(5)).expect("drained"),
-        KickRead::Drained
+        read_kick(&kick, Duration::from_millis(50)).expect("empty"),
+        KickRead::Lost
     );
 }
 
@@ -298,4 +300,45 @@ fn repair5_notify_times_out_when_call_is_full() {
     let e = notify(&call, Duration::from_millis(100)).expect_err("full");
     assert_eq!(e.code, SessionErrorCode::Timeout);
     assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// REPAIR-5: 補助スレッドの枠は上限で拒否され、解放すれば再び取れる（接続の繰り返しで残存スレッドが蓄積しない）。
+#[test]
+fn repair5_worker_slots_are_capped_and_released() {
+    let live = AtomicUsize::new(0);
+    let a = WorkerSlot::acquire(&live, 2).expect("first");
+    let b = WorkerSlot::acquire(&live, 2).expect("second");
+    assert!(WorkerSlot::acquire(&live, 2).is_none());
+    assert_eq!(live.load(Ordering::Acquire), 2);
+    drop(a);
+    assert_eq!(live.load(Ordering::Acquire), 1);
+    let c = WorkerSlot::acquire(&live, 2).expect("after release");
+    drop((b, c));
+    assert_eq!(live.load(Ordering::Acquire), 0);
+}
+
+/// REPAIR-5: 書き込めない（満杯の）fd でも補助スレッド自身が期限で終了し、結果が `TimedOut` として返る
+/// （期限切れの I/O が回収されずに残らない）。繰り返しても毎回同じ。
+#[test]
+fn repair5_full_call_worker_ends_by_itself_on_deadline() {
+    let (call, _peer) = file_pair();
+    let sock = UnixStream::from(OwnedFd::from(call.try_clone().expect("dup")));
+    sock.set_nonblocking(true).expect("nb");
+    let mut writer = &call;
+    while writer.write(&[0u8; 4096]).is_ok() {}
+    sock.set_nonblocking(false).expect("blocking");
+    for _ in 0..3 {
+        let r = run_bounded(
+            &call,
+            sys::Interest::Writable,
+            Duration::from_millis(50),
+            |f| {
+                let mut w = f;
+                w.write(&1u64.to_le_bytes())
+            },
+        )
+        .expect("spawned")
+        .expect("worker reports before the grace period");
+        assert_eq!(r.expect_err("not writable").kind(), ErrorKind::TimedOut);
+    }
 }

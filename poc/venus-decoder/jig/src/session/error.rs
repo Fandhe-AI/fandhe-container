@@ -38,6 +38,8 @@ pub enum SessionErrorCode {
     CallFailed,
     /// kick / call の fd を非ブロックにできなかった。
     FdSetupFailed,
+    /// 補助スレッドの同時存在数がプロセス全体の上限に達した（残存スレッドの蓄積防止）。
+    WorkerLimit,
     /// 無通信のまま idle タイムアウトに達した。
     IdleTimeout,
     /// 1 メッセージの受信・応答送信・call の書き込みが期限内に終わらなかった。
@@ -69,6 +71,7 @@ impl SessionErrorCode {
             Self::InvalidKick => "INVALID_KICK",
             Self::CallFailed => "CALL_FAILED",
             Self::FdSetupFailed => "FD_SETUP_FAILED",
+            Self::WorkerLimit => "WORKER_LIMIT",
             Self::IdleTimeout => "IDLE_TIMEOUT",
             Self::Timeout => "TIMEOUT",
             Self::Codec => "CODEC",
@@ -94,6 +97,7 @@ impl SessionErrorCode {
             Self::InvalidKick => "kick fd did not yield 8 bytes",
             Self::CallFailed => "call fd write was short",
             Self::FdSetupFailed => "kick or call fd could not be set non-blocking",
+            Self::WorkerLimit => "too many fd I/O workers are alive in this process",
             Self::IdleTimeout => "no activity before the idle timeout",
             Self::Timeout => "operation did not finish before its deadline",
             Self::Codec => "vhost-user codec error",

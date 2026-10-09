@@ -17,10 +17,13 @@
 //! kick / call の fd は frontend が複製を持ち得るため、`O_NONBLOCK` を含む open file description のフラグと counter は
 //! 相手と共有され、poll の後に相手が eventfd を読み書きして状態を変えたり、フラグを落としたりできる。そこでセッションの
 //! スレッドは eventfd を直接 read / write せず、使い捨ての補助スレッドへ I/O を任せ、`recv_timeout` で期限を評価する
-//! （共有フラグに依存しない。REPAIR-5）。期限を超えたら補助スレッドを起こす逆向きの操作（kick は 1 を書く、call は読み出して
-//! counter を空ける）を別の切り離したスレッドで試み、セッションのスレッドは決して eventfd の I/O で止まらない。
-//! 逆向きの操作が間に合わなければ補助スレッドが残り得るが、それはプロセス終了で回収される（セッション 1 本につき高々数本）。
+//! （共有フラグに依存しない。REPAIR-5）。補助スレッド自身も I/O の前に期限つきの poll で readiness を待つので、満杯の socket
+//! や空の eventfd が渡されても期限で自力終了して fd ごと回収される。poll の後に相手が状態を変えた競合で I/O が止まった
+//! 場合だけ、起こす逆向きの操作（kick は 1 を書く）を別の切り離したスレッドで試む。それでも残るスレッドの数は
+//! プロセス全体で [`MAX_LIVE_WORKERS`] に抑え、超えたら `WORKER_LIMIT` で新規の I/O を拒否する。
 //! 補助スレッドを使うぶん kick 1 回あたり数十 us の上乗せがあり、`ctrl_kick` のヒストグラムに現れる。
+//! 未対応（REPAIR-3・将来仕様）: kick / call の fd の種類（eventfd）検査。eventfd の生成は `sys` の承認範囲（U1〜U10）外の
+//! `unsafe` を要し、結合試験の偽 frontend が `UnixStream` で代用しているため、現状は種類によらず期限つき poll で守る。
 
 mod error;
 mod metrics;
@@ -30,6 +33,7 @@ use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -392,55 +396,120 @@ enum KickRead {
     Lost,
 }
 
-/// 補助スレッドで `op` を実行し、`wait_for` 以内の結果を返す。期限切れは `Ok(None)`（補助スレッドは切り離す）。
+/// 補助スレッド（fd I/O 用・unblock 用の合計）のプロセス全体での同時存在数の上限（REPAIR-5）。セッション 1 本は高々
+/// 数本しか持たないので、これを超えるのは接続の繰り返しで残存スレッドが蓄積している異常時で、新規の I/O を拒否する。
+const MAX_LIVE_WORKERS: usize = 64;
+
+/// 生存中の補助スレッド数。[`WorkerSlot`] の取得で増え、`Drop`（スレッド終了時）で減る。
+static LIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// 補助スレッド 1 本分の枠。スレッドのクロージャへ move し、スレッドの終了（またはクロージャの破棄）で解放する。
+struct WorkerSlot<'a>(&'a AtomicUsize);
+
+impl<'a> WorkerSlot<'a> {
+    /// `live` が `max` 未満なら枠を取る。上限なら `None`（fail-closed）。
+    fn acquire(live: &'a AtomicUsize, max: usize) -> Option<Self> {
+        live.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < max).then_some(n + 1)
+        })
+        .ok()
+        .map(|_| Self(live))
+    }
+}
+
+impl Drop for WorkerSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn global_slot() -> Option<WorkerSlot<'static>> {
+    WorkerSlot::acquire(&LIVE_WORKERS, MAX_LIVE_WORKERS)
+}
+
+/// 補助スレッドで `interest` の readiness を最大 `wait_for` 待ってから `op` を実行し、`wait_for` 以内の結果を返す。
+/// 補助スレッド自身が期限つきの poll で待つので、満杯の socket や空の eventfd でも期限で自力終了して回収される
+/// （期限切れは `io::ErrorKind::TimedOut`）。poll 後に相手が状態を変えた競合で `op` が止まった場合に限り、
+/// 呼び出し側が起こす操作を試み、それでも残るスレッドは [`MAX_LIVE_WORKERS`] の上限で数を抑える。
+/// 期限切れ（結果が来ない）は `Ok(None)`。
 fn run_bounded<T: Send + 'static>(
     file: &File,
+    interest: sys::Interest,
     wait_for: Duration,
     op: impl FnOnce(&File) -> io::Result<T> + Send + 'static,
 ) -> Result<Option<io::Result<T>>, SessionError> {
     let failed = || SessionError::new(SessionErrorCode::FdSetupFailed, None);
+    let Some(slot) = global_slot() else {
+        return Err(SessionError::new(SessionErrorCode::WorkerLimit, None));
+    };
     let dup = file.try_clone().map_err(|_| failed())?;
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("venus-jig-fd-io".into())
         .spawn(move || {
+            let _slot = slot;
+            let ready = match sys::wait_fd(dup.as_fd(), interest, wait_for) {
+                Ok(ready) => ready,
+                Err(sys::SysError::Interrupted(_)) => false,
+                Err(_) => {
+                    let _ = tx.send(Err(io::Error::from(ErrorKind::Other)));
+                    return;
+                }
+            };
+            let result = if ready {
+                op(&dup)
+            } else {
+                Err(io::Error::from(ErrorKind::TimedOut))
+            };
             // 受け側が期限切れで捨てていれば送信は失敗するが、結果が要らないので無視する。
-            let _ = tx.send(op(&dup));
+            let _ = tx.send(result);
         })
         .map_err(|_| failed())?;
-    match rx.recv_timeout(wait_for) {
+    // 補助スレッドの poll の期限（`wait_for`）より少し長く待ち、通常は補助スレッド自身の TimedOut を受け取る。
+    match rx.recv_timeout(wait_for.saturating_add(WORKER_GRACE)) {
         Ok(r) => Ok(Some(r)),
         Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(failed()),
     }
 }
 
-/// `op` を切り離したスレッドで実行する（結果は捨てる。失敗しても何もしない）。
+/// 補助スレッドの結果を待つときに `wait_for` へ足す余裕。
+const WORKER_GRACE: Duration = Duration::from_millis(50);
+
+/// `op` を切り離したスレッドで実行する（結果は捨てる。失敗や上限超過では何もしない）。
 fn detach(file: &File, op: impl FnOnce(&File) + Send + 'static) {
+    let Some(slot) = global_slot() else {
+        return;
+    };
     if let Ok(dup) = file.try_clone() {
         let _ = std::thread::Builder::new()
             .name("venus-jig-fd-unblock".into())
-            .spawn(move || op(&dup));
+            .spawn(move || {
+                let _slot = slot;
+                op(&dup);
+            });
     }
 }
 
-/// kick の eventfd から counter（8 バイト）を読む。読み取りは補助スレッドに任せ、`wait_for` 以内に終わらなければ
-/// 読み取りを起こすために 1 を書いて（別の切り離したスレッドで）`Lost` を返す。
+/// kick の eventfd から counter（8 バイト）を読む。読み取りは補助スレッドに任せ（readiness を期限つきで待ってから読む）、
+/// `wait_for` 以内に終わらなければ読み取りを起こすために 1 を書いて（別の切り離したスレッドで）`Lost` を返す。
 fn read_kick(kick: &File, wait_for: Duration) -> Result<KickRead, SessionError> {
-    let result = run_bounded(kick, wait_for, |f| {
+    let result = run_bounded(kick, sys::Interest::Readable, wait_for, |f| {
         let mut counter = [0u8; 8];
         let mut r = f;
         r.read(&mut counter).map(|n| (n, counter))
     })?;
     match result {
         None => {
-            // 補助スレッドは counter 0 の read で止まっている。1 を足して起こす（余分な kick は空走査で無害）。
+            // poll の後で相手が counter を読み切り、読み取りが止まった競合。1 を足して起こす（余分な kick は空走査で無害）。
             detach(kick, |f| {
                 let mut w = f;
                 let _ = w.write(&1u64.to_le_bytes());
             });
             Ok(KickRead::Lost)
         }
+        // 補助スレッドが readiness を待ち切れず終わった（相手が読み切り、フラグも落としている等）。
+        Some(Err(e)) if e.kind() == ErrorKind::TimedOut => Ok(KickRead::Lost),
         Some(Ok((0, _))) => Err(SessionError::new(SessionErrorCode::KickClosed, None)),
         Some(Ok((8, _))) => Ok(KickRead::Read),
         Some(Ok(_)) => Err(SessionError::new(SessionErrorCode::InvalidKick, None)),
@@ -451,28 +520,22 @@ fn read_kick(kick: &File, wait_for: Duration) -> Result<KickRead, SessionError> 
     }
 }
 
-/// call の eventfd へ 1 を書いてゲストへ通知する。書き込みは補助スレッドに任せて `timeout` の期限まで待ち、`EAGAIN`
-/// （相手が counter を満たし `O_NONBLOCK` が立っている等）は期限内で再試行する。期限切れは `TIMEOUT`
-/// （書き込みを起こすため、別の切り離したスレッドで call を読み出して counter を空ける）。
+/// call の eventfd へ 1 を書いてゲストへ通知する。書き込みは補助スレッドに任せ、書き込み可能になるのを期限つきの poll で
+/// 待ってから書く。満杯の socket など書けない fd でも補助スレッドは期限で自力終了し、`timeout` で `TIMEOUT` になる。
+/// `EAGAIN`（poll 後に相手が counter を満たした等）は期限内で再試行する。
 fn notify(call: &File, timeout: Duration) -> Result<(), SessionError> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| SessionError::new(SessionErrorCode::InvalidArgument, None))?;
     loop {
-        let left = match remaining(deadline) {
-            Ok(left) => left,
-            Err(e) => {
-                unblock_call(call);
-                return Err(e);
-            }
-        };
-        let result = run_bounded(call, left, |f| {
+        let left = remaining(deadline)?;
+        let result = run_bounded(call, sys::Interest::Writable, left, |f| {
             let mut w = f;
             w.write(&1u64.to_le_bytes())
         })?;
         match result {
-            None => {
-                unblock_call(call);
+            None => return Err(SessionError::new(SessionErrorCode::Timeout, None)),
+            Some(Err(e)) if e.kind() == ErrorKind::TimedOut => {
                 return Err(SessionError::new(SessionErrorCode::Timeout, None));
             }
             Some(Ok(8)) => return Ok(()),
@@ -485,23 +548,6 @@ fn notify(call: &File, timeout: Duration) -> Result<(), SessionError> {
         }
     }
 }
-
-/// 止まっている call の書き込みを起こすため、読める状態を確認してから 1 回読み出す（切り離したスレッドで実行）。
-fn unblock_call(call: &File) {
-    detach(call, |f| {
-        if matches!(
-            sys::wait_fd(f.as_fd(), sys::Interest::Readable, MAX_UNBLOCK_WAIT),
-            Ok(true)
-        ) {
-            let mut buf = [0u8; 8];
-            let mut r = f;
-            let _ = r.read(&mut buf);
-        }
-    });
-}
-
-/// [`unblock_call`] が読み出せるようになるのを待つ上限。
-const MAX_UNBLOCK_WAIT: Duration = Duration::from_millis(100);
 
 #[cfg(test)]
 mod tests;

@@ -20,8 +20,9 @@
 //! - 失敗した接続は再利用しない。往復が失敗した時点で接続を閉じ、子を kill・回収してセッションを終了
 //!   状態にする。以後の [`ResidentPlugin::call`] は I/O せず `FailedPrecondition`。回収を確認できない
 //!   場合は `Internal`（pid つき）を返し、その子は以後回収しない（都度起動モードと同じ契約）。子は回収
-//!   できたがプロセスグループを停止できなかった場合は、未回収とは別の `Internal`（pid なし。
-//!   `process group could not be killed`）を返し、状態は [`ResidentState::GroupKillFailed`] になる。
+//!   できたがプロセスグループを停止できなかった場合は、元のエラーの code を保ち message に
+//!   `process group could not be killed` の付記（pid なし）を加えて返し、状態は
+//!   [`ResidentState::GroupKillFailed`] になる（shutdown は未回収とは別の `Internal` を返す）。
 //! - 子の環境は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ。stdin / stdout は null、stderr は
 //!   セッション全期間で 1 本の読み取りスレッドが上限つきで収集し、[`ResidentPlugin::shutdown`] の結果
 //!   （失敗時も [`ResidentShutdownError`] に載せる）でのみ返す（untrusted）。[`ResidentPlugin`] の破棄（panic 等を含む）でも子の kill・回収とスレッド停止を行う。
@@ -49,7 +50,7 @@ use super::{
     ChildGuard, ONE_SHOT_EXIT_TIMEOUT, ONE_SHOT_STDERR_DRAIN_TIMEOUT, OneShotPlugin, OneShotStderr,
     OneShotTermination, PLUGIN_SOCKET_ENV, Reap, StderrCapture, bind_to_parent_lifetime,
     classify_reaped, group_kill_failed_error, rpc_timeout, spawn_registered, stderr_channel,
-    unreaped_error,
+    unreaped_error, with_group_kill_failure,
 };
 use crate::error::{PluginError, PluginErrorCode};
 use crate::frame::Frame;
@@ -513,11 +514,11 @@ impl ResidentPlugin {
                 original
             }
             // 直接の子は回収済み（pid は解放済みで報告しない）だが、孫の停止を保証できない。
-            // 元のエラーに隠さず後始末の失敗として返す。状態は未回収の子（`Unreaped`）と区別して
+            // 元のエラーの code を保ち、孫が残り得ることを付記する。状態は未回収の子（`Unreaped`）と区別して
             // `GroupKillFailed` にし、shutdown でも同じ種類の失敗を報告する（#1311・PLUG-7・REPAIR-5）。
             Reap::GroupKillFailed => {
                 self.state = ResidentState::GroupKillFailed;
-                group_kill_failed_error("a failed call")
+                with_group_kill_failure(original, "a failed call")
             }
             // 他所で回収された（ECHILD 等。#1513）。終了状態が失われたため終了コード不明の終了として扱う。
             Reap::Lost => {
@@ -587,11 +588,13 @@ fn not_running_error() -> PluginError {
 }
 
 /// 起動失敗経路で子を kill・回収する。回収を確認できなければ元のエラーに代えて `Internal`。
+/// プロセスグループの停止失敗は元のエラーの code を保って付記する（`super::reap_after_failure` と同じ。
+/// macOS のゾンビだけのグループの `EPERM` もその doc を参照）。
 fn reap_after_failure(guard: &mut ChildGuard, error: PluginError) -> PluginError {
     match guard.kill_and_reap() {
         // 他所で回収された（`Lost`。#1513）子は自プロセスの子として残っていないため、元のエラーを返す。
         Reap::Reaped(_) | Reap::AlreadyReaped | Reap::Lost => error,
-        Reap::GroupKillFailed => group_kill_failed_error("a failed start"),
+        Reap::GroupKillFailed => with_group_kill_failure(error, "a failed start"),
         Reap::Unreaped => unreaped_error(guard, "a failed start"),
     }
 }

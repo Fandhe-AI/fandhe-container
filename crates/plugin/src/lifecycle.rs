@@ -19,9 +19,13 @@
 //!   （報告後に回収すると、解放済みの pid を未回収として伝えることになるため）。子は終了済みでも
 //!   ゾンビとして残り、親プロセスの終了時に OS が引き取る。呼び出し側はその pid を未回収として扱う。
 //! - プロセスグループの停止失敗（#1311）: 直接の子は回収できたが、子のプロセスグループ宛ての kill が
-//!   失敗して孫の停止を保証できない場合は、未回収の子とは別の `Internal`（メッセージに
-//!   `process group could not be killed` を含み、解放済みの子の pid は含めない）を元のエラーに代えて
-//!   返す。`could not be reaped` とは報告しない（PLUG-7・REPAIR-5）。
+//!   失敗して孫の停止を保証できない場合、応答前の失敗経路では元のエラーの `code` と `message` を保ち、
+//!   `message` に `process group could not be killed` の付記を加えて返す（[`with_group_kill_failure`]。
+//!   元の失敗の分類を失わず、孫が残り得ることも黙らない）。元のエラーが無い経路（応答後・常駐の
+//!   shutdown）は未回収の子とは別の `Internal`（同じ文言を含み、解放済みの子の pid は含めない）を返す。
+//!   いずれも `could not be reaped` とは報告しない（PLUG-7・REPAIR-5）。macOS はゾンビだけのグループへの
+//!   `killpg` にも `EPERM` を返すため、接続後・応答前に plugin が終了した場合は孫がいなくても付記が付き得る
+//!   （`EPERM` を許容しない理由は [`group_kill_tolerated`]）。
 //! - 子の環境変数は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ設定する（資格情報を継承させない）。
 //!   stdin / stdout は null。stderr は親へ継承させず、専用の UNIX ソケット対で受けて
 //!   [`OneShotStderr`] として返す（untrusted。保持は [`ONE_SHOT_STDERR_MAX_BYTES`] まで。超過分は
@@ -223,7 +227,10 @@ pub enum OneShotTermination {
     ///
     /// 契約の限界: 送信自体が失敗した場合だけを表す。Linux の `killpg` は 1 プロセスにでも送れれば成功する
     /// ため、setuid 実行ファイル等で UID を変えた孫には SIGKILL が届かず残り得る。この部分配送による
-    /// 残留は検出できず保証対象外（全数停止は cgroup・pidfd 等を要する別課題）。
+    /// 残留は検出できず保証対象外（全数停止は cgroup・pidfd 等を要する別課題）。逆に macOS は、ゾンビだけの
+    /// グループ（孫がいない）への `killpg` にも `EPERM` を返し、生存者への権限不足と区別できないため、
+    /// 孫がいなくても本結果になり得る（fail-closed。応答後の経路は先に `try_wait` で回収するため通常は
+    /// 起きず、主に応答前の失敗経路で `reap_after_failure` の付記として現れる）。
     GroupKillFailed,
 }
 
@@ -1153,18 +1160,43 @@ fn spawn_registered(
 
 /// 応答前の失敗経路で子を明示的に kill・回収する。回収を確認できなければ、元のエラーではなく
 /// 回収失敗（`Internal`）を返す（孤児の可能性を呼び出し側へ伝える。REPAIR-5・PLUG-7）。
+///
+/// プロセスグループの停止失敗（`GroupKillFailed`）では、元のエラーの `code` を保ち、`message` に付記を
+/// 加える（[`with_group_kill_failure`]。#1311）。この経路は plugin が接続後・応答前に終了した場合
+/// （最頻の失敗経路）を含み、子は未回収のゾンビのまま `kill_and_reap` に入る。macOS はゾンビだけの
+/// グループへの `killpg` に `EPERM` を返すため、孫がいなくても付記が付き得るが、元の分類
+/// （`Unavailable` 等）は失わない。Linux はゾンビへの送信が成功するため付記は付かない。
 fn reap_after_failure(guard: &mut ChildGuard, error: PluginError) -> PluginError {
     match guard.kill_and_reap() {
         // 他所で回収された（`Lost`。#1513）子は自プロセスの子として残っていないため、元のエラーを返す。
         Reap::Reaped(_) | Reap::AlreadyReaped | Reap::Lost => error,
-        Reap::GroupKillFailed => group_kill_failed_error("a failed exchange"),
+        Reap::GroupKillFailed => with_group_kill_failure(error, "a failed exchange"),
         Reap::Unreaped => unreaped_error(guard, "a failed exchange"),
     }
 }
 
+/// 元のエラーの `code` と `message` を保ったまま、プロセスグループを停止できず孫が残り得ることを
+/// `message` に付記する（#1311・PLUG-7・REPAIR-5）。付記が上限（[`crate::error::PLUGIN_ERROR_MESSAGE_MAX_BYTES`]）
+/// で切り捨てられないよう、元の `message` 側を文字境界で詰める。直接の子の pid は解放済みのため含めない。
+pub(crate) fn with_group_kill_failure(error: PluginError, phase: &str) -> PluginError {
+    let note = format!(
+        "; additionally, the plugin process group could not be killed after {phase}, so descendant processes may remain"
+    );
+    let original = error.message();
+    let mut end = original
+        .len()
+        .min(crate::error::PLUGIN_ERROR_MESSAGE_MAX_BYTES.saturating_sub(note.len()));
+    while end > 0 && !original.is_char_boundary(end) {
+        end -= 1;
+    }
+    let head = original.get(..end).unwrap_or_default();
+    PluginError::new(error.code(), format!("{head}{note}"))
+}
+
 /// 直接の子は回収済みだが、プロセスグループ宛て SIGKILL が失敗し孫の停止を保証できないことを
-/// 伝えるエラー（`Internal`）。元のエラーに隠さず、後始末の失敗として呼び出し側へ返す
-/// （PLUG-7・REPAIR-5・#1311）。直接の子の pid は解放済みのため含めない。
+/// 伝えるエラー（`Internal`）。元のエラーが無い経路（応答後・常駐の shutdown）で、後始末の失敗として
+/// 呼び出し側へ返す（元のエラーがある経路は [`with_group_kill_failure`]。PLUG-7・REPAIR-5・#1311）。
+/// 直接の子の pid は解放済みのため含めない。
 pub(crate) fn group_kill_failed_error(phase: &str) -> PluginError {
     PluginError::new(
         PluginErrorCode::Internal,
@@ -1761,6 +1793,34 @@ mod tests {
             termination_after_kill(Reap::AlreadyReaped),
             OneShotTermination::Unreaped
         );
+    }
+
+    /// #1311・PLUG-7・REPAIR-5: 応答前の失敗経路のグループ停止失敗は、元のエラーの code と message を保って
+    /// 付記する（macOS のゾンビだけのグループの `EPERM` で `Unavailable` 等を `Internal` に置き換えない）。
+    #[test]
+    fn plug7_with_group_kill_failure_keeps_original_code_and_message() {
+        let e = with_group_kill_failure(
+            PluginError::new(PluginErrorCode::Unavailable, "peer closed the connection"),
+            "a failed exchange",
+        );
+        assert_eq!(e.code(), PluginErrorCode::Unavailable);
+        assert_eq!(
+            e.message(),
+            "peer closed the connection; additionally, the plugin process group could not be \
+             killed after a failed exchange, so descendant processes may remain"
+        );
+        // 元の message が上限近くでも付記は切り捨てられない（元の側を文字境界で詰める）。
+        let long = "あ".repeat(crate::error::PLUGIN_ERROR_MESSAGE_MAX_BYTES / 3);
+        let e = with_group_kill_failure(
+            PluginError::new(PluginErrorCode::Timeout, &long),
+            "a failed start",
+        );
+        assert_eq!(e.code(), PluginErrorCode::Timeout);
+        let note = "; additionally, the plugin process group could not be killed after a failed \
+                    start, so descendant processes may remain";
+        assert!(e.message().ends_with(note), "{}", e.message());
+        assert!(e.message().len() <= crate::error::PLUGIN_ERROR_MESSAGE_MAX_BYTES);
+        assert!(e.message().starts_with("あ"));
     }
 
     /// #1311・PLUG-7・REPAIR-5: 応答後のグループ停止失敗は `group_kill_failed_error` で報告し、回収済みの

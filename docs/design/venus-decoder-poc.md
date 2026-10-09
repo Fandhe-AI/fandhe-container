@@ -260,7 +260,8 @@ macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なし�
 ### 10.1 本 PR の範囲と未達（実装済みを装わない。REPAIR-3）
 
 - 実装済み: 候補比較（本章）、ctrl の `GET_CAPSET_INFO` / `GET_CAPSET` の復号・応答符号化・構造化ログ 1 行（`adapter`）、#1520 で `GET_DISPLAY_INFO`（scanout なし）・`CTX_CREATE`（venus の context_init）・`CTX_DESTROY` を追加（ctx 表は上限 64）、治具が広告する feature と config の定数（`device`）、ログ照合器と実機前提テストの枠（`log`・`tests/real_machine_capset_log.rs`）。socket は開かない
-- 実装済み（F1.1・#1516）: vhost-user メッセージの codec（`vhost_user`。10.5）。fd・socket・virtqueue・セッションは未実装（F1.2〜F1.4）
+- 実装済み（F1.1・#1516）: vhost-user メッセージの codec（`vhost_user`。10.5）。virtqueue・セッションは未実装（F1.3・F1.4）
+- 実装済み（F1.2・#1517）: `SCM_RIGHTS` の fd 送受信とゲストメモリの mmap のラッパー（`vhost_user::fd_passing` / `guest_memory`・`src/sys.rs`。Linux 限定。10.6）
 - **受入基準 2（ゲストの Mesa venus の capset クエリが自前デコーダに届いたことをログで確認）は未達**。トランスポート（後続 F1）と実機実行（F3・#725。人間担当）が必要なため
 - 後続（issue 起票は未実施・承認待ち）: F1 vhost-user トランスポート（メッセージ codec・fd 受け渡しと `mmap` の `sys` ラッパー・split virtqueue・kick / call。rust-vmm 系クレートは MVM-4 で使えないため自作）、F2 残りの ctrl 応答（10.4 節。`RESOURCE_CREATE_BLOB`・`SUBMIT_3D` 等）、F3 実機疎通（#725）
 - CI: `make poc-venus-jig-check`（fmt-check・clippy・test）は CI の `rust-ci-default-features` ジョブが 3 OS で実行し、`crates/plugin-macos` 側の変更による治具の破損を検出する（実機前提テストは `#[ignore]` で分離済みで CI では走らない）
@@ -352,7 +353,46 @@ Mesa venus が capset 取得の後に発行する ctrl の一次情報（`mesa-2
 - config データは治具独自の上限 256 バイト（`virtio_gpu_config` は 16 バイト）。config の flags は crosvm のビット（`WRITABLE`=0x1・`LIVE_MIGRATION`=0x2）を受理し、他のビットは拒否する（QEMU の rst は値として 0 / 1 を定めるが、crosvm の GET_CONFIG は毎回 0x1 を送るため両方を受理できる形にした）
 - 検査順は固定: `SHORT_HEADER` → `UNSUPPORTED_VERSION` → `INVALID_FLAGS`（予約ビット・方向） → `PAYLOAD_TOO_LARGE` → `UNKNOWN_REQUEST` → `LENGTH_MISMATCH` → `INVALID_VALUE`
 
-F1.1 の範囲外（申し送り）: 値の意味の検証（vring addr のアラインメント・index < キュー数・log ビット・avail index）は F1.3（#1518）、ネゴシエーション済み feature との照合・セッション状態は F1.4（#1519）、ソケット I/O・fd・mmap・タイムアウト（REPAIR-5）は F1.2（#1517）で扱う。
+F1.1 の範囲外（申し送り）: 値の意味の検証（vring addr のアラインメント・index < キュー数・log ビット・avail index）は F1.3（#1518）、ネゴシエーション済み feature との照合・セッション状態は F1.4（#1519）、fd・mmap・タイムアウト（REPAIR-5）は F1.2（#1517。10.6）で扱う。
+
+### 10.6 fd の受け渡しと共有メモリ（F1.2・#1517）
+
+frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲストメモリ領域の fd と eventfd を渡し、backend は `SET_MEM_TABLE` の領域を `mmap` して GPA 経由でアクセスする。rust-vmm 系は MVM-4 で使えないため自作し、crosvm の構造体やロジックは写していない。`unsafe` は `src/sys.rs` にだけ置く（個別承認: [#1517 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6074351741)。U1 `syscall` 宣言・U2 `recvmsg`・U3 受信 fd の所有・U4 `sendmsg`・U5 `memfd_create`・U6 `mmap`・U7 `Drop` の `munmap`・U8 境界検査後のコピー。レビュー指摘への対応で U9 `fcntl`〔`F_GET_SEALS` / `F_ADD_SEALS`〕・U10 `ppoll` を #1517 の追加承認〔[#1517 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6075711404)〕で加えた。#4 の `sys` モジュールの事前承認は根拠にしない）。lint は `lib.rs` に crate 全体の `#![deny(unsafe_code)]` を置き、`sys` にだけ `#[allow(unsafe_code)]` を付ける（承認条件）。
+
+出典（確認日 2026-10-09。値だけを転記）: Linux UAPI ヘッダ（`linux-libc-dev`）の `asm-generic/socket.h`（SHA-256 `e833d32d3d8d03732021da6968665431d693ab4effdd4d39965ff05115a4ed21`）・`linux/socket.h`（`f4331fd201269894f63242a2521b3d5b3290ca556969011d7858908d5fe658c4`）・`asm-generic/mman-common.h`・`linux/memfd.h`、`linux/fcntl.h`（`F_ADD_SEALS` / `F_GET_SEALS` / `F_SEAL_*`）・`asm-generic/poll.h`（`POLLIN` / `POLLOUT`）、syscall 番号は `asm/unistd_64.h`（x86_64）と asm-generic `unistd.h`（aarch64）、man `recvmsg(2)`・`unix(7)`・`cmsg(3)`・`mmap(2)`・`memfd_create(2)`・`fcntl(2)`・`ppoll(2)`。
+
+| 定数 | x86_64 | aarch64 |
+| ---- | ------ | ------- |
+| `sendmsg` / `recvmsg` | 46 / 47 | 211 / 212 |
+| `mmap` / `munmap` | 9 / 11 | 222 / 215 |
+| `memfd_create` | 319 | 279 |
+| `fcntl` | 72 | 25 |
+| `ppoll` | 271 | 73 |
+| `F_ADD_SEALS` / `F_GET_SEALS` / `F_SEAL_SHRINK` / `MFD_ALLOW_SEALING` | 1033 / 1034 / 0x2 / 0x2 | 同左（個別に定義） |
+| `SOL_SOCKET` / `SCM_RIGHTS` | 1 / 1 | 1 / 1 |
+| `MSG_CTRUNC` / `MSG_TRUNC` / `MSG_NOSIGNAL` / `MSG_CMSG_CLOEXEC` | 0x8 / 0x20 / 0x4000 / 0x4000_0000 | 同左（個別に定義） |
+| `SCM_PIDFD` / `MSG_DONTWAIT` / `POLLIN` / `POLLOUT` | 4 / 0x40 / 0x1 / 0x4 | 同左（個別に定義） |
+| `CMSG_HDR_LEN` / `CMSG_ALIGN` | 16 / 8 | 同左（個別に定義） |
+
+定数・カーネル ABI の構造体・`unsafe` は `sys` の `imp`（`cfg(any(target_arch = "x86_64", target_arch = "aarch64"))`）にだけ置く。それ以外のアーキの `imp` は定数を一切定義せず、すべて `UNSUPPORTED` を返す（0 などの代替定数はビット判定を常に偽にして fail-open になり得るため置かない）。riscv64 では clippy（`--all-targets -D warnings`）の型検査のみ通した。
+
+設計判断:
+
+- `recvmsg` 等は `syscall(2)` 経由でカーネル ABI の `user_msghdr` / `cmsghdr` を直接使う（glibc / musl の `msghdr` のパディング差に依存しない）。`sysconf` は使わない。タイムアウト（REPAIR-5）は呼び出しごとの期限を持ち、`MSG_DONTWAIT` の `recvmsg` / `sendmsg` と `ppoll`（U10）で待つ（共有ソケットの `SO_RCVTIMEO` に依存しない）
+- 受け取る fd は `MAX_FDS`（32）。受信した fd は `sys::recvmsg_fds` が補助データをローカルなバッファで受け、同じ呼び出しの中で検証より前にすべて `OwnedFd` にして返す（生の番号から `OwnedFd` を作る経路を `sys` の外へ出さないので、細工したバイト列で任意の fd を所有したり同じ補助データを二度解析して二重に閉じたりできない）。`MSG_CTRUNC`・上限超過・構造異常のどのエラー経路でも `Drop` で閉じる。`MSG_CMSG_CLOEXEC` で close-on-exec を原子的に付ける
+- map は file offset 0 から `mmap_offset + memory_size` バイトを `MAP_SHARED` で行い、領域の先頭をマップ内の `mmap_offset` の位置として扱う（ページ境界にそろっていない `mmap_offset` でも `EINVAL` にしない）。QEMU `vhost-user.rst` の `mmap_offset` の定義との照合は未実施で、F1.4 の結合で確認する
+- 上限は治具独自: 1 領域の map 長 64 GiB・合計 128 GiB。合計の上限は mmap より前に checked 演算で判定する（`INVALID_REGION`）。fd は治具自身が作る memfd（shmem）と `st_dev` が違えば `UNSUPPORTED_BACKING`（hugetlb の memfd は hole punch の後に SIGBUS になり得て、huge page に揃わない長さの munmap が失敗してマッピングが残るため。通常ファイルも同じ）、`F_SEAL_SHRINK` が確認できなければ `SHRINK_NOT_SEALED` で拒否し（seal 非対応の fd も同様）、そのうえでファイル長が map 長に届かなければ `FILE_TOO_SHORT`。これらとアクセス範囲の占有は `sys::MmapRegion::map_shared` が map と不可分に行い、呼び出し側に頼らない。領域をまたぐアクセスは `OUT_OF_BOUNDS`（PoC の割り切り）
+- マッピングへの参照は作らず、境界検査したコピーだけで出し入れする。`MmapRegion` は `!Send` / `!Sync`（`PhantomData<*mut u8>` で明示し、`compile_fail` の doctest で照合）
+- プロセス内の排他性: コピーは非アトミックなので、同じ backing file（`st_dev`・`st_ino`）のファイル上のアクセス範囲（`[mmap_offset, mmap_offset + memory_size)`）が重なる領域は、プロセス全体で同時に 1 個だけ map できる（重なれば mmap 前に `BACKING_IN_USE`。fd を複製しても同じ判定）。同じ memfd の重ならない範囲を別領域にするのは受け付ける。frontend プロセスの同時書き込みは vhost-user の前提として残る（値が不定になるだけ）。アトミックなコピーへの置き換えは U8 と別の unsafe になるため、承認を得るまで行わない
+- 縮小の封じ込め: frontend が後から `ftruncate` で縮めると `SIGBUS` になるため、`F_SEAL_SHRINK` つきの memfd だけを受け付ける。seal を付けない frontend は接続できない（PoC の割り切り。製品版の fd 要件は TASK-173 系で扱う）
+- aarch64 の定数と構造体は CI で型検査されない（治具はルート workspace 外で `aarch64-linux-check` の対象外）。固定値テストも実行アーキの分しか走らない。ローカルでは `cargo check --target aarch64-unknown-linux-gnu --all-targets` の型検査のみ通した（実行は未検証）
+- 範囲外: ヘッダ単位の読み書きの枠組み・セッション・UDS の bind と所有者・権限・peer credential の検証（PLUG-12 相当）・eventfd の待機は F1.4（#1519）、virtqueue と `userspace_addr` の変換は F1.3（#1518）
+- F1.4（#1519）への注意: `SET_MEM_TABLE` を送り直されたとき、古い `GuestMemory` を生かしたまま新しい表を map すると、同じ memfd の重なる範囲が `BACKING_IN_USE` で拒否される。F1.4 では「古い表を drop してから新しい表を map する」順序を決める必要がある。また合計上限（128 GiB）は `GuestMemory` 1 個の中だけで、複数の `GuestMemory` をまたぐ上限は無いため、セッション単位の上限も F1.4 で決める
+
+残っている前提:
+
+- frontend プロセスによる同時書き込みは、Rust の抽象機械の外にある非アトミックなコピー（`copy_nonoverlapping`）として扱っている。プロセス内の並行アクセスは `!Send` / `!Sync` と範囲の占有で封じたが、frontend の書き込みと backend のコピーの競合は vhost-user の前提として残る（コピーした値が不定になるだけで、マッピング外は触らない）。アトミックなアクセスへの置き換えは U1〜U10 の承認範囲外
+- 後続の F1.3（#1518）は、共有メモリから `read_at` でコピーした後のバッファだけを解析する。同じ値を共有メモリから二度読むと、frontend がその間に書き換えて検査済みの値と使う値が食い違い得る（二度読み・TOCTOU）ため、検査と使用は同じコピーに対して行う
 
 ## 11. 以降の章（未着手。10 章は #888 の範囲）
 

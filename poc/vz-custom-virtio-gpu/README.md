@@ -9,7 +9,7 @@ macOS 27 の `VZCustomVirtioDevice` で、VENUS capset だけを広告する最�
 | 項目 | 状態 |
 | ---- | ---- |
 | ゲスト側確認スクリプト（`guest/check-virtio-gpu.sh`）と自己テスト | 実装済み。合成 fixture だけで検証 |
-| ホスト側のデバイス登録コード | **未実装**。承認事項 A〜D の承認待ち（`docs/design/venus-decoder-poc.md` 9 章） |
+| ホスト側のデバイス登録コード | **未実装**。承認事項 A〜D は決定済み（`docs/design/venus-decoder-poc.md` 9 章）。本体は #1522 |
 | 実機での判定（probe・capset・host visible・Mesa venus 初期化） | 未実施。#1057 で人間が行う |
 
 ホスト側を止めた理由は、採用中の `objc2-virtualization =0.3.2` が `VZCustomVirtioDevice` 系を含まず、新規依存・`unsafe` の承認が要るため。

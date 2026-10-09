@@ -11,12 +11,21 @@
 //! `vk_mesa_venus_protocol_spec_version`(12) / `supports_blob_id_0`(16) / `vk_extension_mask1[32]`(20..148) /
 //! `allow_vk_wait_syncs`(148) / `supports_multiple_timelines`(152) / `use_guest_vram`(156)。
 //!
-//! 出典（確認日 2026-10-08。値のみ転記しコードは流用していない。SHA-256 は計画フェーズで照合した値で、
-//! 実装フェーズでは取得不能のため再照合していない）:
-//! virglrenderer `virglrenderer-1.1.0` の `src/venus_hw.h`（`7bc1a8195294d681f4081719e7c4dfea396765e82b5583a2471fad9705aab64e`）、
-//! mesa `mesa-25.0.0` の `src/virtio/virtio-gpu/venus_hw.h`（`fa736817518a9c94bf50788a404cae8282987e2e82bcee6436370b2cc6a5988b`）・
-//! `src/virtio/vulkan/vn_renderer_virtgpu.c`（`a7a0f1a395d006bfb1ef4aea4d3b2c6a44c30c50ede855416e1183442e1e03aa`）、
-//! venus-protocol `v1.1.3` の `xmls/vk.xml`（`264d0d7350e37d70c82407fb430d085040fc01a9a961d43dec8c2d6ed1dfd183`）。
+//! 出典（確認日 2026-10-09。値のみ転記しコードは流用していない。SHA-256 は全件を計画フェーズで上流から再取得して照合）:
+//! - virglrenderer `virglrenderer-1.1.0` の `src/venus_hw.h`（`7bc1a8195294d681f4081719e7c4dfea396765e82b5583a2471fad9705aab64e`）: 構造体レイアウトとフィールド名
+//! - mesa `mesa-25.0.0` の `src/virtio/virtio-gpu/venus_hw.h`（`fa736817518a9c94bf50788a404cae8282987e2e82bcee6436370b2cc6a5988b`）: レイアウトと、`vk_extension_mask1` の bit 0 の意味
+//! - mesa `mesa-25.0.0` の `src/virtio/vulkan/vn_renderer_virtgpu.c`（`a7a0f1a395d006bfb1ef4aea4d3b2c6a44c30c50ede855416e1183442e1e03aa`）: flag 3 件と `supports_blob_id_0` への `assert`（1394・1402・1404・1456 行。release ビルドでは検査されない）
+//! - mesa `mesa-25.0.0` の `src/virtio/vulkan/vn_instance.c`（`b8d3461d9a8b8d740d7c383100ac972e256263d9bd55e663be31f709c4e838a9`）: ゲストの受理条件（`wire_format_version` の完全一致・`vk_xml_version` の上限クランプと最小版の拒否。165〜184 行）
+//! - venus-protocol `v1.1.3` の `xmls/VK_EXT_command_serialization.xml`（`2451e5dcc5306f604c52da48a8cc883a24de708dd86f38bbb035d29a753a0474`）: 拡張番号 384・spec version 1
+//! - venus-protocol `v1.1.3` の `xmls/VK_MESA_venus_protocol.xml`（`d92839bc728fa9ad9a7decdc6b91df6fa1a0fb26cffae4009865f18a789e0535`）: 拡張番号 385・spec version 4
+//! - venus-protocol `v1.1.3` の `xmls/vk.xml`（`264d0d7350e37d70c82407fb430d085040fc01a9a961d43dec8c2d6ed1dfd183`）: `VK_HEADER_VERSION`（357）だけを取った。venus の 2 拡張は含まれない
+//!
+//! ライセンス・著作権表記（転記はフィールド名・並び・数値定数のみのため NOTICE は作らない。オーナー判断）:
+//! - `venus_hw.h`（virglrenderer・mesa）: MIT、`Copyright 2020 Chromium`
+//! - `vn_renderer_virtgpu.c`: MIT、`Copyright 2020 Google LLC`
+//! - `vn_instance.c`: MIT、`Copyright 2019 Google LLC`（ほかに anv / radv 由来の帰属表記〔Intel Corporation・Red Hat・Bas Nieuwenhuizen〕を含む）
+//! - `VK_EXT_command_serialization.xml`・`VK_MESA_venus_protocol.xml`: `Apache-2.0 OR MIT`、`Copyright 2020 Google LLC`
+//! - `vk.xml`: `Apache-2.0 OR MIT`、`Copyright 2015-2026 The Khronos Group Inc.`
 //!
 //! 広告値は PoC の暫定値で確定扱いにしない（#725・#726・#1057 で見直す）。未実装（REPAIR-3）:
 //! `supports_blob_id_0`・`allow_vk_wait_syncs`・`supports_multiple_timelines` を 1 にするのは対応機能
@@ -52,9 +61,9 @@ const fn with_extension(mut mask: [u32; EXT_MASK_WORDS], ext: u32) -> [u32; EXT_
     mask
 }
 
-/// `VK_EXT_command_serialization` の拡張番号（venus-protocol v1.1.3）。
+/// `VK_EXT_command_serialization` の拡張番号（venus-protocol v1.1.3 の `xmls/VK_EXT_command_serialization.xml`）。
 const EXT_COMMAND_SERIALIZATION: u32 = 384;
-/// `VK_MESA_venus_protocol` の拡張番号（venus-protocol v1.1.3）。
+/// `VK_MESA_venus_protocol` の拡張番号（venus-protocol v1.1.3 の `xmls/VK_MESA_venus_protocol.xml`）。
 const EXT_MESA_VENUS_PROTOCOL: u32 = 385;
 
 /// 最小拡張マスク: bit 0（マスク有効。未設定だと「全拡張対応」と解釈される）と venus 自身の 2 拡張のみ。

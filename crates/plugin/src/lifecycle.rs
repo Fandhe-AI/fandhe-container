@@ -55,7 +55,7 @@
 //!   終了を観測し（ゾンビのまま pgid は再利用されない）、グループへ `SIGKILL` を送ってから回収する
 //!   （Linux x86_64 / aarch64・macOS）。残るのは、(a) プローブ非対応の OS・アーキテクチャ（従来どおり回収後は
 //!   送らず孫が残る）、UID を変えた孫（Linux の `killpg` は部分配送でも成功し検出できない。macOS は孫が
-//!   いなくてもゾンビだけのグループへの送信が `EPERM` になり、権限外の生存者と区別できないため、自発終了後の
+//!   いなくてもゾンビだけのグループへの送信が `EPERM` になり、権限外の生存者と区別できないため、有限時間の再送後も残る自発終了後の
 //!   送信では `EPERM` を失敗扱いにしない）、(b) `setsid` / `setpgid` でグループを抜けた孫（plugin 本体が抜けた場合、
 //!   グループ宛ての kill・転送は旧グループに残った孫にだけ届き、本体は `Child::kill` のフォールバックで
 //!   止めて回収する。本体が抜けた後に起動した孫は届かない）、(c) Windows
@@ -898,16 +898,18 @@ thread_local! {
 /// 自発終了を観測した（ゾンビのまま未回収の）リーダーのグループへ `SIGKILL` を 1 回送り、孫の停止を
 /// 保証できない失敗なら true を返す（#1604・PLUG-7・REPAIR-5）。
 ///
-/// リーダーは終了済みで `exec` 中の窓がないため、[`kill_group_retrying_eperm`] の再送はしない（macOS で
-/// 正常終了のたびに待たせない）。許容するのは [`group_kill_tolerated`] と、macOS の `EPERM` である。
-/// macOS の `killpg` はゾンビを除いて数えるため、孫がいない（ゾンビだけの）グループは必ず `EPERM` になり、
-/// 権限外の生存者への送信失敗とは区別できない。従来この経路は何も送らず何も報告しなかったため、許容しても
-/// 退行ではない（生存中の同一 UID の孫は確実に止まる。権限外の孫は元から保証対象外。区別には生存者の
-/// 列挙が要り、将来課題）。Linux はゾンビのリーダーへの送信が成功するため `EPERM` を許容しない。
+/// リーダーが終了済みでも同じグループの孫は `exec` 中であり得て、macOS の一過性 `EPERM` は孫にも当てはまる。
+/// 最初の `EPERM` で諦めると `SIGKILL` が孫に届かないままリーダーを回収し、回収後は再送できない。そのため
+/// [`kill_group_retrying_eperm`] と同じ仕組みで `EPERM` を [`GROUP_KILL_EPERM_RETRY`] まで再送してから判断する。
+/// 再送を尽くしても残る macOS の `EPERM` は、孫がいない（ゾンビだけの）グループと区別できない
+/// （`killpg` はゾンビを除いて数える）。従来この経路は何も送らず何も報告しなかったため、許容しても退行では
+/// ない（権限外の孫は元から保証対象外。区別には生存者の列挙が要り、将来課題）。ゾンビのみの場合は
+/// 上限（200ms）まで待つことになる（macOS のみ・自発終了の観測時のみ）。Linux はゾンビのリーダーへの送信が
+/// 成功するため `EPERM` を許容しない。許容するのは [`group_kill_tolerated`] と、この macOS の `EPERM` である。
 #[cfg(unix)]
 fn kill_group_after_exit(pgid: u32) -> bool {
     const EPERM: i32 = 1;
-    match send_group_kill(pgid) {
+    match kill_group_retrying_eperm(pgid) {
         Ok(()) => false,
         Err(e) => {
             let macos_zombie_only = cfg!(target_os = "macos") && e.raw_os_error() == Some(EPERM);

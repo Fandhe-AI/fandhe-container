@@ -389,7 +389,7 @@ impl Session {
 enum KickRead {
     /// counter を読めた。
     Read,
-    /// 相手が先に読み切っていて counter が無かった（`O_NONBLOCK` が立っている場合）。
+    /// 相手が先に読み切っていて counter が無かった（現在は run_bounded が期限切れを `Lost` に畳むため返らない）。
     Drained,
     /// 補助スレッドが期限内に終わらなかった（相手が読み切ってフラグも落としている等）。読めたか不明なので、
     /// 呼び出し側は ring を走査する（空なら何も起きない）。
@@ -434,53 +434,69 @@ fn global_slot() -> Option<WorkerSlot<'static>> {
 }
 
 /// 補助スレッドで `interest` の readiness を最大 `wait_for` 待ってから `op` を実行し、`wait_for` 以内の結果を返す。
-/// 補助スレッド自身が期限つきの poll で待つので、満杯の socket や空の eventfd でも期限で自力終了して回収される
-/// （期限切れは `io::ErrorKind::TimedOut`）。poll 後に相手が状態を変えた競合で `op` が止まった場合に限り、
-/// 呼び出し側が起こす操作を試み、それでも残るスレッドは [`MAX_LIVE_WORKERS`] の上限で数を抑える。
+/// 補助スレッドは複製 fd を `O_NONBLOCK`（`FIONBIO`）にして、期限つきの poll → 非ブロッキング `op` を期限までループする。
+/// `op` が `WouldBlock`（poll 後に相手が counter を読み切った・満たした競合）なら残り時間で poll からやり直し、期限で
+/// `io::ErrorKind::TimedOut` を返して自力終了する。blocking I/O に入らないので、共有フラグを変えない相手でも
+/// スレッドと [`WorkerSlot`] は期限＋poll 1 回分の遅延以内に必ず回収される（REPAIR-5）。
+/// `O_NONBLOCK` は open file description 共有なので、フラグを同時に落とし続ける敵対的な相手に対しては
+/// poll 後の隙間が理論上残る（その場合も [`MAX_LIVE_WORKERS`] で数を抑え、受け側は `recv_timeout` で期限切れにする）。
 /// 期限切れ（結果が来ない）は `Ok(None)`。
 fn run_bounded<T: Send + 'static>(
     file: &File,
     interest: sys::Interest,
     wait_for: Duration,
-    op: impl FnOnce(&File) -> io::Result<T> + Send + 'static,
+    op: impl Fn(&File) -> io::Result<T> + Send + 'static,
 ) -> Result<Option<io::Result<T>>, SessionError> {
     let failed = || SessionError::new(SessionErrorCode::FdSetupFailed, None);
     let Some(slot) = global_slot() else {
         return Err(SessionError::new(SessionErrorCode::WorkerLimit, None));
     };
     let dup = file.try_clone().map_err(|_| failed())?;
+    // `FIONBIO` を safe に発行するため、別の複製を `UnixStream` として包む（`set_nonblocking` は fd の種別に依らない ioctl）。
+    let nb = UnixStream::from(OwnedFd::from(file.try_clone().map_err(|_| failed())?));
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("venus-jig-fd-io".into())
         .spawn(move || {
             let _slot = slot;
-            // EINTR は残り時間で再試行する（シグナルで生きたセッションを TimedOut にしない）。
             let deadline = Instant::now().checked_add(wait_for);
-            let ready = loop {
+            let result = loop {
                 let left = match deadline {
                     Some(d) => d.saturating_duration_since(Instant::now()),
                     None => wait_for,
                 };
-                match sys::wait_fd(dup.as_fd(), interest, left) {
-                    Ok(ready) => break ready,
+                // EINTR は残り時間で再試行する（シグナルで生きたセッションを TimedOut にしない）。
+                let ready = match sys::wait_fd(dup.as_fd(), interest, left) {
+                    Ok(ready) => ready,
                     Err(sys::SysError::Interrupted(_)) if !left.is_zero() => continue,
-                    Err(sys::SysError::Interrupted(_)) => break false,
-                    Err(_) => {
-                        let _ = tx.send(Err(io::Error::from(ErrorKind::Other)));
-                        return;
-                    }
+                    Err(sys::SysError::Interrupted(_)) => false,
+                    Err(_) => break Err(io::Error::from(ErrorKind::Other)),
+                };
+                if !ready {
+                    break Err(io::Error::from(ErrorKind::TimedOut));
                 }
-            };
-            let result = if ready {
-                op(&dup)
-            } else {
-                Err(io::Error::from(ErrorKind::TimedOut))
+                // poll の直後に毎回立て直してから非ブロッキングで実行する。
+                if nb.set_nonblocking(true).is_err() {
+                    break Err(io::Error::from(ErrorKind::Other));
+                }
+                match op(&dup) {
+                    Err(e)
+                        if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
+                    {
+                        if deadline.is_some_and(|d| Instant::now() >= d) {
+                            break Err(io::Error::from(ErrorKind::TimedOut));
+                        }
+                        // busy loop を避けて短く待ってから poll へ戻る。
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    other => break other,
+                }
             };
             // 受け側が期限切れで捨てていれば送信は失敗するが、結果が要らないので無視する。
             let _ = tx.send(result);
         })
         .map_err(|_| failed())?;
-    // 補助スレッドの poll の期限（`wait_for`）より少し長く待ち、通常は補助スレッド自身の TimedOut を受け取る。
+    // 補助スレッドの期限（`wait_for`）より少し長く待ち、通常は補助スレッド自身の TimedOut を受け取る。
     match rx.recv_timeout(wait_for.saturating_add(WORKER_GRACE)) {
         Ok(r) => Ok(Some(r)),
         Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
@@ -491,29 +507,8 @@ fn run_bounded<T: Send + 'static>(
 /// 補助スレッドの結果を待つときに `wait_for` へ足す余裕。
 const WORKER_GRACE: Duration = Duration::from_millis(50);
 
-/// 切り離した unblock 用スレッドが readiness を待つ上限。これを過ぎれば何もせず自力で終了する（REPAIR-5）。
-const UNBLOCK_WAIT: Duration = Duration::from_secs(1);
-
-/// `op` を切り離したスレッドで実行する（結果は捨てる。失敗や上限超過では何もしない）。blocking の fd で `op` が
-/// 無期限に止まらないよう、`interest` の readiness を [`UNBLOCK_WAIT`] だけ待ってから実行し、来なければ何もせず終了する。
-fn detach(file: &File, interest: sys::Interest, op: impl FnOnce(&File) + Send + 'static) {
-    let Some(slot) = global_slot() else {
-        return;
-    };
-    if let Ok(dup) = file.try_clone() {
-        let _ = std::thread::Builder::new()
-            .name("venus-jig-fd-unblock".into())
-            .spawn(move || {
-                let _slot = slot;
-                if matches!(sys::wait_fd(dup.as_fd(), interest, UNBLOCK_WAIT), Ok(true)) {
-                    op(&dup);
-                }
-            });
-    }
-}
-
-/// kick の eventfd から counter（8 バイト）を読む。読み取りは補助スレッドに任せ（readiness を期限つきで待ってから読む）、
-/// `wait_for` 以内に終わらなければ読み取りを起こすために 1 を書いて（別の切り離したスレッドで）`Lost` を返す。
+/// kick の eventfd から counter（8 バイト）を読む。読み取りは補助スレッドに任せ（readiness を期限つきで待ち、非ブロッキングで
+/// 読む）、`wait_for` 以内に読めなければ `Lost`（読めたか不明なので呼び出し側は ring を走査する。空なら何も起きない）。
 fn read_kick(kick: &File, wait_for: Duration) -> Result<KickRead, SessionError> {
     let result = run_bounded(kick, sys::Interest::Readable, wait_for, |f| {
         let mut counter = [0u8; 8];
@@ -521,60 +516,29 @@ fn read_kick(kick: &File, wait_for: Duration) -> Result<KickRead, SessionError> 
         r.read(&mut counter).map(|n| (n, counter))
     })?;
     match result {
-        None => {
-            // poll の後で相手が counter を読み切り、読み取りが止まった競合。1 を足して起こす（余分な kick は空走査で無害）。
-            detach(kick, sys::Interest::Writable, |f| {
-                let mut w = f;
-                let _ = w.write(&1u64.to_le_bytes());
-            });
-            Ok(KickRead::Lost)
-        }
-        // 補助スレッドが readiness を待ち切れず終わった（相手が読み切り、フラグも落としている等）。
+        None => Ok(KickRead::Lost),
         Some(Err(e)) if e.kind() == ErrorKind::TimedOut => Ok(KickRead::Lost),
         Some(Ok((0, _))) => Err(SessionError::new(SessionErrorCode::KickClosed, None)),
         Some(Ok((8, _))) => Ok(KickRead::Read),
         Some(Ok(_)) => Err(SessionError::new(SessionErrorCode::InvalidKick, None)),
-        Some(Err(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
-            Ok(KickRead::Drained)
-        }
         Some(Err(_)) => Err(SessionError::new(SessionErrorCode::InvalidKick, None)),
     }
 }
 
 /// call の eventfd へ 1 を書いてゲストへ通知する。書き込みは補助スレッドに任せ、書き込み可能になるのを期限つきの poll で
-/// 待ってから書く。満杯の socket など書けない fd でも補助スレッドは期限で自力終了し、`timeout` で `TIMEOUT` になる。
-/// `EAGAIN`（poll 後に相手が counter を満たした等）は期限内で再試行する。
+/// 待ってから非ブロッキングで書く。満杯の socket など書けない fd でも補助スレッドは期限で自力終了し、`timeout` で `TIMEOUT` になる。
 fn notify(call: &File, timeout: Duration) -> Result<(), SessionError> {
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| SessionError::new(SessionErrorCode::InvalidArgument, None))?;
-    loop {
-        let left = remaining(deadline)?;
-        let result = run_bounded(call, sys::Interest::Writable, left, |f| {
-            let mut w = f;
-            w.write(&1u64.to_le_bytes())
-        })?;
-        match result {
-            None => {
-                // poll の後で相手が counter を満たし、書き込みが止まった競合。counter を読んで（drain）起こす。
-                detach(call, sys::Interest::Readable, |f| {
-                    let mut r = f;
-                    let mut b = [0u8; 8];
-                    let _ = r.read(&mut b);
-                });
-                return Err(SessionError::new(SessionErrorCode::Timeout, None));
-            }
-            Some(Err(e)) if e.kind() == ErrorKind::TimedOut => {
-                return Err(SessionError::new(SessionErrorCode::Timeout, None));
-            }
-            Some(Ok(8)) => return Ok(()),
-            Some(Ok(_)) => return Err(SessionError::new(SessionErrorCode::CallFailed, None)),
-            Some(Err(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
-                // busy loop を避けて短く待ってから期限内で再試行する。
-                std::thread::sleep(left.min(Duration::from_millis(1)));
-            }
-            Some(Err(_)) => return Err(SessionError::new(SessionErrorCode::CallFailed, None)),
+    let result = run_bounded(call, sys::Interest::Writable, timeout, |f| {
+        let mut w = f;
+        w.write(&1u64.to_le_bytes())
+    })?;
+    match result {
+        None => Err(SessionError::new(SessionErrorCode::Timeout, None)),
+        Some(Err(e)) if e.kind() == ErrorKind::TimedOut => {
+            Err(SessionError::new(SessionErrorCode::Timeout, None))
         }
+        Some(Ok(8)) => Ok(()),
+        Some(Ok(_)) | Some(Err(_)) => Err(SessionError::new(SessionErrorCode::CallFailed, None)),
     }
 }
 

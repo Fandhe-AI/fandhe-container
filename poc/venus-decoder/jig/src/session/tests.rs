@@ -342,3 +342,22 @@ fn repair5_full_call_worker_ends_by_itself_on_deadline() {
         assert_eq!(r.expect_err("not writable").kind(), ErrorKind::TimedOut);
     }
 }
+
+/// REPAIR-5: poll が成立しても `op` が `WouldBlock` を返し続ける競合（相手が counter を読み切る・満たす）では、
+/// 補助スレッドは blocking I/O に入らず期限で `TimedOut` を返して自力終了する。
+#[test]
+fn repair5_worker_ends_on_deadline_when_op_keeps_would_block() {
+    let (kick, mut peer) = file_pair();
+    peer.write_all(&[1u8]).expect("readable");
+    let started = Instant::now();
+    let r = run_bounded(
+        &kick,
+        sys::Interest::Readable,
+        Duration::from_millis(80),
+        |_| Err::<usize, _>(io::Error::from(ErrorKind::WouldBlock)),
+    )
+    .expect("spawned")
+    .expect("worker reports before the grace period");
+    assert_eq!(r.expect_err("never completes").kind(), ErrorKind::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(5));
+}

@@ -99,6 +99,7 @@ mod capabilities;
 mod cgroup_join;
 mod container_env;
 mod devices;
+mod entrypoint_mode;
 mod exec_command;
 mod inject;
 mod interpreter;
@@ -132,6 +133,8 @@ pub use devices::{
     DeviceLinkOutcome, DeviceLinkStatus, DeviceNodeOutcome, DeviceNodeStatus, DeviceReport,
     create_default_devices,
 };
+/// 封印した複製の上限（結合試験が上限超過を再現するための再公開。TASK-163 追補・#1531）。
+pub use entrypoint_mode::{EntrypointExecMode, PathBoundLsm, SealedCopyUnavailable};
 pub use exec_command::{ExecChild, ExecWorkerProof, spawn_exec_command, spawn_exec_worker};
 pub use inject::{InjectReport, InjectedDirectoryOutcome, InjectedFileOutcome, inject_files};
 /// 結合試験 `tests/landlock.rs` 専用の再公開（CORE-5・TASK-39.5・#185。通常の利用者は呼ばない。詳細は定義側）。
@@ -161,7 +164,8 @@ pub use process::{
 #[doc(hidden)]
 pub use process::{
     EXEC_FD_HEAD_BYTES, ExecChildSetupObservation, ExecChildSetupReport, ExecFdReport,
-    observe_exec_child_setup, observe_exec_child_setup_with, observe_exec_child_setup_with_fsize,
+    observe_exec_child_setup, observe_exec_child_setup_pinned, observe_exec_child_setup_with,
+    observe_exec_child_setup_with_fsize,
 };
 /// 結合試験 `tests/exec_child_setup.rs`・`tests/fork_exec_isolation.rs` 専用の再公開（SEC-1・CORE-1・TASK-27.4.1・#1299。
 /// 通常の利用者は呼ばない。詳細は定義側）。
@@ -178,7 +182,6 @@ pub use reapply::{
 #[doc(hidden)]
 pub use reapply::{ExecReapplyObservation, observe_exec_restriction_reapply};
 pub use rootfs::{PivotReport, PreparedRootfs, pivot_root, prepare_rootfs};
-/// 封印した複製の上限（結合試験が上限超過を再現するための再公開。TASK-163 追補・#1531）。
 pub use sealed_copy::MAX_SEALED_COPY_BYTES;
 pub use seccomp::SeccompReport;
 /// 結合試験 `tests/escape_suite.rs` の ESC-03 専用の再公開（SEC-2・TASK-42.2・#200。通常の利用者は呼ばない。詳細は定義側）。

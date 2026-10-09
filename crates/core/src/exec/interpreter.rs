@@ -25,13 +25,23 @@
 //! 独立に効く層で、Landlock が無くても静的な指定を拒否し、拒否を違反記録
 //! （`entrypoint_interpreter_is_runtime_binary`。SEC-4）として返す。B' は A の上に重ねて本体の書き換えの窓を
 //! 狭める方式で、設計は下記の節に決め、`sys` のラッパーが #1530、稼働中コンテナへの exec の子への組み込みが #1531
-//! （`sealed_copy.rs`・`process.rs` の `EntrypointSource::SealedCopy`）。
+//! （`sealed_copy.rs`・`process.rs` の `EntrypointSource::Switchable`）。
 //!
 //! # 封印した複製からの実行（B'。設計決定。#1529・#1530・#1531）
 //!
-//! **実装済み（稼働中コンテナへの exec のみ。#1531）**: `prepare_exec_child` の `EntrypointSource::SealedCopy`
-//! （`run_exec_child` 経由）が `sealed_copy.rs` の `seal_entrypoint_copy` を呼び、以降の解析・照合・実行を複製に
-//! 対して行う。launch 経路（`EntrypointSource::Pinned`）には掛けない（下記「サイズ上限」の理由。#1314 の後）。
+//! **実装済み（稼働中コンテナへの exec のみ。#1531）**: `prepare_exec_child` の `EntrypointSource::Switchable`
+//! （`run_exec_child` 経由）が、判定した方式（`EntrypointExecMode`。`entrypoint_mode.rs`）が封印した複製なら
+//! `sealed_copy.rs` の `seal_entrypoint_copy` を呼び、以降の解析・照合・実行を複製に対して行う。launch 経路
+//! （`EntrypointSource::Pinned`）には掛けない（下記「サイズ上限」の理由。#1314 の後）。
+//!
+//! **方式の切り替え（オーナー判断 2026-10-09「条件付き切り替え」）**: 封印した複製を使える環境（下記「限界」の
+//! (a)〜(c)）では B' で実行し、それ以外では A（O_PATH での固定 + inode 照合をした元の fd をそのまま `execveat` する
+//! 現行方式。#1478）で実行する。切り替えは黙って行わない: 判定結果は `EntrypointExecMode`（方式と、A を選んだ理由の
+//! 機械可読なコード `kernel_too_old`・`lsm_apparmor`・`ima_policy_unreadable` 等）で表し、supervisor が構造化ログ
+//! （`{"component":"supervisor.exec","operation":"entrypoint_mode",...}`）と `ExecOutcome` に残す（REPAIR-4）。A でも
+//! 元のファイルのマウントの `noexec` は `fstatfs` で判定して違反 `entrypoint_on_noexec_mount` で拒否する（B' と判定・
+//! 違反記録を揃える）。A では照合した元の fd を実行するため、照合の後・`execveat` の前に元のファイルの内容（シェバン・
+//! `PT_INTERP`）を書き換える競合と、インタープリタのパスの差し替えは残る（#1458 の論点。下記「限界」）。
 //! 拒否は違反 `entrypoint_copy_too_large`・`entrypoint_copy_seal_unverified`・`entrypoint_on_noexec_mount`（SEC-4）で
 //! 子から親へ届く。`sys` のラッパー（`memfd_create_for_exec_copy`・`add_seals`・`get_seals`・`seal_for_exec`〔封印を
 //! 検証した `SealedMemfd` だけを返す〕）は #1530、元のファイルを実行してよいかのカーネルへの問い合わせ
@@ -69,8 +79,9 @@
 //!   参加した後に作るため、コンテナの `memory.max` に計上される（ホストのメモリを直接は奪わない）。一方、memfd の
 //!   ページは exec 先が生きている間残る（共有されない shmem）ため、exec 1 回ごとに本体の大きさぶん常駐メモリが
 //!   増える。exec は一時的なコマンド向けで、常駐するワークロード（launch）には掛けない（CORE-7〜9 との関係）
-//! - **memfd を使えないとき（fail-closed）**: `close_range`（5.11）・新マウント API（5.2）の前例に合わせて拒否し、
-//!   照合だけの方式 A へ黙って戻さない。`memfd_create`（3.17）・seal は対応カーネルの下限より古いため `ENOSYS` は
+//! - **memfd を使えないとき（fail-closed）**: 方式の判定（`setns` の前）が B' を選んだ後に exec の子で memfd を
+//!   作れない場合は、`close_range`（5.11）・新マウント API（5.2）の前例に合わせて拒否し、子の中で A へは切り替えない
+//!   （切り替えは事前の判定でだけ行い、記録する）。`memfd_create`（3.17）・seal は対応カーネルの下限より古いため `ENOSYS` は
 //!   想定外として拒否する。`MFD_EXEC` を知らないカーネル（6.3 未満）の `EINVAL` に限り、`sys` が `MFD_EXEC` を外して
 //!   1 回だけ再試行する（6.3 未満の memfd は実行できる）。`vm.memfd_noexec=2` の下では `MFD_EXEC` が `EACCES`、
 //!   コンテナの seccomp が `memfd_create` を禁止していれば `EPERM` などになり、いずれも拒否する（`memfd_create`・
@@ -86,7 +97,8 @@
 //!   `mount_rights` が `noexec` のマウントから外す `EXECUTE` は、祖先（`/`）の許可に覆われて Landlock では効かない
 //!   （`ShadowedRestriction`。VFS の `noexec` が守る前提）が、その `noexec` は `fstatfs` の `ST_NOEXEC`（手順 1。違反
 //!   `entrypoint_on_noexec_mount`）と `AT_EXECVE_CHECK` の両方で元のファイルについて判定する。Linux 6.14 未満では
-//!   `AT_EXECVE_CHECK` が無いため、複製せずに拒否する（fail-closed）。本番相当の通し（root・Landlock ABI 6+ を要する
+//!   `AT_EXECVE_CHECK` が無いため封印した複製を使わず、現行方式（元の fd の `execveat` がカーネルの規則のまま Landlock を
+//!   判定する）で実行し、理由 `kernel_too_old` を記録する。本番相当の通し（root・Landlock ABI 6+ を要する
 //!   supervisor の `tests/exec.rs`）での実行確認は実機の記録に委ねる
 //! - **`ETXTBSY`**: 本リポの検証環境（Linux 7.0）では、封印した memfd を読み取り専用で開き直して書き込み用 fd を閉じれば、
 //!   実行できることを `sys` のテスト（`sup6_task163_sealed_memfd_is_executable_after_readonly_reopen`）で確認した。
@@ -125,24 +137,25 @@
 //!   #1314（本番 launcher の構成）の後になる
 //! - **B' は元のファイルに結び付いた exec 後の拘束を再現しない（維持できない環境は拒否する）**: 実行の **許可**
 //!   （実行ビット・`noexec`・Landlock の `EXECUTE`・`security_bprm_creds_for_exec`）は、複製の前に元のファイルの fd へ
-//!   `AT_EXECVE_CHECK`（Linux 6.14+）で問い合わせる（6.14 未満は拒否）。一方、AppArmor のパス結び付きプロファイル・
+//!   `AT_EXECVE_CHECK`（Linux 6.14+）で問い合わせる（6.14 未満は B' を使わない）。一方、AppArmor のパス結び付きプロファイル・
 //!   SELinux の exec 遷移は、実行した後にどのプロファイル・ドメインで動くかを実行したファイルについて決めるため、
 //!   memfd を実行すると元のファイルについては働かない。IMA の appraisal が `AT_EXECVE_CHECK` で評価されるかは一次情報で
 //!   確かめていない。`sealed_copy.rs` の手順 0（`SealPolicy`）が、`prepare_exec_restrictions` が `setns` の前にホスト側で
 //!   読んだ環境（`/sys/kernel/security/lsm`・`/proc/cmdline`・IMA の policy）から許可リスト方式で判定し、維持できない
-//!   （または判定できない）なら複製せずに `FailedPrecondition` で拒否する: 安全と分かっている LSM（`capability`・
+//!   （または判定できない）なら複製せず、理由を記録して A（現行方式）で実行する（オーナー判断 2026-10-09）: 安全と分かっている LSM（`capability`・
 //!   `lockdown`・`yama`・`landlock`・`loadpin`・`safesetid`）と、IMA の appraisal が無いと確かめられた場合の IMA 系
-//!   （`ima`・`evm`・`integrity`）以外が有効なら拒否する（AppArmor・TOMOYO・Smack・BPF LSM・IPE・SELinux と未知の名前）。
+//!   （`ima`・`evm`・`integrity`）以外が有効なら B' を使わない（AppArmor・TOMOYO・Smack・BPF LSM・IPE・SELinux と未知の名前）。
 //!   Landlock は有効でも一律には拒否しない（exec の子は自前のルールセットを必ず適用するため、一律拒否は本番の exec を
 //!   成立させない。`EXECUTE` は `AT_EXECVE_CHECK` が判定する）。
-//!   **帰結**: 封印した複製を使える（稼働中コンテナへの exec が成立する）のは、(a) Linux 6.14 以上、(b) 有効な LSM が
+//!   **帰結**: 封印した複製を使える（B' で実行する）のは、(a) Linux 6.14 以上、(b) 有効な LSM が
 //!   上の許可リストに収まる（`apparmor`・`selinux`・`tomoyo`・`smack`・`bpf`・`ipe` や未知の LSM が無い）、(c) IMA 系が
 //!   有効なら `/proc/cmdline` に appraisal の指定が無く、`/sys/kernel/security/ima/policy` を読めて appraise 行が無いと
 //!   確かめられる、をすべて満たすホストだけ。(c) は `CONFIG_IMA_READ_POLICY` なしのカーネル（policy が書き込み専用）
 //!   では満たせない。例えば Ubuntu の既定（LSM が `lockdown,capability,landlock,yama,apparmor,ima,evm`・`CONFIG_IMA=y`・
-//!   `CONFIG_IMA_READ_POLICY` 未設定・`ima/policy` が `--w-------`）では、AppArmor を外しても IMA の判定で常に拒否される
-//!   （独立監査が Linux 7.0 の実機で確認）。Fedora 等の SELinux 既定のホストも拒否される。照合だけの方式 A へは
-//!   戻さない。この環境での採否は所有者の判断事項。setuid ビット・ファイル capability は `NO_NEW_PRIVS` が適用済みの
+//!   `CONFIG_IMA_READ_POLICY` 未設定・`ima/policy` が `--w-------`）では、AppArmor を外しても IMA の判定で常に B' を
+//!   使えない（独立監査が Linux 7.0 の実機で確認）。Fedora 等の SELinux 既定のホストも同じ。これらのホストでは A で
+//!   実行し、理由コード（`lsm_apparmor`・`ima_policy_unreadable`・`lsm_selinux` 等）を記録する。A では照合と `execveat`
+//!   の間の書き換え（下の 2 項目。#1458 の論点）が残余のリスクとして残る。setuid ビット・ファイル capability は `NO_NEW_PRIVS` が適用済みの
 //!   ため元々無効で、複製しても緩和にならない
 //! - **B' で `/proc/self/exe` の見え方が変わる**: exec 先の `/proc/self/exe` は `/memfd:fandhe-exec-entrypoint (deleted)`
 //!   を指す（元のパスではなくなる）。シェバンのスクリプトは従来どおり `/dev/fd/N` を渡される

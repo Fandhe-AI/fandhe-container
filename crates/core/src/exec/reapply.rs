@@ -159,6 +159,7 @@ use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
+use super::entrypoint_mode::EntrypointExecMode;
 use super::landlock::landlock_ruleset_from_config;
 #[cfg(feature = "exec-test-support")]
 use super::landlock::{LandlockAccessProbe, run_probe};
@@ -228,6 +229,15 @@ struct TargetBinding {
     /// 対象のコンテナ cgroup（`Pid1Target::open` が記録から組み立てた期待パス）。cgroup 参加後の自プロセスの
     /// 所属と完全一致を照合する。
     expected_cgroup: String,
+}
+
+impl ExecRestrictions {
+    /// エントリポイントの実行方式の判定結果（`setns` の前に判定済み。封印した複製か現行方式と、その理由。
+    /// オーナー判断 2026-10-09「条件付き切り替え」・#1531・REPAIR-4）。supervisor が構造化ログと `ExecOutcome` に
+    /// 残すために読む。
+    pub fn entrypoint_mode(&self) -> EntrypointExecMode {
+        self.seal_policy.mode()
+    }
 }
 
 impl std::fmt::Debug for ExecRestrictions {
@@ -352,6 +362,11 @@ impl ExecRestrictionReport {
     /// 追加した Landlock ルール数。
     pub fn landlock_rules(&self) -> usize {
         self.landlock_rules
+    }
+
+    /// exec の子が使うエントリポイントの実行方式（[`ExecRestrictions::entrypoint_mode`] と同じ判定。#1531）。
+    pub fn entrypoint_mode(&self) -> EntrypointExecMode {
+        self.carry.seal_policy.mode()
     }
 
     /// 適用した seccomp の BPF 命令数。

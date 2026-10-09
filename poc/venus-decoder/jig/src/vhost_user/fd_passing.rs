@@ -37,6 +37,13 @@ pub struct Received {
     pub fds: Vec<OwnedFd>,
 }
 
+/// 送信結果。将来のフィールド追加（fd の送信状態等）に備えて構造体にする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sent {
+    /// 送れたデータのバイト数（部分送信なら `data.len()` 未満）。
+    pub len: usize,
+}
+
 fn err(code: TransportErrorCode) -> TransportError {
     TransportError::new(code)
 }
@@ -218,7 +225,7 @@ fn recv_impl(
     Ok(Received { len: raw.len, fds })
 }
 
-/// データと fd を 1 回の `sendmsg` で送り、送れたバイト数を返す（部分送信はあり得る）。
+/// データと fd を 1 回の `sendmsg` で送り、送れたバイト数を [`Sent`] で返す（部分送信はあり得る）。
 ///
 /// backend から frontend への fd 送信は後送り（BACKEND_REQ・#1057）だが、F1.4 の偽 frontend とテストが使うので公開する。
 /// `fds` は `MAX_FDS` 以下、`data` は空でなく、`timeout` は 0 より大きく [`MAX_TIMEOUT`] 以下であること（`INVALID_ARGUMENT`）。
@@ -227,7 +234,7 @@ pub fn send_with_fds(
     data: &[u8],
     fds: &[BorrowedFd<'_>],
     timeout: Duration,
-) -> Result<usize, TransportError> {
+) -> Result<Sent, TransportError> {
     observe::global().observe(Op::SendFds, || {
         if fds.len() > MAX_FDS || data.is_empty() {
             return Err(err(TransportErrorCode::InvalidArgument));
@@ -235,7 +242,7 @@ pub fn send_with_fds(
         let deadline = deadline_for(timeout)?;
         loop {
             match sys::sendmsg_fds(sock.as_fd(), data, fds) {
-                Ok(n) => return Ok(n),
+                Ok(len) => return Ok(Sent { len }),
                 Err(sys::SysError::Os(n)) if n == sys::EINTR => check_deadline(deadline)?,
                 Err(sys::SysError::Os(n)) if n == sys::EAGAIN => {
                     wait_until(sock, sys::Interest::Writable, deadline)?;
@@ -325,7 +332,10 @@ mod tests {
             assert_eq!(e.code, TransportErrorCode::InvalidArgument);
         }
         // 上限ちょうどは受理され、データが既にあれば即座に返る。
-        assert_eq!(send_with_fds(&a, b"x", &[], MAX_TIMEOUT).expect("send"), 1);
+        assert_eq!(
+            send_with_fds(&a, b"x", &[], MAX_TIMEOUT).expect("send"),
+            Sent { len: 1 }
+        );
         let r = recv_with_fds(&b, &mut buf, 0, MAX_TIMEOUT).expect("recv");
         assert_eq!((r.len, r.fds.len()), (1, 0));
     }

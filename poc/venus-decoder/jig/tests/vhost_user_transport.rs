@@ -90,7 +90,7 @@ mod linux {
             f.write_all_at(&[i as u8 + 1; 4], 0).expect("write");
         }
         let fds: Vec<BorrowedFd<'_>> = files.iter().map(|f| f.as_fd()).collect();
-        assert_eq!(send_with_fds(&a, b"hello", &fds, T).expect("send"), 5);
+        assert_eq!(send_with_fds(&a, b"hello", &fds, T).expect("send").len, 5);
 
         let mut buf = [0u8; 64];
         let got = recv_with_fds(&b, &mut buf, 3, T).expect("recv");

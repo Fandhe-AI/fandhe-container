@@ -373,9 +373,6 @@ pub fn prepare_restrictions(
     core_prepare_exec_restrictions(worker, &target.pid1, &config, &rootfs).map_err(from_exec_error)
 }
 
-/// 稼働中コンテナの中で実行するコマンドの要求（コンテナ内の絶対パス・argv・明示の環境変数。
-/// SUP-6・SEC-1・TASK-163 追補・#1457）。
-///
 /// exec の拒否を永続化する本番の記録先を作る（SEC-4・SUP-6・TASK-163 追補・#1594）。
 ///
 /// `root_override` が `None` なら core の既定ルート解決に従い（`state::open_default_store` と同じ規則）、状態ストアを
@@ -391,6 +388,9 @@ pub fn default_audit_sink(
     Ok(FileAuditSink::in_state_store(&store))
 }
 
+/// 稼働中コンテナの中で実行するコマンドの要求（コンテナ内の絶対パス・argv・明示の環境変数。
+/// SUP-6・SEC-1・TASK-163 追補・#1457）。
+///
 /// [`run_command`] の入力。**環境変数の基底は呼び出し側から渡せない**: 基底は常に、対象の記録の bundle の
 /// `config.json` の `process.env`（コンテナ定義。launch 経路がエントリポイントへ渡すのと同じ出所）で、worker が
 /// 読み込んで組み立てる。呼び出し側が足せるのは、利用者がその exec に対して明示した値（[`Self::with_env`]。

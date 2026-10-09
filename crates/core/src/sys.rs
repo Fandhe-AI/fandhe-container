@@ -156,6 +156,9 @@ mod consts {
     // include/uapi/asm-generic/signal.h の `SIGKILL`・`SIGPIPE`（x86_64 は上書きしない）。
     pub const SIGKILL: i32 = 9;
     pub const SIGPIPE: i32 = 13;
+    // arch/x86/include/uapi/asm/signal.h の `SIGCHLD`（結合試験の `set_child_signal_ignored_for_test` だけが使う）。
+    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
+    pub const SIGCHLD: i32 = 17;
     // include/uapi/asm-generic/fcntl.h（x86_64 は上書きしない）。
     pub const O_DIRECTORY: i32 = 0o200_000;
     pub const O_NOFOLLOW: i32 = 0o400_000;
@@ -373,6 +376,9 @@ mod consts {
     // include/uapi/asm-generic/signal.h の `SIGKILL`・`SIGPIPE`（arm64 は上書きしない）。
     pub const SIGKILL: i32 = 9;
     pub const SIGPIPE: i32 = 13;
+    // include/uapi/asm-generic/signal.h の `SIGCHLD`（結合試験の `set_child_signal_ignored_for_test` だけが使う）。
+    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
+    pub const SIGCHLD: i32 = 17;
     // arch/arm64/include/uapi/asm/fcntl.h（asm-generic と異なる。x86_64 の値を流用しない。
     // 流用すると O_DIRECT / O_LARGEFILE に化ける）。
     pub const O_DIRECTORY: i32 = 0o40_000;
@@ -583,6 +589,8 @@ mod consts {
     pub const WNOHANG: i32 = 0;
     pub const SIGKILL: i32 = 0;
     pub const SIGPIPE: i32 = 0;
+    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
+    pub const SIGCHLD: i32 = 0;
     pub const O_DIRECTORY: i32 = 0;
     pub const O_NOFOLLOW: i32 = 0;
     pub const O_CLOEXEC: i32 = 0;
@@ -2393,6 +2401,31 @@ pub(crate) fn clear_supplementary_groups() -> Result<(), SysError> {
 /// `signal(2)` の `SIG_DFL`（既定動作）と `SIG_ERR`（失敗）。`sighandler_t` はポインタ幅。
 const SIG_DFL: usize = 0;
 const SIG_ERR: usize = usize::MAX;
+/// `signal(2)` の `SIG_IGN`（無視。include/uapi/asm-generic/signal-defs.h の `((__sighandler_t)1)`）。
+#[cfg(feature = "exec-test-support")]
+const SIG_IGN: usize = 1;
+
+/// 結合試験専用: 自プロセスの `SIGCHLD` を `ignored` なら `SIG_IGN`、そうでなければ `SIG_DFL` にする
+/// （`FileAuditSink` の子プロセス隔離が、`SIGCHLD` を無視するプロセス〔子が自動回収され `waitpid` が
+/// `ECHILD` を返す〕でも主経路の結果を取り違えないことの照合用。REPAIR-5・SEC-4・TASK-163 追補・#1594）。
+///
+/// `tests/audit_sink_isolation.rs` の単一スレッドの `main` からだけ呼ぶ。プロセス全体の disposition を
+/// 変えるため、他の試験と同じプロセスで並行に使わない。
+#[cfg(feature = "exec-test-support")]
+pub(crate) fn set_child_signal_ignored_for_test(ignored: bool) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let handler = if ignored { SIG_IGN } else { SIG_DFL };
+    // SAFETY: 引数は整数（`SIG_IGN` = 1 / `SIG_DFL` = 0）のみでポインタを取らない。ハンドラ関数を
+    // 登録しないため、シグナルハンドラの再入・非同期安全性の問題は生じない。対象は `SIGCHLD` の定数だけ。
+    let prev = unsafe { signal(consts::SIGCHLD, handler) };
+    if prev == SIG_ERR {
+        Err(last_error())
+    } else {
+        Ok(())
+    }
+}
 
 /// [`kill_pid`] が送るシグナル（生の番号を crate 外へ出さない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -103,7 +103,7 @@ fn wait_until(
     match sys::wait_fd(sock.as_fd(), interest, remaining) {
         Ok(true) => Ok(()),
         Ok(false) => Err(err(TransportErrorCode::Timeout)),
-        Err(sys::SysError::Interrupted) => Ok(()),
+        Err(sys::SysError::Interrupted(_)) => Ok(()),
         Err(e) => Err(TransportError::from_sys(e)),
     }
 }
@@ -125,7 +125,7 @@ fn recv_impl(
     let raw = loop {
         match sys::recvmsg_fds(sock.as_fd(), buf, ctrl_fds) {
             Ok(r) => break r,
-            Err(sys::SysError::Interrupted) => check_deadline(deadline)?,
+            Err(sys::SysError::Interrupted(_)) => check_deadline(deadline)?,
             Err(sys::SysError::WouldBlock) => {
                 wait_until(sock, sys::Interest::Readable, deadline)?;
             }
@@ -174,7 +174,7 @@ pub fn send_with_fds(
         loop {
             match sys::sendmsg_fds(sock.as_fd(), data, fds) {
                 Ok(len) => return Ok(Sent { len }),
-                Err(sys::SysError::Interrupted) => check_deadline(deadline)?,
+                Err(sys::SysError::Interrupted(_)) => check_deadline(deadline)?,
                 Err(sys::SysError::WouldBlock) => {
                     wait_until(sock, sys::Interest::Writable, deadline)?;
                 }

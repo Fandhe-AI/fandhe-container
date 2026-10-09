@@ -25,7 +25,7 @@ pub const MAX_RECORD_COUNT: u32 = 65_536;
 /// ファイル全体長の上限（256 MiB）。
 pub const MAX_RECORDING_LEN: u64 = 256 * 1024 * 1024;
 
-/// レコード種別。ホスト→ゲスト reply・期待出力は番号を予約するのみで未対応（REPAIR-3）。
+/// レコード種別。ホスト→ゲスト reply・期待出力のレコード種別は番号が未割当で未対応（REPAIR-3）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RecordKind {

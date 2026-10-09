@@ -23,18 +23,30 @@
 //!   `cgroup.subtree_control` は空のまま）。親 cgroup の `memory.max`・`pids.max` 等は階層的に子孫へ掛かる
 //! - 削除は `cgroup.kill` → `cgroup.events` の `populated 0` を上限時間つきで待つ → 保持 fd と同一性を確認して
 //!   `rmdir`（`remove_verified_at`）。カーネル応答は上限付きで読み、`unwrap` / 添字アクセスは使わない
+//! - **残骸の掃除（#1596）**: 呼び出しプロセスが `SIGKILL` された・後始末が上限を超えた・kill に失敗した場合に残った
+//!   `exec-*` を、検証済みのコンテナ cgroup の fd を起点に [`sweep_exec_children_at`] が掃除する（SUP-6・OCI-6・CORE-4）。
+//!   時機と対象は 2 つ。**delete 前**（`SweepMode::KillAll`）はコンテナが停止済みなので、直下の `exec-*` すべてに
+//!   `cgroup.kill` → `populated 0` を全体で 1 つの期限つきで待つ → 同一性確認つきで `rmdir`。**exec 開始時**
+//!   （`SweepMode::UnpopulatedOnly`）は並行する別の exec を壊さないよう `cgroup.kill` を一切書かず、プロセスの
+//!   居ない残骸だけを消す（プロセスの居るものは delete 前に回収される。割り切り）。さらに名前の pid の持ち主が
+//!   生きているものにも触れない（作成から `join_self` までの空の間の並行 exec を守る）。判定できないときは触れない
+//! - 掃除の列挙は `/proc/thread-self/fd/<N>` の `read_dir`（`sys` に `getdents64` ラッパーを足さず新しい `unsafe` を
+//!   増やさないため）。**列挙から使うのは名前だけ**で、名前ごとに [`validate_exec_child_name`]・コンテナ fd 相対の
+//!   `O_NOFOLLOW|O_DIRECTORY` open・cgroup2 検証・所有者検証を必ず通すため、列挙結果が偽装されても触れる先は
+//!   コンテナ fd 直下の検証済みの実体に限られる（SEC-1）。総エントリ数と候補数に上限を設け、超過は `truncated` で返す（REPAIR-5）
 //! - 名前指定の `rmdir` は同一性確認と削除の間の差し替えを原理的に塞げない（`DelegatedCgroup` と同じ限界。
 //!   削除後に保持 fd 経由で消えたことを確認する）
 
 use std::fs::File;
 use std::io::Write as _;
-use std::os::fd::{AsFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
 use std::time::{Duration, Instant};
 
 use super::{
     CgroupError, CgroupStep, PROCS_LIMIT, cstring, io_error, open_cgroup_dir, owner_uid,
     parse_procs, read_iface, remove_verified_at, sys_error, validate_component,
 };
+use crate::observability::{OpName, OpOutcome, OpRecorder};
 use crate::sys;
 use crate::traits::ErrorCode;
 
@@ -257,15 +269,272 @@ pub(crate) fn remove_exec_child_cgroup_at(
         Err(e) => return Err(e),
     };
     require_owned_by_euid(step, entry.as_fd())?;
+    kill_wait_remove(container, name, entry.as_fd(), timeout)
+}
+
+/// 開いて所有者確認まで済んだ `entry` を `cgroup.kill` で停止し、空になるまで `timeout` を上限に待って、
+/// 同一性確認つきで削除する（[`remove_exec_child_cgroup_at`] と delete 前の掃除が共用する）。
+fn kill_wait_remove(
+    container: std::os::fd::BorrowedFd<'_>,
+    name: &str,
+    entry: std::os::fd::BorrowedFd<'_>,
+    timeout: Duration,
+) -> Result<ExecChildRemoval, CgroupError> {
+    let step = CgroupStep::Cleanup;
     let kill = cstring(step, "cgroup.kill")?;
-    let kill_w =
-        sys::open_write_at(entry.as_fd(), &kill).map_err(|e| sys_error(step, "cgroup.kill", e))?;
+    let kill_w = sys::open_write_at(entry, &kill).map_err(|e| sys_error(step, "cgroup.kill", e))?;
     write_kill(&File::from(kill_w))?;
-    wait_unpopulated(entry.as_fd(), timeout)?;
-    match remove_verified_at(container, name, entry.as_fd()) {
+    wait_unpopulated(entry, timeout)?;
+    match remove_verified_at(container, name, entry) {
         Ok(()) => Ok(ExecChildRemoval::Removed),
         Err(e) if e.code == ErrorCode::NotFound => Ok(ExecChildRemoval::Absent),
         Err(e) => Err(e),
+    }
+}
+
+/// 掃除で読むディレクトリエントリ総数の上限（cgroup のインターフェースファイルも数えるため大きめ。REPAIR-5）。
+pub(crate) const EXEC_SWEEP_SCAN_LIMIT: usize = 4096;
+
+/// 1 回の掃除で処理する候補（検証を通った名前）数の上限（REPAIR-5）。
+pub(crate) const EXEC_SWEEP_CANDIDATE_LIMIT: usize = 256;
+
+/// delete 前の掃除全体で 1 つ持つ、`populated 0` を待つ期限（子ごとに積み重ねない。REPAIR-5）。
+pub(crate) const EXEC_SWEEP_DELETE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 掃除の方式（時機ごとの対象の違いはモジュール doc）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SweepMode {
+    /// delete 前: すべての `exec-*` を `cgroup.kill` で止めて消す。
+    KillAll,
+    /// exec 開始時: `cgroup.kill` を書かず、持ち主が居ない空の `exec-*` だけを消す。
+    UnpopulatedOnly,
+}
+
+/// [`sweep_exec_children_at`] の結果（将来拡張できる構造）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ExecChildSweep {
+    /// 削除した数。
+    pub(crate) removed: usize,
+    /// プロセスが居る・削除の直前に参加された等で残した数（`UnpopulatedOnly` のみ）。
+    pub(crate) left_populated: usize,
+    /// 名前の pid の持ち主が生きている、または判定できず残した数（`UnpopulatedOnly` のみ）。
+    pub(crate) left_owner_alive: usize,
+    /// 検証・停止・削除に失敗した数。
+    pub(crate) failed: usize,
+    /// 件数の上限で打ち切った。
+    pub(crate) truncated: bool,
+    /// 最初の失敗の `code`（`Timeout` が 1 件でもあればそれを優先）。
+    pub(crate) first_error: Option<ErrorCode>,
+}
+
+impl ExecChildSweep {
+    fn record(&mut self, e: &CgroupError) {
+        self.failed += 1;
+        if self.first_error.is_none() || e.code == ErrorCode::Timeout {
+            self.first_error = Some(e.code);
+        }
+    }
+}
+
+/// `container` 直下の `exec-*` の名前を列挙する。戻り値の bool は上限で打ち切ったか。
+///
+/// 名前だけを使う（`file_type` には頼らない）。[`validate_exec_child_name`] を通る UTF-8 の名前だけを、
+/// ソートして返す。
+fn list_exec_child_names(
+    container: std::os::fd::BorrowedFd<'_>,
+) -> Result<(Vec<String>, bool), CgroupError> {
+    let step = CgroupStep::Cleanup;
+    let path = format!("/proc/thread-self/fd/{}", container.as_raw_fd());
+    let entries =
+        std::fs::read_dir(path).map_err(|e| io_error(step, "list container cgroup", &e))?;
+    let mut names = Vec::new();
+    let mut truncated = false;
+    for (scanned, entry) in entries.enumerate() {
+        if scanned >= EXEC_SWEEP_SCAN_LIMIT {
+            truncated = true;
+            break;
+        }
+        let entry = entry.map_err(|e| io_error(step, "list container cgroup", &e))?;
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if validate_exec_child_name(name).is_err() {
+            continue;
+        }
+        if names.len() >= EXEC_SWEEP_CANDIDATE_LIMIT {
+            truncated = true;
+            break;
+        }
+        names.push(name.to_owned());
+    }
+    names.sort();
+    Ok((names, truncated))
+}
+
+/// `exec-<pid>-<seq>` の厳密な形から pid を取り出す。形式外・`0`・`i32::MAX` 超は `None`。
+fn owner_pid_of(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("exec-")?;
+    let (pid, seq) = rest.split_once('-')?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(pid) || !digits(seq) || seq.parse::<u64>().is_err() {
+        return None;
+    }
+    let pid: u32 = pid.parse().ok()?;
+    (pid != 0 && i32::try_from(pid).is_ok()).then_some(pid)
+}
+
+/// 子 cgroup の持ち主の状態。
+enum OwnerState {
+    /// 持ち主（または pid を再利用したプロセス）が居る。
+    Alive,
+    /// 持ち主は居ない（自プロセスの過去の残骸・形式外の名前を含む）。
+    Gone,
+    /// 判定できない（`pidfd_open` が使えない等）。安全側で触れない。
+    Unknown,
+}
+
+fn owner_state(name: &str) -> OwnerState {
+    let Some(pid) = owner_pid_of(name) else {
+        return OwnerState::Gone;
+    };
+    // 呼び出しプロセスは単一スレッドの exec 専用プロセスで、並行する自分の exec は無い。自分の pid の
+    // 子 cgroup は過去の残骸とみなす。
+    if pid == std::process::id() {
+        return OwnerState::Gone;
+    }
+    match sys::pidfd_open(pid) {
+        Ok(_) => OwnerState::Alive,
+        Err(sys::SysError::Os(errno)) if errno == sys::ESRCH => OwnerState::Gone,
+        Err(_) => OwnerState::Unknown,
+    }
+}
+
+/// `container` 直下の `exec-*` を `mode` に従って掃除する（契約はモジュール doc。#1596）。
+///
+/// 列挙に失敗したときだけ `Err`。個々の失敗は結果の `failed` / `first_error` に数えて次へ進む。`deadline` は
+/// `KillAll` の待機の全体の期限（`UnpopulatedOnly` では使わない）。
+pub(crate) fn sweep_exec_children_at(
+    container: std::os::fd::BorrowedFd<'_>,
+    mode: SweepMode,
+    deadline: Instant,
+) -> Result<ExecChildSweep, CgroupError> {
+    let started = Instant::now();
+    let result = sweep_exec_children_inner(container, mode, deadline);
+    record_sweep(mode, &result, started.elapsed());
+    result
+}
+
+/// 掃除の方式ごとの記録先の操作名（REPAIR-4）。`OpName` の許容文字だけで作る固定文字列。
+fn sweep_op_names(mode: SweepMode) -> (&'static str, &'static str) {
+    match mode {
+        SweepMode::KillAll => (
+            "exec_cgroup_sweep_kill_all",
+            "exec_cgroup_sweep_kill_all_cut",
+        ),
+        SweepMode::UnpopulatedOnly => (
+            "exec_cgroup_sweep_unpopulated",
+            "exec_cgroup_sweep_unpopulated_cut",
+        ),
+    }
+}
+
+/// 掃除の成否とレイテンシを、プロセス共通の [`exec_cgroup_sweep_recorder`] へ記録する（全終了経路。
+/// 列挙失敗の `Err`・個別の失敗・件数上限の打ち切りは失敗として数える。打ち切りは別名の操作にも数える）。
+/// 記録の失敗（名前上限・カウンタ飽和）は掃除の結果に影響させない。
+fn record_sweep(mode: SweepMode, result: &Result<ExecChildSweep, CgroupError>, elapsed: Duration) {
+    let (name, cut_name) = sweep_op_names(mode);
+    let recorder = exec_cgroup_sweep_recorder();
+    let ok = matches!(result, Ok(v) if v.failed == 0 && !v.truncated);
+    let outcome = if ok {
+        OpOutcome::Success
+    } else {
+        OpOutcome::Failure
+    };
+    if let Ok(n) = OpName::new(name) {
+        let _ = recorder.record(&n, outcome, elapsed);
+    }
+    if matches!(result, Ok(v) if v.truncated)
+        && let Ok(n) = OpName::new(cut_name)
+    {
+        let _ = recorder.record(&n, OpOutcome::Failure, elapsed);
+    }
+}
+
+/// exec 用の子 cgroup 掃除の観測記録器（REPAIR-4・#1596）。操作名は `exec_cgroup_sweep_kill_all`（delete 前）・
+/// `exec_cgroup_sweep_unpopulated`（exec 開始時）と、件数上限で打ち切った回数を数える `*_cut`。
+/// 集計は [`crate::observability::OpRecorder::export_json_lines`] で構造化出力できる。
+/// delete 前の掃除は `ContainerCgroupRemover::remove` の戻り値に載せられないため、プロセス共通の
+/// 記録器へ集約する（スレッドセーフ。長寿命の supervisor でもウィンドウ上限でメモリは増えない）。
+pub fn exec_cgroup_sweep_recorder() -> &'static OpRecorder {
+    static RECORDER: std::sync::OnceLock<OpRecorder> = std::sync::OnceLock::new();
+    RECORDER.get_or_init(OpRecorder::new)
+}
+
+fn sweep_exec_children_inner(
+    container: std::os::fd::BorrowedFd<'_>,
+    mode: SweepMode,
+    deadline: Instant,
+) -> Result<ExecChildSweep, CgroupError> {
+    let step = CgroupStep::Cleanup;
+    let (names, truncated) = list_exec_child_names(container)?;
+    let mut out = ExecChildSweep {
+        truncated,
+        ..ExecChildSweep::default()
+    };
+    for name in &names {
+        let entry = match open_cgroup_dir(step, container, name) {
+            Ok(fd) => fd,
+            // 並行して削除された。
+            Err(e) if e.code == ErrorCode::NotFound => continue,
+            Err(e) => {
+                out.record(&e);
+                continue;
+            }
+        };
+        if let Err(e) = require_owned_by_euid(step, entry.as_fd()) {
+            out.record(&e);
+            continue;
+        }
+        match mode {
+            SweepMode::KillAll => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match kill_wait_remove(container, name, entry.as_fd(), left) {
+                    Ok(ExecChildRemoval::Removed) => out.removed += 1,
+                    Ok(ExecChildRemoval::Absent) => {}
+                    Err(e) => out.record(&e),
+                }
+            }
+            SweepMode::UnpopulatedOnly => sweep_one_unpopulated(container, name, &entry, &mut out),
+        }
+    }
+    Ok(out)
+}
+
+/// `UnpopulatedOnly` の 1 件分。持ち主が居ない空の子 cgroup だけを消し、それ以外は残す。
+fn sweep_one_unpopulated(
+    container: std::os::fd::BorrowedFd<'_>,
+    name: &str,
+    entry: &OwnedFd,
+    out: &mut ExecChildSweep,
+) {
+    let step = CgroupStep::Cleanup;
+    if !matches!(owner_state(name), OwnerState::Gone) {
+        out.left_owner_alive += 1;
+        return;
+    }
+    let populated = read_iface(step, entry.as_fd(), "cgroup.events", EVENTS_LIMIT)
+        .and_then(|text| parse_populated(&text));
+    match populated {
+        Ok(true) => out.left_populated += 1,
+        Ok(false) => match remove_verified_at(container, name, entry.as_fd()) {
+            Ok(()) => out.removed += 1,
+            Err(e) if e.code == ErrorCode::NotFound => {}
+            // 読んでから削除するまでの間に参加された（カーネルが EBUSY / ENOTEMPTY で拒否）。使用中として残す。
+            Err(e) if e.code == ErrorCode::FailedPrecondition => out.left_populated += 1,
+            Err(e) => out.record(&e),
+        },
+        Err(e) => out.record(&e),
     }
 }
 
@@ -352,6 +621,99 @@ mod tests {
         let err = ExecChildCgroupFds::from_dir_for_test(OwnedFd::from(File::open(&d).unwrap()))
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::Unimplemented);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// SUP-6・#1596: 持ち主 pid の解析は `exec-<u32>-<u64>` の厳密な形だけを通す。
+    #[test]
+    fn sup6_owner_pid_of_parses_only_strict_form() {
+        assert_eq!(owner_pid_of("exec-123-4"), Some(123));
+        assert_eq!(owner_pid_of("exec-2147483647-0"), Some(2_147_483_647));
+        for bad in [
+            "exec-stale",
+            "exec-0x1-2",
+            "exec-123",
+            "exec--1",
+            "exec-1-",
+            "exec-0-1",
+            "exec-4294967296-0",
+            "exec-2147483648-0",
+            "fc-1-1",
+        ] {
+            assert_eq!(owner_pid_of(bad), None, "{bad}");
+        }
+    }
+
+    /// 列挙の試験用に、検証を通る名前・通らない名前・symlink・通常ファイルを混在させる。
+    fn mixed_dir(label: &str) -> std::path::PathBuf {
+        let d = tmp(label);
+        for dir in ["exec-1-1", "exec_1", "fc-x@1", "exec-..", "exec-A"] {
+            std::fs::create_dir(d.join(dir)).unwrap();
+        }
+        std::fs::write(d.join("cgroup.procs"), "").unwrap();
+        std::fs::write(d.join("exec-2-2"), "").unwrap();
+        std::os::unix::fs::symlink(d.join("exec-1-1"), d.join("exec-3-3")).unwrap();
+        d
+    }
+
+    /// SUP-6・#1596: 列挙は名前の検証を通ったものだけを返す（`exec-` で始まらない・不正文字は除く）。
+    #[test]
+    fn sup6_list_exec_child_names_returns_only_valid_names() {
+        let d = mixed_dir("list");
+        let fd = OwnedFd::from(File::open(&d).unwrap());
+        let (names, truncated) = list_exec_child_names(fd.as_fd()).unwrap();
+        assert_eq!(names, ["exec-1-1", "exec-2-2", "exec-3-3"]);
+        assert!(!truncated);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// SUP-6・SEC-1・#1596: 名前の検証を通っても cgroup2 でない・symlink・通常ファイルには触れず、
+    /// すべて残して失敗に数える（`KillAll` は他の entry も含めて何も消さない）。
+    #[test]
+    fn sup6_sweep_does_not_touch_non_cgroup_entries() {
+        for mode in [SweepMode::KillAll, SweepMode::UnpopulatedOnly] {
+            let d = mixed_dir("sweepmix");
+            let fd = OwnedFd::from(File::open(&d).unwrap());
+            let deadline = Instant::now() + Duration::from_millis(50);
+            let out = sweep_exec_children_at(fd.as_fd(), mode, deadline).unwrap();
+            assert_eq!(out.removed, 0, "{mode:?}");
+            assert_eq!(out.failed, 3, "{mode:?}");
+            assert!(out.first_error.is_some(), "{mode:?}");
+            // REPAIR-4: 失敗した掃除が構造化記録に失敗として載る。
+            let name = OpName::new(sweep_op_names(mode).0).unwrap();
+            let stats = exec_cgroup_sweep_recorder().snapshot_op(&name).unwrap();
+            assert!(stats.failure() >= 1, "{mode:?}");
+            assert!(stats.latency().is_some(), "{mode:?}");
+            for kept in [
+                "exec-1-1",
+                "exec_1",
+                "fc-x@1",
+                "exec-..",
+                "exec-A",
+                "cgroup.procs",
+                "exec-2-2",
+                "exec-3-3",
+            ] {
+                assert!(
+                    d.join(kept).symlink_metadata().is_ok(),
+                    "{kept} must remain ({mode:?})"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// SUP-6・REPAIR-5・#1596: 候補が上限を超えたら上限件数までを返し、打ち切りを示す。
+    #[test]
+    fn sup6_list_exec_child_names_truncates_at_limit() {
+        let d = tmp("trunc");
+        for n in 0..=EXEC_SWEEP_CANDIDATE_LIMIT {
+            std::fs::create_dir(d.join(format!("exec-{n}-0"))).unwrap();
+        }
+        let fd = OwnedFd::from(File::open(&d).unwrap());
+        let (names, truncated) = list_exec_child_names(fd.as_fd()).unwrap();
+        assert_eq!(names.len(), EXEC_SWEEP_CANDIDATE_LIMIT);
+        assert!(truncated);
         let _ = std::fs::remove_dir_all(&d);
     }
 

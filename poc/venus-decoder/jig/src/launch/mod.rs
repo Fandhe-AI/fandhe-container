@@ -9,9 +9,11 @@
 //!
 //! 接続元の認証（PLUG-12 相当。REPAIR-3・将来仕様）: peer credential（`SO_PEERCRED`）の検証は未実装。`UnixStream::peer_cred` が
 //! unstable で、実装には `sys` の承認範囲（U1〜U10）外の `unsafe` が要るため。代わりにソケットディレクトリを自 UID 所有・
-//! `0700` に限り、接続できるのを同じ UID と root に絞る。限界: (1) 同じ UID の別プロセスと root は接続できる。
-//! (2) 検証するのは直接の親ディレクトリだけで祖先は見ない。(3) 検査と bind の間の TOCTOU は、所有者が自分で `0700` の
-//! ディレクトリであることで抑える。
+//! `0700` に限り、接続できるのを同じ UID と root に絞る。さらに `/` までの祖先を全て検査し、symlink・自 UID でも root
+//! でもない所有者・グループ／他者が書けて sticky でないディレクトリがあれば拒否する（別 UID が祖先を rename で差し替えて
+//! bind・chmod・削除を未検証の場所へ向けるのを防ぐ。祖先に symlink がある環境、例えば `/var/run` 経由は拒否される）。
+//! 限界: (1) 同じ UID の別プロセスと root は接続できる。(2) 検査と bind の間の TOCTOU は、祖先が他 UID に差し替え不能で
+//! あることと、所有者が自分で `0700` のディレクトリであることで抑える（同じ UID と root は差し替えられる）。
 //!
 //! accept は非ブロックの sleep ループで待つ（`sys::wait_fd` の別用途の呼び出しは承認範囲外のため。設計書 10.9）。
 //! 1 接続を受けたらただちに listener を閉じてソケットファイルを消し、2 本目の接続は受けない。
@@ -110,9 +112,7 @@ pub fn parse_args(args: &[OsString]) -> Result<Config, LaunchError> {
         limits = limits.with_poll_slice(s).map_err(|_| invalid())?;
     }
     let accept_timeout = acc.unwrap_or(Duration::from_millis(DEFAULT_ACCEPT_TIMEOUT_MS));
-    if accept_timeout.is_zero() || accept_timeout > MAX_ACCEPT_TIMEOUT {
-        return Err(invalid());
-    }
+    validate_accept_timeout(accept_timeout)?;
     validate_path(&socket)?;
     validate_path(&log)?;
     if socket.as_os_str().len() > SUN_PATH_MAX {
@@ -127,6 +127,15 @@ pub fn parse_args(args: &[OsString]) -> Result<Config, LaunchError> {
         limits,
         accept_timeout,
     })
+}
+
+/// accept の期限が 0 より大きく 1 時間以下であること（`Instant` の加算が panic しない範囲）。
+/// `parse_args` と、公開フィールドから直接組み立てた `Config` を受ける `run` の両方で検証する。
+fn validate_accept_timeout(t: Duration) -> Result<(), LaunchError> {
+    if t.is_zero() || t > MAX_ACCEPT_TIMEOUT {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 /// 絶対パスで、成分が `/` と通常の名前だけ（`.` / `..` なし）、NUL なし、ファイル名ありであること。
@@ -174,6 +183,7 @@ fn check_socket_dir(socket: &Path, uid: u32) -> Result<(), LaunchError> {
     let dir = socket
         .parent()
         .ok_or_else(|| LaunchError::new(LaunchErrorCode::PathInvalid))?;
+    check_ancestors(dir, uid)?;
     let mut meta = fs::symlink_metadata(dir);
     if matches!(&meta, Err(e) if e.kind() == ErrorKind::NotFound) {
         let grand_ok = dir.parent().is_some_and(|g| g.is_dir());
@@ -198,6 +208,28 @@ fn check_socket_dir(socket: &Path, uid: u32) -> Result<(), LaunchError> {
     }
     if meta.mode() & 0o7777 != 0o700 {
         return Err(LaunchError::new(LaunchErrorCode::SocketDirNotPrivate));
+    }
+    Ok(())
+}
+
+/// `dir` の祖先（`/` まで）が、別 UID に差し替えられないことを検査する。
+///
+/// 各祖先は symlink でなく、自 UID または root 所有で、グループ／他者が書ける場合は sticky が立っていること
+/// （sticky なら他ユーザーは自分の所有でない子を rename・削除できない）。
+fn check_ancestors(dir: &Path, uid: u32) -> Result<(), LaunchError> {
+    let bad = || LaunchError::new(LaunchErrorCode::SocketDirAncestorUnsafe);
+    for anc in dir.ancestors().skip(1) {
+        let meta = fs::symlink_metadata(anc).map_err(|_| bad())?;
+        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+            return Err(bad());
+        }
+        if meta.uid() != uid && meta.uid() != 0 {
+            return Err(bad());
+        }
+        let mode = meta.mode();
+        if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+            return Err(bad());
+        }
     }
     Ok(())
 }
@@ -252,6 +284,8 @@ fn accept_with_deadline(
 
 /// 起動して 1 接続を最後まで処理する。
 pub fn run(config: &Config) -> Result<SessionEnd, LaunchError> {
+    // `Config` は公開フィールドなので `parse_args` を経ない値が来うる。副作用の前に範囲を再検証する。
+    validate_accept_timeout(config.accept_timeout)?;
     validate_path(&config.socket)?;
     validate_path(&config.log)?;
     if config.socket.as_os_str().len() > SUN_PATH_MAX {

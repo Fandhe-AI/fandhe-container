@@ -2,9 +2,7 @@
 //!
 //! `vhost_user_session.rs`（`run` を直接呼ぶ）と `venus_jig_bin.rs`（bin の UDS へ接続する）が使う。ネゴシエーション・
 //! ring 0 の設定・GET_CAPSET の投入・call の待機・used の読み出しを具体値の照合つきで提供する。
-//! 片方の test crate でしか使わない項目があるため `dead_code` を許す。
-
-#![allow(dead_code)]
+//! test crate ごとに使う項目が異なるため、片方でしか使わない項目には個別に `#[allow(dead_code)]` を付ける。
 
 use std::ffi::CString;
 use std::fs::File;

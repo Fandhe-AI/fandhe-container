@@ -25,6 +25,8 @@ pub enum LaunchErrorCode {
     SocketDirNotOwned,
     /// ソケットディレクトリのモードが `0700` でない。
     SocketDirNotPrivate,
+    /// ソケットディレクトリの祖先に symlink・他ユーザー所有・他ユーザーが差し替えられるディレクトリがある。
+    SocketDirAncestorUnsafe,
     /// ソケットディレクトリを作れない。
     SocketDirCreateFailed,
     /// ソケットパスに既に何かある（消さずに拒否する）。
@@ -60,6 +62,7 @@ impl LaunchErrorCode {
             Self::SocketDirNotDirectory => "SOCKET_DIR_NOT_DIRECTORY",
             Self::SocketDirNotOwned => "SOCKET_DIR_NOT_OWNED",
             Self::SocketDirNotPrivate => "SOCKET_DIR_NOT_PRIVATE",
+            Self::SocketDirAncestorUnsafe => "SOCKET_DIR_ANCESTOR_UNSAFE",
             Self::SocketDirCreateFailed => "SOCKET_DIR_CREATE_FAILED",
             Self::SocketPathExists => "SOCKET_PATH_EXISTS",
             Self::LogPathExists => "LOG_PATH_EXISTS",
@@ -85,6 +88,9 @@ impl LaunchErrorCode {
             Self::SocketDirNotDirectory => "socket directory is not a directory",
             Self::SocketDirNotOwned => "socket directory is not owned by the current user",
             Self::SocketDirNotPrivate => "socket directory mode must be 0700",
+            Self::SocketDirAncestorUnsafe => {
+                "an ancestor of the socket directory is a symlink or can be replaced by another user"
+            }
             Self::SocketDirCreateFailed => "cannot create the socket directory",
             Self::SocketPathExists => "socket path already exists; remove it manually",
             Self::LogPathExists => "log path already exists; it is never overwritten",
@@ -110,6 +116,7 @@ impl LaunchErrorCode {
                 | Self::SocketDirNotDirectory
                 | Self::SocketDirNotOwned
                 | Self::SocketDirNotPrivate
+                | Self::SocketDirAncestorUnsafe
                 | Self::SocketPathExists
                 | Self::LogPathExists
         )
@@ -136,7 +143,7 @@ impl LaunchError {
         if self.code.is_validation() { 2 } else { 1 }
     }
 
-    /// stderr に出す 1 行の JSON。値はすべて固定の ASCII 語彙で `"` や `\` を含まないので、エスケープは要らない。
+    /// stderr に出す 1 行の JSON。`cause` は公開フィールドで任意の文字列を持てるため、JSON のエスケープを通す。
     pub fn to_json_line(&self) -> String {
         let mut s = format!(
             "{{\"code\":\"{}\",\"message\":\"{}\"",
@@ -144,11 +151,27 @@ impl LaunchError {
             self.code.message()
         );
         if let Some(c) = self.cause {
-            s.push_str(&format!(",\"cause\":\"{c}\""));
+            s.push_str(&format!(",\"cause\":\"{}\"", json_escape(c)));
         }
         s.push('}');
         s
     }
+}
+
+/// JSON 文字列の中身として安全にする（二重引用符・バックスラッシュ・制御文字をエスケープ）。
+fn json_escape(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 impl std::fmt::Display for LaunchError {

@@ -249,3 +249,74 @@ fn gpu6_error_json_line_is_fixed_vocabulary() {
         "{\"code\":\"PATH_NOT_ABSOLUTE\",\"message\":\"path must be absolute\"}"
     );
 }
+
+#[test]
+fn gpu6_writable_ancestor_is_rejected_without_bind() {
+    // 祖先が他者書き込み可で sticky なし: 別 UID が子を rename で差し替えられる。
+    let top = scratch("anc");
+    let mid = top.join("mid");
+    DirBuilder::new().mode(0o700).create(&mid).unwrap();
+    let dir = mid.join("sock");
+    DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    fs::set_permissions(&mid, fs::Permissions::from_mode(0o777)).unwrap();
+    let c = cfg(&dir.join("s.sock"), &top.join("j.log"), &[]).unwrap();
+    assert_eq!(code_of(run(&c)), "SOCKET_DIR_ANCESTOR_UNSAFE");
+    assert!(fs::symlink_metadata(dir.join("s.sock")).is_err());
+    assert!(fs::symlink_metadata(top.join("j.log")).is_err());
+    fs::set_permissions(&mid, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::remove_dir_all(&top).unwrap();
+}
+
+#[test]
+fn gpu6_symlinked_ancestor_is_rejected() {
+    let real = scratch("areal");
+    let holder = scratch("ahold");
+    DirBuilder::new()
+        .mode(0o700)
+        .create(real.join("sock"))
+        .unwrap();
+    let link = holder.join("link");
+    symlink(&real, &link).unwrap();
+    let c = cfg(
+        &link.join("sock").join("s.sock"),
+        &holder.join("j.log"),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(code_of(run(&c)), "SOCKET_DIR_ANCESTOR_UNSAFE");
+    assert!(fs::symlink_metadata(real.join("sock").join("s.sock")).is_err());
+    fs::remove_dir_all(&real).unwrap();
+    fs::remove_dir_all(&holder).unwrap();
+}
+
+#[test]
+fn repair5_run_revalidates_accept_timeout_without_side_effects() {
+    let dir = scratch("at");
+    let sock = dir.join("s.sock");
+    let log = dir.join("j.log");
+    let mut c = cfg(&sock, &log, &[]).unwrap();
+    for t in [
+        Duration::MAX,
+        Duration::ZERO,
+        MAX_ACCEPT_TIMEOUT + Duration::from_millis(1),
+    ] {
+        c.accept_timeout = t;
+        assert_eq!(code_of(run(&c)), "INVALID_ARGUMENT");
+    }
+    assert!(fs::symlink_metadata(&log).is_err(), "must not create log");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn repair4_error_json_line_escapes_cause() {
+    let e = LaunchError {
+        code: LaunchErrorCode::SessionFailed,
+        cause: Some("A\"B\\C\nD"),
+    };
+    assert!(
+        e.to_json_line()
+            .ends_with(",\"cause\":\"A\\\"B\\\\C\\u000aD\"}"),
+        "{}",
+        e.to_json_line()
+    );
+}

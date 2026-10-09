@@ -29,7 +29,7 @@ cargo run --manifest-path poc/venus-decoder/jig/Cargo.toml --bin venus-jig -- \
 - 任意: `--message-timeout-ms`（既定 5000）・`--idle-timeout-ms`（既定 60000）・`--poll-slice-ms`・`--accept-timeout-ms`（既定 60000）。
 - VMM（vhost-user frontend）側から指定するのは `--socket` に渡した絶対パス。crosvm の `--vhost-user` の構文・最小カーネル版数・render server の要否は未確認（実機で確かめる。#725）。
 - ログは `0600` で新規作成し、4 MiB・1 行 512 バイト・10 万行を超えたら `log_truncated` の行を残して止める。エラーは stderr に 1 行の JSON（`code` / `message`）。終了コードは 0 が正常、2 が引数・パス・ディレクトリの検証エラー、1 がそれ以外。
-- peer credential の検証は未実装。接続できるのは同じ UID と root に限られる（同じ UID の別プロセスは接続できる）。検証は直接の親ディレクトリだけ。限界と承認事項は設計書 10.9。
+- peer credential の検証は未実装。接続できるのは同じ UID と root に限られる（同じ UID の別プロセスは接続できる）。ソケットディレクトリは `/` までの祖先も検査する（symlink・他 UID 所有・sticky なしの書き込み可は `SOCKET_DIR_ANCESTOR_UNSAFE`）。限界と承認事項は設計書 10.9。
 - ログを読む側（`log::read_log_file`）は通常ファイル以外（FIFO・symlink）を open 前に拒否する。
 
 ## 実行

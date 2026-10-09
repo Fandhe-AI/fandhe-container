@@ -184,7 +184,12 @@ pub(super) fn assess_lsm_environment(input: LsmProbeInput) -> LsmEnvironment {
             let appraise_on = token
                 .strip_prefix("ima_appraise=")
                 .is_some_and(|v| v != "off");
-            if appraise_on || token.starts_with("ima_policy=") {
+            // `ima_policy=` は、計測専用と分かっている組み込みポリシー（`tcb`・`critical_data`）だけを
+            // 通し、後続の現行 policy ファイルの判定へ進める。appraise 系・未知の値は拒否する。
+            let policy_unknown = token
+                .strip_prefix("ima_policy=")
+                .is_some_and(|v| !v.split('|').all(is_measure_only_ima_policy));
+            if appraise_on || policy_unknown {
                 return LsmEnvironment::Refuse(
                     "IMA appraisal may be active; its exec-time check cannot be reproduced for a sealed copy",
                 );
@@ -216,6 +221,12 @@ pub(super) fn assess_lsm_environment(input: LsmProbeInput) -> LsmEnvironment {
     // `check_landlock_execute` が元のファイルの実パスで照合する。起動前から継承した domain の有無は
     // `probe_inherited_landlock` が別に判定し、あれば `check_exec_policy_preserved` が拒否する（CORE-5・SEC-1）。
     LsmEnvironment::Unrestricted
+}
+
+/// カーネル組み込みの IMA ポリシー名のうち、appraisal を含まない計測専用のもの。
+/// `|` 区切りで複数指定できる（`ima_policy=tcb|critical_data`）。
+fn is_measure_only_ima_policy(name: &str) -> bool {
+    matches!(name, "tcb" | "critical_data")
 }
 
 /// ファイルを `cap` バイトまで読む（巨大ファイルの確保を避ける）。`cap` を超えて続く場合は切り詰めず
@@ -284,14 +295,34 @@ fn probe_inherited_landlock() -> InheritedLandlock {
             Ok(None) => {}
             Err(SysError::Os(e)) if e == sys::EINTR => {}
             Err(_) => {
+                kill_and_reap_probe(pid);
                 return InheritedLandlock::Unknown("waiting for the Landlock probe failed");
             }
         }
         if std::time::Instant::now() >= deadline {
             // 子は自分の層を積むだけの使い捨て。固まったら止めて回収し、判定不能として拒否に倒す。
-            let _ = sys::kill_pid(pid, sys::Signal::Kill);
-            let _ = sys::wait_pid_nohang(pid);
+            kill_and_reap_probe(pid);
             return InheritedLandlock::Unknown("the Landlock probe timed out");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// 判定用の子を SIGKILL し、zombie を残さないよう回収を上限付きで繰り返す（EINTR は再試行）。
+///
+/// SIGKILL された子はすぐ終了するため、数百 ms の上限で回収できる。回収済み・ECHILD は完了扱い。
+fn kill_and_reap_probe(pid: u32) {
+    let _ = sys::kill_pid(pid, sys::Signal::Kill);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match sys::wait_pid_nohang(pid) {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(SysError::Os(e)) if e == sys::EINTR => {}
+            Err(_) => return,
+        }
+        if std::time::Instant::now() >= deadline {
+            return;
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
@@ -625,11 +656,15 @@ mod tests {
             ("ima_appraise=enforce", Some("")),
             ("ima_appraise=fix", Some("")),
             ("ima_policy=appraise_tcb", Some("")),
+            ("ima_policy=tcb|appraise_tcb", Some("")),
+            ("ima_policy=unknown_policy", Some("")),
             (
                 "quiet",
                 Some("appraise func=BPRM_CHECK appraise_type=imasig\n"),
             ),
             ("quiet", None),
+            ("ima_policy=tcb", Some("appraise func=BPRM_CHECK\n")),
+            ("ima_policy=tcb", None),
         ] {
             let got = assess_lsm_environment(probe_input(lsm, cmdline, policy));
             assert!(
@@ -638,7 +673,13 @@ mod tests {
             );
         }
         // appraisal がないことを確かめられる（`off`・policy に appraise 行なし）なら通す。
-        for cmdline in ["quiet", "ima_appraise=off"] {
+        // 計測専用の組み込みポリシーは後続の policy ファイル判定へ進み、appraise 行がなければ通す（#1579）。
+        for cmdline in [
+            "quiet",
+            "ima_appraise=off",
+            "ima_policy=tcb",
+            "ima_policy=tcb|critical_data",
+        ] {
             let got = assess_lsm_environment(probe_input(
                 lsm,
                 cmdline,

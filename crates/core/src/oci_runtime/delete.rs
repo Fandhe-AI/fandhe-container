@@ -127,6 +127,10 @@ pub enum CgroupRemoval {
 /// - 直下に残った exec 用の子 cgroup（`exec-*`）は、実装が上限つきの待機（`cgroup.kill` の後に空になるまで。
 ///   全体で 5 秒）で止めて消してから、コンテナ cgroup を削除してよい（#1596・SUP-6）。待機の超過は
 ///   [`ErrorCode::Timeout`]、掃除が完了しなければ `remove` はエラーを返し、コンテナ cgroup には触れない
+/// - **`remove` は停止済み（[`delete`] の状態判定で `Stopped` か pid なしの `Created`）のコンテナに対してだけ
+///   呼ぶ**。実装は呼び出し側の判定に頼らず、`exec-*` を止める前にコンテナ cgroup 自身にプロセスが居ないことを
+///   確かめ、居れば何も止めずに [`ErrorCode::FailedPrecondition`] を返す（稼働中の exec コマンドを止めない。
+///   OCI-6・CORE-2・SUP-6）
 /// - エラーのメッセージにパス・errno を含めない（`code` だけを機械可読な判定に使う）
 pub trait ContainerCgroupRemover: Send + Sync {
     /// `remove` が対象とする委譲スコープ（コンテナ用子 cgroup の親）を返す。

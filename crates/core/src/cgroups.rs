@@ -61,7 +61,8 @@
 //!   名前（`fc-<id>@<n>`）で削除・不存在確認を行う。削除の直前に、コンテナ cgroup 直下に残った exec 用の
 //!   子 cgroup（`exec-*`）を `cgroup.kill` で止めて消す（全体で 5 秒の期限つき。失敗・件数上限の超過は
 //!   `Err` で返し、コンテナ cgroup の `rmdir` は試みない。#1596・SUP-6。コンテナ cgroup 自体には `cgroup.kill`
-//!   を書かない）
+//!   を書かない）。`remove` は停止済みのコンテナに対してだけ呼ぶ前提で、kill の前にコンテナ cgroup 自身の
+//!   `cgroup.procs` が空であることを確かめ、空でなければ何も kill せず `FailedPrecondition` を返す（OCI-6・CORE-2）
 //!
 //! # 資源制限 setter の計装（REPAIR-4・TASK-170 追補・#1535）
 //! 資源制限の各 setter は `recorder: &OpRecorder` を受け取り、setter の内部で全終了経路（controller 未有効・
@@ -1310,7 +1311,9 @@ fn identity_mismatch_error() -> CgroupError {
 /// `oci_runtime::delete` が使う cgroup 削除（TASK-30.3・OCI-6）。対象は `fc-<id>@<instance>`（CORE-3 で作った子）だけ。
 ///
 /// 削除の直前に、直下の残留 `exec-*` を `cgroup.kill` で止めて消す。その待機は掃除全体で
-/// `EXEC_SWEEP_DELETE_TIMEOUT`（5 秒）の上限つき（REPAIR-5。超過は `Timeout`。#1596）。
+/// `EXEC_SWEEP_DELETE_TIMEOUT`（5 秒）の上限つき（REPAIR-5。超過は `Timeout`。#1596）。停止済みのコンテナに
+/// 対してだけ呼ぶ前提で、kill の前にコンテナ cgroup 自身の `cgroup.procs` が空であることを確かめ、空でなければ
+/// 何も kill せず `FailedPrecondition` を返す（OCI-6・CORE-2・SUP-6）。
 impl ContainerCgroupRemover for DelegatedCgroup {
     /// 検出した委譲パス（[`DelegatedCgroup::path`]。ルートは `"/"`）を [`CgroupScope`] にして返す。
     ///
@@ -1335,7 +1338,8 @@ impl ContainerCgroupRemover for DelegatedCgroup {
             None => Ok(CgroupRemoval::NotPresent),
             Some(child) => {
                 // コンテナは停止済みなので、残った exec 用の子 cgroup はすべて止めて消す。残すと下の
-                // `rmdir` が EBUSY になり、何度再試行しても成功しない。
+                // `rmdir` が EBUSY になり、何度再試行しても成功しない。停止済みでない（コンテナ cgroup 自身に
+                // プロセスが居る）ときは掃除が何も kill せず `FailedPrecondition` を返す。
                 let deadline = std::time::Instant::now() + EXEC_SWEEP_DELETE_TIMEOUT;
                 let swept = sweep_exec_children_at(child.fd.as_fd(), SweepMode::KillAll, deadline)
                     .map_err(removal_error)?;

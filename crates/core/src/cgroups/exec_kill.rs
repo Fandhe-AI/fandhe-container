@@ -26,7 +26,9 @@
 //! - **残骸の掃除（#1596）**: 呼び出しプロセスが `SIGKILL` された・後始末が上限を超えた・kill に失敗した場合に残った
 //!   `exec-*` を、検証済みのコンテナ cgroup の fd を起点に [`sweep_exec_children_at`] が掃除する（SUP-6・OCI-6・CORE-4）。
 //!   時機と対象は 2 つ。**delete 前**（`SweepMode::KillAll`）はコンテナが停止済みなので、直下の `exec-*` すべてに
-//!   `cgroup.kill` → `populated 0` を全体で 1 つの期限つきで待つ → 同一性確認つきで `rmdir`。**exec 開始時**
+//!   `cgroup.kill` → `populated 0` を全体で 1 つの期限つきで待つ → 同一性確認つきで `rmdir`。停止済みであることは
+//!   呼び出し側の状態判定に頼らず、先にコンテナ cgroup 自身の `cgroup.procs` が空であることを確かめ、空でなければ
+//!   何も kill せず `FailedPrecondition` で返す（OCI-6・CORE-2）。**exec 開始時**
 //!   （`SweepMode::UnpopulatedOnly`）は並行する別の exec を壊さないよう `cgroup.kill` を一切書かず、プロセスの
 //!   居ない残骸だけを消す（プロセスの居るものは delete 前に回収される。割り切り）。さらに名前の pid の持ち主が
 //!   生きているものにも触れない（作成から `join_self` までの空の間の並行 exec を守る）。判定できないときは触れない
@@ -304,7 +306,8 @@ pub(crate) const EXEC_SWEEP_DELETE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 掃除の方式（時機ごとの対象の違いはモジュール doc）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SweepMode {
-    /// delete 前: すべての `exec-*` を `cgroup.kill` で止めて消す。
+    /// delete 前: すべての `exec-*` を `cgroup.kill` で止めて消す。コンテナ cgroup 自身の `cgroup.procs` が
+    /// 空（停止済み）であることを先に確かめ、空でなければ何も kill せず `FailedPrecondition`。
     KillAll,
     /// exec 開始時: `cgroup.kill` を書かず、持ち主が居ない空の `exec-*` だけを消す。
     UnpopulatedOnly,
@@ -394,6 +397,24 @@ fn list_exec_child_names(
     }
     names.sort();
     Ok((names, truncated))
+}
+
+/// `KillAll` の前提: コンテナ cgroup 自身の `cgroup.procs` が空であること（OCI-6・CORE-2・SUP-6・#1596）。
+///
+/// 空でなければ pid1 または exec の worker が居る（稼働中）ので、`exec-*` に `cgroup.kill` を書かず
+/// `FailedPrecondition` を返す。呼び出し側（`oci_runtime::delete` の状態判定）が停止済みを確かめていても、
+/// それを通らない呼び出し元（force delete 等）が増えたときに稼働中の exec コマンドを止めないための多層防御。
+/// 確認と `cgroup.kill` の間に参加される競合は塞げない（停止済みのコンテナには参加する主体が居ない前提）。
+fn require_container_stopped(container: std::os::fd::BorrowedFd<'_>) -> Result<(), CgroupError> {
+    let step = CgroupStep::Cleanup;
+    let procs = read_iface(step, container, "cgroup.procs", PROCS_LIMIT)?;
+    if !parse_procs(step, &procs)?.is_empty() {
+        return Err(CgroupError::precondition(
+            step,
+            "container cgroup still has processes; exec child cgroups are left untouched",
+        ));
+    }
+    Ok(())
 }
 
 /// 列挙の `NotFound` を、コンテナ cgroup が削除済み（`removed`）なら残骸 0 件として扱う（OCI-6・#1596）。
@@ -526,6 +547,15 @@ fn sweep_exec_children_inner(
     mode: SweepMode,
     deadline: Instant,
 ) -> Result<ExecChildSweep, CgroupError> {
+    if mode == SweepMode::KillAll
+        && let Err(e) = require_container_stopped(container)
+    {
+        // 並行して削除済みなら配下に残骸は無い（列挙の `NotFound` と同じ扱い。OCI-6）。
+        if e.code == ErrorCode::NotFound && container_removed(container) {
+            return Ok(ExecChildSweep::default());
+        }
+        return Err(e);
+    }
     let (names, truncated) = listing_or_removed(list_exec_child_names(container), || {
         container_removed(container)
     })?;
@@ -873,6 +903,37 @@ mod tests {
         std::fs::write(d.join("cgroup.events"), "populated 0\n").unwrap();
         let fd = OwnedFd::from(File::open(&d).unwrap());
         assert!(!container_removed(fd.as_fd()));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// OCI-6・CORE-2・SUP-6・#1596: `KillAll` はコンテナ cgroup 自身の `cgroup.procs` が空でなければ何も
+    /// kill・削除せず `FailedPrecondition` を返す。空なら掃除へ進む（ここでは tmpfs の子が cgroup2 検証で失敗 1）。
+    /// `UnpopulatedOnly` はこの前提を持たない。
+    #[test]
+    fn oci6_kill_all_refuses_while_container_cgroup_has_processes() {
+        let d = tmp("running");
+        std::fs::write(d.join("cgroup.procs"), "4242\n").unwrap();
+        std::fs::create_dir(d.join("exec-1-1")).unwrap();
+        let fd = OwnedFd::from(File::open(&d).unwrap());
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let err = sweep_exec_children_at(fd.as_fd(), SweepMode::KillAll, deadline).unwrap_err();
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(err.step, CgroupStep::Cleanup);
+        assert_eq!(
+            err.message,
+            "container cgroup still has processes; exec child cgroups are left untouched"
+        );
+        assert!(d.join("exec-1-1").is_dir());
+        let unpopulated =
+            sweep_exec_children_at(fd.as_fd(), SweepMode::UnpopulatedOnly, deadline).unwrap();
+        assert_eq!(unpopulated.failed, 1);
+
+        std::fs::write(d.join("cgroup.procs"), "").unwrap();
+        let stopped = sweep_exec_children_at(fd.as_fd(), SweepMode::KillAll, deadline).unwrap();
+        assert_eq!(stopped.removed, 0);
+        assert_eq!(stopped.failed, 1);
+        assert_eq!(stopped.first_error, Some(ErrorCode::FailedPrecondition));
+        assert!(d.join("exec-1-1").is_dir());
         let _ = std::fs::remove_dir_all(&d);
     }
 

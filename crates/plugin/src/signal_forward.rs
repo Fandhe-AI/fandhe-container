@@ -42,6 +42,9 @@
 //!   保ち、plugin の子を `waitpid(-1)` で回収しないこと。
 //! - plugin は独立したプロセスグループで起動される（#1311。`lifecycle::spawn_registered`）。端末の Ctrl-C は
 //!   カーネルのグループ配送では plugin に届かず、本転送（`kill(-pid)`）だけが孫まで届く。
+//! - plugin 本体が `setsid` / `setpgid` で自分のグループを抜けた場合、グループ宛て（`kill(-pid)`）は
+//!   旧グループに残った孫にだけ届き、送信が成功するため本体への直接送信（`kill(pid)`）は行わない。
+//!   本体はシグナルを受けず、後始末（`ChildGuard::kill_and_reap` の `Child::kill`）で止めて回収する。
 
 use crate::error::{PluginError, PluginErrorCode};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};

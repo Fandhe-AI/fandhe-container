@@ -32,6 +32,8 @@
 //!   対応外の OS・アーキテクチャは `Unsupported`
 //! - macOS の RSS 取得（TASK-112.1・#265）: `proc_pidinfo(PROC_PIDTASKINFO)`（`resident_size_bytes`。`crate::rss` から呼ばれる）
 //! - Linux・macOS: `killpg(2)`（`kill_process_group`。plugin の子のプロセスグループへ `SIGKILL`。#1311。それ以外の unix は `Unsupported`）
+//! - Linux（x86_64 / aarch64）・macOS: `waitid(2)`（`WEXITED | WNOHANG | WNOWAIT`。`probe_child_exit`。自発終了した plugin を回収せずに
+//!   観測し、グループへ送ってから回収するため。#1604・PLUG-7・REPAIR-5。それ以外は `Unsupported`）
 //! - いずれの unix: `kill(2)` で起動中の plugin へ SIGINT・SIGTERM・SIGHUP を転送する（`send_signal`。
 //!   `crate::signal_forward` が CLI バイナリのシグナルハンドラ上から呼ぶため async-signal-safe であること。#1513・PLUG-7）
 //! - Linux: `prctl(PR_SET_PDEATHSIG, SIGKILL)` と `getppid(2)` を `pre_exec` で呼び、親の強制終了時に plugin 本体を
@@ -50,7 +52,7 @@
 //!
 //! # 契約
 //! - `unsafe fn` は公開しない。公開するのは安全な [`send_signal`]・[`peer_uid`]・[`effective_uid`]・[`fchmodat_nofollow`]・
-//!   [`unlinkat`]・[`mkdirat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・[`kill_process_group`]・（Linux のみ）`set_parent_death_sigkill`・[`DirStream`]（`open_at`・`next_entry`・`position`）・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
+//!   [`unlinkat`]・[`mkdirat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・[`kill_process_group`]・[`probe_child_exit`]・（Linux のみ）`set_parent_death_sigkill`・[`DirStream`]（`open_at`・`next_entry`・`position`）・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
 //! - fd は `&UnixStream` の借用中のみ渡す（呼び出し中にクローズされない）
 //! - SOL_SOCKET / SO_PEERCRED の定数は `cfg(target_arch)` ごとに個別定義し、流用しない
 //! - OS ごとに値・幅が異なる定数・型（`ModeT`・`AT_SYMLINK_NOFOLLOW`・`O_*` 等）は対応 OS ごとに個別定義し、
@@ -109,7 +111,8 @@ unsafe extern "C" {
 /// 得るため fail-closed）。
 ///
 /// 呼び出し側の不変条件: 送信先は自プロセスが spawn し、まだ wait していない子の pgid に限る
-/// （wait 済みなら pid が再利用され得るため送らない）。グループが空の `ESRCH` もエラーとして返すので、
+/// （wait 済みなら pid が再利用され得るため送らない）。自発終了した子は [`probe_child_exit`] で終了を
+/// 観測し（回収はまだ）、未回収のリーダーとして本関数で送ってから回収する（#1604）。グループが空の `ESRCH` もエラーとして返すので、
 /// 呼び出し側が無視するか判断する。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn kill_process_group(pgid: u32) -> io::Result<()> {
@@ -134,6 +137,193 @@ pub(crate) fn kill_process_group(pgid: u32) -> io::Result<()> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn kill_process_group(pgid: u32) -> io::Result<()> {
     let _ = pgid;
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
+/// [`probe_child_exit`] の結果。真偽値にせず、将来の状態（停止・継続等）を足せる形にする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildExitProbe {
+    /// まだ終了していない。
+    Running,
+    /// 終了済みで、親（自プロセス）がまだ回収していない（ゾンビとして残っている）。
+    Exited,
+}
+
+/// `waitid(2)` の ABI。OS・アーキテクチャごとに個別定義し、他の定義を流用しない。値の出典は各定義の注記。
+/// 定義を持たない OS・アーキテクチャは [`probe_child_exit`] が `Unsupported` を返す（fail-closed）。
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos"
+))]
+mod waitid_abi {
+    /// `idtype_t` の `P_PID`（pid 指定）。Linux（`linux/wait.h`・`bits/types/idtype_t.h`）・macOS
+    /// （`sys/wait.h`）とも 1。
+    pub(super) const P_PID: i32 = 1;
+    /// `WNOHANG`（待機せず戻る）。Linux・macOS とも 1。
+    pub(super) const WNOHANG: i32 = 1;
+    /// `WEXITED`（終了した子を対象にする）。Linux・macOS とも 4。
+    pub(super) const WEXITED: i32 = 4;
+    /// `WNOWAIT`（子を回収せず状態を残す）。Linux は `linux/wait.h` の `0x0100_0000`。
+    #[cfg(target_os = "linux")]
+    pub(super) const WNOWAIT: i32 = 0x0100_0000;
+    /// macOS は `sys/wait.h` の `0x20`（Linux と値が異なる）。
+    #[cfg(target_os = "macos")]
+    pub(super) const WNOWAIT: i32 = 0x20;
+
+    /// Linux の `siginfo_t`（`bits/types/siginfo_t.h`。`__SI_MAX_SIZE` = 128 バイト）。
+    /// 先頭が `si_signo`・`si_errno`・`si_code`、64 bit では union が 8 バイト境界に置かれ、
+    /// `_sigchld.si_pid` はオフセット 16。x86_64 と aarch64 は同じ asm-generic レイアウトだが、
+    /// アーキテクチャごとに個別に定義する。
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[repr(C)]
+    #[allow(dead_code)] // カーネルが書く領域を写すだけで、読むのは `si_pid` のみ
+    pub(super) struct SigInfo {
+        pub(super) si_signo: i32,
+        pub(super) si_errno: i32,
+        pub(super) si_code: i32,
+        pub(super) pad0: i32,
+        pub(super) si_pid: i32,
+        pub(super) si_uid: u32,
+        pub(super) rest: [u8; 128 - 24],
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    const _: () = {
+        assert!(size_of::<SigInfo>() == 128);
+        assert!(std::mem::offset_of!(SigInfo, si_pid) == 16);
+    };
+
+    /// Linux aarch64 の `siginfo_t`（x86_64 と同じ 128 バイト・`si_pid` はオフセット 16）。
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[repr(C)]
+    #[allow(dead_code)] // カーネルが書く領域を写すだけで、読むのは `si_pid` のみ
+    pub(super) struct SigInfo {
+        pub(super) si_signo: i32,
+        pub(super) si_errno: i32,
+        pub(super) si_code: i32,
+        pub(super) pad0: i32,
+        pub(super) si_pid: i32,
+        pub(super) si_uid: u32,
+        pub(super) rest: [u8; 128 - 24],
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    const _: () = {
+        assert!(size_of::<SigInfo>() == 128);
+        assert!(std::mem::offset_of!(SigInfo, si_pid) == 16);
+    };
+
+    /// macOS の `siginfo_t`（`sys/signal.h` の `struct __siginfo`。LP64 で 104 バイト）。
+    /// `si_signo`・`si_errno`・`si_code`・`si_pid`・`si_uid`・`si_status` の順で、`si_pid` はオフセット 12。
+    /// 以降（`si_addr`・`si_value`・`si_band`・`__pad[7]`）は 80 バイトを不透明に写す。
+    #[cfg(target_os = "macos")]
+    #[repr(C)]
+    #[allow(dead_code)] // カーネルが書く領域を写すだけで、読むのは `si_pid` のみ
+    pub(super) struct SigInfo {
+        pub(super) si_signo: i32,
+        pub(super) si_errno: i32,
+        pub(super) si_code: i32,
+        pub(super) si_pid: i32,
+        pub(super) si_uid: u32,
+        pub(super) si_status: i32,
+        pub(super) rest: [u64; 10],
+    }
+    #[cfg(target_os = "macos")]
+    const _: () = {
+        assert!(size_of::<SigInfo>() == 104);
+        assert!(std::mem::offset_of!(SigInfo, si_pid) == 12);
+    };
+
+    unsafe extern "C" {
+        // SAFETY（宣言そのものの妥当性）: POSIX の `int waitid(idtype_t idtype, id_t id, siginfo_t *infop,
+        // int options)`。`idtype_t` は C の列挙型（int 幅）、`id_t` は `u32`、戻り値は `int`（対応ターゲットで
+        // 32 bit 符号付き）。`infop` は上の `SigInfo`（`siginfo_t` 全体と同じ大きさ）を指す。
+        pub(super) fn waitid(idtype: i32, id: u32, infop: *mut SigInfo, options: i32) -> i32;
+    }
+}
+
+/// `EINTR` で再試行する上限（無制限に回さない。REPAIR-5）。
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos"
+))]
+const PROBE_EINTR_RETRIES: usize = 3;
+
+/// 子 `pid` が終了済みかを、回収せず非ブロックで確かめる（`waitid(P_PID, pid, WEXITED | WNOHANG | WNOWAIT)`。
+/// #1604・PLUG-7・REPAIR-5）。
+///
+/// `crate::lifecycle` の `ChildGuard` が、自発終了した plugin のプロセスグループへ `SIGKILL` を送る前に呼ぶ。
+/// `WNOWAIT` のため子はゾンビのまま残り、pid（= pgid）は再利用されない。観測できたら呼び出し側がグループへ
+/// 送信してから `waitpid` で回収する。契約外の回収（`ECHILD`）は `Err` で返し、呼び出し側は送らない。
+///
+/// - `pid` が 1 以下、または `i32` に収まらない場合は `InvalidInput`（`P_PID` で 0 や init を対象にしない）
+/// - カーネルが返した `si_pid` が `pid` と食い違う場合は `io::Error::other`（fail-closed）
+/// - 対応外の OS・アーキテクチャは `Unsupported`
+///
+/// 呼び出し側の不変条件: 自プロセスが spawn した子の pid だけを渡す。
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos"
+))]
+pub(crate) fn probe_child_exit(pid: u32) -> io::Result<ChildExitProbe> {
+    use std::mem::MaybeUninit;
+    let checked = i32::try_from(pid)
+        .ok()
+        .filter(|p| *p > 1)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let mut attempts = 0;
+    loop {
+        // 待機可能な子がいないときの `infop` の中身は実装依存のため、0 初期化して `si_pid == 0` を
+        // 「未終了」と読む。
+        let mut info = MaybeUninit::<waitid_abi::SigInfo>::zeroed();
+        // SAFETY: `info` は呼び出し中有効な、`siginfo_t` 全体と同じ大きさ（コンパイル時に検査）の書き込み可能な
+        // スタック領域で、0 初期化済み（整数のみの `#[repr(C)]` 型は 0 が有効値）。`pid` は 1 より大きい値に
+        // 限定済みで `P_PID` により 1 プロセスだけを対象にする。`WNOWAIT` により子の状態を消費しないので、
+        // std の `Child` が前提にする「未回収の子だけを `waitpid` する」不変条件を崩さない。呼び出し側が
+        // 自プロセスの子の pid だけを渡すことが前提。
+        let rc = unsafe {
+            waitid_abi::waitid(
+                waitid_abi::P_PID,
+                pid,
+                info.as_mut_ptr(),
+                waitid_abi::WEXITED | waitid_abi::WNOHANG | waitid_abi::WNOWAIT,
+            )
+        };
+        if rc != 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted && attempts < PROBE_EINTR_RETRIES {
+                attempts += 1;
+                continue;
+            }
+            return Err(e);
+        }
+        // SAFETY: 0 初期化済みで、カーネルが書いた場合も整数フィールドのみ。
+        let info = unsafe { info.assume_init() };
+        return match info.si_pid {
+            0 => Ok(ChildExitProbe::Running),
+            p if p == checked => Ok(ChildExitProbe::Exited),
+            _ => Err(io::Error::other("waitid reported an unexpected pid")),
+        };
+    }
+}
+
+/// `waitid` の ABI を持たない OS・アーキテクチャ向け。判定せず `Unsupported`（fail-closed。他 OS の値を流用しない）。
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos"
+)))]
+pub(crate) fn probe_child_exit(pid: u32) -> io::Result<ChildExitProbe> {
+    let _ = pid;
     Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
@@ -2411,5 +2601,73 @@ mod killpg_tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
         assert_eq!(status.signal(), Some(9));
+    }
+}
+/// #1604・PLUG-7・REPAIR-5: `probe_child_exit` は回収せずに終了を観測し、他所で回収された後は `ECHILD`。
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod probe_child_exit_tests {
+    use super::*;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    /// 終了済みと観測できるまで期限つきでポーリングする（REPAIR-5）。
+    fn wait_exited(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if probe_child_exit(pid).unwrap() == ChildExitProbe::Exited {
+                return;
+            }
+            assert!(Instant::now() < deadline, "child did not exit in time");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn plug7_probe_reports_running_for_live_child() {
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        assert_eq!(
+            probe_child_exit(child.id()).unwrap(),
+            ChildExitProbe::Running
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn plug7_probe_reports_exited_without_reaping() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        wait_exited(pid);
+        // 2 回目も同じ結果（回収していない）で、その後 std の `try_wait` が終了コードを回収できる。
+        assert_eq!(probe_child_exit(pid).unwrap(), ChildExitProbe::Exited);
+        let status = child.try_wait().unwrap().expect("must still be reapable");
+        assert_eq!(status.code(), Some(7));
+    }
+
+    #[test]
+    // 回収は `reap_child_for_test`（`waitpid` を pid で呼ぶ）が行うため、`Child::wait` は呼ばない。
+    #[allow(clippy::zombie_processes)]
+    fn plug7_probe_fails_with_echild_after_reaped_elsewhere() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        wait_exited(pid);
+        assert!(reap_child_for_test(pid).unwrap());
+        let e = probe_child_exit(pid).unwrap_err();
+        // ECHILD は Linux・macOS とも 10。
+        assert_eq!(e.raw_os_error(), Some(10));
+    }
+
+    #[test]
+    fn plug7_probe_rejects_pid_zero_and_one() {
+        for bad in [0u32, 1, u32::MAX] {
+            let e = probe_child_exit(bad).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "pid={bad}");
+        }
     }
 }

@@ -42,7 +42,7 @@ use std::num::NonZeroU8;
 
 use serde::Serialize;
 
-use crate::sanitize::push_sanitized_bounded;
+use crate::sanitize::sanitize_display_bounded;
 use crate::traits::{ErrorCode, TraitError};
 
 /// `message` の最大バイト数。超過分は UTF-8 文字境界で切り詰める（無制限出力の防止）。
@@ -140,14 +140,9 @@ pub struct OciRuntimeError {
 impl OciRuntimeError {
     /// エラーを構築する。`message` はサニタイズ（表示を乱す文字の置換・長さ上限での切り詰め）して保持する。
     pub fn new(op: LifecycleOp, code: ErrorCode, message: impl AsRef<str>) -> Self {
-        // `AsRef<str>` で借用のまま受け取り、入力全体を `String` へ複製しない
-        // （`&str` を `Into<String>` で受けると全量確保になるため）。
-        let raw: &str = message.as_ref();
-        // 置換後の空白（1 バイト）は元の文字のバイト長以下なので、出力長は
-        // min(入力長, 上限) を超えない。よって初回確保のみで再確保は起きず、
-        // 確保量も上限で頭打ちになる。
-        let mut message = String::with_capacity(raw.len().min(OCI_ERROR_MESSAGE_MAX_BYTES));
-        push_sanitized_bounded(&mut message, raw.chars(), OCI_ERROR_MESSAGE_MAX_BYTES);
+        // `AsRef<str>` で借用のまま受け取り、入力全体を複製しない。確保量・走査は上限で頭打ち
+        // （詳細は `sanitize_display_bounded`。cli の `CliError` も同じ入口を通る）。
+        let message = sanitize_display_bounded(message.as_ref(), OCI_ERROR_MESSAGE_MAX_BYTES);
         Self { op, code, message }
     }
 

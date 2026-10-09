@@ -21,7 +21,7 @@
 //!   `OciRuntimeError` と同じ規則でサニタイズする: Unicode 一般カテゴリ Cc（制御）・Cf（書式。
 //!   双方向制御 U+202A〜U+202E・ゼロ幅文字等）・Zl / Zp（行区切り U+2028 / U+2029）を空白へ
 //!   置換し、[`CLI_ERROR_MESSAGE_MAX_BYTES`] で打ち切る（行注入・端末制御・表示順の偽装を防ぐ）。
-//!   判定表は core が SSOT で、cli に写しを持たない（`sanitize_bounded`）。
+//!   判定表は core が SSOT で、cli に写しを持たず、core の公開 API `sanitize_display_bounded` を直接呼ぶ。
 //! - 依存を増やさないため JSON は手で組む。キーは `code` → `message` の固定順・固定 2 個で、
 //!   エスケープ関数は本モジュールの 1 か所に限る（`doctor.rs` の同種関数との共通化は後続課題）。
 
@@ -30,8 +30,9 @@ use std::io::Write;
 use std::num::NonZeroU8;
 
 use fandhe_container_core::oci_runtime::{
-    LifecycleOp, OCI_ERROR_MESSAGE_MAX_BYTES, OciRuntimeError, exit_code_for,
+    OCI_ERROR_MESSAGE_MAX_BYTES, OciRuntimeError, exit_code_for,
 };
+use fandhe_container_core::sanitize::sanitize_display_bounded;
 use fandhe_container_core::traits::{ErrorCode, TraitError};
 
 /// [`CliError`] が保持する `message` の最大バイト数。core の OCI エラーの上限と同値。
@@ -52,7 +53,7 @@ impl CliError {
     pub fn new(code: ErrorCode, message: impl AsRef<str>) -> Self {
         Self {
             code,
-            message: sanitize_bounded(message.as_ref()),
+            message: sanitize_display_bounded(message.as_ref(), CLI_ERROR_MESSAGE_MAX_BYTES),
         }
     }
 
@@ -119,20 +120,6 @@ impl From<&OciRuntimeError> for CliError {
     }
 }
 
-/// 表示・行構造を乱す文字（Cc・Cf・Zl・Zp）を空白へ置換しつつ、UTF-8 文字境界で上限バイトに打ち切る。
-///
-/// 判定（Cf の範囲表を含む）は core の private 実装で、cli から直接は呼べない。写しを持つと
-/// Unicode 版の更新で乖離するため、同じ規則を適用する公開入口 `OciRuntimeError::new` を通して
-/// サニタイズ結果だけを取り出す。`op` は出力に使わないダミーで、`code` も結果に影響しない。
-/// core 側は入力を借用のまま走査して上限で読み取りを止めるため、巨大な入力でも確保・走査は
-/// [`CLI_ERROR_MESSAGE_MAX_BYTES`]（core の上限と同値）で頭打ちになる。
-/// core がサニタイズ関数を公開したら直接呼び出しへ置き換える（runtime-builder 担当の後続課題）。
-fn sanitize_bounded(input: &str) -> String {
-    OciRuntimeError::new(LifecycleOp::Create, ErrorCode::Internal, input)
-        .message()
-        .to_owned()
-}
-
 /// JSON 文字列の中身として `s` を `out` へ追記する（`"`・`\`・0x20 未満をエスケープ）。
 fn json_escape_into(out: &mut String, s: &str) {
     use std::fmt::Write as _;
@@ -154,6 +141,7 @@ fn json_escape_into(out: &mut String, s: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fandhe_container_core::oci_runtime::LifecycleOp;
 
     #[test]
     fn err1_fields_are_kept() {

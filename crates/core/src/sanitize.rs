@@ -1,9 +1,10 @@
-//! 表示を乱す文字の判定と有界追記（crate 内でただ 1 つの実装）。
+//! 表示を乱す文字の判定と有界追記（判定表は本モジュール内でただ 1 つの実装）。
 //!
 //! 外部由来（plugin 応答・ヘルパーの stderr・パス）の文字列をログ・エラーメッセージ・監査記録へ
 //! 入れる前に、Unicode 一般カテゴリ Cc・Cf・Zl・Zp の文字を判定する。利用者は
 //! `oci_runtime::error`（空白へ置換）・`rootless`（除去）・`exec::violation`（`escape_default`
-//! 形式でエスケープ）。置換の形は呼び出し側が決め、本モジュールは判定と有界追記だけを持つ
+//! 形式でエスケープ）。外部 crate 向けには空白置換の `sanitize_display_bounded` だけを公開し、
+//! cli の `CliError` が使う（判定表は公開しない）。置換の形は呼び出し側が決め、本モジュールは判定と有界追記だけを持つ
 //! （ERR-2・SEC-4・REPAIR-4・TASK-96.1）。
 
 /// Unicode 一般カテゴリ Cf（Format）に属する符号位置の範囲（Unicode 16.0.0。昇順・重複なし・計 170 個）。
@@ -87,9 +88,51 @@ pub(crate) fn push_sanitized_bounded(
     }
 }
 
+/// 表示を乱す文字（Cc・Cf・Zl・Zp と U+2065）を空白へ置換し、UTF-8 文字境界で `max_bytes` に
+/// 打ち切った文字列を返す公開入口。
+///
+/// `OciRuntimeError::new`（core）と cli の `CliError::new` が同じ規則を共有するための単一の入口で、
+/// 判定表は公開しない。`input` は借用のまま走査し上限で読み取りを止めるため、巨大な入力でも
+/// 確保・走査は `max_bytes` で頭打ちになる（untrusted 入力の DoS 防止）。置換後の空白は元の文字
+/// 以下のバイト長なので、確保は `min(入力長, max_bytes)` の 1 回で済む（ERR-1・ERR-2・SEC-4・TASK-96.1）。
+pub fn sanitize_display_bounded(input: &str, max_bytes: usize) -> String {
+    let mut out = String::with_capacity(input.len().min(max_bytes));
+    push_sanitized_bounded(&mut out, input.chars(), max_bytes);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ERR-2: 公開入口は制御・書式・行区切り文字を空白へ置換する。
+    #[test]
+    fn err2_sanitize_display_bounded_replaces_unsafe_chars() {
+        assert_eq!(
+            sanitize_display_bounded("a\u{202E}b\nc\u{2028}d", 4096),
+            "a b c d"
+        );
+    }
+
+    /// ERR-2: 公開入口は UTF-8 文字境界で打ち切り、上限 0 は空文字列。
+    #[test]
+    fn err2_sanitize_display_bounded_truncates_at_char_boundary() {
+        let s = sanitize_display_bounded(&"あ".repeat(5000), 4096);
+        assert_eq!((s.len(), s.chars().count()), (4095, 1365));
+        assert_eq!(
+            sanitize_display_bounded(&"a".repeat(10_000), 4096).len(),
+            4096
+        );
+        assert_eq!(sanitize_display_bounded("abc", 0), "");
+    }
+
+    /// ERR-2: 確保量は上限で頭打ちになる。
+    #[test]
+    fn err2_sanitize_display_bounded_capacity_is_capped() {
+        let big = "a".repeat(1 << 20);
+        assert_eq!(sanitize_display_bounded(&big, 4096).capacity(), 4096);
+        assert_eq!(sanitize_display_bounded("abc", 4096).capacity(), 3);
+    }
 
     /// ERR-2: Cf の範囲表は昇順・重複なしで、Unicode 16.0.0 の Cf 全 170 符号位置と一致する。
     #[test]

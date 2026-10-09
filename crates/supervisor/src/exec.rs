@@ -193,11 +193,11 @@ use std::time::{Duration, Instant};
 use fandhe_container_core::audit_log::{AuditSink, AuditedRejection};
 use fandhe_container_core::exec::{
     ChildExit, ContainerEnv, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV, ENTRYPOINT_MAX_STRING_BYTES,
-    ENTRYPOINT_MAX_TOTAL_BYTES, ExecCgroupJoin, ExecCgroupJoinReport, ExecCgroupName,
-    ExecChildCgroup, ExecCommand, ExecError, ExecExit, ExecReady, ExecRestrictionReport,
-    ExecRestrictions, ExecWorkerProof, NamespaceJoinReport, Pid1Target, SupplementaryGroups,
-    ViolationReason, join_cgroup as core_join_cgroup, join_namespaces,
-    prepare_cgroup_join as core_prepare_cgroup_join,
+    ENTRYPOINT_MAX_TOTAL_BYTES, EntrypointExecMode, ExecCgroupJoin, ExecCgroupJoinReport,
+    ExecCgroupName, ExecChildCgroup, ExecCommand, ExecError, ExecExit, ExecReady,
+    ExecRestrictionReport, ExecRestrictions, ExecWorkerProof, NamespaceJoinReport, Pid1Target,
+    SealedCopyUnavailable, SupplementaryGroups, ViolationReason, join_cgroup as core_join_cgroup,
+    join_namespaces, prepare_cgroup_join as core_prepare_cgroup_join,
     prepare_exec_restrictions as core_prepare_exec_restrictions,
     reapply_restrictions as core_reapply_restrictions, record_exec_target_rejection,
     remove_exec_child_cgroup, spawn_exec_command, spawn_exec_worker,
@@ -514,6 +514,9 @@ pub struct ExecOutcome {
     /// 補助グループの扱いの結果（launch と同じく空にする。`setgroups` が `deny` の user namespace では残して
     /// 記録する。TASK-163 追補・#1457）。
     pub supplementary_groups: SupplementaryGroups,
+    /// エントリポイントの実行方式（封印した複製か現行方式と、現行方式を選んだ理由。オーナー判断 2026-10-09
+    /// 「条件付き切り替え」・#1531・REPAIR-4）。同じ値を worker が構造化ログ（`supervisor.exec` の `entrypoint_mode`）に出す。
+    pub entrypoint_mode: EntrypointExecMode,
 }
 
 /// 準備から fork までの全体の期限（REPAIR-5）。各段の間で残りを確かめ、超過したら次の段へ進まず `Timeout`。
@@ -921,12 +924,16 @@ fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
                 other => other.remaining(),
             };
             format!(
-                "ok {started} {violation} {kind} {value} {} {} {} {} {} {groups}\n",
+                "ok {started} {violation} {kind} {value} {} {} {} {} {} {groups} {} {}\n",
                 o.rlimits_applied,
                 o.capability_bounding_dropped,
                 o.landlock_rules,
                 o.seccomp_instructions,
                 o.supplementary_groups.as_str(),
+                o.entrypoint_mode.as_str(),
+                o.entrypoint_mode
+                    .fallback_reason()
+                    .map_or("-", SealedCopyUnavailable::as_str),
             )
         }
         Err(e) => format!(
@@ -1054,6 +1061,9 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
         "kept_setgroups_denied" => SupplementaryGroups::KeptSetgroupsDenied { kept: groups },
         _ => return Err(malformed()),
     };
+    let mode = it.next().ok_or_else(malformed)?;
+    let reason = it.next().ok_or_else(malformed)?;
+    let entrypoint_mode = EntrypointExecMode::from_tokens(mode, reason).ok_or_else(malformed)?;
     if it.next().is_some() {
         return Err(malformed());
     }
@@ -1064,6 +1074,7 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
         landlock_rules,
         seccomp_instructions,
         supplementary_groups,
+        entrypoint_mode,
     })
 }
 
@@ -1106,6 +1117,9 @@ fn run_in_child_cgroup(
     let command = request.command(&ContainerEnv::from_config(&config).map_err(from_exec_error)?)?;
     let restrictions = core_prepare_exec_restrictions(proof, &target.pid1, &config, &rootfs)
         .map_err(from_exec_error)?;
+    // 方式の切り替えを黙って行わない（オーナー判断 2026-10-09・#1531・REPAIR-4）。判定の直後に 1 回だけ出す。
+    let entrypoint_mode = restrictions.entrypoint_mode();
+    log_entrypoint_mode(entrypoint_mode);
     deadline.remaining("joining namespaces")?;
     enter_namespaces(target)?;
     deadline.remaining("joining the cgroup")?;
@@ -1144,7 +1158,31 @@ fn run_in_child_cgroup(
         landlock_rules,
         seccomp_instructions,
         supplementary_groups,
+        entrypoint_mode,
     })
+}
+
+/// エントリポイントの実行方式の構造化ログ 1 行（JSON。値は固定語彙のみ。REPAIR-4・#1531）。
+///
+/// `{"component":"supervisor.exec","operation":"entrypoint_mode","mode":"pinned_inode","reason":"lsm_apparmor"}` の形で、
+/// 封印した複製なら `reason` は空文字列（`supervisor.monitor` の `code` と同じ流儀）。パス・LSM 名の生文字列は含めない。
+fn entrypoint_mode_log_line(mode: EntrypointExecMode) -> String {
+    format!(
+        "{{\"component\":\"supervisor.exec\",\"operation\":\"entrypoint_mode\",\"mode\":\"{}\",\"reason\":\"{}\"}}",
+        mode.as_str(),
+        mode.fallback_reason()
+            .map_or("", SealedCopyUnavailable::as_str)
+    )
+}
+
+/// [`entrypoint_mode_log_line`] を stderr へ出す（`eprintln!` は書き込み失敗で panic するため、結果を無視する
+/// `writeln!` を使う。`logs::rotating` と同じ）。
+fn log_entrypoint_mode(mode: EntrypointExecMode) {
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "{}",
+        entrypoint_mode_log_line(mode)
+    );
 }
 
 /// 起動後の子に対する期限内の待機。期限が既に切れていれば待たずに直ちに `kill` で停止・回収してから `Timeout`
@@ -1218,7 +1256,7 @@ fn from_exec_error(err: ExecError) -> TraitError {
 mod tests {
     use super::*;
     use fandhe_container_core::audit_log::{AuditDelivery, AuditLayer, AuditRecord};
-    use fandhe_container_core::exec::exec_child_violation_reasons;
+    use fandhe_container_core::exec::{PathBoundLsm, exec_child_violation_reasons};
     use fandhe_container_core::traits::{
         CgroupPlacement, CgroupScope, ContainerStatus, StateRevision,
     };
@@ -1235,6 +1273,28 @@ mod tests {
 
     fn cid() -> ContainerId {
         ContainerId::new("c1").unwrap()
+    }
+
+    /// SUP-6・REPAIR-4・#1531（オーナー判断 2026-10-09「条件付き切り替え」）: 実行方式の構造化ログの具体値。
+    /// 封印した複製は `reason` が空、現行方式は理由コードを持つ。
+    #[test]
+    fn sup6_repair4_entrypoint_mode_log_line_is_exact() {
+        assert_eq!(
+            entrypoint_mode_log_line(EntrypointExecMode::SealedCopy),
+            r#"{"component":"supervisor.exec","operation":"entrypoint_mode","mode":"sealed_copy","reason":""}"#
+        );
+        assert_eq!(
+            entrypoint_mode_log_line(EntrypointExecMode::PinnedInode {
+                reason: SealedCopyUnavailable::PathBoundLsm(PathBoundLsm::AppArmor),
+            }),
+            r#"{"component":"supervisor.exec","operation":"entrypoint_mode","mode":"pinned_inode","reason":"lsm_apparmor"}"#
+        );
+        assert_eq!(
+            entrypoint_mode_log_line(EntrypointExecMode::PinnedInode {
+                reason: SealedCopyUnavailable::KernelTooOld,
+            }),
+            r#"{"component":"supervisor.exec","operation":"entrypoint_mode","mode":"pinned_inode","reason":"kernel_too_old"}"#
+        );
     }
 
     /// SEC-4・SUP-6・#1579: worker 結果の復号が引き直す違反の一覧（`SETUP_VIOLATIONS`）は、core の exec の子が
@@ -1546,9 +1606,13 @@ mod tests {
             landlock_rules: 3,
             seccomp_instructions: 120,
             supplementary_groups: SupplementaryGroups::Cleared { cleared: 4 },
+            entrypoint_mode: EntrypointExecMode::SealedCopy,
         };
         let line = encode_worker_result(&Ok(outcome));
-        assert_eq!(line, b"ok command - signaled 15 16 23 3 120 cleared 4\n");
+        assert_eq!(
+            line,
+            b"ok command - signaled 15 16 23 3 120 cleared 4 sealed_copy -\n"
+        );
         assert_eq!(decode_worker_result(&line).unwrap(), outcome);
         // 補助グループの扱いは 3 通りとも往復する（TASK-163 追補・#1457）。
         for (groups, text) in [
@@ -1565,7 +1629,30 @@ mod tests {
             let line = encode_worker_result(&Ok(outcome));
             assert_eq!(
                 String::from_utf8(line.clone()).unwrap(),
-                format!("ok command - signaled 15 16 23 3 120 {text}\n")
+                format!("ok command - signaled 15 16 23 3 120 {text} sealed_copy -\n")
+            );
+            assert_eq!(decode_worker_result(&line).unwrap(), outcome);
+        }
+        // 現行方式と理由コードも往復する（オーナー判断 2026-10-09・#1531）。
+        for (reason, code) in [
+            (SealedCopyUnavailable::KernelTooOld, "kernel_too_old"),
+            (
+                SealedCopyUnavailable::PathBoundLsm(PathBoundLsm::AppArmor),
+                "lsm_apparmor",
+            ),
+            (
+                SealedCopyUnavailable::ImaPolicyUnreadable,
+                "ima_policy_unreadable",
+            ),
+        ] {
+            let outcome = ExecOutcome {
+                entrypoint_mode: EntrypointExecMode::PinnedInode { reason },
+                ..outcome
+            };
+            let line = encode_worker_result(&Ok(outcome));
+            assert_eq!(
+                String::from_utf8(line.clone()).unwrap(),
+                format!("ok command - signaled 15 16 23 3 120 cleared 4 pinned_inode {code}\n")
             );
             assert_eq!(decode_worker_result(&line).unwrap(), outcome);
         }
@@ -1652,7 +1739,7 @@ mod tests {
             let line = encode_worker_result(&Ok(outcome));
             assert_eq!(
                 String::from_utf8(line.clone()).unwrap(),
-                format!("ok {text} 16 23 3 120 cleared 4\n")
+                format!("ok {text} 16 23 3 120 cleared 4 sealed_copy -\n")
             );
             assert_eq!(decode_worker_result(&line).unwrap(), outcome);
         }
@@ -1678,15 +1765,20 @@ mod tests {
             b"ok command - exited 0 1 2 3\n",
             b"ok command - exited 0 1 2 3 4\n",
             b"ok command - exited 0 1 2 3 4 cleared\n",
-            b"ok command - exited 0 1 2 3 4 unknown 1\n",
-            b"ok command - exited 0 1 2 3 4 already_empty 2\n",
-            b"ok command - exited 0 1 2 3 4 cleared 1 extra\n",
-            b"ok command - weird 0 1 2 3 4 cleared 1\n",
+            b"ok command - exited 0 1 2 3 4 unknown 1 sealed_copy -\n",
+            b"ok command - exited 0 1 2 3 4 already_empty 2 sealed_copy -\n",
+            b"ok command - weird 0 1 2 3 4 cleared 1 sealed_copy -\n",
+            // 実行方式の欄: 欠落・不正な組み合わせ・未知の理由コード。
+            b"ok command - exited 0 1 2 3 4 cleared 1 sealed_copy\n",
+            b"ok command - exited 0 1 2 3 4 cleared 1 sealed_copy kernel_too_old\n",
+            b"ok command - exited 0 1 2 3 4 cleared 1 pinned_inode -\n",
+            b"ok command - exited 0 1 2 3 4 cleared 1 pinned_inode lsm_mystery\n",
+            b"ok command - exited 0 1 2 3 4 cleared 1 sealed_copy - extra\n",
             // 旧形式（起動の別が無い）・未知の起動の別・コマンドの終了に違反が付く・子が返さない理由コード。
-            b"ok exited 0 1 2 3 4 cleared 1\n",
-            b"ok started - exited 0 1 2 3 4 cleared 1\n",
-            b"ok command entrypoint_is_runtime_binary exited 0 1 2 3 4 cleared 1\n",
-            b"ok setup rootfs_is_host_root exited 126 1 2 3 4 cleared 1\n",
+            b"ok exited 0 1 2 3 4 cleared 1 sealed_copy -\n",
+            b"ok started - exited 0 1 2 3 4 cleared 1 sealed_copy -\n",
+            b"ok command entrypoint_is_runtime_binary exited 0 1 2 3 4 cleared 1 sealed_copy -\n",
+            b"ok setup rootfs_is_host_root exited 126 1 2 3 4 cleared 1 sealed_copy -\n",
             b"hello\n",
             // 失敗行: 理由の欄が無い旧形式・未知の理由・exec 対象でない理由。
             b"err TIMEOUT\n",

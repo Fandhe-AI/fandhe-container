@@ -322,10 +322,16 @@ fn f1_1_gpu6_length_mismatch() {
 
 #[test]
 fn f1_1_gpu6_invalid_value() {
-    for n in [0u32, 33] {
-        let p = mem_table_bytes(n, &[]);
-        assert_eq!(code_of(decode_request(&msg(5, 1, &p))), "INVALID_VALUE");
-    }
+    // n=0 は期待長（領域データなし）と一致したうえで値として拒否する。
+    let p = mem_table_bytes(0, &[]);
+    assert_eq!(code_of(decode_request(&msg(5, 1, &p))), "INVALID_VALUE");
+    // n=33 で領域データなしは、値より先に期待長で LENGTH_MISMATCH（検査順は固定）。
+    // 33 領域分のデータを付けると size が MAX_PAYLOAD_LEN を超え PAYLOAD_TOO_LARGE になる。
+    let p = mem_table_bytes(33, &[]);
+    assert_eq!(code_of(decode_request(&msg(5, 1, &p))), "LENGTH_MISMATCH");
+    // config: size=257 でデータなしも LENGTH_MISMATCH が先。
+    let p = config_bytes(0, 257, 1, &[]);
+    assert_eq!(code_of(decode_request(&msg(24, 1, &p))), "LENGTH_MISMATCH");
     // kick / call の bit 9。
     for id in [12u32, 13] {
         assert_eq!(

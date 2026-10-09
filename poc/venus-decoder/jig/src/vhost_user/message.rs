@@ -166,6 +166,10 @@ impl ConfigPayload {
         let size = r.u32()?;
         let flags = r.u32()?;
         let size = usize::try_from(size).unwrap_or(usize::MAX);
+        // 検査順は固定（LENGTH_MISMATCH → INVALID_VALUE）。期待長を先に照合してから上限を検証する。
+        if r.remaining() != size {
+            return Err(err(CodecErrorCode::LengthMismatch, req));
+        }
         if size > MAX_CONFIG_SIZE {
             return Err(err(CodecErrorCode::InvalidValue, req));
         }
@@ -299,6 +303,13 @@ fn read_mem_table(r: &mut Reader) -> Result<MemTable, CodecError> {
     let n = r.u32()?;
     let _padding = r.u32()?;
     let n = usize::try_from(n).unwrap_or(usize::MAX);
+    // 検査順は固定（LENGTH_MISMATCH → INVALID_VALUE）。期待長（飽和乗算なので溢れない）を先に照合する。
+    if r.remaining() != n.saturating_mul(MEM_REGION_LEN) {
+        return Err(err(
+            CodecErrorCode::LengthMismatch,
+            RequestCode::SetMemTable,
+        ));
+    }
     if n == 0 || n > MAX_MEM_REGIONS {
         return Err(err(CodecErrorCode::InvalidValue, RequestCode::SetMemTable));
     }

@@ -378,6 +378,11 @@ impl<'a> Reader<'a> {
         self.take(n)
     }
 
+    /// 未読の残りバイト数。
+    pub(crate) fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
+
     /// 全部読み切ったか（余りがあれば `LENGTH_MISMATCH`）。
     pub(crate) fn finish(&self) -> Result<(), CodecError> {
         if self.pos == self.buf.len() {

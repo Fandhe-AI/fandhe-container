@@ -828,12 +828,27 @@ impl ChildGuard {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         // 書き込み失敗は無視する（`Drop`・panic の unwinding 中でも panic しない）。
+        // stderr が満杯の pipe 等でブロックしても後始末を止めないため、書き込みは別スレッドに任せ、
+        // 待つのは短い上限まで（超えたら記録を打ち切る。REPAIR-5・PLUG-7）。
         self.finish_on_drop(&mut |rec| {
-            use std::io::Write;
-            let _ = writeln!(io::stderr(), "{}", rec.to_json_line());
+            let line = rec.to_json_line();
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let spawned = std::thread::Builder::new()
+                .name("child-guard-drop-log".into())
+                .spawn(move || {
+                    use std::io::Write;
+                    let _ = writeln!(io::stderr(), "{line}");
+                    let _ = tx.send(());
+                });
+            if spawned.is_ok() {
+                let _ = rx.recv_timeout(DROP_LOG_LIMIT);
+            }
         });
     }
 }
+
+/// `Drop` の診断出力を待つ上限（stderr が詰まっても後始末を止めない。#1605・REPAIR-5）。
+const DROP_LOG_LIMIT: Duration = Duration::from_millis(200);
 
 /// `EPERM` が出た間だけ短時間再送する上限（#1311・PLUG-7・REPAIR-5）。
 #[cfg(unix)]

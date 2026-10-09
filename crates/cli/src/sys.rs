@@ -124,10 +124,11 @@ mod layout {
         Some(mask)
     }
 
-    /// 読み戻し照合用: `sa_mask` の各 word。
+    /// 読み戻し照合用: `sa_mask` の先頭 word だけ。Linux のカーネルは 8 バイト（`_NSIG` = 64 ビット）しか
+    /// 読み書きせず、glibc の読み戻しは word 1 以降を未初期化にし得るため、初期化が保証された先頭だけを返す。
     #[cfg(test)]
-    pub(super) fn mask_words(a: &SigAction) -> Vec<u64> {
-        a.mask.to_vec()
+    pub(super) fn mask_first_word(a: &SigAction) -> u64 {
+        a.mask[0]
     }
 }
 
@@ -169,8 +170,8 @@ mod layout {
 
     /// 読み戻し照合用: `sa_mask`（1 word）。
     #[cfg(test)]
-    pub(super) fn mask_words(a: &SigAction) -> Vec<u64> {
-        vec![u64::from(a.mask)]
+    pub(super) fn mask_first_word(a: &SigAction) -> u64 {
+        u64::from(a.mask)
     }
 }
 
@@ -389,15 +390,15 @@ mod imp {
         Ok((old.handler, old.flags))
     }
 
-    /// テスト専用: `sig` の `sa_mask` の各 word（読み戻し照合用）。
+    /// テスト専用: `sig` の `sa_mask` の先頭 word（読み戻し照合用）。
     #[cfg(test)]
-    pub(super) fn current_mask(sig: i32) -> io::Result<Vec<u64>> {
+    pub(super) fn current_mask(sig: i32) -> io::Result<u64> {
         let mut old = layout::empty();
         // SAFETY: `act` は NULL（取得のみ）、`old` は呼び出し中有効なスタック上の書き込み可能な領域。
         if unsafe { sigaction(sig, std::ptr::null(), &mut old) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(layout::mask_words(&old))
+        Ok(layout::mask_first_word(&old))
     }
 
     /// テスト専用: 所有者 pid と照合の判定（ユニットテスト用）。
@@ -438,6 +439,9 @@ mod imp {
     /// `EINTR`（Linux・macOS とも 4）。
     #[cfg(feature = "signal-test-support")]
     const EINTR: i32 = 4;
+    /// SIGKILL 後の回収を待つ上限（REPAIR-5）。
+    #[cfg(feature = "signal-test-support")]
+    const REAP_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// 結合試験専用（feature `signal-test-support`）: fork した子で `sig` を自分へ送り、子の終了を `limit` まで
     /// 待って、シグナル終了ならその番号（`Some`）、通常終了なら `None` を返す（#1605・PLUG-7）。
@@ -482,13 +486,31 @@ mod imp {
                 }
             }
             if start.elapsed() >= limit {
-                // SAFETY: 未回収の自分の子（pid は再利用されない）への SIGKILL。続く `waitpid` は kill 後の
-                // 回収のみで有限時間で戻る。
-                unsafe {
-                    let _ = kill(pid, SIGKILL);
-                    let _ = waitpid(pid, &mut status, 0);
+                // SAFETY: 未回収の自分の子（pid は再利用されない）への SIGKILL。
+                let killed = unsafe { kill(pid, SIGKILL) };
+                let kill_err = (killed != 0).then(io::Error::last_os_error);
+                // 強制終了後の回収も期限つき（REPAIR-5）。無期限の `waitpid` にしない。
+                let reap_start = std::time::Instant::now();
+                loop {
+                    // SAFETY: `status` は呼び出し中有効なスタック上の書き込み可能な領域。`pid` は未回収の自分の子。
+                    let r = unsafe { waitpid(pid, &mut status, WNOHANG) };
+                    if r == pid {
+                        break;
+                    }
+                    if r < 0 && io::Error::last_os_error().raw_os_error() != Some(EINTR) {
+                        break;
+                    }
+                    if reap_start.elapsed() >= REAP_LIMIT {
+                        return Err(io::Error::other(format!(
+                            "child {pid} not reaped within {REAP_LIMIT:?} after SIGKILL"
+                        )));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
-                return Err(io::Error::from(io::ErrorKind::TimedOut));
+                return Err(match kill_err {
+                    Some(e) => io::Error::other(format!("SIGKILL to child {pid} failed: {e}")),
+                    None => io::Error::from(io::ErrorKind::TimedOut),
+                });
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -622,12 +644,11 @@ mod tests {
     fn plug7_installed_handler_reads_back_with_forwarded_signal_mask() {
         const SIGPROF: i32 = 27;
         install_forwarding_handler(SIGPROF).unwrap();
-        let words = imp::current_mask(SIGPROF).unwrap();
-        // 先頭 word だけを照合する。Linux のカーネルは 8 バイト（`_NSIG` = 64 ビット）しか読み書きせず、
-        // glibc の読み戻しは残りの word に未初期化の値を入れ得るため、照合の対象にしない。
-        assert_eq!(words[0], 0x4003);
+        // 先頭 word だけを照合する（残りの word は読み戻し API が返さない）。
+        let word = imp::current_mask(SIGPROF).unwrap();
+        assert_eq!(word, 0x4003);
         // 自分自身（SIGPROF = 27）は含まない（sa_mask は追加で止めるシグナルだけ）。
-        assert_eq!(words[0] & (1 << (SIGPROF - 1)), 0);
+        assert_eq!(word & (1 << (SIGPROF - 1)), 0);
         // 範囲外の番号は立てられない。
         assert!(layout::mask_of(&[0]).is_none());
         assert!(layout::mask_of(&[-1]).is_none());

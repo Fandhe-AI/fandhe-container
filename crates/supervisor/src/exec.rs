@@ -905,7 +905,8 @@ pub fn run_in_worker_for_test(
 }
 
 /// worker の結果を pipe 用の 1 行へ符号化する。成功は `ok <command|setup> <違反の理由コードまたは -> <exited|signaled>
-/// <値> <rlimit 数> <capability 数> <Landlock 数> <seccomp 命令数> <補助グループの扱い> <その件数>`、失敗は
+/// <値> <適用した rlimit 数> <子へ持ち越した rlimit 数（0 か 1）> <capability 数> <Landlock 数> <seccomp 命令数>
+/// <補助グループの扱い> <その件数> <実行方式（sealed_copy|pinned_inode）> <現行方式の理由コードまたは ->`、失敗は
 /// `err <ERR-1 コード> <exec 対象の違反の理由コードまたは -> <メッセージ>`（改行は空白へ置換）。
 fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
     let line = match result {

@@ -178,6 +178,10 @@ pub enum CgroupStep {
     JoinContainer,
     /// `memory.current` / `cpu.stat` / `io.stat` の読み取り（SUP-10・TASK-167.1）。
     ReadStats,
+    /// 名前指定の削除の直前に、親直下の同名エントリが保持 fd と同一の cgroup であることの確認
+    /// （差し替えの検出。`rmdir` のカーネル拒否〔`Cleanup` 段の `EBUSY` / `ENOTEMPTY`〕と区別する。
+    /// #1596・REPAIR-4）。
+    VerifyIdentity,
 }
 
 /// cgroup 操作のエラー。`code` は ERR 系の機械可読コード、`message` は英語の説明。
@@ -1274,10 +1278,7 @@ fn remove_verified_at(
     if dir_identity(step, entry.as_fd(), "stat cgroup entry")?
         != dir_identity(step, held, "stat held cgroup")?
     {
-        return Err(CgroupError::precondition(
-            step,
-            "cgroup entry no longer matches the held handle",
-        ));
+        return Err(identity_mismatch_error());
     }
     drop(entry);
     let c = cstring(step, name)?;
@@ -1292,6 +1293,18 @@ fn remove_verified_at(
         )),
         Err(e) => Err(sys_error(step, "confirm removal via held cgroup.events", e)),
     }
+}
+
+/// [`remove_verified_at`] の同一性不一致（名前のエントリが保持 fd と別の cgroup に差し替えられた）のエラー。
+///
+/// `code` は従来どおり `FailedPrecondition`（delete の再試行の判定を変えない）で、段を
+/// [`CgroupStep::VerifyIdentity`] にして `rmdir` のカーネル拒否（`Cleanup` 段の `EBUSY` / `ENOTEMPTY`）と
+/// 区別する。exec 用の子 cgroup の掃除はこれを「使用中で残す」ではなく失敗に数える（#1596・REPAIR-4・SUP-6）。
+fn identity_mismatch_error() -> CgroupError {
+    CgroupError::precondition(
+        CgroupStep::VerifyIdentity,
+        "cgroup entry no longer matches the held handle",
+    )
 }
 
 /// `oci_runtime::delete` が使う cgroup 削除（TASK-30.3・OCI-6）。対象は `fc-<id>@<instance>`（CORE-3 で作った子）だけ。

@@ -188,7 +188,7 @@ GPU-6 の決定（ヘッドレス compute のみ・2D スキャンアウト非�
 - 配置の逸脱: issue 記載の `poc/venus-decoder/replay/` ではなく既存骨格の隣に置いた。`poc/` は存在せず、新設には workspace メンバー追加（ルート `Cargo.toml` の変更）が要る。再生器は同モジュールの `parse_command_header` を直接使う
 - 取り扱い: 実機で採取したストリームにはワークロード由来のデータが含まれうる。テストの fixture は合成データのみで、実ストリームはリポジトリにコミットしない
 - **未達（実装済みを装わない。REPAIR-3）**: 受け入れ条件「lavapipe 上で記録を再生し、最小 compute の結果が記録時と一致する」は本書時点で未達。理由は (1) コマンド引数のパース・Vulkan ディスパッチが未実装（TASK-177.x）、(2) lavapipe 実行に Vulkan バインディング（外部クレートまたは自前 FFI。依存追加・`unsafe` の承認が必要）が要る、(3) 実ストリームの採取は #725（人間担当）。再生先は `ReplayBackend` トレイトの差し替え点として定義し、`CollectingBackend`（提出内容を保持する模擬）でのみ検証している
-- 先送り: reply ストリーム・期待出力レコード（kind の番号は未割当。REPAIR-3）、実機側の記録フック配線（#888・#725）
+- 先送り: reply ストリーム・期待出力レコード（kind の番号は未割当。REPAIR-3）。治具側の記録フック配線は #1602 で実装済み（10.4.5・10.9。対象は `SUBMIT_3D` の本体だけで、リングの中身は F5.2b の後）。実機での採取は #725（人間担当）
 
 ## 8. capset 応答（TASK-172.3・#724）
 
@@ -428,6 +428,7 @@ Mesa は 2 層で読む。Mesa は ctrl を直接出さず、DRM ioctl を呼ぶ
 - venus の通常のコマンドは、ring の共有メモリ（HOST3D・`blob_id` 0 の blob）へ書かれる。ring の書き込み先は共有メモリで、virtqueue を通らない。ホストは ring を消費して処理する。`vn_ring_submit_locked` はコマンドをリングに書き（`vn_ring.c` 436〜442 行）、`SUBMIT_3D` を使うのは idle のリングを起こす `vkNotifyRingMESA` だけ（同 457〜469・627〜636 行）
 - 取得したファイルの範囲では、リングを使わない直接提出は `vkCreateRingMESA`・`vkDestroyRingMESA`・`vkNotifyRingMESA`・ring の roundtrip（`vn_ring.c` 741 行）の 4 か所の `vn_renderer_submit_simple` だけ。ほかのファイル（キュー提出の `vn_queue.c` 等）は取得しておらず、`vn_renderer_submit` を直接呼ぶ経路は**未確認**
 - したがって #1602 の第 1 段は、`SUBMIT_3D` のペイロードを 1 回 1 レコードで記録する（偽の frontend で試験できる）。ただし中身はリングの制御だけで、2 段目の再生に使える価値は小さい。**リングの中身の記録は F5.2b（共有メモリ）の後に回す**。#1602 の本文は編集していない。範囲の確定は本節と #1600 のコメントで行う
+- **#1602 で実装済み**: 治具の `--record` が、ACK を返せた `SUBMIT_3D` の本体（`Submit3d.payload`）を 1 提出 1 レコードで記録ファイルへ書く。応答を捨てて adapter を巻き戻した提出は記録しない。上限（1 レコード 16 MiB・65,536 件・全体 256 MiB）は治具側のラッパー（`recording`）が確保の前に検査し、達したら記録だけを止めて 1 回だけ `record_stopped` を出す（以降は小さい提出も記録しない）。治具の本体上限は 4064 バイトなので 1 件の上限には達せず、全体長の上限が件数の上限より先に効きうる
 
 #### 10.4.6 `SUBMIT_3D` のペイロード上限
 
@@ -586,7 +587,7 @@ frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲスト
 
 `launch`（lib）と bin `venus-jig` が、UDS の bind・期限つき accept・ログのファイル出力を担う。Linux 限定。1 接続を `session::run` で最後まで処理して終わる（実機の疎通は #725）。
 
-- 引数: `--socket <絶対パス>`・`--log <絶対パス>`（必須）、`--message-timeout-ms`（既定 5000）・`--idle-timeout-ms`（既定 60000）・`--poll-slice-ms`・`--accept-timeout-ms`（既定 60000、0 より大きく 1 時間以下）。VMM 側から指定するのは `--socket` に渡した絶対パス。記録ファイルのパスは #1602 で足す
+- 引数: `--socket <絶対パス>`・`--log <絶対パス>`（必須）、`--message-timeout-ms`（既定 5000）・`--idle-timeout-ms`（既定 60000）・`--poll-slice-ms`・`--accept-timeout-ms`（既定 60000、0 より大きく 1 時間以下）。VMM 側から指定するのは `--socket` に渡した絶対パス。任意で `--record <絶対パス>`（#1602。`create_new` + `0600`。既存は `RECORD_PATH_EXISTS`、祖先の検査は `RECORD_DIR_UNSAFE`、作成失敗は `RECORD_OPEN_FAILED`、書き出し・同期の失敗は `RECORD_WRITE_FAILED`。記録先は socket・log と別パス）。記録は `session::run_with_submit_hook` の提出フックで受け、セッションが正常・エラーのどちらで終わっても `finish` と `sync_all` を行い、集計行 `record_summary` を残す（書き出しの失敗は成功と装わず `RECORD_WRITE_FAILED`。セッションの失敗が先ならそちらを優先）。上限による停止はセッションの失敗ではなく終了コード 0。書き出しに失敗したファイルは件数と本体が合わず `validate` が拒否する。実機で採取したストリームはコミットしない
 - bind 前の検証（拒否時は何も作らず、既存のパスは消さない）: 絶対パス・成分に `.` / `..` / 空がない・NUL なし・ソケットとログが別パス（`PATH_NOT_ABSOLUTE` / `PATH_INVALID`）、ソケットパスが `sun_path` の 107 バイト以下（`PATH_TOO_LONG`。`linux/un.h` の `UNIX_PATH_MAX` 108 から NUL を除く）、ソケットの親ディレクトリが symlink でない・ディレクトリ・実行ユーザー（`/proc/self/status` の effective UID）の所有・モード `0700`（`SOCKET_DIR_SYMLINK` / `SOCKET_DIR_NOT_DIRECTORY` / `SOCKET_DIR_NOT_OWNED` / `SOCKET_DIR_NOT_PRIVATE`）、`/` までの祖先が存在し（無ければ拒否。検査後に別 UID が作って差し替えるのを防ぐ。ログの置き場所も同じ規則で `LOG_DIR_UNSAFE`）、symlink でなく自 UID か root の所有で、グループ／他者が書ける場合は sticky が立っている（`SOCKET_DIR_ANCESTOR_UNSAFE`。別 UID の rename 差し替えを防ぐ）、ソケットパスに何もない（`SOCKET_PATH_EXISTS`）。ソケットディレクトリ自身が無ければ（その親は検証済みで存在が必須）1 段だけ `DirBuilder` の mode `0700` で作る
 - ログ: `create_new` + `0600`（既存は `LOG_PATH_EXISTS`、symlink も `O_EXCL` で失敗）。`log::LogSink` が総量 4 MiB・1 行 512 バイト・10 万行の照合器の上限に収め、超えたら `venus_jig event=log_truncated reason=limit` を 1 回だけ書いて以降を捨てる。パス文字列・ゲスト由来のバイト列は出さない
 - 実行時エラーは stderr に 1 行の JSON `{"code","message"}`（`SESSION_FAILED` のみ `cause` にセッションの code）。終了コードは検証エラー 2、それ以外の失敗 1、正常終了 0

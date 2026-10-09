@@ -10,6 +10,8 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
+use crate::recording::{RecordSummary, StopReason};
+
 /// ログ全体の上限（バイト）。
 pub const MAX_LOG_BYTES: usize = 4 * 1024 * 1024;
 /// 1 行の上限（バイト）。超えた行は壊れた行として数える。
@@ -195,6 +197,27 @@ pub fn response_dropped_line() -> String {
 /// セッションが正常終了（frontend がメッセージ境界で切断）したときのログ行。
 pub fn session_end_line() -> String {
     "venus_jig event=session_end result=peer_closed".to_string()
+}
+
+/// 記録（`--record`）が上限で止まったことを示すログ行。理由は固定語彙、件数は数値だけを出す（パスは出さない）。
+/// 照合器（`find_capset_queries`）では `Other` に分類され、壊れた行に数えられない。停止ごとに 1 回だけ出る。
+pub fn record_stopped_line(reason: StopReason, records: u32) -> String {
+    format!(
+        "venus_jig event=record_stopped reason={} records={records}",
+        reason.as_str()
+    )
+}
+
+/// 終了時の記録の集計行。`write_ok` が偽なら `result=write_failed`（書き出しの失敗を成功と装わない）。
+/// 照合器では `Other` に分類される。
+pub fn record_summary_line(summary: &RecordSummary, write_ok: bool) -> String {
+    format!(
+        "venus_jig event=record_summary records={} skipped={} stopped={} result={}",
+        summary.records,
+        summary.skipped,
+        summary.stopped.map_or("none", StopReason::as_str),
+        if write_ok { "ok" } else { "write_failed" }
+    )
 }
 
 /// 照合結果。

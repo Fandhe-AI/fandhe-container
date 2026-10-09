@@ -189,3 +189,84 @@ pub fn used(fe: &Frontend) -> [u8; 12] {
     fe.mem.read_at(&mut u, 0x2000).expect("used");
     u
 }
+
+/// n 番目（0..4）の要求を ring 0 へ積んで kick し、call を待つ。descriptor は 2n（readable・NEXT）と 2n+1（writable）。
+#[allow(dead_code)]
+pub fn post(fe: &Frontend, n: u16, req: &[u8], writable_len: u32) {
+    let desc = |addr: u64, len: u32, flags: u16, next: u16| {
+        let mut d = Vec::new();
+        d.extend_from_slice(&addr.to_le_bytes());
+        d.extend_from_slice(&len.to_le_bytes());
+        d.extend_from_slice(&flags.to_le_bytes());
+        d.extend_from_slice(&next.to_le_bytes());
+        d
+    };
+    let req_addr = 0x4000 + u64::from(n) * 0x400;
+    let resp_addr = 0x5000 + u64::from(n) * 0x400;
+    let head = 2 * n;
+    let readable = u32::try_from(req.len()).expect("len");
+    fe.mem
+        .write_at(&desc(req_addr, readable, 1, head + 1), u64::from(head) * 16)
+        .expect("desc r");
+    fe.mem
+        .write_at(
+            &desc(resp_addr, writable_len, 2, 0),
+            u64::from(head + 1) * 16,
+        )
+        .expect("desc w");
+    fe.mem.write_at(req, req_addr).expect("req");
+    fe.mem
+        .write_at(&head.to_le_bytes(), 0x1004 + u64::from(n) * 2)
+        .expect("ring");
+    fe.mem
+        .write_at(&(n + 1).to_le_bytes(), 0x1002)
+        .expect("idx");
+    (&fe.kick).write_all(&1u64.to_le_bytes()).expect("kick");
+    wait_call(fe);
+}
+
+#[allow(dead_code)]
+pub fn resp_type(fe: &Frontend, n: u16) -> u32 {
+    let mut b = [0u8; 4];
+    fe.mem
+        .read_at(&mut b, 0x5000 + u64::from(n) * 0x400)
+        .expect("resp");
+    u32::from_le_bytes(b)
+}
+
+#[allow(dead_code)]
+pub fn used_len(fe: &Frontend, n: u16) -> u32 {
+    let mut b = [0u8; 4];
+    fe.mem
+        .read_at(&mut b, 0x2000 + 4 + u64::from(n) * 8 + 4)
+        .expect("used len");
+    u32::from_le_bytes(b)
+}
+
+#[allow(dead_code)]
+pub fn ctrl_req(cmd: u32, ctx: u32, total: usize, words: &[(usize, u32)]) -> Vec<u8> {
+    let mut v = vec![0u8; total];
+    v[..4].copy_from_slice(&cmd.to_le_bytes());
+    v[16..20].copy_from_slice(&ctx.to_le_bytes());
+    for (off, x) in words {
+        v[*off..*off + 4].copy_from_slice(&x.to_le_bytes());
+    }
+    v
+}
+
+/// `CTX_CREATE`（ctx_id=`ctx`、capset 4）の要求。
+#[allow(dead_code)]
+pub fn ctx_create_req(ctx: u32) -> Vec<u8> {
+    ctrl_req(0x0200, ctx, 96, &[(24, 3), (28, 4)])
+}
+
+/// `SUBMIT_3D`（ring_idx=0・`INFO_RING_IDX`）の要求。32 バイトの固定部の後ろに `body` を続ける。
+#[allow(dead_code)]
+pub fn submit_3d_req(ctx: u32, body: &[u8]) -> Vec<u8> {
+    let size = u32::try_from(body.len()).expect("body len");
+    let mut req = ctrl_req(0x0207, ctx, 32, &[(24, size)]);
+    req[4..8].copy_from_slice(&2u32.to_le_bytes());
+    req[20] = 0;
+    req.extend_from_slice(body);
+    req
+}

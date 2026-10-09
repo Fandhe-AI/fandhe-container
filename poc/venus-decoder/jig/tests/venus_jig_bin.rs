@@ -32,6 +32,7 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use super::common::*;
+    use fandhe_container_plugin_macos::gpu::venus::replay::{read_recording_file, validate};
     use fandhe_container_poc_venus_jig::log::{find_capset_queries, read_log_file};
 
     const BIN: &str = env!("CARGO_BIN_EXE_venus-jig");
@@ -126,6 +127,91 @@ mod linux {
         let report = find_capset_queries(&text).expect("report");
         assert_eq!(report.venus_get_capset_ok, 1);
         assert_eq!(report.malformed_lines, 0, "log: {text}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// GPU-6・TASK-172 F6・#1602: `--record` を付けると、受理した `SUBMIT_3D` の本体が 1 提出 1 レコードで
+    /// `0600` の記録ファイルへ書かれ、`replay::validate` を通り、本体は送ったバイト列と一致する。
+    #[test]
+    fn task1602_gpu6_bin_records_submits_and_file_validates() {
+        let dir = scratch();
+        let (sock, log, rec) = (
+            dir.join("s.sock"),
+            dir.join("jig.log"),
+            dir.join("rec.fcvns"),
+        );
+        let mut child = spawn(&[
+            "--socket",
+            sock.to_str().unwrap(),
+            "--log",
+            log.to_str().unwrap(),
+            "--record",
+            rec.to_str().unwrap(),
+            "--accept-timeout-ms",
+            "20000",
+            "--idle-timeout-ms",
+            "20000",
+        ]);
+        let front = connect_when_ready(&sock);
+        let fe = setup_ring0(front, 408, "binrec");
+        post(&fe, 0, &ctx_create_req(1), 408);
+        let mut a = vec![0u8; 256];
+        a[..4].copy_from_slice(&188u32.to_le_bytes());
+        a[4..8].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        let mut b = vec![0x5au8; 64];
+        b[..4].copy_from_slice(&188u32.to_le_bytes());
+        post(&fe, 1, &submit_3d_req(1, &a), 408);
+        post(&fe, 2, &submit_3d_req(1, &b), 408);
+        assert_eq!(resp_type(&fe, 2), 0x1100);
+        drop(fe);
+
+        let status = wait_exit(&mut child);
+        assert_eq!(status.code(), Some(0), "stderr: {}", stderr_of(child));
+        assert_eq!(fs::metadata(&rec).unwrap().mode() & 0o777, 0o600);
+        let bytes = read_recording_file(&rec).expect("read record");
+        let v = validate(&bytes).expect("validate");
+        assert_eq!(v.records().len(), 2);
+        assert_eq!(v.records()[0].payload, a.as_slice());
+        assert_eq!(v.records()[1].payload, b.as_slice());
+        assert_eq!(v.records()[0].header.seqno, 0);
+        assert_eq!(v.records()[1].header.seqno, 1);
+
+        let text = read_log_file(&log).expect("log readable");
+        let want = "venus_jig event=record_summary records=2 skipped=0 stopped=none result=ok";
+        assert!(text.lines().any(|l| l == want), "log: {text}");
+        assert_eq!(
+            find_capset_queries(&text).expect("report").malformed_lines,
+            0
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// GPU-6・TASK-172 F6・#1602: 既存の記録先は上書きせず、終了コード 2 で拒否し、ログもソケットも作らない。
+    #[test]
+    fn task1602_gpu6_bin_never_overwrites_an_existing_record_file() {
+        let dir = scratch();
+        let rec = dir.join("rec.fcvns");
+        fs::write(&rec, b"keep me").unwrap();
+        let (sock, log) = (dir.join("s.sock"), dir.join("jig.log"));
+        let mut child = spawn(&[
+            "--socket",
+            sock.to_str().unwrap(),
+            "--log",
+            log.to_str().unwrap(),
+            "--record",
+            rec.to_str().unwrap(),
+        ]);
+        let status = wait_exit(&mut child);
+        assert_eq!(status.code(), Some(2));
+        let err = stderr_of(child);
+        assert!(
+            err.starts_with("{\"code\":\"RECORD_PATH_EXISTS\","),
+            "stderr: {err}"
+        );
+        assert_eq!(err.lines().count(), 1);
+        assert_eq!(fs::read(&rec).unwrap(), b"keep me");
+        assert!(fs::symlink_metadata(&log).is_err());
+        assert!(fs::symlink_metadata(&sock).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 

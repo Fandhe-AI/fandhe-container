@@ -2,7 +2,8 @@
 //!
 //! 役割: 引数を集めて `launch` を呼び、エラーを stderr に 1 行の JSON（`code` / `message`）で出して終了コードを返すだけ。
 //! 処理の本体は lib の `launch`（UDS の bind・期限つき accept・ログのファイル出力）。治具 VMM（crosvm 等の
-//! vhost-user frontend）が `--socket` のパスへ接続する。Linux 限定で、他 OS では `UNSUPPORTED` を出して非ゼロで終わる。
+//! vhost-user frontend）が `--socket` のパスへ接続する。`--record <絶対パス>` を付けると、受理した `SUBMIT_3D` の本体を
+//! 記録ファイル（`create_new` + `0600`）へ書く（#1602。実機で採取したストリームはコミットしない）。Linux 限定で、他 OS では `UNSUPPORTED` を出して非ゼロで終わる。
 //! 実機での疎通は #725（人間担当）。
 
 // lib.rs の属性は bin には効かないため、ここにも付ける（unsafe は `sys` にだけ置く）。

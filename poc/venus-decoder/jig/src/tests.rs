@@ -494,3 +494,38 @@ fn d2_read_log_file_rejects_non_regular_without_opening() {
     assert_eq!(read_log_file(&bad), Err(LogFileError::NotUtf8));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// GPU-6・TASK-172 F6・#1602: 記録の 2 行は固定語彙と数値だけで、照合器は壊れた行に数えない。
+#[test]
+fn task1602_gpu6_record_lines_are_fixed_vocabulary_and_not_malformed() {
+    use crate::log::{find_capset_queries, record_stopped_line, record_summary_line};
+    use crate::recording::{RecordSummary, StopReason};
+    let stopped = record_stopped_line(StopReason::TooManyRecords, 3);
+    assert_eq!(
+        stopped,
+        "venus_jig event=record_stopped reason=too_many_records records=3"
+    );
+    let ok = RecordSummary {
+        records: 2,
+        skipped: 0,
+        stopped: None,
+    };
+    let done = record_summary_line(&ok, true);
+    assert_eq!(
+        done,
+        "venus_jig event=record_summary records=2 skipped=0 stopped=none result=ok"
+    );
+    let cut = RecordSummary {
+        records: 1,
+        skipped: 4,
+        stopped: Some(StopReason::RecordingTooLarge),
+    };
+    let failed = record_summary_line(&cut, false);
+    assert_eq!(
+        failed,
+        "venus_jig event=record_summary records=1 skipped=4 stopped=recording_too_large result=write_failed"
+    );
+    let report = find_capset_queries(&[stopped, done, failed].join("\n")).expect("report");
+    assert_eq!(report.malformed_lines, 0);
+    assert_eq!(report.venus_get_capset_ok, 0);
+}

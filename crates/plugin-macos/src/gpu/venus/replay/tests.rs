@@ -420,10 +420,25 @@ fn c1_rejects_symlink() {
 fn c1_rejects_fifo_without_blocking() {
     let p = tmp_path("fifo");
     // 前提（mkfifo の起動と成功）が満たせない環境ではテストを失敗させる（skip で成功扱いにしない）。
-    let made = std::process::Command::new("mkfifo")
+    // REPAIR-5: 子プロセスの終了待ちにも期限を設け、超過時は kill して回収し失敗させる。
+    const MKFIFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const MKFIFO_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+    let mut child = std::process::Command::new("mkfifo")
         .arg(&p)
-        .status()
+        .spawn()
         .expect("mkfifo must be runnable to verify FIFO rejection");
+    let deadline = std::time::Instant::now() + MKFIFO_TIMEOUT;
+    let made = loop {
+        match child.try_wait().expect("try_wait on mkfifo") {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("mkfifo did not finish within {MKFIFO_TIMEOUT:?}");
+            }
+            None => std::thread::sleep(MKFIFO_POLL),
+        }
+    };
     assert!(made.success(), "mkfifo must succeed: {made:?}");
     let (tx, rx) = std::sync::mpsc::channel();
     let p2 = p.clone();

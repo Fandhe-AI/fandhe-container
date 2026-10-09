@@ -505,6 +505,9 @@ pub(crate) fn sweep_exec_children_at(
 }
 
 /// 掃除の方式ごとの記録先の操作名（REPAIR-4）。`OpName` の許容文字だけで作る固定文字列。
+///
+/// `KillAll` は持ち主・`populated` で残す判定を持たないため、`left_*` の操作には記録されない（方式によらず
+/// 同じ形の名前の組を持つのは、件数の型 [`ExecChildSweep`] と対応させるため）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SweepOpNames {
     /// 掃除 1 回の成否とレイテンシ。

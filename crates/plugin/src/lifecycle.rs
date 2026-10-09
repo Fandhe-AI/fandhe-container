@@ -1453,8 +1453,10 @@ mod tests {
         let make_ignoring = |tag: &str| {
             let marker = marker_dir.join(format!("fcos-trap-{}-{tag}", std::process::id()));
             let _ = std::fs::remove_file(&marker);
-            let script = format!("trap '' HUP; touch '{}'; exec sleep 30", marker.display());
-            (script, marker)
+            // パスはシェルの文字列へ埋め込まず位置引数（`$1`）で渡す（`TMPDIR` に `'` 等を含んでも壊れない）。
+            let mut cmd = sh("trap '' HUP; touch \"$1\"; exec sleep 30");
+            cmd.arg("sh").arg(&marker);
+            (cmd, marker)
         };
         let wait_marker = |m: &std::path::Path| {
             let start = Instant::now();
@@ -1465,8 +1467,8 @@ mod tests {
             let _ = std::fs::remove_file(m);
         };
         // kill_and_reap
-        let (script, marker) = make_ignoring("a");
-        let mut g = spawn_registered(&mut sh(&script), reg).unwrap();
+        let (mut cmd, marker) = make_ignoring("a");
+        let mut g = spawn_registered(&mut cmd, reg).unwrap();
         wait_marker(&marker);
         assert_eq!(targets(reg), 1);
         assert!(g.kill_and_reap().is_reaped());
@@ -1480,8 +1482,8 @@ mod tests {
         }
         assert_eq!(targets(reg), 0);
         // 生存中の try_wait は登録を保つ
-        let (script, marker) = make_ignoring("b");
-        let mut live = spawn_registered(&mut sh(&script), reg).unwrap();
+        let (mut cmd, marker) = make_ignoring("b");
+        let mut live = spawn_registered(&mut cmd, reg).unwrap();
         wait_marker(&marker);
         assert!(live.try_wait().unwrap().is_none());
         assert_eq!(targets(reg), 1);

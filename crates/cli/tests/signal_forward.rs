@@ -5,8 +5,12 @@
 //! - ランナー（通常の `#[test]`）: 親役を起動し、親役の pid だけへシグナルを送る。plugin の停止は
 //!   端末のグループ配送ではなく転送の結果であることの証拠になる
 //! - 親役（`parent_entry`。`FCSF_ROLE=parent`）: ハンドラを登録し、常駐 plugin と都度起動 plugin を起動する
-//! - plugin 役（`plugin_entry`。`PLUGIN_SOCKET_ENV` 設定時）: 接続後に pid をファイルへ書き、応答せず待つ
-//!   （EOF を読まないので、停止は転送されたシグナルによる）
+//! - plugin 役（`plugin_entry`。`PLUGIN_SOCKET_ENV` 設定時）: 孫（`/bin/sleep`）を起動し、接続後に自分と
+//!   孫の pid をファイルへ書き、応答せず待つ（EOF を読まないので、停止は転送されたシグナルによる）
+//!
+//! 孫は plugin と同じプロセスグループ（#1311 で plugin は独立したグループの先頭として起動される）に属し、
+//! 既定のシグナル処理のまま待つ。`PR_SET_PDEATHSIG` は直接の子（plugin 本体）にしか効かないため、孫の
+//! 停止は転送がグループ宛て（`kill(-pid)`）で届いたことの証拠になる（#1311・#1513・PLUG-7）。
 //!
 //! 親が受けたシグナルでの終了検証（`run_case`）では、Linux の plugin が `PR_SET_PDEATHSIG(SIGKILL)` で
 //! 親の死に追従するため、plugin の停止だけでは転送の有無を区別できない。そこで転送の受信は、親を
@@ -105,17 +109,29 @@ fn plugin_entry() {
     )
     .unwrap();
     let name = sock.file_name().unwrap().to_string_lossy().into_owned();
+    // 孫は既定のシグナル処理のまま（SIGINT も無視しない）待つ。自前の上限で終了し、テストが失敗しても
+    // 残留は有限。回収は plugin 役の終了後に init（またはサブリーパー）が行う。
+    #[allow(clippy::zombie_processes)]
+    let grandchild = Command::new("/bin/sleep")
+        .arg("40")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
     // 応答も読み取りもしない。受信したシグナル番号を記録して終了する（記録はハンドラ外で行う）。
     for sig in [1, 2, 15] {
         fandhe_container_cli::signals::install_recording_handler_for_test(sig).unwrap();
     }
-    // 全ハンドラの登録後に PID ファイル（準備完了の合図）を公開する。先に公開すると、転送が先に届いて
-    // 既定動作で終了し得る。
+    // 全ハンドラの登録後に PID ファイル（準備完了の合図。1 行目が自分、2 行目が孫）を公開する。先に公開すると、
+    // 転送が先に届いて既定動作で終了し得る。読み手が書きかけを読まないよう一時ファイルから rename する。
+    let tmp = sock.with_file_name(format!("{name}.pid.tmp"));
     std::fs::write(
-        sock.with_file_name(format!("{name}.pid")),
-        std::process::id().to_string(),
+        &tmp,
+        format!("{}\n{}\n", std::process::id(), grandchild.id()),
     )
     .unwrap();
+    std::fs::rename(&tmp, sock.with_file_name(format!("{name}.pid"))).unwrap();
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(40) {
         let sig = fandhe_container_cli::signals::recorded_signal_for_test();
@@ -217,7 +233,8 @@ fn is_alive(pid: u32) -> bool {
 /// 失敗時にも親役を残さない。
 ///
 /// plugin 役へは SIGKILL を送らない。plugin 役は終了済みで pid が再利用され得るうえ、Linux では親役の
-/// kill で `PR_SET_PDEATHSIG` により停止し、その他でも自前の期限（40 秒）で終了するため。
+/// kill で `PR_SET_PDEATHSIG` により停止し、その他でも自前の期限（40 秒）で終了するため。孫（`/bin/sleep 40`）
+/// も同じ理由で送らず、自前の期限で終了させる。
 struct Cleanup {
     parent: Child,
 }
@@ -229,8 +246,24 @@ impl Drop for Cleanup {
     }
 }
 
-/// `dir` に `resident-*.pid` と `oneshot-*.pid` が揃うのを待ち、(resident, one_shot) の pid を返す。
-fn wait_plugin_pids(dir: &Path) -> (u32, u32) {
+/// 各 plugin 役（常駐・都度起動）が公開した pid。
+struct PluginPids {
+    resident: u32,
+    one_shot: u32,
+    /// 常駐・都度起動の plugin 役がそれぞれ起動した孫の pid。
+    grandchildren: [u32; 2],
+}
+
+/// PID ファイル（1 行目が plugin 役、2 行目が孫）を (plugin, 孫) として読む。
+fn parse_pid_file(text: &str) -> Option<(u32, u32)> {
+    let mut lines = text.lines();
+    let plugin = lines.next()?.trim().parse().ok()?;
+    let grandchild = lines.next()?.trim().parse().ok()?;
+    Some((plugin, grandchild))
+}
+
+/// `dir` に `resident-*.pid` と `oneshot-*.pid` が揃うのを待ち、plugin 役と孫の pid を返す。
+fn wait_plugin_pids(dir: &Path) -> PluginPids {
     let start = Instant::now();
     loop {
         let mut resident = None;
@@ -240,17 +273,21 @@ fn wait_plugin_pids(dir: &Path) -> (u32, u32) {
             if !name.ends_with(".sock.pid") {
                 continue;
             }
-            let pid = std::fs::read_to_string(entry.path())
+            let pids = std::fs::read_to_string(entry.path())
                 .ok()
-                .and_then(|t| t.trim().parse::<u32>().ok());
+                .and_then(|t| parse_pid_file(&t));
             if name.starts_with("resident-") {
-                resident = pid.or(resident);
+                resident = pids.or(resident);
             } else if name.starts_with("oneshot-") {
-                one_shot = pid.or(one_shot);
+                one_shot = pids.or(one_shot);
             }
         }
-        if let (Some(r), Some(o)) = (resident, one_shot) {
-            return (r, o);
+        if let (Some((r, rg)), Some((o, og))) = (resident, one_shot) {
+            return PluginPids {
+                resident: r,
+                one_shot: o,
+                grandchildren: [rg, og],
+            };
         }
         assert!(start.elapsed() < WAIT, "plugins did not become ready");
         std::thread::sleep(Duration::from_millis(20));
@@ -270,8 +307,14 @@ fn run_case(sig_name: &str, sig_num: i32) {
         .unwrap();
     let parent_pid = parent.id();
     let mut cleanup = Cleanup { parent };
-    let (resident, one_shot) = wait_plugin_pids(&dir.0);
-    assert!(is_alive(resident) && is_alive(one_shot));
+    let pids = wait_plugin_pids(&dir.0);
+    assert!(is_alive(pids.resident) && is_alive(pids.one_shot));
+    for gc in pids.grandchildren {
+        assert!(
+            is_alive(gc),
+            "grandchild {gc} is not running before SIG{sig_name}"
+        );
+    }
 
     // 親だけへ送る。plugin の停止は転送の結果になる。
     send(sig_name, parent_pid);
@@ -291,12 +334,29 @@ fn run_case(sig_name: &str, sig_num: i32) {
     assert_eq!(status.signal(), Some(sig_num), "SIG{sig_name}: {status:?}");
 
     // A1: 都度起動・常駐の両 plugin が停止する。
-    for pid in [resident, one_shot] {
+    for pid in [pids.resident, pids.one_shot] {
         let start = Instant::now();
         while is_alive(pid) {
             assert!(
                 start.elapsed() < WAIT,
                 "plugin pid {pid} survived SIG{sig_name}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    // #1311: 孫も停止する。Linux の `PR_SET_PDEATHSIG` は孫に届かないため、転送がグループ宛てで
+    // 孫まで届いたことの確認になる。
+    assert_grandchildren_stop(&pids, &format!("SIG{sig_name}"));
+}
+
+/// 孫（plugin 役が起動した `/bin/sleep`）が有限の期限内に停止することを pid で確かめる（#1311・PLUG-7）。
+fn assert_grandchildren_stop(pids: &PluginPids, what: &str) {
+    for gc in pids.grandchildren {
+        let start = Instant::now();
+        while is_alive(gc) {
+            assert!(
+                start.elapsed() < WAIT,
+                "grandchild pid {gc} survived {what}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -318,7 +378,7 @@ fn run_direct_case(sig_num: i32) {
         .spawn()
         .unwrap();
     let mut cleanup = Cleanup { parent };
-    let _ = wait_plugin_pids(&dir.0);
+    let pids = wait_plugin_pids(&dir.0);
     std::fs::write(dir.0.join(TRIGGER_FILE), sig_num.to_string()).unwrap();
 
     let start = Instant::now();
@@ -342,11 +402,14 @@ fn run_direct_case(sig_num: i32) {
     for (name, content) in &records {
         assert_eq!(content.trim(), sig_num.to_string(), "{name}");
     }
+    // #1311: 親が生存したままでも孫が止まる（PDEATHSIG ではなくグループ宛ての転送による）。
+    assert_grandchildren_stop(&pids, &format!("forwarded signal {sig_num}"));
     // 親は生存したまま（停止は親の死ではなく転送によるもの）。
     assert!(cleanup.parent.try_wait().unwrap().is_none());
 }
 
-/// PLUG-7・#1513: 転送された SIGINT・SIGTERM・SIGHUP の番号が、都度起動・常駐の両 plugin に届く。
+/// PLUG-7・#1513・#1311: 転送された SIGINT・SIGTERM・SIGHUP の番号が、都度起動・常駐の両 plugin に届き、
+/// グループ宛てで孫も止まる。
 #[test]
 fn plug7_forwarded_signal_number_reaches_both_plugins() {
     run_direct_case(2);
@@ -354,19 +417,19 @@ fn plug7_forwarded_signal_number_reaches_both_plugins() {
     run_direct_case(1);
 }
 
-/// PLUG-7・#1513: SIGINT を転送し、親は SIGINT で終了する。
+/// PLUG-7・#1513・#1311: SIGINT を転送し、親は SIGINT で終了する。plugin と孫が止まる。
 #[test]
 fn plug7_sigint_is_forwarded_and_parent_exits_by_signal() {
     run_case("INT", 2);
 }
 
-/// PLUG-7・#1513: SIGTERM を転送し、親は SIGTERM で終了する。
+/// PLUG-7・#1513・#1311: SIGTERM を転送し、親は SIGTERM で終了する。plugin と孫が止まる。
 #[test]
 fn plug7_sigterm_is_forwarded_and_parent_exits_by_signal() {
     run_case("TERM", 15);
 }
 
-/// PLUG-7・#1513: SIGHUP を転送し、親は SIGHUP で終了する。
+/// PLUG-7・#1513・#1311: SIGHUP を転送し、親は SIGHUP で終了する。plugin と孫が止まる。
 #[test]
 fn plug7_sighup_is_forwarded_and_parent_exits_by_signal() {
     run_case("HUP", 1);
@@ -391,7 +454,7 @@ fn plug7_sighup_ignored_at_startup_is_kept_and_not_forwarded() {
         .unwrap();
     let parent_pid = parent.id();
     let mut cleanup = Cleanup { parent };
-    let (resident, one_shot) = wait_plugin_pids(&dir.0);
+    let pids = wait_plugin_pids(&dir.0);
 
     send("HUP", parent_pid);
 
@@ -404,5 +467,5 @@ fn plug7_sighup_ignored_at_startup_is_kept_and_not_forwarded() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(is_alive(resident) && is_alive(one_shot));
+    assert!(is_alive(pids.resident) && is_alive(pids.one_shot));
 }

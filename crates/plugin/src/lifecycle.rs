@@ -18,6 +18,14 @@
 //!   含む）を元のエラーに代えて返す。報告した pid の子は、この呼び出しではそれ以降回収しない
 //!   （報告後に回収すると、解放済みの pid を未回収として伝えることになるため）。子は終了済みでも
 //!   ゾンビとして残り、親プロセスの終了時に OS が引き取る。呼び出し側はその pid を未回収として扱う。
+//! - プロセスグループの停止失敗（#1311）: 直接の子は回収できたが、子のプロセスグループ宛ての kill が
+//!   失敗して孫の停止を保証できない場合、応答前の失敗経路では元のエラーの `code` と `message` を保ち、
+//!   `message` に `process group could not be killed` の付記を加えて返す（`with_group_kill_failure`。
+//!   元の失敗の分類を失わず、孫が残り得ることも黙らない）。元のエラーが無い経路（応答後・常駐の
+//!   shutdown）は未回収の子とは別の `Internal`（同じ文言を含み、解放済みの子の pid は含めない）を返す。
+//!   いずれも `could not be reaped` とは報告しない（PLUG-7・REPAIR-5）。macOS はゾンビだけのグループへの
+//!   `killpg` にも `EPERM` を返すため、接続後・応答前に plugin が終了した場合は孫がいなくても付記が付き得る
+//!   （`EPERM` を許容しない理由は `group_kill_tolerated` の doc）。
 //! - 子の環境変数は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ設定する（資格情報を継承させない）。
 //!   stdin / stdout は null。stderr は親へ継承させず、専用の UNIX ソケット対で受けて
 //!   [`OneShotStderr`] として返す（untrusted。保持は [`ONE_SHOT_STDERR_MAX_BYTES`] まで。超過分は
@@ -41,9 +49,19 @@
 //! - 外部管理の常駐 plugin への再接続（attach）と、観測記録を受け取る統一 API（`mode` の冒頭を参照）。
 //! - 起動対象の信頼性検証（所有者・モード・sha256 照合。TASK-122・PLUG-11）。本 API は検証を
 //!   行わず、呼び出し側が検証済みの絶対パスを渡すことを前提とする。
-//! - 孫プロセスの回収（プロセスグループ単位の kill は未対応）。孫が stderr の書き込み端を保持し
-//!   続けた場合、収集は [`ONE_SHOT_STDERR_DRAIN_TIMEOUT`] で打ち切り、[`OneShotStderr::is_complete`]
-//!   が false になる。打ち切り後は読み取り側を閉じるため、孫の以後の書き込みは `EPIPE` になる。
+//! - 孫プロセスの回収の残る制限（#1311）。タイムアウト・後始末の kill は子のプロセスグループ全体へ
+//!   送るため孫も止まるが、(a) plugin が自発終了・正常終了して先に回収した経路（回収後は pid が再利用
+//!   され得るためグループへ送らない）、(b) `setsid` / `setpgid` でグループを抜けた孫（plugin 本体が抜けた場合、
+//!   グループ宛ての kill・転送は旧グループに残った孫にだけ届き、本体は `Child::kill` のフォールバックで
+//!   止めて回収する。本体が抜けた後に起動した孫は届かない）、(c) Windows
+//!   （プロセスグループ単位の kill が無く、相当する Job Object は別タスク）では孫が残る。孫が stderr の
+//!   書き込み端を保持し続けた場合、収集は [`ONE_SHOT_STDERR_DRAIN_TIMEOUT`] で打ち切り、
+//!   [`OneShotStderr::is_complete`] が false になる。打ち切り後は読み取り側を閉じるため、孫の以後の
+//!   書き込みは `EPIPE` になる。子は親と別のプロセスグループになるため、端末由来のシグナル（Ctrl-C 等）は
+//!   カーネルからは届かない。親が受けた SIGINT・SIGTERM・SIGHUP は CLI バイナリのハンドラが
+//!   `signal_forward` 経由でグループ宛て（`kill(-pid)`）に転送し、孫まで届く（#1513）。親が SIGKILL・
+//!   abort で落ちた場合は転送されず、Linux の `PR_SET_PDEATHSIG` が止めるのは plugin 本体だけで孫は
+//!   残留し得る。macOS では plugin 本体も孫も残留し得る（kqueue `NOTE_EXIT` は将来課題）。
 //! - 要求 ID と応答 ID の対応づけ（TASK-114）。
 
 mod mode;
@@ -202,9 +220,20 @@ pub enum OneShotTermination {
     Exited { code: Option<i32> },
     /// 猶予内に終了せず強制終了し、回収まで確認した（回収した終了状態が強制終了によるもの）。
     Killed,
-    /// 強制終了を試みたが、[`ONE_SHOT_REAP_TIMEOUT`] 内に回収を確認できなかった（kill 失敗を含む）。
-    /// 呼び出し側は孤児の可能性として扱う（REPAIR-5・PLUG-7）。
+    /// 強制終了を試みたが、[`ONE_SHOT_REAP_TIMEOUT`] 内に直接の子の回収を確認できなかった（直接の子への
+    /// kill 失敗を含む）。呼び出し側は孤児の可能性として扱う（REPAIR-5・PLUG-7）。
     Unreaped,
+    /// 直接の子は回収済み（pid は解放済み）だが、子のプロセスグループ宛ての kill が失敗し、孫プロセスの
+    /// 停止を保証できない（#1311・PLUG-7・REPAIR-5）。未回収の子（[`Self::Unreaped`]）とは別の結果で、
+    /// 成功した呼び出しの結果には現れない（呼び出しは `Internal` で失敗する）。
+    ///
+    /// 契約の限界: 送信自体が失敗した場合だけを表す。Linux の `killpg` は 1 プロセスにでも送れれば成功する
+    /// ため、setuid 実行ファイル等で UID を変えた孫には SIGKILL が届かず残り得る。この部分配送による
+    /// 残留は検出できず保証対象外（全数停止は cgroup・pidfd 等を要する別課題）。逆に macOS は、ゾンビだけの
+    /// グループ（孫がいない）への `killpg` にも `EPERM` を返し、生存者への権限不足と区別できないため、
+    /// 孫がいなくても本結果になり得る（fail-closed。応答後の経路は先に `try_wait` で回収するため通常は
+    /// 起きず、主に応答前の失敗経路で `reap_after_failure` の付記として現れる）。
+    GroupKillFailed,
 }
 
 /// plugin が stderr へ書いた内容の収集結果（untrusted。出所は起動した plugin プロセス）。
@@ -469,7 +498,9 @@ impl OneShotOutcome {
 /// 子プロセスを保持し、Drop で kill・回収を試みるガード（panic 等の早期離脱でも子を残さない）。
 ///
 /// 回収の成否を呼び出し側へ返す責務は明示的な [`Self::kill_and_reap`] / [`Self::wait_or_kill`] の
-/// 呼び出しが担う。未回収として報告した後（[`unreaped_error`]）は `Drop` で回収しない。報告後に回収
+/// 呼び出しが担う。直接の子の未回収（`Unreaped`）と、直接の子は回収済みでプロセスグループの停止だけが
+/// 失敗した場合（`GroupKillFailed`）は別の結果として返し、呼び出し側はそれぞれ [`unreaped_error`]・
+/// [`group_kill_failed_error`] で報告する（#1311・PLUG-7・REPAIR-5）。未回収として報告した後（[`unreaped_error`]）は `Drop` で回収しない。報告後に回収
 /// すると、呼び出し側へ伝えた pid が解放済みになり、別プロセスを指し得るため（kill は報告前に送信
 /// 済みで、`Drop` での再試行は待ち時間を延ばすだけになる）。
 struct ChildGuard {
@@ -480,8 +511,14 @@ struct ChildGuard {
     /// 解放する。回収後に再利用された pid へシグナルを送らないための構造で、回収は必ず
     /// [`Self::try_wait`] / [`Self::kill_and_reap`] を経由する。
     slot: Option<SlotToken>,
+    /// 直接の子（プロセスグループのリーダー）を wait 済みか、追跡できなくなったか。true ならグループ宛ての
+    /// 送信をしない。回収後は pid（= pgid）が再利用され得るため、別プロセスのグループへ誤送信しないための印。
+    /// `try_wait` が `Some` を返した時点（[`Self::release_reaped`]）と終端化（[`Self::mark_lost`]）で立てる
+    /// （#1311・PLUG-7・REPAIR-5）。
+    leader_reaped: bool,
     /// 子の状態を追跡できなくなったか（`waitpid` が失敗した。主に `ECHILD`＝契約外の回収者による回収）。
-    /// true なら `child` と `slot` は手放し済みで、以後 kill も回収も転送もしない終端状態（[`Reap::Lost`]）。
+    /// true なら `child` と `slot` は手放し済みで、以後 kill（プロセスグループ宛てを含む）も回収も転送もしない
+    /// 終端状態（[`Reap::Lost`]。#1513）。
     lost: bool,
 }
 
@@ -491,6 +528,7 @@ impl ChildGuard {
             child: Some(child),
             reported_unreaped: false,
             slot: None,
+            leader_reaped: false,
             lost: false,
         }
     }
@@ -531,8 +569,11 @@ impl ChildGuard {
         }
         let result = c.try_wait();
         match result {
-            // 回収した。pid は再利用され得るため、登録を戻さず解放する。
-            Ok(Some(_)) => self.slot = None,
+            // 回収した。pid は再利用され得るため、登録を戻さず解放する。グループ宛ての送信も止める。
+            Ok(Some(_)) => {
+                self.slot = None;
+                self.leader_reaped = true;
+            }
             Ok(None) => {
                 if let Some(slot) = &self.slot {
                     slot.resume();
@@ -544,18 +585,29 @@ impl ChildGuard {
         result
     }
 
+    /// 子を回収済みとして手放す。以後 `kill_and_reap` は何も送らない。
+    fn release_reaped(&mut self) {
+        self.child = None;
+        self.slot = None;
+        self.leader_reaped = true;
+    }
+
     /// 子を追跡できない終端状態にする。登録表のスロットを解放し（以後転送しない）、`Child` を手放す
     /// （以後 `kill` しない。std の `Child::kill` は回収済みを知らない限り `kill(pid)` を送るため、
     /// 再利用された pid へ SIGKILL を送らないよう保持しない）。`Child` の破棄は kill も wait もしない。
+    /// pgid（= pid）も再利用され得るため、プロセスグループ宛ての SIGKILL も以後送らない（#1311）。
     fn mark_lost(&mut self) {
         self.slot = None;
         self.child = None;
+        self.leader_reaped = true;
         self.lost = true;
     }
 
     /// kill して回収を `ONE_SHOT_REAP_TIMEOUT` まで待つ。
     ///
     /// kill の失敗は無視せず、回収確認ができなければ `Unreaped` を返す（呼び出し側が報告する）。
+    /// 直接の子を回収できてもグループ宛ての送信が許容外のエラーで失敗した場合は `GroupKillFailed` を
+    /// 返す（子は手放し済みで、未回収とは区別する）。
     /// 回収できなかった場合は `Child` を保持し続ける（呼び出し側が pid を報告できるよう手放さない）。
     /// 回収できた場合は終了状態を捨てずに返す。kill の直前・直後に子が自発終了していた場合、
     /// 回収される状態は「こちらの kill」ではなく子自身の終了状態になるため、呼び出し側が
@@ -581,36 +633,81 @@ impl ChildGuard {
         if let Some(slot) = self.slot.take()
             && !slot.suspend()
         {
+            // 直接の子は未回収なので pid（= pgid）は再利用されず、グループへの送信は安全。通常経路と同じく
+            // macOS の exec 窓の一過性 `EPERM` を再送で吸収する（`kill_group_retrying_eperm`）。結果は
+            // 直接の子の未回収（`Unreaped`）が優先するため使わない（`Drop` は報告後に再送しない）。
+            #[cfg(unix)]
+            if !self.leader_reaped {
+                let _ = kill_group_retrying_eperm(c.id());
+            }
             let _ = c.kill();
             self.slot = Some(slot);
             return Reap::Unreaped;
         }
+        // 子のプロセスグループ全体（孫を含む）へ SIGKILL を 1 回送る（#1311）。リーダーを自分がまだ
+        // wait していない間に限る。ゾンビでも未回収の間は pid（= pgid）が再利用されないため、送信先は
+        // 自分が起動したグループに限られる（契約外の回収者を除く。下記）。最初の `try_wait` より前に送るのは、自発終了済み（ゾンビ）の
+        // 子を先に回収すると孫へ送る安全な機会を失うため（ゾンビの終了状態はシグナルで変わらず、
+        // `classify_reaped` の区別は保たれる）。許容するエラーは「グループに生存者がいない」ことを
+        // 示すものに限る（`group_kill_tolerated`）。それ以外の失敗は孫の停止を保証できないため、
+        // 直接の子を回収できても `GroupKillFailed` を返す（成功扱いにしない。回収済みの子を未回収とも
+        // 報告しない。PLUG-7・REPAIR-5）。直接の子も回収できなければ `Unreaped` が優先する。
+        //
+        // 残る窓（#1513・`signal_forward` の「制限」と同じ契約外の場合）: 利用側が子を回収していた
+        // （`SIGCHLD` の `SIG_IGN`・`waitpid(-1)` 等）場合、この送信はそれを観測する前に行われる。上の
+        // suspend 失敗時の `Child::kill` と同じ扱いで、回収しない確認には `waitid` の `WNOWAIT` が要る。
+        // ただし pid はその値のプロセスグループに生存メンバーがいる間は再利用されないため、孫が 1 つでも
+        // 生きていれば宛先は自分のグループのままで、誤配送は「グループが空になり、かつ再利用された pid が
+        // 新しいグループのリーダーになった」場合に限られる。`waitpid` の失敗を観測した後は終端
+        // （[`Self::mark_lost`]）にし、以後はグループ宛てを含めて何も送らない。
+        #[cfg(unix)]
+        let group_failed = !self.leader_reaped
+            && kill_group_retrying_eperm(c.id())
+                .err()
+                .is_some_and(|e| !group_kill_tolerated(&e));
+        #[cfg(not(unix))]
+        let group_failed = false;
         // kill の前に終了済みかを確認し、自発終了の状態をそのまま拾う（kill との競合窓を狭める）。
-        // 失敗（他所で回収済み等）なら kill を送らない（再利用された pid を撃たない。fail-closed）。
+        // 失敗（他所で回収済み等）なら以後 kill を送らない（再利用された pid・pgid を撃たない。fail-closed）。
         match c.try_wait() {
             Ok(Some(status)) => {
-                self.child = None;
+                self.release_reaped();
+                if group_failed {
+                    return Reap::GroupKillFailed;
+                }
                 return Reap::Reaped(status);
             }
             Ok(None) => {}
+            // グループ停止の失敗は、リーダーを誰が回収したかと無関係に孫が残り得るため優先して返す。
             Err(_) => {
                 self.mark_lost();
+                if group_failed {
+                    return Reap::GroupKillFailed;
+                }
                 return Reap::Lost;
             }
         }
+        // setsid / setpgid でグループを抜けた plugin 本体も確実に止めるフォールバック。
         let _ = c.kill();
         let start = Instant::now();
         let mut interval = Duration::from_millis(1);
         loop {
             match c.try_wait() {
                 Ok(Some(status)) => {
-                    self.child = None;
+                    self.release_reaped();
+                    if group_failed {
+                        return Reap::GroupKillFailed;
+                    }
                     return Reap::Reaped(status);
                 }
                 Ok(None) => {}
                 // kill の後に他所で回収された（ECHILD）等。`Child` を残すと `Drop` が再び kill するため手放す。
+                // グループ停止の失敗は `Ok(Some)` と同じく優先して返す（孫が残り得る）。
                 Err(_) => {
                     self.mark_lost();
+                    if group_failed {
+                        return Reap::GroupKillFailed;
+                    }
                     return Reap::Lost;
                 }
             }
@@ -630,7 +727,7 @@ impl ChildGuard {
         loop {
             match self.try_wait() {
                 Ok(Some(status)) => {
-                    self.child = None;
+                    self.release_reaped();
                     return OneShotTermination::Exited {
                         code: status.code(),
                     };
@@ -644,14 +741,24 @@ impl ChildGuard {
             std::thread::sleep(interval);
             interval = (interval * 2).min(POLL_MAX);
         }
-        match self.kill_and_reap() {
-            Reap::Reaped(status) => classify_reaped(status),
-            // 他所で回収された。孤児ではないが終了状態は失われたため、終了コード不明の終了として返す
-            // （呼び出し側で成功扱いにならない。`call_once` は `Unavailable`、常駐の終了は `exited_error`）。
-            Reap::Lost => OneShotTermination::Exited { code: None },
-            // 既に回収済みのガードに対して呼ばれることはないが、終了状態が不明なため成功扱いしない。
-            Reap::AlreadyReaped | Reap::Unreaped => OneShotTermination::Unreaped,
-        }
+        termination_after_kill(self.kill_and_reap())
+    }
+}
+
+/// 終了猶予の超過後に行った [`ChildGuard::kill_and_reap`] の結果を終了状況へ写す（PLUG-7・REPAIR-5）。
+///
+/// グループ停止の失敗（直接の子は回収済み）は未回収の子と区別して保つ。`Unreaped` へ畳むと、呼び出し側が
+/// 回収済みの子を「回収できなかった」と誤って報告するため（#1311）。
+fn termination_after_kill(reap: Reap) -> OneShotTermination {
+    match reap {
+        Reap::Reaped(status) => classify_reaped(status),
+        // 孫の停止を保証できないため成功扱いにしないが、直接の子は回収済みなので未回収にもしない。
+        Reap::GroupKillFailed => OneShotTermination::GroupKillFailed,
+        // 他所で回収された。孤児ではないが終了状態は失われたため、終了コード不明の終了として返す
+        // （呼び出し側で成功扱いにならない。`call_once` は `Unavailable`、常駐の終了は `exited_error`。#1513）。
+        Reap::Lost => OneShotTermination::Exited { code: None },
+        // 既に回収済みのガードに対して呼ばれることはないが、終了状態が不明なため成功扱いしない。
+        Reap::AlreadyReaped | Reap::Unreaped => OneShotTermination::Unreaped,
     }
 }
 
@@ -663,6 +770,54 @@ impl Drop for ChildGuard {
     }
 }
 
+/// `EPERM` が出た間だけ短時間再送する上限（#1311・PLUG-7・REPAIR-5）。
+#[cfg(unix)]
+const GROUP_KILL_EPERM_RETRY: Duration = Duration::from_millis(200);
+
+/// プロセスグループへ `SIGKILL` を送る。`EPERM` のときだけ [`GROUP_KILL_EPERM_RETRY`] まで再送する。
+///
+/// macOS は spawn 直後で plugin 本体が `exec` 中の窓にも `kill(2)` が `EPERM` を返すことがあり、この一過性の
+/// 失敗を 1 回で確定すると生存中のグループを `GroupKillFailed` と誤報し、直後の `Child::kill` も同じ窓で
+/// 失敗して回収できなくなる。窓は短いので再送で解消する。ゾンビのみのグループの `EPERM` は解消しないため、
+/// 上限後は最後のエラーをそのまま返し、呼び出し側が `GroupKillFailed` として報告する（成功扱いにしない）。
+/// 呼び出し側の不変条件（リーダー未回収）は [`crate::sys::kill_process_group`] と同じ。
+#[cfg(unix)]
+fn kill_group_retrying_eperm(pgid: u32) -> io::Result<()> {
+    const EPERM: i32 = 1;
+    let start = Instant::now();
+    let mut interval = Duration::from_millis(1);
+    loop {
+        match crate::sys::kill_process_group(pgid) {
+            Err(e)
+                if e.raw_os_error() == Some(EPERM) && start.elapsed() < GROUP_KILL_EPERM_RETRY =>
+            {
+                std::thread::sleep(interval);
+                interval = (interval * 2).min(POLL_MAX);
+            }
+            other => return other,
+        }
+    }
+}
+
+/// プロセスグループへの `SIGKILL` 送信エラーのうち、グループに生存者がいないことを示すものか。
+///
+/// `ESRCH`（グループが空）は正常。`EPERM` はどの OS でも許容しない。macOS ではゾンビのみのグループでも
+/// 生存者への送信権限不足（setuid 実行ファイル経由で別 UID に変わった孫など）でも `EPERM` になり、再送後も
+/// 両者を区別できないため、生存者不在の証明として扱わず、孫の停止を保証できない失敗として呼び出し側
+/// （`kill_and_reap`）が `GroupKillFailed` として報告する（PLUG-7・REPAIR-5）。`Unsupported` はグループ送信を持たない unix
+/// （Linux・macOS 以外）で、送信自体ができないことと直接の子の回収成否は別問題のため許容し、
+/// `Child::kill` による直接の子の kill・回収だけにフォールバックする（孫の回収は保証しない。この環境では
+/// 回収済みの pid を未回収として報告しない。PLUG-7・#1311）。それ以外（`InvalidInput` 等）は孫の停止を
+/// 保証できず、同じく `GroupKillFailed` として報告する（直接の子も回収できなかった場合だけ `Unreaped`）。
+#[cfg(unix)]
+fn group_kill_tolerated(e: &io::Error) -> bool {
+    const ESRCH: i32 = 3;
+    if e.kind() == io::ErrorKind::Unsupported {
+        return true;
+    }
+    e.raw_os_error() == Some(ESRCH)
+}
+
 /// [`ChildGuard::kill_and_reap`] の結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reap {
@@ -670,6 +825,10 @@ enum Reap {
     Reaped(ExitStatus),
     /// 既に回収済みで保持している子がない。
     AlreadyReaped,
+    /// 直接の子は回収済み（pid は解放済みで報告対象にしない）だが、グループ宛て SIGKILL が許容外の
+    /// エラーで失敗し、孫の停止を保証できない。呼び出し側は `Unreaped`（未回収の子）へ畳まず、元の
+    /// エラーに代えて [`group_kill_failed_error`] を返す（PLUG-7・REPAIR-5）。
+    GroupKillFailed,
     /// kill 失敗または期限超過で回収を確認できなかった（孤児の可能性）。
     Unreaped,
     /// `waitpid` が失敗した（主に `ECHILD`＝契約外の回収者による回収）。終了状態は失われ、pid は再利用
@@ -679,15 +838,14 @@ enum Reap {
 }
 
 impl Reap {
-    /// 子が残っていない（回収を確認できた、または他所で回収済み）か。
+    /// 子が残っておらず（回収を確認できた、または他所で回収済み）、グループ停止も失敗していないか。
+    /// `GroupKillFailed` は孫の停止を保証できないため偽（呼び出し側は [`group_kill_failed_error`] で後始末の
+    /// 失敗として報告する）。本体の経路は各結果を明示的に場合分けし、本関数はテストの照合にだけ使う。
+    #[cfg(test)]
     fn is_reaped(self) -> bool {
-        !matches!(self, Self::Unreaped)
+        matches!(self, Self::Reaped(_) | Self::AlreadyReaped | Self::Lost)
     }
 }
-
-/// `Child::kill` が unix で送るシグナル番号（`SIGKILL`。Linux・macOS とも 9）。
-#[cfg(unix)]
-const SIGKILL: i32 = 9;
 
 /// 強制終了を試みた後に回収した終了状態を分類する（PLUG-7・REPAIR-5）。
 ///
@@ -700,7 +858,7 @@ fn classify_reaped(status: ExitStatus) -> OneShotTermination {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
-        if status.signal() == Some(SIGKILL) {
+        if status.signal() == Some(crate::sys::SIGKILL) {
             return OneShotTermination::Killed;
         }
         OneShotTermination::Exited {
@@ -968,6 +1126,19 @@ fn call_once_inner(
 
 /// 登録表のスロットを確保してから子を spawn し、pid を登録したガードを返す（#1513・PLUG-7）。
 ///
+/// unix では子を新しいプロセスグループ（pgid == 子の pid）で起動する（`process_group(0)`。#1311）。
+/// 都度起動・常駐の両モードがこの関数を共用するので 2 か所の起動条件は食い違わない。`ChildGuard::kill_and_reap` が
+/// グループ全体へ SIGKILL を送って plugin の孫を残さず、登録表のシグナル転送（#1513）も `kill(-pid)` で
+/// 孫まで届く。`PR_SET_PDEATHSIG`（#1514。`bind_to_parent_lifetime`）とは独立に併用できる（前者は `pre_exec`、
+/// 後者は fork 時のグループ設定で干渉しない）。
+/// Windows にプロセスグループ単位の kill は無く（Job Object は別タスク）、unix transport も無いため対象外。
+///
+/// pgid 確立の同期性: `Command::spawn` は子の `exec` 成功（または失敗の報告）を CLOEXEC パイプで待ってから
+/// 返り、`process_group(0)` の `setpgid(0, 0)` は `pre_exec` フックより前に子の `exec` 前で完了する。
+/// このため `spawn` 復帰時点で pgid == 子の pid は確立済みで、`kill_and_reap` の `killpg(pid)` が
+/// 親のグループや無関係なグループへ届くことはない（`PR_SET_PDEATHSIG` の fork 経路でも同じ。
+/// 回帰テスト `plug7_spawn_registered_establishes_own_process_group`）。
+///
 /// 確保を spawn より前に行うので、表が満杯のときは子を一切起動せず `ResourceExhausted` で拒否する
 /// （fail-closed。追跡できない子を作らない）。spawn の失敗・pid の範囲外ではスロットを解放し、
 /// 起動済みの子は kill・回収する。`registry` は本番では [`PLUGIN_REGISTRY`]（テストは局所の表）。
@@ -976,6 +1147,11 @@ fn spawn_registered(
     registry: &'static Registry,
 ) -> Result<ChildGuard, PluginError> {
     let mut slot = registry.reserve()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let child = cmd.spawn().map_err(|e| spawn_error(&e))?;
     let pid = child.id();
     // activate が失敗した場合は guard の Drop が子を kill・回収する。
@@ -986,12 +1162,50 @@ fn spawn_registered(
 
 /// 応答前の失敗経路で子を明示的に kill・回収する。回収を確認できなければ、元のエラーではなく
 /// 回収失敗（`Internal`）を返す（孤児の可能性を呼び出し側へ伝える。REPAIR-5・PLUG-7）。
+///
+/// プロセスグループの停止失敗（`GroupKillFailed`）では、元のエラーの `code` を保ち、`message` に付記を
+/// 加える（[`with_group_kill_failure`]。#1311）。この経路は plugin が接続後・応答前に終了した場合
+/// （最頻の失敗経路）を含み、子は未回収のゾンビのまま `kill_and_reap` に入る。macOS はゾンビだけの
+/// グループへの `killpg` に `EPERM` を返すため、孫がいなくても付記が付き得るが、元の分類
+/// （`Unavailable` 等）は失わない。Linux はゾンビへの送信が成功するため付記は付かない。
 fn reap_after_failure(guard: &mut ChildGuard, error: PluginError) -> PluginError {
-    if guard.kill_and_reap().is_reaped() {
-        error
-    } else {
-        unreaped_error(guard, "a failed exchange")
+    match guard.kill_and_reap() {
+        // 他所で回収された（`Lost`。#1513）子は自プロセスの子として残っていないため、元のエラーを返す。
+        Reap::Reaped(_) | Reap::AlreadyReaped | Reap::Lost => error,
+        Reap::GroupKillFailed => with_group_kill_failure(error, "a failed exchange"),
+        Reap::Unreaped => unreaped_error(guard, "a failed exchange"),
     }
+}
+
+/// 元のエラーの `code` と `message` を保ったまま、プロセスグループを停止できず孫が残り得ることを
+/// `message` に付記する（#1311・PLUG-7・REPAIR-5）。付記が上限（[`crate::error::PLUGIN_ERROR_MESSAGE_MAX_BYTES`]）
+/// で切り捨てられないよう、元の `message` 側を文字境界で詰める。直接の子の pid は解放済みのため含めない。
+pub(crate) fn with_group_kill_failure(error: PluginError, phase: &str) -> PluginError {
+    let note = format!(
+        "; additionally, the plugin process group could not be killed after {phase}, so descendant processes may remain"
+    );
+    let original = error.message();
+    let mut end = original
+        .len()
+        .min(crate::error::PLUGIN_ERROR_MESSAGE_MAX_BYTES.saturating_sub(note.len()));
+    while end > 0 && !original.is_char_boundary(end) {
+        end -= 1;
+    }
+    let head = original.get(..end).unwrap_or_default();
+    PluginError::new(error.code(), format!("{head}{note}"))
+}
+
+/// 直接の子は回収済みだが、プロセスグループ宛て SIGKILL が失敗し孫の停止を保証できないことを
+/// 伝えるエラー（`Internal`）。元のエラーが無い経路（応答後・常駐の shutdown）で、後始末の失敗として
+/// 呼び出し側へ返す（元のエラーがある経路は [`with_group_kill_failure`]。PLUG-7・REPAIR-5・#1311）。
+/// 直接の子の pid は解放済みのため含めない。
+pub(crate) fn group_kill_failed_error(phase: &str) -> PluginError {
+    PluginError::new(
+        PluginErrorCode::Internal,
+        format!(
+            "plugin process group could not be killed after {phase}; the direct child was reaped but descendant processes may remain"
+        ),
+    )
 }
 
 /// 回収を確認できなかった子についてのエラー（`Internal`）。呼び出し側が未回収の子を特定できるよう
@@ -1012,7 +1226,8 @@ fn unreaped_error(guard: &mut ChildGuard, phase: &str) -> PluginError {
 }
 
 /// 接続の受付・1 往復・子の回収を行う。`Ok` で戻る時点で子は回収済み。回収を確認できなかった場合は
-/// `Internal`（[`unreaped_error`]）を返し、以後 `guard` はその子を回収しない。
+/// `Internal`（[`unreaped_error`]）を返し、以後 `guard` はその子を回収しない。子は回収できたが
+/// プロセスグループを停止できなかった場合は `Internal`（[`group_kill_failed_error`]）を返す。
 fn exchange_and_reap(
     guard: &mut ChildGuard,
     listener: UdsListener,
@@ -1052,12 +1267,22 @@ fn exchange_and_reap(
         Err(e) => return Err(reap_after_failure(guard, e)),
     };
     let termination = guard.wait_or_kill(ONE_SHOT_EXIT_TIMEOUT);
-    // 回収を確認できない子（孤児の可能性）と異常終了（非ゼロ・シグナル）は成功扱いにしない（REPAIR-5・PLUG-7）。
+    check_termination_after_response(guard, termination).map(|()| (response, termination))
+}
+
+/// 応答受信後の終了状況を検査する。回収を確認できない子（孤児の可能性）・グループ停止の失敗（孫が残る
+/// 可能性）・異常終了（非ゼロ・シグナル）は成功扱いにしない（REPAIR-5・PLUG-7）。
+///
+/// グループ停止の失敗では直接の子は回収済みのため、未回収（[`unreaped_error`]）としては報告せず、
+/// `guard` に報告済みの印も付けない（#1311）。
+fn check_termination_after_response(
+    guard: &mut ChildGuard,
+    termination: OneShotTermination,
+) -> Result<(), PluginError> {
     match termination {
         OneShotTermination::Unreaped => Err(unreaped_error(guard, "the response")),
-        OneShotTermination::Exited { code: Some(0) } | OneShotTermination::Killed => {
-            Ok((response, termination))
-        }
+        OneShotTermination::GroupKillFailed => Err(group_kill_failed_error("the response")),
+        OneShotTermination::Exited { code: Some(0) } | OneShotTermination::Killed => Ok(()),
         OneShotTermination::Exited { .. } => Err(PluginError::new(
             PluginErrorCode::Unavailable,
             "plugin process exited abnormally after the response",
@@ -1068,6 +1293,23 @@ fn exchange_and_reap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PLUG-7・#1311: グループ送信エラーの許容は ESRCH と Unsupported（送信非対応 unix で直接の子の
+    /// 回収結果を Unreaped に変えない）のみ。InvalidInput は許容しない。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_group_kill_tolerates_only_empty_group_errors() {
+        assert!(group_kill_tolerated(&io::Error::from_raw_os_error(3)));
+        assert!(!group_kill_tolerated(&io::Error::from(
+            io::ErrorKind::InvalidInput
+        )));
+        assert!(group_kill_tolerated(&io::Error::from(
+            io::ErrorKind::Unsupported
+        )));
+        assert!(!group_kill_tolerated(&io::Error::from_raw_os_error(22)));
+        // EPERM は生存者への権限不足と区別できないため、どの OS でも失敗として扱う。
+        assert!(!group_kill_tolerated(&io::Error::from_raw_os_error(1)));
+    }
 
     #[test]
     fn plug7_timeout_rejects_zero_and_over_max() {
@@ -1205,9 +1447,29 @@ mod tests {
         let reg = local_registry(4);
         let targets = |r: &Registry| r.forward(ForwardSignal::Hangup).targets;
         // 登録の有無（targets）だけを見る。確認用の転送（SIGHUP）で死なないよう HUP を無視する子を使う。
-        let ignoring = "trap '' HUP; exec sleep 30";
+        // trap 設定前の HUP で sh が死ぬ競合（macOS ではゾンビのみのグループへの killpg が EPERM になる）を
+        // 避けるため、trap 後にマーカーを作らせ、確認してから転送する。
+        let marker_dir = std::env::temp_dir();
+        let make_ignoring = |tag: &str| {
+            let marker = marker_dir.join(format!("fcos-trap-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_file(&marker);
+            // パスはシェルの文字列へ埋め込まず位置引数（`$1`）で渡す（`TMPDIR` に `'` 等を含んでも壊れない）。
+            let mut cmd = sh("trap '' HUP; touch \"$1\"; exec sleep 30");
+            cmd.arg("sh").arg(&marker);
+            (cmd, marker)
+        };
+        let wait_marker = |m: &std::path::Path| {
+            let start = Instant::now();
+            while !m.exists() {
+                assert!(start.elapsed() < Duration::from_secs(10), "trap marker");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let _ = std::fs::remove_file(m);
+        };
         // kill_and_reap
-        let mut g = spawn_registered(&mut sh(ignoring), reg).unwrap();
+        let (mut cmd, marker) = make_ignoring("a");
+        let mut g = spawn_registered(&mut cmd, reg).unwrap();
+        wait_marker(&marker);
         assert_eq!(targets(reg), 1);
         assert!(g.kill_and_reap().is_reaped());
         assert_eq!(targets(reg), 0);
@@ -1220,7 +1482,9 @@ mod tests {
         }
         assert_eq!(targets(reg), 0);
         // 生存中の try_wait は登録を保つ
-        let mut live = spawn_registered(&mut sh(ignoring), reg).unwrap();
+        let (mut cmd, marker) = make_ignoring("b");
+        let mut live = spawn_registered(&mut cmd, reg).unwrap();
+        wait_marker(&marker);
         assert!(live.try_wait().unwrap().is_none());
         assert_eq!(targets(reg), 1);
         // 未回収の報告でスロットを解放する
@@ -1244,6 +1508,18 @@ mod tests {
         assert!(other.kill_and_reap().is_reaped());
     }
 
+    /// #1311・PLUG-7: `spawn_registered` の復帰時点で子は自分専用のプロセスグループ（pgid == pid）に
+    /// いる。`kill_and_reap` の `killpg(pid)` が親や他のグループへ届かないことの前提を固定する。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_spawn_registered_establishes_own_process_group() {
+        let reg = local_registry(2);
+        let mut g = spawn_registered(&mut sh("exec sleep 30"), reg).unwrap();
+        let pid = g.child.as_ref().unwrap().id();
+        assert_eq!(process_group_of(pid), pid);
+        assert!(g.kill_and_reap().is_reaped());
+    }
+
     /// PLUG-7・#1513: 登録中の子へ転送するとシグナルで終了する。
     #[cfg(unix)]
     #[test]
@@ -1263,6 +1539,40 @@ mod tests {
         };
         assert_eq!(status.signal(), Some(15));
         assert_eq!(reg.forward(ForwardSignal::Terminate).targets, 0);
+    }
+
+    /// #1311・#1513・PLUG-7: 登録中の plugin へ転送した SIGTERM・SIGHUP は、`spawn_registered` が作る
+    /// プロセスグループ宛て（`kill(-pid)`）で孫にも届き、plugin 本体と孫の両方が止まる。
+    /// SIGINT は非対話 sh が非同期起動の孫で無視するため、孫の停止は SIGTERM・SIGHUP で確かめる。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_forward_stops_plugin_and_grandchild_via_group() {
+        use crate::signal_forward::ForwardSignal;
+        for sig in [ForwardSignal::Terminate, ForwardSignal::Hangup] {
+            let reg = local_registry(2);
+            let mut cmd = sh("/bin/sleep 30 >/dev/null 2>&1 & echo $!; wait");
+            cmd.stdout(Stdio::piped());
+            let mut g = spawn_registered(&mut cmd, reg).unwrap();
+            let out = g.child.as_mut().unwrap().stdout.take().unwrap();
+            let gc: u32 = read_grandchild_pid(&mut g, out);
+            assert!(is_running(gc));
+            assert_eq!(reg.forward(sig).targets, 1);
+            let start = Instant::now();
+            while g.try_wait().unwrap().is_none() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "{sig:?}: leader alive"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            while is_running(gc) {
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "{sig:?}: grandchild {gc} alive"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
     }
 
     /// PLUG-7: kill の前に自発終了していた子は、その終了状態のまま回収される（`Killed` にしない）。
@@ -1291,6 +1601,292 @@ mod tests {
             OneShotTermination::Exited { code: Some(3) }
         );
         assert_eq!(guard.kill_and_reap(), Reap::AlreadyReaped);
+    }
+
+    /// 子の標準出力 1 行目の孫 pid を有限の期限内に読む（REPAIR-5・#1311）。期限内に改行も EOF も来なければ
+    /// 起動したグループへ SIGKILL を送り、直接の子を回収してから panic する（`read_line` の無期限ブロック防止）。
+    #[cfg(unix)]
+    fn read_grandchild_pid(guard: &mut ChildGuard, out: std::process::ChildStdout) -> u32 {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let r = io::BufRead::read_line(&mut io::BufReader::new(out), &mut line).map(|_| line);
+            let _ = tx.send(r);
+        });
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(line)) => line.trim().parse().expect("grandchild pid line"),
+            Ok(Err(e)) => {
+                let _ = guard.kill_and_reap();
+                panic!("failed to read grandchild pid: {e}");
+            }
+            Err(_) => {
+                let reap = guard.kill_and_reap();
+                panic!("timed out reading grandchild pid (reap: {reap:?})");
+            }
+        }
+    }
+
+    /// 新しいプロセスグループで `script` を起動し、標準出力 1 行目の孫 pid を返す（#1311 のテスト用）。
+    #[cfg(unix)]
+    fn spawn_group_with_grandchild(script: &str) -> (ChildGuard, u32) {
+        use std::os::unix::process::CommandExt;
+        let child = Command::new("/bin/sh")
+            .args(["-c", script])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut guard = ChildGuard::new(child);
+        let out = guard.child.as_mut().unwrap().stdout.take().unwrap();
+        let pid = read_grandchild_pid(&mut guard, out);
+        (guard, pid)
+    }
+
+    /// `pid` のプロセスグループ ID（#1311 のテスト用）。Linux は `/proc/<pid>/stat` の pgrp 欄を読み、
+    /// 外部コマンドに依存しない（開発コンテナの slim イメージには procps〔`ps`・`kill`〕が無い）。
+    #[cfg(target_os = "linux")]
+    fn process_group_of(pid: u32) -> u32 {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read /proc stat");
+        // `pid (comm) state ppid pgrp ...`。comm に空白や括弧を含み得るため最後の ')' の後ろを見る。
+        let (_, rest) = stat.rsplit_once(')').expect("stat comm");
+        rest.split_whitespace()
+            .nth(2)
+            .expect("pgrp field")
+            .parse()
+            .expect("pgrp")
+    }
+
+    /// `pid` のプロセスグループ ID（#1311 のテスト用）。`/proc` の無い unix（macOS）は OS 標準の `/bin/ps` を
+    /// 期限付きで実行して読む。
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn process_group_of(pid: u32) -> u32 {
+        let mut ps = Command::new("/bin/ps");
+        ps.args(["-o", "pgid=", "-p", &pid.to_string()]);
+        let (_, stdout) =
+            run_bounded(ps, Duration::from_secs(10)).expect("ps failed to start or timed out");
+        stdout.trim().parse().expect("pgid")
+    }
+
+    /// 確認用の外部コマンド（`ps`）を期限付きで実行する（REPAIR-5・#1311）。`output()` / `status()` は
+    /// 子の終了を無期限に待つため、spawn して `try_wait` を期限までポーリングし、超過時は kill して
+    /// 有限時間だけ回収を試みる。起動失敗・期限切れは `None`（呼び出し側が失敗として扱う）。
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn run_bounded(mut cmd: Command, limit: Duration) -> Option<(ExitStatus, String)> {
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped());
+        let mut child = cmd.spawn().ok()?;
+        let start = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(st)) => {
+                    let mut s = String::new();
+                    if let Some(mut o) = child.stdout.take() {
+                        let _ = o.read_to_string(&mut s);
+                    }
+                    return Some((st, s));
+                }
+                Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(5)),
+                _ => break,
+            }
+        }
+        let _ = child.kill();
+        let reap = Instant::now();
+        while reap.elapsed() < Duration::from_secs(2) {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        None
+    }
+
+    /// 孫が実行中か（Linux ではゾンビ `Z` を実行中に数えない）。存在確認は `kill(pid, 0)`（`sys::send_signal`）で
+    /// 行い、外部コマンド（procps の `kill`。開発コンテナに無い）に依存しない。
+    #[cfg(unix)]
+    fn is_running(pid: u32) -> bool {
+        let alive = crate::sys::send_signal(i32::try_from(pid).expect("pid fits in i32"), 0);
+        #[cfg(target_os = "linux")]
+        let alive = alive
+            && std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map(|st| {
+                    !st.rsplit(')')
+                        .next()
+                        .unwrap_or("")
+                        .trim_start()
+                        .starts_with('Z')
+                })
+                .unwrap_or(false);
+        alive
+    }
+
+    /// 試験の後始末で、生存を確認した直後の孫へ SIGKILL を送る（外部コマンドに依存しない）。
+    #[cfg(unix)]
+    fn force_kill(pid: u32) {
+        let pid = i32::try_from(pid).expect("pid fits in i32");
+        let _ = crate::sys::send_signal(pid, crate::sys::SIGKILL);
+    }
+
+    #[cfg(unix)]
+    const GRANDCHILD_SCRIPT_EXIT: &str = "/bin/sleep 30 >/dev/null 2>&1 & echo $!; exit 0";
+    #[cfg(unix)]
+    const GRANDCHILD_SCRIPT_WAIT: &str = "/bin/sleep 30 >/dev/null 2>&1 & echo $!; wait";
+
+    /// #1311・PLUG-7: 子が生存中の `kill_and_reap` はグループ内の孫も止める。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_kill_and_reap_kills_grandchild_in_process_group() {
+        let (mut guard, gc) = spawn_group_with_grandchild(GRANDCHILD_SCRIPT_WAIT);
+        assert!(is_running(gc));
+        assert!(matches!(guard.kill_and_reap(), Reap::Reaped(_)));
+        let start = Instant::now();
+        while is_running(gc) {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "grandchild {gc} alive"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// #1311・PLUG-7: `try_wait` で回収済み（`child` は `Some` のまま）なら、グループへ送らない
+    /// （pid 再利用による誤送信の防止）。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_kill_and_reap_skips_group_after_try_wait_reaped_leader() {
+        let (mut guard, gc) = spawn_group_with_grandchild(GRANDCHILD_SCRIPT_EXIT);
+        let start = Instant::now();
+        while guard.try_wait().unwrap().is_none() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "leader did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(guard.child.is_some());
+        let _ = guard.kill_and_reap();
+        let still_running = is_running(gc);
+        force_kill(gc);
+        assert!(
+            still_running,
+            "group was signalled after the leader was reaped"
+        );
+    }
+
+    /// #1311・PLUG-7・REPAIR-5: グループ送信失敗は後始末の成功に数えない（`is_reaped` は偽）。
+    #[test]
+    fn plug7_group_kill_failed_is_not_a_successful_reap() {
+        assert!(!Reap::GroupKillFailed.is_reaped());
+        assert!(!Reap::Unreaped.is_reaped());
+        assert!(Reap::AlreadyReaped.is_reaped());
+    }
+
+    /// #1311・PLUG-7・REPAIR-5: 終了猶予超過後のグループ停止失敗は、未回収の子（`Unreaped`）へ畳まずに
+    /// 別の終了状況として保つ。
+    #[test]
+    fn plug7_termination_after_kill_keeps_group_kill_failure_distinct() {
+        assert_eq!(
+            termination_after_kill(Reap::GroupKillFailed),
+            OneShotTermination::GroupKillFailed
+        );
+        assert_eq!(
+            termination_after_kill(Reap::Unreaped),
+            OneShotTermination::Unreaped
+        );
+        assert_eq!(
+            termination_after_kill(Reap::AlreadyReaped),
+            OneShotTermination::Unreaped
+        );
+    }
+
+    /// #1311・PLUG-7・REPAIR-5: 応答前の失敗経路のグループ停止失敗は、元のエラーの code と message を保って
+    /// 付記する（macOS のゾンビだけのグループの `EPERM` で `Unavailable` 等を `Internal` に置き換えない）。
+    #[test]
+    fn plug7_with_group_kill_failure_keeps_original_code_and_message() {
+        let e = with_group_kill_failure(
+            PluginError::new(PluginErrorCode::Unavailable, "peer closed the connection"),
+            "a failed exchange",
+        );
+        assert_eq!(e.code(), PluginErrorCode::Unavailable);
+        assert_eq!(
+            e.message(),
+            "peer closed the connection; additionally, the plugin process group could not be \
+             killed after a failed exchange, so descendant processes may remain"
+        );
+        // 元の message が上限近くでも付記は切り捨てられない（元の側を文字境界で詰める）。
+        let long = "あ".repeat(crate::error::PLUGIN_ERROR_MESSAGE_MAX_BYTES / 3);
+        let e = with_group_kill_failure(
+            PluginError::new(PluginErrorCode::Timeout, &long),
+            "a failed start",
+        );
+        assert_eq!(e.code(), PluginErrorCode::Timeout);
+        let note = "; additionally, the plugin process group could not be killed after a failed \
+                    start, so descendant processes may remain";
+        assert!(e.message().ends_with(note), "{}", e.message());
+        assert!(e.message().len() <= crate::error::PLUGIN_ERROR_MESSAGE_MAX_BYTES);
+        assert!(e.message().starts_with("あ"));
+    }
+
+    /// #1311・PLUG-7・REPAIR-5: 応答後のグループ停止失敗は `group_kill_failed_error` で報告し、回収済みの
+    /// 子を「回収できなかった」とは報告しない（pid を含めず、報告済みの印も付けない）。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_group_kill_failure_after_response_is_not_reported_as_unreaped() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut guard = ChildGuard::new(child);
+        // グループ停止失敗の時点で直接の子は回収済み（`child` は `None`）。その状態を再現する。
+        assert_eq!(
+            guard.wait_or_kill(Duration::from_secs(5)),
+            OneShotTermination::Exited { code: Some(0) }
+        );
+        assert_eq!(guard.pid(), None);
+
+        let e = check_termination_after_response(&mut guard, OneShotTermination::GroupKillFailed)
+            .unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Internal);
+        assert_eq!(
+            e.message(),
+            "plugin process group could not be killed after the response; \
+             the direct child was reaped but descendant processes may remain"
+        );
+        assert!(!guard.reported_unreaped);
+
+        // 未回収の子は従来どおり別のメッセージで報告する（両者を取り違えない）。
+        let e =
+            check_termination_after_response(&mut guard, OneShotTermination::Unreaped).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Internal);
+        assert_eq!(
+            e.message(),
+            "plugin process could not be reaped after the response"
+        );
+        assert_eq!(
+            check_termination_after_response(&mut guard, OneShotTermination::Killed),
+            Ok(())
+        );
+    }
+
+    /// #1311・PLUG-7: 回収済みで `child` を手放した後は何も送らない（`AlreadyReaped`）。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_kill_and_reap_skips_group_after_release() {
+        let (mut guard, gc) = spawn_group_with_grandchild(GRANDCHILD_SCRIPT_EXIT);
+        assert_eq!(
+            guard.wait_or_kill(Duration::from_secs(5)),
+            OneShotTermination::Exited { code: Some(0) }
+        );
+        assert_eq!(guard.kill_and_reap(), Reap::AlreadyReaped);
+        let still_running = is_running(gc);
+        force_kill(gc);
+        assert!(
+            still_running,
+            "group was signalled after the leader was reaped"
+        );
     }
 
     /// PLUG-7: 終了猶予を使い切った後の回収でも、自発的な非ゼロ終了は `Exited` として返る。
@@ -1638,6 +2234,36 @@ mod tests {
         // スロットは解放済みで、表の容量を消費し続けない。
         let _a = reg.reserve().unwrap();
         let _b = reg.reserve().unwrap();
+    }
+
+    /// #1311・#1513・PLUG-7: `try_wait` が `ECHILD`（他所での回収）を観測した後は終端になり、`kill_and_reap` は
+    /// プロセスグループ宛ての SIGKILL も送らない（pgid が再利用され得るため）。生存中の孫が止まらないことを
+    /// pid で確かめる。
+    #[cfg(unix)]
+    #[test]
+    fn plug7_kill_and_reap_skips_group_after_try_wait_echild() {
+        // ECHILD は Linux（asm-generic/errno-base.h）・macOS（sys/errno.h）とも 10。
+        const ECHILD: i32 = 10;
+        let (mut guard, gc) = spawn_group_with_grandchild(GRANDCHILD_SCRIPT_EXIT);
+        let pid = guard.pid().unwrap();
+        let start = Instant::now();
+        while !crate::sys::reap_child_for_test(pid).unwrap() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "leader did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let e = guard.try_wait().unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(ECHILD));
+        assert!(guard.lost && guard.leader_reaped);
+        assert_eq!(guard.kill_and_reap(), Reap::Lost);
+        let still_running = is_running(gc);
+        force_kill(gc);
+        assert!(
+            still_running,
+            "group was signalled after waitpid failed with ECHILD"
+        );
     }
 
     /// PLUG-7・#1513: `kill_and_reap` の kill 前の確認で `ECHILD` を受けたら kill を送らず `Lost` で終える

@@ -36,7 +36,9 @@
 //! # 孫プロセス（#1311）
 //!
 //! 呼び出しタイムアウト・shutdown・`Drop` の kill は子のプロセスグループ全体へ送り、孫も止める。
-//! plugin の自発終了後に先に回収した場合・グループを抜けた孫・Windows は対象外（`super` のモジュール doc を参照）。
+//! plugin が自発終了した場合も、`call` の生存確認・`fail_session`・`shutdown` が `waitid(WNOWAIT)` で終了を観測し、
+//! 回収の前にグループへ送って孫を止める（#1604）。グループを抜けた孫・UID を変えた孫・Windows・プローブ非対応の
+//! OS は対象外（`super` のモジュール doc を参照）。
 //!
 //! # 未実装（REPAIR-3）
 //!
@@ -422,6 +424,11 @@ impl ResidentPlugin {
                 self.guard.release_reaped();
                 self.stream = None;
                 let code = status.code();
+                // 自発終了の観測後のグループ送信が失敗した（#1604）。元の `Unavailable` を保ち、孫が残り得ることを付記する。
+                if self.guard.group_kill_failed_after_exit {
+                    self.state = ResidentState::GroupKillFailed;
+                    return Err(with_group_kill_failure(exited_error(code), "plugin exit"));
+                }
                 self.state = ResidentState::Exited { code };
                 return Err(exited_error(code));
             }
@@ -477,6 +484,16 @@ impl ResidentPlugin {
                 Ok(Some(status)) => {
                     self.guard.release_reaped();
                     let code = status.code();
+                    // 自発終了の観測後のグループ送信が失敗した（#1604）。孫が残り得ることを付記する。
+                    if self.guard.group_kill_failed_after_exit {
+                        self.state = ResidentState::GroupKillFailed;
+                        let error = if code == Some(0) {
+                            original
+                        } else {
+                            exited_error(code)
+                        };
+                        return with_group_kill_failure(error, "a failed call");
+                    }
                     self.state = ResidentState::Exited { code };
                     // 終了コード 0 の後始末（EOF を受けた正常終了）は通信失敗の原因ではないため、
                     // 元のエラーを保つ。異常終了（非ゼロ・取得不能）のときだけ読み替える。
@@ -692,6 +709,7 @@ mod tests {
                 leader_reaped: true,
                 lost: false,
                 slot: None,
+                group_kill_failed_after_exit: false,
             },
             capture: None,
             state: ResidentState::GroupKillFailed,
@@ -719,6 +737,7 @@ mod tests {
                 leader_reaped: true,
                 lost: false,
                 slot: None,
+                group_kill_failed_after_exit: false,
             },
             capture: None,
             state: ResidentState::Unreaped,

@@ -28,16 +28,36 @@ fn task172_4_gpu6_info_then_query_log_is_accepted() {
     destroy[16..20].copy_from_slice(&3u32.to_le_bytes());
     let mut display = vec![0u8; 24];
     display[..4].copy_from_slice(&0x0100u32.to_le_bytes());
-    for r in [
+    let reqs = [
         req(0x0108, 0, 0),
         req(0x0109, 4, 0),
         display,
         create,
         destroy,
-    ] {
-        log.push_str(&adapter.handle_ctrl(&r).log_line);
+    ];
+    let mut resps = Vec::new();
+    for r in reqs {
+        let h = adapter.handle_ctrl(&r);
+        log.push_str(&h.log_line);
         log.push('\n');
+        resps.push(h.response);
     }
+    // GET_DISPLAY_INFO: OK_DISPLAY_INFO・ヘッダ 24 + 16 scanout * 24、全 scanout 無効（本体は全 0）。
+    let disp = &resps[2];
+    assert_eq!(disp.resp_type(), 0x1101);
+    assert_eq!(disp.as_bytes().len(), 24 + 16 * 24);
+    assert!(disp.as_bytes()[24..].iter().all(|b| *b == 0));
+    // CTX_CREATE（ctx_id=3）・CTX_DESTROY: どちらも OK_NODATA・ヘッダのみ。
+    assert_eq!(resps[3].resp_type(), 0x1100);
+    assert_eq!(resps[3].as_bytes().len(), 24);
+    assert_eq!(resps[4].resp_type(), 0x1100);
+    assert_eq!(resps[4].as_bytes().len(), 24);
+    // 破棄済みの ctx_id=3 を再度破棄すると INVALID_CONTEXT_ID（作成で表に入り、破棄で消えた証拠）。
+    let mut again = vec![0u8; 24];
+    again[..4].copy_from_slice(&0x0201u32.to_le_bytes());
+    again[16..20].copy_from_slice(&3u32.to_le_bytes());
+    let h = adapter.handle_ctrl(&again);
+    assert_eq!(h.response.resp_type(), 0x1204);
     let report = find_capset_queries(&log).unwrap();
     assert_eq!(report.venus_get_capset_ok, 1);
     assert_eq!(report.info_ok, 1);

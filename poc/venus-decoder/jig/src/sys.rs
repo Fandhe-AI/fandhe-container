@@ -28,7 +28,7 @@
 //! - 構造体はカーネル ABI（`struct user_msghdr`・`struct cmsghdr`・`struct iovec`）に合わせる。syscall を直接呼ぶので
 //!   glibc / musl の `msghdr` のパディング差に依存しない
 //! - 戻り値が -1 のときは直後に `io::Error::last_os_error()` で errno を確保する。`EINTR` / `EAGAIN` は
-//!   `Interrupted` / `WouldBlock` に写し、呼び出し側がアーキ固有の errno 定数を持たずに済むようにする
+//!   `Interrupted`（errno を保持）/ `WouldBlock` に写し、呼び出し側がアーキ固有の errno 定数を持たずに済むようにする
 //! - `MmapRegion::map_shared` は安全性に要る検証（backing の `st_dev`・`F_SEAL_SHRINK`・ファイル長・アクセス範囲の占有）を
 //!   map と不可分に自分で行い、呼び出し側に頼らない（呼び出し元は `vhost_user::guest_memory` だけ）
 //! - 受信した補助データの fd は、このモジュールの中で受信と同じ呼び出しのうちに所有する（`recvmsg_fds` の戻り値は
@@ -64,8 +64,9 @@ pub(crate) enum SysError {
     /// 対応外のアーキテクチャ（定数・syscall を定義しない。fail-closed）。対応アーキには存在しない。
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     Unsupported,
-    /// シグナルで中断された（`EINTR`）。呼び出し側が期限を確かめて再試行する。
-    Interrupted,
+    /// シグナルで中断された（`EINTR`）。呼び出し側が期限を確かめて再試行する。値はカーネルが返した errno そのもので、
+    /// `imp` が写す（呼び出し側がアーキ固有の errno 定数を持たずに、構造化エラーへ errno を載せられるようにする）。
+    Interrupted(i32),
     /// 今は読み書きできない（`EAGAIN`。`MSG_DONTWAIT` の送受信）。呼び出し側が期限つきで待つ。
     WouldBlock,
     /// ラッパー内部の検証に掛かった（fd 数の上限超過・空の範囲・値の変換失敗等。カーネルを呼ぶ前の拒否を含む）。
@@ -359,7 +360,7 @@ mod imp {
         if ret < 0 {
             // 直後に errno を確保する（間に他の libc 呼び出しを挟まない）。
             Err(match io::Error::last_os_error().raw_os_error() {
-                Some(EINTR) => SysError::Interrupted,
+                Some(EINTR) => SysError::Interrupted(EINTR),
                 Some(EAGAIN) => SysError::WouldBlock,
                 Some(n) => SysError::Os(n),
                 None => SysError::Invalid,
@@ -501,7 +502,7 @@ mod imp {
 
     /// `ppoll(2)` で `fd` が `interest` になるか `timeout` が尽きるまで待つ（U10）。真なら待ち対象が成立（`POLLERR` / `POLLHUP` も
     /// 成立として返し、結果は続く `recvmsg` / `sendmsg` のエラーで分かる）、偽ならタイムアウト。ソケット設定に依存しない期限つき待機。
-    /// シグナルで中断されたときは `Os(EINTR)`（呼び出し側が残り時間を計算し直す）。
+    /// シグナルで中断されたときは `Interrupted`（呼び出し側が残り時間を計算し直す）。
     pub(crate) fn wait_fd(
         fd: BorrowedFd<'_>,
         interest: Interest,

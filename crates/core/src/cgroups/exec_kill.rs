@@ -46,6 +46,7 @@ use super::{
     CgroupError, CgroupStep, PROCS_LIMIT, cstring, io_error, open_cgroup_dir, owner_uid,
     parse_procs, read_iface, remove_verified_at, sys_error, validate_component,
 };
+use crate::observability::{OpName, OpOutcome, OpRecorder};
 use crate::sys;
 use crate::traits::ErrorCode;
 
@@ -418,6 +419,63 @@ pub(crate) fn sweep_exec_children_at(
     mode: SweepMode,
     deadline: Instant,
 ) -> Result<ExecChildSweep, CgroupError> {
+    let started = Instant::now();
+    let result = sweep_exec_children_inner(container, mode, deadline);
+    record_sweep(mode, &result, started.elapsed());
+    result
+}
+
+/// 掃除の方式ごとの記録先の操作名（REPAIR-4）。`OpName` の許容文字だけで作る固定文字列。
+fn sweep_op_names(mode: SweepMode) -> (&'static str, &'static str) {
+    match mode {
+        SweepMode::KillAll => (
+            "exec_cgroup_sweep_kill_all",
+            "exec_cgroup_sweep_kill_all_cut",
+        ),
+        SweepMode::UnpopulatedOnly => (
+            "exec_cgroup_sweep_unpopulated",
+            "exec_cgroup_sweep_unpopulated_cut",
+        ),
+    }
+}
+
+/// 掃除の成否とレイテンシを、プロセス共通の [`exec_cgroup_sweep_recorder`] へ記録する（全終了経路。
+/// 列挙失敗の `Err`・個別の失敗・件数上限の打ち切りは失敗として数える。打ち切りは別名の操作にも数える）。
+/// 記録の失敗（名前上限・カウンタ飽和）は掃除の結果に影響させない。
+fn record_sweep(mode: SweepMode, result: &Result<ExecChildSweep, CgroupError>, elapsed: Duration) {
+    let (name, cut_name) = sweep_op_names(mode);
+    let recorder = exec_cgroup_sweep_recorder();
+    let ok = matches!(result, Ok(v) if v.failed == 0 && !v.truncated);
+    let outcome = if ok {
+        OpOutcome::Success
+    } else {
+        OpOutcome::Failure
+    };
+    if let Ok(n) = OpName::new(name) {
+        let _ = recorder.record(&n, outcome, elapsed);
+    }
+    if matches!(result, Ok(v) if v.truncated)
+        && let Ok(n) = OpName::new(cut_name)
+    {
+        let _ = recorder.record(&n, OpOutcome::Failure, elapsed);
+    }
+}
+
+/// exec 用の子 cgroup 掃除の観測記録器（REPAIR-4・#1596）。操作名は `exec_cgroup_sweep_kill_all`（delete 前）・
+/// `exec_cgroup_sweep_unpopulated`（exec 開始時）と、件数上限で打ち切った回数を数える `*_cut`。
+/// 集計は [`crate::observability::OpRecorder::export_json_lines`] で構造化出力できる。
+/// delete 前の掃除は `ContainerCgroupRemover::remove` の戻り値に載せられないため、プロセス共通の
+/// 記録器へ集約する（スレッドセーフ。長寿命の supervisor でもウィンドウ上限でメモリは増えない）。
+pub fn exec_cgroup_sweep_recorder() -> &'static OpRecorder {
+    static RECORDER: std::sync::OnceLock<OpRecorder> = std::sync::OnceLock::new();
+    RECORDER.get_or_init(OpRecorder::new)
+}
+
+fn sweep_exec_children_inner(
+    container: std::os::fd::BorrowedFd<'_>,
+    mode: SweepMode,
+    deadline: Instant,
+) -> Result<ExecChildSweep, CgroupError> {
     let step = CgroupStep::Cleanup;
     let (names, truncated) = list_exec_child_names(container)?;
     let mut out = ExecChildSweep {
@@ -621,6 +679,11 @@ mod tests {
             assert_eq!(out.removed, 0, "{mode:?}");
             assert_eq!(out.failed, 3, "{mode:?}");
             assert!(out.first_error.is_some(), "{mode:?}");
+            // REPAIR-4: 失敗した掃除が構造化記録に失敗として載る。
+            let name = OpName::new(sweep_op_names(mode).0).unwrap();
+            let stats = exec_cgroup_sweep_recorder().snapshot_op(&name).unwrap();
+            assert!(stats.failure() >= 1, "{mode:?}");
+            assert!(stats.latency().is_some(), "{mode:?}");
             for kept in [
                 "exec-1-1",
                 "exec_1",

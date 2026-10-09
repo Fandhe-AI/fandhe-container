@@ -111,6 +111,7 @@ pub use pids::{PIDS_MAX_LIMIT, PidsMax};
 mod exec_join;
 mod exec_kill;
 pub(crate) use exec_join::{ExecJoinFds, contains_pid, open_cgroup_by_path};
+pub use exec_kill::exec_cgroup_sweep_recorder;
 pub(crate) use exec_kill::{
     EXEC_SWEEP_DELETE_TIMEOUT, ExecChildCgroupFds, ExecChildRemoval, ExecChildSweep, SweepMode,
     remove_exec_child_cgroup_at, sweep_exec_children_at, validate_exec_child_name,

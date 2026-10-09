@@ -33,7 +33,7 @@
 //! - macOS の RSS 取得（TASK-112.1・#265）: `proc_pidinfo(PROC_PIDTASKINFO)`（`resident_size_bytes`。`crate::rss` から呼ばれる）
 //! - Linux・macOS: `killpg(2)`（`kill_process_group`。plugin の子のプロセスグループへ `SIGKILL`。#1311。それ以外の unix は `Unsupported`）
 //! - Linux・macOS: ブロックしないことを保証できる経路（ソケットは `send(MSG_DONTWAIT)`、Linux の FIFO は
-//!   `/proc/self/fd` の `O_NONBLOCK` 開き直し）でだけ fd へ書く（`write_nonblocking`。`ChildGuard::drop` の
+//!   `/proc/self/fd` の `O_NONBLOCK` 開き直し。種別判定は `getsockopt` / `fcntl` で `fstat` は使わない）でだけ fd へ書く（`write_nonblocking`。`ChildGuard::drop` の
 //!   診断出力がブロックしない。#1605。保証できなければ捨てる）
 //! - いずれの unix: `kill(2)` で起動中の plugin へ SIGINT・SIGTERM・SIGHUP を転送する（`send_signal`。
 //!   `crate::signal_forward` が CLI バイナリのシグナルハンドラ上から呼ぶため async-signal-safe であること。#1513・PLUG-7）
@@ -146,7 +146,44 @@ unsafe extern "C" {
     // `ssize_t` / `size_t` は対応ターゲットでポインタ幅、`int` は 32 bit 符号付き。
     #[link_name = "send"]
     fn c_send(fd: i32, buf: *const u8, len: usize, flags: i32) -> isize;
+    // SAFETY（宣言そのものの妥当性）: POSIX の `int getsockopt(int, int, int, void *, socklen_t *)`
+    // （`socklen_t` は対応ターゲットで 32 bit 符号なし）。
+    #[link_name = "getsockopt"]
+    fn c_getsockopt(
+        fd: i32,
+        level: i32,
+        name: i32,
+        val: *mut core::ffi::c_void,
+        len: *mut u32,
+    ) -> i32;
 }
+
+/// `SOL_SOCKET` / `SO_TYPE`（Linux は x86_64・aarch64 とも 1 / 3、macOS は 0xffff / 0x1008。OS ごとに個別定義する）。
+#[cfg(target_os = "linux")]
+const SOL_SOCKET: i32 = 1;
+#[cfg(target_os = "linux")]
+const SO_TYPE: i32 = 3;
+#[cfg(target_os = "macos")]
+const SOL_SOCKET: i32 = 0xffff;
+#[cfg(target_os = "macos")]
+const SO_TYPE: i32 = 0x1008;
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+unsafe extern "C" {
+    // SAFETY（宣言そのものの妥当性）: `int fcntl(int fd, int cmd, ...)`。`F_GETPIPE_SZ` は追加引数を取らない。
+    #[link_name = "fcntl"]
+    fn c_fcntl(fd: i32, cmd: i32, ...) -> i32;
+}
+
+/// Linux の `F_GETPIPE_SZ`（`F_LINUX_SPECIFIC_BASE` 1024 + 8。x86_64・aarch64 共通）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const F_GETPIPE_SZ: i32 = 1032;
 
 /// `MSG_DONTWAIT`（呼び出し 1 回限りの非ブロッキング送信。Linux 0x40・macOS 0x80。OS ごとに個別定義する）。
 #[cfg(target_os = "linux")]
@@ -161,40 +198,67 @@ const MSG_DONTWAIT: i32 = 0x80;
 ))]
 const O_NONBLOCK_NOCTTY: i32 = 0o4000 | 0o400;
 
+/// fd が socket か（`getsockopt(SO_TYPE)`）。fd 単位のカーネル内判定で、ファイルシステムへ問い合わせない
+/// （`fstat` は FUSE / NFS で無期限に止まり得るため使わない。#1605・REPAIR-5）。socket 以外は `ENOTSOCK` で `false`。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn is_socket_fd(fd: i32) -> bool {
+    let mut val: i32 = 0;
+    let mut len: u32 = 4;
+    // SAFETY: `val`・`len` はこの関数のスタック上の有効な書き込み先で、`len` は `val` の大きさ（4）と一致する。
+    // fd は呼び出し側の複製が保持し呼び出し中は閉じられない。fd 単位の問い合わせで副作用は無い。
+    let rc = unsafe {
+        c_getsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_TYPE,
+            (&raw mut val).cast::<core::ffi::c_void>(),
+            &raw mut len,
+        )
+    };
+    rc == 0
+}
+
+/// fd が pipe / FIFO か（Linux の `fcntl(F_GETPIPE_SZ)`。pipe 以外は `EBADF` / `EINVAL`）。`fstat` を使わない。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn is_pipe_fd(fd: i32) -> bool {
+    // SAFETY: 引数は整数のみで、fd 単位のカーネル内問い合わせ（読み取りのみ）。メモリ安全性の前提は無い。
+    unsafe { c_fcntl(fd, F_GETPIPE_SZ) >= 0 }
+}
+
 /// ブロックしないことを保証できる経路でだけ `fd` へ `buf` を 1 回書く。保証できなければ書かない（#1605・REPAIR-5・PLUG-7）。
 ///
 /// `crate::lifecycle` の `ChildGuard::drop` が診断 1 行を stderr へ出すために呼ぶ。共有 fd の
 /// open file description（親・他プロセスと共有される）の状態は変えない。`poll(POLLOUT)` は空き容量を
-/// 予約せず poll と write の間に他者が満たし得るため使わず、fd の種別ごとに次のとおり扱う。
+/// 予約せず poll と write の間に他者が満たし得るため使わない。種別判定は `fstat` / `metadata()` を使わず
+/// fd 単位のカーネル内問い合わせ（`getsockopt` / `fcntl`）だけで行い、応答しない FUSE / NFS 上の fd でも
+/// 判定自体が止まらない。
 /// - ソケット（journald 等への stderr）: `send(MSG_DONTWAIT)`。この呼び出しだけ非ブロッキング
-/// - 通常ファイル: 応答しない FUSE / NFS・FS freeze で同期 write が止まり得て `O_NONBLOCK` でも防げないため
-///   書かず `Unsupported`（診断は捨てる）
-/// - Linux の FIFO・キャラクタデバイス: `/proc/self/fd/N` を `O_NONBLOCK` で開き直した別 description へ書く
+/// - Linux の pipe / FIFO: `/proc/self/fd/N` を `O_NONBLOCK` で開き直した別 description へ書く
 ///   （共有側のフラグは変わらない。満杯なら `WouldBlock`）
-/// - 上記以外（macOS の pipe・通常ファイル等）: ブロックしない保証がないため書かず `Unsupported`（診断は捨てる）
+/// - 上記以外（通常ファイル・キャラクタデバイス・macOS の pipe 等）: 通常ファイルは FUSE / NFS・FS freeze で、
+///   キャラクタデバイスは CUSE 等の open / write で無期限に止まり得て `O_NONBLOCK` でも防げず、保証できないため
+///   書かず `Unsupported`（診断は捨てる）
 ///
 /// 満杯なら `WouldBlock`。部分書き込みも有り得るため書けたバイト数を返す。std の stderr ロックは取らない。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn write_nonblocking(fd: &impl AsFd, buf: &[u8]) -> io::Result<usize> {
-    use std::os::unix::fs::FileTypeExt;
-
     let owned = fd.as_fd().try_clone_to_owned()?;
     let file = File::from(owned);
-    let ft = file.metadata()?.file_type();
-    if ft.is_socket() {
+    if is_socket_fd(file.as_raw_fd()) {
         // SAFETY: `buf` は有効な読み取り専用スライスで、渡す長さは `buf.len()`。fd は `file`（複製）が保持し
         // 呼び出し中は閉じられない。`MSG_DONTWAIT` で待たない。`MSG_NOSIGNAL` は付けないが Rust ランタイムは
         // `SIGPIPE` を無視している。
         let w = unsafe { c_send(file.as_raw_fd(), buf.as_ptr(), buf.len(), MSG_DONTWAIT) };
         return usize::try_from(w).map_err(|_| io::Error::last_os_error());
     }
-    // 通常ファイルは書かない: 応答しない FUSE / NFS・freeze された FS では同期 write が無期限に止まり得て、
-    // `O_NONBLOCK` でも防げない。保証できないので下の `Unsupported` に落として診断を捨てる。
     #[cfg(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
-    if ft.is_fifo() || ft.is_char_device() {
+    if is_pipe_fd(file.as_raw_fd()) {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let path = format!("/proc/self/fd/{}", file.as_raw_fd());

@@ -1506,6 +1506,18 @@ mod tests {
         assert_eq!(len, 0);
     }
 
+    /// REPAIR-5・PLUG-7・#1605: キャラクタデバイスは CUSE 等で open / write が止まり得るため書かず `Unsupported`。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn repair5_drop_log_discards_on_char_device() {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let r = crate::sys::write_nonblocking(&f, b"x\n");
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::Unsupported);
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn repair4_drop_log_writes_line_when_fd_ready() {

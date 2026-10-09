@@ -828,7 +828,7 @@ impl ChildGuard {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         // 書き込み失敗は無視する（`Drop`・panic の unwinding 中でも panic しない）。
-        // stderr が満杯の pipe 等でも後始末を止めないため、書き込み可を確認できたときだけ 1 回 `write` し、
+        // stderr が満杯の pipe 等でも後始末を止めないため、ブロックしないことを保証できる経路でだけ 1 回書き、
         // 書けなければ記録を捨てる（スレッドもロックも残さない。REPAIR-5・PLUG-7）。
         self.finish_on_drop(&mut |rec| {
             let mut line = rec.to_json_line();
@@ -840,8 +840,8 @@ impl Drop for ChildGuard {
 
 /// `Drop` の診断 1 行を `fd` へ非ブロッキングで書く。書けなければ捨てる（#1605・REPAIR-5）。
 #[cfg(unix)]
-fn write_drop_log(fd: &impl std::os::unix::io::AsRawFd, line: &[u8]) {
-    let _ = crate::sys::write_if_ready(fd, line);
+fn write_drop_log(fd: &impl std::os::unix::io::AsFd, line: &[u8]) {
+    let _ = crate::sys::write_nonblocking(fd, line);
 }
 
 /// 非 unix ではブロックしない書き込み手段を持たないため診断出力を捨てる（fail-closed）。
@@ -1432,7 +1432,7 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn repair4_drop_log_does_not_block_on_full_fd_and_leaves_no_thread() {
-        // 満杯のソケットを stderr に見立てる。書き込み可でなければ書かず即座に戻り、スレッドを作らない
+        // 満杯のソケットを stderr に見立てる。ブロックしない保証のある経路（MSG_DONTWAIT）で即座に戻り、スレッドを作らない
         // （#1605・REPAIR-5・PLUG-7）。
         use std::io::Write;
         use std::os::unix::net::UnixStream;
@@ -1449,13 +1449,47 @@ mod tests {
         // 非ブロッキングに戻さない（ブロッキング fd なら無条件 write は永久に止まる状況）。
         a.set_nonblocking(false).unwrap();
         let start = Instant::now();
-        let r = crate::sys::write_if_ready(&a, GROUP_KILL_FAILED_LINE.as_bytes());
+        let r = crate::sys::write_nonblocking(&a, GROUP_KILL_FAILED_LINE.as_bytes());
         assert!(start.elapsed() < Duration::from_millis(100));
         assert_eq!(r.unwrap_err().kind(), io::ErrorKind::WouldBlock);
         // `Drop` 経路の入口も同様に期限内に戻る。
         let start = Instant::now();
         write_drop_log(&a, GROUP_KILL_FAILED_LINE.as_bytes());
         assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    /// REPAIR-5・PLUG-7・#1605: 満杯の pipe（ブロッキングのまま）でも戻り、共有 fd を非ブロッキング化しない。
+    #[test]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn repair5_drop_log_does_not_block_on_full_pipe() {
+        use std::os::unix::io::AsRawFd;
+        let (_r, w) = io::pipe().unwrap();
+        // `write_nonblocking` 自身で満杯にする（書けなくなった時点で `WouldBlock`）。ブロックするなら
+        // ここで固まるため、テスト全体の timeout が検出する。
+        let start = Instant::now();
+        let line = GROUP_KILL_FAILED_LINE.as_bytes();
+        loop {
+            match crate::sys::write_nonblocking(&w, line) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("write failed: {e}"),
+            }
+            assert!(start.elapsed() < Duration::from_secs(10));
+        }
+        let start = Instant::now();
+        write_drop_log(&w, line);
+        assert!(start.elapsed() < Duration::from_millis(500));
+        // 共有 description のフラグ（`O_NONBLOCK` = 0o4000）は変わっていない。
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", w.as_raw_fd())).unwrap();
+        let flags = info
+            .lines()
+            .find_map(|l| l.strip_prefix("flags:"))
+            .map(|v| i64::from_str_radix(v.trim(), 8).unwrap())
+            .unwrap();
+        assert_eq!(flags & 0o4000, 0);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1465,7 +1499,7 @@ mod tests {
         use std::os::unix::net::UnixStream;
         let (a, mut b) = UnixStream::pair().unwrap();
         let line = b"{\"event\":\"x\"}\n";
-        assert_eq!(crate::sys::write_if_ready(&a, line).unwrap(), line.len());
+        assert_eq!(crate::sys::write_nonblocking(&a, line).unwrap(), line.len());
         let mut got = vec![0u8; line.len()];
         b.read_exact(&mut got).unwrap();
         assert_eq!(got, line);

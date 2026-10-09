@@ -32,8 +32,9 @@
 //!   対応外の OS・アーキテクチャは `Unsupported`
 //! - macOS の RSS 取得（TASK-112.1・#265）: `proc_pidinfo(PROC_PIDTASKINFO)`（`resident_size_bytes`。`crate::rss` から呼ばれる）
 //! - Linux・macOS: `killpg(2)`（`kill_process_group`。plugin の子のプロセスグループへ `SIGKILL`。#1311。それ以外の unix は `Unsupported`）
-//! - Linux・macOS: `poll(2)` + `write(2)` で、書き込み可のときだけ fd へ書く（`write_if_ready`。`ChildGuard::drop` の
-//!   診断出力がブロックしない。#1605。それ以外の unix は `Unsupported`）
+//! - Linux・macOS: ブロックしないことを保証できる経路（ソケットは `send(MSG_DONTWAIT)`、Linux の FIFO は
+//!   `/proc/self/fd` の `O_NONBLOCK` 開き直し）でだけ fd へ書く（`write_nonblocking`。`ChildGuard::drop` の
+//!   診断出力がブロックしない。#1605。保証できなければ捨てる）
 //! - いずれの unix: `kill(2)` で起動中の plugin へ SIGINT・SIGTERM・SIGHUP を転送する（`send_signal`。
 //!   `crate::signal_forward` が CLI バイナリのシグナルハンドラ上から呼ぶため async-signal-safe であること。#1513・PLUG-7）
 //! - Linux: `prctl(PR_SET_PDEATHSIG, SIGKILL)` と `getppid(2)` を `pre_exec` で呼び、親の強制終了時に plugin 本体を
@@ -64,7 +65,6 @@
 use std::ffi::CStr;
 use std::fs::File;
 use std::io;
-use std::os::unix::io::AsRawFd;
 #[cfg(any(
     target_os = "macos",
     all(
@@ -73,6 +73,7 @@ use std::os::unix::io::AsRawFd;
     )
 ))]
 use std::os::unix::io::FromRawFd;
+use std::os::unix::io::{AsFd, AsRawFd};
 use std::os::unix::net::UnixStream;
 
 use crate::error::{PluginError, PluginErrorCode};
@@ -141,63 +142,74 @@ pub(crate) fn kill_process_group(pgid: u32) -> io::Result<()> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 unsafe extern "C" {
-    // SAFETY（宣言そのものの妥当性）: POSIX の `int poll(struct pollfd *fds, nfds_t nfds, int timeout)` と
-    // `ssize_t write(int fd, const void *buf, size_t count)`。`nfds_t` は Linux で `unsigned long`、macOS で
-    // `unsigned int` のため OS ごとに別の型で宣言する。`ssize_t` / `size_t` は対応ターゲットでポインタ幅。
-    #[cfg(target_os = "linux")]
-    #[link_name = "poll"]
-    fn c_poll(fds: *mut PollFd, nfds: std::ffi::c_ulong, timeout: i32) -> i32;
-    #[cfg(target_os = "macos")]
-    #[link_name = "poll"]
-    fn c_poll(fds: *mut PollFd, nfds: std::ffi::c_uint, timeout: i32) -> i32;
-    #[link_name = "write"]
-    fn c_write(fd: i32, buf: *const u8, count: usize) -> isize;
+    // SAFETY（宣言そのものの妥当性）: POSIX の `ssize_t send(int socket, const void *buffer, size_t length, int flags)`。
+    // `ssize_t` / `size_t` は対応ターゲットでポインタ幅、`int` は 32 bit 符号付き。
+    #[link_name = "send"]
+    fn c_send(fd: i32, buf: *const u8, len: usize, flags: i32) -> isize;
 }
 
-/// `struct pollfd`（Linux・macOS 共通のレイアウト: `int fd; short events; short revents;`）。
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[repr(C)]
-struct PollFd {
-    fd: i32,
-    events: i16,
-    revents: i16,
-}
+/// `MSG_DONTWAIT`（呼び出し 1 回限りの非ブロッキング送信。Linux 0x40・macOS 0x80。OS ごとに個別定義する）。
+#[cfg(target_os = "linux")]
+const MSG_DONTWAIT: i32 = 0x40;
+#[cfg(target_os = "macos")]
+const MSG_DONTWAIT: i32 = 0x80;
 
-/// `POLLOUT`（Linux・macOS とも 0x0004）。
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-const POLLOUT: i16 = 0x0004;
+/// `O_NONBLOCK | O_NOCTTY`（Linux の x86_64・aarch64 とも `O_NONBLOCK` は 0o4000、`O_NOCTTY` は 0o400）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const O_NONBLOCK_NOCTTY: i32 = 0o4000 | 0o400;
 
-/// 書き込み可のときだけ `fd` へ `buf` を 1 回 `write(2)` する。ブロックしない（#1605・REPAIR-5・PLUG-7）。
+/// ブロックしないことを保証できる経路でだけ `fd` へ `buf` を 1 回書く。保証できなければ書かない（#1605・REPAIR-5・PLUG-7）。
 ///
-/// `crate::lifecycle` の `ChildGuard::drop` が診断 1 行を stderr へ出すために呼ぶ。`poll(POLLOUT, 0)` で
-/// 書き込み可を確認できなければ書かず `WouldBlock` を返す。呼び出し側は `PIPE_BUF` 以下の短い 1 行だけを
-/// 渡す前提で、この長さの `write` は空きがあれば原子的に入りブロックしない。部分書き込みも有り得るため
-/// 書けたバイト数を返す。`O_NONBLOCK` は設定しない（open file description は親・他プロセスと共有されるため）。
-/// std の stderr ロックは取らない（別スレッドの出力が滞留していても進める）。
+/// `crate::lifecycle` の `ChildGuard::drop` が診断 1 行を stderr へ出すために呼ぶ。共有 fd の
+/// open file description（親・他プロセスと共有される）の状態は変えない。`poll(POLLOUT)` は空き容量を
+/// 予約せず poll と write の間に他者が満たし得るため使わず、fd の種別ごとに次のとおり扱う。
+/// - ソケット（journald 等への stderr）: `send(MSG_DONTWAIT)`。この呼び出しだけ非ブロッキング
+/// - 通常ファイル: 無期限には待たないので通常の書き込み
+/// - Linux の FIFO・キャラクタデバイス: `/proc/self/fd/N` を `O_NONBLOCK` で開き直した別 description へ書く
+///   （共有側のフラグは変わらない。満杯なら `WouldBlock`）
+/// - 上記以外（macOS の pipe 等）: ブロックしない保証がないため書かず `Unsupported`（診断は捨てる）
+///
+/// 満杯なら `WouldBlock`。部分書き込みも有り得るため書けたバイト数を返す。std の stderr ロックは取らない。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) fn write_if_ready(fd: &impl AsRawFd, buf: &[u8]) -> io::Result<usize> {
-    let raw = fd.as_raw_fd();
-    let mut pfd = PollFd {
-        fd: raw,
-        events: POLLOUT,
-        revents: 0,
-    };
-    // SAFETY: `pfd` は有効な単一要素で `nfds` は 1、`timeout` 0 は即時復帰。fd は呼び出し中借用されている。
-    let n = unsafe { c_poll(&mut pfd, 1, 0) };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
+pub(crate) fn write_nonblocking(fd: &impl AsFd, buf: &[u8]) -> io::Result<usize> {
+    use std::io::Write;
+    use std::os::unix::fs::FileTypeExt;
+
+    let owned = fd.as_fd().try_clone_to_owned()?;
+    let file = File::from(owned);
+    let ft = file.metadata()?.file_type();
+    if ft.is_socket() {
+        // SAFETY: `buf` は有効な読み取り専用スライスで、渡す長さは `buf.len()`。fd は `file`（複製）が保持し
+        // 呼び出し中は閉じられない。`MSG_DONTWAIT` で待たない。`MSG_NOSIGNAL` は付けないが Rust ランタイムは
+        // `SIGPIPE` を無視している。
+        let w = unsafe { c_send(file.as_raw_fd(), buf.as_ptr(), buf.len(), MSG_DONTWAIT) };
+        return usize::try_from(w).map_err(|_| io::Error::last_os_error());
     }
-    if n == 0 || pfd.revents & POLLOUT == 0 {
-        return Err(io::Error::from(io::ErrorKind::WouldBlock));
+    if ft.is_file() {
+        return (&file).write(buf);
     }
-    // SAFETY: `buf` は有効な読み取り専用スライスで、渡す長さは `buf.len()` 以下。fd は借用中で閉じられない。
-    let w = unsafe { c_write(raw, buf.as_ptr(), buf.len()) };
-    usize::try_from(w).map_err(|_| io::Error::last_os_error())
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    if ft.is_fifo() || ft.is_char_device() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = format!("/proc/self/fd/{}", file.as_raw_fd());
+        let mut private = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(O_NONBLOCK_NOCTTY)
+            .open(path)?;
+        return private.write(buf);
+    }
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
-/// Linux・macOS 以外の unix 向け。`poll` の型を持たないため書かず `Unsupported`（fail-closed）。
+/// Linux・macOS 以外の unix 向け。ブロックしない保証がないため書かず `Unsupported`（fail-closed）。
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn write_if_ready(fd: &impl AsRawFd, buf: &[u8]) -> io::Result<usize> {
+pub(crate) fn write_nonblocking(fd: &impl AsFd, buf: &[u8]) -> io::Result<usize> {
     let _ = (fd, buf);
     Err(io::Error::from(io::ErrorKind::Unsupported))
 }

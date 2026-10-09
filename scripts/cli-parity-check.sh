@@ -33,6 +33,9 @@
 #
 # 後始末の限界: タイムアウト・中断時の回収は CLI を起動したプロセスグループ単位で行う。CLI の子孫が
 # setsid 等で別セッション / 別グループへ出た場合は回収できない（追跡手段が無い。REPAIR-5 の範囲外として残る）。
+# Windows（Git Bash）のネイティブ exe の子は POSIX の pgid を持たないため、未回収の CLI に限り
+# taskkill /T でツリーごと回収する（kill_win_tree。#1548）。CLI の正常終了後に残った子孫と、期限前に
+# 親が死んで孤児になった子孫は辿れない。CI での確認は scripts/cli-parity-native-reclaim-check.sh。
 #
 # 動作環境: bash 3.2 以上（macOS 標準）。GNU / BSD 双方のツールで動く書き方にしている。
 # Windows は Git Bash で実行する。自己テスト（スタブ CLI）は CI の windows runner でも実行するが、
@@ -41,13 +44,15 @@
 set -euo pipefail
 
 # 文字クラス・範囲・文字列長（${#var} はバイト数になる）の解釈を実行環境のロケールに依存させない
-# （OS 間で判定が変わるのを防ぐ）。検査対象の CLI には元の値を戻して渡す（run_cli。CLI の実行環境は変えない）。
-if [ -n "${LC_ALL+x}" ]; then
-  readonly ORIG_LC_ALL_SET=1 ORIG_LC_ALL="$LC_ALL"
-else
-  readonly ORIG_LC_ALL_SET=0 ORIG_LC_ALL=""
-fi
+# （OS 間で判定が変わるのを防ぐ）。検査対象の CLI も同じ LC_ALL=C で実行する（#1548・CLI-1）。製品 CLI は
+# setlocale を呼ばず出力は英語固定のため、ホストのロケールを渡しても比較の情報は増えない。一方、無効な
+# LC_ALL を bash 製スタブへ渡すと子の bash が setlocale 警告を stderr に足し、code の判定を壊す。
+# 残る限界: 本スクリプト自身の起動時に bash が出す setlocale 警告（スクリプトの stderr）は抑えられないが、
+# 記録内容と終了コードには影響しない。
 export LC_ALL=C
+
+# Git Bash（MSYS2）か。ネイティブ exe の子孫回収（kill_win_tree）を Windows でだけ行うために使う。
+case "${OSTYPE:-}" in msys* | cygwin*) readonly IS_WINDOWS_HOST=1 ;; *) readonly IS_WINDOWS_HOST=0 ;; esac
 
 readonly FORMAT_HEADER='# fandhe-container-cli-parity v1'
 readonly COLUMNS_LINE=$'case\tlayer\texit\tcode\tstdout'
@@ -138,6 +143,19 @@ kill_group() {
   done
 }
 
+# Windows のネイティブ exe の子孫を taskkill /T でツリーごと回収する（#1548・REPAIR-5）。Git Bash では
+# ネイティブ exe の子が POSIX の pgid を持たず kill_group が届かない。Windows の PID は /proc/<pid>/winpid
+# から数字だけ読み、検証してから渡す（インジェクション防止）。呼んでよいのは CLI が未回収の間だけ
+# （回収済みの pid の winpid を使わない）。先に親が死ぬと /T が辿れないので kill_group より前に呼ぶ。
+kill_win_tree() {
+  [ "$IS_WINDOWS_HOST" -eq 1 ] || return 0
+  local w=""
+  [ -r "/proc/$1/winpid" ] || return 0
+  IFS= read -r w <"/proc/$1/winpid" || true
+  case "$w" in '' | *[!0-9]* | ???????????*) return 0 ;; esac
+  taskkill //F //T //PID "$w" >/dev/null 2>&1 || true
+}
+
 # 未回収（まだ wait していない）の子 $1 が、グループ宛ての回収の後も生きている場合に限り pid 単体へ
 # KILL を送る。set -m が効かずプロセスグループが分かれなかった環境で、ハングした CLI を残さないための
 # 保険。呼び出してよいのは親が wait する前だけ（未回収の子の pid は再利用されない）。
@@ -155,6 +173,7 @@ cleanup() {
   # 中断時に実行中の CLI とその子孫を残さない。グループごと回収を待ってから一時ディレクトリを消す。
   # run_pid は run_cli が wait を終えた直後に空にするので、ここへ来る時点では未回収である。
   if [ -n "$run_pid" ]; then
+    kill_win_tree "$run_pid"
     kill_group "$run_pid"
     kill_unreaped_child "$run_pid"
     wait "$run_pid" 2>/dev/null || true
@@ -195,7 +214,6 @@ run_cli() {
   set -m
   (
     ulimit -f 256 2>/dev/null || true
-    if [ "$ORIG_LC_ALL_SET" -eq 1 ]; then LC_ALL="$ORIG_LC_ALL"; else unset LC_ALL; fi
     exec "$cli" "$@" </dev/null >"$tmp_dir/out" 2>"$tmp_dir/err"
   ) &
   pid=$!
@@ -213,6 +231,7 @@ run_cli() {
     # 終えていたら（done の印）何もしない（回収済みの pid を調べない・撃たない）。
     if [ ! -e "$marker.done" ] && kill -0 "$pid" 2>/dev/null; then
       : >"$marker"
+      kill_win_tree "$pid"
       kill_group "$pid"
       [ -e "$marker.done" ] || kill_unreaped_child "$pid"
     fi

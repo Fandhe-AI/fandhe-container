@@ -61,6 +61,8 @@ stub="$work/stub-cli"
 cat >"$stub" <<'STUB'
 #!/usr/bin/env bash
 mode="${STUB_MODE:-ok}"
+# 受け取った LC_ALL を記録する（無効なロケールを CLI へ渡していないことの照合用。#1548）。
+[ -z "${STUB_LOCALE_FILE:-}" ] || printf '%s\n' "${LC_ALL-<unset>}" >>"$STUB_LOCALE_FILE"
 seen_root=0
 seen_pps=0
 root=""
@@ -301,6 +303,8 @@ expect_line() { # <表示名> <名前> <期待する行>
 mkdir -p "$work/tmpdir"
 : >"$work/pids.txt"
 start_capture ok ok
+# 無効な LC_ALL（#1548・CLI-1）。bash 製スタブの setlocale 警告が stderr に混ざらず、CLI へは C が渡る。
+LC_ALL=xx_XX.UTF-8 STUB_LOCALE_FILE="$work/locale.txt" start_capture lcall ok
 start_capture nonlinux nonlinux
 TMPDIR="$work/tmpdir" start_capture diff diff
 start_capture noisy noisy
@@ -310,10 +314,10 @@ STUB_ERR_DIR="$errmax" STUB_OUT_DIR="$pidout" start_capture errmax ok
 STUB_OUT_DIR="$outdir" start_capture outtable ok
 wait
 
-for name in ok nonlinux diff noisy errtable errmax outtable; do
+for name in ok lcall nonlinux diff noisy errtable errmax outtable; do
   expect_rc "capture $name exits 0" 0 "$(rc_of "$name")"
 done
-for name in ok nonlinux diff noisy errtable errmax outtable; do
+for name in ok lcall nonlinux diff noisy errtable errmax outtable; do
   # 失敗の調査用。capture の stderr は固定語彙の 1 行で、パスや環境の値を含まない。
   [ "$(rc_of "$name")" = "0" ] || [ ! -s "$work/$name.err" ] || sed "s/^/  $name stderr: /" "$work/$name.err"
 done
@@ -328,6 +332,22 @@ expect_line "A02 usage error" ok "A02${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-
 expect_line "B01 empty list" ok "B01${tab}B${tab}0${tab}-${tab}list:H"
 expect_line "B03 list after create" ok "B03${tab}B${tab}0${tab}-${tab}list:H;c1,created,-"
 expect_line "B04 duplicate create" ok "B04${tab}B${tab}4${tab}ALREADY_EXISTS${tab}-"
+# --- 無効な LC_ALL（#1548） ---
+# macOS の bash 3.2 は警告を出さないことがあり、その環境ではこのケースが回帰を判別しない（診断のみ。値の照合は全 OS で行う）。
+warn_probe="$(LC_ALL=xx_XX.UTF-8 bash -c : 2>&1 || true)"
+if [ -n "$warn_probe" ]; then echo "note: invalid LC_ALL emits a bash warning on this runner: yes"; else echo "note: invalid LC_ALL emits a bash warning on this runner: no"; fi
+expect_line "lcall A02 usage error" lcall "A02${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
+expect_line "lcall B01 empty list" lcall "B01${tab}B${tab}0${tab}-${tab}list:H"
+expect_line "lcall B04 duplicate create" lcall "B04${tab}B${tab}4${tab}ALREADY_EXISTS${tab}-"
+expect_line "lcall B15 missing state root" lcall "B15${tab}B${tab}3${tab}NOT_FOUND${tab}-"
+loc_n=0
+loc_bad=0
+while IFS= read -r l; do
+  loc_n=$((loc_n + 1))
+  [ "$l" = "C" ] || loc_bad=$((loc_bad + 1))
+done <"$work/locale.txt"
+expect_eq "lcall stub invocations" 33 "$loc_n"
+expect_eq "lcall stub got LC_ALL other than C" 0 "$loc_bad"
 expect_line "B15 missing state root" ok "B15${tab}B${tab}3${tab}NOT_FOUND${tab}-"
 {
   IFS= read -r meta1
@@ -402,6 +422,10 @@ compare ok ok
 expect_rc "compare identical is rc 0" 0 $?
 cmp_has "layer A summary" 'layer A (syntax): match=18 mismatch=0 missing=0'
 cmp_has "layer B summary" 'layer B (behavior): match=15 mismatch=0 missing=0'
+compare ok lcall
+expect_rc "compare ok vs lcall is rc 0" 0 $?
+cmp_has "lcall layer A summary" 'layer A (syntax): match=18 mismatch=0 missing=0'
+cmp_has "lcall layer B summary" 'layer B (behavior): match=15 mismatch=0 missing=0'
 
 compare ok diff
 expect_rc "compare with changed exit code is rc 1" 1 $?
@@ -462,9 +486,10 @@ expect_rc "invalid input wins over os precondition (rc 2)" 2 $?
 
 # --- タイムアウト ---
 expect_rc "hanging CLI is rc 1" 1 "$(rc_of hang)"
-# 終了コード欄は強制終了のシグナル（TERM = 143 / KILL = 137）で変わるため、タイムアウトの印だけを照合する。
+# 終了コード欄は強制終了のシグナル（TERM = 143 / KILL = 137。Windows の Bash では 0 になることもある）
+# で変わるため、タイムアウトの印（コード・stdout 欄の <timeout>）だけを照合する。
 case "$(line_of hang A02)" in
-  "A02${tab}A${tab}143${tab}<timeout>${tab}<timeout>" | "A02${tab}A${tab}137${tab}<timeout>${tab}<timeout>")
+  "A02${tab}A${tab}"[0-9]*"${tab}<timeout>${tab}<timeout>")
     pass "A02 recorded as timeout"
     ;;
   *) fail "A02 recorded as timeout (got '$(line_of hang A02)')" ;;

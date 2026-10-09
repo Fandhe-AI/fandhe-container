@@ -357,7 +357,7 @@ F1.1 の範囲外（申し送り）: 値の意味の検証（vring addr のア�
 
 ### 10.6 fd の受け渡しと共有メモリ（F1.2・#1517）
 
-frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲストメモリ領域の fd と eventfd を渡し、backend は `SET_MEM_TABLE` の領域を `mmap` して GPA 経由でアクセスする。rust-vmm 系は MVM-4 で使えないため自作し、crosvm の構造体やロジックは写していない。`unsafe` は `src/sys.rs` にだけ置く（個別承認: [#1517 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6074351741)。U1 `syscall` 宣言・U2 `recvmsg`・U3 受信 fd の所有・U4 `sendmsg`・U5 `memfd_create`・U6 `mmap`・U7 `Drop` の `munmap`・U8 境界検査後のコピー。レビュー指摘で U9 `fcntl`〔`F_GET_SEALS` / `F_ADD_SEALS`〕を `sys` モジュールの事前承認の範囲で追加）。
+frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲストメモリ領域の fd と eventfd を渡し、backend は `SET_MEM_TABLE` の領域を `mmap` して GPA 経由でアクセスする。rust-vmm 系は MVM-4 で使えないため自作し、crosvm の構造体やロジックは写していない。`unsafe` は `src/sys.rs` にだけ置く（個別承認: [#1517 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6074351741)。U1 `syscall` 宣言・U2 `recvmsg`・U3 受信 fd の所有・U4 `sendmsg`・U5 `memfd_create`・U6 `mmap`・U7 `Drop` の `munmap`・U8 境界検査後のコピー。レビュー指摘への対応で U9 `fcntl`〔`F_GET_SEALS` / `F_ADD_SEALS`〕・U10 `ppoll` を #1517 の追加承認〔[#1517 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6075711404)〕で加えた。#4 の `sys` モジュールの事前承認は根拠にしない）。lint は `lib.rs` に crate 全体の `#![deny(unsafe_code)]` を置き、`sys` にだけ `#[allow(unsafe_code)]` を付ける（承認条件）。
 
 出典（確認日 2026-10-09。値だけを転記）: Linux UAPI ヘッダ（`linux-libc-dev`）の `asm-generic/socket.h`（SHA-256 `e833d32d3d8d03732021da6968665431d693ab4effdd4d39965ff05115a4ed21`）・`linux/socket.h`（`f4331fd201269894f63242a2521b3d5b3290ca556969011d7858908d5fe658c4`）・`asm-generic/mman-common.h`・`linux/memfd.h`、syscall 番号は `asm/unistd_64.h`（x86_64）と asm-generic `unistd.h`（aarch64）、man `recvmsg(2)`・`unix(7)`・`cmsg(3)`・`mmap(2)`・`memfd_create(2)`。
 

@@ -10,7 +10,7 @@ virtio-gpu 外部バックエンドの仕組みへ、自前の最小 venus デ�
   ログ照合器（`log`）。トランスポート（vhost-user 等）のソケット I/O は未実装で、socket を開かない。
 - 実装済み（F1.1・#1516）: vhost-user メッセージの codec（`vhost_user`。最小 16 要求種別の復号・符号化と応答 5 種。
   fd・socket・virtqueue には触れない）。出典と前提は `docs/design/venus-decoder-poc.md` 10.5。
-- 実装済み（F1.2・#1517。Linux 限定）: `SCM_RIGHTS` による fd の送受信（上限・`MSG_CTRUNC` 検出・close-on-exec・タイムアウト）と、ゲストメモリ領域の mmap / munmap（境界検査つきの読み書き）。`unsafe` は `src/sys.rs` にだけ置く（承認範囲 U1〜U8 に、縮小封じ込めの seal 検査用の `fcntl` U9 を追加）
+- 実装済み（F1.2・#1517。Linux 限定）: `SCM_RIGHTS` による fd の送受信（上限・`MSG_CTRUNC` 検出・close-on-exec・タイムアウト）と、ゲストメモリ領域の mmap / munmap（境界検査つきの読み書き）。`unsafe` は `src/sys.rs` にだけ置く（根拠は #1517 の個別承認 U1〜U8 と、追加承認の U9 `fcntl`〔縮小封じ込めの seal 検査〕・U10 `ppoll`〔期限つき待機〕。`lib.rs` の crate 全体の `#![deny(unsafe_code)]` を `sys` でだけ `#[allow(unsafe_code)]` で外す）
 - 未実装: virtqueue（F1.3）、セッションと応答ループ・UDS の bind と peer credential の検証（F1.4）。治具自身は socket を開かない。
 - 未達: 「Linux ゲストの Mesa venus の capset クエリが自前デコーダに届いたことをログで確認」は
   トランスポート（後続 F1）と実機実行（#725。人間担当）の完了まで満たせない。

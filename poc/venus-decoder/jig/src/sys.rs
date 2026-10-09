@@ -1,17 +1,19 @@
 #![cfg(target_os = "linux")]
 //! vhost-user のトランスポートが使う syscall の薄いラッパー（GPU-6・MVM-4・TASK-172 F1.2・#1517）。
 //!
-//! 役割: `SCM_RIGHTS` による fd の送受信（`recvmsg(2)` / `sendmsg(2)`）・`memfd_create(2)`・`mmap(2)` / `munmap(2)` と、
-//! マッピング領域へのコピー入出力を、安全な `pub(crate)` 関数と型だけで包む。呼び出し元は
-//! `vhost_user::fd_passing` と `vhost_user::guest_memory` で、`unsafe` はこのモジュールの外へ出さない。
+//! 役割: `SCM_RIGHTS` による fd の送受信（`recvmsg(2)` / `sendmsg(2)`）・期限つき待機（`ppoll(2)`）・`memfd_create(2)`・
+//! seal の確認と追加（`fcntl(2)`）・`mmap(2)` / `munmap(2)` と、マッピング領域へのコピー入出力を、安全な `pub(crate)`
+//! 関数と型だけで包む。呼び出し元は `vhost_user::fd_passing` と `vhost_user::guest_memory` で、`unsafe` はこのモジュールの外へ出さない。
 //!
-//! # unsafe の承認範囲（U1〜U8）
-//! 個別承認の記録: <https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6074351741>。
-//! 承認範囲は U1 `syscall(2)` の `extern` 宣言・U2 `recvmsg`・U3 受信 fd の `OwnedFd::from_raw_fd`・U4 `sendmsg`・
-//! U5 `memfd_create` と `from_raw_fd`・U6 `mmap`・U7 `Drop` での `munmap`・U8 境界検査後の `copy_nonoverlapping`。
-//! U10 `ppoll`（期限つき待機。`syscall(2)` 経由。fd の状態を待つだけでメモリは `pollfd` の `revents` にしか書かない薄いラッパー。
-//! F1.2 のレビュー指摘で追加。事前承認の範囲に収まる）・U9 `fcntl`（`F_GET_SEALS` / `F_ADD_SEALS`。`syscall(2)` 経由。メモリに触れない薄いラッパー。F1.2 のレビュー指摘で追加。
-//! 各 crate の `sys` モジュールに置く syscall ラッパーの事前承認の範囲に収まる）。
+//! # unsafe の承認範囲（U1〜U10）
+//! 根拠は #1517 の個別承認（U9・U10 は追加承認）。#4 の `sys` モジュールの事前承認は PoC パッケージに及ぶか
+//! 明確でないため根拠にしない。
+//! - U1〜U8: <https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6074351741>。
+//!   U1 `syscall(2)` の `extern` 宣言・U2 `recvmsg`・U3 受信 fd の `OwnedFd::from_raw_fd`・U4 `sendmsg`・
+//!   U5 `memfd_create` と `from_raw_fd`・U6 `mmap`・U7 `Drop` での `munmap`・U8 境界検査後の `copy_nonoverlapping`。
+//! - U9・U10（追加承認）: <https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6075711404>。
+//!   U9 `fcntl`（`F_GET_SEALS` / `F_ADD_SEALS`。`syscall(2)` 経由。メモリに触れない。受け取った memfd の縮小封じ込めの確認）・
+//!   U10 `ppoll`（`syscall(2)` 経由の期限つき待機。カーネルは `pollfd` の `revents` と、残り時間を `timespec` へ書き戻す）。
 //! これを超える `unsafe`（`extern` 宣言の追加を含む）は書かない。`recvmsg` 等を直接 `extern` で宣言せず、すべて
 //! `syscall(2)` 経由にする。
 //!

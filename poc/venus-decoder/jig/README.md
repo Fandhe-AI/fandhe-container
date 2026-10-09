@@ -7,7 +7,10 @@ virtio-gpu 外部バックエンドの仕組みへ、自前の最小 venus デ�
 ## 現状（実装済みを装わない。REPAIR-3）
 
 - 実装済み: virtio-gpu ctrl の `GET_CAPSET_INFO` / `GET_CAPSET` の復号・応答符号化・構造化ログ 1 行（`adapter`）と
-  ログ照合器（`log`）。トランスポート（vhost-user 等）は未実装で、socket を開かない。
+  ログ照合器（`log`）。
+- 実装済み（F1.1・#1516）: vhost-user メッセージの codec（`vhost_user`。最小 16 要求種別の復号・符号化と応答 5 種。
+  fd・socket・virtqueue には触れない）。出典と前提は `docs/design/venus-decoder-poc.md` 10.4。
+- 未実装: ソケット I/O・fd 受け渡し・mmap（F1.2）、virtqueue（F1.3）、セッションと応答ループ（F1.4）。socket は開かない。
 - 未達: 「Linux ゲストの Mesa venus の capset クエリが自前デコーダに届いたことをログで確認」は
   トランスポート（後続 F1）と実機実行（#725。人間担当）の完了まで満たせない。
 
@@ -22,6 +25,6 @@ FANDHE_VENUS_JIG_LOG=<ログファイル> cargo test --manifest-path poc/venus-d
 
 ## 後続
 
-- F1: vhost-user トランスポート（メッセージ codec・fd 受け渡しと mmap の sys ラッパー・split virtqueue）
+- F1: vhost-user トランスポート（F1.1 メッセージ codec は実装済み／F1.2 fd 受け渡しと mmap の sys ラッパー〔#1517〕／F1.3 split virtqueue〔#1518〕／F1.4 セッション〔#1519〕）
 - F2: 残りの ctrl 応答（`GET_DISPLAY_INFO`・`CTX_CREATE` 等。未対応は `ERR_UNSPEC`）
 - F3: 実機での疎通実行（#725）

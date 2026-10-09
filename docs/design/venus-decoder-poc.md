@@ -251,6 +251,7 @@ macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なし�
 ### 10.1 本 PR の範囲と未達（実装済みを装わない。REPAIR-3）
 
 - 実装済み: 候補比較（本章）、ctrl の `GET_CAPSET_INFO` / `GET_CAPSET` の復号・応答符号化・構造化ログ 1 行（`adapter`）、治具が広告する feature と config の定数（`device`）、ログ照合器と実機前提テストの枠（`log`・`tests/real_machine_capset_log.rs`）。socket は開かない
+- 実装済み（F1.1・#1516）: vhost-user メッセージの codec（`vhost_user`。10.4）。fd・socket・virtqueue・セッションは未実装（F1.2〜F1.4）
 - **受入基準 2（ゲストの Mesa venus の capset クエリが自前デコーダに届いたことをログで確認）は未達**。トランスポート（後続 F1）と実機実行（F3・#725。人間担当）が必要なため
 - 後続（issue 起票は未実施・承認待ち）: F1 vhost-user トランスポート（メッセージ codec・fd 受け渡しと `mmap` の `sys` ラッパー・split virtqueue・kick / call。rust-vmm 系クレートは MVM-4 で使えないため自作）、F2 残りの ctrl 応答（`GET_DISPLAY_INFO`・`CTX_CREATE` 等）、F3 実機疎通（#725）
 - CI: `make poc-venus-jig-check`（fmt-check・clippy・test）は CI の `rust-ci-default-features` ジョブが 3 OS で実行し、`crates/plugin-macos` 側の変更による治具の破損を検出する（実機前提テストは `#[ignore]` で分離済みで CI では走らない）
@@ -285,6 +286,43 @@ macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なし�
 | 広告 feature | VIRGL（bit 0）・RESOURCE_BLOB（3）・CONTEXT_INIT（4）・VERSION_1（32）。`num_capsets` = 1、`num_scanouts` = 0（カーネルが 0 を受け付けるかは未確認。F1 の実機で確認） |
 
 ログ形式（数値と固定語彙のみ。ゲストのバイト列はエコーしない）: `venus_jig event=capset_query cmd=GET_CAPSET capset_id=4 version=0 result=ok max_size=160`。要求長はヘッダ 24 + 本体 8 バイトちょうどのみ受理する（PoC）。
+
+### 10.4 vhost-user メッセージの値（F1.1・#1516）
+
+出典（確認日 2026-10-09。転記したのは要求 ID・ビット値・フィールド配置という事実だけで、コードは流用していない。crosvm の `vmm_vhost` は rust-vmm の `vhost` 由来の系統のため構造体定義やロジックは写さない。MVM-4・from-scratch-policy）。
+
+| 出典 | 版 | SHA-256 |
+| ---- | -- | ------- |
+| QEMU `docs/interop/vhost-user.rst` | タグ `v10.1.0` | `1c06e32a3306172499767170b0b64ce8de4a8a90cbe543a00cc1b3861ae5bccd` |
+| crosvm `third_party/vmm_vhost/src/message.rs` | コミット `044c3e3fc53d` | `df6c31711167fe3b94080db4655826bb834cd2e9ac085915ce448652b8ab3495` |
+| crosvm `third_party/vmm_vhost/src/backend_client.rs` | 同上 | `709fe08830a38c5e15a00c0c5af47ef7dabf19a784c0694abf8c10d335dec7c2` |
+| crosvm `devices/src/virtio/vhost_user_frontend/mod.rs` | 同上 | `9506fcaae2e7e4aec09baa1374cbbd0a3807c5f38f8566b5c4f5856e4ea22266` |
+
+前提（実際に広告するのは F1.4・#1519）: virtio feature は bit 30（`VHOST_USER_F_PROTOCOL_FEATURES`）を立て、protocol feature は CONFIG（bit 9。virtio-gpu config の読み出しに要る）と MQ（bit 0）だけにする。REPLY_ACK・BACKEND_REQ・SHMEM・DEVICE_STATE・CONFIGURE_MEM_SLOTS は host-visible 共有メモリの方式が決まる #1057 まで後送りで、追加する場合は対応する要求を codec に足す。
+
+最小要求集合（16 種。QEMU と crosvm で ID が一致）。これ以外は既知 ID も含め `UNKNOWN_REQUEST` で拒否する。
+
+| ID | 要求 | ペイロード |
+| -- | ---- | ---------- |
+| 1 / 15 / 17 | GET_FEATURES / GET_PROTOCOL_FEATURES / GET_QUEUE_NUM | なし（応答は u64 8 バイト） |
+| 2 / 16 | SET_FEATURES / SET_PROTOCOL_FEATURES | u64（8 バイト） |
+| 3 | SET_OWNER | なし |
+| 5 | SET_MEM_TABLE | 8 + n × 32 バイト（num_regions u32・padding u32・領域 n 個） |
+| 8 / 10 / 11 / 18 | SET_VRING_NUM / SET_VRING_BASE / GET_VRING_BASE / SET_VRING_ENABLE | vring state 8 バイト（index u32・num u32）。GET_VRING_BASE の応答も同形 |
+| 9 | SET_VRING_ADDR | 40 バイト（index・flags 各 u32、descriptor・used・available・log 各 u64） |
+| 12 / 13 | SET_VRING_KICK / SET_VRING_CALL | u64（bit 0-7 が vring index、bit 8 が NOFD。bit 9 以上は拒否） |
+| 24 / 25 | GET_CONFIG / SET_CONFIG | 12 + size バイト（offset・size・flags 各 u32 + データ）。GET_CONFIG は要求側もデータ領域を含む |
+
+ヘッダは 12 バイト（request・flags・size の各 u32）。flags の下位 2 ビットが version（1）、bit 2 が REPLY、bit 3 が NEED_REPLY で、他は予約。バイト順は rst 上「ホストのネイティブ順」で、治具の動作環境（Linux x86_64 / aarch64、CI の 3 OS）はすべて little-endian のため little-endian 固定とし、big-endian ターゲットは `compile_error!` にする。
+
+上限と QEMU / crosvm の食い違いへの対応:
+
+- `MAX_PAYLOAD_LEN` = 1032（32 領域）、ヘッダ込みの最大は 1044。size は確保・読み取りより前に検証する
+- メモリ領域数は 1〜32。QEMU の rst は 8 だが crosvm は最大 32（0 は拒否）なので、crosvm の正当な要求を拒否しないよう大きい方に揃える
+- config データは治具独自の上限 256 バイト（`virtio_gpu_config` は 16 バイト）。config の flags は crosvm のビット（`WRITABLE`=0x1・`LIVE_MIGRATION`=0x2）を受理し、他のビットは拒否する（QEMU の rst は値として 0 / 1 を定めるが、crosvm の GET_CONFIG は毎回 0x1 を送るため両方を受理できる形にした）
+- 検査順は固定: `SHORT_HEADER` → `UNSUPPORTED_VERSION` → `INVALID_FLAGS`（予約ビット・方向） → `PAYLOAD_TOO_LARGE` → `UNKNOWN_REQUEST` → `LENGTH_MISMATCH` → `INVALID_VALUE`
+
+F1.1 の範囲外（申し送り）: 値の意味の検証（vring addr のアラインメント・index < キュー数・log ビット・avail index）は F1.3（#1518）、ネゴシエーション済み feature との照合・セッション状態は F1.4（#1519）、ソケット I/O・fd・mmap・タイムアウト（REPAIR-5）は F1.2（#1517）で扱う。
 
 ## 11. 以降の章（未着手。10 章は #888 の範囲）
 

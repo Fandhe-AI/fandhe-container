@@ -396,6 +396,12 @@ plug4-core-invariance-selftest: ## PLUG-4 判定スクリプトの自己テス�
 cli-parity-selftest: ## CLI 3 OS 比較スクリプトの自己テスト（TASK-125.1・REPAIR-12。スタブ CLI のみ）
 	bash scripts/cli-parity-check-selftest.sh
 
+# タイムアウト回収がネイティブ exe の子孫に届くかの確認（#1548・TASK-125.1・CLI-1・REPAIR-5）。rustc で
+# 一時ヘルパーをビルドする。CI の integration-test ジョブ（3 OS）が実行する。make ci には含めない。
+.PHONY: cli-parity-native-reclaim-check
+cli-parity-native-reclaim-check: ## capture のタイムアウトでネイティブ exe の子孫が回収されるかの確認（#1548）
+	bash scripts/cli-parity-native-reclaim-check.sh
+
 # commit-msg フックの本文行長検査（Issue #1295）。一時ファイルのみで完結する。make ci には含めない。
 .PHONY: commit-msg-line-length-selftest
 commit-msg-line-length-selftest: ## commit-msg 行長検査スクリプトの自己テスト（Issue #1295・REPAIR-12）

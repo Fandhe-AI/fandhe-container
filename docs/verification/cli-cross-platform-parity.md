@@ -12,7 +12,7 @@ TASK-125（共同タスク）の確認記録の雛形。実機での実行・結
 | ---- | ---- |
 | 非 Linux の plugin 起動・RPC | 発見 → 登録 → 信頼性検証までは配線済みだが、plugin の起動と RPC は未実装（TASK-114）。macOS / Windows ではバックエンド解決が必ず失敗する。よって B 層（挙動）の非 Linux 欄は **前提未達** であり、合格として記入しない |
 | Linux 経路の未実装 | `start` の本番 launcher、`logs`、pid ありの `stop`、cgroup 配置つき `delete` は未実装（REPAIR-3）。Linux 側の現行値（`start` = 8 など）は「現行実装での参考値」で、launcher 提供後に変わる。固定の合格基準にしない |
-| Windows の自動化 | `scripts/cli-parity-check.sh` は Git Bash で実行する。スタブ CLI による自己テストは CI の 3 OS（ubuntu・macos・windows）で実行しているが、製品バイナリ（ネイティブ exe）に対する capture は CI で確かめていない（実機確認の範囲） |
+| Windows の自動化 | `scripts/cli-parity-check.sh` は Git Bash で実行する。スタブ CLI による自己テストは CI の 3 OS（ubuntu・macos・windows）で実行しているが、製品バイナリ（ネイティブ exe）に対する capture は CI で確かめていない（実機確認の範囲）。タイムアウト時の子孫回収だけはヘルパー exe で CI 実測する（#1548） |
 
 期待値の正は「Linux ネイティブ実行と同一」。Linux の capture を基準にして他 OS を突き合わせる。
 
@@ -35,7 +35,8 @@ TASK-125（共同タスク）の確認記録の雛形。実機での実行・結
 4. 下のチェックリストの結果欄を記入する（A 層は capture の値を転記。B 層の非 Linux は前提が整うまで「前提未達」のまま）
 5. Windows でスクリプトが動かない場合の手動手順: 下のケース表の引数を PowerShell 等で 1 件ずつ実行し、終了コードと stderr 1 行 JSON の `code` を転記する。状態ルートは `--root` に専用の一時ディレクトリを指定し、既定の状態ルートに触れない。B 層は表の順（上から）に実行する
 
-スクリプトは全ケースで `--root` を一時ディレクトリに向け、sudo を呼ばず、各 CLI 呼び出しにタイムアウトを持つ。タイムアウト・中断時の回収は CLI を起動したプロセスグループ単位で行うため、CLI の子孫が `setsid` 等で別セッションへ出た場合は回収できない。
+スクリプトは全ケースで `--root` を一時ディレクトリに向け、sudo を呼ばず、各 CLI 呼び出しにタイムアウトを持つ。タイムアウト・中断時の回収は CLI を起動したプロセスグループ単位で行うため、CLI の子孫が `setsid` 等で別セッションへ出た場合は回収できない。Windows（Git Bash）のネイティブ exe の子は POSIX の pgid を持たないため、未回収の CLI に限り `taskkill /T` でもツリーごと回収する（#1548・REPAIR-5）。CLI の正常終了後に残った子孫と、期限前に親が死んで孤児になった子孫は辿れない。CI の `integration-test`（3 OS）が `make cli-parity-native-reclaim-check` で回収を実測し、ログの `cli-parity native reclaim:` 行（`descendant_alive`・`winpid_available`・`baseline_group_kill_descendant_alive`）に結果を出す。Windows の実測値は PR の CI ログで確認する。
+スクリプトは判定・CLI の実行ともに `LC_ALL=C` に固定する（#1548・CLI-1）。製品 CLI は setlocale を呼ばず出力は英語固定のため比較の情報は減らず、無効な `LC_ALL` による bash 製スタブの警告で `code` の判定が壊れるのを防ぐ。
 
 ### stderr の `code` の読み取り（ERR-1・ERR-2）
 

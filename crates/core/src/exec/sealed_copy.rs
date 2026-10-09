@@ -14,8 +14,15 @@
 //!
 //! 手順（順序固定。いずれかの失敗は fail-closed で exec しない）:
 //!
-//! 0. 自プロセスが LSM（AppArmor・SELinux）に閉じ込められていれば拒否する（`FailedPrecondition`。元のファイルの
-//!    exec 遷移を memfd では再現できないため。#1531）
+//! 0. 元のファイルの実行時ポリシーを複製が迂回しないことを確かめる（[`SealPolicy`]。#1531）。memfd を
+//!    `execveat` すると、元のファイルに結び付いたカーネルの exec 時検査（AppArmor のパス結び付きプロファイル・
+//!    IMA の `BPRM_CHECK` 評価・Landlock の `EXECUTE`）は働かない。維持できないと判定した環境は、複製せずに
+//!    拒否する（fail-closed。照合だけの方式 A へ黙って戻さない）:
+//!    - パス結び付きの LSM（AppArmor・TOMOYO・Smack・BPF LSM・IPE）が有効、または IMA の appraisal が有効
+//!      （か判定できない）なら `FailedPrecondition`（[`LsmEnvironment::Refuse`]）
+//!    - SELinux 有効時は、自プロセスのドメインが `unconfined_t` でなければ `FailedPrecondition`
+//!    - Landlock が `EXECUTE` を扱う場合、元のファイルの実パスに `EXECUTE` を与えるルールの配下になければ
+//!      `PermissionDenied`（`execveat` が元のファイルで返していた `EACCES` と同じ扱い）
 //! 1. 元のファイルの実行権限をカーネルに判定させる（`sys::access_exec_via_proc`。実行ビット・`noexec`）。
 //!    memfd へ複製すると元のファイルの実行権限はカーネルから見えなくなるため、複製の前に確かめる。
 //!    `EACCES` は `PermissionDenied`（違反にしない。今の `execve` の `EACCES` と同じ扱い）
@@ -32,13 +39,20 @@
 //! memfd の作成失敗（`ENOSYS`・`EACCES` = `vm.memfd_noexec=2`・`EPERM` = seccomp）は前提不足のシステム
 //! エラーで、違反にはせず `FailedPrecondition` で拒否する（照合だけの方式 A へ黙って戻さない）。
 //!
-//! 限界: 手順 0 は子のラベルで判定する。`unconfined` の子に対するパス結び付きの AppArmor プロファイルと IMA の
-//! appraisal は検出できず、元のファイルについて再現しない。詳細は `interpreter.rs` の「限界」。
+//! 限界: 環境の判定（[`SealPolicy::probe`]）はホスト側の securityfs と `/proc/cmdline` に依る。実行プロセスが
+//! 起動前から継承していた Landlock の domain はカーネルに問い合わせる手段がなく、判定できない（ここで評価する
+//! のは exec 用に組み立てたルールセットだけ）。SELinux はプロセスのドメインだけを見て、元のファイルのラベルに
+//! よる遷移は評価しない。詳細は `interpreter.rs` の「限界」。
 
 use std::ffi::CStr;
 use std::fs::{File, Metadata};
+use std::io::Read as _;
 use std::os::fd::{AsFd as _, BorrowedFd};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::FileExt as _;
+use std::path::Path;
+
+use crate::landlock::{AccessFs, LandlockRuleset};
 
 use crate::sys::{self, SealError, SealSet, SysError};
 use crate::traits::types::ErrorCode;
@@ -59,6 +73,160 @@ const COPY_NAME: &CStr = c"fandhe-exec-entrypoint";
 
 const STAGE: IsolationStage = IsolationStage::Exec;
 
+/// 元のファイルの実行時ポリシーを複製が維持できるかの判定材料（#1531・SEC-1。モジュール doc の手順 0）。
+///
+/// `prepare_exec_restrictions` が `setns` の **前**（ホスト側の securityfs が見えるうち）に [`SealPolicy::probe`]
+/// で作り、`ExecReady` → `spawn_exec_command` → exec の子へ持ち越す。子は [`seal_entrypoint_copy`] の最初に参照する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SealPolicy {
+    lsm: LsmEnvironment,
+    landlock: LandlockExec,
+}
+
+/// LSM の環境の判定結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LsmEnvironment {
+    /// 複製が迂回するパス結び付きの LSM 検査がない。
+    Unrestricted,
+    /// SELinux のみ有効。自プロセスのドメインが `unconfined_t` のときだけ通す。
+    SelinuxLabel,
+    /// 維持できない（または判定できない）ため複製しない。値は静的な理由。
+    Refuse(&'static str),
+}
+
+/// Landlock の `EXECUTE` の扱い（exec 用に組み立てたルールセットから導く）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum LandlockExec {
+    /// `EXECUTE` を扱わない（検査対象外）。
+    NotHandled,
+    /// `EXECUTE` を扱う。値は `EXECUTE` を与えるルールのコンテナ内パス（この配下のファイルだけ実行できる）。
+    Beneath(Vec<String>),
+}
+
+impl LandlockExec {
+    /// ルールセットから導く。
+    pub(super) fn from_ruleset(ruleset: &LandlockRuleset) -> Self {
+        if !ruleset.handled_access_fs().contains(AccessFs::EXECUTE) {
+            return Self::NotHandled;
+        }
+        Self::Beneath(
+            ruleset
+                .rules()
+                .iter()
+                .filter(|r| r.allowed.contains(AccessFs::EXECUTE))
+                .map(|r| r.path.as_str().to_owned())
+                .collect(),
+        )
+    }
+
+    /// `real_path`（元のファイルの実パス。root からの絶対パス）への `EXECUTE` を許すか。
+    /// Landlock と同じく、与えられた祖先ルールのいずれかの配下であれば許す（コンポーネント境界で比較する）。
+    fn permits(&self, real_path: &Path) -> bool {
+        match self {
+            Self::NotHandled => true,
+            Self::Beneath(paths) => {
+                real_path.is_absolute() && paths.iter().any(|p| real_path.starts_with(Path::new(p)))
+            }
+        }
+    }
+}
+
+/// [`LsmEnvironment`] の判定に使う、ホスト側で読んだ入力（読み取りの失敗は `Err` のまま渡す）。
+pub(super) struct LsmProbeInput {
+    /// `/sys/kernel/security/lsm`（有効な LSM のカンマ区切り一覧）。
+    pub(super) lsm_list: std::io::Result<String>,
+    /// `/proc/cmdline`。
+    pub(super) cmdline: std::io::Result<String>,
+    /// `/sys/kernel/security/ima/policy`（読めた場合の現行ポリシー）。
+    pub(super) ima_policy: std::io::Result<String>,
+}
+
+/// 読み取った入力から LSM の環境を判定する（純粋関数。単体テストが具体値で確かめる）。
+///
+/// 判定できない入力は拒否に倒す（fail-closed）。パス結び付きで元のファイルに働く LSM は複製で再現できない。
+pub(super) fn assess_lsm_environment(input: LsmProbeInput) -> LsmEnvironment {
+    let list = match input.lsm_list {
+        Ok(list) => list,
+        Err(_) => return LsmEnvironment::Refuse("the active security modules could not be read"),
+    };
+    let names: Vec<&str> = list.trim().split(',').map(str::trim).collect();
+    for path_bound in ["apparmor", "tomoyo", "smack", "bpf", "ipe"] {
+        if names.contains(&path_bound) {
+            return LsmEnvironment::Refuse(
+                "a path-bound security module is active; its exec-time checks cannot be reproduced for a sealed copy",
+            );
+        }
+    }
+    if names.contains(&"ima") {
+        let cmdline = match &input.cmdline {
+            Ok(text) => text,
+            Err(_) => return LsmEnvironment::Refuse("the kernel command line could not be read"),
+        };
+        for token in cmdline.split_whitespace() {
+            let appraise_on = token
+                .strip_prefix("ima_appraise=")
+                .is_some_and(|v| v != "off");
+            if appraise_on || token.starts_with("ima_policy=") {
+                return LsmEnvironment::Refuse(
+                    "IMA appraisal may be active; its exec-time check cannot be reproduced for a sealed copy",
+                );
+            }
+        }
+        match &input.ima_policy {
+            Ok(text) if !text.to_ascii_lowercase().contains("appraise") => {}
+            Ok(_) => {
+                return LsmEnvironment::Refuse(
+                    "IMA appraisal is active; its exec-time check cannot be reproduced for a sealed copy",
+                );
+            }
+            Err(_) => {
+                return LsmEnvironment::Refuse(
+                    "the IMA policy could not be read; appraisal cannot be ruled out",
+                );
+            }
+        }
+    }
+    if names.contains(&"selinux") {
+        LsmEnvironment::SelinuxLabel
+    } else {
+        LsmEnvironment::Unrestricted
+    }
+}
+
+/// ファイルを `cap` バイトまで読む（巨大ファイルの確保を避ける）。
+fn read_capped(path: &str, cap: u64) -> std::io::Result<String> {
+    let mut text = String::new();
+    File::open(path)?.take(cap).read_to_string(&mut text)?;
+    Ok(text)
+}
+
+impl SealPolicy {
+    /// ルールセットとホスト側の実環境から作る。`setns` の前に呼ぶこと。
+    pub(super) fn probe(ruleset: &LandlockRuleset) -> Self {
+        let lsm = assess_lsm_environment(LsmProbeInput {
+            lsm_list: read_capped("/sys/kernel/security/lsm", 4096),
+            cmdline: read_capped("/proc/cmdline", 64 * 1024),
+            ima_policy: read_capped("/sys/kernel/security/ima/policy", 1024 * 1024),
+        });
+        Self {
+            lsm,
+            landlock: LandlockExec::from_ruleset(ruleset),
+        }
+    }
+
+    /// 判定材料を直接指定する。
+    #[cfg(any(test, feature = "exec-test-support"))]
+    pub(super) fn new(lsm: LsmEnvironment, landlock: LandlockExec) -> Self {
+        Self { lsm, landlock }
+    }
+
+    /// 制約なし（`execveat` を行わない観測・単体テスト専用。本番の入口は [`SealPolicy::probe`] だけ）。
+    #[cfg(any(test, feature = "exec-test-support"))]
+    pub(super) fn unrestricted() -> Self {
+        Self::new(LsmEnvironment::Unrestricted, LandlockExec::NotHandled)
+    }
+}
+
 /// `file`（照合済みのエントリポイントを読み取り専用で開いた fd。`meta` はその `fstat`）の封印した複製を作り、
 /// 読み取り専用で開き直した fd とその `fstat` を返す。`subject` は違反・拒否の診断に載せるエントリポイントの
 /// パス。手順と契約はモジュール doc を参照。
@@ -66,9 +234,17 @@ pub(super) fn seal_entrypoint_copy(
     file: &File,
     meta: &Metadata,
     procfs: BorrowedFd<'_>,
-    subject: &std::path::Path,
+    subject: &Path,
+    policy: &SealPolicy,
 ) -> Result<(File, Metadata), ExecError> {
-    seal_copy_bounded(file, meta.len(), MAX_SEALED_COPY_BYTES, procfs, subject)
+    seal_copy_bounded(
+        file,
+        meta.len(),
+        MAX_SEALED_COPY_BYTES,
+        procfs,
+        subject,
+        policy,
+    )
 }
 
 /// [`seal_entrypoint_copy`] の本体。`size`（元の `st_size`）と `limit` を引数に取り、単体テストが小さい上限や
@@ -78,9 +254,10 @@ pub(super) fn seal_copy_bounded(
     size: u64,
     limit: u64,
     procfs: BorrowedFd<'_>,
-    subject: &std::path::Path,
+    subject: &Path,
+    policy: &SealPolicy,
 ) -> Result<(File, Metadata), ExecError> {
-    reject_if_lsm_confined(read_lsm_attr_current(), subject)?;
+    check_exec_policy_preserved(policy, read_lsm_attr_current, file, procfs, subject)?;
     check_executable(file, procfs, subject)?;
     if size > limit {
         return Err(ExecError::from_violation_at(
@@ -129,46 +306,80 @@ pub(super) fn seal_copy_bounded(
     Ok((reopened, meta))
 }
 
-/// 手順 0: 自プロセスが LSM（AppArmor・SELinux）に閉じ込められていないか（`/proc/thread-self/attr/current` の読み取り結果）。
-///
-/// 元のファイルに対する LSM の exec 遷移（AppArmor のパスによるプロファイル選択・SELinux のファイルラベルによる
-/// ドメイン遷移）は、memfd を実行すると働かない。遷移を再現できないため、LSM の制約下（`unconfined` 以外の
-/// ラベル）の子は複製の前に拒否する（fail-closed。照合だけの方式 A へ黙って戻さない）。属性が存在しない・
-/// 読めない種類のエラー（`NotFound`・`InvalidInput` = LSM が属性を持たない）は LSM なしとして通し、それ以外の
-/// 読み取り失敗は確認できないため拒否する。残る限界: AppArmor が `unconfined` の子に対し、パスで結び付く
-/// プロファイルが元のファイルに存在する場合は検出できない（`interpreter.rs` の「限界」）。
-fn reject_if_lsm_confined(
-    attr: std::io::Result<String>,
-    subject: &std::path::Path,
+/// 手順 0: 元のファイルの実行時ポリシーを複製が迂回しないか。`read_attr` は自プロセスの SELinux ラベルの
+/// 読み取り（単体テストが差し替える）。
+fn check_exec_policy_preserved(
+    policy: &SealPolicy,
+    read_attr: impl FnOnce() -> std::io::Result<String>,
+    file: &File,
+    procfs: BorrowedFd<'_>,
+    subject: &Path,
 ) -> Result<(), ExecError> {
-    match attr {
-        Ok(text) => {
-            let label = text.trim_matches(|c: char| c == '\0' || c.is_whitespace());
-            if label.is_empty() || label == "unconfined" {
-                Ok(())
-            } else {
-                Err(ExecError::new(
-                    ErrorCode::FailedPrecondition,
-                    STAGE,
-                    format!(
-                        "the process is confined by a Linux security module; refusing to run {subject:?} from a sealed copy, which would bypass its exec transition"
-                    ),
-                ))
-            }
+    match policy.lsm {
+        LsmEnvironment::Unrestricted => {}
+        LsmEnvironment::SelinuxLabel => reject_if_selinux_confined(read_attr(), subject)?,
+        LsmEnvironment::Refuse(reason) => {
+            return Err(ExecError::new(
+                ErrorCode::FailedPrecondition,
+                STAGE,
+                format!("refusing to run {subject:?} from a sealed copy: {reason}"),
+            ));
         }
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
-            ) =>
-        {
-            Ok(())
-        }
-        Err(e) => Err(ExecError::from_io(
-            &e,
+    }
+    check_landlock_execute(&policy.landlock, file, procfs, subject)
+}
+
+/// 手順 0（Landlock）: 元のファイルの実パスに `EXECUTE` が許されているか。memfd は Landlock のルール外で
+/// 実行できてしまうため、元のファイルについてここで確かめる。許されなければ `execveat` が返していた `EACCES`
+/// と同じ `PermissionDenied`（違反にしない）。実パスを確かめられなければ拒否する（fail-closed）。
+fn check_landlock_execute(
+    landlock: &LandlockExec,
+    file: &File,
+    procfs: BorrowedFd<'_>,
+    subject: &Path,
+) -> Result<(), ExecError> {
+    if matches!(landlock, LandlockExec::NotHandled) {
+        return Ok(());
+    }
+    let mut buf = vec![0u8; 4097];
+    let n = sys::readlink_fd_via_proc(procfs, file.as_fd(), &mut buf)
+        .map_err(|e| ExecError::from_sys(e, STAGE, "readlink of the entrypoint"))?;
+    let bytes = buf.get(..n).ok_or_else(|| changed_while_copying(subject))?;
+    let real = Path::new(std::ffi::OsStr::from_bytes(bytes));
+    if !bytes.ends_with(b" (deleted)") && landlock.permits(real) {
+        Ok(())
+    } else {
+        Err(ExecError::new(
+            ErrorCode::PermissionDenied,
             STAGE,
-            "read of the security module attribute",
-        )),
+            format!(
+                "the entrypoint {subject:?} is not under a path that grants Landlock EXECUTE; refusing to run it from a sealed copy"
+            ),
+        ))
+    }
+}
+
+/// 手順 0（SELinux）: 自プロセスのドメインが `unconfined_t` か。`attr/current` の文字列は
+/// `user:role:type:level` で、`unconfined_u:unconfined_r:unconfined_t:s0` のように unconfined なドメインにも
+/// コンテキストが付く。型が `unconfined_t` 以外（`container_t` 等）は、元のファイルのラベルによるドメイン遷移を
+/// memfd では再現できないため拒否する。読み取り失敗は確認できないため拒否する。
+fn reject_if_selinux_confined(
+    attr: std::io::Result<String>,
+    subject: &Path,
+) -> Result<(), ExecError> {
+    let text =
+        attr.map_err(|e| ExecError::from_io(&e, STAGE, "read of the security module attribute"))?;
+    let label = text.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+    if label.split(':').nth(2) == Some("unconfined_t") {
+        Ok(())
+    } else {
+        Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            STAGE,
+            format!(
+                "the process is confined by SELinux; refusing to run {subject:?} from a sealed copy, which would bypass its exec transition"
+            ),
+        ))
     }
 }
 
@@ -176,13 +387,8 @@ fn reject_if_lsm_confined(
 fn read_lsm_attr_current() -> std::io::Result<String> {
     std::fs::read_to_string("/proc/thread-self/attr/current")
 }
-
 /// 手順 1: 元のファイルをカーネルが実行できると判定するか。
-fn check_executable(
-    file: &File,
-    procfs: BorrowedFd<'_>,
-    subject: &std::path::Path,
-) -> Result<(), ExecError> {
+fn check_executable(file: &File, procfs: BorrowedFd<'_>, subject: &Path) -> Result<(), ExecError> {
     sys::access_exec_via_proc(procfs, file.as_fd()).map_err(|e| match e {
         SysError::Os(errno) if errno == sys::EACCES => ExecError::new(
             ErrorCode::PermissionDenied,
@@ -200,12 +406,7 @@ fn check_executable(
 }
 
 /// 手順 3: `size` バイトを `src` から `dst` へ複製し、複製中に元が伸縮していないことを確かめる。
-fn copy_exact(
-    src: &File,
-    dst: &File,
-    size: u64,
-    subject: &std::path::Path,
-) -> Result<(), ExecError> {
+fn copy_exact(src: &File, dst: &File, size: u64, subject: &Path) -> Result<(), ExecError> {
     let mut buf = [0u8; COPY_CHUNK_BYTES];
     let mut offset = 0u64;
     while offset < size {
@@ -243,7 +444,7 @@ fn copy_exact(
 }
 
 /// 複製中の伸縮による拒否（違反にしない。開き直しの間の競合と同じ根拠）。
-fn changed_while_copying(subject: &std::path::Path) -> ExecError {
+fn changed_while_copying(subject: &Path) -> ExecError {
     ExecError::new(
         ErrorCode::PermissionDenied,
         STAGE,
@@ -252,7 +453,7 @@ fn changed_while_copying(subject: &std::path::Path) -> ExecError {
 }
 
 /// 封印を確認できなかった失敗を違反へ写す（理由コードは静的トークン。errno 等の外部由来の文字列は載せない）。
-fn seal_violation(_err: &SealError, subject: &std::path::Path) -> ExecError {
+fn seal_violation(_err: &SealError, subject: &Path) -> ExecError {
     ExecError::from_violation_at(
         ViolationReason::EntrypointCopySealUnverified,
         Some(subject),
@@ -266,34 +467,201 @@ mod tests {
 
     use super::*;
 
-    /// SUP-6・SEC-1・CORE-5・TASK-163 追補・#1531: LSM の制約下の子は複製の前に拒否し、`unconfined`・属性なしは通す。
+    fn probe_input(lsm: &str, cmdline: &str, ima: Option<&str>) -> LsmProbeInput {
+        LsmProbeInput {
+            lsm_list: Ok(lsm.to_owned()),
+            cmdline: Ok(cmdline.to_owned()),
+            ima_policy: ima.map_or_else(
+                || Err(std::io::ErrorKind::PermissionDenied.into()),
+                |t| Ok(t.to_owned()),
+            ),
+        }
+    }
+
+    /// SUP-6・SEC-1・CORE-5・TASK-163 追補・#1531: パス結び付きの LSM（AppArmor 等）が有効な環境は、複製せずに
+    /// 拒否する。LSM 一覧を読めない場合も拒否する（fail-closed）。
     #[test]
-    fn sup6_sec1_lsm_confined_child_is_rejected_before_copy() {
-        let subject = Path::new("/bin/true");
-        for ok in ["unconfined\n", "unconfined", "", "\0"] {
+    fn sup6_sec1_path_bound_lsm_environment_is_refused() {
+        for lsm in [
+            "lockdown,capability,landlock,yama,apparmor",
+            "capability,tomoyo",
+            "capability,smack",
+            "capability,bpf",
+            "capability,ipe",
+        ] {
+            let got = assess_lsm_environment(probe_input(lsm, "quiet", None));
+            assert!(matches!(got, LsmEnvironment::Refuse(_)), "{lsm}: {got:?}");
+        }
+        let unreadable = LsmProbeInput {
+            lsm_list: Err(std::io::ErrorKind::NotFound.into()),
+            cmdline: Ok(String::new()),
+            ima_policy: Ok(String::new()),
+        };
+        assert!(matches!(
+            assess_lsm_environment(unreadable),
+            LsmEnvironment::Refuse(_)
+        ));
+    }
+
+    /// SUP-6・SEC-1・TASK-163 追補・#1531: IMA は appraisal が有効、または無効と判定できないときに拒否する。
+    #[test]
+    fn sup6_sec1_ima_appraisal_is_refused_unless_ruled_out() {
+        let lsm = "capability,landlock,ima,evm";
+        for (cmdline, policy) in [
+            ("ima_appraise=enforce", Some("")),
+            ("ima_appraise=fix", Some("")),
+            ("ima_policy=appraise_tcb", Some("")),
+            (
+                "quiet",
+                Some("appraise func=BPRM_CHECK appraise_type=imasig\n"),
+            ),
+            ("quiet", None),
+        ] {
+            let got = assess_lsm_environment(probe_input(lsm, cmdline, policy));
             assert!(
-                reject_if_lsm_confined(Ok(ok.to_owned()), subject).is_ok(),
+                matches!(got, LsmEnvironment::Refuse(_)),
+                "{cmdline} {policy:?}: {got:?}"
+            );
+        }
+        // appraisal がないことを確かめられる（`off`・policy に appraise 行なし）なら通す。
+        for cmdline in ["quiet", "ima_appraise=off"] {
+            let got = assess_lsm_environment(probe_input(
+                lsm,
+                cmdline,
+                Some("measure func=BPRM_CHECK\n"),
+            ));
+            assert_eq!(got, LsmEnvironment::Unrestricted, "{cmdline}");
+        }
+    }
+
+    /// SUP-6・SEC-1・TASK-163 追補・#1531: 対象外の LSM のみの環境は制約なし、SELinux は子のドメインで判定する。
+    #[test]
+    fn sup6_sec1_unrelated_and_selinux_environments_are_classified() {
+        let none =
+            assess_lsm_environment(probe_input("lockdown,capability,landlock,yama", "", None));
+        assert_eq!(none, LsmEnvironment::Unrestricted);
+        let selinux = assess_lsm_environment(probe_input("capability,landlock,selinux", "", None));
+        assert_eq!(selinux, LsmEnvironment::SelinuxLabel);
+    }
+
+    /// SUP-6・SEC-1・CORE-5・TASK-163 追補・#1531: SELinux ホストでは unconfined なドメインにもコンテキストが付く。
+    /// `unconfined_t` は通し、`container_t` 等・読み取り失敗・コンテキストでない値は拒否する。
+    #[test]
+    fn sup6_sec1_selinux_unconfined_domain_is_accepted() {
+        let subject = Path::new("/bin/true");
+        for ok in [
+            "unconfined_u:unconfined_r:unconfined_t:s0\n",
+            "unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023\0",
+        ] {
+            assert!(
+                reject_if_selinux_confined(Ok(ok.to_owned()), subject).is_ok(),
                 "{ok:?}"
             );
         }
         for confined in [
-            "docker-default (enforce)\n",
             "system_u:system_r:container_t:s0:c1,c2\0",
-            "unconfined_u:unconfined_r:unconfined_t:s0",
+            "unconfined_u:unconfined_r:container_runtime_t:s0",
+            "unconfined",
+            "",
         ] {
-            let e = reject_if_lsm_confined(Ok(confined.to_owned()), subject).unwrap_err();
+            let e = reject_if_selinux_confined(Ok(confined.to_owned()), subject).unwrap_err();
             assert_eq!(e.code, ErrorCode::FailedPrecondition, "{confined:?}");
         }
-        for kind in [
-            std::io::ErrorKind::NotFound,
-            std::io::ErrorKind::InvalidInput,
-        ] {
-            assert!(reject_if_lsm_confined(Err(kind.into()), subject).is_ok());
-        }
-        let e =
-            reject_if_lsm_confined(Err(std::io::Error::from_raw_os_error(sys::EACCES)), subject)
-                .unwrap_err();
+        let e = reject_if_selinux_confined(
+            Err(std::io::Error::from_raw_os_error(sys::EACCES)),
+            subject,
+        )
+        .unwrap_err();
         assert_eq!(e.code, ErrorCode::PermissionDenied);
+    }
+
+    /// SUP-6・SEC-1・TASK-163 追補・#1531: Landlock の `EXECUTE` を与えるルールの配下だけを許す
+    /// （コンポーネント境界で比較し、`/usr` は `/usr2` を許さない）。
+    #[test]
+    fn sup6_sec1_landlock_execute_path_membership() {
+        let policy = LandlockExec::Beneath(vec!["/usr".to_owned(), "/opt/app".to_owned()]);
+        assert!(policy.permits(Path::new("/usr/bin/true")));
+        assert!(policy.permits(Path::new("/opt/app")));
+        assert!(!policy.permits(Path::new("/usr2/bin/true")));
+        assert!(!policy.permits(Path::new("/opt/application")));
+        assert!(!policy.permits(Path::new("/tmp/x")));
+        assert!(!policy.permits(Path::new("relative/usr/x")));
+        assert!(LandlockExec::NotHandled.permits(Path::new("/tmp/x")));
+        assert!(!LandlockExec::Beneath(Vec::new()).permits(Path::new("/usr/bin/true")));
+    }
+
+    fn ruleset_with(allowed: AccessFs) -> LandlockRuleset {
+        use crate::landlock::{PathRule, RuleOrigin, RulePath};
+        LandlockRuleset::for_observation(
+            6,
+            vec![PathRule {
+                path: RulePath::Root,
+                allowed,
+                origin: RuleOrigin::Root,
+            }],
+        )
+    }
+
+    /// SUP-6・SEC-1・CORE-5・TASK-163 追補・#1531: 読み取りだけを許し `EXECUTE` を許さない Landlock の
+    /// ルールセットでは、ルール外の実行を複製が迂回しないよう、元のファイルを複製せず `PermissionDenied`
+    /// （違反にしない）で拒否する。`EXECUTE` を与えるルールの配下なら通る。
+    #[test]
+    fn sup6_sec1_landlock_without_execute_refuses_the_copy() {
+        let scratch = Scratch::new("landlock");
+        let file = scratch.file("script", b"#!/bin/sh\nexit 0\n", 0o755);
+        let procfs = procfs();
+        let read_only = SealPolicy::new(
+            LsmEnvironment::Unrestricted,
+            LandlockExec::from_ruleset(&ruleset_with(
+                AccessFs::READ_FILE.union(AccessFs::READ_DIR),
+            )),
+        );
+        let err = seal_copy_bounded(
+            &file,
+            17,
+            MAX_SEALED_COPY_BYTES,
+            procfs.as_fd(),
+            Path::new("/script"),
+            &read_only,
+        )
+        .expect_err("EXECUTE is not granted");
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert_eq!(violation_of(&err), None);
+        assert_eq!(err.stage, IsolationStage::Exec);
+        let granted = SealPolicy::new(
+            LsmEnvironment::Unrestricted,
+            LandlockExec::from_ruleset(&ruleset_with(AccessFs::READ)),
+        );
+        let ok = seal_copy_bounded(
+            &file,
+            17,
+            MAX_SEALED_COPY_BYTES,
+            procfs.as_fd(),
+            Path::new("/script"),
+            &granted,
+        );
+        assert_eq!(ok.expect("EXECUTE granted at /").1.len(), 17);
+    }
+
+    /// SUP-6・SEC-1・TASK-163 追補・#1531: 環境が維持できないと判定された場合、複製の手順に入らず
+    /// `FailedPrecondition`（違反にしない）で拒否する。
+    #[test]
+    fn sup6_sec1_refused_environment_stops_before_copy() {
+        let scratch = Scratch::new("refuse-env");
+        let file = scratch.file("script", b"#!/bin/sh\n", 0o755);
+        let procfs = procfs();
+        let policy = SealPolicy::new(LsmEnvironment::Refuse("test"), LandlockExec::NotHandled);
+        let err = seal_copy_bounded(
+            &file,
+            10,
+            MAX_SEALED_COPY_BYTES,
+            procfs.as_fd(),
+            Path::new("/script"),
+            &policy,
+        )
+        .expect_err("refused");
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(violation_of(&err), None);
     }
 
     /// 試験ごとの作業ディレクトリ（pid とラベルで一意。drop で削除）。
@@ -347,6 +715,7 @@ mod tests {
             MAX_SEALED_COPY_BYTES,
             procfs.as_fd(),
             Path::new("/script"),
+            &SealPolicy::unrestricted(),
         )
         .expect("seal_copy_bounded");
         assert_eq!(meta.len(), size);
@@ -376,15 +745,29 @@ mod tests {
         let scratch = Scratch::new("limit");
         let file = scratch.file("script", &[b'a'; 100], 0o755);
         let procfs = procfs();
-        let err = seal_copy_bounded(&file, 100, 99, procfs.as_fd(), Path::new("/script"))
-            .expect_err("over the limit");
+        let err = seal_copy_bounded(
+            &file,
+            100,
+            99,
+            procfs.as_fd(),
+            Path::new("/script"),
+            &SealPolicy::unrestricted(),
+        )
+        .expect_err("over the limit");
         assert_eq!(
             violation_of(&err),
             Some(ViolationReason::EntrypointCopyTooLarge)
         );
         assert_eq!(err.code, ErrorCode::PermissionDenied);
         assert_eq!(err.stage, IsolationStage::Exec);
-        let ok = seal_copy_bounded(&file, 100, 100, procfs.as_fd(), Path::new("/script"));
+        let ok = seal_copy_bounded(
+            &file,
+            100,
+            100,
+            procfs.as_fd(),
+            Path::new("/script"),
+            &SealPolicy::unrestricted(),
+        );
         assert_eq!(ok.expect("at the limit").1.len(), 100);
     }
 
@@ -401,6 +784,7 @@ mod tests {
                 MAX_SEALED_COPY_BYTES,
                 procfs.as_fd(),
                 Path::new("/script"),
+                &SealPolicy::unrestricted(),
             )
             .expect_err("size mismatch");
             assert_eq!(violation_of(&err), None, "claimed size {claimed}");
@@ -422,6 +806,7 @@ mod tests {
             MAX_SEALED_COPY_BYTES,
             procfs.as_fd(),
             Path::new("/s"),
+            &SealPolicy::unrestricted(),
         )
         .expect_err("not executable");
         assert_eq!(violation_of(&err), None);

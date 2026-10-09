@@ -765,6 +765,14 @@ unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: `int mknodat(int dirfd, const char *pathname, mode_t mode,
     // dev_t dev)`（glibc / musl の LP64 で `mode_t` は u32・`dev_t` は u64）。
     fn mknodat(dirfd: i32, path: *const core::ffi::c_char, mode: u32, dev: u64) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `ssize_t readlinkat(int dirfd, const char *path, char *buf,
+    // size_t bufsiz)`（LP64 で `ssize_t` は isize・`size_t` は usize。失敗は -1）。
+    fn readlinkat(
+        dirfd: i32,
+        path: *const core::ffi::c_char,
+        buf: *mut core::ffi::c_char,
+        len: usize,
+    ) -> isize;
     // SAFETY（宣言そのものの妥当性）: `uid_t geteuid(void)`（Linux の `uid_t` は u32）。
     fn geteuid() -> u32;
     // SAFETY（宣言そのものの妥当性）: `gid_t getegid(void)`（Linux の `gid_t` は u32）。
@@ -1779,6 +1787,41 @@ pub(crate) fn access_exec_via_proc(
         )
     };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `fd` が指すファイルの実パス（procfs の `thread-self/fd/N` の magic link の読み取り結果）を返す
+/// （TASK-163 追補・#1531・SEC-1。封印した複製の前に、元のファイルへ Landlock の `EXECUTE` が許可されているかを
+/// パスで判定する材料）。
+///
+/// `proc_dir` は呼び出し側が検証した procfs のディレクトリ fd。リンク先は呼び出しプロセスの root からの
+/// 絶対パスで、削除済みなら末尾に ` (deleted)` が付く（呼び出し側が拒否する）。`buf` に収まらない長さは
+/// 切り詰めを避けるため `EINVAL` で失敗させる。
+pub(crate) fn readlink_fd_via_proc(
+    proc_dir: BorrowedFd<'_>,
+    fd: BorrowedFd<'_>,
+    buf: &mut [u8],
+) -> Result<usize, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut name_buf = [0u8; 32];
+    let name = proc_fd_entry(fd.as_raw_fd(), &mut name_buf).ok_or(SysError::Os(EBADF))?;
+    // SAFETY: `name` は呼び出しの間生存する NUL 終端の借用でカーネルは読み取るだけ。`buf` は書き込み可能な
+    // 有効領域で、カーネルは `buf.len()` バイトを超えて書かない。`proc_dir` は生存中の `BorrowedFd`。
+    let rc = unsafe {
+        readlinkat(
+            proc_dir.as_raw_fd(),
+            name.as_ptr(),
+            buf.as_mut_ptr().cast::<core::ffi::c_char>(),
+            buf.len(),
+        )
+    };
+    match usize::try_from(rc) {
+        // 満杯は切り詰めの可能性があるため失敗にする。
+        Ok(n) if n < buf.len() => Ok(n),
+        Ok(_) => Err(SysError::Os(EINVAL)),
+        Err(_) => Err(last_error()),
+    }
 }
 
 /// `close_range(first, last, flags)` を呼ぶ（Linux 5.11 以降。glibc 2.34 未満にラッパーが無いため `syscall(2)` 経由）。
@@ -3497,6 +3540,29 @@ mod tests {
         };
         assert_eq!(check(0o755), Ok(()));
         assert_eq!(check(0o644), Err(SysError::Os(EACCES)));
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// SEC-1（TASK-163 追補・#1531）: `fd` の実パスを procfs の magic link から読む。短すぎるバッファは
+    /// 切り詰めずに `EINVAL`、`fd` が不正なら失敗する。
+    #[test]
+    fn sec1_task163_readlink_fd_via_proc_returns_the_real_path() {
+        use std::os::fd::AsFd as _;
+        let dir = std::env::temp_dir().join(format!("fandhe-readlink-fd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("target");
+        std::fs::write(&path, b"x").expect("write");
+        let file = std::fs::File::open(&path).expect("open");
+        let procfs = std::fs::File::open("/proc").expect("open /proc");
+        let mut buf = vec![0u8; 4097];
+        let n = readlink_fd_via_proc(procfs.as_fd(), file.as_fd(), &mut buf).expect("readlink");
+        let real = std::fs::canonicalize(&path).expect("canonicalize");
+        assert_eq!(buf.get(..n), Some(real.as_os_str().as_encoded_bytes()));
+        let mut tiny = [0u8; 4];
+        assert_eq!(
+            readlink_fd_via_proc(procfs.as_fd(), file.as_fd(), &mut tiny),
+            Err(SysError::Os(EINVAL))
+        );
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 

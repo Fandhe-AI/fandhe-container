@@ -57,6 +57,35 @@ pub(super) fn apply_rlimits(set: &Rlimits) -> Result<(), ExecError> {
     Ok(())
 }
 
+/// 子が複製の後に適用する `RLIMIT_FSIZE`（`target`）の hard limit が、いまの hard limit より大きいときだけ、
+/// hard limit を `target` の値へ引き上げる（soft は変えない。#1531）。
+///
+/// hard limit の引き上げは `CAP_SYS_RESOURCE` を要し、capability 削減の後では常に `EPERM` になる。そのため
+/// capability 削減の **前**（本モジュールの冒頭の「順序の根拠」と同じ位置）で呼ぶ。この後に子が適用する
+/// `target` は引き下げだけになり、特権を要さない。失敗は launch 経路の `apply_rlimits` と同じ段 `Rlimits` の
+/// `EPERM`（`PermissionDenied`）等で、exec は始まらない（黙ってクランプしない）。
+pub(super) fn raise_fsize_hard_before_deferral(target: &Rlimit) -> Result<(), ExecError> {
+    let stage = IsolationStage::Rlimits;
+    let what = "prlimit(fsize) hard limit raise";
+    let (soft, hard) =
+        get_rlimit_self(RlimitKind::Fsize).map_err(|e| ExecError::from_sys(e, stage, what))?;
+    if target.hard() <= hard {
+        return Ok(());
+    }
+    set_rlimit_self(RlimitKind::Fsize, soft, target.hard())
+        .map_err(|e| ExecError::from_sys(e, stage, what))?;
+    let now =
+        get_rlimit_self(RlimitKind::Fsize).map_err(|e| ExecError::from_sys(e, stage, what))?;
+    if now != (soft, target.hard()) {
+        return Err(ExecError::new(
+            ErrorCode::Internal,
+            stage,
+            format!("{what} did not take effect"),
+        ));
+    }
+    Ok(())
+}
+
 /// `/proc/<pid>/limits` の行頭ラベルと rlimit 種別の対応（カーネルの `lnx_rlimit` 表の文言。
 /// どのラベルも他のラベルの前置にならない）。
 const LIMITS_LABELS: [(&str, RlimitKind); 16] = [
@@ -234,6 +263,45 @@ mod tests {
         fake(Ok(()), Some((100, 512)));
         let e = apply_rlimits(&set_of(&[(RlimitKind::Nofile, 256, 512)])).unwrap_err();
         assert_eq!(e.code, ErrorCode::Internal);
+        assert_eq!(e.stage, IsolationStage::Rlimits);
+        take();
+        take_sets();
+    }
+
+    /// SUP-12・SEC-1・#1531: hard limit を引き上げる必要があるときだけ、soft を保ったまま引き上げる。
+    /// 引き上げが不要（現在の hard 以下）なら何も設定しない。
+    #[test]
+    fn sup12_raise_fsize_hard_only_when_needed() {
+        take();
+        take_sets();
+        // 現在値は (soft 100, hard 200)。target.hard = 300 > 200 なので (100, 300) へ引き上げる。
+        fake(Ok(()), None);
+        set_rlimit_self(RlimitKind::Fsize, 100, 200).unwrap();
+        take_sets();
+        let target = Rlimit::new(RlimitKind::Fsize, 0, 300).unwrap();
+        raise_fsize_hard_before_deferral(&target).unwrap();
+        assert_eq!(take_sets(), [(RlimitKind::Fsize, 100, 300)]);
+        // 引き下げ・同値は設定しない。
+        take();
+        set_rlimit_self(RlimitKind::Fsize, 100, 200).unwrap();
+        take_sets();
+        let lower = Rlimit::new(RlimitKind::Fsize, 0, 50).unwrap();
+        raise_fsize_hard_before_deferral(&lower).unwrap();
+        assert_eq!(take_sets(), []);
+        take();
+    }
+
+    /// SUP-12・SEC-1・#1531: 引き上げの失敗（`EPERM`）は段 `Rlimits` の `PermissionDenied` で、exec は始まらない。
+    #[test]
+    fn sup12_raise_fsize_hard_failure_is_permission_denied() {
+        take();
+        take_sets();
+        set_rlimit_self(RlimitKind::Fsize, 100, 200).unwrap();
+        take_sets();
+        fake(Err(SysError::Os(sys::EPERM)), None);
+        let target = Rlimit::new(RlimitKind::Fsize, 0, 300).unwrap();
+        let e = raise_fsize_hard_before_deferral(&target).unwrap_err();
+        assert_eq!(e.code, ErrorCode::PermissionDenied);
         assert_eq!(e.stage, IsolationStage::Rlimits);
         take();
         take_sets();

@@ -106,7 +106,7 @@ use crate::traits::types::ErrorCode;
 
 use super::interpreter::reject_runtime_interpreter;
 use super::rlimits::apply_rlimits;
-use super::sealed_copy::seal_entrypoint_copy;
+use super::sealed_copy::{SealPolicy, seal_entrypoint_copy};
 use super::{
     CapabilityReport, ExecError, IsolationStage, MountIsolation, PivotReport, StagePipeline,
     ViolationReason, describe, fd_mount_id, pivot_root, prepare_rootfs,
@@ -442,8 +442,8 @@ fn prepare_exec_child(
     // 後は）この関数を抜けるときに閉じ、実行する子には残らない。
     let (file, meta) = match source {
         EntrypointSource::Pinned => (file, meta),
-        EntrypointSource::SealedCopy => {
-            seal_entrypoint_copy(&file, &meta, procfs.as_fd(), entry.path())?
+        EntrypointSource::SealedCopy(policy) => {
+            seal_entrypoint_copy(&file, &meta, procfs.as_fd(), entry.path(), &policy)?
         }
     };
     // 複製の書き込みが済んだので、持ち越した `RLIMIT_FSIZE` を適用する（複製の前に載せると `RLIMIT_FSIZE` が 0 や
@@ -483,13 +483,15 @@ fn prepare_exec_child(
 }
 
 /// 実行に使う fd の作り方（[`prepare_exec_child`] の呼び出し側が明示する。TASK-163 追補・#1531）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum EntrypointSource {
     /// 照合した fd（元の inode）をそのまま `execveat` する。launch 経路（常駐するワークロードのメモリ増を避ける。
     /// 封印した複製の適用は #1314 の後）。
     Pinned,
     /// 照合した本体を封印した memfd に複製し、その複製を解析・照合して `execveat` する。稼働中コンテナへの exec。
-    SealedCopy,
+    /// 値は、元のファイルの実行時ポリシー（LSM・Landlock の `EXECUTE`）を複製が迂回しないかの判定材料
+    /// （`prepare_exec_restrictions` が `setns` の前に作る。維持できない環境は複製せず拒否する。#1531）。
+    SealedCopy(SealPolicy),
 }
 
 /// ランタイム自身のバイナリの `(st_dev, st_ino)`。検証済みの procfs（`proc_dir`）の `self/exe` を `O_PATH` で
@@ -1032,12 +1034,13 @@ fn run_exec_child(
     entry: &Entrypoint,
     status: &std::fs::File,
     deferred_fsize: Option<Rlimit>,
+    seal_policy: SealPolicy,
     terminal: impl FnOnce(&Entrypoint, &std::fs::File) -> Result<i32, ExecError>,
 ) -> i32 {
     let result = prepare_exec_child(
         entry,
         Some(status.as_fd()),
-        EntrypointSource::SealedCopy,
+        EntrypointSource::SealedCopy(seal_policy),
         deferred_fsize,
     )
     .and_then(|file| {
@@ -1091,8 +1094,9 @@ pub(super) fn exec_child_main(
     entry: &Entrypoint,
     status: &std::fs::File,
     deferred_fsize: Option<Rlimit>,
+    seal_policy: SealPolicy,
 ) -> i32 {
-    run_exec_child(entry, status, deferred_fsize, |entry, file| {
+    run_exec_child(entry, status, deferred_fsize, seal_policy, |entry, file| {
         Err(execve_checked(entry, file))
     })
 }
@@ -1263,10 +1267,17 @@ pub fn observe_exec_child_setup_with(
     let (status_read, status_write) = exec_status_pipe()?;
     let pid = sys::fork_single_threaded(
         || {
-            run_exec_child(entry, &status_write, None, |entry, file| {
-                after_prepare();
-                write_setup_report(entry, report, file).map(|()| 0)
-            })
+            // 観測は `execveat` を呼ばず、実環境の LSM（CI の AppArmor 等）で複製の手順が止まらないよう制約なしにする。
+            run_exec_child(
+                entry,
+                &status_write,
+                None,
+                SealPolicy::unrestricted(),
+                |entry, file| {
+                    after_prepare();
+                    write_setup_report(entry, report, file).map(|()| 0)
+                },
+            )
         },
         EXIT_SETUP_FAILED,
     )

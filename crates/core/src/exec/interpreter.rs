@@ -80,7 +80,8 @@
 //!   この確認はカーネル版に依存し得るため、本番相当の通し（root・Landlock ABI 6+ を要する supervisor の
 //!   `tests/exec.rs`）での実行確認は実機の記録に委ねる。`landlock/rules.rs` の `mount_rights` は `noexec` の
 //!   マウントから `EXECUTE` を外すが、Landlock は memfd の側を検査するため、複製を通る実行には効かない
-//!   （(1') の `faccessat2` が元のファイルの `noexec` を担う）
+//!   （(1') の `faccessat2` が元のファイルの `noexec` を、`SealPolicy` の Landlock 判定が元のファイルの `EXECUTE`
+//!   許可を担う。下記「限界」）
 //! - **`ETXTBSY`**: 本リポの検証環境（Linux 7.0）では、封印した memfd を読み取り専用で開き直して書き込み用 fd を閉じれば、
 //!   実行できることを `sys` のテスト（`sup6_task163_sealed_memfd_is_executable_after_readonly_reopen`）で確認した。
 //!   カーネルの版による `deny_write_access` の挙動差（6.11 前後の変更）は一次情報では未確認で、書き込み用 fd を
@@ -116,10 +117,18 @@
 //!   をランタイムの照合に通すため、書き換えた内容はシェバン・`PT_INTERP` の照合に掛かる）。B' でもインタープリタの
 //!   パスの差し替えとインタープリタ自身の内容の書き換えは閉じず、引き続き Landlock に頼る。launch 経路への適用は
 //!   #1314（本番 launcher の構成）の後になる
-//! - **B' は LSM の exec 検査を再現しない**: 元のファイルに対する AppArmor・SELinux の exec 遷移・IMA の appraisal は、
-//!   memfd を実行する場合は元のファイルについて働かない。子が LSM の制約下（`attr/current` が `unconfined` 以外）なら
-//!   複製の前に `FailedPrecondition` で拒否する（`sealed_copy.rs` の手順 0）。`unconfined` の子へのパス結び付きの
-//!   AppArmor プロファイルと IMA は検出できない。実行ビットと `noexec` だけを `faccessat2` で再現する。
+//! - **B' は元のファイルに結び付いた exec 時検査を再現しない（維持できない環境は拒否する）**: AppArmor のパス結び付き
+//!   プロファイル・SELinux の exec 遷移・IMA の appraisal・Landlock の `EXECUTE` は、memfd を実行する場合は元のファイル
+//!   について働かない。`sealed_copy.rs` の手順 0（`SealPolicy`）が、複製の前に `prepare_exec_restrictions` が
+//!   `setns` の前にホスト側で読んだ環境（`/sys/kernel/security/lsm`・`/proc/cmdline`・IMA の policy）と exec 用の
+//!   Landlock ルールセットから判定し、維持できない（または判定できない）なら複製せずに拒否する: パス結び付きの LSM
+//!   （AppArmor・TOMOYO・Smack・BPF LSM・IPE）が有効なら `FailedPrecondition`、IMA は appraisal が有効か無効と
+//!   判定できないとき `FailedPrecondition`、SELinux は自プロセスのドメインが `unconfined_t` でなければ
+//!   `FailedPrecondition`、Landlock は元のファイルの実パスが `EXECUTE` を与えるルールの配下になければ
+//!   `PermissionDenied`。**帰結**: AppArmor を有効にしたホスト（Ubuntu の既定等）では、稼働中コンテナへの exec は
+//!   封印した複製を使えず拒否される（照合だけの方式 A へは戻さない）。この環境での採否は所有者の判断事項。残る限界:
+//!   実行プロセスが起動前から継承していた Landlock の domain はカーネルに問い合わせる手段がなく判定できない。
+//!   SELinux の元のファイルのラベルによる遷移は評価しない。実行ビットと `noexec` は `faccessat2` で再現する。
 //!   setuid ビット・ファイル capability は `NO_NEW_PRIVS` が適用済みのため元々無効で、複製しても緩和にならない
 //! - **B' で `/proc/self/exe` の見え方が変わる**: exec 先の `/proc/self/exe` は `/memfd:fandhe-exec-entrypoint (deleted)`
 //!   を指す（元のパスではなくなる）。シェバンのスクリプトは従来どおり `/dev/fd/N` を渡される

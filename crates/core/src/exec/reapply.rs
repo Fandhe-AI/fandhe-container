@@ -162,7 +162,8 @@ use std::path::Path;
 use super::landlock::landlock_ruleset_from_config;
 #[cfg(feature = "exec-test-support")]
 use super::landlock::{LandlockAccessProbe, run_probe};
-use super::rlimits::{apply_rlimits, parse_proc_limits};
+use super::rlimits::{apply_rlimits, parse_proc_limits, raise_fsize_hard_before_deferral};
+use super::sealed_copy::SealPolicy;
 use super::setns::{NsIdentity, cgroup_path_matches, read_bounded_from};
 use super::{
     ExecError, ExecWorkerProof, IsolationStage, Pid1Target, StageKind, SupplementaryGroups,
@@ -208,6 +209,9 @@ pub struct ExecRestrictions {
     /// namespace へ参加する前に補助グループを空にした結果（[`prepare_exec_restrictions`] が行う。#1457）。
     /// 観測用の経路・単体テストが直接組み立てた値では `None`（参加前の消去をしていない）。
     groups_before_join: Option<SupplementaryGroups>,
+    /// 封印した複製が元のファイルの実行時ポリシー（LSM・Landlock の `EXECUTE`）を迂回しないかの判定材料。
+    /// `setns` の前（ホスト側の securityfs が見えるうち）に作る（#1531）。
+    seal_policy: SealPolicy,
 }
 
 /// 制限を exec の対象（pid1）へ束縛する材料（SUP-6・SEC-1・TASK-163.4）。
@@ -279,6 +283,8 @@ struct ExecCarry {
     /// 子へ持ち越す `RLIMIT_FSIZE`（#1531）。封印した複製の書き込みが `RLIMIT_FSIZE`（0 や小さい値）で失敗
     /// しないよう、exec プロセスには載せず、子が複製を完成させた後・`execveat` の前に適用する。
     deferred_fsize: Option<Rlimit>,
+    /// 子が封印した複製を作る前に参照する判定材料（[`ExecRestrictions`] から持ち越す。#1531）。
+    seal_policy: SealPolicy,
 }
 
 impl std::fmt::Debug for ExecCarry {
@@ -430,12 +436,14 @@ impl ExecReady {
             threads,
             owner_pid,
             deferred_fsize,
+            seal_policy,
         } = self.carry;
         ExecReadyParts {
             root,
             threads,
             owner_pid,
             deferred_fsize,
+            seal_policy,
         }
     }
 
@@ -448,6 +456,7 @@ impl ExecReady {
                 threads,
                 owner_pid,
                 deferred_fsize: None,
+                seal_policy: SealPolicy::unrestricted(),
             },
         }
     }
@@ -460,6 +469,8 @@ pub(super) struct ExecReadyParts {
     pub(super) owner_pid: u32,
     /// 子が複製の完成後に適用する `RLIMIT_FSIZE`（[`ExecCarry::deferred_fsize`]）。
     pub(super) deferred_fsize: Option<Rlimit>,
+    /// 子が封印した複製を作る前に参照する判定材料（[`ExecCarry::seal_policy`]）。
+    pub(super) seal_policy: SealPolicy,
 }
 
 /// `config`（コンテナの `config.json`）から Landlock ruleset を作り、参加後の `/` と照合する rootfs・
@@ -668,6 +679,7 @@ fn prepare_with_rootfs(
     binding: TargetBinding,
 ) -> Result<ExecRestrictions, ExecError> {
     let landlock = landlock_ruleset_from_config(config)?;
+    let seal_policy = SealPolicy::probe(&landlock);
     let status_error =
         |what: &'static str| ExecError::new(ErrorCode::Internal, IsolationStage::Landlock, what);
     let file = std::fs::File::open("/proc/self/status")
@@ -685,6 +697,7 @@ fn prepare_with_rootfs(
         rlimits,
         binding,
         groups_before_join: None,
+        seal_policy,
     })
 }
 
@@ -788,6 +801,7 @@ fn reapply_inner(
         rlimits,
         binding,
         groups_before_join,
+        seal_policy,
     } = restrictions;
     if owner_pid != std::process::id() {
         return Err(ExecError::new(
@@ -809,6 +823,12 @@ fn reapply_inner(
     let (immediate, deferred_fsize) = split_deferred_fsize(&rlimits)?;
     if !rlimits_skipped {
         apply_rlimits(&immediate).map_err(|e| e.at_stage(IsolationStage::Rlimits))?;
+        // hard limit を引き上げる必要があるときだけ、`CAP_SYS_RESOURCE` を落とす前の今ここで引き上げる。子が
+        // 複製の後に適用する値は引き下げだけになり、特権を要さない（#1531）。
+        if let Some(fsize) = &deferred_fsize {
+            raise_fsize_hard_before_deferral(fsize)
+                .map_err(|e| e.at_stage(IsolationStage::Rlimits))?;
+        }
     }
     // capability 削減は、先頭で補助グループも空にする（launch 経路と同じ関数。#1457）。
     let capabilities = if drop_capabilities {
@@ -854,6 +874,7 @@ fn reapply_inner(
             threads,
             owner_pid,
             deferred_fsize,
+            seal_policy,
         },
     })
 }
@@ -1043,6 +1064,7 @@ mod tests {
             rlimits: one_rlimit(),
             binding: own_binding(),
             groups_before_join: None,
+            seal_policy: SealPolicy::unrestricted(),
         }
     }
 
@@ -1084,6 +1106,7 @@ mod tests {
                 threads: ThreadCountSource::ProcSelf,
                 owner_pid: std::process::id(),
                 deferred_fsize: None,
+                seal_policy: SealPolicy::unrestricted(),
             },
         }
     }

@@ -384,3 +384,29 @@ fn gpu6_error_display_has_no_guest_values() {
     let e = err(VirtqueueErrorCode::ChainLoop);
     assert_eq!(e.to_string(), "CHAIN_LOOP: descriptor chain has a loop");
 }
+
+/// GPU-6・REPAIR-12: 長さ 0 の readable 記述子を挟んでも後続を取りこぼさない（[0,24]・[8,0,16]）。
+#[test]
+fn gpu6_read_readable_skips_zero_length_descriptors() {
+    let mem = FakeMemory::new();
+    let data: Vec<u8> = (1..=24).collect();
+    mem.put(DATA_OFF, &data);
+    // [0, 24]
+    mem.desc(0, D, 0, DESC_F_NEXT, 1);
+    mem.desc(1, D, 24, 0, 0);
+    mem.avail(1, &[0]);
+    let mut q = queue(&mem, 8, 0, 0);
+    let chain = q.pop(&mem).expect("pop").expect("some");
+    let mut req = [0u8; 64];
+    assert_eq!(chain.read_readable(&mem, &mut req).expect("read"), 24);
+    assert_eq!(&req[..24], &data[..]);
+    // [8, 0, 16]
+    mem.desc(2, D, 8, DESC_F_NEXT, 3);
+    mem.desc(3, D + 8, 0, DESC_F_NEXT, 4);
+    mem.desc(4, D + 8, 16, 0, 0);
+    mem.avail(2, &[0, 2]);
+    let chain = q.pop(&mem).expect("pop").expect("some");
+    let mut req = [0u8; 64];
+    assert_eq!(chain.read_readable(&mem, &mut req).expect("read"), 24);
+    assert_eq!(&req[..24], &data[..]);
+}

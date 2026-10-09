@@ -303,9 +303,14 @@ impl DescChain {
     ) -> Result<usize, VirtqueueError> {
         let mut done = 0usize;
         for &(gpa, len) in &self.readable {
-            let want = (len as usize).min(dst.len().saturating_sub(done));
-            if want == 0 {
+            // 長さ 0 の記述子は読むものが無いだけなので飛ばし、後続を読み続ける。
+            // 打ち切るのは dst が満杯のときだけ。
+            if done >= dst.len() {
                 break;
+            }
+            let want = (len as usize).min(dst.len() - done);
+            if want == 0 {
+                continue;
             }
             let slot = dst
                 .get_mut(done..done + want)

@@ -10,10 +10,14 @@
 //! 差し替え点のみで、Vulkan バインディング方式の承認待ち。[`CollectingBackend`] は提出内容を
 //! 保持する模擬で、実行はしない。
 
+use std::io::Read;
+use std::path::Path;
+
 use super::super::{CommandType, WireReader, parse_command_header};
 use super::error::VenusReplayError;
 use super::format::{
-    FILE_HEADER_LEN, MAX_RECORDING_LEN, RecordView, RecordingHeader, decode_record,
+    FILE_HEADER_LEN, MAX_RECORDING_LEN, RECORD_CHECKSUM_LEN, RECORD_HEADER_LEN, RecordView,
+    RecordingHeader, decode_record,
 };
 
 /// 検証済みの記録。[`validate`] からのみ作れる。
@@ -38,8 +42,12 @@ pub fn validate(bytes: &[u8]) -> Result<ValidatedRecording<'_>, VenusReplayError
         });
     }
     let header = RecordingHeader::decode(bytes)?;
-    // 件数はヘッダ復号で上限（65536）検証済みなので確保してよい。
-    let mut records = Vec::with_capacity(usize::try_from(header.record_count).unwrap_or(0));
+    // 件数はヘッダ復号で上限（65536）検証済みだが、本体が空でも過大に確保しないよう、
+    // 1 レコードの最小長（16 バイト）で残りバイト数に照らして頭打ちにする。
+    let mut records = Vec::with_capacity(record_capacity_budget(
+        header.record_count,
+        bytes.len().saturating_sub(FILE_HEADER_LEN),
+    ));
     let mut at = FILE_HEADER_LEN;
     for seqno in 0..header.record_count {
         let (rec, next) = decode_record(bytes, at, seqno)?;
@@ -51,6 +59,65 @@ pub fn validate(bytes: &[u8]) -> Result<ValidatedRecording<'_>, VenusReplayError
         return Err(VenusReplayError::TrailingBytes { extra });
     }
     Ok(ValidatedRecording { records })
+}
+
+/// 件数による `Vec` 確保の予算: `min(件数, 残りバイト / 1 レコードの最小長)`。
+/// 最小長はレコードヘッダ + チェックサム（空ペイロード）の 16 バイト。
+pub(crate) fn record_capacity_budget(record_count: u32, remaining_bytes: usize) -> usize {
+    let by_count = usize::try_from(record_count).unwrap_or(usize::MAX);
+    by_count.min(remaining_bytes / (RECORD_HEADER_LEN + RECORD_CHECKSUM_LEN))
+}
+
+/// `declared_len`（stat 等で得た宣言長）を上限検証してから `reader` を読み切る。
+/// 宣言後に伸びた入力にも備え、上限 + 1 バイトで読み込みを打ち切る。
+pub(crate) fn read_bounded<R: Read>(
+    reader: R,
+    declared_len: u64,
+) -> Result<Vec<u8>, VenusReplayError> {
+    read_bounded_with_limit(reader, declared_len, MAX_RECORDING_LEN)
+}
+
+/// [`read_bounded`] の上限を引数にした本体（テストで小さな上限を使うため分離）。
+pub(crate) fn read_bounded_with_limit<R: Read>(
+    reader: R,
+    declared_len: u64,
+    max: u64,
+) -> Result<Vec<u8>, VenusReplayError> {
+    let too_large = |requested| VenusReplayError::RecordingTooLarge { requested, max };
+    if declared_len > max {
+        return Err(too_large(declared_len));
+    }
+    let mut buf = Vec::with_capacity(usize::try_from(declared_len).unwrap_or(0));
+    reader
+        .take(max.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|e| VenusReplayError::Io { kind: e.kind() })?;
+    let got = u64::try_from(buf.len()).unwrap_or(u64::MAX);
+    if got > max {
+        return Err(too_large(got));
+    }
+    Ok(buf)
+}
+
+/// 記録ファイルを上限つきで読む（2 段目の入口。続けて [`validate`] に渡す）。
+///
+/// 開く前に `symlink_metadata` で通常ファイルであることを確かめ（FIFO の open は書き手が現れるまで
+/// ブロックするため）、開いた後も fd の `metadata` で再確認し、長さを読み込み前に検証する。
+/// 残存リスク: 検査から open までの間に FIFO や symlink へ差し替えられると open がブロックしたり
+/// symlink の先を読んだりしうる（`O_NOFOLLOW | O_NONBLOCK` の `sys` ラッパーは未導入。TOCTOU を
+/// 塞いだとは主張しない）。運用者が自分で指定したパスを読む PoC の道具としての前提。
+pub fn read_recording_file(path: &Path) -> Result<Vec<u8>, VenusReplayError> {
+    let io = |e: std::io::Error| VenusReplayError::Io { kind: e.kind() };
+    let before = std::fs::symlink_metadata(path).map_err(io)?;
+    if !before.file_type().is_file() {
+        return Err(VenusReplayError::NotRegularFile);
+    }
+    let file = std::fs::File::open(path).map_err(io)?;
+    let meta = file.metadata().map_err(io)?;
+    if !meta.is_file() {
+        return Err(VenusReplayError::NotRegularFile);
+    }
+    read_bounded(file, meta.len())
 }
 
 /// 再生先。将来の lavapipe / MoltenVK 実行バックエンドの差し替え点（未実装。TASK-177.x）。

@@ -373,11 +373,13 @@ fn sweep_at_path(container_cgroup_path: &str) -> Result<ExecCgroupSweep, ExecErr
         Err(e) if e.code == ErrorCode::NotFound => return Ok(ExecCgroupSweep::default()),
         Err(e) => return Err(ExecError::from_cgroup(e)),
     };
-    // 待機しないモードのため期限は使われない。
+    // 待機しないモードのため期限は使われない。exec の経路は `OpRecorder` を注入されていないため記録器は渡さず、
+    // 件数は戻り値（supervisor の `ExecOutcome::stale_exec_cgroups`）で返す（REPAIR-4）。
     sweep_exec_children_at(
         dir.as_fd(),
         SweepMode::UnpopulatedOnly,
         std::time::Instant::now(),
+        None,
     )
     .map(ExecCgroupSweep::from)
     .map_err(ExecError::from_cgroup)

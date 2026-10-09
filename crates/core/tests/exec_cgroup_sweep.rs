@@ -13,7 +13,7 @@
 //!
 //! 照合するのは、(1) exec 開始時の掃除が空で持ち主の居ない `exec-*` だけを消し、持ち主が生きているもの・
 //! プロセスの居るものを残す、(2) delete 前の掃除（`ContainerCgroupRemover::remove`）が空のものとプロセスの
-//! 居るものを両方消し、コンテナ cgroup の削除が成功する、の 2 点。
+//! 居るものを両方消し、コンテナ cgroup の削除が成功し、その件数が注入した記録器に載る、の 2 点。
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -26,6 +26,7 @@ mod linux {
     use fandhe_container_core::exec::{
         ExecCgroupName, ExecChildCgroup, sweep_stale_exec_child_cgroups_in,
     };
+    use fandhe_container_core::observability::{OpName, OpRecorder};
     use fandhe_container_core::oci_runtime::{CgroupRemoval, ContainerCgroupRemover};
     use fandhe_container_core::traits::{ContainerId, StateRevision};
 
@@ -113,10 +114,22 @@ mod linux {
         assert!(members.iter().all(|p| pid_exists(*p)), "D must stay alive");
 
         // (2) delete 前の掃除: 空の C もプロセスの居る D も消え、コンテナ cgroup の削除が成功する。
+        // 件数は delete が注入する記録器へ載る（REPAIR-4: removed 2・failed 0）。
+        let recorder = OpRecorder::new();
         assert_eq!(
-            delegated.remove(&id, instance).expect("remove"),
+            delegated
+                .remove_with_recorder(&id, instance, &recorder)
+                .expect("remove"),
             CgroupRemoval::Removed
         );
+        let counts = |n: &str| {
+            let s = recorder
+                .snapshot_op(&OpName::new(n).unwrap())
+                .expect("recorded");
+            (s.success(), s.failure())
+        };
+        assert_eq!(counts("exec_cgroup_sweep_kill_all"), (1, 0));
+        assert_eq!(counts("exec_cgroup_sweep_kill_all_child"), (2, 0));
         assert!(!container_dir.exists());
         let _ = command.wait();
         wait_until("all processes of D to be gone", || {

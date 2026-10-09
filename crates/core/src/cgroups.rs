@@ -112,7 +112,6 @@ pub use pids::{PIDS_MAX_LIMIT, PidsMax};
 mod exec_join;
 mod exec_kill;
 pub(crate) use exec_join::{ExecJoinFds, contains_pid, open_cgroup_by_path};
-pub use exec_kill::exec_cgroup_sweep_recorder;
 pub(crate) use exec_kill::{
     EXEC_SWEEP_DELETE_TIMEOUT, ExecChildCgroupFds, ExecChildRemoval, ExecChildSweep, SweepMode,
     remove_exec_child_cgroup_at, sweep_exec_children_at, validate_exec_child_name,
@@ -1324,10 +1323,34 @@ impl ContainerCgroupRemover for DelegatedCgroup {
         CgroupScope::new(&self.path.display())
     }
 
+    /// [`Self::remove_with_recorder`] と同じ削除。記録器を受けないため、残留 `exec-*` の掃除の件数は記録しない。
     fn remove(
         &self,
         id: &ContainerId,
         instance: StateRevision,
+    ) -> Result<CgroupRemoval, TraitError> {
+        self.remove_container_cgroup(id, instance, None)
+    }
+
+    /// 残留 `exec-*` の掃除の成否・レイテンシ・件数（`removed` / `left_*` / `failed`）を、`oci_runtime::delete`
+    /// に注入された `recorder` へ記録して削除する（REPAIR-4・#1596。操作名は `exec_cgroup_sweep_kill_all*`）。
+    fn remove_with_recorder(
+        &self,
+        id: &ContainerId,
+        instance: StateRevision,
+        recorder: &OpRecorder,
+    ) -> Result<CgroupRemoval, TraitError> {
+        self.remove_container_cgroup(id, instance, Some(recorder))
+    }
+}
+
+impl DelegatedCgroup {
+    /// [`ContainerCgroupRemover`] の 2 つの入口の実体（`recorder` は残留 `exec-*` の掃除の記録先）。
+    fn remove_container_cgroup(
+        &self,
+        id: &ContainerId,
+        instance: StateRevision,
+        recorder: Option<&OpRecorder>,
     ) -> Result<CgroupRemoval, TraitError> {
         // 名前を作れない（長さ超過）cgroup は `prepare` に渡す名前も同じ規則で作れないため存在し得ない。
         // 失敗にすると該当レコードが永久に削除不能になるので NotPresent とする。
@@ -1341,8 +1364,13 @@ impl ContainerCgroupRemover for DelegatedCgroup {
                 // `rmdir` が EBUSY になり、何度再試行しても成功しない。停止済みでない（コンテナ cgroup 自身に
                 // プロセスが居る）ときは掃除が何も kill せず `FailedPrecondition` を返す。
                 let deadline = std::time::Instant::now() + EXEC_SWEEP_DELETE_TIMEOUT;
-                let swept = sweep_exec_children_at(child.fd.as_fd(), SweepMode::KillAll, deadline)
-                    .map_err(removal_error)?;
+                let swept = sweep_exec_children_at(
+                    child.fd.as_fd(),
+                    SweepMode::KillAll,
+                    deadline,
+                    recorder,
+                )
+                .map_err(removal_error)?;
                 if swept.failed > 0 || swept.truncated {
                     return Err(sweep_removal_error(&swept));
                 }

@@ -20,7 +20,10 @@
 //!    拒否する（fail-closed。照合だけの方式 A へ黙って戻さない）:
 //!    - パス結び付きの LSM（AppArmor・TOMOYO・Smack・BPF LSM・IPE）が有効、または IMA の appraisal が有効
 //!      （か判定できない）なら `FailedPrecondition`（[`LsmEnvironment::Refuse`]）
-//!    - SELinux 有効時は、自プロセスのドメインが `unconfined_t` でなければ `FailedPrecondition`
+//!    - SELinux が有効なら `FailedPrecondition`（元のファイルのラベルに対する `execute`・ドメイン遷移を memfd は
+//!      迂回するため、ドメインだけを根拠に通さない。[`LsmEnvironment::Refuse`]）
+//!    - Landlock が有効なら `FailedPrecondition`（実行プロセスが起動前から継承した domain の `EXECUTE` 制限は
+//!      カーネルに問い合わせられず、内部マウント上の memfd は継承した制限を受けないため、維持を保証できない）
 //!    - Landlock が `EXECUTE` を扱う場合、元のファイルの実パスに `EXECUTE` を与えるルールの配下になければ
 //!      `PermissionDenied`（`execveat` が元のファイルで返していた `EACCES` と同じ扱い）
 //! 1. 元のファイルの実行権限をカーネルに判定させる（`sys::access_exec_via_proc`。実行ビット・`noexec`）。
@@ -39,10 +42,10 @@
 //! memfd の作成失敗（`ENOSYS`・`EACCES` = `vm.memfd_noexec=2`・`EPERM` = seccomp）は前提不足のシステム
 //! エラーで、違反にはせず `FailedPrecondition` で拒否する（照合だけの方式 A へ黙って戻さない）。
 //!
-//! 限界: 環境の判定（[`SealPolicy::probe`]）はホスト側の securityfs と `/proc/cmdline` に依る。実行プロセスが
-//! 起動前から継承していた Landlock の domain はカーネルに問い合わせる手段がなく、判定できない（ここで評価する
-//! のは exec 用に組み立てたルールセットだけ）。SELinux はプロセスのドメインだけを見て、元のファイルのラベルに
-//! よる遷移は評価しない。詳細は `interpreter.rs` の「限界」。
+//! 限界: 環境の判定（[`SealPolicy::probe`]）はホスト側の securityfs と `/proc/cmdline` に依る。判定できない
+//! 入力はすべて拒否に倒す。帰結として、AppArmor・SELinux・Landlock のいずれかが有効なホストでは封印した複製を
+//! 使えず exec は拒否される（照合だけの方式 A へは戻さない。採否は所有者の判断事項）。詳細は `interpreter.rs` の
+//! 「限界」。
 
 use std::ffi::CStr;
 use std::fs::{File, Metadata};
@@ -88,8 +91,6 @@ pub(super) struct SealPolicy {
 pub(super) enum LsmEnvironment {
     /// 複製が迂回するパス結び付きの LSM 検査がない。
     Unrestricted,
-    /// SELinux のみ有効。自プロセスのドメインが `unconfined_t` のときだけ通す。
-    SelinuxLabel,
     /// 維持できない（または判定できない）ため複製しない。値は静的な理由。
     Refuse(&'static str),
 }
@@ -187,10 +188,20 @@ pub(super) fn assess_lsm_environment(input: LsmProbeInput) -> LsmEnvironment {
         }
     }
     if names.contains(&"selinux") {
-        LsmEnvironment::SelinuxLabel
-    } else {
-        LsmEnvironment::Unrestricted
+        // 自プロセスのドメイン（`unconfined_t` 等）は、元のファイルのラベルに対する `execute` 許可や
+        // ドメイン遷移の代わりにならない。memfd はそれらを迂回するため拒否する（SEC-1・CORE-5）。
+        return LsmEnvironment::Refuse(
+            "SELinux is active; the exec-time permission and transition for the original file label cannot be reproduced for a sealed copy",
+        );
     }
+    if names.contains(&"landlock") {
+        // 起動前から継承した Landlock domain の `EXECUTE` 制限は問い合わせられず、内部マウント上の memfd は
+        // その制限を受けない。継承 domain がないと保証できないため拒否する（CORE-5・SEC-1）。
+        return LsmEnvironment::Refuse(
+            "Landlock is active; an inherited EXECUTE restriction cannot be ruled out and would not apply to a sealed copy",
+        );
+    }
+    LsmEnvironment::Unrestricted
 }
 
 /// ファイルを `cap` バイトまで読む（巨大ファイルの確保を避ける）。
@@ -257,7 +268,7 @@ pub(super) fn seal_copy_bounded(
     subject: &Path,
     policy: &SealPolicy,
 ) -> Result<(File, Metadata), ExecError> {
-    check_exec_policy_preserved(policy, read_lsm_attr_current, file, procfs, subject)?;
+    check_exec_policy_preserved(policy, file, procfs, subject)?;
     check_executable(file, procfs, subject)?;
     if size > limit {
         return Err(ExecError::from_violation_at(
@@ -306,18 +317,15 @@ pub(super) fn seal_copy_bounded(
     Ok((reopened, meta))
 }
 
-/// 手順 0: 元のファイルの実行時ポリシーを複製が迂回しないか。`read_attr` は自プロセスの SELinux ラベルの
-/// 読み取り（単体テストが差し替える）。
+/// 手順 0: 元のファイルの実行時ポリシーを複製が迂回しないか。
 fn check_exec_policy_preserved(
     policy: &SealPolicy,
-    read_attr: impl FnOnce() -> std::io::Result<String>,
     file: &File,
     procfs: BorrowedFd<'_>,
     subject: &Path,
 ) -> Result<(), ExecError> {
     match policy.lsm {
         LsmEnvironment::Unrestricted => {}
-        LsmEnvironment::SelinuxLabel => reject_if_selinux_confined(read_attr(), subject)?,
         LsmEnvironment::Refuse(reason) => {
             return Err(ExecError::new(
                 ErrorCode::FailedPrecondition,
@@ -359,34 +367,6 @@ fn check_landlock_execute(
     }
 }
 
-/// 手順 0（SELinux）: 自プロセスのドメインが `unconfined_t` か。`attr/current` の文字列は
-/// `user:role:type:level` で、`unconfined_u:unconfined_r:unconfined_t:s0` のように unconfined なドメインにも
-/// コンテキストが付く。型が `unconfined_t` 以外（`container_t` 等）は、元のファイルのラベルによるドメイン遷移を
-/// memfd では再現できないため拒否する。読み取り失敗は確認できないため拒否する。
-fn reject_if_selinux_confined(
-    attr: std::io::Result<String>,
-    subject: &Path,
-) -> Result<(), ExecError> {
-    let text =
-        attr.map_err(|e| ExecError::from_io(&e, STAGE, "read of the security module attribute"))?;
-    let label = text.trim_matches(|c: char| c == '\0' || c.is_whitespace());
-    if label.split(':').nth(2) == Some("unconfined_t") {
-        Ok(())
-    } else {
-        Err(ExecError::new(
-            ErrorCode::FailedPrecondition,
-            STAGE,
-            format!(
-                "the process is confined by SELinux; refusing to run {subject:?} from a sealed copy, which would bypass its exec transition"
-            ),
-        ))
-    }
-}
-
-/// 自プロセス（スレッド）の LSM 属性（`attr/current`）を読む。
-fn read_lsm_attr_current() -> std::io::Result<String> {
-    std::fs::read_to_string("/proc/thread-self/attr/current")
-}
 /// 手順 1: 元のファイルをカーネルが実行できると判定するか。
 fn check_executable(file: &File, procfs: BorrowedFd<'_>, subject: &Path) -> Result<(), ExecError> {
     sys::access_exec_via_proc(procfs, file.as_fd()).map_err(|e| match e {
@@ -506,7 +486,7 @@ mod tests {
     /// SUP-6・SEC-1・TASK-163 追補・#1531: IMA は appraisal が有効、または無効と判定できないときに拒否する。
     #[test]
     fn sup6_sec1_ima_appraisal_is_refused_unless_ruled_out() {
-        let lsm = "capability,landlock,ima,evm";
+        let lsm = "capability,ima,evm";
         for (cmdline, policy) in [
             ("ima_appraise=enforce", Some("")),
             ("ima_appraise=fix", Some("")),
@@ -534,45 +514,20 @@ mod tests {
         }
     }
 
-    /// SUP-6・SEC-1・TASK-163 追補・#1531: 対象外の LSM のみの環境は制約なし、SELinux は子のドメインで判定する。
+    /// SUP-6・SEC-1・CORE-5・TASK-163 追補・#1531: 対象外の LSM のみの環境は制約なし。SELinux・Landlock が有効な
+    /// 環境は（ドメインや自前のルールセットを根拠に通さず）拒否する。
     #[test]
-    fn sup6_sec1_unrelated_and_selinux_environments_are_classified() {
-        let none =
-            assess_lsm_environment(probe_input("lockdown,capability,landlock,yama", "", None));
+    fn sup6_sec1_unrelated_environment_is_unrestricted_and_selinux_landlock_are_refused() {
+        let none = assess_lsm_environment(probe_input("lockdown,capability,yama", "", None));
         assert_eq!(none, LsmEnvironment::Unrestricted);
-        let selinux = assess_lsm_environment(probe_input("capability,landlock,selinux", "", None));
-        assert_eq!(selinux, LsmEnvironment::SelinuxLabel);
-    }
-
-    /// SUP-6・SEC-1・CORE-5・TASK-163 追補・#1531: SELinux ホストでは unconfined なドメインにもコンテキストが付く。
-    /// `unconfined_t` は通し、`container_t` 等・読み取り失敗・コンテキストでない値は拒否する。
-    #[test]
-    fn sup6_sec1_selinux_unconfined_domain_is_accepted() {
-        let subject = Path::new("/bin/true");
-        for ok in [
-            "unconfined_u:unconfined_r:unconfined_t:s0\n",
-            "unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023\0",
+        for lsm in [
+            "capability,landlock,selinux",
+            "capability,selinux",
+            "capability,landlock",
         ] {
-            assert!(
-                reject_if_selinux_confined(Ok(ok.to_owned()), subject).is_ok(),
-                "{ok:?}"
-            );
+            let got = assess_lsm_environment(probe_input(lsm, "", None));
+            assert!(matches!(got, LsmEnvironment::Refuse(_)), "{lsm}: {got:?}");
         }
-        for confined in [
-            "system_u:system_r:container_t:s0:c1,c2\0",
-            "unconfined_u:unconfined_r:container_runtime_t:s0",
-            "unconfined",
-            "",
-        ] {
-            let e = reject_if_selinux_confined(Ok(confined.to_owned()), subject).unwrap_err();
-            assert_eq!(e.code, ErrorCode::FailedPrecondition, "{confined:?}");
-        }
-        let e = reject_if_selinux_confined(
-            Err(std::io::Error::from_raw_os_error(sys::EACCES)),
-            subject,
-        )
-        .unwrap_err();
-        assert_eq!(e.code, ErrorCode::PermissionDenied);
     }
 
     /// SUP-6・SEC-1・TASK-163 追補・#1531: Landlock の `EXECUTE` を与えるルールの配下だけを許す

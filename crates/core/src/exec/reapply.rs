@@ -162,7 +162,7 @@ use std::path::Path;
 use super::landlock::landlock_ruleset_from_config;
 #[cfg(feature = "exec-test-support")]
 use super::landlock::{LandlockAccessProbe, run_probe};
-use super::rlimits::{apply_rlimits, parse_proc_limits, raise_fsize_hard_before_deferral};
+use super::rlimits::{apply_rlimits, parse_proc_limits, widen_fsize_for_copy};
 use super::sealed_copy::SealPolicy;
 use super::setns::{NsIdentity, cgroup_path_matches, read_bounded_from};
 use super::{
@@ -823,11 +823,10 @@ fn reapply_inner(
     let (immediate, deferred_fsize) = split_deferred_fsize(&rlimits)?;
     if !rlimits_skipped {
         apply_rlimits(&immediate).map_err(|e| e.at_stage(IsolationStage::Rlimits))?;
-        // hard limit を引き上げる必要があるときだけ、`CAP_SYS_RESOURCE` を落とす前の今ここで引き上げる。子が
-        // 複製の後に適用する値は引き下げだけになり、特権を要さない（#1531）。
+        // 複製の期間に必要な soft・hard を、`CAP_SYS_RESOURCE` を落とす前の今ここで確保する。子が複製の後に
+        // 適用する値は引き下げだけになり、特権を要さない（#1531）。
         if let Some(fsize) = &deferred_fsize {
-            raise_fsize_hard_before_deferral(fsize)
-                .map_err(|e| e.at_stage(IsolationStage::Rlimits))?;
+            widen_fsize_for_copy(fsize).map_err(|e| e.at_stage(IsolationStage::Rlimits))?;
         }
     }
     // capability 削減は、先頭で補助グループも空にする（launch 経路と同じ関数。#1457）。

@@ -57,33 +57,49 @@ pub(super) fn apply_rlimits(set: &Rlimits) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// 子が複製の後に適用する `RLIMIT_FSIZE`（`target`）の hard limit が、いまの hard limit より大きいときだけ、
-/// hard limit を `target` の値へ引き上げる（soft は変えない。#1531）。
+/// 封印した複製の書き込みのために `RLIMIT_FSIZE` の soft・hard limit を広げる（#1531）。
 ///
-/// hard limit の引き上げは `CAP_SYS_RESOURCE` を要し、capability 削減の後では常に `EPERM` になる。そのため
-/// capability 削減の **前**（本モジュールの冒頭の「順序の根拠」と同じ位置）で呼ぶ。この後に子が適用する
-/// `target` は引き下げだけになり、特権を要さない。失敗は launch 経路の `apply_rlimits` と同じ段 `Rlimits` の
-/// `EPERM`（`PermissionDenied`）等で、exec は始まらない（黙ってクランプしない）。
-pub(super) fn raise_fsize_hard_before_deferral(target: &Rlimit) -> Result<(), ExecError> {
+/// 継承した soft limit が 0 やバイナリサイズ未満だと、memfd への書き込みが `SIGXFSZ`・`EFBIG` で失敗し、
+/// 従来は起動できたコマンドが起動しなくなる。そこで複製の期間だけ soft・hard を広げ、子が複製の後に `target`
+/// （コンテナの値）を適用し直す（引き下げだけで特権を要さない）。hard limit の引き上げは `CAP_SYS_RESOURCE` を
+/// 要し、capability 削減の後では常に `EPERM` になるため、capability 削減の **前**（本モジュールの冒頭の
+/// 「順序の根拠」と同じ位置）で呼ぶ。
+///
+/// まず `RLIM_INFINITY` へ広げ、特権が足りず失敗したときは `max(現在の hard, target.hard)` を soft・hard の
+/// 両方へ設定する（soft の引き上げは hard の範囲内なら特権を要さない）。どちらも失敗したら段 `Rlimits` の
+/// `PermissionDenied` 等で、exec は始まらない（黙ってクランプしない）。
+pub(super) fn widen_fsize_for_copy(target: &Rlimit) -> Result<(), ExecError> {
     let stage = IsolationStage::Rlimits;
-    let what = "prlimit(fsize) hard limit raise";
-    let (soft, hard) =
+    let what = "prlimit(fsize) widen for the executable copy";
+    let current =
         get_rlimit_self(RlimitKind::Fsize).map_err(|e| ExecError::from_sys(e, stage, what))?;
-    if target.hard() <= hard {
-        return Ok(());
+    let fallback = current.1.max(target.hard());
+    let attempts = [RLIMIT_INFINITY, fallback];
+    let mut last_err = None;
+    for want in attempts {
+        if current == (want, want) {
+            return Ok(());
+        }
+        match set_rlimit_self(RlimitKind::Fsize, want, want) {
+            Ok(()) => {
+                let now = get_rlimit_self(RlimitKind::Fsize)
+                    .map_err(|e| ExecError::from_sys(e, stage, what))?;
+                if now != (want, want) {
+                    return Err(ExecError::new(
+                        ErrorCode::Internal,
+                        stage,
+                        format!("{what} did not take effect"),
+                    ));
+                }
+                return Ok(());
+            }
+            Err(e) => last_err = Some(e),
+        }
     }
-    set_rlimit_self(RlimitKind::Fsize, soft, target.hard())
-        .map_err(|e| ExecError::from_sys(e, stage, what))?;
-    let now =
-        get_rlimit_self(RlimitKind::Fsize).map_err(|e| ExecError::from_sys(e, stage, what))?;
-    if now != (soft, target.hard()) {
-        return Err(ExecError::new(
-            ErrorCode::Internal,
-            stage,
-            format!("{what} did not take effect"),
-        ));
+    match last_err {
+        Some(e) => Err(ExecError::from_sys(e, stage, what)),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// `/proc/<pid>/limits` の行頭ラベルと rlimit 種別の対応（カーネルの `lnx_rlimit` 表の文言。
@@ -268,43 +284,50 @@ mod tests {
         take_sets();
     }
 
-    /// SUP-12・SEC-1・#1531: hard limit を引き上げる必要があるときだけ、soft を保ったまま引き上げる。
-    /// 引き上げが不要（現在の hard 以下）なら何も設定しない。
+    /// SUP-12・SEC-1・#1531: 継承した soft が小さい（0 やバイナリ未満）でも、複製の期間だけ soft・hard を
+    /// `RLIM_INFINITY` へ広げる。すでに無制限なら何も設定しない。
     #[test]
-    fn sup12_raise_fsize_hard_only_when_needed() {
+    fn sup12_widen_fsize_for_copy_covers_soft_and_hard() {
         take();
         take_sets();
-        // 現在値は (soft 100, hard 200)。target.hard = 300 > 200 なので (100, 300) へ引き上げる。
         fake(Ok(()), None);
-        set_rlimit_self(RlimitKind::Fsize, 100, 200).unwrap();
+        set_rlimit_self(RlimitKind::Fsize, 0, 200).unwrap();
         take_sets();
         let target = Rlimit::new(RlimitKind::Fsize, 0, 300).unwrap();
-        raise_fsize_hard_before_deferral(&target).unwrap();
-        assert_eq!(take_sets(), [(RlimitKind::Fsize, 100, 300)]);
-        // 引き下げ・同値は設定しない。
+        widen_fsize_for_copy(&target).unwrap();
+        assert_eq!(
+            take_sets(),
+            [(RlimitKind::Fsize, RLIMIT_INFINITY, RLIMIT_INFINITY)]
+        );
         take();
-        set_rlimit_self(RlimitKind::Fsize, 100, 200).unwrap();
+        set_rlimit_self(RlimitKind::Fsize, RLIMIT_INFINITY, RLIMIT_INFINITY).unwrap();
         take_sets();
-        let lower = Rlimit::new(RlimitKind::Fsize, 0, 50).unwrap();
-        raise_fsize_hard_before_deferral(&lower).unwrap();
+        widen_fsize_for_copy(&target).unwrap();
         assert_eq!(take_sets(), []);
         take();
     }
 
-    /// SUP-12・SEC-1・#1531: 引き上げの失敗（`EPERM`）は段 `Rlimits` の `PermissionDenied` で、exec は始まらない。
+    /// SUP-12・SEC-1・#1531: 広げる設定の失敗（`EPERM`）は段 `Rlimits` の `PermissionDenied` で、exec は始まらない。
     #[test]
-    fn sup12_raise_fsize_hard_failure_is_permission_denied() {
+    fn sup12_widen_fsize_failure_is_permission_denied() {
         take();
         take_sets();
         set_rlimit_self(RlimitKind::Fsize, 100, 200).unwrap();
         take_sets();
         fake(Err(SysError::Os(sys::EPERM)), None);
         let target = Rlimit::new(RlimitKind::Fsize, 0, 300).unwrap();
-        let e = raise_fsize_hard_before_deferral(&target).unwrap_err();
+        let e = widen_fsize_for_copy(&target).unwrap_err();
         assert_eq!(e.code, ErrorCode::PermissionDenied);
         assert_eq!(e.stage, IsolationStage::Rlimits);
+        // 無制限が拒否されたら、max(現在の hard, target.hard) = 300 の設定も試みる。
+        assert_eq!(
+            take_sets(),
+            [
+                (RlimitKind::Fsize, RLIMIT_INFINITY, RLIMIT_INFINITY),
+                (RlimitKind::Fsize, 300, 300)
+            ]
+        );
         take();
-        take_sets();
     }
 
     /// SUP-12・TASK-169.1: 途中の失敗で後続の種別を呼ばない。

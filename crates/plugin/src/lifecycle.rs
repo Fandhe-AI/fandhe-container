@@ -26,6 +26,11 @@
 //!   いずれも `could not be reaped` とは報告しない（PLUG-7・REPAIR-5）。macOS はゾンビだけのグループへの
 //!   `killpg` にも `EPERM` を返すため、接続後・応答前に plugin が終了した場合は孫がいなくても付記が付き得る
 //!   （`EPERM` を許容しない理由は `group_kill_tolerated` の doc）。
+//! - `Drop` 経路の記録（#1605・REPAIR-4）: `ChildGuard` の破棄時にグループ停止の失敗（`GroupKillFailed`。
+//!   孫が残り得る）または直接の子の未回収（`Unreaped`）が起きた場合、stderr へ 1 行の JSON
+//!   （`{"event":"plugin_child_cleanup","op":"drop","outcome":"error","reason":"group_kill_failed"|"unreaped"}`。
+//!   `unreaped` のみ保持中の `pid` を整数で付す）を 1 回だけ出す。書き込み失敗は無視し、plugin 由来の文字列は
+//!   載せない。`unreaped_error` で報告済みの子と、回収済み・他所で回収された（`Lost`）子は記録しない。
 //! - 子の環境変数は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ設定する（資格情報を継承させない）。
 //!   stdin / stdout は null。stderr は親へ継承させず、専用の UNIX ソケット対で受けて
 //!   [`OneShotStderr`] として返す（untrusted。保持は [`ONE_SHOT_STDERR_MAX_BYTES`] まで。超過分は
@@ -762,11 +767,71 @@ fn termination_after_kill(reap: Reap) -> OneShotTermination {
     }
 }
 
+/// `ChildGuard` の `Drop` 経路で後始末に失敗したときの記録（#1605・PLUG-7・REPAIR-4）。
+///
+/// `Drop` は `Result` を返せないため、呼び出し側へ報告できない失敗を stderr へ 1 行の JSON で残す。
+/// 値は固定文字列と整数のみで、plugin 由来の untrusted な文字列（stderr・パス）は載せない
+/// （ログ行の偽装を防ぐ。エスケープ不要）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildGuardDropFailure {
+    /// 直接の子は回収したが、グループ宛て SIGKILL が許容外のエラーで失敗し、孫が残り得る。
+    /// 直接の子は解放済みのため pid は載せない（`group_kill_failed_error` と同じ扱い）。
+    GroupKillFailed,
+    /// 直接の子を回収できなかった（孤児の可能性）。保持中の pid を載せる（`unreaped_error` と同じ）。
+    Unreaped { pid: Option<u32> },
+}
+
+impl ChildGuardDropFailure {
+    /// 構造化ログの 1 行（キーは `audit` の `event` / `op` / `outcome` / `reason` の流儀に揃える）。
+    fn to_json_line(self) -> String {
+        match self {
+            Self::GroupKillFailed => "{\"event\":\"plugin_child_cleanup\",\"op\":\"drop\",\"outcome\":\"error\",\"reason\":\"group_kill_failed\"}".to_string(),
+            Self::Unreaped { pid: Some(pid) } => format!(
+                "{{\"event\":\"plugin_child_cleanup\",\"op\":\"drop\",\"outcome\":\"error\",\"reason\":\"unreaped\",\"pid\":{pid}}}"
+            ),
+            Self::Unreaped { pid: None } => "{\"event\":\"plugin_child_cleanup\",\"op\":\"drop\",\"outcome\":\"error\",\"reason\":\"unreaped\"}".to_string(),
+        }
+    }
+}
+
+/// `Drop` 時の `Reap` を記録対象へ写す。孫が残り得る `GroupKillFailed` と未回収の `Unreaped` だけが対象で、
+/// `Lost`（他所で回収済み。孤児ではない）や回収成功は記録しない。
+fn drop_failure(reap: Reap, pid: Option<u32>) -> Option<ChildGuardDropFailure> {
+    match reap {
+        Reap::GroupKillFailed => Some(ChildGuardDropFailure::GroupKillFailed),
+        Reap::Unreaped => Some(ChildGuardDropFailure::Unreaped { pid }),
+        Reap::Reaped(_) | Reap::AlreadyReaped | Reap::Lost => None,
+    }
+}
+
+impl ChildGuard {
+    /// `Drop` の本体。後始末の失敗があれば `emit` を 1 回だけ呼ぶ。
+    ///
+    /// 報告済み（`reported_unreaped`）のときは何もしない。`Unreaped` を記録したら報告済みにして登録を
+    /// 解放し、以後の `Drop` で再記録・再 kill をしない（`unreaped_error` と同じ扱い）。
+    fn finish_on_drop(&mut self, emit: &mut dyn FnMut(&ChildGuardDropFailure)) {
+        if self.reported_unreaped {
+            return;
+        }
+        let pid = self.pid();
+        let reap = self.kill_and_reap();
+        if let Some(failure) = drop_failure(reap, pid) {
+            if matches!(failure, ChildGuardDropFailure::Unreaped { .. }) {
+                self.reported_unreaped = true;
+                self.slot = None;
+            }
+            emit(&failure);
+        }
+    }
+}
+
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if !self.reported_unreaped {
-            let _ = self.kill_and_reap();
-        }
+        // 書き込み失敗は無視する（`Drop`・panic の unwinding 中でも panic しない）。
+        self.finish_on_drop(&mut |rec| {
+            use std::io::Write;
+            let _ = writeln!(io::stderr(), "{}", rec.to_json_line());
+        });
     }
 }
 
@@ -784,6 +849,11 @@ const GROUP_KILL_EPERM_RETRY: Duration = Duration::from_millis(200);
 #[cfg(unix)]
 fn kill_group_retrying_eperm(pgid: u32) -> io::Result<()> {
     const EPERM: i32 = 1;
+    // テスト専用: 非特権では再現できない許容外のエラーを注入する（本番ビルドには存在しない）。
+    #[cfg(test)]
+    if let Some(e) = tests::FORCED_GROUP_KILL_ERRNO.with(|c| c.get()) {
+        return Err(io::Error::from_raw_os_error(e));
+    }
     let start = Instant::now();
     let mut interval = Duration::from_millis(1);
     loop {
@@ -1293,6 +1363,84 @@ fn check_termination_after_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// `kill_group_retrying_eperm` へ注入する errno（スレッドローカルで並列テストに影響しない）。
+        pub(super) static FORCED_GROUP_KILL_ERRNO: std::cell::Cell<Option<i32>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    const GROUP_KILL_FAILED_LINE: &str = "{\"event\":\"plugin_child_cleanup\",\"op\":\"drop\",\"outcome\":\"error\",\"reason\":\"group_kill_failed\"}";
+
+    #[cfg(unix)]
+    fn spawn_sleeper_group() -> ChildGuard {
+        use std::os::unix::process::CommandExt;
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        ChildGuard::new(child)
+    }
+
+    /// REPAIR-4・PLUG-7・#1605: Drop でグループ停止に失敗したとき、記録がちょうど 1 件出る。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_drop_records_group_kill_failure_once() {
+        let mut guard = spawn_sleeper_group();
+        FORCED_GROUP_KILL_ERRNO.with(|c| c.set(Some(22)));
+        let mut lines: Vec<String> = Vec::new();
+        guard.finish_on_drop(&mut |rec| lines.push(rec.to_json_line()));
+        FORCED_GROUP_KILL_ERRNO.with(|c| c.set(None));
+        assert_eq!(lines, vec![GROUP_KILL_FAILED_LINE.to_string()]);
+        // 直接の子はフォールバックの `Child::kill` で回収済み。
+        assert_eq!(guard.pid(), None);
+        // 2 回目は AlreadyReaped で記録しない。
+        guard.finish_on_drop(&mut |rec| lines.push(rec.to_json_line()));
+        assert_eq!(lines.len(), 1);
+        drop(guard);
+    }
+
+    /// REPAIR-4・#1605: 通常の破棄は何も記録せず、子を回収する。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_drop_of_running_child_records_nothing() {
+        let mut guard = spawn_sleeper_group();
+        let mut lines: Vec<String> = Vec::new();
+        guard.finish_on_drop(&mut |rec| lines.push(rec.to_json_line()));
+        assert!(lines.is_empty());
+        assert_eq!(guard.pid(), None);
+    }
+
+    /// REPAIR-4・#1605: `Reap` から記録への写像と JSON 行の全文。
+    #[test]
+    fn repair4_drop_failure_mapping() {
+        assert_eq!(
+            drop_failure(Reap::GroupKillFailed, Some(7)),
+            Some(ChildGuardDropFailure::GroupKillFailed)
+        );
+        assert_eq!(
+            drop_failure(Reap::Unreaped, Some(1234)),
+            Some(ChildGuardDropFailure::Unreaped { pid: Some(1234) })
+        );
+        assert_eq!(drop_failure(Reap::AlreadyReaped, Some(1)), None);
+        assert_eq!(drop_failure(Reap::Lost, Some(1)), None);
+        assert_eq!(
+            ChildGuardDropFailure::GroupKillFailed.to_json_line(),
+            GROUP_KILL_FAILED_LINE
+        );
+        assert_eq!(
+            ChildGuardDropFailure::Unreaped { pid: Some(1234) }.to_json_line(),
+            "{\"event\":\"plugin_child_cleanup\",\"op\":\"drop\",\"outcome\":\"error\",\"reason\":\"unreaped\",\"pid\":1234}"
+        );
+        assert_eq!(
+            ChildGuardDropFailure::Unreaped { pid: None }.to_json_line(),
+            "{\"event\":\"plugin_child_cleanup\",\"op\":\"drop\",\"outcome\":\"error\",\"reason\":\"unreaped\"}"
+        );
+    }
 
     /// PLUG-7・#1311: グループ送信エラーの許容は ESRCH と Unsupported（送信非対応 unix で直接の子の
     /// 回収結果を Unreaped に変えない）のみ。InvalidInput は許容しない。

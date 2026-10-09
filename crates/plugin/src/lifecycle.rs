@@ -624,10 +624,12 @@ impl ChildGuard {
         if let Some(slot) = self.slot.take()
             && !slot.suspend()
         {
-            // 直接の子は未回収なので pid（= pgid）は再利用されず、グループへの送信は安全。
+            // 直接の子は未回収なので pid（= pgid）は再利用されず、グループへの送信は安全。通常経路と同じく
+            // macOS の exec 窓の一過性 `EPERM` を再送で吸収する（`kill_group_retrying_eperm`）。結果は
+            // 直接の子の未回収（`Unreaped`）が優先するため使わない（`Drop` は報告後に再送しない）。
             #[cfg(unix)]
             if !self.leader_reaped {
-                let _ = crate::sys::kill_process_group(c.id());
+                let _ = kill_group_retrying_eperm(c.id());
             }
             let _ = c.kill();
             self.slot = Some(slot);

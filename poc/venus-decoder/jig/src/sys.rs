@@ -491,7 +491,10 @@ pub(crate) fn fcntl_add_seals(fd: BorrowedFd<'_>, seals: u32) -> Result<(), SysE
     check(ret).map(|_| ())
 }
 
-/// `mmap` した共有マッピング。`Drop` で `munmap` する。生ポインタを持つので `!Send` / `!Sync`（そのままにする）。
+/// `mmap` した共有マッピング。`Drop` で `munmap` する。アドレスを `NonNull<u8>` で持ち、`NonNull` 自体が `!Send` / `!Sync`
+/// なので、この型と包む側（`GuestMemoryRegion` / `GuestMemory`）も `!Send` / `!Sync` になる（`unsafe impl` で付け足さない）。
+/// `copy_in` / `copy_out` は `&self` から非アトミックにコピーするため、複数スレッドから同じマッピングを使えないことが前提。
+/// この性質は `GuestMemory` の `compile_fail` doctest で照合する。
 ///
 /// マッピングへの `&[u8]` / `&mut [u8]` は作らない。frontend / ゲストが同時に書き換える共有メモリへの参照は
 /// エイリアシング規則に反するため、境界検査したコピー（[`Self::copy_out`] / [`Self::copy_in`]）だけで出し入れする。

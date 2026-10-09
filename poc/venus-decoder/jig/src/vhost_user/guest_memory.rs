@@ -172,6 +172,19 @@ impl GuestMemoryRegion {
 }
 
 /// `SET_MEM_TABLE` 全体のゲストメモリ。GPA から領域を引いてアクセスする。
+///
+/// `!Send` / `!Sync`（マッピングを `NonNull<u8>` で持つため）。`read_at` / `write_at` は `&self` から非アトミックに
+/// コピーするので、スレッド間で共有・移動できないことをコンパイル時に保証する（GPU-6）。
+///
+/// ```compile_fail,E0277
+/// fn need_sync<T: Sync>() {}
+/// need_sync::<fandhe_container_poc_venus_jig::vhost_user::guest_memory::GuestMemory>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// fn need_send<T: Send>() {}
+/// need_send::<fandhe_container_poc_venus_jig::vhost_user::guest_memory::GuestMemoryRegion>();
+/// ```
 #[derive(Debug)]
 pub struct GuestMemory {
     regions: Vec<GuestMemoryRegion>,

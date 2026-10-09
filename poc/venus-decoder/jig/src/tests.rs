@@ -93,8 +93,8 @@ fn task172_4_gpu6_bad_lengths_rejected() {
 
 #[test]
 fn task172_4_gpu6_unknown_type_is_unspec() {
-    // 0x0101 = RESOURCE_CREATE_2D、0x010c = RESOURCE_CREATE_BLOB、0x0207 = SUBMIT_3D（いずれも未実装）。
-    for (cmd, dec) in [(0x0101u32, 257), (0x010c, 268), (0x0207, 519)] {
+    // 0x0101 = RESOURCE_CREATE_2D、0x0208 = RESOURCE_MAP_BLOB、0x0209 = RESOURCE_UNMAP_BLOB（いずれも未実装。#1601 で BLOB 作成と SUBMIT_3D は実装済み）。
+    for (cmd, dec) in [(0x0101u32, 257), (0x0208, 520), (0x0209, 521)] {
         let h = handle_ctrl(&req(cmd, 0, 0, 0, 0));
         assert_eq!(h.response.resp_type(), RESP_ERR_UNSPEC);
         assert_eq!(

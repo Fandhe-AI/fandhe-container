@@ -28,8 +28,10 @@ pub enum QueryResult {
     Unspec,
     /// ctx_id が 0・重複・未作成（`ERR_INVALID_CONTEXT_ID`）。
     InvalidContextId,
-    /// ctx 表が上限（`ERR_OUT_OF_MEMORY`）。
+    /// 資源表または ctx 表が上限（`ERR_OUT_OF_MEMORY`）。
     OutOfMemory,
+    /// resource_id が 0・重複・未作成（`ERR_INVALID_RESOURCE_ID`）。
+    InvalidResourceId,
 }
 
 impl QueryResult {
@@ -40,6 +42,7 @@ impl QueryResult {
             Self::Unspec => "unspec",
             Self::InvalidContextId => "invalid_context_id",
             Self::OutOfMemory => "out_of_memory",
+            Self::InvalidResourceId => "invalid_resource_id",
         }
     }
 }
@@ -90,6 +93,75 @@ pub fn ctx_destroy_line(ctx_id: u32, result: QueryResult) -> String {
     format!(
         "venus_jig event=ctx cmd=CTX_DESTROY ctx_id={ctx_id} result={}",
         result.word()
+    )
+}
+
+/// `RESOURCE_CREATE_BLOB` のログ行。復号できなかった値は -1。`blob_id` は出さない。
+pub fn resource_create_blob_line(
+    ctx_id: u32,
+    req: Option<&crate::ctrl::ResourceCreateBlob>,
+    result: QueryResult,
+) -> String {
+    format!(
+        "venus_jig event=resource cmd=RESOURCE_CREATE_BLOB ctx_id={ctx_id} res_id={} blob_mem={} blob_flags={} size={} result={}",
+        req.map_or(-1, |c| i128::from(c.res_id)),
+        req.map_or(-1, |c| i128::from(c.blob_mem)),
+        req.map_or(-1, |c| i128::from(c.blob_flags)),
+        req.map_or(-1, |c| i128::from(c.size)),
+        result.word()
+    )
+}
+
+/// `CTX_ATTACH_RESOURCE` / `CTX_DETACH_RESOURCE` のログ行（`cmd` は呼び出し側の固定語彙）。
+pub fn ctx_resource_line(
+    cmd: &'static str,
+    ctx_id: u32,
+    res_id: Option<u32>,
+    result: QueryResult,
+) -> String {
+    format!(
+        "venus_jig event=resource cmd={cmd} ctx_id={ctx_id} res_id={} result={}",
+        res_id.map_or(-1, i64::from),
+        result.word()
+    )
+}
+
+/// `RESOURCE_UNREF` のログ行。
+pub fn resource_unref_line(res_id: Option<u32>, result: QueryResult) -> String {
+    format!(
+        "venus_jig event=resource cmd=RESOURCE_UNREF res_id={} result={}",
+        res_id.map_or(-1, i64::from),
+        result.word()
+    )
+}
+
+/// `SUBMIT_3D` のログ行の材料。本体のバイト列は含めない（数値と固定語彙のみ）。
+#[derive(Debug, Clone, Copy)]
+pub struct Submit3dLog {
+    /// ヘッダの ctx_id。
+    pub ctx_id: u32,
+    /// `INFO_RING_IDX` が立つときだけ入る ring_idx（無ければ -1 で出す）。
+    pub ring_idx: Option<u8>,
+    /// `size` フィールド（復号できなければ -1）。
+    pub size: Option<u32>,
+    /// 本体先頭の venus コマンド種別の生値（解析できなければ -1）。
+    pub venus_cmd: Option<u32>,
+    /// 本体ヘッダ検査の結果の固定語彙（`ok` / `empty` / `none` / `venus_wire.*`）。
+    pub wire: &'static str,
+    /// 応答の結果。
+    pub result: QueryResult,
+}
+
+/// `SUBMIT_3D` のログ行。
+pub fn submit_3d_line(l: &Submit3dLog) -> String {
+    format!(
+        "venus_jig event=submit_3d cmd=SUBMIT_3D ctx_id={} ring_idx={} size={} venus_cmd={} wire={} result={}",
+        l.ctx_id,
+        l.ring_idx.map_or(-1, i64::from),
+        l.size.map_or(-1, i64::from),
+        l.venus_cmd.map_or(-1, i64::from),
+        l.wire,
+        l.result.word()
     )
 }
 

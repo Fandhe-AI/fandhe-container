@@ -56,6 +56,8 @@ use negotiation::{State, expected_fds};
 
 /// ctrl 要求として受け付ける readable の最大長（固定長のスタックバッファの大きさ）。`CTX_CREATE`（96 バイト）より十分大きい。
 pub const MAX_CTRL_REQ_LEN: usize = 4096;
+// 3 OS でビルドされる `ctrl` の上限（`SUBMIT_3D` の検査）と同じ値に保つ。
+const _: () = assert!(MAX_CTRL_REQ_LEN == crate::ctrl::MAX_REQ_LEN);
 
 const DEFAULT_POLL_SLICE: Duration = Duration::from_millis(10);
 
@@ -352,6 +354,9 @@ impl Session {
                     .get(..n)
                     .ok_or_else(|| SessionError::new(SessionErrorCode::InvalidValue, None))?;
                 let h = adapter.handle_ctrl(req);
+                // `h.submit`（受理した SUBMIT_3D の受け渡し点）は、応答を書き戻せた場合だけ記録へ渡す契約
+                // （`dropped` で adapter を巻き戻した要求の提出は、ゲストが ACK を見ていないので捨てる）。
+                // 配線は #1602（F6）で行うため、ここでは消費しない。
                 (h.response, h.log_line)
             };
             let mut dropped = false;

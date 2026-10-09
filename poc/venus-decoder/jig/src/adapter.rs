@@ -5,18 +5,51 @@
 //! #1520 で `GET_DISPLAY_INFO`（scanout なし）・`CTX_CREATE`（venus の context_init）・`CTX_DESTROY` を追加した。
 //! CTX の重複・未知を判定するため、作成済み ctx_id の表（上限 [`MAX_CONTEXTS`]）を [`CtrlAdapter`] が所有する。
 //! 未知の種別は `ERR_UNSPEC`、長さ・値の不正は `ERR_INVALID_PARAMETER` で拒否する（fail-closed）。
-//! 未実装（REPAIR-3）: 上記以外の ctrl 応答（RESOURCE_CREATE_BLOB・SUBMIT_3D 等。後続 F2 の残り）。
+//! #1601 で blob リソース（`RESOURCE_CREATE_BLOB`・`CTX_ATTACH_RESOURCE` / `DETACH_RESOURCE`・`RESOURCE_UNREF`。資源表は
+//! `resource`）と `SUBMIT_3D` の最小応答を追加した。`SUBMIT_3D` は受理して [`Handled::submit`] で本体を呼び出し側へ渡すだけで、
+//! コマンドは実行しない。`CTX_DESTROY` はその ctx への attach を暗黙に外す。
+//! 未実装（REPAIR-3）: `RESOURCE_MAP_BLOB` / `UNMAP_BLOB`（共有メモリが前提。F5.2b・承認待ち。`ERR_UNSPEC` のまま）、
+//! 実メモリの確保、`SUBMIT_3D` の dispatch（TASK-177.x）。
 
-use fandhe_container_plugin_macos::gpu::venus::{capset_info, respond_capset_query};
+use fandhe_container_plugin_macos::gpu::venus::{
+    CommandHeader, VenusWireError, WireReader, capset_info, parse_command_header,
+    respond_capset_query,
+};
 
 use crate::ctrl::{
-    CMD_CTX_CREATE, CMD_CTX_DESTROY, CMD_GET_CAPSET, CMD_GET_CAPSET_INFO, CMD_GET_DISPLAY_INFO,
+    BLOB_FLAG_USE_MAPPABLE, BLOB_MEM_HOST3D, CMD_CTX_ATTACH_RESOURCE, CMD_CTX_CREATE,
+    CMD_CTX_DESTROY, CMD_CTX_DETACH_RESOURCE, CMD_GET_CAPSET, CMD_GET_CAPSET_INFO,
+    CMD_GET_DISPLAY_INFO, CMD_RESOURCE_CREATE_BLOB, CMD_RESOURCE_UNREF, CMD_SUBMIT_3D,
     CTX_DESTROY_REQ_LEN, CtrlHeader, CtrlResponse, CtxCreate, CtxCreateError,
-    DISPLAY_INFO_BODY_LEN, DISPLAY_INFO_REQ_LEN, HDR_LEN, REQ_LEN, RESP_ERR_INVALID_CONTEXT_ID,
-    RESP_ERR_INVALID_PARAMETER, RESP_ERR_OUT_OF_MEMORY, RESP_ERR_UNSPEC, RESP_OK_CAPSET,
-    RESP_OK_CAPSET_INFO, RESP_OK_DISPLAY_INFO, RESP_OK_NODATA, le32,
+    DISPLAY_INFO_BODY_LEN, DISPLAY_INFO_REQ_LEN, FLAG_FENCE, FLAG_INFO_RING_IDX, HDR_LEN, REQ_LEN,
+    RESP_ERR_INVALID_CONTEXT_ID, RESP_ERR_INVALID_PARAMETER, RESP_ERR_INVALID_RESOURCE_ID,
+    RESP_ERR_OUT_OF_MEMORY, RESP_ERR_UNSPEC, RESP_OK_CAPSET, RESP_OK_CAPSET_INFO,
+    RESP_OK_DISPLAY_INFO, RESP_OK_NODATA, ResourceCreateBlob, Submit3dError, le32,
+    parse_resource_id, parse_submit_3d,
 };
 use crate::log::{self, QueryResult};
+use crate::resource::{ResourceError, ResourceTable};
+
+/// `SUBMIT_3D` の ring_idx の上限（`NUM_RINGS` = 64。`INFO_RING_IDX` が立つときだけ検査する。設計書 10.4.3）。
+pub const MAX_RINGS: u8 = 64;
+
+/// 受理した `SUBMIT_3D` の受け渡し点。#1602（コマンドストリームの記録）が使う。
+///
+/// `session` は応答を書き戻せなかった要求（adapter を巻き戻した要求）の `submit` を捨てる契約で、
+/// ゲストが ACK を見ていない提出を記録しない。コマンドの実行はしない（TASK-177.x の範囲）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Submit3d {
+    /// 提出元の ctx。
+    pub ctx_id: u32,
+    /// `INFO_RING_IDX` が立つときだけ入る ring_idx。
+    pub ring_idx: Option<u8>,
+    /// `FLAG_FENCE` が立つときだけ入る fence_id。
+    pub fence_id: Option<u64>,
+    /// 本体の先頭 8 バイトの venus コマンドヘッダの復号結果（本体が空なら `None`）。応答の種別には影響しない。
+    pub header: Option<Result<CommandHeader, VenusWireError>>,
+    /// 本体のバイト列（長さ検査の後にだけ確保・コピーする。上限は `ctrl::MAX_SUBMIT_3D_PAYLOAD_LEN`）。
+    pub payload: Vec<u8>,
+}
 
 /// 1 要求の処理結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +58,8 @@ pub struct Handled {
     pub response: CtrlResponse,
     /// 構造化ログ 1 行（改行なし）。
     pub log_line: String,
+    /// 受理した `SUBMIT_3D` の受け渡し点（それ以外の要求・拒否では `None`）。
+    pub submit: Option<Submit3d>,
 }
 
 /// 同時に保持する ctx の上限（ゲスト由来の無制限 insert による DoS を防ぐ）。
@@ -60,17 +95,20 @@ impl ContextTable {
         }
     }
 
-    fn remove(&mut self, ctx_id: u32) -> Result<(), CtxError> {
+    /// 作成済み ctx のスロット番号（ctx_id 0 は常に `None`）。
+    fn index_of(&self, ctx_id: u32) -> Option<usize> {
         if ctx_id == 0 {
-            return Err(CtxError::InvalidId);
+            return None;
         }
-        match self.slots.iter_mut().find(|s| **s == ctx_id) {
-            Some(slot) => {
-                *slot = 0;
-                Ok(())
-            }
-            None => Err(CtxError::InvalidId),
-        }
+        self.slots.iter().position(|s| *s == ctx_id)
+    }
+
+    /// ctx を消し、解放したスロット番号を返す。
+    fn remove(&mut self, ctx_id: u32) -> Result<usize, CtxError> {
+        let idx = self.index_of(ctx_id).ok_or(CtxError::InvalidId)?;
+        let slot = self.slots.get_mut(idx).ok_or(CtxError::InvalidId)?;
+        *slot = 0;
+        Ok(idx)
     }
 }
 
@@ -78,6 +116,7 @@ impl ContextTable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CtrlAdapter {
     contexts: ContextTable,
+    resources: ResourceTable,
 }
 
 impl Default for CtrlAdapter {
@@ -86,6 +125,7 @@ impl Default for CtrlAdapter {
             contexts: ContextTable {
                 slots: [0; MAX_CONTEXTS],
             },
+            resources: ResourceTable::default(),
         }
     }
 }
@@ -97,6 +137,7 @@ impl CtrlAdapter {
             return Handled {
                 response: CtrlResponse::new(None, RESP_ERR_INVALID_PARAMETER, &[]),
                 log_line: log::rejected_line(None, QueryResult::InvalidParameter),
+                submit: None,
             };
         };
         match hdr.cmd_type {
@@ -105,9 +146,14 @@ impl CtrlAdapter {
             CMD_GET_DISPLAY_INFO => get_display_info(&hdr, req),
             CMD_CTX_CREATE => self.ctx_create(&hdr, req),
             CMD_CTX_DESTROY => self.ctx_destroy(&hdr, req),
+            CMD_RESOURCE_CREATE_BLOB => self.resource_create_blob(&hdr, req),
+            CMD_CTX_ATTACH_RESOURCE | CMD_CTX_DETACH_RESOURCE => self.ctx_resource(&hdr, req),
+            CMD_RESOURCE_UNREF => self.resource_unref(&hdr, req),
+            CMD_SUBMIT_3D => self.submit_3d(&hdr, req),
             other => Handled {
                 response: CtrlResponse::new(Some(&hdr), RESP_ERR_UNSPEC, &[]),
                 log_line: log::rejected_line(Some(other), QueryResult::Unspec),
+                submit: None,
             },
         }
     }
@@ -131,6 +177,7 @@ impl CtrlAdapter {
         Handled {
             response: ctx_response(hdr, result),
             log_line: log::ctx_create_line(hdr.ctx_id, capset_id, nlen, result),
+            submit: None,
         }
     }
 
@@ -139,14 +186,147 @@ impl CtrlAdapter {
             QueryResult::InvalidParameter
         } else {
             match self.contexts.remove(hdr.ctx_id) {
-                Ok(()) => QueryResult::Ok,
+                Ok(slot) => {
+                    // 順序が崩れて attach したまま破棄されても、後続の UNREF が拒否され続けず、
+                    // スロット再利用時に古い所属が新しい ctx へ化けないようにする（設計書 10.4.3）。
+                    self.resources.detach_all_from(slot);
+                    QueryResult::Ok
+                }
                 Err(_) => QueryResult::InvalidContextId,
             }
         };
         Handled {
             response: ctx_response(hdr, result),
             log_line: log::ctx_destroy_line(hdr.ctx_id, result),
+            submit: None,
         }
+    }
+
+    fn resource_create_blob(&mut self, hdr: &CtrlHeader, req: &[u8]) -> Handled {
+        let parsed = ResourceCreateBlob::parse(req);
+        let result = match &parsed {
+            None => QueryResult::InvalidParameter,
+            Some(c) => {
+                if self.contexts.index_of(hdr.ctx_id).is_none() {
+                    QueryResult::InvalidContextId
+                } else if c.blob_mem != BLOB_MEM_HOST3D
+                    || c.blob_flags != BLOB_FLAG_USE_MAPPABLE
+                    || c.blob_id != 0
+                    || c.nr_entries != 0
+                {
+                    QueryResult::InvalidParameter
+                } else {
+                    resource_result(self.resources.create(c.res_id, c.size))
+                }
+            }
+        };
+        Handled {
+            response: ctx_response(hdr, result),
+            log_line: log::resource_create_blob_line(hdr.ctx_id, parsed.as_ref(), result),
+            submit: None,
+        }
+    }
+
+    /// `CTX_ATTACH_RESOURCE` / `CTX_DETACH_RESOURCE`（`hdr.cmd_type` で分ける）。
+    fn ctx_resource(&mut self, hdr: &CtrlHeader, req: &[u8]) -> Handled {
+        let attach = hdr.cmd_type == CMD_CTX_ATTACH_RESOURCE;
+        let res_id = parse_resource_id(req);
+        let result = match (res_id, self.contexts.index_of(hdr.ctx_id)) {
+            (None, _) => QueryResult::InvalidParameter,
+            (Some(_), None) => QueryResult::InvalidContextId,
+            (Some(id), Some(slot)) => resource_result(if attach {
+                self.resources.attach(id, slot)
+            } else {
+                self.resources.detach(id, slot)
+            }),
+        };
+        let cmd = if attach {
+            "CTX_ATTACH_RESOURCE"
+        } else {
+            "CTX_DETACH_RESOURCE"
+        };
+        Handled {
+            response: ctx_response(hdr, result),
+            log_line: log::ctx_resource_line(cmd, hdr.ctx_id, res_id, result),
+            submit: None,
+        }
+    }
+
+    fn resource_unref(&mut self, hdr: &CtrlHeader, req: &[u8]) -> Handled {
+        let res_id = parse_resource_id(req);
+        let result = match res_id {
+            None => QueryResult::InvalidParameter,
+            Some(id) => resource_result(self.resources.unref(id)),
+        };
+        Handled {
+            response: ctx_response(hdr, result),
+            log_line: log::resource_unref_line(res_id, result),
+            submit: None,
+        }
+    }
+
+    fn submit_3d(&mut self, hdr: &CtrlHeader, req: &[u8]) -> Handled {
+        let reject = |result: QueryResult, size: Option<u32>| Handled {
+            response: ctx_response(hdr, result),
+            log_line: log::submit_3d_line(&log::Submit3dLog {
+                ctx_id: hdr.ctx_id,
+                ring_idx: None,
+                size,
+                venus_cmd: None,
+                wire: "none",
+                result,
+            }),
+            submit: None,
+        };
+        let body = match parse_submit_3d(req) {
+            Ok(b) => b,
+            Err(Submit3dError::BadLength) => return reject(QueryResult::InvalidParameter, None),
+            Err(Submit3dError::SizeMismatch(n)) => {
+                return reject(QueryResult::InvalidParameter, Some(n));
+            }
+        };
+        let size = u32::try_from(body.len()).ok();
+        if self.contexts.index_of(hdr.ctx_id).is_none() {
+            return reject(QueryResult::InvalidContextId, size);
+        }
+        let ring_idx = (hdr.flags & FLAG_INFO_RING_IDX != 0).then_some(hdr.ring_idx);
+        if ring_idx.is_some_and(|r| r >= MAX_RINGS) {
+            return reject(QueryResult::InvalidParameter, size);
+        }
+        // 先頭 8 バイトだけ読む。結果は応答の種別を変えず、ログと受け渡し点で解析側へ渡す（実行はしない）。
+        let header = (!body.is_empty()).then(|| parse_command_header(&mut WireReader::new(body)));
+        let (venus_cmd, wire) = match &header {
+            None => (None, "empty"),
+            Some(Ok(h)) => (Some(h.command.as_raw()), "ok"),
+            Some(Err(e)) => (None, e.code()),
+        };
+        Handled {
+            response: ctx_response(hdr, QueryResult::Ok),
+            log_line: log::submit_3d_line(&log::Submit3dLog {
+                ctx_id: hdr.ctx_id,
+                ring_idx,
+                size,
+                venus_cmd,
+                wire,
+                result: QueryResult::Ok,
+            }),
+            submit: Some(Submit3d {
+                ctx_id: hdr.ctx_id,
+                ring_idx,
+                fence_id: (hdr.flags & FLAG_FENCE != 0).then_some(hdr.fence_id),
+                header,
+                payload: body.to_vec(),
+            }),
+        }
+    }
+}
+
+fn resource_result(r: Result<(), ResourceError>) -> QueryResult {
+    match r {
+        Ok(()) => QueryResult::Ok,
+        Err(ResourceError::InvalidId) => QueryResult::InvalidResourceId,
+        Err(ResourceError::InvalidParameter) => QueryResult::InvalidParameter,
+        Err(ResourceError::Full) => QueryResult::OutOfMemory,
     }
 }
 
@@ -154,6 +334,7 @@ fn ctx_response(hdr: &CtrlHeader, result: QueryResult) -> CtrlResponse {
     let resp_type = match result {
         QueryResult::Ok => RESP_OK_NODATA,
         QueryResult::InvalidContextId => RESP_ERR_INVALID_CONTEXT_ID,
+        QueryResult::InvalidResourceId => RESP_ERR_INVALID_RESOURCE_ID,
         QueryResult::OutOfMemory => RESP_ERR_OUT_OF_MEMORY,
         QueryResult::InvalidParameter => RESP_ERR_INVALID_PARAMETER,
         QueryResult::Unspec => RESP_ERR_UNSPEC,
@@ -173,6 +354,7 @@ fn get_display_info(hdr: &CtrlHeader, req: &[u8]) -> Handled {
             &[0u8; DISPLAY_INFO_BODY_LEN],
         ),
         log_line: log::display_info_line(QueryResult::Ok),
+        submit: None,
     }
 }
 
@@ -180,6 +362,7 @@ fn invalid(hdr: &CtrlHeader, log_line: String) -> Handled {
     Handled {
         response: CtrlResponse::new(Some(hdr), RESP_ERR_INVALID_PARAMETER, &[]),
         log_line,
+        submit: None,
     }
 }
 
@@ -205,6 +388,7 @@ fn get_capset_info(hdr: &CtrlHeader, req: &[u8]) -> Handled {
     Handled {
         response: CtrlResponse::new(Some(hdr), RESP_OK_CAPSET_INFO, &body),
         log_line: log::info_line(Some(index), QueryResult::Ok, info.max_size),
+        submit: None,
     }
 }
 
@@ -219,6 +403,7 @@ fn get_capset(hdr: &CtrlHeader, req: &[u8]) -> Handled {
         Ok(resp) => Handled {
             response: CtrlResponse::new(Some(hdr), RESP_OK_CAPSET, &resp.data),
             log_line: log::query_line(Some(id), version, QueryResult::Ok, resp.info.max_size),
+            submit: None,
         },
         Err(_) => invalid(
             hdr,

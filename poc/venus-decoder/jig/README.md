@@ -6,7 +6,7 @@ virtio-gpu 外部バックエンドの仕組みへ、自前の最小 venus デ�
 
 ## 現状（実装済みを装わない。REPAIR-3）
 
-- 実装済み: virtio-gpu ctrl の `GET_CAPSET_INFO` / `GET_CAPSET` / `GET_DISPLAY_INFO` / `CTX_CREATE` / `CTX_DESTROY` の復号・応答符号化・構造化ログ 1 行（`adapter`）と
+- 実装済み: virtio-gpu ctrl の `GET_CAPSET_INFO` / `GET_CAPSET` / `GET_DISPLAY_INFO` / `CTX_CREATE` / `CTX_DESTROY` / `RESOURCE_CREATE_BLOB` / `CTX_ATTACH_RESOURCE` / `CTX_DETACH_RESOURCE` / `RESOURCE_UNREF` / `SUBMIT_3D`（受理して受け渡し点へ渡すだけ。dispatch はしない）の復号・応答符号化・構造化ログ 1 行（`adapter`）と
   ログ照合器（`log`）。トランスポート（vhost-user 等）のソケット I/O は未実装で、socket を開かない。
 - 実装済み（F1.1・#1516）: vhost-user メッセージの codec（`vhost_user`。最小 16 要求種別の復号・符号化と応答 5 種。
   fd・socket・virtqueue には触れない）。出典と前提は `docs/design/venus-decoder-poc.md` 10.5。
@@ -45,6 +45,6 @@ FANDHE_VENUS_JIG_LOG=<ログファイル> cargo test --manifest-path poc/venus-d
 ## 後続
 
 - F1: vhost-user トランスポート（F1.1 メッセージ codec は実装済み／F1.2 fd 受け渡しと mmap のラッパーは実装済み〔#1517〕／F1.3 split virtqueue は実装済み〔#1518〕／F1.4 セッションは実装済み〔#1519〕）
-- F2 の残り: `RESOURCE_CREATE_BLOB`・`SUBMIT_3D` 等の ctrl 応答（未対応は `ERR_UNSPEC`。設計書 10.4 節）
+- `RESOURCE_MAP_BLOB` / `UNMAP_BLOB`（共有メモリが前提。F5.2b。未対応は `ERR_UNSPEC`。設計書 10.4 節）
 - F4: 起動入口（実装済み。#1598）。記録ファイルのパス引数は #1602、capset より後の ctrl 応答は #1599
 - F3: 実機での疎通実行（#725）

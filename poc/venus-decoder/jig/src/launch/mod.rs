@@ -268,12 +268,39 @@ fn verify_peer(peer: Result<u32, sys::SysError>, expected: u32) -> Result<(), La
     }
 }
 
-/// 自分で bind したソケットだけを終了時に消す。既存のパスは消さない。
-struct SocketGuard(PathBuf);
+/// 自分で bind したソケットだけを消す。既存のパスは消さない。
+///
+/// 通常経路は `remove` で削除結果を確認して `SOCKET_REMOVE_FAILED` を返す。`Drop` は
+/// accept 失敗等の異常経路で消し忘れないための補助で、結果は捨てる（既に別のエラーを返している）。
+struct SocketGuard {
+    path: PathBuf,
+    removed: bool,
+}
+
+impl SocketGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            removed: false,
+        }
+    }
+
+    /// ソケットファイルを削除する。既に無い（`NotFound`）場合は成功扱い。
+    fn remove(mut self) -> Result<(), LaunchError> {
+        self.removed = true;
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(LaunchError::new(LaunchErrorCode::SocketRemoveFailed)),
+        }
+    }
+}
 
 impl Drop for SocketGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        if !self.removed {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -353,13 +380,13 @@ pub fn run(config: &Config) -> Result<SessionEnd, LaunchError> {
 fn serve(config: &Config, uid: u32, sink: &mut LogSink<File>) -> Result<SessionEnd, LaunchError> {
     let listener = UnixListener::bind(&config.socket)
         .map_err(|_| LaunchError::new(LaunchErrorCode::BindFailed))?;
-    let guard = SocketGuard(config.socket.clone());
+    let guard = SocketGuard::new(config.socket.clone());
     fs::set_permissions(&config.socket, fs::Permissions::from_mode(0o600))
         .map_err(|_| LaunchError::new(LaunchErrorCode::BindFailed))?;
     let stream = accept_with_deadline(&listener, config.accept_timeout)?;
     // 2 本目の接続は受けない（PoC の割り切り）。listener を閉じてソケットファイルを消す。
     drop(listener);
-    drop(guard);
+    guard.remove()?;
     // 接続元 UID を照合してからセッションを始める。拒否時は `stream` を Drop して閉じる。
     verify_peer(sys::peer_uid(stream.as_fd()), uid)?;
     stream

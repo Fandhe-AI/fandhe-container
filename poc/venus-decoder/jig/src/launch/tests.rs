@@ -428,3 +428,24 @@ fn plug12_peer_cred_failure_is_rejected() {
     assert_eq!(e.code.as_str(), "PEER_CRED_UNAVAILABLE");
     assert_eq!(e.exit_code(), 1);
 }
+
+/// 自分のソケットの削除に失敗したら `SOCKET_REMOVE_FAILED` を返す（GPU-6・#1598。結果を捨てない）。
+#[test]
+fn socket_remove_failure_is_reported() {
+    let dir = scratch("rmfail");
+    let file = dir.join("plain");
+    fs::write(&file, b"x").expect("file");
+    // 親がファイルなので remove_file は NotADirectory で失敗する。
+    let guard = SocketGuard::new(file.join("sock"));
+    let e = guard.remove().expect_err("must fail");
+    assert_eq!(e.code.as_str(), "SOCKET_REMOVE_FAILED");
+    fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+/// 既に無いソケットの削除は成功扱い。
+#[test]
+fn socket_remove_missing_is_ok() {
+    let dir = scratch("rmmiss");
+    SocketGuard::new(dir.join("gone")).remove().expect("ok");
+    fs::remove_dir_all(&dir).expect("cleanup");
+}

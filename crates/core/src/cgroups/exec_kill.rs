@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use super::{
     CgroupError, CgroupStep, PROCS_LIMIT, cstring, io_error, open_cgroup_dir, owner_uid,
-    parse_procs, read_iface, remove_verified_at, sys_error, validate_component,
+    parse_procs, read_iface, removal_confirmed, remove_verified_at, sys_error, validate_component,
 };
 use crate::observability::{OpName, OpOutcome, OpRecorder};
 use crate::sys;
@@ -396,6 +396,32 @@ fn list_exec_child_names(
     Ok((names, truncated))
 }
 
+/// 列挙の `NotFound` を、コンテナ cgroup が削除済み（`removed`）なら残骸 0 件として扱う（OCI-6・#1596）。
+///
+/// 並行する delete 等がコンテナ cgroup を先に消した場合、配下に残骸は無い。エラーにせず 0 件とし、続く判定
+/// （delete では `remove_child` の `NotFound` → `NotPresent`）に任せて冪等性を揃える。なお glibc の `readdir` は
+/// 削除済みディレクトリの `getdents64` の `ENOENT` を終端として扱うため、その場合は列挙自体が 0 件で返る。
+/// `NotFound` 以外のエラーと、削除済みを確かめられない `NotFound` はそのまま返す（fail-closed）。
+fn listing_or_removed(
+    listed: Result<(Vec<String>, bool), CgroupError>,
+    removed: impl FnOnce() -> bool,
+) -> Result<(Vec<String>, bool), CgroupError> {
+    match listed {
+        Err(e) if e.code == ErrorCode::NotFound && removed() => Ok((Vec::new(), false)),
+        other => other,
+    }
+}
+
+/// 保持 fd のコンテナ cgroup が削除済みか（保持 fd 起点の `cgroup.events` の lookup が `ENOENT`。
+/// `remove_verified_at` の削除確認と同じ根拠）。列挙の `NotFound` が `/proc` の不在等によるものなら、
+/// cgroupfs では `cgroup.events` が開けるので `false` になり、列挙のエラーをそのまま返す（fail-closed）。
+fn container_removed(container: std::os::fd::BorrowedFd<'_>) -> bool {
+    let Ok(events) = cstring(CgroupStep::Cleanup, "cgroup.events") else {
+        return false;
+    };
+    matches!(sys::open_read_at(container, &events), Err(e) if removal_confirmed(&e))
+}
+
 /// `exec-<pid>-<seq>` の厳密な形から pid を取り出す。形式外・`0`・`i32::MAX` 超は `None`。
 fn owner_pid_of(name: &str) -> Option<u32> {
     let rest = name.strip_prefix("exec-")?;
@@ -436,7 +462,7 @@ fn owner_state(name: &str) -> OwnerState {
 
 /// `container` 直下の `exec-*` を `mode` に従って掃除する（契約はモジュール doc。#1596）。
 ///
-/// 列挙に失敗したときだけ `Err`。個々の失敗は結果の `failed` / `first_error` に数えて次へ進む。`deadline` は
+/// 列挙に失敗したときだけ `Err`（コンテナ cgroup が並行して削除済みなら `Err` にせず 0 件。OCI-6）。個々の失敗は結果の `failed` / `first_error` に数えて次へ進む。`deadline` は
 /// `KillAll` の待機の全体の期限（`UnpopulatedOnly` では使わない）。
 pub(crate) fn sweep_exec_children_at(
     container: std::os::fd::BorrowedFd<'_>,
@@ -500,7 +526,9 @@ fn sweep_exec_children_inner(
     mode: SweepMode,
     deadline: Instant,
 ) -> Result<ExecChildSweep, CgroupError> {
-    let (names, truncated) = list_exec_child_names(container)?;
+    let (names, truncated) = listing_or_removed(list_exec_child_names(container), || {
+        container_removed(container)
+    })?;
     let mut out = ExecChildSweep {
         truncated,
         ..ExecChildSweep::default()
@@ -794,6 +822,58 @@ mod tests {
                 first_error: Some(ErrorCode::FailedPrecondition),
             }
         );
+    }
+
+    /// OCI-6・#1596: 列挙の `NotFound` は、コンテナ cgroup が削除済みのときだけ残骸 0 件として扱う。
+    /// 削除済みを確かめられない `NotFound` と他のエラーはそのまま返す。
+    #[test]
+    fn oci6_listing_not_found_of_removed_container_is_zero_children() {
+        let not_found = || CgroupError::new(ErrorCode::NotFound, CgroupStep::Cleanup, "gone");
+        assert_eq!(
+            listing_or_removed(Err(not_found()), || true).unwrap(),
+            (Vec::<String>::new(), false)
+        );
+        assert_eq!(
+            listing_or_removed(Err(not_found()), || false)
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound
+        );
+        let denied = CgroupError::new(ErrorCode::PermissionDenied, CgroupStep::Cleanup, "x");
+        assert_eq!(
+            listing_or_removed(Err(denied), || true).unwrap_err().code,
+            ErrorCode::PermissionDenied
+        );
+        let listed = (vec!["exec-1-1".to_owned()], true);
+        assert_eq!(
+            listing_or_removed(Ok(listed.clone()), || true).unwrap(),
+            listed
+        );
+    }
+
+    /// OCI-6・#1596: 保持 fd のコンテナ cgroup が並行して消された場合、掃除はエラーにせず残骸 0 件を返す。
+    #[test]
+    fn oci6_sweep_of_removed_container_reports_zero_stale_children() {
+        for mode in [SweepMode::KillAll, SweepMode::UnpopulatedOnly] {
+            let d = tmp("gone");
+            std::fs::create_dir(d.join("exec-1-1")).unwrap();
+            let fd = OwnedFd::from(File::open(&d).unwrap());
+            std::fs::remove_dir_all(&d).unwrap();
+            assert!(container_removed(fd.as_fd()), "{mode:?}");
+            let deadline = Instant::now() + Duration::from_millis(50);
+            let out = sweep_exec_children_at(fd.as_fd(), mode, deadline).unwrap();
+            assert_eq!(out, ExecChildSweep::default(), "{mode:?}");
+        }
+    }
+
+    /// OCI-6・#1596: 生きているコンテナ cgroup（`cgroup.events` が開ける）は削除済みとみなさない。
+    #[test]
+    fn oci6_live_container_is_not_treated_as_removed() {
+        let d = tmp("live");
+        std::fs::write(d.join("cgroup.events"), "populated 0\n").unwrap();
+        let fd = OwnedFd::from(File::open(&d).unwrap());
+        assert!(!container_removed(fd.as_fd()));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// SUP-6・TASK-163 追補: 存在しない子 cgroup の後始末は `Absent`（冪等）。cgroup2 でない場所の同名

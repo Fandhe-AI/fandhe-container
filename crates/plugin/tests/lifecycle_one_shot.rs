@@ -151,6 +151,10 @@ mod unix {
                     return;
                 }
                 let _req = s.read_frame(rpc(5000)).unwrap();
+                // 要求を受け取った後、応答せずに終了する（応答前に plugin が落ちる最頻の失敗経路。#1311）。
+                if mode == "exit_after_request" {
+                    return;
+                }
                 let body = format!("pid={}", std::process::id());
                 s.write_frame(&Frame::new(body.into_bytes()).unwrap(), rpc(5000))
                     .unwrap();
@@ -231,6 +235,32 @@ mod unix {
             assert!(start.elapsed() < limit, "grandchild {pid} still alive");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// #1311・PLUG-7・REPAIR-5: 接続して要求を受け取った後、応答せずに終了した plugin（子は未回収のゾンビの
+    /// まま後始末に入る）では、元のエラー（`Unavailable`・`peer closed the connection`）の分類を失わない。
+    /// Linux はゾンビへの `killpg` が成功するため元のエラーそのもの。macOS はゾンビだけのグループへの
+    /// `killpg` が `EPERM` になり得るため、グループ停止失敗の付記つきの値も許す（どちらも code は同じ）。
+    #[test]
+    fn plug7_exit_after_request_keeps_original_error() {
+        let (res, elapsed, _dir) = run("exit_after_request", 8000);
+        let e = res.unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Unavailable);
+        let original = "peer closed the connection";
+        let with_note = "peer closed the connection; additionally, the plugin process group could \
+                         not be killed after a failed exchange, so descendant processes may remain";
+        #[cfg(target_os = "macos")]
+        assert!(
+            e.message() == original || e.message() == with_note,
+            "{}",
+            e.message()
+        );
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = with_note;
+            assert_eq!(e.message(), original);
+        }
+        assert!(elapsed < Duration::from_secs(8), "{elapsed:?}");
     }
 
     /// #1311・PLUG-7・REPAIR-5: タイムアウト後始末の kill はプロセスグループ全体へ届き、孫も残らない。

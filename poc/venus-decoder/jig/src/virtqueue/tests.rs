@@ -410,3 +410,18 @@ fn gpu6_read_readable_skips_zero_length_descriptors() {
     assert_eq!(chain.read_readable(&mem, &mut req).expect("read"), 24);
     assert_eq!(&req[..24], &data[..]);
 }
+
+/// GPU-6・REPAIR-12: 長さ 0 の writable 記述子（未登録 GPA）を挟んでも後続へ応答を書ける。
+#[test]
+fn gpu6_write_writable_skips_zero_length_descriptors() {
+    let mem = FakeMemory::new();
+    mem.desc(0, D, 8, DESC_F_NEXT, 1);
+    // 未登録 GPA（0）を指す長さ 0 の writable
+    mem.desc(1, 0, 0, DESC_F_NEXT | DESC_F_WRITE, 2);
+    mem.desc(2, D + 0x100, 24, DESC_F_WRITE, 0);
+    mem.avail(1, &[0]);
+    let mut q = queue(&mem, 8, 0, 0);
+    let chain = q.pop(&mem).expect("pop").expect("some");
+    assert_eq!(chain.write_writable(&mem, &[0x7E; 24]).expect("write"), 24);
+    assert_eq!(mem.get(DATA_OFF + 0x100, 24), vec![0x7E; 24]);
+}

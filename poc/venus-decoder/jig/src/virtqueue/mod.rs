@@ -337,6 +337,10 @@ impl DescChain {
                 break;
             }
             let n = (len as usize).min(rest.len());
+            // 長さ 0 の記述子は書くものが無く、GPA が未登録でもメモリへ触れない。
+            if n == 0 {
+                continue;
+            }
             let (now, later) = rest.split_at(n);
             mem.write_at(gpa, now)?;
             rest = later;

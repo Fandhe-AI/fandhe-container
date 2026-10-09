@@ -22,7 +22,10 @@
 //!
 //! - **封印した複製（#1531）**: 実行に使う fd は照合した本体の memfd 複製（seal 0x0F・リンク先 `/memfd:fandhe-exec-entrypoint
 //!   (deleted)`）で、照合の後に元のファイルを上書き・`rename` で差し替えても内容は変わらない（差し込み点
-//!   `observe_exec_child_setup_with`）。上限超過は違反 `entrypoint_copy_too_large`、実行ビットのないスクリプトは違反なしで拒否する
+//!   `observe_exec_child_setup_with`）。上限超過は違反 `entrypoint_copy_too_large`、`noexec` のマウント（`/proc`）上の
+//!   ファイルはカーネル版に依らず違反 `entrypoint_on_noexec_mount`、実行ビットのないスクリプトは Linux 6.14 以降で
+//!   `AT_EXECVE_CHECK` により違反なしで拒否する（6.14 未満は観測の入口が判定を省くため手順を通る。分岐ごとに具体値で照合）。
+//!   `noexec` の tmpfs を user namespace の中でマウントする場面は実機前提で、`-- --ignored` 指定時のみ実行する
 //! - **`execve` 前の失敗の区別（#1460）**: 子が本番と同じ pipe で親へ知らせた内容から、「コマンドは起動して
 //!   いない」（終了コード 125〜127 と違反の理由）と「`execveat` の直前まで到達した」が区別される。子に残る fd が
 //!   その pipe と検査済みのエントリポイントの 2 本だけであること（継承 fd の後始末）も照合する
@@ -35,7 +38,7 @@
 //! - **補助グループ（#1457）**: launch・exec が共有する補助グループの消去を、使い捨ての子で実 syscall により通す
 //!   （非特権では `CAP_SETGID` が無いため拒否されること、root では消去されること）
 //!
-//! root・実コンテナ・user namespace は不要で、既定のテスト集合（`cargo test --workspace`・
+//! 既定の場面は root・実コンテナ・user namespace が不要で、既定のテスト集合（`cargo test --workspace`・
 //! `make test-integration`）で実行する。fork は呼び出しプロセスが単一スレッドであることを要求するため、
 //! libtest ではなく `harness = false` の単一スレッド `main` で動かす。非 Linux では対象外（OS 非該当）。
 
@@ -60,11 +63,24 @@ fn main() {
             linux::pty_child(std::path::Path::new(args.get(2).expect("work directory")));
         }
         Some(linux::GROUPS_CHILD) => linux::groups_child(),
+        Some(linux::NOEXEC_MOUNT_CHILD) => {
+            linux::noexec_mount_child(std::path::Path::new(args.get(2).expect("work directory")))
+        }
         Some(linux::CLOSED_STDIO_CHILD) => linux::closed_stdio_child(
             std::path::Path::new(args.get(2).expect("work directory")),
             args.get(3).expect("closed fd list"),
         ),
-        _ => linux::run(),
+        _ => {
+            linux::run();
+            // 実機前提の場面（user namespace の中で tmpfs を `noexec` でマウントする）は `-- --ignored` 指定時のみ。
+            if args.iter().any(|a| a == "--ignored") {
+                linux::noexec_tmpfs_is_refused_in_a_user_namespace();
+            } else {
+                println!(
+                    "exec_child_setup: noexec tmpfs scenario ignored (real-machine test; run with `-- --ignored`, see AGENTS.md)"
+                );
+            }
+        }
     }
 }
 
@@ -90,6 +106,10 @@ mod linux {
     pub const GROUPS_CHILD: &str = "--groups-child";
     /// 標準 fd を閉じた呼び出し側を作る使い捨ての子の再入フラグ（引数: 作業ディレクトリ・閉じる番号のコンマ区切り）。
     pub const CLOSED_STDIO_CHILD: &str = "--closed-stdio-child";
+    /// user namespace の中で `noexec` の tmpfs 上のエントリポイントを照合する子の再入フラグ（引数: 作業ディレクトリ）。
+    pub const NOEXEC_MOUNT_CHILD: &str = "--noexec-mount-child";
+    /// `noexec` の tmpfs の子が照合を終えたことを標準出力で知らせる合図。
+    const NOEXEC_MOUNT_OK: &str = "noexec-mount-ok";
     /// 疑似端末の下の子が、照合を終えたことを知らせる合図ファイルの名前と内容。
     const PTY_OK: &str = "pty-ok";
     /// `ENXIO`（制御端末を持たないプロセスが `/dev/tty` を開いたときの errno。全アーキテクチャ共通の 6）。
@@ -469,21 +489,167 @@ mod linux {
             }
         );
         assert_eq!(observation.report, None);
-        // 実行ビットのないスクリプト: 複製（memfd は実行可能）に写すと実行できてしまうため、複製の前に拒否する。
+        // 実行ビットのないスクリプト: 複製（memfd は実行可能）に写すと実行できてしまうため、複製の前に
+        // `AT_EXECVE_CHECK`（Linux 6.14+）で拒否する。観測の入口は 6.14 未満では判定を省く（本番は 6.14 未満なら
+        // 複製せず拒否する。core の単体テスト `sec1_task163_kernel_exec_check_gates_the_copy` が照合する）ため、
+        // 結果はカーネル版で分かれる。どちらの分岐も具体値で照合する。
         let plain = work.join("not-executable");
         write_script(&plain, "#!/bin/sh\nexit 0\n");
         fs::set_permissions(&plain, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
         let command = ExecCommand::new(&plain, ["plain"], &env).expect("command");
         let observation = observe_exec_child_setup(&command, &work.join("report-plain"), timeout())
             .expect("observe the exec child setup");
+        if kernel_at_least(6, 14) {
+            assert_eq!(
+                observation.exit,
+                ExecExit::SetupFailed {
+                    exit: ChildExit::Exited(126),
+                    violation: None,
+                }
+            );
+            assert_eq!(observation.report, None);
+        } else {
+            assert_eq!(observation.exit, ExecExit::Command(ChildExit::Exited(0)));
+            assert_eq!(
+                observation.report.expect("report").exec_fd.seals,
+                Some(SEALED_COPY_SEALS)
+            );
+        }
+        // `noexec` のマウント上のファイル（非特権で作れないため、既存の `noexec` マウントである `/proc` 上の通常ファイル）:
+        // カーネル版に依らず、複製の前に違反 `entrypoint_on_noexec_mount`（126）で拒否される（#1531・SEC-1・SEC-4）。
+        assert!(
+            proc_is_mounted_noexec(),
+            "/proc must be mounted noexec for this scenario"
+        );
+        let on_noexec = ExecCommand::new("/proc/self/status", ["status"], &env).expect("command");
+        let observation =
+            observe_exec_child_setup(&on_noexec, &work.join("report-noexec"), timeout())
+                .expect("observe the exec child setup");
         assert_eq!(
             observation.exit,
             ExecExit::SetupFailed {
                 exit: ChildExit::Exited(126),
-                violation: None,
+                violation: Some(ViolationReason::EntrypointOnNoexecMount),
             }
         );
         assert_eq!(observation.report, None);
+    }
+
+    /// `/proc/self/mountinfo` で、`/proc` のマウントが `noexec` か（最上位のマウントの 6 列目）。
+    fn proc_is_mounted_noexec() -> bool {
+        let text = fs::read_to_string("/proc/self/mountinfo").expect("read mountinfo");
+        text.lines()
+            .rev()
+            .find_map(|line| {
+                let mut cols = line.split(' ');
+                let point = cols.nth(4)?;
+                let opts = cols.next()?;
+                (point == "/proc").then(|| opts.split(',').any(|o| o == "noexec"))
+            })
+            .expect("/proc is mounted")
+    }
+
+    /// 実行中のカーネルが `major.minor` 以上か（`/proc/sys/kernel/osrelease`。判定対象の syscall とは独立の基準）。
+    fn kernel_at_least(major: u32, minor: u32) -> bool {
+        let text = fs::read_to_string("/proc/sys/kernel/osrelease").expect("read osrelease");
+        let mut parts = text.trim().split(['.', '-']);
+        let got_major: u32 = parts.next().and_then(|v| v.parse().ok()).expect("major");
+        let got_minor: u32 = parts.next().and_then(|v| v.parse().ok()).expect("minor");
+        (got_major, got_minor) >= (major, minor)
+    }
+
+    /// SEC-1・SEC-4・SUP-6・TASK-163 追補（#1531）の実機前提の場面: user namespace と mount namespace を作り
+    /// （util-linux の `unshare --user --map-root-user --mount`。root、または非特権 user namespace を許可するホストが要る）、
+    /// その中で tmpfs を `noexec` と通常の 2 つでマウントした子を再実行し、`noexec` の tmpfs 上の 0755 のスクリプトが
+    /// 違反 `entrypoint_on_noexec_mount` で拒否され、通常の tmpfs 上の同じスクリプトは封印した複製まで進むことを
+    /// 照合する。`-- --ignored` 指定時のみ実行する（ホストのマウントは変えない。namespace は子の終了で消える）。
+    pub fn noexec_tmpfs_is_refused_in_a_user_namespace() {
+        let work = WorkDir::create("noexec-mount");
+        for sub in ["noexec", "exec"] {
+            fs::create_dir(work.0.join(sub)).expect("mkdir mount point");
+        }
+        // `$1` は作業ディレクトリ、`$2` は本バイナリ、`$3` は再入フラグ（いずれも引数で渡し、シェルの文字列へ連結しない）。
+        let script = r#"set -e
+mount -t tmpfs -o noexec,mode=0755 tmpfs "$1/noexec"
+mount -t tmpfs -o mode=0755 tmpfs "$1/exec"
+exec "$2" "$3" "$1""#;
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut child = Command::new("unshare")
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--propagation",
+                "private",
+                "sh",
+                "-c",
+                script,
+                "sh",
+            ])
+            .arg(&work.0)
+            .arg(&exe)
+            .arg(NOEXEC_MOUNT_CHILD)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn unshare (util-linux)");
+        let deadline = Instant::now() + timeout();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the noexec mount child did not exit within {:?}", timeout());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        {
+            use std::io::Read as _;
+            if let Some(mut out) = child.stdout.take() {
+                let _ = out.read_to_string(&mut stdout);
+            }
+            if let Some(mut err) = child.stderr.take() {
+                let _ = err.read_to_string(&mut stderr);
+            }
+        }
+        assert!(
+            status.success() && stdout.lines().any(|l| l == NOEXEC_MOUNT_OK),
+            "noexec mount child failed: status {status:?}, stdout {stdout}, stderr {stderr}"
+        );
+        println!("exec_child_setup: noexec tmpfs scenario passed");
+    }
+
+    /// [`noexec_tmpfs_is_refused_in_a_user_namespace`] が namespace の中で再実行する子。
+    pub fn noexec_mount_child(work: &Path) {
+        let env = ContainerEnv::empty();
+        let body = "#!/bin/sh\nexit 0\n";
+        let on_noexec = work.join("noexec").join("script");
+        write_script(&on_noexec, body);
+        let command = ExecCommand::new(&on_noexec, ["script"], &env).expect("command");
+        let observation =
+            observe_exec_child_setup(&command, &work.join("report-noexec"), timeout())
+                .expect("observe the exec child setup");
+        assert_eq!(
+            observation.exit,
+            ExecExit::SetupFailed {
+                exit: ChildExit::Exited(126),
+                violation: Some(ViolationReason::EntrypointOnNoexecMount),
+            }
+        );
+        assert_eq!(observation.report, None);
+        // 対照: `noexec` でない tmpfs 上の同じスクリプトは手順を通り、封印した複製を実行する fd にする。
+        let on_exec = work.join("exec").join("script");
+        write_script(&on_exec, body);
+        let command = ExecCommand::new(&on_exec, ["script"], &env).expect("command");
+        let report = observe_ok(&command, work, "report-exec");
+        assert_eq!(report.exec_fd.seals, Some(SEALED_COPY_SEALS));
+        assert_eq!(report.exec_fd.link, SEALED_COPY_LINK);
+        println!("{NOEXEC_MOUNT_OK}");
     }
 
     /// SUP-6・REPAIR-3・TASK-163 追補（#1460）: `execveat` より前の失敗は、終了コード（125〜127。コマンド自身も

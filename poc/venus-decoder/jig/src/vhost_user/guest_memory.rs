@@ -23,7 +23,8 @@
 //! データ競合になる。これを safe API だけでは起こせないよう、次の 2 つを保証する。
 //! - 領域の型は `!Send` / `!Sync`（1 領域は 1 スレッドからしか使えない）
 //! - backing file（`st_dev`・`st_ino`）のアクセス範囲（ファイル上の `[mmap_offset, mmap_offset + memory_size)`）ごとに、
-//!   生きている領域は 1 個だけ。重なる範囲を別の領域で map しようとすると mmap より前に `BACKING_IN_USE` で拒否する。
+//!   生きている領域は 1 個だけ。重なる範囲を別の領域で map しようとすると mmap より前に `BACKING_IN_USE` で拒否する
+//!   （占有一覧は `sys::MmapRegion` が持ち、seal・ファイル長の検査とあわせて map と不可分に行う）。
 //!   fd を複製（`dup`・`try_clone`・`/proc/self/fd` の再オープン）しても同じ inode なので同じ判定になる。
 //!   同じ memfd の重ならない範囲を別領域にする frontend（4 GiB 境界の上下で分ける等）は受け付ける
 //!
@@ -32,15 +33,13 @@
 
 use std::fs::File;
 use std::num::NonZeroUsize;
-use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::fs::MetadataExt;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::os::fd::OwnedFd;
 
 use super::MemRegion;
 use super::MemTable;
 use super::observe::{self, Op};
 use super::transport_error::{TransportError, TransportErrorCode};
-use crate::sys::{self, MmapRegion};
+use crate::sys::MmapRegion;
 
 /// 1 領域の map 長（`mmap_offset + memory_size`）の上限。仮想アドレス空間の浪費（DoS）を防ぐ治具独自の値で、64 GiB。
 pub const MAX_REGION_SIZE: u64 = 64 << 30;
@@ -49,65 +48,6 @@ pub const MAX_TOTAL_MAP_LEN: u64 = 128 << 30;
 
 fn err(code: TransportErrorCode) -> TransportError {
     TransportError::new(code)
-}
-
-fn map_sys_oob(_: sys::SysError) -> TransportError {
-    // sys 側の再検査（多層防御）に掛かった場合。上位の検査をすり抜けたことを意味するので範囲外として拒否する。
-    err(TransportErrorCode::OutOfBounds)
-}
-
-/// backing file 上のアクセス範囲（`[start, end)`。ファイルのバイトオフセット）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LeaseKey {
-    dev: u64,
-    ino: u64,
-    start: u64,
-    end: u64,
-}
-
-impl LeaseKey {
-    fn overlaps(&self, other: &Self) -> bool {
-        self.dev == other.dev
-            && self.ino == other.ino
-            && self.start < other.end
-            && other.start < self.end
-    }
-}
-
-/// 生きている領域のアクセス範囲の一覧（プロセス全体で 1 個）。件数は生きている領域の数で、それぞれが mmap を伴う。
-static LEASES: Mutex<Vec<LeaseKey>> = Mutex::new(Vec::new());
-
-fn leases() -> MutexGuard<'static, Vec<LeaseKey>> {
-    // 保持中に panic する処理は無いが、poison しても一覧そのものは整合しているのでそのまま使う。
-    LEASES.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// アクセス範囲の占有。`Drop` で一覧から外す。
-#[derive(Debug)]
-struct Lease {
-    key: LeaseKey,
-}
-
-impl Lease {
-    /// 重なる範囲が生きていれば `BACKING_IN_USE`。確認と登録は同じロックの中で行う（確認後の割り込みを許さない）。
-    fn acquire(key: LeaseKey) -> Result<Self, TransportError> {
-        let mut list = leases();
-        if list.iter().any(|k| k.overlaps(&key)) {
-            return Err(err(TransportErrorCode::BackingInUse));
-        }
-        list.push(key);
-        Ok(Self { key })
-    }
-}
-
-impl Drop for Lease {
-    fn drop(&mut self) {
-        let mut list = leases();
-        // 重なりを拒否して登録するので、同じ key は一覧に 1 個しか無い。
-        if let Some(i) = list.iter().position(|k| *k == self.key) {
-            list.swap_remove(i);
-        }
-    }
 }
 
 /// map 済みのゲストメモリ領域 1 個。
@@ -123,8 +63,6 @@ pub struct GuestMemoryRegion {
     size: u64,
     map_offset: usize,
     userspace_addr: u64,
-    /// 宣言順で最後に drop する（`map` の munmap の後に範囲を解放する）。
-    _lease: Lease,
 }
 
 impl GuestMemoryRegion {
@@ -157,30 +95,10 @@ impl GuestMemoryRegion {
             .ok_or_else(bad)?;
         let map_len_usize = usize::try_from(map_len).map_err(|_| bad())?;
         let map_offset = usize::try_from(region.mmap_offset).map_err(|_| bad())?;
-        match sys::fcntl_get_seals(file.as_fd()) {
-            Ok(seals) if seals & sys::F_SEAL_SHRINK != 0 => {}
-            Ok(_) => return Err(err(TransportErrorCode::ShrinkNotSealed)),
-            // seal 非対応の fd（通常ファイル等）。縮まない保証を確認できないので拒否する。
-            Err(sys::SysError::Os(n)) if n == sys::EINVAL => {
-                return Err(err(TransportErrorCode::ShrinkNotSealed));
-            }
-            Err(e) => return Err(TransportError::from_sys(e)),
-        }
-        let meta = file.metadata().map_err(|e| TransportError::from_io(&e))?;
-        if meta.len() < map_len {
-            return Err(err(TransportErrorCode::FileTooShort));
-        }
         let non_zero = NonZeroUsize::new(map_len_usize).ok_or_else(bad)?;
-        // アクセスするのはファイル上の [mmap_offset, map_len) だけなので、その範囲を占有する。mmap が失敗すれば
-        // `lease` の Drop で解放される。
-        let lease = Lease::acquire(LeaseKey {
-            dev: meta.dev(),
-            ino: meta.ino(),
-            start: region.mmap_offset,
-            end: map_len,
-        })?;
-        let map =
-            MmapRegion::map_shared(file.as_fd(), non_zero).map_err(TransportError::from_sys)?;
+        // seal・ファイル長・アクセス範囲の占有の検証は、map と不可分に `sys::MmapRegion::map_shared` が行う。
+        let map = MmapRegion::map_shared(file, region.mmap_offset, non_zero)
+            .map_err(TransportError::from_sys)?;
         Ok(Self {
             map,
             gpa: region.guest_phys_addr,
@@ -188,7 +106,6 @@ impl GuestMemoryRegion {
             size: region.memory_size,
             map_offset,
             userspace_addr: region.userspace_addr,
-            _lease: lease,
         })
     }
 
@@ -240,12 +157,12 @@ impl GuestMemoryRegion {
     /// 計上なしの読み出し（`GuestMemory` が領域の検索失敗も含めて 1 回として計上するために使う）。
     fn read_raw(&self, gpa: u64, dst: &mut [u8]) -> Result<(), TransportError> {
         let at = self.locate(gpa, dst.len())?;
-        self.map.copy_out(at, dst).map_err(map_sys_oob)
+        self.map.copy_out(at, dst).map_err(TransportError::from_sys)
     }
 
     fn write_raw(&self, gpa: u64, src: &[u8]) -> Result<(), TransportError> {
         let at = self.locate(gpa, src.len())?;
-        self.map.copy_in(at, src).map_err(map_sys_oob)
+        self.map.copy_in(at, src).map_err(TransportError::from_sys)
     }
 
     fn contains(&self, gpa: u64) -> bool {
@@ -447,24 +364,6 @@ mod tests {
         drop(first);
         let again = GuestMemoryRegion::map(&dup, &region(0x1000, 0x2000, 0)).expect("after drop");
         assert_eq!(again.mapped_len(), 0x2000);
-    }
-
-    /// GPU-6: 占有の重なり判定（半開区間。接するだけなら重ならない）と、別 inode は干渉しないこと。
-    #[test]
-    fn gpu6_lease_key_overlap_values() {
-        let k = |ino, start, end| LeaseKey {
-            dev: 7,
-            ino,
-            start,
-            end,
-        };
-        assert!(k(1, 0, 0x1000).overlaps(&k(1, 0xfff, 0x2000)));
-        assert!(!k(1, 0, 0x1000).overlaps(&k(1, 0x1000, 0x2000)));
-        assert!(!k(1, 0, 0x1000).overlaps(&k(2, 0, 0x1000)));
-        assert!(!k(1, 0, 0x1000).overlaps(&LeaseKey {
-            dev: 8,
-            ..k(1, 0, 0x1000)
-        }));
     }
 
     /// GPU-6・REPAIR-12: 領域の末尾は map 時の値を使う。GPA 空間の末尾（`u64::MAX`）に接する領域でも加減算で

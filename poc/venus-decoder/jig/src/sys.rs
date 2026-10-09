@@ -35,11 +35,14 @@
 //! `memfd_create(2)`・`fcntl(2)`・`linux/fcntl.h`（`F_ADD_SEALS` / `F_GET_SEALS` / `F_SEAL_*`）。値だけを転記し、コードは流用していない。
 
 use std::ffi::CStr;
+use std::fs::File;
 use std::io;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
 use std::ptr::NonNull;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// 1 回の受信・送信で扱う fd 数の上限。補助データバッファの固定長を決める（`MAX_MEM_REGIONS` と同じ 32）。
 pub(crate) const MAX_SCM_FDS: usize = 32;
@@ -49,6 +52,14 @@ pub(crate) const MAX_SCM_FDS: usize = 32;
 pub(crate) enum SysError {
     /// 対応外のアーキテクチャ（定数が未定義。fail-closed）。
     Unsupported,
+    /// map しようとした fd に縮小を封じる `F_SEAL_SHRINK` が無い（seal 非対応の fd を含む）。
+    NotSealed,
+    /// ファイルが map 長に届かない（EOF を超えるアクセスは SIGBUS になる）。
+    TooShort,
+    /// 同じ backing file の重なるアクセス範囲を、このプロセスの別のマッピングが占有している。
+    InUse,
+    /// マッピング内のコピーの範囲外。
+    OutOfRange,
     /// カーネルが返した errno。
     Os(i32),
 }
@@ -553,7 +564,7 @@ pub(crate) fn memfd_create_cloexec(name: &CStr, allow_sealing: bool) -> Result<O
 }
 
 /// `fcntl(fd, F_GET_SEALS)` で seal のビット集合を得る（U9）。seal 非対応の fd（通常ファイル等）は `EINVAL`。
-pub(crate) fn fcntl_get_seals(fd: BorrowedFd<'_>) -> Result<u32, SysError> {
+fn fcntl_get_seals(fd: BorrowedFd<'_>) -> Result<u32, SysError> {
     if !SUPPORTED {
         return Err(SysError::Unsupported);
     }
@@ -580,6 +591,60 @@ pub(crate) fn fcntl_add_seals(fd: BorrowedFd<'_>, seals: u32) -> Result<(), SysE
     check(ret).map(|_| ())
 }
 
+/// backing file 上のアクセス範囲（`[start, end)`。ファイルのバイトオフセット）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LeaseKey {
+    dev: u64,
+    ino: u64,
+    start: u64,
+    end: u64,
+}
+
+impl LeaseKey {
+    fn overlaps(&self, other: &Self) -> bool {
+        self.dev == other.dev
+            && self.ino == other.ino
+            && self.start < other.end
+            && other.start < self.end
+    }
+}
+
+/// 生きているマッピングのアクセス範囲の一覧（プロセス全体で 1 個）。件数は生きているマッピングの数で、それぞれが mmap を伴う。
+static LEASES: Mutex<Vec<LeaseKey>> = Mutex::new(Vec::new());
+
+fn leases() -> MutexGuard<'static, Vec<LeaseKey>> {
+    // 保持中に panic する処理は無いが、poison しても一覧そのものは整合しているのでそのまま使う。
+    LEASES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// アクセス範囲の占有。`Drop` で一覧から外す。
+#[derive(Debug)]
+struct Lease {
+    key: LeaseKey,
+}
+
+impl Lease {
+    /// 重なる範囲が生きていれば `InUse`。確認と登録は同じロックの中で行う（確認後の割り込みを許さない）。
+    fn acquire(key: LeaseKey) -> Result<Self, SysError> {
+        let mut list = leases();
+        if list.iter().any(|k| k.overlaps(&key)) {
+            return Err(SysError::InUse);
+        }
+        list.push(key);
+        Ok(Self { key })
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let mut list = leases();
+        // 重なりを拒否して登録するので、同じ key は一覧に 1 個しか無い。
+        if let Some(i) = list.iter().position(|k| *k == self.key) {
+            list.swap_remove(i);
+        }
+    }
+}
+
 /// `mmap` した共有マッピング。`Drop` で `munmap` する。`!Send` / `!Sync` で、包む側（`GuestMemoryRegion` /
 /// `GuestMemory`）も同じになる（`unsafe impl` で付け足さない）。`copy_in` / `copy_out` は `&self` から非アトミックに
 /// コピーするため、複数スレッドから同じマッピングを使えないことが前提。`NonNull<u8>` も `!Send` / `!Sync` だが、その性質に
@@ -593,19 +658,54 @@ pub(crate) struct MmapRegion {
     len: usize,
     /// `!Send` / `!Sync` を型の上で明示する marker（`*mut u8` は `Send` でも `Sync` でもない）。
     _not_send_sync: PhantomData<*mut u8>,
+    /// アクセス範囲の占有。`Drop` の本体（munmap）の後にフィールドとして drop されるので、範囲は unmap の後に解放される。
+    _lease: Lease,
 }
 
 impl MmapRegion {
-    /// `fd` の先頭 `len` バイトを `PROT_READ | PROT_WRITE`・`MAP_SHARED` で map する（U6）。
+    /// `file` の先頭 `len` バイトを `PROT_READ | PROT_WRITE`・`MAP_SHARED` で map する（U6）。アクセスするのはファイル上の
+    /// `[access_start, len)` だけで、その範囲をプロセス内で占有する。
     ///
-    /// `len` が fd の実長以下か、およびその後に縮まない（`F_SEAL_SHRINK`）ことは呼び出し側が検証する（EOF を超えた
-    /// 範囲へのアクセスは SIGBUS になる）。
-    pub(crate) fn map_shared(fd: BorrowedFd<'_>, len: NonZeroUsize) -> Result<Self, SysError> {
+    /// 安全性に要る検証はすべてここで map と不可分に行い、呼び出し側に頼らない（呼び出し元は `guest_memory` だけ）:
+    /// 1. `F_SEAL_SHRINK` があり縮まない（無ければ・seal 非対応の fd は `NotSealed`。後から縮むと SIGBUS になる）
+    /// 2. seal の確認後に取り直したファイル長が `len` 以上（`TooShort`。seal は取り消せないので以後も縮まない）
+    /// 3. 同じ backing file（`st_dev`・`st_ino`）の重なるアクセス範囲を別のマッピングが占有していない（`InUse`。
+    ///    `copy_nonoverlapping` は非アトミックなので、プロセス内で同じ backing memory へ並行にアクセスさせない）
+    ///
+    /// `access_start` が `len` 以上（空の範囲）は `Os(EINVAL)`。
+    pub(crate) fn map_shared(
+        file: &File,
+        access_start: u64,
+        len: NonZeroUsize,
+    ) -> Result<Self, SysError> {
         if !SUPPORTED {
             return Err(SysError::Unsupported);
         }
+        let len_u64 = u64::try_from(len.get()).map_err(|_| SysError::Os(EINVAL))?;
+        if access_start >= len_u64 {
+            return Err(SysError::Os(EINVAL));
+        }
+        let io_err = |e: io::Error| SysError::Os(e.raw_os_error().unwrap_or(EINVAL));
+        let id = file.metadata().map_err(io_err)?;
+        match fcntl_get_seals(file.as_fd()) {
+            Ok(seals) if seals & F_SEAL_SHRINK != 0 => {}
+            Ok(_) => return Err(SysError::NotSealed),
+            // seal 非対応の fd（通常ファイル等）。縮まない保証を確認できないので拒否する。
+            Err(SysError::Os(n)) if n == EINVAL => return Err(SysError::NotSealed),
+            Err(e) => return Err(e),
+        }
+        if file.metadata().map_err(io_err)?.len() < len_u64 {
+            return Err(SysError::TooShort);
+        }
+        // mmap が失敗すれば `lease` の Drop で占有を解放する。
+        let lease = Lease::acquire(LeaseKey {
+            dev: id.dev(),
+            ino: id.ino(),
+            start: access_start,
+            end: len_u64,
+        })?;
         // SAFETY: addr = NULL（カーネルが配置を決める）・offset = 0 の新規マッピングで、既存のメモリを上書きしない
-        // （`MAP_FIXED` なし）。`fd` は `BorrowedFd` で有効。`len` は非 0。失敗は -1 で返る。
+        // （`MAP_FIXED` なし）。fd は `&File` の借用で呼び出し中は有効。`len` は非 0。失敗は -1 で返る。
         let ret = unsafe {
             syscall(
                 NR_MMAP,
@@ -613,7 +713,7 @@ impl MmapRegion {
                 len.get(),
                 PROT_READ | PROT_WRITE,
                 MAP_SHARED,
-                fd.as_raw_fd() as usize,
+                file.as_raw_fd() as usize,
                 0usize,
             )
         };
@@ -624,6 +724,7 @@ impl MmapRegion {
             ptr,
             len: len.get(),
             _not_send_sync: PhantomData,
+            _lease: lease,
         })
     }
 
@@ -634,14 +735,14 @@ impl MmapRegion {
 
     /// `off` から `dst.len()` バイトを `dst` へコピーする（U8）。範囲外は `Err`。
     pub(crate) fn copy_out(&self, off: usize, dst: &mut [u8]) -> Result<(), SysError> {
-        let end = off.checked_add(dst.len()).ok_or(SysError::Os(EINVAL))?;
+        let end = off.checked_add(dst.len()).ok_or(SysError::OutOfRange)?;
         if end > self.len {
-            return Err(SysError::Os(EINVAL));
+            return Err(SysError::OutOfRange);
         }
         // SAFETY: 上で `off + dst.len() <= self.len` を検査済みで、読み取り元 `ptr + off` は生きているマッピングの
         // 範囲内。`dst` は排他的な Rust の借用でマッピングと重ならない（マッピングへの参照は作らない）。
         // プロセス内の並行アクセスは起きない: `MmapRegion` は `!Send` / `!Sync` で 1 スレッドに閉じ、同じ backing file の
-        // 重なる範囲を map する領域は `guest_memory` の占有一覧で同時に 1 個に限る（`BACKING_IN_USE`）。残る並行書き込みは
+        // 重なるアクセス範囲を map するマッピングは占有一覧（`Lease`）で同時に 1 個に限る（`map_shared` の `InUse`）。残る並行書き込みは
         // frontend プロセスによるもので、バイト列のコピーに限り値が不定になるだけでメモリ安全性は損なわない。
         unsafe {
             std::ptr::copy_nonoverlapping(self.ptr.as_ptr().add(off), dst.as_mut_ptr(), dst.len())
@@ -651,13 +752,13 @@ impl MmapRegion {
 
     /// `src` を `off` へコピーする（U8）。範囲外は `Err`。
     pub(crate) fn copy_in(&self, off: usize, src: &[u8]) -> Result<(), SysError> {
-        let end = off.checked_add(src.len()).ok_or(SysError::Os(EINVAL))?;
+        let end = off.checked_add(src.len()).ok_or(SysError::OutOfRange)?;
         if end > self.len {
-            return Err(SysError::Os(EINVAL));
+            return Err(SysError::OutOfRange);
         }
         // SAFETY: 上で `off + src.len() <= self.len` を検査済みで、書き込み先 `ptr + off` は `PROT_WRITE` で map した
         // 生きているマッピングの範囲内。`src` は Rust の借用でマッピングと重ならない。プロセス内の並行アクセスが
-        // 起きないことは `copy_out` と同じ（`!Send` / `!Sync` と `guest_memory` の占有一覧）。
+        // 起きないことは `copy_out` と同じ（`!Send` / `!Sync` と占有一覧）。
         unsafe {
             std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.as_ptr().add(off), src.len())
         };
@@ -754,6 +855,56 @@ mod tests {
         );
         let trailing = scan_control(&[0u8; 8]);
         assert!(trailing.malformed);
+    }
+
+    /// GPU-6: 占有の重なり判定（半開区間。接するだけなら重ならない）と、別 inode は干渉しないこと。
+    #[test]
+    fn gpu6_lease_key_overlap_values() {
+        let k = |ino, start, end| LeaseKey {
+            dev: 7,
+            ino,
+            start,
+            end,
+        };
+        assert!(k(1, 0, 0x1000).overlaps(&k(1, 0xfff, 0x2000)));
+        assert!(!k(1, 0, 0x1000).overlaps(&k(1, 0x1000, 0x2000)));
+        assert!(!k(1, 0, 0x1000).overlaps(&k(2, 0, 0x1000)));
+        assert!(!k(1, 0, 0x1000).overlaps(&LeaseKey {
+            dev: 8,
+            ..k(1, 0, 0x1000)
+        }));
+    }
+
+    /// GPU-6: `map_shared` は呼び出し側に頼らず、seal・ファイル長・占有・空の範囲を map 前に自分で検証する。
+    #[test]
+    fn gpu6_map_shared_validates_by_itself() {
+        let len = NonZeroUsize::new(0x2000).expect("non-zero");
+        let unsealed = File::from(memfd_create_cloexec(c"jig-sys-unsealed", true).expect("memfd"));
+        unsealed.set_len(0x2000).expect("len");
+        let e = MmapRegion::map_shared(&unsealed, 0, len).expect_err("no seal");
+        assert_eq!(e, SysError::NotSealed);
+
+        let short = File::from(memfd_create_cloexec(c"jig-sys-short", true).expect("memfd"));
+        short.set_len(0x1000).expect("len");
+        fcntl_add_seals(short.as_fd(), F_SEAL_SHRINK).expect("seal");
+        let e = MmapRegion::map_shared(&short, 0, len).expect_err("short");
+        assert_eq!(e, SysError::TooShort);
+
+        let ok = File::from(memfd_create_cloexec(c"jig-sys-ok", true).expect("memfd"));
+        ok.set_len(0x2000).expect("len");
+        fcntl_add_seals(ok.as_fd(), F_SEAL_SHRINK).expect("seal");
+        let e = MmapRegion::map_shared(&ok, 0x2000, len).expect_err("empty range");
+        assert_eq!(e, SysError::Os(EINVAL));
+        let m = MmapRegion::map_shared(&ok, 0x1000, len).expect("map");
+        assert_eq!(m.len(), 0x2000);
+        let e = MmapRegion::map_shared(&ok, 0x1fff, len).expect_err("overlap");
+        assert_eq!(e, SysError::InUse);
+        let head = MmapRegion::map_shared(&ok, 0, NonZeroUsize::new(0x1000).expect("nz"))
+            .expect("disjoint head");
+        let mut b = [0u8; 2];
+        assert_eq!(m.copy_out(0x1fff, &mut b), Err(SysError::OutOfRange));
+        drop((m, head));
+        MmapRegion::map_shared(&ok, 0x1fff, len).expect("after release");
     }
 
     /// GPU-6: `CMSG_SPACE` と補助データバッファの長さ。

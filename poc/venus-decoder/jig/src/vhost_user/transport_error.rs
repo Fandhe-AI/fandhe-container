@@ -124,6 +124,11 @@ impl TransportError {
     pub(crate) fn from_sys(e: SysError) -> Self {
         match e {
             SysError::Unsupported => Self::new(TransportErrorCode::Unsupported),
+            SysError::NotSealed => Self::new(TransportErrorCode::ShrinkNotSealed),
+            SysError::TooShort => Self::new(TransportErrorCode::FileTooShort),
+            SysError::InUse => Self::new(TransportErrorCode::BackingInUse),
+            // sys 側の境界の再検査（多層防御）に掛かった場合。上位の検査をすり抜けたので範囲外として拒否する。
+            SysError::OutOfRange => Self::new(TransportErrorCode::OutOfBounds),
             SysError::Os(n) if n == sys::EAGAIN => Self::new(TransportErrorCode::Timeout),
             SysError::Os(n) => Self {
                 code: TransportErrorCode::OsError,

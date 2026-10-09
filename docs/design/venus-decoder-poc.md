@@ -260,7 +260,8 @@ macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なし�
 ### 10.1 本 PR の範囲と未達（実装済みを装わない。REPAIR-3）
 
 - 実装済み: 候補比較（本章）、ctrl の `GET_CAPSET_INFO` / `GET_CAPSET` の復号・応答符号化・構造化ログ 1 行（`adapter`）、#1520 で `GET_DISPLAY_INFO`（scanout なし）・`CTX_CREATE`（venus の context_init）・`CTX_DESTROY` を追加（ctx 表は上限 64）、治具が広告する feature と config の定数（`device`）、ログ照合器と実機前提テストの枠（`log`・`tests/real_machine_capset_log.rs`）。socket は開かない
-- 実装済み（F1.1・#1516）: vhost-user メッセージの codec（`vhost_user`。10.5）。fd・socket・virtqueue・セッションは未実装（F1.2〜F1.4）
+- 実装済み（F1.1・#1516）: vhost-user メッセージの codec（`vhost_user`。10.5）。virtqueue・セッションは未実装（F1.3・F1.4）
+- 実装済み（F1.2・#1517）: `SCM_RIGHTS` の fd 送受信とゲストメモリの mmap のラッパー（`vhost_user::fd_passing` / `guest_memory`・`src/sys.rs`。Linux 限定。10.6）
 - **受入基準 2（ゲストの Mesa venus の capset クエリが自前デコーダに届いたことをログで確認）は未達**。トランスポート（後続 F1）と実機実行（F3・#725。人間担当）が必要なため
 - 後続（issue 起票は未実施・承認待ち）: F1 vhost-user トランスポート（メッセージ codec・fd 受け渡しと `mmap` の `sys` ラッパー・split virtqueue・kick / call。rust-vmm 系クレートは MVM-4 で使えないため自作）、F2 残りの ctrl 応答（10.4 節。`RESOURCE_CREATE_BLOB`・`SUBMIT_3D` 等）、F3 実機疎通（#725）
 - CI: `make poc-venus-jig-check`（fmt-check・clippy・test）は CI の `rust-ci-default-features` ジョブが 3 OS で実行し、`crates/plugin-macos` 側の変更による治具の破損を検出する（実機前提テストは `#[ignore]` で分離済みで CI では走らない）
@@ -352,7 +353,32 @@ Mesa venus が capset 取得の後に発行する ctrl の一次情報（`mesa-2
 - config データは治具独自の上限 256 バイト（`virtio_gpu_config` は 16 バイト）。config の flags は crosvm のビット（`WRITABLE`=0x1・`LIVE_MIGRATION`=0x2）を受理し、他のビットは拒否する（QEMU の rst は値として 0 / 1 を定めるが、crosvm の GET_CONFIG は毎回 0x1 を送るため両方を受理できる形にした）
 - 検査順は固定: `SHORT_HEADER` → `UNSUPPORTED_VERSION` → `INVALID_FLAGS`（予約ビット・方向） → `PAYLOAD_TOO_LARGE` → `UNKNOWN_REQUEST` → `LENGTH_MISMATCH` → `INVALID_VALUE`
 
-F1.1 の範囲外（申し送り）: 値の意味の検証（vring addr のアラインメント・index < キュー数・log ビット・avail index）は F1.3（#1518）、ネゴシエーション済み feature との照合・セッション状態は F1.4（#1519）、ソケット I/O・fd・mmap・タイムアウト（REPAIR-5）は F1.2（#1517）で扱う。
+F1.1 の範囲外（申し送り）: 値の意味の検証（vring addr のアラインメント・index < キュー数・log ビット・avail index）は F1.3（#1518）、ネゴシエーション済み feature との照合・セッション状態は F1.4（#1519）、fd・mmap・タイムアウト（REPAIR-5）は F1.2（#1517。10.6）で扱う。
+
+### 10.6 fd の受け渡しと共有メモリ（F1.2・#1517）
+
+frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲストメモリ領域の fd と eventfd を渡し、backend は `SET_MEM_TABLE` の領域を `mmap` して GPA 経由でアクセスする。rust-vmm 系は MVM-4 で使えないため自作し、crosvm の構造体やロジックは写していない。`unsafe` は `src/sys.rs` にだけ置く（個別承認: [#1517 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6074351741)。U1 `syscall` 宣言・U2 `recvmsg`・U3 受信 fd の所有・U4 `sendmsg`・U5 `memfd_create`・U6 `mmap`・U7 `Drop` の `munmap`・U8 境界検査後のコピー）。
+
+出典（確認日 2026-10-09。値だけを転記）: Linux UAPI ヘッダ（`linux-libc-dev`）の `asm-generic/socket.h`（SHA-256 `e833d32d3d8d03732021da6968665431d693ab4effdd4d39965ff05115a4ed21`）・`linux/socket.h`（`f4331fd201269894f63242a2521b3d5b3290ca556969011d7858908d5fe658c4`）・`asm-generic/mman-common.h`・`linux/memfd.h`、syscall 番号は `asm/unistd_64.h`（x86_64）と asm-generic `unistd.h`（aarch64）、man `recvmsg(2)`・`unix(7)`・`cmsg(3)`・`mmap(2)`・`memfd_create(2)`。
+
+| 定数 | x86_64 | aarch64 |
+| ---- | ------ | ------- |
+| `sendmsg` / `recvmsg` | 46 / 47 | 211 / 212 |
+| `mmap` / `munmap` | 9 / 11 | 222 / 215 |
+| `memfd_create` | 319 | 279 |
+| `SOL_SOCKET` / `SCM_RIGHTS` | 1 / 1 | 1 / 1 |
+| `MSG_CTRUNC` / `MSG_TRUNC` / `MSG_NOSIGNAL` / `MSG_CMSG_CLOEXEC` | 0x8 / 0x20 / 0x4000 / 0x4000_0000 | 同左（個別に定義） |
+
+設計判断:
+
+- `recvmsg` 等は `syscall(2)` 経由でカーネル ABI の `user_msghdr` / `cmsghdr` を直接使う（glibc / musl の `msghdr` のパディング差に依存しない）。`poll` / `fcntl` / `sysconf` は使わず、タイムアウト（REPAIR-5）は std の `set_read_timeout` / `set_write_timeout`（`SO_RCVTIMEO` / `SO_SNDTIMEO`）で実現する
+- 受け取る fd は `MAX_FDS`（32）。受信した fd は検証より前にすべて `OwnedFd` にし、`MSG_CTRUNC`・上限超過・構造異常のどのエラー経路でも `Drop` で閉じる。`MSG_CMSG_CLOEXEC` で close-on-exec を原子的に付ける
+- map は file offset 0 から `mmap_offset + memory_size` バイトを `MAP_SHARED` で行い、領域の先頭をマップ内の `mmap_offset` の位置として扱う（ページ境界にそろっていない `mmap_offset` でも `EINVAL` にしない）。QEMU `vhost-user.rst` の `mmap_offset` の定義との照合は未実施で、F1.4 の結合で確認する
+- 上限は治具独自: 1 領域の map 長 64 GiB・合計 128 GiB。ファイル長が map 長に届かなければ `FILE_TOO_SHORT`。領域をまたぐアクセスは `OUT_OF_BOUNDS`（PoC の割り切り）
+- マッピングへの参照は作らず、境界検査したコピーだけで出し入れする。`MmapRegion` は `!Send` / `!Sync`
+- 残余リスク: frontend が後から `ftruncate` で縮めると `SIGBUS` になり得る（backend 側に seal を強制する手段が無い。製品版は TASK-173 系）
+- aarch64 の定数と構造体は CI で型検査されない（治具はルート workspace 外で `aarch64-linux-check` の対象外）。固定値テストも実行アーキの分しか走らない。ローカルでは `cargo check --target aarch64-unknown-linux-gnu --all-targets` の型検査のみ通した（実行は未検証）
+- 範囲外: ヘッダ単位の読み書きの枠組み・セッション・UDS の bind と所有者・権限・peer credential の検証（PLUG-12 相当）・eventfd の待機は F1.4（#1519）、virtqueue と `userspace_addr` の変換は F1.3（#1518）
 
 ## 11. 以降の章（未着手。10 章は #888 の範囲）
 

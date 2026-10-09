@@ -4,7 +4,9 @@
 //! 固定長の型で復号・符号化する。呼び出し元は後続の F1.2（ソケット I/O と fd 受け渡し。#1517）と
 //! F1.4（セッション状態。#1519）で、現時点でどこからも呼ばれない。
 //!
-//! 範囲外（実装済みを装わない。REPAIR-3）: ソケット I/O・fd（SCM_RIGHTS）・mmap（F1.2）、virtqueue と値の意味の検証
+//! fd（`SCM_RIGHTS`）の送受信と共有メモリの mmap は `fd_passing` / `guest_memory`（Linux 限定。F1.2・#1517）が担当する。
+//!
+//! 範囲外（実装済みを装わない。REPAIR-3）: ヘッダ単位のソケット読み書きの枠組み（F1.4）、virtqueue と値の意味の検証
 //! （アラインメント・index の範囲。F1.3・#1518）、セッション状態とネゴシエーション済み feature の照合（F1.4）。
 //! ここで検査するのはワイヤー上の予約ビット・長さ・個数の上限だけ。
 //!
@@ -29,6 +31,13 @@ compile_error!("vhost-user codec supports little-endian targets only");
 mod error;
 mod message;
 
+#[cfg(target_os = "linux")]
+pub mod fd_passing;
+#[cfg(target_os = "linux")]
+pub mod guest_memory;
+#[cfg(target_os = "linux")]
+mod transport_error;
+
 #[cfg(test)]
 mod tests;
 
@@ -37,6 +46,8 @@ pub use message::{
     ConfigPayload, Decoded, MemRegion, MemTable, Reply, Request, VringAddr, VringFd, VringState,
     decode_reply, decode_request, decode_request_payload,
 };
+#[cfg(target_os = "linux")]
+pub use transport_error::{TransportError, TransportErrorCode};
 
 /// ヘッダ長（request・flags・size の各 u32）。
 pub const HEADER_LEN: usize = 12;

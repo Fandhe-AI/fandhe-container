@@ -193,7 +193,15 @@ GPU-6 の決定（ヘッドレス compute のみ・2D スキャンアウト非�
 
 実装は `crates/plugin-macos/src/gpu/venus/capset.rs`（`capset_info`・`respond_capset_query`）。PoC-14 で既存 OSS 構成が venus capset（id 4）を `max-size=0` で返し、ゲストの Mesa venus が物理デバイス 0 件と判定した問題への対処として、`max_size` が 0 でない（160）応答を返す最小実装を置いた。トランスポート非依存で、virtio-gpu の ctrl 枠は TASK-175 のデバイスモデルが包む。疎通の成否は #725 で確認する。本章は実装の存在のみを示す。
 
-- 出典（確認日 2026-10-08。値のみ転記。SHA-256 は計画フェーズで照合した値）: virglrenderer `virglrenderer-1.1.0` の `src/venus_hw.h`（`7bc1a8195294d681f4081719e7c4dfea396765e82b5583a2471fad9705aab64e`）、mesa `mesa-25.0.0` の `src/virtio/virtio-gpu/venus_hw.h`（`fa736817518a9c94bf50788a404cae8282987e2e82bcee6436370b2cc6a5988b`）・`src/virtio/vulkan/vn_renderer_virtgpu.c`（`a7a0f1a395d006bfb1ef4aea4d3b2c6a44c30c50ede855416e1183442e1e03aa`）、venus-protocol `v1.1.3` の `xmls/vk.xml`（`264d0d7350e37d70c82407fb430d085040fc01a9a961d43dec8c2d6ed1dfd183`）
+- 出典（確認日 2026-10-09。値のみ転記。SHA-256 は全件を計画フェーズで上流から再取得して照合）:
+  - virglrenderer `virglrenderer-1.1.0` の `src/venus_hw.h`（`7bc1a8195294d681f4081719e7c4dfea396765e82b5583a2471fad9705aab64e`）
+  - mesa `mesa-25.0.0` の `src/virtio/virtio-gpu/venus_hw.h`（`fa736817518a9c94bf50788a404cae8282987e2e82bcee6436370b2cc6a5988b`）: `vk_extension_mask1` の bit 0 の意味もここ
+  - mesa `mesa-25.0.0` の `src/virtio/vulkan/vn_renderer_virtgpu.c`（`a7a0f1a395d006bfb1ef4aea4d3b2c6a44c30c50ede855416e1183442e1e03aa`）
+  - mesa `mesa-25.0.0` の `src/virtio/vulkan/vn_instance.c`（`b8d3461d9a8b8d740d7c383100ac972e256263d9bd55e663be31f709c4e838a9`）: ゲストの受理条件
+  - venus-protocol `v1.1.3` の `xmls/VK_EXT_command_serialization.xml`（`2451e5dcc5306f604c52da48a8cc883a24de708dd86f38bbb035d29a753a0474`）: 拡張番号 384・spec version 1
+  - venus-protocol `v1.1.3` の `xmls/VK_MESA_venus_protocol.xml`（`d92839bc728fa9ad9a7decdc6b91df6fa1a0fb26cffae4009865f18a789e0535`）: 拡張番号 385・spec version 4
+  - venus-protocol `v1.1.3` の `xmls/vk.xml`（`264d0d7350e37d70c82407fb430d085040fc01a9a961d43dec8c2d6ed1dfd183`）: `VK_HEADER_VERSION`（357）だけを取った。venus の 2 拡張は含まれない
+  - ライセンス・著作権表記は `capset.rs` のモジュール doc に記載（転記はフィールド名・並び・数値定数のみ。NOTICE は作らない）
 - レイアウト（全て `u32` リトルエンディアン、計 160 バイト）:
 
 | offset | フィールド | 広告値 |
@@ -202,13 +210,14 @@ GPU-6 の決定（ヘッドレス compute のみ・2D スキャンアウト非�
 | 4 | `vk_xml_version` | `VK_MAKE_API_VERSION(0,1,4,357)` = `0x0040_4165`（ゲスト側で上限クランプ） |
 | 8 | `vk_ext_command_serialization_spec_version` | 1 |
 | 12 | `vk_mesa_venus_protocol_spec_version` | 4（ゲスト側で上限クランプ） |
-| 16 | `supports_blob_id_0` | 1（Mesa が非 0 を前提） |
+| 16 | `supports_blob_id_0` | 1（Mesa は `assert` で非 0 を前提。release ビルドでは無検査） |
 | 20〜147 | `vk_extension_mask1[32]` | `[0]` = 0x1（マスク有効）、`[12]` = 0x3（拡張 384・385）、他 0 |
-| 148 | `allow_vk_wait_syncs` | 1（Mesa が非 0 を前提） |
-| 152 | `supports_multiple_timelines` | 1（Mesa が非 0 を前提） |
+| 148 | `allow_vk_wait_syncs` | 1（Mesa は `assert` で非 0 を前提。release ビルドでは無検査） |
+| 152 | `supports_multiple_timelines` | 1（Mesa は `assert` で非 0 を前提。release ビルドでは無検査） |
 | 156 | `use_guest_vram` | 0 |
 
-- ゲスト（Mesa 25.0.0）の受理条件: capset id 4・version 0 で要求する。`wire_format_version` は完全一致必須。`vk_xml_version` は Vulkan 1.1 未満なら拒否。拡張マスクは bit 0 が立っていないと「全拡張対応」とみなされるため、最小集合を明示した（fail-closed）
+- 上表の `assert` の根拠は `vn_renderer_virtgpu.c` の 1394（`supports_blob_id_0`）・1402（`allow_vk_wait_syncs`）・1404（`supports_multiple_timelines`）・1456 行。release ビルドでは検査されないため、0 を返してもゲストが即座に拒否するとは限らない
+- ゲスト（Mesa 25.0.0）の受理条件: capset id 4・version 0 で要求する。`wire_format_version` の完全一致必須・`vk_xml_version` の上限クランプ・最小版（Vulkan 1.1）未満の拒否は `vn_instance.c` の 165〜184 行。拡張マスクは `venus_hw.h` のコメントどおり bit 0 が立っていないと「全拡張対応」とみなされるため、最小集合を明示した（fail-closed）
 - エラー方針: id 4・version 0・index 0 以外は `venus_capset.*` のエラーで拒否する（`VenusCapsetError`）
 - 先送り・未決事項（値は暫定で確定扱いにしない）:
   - protocol spec version 4 を広告すると v3・v4 のコマンドがゲストから発行されうる（3 章では保留扱い）。下げるかは #725 の実ストリームと #726 で判断
@@ -228,20 +237,20 @@ macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なし�
   - 生成バインディング上は `VZCustomVirtioDeviceConfiguration` に `deviceID`・`virtioQueueCount`・`mandatoryFeatures` / `optionalFeatures`・`deviceSpecificConfiguration`・`sharedMemoryRegions` があり、`VZVirtioSharedMemoryRegionConfiguration` は `initWithRegionID:size:`。API 上は共有メモリ領域を提示できる見込みだが実機では未確認
   - `deny.toml` の `[sources]` は `unknown-git = "deny"` で、git 依存は現設定では入れられない
   - ゲスト Linux driver は mainline で `num_scanouts == 0` を `KMS disabled` として受理する。古いカーネルは `num_scanouts is zero` で probe が失敗しうる（受理される版数は未確認）
-- 承認事項（ユーザー承認が必要。Agent は実行していない）:
-  - A. バインディングの入手経路。A1（推奨）: macOS 27 対応の `objc2-virtualization` の crates.io リリースを待ち `=x.y.z` で更新（`objc2`・`objc2-foundation`・`block2`・`dispatch2` の連鎖更新も判断）。A2: 上記コミットを git 依存で固定（`deny.toml` の変更が要りサプライチェーン上非推奨）。A3: 自前 `extern_class!` / `define_class!`（`unsafe` の新規追加。セレクタ・型を macOS 27 SDK と照合する必要がある）
-  - B. ホスト側ハーネスの配置（ルート `Cargo.toml` の `members` 追加・`exclude`・入れ子 workspace のいずれか。7 章の「配置の逸脱」と同じ論点）
-  - C. `unsafe` の扱い（delegate 実装と `unsafe fn` バインディング呼び出し。事前承認の範囲は `sys` モジュールで、PoC crate が対象かは不明確なため個別承認）
-  - D. 実行環境（macOS 27＋Xcode 27 SDK の Apple Silicon 実機。CI に macOS 27 ランナーは無く、ホスト側コードは CI でビルド検証できない見込み）
+- 承認事項（オーナー決定済み。ホスト側ハーネス本体は #1522〔sub-issue #1523・#1524〕で追跡）:
+  - A. バインディングの入手経路。**決定: A1**（承認は #1521）。A1: macOS 27 対応の `objc2-virtualization` の crates.io リリースを待ち `=x.y.z` で更新（`objc2`・`objc2-foundation`・`block2`・`dispatch2` の連鎖更新を含む）。A2: 上記コミットを git 依存で固定（`deny.toml` の変更が要りサプライチェーン上非推奨）。A3: 自前 `extern_class!` / `define_class!`（`unsafe` の新規追加。セレクタ・型を macOS 27 SDK と照合する必要がある）
+  - B. ホスト側ハーネスの配置（ルート `Cargo.toml` の `members` 追加・`exclude`・入れ子 workspace のいずれか。7 章の「配置の逸脱」と同じ論点）。**決定: `poc/` 配下の独立パッケージ**（ルート workspace の外。既存の `poc/vz-custom-virtio-gpu/`）
+  - C. `unsafe` の扱い（delegate 実装と `unsafe fn` バインディング呼び出し。事前承認の範囲は `sys` モジュールで、PoC crate が対象かは不明確なため個別承認）。**決定: 実装時に個別承認**
+  - D. 実行環境（macOS 27＋Xcode 27 SDK の Apple Silicon 実機。CI に macOS 27 ランナーは無く、ホスト側コードは CI でビルド検証できない見込み）。**決定: macOS 27＋Xcode 27 SDK の Apple Silicon 実機で人間が実行する**（#1057）
 - 受け入れ条件の状態:
 
 | 条件 | 状態 |
 | ---- | ---- |
 | 1. VENUS capset のみ・scanout なしの virtio-gpu をゲストが probe する | 実機前提で未確認（#1057）。ゲスト側確認スクリプトは用意済み |
 | 2. host visible 共有メモリ領域を提示できる | API 上は提示できる見込み。ゲストで host visible が有効になるかは未確認（#1057） |
-| 3. 新規依存・`unsafe` が要る場合は止めて報告 | ゲートに当たり停止。上記の承認事項 A〜D として報告済み |
+| 3. 新規依存・`unsafe` が要る場合は止めて報告 | ゲートに当たり停止。承認事項 A〜D はオーナー決定済み（上記）。本体は #1522 |
 
-- 先送り: ホスト側の登録ハーネス本体（承認事項の決定後に別 issue）、`num_scanouts=0` が古いカーネルで通らない場合の受け入れ条件見直し（#1057 へ申し送り）
+- 先送り: ホスト側の登録ハーネス本体（#1522 で追跡）、`num_scanouts=0` が古いカーネルで通らない場合の受け入れ条件見直し（#1057 へ申し送り）
 - セキュリティ: host visible 共有メモリと virtqueue 経由の ctrl コマンドはゲストからの untrusted 入力。ホスト側実装時は security-auditor を必須とし、境界検査・サイズ上限・fail-closed（#723 の方針）を適用する
 
 ## 10. 試験治具 VMM と外部バックエンド接続（TASK-172.4・#888）

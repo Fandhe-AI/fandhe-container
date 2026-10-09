@@ -2,7 +2,7 @@
 //!
 //! 役割: vhost-user の `SET_VRING_NUM` / `SET_VRING_ADDR` / `SET_VRING_BASE` で受けた値を検証して [`QueueConfig`] にし、
 //! avail リングから要求の記述子チェーンを取り出し（[`SplitQueue::pop`]）、処理後に used リングへ書き戻す
-//! （[`SplitQueue::add_used`]）。呼び出し元は後続の F1.4（セッションと応答ループ。#1519）で、現時点でどこからも呼ばれない。
+//! （[`SplitQueue::add_used`]）。呼び出し元は `crate::session`（セッションと応答ループ。F1.4・#1519。Linux 限定）。
 //! メモリへのアクセスは [`QueueMemory`] だけを通す。Linux では `vhost_user::guest_memory::GuestMemory`
 //! （境界検査つきのコピー）が実装し、合成リングのテストは OS を問わず動く。トランスポートに依存しないので `vhost_user` の外に置く。
 //!

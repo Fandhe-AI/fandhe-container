@@ -95,6 +95,29 @@ pub fn rejected_line(cmd_type: Option<u32>, result: QueryResult) -> String {
     )
 }
 
+/// セッションがエラーで終了したときのログ行。code は固定語彙、要求 ID は数値（無ければ -1）だけを出す。
+pub fn session_error_line(code: &str, request: Option<u32>) -> String {
+    format!(
+        "venus_jig event=session_error code={code} request={}",
+        request.map_or(-1, i64::from)
+    )
+}
+
+/// `NEED_REPLY` が付いた `SET_*` に応答しなかった（REPLY_ACK を広告していない）ことを示すログ行。
+pub fn need_reply_ignored_line(request: u32) -> String {
+    format!("venus_jig event=need_reply_ignored request={request}")
+}
+
+/// writable の容量が応答に足りず、応答を書かずに len=0 で返したことを示すログ行。
+pub fn response_dropped_line() -> String {
+    "venus_jig event=response_dropped reason=writable_too_small".to_string()
+}
+
+/// セッションが正常終了（frontend がメッセージ境界で切断）したときのログ行。
+pub fn session_end_line() -> String {
+    "venus_jig event=session_end result=peer_closed".to_string()
+}
+
 /// 照合結果。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CapsetLogReport {

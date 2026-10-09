@@ -1,11 +1,11 @@
 //! `SCM_RIGHTS` による fd の送受信（GPU-6・MVM-4・REPAIR-5・TASK-172 F1.2・#1517）。
 //!
 //! 役割: vhost-user の frontend が UDS の補助データで渡すゲストメモリ領域の fd と eventfd を、上限・切り詰め検出・
-//! close-on-exec・タイムアウトつきで受け取る安全な入口。呼び出し元は後続の F1.4（セッション。#1519）と偽 frontend の
+//! close-on-exec・タイムアウトつきで受け取る安全な入口。呼び出し元は `crate::session`（F1.4。#1519）と偽 frontend の
 //! 結合テスト。syscall は `crate::sys`（unsafe の承認範囲）に閉じる。
 //!
-//! 範囲外（実装済みを装わない。REPAIR-3）: vhost-user の 12 バイトヘッダ単位の読み書き・セッション状態・UDS の bind と
-//! peer credential の検証・eventfd の待機は F1.4（#1519）。ここは「1 回の `recvmsg` / `sendmsg`」までを担当する。
+//! 範囲外（実装済みを装わない。REPAIR-3）: vhost-user の 12 バイトヘッダ単位の読み書き・セッション状態・eventfd の待機は
+//! `crate::session`（F1.4・#1519）が実装済み。UDS の bind と peer credential の検証は未実装（呼び出し側の責務）。ここは「1 回の `recvmsg` / `sendmsg`」までを担当する。
 //!
 //! 入力は frontend 由来の untrusted。fd は検証より前にすべて `OwnedFd` にし、どのエラー経路でも `Drop` で閉じる（fd 漏れ防止）。
 //! タイムアウトは呼び出しごとの期限（単調時計）で管理する。`recvmsg` / `sendmsg` は常に `MSG_DONTWAIT` で呼び、読み書きできない間は

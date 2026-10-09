@@ -105,7 +105,8 @@ unsafe extern "C" {
 /// `crate::lifecycle` の `ChildGuard::kill_and_reap` が、`process_group(0)` で起動した plugin の子の
 /// pid（= pgid）を渡して孫プロセスごと止めるために呼ぶ。シグナルは `SIGKILL` 固定で、番号を
 /// 呼び出し側へ出さない。`pgid` が 2 未満または `i32` に収まらない場合は送信せず `InvalidInput` を返す
-/// （`killpg(0, ..)` は呼び出し側自身のグループ宛て、1 以下は init・未定義の宛先になり得るため fail-closed）。
+/// （`killpg(0, ..)` は呼び出し側自身のグループ宛て、`killpg(1, ..)` は `kill(-1)` 相当の全プロセス宛てになり
+/// 得るため fail-closed）。
 ///
 /// 呼び出し側の不変条件: 送信先は自プロセスが spawn し、まだ wait していない子の pgid に限る
 /// （wait 済みなら pid が再利用され得るため送らない）。グループが空の `ESRCH` もエラーとして返すので、
@@ -116,9 +117,11 @@ pub(crate) fn kill_process_group(pgid: u32) -> io::Result<()> {
     if pgrp < 2 {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
     }
-    // SAFETY: 引数はポインタを含まない整数 2 つでメモリ安全性の前提がない。`pgrp` は 2 以上に検証済みで、
-    // 自プロセスや全プロセス宛てにならない。送信先が未回収の子のグループに限る不変条件は呼び出し側
-    // （`ChildGuard`）が維持する。
+    // SAFETY: 引数はポインタを含まない整数 2 つでメモリ安全性の前提がない。上の 2 以上の検査で、0（呼び出し側
+    // 自身のグループ宛て）と 1（glibc 等で `kill(-1)` 相当の権限の及ぶ全プロセス宛て）を排除する。宛先が
+    // 呼び出し側自身のグループと一致しないこと・未回収の子のグループに限ることは、ここでは検査できない
+    // 呼び出し側の不変条件で、`spawn_registered` の `process_group(0)`（子が自分の pid を pgid にする）と
+    // `Child::id()` だけを渡す `ChildGuard`（回収済み・終端後は送らない）が維持する。
     let rc = unsafe { c_killpg(pgrp, SIGKILL) };
     if rc == 0 {
         Ok(())

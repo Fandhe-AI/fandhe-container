@@ -432,6 +432,43 @@ mod tests {
         assert_eq!(e.code, TransportErrorCode::OutOfBounds);
     }
 
+    /// GPU-6: 同じ memfd の重なる範囲は、先の領域が生きている間 `BACKING_IN_USE` で拒否し、drop 後は map できる。
+    /// fd を複製しても同じ inode として判定する。
+    #[test]
+    fn gpu6_overlapping_backing_range_is_exclusive() {
+        let f = create_memfd(c"jig-gm-lease", 0x3000).expect("memfd");
+        let dup = f.try_clone().expect("dup");
+        let first = GuestMemoryRegion::map(&f, &region(0x1000, 0x2000, 0)).expect("first");
+        // ファイル上 [0x1000, 0x3000) は [0, 0x2000) と 0x1000 バイト重なる。
+        let e = GuestMemoryRegion::map(&dup, &region(0x8000, 0x2000, 0x1000)).expect_err("overlap");
+        assert_eq!(e.code, TransportErrorCode::BackingInUse);
+        assert_eq!(e.code.as_str(), "BACKING_IN_USE");
+        // 重ならない範囲 [0x2000, 0x3000) は受け付ける。
+        let tail = GuestMemoryRegion::map(&dup, &region(0x8000, 0x1000, 0x2000)).expect("disjoint");
+        assert_eq!(tail.mapped_len(), 0x3000);
+        drop(first);
+        let again = GuestMemoryRegion::map(&dup, &region(0x1000, 0x2000, 0)).expect("after drop");
+        assert_eq!(again.mapped_len(), 0x2000);
+    }
+
+    /// GPU-6: 占有の重なり判定（半開区間。接するだけなら重ならない）と、別 inode は干渉しないこと。
+    #[test]
+    fn gpu6_lease_key_overlap_values() {
+        let k = |ino, start, end| LeaseKey {
+            dev: 7,
+            ino,
+            start,
+            end,
+        };
+        assert!(k(1, 0, 0x1000).overlaps(&k(1, 0xfff, 0x2000)));
+        assert!(!k(1, 0, 0x1000).overlaps(&k(1, 0x1000, 0x2000)));
+        assert!(!k(1, 0, 0x1000).overlaps(&k(2, 0, 0x1000)));
+        assert!(!k(1, 0, 0x1000).overlaps(&LeaseKey {
+            dev: 8,
+            ..k(1, 0, 0x1000)
+        }));
+    }
+
     /// GPU-6・REPAIR-4: 境界検査の拒否が観測カウンタに失敗として計上される（増分で照合する）。
     #[test]
     fn gpu6_memory_ops_are_observed() {

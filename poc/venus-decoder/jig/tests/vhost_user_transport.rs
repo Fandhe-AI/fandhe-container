@@ -331,6 +331,47 @@ mod linux {
         r.read_at(0x1fff, &mut b).expect("still readable");
     }
 
+    /// GPU-6: 同じ backing memory を複製した `File` で 2 スレッドから同時に map しても、重なる範囲は 1 領域しか
+    /// 生きられない（もう一方は mmap 前に `BACKING_IN_USE`）。safe API だけで非アトミックなコピーを並行させない。
+    #[test]
+    fn gpu6_two_threads_cannot_map_the_same_backing_range() {
+        let name = unique_name("excl");
+        let f = memfd(&name, 0x2000);
+        let files = [f.try_clone().expect("dup 1"), f.try_clone().expect("dup 2")];
+        let barrier = std::sync::Barrier::new(2);
+        let codes: Vec<Option<&'static str>> = std::thread::scope(|s| {
+            let handles: Vec<_> = files
+                .iter()
+                .enumerate()
+                .map(|(i, file)| {
+                    let barrier = &barrier;
+                    s.spawn(move || {
+                        let gpa = 0x1000_0000 * (u64::try_from(i).expect("index") + 1);
+                        let r = GuestMemoryRegion::map(file, &region(gpa, 0x2000, 0));
+                        // 両方の map が終わるまで成功した領域を生かしておく（先に drop すると両方成功し得る）。
+                        barrier.wait();
+                        r.err().map(|e| e.code.as_str())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("join"))
+                .collect()
+        });
+        let mut sorted = codes.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec![None, Some("BACKING_IN_USE")],
+            "codes={codes:?}"
+        );
+        // 成功した側の drop 後は map も占有も残らない。
+        assert_eq!(count_maps(&name), 0);
+        let r = GuestMemoryRegion::map(&f, &region(0, 0x2000, 0)).expect("after both dropped");
+        assert_eq!(r.mapped_len(), 0x2000);
+    }
+
     /// GPU-6: 合計上限は mmap より前に判定する（3 x 64 GiB は map されず `INVALID_REGION`）。
     #[test]
     fn gpu6_total_limit_is_checked_before_any_mmap() {

@@ -2875,6 +2875,27 @@ pub(crate) fn nofollow_nonblock_open_flags() -> Option<i32> {
     consts::SUPPORTED.then_some(consts::O_NOFOLLOW | consts::O_NONBLOCK)
 }
 
+/// `O_NONBLOCK` 単体（アーキテクチャ別の値）。`/proc/self/fd` 経由の開き直しで FIFO 等に止まらないために使う。
+///
+/// `crate::open_flags` が呼ぶ。対応外アーキテクチャでは `None`（fail-closed）。`unsafe` を含まない。
+pub(crate) fn nonblock_open_flag() -> Option<i32> {
+    consts::SUPPORTED.then_some(consts::O_NONBLOCK)
+}
+
+/// `O_NONBLOCK | O_NOFOLLOW | O_DIRECTORY`。親ディレクトリを 1 要素ずつ symlink 非追従で開くための値。
+///
+/// `crate::open_flags` が呼ぶ。対応外アーキテクチャでは `None`（fail-closed）。`unsafe` を含まない。
+pub(crate) fn directory_nofollow_nonblock_open_flags() -> Option<i32> {
+    consts::SUPPORTED.then_some(consts::O_NONBLOCK | consts::O_NOFOLLOW | consts::O_DIRECTORY)
+}
+
+/// `O_PATH | O_NOFOLLOW`。最終要素を副作用なく固定するための値。
+///
+/// `crate::open_flags` が呼ぶ。対応外アーキテクチャでは `None`（fail-closed）。`unsafe` を含まない。
+pub(crate) fn path_nofollow_open_flags() -> Option<i32> {
+    consts::SUPPORTED.then_some(consts::O_PATH | consts::O_NOFOLLOW)
+}
+
 /// 自プロセスの実効 uid。
 pub(crate) fn effective_uid() -> u32 {
     // SAFETY: 引数なし・常に成功する副作用のない syscall。
@@ -3216,6 +3237,9 @@ mod tests {
         assert_eq!(open_dir_path_flags(), 0o12_600_000);
         // OCI-5・REPAIR-5: 状態ストアの非ブロッキング・symlink 非追従 open（0o400000 | 0o4000）。
         assert_eq!(nofollow_nonblock_open_flags(), Some(0o404_000));
+        assert_eq!(nonblock_open_flag(), Some(0o4_000));
+        assert_eq!(directory_nofollow_nonblock_open_flags(), Some(0o604_000));
+        assert_eq!(path_nofollow_open_flags(), Some(0o10_400_000));
         assert_eq!(
             (EPERM, ENOENT, EACCES, ENOTDIR, EINVAL, ELOOP),
             (1, 2, 13, 20, 22, 40)
@@ -3364,6 +3388,9 @@ mod tests {
         assert_eq!(open_dir_path_flags(), 0o12_140_000);
         // OCI-5・REPAIR-5: 状態ストアの非ブロッキング・symlink 非追従 open（0o100000 | 0o4000）。
         assert_eq!(nofollow_nonblock_open_flags(), Some(0o104_000));
+        assert_eq!(nonblock_open_flag(), Some(0o4_000));
+        assert_eq!(directory_nofollow_nonblock_open_flags(), Some(0o144_000));
+        assert_eq!(path_nofollow_open_flags(), Some(0o10_100_000));
         assert_eq!(
             (EPERM, ENOENT, EACCES, ENOTDIR, EINVAL, ELOOP),
             (1, 2, 13, 20, 22, 40)

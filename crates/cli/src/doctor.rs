@@ -39,6 +39,8 @@ use std::path::{Path, PathBuf};
 use fandhe_container_net::error::{NetError, NetErrorCode};
 use fandhe_container_net::nftables_batch::{ChainInfo, ChainPolicy, NfInetHook};
 
+use crate::json::json_escape;
+
 /// sysctl・`/proc` の読み取り上限（バイト）。想定値は 1 文字なので小さく抑える。
 const MAX_PROC_READ: u64 = 4096;
 
@@ -713,24 +715,6 @@ fn forward_policy_token(s: &ForwardPolicyState) -> String {
     }
 }
 
-/// JSON 文字列リテラルの内側用エスケープ。cli は plugin crate に依存しないため共有せずローカルに持つ
-/// （同種の実装: `crates/plugin/src/lifecycle/resident.rs`）。
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 /// 評価層（`evaluate`）のテスト。実機に依存しない純粋関数のため全 OS で実行される
 /// （Linux 限定の実機プローブテストは後続の `tests` モジュール）。
 #[cfg(test)]
@@ -1043,11 +1027,6 @@ mod eval_tests {
             assert!(d.message.contains(code), "{}", d.message);
             assert_eq!(d.remediation[0].contains("Re-run as a user"), root_hint);
         }
-    }
-
-    #[test]
-    fn net10_json_escape() {
-        assert_eq!(json_escape("a\"b\\c\nd\u{1}"), "a\\\"b\\\\c\\nd\\u0001");
     }
 }
 

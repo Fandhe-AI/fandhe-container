@@ -23,7 +23,7 @@
 //!   置換し、[`CLI_ERROR_MESSAGE_MAX_BYTES`] で打ち切る（行注入・端末制御・表示順の偽装を防ぐ）。
 //!   判定表は core が SSOT で、cli に写しを持たず、core の公開 API `sanitize_display_bounded` を直接呼ぶ。
 //! - 依存を増やさないため JSON は手で組む。キーは `code` → `message` の固定順・固定 2 個で、
-//!   エスケープ関数は本モジュールの 1 か所に限る（`doctor.rs` の同種関数との共通化は後続課題）。
+//!   エスケープは cli 共通の `json` モジュール（private）の 1 か所に置き、`doctor` と共用する。
 
 use std::fmt;
 use std::io::Write;
@@ -34,6 +34,8 @@ use fandhe_container_core::oci_runtime::{
 };
 use fandhe_container_core::sanitize::sanitize_display_bounded;
 use fandhe_container_core::traits::{ErrorCode, TraitError};
+
+use crate::json::json_escape_into;
 
 /// [`CliError`] が保持する `message` の最大バイト数。core の OCI エラーの上限と同値。
 pub const CLI_ERROR_MESSAGE_MAX_BYTES: usize = OCI_ERROR_MESSAGE_MAX_BYTES;
@@ -118,24 +120,6 @@ impl From<&OciRuntimeError> for CliError {
     /// `op` は落として `code` / `message` を引き継ぐ。
     fn from(e: &OciRuntimeError) -> Self {
         Self::new(e.code(), e.message())
-    }
-}
-
-/// JSON 文字列の中身として `s` を `out` へ追記する（`"`・`\`・0x20 未満をエスケープ）。
-fn json_escape_into(out: &mut String, s: &str) {
-    use std::fmt::Write as _;
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
     }
 }
 
@@ -280,12 +264,5 @@ mod tests {
     fn err1_display_format() {
         let e = CliError::new(ErrorCode::NotFound, "missing");
         assert_eq!(e.to_string(), "NOT_FOUND: missing");
-    }
-
-    #[test]
-    fn err1_json_escape_handles_low_control() {
-        let mut s = String::new();
-        json_escape_into(&mut s, "\u{1}\"\\\n");
-        assert_eq!(s, "\\u0001\\\"\\\\\\n");
     }
 }

@@ -204,9 +204,10 @@ impl CliExit {
 
     /// stderr へ失敗の 1 行 JSON（LF 終端）を書く。成功では何も書かない。
     ///
-    /// 行本体と LF を 1 つのバッファにまとめ、1 回の `write_all` で書く（`CliError::write_stderr`・
-    /// `OciRuntimeError::write_json_line`）。`writeln!` は書式の断片ごとに write を分けうるため、
-    /// stderr を共有する他プロセスの出力が行の途中へ入るのを避ける（ERR-1）。
+    /// 行本体と LF を 1 つのバッファにまとめ、`write_all` で全量を書こうとする（`CliError::write_stderr`・
+    /// `OciRuntimeError::write_json_line`）。`writeln!` は書式の断片ごとに write を分けうるための措置で、
+    /// 他プロセスの出力との不可分性は保証しない（部分書き込みでは複数回の write に分かれうる。
+    /// `O_APPEND` の共有ログへの 1 回の write〔`create_start::write_ops_once`〕とは別。ERR-1）。
     pub fn write_stderr(&self, out: &mut dyn Write) -> std::io::Result<()> {
         match self {
             CliExit::Success => Ok(()),
@@ -476,7 +477,7 @@ mod tests {
         }
     }
 
-    /// ERR-1: 固定文言の失敗は行本体と LF を 1 回の write で書く（他の出力が行の途中へ入らない）。
+    /// ERR-1: 固定文言の失敗は行本体と LF がモックの出力先へ 1 回の write で渡ることを確認する（他プロセスとの不可分性の保証ではない）。
     #[test]
     fn err1_write_stderr_emits_fixed_line_in_single_write() {
         struct Counting(Vec<Vec<u8>>);

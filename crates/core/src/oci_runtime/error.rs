@@ -186,7 +186,7 @@ impl OciRuntimeError {
     ///
     /// CLI・plugin 側 `ContainerRuntime` 実装が `stderr` を渡す想定。JSON は `serde_json` で組み、
     /// `message` 内の `"` と `\` をエスケープする。`message` は構築時にサニタイズ・長さ上限済みのため
-    /// 行は有界で LF は行末の 1 個のみ。他の出力との行混在を避けるため 1 回の `write_all` で書く。
+    /// 行は有界で LF は行末の 1 個のみ。行全体を 1 つのバッファにまとめて `write_all` で全量を書こうとする（他プロセスの出力との不可分性は保証しない）。
     /// 書き込みに失敗しても呼び出し元は [`Self::exit_code`] で終了すること（終了コードを書き込みの
     /// 成否に依存させない）。
     pub fn write_json_line(&self, out: &mut dyn Write) -> std::io::Result<()> {

@@ -61,6 +61,7 @@ echo "cli-parity native reclaim: baseline_group_kill_descendant_alive=$base_aliv
 run="$work/run"
 mkdir "$run"
 rc=0
+started=$SECONDS
 STUB_NATIVE_DIR="$run" bash "$root/scripts/cli-parity-check.sh" capture --cli "$helper" --output "$work/cap.txt" --timeout 2 >/dev/null 2>"$work/cap.err" || rc=$?
 [ "$rc" -eq 1 ] || fail "capture rc expected 1 (timeout), got $rc"
 tab=$'\t'
@@ -82,6 +83,10 @@ sleep 3
 t2="$(count_ticks "$run")"
 alive=0
 if [ "$t2" -gt "$t1" ]; then alive=1; fi
+# ヘルパーは起動から約 120 秒で自然終了する。観測がその前に終わっていなければ、回収失敗でも tick が
+# 増えず偽陽性になるため、判定不能として失敗させる（余裕を見て 90 秒を上限にする）。
+elapsed=$((SECONDS - started))
+[ "$elapsed" -le 90 ] || fail "observation finished too late to be conclusive (elapsed=${elapsed}s, helper lifetime 120s)"
 winpid=no
 case "${OSTYPE:-}" in msys* | cygwin*) if [ -r "/proc/$$/winpid" ]; then winpid=yes; fi ;; esac
 echo "cli-parity native reclaim: os=$(uname -s | cut -c1-7) descendant_alive=$alive winpid_available=$winpid"

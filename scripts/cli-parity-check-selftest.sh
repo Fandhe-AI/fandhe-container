@@ -486,9 +486,10 @@ expect_rc "invalid input wins over os precondition (rc 2)" 2 $?
 
 # --- タイムアウト ---
 expect_rc "hanging CLI is rc 1" 1 "$(rc_of hang)"
-# 終了コード欄は強制終了のシグナル（TERM = 143 / KILL = 137）で変わるため、タイムアウトの印だけを照合する。
+# 終了コード欄は強制終了のシグナル（TERM = 143 / KILL = 137。Windows の Bash では 0 になることもある）
+# で変わるため、タイムアウトの印（コード・stdout 欄の <timeout>）だけを照合する。
 case "$(line_of hang A02)" in
-  "A02${tab}A${tab}143${tab}<timeout>${tab}<timeout>" | "A02${tab}A${tab}137${tab}<timeout>${tab}<timeout>")
+  "A02${tab}A${tab}"[0-9]*"${tab}<timeout>${tab}<timeout>")
     pass "A02 recorded as timeout"
     ;;
   *) fail "A02 recorded as timeout (got '$(line_of hang A02)')" ;;

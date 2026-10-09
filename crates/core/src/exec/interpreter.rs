@@ -129,15 +129,21 @@
 //!   SELinux の exec 遷移は、実行した後にどのプロファイル・ドメインで動くかを実行したファイルについて決めるため、
 //!   memfd を実行すると元のファイルについては働かない。IMA の appraisal が `AT_EXECVE_CHECK` で評価されるかは一次情報で
 //!   確かめていない。`sealed_copy.rs` の手順 0（`SealPolicy`）が、`prepare_exec_restrictions` が `setns` の前にホスト側で
-//!   読んだ環境（`/sys/kernel/security/lsm`・`/proc/cmdline`・IMA の policy）から判定し、維持できない（または判定
-//!   できない）なら複製せずに拒否する: パス結び付きの LSM（AppArmor・TOMOYO・Smack・BPF LSM・IPE）が有効なら
-//!   `FailedPrecondition`、IMA は appraisal が有効か無効と判定できないとき `FailedPrecondition`、SELinux が有効なら
-//!   （ドメインを根拠に通さず）`FailedPrecondition`。Landlock は有効でも一律には拒否しない（exec の子は自前の
-//!   ルールセットを必ず適用するため、一律拒否は本番の exec を成立させない。`EXECUTE` は `AT_EXECVE_CHECK` が判定する）。
-//!   **帰結**: AppArmor・SELinux のいずれかを有効にしたホスト（Ubuntu・Fedora の既定等）と Linux 6.14 未満のカーネルでは、
-//!   稼働中コンテナへの exec は封印した複製を使えず拒否される（照合だけの方式 A へは戻さない）。この環境での採否は
-//!   所有者の判断事項。setuid ビット・ファイル capability は `NO_NEW_PRIVS` が適用済みのため元々無効で、複製しても
-//!   緩和にならない
+//!   読んだ環境（`/sys/kernel/security/lsm`・`/proc/cmdline`・IMA の policy）から許可リスト方式で判定し、維持できない
+//!   （または判定できない）なら複製せずに `FailedPrecondition` で拒否する: 安全と分かっている LSM（`capability`・
+//!   `lockdown`・`yama`・`landlock`・`loadpin`・`safesetid`）と、IMA の appraisal が無いと確かめられた場合の IMA 系
+//!   （`ima`・`evm`・`integrity`）以外が有効なら拒否する（AppArmor・TOMOYO・Smack・BPF LSM・IPE・SELinux と未知の名前）。
+//!   Landlock は有効でも一律には拒否しない（exec の子は自前のルールセットを必ず適用するため、一律拒否は本番の exec を
+//!   成立させない。`EXECUTE` は `AT_EXECVE_CHECK` が判定する）。
+//!   **帰結**: 封印した複製を使える（稼働中コンテナへの exec が成立する）のは、(a) Linux 6.14 以上、(b) 有効な LSM が
+//!   上の許可リストに収まる（`apparmor`・`selinux`・`tomoyo`・`smack`・`bpf`・`ipe` や未知の LSM が無い）、(c) IMA 系が
+//!   有効なら `/proc/cmdline` に appraisal の指定が無く、`/sys/kernel/security/ima/policy` を読めて appraise 行が無いと
+//!   確かめられる、をすべて満たすホストだけ。(c) は `CONFIG_IMA_READ_POLICY` なしのカーネル（policy が書き込み専用）
+//!   では満たせない。例えば Ubuntu の既定（LSM が `lockdown,capability,landlock,yama,apparmor,ima,evm`・`CONFIG_IMA=y`・
+//!   `CONFIG_IMA_READ_POLICY` 未設定・`ima/policy` が `--w-------`）では、AppArmor を外しても IMA の判定で常に拒否される
+//!   （独立監査が Linux 7.0 の実機で確認）。Fedora 等の SELinux 既定のホストも拒否される。照合だけの方式 A へは
+//!   戻さない。この環境での採否は所有者の判断事項。setuid ビット・ファイル capability は `NO_NEW_PRIVS` が適用済みの
+//!   ため元々無効で、複製しても緩和にならない
 //! - **B' で `/proc/self/exe` の見え方が変わる**: exec 先の `/proc/self/exe` は `/memfd:fandhe-exec-entrypoint (deleted)`
 //!   を指す（元のパスではなくなる）。シェバンのスクリプトは従来どおり `/dev/fd/N` を渡される
 //! - **検査と実行の間の競合（TOCTOU）は残る**:カーネルは `execve` の中でインタープリタのパスを解決し直す。

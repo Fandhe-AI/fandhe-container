@@ -13,6 +13,8 @@
 //! **本モジュールは記録の経路のみを提供する。** マウント層の違反から `Mount` 監査イベントへの
 //! 写像は [`IsolationViolation::mount_audit_event`]（TASK-41.4・#195）、exec の対象の拒否から `ExecTarget`
 //! 監査イベントへの写像は [`IsolationViolation::exec_audit_event`]（SUP-6・TASK-163 追補・#1465）で実装済み。
+//! エントリポイント検証の拒否（種別 `entrypoint` の 8 理由。launch と exec の子が共有する）から `Entrypoint`
+//! 監査イベントへの写像は [`IsolationViolation::entrypoint_audit_event`]（SEC-4・SUP-6・SEC-1・TASK-163 追補・#1595）。
 //! ファイルへの永続化（TASK-41.5.1・#839）とカーネル監査フォールバック（#840）も `audit_log` に実装済みで、
 //! 本モジュールの記録を実際の sink へ流す本番経路（launcher・CLI への配線）は未実装
 //! （REPAIR-3: 実装済みを装わない）。
@@ -36,6 +38,15 @@
 //!
 //! exec 対象の監査イベントは理由コード（静的トークン）だけを持ち、対象パス（期待 cgroup パス等）も
 //! 載せない（`AuditEvent::ExecTarget` がパスのフィールドを持たない型で保証する。#1465）。
+//! エントリポイントの監査イベントも同様に理由コードだけを持つ（`AuditEvent::Entrypoint`。#1595）。
+//!
+//! # `target_moved`（種別 `mount_target`）の扱い（#1595）
+//!
+//! `target_moved` の発生源は `mount_proc_at_dir`・`exec/inject.rs`・`exec/tmpfs.rs` の 3 箇所で、いずれも
+//! launch 経路の `pivot_root` の前にある。稼働中コンテナへの exec の子（`prepare_exec_child` /
+//! `exec_checked_entrypoint`・インタプリタ検証・封印コピー）では生じず、supervisor の worker の結果行にも
+//! 載らない。そのため exec 側の記録（`Entrypoint` / `ExecTarget`）の対象外で、launch 側では
+//! `exec::audit_mount_violation`（`Mount` イベント）で記録する（本番配線は #1314）。
 
 use std::path::Path;
 
@@ -237,6 +248,36 @@ impl ViolationReason {
         Self::ExecJoinedCgroupMismatch,
         Self::ExecTargetPidfdMismatch,
     ];
+
+    /// 種別 [`ViolationKind::Entrypoint`] の理由の全一覧（エントリポイント検証の拒否。SEC-4・SUP-6・SEC-1）。
+    ///
+    /// supervisor の worker が返す `SetupFailed` の理由コードを許可リストとして引き直すための SSOT（#1595）。
+    pub const ENTRYPOINT_REASONS: [ViolationReason; 8] = [
+        Self::EntrypointIsRuntimeBinary,
+        Self::EntrypointInterpreterIsRuntimeBinary,
+        Self::StdioNullNotNullDevice,
+        Self::ExecDevNotDirectory,
+        Self::ExecProcNotProcfs,
+        Self::EntrypointCopyTooLarge,
+        Self::EntrypointCopySealUnverified,
+        Self::EntrypointOnNoexecMount,
+    ];
+
+    /// エントリポイント検証の理由コード文字列から理由を引き直す（許可リスト照合。未知の文字列は `None`）。
+    ///
+    /// worker の結果行から届いた文字列を、監査レコードへ入る静的トークンへ変換する唯一の入口（#1595）。
+    pub fn from_entrypoint_token(token: &str) -> Option<Self> {
+        Self::ENTRYPOINT_REASONS
+            .into_iter()
+            .find(|r| r.as_str() == token)
+    }
+
+    /// エントリポイント検証の理由なら `Entrypoint` 監査イベントを返す（それ以外は `None`）。パスは持たない。
+    pub fn entrypoint_audit_event(self) -> Option<AuditEvent> {
+        (self.kind() == ViolationKind::Entrypoint).then(|| AuditEvent::Entrypoint {
+            reason: AuditReason::new(self.as_str()),
+        })
+    }
 
     /// exec 対象の理由コード文字列から理由を引き直す（許可リスト照合。未知の文字列は `None`）。
     ///
@@ -698,10 +739,18 @@ impl IsolationViolation {
         self.reason.exec_target_audit_event()
     }
 
+    /// エントリポイント検証の違反（種別 `Entrypoint`）なら `Entrypoint` 監査イベントを返す（SEC-4・SUP-6・#1595）。
+    ///
+    /// 理由コードだけを載せ、`audit_path` は使わない。
+    pub fn entrypoint_audit_event(&self) -> Option<AuditEvent> {
+        self.reason.entrypoint_audit_event()
+    }
+
     /// マウント検証層の違反なら `Mount` 監査イベントを返す（SEC-4・TASK-41.4）。
     ///
     /// 対象は `MountTarget`・`SharedPropagation`・`RootfsPivot`。計画・establish 前提・証跡不一致・
-    /// エントリポイントはマウント層の拒否ではないため `None`。exec の対象の拒否は [`Self::exec_audit_event`]。
+    /// エントリポイントはマウント層の拒否ではないため `None`（エントリポイントは [`Self::entrypoint_audit_event`]、
+    /// exec の対象の拒否は [`Self::exec_audit_event`] が記録する）。
     pub fn mount_audit_event(&self) -> Option<AuditEvent> {
         match self.kind {
             ViolationKind::MountTarget
@@ -1068,6 +1117,122 @@ mod tests {
             })
         );
         assert_eq!(v.mount_audit_event(), None);
+    }
+
+    /// SEC-4・SUP-6・TASK-163 追補・#1595: エントリポイントの 8 理由は許可リスト往復でき、対象外・未知は引けない。
+    #[test]
+    fn sec4_sup6_task163_entrypoint_token_allowlist() {
+        assert_eq!(ViolationReason::ENTRYPOINT_REASONS.len(), 8);
+        for r in ViolationReason::ENTRYPOINT_REASONS {
+            assert_eq!(r.kind(), ViolationKind::Entrypoint);
+            assert_eq!(ViolationReason::from_entrypoint_token(r.as_str()), Some(r));
+        }
+        for t in [
+            "target_moved",
+            "exec_target_cgroup_mismatch",
+            "",
+            "unknown",
+            "entrypoint",
+        ] {
+            assert_eq!(ViolationReason::from_entrypoint_token(t), None, "{t}");
+        }
+        assert_eq!(
+            ViolationReason::ExecTargetCgroupMismatch.entrypoint_audit_event(),
+            None
+        );
+        assert_eq!(ViolationReason::TargetMoved.entrypoint_audit_event(), None);
+    }
+
+    /// SEC-4・SUP-6・TASK-163 追補・#1595: subject 付きでもレコードにパスは載らず、他層の写像は None（二重記録なし）。
+    #[test]
+    fn sec4_sup6_task163_entrypoint_audit_event_has_no_path() {
+        let v = IsolationViolation::new(
+            ViolationReason::EntrypointIsRuntimeBinary,
+            Some(Path::new("/usr/bin/fandhe")),
+        );
+        assert!(v.audit_path().is_some());
+        assert_eq!(
+            v.entrypoint_audit_event(),
+            Some(AuditEvent::Entrypoint {
+                reason: AuditReason::new("entrypoint_is_runtime_binary")
+            })
+        );
+        assert_eq!(v.mount_audit_event(), None);
+        assert_eq!(v.exec_audit_event(), None);
+    }
+
+    /// SEC-4・SUP-6・TASK-163 追補・#1595: 8 理由それぞれで 1 件・層 entrypoint・パス無しで記録し、失敗でも error は不変。
+    #[test]
+    fn sec4_sup6_task163_record_entrypoint_rejection_records_once() {
+        use crate::audit_log::mount::tests::VecSink;
+        use crate::audit_log::{AuditDelivery, AuditLayer};
+        use crate::exec::record_entrypoint_rejection;
+
+        for r in ViolationReason::ENTRYPOINT_REASONS {
+            let sink = VecSink::new(false);
+            let out = record_entrypoint_rejection("rejected", r, &sink);
+            assert_eq!(out.delivery, AuditDelivery::Recorded, "{r:?}");
+            assert_eq!(out.error, "rejected");
+            let recs = sink.snapshot();
+            assert_eq!(recs.len(), 1, "{r:?}");
+            assert_eq!(recs[0].layer(), AuditLayer::Entrypoint);
+            assert_eq!(recs[0].reason().map(AuditReason::as_str), Some(r.as_str()));
+            assert_eq!(recs[0].path(), None);
+            assert_eq!(recs[0].pid().get(), std::process::id());
+
+            let failing = VecSink::new(true);
+            let out = record_entrypoint_rejection("rejected", r, &failing);
+            assert!(
+                matches!(out.delivery, AuditDelivery::SinkFailed(_)),
+                "{r:?}"
+            );
+            assert_eq!(out.error, "rejected");
+        }
+        for r in [
+            ViolationReason::ExecTargetCgroupMismatch,
+            ViolationReason::TargetMoved,
+        ] {
+            let sink = VecSink::new(false);
+            let out = record_entrypoint_rejection("x", r, &sink);
+            assert_eq!(out.delivery, AuditDelivery::NotApplicable);
+            assert_eq!(sink.snapshot().len(), 0);
+        }
+    }
+
+    /// SEC-4・SUP-6・TASK-163 追補・#1595: ExecError 入口は種別 Entrypoint のときだけ 1 件記録する。
+    #[test]
+    fn sec4_sup6_task163_audit_entrypoint_violation_records_once() {
+        use crate::audit_log::mount::tests::VecSink;
+        use crate::audit_log::{AuditDelivery, AuditLayer};
+        use crate::exec::{ExecError, audit_entrypoint_violation};
+
+        let sink = VecSink::new(false);
+        let err = ExecError::from_violation_at(
+            ViolationReason::EntrypointIsRuntimeBinary,
+            None,
+            IsolationStage::Exec,
+        );
+        let r = audit_entrypoint_violation(err, &sink);
+        assert_eq!(r.delivery, AuditDelivery::Recorded);
+        assert_eq!(
+            r.error.violation.as_ref().map(|v| v.reason),
+            Some(ViolationReason::EntrypointIsRuntimeBinary)
+        );
+        let recs = sink.snapshot();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].layer(), AuditLayer::Entrypoint);
+
+        let sys = ExecError::new(ErrorCode::Internal, IsolationStage::Exec, "sys");
+        let r = audit_entrypoint_violation(sys, &sink);
+        assert_eq!(r.delivery, AuditDelivery::NotApplicable);
+        let mount = ExecError::from_violation_at(
+            ViolationReason::PathParentComponent,
+            Some(Path::new("/a/../b")),
+            IsolationStage::PrepareRootfs,
+        );
+        let r = audit_entrypoint_violation(mount, &sink);
+        assert_eq!(r.delivery, AuditDelivery::NotApplicable);
+        assert_eq!(sink.snapshot().len(), 1);
     }
 
     /// SEC-4・TASK-41.4: audit_mount_violation は違反のみ記録し、エラーを変えない。

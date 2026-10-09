@@ -12,7 +12,10 @@
 //!
 //! セッションと ctrl キューの応答ループ（kick / call・used への書き戻し）は `session` に実装済み（F1.4・#1519。Linux 限定）。
 //!
-//! 未実装（実装済みを装わない。REPAIR-3）: UDS の bind と peer credential の検証（呼び出し側の責務。設計書 10.8）、cursorq の処理、
+//! 起動入口（UDS の bind・期限つき accept・ログのファイル出力。F4・#1598）は `launch` と bin `venus-jig` に実装済み（Linux 限定）。
+//!
+//! 未実装（実装済みを装わない。REPAIR-3）: peer credential（`SO_PEERCRED`）の検証（`unsafe` の承認範囲外。ソケットディレクトリを
+//! 自 UID 所有・`0700` に限る代替で割り切り。`launch` の doc と設計書 10.9）、cursorq の処理、
 //! `observe::snapshot_lines` の定期出力（終了時の集計出力は実装済み）と virtqueue 個別の観測カウンタ、上記以外の ctrl 応答（F2 の残り。未対応は `ERR_UNSPEC`）、
 //! 実機での疎通（F3・#725）。
 
@@ -23,6 +26,8 @@
 pub mod adapter;
 pub mod ctrl;
 pub mod device;
+#[cfg(target_os = "linux")]
+pub mod launch;
 pub mod log;
 #[cfg(target_os = "linux")]
 pub mod session;

@@ -1,34 +1,37 @@
 //! 実機前提テスト: 治具 VMM のログに Mesa venus 由来の capset クエリが届いた記録があること（GPU-6・TASK-172.4・#888）。
 //!
-//! 既定のテスト集合から分離している（`#[ignore]`）。必要環境: GPU 付き Linux ホスト・治具 VMM・Mesa venus を載せた
-//! ゲスト。環境変数 `FANDHE_VENUS_JIG_LOG` に治具の出力ログのパスを渡して
+//! 既定のテスト集合から分離している（`#[ignore]`）。必要環境: GPU 付き Linux ホスト・治具の起動 bin `venus-jig`
+//! （`--log` で出力したログ。#1598）・治具に vhost-user で接続する VMM・Mesa venus を載せたゲスト。環境変数
+//! `FANDHE_VENUS_JIG_LOG` に治具の出力ログのパスを渡して
 //! `cargo test --manifest-path poc/venus-decoder/jig/Cargo.toml --test real_machine_capset_log -- --ignored` で実行する。
-//! 現時点ではトランスポート（後続 F1）が未実装のため、実行しても成功するログは得られない。
+//! 実機での疎通は #725（人間担当）。
+//!
+//! 読み取りは `log::read_log_file`（通常ファイル以外を open 前に拒否。事後監査 #1528 D2）を補助スレッドで動かし、
+//! `recv_timeout` で待つ。検査後の差し替えで読み取りが止まってもテストはハングせず失敗する（REPAIR-5）。
 
-use std::fs;
-use std::io::Read;
+use std::path::PathBuf;
+use std::sync::mpsc;
+use std::time::Duration;
 
-use fandhe_container_poc_venus_jig::log::{MAX_LOG_BYTES, find_capset_queries};
+use fandhe_container_poc_venus_jig::log::{find_capset_queries, read_log_file};
+
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[test]
 #[ignore = "GPU-6: requires Linux host with GPU + jig VMM + Mesa venus guest (#725)"]
 fn task172_4_gpu6_guest_capset_query_reached_decoder() {
-    let path = std::env::var("FANDHE_VENUS_JIG_LOG")
-        .expect("FANDHE_VENUS_JIG_LOG must point to the jig VMM log file");
-    // 開いたファイル自体の metadata を検証し、読み取りも上限 + 1 バイトで打ち切る（検査後の増大による メモリ枯渇を防ぐ）。
-    let file = fs::File::open(&path).expect("log file must exist");
-    let meta = file.metadata().expect("log metadata must be readable");
-    assert!(meta.file_type().is_file(), "log must be a regular file");
-    assert!(
-        meta.len() <= MAX_LOG_BYTES as u64,
-        "log exceeds the size limit"
+    let path = PathBuf::from(
+        std::env::var_os("FANDHE_VENUS_JIG_LOG")
+            .expect("FANDHE_VENUS_JIG_LOG must point to the jig VMM log file"),
     );
-    let mut bytes = Vec::new();
-    file.take(MAX_LOG_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .expect("log must be readable");
-    assert!(bytes.len() <= MAX_LOG_BYTES, "log exceeds the size limit");
-    let log = String::from_utf8(bytes).expect("log must be valid UTF-8");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(read_log_file(&path));
+    });
+    let log = rx
+        .recv_timeout(READ_TIMEOUT)
+        .expect("reading the log timed out (is it a FIFO?)")
+        .expect("log must be a readable regular file within the size limit");
     let report = find_capset_queries(&log).expect("log within limits");
     assert!(
         report.venus_get_capset_ok >= 1,

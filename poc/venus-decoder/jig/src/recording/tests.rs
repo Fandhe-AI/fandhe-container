@@ -134,3 +134,12 @@ fn task1602_gpu6_stop_reason_vocabulary_is_fixed() {
     );
     assert_eq!(StopReason::WriterRejected.as_str(), "writer_rejected");
 }
+
+/// 全体長の上限がファイルヘッダ長未満の設定は、提出ゼロでも上限を超えて書くため構築時に拒否する。
+#[test]
+fn task1602_gpu6_limits_new_rejects_total_below_file_header() {
+    let h = FILE_HEADER_LEN as u64;
+    assert!(RecorderLimits::new(1, 1, h - 1).is_none());
+    assert!(RecorderLimits::new(1, 1, 1).is_none());
+    assert!(RecorderLimits::new(1, 1, h).is_some());
+}

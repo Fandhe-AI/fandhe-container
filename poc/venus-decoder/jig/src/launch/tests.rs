@@ -580,3 +580,30 @@ fn task1602_gpu6_record_error_codes_are_fixed_vocabulary() {
         );
     }
 }
+
+/// 記録先の拒否（親が危険・既存パス）では、ソケット親ディレクトリも作らない。
+#[test]
+fn task1602_gpu6_record_rejection_creates_no_socket_parent_dir() {
+    let top = scratch("rnodir");
+    let recdir = top.join("recs");
+    DirBuilder::new().mode(0o700).create(&recdir).unwrap();
+    let existing = recdir.join("r");
+    fs::write(&existing, b"x").unwrap();
+    let sockdir = top.join("sockdir");
+    let (sock, log) = (sockdir.join("s.sock"), top.join("j.log"));
+    let c = cfg_rec(&sock, &log, &existing, &[]).unwrap();
+    assert_eq!(code_of(run(&c)), "RECORD_PATH_EXISTS");
+    assert!(fs::symlink_metadata(&sockdir).is_err(), "no socket dir");
+    assert!(fs::symlink_metadata(&log).is_err(), "no log");
+    // 危険な親でも同様。
+    let mid = top.join("mid");
+    DirBuilder::new().mode(0o700).create(&mid).unwrap();
+    let unsafe_rec = mid.join("recs");
+    DirBuilder::new().mode(0o700).create(&unsafe_rec).unwrap();
+    fs::set_permissions(&mid, fs::Permissions::from_mode(0o777)).unwrap();
+    let c = cfg_rec(&sock, &log, &unsafe_rec.join("r"), &[]).unwrap();
+    assert_eq!(code_of(run(&c)), "RECORD_DIR_UNSAFE");
+    assert!(fs::symlink_metadata(&sockdir).is_err(), "no socket dir");
+    fs::set_permissions(&mid, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::remove_dir_all(&top).unwrap();
+}

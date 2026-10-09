@@ -50,13 +50,14 @@ impl Default for RecorderLimits {
 }
 
 impl RecorderLimits {
-    /// 範囲外（0 または形式の定数超え）は `None`。
+    /// 範囲外（0・形式の定数超え・`max_total_len` がファイルヘッダ長未満）は `None`。
+    /// 提出ゼロでも `finish` はヘッダを書くため、全体長の上限はヘッダ長以上でなければ約束を守れない。
     pub fn new(max_record_len: u32, max_records: u32, max_total_len: u64) -> Option<Self> {
         let ok = max_record_len > 0
             && max_record_len <= MAX_RECORD_PAYLOAD_LEN
             && max_records > 0
             && max_records <= MAX_RECORD_COUNT
-            && max_total_len > 0
+            && max_total_len >= FILE_HEADER_LEN as u64
             && max_total_len <= MAX_RECORDING_LEN;
         ok.then_some(Self {
             max_record_len,

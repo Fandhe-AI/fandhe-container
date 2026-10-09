@@ -18,6 +18,10 @@ pub const MAX_LOG_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_LINE_BYTES: usize = 512;
 /// 行数の上限。
 pub const MAX_LINES: usize = 100_000;
+/// 優先行（[`LogSink::write_priority`]）のために通常行から取り置くバイト数。
+pub const PRIORITY_RESERVE_BYTES: usize = 2048;
+/// 優先行のために通常行から取り置く行数。
+pub const PRIORITY_RESERVE_LINES: usize = 8;
 
 /// ctrl 応答の結果語彙（capset クエリ・display info・ctx 操作で共用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +212,16 @@ pub fn record_stopped_line(reason: StopReason, records: u32) -> String {
     )
 }
 
+/// 打ち切り後も [`LogSink::write_priority`] で書く行か（記録の停止通知・集計・起動エラー）。固定語彙の接頭辞で判定する。
+pub fn is_priority_line(line: &str) -> bool {
+    ["record_stopped", "record_summary", "launch_error"]
+        .iter()
+        .any(|e| {
+            line.strip_prefix("venus_jig event=")
+                .is_some_and(|r| r.starts_with(e))
+        })
+}
+
 /// 終了時の記録の集計行。`write_ok` が偽なら `result=write_failed`（書き出しの失敗を成功と装わない）。
 /// 照合器では `Other` に分類される。
 pub fn record_summary_line(summary: &RecordSummary, write_ok: bool) -> String {
@@ -370,8 +384,8 @@ impl<W: Write> LogSink<W> {
         let need = line.len() + 1;
         let fits = line.len() <= MAX_LINE_BYTES
             && !line.contains(['\n', '\r'])
-            && self.bytes + need + reserve <= MAX_LOG_BYTES
-            && self.lines + 2 <= MAX_LINES;
+            && self.bytes + need + reserve + PRIORITY_RESERVE_BYTES <= MAX_LOG_BYTES
+            && self.lines + 2 + PRIORITY_RESERVE_LINES <= MAX_LINES;
         if fits {
             self.put(line, need);
         } else {
@@ -379,6 +393,20 @@ impl<W: Write> LogSink<W> {
             let t = log_truncated_line();
             let n = t.len() + 1;
             self.put(&t, n);
+        }
+    }
+
+    /// 打ち切り後も届く優先行（記録の停止通知・集計・起動エラー）を書く。通常行が取り置いた領域だけを使い、
+    /// 領域も尽きたとき・不正な行（長すぎる・改行を含む）は捨てる（REPAIR-4）。
+    pub fn write_priority(&mut self, line: &str) {
+        let need = line.len() + 1;
+        let fits = self.error.is_none()
+            && line.len() <= MAX_LINE_BYTES
+            && !line.contains(['\n', '\r'])
+            && self.bytes + need <= MAX_LOG_BYTES
+            && self.lines < MAX_LINES;
+        if fits {
+            self.put(line, need);
         }
     }
 

@@ -409,22 +409,23 @@ pub fn run(config: &Config) -> Result<SessionEnd, LaunchError> {
     check_path_collision(&config.socket, &config.log, config.record.as_deref())?;
     let uid = effective_uid()?;
     check_log_dir(&config.log, uid)?;
-    check_socket_dir(&config.socket, uid)?;
-    if fs::symlink_metadata(&config.socket).is_ok() {
-        return Err(LaunchError::new(LaunchErrorCode::SocketPathExists));
-    }
+    // 記録先の検証は、ソケット親ディレクトリを作る前に済ませる（検証で拒否したら何も作らない）。
     if let Some(r) = &config.record {
         check_record_dir(r, uid)?;
-        // 既存のパスは、ログを作る前に拒否する（検証で拒否したら何も作らない）。open の `create_new` が最終判定。
+        // 既存のパスはログを作る前に拒否する。open の `create_new` が最終判定。
         if fs::symlink_metadata(r).is_ok() {
             return Err(LaunchError::new(LaunchErrorCode::RecordPathExists));
         }
+    }
+    check_socket_dir(&config.socket, uid)?;
+    if fs::symlink_metadata(&config.socket).is_ok() {
+        return Err(LaunchError::new(LaunchErrorCode::SocketPathExists));
     }
     let file = open_log(&config.log)?;
     let mut sink = LogSink::new(file);
     let result = run_logged(config, uid, &mut sink);
     if let Err(e) = &result {
-        sink.write_line(&format!(
+        sink.write_priority(&format!(
             "venus_jig event=launch_error code={}",
             e.code.as_str()
         ));
@@ -456,7 +457,7 @@ fn run_logged(
         Ok(file) => file.sync_all().is_ok(),
         Err(_) => false,
     };
-    sink.write_line(&log::record_summary_line(&summary, write_ok));
+    sink.write_priority(&log::record_summary_line(&summary, write_ok));
     match result {
         Ok(_) if !write_ok => Err(LaunchError::new(LaunchErrorCode::RecordWriteFailed)),
         other => other,
@@ -487,7 +488,13 @@ fn serve(
     let outcome = run_with_submit_hook(
         &stream,
         &config.limits,
-        &mut |l| sink.write_line(l),
+        &mut |l| {
+            if log::is_priority_line(l) {
+                sink.write_priority(l);
+            } else {
+                sink.write_line(l);
+            }
+        },
         &mut |s| recorder.as_mut().and_then(|r| r.on_submit(s)),
     );
     outcome.map_err(|e| LaunchError {

@@ -47,10 +47,23 @@
 //! worker は Landlock で `rmdir` できない）。期待パスは記録の型（`ContainerId`・`CgroupPlacement`）から導き、
 //! 文字列で受ける入口は `exec-test-support` だけ。詳細は `crate::cgroups::exec_kill`。
 //!
+//! # 残った exec 用の子 cgroup の掃除（#1596）
+//!
+//! 呼び出しプロセスが `SIGKILL` された・後始末が上限を超えた・kill に失敗した場合は `exec-*` が残り、残ると
+//! コンテナ cgroup の `rmdir` が `EBUSY` になる。掃除は 2 つの時機で行う（TASK-30.3・OCI-6・SUP-6）。
+//!
+//! - **delete 前**: core の delete（`ContainerCgroupRemover::remove`）が直下の `exec-*` すべてを `cgroup.kill` で
+//!   止めて消す（コンテナは停止済み）
+//! - **exec 開始時**: [`sweep_stale_exec_child_cgroups`] が、自分の子 cgroup を作る **前** に呼ばれ、プロセスの
+//!   居ない `exec-*` だけを消す。`cgroup.kill` は書かない。割り切り: プロセスの居る残骸と、名前の pid の持ち主が
+//!   生きている（または判定できない）ものには触れず、delete 前の掃除に任せる。別の exec の子 cgroup は作成から
+//!   `join_self` までの間は空のため、名前の pid で持ち主の生存を確かめて壊さない。pid の再利用による取りこぼしは
+//!   delete 前に回収され、PID namespace が異なる呼び出し元どうしで判定がずれても、最悪は並行する exec が
+//!   fail-closed で倒れるだけで分離は破れない
+//!
 //! # 未実装（REPAIR-3）
 //!
-//! 残留した `exec-*` の掃除（呼び出しプロセスが `SIGKILL` された場合に残り得る。delete 前・次回 exec 開始時。
-//! TASK-30.3・OCI-6・SUP-6）。user namespace 参加（対象が呼び出し側と別の user namespace にいれば `Pid1Target::open` が拒否する）。
+//! user namespace 参加（対象が呼び出し側と別の user namespace にいれば `Pid1Target::open` が拒否する）。
 //! 制限の再適用は `exec/reapply.rs`（#502・#503）、fork・`close_range`・`execveat` は `exec/exec_command.rs`
 //! （#503）で実装済み。
 
@@ -63,8 +76,8 @@ use std::time::Duration;
 use super::setns::{Pid1Target, cgroup_path_matches, container_cgroup_path_for, ensure_not_exited};
 use super::{ExecError, IsolationStage, ViolationReason};
 use crate::cgroups::{
-    ExecChildCgroupFds, ExecChildRemoval, ExecJoinFds, contains_pid, open_cgroup_by_path,
-    remove_exec_child_cgroup_at,
+    ExecChildCgroupFds, ExecChildRemoval, ExecChildSweep, ExecJoinFds, SweepMode, contains_pid,
+    open_cgroup_by_path, remove_exec_child_cgroup_at, sweep_exec_children_at,
 };
 use crate::traits::types::ErrorCode;
 use crate::traits::{CgroupPlacement, ContainerId};
@@ -299,6 +312,75 @@ pub fn remove_exec_child_cgroup_in(
     timeout: Duration,
 ) -> Result<ExecCgroupRemoval, ExecError> {
     remove_at_path(container_cgroup_path, name, timeout)
+}
+
+/// [`sweep_stale_exec_child_cgroups`] の結果（将来拡張できる構造。既定値は「未実施」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct ExecCgroupSweep {
+    /// 削除した（プロセスの居ない・持ち主の居ない）残骸の数。
+    pub removed: usize,
+    /// プロセスが居る、または削除の直前に参加されて残した数。delete 前の掃除で回収される。
+    pub left_populated: usize,
+    /// 名前の pid の持ち主が生きている、または判定できず残した数。
+    pub left_owner_alive: usize,
+    /// 検証・削除に失敗した数。
+    pub failed: usize,
+    /// 件数の上限で打ち切った（残りは次回以降・delete 前に掃除される）。
+    pub truncated: bool,
+    /// 最初の失敗の `code`。`failed` が 0 でなければ `Some`。
+    pub first_error: Option<ErrorCode>,
+}
+
+impl From<ExecChildSweep> for ExecCgroupSweep {
+    fn from(v: ExecChildSweep) -> Self {
+        Self {
+            removed: v.removed,
+            left_populated: v.left_populated,
+            left_owner_alive: v.left_owner_alive,
+            failed: v.failed,
+            truncated: v.truncated,
+            first_error: v.first_error,
+        }
+    }
+}
+
+/// 記録（`id`・`placement`）から導いたコンテナ cgroup の直下に残った、プロセスの居ない `exec-*` を掃除する。
+///
+/// exec の開始時に、自分の子 cgroup を作る **前** に呼ぶ（契約と割り切りはモジュール doc「残った exec 用の
+/// 子 cgroup の掃除」）。`cgroup.kill` は書かず待機もしない（件数上限で時間を抑える）。コンテナ cgroup が
+/// 無ければ何もせず既定値を返す。期待パスは記録の型から core が導く（SEC-1）。
+pub fn sweep_stale_exec_child_cgroups(
+    id: &ContainerId,
+    placement: &CgroupPlacement,
+) -> Result<ExecCgroupSweep, ExecError> {
+    sweep_at_path(&container_cgroup_path_for(id, placement)?)
+}
+
+/// 実機結合試験専用の入口: コンテナ cgroup の絶対パスを文字列で受ける（`exec-test-support`。
+/// [`sweep_stale_exec_child_cgroups`] と同じ掃除）。
+#[cfg(feature = "exec-test-support")]
+pub fn sweep_stale_exec_child_cgroups_in(
+    container_cgroup_path: &str,
+) -> Result<ExecCgroupSweep, ExecError> {
+    sweep_at_path(container_cgroup_path)
+}
+
+fn sweep_at_path(container_cgroup_path: &str) -> Result<ExecCgroupSweep, ExecError> {
+    let dir = match open_cgroup_by_path(container_cgroup_path) {
+        Ok(dir) => dir,
+        // コンテナ cgroup が無ければ配下に残骸も無い。
+        Err(e) if e.code == ErrorCode::NotFound => return Ok(ExecCgroupSweep::default()),
+        Err(e) => return Err(ExecError::from_cgroup(e)),
+    };
+    // 待機しないモードのため期限は使われない。
+    sweep_exec_children_at(
+        dir.as_fd(),
+        SweepMode::UnpopulatedOnly,
+        std::time::Instant::now(),
+    )
+    .map(ExecCgroupSweep::from)
+    .map_err(ExecError::from_cgroup)
 }
 
 fn remove_at_path(

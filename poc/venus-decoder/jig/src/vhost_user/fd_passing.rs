@@ -18,6 +18,7 @@ use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use super::MAX_MEM_REGIONS;
+use super::observe::{self, Op};
 use super::transport_error::{TransportError, TransportErrorCode};
 use crate::sys::{self, CMSG_HDR_LEN, CmsgBuf};
 
@@ -78,7 +79,11 @@ fn collect_fds(ctrl: &[u8]) -> (Vec<OwnedFd>, bool, bool) {
             malformed = true;
             break;
         };
-        if level == sys::SOL_SOCKET && kind == sys::SCM_RIGHTS {
+        // `SCM_PIDFD` は受信側ソケットが `SO_PASSPIDFD` を有効にしていると、カーネルが pidfd を fd テーブルへ導入する。
+        // 受け取らない種別だが、導入された fd を漏らさないよう `SCM_RIGHTS` と同じく先に所有してから拒否する。
+        let is_fd_carrier =
+            level == sys::SOL_SOCKET && (kind == sys::SCM_RIGHTS || kind == sys::SCM_PIDFD);
+        if is_fd_carrier {
             let (chunks, rest) = data.as_chunks::<4>();
             if !rest.is_empty() {
                 malformed = true;
@@ -90,7 +95,8 @@ fn collect_fds(ctrl: &[u8]) -> (Vec<OwnedFd>, bool, bool) {
                     None => malformed = true,
                 }
             }
-        } else {
+        }
+        if !(level == sys::SOL_SOCKET && kind == sys::SCM_RIGHTS) {
             unexpected = true;
         }
         off = match off.checked_add(sys::cmsg_align(cmsg_len)) {
@@ -111,14 +117,30 @@ fn collect_fds(ctrl: &[u8]) -> (Vec<OwnedFd>, bool, bool) {
 /// 拒否する）→ `SCM_RIGHTS` 以外（`UNEXPECTED_CONTROL`）→ fd 数が `max_fds` 超過（`TOO_MANY_FDS`）→ 0 バイト（`PEER_CLOSED`）。
 /// 拒否したときに受け取っていた fd はすべて閉じられる。
 ///
-/// `max_fds` は `0..=MAX_FDS`、`timeout` は 0 より大きく、`buf` は空でないこと（`INVALID_ARGUMENT`）。
+/// `max_fds` は `0..=MAX_FDS`、`timeout` は 0 より大きく [`MAX_TIMEOUT`] 以下、`buf` は空でないこと（`INVALID_ARGUMENT`）。
 pub fn recv_with_fds(
     sock: &UnixStream,
     buf: &mut [u8],
     max_fds: usize,
     timeout: Duration,
 ) -> Result<Received, TransportError> {
-    recv_impl(sock, buf, max_fds, sys::CMSG_BUF_LEN, timeout)
+    observe::global().observe(Op::RecvFds, || {
+        recv_impl(sock, buf, max_fds, sys::CMSG_BUF_LEN, timeout)
+    })
+}
+
+/// 待ち時間の上限（1 時間）。`SO_RCVTIMEO` / `SO_SNDTIMEO` へ巨大な値を渡すと事実上の無期限待ちになり、
+/// 期限（単調時計の加算）も作れなくなるため、入口で `INVALID_ARGUMENT` として拒否する（REPAIR-5）。
+pub const MAX_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// `timeout` を検証して期限を作る。0・上限超過・期限を構築できない値は `INVALID_ARGUMENT`。
+fn deadline_for(timeout: Duration) -> Result<Instant, TransportError> {
+    if timeout.is_zero() || timeout > MAX_TIMEOUT {
+        return Err(err(TransportErrorCode::InvalidArgument));
+    }
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| err(TransportErrorCode::InvalidArgument))
 }
 
 /// [`recv_with_fds`] の本体。`ctrl_cap` は補助データの受付上限で、切り詰め検出の試験だけが `CMSG_BUF_LEN` 未満を渡す。
@@ -129,10 +151,10 @@ fn recv_impl(
     ctrl_cap: usize,
     timeout: Duration,
 ) -> Result<Received, TransportError> {
-    if max_fds > MAX_FDS || timeout.is_zero() || buf.is_empty() {
+    if max_fds > MAX_FDS || buf.is_empty() {
         return Err(err(TransportErrorCode::InvalidArgument));
     }
-    let deadline = Instant::now().checked_add(timeout);
+    let deadline = deadline_for(timeout)?;
     let mut remaining = timeout;
     let mut ctrl = CmsgBuf::new();
     let raw = loop {
@@ -142,9 +164,7 @@ fn recv_impl(
             Ok(r) => break r,
             Err(sys::SysError::Os(n)) if n == sys::EINTR => {
                 // 単調時計で残り時間を計算し直す。尽きていれば TIMEOUT。
-                remaining = deadline
-                    .map(|d| d.saturating_duration_since(Instant::now()))
-                    .unwrap_or(timeout);
+                remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return Err(err(TransportErrorCode::Timeout));
                 }
@@ -179,34 +199,34 @@ fn recv_impl(
 /// データと fd を 1 回の `sendmsg` で送り、送れたバイト数を返す（部分送信はあり得る）。
 ///
 /// backend から frontend への fd 送信は後送り（BACKEND_REQ・#1057）だが、F1.4 の偽 frontend とテストが使うので公開する。
-/// `fds` は `MAX_FDS` 以下、`data` は空でなく、`timeout` は 0 より大きいこと（`INVALID_ARGUMENT`）。
+/// `fds` は `MAX_FDS` 以下、`data` は空でなく、`timeout` は 0 より大きく [`MAX_TIMEOUT`] 以下であること（`INVALID_ARGUMENT`）。
 pub fn send_with_fds(
     sock: &UnixStream,
     data: &[u8],
     fds: &[BorrowedFd<'_>],
     timeout: Duration,
 ) -> Result<usize, TransportError> {
-    if fds.len() > MAX_FDS || data.is_empty() || timeout.is_zero() {
-        return Err(err(TransportErrorCode::InvalidArgument));
-    }
-    let deadline = Instant::now().checked_add(timeout);
-    let mut remaining = timeout;
-    loop {
-        sock.set_write_timeout(Some(remaining))
-            .map_err(|e| TransportError::from_io(&e))?;
-        match sys::sendmsg_fds(sock.as_fd(), data, fds) {
-            Ok(n) => return Ok(n),
-            Err(sys::SysError::Os(n)) if n == sys::EINTR => {
-                remaining = deadline
-                    .map(|d| d.saturating_duration_since(Instant::now()))
-                    .unwrap_or(timeout);
-                if remaining.is_zero() {
-                    return Err(err(TransportErrorCode::Timeout));
-                }
-            }
-            Err(e) => return Err(TransportError::from_sys(e)),
+    observe::global().observe(Op::SendFds, || {
+        if fds.len() > MAX_FDS || data.is_empty() {
+            return Err(err(TransportErrorCode::InvalidArgument));
         }
-    }
+        let deadline = deadline_for(timeout)?;
+        let mut remaining = timeout;
+        loop {
+            sock.set_write_timeout(Some(remaining))
+                .map_err(|e| TransportError::from_io(&e))?;
+            match sys::sendmsg_fds(sock.as_fd(), data, fds) {
+                Ok(n) => return Ok(n),
+                Err(sys::SysError::Os(n)) if n == sys::EINTR => {
+                    remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(err(TransportErrorCode::Timeout));
+                    }
+                }
+                Err(e) => return Err(TransportError::from_sys(e)),
+            }
+        }
+    })
 }
 
 /// 長さ `len` の memfd（close-on-exec）を作り、縮小を禁じる `F_SEAL_SHRINK` を付ける。テストと F1.4 の偽 frontend が
@@ -264,6 +284,76 @@ mod tests {
         // 送信側の元の fd だけが残る。
         assert_eq!(count(), 1);
         assert!(f.as_raw_fd() >= 0);
+    }
+
+    /// GPU-6・REPAIR-5: 上限超過・巨大な timeout は入口で `INVALID_ARGUMENT`、上限ちょうどは受理される。
+    #[test]
+    fn gpu6_timeout_is_capped_at_entry() {
+        let (a, b) = UnixStream::pair().expect("pair");
+        let mut buf = [0u8; 4];
+        for t in [
+            Duration::MAX,
+            MAX_TIMEOUT + Duration::from_nanos(1),
+            Duration::ZERO,
+        ] {
+            let e = recv_with_fds(&b, &mut buf, 0, t).expect_err("recv");
+            assert_eq!(e.code, TransportErrorCode::InvalidArgument);
+            let e = send_with_fds(&a, b"x", &[], t).expect_err("send");
+            assert_eq!(e.code, TransportErrorCode::InvalidArgument);
+        }
+        // 上限ちょうどは受理され、データが既にあれば即座に返る。
+        assert_eq!(send_with_fds(&a, b"x", &[], MAX_TIMEOUT).expect("send"), 1);
+        let r = recv_with_fds(&b, &mut buf, 0, MAX_TIMEOUT).expect("recv");
+        assert_eq!((r.len, r.fds.len()), (1, 0));
+    }
+
+    /// GPU-6: `SCM_PIDFD` で導入された fd も所有してから拒否し、閉じ忘れない（解析の単体照合）。
+    #[test]
+    fn gpu6_pidfd_control_fd_is_owned_and_closed() {
+        use std::os::fd::IntoRawFd;
+        let f = create_memfd(c"jig-pidfd", 8).expect("memfd");
+        let raw = f.try_clone().expect("clone").into_raw_fd();
+        let mut ctrl = [0u8; 24];
+        ctrl[0..8].copy_from_slice(&20u64.to_ne_bytes());
+        ctrl[8..12].copy_from_slice(&sys::SOL_SOCKET.to_ne_bytes());
+        ctrl[12..16].copy_from_slice(&sys::SCM_PIDFD.to_ne_bytes());
+        ctrl[16..20].copy_from_slice(&raw.to_ne_bytes());
+        let count = || {
+            std::fs::read_dir("/proc/self/fd")
+                .expect("fd dir")
+                .filter_map(|e| e.ok())
+                .filter_map(|e| std::fs::read_link(e.path()).ok())
+                .filter(|l| l.to_string_lossy() == "/memfd:jig-pidfd (deleted)")
+                .count()
+        };
+        // 元の fd と複製の 2 個。
+        assert_eq!(count(), 2);
+        let (fds, malformed, unexpected) = collect_fds(&ctrl);
+        assert_eq!(fds.len(), 1);
+        assert!(!malformed);
+        assert!(unexpected);
+        drop(fds);
+        // 複製が閉じられ、元の fd だけが残る。
+        assert_eq!(count(), 1);
+    }
+
+    /// GPU-6・REPAIR-4: 成功・失敗が全体の観測カウンタに計上される（他テストと並行するため増分で照合する）。
+    #[test]
+    fn gpu6_io_is_observed() {
+        let m = observe::global();
+        let before_send = m.snapshot(Op::SendFds);
+        let before_recv = m.snapshot(Op::RecvFds);
+        let (a, b) = UnixStream::pair().expect("pair");
+        send_with_fds(&a, b"x", &[], Duration::from_secs(5)).expect("send");
+        let mut buf = [0u8; 4];
+        recv_with_fds(&b, &mut buf, 0, Duration::from_secs(5)).expect("recv");
+        recv_with_fds(&b, &mut buf, 0, Duration::ZERO).expect_err("invalid");
+        let (s, r) = (m.snapshot(Op::SendFds), m.snapshot(Op::RecvFds));
+        assert!(s.ok > before_send.ok);
+        assert!(r.ok > before_recv.ok);
+        assert!(r.err > before_recv.err);
+        let i = TransportErrorCode::InvalidArgument as usize;
+        assert!(r.by_code[i] > before_recv.by_code[i]);
     }
 
     /// GPU-6: `cmsg_len` が範囲外の補助データは `MALFORMED_CONTROL` として拒否する（解析の単体照合）。

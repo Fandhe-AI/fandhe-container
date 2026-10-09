@@ -142,6 +142,9 @@ mod consts {
 pub(crate) use consts::{
     EAGAIN, EINTR, EINVAL, F_SEAL_SHRINK, MSG_CTRUNC, MSG_TRUNC, SCM_RIGHTS, SOL_SOCKET,
 };
+/// `SCM_PIDFD`（include/linux/socket.h。アーキ共通の 4）。受信側が `SO_PASSPIDFD` を有効にしているソケットでは、
+/// カーネルが送信元の pidfd をこの種別の補助データとして受信側の fd テーブルへ導入する（受け取った側が閉じる責務を負う）。
+pub(crate) const SCM_PIDFD: i32 = 4;
 use consts::{
     F_ADD_SEALS, F_GET_SEALS, MAP_SHARED, MFD_ALLOW_SEALING, MFD_CLOEXEC, MSG_CMSG_CLOEXEC,
     MSG_NOSIGNAL, NR_FCNTL, NR_MEMFD_CREATE, NR_MMAP, NR_MUNMAP, NR_RECVMSG, NR_SENDMSG, PROT_READ,
@@ -530,6 +533,7 @@ mod tests {
         const { assert!(SUPPORTED) };
         assert_eq!(SOL_SOCKET, 1);
         assert_eq!(SCM_RIGHTS, 1);
+        assert_eq!(SCM_PIDFD, 4);
         assert_eq!(MSG_CTRUNC, 0x8);
         assert_eq!(MSG_TRUNC, 0x20);
         assert_eq!(MSG_NOSIGNAL, 0x4000);

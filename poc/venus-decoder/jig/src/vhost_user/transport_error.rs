@@ -46,6 +46,26 @@ pub enum TransportErrorCode {
 }
 
 impl TransportErrorCode {
+    /// 全 code（添字は `as usize` と一致する。観測カウンタの添字に使う。REPAIR-4）。
+    pub const ALL: [Self; 16] = [
+        Self::TooManyFds,
+        Self::ControlTruncated,
+        Self::DataTruncated,
+        Self::MalformedControl,
+        Self::UnexpectedControl,
+        Self::PeerClosed,
+        Self::Timeout,
+        Self::InvalidArgument,
+        Self::InvalidRegion,
+        Self::FileTooShort,
+        Self::ShrinkNotSealed,
+        Self::OverlappingRegions,
+        Self::FdCountMismatch,
+        Self::OutOfBounds,
+        Self::OsError,
+        Self::Unsupported,
+    ];
+
     /// 外部へ出す固定の code 文字列。
     pub fn as_str(self) -> &'static str {
         match self {

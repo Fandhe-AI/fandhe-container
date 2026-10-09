@@ -36,6 +36,8 @@ pub mod fd_passing;
 #[cfg(target_os = "linux")]
 pub mod guest_memory;
 #[cfg(target_os = "linux")]
+pub mod observe;
+#[cfg(target_os = "linux")]
 mod transport_error;
 
 #[cfg(test)]

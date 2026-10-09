@@ -24,6 +24,7 @@ use std::os::fd::{AsFd, OwnedFd};
 
 use super::MemRegion;
 use super::MemTable;
+use super::observe::{self, Op};
 use super::transport_error::{TransportError, TransportErrorCode};
 use crate::sys::{self, MmapRegion};
 
@@ -136,13 +137,24 @@ impl GuestMemoryRegion {
     }
 
     /// `gpa` から `dst.len()` バイトを `dst` へコピーする。範囲外は `OUT_OF_BOUNDS`（長さ 0 は領域内に限り成功）。
+    /// 結果と所要時間は観測カウンタに計上する（REPAIR-4）。
     pub fn read_at(&self, gpa: u64, dst: &mut [u8]) -> Result<(), TransportError> {
+        observe::global().observe(Op::MemRead, || self.read_raw(gpa, dst))
+    }
+
+    /// `src` を `gpa` へコピーする。範囲外は `OUT_OF_BOUNDS`（長さ 0 は領域内に限り成功）。
+    /// 結果と所要時間は観測カウンタに計上する（REPAIR-4）。
+    pub fn write_at(&self, gpa: u64, src: &[u8]) -> Result<(), TransportError> {
+        observe::global().observe(Op::MemWrite, || self.write_raw(gpa, src))
+    }
+
+    /// 計上なしの読み出し（`GuestMemory` が領域の検索失敗も含めて 1 回として計上するために使う）。
+    fn read_raw(&self, gpa: u64, dst: &mut [u8]) -> Result<(), TransportError> {
         let at = self.locate(gpa, dst.len())?;
         self.map.copy_out(at, dst).map_err(map_sys_oob)
     }
 
-    /// `src` を `gpa` へコピーする。範囲外は `OUT_OF_BOUNDS`（長さ 0 は領域内に限り成功）。
-    pub fn write_at(&self, gpa: u64, src: &[u8]) -> Result<(), TransportError> {
+    fn write_raw(&self, gpa: u64, src: &[u8]) -> Result<(), TransportError> {
         let at = self.locate(gpa, src.len())?;
         self.map.copy_in(at, src).map_err(map_sys_oob)
     }
@@ -211,12 +223,126 @@ impl GuestMemory {
     }
 
     /// `gpa` を含む 1 領域の中に収まるアクセスだけ許す。領域をまたぐと `OUT_OF_BOUNDS`。
+    /// 領域が見つからない失敗も含めて 1 回の操作として観測カウンタに計上する（REPAIR-4）。
     pub fn read_at(&self, gpa: u64, dst: &mut [u8]) -> Result<(), TransportError> {
-        self.find(gpa)?.read_at(gpa, dst)
+        observe::global().observe(Op::MemRead, || self.find(gpa)?.read_raw(gpa, dst))
     }
 
     /// [`Self::read_at`] の書き込み版。
     pub fn write_at(&self, gpa: u64, src: &[u8]) -> Result<(), TransportError> {
-        self.find(gpa)?.write_at(gpa, src)
+        observe::global().observe(Op::MemWrite, || self.find(gpa)?.write_raw(gpa, src))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vhost_user::fd_passing::create_memfd;
+    use std::os::unix::fs::FileExt;
+
+    fn region(gpa: u64, size: u64, off: u64) -> MemRegion {
+        MemRegion {
+            guest_phys_addr: gpa,
+            memory_size: size,
+            userspace_addr: 0x7000_0000,
+            mmap_offset: off,
+        }
+    }
+
+    /// gpa=0x1000・size=0x2000・mmap_offset=0 の領域。
+    fn basic() -> (File, GuestMemoryRegion) {
+        let f = create_memfd(c"jig-gm-basic", 0x2000).expect("memfd");
+        let r = GuestMemoryRegion::map(&f, &region(0x1000, 0x2000, 0)).expect("map");
+        (f, r)
+    }
+
+    /// GPU-6・REPAIR-12: `locate` の境界。領域内の先頭・末尾ちょうどは成功、1 バイト超過は `OUT_OF_BOUNDS`。
+    #[test]
+    fn gpu6_locate_boundaries() {
+        let (_f, r) = basic();
+        assert_eq!(r.locate(0x1000, 0x2000).expect("whole"), 0);
+        assert_eq!(r.locate(0x2fff, 1).expect("last byte"), 0x1fff);
+        for (gpa, len) in [(0x1000, 0x2001), (0x2fff, 2), (0x3000, 1)] {
+            let e = r.locate(gpa, len).expect_err("oob");
+            assert_eq!(e.code, TransportErrorCode::OutOfBounds, "gpa={gpa:#x}");
+        }
+    }
+
+    /// GPU-6・REPAIR-12: `gpa - 領域先頭` の減算 underflow と `off + len` の加算 overflow は `OUT_OF_BOUNDS`（panic しない）。
+    #[test]
+    fn gpu6_locate_arithmetic_overflow_is_rejected() {
+        let (_f, r) = basic();
+        // 領域より前の GPA（減算 underflow）。
+        for gpa in [0, 0xfff] {
+            let e = r.locate(gpa, 1).expect_err("below region");
+            assert_eq!(e.code, TransportErrorCode::OutOfBounds);
+        }
+        // off = 0x10 に usize::MAX を足すと u64 で overflow する。
+        let e = r.locate(0x1010, usize::MAX).expect_err("add overflow");
+        assert_eq!(e.code, TransportErrorCode::OutOfBounds);
+        let mut dst = [0u8; 1];
+        let e = r.read_at(u64::MAX, &mut dst).expect_err("max gpa");
+        assert_eq!(e.code, TransportErrorCode::OutOfBounds);
+    }
+
+    /// GPU-6・REPAIR-12: 長さ 0 は領域末尾ちょうど（gpa+size）まで成功し、それを超えると失敗する。
+    /// 領域単体では末尾の 1 つ先も長さ 0 なら成功、`GuestMemory` は領域に含まれない GPA として拒否する。
+    #[test]
+    fn gpu6_zero_length_at_region_end() {
+        let (_f, r) = basic();
+        assert_eq!(r.locate(0x1000, 0).expect("start"), 0);
+        assert_eq!(r.locate(0x3000, 0).expect("end"), 0x2000);
+        let e = r.locate(0x3001, 0).expect_err("past end");
+        assert_eq!(e.code, TransportErrorCode::OutOfBounds);
+        r.read_at(0x3000, &mut []).expect("empty read at end");
+        r.write_at(0x1000, &[]).expect("empty write at start");
+
+        let f = create_memfd(c"jig-gm-zero", 0x2000).expect("memfd");
+        let table = MemTable::new(&[region(0x1000, 0x2000, 0)]).expect("table");
+        let gm = GuestMemory::from_table(&table, vec![OwnedFd::from(f)]).expect("gm");
+        gm.read_at(0x1000, &mut []).expect("empty read in region");
+        let e = gm
+            .read_at(0x3000, &mut [])
+            .expect_err("end is not in region");
+        assert_eq!(e.code, TransportErrorCode::OutOfBounds);
+    }
+
+    /// GPU-6・REPAIR-12: ページ境界にそろっていない `mmap_offset`（0x123）でも map でき、領域の先頭は
+    /// ファイルの 0x123 バイト目に対応する。`locate` の結果にもオフセットが足される。
+    #[test]
+    fn gpu6_unaligned_mmap_offset() {
+        let f = create_memfd(c"jig-gm-unaligned", 0x123 + 0x100).expect("memfd");
+        let r = GuestMemoryRegion::map(&f, &region(0x4000, 0x100, 0x123)).expect("map");
+        assert_eq!(r.mapped_len(), 0x223);
+        assert_eq!(r.locate(0x4000, 4).expect("head"), 0x123);
+        assert_eq!(r.locate(0x40fc, 4).expect("tail"), 0x123 + 0xfc);
+        r.write_at(0x4000, b"ABCD").expect("write");
+        let mut got = [0u8; 4];
+        f.read_exact_at(&mut got, 0x123).expect("file read");
+        assert_eq!(&got, b"ABCD");
+        let mut back = [0u8; 4];
+        r.read_at(0x4000, &mut back).expect("read");
+        assert_eq!(&back, b"ABCD");
+        // 領域末尾を 1 バイト超えると拒否される（ファイル側の余りではなく領域サイズで判定）。
+        let e = r.write_at(0x40fd, b"ABCD").expect_err("oob");
+        assert_eq!(e.code, TransportErrorCode::OutOfBounds);
+    }
+
+    /// GPU-6・REPAIR-4: 境界検査の拒否が観測カウンタに失敗として計上される（増分で照合する）。
+    #[test]
+    fn gpu6_memory_ops_are_observed() {
+        let (_f, r) = basic();
+        let m = observe::global();
+        let (rd, wr) = (m.snapshot(Op::MemRead), m.snapshot(Op::MemWrite));
+        let mut b = [0u8; 1];
+        r.read_at(0x1000, &mut b).expect("read");
+        r.read_at(0x3000, &mut b).expect_err("oob read");
+        r.write_at(0x1000, &[1]).expect("write");
+        let (rd2, wr2) = (m.snapshot(Op::MemRead), m.snapshot(Op::MemWrite));
+        let oob = TransportErrorCode::OutOfBounds as usize;
+        assert!(rd2.ok > rd.ok);
+        assert!(rd2.err > rd.err);
+        assert!(rd2.by_code[oob] > rd.by_code[oob]);
+        assert!(wr2.ok > wr.ok);
     }
 }

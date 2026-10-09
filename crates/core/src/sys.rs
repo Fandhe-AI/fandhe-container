@@ -28,8 +28,9 @@
 //! さらに `crate::exec` の結合試験用プローブ（CORE-5・TASK-38.4・#179）が、副作用の無い引数に固定した
 //! `ptrace(2)`・`kexec_load(2)`（`syscall(2)` 経由）を呼ぶ。
 //! さらに封印した複製からの実行（TASK-163 追補・#1530・#1531）が、`memfd_create(2)`（`syscall(2)` 経由）と
-//! `fcntl(2)` の `F_ADD_SEALS` / `F_GET_SEALS`、複製の前に元のファイルの実行権限を判定する
-//! `faccessat2(2)`（`syscall(2)` 経由。Linux 5.8 以降）を呼ぶ。実行そのものは既存の `execveat(2)`（`exec_fd`）を使う。
+//! `fcntl(2)` の `F_ADD_SEALS` / `F_GET_SEALS`、複製の前に元のファイルを実行してよいかをカーネルに判定させる
+//! `execveat(2)` の `AT_EXECVE_CHECK`（`syscall(2)` 経由。Linux 6.14 以降）と、元のファイルのマウントの `noexec` を
+//! 見る `fstatfs(2)` を呼ぶ。実行そのものは既存の `execveat(2)`（`exec_fd`）を使う。
 //! 基本デバイスノード作成は、`mknodat(2)`・`O_PATH` での `openat(2)` を呼ぶために使う。
 //! 委譲 cgroup の検出と子 cgroup 作成（`crate::cgroups`。CORE-3・TASK-32.1・#158）は、
 //! `mkdirat(2)`・`unlinkat(2)`・`fstatfs(2)`（cgroup2 判定）と `O_NOFOLLOW` 付きの `openat(2)` を呼ぶために使う。
@@ -178,15 +179,15 @@ mod consts {
     pub const ENOTEMPTY: i32 = 39;
     // include/uapi/linux/magic.h の `CGROUP2_SUPER_MAGIC`（"cgrp"）。
     pub const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
+    // include/linux/statfs.h の `ST_NOEXEC`・`ST_VALID`（`statfs.f_flags`。全アーキテクチャ共通）。
+    pub const ST_NOEXEC: i64 = 0x0008;
+    pub const ST_VALID: i64 = 0x0020;
     // arch/x86/entry/syscalls/syscall_64.tbl の `execveat`。
     pub const SYS_EXECVEAT: i64 = 322;
     // include/uapi/linux/fcntl.h の `AT_EMPTY_PATH`（全アーキテクチャ共通）。
     pub const AT_EMPTY_PATH: i64 = 0x1000;
-    // arch/x86/entry/syscalls/syscall_64.tbl の `faccessat2`（Linux 5.8+）。
-    pub const SYS_FACCESSAT2: i64 = 439;
-    // include/uapi/linux/fcntl.h の `AT_EACCESS`、include/uapi/linux/unistd 系 `X_OK`（全アーキテクチャ共通）。
-    pub const AT_EACCESS: i64 = 0x200;
-    pub const X_OK: i64 = 1;
+    // include/uapi/linux/fcntl.h の `AT_EXECVE_CHECK`（Linux 6.14+。全アーキテクチャ共通）。
+    pub const AT_EXECVE_CHECK: i64 = 0x10000;
     // arch/x86/entry/syscalls/syscall_64.tbl の `memfd_create`。
     pub const SYS_MEMFD_CREATE: i64 = 319;
     // include/uapi/linux/memfd.h の `MFD_CLOEXEC`・`MFD_ALLOW_SEALING`・`MFD_EXEC`（6.3+。全アーキテクチャ共通）。
@@ -398,16 +399,16 @@ mod consts {
     pub const ENOTEMPTY: i32 = 39;
     // include/uapi/linux/magic.h の `CGROUP2_SUPER_MAGIC`（"cgrp"）。
     pub const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
+    // include/linux/statfs.h の `ST_NOEXEC`・`ST_VALID`（`statfs.f_flags`。全アーキテクチャ共通）。
+    pub const ST_NOEXEC: i64 = 0x0008;
+    pub const ST_VALID: i64 = 0x0020;
     // include/uapi/asm-generic/unistd.h の `__NR_execveat`（arm64 は asm-generic の表。
     // x86_64 の 322 を流用しない）。
     pub const SYS_EXECVEAT: i64 = 281;
     // include/uapi/linux/fcntl.h の `AT_EMPTY_PATH`（全アーキテクチャ共通）。
     pub const AT_EMPTY_PATH: i64 = 0x1000;
-    // include/uapi/asm-generic/unistd.h の `__NR_faccessat2`（aarch64 は asm-generic の表。x86_64 の値を流用しない）。
-    pub const SYS_FACCESSAT2: i64 = 439;
-    // include/uapi/linux/fcntl.h の `AT_EACCESS`、`X_OK`（全アーキテクチャ共通）。
-    pub const AT_EACCESS: i64 = 0x200;
-    pub const X_OK: i64 = 1;
+    // include/uapi/linux/fcntl.h の `AT_EXECVE_CHECK`（Linux 6.14+。全アーキテクチャ共通）。
+    pub const AT_EXECVE_CHECK: i64 = 0x10000;
     // include/uapi/asm-generic/unistd.h の `__NR_memfd_create`（aarch64 は asm-generic 表を使う）。
     pub const SYS_MEMFD_CREATE: i64 = 279;
     // include/uapi/linux/memfd.h の `MFD_CLOEXEC`・`MFD_ALLOW_SEALING`・`MFD_EXEC`（6.3+。全アーキテクチャ共通）。
@@ -597,11 +598,11 @@ mod consts {
     pub const EBUSY: i32 = -16;
     pub const ENOTEMPTY: i32 = -17;
     pub const CGROUP2_SUPER_MAGIC: i64 = 0;
+    pub const ST_NOEXEC: i64 = 0;
+    pub const ST_VALID: i64 = 0;
     pub const SYS_EXECVEAT: i64 = 0;
     pub const AT_EMPTY_PATH: i64 = 0;
-    pub const SYS_FACCESSAT2: i64 = 0;
-    pub const AT_EACCESS: i64 = 0;
-    pub const X_OK: i64 = 0;
+    pub const AT_EXECVE_CHECK: i64 = 0;
     pub const SYS_MEMFD_CREATE: i64 = 0;
     pub const MFD_CLOEXEC: u32 = 0;
     pub const MFD_ALLOW_SEALING: u32 = 0;
@@ -765,14 +766,6 @@ unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: `int mknodat(int dirfd, const char *pathname, mode_t mode,
     // dev_t dev)`（glibc / musl の LP64 で `mode_t` は u32・`dev_t` は u64）。
     fn mknodat(dirfd: i32, path: *const core::ffi::c_char, mode: u32, dev: u64) -> i32;
-    // SAFETY（宣言そのものの妥当性）: `ssize_t readlinkat(int dirfd, const char *path, char *buf,
-    // size_t bufsiz)`（LP64 で `ssize_t` は isize・`size_t` は usize。失敗は -1）。
-    fn readlinkat(
-        dirfd: i32,
-        path: *const core::ffi::c_char,
-        buf: *mut core::ffi::c_char,
-        len: usize,
-    ) -> isize;
     // SAFETY（宣言そのものの妥当性）: `uid_t geteuid(void)`（Linux の `uid_t` は u32）。
     fn geteuid() -> u32;
     // SAFETY（宣言そのものの妥当性）: `gid_t getegid(void)`（Linux の `gid_t` は u32）。
@@ -872,22 +865,28 @@ struct PollFd {
     revents: i16,
 }
 
-/// `fstatfs(2)` の出力バッファ（x86_64）。`struct statfs` は先頭が `f_type`（`long`）、全体 120 バイト
-/// （arch/x86/include/uapi/asm/statfs.h → asm-generic/statfs.h の 64 ビット版）。先頭以外は使わない。
+/// `fstatfs(2)` の出力バッファ（x86_64）。`struct statfs` は `f_type`・`f_bsize`・`f_blocks`・`f_bfree`・
+/// `f_bavail`・`f_files`・`f_ffree`・`f_fsid`（`int` × 2）・`f_namelen`・`f_frsize`・`f_flags`・`f_spare[4]` の順で
+/// 全体 120 バイト（arch/x86/include/uapi/asm/statfs.h → asm-generic/statfs.h の 64 ビット版。各語は `long`）。
+/// 使うのは `f_type` と `f_flags`（`f_flags` は先頭から 11 語目 = オフセット 80）だけで、間は名前を付けずに確保する。
 #[cfg(target_arch = "x86_64")]
 #[repr(C)]
 struct StatFs {
     f_type: i64,
-    _rest: [i64; 14],
+    _before_flags: [i64; 9],
+    f_flags: i64,
+    _spare: [i64; 4],
 }
 
 /// `fstatfs(2)` の出力バッファ（aarch64）。レイアウトは asm-generic/statfs.h の 64 ビット版で、
-/// x86_64 と同値だが他 arch の定義を流用せず個別に持つ（先頭 `f_type`、全体 120 バイト）。
+/// x86_64 と同値だが他 arch の定義を流用せず個別に持つ（`f_type` が先頭・`f_flags` がオフセット 80、全体 120 バイト）。
 #[cfg(target_arch = "aarch64")]
 #[repr(C)]
 struct StatFs {
     f_type: i64,
-    _rest: [i64; 14],
+    _before_flags: [i64; 9],
+    f_flags: i64,
+    _spare: [i64; 4],
 }
 
 /// 対応外アーキテクチャ: レイアウト未確認のためラッパーは `Unsupported` を返し、カーネルには渡さない。
@@ -895,6 +894,7 @@ struct StatFs {
 #[repr(C)]
 struct StatFs {
     f_type: i64,
+    f_flags: i64,
 }
 
 /// カーネル監査（NETLINK_AUDIT）用のソケットを開く（`SOCK_RAW|SOCK_CLOEXEC`。TASK-41.5.2・#840）。
@@ -1663,7 +1663,7 @@ impl SealSet {
 /// `EACCES`（`vm.memfd_noexec=2`）・`EPERM`（seccomp）・`ENOSYS` などはそのまま返し、拒否（fail-closed）
 /// は呼び出し側が行う。`name` は固定値を渡す前提で、外部入力を混ぜない（`/` を含めない・249 バイト以下）。
 /// glibc 2.27・musl 1.1.20 の版前提を増やさないよう、`execveat`・`close_range` と同じく `syscall(2)` 経由で呼ぶ。
-pub(crate) fn memfd_create_for_exec_copy(name: &CStr) -> Result<OwnedFd, SysError> {
+pub(crate) fn memfd_create_for_exec_copy(name: &'static CStr) -> Result<OwnedFd, SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
@@ -1710,8 +1710,10 @@ pub(crate) fn get_seals(fd: BorrowedFd<'_>) -> Result<SealSet, SysError> {
     if rc < 0 {
         return Err(last_error());
     }
-    // rc は非負の int なので u32 へ損失なく変換できる。
-    Ok(SealSet(u32::try_from(rc).unwrap_or(0)))
+    // rc は非負の int なので u32 へ損失なく変換できる（できなければ黙って 0 にせず失敗にする）。
+    u32::try_from(rc)
+        .map(SealSet)
+        .map_err(|_| SysError::Os(EINVAL))
 }
 
 /// 封印の検証に失敗した理由（[`seal_for_exec`]）。`SysError` を拡張せず別の列挙にして、既存の
@@ -1723,6 +1725,8 @@ pub(crate) enum SealError {
     /// 追加後の `F_GET_SEALS` が期待（`SealSet::EXEC_COPY` ちょうど）と一致しない。`F_SEAL_EXEC` など
     /// 余分な seal が付いていた場合も含む。
     Unexpected { actual: u32 },
+    /// 読み取り専用で開き直した fd が、封印した memfd と同じ実体（`(st_dev, st_ino)`）を指さない。
+    IdentityMismatch,
 }
 
 /// 封印を検証済みの memfd。作れるのは [`seal_for_exec`] だけで、「封印を確認していない fd を実行する」
@@ -1731,15 +1735,90 @@ pub(crate) enum SealError {
 pub(crate) struct SealedMemfd(OwnedFd);
 
 impl SealedMemfd {
-    /// 封印済み fd を貸す。
+    /// 封印済み fd を貸す（単体テストが封印の性質を直接確かめる用。本番は [`SealedMemfd::reopen_read_only`] だけを使う）。
+    #[cfg(test)]
     pub(crate) fn as_fd(&self) -> BorrowedFd<'_> {
         std::os::fd::AsFd::as_fd(&self.0)
     }
 
-    /// 所有権を取り出す（読み取り専用で開き直した後に元の書き込み用 fd を閉じる等）。
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// 所有権を取り出す（単体テストが封印の性質を直接確かめる用）。
+    #[cfg(test)]
     pub(crate) fn into_owned_fd(self) -> OwnedFd {
         self.0
+    }
+
+    /// 読み取り専用で開き直し（`proc_dir` 配下の `thread-self/fd/N` 経由。[`reopen_pinned_read`]）、開き直した fd の
+    /// `F_GET_SEALS` が 0x0F ちょうどで `(st_dev, st_ino)` が封印した memfd と一致することを確かめて
+    /// [`SealedReadOnlyCopy`] にする（TASK-163 追補・#1531・SEC-1。開き直した fd は 3 以上に置く）。書き込み用の fd（`self`）はここで閉じる
+    /// （`ETXTBSY` と、書き込み可能な fd が exec 先へ残ることを避ける）。開き直しの syscall の失敗は
+    /// `SealError::Sys`、seal の不一致は `Unexpected`、実体の不一致は `IdentityMismatch`。
+    pub(crate) fn reopen_read_only(
+        self,
+        proc_dir: BorrowedFd<'_>,
+    ) -> Result<SealedReadOnlyCopy, SealError> {
+        let writer = std::fs::File::from(self.0);
+        let expected = writer
+            .metadata()
+            .map_err(|e| SealError::Sys(SysError::Os(e.raw_os_error().unwrap_or(EINVAL))))?;
+        let reopened = reopen_pinned_read(proc_dir, std::os::fd::AsFd::as_fd(&writer))
+            .and_then(above_stdio)
+            .map(std::fs::File::from)
+            .map_err(SealError::Sys)?;
+        let actual = get_seals(std::os::fd::AsFd::as_fd(&reopened)).map_err(SealError::Sys)?;
+        if actual != SealSet::EXEC_COPY {
+            return Err(SealError::Unexpected {
+                actual: actual.bits(),
+            });
+        }
+        let meta = reopened
+            .metadata()
+            .map_err(|e| SealError::Sys(SysError::Os(e.raw_os_error().unwrap_or(EINVAL))))?;
+        if !same_inode(&meta, &expected) {
+            return Err(SealError::IdentityMismatch);
+        }
+        drop(writer);
+        Ok(SealedReadOnlyCopy {
+            file: reopened,
+            meta,
+        })
+    }
+}
+
+/// `fd` が 0〜2 なら 3 以上へ複製して元を閉じる（標準 fd が閉じた呼び出し側で、後段の標準入出力の置換に
+/// 潰されないようにする。照合はこの後の fd に対して行う）。
+fn above_stdio(fd: OwnedFd) -> Result<OwnedFd, SysError> {
+    if fd.as_raw_fd() > 2 {
+        return Ok(fd);
+    }
+    dup_fd_at_least(std::os::fd::AsFd::as_fd(&fd), 3)
+}
+
+/// `(st_dev, st_ino)` が一致するか。
+fn same_inode(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    (a.dev(), a.ino()) == (b.dev(), b.ino())
+}
+
+/// 封印した memfd を読み取り専用で開き直し、seal（0x0F ちょうど）と実体（`(st_dev, st_ino)`）を再照合した fd
+/// （TASK-163 追補・#1531・SEC-1）。作れるのは [`SealedMemfd::reopen_read_only`] だけで、「封印を確かめていない
+/// fd を複製として実行する」状態を型の上で表せなくする（REPAIR-2）。exec の子が解析（読み取りの借用）と
+/// `execveat`（`as_fd`）に使い、所有権は外へ出さない。
+#[derive(Debug)]
+pub(crate) struct SealedReadOnlyCopy {
+    file: std::fs::File,
+    meta: std::fs::Metadata,
+}
+
+impl SealedReadOnlyCopy {
+    /// 読み取り用の借用（シェバン・`PT_INTERP` の解析と `pread`）。読み取り専用で開いており、seal 0x0F の下で
+    /// 内容は変えられない。
+    pub(crate) fn file(&self) -> &std::fs::File {
+        &self.file
+    }
+
+    /// 開き直した fd の `fstat`（再照合に使った値）。
+    pub(crate) fn metadata(&self) -> &std::fs::Metadata {
+        &self.meta
     }
 }
 
@@ -1757,71 +1836,36 @@ pub(crate) fn seal_for_exec(fd: OwnedFd) -> Result<SealedMemfd, SealError> {
     Ok(SealedMemfd(fd))
 }
 
-/// 元のファイルを `execveat` できるかを、カーネル自身に判定させる（`faccessat2(proc_dir, "thread-self/fd/N",
-/// X_OK, AT_EACCESS)`。Linux 5.8 以降。封印した複製からの実行〔TASK-163 追補・#1531・SEC-1〕の前提）。
+/// `fd` の実体を実行してよいかを、実行せずにカーネルへ判定させる（`execveat(fd, "", argv, envp,
+/// AT_EMPTY_PATH | AT_EXECVE_CHECK)`。Linux 6.14 以降。封印した複製からの実行〔TASK-163 追補・#1531・SEC-1〕の前提）。
 ///
-/// memfd へ複製して実行すると、元のファイルの実行ビット・マウントの `noexec` はカーネルから見えなくなる
-/// ため、複製の前に元のファイルについて確かめる（緩和にならないようにする）。`proc_dir` は呼び出し側が検証した
-/// procfs のディレクトリ fd で、`thread-self/fd/N`（magic link）は `fd` が指す inode とそのマウントへ解決する
-/// （パスを再解決しない。`AT_EMPTY_PATH` に依存しない）。実行できなければ `EACCES`、`faccessat2` を知らない
-/// カーネルは `ENOSYS`（呼び出し側が拒否する）。`AT_EACCESS` で実効の資格情報を使う（`execve` と同じ）。
-/// LSM の exec 検査〔AppArmor・SELinux・IMA〕は再現しない（`exec/interpreter.rs` の「限界」）。
-pub(crate) fn access_exec_via_proc(
-    proc_dir: BorrowedFd<'_>,
-    fd: BorrowedFd<'_>,
-) -> Result<(), SysError> {
+/// カーネルは `execveat` と同じ経路で `fd` を実行用に開き直し（マウントの `noexec`・`MAY_EXEC`・Landlock の
+/// `EXECUTE`〔継承した domain を含む全層〕）、`security_bprm_creds_for_exec` まで評価したところで戻る（プロセスは
+/// 置き換わらない）。呼び出しスレッドに載った最終的な Landlock・seccomp・LSM の下で呼ぶこと（判定はその時点の
+/// domain で行われる）。許されなければ `EACCES` 等、`AT_EXECVE_CHECK` を知らないカーネル（6.14 未満）は
+/// `EINVAL`（呼び出し側が fail-closed にする）。`argv` は固定の 1 要素（`argc` 0 の警告を避ける）・`envp` は空で、
+/// 判定に外部入力を渡さない。ファイルの形式（ELF・シェバン）と、その先のインタープリタは判定しない。
+pub(crate) fn exec_check_fd(fd: BorrowedFd<'_>) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
-    let mut buf = [0u8; 32];
-    let name = proc_fd_entry(fd.as_raw_fd(), &mut buf).ok_or(SysError::Os(EBADF))?;
-    // SAFETY: `name` は呼び出しの間生存する NUL 終端の借用で、カーネルは読み取るだけ。`proc_dir` は生存中の
-    // `BorrowedFd`。`mode`・`flags` は整数定数（`X_OK`・`AT_EACCESS`）。ファイルの状態は変えない。
+    let argv: [*const core::ffi::c_char; 2] = [c"exec-check".as_ptr(), std::ptr::null()];
+    let envp: [*const core::ffi::c_char; 1] = [std::ptr::null()];
+    // SAFETY: `fd` は生存中の `BorrowedFd`。パス引数は静的な空文字列（NUL 終端）で `AT_EMPTY_PATH` と組で使う。
+    // `argv` / `envp` は末尾が NULL のポインタ配列で、要素は静的な NUL 終端文字列を指し、呼び出しの間生存する。
+    // `AT_EXECVE_CHECK` によりカーネルは判定だけを行って戻り、呼び出しプロセスを置き換えない（未対応カーネルは
+    // フラグを `EINVAL` で拒否し、何も実行しない）。
     let rc = unsafe {
         syscall(
-            consts::SYS_FACCESSAT2,
-            i64::from(proc_dir.as_raw_fd()),
-            name.as_ptr(),
-            consts::X_OK,
-            consts::AT_EACCESS,
+            consts::SYS_EXECVEAT,
+            i64::from(fd.as_raw_fd()),
+            c"".as_ptr(),
+            argv.as_ptr(),
+            envp.as_ptr(),
+            consts::AT_EMPTY_PATH | consts::AT_EXECVE_CHECK,
         )
     };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
-}
-
-/// `fd` が指すファイルの実パス（procfs の `thread-self/fd/N` の magic link の読み取り結果）を返す
-/// （TASK-163 追補・#1531・SEC-1。封印した複製の前に、元のファイルへ Landlock の `EXECUTE` が許可されているかを
-/// パスで判定する材料）。
-///
-/// `proc_dir` は呼び出し側が検証した procfs のディレクトリ fd。リンク先は呼び出しプロセスの root からの
-/// 絶対パスで、削除済みなら末尾に ` (deleted)` が付く（呼び出し側が拒否する）。`buf` に収まらない長さは
-/// 切り詰めを避けるため `EINVAL` で失敗させる。
-pub(crate) fn readlink_fd_via_proc(
-    proc_dir: BorrowedFd<'_>,
-    fd: BorrowedFd<'_>,
-    buf: &mut [u8],
-) -> Result<usize, SysError> {
-    if !consts::SUPPORTED {
-        return Err(SysError::Unsupported);
-    }
-    let mut name_buf = [0u8; 32];
-    let name = proc_fd_entry(fd.as_raw_fd(), &mut name_buf).ok_or(SysError::Os(EBADF))?;
-    // SAFETY: `name` は呼び出しの間生存する NUL 終端の借用でカーネルは読み取るだけ。`buf` は書き込み可能な
-    // 有効領域で、カーネルは `buf.len()` バイトを超えて書かない。`proc_dir` は生存中の `BorrowedFd`。
-    let rc = unsafe {
-        readlinkat(
-            proc_dir.as_raw_fd(),
-            name.as_ptr(),
-            buf.as_mut_ptr().cast::<core::ffi::c_char>(),
-            buf.len(),
-        )
-    };
-    match usize::try_from(rc) {
-        // 満杯は切り詰めの可能性があるため失敗にする。
-        Ok(n) if n < buf.len() => Ok(n),
-        Ok(_) => Err(SysError::Os(EINVAL)),
-        Err(_) => Err(last_error()),
-    }
 }
 
 /// `close_range(first, last, flags)` を呼ぶ（Linux 5.11 以降。glibc 2.34 未満にラッパーが無いため `syscall(2)` 経由）。
@@ -2135,13 +2179,55 @@ pub(crate) fn open_write_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<Owned
 /// `fd` が属するファイルシステムの種別（`statfs.f_type`）を `fstatfs(2)` で返す。cgroup2 の
 /// 検証（`consts::CGROUP2_SUPER_MAGIC` との比較）に使う。O_PATH fd でも使える。
 pub(crate) fn fs_type(fd: BorrowedFd<'_>) -> Result<i64, SysError> {
+    statfs_of(fd).map(|buf| buf.f_type)
+}
+
+/// `fd` が開かれているマウントのフラグ（`statfs.f_flags`。`ST_*`）。生の整数を `sys` の外へ出さない newtype
+/// （REPAIR-2）。封印した複製からの実行（TASK-163 追補・#1531・SEC-1）が、元のファイルのマウントの `noexec` を
+/// 複製の前に確かめるのに使う。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MountFlags(i64);
+
+impl MountFlags {
+    /// 生の `f_flags` から作る（単体テストが境界値を組み立てる用）。
+    #[cfg(test)]
+    pub(crate) const fn from_bits(bits: i64) -> Self {
+        Self(bits)
+    }
+
+    /// カーネルが `f_flags` を埋めたか（`ST_VALID`。Linux 2.6.36 以降は常に立つ）。立っていない値は
+    /// マウントフラグとして信用できない（呼び出し側は判定不能として拒否に倒す）。
+    pub(crate) fn is_valid(self) -> bool {
+        self.0 & consts::ST_VALID != 0
+    }
+
+    /// マウントが `noexec`（`ST_NOEXEC`。`MNT_NOEXEC` 由来）か。
+    pub(crate) fn is_noexec(self) -> bool {
+        self.0 & consts::ST_NOEXEC != 0
+    }
+}
+
+/// `fd` が開かれているマウント（`fd` の `f_path.mnt`）のフラグを `fstatfs(2)` で返す（パスを再解決しない）。
+///
+/// `f_flags` はカーネルが `fd` の vfsmount のフラグ（`MNT_NOEXEC` → `ST_NOEXEC` 等）と superblock のフラグから
+/// 作る値で、`execveat(fd, "", AT_EMPTY_PATH)` が `path_noexec` で見るマウントと同じものを指す。superblock 単位の
+/// `SB_I_NOEXEC`（procfs 等）は含まない（呼び出し側は `exec_check_fd` と併用する）。O_PATH fd でも使える。
+pub(crate) fn mount_flags(fd: BorrowedFd<'_>) -> Result<MountFlags, SysError> {
+    statfs_of(fd).map(|buf| MountFlags(buf.f_flags))
+}
+
+/// `fstatfs(2)` の本体（[`fs_type`]・[`mount_flags`] が共有する）。
+fn statfs_of(fd: BorrowedFd<'_>) -> Result<StatFs, SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
     let mut buf = StatFs {
         f_type: 0,
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        _rest: [0; 14],
+        _before_flags: [0; 9],
+        f_flags: 0,
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        _spare: [0; 4],
     };
     // SAFETY: `buf` は `struct statfs`（120 バイト）と同じレイアウトの書き込み可能な領域で、
     // 呼び出しの間生存する（対応 arch のみ。対応外は上で `Unsupported`）。`fd` は生存中の
@@ -2150,7 +2236,7 @@ pub(crate) fn fs_type(fd: BorrowedFd<'_>) -> Result<i64, SysError> {
     if rc == -1 {
         return Err(last_error());
     }
-    Ok(buf.f_type)
+    Ok(buf)
 }
 
 /// CORE-3: cgroup2 の `statfs.f_type` 定数（`CGROUP2_SUPER_MAGIC`）。
@@ -3075,6 +3161,56 @@ mod tests {
         assert_eq!(std::mem::size_of::<StatFs>(), 120);
     }
 
+    /// SEC-1（TASK-163 追補・#1531）: `statfs.f_flags` の位置と `ST_*` の具体値（include/linux/statfs.h）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sec1_task163_statfs_flags_layout_and_consts_are_exact() {
+        assert_eq!(std::mem::offset_of!(StatFs, f_flags), 80);
+        assert_eq!(std::mem::size_of::<StatFs>(), 120);
+        assert_eq!((consts::ST_NOEXEC, consts::ST_VALID), (0x8, 0x20));
+        let flags = MountFlags::from_bits(0x20 | 0x8);
+        assert!(flags.is_valid() && flags.is_noexec());
+        assert!(!MountFlags::from_bits(0x20).is_noexec());
+        assert!(!MountFlags::from_bits(0x8).is_valid());
+    }
+
+    /// `/proc/self/mountinfo` から、マウントポイント `mount_point` のマウントごとのオプション（6 列目）を返す。
+    fn mount_options_of(mount_point: &str) -> Option<String> {
+        let text = std::fs::read_to_string("/proc/self/mountinfo").expect("read mountinfo");
+        text.lines().rev().find_map(|line| {
+            let mut cols = line.split(' ');
+            let point = cols.nth(4)?;
+            let options = cols.next()?;
+            (point == mount_point).then(|| options.to_owned())
+        })
+    }
+
+    /// SEC-1（TASK-163 追補・#1531）: `mount_flags` が fd のマウントの `noexec` を返す。`/proc`（mountinfo で
+    /// `noexec` と確かめたうえで）は `ST_NOEXEC` 付き、`noexec` でない `/` は付かない。どちらも `ST_VALID` が立つ。
+    /// mountinfo の値と照合するため、前提（`/proc` が `noexec`・`/` が `noexec` でない）が崩れた環境では失敗する
+    /// （skip しない。systemd・コンテナ実行環境の既定はどちらもこの前提を満たす）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sec1_task163_mount_flags_report_noexec_of_the_fd_mount() {
+        let has_noexec = |opts: &str| opts.split(',').any(|o| o == "noexec");
+        let proc_opts = mount_options_of("/proc").expect("/proc is mounted");
+        assert!(has_noexec(&proc_opts), "/proc must be noexec: {proc_opts}");
+        let root_opts = mount_options_of("/").expect("/ is mounted");
+        assert!(!has_noexec(&root_opts), "/ must not be noexec: {root_opts}");
+        let proc_file = std::fs::File::open("/proc/self/status").expect("open status");
+        let proc_flags = mount_flags(proc_file.as_fd()).expect("fstatfs /proc");
+        assert_eq!(
+            (proc_flags.is_valid(), proc_flags.is_noexec()),
+            (true, true)
+        );
+        let root = std::fs::File::open("/").expect("open /");
+        let root_flags = mount_flags(root.as_fd()).expect("fstatfs /");
+        assert_eq!(
+            (root_flags.is_valid(), root_flags.is_noexec()),
+            (true, false)
+        );
+    }
+
     /// CORE-3・TASK-32.1: `/proc` が procfs と判定され、cgroup2 とは区別されること。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
@@ -3509,61 +3645,79 @@ mod tests {
         assert_eq!(consts::F_SEAL_EXEC, 0x20);
     }
 
-    /// SEC-1（TASK-163 追補・#1531）: `faccessat2` の定数の具体値。syscall 番号は arch ごとに個別定義する
-    /// （x86_64 = syscall_64.tbl の 439、aarch64 = asm-generic/unistd.h の 439）。
+    /// SEC-1（TASK-163 追補・#1531）: `AT_EXECVE_CHECK` の具体値（include/uapi/linux/fcntl.h。全アーキテクチャ共通）。
     #[test]
-    fn sec1_task163_faccessat2_consts_are_exact() {
-        #[cfg(target_arch = "x86_64")]
-        assert_eq!(consts::SYS_FACCESSAT2, 439);
-        #[cfg(target_arch = "aarch64")]
-        assert_eq!(consts::SYS_FACCESSAT2, 439);
-        assert_eq!(consts::AT_EACCESS, 0x200);
-        assert_eq!(consts::X_OK, 1);
+    fn sec1_task163_at_execve_check_const_is_exact() {
+        assert_eq!(consts::AT_EXECVE_CHECK, 0x10000);
+        assert_eq!(consts::AT_EMPTY_PATH, 0x1000);
     }
 
-    /// SEC-1（#1531）: 元のファイルの実行権限をカーネルが判定する。0755 は成功、0644 は `EACCES`
-    /// （root で実行しても実行ビットが無ければ拒否される）。`noexec` のマウントは非特権で作れないため
-    /// この試験の範囲外（`exec/interpreter.rs` の「限界」）。
+    /// SEC-1（TASK-163 追補・#1531）: `exec_check_fd` は実行せずにカーネルの判定だけを返す。Linux 6.14 以降
+    /// （`/proc/sys/kernel/osrelease` で判定）では 0755 のスクリプト・`/bin/true` が成功、0644 のファイル・`noexec` の
+    /// `/proc` 上のファイル・ディレクトリが `EACCES`。6.14 未満ではフラグを知らないため、いずれも `EINVAL`
+    /// （呼び出し側が fail-closed にする）。どちらの場合も呼び出しプロセスは置き換わらない（この試験が続行する）。
     #[test]
-    fn sec1_task163_access_exec_checks_the_execute_bit() {
+    fn sec1_task163_exec_check_fd_reports_the_kernel_verdict_without_executing() {
         use std::os::fd::AsFd as _;
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = std::env::temp_dir().join(format!("fandhe-access-exec-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let procfs = std::fs::File::open("/proc").expect("open /proc");
-        let check = |mode: u32| {
+        let tmp = crate::test_support::TestTempDir::new("exec-check").expect("temp dir");
+        let dir = tmp.path().to_path_buf();
+        let file_with_mode = |mode: u32| {
             let path = dir.join(format!("f{mode:o}"));
-            std::fs::write(&path, b"#!/bin/sh\n").expect("write");
+            std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
-            let file = std::fs::File::open(&path).expect("open");
-            access_exec_via_proc(procfs.as_fd(), file.as_fd())
+            std::fs::File::open(&path).expect("open")
         };
-        assert_eq!(check(0o755), Ok(()));
-        assert_eq!(check(0o644), Err(SysError::Os(EACCES)));
-        std::fs::remove_dir_all(&dir).expect("cleanup");
+        let x755 = file_with_mode(0o755);
+        let x644 = file_with_mode(0o644);
+        let true_bin = std::fs::File::open("/bin/true").expect("open /bin/true");
+        let proc_file = std::fs::File::open("/proc/self/status").expect("open status");
+        let directory = std::fs::File::open(&dir).expect("open dir");
+        let got = [
+            exec_check_fd(x755.as_fd()),
+            exec_check_fd(true_bin.as_fd()),
+            exec_check_fd(x644.as_fd()),
+            exec_check_fd(proc_file.as_fd()),
+            exec_check_fd(directory.as_fd()),
+        ];
+        let expected = if crate::test_support::kernel_at_least(6, 14) {
+            [
+                Ok(()),
+                Ok(()),
+                Err(SysError::Os(EACCES)),
+                Err(SysError::Os(EACCES)),
+                Err(SysError::Os(EACCES)),
+            ]
+        } else {
+            [Err(SysError::Os(EINVAL)); 5]
+        };
+        assert_eq!(got, expected);
     }
 
-    /// SEC-1（TASK-163 追補・#1531）: `fd` の実パスを procfs の magic link から読む。短すぎるバッファは
-    /// 切り詰めずに `EINVAL`、`fd` が不正なら失敗する。
+    /// SEC-1（TASK-163 追補・#1531）: 封印した memfd を読み取り専用で開き直すと、seal 0x0F と実体が再照合された
+    /// fd になる（書き込みは拒否され、`(st_dev, st_ino)` は封印した memfd と同じ）。
     #[test]
-    fn sec1_task163_readlink_fd_via_proc_returns_the_real_path() {
+    fn sec1_task163_reopen_read_only_verifies_seals_and_identity() {
+        use std::io::Write as _;
         use std::os::fd::AsFd as _;
-        let dir = std::env::temp_dir().join(format!("fandhe-readlink-fd-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let path = dir.join("target");
-        std::fs::write(&path, b"x").expect("write");
-        let file = std::fs::File::open(&path).expect("open");
+        use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+        let mut writer =
+            std::fs::File::from(memfd_create_for_exec_copy(c"fandhe-reopen-test").expect("memfd"));
+        writer.write_all(b"#!/bin/sh\n").expect("write");
+        let sealed = seal_for_exec(writer.into()).expect("seal");
+        let ino = std::fs::File::from(dup_fd_at_least(sealed.as_fd(), 3).expect("dup"))
+            .metadata()
+            .expect("stat")
+            .ino();
         let procfs = std::fs::File::open("/proc").expect("open /proc");
-        let mut buf = vec![0u8; 4097];
-        let n = readlink_fd_via_proc(procfs.as_fd(), file.as_fd(), &mut buf).expect("readlink");
-        let real = std::fs::canonicalize(&path).expect("canonicalize");
-        assert_eq!(buf.get(..n), Some(real.as_os_str().as_encoded_bytes()));
-        let mut tiny = [0u8; 4];
-        assert_eq!(
-            readlink_fd_via_proc(procfs.as_fd(), file.as_fd(), &mut tiny),
-            Err(SysError::Os(EINVAL))
-        );
-        std::fs::remove_dir_all(&dir).expect("cleanup");
+        let copy = sealed.reopen_read_only(procfs.as_fd()).expect("reopen");
+        assert_eq!(get_seals(copy.file().as_fd()).expect("seals").bits(), 0x0F);
+        assert_eq!(copy.metadata().ino(), ino);
+        assert_eq!(copy.metadata().len(), 10);
+        assert!(copy.file().write_at(b"x", 0).is_err());
+        let mut head = [0u8; 2];
+        assert_eq!(copy.file().read_at(&mut head, 0).expect("read"), 2);
+        assert_eq!(&head, b"#!");
     }
 
     /// SUP-6: 封印に使う seal の完全集合は SEAL | SHRINK | GROW | WRITE の 0x0F（`F_SEAL_EXEC` を含まない）。

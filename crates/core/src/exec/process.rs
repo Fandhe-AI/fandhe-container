@@ -101,7 +101,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::rlimits::{Rlimit, Rlimits};
-use crate::sys::{self, Signal, SysError};
+use crate::sys::{self, SealedReadOnlyCopy, Signal, SysError};
 use crate::traits::types::ErrorCode;
 
 use super::interpreter::reject_runtime_interpreter;
@@ -382,13 +382,13 @@ fn exec_entrypoint_verified(
 /// （`exec_command::spawn_exec_command` の子。参加後の `/` の照合は `reapply_restrictions` が済ませている。
 /// SUP-6・TASK-163.4）が共有する。呼び出し元は「`/` が正しい root であること」を事前に保証すること。
 pub(super) fn exec_checked_entrypoint(entry: &Entrypoint) -> Result<Infallible, ExecError> {
-    let file = prepare_exec_child(entry, None, EntrypointSource::Pinned, None)?;
-    Err(execve_checked(entry, &file))
+    let exe = prepare_exec_child(entry, None, EntrypointSource::Pinned, None)?;
+    Err(execve_checked(entry, &exe))
 }
 
 /// 検査済みの fd を `execveat` する。成功すると戻らず、戻ったら失敗（errno を `Exec` 段のエラーへ写す）。
-fn execve_checked(entry: &Entrypoint, file: &std::fs::File) -> ExecError {
-    let err = do_execve(entry, file);
+fn execve_checked(entry: &Entrypoint, exe: &ExecutableFd) -> ExecError {
+    let err = do_execve(entry, exe);
     ExecError::new(
         exec_errno_to_code(err),
         IsolationStage::Exec,
@@ -396,7 +396,7 @@ fn execve_checked(entry: &Entrypoint, file: &std::fs::File) -> ExecError {
     )
 }
 
-/// [`exec_checked_entrypoint`] の `execveat` より前の全手順。戻り値は検査済みで実行に使う fd。
+/// [`exec_checked_entrypoint`] の `execveat` より前の全手順。戻り値は検査済みで実行に使う fd（[`ExecutableFd`]）。
 ///
 /// 手順を 1 か所に置くことで、本番の子（直後に `execveat`）と、結合試験用の観測
 /// （`observe_exec_child_setup`。`execveat` の代わりに子自身の状態を報告する）が同じ処理を通る。
@@ -411,7 +411,7 @@ fn prepare_exec_child(
     keep: Option<BorrowedFd<'_>>,
     source: EntrypointSource,
     deferred_fsize: Option<Rlimit>,
-) -> Result<std::fs::File, ExecError> {
+) -> Result<ExecutableFd, ExecError> {
     const STAGE: IsolationStage = IsolationStage::Exec;
     // 継承したホスト側の fd 3 以上を開く前に閉じる（rootfs 内の /proc/self/fd/N 経由で実体を開かれない）。
     close_inherited_fds(keep)?;
@@ -438,14 +438,18 @@ fn prepare_exec_child(
         ));
     }
     // 稼働中コンテナへの exec は、照合した本体を封印した複製に置き換える（TASK-163 追補・#1531）。以降の解析・
-    // 照合・実行はすべて複製に対して行い、照合した内容と実行する内容を一致させる。元の fd は（同名で束縛し直した
-    // 後は）この関数を抜けるときに閉じ、実行する子には残らない。
-    let (file, meta) = match source {
-        EntrypointSource::Pinned => (file, meta),
+    // 照合・実行はすべて複製（seal と実体を再照合した `sys::SealedReadOnlyCopy`）に対して行い、照合した内容と
+    // 実行する内容を一致させる。元の fd はこの関数を抜けるときに閉じ、実行する子には残らない。
+    let (exe, meta) = match source {
+        EntrypointSource::Pinned => (ExecutableFd::Pinned(file), meta),
         EntrypointSource::SealedCopy(policy) => {
-            seal_entrypoint_copy(&file, &meta, procfs.as_fd(), entry.path(), &policy)?
+            let copy = seal_entrypoint_copy(&file, &meta, procfs.as_fd(), entry.path(), &policy)?;
+            drop(file);
+            let meta = copy.metadata().clone();
+            (ExecutableFd::Sealed(copy), meta)
         }
     };
+    let file = exe.file();
     // 複製の書き込みが済んだので、持ち越した `RLIMIT_FSIZE` を適用する（複製の前に載せると `RLIMIT_FSIZE` が 0 や
     // バイナリより小さい構成で `SIGXFSZ`・`EFBIG` により起動できない。SUP-12。#1531）。複製の上限と cgroup の
     // メモリ制限は維持される。capability 削減後でも、rlimit を下げる `prlimit` は特権を要さない。
@@ -461,14 +465,14 @@ fn prepare_exec_child(
     }
     // シェバン・`PT_INTERP` の解決先がランタイム自身でないことも確かめる（本体の照合だけでは
     // `#!/proc/self/exe` を通してしまう。#1458。契約と限界は `interpreter.rs`）。
-    reject_runtime_interpreter(&file, entry.path(), runtime, procfs.as_fd())?;
+    reject_runtime_interpreter(file, entry.path(), runtime, procfs.as_fd())?;
     // シェバン付きスクリプトは fd が CLOEXEC だと execveat が ENOENT になるため、その場合だけ
     // mark_fds_cloexec の後に fd を継承させる（読み取り専用の同一ファイルの fd のみが漏れる）。
     let mut magic = [0u8; 2];
     let is_script = matches!(file.read_at(&mut magic, 0), Ok(2)) && &magic == b"#!";
     if is_script {
         // インタープリタは `/dev/fd/N` を開き直すため、新 root 内でそれが同じ実体を指すことを確認する。
-        verify_script_fd_path(Path::new("/dev/fd"), &file, &meta, entry)?;
+        verify_script_fd_path(Path::new("/dev/fd"), file, &meta, entry)?;
     }
 
     mark_fds_cloexec()?;
@@ -479,7 +483,29 @@ fn prepare_exec_child(
     }
     // 最後に標準入出力を置換する（以降の execve 失敗の診断は stderr へ出せず、終了コードのみで通知）。
     redirect_stdio_to_null(root.as_fd(), procfs.as_fd())?;
-    Ok(file)
+    Ok(exe)
+}
+
+/// 検査を終えて `execveat` に渡す fd（[`prepare_exec_child`] の戻り値。TASK-163 追補・#1531）。
+///
+/// 封印した複製は `sys::SealedReadOnlyCopy`（seal 0x0F と実体を再照合した型）のまま持ち、所有権を取り出さない。
+/// 解析・観測には読み取りの借用（[`ExecutableFd::file`]）だけを貸す。
+#[derive(Debug)]
+enum ExecutableFd {
+    /// 照合した元のファイルの fd（launch 経路）。
+    Pinned(std::fs::File),
+    /// 封印した複製（稼働中コンテナへの exec）。
+    Sealed(SealedReadOnlyCopy),
+}
+
+impl ExecutableFd {
+    /// 読み取り用の借用（シェバン・`PT_INTERP` の解析・`execveat`）。
+    fn file(&self) -> &std::fs::File {
+        match self {
+            Self::Pinned(file) => file,
+            Self::Sealed(copy) => copy.file(),
+        }
+    }
 }
 
 /// 実行に使う fd の作り方（[`prepare_exec_child`] の呼び出し側が明示する。TASK-163 追補・#1531）。
@@ -489,7 +515,7 @@ enum EntrypointSource {
     /// 封印した複製の適用は #1314 の後）。
     Pinned,
     /// 照合した本体を封印した memfd に複製し、その複製を解析・照合して `execveat` する。稼働中コンテナへの exec。
-    /// 値は、元のファイルの実行時ポリシー（LSM・Landlock の `EXECUTE`）を複製が迂回しないかの判定材料
+    /// 値は、元のファイルの実行時ポリシー（複製では維持できない LSM・`AT_EXECVE_CHECK` の要否）を複製が迂回しないかの判定材料
     /// （`prepare_exec_restrictions` が `setns` の前に作る。維持できない環境は複製せず拒否する。#1531）。
     SealedCopy(SealPolicy),
 }
@@ -925,13 +951,13 @@ fn io_exec_error(e: &std::io::Error, entry: &Entrypoint) -> ExecError {
 
 /// 開いた fd を `execveat` する。本番ビルドの実装（戻ってきたら失敗の errno）。
 #[cfg(not(test))]
-fn do_execve(entry: &Entrypoint, file: &std::fs::File) -> SysError {
-    sys::exec_fd(file.as_fd(), &entry.argv, &entry.env)
+fn do_execve(entry: &Entrypoint, exe: &ExecutableFd) -> SysError {
+    sys::exec_fd(exe.file().as_fd(), &entry.argv, &entry.env)
 }
 
 /// テストビルドの dry-run 差し込み点。`execveat` を呼ばず、渡された引数を記録して `EINTR`（`Internal` に写る）を返す。
 #[cfg(test)]
-fn do_execve(entry: &Entrypoint, _file: &std::fs::File) -> SysError {
+fn do_execve(entry: &Entrypoint, _exe: &ExecutableFd) -> SysError {
     let show = |v: &[CString]| {
         v.iter()
             .map(|c| c.to_string_lossy().into_owned())
@@ -994,10 +1020,12 @@ const EXEC_STATUS_MAX: usize = 256;
 /// がソース照合で双方向に突き合わせる（SEC-4・SUP-6・SEC-1・CORE-5。TASK-163 追補・#1533）。
 ///
 /// 違反記録の対象外とする子の失敗（状態には `-` を書くか、何も書かずに終わる）と根拠:
-/// - 封印した複製の作成（`sealed_copy.rs`）の、元のファイルの実行権限なし（`EACCES`）・複製中の伸縮による
-///   `PermissionDenied`、`memfd_create`・`faccessat2` の前提不足（`ENOSYS`・`vm.memfd_noexec=2` の `EACCES`・
-///   seccomp の `EPERM`）による `FailedPrecondition`: 実行ビット・`noexec` の通常の拒否、競合、前提不足であり、
-///   分離境界の突破試行とは断定できない
+/// - 封印した複製の作成（`sealed_copy.rs`）の、`AT_EXECVE_CHECK` の拒否（`EACCES`・`EPERM`。実行ビット・Landlock の
+///   `EXECUTE` 等）・通常ファイルでない複製元・複製中の伸縮による `PermissionDenied`、LSM の環境・`AT_EXECVE_CHECK`
+///   未対応（6.14 未満の `EINVAL`）・`fstatfs` の失敗・`memfd_create` の前提不足（`ENOSYS`・`vm.memfd_noexec=2` の
+///   `EACCES`・seccomp の `EPERM`）による `FailedPrecondition`: `execve` が元のファイルで返していた通常の拒否、競合、
+///   前提不足であり、分離境界の突破試行とは断定できない。マウントの `noexec` は複製が迂回し得る境界のため違反
+///   （`entrypoint_on_noexec_mount`）として記録する
 /// - `open_entrypoint` の `PermissionDenied`: 入力の種別不正（通常ファイルでない・継承した標準入出力と同一）や
 ///   開き直しの間の競合による拒否で、分離境界の突破試行とは断定できない
 /// - `FailedPrecondition`（`/dev/null`・`/proc`・`/dev/fd` の不在や準備不足）: 差し替えではなく前提不足
@@ -1008,7 +1036,7 @@ const EXEC_STATUS_MAX: usize = 256;
 /// 照合の限界: 対象は `process.rs`・`interpreter.rs`・`sealed_copy.rs` だけ。`prepare_exec_child` から別ファイルの違反生成
 /// ヘルパを呼ぶようになったら、そのファイルを照合対象に加えること（`rootfs.rs`・`setns.rs` 等は子の経路の外の
 /// 違反を多数作るため `exec/` 全体は走査しない）。
-pub(super) const EXEC_CHILD_VIOLATIONS: [ViolationReason; 7] = [
+pub(super) const EXEC_CHILD_VIOLATIONS: [ViolationReason; 8] = [
     ViolationReason::EntrypointIsRuntimeBinary,
     ViolationReason::EntrypointInterpreterIsRuntimeBinary,
     ViolationReason::StdioNullNotNullDevice,
@@ -1016,6 +1044,7 @@ pub(super) const EXEC_CHILD_VIOLATIONS: [ViolationReason; 7] = [
     ViolationReason::ExecProcNotProcfs,
     ViolationReason::EntrypointCopyTooLarge,
     ViolationReason::EntrypointCopySealUnverified,
+    ViolationReason::EntrypointOnNoexecMount,
 ];
 
 /// 稼働中コンテナへの exec の子の本体（SUP-6・TASK-163.4。launch の `child_main` と同じ規約: 失敗したら stderr に
@@ -1035,7 +1064,7 @@ fn run_exec_child(
     status: &std::fs::File,
     deferred_fsize: Option<Rlimit>,
     seal_policy: SealPolicy,
-    terminal: impl FnOnce(&Entrypoint, &std::fs::File) -> Result<i32, ExecError>,
+    terminal: impl FnOnce(&Entrypoint, &ExecutableFd) -> Result<i32, ExecError>,
 ) -> i32 {
     let result = prepare_exec_child(
         entry,
@@ -1043,9 +1072,9 @@ fn run_exec_child(
         EntrypointSource::SealedCopy(seal_policy),
         deferred_fsize,
     )
-    .and_then(|file| {
+    .and_then(|exe| {
         write_exec_status(status, EXEC_STATUS_READY)?;
-        terminal(entry, &file)
+        terminal(entry, &exe)
     });
     match result {
         Ok(code) => code,
@@ -1096,8 +1125,8 @@ pub(super) fn exec_child_main(
     deferred_fsize: Option<Rlimit>,
     seal_policy: SealPolicy,
 ) -> i32 {
-    run_exec_child(entry, status, deferred_fsize, seal_policy, |entry, file| {
-        Err(execve_checked(entry, file))
+    run_exec_child(entry, status, deferred_fsize, seal_policy, |entry, exe| {
+        Err(execve_checked(entry, exe))
     })
 }
 
@@ -1253,6 +1282,9 @@ pub fn observe_exec_child_setup(
 /// 競合を試験が再現するための入口で、実行する fd（封印した複製）の内容がその書き換えの影響を受けないことを
 /// 報告の `exec_fd` で照合する。本番の `terminal`（`execveat`）には常時のフックを入れず、既存の `terminal`
 /// 引数の仕組みだけで差し込む。`execveat` は呼ばない（制限適用の証跡を迂回する実行経路を作らない）。
+/// 複製の方針は `SealPolicy::unrestricted`（LSM の環境判定なし・`AT_EXECVE_CHECK` は 6.14 以降でだけ行う）で、本番の
+/// `SealPolicy::probe` より弱い（観測専用。`exec-test-support` feature でだけ作れる）。マウントの `noexec` の拒否は
+/// 本番と同じく常に行う。
 /// `after_prepare` は fork した単一スレッドの子で動くため、async-signal-safe でない処理を避ける必要は
 /// ない一方、panic すると子が 125 で終わる（呼び出し側の試験が失敗として検出する）。
 #[cfg(all(feature = "exec-test-support", not(test)))]
@@ -1267,15 +1299,17 @@ pub fn observe_exec_child_setup_with(
     let (status_read, status_write) = exec_status_pipe()?;
     let pid = sys::fork_single_threaded(
         || {
-            // 観測は `execveat` を呼ばず、実環境の LSM（CI の AppArmor 等）で複製の手順が止まらないよう制約なしにする。
+            // 観測は `execveat` を呼ばず、実環境の LSM（CI の AppArmor 等）で複製の手順が止まらないよう LSM の制約なしに
+            // する。`AT_EXECVE_CHECK` は対応カーネル（6.14+）でだけ行い、6.14 未満では省く（`SealPolicy::unrestricted`。
+            // 本番の `SealPolicy::probe` は常に必須で、6.14 未満は拒否する）。`noexec` の判定は省かない。
             run_exec_child(
                 entry,
                 &status_write,
                 None,
                 SealPolicy::unrestricted(),
-                |entry, file| {
+                |entry, exe| {
                     after_prepare();
-                    write_setup_report(entry, report, file).map(|()| 0)
+                    write_setup_report(entry, report, exe.file()).map(|()| 0)
                 },
             )
         },
@@ -2731,6 +2765,10 @@ mod tests {
                 &b"126 entrypoint_copy_seal_unverified\n"[..],
                 ViolationReason::EntrypointCopySealUnverified,
             ),
+            (
+                &b"126 entrypoint_on_noexec_mount\n"[..],
+                ViolationReason::EntrypointOnNoexecMount,
+            ),
         ] {
             assert_eq!(classify_exec_status(line, exit), failed(exit, Some(reason)));
         }
@@ -3337,7 +3375,7 @@ mod tests {
             stale.is_empty(),
             "EXEC_CHILD_VIOLATIONS entries not produced by child-path sources: {stale:?}"
         );
-        assert_eq!(found.len(), 7);
+        assert_eq!(found.len(), 8);
     }
 
     /// 足し忘れ・余剰・除外規則を合成入力で検出できる（上のテストが実際に失敗を報告する根拠。#1533）。

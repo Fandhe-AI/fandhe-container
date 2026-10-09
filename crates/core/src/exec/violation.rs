@@ -184,6 +184,10 @@ pub enum ViolationReason {
     /// （封印の追加・取得の失敗、開き直した fd の seal が 0x0F でない。SUP-6・SEC-1・SEC-4・TASK-163 追補・
     /// #1531）。書き込み可能な複製を実行すると照合と実行の内容がずれるため、実行せず拒否する（fail-closed）。
     EntrypointCopySealUnverified,
+    /// エントリポイントが `noexec` のマウント上にある（`fstatfs` の `ST_NOEXEC`。SUP-6・SEC-1・SEC-4・
+    /// TASK-163 追補・#1531）。封印した複製（memfd）は内部マウント上にあるため、`execveat` が元のファイルの
+    /// マウントで行う `noexec` の拒否が働かない。マウントの `noexec` を複製で迂回させないため、複製せずに拒否する。
+    EntrypointOnNoexecMount,
     /// exec の対象が入れ子の PID namespace の PID 1 でない（`NSpid` が 2 要素・末尾 1 でない。SUP-6）。
     ExecTargetNotNestedPid1,
     /// exec の対象の所属 cgroup が、記録から導いた期待パスと一致しない（pid 再利用・移動。SEC-1）。
@@ -295,6 +299,7 @@ impl ViolationReason {
             Self::ExecProcNotProcfs => "exec_proc_not_procfs",
             Self::EntrypointCopyTooLarge => "entrypoint_copy_too_large",
             Self::EntrypointCopySealUnverified => "entrypoint_copy_seal_unverified",
+            Self::EntrypointOnNoexecMount => "entrypoint_on_noexec_mount",
             Self::ExecTargetNotNestedPid1 => "exec_target_not_nested_pid1",
             Self::ExecTargetCgroupMismatch => "exec_target_cgroup_mismatch",
             Self::ExecTargetSharesPidNamespace => "exec_target_shares_pid_namespace",
@@ -351,7 +356,8 @@ impl ViolationReason {
             | Self::ExecDevNotDirectory
             | Self::ExecProcNotProcfs
             | Self::EntrypointCopyTooLarge
-            | Self::EntrypointCopySealUnverified => ViolationKind::Entrypoint,
+            | Self::EntrypointCopySealUnverified
+            | Self::EntrypointOnNoexecMount => ViolationKind::Entrypoint,
             Self::ExecTargetNotNestedPid1
             | Self::ExecTargetCgroupMismatch
             | Self::ExecTargetSharesPidNamespace
@@ -378,6 +384,7 @@ impl ViolationReason {
             | Self::ExecProcNotProcfs
             | Self::EntrypointCopyTooLarge
             | Self::EntrypointCopySealUnverified
+            | Self::EntrypointOnNoexecMount
             | Self::ExecRootNotContainerRootfs
             | Self::ExecJoinedNamespaceMismatch
             | Self::ExecJoinedPidNamespaceMismatch
@@ -444,7 +451,8 @@ impl ViolationReason {
             Self::EntrypointIsRuntimeBinary
             | Self::StdioNullNotNullDevice
             | Self::EntrypointInterpreterIsRuntimeBinary
-            | Self::EntrypointCopyTooLarge => ErrorCode::PermissionDenied,
+            | Self::EntrypointCopyTooLarge
+            | Self::EntrypointOnNoexecMount => ErrorCode::PermissionDenied,
         }
     }
 
@@ -552,6 +560,9 @@ impl ViolationReason {
             }
             Self::EntrypointCopySealUnverified => {
                 "the seals of the entrypoint copy could not be verified; refusing to exec it"
+            }
+            Self::EntrypointOnNoexecMount => {
+                "the entrypoint is on a noexec mount; refusing to exec it from a sealed copy"
             }
             Self::StdioNullNotNullDevice => {
                 "/dev/null in the new root is not the null device (1:3); refusing to open it"
@@ -850,6 +861,12 @@ mod tests {
                 "entrypoint_copy_seal_unverified",
                 ErrorCode::FailedPrecondition,
                 "the seals of the entrypoint copy could not be verified; refusing to exec it",
+            ),
+            (
+                ViolationReason::EntrypointOnNoexecMount,
+                "entrypoint_on_noexec_mount",
+                ErrorCode::PermissionDenied,
+                "the entrypoint is on a noexec mount; refusing to exec it from a sealed copy",
             ),
         ] {
             assert_eq!(r.as_str(), code);

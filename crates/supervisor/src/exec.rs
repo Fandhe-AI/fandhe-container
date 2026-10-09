@@ -961,7 +961,7 @@ fn exec_target_reason_of(err: &TraitError) -> Option<ViolationReason> {
 }
 
 /// worker が返し得る違反の理由（`execve` 前の手順が返すもの。[`decode_worker_result`] が名前から引き直す）。
-const SETUP_VIOLATIONS: [ViolationReason; 7] = [
+const SETUP_VIOLATIONS: [ViolationReason; 8] = [
     ViolationReason::EntrypointIsRuntimeBinary,
     ViolationReason::EntrypointInterpreterIsRuntimeBinary,
     ViolationReason::StdioNullNotNullDevice,
@@ -969,6 +969,7 @@ const SETUP_VIOLATIONS: [ViolationReason; 7] = [
     ViolationReason::ExecProcNotProcfs,
     ViolationReason::EntrypointCopyTooLarge,
     ViolationReason::EntrypointCopySealUnverified,
+    ViolationReason::EntrypointOnNoexecMount,
 ];
 
 /// [`encode_worker_result`] の逆変換。形式に合わない入力（空・切れた行・未知の種別）は `Internal`（fail-closed）。
@@ -1593,6 +1594,13 @@ mod tests {
                     violation: Some(ViolationReason::EntrypointCopySealUnverified),
                 },
                 "setup entrypoint_copy_seal_unverified exited 126",
+            ),
+            (
+                ExecExit::SetupFailed {
+                    exit: ChildExit::Exited(126),
+                    violation: Some(ViolationReason::EntrypointOnNoexecMount),
+                },
+                "setup entrypoint_on_noexec_mount exited 126",
             ),
             (
                 ExecExit::SetupFailed {

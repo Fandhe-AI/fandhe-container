@@ -32,9 +32,11 @@
 //! **実装済み（稼働中コンテナへの exec のみ。#1531）**: `prepare_exec_child` の `EntrypointSource::SealedCopy`
 //! （`run_exec_child` 経由）が `sealed_copy.rs` の `seal_entrypoint_copy` を呼び、以降の解析・照合・実行を複製に
 //! 対して行う。launch 経路（`EntrypointSource::Pinned`）には掛けない（下記「サイズ上限」の理由。#1314 の後）。
-//! 拒否は違反 `entrypoint_copy_too_large`・`entrypoint_copy_seal_unverified`（SEC-4）で子から親へ届く。
-//! `sys` のラッパー（`memfd_create_for_exec_copy`・`add_seals`・`get_seals`・`seal_for_exec`〔封印を検証した
-//! `SealedMemfd` だけを返す〕）は #1530、元のファイルの実行権限の照合（`access_exec_via_proc`）は #1531 で足した。
+//! 拒否は違反 `entrypoint_copy_too_large`・`entrypoint_copy_seal_unverified`・`entrypoint_on_noexec_mount`（SEC-4）で
+//! 子から親へ届く。`sys` のラッパー（`memfd_create_for_exec_copy`・`add_seals`・`get_seals`・`seal_for_exec`〔封印を
+//! 検証した `SealedMemfd` だけを返す〕）は #1530、元のファイルを実行してよいかのカーネルへの問い合わせ
+//! （`exec_check_fd` = `AT_EXECVE_CHECK`）・マウントの `noexec` の判定（`mount_flags`）・開き直した fd の再照合
+//! （`SealedMemfd::reopen_read_only` → `SealedReadOnlyCopy`）は #1531 で足した。
 //! 実行は既存の `sys::exec_fd`（`execveat(AT_EMPTY_PATH)`）を使い、重複させない。
 //!
 //! - **複製する対象**: エントリポイント本体（ELF・スクリプトとも）だけ。照合に使ったのと同じ開いた fd から複製する。
@@ -46,11 +48,13 @@
 //!     `argv[0]` の意味を変えてコンテナのプログラムから見える挙動を壊すため採らない
 //!   - `binfmt_misc` は従来どおり対象外（`F` フラグ付きの登録を除き、カーネルは登録されたインタープリタをパスで開く）
 //! - **手順の順序（#1531 で実装）**: (1) 本体を fd で開き `(st_dev, st_ino)` をランタイムと照合する（複製は別の
-//!   inode になるため、この照合だけは元のファイルに対して行う）→ (1') 元のファイルの実行権限をカーネルに判定させる
-//!   （`faccessat2(X_OK, AT_EACCESS)`。実行ビット・`noexec`。memfd へ複製すると元のファイルの実行権限は効かなく
-//!   なり、0644 や `noexec` 上のファイルを実行できてしまう緩和になるため、複製の前に確かめる）→ (2) `fstat` の `st_size` が上限以下であることを
+//!   inode になるため、この照合だけは元のファイルに対して行う）→ (1') 元のファイルのマウントが `noexec` でないことを
+//!   `fstatfs` で確かめ、実行してよいかをカーネルに判定させる（`AT_EXECVE_CHECK`。実行ビット・`noexec`・Landlock の
+//!   `EXECUTE`。memfd へ複製すると元のファイルに対するこれらの検査は効かなくなり、0644 や `noexec` 上のファイル、
+//!   Landlock が実行を許さないファイルを実行できてしまう緩和になるため、複製の前に確かめる。順序と根拠は
+//!   `sealed_copy.rs` の「全体の順序」）→ (2) `fstat` の `st_size` が上限以下であることを
 //!   確かめて複製する → (3) 封印する → (4) `F_GET_SEALS` が 0x0F とちょうど一致することを確かめる（`SealedMemfd`
-//!   の生成条件）→ (5) シェバン・`PT_INTERP` の解析（[`reject_runtime_interpreter`] の先頭の読み取り）は
+//!   の生成条件。読み取り専用で開き直した fd でも 0x0F と `(st_dev, st_ino)` を再照合する `SealedReadOnlyCopy`）→ (5) シェバン・`PT_INTERP` の解析（[`reject_runtime_interpreter`] の先頭の読み取り）は
 //!   **封印した複製に対して** 行う（照合用と実行用で読み取りが 2 回あると、その間の書き換えで食い違う）→ (6) スクリプト
 //!   なら `/dev/fd/N` の検証を複製の metadata と比べる → (7) `execveat`
 //! - **fd と close-on-exec**: `MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_EXEC` で作る（`MFD_ALLOW_SEALING` が無いと
@@ -71,17 +75,19 @@
 //!   1 回だけ再試行する（6.3 未満の memfd は実行できる）。`vm.memfd_noexec=2` の下では `MFD_EXEC` が `EACCES`、
 //!   コンテナの seccomp が `memfd_create` を禁止していれば `EPERM` などになり、いずれも拒否する（`memfd_create`・
 //!   `fcntl` は deny-list に含めない契約を `seccomp` のテストで機械照合している）
-//! - **Landlock との関係（#1531 で実プロセスの確認。ソースでの照合は未実施）**: exec の子は `EXECUTE` を扱う Landlock
-//!   ruleset の下で memfd を `execveat` する。memfd はカーネル内部の shmem マウント上にありルールの対象パスが無い。
-//!   Linux 7.0 の検証環境で、`EXECUTE` を扱う ruleset を `/usr`・`/bin`・`/lib*` にだけ許可して適用した後に、
-//!   ルール外の memfd（封印・読み取り専用で開き直したもの）を `execveat(AT_EMPTY_PATH)` すると実行できた
-//!   （動的リンクの ELF なので、`PT_INTERP` の解決先は許可したルール内）。ルールを 1 つも許可しない場合は
-//!   `EACCES`（この拒否は memfd ではなく `PT_INTERP` の側の可能性があり、memfd 自体の判定とは切り分けていない）。
-//!   この確認はカーネル版に依存し得るため、本番相当の通し（root・Landlock ABI 6+ を要する supervisor の
-//!   `tests/exec.rs`）での実行確認は実機の記録に委ねる。`landlock/rules.rs` の `mount_rights` は `noexec` の
-//!   マウントから `EXECUTE` を外すが、Landlock は memfd の側を検査するため、複製を通る実行には効かない
-//!   （(1') の `faccessat2` が元のファイルの `noexec` を、`SealPolicy` の Landlock 判定が元のファイルの `EXECUTE`
-//!   許可を担う。下記「限界」）
+//! - **Landlock との関係（確認: 迂回にならないこと。#1531）**: memfd はカーネル内部の shmem マウント上にあり、Landlock の
+//!   ルールの対象パスを持たないため、`EXECUTE` を扱う ruleset の下でも memfd 自体の `execveat` は拒否されない
+//!   （Linux 7.0 の検証環境で、`EXECUTE` を `/usr`・`/bin`・`/lib*` にだけ許可した ruleset の下で、ルール外の memfd を
+//!   実行できることを実プロセスで確かめた。`security/landlock/fs.c` での一次照合は未実施）。そのままでは、元のファイルに
+//!   `EXECUTE` が許されていなくても複製を通して実行できてしまう。これを、複製の **前** に元のファイルの fd へ
+//!   `AT_EXECVE_CHECK` を掛けて塞ぐ: 判定は exec の子に載った最終的な domain（呼び出し側から継承した層と自前の層の
+//!   すべて）で、`execveat` と同じ inode 単位の規則のまま行われるため、元のファイルを直接 `execveat` した場合に
+//!   拒否されるものは複製の前に `PermissionDenied` で拒否される（`sealed_copy.rs` の手順 2）。`landlock/rules.rs` の
+//!   `mount_rights` が `noexec` のマウントから外す `EXECUTE` は、祖先（`/`）の許可に覆われて Landlock では効かない
+//!   （`ShadowedRestriction`。VFS の `noexec` が守る前提）が、その `noexec` は `fstatfs` の `ST_NOEXEC`（手順 1。違反
+//!   `entrypoint_on_noexec_mount`）と `AT_EXECVE_CHECK` の両方で元のファイルについて判定する。Linux 6.14 未満では
+//!   `AT_EXECVE_CHECK` が無いため、複製せずに拒否する（fail-closed）。本番相当の通し（root・Landlock ABI 6+ を要する
+//!   supervisor の `tests/exec.rs`）での実行確認は実機の記録に委ねる
 //! - **`ETXTBSY`**: 本リポの検証環境（Linux 7.0）では、封印した memfd を読み取り専用で開き直して書き込み用 fd を閉じれば、
 //!   実行できることを `sys` のテスト（`sup6_task163_sealed_memfd_is_executable_after_readonly_reopen`）で確認した。
 //!   カーネルの版による `deny_write_access` の挙動差（6.11 前後の変更）は一次情報では未確認で、書き込み用 fd を
@@ -117,21 +123,21 @@
 //!   をランタイムの照合に通すため、書き換えた内容はシェバン・`PT_INTERP` の照合に掛かる）。B' でもインタープリタの
 //!   パスの差し替えとインタープリタ自身の内容の書き換えは閉じず、引き続き Landlock に頼る。launch 経路への適用は
 //!   #1314（本番 launcher の構成）の後になる
-//! - **B' は元のファイルに結び付いた exec 時検査を再現しない（維持できない環境は拒否する）**: AppArmor のパス結び付き
-//!   プロファイル・SELinux の exec 遷移・IMA の appraisal・Landlock の `EXECUTE` は、memfd を実行する場合は元のファイル
-//!   について働かない。`sealed_copy.rs` の手順 0（`SealPolicy`）が、複製の前に `prepare_exec_restrictions` が
-//!   `setns` の前にホスト側で読んだ環境（`/sys/kernel/security/lsm`・`/proc/cmdline`・IMA の policy）と exec 用の
-//!   Landlock ルールセットから判定し、維持できない（または判定できない）なら複製せずに拒否する: パス結び付きの LSM
-//!   （AppArmor・TOMOYO・Smack・BPF LSM・IPE）が有効なら `FailedPrecondition`、IMA は appraisal が有効か無効と
-//!   判定できないとき `FailedPrecondition`、SELinux が有効なら（ドメインを根拠に通さず）
-//!   `FailedPrecondition`。Landlock は有効でも一律には拒否しない（exec の子は自前のルールセットを必ず適用するため、
-//!   一律拒否は本番の exec を成立させない）。ただし起動前から継承した domain の `EXECUTE` 制限は問い合わせられず
-//!   memfd には及ばないため、使い捨ての子で Landlock の層を上限（16）まで積めるかで継承 domain の有無を判定し、
-//!   ある・判定できないなら `FailedPrecondition` で拒否する（fail-closed。`InheritedLandlock`）。exec 用ルールセットが `EXECUTE` を扱う場合は元のファイルの実パスが
-//!   `EXECUTE` を与えるルールの配下になければ `PermissionDenied`。**帰結**: AppArmor・SELinux のいずれかを
-//!   有効にしたホスト（Ubuntu・Fedora の既定等）では、稼働中コンテナへの exec は封印した複製を使えず拒否される
-//!   （照合だけの方式 A へは戻さない）。この環境での採否は所有者の判断事項。実行ビットと `noexec` は `faccessat2` で再現する。
-//!   setuid ビット・ファイル capability は `NO_NEW_PRIVS` が適用済みのため元々無効で、複製しても緩和にならない
+//! - **B' は元のファイルに結び付いた exec 後の拘束を再現しない（維持できない環境は拒否する）**: 実行の **許可**
+//!   （実行ビット・`noexec`・Landlock の `EXECUTE`・`security_bprm_creds_for_exec`）は、複製の前に元のファイルの fd へ
+//!   `AT_EXECVE_CHECK`（Linux 6.14+）で問い合わせる（6.14 未満は拒否）。一方、AppArmor のパス結び付きプロファイル・
+//!   SELinux の exec 遷移は、実行した後にどのプロファイル・ドメインで動くかを実行したファイルについて決めるため、
+//!   memfd を実行すると元のファイルについては働かない。IMA の appraisal が `AT_EXECVE_CHECK` で評価されるかは一次情報で
+//!   確かめていない。`sealed_copy.rs` の手順 0（`SealPolicy`）が、`prepare_exec_restrictions` が `setns` の前にホスト側で
+//!   読んだ環境（`/sys/kernel/security/lsm`・`/proc/cmdline`・IMA の policy）から判定し、維持できない（または判定
+//!   できない）なら複製せずに拒否する: パス結び付きの LSM（AppArmor・TOMOYO・Smack・BPF LSM・IPE）が有効なら
+//!   `FailedPrecondition`、IMA は appraisal が有効か無効と判定できないとき `FailedPrecondition`、SELinux が有効なら
+//!   （ドメインを根拠に通さず）`FailedPrecondition`。Landlock は有効でも一律には拒否しない（exec の子は自前の
+//!   ルールセットを必ず適用するため、一律拒否は本番の exec を成立させない。`EXECUTE` は `AT_EXECVE_CHECK` が判定する）。
+//!   **帰結**: AppArmor・SELinux のいずれかを有効にしたホスト（Ubuntu・Fedora の既定等）と Linux 6.14 未満のカーネルでは、
+//!   稼働中コンテナへの exec は封印した複製を使えず拒否される（照合だけの方式 A へは戻さない）。この環境での採否は
+//!   所有者の判断事項。setuid ビット・ファイル capability は `NO_NEW_PRIVS` が適用済みのため元々無効で、複製しても
+//!   緩和にならない
 //! - **B' で `/proc/self/exe` の見え方が変わる**: exec 先の `/proc/self/exe` は `/memfd:fandhe-exec-entrypoint (deleted)`
 //!   を指す（元のパスではなくなる）。シェバンのスクリプトは従来どおり `/dev/fd/N` を渡される
 //! - **検査と実行の間の競合（TOCTOU）は残る**:カーネルは `execve` の中でインタープリタのパスを解決し直す。

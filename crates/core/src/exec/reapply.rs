@@ -209,8 +209,8 @@ pub struct ExecRestrictions {
     /// namespace へ参加する前に補助グループを空にした結果（[`prepare_exec_restrictions`] が行う。#1457）。
     /// 観測用の経路・単体テストが直接組み立てた値では `None`（参加前の消去をしていない）。
     groups_before_join: Option<SupplementaryGroups>,
-    /// 封印した複製が元のファイルの実行時ポリシー（LSM・Landlock の `EXECUTE`）を迂回しないかの判定材料。
-    /// `setns` の前（ホスト側の securityfs が見えるうち）に作る（#1531）。
+    /// 封印した複製が元のファイルの実行時ポリシー（複製では維持できない LSM・`AT_EXECVE_CHECK` の要否）を
+    /// 迂回しないかの判定材料。`setns` の前（ホスト側の securityfs が見えるうち）に作る（#1531）。
     seal_policy: SealPolicy,
 }
 
@@ -679,7 +679,7 @@ fn prepare_with_rootfs(
     binding: TargetBinding,
 ) -> Result<ExecRestrictions, ExecError> {
     let landlock = landlock_ruleset_from_config(config)?;
-    let seal_policy = SealPolicy::probe(&landlock);
+    let seal_policy = SealPolicy::probe();
     let status_error =
         |what: &'static str| ExecError::new(ErrorCode::Internal, IsolationStage::Landlock, what);
     let file = std::fs::File::open("/proc/self/status")

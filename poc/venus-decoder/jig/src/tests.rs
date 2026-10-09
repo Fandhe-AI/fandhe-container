@@ -563,4 +563,10 @@ fn task1602_gpu6_is_priority_line_matches_only_known_events() {
     assert!(is_priority_line("venus_jig event=launch_error code=X"));
     assert!(!is_priority_line("venus_jig event=submit_3d"));
     assert!(!is_priority_line("record_stopped"));
+    // event の値は完全一致で判定する（接頭辞一致・語彙の後続文字は優先しない）。
+    assert!(is_priority_line("venus_jig event=record_stopped"));
+    assert!(!is_priority_line(
+        "venus_jig event=record_stopped_x records=1"
+    ));
+    assert!(!is_priority_line("venus_jig event=launch_errors code=X"));
 }

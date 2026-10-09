@@ -212,14 +212,14 @@ pub fn record_stopped_line(reason: StopReason, records: u32) -> String {
     )
 }
 
-/// 打ち切り後も [`LogSink::write_priority`] で書く行か（記録の停止通知・集計・起動エラー）。固定語彙の接頭辞で判定する。
+/// 打ち切り後も [`LogSink::write_priority`] で書く行か（記録の停止通知・集計・起動エラー）。`event=` の値が固定語彙と
+/// 完全一致するときだけ真（`record_stopped_x` のような接頭辞一致は優先しない）。
 pub fn is_priority_line(line: &str) -> bool {
-    ["record_stopped", "record_summary", "launch_error"]
-        .iter()
-        .any(|e| {
-            line.strip_prefix("venus_jig event=")
-                .is_some_and(|r| r.starts_with(e))
-        })
+    let Some(rest) = line.strip_prefix("venus_jig event=") else {
+        return false;
+    };
+    let event = rest.split(' ').next().unwrap_or_default();
+    matches!(event, "record_stopped" | "record_summary" | "launch_error")
 }
 
 /// 終了時の記録の集計行。`write_ok` が偽なら `result=write_failed`（書き出しの失敗を成功と装わない）。

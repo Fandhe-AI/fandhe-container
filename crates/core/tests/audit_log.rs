@@ -449,3 +449,30 @@ fn sec4_sup6_task163_exec_target_rejection_is_one_record_without_path() {
     assert_eq!(r.delivery, AuditDelivery::NotApplicable);
     assert_eq!(sink.snapshot().len(), 1);
 }
+
+/// SEC-4・SUP-6・TASK-163 追補（#1595）: エントリポイント検証の拒否は層 `entrypoint` のレコード 1 件になり、
+/// ワイヤー表現はパスが null・reason が理由コード。対象外の理由は記録されない。
+#[cfg(target_os = "linux")]
+#[test]
+fn sec4_sup6_task163_entrypoint_rejection_is_one_record_without_path() {
+    use fandhe_container_core::exec::{ViolationReason, record_entrypoint_rejection};
+
+    let sink = BoundedSink::new();
+    let r =
+        record_entrypoint_rejection("rejected", ViolationReason::EntrypointOnNoexecMount, &sink);
+    assert_eq!(r.error, "rejected");
+    assert_eq!(r.delivery, AuditDelivery::Recorded);
+    let recs = sink.snapshot();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].layer(), AuditLayer::Entrypoint);
+    assert_eq!(recs[0].path(), None);
+    assert_eq!(recs[0].pid().get(), std::process::id());
+    let j = wire(&recs[0]);
+    assert_eq!(j["layer"], "entrypoint");
+    assert!(j["path"].is_null());
+    assert_eq!(j["reason"], "entrypoint_on_noexec_mount");
+
+    let r = record_entrypoint_rejection("x", ViolationReason::ExecTargetCgroupMismatch, &sink);
+    assert_eq!(r.delivery, AuditDelivery::NotApplicable);
+    assert_eq!(sink.snapshot().len(), 1);
+}

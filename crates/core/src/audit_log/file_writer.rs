@@ -225,7 +225,7 @@ pub fn encode_json_line(record: &AuditRecord) -> Result<Vec<u8>, AuditWriteError
         AuditEvent::Landlock { path, syscall, .. } => (syscall.map(|s| s.get()), Some(path)),
         AuditEvent::Mount { path, .. } => (None, path.as_ref()),
         AuditEvent::PluginTrust { path, .. } => (None, Some(path)),
-        AuditEvent::ExecTarget { .. } => (None, None),
+        AuditEvent::ExecTarget { .. } | AuditEvent::Entrypoint { .. } => (None, None),
     };
     let ts = record.timestamp().as_unix_duration();
     let dto = AuditLineDto {
@@ -669,6 +669,21 @@ mod tests {
         assert_eq!(
             text(&r),
             "{\"event\":\"audit\",\"layer\":\"exec_target\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":11,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null,\"reason\":\"exec_target_cgroup_mismatch\"}\n"
+        );
+    }
+
+    /// SEC-4・SUP-6・TASK-163 追補・#1595: entrypoint レコードはパスが null で reason を持つ。
+    #[test]
+    fn sec4_sup6_task163_encode_entrypoint_has_reason_without_path() {
+        let r = rec(
+            12,
+            AuditEvent::Entrypoint {
+                reason: crate::audit_log::AuditReason::new("entrypoint_is_runtime_binary"),
+            },
+        );
+        assert_eq!(
+            text(&r),
+            "{\"event\":\"audit\",\"layer\":\"entrypoint\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":12,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null,\"reason\":\"entrypoint_is_runtime_binary\"}\n"
         );
     }
 

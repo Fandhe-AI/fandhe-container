@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use super::MAX_MEM_REGIONS;
 use super::observe::{self, Op};
 use super::transport_error::{TransportError, TransportErrorCode};
-use crate::sys::{self, CMSG_HDR_LEN, CmsgBuf};
+use crate::sys;
 
 /// 1 回に受け取れる fd 数の上限。`SET_MEM_TABLE` の最大領域数と同じ 32。
 pub const MAX_FDS: usize = MAX_MEM_REGIONS;
@@ -48,76 +48,6 @@ fn err(code: TransportErrorCode) -> TransportError {
     TransportError::new(code)
 }
 
-/// 補助データを走査して `SCM_RIGHTS` の fd をすべて `OwnedFd` にする。
-///
-/// 構造の異常は `malformed`、`SCM_RIGHTS` 以外は `unexpected` として返し、fd の回収は異常があっても続ける
-/// （回収できた fd は呼び出し側で `Drop` される）。`cmsg_len` が範囲外のときは以降を読めないので走査を打ち切る。
-fn collect_fds(ctrl: &[u8]) -> (Vec<OwnedFd>, bool, bool) {
-    let mut fds = Vec::new();
-    let (mut malformed, mut unexpected) = (false, false);
-    let mut off = 0usize;
-    while off < ctrl.len() {
-        let hdr = ctrl.get(off..).and_then(|b| b.get(..CMSG_HDR_LEN));
-        let Some(hdr) = hdr else {
-            malformed = true;
-            break;
-        };
-        let cmsg_len = hdr
-            .get(0..8)
-            .and_then(|b| <[u8; 8]>::try_from(b).ok())
-            .map(u64::from_ne_bytes)
-            .and_then(|v| usize::try_from(v).ok());
-        let level = hdr
-            .get(8..12)
-            .and_then(|b| <[u8; 4]>::try_from(b).ok())
-            .map(i32::from_ne_bytes);
-        let kind = hdr
-            .get(12..16)
-            .and_then(|b| <[u8; 4]>::try_from(b).ok())
-            .map(i32::from_ne_bytes);
-        let (Some(cmsg_len), Some(level), Some(kind)) = (cmsg_len, level, kind) else {
-            malformed = true;
-            break;
-        };
-        let data = off
-            .checked_add(cmsg_len)
-            .filter(|_| cmsg_len >= CMSG_HDR_LEN)
-            .and_then(|end| ctrl.get(off + CMSG_HDR_LEN..end));
-        let Some(data) = data else {
-            malformed = true;
-            break;
-        };
-        // `SCM_PIDFD` は受信側ソケットが `SO_PASSPIDFD` を有効にしていると、カーネルが pidfd を fd テーブルへ導入する。
-        // 受け取らない種別だが、導入された fd を漏らさないよう `SCM_RIGHTS` と同じく先に所有してから拒否する。
-        let is_fd_carrier =
-            level == sys::SOL_SOCKET && (kind == sys::SCM_RIGHTS || kind == sys::SCM_PIDFD);
-        if is_fd_carrier {
-            let (chunks, rest) = data.as_chunks::<4>();
-            if !rest.is_empty() {
-                malformed = true;
-            }
-            for c in chunks {
-                let owned = sys::owned_fd_from_received(i32::from_ne_bytes(*c));
-                match owned {
-                    Some(fd) => fds.push(fd),
-                    None => malformed = true,
-                }
-            }
-        }
-        if !(level == sys::SOL_SOCKET && kind == sys::SCM_RIGHTS) {
-            unexpected = true;
-        }
-        off = match off.checked_add(sys::cmsg_align(cmsg_len)) {
-            Some(n) => n,
-            None => {
-                malformed = true;
-                break;
-            }
-        };
-    }
-    (fds, malformed, unexpected)
-}
-
 /// データと fd を 1 回の `recvmsg` で受け取る。
 ///
 /// 検査順（fd を漏らさない順序）: 受信 → 補助データの fd をすべて所有 → `MSG_CTRUNC`（`CONTROL_TRUNCATED`）→
@@ -133,7 +63,7 @@ pub fn recv_with_fds(
     timeout: Duration,
 ) -> Result<Received, TransportError> {
     observe::global().observe(Op::RecvFds, || {
-        recv_impl(sock, buf, max_fds, sys::CMSG_BUF_LEN, timeout)
+        recv_impl(sock, buf, max_fds, sys::MAX_SCM_FDS, timeout)
     })
 }
 
@@ -178,21 +108,22 @@ fn wait_until(
     }
 }
 
-/// [`recv_with_fds`] の本体。`ctrl_cap` は補助データの受付上限で、切り詰め検出の試験だけが `CMSG_BUF_LEN` 未満を渡す。
+/// [`recv_with_fds`] の本体。`ctrl_fds` は補助データの受付容量（fd の個数分）で、切り詰め検出の試験だけが
+/// `MAX_SCM_FDS` 未満を渡す。
 fn recv_impl(
     sock: &UnixStream,
     buf: &mut [u8],
     max_fds: usize,
-    ctrl_cap: usize,
+    ctrl_fds: usize,
     timeout: Duration,
 ) -> Result<Received, TransportError> {
     if max_fds > MAX_FDS || buf.is_empty() {
         return Err(err(TransportErrorCode::InvalidArgument));
     }
     let deadline = deadline_for(timeout)?;
-    let mut ctrl = CmsgBuf::new();
+    // fd は `recvmsg_fds` が受信と同じ呼び出しの中で所有済み。以降の return では Drop で閉じられる。
     let raw = loop {
-        match sys::recvmsg_fds(sock.as_fd(), buf, &mut ctrl, ctrl_cap) {
+        match sys::recvmsg_fds(sock.as_fd(), buf, ctrl_fds) {
             Ok(r) => break r,
             Err(sys::SysError::Os(n)) if n == sys::EINTR => check_deadline(deadline)?,
             Err(sys::SysError::Os(n)) if n == sys::EAGAIN => {
@@ -201,28 +132,28 @@ fn recv_impl(
             Err(e) => return Err(TransportError::from_sys(e)),
         }
     };
-    let ctrl_bytes = ctrl.as_bytes().get(..raw.ctrl_len).unwrap_or(&[]);
-    // 先にすべての fd を所有する。以降の return では Drop で閉じられる。
-    let (fds, malformed, unexpected) = collect_fds(ctrl_bytes);
-    if raw.flags & sys::MSG_CTRUNC != 0 {
+    if raw.control_truncated {
         return Err(err(TransportErrorCode::ControlTruncated));
     }
-    if raw.flags & sys::MSG_TRUNC != 0 {
+    if raw.data_truncated {
         return Err(err(TransportErrorCode::DataTruncated));
     }
-    if malformed {
+    if raw.malformed {
         return Err(err(TransportErrorCode::MalformedControl));
     }
-    if unexpected {
+    if raw.unexpected {
         return Err(err(TransportErrorCode::UnexpectedControl));
     }
-    if fds.len() > max_fds {
+    if raw.fds.len() > max_fds {
         return Err(err(TransportErrorCode::TooManyFds));
     }
     if raw.len == 0 {
         return Err(err(TransportErrorCode::PeerClosed));
     }
-    Ok(Received { len: raw.len, fds })
+    Ok(Received {
+        len: raw.len,
+        fds: raw.fds,
+    })
 }
 
 /// データと fd を 1 回の `sendmsg` で送り、送れたバイト数を [`Sent`] で返す（部分送信はあり得る）。
@@ -293,14 +224,7 @@ mod tests {
         send_with_fds(&a, b"x", &fds, Duration::from_secs(5)).expect("send");
         let mut buf = [0u8; 4];
         // 2 個分（CMSG_SPACE(8) = 24 バイト）だけ受け付ける。
-        let e = recv_impl(
-            &b,
-            &mut buf,
-            MAX_FDS,
-            sys::cmsg_space(8),
-            Duration::from_secs(5),
-        )
-        .expect_err("truncated");
+        let e = recv_impl(&b, &mut buf, MAX_FDS, 2, Duration::from_secs(5)).expect_err("truncated");
         assert_eq!(e.code, TransportErrorCode::ControlTruncated);
         let needle = "/memfd:jig-ctrunc (deleted)";
         let count = || {
@@ -371,36 +295,6 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(30));
     }
 
-    /// GPU-6: `SCM_PIDFD` で導入された fd も所有してから拒否し、閉じ忘れない（解析の単体照合）。
-    #[test]
-    fn gpu6_pidfd_control_fd_is_owned_and_closed() {
-        use std::os::fd::IntoRawFd;
-        let f = create_memfd(c"jig-pidfd", 8).expect("memfd");
-        let raw = f.try_clone().expect("clone").into_raw_fd();
-        let mut ctrl = [0u8; 24];
-        ctrl[0..8].copy_from_slice(&20u64.to_ne_bytes());
-        ctrl[8..12].copy_from_slice(&sys::SOL_SOCKET.to_ne_bytes());
-        ctrl[12..16].copy_from_slice(&sys::SCM_PIDFD.to_ne_bytes());
-        ctrl[16..20].copy_from_slice(&raw.to_ne_bytes());
-        let count = || {
-            std::fs::read_dir("/proc/self/fd")
-                .expect("fd dir")
-                .filter_map(|e| e.ok())
-                .filter_map(|e| std::fs::read_link(e.path()).ok())
-                .filter(|l| l.to_string_lossy() == "/memfd:jig-pidfd (deleted)")
-                .count()
-        };
-        // 元の fd と複製の 2 個。
-        assert_eq!(count(), 2);
-        let (fds, malformed, unexpected) = collect_fds(&ctrl);
-        assert_eq!(fds.len(), 1);
-        assert!(!malformed);
-        assert!(unexpected);
-        drop(fds);
-        // 複製が閉じられ、元の fd だけが残る。
-        assert_eq!(count(), 1);
-    }
-
     /// GPU-6・REPAIR-4: 成功・失敗が全体の観測カウンタに計上される（他テストと並行するため増分で照合する）。
     #[test]
     fn gpu6_io_is_observed() {
@@ -418,32 +312,5 @@ mod tests {
         assert!(r.err > before_recv.err);
         let i = TransportErrorCode::InvalidArgument as usize;
         assert!(r.by_code[i] > before_recv.by_code[i]);
-    }
-
-    /// GPU-6: `cmsg_len` が範囲外の補助データは `MALFORMED_CONTROL` として拒否する（解析の単体照合）。
-    #[test]
-    fn gpu6_malformed_cmsg_is_flagged() {
-        // cmsg_len = 100 だが実データは 24 バイトだけ。
-        let mut ctrl = [0u8; 24];
-        ctrl[0..8].copy_from_slice(&100u64.to_ne_bytes());
-        ctrl[8..12].copy_from_slice(&sys::SOL_SOCKET.to_ne_bytes());
-        ctrl[12..16].copy_from_slice(&sys::SCM_RIGHTS.to_ne_bytes());
-        let (fds, malformed, unexpected) = collect_fds(&ctrl);
-        assert!(fds.is_empty());
-        assert!(malformed);
-        assert!(!unexpected);
-        // cmsg_len が 16 未満。
-        let mut short = [0u8; 16];
-        short[0..8].copy_from_slice(&8u64.to_ne_bytes());
-        let (_, malformed, _) = collect_fds(&short);
-        assert!(malformed);
-        // SCM_RIGHTS 以外（level=1・type=2）。
-        let mut other = [0u8; 24];
-        other[0..8].copy_from_slice(&20u64.to_ne_bytes());
-        other[8..12].copy_from_slice(&sys::SOL_SOCKET.to_ne_bytes());
-        other[12..16].copy_from_slice(&2i32.to_ne_bytes());
-        let (_, malformed, unexpected) = collect_fds(&other);
-        assert!(!malformed);
-        assert!(unexpected);
     }
 }

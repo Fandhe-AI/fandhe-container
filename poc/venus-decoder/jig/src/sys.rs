@@ -24,7 +24,9 @@
 //! - 構造体はカーネル ABI（`struct user_msghdr`・`struct cmsghdr`・`struct iovec`）に合わせる。syscall を直接呼ぶので
 //!   glibc / musl の `msghdr` のパディング差に依存しない
 //! - 戻り値が -1 のときは直後に `io::Error::last_os_error()` で errno を確保する
-//! - 補助データの解析は呼び出し側の safe コードで行い、ここでは増やさない
+//! - 受信した補助データの fd は、このモジュールの中で受信と同じ呼び出しのうちに所有する（`recvmsg_fds` の戻り値は
+//!   `OwnedFd` だけ）。生の fd 番号から `OwnedFd` を作る経路を外へ出さないので、safe API だけでは任意の fd を所有したり
+//!   二重に閉じたりできない。補助データの構造の判定（malformed・unexpected）は結果のフラグとして返し、拒否の判断は呼び出し側が行う
 //!
 //! 出典（確認日 2026-10-09）: Linux UAPI ヘッダ（ローカルの `linux-libc-dev`）の `asm-generic/socket.h`
 //! （SHA-256 `e833d32d3d8d03732021da6968665431d693ab4effdd4d39965ff05115a4ed21`）・`linux/socket.h`
@@ -204,33 +206,116 @@ pub(crate) const fn cmsg_space(data_len: usize) -> usize {
 /// 補助データバッファの長さ（`MAX_SCM_FDS` 個の fd を載せられる固定長）。
 pub(crate) const CMSG_BUF_LEN: usize = cmsg_space(MAX_SCM_FDS * 4);
 
-/// 補助データ用の固定長バッファ。`cmsghdr` の整列（8 バイト）を満たす。
+/// 補助データ用の固定長バッファ。`cmsghdr` の整列（8 バイト）を満たす。`recvmsg_fds` / `sendmsg_fds` のローカル変数としてだけ使う。
 #[repr(C, align(8))]
-pub(crate) struct CmsgBuf {
+struct CmsgBuf {
     buf: [u8; CMSG_BUF_LEN],
 }
 
 impl CmsgBuf {
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self {
             buf: [0u8; CMSG_BUF_LEN],
         }
     }
-
-    pub(crate) fn as_bytes(&self) -> &[u8] {
-        &self.buf
-    }
 }
 
-/// `recvmsg` の生の結果。
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct RecvRaw {
+/// `recvmsg_fds` の結果。fd は受信と同じ呼び出しの中で所有済み。
+#[derive(Debug)]
+pub(crate) struct Received {
     /// 受信したデータ長。
     pub(crate) len: usize,
-    /// カーネルが書き戻した `msg_flags`（`MSG_CTRUNC` 等）。
-    pub(crate) flags: u32,
-    /// 補助データの有効長（`CmsgBuf` の先頭からの長さ）。
-    pub(crate) ctrl_len: usize,
+    /// `MSG_TRUNC`（データ部が切り詰められた）。
+    pub(crate) data_truncated: bool,
+    /// `MSG_CTRUNC`（補助データが切り詰められ、カーネルが入りきらない fd を閉じた）。
+    pub(crate) control_truncated: bool,
+    /// 補助データの構造が不正（`cmsg_len` の範囲外・fd 配列の長さが 4 の倍数でない・負の fd 番号）。
+    pub(crate) malformed: bool,
+    /// `SOL_SOCKET` / `SCM_RIGHTS` 以外の補助データがあった（`SCM_PIDFD` を含む）。
+    pub(crate) unexpected: bool,
+    /// `SCM_RIGHTS` と `SCM_PIDFD` で導入された fd（拒否する場合も、ここで所有してから `Drop` で閉じる）。
+    pub(crate) fds: Vec<OwnedFd>,
+}
+
+/// 補助データの走査結果。fd は生の番号のままで所有しない（解析だけの純粋な関数にして単体で照合できるようにする）。
+#[derive(Debug, PartialEq, Eq)]
+struct ControlScan {
+    /// fd を運ぶ cmsg（`SCM_RIGHTS`・`SCM_PIDFD`）の各スロットの番号。スロットごとに 1 回だけ現れる。非負のものだけ。
+    raws: Vec<i32>,
+    malformed: bool,
+    unexpected: bool,
+}
+
+/// 補助データを走査して、fd を運ぶ cmsg の番号と構造の異常を集める。
+///
+/// `SCM_PIDFD` は受信側ソケットが `SO_PASSPIDFD` を有効にしていると、カーネルが pidfd を fd テーブルへ導入する。
+/// 受け取らない種別（unexpected）だが、導入された fd を漏らさないよう `SCM_RIGHTS` と同じく番号を集める。
+/// `cmsg_len` が範囲外のときは以降を読めないので走査を打ち切る。番号の個数は `ctrl.len() / 4` 以下に収まる。
+fn scan_control(ctrl: &[u8]) -> ControlScan {
+    let mut out = ControlScan {
+        raws: Vec::new(),
+        malformed: false,
+        unexpected: false,
+    };
+    let mut off = 0usize;
+    while off < ctrl.len() {
+        let hdr = ctrl.get(off..).and_then(|b| b.get(..CMSG_HDR_LEN));
+        let Some(hdr) = hdr else {
+            out.malformed = true;
+            break;
+        };
+        let cmsg_len = hdr
+            .get(0..8)
+            .and_then(|b| <[u8; 8]>::try_from(b).ok())
+            .map(u64::from_ne_bytes)
+            .and_then(|v| usize::try_from(v).ok());
+        let level = hdr
+            .get(8..12)
+            .and_then(|b| <[u8; 4]>::try_from(b).ok())
+            .map(i32::from_ne_bytes);
+        let kind = hdr
+            .get(12..16)
+            .and_then(|b| <[u8; 4]>::try_from(b).ok())
+            .map(i32::from_ne_bytes);
+        let (Some(cmsg_len), Some(level), Some(kind)) = (cmsg_len, level, kind) else {
+            out.malformed = true;
+            break;
+        };
+        let data = off
+            .checked_add(cmsg_len)
+            .filter(|_| cmsg_len >= CMSG_HDR_LEN)
+            .zip(off.checked_add(CMSG_HDR_LEN))
+            .and_then(|(end, start)| ctrl.get(start..end));
+        let Some(data) = data else {
+            out.malformed = true;
+            break;
+        };
+        if level == SOL_SOCKET && (kind == SCM_RIGHTS || kind == SCM_PIDFD) {
+            let (chunks, rest) = data.as_chunks::<4>();
+            if !rest.is_empty() {
+                out.malformed = true;
+            }
+            for c in chunks {
+                let raw = i32::from_ne_bytes(*c);
+                if raw < 0 {
+                    out.malformed = true;
+                } else {
+                    out.raws.push(raw);
+                }
+            }
+        }
+        if !(level == SOL_SOCKET && kind == SCM_RIGHTS) {
+            out.unexpected = true;
+        }
+        off = match off.checked_add(cmsg_align(cmsg_len)) {
+            Some(n) => n,
+            None => {
+                out.malformed = true;
+                break;
+            }
+        };
+    }
+    out
 }
 
 fn check(ret: i64) -> Result<i64, SysError> {
@@ -245,20 +330,21 @@ fn check(ret: i64) -> Result<i64, SysError> {
 }
 
 /// 補助データ付きで受信する（U2）。常に `MSG_DONTWAIT` で、読めなければ `EAGAIN`（待機は [`wait_fd`] で期限つきに行う）。
-///`MSG_CMSG_CLOEXEC` を必ず付け、受け取った fd を原子的に close-on-exec にする。
-/// 受け取った fd は `ctrl` の中に生の番号で入っているので、呼び出し側は直ちに [`owned_fd_from_received`] で所有する。
+/// `MSG_CMSG_CLOEXEC` を必ず付け、受け取った fd を原子的に close-on-exec にする。
+/// 補助データはこの関数のローカルなバッファで受け、走査した fd をすべてここで所有してから返す（どのエラー経路でも
+/// 呼び出し側の `Drop` で閉じられる）。
 ///
-/// `ctrl_cap` は補助データとして受け付ける最大長で、`CMSG_BUF_LEN` 以下に丸める。通常は `CMSG_BUF_LEN` を渡し、
+/// `ctrl_fds` は補助データとして受け付ける fd の個数分の容量で、`MAX_SCM_FDS` 以下に丸める。通常は `MAX_SCM_FDS` を渡し、
 /// 切り詰め（`MSG_CTRUNC`）の検出試験だけが小さい値を渡す。
 pub(crate) fn recvmsg_fds(
     sock: BorrowedFd<'_>,
     data: &mut [u8],
-    ctrl: &mut CmsgBuf,
-    ctrl_cap: usize,
-) -> Result<RecvRaw, SysError> {
+    ctrl_fds: usize,
+) -> Result<Received, SysError> {
     if !SUPPORTED {
         return Err(SysError::Unsupported);
     }
+    let mut ctrl = CmsgBuf::new();
     let mut iov = Iovec {
         base: data.as_mut_ptr(),
         len: data.len(),
@@ -269,7 +355,7 @@ pub(crate) fn recvmsg_fds(
         iov: &raw mut iov,
         iovlen: 1,
         control: ctrl.buf.as_mut_ptr(),
-        controllen: ctrl_cap.min(CMSG_BUF_LEN),
+        controllen: cmsg_space(ctrl_fds.min(MAX_SCM_FDS) * 4),
         flags: 0,
     };
     // SAFETY: `hdr` はカーネル ABI の `user_msghdr` と同じレイアウト（固定値テストで照合）で、`iov` は `data`
@@ -285,25 +371,27 @@ pub(crate) fn recvmsg_fds(
         )
     };
     let n = check(ret)?;
-    Ok(RecvRaw {
+    // カーネルは controllen を渡した値以下に更新する。念のためバッファ長で頭打ちにする。
+    let ctrl_len = hdr.controllen.min(CMSG_BUF_LEN);
+    let scan = scan_control(ctrl.buf.get(..ctrl_len).unwrap_or(&[]));
+    // 長さの変換より先に fd を所有する（以降のどの経路でも漏らさない）。
+    let fds: Vec<OwnedFd> = scan.raws.into_iter().map(own_received_fd).collect();
+    Ok(Received {
         len: usize::try_from(n).map_err(|_| SysError::Os(EINVAL))?,
-        flags: hdr.flags,
-        // カーネルは controllen を渡した値以下に更新する。念のためバッファ長で頭打ちにする。
-        ctrl_len: hdr.controllen.min(CMSG_BUF_LEN),
+        data_truncated: hdr.flags & MSG_TRUNC != 0,
+        control_truncated: hdr.flags & MSG_CTRUNC != 0,
+        malformed: scan.malformed,
+        unexpected: scan.unexpected,
+        fds,
     })
 }
 
-/// 受信した生の fd 番号を所有する（U3）。負の値は `None`。
-///
-/// 前提: `raw` はカーネルが `SCM_RIGHTS` でこのプロセスに導入したばかりの fd で、他に所有者がいない。
-/// 呼び出し側は補助データを解析した直後、検証より前に全 fd をこの関数で `OwnedFd` にする（エラー経路での fd 漏れ防止）。
-pub(crate) fn owned_fd_from_received(raw: i32) -> Option<OwnedFd> {
-    if raw < 0 {
-        return None;
-    }
-    // SAFETY: `raw` は非負で、直前の `recvmsg` がこのプロセスの fd テーブルに新規に導入した fd。呼び出し側が
-    // 同じ番号を二重に所有しない（補助データの各 fd を 1 回だけ渡す）限り、この `OwnedFd` が唯一の所有者になる。
-    Some(unsafe { OwnedFd::from_raw_fd(raw) })
+/// 受信した fd 番号を所有する（U3）。[`recvmsg_fds`] の中からだけ、同じ呼び出しで走査した番号に対して呼ぶ。
+fn own_received_fd(raw: i32) -> OwnedFd {
+    // SAFETY: `raw` は [`scan_control`] が非負と確かめた番号で、直前の `recvmsg` がこの呼び出しのローカルな補助データ
+    // バッファの 1 スロットに書いた、このプロセスの fd テーブルへ新規に導入された fd。走査は各スロットを 1 回だけ返し、
+    // バッファはこの関数の呼び出し元のローカル変数なので二度は走査されない。よってこの `OwnedFd` が唯一の所有者になる。
+    unsafe { OwnedFd::from_raw_fd(raw) }
 }
 
 /// データと fd を `SCM_RIGHTS` で送る（U4）。常に `MSG_DONTWAIT` で、書けなければ `EAGAIN`（待機は [`wait_fd`]）。`MSG_NOSIGNAL` で SIGPIPE を避ける。fd 数は `MAX_SCM_FDS` 以下に限る。
@@ -608,6 +696,64 @@ mod tests {
         assert_eq!(offset_of!(PollFd, revents), 6);
         assert_eq!(size_of::<Timespec>(), 16);
         assert_eq!(offset_of!(Timespec, nsec), 8);
+    }
+
+    /// 1 個の cmsg（ヘッダ + `data`）を組み立てる。`cmsg_len` は `len` で上書きできる（構造異常の試験用）。
+    fn cmsg(level: i32, kind: i32, data: &[u8], len: Option<u64>) -> Vec<u8> {
+        let total = CMSG_HDR_LEN + data.len();
+        let mut v = vec![0u8; cmsg_align(total)];
+        v[0..8].copy_from_slice(&len.unwrap_or(total as u64).to_ne_bytes());
+        v[8..12].copy_from_slice(&level.to_ne_bytes());
+        v[12..16].copy_from_slice(&kind.to_ne_bytes());
+        v[16..total].copy_from_slice(data);
+        v
+    }
+
+    fn fds_bytes(raws: &[i32]) -> Vec<u8> {
+        raws.iter().flat_map(|r| r.to_ne_bytes()).collect()
+    }
+
+    /// GPU-6: 走査は fd を運ぶ cmsg（`SCM_RIGHTS`・`SCM_PIDFD`）の番号をスロットごとに 1 回だけ返す。`SCM_PIDFD` は
+    /// unexpected だが番号は集める（受信経路で所有してから拒否するため）。走査は番号を所有しない。
+    #[test]
+    fn gpu6_scan_collects_fd_carriers_once_per_slot() {
+        let mut ctrl = cmsg(SOL_SOCKET, SCM_RIGHTS, &fds_bytes(&[7, 8]), None);
+        ctrl.extend(cmsg(SOL_SOCKET, SCM_PIDFD, &fds_bytes(&[9]), None));
+        let scan = scan_control(&ctrl);
+        assert_eq!(
+            scan,
+            ControlScan {
+                raws: vec![7, 8, 9],
+                malformed: false,
+                unexpected: true,
+            }
+        );
+        let only_rights = scan_control(&cmsg(SOL_SOCKET, SCM_RIGHTS, &fds_bytes(&[3]), None));
+        assert_eq!((only_rights.raws, only_rights.unexpected), (vec![3], false));
+    }
+
+    /// GPU-6: 構造異常（`cmsg_len` がバッファ超過・ヘッダ長未満・fd 配列が 4 の倍数でない・負の番号）は malformed。
+    /// それ以外の種別（level=1・type=2）は unexpected で、番号は集めない。
+    #[test]
+    fn gpu6_scan_flags_malformed_and_unexpected() {
+        let over = scan_control(&cmsg(SOL_SOCKET, SCM_RIGHTS, &[0; 8], Some(100)));
+        assert_eq!(
+            (over.raws.len(), over.malformed, over.unexpected),
+            (0, true, false)
+        );
+        let short = scan_control(&cmsg(SOL_SOCKET, SCM_RIGHTS, &[], Some(8)));
+        assert!(short.malformed);
+        let odd = scan_control(&cmsg(SOL_SOCKET, SCM_RIGHTS, &[5, 0, 0, 0, 1], None));
+        assert_eq!((odd.raws, odd.malformed), (vec![5], true));
+        let neg = scan_control(&cmsg(SOL_SOCKET, SCM_RIGHTS, &fds_bytes(&[-1, 4]), None));
+        assert_eq!((neg.raws, neg.malformed), (vec![4], true));
+        let other = scan_control(&cmsg(SOL_SOCKET, 2, &fds_bytes(&[6]), None));
+        assert_eq!(
+            (other.raws.len(), other.malformed, other.unexpected),
+            (0, false, true)
+        );
+        let trailing = scan_control(&[0u8; 8]);
+        assert!(trailing.malformed);
     }
 
     /// GPU-6: `CMSG_SPACE` と補助データバッファの長さ。

@@ -13,7 +13,7 @@
 //! セッションと ctrl キューの応答ループ（kick / call・used への書き戻し）は `session` に実装済み（F1.4・#1519。Linux 限定）。
 //!
 //! 未実装（実装済みを装わない。REPAIR-3）: UDS の bind と peer credential の検証（呼び出し側の責務。設計書 10.8）、cursorq の処理、
-//! `observe::snapshot_lines` の定期出力（セッション終了時の 1 回だけ出す）、上記以外の ctrl 応答（F2 の残り。未対応は `ERR_UNSPEC`）、
+//! `observe::snapshot_lines` の定期出力（終了時の集計出力は実装済み）と virtqueue 個別の観測カウンタ、上記以外の ctrl 応答（F2 の残り。未対応は `ERR_UNSPEC`）、
 //! 実機での疎通（F3・#725）。
 
 // unsafe の配置制約（#1517 の個別承認の条件）: crate 全体で unsafe を禁止し、syscall の薄いラッパーを置く `sys`

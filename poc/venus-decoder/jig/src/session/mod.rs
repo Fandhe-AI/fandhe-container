@@ -12,7 +12,7 @@
 //! 待機はすべて期限つき（REPAIR-5）。単一 fd 用の `sys::wait_fd` を socket と ctrl の kick で交互に短く待つ方式のため、
 //! kick への反応には最大 [`SessionLimits::poll_slice`] の遅延が乗る（複数 fd の ppoll 化は unsafe の承認範囲外）。
 //! 未実装（REPAIR-3）: cursorq（ring 1）の要求処理・`SET_CONFIG`・`VRING_NOFD`・REPLY_ACK・inflight・
-//! `observe::snapshot_lines` の定期出力（セッション終了時に 1 回だけ出す）。
+//! `observe::snapshot_lines` の定期出力（終了時の集計出力は実装済み。定期出力と virtqueue 個別の観測カウンタは未実装）。
 //!
 //! kick / call の fd は frontend が複製を持ち得るため、`O_NONBLOCK` を含む open file description のフラグと counter は
 //! 相手と共有され、poll の後に相手が eventfd を読み書きして状態を変えたり、フラグを落としたりできる。そこでセッションの
@@ -409,11 +409,17 @@ struct WorkerSlot<'a>(&'a AtomicUsize);
 impl<'a> WorkerSlot<'a> {
     /// `live` が `max` 未満なら枠を取る。上限なら `None`（fail-closed）。
     fn acquire(live: &'a AtomicUsize, max: usize) -> Option<Self> {
-        live.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            (n < max).then_some(n + 1)
-        })
-        .ok()
-        .map(|_| Self(live))
+        // fetch_update は toolchain により deprecated（try_update へ改名）になるため CAS ループで書く。
+        let mut n = live.load(Ordering::Acquire);
+        loop {
+            if n >= max {
+                return None;
+            }
+            match live.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(Self(live)),
+                Err(cur) => n = cur,
+            }
+        }
     }
 }
 
@@ -448,12 +454,21 @@ fn run_bounded<T: Send + 'static>(
         .name("venus-jig-fd-io".into())
         .spawn(move || {
             let _slot = slot;
-            let ready = match sys::wait_fd(dup.as_fd(), interest, wait_for) {
-                Ok(ready) => ready,
-                Err(sys::SysError::Interrupted(_)) => false,
-                Err(_) => {
-                    let _ = tx.send(Err(io::Error::from(ErrorKind::Other)));
-                    return;
+            // EINTR は残り時間で再試行する（シグナルで生きたセッションを TimedOut にしない）。
+            let deadline = Instant::now().checked_add(wait_for);
+            let ready = loop {
+                let left = match deadline {
+                    Some(d) => d.saturating_duration_since(Instant::now()),
+                    None => wait_for,
+                };
+                match sys::wait_fd(dup.as_fd(), interest, left) {
+                    Ok(ready) => break ready,
+                    Err(sys::SysError::Interrupted(_)) if !left.is_zero() => continue,
+                    Err(sys::SysError::Interrupted(_)) => break false,
+                    Err(_) => {
+                        let _ = tx.send(Err(io::Error::from(ErrorKind::Other)));
+                        return;
+                    }
                 }
             };
             let result = if ready {
@@ -476,8 +491,12 @@ fn run_bounded<T: Send + 'static>(
 /// 補助スレッドの結果を待つときに `wait_for` へ足す余裕。
 const WORKER_GRACE: Duration = Duration::from_millis(50);
 
-/// `op` を切り離したスレッドで実行する（結果は捨てる。失敗や上限超過では何もしない）。
-fn detach(file: &File, op: impl FnOnce(&File) + Send + 'static) {
+/// 切り離した unblock 用スレッドが readiness を待つ上限。これを過ぎれば何もせず自力で終了する（REPAIR-5）。
+const UNBLOCK_WAIT: Duration = Duration::from_secs(1);
+
+/// `op` を切り離したスレッドで実行する（結果は捨てる。失敗や上限超過では何もしない）。blocking の fd で `op` が
+/// 無期限に止まらないよう、`interest` の readiness を [`UNBLOCK_WAIT`] だけ待ってから実行し、来なければ何もせず終了する。
+fn detach(file: &File, interest: sys::Interest, op: impl FnOnce(&File) + Send + 'static) {
     let Some(slot) = global_slot() else {
         return;
     };
@@ -486,7 +505,9 @@ fn detach(file: &File, op: impl FnOnce(&File) + Send + 'static) {
             .name("venus-jig-fd-unblock".into())
             .spawn(move || {
                 let _slot = slot;
-                op(&dup);
+                if matches!(sys::wait_fd(dup.as_fd(), interest, UNBLOCK_WAIT), Ok(true)) {
+                    op(&dup);
+                }
             });
     }
 }
@@ -502,7 +523,7 @@ fn read_kick(kick: &File, wait_for: Duration) -> Result<KickRead, SessionError> 
     match result {
         None => {
             // poll の後で相手が counter を読み切り、読み取りが止まった競合。1 を足して起こす（余分な kick は空走査で無害）。
-            detach(kick, |f| {
+            detach(kick, sys::Interest::Writable, |f| {
                 let mut w = f;
                 let _ = w.write(&1u64.to_le_bytes());
             });
@@ -534,7 +555,15 @@ fn notify(call: &File, timeout: Duration) -> Result<(), SessionError> {
             w.write(&1u64.to_le_bytes())
         })?;
         match result {
-            None => return Err(SessionError::new(SessionErrorCode::Timeout, None)),
+            None => {
+                // poll の後で相手が counter を満たし、書き込みが止まった競合。counter を読んで（drain）起こす。
+                detach(call, sys::Interest::Readable, |f| {
+                    let mut r = f;
+                    let mut b = [0u8; 8];
+                    let _ = r.read(&mut b);
+                });
+                return Err(SessionError::new(SessionErrorCode::Timeout, None));
+            }
             Some(Err(e)) if e.kind() == ErrorKind::TimedOut => {
                 return Err(SessionError::new(SessionErrorCode::Timeout, None));
             }

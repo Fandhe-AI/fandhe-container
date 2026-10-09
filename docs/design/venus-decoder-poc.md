@@ -444,7 +444,7 @@ frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲスト
 - タイムアウト（REPAIR-5）: `SessionLimits` の `message_timeout`（1 メッセージの受信・応答送信・call の書き込み。超過は `TIMEOUT`）と `idle_timeout`（無通信。超過は `IDLE_TIMEOUT`）。どちらも 0 より大きく 1 時間以下
 - 応答ループ: socket と ctrl キューの kick を、単一 fd 用の `sys::wait_fd` で `poll_slice`（既定 10ms）ずつ交互に待つ。1 回の kick で最大 `num` 件を処理して used へ書き、1 件以上なら call へ 1 を書く。`pop` / `add_used` の失敗はセッションを終了する（壊れたキューを黙って続けない）。writable が応答に足りない要求は応答を捨てて len=0 で返し、`response_dropped` の行を出してセッションは続ける。readable が 4 KiB を超える要求はアダプタへ渡さず `ERR_INVALID_PARAMETER`
 - ログ: 既存の `venus_jig event=...` 形式を保つ。追加は `session_error`（`code`・`request`）・`need_reply_ignored`・`response_dropped`・`session_end`。固定語彙と数値だけで、frontend やゲスト由来のバイト列・fd 番号・GPA は出さない
-- 扱わない（REPAIR-3）: `NEED_REPLY`（REPLY_ACK を広告しないので `SET_*` には応答せず、ログに 1 行出す）、cursorq（ring 1）の要求処理、`SET_CONFIG`、`VRING_NOFD`、inflight、`INDIRECT` / `EVENT_IDX`、`observe::snapshot_lines` の定期出力と session / virtqueue の観測カウンタ
+- 扱わない（REPAIR-3）: `NEED_REPLY`（REPLY_ACK を広告しないので `SET_*` には応答せず、ログに 1 行出す）、cursorq（ring 1）の要求処理、`SET_CONFIG`、`VRING_NOFD`、inflight、`INDIRECT` / `EVENT_IDX`、`observe::snapshot_lines` の定期出力と virtqueue 個別の観測カウンタ（終了時の集計出力は `session::run` で実装済み）
 - 既知の穴: UDS の bind と所有者・権限・symlink の検証、peer credential の検証（PLUG-12 相当）は範囲外。`UnixStream::peer_cred` が unstable で、`SO_PEERCRED` の取得は #1517 の承認範囲外の `unsafe` を要するため、`UnixStream` を受け取る API に留め、bind は F3 の起動側に委ねる。治具は PoC で、実機の実行は人間が担当する閉じた環境という前提
 - 承認事項: socket と kick を同時に待つ複数 fd の `ppoll` は `sys.rs` の `unsafe`（U10）の変更になるため行っていない。kick への反応に最大 `poll_slice` の遅延が乗る
 

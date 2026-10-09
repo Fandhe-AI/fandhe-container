@@ -57,7 +57,8 @@
 use std::fmt;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 use crate::state_store::FileStateStore;
 use crate::traits::TraitError;
@@ -72,6 +73,66 @@ pub const AUDIT_LOG_FILE_NAME: &str = "@audit.log";
 
 type FallbackFactory = Arc<dyn Fn() -> Box<dyn AuditFallback> + Send + Sync>;
 type FailureNotifier = Arc<dyn Fn(&AuditWriteFailure) + Send + Sync>;
+
+/// 通知待ちキューの上限。満杯時は通知を捨てる（拒否経路を止めない）。
+const NOTIFY_QUEUE_CAP: usize = 8;
+/// 通知の完了を呼び出し側が待つ上限。stderr が詰まっていても `record` はこの時間内に戻る（REPAIR-5）。
+const NOTIFY_WAIT: Duration = Duration::from_millis(200);
+
+/// 専用スレッドへ渡して出力する通知器を作る。
+///
+/// stderr のロック取得・書き込みは満杯パイプで無期限に停止し得るため、呼び出し側のスレッドでは行わない。
+/// 呼び出し側は行を渡し、最大 [`NOTIFY_WAIT`] だけ完了を待って戻る（プロセス終了直前でも通常は出力が間に合う）。
+fn stderr_notifier() -> FailureNotifier {
+    notifier_to(|| Box::new(StderrLine), NOTIFY_QUEUE_CAP, NOTIFY_WAIT)
+}
+
+/// 書き込み時に毎回 stderr をロックする `Write`（ロック取得も専用スレッド側で行う）。
+struct StderrLine;
+
+impl Write for StderrLine {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        std::io::stderr().lock().write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stderr().lock().flush()
+    }
+}
+
+/// 出力先を生成する関数から、非同期・有限待ちの通知器を作る。出力先の生成も専用スレッド側で行う。
+fn notifier_to(
+    make: impl FnOnce() -> Box<dyn Write> + Send + 'static,
+    cap: usize,
+    wait: Duration,
+) -> FailureNotifier {
+    let (tx, rx) = mpsc::sync_channel::<(Vec<u8>, mpsc::SyncSender<()>)>(cap);
+    let spawned = std::thread::Builder::new()
+        .name("audit-notify".into())
+        .spawn(move || {
+            let mut out = make();
+            while let Ok((line, ack)) = rx.recv() {
+                // 書き込み失敗は握りつぶす（拒否経路を止めない）。
+                let _ = out.write_all(&line);
+                let _ = out.flush();
+                let _ = ack.try_send(());
+            }
+        })
+        .is_ok();
+    Arc::new(move |failure| {
+        if !spawned {
+            return;
+        }
+        let mut line = Vec::new();
+        if failure.write_json_line(&mut line).is_err() {
+            return;
+        }
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        // 満杯なら待たずに捨てる。
+        if tx.try_send((line, ack_tx)).is_ok() {
+            let _ = ack_rx.recv_timeout(wait);
+        }
+    })
+}
 
 /// ファイル（主経路）＋カーネル監査（代替経路）の本番 [`AuditSink`]。
 pub struct FileAuditSink {
@@ -88,12 +149,7 @@ impl FileAuditSink {
         Self {
             path: store.root().join(AUDIT_LOG_FILE_NAME),
             fallback: Arc::new(|| Box::new(KernelAuditFallback::new())),
-            notify: Arc::new(|failure| {
-                let mut err = std::io::stderr().lock();
-                // stderr への書き込み失敗は握りつぶす（拒否経路を止めない）。
-                let _ = failure.write_json_line(&mut err);
-                let _ = err.flush();
-            }),
+            notify: stderr_notifier(),
         }
     }
 
@@ -142,11 +198,11 @@ mod tests {
     use super::*;
     use crate::audit_log::{
         AuditDelivery, AuditEvent, AuditPid, AuditReason, AuditTimestamp, AuditWriteError,
-        AuditWriteErrorKind, NoAuditFallback, encode_json_line, record_mount_rejection,
+        AuditWriteErrorKind, NoAuditFallback, record_mount_rejection,
     };
     use crate::traits::ErrorCode;
     use std::sync::Mutex;
-    use std::time::Duration;
+    use std::time::Instant;
 
     fn sample() -> AuditRecord {
         AuditRecord::new(
@@ -266,6 +322,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod linux {
         use super::*;
+        use crate::audit_log::encode_json_line;
         use crate::state_store::StateRoot;
         use std::os::unix::fs::{PermissionsExt, symlink};
 
@@ -323,5 +380,43 @@ mod tests {
             assert_eq!(std::fs::read(again.root().join("@revision")).unwrap(), rev);
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// 書き込みが戻らない出力先（満杯パイプ相当）。
+    struct Stuck(mpsc::Receiver<()>);
+
+    impl Write for Stuck {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            let _ = self.0.recv();
+            Ok(0)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// REPAIR-5・SEC-4・TASK-163: 通知先が無期限に詰まっても `record` は上限時間内に拒否結果を返す。
+    #[test]
+    fn repair5_task163_stuck_notifier_does_not_block_record() {
+        let (hold_tx, hold_rx) = mpsc::channel::<()>();
+        let notify = notifier_to(
+            move || Box::new(Stuck(hold_rx)),
+            2,
+            Duration::from_millis(50),
+        );
+        let f: FallbackFactory = Arc::new(|| Box::new(NoAuditFallback));
+        let sink = FileAuditSink::with_parts(missing_path(), f, notify);
+        let start = Instant::now();
+        // キュー上限を超える回数を呼んでも、各呼び出しが有限時間で戻る。
+        for _ in 0..6 {
+            let e = sink.record(&sample()).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::Internal);
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        drop(hold_tx);
     }
 }

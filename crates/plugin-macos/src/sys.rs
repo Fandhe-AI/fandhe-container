@@ -146,6 +146,55 @@ fn register() -> Result<(), PluginError> {
     Ok(())
 }
 
+/// 記録ファイル読み込み用の open（TASK-177.x の venus 再生器。REPAIR-5）。
+///
+/// unix では `O_NOFOLLOW | O_NONBLOCK` を付けて開く。検査から open までの間に FIFO へ差し替えられても
+/// open が書き手待ちでブロックせず、symlink へ差し替えられても末尾の symlink を辿らず `ELOOP` で失敗する。
+/// 呼び出し側は開いた fd の種別を `metadata` で必ず再検証する。`std::os::unix::fs::OpenOptionsExt` の
+/// `custom_flags` だけで済むため `unsafe` は使わない。フラグ値は OS・アーキテクチャで異なるため
+/// `cfg` で分け、値を確認済みの組（Linux x86_64 / aarch64・macOS）以外では通常の open にフォールバックする
+/// （その場合の保護は呼び出し側の事前検査と事後検証のみで、TOCTOU は塞がらない）。
+pub fn open_nofollow_nonblock(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Some(flags) = NOFOLLOW_NONBLOCK_FLAGS {
+            opts.custom_flags(flags);
+        }
+    }
+    opts.open(path)
+}
+
+/// `O_NOFOLLOW | O_NONBLOCK`（Linux x86_64: 0x20000 | 0x800）。
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const NOFOLLOW_NONBLOCK_FLAGS: Option<i32> = Some(0x20000 | 0x800);
+/// `O_NOFOLLOW | O_NONBLOCK`（Linux aarch64: 0x8000 | 0x800）。
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const NOFOLLOW_NONBLOCK_FLAGS: Option<i32> = Some(0x8000 | 0x800);
+/// `O_NOFOLLOW | O_NONBLOCK`（macOS: 0x100 | 0x4）。
+#[cfg(target_os = "macos")]
+const NOFOLLOW_NONBLOCK_FLAGS: Option<i32> = Some(0x100 | 0x4);
+/// フラグ値が未確認の unix。通常の open にフォールバックする。
+#[cfg(all(
+    unix,
+    not(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos"
+    ))
+))]
+const NOFOLLOW_NONBLOCK_FLAGS: Option<i32> = None;
+
+/// `O_NOFOLLOW` で symlink を開こうとしたときの errno（`ELOOP`。Linux 40・macOS 62）。
+#[cfg(target_os = "linux")]
+pub const ELOOP: i32 = 40;
+#[cfg(not(target_os = "linux"))]
+pub const ELOOP: i32 = 62;
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;

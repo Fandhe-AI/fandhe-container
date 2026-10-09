@@ -263,9 +263,10 @@ macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なし�
 - 実装済み（F1.1・#1516）: vhost-user メッセージの codec（`vhost_user`。10.5）。virtqueue・セッションは F1.3・F1.4 で実装
 - 実装済み（F1.2・#1517）: `SCM_RIGHTS` の fd 送受信とゲストメモリの mmap のラッパー（`vhost_user::fd_passing` / `guest_memory`・`src/sys.rs`。Linux 限定。10.6）
 - **受入基準 2（ゲストの Mesa venus の capset クエリが自前デコーダに届いたことをログで確認）は未達**。トランスポート（後続 F1）と実機実行（F3・#725。人間担当）が必要なため
-- 後続（issue 起票は未実施・承認待ち）: F1 vhost-user トランスポート（メッセージ codec・fd 受け渡しと `mmap` の `sys` ラッパー・split virtqueue・kick / call。rust-vmm 系クレートは MVM-4 で使えないため自作）、F2 残りの ctrl 応答（10.4 節。`RESOURCE_CREATE_BLOB`・`SUBMIT_3D` 等）、F3 実機疎通（#725）
+- 後続（issue 起票は未実施・承認待ち）: F1 vhost-user トランスポート（メッセージ codec・fd 受け渡しと `mmap` の `sys` ラッパー・split virtqueue・kick / call。rust-vmm 系クレートは MVM-4 で使えないため自作）、F2 残りの ctrl 応答（10.4 節。`RESOURCE_CREATE_BLOB`・`SUBMIT_3D` 等は F5.2・#1601 で実装済み。`MAP_BLOB` / `UNMAP_BLOB` は F5.2b）、F3 実機疎通（#725）
 - 実装済み（F1.3・#1518）: split virtqueue（`virtqueue`。10.7）
 - 実装済み（F1.4・#1519）: vhost-user のセッションと ctrl キューの応答ループ（`session`。Linux 限定。10.8）。受入基準 2 は F3（#725）の実機待ちのまま
+- 実装済み（F5.2・#1601）: `RESOURCE_CREATE_BLOB`・`CTX_ATTACH_RESOURCE` / `DETACH_RESOURCE`・`RESOURCE_UNREF`（資源表 `resource`。計上のみで実メモリは確保しない）と `SUBMIT_3D` の最小応答（受理して受け渡し点 `Handled::submit` へ渡す。dispatch はしない）。10.3・10.4.3
 - 後続（F5。#1599）: F5.1（#1600）で capset 以降の ctrl の列と治具の応答範囲を一次情報で確かめて 10.4 節に記録した。F5.2（#1601）は ctrl の応答（共有メモリを要しない部分）、F6（#1602）は記録、共有メモリの対応（F5.2b。issue 起票は未実施・承認待ち）は 10.4.4 節
 - CI: `make poc-venus-jig-check`（fmt-check・clippy・test）は CI の `rust-ci-default-features` ジョブが 3 OS で実行し、`crates/plugin-macos` 側の変更による治具の破損を検出する（実機前提テストは `#[ignore]` で分離済みで CI では走らない）
 
@@ -316,6 +317,24 @@ issue #1520（GPU-6・TASK-172 後続 F2）で追加した ctrl:
 - `venus_jig event=ctx cmd=CTX_DESTROY ctx_id=1 result=ok`
 
 要求長はコマンドごとにちょうどの値のみ受理する（PoC。余剰バイトも拒否）。
+
+issue #1601（GPU-6・TASK-172 後続 F5.2）で追加した ctrl（値は同じ `v6.12` の `virtio_gpu.h` を再取得して確認。SHA-256 一致）:
+
+| 項目 | 値 |
+| ---- | -- |
+| `RESOURCE_CREATE_BLOB` | 0x010c。要求長 56（ヘッダ + resource_id 4 + blob_mem 4 + blob_flags 4 + nr_entries 4 + blob_id 8 + size 8）。`blob_mem` = HOST3D（2）・`blob_flags` = MAPPABLE（1）・`blob_id` = 0・`nr_entries` = 0 だけ受理。size は 0 でなく 4096 の倍数で 16 MiB 以下。件数 256・合計 64 MiB の上限（案） |
+| `CTX_ATTACH_RESOURCE` / `CTX_DETACH_RESOURCE` | 0x0202 / 0x0203。要求長 32（ヘッダ + resource_id 4 + padding 4）。ヘッダの `ctx_id` が作成済みで、res が作成済みの組だけ成功 |
+| `RESOURCE_UNREF` | 0x0102。要求長 32。attach 中は `ERR_INVALID_PARAMETER`。ヘッダの ctx は問わない |
+| `SUBMIT_3D` | 0x0207。固定部 32（ヘッダ + size 4 + padding 4）+ 本体。`size` = 本体の実長、要求全体 4096 以下。`INFO_RING_IDX` が立つときだけ ring_idx < 64。本体 0 バイトも受理 |
+| 追加エラー | `ERR_INVALID_RESOURCE_ID` 0x1203（res_id 0・重複・未作成）。件数・合計の上限は `ERR_OUT_OF_MEMORY` 0x1201 |
+| 未実装のまま | `RESOURCE_MAP_BLOB` 0x0208 / `UNMAP_BLOB` 0x0209（`ERR_UNSPEC`。F5.2b） |
+
+ログ形式（数値と固定語彙のみ。復号できなかった値は -1。`blob_id` と本体のバイト列は出さない）:
+
+- `venus_jig event=resource cmd=RESOURCE_CREATE_BLOB ctx_id=1 res_id=1 blob_mem=2 blob_flags=1 size=135168 result=ok`
+- `venus_jig event=resource cmd=CTX_ATTACH_RESOURCE ctx_id=1 res_id=1 result=ok`（`CTX_DETACH_RESOURCE` も同形）
+- `venus_jig event=resource cmd=RESOURCE_UNREF res_id=1 result=ok`
+- `venus_jig event=submit_3d cmd=SUBMIT_3D ctx_id=1 ring_idx=0 size=256 venus_cmd=188 wire=ok result=ok`（`wire` は `ok` / `empty` / `none`〔拒否〕/ `venus_wire.*`）
 
 ### 10.4 capset 以降の ctrl の列と治具の応答範囲（F5.1・#1600）
 
@@ -384,6 +403,13 @@ Mesa は 2 層で読む。Mesa は ctrl を直接出さず、DRM ioctl を呼ぶ
 | `RESOURCE_MAP_BLOB` / `UNMAP_BLOB`（0x0208 / 0x0209） | **#1601 では未実装のまま**（`ERR_UNSPEC`）。ゲストカーネルが作成直後に出すので、実装するとき F5.2b | — | `offset` が共有メモリ領域の内側で、`offset + size` が領域内、他の map と重ならないこと（F5.2b への申し送り） | 要る。protocol feature `SHMEM` と `BACKEND_REQ`、`GET_SHMEM_CONFIG`、バックエンド要求 `SHMEM_MAP` / `SHMEM_UNMAP`。10.4.4 |
 | `SUBMIT_3D`（0x0207） | #1601: 受理して、ペイロードを記録の受け渡し点へ渡す。dispatch はしない（応答は `OK_NODATA` で、`FLAG_FENCE` なら fence を引き継ぐ） | ペイロードは上限つきの固定長（10.4.6） | ctx が作成済みか、`ring_idx` < 64（`INFO_RING_IDX` が立つときだけ見る。`NUM_RINGS`=64）、`size` とペイロード実長の一致。本体 0 バイトも受理 | 不要（既存の `SplitQueue` で連結できる範囲。10.4.6） |
 
+本 issue（#1601）で実装した内容（実装済み。上の表の「#1601:」の記述どおり）の補足:
+
+- `CTX_DESTROY` は、その ctx に attach 中の res を暗黙に detach する（本表に定めが無かったため #1601 で決めた）。ゲストのカーネルは GEM close（detach → unref）を先に出すが、順序が崩れても後続の `RESOURCE_UNREF` が拒否され続けないように、またスロット再利用時に古い所属が新しい ctx へ化けないようにするため。応答とログ行は変えない
+- `SUBMIT_3D` の本体が空でなければ先頭 8 バイトを `parse_command_header` で読むが、結果は応答の種別を変えない（ヘッダ不正・候補外の種別でも `OK_NODATA`）。治具は受け取りまでで実行しないので OK は「受け取った」の意味に留まり、検査結果はログ（`wire=`）と受け渡し点で #1602 / 解析側へ渡す
+- 受け渡し点は `adapter::Handled::submit`（`Submit3d`: ctx_id・ring_idx・fence_id・header・payload）。`session` は応答を書き戻せず adapter を巻き戻した要求の `submit` を捨てる契約で、ゲストが ACK を見ていない提出を記録しない。配線は #1602
+- 資源表は `CtrlAdapter` が所有する固定長配列（所属 ctx は ctx 表のスロット番号のビット集合）で、巻き戻しの対象に含まれる
+
 上限の根拠: Mesa が確保する共有メモリは、ring が 128 KiB に extra 4 バイトを足した大きさ（`vn_instance.c` 128〜140 行、`vn_ring.c` 262〜270 行付近のレイアウト。行番号は付近）、cs pool が 8 MiB、reply pool が 1 MiB（`vn_instance.c` 300〜312 行）。1 件 16 MiB は最大の cs pool の 2 倍、合計 64 MiB は同時に持つ ring・cs・reply の合計に余裕を足した値で、いずれも**案**（実機でプール拡張の挙動を確かめて#725 で見直す）。cs pool の拡張は `vn_cs.c` の `next_buffer_size` が倍々に増やすため、16 MiB を超える要求は拒否して Mesa に失敗を返す（`VK_ERROR_OUT_OF_DEVICE_MEMORY` で止まる見込みで、挙動は未確認）。
 
 #### 10.4.4 共有メモリの前提（F5.2b の要件）
@@ -425,7 +451,7 @@ Mesa は 2 層で読む。Mesa は ctrl を直接出さず、DRM ioctl を呼ぶ
 | `RESOURCE_CREATE_BLOB` の `GUEST` / `HOST3D_GUEST`・`USE_SHAREABLE` / `USE_CROSS_DEVICE` | ring・cs・reply の用途は HOST3D・MAPPABLE・`blob_id` 0 だけ。sg を要する経路は範囲外 |
 | `ERR_INVALID_SCANOUT_ID`（0x1202） | scanout を持たないため使わない |
 
-10.3 の表との対応: 既存の `GET_CAPSET_INFO` / `GET_CAPSET`・`GET_DISPLAY_INFO`・`CTX_CREATE` / `CTX_DESTROY` は変更しない。追加するのは上の表の `RESOURCE_CREATE_BLOB`・`CTX_ATTACH_RESOURCE` / `DETACH_RESOURCE`・`RESOURCE_UNREF`・`SUBMIT_3D` の応答で、`MAP_BLOB` / `UNMAP_BLOB` は引き続き未実装（`ERR_UNSPEC`）。製品版の ctrl 枠は TASK-175.1.3（#915）・TASK-176.1（#749）。
+10.3 の表との対応: 既存の `GET_CAPSET_INFO` / `GET_CAPSET`・`GET_DISPLAY_INFO`・`CTX_CREATE` / `CTX_DESTROY` は変更しない。追加するのは上の表の `RESOURCE_CREATE_BLOB`・`CTX_ATTACH_RESOURCE` / `DETACH_RESOURCE`・`RESOURCE_UNREF`・`SUBMIT_3D` の応答で、`MAP_BLOB` / `UNMAP_BLOB` は引き続き未実装（`ERR_UNSPEC`）。上の 5 種の応答は #1601 で実装済み。製品版の ctrl 枠は TASK-175.1.3（#915）・TASK-176.1（#749）。
 
 ### 10.5 vhost-user メッセージの値（F1.1・#1516）
 

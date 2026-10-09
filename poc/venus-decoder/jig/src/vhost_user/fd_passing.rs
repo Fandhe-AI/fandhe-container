@@ -209,10 +209,21 @@ pub fn send_with_fds(
     }
 }
 
-/// 長さ `len` の memfd（close-on-exec）を作る。テストと F1.4 の偽 frontend がゲストメモリ領域の代わりに使う。
+/// 長さ `len` の memfd（close-on-exec）を作り、縮小を禁じる `F_SEAL_SHRINK` を付ける。テストと F1.4 の偽 frontend が
+/// ゲストメモリ領域の代わりに使う（`GuestMemoryRegion::map` は縮小が封じられた fd だけを受け付ける）。
 /// `name` は `/proc/self/maps` に出る識別名で、秘密情報を入れない。
 pub fn create_memfd(name: &CStr, len: u64) -> Result<File, TransportError> {
-    let fd = sys::memfd_create_cloexec(name).map_err(TransportError::from_sys)?;
+    let fd = sys::memfd_create_cloexec(name, true).map_err(TransportError::from_sys)?;
+    let file = File::from(fd);
+    file.set_len(len).map_err(|e| TransportError::from_io(&e))?;
+    sys::fcntl_add_seals(file.as_fd(), sys::F_SEAL_SHRINK).map_err(TransportError::from_sys)?;
+    Ok(file)
+}
+
+/// [`create_memfd`] の seal なし版。`GuestMemoryRegion::map` の拒否経路（`SHRINK_NOT_SEALED`）の試験専用で、
+/// `MFD_ALLOW_SEALING` を付けないため後から seal を足せない。
+pub fn create_memfd_unsealed(name: &CStr, len: u64) -> Result<File, TransportError> {
+    let fd = sys::memfd_create_cloexec(name, false).map_err(TransportError::from_sys)?;
     let file = File::from(fd);
     file.set_len(len).map_err(|e| TransportError::from_io(&e))?;
     Ok(file)

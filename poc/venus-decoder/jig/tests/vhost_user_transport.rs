@@ -20,10 +20,10 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_poc_venus_jig::vhost_user::fd_passing::{
-        MAX_FDS, create_memfd, recv_with_fds, send_with_fds,
+        MAX_FDS, create_memfd, create_memfd_unsealed, recv_with_fds, send_with_fds,
     };
     use fandhe_container_poc_venus_jig::vhost_user::guest_memory::{
-        GuestMemory, GuestMemoryRegion, MAX_REGION_SIZE,
+        GuestMemory, GuestMemoryRegion, MAX_REGION_SIZE, MAX_TOTAL_MAP_LEN,
     };
     use fandhe_container_poc_venus_jig::vhost_user::{MemRegion, MemTable, TransportErrorCode};
 
@@ -298,5 +298,53 @@ mod linux {
         assert_eq!(e.code, TransportErrorCode::FileTooShort);
         assert_eq!(count_maps(&name), 0);
         assert_eq!(count_fds(&name), 0);
+    }
+
+    /// GPU-6・REPAIR-5: 縮小が封じられていない fd は map 前に `SHRINK_NOT_SEALED` で拒否する（SIGBUS 対策）。
+    #[test]
+    fn gpu6_unsealed_or_unsealable_fd_is_rejected_before_mmap() {
+        let name = unique_name("unsealed");
+        let c = CString::new(name.as_str()).expect("name");
+        let f = create_memfd_unsealed(&c, 0x1000).expect("memfd");
+        let e = GuestMemoryRegion::map(&f, &region(0, 0x1000, 0)).expect_err("no seal");
+        assert_eq!(e.code, TransportErrorCode::ShrinkNotSealed);
+        assert_eq!(e.code.as_str(), "SHRINK_NOT_SEALED");
+        assert_eq!(count_maps(&name), 0);
+        // seal 非対応の通常ファイル（F_GET_SEALS が EINVAL）も拒否する。長さが足りる場合でも同じ。
+        let exe = File::open("/proc/self/exe").expect("open exe");
+        let e = GuestMemoryRegion::map(&exe, &region(0, 1, 0)).expect_err("regular file");
+        assert_eq!(e.code, TransportErrorCode::ShrinkNotSealed);
+        // GuestMemory 経由でも同じ。
+        let g = create_memfd_unsealed(&c, 0x1000).expect("memfd");
+        let t = table(&[region(0, 0x1000, 0)]);
+        let e = GuestMemory::from_table(&t, vec![owned(g)]).expect_err("table");
+        assert_eq!(e.code, TransportErrorCode::ShrinkNotSealed);
+    }
+
+    /// GPU-6: seal 済みの memfd は map 後に縮められず、領域内のアクセスが SIGBUS にならない。
+    #[test]
+    fn gpu6_sealed_memfd_cannot_shrink_after_map() {
+        let f = memfd(&unique_name("seal"), 0x2000);
+        let r = GuestMemoryRegion::map(&f, &region(0, 0x2000, 0)).expect("map");
+        assert!(f.set_len(0).is_err(), "shrink must be refused by the seal");
+        let mut b = [0u8; 1];
+        r.read_at(0x1fff, &mut b).expect("still readable");
+    }
+
+    /// GPU-6: 合計上限は mmap より前に判定する（3 x 64 GiB は map されず `INVALID_REGION`）。
+    #[test]
+    fn gpu6_total_limit_is_checked_before_any_mmap() {
+        assert_eq!(MAX_TOTAL_MAP_LEN, 2 * MAX_REGION_SIZE);
+        let names: Vec<String> = (0..3).map(|i| unique_name(&format!("tot{i}"))).collect();
+        let fds: Vec<OwnedFd> = names.iter().map(|n| owned(memfd(n, 0x1000))).collect();
+        let g = MAX_REGION_SIZE;
+        let t = table(&[region(0, g, 0), region(g, g, 0), region(2 * g, g, 0)]);
+        let e = GuestMemory::from_table(&t, fds).expect_err("over total");
+        // 先に map していれば先頭領域が FILE_TOO_SHORT になる。mmap 前の判定なら INVALID_REGION。
+        assert_eq!(e.code, TransportErrorCode::InvalidRegion);
+        for n in &names {
+            assert_eq!(count_maps(n), 0);
+            assert_eq!(count_fds(n), 0);
+        }
     }
 }

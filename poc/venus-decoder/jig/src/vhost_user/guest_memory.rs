@@ -10,9 +10,11 @@
 //! `mmap_offset` の位置として扱う。ページ境界にそろっていない `mmap_offset` でも `EINVAL` にならず、ページサイズの
 //! 問い合わせも要らない。上限（[`MAX_REGION_SIZE`]・[`MAX_TOTAL_MAP_LEN`]）は mmap より前に検証する。
 //!
-//! # 残余リスク（PoC の割り切り）
-//! map 前にファイル長を検査するが、frontend が後から `ftruncate` で縮めると EOF を超えたアクセスは `SIGBUS` になる。
-//! frontend はローカルの VMM で、backend 側に seal を強制する手段は無い。製品版は TASK-173 系で扱う。
+//! # 縮小の封じ込め（SIGBUS 対策）
+//! map 前のファイル長検査だけでは、frontend が後から `ftruncate` で縮めると EOF を超えたアクセスが `SIGBUS` になり
+//! backend 全体が落ちる。このため `fcntl(F_GET_SEALS)` で `F_SEAL_SHRINK` を確認し、縮まないと確認できない fd
+//! （seal なしの memfd・seal 非対応の通常ファイル等）は `SHRINK_NOT_SEALED` で map せず拒否する（fail-closed）。
+//! seal は取り消せないので、確認後に縮むことは無い。長さの検査は seal の確認後に行う。
 //! 領域をまたぐアクセスは `OUT_OF_BOUNDS` で拒否する（PoC の割り切り）。`userspace_addr` は vring アドレスの変換
 //! （F1.3 / F1.4）で使うので [`GuestMemoryRegion::userspace_addr`] で保持だけし、ここでは使わない。
 
@@ -54,7 +56,8 @@ impl GuestMemoryRegion {
     ///
     /// - `memory_size` は 0 より大きく、`mmap_offset + memory_size`（map 長）は [`MAX_REGION_SIZE`] 以下（`INVALID_REGION`）
     /// - `guest_phys_addr + memory_size` と `mmap_offset + memory_size` が overflow しない（`INVALID_REGION`）
-    /// - ファイル長が map 長以上（`FILE_TOO_SHORT`）
+    /// - fd が `F_SEAL_SHRINK` つきで縮まない（`SHRINK_NOT_SEALED`。seal 非対応の fd の `EINVAL` もこれに含める）
+    /// - ファイル長が map 長以上（`FILE_TOO_SHORT`。seal の確認後に検査する）
     pub fn map(file: &File, region: &MemRegion) -> Result<Self, TransportError> {
         let bad = || err(TransportErrorCode::InvalidRegion);
         if region.memory_size == 0 {
@@ -71,6 +74,15 @@ impl GuestMemoryRegion {
             .ok_or_else(bad)?;
         let map_len_usize = usize::try_from(map_len).map_err(|_| bad())?;
         let map_offset = usize::try_from(region.mmap_offset).map_err(|_| bad())?;
+        match sys::fcntl_get_seals(file.as_fd()) {
+            Ok(seals) if seals & sys::F_SEAL_SHRINK != 0 => {}
+            Ok(_) => return Err(err(TransportErrorCode::ShrinkNotSealed)),
+            // seal 非対応の fd（通常ファイル等）。縮まない保証を確認できないので拒否する。
+            Err(sys::SysError::Os(n)) if n == sys::EINVAL => {
+                return Err(err(TransportErrorCode::ShrinkNotSealed));
+            }
+            Err(e) => return Err(TransportError::from_sys(e)),
+        }
         let file_len = file
             .metadata()
             .map_err(|e| TransportError::from_io(&e))?
@@ -151,22 +163,28 @@ impl GuestMemory {
     /// `table` の各領域を、同じ順序の `fds` と対応させて map する。
     ///
     /// 領域数と fd 数が違えば `FD_COUNT_MISMATCH`、GPA の範囲が重なれば `OVERLAPPING_REGIONS`、map 長の合計が
-    /// [`MAX_TOTAL_MAP_LEN`] を超えれば `INVALID_REGION`。途中で失敗しても map 済みの領域は `Drop` で解放される。
+    /// [`MAX_TOTAL_MAP_LEN`] を超えれば（mmap より前に判定して）`INVALID_REGION`。途中で失敗しても map 済みの領域は `Drop` で解放される。
     pub fn from_table(table: &MemTable, fds: Vec<OwnedFd>) -> Result<Self, TransportError> {
         let specs = table.regions();
         if specs.len() != fds.len() {
             return Err(err(TransportErrorCode::FdCountMismatch));
         }
-        let mut regions: Vec<GuestMemoryRegion> = Vec::with_capacity(specs.len());
+        // 合計の上限は mmap より前に checked 演算で検証する（超過入力でアドレス空間を確保しない）。
+        // 1 領域ごとの値検証は `GuestMemoryRegion::map` が行うので、ここでは map 長の合計だけを見る。
         let mut total: u64 = 0;
+        for spec in specs {
+            total = spec
+                .mmap_offset
+                .checked_add(spec.memory_size)
+                .filter(|len| *len <= MAX_REGION_SIZE)
+                .and_then(|len| total.checked_add(len))
+                .filter(|t| *t <= MAX_TOTAL_MAP_LEN)
+                .ok_or_else(|| err(TransportErrorCode::InvalidRegion))?;
+        }
+        let mut regions: Vec<GuestMemoryRegion> = Vec::with_capacity(specs.len());
         for (spec, fd) in specs.iter().zip(fds) {
             let file = File::from(fd);
             let region = GuestMemoryRegion::map(&file, spec)?;
-            // map 長は MAX_REGION_SIZE 以下で、領域数は 32 以下なので u64 の加算は溢れない。
-            total += u64::try_from(region.mapped_len()).unwrap_or(u64::MAX);
-            if total > MAX_TOTAL_MAP_LEN {
-                return Err(err(TransportErrorCode::InvalidRegion));
-            }
             // gpa + size の overflow は map 時に検証済み。
             let (start, end) = (region.gpa, region.gpa + region.size);
             if regions

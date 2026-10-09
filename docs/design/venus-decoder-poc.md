@@ -357,7 +357,7 @@ F1.1 の範囲外（申し送り）: 値の意味の検証（vring addr のア�
 
 ### 10.6 fd の受け渡しと共有メモリ（F1.2・#1517）
 
-frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲストメモリ領域の fd と eventfd を渡し、backend は `SET_MEM_TABLE` の領域を `mmap` して GPA 経由でアクセスする。rust-vmm 系は MVM-4 で使えないため自作し、crosvm の構造体やロジックは写していない。`unsafe` は `src/sys.rs` にだけ置く（個別承認: [#1517 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6074351741)。U1 `syscall` 宣言・U2 `recvmsg`・U3 受信 fd の所有・U4 `sendmsg`・U5 `memfd_create`・U6 `mmap`・U7 `Drop` の `munmap`・U8 境界検査後のコピー）。
+frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲストメモリ領域の fd と eventfd を渡し、backend は `SET_MEM_TABLE` の領域を `mmap` して GPA 経由でアクセスする。rust-vmm 系は MVM-4 で使えないため自作し、crosvm の構造体やロジックは写していない。`unsafe` は `src/sys.rs` にだけ置く（個別承認: [#1517 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6074351741)。U1 `syscall` 宣言・U2 `recvmsg`・U3 受信 fd の所有・U4 `sendmsg`・U5 `memfd_create`・U6 `mmap`・U7 `Drop` の `munmap`・U8 境界検査後のコピー。レビュー指摘で U9 `fcntl`〔`F_GET_SEALS` / `F_ADD_SEALS`〕を `sys` モジュールの事前承認の範囲で追加）。
 
 出典（確認日 2026-10-09。値だけを転記）: Linux UAPI ヘッダ（`linux-libc-dev`）の `asm-generic/socket.h`（SHA-256 `e833d32d3d8d03732021da6968665431d693ab4effdd4d39965ff05115a4ed21`）・`linux/socket.h`（`f4331fd201269894f63242a2521b3d5b3290ca556969011d7858908d5fe658c4`）・`asm-generic/mman-common.h`・`linux/memfd.h`、syscall 番号は `asm/unistd_64.h`（x86_64）と asm-generic `unistd.h`（aarch64）、man `recvmsg(2)`・`unix(7)`・`cmsg(3)`・`mmap(2)`・`memfd_create(2)`。
 
@@ -366,17 +366,19 @@ frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲスト
 | `sendmsg` / `recvmsg` | 46 / 47 | 211 / 212 |
 | `mmap` / `munmap` | 9 / 11 | 222 / 215 |
 | `memfd_create` | 319 | 279 |
+| `fcntl` | 72 | 25 |
+| `F_ADD_SEALS` / `F_GET_SEALS` / `F_SEAL_SHRINK` / `MFD_ALLOW_SEALING` | 1033 / 1034 / 0x2 / 0x2 | 同左（個別に定義） |
 | `SOL_SOCKET` / `SCM_RIGHTS` | 1 / 1 | 1 / 1 |
 | `MSG_CTRUNC` / `MSG_TRUNC` / `MSG_NOSIGNAL` / `MSG_CMSG_CLOEXEC` | 0x8 / 0x20 / 0x4000 / 0x4000_0000 | 同左（個別に定義） |
 
 設計判断:
 
-- `recvmsg` 等は `syscall(2)` 経由でカーネル ABI の `user_msghdr` / `cmsghdr` を直接使う（glibc / musl の `msghdr` のパディング差に依存しない）。`poll` / `fcntl` / `sysconf` は使わず、タイムアウト（REPAIR-5）は std の `set_read_timeout` / `set_write_timeout`（`SO_RCVTIMEO` / `SO_SNDTIMEO`）で実現する
+- `recvmsg` 等は `syscall(2)` 経由でカーネル ABI の `user_msghdr` / `cmsghdr` を直接使う（glibc / musl の `msghdr` のパディング差に依存しない）。`poll` / `sysconf` は使わず、タイムアウト（REPAIR-5）は std の `set_read_timeout` / `set_write_timeout`（`SO_RCVTIMEO` / `SO_SNDTIMEO`）で実現する
 - 受け取る fd は `MAX_FDS`（32）。受信した fd は検証より前にすべて `OwnedFd` にし、`MSG_CTRUNC`・上限超過・構造異常のどのエラー経路でも `Drop` で閉じる。`MSG_CMSG_CLOEXEC` で close-on-exec を原子的に付ける
 - map は file offset 0 から `mmap_offset + memory_size` バイトを `MAP_SHARED` で行い、領域の先頭をマップ内の `mmap_offset` の位置として扱う（ページ境界にそろっていない `mmap_offset` でも `EINVAL` にしない）。QEMU `vhost-user.rst` の `mmap_offset` の定義との照合は未実施で、F1.4 の結合で確認する
-- 上限は治具独自: 1 領域の map 長 64 GiB・合計 128 GiB。ファイル長が map 長に届かなければ `FILE_TOO_SHORT`。領域をまたぐアクセスは `OUT_OF_BOUNDS`（PoC の割り切り）
+- 上限は治具独自: 1 領域の map 長 64 GiB・合計 128 GiB。合計の上限は mmap より前に checked 演算で判定する（`INVALID_REGION`）。fd は `F_SEAL_SHRINK` が確認できなければ `SHRINK_NOT_SEALED` で拒否し（seal 非対応の fd も同様）、そのうえでファイル長が map 長に届かなければ `FILE_TOO_SHORT`。領域をまたぐアクセスは `OUT_OF_BOUNDS`（PoC の割り切り）
 - マッピングへの参照は作らず、境界検査したコピーだけで出し入れする。`MmapRegion` は `!Send` / `!Sync`
-- 残余リスク: frontend が後から `ftruncate` で縮めると `SIGBUS` になり得る（backend 側に seal を強制する手段が無い。製品版は TASK-173 系）
+- 縮小の封じ込め: frontend が後から `ftruncate` で縮めると `SIGBUS` になるため、`F_SEAL_SHRINK` つきの memfd だけを受け付ける。seal を付けない frontend は接続できない（PoC の割り切り。製品版の fd 要件は TASK-173 系で扱う）
 - aarch64 の定数と構造体は CI で型検査されない（治具はルート workspace 外で `aarch64-linux-check` の対象外）。固定値テストも実行アーキの分しか走らない。ローカルでは `cargo check --target aarch64-unknown-linux-gnu --all-targets` の型検査のみ通した（実行は未検証）
 - 範囲外: ヘッダ単位の読み書きの枠組み・セッション・UDS の bind と所有者・権限・peer credential の検証（PLUG-12 相当）・eventfd の待機は F1.4（#1519）、virtqueue と `userspace_addr` の変換は F1.3（#1518）
 

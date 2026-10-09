@@ -31,6 +31,8 @@ pub enum TransportErrorCode {
     InvalidRegion,
     /// ファイルが領域の末尾に届かない（EOF を超えるアクセスは SIGBUS になるため map 前に拒否する）。
     FileTooShort,
+    /// fd が縮まないことを確認できない（`F_SEAL_SHRINK` が無い・seal 非対応の fd）。後から縮むと SIGBUS になるため拒否する。
+    ShrinkNotSealed,
     /// 領域のゲスト物理アドレスの範囲が重なっている。
     OverlappingRegions,
     /// 領域数と受け取った fd 数が一致しない。
@@ -57,6 +59,7 @@ impl TransportErrorCode {
             Self::InvalidArgument => "INVALID_ARGUMENT",
             Self::InvalidRegion => "INVALID_REGION",
             Self::FileTooShort => "FILE_TOO_SHORT",
+            Self::ShrinkNotSealed => "SHRINK_NOT_SEALED",
             Self::OverlappingRegions => "OVERLAPPING_REGIONS",
             Self::FdCountMismatch => "FD_COUNT_MISMATCH",
             Self::OutOfBounds => "OUT_OF_BOUNDS",
@@ -117,6 +120,7 @@ impl TransportError {
             TransportErrorCode::InvalidArgument => "invalid argument",
             TransportErrorCode::InvalidRegion => "memory region values are invalid",
             TransportErrorCode::FileTooShort => "backing file is shorter than the region",
+            TransportErrorCode::ShrinkNotSealed => "backing file is not sealed against shrinking",
             TransportErrorCode::OverlappingRegions => "memory regions overlap",
             TransportErrorCode::FdCountMismatch => "region count does not match fd count",
             TransportErrorCode::OutOfBounds => "access is outside the memory region",

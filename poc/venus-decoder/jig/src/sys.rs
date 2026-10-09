@@ -9,6 +9,8 @@
 //! 個別承認の記録: <https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6074351741>。
 //! 承認範囲は U1 `syscall(2)` の `extern` 宣言・U2 `recvmsg`・U3 受信 fd の `OwnedFd::from_raw_fd`・U4 `sendmsg`・
 //! U5 `memfd_create` と `from_raw_fd`・U6 `mmap`・U7 `Drop` での `munmap`・U8 境界検査後の `copy_nonoverlapping`。
+//! U9 `fcntl`（`F_GET_SEALS` / `F_ADD_SEALS`。`syscall(2)` 経由。メモリに触れない薄いラッパー。F1.2 のレビュー指摘で追加。
+//! 各 crate の `sys` モジュールに置く syscall ラッパーの事前承認の範囲に収まる）。
 //! これを超える `unsafe`（`extern` 宣言の追加を含む）は書かない。`recvmsg` 等を直接 `extern` で宣言せず、すべて
 //! `syscall(2)` 経由にする。
 //!
@@ -25,7 +27,7 @@
 //! （SHA-256 `e833d32d3d8d03732021da6968665431d693ab4effdd4d39965ff05115a4ed21`）・`linux/socket.h`
 //! （`f4331fd201269894f63242a2521b3d5b3290ca556969011d7858908d5fe658c4`）・`asm-generic/mman-common.h`・`linux/memfd.h`、
 //! syscall 番号は x86_64 の `asm/unistd_64.h` と asm-generic の `unistd.h`、man `recvmsg(2)`・`unix(7)`・`cmsg(3)`・`mmap(2)`・
-//! `memfd_create(2)`。値だけを転記し、コードは流用していない。
+//! `memfd_create(2)`・`fcntl(2)`・`linux/fcntl.h`（`F_ADD_SEALS` / `F_GET_SEALS` / `F_SEAL_*`）。値だけを転記し、コードは流用していない。
 
 use std::ffi::CStr;
 use std::io;
@@ -54,6 +56,7 @@ mod consts {
     pub(crate) const NR_MMAP: i64 = 9;
     pub(crate) const NR_MUNMAP: i64 = 11;
     pub(crate) const NR_MEMFD_CREATE: i64 = 319;
+    pub(crate) const NR_FCNTL: i64 = 72;
     // asm-generic/socket.h・linux/socket.h・bits/socket.h の MSG_*。
     pub(crate) const SOL_SOCKET: i32 = 1;
     pub(crate) const SCM_RIGHTS: i32 = 1;
@@ -67,6 +70,11 @@ mod consts {
     pub(crate) const MAP_SHARED: usize = 0x1;
     // linux/memfd.h。
     pub(crate) const MFD_CLOEXEC: usize = 0x1;
+    pub(crate) const MFD_ALLOW_SEALING: usize = 0x2;
+    // linux/fcntl.h（F_LINUX_SPECIFIC_BASE = 1024 + 9 / 10、F_SEAL_*）。
+    pub(crate) const F_ADD_SEALS: usize = 1033;
+    pub(crate) const F_GET_SEALS: usize = 1034;
+    pub(crate) const F_SEAL_SHRINK: u32 = 0x2;
     // asm-generic/errno-base.h。
     pub(crate) const EINTR: i32 = 4;
     pub(crate) const EAGAIN: i32 = 11;
@@ -82,6 +90,7 @@ mod consts {
     pub(crate) const NR_MMAP: i64 = 222;
     pub(crate) const NR_MUNMAP: i64 = 215;
     pub(crate) const NR_MEMFD_CREATE: i64 = 279;
+    pub(crate) const NR_FCNTL: i64 = 25;
     pub(crate) const SOL_SOCKET: i32 = 1;
     pub(crate) const SCM_RIGHTS: i32 = 1;
     pub(crate) const MSG_TRUNC: u32 = 0x20;
@@ -92,6 +101,10 @@ mod consts {
     pub(crate) const PROT_WRITE: usize = 0x2;
     pub(crate) const MAP_SHARED: usize = 0x1;
     pub(crate) const MFD_CLOEXEC: usize = 0x1;
+    pub(crate) const MFD_ALLOW_SEALING: usize = 0x2;
+    pub(crate) const F_ADD_SEALS: usize = 1033;
+    pub(crate) const F_GET_SEALS: usize = 1034;
+    pub(crate) const F_SEAL_SHRINK: u32 = 0x2;
     pub(crate) const EINTR: i32 = 4;
     pub(crate) const EAGAIN: i32 = 11;
     pub(crate) const EINVAL: i32 = 22;
@@ -106,6 +119,7 @@ mod consts {
     pub(crate) const NR_MMAP: i64 = 0;
     pub(crate) const NR_MUNMAP: i64 = 0;
     pub(crate) const NR_MEMFD_CREATE: i64 = 0;
+    pub(crate) const NR_FCNTL: i64 = 0;
     pub(crate) const SOL_SOCKET: i32 = 0;
     pub(crate) const SCM_RIGHTS: i32 = 0;
     pub(crate) const MSG_TRUNC: u32 = 0;
@@ -116,15 +130,22 @@ mod consts {
     pub(crate) const PROT_WRITE: usize = 0;
     pub(crate) const MAP_SHARED: usize = 0;
     pub(crate) const MFD_CLOEXEC: usize = 0;
+    pub(crate) const MFD_ALLOW_SEALING: usize = 0;
+    pub(crate) const F_ADD_SEALS: usize = 0;
+    pub(crate) const F_GET_SEALS: usize = 0;
+    pub(crate) const F_SEAL_SHRINK: u32 = 0;
     pub(crate) const EINTR: i32 = 0;
     pub(crate) const EAGAIN: i32 = 0;
     pub(crate) const EINVAL: i32 = 0;
 }
 
-pub(crate) use consts::{EAGAIN, EINTR, MSG_CTRUNC, MSG_TRUNC, SCM_RIGHTS, SOL_SOCKET};
+pub(crate) use consts::{
+    EAGAIN, EINTR, EINVAL, F_SEAL_SHRINK, MSG_CTRUNC, MSG_TRUNC, SCM_RIGHTS, SOL_SOCKET,
+};
 use consts::{
-    EINVAL, MAP_SHARED, MFD_CLOEXEC, MSG_CMSG_CLOEXEC, MSG_NOSIGNAL, NR_MEMFD_CREATE, NR_MMAP,
-    NR_MUNMAP, NR_RECVMSG, NR_SENDMSG, PROT_READ, PROT_WRITE, SUPPORTED,
+    F_ADD_SEALS, F_GET_SEALS, MAP_SHARED, MFD_ALLOW_SEALING, MFD_CLOEXEC, MSG_CMSG_CLOEXEC,
+    MSG_NOSIGNAL, NR_FCNTL, NR_MEMFD_CREATE, NR_MMAP, NR_MUNMAP, NR_RECVMSG, NR_SENDMSG, PROT_READ,
+    PROT_WRITE, SUPPORTED,
 };
 
 unsafe extern "C" {
@@ -342,17 +363,51 @@ fn write_scm_rights(buf: &mut [u8], fds: &[BorrowedFd<'_>]) -> Result<(), SysErr
     Ok(())
 }
 
-/// close-on-exec の memfd を作る（U5）。
-pub(crate) fn memfd_create_cloexec(name: &CStr) -> Result<OwnedFd, SysError> {
+/// close-on-exec の memfd を作る（U5）。`allow_sealing` が真なら `MFD_ALLOW_SEALING` を付け、後から seal を追加できる
+/// （偽だと `F_SEAL_SEAL` 済みで seal を足せない。seal 検査の拒否試験用）。
+pub(crate) fn memfd_create_cloexec(name: &CStr, allow_sealing: bool) -> Result<OwnedFd, SysError> {
     if !SUPPORTED {
         return Err(SysError::Unsupported);
     }
+    let flags = if allow_sealing {
+        MFD_CLOEXEC | MFD_ALLOW_SEALING
+    } else {
+        MFD_CLOEXEC
+    };
     // SAFETY: `name` は NUL 終端の C 文字列で、呼び出し中は生きている。`memfd_create(name, flags)` は引数の
     // ポインタを読むだけで保持しない。
-    let ret = unsafe { syscall(NR_MEMFD_CREATE, name.as_ptr() as usize, MFD_CLOEXEC) };
+    let ret = unsafe { syscall(NR_MEMFD_CREATE, name.as_ptr() as usize, flags) };
     let fd = i32::try_from(check(ret)?).map_err(|_| SysError::Os(EINVAL))?;
     // SAFETY: 成功した `memfd_create` が新規に返した fd で、他に所有者がいない。
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// `fcntl(fd, F_GET_SEALS)` で seal のビット集合を得る（U9）。seal 非対応の fd（通常ファイル等）は `EINVAL`。
+pub(crate) fn fcntl_get_seals(fd: BorrowedFd<'_>) -> Result<u32, SysError> {
+    if !SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `fd` は `BorrowedFd` で有効。`F_GET_SEALS` は第 3 引数を取らず、fd の状態を読むだけでメモリに触れない。
+    let ret = unsafe { syscall(NR_FCNTL, fd.as_raw_fd() as usize, F_GET_SEALS) };
+    u32::try_from(check(ret)?).map_err(|_| SysError::Os(EINVAL))
+}
+
+/// `fcntl(fd, F_ADD_SEALS, seals)` で seal を追加する（U9）。`MFD_ALLOW_SEALING` の memfd だけが成功する。
+pub(crate) fn fcntl_add_seals(fd: BorrowedFd<'_>, seals: u32) -> Result<(), SysError> {
+    if !SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `fd` は `BorrowedFd` で有効。`F_ADD_SEALS` の第 3 引数は seal のビット値そのもの（ポインタではない）で、
+    // メモリには触れない。
+    let ret = unsafe {
+        syscall(
+            NR_FCNTL,
+            fd.as_raw_fd() as usize,
+            F_ADD_SEALS,
+            seals as usize,
+        )
+    };
+    check(ret).map(|_| ())
 }
 
 /// `mmap` した共有マッピング。`Drop` で `munmap` する。生ポインタを持つので `!Send` / `!Sync`（そのままにする）。
@@ -368,7 +423,8 @@ pub(crate) struct MmapRegion {
 impl MmapRegion {
     /// `fd` の先頭 `len` バイトを `PROT_READ | PROT_WRITE`・`MAP_SHARED` で map する（U6）。
     ///
-    /// `len` が fd の実長以下かは呼び出し側が検証する（超えた範囲へのアクセスは SIGBUS になる）。
+    /// `len` が fd の実長以下か、およびその後に縮まない（`F_SEAL_SHRINK`）ことは呼び出し側が検証する（EOF を超えた
+    /// 範囲へのアクセスは SIGBUS になる）。
     pub(crate) fn map_shared(fd: BorrowedFd<'_>, len: NonZeroUsize) -> Result<Self, SysError> {
         if !SUPPORTED {
             return Err(SysError::Unsupported);
@@ -482,16 +538,34 @@ mod tests {
             (PROT_READ, PROT_WRITE, MAP_SHARED, MFD_CLOEXEC),
             (1, 2, 1, 1)
         );
+        assert_eq!(
+            (MFD_ALLOW_SEALING, F_ADD_SEALS, F_GET_SEALS, F_SEAL_SHRINK),
+            (2, 1033, 1034, 2)
+        );
         assert_eq!((EINTR, EAGAIN, EINVAL), (4, 11, 22));
         #[cfg(target_arch = "x86_64")]
         assert_eq!(
-            (NR_SENDMSG, NR_RECVMSG, NR_MMAP, NR_MUNMAP, NR_MEMFD_CREATE),
-            (46, 47, 9, 11, 319)
+            (
+                NR_SENDMSG,
+                NR_RECVMSG,
+                NR_MMAP,
+                NR_MUNMAP,
+                NR_MEMFD_CREATE,
+                NR_FCNTL
+            ),
+            (46, 47, 9, 11, 319, 72)
         );
         #[cfg(target_arch = "aarch64")]
         assert_eq!(
-            (NR_SENDMSG, NR_RECVMSG, NR_MMAP, NR_MUNMAP, NR_MEMFD_CREATE),
-            (211, 212, 222, 215, 279)
+            (
+                NR_SENDMSG,
+                NR_RECVMSG,
+                NR_MMAP,
+                NR_MUNMAP,
+                NR_MEMFD_CREATE,
+                NR_FCNTL
+            ),
+            (211, 212, 222, 215, 279, 25)
         );
     }
 }

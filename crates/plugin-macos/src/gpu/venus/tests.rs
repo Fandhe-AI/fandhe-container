@@ -410,3 +410,55 @@ fn task172_2_gpu6_error_codes_fixed() {
         assert!(e.to_string().starts_with(code));
     }
 }
+
+/// B1: 件数 × 最小要素長が残りバイト数を超える配列を拒否する（GPU-6・REPAIR-5）。
+#[test]
+fn b1_gpu6_array_len_sized_rejects_count_exceeding_remaining() {
+    let mk = |tail: usize| {
+        let mut b = 3u64.to_le_bytes().to_vec();
+        b.extend(std::iter::repeat_n(0u8, tail));
+        b
+    };
+    let b = mk(16);
+    assert_eq!(
+        WireReader::new(&b).read_array_len_sized(MAX_ARRAY_LEN, 8),
+        Err(VenusWireError::Truncated {
+            needed: 24,
+            remaining: 16
+        })
+    );
+    let b = mk(23);
+    assert_eq!(
+        WireReader::new(&b).read_array_len_sized(MAX_ARRAY_LEN, 8),
+        Err(VenusWireError::Truncated {
+            needed: 24,
+            remaining: 23
+        })
+    );
+    let b = mk(24);
+    assert_eq!(
+        WireReader::new(&b).read_array_len_sized(MAX_ARRAY_LEN, 8),
+        Ok(3)
+    );
+}
+
+/// B1: 積の溢れと件数上限超過は `LengthExceeded`。
+#[test]
+fn b1_gpu6_array_len_sized_overflow_and_max() {
+    let b = MAX_ARRAY_LEN.to_le_bytes();
+    assert_eq!(
+        WireReader::new(&b).read_array_len_sized(MAX_ARRAY_LEN, usize::MAX),
+        Err(VenusWireError::LengthExceeded {
+            requested: MAX_ARRAY_LEN,
+            max: MAX_ARRAY_LEN
+        })
+    );
+    let b = (MAX_ARRAY_LEN + 1).to_le_bytes();
+    assert_eq!(
+        WireReader::new(&b).read_array_len_sized(MAX_ARRAY_LEN, 1),
+        Err(VenusWireError::LengthExceeded {
+            requested: MAX_ARRAY_LEN + 1,
+            max: MAX_ARRAY_LEN
+        })
+    );
+}

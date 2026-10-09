@@ -9,9 +9,10 @@ macOS の virtio-gpu Venus 自前実装（ヘッドレス Vulkan compute のみ�
 - 後続・関連: #723（wire パース骨格）・#724（capset 応答。実装済み）・#889（コマンドストリーム記録）・#888（試験治具。アダプタまで実装済み・トランスポート未実装）・#725（1〜3 段目の結果）・#726（確定）・#776 / #777（対象範囲判断・工数再確定）・#781（サブセットのフィルタ機構）。ディスパッチ・ハンドラ群は TASK-177.x（#765・#769・#771・#773・#774）
 - 出典（spec）: GPU-6・TASK-172・D-15・PoC-14（submodule リビジョン `984f8a2`）。作業環境で `docs/spec` を取得できなかったため、spec 本文は参照せず ID のみで辿れるようにしている
 - 出典（外部。確認日 2026-10-08）:
-  - Vulkan レジストリ `vk.xml`: KhronosGroup/Vulkan-Headers のタグ `vulkan-sdk-1.4.363.0`（`registry/vk.xml`。`VK_HEADER_VERSION` 363。SHA-256 `55ec60950cfb18c3575dcf5fd52741b2bb70eb1e466408f803a91049973ee6fb`）
-  - venus 固有コマンド: virgl/venus-protocol（freedesktop.org の GitLab）のタグ `v1.1.3`（コミット `ca19b6358d7c`）の `xmls/VK_MESA_venus_protocol.xml`（SHA-256 `d92839bc728fa9ad9a7decdc6b91df6fa1a0fb26cffae4009865f18a789e0535`）
-  - Mesa Venus ドキュメント（docs.mesa3d.org/drivers/venus.html）・MoltenVK Runtime User Guide（KhronosGroup/MoltenVK の `Docs/MoltenVK_Runtime_UserGuide.md`）
+  - Vulkan レジストリ `vk.xml`: KhronosGroup/Vulkan-Headers のタグ `vulkan-sdk-1.4.363.0`（`registry/vk.xml`。`VK_HEADER_VERSION` 363。SHA-256 `55ec60950cfb18c3575dcf5fd52741b2bb70eb1e466408f803a91049973ee6fb`）。ライセンス: ファイル内 SPDX `Apache-2.0 OR MIT`（Copyright 2015-2026 The Khronos Group Inc.）
+  - venus 固有コマンド: virgl/venus-protocol（freedesktop.org の GitLab）のタグ `v1.1.3`（コミット `ca19b6358d7c`）の `xmls/VK_MESA_venus_protocol.xml`（SHA-256 `d92839bc728fa9ad9a7decdc6b91df6fa1a0fb26cffae4009865f18a789e0535`）。ライセンス: ファイル内 SPDX `Apache-2.0 OR MIT`（Copyright 2020 Google LLC）。同タグの `xmls/VK_EXT_command_serialization.xml` も同じ SPDX・著作権者
+  - Mesa Venus ドキュメント（docs.mesa3d.org/drivers/venus.html）（ページ自体に SPDX は無い。Mesa の `docs/license.rst`〔`mesa-25.0.0`〕は「コアは MIT、個別ファイルは固有ライセンスがありうる」とし、`docs/drivers/venus.rst` に個別のライセンス表記は無い。ドキュメントの個別ライセンスは未確認）・MoltenVK Runtime User Guide（KhronosGroup/MoltenVK の `Docs/MoltenVK_Runtime_UserGuide.md`。`main` のコミット `67b2682699d7` で確認、SHA-256 `6939c675f01e20acd5fcff05a586530055c31a0d0bf94d3813d9eab93763f769`。同コミットの `LICENSE` は Apache License 2.0 の標準全文で SPDX 行は無く、著作権者の記載も無い）
+  - 帰属表示（NOTICE 等）の要否: **未決**（ユーザー判断待ち。#1603 で報告）。転記は値（事実情報）のみでコードは流用していない
 
 ## 1. 前提と範囲
 
@@ -159,7 +160,7 @@ GPU-6 の決定（ヘッドレス compute のみ・2D スキャンアウト非�
 - 確認した wire 規則（venus-protocol `v1.1.3`・コミット `ca19b6358d7c` の `docs/VK_EXT_command_serialization.txt`）: リトルエンディアン。コマンドは DW0 = `VkCommandTypeEXT`、DW1 = `VkCommandFlagsEXT`、DW2.. = 引数。長さは種別から暗黙に決まり、未知の種別は読み飛ばせない。ポインタ・配列は 64bit 件数＋値列で、末尾を 32bit にパディングする。ハンドルは 64bit。enum は `int32_t`。フラグで定義済みのビットは `VK_COMMAND_GENERATE_REPLY_BIT_EXT`（bit 0）のみ
 - ID の出典: 同タグの `xmls/VK_EXT_command_serialization.xml`（SHA-256 `2451e5dcc5306f604c52da48a8cc883a24de708dd86f38bbb035d29a753a0474`）。`xmls/VK_MESA_venus_protocol.xml`（SHA-256 は前掲）の記載と一致することを確認した。3 章の候補 116 件（必須 62・推奨 22・保留 32）すべてについてコマンド名から ID を機械抽出し、欠落 0 件、ID 重複なしを確認した。同じ対応表をテスト（`task172_2_gpu6_candidate_table_matches_command_type`）で照合している
 - パース済み: 境界検査つきカーソル（`WireReader`）、候補コマンド種別（`CommandType`）、フラグ（`CommandFlags`。定義外ビットは拒否）、ヘッダ（`parse_command_header`）、構造化エラー（`VenusWireError`。`venus_wire.*`）
-- fail-closed: 候補外・未知の種別は `unsupported_command` でストリームを拒否する。配列件数は `MAX_ARRAY_LEN` で確保前に検証する
+- fail-closed: 候補外・未知の種別は `unsupported_command` でストリームを拒否する。配列件数は `MAX_ARRAY_LEN` と、要素の最小 wire サイズ × 件数 ≤ 残りバイト数（`read_array_len_sized`）で確保前に検証する。入れ子の配列では呼び出し側が累積の予算を持つ
 - 先送り: コマンドごとの引数パース・ディスパッチ（TASK-177.x: #765・#769・#771・#773・#774）、reply の符号化、ring、frame_loop／adapter への配線。優先度は確定扱いにしない
 
 ## 7. コマンドストリームの記録と再生ハーネス（TASK-172.5・#889）
@@ -183,11 +184,11 @@ GPU-6 の決定（ヘッドレス compute のみ・2D スキャンアウト非�
 | | payload | N B | |
 | | checksum | 4 B | CRC-32C（kind から payload まで） |
 
-- 保証範囲: `validate` が全レコードのチェックサム・seqno 連続・余剰バイト無しまで確認し、`ValidatedRecording` を返す。`replay` はこの型しか受け取らず、さらに全レコードの先頭がコマンドヘッダとして有効かを提出前に検査する。長さ・件数・ファイル全体長（256 MiB）は確保前に検証する。CRC-32C は偶発的な破損の検出用で、改ざん耐性はない（署名・ハッシュ照合は将来課題）
+- 保証範囲: `validate` が全レコードのチェックサム・seqno 連続・余剰バイト無しまで確認し、`ValidatedRecording` を返す。`replay` はこの型しか受け取らず、さらに全レコードの先頭がコマンドヘッダとして有効かを提出前に検査する。ファイルは `read_recording_file` が読む。開く前（`symlink_metadata`）と開いた後（fd の `metadata`）に通常ファイルであることを確かめ（symlink・ディレクトリ・FIFO・デバイスは `not_regular_file`。FIFO の open によるブロックを避ける）、全体長（256 MiB）を読み込み前に検証し、読み込みは上限 + 1 バイトで打ち切る。`validate` は受け取り済みの `&[u8]` の長さと件数を検査するだけで、件数による `Vec` 確保は残りバイト数 / 16 で頭打ちにする。観測（REPAIR-4）: `read_recording_file_observed` が早期拒否・I/O エラーを含む全終了経路で結果コード・終了段階・バイト数・所要時間（`ReadObservation`。path と内容は含めない）を返し、呼び出し側が構造化ログ / メトリクスへ流す。TOCTOU: Linux x86_64 / aarch64 と macOS では `sys::open_nofollow_nonblock`（`O_NOFOLLOW | O_NONBLOCK`）で開くため、検査後の FIFO 差し替えは open がブロックせず、末尾 symlink 差し替えは `ELOOP` で `not_regular_file` になり、fd の `metadata` 再確認で種別も弾く。残存リスク: フラグ値が未確認の OS では通常の open にフォールバックし、検査から open までの差し替えは塞がらない（事後の fd 検証のみ）。親ディレクトリ要素の差し替えも対象外。CRC-32C は偶発的な破損の検出用で、改ざん耐性はない（署名・ハッシュ照合は将来課題）
 - 配置の逸脱: issue 記載の `poc/venus-decoder/replay/` ではなく既存骨格の隣に置いた。`poc/` は存在せず、新設には workspace メンバー追加（ルート `Cargo.toml` の変更）が要る。再生器は同モジュールの `parse_command_header` を直接使う
 - 取り扱い: 実機で採取したストリームにはワークロード由来のデータが含まれうる。テストの fixture は合成データのみで、実ストリームはリポジトリにコミットしない
 - **未達（実装済みを装わない。REPAIR-3）**: 受け入れ条件「lavapipe 上で記録を再生し、最小 compute の結果が記録時と一致する」は本書時点で未達。理由は (1) コマンド引数のパース・Vulkan ディスパッチが未実装（TASK-177.x）、(2) lavapipe 実行に Vulkan バインディング（外部クレートまたは自前 FFI。依存追加・`unsafe` の承認が必要）が要る、(3) 実ストリームの採取は #725（人間担当）。再生先は `ReplayBackend` トレイトの差し替え点として定義し、`CollectingBackend`（提出内容を保持する模擬）でのみ検証している
-- 先送り: reply ストリーム・期待出力レコード（kind の番号のみ未割当）、実機側の記録フック配線（#888・#725）
+- 先送り: reply ストリーム・期待出力レコード（kind の番号は未割当。REPAIR-3）、実機側の記録フック配線（#888・#725）
 
 ## 8. capset 応答（TASK-172.3・#724）
 
@@ -263,9 +264,11 @@ macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なし�
 - 実装済み（F1.1・#1516）: vhost-user メッセージの codec（`vhost_user`。10.5）。virtqueue・セッションは F1.3・F1.4 で実装
 - 実装済み（F1.2・#1517）: `SCM_RIGHTS` の fd 送受信とゲストメモリの mmap のラッパー（`vhost_user::fd_passing` / `guest_memory`・`src/sys.rs`。Linux 限定。10.6）
 - **受入基準 2（ゲストの Mesa venus の capset クエリが自前デコーダに届いたことをログで確認）は未達**。トランスポート（後続 F1）と実機実行（F3・#725。人間担当）が必要なため
-- 後続（issue 起票は未実施・承認待ち）: F1 vhost-user トランスポート（メッセージ codec・fd 受け渡しと `mmap` の `sys` ラッパー・split virtqueue・kick / call。rust-vmm 系クレートは MVM-4 で使えないため自作）、F2 残りの ctrl 応答（10.4 節。`RESOURCE_CREATE_BLOB`・`SUBMIT_3D` 等）、F3 実機疎通（#725）
+- 後続（issue 起票は未実施・承認待ち）: F1 vhost-user トランスポート（メッセージ codec・fd 受け渡しと `mmap` の `sys` ラッパー・split virtqueue・kick / call。rust-vmm 系クレートは MVM-4 で使えないため自作）、F2 残りの ctrl 応答（10.4 節。`RESOURCE_CREATE_BLOB`・`SUBMIT_3D` 等は F5.2・#1601 で実装済み。`MAP_BLOB` / `UNMAP_BLOB` は F5.2b）、F3 実機疎通（#725）
 - 実装済み（F1.3・#1518）: split virtqueue（`virtqueue`。10.7）
 - 実装済み（F1.4・#1519）: vhost-user のセッションと ctrl キューの応答ループ（`session`。Linux 限定。10.8）。受入基準 2 は F3（#725）の実機待ちのまま
+- 実装済み（F5.2・#1601）: `RESOURCE_CREATE_BLOB`・`CTX_ATTACH_RESOURCE` / `DETACH_RESOURCE`・`RESOURCE_UNREF`（資源表 `resource`。計上のみで実メモリは確保しない）と `SUBMIT_3D` の最小応答（受理して受け渡し点 `Handled::submit` へ渡す。dispatch はしない）。10.3・10.4.3
+- 後続（F5。#1599）: F5.1（#1600）で capset 以降の ctrl の列と治具の応答範囲を一次情報で確かめて 10.4 節に記録した。F5.2（#1601）は ctrl の応答（共有メモリを要しない部分）、F6（#1602）は記録、共有メモリの対応（F5.2b。issue 起票は未実施・承認待ち）は 10.4.4 節
 - CI: `make poc-venus-jig-check`（fmt-check・clippy・test）は CI の `rust-ci-default-features` ジョブが 3 OS で実行し、`crates/plugin-macos` 側の変更による治具の破損を検出する（実機前提テストは `#[ignore]` で分離済みで CI では走らない）
 
 ### 10.2 候補比較
@@ -280,13 +283,13 @@ macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なし�
 | virglrenderer の render server（`virgl_render_server`） | virglrenderer 利用側が必要。単体では VMM ではない | VMM 次第 | capset を server へ転送するか未確認 | MIT | — |
 | Cloud Hypervisor・Firecracker | — | — | — | — | 比較対象外（GPU デバイスを持たず、依存・流用は禁止。dependency-policy） |
 
-決め手: Mesa venus（`mesa-25.0.0` の `src/virtio/vulkan/vn_renderer_virtgpu.c`。`required_params`）は capset 取得より前に 3D 機能・`CAPSET_QUERY_FIX`・`RESOURCE_BLOB`・`CONTEXT_INIT` を必須として検査し、欠けると初期化を中止する。治具 VMM がゲストへ `VIRGL`・`RESOURCE_BLOB`・`CONTEXT_INIT` を見せられることが capset クエリ発行の前提になる。
+決め手: Mesa venus（`mesa-25.0.0` の `src/virtio/vulkan/vn_renderer_virtgpu.c`。`required_params`）は capset 取得より前に 3D 機能・`CAPSET_QUERY_FIX`・`RESOURCE_BLOB`・`CONTEXT_INIT` を必須として検査し、欠けると初期化を中止する。治具 VMM がゲストへ `VIRGL`・`RESOURCE_BLOB`・`CONTEXT_INIT` を見せられることが capset クエリ発行の前提になる。ただし `required_params` の後に、`HOST_VISIBLE`（virtio の共有メモリ領域 id 1）か `GUEST_VRAM` の一方も必須で、mainline カーネルでは前者だけが成立しうる。共有メモリ領域が無いと capset 取得まで届かない見込みである（10.4 節）。
 
 選定（暫定）: **crosvm の vhost-user frontend**。BSD-3-Clause で改変不要の見込みであり、feature が素通しされる。QEMU を使う場合は GPL の VMM バイナリを外部プロセスとして実行するだけでリンクせず、汎用デバイスの有効化には GPL の改変ビルドが要る。この扱いは**要確認（ユーザー判断。licensing.md）**。`use_guest_vram`（8 章）は選定した VMM の共有メモリ方式に従属し、3 段目（#1057）まで未決。
 
 ### 10.3 ctrl の値と広告 feature
 
-出典: Linux `include/uapi/linux/virtio_gpu.h` タグ `v6.12`（確認日 2026-10-08。SHA-256 `7c9e2f7d47fa0b1a2c737fc5a741f57c5cf25303dd5c68c2c9738e9bb761eee6`）。値のみ転記。
+出典: Linux `include/uapi/linux/virtio_gpu.h` タグ `v6.12`（確認日 2026-10-08。SHA-256 `7c9e2f7d47fa0b1a2c737fc5a741f57c5cf25303dd5c68c2c9738e9bb761eee6`）。値のみ転記。ライセンス: ファイル先頭に SPDX 行は無く、BSD 系の許諾文（3 条項。「This header is BSD licensed」、Copyright Red Hat, Inc. 2013-2014、3 条項目の名指しは IBM）が書かれている。SPDX 表記は `BSD-3-Clause` 相当だが、ファイルに SPDX は無いため断定せず原文を正とする。帰属表示の要否は未決（#1603 で報告）。
 
 | 項目 | 値 |
 | ---- | -- |
@@ -316,9 +319,140 @@ issue #1520（GPU-6・TASK-172 後続 F2）で追加した ctrl:
 
 要求長はコマンドごとにちょうどの値のみ受理する（PoC。余剰バイトも拒否）。
 
-### 10.4 未実装の ctrl（REPAIR-3）
+issue #1601（GPU-6・TASK-172 後続 F5.2）で追加した ctrl（値は同じ `v6.12` の `virtio_gpu.h` を再取得して確認。SHA-256 一致）:
 
-Mesa venus が capset 取得の後に発行する ctrl の一次情報（`mesa-25.0.0` の `vn_renderer_virtgpu.c`）は**本 PR では未確認**。推測で確定させず、`virtio_gpu.h`（v6.12）上の 3D 系の候補だけを挙げる。いずれも**未実装（`ERR_UNSPEC`）**: `RESOURCE_CREATE_BLOB`（0x010c）・`RESOURCE_MAP_BLOB` / `UNMAP_BLOB`（0x0208 / 0x0209）・`CTX_ATTACH_RESOURCE` / `DETACH_RESOURCE`（0x0202 / 0x0203）・`SUBMIT_3D`（0x0207）・`RESOURCE_UNREF`（0x0102）。製品版の ctrl 枠は TASK-175.1.3（#915）・TASK-176.1（#749）。
+| 項目 | 値 |
+| ---- | -- |
+| `RESOURCE_CREATE_BLOB` | 0x010c。要求長 56（ヘッダ + resource_id 4 + blob_mem 4 + blob_flags 4 + nr_entries 4 + blob_id 8 + size 8）。`blob_mem` = HOST3D（2）・`blob_flags` = MAPPABLE（1）・`blob_id` = 0・`nr_entries` = 0 だけ受理。size は 0 でなく 4096 の倍数で 16 MiB 以下。件数 256・合計 64 MiB の上限（案） |
+| `CTX_ATTACH_RESOURCE` / `CTX_DETACH_RESOURCE` | 0x0202 / 0x0203。要求長 32（ヘッダ + resource_id 4 + padding 4）。ヘッダの `ctx_id` が作成済みで、res が作成済みの組だけ成功 |
+| `RESOURCE_UNREF` | 0x0102。要求長 32。attach 中は `ERR_INVALID_PARAMETER`。ヘッダの ctx は問わない |
+| `SUBMIT_3D` | 0x0207。固定部 32（ヘッダ + size 4 + padding 4）+ 本体。`size` = 本体の実長、要求全体 4096 以下。`INFO_RING_IDX` が立つときだけ ring_idx < 64。本体 0 バイトも受理 |
+| 追加エラー | `ERR_INVALID_RESOURCE_ID` 0x1203（res_id 0・重複・未作成）。件数・合計の上限は `ERR_OUT_OF_MEMORY` 0x1201 |
+| 未実装のまま | `RESOURCE_MAP_BLOB` 0x0208 / `UNMAP_BLOB` 0x0209（`ERR_UNSPEC`。F5.2b） |
+
+ログ形式（数値と固定語彙のみ。復号できなかった値は -1。`blob_id` と本体のバイト列は出さない）:
+
+- `venus_jig event=resource cmd=RESOURCE_CREATE_BLOB ctx_id=1 res_id=1 blob_mem=2 blob_flags=1 size=135168 result=ok`
+- `venus_jig event=resource cmd=CTX_ATTACH_RESOURCE ctx_id=1 res_id=1 result=ok`（`CTX_DETACH_RESOURCE` も同形）
+- `venus_jig event=resource cmd=RESOURCE_UNREF res_id=1 result=ok`
+- `venus_jig event=submit_3d cmd=SUBMIT_3D ctx_id=1 ring_idx=0 size=256 venus_cmd=188 wire=ok result=ok`（`wire` は `ok` / `empty` / `none`〔拒否〕/ `venus_wire.*`）
+
+### 10.4 capset 以降の ctrl の列と治具の応答範囲（F5.1・#1600）
+
+TASK-172 後続 F5（#1599）の一次情報の確認。結論を先に書く。コードは変えていない（`poc/venus-decoder/jig/` は未変更）。
+
+- **結論 1（前提の不足）**: Mesa venus は capset を取る前に `virtgpu_init_params` で `VIRTGPU_PARAM_HOST_VISIBLE` か `VIRTGPU_PARAM_GUEST_VRAM` の一方を必須にしている。mainline カーネルの `HOST_VISIBLE` は virtio の共有メモリ領域 `VIRTIO_GPU_SHM_ID_HOST_VISIBLE`（id 1）が見えるときだけ真になり、`GUEST_VRAM` は mainline v6.12 に case が無い。今の治具は protocol feature を MQ と CONFIG しか広告せず共有メモリ領域を見せないので、**Mesa は `GET_CAPSET` も `CTX_CREATE` も出す前に中止する見込み**になる。10.2 節の「決め手」と #888 の受入基準 2 の前提（`required_params` を満たせば capset クエリが届く）はこの分だけ足りない。
+- **結論 2（治具の応答範囲）**: ctrl 単体の応答（資源表・`SUBMIT_3D` の受け取り）は #1601 の範囲として確定できる。ただし ring・reply 用の共有メモリ（`RESOURCE_MAP_BLOB`）は vhost-user の新しい仕組み（protocol feature `SHMEM` と `BACKEND_REQ`・`GET_SHMEM_CONFIG`・バックエンド要求）が前提で、本 Issue では実装を決めず承認待ちの別段（F5.2b）に切り出す。
+- **結論 3（記録対象）**: venus の通常のコマンドは共有メモリ上のリングに書かれ、`SUBMIT_3D` に載るのはリングの制御（作成・起床・破棄）だけ。
+- **結論 4（上限）**: リング制御のペイロードは最大 256 バイトで、`MAX_CTRL_REQ_LEN`（4096）の固定長バッファに収まる。
+- **結論 5（reply 待ち）**: 最初に reply を要するコマンドで、ゲストはホストがリングを消費して reply を書くのを待つ。自前デコーダに dispatch（TASK-177.x）が無いのでここを越えられない見込み。
+
+#### 10.4.1 出典
+
+確認日 2026-10-09。転記したのは値（要求 ID・bit 値・フィールド配置・順序・サイズ）という事実だけで、コードは流用していない（MVM-4・from-scratch-policy）。行番号は下記の版のファイルでの値。
+
+| 出典 | 版 | SHA-256 |
+| ---- | -- | ------- |
+| Mesa `src/virtio/vulkan/vn_renderer_virtgpu.c` | タグ `mesa-25.0.0` | `a7a0f1a395d006bfb1ef4aea4d3b2c6a44c30c50ede855416e1183442e1e03aa` |
+| Mesa `src/virtio/vulkan/vn_instance.c` | 同上 | `b8d3461d9a8b8d740d7c383100ac972e256263d9bd55e663be31f709c4e838a9` |
+| Mesa `src/virtio/vulkan/vn_ring.c` | 同上 | `927d4f1c292dbf4b0bf5cb87c3a0d3b7a2f2144b295b30d94afdd1f8f2cc2103` |
+| Mesa `src/virtio/vulkan/vn_ring.h` | 同上 | `a56794982b64b94019158e6775f75e4d0e0609a57d69f676fab49f431b98f806` |
+| Mesa `src/virtio/vulkan/vn_renderer.h` | 同上 | `120385cf9a90657184623e07c3ba895e4a31ccdf1a34b6b3d3e0ce65772b7b80` |
+| Mesa `src/virtio/vulkan/vn_cs.c` | 同上 | `e3c66ff11030fdf13d57e0415825a5beae3dbfece121452d64d173023c32c46e` |
+| Mesa `src/virtio/vulkan/vn_renderer_util.c` | 同上 | `53fdb195e751bf13366540576b99e0c600a4f8585ba51db6c73e6545962fbe75` |
+| Linux `include/uapi/linux/virtio_gpu.h` | タグ `v6.12` | `7c9e2f7d47fa0b1a2c737fc5a741f57c5cf25303dd5c68c2c9738e9bb761eee6` |
+| Linux `drivers/gpu/drm/virtio/virtgpu_kms.c` | 同上 | `9388cdb019b5bbf52f442d8d5073fcc7c6d00b2952d8ddc2c8b7229947346a7d` |
+| Linux `drivers/gpu/drm/virtio/virtgpu_ioctl.c` | 同上 | `509cc5f489a489849e163fc7947859b7febf15237cb05c620762f69a207d6865` |
+| Linux `drivers/gpu/drm/virtio/virtgpu_vq.c` | 同上 | `ae7c9bab76af9672414dc7fe001259a0cfbc617dc2888445c504c4f96b994be8` |
+| Linux `drivers/gpu/drm/virtio/virtgpu_vram.c` | 同上 | `58561c4bc32b435785608efd057542cd4a37a2697b64f2cb85abb1e8f3649158` |
+| Linux `drivers/gpu/drm/virtio/virtgpu_submit.c` | 同上 | `d3f947bc18f181d1d95f946fee3e4220a471b878991dc06968a48c0c24f2f3eb` |
+| Linux `drivers/gpu/drm/virtio/virtgpu_gem.c` | 同上 | `8508331c97838c144011e5c6e789c3350825468c4ccf7388d2bf9696863d0cba` |
+| Linux `drivers/gpu/drm/virtio/virtgpu_object.c` | 同上 | `a26e29eecee86b60b9654cddfc50945bc2c7bd37ce1f669b4f446c62a112d912` |
+| crosvm `third_party/vmm_vhost/src/message.rs` | コミット `044c3e3fc53d` | `df6c31711167fe3b94080db4655826bb834cd2e9ac085915ce448652b8ab3495` |
+| crosvm `devices/src/virtio/vhost_user_frontend/mod.rs` | 同上 | `9506fcaae2e7e4aec09baa1374cbbd0a3807c5f38f8566b5c4f5856e4ea22266` |
+| QEMU `docs/interop/vhost-user.rst` | タグ `v10.1.0` | `1c06e32a3306172499767170b0b64ce8de4a8a90cbe543a00cc1b3861ae5bccd` |
+
+Mesa は 2 層で読む。Mesa は ctrl を直接出さず、DRM ioctl を呼ぶ。ゲストのカーネル（`drivers/gpu/drm/virtio/`）がその ioctl から ctrl を組み立てて virtqueue に積む。以下の表は「Mesa の呼び出し → ioctl → カーネルが出す ctrl」の順に書く。
+
+#### 10.4.2 ctrl の列（最小 compute: インスタンス作成からキューへの提出まで）
+
+| 順 | Mesa 側（`vn_renderer_virtgpu.c` ほか） | ioctl | カーネルが出す ctrl | 出典の行 |
+| -- | ---------------------------------------- | ----- | ------------------- | -------- |
+| 0 | Mesa 以前（ゲストカーネルの probe） | なし | `GET_DISPLAY_INFO`・`GET_CAPSET_INFO` | 未確認（`virtgpu_kms.c` の probe 経路は ctrl 名の確認まで行っていない。10.3 の既存実装が前提） |
+| 1 | `virtgpu_init_params`（`virtgpu_init` の中で `init_capset` より前。1497・1667 行） | `GETPARAM`（`3D_FEATURES`・`CAPSET_QUERY_FIX`・`RESOURCE_BLOB`・`CONTEXT_INIT`、続けて `HOST_VISIBLE`、0 なら `GUEST_VRAM`） | なし（カーネル内で答える）。`HOST_VISIBLE` も `GUEST_VRAM` も 0 なら `VK_ERROR_INITIALIZATION_FAILED` で中止（1515〜1531 行） | `virtgpu_ioctl.c` 88〜125 行（`GUEST_VRAM` の case は無く `-EINVAL`）。`virtgpu_kms.c` 177〜191 行（`has_host_visible` は共有メモリ領域 id 1 の取得に成功したときだけ真） |
+| 2 | `virtgpu_init_capset`（1477 行） | `GET_CAPS`（capset id 4・version 0） | `GET_CAPSET`（カーネルのキャッシュに無いとき） | 10.3 と同じ。ここから先は 1 を越えたときだけ |
+| 3 | `virtgpu_init_context`（`virtgpu_ioctl_context_init`。600〜622 行） | `CONTEXT_INIT`（`CAPSET_ID`=4・`NUM_RINGS`=64・`POLL_RINGS_MASK`=0） | `CTX_CREATE`（0x0200）。`context_init` に capset id 4 が入る（`virtgpu_ioctl.c` の `create_context_locked`）。10.3 の「下位 8 bit が VENUS のときだけ受理」と矛盾しない | `virtgpu_ioctl.c` 42〜60 行、`virtgpu_vq.c` 912〜927 行 |
+| 4 | `virtgpu_shmem_create`（1289〜1326 行）。ring・cs pool・reply pool 用。`blob_mem`=HOST3D・`blob_flags`=USE_MAPPABLE・`blob_id`=0 | `RESOURCE_CREATE_BLOB`、続けて `MAP`（mmap 用のオフセット取得） | `RESOURCE_CREATE_BLOB`（0x010c。ヘッダの `ctx_id`=呼び出した ctx、`nr_entries`=0）→ GEM open で `CTX_ATTACH_RESOURCE`（0x0202）→ **作成の直後に** `RESOURCE_MAP_BLOB`（0x0208。`offset` は共有メモリ領域内。応答は `OK_MAP_INFO`）。`MAP_BLOB` は `DRM_IOCTL_VIRTGPU_MAP` ではなく作成時に出る | `virtgpu_ioctl.c` 一帯の `verify_blob` と `virtio_gpu_resource_create_blob_ioctl`、`virtgpu_vram.c` 141〜175・205〜222 行、`virtgpu_gem.c` 137 行、`virtgpu_vq.c` 1200〜1223・1242〜1262 行 |
+| 5 | `sim_syncobj_create`（`SIMULATE_SYNCOBJ`。初回のみ。143〜187 行） | `EXECBUFFER`（size 0・`RING_IDX`・`FENCE_FD_OUT`・`ring_idx` 0） | `SUBMIT_3D`（0x0207）の見込み。本体 0 バイトで flags に `FENCE` と `INFO_RING_IDX` | Mesa 側のみ確認。size 0 の execbuf が `SUBMIT_3D` を出すかは**未確認**（`virtgpu_submit.c` の size 0 経路を追っていない） |
+| 6 | `vn_ring_create`（`vkCreateRingMESA`。`vn_ring.c` 339〜361 行）→ `vn_renderer_submit_simple` → `sim_submit` | `EXECBUFFER`（`ring_idx` 0） | `SUBMIT_3D`。ペイロードは `vkCreateRingMESA` のエンコード。ring の共有メモリの `res_id` と各オフセットを持つ | `vn_ring.c` 339〜362 行。`vn_renderer_submit_simple` の定義は未取得のファイル（`vn_renderer_util.h`）にあり**未確認** |
+| 7 | 以降の venus コマンド（`vkEnumerateInstanceVersion`〜`vkCreateInstance`〜`vkQueueSubmit`） | なし（ring の共有メモリへ書く） | リングが idle のときの `vkNotifyRingMESA` だけが `SUBMIT_3D` で届く | `vn_ring.c` 427〜470・612〜636 行 |
+| 8 | reply（`vkSetReplyCommandStreamMESA` は ring に書く。reply 本体は reply pool の共有メモリ） | 4 と同じ blob 経路 | 4 と同じ | `vn_ring.c` 658〜727 行、`vn_instance.c` 300〜312 行 |
+| 9 | 解放（`virtgpu_shmem_destroy_now`。`vkDestroyRingMESA` は `vn_ring.c` 370〜378 行） | `GEM_CLOSE` | `CTX_DETACH_RESOURCE`（0x0203）→ `RESOURCE_UNMAP_BLOB`（0x0209）→ `RESOURCE_UNREF`（0x0102） | `virtgpu_gem.c` 159 行、`virtgpu_vram.c` 6〜20 行、`virtgpu_vq.c` 1226〜1240 行 |
+| — | プロセス終了 | close | `CTX_DESTROY`（0x0201） | `virtgpu_vq.c` 930〜940 行 |
+
+0x0100 台と 0x0200 台の値は `virtio_gpu.h`（v6.12）72〜97 行の列挙から数えた値。エラー応答は同じ列挙の `ERR_UNSPEC`（0x1200）の後ろへ連番で、`ERR_OUT_OF_MEMORY` 0x1201・`ERR_INVALID_SCANOUT_ID` 0x1202・`ERR_INVALID_RESOURCE_ID` 0x1203・`ERR_INVALID_CONTEXT_ID` 0x1204・`ERR_INVALID_PARAMETER` 0x1205。
+
+#### 10.4.3 要求ごとの決定（治具の応答・資源表・検証・新しい仕組みの要否）
+
+「#1601」は F5.2（ctrl の応答。共有メモリを要しない部分）、「F5.2b」は共有メモリの対応（新規・承認待ち。10.4.4）。
+
+| 要求 | 治具の応答 | 資源表と上限 | ゲスト由来の入力の検証 | 新しい `unsafe` / vhost-user の要否 |
+| ---- | ---------- | ------------ | ---------------------- | ------------------------------------ |
+| `RESOURCE_CREATE_BLOB`（0x010c） | #1601: 成功（`OK_NODATA`）は HOST3D・`blob_flags` = MAPPABLE（0x0001）だけ・`blob_id` 0・`nr_entries` 0・ctx 作成済みのときだけ。それ以外の `blob_mem`・flags・`blob_id`・`nr_entries` は `ERR_INVALID_PARAMETER` | 件数 256・1 件の size 16 MiB・合計 64 MiB（案。根拠は下の「上限の根拠」） | res_id 0・重複・size 0・4096 の倍数でない size は拒否。`ctx_id` は作成済みの ctx。上限は確保より前に検査し、size は checked 演算 | #1601 は不要。**実際の確保**（memfd 等）は F5.2b |
+| `CTX_ATTACH_RESOURCE` / `DETACH_RESOURCE`（0x0202 / 0x0203） | #1601: 作成済みの ctx と res の組だけ成功。未知の ctx は `ERR_INVALID_CONTEXT_ID`、未知の res は `ERR_INVALID_RESOURCE_ID` | 資源表に所属 ctx の集合を持つ（上限は ctx 表の 64 × 資源表の件数の範囲内） | 二重 attach・未 attach の detach は `ERR_INVALID_PARAMETER` | 不要 |
+| `RESOURCE_UNREF`（0x0102） | #1601: 作成済みの res だけ成功し、表から消す。attach 中の res は拒否（`ERR_INVALID_PARAMETER`）。map 中の扱いは F5.2b で決める | 同上 | res_id の検査 | 不要（`munmap` は F5.2b） |
+| `RESOURCE_MAP_BLOB` / `UNMAP_BLOB`（0x0208 / 0x0209） | **#1601 では未実装のまま**（`ERR_UNSPEC`）。ゲストカーネルが作成直後に出すので、実装するとき F5.2b | — | `offset` が共有メモリ領域の内側で、`offset + size` が領域内、他の map と重ならないこと（F5.2b への申し送り） | 要る。protocol feature `SHMEM` と `BACKEND_REQ`、`GET_SHMEM_CONFIG`、バックエンド要求 `SHMEM_MAP` / `SHMEM_UNMAP`。10.4.4 |
+| `SUBMIT_3D`（0x0207） | #1601: 受理して、ペイロードを記録の受け渡し点へ渡す。dispatch はしない（応答は `OK_NODATA` で、`FLAG_FENCE` なら fence を引き継ぐ） | ペイロードは上限つきの固定長（10.4.6） | ctx が作成済みか、`ring_idx` < 64（`INFO_RING_IDX` が立つときだけ見る。`NUM_RINGS`=64）、`size` とペイロード実長の一致。本体 0 バイトも受理 | 不要（既存の `SplitQueue` で連結できる範囲。10.4.6） |
+
+本 issue（#1601）で実装した内容（実装済み。上の表の「#1601:」の記述どおり）の補足:
+
+- `CTX_DESTROY` は、その ctx に attach 中の res を暗黙に detach する（本表に定めが無かったため #1601 で決めた）。ゲストのカーネルは GEM close（detach → unref）を先に出すが、順序が崩れても後続の `RESOURCE_UNREF` が拒否され続けないように、またスロット再利用時に古い所属が新しい ctx へ化けないようにするため。応答とログ行は変えない
+- `SUBMIT_3D` の本体が空でなければ先頭 8 バイトを `parse_command_header` で読むが、結果は応答の種別を変えない（ヘッダ不正・候補外の種別でも `OK_NODATA`）。治具は受け取りまでで実行しないので OK は「受け取った」の意味に留まり、検査結果はログ（`wire=`）と受け渡し点で #1602 / 解析側へ渡す
+- 受け渡し点は `adapter::Handled::submit`（`Submit3d`: ctx_id・ring_idx・fence_id・header・payload）。`session` は応答を書き戻せず adapter を巻き戻した要求の `submit` を捨てる契約で、ゲストが ACK を見ていない提出を記録しない。配線は #1602
+- 資源表は `CtrlAdapter` が所有する固定長配列（所属 ctx は ctx 表のスロット番号のビット集合）で、巻き戻しの対象に含まれる
+
+上限の根拠: Mesa が確保する共有メモリは、ring が 128 KiB に extra 4 バイトを足した大きさ（`vn_instance.c` 128〜140 行、`vn_ring.c` 262〜270 行付近のレイアウト。行番号は付近）、cs pool が 8 MiB、reply pool が 1 MiB（`vn_instance.c` 300〜312 行）。1 件 16 MiB は最大の cs pool の 2 倍、合計 64 MiB は同時に持つ ring・cs・reply の合計に余裕を足した値で、いずれも**案**（実機でプール拡張の挙動を確かめて#725 で見直す）。cs pool の拡張は `vn_cs.c` の `next_buffer_size` が倍々に増やすため、16 MiB を超える要求は拒否して Mesa に失敗を返す（`VK_ERROR_OUT_OF_DEVICE_MEMORY` で止まる見込みで、挙動は未確認）。
+
+#### 10.4.4 共有メモリの前提（F5.2b の要件）
+
+- ゲストカーネルは `virtio_get_shm_region(..., id 1)` が成功したときだけ `has_host_visible` を立てる（`virtgpu_kms.c` 177〜191 行）。vhost-user では frontend 側がバックエンドに共有メモリ領域を問い合わせる
+- crosvm の frontend（`mod.rs` 514〜543 行）は、バックエンドが protocol feature `SHMEM`（bit 22、`0x0040_0000`。`message.rs` 384 行）をネゴシエーションしたときだけ `GET_SHMEM_CONFIG`（要求 ID 44。`message.rs` 154 行）で領域を取得し、領域が 0 個なら共有メモリ無し、1 個ならそれを使い、2 個以上はエラーにする。ネゴシエーションの前提として crosvm は `BACKEND_REQ`（bit 5、`0x20`）と `REPLY_ACK`（bit 3、`0x08`）も広告する（`mod.rs` 143〜151 行）
+- バックエンドから frontend への要求は `SET_BACKEND_REQ_FD`（要求 ID 21。ancillary data で fd を渡す。QEMU の rst と crosvm で同じ）で張ったソケットで送る。`SHMEM_MAP` = 9、`SHMEM_UNMAP` = 10（`message.rs` 192・194 行）。`SHMEM_MAP` のペイロードは `shmid`（u8）+ padding 7 バイト、`fd_offset`（u64）、`shm_offset`（u64）、`len`（u64）、`flags`（u64。`MAP_RW` = 0x1）の 40 バイトで、map する fd は ancillary data で渡す（`message.rs` 776〜815 行）
+- crosvm には非標準の `GPU_MAP`（1006）と `EXTERNAL_MAP`（1007）もある（`message.rs` 200〜204 行）。ring・reply・cs 用の HOST3D・`blob_id` 0 の共有メモリに `SHMEM_MAP` と `GPU_MAP` のどちらを使うかは**未確認**（crosvm の gpu backend 側の呼び出しは取得していない）。`GET_SHMEM_CONFIG` の応答ペイロードの配置も**未確認**
+- crosvm は `REPLY_ACK` を広告するが、`need_reply` は立てない（`SHMEM_MAP` の競合を避けるためという旨のコメント。`mod.rs` 146〜151 行）。治具が `REPLY_ACK` を広告するかは F5.2b で決める
+- **QEMU v10.1.0 の `docs/interop/vhost-user.rst` には `SHMEM` の protocol feature も `GET_SHMEM_CONFIG`・`SHMEM_MAP` / `SHMEM_UNMAP` も見当たらない**（語 `shmem` で検索して 0 件）。10.5 節の「QEMU と crosvm で ID が一致」は最小要求集合 16 種の範囲の話で、共有メモリの要求は crosvm 側だけの拡張になる。10.2 節の暫定選定（crosvm）はこの点でも補強される
+- バックエンド側の設計の見込み: memfd を作り、`SHMEM_MAP` で frontend に渡す。fd の送受信（`SCM_RIGHTS`）・`memfd_create`・`mmap` の `sys` ラッパーは 10.6 節で実装済みで、既存の範囲に収まる見込み。ただし、バックエンドが frontend 宛にバックエンド要求を**送る**経路（`SET_BACKEND_REQ_FD` で受けた fd へ書く）は新規で、新しい `unsafe` が要るかどうかは F5.2b の承認事項（10.6 節の `sys` ラッパーで足りれば不要）
+
+#### 10.4.5 コマンドストリームの経路と #1602 の記録対象
+
+- venus の通常のコマンドは、ring の共有メモリ（HOST3D・`blob_id` 0 の blob）へ書かれる。ring の書き込み先は共有メモリで、virtqueue を通らない。ホストは ring を消費して処理する。`vn_ring_submit_locked` はコマンドをリングに書き（`vn_ring.c` 436〜442 行）、`SUBMIT_3D` を使うのは idle のリングを起こす `vkNotifyRingMESA` だけ（同 457〜469・627〜636 行）
+- 取得したファイルの範囲では、リングを使わない直接提出は `vkCreateRingMESA`・`vkDestroyRingMESA`・`vkNotifyRingMESA`・ring の roundtrip（`vn_ring.c` 741 行）の 4 か所の `vn_renderer_submit_simple` だけ。ほかのファイル（キュー提出の `vn_queue.c` 等）は取得しておらず、`vn_renderer_submit` を直接呼ぶ経路は**未確認**
+- したがって #1602 の第 1 段は、`SUBMIT_3D` のペイロードを 1 回 1 レコードで記録する（偽の frontend で試験できる）。ただし中身はリングの制御だけで、2 段目の再生に使える価値は小さい。**リングの中身の記録は F5.2b（共有メモリ）の後に回す**。#1602 の本文は編集していない。範囲の確定は本節と #1600 のコメントで行う
+
+#### 10.4.6 `SUBMIT_3D` のペイロード上限
+
+- ゲストのカーネルが組み立てる `SUBMIT_3D` は、ヘッダ 24 バイト + `size` 4 バイト + padding 4 バイトの 32 バイトに本体が続く（`virtgpu_vq.c` 1078〜1099 行）。本体は `vmemdup_user` で取られ（`virtgpu_submit.c` 416 行）、カーネル側に明示の上限は無い。vmalloc の領域はページごとの sg になり、readable の記述子が複数に分かれる（`virtgpu_vq.c` 274〜290・387〜400 行）
+- リング制御のエンコードは Mesa 側の固定長バッファで作られる: `vkCreateRingMESA` は `uint32_t[64]` = 256 バイト（`vn_ring.c` 339〜361 行）、`vkNotifyRingMESA` は `uint32_t[8]` = 32 バイト、`vkDestroyRingMESA` は `uint32_t[4]` = 16 バイト、roundtrip は `uint32_t[8]` = 32 バイト。ヘッダ込みで最大 288 バイトで、`MAX_CTRL_REQ_LEN`（4096。`session/mod.rs`）に十分収まる
+- 決定: **当面は 4096（ヘッダ込み）の固定長のまま**にする。超える要求は既存どおり `ERR_INVALID_PARAMETER`（ゲストに失敗を返す）。ヒープで受ける経路（上限を検証してから確保）は、リング以外の直接提出が見つかった場合に後続で決める。複数の記述子にまたがる本体の連結は、既存の `SplitQueue`（10.7）の記述子チェーン（64 本・1 MiB）で足りる見込み
+
+#### 10.4.7 reply 待ちで止まる箇所と dispatch の要否
+
+- 見込み: `vn_instance_init_renderer_versions`（`vn_instance.c` 74〜113 行。`vkEnumerateInstanceVersion`）が、ring に書いたコマンドの reply を待つ最初の箇所。`vn_ring_submit_command` が reply を要するコマンドで `vn_ring_wait_seqno` を呼ぶ（`vn_ring.c` 700〜713・175〜192 行）。待ちはリングの head を見る `vn_relax` のポーリングで、タイムアウトで中止するか待ち続けるかは**未確認**（`vn_relax` の実装は `vn_common.c` にあり未取得）
+- このポーリングを越えるには、ホストが共有メモリ上のリングを消費して reply を書く必要がある。これには共有メモリ（F5.2b）と、コマンドの dispatch（TASK-177.x。`vkEnumerateInstanceVersion` の応答の符号化）が両方要る。自前デコーダには dispatch が無いので越えられない見込み
+- #725（TASK-172.h1・人間担当）の受入基準 1 は、「どこまで進み、どこで止まったか」の記録になる。現状の治具では**（結論 1 のとおり）capset の前で止まる**見込みで、共有メモリを入れても reply の待ちで止まる見込み
+- 治具側のタイムアウト（REPAIR-5。10.8 節の `message_timeout` / `idle_timeout`）は、ゲストの待ちとは別にホスト側の切断を保証する
+
+#### 10.4.8 範囲外にしたもの（理由つき）と 10.3 の表との対応
+
+| 項目 | 範囲外にした理由 |
+| ---- | ---------------- |
+| `RESOURCE_MAP_BLOB` / `UNMAP_BLOB` の実装 | 共有メモリ（`SHMEM`・`BACKEND_REQ`）が前提で、承認待ちの F5.2b。#1057（共有メモリ方式の判定）とも関わる |
+| リングの消費と dispatch | TASK-177.x（デコーダ本体）の範囲 |
+| `GET_DISPLAY_INFO` の scanout あり・`RESOURCE_CREATE_2D` 系・cursor | 最小 compute の ctrl の列に出ない（10.4.2 の表に無い） |
+| `RESOURCE_CREATE_BLOB` の `GUEST` / `HOST3D_GUEST`・`USE_SHAREABLE` / `USE_CROSS_DEVICE` | ring・cs・reply の用途は HOST3D・MAPPABLE・`blob_id` 0 だけ。sg を要する経路は範囲外 |
+| `ERR_INVALID_SCANOUT_ID`（0x1202） | scanout を持たないため使わない |
+
+10.3 の表との対応: 既存の `GET_CAPSET_INFO` / `GET_CAPSET`・`GET_DISPLAY_INFO`・`CTX_CREATE` / `CTX_DESTROY` は変更しない。追加するのは上の表の `RESOURCE_CREATE_BLOB`・`CTX_ATTACH_RESOURCE` / `DETACH_RESOURCE`・`RESOURCE_UNREF`・`SUBMIT_3D` の応答で、`MAP_BLOB` / `UNMAP_BLOB` は引き続き未実装（`ERR_UNSPEC`）。上の 5 種の応答は #1601 で実装済み。製品版の ctrl 枠は TASK-175.1.3（#915）・TASK-176.1（#749）。
 
 ### 10.5 vhost-user メッセージの値（F1.1・#1516）
 
@@ -331,7 +465,7 @@ Mesa venus が capset 取得の後に発行する ctrl の一次情報（`mesa-2
 | crosvm `third_party/vmm_vhost/src/backend_client.rs` | 同上 | `709fe08830a38c5e15a00c0c5af47ef7dabf19a784c0694abf8c10d335dec7c2` |
 | crosvm `devices/src/virtio/vhost_user_frontend/mod.rs` | 同上 | `9506fcaae2e7e4aec09baa1374cbbd0a3807c5f38f8566b5c4f5856e4ea22266` |
 
-前提（実際に広告するのは F1.4・#1519）: virtio feature は bit 30（`VHOST_USER_F_PROTOCOL_FEATURES`）を立て、protocol feature は CONFIG（bit 9。virtio-gpu config の読み出しに要る）と MQ（bit 0）だけにする。REPLY_ACK・BACKEND_REQ・SHMEM・DEVICE_STATE・CONFIGURE_MEM_SLOTS は host-visible 共有メモリの方式が決まる #1057 まで後送りで、追加する場合は対応する要求を codec に足す。
+前提（実際に広告するのは F1.4・#1519）: virtio feature は bit 30（`VHOST_USER_F_PROTOCOL_FEATURES`）を立て、protocol feature は CONFIG（bit 9。virtio-gpu config の読み出しに要る）と MQ（bit 0）だけにする。REPLY_ACK・BACKEND_REQ・SHMEM・DEVICE_STATE・CONFIGURE_MEM_SLOTS は host-visible 共有メモリの方式が決まる #1057 まで後送りで、追加する場合は対応する要求を codec に足す。最小要求集合に SHMEM 系は無く、crosvm だけの拡張は 10.4.4 節で扱う。
 
 最小要求集合（16 種。QEMU と crosvm で ID が一致）。これ以外は既知 ID も含め `UNKNOWN_REQUEST` で拒否する。
 
@@ -445,8 +579,20 @@ frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲスト
 - 応答ループ: socket と ctrl キューの kick を、単一 fd 用の `sys::wait_fd` で `poll_slice`（既定 10ms）ずつ交互に待つ。1 回の kick で最大 `num` 件を処理して used へ書き、1 件以上なら call へ 1 を書く。`pop` / `add_used` の失敗はセッションを終了する（壊れたキューを黙って続けない）。writable が応答に足りない要求は応答を捨てて len=0 で返し、`response_dropped` の行を出してセッションは続ける。readable が 4 KiB を超える要求はアダプタへ渡さず `ERR_INVALID_PARAMETER`
 - ログ: 既存の `venus_jig event=...` 形式を保つ。追加は `session_error`（`code`・`request`）・`need_reply_ignored`・`response_dropped`・`session_end`。固定語彙と数値だけで、frontend やゲスト由来のバイト列・fd 番号・GPA は出さない
 - 扱わない（REPAIR-3）: `NEED_REPLY`（REPLY_ACK を広告しないので `SET_*` には応答せず、ログに 1 行出す）、cursorq（ring 1）の要求処理、`SET_CONFIG`、`VRING_NOFD`、inflight、`INDIRECT` / `EVENT_IDX`、`observe::snapshot_lines` の定期出力と virtqueue 個別の観測カウンタ（終了時の集計出力は `session::run` で実装済み）
-- 既知の穴: UDS の bind と所有者・権限・symlink の検証、peer credential の検証（PLUG-12 相当）は範囲外。`UnixStream::peer_cred` が unstable で、`SO_PEERCRED` の取得は #1517 の承認範囲外の `unsafe` を要するため、`UnixStream` を受け取る API に留め、bind は F3 の起動側に委ねる。治具は PoC で、実機の実行は人間が担当する閉じた環境という前提
+- peer credential の検証（PLUG-12）は起動入口が accept 直後に `SO_PEERCRED`（`sys::peer_uid`＝U11）で行い、`session::run` は照合済みの `UnixStream` を受け取る API に留める。UDS の bind と所有者・権限・symlink の検証は起動入口（10.9）が行う。治具は PoC で、実機の実行は人間が担当する閉じた環境という前提
 - 承認事項: socket と kick を同時に待つ複数 fd の `ppoll` は `sys.rs` の `unsafe`（U10）の変更になるため行っていない。kick への反応に最大 `poll_slice` の遅延が乗る
+
+### 10.9 起動入口（F4・#1598）
+
+`launch`（lib）と bin `venus-jig` が、UDS の bind・期限つき accept・ログのファイル出力を担う。Linux 限定。1 接続を `session::run` で最後まで処理して終わる（実機の疎通は #725）。
+
+- 引数: `--socket <絶対パス>`・`--log <絶対パス>`（必須）、`--message-timeout-ms`（既定 5000）・`--idle-timeout-ms`（既定 60000）・`--poll-slice-ms`・`--accept-timeout-ms`（既定 60000、0 より大きく 1 時間以下）。VMM 側から指定するのは `--socket` に渡した絶対パス。記録ファイルのパスは #1602 で足す
+- bind 前の検証（拒否時は何も作らず、既存のパスは消さない）: 絶対パス・成分に `.` / `..` / 空がない・NUL なし・ソケットとログが別パス（`PATH_NOT_ABSOLUTE` / `PATH_INVALID`）、ソケットパスが `sun_path` の 107 バイト以下（`PATH_TOO_LONG`。`linux/un.h` の `UNIX_PATH_MAX` 108 から NUL を除く）、ソケットの親ディレクトリが symlink でない・ディレクトリ・実行ユーザー（`/proc/self/status` の effective UID）の所有・モード `0700`（`SOCKET_DIR_SYMLINK` / `SOCKET_DIR_NOT_DIRECTORY` / `SOCKET_DIR_NOT_OWNED` / `SOCKET_DIR_NOT_PRIVATE`）、`/` までの祖先が存在し（無ければ拒否。検査後に別 UID が作って差し替えるのを防ぐ。ログの置き場所も同じ規則で `LOG_DIR_UNSAFE`）、symlink でなく自 UID か root の所有で、グループ／他者が書ける場合は sticky が立っている（`SOCKET_DIR_ANCESTOR_UNSAFE`。別 UID の rename 差し替えを防ぐ）、ソケットパスに何もない（`SOCKET_PATH_EXISTS`）。ソケットディレクトリ自身が無ければ（その親は検証済みで存在が必須）1 段だけ `DirBuilder` の mode `0700` で作る
+- ログ: `create_new` + `0600`（既存は `LOG_PATH_EXISTS`、symlink も `O_EXCL` で失敗）。`log::LogSink` が総量 4 MiB・1 行 512 バイト・10 万行の照合器の上限に収め、超えたら `venus_jig event=log_truncated reason=limit` を 1 回だけ書いて以降を捨てる。パス文字列・ゲスト由来のバイト列は出さない
+- 実行時エラーは stderr に 1 行の JSON `{"code","message"}`（`SESSION_FAILED` のみ `cause` にセッションの code）。終了コードは検証エラー 2、それ以外の失敗 1、正常終了 0
+- accept は非ブロックの sleep ループ（10ms 刻み、期限切れは `ACCEPT_TIMEOUT`）。`sys::wait_fd`（ppoll）の listener fd への別用途の呼び出しは承認範囲外のため採らなかった（承認されれば置き換え可能な改善案）。1 接続を受けたら listener を閉じてソケットファイルを消す
+- peer credential（PLUG-12）: accept 直後に `sys::peer_uid`（`getsockopt(SO_PEERCRED)`。U11）で接続元 UID を取得し、実行ユーザーの effective UID と照合する。不一致（`PEER_UID_MISMATCH`）・取得失敗（`PEER_CRED_UNAVAILABLE`）は接続を閉じて拒否する（fail-closed）。加えてソケットディレクトリを自 UID 所有・`0700` に限る。限界は、同じ UID の別プロセスは接続できること、検査と bind の間の TOCTOU は、祖先が他 UID に差し替え不能であることと所有者が自分で `0700` のディレクトリであることで抑えるに留まること（同じ UID と root は差し替えられる。祖先に symlink がある環境は拒否される）。別 UID の接続拒否は別 UID を用意できないため実機前提で、単体試験は期待 UID をずらして照合関数を検証する。U11 は `sys` モジュールの事前承認（coding-rust.md）の条件で追加した。
+- ログ読み取り側（事後監査 #1528 D2）: `log::read_log_file` が open 前に `symlink_metadata` で通常ファイル以外（FIFO・symlink・ディレクトリ）を拒否し、open 後も `metadata` で確かめ直し、上限つきで読む。(1) と open の間に FIFO へ差し替える競合は残る。実機前提テストは読み取りを補助スレッドで動かし 30 秒の `recv_timeout` で待つ
 
 ## 11. 以降の章（未着手。10 章は #888 の範囲）
 

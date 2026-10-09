@@ -9,6 +9,7 @@
 //! 出典: virgl/venus-protocol タグ `v1.1.3`（コミット `ca19b6358d7c`）。
 //! `xmls/VK_MESA_venus_protocol.xml` SHA-256 `d92839bc728fa9ad9a7decdc6b91df6fa1a0fb26cffae4009865f18a789e0535`、
 //! `xmls/VK_EXT_command_serialization.xml` SHA-256 `2451e5dcc5306f604c52da48a8cc883a24de708dd86f38bbb035d29a753a0474`。
+//! 両 XML のライセンスはファイル内 SPDX `Apache-2.0 OR MIT`（Copyright 2020 Google LLC）。
 //! 値（事実情報）のみを転記し、コードや生成物は流用していない。
 //!
 //! コマンドストリームの記録と再生ハーネスは [`replay`]（TASK-172.5・#889）。

@@ -5,6 +5,10 @@
 //! 自前デコーダ（親モジュールの `parse_command_header`）へ流し込む。壊れたファイルは再生前に
 //! 検出する（ヘッダ・長さ接頭辞・CRC-32C。CRC は偶発的破損の検出で改ざん耐性はない）。
 //!
+//! 2 段目の呼び出し順は [`read_recording_file`]（通常ファイルのみ・上限つき読み込み）→ [`validate`] →
+//! [`replay`]。`validate` は受け取り済みの `&[u8]` を検査するだけで、確保前の長さ検証は
+//! `read_recording_file` が担う。
+//!
 //! 記録単位は「提出バッファ 1 個」。venus wire はコマンド長を持たず引数パーサ無しには境界を切れ
 //! ないため、長さはレコード側で持つ。配置は issue 記載の `poc/` ではなく既存骨格の隣（理由は
 //! `docs/design/venus-decoder-poc.md`）。
@@ -26,7 +30,8 @@ pub use format::{
     RecordView, RecordingHeader,
 };
 pub use player::{
-    CollectingBackend, ReplayBackend, ReplaySummary, ValidatedRecording, replay, validate,
+    CollectingBackend, ReadObservation, ReadStage, ReplayBackend, ReplaySummary,
+    ValidatedRecording, read_recording_file, read_recording_file_observed, replay, validate,
 };
 pub use recorder::RecordingWriter;
 

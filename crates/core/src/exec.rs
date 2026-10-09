@@ -51,7 +51,9 @@
 //! - 分離違反の試行を拒否したエラーは `ExecError::violation` に構造化された違反記録
 //!   （[`IsolationViolation`]: 種別・理由コード・ビヘイビア ID・対象）を持つ。**記録の経路のみ**で、
 //!   マウント層の監査レコード化は [`audit_mount_violation`]（TASK-41.4）、exec の対象の拒否の監査レコード化
-//!   （層 `exec_target`）は [`audit_exec_violation`]・[`record_exec_target_rejection`]（#1465）が担う。
+//!   （層 `exec_target`）は [`audit_exec_violation`]・[`record_exec_target_rejection`]（#1465）、
+//!   エントリポイント検証の拒否（層 `entrypoint`）は [`audit_entrypoint_violation`]・
+//!   [`record_entrypoint_rejection`]（#1595）が担う。
 //!   ファイルへの保存は `audit_log::AuditFileWriter`（#839）で実装済みで、本番経路への sink の配線は未実装
 //!   （REPAIR-3）。システムエラーには付かない
 //!
@@ -289,6 +291,52 @@ pub fn record_exec_target_rejection<E>(
     sink: &dyn crate::audit_log::AuditSink,
 ) -> crate::audit_log::AuditedRejection<E> {
     match reason.exec_target_audit_event() {
+        Some(event) => {
+            let delivery = crate::audit_log::mount::deliver(event, sink);
+            crate::audit_log::AuditedRejection { error, delivery }
+        }
+        None => crate::audit_log::AuditedRejection::not_applicable(error),
+    }
+}
+
+/// エントリポイント検証の違反を `Entrypoint` 監査レコードとして記録する（SEC-4・SUP-6・SEC-1・TASK-163 追補・#1595）。
+///
+/// `err.violation` が種別 `Entrypoint` のときだけ 1 件 `sink` へ渡す。それ以外（マウント層・exec 対象の違反・
+/// システムエラー）は `NotApplicable`。`err` は常にそのまま返り、記録の失敗で拒否は覆らない（fail-closed）。
+/// `ExecError` を直接扱う launch 側の入口で、理由コードだけを持つ supervisor の親プロセスは
+/// [`record_entrypoint_rejection`] を使う。launch 経路（`spawn_container` の子・launcher）への配線は
+/// 未実装（#1314。TASK-29 / TASK-157 系。REPAIR-3）。
+pub fn audit_entrypoint_violation(
+    err: ExecError,
+    sink: &dyn crate::audit_log::AuditSink,
+) -> crate::audit_log::AuditedRejection<ExecError> {
+    let event = err
+        .violation
+        .as_ref()
+        .and_then(IsolationViolation::entrypoint_audit_event);
+    match event {
+        Some(event) => {
+            let delivery = crate::audit_log::mount::deliver(event, sink);
+            crate::audit_log::AuditedRejection {
+                error: err,
+                delivery,
+            }
+        }
+        None => crate::audit_log::AuditedRejection::not_applicable(err),
+    }
+}
+
+/// 理由コードだけを持つ呼び出し側（supervisor が worker の結果行を復号した親プロセス）向けに、
+/// エントリポイント検証の拒否 `error` を 1 件記録して返す（SEC-4・SUP-6・SEC-1・TASK-163 追補・#1595）。
+///
+/// `reason` がエントリポイント検証の理由でなければ記録せず `NotApplicable`。時刻と PID は呼び出した
+/// プロセスのもの。記録の成否で `error` は変わらない（fail-closed）。
+pub fn record_entrypoint_rejection<E>(
+    error: E,
+    reason: ViolationReason,
+    sink: &dyn crate::audit_log::AuditSink,
+) -> crate::audit_log::AuditedRejection<E> {
+    match reason.entrypoint_audit_event() {
         Some(event) => {
             let delivery = crate::audit_log::mount::deliver(event, sink);
             crate::audit_log::AuditedRejection { error, delivery }

@@ -5,7 +5,8 @@
 
 use fandhe_container_plugin_macos::gpu::venus::CommandType;
 use fandhe_container_plugin_macos::gpu::venus::replay::{
-    CollectingBackend, FILE_HEADER_LEN, RecordingWriter, replay, validate,
+    CollectingBackend, FILE_HEADER_LEN, RecordingWriter, VenusReplayError, read_recording_file,
+    replay, validate,
 };
 
 /// vkCreateRingMESA(188) + GENERATE_REPLY フラグ + 引数 u64。
@@ -48,4 +49,23 @@ fn corrupted_recording_is_rejected_before_replay() {
     bytes[last] ^= 0xFF;
     let err = validate(&bytes).expect_err("must reject");
     assert_eq!(err.code(), "venus_replay.record_checksum");
+}
+
+#[test]
+fn read_recording_file_roundtrip_and_rejects_directory() {
+    let mut w = RecordingWriter::new(Vec::new());
+    w.append(&stream()).expect("append");
+    let bytes = w.finish().expect("finish");
+    let base = std::env::temp_dir().join(format!("fc-venus-it-{}", std::process::id()));
+    let file = base.with_extension("bin");
+    std::fs::write(&file, &bytes).expect("write");
+    let got = read_recording_file(&file);
+    let _ = std::fs::remove_file(&file);
+    let got = got.expect("read");
+    assert_eq!(validate(&got).expect("validate").records().len(), 1);
+
+    std::fs::create_dir_all(&base).expect("mkdir");
+    let r = read_recording_file(&base);
+    let _ = std::fs::remove_dir(&base);
+    assert_eq!(r, Err(VenusReplayError::NotRegularFile));
 }

@@ -46,7 +46,9 @@ pub enum VenusReplayError {
     Wire { seqno: u32, source: VenusWireError },
     /// 再生バックエンドが提出を拒否した。
     Backend { seqno: u32 },
-    /// 書き出し先の I/O 失敗。
+    /// 読み込み先のパスが通常ファイルでない（symlink・ディレクトリ・FIFO・デバイス）。
+    NotRegularFile,
+    /// 書き出し・読み込みの I/O 失敗。
     Io { kind: std::io::ErrorKind },
 }
 
@@ -69,6 +71,7 @@ impl VenusReplayError {
             Self::TrailingBytes { .. } => "venus_replay.trailing_bytes",
             Self::Wire { .. } => "venus_replay.wire",
             Self::Backend { .. } => "venus_replay.backend",
+            Self::NotRegularFile => "venus_replay.not_regular_file",
             Self::Io { .. } => "venus_replay.io",
         }
     }
@@ -114,6 +117,7 @@ impl VenusReplayError {
                 )
             }
             Self::Backend { seqno } => format!("replay backend rejected record {seqno}"),
+            Self::NotRegularFile => "recording is not a regular file".to_string(),
             Self::Io { kind } => format!("i/o error: {kind}"),
         }
     }

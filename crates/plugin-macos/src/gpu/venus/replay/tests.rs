@@ -278,4 +278,178 @@ fn error_messages_are_english_and_carry_numbers_only() {
         e.to_string(),
         "venus_replay.sequence_mismatch: record seqno 7 where 1 expected"
     );
+    assert_eq!(
+        VenusReplayError::NotRegularFile.to_string(),
+        "venus_replay.not_regular_file: recording is not a regular file"
+    );
+}
+
+// ---- #1603: 上限つき読み込み・確保予算（GPU-6・REPAIR-2・REPAIR-5）----
+
+use super::player::{read_bounded, read_bounded_with_limit, record_capacity_budget};
+use std::path::PathBuf;
+
+/// 並列テストと衝突しない一時パス（プロセス ID + 名前）。
+fn tmp_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("fc-venus-{}-{name}", std::process::id()))
+}
+
+#[test]
+fn repair2_record_capacity_is_capped_by_remaining_bytes() {
+    assert_eq!(record_capacity_budget(65_536, 0), 0);
+    assert_eq!(record_capacity_budget(65_536, 16), 1);
+    assert_eq!(record_capacity_budget(65_536, 20), 1);
+    assert_eq!(record_capacity_budget(3, 1000), 3);
+    assert_eq!(record_capacity_budget(0, 1000), 0);
+    // 件数だけが大きい有効ヘッダ（CRC 正）と空の本体。
+    let bytes = RecordingHeader {
+        record_count: MAX_RECORD_COUNT,
+    }
+    .encode()
+    .to_vec();
+    assert_eq!(code_of(&bytes), "venus_replay.truncated");
+    assert_eq!(
+        record_capacity_budget(MAX_RECORD_COUNT, bytes.len() - FILE_HEADER_LEN),
+        0
+    );
+}
+
+#[test]
+fn c1_read_bounded_rejects_declared_len_over_limit() {
+    let r = read_bounded(std::io::Cursor::new(Vec::new()), MAX_RECORDING_LEN + 1);
+    assert_eq!(
+        r,
+        Err(VenusReplayError::RecordingTooLarge {
+            requested: MAX_RECORDING_LEN + 1,
+            max: MAX_RECORDING_LEN
+        })
+    );
+}
+
+#[test]
+fn c1_read_bounded_stops_stream_longer_than_limit() {
+    // 宣言長 0 でも実体が上限を超えて続く入力は、上限 + 1 バイトで打ち切って拒否する。
+    let r = read_bounded_with_limit(std::io::repeat(0), 0, 100);
+    assert_eq!(
+        r,
+        Err(VenusReplayError::RecordingTooLarge {
+            requested: 101,
+            max: 100
+        })
+    );
+    assert_eq!(
+        read_bounded_with_limit(std::io::Cursor::new(vec![7u8; 100]), 100, 100),
+        Ok(vec![7u8; 100])
+    );
+}
+
+#[test]
+fn c1_read_recording_file_roundtrip() {
+    let bytes = record(&[stream_a(), stream_b()]);
+    let p = tmp_path("roundtrip");
+    std::fs::write(&p, &bytes).expect("write");
+    let got = read_recording_file(&p);
+    let _ = std::fs::remove_file(&p);
+    let got = got.expect("read");
+    assert_eq!(got, bytes);
+    let v = validate(&got).expect("validate");
+    let mut be = CollectingBackend::default();
+    let s = replay(&v, &mut be).expect("replay");
+    assert_eq!(s.records, 2);
+}
+
+/// REPAIR-4: 成功・早期拒否・I/O エラーの全経路で観測結果が返る。
+#[test]
+fn c1_read_recording_file_observed_all_paths() {
+    let bytes = record(&[stream_a()]);
+    let p = tmp_path("obs_ok");
+    std::fs::write(&p, &bytes).expect("write");
+    let (r, obs) = read_recording_file_observed(&p);
+    let _ = std::fs::remove_file(&p);
+    assert_eq!(r.expect("read"), bytes);
+    assert_eq!(obs.outcome, "ok");
+    assert_eq!(obs.stage, ReadStage::Done);
+    assert_eq!(obs.bytes, bytes.len() as u64);
+
+    let d = tmp_path("obs_dir");
+    std::fs::create_dir_all(&d).expect("mkdir");
+    let (r, obs) = read_recording_file_observed(&d);
+    let _ = std::fs::remove_dir(&d);
+    assert_eq!(r, Err(VenusReplayError::NotRegularFile));
+    assert_eq!(obs.outcome, "venus_replay.not_regular_file");
+    assert_eq!(obs.stage, ReadStage::Metadata);
+    assert_eq!(obs.bytes, 0);
+
+    let (r, obs) = read_recording_file_observed(&tmp_path("obs_missing"));
+    assert!(matches!(r, Err(VenusReplayError::Io { .. })));
+    assert_eq!(obs.outcome, "venus_replay.io");
+    assert_eq!(obs.stage, ReadStage::Metadata);
+}
+
+#[test]
+fn c1_rejects_directory_and_missing_path() {
+    let d = tmp_path("dir");
+    std::fs::create_dir_all(&d).expect("mkdir");
+    let r = read_recording_file(&d);
+    let _ = std::fs::remove_dir(&d);
+    assert_eq!(r, Err(VenusReplayError::NotRegularFile));
+    assert_eq!(
+        read_recording_file(&tmp_path("missing")),
+        Err(VenusReplayError::Io {
+            kind: std::io::ErrorKind::NotFound
+        })
+    );
+}
+
+// symlink の作成は Windows で Developer Mode を要し、FIFO は Windows に無いため unix 限定。
+#[cfg(unix)]
+#[test]
+fn c1_rejects_symlink() {
+    let target = tmp_path("symlink-target");
+    let link = tmp_path("symlink");
+    std::fs::write(&target, record(&[stream_a()])).expect("write");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    let r = read_recording_file(&link);
+    let _ = std::fs::remove_file(&link);
+    let _ = std::fs::remove_file(&target);
+    assert_eq!(r, Err(VenusReplayError::NotRegularFile));
+}
+
+#[cfg(unix)]
+#[test]
+fn c1_rejects_fifo_without_blocking() {
+    let p = tmp_path("fifo");
+    // 前提（mkfifo の起動と成功）が満たせない環境ではテストを失敗させる（skip で成功扱いにしない）。
+    // REPAIR-5: 子プロセスの終了待ちにも期限を設け、超過時は kill して回収し失敗させる。
+    const MKFIFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const MKFIFO_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+    let mut child = std::process::Command::new("mkfifo")
+        .arg(&p)
+        .spawn()
+        .expect("mkfifo must be runnable to verify FIFO rejection");
+    let deadline = std::time::Instant::now() + MKFIFO_TIMEOUT;
+    let made = loop {
+        match child.try_wait().expect("try_wait on mkfifo") {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("mkfifo did not finish within {MKFIFO_TIMEOUT:?}");
+            }
+            None => std::thread::sleep(MKFIFO_POLL),
+        }
+    };
+    assert!(made.success(), "mkfifo must succeed: {made:?}");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let p2 = p.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(read_recording_file(&p2));
+    });
+    // REPAIR-5: open でブロックしたらタイムアウトで fail させる。
+    let r = rx.recv_timeout(std::time::Duration::from_secs(5));
+    let _ = std::fs::remove_file(&p);
+    assert_eq!(
+        r.expect("read_recording_file must not block on a FIFO"),
+        Err(VenusReplayError::NotRegularFile)
+    );
 }

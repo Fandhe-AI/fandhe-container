@@ -259,9 +259,9 @@ macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なし�
 
 ### 10.1 本 PR の範囲と未達（実装済みを装わない。REPAIR-3）
 
-- 実装済み: 候補比較（本章）、ctrl の `GET_CAPSET_INFO` / `GET_CAPSET` の復号・応答符号化・構造化ログ 1 行（`adapter`）、治具が広告する feature と config の定数（`device`）、ログ照合器と実機前提テストの枠（`log`・`tests/real_machine_capset_log.rs`）。socket は開かない
+- 実装済み: 候補比較（本章）、ctrl の `GET_CAPSET_INFO` / `GET_CAPSET` の復号・応答符号化・構造化ログ 1 行（`adapter`）、#1520 で `GET_DISPLAY_INFO`（scanout なし）・`CTX_CREATE`（venus の context_init）・`CTX_DESTROY` を追加（ctx 表は上限 64）、治具が広告する feature と config の定数（`device`）、ログ照合器と実機前提テストの枠（`log`・`tests/real_machine_capset_log.rs`）。socket は開かない
 - **受入基準 2（ゲストの Mesa venus の capset クエリが自前デコーダに届いたことをログで確認）は未達**。トランスポート（後続 F1）と実機実行（F3・#725。人間担当）が必要なため
-- 後続（issue 起票は未実施・承認待ち）: F1 vhost-user トランスポート（メッセージ codec・fd 受け渡しと `mmap` の `sys` ラッパー・split virtqueue・kick / call。rust-vmm 系クレートは MVM-4 で使えないため自作）、F2 残りの ctrl 応答（`GET_DISPLAY_INFO`・`CTX_CREATE` 等）、F3 実機疎通（#725）
+- 後続（issue 起票は未実施・承認待ち）: F1 vhost-user トランスポート（メッセージ codec・fd 受け渡しと `mmap` の `sys` ラッパー・split virtqueue・kick / call。rust-vmm 系クレートは MVM-4 で使えないため自作）、F2 残りの ctrl 応答（10.4 節。`RESOURCE_CREATE_BLOB`・`SUBMIT_3D` 等）、F3 実機疎通（#725）
 - CI: `make poc-venus-jig-check`（fmt-check・clippy・test）は CI の `rust-ci-default-features` ジョブが 3 OS で実行し、`crates/plugin-macos` 側の変更による治具の破損を検出する（実機前提テストは `#[ignore]` で分離済みで CI では走らない）
 
 ### 10.2 候補比較
@@ -293,7 +293,28 @@ macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なし�
 | fence | `FLAG_FENCE` が立つ要求では応答ヘッダへ flags・fence_id・ctx_id・ring_idx を引き継ぐ |
 | 広告 feature | VIRGL（bit 0）・RESOURCE_BLOB（3）・CONTEXT_INIT（4）・VERSION_1（32）。`num_capsets` = 1、`num_scanouts` = 0（カーネルが 0 を受け付けるかは未確認。F1 の実機で確認） |
 
-ログ形式（数値と固定語彙のみ。ゲストのバイト列はエコーしない）: `venus_jig event=capset_query cmd=GET_CAPSET capset_id=4 version=0 result=ok max_size=160`。要求長はヘッダ 24 + 本体 8 バイトちょうどのみ受理する（PoC）。
+issue #1520（GPU-6・TASK-172 後続 F2）で追加した ctrl:
+
+| 項目 | 値 |
+| ---- | -- |
+| `GET_DISPLAY_INFO` / `OK_DISPLAY_INFO` | 0x0100（ヘッダのみ 24 バイト）/ 0x1101（ヘッダ + `pmodes[16]`。1 件 24 バイト = rect 16 + enabled 4 + flags 4。全長 408）。全 scanout を無効（全 0）で返す |
+| `CTX_CREATE` / `CTX_DESTROY` | 0x0200（ヘッダ + nlen 4 + context_init 4 + debug_name[64] = 96 バイト）/ 0x0201（ヘッダのみ）。成功は `OK_NODATA` 0x1100 |
+| `context_init` | 下位 8 bit（`CAPSET_ID_MASK` 0x000000ff）が VENUS（4）のときだけ受理。上位 bit が立つ値・0・他 id は拒否 |
+| 追加エラー | `ERR_OUT_OF_MEMORY` 0x1201（ctx 表が上限 64 件）・`ERR_INVALID_CONTEXT_ID` 0x1204（ctx_id 0・重複・未作成） |
+| 割り当て | 要求長不正・capset id 違い・`nlen` > 64 は `ERR_INVALID_PARAMETER`。対象 ctx_id はヘッダの `ctx_id` |
+
+ログ形式（数値と固定語彙のみ。ゲストのバイト列はエコーしない。`debug_name` は保持も出力もしない）:
+
+- `venus_jig event=capset_query cmd=GET_CAPSET capset_id=4 version=0 result=ok max_size=160`
+- `venus_jig event=display_info cmd=GET_DISPLAY_INFO num_scanouts=0 result=ok`
+- `venus_jig event=ctx cmd=CTX_CREATE ctx_id=1 capset_id=4 nlen=5 result=ok`
+- `venus_jig event=ctx cmd=CTX_DESTROY ctx_id=1 result=ok`
+
+要求長はコマンドごとにちょうどの値のみ受理する（PoC。余剰バイトも拒否）。
+
+### 10.4 未実装の ctrl（REPAIR-3）
+
+Mesa venus が capset 取得の後に発行する ctrl の一次情報（`mesa-25.0.0` の `vn_renderer_virtgpu.c`）は**本 PR では未確認**。推測で確定させず、`virtio_gpu.h`（v6.12）上の 3D 系の候補だけを挙げる。いずれも**未実装（`ERR_UNSPEC`）**: `RESOURCE_CREATE_BLOB`（0x010c）・`RESOURCE_MAP_BLOB` / `UNMAP_BLOB`（0x0208 / 0x0209）・`CTX_ATTACH_RESOURCE` / `DETACH_RESOURCE`（0x0202 / 0x0203）・`SUBMIT_3D`（0x0207）・`RESOURCE_UNREF`（0x0102）。製品版の ctrl 枠は TASK-175.1.3（#915）・TASK-176.1（#749）。
 
 ## 11. 以降の章（未着手。10 章は #888 の範囲）
 

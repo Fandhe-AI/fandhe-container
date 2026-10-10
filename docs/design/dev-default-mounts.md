@@ -70,7 +70,7 @@ tmpfs にする（runc 方式）に確定（4 章の判断 1）。実装は #165
 | (b) 既存の `mount(2)` + `MS_BIND` に合わせる | `bind_mount_recursive` の流儀 | 実装は軽いが、パス経由で競合の余地が増える |
 | (c) 供給せず fail-closed のまま | 現状 | rootless で実用にならない |
 
-(a) に確定した（判断 4）。実装は #1659・#1660。`nodev` の rootfs を検出していない既知の問題（`devices.rs` に記載済み）と、bind したマウントへの `nosuid`・`noexec` の付与も併せて扱う。
+(a) に確定した（判断 4）。実装は #1659・#1660。`nodev` の rootfs を検出していない既知の問題（`devices.rs` に記載済み）は併せて扱う。bind したマウントへの `nosuid`・`noexec` は付与しない（下記）。
 
 bind したマウントへの `nosuid`・`noexec` は付与しない（#1659 の判断。CORE-6・SEC-5）。マウントのルートが文字デバイス 1 個で他のファイルへ届かず、exec と setuid が通常ファイルにしか効かないため守る対象が無い（runc の `bindMountDeviceNode` も `MS_BIND` のみ）。複製はホスト側マウントのフラグを継承する。`nodev` は付けない（ノードが使えなくなる）。よって `mount_setattr` の sys ラッパーは足さない。
 

@@ -98,8 +98,7 @@ mod linux {
                     return;
                 }
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_and_reap_bounded(&mut child);
                     panic!("mknod did not exit within {:?}", timeout());
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),
@@ -131,6 +130,28 @@ mod linux {
             .and_then(|l| l.split_whitespace().nth(2).map(str::to_string))
             .and_then(|v| v.parse().ok())
             .expect("parse egid")
+    }
+
+    /// 期限超過した子を kill し、回収も有限の猶予で打ち切る（REPAIR-5）。
+    /// SIGKILL は終了完了を保証せず（割り込み不能待機等）、無期限 `wait()` は
+    /// 期限超過の報告に到達できなくなるため `try_wait()` をポーリングする。
+    /// 回収できない場合は明示的に panic して失敗を報告する。
+    fn kill_and_reap_bounded(child: &mut std::process::Child) {
+        if let Err(e) = child.kill() {
+            // 既に終了済みの場合などは回収確認へ進む。それ以外は回収の成否で判定する。
+            eprintln!("kill failed: {e}");
+        }
+        let reap_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() >= reap_deadline => {
+                    panic!("child could not be reaped within 5s after kill");
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => panic!("try_wait after kill failed: {e}"),
+            }
+        }
     }
 
     fn timeout() -> Duration {
@@ -279,8 +300,7 @@ mod linux {
                     return;
                 }
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_and_reap_bounded(&mut child);
                     panic!("child did not exit within {:?}", timeout());
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),

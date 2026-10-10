@@ -15,11 +15,16 @@
 //!   `nodev`・`size=<値>`・`mode=<8 進>`）。既定は `nosuid,nodev,noexec`（`nosuid`・`nodev` は常に付与）。
 //!   `suid`・`dev` を含む未知のキーは拒否する。`size=` と `mode=` の重複も拒否する
 //!
+//! # 既定の `/dev/shm`
+//!
+//! `to_tmpfs_set` は `--ipc=host` 以外のとき、`/dev/shm` の指定が無ければ既定 [`DEFAULT_SHM_SIZE_BYTES`]
+//! （64 MiB）の件を足す（オーナー判断 2・TASK-29 追補・#1654）。既定の件も件数上限 64 に数える。
+//!
 //! # 未対応（REPAIR-3: 実装済みを装わない）
 //!
 //! - 本番 launcher・CLI・stack（TOML）からの配線（TASK-79・TASK-169 の後続）
-//! - `--shm-size` 未指定時に `/dev/shm` を既定 [`DEFAULT_SHM_SIZE_BYTES`] で常時マウントする挙動
-//!   （launcher 配線と同時に決める）。サイズ未指定の `--tmpfs` はカーネル既定（Docker と同じ）
+//! - `--ipc=host` でのホストの `/dev/shm` の bind（`docs/design/dev-default-mounts.md` 3.4 の別の関心事）。
+//!   host IPC では既定の `/dev/shm` も載せない。サイズ未指定の `--tmpfs` はカーネル既定（Docker と同じ）
 //! - `uid=`・`gid=`・`%` 指定・小数サイズ・`suid` / `dev` の許可
 //! - `--ipc=host` と `--shm-size` の併用は `MountOptions::to_tmpfs_set`（`ContainerOptions::tmpfs_set` 経由）が拒否する（TASK-169.5.2）。`shareable` との関係は変えない
 
@@ -30,8 +35,8 @@ use fandhe_container_core::traits::{ErrorCode, TraitError};
 
 use super::IpcMode;
 
-/// Docker の `/dev/shm` 既定サイズ（64 MiB）。
-pub const DEFAULT_SHM_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+/// Docker の `/dev/shm` 既定サイズ（64 MiB）。値の定義は core 側の 1 か所に置く。
+pub use fandhe_container_core::tmpfs::DEFAULT_DEV_SHM_SIZE_BYTES as DEFAULT_SHM_SIZE_BYTES;
 
 /// `--tmpfs` 1 件の入力長上限（core の `CONFIG_MAX_PATH_BYTES` と同じ値）。
 const MAX_OPTION_BYTES: usize = 4096;
@@ -189,7 +194,8 @@ impl MountOptions {
         Ok(self)
     }
 
-    /// core の [`TmpfsMountSet`] へ変換する。`shm_size` 指定時は `/dev/shm` を先頭に置く。
+    /// core の [`TmpfsMountSet`] へ変換する。`shm_size` 指定時は `/dev/shm` を先頭に置く。指定が無く
+    /// `ipc` が Host 以外なら、既定 64 MiB の `/dev/shm` を足す（#1654）。
     /// `--tmpfs /dev/shm` との同時指定は重複として拒否する（予約先・件数上限も core が検証する）。
     ///
     /// `ipc` が [`IpcMode::Host`] のとき、`--shm-size` と `--tmpfs /dev/shm` を拒否する（SUP-12・TASK-169.5.2）。
@@ -224,6 +230,10 @@ impl MountOptions {
                 ));
             }
             set.push(t.spec().clone())?;
+        }
+        // host IPC ではホストの `/dev/shm` を共有する前提のため、専用の既定 tmpfs は載せない。
+        if ipc != IpcMode::Host {
+            set.ensure_default_dev_shm()?;
         }
         Ok(set)
     }
@@ -439,9 +449,12 @@ mod tests {
                 .expect("within limit");
         }
         assert_eq!(opts.tmpfs().len(), 64);
+        // 既定の `/dev/shm` も件数に数えるため、64 件では Private を拒否し Host は受理する。
+        let e = opts.to_tmpfs_set(IpcMode::Private).expect_err("full");
+        assert_eq!(e.message(), "too many tmpfs mounts");
         assert_eq!(
-            opts.to_tmpfs_set(IpcMode::Private)
-                .expect("set")
+            opts.to_tmpfs_set(IpcMode::Host)
+                .expect("host")
                 .mounts()
                 .len(),
             64
@@ -451,5 +464,43 @@ mod tests {
             .expect_err("over limit");
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
         assert_eq!(e.message(), "too many tmpfs mounts");
+    }
+
+    /// SUP-12・TASK-29 追補（#1654）: `--shm-size` 未指定でも Private / Shareable は既定 64 MiB を足し、Host は足さない。
+    #[test]
+    fn sup12_task29_default_dev_shm_in_to_tmpfs_set() {
+        let opts = MountOptions::default()
+            .with_tmpfs(TmpfsOption::parse("/run").expect("run"))
+            .expect("add");
+        for ipc in [IpcMode::Private, IpcMode::Shareable] {
+            let set = opts.to_tmpfs_set(ipc).expect("set");
+            let dests: Vec<&str> = set
+                .mounts()
+                .iter()
+                .map(|m| m.destination.as_str())
+                .collect();
+            assert_eq!(dests, ["/dev/shm", "/run"]);
+            assert_eq!(set.mounts()[0].data_string(), "mode=1777,size=67108864");
+        }
+        let host = opts.to_tmpfs_set(IpcMode::Host).expect("host");
+        assert_eq!(host.mounts().len(), 1);
+        assert_eq!(host.mounts()[0].destination.as_str(), "/run");
+
+        let user = MountOptions::default()
+            .with_tmpfs(TmpfsOption::parse("/dev/shm:size=1m").expect("shm"))
+            .expect("add");
+        let set = user.to_tmpfs_set(IpcMode::Private).expect("set");
+        assert_eq!(set.mounts().len(), 1);
+        assert_eq!(set.mounts()[0].data_string(), "mode=1777,size=1048576");
+
+        let mut sixty_three = MountOptions::default();
+        for i in 0..TMPFS_MAX_MOUNTS - 1 {
+            sixty_three = sixty_three
+                .with_tmpfs(TmpfsOption::parse(&format!("/m{i}")).expect("parse"))
+                .expect("add");
+        }
+        let set = sixty_three.to_tmpfs_set(IpcMode::Private).expect("set");
+        assert_eq!(set.mounts().len(), 64);
+        assert_eq!(set.mounts()[0].destination.as_str(), "/dev/shm");
     }
 }

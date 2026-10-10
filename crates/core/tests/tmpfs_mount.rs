@@ -17,7 +17,7 @@
 //!   2. **検査後の差し替え**: `exec-test-support` の入口 `mount_tmpfs_with_attach_hook` で、移動検査の後・
 //!      付け替えの直前に `/swap` を改名して同名の新ディレクトリを作る。`failed_precondition` で失敗し、
 //!      `swap`・`swapped` のどちらにもマウントが残らず（自分のマウントを fd で外す）、両方が空のまま残ること
-//!   3. **成功経路**: `/dev/shm`（64 KiB）・`/scratch`（128 KiB）・`/roexec`（`ro,exec`・64 KiB）・
+//!   3. **成功経路**: `/dev/shm`（未指定の既定 64 MiB。`ensure_default_dev_shm`・#1654）・`/scratch`（128 KiB）・`/roexec`（`ro,exec`・64 KiB）・
 //!      `/nosize`（サイズ未指定）を適用 → `pivot_root` の後、`/proc/self/mountinfo` で 4 件が fstype
 //!      `tmpfs`・`nosuid,nodev` で存在し、`noexec` / `ro` が指定どおりであること、サイズ指定の 3 件が
 //!      指定サイズであること、サイズ未指定の件に `size=` が出ないこと（カーネル既定のまま）、マウント先の
@@ -27,6 +27,9 @@
 //! （`shmem_show_options`）、モードは `stat` で確かめる。サイズはページ単位へ切り上げて表示されるため、
 //! 4K / 16K / 64K ページのいずれでも表示が変わらない 64 KiB の倍数を使う。rootless でも tmpfs は user
 //! namespace 内で作れるため両経路とも成功を要求する（`create_default_devices` には依存しない）。
+//! 本試験の rootfs の `dev` は素のディレクトリで、`create_default_devices`（#1653）の tmpfs の上には載らない
+//! （rootless では `mknod` が EPERM になり使えないため）。`/dev` の tmpfs の上に載る組み合わせは本番の起動順
+//! （`create_default_devices` → `mount_tmpfs`）でのみ成り立つ。
 //! 失敗後に同じ分離を使い続けるのは後始末の照合のためで、本番の契約（失敗時はプロセスを破棄）とは別。
 //!
 //! # 実機前提テストとしての分離
@@ -66,7 +69,7 @@ mod linux {
         ViolationReason, isolate, isolate_rootful_host_root, mount_tmpfs,
         mount_tmpfs_with_attach_hook, pivot_root, plan, plan_rootful_host_root, prepare_rootfs,
     };
-    use fandhe_container_core::tmpfs::{TmpfsMountSet, TmpfsMountSpec, TmpfsSize};
+    use fandhe_container_core::tmpfs::{DevShmOrigin, TmpfsMountSet, TmpfsMountSpec, TmpfsSize};
 
     fn is_root() -> bool {
         std::fs::read_to_string("/proc/self/status")
@@ -293,8 +296,6 @@ mod linux {
         let mut set = TmpfsMountSet::new();
         let kib64 = TmpfsSize::from_bytes(64 * 1024).expect("64 KiB");
         let kib128 = TmpfsSize::from_bytes(128 * 1024).expect("128 KiB");
-        set.push(TmpfsMountSpec::dev_shm(kib64).expect("shm spec"))
-            .expect("push shm");
         set.push(TmpfsMountSpec::new("/scratch", Some(kib128)).expect("scratch spec"))
             .expect("push scratch");
         let mut roexec = TmpfsMountSpec::new("/roexec", Some(kib64)).expect("roexec spec");
@@ -303,6 +304,11 @@ mod linux {
         set.push(roexec).expect("push roexec");
         set.push(TmpfsMountSpec::new("/nosize", None).expect("nosize spec"))
             .expect("push nosize");
+        // `/dev/shm` は指定せず、既定 64 MiB が集合の先頭へ足されることを使う（#1654）。
+        assert_eq!(
+            set.ensure_default_dev_shm().expect("default shm"),
+            DevShmOrigin::Default
+        );
         let report = mount_tmpfs(&isolation, &prepared, &set).expect("mount tmpfs");
         let applied: Vec<(&str, Option<u64>, bool, bool)> = report
             .mounts
@@ -312,7 +318,7 @@ mod linux {
         assert_eq!(
             applied,
             vec![
-                ("/dev/shm", Some(65_536), false, false),
+                ("/dev/shm", Some(67_108_864), false, false),
                 ("/scratch", Some(131_072), false, false),
                 ("/roexec", Some(65_536), true, true),
                 ("/nosize", None, false, false),
@@ -324,7 +330,7 @@ mod linux {
         let info = std::fs::read_to_string("/proc/self/mountinfo").expect("mountinfo");
         // (マウント先, 表示サイズ, 読み取り専用か, noexec か)
         for (point, size, read_only, noexec) in [
-            ("/dev/shm", Some("size=64k"), false, true),
+            ("/dev/shm", Some("size=65536k"), false, true),
             ("/scratch", Some("size=128k"), false, true),
             ("/roexec", Some("size=64k"), true, false),
             ("/nosize", None, false, true),

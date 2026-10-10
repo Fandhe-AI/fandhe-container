@@ -169,6 +169,7 @@ impl ContainerOptions {
     /// （SUP-12・TASK-169.5.2）。host IPC ではホストの `/dev/shm` を共有するはずで、コンテナ専用の
     /// `/dev/shm` サイズ指定を黙って無視したり専用 tmpfs で覆ったりすると、指定した IPC モードと実際の共有状態が食い違うため（fail-closed）。
     /// 検証は消費時点で行い、builder の呼び出し順で迂回できないようにする。
+    /// `--ipc=host` 以外では `/dev/shm` の指定が無くても既定 64 MiB の `/dev/shm` を含む（#1654）。
     pub fn tmpfs_set(&self) -> Result<TmpfsMountSet, TraitError> {
         self.mounts.to_tmpfs_set(self.ipc)
     }
@@ -417,7 +418,14 @@ mod tests {
                 .unwrap();
             assert_eq!(set.mounts().len(), 1);
         }
-        assert!(ContainerOptions::new().tmpfs_set().unwrap().is_empty());
+        // 指定が無くても Private（既定）は既定の `/dev/shm` ちょうど 1 件（#1654）。
+        let default_set = ContainerOptions::new().tmpfs_set().unwrap();
+        assert_eq!(default_set.mounts().len(), 1);
+        assert_eq!(default_set.mounts()[0].destination.as_str(), "/dev/shm");
+        assert_eq!(
+            default_set.mounts()[0].data_string(),
+            "mode=1777,size=67108864"
+        );
         assert!(ContainerOptions::new().mounts().tmpfs().is_empty());
     }
 }

@@ -54,7 +54,7 @@
 //!   kill（TASK-30.1）も実装済みで、送信は `ProcessSignaler` の依存注入（本番実装は supervisor 待ち）。delete（TASK-30.2・TASK-30.3）は cgroup（`ContainerCgroupRemover` の依存注入）と `StateStore` のレコードの削除を実装済みで、OCI-7 の参照解除は TASK-183 で未実装。
 //!   失敗のエラー型 `OciRuntimeError`（ERR-2・TASK-96.1）は定義済みで、4 操作（create / start / kill / delete）は結線済み・`write_json_line` で stderr 向け 1 行を出せる（TASK-96.2・TASK-96.3）。実 stderr 出力・終了は CLI 側で未実装
 //! - `tmpfs`: tmpfs マウントの検証済み仕様型（`--shm-size` / `--tmpfs`。SUP-12・TASK-169.2）。OS 非依存で、
-//!   Linux 限定の適用は `exec::mount_tmpfs`。launcher・CLI への配線は未実装（REPAIR-3）
+//!   Linux 限定の適用は `exec::mount_tmpfs`。暗黙の既定 `/dev/shm`（64 MiB）は `TmpfsMountSet::ensure_default_dev_shm`（#1654）。launcher・CLI への配線は未実装（REPAIR-3）
 //! - `injected_files`: secrets / configs 注入の検証済み仕様型（SUP-12・TASK-169.4.2）。OS 非依存で、
 //!   Linux 限定の適用は `exec::inject_files`（専用 tmpfs へ書き込み後に read-only 化）。配線は未実装（REPAIR-3）
 //! - `state_store`: ファイルベース `StateStore`（TASK-31.1・OCI-5）は実装済み。3 OS でコンパイルされるが

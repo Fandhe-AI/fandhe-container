@@ -5,13 +5,15 @@ use fandhe_container_plugin_macos::gpu::venus::{CommandType, VenusWireError};
 
 use super::*;
 use crate::adapter::{CtrlAdapter, Handled};
+use crate::adapter::{ShmemOp, ShmemOpKind};
 use crate::ctrl::{
     CMD_CTX_ATTACH_RESOURCE, CMD_CTX_CREATE, CMD_CTX_DESTROY, CMD_CTX_DETACH_RESOURCE,
     CMD_RESOURCE_CREATE_BLOB, CMD_RESOURCE_MAP_BLOB, CMD_RESOURCE_UNMAP_BLOB, CMD_RESOURCE_UNREF,
-    CMD_SUBMIT_3D, FLAG_FENCE, FLAG_INFO_RING_IDX, HDR_LEN, MAX_REQ_LEN,
+    CMD_SUBMIT_3D, CtrlHeader, FLAG_FENCE, FLAG_INFO_RING_IDX, HDR_LEN, MAX_REQ_LEN,
     RESP_ERR_INVALID_CONTEXT_ID, RESP_ERR_INVALID_PARAMETER, RESP_ERR_INVALID_RESOURCE_ID,
-    RESP_ERR_OUT_OF_MEMORY, RESP_ERR_UNSPEC, RESP_OK_NODATA,
+    RESP_ERR_OUT_OF_MEMORY, RESP_ERR_UNSPEC, RESP_OK_MAP_INFO, RESP_OK_NODATA,
 };
+use crate::log::QueryResult;
 use crate::log::{MAX_LINE_BYTES, find_capset_queries};
 
 const OK: u32 = RESP_OK_NODATA;
@@ -320,14 +322,181 @@ fn task1601_gpu6_fence_is_carried_over_on_success_and_failure() {
     }
 }
 
-#[test]
-fn task1601_gpu6_map_unmap_blob_stay_unspec() {
+// ---- RESOURCE_MAP_BLOB / UNMAP_BLOB（F5.2b.4a・#1643） ----
+
+const PAGE: u64 = 4096;
+
+fn map_req(res: u32, offset: u64, total: usize) -> Vec<u8> {
+    let mut v = hdr(CMD_RESOURCE_MAP_BLOB, 0, 0, total.max(HDR_LEN + 16));
+    put32(&mut v, 24, res);
+    v[32..40].copy_from_slice(&offset.to_le_bytes());
+    v.truncate(total);
+    v
+}
+
+fn unmap_req(res: u32, total: usize) -> Vec<u8> {
+    let mut v = hdr(CMD_RESOURCE_UNMAP_BLOB, 0, 0, total.max(HDR_LEN + 4));
+    put32(&mut v, 24, res);
+    v.truncate(total);
+    v
+}
+
+/// ctx 1 を作り、res 7（8192 バイト）を作る。
+fn with_blob7() -> CtrlAdapter {
     let mut a = with_ctx(1);
-    assert_eq!(ty(&mut a, &blob_req(&blob(1, 1, 4096))), OK);
-    for cmd in [CMD_RESOURCE_MAP_BLOB, CMD_RESOURCE_UNMAP_BLOB] {
-        let h = run(&mut a, &res_req(cmd, 1, 1, 40));
-        assert_eq!(h.response.resp_type(), RESP_ERR_UNSPEC);
-        assert!(h.submit.is_none());
+    assert_eq!(ty(&mut a, &blob_req(&blob(1, 7, 8192))), OK);
+    a
+}
+
+#[test]
+fn f5_2b_4a_gpu6_map_blob_success_without_attach() {
+    let mut a = with_blob7();
+    let h = run(&mut a, &map_req(7, PAGE, 40));
+    assert_eq!(
+        h.shmem,
+        Some(ShmemOp {
+            kind: ShmemOpKind::Map,
+            res_id: 7,
+            shm_offset: 4096,
+            len: 8192,
+            hdr: CtrlHeader::parse(&map_req(7, PAGE, 40)).unwrap(),
+        })
+    );
+    assert_eq!(a.mapped_offset(7), Some(4096));
+    let op = h.shmem.unwrap();
+    let r = op.response(QueryResult::Ok);
+    assert_eq!((r.resp_type(), r.as_bytes().len()), (RESP_OK_MAP_INFO, 32));
+    assert_eq!(word(r.as_bytes(), 24), 1);
+    assert_eq!(word(r.as_bytes(), 28), 0);
+    assert_eq!(op.max_response_len(), 32);
+    assert_eq!(
+        op.log_line(QueryResult::Ok),
+        "venus_jig event=resource cmd=RESOURCE_MAP_BLOB res_id=7 offset=4096 size=8192 map_info=1 result=ok"
+    );
+    assert_eq!(
+        op.log_line(QueryResult::Unspec),
+        "venus_jig event=resource cmd=RESOURCE_MAP_BLOB res_id=7 offset=4096 size=8192 map_info=-1 result=unspec"
+    );
+    assert_eq!(
+        op.response(QueryResult::Unspec).resp_type(),
+        RESP_ERR_UNSPEC
+    );
+}
+
+#[test]
+fn f5_2b_4a_gpu6_map_blob_carries_fence() {
+    let mut a = with_blob7();
+    let mut req = map_req(7, 0, 40);
+    req[4..8].copy_from_slice(&FLAG_FENCE.to_le_bytes());
+    let h = run(&mut a, &req);
+    let r = h.response.as_bytes();
+    assert_eq!(h.response.resp_type(), RESP_OK_MAP_INFO);
+    assert_eq!(word(r, 4), FLAG_FENCE);
+    assert_eq!(u64::from_le_bytes(r[8..16].try_into().unwrap()), 0x77);
+    let final_resp = h.shmem.unwrap().response(QueryResult::Ok);
+    assert_eq!(final_resp.as_bytes(), r);
+}
+
+#[test]
+fn f5_2b_4a_gpu6_unmap_blob_success_and_unref_after() {
+    let mut a = with_blob7();
+    assert!(run(&mut a, &map_req(7, PAGE, 40)).shmem.is_some());
+    // 暫定: map 中の UNREF は拒否する。
+    assert_eq!(ty(&mut a, &res_req(CMD_RESOURCE_UNREF, 0, 7, 32)), BAD);
+    let h = run(&mut a, &unmap_req(7, 32));
+    let op = h.shmem.expect("unmap op");
+    assert_eq!(
+        (op.kind, op.res_id, op.shm_offset, op.len),
+        (ShmemOpKind::Unmap, 7, 4096, 8192)
+    );
+    assert_eq!(a.mapped_offset(7), None);
+    let r = op.response(QueryResult::Ok);
+    assert_eq!((r.resp_type(), r.as_bytes().len()), (OK, 24));
+    assert_eq!(op.max_response_len(), 24);
+    assert_eq!(
+        op.log_line(QueryResult::Ok),
+        "venus_jig event=resource cmd=RESOURCE_UNMAP_BLOB res_id=7 offset=4096 size=8192 result=ok"
+    );
+    assert_eq!(ty(&mut a, &res_req(CMD_RESOURCE_UNREF, 0, 7, 32)), OK);
+}
+
+#[test]
+fn f5_2b_4a_gpu6_map_unmap_blob_rejects_leave_table_unchanged() {
+    let region = crate::device::HOST_VISIBLE_SHM_SIZE;
+    let mut a = with_blob7();
+    let before = a.clone();
+    let cases: Vec<(&str, Vec<u8>, u32)> = vec![
+        ("map unknown res", map_req(9, 0, 40), NO_RES),
+        ("map res 0", map_req(0, 0, 40), NO_RES),
+        ("unmap unknown res", unmap_req(9, 32), NO_RES),
+        ("unmap not mapped", unmap_req(7, 32), BAD),
+        ("misaligned", map_req(7, 4097, 40), BAD),
+        ("past region", map_req(7, region - PAGE, 40), BAD),
+        ("overflow", map_req(7, u64::MAX - 4095, 40), BAD),
+        ("map short", map_req(7, 0, 39), BAD),
+        ("map long", map_req(7, 0, 41), BAD),
+        ("unmap short", unmap_req(7, 31), BAD),
+        ("unmap long", unmap_req(7, 33), BAD),
+    ];
+    for (name, req, want) in cases {
+        let h = run(&mut a, &req);
+        assert_eq!(h.response.resp_type(), want, "{name}");
+        assert!(h.shmem.is_none(), "{name}");
+        assert_eq!(a, before, "{name}");
+    }
+    // padding が 0 でない。
+    let mut req = map_req(7, 0, 40);
+    req[28..32].copy_from_slice(&1u32.to_le_bytes());
+    assert_eq!(ty(&mut a, &req), BAD);
+    let mut req = unmap_req(7, 32);
+    req[28..32].copy_from_slice(&1u32.to_le_bytes());
+    assert_eq!(ty(&mut a, &req), BAD);
+    assert_eq!(a, before);
+    // 領域の末尾にちょうど収まる offset は成功する。
+    assert!(run(&mut a, &map_req(7, region - 8192, 40)).shmem.is_some());
+}
+
+#[test]
+fn f5_2b_4a_gpu6_map_blob_double_and_overlap() {
+    let mut a = with_blob7();
+    assert_eq!(ty(&mut a, &blob_req(&blob(1, 8, 8192))), OK);
+    assert!(run(&mut a, &map_req(7, 0, 40)).shmem.is_some());
+    // 二重の MAP。
+    assert_eq!(ty(&mut a, &map_req(7, 65536, 40)), BAD);
+    // 重なる（res 8 を 4096 に置くと 7 の [0, 8192) と重なる）。
+    assert_eq!(ty(&mut a, &map_req(8, PAGE, 40)), BAD);
+    assert_eq!(a.mapped_offset(8), None);
+    // 隣接は成功する。
+    assert!(run(&mut a, &map_req(8, 8192, 40)).shmem.is_some());
+    assert_eq!(a.mapped_offset(8), Some(8192));
+}
+
+#[test]
+fn f5_2b_4a_gpu6_map_blob_log_lines_fit_and_classify() {
+    let mut a = with_blob7();
+    let h = run(&mut a, &map_req(9, PAGE, 40));
+    assert_eq!(
+        h.log_line,
+        "venus_jig event=resource cmd=RESOURCE_MAP_BLOB res_id=9 offset=4096 size=-1 map_info=-1 result=invalid_resource_id"
+    );
+    let h2 = run(&mut a, &map_req(7, 0, 39));
+    assert_eq!(
+        h2.log_line,
+        "venus_jig event=resource cmd=RESOURCE_MAP_BLOB res_id=-1 offset=-1 size=-1 map_info=-1 result=invalid_parameter"
+    );
+    let h3 = run(&mut a, &unmap_req(9, 32));
+    assert_eq!(
+        h3.log_line,
+        "venus_jig event=resource cmd=RESOURCE_UNMAP_BLOB res_id=9 offset=-1 size=-1 result=invalid_resource_id"
+    );
+    for l in [&h.log_line, &h2.log_line, &h3.log_line] {
+        assert!(l.len() <= MAX_LINE_BYTES);
+        let r = find_capset_queries(l).unwrap();
+        assert_eq!(
+            (r.venus_get_capset_ok, r.info_ok, r.malformed_lines),
+            (0, 0, 0),
+            "{l}"
+        );
     }
 }
 

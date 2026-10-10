@@ -8,8 +8,10 @@
 //! #1601 で blob リソース（`RESOURCE_CREATE_BLOB`・`CTX_ATTACH_RESOURCE` / `DETACH_RESOURCE`・`RESOURCE_UNREF`。資源表は
 //! `resource`）と `SUBMIT_3D` の最小応答を追加した。`SUBMIT_3D` は受理して [`Handled::submit`] で本体を呼び出し側へ渡すだけで、
 //! コマンドは実行しない。`CTX_DESTROY` はその ctx への attach を暗黙に外す。
-//! 未実装（REPAIR-3）: `RESOURCE_MAP_BLOB` / `UNMAP_BLOB`（共有メモリが前提。F5.2b・承認待ち。`ERR_UNSPEC` のまま）、
-//! 実メモリの確保、`SUBMIT_3D` の dispatch（TASK-177.x）。
+//! F5.2b.4a（#1643）で `RESOURCE_MAP_BLOB` / `UNMAP_BLOB` を追加した。adapter は検証して資源表を仮に更新するところまでで、
+//! [`Handled::shmem`] に実行指示（[`ShmemOp`]）を返す。実メモリ（memfd）の確保と frontend との `SHMEM_MAP` / `SHMEM_UNMAP` は
+//! `session` が行い、失敗時は adapter ごと巻き戻してゲストへ ERR を返す。map 中の資源の解放の確定は #1645。
+//! 未実装（REPAIR-3）: `SUBMIT_3D` の dispatch（TASK-177.x）、map 中の資源の解放の確定（#1645）。
 
 use fandhe_container_plugin_macos::gpu::venus::{
     CommandHeader, VenusWireError, WireReader, capset_info, parse_command_header,
@@ -19,14 +21,16 @@ use fandhe_container_plugin_macos::gpu::venus::{
 use crate::ctrl::{
     BLOB_FLAG_USE_MAPPABLE, BLOB_MEM_HOST3D, CMD_CTX_ATTACH_RESOURCE, CMD_CTX_CREATE,
     CMD_CTX_DESTROY, CMD_CTX_DETACH_RESOURCE, CMD_GET_CAPSET, CMD_GET_CAPSET_INFO,
-    CMD_GET_DISPLAY_INFO, CMD_RESOURCE_CREATE_BLOB, CMD_RESOURCE_UNREF, CMD_SUBMIT_3D,
-    CTX_DESTROY_REQ_LEN, CtrlHeader, CtrlResponse, CtxCreate, CtxCreateError,
-    DISPLAY_INFO_BODY_LEN, DISPLAY_INFO_REQ_LEN, FLAG_FENCE, FLAG_INFO_RING_IDX, HDR_LEN, REQ_LEN,
-    RESP_ERR_INVALID_CONTEXT_ID, RESP_ERR_INVALID_PARAMETER, RESP_ERR_INVALID_RESOURCE_ID,
-    RESP_ERR_OUT_OF_MEMORY, RESP_ERR_UNSPEC, RESP_OK_CAPSET, RESP_OK_CAPSET_INFO,
-    RESP_OK_DISPLAY_INFO, RESP_OK_NODATA, ResourceCreateBlob, Submit3dError, le32,
-    parse_resource_id, parse_submit_3d,
+    CMD_GET_DISPLAY_INFO, CMD_RESOURCE_CREATE_BLOB, CMD_RESOURCE_MAP_BLOB, CMD_RESOURCE_UNMAP_BLOB,
+    CMD_RESOURCE_UNREF, CMD_SUBMIT_3D, CTX_DESTROY_REQ_LEN, CtrlHeader, CtrlResponse, CtxCreate,
+    CtxCreateError, DISPLAY_INFO_BODY_LEN, DISPLAY_INFO_REQ_LEN, FLAG_FENCE, FLAG_INFO_RING_IDX,
+    HDR_LEN, MAP_CACHE_CACHED, MAP_INFO_BODY_LEN, REQ_LEN, RESP_ERR_INVALID_CONTEXT_ID,
+    RESP_ERR_INVALID_PARAMETER, RESP_ERR_INVALID_RESOURCE_ID, RESP_ERR_OUT_OF_MEMORY,
+    RESP_ERR_UNSPEC, RESP_OK_CAPSET, RESP_OK_CAPSET_INFO, RESP_OK_DISPLAY_INFO, RESP_OK_MAP_INFO,
+    RESP_OK_NODATA, ResourceCreateBlob, ResourceMapBlob, Submit3dError, le32, parse_resource_id,
+    parse_resource_unmap_blob, parse_submit_3d,
 };
+use crate::device;
 use crate::log::{self, QueryResult};
 use crate::resource::{ResourceError, ResourceTable};
 
@@ -60,6 +64,78 @@ pub struct Handled {
     pub log_line: String,
     /// 受理した `SUBMIT_3D` の受け渡し点（それ以外の要求・拒否では `None`）。
     pub submit: Option<Submit3d>,
+    /// 受理した `RESOURCE_MAP_BLOB` / `UNMAP_BLOB` の実行指示（それ以外の要求・拒否では `None`）。`response` / `log_line` は
+    /// 成功を仮定した値で、`session` が frontend とのやりとりの結果で [`ShmemOp::response`] / [`ShmemOp::log_line`] から組み直す。
+    pub shmem: Option<ShmemOp>,
+}
+
+/// [`ShmemOp`] の種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShmemOpKind {
+    /// `RESOURCE_MAP_BLOB`（memfd を作って `SHMEM_MAP` で frontend へ渡す）。
+    Map,
+    /// `RESOURCE_UNMAP_BLOB`（`SHMEM_UNMAP` を送る）。
+    Unmap,
+}
+
+/// adapter が検証して資源表を仮に更新した `MAP_BLOB` / `UNMAP_BLOB` の実行指示（F5.2b.4a・#1643）。
+///
+/// adapter は I/O を持たないので、frontend とのやりとり（memfd の確保・`SHMEM_MAP` / `SHMEM_UNMAP`）は `session` が行う。
+/// 失敗・巻き戻しの契約は `session` 側にある。`session` は失敗時に adapter を巻き戻し、ゲストへ ERR を返す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShmemOp {
+    /// map / unmap の別。
+    pub kind: ShmemOpKind,
+    /// 対象の resource_id。
+    pub res_id: u32,
+    /// host-visible 領域内のバイトオフセット。
+    pub shm_offset: u64,
+    /// 長さ（resource の大きさ）。
+    pub len: u64,
+    /// 要求ヘッダ（fence の引き継ぎ用）。
+    pub hdr: CtrlHeader,
+}
+
+impl ShmemOp {
+    /// 応答の最大長。frontend へ送る前に、ゲストの書き込み可能長がこれに満たないかを調べるために使う
+    /// （満たないまま map して応答だけ捨てると、frontend にだけ map が残るため）。
+    pub fn max_response_len(&self) -> usize {
+        match self.kind {
+            ShmemOpKind::Map => HDR_LEN + MAP_INFO_BODY_LEN,
+            ShmemOpKind::Unmap => HDR_LEN,
+        }
+    }
+
+    /// 結果に応じた最終応答。MAP の成功は `OK_MAP_INFO`（`map_info` = CACHED）、UNMAP の成功は `OK_NODATA`。
+    pub fn response(&self, result: QueryResult) -> CtrlResponse {
+        match (self.kind, result) {
+            (ShmemOpKind::Map, QueryResult::Ok) => {
+                let mut body = [0u8; MAP_INFO_BODY_LEN];
+                if let Some(dst) = body.get_mut(..4) {
+                    dst.copy_from_slice(&MAP_CACHE_CACHED.to_le_bytes());
+                }
+                CtrlResponse::new(Some(&self.hdr), RESP_OK_MAP_INFO, &body)
+            }
+            _ => ctx_response(&self.hdr, result),
+        }
+    }
+
+    /// 結果に応じた構造化ログ 1 行。
+    pub fn log_line(&self, result: QueryResult) -> String {
+        let (off, len) = (Some(self.shm_offset), Some(self.len));
+        match self.kind {
+            ShmemOpKind::Map => log::resource_map_blob_line(
+                Some(self.res_id),
+                off,
+                len,
+                (result == QueryResult::Ok).then_some(MAP_CACHE_CACHED),
+                result,
+            ),
+            ShmemOpKind::Unmap => {
+                log::resource_unmap_blob_line(Some(self.res_id), off, len, result)
+            }
+        }
+    }
 }
 
 /// 同時に保持する ctx の上限（ゲスト由来の無制限 insert による DoS を防ぐ）。
@@ -138,6 +214,7 @@ impl CtrlAdapter {
                 response: CtrlResponse::new(None, RESP_ERR_INVALID_PARAMETER, &[]),
                 log_line: log::rejected_line(None, QueryResult::InvalidParameter),
                 submit: None,
+                shmem: None,
             };
         };
         match hdr.cmd_type {
@@ -150,10 +227,13 @@ impl CtrlAdapter {
             CMD_CTX_ATTACH_RESOURCE | CMD_CTX_DETACH_RESOURCE => self.ctx_resource(&hdr, req),
             CMD_RESOURCE_UNREF => self.resource_unref(&hdr, req),
             CMD_SUBMIT_3D => self.submit_3d(&hdr, req),
+            CMD_RESOURCE_MAP_BLOB => self.resource_map_blob(&hdr, req),
+            CMD_RESOURCE_UNMAP_BLOB => self.resource_unmap_blob(&hdr, req),
             other => Handled {
                 response: CtrlResponse::new(Some(&hdr), RESP_ERR_UNSPEC, &[]),
                 log_line: log::rejected_line(Some(other), QueryResult::Unspec),
                 submit: None,
+                shmem: None,
             },
         }
     }
@@ -178,6 +258,7 @@ impl CtrlAdapter {
             response: ctx_response(hdr, result),
             log_line: log::ctx_create_line(hdr.ctx_id, capset_id, nlen, result),
             submit: None,
+            shmem: None,
         }
     }
 
@@ -199,6 +280,7 @@ impl CtrlAdapter {
             response: ctx_response(hdr, result),
             log_line: log::ctx_destroy_line(hdr.ctx_id, result),
             submit: None,
+            shmem: None,
         }
     }
 
@@ -224,6 +306,7 @@ impl CtrlAdapter {
             response: ctx_response(hdr, result),
             log_line: log::resource_create_blob_line(hdr.ctx_id, parsed.as_ref(), result),
             submit: None,
+            shmem: None,
         }
     }
 
@@ -249,6 +332,7 @@ impl CtrlAdapter {
             response: ctx_response(hdr, result),
             log_line: log::ctx_resource_line(cmd, hdr.ctx_id, res_id, result),
             submit: None,
+            shmem: None,
         }
     }
 
@@ -262,7 +346,92 @@ impl CtrlAdapter {
             response: ctx_response(hdr, result),
             log_line: log::resource_unref_line(res_id, result),
             submit: None,
+            shmem: None,
         }
+    }
+
+    /// `RESOURCE_MAP_BLOB`。ctx_id は見ない（Linux のドライバは常に 0 で送り、`CTX_ATTACH_RESOURCE` より先に届く）。
+    fn resource_map_blob(&mut self, hdr: &CtrlHeader, req: &[u8]) -> Handled {
+        let parsed = ResourceMapBlob::parse(req);
+        let offset = parsed.map(|p| p.offset);
+        let range = match parsed {
+            None => Err(QueryResult::InvalidParameter),
+            Some(p) if p.padding != 0 => Err(QueryResult::InvalidParameter),
+            Some(p) => self
+                .resources
+                .map(p.res_id, p.offset, device::HOST_VISIBLE_SHM_SIZE)
+                .map(|r| (p.res_id, r))
+                .map_err(resource_error),
+        };
+        match range {
+            Ok((res_id, r)) => shmem_handled(ShmemOp {
+                kind: ShmemOpKind::Map,
+                res_id,
+                shm_offset: r.offset,
+                len: r.len,
+                hdr: *hdr,
+            }),
+            Err(result) => Handled {
+                response: ctx_response(hdr, result),
+                log_line: log::resource_map_blob_line(
+                    parsed.map(|p| p.res_id),
+                    offset,
+                    None,
+                    None,
+                    result,
+                ),
+                submit: None,
+                shmem: None,
+            },
+        }
+    }
+
+    /// `RESOURCE_UNMAP_BLOB`。map 中の resource だけを受け付ける。
+    fn resource_unmap_blob(&mut self, hdr: &CtrlHeader, req: &[u8]) -> Handled {
+        let parsed = parse_resource_unmap_blob(req);
+        let range = match parsed {
+            None => Err(QueryResult::InvalidParameter),
+            Some(p) if p.padding != 0 => Err(QueryResult::InvalidParameter),
+            Some(p) => self
+                .resources
+                .unmap(p.res_id)
+                .map(|r| (p.res_id, r))
+                .map_err(resource_error),
+        };
+        match range {
+            Ok((res_id, r)) => shmem_handled(ShmemOp {
+                kind: ShmemOpKind::Unmap,
+                res_id,
+                shm_offset: r.offset,
+                len: r.len,
+                hdr: *hdr,
+            }),
+            Err(result) => Handled {
+                response: ctx_response(hdr, result),
+                log_line: log::resource_unmap_blob_line(
+                    parsed.map(|p| p.res_id),
+                    None,
+                    None,
+                    result,
+                ),
+                submit: None,
+                shmem: None,
+            },
+        }
+    }
+
+    /// resource の大きさ（`session` が実メモリの副表を資源表と突き合わせる）。無ければ `None`。
+    ///
+    /// 呼び出し元の `session` は Linux 限定のため、他 OS では dead_code になるので同じ cfg で絞る。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn resource_size(&self, res_id: u32) -> Option<u64> {
+        self.resources.size_of(res_id)
+    }
+
+    /// map 中の offset（試験用の参照）。
+    #[cfg(test)]
+    pub(crate) fn mapped_offset(&self, res_id: u32) -> Option<u64> {
+        self.resources.mapped(res_id)
     }
 
     fn submit_3d(&mut self, hdr: &CtrlHeader, req: &[u8]) -> Handled {
@@ -277,6 +446,7 @@ impl CtrlAdapter {
                 result,
             }),
             submit: None,
+            shmem: None,
         };
         let body = match parse_submit_3d(req) {
             Ok(b) => b,
@@ -317,16 +487,30 @@ impl CtrlAdapter {
                 header,
                 payload: body.to_vec(),
             }),
+            shmem: None,
         }
     }
 }
 
 fn resource_result(r: Result<(), ResourceError>) -> QueryResult {
-    match r {
-        Ok(()) => QueryResult::Ok,
-        Err(ResourceError::InvalidId) => QueryResult::InvalidResourceId,
-        Err(ResourceError::InvalidParameter) => QueryResult::InvalidParameter,
-        Err(ResourceError::Full) => QueryResult::OutOfMemory,
+    r.map_or_else(resource_error, |()| QueryResult::Ok)
+}
+
+fn resource_error(e: ResourceError) -> QueryResult {
+    match e {
+        ResourceError::InvalidId => QueryResult::InvalidResourceId,
+        ResourceError::InvalidParameter => QueryResult::InvalidParameter,
+        ResourceError::Full => QueryResult::OutOfMemory,
+    }
+}
+
+/// 受理した map / unmap の仮の `Handled`（成功を仮定した応答とログ。`session` が結果で組み直す）。
+fn shmem_handled(op: ShmemOp) -> Handled {
+    Handled {
+        response: op.response(QueryResult::Ok),
+        log_line: op.log_line(QueryResult::Ok),
+        submit: None,
+        shmem: Some(op),
     }
 }
 
@@ -355,6 +539,7 @@ fn get_display_info(hdr: &CtrlHeader, req: &[u8]) -> Handled {
         ),
         log_line: log::display_info_line(QueryResult::Ok),
         submit: None,
+        shmem: None,
     }
 }
 
@@ -363,6 +548,7 @@ fn invalid(hdr: &CtrlHeader, log_line: String) -> Handled {
         response: CtrlResponse::new(Some(hdr), RESP_ERR_INVALID_PARAMETER, &[]),
         log_line,
         submit: None,
+        shmem: None,
     }
 }
 
@@ -389,6 +575,7 @@ fn get_capset_info(hdr: &CtrlHeader, req: &[u8]) -> Handled {
         response: CtrlResponse::new(Some(hdr), RESP_OK_CAPSET_INFO, &body),
         log_line: log::info_line(Some(index), QueryResult::Ok, info.max_size),
         submit: None,
+        shmem: None,
     }
 }
 
@@ -404,6 +591,7 @@ fn get_capset(hdr: &CtrlHeader, req: &[u8]) -> Handled {
             response: CtrlResponse::new(Some(hdr), RESP_OK_CAPSET, &resp.data),
             log_line: log::query_line(Some(id), version, QueryResult::Ok, resp.info.max_size),
             submit: None,
+            shmem: None,
         },
         Err(_) => invalid(
             hdr,

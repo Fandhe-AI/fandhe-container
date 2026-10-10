@@ -94,15 +94,13 @@ fn task172_4_gpu6_bad_lengths_rejected() {
 
 #[test]
 fn task172_4_gpu6_unknown_type_is_unspec() {
-    // 0x0101 = RESOURCE_CREATE_2D、0x0208 = RESOURCE_MAP_BLOB、0x0209 = RESOURCE_UNMAP_BLOB（いずれも未実装。#1601 で BLOB 作成と SUBMIT_3D は実装済み）。
-    for (cmd, dec) in [(0x0101u32, 257), (0x0208, 520), (0x0209, 521)] {
-        let h = handle_ctrl(&req(cmd, 0, 0, 0, 0));
-        assert_eq!(h.response.resp_type(), RESP_ERR_UNSPEC);
-        assert_eq!(
-            h.log_line,
-            format!("venus_jig event=ctrl_rejected cmd_type={dec} result=unspec")
-        );
-    }
+    // 0x0101 = RESOURCE_CREATE_2D（未実装。#1601 で BLOB 作成と SUBMIT_3D、#1643 で MAP_BLOB / UNMAP_BLOB は実装済み）。
+    let h = handle_ctrl(&req(0x0101, 0, 0, 0, 0));
+    assert_eq!(h.response.resp_type(), RESP_ERR_UNSPEC);
+    assert_eq!(
+        h.log_line,
+        "venus_jig event=ctrl_rejected cmd_type=257 result=unspec"
+    );
 }
 
 #[test]

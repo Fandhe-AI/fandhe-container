@@ -2,7 +2,7 @@
 //!
 //! 役割: `negotiation::State` が保持する backend 要求用 UDS へ、`vhost_user::backend_req` で組んだ 52 バイトの要求を
 //! NEED_REPLY つきで送り、frontend の u64 応答（0 = 成功、非 0 = 失敗）を検査して返す。呼び出し元は
-//! `Session::shmem_map` / `shmem_unmap`（さらにその呼び出し元は #1643 の ctrl `MAP_BLOB` / `UNMAP_BLOB`）。
+//! `Session::shmem_map` / `shmem_unmap`（さらにその呼び出し元は ctrl `MAP_BLOB` / `UNMAP_BLOB`＝`Session::execute_shmem`。#1643）。
 //!
 //! 期限（REPAIR-5）は呼び出しごとの 1 つで、送信と受信の全体を覆う（セッションからは `SessionLimits::message_timeout`）。
 //! fd は 52 バイトを送る最初の `sendmsg` に付ける（crosvm は先頭のヘッダ受信で添付 fd を受け、本体側の fd を

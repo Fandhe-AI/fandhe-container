@@ -20,7 +20,7 @@ Rust でフルスクラッチ開発する軽量なコンテナ実行基盤の実
 - **OCI / CRI 互換**: OCI 準拠のコンテナランタイムとして動作し、VM は macOS / Windows 対応と分離オプションの手段として使います
 - **I/O レイヤー再設計**: 大量ボリューム書き込み時のボトルネック解消を MVP の中核とします
 - **対象 OS**: macOS（Apple Silicon）・Windows 10/11（WSL2）・Linux（x86_64 / arm64）の 3 OS で、ローカルとサーバーの双方に対応します
-  - Linux のカーネルは 6.12 以降を前提とします（Landlock ABI 6 以上。CORE-5）。rootful の起動は rootfs の `nodev` 付与に `mount_setattr(2)`（Linux 5.12 以降。#1676）を、rootless の基本デバイスの bind は新マウント API（Linux 5.2 以降。#1660）を使い、いずれも 6.12 の範囲に含まれます。未対応のカーネルでは縮退せず起動を拒否します
+  - Linux のカーネルは 6.12 以降を前提とします（Landlock ABI 6 以上。CORE-5）。起動時の rootfs の `nodev` 付与（rootful・rootless とも）は `mount_setattr(2)`（Linux 5.12 以降。#1676）を、rootless の基本デバイスの bind は新マウント API（Linux 5.2 以降。#1660）を使い、いずれも 6.12 の範囲に含まれます。これらが使えないカーネルでは `mount(2)` へ縮退せず起動を拒否します
 - **plugin 分割**: 拡張機能は別プロセス＋UDS 境界の plugin として分離します
 - **周辺機能**: GPU パススルー・network・複数コンテナ定義・コンテナごとの軽量監視を含みます
 - **AI 自己補修**: AI 自身が保守・改善・機能追加できるモジュール設計（crate 境界・型契約）を MVP の設計制約とします

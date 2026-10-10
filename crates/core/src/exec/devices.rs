@@ -12,8 +12,8 @@
 //! （runc 方式。設計ドラフト `docs/design/dev-default-mounts.md` 3.1・オーナー判断 2026-10-10）である。
 //! これによりノードがホスト側の rootfs に残らず、イメージ同梱の `dev` 配下（偽ノード等）は tmpfs に
 //! 覆い隠されてコンテナから見えない。覆い隠す効果は `dev` 配下に限る（#1667 の事後監査 P2）: rootfs の残りの
-//! 部分にイメージが同梱したデバイスノードは、rootful では `prepare_rootfs` が自己 bind に付ける `nodev`
-//! （#1676）で開けない。rootless の rootfs には足さない。`nodev` は rootfs の mount top 1 枚だけに掛かり、本モジュールが
+//! 部分にイメージが同梱したデバイスノードは、`prepare_rootfs` が rootful・rootless を問わず自己 bind に付ける `nodev`
+//! （#1676。オーナー判断 2026-10-10）で開けない。`nodev` は rootfs の mount top 1 枚だけに掛かり、本モジュールが
 //! 後から載せる `/dev` の tmpfs・devpts・rootless の bind（#1660）には及ばない。汎用のデバイス cgroup は #1677 で扱う（SEC-1）。
 //! tmpfs の作成は `sys::mount_dev_tmpfs_on`（#1652。mode 0755・64 MiB・`nosuid|strictatime`・`nodev`/`noexec`
 //! なし）を使う。
@@ -2757,7 +2757,7 @@ mod tests {
         );
     }
 
-    /// SEC-1・CORE-6（#1676・#1660）: rootful の rootfs の `nodev`（`sys::set_mount_nodev`）の呼び出しは
+    /// SEC-1・CORE-6（#1676・#1660）: rootfs の `nodev`（`sys::set_mount_nodev`）の呼び出しは
     /// `exec/rootfs.rs` の `nodev_syscall` の 1 か所だけで、`mount_setattr(2)` の syscall 番号を使うのも `sys` だけ。
     /// 本モジュールの `/dev` の tmpfs・devpts・rootless の bind（ホストのノードの複製）へ `nodev` を掛ける経路が
     /// 無いことを、ソースの走査で機械的に確かめる（`nodev` が及ぶとノードを開けなくなる）。

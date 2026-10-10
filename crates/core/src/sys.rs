@@ -1778,9 +1778,10 @@ pub(crate) fn rootfs_nodev_call_params() -> (u64, u64, u64, u64, u32, usize) {
 
 /// `mount_top`（マウントのルートを指す fd）のマウントに `nodev` を足す（`mount_setattr(2)`。再帰なし）。
 ///
-/// rootful の rootfs の自己 bind は初回の `MS_BIND` がフラグを無視するため `nodev` が付かない。イメージが
+/// rootfs の自己 bind は初回の `MS_BIND` がフラグを無視するため `nodev` が付かない。イメージが
 /// `/dev` 以外へ同梱したデバイスノードを開けないよう、`crate::exec::prepare_rootfs` が検証済みの mount top の
-/// fd に対して `/dev` の tmpfs を載せる前に呼ぶ（#1676・SEC-1・CORE-1・TASK-27.3）。値は nodev 固定で、
+/// fd に対して `/dev` の tmpfs を載せる前に、rootful・rootless を問わず常に呼ぶ（#1676・SEC-1・CORE-1・TASK-27.3。
+/// オーナー判断 2026-10-10）。rootless では mount namespace を所有する user namespace の `CAP_SYS_ADMIN` で通る。値は nodev 固定で、
 /// 既存の属性は変えない。パスは渡さず `AT_EMPTY_PATH` で fd 自身を対象にする。
 ///
 /// fd がマウントのルートでない、または呼び出し側の mount namespace の外にあると `EINVAL`。必要なカーネルは

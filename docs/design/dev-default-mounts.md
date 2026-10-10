@@ -43,7 +43,7 @@ OCI 既定の `/dev` のうち、基本デバイスノード 6 種と default sy
 
 tmpfs にする（runc 方式）に確定（4 章の判断 1）。実装は #1652・#1653。
 
-イメージ同梱の偽ノードを覆い隠せるのは `dev` 配下に限る（#1667 の事後監査 P2）。rootfs の残りの部分（例: イメージが `/dev` 以外に同梱したブロックデバイスのノード）は、rootful では rootfs の自己 bind に `nodev` が無く、汎用のデバイス cgroup（`BPF_CGROUP_DEVICE`）も core に無いため、Landlock の `READ_FILE`・`WRITE_FILE` の範囲で開けてしまっていた。そこで rootful では rootfs の自己 bind に `nodev` を付けた（#1676。`mount_setattr(2)`〔Linux 5.12 以降〕で mount top 1 枚だけに足し、`/dev` の tmpfs・devpts は `nodev` なしのまま。rootless は変えておらず、基本デバイスのホストのノードの bind〔#1660〕にも `nodev` は及ばない）。既定のデバイス cgroup の許可リストは #1677 で追跡する（GPU 向けの TASK-129 とは別）。CDI `deviceNodes`（TASK-127・#547）が `/dev` 以外を指すと、この `nodev` で開けなくなる。配置先の扱いは TASK-127 で決める。新たなノードの作成（mknod）は Landlock の `MAKE_CHAR`・`MAKE_BLOCK` 不許可が止め、`/dev`・`/dev/shm` での拒否は `tests/landlock_implicit_dev.rs` が照合する
+イメージ同梱の偽ノードを覆い隠せるのは `dev` 配下に限る（#1667 の事後監査 P2）。rootfs の残りの部分（例: イメージが `/dev` 以外に同梱したブロックデバイスのノード）は、rootful では rootfs の自己 bind に `nodev` が無く、汎用のデバイス cgroup（`BPF_CGROUP_DEVICE`）も core に無いため、Landlock の `READ_FILE`・`WRITE_FILE` の範囲で開けてしまっていた。そこで rootfs の自己 bind に、rootful・rootless を問わず常に `nodev` を付けた（#1676。オーナー判断 2026-10-10。`mount_setattr(2)`〔Linux 5.12 以降。Landlock ABI 6 の前提の Linux 6.12 に含まれる〕で mount top 1 枚だけに足し、失敗は rootless の `EPERM` を含め縮退せず拒否する。`/dev` の tmpfs・devpts・基本デバイスのホストのノードの bind〔#1660〕は別マウントのため `nodev` は及ばない）。既定のデバイス cgroup の許可リストは #1677 で追跡する（GPU 向けの TASK-129 とは別）。CDI `deviceNodes`（TASK-127・#547）が `/dev` 以外を指すと、この `nodev` で開けなくなる。配置先の扱いは TASK-127 で決める。新たなノードの作成（mknod）は Landlock の `MAKE_CHAR`・`MAKE_BLOCK` 不許可が止め、`/dev`・`/dev/shm` での拒否は `tests/landlock_implicit_dev.rs` が照合する
 
 ### 3.2 暗黙の固定集合か `mounts[]` の汎用処理か
 

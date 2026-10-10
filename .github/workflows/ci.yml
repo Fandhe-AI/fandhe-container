@@ -9,17 +9,25 @@ name: CI
 # ci.yml から取り込み済み。
 # ruleset（branch protection）の必須チェックには、implement-issue-tree の自動マージ前
 # ゲート（G0。PR 上の全 check-run context が必須チェックに含まれることを要求する）に
-# 適合させるため、本 workflow が生成する check-run 16 件（ci-complete・
-# lint-docs / * 5 件・rust-ci (ubuntu-latest) / * 5 件・platform-ci (<os>) 3 件・
-# bench-regression 1 件・aarch64-linux-check 1 件）をすべて個別に登録する。
+# 適合させるため、本 workflow が pull_request で生成する check-run 14 件（ci-complete・
+# lint-docs / * 5 件・rust-ci (ubuntu-latest) / * 5 件・platform-ci (ubuntu-latest) 1 件・
+# bench-regression 1 件・cross-target-check 1 件）をすべて個別に登録する。
+# push（main）・workflow_dispatch では platform-ci が 3 OS になり 16 件
+# （platform-ci (macos-latest)・platform-ci (windows-latest) が加わる）。
 # 2026-10-10 に macOS ランナーの同時実行枠（1 枠程度）待ちで全 PR の CI が詰まったため、
-# オーナー承認のもとで 3 OS のジョブを再構成した（rust-ci は ubuntu のみ・
-# rust-ci-default-features と integration-test は platform-ci へ統合。1 回の CI の
-# macOS ジョブは 7 本から 1 本になる）。再構成前は 29 件（rust-ci (<os>) / * 15 件・
-# rust-ci-default-features (<os>) 3 件・integration-test (<os>) 3 件を含む）で、
+# オーナー承認のもとで 3 OS のジョブを 2 段階で再構成した。
+# - 1 段階目（#1724）: rust-ci は ubuntu のみ・rust-ci-default-features と integration-test は
+#   platform-ci へ統合（1 回の CI の macOS ジョブは 7 本から 1 本）。再構成前は 29 件
+#   （rust-ci (<os>) / * 15 件・rust-ci-default-features (<os>) 3 件・integration-test (<os>) 3 件を含む）
+# - 2 段階目: pull_request では macOS・Windows のネイティブランナーを使わない（platform-ci は
+#   ubuntu のみ）。代わりに cross-target-check（旧 aarch64-linux-check を拡張）が Linux 上で
+#   macOS・Windows 向けの型検査を行う。macOS・Windows のネイティブ実行は main への push と
+#   workflow_dispatch（release 前の 3 OS 確認を含む）で行う（ci.md「3 OS CI」）
 # 差し替えの ruleset 更新は main セッションが行う（下の ci-complete ジョブのコメント参照）。
-# 件数の範囲に注意: 16 件は本 workflow 分のみで、ruleset の必須チェック全体は
-# 本 workflow 分に本 workflow の外が生成する 4 件を足した 20 件になる。外の 4 件は
+# ruleset に登録するのは PR で生成される 14 件で、push（main）だけで生成される
+# platform-ci (macos-latest|windows-latest) は登録しない（登録すると PR が永久に待ちになる）。
+# 件数の範囲に注意: 14 件は本 workflow 分のみで、ruleset の必須チェック全体は
+# 本 workflow 分に本 workflow の外が生成する 4 件を足した 18 件になる。外の 4 件は
 # ai-review.yml の codex / preflight・codex / review・codex / post_feedback 3 件と、
 # 外部 GitHub App の Cursor Bugbot 1 件。数え方: 本 workflow 分は
 # PR の `gh pr checks <PR> --json name,workflow` を workflow 名 CI で絞った件数、
@@ -47,7 +55,12 @@ permissions:
 
 concurrency:
   # PR ごとに一意な番号を group に含める（head_ref のみだと fork 間で同名ブランチの
-  # 別 PR が同一グループになり、互いの CI を cancel し合う）
+  # 別 PR が同一グループになり、互いの CI を cancel し合う）。
+  # push（main）では group が `CI-refs/heads/main` になり、cancel-in-progress により main への
+  # 新しい push は実行中の古い main の CI（macOS・Windows のネイティブ実行を含む 3 OS）を
+  # 取り消す。取り消された commit の macOS・Windows の結果は残らず、OS 固有の実行時の誤りは
+  # 後続 commit の main の CI（最新 commit を含む 3 OS 実行）で検出する（オーナー承認の挙動。
+  # ci.md「3 OS CI」）。workflow_dispatch を main へ向けて起動した場合も同じ group になる
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
@@ -65,10 +78,11 @@ jobs:
   # `lint-docs / lint-docs-complete`（fail-closed。各 lint ジョブは boolean input の
   # if: を持つ条件付きジョブとして明示リストで skipped を判定する）で単一の result に
   # まとめられているため、本 workflow からは `needs.lint-docs.result` を信頼できる
-  # 単一値として扱える。rust-ci（ubuntu 1 要素の matrix）・platform-ci（3 OS matrix）は
+  # 単一値として扱える。rust-ci（ubuntu 1 要素の matrix）・platform-ci（pull_request では
+  # ubuntu 1 要素、push（main）・workflow_dispatch では 3 OS の matrix）は
   # matrix の値ごとに別名のチェックが生成される。本 workflow 内の集約ジョブ
   # `ci-complete`（下部）は lint-docs・rust-ci・platform-ci・
-  # bench-regression・aarch64-linux-check の結果をまとめて fail-closed 判定する
+  # bench-regression・cross-target-check の結果をまとめて fail-closed 判定する
   # ゲートとして残しつつ、ruleset（branch protection）の
   # 必須チェックには本 workflow が生成する check-run（`ci-complete` を含む全件）を
   # 個別に登録している（冒頭コメント参照。implement-issue-tree の自動マージ前ゲート
@@ -104,8 +118,9 @@ jobs:
   # 呼び出し 1 回で fmt / clippy / test / deny / complete の 5 ジョブを生み、3 OS matrix では
   # macOS ジョブが 5 本になって macOS ランナーの同時実行枠（1 枠程度）を占有していた。
   # fmt・deny は結果が OS に依らず、macOS・Windows の `--all-features` の clippy / test は
-  # platform-ci ジョブ（下記）のステップとして同じコマンドで実行するため、3 OS 一級対応
-  # （ci.md「3 OS CI」）の検証範囲は変わらない。
+  # platform-ci ジョブ（下記）のステップとして同じコマンドで実行する（platform-ci の macOS・
+  # Windows は push（main）・workflow_dispatch のみ。pull_request では cross-target-check の
+  # 型検査が代わる。ci.md「3 OS CI」）。
   # matrix を ubuntu 1 要素で残すのは、check-run 名を `rust-ci (ubuntu-latest) / ...` のまま
   # 保ち、ruleset（必須チェック）の差し替えを macOS・Windows 分の削除だけに留めるため。
   #
@@ -154,8 +169,20 @@ jobs:
       cache-key-prefix: fandhe-container
 
   # --------------------------------------------------
-  # platform-ci（3 OS のビルド・テスト・タイムアウト保護付き結合試験。REPAIR-7 ステージ 1〜3）
+  # platform-ci（ネイティブのビルド・テスト・タイムアウト保護付き結合試験。REPAIR-7 ステージ 1〜3）
   # --------------------------------------------------
+  # 実行 OS はイベントで切り替える（2026-10-10 の 2 段階目の再構成・オーナー承認）:
+  # - pull_request: ubuntu-latest のみ（macOS・Windows のネイティブランナーを使わない）。
+  #   macOS・Windows 向けのコンパイル・lint の誤りは cross-target-check（Linux 上の型検査）で
+  #   PR ごとに検出する
+  # - push（main）・workflow_dispatch: ubuntu・macos・windows の 3 OS（従来どおり全ステップ。
+  #   macOS・Windows の `--all-features` の clippy / test を含む）。release 前の 3 OS 確認は
+  #   workflow_dispatch で本 workflow を実行して行う
+  # PR で見落とすのは macOS・Windows 固有の実行時の誤り（テストの失敗・BSD / Git Bash のツール差）で、
+  # main への push 後の 3 OS 実行で検出する（rustdoc のリンクは cross-target-check が PR で検出する）。
+  # main への新しい push は古い main の実行を取り消す（concurrency のコメント参照）。
+  # check-run 名 `platform-ci (ubuntu-latest)` はどのイベントでも変わらない。
+  #
   # 2026-10-10 のジョブ再構成（オーナー承認）で、旧 rust-ci-default-features（既定 feature の
   # ローカルゲート再現）と旧 integration-test（タイムアウト保護された結合試験）を 1 つの
   # 3 OS matrix ジョブへ統合し、macOS・Windows では rust-ci（reusable。ubuntu のみになった）が
@@ -164,7 +191,9 @@ jobs:
   # 7 本（rust-ci の 5 本＋旧 2 ジョブ）並んで全 PR の CI が待ち行列で詰まったため。各ジョブ
   # 自体は 2〜5 分で、問題はジョブ本数だった。ジョブを 1 本にまとめてもステップ・コマンド・
   # ステップごとの timeout-minutes は旧ジョブのまま移しており、検証範囲は変わらない。
-  # check-run 名は `platform-ci (<os>)` の 3 件（ruleset への登録は main セッションが行う）。
+  # check-run 名は pull_request では `platform-ci (ubuntu-latest)` の 1 件、push（main）・
+  # workflow_dispatch では `platform-ci (<os>)` の 3 件。ruleset へは PR で出る 1 件だけを
+  # 登録する（登録は main セッションが行う）。
   #
   # 実行順: 既定 feature のステップ（旧 rust-ci-default-features）→ macOS・Windows の
   # `--all-features` の clippy / test → 結合試験のステップ（旧 integration-test）。Linux 限定の
@@ -189,8 +218,8 @@ jobs:
   # （いずれも既定 feature）を本 workflow 内で直接実行し、既定 feature 側の回帰も
   # CI で検出できるようにする。Makefile の `lint`/`test`/`doc` ターゲット（既定 feature 用）と
   # 同一コマンドを実行する（`cargo build` は `--locked` を付けず、他ステップと条件を
-  # そろえる）。3 OS で実行する（既定 feature 構成の OS 依存回帰を
-  # --all-features 側だけでは検出できないため）。
+  # そろえる）。push（main）・workflow_dispatch では 3 OS で実行する（既定 feature 構成の OS 依存
+  # 回帰を --all-features 側だけでは検出できないため）。
   # 生の steps を持つジョブのため、第三者 action は SHA 固定で参照する
   # （`@latest` が許されるのは Fandhe-AI/actions のみ）。
   #
@@ -214,7 +243,7 @@ jobs:
   # タイムアウトは二段構え: ジョブ全体 60 分（統合前の 2 ジョブ各 30 分の合計に見合う
   # 多層防御）、実行ステップ 10 分（ハング検出の本体）。テスト 1 件ごとの推奨タイムアウト値
   # （PoC-8 実測に基づく 5〜10 秒のレンジ）は TASK-87.1（#40）で
-  # FANDHE_CONTAINER_TEST_TIMEOUT_SECS（下記 env）として設定済み。3 OS matrix
+  # FANDHE_CONTAINER_TEST_TIMEOUT_SECS（下記 env）として設定済み。main の 3 OS 実行
   # （特に macOS/Windows runner のノイズ）を踏まえ上限寄りの 10 秒を採用した。
   # 値を渡すだけで、これを読んで Duration を組み立て recv_timeout 等へ使うのは
   # 各テスト側の責務である。消費側は `crates/io/tests/responsiveness.rs` と
@@ -224,7 +253,7 @@ jobs:
   # 対象テストごとに順次消費側になる（未実装のテストは実装済みを装わない。REPAIR-3）。
   #
   # crash_safety（`crates/io/tests/crash_safety.rs`。IO-3・TASK-18.3.1・#827）:
-  # SIGKILL 耐性の結合試験は本ジョブ（3 OS）の既定 CI 集合で実行し、root・KVM・
+  # SIGKILL 耐性の結合試験は本ジョブ（PR は ubuntu・main は 3 OS）の既定 CI 集合で実行し、root・KVM・
   # GPU・WSL2 を要する実機前提テストとしては分離しない（ci.md「実機前提テスト」）。
   # SIGKILL の対象はテスト自身が起動した子プロセス（crash_test_server）のみで、
   # UDS は 0700 の一時ディレクトリ内に作るためホストの設定に触れない。カーネル版数
@@ -290,11 +319,20 @@ jobs:
   #
   # Windows runner の既定シェルは pwsh のため、bash のヒアドキュメント・
   # `set -euo pipefail` をそのまま使えるよう defaults.run.shell を明示する。
+  #
+  # 以下のステップのコメント・ステップ名にある「3 OS」「ubuntu・macos・windows」は、
+  # push（main）・workflow_dispatch での実行を指す（pull_request では ubuntu のみ）。
   platform-ci:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # pull_request では ubuntu のみ、push（main）・workflow_dispatch では 3 OS（上記コメント参照）。
+        # `&&` / `||` の三項相当は両分岐とも空でない文字列リテラルのため取り違えない。
+        # github.event_name は GitHub が設定する値で、利用者の入力を含まない
+        os: >-
+          ${{ fromJSON(github.event_name == 'pull_request'
+          && '["ubuntu-latest"]'
+          || '["ubuntu-latest", "macos-latest", "windows-latest"]') }}
     runs-on: ${{ matrix.os }}
     # ハングしたジョブの無期限実行を防ぐ多層防御（統合前の 2 ジョブ各 30 分の合計に見合う値）。
     # 実測（2026-10-10 時点）は統合前の 2 ジョブの合計で ubuntu 約 8 分・macOS 約 6 分
@@ -383,8 +421,10 @@ jobs:
       # させる（REPAIR-3・REPAIR-7・#1300）。Makefile の `doc` ターゲット（既定 feature・--no-deps）を
       # そのまま実行する。新ジョブは check-run 名が増えて ruleset の更新が要るため、既定 feature の
       # ローカルゲートを再現する本ジョブへステップとして追加する（check-run 件数は不変）。
-      # 3 OS で実行する: cfg(target_os) 限定の項目へのリンクは OS ごとに解決結果が変わり、Linux
-      # では通るが macOS / Windows でだけ壊れる（またはその逆の）リンクがあるため
+      # push（main）・workflow_dispatch では 3 OS で実行する: cfg(target_os) 限定の項目へのリンクは
+      # OS ごとに解決結果が変わり、Linux では通るが macOS / Windows でだけ壊れる（またはその逆の）
+      # リンクがあるため。pull_request では ubuntu のみのため、macOS / Windows でだけ壊れるリンクは
+      # cross-target-check が aarch64-apple-darwin・x86_64-pc-windows-msvc 向けの cargo doc で検出する
       - name: cargo doc（既定 feature・-D warnings）
         shell: bash
         timeout-minutes: 10
@@ -403,7 +443,8 @@ jobs:
       # crates/plugin-macos（gpu::venus）へ path 依存するため、plugin-macos 側の変更で治具が壊れても
       # 他のステップでは検出できない。依存先の plugin-macos・platform-macos は上の cargo build
       # --workspace が 3 OS でビルドしており、治具自身にも OS 分岐（cfg(target_os)）が無いため、
-      # 本ジョブの 3 OS matrix でそのまま実行する（特定 OS の skip はしない）。実機前提テスト
+      # 本ジョブの matrix でそのまま実行する（特定 OS の skip はしない。pull_request では ubuntu のみで、
+      # macOS 向けの型検査は cross-target-check が aarch64-apple-darwin で行う）。実機前提テスト
       # （tests/real_machine_capset_log.rs）は #[ignore] で既定集合から分離済みで、ここでは走らない。
       # 治具は独自の Cargo.lock を持ち、clippy / test は --locked で lock を固定する（lock が黙って再解決
       # されない）。target は治具ディレクトリ配下（.gitignore 済み）に作る。
@@ -419,7 +460,7 @@ jobs:
       # cargo install --locked で導入する（action は追加しない）。deny.toml に targets の指定が無く、
       # cargo-deny は実行ホストに関係なく全ターゲットの依存グラフを検査するため、結果は OS に依らない。
       # 導入のビルド時間を 3 重に払わないよう ubuntu のみで実行する（ビルド・テストのゲートではなく
-      # 依存監査のため、ci.md の 3 OS 必須の対象外。bench-regression と同じ扱い）
+      # 依存監査のため、ci.md「3 OS CI」の main での 3 OS ネイティブ実行の対象外。bench-regression と同じ扱い）
       - name: venus 試験治具の Cargo.lock の依存監査（cargo deny。ubuntu のみ）
         if: runner.os == 'Linux'
         shell: bash
@@ -738,8 +779,8 @@ jobs:
   #
   # ubuntu-latest 単独とし 3 OS matrix にしない: ベンチの数値は OS 間の実行環境
   # （CPU・ノイズ）が異なり比較できないこと、check-run が増えると ruleset
-  # （branch protection）の登録作業が増えることが理由。ci.md の「3 OS 必須」は
-  # ビルド・テストのゲート（rust-ci・platform-ci）を対象とする規則
+  # （branch protection）の登録作業が増えることが理由。ci.md「3 OS CI」の 3 OS ネイティブ実行は
+  # ビルド・テストのゲート（platform-ci）を対象とする規則
   # であり、ベンチ回帰チェックはその対象外と整理する。
   bench-regression:
     runs-on: ubuntu-latest
@@ -806,7 +847,7 @@ jobs:
           make plugin-feature-size | tee -a "${GITHUB_STEP_SUMMARY}"
 
       # PLUG-4（TASK-109.4）: plugin 追加前後の別ビルドで core の指紋（ソース一覧・依存木・rlib sha256）を比較する。
-      # スクリプトの自己テストは platform-ci ジョブ（ubuntu・macos・windows の 3 OS）で実行する。
+      # スクリプトの自己テストは platform-ci ジョブ（pull_request は ubuntu、main は 3 OS）で実行する。
       # 既存ジョブのステップとして追加（check-run 件数は不変）
       - name: plugin 追加前後の core 不変性（PLUG-4・TASK-109.4）
         shell: bash
@@ -826,44 +867,69 @@ jobs:
           make plug4-core-invariance
 
   # --------------------------------------------------
-  # aarch64-linux-check（Linux aarch64 向けクロス型検査: #1120・REPAIR-7 第 1 段階を補うアーキ網羅）
+  # cross-target-check（Linux 上のクロス型検査: aarch64 Linux・macOS・Windows。
+  # #1120・REPAIR-7 第 1 段階を補うアーキ・OS 網羅）
   # --------------------------------------------------
-  # `cfg(target_arch = "aarch64")` 分岐（crates/io/src/sys.rs の SO_PEERCRED 等。
-  # 今後は TASK-38 の seccomp syscall 番号表など）を x86_64 ランナー上で
-  # aarch64-unknown-linux-gnu 向けに型検査し、コンパイルエラーや aarch64 でのみ
-  # 出る警告を PR ごとに検出する。check / clippy のみでリンクもテスト実行もしない
-  # ため、aarch64 での実行時の正しさ（struct ucred のレイアウト等）は保証しない。
-  # ネイティブ arm64 ランナーでのテスト実行は将来の課題（ci.md 参照）。
+  # 旧 aarch64-linux-check（aarch64-unknown-linux-gnu のみ）を拡張したジョブ（2026-10-10 の 2 段階目の
+  # 再構成・オーナー承認）。pull_request では platform-ci が ubuntu のみになり macOS・Windows の
+  # ネイティブランナーを使わないため、x86_64 の ubuntu ランナー上で次の 3 ターゲットを順に型検査し、
+  # OS・アーキ固有のコンパイルエラーと clippy 警告を PR ごとに検出する。
+  #   - aarch64-unknown-linux-gnu: `cfg(target_arch = "aarch64")` 分岐（crates/io/src/sys.rs の
+  #     SO_PEERCRED、seccomp・新マウント API の syscall 番号表等）
+  #   - aarch64-apple-darwin: `cfg(target_os = "macos")` 分岐（platform-macos・plugin-macos の
+  #     objc2 系 FFI 等）。macOS ランナー（GitHub ホステッドの macos-latest）は arm64 のため
+  #   - x86_64-pc-windows-msvc: `cfg(target_os = "windows")` 分岐（platform-windows の windows-sys 等）。
+  #     windows-latest ランナーと同じターゲット
+  # check / clippy / doc のみでリンクもテスト実行もしないため、実行時の正しさ（struct のレイアウト・
+  # OS の挙動差・BSD / Git Bash のツール差）は保証しない。macOS・Windows の実行時の検証は
+  # push（main）・workflow_dispatch の platform-ci（3 OS ネイティブ）が担い、aarch64 Linux での
+  # 実行はネイティブ arm64 ランナーでのテスト実行が将来の課題（ci.md「3 OS CI」参照）。
   #
-  # 外部依存は純 Rust のクレートのみ（serde / serde_json / sha2 と推移依存。
-  # aarch64 Linux では libc・cpufeatures も入る）でネイティブビルドを伴わないため、
-  # クロスリンカ無しで成立する。cc 等ネイティブビルドを
-  # 伴う依存を承認・追加した場合は、cross toolchain かネイティブ arm64 ランナーへ
-  # 切り替えること。--locked・cache を使わないのは platform-ci（旧 rust-ci-default-features）と
-  # 条件をそろえるため。ビルド・テストのゲートではなく型検査ゲートのため、
-  # 3 OS matrix・ネイティブランナー規則の対象外とする（bench-regression と同じ整理。
+  # 外部依存は純 Rust のクレートのみ（serde / serde_json / sha2 と推移依存。ターゲットにより
+  # libc・cpufeatures・objc2 系・windows-sys / windows-link も入る）で、build.rs・cc 等のネイティブ
+  # ビルドを伴わないため、クロスリンカ・SDK（macOS SDK・MSVC）無しで成立する（2026-10-10 に
+  # 3 ターゲットとも cargo check / clippy が通ることをローカルで確認）。cc 等ネイティブビルドを
+  # 伴う依存を承認・追加した場合は、cross toolchain か各 OS のネイティブランナーへ切り替えること。
+  # --locked・cache を使わないのは platform-ci と条件をそろえるため。ビルド・テストのゲートでは
+  # なく型検査ゲートのため、ネイティブランナー規則の対象外とする（bench-regression と同じ整理。
   # ci.md「3 OS CI」参照）。
   #
-  # 実コマンドは `cargo check|clippy --workspace --all-targets --all-features
-  # --target aarch64-unknown-linux-gnu`（AGENTS.md と一致）。--all-features を付けるのは、
+  # 実コマンドはターゲットごとに `cargo check|clippy --workspace --all-targets --all-features
+  # --target <target>`（AGENTS.md と一致。旧 aarch64-linux-check と同じ形）。--all-features を付けるのは、
   # required-features を持つ target（crates/io の crash_test_server bin・crash_safety test）、
   # `#![cfg(feature = "wsl2-test-support")]` の結合試験、exec-test-support の入口を
   # 型検査の対象に入れるため。feature は io の crash-test-server、core の
   # default = ["plugin"]・plugin・escape-probe・exec-test-support、supervisor の
   # exec-test-support、platform-windows の wsl2-test-support。exec-test-support は
   # 最適化ビルドで compile_error! になるが、check / clippy は dev プロファイルなので影響しない。
-  # 未検査の範囲（REPAIR-3）: cfg(not(feature = "exec-test-support")) 分岐
-  # （supervisor/tests/exec_setns_join.rs・core/tests/exec_child_setup.rs・
-  # core/src/exec/reapply.rs の cfg_attr）と、plugin を無効にした構成
-  # （--no-default-features）は aarch64 では型検査されない。x86_64 でも、lib 側の
-  # cfg_attr（core/src/exec/reapply.rs）は cargo build --workspace が、plugin 無効構成は
+  #
+  # aarch64-apple-darwin・x86_64-pc-windows-msvc の 2 ターゲットには、pull_request で main の platform-ci
+  # （macOS・Windows）の代わりになるよう、既定 feature（--all-features なし）の検査も加える（オーナー指示）:
+  #   - `cargo clippy --workspace --all-targets --target <target> -- -D warnings`（platform-ci の既定 feature の
+  #     clippy〔make lint〕と同じ構成の型検査）
+  #   - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --target <target>`（make doc と同じ構成。
+  #     cfg(target_os) 限定の項目へのリンクが OS ごとに解決結果を変えるため。REPAIR-3・#1300）
+  # rustdoc はターゲット向けの型検査のみでリンクしないため、クロス実行でも SDK は不要。
+  # aarch64-unknown-linux-gnu は旧 aarch64-linux-check と同じ --all-features の check / clippy のみとする。
+  # 未検査の範囲（REPAIR-3）: aarch64 Linux の既定 feature の構成・cfg(not(feature = "exec-test-support"))
+  # 分岐（supervisor/tests/exec_setns_join.rs・core/tests/exec_child_setup.rs・
+  # core/src/exec/reapply.rs の cfg_attr）・plugin を無効にした構成（--no-default-features）は
+  # 本ジョブでは型検査されない（macOS・Windows の plugin 無効構成は main の platform-ci が検査する）。
+  # x86_64 Linux でも、
+  # lib 側の cfg_attr（core/src/exec/reapply.rs）は cargo build --workspace が、plugin 無効構成は
   # make test-core-no-plugin が検査するのみで、テスト側の cfg(not(feature)) 分岐は
   # 自己参照 dev-dependency による feature 統一で常に有効になるため、どの CI ジョブでも
-  # 型検査されない。aarch64 での既定 feature 検査の追加はジョブ構成の変更になるため
-  # 別 Issue で扱う。
-  aarch64-linux-check:
+  # 型検査されない。
+  #
+  # venus 試験治具（poc/venus-decoder/jig。ルート workspace 外。crates/plugin-macos へ path 依存。
+  # GPU-6・TASK-172.4）も aarch64-apple-darwin で型検査する。治具は --workspace の対象外のため、
+  # pull_request で plugin-macos の macOS 専用コードの変更が治具を壊しても他のステップでは
+  # 検出できない（platform-ci の make poc-venus-jig-check は PR では ubuntu のみ）。
+  # 治具の Cargo.lock を固定するため --locked を付ける（make poc-venus-jig-check と同じ）。
+  cross-target-check:
     runs-on: ubuntu-latest
-    # ハングに対する多層防御（旧 rust-ci-default-features と同じ値）
+    # ハングに対する多層防御。旧 aarch64-linux-check（1 ターゲット）の実測は約 1 分で、3 ターゲットと
+    # 治具でも数分の見込み。旧ジョブと同じ値を維持する
     timeout-minutes: 30
     permissions:
       contents: read
@@ -873,21 +939,51 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-          targets: aarch64-unknown-linux-gnu
+          targets: aarch64-unknown-linux-gnu,aarch64-apple-darwin,x86_64-pc-windows-msvc
       - name: cargo check（aarch64-unknown-linux-gnu・クロス型検査）
         run: cargo check --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu
       - name: cargo clippy（aarch64-unknown-linux-gnu）
         run: cargo clippy --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu -- -D warnings
+      - name: cargo check（aarch64-apple-darwin・クロス型検査）
+        run: cargo check --workspace --all-targets --all-features --target aarch64-apple-darwin
+      - name: cargo clippy（aarch64-apple-darwin）
+        run: cargo clippy --workspace --all-targets --all-features --target aarch64-apple-darwin -- -D warnings
+      - name: cargo clippy（aarch64-apple-darwin・既定 feature）
+        run: cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings
+      - name: cargo doc（aarch64-apple-darwin・既定 feature・-D warnings）
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --target aarch64-apple-darwin
+      - name: cargo check（x86_64-pc-windows-msvc・クロス型検査）
+        run: cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-msvc
+      - name: cargo clippy（x86_64-pc-windows-msvc）
+        run: cargo clippy --workspace --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings
+      - name: cargo clippy（x86_64-pc-windows-msvc・既定 feature）
+        run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+      - name: cargo doc（x86_64-pc-windows-msvc・既定 feature・-D warnings）
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --target x86_64-pc-windows-msvc
+      - name: venus 試験治具の cargo check（aarch64-apple-darwin・GPU-6・TASK-172.4）
+        run: >-
+          cargo check --manifest-path poc/venus-decoder/jig/Cargo.toml --locked --all-targets
+          --target aarch64-apple-darwin
+      - name: venus 試験治具の cargo clippy（aarch64-apple-darwin・GPU-6・TASK-172.4）
+        run: >-
+          cargo clippy --manifest-path poc/venus-decoder/jig/Cargo.toml --locked --all-targets
+          --target aarch64-apple-darwin -- -D warnings
 
   # --------------------------------------------------
   # ci-complete（全ジョブ結果の fail-closed 集約ゲート）
   # --------------------------------------------------
-  # lint-docs・rust-ci・platform-ci・bench-regression・aarch64-linux-check の結果を
+  # lint-docs・rust-ci・platform-ci・bench-regression・cross-target-check の結果を
   # 集約し、いずれかが失敗・キャンセルされれば本ジョブも failure にする fail-closed ゲート。
-  # rust-ci（ubuntu 1 要素）・platform-ci（3 OS）は matrix ジョブの
-  # ため、needs 上では OS ごとの結果ではなく 1 つの result に集約される
-  # （いずれかの OS が失敗・キャンセルされれば全体が failure / cancelled になる。
-  # fail-fast: false でも集約結果には影響しない）。
+  # rust-ci（ubuntu 1 要素）・platform-ci（pull_request は ubuntu 1 要素、push（main）・
+  # workflow_dispatch は 3 OS）は matrix ジョブのため、needs 上では OS ごとの結果ではなく
+  # 1 つの result に集約される（いずれかの OS が失敗・キャンセルされれば全体が failure /
+  # cancelled になる。fail-fast: false でも集約結果には影響しない）。したがって本ジョブは
+  # pull_request では ubuntu の結果だけを、push（main）・workflow_dispatch では 3 OS すべての
+  # 結果を見る（判定ロジックはイベントで分けない）。
   #
   # ruleset（branch protection）の必須チェックには本ジョブに加え、本 workflow が
   # 生成する check-run 全件を個別に登録する（冒頭コメント参照。implement-issue-tree
@@ -897,13 +993,17 @@ jobs:
   # チェックが未登録だと自動マージが G0 で止まる。改名された旧名が必須のまま
   # 残ると新たな check-run が報告されず全 PR がマージ不能になる）。ruleset の
   # 変更はリポジトリ設定の変更のためオーナー承認を経る。
-  # 本 workflow の check-run の内訳は 1 + lint-docs 5 + rust-ci (ubuntu-latest) 5 +
-  # platform-ci 3 + bench-regression 1 + aarch64-linux-check 1 = 16（冒頭コメントと一致させる）。
+  # 本 workflow の check-run の内訳は pull_request で 1 + lint-docs 5 + rust-ci (ubuntu-latest) 5 +
+  # platform-ci (ubuntu-latest) 1 + bench-regression 1 + cross-target-check 1 = 14、push（main）・
+  # workflow_dispatch では platform-ci が 3 件になり 16（冒頭コメントと一致させる）。
+  # 2 段階目の再構成（pull_request で macOS・Windows のネイティブランナーを使わない。オーナー承認）で、
+  # ruleset から platform-ci (macos-latest)・platform-ci (windows-latest)・aarch64-linux-check を外し、
+  # cross-target-check を足す（差し替えは main セッションが行う）。
   # 2026-10-10 のジョブ再構成（macOS ランナー待ちの解消。オーナー承認）で、旧構成の
   # rust-ci (macos-latest|windows-latest) / * 10 件・rust-ci-default-features (<os>) 3 件・
   # integration-test (<os>) 3 件を platform-ci (<os>) 3 件へ差し替えた（ruleset の差し替えは
-  # main セッションが行う）。ruleset の必須チェック全体は、16 件に ai-review.yml の codex 3 件と
-  # 外部 App の Cursor Bugbot 1 件（本 workflow の外）を足した 20 件（冒頭コメント参照）。
+  # main セッションが行う）。ruleset の必須チェック全体は、PR の 14 件に ai-review.yml の codex 3 件と
+  # 外部 App の Cursor Bugbot 1 件（本 workflow の外）を足した 18 件（冒頭コメント参照）。
   # platform-ci は if: を持たない（常に実行される）ため、allow_skipped には入れない。
   ci-complete:
     needs:
@@ -912,7 +1012,7 @@ jobs:
         rust-ci,
         platform-ci,
         bench-regression,
-        aarch64-linux-check,
+        cross-target-check,
       ]
     if: always()
     permissions: {}

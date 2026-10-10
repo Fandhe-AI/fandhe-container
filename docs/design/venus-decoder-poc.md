@@ -230,7 +230,7 @@ GPU-6 の決定（ヘッドレス compute のみ・2D スキャンアウト非�
 
 macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なしの最小 virtio-gpu を TASK-64（#350。完了済み）の最小 VM に登録できるかの確認ハーネス（GPU-6・MAC-5）。配置は `poc/vz-custom-virtio-gpu/`（製品 crate 外・workspace 外）。判定は #1057（TASK-172.h5。人間担当）。
 
-- 実装したもの: ゲスト側確認スクリプト `poc/vz-custom-virtio-gpu/guest/check-virtio-gpu.sh`（dmesg の virtio_gpu 行から probe・feature・KMS・capset・host memory window を判定）、自己テスト（合成 fixture。`make vz-virtio-gpu-guest-check-selftest`。CI の `platform-ci` ジョブが 3 OS で実行）、README（デバイス契約・実機手順）
+- 実装したもの: ゲスト側確認スクリプト `poc/vz-custom-virtio-gpu/guest/check-virtio-gpu.sh`（dmesg の virtio_gpu 行から probe・feature・KMS・capset・host memory window を判定）、自己テスト（合成 fixture。`make vz-virtio-gpu-guest-check-selftest`。CI の `platform-ci` ジョブが実行。PR は ubuntu・main は 3 OS）、README（デバイス契約・実機手順）
 - **ホスト側のデバイス登録コードは未実装（REPAIR-3）**。計画フェーズの調査（確認日 2026-10-08）で、受け入れ条件の「新規依存・`unsafe` が要る場合は止めて承認事項として報告」に当たったため
 - 調査結果:
   - 採用済み `objc2-virtualization =0.3.2`（承認 #356）は `VZCustomVirtioDevice`・`VZVirtioQueue`・`VZVirtioSharedMemoryRegion*` を含まない。crates.io の最新も 0.3.2（2025-10-04）で、macOS 27 対応版は未リリース
@@ -272,7 +272,7 @@ macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なし�
 - 実装済み（F5.2b.1〜F5.2b.3・#1639・#1641・#1642）: REPLY_ACK の応答、protocol feature `SHMEM` / `BACKEND_REQ` の広告と `GET_SHMEM_CONFIG` / `SET_BACKEND_REQ_FD`、backend 要求 `SHMEM_MAP` / `SHMEM_UNMAP` の期限つき送信（10.4.4・10.8）
 - 実装済み（F5.2b.4a・#1643）: ctrl の `RESOURCE_MAP_BLOB` / `UNMAP_BLOB`（blob ごとに memfd を作り、`SHMEM_MAP` で frontend へ渡す）。10.3・10.4.4
 - 実装済み（F5.2b.4b・#1645）: map 中の資源の解放の確定（map 中の `UNREF` は拒否、`CTX_DESTROY` は map を残す、map が残ったままの終了では期限つきで `SHMEM_UNMAP` を送ってから memfd を閉じる。10.4.3）と、ネゴシエーションから解放までの結合試験（`tests/shmem_lifecycle.rs`）
-- CI: `make poc-venus-jig-check`（fmt-check・clippy・test）は CI の `platform-ci` ジョブが 3 OS で実行し、`crates/plugin-macos` 側の変更による治具の破損を検出する（実機前提テストは `#[ignore]` で分離済みで CI では走らない）
+- CI: `make poc-venus-jig-check`（fmt-check・clippy・test）は CI の `platform-ci` ジョブが実行し（PR は ubuntu・main への push は 3 OS。PR の macOS 向けは `cross-target-check` が `aarch64-apple-darwin` で check / clippy する）、`crates/plugin-macos` 側の変更による治具の破損を検出する（実機前提テストは `#[ignore]` で分離済みで CI では走らない）
 
 ### 10.2 候補比較
 
@@ -569,7 +569,7 @@ frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲスト
 - マッピングへの参照は作らず、境界検査したコピーだけで出し入れする。`MmapRegion` は `!Send` / `!Sync`（`PhantomData<*mut u8>` で明示し、`compile_fail` の doctest で照合）
 - プロセス内の排他性: コピーは非アトミックなので、同じ backing file（`st_dev`・`st_ino`）のファイル上のアクセス範囲（`[mmap_offset, mmap_offset + memory_size)`）が重なる領域は、プロセス全体で同時に 1 個だけ map できる（重なれば mmap 前に `BACKING_IN_USE`。fd を複製しても同じ判定）。同じ memfd の重ならない範囲を別領域にするのは受け付ける。frontend プロセスの同時書き込みは vhost-user の前提として残る（値が不定になるだけ）。アトミックなコピーへの置き換えは U8 と別の unsafe になるため、承認を得るまで行わない
 - 縮小の封じ込め: frontend が後から `ftruncate` で縮めると `SIGBUS` になるため、`F_SEAL_SHRINK` つきの memfd だけを受け付ける。seal を付けない frontend は接続できない（PoC の割り切り。製品版の fd 要件は TASK-173 系で扱う）
-- aarch64 の定数と構造体は CI で型検査されない（治具はルート workspace 外で `aarch64-linux-check` の対象外）。固定値テストも実行アーキの分しか走らない。ローカルでは `cargo check --target aarch64-unknown-linux-gnu --all-targets` の型検査のみ通した（実行は未検証）
+- aarch64 の定数と構造体は CI で型検査されない（治具はルート workspace 外で、`cross-target-check` は治具を `aarch64-apple-darwin` でのみ型検査し `aarch64-unknown-linux-gnu` は対象外）。固定値テストも実行アーキの分しか走らない。ローカルでは `cargo check --target aarch64-unknown-linux-gnu --all-targets` の型検査のみ通した（実行は未検証）
 - 範囲外: ヘッダ単位の読み書きの枠組み・セッション・UDS の bind と所有者・権限・peer credential の検証（PLUG-12 相当）・eventfd の待機は F1.4（#1519）、virtqueue と `userspace_addr` の変換は F1.3（#1518）
 - F1.4（#1519）への注意: `SET_MEM_TABLE` を送り直されたとき、古い `GuestMemory` を生かしたまま新しい表を map すると、同じ memfd の重なる範囲が `BACKING_IN_USE` で拒否される。F1.4 では「古い表を drop してから新しい表を map する」順序を決める必要がある。また合計上限（128 GiB）は `GuestMemory` 1 個の中だけで、複数の `GuestMemory` をまたぐ上限は無いため、セッション単位の上限も F1.4 で決める
 

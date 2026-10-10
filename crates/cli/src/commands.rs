@@ -173,15 +173,25 @@ impl CliExit {
         CliExit::Error(CliError::new(code, failure_message(code)))
     }
 
-    /// 状態ルート（ストアのディレクトリ）が存在しない（終了コード 3・`NOT_FOUND`）。
+    /// 状態ルートの親ディレクトリが存在しない（終了コード 3・`NOT_FOUND`）。
     ///
-    /// コンテナ不在（`failed(NotFound)`、文言 `container not found`）と区別するための専用値で、
-    /// `list` / `logs` が状態ストアを開く段階の `NotFound` だけに使う（コンテナ ID を参照していない失敗）。
-    pub(crate) fn state_root_not_found() -> Self {
+    /// core の `FileStateStore::open` は状態ルート自体が無ければ 0700 で作るため、開く段階の `NotFound` は
+    /// 「状態ルートの親が無い」ときだけ出る（#1607 E1・ERR-1）。コンテナ不在（`failed(NotFound)`、文言
+    /// `container not found`）と区別するための専用値で、`list` / `logs` が状態ストアを開く段階の
+    /// `NotFound` だけに使う（コンテナ ID を参照していない失敗）。
+    pub(crate) fn state_root_parent_not_found() -> Self {
         CliExit::Error(CliError::new(
             ErrorCode::NotFound,
-            STATE_ROOT_NOT_FOUND_MESSAGE,
+            STATE_ROOT_PARENT_NOT_FOUND_MESSAGE,
         ))
+    }
+
+    /// 状態ストアに破損レコードがあり、`list` が fail-closed で失敗した（OCI-5・ERR-1・#1607 E3）。
+    ///
+    /// `code` は list が返したエラーのもの（終了コードもそれに従う）。文言だけを回復手段を示す固定文言に替える。
+    /// ID・パスは含めない。呼び出し元は core の `find_corrupted` で破損の存在を確かめた場合に限る。
+    pub(crate) fn state_store_corrupted(code: ErrorCode) -> Self {
+        CliExit::Error(CliError::new(code, STATE_STORE_CORRUPTED_MESSAGE))
     }
 
     /// プロセスの終了コード。
@@ -218,7 +228,10 @@ impl CliExit {
 }
 
 const USAGE_MESSAGE: &str = "usage: fandhe-container <create|start|stop|delete|list|logs|setup>";
-const STATE_ROOT_NOT_FOUND_MESSAGE: &str = "state root not found";
+const STATE_ROOT_PARENT_NOT_FOUND_MESSAGE: &str = "parent of the state root not found";
+/// 回復手段（core の `purge_corrupted`）を管理操作名で示す。CLI に purge サブコマンドは無い（実在しない名を案内しない）。
+const STATE_STORE_CORRUPTED_MESSAGE: &str =
+    "state store has a corrupted record; recover it with the purge_corrupted management operation";
 const UNIMPLEMENTED_MESSAGE: &str = "command is not implemented yet";
 
 /// [`CliExit::failed`] の固定文言表。引用符・バックスラッシュ・制御文字を含まない定数のみ（テストで固定）。
@@ -504,8 +517,12 @@ mod tests {
                 "{\"code\":\"NOT_FOUND\",\"message\":\"container not found\"}\n",
             ),
             (
-                CliExit::state_root_not_found(),
-                "{\"code\":\"NOT_FOUND\",\"message\":\"state root not found\"}\n",
+                CliExit::state_root_parent_not_found(),
+                "{\"code\":\"NOT_FOUND\",\"message\":\"parent of the state root not found\"}\n",
+            ),
+            (
+                CliExit::state_store_corrupted(ErrorCode::Internal),
+                "{\"code\":\"INTERNAL\",\"message\":\"state store has a corrupted record; recover it with the purge_corrupted management operation\"}\n",
             ),
         ] {
             let mut out = Counting(Vec::new());
@@ -804,7 +821,7 @@ mod tests {
                 assert_eq!(o.exit, 3, "{argv:?}");
                 assert_eq!(
                     o.stderr,
-                    "{\"code\":\"NOT_FOUND\",\"message\":\"state root not found\"}\n"
+                    "{\"code\":\"NOT_FOUND\",\"message\":\"parent of the state root not found\"}\n"
                 );
             }
 
@@ -820,6 +837,60 @@ mod tests {
                 assert_eq!(op_and_code(&o.stderr), failure(op, "NOT_FOUND"), "{argv:?}");
             }
             assert!(!parent.exists());
+        }
+
+        /// CLI-1・#1607 E2: 親があり状態ルートが無いとき、list は終了コード 0・ヘッダのみで、
+        /// ルートを 0700 で作る（読み取り専用コマンドでも open が作る副作用の機械照合。親は作らない）。
+        #[test]
+        fn cli1_list_creates_absent_state_root_on_linux() {
+            use std::os::unix::fs::PermissionsExt;
+            let base = TmpDir::new("absentroot");
+            let root = base.state_root();
+            assert!(!root.exists());
+            let o = invoke(&root, &["list"]);
+            assert_eq!(o.exit, 0, "{}", o.stderr);
+            assert_eq!(o.stdout, "ID\tSTATUS\tPID\n");
+            assert_eq!(o.stderr, "");
+            assert!(root.is_dir());
+            let mode = std::fs::metadata(&root).expect("meta").permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+
+        /// ERR-1・OCI-5・#1607 E3: 破損レコードがあると list は回復手段を示す固定文言で失敗し、
+        /// 回復（purge_corrupted）後は成功に戻る。内容破損は INTERNAL（1）、非ディレクトリ entry は PERMISSION_DENIED（6）。
+        #[test]
+        fn err1_list_corrupted_record_points_to_recovery_on_linux() {
+            use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+            use fandhe_container_core::traits::ContainerId;
+            let base = TmpDir::new("corrupt");
+            let root = base.state_root();
+            create_ok(&base, "c1");
+            std::fs::write(root.join("c1").join("state.json"), "{").expect("corrupt");
+
+            let o = invoke(&root, &["list"]);
+            assert_eq!(o.exit, 1);
+            assert_eq!(o.code, Some("INTERNAL"));
+            assert_eq!(
+                o.stderr,
+                "{\"code\":\"INTERNAL\",\"message\":\"state store has a corrupted record; recover it with the purge_corrupted management operation\"}\n"
+            );
+            assert_eq!(o.stdout, "ID\tSTATUS\tPID\n");
+
+            let store = FileStateStore::open(StateRoot::from_override(root.clone()).expect("root"))
+                .expect("open");
+            store
+                .purge_corrupted(&ContainerId::new("c1").expect("id"))
+                .expect("purge");
+            let o = invoke(&root, &["list"]);
+            assert_eq!((o.exit, o.stderr.as_str()), (0, ""));
+
+            std::fs::write(root.join("zz"), "x").expect("file");
+            let o = invoke(&root, &["list"]);
+            assert_eq!(o.exit, 6);
+            assert_eq!(
+                o.stderr,
+                "{\"code\":\"PERMISSION_DENIED\",\"message\":\"state store has a corrupted record; recover it with the purge_corrupted management operation\"}\n"
+            );
         }
 
         /// SEC-1: 引用符・バックスラッシュ・改行を含む入力値は出力へ反射されず、stderr は 1 行のまま。
@@ -885,7 +956,7 @@ mod tests {
             check(&o, 3, "NOT_FOUND");
             assert_eq!(
                 o.stderr,
-                "{\"code\":\"NOT_FOUND\",\"message\":\"state root not found\"}\n"
+                "{\"code\":\"NOT_FOUND\",\"message\":\"parent of the state root not found\"}\n"
             );
             // logs: 未作成（固定文言で完全一致）。
             let o = invoke(&root, &["logs", "none"]);

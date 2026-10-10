@@ -12,11 +12,26 @@
 //! 10 進の PID だけで、エスケープ不要。`bundle` や annotations は任意の UTF-8（タブ・改行・端末制御文字を含み得る）
 //! ため出力しない（インジェクション回避。SEC-1）。
 //!
+//! # 状態ルートの開き方と失敗時の文言（#1607 E1〜E3・ERR-1・OCI-5）
+//!
+//! - 状態ルート自体が無ければ core の `FileStateStore::open` が親の下に 0700 で作る（stop / delete も同じ）。
+//!   開く段階の `NotFound` は「状態ルートの親が無い」ときだけで、固定文言 `parent of the state root not found`（3）にする。
+//! - 読み取り専用の open は足さない（E2）。理由: (1) list / get も含め全メソッドが `@lock` を作るため本当の読み取り専用に
+//!   ならない。(2) 新規ルートで `@revision` の初期化を省くと、外部で作ったルートに `@lock` だけが残り以後の create が
+//!   恒久的に fail-closed になる。(3) 作るのは存在する親の下の 0700 検証済みルートだけで副作用が小さく、初回 list が
+//!   ヘッダのみで 0 を返す挙動を保てる。(4) 6 コマンドで open の経路と検証を共有できる。ロック手順を含む本当の
+//!   読み取り専用 open は core の設計変更として別途扱う。
+//! - 破損レコードがあると `StateStore::list` は全体を fail-closed で失敗させる（E3）。失敗時だけ具体型のストアを開き直し
+//!   core の `find_corrupted` で破損の存在を確かめ、あれば回復手段（`purge_corrupted` の管理操作）を示す固定文言にする。
+//!   code と終了コードは list のものを保つ。ID・パスは出さない。list はページごとにストア全体を走査する
+//!   （効率化は規模が課題になった時点で扱う）。
+//!
 //! # logs の判定表（fail-closed。実装済みを装わない。REPAIR-3）
 //!
 //! | 条件 | 結果 |
 //! | ---- | ---- |
 //! | ID の文字種違反 | 2（`INVALID_ARGUMENT`） |
+//! | 状態ルートの親が無い | 3（`NOT_FOUND`。文言は `parent of the state root not found`） |
 //! | 状態ルートを開けない（非 Linux は plugin 解決の失敗） | core のコードどおり（非 Linux は候補なしで 5、他は 8 / 6） |
 //! | 対象の状態レコードが無い | 3（`NOT_FOUND`） |
 //! | 対象が存在する | 8（`UNIMPLEMENTED`。stdout には何も出さない） |
@@ -42,7 +57,7 @@ use fandhe_container_core::traits::{
 
 use super::CliExit;
 use super::args::{GlobalArgs, ListArgs, LogsArgs};
-use super::create_start::{OP_LOG_ENV, export_ops, production_runtime};
+use super::create_start::{OP_LOG_ENV, export_ops, open_store, production_runtime};
 
 /// list の固定ヘッダ行（LF 終端）。
 const LIST_HEADER: &str = "ID\tSTATUS\tPID\n";
@@ -63,8 +78,18 @@ fn format_record_line(record: &StateRecord, out: &mut String) {
     out.push('\n');
 }
 
-fn stdout_error() -> TraitError {
-    TraitError::new(ErrorCode::Internal, "failed to write to stdout")
+/// list の失敗の出どころ。stdout の書き込み失敗を破損の診断対象にしない（誤って破損と伝えない）ための区別。
+enum ListFailure {
+    /// 状態ストア側の失敗（破損レコードによる fail-closed を含む）。
+    Store(TraitError),
+    /// stdout への書き込み失敗。
+    Stdout,
+}
+
+impl From<TraitError> for ListFailure {
+    fn from(e: TraitError) -> Self {
+        ListFailure::Store(e)
+    }
 }
 
 /// 状態ストアの全レコードをヘッダ付きで `out` へ書く。ページごとに 1 回の `write_all` で書き、全件を溜めない。
@@ -72,9 +97,9 @@ fn list_containers(
     store: &dyn StateStore,
     out: &mut dyn Write,
     page_size: NonZeroU32,
-) -> Result<(), TraitError> {
+) -> Result<(), ListFailure> {
     out.write_all(LIST_HEADER.as_bytes())
-        .map_err(|_| stdout_error())?;
+        .map_err(|_| ListFailure::Stdout)?;
     let mut req = ListStateRequest::new(page_size)?;
     for _ in 0..MAX_LIST_PAGES {
         let page = store.list(&req)?;
@@ -83,17 +108,37 @@ fn list_containers(
             format_record_line(record, &mut buf);
         }
         if !buf.is_empty() {
-            out.write_all(buf.as_bytes()).map_err(|_| stdout_error())?;
+            out.write_all(buf.as_bytes())
+                .map_err(|_| ListFailure::Stdout)?;
         }
         match page.next_cursor() {
             Some(cursor) => req = req.with_cursor(cursor.clone()),
             None => return Ok(()),
         }
     }
-    Err(TraitError::new(
+    Err(ListFailure::Store(TraitError::new(
         ErrorCode::Internal,
         "state listing did not terminate",
-    ))
+    )))
+}
+
+/// list の失敗を終了値へ写す。ストア側の失敗では、同じ `--root` を開き直して core の `find_corrupted` で
+/// 破損の存在を確かめ、あれば回復手段を示す固定文言にする（code・終了コードは list のものを保つ。#1607 E3）。
+/// 開き直せない・破損が見つからない場合は従来の写像（診断は 1 回だけでループしない。REPAIR-5）。
+fn list_failure(global: &GlobalArgs, f: &ListFailure) -> CliExit {
+    match f {
+        ListFailure::Stdout => CliExit::failed(ErrorCode::Internal),
+        ListFailure::Store(e) => {
+            let corrupted = open_store(global)
+                .and_then(|s| s.find_corrupted())
+                .is_ok_and(|found| !found.is_empty());
+            if corrupted {
+                CliExit::state_store_corrupted(e.code())
+            } else {
+                store_open_failure(e)
+            }
+        }
+    }
 }
 
 /// 対象の状態レコードが存在することを確かめる（無ければ `NotFound`）。
@@ -114,10 +159,10 @@ fn record_op(recorder: &OpRecorder, op_name: &str, ok: bool, started: Instant) {
 }
 
 /// 状態ストアを開く段階の失敗を終了値へ写す。コンテナ ID を参照していない段階の `NotFound` は
-/// 状態ルート不在であり、コンテナ不在（`container not found`）と誤報しない。
+/// 状態ルートの親の不在であり（ルート自体は open が作る）、コンテナ不在（`container not found`）と誤報しない。
 fn store_open_failure(e: &TraitError) -> CliExit {
     match e.code() {
-        ErrorCode::NotFound => CliExit::state_root_not_found(),
+        ErrorCode::NotFound => CliExit::state_root_parent_not_found(),
         c => CliExit::failed(c),
     }
 }
@@ -137,7 +182,7 @@ pub(super) fn run_list(global: &GlobalArgs, _args: &ListArgs, stdout: &mut dyn W
     match result {
         Ok(()) => CliExit::Success,
         // list はコンテナを参照しないため、NotFound はコンテナ不在ではない。
-        Err(e) => store_open_failure(&e),
+        Err(f) => list_failure(global, &f),
     }
 }
 
@@ -199,15 +244,15 @@ mod tests {
         String::from_utf8(buf).expect("utf8")
     }
 
-    /// CLI-1: ストアを開く段階の NotFound は状態ルート不在で、コンテナ不在と区別される。
+    /// CLI-1: ストアを開く段階の NotFound は状態ルートの親の不在で、コンテナ不在と区別される。
     #[test]
-    fn cli1_store_open_not_found_is_state_root() {
+    fn cli1_store_open_not_found_is_state_root_parent() {
         let nf = TraitError::new(ErrorCode::NotFound, "x");
         let e = store_open_failure(&nf);
         assert_eq!(e.exit_code(), 3);
         assert_eq!(
             stderr_line(&e),
-            "{\"code\":\"NOT_FOUND\",\"message\":\"state root not found\"}\n"
+            "{\"code\":\"NOT_FOUND\",\"message\":\"parent of the state root not found\"}\n"
         );
         let inv = TraitError::new(ErrorCode::InvalidArgument, "x");
         let e = store_open_failure(&inv);
@@ -292,7 +337,8 @@ mod tests {
 
         fn listed(st: &FileStateStore, page: u32) -> String {
             let mut out = Vec::new();
-            list_containers(st, &mut out, NonZeroU32::new(page).expect("nz")).expect("list");
+            list_containers(st, &mut out, NonZeroU32::new(page).expect("nz"))
+                .unwrap_or_else(|_| panic!("list"));
             String::from_utf8(out).expect("utf8")
         }
 
@@ -334,8 +380,14 @@ mod tests {
         fn err2_list_write_failure_is_internal() {
             let base = TmpDir::new("wfail");
             let st = store(&base);
-            let e = list_containers(&st, &mut FailingWriter, NonZeroU32::MIN).expect_err("io");
-            assert_eq!(e.code(), ErrorCode::Internal);
+            let f = list_containers(&st, &mut FailingWriter, NonZeroU32::MIN).expect_err("io");
+            assert!(matches!(f, ListFailure::Stdout));
+            let e = list_failure(&GlobalArgs::default(), &f);
+            assert_eq!(e.exit_code(), 1);
+            assert_eq!(
+                stderr_line(&e),
+                "{\"code\":\"INTERNAL\",\"message\":\"operation failed\"}\n"
+            );
         }
     }
 }

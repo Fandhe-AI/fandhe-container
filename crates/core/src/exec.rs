@@ -860,11 +860,6 @@ pub struct MountIsolation {
 /// 依存しない。
 const PID_NS_INIT_INO: u64 = 0xEFFF_FFFC;
 
-/// 初期 user namespace の inode 番号（`include/uapi/linux/nsfs.h` の `enum init_ns_ino` の
-/// `USER_NS_INIT_INO`）。`exec::rootfs::prepare_rootfs` が rootful（初期 user ns に留まる）かどうかの
-/// 判定に使う（#1676・SEC-1）。
-const USER_NS_INIT_INO: u64 = 0xEFFF_FFFD;
-
 /// `/proc/thread-self/ns/pid` のリンク先（`pid:[inode]`）の inode 番号。書式に反すれば `None`。
 fn parse_pid_ns_inode(link: &str) -> Option<u64> {
     link.strip_prefix("pid:[")?.strip_suffix(']')?.parse().ok()

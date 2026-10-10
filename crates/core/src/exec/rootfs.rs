@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! MountIsolation::establish()
-//!   -> prepare_rootfs(&isolation, rootfs) -> PreparedRootfs   // 自己 bind -> (rootful) nodev -> rootfs/proc へ procfs
+//!   -> prepare_rootfs(&isolation, rootfs) -> PreparedRootfs   // 自己 bind -> nodev -> rootfs/proc へ procfs
 //!   -> pivot_root(&isolation, prepared)   -> PivotReport      // rootfs 切替 + 旧 root 切り離し
 //! ```
 //!
@@ -35,18 +35,17 @@
 //! - **外部 inode へのハードリンクは拒否する**: rootfs 内の非ディレクトリが rootfs の外にもリンク
 //!   を持つ（`st_nlink` が rootfs 内のリンク数を超える）と、pivot 後の書き込みで外部ファイルが
 //!   変わる。bind 前に走査し `ViolationReason::RootfsHasExternalHardlink` で拒否する
-//! - **自己 bind のマウントは rootful で `nodev`（#1676・SEC-1・CORE-1・TASK-27.3）**: 初回の `MS_BIND` は
+//! - **自己 bind のマウントは常に `nodev`（#1676・SEC-1・CORE-1・TASK-27.3）**: 初回の `MS_BIND` は
 //!   フラグを無視するため、イメージが `/dev` 以外に同梱したデバイスノードが開けてしまう。そこで bind 後に
 //!   開き直した mount top の fd へ `mount_setattr(2)`（`sys::set_mount_nodev`。Linux 5.12 以降。`ENOSYS` は
 //!   `Unimplemented` で拒否し `mount(2)` へ縮退しない）で `nodev` を足し、`fstatfs` の `ST_NODEV` で事後検証する。
-//!   - mount top 1 枚だけ・再帰なし。submount は拒否済みのため rootfs 全体を覆う。`/dev` の tmpfs・devpts は
-//!     後から別のマウントとして載るので `nodev` にならず、既定のデバイスノード 6 種は使える。procfs も同様
-//!   - 掛けるかの判定は呼び出しスレッドの user namespace で行う（`/proc/thread-self/ns/user` が初期 user ns
-//!     〔`USER_NS_INIT_INO`〕なら rootful）。`IsolationConfig` の rootful（`Namespace::User` なし）は初期 user ns に
-//!     留まり、rootless は非初期 user ns にいる。カーネルの事実で決めるため、呼び出し側の申告違いで緩まない。
-//!     限界: ランタイム自体が非初期 user ns の中で euid 0 として動く入れ子の構成では、rootful の計画でも
-//!     `nodev` は付かない。読み取れない・解釈できないときは fail-closed で拒否する
-//!   - rootless は挙動を変えない（`nodev` を通すかは本 Issue の範囲外）
+//!   - mount top 1 枚だけ・再帰なし。submount は拒否済みのため rootfs 全体を覆う。`/dev` の tmpfs・devpts・
+//!     rootless の基本デバイスの bind（#1660）は後から別のマウントとして載るので `nodev` にならず、既定の
+//!     デバイスノード 6 種は使える。procfs も同様
+//!   - rootful・rootless を問わず常に掛ける（オーナー判断 2026-10-10）。user namespace の種類で分岐しないため、
+//!     入れ子の user namespace の中で動く構成でも黙って外れない。rootless（非初期 user ns）では mount namespace を
+//!     所有する user ns の `CAP_SYS_ADMIN` で足せる。付与・事後検証の失敗は `EPERM` を含め fail-closed で拒否する
+//!   - Linux 5.12 の要件は Landlock ABI 6（Linux 6.12 以降。CORE-5）の前提に含まれる
 //!   - CDI `deviceNodes`（TASK-127・#547）を `/dev` 以外へ置くと、この `nodev` で開けなくなる。配置先は TASK-127 で決める
 //!   - 多層防御のもう一方であるデバイス cgroup は #1677 で扱う
 //! - **同一スレッド**: 呼び出しスレッドだけが新しい mount namespace にいるため、
@@ -75,9 +74,8 @@ use crate::sys::{self, SysError};
 use crate::traits::types::ErrorCode;
 
 use super::{
-    ExecError, IsolationStage, MountIsolation, USER_NS_INIT_INO, ViolationReason, fd_mount_id,
-    fd_still_at, mount_is_shared, mount_proc_at_dir, open_error, pin_rootfs, read_thread_mountinfo,
-    thread_ns_link,
+    ExecError, IsolationStage, MountIsolation, ViolationReason, fd_mount_id, fd_still_at,
+    mount_is_shared, mount_proc_at_dir, open_error, pin_rootfs, read_thread_mountinfo,
 };
 
 /// [`prepare_rootfs`] が返す、pivot 可能な rootfs の証。[`pivot_root`] だけが受け取る（消費する）。
@@ -91,8 +89,6 @@ pub struct PreparedRootfs {
     new_root: OwnedFd,
     /// `new_root` が属するマウントの ID（bind 前の下層マウントとは異なる）。
     new_root_mnt_id: u64,
-    /// mount top に `nodev` を足して事後検証したか（#1676）。[`PivotReport::rootfs_nodev`] へ渡す。
-    nodev: RootfsNodev,
     /// `!Send`・`!Sync` にするための印。
     _not_send: std::marker::PhantomData<*const ()>,
 }
@@ -115,8 +111,9 @@ pub struct PivotReport {
     pub old_root_detached: bool,
     /// pivot 前にマウントした `/proc` が新しい `/proc` になっているか。成功時は常に真。
     pub proc_mounted: bool,
-    /// rootfs の自己 bind に `nodev` を足して `ST_NODEV` を事後検証したか（#1676・SEC-1・REPAIR-4）。
-    /// rootful（初期 user namespace）で真、rootless で偽。判定の結果を呼び出し側が記録・照合できるよう残す。
+    /// rootfs の自己 bind に `nodev` を足し、`ST_NODEV` を事後検証済みか（#1676・SEC-1・REPAIR-4）。
+    /// rootful・rootless を問わず常に付与する（オーナー判断 2026-10-10）ため、成功した [`pivot_root`] では常に真。
+    /// 付与済みであることの証跡として呼び出し側が記録・照合できるよう残す。
     pub rootfs_nodev: bool,
 }
 
@@ -134,7 +131,7 @@ pub struct PivotReport {
 /// 6. bind 前に得た fd は下層の dentry を指すため、保持した親 fd から同じ名前で開き直し、bind で
 ///    できた新しい mount top を得る（マウント ID が変わったこと、開き直した fd が bind 対象と同じ
 ///    `(st_dev, st_ino)` であること、新マウントの親が bind 元のマウントであることを確認する）
-/// 7. rootful（初期 user namespace）なら mount top に `nodev` を足し、`ST_NODEV` を事後検証する（#1676）
+/// 7. mount top に `nodev` を足し、`ST_NODEV` を事後検証する（#1676。rootful・rootless とも）
 /// 8. bind が複製した rootfs 配下の既存マウントが 1 つでもあれば拒否する（`RootfsHasSubmounts`）
 /// 9. 新しい mount top 起点で `proc` を開き直し、procfs をマウントする
 pub fn prepare_rootfs(
@@ -142,38 +139,7 @@ pub fn prepare_rootfs(
     rootfs: &Path,
 ) -> Result<PreparedRootfs, ExecError> {
     isolation.verify_caller(IsolationStage::PrepareRootfs)?;
-    let link = thread_ns_link("user")
-        .map_err(|e| ExecError::from_io(&e, IsolationStage::PrepareRootfs, "readlink(ns/user)"))?;
-    let nodev = rootfs_nodev_for_user_ns(&link)?;
-    prepare_rootfs_verified(rootfs, nodev)
-}
-
-/// 自己 bind の mount top に `nodev` を足すか（#1676）。非公開で、[`prepare_rootfs`] が user namespace から決める。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RootfsNodev {
-    /// rootful（初期 user ns）。`nodev` を足して事後検証する。
-    Apply,
-    /// rootless（非初期 user ns）。従来どおり足さない。
-    Skip,
-}
-
-/// `/proc/thread-self/ns/user` のリンク先（`user:[inode]`）から `nodev` を足すかを決める純関数。
-/// 初期 user namespace の inode なら [`RootfsNodev::Apply`]、それ以外は [`RootfsNodev::Skip`]。
-/// 書式に反すれば fail-closed で拒否する。
-fn rootfs_nodev_for_user_ns(link: &str) -> Result<RootfsNodev, ExecError> {
-    let inode = link
-        .strip_prefix("user:[")
-        .and_then(|r| r.strip_suffix(']'))
-        .and_then(|n| n.parse::<u64>().ok());
-    match inode {
-        Some(USER_NS_INIT_INO) => Ok(RootfsNodev::Apply),
-        Some(_) => Ok(RootfsNodev::Skip),
-        None => Err(ExecError::new(
-            ErrorCode::FailedPrecondition,
-            IsolationStage::PrepareRootfs,
-            "unexpected format of /proc/thread-self/ns/user",
-        )),
-    }
+    prepare_rootfs_verified(rootfs)
 }
 
 /// rootfs の mount top が `nodev` であることの事後検証（純関数。fail-closed）。`ST_VALID` が無い値は信用しない。
@@ -190,7 +156,7 @@ fn check_rootfs_is_nodev(flags: sys::MountFlags) -> Result<(), ExecError> {
 
 /// [`prepare_rootfs`] の証跡検証後の本体。単体テストは証跡を偽造せずに直接呼ぶ
 /// （`mount(2)` は `cfg(test)` では dry-run）。
-fn prepare_rootfs_verified(rootfs: &Path, nodev: RootfsNodev) -> Result<PreparedRootfs, ExecError> {
+fn prepare_rootfs_verified(rootfs: &Path) -> Result<PreparedRootfs, ExecError> {
     const STAGE: IsolationStage = IsolationStage::PrepareRootfs;
     let violation = |r: ViolationReason| ExecError::from_violation_at(r, Some(rootfs), STAGE);
     validate_rootfs_path(rootfs)?;
@@ -239,16 +205,15 @@ fn prepare_rootfs_verified(rootfs: &Path, nodev: RootfsNodev) -> Result<Prepared
     )?;
 
     // 初回の `MS_BIND` はフラグを無視するため、検証済みの mount top の fd へ `nodev` を足す（#1676・SEC-1）。
-    // `/dev` の tmpfs を載せる前に済ませる。submount は下で拒否するので mount top 1 枚で rootfs 全体を覆う。
-    if nodev == RootfsNodev::Apply {
-        nodev_syscall(new_root.as_fd())
-            .map_err(|e| ExecError::from_sys(e, STAGE, "mount_setattr(MOUNT_ATTR_NODEV)"))?;
-        // dry-run（`cfg(test)`）では実マウントが無く、ホストの一時領域の nodev 有無で結果が揺れるため検証しない。
-        if !cfg!(test) {
-            let flags = sys::mount_flags(new_root.as_fd())
-                .map_err(|e| ExecError::from_sys(e, STAGE, "fstatfs(rootfs)"))?;
-            check_rootfs_is_nodev(flags)?;
-        }
+    // rootful・rootless を問わず常に掛ける（オーナー判断 2026-10-10）。`/dev` の tmpfs を載せる前に済ませる。
+    // submount は下で拒否するので mount top 1 枚で rootfs 全体を覆う。失敗（`EPERM`・`ENOSYS` 等）は縮退しない。
+    nodev_syscall(new_root.as_fd())
+        .map_err(|e| ExecError::from_sys(e, STAGE, "mount_setattr(MOUNT_ATTR_NODEV)"))?;
+    // dry-run（`cfg(test)`）では実マウントが無く、ホストの一時領域の nodev 有無で結果が揺れるため検証しない。
+    if !cfg!(test) {
+        let flags = sys::mount_flags(new_root.as_fd())
+            .map_err(|e| ExecError::from_sys(e, STAGE, "fstatfs(rootfs)"))?;
+        check_rootfs_is_nodev(flags)?;
     }
 
     // `MS_BIND | MS_REC` は rootfs 配下の既存マウントも新しい mount 木へ複製する。ホスト領域への
@@ -265,7 +230,6 @@ fn prepare_rootfs_verified(rootfs: &Path, nodev: RootfsNodev) -> Result<Prepared
     Ok(PreparedRootfs {
         new_root,
         new_root_mnt_id,
-        nodev,
         _not_send: std::marker::PhantomData,
     })
 }
@@ -572,7 +536,7 @@ fn pivot_root_verified(prepared: PreparedRootfs) -> Result<PivotReport, ExecErro
         new_root_mnt_id: prepared.new_root_mnt_id,
         old_root_detached: true,
         proc_mounted: true,
-        rootfs_nodev: prepared.nodev == RootfsNodev::Apply,
+        rootfs_nodev: true,
     })
 }
 
@@ -696,13 +660,9 @@ mod tests {
     }
 
     /// shared propagation の判定を `shared` に固定して `prepare_rootfs_verified` を呼ぶ（呼び出し後に戻す）。
-    fn prepare_with_shared(
-        rootfs: &Path,
-        nodev: RootfsNodev,
-        shared: bool,
-    ) -> Result<PreparedRootfs, ExecError> {
+    fn prepare_with_shared(rootfs: &Path, shared: bool) -> Result<PreparedRootfs, ExecError> {
         crate::exec::tests::DRY_RUN_SHARED.with(|s| s.set(Some(shared)));
-        let result = prepare_rootfs_verified(rootfs, nodev);
+        let result = prepare_rootfs_verified(rootfs);
         crate::exec::tests::DRY_RUN_SHARED.with(|s| s.set(None));
         result
     }
@@ -768,7 +728,7 @@ mod tests {
             ("/tmp/a/../b", "path_parent_component", "/tmp/a/../b"),
         ];
         for (path, reason, subject) in cases {
-            let err = prepare_rootfs_verified(Path::new(path), RootfsNodev::Apply).unwrap_err();
+            let err = prepare_rootfs_verified(Path::new(path)).unwrap_err();
             assert_eq!(err.code, ErrorCode::InvalidArgument, "{reason}");
             assert_eq!(err.stage, IsolationStage::PrepareRootfs, "{reason}");
             assert_eq!(
@@ -778,7 +738,7 @@ mod tests {
             );
         }
         for path in ["/", "/.", "//"] {
-            let err = prepare_rootfs_verified(Path::new(path), RootfsNodev::Apply).unwrap_err();
+            let err = prepare_rootfs_verified(Path::new(path)).unwrap_err();
             assert_eq!(err.code, ErrorCode::InvalidArgument, "{path}");
             assert_eq!(err.stage, IsolationStage::PrepareRootfs, "{path}");
             assert_eq!(err.message, "rootfs must not be the host root '/'");
@@ -823,7 +783,7 @@ mod tests {
             (d.clone(), "rootfs_missing", s(&d)),
         ];
         for (rootfs, reason, subject) in cases {
-            let err = prepare_rootfs_verified(&rootfs, RootfsNodev::Apply).unwrap_err();
+            let err = prepare_rootfs_verified(&rootfs).unwrap_err();
             assert_eq!(err.code, ErrorCode::InvalidArgument, "{reason}");
             assert_eq!(err.stage, IsolationStage::PrepareRootfs, "{reason}");
             assert_eq!(
@@ -836,8 +796,9 @@ mod tests {
     }
 
     /// CORE-1・SEC-1（#1676）: 有効な rootfs は（shared でなければ）dry-run の bind と procfs マウントまで進む。
-    /// rootful（`Apply`）の順序は bind -> nodev -> procfs で、nodev はちょうど 1 回・mount top の fd 起点・固定値。
-    /// shared の判定は差し込み点で固定し、実行環境の propagation に依らず必ずこの分岐を照合する。
+    /// 順序は bind -> nodev -> procfs で、nodev はちょうど 1 回・mount top の fd 起点・固定値（rootful・rootless の
+    /// 区別なく常に掛ける。オーナー判断 2026-10-10）。shared の判定は差し込み点で固定し、実行環境の propagation に
+    /// 依らず必ずこの分岐を照合する。
     #[test]
     fn core1_prepare_rootfs_reaches_dry_run_mounts() {
         take_dry_runs();
@@ -845,7 +806,7 @@ mod tests {
         let t = Tmp::new("valid");
         let rootfs = t.0.join("root");
         std::fs::create_dir_all(rootfs.join("proc")).unwrap();
-        let prepared = prepare_with_shared(&rootfs, RootfsNodev::Apply, false).expect("prepare");
+        let prepared = prepare_with_shared(&rootfs, false).expect("prepare");
         let (binds, mounts, switches) = take_dry_runs();
         let calls = take_nodev_calls();
         assert_eq!(calls.len(), 1, "{calls:?}");
@@ -858,77 +819,75 @@ mod tests {
         assert_eq!(mounts.len(), 1, "{mounts:?}");
         assert!(mounts[0].starts_with("/proc/thread-self/fd/"), "{mounts:?}");
         assert_eq!(switches, 0);
-        assert_eq!(prepared.nodev, RootfsNodev::Apply);
     }
 
     /// CORE-1・SEC-1（#1676）: shared propagation 上の rootfs は違反記録付きで拒否し、bind・nodev・procfs の
-    /// いずれも呼ばない（rootful の `Apply` でも副作用の前に止まる）。
+    /// いずれも呼ばない（副作用の前に止まる）。
     #[test]
     fn core1_prepare_rootfs_rejects_shared_before_nodev() {
-        for nodev in [RootfsNodev::Apply, RootfsNodev::Skip] {
+        take_dry_runs();
+        take_nodev_calls();
+        let t = Tmp::new("shared");
+        let rootfs = t.0.join("root");
+        std::fs::create_dir_all(rootfs.join("proc")).unwrap();
+        let err = prepare_with_shared(&rootfs, true).unwrap_err();
+        assert_eq!(err.stage, IsolationStage::PrepareRootfs);
+        assert_eq!(
+            violation_of(&err),
+            (
+                "shared_propagation",
+                "rootfs_on_shared_mount",
+                "CORE-1",
+                Some(rootfs.to_str().unwrap().to_string())
+            )
+        );
+        assert_eq!(take_dry_runs(), (vec![], vec![], 0));
+        assert_eq!(take_nodev_calls().len(), 0);
+    }
+
+    /// SEC-1（#1676）: nodev 付与の失敗は縮退せず拒否し、procfs へ進まない。`ENOSYS`（`Unsupported`）は
+    /// `Unimplemented`、rootless で起こり得る `EPERM` は `PermissionDenied`（`mount(2)` へ縮退せず、nodev なしでも
+    /// 進まない。オーナー判断 2026-10-10 の fail-closed）。bind は済んでいる（プロセスごと破棄する契約）。
+    #[test]
+    fn core1_prepare_rootfs_nodev_failure_is_fail_closed() {
+        const EPERM: i32 = 1;
+        let cases = [
+            (
+                SysError::Unsupported,
+                ErrorCode::Unimplemented,
+                "mount_setattr(MOUNT_ATTR_NODEV) failed: not supported by the kernel or the target architecture"
+                    .to_string(),
+            ),
+            (
+                SysError::Os(EPERM),
+                ErrorCode::PermissionDenied,
+                format!(
+                    "mount_setattr(MOUNT_ATTR_NODEV) failed: {}",
+                    std::io::Error::from_raw_os_error(EPERM)
+                ),
+            ),
+        ];
+        for (injected, code, message) in cases {
             take_dry_runs();
             take_nodev_calls();
-            let t = Tmp::new("shared");
+            let t = Tmp::new("nodev-fail");
             let rootfs = t.0.join("root");
             std::fs::create_dir_all(rootfs.join("proc")).unwrap();
-            let err = prepare_with_shared(&rootfs, nodev, true).unwrap_err();
-            assert_eq!(err.stage, IsolationStage::PrepareRootfs, "{nodev:?}");
+            DRY_RUN_NODEV_FAIL.with(|f| f.set(Some(injected)));
+            let err = prepare_with_shared(&rootfs, false).unwrap_err();
+            DRY_RUN_NODEV_FAIL.with(|f| f.set(None));
+            assert_eq!(err.stage, IsolationStage::PrepareRootfs, "{injected:?}");
+            assert_eq!(err.code, code, "{injected:?}");
+            assert!(err.violation.is_none(), "{err:?}");
+            assert_eq!(err.message, message, "{injected:?}");
+            let (binds, mounts, switches) = take_dry_runs();
             assert_eq!(
-                violation_of(&err),
-                (
-                    "shared_propagation",
-                    "rootfs_on_shared_mount",
-                    "CORE-1",
-                    Some(rootfs.to_str().unwrap().to_string())
-                ),
-                "{nodev:?}"
+                (binds.len(), mounts.len(), switches),
+                (1, 0, 0),
+                "{injected:?}"
             );
-            assert_eq!(take_dry_runs(), (vec![], vec![], 0), "{nodev:?}");
-            assert_eq!(take_nodev_calls().len(), 0, "{nodev:?}");
+            assert_eq!(take_nodev_calls().len(), 0, "{injected:?}");
         }
-    }
-
-    /// CORE-1・SEC-1（#1676）: rootless（`Skip`）では nodev を足さず、bind・procfs は従来どおり 1 回ずつ。
-    #[test]
-    fn core1_prepare_rootfs_rootless_skips_nodev() {
-        take_dry_runs();
-        take_nodev_calls();
-        let t = Tmp::new("skip");
-        let rootfs = t.0.join("root");
-        std::fs::create_dir_all(rootfs.join("proc")).unwrap();
-        let prepared = prepare_with_shared(&rootfs, RootfsNodev::Skip, false).expect("prepare");
-        let (binds, mounts, switches) = take_dry_runs();
-        assert_eq!((binds.len(), mounts.len(), switches), (1, 1, 0));
-        assert_eq!(take_nodev_calls().len(), 0);
-        assert_eq!(prepared.nodev, RootfsNodev::Skip);
-    }
-
-    /// SEC-1（#1676）: nodev 付与が `ENOSYS`（`Unsupported`）なら `Unimplemented` で拒否し、procfs へ進まない
-    /// （`mount(2)` へ縮退しない）。bind は済んでいる（プロセスごと破棄する契約）。
-    #[test]
-    fn core1_prepare_rootfs_nodev_enosys_is_unimplemented() {
-        take_dry_runs();
-        take_nodev_calls();
-        let t = Tmp::new("enosys");
-        let rootfs = t.0.join("root");
-        std::fs::create_dir_all(rootfs.join("proc")).unwrap();
-        DRY_RUN_NODEV_FAIL.with(|f| f.set(Some(SysError::Unsupported)));
-        let err = prepare_with_shared(&rootfs, RootfsNodev::Apply, false).unwrap_err();
-        DRY_RUN_NODEV_FAIL.with(|f| f.set(None));
-        assert_eq!(err.stage, IsolationStage::PrepareRootfs);
-        assert_eq!(err.code, ErrorCode::Unimplemented);
-        assert!(err.violation.is_none(), "{err:?}");
-        assert_eq!(
-            err.message,
-            "mount_setattr(MOUNT_ATTR_NODEV) failed: not supported by the kernel or the target architecture"
-        );
-        let (binds, mounts, switches) = take_dry_runs();
-        assert_eq!(
-            (binds.len(), mounts.len(), switches),
-            (1, 0, 0),
-            "{mounts:?}"
-        );
-        assert_eq!(take_nodev_calls().len(), 0);
     }
 
     /// SEC-1（#1676）: 事後検証は `ST_NODEV` と `ST_VALID` の両方を要求する。
@@ -939,24 +898,6 @@ mod tests {
             let err = check_rootfs_is_nodev(sys::MountFlags::from_bits(bits)).unwrap_err();
             assert_eq!(err.code, ErrorCode::FailedPrecondition, "{bits:#x}");
             assert_eq!(err.stage, IsolationStage::PrepareRootfs, "{bits:#x}");
-        }
-    }
-
-    /// SEC-1（#1676）: user ns のリンク先から rootful（初期 user ns）だけが `Apply` になる。
-    #[test]
-    fn sec1_rootfs_nodev_for_user_ns() {
-        assert_eq!(
-            rootfs_nodev_for_user_ns("user:[4026531837]").unwrap(),
-            RootfsNodev::Apply
-        );
-        assert_eq!(
-            rootfs_nodev_for_user_ns("user:[4026532001]").unwrap(),
-            RootfsNodev::Skip
-        );
-        for bad in ["user:[x]", "pid:[4026531837]", ""] {
-            let err = rootfs_nodev_for_user_ns(bad).unwrap_err();
-            assert_eq!(err.code, ErrorCode::FailedPrecondition, "{bad}");
-            assert_eq!(err.stage, IsolationStage::PrepareRootfs, "{bad}");
         }
     }
 
@@ -993,7 +934,6 @@ mod tests {
         let prepared = PreparedRootfs {
             new_root: sys::open_dir_path_nofollow(None, c"/").unwrap(),
             new_root_mnt_id: 0,
-            nodev: RootfsNodev::Skip,
             _not_send: std::marker::PhantomData,
         };
         let err = pivot_root(&iso, prepared).unwrap_err();
@@ -1020,7 +960,6 @@ mod tests {
         let prepared = PreparedRootfs {
             new_root: root,
             new_root_mnt_id: mnt_id,
-            nodev: RootfsNodev::Skip,
             _not_send: std::marker::PhantomData,
         };
         let err = pivot_root_verified(prepared).unwrap_err();

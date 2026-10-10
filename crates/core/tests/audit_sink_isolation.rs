@@ -225,8 +225,8 @@ mod linux {
         Arc::new(|_, _| AuditFileWriter::open(Path::new("relative/audit.log")).map(|_| ()))
     }
 
-    /// 出し直しのスレッドを join した後、`/proc/self/status` の `Threads:` が 1 に戻るまで待つ（join の完了
-    /// からスレッドの解放までの短い間は 2 と読める）。戻らなければ失敗する。
+    /// スレッド（出し直しのスレッド・試験の helper）を join した後、`/proc/self/status` の `Threads:` が 1 に戻るまで
+    /// 待つ（join の完了からスレッドの解放までの短い間は 2 と読める）。戻らなければ失敗する。
     fn wait_single_threaded() {
         let deadline = Instant::now() + Duration::from_secs(2);
         while threads() != 1 {
@@ -400,6 +400,9 @@ mod linux {
         assert!(!marker.exists());
         drop(release_tx);
         helper.join().unwrap();
+        // join の直後は解放前の helper が `Threads:` に残り得る。1 に戻るのを待ってから次の試験へ進む（待たないと、
+        // 続く試験の fork が `MultiThreaded` で拒否され、主経路の成功を照合する試験が両経路失敗で落ちる。#1616）。
+        wait_single_threaded();
     }
 
     /// SEC-4・REPAIR-4・REPAIR-5・#1594: 未回収の子が上限（D 状態の子が溜まった状態の再現）でも、両経路失敗の

@@ -238,6 +238,8 @@ pub(crate) mod bpf;
 mod consts {
     use super::ArchSysNo;
     pub const SUPPORTED: bool = true;
+    #[cfg(test)]
+    pub const CLONE_FS: i32 = 0x0000_0200;
     pub const CLONE_NEWNS: i32 = 0x0002_0000;
     pub const CLONE_NEWUTS: i32 = 0x0400_0000;
     pub const CLONE_NEWIPC: i32 = 0x0800_0000;
@@ -487,6 +489,8 @@ mod consts {
 mod consts {
     use super::ArchSysNo;
     pub const SUPPORTED: bool = true;
+    #[cfg(test)]
+    pub const CLONE_FS: i32 = 0x0000_0200;
     pub const CLONE_NEWNS: i32 = 0x0002_0000;
     pub const CLONE_NEWUTS: i32 = 0x0400_0000;
     pub const CLONE_NEWIPC: i32 = 0x0800_0000;
@@ -747,6 +751,8 @@ mod consts {
 mod consts {
     use super::ArchSysNo;
     pub const SUPPORTED: bool = false;
+    #[cfg(test)]
+    pub const CLONE_FS: i32 = 0;
     pub const CLONE_NEWNS: i32 = 0;
     pub const CLONE_NEWUTS: i32 = 0;
     pub const CLONE_NEWIPC: i32 = 0;
@@ -1275,6 +1281,23 @@ pub(crate) fn unshare_namespaces(flags: &[NsFlag]) -> Result<(), SysError> {
     // SAFETY: 引数は値渡しの整数のみでポインタを取らない。呼び出し元プロセスの
     // namespace を変更する副作用は `crate::exec::isolate` の契約として文書化済み。
     let rc = unsafe { unshare(bits) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 呼び出しスレッドの `fs_struct`（root・cwd・umask）を私有にする（`unshare(CLONE_FS)`）。試験専用（#1685）。
+///
+/// `exec_check_fd`（`AT_EXECVE_CHECK`）の判定中、カーネルは `fs_struct` を共有するスレッドの `CLONE_FS` 付き
+/// clone（`pthread_create`）を `EAGAIN` にする。多スレッドの試験プロセスでは他試験のスレッド生成が巻き込まれるため、
+/// 実行可能ファイルへ判定を掛ける試験は、本関数を呼んだ専用スレッドで行う（`crate::test_support::run_with_private_fs`）。
+/// 権限・namespace・資格情報は変えない。
+#[cfg(test)]
+pub(crate) fn unshare_fs_for_current_thread() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は値渡しの整数のみでポインタを取らない。影響は呼び出しスレッドが root・cwd・umask を
+    // 他スレッドと共有しなくなることだけで、権限・namespace は変えない（試験専用）。
+    let rc = unsafe { unshare(consts::CLONE_FS) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
@@ -2761,6 +2784,11 @@ pub(crate) fn seal_for_exec(fd: OwnedFd) -> Result<SealedMemfd, SealError> {
 /// domain で行われる）。許されなければ `EACCES` 等、`AT_EXECVE_CHECK` を知らないカーネル（6.14 未満）は
 /// `EINVAL`（呼び出し側が fail-closed にする）。`argv` は固定の 1 要素（`argc` 0 の警告を避ける）・`envp` は空で、
 /// 判定に外部入力を渡さない。ファイルの形式（ELF・シェバン）と、その先のインタープリタは判定しない。
+///
+/// 副作用（#1685）: 実行可能ファイルへの判定中、カーネルは `fs_struct` を共有する同一プロセスのスレッドの
+/// `CLONE_FS` 付き clone を `EAGAIN` にする（`in_exec`）。本番の呼び出し元は単一スレッドの worker
+/// （`SealPolicy::probe`。対象はディレクトリで窓を作らない）と fork した exec の子で、影響しない。
+/// 多スレッドの試験プロセスでは `crate::test_support::run_with_private_fs` 経由で呼ぶ。
 pub(crate) fn exec_check_fd(fd: BorrowedFd<'_>) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
@@ -5297,9 +5325,13 @@ mod tests {
         let true_bin = std::fs::File::open("/bin/true").expect("open /bin/true");
         let proc_file = std::fs::File::open("/proc/self/status").expect("open status");
         let directory = std::fs::File::open(&dir).expect("open dir");
+        // 実行可能ファイルへの判定は私有 fs のスレッドで行う（他試験のスレッド生成の EAGAIN を避ける。#1685）。
+        let (ok755, ok_true) = crate::test_support::run_with_private_fs(|| {
+            (exec_check_fd(x755.as_fd()), exec_check_fd(true_bin.as_fd()))
+        });
         let got = [
-            exec_check_fd(x755.as_fd()),
-            exec_check_fd(true_bin.as_fd()),
+            ok755,
+            ok_true,
             exec_check_fd(x644.as_fd()),
             exec_check_fd(proc_file.as_fd()),
             exec_check_fd(directory.as_fd()),

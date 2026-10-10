@@ -406,3 +406,41 @@ mod tests {
         assert!(a.path().is_dir() && b.path().is_dir());
     }
 }
+
+/// 私有の `fs_struct`（`unshare(CLONE_FS)` 済み）を持つ専用スレッドで `f` を実行して結果を返す（#1685・REPAIR-7）。
+///
+/// `execveat(AT_EXECVE_CHECK)` を実行可能ファイルへ掛けると、カーネルは判定中（`fs_struct->in_exec`）に同じ
+/// `fs_struct` を共有するスレッドの `CLONE_FS` 付き clone を `EAGAIN` にする。libtest の多スレッドのプロセスでは、
+/// 並走する他試験の `std::thread::spawn` が `failed to spawn thread` で落ちる。判定を私有 fs のスレッドに閉じ込めれば
+/// 他スレッドへ波及せず、判定結果（Landlock・NNP・seccomp は新スレッドへ継承）も変わらない。
+/// `unshare` に失敗したら試験を落とす（skip しない）。`f` の panic は呼び出し側へ伝える。
+#[cfg(target_os = "linux")]
+pub(crate) fn run_with_private_fs<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(|| {
+            crate::sys::unshare_fs_for_current_thread().expect("unshare(CLONE_FS) in test thread");
+            f()
+        });
+        match handle.join() {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod private_fs_tests {
+    use super::run_with_private_fs;
+
+    /// #1685: 私有 fs のスレッドでの `chdir` は、試験プロセスの他スレッド（呼び出し元）の cwd を変えない。
+    #[test]
+    fn task1685_private_fs_thread_does_not_share_cwd() {
+        let before = std::env::current_dir().expect("cwd");
+        let inner = run_with_private_fs(|| {
+            std::env::set_current_dir("/").expect("chdir");
+            std::env::current_dir().expect("cwd in thread")
+        });
+        assert_eq!(inner, std::path::PathBuf::from("/"));
+        assert_eq!(std::env::current_dir().expect("cwd after"), before);
+    }
+}

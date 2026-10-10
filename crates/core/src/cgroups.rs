@@ -52,6 +52,9 @@
 //! - exec 経路の cgroup 参加（SUP-6・TASK-163.2・#501）: 記録した cgroup パスから fd で開いて `cgroup.procs` へ
 //!   書く `exec_join` サブモジュール（`exec::prepare_cgroup_join` / `join_cgroup` の実体。起動経路の
 //!   [`CgroupJoin`] とは別の入口）
+//! - デバイス cgroup の eBPF 命令列の組み立て（TASK-32 追補・#1678・SEC-1）: OCI default devices の許可リスト
+//!   から `BPF_PROG_TYPE_CGROUP_DEVICE` の命令列を作る `device` サブモジュール。ロード・アタッチ・起動経路への
+//!   結線は未実装（#1679・#1680・#1314）
 //!
 //! - delete 時の cgroup 削除（TASK-30.3・OCI-6）: [`DelegatedCgroup::open_child`] で名前から既存の子 cgroup を
 //!   検証つきで開き、`oci_runtime::ContainerCgroupRemover` の実装として [`DelegatedCgroup::remove_child`] へ渡す
@@ -109,6 +112,11 @@ pub use io_weight::{
 };
 mod pids;
 pub use pids::{PIDS_MAX_LIMIT, PidsMax};
+mod device;
+pub use device::{
+    DEVICE_PROGRAM_LICENSE, DEVICE_PROGRAM_MAX_INSNS, DeviceAccess, DeviceAllowList, DeviceMinor,
+    DeviceProgram, DeviceRule, DeviceType, EbpfInstruction, EbpfOpcode, EbpfReg,
+};
 mod exec_join;
 mod exec_kill;
 pub(crate) use exec_join::{ExecJoinFds, contains_pid, open_cgroup_by_path};
@@ -182,6 +190,8 @@ pub enum CgroupStep {
     /// （差し替えの検出。`rmdir` のカーネル拒否〔`Cleanup` 段の `EBUSY` / `ENOTEMPTY`〕と区別する。
     /// #1596・REPAIR-4）。
     VerifyIdentity,
+    /// デバイス cgroup の eBPF 命令列の組み立て（命令数の上限超過等。#1678・SEC-1）。
+    BuildDeviceProgram,
 }
 
 /// cgroup 操作のエラー。`code` は ERR 系の機械可読コード、`message` は英語の説明。

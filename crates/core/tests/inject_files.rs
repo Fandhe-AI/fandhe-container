@@ -14,7 +14,10 @@
 //!      自動作成した `rb` が rootfs に残らないこと、symlink の先に何も作られないことを照合する
 //!   2. **成功経路**: 2 ディレクトリ・3 ファイル（モード 0444 と 0400）を注入 → `pivot_root` の後、内容が
 //!      一致し、`stat` のモードが指定どおりで、mountinfo で当該マウントが fstype `tmpfs` かつ
-//!      `ro,nosuid,nodev,noexec` であることを具体値で照合する
+//!      `ro,nosuid,nodev,noexec` であることを具体値で照合する。さらに注入先の `stat` の `st_dev` と同じ
+//!      major:minor を持つ mountinfo の行が注入先の 1 行だけ（2 ディレクトリで別の値）であることを照合する。
+//!      read-only はマウント単位（`mount_setattr(2)` の `MOUNT_ATTR_RDONLY`。#1620）のため、同じ
+//!      superblock の別マウントが無いことが SUP-12・SEC-1 の保証（`EROFS`）の前提になる（#1693 の事後監査 P3）
 //!   3. **書き込み拒否**: 既存ファイルを書き込みで開く・新規ファイルの作成・削除・`chmod` が、いずれも
 //!      `EROFS`（errno 30）で失敗することを具体値で照合する
 //!
@@ -213,6 +216,53 @@ mod linux {
         ))
     }
 
+    /// `/proc/self/mountinfo` の 1 行から `(major:minor, mount_point)` を取り出す（3 列目と 5 列目）。
+    fn parse_dev_and_point(line: &str) -> Option<(String, String)> {
+        let mut fields = line.split(' ');
+        let dev = fields.nth(2)?.to_owned();
+        let point = fields.nth(1)?.to_owned();
+        Some((dev, point))
+    }
+
+    /// `st_dev` を mountinfo と同じ `major:minor` 表記にする（glibc の `gnu_dev_major` / `gnu_dev_minor` と同じ
+    /// Linux の 64 ビット `dev_t` の符号化）。
+    fn dev_to_major_minor(dev: u64) -> String {
+        let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+        let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+        format!("{major}:{minor}")
+    }
+
+    /// 注入先の superblock を指すマウントが注入先の 1 枚だけであること（SUP-12・SEC-1・#1693 の事後監査 P3）。
+    ///
+    /// read-only は `mount_setattr(2)` の `MOUNT_ATTR_RDONLY` によるマウント単位の属性（#1620）なので、同じ
+    /// superblock の別マウント（bind の複製・伝播によるコピー）があれば、そちらからは書けてしまう。注入先の
+    /// `stat` の `st_dev` を major:minor にし、その値を持つ mountinfo の行のマウントポイントが注入先だけで
+    /// あることを具体値で照合する。tmpfs は匿名デバイスのため major は 0。
+    fn assert_single_mount_per_superblock(info: &str) -> Vec<String> {
+        use std::os::unix::fs::MetadataExt as _;
+        let mut devs = Vec::new();
+        for point in ["/run/secrets", "/etc/app"] {
+            let dev = dev_to_major_minor(std::fs::metadata(point).expect(point).dev());
+            assert!(
+                dev.starts_with("0:"),
+                "{point} must be on an anonymous device: {dev}"
+            );
+            let points: Vec<String> = info
+                .lines()
+                .filter_map(parse_dev_and_point)
+                .filter(|(d, _)| *d == dev)
+                .map(|(_, p)| p)
+                .collect();
+            assert_eq!(
+                points,
+                vec![point.to_owned()],
+                "{point} ({dev}) must be the only mount of its superblock:\n{info}"
+            );
+            devs.push(dev);
+        }
+        devs
+    }
+
     fn set(files: &[(&str, &str, u32)]) -> InjectedFileSet {
         let mut s = InjectedFileSet::new();
         for (dest, body, mode) in files {
@@ -334,6 +384,13 @@ mod linux {
                 assert!(opts.contains(&want), "{point} must be {want}: {opts:?}");
             }
         }
+        let devs = assert_single_mount_per_superblock(&info);
+        assert_eq!(devs.len(), 2);
+        assert_ne!(
+            devs.first(),
+            devs.get(1),
+            "each directory must have its own tmpfs superblock"
+        );
 
         for (path, body, mode) in [
             ("/run/secrets/db_password", SENTINEL, 0o400),

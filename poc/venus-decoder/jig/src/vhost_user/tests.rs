@@ -57,12 +57,16 @@ fn config_bytes(offset: u32, size: u32, flags: u32, data: &[u8]) -> Vec<u8> {
     p
 }
 
+fn reply_code(r: Result<Reply, CodecError>) -> &'static str {
+    r.unwrap_err().code.as_str()
+}
+
 fn code_of(r: Result<Decoded, CodecError>) -> &'static str {
     r.unwrap_err().code.as_str()
 }
 
 #[test]
-fn f1_1_gpu6_request_roundtrip_all_16_kinds() {
+fn f1_1_gpu6_request_roundtrip_all_18_kinds() {
     let state = VringState { index: 1, num: 256 };
     let addr = VringAddr {
         index: 1,
@@ -133,12 +137,14 @@ fn f1_1_gpu6_request_roundtrip_all_16_kinds() {
             Request::SetConfig(cfg_set),
             msg(25, 1, &config_bytes(0, 4, 1, &[0xAB; 4])),
         ),
+        (Request::SetBackendReqFd, msg(21, 1, &[])),
+        (Request::GetShmemConfig, msg(44, 1, &[])),
     ];
-    // SET_MEM_TABLE は 1 領域と 2 領域の 2 件を持つので 17 件で、要求種別は 16 種。
-    assert_eq!(cases.len(), 17);
+    // SET_MEM_TABLE は 1 領域と 2 領域の 2 件を持つので 19 件で、要求種別は 18 種。
+    assert_eq!(cases.len(), 19);
     let mut kinds: Vec<u32> = cases.iter().map(|(r, _)| r.code().as_u32()).collect();
     kinds.dedup();
-    assert_eq!(kinds.len(), 16);
+    assert_eq!(kinds.len(), 18);
     for (req, bytes) in cases {
         let d = decode_request(&bytes).unwrap();
         assert_eq!(d.request, req, "decode {:?}", req.code());
@@ -240,8 +246,8 @@ fn f1_1_gpu6_repair2_payload_too_large_before_payload_read() {
 
 #[test]
 fn f1_1_gpu6_unknown_request() {
-    // 0・未割り当て・最小集合外の既知 ID（SET_LOG_BASE=6・GET_SHMEM_CONFIG=44）・範囲外。
-    for id in [0u32, 99, 6, 44, 1004] {
+    // 0・未割り当て・最小集合外の既知 ID（SET_LOG_BASE=6・CHECK_DEVICE_STATE=43）・範囲外。
+    for id in [0u32, 99, 6, 43, 1004] {
         let e = decode_request(&msg(id, 1, &[])).unwrap_err();
         assert_eq!(e.code.as_str(), "UNKNOWN_REQUEST", "id={id}");
         assert_eq!(e.request, Some(id));
@@ -440,4 +446,154 @@ fn f1_1_gpu6_vring_fd_length_before_value() {
             CodecErrorCode::InvalidValue
         );
     }
+}
+
+// ---- GPU-6・TASK-172 F5.2b.2（#1641）: SET_BACKEND_REQ_FD・GET_SHMEM_CONFIG ----
+
+fn shmem_one(size: u64) -> ShmemConfig {
+    ShmemConfig::new(&[ShmemRegion { id: 1, size }]).unwrap()
+}
+
+/// 21・44 の要求はペイロードなしの 12 バイト。ペイロード付きは LENGTH_MISMATCH。
+#[test]
+fn f5_2b_2_gpu6_new_requests_are_header_only() {
+    assert_eq!(
+        Request::SetBackendReqFd.encode(false).unwrap().as_bytes(),
+        &[21, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]
+    );
+    assert_eq!(
+        Request::GetShmemConfig.encode(false).unwrap().as_bytes(),
+        &[44, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]
+    );
+    for id in [21u32, 44] {
+        assert_eq!(
+            code_of(decode_request(&msg(id, 1, &[0u8; 8]))),
+            "LENGTH_MISMATCH"
+        );
+    }
+}
+
+/// 応答は総長 2068（ヘッダ 12 + 2056）。nregions = 1・padding = 0・sizes[1] のみ非 0。
+#[test]
+fn f5_2b_2_gpu6_shmem_config_reply_bytes() {
+    let m = Reply::ShmemConfig(shmem_one(0x0800_0000)).encode().unwrap();
+    let b = m.as_bytes();
+    assert_eq!(b.len(), 2068);
+    assert_eq!(b[..12], [44, 0, 0, 0, 5, 0, 0, 0, 8, 8, 0, 0]);
+    assert_eq!(b[12..16], 1u32.to_le_bytes());
+    assert_eq!(b[16..20], 0u32.to_le_bytes());
+    assert_eq!(b[20..28], 0u64.to_le_bytes());
+    assert_eq!(b[28..36], 0x0800_0000u64.to_le_bytes());
+    assert!(b[36..].iter().all(|x| *x == 0));
+    let r = decode_reply(b, RequestCode::GetShmemConfig).unwrap();
+    assert_eq!(r, Reply::ShmemConfig(shmem_one(0x0800_0000)));
+    assert_eq!(r.code(), RequestCode::GetShmemConfig);
+}
+
+/// 組み立ての拒否: 大きさ 0・ページの倍数でない・id 重複・257 件はいずれも INVALID_VALUE（request = 44）。
+#[test]
+fn f5_2b_2_gpu6_shmem_config_new_rejects_bad_regions() {
+    let r = |id, size| ShmemRegion { id, size };
+    let bad = [
+        vec![r(1, 0)],
+        vec![r(1, 4095)],
+        vec![r(1, 4097)],
+        vec![r(1, 4096), r(1, 8192)],
+    ];
+    for regions in bad {
+        let e = ShmemConfig::new(&regions).unwrap_err();
+        assert_eq!(
+            (e.code.as_str(), e.request),
+            ("INVALID_VALUE", Some(44)),
+            "{regions:?}"
+        );
+    }
+    let many: Vec<ShmemRegion> = (0..257).map(|_| r(0, 4096)).collect();
+    assert_eq!(
+        ShmemConfig::new(&many).unwrap_err().code,
+        CodecErrorCode::InvalidValue
+    );
+    // 空は nregions = 0、最大 id 255 は受理する。
+    assert_eq!(ShmemConfig::new(&[]).unwrap().nregions(), 0);
+    let top = ShmemConfig::new(&[r(255, 4096)]).unwrap();
+    assert_eq!((top.nregions(), top.size(255)), (1, 4096));
+}
+
+/// frontend 役の復号の拒否: 長さ違いは LENGTH_MISMATCH、padding・nregions の食い違いは INVALID_VALUE。
+#[test]
+fn f5_2b_2_gpu6_shmem_config_reply_decode_rejects_inconsistent_payload() {
+    let good = Reply::ShmemConfig(shmem_one(0x0800_0000)).encode().unwrap();
+    let good = good.as_bytes().to_vec();
+    // 2055 バイトは ShmemConfig の期待長（2056）に満たず LENGTH_MISMATCH、2057 バイトは応答の上限超過。
+    for (size, want) in [(2055u32, "LENGTH_MISMATCH"), (2057, "PAYLOAD_TOO_LARGE")] {
+        let mut b = good.clone();
+        b.resize(12 + size as usize, 0);
+        b[8..12].copy_from_slice(&size.to_le_bytes());
+        assert_eq!(
+            reply_code(decode_reply(&b, RequestCode::GetShmemConfig)),
+            want,
+            "size={size}"
+        );
+    }
+    let mutate = |f: &dyn Fn(&mut Vec<u8>)| {
+        let mut b = good.clone();
+        f(&mut b);
+        reply_code(decode_reply(&b, RequestCode::GetShmemConfig))
+    };
+    // padding != 0。
+    assert_eq!(mutate(&|b| b[16] = 1), "INVALID_VALUE");
+    // nregions = 2 だが非 0 は 1 個。
+    assert_eq!(mutate(&|b| b[12] = 2), "INVALID_VALUE");
+    // nregions = 1 だが非 0 が 2 個。
+    assert_eq!(
+        mutate(&|b| b[36..44].copy_from_slice(&4096u64.to_le_bytes())),
+        "INVALID_VALUE"
+    );
+    // ページの倍数でない非 0。
+    assert_eq!(
+        mutate(&|b| b[28..36].copy_from_slice(&4097u64.to_le_bytes())),
+        "INVALID_VALUE"
+    );
+}
+
+/// 上限は向きごと: 要求は 1032 のまま（1033 と 2056 の要求は PAYLOAD_TOO_LARGE）、応答は 2056 まで。
+#[test]
+fn f5_2b_2_gpu6_payload_limits_are_per_direction() {
+    assert_eq!(MAX_PAYLOAD_LEN, 1032);
+    assert_eq!(MAX_REPLY_PAYLOAD_LEN, 2056);
+    assert_eq!(MAX_ENCODED_LEN, 2068);
+    assert_eq!(
+        Header::new(RequestCode::SetMemTable, false, false, 1033)
+            .unwrap_err()
+            .code,
+        CodecErrorCode::PayloadTooLarge
+    );
+    assert!(Header::new(RequestCode::GetShmemConfig, true, false, 2056).is_ok());
+    assert_eq!(
+        Header::new(RequestCode::GetShmemConfig, true, false, 2057)
+            .unwrap_err()
+            .code,
+        CodecErrorCode::PayloadTooLarge
+    );
+    // 受信側: 要求の向きでは 2056 を受け付けない（受信の上限を広げていない）。
+    assert_eq!(
+        code_of(decode_request(&hdr(44, 1, 2056))),
+        "PAYLOAD_TOO_LARGE"
+    );
+    assert_eq!(
+        Header::decode_request(&hdr(5, 1, 1033)).unwrap_err().code,
+        CodecErrorCode::PayloadTooLarge
+    );
+}
+
+/// 44 は応答本体を持つので ack を作れない。21 は持たない。
+#[test]
+fn f5_2b_2_gpu6_get_shmem_config_has_reply_body() {
+    assert!(RequestCode::GetShmemConfig.has_reply_body());
+    assert!(!RequestCode::SetBackendReqFd.has_reply_body());
+    assert_eq!(
+        Ack::success(RequestCode::GetShmemConfig).unwrap_err().code,
+        CodecErrorCode::InvalidValue
+    );
+    assert!(Ack::success(RequestCode::SetBackendReqFd).is_ok());
 }

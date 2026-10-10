@@ -414,7 +414,7 @@ mod linux {
         send(f, &Request::GetProtocolFeatures, &[]);
         assert_eq!(
             recv_reply(f, RequestCode::GetProtocolFeatures),
-            Reply::ProtocolFeatures(0x209)
+            Reply::ProtocolFeatures(0x0040_0229)
         );
         send(f, &Request::SetProtocolFeatures(proto), &[]);
     }
@@ -437,7 +437,7 @@ mod linux {
         send(&front, &Request::GetProtocolFeatures, &[]);
         assert_eq!(
             recv_reply(&front, RequestCode::GetProtocolFeatures),
-            Reply::ProtocolFeatures(0x209)
+            Reply::ProtocolFeatures(0x0040_0229)
         );
         send_need_reply(&front, &Request::SetProtocolFeatures(0x209), &[]);
         assert_eq!(recv_raw(&front, 20), ack_bytes(16, 0));
@@ -595,5 +595,271 @@ mod linux {
             !lines.iter().any(|l| l.contains("need_reply_ack")),
             "log: {lines:?}"
         );
+    }
+
+    // ---- GPU-6・TASK-172 F5.2b.2（#1641）: SHMEM・BACKEND_REQ の広告と GET_SHMEM_CONFIG・SET_BACKEND_REQ_FD ----
+
+    /// SHMEM・BACKEND_REQ・MQ・CONFIG を確定する（REPLY_ACK なし。0x0040_0221）。
+    const PROTO_SHM_BREQ: u64 = 0x0040_0221;
+
+    fn session_error_line(code: &str, request: u32) -> String {
+        format!("venus_jig event=session_error code={code} request={request}")
+    }
+
+    fn count_line(lines: &[String], want: &str) -> usize {
+        lines.iter().filter(|l| l.as_str() == want).count()
+    }
+
+    /// 偽 frontend が backend の切断を観測する（読み出しが 0 バイト = EOF になる）。
+    fn assert_eof(f: &UnixStream) {
+        let mut b = [0u8; 1];
+        let r = recv_with_fds(f, &mut b, 0, T).expect_err("closed");
+        assert_eq!(r.code, TransportErrorCode::PeerClosed);
+    }
+
+    /// 44 の応答: nregions = 1・sizes[1] = 128 MiB・ほかは 0。生バイトでも 2056 バイトの配置を照合する。
+    #[test]
+    fn f5_2b_2_gpu6_get_shmem_config_returns_one_host_visible_region() {
+        let (front, backend) = pair(limits(5000, 5000));
+        confirm_protocol(&front, 0x0040_0201);
+        send(&front, &Request::GetShmemConfig, &[]);
+        let raw = recv_raw(&front, 12 + 2056);
+        assert_eq!(raw[..12], [44, 0, 0, 0, 5, 0, 0, 0, 8, 8, 0, 0]);
+        assert_eq!(raw[12..16], 1u32.to_le_bytes());
+        assert_eq!(raw[16..20], 0u32.to_le_bytes());
+        for id in 0..256usize {
+            let off = 20 + id * 8;
+            let want: u64 = if id == 1 { 0x0800_0000 } else { 0 };
+            assert_eq!(raw[off..off + 8], want.to_le_bytes(), "sizes[{id}]");
+        }
+        // 型でも復号できる。
+        send(&front, &Request::GetShmemConfig, &[]);
+        let Reply::ShmemConfig(cfg) = recv_reply(&front, RequestCode::GetShmemConfig) else {
+            panic!("shmem config reply expected");
+        };
+        assert_eq!(cfg.nregions(), 1);
+        assert_eq!(cfg.size(1), 134_217_728);
+        assert_eq!(cfg.sizes().iter().filter(|s| **s != 0).count(), 1);
+        drop(front);
+        let (end, lines) = backend.join().expect("join");
+        assert_eq!(end, Ok(SessionEnd::PeerClosed));
+        // 2 回答えたので 2 行（何度来ても同じ値）。
+        let want = "venus_jig event=shmem_config request=44 nregions=1 shmid=1 size=134217728";
+        assert_eq!(count_line(&lines, want), 2, "log: {lines:?}");
+        // 21 が来ていない SHMEM だけの確定は、理由つきで使えないと記録される。
+        let want = "venus_jig event=host_visible status=backend_req_not_negotiated";
+        assert_eq!(count_line(&lines, want), 1, "log: {lines:?}");
+    }
+
+    /// 拒否 4 系統の 1: SHMEM を確定していない 44 は OUT_OF_ORDER（request = 44）。
+    #[test]
+    fn f5_2b_2_gpu6_get_shmem_config_without_shmem_is_out_of_order() {
+        let (front, backend) = pair(limits(5000, 5000));
+        confirm_protocol(&front, 0x201);
+        send(&front, &Request::GetShmemConfig, &[]);
+        assert_eof(&front);
+        let (end, lines) = backend.join().expect("join");
+        let e = end.expect_err("must fail");
+        assert_eq!(
+            (e.code, e.request),
+            (SessionErrorCode::OutOfOrder, Some(44))
+        );
+        assert_eq!(
+            count_line(&lines, &session_error_line("OUT_OF_ORDER", 44)),
+            1,
+            "log: {lines:?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains("event=shmem_config")));
+    }
+
+    /// 拒否 4 系統の 2: BACKEND_REQ を確定していない 21 は OUT_OF_ORDER（request = 21）。fd は閉じられる。
+    #[test]
+    fn f5_2b_2_gpu6_set_backend_req_fd_without_backend_req_is_out_of_order() {
+        let (front, backend) = pair(limits(5000, 5000));
+        confirm_protocol(&front, 0x201);
+        let (_keep, give) = UnixStream::pair().expect("pair");
+        send(&front, &Request::SetBackendReqFd, &[give.as_fd()]);
+        assert_eof(&front);
+        let (end, lines) = backend.join().expect("join");
+        let e = end.expect_err("must fail");
+        assert_eq!(
+            (e.code, e.request),
+            (SessionErrorCode::OutOfOrder, Some(21))
+        );
+        assert_eq!(
+            count_line(&lines, &session_error_line("OUT_OF_ORDER", 21)),
+            1,
+            "log: {lines:?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains("event=backend_req")));
+    }
+
+    /// 拒否 4 系統の 3: 21 の fd が 0 本・2 本なら FD_COUNT_MISMATCH（読み取り段階の拒否で ack は無い）。
+    #[test]
+    fn f5_2b_2_gpu6_set_backend_req_fd_requires_exactly_one_fd() {
+        let (a, _a_keep) = UnixStream::pair().expect("pair");
+        let (b, _b_keep) = UnixStream::pair().expect("pair");
+        let cases: [Vec<std::os::fd::BorrowedFd<'_>>; 2] = [vec![], vec![a.as_fd(), b.as_fd()]];
+        for fds in &cases {
+            let (front, backend) = pair(limits(5000, 5000));
+            confirm_protocol(&front, PROTO_SHM_BREQ);
+            send_need_reply(&front, &Request::SetBackendReqFd, fds);
+            assert_eof(&front);
+            let (end, lines) = backend.join().expect("join");
+            let e = end.expect_err("must fail");
+            assert_eq!(
+                (e.code, e.request),
+                (SessionErrorCode::FdCountMismatch, Some(21)),
+                "fds={}",
+                fds.len()
+            );
+            assert_eq!(
+                count_line(&lines, &session_error_line("FD_COUNT_MISMATCH", 21)),
+                1,
+                "log: {lines:?}"
+            );
+        }
+    }
+
+    /// 拒否 4 系統の 4: socket でない fd（memfd）と AF_UNIX でない socket（UDP）は INVALID_BACKEND_REQ_FD。
+    /// REPLY_ACK 確定 + NEED_REPLY なら、失敗 ack（値 1）を返してから終わる。
+    #[test]
+    fn f5_2b_2_gpu6_set_backend_req_fd_rejects_non_unix_socket() {
+        let mem = memfd(&unique_name("breq"), 4096);
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp");
+        let cases = [(mem.as_fd(), "memfd"), (udp.as_fd(), "udp")];
+        for (fd, what) in cases {
+            let (front, backend) = pair(limits(5000, 5000));
+            confirm_protocol(&front, PROTO_SHM_BREQ | 0x8);
+            send_need_reply(&front, &Request::SetBackendReqFd, &[fd]);
+            assert_eq!(recv_raw(&front, 20), ack_bytes(21, 1), "{what}");
+            assert_eof(&front);
+            let (end, lines) = backend.join().expect("join");
+            let e = end.expect_err("must fail");
+            assert_eq!(
+                (e.code, e.request),
+                (SessionErrorCode::InvalidBackendReqFd, Some(21)),
+                "{what}"
+            );
+            assert_eq!(e.code.as_str(), "INVALID_BACKEND_REQ_FD");
+            assert_eq!(
+                count_line(&lines, &session_error_line("INVALID_BACKEND_REQ_FD", 21)),
+                1,
+                "log: {lines:?}"
+            );
+            assert!(!lines.iter().any(|l| l.contains("event=backend_req")));
+        }
+    }
+
+    /// 21 で受けた UDS はセッションの間は保持され、正常終了で閉じられる（frontend 側が EOF を観測する）。
+    #[test]
+    fn f5_2b_2_gpu6_backend_req_fd_is_kept_and_closed_on_normal_end() {
+        let (front, backend) = pair(limits(5000, 5000));
+        confirm_protocol(&front, 0x0040_0229);
+        let (keep, give) = UnixStream::pair().expect("pair");
+        send(&front, &Request::SetBackendReqFd, &[give.as_fd()]);
+        // 手元の複製を閉じる。閉じないと backend が閉じても EOF にならない。
+        drop(give);
+        send(&front, &Request::GetShmemConfig, &[]);
+        let Reply::ShmemConfig(_) = recv_reply(&front, RequestCode::GetShmemConfig) else {
+            panic!("shmem config reply expected");
+        };
+        // 生存中は EOF にならない（期限内にデータも来ない）。
+        keep.set_read_timeout(Some(Duration::from_millis(150)))
+            .expect("timeout");
+        let mut b = [0u8; 1];
+        let err = std::io::Read::read(&mut &keep, &mut b).expect_err("must not be EOF");
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "{err:?}"
+        );
+        drop(front);
+        let (end, lines) = backend.join().expect("join");
+        assert_eq!(end, Ok(SessionEnd::PeerClosed));
+        keep.set_read_timeout(Some(T)).expect("timeout");
+        assert_eq!(std::io::Read::read(&mut &keep, &mut b).expect("eof"), 0);
+        let want = "venus_jig event=backend_req request=21 result=accepted";
+        assert_eq!(count_line(&lines, want), 1, "log: {lines:?}");
+        let want = "venus_jig event=host_visible status=ready";
+        assert_eq!(count_line(&lines, want), 1, "log: {lines:?}");
+        // fd 番号を含む行は無い。
+        assert!(!lines.iter().any(|l| l.contains("fd=")), "log: {lines:?}");
+    }
+
+    /// エラー終了でも保持した UDS は閉じられる。21 の 2 回目は OUT_OF_ORDER。
+    #[test]
+    fn f5_2b_2_gpu6_backend_req_fd_is_closed_on_error_end_and_second_is_rejected() {
+        let (front, backend) = pair(limits(5000, 5000));
+        confirm_protocol(&front, PROTO_SHM_BREQ);
+        let (keep, give) = UnixStream::pair().expect("pair");
+        send(&front, &Request::SetBackendReqFd, &[give.as_fd()]);
+        drop(give);
+        let (_keep2, give2) = UnixStream::pair().expect("pair");
+        send(&front, &Request::SetBackendReqFd, &[give2.as_fd()]);
+        assert_eof(&front);
+        let (end, lines) = backend.join().expect("join");
+        let e = end.expect_err("must fail");
+        assert_eq!(
+            (e.code, e.request),
+            (SessionErrorCode::OutOfOrder, Some(21))
+        );
+        let mut b = [0u8; 1];
+        assert_eq!(std::io::Read::read(&mut &keep, &mut b).expect("eof"), 0);
+        // 1 回目の受理は記録され、SHMEM に答えていない確定は理由つきで残る。
+        let want = "venus_jig event=backend_req request=21 result=accepted";
+        assert_eq!(count_line(&lines, want), 1, "log: {lines:?}");
+        let want = "venus_jig event=host_visible status=config_not_queried";
+        assert_eq!(count_line(&lines, want), 1, "log: {lines:?}");
+    }
+
+    /// NEED_REPLY との組み合わせ: 21 には ack 0、44 には 2056 バイトの応答だけ（追加の ack は無い）。
+    #[test]
+    fn f5_2b_2_gpu6_need_reply_with_backend_req_fd_and_shmem_config() {
+        let (front, backend) = pair(limits(5000, 5000));
+        confirm_protocol(&front, 0x0040_0229);
+        let (_keep, give) = UnixStream::pair().expect("pair");
+        send_need_reply(&front, &Request::SetBackendReqFd, &[give.as_fd()]);
+        assert_eq!(recv_raw(&front, 20), ack_bytes(21, 0));
+        send_need_reply(&front, &Request::GetShmemConfig, &[]);
+        let raw = recv_raw(&front, 12 + 2056);
+        assert_eq!(raw[..4], 44u32.to_le_bytes());
+        // 直後の要求の応答が先頭に来る = 44 の後に ack が挟まっていない。
+        send(&front, &Request::GetQueueNum, &[]);
+        assert_eq!(
+            recv_reply(&front, RequestCode::GetQueueNum),
+            Reply::QueueNum(2)
+        );
+        drop(front);
+        let (end, lines) = backend.join().expect("join");
+        assert_eq!(end, Ok(SessionEnd::PeerClosed));
+        let want = "venus_jig event=need_reply_ack request=21 result=ok";
+        assert_eq!(count_line(&lines, want), 1, "log: {lines:?}");
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("need_reply_ack request=44")),
+            "log: {lines:?}"
+        );
+    }
+
+    /// 21 を送らないセッションの終了時の状態行（SHMEM 未確定は shmem_not_negotiated、SHMEM を確定して 44 を待つだけなら config_not_queried）。
+    #[test]
+    fn f5_2b_2_gpu6_host_visible_status_line_at_end() {
+        let cases = [
+            (0x201u64, "shmem_not_negotiated"),
+            (PROTO_SHM_BREQ, "config_not_queried"),
+        ];
+        for (proto, status) in cases {
+            let (front, backend) = pair(limits(5000, 5000));
+            confirm_protocol(&front, proto);
+            drop(front);
+            let (end, lines) = backend.join().expect("join");
+            assert_eq!(end, Ok(SessionEnd::PeerClosed));
+            let want = format!("venus_jig event=host_visible status={status}");
+            assert_eq!(count_line(&lines, &want), 1, "log: {lines:?}");
+        }
     }
 }

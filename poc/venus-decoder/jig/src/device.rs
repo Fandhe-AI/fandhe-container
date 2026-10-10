@@ -17,6 +17,18 @@ pub const F_VERSION_1: u32 = 32;
 pub const FEATURES: u64 =
     (1 << F_VIRGL) | (1 << F_RESOURCE_BLOB) | (1 << F_CONTEXT_INIT) | (1 << F_VERSION_1);
 
+/// `VIRTIO_GPU_SHM_ID_HOST_VISIBLE`（Linux v6.12 の uapi `virtio_gpu.h`）。ゲストカーネルはこの shmid の共有メモリ領域が
+/// あるときだけ `has_host_visible` を立て、Mesa venus はそれが無いと capset 取得前に中止する（GPU-6・TASK-172 F5.2b.2・#1641）。
+pub const SHM_ID_HOST_VISIBLE: u8 = 1;
+
+/// host-visible 領域として `GET_SHMEM_CONFIG` で返す大きさ（128 MiB）。資源表の合計上限（64 MiB）の 2 倍にするのは、ゲストの
+/// 割り当てが連続領域の断片化で上限内でも失敗しないための余裕。2 の冪なので crosvm の BAR 切り上げで余りが出ず、4・16・64 KiB の
+/// どのページの倍数でもある。crosvm が予約するのはアドレス空間で、実メモリは `SHMEM_MAP` した分だけ消費される。
+pub const HOST_VISIBLE_SHM_SIZE: u64 = 128 * 1024 * 1024;
+const _: () = assert!(HOST_VISIBLE_SHM_SIZE >= crate::resource::MAX_TOTAL_RESOURCE_SIZE);
+const _: () = assert!(HOST_VISIBLE_SHM_SIZE.is_multiple_of(crate::resource::RESOURCE_SIZE_ALIGN));
+const _: () = assert!(HOST_VISIBLE_SHM_SIZE.is_power_of_two());
+
 /// 広告する capset の個数（`virtio_gpu_config.num_capsets`。VENUS のみ）。
 pub const NUM_CAPSETS: u32 = 1;
 

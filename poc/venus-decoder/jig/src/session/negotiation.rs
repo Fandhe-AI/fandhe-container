@@ -5,17 +5,26 @@
 //! `GET_PROTOCOL_FEATURES` の位置が違うため。根拠は `docs/design/venus-decoder-poc.md` 10.8）。違反は `OUT_OF_ORDER`。
 //! ring は [`Ring::Setup`]（設定中）と [`Ring::Running`]（ADDR・KICK・CALL・ENABLE がそろった）の enum で表し、
 //! 「実行中なのに設定が欠けている」状態を型として作れないようにする。
-//! 未実装（REPAIR-3）: `SET_CONFIG`・`VRING_NOFD`（polling）・inflight・cursorq（ring 1）の要求処理。
+//! 共有メモリ（host-visible。GPU-6・TASK-172 F5.2b.2・#1641）: protocol feature の SHMEM を確定した接続だけ `GET_SHMEM_CONFIG` に
+//! 応じ（shmid 1 を 1 個、`device::HOST_VISIBLE_SHM_SIZE`）、BACKEND_REQ を確定した接続だけ `SET_BACKEND_REQ_FD` の UDS を 1 回保持する。
+//! 保持した fd は [`State`] の drop（セッションの終了。正常もエラーも）で閉じる。確定の食い違いは [`State::host_visible`] が理由つきで表し、
+//! 拒否はしない（寛容。`MAP_BLOB` の ERR 化は #1643、`SHMEM_MAP` の送信は #1642）。
+//! 未実装（REPAIR-3）: `SET_CONFIG`・`VRING_NOFD`（polling）・inflight・cursorq（ring 1）の要求処理、
+//! `SET_BACKEND_REQ_FD` の fd が SOCK_STREAM かの検査（`getsockopt(SO_TYPE)` は `sys` の承認範囲外の unsafe になる。種類違いは #1642 の
+//! 期限つき送受信で失敗する）。
 
 use std::fs::File;
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::net::UnixStream;
 
 use super::error::{SessionError, SessionErrorCode};
 use crate::device;
 use crate::vhost_user::guest_memory::GuestMemory;
 use crate::vhost_user::{
-    ConfigPayload, F_PROTOCOL_FEATURES, PROTOCOL_F_CONFIG, PROTOCOL_F_MQ, PROTOCOL_F_REPLY_ACK,
-    Reply, Request, RequestCode, VringAddr, VringState,
+    ConfigPayload, F_PROTOCOL_FEATURES, PROTOCOL_F_BACKEND_REQ, PROTOCOL_F_CONFIG, PROTOCOL_F_MQ,
+    PROTOCOL_F_REPLY_ACK, PROTOCOL_F_SHMEM, Reply, Request, RequestCode, ShmemConfig, ShmemRegion,
+    VringAddr, VringState,
 };
 use crate::virtqueue::{MAX_QUEUE_SIZE, QueueConfig, SplitQueue};
 
@@ -25,15 +34,20 @@ pub(crate) const OFFERED_FEATURES: u64 = device::FEATURES | F_PROTOCOL_FEATURES;
 /// bit 30 が無いと `SET_VRING_ENABLE` の意味が変わるため、広告した全ビットを必須にして fail-closed にする。
 pub(crate) const REQUIRED_FEATURES: u64 = OFFERED_FEATURES;
 /// `GET_PROTOCOL_FEATURES` で広告する値。
-pub(crate) const OFFERED_PROTOCOL: u64 = PROTOCOL_F_MQ | PROTOCOL_F_REPLY_ACK | PROTOCOL_F_CONFIG;
+pub(crate) const OFFERED_PROTOCOL: u64 = PROTOCOL_F_MQ
+    | PROTOCOL_F_REPLY_ACK
+    | PROTOCOL_F_BACKEND_REQ
+    | PROTOCOL_F_CONFIG
+    | PROTOCOL_F_SHMEM;
 /// ring の本数（0 = controlq、1 = cursorq）。
 pub(crate) const NUM_RINGS: usize = 2;
 
-/// 要求に添付されるべき fd の個数（`SET_MEM_TABLE` は領域数、NOFD でない kick / call は 1、他は 0）。
+/// 要求に添付されるべき fd の個数（`SET_MEM_TABLE` は領域数、NOFD でない kick / call と `SET_BACKEND_REQ_FD` は 1、他は 0）。
 pub(crate) fn expected_fds(req: &Request) -> usize {
     match req {
         Request::SetMemTable(t) => t.regions().len(),
         Request::SetVringKick(f) | Request::SetVringCall(f) => usize::from(!f.no_fd),
+        Request::SetBackendReqFd => 1,
         _ => 0,
     }
 }
@@ -98,6 +112,74 @@ pub(crate) struct State {
     protocol: Option<u64>,
     mem: Option<GuestMemory>,
     rings: [Ring; NUM_RINGS],
+    /// `SET_BACKEND_REQ_FD` で受けた backend 要求用の UDS（接続の間は保持し、`State` の drop で閉じる。送信は #1642）。
+    backend_req: Option<UnixStream>,
+    /// `GET_SHMEM_CONFIG` に答えたか（frontend が領域を知っているか）。
+    shmem_config_sent: bool,
+}
+
+/// host-visible 共有メモリが使える状態か（確定の食い違いの理由つき。GPU-6・TASK-172 F5.2b.2・#1641）。
+///
+/// 真偽値にしないのは、使えない理由をログで #725 の実機確認に渡し、#1643 が `MAP_BLOB` の拒否を理由別に扱えるようにするため。
+/// 判定はこの順で、毎回その時点の確定値から求める。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostVisible {
+    /// SHMEM・BACKEND_REQ を確定し、領域の大きさを答え、backend 要求用ソケットを保持している。
+    Ready,
+    /// 使えない。
+    Unavailable(HostVisibleUnavailable),
+}
+
+/// [`HostVisible::Unavailable`] の理由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostVisibleUnavailable {
+    /// SHMEM を確定していない。
+    ShmemNotNegotiated,
+    /// `GET_SHMEM_CONFIG` にまだ答えていない（frontend は領域を知らない）。
+    ConfigNotQueried,
+    /// SHMEM は確定したが BACKEND_REQ を確定していない。
+    BackendReqNotNegotiated,
+    /// BACKEND_REQ は確定したが `SET_BACKEND_REQ_FD` が来ていない。
+    BackendChannelMissing,
+}
+
+impl HostVisible {
+    /// ログに出す固定語彙。
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Unavailable(HostVisibleUnavailable::ShmemNotNegotiated) => "shmem_not_negotiated",
+            Self::Unavailable(HostVisibleUnavailable::ConfigNotQueried) => "config_not_queried",
+            Self::Unavailable(HostVisibleUnavailable::BackendReqNotNegotiated) => {
+                "backend_req_not_negotiated"
+            }
+            Self::Unavailable(HostVisibleUnavailable::BackendChannelMissing) => {
+                "backend_channel_missing"
+            }
+        }
+    }
+}
+
+/// `GET_SHMEM_CONFIG` の応答（shmid 1 を 1 個、大きさは `device::HOST_VISIBLE_SHM_SIZE`）。
+fn host_visible_config() -> Result<ShmemConfig, SessionError> {
+    ShmemConfig::new(&[ShmemRegion {
+        id: device::SHM_ID_HOST_VISIBLE,
+        size: device::HOST_VISIBLE_SHM_SIZE,
+    }])
+    .map_err(SessionError::from)
+}
+
+/// `SET_BACKEND_REQ_FD` の fd を、ソケットかつ AF_UNIX と確かめて `UnixStream` にする。種類違い（memfd・pipe・TCP / UDP）は
+/// `INVALID_BACKEND_REQ_FD`。std の safe API だけで確かめる（`fstat` と `getsockname`。std の `SocketAddr` は AF_UNIX 以外を拒否する）。
+fn backend_req_stream(fd: OwnedFd, code: RequestCode) -> Result<UnixStream, SessionError> {
+    let bad = || fail(SessionErrorCode::InvalidBackendReqFd, code);
+    let file = File::from(fd);
+    if !file.metadata().map_err(|_| bad())?.file_type().is_socket() {
+        return Err(bad());
+    }
+    let stream = UnixStream::from(OwnedFd::from(file));
+    stream.local_addr().map_err(|_| bad())?;
+    Ok(stream)
 }
 
 fn ooo(code: RequestCode) -> SessionError {
@@ -126,6 +208,23 @@ impl State {
     /// で、失敗した `SET_PROTOCOL_FEATURES` は状態を変えないので直前の確定値で判定される。
     pub(crate) fn reply_ack(&self) -> bool {
         self.protocol.is_some_and(|p| p & PROTOCOL_F_REPLY_ACK != 0)
+    }
+
+    /// host-visible 共有メモリが使える状態か。ログ（セッション終了時）と #1643 の `MAP_BLOB` 判定の入口。
+    pub(crate) fn host_visible(&self) -> HostVisible {
+        let negotiated = |bit: u64| self.protocol.is_some_and(|p| p & bit != 0);
+        let reason = if !negotiated(PROTOCOL_F_SHMEM) {
+            HostVisibleUnavailable::ShmemNotNegotiated
+        } else if !self.shmem_config_sent {
+            HostVisibleUnavailable::ConfigNotQueried
+        } else if !negotiated(PROTOCOL_F_BACKEND_REQ) {
+            HostVisibleUnavailable::BackendReqNotNegotiated
+        } else if self.backend_req.is_none() {
+            HostVisibleUnavailable::BackendChannelMissing
+        } else {
+            return HostVisible::Ready;
+        };
+        HostVisible::Unavailable(reason)
     }
 
     fn any_running(&self) -> bool {
@@ -249,6 +348,32 @@ impl State {
                 Ok(Some(config_reply(&c)?))
             }
             Request::SetConfig(_) => Err(fail(SessionErrorCode::UnsupportedRequest, code)),
+            Request::GetShmemConfig => {
+                if self.protocol.is_none_or(|p| p & PROTOCOL_F_SHMEM == 0) {
+                    return Err(ooo(code));
+                }
+                self.shmem_config_sent = true;
+                Ok(Some(Reply::ShmemConfig(host_visible_config()?)))
+            }
+            Request::SetBackendReqFd => {
+                // features の bit 30 や owner は要求しない（crosvm は SET_FEATURES より前に送る。ゲートは本当の依存だけ）。
+                if self
+                    .protocol
+                    .is_none_or(|p| p & PROTOCOL_F_BACKEND_REQ == 0)
+                {
+                    return Err(ooo(code));
+                }
+                // 2 回目は拒否（fail-closed）。置き換えを許すと #1642 で送信中の要求と応答がずれうる。
+                if self.backend_req.is_some() {
+                    return Err(ooo(code));
+                }
+                let mut it = fds.into_iter();
+                let (Some(fd), None) = (it.next(), it.next()) else {
+                    return Err(fail(SessionErrorCode::FdCountMismatch, code));
+                };
+                self.backend_req = Some(backend_req_stream(fd, code)?);
+                Ok(None)
+            }
             Request::SetFeatures(v) => {
                 if !self.owner || self.any_running() {
                     return Err(ooo(code));

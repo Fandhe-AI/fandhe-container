@@ -17,6 +17,10 @@
 //! 出典（確認日 2026-10-09。値＝要求 ID・ビット値・フィールド配置のみ転記し、コードは流用していない。crosvm の
 //! `vmm_vhost` は rust-vmm の `vhost` 由来の系統のため構造体定義やロジックは写さない。MVM-4）:
 //! - QEMU `docs/interop/vhost-user.rst` タグ `v10.1.0`（SHA-256 `1c06e32a3306172499767170b0b64ce8de4a8a90cbe543a00cc1b3861ae5bccd`）
+//! - QEMU `docs/interop/vhost-user.rst` タグ `v11.1.0`（SHA-256 `6350c5fe2425be9028519050d164cbee7d277fa199959efe48e5ec859b74d787`。
+//!   protocol feature SHMEM〔bit 22。同タグでの名前は `SHMEM_MAP`〕・`GET_SHMEM_CONFIG`・`SET_BACKEND_REQ_FD`。
+//!   v11.0.x 以前の rst には SHMEM が無く、`v11.1.0-rc0` で入った）と master（コミット `615ece3c406b262996e569f29ea6eed0d81c4d8d`、
+//!   SHA-256 `684b11b15330ee23f2922aab9abd116efa1f48eb15b1b02b0233418e1a224257`。名前は `SHMEM`、ビットは同じ 22）
 //! - crosvm コミット `044c3e3fc53d` の `third_party/vmm_vhost/src/message.rs`
 //!   （`df6c31711167fe3b94080db4655826bb834cd2e9ac085915ce448652b8ab3495`）・`backend_client.rs`
 //!   （`709fe08830a38c5e15a00c0c5af47ef7dabf19a784c0694abf8c10d335dec7c2`）・
@@ -45,18 +49,31 @@ mod tests;
 
 pub use error::{CodecError, CodecErrorCode};
 pub use message::{
-    Ack, ConfigPayload, Decoded, MemRegion, MemTable, Reply, Request, VringAddr, VringFd,
-    VringState, decode_reply, decode_request, decode_request_payload,
+    Ack, ConfigPayload, Decoded, MemRegion, MemTable, Reply, Request, ShmemConfig, ShmemRegion,
+    VringAddr, VringFd, VringState, decode_reply, decode_request, decode_request_payload,
 };
 #[cfg(target_os = "linux")]
 pub use transport_error::{TransportError, TransportErrorCode};
 
 /// ヘッダ長（request・flags・size の各 u32）。
 pub const HEADER_LEN: usize = 12;
-/// 1 メッセージのペイロード長の上限。最大の形は `SET_MEM_TABLE`（8 + 32 領域 × 32 バイト）。
+/// 受信する要求のペイロード長の上限。最大の形は `SET_MEM_TABLE`（8 + 32 領域 × 32 バイト）。
+/// 応答の送信側の上限は [`MAX_REPLY_PAYLOAD_LEN`]（`GET_SHMEM_CONFIG` の 2056 バイトを送るため要求より大きい）。
 pub const MAX_PAYLOAD_LEN: usize = 8 + MAX_MEM_REGIONS * MEM_REGION_LEN;
-/// ヘッダを含む 1 メッセージの最大長。
+/// ヘッダを含む 1 要求の最大長（受信側）。
 pub const MAX_MSG_LEN: usize = HEADER_LEN + MAX_PAYLOAD_LEN;
+/// `GET_SHMEM_CONFIG` の応答が持つ領域 id の数（`sizes` の要素数。QEMU rst の 256）。
+pub const MAX_SHMEM_REGIONS: usize = 256;
+/// `GET_SHMEM_CONFIG` の応答ペイロード長（`nregions` u32 + padding u32 + `sizes` [u64; 256]）。
+pub const SHMEM_CONFIG_LEN: usize = 8 + MAX_SHMEM_REGIONS * 8;
+/// 共有メモリ領域の大きさが満たすページ境界。mmap(2) のページの倍数が rst の要件で、4 KiB の倍数は
+/// 4 KiB・16 KiB・64 KiB ページのいずれのホストでも満たす最小の公約として、治具が採る下限。
+pub const SHMEM_PAGE_ALIGN: u64 = 4096;
+/// 応答（backend から frontend）のペイロード長の上限。受信の上限は変えず、送信と偽 frontend の復号だけ広げる。
+pub const MAX_REPLY_PAYLOAD_LEN: usize = SHMEM_CONFIG_LEN;
+/// ヘッダを含む符号化済みメッセージの最大長（要求・応答の大きい方）。
+pub const MAX_ENCODED_LEN: usize = HEADER_LEN + MAX_REPLY_PAYLOAD_LEN;
+const _: () = assert!(MAX_REPLY_PAYLOAD_LEN >= MAX_PAYLOAD_LEN);
 /// `SET_MEM_TABLE` の領域数の上限。crosvm の上限（`MAX_ATTACHED_FD_ENTRIES`）に合わせる。QEMU の rst は 8 だが、
 /// crosvm の正当な要求を拒否しないよう大きい方に揃える。0 領域は拒否する。
 pub const MAX_MEM_REGIONS: usize = 32;
@@ -90,14 +107,20 @@ pub const PROTOCOL_F_MQ: u64 = 1 << 0;
 /// protocol feature の REPLY_ACK（bit 3）。確定すると、frontend が NEED_REPLY を立てた要求へ backend が応答する義務を負う
 /// （GPU-6・TASK-172 F5.2b.1・#1639。応答規則は `docs/design/venus-decoder-poc.md` 10.8）。
 pub const PROTOCOL_F_REPLY_ACK: u64 = 1 << 3;
+/// protocol feature の BACKEND_REQ（bit 5）。確定すると、frontend が backend 要求用のソケットを `SET_BACKEND_REQ_FD` で渡す
+/// （GPU-6・TASK-172 F5.2b.2・#1641。後続の `SHMEM_MAP` 送信は #1642）。
+pub const PROTOCOL_F_BACKEND_REQ: u64 = 1 << 5;
 /// protocol feature の CONFIG（bit 9）。virtio-gpu config の読み出しに要る。
 pub const PROTOCOL_F_CONFIG: u64 = 1 << 9;
+/// protocol feature の SHMEM（bit 22）。確定すると frontend が `GET_SHMEM_CONFIG` で共有メモリ領域の大きさを取得する。
+/// crosvm はこのビットが立つときだけ領域をゲストへ見せる（host-visible。GPU-6・TASK-172 F5.2b.2・#1641）。
+/// QEMU v11.1.0 の rst では `VHOST_USER_PROTOCOL_F_SHMEM_MAP`、master では `..._F_SHMEM` と名前が違うが、ビットは同じ。
+pub const PROTOCOL_F_SHMEM: u64 = 1 << 22;
 
-/// 治具が扱う最小の要求種別（16 種）。値は QEMU rst と crosvm で一致する要求 ID。
+/// 治具が扱う最小の要求種別（18 種）。値は QEMU rst と crosvm で一致する要求 ID。
 ///
-/// 前提: 治具は virtio feature の bit 30 を立て、protocol feature は MQ・REPLY_ACK・CONFIG だけを広告する。
-/// BACKEND_REQ・SHMEM・DEVICE_STATE・CONFIGURE_MEM_SLOTS は host-visible 共有メモリの方式（#1057）が
-/// 決まるまで後送りで、それらの要求は `UNKNOWN_REQUEST` で拒否する。
+/// 前提: 治具は virtio feature の bit 30 を立て、protocol feature は MQ・REPLY_ACK・BACKEND_REQ・CONFIG・SHMEM を広告する。
+/// DEVICE_STATE・CONFIGURE_MEM_SLOTS は後送りで、それらの要求は `UNKNOWN_REQUEST` で拒否する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum RequestCode {
@@ -133,6 +156,10 @@ pub enum RequestCode {
     GetConfig = 24,
     /// `SET_CONFIG`。
     SetConfig = 25,
+    /// `SET_BACKEND_REQ_FD`（ペイロードなし・fd 1 本。BACKEND_REQ 確定後）。
+    SetBackendReqFd = 21,
+    /// `GET_SHMEM_CONFIG`（要求ペイロードなし。応答は 2056 バイト。SHMEM 確定後）。
+    GetShmemConfig = 44,
 }
 
 impl RequestCode {
@@ -155,6 +182,8 @@ impl RequestCode {
             18 => Self::SetVringEnable,
             24 => Self::GetConfig,
             25 => Self::SetConfig,
+            21 => Self::SetBackendReqFd,
+            44 => Self::GetShmemConfig,
             _ => return None,
         })
     }
@@ -167,7 +196,7 @@ impl RequestCode {
     /// この要求がもともと明示的な応答本体を持つなら真（`GET_*`）。
     ///
     /// QEMU `docs/interop/vhost-user.rst`（v10.1.0）の Communication 節は応答を求める要求として `GET_FEATURES`・
-    /// `GET_PROTOCOL_FEATURES`・`GET_QUEUE_NUM`・`GET_VRING_BASE`・`GET_CONFIG` を挙げ、REPLY_ACK 節は「応答本体を持つ要求は
+    /// `GET_PROTOCOL_FEATURES`・`GET_QUEUE_NUM`・`GET_VRING_BASE`・`GET_CONFIG` を挙げ（`GET_SHMEM_CONFIG` も応答本体を持つ）、REPLY_ACK 節は「応答本体を持つ要求は
     /// NEED_REPLY があっても挙動が変わらない」とする。このため真の要求には追加の ack を返さず、既存の応答で兼ねる
     /// （GPU-6・TASK-172 F5.2b.1・#1639）。
     pub fn has_reply_body(self) -> bool {
@@ -178,6 +207,7 @@ impl RequestCode {
                 | Self::GetQueueNum
                 | Self::GetVringBase
                 | Self::GetConfig
+                | Self::GetShmemConfig
         )
     }
 }
@@ -221,7 +251,12 @@ impl Header {
         if flags & !FLAGS_DEFINED != 0 || bad_dir {
             return Err(CodecError::new(CodecErrorCode::InvalidFlags, req));
         }
-        if usize::try_from(size).map_or(true, |s| s > MAX_PAYLOAD_LEN) {
+        // 受信する要求の上限は変えない。応答の向きだけ `GET_SHMEM_CONFIG` を復号できる上限にする（偽 frontend 用）。
+        let limit = match dir {
+            Direction::Request => MAX_PAYLOAD_LEN,
+            Direction::Reply => MAX_REPLY_PAYLOAD_LEN,
+        };
+        if usize::try_from(size).map_or(true, |s| s > limit) {
             return Err(CodecError::new(CodecErrorCode::PayloadTooLarge, req));
         }
         let request = RequestCode::from_u32(raw_request)
@@ -257,10 +292,11 @@ impl Header {
         self.need_reply
     }
 
-    /// 後続ペイロードの長さ（`MAX_PAYLOAD_LEN` 以下であることは `decode` が保証する）。
+    /// 後続ペイロードの長さ（向きごとの上限〔要求は `MAX_PAYLOAD_LEN`・応答は `MAX_REPLY_PAYLOAD_LEN`〕以下であることは
+    /// `decode` / `new` が保証する）。
     pub fn payload_len(&self) -> usize {
-        // decode で MAX_PAYLOAD_LEN 以下と検証済みなので変換は失敗しない。
-        usize::try_from(self.size).unwrap_or(MAX_PAYLOAD_LEN)
+        // 上限以下と検証済みなので変換は失敗しない。
+        usize::try_from(self.size).unwrap_or(MAX_REPLY_PAYLOAD_LEN)
     }
 
     /// 12 バイトへ符号化する。
@@ -279,14 +315,19 @@ impl Header {
         out
     }
 
-    /// 符号化側の組み立て用。`payload_len` は呼び出し側で `MAX_PAYLOAD_LEN` 以下にしてから渡す。
+    /// 符号化側の組み立て用。`payload_len` は向きごとの上限（要求は `MAX_PAYLOAD_LEN`・応答は `MAX_REPLY_PAYLOAD_LEN`）以下に限る。
     pub(crate) fn new(
         request: RequestCode,
         reply: bool,
         need_reply: bool,
         payload_len: usize,
     ) -> Result<Self, CodecError> {
-        if payload_len > MAX_PAYLOAD_LEN {
+        let limit = if reply {
+            MAX_REPLY_PAYLOAD_LEN
+        } else {
+            MAX_PAYLOAD_LEN
+        };
+        if payload_len > limit {
             return Err(CodecError::new(
                 CodecErrorCode::PayloadTooLarge,
                 Some(request.as_u32()),
@@ -307,7 +348,7 @@ impl Header {
 /// 符号化済みメッセージ。固定長配列と有効長で持ち、ヒープ確保をしない（REPAIR-2）。
 #[derive(Clone, PartialEq, Eq)]
 pub struct EncodedMessage {
-    buf: [u8; MAX_MSG_LEN],
+    buf: [u8; MAX_ENCODED_LEN],
     len: usize,
 }
 
@@ -332,7 +373,7 @@ impl EncodedMessage {
     ) -> Result<Self, CodecError> {
         let req = Some(header.request().as_u32());
         let mut w = Writer {
-            buf: [0u8; MAX_MSG_LEN],
+            buf: [0u8; MAX_ENCODED_LEN],
             pos: 0,
             req,
         };
@@ -351,7 +392,7 @@ impl EncodedMessage {
 
 /// 固定長バッファへの境界検査付き書き込み。
 pub(crate) struct Writer {
-    buf: [u8; MAX_MSG_LEN],
+    buf: [u8; MAX_ENCODED_LEN],
     pos: usize,
     req: Option<u32>,
 }

@@ -268,7 +268,7 @@ macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なし�
 - 実装済み（F1.3・#1518）: split virtqueue（`virtqueue`。10.7）
 - 実装済み（F1.4・#1519）: vhost-user のセッションと ctrl キューの応答ループ（`session`。Linux 限定。10.8）。受入基準 2 は F3（#725）の実機待ちのまま
 - 実装済み（F5.2・#1601）: `RESOURCE_CREATE_BLOB`・`CTX_ATTACH_RESOURCE` / `DETACH_RESOURCE`・`RESOURCE_UNREF`（資源表 `resource`。計上のみで実メモリは確保しない）と `SUBMIT_3D` の最小応答（受理して受け渡し点 `Handled::submit` へ渡す。dispatch はしない）。10.3・10.4.3
-- 後続（F5。#1599）: F5.1（#1600）で capset 以降の ctrl の列と治具の応答範囲を一次情報で確かめて 10.4 節に記録した。F5.2（#1601）は ctrl の応答（共有メモリを要しない部分）、F6（#1602）は記録、共有メモリの対応（F5.2b。issue 起票は未実施・承認待ち）は 10.4.4 節
+- 後続（F5。#1599）: F5.1（#1600）で capset 以降の ctrl の列と治具の応答範囲を一次情報で確かめて 10.4 節に記録した。F5.2（#1601）は ctrl の応答（共有メモリを要しない部分）、F6（#1602）は記録、共有メモリの対応（F5.2b。親 #1638 配下で進行中。F5.2b.1 #1639・F5.2b.2 #1641 は実装済み）は 10.4.4 節
 - CI: `make poc-venus-jig-check`（fmt-check・clippy・test）は CI の `rust-ci-default-features` ジョブが 3 OS で実行し、`crates/plugin-macos` 側の変更による治具の破損を検出する（実機前提テストは `#[ignore]` で分離済みで CI では走らない）
 
 ### 10.2 候補比較
@@ -418,9 +418,12 @@ Mesa は 2 層で読む。Mesa は ctrl を直接出さず、DRM ioctl を呼ぶ
 - ゲストカーネルは `virtio_get_shm_region(..., id 1)` が成功したときだけ `has_host_visible` を立てる（`virtgpu_kms.c` 177〜191 行）。vhost-user では frontend 側がバックエンドに共有メモリ領域を問い合わせる
 - crosvm の frontend（`mod.rs` 514〜543 行）は、バックエンドが protocol feature `SHMEM`（bit 22、`0x0040_0000`。`message.rs` 384 行）をネゴシエーションしたときだけ `GET_SHMEM_CONFIG`（要求 ID 44。`message.rs` 154 行）で領域を取得し、領域が 0 個なら共有メモリ無し、1 個ならそれを使い、2 個以上はエラーにする。ネゴシエーションの前提として crosvm は `BACKEND_REQ`（bit 5、`0x20`）と `REPLY_ACK`（bit 3、`0x08`）も広告する（`mod.rs` 143〜151 行）
 - バックエンドから frontend への要求は `SET_BACKEND_REQ_FD`（要求 ID 21。ancillary data で fd を渡す。QEMU の rst と crosvm で同じ）で張ったソケットで送る。`SHMEM_MAP` = 9、`SHMEM_UNMAP` = 10（`message.rs` 192・194 行）。`SHMEM_MAP` のペイロードは `shmid`（u8）+ padding 7 バイト、`fd_offset`（u64）、`shm_offset`（u64）、`len`（u64）、`flags`（u64。`MAP_RW` = 0x1）の 40 バイトで、map する fd は ancillary data で渡す（`message.rs` 776〜815 行）
-- crosvm には非標準の `GPU_MAP`（1006）と `EXTERNAL_MAP`（1007）もある（`message.rs` 200〜204 行）。ring・reply・cs 用の HOST3D・`blob_id` 0 の共有メモリに `SHMEM_MAP` と `GPU_MAP` のどちらを使うかは**未確認**（crosvm の gpu backend 側の呼び出しは取得していない）。`GET_SHMEM_CONFIG` の応答ペイロードの配置も**未確認**
+- crosvm には非標準の `GPU_MAP`（1006）と `EXTERNAL_MAP`（1007）もある（`message.rs` 200〜204 行）。ring・reply・cs 用の HOST3D・`blob_id` 0 の共有メモリに `SHMEM_MAP` と `GPU_MAP` のどちらを使うかは**未確認**（crosvm の gpu backend 側の呼び出しは取得していない）。`GET_SHMEM_CONFIG` の応答ペイロードの配置は F5.2b.2（#1641）で確認した（下の「GET_SHMEM_CONFIG の配置」）
 - crosvm は `REPLY_ACK` を広告するが、`need_reply` は立てない（`SHMEM_MAP` の競合を避けるためという旨のコメント。`mod.rs` 146〜151 行）。治具は F5.2b.1（#1639）で `REPLY_ACK` を広告し、確定したセッションでは NEED_REPLY の要求に応答する（10.8 節）。これは後続の F5.2b で backend から frontend への要求（`SHMEM_MAP`）の成否を確かめる前提になる
-- **QEMU v10.1.0 の `docs/interop/vhost-user.rst` には `SHMEM` の protocol feature も `GET_SHMEM_CONFIG`・`SHMEM_MAP` / `SHMEM_UNMAP` も見当たらない**（語 `shmem` で検索して 0 件）。10.5 節の「QEMU と crosvm で ID が一致」は最小要求集合 16 種の範囲の話で、共有メモリの要求は crosvm 側だけの拡張になる。10.2 節の暫定選定（crosvm）はこの点でも補強される
+- **QEMU v10.1.0 の `docs/interop/vhost-user.rst` には `SHMEM` の protocol feature も `GET_SHMEM_CONFIG`・`SHMEM_MAP` / `SHMEM_UNMAP` も見当たらない**（語 `shmem` で検索して 0 件）。F5.2b.2（#1641。確認日 2026-10-10）で版を追った結果、v10.1.0〜v10.1.2・v10.2.0・v11.0.x の rst にも無く、**最初に入ったタグは `v11.1.0-rc0`** だった。v11.1.0 は bit 22 を `VHOST_USER_PROTOCOL_F_SHMEM_MAP` と書き、master は `VHOST_USER_PROTOCOL_F_SHMEM` と書く（ビットは同じ 22）。SHA-256 は v11.1.0 が `6350c5fe2425be9028519050d164cbee7d277fa199959efe48e5ec859b74d787`、master（コミット `615ece3c406b262996e569f29ea6eed0d81c4d8d`）が `684b11b15330ee23f2922aab9abd116efa1f48eb15b1b02b0233418e1a224257`、v10.2.0 が `7a030bfd…`、v11.0.0 が `7c2e3e83…`。したがって 10.5 節の「QEMU と crosvm で ID が一致」は最小要求集合の範囲の話で、共有メモリの要求は v11.1.0 より前の QEMU では crosvm 側だけの拡張になる（v11.1.0 以降の QEMU にもある）。10.2 節の暫定選定（crosvm）はこの点でも補強される
+- **GET_SHMEM_CONFIG の配置と治具の応答（F5.2b.2・#1641）**: 応答ペイロードは 2056 バイト（`nregions` u32・padding u32・`sizes` [u64; 256]）。crosvm の `get_shmem_config` は `sizes` を添字つきで列挙し**非 0 だけを残して** `nregions` 個を取り、添字がそのまま領域 id になる（`get_shared_memory_region` は 0 個なら無し、1 個ならそれ、2 個以上はエラー）。治具は **`nregions` = 1・`sizes[1]` = 134217728（128 MiB）・ほかは 0** を返す。`nregions` = 2・`sizes[0]` = 0 の形も crosvm は結果として id 1 だけを残すが、rst の定義（`nregions` は非 0 の領域の数）に反するので採らない。crosvm の PCI 層は `VirtioPciShmCap` の id へ `region.id` をそのまま入れるため、ゲストには id 1（`VIRTIO_GPU_SHM_ID_HOST_VISIBLE`）として見える見込みだが、**実機でゲストから見えるかは #725 で確かめる（未確認）**。2 の冪の制約は backend 側には無く、crosvm が BAR の大きさを `checked_next_power_of_two()` で切り上げる（cap の length は返した値のまま）。128 MiB は資源表の合計上限 64 MiB の 2 倍（連続領域の断片化の余裕。2 の冪で 4・16・64 KiB のどのページの倍数でもある）。出典の crosvm `devices/src/virtio/virtio_pci_device.rs`（コミット `044c3e3fc53d`）の SHA-256 は `8044bdb33a7362e64f4c022b858412650d7792f24a508220295824e04ce9907c`、`third_party/vmm_vhost/src/message.rs` の `VhostUserShMemConfig::new` と QEMU rst v11.1.0 の `GET_SHMEM_CONFIG` 節で配置を照合した。値・配置だけを転記し、crosvm のコードは写していない（MVM-4）
+- **SET_BACKEND_REQ_FD と確定の食い違い（F5.2b.2・#1641）**: 21 は `BACKEND_REQ` 確定後だけ受け付け、fd 1 本（socket かつ AF_UNIX。違えば `INVALID_BACKEND_REQ_FD`）を保持し、**2 回目は `OUT_OF_ORDER` で拒否**する（`SET_OWNER` の 2 回目と同じ fail-closed。置き換えを許すと #1642 で送信中の要求と応答がずれうる）。確定のやり直しは拒否せず（寛容）、保持した fd は接続の終わりまで持ち続ける。host-visible が使えるかは `State::host_visible` が毎回その時点の確定値から求め、理由は次の 4 つ（判定はこの順）: `shmem_not_negotiated`（SHMEM 未確定）・`config_not_queried`（44 に未回答）・`backend_req_not_negotiated`（SHMEM だけ確定）・`backend_channel_missing`（BACKEND_REQ は確定したが 21 が来ていない）。使えるときは `ready`。`ready` 以外のときの `MAP_BLOB` は #1643 が ctrl の ERR で返し、セッションはエラー終了しない（crosvm の frontend も BACKEND_REQ が無いときは mapper を設定せずログへ出すだけ）。状態はセッション終了時に `host_visible` 行として残る
+- 未対応として残すもの（REPAIR-3）: 21 の fd が SOCK_STREAM かの検査（`getsockopt(SO_TYPE)` は `sys` の承認範囲 U1〜U11 外の `unsafe` になるため行わず、種類違いは #1642 の期限つき送受信で失敗する）、ゲストへ id 1 として見えるかの実機確認（#725）
 - バックエンド側の設計の見込み: memfd を作り、`SHMEM_MAP` で frontend に渡す。fd の送受信（`SCM_RIGHTS`）・`memfd_create`・`mmap` の `sys` ラッパーは 10.6 節で実装済みで、既存の範囲に収まる見込み。ただし、バックエンドが frontend 宛にバックエンド要求を**送る**経路（`SET_BACKEND_REQ_FD` で受けた fd へ書く）は新規で、新しい `unsafe` が要るかどうかは F5.2b の承認事項（10.6 節の `sys` ラッパーで足りれば不要）
 
 #### 10.4.5 コマンドストリームの経路と #1602 の記録対象
@@ -466,9 +469,9 @@ Mesa は 2 層で読む。Mesa は ctrl を直接出さず、DRM ioctl を呼ぶ
 | crosvm `third_party/vmm_vhost/src/backend_client.rs` | 同上 | `709fe08830a38c5e15a00c0c5af47ef7dabf19a784c0694abf8c10d335dec7c2` |
 | crosvm `devices/src/virtio/vhost_user_frontend/mod.rs` | 同上 | `9506fcaae2e7e4aec09baa1374cbbd0a3807c5f38f8566b5c4f5856e4ea22266` |
 
-前提（実際に広告するのは F1.4・#1519）: virtio feature は bit 30（`VHOST_USER_F_PROTOCOL_FEATURES`）を立て、protocol feature は CONFIG（bit 9。virtio-gpu config の読み出しに要る）・MQ（bit 0）・REPLY_ACK（bit 3。F5.2b.1・#1639。QEMU `docs/interop/vhost-user.rst` v10.1.0 の REPLY_ACK 節で確認、SHA-256 は 2 章の固定値と同じ）だけにする。BACKEND_REQ・SHMEM・DEVICE_STATE・CONFIGURE_MEM_SLOTS は host-visible 共有メモリの方式が決まる #1057 まで後送りで、追加する場合は対応する要求を codec に足す。最小要求集合に SHMEM 系は無く、crosvm だけの拡張は 10.4.4 節で扱う。
+前提（実際に広告するのは F1.4・#1519）: virtio feature は bit 30（`VHOST_USER_F_PROTOCOL_FEATURES`）を立て、protocol feature は CONFIG（bit 9。virtio-gpu config の読み出しに要る）・MQ（bit 0）・REPLY_ACK（bit 3。F5.2b.1・#1639。QEMU `docs/interop/vhost-user.rst` v10.1.0 の REPLY_ACK 節で確認、SHA-256 は 2 章の固定値と同じ）・BACKEND_REQ（bit 5）・SHMEM（bit 22。F5.2b.2・#1641。10.4.4 節）の 5 つ（`0x0040_0229`）を広告する。DEVICE_STATE・CONFIGURE_MEM_SLOTS は後送りで、追加する場合は対応する要求を codec に足す。SHMEM 系は v11.1.0 より前の QEMU には無く crosvm 側の拡張だった（10.4.4 節）。
 
-最小要求集合（16 種。QEMU と crosvm で ID が一致）。これ以外は既知 ID も含め `UNKNOWN_REQUEST` で拒否する。
+最小要求集合（18 種。21・44 は F5.2b.2・#1641 で追加。QEMU〔21 は v10.1.0 から、44 は v11.1.0 から〕と crosvm で ID が一致）。これ以外は既知 ID も含め `UNKNOWN_REQUEST` で拒否する。
 
 | ID | 要求 | ペイロード |
 | -- | ---- | ---------- |
@@ -480,12 +483,14 @@ Mesa は 2 層で読む。Mesa は ctrl を直接出さず、DRM ioctl を呼ぶ
 | 9 | SET_VRING_ADDR | 40 バイト（index・flags 各 u32、descriptor・used・available・log 各 u64） |
 | 12 / 13 | SET_VRING_KICK / SET_VRING_CALL | u64（bit 0-7 が vring index、bit 8 が NOFD。bit 9 以上は拒否） |
 | 24 / 25 | GET_CONFIG / SET_CONFIG | 12 + size バイト（offset・size・flags 各 u32 + データ）。GET_CONFIG は要求側もデータ領域を含む |
+| 21 | SET_BACKEND_REQ_FD | なし（fd 1 本は補助データ。BACKEND_REQ 確定後） |
+| 44 | GET_SHMEM_CONFIG | 要求はなし。応答は 2056 バイト（nregions u32・padding u32・sizes [u64; 256]。SHMEM 確定後） |
 
 ヘッダは 12 バイト（request・flags・size の各 u32）。flags の下位 2 ビットが version（1）、bit 2 が REPLY、bit 3 が NEED_REPLY で、他は予約。バイト順は rst 上「ホストのネイティブ順」で、治具の動作環境（Linux x86_64 / aarch64、CI の 3 OS）はすべて little-endian のため little-endian 固定とし、big-endian ターゲットは `compile_error!` にする。
 
 上限と QEMU / crosvm の食い違いへの対応:
 
-- `MAX_PAYLOAD_LEN` = 1032（32 領域）、ヘッダ込みの最大は 1044。size は確保・読み取りより前に検証する
+- `MAX_PAYLOAD_LEN` = 1032（32 領域）、ヘッダ込みの最大は 1044。size は確保・読み取りより前に検証する。この受信の上限は F5.2b.2 でも変えない。送信（応答）と偽 frontend の復号だけ `GET_SHMEM_CONFIG` のために 2056 / 2068（ヘッダ込み）まで許す（`MAX_REPLY_PAYLOAD_LEN`・`MAX_ENCODED_LEN`）
 - メモリ領域数は 1〜32。QEMU の rst は 8 だが crosvm は最大 32（0 は拒否）なので、crosvm の正当な要求を拒否しないよう大きい方に揃える
 - config データは治具独自の上限 256 バイト（`virtio_gpu_config` は 16 バイト）。config の flags は crosvm のビット（`WRITABLE`=0x1・`LIVE_MIGRATION`=0x2）を受理し、他のビットは拒否する（QEMU の rst は値として 0 / 1 を定めるが、crosvm の GET_CONFIG は毎回 0x1 を送るため両方を受理できる形にした）
 - 検査順は固定: `SHORT_HEADER` → `UNSUPPORTED_VERSION` → `INVALID_FLAGS`（予約ビット・方向） → `PAYLOAD_TOO_LARGE` → `UNKNOWN_REQUEST` → `LENGTH_MISMATCH` → `INVALID_VALUE`
@@ -555,7 +560,7 @@ frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲスト
 
 実装は `poc/venus-decoder/jig/src/session/`（Linux 限定。`unsafe` は追加せず `sys.rs` も変更していない。依存の追加なし）。入口は `session::run(&UnixStream, &SessionLimits, sink)`。接続 1 本分を最後まで処理し、ログ（1 要求 1 行）を `sink` へ流す。
 
-- 広告値: `GET_FEATURES` は `0x0000_0001_4000_0019`（VIRGL・RESOURCE_BLOB・CONTEXT_INIT・VERSION_1・PROTOCOL_FEATURES）、`GET_PROTOCOL_FEATURES` は `0x209`（MQ・REPLY_ACK・CONFIG）、`GET_QUEUE_NUM` は 2（controlq・cursorq）。`GET_CONFIG` は 16 バイトの config（`num_capsets` = 1）の `offset + size <= 16` を返し、範囲外は空ペイロードのエラー応答でセッションは続ける
+- 広告値: `GET_FEATURES` は `0x0000_0001_4000_0019`（VIRGL・RESOURCE_BLOB・CONTEXT_INIT・VERSION_1・PROTOCOL_FEATURES）、`GET_PROTOCOL_FEATURES` は `0x0040_0229`（MQ・REPLY_ACK・BACKEND_REQ・CONFIG・SHMEM。F5.2b.2・#1641）、`GET_QUEUE_NUM` は 2（controlq・cursorq）。`GET_CONFIG` は 16 バイトの config（`num_capsets` = 1）の `offset + size <= 16` を返し、範囲外は空ペイロードのエラー応答でセッションは続ける
 - `SET_FEATURES`: 広告外のビットは `FEATURE_NOT_OFFERED`、広告した 5 ビットのどれかが欠ければ `REQUIRED_FEATURE_MISSING`（Mesa venus が capset 取得前に中止するため、PoC では fail-closed）
 - 順序のゲート（違反は `OUT_OF_ORDER` で要求 ID を載せる）。本当の依存関係だけを判定し、一本道は強制しない（QEMU と crosvm で `SET_OWNER` / `GET_PROTOCOL_FEATURES` の位置が違うため）。根拠は 10.5 で固定済みの crosvm コミット `044c3e3fc53d` の `backend_client.rs` / `vhost_user_frontend/mod.rs` と QEMU `vhost-user.rst`（v10.1.0）だが、**この節の表は PR 作成時点で両者の再取得による照合を行っていない（未照合）**。F3 で食い違えばここを直す
 
@@ -573,18 +578,21 @@ frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲスト
 | `SET_VRING_ENABLE` | bit 30 が確定済みで ADDR が設定済み。値は 0 / 1 |
 | `GET_VRING_BASE` | ring を停止し kick / call を閉じて `last_avail` を返す |
 | `SET_CONFIG` | 未対応として `UNSUPPORTED_REQUEST` |
+| `SET_BACKEND_REQ_FD`（F5.2b.2・#1641） | 確定した protocol feature に BACKEND_REQ がある（virtio feature の bit 30 や owner は要求しない。crosvm は `SET_FEATURES` より前に送る）。2 回目は拒否。fd は socket かつ AF_UNIX で、違えば `INVALID_BACKEND_REQ_FD` |
+| `GET_SHMEM_CONFIG`（F5.2b.2・#1641） | 確定した protocol feature に SHMEM がある。何度来ても同じ値（shmid 1 を 128 MiB で 1 個）を返す |
 
 - ring の起動: ADDR・KICK・CALL・ENABLE(1) がそろった時点で `SplitQueue::new(cfg, base, base)`。初期の used_idx は base とする（新規開始では 0。inflight は扱わない割り切り）
-- fd の個数: `SET_MEM_TABLE` は領域数、NOFD でない kick / call は 1、それ以外は 0。復号の後に照合し、合わなければ `FD_COUNT_MISMATCH` / `UNEXPECTED_FDS`。受け取った fd は `OwnedFd` で、どのエラー経路でも `Drop` で閉じる。fd は各メッセージの最初の受信でだけ受け付ける
+- fd の個数: `SET_MEM_TABLE` は領域数、NOFD でない kick / call と `SET_BACKEND_REQ_FD` は 1、それ以外は 0。復号の後に照合し、合わなければ `FD_COUNT_MISMATCH` / `UNEXPECTED_FDS`。受け取った fd は `OwnedFd` で、どのエラー経路でも `Drop` で閉じる。fd は各メッセージの最初の受信でだけ受け付ける
 - タイムアウト（REPAIR-5）: `SessionLimits` の `message_timeout`（1 メッセージの受信・応答送信・call の書き込み。超過は `TIMEOUT`）と `idle_timeout`（無通信。超過は `IDLE_TIMEOUT`）。どちらも 0 より大きく 1 時間以下
 - 応答ループ: socket と ctrl キューの kick を、単一 fd 用の `sys::wait_fd` で `poll_slice`（既定 10ms）ずつ交互に待つ。1 回の kick で最大 `num` 件を処理して used へ書き、1 件以上なら call へ 1 を書く。`pop` / `add_used` の失敗はセッションを終了する（壊れたキューを黙って続けない）。writable が応答に足りない要求は応答を捨てて len=0 で返し、`response_dropped` の行を出してセッションは続ける。readable が 4 KiB を超える要求はアダプタへ渡さず `ERR_INVALID_PARAMETER`
-- ログ: 既存の `venus_jig event=...` 形式を保つ。追加は `session_error`（`code`・`request`）・`need_reply_ack`（`request`・`result=ok|err`）・`need_reply_ignored`・`response_dropped`・`session_end`。固定語彙と数値だけで、frontend やゲスト由来のバイト列・fd 番号・GPA は出さない
+- ログ: 既存の `venus_jig event=...` 形式を保つ。追加は `session_error`（`code`・`request`）・`need_reply_ack`（`request`・`result=ok|err`）・`need_reply_ignored`・`response_dropped`・`session_end`、F5.2b.2（#1641）の `shmem_config`（44 の応答。`nregions`・`shmid`・`size`）・`backend_req`（21 の受理）・`host_visible`（セッション終了時の成立状況。語彙は `ready`・`shmem_not_negotiated`・`config_not_queried`・`backend_req_not_negotiated`・`backend_channel_missing`）。固定語彙と数値だけで、frontend やゲスト由来のバイト列・fd 番号・GPA は出さない
 - NEED_REPLY への応答（F5.2b.1・#1639）: `REPLY_ACK` の確定は `State::handle` の後で判定する（NEED_REPLY つきの `SET_PROTOCOL_FEATURES` 自体にも応答する）。確定済みなら次のとおり。確定していないセッションは従来どおり `SET_*` に応答せず `need_reply_ignored` を 1 行出す。応答は fd なしの既存送信経路で、`message_timeout` の期限を守る
   - 応答本体を持たない要求（`SET_*`）の成功: size 8・REPLY の u64 で値 0 を返し、`need_reply_ack ... result=ok` を出す
   - `GET_*`（`GET_FEATURES`・`GET_PROTOCOL_FEATURES`・`GET_QUEUE_NUM`・`GET_VRING_BASE`・`GET_CONFIG`）: rst の REPLY_ACK 節（応答本体を持つ要求は挙動が変わらない）に従い、既存の応答で兼ねる。追加の u64 は送らない。ack の型は `GET_*` の要求 ID では作れない
   - `SET_*` の失敗: 値 1 の ack を返してから既存のエラーでセッションを終える（rst は非 0 を受けた QEMU が終了すると想定）。ログは `need_reply_ack ... result=err` の後に `session_error`。ack の送信に失敗しても元のエラーを優先し、その場合 `need_reply_ack` は出さない
   - `GET_*` の失敗: 応答せずセッションを終える（ack の値が応答値と誤解されるのを避ける）
   - メッセージの読み取り段階の失敗（codec の復号エラー・`UNKNOWN_REQUEST`・fd 個数の不一致）には応答しない。信頼できない、または不整合なメッセージへ応答しない fail-closed の判断で、相手には切断（EOF）が見える
+- 21 で受けた fd（backend 要求用の UDS）は `State` が保持し、セッションの終了（正常もエラーも）の drop で閉じる。backend 要求の送信（`SHMEM_MAP`）は #1642、`MAP_BLOB` の ERR 化は #1643。確定の食い違いの扱いは 10.4.4 節
 - 扱わない（REPAIR-3）: cursorq（ring 1）の要求処理、`SET_CONFIG`、`VRING_NOFD`、inflight、`INDIRECT` / `EVENT_IDX`、`observe::snapshot_lines` の定期出力と virtqueue 個別の観測カウンタ（終了時の集計出力は `session::run` で実装済み）
 - peer credential の検証（PLUG-12）は起動入口が accept 直後に `SO_PEERCRED`（`sys::peer_uid`＝U11）で行い、`session::run` は照合済みの `UnixStream` を受け取る API に留める。UDS の bind と所有者・権限・symlink の検証は起動入口（10.9）が行う。治具は PoC で、実機の実行は人間が担当する閉じた環境という前提
 - 承認事項: socket と kick を同時に待つ複数 fd の `ppoll` は `sys.rs` の `unsafe`（U10）の変更になるため行っていない。kick への反応に最大 `poll_slice` の遅延が乗る

@@ -96,7 +96,7 @@ pub fn negotiate(f: &UnixStream) {
     send(f, &Request::GetProtocolFeatures, &[]);
     assert_eq!(
         recv_reply(f, RequestCode::GetProtocolFeatures),
-        Reply::ProtocolFeatures(0x209)
+        Reply::ProtocolFeatures(0x0040_0229)
     );
     // 確定は REPLY_ACK を含まない 0x201 のままにする（NEED_REPLY を立てない既定の流れと、未確定セッションの挙動を保つ）。
     send(f, &Request::SetProtocolFeatures(0x201), &[]);

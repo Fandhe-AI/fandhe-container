@@ -9,8 +9,8 @@
 
 use super::{
     CONFIG_FIXED_LEN, CONFIG_FLAGS_DEFINED, CodecError, CodecErrorCode, Direction, EncodedMessage,
-    HEADER_LEN, Header, MAX_CONFIG_SIZE, MAX_MEM_REGIONS, MEM_REGION_LEN, Reader, RequestCode,
-    VRING_INDEX_MASK, VRING_NOFD, Writer,
+    HEADER_LEN, Header, MAX_CONFIG_SIZE, MAX_MEM_REGIONS, MAX_SHMEM_REGIONS, MEM_REGION_LEN,
+    Reader, RequestCode, SHMEM_CONFIG_LEN, SHMEM_PAGE_ALIGN, VRING_INDEX_MASK, VRING_NOFD, Writer,
 };
 
 fn err(code: CodecErrorCode, req: RequestCode) -> CodecError {
@@ -187,7 +187,94 @@ impl ConfigPayload {
     }
 }
 
-/// frontend から backend への要求（最小集合 16 種）。
+/// 共有メモリ領域 1 個（id と大きさ）。[`ShmemConfig::new`] の入力。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShmemRegion {
+    /// 領域 id（virtio の shmid。host-visible は 1）。
+    pub id: u8,
+    /// 領域の大きさ（バイト）。0 ではなく、[`SHMEM_PAGE_ALIGN`] の倍数。
+    pub size: u64,
+}
+
+/// `GET_SHMEM_CONFIG` の応答（`nregions` u32・padding u32・`sizes` [u64; 256] の 2056 バイト。GPU-6・TASK-172 F5.2b.2・#1641）。
+///
+/// 配置は「非 0 の領域の数 = `nregions`、`sizes[id]` = その大きさ、未使用は 0」（QEMU rst v11.1.0）。`nregions` はフィールドに持たず
+/// `sizes` の非 0 の数から毎回求めるので、両者の食い違いは型として作れない（REPAIR-2）。crosvm は `sizes` を添字つきで走査し非 0 だけを
+/// 領域 id として使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShmemConfig {
+    sizes: [u64; MAX_SHMEM_REGIONS],
+}
+
+impl ShmemConfig {
+    /// 領域列から作る。大きさが 0・ページの倍数でない、id の重複、件数が 256 超のいずれかは `INVALID_VALUE`
+    /// （要求種別は `GetShmemConfig`）。空の列は受理する（`nregions` = 0）。
+    pub fn new(regions: &[ShmemRegion]) -> Result<Self, CodecError> {
+        let bad = || err(CodecErrorCode::InvalidValue, RequestCode::GetShmemConfig);
+        if regions.len() > MAX_SHMEM_REGIONS {
+            return Err(bad());
+        }
+        let mut sizes = [0u64; MAX_SHMEM_REGIONS];
+        for r in regions {
+            if r.size == 0 || !r.size.is_multiple_of(SHMEM_PAGE_ALIGN) {
+                return Err(bad());
+            }
+            let slot = sizes.get_mut(usize::from(r.id)).ok_or_else(bad)?;
+            if *slot != 0 {
+                return Err(bad());
+            }
+            *slot = r.size;
+        }
+        Ok(Self { sizes })
+    }
+
+    /// 非 0 の領域の数。
+    pub fn nregions(&self) -> u32 {
+        // 256 以下なので変換は失敗しない。
+        u32::try_from(self.sizes.iter().filter(|s| **s != 0).count()).unwrap_or(0)
+    }
+
+    /// 領域 `id` の大きさ（未使用は 0）。
+    pub fn size(&self, id: u8) -> u64 {
+        self.sizes.get(usize::from(id)).copied().unwrap_or(0)
+    }
+
+    /// 256 個の大きさ（添字が領域 id）。
+    pub fn sizes(&self) -> &[u64; MAX_SHMEM_REGIONS] {
+        &self.sizes
+    }
+
+    fn write(&self, w: &mut Writer) -> Result<(), CodecError> {
+        w.u32(self.nregions())?;
+        w.u32(0)?;
+        for s in &self.sizes {
+            w.u64(*s)?;
+        }
+        Ok(())
+    }
+
+    /// frontend 役（試験）の復号。長さを先に照合し（`LENGTH_MISMATCH`）、padding・ページ境界・`nregions` の整合を検査する（`INVALID_VALUE`）。
+    fn read(r: &mut Reader) -> Result<Self, CodecError> {
+        let code = RequestCode::GetShmemConfig;
+        if r.remaining() != SHMEM_CONFIG_LEN {
+            return Err(err(CodecErrorCode::LengthMismatch, code));
+        }
+        let nregions = r.u32()?;
+        let padding = r.u32()?;
+        let mut sizes = [0u64; MAX_SHMEM_REGIONS];
+        for s in &mut sizes {
+            *s = r.u64()?;
+        }
+        let cfg = Self { sizes };
+        let aligned = cfg.sizes.iter().all(|s| s.is_multiple_of(SHMEM_PAGE_ALIGN));
+        if padding != 0 || !aligned || nregions != cfg.nregions() {
+            return Err(err(CodecErrorCode::InvalidValue, code));
+        }
+        Ok(cfg)
+    }
+}
+
+/// frontend から backend への要求（最小集合 18 種）。
 // 固定長配列で持ちヒープ確保をしない設計（REPAIR-2）のため、バリアント間のサイズ差は許容する。
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +311,10 @@ pub enum Request {
     GetConfig(ConfigPayload),
     /// `SET_CONFIG`。
     SetConfig(ConfigPayload),
+    /// `SET_BACKEND_REQ_FD`（ペイロードなし。fd 1 本は補助データで届く）。
+    SetBackendReqFd,
+    /// `GET_SHMEM_CONFIG`（ペイロードなし）。
+    GetShmemConfig,
 }
 
 /// 復号済みの要求と、ヘッダの `NEED_REPLY`。
@@ -265,6 +356,8 @@ pub fn decode_request_payload(header: &Header, payload: &[u8]) -> Result<Decoded
         RequestCode::SetOwner => Request::SetOwner,
         RequestCode::GetProtocolFeatures => Request::GetProtocolFeatures,
         RequestCode::GetQueueNum => Request::GetQueueNum,
+        RequestCode::SetBackendReqFd => Request::SetBackendReqFd,
+        RequestCode::GetShmemConfig => Request::GetShmemConfig,
         RequestCode::SetFeatures => Request::SetFeatures(r.u64()?),
         RequestCode::SetProtocolFeatures => Request::SetProtocolFeatures(r.u64()?),
         RequestCode::SetVringKick => Request::SetVringKick(read_vring_fd(&mut r, code)?),
@@ -358,12 +451,19 @@ impl Request {
             Self::SetVringEnable(_) => RequestCode::SetVringEnable,
             Self::GetConfig(_) => RequestCode::GetConfig,
             Self::SetConfig(_) => RequestCode::SetConfig,
+            Self::SetBackendReqFd => RequestCode::SetBackendReqFd,
+            Self::GetShmemConfig => RequestCode::GetShmemConfig,
         }
     }
 
     fn payload_len(&self) -> usize {
         match self {
-            Self::GetFeatures | Self::SetOwner | Self::GetProtocolFeatures | Self::GetQueueNum => 0,
+            Self::GetFeatures
+            | Self::SetOwner
+            | Self::GetProtocolFeatures
+            | Self::GetQueueNum
+            | Self::SetBackendReqFd
+            | Self::GetShmemConfig => 0,
             Self::SetFeatures(_)
             | Self::SetProtocolFeatures(_)
             | Self::SetVringKick(_)
@@ -382,9 +482,12 @@ impl Request {
     pub fn encode(&self, need_reply: bool) -> Result<EncodedMessage, CodecError> {
         let header = Header::new(self.code(), false, need_reply, self.payload_len())?;
         EncodedMessage::build(&header, |w| match self {
-            Self::GetFeatures | Self::SetOwner | Self::GetProtocolFeatures | Self::GetQueueNum => {
-                Ok(())
-            }
+            Self::GetFeatures
+            | Self::SetOwner
+            | Self::GetProtocolFeatures
+            | Self::GetQueueNum
+            | Self::SetBackendReqFd
+            | Self::GetShmemConfig => Ok(()),
             Self::SetFeatures(v) | Self::SetProtocolFeatures(v) => w.u64(*v),
             Self::SetVringKick(f) | Self::SetVringCall(f) => w.u64(f.to_u64()),
             Self::SetVringNum(s)
@@ -459,7 +562,7 @@ impl Ack {
     }
 }
 
-/// backend から frontend への応答（値を返す 5 種と、REPLY_ACK の ack）。
+/// backend から frontend への応答（値を返す 6 種と、REPLY_ACK の ack）。
 // 固定長配列で持ちヒープ確保をしない設計（REPAIR-2）のため、バリアント間のサイズ差は許容する。
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -476,6 +579,8 @@ pub enum Reply {
     Config(ConfigPayload),
     /// `GET_CONFIG` のエラー応答（仕様どおりヘッダ size = 0 の空ペイロード）。
     ConfigError,
+    /// `GET_SHMEM_CONFIG` の応答（2056 バイト）。
+    ShmemConfig(ShmemConfig),
     /// NEED_REPLY への ack（REPLY_ACK 確定後。応答本体を持たない要求のみ）。
     Ack(Ack),
 }
@@ -489,6 +594,7 @@ impl Reply {
             Self::QueueNum(_) => RequestCode::GetQueueNum,
             Self::VringBase(_) => RequestCode::GetVringBase,
             Self::Config(_) | Self::ConfigError => RequestCode::GetConfig,
+            Self::ShmemConfig(_) => RequestCode::GetShmemConfig,
             Self::Ack(a) => a.request(),
         }
     }
@@ -500,6 +606,7 @@ impl Reply {
             Self::VringBase(_) | Self::Ack(_) => 8,
             Self::Config(c) => c.payload_len(),
             Self::ConfigError => 0,
+            Self::ShmemConfig(_) => SHMEM_CONFIG_LEN,
         };
         let header = Header::new(self.code(), true, false, len)?;
         EncodedMessage::build(&header, |w| match self {
@@ -508,6 +615,7 @@ impl Reply {
             Self::VringBase(s) => write_state(w, s),
             Self::Config(c) => c.write(w),
             Self::ConfigError => Ok(()),
+            Self::ShmemConfig(c) => c.write(w),
         })
     }
 }
@@ -538,6 +646,7 @@ pub fn decode_reply(buf: &[u8], expected: RequestCode) -> Result<Reply, CodecErr
         // ペイロード長 0 は GET_CONFIG のエラー応答（仕様）。
         RequestCode::GetConfig if payload.is_empty() => Reply::ConfigError,
         RequestCode::GetConfig => Reply::Config(ConfigPayload::read(&mut r, code)?),
+        RequestCode::GetShmemConfig => Reply::ShmemConfig(ShmemConfig::read(&mut r)?),
         // 応答本体を持たない要求（SET_* 等）への応答は ack（u64）。frontend 視点の復号なので値は任意の u64 を受ける。
         // 長さは上の total 照合で確定済みで、u64 が 8 バイトでなければ `r.u64()` / `finish` が LENGTH_MISMATCH にする。
         _ => Reply::Ack(Ack {

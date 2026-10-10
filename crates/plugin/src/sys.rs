@@ -288,6 +288,20 @@ pub(crate) fn write_nonblocking(fd: &impl AsFd, buf: &[u8]) -> io::Result<usize>
 }
 
 /// [`probe_child_exit`] の結果。真偽値にせず、将来の状態（停止・継続等）を足せる形にする。
+///
+/// `waitid` の ABI を持たない構成（riscv64 等。`waitid_abi` と同じ cfg の否定）では `probe_child_exit` が
+/// 常に `Unsupported` を返し、どの variant も構築されないため `dead_code` を許す。ABI を持つ構成では
+/// 検出を残す（REPAIR-7・PLUG-7）。
+#[cfg_attr(
+    not(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos"
+    )),
+    allow(dead_code)
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChildExitProbe {
     /// まだ終了していない。

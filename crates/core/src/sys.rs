@@ -92,8 +92,6 @@ pub(crate) enum SysError {
     /// - 古いカーネル: 新マウント API（`fsopen`・`fsconfig`・`fsmount`・`move_mount`・`open_tree` は
     ///   Linux 5.2 未満、`mount_setattr` は 5.12 未満）が返した `ENOSYS` を `new_mount_api_error` が写す。
     ///   それ以外の syscall の `ENOSYS` は写さず [`SysError::Os`] のまま返す
-    /// - `reopen_pinned_read_nonblock` のパス組み立て（`CString::new`）の失敗。整数の書式化のため NUL を
-    ///   含まず、実際には起こらない
     Unsupported,
     /// カーネルが返した errno。
     Os(i32),
@@ -3009,7 +3007,8 @@ pub(crate) fn open_path_follow_at(
 /// open の副作用を避ける。REPAIR-5・PLUG-11・TASK-122.2）。
 pub(crate) fn reopen_pinned_read_nonblock(pinned: BorrowedFd<'_>) -> Result<OwnedFd, SysError> {
     let path = std::ffi::CString::new(format!("/proc/thread-self/fd/{}", pinned.as_raw_fd()))
-        .map_err(|_| SysError::Unsupported)?;
+        // 整数の書式化のため NUL は含まず実際には起こらない。起きても「対応外」とは分類しない（REPAIR-2）。
+        .map_err(|_| SysError::Os(consts::EINVAL))?;
     // 絶対パスのため dirfd は無視される（`pinned` を渡しても解決に影響しない）。
     open_follow_at(pinned, &path, consts::O_RDONLY | consts::O_NONBLOCK)
 }
@@ -3099,6 +3098,14 @@ pub(crate) fn fs_type(fd: BorrowedFd<'_>) -> Result<i64, SysError> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MountFlags(i64);
 
+/// `bits` に `mask` のビットが立っているか。対応外アーキテクチャでは `ST_*` が 0 になり、`mount_flags()` が
+/// 先に `Unsupported` を返すため本番では `MountFlags` が作られない。`mask == 0` では常に偽（判定不能として
+/// 呼び出し側が拒否に倒れる。SEC-1・REPAIR-2）とし、定数 0 によるマスクを式に書かない
+/// （`clippy::bad_bit_mask` の回避。x86_64 / aarch64 の結果は従来の `bits & mask != 0` と同じ）。
+fn has_flag(bits: i64, mask: i64) -> bool {
+    mask != 0 && bits & mask != 0
+}
+
 impl MountFlags {
     /// 生の `f_flags` から作る（単体テストが境界値を組み立てる用）。
     #[cfg(test)]
@@ -3109,18 +3116,18 @@ impl MountFlags {
     /// カーネルが `f_flags` を埋めたか（`ST_VALID`。Linux 2.6.36 以降は常に立つ）。立っていない値は
     /// マウントフラグとして信用できない（呼び出し側は判定不能として拒否に倒す）。
     pub(crate) fn is_valid(self) -> bool {
-        self.0 & consts::ST_VALID != 0
+        has_flag(self.0, consts::ST_VALID)
     }
 
     /// マウントが `nodev`（`ST_NODEV`。`MNT_NODEV` 由来）か。rootfs の nodev 付与の事後検証に使う
     /// （`crate::exec::prepare_rootfs`。#1676・SEC-1）。
     pub(crate) fn is_nodev(self) -> bool {
-        self.0 & consts::ST_NODEV != 0
+        has_flag(self.0, consts::ST_NODEV)
     }
 
     /// マウントが `noexec`（`ST_NOEXEC`。`MNT_NOEXEC` 由来）か。
     pub(crate) fn is_noexec(self) -> bool {
-        self.0 & consts::ST_NOEXEC != 0
+        has_flag(self.0, consts::ST_NOEXEC)
     }
 }
 
@@ -4230,6 +4237,14 @@ mod tests {
         assert_eq!((EBUSY, ENOTEMPTY), (16, 39));
         assert_eq!(consts::CGROUP2_SUPER_MAGIC, 0x6367_7270);
         assert_eq!(std::mem::size_of::<StatFs>(), 120);
+    }
+
+    /// SEC-1・REPAIR-2（#1704）: `has_flag` はマスクが 0（対応外アーキテクチャの `ST_*`）なら常に偽。
+    #[test]
+    fn sec1_has_flag_is_false_for_zero_mask_and_exact_otherwise() {
+        assert!(has_flag(0x24, 0x4));
+        assert!(!has_flag(0x20, 0x4));
+        assert!(!has_flag(-1, 0));
     }
 
     /// SEC-1（TASK-163 追補・#1531）: `statfs.f_flags` の位置と `ST_*` の具体値（include/linux/statfs.h）。

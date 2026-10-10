@@ -3087,11 +3087,11 @@ mod tests {
     #[test]
     fn core3_task32_4_exec_error_from_cgroup_keeps_code_and_names_stage() {
         use crate::cgroups::{CgroupError, CgroupStep};
-        let e = ExecError::from_cgroup(CgroupError {
-            code: ErrorCode::PermissionDenied,
-            step: CgroupStep::JoinContainer,
-            message: "denied".to_string(),
-        });
+        let e = ExecError::from_cgroup(CgroupError::new_for_test(
+            ErrorCode::PermissionDenied,
+            CgroupStep::JoinContainer,
+            "denied",
+        ));
         assert_eq!(e.code, ErrorCode::PermissionDenied);
         assert_eq!(e.stage, IsolationStage::CgroupJoin);
         assert_eq!(e.message, "JoinContainer: denied");

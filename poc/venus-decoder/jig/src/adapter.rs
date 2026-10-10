@@ -10,8 +10,9 @@
 //! コマンドは実行しない。`CTX_DESTROY` はその ctx への attach を暗黙に外す。
 //! F5.2b.4a（#1643）で `RESOURCE_MAP_BLOB` / `UNMAP_BLOB` を追加した。adapter は検証して資源表を仮に更新するところまでで、
 //! [`Handled::shmem`] に実行指示（[`ShmemOp`]）を返す。実メモリ（memfd）の確保と frontend との `SHMEM_MAP` / `SHMEM_UNMAP` は
-//! `session` が行い、失敗時は adapter ごと巻き戻してゲストへ ERR を返す。map 中の資源の解放の確定は #1645。
-//! 未実装（REPAIR-3）: `SUBMIT_3D` の dispatch（TASK-177.x）、map 中の資源の解放の確定（#1645）。
+//! `session` が行い、失敗時は adapter ごと巻き戻してゲストへ ERR を返す。map 中の資源の解放は確定済み（#1645）:
+//! map 中の `RESOURCE_UNREF` は拒否、`CTX_DESTROY` は detach だけで map は残し、終了時の片づけは `session` が行う。
+//! 未実装（REPAIR-3）: `SUBMIT_3D` の dispatch（TASK-177.x）。
 
 use fandhe_container_plugin_macos::gpu::venus::{
     CommandHeader, VenusWireError, WireReader, capset_info, parse_command_header,
@@ -270,6 +271,7 @@ impl CtrlAdapter {
                 Ok(slot) => {
                     // 順序が崩れて attach したまま破棄されても、後続の UNREF が拒否され続けず、
                     // スロット再利用時に古い所属が新しい ctx へ化けないようにする（設計書 10.4.3）。
+                    // map は ctx ではなくデバイスの host-visible 領域に属するので残す（D2。#1645）。
                     self.resources.detach_all_from(slot);
                     QueryResult::Ok
                 }

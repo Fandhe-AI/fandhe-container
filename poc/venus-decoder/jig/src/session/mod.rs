@@ -16,7 +16,8 @@
 //! host-visible の成立状況（`host_visible` 行）を出す。backend 要求（`SHMEM_MAP` / `SHMEM_UNMAP`）の期限つき送信は `Session::shmem_map` / `shmem_unmap`（#1642）で、
 //! ctrl の `RESOURCE_MAP_BLOB` / `UNMAP_BLOB` から呼ぶ（F5.2b.4a・#1643）。MAP は resource の大きさの memfd を作って frontend へ渡し、
 //! UNMAP 後も memfd は resource の寿命（UNREF・セッション終了）まで保持して再 MAP で再利用する。frontend の失敗・期限切れ・切断ではゲストへ ERR を返し adapter を巻き戻す（無応答にしない）。
-//! map 中の資源の解放の確定（UNREF の暫定拒否・channel 破損後の残存・セッション終了時の扱い）と一連の結合試験は #1645。
+//! map 中の資源の解放（#1645 で確定）: map 中の `RESOURCE_UNREF` は拒否（`ERR_INVALID_PARAMETER`）、`CTX_DESTROY` は detach だけで map は残す、
+//! map が残ったままのセッション終了（正常・エラー）では `release_blobs_at_end` が期限つきで `SHMEM_UNMAP` を送ってから memfd を閉じる。
 //! 未実装（REPAIR-3）: cursorq（ring 1）の要求処理・`SET_CONFIG`・`VRING_NOFD`・inflight・
 //! `observe::snapshot_lines` の定期出力（終了時の集計出力は実装済み。定期出力と virtqueue 個別の観測カウンタは未実装）。
 //!
@@ -131,6 +132,8 @@ pub enum SessionEnd {
 /// 接続 1 本分のセッションを最後まで処理する。ログ（1 行 1 要求）は `sink` へ流す。
 ///
 /// エラーで終わる場合は `session_error` の行を 1 行出してから `Err` を返す。どの経路でも保持する fd と mmap は `Drop` で解放される。
+/// map が残ったままの終了（正常・エラー）では、frontend へ期限つきで `SHMEM_UNMAP` を送ってから blob の memfd を閉じ、`blob_release` の
+/// 集計行を出す（片づけの成否は結果を変えない。#1645）。
 /// 内部状態が `!Send` なので、この関数を呼ぶスレッドの中で完結する。
 pub fn run(
     sock: &UnixStream,
@@ -163,9 +166,13 @@ pub fn run_with_submit_hook(
     };
     let result = session.serve(sock, sink, on_submit);
     // #1641: host-visible 共有メモリが成立したか（しない場合は理由）。#725 の実機確認でログから直接読めるようにする。
+    // 成立の意味（セッション中に成立したか）を保つため、片づけで channel が壊れる前に出す。
     sink(&log::host_visible_line(
         session.state.host_visible().as_str(),
     ));
+    // #1645: map が残ったままの終了では、frontend の map の表を治具の状態と食い違わせないよう SHMEM_UNMAP を送ってから
+    // memfd を閉じる。片づけの成否は上のセッションの結果を変えない。
+    session.release_blobs_at_end(sink);
     // REPAIR-4: 操作ごとの成功 / 失敗件数と所要時間、fd 受け渡し・ゲストメモリ I/O の集計を終了時に出す。
     for line in session
         .metrics
@@ -187,7 +194,8 @@ struct Session {
     adapter: CtrlAdapter,
     limits: SessionLimits,
     metrics: SessionMetrics,
-    /// map 中の blob の実メモリ（memfd）。`UNMAP_BLOB` の成功まで保持し、セッション終了時に `Drop` で閉じる。
+    /// blob の実メモリ（memfd）。`UNMAP_BLOB` の後も `UNREF` まで保持する。map が残ったままの終了では、
+    /// `release_blobs_at_end` が `SHMEM_UNMAP` を（期限つきで）送ってから表を空にして `Drop` で閉じる（#1645）。
     blobs: BlobMemTable,
 }
 
@@ -276,9 +284,28 @@ impl BlobMemTable {
         }
     }
 
+    /// map 中の区間を slot 順に返す（終了時の片づけ用。固定長の表の走査だけでアロケーションしない）。
+    fn mapped_mappings(&self) -> impl Iterator<Item = ShmemMapping> + '_ {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|b| b.mapped)
+            .map(|b| b.mapping)
+    }
+
+    /// map 中の件数。
+    fn mapped_count(&self) -> usize {
+        self.slots.iter().flatten().filter(|b| b.mapped).count()
+    }
+
+    /// 保持している memfd の件数（map 中・UNMAP 済みを問わない）。
+    fn memfd_count(&self) -> usize {
+        self.slots.iter().flatten().count()
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.slots.iter().flatten().count()
+        self.memfd_count()
     }
 }
 
@@ -351,6 +378,43 @@ fn fill(
 }
 
 impl Session {
+    /// セッション終了時の blob の片づけ（D3。GPU-6・REPAIR-5・#1645）。`run_with_submit_hook` が `serve` の後に呼ぶ。
+    ///
+    /// map 中の blob（frontend が 0 を返したもの）へ slot 順に 1 件ずつ `SHMEM_UNMAP` を送る。crosvm は backend の切断でも
+    /// reset でも SHMEM_MAP の map を自分から消さない（設計書 10.4.4）ため、治具が自分で外す。最初の失敗（期限切れ・切断・
+    /// 非 0 の応答）で打ち切り、全体を `message_timeout` 1 つ分の期限で抑える。channel が未成立・`Broken` なら 1 バイトも送らない
+    /// （`backend_exchange_within` のゲート）。最後に表を空にして memfd を `Drop` で閉じる。frontend が受け取った複製 fd と
+    /// その mmap は治具が閉じても有効なまま。ログは数値と固定語彙だけ。
+    fn release_blobs_at_end(&mut self, sink: &mut dyn FnMut(&str)) {
+        let mapped = self.blobs.mapped_count();
+        let memfds = self.blobs.memfd_count();
+        let mut unmapped = 0usize;
+        if mapped > 0 {
+            let deadline = Instant::now().checked_add(self.limits.message_timeout);
+            let targets: Vec<ShmemMapping> = self.blobs.mapped_mappings().collect();
+            for mapping in targets {
+                let left = match deadline {
+                    Some(d) => d.saturating_duration_since(Instant::now()),
+                    None => self.limits.message_timeout,
+                };
+                if left.is_zero() {
+                    break;
+                }
+                let req = BackendRequest::ShmemUnmap(mapping);
+                if self
+                    .backend_exchange_within(&req, None, left, sink)
+                    .is_err()
+                {
+                    break;
+                }
+                unmapped = unmapped.saturating_add(1);
+            }
+        }
+        // 表を差し替えて memfd をすべて閉じる（どの経路でも閉じ忘れない）。
+        self.blobs = BlobMemTable::default();
+        sink(&log::blob_release_line(mapped, unmapped, memfds));
+    }
+
     /// `SHMEM_MAP` を frontend へ送り、応答を確かめる（#1642。呼び出し元は `execute_shmem`＝ctrl `MAP_BLOB`。#1643）。
     ///
     /// ゲート（REPLY_ACK 確定・host-visible 成立）を通らなければ送らずに `Err`（ログも出さない。呼び出し側が ctrl の
@@ -380,6 +444,17 @@ impl Session {
         sink: &mut dyn FnMut(&str),
     ) -> Result<BackendAck, BackendReqError> {
         let timeout = self.limits.message_timeout;
+        self.backend_exchange_within(req, fd, timeout, sink)
+    }
+
+    /// `backend_exchange` の期限を呼び出し側が決める版（終了時の片づけが全体の期限の残りを渡す。#1645）。
+    fn backend_exchange_within(
+        &mut self,
+        req: &BackendRequest,
+        fd: Option<BorrowedFd<'_>>,
+        timeout: Duration,
+        sink: &mut dyn FnMut(&str),
+    ) -> Result<BackendAck, BackendReqError> {
         let result = {
             let sock = self.state.backend_channel(req.code())?;
             backend_req::exchange(sock, req, fd, timeout)
@@ -757,7 +832,7 @@ impl Session {
     ///
     /// 共有メモリが未成立・frontend の失敗・期限切れ・切断は `Unspec`、memfd を作れないときは `OutOfMemory`。
     /// 失敗した MAP の新規 memfd は捨てる（UNMAP 後に残した memfd は保つ）。失敗した UNMAP は map 中のまま残す（frontend 側に map が残っているかもしれず、
-    /// 区間を再利用させない。解放の扱いは #1645）。channel の破損は `backend_exchange` が扱う。
+    /// 区間を再利用させない。残った map は終了時の片づけ `release_blobs_at_end` が扱う。#1645）。channel の破損は `backend_exchange` が扱う。
     fn execute_shmem(&mut self, op: &ShmemOp, sink: &mut dyn FnMut(&str)) -> QueryResult {
         match op.kind {
             ShmemOpKind::Map => {

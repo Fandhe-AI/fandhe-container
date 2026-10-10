@@ -11,9 +11,14 @@
 //! （memfd）の確保と frontend への `SHMEM_MAP` は `session` が行い、本表は検証と重なり検査だけを担う（I/O を持たない）。
 //! 本表の上限（1 件 16 MiB・合計 64 MiB）は `CREATE_BLOB` の時点で検査済みなので、memfd の長さはその範囲に収まる。
 //!
-//! 暫定（REPAIR-3）: map 中の resource への `RESOURCE_UNREF` は `ERR_INVALID_PARAMETER` で拒否する。実ゲストは
-//! `UNMAP` → `UNREF` の順に出すので通常の流れは妨げない。channel 破損後に map 中で残る resource・セッション終了時の扱いなど、
-//! map 中の資源の解放の確定は #1645 で行う。
+//! map 中の資源の解放（確定。#1645・GPU-6）:
+//!
+//! - D1: map 中の resource への `RESOURCE_UNREF` は `ERR_INVALID_PARAMETER` で拒否する（表と合計は変えない）。実ゲストは
+//!   `UNMAP` → `UNREF` の順に出すので通常の流れは妨げない。拒否が起きるのは治具の `SHMEM_UNMAP` が失敗した後だけで、
+//!   その時点で frontend 側に map が残っているか分からないため、区間を解放して重なる map を許さない。残った資源は
+//!   セッション終了時の片づけ（`session` の `release_blobs_at_end`）が解放する。
+//! - D2: map 中の resource を持つ ctx の `CTX_DESTROY` は detach だけ行い、map は残す（map は ctx ではなくデバイスの
+//!   host-visible 領域に属する。`detach_all_from`）。
 
 /// 同時に持つ resource の上限件数。
 pub const MAX_RESOURCES: usize = 256;
@@ -219,7 +224,7 @@ impl ResourceTable {
             .and_then(|e| e.mapped)
     }
 
-    /// resource を消す。attach 中・map 中は `InvalidParameter`（map 中の拒否は暫定。#1645 で確定する）。
+    /// resource を消す。attach 中・map 中は `InvalidParameter`（map 中の拒否は D1。#1645 で確定）。
     pub fn unref(&mut self, res_id: u32) -> Result<(), ResourceError> {
         let e = self.find_mut(res_id).ok_or(ResourceError::InvalidId)?;
         if e.attached != 0 || e.mapped.is_some() {

@@ -264,11 +264,14 @@ macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なし�
 - 実装済み（F1.1・#1516）: vhost-user メッセージの codec（`vhost_user`。10.5）。virtqueue・セッションは F1.3・F1.4 で実装
 - 実装済み（F1.2・#1517）: `SCM_RIGHTS` の fd 送受信とゲストメモリの mmap のラッパー（`vhost_user::fd_passing` / `guest_memory`・`src/sys.rs`。Linux 限定。10.6）
 - **受入基準 2（ゲストの Mesa venus の capset クエリが自前デコーダに届いたことをログで確認）は未達**。トランスポート（後続 F1）と実機実行（F3・#725。人間担当）が必要なため
-- 後続（issue 起票は未実施・承認待ち）: F1 vhost-user トランスポート（メッセージ codec・fd 受け渡しと `mmap` の `sys` ラッパー・split virtqueue・kick / call。rust-vmm 系クレートは MVM-4 で使えないため自作）、F2 残りの ctrl 応答（10.4 節。`RESOURCE_CREATE_BLOB`・`SUBMIT_3D` 等は F5.2・#1601 で実装済み。`MAP_BLOB` / `UNMAP_BLOB` は F5.2b）、F3 実機疎通（#725）
+- 後続（issue 起票は未実施・承認待ち）: F1 vhost-user トランスポート（メッセージ codec・fd 受け渡しと `mmap` の `sys` ラッパー・split virtqueue・kick / call。rust-vmm 系クレートは MVM-4 で使えないため自作）、F2 残りの ctrl 応答（10.4 節。`RESOURCE_CREATE_BLOB`・`SUBMIT_3D` 等は F5.2・#1601 で、`MAP_BLOB` / `UNMAP_BLOB` は F5.2b.4a・#1643 で実装済み）、F3 実機疎通（#725）
 - 実装済み（F1.3・#1518）: split virtqueue（`virtqueue`。10.7）
 - 実装済み（F1.4・#1519）: vhost-user のセッションと ctrl キューの応答ループ（`session`。Linux 限定。10.8）。受入基準 2 は F3（#725）の実機待ちのまま
 - 実装済み（F5.2・#1601）: `RESOURCE_CREATE_BLOB`・`CTX_ATTACH_RESOURCE` / `DETACH_RESOURCE`・`RESOURCE_UNREF`（資源表 `resource`。計上のみで実メモリは確保しない）と `SUBMIT_3D` の最小応答（受理して受け渡し点 `Handled::submit` へ渡す。dispatch はしない）。10.3・10.4.3
-- 後続（F5。#1599）: F5.1（#1600）で capset 以降の ctrl の列と治具の応答範囲を一次情報で確かめて 10.4 節に記録した。F5.2（#1601）は ctrl の応答（共有メモリを要しない部分）、F6（#1602）は記録、共有メモリの対応（F5.2b。親 #1638 配下で進行中。F5.2b.1 #1639・F5.2b.2 #1641・F5.2b.3 #1642 は実装済み）は 10.4.4 節
+- 後続（F5。#1599）: F5.1（#1600）で capset 以降の ctrl の列と治具の応答範囲を一次情報で確かめて 10.4 節に記録した。F5.2（#1601）は ctrl の応答（共有メモリを要しない部分）、F6（#1602）は記録、共有メモリの対応（F5.2b。親 #1638 配下。F5.2b.1 #1639・F5.2b.2 #1641・F5.2b.3 #1642・F5.2b.4a #1643・F5.2b.4b #1645 は実装済みで、**F5.2b は完了**。残りは実機の #725）は 10.4.4 節
+- 実装済み（F5.2b.1〜F5.2b.3・#1639・#1641・#1642）: REPLY_ACK の応答、protocol feature `SHMEM` / `BACKEND_REQ` の広告と `GET_SHMEM_CONFIG` / `SET_BACKEND_REQ_FD`、backend 要求 `SHMEM_MAP` / `SHMEM_UNMAP` の期限つき送信（10.4.4・10.8）
+- 実装済み（F5.2b.4a・#1643）: ctrl の `RESOURCE_MAP_BLOB` / `UNMAP_BLOB`（blob ごとに memfd を作り、`SHMEM_MAP` で frontend へ渡す）。10.3・10.4.4
+- 実装済み（F5.2b.4b・#1645）: map 中の資源の解放の確定（map 中の `UNREF` は拒否、`CTX_DESTROY` は map を残す、map が残ったままの終了では期限つきで `SHMEM_UNMAP` を送ってから memfd を閉じる。10.4.3）と、ネゴシエーションから解放までの結合試験（`tests/shmem_lifecycle.rs`）
 - CI: `make poc-venus-jig-check`（fmt-check・clippy・test）は CI の `rust-ci-default-features` ジョブが 3 OS で実行し、`crates/plugin-macos` 側の変更による治具の破損を検出する（実機前提テストは `#[ignore]` で分離済みで CI では走らない）
 
 ### 10.2 候補比較
@@ -328,7 +331,7 @@ issue #1601（GPU-6・TASK-172 後続 F5.2）で追加した ctrl（値は同じ
 | `RESOURCE_UNREF` | 0x0102。要求長 32。attach 中は `ERR_INVALID_PARAMETER`。ヘッダの ctx は問わない |
 | `SUBMIT_3D` | 0x0207。固定部 32（ヘッダ + size 4 + padding 4）+ 本体。`size` = 本体の実長、要求全体 4096 以下。`INFO_RING_IDX` が立つときだけ ring_idx < 64。本体 0 バイトも受理 |
 | 追加エラー | `ERR_INVALID_RESOURCE_ID` 0x1203（res_id 0・重複・未作成）。件数・合計の上限は `ERR_OUT_OF_MEMORY` 0x1201 |
-| 未実装のまま | `RESOURCE_MAP_BLOB` 0x0208 / `UNMAP_BLOB` 0x0209（`ERR_UNSPEC`。F5.2b） |
+| map 中の `RESOURCE_UNREF` | `ERR_INVALID_PARAMETER` で拒否（確定。#1645・10.4.3） |
 
 ログ形式（数値と固定語彙のみ。復号できなかった値は -1。`blob_id` と本体のバイト列は出さない）:
 
@@ -337,10 +340,23 @@ issue #1601（GPU-6・TASK-172 後続 F5.2）で追加した ctrl（値は同じ
 - `venus_jig event=resource cmd=RESOURCE_UNREF res_id=1 result=ok`
 - `venus_jig event=submit_3d cmd=SUBMIT_3D ctx_id=1 ring_idx=0 size=256 venus_cmd=188 wire=ok result=ok`（`wire` は `ok` / `empty` / `none`〔拒否〕/ `venus_wire.*`）
 
+issue #1643（GPU-6・TASK-172 後続 F5.2b.4a）で追加した ctrl（値は `poc/venus-decoder/jig/src/ctrl.rs` の定数。ゲストのカーネルの `virtio_gpu.h` v6.12 と同じ）:
+
+| 項目 | 値 |
+| ---- | -- |
+| `RESOURCE_MAP_BLOB` | 0x0208。要求長 40（ヘッダ + resource_id 4 + padding 4 + offset 8）。ヘッダの `ctx_id` は 0（map は ctx ではなくデバイスの共有メモリ領域に属する）。成功は `OK_MAP_INFO` 0x1106（ヘッダ + map_info 4 + padding 4 = 32 バイト。map_info = CACHED 0x01） |
+| `RESOURCE_UNMAP_BLOB` | 0x0209。要求長 32（ヘッダ + resource_id 4 + padding 4）。成功は `OK_NODATA`（24 バイト） |
+| 失敗 | 共有メモリが未成立・frontend の失敗・期限切れ・切断は `ERR_UNSPEC`、memfd を作れないときは `ERR_OUT_OF_MEMORY`、検証の失敗（領域外・ページ境界・重なり・map 済み / 未 map）は `ERR_INVALID_PARAMETER`、未知の res は `ERR_INVALID_RESOURCE_ID` |
+
+- `venus_jig event=resource cmd=RESOURCE_MAP_BLOB res_id=7 offset=4096 size=8192 map_info=1 result=ok`（失敗は `map_info=-1 result=unspec` など）
+- `venus_jig event=resource cmd=RESOURCE_UNMAP_BLOB res_id=7 offset=4096 size=8192 result=ok`
+- `venus_jig event=blob_release mapped=1 unmapped=1 memfds=1`（#1645。セッション終了時の片づけの集計。10.4.4）
+
 ### 10.4 capset 以降の ctrl の列と治具の応答範囲（F5.1・#1600）
 
 TASK-172 後続 F5（#1599）の一次情報の確認。結論を先に書く。コードは変えていない（`poc/venus-decoder/jig/` は未変更）。
 
+- **（注記）結論 1・2 は F5.2b で対応済み（#1639〜#1645）**。以下は #1600 時点の記録として残す。
 - **結論 1（前提の不足）**: Mesa venus は capset を取る前に `virtgpu_init_params` で `VIRTGPU_PARAM_HOST_VISIBLE` か `VIRTGPU_PARAM_GUEST_VRAM` の一方を必須にしている。mainline カーネルの `HOST_VISIBLE` は virtio の共有メモリ領域 `VIRTIO_GPU_SHM_ID_HOST_VISIBLE`（id 1）が見えるときだけ真になり、`GUEST_VRAM` は mainline v6.12 に case が無い。今の治具は protocol feature を MQ と CONFIG しか広告せず共有メモリ領域を見せないので、**Mesa は `GET_CAPSET` も `CTX_CREATE` も出す前に中止する見込み**になる。10.2 節の「決め手」と #888 の受入基準 2 の前提（`required_params` を満たせば capset クエリが届く）はこの分だけ足りない。
 - **結論 2（治具の応答範囲）**: ctrl 単体の応答（資源表・`SUBMIT_3D` の受け取り）は #1601 の範囲として確定できる。ただし ring・reply 用の共有メモリ（`RESOURCE_MAP_BLOB`）は vhost-user の新しい仕組み（protocol feature `SHMEM` と `BACKEND_REQ`・`GET_SHMEM_CONFIG`・バックエンド要求）が前提で、本 Issue では実装を決めず承認待ちの別段（F5.2b）に切り出す。
 - **結論 3（記録対象）**: venus の通常のコマンドは共有メモリ上のリングに書かれ、`SUBMIT_3D` に載るのはリングの制御（作成・起床・破棄）だけ。
@@ -386,12 +402,12 @@ Mesa は 2 層で読む。Mesa は ctrl を直接出さず、DRM ioctl を呼ぶ
 | 1 | `virtgpu_init_params`（`virtgpu_init` の中で `init_capset` より前。1497・1667 行） | `GETPARAM`（`3D_FEATURES`・`CAPSET_QUERY_FIX`・`RESOURCE_BLOB`・`CONTEXT_INIT`、続けて `HOST_VISIBLE`、0 なら `GUEST_VRAM`） | なし（カーネル内で答える）。`HOST_VISIBLE` も `GUEST_VRAM` も 0 なら `VK_ERROR_INITIALIZATION_FAILED` で中止（1515〜1531 行） | `virtgpu_ioctl.c` 88〜125 行（`GUEST_VRAM` の case は無く `-EINVAL`）。`virtgpu_kms.c` 177〜191 行（`has_host_visible` は共有メモリ領域 id 1 の取得に成功したときだけ真） |
 | 2 | `virtgpu_init_capset`（1477 行） | `GET_CAPS`（capset id 4・version 0） | `GET_CAPSET`（カーネルのキャッシュに無いとき） | 10.3 と同じ。ここから先は 1 を越えたときだけ |
 | 3 | `virtgpu_init_context`（`virtgpu_ioctl_context_init`。600〜622 行） | `CONTEXT_INIT`（`CAPSET_ID`=4・`NUM_RINGS`=64・`POLL_RINGS_MASK`=0） | `CTX_CREATE`（0x0200）。`context_init` に capset id 4 が入る（`virtgpu_ioctl.c` の `create_context_locked`）。10.3 の「下位 8 bit が VENUS のときだけ受理」と矛盾しない | `virtgpu_ioctl.c` 42〜60 行、`virtgpu_vq.c` 912〜927 行 |
-| 4 | `virtgpu_shmem_create`（1289〜1326 行）。ring・cs pool・reply pool 用。`blob_mem`=HOST3D・`blob_flags`=USE_MAPPABLE・`blob_id`=0 | `RESOURCE_CREATE_BLOB`、続けて `MAP`（mmap 用のオフセット取得） | `RESOURCE_CREATE_BLOB`（0x010c。ヘッダの `ctx_id`=呼び出した ctx、`nr_entries`=0）→ GEM open で `CTX_ATTACH_RESOURCE`（0x0202）→ **作成の直後に** `RESOURCE_MAP_BLOB`（0x0208。`offset` は共有メモリ領域内。応答は `OK_MAP_INFO`）。`MAP_BLOB` は `DRM_IOCTL_VIRTGPU_MAP` ではなく作成時に出る | `virtgpu_ioctl.c` 一帯の `verify_blob` と `virtio_gpu_resource_create_blob_ioctl`、`virtgpu_vram.c` 141〜175・205〜222 行、`virtgpu_gem.c` 137 行、`virtgpu_vq.c` 1200〜1223・1242〜1262 行 |
+| 4 | `virtgpu_shmem_create`（1289〜1326 行）。ring・cs pool・reply pool 用。`blob_mem`=HOST3D・`blob_flags`=USE_MAPPABLE・`blob_id`=0 | `RESOURCE_CREATE_BLOB`、続けて `MAP`（mmap 用のオフセット取得） | `RESOURCE_CREATE_BLOB`（0x010c。ヘッダの `ctx_id`=呼び出した ctx、`nr_entries`=0）→ **作成の直後に** `RESOURCE_MAP_BLOB`（0x0208。`offset` は共有メモリ領域内。応答は `OK_MAP_INFO`）→ GEM handle の作成（GEM open）で `CTX_ATTACH_RESOURCE`（0x0202）。順は CREATE_BLOB → MAP_BLOB → ATTACH（F5.2b.4b・#1645 で v6.12 の一次情報から修正。`virtgpu_vram.c` 185〜222 行で `virtio_gpu_vram_create` が MAP を出し、`virtgpu_ioctl.c` 533 行の後の 554 行で `drm_gem_handle_create`、そこから `virtgpu_gem.c` 137 行の ATTACH）。`MAP_BLOB` は `DRM_IOCTL_VIRTGPU_MAP` ではなく作成時に出る | `virtgpu_ioctl.c` 一帯の `verify_blob` と `virtio_gpu_resource_create_blob_ioctl`、`virtgpu_vram.c` 141〜175・205〜222 行、`virtgpu_gem.c` 137 行、`virtgpu_vq.c` 1200〜1223・1242〜1262 行 |
 | 5 | `sim_syncobj_create`（`SIMULATE_SYNCOBJ`。初回のみ。143〜187 行） | `EXECBUFFER`（size 0・`RING_IDX`・`FENCE_FD_OUT`・`ring_idx` 0） | `SUBMIT_3D`（0x0207）の見込み。本体 0 バイトで flags に `FENCE` と `INFO_RING_IDX` | Mesa 側のみ確認。size 0 の execbuf が `SUBMIT_3D` を出すかは**未確認**（`virtgpu_submit.c` の size 0 経路を追っていない） |
 | 6 | `vn_ring_create`（`vkCreateRingMESA`。`vn_ring.c` 339〜361 行）→ `vn_renderer_submit_simple` → `sim_submit` | `EXECBUFFER`（`ring_idx` 0） | `SUBMIT_3D`。ペイロードは `vkCreateRingMESA` のエンコード。ring の共有メモリの `res_id` と各オフセットを持つ | `vn_ring.c` 339〜362 行。`vn_renderer_submit_simple` の定義は未取得のファイル（`vn_renderer_util.h`）にあり**未確認** |
 | 7 | 以降の venus コマンド（`vkEnumerateInstanceVersion`〜`vkCreateInstance`〜`vkQueueSubmit`） | なし（ring の共有メモリへ書く） | リングが idle のときの `vkNotifyRingMESA` だけが `SUBMIT_3D` で届く | `vn_ring.c` 427〜470・612〜636 行 |
 | 8 | reply（`vkSetReplyCommandStreamMESA` は ring に書く。reply 本体は reply pool の共有メモリ） | 4 と同じ blob 経路 | 4 と同じ | `vn_ring.c` 658〜727 行、`vn_instance.c` 300〜312 行 |
-| 9 | 解放（`virtgpu_shmem_destroy_now`。`vkDestroyRingMESA` は `vn_ring.c` 370〜378 行） | `GEM_CLOSE` | `CTX_DETACH_RESOURCE`（0x0203）→ `RESOURCE_UNMAP_BLOB`（0x0209）→ `RESOURCE_UNREF`（0x0102） | `virtgpu_gem.c` 159 行、`virtgpu_vram.c` 6〜20 行、`virtgpu_vq.c` 1226〜1240 行 |
+| 9 | 解放（`virtgpu_shmem_destroy_now`。`vkDestroyRingMESA` は `vn_ring.c` 370〜378 行） | `GEM_CLOSE` | `CTX_DETACH_RESOURCE`（0x0203）→ `RESOURCE_UNMAP_BLOB`（0x0209）→ `RESOURCE_UNREF`（0x0102） | `virtgpu_gem.c` 159 行、`virtgpu_vram.c` 6〜24 行、`virtgpu_vq.c` 1226〜1240 行。UNMAP には応答のコールバックが無く、カーネルは成否を見ずに UNREF を続けて出す（#1645） |
 | — | プロセス終了 | close | `CTX_DESTROY`（0x0201） | `virtgpu_vq.c` 930〜940 行 |
 
 0x0100 台と 0x0200 台の値は `virtio_gpu.h`（v6.12）72〜97 行の列挙から数えた値。エラー応答は同じ列挙の `ERR_UNSPEC`（0x1200）の後ろへ連番で、`ERR_OUT_OF_MEMORY` 0x1201・`ERR_INVALID_SCANOUT_ID` 0x1202・`ERR_INVALID_RESOURCE_ID` 0x1203・`ERR_INVALID_CONTEXT_ID` 0x1204・`ERR_INVALID_PARAMETER` 0x1205。
@@ -404,8 +420,8 @@ Mesa は 2 層で読む。Mesa は ctrl を直接出さず、DRM ioctl を呼ぶ
 | ---- | ---------- | ------------ | ---------------------- | ------------------------------------ |
 | `RESOURCE_CREATE_BLOB`（0x010c） | #1601: 成功（`OK_NODATA`）は HOST3D・`blob_flags` = MAPPABLE（0x0001）だけ・`blob_id` 0・`nr_entries` 0・ctx 作成済みのときだけ。それ以外の `blob_mem`・flags・`blob_id`・`nr_entries` は `ERR_INVALID_PARAMETER` | 件数 256・1 件の size 16 MiB・合計 64 MiB（案。根拠は下の「上限の根拠」） | res_id 0・重複・size 0・4096 の倍数でない size は拒否。`ctx_id` は作成済みの ctx。上限は確保より前に検査し、size は checked 演算 | #1601 は不要。**実際の確保**（memfd 等）は F5.2b |
 | `CTX_ATTACH_RESOURCE` / `DETACH_RESOURCE`（0x0202 / 0x0203） | #1601: 作成済みの ctx と res の組だけ成功。未知の ctx は `ERR_INVALID_CONTEXT_ID`、未知の res は `ERR_INVALID_RESOURCE_ID` | 資源表に所属 ctx の集合を持つ（上限は ctx 表の 64 × 資源表の件数の範囲内） | 二重 attach・未 attach の detach は `ERR_INVALID_PARAMETER` | 不要 |
-| `RESOURCE_UNREF`（0x0102） | #1601: 作成済みの res だけ成功し、表から消す。attach 中の res は拒否（`ERR_INVALID_PARAMETER`）。map 中の扱いは F5.2b で決める | 同上 | res_id の検査 | 不要（`munmap` は F5.2b） |
-| `RESOURCE_MAP_BLOB` / `UNMAP_BLOB`（0x0208 / 0x0209） | **#1601 では未実装のまま**（`ERR_UNSPEC`）。ゲストカーネルが作成直後に出すので、実装するとき F5.2b | — | `offset` が共有メモリ領域の内側で、`offset + size` が領域内、他の map と重ならないこと（F5.2b への申し送り） | 要る。protocol feature `SHMEM` と `BACKEND_REQ`、`GET_SHMEM_CONFIG`、バックエンド要求 `SHMEM_MAP` / `SHMEM_UNMAP`。10.4.4 |
+| `RESOURCE_UNREF`（0x0102） | #1601: 作成済みの res だけ成功し、表から消す。attach 中の res は拒否（`ERR_INVALID_PARAMETER`）。**map 中も拒否**（確定。#1645・D1。下の「解放の扱い」） | 同上 | res_id の検査 | 不要 |
+| `RESOURCE_MAP_BLOB` / `UNMAP_BLOB`（0x0208 / 0x0209） | **#1643 で実装済み**。MAP は resource の大きさの memfd を作って `SHMEM_MAP` で frontend へ渡し、`OK_MAP_INFO` を返す。UNMAP は `SHMEM_UNMAP` を送って `OK_NODATA`。共有メモリが未成立・frontend の失敗は `ERR_UNSPEC`（adapter は巻き戻す） | memfd は resource ごとに 1 本（UNMAP をまたいで UNREF・セッション終了まで保持し、再 MAP で再利用）。副表は資源表と同じ 256 件の固定長 | `offset` が共有メモリ領域の内側・ページ境界で、`offset + size` が領域内、他の map と重ならないこと。attach は要求しない（map は ctx に属さない）。未 map の UNMAP・map 済みの MAP は `ERR_INVALID_PARAMETER` | 要る。protocol feature `SHMEM` と `BACKEND_REQ`、`GET_SHMEM_CONFIG`、バックエンド要求 `SHMEM_MAP` / `SHMEM_UNMAP`。10.4.4 |
 | `SUBMIT_3D`（0x0207） | #1601: 受理して、ペイロードを記録の受け渡し点へ渡す。dispatch はしない（応答は `OK_NODATA` で、`FLAG_FENCE` なら fence を引き継ぐ） | ペイロードは上限つきの固定長（10.4.6） | ctx が作成済みか、`ring_idx` < 64（`INFO_RING_IDX` が立つときだけ見る。`NUM_RINGS`=64）、`size` とペイロード実長の一致。本体 0 バイトも受理 | 不要（既存の `SplitQueue` で連結できる範囲。10.4.6） |
 
 本 issue（#1601）で実装した内容（実装済み。上の表の「#1601:」の記述どおり）の補足:
@@ -414,6 +430,12 @@ Mesa は 2 層で読む。Mesa は ctrl を直接出さず、DRM ioctl を呼ぶ
 - `SUBMIT_3D` の本体が空でなければ先頭 8 バイトを `parse_command_header` で読むが、結果は応答の種別を変えない（ヘッダ不正・候補外の種別でも `OK_NODATA`）。治具は受け取りまでで実行しないので OK は「受け取った」の意味に留まり、検査結果はログ（`wire=`）と受け渡し点で #1602 / 解析側へ渡す
 - 受け渡し点は `adapter::Handled::submit`（`Submit3d`: ctx_id・ring_idx・fence_id・header・payload）。`session` は応答を書き戻せず adapter を巻き戻した要求の `submit` を捨てる契約で、ゲストが ACK を見ていない提出を記録しない。配線は #1602
 - 資源表は `CtrlAdapter` が所有する固定長配列（所属 ctx は ctx 表のスロット番号のビット集合）で、巻き戻しの対象に含まれる
+
+解放の扱い（F5.2b.4b・#1645。GPU-6・REPAIR-5）: 次の 3 つを確定した。
+
+- **D1 map 中の `RESOURCE_UNREF` は拒否する**（`ERR_INVALID_PARAMETER`。frontend へは何も送らず、資源表と memfd は残す）。理由: カーネルの正しい順（unmap → unref）では起きない。起きるのは治具の `SHMEM_UNMAP` が失敗した後だけ（カーネルは UNMAP の結果を見ずに UNREF を出す）。その時点で frontend 側に map が残っているか分からず、区間を解放すると重なる map を許しうる。crosvm は失敗応答の後に worker を止める見込み（10.4.4）で、暗黙の `SHMEM_UNMAP` が成功する場面はほとんど無い。暗黙の unmap を入れると UNREF が frontend とのやりとりを持ち、adapter と session の巻き戻しの契約が広がる。残った資源は D3 の片づけで解放する
+- **D2 map 中の res を持つ ctx の `CTX_DESTROY` は detach だけ行い、map は残す**（`OK_NODATA`。backend 要求は送らない）。理由: map はデバイスの host-visible 領域に属し、ctx には属さない（`MAP_BLOB` のヘッダの ctx_id は 0。治具も map に attach を要求しない）。その後の `UNMAP_BLOB` / `UNREF` はそのまま成功する（attach は暗黙に外れている）。プロセス終了では GEM の解放（unmap・unref）と `CTX_DESTROY` の前後が入れ替わりうる（dma-buf 等で参照が残ると object の解放が後になる）、という点は**見込み**で、`drm_file.c` までは確かめていない
+- **D3 map が残ったままのセッション終了は、期限つきで `SHMEM_UNMAP` を送ってから memfd を閉じる**。対象・順序・打ち切りは 10.4.4 の「終了時の片づけ」
 
 上限の根拠: Mesa が確保する共有メモリは、ring が 128 KiB に extra 4 バイトを足した大きさ（`vn_instance.c` 128〜140 行、`vn_ring.c` 262〜270 行付近のレイアウト。行番号は付近）、cs pool が 8 MiB、reply pool が 1 MiB（`vn_instance.c` 300〜312 行）。1 件 16 MiB は最大の cs pool の 2 倍、合計 64 MiB は同時に持つ ring・cs・reply の合計に余裕を足した値で、いずれも**案**（実機でプール拡張の挙動を確かめて#725 で見直す）。cs pool の拡張は `vn_cs.c` の `next_buffer_size` が倍々に増やすため、16 MiB を超える要求は拒否して Mesa に失敗を返す（`VK_ERROR_OUT_OF_DEVICE_MEMORY` で止まる見込みで、挙動は未確認）。
 
@@ -428,7 +450,12 @@ Mesa は 2 層で読む。Mesa は ctrl を直接出さず、DRM ioctl を呼ぶ
 - **GET_SHMEM_CONFIG の配置と治具の応答（F5.2b.2・#1641）**: 応答ペイロードは 2056 バイト（`nregions` u32・padding u32・`sizes` [u64; 256]）。crosvm の `get_shmem_config` は `sizes` を添字つきで列挙し**非 0 だけを残して** `nregions` 個を取り、添字がそのまま領域 id になる（`get_shared_memory_region` は 0 個なら無し、1 個ならそれ、2 個以上はエラー）。治具は **`nregions` = 1・`sizes[1]` = 134217728（128 MiB）・ほかは 0** を返す。`nregions` = 2・`sizes[0]` = 0 の形も crosvm は結果として id 1 だけを残すが、rst の定義（`nregions` は非 0 の領域の数）に反するので採らない。crosvm の PCI 層は `VirtioPciShmCap` の id へ `region.id` をそのまま入れるため、ゲストには id 1（`VIRTIO_GPU_SHM_ID_HOST_VISIBLE`）として見える見込みだが、**実機でゲストから見えるかは #725 で確かめる（未確認）**。2 の冪の制約は backend 側には無く、crosvm が BAR の大きさを `checked_next_power_of_two()` で切り上げる（cap の length は返した値のまま）。128 MiB は資源表の合計上限 64 MiB の 2 倍（連続領域の断片化の余裕。2 の冪で 4・16・64 KiB のどのページの倍数でもある）。出典の crosvm `devices/src/virtio/virtio_pci_device.rs`（コミット `044c3e3fc53d`）の SHA-256 は `8044bdb33a7362e64f4c022b858412650d7792f24a508220295824e04ce9907c`、`third_party/vmm_vhost/src/message.rs` の `VhostUserShMemConfig::new` と QEMU rst v11.1.0 の `GET_SHMEM_CONFIG` 節で配置を照合した。値・配置だけを転記し、crosvm のコードは写していない（MVM-4）
 - **SET_BACKEND_REQ_FD と確定の食い違い（F5.2b.2・#1641）**: 21 は `BACKEND_REQ` 確定後だけ受け付け、fd 1 本（socket かつ AF_UNIX。違えば `INVALID_BACKEND_REQ_FD`）を保持し、**2 回目は `OUT_OF_ORDER` で拒否**する（`SET_OWNER` の 2 回目と同じ fail-closed。置き換えを許すと #1642 で送信中の要求と応答がずれうる）。確定のやり直しは拒否せず（寛容）、保持した fd は接続の終わりまで持ち続ける。host-visible が使えるかは `State::host_visible` が毎回その時点の確定値から求め、理由は次の 5 つ（判定はこの順。5 つ目は #1642 で追加）: `shmem_not_negotiated`（SHMEM 未確定）・`config_not_queried`（44 に未回答）・`backend_req_not_negotiated`（SHMEM だけ確定）・`backend_channel_missing`（BACKEND_REQ は確定したが 21 が来ていない）・`backend_channel_broken`（送受信に失敗して閉じた）。使えるときは `ready`。`ready` 以外のときの `MAP_BLOB` は #1643 が ctrl の ERR で返し、セッションはエラー終了しない（crosvm の frontend も BACKEND_REQ が無いときは mapper を設定せずログへ出すだけ）。状態はセッション終了時に `host_visible` 行として残る
 - 未対応として残すもの（REPAIR-3）: 21 の fd が SOCK_STREAM かの検査（`getsockopt(SO_TYPE)` は `sys` の承認範囲 U1〜U11 外の `unsafe` になるため行わず、種類違いは #1642 の期限つき送受信で `TRANSPORT` か `TIMEOUT` になる）、ゲストへ id 1 として見えるかの実機確認（#725）
-- **backend 要求 `SHMEM_MAP` / `SHMEM_UNMAP` の送信（F5.2b.3・#1642。確認日 2026-10-10）**: 治具は `SET_BACKEND_REQ_FD` で保持した UDS へ、要求を NEED_REPLY つきで送り、frontend の u64 応答（0 = 成功、非 0 = 失敗）を確かめる。呼び出し元の ctrl（`MAP_BLOB` / `UNMAP_BLOB`）は #1643。実装は `vhost_user::backend_req`（codec。OS 非依存）と `session::backend_req`（期限つき送受信。Linux 限定）。
+- **MAP_BLOB / UNMAP_BLOB の実装（F5.2b.4a・#1643）**: blob（resource）ごとに `memfd_create` で resource の大きさの memfd を作り（名前は固定文字列 `venus-jig-blob`）、MAP の `SHMEM_MAP` で fd を frontend へ渡す。治具自身は mmap しない。memfd は UNMAP をまたいで UNREF・セッション終了まで保持し、再 MAP では同じ memfd（同じ内容）を渡す。MAP が失敗したら adapter を巻き戻し、新規に作った memfd は捨てる（再利用の memfd は残す）。UNMAP が失敗したら map 中のまま残す。応答の領域が足りない要求（writable の事前検査）は frontend へ送る前に捨てる
+- **終了時の片づけ（F5.2b.4b・#1645・D3）**: `serve` が戻った後（正常・エラーどちらも）、`State`（backend channel）を drop する前に、frontend が 0 を返して map 中の blob へ slot 順に 1 件ずつ `SHMEM_UNMAP` を送る。送る前に channel のゲートを通すので、未成立・`Broken` なら 1 バイトも送らない。**最初の失敗**（期限切れ・切断・非 0 の応答）で打ち切り、片づけ全体を `message_timeout` 1 つ分の期限で抑える（各送信の前に残り時間を見る。REPAIR-5）。最後に副表を空にして memfd を `Drop` で閉じる（フローは正常終了・エラー終了・片づけの失敗のどれでも同じで、閉じ忘れない）。frontend が受け取った複製の fd と mmap は治具が閉じても有効なまま。片づけの成否はセッションの結果（`Ok(PeerClosed)` / `Err`）を変えない。ログは送った分の `backend_req` 行と、集計の `blob_release mapped=<片づけ前の map 中の件数> unmapped=<0 が返った件数> memfds=<閉じた memfd の数>`（数値のみ。`host_visible` の後・`session_end` / `session_error` の前）
+  - 理由: **crosvm は backend の切断でも reset でも、SHMEM_MAP の map を自分から片づけない**。一次情報（コミット `044c3e3fc53d`。`worker.rs`・`mod.rs`・`handler.rs`・`frontend_server.rs` の SHA-256 は下の「一次情報」と同じ）: `vhost_user_frontend/worker.rs` 108 行付近の backend 要求ソケットの `ClientExit` / `Disconnect` は handler の監視をやめるだけで `remove_mapping` を呼ばない。128〜139 行付近で主ソケットの hangup は `Backend device disconnected early` のエラーになる。`mod.rs` 365〜373 行付近は worker がエラーで終わると `DeviceCrashed` を送り、486〜488 行の `reset()` には「TODO: Reset SHMEM_MAP mappings」とある。つまり crosvm は主ソケットが切れたら `DeviceCrashed`（VM ごと終わる）に任せる作りで、「切断で frontend が片付ける」前提には立てない。QEMU v11.1.0 以降のように frontend が生き続ける実装もありうるため、治具が自分で UNMAP して frontend の map の表を治具の状態と食い違わせない。主ソケットがすでに切れている場合は、多くは即座に `TRANSPORT`（`PEER_CLOSED` / `OS_ERROR` を含む失敗）で失敗して打ち切られる（送信は `MSG_NOSIGNAL` なので SIGPIPE は出ない）
+  - 照合: `tests/shmem_lifecycle.rs`（正常・エラー終了・channel が閉じている場合）と `session::map_blob_tests`（memfd 数・打ち切り・Broken）
+- **未確認のまま（#725）**: ring・reply・cs 用の共有メモリに `SHMEM_MAP` と `GPU_MAP` のどちらを使うか、`BACKEND_SEND_FD` の扱い、ゲストから id 1 が見えるかは、実機（#725）で確かめる。F5.2b.4b でも確定していない
+- **backend 要求 `SHMEM_MAP` / `SHMEM_UNMAP` の送信（F5.2b.3・#1642。確認日 2026-10-10）**: 治具は `SET_BACKEND_REQ_FD` で保持した UDS へ、要求を NEED_REPLY つきで送り、frontend の u64 応答（0 = 成功、非 0 = 失敗）を確かめる。呼び出し元の ctrl（`MAP_BLOB` / `UNMAP_BLOB`）は #1643 で実装済み。実装は `vhost_user::backend_req`（codec。OS 非依存）と `session::backend_req`（期限つき送受信。Linux 限定）。
   - **ワイヤー形式**: 要求は 52 バイト（ヘッダ `[9 または 10, 0x9, 40]` + `shmid` u8・padding 7・`fd_offset`・`shm_offset`・`len`・`flags` の各 u64）。flags の version は下位 2 bit で 0x1、bit 2 = REPLY（0x4）、bit 3 = NEED_REPLY（0x8）。応答は `[同じ ID, 0x5, 8]` + u64。9・10 は frontend 要求の `SET_VRING_ADDR`・`SET_VRING_BASE` と数値が重なるため、専用の `BackendRequestCode` と専用 codec を持つ（既存の `decode_reply` に渡すと `SET_VRING_ADDR` の応答として読む。試験で固定）。UNMAP は MAP と同じ区間（型で保証）・`fd_offset` と `flags` は 0・fd なし。rst は「既存の map と重なる map は失敗」「UNMAP は map 済み領域全体と一致」と定める（範囲の追跡は #1643）
   - **送る前の検査（fail-closed）**: shmid が `GET_SHMEM_CONFIG` で広告した領域であること、len が 0 でなくページ（4096）の倍数、`shm_offset` がページ境界、`shm_offset + len` が溢れず領域内、`fd_offset` がページ境界（mmap の offset 制約。issue の列挙より厳しい）、`fd_offset + len` が溢れない。flags は型として `MAP_RW` に固定。crosvm の `VhostUserMMap::is_valid` が拒否する条件（未定義 flags・溢れ）を含む
   - **fd の付け方**: crosvm の `handle_request` はヘッダ受信（`recv_header`）で添付 fd を受け、本体の受信側に fd が付いていると `InvalidMessage` にする。したがって fd は 52 バイトを送る最初の `sendmsg` に付ける（部分送信の残りは fd なし）。形式不正の要求には応答が返らず、治具側は期限切れになる
@@ -459,20 +486,19 @@ Mesa は 2 層で読む。Mesa は ctrl を直接出さず、DRM ioctl を呼ぶ
 
 - 見込み: `vn_instance_init_renderer_versions`（`vn_instance.c` 74〜113 行。`vkEnumerateInstanceVersion`）が、ring に書いたコマンドの reply を待つ最初の箇所。`vn_ring_submit_command` が reply を要するコマンドで `vn_ring_wait_seqno` を呼ぶ（`vn_ring.c` 700〜713・175〜192 行）。待ちはリングの head を見る `vn_relax` のポーリングで、タイムアウトで中止するか待ち続けるかは**未確認**（`vn_relax` の実装は `vn_common.c` にあり未取得）
 - このポーリングを越えるには、ホストが共有メモリ上のリングを消費して reply を書く必要がある。これには共有メモリ（F5.2b）と、コマンドの dispatch（TASK-177.x。`vkEnumerateInstanceVersion` の応答の符号化）が両方要る。自前デコーダには dispatch が無いので越えられない見込み
-- #725（TASK-172.h1・人間担当）の受入基準 1 は、「どこまで進み、どこで止まったか」の記録になる。現状の治具では**（結論 1 のとおり）capset の前で止まる**見込みで、共有メモリを入れても reply の待ちで止まる見込み
+- #725（TASK-172.h1・人間担当）の受入基準 1 は、「どこまで進み、どこで止まったか」の記録になる。F5.2b（#1639〜#1645）で共有メモリが成立すれば、HOST_VISIBLE の成立 → capset → ring / cs / reply の blob の map → `vkCreateRingMESA` の `SUBMIT_3D` まで進み、**最初の reply 待ち（`vkEnumerateInstanceVersion`）で止まる**見込み（dispatch が無いため。実機は未確認）。F5.2b より前の治具は結論 1 のとおり capset の前で止まった
 - 治具側のタイムアウト（REPAIR-5。10.8 節の `message_timeout` / `idle_timeout`）は、ゲストの待ちとは別にホスト側の切断を保証する
 
 #### 10.4.8 範囲外にしたもの（理由つき）と 10.3 の表との対応
 
 | 項目 | 範囲外にした理由 |
 | ---- | ---------------- |
-| `RESOURCE_MAP_BLOB` / `UNMAP_BLOB` の実装 | 共有メモリ（`SHMEM`・`BACKEND_REQ`）が前提で、承認待ちの F5.2b。#1057（共有メモリ方式の判定）とも関わる |
 | リングの消費と dispatch | TASK-177.x（デコーダ本体）の範囲 |
 | `GET_DISPLAY_INFO` の scanout あり・`RESOURCE_CREATE_2D` 系・cursor | 最小 compute の ctrl の列に出ない（10.4.2 の表に無い） |
 | `RESOURCE_CREATE_BLOB` の `GUEST` / `HOST3D_GUEST`・`USE_SHAREABLE` / `USE_CROSS_DEVICE` | ring・cs・reply の用途は HOST3D・MAPPABLE・`blob_id` 0 だけ。sg を要する経路は範囲外 |
 | `ERR_INVALID_SCANOUT_ID`（0x1202） | scanout を持たないため使わない |
 
-10.3 の表との対応: 既存の `GET_CAPSET_INFO` / `GET_CAPSET`・`GET_DISPLAY_INFO`・`CTX_CREATE` / `CTX_DESTROY` は変更しない。追加するのは上の表の `RESOURCE_CREATE_BLOB`・`CTX_ATTACH_RESOURCE` / `DETACH_RESOURCE`・`RESOURCE_UNREF`・`SUBMIT_3D` の応答で、`MAP_BLOB` / `UNMAP_BLOB` は引き続き未実装（`ERR_UNSPEC`）。上の 5 種の応答は #1601 で実装済み。製品版の ctrl 枠は TASK-175.1.3（#915）・TASK-176.1（#749）。
+10.3 の表との対応: 既存の `GET_CAPSET_INFO` / `GET_CAPSET`・`GET_DISPLAY_INFO`・`CTX_CREATE` / `CTX_DESTROY` は変更しない。追加するのは上の表の `RESOURCE_CREATE_BLOB`・`CTX_ATTACH_RESOURCE` / `DETACH_RESOURCE`・`RESOURCE_UNREF`・`SUBMIT_3D` の応答で、`MAP_BLOB` / `UNMAP_BLOB` は後に F5.2b.4a（#1643）で実装した（10.3 の表）。上の 5 種の応答は #1601 で実装済み。製品版の ctrl 枠は TASK-175.1.3（#915）・TASK-176.1（#749）。
 
 ### 10.5 vhost-user メッセージの値（F1.1・#1516）
 
@@ -601,14 +627,14 @@ frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲスト
 - fd の個数: `SET_MEM_TABLE` は領域数、NOFD でない kick / call と `SET_BACKEND_REQ_FD` は 1、それ以外は 0。復号の後に照合し、合わなければ `FD_COUNT_MISMATCH` / `UNEXPECTED_FDS`。受け取った fd は `OwnedFd` で、どのエラー経路でも `Drop` で閉じる。fd は各メッセージの最初の受信でだけ受け付ける
 - タイムアウト（REPAIR-5）: `SessionLimits` の `message_timeout`（1 メッセージの受信・応答送信・call の書き込み。超過は `TIMEOUT`）と `idle_timeout`（無通信。超過は `IDLE_TIMEOUT`）。どちらも 0 より大きく 1 時間以下
 - 応答ループ: socket と ctrl キューの kick を、単一 fd 用の `sys::wait_fd` で `poll_slice`（既定 10ms）ずつ交互に待つ。1 回の kick で最大 `num` 件を処理して used へ書き、1 件以上なら call へ 1 を書く。`pop` / `add_used` の失敗はセッションを終了する（壊れたキューを黙って続けない）。writable が応答に足りない要求は応答を捨てて len=0 で返し、`response_dropped` の行を出してセッションは続ける。readable が 4 KiB を超える要求はアダプタへ渡さず `ERR_INVALID_PARAMETER`
-- ログ: 既存の `venus_jig event=...` 形式を保つ。追加は `session_error`（`code`・`request`）・`need_reply_ack`（`request`・`result=ok|err`）・`need_reply_ignored`・`response_dropped`・`session_end`、F5.2b.2（#1641）の `shmem_config`（44 の応答。`nregions`・`shmid`・`size`）・`backend_req`（21 の受理）・`host_visible`（セッション終了時の成立状況。語彙は `ready`・`shmem_not_negotiated`・`config_not_queried`・`backend_req_not_negotiated`・`backend_channel_missing`）。固定語彙と数値だけで、frontend やゲスト由来のバイト列・fd 番号・GPA は出さない
+- ログ: 既存の `venus_jig event=...` 形式を保つ。追加は `session_error`（`code`・`request`）・`need_reply_ack`（`request`・`result=ok|err`）・`need_reply_ignored`・`response_dropped`・`session_end`、F5.2b.2（#1641）の `shmem_config`（44 の応答。`nregions`・`shmid`・`size`）・`backend_req`（21 の受理）・`host_visible`（セッション終了時の成立状況。語彙は `ready`・`shmem_not_negotiated`・`config_not_queried`・`backend_req_not_negotiated`・`backend_channel_missing`・`backend_channel_broken`）、F5.2b.3 / F5.2b.4a の `backend_req`（`cmd=` つき。送信を試みた 1 回につき 1 行。終了時の `SHMEM_UNMAP` を含む）、F5.2b.4b（#1645）の `blob_release`（終了時の片づけの集計）。固定語彙と数値だけで、frontend やゲスト由来のバイト列・fd 番号・GPA は出さない
 - NEED_REPLY への応答（F5.2b.1・#1639）: `REPLY_ACK` の確定は `State::handle` の後で判定する（NEED_REPLY つきの `SET_PROTOCOL_FEATURES` 自体にも応答する）。確定済みなら次のとおり。確定していないセッションは従来どおり `SET_*` に応答せず `need_reply_ignored` を 1 行出す。応答は fd なしの既存送信経路で、`message_timeout` の期限を守る
   - 応答本体を持たない要求（`SET_*`）の成功: size 8・REPLY の u64 で値 0 を返し、`need_reply_ack ... result=ok` を出す
   - `GET_*`（`GET_FEATURES`・`GET_PROTOCOL_FEATURES`・`GET_QUEUE_NUM`・`GET_VRING_BASE`・`GET_CONFIG`）: rst の REPLY_ACK 節（応答本体を持つ要求は挙動が変わらない）に従い、既存の応答で兼ねる。追加の u64 は送らない。ack の型は `GET_*` の要求 ID では作れない
   - `SET_*` の失敗: 値 1 の ack を返してから既存のエラーでセッションを終える（rst は非 0 を受けた QEMU が終了すると想定）。ログは `need_reply_ack ... result=err` の後に `session_error`。ack の送信に失敗しても元のエラーを優先し、その場合 `need_reply_ack` は出さない
   - `GET_*` の失敗: 応答せずセッションを終える（ack の値が応答値と誤解されるのを避ける）
   - メッセージの読み取り段階の失敗（codec の復号エラー・`UNKNOWN_REQUEST`・fd 個数の不一致）には応答しない。信頼できない、または不整合なメッセージへ応答しない fail-closed の判断で、相手には切断（EOF）が見える
-- 21 で受けた fd（backend 要求用の UDS）は `State` が保持し、セッションの終了（正常もエラーも）の drop で閉じる。backend 要求の送信（`SHMEM_MAP` / `SHMEM_UNMAP`）は F5.2b.3（#1642。10.4.4 節）で実装済みで、channel は送受信の失敗で `Broken` になる（`host_visible` の理由 `backend_channel_broken`）。`MAP_BLOB` の ERR 化は #1643。確定の食い違いの扱いは 10.4.4 節
+- 21 で受けた fd（backend 要求用の UDS）は `State` が保持し、セッションの終了（正常もエラーも）の drop で閉じる。その前に、map が残った blob へ `SHMEM_UNMAP` を送って memfd を閉じる終了時の片づけを行う（F5.2b.4b・#1645。10.4.4 節）。backend 要求の送信（`SHMEM_MAP` / `SHMEM_UNMAP`）は F5.2b.3（#1642。10.4.4 節）で実装済みで、channel は送受信の失敗で `Broken` になる（`host_visible` の理由 `backend_channel_broken`）。`MAP_BLOB` の ERR 化は #1643 で実装済み。確定の食い違いの扱いは 10.4.4 節
 - 扱わない（REPAIR-3）: cursorq（ring 1）の要求処理、`SET_CONFIG`、`VRING_NOFD`、inflight、`INDIRECT` / `EVENT_IDX`、`observe::snapshot_lines` の定期出力と virtqueue 個別の観測カウンタ（終了時の集計出力は `session::run` で実装済み）
 - peer credential の検証（PLUG-12）は起動入口が accept 直後に `SO_PEERCRED`（`sys::peer_uid`＝U11）で行い、`session::run` は照合済みの `UnixStream` を受け取る API に留める。UDS の bind と所有者・権限・symlink の検証は起動入口（10.9）が行う。治具は PoC で、実機の実行は人間が担当する閉じた環境という前提
 - 承認事項: socket と kick を同時に待つ複数 fd の `ppoll` は `sys.rs` の `unsafe`（U10）の変更になるため行っていない。kick への反応に最大 `poll_slice` の遅延が乗る

@@ -161,6 +161,43 @@ pub fn setup_ring0_shmem(
     configure_ring0(sock, writable_len, tag)
 }
 
+/// [`setup_ring0_shmem`] の値を照合する版（ゲストのカーネルの前に frontend が行うネゴシエーションの一連。#1645）。
+///
+/// `GET_SHMEM_CONFIG` の応答が `nregions` = 1・`sizes[1]` = 134217728（128 MiB）であること、`SET_BACKEND_REQ_FD` を
+/// NEED_REPLY つきで送って値 0 の ack（20 バイト）が返ることを確かめる。
+#[allow(dead_code)]
+pub fn setup_ring0_shmem_checked(
+    sock: UnixStream,
+    writable_len: u32,
+    tag: &str,
+    backend: std::os::fd::BorrowedFd<'_>,
+) -> Frontend {
+    send(&sock, &Request::GetFeatures, &[]);
+    assert_eq!(
+        recv_reply(&sock, RequestCode::GetFeatures),
+        Reply::Features(FEATURES)
+    );
+    send(&sock, &Request::SetOwner, &[]);
+    send(&sock, &Request::GetProtocolFeatures, &[]);
+    assert_eq!(
+        recv_reply(&sock, RequestCode::GetProtocolFeatures),
+        Reply::ProtocolFeatures(0x0040_0229)
+    );
+    send(&sock, &Request::SetProtocolFeatures(0x0040_0229), &[]);
+    send(&sock, &Request::GetShmemConfig, &[]);
+    let Reply::ShmemConfig(cfg) = recv_reply(&sock, RequestCode::GetShmemConfig) else {
+        panic!("shmem config reply expected");
+    };
+    assert_eq!((cfg.nregions(), cfg.size(1)), (1, 134_217_728));
+    send_need_reply(&sock, &Request::SetBackendReqFd, &[backend]);
+    assert_eq!(
+        recv_raw(&sock, 20),
+        vec![21, 0, 0, 0, 5, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    );
+    send(&sock, &Request::SetFeatures(FEATURES), &[]);
+    configure_ring0(sock, writable_len, tag)
+}
+
 fn configure_ring0(sock: UnixStream, writable_len: u32, tag: &str) -> Frontend {
     let mem = memfd(&unique_name(tag), MEM_LEN);
     let table = MemTable::new(&[MemRegion {
@@ -246,7 +283,8 @@ pub fn used(fe: &Frontend) -> [u8; 12] {
     u
 }
 
-/// n 番目（0..4）の要求を ring 0 へ積んで kick し、call を待つ。descriptor は 2n（readable・NEXT）と 2n+1（writable）。
+/// n 番目の要求を ring 0 へ積んで kick し、call を待つ。descriptor は 2(n%4)（readable・NEXT）と 2(n%4)+1（writable）。
+/// 応答の領域は 4 要求ごとに上書きされるので、`resp_type` / `used_len` は各 `post` の直後に読む。
 #[allow(dead_code)]
 pub fn post(fe: &Frontend, n: u16, req: &[u8], writable_len: u32) {
     let desc = |addr: u64, len: u32, flags: u16, next: u16| {
@@ -257,9 +295,11 @@ pub fn post(fe: &Frontend, n: u16, req: &[u8], writable_len: u32) {
         d.extend_from_slice(&next.to_le_bytes());
         d
     };
-    let req_addr = 0x4000 + u64::from(n) * 0x400;
-    let resp_addr = 0x5000 + u64::from(n) * 0x400;
-    let head = 2 * n;
+    // 通し番号 n は 4 以上でもよい（要求・応答の領域と descriptor の対は n % 4、avail の slot は n % 8 で使い回す）。
+    let pair = n % 4;
+    let req_addr = 0x4000 + u64::from(pair) * 0x400;
+    let resp_addr = 0x5000 + u64::from(pair) * 0x400;
+    let head = 2 * pair;
     let readable = u32::try_from(req.len()).expect("len");
     fe.mem
         .write_at(&desc(req_addr, readable, 1, head + 1), u64::from(head) * 16)
@@ -272,10 +312,10 @@ pub fn post(fe: &Frontend, n: u16, req: &[u8], writable_len: u32) {
         .expect("desc w");
     fe.mem.write_at(req, req_addr).expect("req");
     fe.mem
-        .write_at(&head.to_le_bytes(), 0x1004 + u64::from(n) * 2)
+        .write_at(&head.to_le_bytes(), 0x1004 + u64::from(n % 8) * 2)
         .expect("ring");
     fe.mem
-        .write_at(&(n + 1).to_le_bytes(), 0x1002)
+        .write_at(&n.wrapping_add(1).to_le_bytes(), 0x1002)
         .expect("idx");
     (&fe.kick).write_all(&1u64.to_le_bytes()).expect("kick");
     wait_call(fe);
@@ -285,7 +325,7 @@ pub fn post(fe: &Frontend, n: u16, req: &[u8], writable_len: u32) {
 pub fn resp_type(fe: &Frontend, n: u16) -> u32 {
     let mut b = [0u8; 4];
     fe.mem
-        .read_at(&mut b, 0x5000 + u64::from(n) * 0x400)
+        .read_at(&mut b, 0x5000 + u64::from(n % 4) * 0x400)
         .expect("resp");
     u32::from_le_bytes(b)
 }
@@ -294,7 +334,7 @@ pub fn resp_type(fe: &Frontend, n: u16) -> u32 {
 pub fn used_len(fe: &Frontend, n: u16) -> u32 {
     let mut b = [0u8; 4];
     fe.mem
-        .read_at(&mut b, 0x2000 + 4 + u64::from(n) * 8 + 4)
+        .read_at(&mut b, 0x2000 + 4 + u64::from(n % 8) * 8 + 4)
         .expect("used len");
     u32::from_le_bytes(b)
 }

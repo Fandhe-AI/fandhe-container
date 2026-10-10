@@ -170,15 +170,6 @@ jobs:
   # `--all-features` の clippy / test → 結合試験のステップ（旧 integration-test）。Linux 限定の
   # AppArmor 緩和は結合試験の通常実行より後ろに置く（下記「unshare_isolation」の項参照）。
   #
-  # docs のみの変更での省略（pull_request のみ）: 最初の判定ステップ（id: changes）が、
-  # PR の差分が docs だけかを出力 docs_only に書く。docs_only == 'true' のとき、macOS・Windows
-  # ではツールチェーン導入・cargo 系・結合試験・自己テストのステップを `if:` で飛ばす。
-  # ubuntu は常に全ステップを実行する（docs の変更でも Linux では全ゲートを通す）。ジョブ自体は
-  # 常に実行されて success を返すため、必須チェック `platform-ci (<os>)` が欠けることはない。
-  # docs とみなすパスは判定ステップのコメントを参照。push（main）・workflow_dispatch では
-  # 判定ステップ自体を実行せず（出力が空になり `!= 'true'` が成り立つ）、常に全ステップを実行する。
-  # 判定に失敗した場合も docs_only は 'true' にならず全ステップを実行する（fail-closed）。
-  #
   # キャッシュ: 旧 rust-ci-default-features・旧 integration-test と同じく actions/cache を
   # 使わない（毎回コールドビルド）。reusable の cache は Windows で prune ステップが正当な
   # crate 名を誤検出する既知の問題（fandhe-browser PR #409）があり、本ジョブは reusable を
@@ -333,68 +324,7 @@ jobs:
       # ビルド・存在確認・実行の全ステップで同一値を参照する（#827）
       INTEGRATION_TEST_FEATURES: fandhe-container-io/crash-test-server
     steps:
-      # docs のみ判定（下の changes ステップ）で PR のマージコミットの親（base 側）を参照するため
-      # fetch-depth: 2 にする（pull_request の checkout は refs/pull/<n>/merge のマージコミット）
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-        with:
-          fetch-depth: 2
-      # docs のみの変更かの判定（pull_request のみ。上のジョブコメント参照）。
-      # マージコミット HEAD の第 1 親（PR 作成時点の base 先端）との差分 `git diff HEAD^1 HEAD` は
-      # `<base>...HEAD`（merge-base からの PR の差分）と一致する。--no-renames で rename を
-      # 削除＋追加の 2 パスに分け、移動元（コード側）を見落とさない。core.quotePath=false で
-      # 非 ASCII のパスを引用符なしで出す（引用符付きは docs と一致せず fail-closed 側に倒れる）。
-      # docs とみなすパス: docs/**（docs/spec の gitlink を含む）・.claude/**・.agents/**・
-      # skills-lock.json・*.md。ただし crates/・benches/・poc/・scripts/ 配下は .md でも docs と
-      # みなさない（crates/cri/tests/proto_placement.rs が include_str!("../proto/README.md") で
-      # .md を読むため、コード側ディレクトリの .md はビルド・テストの入力になり得る）。
-      # docs/spec を docs 扱いにできる根拠: checkout は submodule を取得せず、コード・build.rs・
-      # テスト・CI の make ターゲットは docs/spec を読まない（ci.md・spec-reference.md の規約）。
-      # fail-closed: マージコミットでない・HEAD^2 が PR の head と一致しない・git が失敗した・
-      # 差分が空・docs 外のパスを含む、のいずれでも docs_only=false（全ステップを実行）にする。
-      # ステップ自体は失敗させない（continue-on-error は想定外の失敗に対する保険。失敗時は出力が
-      # 書かれず `!= 'true'` が成り立ち全ステップを実行する）。`${{ }}` は run へ埋め込まず env 経由
-      - name: docs のみの変更かの判定（pull_request のみ。macOS・Windows の省略判定）
-        id: changes
-        if: github.event_name == 'pull_request'
-        continue-on-error: true
-        timeout-minutes: 2
-        env:
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -uo pipefail
-          docs_only=false
-          reason=""
-          read -r -a parents <<< "$(git rev-list --parents -n 1 HEAD 2>/dev/null || true)"
-          if [ "${#parents[@]}" -ne 3 ]; then
-            reason="HEAD is not a merge commit"
-          elif [ "${parents[2]}" != "${PR_HEAD_SHA}" ]; then
-            reason="HEAD^2 does not match the pull request head"
-          elif ! files="$(git -c core.quotePath=false diff --name-only --no-renames HEAD^1 HEAD)"; then
-            reason="git diff failed"
-          elif [ -z "${files}" ]; then
-            reason="empty diff"
-          else
-            docs_only=true
-            while IFS= read -r f; do
-              case "${f}" in
-                crates/*|benches/*|poc/*|scripts/*) docs_only=false ;;
-                docs/*|.claude/*|.agents/*|skills-lock.json|*.md) ;;
-                *) docs_only=false ;;
-              esac
-              if [ "${docs_only}" = "false" ]; then
-                reason="non-docs path changed: ${f}"
-                break
-              fi
-            done <<< "${files}"
-          fi
-          echo "docs_only=${docs_only}" >> "${GITHUB_OUTPUT}"
-          if [ "${docs_only}" = "true" ]; then
-            msg="docs-only change: heavy steps are skipped on macOS/Windows (always run on Linux)"
-          else
-            msg="full run: ${reason}"
-          fi
-          echo "${msg}" >> "${GITHUB_STEP_SUMMARY}"
-          echo "::notice::${msg}"
       # REPAIR-7 ステージ 5（セキュリティチェック・依存監査。TASK-86.4・#38）の
       # 前提ファイル検証（fail-closed）。rust-ci が呼ぶ reusable
       # rust-base-ci.yml 側の deny ジョブは、Cargo.toml・deny.toml のいずれかが
@@ -422,7 +352,6 @@ jobs:
       # stable（rust-toolchain.toml の channel = "stable" を単一真実源として追従）。
       # rustfmt は下の venus 試験治具の fmt-check（make poc-venus-jig-check）が使う
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
-        if: (runner.os == 'Linux' || steps.changes.outputs.docs_only != 'true')
         with:
           toolchain: stable
           components: clippy, rustfmt
@@ -430,28 +359,24 @@ jobs:
       # members から外れると cargo test --workspace が機械照合テストごと実行しなくなるため、
       # workspace 外の make ターゲットで検出する。既存ジョブへの追加（新ジョブは必須チェック名が増える）
       - name: workspace manifest・supervisor 登録の検証
-        if: (runner.os == 'Linux' || steps.changes.outputs.docs_only != 'true')
         shell: bash
         run: make check-workspace-manifest
       - name: cargo build（既定 feature。ステージ 1）
-        if: (runner.os == 'Linux' || steps.changes.outputs.docs_only != 'true')
         run: cargo build --workspace
       - name: cargo clippy（既定 feature）
-        if: (runner.os == 'Linux' || steps.changes.outputs.docs_only != 'true')
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test（既定 feature）
-        if: (runner.os == 'Linux' || steps.changes.outputs.docs_only != 'true')
         run: cargo test --workspace
       # macOS・Windows の `--all-features` の clippy / test（2026-10-10 の再構成で rust-ci〔reusable
       # rust-base-ci.yml の clippy / test ジョブ〕から移したもの）。コマンドは reusable と同一
       # （`--locked` なし）。Linux は rust-ci (ubuntu-latest) が実行するため重複させない。
       # timeout-minutes は reusable の clippy / test ジョブの既定値（各 30 分）に合わせる
       - name: cargo clippy（--all-features。macOS・Windows のみ）
-        if: runner.os != 'Linux' && steps.changes.outputs.docs_only != 'true'
+        if: runner.os != 'Linux'
         timeout-minutes: 30
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: cargo test（--all-features。macOS・Windows のみ）
-        if: runner.os != 'Linux' && steps.changes.outputs.docs_only != 'true'
+        if: runner.os != 'Linux'
         timeout-minutes: 30
         run: cargo test --workspace --all-features
       # rustdoc の警告（壊れた intra-doc リンク・private 項目へのリンク等）を -D warnings で fail
@@ -461,19 +386,16 @@ jobs:
       # 3 OS で実行する: cfg(target_os) 限定の項目へのリンクは OS ごとに解決結果が変わり、Linux
       # では通るが macOS / Windows でだけ壊れる（またはその逆の）リンクがあるため
       - name: cargo doc（既定 feature・-D warnings）
-        if: (runner.os == 'Linux' || steps.changes.outputs.docs_only != 'true')
         shell: bash
         timeout-minutes: 10
         run: make doc
       # core の plugin 無効構成（--no-default-features）の検証（PLUG-3・TASK-111.1・#262）。
       # 新ジョブは必須チェック名が増えるため既存ジョブへのステップとして追加する。
       - name: core plugin 無効構成の検証
-        if: (runner.os == 'Linux' || steps.changes.outputs.docs_only != 'true')
         shell: bash
         run: make test-core-no-plugin
       # CLI がバックエンド実装 crate へ直接依存しない（CLI-1・PLUG-4・TASK-79.4）。既存ジョブへのステップ追加
       - name: cli のバックエンド直接依存なしの検証
-        if: (runner.os == 'Linux' || steps.changes.outputs.docs_only != 'true')
         shell: bash
         run: make check-cli-backend-deps
       # venus 試験治具（poc/venus-decoder/jig。GPU-6・TASK-172.4・#888）の fmt-check・clippy・test。
@@ -487,7 +409,6 @@ jobs:
       # されない）。target は治具ディレクトリ配下（.gitignore 済み）に作る。
       # 新ジョブは check-run 名が増えるため既存ジョブのステップとする（check-run 件数は不変）
       - name: venus 試験治具の fmt-check・clippy・test（GPU-6・TASK-172.4）
-        if: (runner.os == 'Linux' || steps.changes.outputs.docs_only != 'true')
         shell: bash
         timeout-minutes: 15
         run: make poc-venus-jig-check
@@ -507,7 +428,6 @@ jobs:
 
       # 以下は旧 integration-test のステップ（REPAIR-7 ステージ 3: タイムアウト保護された結合試験）
       - name: integration test target 件数の判定
-        if: (runner.os == 'Linux' || steps.changes.outputs.docs_only != 'true')
         id: count
         run: |
           set -euo pipefail
@@ -518,15 +438,11 @@ jobs:
           echo "::notice::integration test targets: ${count}"
 
       - name: 結合試験のビルド（ステージ 3。実行タイムアウトの時間枠を消費しないよう分離）
-        if: >-
-          (runner.os == 'Linux' || steps.changes.outputs.docs_only != 'true')
-          && steps.count.outputs.count != '0' && env.HANG_PROBE != 'true'
+        if: steps.count.outputs.count != '0' && env.HANG_PROBE != 'true'
         run: cargo test --workspace --test '*' --features "${INTEGRATION_TEST_FEATURES}" --no-run
 
       - name: crash_safety の存在確認（IO-3・TASK-18.3.1。glob による無言除外の検出）
-        if: >-
-          (runner.os == 'Linux' || steps.changes.outputs.docs_only != 'true')
-          && steps.count.outputs.count != '0' && env.HANG_PROBE != 'true'
+        if: steps.count.outputs.count != '0' && env.HANG_PROBE != 'true'
         run: |
           set -euo pipefail
           listed="$(cargo test --workspace --test '*' --features "${INTEGRATION_TEST_FEATURES}" -- --list)"
@@ -555,7 +471,7 @@ jobs:
           echo "::notice::crash_safety (IO-3) listed"
 
       - name: ハングプローブ crate の生成（workflow_dispatch の hang-probe=true 時のみ）
-        if: (runner.os == 'Linux' || steps.changes.outputs.docs_only != 'true') && env.HANG_PROBE == 'true'
+        if: env.HANG_PROBE == 'true'
         run: |
           set -euo pipefail
           probe_dir="${RUNNER_TEMP}/hang-probe"
@@ -593,7 +509,6 @@ jobs:
           cargo test --manifest-path "${probe_dir}/Cargo.toml" --no-run
 
       - name: 結合試験の実行（ステージ 3・タイムアウト保護。REPAIR-5 / REPAIR-7）
-        if: (runner.os == 'Linux' || steps.changes.outputs.docs_only != 'true')
         timeout-minutes: 10
         env:
           # 前段ステップの outputs も `${{ }}` を run: へ直接埋め込まず env 経由で
@@ -623,7 +538,7 @@ jobs:
       # `ln -s` が複製になるため、空白を含むパスと複製の経路だけを確かめる（詳細は自己テスト冒頭のコメント）。
       # 新ジョブは check-run 名が増えるため既存ジョブのステップとする（check-run 件数は不変）
       - name: PLUG-4 判定スクリプトの自己テスト（TASK-109.4・REPAIR-12。ubuntu・macos・windows）
-        if: (runner.os == 'Linux' || steps.changes.outputs.docs_only != 'true') && env.HANG_PROBE != 'true'
+        if: env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: make plug4-core-invariance-selftest
 
@@ -635,14 +550,14 @@ jobs:
       # bash でレシピを実行する。本ジョブの既定 feature 側のステップも windows で make を使う）。
       # 新ジョブは check-run 名が増えるため既存ジョブのステップとする（check-run 件数は不変）
       - name: CLI 3 OS 比較スクリプトの自己テスト（TASK-125.1・CLI-1。ubuntu・macos・windows）
-        if: (runner.os == 'Linux' || steps.changes.outputs.docs_only != 'true') && env.HANG_PROBE != 'true'
+        if: env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: make cli-parity-selftest
 
       # capture のタイムアウトでネイティブ exe の子孫が回収されるかの実測（#1548・TASK-125・CLI-1・REPAIR-5）。
       # ログの `cli-parity native reclaim:` 行が Windows での確認結果。既存ジョブのステップ（check-run 件数は不変）
       - name: CLI 比較スクリプトのタイムアウト回収確認（ネイティブ exe・#1548）
-        if: (runner.os == 'Linux' || steps.changes.outputs.docs_only != 'true') && env.HANG_PROBE != 'true'
+        if: env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: make cli-parity-native-reclaim-check
 
@@ -654,7 +569,7 @@ jobs:
       # 自己テストの実行環境として 3 OS で回す。新ジョブは check-run 名が増えるため既存ジョブの
       # ステップとする（check-run 件数は不変）
       - name: virtio-gpu ゲスト側確認スクリプトの自己テスト（TASK-172.6・GPU-6。ubuntu・macos・windows）
-        if: (runner.os == 'Linux' || steps.changes.outputs.docs_only != 'true') && env.HANG_PROBE != 'true'
+        if: env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: make vz-virtio-gpu-guest-check-selftest
 
@@ -989,8 +904,7 @@ jobs:
   # integration-test (<os>) 3 件を platform-ci (<os>) 3 件へ差し替えた（ruleset の差し替えは
   # main セッションが行う）。ruleset の必須チェック全体は、16 件に ai-review.yml の codex 3 件と
   # 外部 App の Cursor Bugbot 1 件（本 workflow の外）を足した 20 件（冒頭コメント参照）。
-  # platform-ci は docs のみの変更でも skipped にならない（ジョブ内のステップ単位で省略する）
-  # ため、allow_skipped には入れない。
+  # platform-ci は if: を持たない（常に実行される）ため、allow_skipped には入れない。
   ci-complete:
     needs:
       [

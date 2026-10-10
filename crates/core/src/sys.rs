@@ -54,6 +54,10 @@
 //! - `unsafe fn` はこのモジュールの外へ公開しない。公開するのは安全な関数のみ
 //! - すべての `unsafe` ブロック・`unsafe extern "C"` 宣言に `// SAFETY:` で理由と
 //!   維持すべき不変条件を明記する
+//! - syscall(2) の番号は `ArchSysNo::get` を通した `SyscallNumber` でしか `syscall` に渡せない
+//!   （型で強制。対応外アーキテクチャでは `get` が常に `Unsupported` を返し番号 0 を発行しない。
+//!   #1619）。フラグ定数（`MS_*` 等）は対応外 arch で 0 のままで、libc 経由ラッパーの
+//!   `SUPPORTED` 検査は引き続き慣習で保つ（型では強制しない）
 //! - syscall の定数は `cfg(target_arch = ...)` ごとに個別に定義し、値が同じでも
 //!   他アーキテクチャの定義を流用しない。対応外アーキテクチャでは各ラッパーが
 //!   [`SysError::Unsupported`] を返す（fail-closed。`ErrorCode::Unimplemented` に写す）
@@ -106,9 +110,75 @@ pub(crate) use consts::{
 // 値は固定値テストで照合する（`crates/io/src/sys.rs` の `beneath_consts` と同じ判断）。
 // `O_CLOEXEC`（`0o2000000`）は arm64 も上書きしない asm-generic の値。
 
+/// syscall(2) の番号を型で守る小さなサブモジュール（#1619・SUP-12・SEC-1・CORE-5・REPAIR-3）。
+///
+/// 対応外アーキテクチャでは `consts` の番号が実在せず、素の整数 0 を `syscall` に渡すと別の
+/// syscall（x86_64 以外では 0 番が何に当たるかは arch 依存）を発行し得る。各ラッパー冒頭の
+/// `SUPPORTED` 検査が慣習で止めていたのを、`extern` の `syscall` が [`SyscallNumber`] しか
+/// 受けず、その唯一の入手経路が [`ArchSysNo::get`]（対応外 arch では常に `Unsupported`）に
+/// なる形で型に強制する。構築子は本モジュールの外へ出さない（フィールドは非公開）。
+mod sysno {
+    use super::SysError;
+
+    /// カーネルへ渡せる syscall 番号。`extern` の `syscall` の第 1 引数はこの型だけを受ける。
+    /// `repr(transparent)` により ABI は C の `long`（LP64 で i64）と同一。
+    #[repr(transparent)]
+    #[derive(Clone, Copy)]
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        allow(dead_code, reason = "対応外 arch では構築されない（常に Unsupported）")
+    )]
+    pub(super) struct SyscallNumber(i64);
+
+    /// `consts` に置く、この arch での syscall 番号の定義。取り出し口は [`ArchSysNo::get`] のみ。
+    #[derive(Clone, Copy)]
+    pub(super) struct ArchSysNo(
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))] i64,
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))] (),
+    );
+
+    impl ArchSysNo {
+        /// 対応 arch の番号定義。対応外 arch には存在しない（直書きはコンパイルエラー）。
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        pub(super) const fn new(nr: i64) -> Self {
+            Self(nr)
+        }
+
+        /// 対応外 arch の番号定義。`get` は常に `Unsupported` を返し、番号は発行されない。
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        pub(super) const UNSUPPORTED: Self = Self(());
+
+        /// 発行可能な番号を返す。対応外 arch では `Err(Unsupported)`（fail-closed）。
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[expect(
+            clippy::unnecessary_wraps,
+            reason = "対応外 arch と同じシグネチャにして呼び出し側の `?` を強制するため"
+        )]
+        pub(super) const fn get(self) -> Result<SyscallNumber, SysError> {
+            Ok(SyscallNumber(self.0))
+        }
+
+        /// 対応外 arch では番号を持たないため常に `Unsupported`。
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        pub(super) const fn get(self) -> Result<SyscallNumber, SysError> {
+            let () = self.0;
+            Err(SysError::Unsupported)
+        }
+
+        /// 固定値テスト専用の生の番号（対応 arch のみ）。
+        #[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+        pub(super) const fn raw(self) -> Option<i64> {
+            Some(self.0)
+        }
+    }
+}
+use sysno::{ArchSysNo, SyscallNumber};
+
 /// アーキテクチャごとの clone / mount / open 定数。値が同一でも arch ごとに個別定義する。
 #[cfg(target_arch = "x86_64")]
 mod consts {
+    #[allow(unused_imports)]
+    use super::ArchSysNo;
     pub const SUPPORTED: bool = true;
     pub const CLONE_NEWNS: i32 = 0x0002_0000;
     pub const CLONE_NEWUTS: i32 = 0x0400_0000;
@@ -128,16 +198,16 @@ mod consts {
     // include/uapi/linux/mount.h の `MNT_DETACH`（umount2 のフラグ。全アーキテクチャ共通）。
     pub const MNT_DETACH: i32 = 2;
     // arch/x86/entry/syscalls/syscall_64.tbl の `pivot_root`。
-    pub const SYS_PIVOT_ROOT: i64 = 155;
+    pub const SYS_PIVOT_ROOT: ArchSysNo = ArchSysNo::new(155);
     // arch/x86/entry/syscalls/syscall_64.tbl の `close_range`（436）。
-    pub const SYS_CLOSE_RANGE: i64 = 436;
+    pub const SYS_CLOSE_RANGE: ArchSysNo = ArchSysNo::new(436);
     // arch/x86/entry/syscalls/syscall_64.tbl の `move_mount`・`fsopen`・`fsconfig`・`fsmount`（新マウント API。Linux 5.2 以降。SUP-12・TASK-169 追補・#1472）。
-    pub const SYS_MOVE_MOUNT: i64 = 429;
-    pub const SYS_FSOPEN: i64 = 430;
-    pub const SYS_FSCONFIG: i64 = 431;
-    pub const SYS_FSMOUNT: i64 = 432;
+    pub const SYS_MOVE_MOUNT: ArchSysNo = ArchSysNo::new(429);
+    pub const SYS_FSOPEN: ArchSysNo = ArchSysNo::new(430);
+    pub const SYS_FSCONFIG: ArchSysNo = ArchSysNo::new(431);
+    pub const SYS_FSMOUNT: ArchSysNo = ArchSysNo::new(432);
     // arch/x86/entry/syscalls/syscall_64.tbl の `open_tree`（428。#1659）。
-    pub const SYS_OPEN_TREE: i64 = 428;
+    pub const SYS_OPEN_TREE: ArchSysNo = ArchSysNo::new(428);
     // include/uapi/linux/mount.h の `FSOPEN_CLOEXEC`・`FSMOUNT_CLOEXEC`・`fsconfig_command`・`MOUNT_ATTR_*`（`MOUNT_ATTR_STRICTATIME` を含む）・`MOVE_MOUNT_*`（全アーキテクチャ共通）。
     pub const FSOPEN_CLOEXEC: u32 = 1;
     pub const FSMOUNT_CLOEXEC: u32 = 1;
@@ -157,8 +227,8 @@ mod consts {
     pub const OPEN_TREE_CLOEXEC: u32 = 0o2_000_000;
     pub const OPEN_TREE_AT_EMPTY_PATH: u32 = 0x1000;
     // arch/x86/entry/syscalls/syscall_64.tbl の `pidfd_send_signal`（424）・`pidfd_open`（434）。
-    pub const SYS_PIDFD_SEND_SIGNAL: i64 = 424;
-    pub const SYS_PIDFD_OPEN: i64 = 434;
+    pub const SYS_PIDFD_SEND_SIGNAL: ArchSysNo = ArchSysNo::new(424);
+    pub const SYS_PIDFD_OPEN: ArchSysNo = ArchSysNo::new(434);
     // include/uapi/linux/close_range.h の `CLOSE_RANGE_CLOEXEC`（`1U << 2`）。
     pub const CLOSE_RANGE_CLOEXEC: i64 = 4;
     // include/uapi/linux/wait.h の `WNOHANG`。
@@ -196,13 +266,13 @@ mod consts {
     pub const ST_NOEXEC: i64 = 0x0008;
     pub const ST_VALID: i64 = 0x0020;
     // arch/x86/entry/syscalls/syscall_64.tbl の `execveat`。
-    pub const SYS_EXECVEAT: i64 = 322;
+    pub const SYS_EXECVEAT: ArchSysNo = ArchSysNo::new(322);
     // include/uapi/linux/fcntl.h の `AT_EMPTY_PATH`（全アーキテクチャ共通）。
     pub const AT_EMPTY_PATH: i64 = 0x1000;
     // include/uapi/linux/fcntl.h の `AT_EXECVE_CHECK`（Linux 6.14+。全アーキテクチャ共通）。
     pub const AT_EXECVE_CHECK: i64 = 0x10000;
     // arch/x86/entry/syscalls/syscall_64.tbl の `memfd_create`。
-    pub const SYS_MEMFD_CREATE: i64 = 319;
+    pub const SYS_MEMFD_CREATE: ArchSysNo = ArchSysNo::new(319);
     // include/uapi/linux/memfd.h の `MFD_CLOEXEC`・`MFD_ALLOW_SEALING`・`MFD_EXEC`（6.3+。全アーキテクチャ共通）。
     pub const MFD_CLOEXEC: u32 = 0x1;
     pub const MFD_ALLOW_SEALING: u32 = 0x2;
@@ -230,12 +300,12 @@ mod consts {
     pub const ENOTDIR: i32 = 20;
     pub const EINVAL: i32 = 22;
     // arch/x86/entry/syscalls/syscall_64.tbl の `landlock_create_ruleset`（444）。
-    pub const SYS_LANDLOCK_CREATE_RULESET: i64 = 444;
+    pub const SYS_LANDLOCK_CREATE_RULESET: ArchSysNo = ArchSysNo::new(444);
     // include/uapi/linux/landlock.h の `LANDLOCK_CREATE_RULESET_VERSION`（`1U << 0`）。
     pub const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
     // arch/x86/entry/syscalls/syscall_64.tbl の `landlock_add_rule`（445）・`landlock_restrict_self`（446）。
-    pub const SYS_LANDLOCK_ADD_RULE: i64 = 445;
-    pub const SYS_LANDLOCK_RESTRICT_SELF: i64 = 446;
+    pub const SYS_LANDLOCK_ADD_RULE: ArchSysNo = ArchSysNo::new(445);
+    pub const SYS_LANDLOCK_RESTRICT_SELF: ArchSysNo = ArchSysNo::new(446);
     // include/uapi/linux/landlock.h の `enum landlock_rule_type` の `LANDLOCK_RULE_PATH_BENEATH`。
     pub const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
     // include/uapi/asm-generic/errno.h の `EOPNOTSUPP`（x86_64 は上書きしない）。
@@ -295,19 +365,19 @@ mod consts {
     // capability 操作（TASK-37.1・#172）。`SYS_CAPGET` / `SYS_CAPSET` は glibc がラッパーを
     // 公開しないため `syscall(2)` 経由で呼ぶ。出典: x86_64 は arch/x86/entry/syscalls/syscall_64.tbl、
     // aarch64 は include/uapi/asm-generic/unistd.h。
-    pub const SYS_CAPGET: i64 = 125;
-    pub const SYS_CAPSET: i64 = 126;
+    pub const SYS_CAPGET: ArchSysNo = ArchSysNo::new(125);
+    pub const SYS_CAPSET: ArchSysNo = ArchSysNo::new(126);
     // arch/x86/entry/syscalls/syscall_64.tbl の `getgroups`（115）・`setgroups`（116）。補助グループの
     // 消去（SUP-6・SEC-1・SEC-5・TASK-163 追補・#1457）。glibc の `setgroups` は全スレッドへ反映する仕組み
     // （setxid のシグナル配送）を持つため、capability と同じく呼び出しスレッドだけに効く生の syscall を使う。
-    pub const SYS_GETGROUPS: i64 = 115;
-    pub const SYS_SETGROUPS: i64 = 116;
+    pub const SYS_GETGROUPS: ArchSysNo = ArchSysNo::new(115);
+    pub const SYS_SETGROUPS: ArchSysNo = ArchSysNo::new(116);
     // 禁止 syscall 遮断の結合試験用プローブ（CORE-5・TASK-38.4・#179）。番号は `crate::seccomp` の
     // テーブルとは独立に、x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h から取る。
     // `PTRACE_CONT`（include/uapi/linux/ptrace.h）は attach を伴わない要求で、`KEXEC_SEGMENT_MAX`
     // （include/linux/kexec.h）は kexec_load の segment 数の上限。
-    pub const SYS_PTRACE: i64 = 101;
-    pub const SYS_KEXEC_LOAD: i64 = 246;
+    pub const SYS_PTRACE: ArchSysNo = ArchSysNo::new(101);
+    pub const SYS_KEXEC_LOAD: ArchSysNo = ArchSysNo::new(246);
     pub const PTRACE_CONT: i64 = 7;
     pub const KEXEC_SEGMENT_MAX: i64 = 16;
     // include/uapi/linux/capability.h の `_LINUX_CAPABILITY_VERSION_3`（2 語・64 bit 形式）。
@@ -334,6 +404,8 @@ mod consts {
 
 #[cfg(target_arch = "aarch64")]
 mod consts {
+    #[allow(unused_imports)]
+    use super::ArchSysNo;
     pub const SUPPORTED: bool = true;
     pub const CLONE_NEWNS: i32 = 0x0002_0000;
     pub const CLONE_NEWUTS: i32 = 0x0400_0000;
@@ -354,18 +426,18 @@ mod consts {
     pub const MNT_DETACH: i32 = 2;
     // include/uapi/asm-generic/unistd.h の `__NR_pivot_root`（arm64 は asm-generic の表を使う。
     // x86_64 の 155 を流用しない）。
-    pub const SYS_PIVOT_ROOT: i64 = 41;
+    pub const SYS_PIVOT_ROOT: ArchSysNo = ArchSysNo::new(41);
     // include/uapi/asm-generic/unistd.h の `__NR_close_range`（arm64 は asm-generic の表。
     // x86_64 と値が同じでも流用せず個別に定義する）。
-    pub const SYS_CLOSE_RANGE: i64 = 436;
+    pub const SYS_CLOSE_RANGE: ArchSysNo = ArchSysNo::new(436);
     // include/uapi/asm-generic/unistd.h（aarch64） の `move_mount`・`fsopen`・`fsconfig`・`fsmount`（新マウント API。Linux 5.2 以降。SUP-12・TASK-169 追補・#1472）。
-    pub const SYS_MOVE_MOUNT: i64 = 429;
-    pub const SYS_FSOPEN: i64 = 430;
-    pub const SYS_FSCONFIG: i64 = 431;
-    pub const SYS_FSMOUNT: i64 = 432;
+    pub const SYS_MOVE_MOUNT: ArchSysNo = ArchSysNo::new(429);
+    pub const SYS_FSOPEN: ArchSysNo = ArchSysNo::new(430);
+    pub const SYS_FSCONFIG: ArchSysNo = ArchSysNo::new(431);
+    pub const SYS_FSMOUNT: ArchSysNo = ArchSysNo::new(432);
     // include/uapi/asm-generic/unistd.h の `__NR_open_tree`（428。arm64 は asm-generic の表。
     // x86_64 と値が同じでも流用せず個別に定義する。#1659）。
-    pub const SYS_OPEN_TREE: i64 = 428;
+    pub const SYS_OPEN_TREE: ArchSysNo = ArchSysNo::new(428);
     // include/uapi/linux/mount.h の `FSOPEN_CLOEXEC`・`FSMOUNT_CLOEXEC`・`fsconfig_command`・`MOUNT_ATTR_*`（`MOUNT_ATTR_STRICTATIME` を含む）・`MOVE_MOUNT_*`（全アーキテクチャ共通）。
     pub const FSOPEN_CLOEXEC: u32 = 1;
     pub const FSMOUNT_CLOEXEC: u32 = 1;
@@ -386,8 +458,8 @@ mod consts {
     pub const OPEN_TREE_AT_EMPTY_PATH: u32 = 0x1000;
     // include/uapi/asm-generic/unistd.h の `__NR_pidfd_send_signal`・`__NR_pidfd_open`（arm64 は
     // asm-generic の表。x86_64 と値が同じでも流用せず個別に定義する）。
-    pub const SYS_PIDFD_SEND_SIGNAL: i64 = 424;
-    pub const SYS_PIDFD_OPEN: i64 = 434;
+    pub const SYS_PIDFD_SEND_SIGNAL: ArchSysNo = ArchSysNo::new(424);
+    pub const SYS_PIDFD_OPEN: ArchSysNo = ArchSysNo::new(434);
     // include/uapi/linux/close_range.h の `CLOSE_RANGE_CLOEXEC`（`1U << 2`）。
     pub const CLOSE_RANGE_CLOEXEC: i64 = 4;
     // include/uapi/linux/wait.h の `WNOHANG`。
@@ -429,13 +501,13 @@ mod consts {
     pub const ST_VALID: i64 = 0x0020;
     // include/uapi/asm-generic/unistd.h の `__NR_execveat`（arm64 は asm-generic の表。
     // x86_64 の 322 を流用しない）。
-    pub const SYS_EXECVEAT: i64 = 281;
+    pub const SYS_EXECVEAT: ArchSysNo = ArchSysNo::new(281);
     // include/uapi/linux/fcntl.h の `AT_EMPTY_PATH`（全アーキテクチャ共通）。
     pub const AT_EMPTY_PATH: i64 = 0x1000;
     // include/uapi/linux/fcntl.h の `AT_EXECVE_CHECK`（Linux 6.14+。全アーキテクチャ共通）。
     pub const AT_EXECVE_CHECK: i64 = 0x10000;
     // include/uapi/asm-generic/unistd.h の `__NR_memfd_create`（aarch64 は asm-generic 表を使う）。
-    pub const SYS_MEMFD_CREATE: i64 = 279;
+    pub const SYS_MEMFD_CREATE: ArchSysNo = ArchSysNo::new(279);
     // include/uapi/linux/memfd.h の `MFD_CLOEXEC`・`MFD_ALLOW_SEALING`・`MFD_EXEC`（6.3+。全アーキテクチャ共通）。
     pub const MFD_CLOEXEC: u32 = 0x1;
     pub const MFD_ALLOW_SEALING: u32 = 0x2;
@@ -463,12 +535,12 @@ mod consts {
     pub const ENOTDIR: i32 = 20;
     pub const EINVAL: i32 = 22;
     // include/uapi/asm-generic/unistd.h の `__NR_landlock_create_ruleset`（444。arm64 は汎用表）。
-    pub const SYS_LANDLOCK_CREATE_RULESET: i64 = 444;
+    pub const SYS_LANDLOCK_CREATE_RULESET: ArchSysNo = ArchSysNo::new(444);
     // include/uapi/linux/landlock.h の `LANDLOCK_CREATE_RULESET_VERSION`（`1U << 0`）。
     pub const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
     // include/uapi/asm-generic/unistd.h の `landlock_add_rule`（445）・`landlock_restrict_self`（446）。
-    pub const SYS_LANDLOCK_ADD_RULE: i64 = 445;
-    pub const SYS_LANDLOCK_RESTRICT_SELF: i64 = 446;
+    pub const SYS_LANDLOCK_ADD_RULE: ArchSysNo = ArchSysNo::new(445);
+    pub const SYS_LANDLOCK_RESTRICT_SELF: ArchSysNo = ArchSysNo::new(446);
     // include/uapi/linux/landlock.h の `enum landlock_rule_type` の `LANDLOCK_RULE_PATH_BENEATH`。
     pub const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
     // include/uapi/asm-generic/errno.h の `EOPNOTSUPP`（arm64 は上書きしない）。
@@ -528,17 +600,17 @@ mod consts {
     // capability 操作（TASK-37.1・#172）。`SYS_CAPGET` / `SYS_CAPSET` は glibc がラッパーを
     // 公開しないため `syscall(2)` 経由で呼ぶ。出典: x86_64 は arch/x86/entry/syscalls/syscall_64.tbl、
     // aarch64 は include/uapi/asm-generic/unistd.h。
-    pub const SYS_CAPGET: i64 = 90;
-    pub const SYS_CAPSET: i64 = 91;
+    pub const SYS_CAPGET: ArchSysNo = ArchSysNo::new(90);
+    pub const SYS_CAPSET: ArchSysNo = ArchSysNo::new(91);
     // include/uapi/asm-generic/unistd.h の `getgroups`（158）・`setgroups`（159）。TASK-163 追補・#1457。
-    pub const SYS_GETGROUPS: i64 = 158;
-    pub const SYS_SETGROUPS: i64 = 159;
+    pub const SYS_GETGROUPS: ArchSysNo = ArchSysNo::new(158);
+    pub const SYS_SETGROUPS: ArchSysNo = ArchSysNo::new(159);
     // 禁止 syscall 遮断の結合試験用プローブ（CORE-5・TASK-38.4・#179）。番号は `crate::seccomp` の
     // テーブルとは独立に、x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h から取る。
     // `PTRACE_CONT`（include/uapi/linux/ptrace.h）は attach を伴わない要求で、`KEXEC_SEGMENT_MAX`
     // （include/linux/kexec.h）は kexec_load の segment 数の上限。
-    pub const SYS_PTRACE: i64 = 117;
-    pub const SYS_KEXEC_LOAD: i64 = 104;
+    pub const SYS_PTRACE: ArchSysNo = ArchSysNo::new(117);
+    pub const SYS_KEXEC_LOAD: ArchSysNo = ArchSysNo::new(104);
     pub const PTRACE_CONT: i64 = 7;
     pub const KEXEC_SEGMENT_MAX: i64 = 16;
     // include/uapi/linux/capability.h の `_LINUX_CAPABILITY_VERSION_3`（2 語・64 bit 形式）。
@@ -567,6 +639,8 @@ mod consts {
 /// 負の値にして、`std::io::Error` 由来の実 errno と誤って一致させない（分類は `Internal`）。
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod consts {
+    #[allow(unused_imports)]
+    use super::ArchSysNo;
     pub const SUPPORTED: bool = false;
     pub const CLONE_NEWNS: i32 = 0;
     pub const CLONE_NEWUTS: i32 = 0;
@@ -583,14 +657,14 @@ mod consts {
     pub const MS_REC: u64 = 0;
     pub const MS_PRIVATE: u64 = 0;
     pub const MNT_DETACH: i32 = 0;
-    pub const SYS_PIVOT_ROOT: i64 = 0;
-    pub const SYS_CLOSE_RANGE: i64 = 0;
+    pub const SYS_PIVOT_ROOT: ArchSysNo = ArchSysNo::UNSUPPORTED;
+    pub const SYS_CLOSE_RANGE: ArchSysNo = ArchSysNo::UNSUPPORTED;
     // 対応外アーキテクチャ（各ラッパーが SUPPORTED で弾く） の `move_mount`・`fsopen`・`fsconfig`・`fsmount`（新マウント API。Linux 5.2 以降。SUP-12・TASK-169 追補・#1472）。
-    pub const SYS_MOVE_MOUNT: i64 = 0;
-    pub const SYS_FSOPEN: i64 = 0;
-    pub const SYS_FSCONFIG: i64 = 0;
-    pub const SYS_FSMOUNT: i64 = 0;
-    pub const SYS_OPEN_TREE: i64 = 0;
+    pub const SYS_MOVE_MOUNT: ArchSysNo = ArchSysNo::UNSUPPORTED;
+    pub const SYS_FSOPEN: ArchSysNo = ArchSysNo::UNSUPPORTED;
+    pub const SYS_FSCONFIG: ArchSysNo = ArchSysNo::UNSUPPORTED;
+    pub const SYS_FSMOUNT: ArchSysNo = ArchSysNo::UNSUPPORTED;
+    pub const SYS_OPEN_TREE: ArchSysNo = ArchSysNo::UNSUPPORTED;
     // include/uapi/linux/mount.h の `FSOPEN_CLOEXEC`・`FSMOUNT_CLOEXEC`・`fsconfig_command`・`MOUNT_ATTR_*`（`MOUNT_ATTR_STRICTATIME` を含む）・`MOVE_MOUNT_*`（全アーキテクチャ共通）。
     pub const FSOPEN_CLOEXEC: u32 = 0;
     pub const FSMOUNT_CLOEXEC: u32 = 0;
@@ -608,8 +682,8 @@ mod consts {
     pub const OPEN_TREE_CLONE: u32 = 0;
     pub const OPEN_TREE_CLOEXEC: u32 = 0;
     pub const OPEN_TREE_AT_EMPTY_PATH: u32 = 0;
-    pub const SYS_PIDFD_SEND_SIGNAL: i64 = 0;
-    pub const SYS_PIDFD_OPEN: i64 = 0;
+    pub const SYS_PIDFD_SEND_SIGNAL: ArchSysNo = ArchSysNo::UNSUPPORTED;
+    pub const SYS_PIDFD_OPEN: ArchSysNo = ArchSysNo::UNSUPPORTED;
     pub const CLOSE_RANGE_CLOEXEC: i64 = 0;
     pub const WNOHANG: i32 = 0;
     pub const SIGKILL: i32 = 0;
@@ -633,10 +707,10 @@ mod consts {
     pub const CGROUP2_SUPER_MAGIC: i64 = 0;
     pub const ST_NOEXEC: i64 = 0;
     pub const ST_VALID: i64 = 0;
-    pub const SYS_EXECVEAT: i64 = 0;
+    pub const SYS_EXECVEAT: ArchSysNo = ArchSysNo::UNSUPPORTED;
     pub const AT_EMPTY_PATH: i64 = 0;
     pub const AT_EXECVE_CHECK: i64 = 0;
-    pub const SYS_MEMFD_CREATE: i64 = 0;
+    pub const SYS_MEMFD_CREATE: ArchSysNo = ArchSysNo::UNSUPPORTED;
     pub const MFD_CLOEXEC: u32 = 0;
     pub const MFD_ALLOW_SEALING: u32 = 0;
     pub const MFD_EXEC: u32 = 0;
@@ -657,10 +731,10 @@ mod consts {
     pub const EEXIST: i32 = -7;
     pub const ENOTDIR: i32 = -4;
     pub const EINVAL: i32 = -5;
-    pub const SYS_LANDLOCK_CREATE_RULESET: i64 = 0;
+    pub const SYS_LANDLOCK_CREATE_RULESET: ArchSysNo = ArchSysNo::UNSUPPORTED;
     pub const LANDLOCK_CREATE_RULESET_VERSION: u32 = 0;
-    pub const SYS_LANDLOCK_ADD_RULE: i64 = 0;
-    pub const SYS_LANDLOCK_RESTRICT_SELF: i64 = 0;
+    pub const SYS_LANDLOCK_ADD_RULE: ArchSysNo = ArchSysNo::UNSUPPORTED;
+    pub const SYS_LANDLOCK_RESTRICT_SELF: ArchSysNo = ArchSysNo::UNSUPPORTED;
     pub const LANDLOCK_RULE_PATH_BENEATH: u32 = 0;
     pub const EOPNOTSUPP: i32 = -15;
     pub const ELOOP: i32 = -6;
@@ -705,16 +779,16 @@ mod consts {
     // capability 操作（TASK-37.1・#172）。`SYS_CAPGET` / `SYS_CAPSET` は glibc がラッパーを
     // 公開しないため `syscall(2)` 経由で呼ぶ。出典: x86_64 は arch/x86/entry/syscalls/syscall_64.tbl、
     // aarch64 は include/uapi/asm-generic/unistd.h。
-    pub const SYS_CAPGET: i64 = 0;
-    pub const SYS_CAPSET: i64 = 0;
-    pub const SYS_GETGROUPS: i64 = 0;
-    pub const SYS_SETGROUPS: i64 = 0;
+    pub const SYS_CAPGET: ArchSysNo = ArchSysNo::UNSUPPORTED;
+    pub const SYS_CAPSET: ArchSysNo = ArchSysNo::UNSUPPORTED;
+    pub const SYS_GETGROUPS: ArchSysNo = ArchSysNo::UNSUPPORTED;
+    pub const SYS_SETGROUPS: ArchSysNo = ArchSysNo::UNSUPPORTED;
     // 禁止 syscall 遮断の結合試験用プローブ（CORE-5・TASK-38.4・#179）。番号は `crate::seccomp` の
     // テーブルとは独立に、x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h から取る。
     // `PTRACE_CONT`（include/uapi/linux/ptrace.h）は attach を伴わない要求で、`KEXEC_SEGMENT_MAX`
     // （include/linux/kexec.h）は kexec_load の segment 数の上限。
-    pub const SYS_PTRACE: i64 = 0;
-    pub const SYS_KEXEC_LOAD: i64 = 0;
+    pub const SYS_PTRACE: ArchSysNo = ArchSysNo::UNSUPPORTED;
+    pub const SYS_KEXEC_LOAD: ArchSysNo = ArchSysNo::UNSUPPORTED;
     pub const PTRACE_CONT: i64 = 0;
     pub const KEXEC_SEGMENT_MAX: i64 = 0;
     // include/uapi/linux/capability.h の `_LINUX_CAPABILITY_VERSION_3`（2 語・64 bit 形式）。
@@ -791,7 +865,9 @@ unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: `long syscall(long number, ...)`（glibc / musl。LP64 で
     // `long` は i64）。`pivot_root(2)` は glibc にラッパーが無いため使う。可変長引数として宣言する
     // （非可変長で宣言して呼ぶと、可変長引数の渡し方が異なる ABI で未定義動作になる）。
-    fn syscall(number: i64, ...) -> i64;
+    // 第 1 引数は `repr(transparent)` の `SyscallNumber`（中身 i64）で `long` と ABI が同一。
+    // 番号は `ArchSysNo::get` からしか得られない（#1619。対応外 arch では常に `Unsupported`）。
+    fn syscall(number: SyscallNumber, ...) -> i64;
     // SAFETY（宣言そのものの妥当性）: `int umount2(const char *target, int flags)`。
     fn umount2(target: *const core::ffi::c_char, flags: i32) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int fchdir(int fd)`。
@@ -1434,7 +1510,7 @@ fn mount_tmpfs_impl(target_dir: BorrowedFd<'_>, params: &TmpfsParams) -> Result<
     // 直後に `new_mount_api_fd` が唯一の所有者にする。
     let fs_fd = new_mount_api_fd(unsafe {
         syscall(
-            consts::SYS_FSOPEN,
+            consts::SYS_FSOPEN.get()?,
             c"tmpfs".as_ptr(),
             i64::from(consts::FSOPEN_CLOEXEC),
         )
@@ -1446,7 +1522,7 @@ fn mount_tmpfs_impl(target_dir: BorrowedFd<'_>, params: &TmpfsParams) -> Result<
         let rc = unsafe {
             match param {
                 FsconfigParam::String(key, value) => syscall(
-                    consts::SYS_FSCONFIG,
+                    consts::SYS_FSCONFIG.get()?,
                     i64::from(fs_fd.as_raw_fd()),
                     i64::from(consts::FSCONFIG_SET_STRING),
                     key.as_ptr(),
@@ -1454,7 +1530,7 @@ fn mount_tmpfs_impl(target_dir: BorrowedFd<'_>, params: &TmpfsParams) -> Result<
                     0i64,
                 ),
                 FsconfigParam::Flag(key) => syscall(
-                    consts::SYS_FSCONFIG,
+                    consts::SYS_FSCONFIG.get()?,
                     i64::from(fs_fd.as_raw_fd()),
                     i64::from(consts::FSCONFIG_SET_FLAG),
                     key.as_ptr(),
@@ -1469,7 +1545,7 @@ fn mount_tmpfs_impl(target_dir: BorrowedFd<'_>, params: &TmpfsParams) -> Result<
     // 副作用は superblock の作成（まだどこにも接続されない）に限る。
     fsconfig_result(unsafe {
         syscall(
-            consts::SYS_FSCONFIG,
+            consts::SYS_FSCONFIG.get()?,
             i64::from(fs_fd.as_raw_fd()),
             i64::from(consts::FSCONFIG_CMD_CREATE),
             core::ptr::null::<core::ffi::c_char>(),
@@ -1482,7 +1558,7 @@ fn mount_tmpfs_impl(target_dir: BorrowedFd<'_>, params: &TmpfsParams) -> Result<
     // マウントの作成に限る（fd を閉じればカーネルが破棄する）。
     let mnt_fd = new_mount_api_fd(unsafe {
         syscall(
-            consts::SYS_FSMOUNT,
+            consts::SYS_FSMOUNT.get()?,
             i64::from(fs_fd.as_raw_fd()),
             i64::from(consts::FSMOUNT_CLOEXEC),
             i64::from(params.attr),
@@ -1532,7 +1608,7 @@ fn move_mount_empty_path_raw(from: RawFd, to: RawFd) -> Result<(), SysError> {
     // （接続先は private であること〔`MountIsolation::establish` の `MS_REC|MS_PRIVATE` 済み〕が前提。shared なら peer へ伝播する）。
     let rc = unsafe {
         syscall(
-            consts::SYS_MOVE_MOUNT,
+            consts::SYS_MOVE_MOUNT.get()?,
             i64::from(from),
             c"".as_ptr(),
             i64::from(to),
@@ -1715,7 +1791,7 @@ fn open_tree_clone_raw(node: RawFd) -> Result<OwnedFd, SysError> {
     // `new_mount_api_fd` が唯一の所有者にする。副作用は未接続の複製マウントの作成に限る（fd を閉じれば破棄される）。
     new_mount_api_fd(unsafe {
         syscall(
-            consts::SYS_OPEN_TREE,
+            consts::SYS_OPEN_TREE.get()?,
             i64::from(node),
             c"".as_ptr(),
             i64::from(open_tree_clone_flags()),
@@ -1826,7 +1902,7 @@ pub(crate) fn mount_devpts_on(
     // 直後に `new_mount_api_fd` が唯一の所有者にする。
     let fs_fd = new_mount_api_fd(unsafe {
         syscall(
-            consts::SYS_FSOPEN,
+            consts::SYS_FSOPEN.get()?,
             c"devpts".as_ptr(),
             i64::from(consts::FSOPEN_CLOEXEC),
         )
@@ -1840,7 +1916,7 @@ pub(crate) fn mount_devpts_on(
         // 呼び出しの間生存し、カーネルは保持しない。aux は 0。副作用はこの fs コンテキストへのパラメータ設定に限る。
         fsconfig_result(unsafe {
             syscall(
-                consts::SYS_FSCONFIG,
+                consts::SYS_FSCONFIG.get()?,
                 i64::from(fs_fd.as_raw_fd()),
                 i64::from(consts::FSCONFIG_SET_STRING),
                 key.as_ptr(),
@@ -1853,7 +1929,7 @@ pub(crate) fn mount_devpts_on(
     // 副作用は superblock の作成（まだどこにも接続されない）に限る。
     fsconfig_result(unsafe {
         syscall(
-            consts::SYS_FSCONFIG,
+            consts::SYS_FSCONFIG.get()?,
             i64::from(fs_fd.as_raw_fd()),
             i64::from(consts::FSCONFIG_CMD_CREATE),
             core::ptr::null::<core::ffi::c_char>(),
@@ -1866,7 +1942,7 @@ pub(crate) fn mount_devpts_on(
     // マウントの作成に限る（fd を閉じればカーネルが破棄する）。
     let mnt_fd = new_mount_api_fd(unsafe {
         syscall(
-            consts::SYS_FSMOUNT,
+            consts::SYS_FSMOUNT.get()?,
             i64::from(fs_fd.as_raw_fd()),
             i64::from(consts::FSMOUNT_CLOEXEC),
             i64::from(create.attr_bits()),
@@ -1877,7 +1953,7 @@ pub(crate) fn mount_devpts_on(
     // マウント 1 件の追加に限る。
     let rc = unsafe {
         syscall(
-            consts::SYS_MOVE_MOUNT,
+            consts::SYS_MOVE_MOUNT.get()?,
             i64::from(mnt_fd.as_raw_fd()),
             c"".as_ptr(),
             i64::from(target_dir.as_raw_fd()),
@@ -1978,7 +2054,7 @@ pub(crate) fn pivot_root_dot() -> Result<(), SysError> {
     // SAFETY: 第 2・3 引数は静的な NUL 終端文字列 `c"."` へのポインタ（`*const c_char`。可変長
     // 引数として register 幅で渡され、カーネルは 2 引数だけ読む）。番号は arch ごとの定数。
     // 戻り値 -1 のとき直後に errno を確保する。
-    let rc = unsafe { syscall(consts::SYS_PIVOT_ROOT, c".".as_ptr(), c".".as_ptr()) };
+    let rc = unsafe { syscall(consts::SYS_PIVOT_ROOT.get()?, c".".as_ptr(), c".".as_ptr()) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
@@ -2212,14 +2288,18 @@ pub(crate) fn exec_fd(fd: BorrowedFd<'_>, argv: &[CString], envp: &[CString]) ->
     if !consts::SUPPORTED {
         return SysError::Unsupported;
     }
+    let nr = match consts::SYS_EXECVEAT.get() {
+        Ok(nr) => nr,
+        Err(e) => return e,
+    };
     let argv_ptrs = null_terminated_ptrs(argv);
     let envp_ptrs = null_terminated_ptrs(envp);
-    // SAFETY: `fd` は生存中の `BorrowedFd`。パス引数は静的な空文字列（NUL 終端）で AT_EMPTY_PATH と
+    // SAFETY: 番号は `ArchSysNo::get` を通した arch 別の定数（#1619）。`fd` は生存中の `BorrowedFd`。パス引数は静的な空文字列（NUL 終端）で AT_EMPTY_PATH と
     // 組で使う。`argv_ptrs` / `envp_ptrs` は末尾が NULL のポインタ配列で、各要素は呼び出しの間生存する
     // `argv` / `envp`（NUL 終端の `CString`）を指す。成功時は戻らず、失敗時は配列を読み取っただけ。
     unsafe {
         syscall(
-            consts::SYS_EXECVEAT,
+            nr,
             i64::from(fd.as_raw_fd()),
             c"".as_ptr(),
             argv_ptrs.as_ptr(),
@@ -2274,7 +2354,13 @@ pub(crate) fn memfd_create_for_exec_copy(name: &'static CStr) -> Result<OwnedFd,
 fn memfd_create_raw(name: &CStr, flags: u32) -> Result<OwnedFd, SysError> {
     // SAFETY: `name` は呼び出しの間生存する NUL 終端の借用で、カーネルは読み取るだけ。`flags` は整数
     // （unsigned int 引数は register 幅に拡張して渡され、カーネルは下位 32 bit を読む）。
-    let rc = unsafe { syscall(consts::SYS_MEMFD_CREATE, name.as_ptr(), i64::from(flags)) };
+    let rc = unsafe {
+        syscall(
+            consts::SYS_MEMFD_CREATE.get()?,
+            name.as_ptr(),
+            i64::from(flags),
+        )
+    };
     if rc < 0 {
         return Err(last_error());
     }
@@ -2454,7 +2540,7 @@ pub(crate) fn exec_check_fd(fd: BorrowedFd<'_>) -> Result<(), SysError> {
     // フラグを `EINVAL` で拒否し、何も実行しない）。
     let rc = unsafe {
         syscall(
-            consts::SYS_EXECVEAT,
+            consts::SYS_EXECVEAT.get()?,
             i64::from(fd.as_raw_fd()),
             c"".as_ptr(),
             argv.as_ptr(),
@@ -2476,7 +2562,7 @@ fn close_range_raw(first: u32, last: u32, flags: i64) -> Result<(), SysError> {
     // 対象は `first`〜`last` の fd だけ。閉じる場合、呼び出し側（exec 直前の子）はそれらの fd をこの後使わない前提。
     let rc = unsafe {
         syscall(
-            consts::SYS_CLOSE_RANGE,
+            consts::SYS_CLOSE_RANGE.get()?,
             i64::from(first),
             i64::from(last),
             flags,
@@ -2928,7 +3014,13 @@ pub(crate) fn supplementary_group_count() -> Result<usize, SysError> {
     }
     // SAFETY: `getgroups(int size, gid_t *list)` に size = 0 と NULL を渡す。size が 0 のときカーネルは `list` を
     // 参照せず件数だけを返す（getgroups(2)）ため、ポインタは読み書きされない。引数は register 幅の整数として渡す。
-    let count = unsafe { syscall(consts::SYS_GETGROUPS, 0i64, core::ptr::null_mut::<u32>()) };
+    let count = unsafe {
+        syscall(
+            consts::SYS_GETGROUPS.get()?,
+            0i64,
+            core::ptr::null_mut::<u32>(),
+        )
+    };
     if count < 0 {
         return Err(last_error());
     }
@@ -2951,7 +3043,7 @@ pub(crate) fn clear_supplementary_groups() -> Result<(), SysError> {
     // SAFETY: `setgroups(size_t size, const gid_t *list)` に size = 0 と NULL を渡す。size が 0 のときカーネルは
     // `list` を読まない（空のグループ集合を設定する）ため、ポインタは参照されない。効果は呼び出しスレッドの
     // 資格情報（補助グループ）の変更のみで、メモリには触れない。
-    let rc = unsafe { syscall(consts::SYS_SETGROUPS, 0i64, core::ptr::null::<u32>()) };
+    let rc = unsafe { syscall(consts::SYS_SETGROUPS.get()?, 0i64, core::ptr::null::<u32>()) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
@@ -3060,7 +3152,7 @@ pub(crate) fn pidfd_open(pid: u32) -> Result<OwnedFd, SysError> {
     let raw = positive_pid(pid)?;
     // SAFETY: 引数は整数のみでポインタを取らない（glibc 2.36 未満に無いため `syscall(2)` 経由）。
     // `raw` は正であることを確認済み。flags は 0 で、成功時は新規 fd を返す。
-    let fd = unsafe { syscall(consts::SYS_PIDFD_OPEN, i64::from(raw), 0_i64) };
+    let fd = unsafe { syscall(consts::SYS_PIDFD_OPEN.get()?, i64::from(raw), 0_i64) };
     if fd == -1 {
         return Err(last_error());
     }
@@ -3087,7 +3179,7 @@ pub(crate) fn pidfd_send_signal(pidfd: BorrowedFd<'_>, sig: Signal) -> Result<()
     // 既定値で作る）で、ポインタ引数は書き込み・読み出しされない。`number` は検証済みの値、flags は 0。
     let rc = unsafe {
         syscall(
-            consts::SYS_PIDFD_SEND_SIGNAL,
+            consts::SYS_PIDFD_SEND_SIGNAL.get()?,
             i64::from(pidfd.as_raw_fd()),
             i64::from(number),
             0_i64,
@@ -3389,7 +3481,13 @@ pub(crate) fn cap_get_thread() -> Result<ThreadCaps, SysError> {
     // 呼び出しの間有効かつ排他的に借用されている。可変長部のポインタはカーネルが
     // `CapUserHeader` と `[CapUserData; 2]` の大きさだけ読み書きする。影響は呼び出したスレッドの
     // 読み取りのみ。
-    let rc = unsafe { syscall(consts::SYS_CAPGET, &raw mut header, data.as_mut_ptr()) };
+    let rc = unsafe {
+        syscall(
+            consts::SYS_CAPGET.get()?,
+            &raw mut header,
+            data.as_mut_ptr(),
+        )
+    };
     if rc == -1 {
         return Err(last_error());
     }
@@ -3423,7 +3521,7 @@ pub(crate) fn cap_set_thread(caps: ThreadCaps) -> Result<(), SysError> {
     // SAFETY: `header` と `data`（v3 が要求する 2 要素）はスタック上の `#[repr(C)]` 値で、呼び出しの
     // 間有効。カーネルは読み取りのみ行う（const ポインタ）。資格情報の変更は呼び出したスレッドに
     // 限られ、メモリ安全性には影響しない。
-    let rc = unsafe { syscall(consts::SYS_CAPSET, &raw const header, data.as_ptr()) };
+    let rc = unsafe { syscall(consts::SYS_CAPSET.get()?, &raw const header, data.as_ptr()) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
@@ -3489,7 +3587,7 @@ pub(crate) fn landlock_abi_version() -> Result<u32, SysError> {
     // なり得るため、flags は `prctl` と同様に `u64` へ拡幅する。カーネルは `__u32` へ切り詰める）。
     let rc = unsafe {
         syscall(
-            consts::SYS_LANDLOCK_CREATE_RULESET,
+            consts::SYS_LANDLOCK_CREATE_RULESET.get()?,
             core::ptr::null::<core::ffi::c_void>(),
             0usize,
             u64::from(consts::LANDLOCK_CREATE_RULESET_VERSION),
@@ -3535,7 +3633,7 @@ pub(crate) fn landlock_create_ruleset_fs(handled_fs: u64) -> Result<OwnedFd, Sys
     // flags は 0。可変長 `syscall(2)` へはポインタ・`usize`・`u64` とレジスタ幅で渡す。
     let rc = unsafe {
         syscall(
-            consts::SYS_LANDLOCK_CREATE_RULESET,
+            consts::SYS_LANDLOCK_CREATE_RULESET.get()?,
             &raw const attr,
             core::mem::size_of::<LandlockRulesetAttr>(),
             0u64,
@@ -3569,7 +3667,7 @@ pub(crate) fn landlock_add_path_beneath(
     // flags は 0。可変長引数はレジスタ幅（`i32` は `i64` へ拡幅して符号を保つ）で渡す。
     let rc = unsafe {
         syscall(
-            consts::SYS_LANDLOCK_ADD_RULE,
+            consts::SYS_LANDLOCK_ADD_RULE.get()?,
             i64::from(ruleset.as_raw_fd()),
             u64::from(consts::LANDLOCK_RULE_PATH_BENEATH),
             &raw const attr,
@@ -3592,7 +3690,7 @@ pub(crate) fn landlock_restrict_self(ruleset: BorrowedFd<'_>) -> Result<(), SysE
     // メモリには触れず、影響は呼び出したスレッドの Landlock ドメインの追加（権限を減らす方向）のみ。
     let rc = unsafe {
         syscall(
-            consts::SYS_LANDLOCK_RESTRICT_SELF,
+            consts::SYS_LANDLOCK_RESTRICT_SELF.get()?,
             i64::from(ruleset.as_raw_fd()),
             0u64,
         )
@@ -3616,7 +3714,7 @@ pub(crate) fn ptrace_cont_probe(pid: u32) -> Result<(), SysError> {
     // フィルタが欠けていても対象プロセスへの副作用は無い（`ESRCH`）。
     let rc = unsafe {
         syscall(
-            consts::SYS_PTRACE,
+            consts::SYS_PTRACE.get()?,
             consts::PTRACE_CONT,
             i64::from(pid),
             0_i64,
@@ -3642,7 +3740,7 @@ pub(crate) fn kexec_load_invalid_probe() -> Result<(), SysError> {
     // segments を読む前に拒否する。flags は無効値で、どの経路でもロード・アンロードに至らない。
     let rc = unsafe {
         syscall(
-            consts::SYS_KEXEC_LOAD,
+            consts::SYS_KEXEC_LOAD.get()?,
             0_i64,
             consts::KEXEC_SEGMENT_MAX + 1,
             0_i64,
@@ -3710,8 +3808,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn core5_probe_consts_are_exact_x86_64() {
-        assert_eq!(consts::SYS_PTRACE, 101);
-        assert_eq!(consts::SYS_KEXEC_LOAD, 246);
+        assert_eq!(consts::SYS_PTRACE.raw(), Some(101));
+        assert_eq!(consts::SYS_KEXEC_LOAD.raw(), Some(246));
         assert_eq!(consts::PTRACE_CONT, 7);
         assert_eq!(consts::KEXEC_SEGMENT_MAX, 16);
     }
@@ -3720,8 +3818,8 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn core5_probe_consts_are_exact_aarch64() {
-        assert_eq!(consts::SYS_PTRACE, 117);
-        assert_eq!(consts::SYS_KEXEC_LOAD, 104);
+        assert_eq!(consts::SYS_PTRACE.raw(), Some(117));
+        assert_eq!(consts::SYS_KEXEC_LOAD.raw(), Some(104));
         assert_eq!(consts::PTRACE_CONT, 7);
         assert_eq!(consts::KEXEC_SEGMENT_MAX, 16);
     }
@@ -3730,7 +3828,7 @@ mod tests {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn core5_landlock_consts_are_exact() {
-        assert_eq!(consts::SYS_LANDLOCK_CREATE_RULESET, 444);
+        assert_eq!(consts::SYS_LANDLOCK_CREATE_RULESET.raw(), Some(444));
         assert_eq!(consts::LANDLOCK_CREATE_RULESET_VERSION, 1);
         assert_eq!(consts::EOPNOTSUPP, 95);
     }
@@ -3739,8 +3837,8 @@ mod tests {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn core5_landlock_apply_consts_and_layout_are_exact() {
-        assert_eq!(consts::SYS_LANDLOCK_ADD_RULE, 445);
-        assert_eq!(consts::SYS_LANDLOCK_RESTRICT_SELF, 446);
+        assert_eq!(consts::SYS_LANDLOCK_ADD_RULE.raw(), Some(445));
+        assert_eq!(consts::SYS_LANDLOCK_RESTRICT_SELF.raw(), Some(446));
         assert_eq!(consts::LANDLOCK_RULE_PATH_BENEATH, 1);
         assert_eq!(core::mem::size_of::<LandlockRulesetAttr>(), 24);
         assert_eq!(core::mem::size_of::<LandlockPathBeneathAttr>(), 12);
@@ -3904,9 +4002,15 @@ mod tests {
     #[test]
     fn sup6_task163_group_syscall_numbers_and_count_are_exact() {
         #[cfg(target_arch = "x86_64")]
-        assert_eq!((consts::SYS_GETGROUPS, consts::SYS_SETGROUPS), (115, 116));
+        assert_eq!(
+            (consts::SYS_GETGROUPS.raw(), consts::SYS_SETGROUPS.raw()),
+            (Some(115), Some(116))
+        );
         #[cfg(target_arch = "aarch64")]
-        assert_eq!((consts::SYS_GETGROUPS, consts::SYS_SETGROUPS), (158, 159));
+        assert_eq!(
+            (consts::SYS_GETGROUPS.raw(), consts::SYS_SETGROUPS.raw()),
+            (Some(158), Some(159))
+        );
         let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
         let groups = status
             .lines()
@@ -3921,8 +4025,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn sec1_capability_consts_are_exact_x86_64() {
-        assert_eq!(consts::SYS_CAPGET, 125);
-        assert_eq!(consts::SYS_CAPSET, 126);
+        assert_eq!(consts::SYS_CAPGET.raw(), Some(125));
+        assert_eq!(consts::SYS_CAPSET.raw(), Some(126));
         assert_eq!(consts::LINUX_CAPABILITY_VERSION_3, 0x2008_0522);
         assert_eq!(consts::PR_CAPBSET_READ, 23);
         assert_eq!(consts::PR_CAPBSET_DROP, 24);
@@ -3934,8 +4038,8 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn sec1_capability_consts_are_exact_aarch64() {
-        assert_eq!(consts::SYS_CAPGET, 90);
-        assert_eq!(consts::SYS_CAPSET, 91);
+        assert_eq!(consts::SYS_CAPGET.raw(), Some(90));
+        assert_eq!(consts::SYS_CAPSET.raw(), Some(91));
         assert_eq!(consts::LINUX_CAPABILITY_VERSION_3, 0x2008_0522);
         assert_eq!(consts::PR_CAPBSET_READ, 23);
         assert_eq!(consts::PR_CAPBSET_DROP, 24);
@@ -4323,7 +4427,7 @@ mod tests {
     fn core6_sec5_open_tree_consts_and_flags_are_exact() {
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         {
-            assert_eq!(consts::SYS_OPEN_TREE, 428);
+            assert_eq!(consts::SYS_OPEN_TREE.raw(), Some(428));
             assert_eq!(
                 (
                     consts::OPEN_TREE_CLONE,
@@ -4491,22 +4595,22 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         assert_eq!(
             (
-                consts::SYS_MOVE_MOUNT,
-                consts::SYS_FSOPEN,
-                consts::SYS_FSCONFIG,
-                consts::SYS_FSMOUNT
+                consts::SYS_MOVE_MOUNT.raw(),
+                consts::SYS_FSOPEN.raw(),
+                consts::SYS_FSCONFIG.raw(),
+                consts::SYS_FSMOUNT.raw()
             ),
-            (429, 430, 431, 432)
+            (Some(429), Some(430), Some(431), Some(432))
         );
         #[cfg(target_arch = "aarch64")]
         assert_eq!(
             (
-                consts::SYS_MOVE_MOUNT,
-                consts::SYS_FSOPEN,
-                consts::SYS_FSCONFIG,
-                consts::SYS_FSMOUNT
+                consts::SYS_MOVE_MOUNT.raw(),
+                consts::SYS_FSOPEN.raw(),
+                consts::SYS_FSCONFIG.raw(),
+                consts::SYS_FSMOUNT.raw()
             ),
-            (429, 430, 431, 432)
+            (Some(429), Some(430), Some(431), Some(432))
         );
         assert_eq!(
             (
@@ -4589,9 +4693,9 @@ mod tests {
         assert_eq!(consts::MS_REC, 0x4000);
         assert_eq!(consts::MNT_DETACH, 2);
         #[cfg(target_arch = "x86_64")]
-        assert_eq!(consts::SYS_PIVOT_ROOT, 155);
+        assert_eq!(consts::SYS_PIVOT_ROOT.raw(), Some(155));
         #[cfg(target_arch = "aarch64")]
-        assert_eq!(consts::SYS_PIVOT_ROOT, 41);
+        assert_eq!(consts::SYS_PIVOT_ROOT.raw(), Some(41));
     }
 
     /// aarch64: O_DIRECTORY / O_NOFOLLOW は arch/arm64/include/uapi/asm/fcntl.h の上書き値
@@ -4660,9 +4764,9 @@ mod tests {
     #[test]
     fn sup6_task163_sealed_copy_consts_are_exact() {
         #[cfg(target_arch = "x86_64")]
-        assert_eq!(consts::SYS_MEMFD_CREATE, 319);
+        assert_eq!(consts::SYS_MEMFD_CREATE.raw(), Some(319));
         #[cfg(target_arch = "aarch64")]
-        assert_eq!(consts::SYS_MEMFD_CREATE, 279);
+        assert_eq!(consts::SYS_MEMFD_CREATE.raw(), Some(279));
         assert_eq!(consts::MFD_CLOEXEC, 0x1);
         assert_eq!(consts::MFD_ALLOW_SEALING, 0x2);
         assert_eq!(consts::MFD_EXEC, 0x10);
@@ -4933,18 +5037,18 @@ mod tests {
     #[test]
     fn core1_fork_exec_consts_are_exact() {
         #[cfg(target_arch = "x86_64")]
-        assert_eq!(consts::SYS_EXECVEAT, 322);
+        assert_eq!(consts::SYS_EXECVEAT.raw(), Some(322));
         #[cfg(target_arch = "aarch64")]
-        assert_eq!(consts::SYS_EXECVEAT, 281);
+        assert_eq!(consts::SYS_EXECVEAT.raw(), Some(281));
         assert_eq!(consts::AT_EMPTY_PATH, 0x1000);
         assert_eq!(consts::O_NONBLOCK, 0o4_000);
         assert_eq!(consts::O_RDWR, 2);
         assert_eq!((consts::F_SETFD, consts::FD_CLOEXEC), (2, 1));
         assert_eq!(consts::F_DUPFD_CLOEXEC, 1030);
         #[cfg(target_arch = "x86_64")]
-        assert_eq!(consts::SYS_CLOSE_RANGE, 436);
+        assert_eq!(consts::SYS_CLOSE_RANGE.raw(), Some(436));
         #[cfg(target_arch = "aarch64")]
-        assert_eq!(consts::SYS_CLOSE_RANGE, 436);
+        assert_eq!(consts::SYS_CLOSE_RANGE.raw(), Some(436));
         assert_eq!(consts::CLOSE_RANGE_CLOEXEC, 4);
         assert_eq!(consts::WNOHANG, 1);
         assert_eq!((consts::SIGKILL, consts::SIGPIPE), (9, 13));

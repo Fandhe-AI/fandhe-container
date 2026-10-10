@@ -277,37 +277,56 @@ fn prog_load_raw(attr: &BpfProgLoadAttr) -> Result<OwnedFd, SysError> {
 ///
 /// 1 回目はログ無しでロードし、`EINVAL`・`EACCES` のときだけ `BPF_LOG_LEVEL1`・固定上限のバッファで
 /// 再実行してログを取る。再実行が成功しても fd は閉じて 1 回目のエラーを返す（fail-closed・決定的）。
-/// それ以外の errno は再試行もログも無しで返す。
+/// それ以外の errno は再試行もログも無しで返す。判定と再試行の流れは `load_with_verifier_log_retry`。
 pub(crate) fn bpf_prog_load_cgroup_device(
     program: &DeviceProgram,
 ) -> Result<CgroupDeviceProgFd, BpfProgLoadError> {
-    let plain = |cause| BpfProgLoadError {
-        cause,
-        verifier_log: None,
-    };
     if !consts::SUPPORTED {
-        return Err(plain(SysError::Unsupported));
+        return Err(BpfProgLoadError {
+            cause: SysError::Unsupported,
+            verifier_log: None,
+        });
     }
-    let attr = load_attr(program, None).map_err(plain)?;
-    let cause = match prog_load_raw(&attr) {
+    load_with_verifier_log_retry(program, |program, log| {
+        prog_load_raw(&load_attr(program, log)?)
+    })
+}
+
+/// 1 回目のロード失敗のうち、verifier ログ付きで再実行する errno か（`EINVAL`・`EACCES` だけ。
+/// verifier の拒否はこの 2 つで返る。SEC-1・CORE-4）。
+fn retries_with_verifier_log(cause: SysError) -> bool {
+    cause == SysError::Os(consts::EINVAL) || cause == SysError::Os(consts::EACCES)
+}
+
+/// ロードと再試行の流れ（`bpf_prog_load_cgroup_device` の本体）。`load` は属性を組み立てて
+/// `BPF_PROG_LOAD` を 1 回発行する関数で、2 引数目が `Some` のときはそのバッファへ verifier ログを
+/// 書かせる。本番は `prog_load_raw`、単体試験は syscall を呼ばない偽のローダーを渡す。
+///
+/// 1 回目（ログ無し）が成功すればその fd を返す。失敗が `retries_with_verifier_log` に当たるときだけ
+/// ログ付きで 1 回再実行し、その結果は捨てて（成功した fd は直ちに drop して close する）1 回目のエラーと
+/// ログを返す。ENOSPC（ログの切り詰め）でもバッファに書かれた分は使う。
+fn load_with_verifier_log_retry<F>(
+    program: &DeviceProgram,
+    mut load: F,
+) -> Result<CgroupDeviceProgFd, BpfProgLoadError>
+where
+    F: FnMut(&DeviceProgram, Option<&mut [u8; BPF_VERIFIER_LOG_CAP]>) -> Result<OwnedFd, SysError>,
+{
+    let cause = match load(program, None) {
         Ok(fd) => return Ok(CgroupDeviceProgFd(fd)),
         Err(e) => e,
     };
-    if cause != SysError::Os(consts::EINVAL) && cause != SysError::Os(consts::EACCES) {
-        return Err(plain(cause));
+    if !retries_with_verifier_log(cause) {
+        return Err(BpfProgLoadError {
+            cause,
+            verifier_log: None,
+        });
     }
     let mut log = [0u8; BPF_VERIFIER_LOG_CAP];
-    let verifier_log = match load_attr(program, Some(&mut log)) {
-        Ok(attr) => {
-            // 成功した場合の fd は包んで直ちに drop（close）する。ENOSPC（切り詰め）でもログは使える。
-            drop(prog_load_raw(&attr));
-            verifier_log_text(&log)
-        }
-        Err(_) => None,
-    };
+    drop(load(program, Some(&mut log)));
     Err(BpfProgLoadError {
         cause,
-        verifier_log,
+        verifier_log: verifier_log_text(&log),
     })
 }
 

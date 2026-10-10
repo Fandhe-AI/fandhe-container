@@ -3,7 +3,7 @@
 # 試験専用の切り替え（CLI_PARITY_RECLAIM_TEST_HANG）で意図的にハングさせ、スクリプトが「期限以上、期限 + 猶予
 # 以内」に非ゼロで終わり、`deadline_exceeded` の行に段・経過秒・descendant_alive=0 が出ることを外側の
 # $SECONDS で照合する。不正な環境変数値がビルド前に終了コード 2 で拒否されることも確かめる。
-# CI の integration-test ジョブが `make cli-parity-native-reclaim-selftest` で 3 OS 実行する（Windows は
+# CI の platform-ci ジョブが `make cli-parity-native-reclaim-selftest` で実行する（PR は ubuntu・main は 3 OS。Windows は
 # Git Bash）。rustc でヘルパーをビルドし、ハングするプロセスを起動するため make ci には含めない。
 # 成功基準: 終了コード 0 かつ FAIL 行なし。
 set -euo pipefail

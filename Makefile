@@ -220,7 +220,7 @@ else
 endif
 
 # 既定 feature のみで検証する（`--all-features` 込みの検証は CI の rust-ci ジョブが
-# 担う。CI の rust-ci-default-features ジョブと同一コマンド）。
+# 担う。CI の platform-ci ジョブと同一コマンド）。
 .PHONY: lint
 lint: ## cargo clippy -D warnings（既定 feature。lint ゲート）
 ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
@@ -239,7 +239,7 @@ endif
 
 # rustdoc の警告（壊れた intra-doc リンク・private 項目へのリンク等）を -D warnings で fail させる
 # （REPAIR-3・REPAIR-7・#1300）。既定 feature・--no-deps（依存の doc は生成しない）。CI は
-# rust-ci-default-features ジョブ（3 OS）が本ターゲットを実行する。cfg(target_os) 限定の項目への
+# platform-ci ジョブ（PR は ubuntu・main は 3 OS）が本ターゲットを実行する。cfg(target_os) 限定の項目への
 # リンクは他 OS で解決できず fail するため、doc コメントではリンクにせずコード表記にする。
 .PHONY: doc
 doc: ## cargo doc -D warnings（既定 feature・--no-deps。rustdoc 警告のゲート）
@@ -250,7 +250,7 @@ else
 endif
 
 # venus 試験治具（workspace 外の独立 PoC パッケージ。GPU-6・TASK-172.4・#888）の fmt / clippy / test。
-# `make ci` には含めない。CI は rust-ci-default-features ジョブ（3 OS）が本ターゲットを実行し、
+# `make ci` には含めない。CI は platform-ci ジョブ（PR は ubuntu・main は 3 OS）が本ターゲットを実行し、
 # plugin-macos 側の変更で治具が壊れたことを検出する。実機前提テストは #[ignore] で分離済み。
 # clippy / test は --locked で治具の Cargo.lock を固定する（ルート側の依存変更で lock が黙って再解決され、
 # 監査していない版でビルドされるのを防ぐ。lock の更新が要る変更は lock の差分として PR に現れる）。
@@ -288,7 +288,7 @@ endif
 # core の plugin 無効構成の検証（PLUG-3・TASK-111.1・#262。REPAIR-10 (d)）。
 # `--no-default-features` で core がビルド・テストでき、依存ツリーに plugin 境界基盤
 # （fandhe-container-plugin）が入らないことを確認する。`make ci` には含めない
-# （CI の rust-ci-default-features ジョブが同じターゲットを実行する）。
+# （CI の platform-ci ジョブが同じターゲットを実行する）。
 .PHONY: test-core-no-plugin
 test-core-no-plugin: ## core を --no-default-features でテストし plugin 依存が入らないことを検証する
 ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
@@ -381,8 +381,8 @@ endif
 
 # 判定スクリプトの自己テスト（PLUG-4・TASK-109.4・REPAIR-12）。依存 0 件の最小 workspace を一時 git
 # リポジトリとして作って判定スクリプトを走らせるため、実リポの workspace には依存しない（HAS_CARGO では
-# 判定しない）。cargo・git 未導入時は黙ってスキップせず fail-closed で止める。CI の integration-test
-# ジョブ（ubuntu・macos・windows の 3 OS。Windows は Git Bash）が実行し、GNU / BSD 双方のツールと
+# 判定しない）。cargo・git 未導入時は黙ってスキップせず fail-closed で止める。CI の platform-ci
+# ジョブ（main への push では ubuntu・macos・windows の 3 OS、PR では ubuntu。Windows は Git Bash）が実行し、GNU / BSD 双方のツールと
 # Git Bash で動くことを確かめる。
 .PHONY: plug4-core-invariance-selftest
 plug4-core-invariance-selftest: ## PLUG-4 判定スクリプトの自己テスト（TASK-109.4・REPAIR-12。fixture workspace）
@@ -395,20 +395,20 @@ plug4-core-invariance-selftest: ## PLUG-4 判定スクリプトの自己テス�
 	bash scripts/check-plug4-core-invariance-selftest.sh
 
 # CLI 基本 6 コマンドの 3 OS 同一構文・挙動の比較（TASK-125.1・CLI-1・MS-6）。
-# 自己テストはスタブ CLI のみを使い、製品バイナリ・root は使わない（REPAIR-12）。CI の integration-test
-# ジョブ（ubuntu・macos・windows の 3 OS）が本ターゲットを実行する。make ci には含めない。
+# 自己テストはスタブ CLI のみを使い、製品バイナリ・root は使わない（REPAIR-12）。CI の platform-ci
+# ジョブ（main への push では ubuntu・macos・windows の 3 OS、PR では ubuntu）が本ターゲットを実行する。make ci には含めない。
 .PHONY: cli-parity-selftest
 cli-parity-selftest: ## CLI 3 OS 比較スクリプトの自己テスト（TASK-125.1・REPAIR-12。スタブ CLI のみ）
 	bash scripts/cli-parity-check-selftest.sh
 
 # タイムアウト回収がネイティブ exe の子孫に届くかの確認（#1548・TASK-125.1・CLI-1・REPAIR-5）。rustc で
-# 一時ヘルパーをビルドする。CI の integration-test ジョブ（3 OS）が実行する。make ci には含めない。
+# 一時ヘルパーをビルドする。CI の platform-ci ジョブ（PR は ubuntu・main は 3 OS）が実行する。make ci には含めない。
 .PHONY: cli-parity-native-reclaim-check
 cli-parity-native-reclaim-check: ## capture のタイムアウトでネイティブ exe の子孫が回収されるかの確認（#1548）
 	bash scripts/cli-parity-native-reclaim-check.sh
 
 # 回収確認の全体期限の自己テスト（#1688・REPAIR-5・REPAIR-12）。ハングを注入して期限で止まることを経過秒で照合する。
-# rustc でヘルパーをビルドしハングするプロセスを起動するため make ci には含めない。CI の integration-test（3 OS）が実行する。
+# rustc でヘルパーをビルドしハングするプロセスを起動するため make ci には含めない。CI の platform-ci（PR は ubuntu・main は 3 OS）が実行する。
 .PHONY: cli-parity-native-reclaim-selftest
 cli-parity-native-reclaim-selftest: ## 回収確認スクリプトの全体期限の自己テスト（#1688・REPAIR-5・REPAIR-12）
 	bash scripts/cli-parity-native-reclaim-check-selftest.sh
@@ -433,7 +433,7 @@ cli-parity: ## CLI 3 OS 比較の capture（CLI/OUTPUT）または compare（BAS
 	fi
 
 # REPAIR-7 ステージ 3（タイムアウト保護された結合試験。TASK-86.2・#36）。
-# CI（ci.yml の integration-test ジョブ）と同じ判定を行う: integration test
+# CI（ci.yml の platform-ci ジョブ）と同じ判定を行う: integration test
 # target（`tests/*.rs`。cargo metadata 上で kind が "test" のもの）が 0 件の
 # 場合は「no test target matches pattern」で `cargo test --workspace --test '*'`
 # が非 0 終了するため、jq で件数を数えてから呼び出す。jq 未導入は fail-closed
@@ -484,7 +484,7 @@ endif
 
 # venus 試験治具（ルート workspace 外。独自の Cargo.lock を持つ。GPU-6・TASK-172.4）の依存監査。
 # ルートの deny.toml を共有し（--config）、ルートと同じ 4 種を --locked で検査する。CI の rust-ci
-# （reusable workflow）の deny はルート workspace だけを見るため、CI では rust-ci-default-features
+# （reusable workflow）の deny はルート workspace だけを見るため、CI では platform-ci
 # ジョブ（ubuntu）が本ターゲットを実行する。cargo-deny 未導入なら deny と同じ版を自動導入する。
 # 引数の位置: cargo-deny 0.20.2 では --manifest-path・--config・--locked は `cargo deny` 直下の大域
 # オプションで、`check` の後ろに置くと「unexpected argument '--config'」で失敗する（`cargo deny --help`
@@ -676,8 +676,8 @@ fio-bench-selftest: ## fio ベンチスクリプトの自己テスト（REPAIR-1
 	bash scripts/fio-randwrite-4k-selftest.sh
 
 # virtio-gpu ゲスト側確認スクリプトの自己テスト（TASK-172.6・GPU-6・REPAIR-12）。
-# 合成 fixture のみで完結し、macOS 27・ゲスト VM は不要。make ci には含めない。CI は integration-test
-# ジョブ（ubuntu・macos・windows の 3 OS）が本ターゲットを実行し、BSD 系ツールでの移植性も確かめる。
+# 合成 fixture のみで完結し、macOS 27・ゲスト VM は不要。make ci には含めない。CI は platform-ci
+# ジョブ（main への push では ubuntu・macos・windows の 3 OS、PR では ubuntu）が本ターゲットを実行し、BSD 系ツールでの移植性も確かめる。
 .PHONY: vz-virtio-gpu-guest-check-selftest
 vz-virtio-gpu-guest-check-selftest: ## virtio-gpu ゲスト側確認スクリプトの自己テスト（TASK-172.6・GPU-6・REPAIR-12。fixture のみ）
 	bash poc/vz-custom-virtio-gpu/guest/check-virtio-gpu-selftest.sh

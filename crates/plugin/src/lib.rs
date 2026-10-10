@@ -19,6 +19,11 @@
 //! 本体は G8（TASK-107 が crate 本体、TASK-108 が gRPC〔tonic〕境界、TASK-110・TASK-113・TASK-122〜124）で
 //! 実装する。plugin 発見・登録（TASK-109）の成果物は `fandhe-container-core` 側に置かれ、本 crate ではない。
 //! PLUG-1 区分は core・plugin 双方が依存する境界基盤ライブラリ（crate-naming.md 決定 4）。
+//!
+//! `unsafe` は `sys` モジュールだけに置く（coding-rust.md「unsafe・FFI・syscall」・#4 の事前承認の範囲）。
+//! crate 全体を `deny(unsafe_code)` にし、`sys` だけを許可して機械的に担保する（REPAIR-9）。
+
+#![deny(unsafe_code)]
 
 pub mod audit;
 pub(crate) mod checksum;
@@ -28,7 +33,10 @@ pub mod lifecycle;
 pub mod message;
 pub mod rss;
 pub mod signal_forward;
+// syscall・FFI の薄いラッパーの置き場で、`unsafe` を許すのはここだけ（#4 の事前承認は `sys` に限る。
+// `unsafe fn` を外へ公開せず安全な `pub(crate)` 関数だけを出す契約は `sys` の冒頭 doc を参照）。
 #[cfg(unix)]
+#[allow(unsafe_code)]
 pub(crate) mod sys;
 pub mod transport;
 pub mod uds_security;

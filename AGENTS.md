@@ -118,7 +118,7 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 - `make fio-bench`: 実機前提（fio・GNU coreutils の `timeout`・Linux ホスト）。`TARGET_DIR`・`LABEL` 未指定時は案内を出して終了コード 2 で止まる。詳細は下記「実機前提テスト」節・[docs/design/io-fio-bench.md](docs/design/io-fio-bench.md) を参照
 - `make fio-baseline-ratio-selftest`: 終了コード 0 が成功基準。固定 fixture（`scripts/testdata/fio-baseline/`）で完結し、実 fio・Docker は使わない。CI の `bench-regression` ジョブにも組み込まれている
 - `make fio-baseline-ratio`: `BASELINE`・`CANDIDATE`（いずれも `fio-randwrite-4k.sh` の出力 JSON）未指定時は案内を出して終了コード 2 で止まる。fio・Docker を必要としないため実機前提テストではない
-- CI の `rust-ci`（ubuntu-latest のみ）は fmt・deny と clippy/test の `--all-features` を実行し、macOS・Windows の clippy/test の `--all-features` は `platform-ci`（3 OS matrix）のステップが同じコマンドで実行する（fmt/deny は結果が OS に依らない）。`platform-ci` は 3 OS で `make lint`/`make test`/`make doc` と同一コマンド（既定 feature）も再現し、既定 feature 側の回帰は `platform-ci` でのみ検出される。docs のみの PR では macOS・Windows の重いステップを省略する（規則は [ci](.claude/rules/ci.md)「3 OS CI」）
+- CI の `rust-ci`（ubuntu-latest のみ）は fmt・deny と clippy/test の `--all-features` を実行し、macOS・Windows の clippy/test の `--all-features` は `platform-ci`（3 OS matrix）のステップが同じコマンドで実行する（fmt/deny は結果が OS に依らない）。`platform-ci` は 3 OS で `make lint`/`make test`/`make doc` と同一コマンド（既定 feature）も再現し、既定 feature 側の回帰は `platform-ci` でのみ検出される
 - 各コマンドと CI ジョブの対応（TASK-94 の整合確認で参照する）:
 
 | コマンド | 対応する CI ジョブ |

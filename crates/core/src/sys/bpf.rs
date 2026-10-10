@@ -252,7 +252,10 @@ fn prog_load_raw(attr: &BpfProgLoadAttr) -> Result<OwnedFd, SysError> {
     // `struct bpf_insn` と同レイアウト）、`license` は静的な NUL 終端文字列、`log_buf` は `log_size`
     // 以下だけカーネルが書くスタック上のバッファ（または 0）を指し、いずれも呼び出し元の関数が
     // 呼び出しの間保持する。`insn_cnt` は実際の命令数に一致する。未使用の領域は 0。ポインタは
-    // カーネルが複写するだけで保持しない。
+    // カーネルが複写するだけで保持しない。属性そのものへの書き戻しは無いため const ポインタでよい
+    // （v6.12: `__sys_bpf` は属性を複写して読むだけで、`bpf_prog_load` は属性へ書かない。唯一の
+    // 書き戻しである `bpf_check` の `log_true_size` は `uattr_size >= offsetofend(union bpf_attr,
+    // log_true_size)` のときだけで、size 72 はこのオフセットに届かない）。
     let rc = unsafe {
         syscall(
             nr,
@@ -338,8 +341,9 @@ pub(crate) fn bpf_prog_query_cgroup_device(
     let mut attr = query_attr(cgroup, &mut ids)?;
     // SAFETY: `attr` は呼び出しの間生存する書き込み可能な `#[repr(C)]` の 64 バイトで、size 引数も同じ
     // 大きさ。`prog_ids` は書き込み可能な `[u32; 64]` を指し、`prog_cnt`（入力値）は配列の長さに一致し、
-    // カーネルはその個数以下しか書かない。書き戻しは `attach_flags`・`prog_cnt`（と size が足りるときの
-    // `revision`）で、いずれも構造体の内側。`ids` は呼び出しの間生存する。
+    // カーネルはその個数以下しか書かない。属性への書き戻しは `attach_flags`・`prog_cnt` だけで、いずれも
+    // 構造体の内側（v6.12 の `__cgroup_bpf_query`。cgroup の問い合わせは `revision` を書かず、
+    // `prog_attach_flags` は 0〔NULL〕なので書かれない）。`ids` は呼び出しの間生存する。
     let rc = unsafe {
         syscall(
             nr,

@@ -4503,9 +4503,11 @@ mod tests {
         );
     }
 
-    /// SUP-12（TASK-169.2）: tmpfs のフラグは nosuid・nodev を常に含み、可変なのは ro / exec だけ。
+    /// SUP-12（TASK-169.2）: tmpfs の `statfs.f_type`（`TMPFS_MAGIC`）の具体値。tmpfs の `fsmount` の attr フラグ
+    /// （nosuid・nodev 固定、ro / exec の 4 通り）は `sup12_task169_tmpfs_attr_bits_are_exact` が照合する
+    /// （`MS_*` 側の `TmpfsMountFlags::bits` は #1693 で削除。#1693 の事後監査 P3・REPAIR-12）。
     #[test]
-    fn sup12_task169_2_tmpfs_flags_are_exact() {
+    fn sup12_task169_2_tmpfs_magic_is_exact() {
         assert_eq!(TMPFS_MAGIC, 0x0102_1994);
     }
 
@@ -4783,6 +4785,50 @@ mod tests {
             assert_eq!(mount_setattr_flags() & 0x8000, 0);
         }
         assert_eq!(std::mem::size_of::<MountAttr>(), 32);
+    }
+
+    /// SEC-1・SUP-12（#1676・#1620・#1693 の事後監査 P3）: `MountAttr` の構築子は `rootfs_nodev_mount_attr`・
+    /// `read_only_mount_attr` の 2 つだけで、どちらも `attr_clr`・`propagation`・`userns_fd` が 0（属性を足すだけ）。
+    /// `mount_setattr_empty_path_raw` の `// SAFETY:` はこの一覧を前提にするため、構築子を足すと本テストが落ちる
+    /// （ソースを走査して `-> MountAttr` を返す `const fn` と `MountAttr {` の構築式を数える）。
+    #[test]
+    fn sec1_sup12_mount_attr_constructors_are_exhaustive() {
+        let fields = |a: MountAttr| (a.attr_set, a.attr_clr, a.propagation, a.userns_fd);
+        let listed = [
+            ("rootfs_nodev_mount_attr", fields(rootfs_nodev_mount_attr())),
+            ("read_only_mount_attr", fields(read_only_mount_attr())),
+        ];
+        assert_eq!(
+            listed,
+            [
+                ("rootfs_nodev_mount_attr", (0x4, 0, 0, 0)),
+                ("read_only_mount_attr", (0x1, 0, 0, 0)),
+            ],
+            "attr_set, attr_clr, propagation, userns_fd"
+        );
+        // テスト以外のソース（`mod tests` より前）を走査する。本テスト自身の行は対象外になる。
+        let src = include_str!("sys.rs");
+        let body = src.split("\nmod tests {").next().unwrap_or(src);
+        let constructors: Vec<&str> = body
+            .lines()
+            .filter(|l| l.trim_end().ends_with("-> MountAttr {"))
+            .filter_map(|l| l.trim_start().strip_prefix("const fn "))
+            .filter_map(|l| l.split('(').next())
+            .collect();
+        assert_eq!(
+            constructors,
+            vec!["rootfs_nodev_mount_attr", "read_only_mount_attr"]
+        );
+        let functions_returning_attr = body.lines().filter(|l| l.contains("-> MountAttr")).count();
+        assert_eq!(
+            functions_returning_attr, 2,
+            "no other MountAttr constructor"
+        );
+        let literals = body.lines().filter(|l| l.trim() == "MountAttr {").count();
+        assert_eq!(
+            literals, 2,
+            "MountAttr is built only in the listed constructors"
+        );
     }
 
     /// SEC-1（#1676）: `is_nodev` は `ST_NODEV`（0x4）だけを見る。

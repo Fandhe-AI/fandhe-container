@@ -4261,11 +4261,20 @@ mod tests {
         let reopened = open_dir_path_nofollow(None, &cdir).unwrap();
         assert_eq!(fs_type(reopened.as_fd()).unwrap(), 0x1cd1);
 
-        // mountinfo: 指定先に fstype devpts・nosuid・noexec で現れ、nodev は付かない。
+        // mountinfo: 指定先に fstype devpts・nosuid・noexec で現れ、nodev は付かない。5 列目は 8 進エスケープを
+        // 戻してから比べる（`TMPDIR` が空白等を含んでも見落とさない。`is_mount_point` と同じ扱い）。
         let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        let dir_bytes = {
+            use std::os::unix::ffi::OsStrExt as _;
+            dir.as_os_str().as_bytes().to_vec()
+        };
         let line = mountinfo
             .lines()
-            .find(|l| l.split(' ').nth(4) == dir.to_str())
+            .find(|l| {
+                l.split(' ')
+                    .nth(4)
+                    .is_some_and(|f| unescape_mountinfo_field(f.as_bytes()) == dir_bytes)
+            })
             .expect("mountinfo entry for the target");
         let (pre, post) = line.split_once(" - ").unwrap();
         let opts: Vec<&str> = pre.split(' ').nth(5).unwrap().split(',').collect();

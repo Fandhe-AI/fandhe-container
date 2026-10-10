@@ -641,6 +641,47 @@ reset_log
 pad_tmp="$work/pad-tmp"
 mkdir -p "$pad_tmp"
 TMPDIR="$pad_tmp" STUB_MODE=state-pad expect_rc "state-truncated-rejected" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 3
+expect_contains "state-truncated-reason" "(exit 125, reason=output-truncated, runtime_exit=0)"
+
+# --- 7c3. state 照会が 125 になる各発生源は理由コードと終了コードを出力する（Issue #1687・REPAIR-4・REPAIR-12） ---
+# 収集の完了が上限（--timeout 1 の期限）を超えて遅れる: collector-timeout。経過時間も上限内に収まる（REPAIR-5）。
+reset_log
+reason_t0="${EPOCHREALTIME/./}"
+STARTUP_LATENCY_TEST_COLLECT_DELAY=state.out:4 expect_rc "state-reason-collector-timeout" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1
+reason_ms=$(((${EPOCHREALTIME/./} - reason_t0) / 1000))
+if [ "$reason_ms" -lt 15000 ]; then pass "state-reason-collector-timeout-bounded (${reason_ms}ms < 15000ms)"; else fail "state-reason-collector-timeout-bounded (${reason_ms}ms)"; fi
+expect_contains "state-reason-collector-timeout-error" "runtime-state-failed"
+expect_contains "state-reason-collector-timeout-reason" "(exit 125, reason=collector-timeout, runtime_exit=0)"
+expect_contains "state-reason-collector-timeout-precreate" "warning: runtime-state-unverified: pre-create state for"
+# 旧来の固定 200ms を超える遅れでも、呼び出しの期限内なら成功する（待ちの上限は期限基準）。
+reset_log
+STARTUP_LATENCY_TEST_COLLECT_DELAY=state.out:0.3 expect_rc "state-collector-delay-within-budget" 0 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 3
+expect_eq "state-collector-delay-within-budget-samples" "1" "$(jq -r '.samples_us | length' <<<"$last_stdout")"
+# 書き込み失敗で完了目印が無い: collector-incomplete（create 前の不存在応答は stderr だけなので出力 0 バイトで失敗せず、
+# 観測ループの照会で初めて失敗する）。
+reset_log
+STARTUP_LATENCY_TEST_COLLECT_FULL=state.out expect_rc "state-reason-collector-incomplete" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 3
+expect_contains "state-reason-collector-incomplete-reason" "(exit 125, reason=collector-incomplete, runtime_exit=0)"
+# GNU timeout 自身（またはランタイム）が 125 を返す: exit-125。start 済みの state 呼び出しだけ偽の timeout で失敗させる。
+mkdir -p "$work/fake125"
+real_timeout="$(command -v timeout)"
+cat >"$work/fake125/timeout" <<FAKE125
+#!/usr/bin/env bash
+case " \$* " in
+  *" state "*)
+    for f in "$stub_state"/*.bundle; do
+      if [ -e "\$f" ]; then echo "timeout: fork system call failed" >&2; exit 125; fi
+    done
+    ;;
+esac
+exec "$real_timeout" "\$@"
+FAKE125
+chmod 755 "$work/fake125/timeout"
+reset_log
+rc=0
+PATH="$work/fake125:$PATH" run_target --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 3
+if [ "$last_rc" -eq 1 ]; then pass "state-reason-exit-125 (exit=1)"; else fail "state-reason-exit-125 (expected exit=1, actual exit=$last_rc)"; print_indented "$last_output"; fi
+expect_contains "state-reason-exit-125-reason" "(exit 125, reason=exit-125, runtime_exit=125)"
 
 # --- 7c4. 子孫への KILL は起動時刻が列挙時と一致するときだけ送る（PID 再利用・同一性不明では送らない） ---
 fn_src="$(sed -n '/^proc_starttime() {/,/^}/p;/^kill_if_same() {/,/^}/p' "$target_script")"

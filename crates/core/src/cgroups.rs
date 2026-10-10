@@ -223,9 +223,15 @@ pub struct CgroupError {
     pub code: ErrorCode,
     /// 失敗した段。
     pub step: CgroupStep,
-    /// 人間向けの説明（英語）。
+    /// 人間向けの説明（英語）。CRI / MCP 等の外部応答へ出しうるため、verifier ログは含めない（#1680）。
     pub message: String,
+    /// verifier がデバイス許可プログラムを拒否したときの診断ログ（[`CgroupError::verifier_log`]。#1680）。
+    verifier_log: Option<String>,
 }
+
+/// [`CgroupError::verifier_log`] の上限バイト数（`sys::bpf` の verifier ログ用バッファと同じ 4096）。
+/// `from_utf8_lossy` の置換で元のバイト数を超えうるため、格納時に改めてこの上限で切る（#1680）。
+pub const CGROUP_VERIFIER_LOG_MAX_BYTES: usize = 4096;
 
 impl CgroupError {
     fn new(code: ErrorCode, step: CgroupStep, message: impl Into<String>) -> Self {
@@ -233,11 +239,36 @@ impl CgroupError {
             code,
             step,
             message: message.into(),
+            verifier_log: None,
         }
     }
 
     fn precondition(step: CgroupStep, message: impl Into<String>) -> Self {
         Self::new(ErrorCode::FailedPrecondition, step, message)
+    }
+
+    /// verifier ログを 1 行に整えて添える。改行・制御文字・書式文字は `crate::sanitize` の判定で空白へ
+    /// 置換し（構造化ログの 1 フィールドに収めるため）、[`CGROUP_VERIFIER_LOG_MAX_BYTES`] で切る。
+    fn with_verifier_log(mut self, raw: &str) -> Self {
+        let text = crate::sanitize::sanitize_display_bounded(raw, CGROUP_VERIFIER_LOG_MAX_BYTES)
+            .into_string();
+        self.verifier_log = Some(text);
+        self
+    }
+
+    /// verifier がデバイス許可プログラムを拒否したときの診断ログ（それ以外は `None`）。
+    ///
+    /// 1 行（改行・制御文字は空白へ置換済み）で [`CGROUP_VERIFIER_LOG_MAX_BYTES`] 以下。`message` と
+    /// `Display` には含めない。呼び出し側は構造化ログへ 1 フィールドとして出し、CRI / MCP 等の外部応答には
+    /// 出さない（verifier ログはカーネル内部の診断情報のため。#1680・PR #1705 事後監査 P3-4・REPAIR-4）。
+    pub fn verifier_log(&self) -> Option<&str> {
+        self.verifier_log.as_deref()
+    }
+
+    /// 試験専用: 任意の `code`・`step`・`message` で組み立てる（`cgroups` の外の単体試験が使う）。
+    #[cfg(test)]
+    pub(crate) fn new_for_test(code: ErrorCode, step: CgroupStep, message: &str) -> Self {
+        Self::new(code, step, message)
     }
 }
 
@@ -1652,11 +1683,7 @@ pub(super) fn record_cgroup_op<T>(
     step: CgroupStep,
     f: impl FnOnce() -> Result<T, CgroupError>,
 ) -> Result<T, CgroupError> {
-    let name = OpName::new(op).map_err(|e| CgroupError {
-        code: e.code(),
-        step,
-        message: e.message().to_string(),
-    })?;
+    let name = OpName::new(op).map_err(|e| CgroupError::new(e.code(), step, e.message()))?;
     recorder.record_op(&name, f)
 }
 

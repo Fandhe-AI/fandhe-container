@@ -15,14 +15,15 @@
 //!   呼ぶ。コンテナ側の seccomp は `bpf` を拒否するため、子プロセスからは呼べない
 //! - 付けたプログラムは子孫の cgroup（exec 用の `exec-*`）にも効く。attach flags は 0 固定のため、子孫で
 //!   上書きも追加もできない（子孫へのアタッチは `EPERM`）
-//! - `BPF_PROG_ATTACH` を使い `BPF_LINK_CREATE` は使わない。プログラムの fd を閉じても外れず、cgroup の
-//!   削除で外れる（常駐デーモンを持たない CORE-1）
 //! - 1 つの cgroup につき 1 回だけ呼ぶ。同じ cgroup に flags 0 のプログラムがあるとアタッチは黙って置き換える
 //!   ため、アタッチ前に問い合わせてプログラム数が 0 でなければ `FailedPrecondition` で拒否する
 //!   （`open_child` が既存の cgroup を開き直す経路でも置き換えを検出するため。付けた後の問い合わせは
 //!   置き換え後もどちらも数 1 を返し検出できない）
 //! - `target_fd` には [`ContainerCgroup::as_fd`]（O_PATH）をそのまま渡す。`cgroup_get_from_fd` が `fdget_raw`
 //!   を使うため通る（`sys::bpf` の一次情報）。開き直しや同一性の再確認はしない
+//! - verifier ログ（PR #1705 事後監査 P3-4）: `message` と `Display` には入れず、1 行に整えた上限つきの
+//!   写しを [`CgroupError::verifier_log`] に持たせる。呼び出し側は構造化ログへ 1 フィールドとして出し、
+//!   CRI / MCP 等の外部応答には出さない
 //! - 失敗は fail-closed で `Err`。途中で失敗しても付いたプログラムを外す後始末はしない（外すには
 //!   `BPF_PROG_DETACH` の `sys` ラッパーが要り範囲外）。呼び出し側は `Err` を受けたらコンテナを起動せず
 //!   cgroup を削除する（削除で外れる）。待機を伴わない同期 syscall のみのためタイムアウトは設けない
@@ -279,15 +280,21 @@ fn bpf_sys_error(step: CgroupStep, what: &str, err: SysError, eperm_hint: &str) 
 }
 
 /// `BPF_PROG_LOAD` の失敗を写す。verifier がログつきで拒否した場合は本リポの命令列の不具合（`Internal`）。
+/// ログは `message` に入れず [`CgroupError::verifier_log`] に持たせる（モジュール doc の「verifier ログ」）。
 fn bpf_load_error(e: &bpf::BpfProgLoadError) -> CgroupError {
     let step = CgroupStep::LoadDeviceProgram;
-    let rejected = e.cause == SysError::Os(sys::EINVAL) || e.cause == SysError::Os(sys::EACCES);
-    if let (true, Some(log)) = (rejected, e.verifier_log.as_deref()) {
+    if let (SysError::Os(errno), Some(log)) = (e.cause, e.verifier_log.as_deref())
+        && (errno == sys::EINVAL || errno == sys::EACCES)
+    {
         return CgroupError::new(
             ErrorCode::Internal,
             step,
-            format!("BPF_PROG_LOAD: the verifier rejected the device program: {log}"),
-        );
+            format!(
+                "BPF_PROG_LOAD: errno {errno}: the verifier rejected the device program \
+                 (verifier log withheld from this message)"
+            ),
+        )
+        .with_verifier_log(log);
     }
     bpf_sys_error(step, "BPF_PROG_LOAD", e.cause, QUERY_EPERM_HINT)
 }
@@ -686,7 +693,14 @@ mod tests {
             (e.code, e.step),
             (ErrorCode::Internal, CgroupStep::LoadDeviceProgram)
         );
-        assert!(e.message.contains("R0 !read_ok"), "{}", e.message);
+        // verifier ログは外部応答に出しうる message へ入れず、別の口で持つ（PR #1705 事後監査 P3-4）。
+        assert_eq!(
+            e.message,
+            "BPF_PROG_LOAD: errno 22: the verifier rejected the device program \
+             (verifier log withheld from this message)"
+        );
+        assert_eq!(e.verifier_log(), Some("R0 !read_ok"));
+        assert!(!e.to_string().contains("R0 !read_ok"), "{e}");
     }
 
     /// SEC-1・TASK-32: アタッチ・問い合わせの errno の写像。

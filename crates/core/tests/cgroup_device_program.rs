@@ -8,6 +8,12 @@
 //!
 //! 命令列は公開アクセサで復号する小さな評価器で `struct bpf_cgroup_dev_ctx` に対して実行し、
 //! 許可・拒否の結果を具体値で照合する。
+//!
+//! # 対象 OS
+//! `cgroups` モジュールは Linux 専用（CORE-4・SEC-1）のため、本ファイル全体を `target_os = "linux"` に
+//! 限定する。macOS・Windows ではコンパイルは通り試験は空になる（アサーションは弱めていない）。
+
+#![cfg(target_os = "linux")]
 
 use fandhe_container_core::cgroups::{
     DEVICE_PROGRAM_MAX_INSNS, DeviceAccess, DeviceAllowList, DeviceMinor, DeviceProgram,

@@ -4,7 +4,7 @@
 //! # 役割
 //! OCI default devices と `/dev/ptmx`・`/dev/pts/*` を表す封印した許可リスト（[`DeviceAllowList`]）から、
 //! cgroup v2 のデバイス制御用 eBPF プログラム（[`DeviceProgram`]）の命令列を組み立てる。
-//! syscall を呼ばない純粋な組み立て層で、`unsafe` を持たない。ロード（`BPF_PROG_LOAD`。#1679）・
+//! syscall を呼ばない純粋な組み立て層で、`unsafe` を持たない。ロードのラッパー（`sys::bpf`。#1679）・
 //! アタッチと事後検証（`BPF_CGROUP_DEVICE`。#1680）・実機の verifier 照合（#1681）・起動経路への結線
 //! （#1314）・GPU の CDI `deviceNodes` の追加入口（TASK-129・GPU-4・#561）は別 issue の担当で、
 //! 現状は未結線（REPAIR-3）。
@@ -40,7 +40,7 @@ use crate::traits::ErrorCode;
 /// プログラムの命令数の上限。カーネルの `BPF_MAXINSNS`（`linux/bpf_common.h`）。
 pub const DEVICE_PROGRAM_MAX_INSNS: usize = 4096;
 
-/// `BPF_PROG_LOAD` に渡す license 文字列（#1679 が使う）。
+/// `BPF_PROG_LOAD` に渡す license 文字列（#1679 の `sys::bpf` のロードが使う）。
 ///
 /// 本プログラムは BPF ヘルパーを呼ばないため、カーネルがこの文字列から決める GPL 互換性は検証結果に
 /// 影響しない見込み。本リポの中核ライセンス（Apache-2.0 単独）と同じ値を宣言する。

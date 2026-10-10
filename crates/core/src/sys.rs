@@ -27,6 +27,8 @@
 //! （restrict は呼び出したスレッドへの不可逆な適用）。
 //! さらに `crate::exec` の結合試験用プローブ（CORE-5・TASK-38.4・#179）が、副作用の無い引数に固定した
 //! `ptrace(2)`・`kexec_load(2)`（`syscall(2)` 経由）を呼ぶ。
+//! さらにデバイス cgroup 用の `sys::bpf`（TASK-32 追補・#1679）が `bpf(2)`（`syscall(2)` 経由。
+//! `BPF_PROG_LOAD`・`BPF_PROG_ATTACH`・`BPF_PROG_QUERY`）を呼ぶ（呼び出し側の配線は #1680・#1314）。
 //! さらに封印した複製からの実行（TASK-163 追補・#1530・#1531）が、`memfd_create(2)`（`syscall(2)` 経由）と
 //! `fcntl(2)` の `F_ADD_SEALS` / `F_GET_SEALS`、複製の前に元のファイルを実行してよいかをカーネルに判定させる
 //! `execveat(2)` の `AT_EXECVE_CHECK`（`syscall(2)` 経由。Linux 6.14 以降）と、元のファイルのマウントの `noexec` を
@@ -103,7 +105,7 @@ pub(crate) enum SysError {
 /// errno の値（アーキテクチャごとに `consts` で個別定義。alpha / mips / sparc 等は値が違う）。
 pub(crate) use consts::{
     E2BIG, EACCES, EAFNOSUPPORT, EBADF, EBUSY, ECHILD, ECONNREFUSED, EEXIST, EINTR, EINVAL, ELOOP,
-    EMFILE, ENFILE, ENOENT, ENOEXEC, ENOMEM, ENOSYS, ENOTDIR, ENOTEMPTY, EOPNOTSUPP, EPERM,
+    EMFILE, ENFILE, ENOENT, ENOEXEC, ENOMEM, ENOSPC, ENOSYS, ENOTDIR, ENOTEMPTY, EOPNOTSUPP, EPERM,
     EPROTONOSUPPORT, ESRCH,
 };
 
@@ -228,6 +230,8 @@ mod sysno {
     }
 }
 use sysno::{ArchSysNo, SyscallNumber};
+
+pub(crate) mod bpf;
 
 /// アーキテクチャごとの clone / mount / open 定数。値が同一でも arch ごとに個別定義する。
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
@@ -383,6 +387,20 @@ mod consts {
     pub const EMFILE: i32 = 24;
     // include/uapi/linux/stat.h の `S_IFCHR`（文字デバイス。全アーキテクチャ共通）。
     pub const S_IFCHR: u32 = 0o020_000;
+
+    // arch/x86/entry/syscalls/syscall_64.tbl の `bpf`（321）。
+    pub const SYS_BPF: ArchSysNo = ArchSysNo::new(321);
+    // include/uapi/linux/bpf.h の `enum bpf_cmd`（`BPF_PROG_LOAD` 5・`BPF_PROG_ATTACH` 8・`BPF_PROG_QUERY` 16）、
+    // `enum bpf_prog_type` の `BPF_PROG_TYPE_CGROUP_DEVICE`（15）、`enum bpf_attach_type` の
+    // `BPF_CGROUP_DEVICE`（6）。`BPF_LOG_LEVEL1`（1）は include/linux/bpf_verifier.h。全 arch 共通値。
+    pub const BPF_PROG_LOAD: u32 = 5;
+    pub const BPF_PROG_ATTACH: u32 = 8;
+    pub const BPF_PROG_QUERY: u32 = 16;
+    pub const BPF_PROG_TYPE_CGROUP_DEVICE: u32 = 15;
+    pub const BPF_CGROUP_DEVICE: u32 = 6;
+    pub const BPF_LOG_LEVEL1: u32 = 1;
+    // include/uapi/asm-generic/errno-base.h の `ENOSPC`（28。x86_64 は上書きしない）。
+    pub const ENOSPC: i32 = 28;
 
     // include/uapi/linux/prctl.h の `PR_SET_NO_NEW_PRIVS`（38）・`PR_GET_NO_NEW_PRIVS`（39）。
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
@@ -625,6 +643,20 @@ mod consts {
     // include/uapi/linux/stat.h の `S_IFCHR`（文字デバイス。全アーキテクチャ共通）。
     pub const S_IFCHR: u32 = 0o020_000;
 
+    // include/uapi/asm-generic/unistd.h の `__NR_bpf`（280。arm64 は汎用表）。
+    pub const SYS_BPF: ArchSysNo = ArchSysNo::new(280);
+    // include/uapi/linux/bpf.h の `enum bpf_cmd`（`BPF_PROG_LOAD` 5・`BPF_PROG_ATTACH` 8・`BPF_PROG_QUERY` 16）、
+    // `enum bpf_prog_type` の `BPF_PROG_TYPE_CGROUP_DEVICE`（15）、`enum bpf_attach_type` の
+    // `BPF_CGROUP_DEVICE`（6）。`BPF_LOG_LEVEL1`（1）は include/linux/bpf_verifier.h。全 arch 共通値。
+    pub const BPF_PROG_LOAD: u32 = 5;
+    pub const BPF_PROG_ATTACH: u32 = 8;
+    pub const BPF_PROG_QUERY: u32 = 16;
+    pub const BPF_PROG_TYPE_CGROUP_DEVICE: u32 = 15;
+    pub const BPF_CGROUP_DEVICE: u32 = 6;
+    pub const BPF_LOG_LEVEL1: u32 = 1;
+    // include/uapi/asm-generic/errno-base.h の `ENOSPC`（28。arm64 は上書きしない）。
+    pub const ENOSPC: i32 = 28;
+
     // include/uapi/linux/prctl.h の `PR_SET_NO_NEW_PRIVS`（38）・`PR_GET_NO_NEW_PRIVS`（39）。
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
     pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
@@ -819,6 +851,16 @@ mod consts {
     pub const EMFILE: i32 = -20;
     pub const EBADF: i32 = -13;
     pub const S_IFCHR: u32 = 0;
+
+    // 対応外アーキテクチャ: `bpf(2)` の番号は無く、各ラッパーが `Unsupported` を返す。
+    pub const SYS_BPF: ArchSysNo = ArchSysNo::UNSUPPORTED;
+    pub const BPF_PROG_LOAD: u32 = 0;
+    pub const BPF_PROG_ATTACH: u32 = 0;
+    pub const BPF_PROG_QUERY: u32 = 0;
+    pub const BPF_PROG_TYPE_CGROUP_DEVICE: u32 = 0;
+    pub const BPF_CGROUP_DEVICE: u32 = 0;
+    pub const BPF_LOG_LEVEL1: u32 = 0;
+    pub const ENOSPC: i32 = -25;
 
     pub const PR_SET_NO_NEW_PRIVS: i32 = 0;
     pub const PR_GET_NO_NEW_PRIVS: i32 = 0;

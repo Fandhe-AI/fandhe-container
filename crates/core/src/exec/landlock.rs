@@ -294,6 +294,7 @@ pub(super) mod testing {
                 rules_added: ruleset.rules().len(),
                 file_rules: 0,
                 skipped_empty: 0,
+                implicit_mounts_verified: 0,
             }),
         }
     }

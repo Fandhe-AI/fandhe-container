@@ -15,10 +15,20 @@
 //!   fsmount の属性ビットは `sys` が固定で持ち、`sys` の単体テストが本定義との一致を照合する
 //! - `crate::landlock`: [`ImplicitDevMounts`] に従い、実マウントの属性から導いた最小の権利でルールを足す
 //!
-//! # 未実装範囲（REPAIR-3）
+//! # `/dev/shm` を載せない構成（#1672 事後監査 P2）
 //!
-//! `--ipc=host` 等で `/dev/shm` を載せない構成の細かい選択肢は無い。呼び出し側（supervisor）の判断が決まった後に
-//! [`ImplicitDevMounts`] へ足す（TASK-29 系）。
+//! `--ipc=host` では `/dev/shm` の tmpfs を載せない（ホストの `/dev/shm` の bind は未実装。
+//! `docs/design/dev-default-mounts.md` 3.4）。その構成で `/dev/shm` のルールを入れると、適用時にパスが無く
+//! 起動を拒否する。そのため [`ImplicitDevMounts::WithoutShm`] を用意し、実際に載せる tmpfs の集合から
+//! [`ImplicitDevMounts::for_tmpfs_set`] で選ぶ（supervisor の `ContainerOptions::implicit_dev_mounts`）。
+//! どの variant でも、適用時に各パスが期待する fs の独立したマウントであることを `crate::landlock` が確かめる
+//! （載っていなければ `landlock_implicit_mount_missing` / `_mismatch` の `FailedPrecondition` で拒否する）。
+//!
+//! # 読み取り専用の root との関係（#1672 事後監査 P2・CORE-5）
+//!
+//! `/dev` は書き込みと実行が可能な tmpfs（runc・Docker と同じ）で、Landlock でも `WRITE` を許す。そのため
+//! `root.readonly=true` で `mounts[]` が空でも、`/dev`（と `/dev/shm`）には書き込める。「読み取り専用の root で
+//! `mounts[]` が空なら書き込めるパスが無い」という #1657 以前の性質は成り立たない。
 
 /// 暗黙に載るマウント 1 件。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,17 +117,34 @@ impl ImplicitDevMount {
 pub enum ImplicitDevMounts {
     /// 3 件すべて。
     All,
+    /// `/dev` と `/dev/pts` だけ（`/dev/shm` を載せない `--ipc=host` 等の構成。#1672 事後監査 P2）。
+    WithoutShm,
     /// 含めない。
     None,
 }
+
+/// [`ImplicitDevMounts::WithoutShm`] の対象（マウント順）。
+const WITHOUT_SHM: [ImplicitDevMount; 2] = [ImplicitDevMount::Dev, ImplicitDevMount::DevPts];
 
 impl ImplicitDevMounts {
     /// 対象のマウント。
     pub fn entries(self) -> &'static [ImplicitDevMount] {
         match self {
             Self::All => &ImplicitDevMount::ALL,
+            Self::WithoutShm => &WITHOUT_SHM,
             Self::None => &[],
         }
+    }
+
+    /// 実際に載せる tmpfs の集合から選ぶ（`/dev`・`/dev/pts` は常に載る暗黙の固定集合）。`set` に `/dev/shm` の
+    /// 件（既定 64 MiB か利用者指定）があれば [`ImplicitDevMounts::All`]、無ければ（`--ipc=host`）
+    /// [`ImplicitDevMounts::WithoutShm`]。
+    pub fn for_tmpfs_set(set: &crate::tmpfs::TmpfsMountSet) -> Self {
+        let has_shm = set
+            .mounts()
+            .iter()
+            .any(|m| m.destination.as_str() == ImplicitDevMount::DevShm.destination());
+        if has_shm { Self::All } else { Self::WithoutShm }
     }
 }
 
@@ -161,6 +188,43 @@ mod tests {
         assert_eq!(ImplicitDevMount::ALL.len(), 3);
         assert_eq!(IMPLICIT_DEV_MOUNT_COUNT, 3);
         assert_eq!(ImplicitDevMounts::All.entries(), &ImplicitDevMount::ALL);
+        assert_eq!(
+            ImplicitDevMounts::WithoutShm.entries(),
+            &[ImplicitDevMount::Dev, ImplicitDevMount::DevPts]
+        );
         assert!(ImplicitDevMounts::None.entries().is_empty());
+    }
+
+    /// SUP-12・CORE-5（#1672 事後監査 P2）: `/dev/shm` を含む集合は `All`、含まない集合（`--ipc=host`）は
+    /// `WithoutShm`。`/dev/shm` 配下だけの件（`/dev/shm/sub`）では `/dev/shm` 自体は載らないため `WithoutShm`。
+    #[test]
+    fn sup12_core5_implicit_dev_mounts_follow_the_tmpfs_set() {
+        use crate::tmpfs::{TmpfsMountSet, TmpfsMountSpec};
+        let mut default_shm = TmpfsMountSet::new();
+        default_shm.ensure_default_dev_shm().expect("default shm");
+        assert_eq!(
+            ImplicitDevMounts::for_tmpfs_set(&default_shm),
+            ImplicitDevMounts::All
+        );
+        let mut user_shm = TmpfsMountSet::new();
+        user_shm
+            .push(TmpfsMountSpec::new("/dev/shm", None).expect("spec"))
+            .expect("push");
+        assert_eq!(
+            ImplicitDevMounts::for_tmpfs_set(&user_shm),
+            ImplicitDevMounts::All
+        );
+        assert_eq!(
+            ImplicitDevMounts::for_tmpfs_set(&TmpfsMountSet::new()),
+            ImplicitDevMounts::WithoutShm
+        );
+        let mut sub_only = TmpfsMountSet::new();
+        sub_only
+            .push(TmpfsMountSpec::new("/dev/shm/sub", None).expect("spec"))
+            .expect("push");
+        assert_eq!(
+            ImplicitDevMounts::for_tmpfs_set(&sub_only),
+            ImplicitDevMounts::WithoutShm
+        );
     }
 }

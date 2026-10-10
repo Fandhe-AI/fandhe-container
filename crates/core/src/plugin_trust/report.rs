@@ -186,7 +186,8 @@ pub fn record_plugin_trust_rejection(
         path: AuditPath::new(error.path()),
         reason: AuditReason::new(error.reason()),
     };
-    let delivery = deliver(event, sink);
+    // plugin の信頼検証は特定のコンテナに属さないため container_id は載せない（#1618）。
+    let delivery = deliver(event, None, sink);
     AuditedRejection { error, delivery }
 }
 

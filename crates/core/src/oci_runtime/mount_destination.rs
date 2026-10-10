@@ -35,6 +35,7 @@ use std::path::{Component, Path, PathBuf};
 
 use super::config::{CONFIG_MAX_PATH_BYTES, OciConfigError, OciConfigErrorKind};
 use crate::audit_log::{AuditSink, AuditedRejection, record_mount_rejection};
+use crate::traits::ContainerId;
 
 const DEST_FIELD: &str = "mounts[].destination";
 const ROOT_FIELD: &str = "root.path";
@@ -114,9 +115,12 @@ impl MountDestination {
     /// 成功時は `resolve_in` と同じ値。`mounts[].destination` 起因の拒否時は正規化済みのコンテナ内パス（ホスト側 rootfs の実パスは
     /// 載せない）を `Mount` レコードとして `sink` へ 1 件渡し、エラーはそのまま返す（fail-closed）。
     /// 本番経路への配線は未実装（TASK-29.2）。
+    ///
+    /// 移行（#1618）: 引数 `container` を `sink` の直前に追加した。ID が無い呼び出し側は `None` を渡す。
     pub fn resolve_in_audited(
         &self,
         rootfs: &Path,
+        container: Option<&ContainerId>,
         sink: &dyn AuditSink,
     ) -> Result<PathBuf, Box<AuditedRejection<OciConfigError>>> {
         self.resolve_in(rootfs).map_err(|e| {
@@ -126,7 +130,7 @@ impl MountDestination {
                 OciConfigErrorKind::Invalid { field } if *field == DEST_FIELD
             );
             Box::new(if is_dest {
-                record_mount_rejection(e, Some(self.as_path()), sink)
+                record_mount_rejection(e, Some(self.as_path()), container, sink)
             } else {
                 AuditedRejection::not_applicable(e)
             })
@@ -139,8 +143,11 @@ impl MountDestination {
 ///
 /// エラーは入力値を保持しないため `path` なしで記録する（計画段階の拒否）。他フィールドの拒否は
 /// 記録せず `NotApplicable`。エラーは常にそのまま返る。
+///
+/// 移行（#1618）: 引数 `container` を `sink` の直前に追加した。ID が無い呼び出し側は `None` を渡す。
 pub fn audit_mount_config_error(
     err: OciConfigError,
+    container: Option<&ContainerId>,
     sink: &dyn AuditSink,
 ) -> AuditedRejection<OciConfigError> {
     let is_dest = match err.kind() {
@@ -149,7 +156,7 @@ pub fn audit_mount_config_error(
         _ => false,
     };
     if is_dest {
-        record_mount_rejection(err, None, sink)
+        record_mount_rejection(err, None, container, sink)
     } else {
         AuditedRejection::not_applicable(err)
     }
@@ -297,7 +304,7 @@ mod tests {
         let dest = MountDestination::parse("/etc").expect("parse");
         let ok_sink = VecSink::new(false);
         let root = std::env::temp_dir();
-        let out = dest.resolve_in_audited(&root, &ok_sink).expect("ok");
+        let out = dest.resolve_in_audited(&root, None, &ok_sink).expect("ok");
         assert_eq!(out, root.join("etc"));
         assert_eq!(ok_sink.snapshot().len(), 0);
     }
@@ -311,7 +318,7 @@ mod tests {
         let dest = MountDestination::parse("/etc").expect("parse");
         let sink = VecSink::new(false);
         let r = dest
-            .resolve_in_audited(Path::new("relative-rootfs"), &sink)
+            .resolve_in_audited(Path::new("relative-rootfs"), None, &sink)
             .expect_err("relative rootfs rejected");
         assert_eq!(r.delivery, AuditDelivery::NotApplicable);
         assert_eq!(sink.snapshot().len(), 0);

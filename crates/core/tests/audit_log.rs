@@ -202,7 +202,7 @@ fn sec4_task41_6_three_layers_into_one_sink() {
     .expect("landlock record");
     sink.record(&ll).unwrap();
 
-    let m = record_mount_rejection("denied", Some(Path::new("/proc/sys")), &sink);
+    let m = record_mount_rejection("denied", Some(Path::new("/proc/sys")), None, &sink);
     assert_eq!(m.delivery, AuditDelivery::Recorded);
     assert_eq!(m.error, "denied");
 
@@ -271,7 +271,7 @@ fn sec4_task41_6_mount_api_violation_via_oci_config() {
     let sink = BoundedSink::new();
     let json = oci_config(r#"[{"destination":"/../etc"}]"#, r#"["/bin/sh"]"#);
     let err = parse_config_bytes(json.as_bytes()).expect_err("rejected");
-    let r = audit_mount_config_error(err, &sink);
+    let r = audit_mount_config_error(err, None, &sink);
     assert_eq!(r.delivery, AuditDelivery::Recorded);
     assert_eq!(r.error.code(), ErrorCode::InvalidArgument);
     let recs = sink.snapshot();
@@ -284,7 +284,7 @@ fn sec4_task41_6_mount_api_violation_via_oci_config() {
 
     let json = oci_config(r#"[{"destination":"/proc"}]"#, "[]");
     let err = parse_config_bytes(json.as_bytes()).expect_err("rejected");
-    let r = audit_mount_config_error(err, &sink);
+    let r = audit_mount_config_error(err, None, &sink);
     assert_eq!(r.delivery, AuditDelivery::NotApplicable);
     assert_eq!(sink.snapshot().len(), 1);
 }
@@ -332,7 +332,7 @@ fn sec4_task41_6_exec_non_mount_violation_is_not_recorded() {
     assert_eq!(err.code, ErrorCode::InvalidArgument);
     assert!(err.violation.is_some());
     let sink = BoundedSink::new();
-    let r = audit_mount_violation(err.clone(), &sink);
+    let r = audit_mount_violation(err.clone(), None, &sink);
     assert_eq!(r.delivery, AuditDelivery::NotApplicable);
     assert_eq!(r.error.code, err.code);
     assert_eq!(r.error.message, err.message);
@@ -412,7 +412,7 @@ fn sec4_task41_6_every_denied_syscall_yields_one_record() {
 /// SEC-4・TASK-41.6: sink の失敗は拒否エラーを覆さない（fail-closed）。seccomp 経路はエラーを伝播する。
 #[test]
 fn sec4_task41_6_sink_failure_does_not_override_rejection() {
-    let r = record_mount_rejection("denied", Some(Path::new("/proc/sys")), &FailingSink);
+    let r = record_mount_rejection("denied", Some(Path::new("/proc/sys")), None, &FailingSink);
     assert_eq!(r.error, "denied");
     match r.delivery {
         AuditDelivery::SinkFailed(e) => assert_eq!(e.code(), ErrorCode::Internal),
@@ -431,8 +431,13 @@ fn sec4_sup6_task163_exec_target_rejection_is_one_record_without_path() {
     use fandhe_container_core::exec::{ViolationReason, record_exec_target_rejection};
 
     let sink = BoundedSink::new();
-    let r =
-        record_exec_target_rejection("rejected", ViolationReason::ExecTargetCgroupMismatch, &sink);
+    let cid = fandhe_container_core::traits::ContainerId::new("c1").unwrap();
+    let r = record_exec_target_rejection(
+        "rejected",
+        ViolationReason::ExecTargetCgroupMismatch,
+        Some(&cid),
+        &sink,
+    );
     assert_eq!(r.error, "rejected");
     assert_eq!(r.delivery, AuditDelivery::Recorded);
     let recs = sink.snapshot();
@@ -444,8 +449,12 @@ fn sec4_sup6_task163_exec_target_rejection_is_one_record_without_path() {
     assert_eq!(j["layer"], "exec_target");
     assert!(j["path"].is_null());
     assert_eq!(j["reason"], "exec_target_cgroup_mismatch");
+    // #1618: 検証済みのコンテナ ID が記録とワイヤー表現の両方に載る。
+    assert_eq!(recs[0].container_id().map(|c| c.as_str()), Some("c1"));
+    assert_eq!(j["container_id"], "c1");
 
-    let r = record_exec_target_rejection("x", ViolationReason::EntrypointIsRuntimeBinary, &sink);
+    let r =
+        record_exec_target_rejection("x", ViolationReason::EntrypointIsRuntimeBinary, None, &sink);
     assert_eq!(r.delivery, AuditDelivery::NotApplicable);
     assert_eq!(sink.snapshot().len(), 1);
 }
@@ -458,8 +467,12 @@ fn sec4_sup6_task163_entrypoint_rejection_is_one_record_without_path() {
     use fandhe_container_core::exec::{ViolationReason, record_entrypoint_rejection};
 
     let sink = BoundedSink::new();
-    let r =
-        record_entrypoint_rejection("rejected", ViolationReason::EntrypointOnNoexecMount, &sink);
+    let r = record_entrypoint_rejection(
+        "rejected",
+        ViolationReason::EntrypointOnNoexecMount,
+        None,
+        &sink,
+    );
     assert_eq!(r.error, "rejected");
     assert_eq!(r.delivery, AuditDelivery::Recorded);
     let recs = sink.snapshot();
@@ -471,8 +484,12 @@ fn sec4_sup6_task163_entrypoint_rejection_is_one_record_without_path() {
     assert_eq!(j["layer"], "entrypoint");
     assert!(j["path"].is_null());
     assert_eq!(j["reason"], "entrypoint_on_noexec_mount");
+    // #1618: ID が無い記録は null。
+    assert_eq!(recs[0].container_id(), None);
+    assert!(j["container_id"].is_null());
 
-    let r = record_entrypoint_rejection("x", ViolationReason::ExecTargetCgroupMismatch, &sink);
+    let r =
+        record_entrypoint_rejection("x", ViolationReason::ExecTargetCgroupMismatch, None, &sink);
     assert_eq!(r.delivery, AuditDelivery::NotApplicable);
     assert_eq!(sink.snapshot().len(), 1);
 }

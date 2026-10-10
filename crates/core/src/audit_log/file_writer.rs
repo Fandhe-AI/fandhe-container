@@ -11,7 +11,7 @@
 //! - 各レイヤーのフック（seccomp / Landlock / マウント。TASK-41.2〜41.4）が組み立てた [`AuditRecord`] を
 //!   supervisor / CLI の配線が [`write_with_fallback`] へ渡す想定（`AuditSink` への適合は `FileAuditSink`〔#1594〕で実装済み）
 //! - [`encode_json_line`] はワイヤースキーマの単一の定義点。#840・#652（TASK-98.1・ERR-4 の共通ログ型）が再利用する
-//! - 全キー常在の固定スキーマ。値が無いものは `null`。`path` は lossy UTF-8 で、制御文字・改行・NUL は
+//! - 全キー常在の固定スキーマ。値が無いものは `null`（`reason` だけは対象外の層で省略。`container_id` は末尾で常在）。`path` は lossy UTF-8 で、制御文字・改行・NUL は
 //!   JSON エスケープされる（ログ注入対策: 生の LF は行末の 1 個だけ）
 //! - [`AuditFileWriter::open`] は symlink・FIFO・他者所有・group/other 権限付きのファイルを拒否する。
 //!   親ディレクトリも `/` から 1 要素ずつ `O_NOFOLLOW|O_DIRECTORY` で辿って fd で固定し、いずれかが
@@ -223,11 +223,13 @@ impl std::error::Error for AuditWriteError {}
 
 /// ワイヤー表現（非公開 DTO）。キー順はフィールド宣言順。
 #[derive(Serialize)]
-struct AuditLineDto {
+struct AuditLineDto<'a> {
     event: &'static str,
     layer: &'static str,
     ts_sec: u64,
     ts_nsec: u32,
+    /// 記録を組み立てたプロセスの PID（違反したプロセスや pid1 とは限らない。層ごとの意味は
+    /// `AuditRecord` の doc）。コンテナとの対応は `container_id` で取る。
     pid: u32,
     syscall: Option<u32>,
     /// seccomp のみ: syscall 番号を解釈するための `AUDIT_ARCH_*`（番号はアーキ相対のため併記）。
@@ -238,6 +240,9 @@ struct AuditLineDto {
     /// plugin 信頼検証と exec 対象のみ: 拒否理由トークン（他レイヤーでは出力しない＝既存行は不変）。
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'static str>,
+    /// 検証済みの `ContainerId`（`[A-Za-z0-9._-]`・255 バイト以下）の生の値。不明なら `null`（省略しない）。
+    /// 末尾に置く（既存キーの値と順序は変えない。#1618）。
+    container_id: Option<&'a str>,
 }
 
 /// レコードを JSON 1 行（LF 終端）へエンコードする。
@@ -264,6 +269,7 @@ pub fn encode_json_line(record: &AuditRecord) -> Result<Vec<u8>, AuditWriteError
         path_truncated: path.map(|p| p.is_truncated()),
         path_original_len: path.map(|p| p.original_len()),
         reason: record.reason().map(|r| r.as_str()),
+        container_id: record.container_id().map(|c| c.as_str()),
     };
     let mut line =
         serde_json::to_vec(&dto).map_err(|_| AuditWriteError::new(AuditWriteErrorKind::Encode))?;
@@ -640,7 +646,7 @@ mod tests {
         );
         assert_eq!(
             text(&r),
-            "{\"event\":\"audit\",\"layer\":\"seccomp\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":42,\"syscall\":272,\"arch\":3221225534,\"path\":null,\"path_truncated\":null,\"path_original_len\":null}\n"
+            "{\"event\":\"audit\",\"layer\":\"seccomp\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":42,\"syscall\":272,\"arch\":3221225534,\"path\":null,\"path_truncated\":null,\"path_original_len\":null,\"container_id\":null}\n"
         );
     }
 
@@ -656,12 +662,12 @@ mod tests {
         );
         assert_eq!(
             text(&l),
-            "{\"event\":\"audit\",\"layer\":\"landlock\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":7,\"syscall\":null,\"arch\":null,\"path\":\"/etc/shadow\",\"path_truncated\":false,\"path_original_len\":11}\n"
+            "{\"event\":\"audit\",\"layer\":\"landlock\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":7,\"syscall\":null,\"arch\":null,\"path\":\"/etc/shadow\",\"path_truncated\":false,\"path_original_len\":11,\"container_id\":null}\n"
         );
         let m = rec(8, AuditEvent::Mount { path: None });
         assert_eq!(
             text(&m),
-            "{\"event\":\"audit\",\"layer\":\"mount\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":8,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null}\n"
+            "{\"event\":\"audit\",\"layer\":\"mount\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":8,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null,\"container_id\":null}\n"
         );
     }
 
@@ -677,7 +683,7 @@ mod tests {
         );
         assert_eq!(
             text(&r),
-            "{\"event\":\"audit\",\"layer\":\"plugin_trust\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":9,\"syscall\":null,\"arch\":null,\"path\":\"/p/plugin\",\"path_truncated\":false,\"path_original_len\":9,\"reason\":\"hash_mismatch\"}\n"
+            "{\"event\":\"audit\",\"layer\":\"plugin_trust\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":9,\"syscall\":null,\"arch\":null,\"path\":\"/p/plugin\",\"path_truncated\":false,\"path_original_len\":9,\"reason\":\"hash_mismatch\",\"container_id\":null}\n"
         );
     }
 
@@ -692,7 +698,7 @@ mod tests {
         );
         assert_eq!(
             text(&r),
-            "{\"event\":\"audit\",\"layer\":\"exec_target\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":11,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null,\"reason\":\"exec_target_cgroup_mismatch\"}\n"
+            "{\"event\":\"audit\",\"layer\":\"exec_target\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":11,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null,\"reason\":\"exec_target_cgroup_mismatch\",\"container_id\":null}\n"
         );
     }
 
@@ -707,7 +713,101 @@ mod tests {
         );
         assert_eq!(
             text(&r),
-            "{\"event\":\"audit\",\"layer\":\"entrypoint\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":12,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null,\"reason\":\"entrypoint_is_runtime_binary\"}\n"
+            "{\"event\":\"audit\",\"layer\":\"entrypoint\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":12,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null,\"reason\":\"entrypoint_is_runtime_binary\",\"container_id\":null}\n"
+        );
+    }
+
+    fn cid(v: &str) -> crate::traits::ContainerId {
+        crate::traits::ContainerId::new(v).unwrap()
+    }
+
+    /// SEC-4・SUP-6・REPAIR-2・#1618: exec_target の行は末尾に検証済みのコンテナ ID を持つ（行まるごと一致）。
+    #[test]
+    fn sec4_sup6_1618_encode_exec_target_with_container_id() {
+        let r = rec(
+            11,
+            AuditEvent::ExecTarget {
+                reason: crate::audit_log::AuditReason::new("exec_target_cgroup_mismatch"),
+            },
+        )
+        .with_container_id(cid("c1"));
+        assert_eq!(
+            text(&r),
+            "{\"event\":\"audit\",\"layer\":\"exec_target\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":11,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null,\"reason\":\"exec_target_cgroup_mismatch\",\"container_id\":\"c1\"}\n"
+        );
+    }
+
+    /// SEC-4・#1618: mount の行はパスあり・なしの両方で末尾が container_id になる。
+    #[test]
+    fn sec4_1618_encode_mount_with_container_id() {
+        let with_path = rec(
+            8,
+            AuditEvent::Mount {
+                path: Some(AuditPath::new("/proc/sys")),
+            },
+        )
+        .with_container_id(cid("c1"));
+        assert!(
+            text(&with_path).ends_with("\"path_original_len\":9,\"container_id\":\"c1\"}\n"),
+            "{}",
+            text(&with_path)
+        );
+        let no_path = rec(8, AuditEvent::Mount { path: None }).with_container_id(cid("c1"));
+        assert!(
+            text(&no_path).ends_with("\"path_original_len\":null,\"container_id\":\"c1\"}\n"),
+            "{}",
+            text(&no_path)
+        );
+    }
+
+    /// SEC-4・#1618: ID が無い記録は全層で `"container_id":null` を末尾に持つ。
+    #[test]
+    fn sec4_1618_encode_without_container_id_is_null() {
+        let events = [
+            AuditEvent::Seccomp {
+                syscall: AuditSyscallNr::new(272).unwrap(),
+                arch: AuditSyscallArch::from_raw(3221225534),
+            },
+            AuditEvent::Landlock {
+                path: AuditPath::new("/etc/shadow"),
+                syscall: None,
+            },
+            AuditEvent::Mount { path: None },
+            AuditEvent::PluginTrust {
+                path: AuditPath::new("/p/plugin"),
+                reason: crate::audit_log::AuditReason::new("hash_mismatch"),
+            },
+            AuditEvent::ExecTarget {
+                reason: crate::audit_log::AuditReason::new("exec_target_cgroup_mismatch"),
+            },
+            AuditEvent::Entrypoint {
+                reason: crate::audit_log::AuditReason::new("entrypoint_is_runtime_binary"),
+            },
+        ];
+        for e in events {
+            let s = text(&rec(3, e));
+            assert!(s.ends_with(",\"container_id\":null}\n"), "{s}");
+        }
+    }
+
+    /// SEC-4・#1618: 最悪ケース（制御文字だけの 4096 バイトのパス＋255 バイトの ID）でも 1 行の上限に収まる。
+    #[test]
+    fn sec4_1618_worst_case_line_fits() {
+        let path = "\u{1}".repeat(4096);
+        let id = "a".repeat(255);
+        let r = rec(
+            2_000_000_000,
+            AuditEvent::Mount {
+                path: Some(AuditPath::new(&path)),
+            },
+        )
+        .with_container_id(cid(&id));
+        let line = encode_json_line(&r).expect("worst case encodes");
+        assert!(line.len() <= AUDIT_LINE_MAX_BYTES, "{}", line.len());
+        assert!(
+            String::from_utf8(line)
+                .unwrap()
+                .ends_with(&format!(",\"container_id\":\"{id}\"}}\n"))
         );
     }
 

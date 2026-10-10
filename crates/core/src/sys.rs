@@ -156,8 +156,8 @@ mod consts {
     pub const OPEN_TREE_CLONE: u32 = 1;
     pub const OPEN_TREE_CLOEXEC: u32 = 0o2_000_000;
     pub const OPEN_TREE_AT_EMPTY_PATH: u32 = 0x1000;
-    // mount_setattr(2)（#1676・rootfs の nodev。CORE-1・SEC-1）。arch/x86/entry/syscalls/syscall_64.tbl・
-    // include/uapi/asm-generic/unistd.h とも 442。`AT_EMPTY_PATH` は `mount_setattr` 用に u32 で持つ。
+    // mount_setattr(2)（#1676・rootfs の nodev。CORE-1・SEC-1）。arch/x86/entry/syscalls/syscall_64.tbl の 442。
+    // `AT_EMPTY_PATH` は `mount_setattr` 用に u32 で持つ。
     pub const SYS_MOUNT_SETATTR: i64 = 442;
     pub const MOUNT_SETATTR_AT_EMPTY_PATH: u32 = 0x1000;
     // arch/x86/entry/syscalls/syscall_64.tbl の `pidfd_send_signal`（424）・`pidfd_open`（434）。
@@ -390,8 +390,8 @@ mod consts {
     pub const OPEN_TREE_CLONE: u32 = 1;
     pub const OPEN_TREE_CLOEXEC: u32 = 0o2_000_000;
     pub const OPEN_TREE_AT_EMPTY_PATH: u32 = 0x1000;
-    // mount_setattr(2)（#1676・rootfs の nodev。CORE-1・SEC-1）。arch/x86/entry/syscalls/syscall_64.tbl・
-    // include/uapi/asm-generic/unistd.h とも 442。`AT_EMPTY_PATH` は `mount_setattr` 用に u32 で持つ。
+    // mount_setattr(2)（#1676・rootfs の nodev。CORE-1・SEC-1）。include/uapi/asm-generic/unistd.h の
+    // `__NR_mount_setattr`（442）。`AT_EMPTY_PATH` は `mount_setattr` 用に u32 で持つ。
     pub const SYS_MOUNT_SETATTR: i64 = 442;
     pub const MOUNT_SETATTR_AT_EMPTY_PATH: u32 = 0x1000;
     // include/uapi/asm-generic/unistd.h の `__NR_pidfd_send_signal`・`__NR_pidfd_open`（arm64 は

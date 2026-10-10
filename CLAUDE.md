@@ -6,7 +6,7 @@ Rust でフルスクラッチ開発する軽量なコンテナ実行基盤の実
 
 - **本リポは public**。仕様・ビヘイビア定義の SSOT は private リポ [fandhe-container-spec](https://github.com/Fandhe-AI/fandhe-container-spec)（`docs/spec` submodule の `04-behavior/`）。spec の内容は本リポに載せてよいが、ビヘイビア ID を併記して SSOT へ辿れるようにする（[spec-reference](.claude/rules/spec-reference.md)）
 - 実装方針の要点は README「実装方針（要点）」を参照（フルスクラッチ・OCI / CRI 互換・I/O レイヤー再設計・3 OS 一級対応・plugin 分割・GPU / network / 複数コンテナ定義 / 監視・AI 自己補修）
-- 依存は最小・`=x.y.z` 完全固定・ユーザー承認制。youki / Firecracker / Cloud Hypervisor / rust-vmm のコード・クレートは使わない（[dependency-policy](.claude/rules/dependency-policy.md)）。ライセンスは中核 Apache-2.0 単独（[licensing](.claude/rules/licensing.md)）
+- 依存は最小・`=x.y.z` 完全固定・ユーザー承認制。youki / Firecracker / Cloud Hypervisor / rust-vmm のコード・クレートは使わない（[dependency-policy](.claude/rules/dependency-policy.md)）。ライセンスは中核 Apache-2.0 単独、補助 crate `fandhe-container-plugin` のみ `MIT OR Apache-2.0`（[licensing](.claude/rules/licensing.md)）
 - **実装の着手はユーザーの明示指示を経てから**行う。タスク定義は spec の `05-tasks.md`（TASK-n・グループ G0〜G12）、マイルストーンは `06-roadmap.md`（MS-1〜14）
 - 進捗・ステータスは本ファイルに逐次記録しない（Issue で管理する）
 
@@ -21,7 +21,8 @@ fandhe-container/
 ├── README.md                      # 概要・実装方針（要点）・クイックスタート・開発環境構築
 ├── CONTRIBUTING.md                # コントリビュータ向け最小骨子（TASK-2・OSS-1/OSS-2・MS-0。PR フロー詳細は TASK-99・OSS-6・MS-6 で後日整備）
 ├── MAINTAINERS.md                 # メンテナンス体制・コアチーム（TASK-100・OSS-6）
-├── LICENSE-APACHE                 # Apache License 2.0
+├── LICENSE-APACHE                 # Apache License 2.0（中核 crate は Apache-2.0 単独）
+├── LICENSE-MIT                    # MIT License（補助 crate fandhe-container-plugin は MIT OR Apache-2.0）
 ├── rust-toolchain.toml            # stable + rustfmt/clippy（単一真実源）
 ├── .editorconfig / .gitattributes # インデント・改行（LF 固定）・文字コード規約
 ├── skills-lock.json               # 導入スキルのロックファイル

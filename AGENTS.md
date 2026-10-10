@@ -509,7 +509,7 @@ make deny   # cargo deny --locked check advisories bans licenses sources
 | 特権操作の後始末 | root 権限を要する操作の失敗時に、マウント・namespace・一時ファイル等の後始末を欠いていないか | P0 |
 | 依存の追加・更新 | `Cargo.toml` の依存が `=x.y.z` の完全固定（exact pin）か。`[workspace.dependencies]` に集約されているか。ユーザー承認（クレート名・バージョン・目的・配置する crate、ライセンス、メンテナンス状況、推移的依存の概要・ネイティブビルドの有無・3 OS ビルド可否、常駐メモリ / バイナリサイズへの影響〔CORE-7〜9〕の提示）を経ているか（PR 本文に承認の記録があるかで確認）。git 依存・crates.io 以外のレジストリ、バージョン無指定（wildcard）の依存を追加していないか（`deny.toml` `[sources]`・`[bans]`） | P0 |
 | 禁止クレート | rust-vmm organization のクレート群・youki（`libcontainer` 等）・Cloud Hypervisor・Firecracker 由来のクレート・コードを依存ツリーやコードへ混入させていないか（MVM-4。`.claude/rules/dependency-policy.md`。機械判定は TASK-73〔`scripts/check-microvm-deps.sh`・`deny.toml` `[bans]`〕で導入予定） | P0 |
-| ライセンス | 中核 crate は Apache-2.0 単独になっているか（OSS-3）。補助 crate の `MIT OR Apache-2.0` 採用はクレートごとにユーザー承認を経ているか。GPL / LGPL / AGPL・MPL-2.0 等のコピーレフト系ライセンスの依存を導入していないか | P0 |
+| ライセンス | 中核 crate は Apache-2.0 単独になっているか（OSS-3）。補助 crate の `MIT OR Apache-2.0` 採用はクレートごとにユーザー承認を経ているか（`fandhe-container-plugin` は #13 で承認済み）。GPL / LGPL / AGPL・MPL-2.0 等のコピーレフト系ライセンスの依存を導入していないか | P0 |
 | 非 Cargo 資産のライセンス | ビルド時に埋め込むデータ（seccomp プロファイル・CDI サンプル等）・VM イメージ / カーネル等、`cargo deny` の対象外資産のライセンス・帰属表示要否をユーザーへ確認しているか | P0 |
 
 ### アーキテクチャ・設計整合（`.claude/rules/coding-rust.md`・`CLAUDE.md`）

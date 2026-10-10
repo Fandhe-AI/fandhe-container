@@ -55,8 +55,8 @@
 //! 作成経路への組み込みは [`guest_files::GuestFileCreator`]（TASK-19.2・#100。
 //! ワイヤー形式は変えないサーバー側 API で、ワイヤー上の作成要求は未実装〔REPAIR-3〕）
 //! が担い、検査済みの [`writeback::AppendFileSink`] を返す。パス長 260 超の検証関数は
-//! [`fs_normalize::check_host_path_length`]（TASK-20.1・#102。作成経路への組み込みは未実装）、Unicode 正規化（NFC / NFD）は #103（TASK-21.h1）の方針決定後に
-//! TASK-21 で後続実装する。
+//! [`fs_normalize::check_host_path_length`]（TASK-20.1・#102。作成経路への組み込みは未実装）。NFC / NFD の別表記も、名前は
+//! 書き換えず同じ衝突として検出する（TASK-21.1・#103）。
 //!
 //! read / write 操作の計装連携点（[`instrument::IoOpRecorder`]。TASK-84.5・REPAIR-4）は
 //! core を参照しない io 内のトレイトで、core の `OpRecorder` への接続は上位 crate の

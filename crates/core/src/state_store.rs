@@ -758,16 +758,30 @@ impl StateStore for FileStateStore {
                 "state revision does not match",
             ));
         }
+        // 配置が既にあるレコードへのスコープの追記は拒否する（トレイト契約 8。別スコープでの delete の
+        // 照合が壊れるため）。revision を消費せず、ファイルも書かない。
+        if existing.cgroup().is_some() && req.cgroup_scope().is_some() {
+            return Err(err(
+                ErrorCode::FailedPrecondition,
+                "cgroup scope already recorded",
+            ));
+        }
         let revision = self.allocate_revision(&mut guard, Some(&existing))?;
         let mut record = StateRecord::new(
             req.status().clone(),
             existing.bundle().to_path_buf(),
             revision,
         )?;
-        // cgroup の配置は作成時の値を変えずに引き継ぐ（トレイト契約 8。落とすと delete が cgroup を
-        // 削除しなくなる。TASK-30.3・OCI-6）。
-        if let Some(cgroup) = existing.cgroup() {
-            record = record.with_cgroup(cgroup.clone());
+        // cgroup の配置は引き継ぐ（トレイト契約 8。落とすと delete が cgroup を削除しなくなる。
+        // TASK-30.3・OCI-6）。配置が無く追記の指定があれば、追記直前の revision を instance として記録する
+        // （start 時の追記。TASK-32・#1314。(Some, Some) は上で拒否済み）。
+        match (existing.cgroup(), req.cgroup_scope()) {
+            (Some(cgroup), _) => record = record.with_cgroup(cgroup.clone()),
+            (None, Some(scope)) => {
+                record =
+                    record.with_cgroup(CgroupPlacement::new(scope.clone(), existing.revision()));
+            }
+            (None, None) => {}
         }
         // 監視状態は指定があれば置き換え、なければ引き継ぐ（トレイト契約 9。CLI 側の status 更新で
         // supervisor の項目を消さないため。SUP-1・TASK-157.2）。
@@ -1234,10 +1248,10 @@ fn open_nowait(path: &Path, opts: &mut OpenOptions) -> std::io::Result<File> {
 ///
 /// `cgroupScope` / `cgroupInstance`（TASK-30.3・OCI-6）は cgroup の配置（[`CgroupPlacement`]）で、記録が
 /// 無ければどちらも書かない。両方あるか両方ないかのどちらかで、片方だけ・`cgroupScope` が
-/// [`CgroupScope`] の形式を満たさない・`cgroupInstance` が `revision` より大きい（create 時の revision は
-/// 現在の revision を超えない）場合は他の項目と同じく破損（`Internal`。回復は `purge_corrupted`）とする。
+/// [`CgroupScope`] の形式を満たさない・`cgroupInstance` が `revision` より大きい（instance は配置を記録した
+/// 時点の revision で、現在の revision を超えない）場合は他の項目と同じく破損（`Internal`。回復は `purge_corrupted`）とする。
 /// どちらも持たない既存の `state.json`（導入前の版が書いたもの）は `None` として読む。導入前の版は
-/// 本番経路で cgroup を作らない（`cgroups::DelegatedCgroup::prepare` は起動フローに未結線）ため、
+/// 本番経路で cgroup を作らない（start 時の追記〔`UpdateStateRequest::with_cgroup_scope`〕の結線は #1717）ため、
 /// フィールドの無いレコードに対応する cgroup は存在せず、「cgroup を作っていない」（delete は cgroup に
 /// 触れない）と読むのが正しい。
 ///
@@ -1712,6 +1726,66 @@ mod tests {
             recreated.cgroup().map(|c| c.instance()),
             Some(StateRevision::from_raw(3))
         );
+    }
+
+    /// TASK-32・OCI-6・CORE-3（契約 8）: create の後に `UpdateStateRequest::with_cgroup_scope` で追記すると、
+    /// `state.json` に `cgroupScope` と `cgroupInstance`（= 追記直前の revision = create の revision）が書かれ、
+    /// get・別インスタンスで同じ値が読め、後続の update でも変わらない。2 回目・古い revision の追記は
+    /// `FailedPrecondition` で `state.json` を変えず、revision も消費しない。
+    #[test]
+    fn oci6_core3_task32_start_append_cgroup_scope_round_trips() {
+        let t = TmpDir::new("cgappend");
+        let store = t.open();
+        let rec = create(&store, "web");
+        assert_eq!(rec.cgroup(), None);
+        let scope = CgroupScope::new("/user.slice/x.scope").unwrap();
+        let state_path = t.path().join("web").join("state.json");
+        let created = ContainerStatus::created(cid("web"), None);
+
+        let appended = store
+            .update(
+                &UpdateStateRequest::new(created.clone(), rec.revision())
+                    .with_cgroup_scope(scope.clone()),
+            )
+            .unwrap();
+        assert_eq!(appended.revision(), StateRevision::from_raw(1));
+        assert_eq!(
+            appended.cgroup(),
+            Some(&CgroupPlacement::new(
+                scope.clone(),
+                StateRevision::from_raw(0)
+            ))
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
+        assert_eq!(v["cgroupScope"], serde_json::json!("/user.slice/x.scope"));
+        assert_eq!(v["cgroupInstance"], serde_json::json!(0));
+        assert_eq!(v["status"], serde_json::json!("created"));
+
+        let got = t.open().get(&GetStateRequest::new(cid("web"))).unwrap();
+        assert_eq!(
+            got.cgroup().map(|c| c.scope().as_str()),
+            Some("/user.slice/x.scope")
+        );
+        assert_eq!(got.cgroup().map(|c| c.instance().value()), Some(0));
+
+        // 追記の後の Created -> Running でも配置は変わらない。
+        let running = update_to_running(&store, &appended);
+        assert_eq!(running.cgroup(), appended.cgroup());
+
+        // 2 回目・古い revision の追記は拒否され、ファイルも revision も変わらない。
+        let before = fs::read(&state_path).unwrap();
+        let again = UpdateStateRequest::new(
+            ContainerStatus::running(cid("web"), NonZeroU32::new(4242)),
+            running.revision(),
+        )
+        .with_cgroup_scope(CgroupScope::new("/other").unwrap());
+        assert_eq!(code(store.update(&again)), "FAILED_PRECONDITION");
+        let stale = UpdateStateRequest::new(created, rec.revision()).with_cgroup_scope(scope);
+        assert_eq!(code(store.update(&stale)), "FAILED_PRECONDITION");
+        assert_eq!(fs::read(&state_path).unwrap(), before);
+        let next = create(&store, "next");
+        assert_eq!(next.revision(), StateRevision::from_raw(3));
     }
 
     /// TASK-30.3・OCI-6: `cgroupScope` / `cgroupInstance` を持たない既存の `state.json`（導入前の版が

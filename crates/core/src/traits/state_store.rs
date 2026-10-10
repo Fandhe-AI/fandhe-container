@@ -30,12 +30,25 @@
 //!    [`TraitError::message`] の長さが上限内かを検証してからアロケーションする
 //! 7. 状態レコードとエラーメッセージに秘密情報（レジストリ資格情報等）を含めない
 //!    （security.md）
-//! 8. [`StateRecord::cgroup`]（コンテナ用 cgroup の配置 [`CgroupPlacement`]。TASK-30.3・OCI-6・CORE-3）は、
-//!    `create` で [`CreateStateRequest::cgroup_scope`] が指定されたときだけ、そのスコープと **この create で
-//!    割り当てた revision**（instance）の組として記録する。`update` では変更せずに引き継ぎ、`get` / `list` で
-//!    返す。plugin 実装も同じく往復させる（落とすと delete が cgroup の削除を飛ばし、cgroup がリークする）。
+//! 8. [`StateRecord::cgroup`]（コンテナ用 cgroup の配置 [`CgroupPlacement`]。TASK-30.3・TASK-32・OCI-6・CORE-3）は、
+//!    スコープと instance の組を **1 コンテナにつき 1 回だけ** 記録する。記録の機会は 2 つある
+//!    （#1314 の決定・案 3-ii）。本番の経路は start 時の追記で、supervisor が [`UpdateStateRequest::with_cgroup_scope`]
+//!    を使う。create 時の記録（[`CreateStateRequest::cgroup_scope`]）も契約として有効である。
+//!    - create で指定があれば、そのスコープと **この create で割り当てた revision**（instance）の組で記録する
+//!    - `update` に `cgroup_scope` の指定が **無ければ**、配置を変えずに引き継ぐ
+//!    - `update` に指定が **あり**、既存のレコードに配置が **無ければ**、そのスコープと **追記直前のレコードの
+//!      revision**（= 照合済みの `expected_revision`）の組を記録する。標準の流れ（create の後の最初の書き込みで
+//!      追記する）では、これは create の revision と一致する
+//!    - `update` に指定があり、既存のレコードに配置が **既にあれば** `FailedPrecondition`（上書きしない。
+//!      別スコープでの delete の照合が壊れるため）。照合の順序は「不在なら `NotFound`」→「revision が合わなければ
+//!      `FailedPrecondition`」→「配置が既にあれば `FailedPrecondition`」で、失敗したときはレコードを変えない
+//!
+//!    `get` / `list` で返す。plugin 実装も同じ規則で往復させる（落とすと delete が cgroup の削除を飛ばし、
+//!    cgroup がリークする。追記を落とす実装は core の `record_scope` の事後照合が `Internal` で検出する）。
 //!    revision の再利用禁止（[`StateStore::create`]）により instance も再利用されず、instance を含む
-//!    cgroup 名（`fc-<id>@<instance>`）は同じ ID の削除・再作成をまたいでも重ならない
+//!    cgroup 名（`fc-<id>@<instance>`）は同じ ID の削除・再作成をまたいでも重ならない。trait のメソッドの
+//!    signature は変えていない（`UpdateStateRequest` のビルダーを足しただけで、既存の実装・呼び出し側は
+//!    破壊されない。PLUG-1）
 //! 9. [`StateRecord::supervision`]（`supervisor_pid`・`health`・`restart_count`。supervisor〔TASK-157〕が
 //!    使う項目。SUP-1）は、`create` で [`CreateStateRequest::with_supervision`] の指定があればその値、
 //!    なければ既定値（PID なし・healthcheck 未設定・再起動 0 回）で記録する。`update` は
@@ -236,7 +249,8 @@ impl CgroupScope {
 /// コンテナ用 cgroup の配置（委譲スコープと instance の組。TASK-30.3・OCI-6・CORE-3）。
 ///
 /// cgroup の実体は `<scope>/fc-<id>@<instance>`（Linux の `cgroups::CgroupName::for_instance`）。instance は
-/// ストアがレコードの create で割り当てた revision で、ストア全体で再利用されない（[`StateStore::create`]）。
+/// 配置を記録した時点のレコードの revision で（create で記録すれば create の revision、start で追記すれば
+/// 追記直前の revision。標準の流れでは両者は一致する。契約 8）、ストア全体で再利用されない（[`StateStore::create`]）。
 /// そのため同じ ID のコンテナが削除・再作成されても cgroup 名は重ならず、古いレコードを読んだ delete が
 /// 再作成後のコンテナの cgroup を名前で消すことは構成上起きない。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,7 +270,7 @@ impl CgroupPlacement {
         &self.scope
     }
 
-    /// cgroup 名に埋め込む instance（create 時の revision）。
+    /// cgroup 名に埋め込む instance（配置を記録した時点のレコードの revision。契約 8）。
     pub fn instance(&self) -> StateRevision {
         self.instance
     }
@@ -526,9 +540,9 @@ impl StateRecord {
     ///
     /// `Some` なら、このコンテナの cgroup は `<scope>/fc-<id>@<instance>` にある（または削除済み）。`None` は
     /// 「このレコードのために cgroup を作っていない」ことを表し、`oci_runtime::delete` は cgroup に
-    /// 触れない。cgroup を作る側（本番 launcher。TASK-29 / TASK-157 系で結線予定）は、create 時にスコープを
-    /// 記録し（[`CreateStateRequest::with_cgroup_scope`]）、返された配置の名前で cgroup を作る契約である
-    /// （`cgroups::DelegatedCgroup::prepare` の doc）。
+    /// 触れない。cgroup を作る側（本番では start 時の supervisor。#1314・#1717）は、mkdir の前にスコープを
+    /// 追記し（[`UpdateStateRequest::with_cgroup_scope`]。create 時の [`CreateStateRequest::with_cgroup_scope`]
+    /// も有効）、記録された配置の名前で cgroup を作る契約である（`cgroups::DelegatedCgroup::record_scope`）。
     pub fn cgroup(&self) -> Option<&CgroupPlacement> {
         self.cgroup.as_ref()
     }
@@ -617,8 +631,8 @@ impl CreateStateRequest {
 
     /// コンテナ用 cgroup を作る委譲スコープを記録する（[`StateRecord::cgroup`]）。
     ///
-    /// ストアは create で割り当てた revision を instance として組にして記録する（契約 8）。cgroup を作る
-    /// 呼び出し元は、作る前（`cgroups::DelegatedCgroup::prepare` の前）にこれで記録する。
+    /// ストアは create で割り当てた revision を instance として組にして記録する（契約 8）。本番の経路では
+    /// create では記録せず、start で [`UpdateStateRequest::with_cgroup_scope`] を使って追記する（#1314・案 3-ii）。
     #[must_use]
     pub fn with_cgroup_scope(mut self, scope: CgroupScope) -> Self {
         self.cgroup_scope = Some(scope);
@@ -655,6 +669,7 @@ pub struct UpdateStateRequest {
     status: ContainerStatus,
     expected_revision: StateRevision,
     supervision: Option<SupervisionState>,
+    cgroup_scope: Option<CgroupScope>,
 }
 
 impl UpdateStateRequest {
@@ -664,7 +679,23 @@ impl UpdateStateRequest {
             status,
             expected_revision,
             supervision: None,
+            cgroup_scope: None,
         }
+    }
+
+    /// コンテナ用 cgroup を作る委譲スコープを **追記** する（TASK-32・OCI-6・CORE-3。契約 8）。
+    ///
+    /// 既存のレコードに配置が無いときだけ、このスコープと追記直前の revision（instance）の組を記録する。
+    /// 既にあれば `FailedPrecondition`。supervisor が start で `detect` の後・mkdir の前に呼ぶ（#1314・案 3-ii）。
+    #[must_use]
+    pub fn with_cgroup_scope(mut self, scope: CgroupScope) -> Self {
+        self.cgroup_scope = Some(scope);
+        self
+    }
+
+    /// 追記するスコープを返す（未指定なら `None`。その場合は既存の配置を引き継ぐ）。
+    pub fn cgroup_scope(&self) -> Option<&CgroupScope> {
+        self.cgroup_scope.as_ref()
     }
 
     /// 更新後の監視状態を指定する（supervisor〔TASK-157〕が使う。SUP-1。契約 9）。
@@ -981,12 +1012,24 @@ mod tests {
                     "revision mismatch",
                 ));
             }
+            if current.cgroup().is_some() && req.cgroup_scope().is_some() {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "cgroup scope already recorded",
+                ));
+            }
             let bundle = current.bundle().to_path_buf();
             let next_revision = self.allocate_revision()?;
             let mut updated = StateRecord::new(req.status().clone(), bundle, next_revision)?;
-            // 契約 8: cgroup の配置は update で変えずに引き継ぐ。
-            if let Some(cgroup) = current.cgroup() {
-                updated = updated.with_cgroup(cgroup.clone());
+            // 契約 8: 配置は引き継ぐ。追記の指定があれば、無いときに限り直前の revision を instance に記録する。
+            match (current.cgroup(), req.cgroup_scope()) {
+                // (Some, Some) は上で FailedPrecondition にしている。
+                (Some(cgroup), _) => updated = updated.with_cgroup(cgroup.clone()),
+                (None, Some(scope)) => {
+                    updated = updated
+                        .with_cgroup(CgroupPlacement::new(scope.clone(), current.revision()));
+                }
+                (None, None) => {}
             }
             // 契約 9: 監視状態は指定があれば置き換え、なければ引き継ぐ。
             updated = updated.with_supervision(req.supervision().unwrap_or(current.supervision()));
@@ -1526,6 +1569,69 @@ mod tests {
         assert!(CgroupScope::new(&max_comp).is_ok());
         let max_depth = "/a".repeat(64);
         assert!(CgroupScope::new(&max_depth).is_ok());
+    }
+
+    /// TASK-32・OCI-6・CORE-3（契約 8）: start 時の追記は配置の無いレコードに 1 回だけ効き、instance は
+    /// 追記直前の revision になる。2 回目・古い revision は `FailedPrecondition` でレコードを変えない。
+    #[test]
+    fn oci6_core3_task32_update_appends_cgroup_scope_once() {
+        let store = StubStateStore::new();
+        let scope = CgroupScope::new("/user.slice/x.scope").expect("scope");
+        let id = sample_id("late");
+        let created = store
+            .create(
+                &CreateStateRequest::new(
+                    ContainerStatus::created(id.clone(), None),
+                    sample_bundle(),
+                )
+                .expect("req"),
+            )
+            .expect("create");
+        assert_eq!(created.cgroup(), None);
+        // 古い revision での追記は拒否される。
+        let stale = UpdateStateRequest::new(
+            ContainerStatus::created(id.clone(), None),
+            StateRevision::from_raw(99),
+        )
+        .with_cgroup_scope(scope.clone());
+        assert_eq!(
+            store.update(&stale).expect_err("stale").code(),
+            ErrorCode::FailedPrecondition
+        );
+        let appended = store
+            .update(
+                &UpdateStateRequest::new(
+                    ContainerStatus::created(id.clone(), None),
+                    created.revision(),
+                )
+                .with_cgroup_scope(scope.clone()),
+            )
+            .expect("append");
+        assert_eq!(
+            appended.cgroup(),
+            Some(&CgroupPlacement::new(scope.clone(), created.revision()))
+        );
+        assert_ne!(appended.revision(), created.revision());
+        // 2 回目は拒否され、レコードは変わらない。
+        let again = UpdateStateRequest::new(
+            ContainerStatus::created(id.clone(), None),
+            appended.revision(),
+        )
+        .with_cgroup_scope(CgroupScope::new("/other").expect("scope"));
+        assert_eq!(
+            store.update(&again).expect_err("again").code(),
+            ErrorCode::FailedPrecondition
+        );
+        let got = store.get(&GetStateRequest::new(id.clone())).expect("get");
+        assert_eq!(got, appended);
+        // スコープの無い update の後も配置は保たれる。
+        let after = store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::stopped(id, Some(0)),
+                appended.revision(),
+            ))
+            .expect("plain update");
+        assert_eq!(after.cgroup(), appended.cgroup());
     }
 
     /// TASK-30.3・OCI-6（契約 8）: create でスコープを指定すると、instance = create で割り当てた revision の

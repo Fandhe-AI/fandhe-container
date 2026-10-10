@@ -9,8 +9,10 @@
 //! 要求する（退避前に有効化するコードはコンパイルできない）。
 //!
 //! # 呼び出し文脈・契約
-//! - 呼び出し元: 起動フロー。本番 launcher（TASK-29 / TASK-157 系）はまだ無く、`detect` / `prepare` の
-//!   呼び出しと [`ContainerCgroup::join_hook`] の登録は未結線（REPAIR-3）
+//! - 呼び出し元: start 経路の supervisor。`detect` → `record_scope`（状態記録へスコープを追記）→ `create_cgroup`
+//!   （`prepare`）→ `apply_limits` → `into_join`（[`ContainerCgroup::join_hook`]）の順序は `start_chain` の型の連鎖で
+//!   固定済み（#1716。[`CgroupScopeRecorded`] 以降）。supervisor・本番 launcher からの呼び出しの結線は
+//!   #1717・#1715（未結線。REPAIR-3）
 //! - `unsafe` は持たない。syscall は `crate::sys` の薄いラッパー（`mkdirat`・`unlinkat`・`fstatfs`・
 //!   `O_NOFOLLOW` 付き `openat`）経由で、検証した実体を fd で固定する（TOCTOU・symlink 対策）
 //! - `/proc/self/cgroup`・`cgroup.procs` 等はカーネル応答（外部入力）として上限付きで読み、
@@ -24,8 +26,8 @@
 //! ├── fc-runtime/             ← 退避リーフ（自プロセス〔runtime / supervisor〕の移動先）
 //! └── fc-<container-id>@<n>/  ← コンテナ用子 cgroup（この時点では空。名前は [`CgroupName::for_instance`]）
 //! ```
-//! コンテナ用子 cgroup の名前は、状態記録の create で割り当てた revision（instance `n`。ストア全体で再利用
-//! されない）を含む `fc-<id>@<n>` とする（TASK-30.3・OCI-6）。同じ ID の削除・再作成をまたいでも名前が
+//! コンテナ用子 cgroup の名前は、状態記録に配置を記録した時点のレコードの revision（instance `n`。ストア全体で
+//! 再利用されない。start で追記する標準の流れでは create の revision と一致する）を含む `fc-<id>@<n>` とする（TASK-30.3・OCI-6）。同じ ID の削除・再作成をまたいでも名前が
 //! 重ならないため、古いレコードを読んだ delete が再作成後のコンテナの cgroup を名前で消すことはない。
 //! `@` は `ContainerId` の許容文字に無いため、`fc-runtime` や ID だけの名前とも衝突しない。
 //! [`CgroupName::new`]（`fc-<id>`）は instance を持たない名前で、TASK-32 の結合試験が使う。delete はこの名前の
@@ -57,7 +59,8 @@
 //! - デバイス cgroup のロード・アタッチ・事後検証（TASK-32 追補・#1680・SEC-1・CORE-1・CORE-4）:
 //!   [`ContainerCgroup::apply_default_device_policy`]（`device_policy` サブモジュール）。rootful では事前問い合わせ →
 //!   ロード → アタッチ（flags 0）→ 事後問い合わせの照合を行い、rootless では何も試さず
-//!   [`DevicePolicyOutcome::NotApplied`] を返す。起動経路からは呼ばれておらず #1314 で結線する（未結線）
+//!   [`DevicePolicyOutcome::NotApplied`] を返す。start の連鎖の制限の段（[`CgroupPrepared::apply_limits`]）から呼ぶ
+//!   （#1716。`IsolationPrivilege` からの変換は `From` 実装。supervisor からの呼び出しは #1717）
 //!
 //! - delete 時の cgroup 削除（TASK-30.3・OCI-6）: [`DelegatedCgroup::open_child`] で名前から既存の子 cgroup を
 //!   検証つきで開き、`oci_runtime::ContainerCgroupRemover` の実装として [`DelegatedCgroup::remove_child`] へ渡す
@@ -82,12 +85,11 @@
 //! 有無が分かれる非対称の再発を防ぐ、(c) 事前検証を含む全終了経路を漏れなく数えられる。
 //!
 //! # 未実装（REPAIR-3）
-//! - デバイス cgroup の起動経路への結線（`IsolationPrivilege` からの [`DevicePolicyMode`] の決定。#1314）・
-//!   入口の実機試験と verifier・EPERM の実機照合（#1681）・GPU の `deviceNodes` の追加（#562）
+//! - デバイス cgroup の supervisor・launcher からの呼び出しの結線（#1717・#1715）・入口の実機試験と verifier・EPERM の実機照合（#1681）・GPU の `deviceNodes` の追加（#562）
 //! - OCI `linux.resources` から `set_memory_limits` / `set_cpu_max` への反映、本番 launcher での
 //!   `detect` → `prepare` → `join_hook` の結線（TASK-29 / TASK-157 系）
-//! - OCI `linux.cgroupsPath` の反映・create での委譲スコープの記録（`CreateStateRequest::with_cgroup_scope`）と
-//!   delete への本番の呼び出し元（CLI / plugin / supervisor）からの結線
+//! - OCI `linux.cgroupsPath` の反映・start 時の委譲スコープの追記の連鎖（`start_chain`。#1716）の supervisor
+//!   からの呼び出しと、delete への本番の呼び出し元（CLI / plugin / supervisor）からの結線（#1717）
 //! - OCI `linux.resources.pids` / `blockIO`（weight を含む）からの `set_pids_max` / `set_io_max` /
 //!   `set_io_weight` への反映（TASK-170.3 ほか）
 //! - cgroup v1 / hybrid は非対応（CORE-4。v2 以外は fail-closed）
@@ -126,6 +128,11 @@ pub use device::{
 mod device_policy;
 pub use device_policy::{
     AppliedDevicePolicy, DevicePolicyMode, DevicePolicyNotApplied, DevicePolicyOutcome,
+};
+mod start_chain;
+pub use start_chain::{
+    CgroupLimitPlan, CgroupLimitReport, CgroupLimited, CgroupPrepared, CgroupScopeRecorded,
+    StartCgroup,
 };
 mod exec_join;
 mod exec_kill;
@@ -180,6 +187,8 @@ pub enum CgroupStep {
     EnableControllers,
     /// 失敗後の後始末。
     Cleanup,
+    /// start 時の委譲スコープの状態記録への追記（#1716・TASK-32 追補）。
+    RecordScope,
     /// `memory.max` / `memory.swap.max` の設定（TASK-32.2）。
     SetMemoryLimit,
     /// `cpu.max` の検証・書き込み・読み戻し。
@@ -1008,8 +1017,8 @@ impl DelegatedCgroup {
     /// 削除する（`Self::remove_verified`。巻き戻しの失敗・fd が無く名前指定で消した事実はエラー文に併記）。
     ///
     /// 呼び出し元は、本関数で子 cgroup を作る前にこの委譲スコープ（`ContainerCgroupRemover::scope`）を
-    /// 状態記録へ記録し（`CreateStateRequest::with_cgroup_scope`。TASK-30.3・OCI-6）、返された配置の instance
-    /// から [`CgroupName::for_instance`] で作った名前を渡す。記録の無いレコードの `oci_runtime::delete` は
+    /// 状態記録へ記録し（start の経路では [`DelegatedCgroup::record_scope`]。#1716・#1314。TASK-30.3・OCI-6）、
+    /// 記録された配置の instance から [`CgroupName::for_instance`] で作った名前を渡す。記録の無いレコードの `oci_runtime::delete` は
     /// cgroup に触れず、`fc-<id>@<n>` 以外の名前の cgroup も削除しないため、それ以外の手順で作った子 cgroup は
     /// 回収されない。
     pub fn prepare(&self, name: &CgroupName) -> Result<(ContainerCgroup, Evacuated), CgroupError> {

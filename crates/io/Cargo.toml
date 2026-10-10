@@ -31,6 +31,10 @@ name = "crash_safety"
 path = "tests/crash_safety.rs"
 required-features = ["crash-test-server"]
 
+# NFC/NFD の別表記の衝突検出用（IO-5・TASK-21.1）。承認: Issue #798・#1720。nfd() だけを使う。
+[dependencies]
+unicode-normalization = { workspace = true }
+
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]
 workspace = true

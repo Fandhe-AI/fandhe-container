@@ -2756,6 +2756,49 @@ mod tests {
         );
     }
 
+    /// SEC-1・CORE-6（#1676・#1660）: rootful の rootfs の `nodev`（`sys::set_mount_nodev`）の呼び出しは
+    /// `exec/rootfs.rs` の `nodev_syscall` の 1 か所だけで、`mount_setattr(2)` の syscall 番号を使うのも `sys` だけ。
+    /// 本モジュールの `/dev` の tmpfs・devpts・rootless の bind（ホストのノードの複製）へ `nodev` を掛ける経路が
+    /// 無いことを、ソースの走査で機械的に確かめる（`nodev` が及ぶとノードを開けなくなる）。
+    #[test]
+    fn sec1_core6_rootfs_nodev_has_single_call_site() {
+        // 走査する語を分割して書き、本試験の行自体が一致しないようにする。
+        let call = concat!("set_mount", "_nodev(");
+        let number = concat!("SYS_MOUNT", "_SETATTR");
+        let mut calls = Vec::new();
+        let mut numbers = Vec::new();
+        for (rel, text) in crate_sources() {
+            for line in text.lines() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                if code.contains(call) {
+                    calls.push((rel.clone(), code.to_owned()));
+                }
+                if code.contains(number) && !numbers.contains(&rel) {
+                    numbers.push(rel.clone());
+                }
+            }
+        }
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "exec/rootfs.rs".to_owned(),
+                    format!("sys::{call}mount_top)")
+                ),
+                (
+                    "sys.rs".to_owned(),
+                    format!(
+                        "pub(crate) fn {call}mount_top: BorrowedFd<'_>) -> Result<(), SysError> {{"
+                    )
+                ),
+            ]
+        );
+        assert_eq!(numbers, vec!["sys.rs".to_owned()]);
+    }
+
     // ---- rootless 経路: ホストのノードの bind（#1660。CORE-6・SEC-5・CORE-1）----
 
     /// rootless の呼び出し（単一 ID 写像。gid 5 は未写像）。

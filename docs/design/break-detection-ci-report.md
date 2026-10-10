@@ -7,6 +7,7 @@ REPAIR-7 の 5 段階 CI 構成が、PoC-8 の破壊 2 種（BREAK-1: ACK 未送
 - 前提タスク: TASK-83・TASK-85・TASK-86・TASK-87
 - 対象マイルストーン: MS-1 Phase 2
 - ステータス: 妥当性の判断は #124 が行う。本書はその判断材料であり、事実（CI ログで観測したもの）と推論（観測していないもの）を分けて書く
+- 注記（2026-10-10）: 本書のジョブ名（`integration-test (<os>)`・`rust-ci (<os>) / *`・`rust-ci-default-features (<os>)` 等）は記録時点の CI 構成のもの。macOS ランナー待ちの解消のためのジョブ再構成で、`rust-ci` は ubuntu のみ、`integration-test` と `rust-ci-default-features` は `platform-ci (<os>)` に統合された（`.claude/rules/ci.md`「3 OS CI」）。記録自体は書き換えない
 
 ## 破壊と検出機構の対応
 

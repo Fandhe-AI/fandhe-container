@@ -118,20 +118,20 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 - `make fio-bench`: 実機前提（fio・GNU coreutils の `timeout`・Linux ホスト）。`TARGET_DIR`・`LABEL` 未指定時は案内を出して終了コード 2 で止まる。詳細は下記「実機前提テスト」節・[docs/design/io-fio-bench.md](docs/design/io-fio-bench.md) を参照
 - `make fio-baseline-ratio-selftest`: 終了コード 0 が成功基準。固定 fixture（`scripts/testdata/fio-baseline/`）で完結し、実 fio・Docker は使わない。CI の `bench-regression` ジョブにも組み込まれている
 - `make fio-baseline-ratio`: `BASELINE`・`CANDIDATE`（いずれも `fio-randwrite-4k.sh` の出力 JSON）未指定時は案内を出して終了コード 2 で止まる。fio・Docker を必要としないため実機前提テストではない
-- CI の `rust-ci`（ubuntu-latest のみ）は fmt・deny と clippy/test の `--all-features` を実行し、macOS・Windows の clippy/test の `--all-features` は `platform-ci` のステップが同じコマンドで実行する（fmt/deny は結果が OS に依らない）。`platform-ci` の matrix は pull_request では ubuntu-latest のみ、main への push と `workflow_dispatch` では 3 OS で、PR では macOS・Windows の代わりに `cross-target-check` が `aarch64-apple-darwin`・`x86_64-pc-windows-msvc`（と `aarch64-unknown-linux-gnu`）の `--all-features` の check / clippy を行う。`platform-ci` は `make lint`/`make test`/`make doc` と同一コマンド（既定 feature）も再現し、既定 feature 側の回帰は `platform-ci` でのみ検出される（macOS・Windows の既定 feature 側・実行時の回帰は main への push 後に検出される）
+- CI の `rust-ci`（ubuntu-latest のみ）は fmt・deny と clippy/test の `--all-features` を実行し、macOS・Windows の clippy/test の `--all-features` は `platform-ci` のステップが同じコマンドで実行する（fmt/deny は結果が OS に依らない）。`platform-ci` の matrix は pull_request では ubuntu-latest のみ、main への push と `workflow_dispatch` では 3 OS で、PR では macOS・Windows の代わりに `cross-target-check` が `aarch64-apple-darwin`・`x86_64-pc-windows-msvc`（と `aarch64-unknown-linux-gnu`）の `--all-features` の check / clippy を行い、`aarch64-apple-darwin`・`x86_64-pc-windows-msvc` には既定 feature の clippy と `cargo doc`（`-D warnings`）も行う。`platform-ci` は `make lint`/`make test`/`make doc` と同一コマンド（既定 feature）も再現し、既定 feature 側の回帰は `platform-ci` でのみ検出される（macOS・Windows の実行時の回帰は main への push 後に検出される）
 - 各コマンドと CI ジョブの対応（TASK-94 の整合確認で参照する）:
 
 | コマンド | 対応する CI ジョブ |
 | ---- | ---- |
 | `fmt-check`・`deny` | `rust-ci`（ubuntu のみ） |
-| `lint`・`test`（既定 feature） | `platform-ci`（PR は ubuntu・main は 3 OS。`--all-features` 側は ubuntu が `rust-ci`、macOS・Windows が main の `platform-ci`。PR の macOS・Windows は `cross-target-check` の型検査のみ） |
-| `doc`（既定 feature） | `platform-ci`（PR は ubuntu・main は 3 OS） |
+| `lint`・`test`（既定 feature） | `platform-ci`（PR は ubuntu・main は 3 OS。`--all-features` 側は ubuntu が `rust-ci`、macOS・Windows が main の `platform-ci`。PR の macOS・Windows は `cross-target-check` の型検査〔既定 feature の clippy を含む〕のみ） |
+| `doc`（既定 feature） | `platform-ci`（PR は ubuntu・main は 3 OS。PR の macOS・Windows 向けは `cross-target-check` が `--target` 付きで実行） |
 | `test-integration` | `platform-ci`（PR は ubuntu・main は 3 OS） |
 | `poc-venus-jig-check` | `platform-ci`（PR は ubuntu・main は 3 OS）。PR の macOS 向けは `cross-target-check` が `aarch64-apple-darwin` で check / clippy） |
 | `deny-poc-venus-jig`（`deny` からも呼ぶ） | `platform-ci`（ubuntu のみ。結果が OS に依らない依存監査のため） |
 | `plug4-core-invariance-selftest`・`cli-parity-selftest`・`cli-parity-native-reclaim-check`・`vz-virtio-gpu-guest-check-selftest` | `platform-ci`（PR は ubuntu・main は 3 OS。Windows は Git Bash） |
 | `bench-check-selftest`・`bench-baseline-selftest`・`bench-check`・`bench-plugin-boundary`・`plugin-feature-size` | `bench-regression` |
-| （対応 target なし。`rustup target add aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc` の後に、`<target>` をこの 3 つに置き換えて `cargo check --workspace --all-targets --all-features --target <target>` と `cargo clippy --workspace --all-targets --all-features --target <target> -- -D warnings`。venus 試験治具は `cargo check` / `cargo clippy --manifest-path poc/venus-decoder/jig/Cargo.toml --locked --all-targets --target aarch64-apple-darwin`〔clippy は `-- -D warnings`〕） | `cross-target-check` |
+| （対応 target なし。`rustup target add aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc` の後に、`<target>` をこの 3 つに置き換えて `cargo check --workspace --all-targets --all-features --target <target>` と `cargo clippy --workspace --all-targets --all-features --target <target> -- -D warnings`。`aarch64-apple-darwin`・`x86_64-pc-windows-msvc` は加えて既定 feature の `cargo clippy --workspace --all-targets --target <target> -- -D warnings` と `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --target <target>`。venus 試験治具は `cargo check` / `cargo clippy --manifest-path poc/venus-decoder/jig/Cargo.toml --locked --all-targets --target aarch64-apple-darwin`〔clippy は `-- -D warnings`〕） | `cross-target-check` |
 | `lint-docs` | `lint-docs` |
 | `check-workspace-manifest`（`make ci` の一部） | 専用の CI ジョブはない（ローカルゲート専用）。workspace manifest が不正なら各 cargo ジョブのビルドが失敗するため、CI では間接的に検出される |
 

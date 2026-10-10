@@ -177,7 +177,6 @@ use sysno::{ArchSysNo, SyscallNumber};
 /// アーキテクチャごとの clone / mount / open 定数。値が同一でも arch ごとに個別定義する。
 #[cfg(target_arch = "x86_64")]
 mod consts {
-    #[allow(unused_imports)]
     use super::ArchSysNo;
     pub const SUPPORTED: bool = true;
     pub const CLONE_NEWNS: i32 = 0x0002_0000;
@@ -404,7 +403,6 @@ mod consts {
 
 #[cfg(target_arch = "aarch64")]
 mod consts {
-    #[allow(unused_imports)]
     use super::ArchSysNo;
     pub const SUPPORTED: bool = true;
     pub const CLONE_NEWNS: i32 = 0x0002_0000;
@@ -639,7 +637,6 @@ mod consts {
 /// 負の値にして、`std::io::Error` 由来の実 errno と誤って一致させない（分類は `Internal`）。
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod consts {
-    #[allow(unused_imports)]
     use super::ArchSysNo;
     pub const SUPPORTED: bool = false;
     pub const CLONE_NEWNS: i32 = 0;

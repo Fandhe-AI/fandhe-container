@@ -271,6 +271,36 @@ fn is_anonymous_pipe_link(proc_fd_path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// `/proc/thread-self/status` の内容から、`SIGPIPE` が無視（`SIG_IGN`）されているかを読む（#1605・REPAIR-5・PLUG-7）。
+///
+/// `SigIgn:` 行の 16 進のマスクで、`SIGPIPE`（Linux の x86_64・aarch64 とも 13）は bit 12。行が無い・読めない
+/// 場合は `false`（無視されていない側に倒す。fail-closed）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn sigpipe_ignored_in_status(status: &str) -> bool {
+    /// `SIGPIPE` のシグナル番号（Linux x86_64・aarch64 とも 13。`asm-generic/signal.h`）。
+    const SIGPIPE: u32 = 13;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigIgn:"))
+        .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        .is_some_and(|mask| mask & (1u64 << (SIGPIPE - 1)) != 0)
+}
+
+/// 呼び出し時点で自プロセスの `SIGPIPE` が無視されているか（`/proc/thread-self/status` の `SigIgn`）。
+/// シグナルの処分はプロセス全体で共有されるため、どのスレッドの status でも同じ値になる。読めなければ `false`。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn sigpipe_ignored() -> bool {
+    std::fs::read_to_string("/proc/thread-self/status")
+        .map(|status| sigpipe_ignored_in_status(&status))
+        .unwrap_or(false)
+}
+
 /// ブロックしないことを保証できる経路でだけ `fd` へ `buf` を 1 回書く。保証できなければ書かない（#1605・REPAIR-5・PLUG-7）。
 ///
 /// `crate::lifecycle` の `ChildGuard::drop` が診断 1 行を stderr へ出すために呼ぶ。共有 fd の
@@ -287,7 +317,10 @@ fn is_anonymous_pipe_link(proc_fd_path: &std::path::Path) -> bool {
 /// - Linux の無名 pipe: `/proc/thread-self/fd/N` を `O_NONBLOCK` で開き直した別 description へ書く
 ///   （共有側のフラグは変わらない。満杯なら `WouldBlock`、読み手が無ければ open が `ENXIO`）。`/proc/self` は
 ///   スレッドグループのリーダーの fd 表を指し、`unshare(CLONE_FILES)` したスレッドでは別の fd になるため
-///   呼び出しスレッド自身の fd 表を指す `thread-self` を使う。開いた fd が pipe でなければ書かない
+///   呼び出しスレッド自身の fd 表を指す `thread-self` を使う。開いた fd が pipe でなければ書かない。
+///   open と write の間に読み手が閉じると `EPIPE` と `SIGPIPE` になり、write 1 回だけに効く `MSG_NOSIGNAL`
+///   相当の手段が無いため、`SIGPIPE` が無視されている（`/proc/thread-self/status` の `SigIgn`）ときだけ書き、
+///   既定動作・ハンドラ登録のときは書かず `Unsupported`（library としてホストの設定を仮定しない）
 /// - 上記以外（通常ファイル・キャラクタデバイス・名前付き FIFO 等）: 通常ファイルは
 ///   FUSE / NFS・FS freeze で、キャラクタデバイスは CUSE 等の open / write で、名前付き FIFO は置き場所の
 ///   NFS / FUSE での開き直し時の権限確認で無期限に止まり得て `O_NONBLOCK` でも防げず、保証できないため
@@ -301,8 +334,8 @@ fn is_anonymous_pipe_link(proc_fd_path: &std::path::Path) -> bool {
 /// - 呼び出し中に別スレッドが同じ fd 番号を `dup2` 等で差し替えない。崩れた場合、判定と開き直しの間に
 ///   差し替わった対象を辿り、対象が NFS / FUSE 上なら open で止まり得る（開いた fd が pipe でなければ書かない
 ///   ため、通常ファイルを上書きすることはない）
-/// - pipe 経路は open と write の間に読み手が閉じると `EPIPE` と `SIGPIPE` になり得る。write 1 回だけに効く
-///   `MSG_NOSIGNAL` 相当の手段が無いため、ホストが `SIGPIPE` を無視している（Rust の実行時の既定）ことを前提にする
+/// - pipe 経路で `SigIgn` を確かめてから write するまでの間に、別スレッドが `SIGPIPE` の処分を変えない
+///   （崩れた場合、その間に読み手も閉じると `SIGPIPE` が届き得る。`dup2` の前提と同じ種類の窓）
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -316,7 +349,7 @@ pub(crate) fn write_nonblocking(fd: &impl AsFd, buf: &[u8]) -> io::Result<usize>
         let w = unsafe { c_send(raw, buf.as_ptr(), buf.len(), MSG_DONTWAIT | MSG_NOSIGNAL) };
         return usize::try_from(w).map_err(|_| io::Error::last_os_error());
     }
-    if is_pipe_fd(raw) {
+    if is_pipe_fd(raw) && sigpipe_ignored() {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let path = std::path::PathBuf::from(format!("/proc/thread-self/fd/{raw}"));

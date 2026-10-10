@@ -18,6 +18,8 @@
 #   CLI_PARITY_RECLAIM_TEST_HANG      baseline = baseline 段でグループ kill を送らない / capture = capture へ
 #                                     --timeout 600 を渡し内側の監視に回収させない（ハングを注入する）
 #   STUB_NATIVE_TICKS                 ヘルパーの寿命（60〜3600。既定 120）。期限より長くしてハングを模擬する
+#   CLI_PARITY_RECLAIM_HELPER_BIN     ビルド済みヘルパーの絶対パス（実行可能な通常ファイルに限る）。指定時は build 段を
+#                                     飛ばす。自己テストが期限をビルド時間に左右されず baseline / capture 段へ当てるため
 set -euo pipefail
 export LC_ALL=C
 
@@ -34,6 +36,11 @@ helper_ticks="${STUB_NATIVE_TICKS:-120}"
 [[ $helper_ticks =~ ^[1-9][0-9]{1,3}$ ]] && [ "$helper_ticks" -ge 60 ] && [ "$helper_ticks" -le 3600 ] ||
   usage_fail "STUB_NATIVE_TICKS must be 60..3600"
 case "$test_hang" in '' | baseline | capture) ;; *) usage_fail "CLI_PARITY_RECLAIM_TEST_HANG must be empty, baseline or capture" ;; esac
+prebuilt="${CLI_PARITY_RECLAIM_HELPER_BIN:-}"
+if [ -n "$prebuilt" ]; then
+  case "$prebuilt" in /*) ;; *) usage_fail "CLI_PARITY_RECLAIM_HELPER_BIN must be an absolute path" ;; esac
+  [ -f "$prebuilt" ] && [ -x "$prebuilt" ] || usage_fail "CLI_PARITY_RECLAIM_HELPER_BIN must be an executable regular file"
+fi
 export STUB_NATIVE_TICKS="$helper_ticks"
 deadline=$((started_all + deadline_secs))
 
@@ -179,10 +186,15 @@ command -v rustc >/dev/null 2>&1 || fail "rustc not found"
 exe=""
 if [ "$is_windows" -eq 1 ]; then exe=".exe"; fi
 helper="$work/native-hang$exe"
-run_bounded build "" rustc --edition 2021 -O -o "$helper" "$root/scripts/testdata/cli-parity/native-hang.rs"
-if [ "$bounded_rc" -ne 0 ]; then
-  head -c 2000 "$work/build.err" >&2 || true
-  fail "helper build failed"
+if [ -n "$prebuilt" ]; then
+  helper="$prebuilt"
+  log_phase build skipped
+else
+  run_bounded build "" rustc --edition 2021 -O -o "$helper" "$root/scripts/testdata/cli-parity/native-hang.rs"
+  if [ "$bounded_rc" -ne 0 ]; then
+    head -c 2000 "$work/build.err" >&2 || true
+    fail "helper build failed"
+  fi
 fi
 
 # ベースライン診断（判定には使わない）: プロセスグループ宛ての kill だけで子が止まるか。

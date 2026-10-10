@@ -70,23 +70,40 @@ run_outer() { # <外側の期限秒> <名前> <env...>。対象スクリプト�
   run_outer_cmd "$limit" "$name" env "$@" bash "$target"
 }
 
+# ヘルパーを 1 回だけビルドし、H1・H2 へ CLI_PARITY_RECLAIM_HELPER_BIN で渡す（#1709 の Cursor 指摘）。ビルドを
+# 期限の外に出し、遅い rustc（Windows 等）で期限が build 段で切れて意図した段（baseline / capture）を試せない
+# 状況を防ぐ。ビルド自体にも外側の期限（600 秒）を置く（REPAIR-5）。
+exe=""
+case "${OSTYPE:-}" in msys* | cygwin*) exe=".exe" ;; esac
+helper="$tmp/native-hang$exe"
+run_outer_cmd 600 build rustc --edition 2021 -O -o "$helper" "$root/scripts/testdata/cli-parity/native-hang.rs"
+if [ "$outer_rc" -ne 0 ]; then
+  head -c 2000 "$tmp/build.err" >&2 || true
+  printf 'FAIL: helper build failed (rc=%s)\n' "$outer_rc"
+  exit 1
+fi
+
 # <名前> <期待 rc> <期限> <段> <env...>: 外側から経過秒を測り、rc・出力行・経過秒の上下限を照合する。
 hang_case() {
   local name="$1" want_rc="$2" dl="$3" phase="$4" rc=0 s e el line="" l
   shift 4
   s=$SECONDS
-  run_outer $((dl + GRACE + 30)) "$name" "$@" CLI_PARITY_RECLAIM_DEADLINE_SECS="$dl"
+  run_outer $((dl + GRACE + 30)) "$name" "$@" CLI_PARITY_RECLAIM_DEADLINE_SECS="$dl" \
+    CLI_PARITY_RECLAIM_HELPER_BIN="$helper"
   rc=$outer_rc
   e=$SECONDS
   el=$((e - s))
   [ "$rc" -eq "$want_rc" ] || fail "$name: rc expected $want_rc, got $rc"
   [ "$el" -ge "$dl" ] || fail "$name: finished before the deadline (elapsed=${el}s, deadline=${dl}s)"
   [ "$el" -le $((dl + GRACE)) ] || fail "$name: exceeded deadline + grace (elapsed=${el}s, deadline=${dl}s, grace=${GRACE}s)"
+  local skipped=0
   while IFS= read -r l; do
     case "$l" in
       *"deadline_exceeded phase="*) line="$l" ;;
+      "cli-parity native reclaim: phase=build event=skipped elapsed="*) skipped=1 ;;
     esac
   done <"$tmp/$name.err"
+  [ "$skipped" -eq 1 ] || fail "$name: the prebuilt helper was not used (no phase=build event=skipped line)"
   case "$line" in
     "cli-parity native reclaim: deadline_exceeded phase=$phase elapsed="*" deadline=$dl descendant_alive=0") ;;
     *) fail "$name: unexpected deadline line: '$line'" ;;
@@ -96,8 +113,8 @@ hang_case() {
 
 # H1: baseline 段でグループ kill が届かない状況。ヘルパーの寿命（120 秒）より先に期限 20 秒で止まる。
 hang_case H1 1 20 baseline CLI_PARITY_RECLAIM_TEST_HANG=baseline STUB_NATIVE_TICKS=120
-# H2: capture 段の内側の監視が効かない状況（--timeout 600）。build + baseline（通常 10 秒未満、遅い Windows でも
-# 数十秒を超えない）を終えた後の capture 中に期限 60 秒が来て、寿命 120 秒より先に止まる。
+# H2: capture 段の内側の監視が効かない状況（--timeout 600）。baseline（通常 5 秒前後。ビルドはビルド済みヘルパーで
+# 飛ばす）を終えた後の capture 中に期限 60 秒が来て、寿命 120 秒より先に止まる。
 hang_case H2 1 60 capture CLI_PARITY_RECLAIM_TEST_HANG=capture STUB_NATIVE_TICKS=120
 
 # E1: 不正値はヘルパーのビルド前に終了コード 2 で拒否する（ビルドへ進んだ形跡 phase=build が無いこと）。
@@ -117,6 +134,8 @@ bad_case E1b CLI_PARITY_RECLAIM_DEADLINE_SECS=5
 bad_case E1c CLI_PARITY_RECLAIM_DEADLINE_SECS=abc
 bad_case E1d CLI_PARITY_RECLAIM_DEADLINE_SECS=99999
 bad_case E1e STUB_NATIVE_TICKS=30
+bad_case E1f CLI_PARITY_RECLAIM_HELPER_BIN=relative/native-hang
+bad_case E1g CLI_PARITY_RECLAIM_HELPER_BIN="$tmp/missing-helper"
 
 if [ "$failures" -ne 0 ]; then
   printf 'FAIL: %s case(s) failed\n' "$failures"

@@ -1484,14 +1484,6 @@ fn mount_tmpfs_impl(target_dir: BorrowedFd<'_>, params: &TmpfsParams) -> Result<
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const DEVPTS_MAGIC: i64 = 0x1cd1;
 
-/// `fsconfig(FSCONFIG_SET_STRING)` へ渡す 1 組のキーと値。キーは静的、値は整数から本モジュール内で生成する。
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
-struct FsconfigParam {
-    key: &'static CStr,
-    value: CString,
-}
-
 /// [`mount_devpts_on`] の作成パラメータ。`/dev/pts` の devpts は OCI runtime-spec の Default Filesystems で
 /// SHOULD とされ、常に載せる暗黙の固定集合である（TASK-29 追補・CORE-1・SEC-1）。
 ///
@@ -1526,7 +1518,7 @@ impl DevptsCreate {
         let make = |key: &'static CStr, value: String| -> Result<FsconfigParam, SysError> {
             // 値は整数から生成した数字（または静的な識別子）のみで、NUL・カンマを含み得ない。
             let value = CString::new(value).map_err(|_| SysError::Os(EINVAL))?;
-            Ok(FsconfigParam { key, value })
+            Ok(FsconfigParam::String(key, value))
         };
         let mut params = vec![
             make(c"source", "devpts".to_owned())?,
@@ -1579,15 +1571,19 @@ pub(crate) fn mount_devpts_on(
         )
     })?;
     for param in &params {
-        // SAFETY: `fs_fd` は生存中の fsopen の fd。`param.key`・`param.value` は借用した NUL 終端文字列で
+        // devpts のパラメータは文字列形式のみ（`fsconfig_params` が `String` しか作らない）。
+        let FsconfigParam::String(key, value) = param else {
+            return Err(SysError::Os(EINVAL));
+        };
+        // SAFETY: `fs_fd` は生存中の fsopen の fd。`key`・`value` は借用した NUL 終端文字列で
         // 呼び出しの間生存し、カーネルは保持しない。aux は 0。副作用はこの fs コンテキストへのパラメータ設定に限る。
         fsconfig_result(unsafe {
             syscall(
                 consts::SYS_FSCONFIG,
                 i64::from(fs_fd.as_raw_fd()),
                 i64::from(consts::FSCONFIG_SET_STRING),
-                param.key.as_ptr(),
-                param.value.as_ptr(),
+                key.as_ptr(),
+                value.as_ptr(),
                 0i64,
             )
         })?;
@@ -3831,11 +3827,12 @@ mod tests {
             c.fsconfig_params()
                 .unwrap()
                 .iter()
-                .map(|p| {
-                    (
-                        p.key.to_str().unwrap().to_owned(),
-                        p.value.to_str().unwrap().to_owned(),
-                    )
+                .map(|p| match p {
+                    FsconfigParam::String(k, v) => (
+                        k.to_str().unwrap().to_owned(),
+                        v.to_str().unwrap().to_owned(),
+                    ),
+                    FsconfigParam::Flag(k) => panic!("unexpected flag param: {k:?}"),
                 })
                 .collect()
         };
@@ -3938,8 +3935,10 @@ mod tests {
                 break st;
             }
             if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                // kill の失敗・回収猶予の超過も無期限に待たず、明示的に失敗させる（REPAIR-5）。
+                child.kill().expect("kill timed-out inner devpts test");
+                reap_bounded(&mut child, std::time::Duration::from_secs(5))
+                    .expect("reap timed-out inner devpts test within the grace period");
                 panic!("inner devpts mount test timed out after 60s");
             }
             std::thread::sleep(std::time::Duration::from_millis(50));

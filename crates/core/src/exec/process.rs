@@ -3416,59 +3416,9 @@ mod tests {
             assert_eq!(reap_snapshot(&handle), (ReapState::Running, 0));
         }
     }
-    /// `ViolationReason::<Name>` の `Name` を集めた集合（子の経路の違反理由の抽出。#1533）。
-    ///
-    /// `mod tests` 以降・コメント行・`EXEC_CHILD_VIOLATIONS` 自身の定義は数えない。拾いすぎは「失敗して判断を
-    /// 迫る」側に倒れるため許容する。
-    fn child_path_violation_names(src: &str) -> std::collections::BTreeSet<String> {
-        let body = src
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .unwrap_or(src);
-        let mut kept = String::new();
-        let mut in_list = false;
-        for line in body.lines() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("pub(super) const EXEC_CHILD_VIOLATIONS") {
-                in_list = true;
-            }
-            if in_list {
-                if trimmed.starts_with("];") {
-                    in_list = false;
-                }
-                continue;
-            }
-            if trimmed.starts_with("//") {
-                continue;
-            }
-            kept.push_str(line);
-            kept.push('\n');
-        }
-        const PREFIX: &str = "ViolationReason::";
-        kept.match_indices(PREFIX)
-            .filter_map(|(at, _)| {
-                let rest = kept.get(at + PREFIX.len()..)?;
-                let name: String = rest
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .collect();
-                (!name.is_empty()).then_some(name)
-            })
-            .collect()
-    }
-
-    /// 抽出した名前と一覧の差分 `(missing, stale)`。`missing` はコードにあって一覧に無い名前、`stale` は逆。
-    fn violation_list_gaps(
-        found: &std::collections::BTreeSet<String>,
-        list: &[ViolationReason],
-    ) -> (Vec<String>, Vec<String>) {
-        let listed: std::collections::BTreeSet<String> =
-            list.iter().map(|r| format!("{r:?}")).collect();
-        (
-            found.difference(&listed).cloned().collect(),
-            listed.difference(found).cloned().collect(),
-        )
-    }
+    use crate::exec::violation_scan::{
+        violation_list_gaps, violation_names as child_path_violation_names,
+    };
 
     /// 子が返し得る違反はすべて `Entrypoint` 監査イベントに写せる（足し忘れの検出。SEC-4・SUP-6・SEC-1・#1595）。
     #[test]

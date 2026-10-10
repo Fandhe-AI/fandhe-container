@@ -4019,6 +4019,39 @@ mod tests {
         assert_eq!(f(true, true), 1 | 2 | 4);
     }
 
+    /// CORE-5（TASK-29 追補・#1657）: `/dev`・`/dev/pts` の fsmount 属性ビットが、Landlock 側と共有する
+    /// 暗黙の固定集合の定義（`dev_mounts`）と一致する。片方だけが変わったらここで検出する。
+    #[test]
+    fn core5_implicit_dev_mount_attrs_match_fsmount_bits() {
+        use crate::dev_mounts::ImplicitDevMount;
+        let bits = |m: ImplicitDevMount| {
+            let a = m.attrs();
+            let mut b = 0;
+            if a.read_only {
+                b |= consts::MOUNT_ATTR_RDONLY;
+            }
+            if a.nosuid {
+                b |= consts::MOUNT_ATTR_NOSUID;
+            }
+            if a.nodev {
+                b |= consts::MOUNT_ATTR_NODEV;
+            }
+            if a.noexec {
+                b |= consts::MOUNT_ATTR_NOEXEC;
+            }
+            b
+        };
+        // `/dev` は strictatime が加わる（定義側に atime の属性は無い）。
+        assert_eq!(
+            DevTmpfsCreate::new().attr_bits() & !consts::MOUNT_ATTR_STRICTATIME,
+            bits(ImplicitDevMount::Dev)
+        );
+        assert_eq!(
+            DevptsCreate { gid: None }.attr_bits(),
+            bits(ImplicitDevMount::DevPts)
+        );
+    }
+
     /// CORE-1・SEC-1（TASK-29 追補・#1652）: `/dev` 用 tmpfs の attr は nosuid|strictatime のみ。
     #[test]
     fn core1_sec1_dev_tmpfs_attr_bits_are_exact() {

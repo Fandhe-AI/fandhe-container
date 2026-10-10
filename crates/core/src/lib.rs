@@ -97,6 +97,7 @@ pub mod audit_log;
 pub mod capabilities;
 #[cfg(target_os = "linux")]
 pub mod cgroups;
+pub mod dev_mounts;
 #[cfg(target_os = "linux")]
 pub mod exec;
 pub mod injected_files;

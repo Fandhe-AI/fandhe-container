@@ -100,13 +100,14 @@ mod linux {
     use std::process::{Command, ExitStatus, Stdio};
     use std::time::{Duration, Instant};
 
+    use fandhe_container_core::dev_mounts::ImplicitDevMounts;
     use fandhe_container_core::exec::{
         ChildExit, Entrypoint, ExecError, Hostname, IsolationConfig, Namespace, NamespaceSet,
         StageKind, StagePipeline, isolate, isolate_rootful_host_root, plan, plan_rootful_host_root,
         spawn_container, spawn_container_seccomp_probe, spawn_container_with_stages,
     };
     use fandhe_container_core::landlock::{
-        LandlockRuleset, detect_landlock_abi, path_rules_from_config,
+        LandlockRuleset, build_path_rules_with_dev, detect_landlock_abi,
     };
     use fandhe_container_core::oci_runtime::parse_config_bytes;
     use fandhe_container_core::rlimits::{Rlimit, RlimitKind, Rlimits};
@@ -595,7 +596,16 @@ mod linux {
         let config = parse_config_bytes(json.as_bytes()).expect("valid config");
         let support = detect_landlock_abi()
             .unwrap_or_else(|e| panic!("Landlock ABI 6+ is required for this test: {e}"));
-        path_rules_from_config(&support, &config).unwrap_or_else(|e| panic!("rules: {e}"))
+        // rootfs に dev が無い最小フロー（`spawn_container` は `create_default_devices` を呼ばない。#1314 未配線）
+        // では暗黙の `/dev` 系のルールを足せない（存在しないパスは適用時に拒否される）ため含めない。ルールは
+        // 従来と同じで弱体化ではない。#1314 で配線したら `ImplicitDevMounts::All` に戻す（#1657）。
+        build_path_rules_with_dev(
+            &support,
+            config.root(),
+            config.mounts(),
+            ImplicitDevMounts::None,
+        )
+        .unwrap_or_else(|e| panic!("rules: {e}"))
     }
 
     /// 自プロセスの `/proc/self/status` の `NoNewPrivs:` の値（0 または 1）。

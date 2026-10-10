@@ -108,9 +108,10 @@ mod linux {
     use fandhe_container_core::exec::{
         ChildExit, ContainerEnv, DevptsGidSource, ExecExit, IsolationConfig, MountIsolation,
         Namespace, NamespaceSet, ViolationReason, create_default_devices,
-        isolate_rootful_host_root, pivot_root, plan_rootful_host_root, prepare_rootfs,
+        isolate_rootful_host_root, mount_tmpfs, pivot_root, plan_rootful_host_root, prepare_rootfs,
     };
     use fandhe_container_core::oci_runtime::load_config;
+    use fandhe_container_core::tmpfs::TmpfsMountSet;
     use fandhe_container_core::traits::{
         CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, StateRecord, StateRevision,
         TraitError,
@@ -319,7 +320,7 @@ mod linux {
         .expect("chmod script");
         fs::write(
             bundle.dir.join("config.json"),
-            br#"{"ociVersion":"1.2.0","root":{"path":"rootfs","readonly":true},"process":{"user":{"uid":0,"gid":0},"cwd":"/","args":["/probe"],"env":["FANDHE_EXEC_ENV=from-config","OVERRIDDEN=config"]},"mounts":[{"destination":"/dev","options":["rw"]},{"destination":"/data","options":["rw"]}]}"#,
+            br#"{"ociVersion":"1.2.0","root":{"path":"rootfs","readonly":true},"process":{"user":{"uid":0,"gid":0},"cwd":"/","args":["/probe"],"env":["FANDHE_EXEC_ENV=from-config","OVERRIDDEN=config"]},"mounts":[{"destination":"/data","options":["rw"]}]}"#,
         )
         .expect("write config.json");
         bundle
@@ -382,6 +383,13 @@ mod linux {
         let prepared = prepare_rootfs(&isolation, rootfs).expect("prepare rootfs");
         create_default_devices(&isolation, &prepared, DevptsGidSource::Rootful)
             .expect("create default devices");
+        // 暗黙の `/dev/shm` を載せる（本番の順序: create_default_devices の後。#1654）。Landlock の暗黙分の
+        // ルール（`/dev/shm`。#1657）が存在するパスを指すために必要。
+        let mut tmpfs = TmpfsMountSet::new();
+        tmpfs
+            .ensure_default_dev_shm()
+            .expect("default /dev/shm spec");
+        mount_tmpfs(&isolation, &prepared, &tmpfs).expect("mount default /dev/shm");
         pivot_root(&isolation, prepared).expect("pivot_root");
         fs::write(format!("/{ready}"), b"ready").expect("write ready marker");
         // 親が stdin 経由で pid1 を kill するまで待機する（上限つき。REPAIR-5）。
@@ -962,7 +970,7 @@ mod linux {
         assert_eq!(
             out.trim_end(),
             format!(
-                "outcome exit={:?} rlimits=15 rlimits_deferred=1 caps_dropped={} landlock_rules=3 seccomp_instructions={} groups={} entrypoint_mode={mode} reason={outcome_reason}",
+                "outcome exit={:?} rlimits=15 rlimits_deferred=1 caps_dropped={} landlock_rules=5 seccomp_instructions={} groups={} entrypoint_mode={mode} reason={outcome_reason}",
                 ExecExit::Command(ChildExit::Signaled(15)),
                 parse_after(&out, "caps_dropped="),
                 parse_after(&out, "seccomp_instructions="),

@@ -25,7 +25,12 @@
 //!
 //! `uid=`・`gid=`・`%` 指定・`suid` / `dev` の許可・OCI `mounts[]` からの変換（TASK-127・TASK-29 系）。
 
+use crate::dev_mounts::ImplicitDevMount;
 use crate::oci_runtime::{CONFIG_MAX_PATH_BYTES, MountDestination};
+
+// `TmpfsMountFlags` は `nosuid`・`nodev` を常に付ける。暗黙の固定集合の定義が食い違ったらビルドを止める（#1657）。
+const _: () =
+    assert!(ImplicitDevMount::DevShm.attrs().nosuid && ImplicitDevMount::DevShm.attrs().nodev);
 use crate::traits::types::{ErrorCode, TraitError};
 
 /// 1 コンテナあたりの tmpfs マウント件数の上限（無制限確保・過大な設定の拒否）。
@@ -156,7 +161,12 @@ impl TmpfsMountSpec {
 
     /// `--shm-size` 未指定時の既定の `/dev/shm`（[`DEFAULT_DEV_SHM_SIZE_BYTES`]・`noexec`・mode 1777）。
     pub fn default_dev_shm() -> Result<Self, TraitError> {
-        Self::dev_shm(TmpfsSize::from_bytes(DEFAULT_DEV_SHM_SIZE_BYTES)?)
+        let mut spec = Self::dev_shm(TmpfsSize::from_bytes(DEFAULT_DEV_SHM_SIZE_BYTES)?)?;
+        // 暗黙の固定集合の定義（Landlock 側のルールと共有。#1657）から属性を設定する。
+        let attrs = ImplicitDevMount::DevShm.attrs();
+        spec.read_only = attrs.read_only;
+        spec.exec = !attrs.noexec;
+        Ok(spec)
     }
 
     /// 表示・照合用の表現（`mode=1777,size=67108864`）。型付きフィールドからのみ組み立てる。カーネルへは

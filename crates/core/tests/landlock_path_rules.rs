@@ -11,9 +11,10 @@
 
 #![cfg(target_os = "linux")]
 
+use fandhe_container_core::dev_mounts::{ImplicitDevMount, ImplicitDevMounts};
 use fandhe_container_core::landlock::{
     AccessFs, LandlockError, LandlockRuleErrorKind, LandlockSupport, RuleOrigin, RulePath,
-    build_path_rules, detect_landlock_abi, path_rules_from_config,
+    build_path_rules_with_dev, detect_landlock_abi, path_rules_from_config,
 };
 use fandhe_container_core::oci_runtime::{OciConfig, parse_config_bytes};
 use fandhe_container_core::traits::ErrorCode;
@@ -70,8 +71,8 @@ fn check_path_rules_from_config(support: &LandlockSupport) {
             {"destination":"/bin","options":["ro"]},
             {"destination":"/x","options":["exec","noexec"]},
             {"destination":"/y","options":["noexec","exec","ro"]},
-            {"destination":"/dev","options":["nodev","dev"]},
-            {"destination":"/dev/shm","options":["dev","nodev"]}
+            {"destination":"/dev/a","options":["nodev","dev"]},
+            {"destination":"/dev/b","options":["dev","nodev"]}
         ]"#,
     );
     let rs = path_rules_from_config(support, &c).expect("rules");
@@ -82,6 +83,28 @@ fn check_path_rules_from_config(support: &LandlockSupport) {
         summary(rules),
         vec![
             ("/".to_string(), RuleOrigin::Root, 0x000D),
+            // 暗黙の固定集合（#1657）。実マウントの属性から導いた権利が root の次に入る。
+            (
+                "/dev".to_string(),
+                RuleOrigin::Implicit {
+                    mount: ImplicitDevMount::Dev
+                },
+                0xF7BF
+            ),
+            (
+                "/dev/pts".to_string(),
+                RuleOrigin::Implicit {
+                    mount: ImplicitDevMount::DevPts
+                },
+                0xF7BE
+            ),
+            (
+                "/dev/shm".to_string(),
+                RuleOrigin::Implicit {
+                    mount: ImplicitDevMount::DevShm
+                },
+                0x77BE
+            ),
             ("/data".to_string(), RuleOrigin::Mount { index: 0 }, 0x77BF),
             ("/bin".to_string(), RuleOrigin::Mount { index: 1 }, 0x000D),
             // 後の noexec が勝ち、EXECUTE だけを除く。
@@ -89,12 +112,8 @@ fn check_path_rules_from_config(support: &LandlockSupport) {
             // noexec の後の exec が勝ち、ro で書き込みを除く。
             ("/y".to_string(), RuleOrigin::Mount { index: 3 }, 0x000D),
             // nodev の後の dev が勝ち、/dev 配下で IOCTL_DEV を許可する。
-            ("/dev".to_string(), RuleOrigin::Mount { index: 4 }, 0xF7BF),
-            (
-                "/dev/shm".to_string(),
-                RuleOrigin::Mount { index: 5 },
-                0x77BF
-            ),
+            ("/dev/a".to_string(), RuleOrigin::Mount { index: 4 }, 0xF7BF),
+            ("/dev/b".to_string(), RuleOrigin::Mount { index: 5 }, 0x77BF),
         ]
     );
     assert_eq!(rw().bits(), 0x77BF);
@@ -102,7 +121,30 @@ fn check_path_rules_from_config(support: &LandlockSupport) {
     let writable = path_rules_from_config(support, &config(false, "[]")).expect("rules");
     assert_eq!(
         summary(writable.rules()),
-        vec![("/".to_string(), RuleOrigin::Root, 0x77BF)]
+        vec![
+            ("/".to_string(), RuleOrigin::Root, 0x77BF),
+            (
+                "/dev".to_string(),
+                RuleOrigin::Implicit {
+                    mount: ImplicitDevMount::Dev
+                },
+                0xF7BF
+            ),
+            (
+                "/dev/pts".to_string(),
+                RuleOrigin::Implicit {
+                    mount: ImplicitDevMount::DevPts
+                },
+                0xF7BE
+            ),
+            (
+                "/dev/shm".to_string(),
+                RuleOrigin::Implicit {
+                    mount: ImplicitDevMount::DevShm
+                },
+                0x77BE
+            ),
+        ]
     );
 }
 
@@ -119,7 +161,9 @@ fn check_build_path_rules_hidden_mounts(support: &LandlockSupport) {
             {"destination":"/x/e","options":["noexec"]}
         ]"#,
     );
-    let rs = build_path_rules(support, c.root(), c.mounts()).expect("rules");
+    // 暗黙の `/dev` 系（#1657）は含めず、`mounts[]` の除外規則だけを照合する。
+    let rs = build_path_rules_with_dev(support, c.root(), c.mounts(), ImplicitDevMounts::None)
+        .expect("rules");
     assert_eq!(
         summary(rs.rules()),
         vec![

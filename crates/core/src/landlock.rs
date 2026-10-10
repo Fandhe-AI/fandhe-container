@@ -36,7 +36,8 @@ pub use apply::{
 pub(crate) use apply::{apply_landlock_ruleset, apply_landlock_ruleset_with};
 pub use rules::{
     AccessFs, LandlockRuleError, LandlockRuleErrorKind, LandlockRuleset, MAX_LANDLOCK_RULES,
-    PathRule, RuleOrigin, RulePath, ShadowedRestriction, build_path_rules, path_rules_from_config,
+    PathRule, RuleOrigin, RulePath, ShadowedRestriction, build_path_rules,
+    build_path_rules_with_dev, path_rules_from_config,
 };
 
 use crate::sys::{self, SysError};

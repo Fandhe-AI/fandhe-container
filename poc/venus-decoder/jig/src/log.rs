@@ -223,6 +223,13 @@ pub fn session_error_line(code: &str, request: Option<u32>) -> String {
     )
 }
 
+/// セッション終了時の blob の片づけの集計行（#1645）。数値だけを出す（ゲスト・frontend 由来のバイト列や fd 番号は出さない）。
+/// `mapped` は片づけ前の map 中の件数、`unmapped` は frontend が 0 を返した `SHMEM_UNMAP` の件数、`memfds` は閉じた memfd の数。
+/// 照合器（`find_capset_queries`）では `Other` に分類され、壊れた行に数えられない。
+pub fn blob_release_line(mapped: usize, unmapped: usize, memfds: usize) -> String {
+    format!("venus_jig event=blob_release mapped={mapped} unmapped={unmapped} memfds={memfds}")
+}
+
 /// REPLY_ACK 確定後に、NEED_REPLY が付いた要求へ ack を返したことを示すログ行（#1639）。固定語彙と要求 ID だけを出す。
 pub fn need_reply_ack_line(request: u32, ok: bool) -> String {
     let result = if ok { "ok" } else { "err" };

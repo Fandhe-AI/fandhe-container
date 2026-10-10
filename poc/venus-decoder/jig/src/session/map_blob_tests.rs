@@ -429,3 +429,128 @@ fn f5_2b_4a_gpu6_unref_after_unmap_closes_memfd() {
     assert_eq!(memfd_count(), base);
     h.join().expect("join");
 }
+/// 終了時の片づけを呼んで、出たログ行を返す。
+fn release(s: &mut Session) -> Vec<String> {
+    let mut lines = Vec::new();
+    s.release_blobs_at_end(&mut |l| lines.push(l.to_string()));
+    lines
+}
+
+/// GPU-6・REPAIR-5・REPAIR-12（#1645・D3）: map が残ったままの終了では SHMEM_UNMAP を送って memfd を閉じる。
+#[test]
+fn f5_2b_4b_gpu6_release_sends_unmap_and_closes_memfd() {
+    let _g = FD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut s, b) = ready(T);
+    prepare(&mut s);
+    let base = memfd_count();
+    let h = frontend(b, vec![0, 0]);
+    let mut sink = |_: &str| {};
+    assert_eq!(
+        resp_type(&s.process_ctrl(Some(&map_blob(7, 4096)), 4096, &mut sink)),
+        RESP_OK_MAP_INFO
+    );
+    assert_eq!(memfd_count(), base + 1);
+    let lines = release(&mut s);
+    let seen = h.join().expect("join");
+    assert_eq!(
+        seen[1],
+        (BackendRequestCode::ShmemUnmap, 4096, 8192, 0, 0, 0, None)
+    );
+    assert_eq!(
+        lines,
+        vec![
+            "venus_jig event=backend_req cmd=SHMEM_UNMAP shmid=1 shm_offset=4096 len=8192 result=ok status=0"
+                .to_string(),
+            "venus_jig event=blob_release mapped=1 unmapped=1 memfds=1".to_string(),
+        ]
+    );
+    assert_eq!(s.blobs.len(), 0);
+    assert_eq!(memfd_count(), base);
+}
+
+/// GPU-6・REPAIR-5（#1645・D3）: channel が `Broken` なら 1 バイトも送らず、memfd は閉じる。
+#[test]
+fn f5_2b_4b_gpu6_release_with_broken_channel_sends_nothing_and_closes_memfd() {
+    let _g = FD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut s, b) = ready(T);
+    prepare(&mut s);
+    let base = memfd_count();
+    let h = frontend(b.try_clone().expect("dup"), vec![0]);
+    let mut sink = |_: &str| {};
+    assert_eq!(
+        resp_type(&s.process_ctrl(Some(&map_blob(7, 4096)), 4096, &mut sink)),
+        RESP_OK_MAP_INFO
+    );
+    h.join().expect("join");
+    s.state.mark_backend_broken();
+    let lines = release(&mut s);
+    assert_eq!(
+        lines,
+        vec!["venus_jig event=blob_release mapped=1 unmapped=0 memfds=1".to_string()]
+    );
+    assert_eq!(s.blobs.len(), 0);
+    assert_eq!(memfd_count(), base);
+    b.set_nonblocking(true).expect("nonblocking");
+    let mut buf = [0u8; 8];
+    let r = (&b).read(&mut buf);
+    // `Broken` にした時点で治具は端を閉じるため EOF（0 バイト）。どちらでも 1 バイトも届いていない。
+    assert!(
+        matches!(r, Ok(0))
+            || r.as_ref()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock),
+        "nothing was sent: {r:?}"
+    );
+}
+
+/// GPU-6・REPAIR-5（#1645・D3）: 非 0 の応答で打ち切る（2 件目は送らない）。memfd は 2 本とも閉じる。
+#[test]
+fn f5_2b_4b_gpu6_release_stops_at_first_failure_and_closes_all_memfds() {
+    let _g = FD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut s, b) = ready(T);
+    prepare(&mut s);
+    let base = memfd_count();
+    let h = frontend(b, vec![0, 0, (-22i64) as u64]);
+    let mut sink = |_: &str| {};
+    let p = s.process_ctrl(Some(&create_blob(1, 8, 4096)), 4096, &mut sink);
+    assert_eq!(resp_type(&p), RESP_OK_NODATA);
+    for (res, off) in [(7, 4096u64), (8, 16384u64)] {
+        assert_eq!(
+            resp_type(&s.process_ctrl(Some(&map_blob(res, off)), 4096, &mut sink)),
+            RESP_OK_MAP_INFO
+        );
+    }
+    assert_eq!(memfd_count(), base + 2);
+    let lines = release(&mut s);
+    assert_eq!(h.join().expect("join").len(), 3);
+    assert_eq!(
+        lines,
+        vec![
+            "venus_jig event=backend_req cmd=SHMEM_UNMAP shmid=1 shm_offset=4096 len=8192 result=err status=18446744073709551594"
+                .to_string(),
+            "venus_jig event=blob_release mapped=2 unmapped=0 memfds=2".to_string(),
+        ]
+    );
+    assert_eq!(s.blobs.len(), 0);
+    assert_eq!(memfd_count(), base);
+}
+
+/// GPU-6（#1645・D3）: UNMAP 済みで memfd だけ残った blob は何も送らずに閉じる。
+#[test]
+fn f5_2b_4b_gpu6_release_closes_unmapped_memfd_without_sending() {
+    let _g = FD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut s, b) = ready(T);
+    prepare(&mut s);
+    let base = memfd_count();
+    let h = frontend(b, vec![0, 0]);
+    let mut sink = |_: &str| {};
+    let _ = s.process_ctrl(Some(&map_blob(7, 4096)), 4096, &mut sink);
+    let _ = s.process_ctrl(Some(&unmap_blob(7)), 4096, &mut sink);
+    h.join().expect("join");
+    assert_eq!(memfd_count(), base + 1);
+    let lines = release(&mut s);
+    assert_eq!(
+        lines,
+        vec!["venus_jig event=blob_release mapped=0 unmapped=0 memfds=1".to_string()]
+    );
+    assert_eq!(memfd_count(), base);
+}

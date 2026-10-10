@@ -32,9 +32,10 @@
 //!   対応外の OS・アーキテクチャは `Unsupported`
 //! - macOS の RSS 取得（TASK-112.1・#265）: `proc_pidinfo(PROC_PIDTASKINFO)`（`resident_size_bytes`。`crate::rss` から呼ばれる）
 //! - Linux・macOS: `killpg(2)`（`kill_process_group`。plugin の子のプロセスグループへ `SIGKILL`。#1311。それ以外の unix は `Unsupported`）
-//! - Linux・macOS: ブロックしないことを保証できる経路（ソケットは `send(MSG_DONTWAIT)`、Linux の FIFO は
-//!   `/proc/self/fd` の `O_NONBLOCK` 開き直し。種別判定は `getsockopt` / `fcntl` で `fstat` は使わない）でだけ fd へ書く（`write_nonblocking`。`ChildGuard::drop` の
-//!   診断出力がブロックしない。#1605。保証できなければ捨てる）
+//! - Linux・macOS: ブロックしないことを保証できる経路（ソケットは `send(MSG_DONTWAIT)`、Linux の無名 pipe は
+//!   `/proc/self/fd` の `O_NONBLOCK` 開き直し。種別判定は `getsockopt` / `fcntl` / procfs の readlink で `fstat` は
+//!   使わず、fd も複製しない）でだけ fd へ書く（`write_nonblocking`。`ChildGuard::drop` の診断出力がブロックしない。
+//!   #1605。保証できなければ捨てる）
 //! - Linux（x86_64 / aarch64）・macOS: `waitid(2)`（`WEXITED | WNOHANG | WNOWAIT`。`probe_child_exit`。自発終了した plugin を回収せずに
 //!   観測し、グループへ送ってから回収するため。#1604・PLUG-7・REPAIR-5。それ以外は `Unsupported`）
 //! - いずれの unix: `kill(2)` で起動中の plugin へ SIGINT・SIGTERM・SIGHUP を転送する（`send_signal`。
@@ -55,7 +56,7 @@
 //!
 //! # 契約
 //! - `unsafe fn` は公開しない。公開するのは安全な [`send_signal`]・[`peer_uid`]・[`effective_uid`]・[`fchmodat_nofollow`]・
-//!   [`unlinkat`]・[`mkdirat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・[`kill_process_group`]・[`probe_child_exit`]・（Linux のみ）`set_parent_death_sigkill`・[`DirStream`]（`open_at`・`next_entry`・`position`）・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
+//!   [`unlinkat`]・[`mkdirat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・[`kill_process_group`]・[`probe_child_exit`]・[`write_nonblocking`]・（Linux のみ）`set_parent_death_sigkill`・[`DirStream`]（`open_at`・`next_entry`・`position`）・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
 //! - fd は `&UnixStream` の借用中のみ渡す（呼び出し中にクローズされない）
 //! - SOL_SOCKET / SO_PEERCRED の定数は `cfg(target_arch)` ごとに個別定義し、流用しない
 //! - OS ごとに値・幅が異なる定数・型（`ModeT`・`AT_SYMLINK_NOFOLLOW`・`O_*` 等）は対応 OS ごとに個別定義し、
@@ -208,7 +209,7 @@ fn is_socket_fd(fd: i32) -> bool {
     let mut val: i32 = 0;
     let mut len: u32 = 4;
     // SAFETY: `val`・`len` はこの関数のスタック上の有効な書き込み先で、`len` は `val` の大きさ（4）と一致する。
-    // fd は呼び出し側の複製が保持し呼び出し中は閉じられない。fd 単位の問い合わせで副作用は無い。
+    // fd は呼び出し側の借用（`BorrowedFd`）が呼び出し中開いていることを保証する。fd 単位の問い合わせで副作用は無い。
     let rc = unsafe {
         c_getsockopt(
             fd,
@@ -231,45 +232,69 @@ fn is_pipe_fd(fd: i32) -> bool {
     unsafe { c_fcntl(fd, F_GETPIPE_SZ) >= 0 }
 }
 
+/// `/proc/self/fd/<fd>` のリンク先が無名 pipe（pipefs の `pipe:[<ino>]`）か。名前付き FIFO は絶対パスになり
+/// `false`（#1605・REPAIR-5）。
+///
+/// procfs の fd リンクの readlink はメモリ上の dentry から名前を組み立てるだけで（`d_path`）、リンク先の
+/// ファイルシステムへ問い合わせない。名前付き FIFO を開き直すと、その FIFO が置かれた NFS / FUSE の
+/// 権限確認・属性再検証で止まり得るため、この判定を通った無名 pipe だけを開き直す。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn is_anonymous_pipe_link(proc_fd_path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    std::fs::read_link(proc_fd_path)
+        .map(|target| target.as_os_str().as_bytes().starts_with(b"pipe:["))
+        .unwrap_or(false)
+}
+
 /// ブロックしないことを保証できる経路でだけ `fd` へ `buf` を 1 回書く。保証できなければ書かない（#1605・REPAIR-5・PLUG-7）。
 ///
 /// `crate::lifecycle` の `ChildGuard::drop` が診断 1 行を stderr へ出すために呼ぶ。共有 fd の
 /// open file description（親・他プロセスと共有される）の状態は変えない。`poll(POLLOUT)` は空き容量を
 /// 予約せず poll と write の間に他者が満たし得るため使わない。種別判定は `fstat` / `metadata()` を使わず
-/// fd 単位のカーネル内問い合わせ（`getsockopt` / `fcntl`）だけで行い、応答しない FUSE / NFS 上の fd でも
-/// 判定自体が止まらない。
+/// fd 単位のカーネル内問い合わせ（`getsockopt` / `fcntl`）と procfs の readlink だけで行い、応答しない
+/// FUSE / NFS 上の fd でも判定自体が止まらない。
+///
+/// `fd` は複製しない。複製を閉じると NFS（未書き出しページの書き戻し）・FUSE（`FUSE_FLUSH`）では close の
+/// たびにファイルシステムの flush が走り、捨てる経路でも止まり得るため。閉じるのは無名 pipe を開き直した
+/// fd（pipefs。flush を持たない）だけである。
 /// - ソケット（journald 等への stderr）: `send(MSG_DONTWAIT)`。この呼び出しだけ非ブロッキング
-/// - Linux の pipe / FIFO: `/proc/self/fd/N` を `O_NONBLOCK` で開き直した別 description へ書く
-///   （共有側のフラグは変わらない。満杯なら `WouldBlock`）
-/// - 上記以外（通常ファイル・キャラクタデバイス・macOS の pipe 等）: 通常ファイルは FUSE / NFS・FS freeze で、
-///   キャラクタデバイスは CUSE 等の open / write で無期限に止まり得て `O_NONBLOCK` でも防げず、保証できないため
+/// - Linux の無名 pipe: `/proc/self/fd/N` を `O_NONBLOCK` で開き直した別 description へ書く
+///   （共有側のフラグは変わらない。満杯なら `WouldBlock`、読み手が無ければ open が `ENXIO`）
+/// - 上記以外（通常ファイル・キャラクタデバイス・名前付き FIFO・macOS の pipe 等）: 通常ファイルは
+///   FUSE / NFS・FS freeze で、キャラクタデバイスは CUSE 等の open / write で、名前付き FIFO は置き場所の
+///   NFS / FUSE での開き直し時の権限確認で無期限に止まり得て `O_NONBLOCK` でも防げず、保証できないため
 ///   書かず `Unsupported`（診断は捨てる）
 ///
 /// 満杯なら `WouldBlock`。部分書き込みも有り得るため書けたバイト数を返す。std の stderr ロックは取らない。
+/// 前提: 呼び出し中に別スレッドが同じ fd 番号を `dup2` 等で差し替えない（判定と書き込みが別の対象を指さないため）。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn write_nonblocking(fd: &impl AsFd, buf: &[u8]) -> io::Result<usize> {
-    let owned = fd.as_fd().try_clone_to_owned()?;
-    let file = File::from(owned);
-    if is_socket_fd(file.as_raw_fd()) {
-        // SAFETY: `buf` は有効な読み取り専用スライスで、渡す長さは `buf.len()`。fd は `file`（複製）が保持し
-        // 呼び出し中は閉じられない。`MSG_DONTWAIT` で待たない。`MSG_NOSIGNAL` は付けないが Rust ランタイムは
-        // `SIGPIPE` を無視している。
-        let w = unsafe { c_send(file.as_raw_fd(), buf.as_ptr(), buf.len(), MSG_DONTWAIT) };
+    let raw = fd.as_fd().as_raw_fd();
+    if is_socket_fd(raw) {
+        // SAFETY: `buf` は有効な読み取り専用スライスで、渡す長さは `buf.len()`。fd は呼び出し側の借用が
+        // 呼び出し中開いていることを保証する。`MSG_DONTWAIT` で待たない。`MSG_NOSIGNAL` は付けないが
+        // Rust ランタイムは `SIGPIPE` を無視している。
+        let w = unsafe { c_send(raw, buf.as_ptr(), buf.len(), MSG_DONTWAIT) };
         return usize::try_from(w).map_err(|_| io::Error::last_os_error());
     }
     #[cfg(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
-    if is_pipe_fd(file.as_raw_fd()) {
+    if is_pipe_fd(raw) {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let path = format!("/proc/self/fd/{}", file.as_raw_fd());
-        let mut private = std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(O_NONBLOCK_NOCTTY)
-            .open(path)?;
-        return private.write(buf);
+        let path = std::path::PathBuf::from(format!("/proc/self/fd/{raw}"));
+        if is_anonymous_pipe_link(&path) {
+            let mut private = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(O_NONBLOCK_NOCTTY)
+                .open(path)?;
+            return private.write(buf);
+        }
     }
     Err(io::Error::from(io::ErrorKind::Unsupported))
 }

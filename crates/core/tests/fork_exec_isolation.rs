@@ -53,6 +53,9 @@
 //!   `all` は stderr も閉じるため marker を空にし、panic の診断だけを退避した複製へ出す。実行用 fd が 3 以上へ移る
 //!   具体値は launch 経路では観測できず（`with_landlock` を載せないため `LaunchReady` が作られず `execveat` の手前で拒否）、`tests/exec_child_setup.rs` で照合する
 //!
+//! - シナリオ `landlock-exec`（#1714・CORE-5・SEC-1・REPAIR-12。`with_landlock` + `spawn_container_with_stages`）: 制限適用の証跡
+//!   `LaunchReady` がそろった launch 経路が実際に `execveat` まで到達する。プローブの終了コード 42 を照合する（拒否なら 126）
+//!
 //! # 実機前提テストとしての分離
 //! 実行には root もしくは非特権 user namespace を許可するホストが必要（AppArmor の
 //! `kernel.apparmor_restrict_unprivileged_userns=1` 等の環境では `PermissionDenied` になる）。
@@ -118,7 +121,7 @@ mod linux {
     /// 子が pivot 後の `/` に追記するステージ実行ログ（親からは `<rootfs>/stage-log`）。
     const STAGE_LOG: &str = "stage-log";
     /// (シナリオ名, stderr に含まれるべき文字列)。
-    const SCENARIOS: [(&str, &str); 13] = [
+    const SCENARIOS: [(&str, &str); 14] = [
         ("ok", "PERMISSION_DENIED"),
         ("missing", "PERMISSION_DENIED"),
         ("not-executable", "PERMISSION_DENIED"),
@@ -129,6 +132,8 @@ mod linux {
         ("landlock-apply-ro", "Permission denied"),
         ("landlock-apply-rw", ""),
         ("landlock-fail", "landlock_open_path_failed"),
+        // 制限適用の証跡 `LaunchReady`（#1714）がそろった launch 経路の実 exec。stderr に診断は出ない。
+        ("landlock-exec", ""),
         // 標準 fd を閉じた親からの起動（#1299）。fd 2 を閉じると子の診断が届かないため、`all` の marker は空。
         ("stdio-closed-one", "PERMISSION_DENIED"),
         ("stdio-closed-many", "PERMISSION_DENIED"),
@@ -386,8 +391,8 @@ mod linux {
             "missing" => "/no-such-entrypoint".to_string(),
             "not-executable" => format!("/{NOT_EXEC}"),
             "stages-order" | "stage-fail" | "landlock-apply-ro" | "landlock-apply-rw"
-            | "landlock-fail" | "rlimits-apply" | "rlimit-fail" | "stdio-closed-one"
-            | "stdio-closed-many" | "stdio-closed-all" => format!("/{PROBE}"),
+            | "landlock-fail" | "landlock-exec" | "rlimits-apply" | "rlimit-fail"
+            | "stdio-closed-one" | "stdio-closed-many" | "stdio-closed-all" => format!("/{PROBE}"),
             other => panic!("unknown scenario {other}"),
         };
         // SEC-1・CORE-5: Landlock が未適用の間は、root / 非 root を問わず
@@ -478,6 +483,20 @@ mod linux {
                 };
                 spawn_container_seccomp_probe(rootfs, stages)
             }
+            "landlock-exec" => {
+                // CORE-5・SEC-1・REPAIR-12・#1714: `with_landlock` を載せた構成は、全段（cgroup 参加 → 組み込みの
+                // capability 削減・NO_NEW_PRIVS → 実カーネルの Landlock → 組み込みの seccomp）の成功後に
+                // `LaunchReady` がそろい、エントリポイントの検査・標準 fd の置換を経て `execveat` へ到達する。
+                // プローブ ELF の終了コード 42 は exec が実際に行われた場合にだけ得られる（拒否は 126）。
+                // 読み取り専用 rootfs でも実行権限は許可される。
+                let ruleset = landlock_ruleset(true, "[]");
+                let stages = StagePipeline::new()
+                    .with_hook(StageKind::CgroupJoin, logging_hook(StageKind::CgroupJoin))
+                    .and_then(|p| p.with_landlock(ruleset))
+                    .unwrap_or_else(|e| panic!("register landlock: {e}"));
+                want = ChildExit::Exited(PROBE_EXIT);
+                spawn_container_with_stages(rootfs, &entry, stages)
+            }
             _ => spawn_container(rootfs, &entry),
         }
         .unwrap_or_else(|e| panic!("spawn: {e}"));
@@ -513,6 +532,11 @@ mod linux {
                 log,
                 format!("cgroup_join root=1 nnp={inherited_nnp}\n"),
                 "no stage after the failed one may run"
+            ),
+            "landlock-exec" => assert_eq!(
+                log,
+                format!("cgroup_join root=1 nnp={inherited_nnp}\n"),
+                "the pre-landlock stage must run before restriction, then the entrypoint must be exec'd"
             ),
             "landlock-apply-ro" | "landlock-apply-rw" | "landlock-fail" => {
                 // Landlock の前段（cgroup 参加）は、制限が掛かる前に pivot 後の `/` へ書けている。

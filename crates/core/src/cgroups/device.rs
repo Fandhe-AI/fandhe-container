@@ -1,4 +1,4 @@
-//! デバイス cgroup（`BPF_PROG_TYPE_CGROUP_DEVICE`）の eBPF 命令列の組み立て（TASK-32 追補・#1678・
+//! デバイス cgroup（`BPF_PROG_TYPE_CGROUP_DEVICE`）の eBPF 命令列の組み立て（TASK-32 追補・MS-2・#1678・
 //! SEC-1・CORE-1・CORE-4）。
 //!
 //! # 役割

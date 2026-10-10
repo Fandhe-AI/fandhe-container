@@ -1,4 +1,4 @@
-//! デバイス cgroup の eBPF 命令列の組み立ての結合試験（SEC-1・TASK-32 追補・#1678）。
+//! デバイス cgroup の eBPF 命令列の組み立ての結合試験（SEC-1・TASK-32 追補・MS-2・#1678）。
 //!
 //! # 役割
 //! crate の公開 API（`DeviceAllowList::oci_default`・`DeviceProgram::from_allow_list`・

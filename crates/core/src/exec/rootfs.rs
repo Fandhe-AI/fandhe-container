@@ -659,12 +659,55 @@ mod tests {
             const { std::cell::Cell::new(None) };
     }
 
-    /// shared propagation の判定を `shared` に固定して `prepare_rootfs_verified` を呼ぶ（呼び出し後に戻す）。
+    /// shared propagation の判定を `shared` に固定して `prepare_rootfs_verified` を呼ぶ。差し込み値は
+    /// ガードの drop で戻すため、中で panic しても後続テストへ残らない（#1690 第 2 回監査 P3-7・REPAIR-12）。
+    /// 同じ理由で、呼び出し前に [`DRY_RUN_NODEV_FAIL`] へ注入した失敗も戻ってから返る。
     fn prepare_with_shared(rootfs: &Path, shared: bool) -> Result<PreparedRootfs, ExecError> {
-        crate::exec::tests::DRY_RUN_SHARED.with(|s| s.set(Some(shared)));
-        let result = prepare_rootfs_verified(rootfs);
-        crate::exec::tests::DRY_RUN_SHARED.with(|s| s.set(None));
-        result
+        with_dry_run_overrides(shared, || prepare_rootfs_verified(rootfs))
+    }
+
+    /// shared の判定を `shared` に固定して `f` を呼び、戻る（panic で巻き戻る場合も含む）ときに
+    /// shared の差し込み値と [`DRY_RUN_NODEV_FAIL`] を `None` へ戻す。
+    fn with_dry_run_overrides<T>(shared: bool, f: impl FnOnce() -> T) -> T {
+        let _shared = crate::exec::tests::override_shared(shared);
+        let _nodev_fail = NodevFailReset;
+        f()
+    }
+
+    /// [`DRY_RUN_NODEV_FAIL`] をスコープの終わりに（panic で巻き戻る場合も）`None` へ戻すガード
+    /// （#1690 第 2 回監査 P3-7 の自己監査。注入した失敗が消費されずに残る経路を塞ぐ。REPAIR-12）。
+    struct NodevFailReset;
+
+    impl Drop for NodevFailReset {
+        fn drop(&mut self) {
+            DRY_RUN_NODEV_FAIL.with(|f| f.set(None));
+        }
+    }
+
+    /// REPAIR-12・SEC-1（#1690 第 2 回監査 P3-7・#1676）: `prepare_with_shared` と同じ `with_dry_run_overrides` の
+    /// 中で panic しても、shared の差し込み値と注入した nodev の失敗はどちらも `None` へ戻る。
+    #[test]
+    fn repair12_dry_run_overrides_are_cleared_on_panic() {
+        let caught = std::panic::catch_unwind(|| {
+            with_dry_run_overrides(true, || {
+                DRY_RUN_NODEV_FAIL.with(|f| f.set(Some(SysError::Unsupported)));
+                assert_eq!(
+                    crate::exec::tests::DRY_RUN_SHARED.with(std::cell::Cell::get),
+                    Some(true)
+                );
+                assert_eq!(
+                    DRY_RUN_NODEV_FAIL.with(std::cell::Cell::get),
+                    Some(SysError::Unsupported)
+                );
+                panic!("injected panic while the dry-run overrides are held");
+            })
+        });
+        assert!(caught.is_err());
+        assert_eq!(
+            crate::exec::tests::DRY_RUN_SHARED.with(std::cell::Cell::get),
+            None
+        );
+        assert_eq!(DRY_RUN_NODEV_FAIL.with(std::cell::Cell::get), None);
     }
 
     /// dry-run の `nodev_syscall` が記録した 1 回分の呼び出し。
@@ -875,7 +918,7 @@ mod tests {
             std::fs::create_dir_all(rootfs.join("proc")).unwrap();
             DRY_RUN_NODEV_FAIL.with(|f| f.set(Some(injected)));
             let err = prepare_with_shared(&rootfs, false).unwrap_err();
-            DRY_RUN_NODEV_FAIL.with(|f| f.set(None));
+            assert_eq!(DRY_RUN_NODEV_FAIL.with(std::cell::Cell::get), None);
             assert_eq!(err.stage, IsolationStage::PrepareRootfs, "{injected:?}");
             assert_eq!(err.code, code, "{injected:?}");
             assert!(err.violation.is_none(), "{err:?}");

@@ -63,7 +63,8 @@
 //!   他アーキテクチャの定義を流用しない。対応 arch は LP64 の x86_64・aarch64 に限り
 //!   （`target_pointer_width = "64"` を条件に含める）、x32 などの 32 bit ABI は対応外とする。
 //!   対応外アーキテクチャでは各ラッパーが [`SysError::Unsupported`] を返す
-//!   （fail-closed。`ErrorCode::Unimplemented` に写す）
+//!   （fail-closed。`ErrorCode::Unimplemented` に写す。新マウント API の `ENOSYS`〔古いカーネル〕も
+//!   同じ値に写す。経路の一覧は [`SysError::Unsupported`] の doc）
 //! - `extern "C"` の型幅は glibc / musl の宣言に合わせる（`c_int` = `i32`・
 //!   `c_ulong` = `u64`・`uid_t`/`gid_t` = `u32`）。戻り値が `-1` のときは直後に
 //!   `std::io::Error::last_os_error()` で errno を確保する
@@ -83,7 +84,14 @@ use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, IntoRawFd as _, Owne
 /// syscall 失敗の分類。`crate::exec` が `ErrorCode` へ写す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SysError {
-    /// 対応外のアーキテクチャ（定数が未定義）。
+    /// 対応外として拒否した操作（縮退せず fail-closed）。`crate::exec` が `ErrorCode::Unimplemented` に写し、
+    /// 表示文言は "not supported by the kernel or the target architecture"（#1690）。次の経路で返る:
+    /// - 対応外アーキテクチャ: `consts::SUPPORTED` が偽、または `ArchSysNo::get` が番号を持たない（#1619）
+    /// - 古いカーネル: 新マウント API（`fsopen`・`fsconfig`・`fsmount`・`move_mount`・`open_tree` は
+    ///   Linux 5.2 未満、`mount_setattr` は 5.12 未満）が返した `ENOSYS` を `new_mount_api_error` が写す。
+    ///   それ以外の syscall の `ENOSYS` は写さず [`SysError::Os`] のまま返す
+    /// - `reopen_pinned_read_nonblock` のパス組み立て（`CString::new`）の失敗。整数の書式化のため NUL を
+    ///   含まず、実際には起こらない
     Unsupported,
     /// カーネルが返した errno。
     Os(i32),

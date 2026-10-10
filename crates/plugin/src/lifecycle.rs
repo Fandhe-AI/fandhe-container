@@ -1613,6 +1613,7 @@ mod tests {
     }
 
     /// REPAIR-5・PLUG-7・#1605: 満杯の pipe（ブロッキングのまま）でも戻り、共有 fd を非ブロッキング化しない。
+    /// 試験の実行時は `SIGPIPE` が無視されている（Rust の実行時の既定）ため、pipe 経路が書き込みまで進む。
     #[test]
     #[cfg(all(
         target_os = "linux",

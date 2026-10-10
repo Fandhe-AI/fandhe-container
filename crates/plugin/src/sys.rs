@@ -3004,6 +3004,30 @@ mod write_nonblocking_flag_tests {
         assert_eq!(O_NONBLOCK_NOCTTY, 0o4400);
     }
 
+    /// `SigIgn` の bit 12（`SIGPIPE` = 13）だけを見る。隣の bit・欠けた行・壊れた値は無視されていない側に倒す。
+    #[test]
+    fn repair5_sigpipe_ignored_parses_sigign_bit_12() {
+        let status = |mask: &str| {
+            format!("Name:\tx\nSigBlk:\t0000000000001000\nSigIgn:\t{mask}\nSigCgt:\t0\n")
+        };
+        assert!(sigpipe_ignored_in_status(&status("0000000000001000")));
+        assert!(sigpipe_ignored_in_status(&status("0000000000001001")));
+        assert!(!sigpipe_ignored_in_status(&status("0000000000000000")));
+        assert!(!sigpipe_ignored_in_status(&status("0000000000000800")));
+        assert!(!sigpipe_ignored_in_status(&status("0000000000002000")));
+        assert!(!sigpipe_ignored_in_status(&status("zz")));
+        assert!(!sigpipe_ignored_in_status(
+            "Name:\tx\nSigBlk:\t0000000000001000\n"
+        ));
+    }
+
+    /// 試験の実行時（Rust の実行時は起動時に `SIGPIPE` を `SIG_IGN` にする）では実際の status から真を読む。
+    /// これが pipe 経路の試験（`lifecycle` の満杯 pipe 試験）が書き込みまで進む前提になる（陽性対照）。
+    #[test]
+    fn repair5_sigpipe_is_ignored_in_test_process() {
+        assert!(sigpipe_ignored());
+    }
+
     /// 相手が閉じた socket への送信は `EPIPE`（`BrokenPipe`）で戻る。`SIGPIPE` が出ないことそのものは、試験の実行時が
     /// `SIGPIPE` を無視しているため本試験では照合できない（フラグの付与は上の固定値試験と呼び出し箇所で担保する）。
     #[test]

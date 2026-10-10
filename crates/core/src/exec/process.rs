@@ -1911,8 +1911,8 @@ type Observed = (ChildExit, bool);
 /// # pidfd を開けなかったときの扱い（#1617・SUP-6・SEC-1・REPAIR-4）
 ///
 /// `pidfd_open` の失敗は [`LaunchPidfdUnavailable`] に分類して保持し（[`ContainerChild::pidfd_unavailable`]）、
-/// 未対応（`ENOSYS`）以外では構造化ログを 1 行出す（`EMFILE`・`ENFILE`・`ENOMEM`・`EPERM` 等を未対応と
-/// 取り違えない）。起動自体は失敗させない: `new` は fork の後に呼ばれ、失敗しうる構成にすると全 fork 箇所
+/// 未対応（`ENOSYS`）以外は [`LaunchPidfdUnavailable::log_line`] で構造化ログ 1 行にできる（`EMFILE`・`ENFILE`・
+/// `ENOMEM`・`EPERM` 等を未対応と取り違えない）。`new` 自身は I/O をしない（停止した stderr でブロックしない。REPAIR-5）。起動自体は失敗させない: `new` は fork の後に呼ばれ、失敗しうる構成にすると全 fork 箇所
 /// （`spawn_container*`・各 probe・exec の worker・rootless mapper・`observe_*`）で子の kill と回収が要り、
 /// 一時的な `EMFILE` がコンテナの起動まで落とすことになるため。代わりに本番の exec の入口
 /// （supervisor の `run_command_with_pidfd`）が pidfd を必須の引数にしており、`pidfd()` が `None` のハンドル
@@ -1962,6 +1962,21 @@ impl LaunchPidfdUnavailable {
         }
     }
 
+    /// 縮退理由の構造化ログ 1 行（`Unsupported` は想定内なので `None`）。固定語彙のみで、pid・パス・数値を載せない。
+    ///
+    /// 出力は呼び出し側の責務（`ContainerChild::new` は書かない。#1683 の指摘: 停止した stderr への同期書き込みが
+    /// ハンドル返却と期限管理を止めるため。REPAIR-5・REPAIR-4）。
+    pub fn log_line(self) -> Option<String> {
+        if self == Self::Unsupported {
+            return None;
+        }
+        Some(format!(
+            "{{\"component\":\"core.exec\",\"operation\":\"launch_pidfd\",\"outcome\":\"unavailable\",\"reason\":\"{}\",\"errno\":\"{}\"}}",
+            self.as_str(),
+            self.errno_name()
+        ))
+    }
+
     /// ログの `errno` に使う固定語彙名（`Unsupported` は `ENOSYS`）。
     pub fn errno_name(self) -> &'static str {
         match self {
@@ -2004,44 +2019,21 @@ fn classify_pidfd_open(
     }
 }
 
-/// 縮退理由の構造化ログ 1 行（`Unsupported` は出さないので `None`）。固定語彙のみで、pid・パス・数値を載せない。
-fn launch_pidfd_log_line(reason: LaunchPidfdUnavailable) -> Option<String> {
-    if reason == LaunchPidfdUnavailable::Unsupported {
-        return None;
-    }
-    Some(format!(
-        "{{\"component\":\"core.exec\",\"operation\":\"launch_pidfd\",\"outcome\":\"unavailable\",\"reason\":\"{}\",\"errno\":\"{}\"}}",
-        reason.as_str(),
-        reason.errno_name()
-    ))
-}
-
 impl ContainerChild {
     /// fork 直後の未回収の子のハンドルを作る（`exec` の rootless mapper の回収にも使う）。
     pub(super) fn new(pid: u32) -> Self {
         // 回収前（fork 直後）に開くので、以後 pid が再利用されても元のプロセスを指し続ける。
         // 未対応カーネル・seccomp 等で開けなければ `None`（`signal_child` が `kill(2)` へ退避）。
-        // 縮退の理由は分類して保持し、未対応以外は stderr へ 1 行出す（`eprintln!` は書き込み失敗で
-        // panic するため、結果を捨てる `writeln!` を使う）。
-        Self::from_pidfd_result(pid, sys::pidfd_open(pid), |line| {
-            let _ = writeln!(std::io::stderr().lock(), "{line}");
-        })
+        // 縮退の理由は分類して保持するだけで、ここでは I/O をしない（stderr が満杯 pipe 等で停止していても
+        // ハンドルの返却と子の回収を妨げない。REPAIR-5）。通知は `pidfd_unavailable()` を見た呼び出し側が行う。
+        Self::from_pidfd_result(pid, sys::pidfd_open(pid))
     }
 
-    /// `pidfd_open` の結果から組み立てる（`new` の本体。結果と出力先を注入できるようにして単体で照合する）。
-    fn from_pidfd_result(
-        pid: u32,
-        result: Result<OwnedFd, SysError>,
-        emit: impl FnOnce(&str),
-    ) -> Self {
+    /// `pidfd_open` の結果から組み立てる（`new` の本体。結果を注入できるようにして単体で照合する）。
+    fn from_pidfd_result(pid: u32, result: Result<OwnedFd, SysError>) -> Self {
         let (pidfd, pidfd_unavailable) = match classify_pidfd_open(result) {
             Ok(fd) => (Some(fd), None),
-            Err(reason) => {
-                if let Some(line) = launch_pidfd_log_line(reason) {
-                    emit(&line);
-                }
-                (None, Some(reason))
-            }
+            Err(reason) => (None, Some(reason)),
         };
         Self {
             pid,
@@ -3417,62 +3409,45 @@ mod tests {
     #[test]
     fn sup6_rep4_1617_launch_pidfd_log_line_bytes() {
         assert_eq!(
-            launch_pidfd_log_line(LaunchPidfdUnavailable::Failed { errno: "EMFILE" }).as_deref(),
+            LaunchPidfdUnavailable::Failed { errno: "EMFILE" }
+                .log_line()
+                .as_deref(),
             Some(
                 "{\"component\":\"core.exec\",\"operation\":\"launch_pidfd\",\"outcome\":\"unavailable\",\"reason\":\"failed\",\"errno\":\"EMFILE\"}"
             )
         );
         assert_eq!(
-            launch_pidfd_log_line(LaunchPidfdUnavailable::Denied).as_deref(),
+            LaunchPidfdUnavailable::Denied.log_line().as_deref(),
             Some(
                 "{\"component\":\"core.exec\",\"operation\":\"launch_pidfd\",\"outcome\":\"unavailable\",\"reason\":\"denied\",\"errno\":\"EPERM\"}"
             )
         );
-        assert_eq!(
-            launch_pidfd_log_line(LaunchPidfdUnavailable::Unsupported),
-            None
-        );
+        assert_eq!(LaunchPidfdUnavailable::Unsupported.log_line(), None);
     }
 
-    /// SUP-6・REPAIR-4（#1617）: `EMFILE` を注入すると pidfd は `None` のまま、理由が保持され、ログがちょうど 1 行出る。
-    /// `ENOSYS` は出力 0 行、成功なら `Some`・理由なし・出力 0 行。
+    /// SUP-6・REPAIR-4・REPAIR-5（#1617）: `EMFILE` を注入すると pidfd は `None` のまま理由が保持される。
+    /// 組み立ては出力先を取らず I/O をしない（停止した stderr でハンドル返却が止まらない。通知は呼び出し側）。
     #[test]
-    fn sup6_rep4_1617_pidfd_open_failure_keeps_none_and_logs_one_line() {
-        let mut lines: Vec<String> = Vec::new();
-        let child = ContainerChild::from_pidfd_result(1, Err(SysError::Os(sys::EMFILE)), |l| {
-            lines.push(l.to_owned());
-        });
+    fn sup6_rep4_1617_pidfd_open_failure_keeps_none_without_io() {
+        let child = ContainerChild::from_pidfd_result(1, Err(SysError::Os(sys::EMFILE)));
         assert!(child.pidfd().is_none());
         assert_eq!(
             child.pidfd_unavailable(),
             Some(LaunchPidfdUnavailable::Failed { errno: "EMFILE" })
         );
-        assert_eq!(
-            lines,
-            vec![
-                "{\"component\":\"core.exec\",\"operation\":\"launch_pidfd\",\"outcome\":\"unavailable\",\"reason\":\"failed\",\"errno\":\"EMFILE\"}"
-                    .to_owned()
-            ]
-        );
 
-        let mut lines: Vec<String> = Vec::new();
-        let child = ContainerChild::from_pidfd_result(1, Err(SysError::Os(sys::ENOSYS)), |l| {
-            lines.push(l.to_owned());
-        });
+        let child = ContainerChild::from_pidfd_result(1, Err(SysError::Os(sys::ENOSYS)));
         assert!(child.pidfd().is_none());
         assert_eq!(
             child.pidfd_unavailable(),
             Some(LaunchPidfdUnavailable::Unsupported)
         );
-        assert!(lines.is_empty());
 
         // 自プロセスの pidfd が開けるカーネルでの成功経路（未対応カーネルでは検証対象外）。
         if let Ok(fd) = sys::pidfd_open(std::process::id()) {
-            let mut lines: Vec<String> = Vec::new();
-            let child = ContainerChild::from_pidfd_result(1, Ok(fd), |l| lines.push(l.to_owned()));
+            let child = ContainerChild::from_pidfd_result(1, Ok(fd));
             assert!(child.pidfd().is_some());
             assert_eq!(child.pidfd_unavailable(), None);
-            assert!(lines.is_empty());
         }
     }
 

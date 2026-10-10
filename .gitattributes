@@ -2,5 +2,5 @@
 # checkout は CI では reusable workflow 内部（Fandhe-AI/actions/rust-base-ci.yml）で
 # 行われ呼び出し側から git config を注入できないため、.gitattributes が
 # Windows ランナー（既定で core.autocrlf=true）での CRLF 変換を防ぐ唯一のレバーになる
-# （macOS・Windows・Linux の 3 OS 一級対応。ci.yml の 3 OS matrix と対）。
+# （macOS・Windows・Linux の 3 OS 一級対応。ci.yml の 3 OS matrix〔main への push〕と対）。
 * text=auto eol=lf

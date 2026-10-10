@@ -1,7 +1,7 @@
 //! ACK を返さない相手に対する往復待ちのタイムアウト保護結合試験
 //! （PLUG-2・PLUG-5・REPAIR-5。TASK-107.7・#251）。
 //! root・特権不要。待ちはすべて有限の期限付きで、CI の既定テスト集合
-//! （`make test`・`integration-test` ジョブ）で実行される。
+//! （`make test`・`platform-ci` ジョブ）で実行される。
 //!
 //! 本 crate での「ACK / RPC 応答待ち」は `UdsStream::read_frame` を指す
 //! （ACK 専用のワイヤー種別は無い）。単体の期限・接続の poisoning は

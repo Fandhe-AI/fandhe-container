@@ -15,8 +15,8 @@
 //! - 未フラッシュ対照（`io3_unflushed_control_records_loss_without_asserting`）: 損失件数は
 //!   記録するだけで、件数ではテストを失敗させない。
 //!
-//! CI 回帰への組み込みは実装済み（#827）: `integration-test`（3 OS）と `rust-ci`（`--all-features`）で
-//! 実行し、実機前提テストとしては分離しない。`integration-test` は存在確認ステップで無言除外を検出する。
+//! CI 回帰への組み込みは実装済み（#827）: `platform-ci`（PR は ubuntu・main は 3 OS）と `rust-ci`（`--all-features`）で
+//! 実行し、実機前提テストとしては分離しない。`platform-ci` は存在確認ステップで無言除外を検出する。
 //!
 //! 未実装（TASK-18 の人間担当）: 実測結果レポートと対照としての妥当性の判断。
 //! ここの小さい目標数の結合試験（`io3_harness_*`）は試行ループの挙動だけを確かめる（REPAIR-3）。

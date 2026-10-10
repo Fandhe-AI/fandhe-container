@@ -9,7 +9,7 @@
 //! Linux 以外では fail-closed の拒否を具体値で確かめる。設定検証の試験は 3 OS の既定のテスト集合で動く。
 //! 実機権限（root 等）は不要。
 //!
-//! 待ちの上限は CI の `integration-test` ジョブが設定する `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`
+//! 待ちの上限は CI の `platform-ci` ジョブが設定する `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`
 //! （既定 10 秒。AGENTS.md「推奨タイムアウト値」・REPAIR-5）から組み立てる。
 
 use std::collections::HashMap;

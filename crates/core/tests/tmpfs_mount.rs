@@ -41,7 +41,7 @@
 //! # 実機前提テストとしての分離
 //! root もしくは非特権 user namespace を許可するホストが必要で、GitHub ホステッド runner では
 //! 保証できないため `-- --ignored` 指定時のみ実行する（ci.md「実機前提テスト」）。CI では
-//! `integration-test` ジョブ（ubuntu-latest）が AppArmor の制限を緩和した後に rootless 経路で実行し、
+//! `platform-ci` ジョブ（ubuntu-latest）が AppArmor の制限を緩和した後に rootless 経路で実行し、
 //! 成功行 `tmpfs_mount: mounts, flags and rollback verified (root=false)` を照合する。実行時は分離の
 //! 拒否を含めあらゆる失敗を失敗として扱う。rootful 経路（root）の実行は root 権限コマンドのため
 //! 明示指示のもとで行い、結果を PR に記録する。
@@ -356,7 +356,7 @@ mod linux {
 
         let info = std::fs::read_to_string("/proc/self/mountinfo").expect("mountinfo");
         // `prepare_rootfs` は rootful・rootless とも rootfs の自己 bind に `nodev` を付ける（#1676。オーナー判断
-        // 2026-10-10）。CI の integration-test は本試験を rootless で走らせるため、rootless で `mount_setattr(2)` が
+        // 2026-10-10）。CI の platform-ci は本試験を rootless で走らせるため、rootless で `mount_setattr(2)` が
         // 通り `nodev` が `/` に付くことの照合を兼ねる。
         assert!(report.rootfs_nodev, "rootfs self-bind must be nodev");
         let (_, root_opts, _, _) = info

@@ -829,6 +829,11 @@ pub struct MountIsolation {
 /// 依存しない。
 const PID_NS_INIT_INO: u64 = 0xEFFF_FFFC;
 
+/// 初期 user namespace の inode 番号（`include/uapi/linux/nsfs.h` の `enum init_ns_ino` の
+/// `USER_NS_INIT_INO`）。`exec::rootfs::prepare_rootfs` が rootful（初期 user ns に留まる）かどうかの
+/// 判定に使う（#1676・SEC-1）。
+const USER_NS_INIT_INO: u64 = 0xEFFF_FFFD;
+
 /// `/proc/thread-self/ns/pid` のリンク先（`pid:[inode]`）の inode 番号。書式に反すれば `None`。
 fn parse_pid_ns_inode(link: &str) -> Option<u64> {
     link.strip_prefix("pid:[")?.strip_suffix(']')?.parse().ok()
@@ -2205,6 +2210,11 @@ mod tests {
     /// 前のテストの記録が後続のテストへ漏れないよう、照合は必ずこの関数で取り出して行う。
     pub(super) fn take_dry_run_mounts() -> Vec<String> {
         DRY_RUN_MOUNTS.with(|m| std::mem::take(&mut *m.borrow_mut()))
+    }
+
+    /// dry-run の記録を消費せずに件数だけ返す（`rootfs` の nodev の順序照合用。#1676）。
+    pub(super) fn peek_dry_run_mounts_len() -> usize {
+        DRY_RUN_MOUNTS.with(|m| m.borrow().len())
     }
 
     /// パス検証は相対パス・NUL を副作用なしで拒否する。

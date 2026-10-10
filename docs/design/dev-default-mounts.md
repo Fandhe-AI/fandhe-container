@@ -43,7 +43,7 @@ OCI 既定の `/dev` のうち、基本デバイスノード 6 種と default sy
 
 tmpfs にする（runc 方式）に確定（4 章の判断 1）。実装は #1652・#1653。
 
-イメージ同梱の偽ノードを覆い隠せるのは `dev` 配下に限る（#1667 の事後監査 P2）。rootfs の残りの部分（例: イメージが `/dev` 以外に同梱したブロックデバイスのノード）は、rootful では rootfs の自己 bind に `nodev` が無く、汎用のデバイス cgroup（`BPF_CGROUP_DEVICE`）も core に無いため、Landlock の `READ_FILE`・`WRITE_FILE` の範囲で開けてしまう。rootfs の自己 bind の `nodev` 化と、既定のデバイス cgroup の許可リストは別の Issue で追跡する（GPU 向けの TASK-129 とは別）。新たなノードの作成（mknod）は Landlock の `MAKE_CHAR`・`MAKE_BLOCK` 不許可が止め、`/dev`・`/dev/shm` での拒否は `tests/landlock_implicit_dev.rs` が照合する
+イメージ同梱の偽ノードを覆い隠せるのは `dev` 配下に限る（#1667 の事後監査 P2）。rootfs の残りの部分（例: イメージが `/dev` 以外に同梱したブロックデバイスのノード）は、rootful では rootfs の自己 bind に `nodev` が無く、汎用のデバイス cgroup（`BPF_CGROUP_DEVICE`）も core に無いため、Landlock の `READ_FILE`・`WRITE_FILE` の範囲で開けてしまう。rootful では rootfs の自己 bind に `nodev` を付けた（#1676。`mount_setattr(2)`〔Linux 5.12 以降〕で mount top 1 枚だけに足し、`/dev` の tmpfs は `nodev` なしのまま。rootless は変えていない）。既定のデバイス cgroup の許可リストは #1677 で追跡する（GPU 向けの TASK-129 とは別）。CDI `deviceNodes`（TASK-127・#547）が `/dev` 以外を指すと、この `nodev` で開けなくなる。配置先の扱いは TASK-127 で決める。新たなノードの作成（mknod）は Landlock の `MAKE_CHAR`・`MAKE_BLOCK` 不許可が止め、`/dev`・`/dev/shm` での拒否は `tests/landlock_implicit_dev.rs` が照合する
 
 ### 3.2 暗黙の固定集合か `mounts[]` の汎用処理か
 
@@ -75,7 +75,7 @@ tmpfs にする（runc 方式）に確定（4 章の判断 1）。実装は #165
 
 (a) に確定した（判断 4）。実装は #1659・#1660。`nodev` の rootfs を検出していない既知の問題（`devices.rs` に記載済み）は併せて扱う。bind したマウントへの `nosuid`・`noexec` は付与しない（下記）。
 
-bind したマウントへの `nosuid`・`noexec` は付与しない（#1659 の判断。CORE-6・SEC-5）。マウントのルートが文字デバイス 1 個で他のファイルへ届かず、exec と setuid が通常ファイルにしか効かないため守る対象が無い（runc の `bindMountDeviceNode` も `MS_BIND` のみ）。複製はホスト側マウントのフラグを継承する。`nodev` は付けない（ノードが使えなくなる）。よって `mount_setattr` の sys ラッパーは足さない。
+bind したマウントへの `nosuid`・`noexec` は付与しない（#1659 の判断。CORE-6・SEC-5）。マウントのルートが文字デバイス 1 個で他のファイルへ届かず、exec と setuid が通常ファイルにしか効かないため守る対象が無い（runc の `bindMountDeviceNode` も `MS_BIND` のみ）。複製はホスト側マウントのフラグを継承する。`nodev` は付けない（ノードが使えなくなる）。よってデバイスノードの bind には `mount_setattr` を掛けない（rootfs の `nodev` 専用のラッパーは #1676）。
 
 ### 3.7 失敗時の後始末
 

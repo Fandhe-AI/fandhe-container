@@ -13,6 +13,12 @@
 //!   から 6 種と symlink 4 本を作る。#1653）→ `pivot_root` の後、`/dev` の mountinfo（tmpfs・`nosuid` あり・
 //!   `nodev` なし）、6 種の種別・`rdev`・モード、symlink 4 本の参照先を具体値で照合する。親は、ホスト側の
 //!   偽ノードが内容ごと不変で、`dev` に新エントリが増えていないことを照合する
+//! - rootfs の自己 bind の `nodev`（#1676・SEC-1・CORE-1）: 親（root）は `dev` の外にも偽のデバイスノード
+//!   `opt/fake-null`（c 1:3）・`root/fake-zero`（c 1:5）を `mknod` で置き、ホスト側で開けること（試験の前提。
+//!   ホストの一時領域が `nodev` だと空振りするため開けなければ panic）を自己検証する。子（root）は `pivot_root` の後、
+//!   この 2 個が `EACCES`（13）で開けないこと（Landlock は適用しないので `nodev` 由来）、`/dev/null` への書き込みと
+//!   `/dev/zero` の 16 バイト読みが成功すること、mountinfo の `/` に `nodev` があり `/dev` に無いことを照合する。
+//!   親は、子の終了後にホスト側の 2 個が同じ `rdev` の文字デバイスのまま残っていることを照合する
 //! - 子（非 root）: 非特権 user namespace では tmpfs までは載るが文字デバイスの `mknod(2)` が `EPERM` に
 //!   なるため、`PermissionDenied`・段 `CreateDevices` で fail-closed し、載せた tmpfs が外れていることを
 //!   照合する。親は、この呼び出しが作った `dev` がホスト側から消えていることを照合する
@@ -67,6 +73,39 @@ mod linux {
 
     /// ホスト側 rootfs の `dev/null` に置く偽ノード（通常ファイル）の内容。
     const FAKE_NULL: &[u8] = b"fake-null";
+
+    /// `dev` の外に置く偽のデバイスノード `(rootfs からの相対パス, major, minor)`（#1676）。
+    const FAKE_DEVICES: [(&str, u64, u64); 2] = [("opt/fake-null", 1, 3), ("root/fake-zero", 1, 5)];
+
+    /// coreutils の `mknod` で文字デバイスを作る（core のテストに `unsafe` を書かないため）。
+    /// 子の待ちには期限を付ける（REPAIR-5）。
+    fn mknod_char(path: &Path, major: u64, minor: u64) {
+        let mut child = Command::new("mknod")
+            .arg("-m")
+            .arg("0666")
+            .arg(path)
+            .arg("c")
+            .arg(major.to_string())
+            .arg(minor.to_string())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn mknod");
+        let deadline = Instant::now() + timeout();
+        loop {
+            match child.try_wait().expect("try_wait") {
+                Some(status) => {
+                    assert_eq!(status.code(), Some(0), "mknod must succeed");
+                    return;
+                }
+                None if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("mknod did not exit within {:?}", timeout());
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
 
     /// glibc の `gnu_dev_makedev` と同じ配置（下位 8 ビットの minor と 8..20 ビットの major）。
     fn makedev(major: u64, minor: u64) -> u64 {
@@ -141,6 +180,19 @@ mod linux {
             // イメージ同梱の偽ノード。tmpfs に覆い隠され、コンテナからは見えずホスト側は不変であること。
             std::fs::create_dir_all(base.join("dev")).expect("create rootfs/dev");
             std::fs::write(base.join("dev/null"), FAKE_NULL).expect("write fake node");
+            // `dev` の外のデバイスノード（rootfs の自己 bind の `nodev` で開けなくなること。#1676）。
+            for (rel, major, minor) in FAKE_DEVICES {
+                let path = base.join(rel);
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+                mknod_char(&path, major, minor);
+                // 試験の前提: ホスト側（`nodev` でないマウント）では開ける。開けないなら空振りになる。
+                if let Err(e) = std::fs::File::open(&path) {
+                    panic!(
+                        "host cannot open {}: {e}; set TMPDIR to a mount that is not nodev",
+                        path.display()
+                    );
+                }
+            }
         }
         Rootfs(base)
     }
@@ -182,8 +234,15 @@ mod linux {
                         .map(|e| e.expect("entry").file_name())
                         .collect();
                     assert_eq!(entries, vec![std::ffi::OsString::from("null")]);
+                    // ホスト側の `dev` 外のノードは変わらない。
+                    for (rel, major, minor) in FAKE_DEVICES {
+                        let meta =
+                            std::fs::symlink_metadata(rootfs.0.join(rel)).expect("stat fake");
+                        assert!(meta.file_type().is_char_device(), "{rel}");
+                        assert_eq!(meta.rdev(), makedev(major, minor), "{rel} rdev");
+                    }
                     println!(
-                        "default_devices: /dev tmpfs, basic device nodes, default links, /dev/pts and /dev/ptmx verified (root=true)"
+                        "default_devices: /dev tmpfs, basic device nodes, default links, /dev/pts and /dev/ptmx verified; rootfs self-bind nodev verified (root=true)"
                     );
                 } else {
                     // この呼び出しが作った `dev` は後始末で消えている。
@@ -335,6 +394,55 @@ mod linux {
         }
 
         verify_devpts();
+        verify_rootfs_nodev();
+    }
+
+    /// pivot 後の rootfs の `nodev`（#1676。SEC-1・CORE-1）。Landlock は適用していないため、`EACCES` は
+    /// `nodev` 由来。`/dev` の既定ノードは専用の tmpfs 上にあるので使える。
+    fn verify_rootfs_nodev() {
+        use std::io::{Read as _, Write as _};
+
+        const EACCES: i32 = 13;
+        for (rel, _, _) in FAKE_DEVICES {
+            let err = std::fs::File::open(format!("/{rel}")).expect_err("must not open on nodev");
+            assert_eq!(err.raw_os_error(), Some(EACCES), "/{rel}");
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("open /dev/null")
+            .write_all(b"discarded")
+            .expect("write /dev/null");
+        let mut buf = [0xffu8; 16];
+        std::fs::File::open("/dev/zero")
+            .expect("open /dev/zero")
+            .read_exact(&mut buf)
+            .expect("read /dev/zero");
+        assert_eq!(buf, [0u8; 16]);
+
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").expect("read mountinfo");
+        let options_at = |target: &str| -> Vec<String> {
+            let lines: Vec<_> = mountinfo
+                .lines()
+                .filter(|l| l.split_whitespace().nth(4) == Some(target))
+                .collect();
+            assert_eq!(lines.len(), 1, "exactly one mount at {target}");
+            lines[0]
+                .split_whitespace()
+                .nth(5)
+                .expect("options")
+                .split(',')
+                .map(str::to_string)
+                .collect()
+        };
+        assert!(
+            options_at("/").iter().any(|o| o == "nodev"),
+            "/ must be nodev"
+        );
+        assert!(
+            !options_at("/dev").iter().any(|o| o == "nodev"),
+            "/dev must not be nodev"
+        );
     }
 
     /// pivot 後の `/dev/pts`（独立した devpts）と `/dev/ptmx` の照合（#1656。CORE-1・SEC-1）。

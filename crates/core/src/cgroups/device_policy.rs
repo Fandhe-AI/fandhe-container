@@ -497,7 +497,7 @@ mod dry_run {
 mod tests {
     use super::dry_run::{BpfCall, BpfScript, install, take_calls};
     use super::*;
-    use crate::cgroups::CgroupName;
+    use crate::cgroups::{CGROUP_VERIFIER_LOG_MAX_BYTES, CgroupName};
     use crate::observability::OpName;
     use crate::traits::ContainerId;
     use std::collections::VecDeque;
@@ -762,6 +762,100 @@ mod tests {
             let (r, _) = run(DevicePolicyMode::Rootful, 0);
             assert_eq!(err_of(r), (code, step));
         }
+    }
+
+    fn load_err(cause: SysError, verifier_log: Option<&str>) -> CgroupError {
+        let _g = install(BpfScript {
+            load: Err(bpf::BpfProgLoadError {
+                cause,
+                verifier_log: verifier_log.map(str::to_owned),
+            }),
+            ..BpfScript::default()
+        });
+        run(DevicePolicyMode::Rootful, 0).0.unwrap_err()
+    }
+
+    /// SEC-1・REPAIR-4・TASK-32（PR #1705 事後監査 P3-4）: verifier ログは改行・制御文字を空白へ置換した
+    /// 1 行で持ち、message には入れない。`EACCES` の拒否も `EINVAL` と同じく `Internal`。
+    #[test]
+    fn sec1_repair4_task32_verifier_log_is_one_line_and_kept_out_of_message() {
+        let e = load_err(SysError::Os(sys::EACCES), Some("a\nb\x1b[0m\u{202e}c"));
+        assert_eq!(
+            (e.code, e.step),
+            (ErrorCode::Internal, CgroupStep::LoadDeviceProgram)
+        );
+        assert_eq!(e.verifier_log(), Some("a b [0m c"));
+        assert_eq!(
+            e.message,
+            "BPF_PROG_LOAD: errno 13: the verifier rejected the device program \
+             (verifier log withheld from this message)"
+        );
+    }
+
+    /// SEC-1・REPAIR-4・TASK-32（P3-4）: `from_utf8_lossy` の置換等で 4096 バイトを超える写しは、UTF-8 の
+    /// 文字境界で 4096 バイト以下に切る（2 バイト文字 2049 個 = 4098 バイト → 2048 個 = 4096 バイト）。
+    #[test]
+    fn sec1_repair4_task32_verifier_log_is_bounded_to_4096_bytes() {
+        let long = "\u{e9}".repeat(2049);
+        assert_eq!(long.len(), 4098);
+        let e = load_err(SysError::Os(sys::EINVAL), Some(&long));
+        let kept = e.verifier_log().unwrap();
+        assert_eq!(
+            (kept.len(), kept.chars().count()),
+            (CGROUP_VERIFIER_LOG_MAX_BYTES, 2048)
+        );
+        assert_eq!(CGROUP_VERIFIER_LOG_MAX_BYTES, 4096);
+    }
+
+    /// SEC-1・ERR 系・TASK-32（PR #1705 事後監査 P3-3）: verifier に届かない失敗は verifier ログを持たない。
+    /// ログ無しの `EACCES` は `PermissionDenied`、シグナル保留中の `EAGAIN`（11）は再試行せず `Internal`。
+    #[test]
+    fn sec1_task32_load_errors_without_verifier_log() {
+        let e = load_err(SysError::Os(sys::EACCES), None);
+        assert_eq!(
+            (e.code, e.message.as_str(), e.verifier_log()),
+            (ErrorCode::PermissionDenied, "BPF_PROG_LOAD: errno 13", None)
+        );
+        let e = load_err(SysError::Os(11), None);
+        assert_eq!(
+            (e.code, e.message.as_str(), e.verifier_log()),
+            (ErrorCode::Internal, "BPF_PROG_LOAD: errno 11", None)
+        );
+        let e = load_err(SysError::Os(sys::EINVAL), None);
+        assert_eq!(e.verifier_log(), None);
+    }
+
+    /// SEC-1・ERR 系・TASK-32（P3-3）: `EPERM` は段ごとに原因の候補（capability・祖先の flags 0・
+    /// seccomp / LSM）を message に書く。ロードは `CAP_BPF` も要る。
+    #[test]
+    fn sec1_task32_eperm_messages_name_the_causes_per_step() {
+        let e = load_err(SysError::Os(sys::EPERM), None);
+        assert_eq!(
+            e.message,
+            "BPF_PROG_LOAD: errno 1 (missing CAP_BPF and CAP_NET_ADMIN, or CAP_SYS_ADMIN, \
+             in the init user namespace; or denied by seccomp/LSM)"
+        );
+        let _g = install(BpfScript {
+            attach: Err(SysError::Os(sys::EPERM)),
+            ..BpfScript::default()
+        });
+        let e = run(DevicePolicyMode::Rootful, 0).0.unwrap_err();
+        assert_eq!(
+            e.message,
+            "BPF_PROG_ATTACH: errno 1 (missing capability, an ancestor cgroup already holds \
+             a flags-0 device program, or denied by seccomp/LSM)"
+        );
+        drop(_g);
+        let _g = install(BpfScript {
+            queries: VecDeque::from([Err(SysError::Os(sys::EPERM))]),
+            ..BpfScript::default()
+        });
+        let e = run(DevicePolicyMode::Rootful, 0).0.unwrap_err();
+        assert_eq!(
+            e.message,
+            "BPF_PROG_QUERY (pre-attach): errno 1 (missing CAP_NET_ADMIN or CAP_SYS_ADMIN \
+             in the init user namespace; or denied by seccomp/LSM)"
+        );
     }
 
     /// REPAIR-4・TASK-32: 全経路が `cgroup.apply_default_device_policy` へ成否つきで記録される。

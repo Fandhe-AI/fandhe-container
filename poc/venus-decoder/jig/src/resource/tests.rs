@@ -383,6 +383,38 @@ fn f5_2b_4a_gpu6_map_blob_success_without_attach() {
     );
 }
 
+/// GPU-6・REPAIR-12（#1645・D2）: map 中の res を attach した ctx の `CTX_DESTROY` は detach だけ行い、map は残す。
+/// その後の `UNMAP_BLOB` と `UNREF` は成功する（暗黙の detach が効いている）。
+#[test]
+fn f5_2b_4b_gpu6_ctx_destroy_keeps_mapping_and_allows_unmap_then_unref() {
+    let mut a = with_blob7();
+    assert!(run(&mut a, &map_req(7, PAGE, 40)).shmem.is_some());
+    assert_eq!(ty(&mut a, &res_req(CMD_CTX_ATTACH_RESOURCE, 1, 7, 32)), OK);
+    assert_eq!(ty(&mut a, &hdr(CMD_CTX_DESTROY, 0, 1, 24)), OK);
+    assert_eq!(a.mapped_offset(7), Some(4096));
+    assert_eq!(a.resource_size(7), Some(8192));
+    let op = run(&mut a, &unmap_req(7, 32)).shmem.expect("unmap op");
+    assert_eq!(
+        (op.kind, op.shm_offset, op.len),
+        (ShmemOpKind::Unmap, 4096, 8192)
+    );
+    assert_eq!(a.mapped_offset(7), None);
+    assert_eq!(ty(&mut a, &res_req(CMD_RESOURCE_UNREF, 0, 7, 32)), OK);
+    assert_eq!(a.resource_size(7), None);
+}
+
+/// GPU-6・REPAIR-12（#1645・D1）: map 中の `UNREF` は拒否し、資源表（大きさ・map）は変わらない。
+#[test]
+fn f5_2b_4b_gpu6_unref_while_mapped_keeps_table_unchanged() {
+    let mut a = with_blob7();
+    assert!(run(&mut a, &map_req(7, PAGE, 40)).shmem.is_some());
+    let before = a.clone();
+    assert_eq!(ty(&mut a, &res_req(CMD_RESOURCE_UNREF, 0, 7, 32)), BAD);
+    assert_eq!(a, before);
+    assert_eq!(a.mapped_offset(7), Some(4096));
+    assert_eq!(a.resource_size(7), Some(8192));
+}
+
 #[test]
 fn f5_2b_4a_gpu6_map_blob_carries_fence() {
     let mut a = with_blob7();

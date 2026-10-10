@@ -5383,16 +5383,97 @@ mod tests {
         }
     }
 
-    /// `path` が呼び出しスレッドの mount namespace でマウントポイントか（`/proc/self/mountinfo` の 5 列目と完全一致）。
-    /// 一時領域のパスは空白等のエスケープ対象を含まない前提（`fandhe-open-tree-…` で作る）。
+    /// `path` が呼び出しスレッドの mount namespace でマウントポイントか（`/proc/self/mountinfo` の 5 列目を
+    /// [`unescape_mountinfo_field`] で戻した値と、正規化したパスのバイト列が完全一致）。`TMPDIR` が空白・タブ・
+    /// 改行・`\` を含んでも誤判定しない（カーネルはこれらを 8 進エスケープして出力する）。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn is_mount_point(path: &std::path::Path) -> bool {
+        use std::os::unix::ffi::OsStrExt as _;
         let real = std::fs::canonicalize(path).expect("canonicalize");
-        let real = real.to_str().expect("utf8 path");
-        std::fs::read_to_string("/proc/self/mountinfo")
+        let real = real.as_os_str().as_bytes();
+        // バイト列のまま読む（他のマウントポイントが UTF-8 でなくても panic しない）。
+        std::fs::read("/proc/self/mountinfo")
             .expect("read mountinfo")
-            .lines()
-            .any(|l| l.split(' ').nth(4) == Some(real))
+            .split(|&c| c == b'\n')
+            .filter_map(|l| l.split(|&c| c == b' ').nth(4))
+            .any(|field| unescape_mountinfo_field(field) == real)
+    }
+
+    /// mountinfo の 1 列を戻す。カーネル（fs/proc_namespace.c の `show_mountinfo` → `seq_path_root` の
+    /// `" \t\n\\"`）は空白・タブ・改行・`\` を `\` + 8 進 3 桁（`\040`・`\011`・`\012`・`\134`）で出力する。
+    /// 1 回の走査で戻し、戻した結果は再走査しない（`\134040` は `\040` の 4 バイトになる）。`\` の後が 8 進
+    /// 3 桁でなければそのまま残す（カーネルはそうした列を出さない）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn unescape_mountinfo_field(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while let Some(&b) = bytes.get(i) {
+            let octal = bytes
+                .get(i + 1..i + 4)
+                .filter(|d| b == b'\\' && d.iter().all(|c| (b'0'..=b'7').contains(c)))
+                .map(|d| d.iter().fold(0u32, |acc, c| acc * 8 + u32::from(c - b'0')))
+                .and_then(|v| u8::try_from(v).ok());
+            match octal {
+                Some(v) => {
+                    out.push(v);
+                    i += 4;
+                }
+                None => {
+                    out.push(b);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// CORE-6・REPAIR-12（TASK-29 追補・#1659）: mountinfo の 8 進エスケープ（空白 `\040`・タブ `\011`・
+    /// 改行 `\012`・`\` の `\134`）を具体値で戻す。1 回だけ戻し（`\134040` → `\040`）、8 進 3 桁でない
+    /// `\` の並びと 255 を超える値（`\777`）はそのまま残す。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core6_unescape_mountinfo_field_decodes_octal_escapes_once() {
+        assert_eq!(
+            unescape_mountinfo_field(b"/tmp/plain"),
+            b"/tmp/plain".to_vec()
+        );
+        assert_eq!(
+            unescape_mountinfo_field(b"/tmp/a\\040b"),
+            b"/tmp/a b".to_vec()
+        );
+        assert_eq!(
+            unescape_mountinfo_field(b"/t\\011m\\012p"),
+            b"/t\tm\np".to_vec()
+        );
+        assert_eq!(unescape_mountinfo_field(b"/x\\134y"), b"/x\\y".to_vec());
+        assert_eq!(unescape_mountinfo_field(b"/\\134040"), b"/\\040".to_vec());
+        assert_eq!(unescape_mountinfo_field(b"/a\\04"), b"/a\\04".to_vec());
+        assert_eq!(unescape_mountinfo_field(b"/a\\089"), b"/a\\089".to_vec());
+        assert_eq!(unescape_mountinfo_field(b"/a\\777"), b"/a\\777".to_vec());
+        assert_eq!(unescape_mountinfo_field(b"\\"), b"\\".to_vec());
+    }
+
+    /// CORE-6・REPAIR-12（TASK-29 追補・#1659）: 実機前提テストが使う `is_mount_point` を、特権なしで実際の
+    /// `/proc/self/mountinfo` に当てる。`/proc`（procfs のマウントポイント）は真、作ったばかりの一時ディレクトリ
+    /// （空白を含む名前の子を含む）は偽になる。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core6_is_mount_point_reads_real_mountinfo() {
+        assert!(
+            is_mount_point(std::path::Path::new("/proc")),
+            "/proc must be a mount point"
+        );
+        let guard = crate::test_support::TestTempDir::new("sys-mountinfo").expect("temp dir");
+        let spaced = guard.path().join("with space");
+        std::fs::create_dir(&spaced).expect("create dir");
+        assert!(
+            !is_mount_point(&spaced),
+            "fresh dir must not be a mount point"
+        );
+        assert!(
+            !is_mount_point(guard.path()),
+            "fresh dir must not be a mount point"
+        );
     }
 
     /// CORE-6・SEC-5・SEC-1（TASK-29 追補・#1659）: `/dev/null`（文字デバイス 1:3）は期待値 (1, 3) で検証を通り、

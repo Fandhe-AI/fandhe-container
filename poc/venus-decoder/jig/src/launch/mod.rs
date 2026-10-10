@@ -17,7 +17,8 @@
 //!
 //! 接続元の制限（PLUG-12）: accept 直後、セッションに渡す前に `SO_PEERCRED`（`sys::peer_uid`）で接続元 UID を取得し、
 //! 実行ユーザーの effective UID と照合する。不一致・取得失敗は接続を閉じて拒否する（fail-closed。`PEER_UID_MISMATCH` /
-//! `PEER_CRED_UNAVAILABLE`）。加えて、ソケットディレクトリを自 UID 所有・`0700` に限り、ソケットを `0600` にして、
+//! `PEER_CRED_UNAVAILABLE`）。実行ユーザーの euid が overflowuid（既定 65534）なら、マッピング外の接続元と区別できない
+//! ので照合せずに拒否する（`PEER_UID_UNVERIFIABLE`）。加えて、ソケットディレクトリを自 UID 所有・`0700` に限り、ソケットを `0600` にして、
 //! `/` までの祖先を全て検査する。ログの置き場所（親〜`/`）も同じ規則で検査する
 //! （存在しない祖先・symlink・自 UID でも root でもない所有者・グループ／他者が書けて sticky でないディレクトリが
 //! あれば拒否。別 UID が祖先を rename や新規作成で差し替えて bind・chmod・削除・ログ作成を未検証の場所へ向けるのを
@@ -293,8 +294,21 @@ fn check_path_collision(
     Ok(())
 }
 
+/// カーネルの overflowuid の既定値（`/proc/sys/kernel/overflowuid`）。user namespace の外の、マッピングされていない UID は
+/// `SO_PEERCRED` でもこの値に写って見える。
+///
+/// 限界: sysctl で既定値から変えた環境は扱わない（その値で実行している場合の照合は数値の一致だけになる）。
+const OVERFLOW_UID: u32 = 65534;
+
 /// 接続元 UID の照合結果を判定する（PLUG-12）。取得失敗と不一致はどちらも拒否（fail-closed）。
+///
+/// 実行ユーザーの effective UID が [`OVERFLOW_UID`] のとき（マッピング外の user namespace 内・nobody 実行等）は、
+/// マッピング外の接続元も同じ値に見えて区別できないので、照合の前に `PEER_UID_UNVERIFIABLE` で拒否する（fail-closed）。
+/// `crates/plugin` の `uds_security` は overflowuid を特別扱いしない（#1390）が、治具は事後監査（PR #1611）に従い拒否する。
 fn verify_peer(peer: Result<u32, sys::SysError>, expected: u32) -> Result<(), LaunchError> {
+    if expected == OVERFLOW_UID {
+        return Err(LaunchError::new(LaunchErrorCode::PeerUidUnverifiable));
+    }
     match peer {
         Ok(u) if u == expected => Ok(()),
         Ok(_) => Err(LaunchError::new(LaunchErrorCode::PeerUidMismatch)),

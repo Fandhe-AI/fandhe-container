@@ -9,18 +9,27 @@ name: CI
 # ci.yml から取り込み済み。
 # ruleset（branch protection）の必須チェックには、implement-issue-tree の自動マージ前
 # ゲート（G0。PR 上の全 check-run context が必須チェックに含まれることを要求する）に
-# 適合させるため、本 workflow が生成する check-run 29 件（ci-complete・
-# lint-docs / * 5 件・rust-ci (<os>) / * 15 件・rust-ci-default-features (<os>) 3 件・
-# integration-test (<os>) 3 件・bench-regression 1 件・aarch64-linux-check 1 件）を
-# すべて個別に登録済み（aarch64-linux-check を除く 28 件はオーナー判断 2026-09-27。
-# TASK-86.2〔#36〕の integration-test (<os>) 3 件・TASK-86.3〔#37〕の
-# bench-regression 1 件を含む。aarch64-linux-check（#1120）は 2026-09-29 に
-# #4 の自律開発方針に基づき main セッションが登録済み。下の ci-complete・
-# integration-test・bench-regression・aarch64-linux-check ジョブのコメントを参照）。
-# 件数の範囲に注意: 29 件は本 workflow 分のみで、ruleset の必須チェック全体は
-# 計 33 件（2026-10-08 時点）。差の 4 件は本 workflow の外が生成するもので、
+# 適合させるため、本 workflow が pull_request で生成する check-run 14 件（ci-complete・
+# lint-docs / * 5 件・rust-ci (ubuntu-latest) / * 5 件・platform-ci (ubuntu-latest) 1 件・
+# bench-regression 1 件・cross-target-check 1 件）をすべて個別に登録する。
+# push（main）・workflow_dispatch では platform-ci が 3 OS になり 16 件
+# （platform-ci (macos-latest)・platform-ci (windows-latest) が加わる）。
+# 2026-10-10 に macOS ランナーの同時実行枠（1 枠程度）待ちで全 PR の CI が詰まったため、
+# オーナー承認のもとで 3 OS のジョブを 2 段階で再構成した。
+# - 1 段階目（#1724）: rust-ci は ubuntu のみ・rust-ci-default-features と integration-test は
+#   platform-ci へ統合（1 回の CI の macOS ジョブは 7 本から 1 本）。再構成前は 29 件
+#   （rust-ci (<os>) / * 15 件・rust-ci-default-features (<os>) 3 件・integration-test (<os>) 3 件を含む）
+# - 2 段階目: pull_request では macOS・Windows のネイティブランナーを使わない（platform-ci は
+#   ubuntu のみ）。代わりに cross-target-check（旧 aarch64-linux-check を拡張）が Linux 上で
+#   macOS・Windows 向けの型検査を行う。macOS・Windows のネイティブ実行は main への push と
+#   workflow_dispatch（release 前の 3 OS 確認を含む）で行う（ci.md「3 OS CI」）
+# 差し替えの ruleset 更新は main セッションが行う（下の ci-complete ジョブのコメント参照）。
+# ruleset に登録するのは PR で生成される 14 件で、push（main）だけで生成される
+# platform-ci (macos-latest|windows-latest) は登録しない（登録すると PR が永久に待ちになる）。
+# 件数の範囲に注意: 14 件は本 workflow 分のみで、ruleset の必須チェック全体は
+# 本 workflow 分に本 workflow の外が生成する 4 件を足した 18 件になる。外の 4 件は
 # ai-review.yml の codex / preflight・codex / review・codex / post_feedback 3 件と、
-# 外部 GitHub App の Cursor Bugbot 1 件（いずれも登録済み）。数え方: 本 workflow 分は
+# 外部 GitHub App の Cursor Bugbot 1 件。数え方: 本 workflow 分は
 # PR の `gh pr checks <PR> --json name,workflow` を workflow 名 CI で絞った件数、
 # ruleset 全体は ruleset の required_status_checks の件数
 # ジョブの追加・改名・matrix 変更で check-run 名が変わる場合は ruleset 側も
@@ -30,7 +39,7 @@ on:
     inputs:
       hang-probe:
         description: >-
-          true にすると、integration-test ジョブでリポ外の使い捨て crate に
+          true にすると、platform-ci ジョブでリポ外の使い捨て crate に
           仕込んだハングするテストを実行し、REPAIR-5（タイムアウト保護）が
           実際に fail することを実証する（TASK-86.2）。既定 false では通常の
           結合試験を実行する。PR・push イベントではこの入力自体が存在しない
@@ -46,7 +55,12 @@ permissions:
 
 concurrency:
   # PR ごとに一意な番号を group に含める（head_ref のみだと fork 間で同名ブランチの
-  # 別 PR が同一グループになり、互いの CI を cancel し合う）
+  # 別 PR が同一グループになり、互いの CI を cancel し合う）。
+  # push（main）では group が `CI-refs/heads/main` になり、cancel-in-progress により main への
+  # 新しい push は実行中の古い main の CI（macOS・Windows のネイティブ実行を含む 3 OS）を
+  # 取り消す。取り消された commit の macOS・Windows の結果は残らず、OS 固有の実行時の誤りは
+  # 後続 commit の main の CI（最新 commit を含む 3 OS 実行）で検出する（オーナー承認の挙動。
+  # ci.md「3 OS CI」）。workflow_dispatch を main へ向けて起動した場合も同じ group になる
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
@@ -64,10 +78,11 @@ jobs:
   # `lint-docs / lint-docs-complete`（fail-closed。各 lint ジョブは boolean input の
   # if: を持つ条件付きジョブとして明示リストで skipped を判定する）で単一の result に
   # まとめられているため、本 workflow からは `needs.lint-docs.result` を信頼できる
-  # 単一値として扱える。rust-ci・rust-ci-default-features は 3 OS matrix のため
-  # OS ごとに別名のチェックが生成される。本 workflow 内の集約ジョブ
-  # `ci-complete`（下部）は lint-docs・rust-ci・rust-ci-default-features・
-  # integration-test・bench-regression・aarch64-linux-check の結果をまとめて fail-closed 判定する
+  # 単一値として扱える。rust-ci（ubuntu 1 要素の matrix）・platform-ci（pull_request では
+  # ubuntu 1 要素、push（main）・workflow_dispatch では 3 OS の matrix）は
+  # matrix の値ごとに別名のチェックが生成される。本 workflow 内の集約ジョブ
+  # `ci-complete`（下部）は lint-docs・rust-ci・platform-ci・
+  # bench-regression・cross-target-check の結果をまとめて fail-closed 判定する
   # ゲートとして残しつつ、ruleset（branch protection）の
   # 必須チェックには本 workflow が生成する check-run（`ci-complete` を含む全件）を
   # 個別に登録している（冒頭コメント参照。implement-issue-tree の自動マージ前ゲート
@@ -97,11 +112,17 @@ jobs:
   # reusable workflow 側の `test` ジョブが `cargo test --workspace --all-features` を
   # continue-on-error 無しで実行し、集約ジョブ `rust-base-ci-complete` が
   # fmt/clippy/test/deny 各ジョブの result を明示チェックしてフェイルクローズで判定する
-  # （本呼び出しからは `rust-ci (<os>) / rust-base-ci-complete` として見える）。
+  # （本呼び出しからは `rust-ci (ubuntu-latest) / rust-base-ci-complete` として見える）。
   #
-  # 3 OS 一級対応（macOS・Windows・Linux）: 各ネイティブ runner で rust-base-ci
-  # （fmt/clippy/test/deny）をそれぞれ実行する。fail-fast: false は 1 OS の失敗で
-  # 他 OS の実行を打ち切らせないため（3 OS すべての結果を必ず得る）。
+  # ubuntu-latest のみで実行する（2026-10-10 のジョブ再構成・オーナー承認）: reusable は
+  # 呼び出し 1 回で fmt / clippy / test / deny / complete の 5 ジョブを生み、3 OS matrix では
+  # macOS ジョブが 5 本になって macOS ランナーの同時実行枠（1 枠程度）を占有していた。
+  # fmt・deny は結果が OS に依らず、macOS・Windows の `--all-features` の clippy / test は
+  # platform-ci ジョブ（下記）のステップとして同じコマンドで実行する（platform-ci の macOS・
+  # Windows は push（main）・workflow_dispatch のみ。pull_request では cross-target-check の
+  # 型検査が代わる。ci.md「3 OS CI」）。
+  # matrix を ubuntu 1 要素で残すのは、check-run 名を `rust-ci (ubuntu-latest) / ...` のまま
+  # 保ち、ruleset（必須チェック）の差し替えを macOS・Windows 分の削除だけに留めるため。
   #
   # deny ジョブ（REPAIR-7 ステージ 5: セキュリティチェック・依存監査。TASK-86.4・#38）は
   # 次の 4 種を `make deny` と同一集合で実行する。
@@ -115,14 +136,14 @@ jobs:
   # 判断してもらう
   rust-ci:
     strategy:
-      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # 1 要素の matrix（check-run 名の `(ubuntu-latest)` を保つため。上記コメント参照）
+        os: [ubuntu-latest]
     uses: Fandhe-AI/actions/.github/workflows/rust-base-ci.yml@latest
     permissions:
       contents: read
     with:
-      # 3 OS matrix。matrix.os をそのまま runner-label へ渡す
+      # matrix.os をそのまま runner-label へ渡す
       # （public リポジトリの GitHub ホステッド runner 方針は維持）
       runner-label: ${{ matrix.os }}
       # make deny（Makefile の deny ターゲット）と同一のチェック集合。
@@ -141,20 +162,55 @@ jobs:
       # workflow 側が OS ごとに分離する）。ホステッド runner は毎回まっさらなため、
       # 無効のままだと各ジョブが依存クレートを毎回フルビルドすることになる。
       # cache-key-prefix は他リポジトリとの衝突回避のため本リポ名にする。
-      #
-      # windows-latest のみ cache を無効化する: rust-base-ci.yml（Fandhe-AI/actions）の
-      # 「workspace メンバー成果物を prune（cache 保存前・cache 有効時のみ）」ステップが
-      # windows-latest（git-bash/MSYS）環境で正当な crate 名を「想定外の crate / target 名」
-      # と誤検出して fail する既知の問題がある（fandhe-browser PR #409 で実測）。
-      # 上流で修正され次第この条件式は削除してよい
-      cache: ${{ matrix.os != 'windows-latest' }}
+      # 以前は windows-latest のみ無効化していた（reusable の prune ステップが Windows で
+      # 誤検出する既知の問題。fandhe-browser PR #409）が、ubuntu のみの実行になったため
+      # 条件式は不要になった
+      cache: true
       cache-key-prefix: fandhe-container
 
   # --------------------------------------------------
-  # rust-ci-default-features（既定 feature でのローカルゲート再現）
+  # platform-ci（ネイティブのビルド・テスト・タイムアウト保護付き結合試験。REPAIR-7 ステージ 1〜3）
   # --------------------------------------------------
-  # 上記 rust-ci（reusable workflow）は `cargo clippy/test --all-features` で
-  # 検証するため、既定 feature（`--all-features` なし）の構成は別途検証されない。
+  # 実行 OS はイベントで切り替える（2026-10-10 の 2 段階目の再構成・オーナー承認）:
+  # - pull_request: ubuntu-latest のみ（macOS・Windows のネイティブランナーを使わない）。
+  #   macOS・Windows 向けのコンパイル・lint の誤りは cross-target-check（Linux 上の型検査）で
+  #   PR ごとに検出する
+  # - push（main）・workflow_dispatch: ubuntu・macos・windows の 3 OS（従来どおり全ステップ。
+  #   macOS・Windows の `--all-features` の clippy / test を含む）。release 前の 3 OS 確認は
+  #   workflow_dispatch で本 workflow を実行して行う
+  # PR で見落とすのは macOS・Windows 固有の実行時の誤り（テストの失敗・BSD / Git Bash のツール差）で、
+  # main への push 後の 3 OS 実行で検出する（rustdoc のリンクは cross-target-check が PR で検出する）。
+  # main への新しい push は古い main の実行を取り消す（concurrency のコメント参照）。
+  # check-run 名 `platform-ci (ubuntu-latest)` はどのイベントでも変わらない。
+  #
+  # 2026-10-10 のジョブ再構成（オーナー承認）で、旧 rust-ci-default-features（既定 feature の
+  # ローカルゲート再現）と旧 integration-test（タイムアウト保護された結合試験）を 1 つの
+  # 3 OS matrix ジョブへ統合し、macOS・Windows では rust-ci（reusable。ubuntu のみになった）が
+  # 担っていた `--all-features` の clippy / test もステップとして実行する。
+  # 統合の理由: macOS ランナーは同時実行枠が 1 枠程度しかなく、1 回の CI で macOS ジョブが
+  # 7 本（rust-ci の 5 本＋旧 2 ジョブ）並んで全 PR の CI が待ち行列で詰まったため。各ジョブ
+  # 自体は 2〜5 分で、問題はジョブ本数だった。ジョブを 1 本にまとめてもステップ・コマンド・
+  # ステップごとの timeout-minutes は旧ジョブのまま移しており、検証範囲は変わらない。
+  # check-run 名は pull_request では `platform-ci (ubuntu-latest)` の 1 件、push（main）・
+  # workflow_dispatch では `platform-ci (<os>)` の 3 件。ruleset へは PR で出る 1 件だけを
+  # 登録する（登録は main セッションが行う）。
+  #
+  # 実行順: 既定 feature のステップ（旧 rust-ci-default-features）→ macOS・Windows の
+  # `--all-features` の clippy / test → 結合試験のステップ（旧 integration-test）。Linux 限定の
+  # AppArmor 緩和は結合試験の通常実行より後ろに置く（下記「unshare_isolation」の項参照）。
+  #
+  # キャッシュ: 旧 rust-ci-default-features・旧 integration-test と同じく actions/cache を
+  # 使わない（毎回コールドビルド）。reusable の cache は Windows で prune ステップが正当な
+  # crate 名を誤検出する既知の問題（fandhe-browser PR #409）があり、本ジョブは reusable を
+  # 経由しないため影響は受けないが、キャッシュの導入は別途の判断とする。
+  # ツールチェーン: reusable は Fandhe-AI/actions/rust-toolchain-setup を使うが、本ジョブは旧 2
+  # ジョブと同じ dtolnay/rust-toolchain（SHA 固定・stable）を使う。
+  #
+  # 以下は旧 rust-ci-default-features の説明（既定 feature 側のステップ）:
+  #
+  # rust-ci（reusable workflow）と本ジョブの macOS・Windows の `--all-features` ステップは
+  # `cargo clippy/test --all-features` で検証するため、既定 feature（`--all-features` なし）の
+  # 構成は別途検証されない。
   #   cargo build --workspace（REPAIR-7 ステージ 1: ビルド・型検査）
   #   cargo clippy --workspace --all-targets -- -D warnings
   #   cargo test --workspace（REPAIR-7 ステージ 2: ユニット / 統合テスト）
@@ -162,20 +218,149 @@ jobs:
   # （いずれも既定 feature）を本 workflow 内で直接実行し、既定 feature 側の回帰も
   # CI で検出できるようにする。Makefile の `lint`/`test`/`doc` ターゲット（既定 feature 用）と
   # 同一コマンドを実行する（`cargo build` は `--locked` を付けず、他ステップと条件を
-  # そろえる）。rust-ci と同じ 3 OS matrix で実行する（既定 feature 構成の OS 依存回帰を
-  # --all-features 側だけでは検出できないため）。
+  # そろえる）。push（main）・workflow_dispatch では 3 OS で実行する（既定 feature 構成の OS 依存
+  # 回帰を --all-features 側だけでは検出できないため）。
   # 生の steps を持つジョブのため、第三者 action は SHA 固定で参照する
   # （`@latest` が許されるのは Fandhe-AI/actions のみ）。
-  rust-ci-default-features:
+  #
+  # 以下は旧 integration-test の説明（結合試験側のステップ）:
+  #
+  # spec の REPAIR-5（PoC-8 の BREAK-1: ACK 未送信、MS-0）は `cargo build` でも
+  # ユニットテストでも検出できず、ハングとしてしか表面化しない。ハングする
+  # テストを有限時間で打ち切り CI を fail させるのが本ジョブの役割
+  # （TASK-86.2・#36）。
+  #
+  # 「結合試験」は Cargo の integration test target（各 crate の `tests/*.rs`。
+  # `cargo metadata` 上で kind が "test" のもの）を指す。lib 内 unit test
+  # （`#[cfg(test)]`）は rust-ci と本ジョブの既定 feature 側ステップ（ステージ 2）が
+  # 既に担っており、ここでは重複させない。
+  #
+  # integration test target が 0 件のまま `cargo test --workspace --test '*'`
+  # を呼ぶと「no test target matches pattern」で非 0 終了するため、実行前に
+  # `cargo metadata` + jq で件数を数え、0 件なら notice を出して成功で終える
+  # （無言の skip にはしない）。jq の失敗は fail-closed で扱う。
+  #
+  # タイムアウトは二段構え: ジョブ全体 60 分（統合前の 2 ジョブ各 30 分の合計に見合う
+  # 多層防御）、実行ステップ 10 分（ハング検出の本体）。テスト 1 件ごとの推奨タイムアウト値
+  # （PoC-8 実測に基づく 5〜10 秒のレンジ）は TASK-87.1（#40）で
+  # FANDHE_CONTAINER_TEST_TIMEOUT_SECS（下記 env）として設定済み。main の 3 OS 実行
+  # （特に macOS/Windows runner のノイズ）を踏まえ上限寄りの 10 秒を採用した。
+  # 値を渡すだけで、これを読んで Duration を組み立て recv_timeout 等へ使うのは
+  # 各テスト側の責務である。消費側は `crates/io/tests/responsiveness.rs` と
+  # `crates/io/tests/break_detection.rs`（いずれも TEST_TIMEOUT_ENV 定数で読む）で
+  # 実装済み。`crates/core/tests/unshare_isolation.rs` も子プロセス待ちで読む。
+  # crash_safety は本値を読まず（自前の試行ループで制御）、他のテストは
+  # 対象テストごとに順次消費側になる（未実装のテストは実装済みを装わない。REPAIR-3）。
+  #
+  # crash_safety（`crates/io/tests/crash_safety.rs`。IO-3・TASK-18.3.1・#827）:
+  # SIGKILL 耐性の結合試験は本ジョブ（PR は ubuntu・main は 3 OS）の既定 CI 集合で実行し、root・KVM・
+  # GPU・WSL2 を要する実機前提テストとしては分離しない（ci.md「実機前提テスト」）。
+  # SIGKILL の対象はテスト自身が起動した子プロセス（crash_test_server）のみで、
+  # UDS は 0700 の一時ディレクトリ内に作るためホストの設定に触れない。カーネル版数
+  # 依存の永続化対応可否は skip ではなくテスト内の分岐で契約として検証する。
+  # Windows は UDS 未対応の段階なので「未対応終了コード」の契約確認のみ行う。
+  # 本 CI が保証しない範囲: 電源断・カーネルクラッシュ後の媒体永続化（IO-2）、
+  # および実測レポート・対照の妥当性判断（TASK-18 の人間担当分）。
+  # crash_safety と crash_test_server は required-features 付きのため、
+  # `--test '*'` の glob は feature が欠けると黙って除外する（fail-open）。
+  # そこで「crash_safety の存在確認」ステップを置き、ビルド・確認・実行の 3 箇所が
+  # 同一の INTEGRATION_TEST_FEATURES を参照する形で feature 欠落を検出する。
+  # rust-ci（ubuntu）と本ジョブの macOS・Windows の `--all-features` ステップでも
+  # 同テストは重複して実行される。
+  #
+  # unshare_isolation（`crates/core/tests/unshare_isolation.rs`。CORE-1・SEC-5・
+  # TASK-27.2・#1159）: namespace 分離の実挙動を検証する実機前提テストで、
+  # `harness = false` のため `-- --ignored` を付けたときだけ分離を検証し、付けない
+  # 上記の既定実行では「ignored」を出力して成功終了するだけになる。この穴を塞ぐため、
+  # 既定の結合試験の実行ステップの後ろに Linux 限定の 3 ステップを置いて
+  # `--ignored` 付きで実行する。
+  # - Linux 限定なのは本テストが Linux 専用（`exec` モジュールが非 Linux ではビルド
+  #   対象外で OS 非該当）だからで、ポータブルなテストを特定 OS で飛ばすものではない。
+  # - 新しい check-run を増やさないため別ジョブにせず本ジョブのステップとした
+  #   （ruleset への個別登録が要るため）。
+  # - ubuntu 24.04 以降のランナーは AppArmor の
+  #   `kernel.apparmor_restrict_unprivileged_userns=1` で非特権 user namespace を
+  #   制限する。sudo で rootful 実行する案ではなく、この sysctl を 0 に緩めて非 root
+  #   のまま実行する案を採った。SEC-5 の既定である rootless 経路
+  #   （`RootlessSingleId`）を CI が検証でき、テストバイナリと cargo に特権を
+  #   与えず sudo を固定キーの sysctl 書き込みだけに限れるため。rootful
+  #   （`RootfulHostRoot`）経路は本ステップでは未検証。
+  # - sysctl の変更はジョブ終了で破棄されるエフェメラル VM のカーネル設定に閉じ、
+  #   リポジトリ・secrets・他ジョブへ影響しない。結合試験の実行ステップより後ろに
+  #   置き、他の結合試験の環境を変えない。
+  # - `harness = false` のため `--ignored` が届かなくても exit 0 になる。false-green を
+  #   防ぐため、成功行がログにあることを grep で照合する。
+  #
+  # TASK-87.2（#41）: CI ジョブ全体のハング防止の最終確認について。下記の
+  # ハングプローブ機構自体は TASK-86.2（#36）で実装済み。本 concurrency
+  # グループ（`${{ github.workflow }}-${{ github.event.pull_request.number ||
+  # github.ref }}`・`cancel-in-progress: true`）は `workflow_dispatch` を
+  # `main` ブランチへ向けて起動した場合、`push`（main）トリガーの通常 CI と
+  # 同一グループになり互いを cancel し合う。そのため他エージェントの並列
+  # 自動実装・自動マージが落ち着き、concurrency グループが衝突しないタイミ
+  # ングを選んで実施した: 2026-09-27、main（4469898）に対し
+  # `gh workflow run ci.yml --ref main -f hang-probe=true` を実行。実行時点
+  # で open PR は 0 件・main への直近 push の CI 完了後だったため衝突なし。
+  # run: https://github.com/Fandhe-AI/fandhe-container/actions/runs/36335480476
+  # 当時の integration-test ジョブの 3 OS（ubuntu-latest / macos-latest / windows-latest）
+  # すべてで、実行ステップ「結合試験の実行（ステージ 3・タイムアウト保護。
+  # REPAIR-5 / REPAIR-7）」が「has timed out after 10 minutes」で fail し、
+  # ジョブ全体は開始から約 10〜11 分で終了した（ジョブの timeout-minutes
+  # 30 分に達する前に、詰まらず fail することを確認済み）。今後再実行する
+  # 際も、他エージェントの CI と concurrency グループが衝突しないタイミン
+  # グを選ぶこと。
+  #
+  # ハングプローブ（workflow_dispatch の hang-probe=true）: リポジトリに
+  # ハングするテストを常設せず、$RUNNER_TEMP 配下（リポ外）に依存なしの
+  # 使い捨て crate を都度生成し、同じ実行ステップ・同じ timeout-minutes で
+  # 実行することで「そのステップの timeout で fail する」ことを実証する。
+  # プローブのテストが戻ってきた場合（sleep がタイムアウトより先に終わる等）
+  # は exit 1 で fail させ、プローブ無効化による false-green を防ぐ。
+  #
+  # Windows runner の既定シェルは pwsh のため、bash のヒアドキュメント・
+  # `set -euo pipefail` をそのまま使えるよう defaults.run.shell を明示する。
+  #
+  # 以下のステップのコメント・ステップ名にある「3 OS」「ubuntu・macos・windows」は、
+  # push（main）・workflow_dispatch での実行を指す（pull_request では ubuntu のみ）。
+  platform-ci:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # pull_request では ubuntu のみ、push（main）・workflow_dispatch では 3 OS（上記コメント参照）。
+        # `&&` / `||` の三項相当は両分岐とも空でない文字列リテラルのため取り違えない。
+        # github.event_name は GitHub が設定する値で、利用者の入力を含まない
+        os: >-
+          ${{ fromJSON(github.event_name == 'pull_request'
+          && '["ubuntu-latest"]'
+          || '["ubuntu-latest", "macos-latest", "windows-latest"]') }}
     runs-on: ${{ matrix.os }}
-    # ハングしたジョブの無期限実行を防ぐ多層防御（release.yml の verify と同じ 30 分）
-    timeout-minutes: 30
+    # ハングしたジョブの無期限実行を防ぐ多層防御（統合前の 2 ジョブ各 30 分の合計に見合う値）。
+    # 実測（2026-10-10 時点）は統合前の 2 ジョブの合計で ubuntu 約 8 分・macOS 約 6 分
+    timeout-minutes: 60
     permissions:
       contents: read
+    defaults:
+      run:
+        shell: bash
+    # env の 3 つは旧 integration-test のジョブ env をそのまま移したもの。統合により既定 feature の
+    # `cargo test --workspace` にも FANDHE_CONTAINER_TEST_TIMEOUT_SECS が渡るが、消費側の既定値は
+    # 10 秒（一部の実機前提テストは 20・30 秒）で、旧 integration-test は同じ 10 秒で同じ test
+    # target を実行していたため、挙動の差は実質生じない
+    env:
+      # inputs.hang-probe は workflow_dispatch 以外のイベントでは存在しないため
+      # github.event_name で明示的に絞る。値は env 経由でのみ受け取り、
+      # run: スクリプトへ `${{ }}` を直接埋め込まない（スクリプトインジェクション対策）
+      HANG_PROBE: ${{ github.event_name == 'workflow_dispatch' && inputs.hang-probe == true }}
+      # 個別テスト 1 件ごとの推奨タイムアウト値（秒。PoC-8 実測に基づく
+      # 5〜10 秒のレンジの上限寄り。TASK-87.1・#40・REPAIR-5）。この値を読んで
+      # 使う消費側は `crates/io/tests/responsiveness.rs` と
+      # `crates/io/tests/break_detection.rs`・`crates/core/tests/unshare_isolation.rs` で
+      # 実装済み（REPAIR-3）。crash_safety は
+      # 本値を読まず、他のテストは対象ごとに順次消費側になる
+      FANDHE_CONTAINER_TEST_TIMEOUT_SECS: "10"
+      # crash_safety 等 required-features 付き結合試験を有効化する feature。
+      # ビルド・存在確認・実行の全ステップで同一値を参照する（#827）
+      INTEGRATION_TEST_FEATURES: fandhe-container-io/crash-test-server
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       # REPAIR-7 ステージ 5（セキュリティチェック・依存監査。TASK-86.4・#38）の
@@ -220,12 +405,26 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test（既定 feature）
         run: cargo test --workspace
+      # macOS・Windows の `--all-features` の clippy / test（2026-10-10 の再構成で rust-ci〔reusable
+      # rust-base-ci.yml の clippy / test ジョブ〕から移したもの）。コマンドは reusable と同一
+      # （`--locked` なし）。Linux は rust-ci (ubuntu-latest) が実行するため重複させない。
+      # timeout-minutes は reusable の clippy / test ジョブの既定値（各 30 分）に合わせる
+      - name: cargo clippy（--all-features。macOS・Windows のみ）
+        if: runner.os != 'Linux'
+        timeout-minutes: 30
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: cargo test（--all-features。macOS・Windows のみ）
+        if: runner.os != 'Linux'
+        timeout-minutes: 30
+        run: cargo test --workspace --all-features
       # rustdoc の警告（壊れた intra-doc リンク・private 項目へのリンク等）を -D warnings で fail
       # させる（REPAIR-3・REPAIR-7・#1300）。Makefile の `doc` ターゲット（既定 feature・--no-deps）を
       # そのまま実行する。新ジョブは check-run 名が増えて ruleset の更新が要るため、既定 feature の
       # ローカルゲートを再現する本ジョブへステップとして追加する（check-run 件数は不変）。
-      # 3 OS で実行する: cfg(target_os) 限定の項目へのリンクは OS ごとに解決結果が変わり、Linux
-      # では通るが macOS / Windows でだけ壊れる（またはその逆の）リンクがあるため
+      # push（main）・workflow_dispatch では 3 OS で実行する: cfg(target_os) 限定の項目へのリンクは
+      # OS ごとに解決結果が変わり、Linux では通るが macOS / Windows でだけ壊れる（またはその逆の）
+      # リンクがあるため。pull_request では ubuntu のみのため、macOS / Windows でだけ壊れるリンクは
+      # cross-target-check が aarch64-apple-darwin・x86_64-pc-windows-msvc 向けの cargo doc で検出する
       - name: cargo doc（既定 feature・-D warnings）
         shell: bash
         timeout-minutes: 10
@@ -244,7 +443,8 @@ jobs:
       # crates/plugin-macos（gpu::venus）へ path 依存するため、plugin-macos 側の変更で治具が壊れても
       # 他のステップでは検出できない。依存先の plugin-macos・platform-macos は上の cargo build
       # --workspace が 3 OS でビルドしており、治具自身にも OS 分岐（cfg(target_os)）が無いため、
-      # 本ジョブの 3 OS matrix でそのまま実行する（特定 OS の skip はしない）。実機前提テスト
+      # 本ジョブの matrix でそのまま実行する（特定 OS の skip はしない。pull_request では ubuntu のみで、
+      # macOS 向けの型検査は cross-target-check が aarch64-apple-darwin で行う）。実機前提テスト
       # （tests/real_machine_capset_log.rs）は #[ignore] で既定集合から分離済みで、ここでは走らない。
       # 治具は独自の Cargo.lock を持ち、clippy / test は --locked で lock を固定する（lock が黙って再解決
       # されない）。target は治具ディレクトリ配下（.gitignore 済み）に作る。
@@ -260,142 +460,14 @@ jobs:
       # cargo install --locked で導入する（action は追加しない）。deny.toml に targets の指定が無く、
       # cargo-deny は実行ホストに関係なく全ターゲットの依存グラフを検査するため、結果は OS に依らない。
       # 導入のビルド時間を 3 重に払わないよう ubuntu のみで実行する（ビルド・テストのゲートではなく
-      # 依存監査のため、ci.md の 3 OS 必須の対象外。bench-regression と同じ扱い）
+      # 依存監査のため、ci.md「3 OS CI」の main での 3 OS ネイティブ実行の対象外。bench-regression と同じ扱い）
       - name: venus 試験治具の Cargo.lock の依存監査（cargo deny。ubuntu のみ）
         if: runner.os == 'Linux'
         shell: bash
         timeout-minutes: 20
         run: make deny-poc-venus-jig
 
-  # --------------------------------------------------
-  # integration-test（REPAIR-7 ステージ 3: タイムアウト保護された結合試験）
-  # --------------------------------------------------
-  # spec の REPAIR-5（PoC-8 の BREAK-1: ACK 未送信、MS-0）は `cargo build` でも
-  # ユニットテストでも検出できず、ハングとしてしか表面化しない。ハングする
-  # テストを有限時間で打ち切り CI を fail させるのが本ジョブの役割
-  # （TASK-86.2・#36）。
-  #
-  # 「結合試験」は Cargo の integration test target（各 crate の `tests/*.rs`。
-  # `cargo metadata` 上で kind が "test" のもの）を指す。lib 内 unit test
-  # （`#[cfg(test)]`）は rust-ci / rust-ci-default-features（ステージ 2）が
-  # 既に担っており、ここでは重複させない。
-  #
-  # integration test target が 0 件のまま `cargo test --workspace --test '*'`
-  # を呼ぶと「no test target matches pattern」で非 0 終了するため、実行前に
-  # `cargo metadata` + jq で件数を数え、0 件なら notice を出して成功で終える
-  # （無言の skip にはしない）。jq の失敗は fail-closed で扱う。
-  #
-  # タイムアウトは二段構え: ジョブ全体 30 分（他ジョブと同じ多層防御）、実行
-  # ステップ 10 分（ハング検出の本体）。テスト 1 件ごとの推奨タイムアウト値
-  # （PoC-8 実測に基づく 5〜10 秒のレンジ）は TASK-87.1（#40）で
-  # FANDHE_CONTAINER_TEST_TIMEOUT_SECS（下記 env）として設定済み。3 OS matrix
-  # （特に macOS/Windows runner のノイズ）を踏まえ上限寄りの 10 秒を採用した。
-  # 値を渡すだけで、これを読んで Duration を組み立て recv_timeout 等へ使うのは
-  # 各テスト側の責務である。消費側は `crates/io/tests/responsiveness.rs` と
-  # `crates/io/tests/break_detection.rs`（いずれも TEST_TIMEOUT_ENV 定数で読む）で
-  # 実装済み。`crates/core/tests/unshare_isolation.rs` も子プロセス待ちで読む。
-  # crash_safety は本値を読まず（自前の試行ループで制御）、他のテストは
-  # 対象テストごとに順次消費側になる（未実装のテストは実装済みを装わない。REPAIR-3）。
-  #
-  # crash_safety（`crates/io/tests/crash_safety.rs`。IO-3・TASK-18.3.1・#827）:
-  # SIGKILL 耐性の結合試験は本ジョブ（3 OS）の既定 CI 集合で実行し、root・KVM・
-  # GPU・WSL2 を要する実機前提テストとしては分離しない（ci.md「実機前提テスト」）。
-  # SIGKILL の対象はテスト自身が起動した子プロセス（crash_test_server）のみで、
-  # UDS は 0700 の一時ディレクトリ内に作るためホストの設定に触れない。カーネル版数
-  # 依存の永続化対応可否は skip ではなくテスト内の分岐で契約として検証する。
-  # Windows は UDS 未対応の段階なので「未対応終了コード」の契約確認のみ行う。
-  # 本 CI が保証しない範囲: 電源断・カーネルクラッシュ後の媒体永続化（IO-2）、
-  # および実測レポート・対照の妥当性判断（TASK-18 の人間担当分）。
-  # crash_safety と crash_test_server は required-features 付きのため、
-  # `--test '*'` の glob は feature が欠けると黙って除外する（fail-open）。
-  # そこで「crash_safety の存在確認」ステップを置き、ビルド・確認・実行の 3 箇所が
-  # 同一の INTEGRATION_TEST_FEATURES を参照する形で feature 欠落を検出する。
-  # rust-ci の `--all-features` でも同テストは重複して実行される。
-  #
-  # unshare_isolation（`crates/core/tests/unshare_isolation.rs`。CORE-1・SEC-5・
-  # TASK-27.2・#1159）: namespace 分離の実挙動を検証する実機前提テストで、
-  # `harness = false` のため `-- --ignored` を付けたときだけ分離を検証し、付けない
-  # 上記の既定実行では「ignored」を出力して成功終了するだけになる。この穴を塞ぐため、
-  # 既定の結合試験の実行ステップの後ろに Linux 限定の 3 ステップを置いて
-  # `--ignored` 付きで実行する。
-  # - Linux 限定なのは本テストが Linux 専用（`exec` モジュールが非 Linux ではビルド
-  #   対象外で OS 非該当）だからで、ポータブルなテストを特定 OS で飛ばすものではない。
-  # - 新しい check-run を増やさないため別ジョブにせず本ジョブのステップとした
-  #   （ruleset への個別登録が要るため。本 workflow の check-run は 29 件のまま）。
-  # - ubuntu 24.04 以降のランナーは AppArmor の
-  #   `kernel.apparmor_restrict_unprivileged_userns=1` で非特権 user namespace を
-  #   制限する。sudo で rootful 実行する案ではなく、この sysctl を 0 に緩めて非 root
-  #   のまま実行する案を採った。SEC-5 の既定である rootless 経路
-  #   （`RootlessSingleId`）を CI が検証でき、テストバイナリと cargo に特権を
-  #   与えず sudo を固定キーの sysctl 書き込みだけに限れるため。rootful
-  #   （`RootfulHostRoot`）経路は本ステップでは未検証。
-  # - sysctl の変更はジョブ終了で破棄されるエフェメラル VM のカーネル設定に閉じ、
-  #   リポジトリ・secrets・他ジョブへ影響しない。結合試験の実行ステップより後ろに
-  #   置き、他の結合試験の環境を変えない。
-  # - `harness = false` のため `--ignored` が届かなくても exit 0 になる。false-green を
-  #   防ぐため、成功行がログにあることを grep で照合する。
-  #
-  # TASK-87.2（#41）: CI ジョブ全体のハング防止の最終確認について。下記の
-  # ハングプローブ機構自体は TASK-86.2（#36）で実装済み。本 concurrency
-  # グループ（`${{ github.workflow }}-${{ github.event.pull_request.number ||
-  # github.ref }}`・`cancel-in-progress: true`）は `workflow_dispatch` を
-  # `main` ブランチへ向けて起動した場合、`push`（main）トリガーの通常 CI と
-  # 同一グループになり互いを cancel し合う。そのため他エージェントの並列
-  # 自動実装・自動マージが落ち着き、concurrency グループが衝突しないタイミ
-  # ングを選んで実施した: 2026-09-27、main（4469898）に対し
-  # `gh workflow run ci.yml --ref main -f hang-probe=true` を実行。実行時点
-  # で open PR は 0 件・main への直近 push の CI 完了後だったため衝突なし。
-  # run: https://github.com/Fandhe-AI/fandhe-container/actions/runs/36335480476
-  # integration-test の 3 OS（ubuntu-latest / macos-latest / windows-latest）
-  # すべてで、実行ステップ「結合試験の実行（ステージ 3・タイムアウト保護。
-  # REPAIR-5 / REPAIR-7）」が「has timed out after 10 minutes」で fail し、
-  # ジョブ全体は開始から約 10〜11 分で終了した（ジョブの timeout-minutes
-  # 30 分に達する前に、詰まらず fail することを確認済み）。今後再実行する
-  # 際も、他エージェントの CI と concurrency グループが衝突しないタイミン
-  # グを選ぶこと。
-  #
-  # ハングプローブ（workflow_dispatch の hang-probe=true）: リポジトリに
-  # ハングするテストを常設せず、$RUNNER_TEMP 配下（リポ外）に依存なしの
-  # 使い捨て crate を都度生成し、同じ実行ステップ・同じ timeout-minutes で
-  # 実行することで「そのステップの timeout で fail する」ことを実証する。
-  # プローブのテストが戻ってきた場合（sleep がタイムアウトより先に終わる等）
-  # は exit 1 で fail させ、プローブ無効化による false-green を防ぐ。
-  #
-  # Windows runner の既定シェルは pwsh のため、bash のヒアドキュメント・
-  # `set -euo pipefail` をそのまま使えるよう defaults.run.shell を明示する。
-  integration-test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    defaults:
-      run:
-        shell: bash
-    env:
-      # inputs.hang-probe は workflow_dispatch 以外のイベントでは存在しないため
-      # github.event_name で明示的に絞る。値は env 経由でのみ受け取り、
-      # run: スクリプトへ `${{ }}` を直接埋め込まない（スクリプトインジェクション対策）
-      HANG_PROBE: ${{ github.event_name == 'workflow_dispatch' && inputs.hang-probe == true }}
-      # 個別テスト 1 件ごとの推奨タイムアウト値（秒。PoC-8 実測に基づく
-      # 5〜10 秒のレンジの上限寄り。TASK-87.1・#40・REPAIR-5）。この値を読んで
-      # 使う消費側は `crates/io/tests/responsiveness.rs` と
-      # `crates/io/tests/break_detection.rs`・`crates/core/tests/unshare_isolation.rs` で
-      # 実装済み（REPAIR-3）。crash_safety は
-      # 本値を読まず、他のテストは対象ごとに順次消費側になる
-      FANDHE_CONTAINER_TEST_TIMEOUT_SECS: "10"
-      # crash_safety 等 required-features 付き結合試験を有効化する feature。
-      # ビルド・存在確認・実行の全ステップで同一値を参照する（#827）
-      INTEGRATION_TEST_FEATURES: fandhe-container-io/crash-test-server
-    steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
-        with:
-          toolchain: stable
-
+      # 以下は旧 integration-test のステップ（REPAIR-7 ステージ 3: タイムアウト保護された結合試験）
       - name: integration test target 件数の判定
         id: count
         run: |
@@ -464,7 +536,7 @@ jobs:
           # 実行される状態にする。
           touch "${probe_dir}/src/lib.rs"
           cat > "${probe_dir}/tests/hang.rs" <<'EOF'
-          // integration-test ジョブ（TASK-86.2・REPAIR-5）が実行ステップの
+          // platform-ci ジョブ（TASK-86.2・REPAIR-5）が実行ステップの
           // timeout-minutes で fail することを実証するためだけのプローブ。
           // 戻ってきた場合（timeout より先に sleep が終わる等）はプローブが
           // 機能していないことを意味するため、false-green を防ぐため fail させる。
@@ -516,7 +588,7 @@ jobs:
       # macOS の BSD ツール（timeout 不在・sed / mktemp の差）と Windows の Git Bash（本ジョブ既定の
       # shell: bash）で動くことを確かめる。本ジョブの自己テスト 3 件（PLUG-4・CLI・virtio-gpu）はいずれも
       # make ターゲット経由で起動する（Makefile は SHELL := /bin/bash で、windows runner の make は Git Bash の
-      # bash でレシピを実行する。rust-ci-default-features も windows で make を使う）。
+      # bash でレシピを実行する。本ジョブの既定 feature 側のステップも windows で make を使う）。
       # 新ジョブは check-run 名が増えるため既存ジョブのステップとする（check-run 件数は不変）
       - name: CLI 3 OS 比較スクリプトの自己テスト（TASK-125.1・CLI-1。ubuntu・macos・windows）
         if: env.HANG_PROBE != 'true'
@@ -710,8 +782,8 @@ jobs:
   #
   # ubuntu-latest 単独とし 3 OS matrix にしない: ベンチの数値は OS 間の実行環境
   # （CPU・ノイズ）が異なり比較できないこと、check-run が増えると ruleset
-  # （branch protection）の登録作業が増えることが理由。ci.md の「3 OS 必須」は
-  # ビルド・テストのゲート（rust-ci・rust-ci-default-features）を対象とする規則
+  # （branch protection）の登録作業が増えることが理由。ci.md「3 OS CI」の 3 OS ネイティブ実行は
+  # ビルド・テストのゲート（platform-ci）を対象とする規則
   # であり、ベンチ回帰チェックはその対象外と整理する。
   bench-regression:
     runs-on: ubuntu-latest
@@ -764,12 +836,12 @@ jobs:
       # 計測とログ出力のみ。baseline.json 未登録のため基準値比較はせず、Δp50 の 15% 回帰判定は
       # 上の bench-check-selftest（fixture）でのみ検証している（TASK-113.3・PLUG-5・REPAIR-8）。
       # 実測基準値の登録と bench-check 対象化は TASK-88.h1・TASK-113.h1 待ち。
-      # check-run 名は増やさず既存ジョブのステップとする（本 workflow の check-run 29 件は不変）
+      # check-run 名は増やさず既存ジョブのステップとする（本 workflow の check-run 件数は不変）
       - name: plugin 境界 Δp50 と CORE-10 比の計測ログ（計測とログ出力のみ・性能回帰は未判定。TASK-113.3）
         run: make bench-plugin-boundary
       # core の既定 / plugin 除外（--no-default-features）release ビルドと成果物サイズの記録
       # （PLUG-3・TASK-111.2・#263）。新ジョブは check-run 名が増え ruleset 変更が要るため
-      # 既存ジョブのステップとする（本 workflow の check-run 29 件は不変）。計測対象は rlib（最終バイナリ未実装。
+      # 既存ジョブのステップとする（本 workflow の check-run 件数は不変）。計測対象は rlib（最終バイナリ未実装。
       # TASK-79 後に実行ファイルへ切り替える）で、差は僅少のため軽量化効果の実測ではない
       - name: plugin feature 除外ビルドとサイズ記録（PLUG-3・TASK-111.2）
         shell: bash
@@ -778,7 +850,7 @@ jobs:
           make plugin-feature-size | tee -a "${GITHUB_STEP_SUMMARY}"
 
       # PLUG-4（TASK-109.4）: plugin 追加前後の別ビルドで core の指紋（ソース一覧・依存木・rlib sha256）を比較する。
-      # スクリプトの自己テストは integration-test ジョブ（ubuntu・macos・windows の 3 OS）で実行する。
+      # スクリプトの自己テストは platform-ci ジョブ（pull_request は ubuntu、main は 3 OS）で実行する。
       # 既存ジョブのステップとして追加（check-run 件数は不変）
       - name: plugin 追加前後の core 不変性（PLUG-4・TASK-109.4）
         shell: bash
@@ -798,44 +870,69 @@ jobs:
           make plug4-core-invariance
 
   # --------------------------------------------------
-  # aarch64-linux-check（Linux aarch64 向けクロス型検査: #1120・REPAIR-7 第 1 段階を補うアーキ網羅）
+  # cross-target-check（Linux 上のクロス型検査: aarch64 Linux・macOS・Windows。
+  # #1120・REPAIR-7 第 1 段階を補うアーキ・OS 網羅）
   # --------------------------------------------------
-  # `cfg(target_arch = "aarch64")` 分岐（crates/io/src/sys.rs の SO_PEERCRED 等。
-  # 今後は TASK-38 の seccomp syscall 番号表など）を x86_64 ランナー上で
-  # aarch64-unknown-linux-gnu 向けに型検査し、コンパイルエラーや aarch64 でのみ
-  # 出る警告を PR ごとに検出する。check / clippy のみでリンクもテスト実行もしない
-  # ため、aarch64 での実行時の正しさ（struct ucred のレイアウト等）は保証しない。
-  # ネイティブ arm64 ランナーでのテスト実行は将来の課題（ci.md 参照）。
+  # 旧 aarch64-linux-check（aarch64-unknown-linux-gnu のみ）を拡張したジョブ（2026-10-10 の 2 段階目の
+  # 再構成・オーナー承認）。pull_request では platform-ci が ubuntu のみになり macOS・Windows の
+  # ネイティブランナーを使わないため、x86_64 の ubuntu ランナー上で次の 3 ターゲットを順に型検査し、
+  # OS・アーキ固有のコンパイルエラーと clippy 警告を PR ごとに検出する。
+  #   - aarch64-unknown-linux-gnu: `cfg(target_arch = "aarch64")` 分岐（crates/io/src/sys.rs の
+  #     SO_PEERCRED、seccomp・新マウント API の syscall 番号表等）
+  #   - aarch64-apple-darwin: `cfg(target_os = "macos")` 分岐（platform-macos・plugin-macos の
+  #     objc2 系 FFI 等）。macOS ランナー（GitHub ホステッドの macos-latest）は arm64 のため
+  #   - x86_64-pc-windows-msvc: `cfg(target_os = "windows")` 分岐（platform-windows の windows-sys 等）。
+  #     windows-latest ランナーと同じターゲット
+  # check / clippy / doc のみでリンクもテスト実行もしないため、実行時の正しさ（struct のレイアウト・
+  # OS の挙動差・BSD / Git Bash のツール差）は保証しない。macOS・Windows の実行時の検証は
+  # push（main）・workflow_dispatch の platform-ci（3 OS ネイティブ）が担い、aarch64 Linux での
+  # 実行はネイティブ arm64 ランナーでのテスト実行が将来の課題（ci.md「3 OS CI」参照）。
   #
-  # 外部依存は純 Rust のクレートのみ（serde / serde_json / sha2 と推移依存。
-  # aarch64 Linux では libc・cpufeatures も入る）でネイティブビルドを伴わないため、
-  # クロスリンカ無しで成立する。cc 等ネイティブビルドを
-  # 伴う依存を承認・追加した場合は、cross toolchain かネイティブ arm64 ランナーへ
-  # 切り替えること。--locked・cache を使わないのは rust-ci-default-features と
-  # 条件をそろえるため。ビルド・テストのゲートではなく型検査ゲートのため、
-  # 3 OS matrix・ネイティブランナー規則の対象外とする（bench-regression と同じ整理。
+  # 外部依存は純 Rust のクレートのみ（serde / serde_json / sha2 と推移依存。ターゲットにより
+  # libc・cpufeatures・objc2 系・windows-sys / windows-link も入る）で、build.rs・cc 等のネイティブ
+  # ビルドを伴わないため、クロスリンカ・SDK（macOS SDK・MSVC）無しで成立する（2026-10-10 に
+  # 3 ターゲットとも cargo check / clippy が通ることをローカルで確認）。cc 等ネイティブビルドを
+  # 伴う依存を承認・追加した場合は、cross toolchain か各 OS のネイティブランナーへ切り替えること。
+  # --locked・cache を使わないのは platform-ci と条件をそろえるため。ビルド・テストのゲートでは
+  # なく型検査ゲートのため、ネイティブランナー規則の対象外とする（bench-regression と同じ整理。
   # ci.md「3 OS CI」参照）。
   #
-  # 実コマンドは `cargo check|clippy --workspace --all-targets --all-features
-  # --target aarch64-unknown-linux-gnu`（AGENTS.md と一致）。--all-features を付けるのは、
+  # 実コマンドはターゲットごとに `cargo check|clippy --workspace --all-targets --all-features
+  # --target <target>`（AGENTS.md と一致。旧 aarch64-linux-check と同じ形）。--all-features を付けるのは、
   # required-features を持つ target（crates/io の crash_test_server bin・crash_safety test）、
   # `#![cfg(feature = "wsl2-test-support")]` の結合試験、exec-test-support の入口を
   # 型検査の対象に入れるため。feature は io の crash-test-server、core の
   # default = ["plugin"]・plugin・escape-probe・exec-test-support、supervisor の
   # exec-test-support、platform-windows の wsl2-test-support。exec-test-support は
   # 最適化ビルドで compile_error! になるが、check / clippy は dev プロファイルなので影響しない。
-  # 未検査の範囲（REPAIR-3）: cfg(not(feature = "exec-test-support")) 分岐
-  # （supervisor/tests/exec_setns_join.rs・core/tests/exec_child_setup.rs・
-  # core/src/exec/reapply.rs の cfg_attr）と、plugin を無効にした構成
-  # （--no-default-features）は aarch64 では型検査されない。x86_64 でも、lib 側の
-  # cfg_attr（core/src/exec/reapply.rs）は cargo build --workspace が、plugin 無効構成は
+  #
+  # aarch64-apple-darwin・x86_64-pc-windows-msvc の 2 ターゲットには、pull_request で main の platform-ci
+  # （macOS・Windows）の代わりになるよう、既定 feature（--all-features なし）の検査も加える（オーナー指示）:
+  #   - `cargo clippy --workspace --all-targets --target <target> -- -D warnings`（platform-ci の既定 feature の
+  #     clippy〔make lint〕と同じ構成の型検査）
+  #   - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --target <target>`（make doc と同じ構成。
+  #     cfg(target_os) 限定の項目へのリンクが OS ごとに解決結果を変えるため。REPAIR-3・#1300）
+  # rustdoc はターゲット向けの型検査のみでリンクしないため、クロス実行でも SDK は不要。
+  # aarch64-unknown-linux-gnu は旧 aarch64-linux-check と同じ --all-features の check / clippy のみとする。
+  # 未検査の範囲（REPAIR-3）: aarch64 Linux の既定 feature の構成・cfg(not(feature = "exec-test-support"))
+  # 分岐（supervisor/tests/exec_setns_join.rs・core/tests/exec_child_setup.rs・
+  # core/src/exec/reapply.rs の cfg_attr）・plugin を無効にした構成（--no-default-features）は
+  # 本ジョブでは型検査されない（macOS・Windows の plugin 無効構成は main の platform-ci が検査する）。
+  # x86_64 Linux でも、
+  # lib 側の cfg_attr（core/src/exec/reapply.rs）は cargo build --workspace が、plugin 無効構成は
   # make test-core-no-plugin が検査するのみで、テスト側の cfg(not(feature)) 分岐は
   # 自己参照 dev-dependency による feature 統一で常に有効になるため、どの CI ジョブでも
-  # 型検査されない。aarch64 での既定 feature 検査の追加はジョブ構成の変更になるため
-  # 別 Issue で扱う。
-  aarch64-linux-check:
+  # 型検査されない。
+  #
+  # venus 試験治具（poc/venus-decoder/jig。ルート workspace 外。crates/plugin-macos へ path 依存。
+  # GPU-6・TASK-172.4）も aarch64-apple-darwin で型検査する。治具は --workspace の対象外のため、
+  # pull_request で plugin-macos の macOS 専用コードの変更が治具を壊しても他のステップでは
+  # 検出できない（platform-ci の make poc-venus-jig-check は PR では ubuntu のみ）。
+  # 治具の Cargo.lock を固定するため --locked を付ける（make poc-venus-jig-check と同じ）。
+  cross-target-check:
     runs-on: ubuntu-latest
-    # ハングに対する多層防御（rust-ci-default-features と同じ値）
+    # ハングに対する多層防御。旧 aarch64-linux-check（1 ターゲット）の実測は約 1 分で、3 ターゲットと
+    # 治具でも数分の見込み。旧ジョブと同じ値を維持する
     timeout-minutes: 30
     permissions:
       contents: read
@@ -845,22 +942,51 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-          targets: aarch64-unknown-linux-gnu
+          targets: aarch64-unknown-linux-gnu,aarch64-apple-darwin,x86_64-pc-windows-msvc
       - name: cargo check（aarch64-unknown-linux-gnu・クロス型検査）
         run: cargo check --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu
       - name: cargo clippy（aarch64-unknown-linux-gnu）
         run: cargo clippy --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu -- -D warnings
+      - name: cargo check（aarch64-apple-darwin・クロス型検査）
+        run: cargo check --workspace --all-targets --all-features --target aarch64-apple-darwin
+      - name: cargo clippy（aarch64-apple-darwin）
+        run: cargo clippy --workspace --all-targets --all-features --target aarch64-apple-darwin -- -D warnings
+      - name: cargo clippy（aarch64-apple-darwin・既定 feature）
+        run: cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings
+      - name: cargo doc（aarch64-apple-darwin・既定 feature・-D warnings）
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --target aarch64-apple-darwin
+      - name: cargo check（x86_64-pc-windows-msvc・クロス型検査）
+        run: cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-msvc
+      - name: cargo clippy（x86_64-pc-windows-msvc）
+        run: cargo clippy --workspace --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings
+      - name: cargo clippy（x86_64-pc-windows-msvc・既定 feature）
+        run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+      - name: cargo doc（x86_64-pc-windows-msvc・既定 feature・-D warnings）
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --target x86_64-pc-windows-msvc
+      - name: venus 試験治具の cargo check（aarch64-apple-darwin・GPU-6・TASK-172.4）
+        run: >-
+          cargo check --manifest-path poc/venus-decoder/jig/Cargo.toml --locked --all-targets
+          --target aarch64-apple-darwin
+      - name: venus 試験治具の cargo clippy（aarch64-apple-darwin・GPU-6・TASK-172.4）
+        run: >-
+          cargo clippy --manifest-path poc/venus-decoder/jig/Cargo.toml --locked --all-targets
+          --target aarch64-apple-darwin -- -D warnings
 
   # --------------------------------------------------
   # ci-complete（全ジョブ結果の fail-closed 集約ゲート）
   # --------------------------------------------------
-  # lint-docs・rust-ci・rust-ci-default-features・integration-test・
-  # bench-regression・aarch64-linux-check の結果を集約し、いずれかが失敗・キャンセルされれば
-  # 本ジョブも failure にする fail-closed ゲート。rust-ci・
-  # rust-ci-default-features・integration-test は 3 OS matrix ジョブの
-  # ため、needs 上では OS ごとの結果ではなく 1 つの result に集約される
-  # （いずれかの OS が失敗・キャンセルされれば全体が failure / cancelled になる。
-  # fail-fast: false でも集約結果には影響しない）。
+  # lint-docs・rust-ci・platform-ci・bench-regression・cross-target-check の結果を
+  # 集約し、いずれかが失敗・キャンセルされれば本ジョブも failure にする fail-closed ゲート。
+  # rust-ci（ubuntu 1 要素）・platform-ci（pull_request は ubuntu 1 要素、push（main）・
+  # workflow_dispatch は 3 OS）は matrix ジョブのため、needs 上では OS ごとの結果ではなく
+  # 1 つの result に集約される（いずれかの OS が失敗・キャンセルされれば全体が failure /
+  # cancelled になる。fail-fast: false でも集約結果には影響しない）。したがって本ジョブは
+  # pull_request では ubuntu の結果だけを、push（main）・workflow_dispatch では 3 OS すべての
+  # 結果を見る（判定ロジックはイベントで分けない）。
   #
   # ruleset（branch protection）の必須チェックには本ジョブに加え、本 workflow が
   # 生成する check-run 全件を個別に登録する（冒頭コメント参照。implement-issue-tree
@@ -869,24 +995,27 @@ jobs:
   # ruleset の必須チェック一覧も同時に更新すること（更新漏れの影響: 増えた
   # チェックが未登録だと自動マージが G0 で止まる。改名された旧名が必須のまま
   # 残ると新たな check-run が報告されず全 PR がマージ不能になる）。ruleset の
-  # 変更はリポジトリ設定の変更のためオーナー承認を経る。TASK-86.2（#36）の
-  # integration-test (<os>) 3 件・TASK-86.3（#37）の bench-regression 1 件は
-  # いずれも ruleset へ登録済み（オーナー承認 2026-09-27。冒頭コメントの内訳
-  # 〔1 + lint-docs 5 + rust-ci 15 + rust-ci-default-features 3 +
-  # integration-test 3 + bench-regression 1 + aarch64-linux-check 1 = 29〕と
-  # 一致させる）。#1120 の aarch64-linux-check 1 件も 2026-09-29 に ruleset へ
-  # 登録済み（#4 の自律開発方針に基づき main セッションが登録）。
-  # なお ruleset の必須チェック全体は 33 件で、29 件に ai-review.yml の codex 3 件と
-  # 外部 App の Cursor Bugbot 1 件（本 workflow の外）を足した値（冒頭コメント参照）。
+  # 変更はリポジトリ設定の変更のためオーナー承認を経る。
+  # 本 workflow の check-run の内訳は pull_request で 1 + lint-docs 5 + rust-ci (ubuntu-latest) 5 +
+  # platform-ci (ubuntu-latest) 1 + bench-regression 1 + cross-target-check 1 = 14、push（main）・
+  # workflow_dispatch では platform-ci が 3 件になり 16（冒頭コメントと一致させる）。
+  # 2 段階目の再構成（pull_request で macOS・Windows のネイティブランナーを使わない。オーナー承認）で、
+  # ruleset から platform-ci (macos-latest)・platform-ci (windows-latest)・aarch64-linux-check を外し、
+  # cross-target-check を足す（差し替えは main セッションが行う）。
+  # 2026-10-10 のジョブ再構成（macOS ランナー待ちの解消。オーナー承認）で、旧構成の
+  # rust-ci (macos-latest|windows-latest) / * 10 件・rust-ci-default-features (<os>) 3 件・
+  # integration-test (<os>) 3 件を platform-ci (<os>) 3 件へ差し替えた（ruleset の差し替えは
+  # main セッションが行う）。ruleset の必須チェック全体は、PR の 14 件に ai-review.yml の codex 3 件と
+  # 外部 App の Cursor Bugbot 1 件（本 workflow の外）を足した 18 件（冒頭コメント参照）。
+  # platform-ci は if: を持たない（常に実行される）ため、allow_skipped には入れない。
   ci-complete:
     needs:
       [
         lint-docs,
         rust-ci,
-        rust-ci-default-features,
-        integration-test,
+        platform-ci,
         bench-regression,
-        aarch64-linux-check,
+        cross-target-check,
       ]
     if: always()
     permissions: {}

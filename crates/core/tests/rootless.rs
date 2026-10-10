@@ -34,7 +34,7 @@
 //! # 実機前提テストとしての分離
 //! 非特権 user namespace を許可するホストが必要。`-- --ignored` 指定時のみ実行し、未指定時は「ignored」を
 //! 出力して成功終了する（ci.md「実機前提テスト」。CI 通過のための弱体化ではない）。CI の
-//! `integration-test` への組み込みは別 PR（ci.yml は infra-builder 担当・AppArmor 緩和の
+//! `platform-ci` への組み込みは別 PR（ci.yml は infra-builder 担当・AppArmor 緩和の
 //! `sudo sysctl` は root 権限コマンド）。実行された場合は拒否を含むあらゆる失敗を失敗として扱い、検証せずに
 //! 成功する分岐は持たない。
 //!

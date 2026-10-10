@@ -229,9 +229,8 @@ impl CliExit {
 
 const USAGE_MESSAGE: &str = "usage: fandhe-container <create|start|stop|delete|list|logs|setup>";
 const STATE_ROOT_PARENT_NOT_FOUND_MESSAGE: &str = "parent of the state root not found";
-/// 回復手段（core の `purge_corrupted`）を管理操作名で示す。CLI に purge サブコマンドは無い（実在しない名を案内しない）。
-const STATE_STORE_CORRUPTED_MESSAGE: &str =
-    "state store has a corrupted record; recover it with the purge_corrupted management operation";
+/// 回復手段（core の `purge_corrupted`）を管理操作名で示す。通常ファイルの entry や中身のある state.json ディレクトリは core が FailedPrecondition で拒否するため、拒否時は管理者による確認・手動回復を促す（core の削除防御は維持）。CLI に purge サブコマンドは無い（実在しない名を案内しない）。
+const STATE_STORE_CORRUPTED_MESSAGE: &str = "state store has a corrupted record; recover it with the purge_corrupted management operation, or if that is refused, ask an administrator to inspect and repair it manually";
 const UNIMPLEMENTED_MESSAGE: &str = "command is not implemented yet";
 
 /// [`CliExit::failed`] の固定文言表。引用符・バックスラッシュ・制御文字を含まない定数のみ（テストで固定）。
@@ -522,7 +521,7 @@ mod tests {
             ),
             (
                 CliExit::state_store_corrupted(ErrorCode::Internal),
-                "{\"code\":\"INTERNAL\",\"message\":\"state store has a corrupted record; recover it with the purge_corrupted management operation\"}\n",
+                "{\"code\":\"INTERNAL\",\"message\":\"state store has a corrupted record; recover it with the purge_corrupted management operation, or if that is refused, ask an administrator to inspect and repair it manually\"}\n",
             ),
         ] {
             let mut out = Counting(Vec::new());
@@ -872,7 +871,7 @@ mod tests {
             assert_eq!(o.code, Some("INTERNAL"));
             assert_eq!(
                 o.stderr,
-                "{\"code\":\"INTERNAL\",\"message\":\"state store has a corrupted record; recover it with the purge_corrupted management operation\"}\n"
+                "{\"code\":\"INTERNAL\",\"message\":\"state store has a corrupted record; recover it with the purge_corrupted management operation, or if that is refused, ask an administrator to inspect and repair it manually\"}\n"
             );
             assert_eq!(o.stdout, "ID\tSTATUS\tPID\n");
 
@@ -889,7 +888,7 @@ mod tests {
             assert_eq!(o.exit, 6);
             assert_eq!(
                 o.stderr,
-                "{\"code\":\"PERMISSION_DENIED\",\"message\":\"state store has a corrupted record; recover it with the purge_corrupted management operation\"}\n"
+                "{\"code\":\"PERMISSION_DENIED\",\"message\":\"state store has a corrupted record; recover it with the purge_corrupted management operation, or if that is refused, ask an administrator to inspect and repair it manually\"}\n"
             );
         }
 

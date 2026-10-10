@@ -178,6 +178,11 @@ pub use process::{
 #[cfg(all(feature = "exec-test-support", not(test)))]
 #[doc(hidden)]
 pub use process::{StandardFd, close_standard_fds_for_test};
+/// supervisor の結合試験 `tests/exec_audit.rs` 専用の再公開（SEC-4・SEC-1・#1614 の事後監査。通常の利用者は
+/// 呼ばない。詳細は定義側）。`exec-test-support` feature を付けたビルドにだけ存在する。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use reapply::reject_own_root_for_test;
 pub use reapply::{
     ExecReady, ExecRestrictionReport, ExecRestrictions, UnappliedExecRestriction,
     prepare_exec_restrictions, reapply_restrictions,

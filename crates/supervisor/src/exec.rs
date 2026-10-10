@@ -1075,6 +1075,28 @@ pub fn run_in_worker_for_test(
     run_in_worker_with(Deadline::after(timeout), grace, cleanup, |_| work()).map_err(|f| f.error)
 }
 
+/// 結合試験専用の入口: `work` を本番と同じ worker（fork・結果行の pipe・期限）で実行し、親側の記録点
+/// （`audit_worker_result`）まで通す（SEC-4・SUP-6・#1614 の事後監査。`tests/exec_audit.rs`）。
+///
+/// `work` の `ExecError` は本番と同じ `from_exec_error` で写す。対象の特定を要する違反（`rootfs_is_host_root` 等）を
+/// 非特権で起こし、worker の結果行を経た記録を確かめるためだけに使う。`exec-test-support` feature を付けた
+/// ビルドにだけ存在し、本番経路は必ず [`run_command`] 系を使う。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn run_in_worker_audited_for_test(
+    timeout: Duration,
+    work: impl FnOnce() -> Result<ExecOutcome, ExecError>,
+    audit: &dyn AuditSink,
+) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
+    let result = run_in_worker_with(
+        Deadline::after(timeout),
+        WORKER_GRACE,
+        || Ok(()),
+        |_| work().map_err(from_exec_error),
+    );
+    audit_worker_result(result, audit)
+}
+
 /// worker の結果を pipe 用の 1 行へ符号化する。成功は `ok <command|setup> <違反の理由コードまたは -> <exited|signaled>
 /// <値> <適用した rlimit 数> <子へ持ち越した rlimit 数（0 か 1）> <capability 数> <Landlock 数> <seccomp 命令数>
 /// <補助グループの扱い> <その件数> <実行方式（sealed_copy|pinned_inode）> <現行方式の理由コードまたは ->`、失敗は

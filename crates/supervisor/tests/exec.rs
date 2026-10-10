@@ -1113,11 +1113,13 @@ mod linux {
     /// TASK-163 追補（#1459・SEC-1・SEC-4）: コンテナの `/dev/null` が symlink・別のデバイスノード（1:5）へ
     /// 差し替えられていたら、exec の子は差し替え先を開かずに拒否し、コマンドは起動しない（終了コード 126）。
     ///
-    /// rootfs の `dev/` は pid1 が `create_default_devices` で作ったホスト側のディレクトリそのものなので、
-    /// ホスト側から差し替える（コンテナが `CAP_MKNOD` で行う差し替えと同じ結果になる）。照合の前に必ず元へ戻す。
+    /// コンテナの `/dev` は pid1 が `create_default_devices` で載せた tmpfs（#1653）で、ホスト側の rootfs の
+    /// `dev/` ではない。ホストからは `/proc/<pid1>/root/dev` で到達できるので、そこで差し替える（コンテナが
+    /// `CAP_MKNOD` で行う差し替えと同じ結果になる）。照合の前に必ず元へ戻す。
     fn replaced_dev_null_is_rejected(bundle: &Bundle, c: &Container) {
-        let null = bundle.rootfs().join("dev/null");
-        let saved = bundle.rootfs().join("dev/null.saved");
+        let pid1_root = PathBuf::from(format!("/proc/{}/root", c.pid1));
+        let null = pid1_root.join("dev/null");
+        let saved = pid1_root.join("dev/null.saved");
         for kind in ["symlink", "device"] {
             clean_probe_files(bundle);
             fs::rename(&null, &saved).expect("move the real /dev/null aside");

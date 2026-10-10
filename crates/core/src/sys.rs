@@ -1327,14 +1327,12 @@ impl TmpfsParams {
 ///   `EPERM` になり `/dev/zero` の実行可能マップが壊れるおそれがあり、付ける根拠となるビヘイビアも無い。
 /// - `strictatime` を付ける: runc と同じ。既定の relatime に任せず明示する。
 ///
-/// 呼び出しは #1653 で `crate::exec` から配線する。
+/// `crate::exec::create_default_devices` が呼ぶ（#1653）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // #1653 で配線するまで呼び出し元が無い。配線時に外す。
 pub(crate) struct DevTmpfsCreate {
     _private: (),
 }
 
-#[allow(dead_code)] // 同上（#1653）。
 impl DevTmpfsCreate {
     const MODE: u32 = 0o755;
     const SIZE_BYTES: u64 = 64 * 1024 * 1024;
@@ -1345,17 +1343,21 @@ impl DevTmpfsCreate {
         Self { _private: () }
     }
 
-    /// ルートディレクトリのモード（0o755）。
+    /// ルートディレクトリのモード（0o755）。dry-run の記録（`cfg(test)`）だけが読む。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn mode(&self) -> u32 {
         Self::MODE
     }
 
-    /// サイズ（バイト。64 MiB）。
+    /// サイズ（バイト。64 MiB）。dry-run の記録（`cfg(test)`）だけが読む。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn size_bytes(&self) -> u64 {
         Self::SIZE_BYTES
     }
 
     /// `fsmount(2)` の `attr_flags`（`MOUNT_ATTR_NOSUID|MOUNT_ATTR_STRICTATIME`。nodev・noexec・rdonly なし）。
+    /// dry-run の記録（`cfg(test)`）だけが読む。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn attr_bits(&self) -> u32 {
         Self::ATTR_BITS
     }
@@ -1385,8 +1387,9 @@ pub(crate) fn mount_tmpfs_on(
 ///
 /// マウント先は検証済みの `O_PATH` fd で受け取り、パス文字列の再解決も `data` 文字列も使わない。返す fd は
 /// 載せたマウントのルートを指す close-on-exec の fd。`ENOSYS` は [`SysError::Unsupported`] で返し縮退しない。
-/// 途中失敗は drop で破棄される。Linux 5.2 以降。実マウントの確認と配線は #1653。
-#[allow(dead_code)] // #1653 で `crate::exec` から配線する。配線時に `cfg_attr(test, allow(dead_code))` へ戻す。
+/// 途中失敗は drop で破棄される。Linux 5.2 以降。`crate::exec::create_default_devices` が呼ぶ（#1653）。
+// テストビルドでは `crate::exec` の dry-run 差し込み点が本関数を呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) fn mount_dev_tmpfs_on(
     target_dir: BorrowedFd<'_>,
     create: DevTmpfsCreate,

@@ -24,12 +24,12 @@ OCI 既定の `/dev` のうち、基本デバイスノード 6 種と default sy
 
 ## 2. 現状（本リポ）
 
-- `/dev` は rootfs（ホスト上のディレクトリを bind したもの）内のディレクトリで、tmpfs ではない。起動順序は `prepare_rootfs` → `create_default_devices` → `mount_tmpfs` → `pivot_root`。`prepare_rootfs` がサブマウントを許さないため、`/dev` 系のマウントは「準備の後・切替の前」に置く
+- `create_default_devices` は rootfs の `dev` に専用の nodev なし tmpfs（`sys::mount_dev_tmpfs_on`・#1652）を載せてから、基本 6 デバイスと default symlink 4 本をそのマウントのルート fd 起点で作る（#1653）。ノードはホストの rootfs に残らず、イメージ同梱の `dev` 配下は覆い隠される。起動順序は `prepare_rootfs` → `create_default_devices`（`dev` に tmpfs → ノード → symlink）→ `mount_tmpfs` → `pivot_root`。`/dev/shm`・`/dev/pts` は本 tmpfs の上に載せる後続 issue（5 章）の担当
 - `/dev/shm` は `--shm-size` 指定時のみマウントする。未指定時に既定 64 MiB を常にマウントする処理は無い
 - `sys` の新マウント API ラッパーは tmpfs 固定（`mount_tmpfs_on`）。devpts のラッパーは無い
 - `process.terminal: true` と `mounts[]` は拒否する。`/proc` と基本 6 デバイスは `mounts[]` を使わず暗黙の固定集合
 - Landlock のルールは `config.json` の `root` と `mounts[]` のみから作る。暗黙の `/dev/pts`・`/dev/shm` に対するルールは無い。`PSEUDO_FS` に devpts は入っていない
-- rootless は `mknod` が `EPERM` になり `PermissionDenied` で fail-closed。ホスト `/dev` の bind は未実装
+- rootless は tmpfs までは載るが `mknod` が `EPERM` になり `PermissionDenied` で fail-closed（載せた tmpfs は外す）。ホスト `/dev` の bind は未実装（#1660）
 
 ## 3. 方式の比較
 

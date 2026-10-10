@@ -17,6 +17,7 @@ use std::io::Write;
 use fandhe_container_core::traits::ErrorCode;
 
 use crate::commands::CliExit;
+use crate::json::json_escape_into;
 
 /// `setup` が要求する OS 固有ステップ（閉じた列挙。外部入力からは構築しない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,13 +90,21 @@ pub fn required_steps(platform: SetupPlatform) -> &'static [SetupStep] {
     }
 }
 
-/// ステップ 1 件の出力行（固定文言のみの JSON。LF 終端）。値は定数由来で引用符等を含まない（テストで固定）。
+/// ステップ 1 件の出力行（固定スキーマの JSON。LF 終端）。手組みの `format!` を使わず、cli の
+/// `json` モジュールのエスケープを通して組み立てる（将来ステップ ID に可変値が入っても注入しない。
+/// REPAIR-2・CLI-2）。
 fn step_line(step: SetupStep) -> String {
-    format!(
-        "{{\"step\":\"{}\",\"requires_admin\":{},\"status\":\"manual\"}}\n",
-        step.id(),
-        step.requires_admin()
-    )
+    let mut line = String::with_capacity(80);
+    line.push_str("{\"step\":\"");
+    json_escape_into(&mut line, step.id());
+    line.push_str("\",\"requires_admin\":");
+    line.push_str(if step.requires_admin() {
+        "true"
+    } else {
+        "false"
+    });
+    line.push_str(",\"status\":\"manual\"}\n");
+    line
 }
 
 /// 区分を指定して `setup` を実行する（テスト用の入口）。

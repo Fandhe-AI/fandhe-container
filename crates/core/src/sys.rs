@@ -41,7 +41,7 @@
 //! tmpfs のマウント（`crate::exec::mount_tmpfs`。SUP-12・TASK-169 追補・#1472）は、新マウント API（`fsopen(2)`・`fsconfig(2)`・
 //! `fsmount(2)`・`move_mount(2)`。Linux 5.2 以降）で検証済みの O_PATH fd の上へ直接載せる。未対応カーネルは拒否する（縮退しない）。
 //! 同じ経路で rootfs の `/dev` 用の nodev なし tmpfs も載せる入口（`mount_dev_tmpfs_on`。TASK-29 追補・#1652）を持つ。
-//! 呼び出しの配線は #1653 で行う。
+//! 呼び出しの配線は #1653 で行う。rootless の基本デバイスは `open_tree(2)` + `move_mount(2)` でホストのノードを fd 起点で bind する（CORE-6・SEC-5・#1659・#1660）。
 //! exec 入口の前提（TASK-163 追補・#1456〜#1460）は、exec 直前の子でセッションを切り離す `setsid(2)`、補助グループを
 //! 空にする `getgroups(2)` / `setgroups(2)`、`/dev/null` とインタープリタを検証済みの `O_PATH` fd から開き直す
 //! `openat(2)`（`O_NOCTTY`）、状態を返す pipe だけを残して fd を閉じる `close_range(2)` を呼ぶ。
@@ -71,7 +71,7 @@
 use crate::seccomp::{BpfInstruction, SeccompProgram};
 use std::ffi::{CStr, CString};
 use std::io;
-use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, IntoRawFd as _, OwnedFd};
+use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd};
 
 /// syscall 失敗の分類。`crate::exec` が `ErrorCode` へ写す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +136,8 @@ mod consts {
     pub const SYS_FSOPEN: i64 = 430;
     pub const SYS_FSCONFIG: i64 = 431;
     pub const SYS_FSMOUNT: i64 = 432;
+    // arch/x86/entry/syscalls/syscall_64.tbl の `open_tree`（428。#1659）。
+    pub const SYS_OPEN_TREE: i64 = 428;
     // include/uapi/linux/mount.h の `FSOPEN_CLOEXEC`・`FSMOUNT_CLOEXEC`・`fsconfig_command`・`MOUNT_ATTR_*`（`MOUNT_ATTR_STRICTATIME` を含む）・`MOVE_MOUNT_*`（全アーキテクチャ共通）。
     pub const FSOPEN_CLOEXEC: u32 = 1;
     pub const FSMOUNT_CLOEXEC: u32 = 1;
@@ -149,6 +151,11 @@ mod consts {
     pub const MOUNT_ATTR_STRICTATIME: u32 = 0x20;
     pub const MOVE_MOUNT_F_EMPTY_PATH: u32 = 4;
     pub const MOVE_MOUNT_T_EMPTY_PATH: u32 = 64;
+    // include/uapi/linux/mount.h の `OPEN_TREE_CLONE`（1 << 0）・`OPEN_TREE_CLOEXEC`（`O_CLOEXEC` と同値で、`FSOPEN_CLOEXEC` の 1 とは別）と、
+    // include/uapi/linux/fcntl.h の `AT_EMPTY_PATH`（`open_tree` 用に u32 で持つ）。rootless のデバイスノード bind 用（#1659・CORE-6・SEC-5）。
+    pub const OPEN_TREE_CLONE: u32 = 1;
+    pub const OPEN_TREE_CLOEXEC: u32 = 0o2_000_000;
+    pub const OPEN_TREE_AT_EMPTY_PATH: u32 = 0x1000;
     // arch/x86/entry/syscalls/syscall_64.tbl の `pidfd_send_signal`（424）・`pidfd_open`（434）。
     pub const SYS_PIDFD_SEND_SIGNAL: i64 = 424;
     pub const SYS_PIDFD_OPEN: i64 = 434;
@@ -356,6 +363,9 @@ mod consts {
     pub const SYS_FSOPEN: i64 = 430;
     pub const SYS_FSCONFIG: i64 = 431;
     pub const SYS_FSMOUNT: i64 = 432;
+    // include/uapi/asm-generic/unistd.h の `__NR_open_tree`（428。arm64 は asm-generic の表。
+    // x86_64 と値が同じでも流用せず個別に定義する。#1659）。
+    pub const SYS_OPEN_TREE: i64 = 428;
     // include/uapi/linux/mount.h の `FSOPEN_CLOEXEC`・`FSMOUNT_CLOEXEC`・`fsconfig_command`・`MOUNT_ATTR_*`（`MOUNT_ATTR_STRICTATIME` を含む）・`MOVE_MOUNT_*`（全アーキテクチャ共通）。
     pub const FSOPEN_CLOEXEC: u32 = 1;
     pub const FSMOUNT_CLOEXEC: u32 = 1;
@@ -369,6 +379,11 @@ mod consts {
     pub const MOUNT_ATTR_STRICTATIME: u32 = 0x20;
     pub const MOVE_MOUNT_F_EMPTY_PATH: u32 = 4;
     pub const MOVE_MOUNT_T_EMPTY_PATH: u32 = 64;
+    // include/uapi/linux/mount.h の `OPEN_TREE_CLONE`（1 << 0）・`OPEN_TREE_CLOEXEC`（`O_CLOEXEC` と同値で、`FSOPEN_CLOEXEC` の 1 とは別）と、
+    // include/uapi/linux/fcntl.h の `AT_EMPTY_PATH`（`open_tree` 用に u32 で持つ）。rootless のデバイスノード bind 用（#1659・CORE-6・SEC-5）。
+    pub const OPEN_TREE_CLONE: u32 = 1;
+    pub const OPEN_TREE_CLOEXEC: u32 = 0o2_000_000;
+    pub const OPEN_TREE_AT_EMPTY_PATH: u32 = 0x1000;
     // include/uapi/asm-generic/unistd.h の `__NR_pidfd_send_signal`・`__NR_pidfd_open`（arm64 は
     // asm-generic の表。x86_64 と値が同じでも流用せず個別に定義する）。
     pub const SYS_PIDFD_SEND_SIGNAL: i64 = 424;
@@ -575,6 +590,7 @@ mod consts {
     pub const SYS_FSOPEN: i64 = 0;
     pub const SYS_FSCONFIG: i64 = 0;
     pub const SYS_FSMOUNT: i64 = 0;
+    pub const SYS_OPEN_TREE: i64 = 0;
     // include/uapi/linux/mount.h の `FSOPEN_CLOEXEC`・`FSMOUNT_CLOEXEC`・`fsconfig_command`・`MOUNT_ATTR_*`（`MOUNT_ATTR_STRICTATIME` を含む）・`MOVE_MOUNT_*`（全アーキテクチャ共通）。
     pub const FSOPEN_CLOEXEC: u32 = 0;
     pub const FSMOUNT_CLOEXEC: u32 = 0;
@@ -588,6 +604,10 @@ mod consts {
     pub const MOUNT_ATTR_STRICTATIME: u32 = 0;
     pub const MOVE_MOUNT_F_EMPTY_PATH: u32 = 0;
     pub const MOVE_MOUNT_T_EMPTY_PATH: u32 = 0;
+    // 対応外アーキテクチャ（各ラッパーが SUPPORTED で弾く）の `open_tree` 用定数。
+    pub const OPEN_TREE_CLONE: u32 = 0;
+    pub const OPEN_TREE_CLOEXEC: u32 = 0;
+    pub const OPEN_TREE_AT_EMPTY_PATH: u32 = 0;
     pub const SYS_PIDFD_SEND_SIGNAL: i64 = 0;
     pub const SYS_PIDFD_OPEN: i64 = 0;
     pub const CLOSE_RANGE_CLOEXEC: i64 = 0;
@@ -1231,7 +1251,7 @@ fn fsconfig_result(rc: i64) -> Result<(), SysError> {
     }
 }
 
-/// fd を返す新マウント API の戻り値（`fsopen` / `fsmount`）を検証して `OwnedFd` にする。
+/// fd を返す新マウント API の戻り値（`fsopen` / `fsmount` / `open_tree`）を検証して `OwnedFd` にする。
 #[cfg_attr(test, allow(dead_code))]
 fn new_mount_api_fd(rc: i64) -> Result<OwnedFd, SysError> {
     if rc == -1 {
@@ -1242,7 +1262,7 @@ fn new_mount_api_fd(rc: i64) -> Result<OwnedFd, SysError> {
         return Err(SysError::Os(EINVAL));
     }
     // SAFETY: `fd` は直前に成功した新マウント API の syscall が返した、他に所有者のいない有効な fd
-    // （`fsopen` / `fsmount` の戻り値）。`OwnedFd` が唯一の所有者になる（二重 close なし）。
+    // （`fsopen` / `fsmount` / `open_tree` の戻り値）。`OwnedFd` が唯一の所有者になる（二重 close なし）。
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -1468,23 +1488,187 @@ fn mount_tmpfs_impl(target_dir: BorrowedFd<'_>, params: &TmpfsParams) -> Result<
             i64::from(params.attr),
         )
     })?;
-    // SAFETY: `mnt_fd`・`target_dir` は生存中の fd（`OwnedFd` と `BorrowedFd`）。パスは静的な空文字列で、
-    // `*_EMPTY_PATH` により fd 自身が対象になる（パス解決なし）。副作用は呼び出しスレッドの mount namespace への
-    // マウント 1 件の追加に限る。
+    move_mount_empty_path(std::os::fd::AsFd::as_fd(&mnt_fd), target_dir)?;
+    Ok(mnt_fd)
+}
+
+/// `move_mount(2)` に渡すフラグ（`MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH`）。
+///
+/// `mount_tmpfs_on` とデバイスノード bind が同じフラグを使うことを、単体テストで具体値（0x44）として
+/// 固定するために `unsafe` から切り出している。
+#[cfg_attr(test, allow(dead_code))]
+fn move_mount_empty_path_flags() -> u32 {
+    consts::MOVE_MOUNT_F_EMPTY_PATH | consts::MOVE_MOUNT_T_EMPTY_PATH
+}
+
+/// 切り離したマウント `from` を、`to`（検証済みの O_PATH fd）の上へ `move_mount(2)` で載せる。
+///
+/// 両端とも fd を指し、パス文字列は渡さない（`*_EMPTY_PATH`）ため、パスの再解決・symlink 追従が起きない。
+/// `mount_tmpfs_on`（tmpfs の載せ替え）と、rootless のデバイスノード bind（#1660 が呼ぶ。CORE-6・SEC-5）が
+/// 共有する。`ENOSYS`（Linux 5.2 未満）は [`SysError::Unsupported`] で返し、`mount(2)` へは縮退しない。
+/// ファイルの bind では `to` もファイルである必要がある（ディレクトリ同士かファイル同士のみ成功する）。
+///
+/// 前提: `to` が属するマウントは shared でない（`crate::exec::MountIsolation::establish` が `/` を
+/// `MS_REC|MS_PRIVATE` にした mount namespace の中で呼ぶ）。shared のままでは接続が peer へ伝播し、
+/// ホスト側にもマウントが現れる。seccomp フィルタ（`DeniedSyscall::MoveMount`）の適用前に呼ぶ。
+// テストビルドでは `crate::exec` の dry-run 差し込み点が呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn move_mount_empty_path(
+    from: BorrowedFd<'_>,
+    to: BorrowedFd<'_>,
+) -> Result<(), SysError> {
+    move_mount_empty_path_raw(from.as_raw_fd(), to.as_raw_fd())
+}
+
+/// [`move_mount_empty_path`] の本体。fd 番号（`RawFd`）を受ける非公開部分で、無効 fd の拒否（`EBADF`）を
+/// `BorrowedFd` の契約に反せず単体テストで確かめるために切り出している。呼び出し側は生存中の fd を渡す。
+#[cfg_attr(test, allow(dead_code))]
+fn move_mount_empty_path_raw(from: RawFd, to: RawFd) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `from`・`to` は fd 番号の整数で、カーネルが検証する（無効なら `EBADF`）。パスは静的な空文字列で、`*_EMPTY_PATH` により fd 自身が
+    // 対象になる（パス解決なし）。副作用は呼び出しスレッドの mount namespace へのマウント 1 件の追加に限る
+    // （接続先は private であること〔`MountIsolation::establish` の `MS_REC|MS_PRIVATE` 済み〕が前提。shared なら peer へ伝播する）。
     let rc = unsafe {
         syscall(
             consts::SYS_MOVE_MOUNT,
-            i64::from(mnt_fd.as_raw_fd()),
+            i64::from(from),
             c"".as_ptr(),
-            i64::from(target_dir.as_raw_fd()),
+            i64::from(to),
             c"".as_ptr(),
-            i64::from(consts::MOVE_MOUNT_F_EMPTY_PATH | consts::MOVE_MOUNT_T_EMPTY_PATH),
+            i64::from(move_mount_empty_path_flags()),
         )
     };
     if rc == -1 {
         return Err(new_mount_api_error());
     }
-    Ok(mnt_fd)
+    Ok(())
+}
+
+/// [`open_tree_clone`] へ渡せる、文字デバイスと確かめたホストのデバイスノードの fd（CORE-6・SEC-5・SEC-1・#1659）。
+///
+/// [`verify_device_node_fd`] だけが作る（フィールドは `sys` の外から触れない）。保持するのは検証に使った fd
+/// そのもので、検証後にパスを開き直さないため、検証と複製の対象は同じ inode になる（TOCTOU なし）。
+// #1660 で呼び出し元を足すまでの間のみ許可する（配線時に外す）。
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct VerifiedDeviceNodeFd(OwnedFd);
+
+impl std::os::fd::AsFd for VerifiedDeviceNodeFd {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.0)
+    }
+}
+
+/// [`verify_device_node_fd`] の拒否理由。照合した実値を持ち、呼び出し側（#1660）が構造化エラーへ写す。
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeviceNodeError {
+    /// 文字デバイスではない（ディレクトリ・通常ファイル・`O_NOFOLLOW` で開いた symlink 等）。`mode` は `st_mode` の実値。
+    NotCharDevice { mode: u32 },
+    /// 文字デバイスだが `rdev` が期待値と違う。
+    UnexpectedRdev { actual: u64, expected: u64 },
+    /// `fstat`（fd の複製を含む）の失敗、または対応外アーキテクチャ（[`SysError::Unsupported`]）。
+    Sys(SysError),
+}
+
+/// `fd`（呼び出し側が `O_PATH|O_NOFOLLOW` で開いたホストのデバイスノード）を、同じ fd の `fstat` で照合する。
+///
+/// 文字デバイス（`S_IFCHR`）かつ `rdev == makedev(major, minor)` のときだけ [`VerifiedDeviceNodeFd`] を返す。
+/// `major`・`minor` は呼び出し側の固定表（`crate::exec::devices` の `DEFAULT_DEVICES`。任意の major/minor を
+/// 受け付ける経路は作らない。TASK-127）から渡す。パスの `stat` ではなく fd の `fstat`（std の
+/// `File::metadata`。fd は複製して見るだけで、元の fd をそのまま保持する）で見るため、検証後の差し替えは効かない。
+/// 照合は `crate::exec::devices` の既存ノードの検証と同じ形（種別と `rdev` の完全一致）。
+#[allow(dead_code)]
+pub(crate) fn verify_device_node_fd(
+    fd: OwnedFd,
+    major: u32,
+    minor: u32,
+) -> Result<VerifiedDeviceNodeFd, DeviceNodeError> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+    if !consts::SUPPORTED {
+        return Err(DeviceNodeError::Sys(SysError::Unsupported));
+    }
+    let os = |e: io::Error| DeviceNodeError::Sys(SysError::Os(e.raw_os_error().unwrap_or(EINVAL)));
+    let dup = std::os::fd::AsFd::as_fd(&fd)
+        .try_clone_to_owned()
+        .map_err(os)?;
+    let meta = std::fs::File::from(dup).metadata().map_err(os)?;
+    if !meta.file_type().is_char_device() {
+        return Err(DeviceNodeError::NotCharDevice { mode: meta.mode() });
+    }
+    let expected = makedev(major, minor);
+    if meta.rdev() != expected {
+        return Err(DeviceNodeError::UnexpectedRdev {
+            actual: meta.rdev(),
+            expected,
+        });
+    }
+    Ok(VerifiedDeviceNodeFd(fd))
+}
+
+/// `open_tree(2)` に渡すフラグ（`OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_EMPTY_PATH`）。
+///
+/// `AT_RECURSIVE` は付けない（複製をノード 1 個に限り、ホスト側の子マウントを持ち込まない）。
+#[cfg_attr(test, allow(dead_code))]
+fn open_tree_clone_flags() -> u32 {
+    consts::OPEN_TREE_CLONE | consts::OPEN_TREE_CLOEXEC | consts::OPEN_TREE_AT_EMPTY_PATH
+}
+
+/// `node`（呼び出し側が検証したホストのデバイスノードの O_PATH fd）を、切り離したマウントとして複製する。
+///
+/// rootless（user namespace）では `mknod` できないため、ホストのノードを fd 起点で `open_tree` +
+/// `move_mount_empty_path` により bind する（方式 (a)。`docs/design/dev-default-mounts.md` §3.6・
+/// 判断 4。CORE-6・SEC-5・#1659。呼び出し元は #1660）。戻り値は未接続のマウントを指す close-on-exec の fd で、
+/// 途中で失敗して drop すればカーネルが破棄する。
+///
+/// 引数は [`verify_device_node_fd`] だけが作れる [`VerifiedDeviceNodeFd`] に限る。文字デバイス（`S_IFCHR`）で
+/// `rdev` が期待値と一致することを同じ fd の `fstat` で確かめた fd しか渡せないため、ディレクトリ・通常ファイルを
+/// 複製して nosuid・noexec なしでコンテナへ渡す経路は型で塞がれる（SEC-1）。symlink を辿らないこと
+/// （`O_PATH|O_NOFOLLOW` で開くこと）は fd を開く呼び出し側の責務で、辿らずに開いた symlink 自体は
+/// `S_IFCHR` でないため検証で拒否される。
+///
+/// マウントフラグは緩めも追加もしない。複製はホスト側マウントのフラグ（locked flag 含む）を継承する。
+/// `nosuid`・`noexec` を付与しない理由は、マウントのルートが文字デバイス 1 個（上の型で強制）で他のファイルへ届かず、exec と
+/// setuid が通常ファイルにしか効かないため守る対象が無いこと（runc の `bindMountDeviceNode` も `MS_BIND` のみ）。
+/// `nodev` はノードが使えなくなるため付けてはならない。よって `mount_setattr` は本 Issue では足さない。
+///
+/// 必要なカーネルは Linux 5.2 以降。`ENOSYS` は [`SysError::Unsupported`] で返し、`mount(2)` へは縮退しない。
+/// user namespace では自分の mount namespace を所有する userns の `CAP_SYS_ADMIN` が要る。
+///
+/// 呼び出し順の前提（#1660 が固定し結合試験で照合する）:
+/// - ホストのノードは `unshare(CLONE_NEWNS)` の後・`pivot_root` の前に、呼び出しと同じ mount namespace の中で
+///   開き、同じ namespace の中で本関数を呼ぶ。fs/namespace.c の `__do_loopback`（v5.2・v6.12 で確認）は
+///   `check_mnt(old)`（fd のマウントの `mnt_ns` が呼び出しスレッドの mount namespace と一致）を満たさないと
+///   `EINVAL` を返す。unshare 前に開いた fd のマウントは元の namespace に属し、`pivot_root` 後に旧ルートを
+///   `umount2(MNT_DETACH)` で切り離すと `umount_tree` が `mnt_ns` を NULL にするため、どちらも複製できない。
+/// - seccomp フィルタの適用前に呼ぶ。`crate::seccomp` の既定の拒否集合は `open_tree`（`DeniedSyscall::OpenTree`）と
+///   `move_mount`（`DeniedSyscall::MoveMount`）を含み、適用後は失敗する。
+// #1660 で呼び出し元を足すまでの間のみ許可する（配線時に外す）。
+#[allow(dead_code)]
+pub(crate) fn open_tree_clone(node: &VerifiedDeviceNodeFd) -> Result<OwnedFd, SysError> {
+    open_tree_clone_raw(node.0.as_raw_fd())
+}
+
+/// [`open_tree_clone`] の本体。fd 番号（`RawFd`）を受ける非公開部分で、無効 fd の拒否（`EBADF`）を
+/// `BorrowedFd` の契約に反せず単体テストで確かめるために切り出している。
+#[allow(dead_code)]
+fn open_tree_clone_raw(node: RawFd) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `node` は fd 番号の整数で、カーネルが検証する（無効なら `EBADF`）。パスは静的な空文字列（NUL 終端）で、`AT_EMPTY_PATH` により fd 自身が
+    // 対象になる（パス解決なし）。`AT_RECURSIVE` は付けない。成功時の戻り値は新規 fd で、直後に
+    // `new_mount_api_fd` が唯一の所有者にする。副作用は未接続の複製マウントの作成に限る（fd を閉じれば破棄される）。
+    new_mount_api_fd(unsafe {
+        syscall(
+            consts::SYS_OPEN_TREE,
+            i64::from(node),
+            c"".as_ptr(),
+            i64::from(open_tree_clone_flags()),
+        )
+    })
 }
 
 /// devpts の `statfs.f_type`（include/uapi/linux/magic.h の `DEVPTS_SUPER_MAGIC`。アーキテクチャ非依存）。
@@ -4072,6 +4256,30 @@ mod tests {
         assert_eq!(f(true, true), 1 | 2 | 4);
     }
 
+    /// CORE-6・SEC-5（TASK-29 追補・#1659）: `open_tree` の syscall 番号（x86_64・aarch64 とも 428）と
+    /// フラグの具体値。`AT_RECURSIVE` は付けず、`move_mount` の空パス指定は 0x44。
+    #[test]
+    fn core6_sec5_open_tree_consts_and_flags_are_exact() {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        {
+            assert_eq!(consts::SYS_OPEN_TREE, 428);
+            assert_eq!(
+                (
+                    consts::OPEN_TREE_CLONE,
+                    consts::OPEN_TREE_CLOEXEC,
+                    consts::OPEN_TREE_AT_EMPTY_PATH
+                ),
+                (1, 0o2_000_000, 0x1000)
+            );
+            assert_eq!(consts::OPEN_TREE_CLOEXEC, 0x8_0000);
+            assert_eq!(open_tree_clone_flags(), 0x8_1001);
+            // AT_RECURSIVE（0x8000）と OPEN_TREE_NAMESPACE（2）は付けない。
+            assert_eq!(open_tree_clone_flags() & 0x8000, 0);
+            assert_eq!(open_tree_clone_flags() & 0x2, 0);
+            assert_eq!(move_mount_empty_path_flags(), 0x44);
+        }
+    }
+
     /// CORE-5（TASK-29 追補・#1657）: `/dev`・`/dev/pts` の fsmount 属性ビットが、Landlock 側と共有する
     /// 暗黙の固定集合の定義（`dev_mounts`）と一致する。片方だけが変わったらここで検出する。
     #[test]
@@ -5080,5 +5288,229 @@ mod tests {
         let line = status.lines().find(|l| l.starts_with("Uid:")).unwrap();
         let euid: u32 = line.split_whitespace().nth(2).unwrap().parse().unwrap();
         assert_eq!(effective_uid(), euid);
+    }
+
+    /// 存在しない fd 番号（`RLIMIT_NOFILE` を超える値）。`BorrowedFd` は作らず `RawFd` のまま非公開部分へ渡す。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    const BOGUS_FD: RawFd = 1_000_000;
+
+    /// CORE-6・SEC-5（TASK-29 追補・#1659）: 失敗経路。無効な fd は `Os(EBADF)`（非特権では先に
+    /// 特権検査で `Os(EPERM)`）で返り、パニックも縮退（`mount(2)` への切り替え）もしない。`move_mount_empty_path` も同様。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core6_sec5_open_tree_and_move_mount_fail_with_ebadf_on_invalid_fd() {
+        // 特権チェックが fd 検証より先に走るため、非特権では EPERM になる（どちらも拒否で、成功しない）。
+        let accepted = [SysError::Os(EBADF), SysError::Os(EPERM)];
+        let err = open_tree_clone_raw(BOGUS_FD).unwrap_err();
+        assert!(accepted.contains(&err), "unexpected error: {err:?}");
+        let null = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let err = move_mount_empty_path_raw(BOGUS_FD, null.as_raw_fd()).unwrap_err();
+        assert!(accepted.contains(&err), "unexpected error: {err:?}");
+    }
+
+    /// CORE-6・SEC-5（TASK-29 追補・#1659）: `open_tree` の複製は呼び出しスレッドの実効 `CAP_SYS_ADMIN`
+    /// （`capget` で読む。bit 21）で結果が決まる。持たなければ `Os(EPERM)` で拒否され、持てば（root で走らせた
+    /// 場合）未接続の複製が close-on-exec の fd で返る（接続しないため drop でカーネルが破棄し、ホストへの副作用は
+    /// 無い）。どちらの分岐も具体値を照合する（euid だけで判定しない。root でも `CAP_SYS_ADMIN` を落とした
+    /// コンテナ内では EPERM 側になる）。Linux 5.2 未満は両分岐とも `Unsupported`。前提: テストプロセスの
+    /// user namespace が自分の mount namespace を所有する（`unshare --user` だけで走らせた場合は対象外）。
+    /// user namespace 内での接続まで含む成功経路は下の実機前提テストが検証する。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core6_sec5_open_tree_clone_result_follows_cap_sys_admin() {
+        const CAP_SYS_ADMIN_BIT: u32 = 1 << 21;
+        let caps = cap_get_thread().expect("capget");
+        let privileged = caps.effective[0] & CAP_SYS_ADMIN_BIT != 0;
+        let node = verify_device_node_fd(open_o_path("/dev/null"), 1, 3).expect("verify /dev/null");
+        match (privileged, open_tree_clone(&node)) {
+            (_, Err(SysError::Unsupported)) => {}
+            (false, Err(err)) => assert_eq!(err, SysError::Os(EPERM)),
+            (true, Ok(clone)) => assert_eq!(fd_flags(&clone) & 0o2_000_000, 0o2_000_000),
+            (privileged, other) => panic!("privileged={privileged}: unexpected result: {other:?}"),
+        }
+    }
+
+    /// `path` が呼び出しスレッドの mount namespace でマウントポイントか（`/proc/self/mountinfo` の 5 列目と完全一致）。
+    /// 一時領域のパスは空白等のエスケープ対象を含まない前提（`fandhe-open-tree-…` で作る）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn is_mount_point(path: &std::path::Path) -> bool {
+        let real = std::fs::canonicalize(path).expect("canonicalize");
+        let real = real.to_str().expect("utf8 path");
+        std::fs::read_to_string("/proc/self/mountinfo")
+            .expect("read mountinfo")
+            .lines()
+            .any(|l| l.split(' ').nth(4) == Some(real))
+    }
+
+    /// CORE-6・SEC-5・SEC-1（TASK-29 追補・#1659）: `/dev/null`（文字デバイス 1:3）は期待値 (1, 3) で検証を通り、
+    /// 検証に使った fd そのもの（開き直さない）を保持する。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core6_sec5_verify_device_node_fd_accepts_dev_null_and_keeps_the_fd() {
+        let fd = open_o_path("/dev/null");
+        let raw = fd.as_raw_fd();
+        let node = verify_device_node_fd(fd, 1, 3).expect("verify /dev/null");
+        assert_eq!(node.as_fd().as_raw_fd(), raw);
+    }
+
+    /// CORE-6・SEC-5・SEC-1（TASK-29 追補・#1659）: 文字デバイスでも `rdev` が期待値と違えば、実値と期待値を
+    /// 持つ `UnexpectedRdev` で拒否する（`/dev/null` = 0x103 を (1, 5) = 0x105 として検証）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core6_sec5_verify_device_node_fd_rejects_unexpected_rdev() {
+        let err = verify_device_node_fd(open_o_path("/dev/null"), 1, 5).unwrap_err();
+        assert_eq!(
+            err,
+            DeviceNodeError::UnexpectedRdev {
+                actual: 0x103,
+                expected: 0x105
+            }
+        );
+    }
+
+    /// CORE-6・SEC-5・SEC-1（TASK-29 追補・#1659）: ディレクトリ（`/`）と通常ファイル（テストバイナリ自身）は
+    /// 文字デバイスでないため `NotCharDevice` で拒否する。`mode` は `st_mode` の実値で、種別ビット
+    /// （`S_IFMT` = 0o170000）がディレクトリ 0o040000・通常ファイル 0o100000 になる。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core6_sec5_verify_device_node_fd_rejects_directory_and_regular_file() {
+        let kind = |path: &str| match verify_device_node_fd(open_o_path(path), 1, 3) {
+            Err(DeviceNodeError::NotCharDevice { mode }) => mode & 0o170_000,
+            other => panic!("{path}: unexpected result: {other:?}"),
+        };
+        assert_eq!(kind("/"), 0o040_000);
+        let exe = std::env::current_exe().expect("current_exe");
+        assert_eq!(kind(exe.to_str().expect("utf8 path")), 0o100_000);
+    }
+
+    /// `path` を `O_PATH | O_NOFOLLOW` で開く（実機前提テストと特権なしテストの共通部品）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn open_o_path(path: &str) -> OwnedFd {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let flags = path_nofollow_open_flags().expect("supported arch");
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags)
+            .open(path)
+            .expect("open O_PATH")
+            .into()
+    }
+
+    /// 実機前提テストの子側であることを示す環境変数。
+    const OPEN_TREE_CHILD_ENV: &str = "FANDHE_OPEN_TREE_CHILD";
+
+    /// CORE-6・SEC-5（TASK-29 追補・#1659）: 実機前提（非特権 user namespace を許可するホスト。util-linux の
+    /// `unshare`）。`unshare --user --map-root-user --mount` で隔離した子として自身（`--ignored`）を再実行し、
+    /// 子の中で `open_tree_clone` → `move_mount_empty_path` の成功経路を照合する。実行:
+    /// `cargo test -p fandhe-container-core --lib core6_sec5_open_tree_binds -- --ignored`
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires unprivileged user+mount namespaces and util-linux unshare (CORE-6, SEC-5)"]
+    fn core6_sec5_open_tree_binds_host_device_node_in_userns() {
+        if std::env::var_os(OPEN_TREE_CHILD_ENV).is_some() {
+            open_tree_bind_checks();
+            return;
+        }
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut cmd = std::process::Command::new("unshare");
+        cmd.args(["--user", "--map-root-user", "--mount", "--"])
+            .arg(exe)
+            .args([
+                "--exact",
+                "sys::tests::core6_sec5_open_tree_binds_host_device_node_in_userns",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(OPEN_TREE_CHILD_ENV, "1");
+        // 子の終了待ちには期限を設け、期限超過時の kill の失敗・回収猶予（5 秒）の超過も無期限に待たず
+        // 明示的に失敗させる（REPAIR-5）。同モジュールの `run_with_deadline`・`reap_bounded` を再利用する。
+        let status = run_with_deadline(cmd, std::time::Duration::from_secs(60))
+            .expect("spawn unshare and reap the inner open_tree test within the 60s deadline");
+        assert!(status.success(), "child failed: {status:?}");
+    }
+
+    /// 子側の照合。fd 起点の複製・close-on-exec・ファイルへの接続・失敗時の未接続を具体値で確かめる。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn open_tree_bind_checks() {
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+        // 共有の一時領域で予測可能な名前・既存ディレクトリの受け入れ・symlink 追従を避ける: 0700 で排他的に
+        // `create_dir` し（既存は拒否して名前を変えて再試行）、対象ファイルは `create_new`（O_EXCL。
+        // symlink は追従せず既存なら失敗）で作る。
+        let (dir, target_file) = {
+            use std::os::unix::fs::DirBuilderExt as _;
+            let mut attempt = 0u32;
+            let dir = loop {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos())
+                    .unwrap_or(0);
+                let candidate = std::env::temp_dir().join(format!(
+                    "fandhe-open-tree-{}-{nanos}-{attempt}",
+                    std::process::id()
+                ));
+                match std::fs::DirBuilder::new().mode(0o700).create(&candidate) {
+                    Ok(()) => break candidate,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 16 => {
+                        attempt += 1;
+                    }
+                    Err(e) => panic!("create dir: {e}"),
+                }
+            };
+            let target_file = dir.join("null");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target_file)
+                .expect("create target file exclusively");
+            (dir, target_file)
+        };
+
+        // fd 起点で /dev/null を複製できる。fd は close-on-exec（fdinfo の flags が O_CLOEXEC = 02000000）。
+        let node = verify_device_node_fd(open_o_path("/dev/null"), 1, 3).expect("verify /dev/null");
+        let clone = open_tree_clone(&node).expect("open_tree_clone");
+        assert_eq!(fd_flags(&clone) & 0o2_000_000, 0o2_000_000);
+
+        // 失敗時: ディレクトリ（ファイルの複製の接続先として不正）へ接続すると `EINVAL` で拒否される
+        // （fs/namespace.c の `do_move_mount` は `err = -EINVAL` のまま `d_is_dir(new) != d_is_dir(old)` で抜ける。
+        // v5.2・v6.12 で確認。`ENOTDIR` は `mount(2)` 側の `graft_tree` の値）。接続を試みたディレクトリにも、
+        // まだ接続していないファイルにも何も載っていない。
+        let dir_fd = open_o_path(dir.to_str().expect("utf8 path"));
+        let err = move_mount_empty_path(clone.as_fd(), dir_fd.as_fd()).unwrap_err();
+        assert_eq!(err, SysError::Os(EINVAL));
+        assert!(!is_mount_point(&dir), "dir must stay unattached");
+        assert!(!is_mount_point(&target_file), "file must stay unattached");
+        let before = std::fs::metadata(&target_file).expect("stat");
+        assert!(
+            before.file_type().is_file(),
+            "target must stay a regular file"
+        );
+
+        // 成功: 通常ファイルへ接続すると、そのパスが /dev/null（文字デバイス 1:3）として見える。
+        let to = open_o_path(target_file.to_str().expect("utf8 path"));
+        move_mount_empty_path(clone.as_fd(), to.as_fd()).expect("move_mount_empty_path");
+        assert!(
+            is_mount_point(&target_file),
+            "file must be a mount point after attach"
+        );
+        assert!(!is_mount_point(&dir), "dir must stay unattached");
+        let meta = std::fs::metadata(&target_file).expect("stat after attach");
+        assert!(meta.file_type().is_char_device());
+        let rdev = meta.rdev();
+        // major = 1, minor = 3（Linux の dev_t エンコード: major は bit 8..19、minor は下位 8bit）。
+        assert_eq!(((rdev >> 8) & 0xfff, rdev & 0xff), (1, 3));
+        // 読み書きが通る（/dev/null として機能している）。
+        std::fs::write(&target_file, b"x").expect("write to attached /dev/null");
+
+        // 後始末: clone の fd を閉じても接続済みのマウントは解除されない。マウントポイントのまま
+        // `remove_dir_all` すると EBUSY で一時領域（ホスト側の dir と空ファイル）が残るため、先に
+        // 切り離してから削除し、どちらの失敗も検出する。
+        drop(clone);
+        let target_c = std::ffi::CString::new(target_file.to_str().expect("utf8 path"))
+            .expect("no interior NUL");
+        umount_detach_at(&target_c).expect("detach attached mount");
+        std::fs::remove_dir_all(&dir).expect("remove temp dir after detach");
+        assert!(!dir.exists(), "temp dir must be removed");
     }
 }

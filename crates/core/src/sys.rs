@@ -156,6 +156,9 @@ mod consts {
     // include/uapi/asm-generic/signal.h の `SIGKILL`・`SIGPIPE`（x86_64 は上書きしない）。
     pub const SIGKILL: i32 = 9;
     pub const SIGPIPE: i32 = 13;
+    // arch/x86/include/uapi/asm/signal.h の `SIGCHLD`（結合試験の `set_child_signal_ignored_for_test` だけが使う）。
+    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
+    pub const SIGCHLD: i32 = 17;
     // include/uapi/asm-generic/fcntl.h（x86_64 は上書きしない）。
     pub const O_DIRECTORY: i32 = 0o200_000;
     pub const O_NOFOLLOW: i32 = 0o400_000;
@@ -373,6 +376,9 @@ mod consts {
     // include/uapi/asm-generic/signal.h の `SIGKILL`・`SIGPIPE`（arm64 は上書きしない）。
     pub const SIGKILL: i32 = 9;
     pub const SIGPIPE: i32 = 13;
+    // include/uapi/asm-generic/signal.h の `SIGCHLD`（結合試験の `set_child_signal_ignored_for_test` だけが使う）。
+    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
+    pub const SIGCHLD: i32 = 17;
     // arch/arm64/include/uapi/asm/fcntl.h（asm-generic と異なる。x86_64 の値を流用しない。
     // 流用すると O_DIRECT / O_LARGEFILE に化ける）。
     pub const O_DIRECTORY: i32 = 0o40_000;
@@ -583,6 +589,8 @@ mod consts {
     pub const WNOHANG: i32 = 0;
     pub const SIGKILL: i32 = 0;
     pub const SIGPIPE: i32 = 0;
+    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
+    pub const SIGCHLD: i32 = 0;
     pub const O_DIRECTORY: i32 = 0;
     pub const O_NOFOLLOW: i32 = 0;
     pub const O_CLOEXEC: i32 = 0;
@@ -1507,10 +1515,42 @@ pub(crate) fn fork_single_threaded_with<F: FnOnce() -> i32>(
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
+    fork_checked(is_single_threaded, child, panic_exit, true)
+}
+
+/// [`fork_single_threaded`] と同じ強制（`Threads: 1` の確認・子は `_exit`）だが、**fork 前に親で
+/// stdout / stderr を flush しない**（REPAIR-5・SEC-4・TASK-163 追補・#1594）。
+///
+/// 親の flush は出力先（パイプ満杯など）で無期限に止まり得て、呼び出し側の期限（監査の
+/// `PRIMARY_WRITE_TIMEOUT` 等）は fork の後に始まるため効かない。子は `child` の後に `_exit` するだけで
+/// 親の stdio バッファを flush しない（`exit` / atexit を通らない）ので、flush を省いても二重出力は起きない。
+/// ただし子の `child` が親から継承した stdout のバッファを書き出す処理を呼んではならない。
+pub(crate) fn fork_single_threaded_no_flush<F: FnOnce() -> i32>(
+    child: F,
+    panic_exit: i32,
+) -> Result<u32, SysError> {
+    fork_checked(
+        || std::fs::read_to_string("/proc/self/status").is_ok_and(|status| threads_is_one(&status)),
+        child,
+        panic_exit,
+        false,
+    )
+}
+
+/// fork の共通本体。`flush_stdio` が真のときだけ fork 前に stdout / stderr を flush する。
+fn fork_checked<F: FnOnce() -> i32>(
+    is_single_threaded: impl FnOnce() -> bool,
+    child: F,
+    panic_exit: i32,
+    flush_stdio: bool,
+) -> Result<u32, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
     if !is_single_threaded() {
         return Err(SysError::MultiThreaded);
     }
-    {
+    if flush_stdio {
         use std::io::Write as _;
         let _ = io::stdout().flush();
         let _ = io::stderr().flush();
@@ -2361,6 +2401,31 @@ pub(crate) fn clear_supplementary_groups() -> Result<(), SysError> {
 /// `signal(2)` の `SIG_DFL`（既定動作）と `SIG_ERR`（失敗）。`sighandler_t` はポインタ幅。
 const SIG_DFL: usize = 0;
 const SIG_ERR: usize = usize::MAX;
+/// `signal(2)` の `SIG_IGN`（無視。include/uapi/asm-generic/signal-defs.h の `((__sighandler_t)1)`）。
+#[cfg(feature = "exec-test-support")]
+const SIG_IGN: usize = 1;
+
+/// 結合試験専用: 自プロセスの `SIGCHLD` を `ignored` なら `SIG_IGN`、そうでなければ `SIG_DFL` にする
+/// （`FileAuditSink` の子プロセス隔離が、`SIGCHLD` を無視するプロセス〔子が自動回収され `waitpid` が
+/// `ECHILD` を返す〕でも主経路の結果を取り違えないことの照合用。REPAIR-5・SEC-4・TASK-163 追補・#1594）。
+///
+/// `tests/audit_sink_isolation.rs` の単一スレッドの `main` からだけ呼ぶ。プロセス全体の disposition を
+/// 変えるため、他の試験と同じプロセスで並行に使わない。
+#[cfg(feature = "exec-test-support")]
+pub(crate) fn set_child_signal_ignored_for_test(ignored: bool) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let handler = if ignored { SIG_IGN } else { SIG_DFL };
+    // SAFETY: 引数は整数（`SIG_IGN` = 1 / `SIG_DFL` = 0）のみでポインタを取らない。ハンドラ関数を
+    // 登録しないため、シグナルハンドラの再入・非同期安全性の問題は生じない。対象は `SIGCHLD` の定数だけ。
+    let prev = unsafe { signal(consts::SIGCHLD, handler) };
+    if prev == SIG_ERR {
+        Err(last_error())
+    } else {
+        Ok(())
+    }
+}
 
 /// [`kill_pid`] が送るシグナル（生の番号を crate 外へ出さない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

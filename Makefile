@@ -239,7 +239,7 @@ endif
 
 # rustdoc の警告（壊れた intra-doc リンク・private 項目へのリンク等）を -D warnings で fail させる
 # （REPAIR-3・REPAIR-7・#1300）。既定 feature・--no-deps（依存の doc は生成しない）。CI は
-# platform-ci ジョブ（3 OS）が本ターゲットを実行する。cfg(target_os) 限定の項目への
+# platform-ci ジョブ（PR は ubuntu・main は 3 OS）が本ターゲットを実行する。cfg(target_os) 限定の項目への
 # リンクは他 OS で解決できず fail するため、doc コメントではリンクにせずコード表記にする。
 .PHONY: doc
 doc: ## cargo doc -D warnings（既定 feature・--no-deps。rustdoc 警告のゲート）
@@ -250,7 +250,7 @@ else
 endif
 
 # venus 試験治具（workspace 外の独立 PoC パッケージ。GPU-6・TASK-172.4・#888）の fmt / clippy / test。
-# `make ci` には含めない。CI は platform-ci ジョブ（3 OS）が本ターゲットを実行し、
+# `make ci` には含めない。CI は platform-ci ジョブ（PR は ubuntu・main は 3 OS）が本ターゲットを実行し、
 # plugin-macos 側の変更で治具が壊れたことを検出する。実機前提テストは #[ignore] で分離済み。
 # clippy / test は --locked で治具の Cargo.lock を固定する（ルート側の依存変更で lock が黙って再解決され、
 # 監査していない版でビルドされるのを防ぐ。lock の更新が要る変更は lock の差分として PR に現れる）。
@@ -382,7 +382,7 @@ endif
 # 判定スクリプトの自己テスト（PLUG-4・TASK-109.4・REPAIR-12）。依存 0 件の最小 workspace を一時 git
 # リポジトリとして作って判定スクリプトを走らせるため、実リポの workspace には依存しない（HAS_CARGO では
 # 判定しない）。cargo・git 未導入時は黙ってスキップせず fail-closed で止める。CI の platform-ci
-# ジョブ（ubuntu・macos・windows の 3 OS。Windows は Git Bash）が実行し、GNU / BSD 双方のツールと
+# ジョブ（main への push では ubuntu・macos・windows の 3 OS、PR では ubuntu。Windows は Git Bash）が実行し、GNU / BSD 双方のツールと
 # Git Bash で動くことを確かめる。
 .PHONY: plug4-core-invariance-selftest
 plug4-core-invariance-selftest: ## PLUG-4 判定スクリプトの自己テスト（TASK-109.4・REPAIR-12。fixture workspace）
@@ -396,13 +396,13 @@ plug4-core-invariance-selftest: ## PLUG-4 判定スクリプトの自己テス�
 
 # CLI 基本 6 コマンドの 3 OS 同一構文・挙動の比較（TASK-125.1・CLI-1・MS-6）。
 # 自己テストはスタブ CLI のみを使い、製品バイナリ・root は使わない（REPAIR-12）。CI の platform-ci
-# ジョブ（ubuntu・macos・windows の 3 OS）が本ターゲットを実行する。make ci には含めない。
+# ジョブ（main への push では ubuntu・macos・windows の 3 OS、PR では ubuntu）が本ターゲットを実行する。make ci には含めない。
 .PHONY: cli-parity-selftest
 cli-parity-selftest: ## CLI 3 OS 比較スクリプトの自己テスト（TASK-125.1・REPAIR-12。スタブ CLI のみ）
 	bash scripts/cli-parity-check-selftest.sh
 
 # タイムアウト回収がネイティブ exe の子孫に届くかの確認（#1548・TASK-125.1・CLI-1・REPAIR-5）。rustc で
-# 一時ヘルパーをビルドする。CI の platform-ci ジョブ（3 OS）が実行する。make ci には含めない。
+# 一時ヘルパーをビルドする。CI の platform-ci ジョブ（PR は ubuntu・main は 3 OS）が実行する。make ci には含めない。
 .PHONY: cli-parity-native-reclaim-check
 cli-parity-native-reclaim-check: ## capture のタイムアウトでネイティブ exe の子孫が回収されるかの確認（#1548）
 	bash scripts/cli-parity-native-reclaim-check.sh
@@ -671,7 +671,7 @@ fio-bench-selftest: ## fio ベンチスクリプトの自己テスト（REPAIR-1
 
 # virtio-gpu ゲスト側確認スクリプトの自己テスト（TASK-172.6・GPU-6・REPAIR-12）。
 # 合成 fixture のみで完結し、macOS 27・ゲスト VM は不要。make ci には含めない。CI は platform-ci
-# ジョブ（ubuntu・macos・windows の 3 OS）が本ターゲットを実行し、BSD 系ツールでの移植性も確かめる。
+# ジョブ（main への push では ubuntu・macos・windows の 3 OS、PR では ubuntu）が本ターゲットを実行し、BSD 系ツールでの移植性も確かめる。
 .PHONY: vz-virtio-gpu-guest-check-selftest
 vz-virtio-gpu-guest-check-selftest: ## virtio-gpu ゲスト側確認スクリプトの自己テスト（TASK-172.6・GPU-6・REPAIR-12。fixture のみ）
 	bash poc/vz-custom-virtio-gpu/guest/check-virtio-gpu-selftest.sh

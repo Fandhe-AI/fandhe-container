@@ -604,3 +604,15 @@ fn task1602_gpu6_is_priority_line_matches_only_known_events() {
     ));
     assert!(!is_priority_line("venus_jig event=launch_errors code=X"));
 }
+
+/// GPU-6・TASK-172 F5.2b.1（#1639）: ack のログ行は固定語彙と要求 ID だけで、照合器に壊れた行と見なされない。
+#[test]
+fn f5_2b_1_gpu6_need_reply_ack_line_is_fixed_vocabulary() {
+    let ok = crate::log::need_reply_ack_line(16, true);
+    let err = crate::log::need_reply_ack_line(8, false);
+    assert_eq!(ok, "venus_jig event=need_reply_ack request=16 result=ok");
+    assert_eq!(err, "venus_jig event=need_reply_ack request=8 result=err");
+    let report = crate::log::find_capset_queries(&format!("{ok}\n{err}")).expect("report");
+    assert_eq!(report.malformed_lines, 0);
+    assert_eq!(report.venus_get_capset_ok, 0);
+}

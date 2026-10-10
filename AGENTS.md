@@ -202,7 +202,7 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 | fio ベースライン比算出 | `scripts/fio-baseline-ratio.sh`・`scripts/testdata/fio-baseline/` | `make fio-baseline-ratio-selftest`（自己テスト）・`make fio-baseline-ratio`（比率算出） | TASK-25.2: 手順・比率算出・目標値案は整備済み。Docker ベースライン比の実測値は人間実施待ち（#114） |
 | 実機前提テスト | 既定のテスト集合から分離する | 分離の仕組みは該当タスクで決める | 下記「実機前提テスト」節・[ci](.claude/rules/ci.md)「実機前提テスト」を参照 |
 | feature 無効構成（PLUG-3・TASK-111.1・TASK-111.2） | `crates/core` の `plugin` feature（`--no-default-features`） | `make test-core-no-plugin`（CI の `rust-ci-default-features` ジョブが実行）・`make plugin-feature-size`（release ビルドの rlib サイズ記録。CI の `bench-regression` ジョブが実行。記録: [plugin-feature-size-record](docs/design/plugin-feature-size-record.md)） | 無効構成で core がテストでき、依存ツリーに `fandhe-container-plugin` が入らないことを検証する |
-| CLI のバックエンド非依存（CLI-1・PLUG-4・TASK-79.4） | `crates/cli/Cargo.toml` | `make check-cli-backend-deps`（CI の `rust-ci-default-features` ジョブが実行） | `cargo tree -p fandhe-container-cli` に platform-* / plugin-macos / plugin-windows が現れないことを検証する。macOS / Windows は core の plugin 発見機構経由 |
+| CLI のバックエンド非依存（CLI-1・PLUG-4・TASK-79.4） | `crates/cli/Cargo.toml` | `make check-cli-backend-deps`（CI の `rust-ci-default-features` ジョブが実行） | `cargo tree -p fandhe-container-cli -e normal,build,dev --target all` に platform-macos / platform-windows / plugin-macos / plugin-windows / microvm / plugin-microvm が現れないことを検証する（build / dev 辺と cfg 限定の依存も対象。plugin-cri / plugin-mcp は範囲外）。macOS / Windows は core の plugin 発見機構経由 |
 | 依存・ライセンス検査 | `Cargo.toml`・`deny.toml` | `make deny` | 依存を追加・更新するときのみ（ユーザー承認制。[dependency-policy](.claude/rules/dependency-policy.md)） |
 
 コマンドと CI ジョブの対応は上記「回帰確認コマンド一覧」節の表を参照する（重複管理しない。TASK-94）。

@@ -45,8 +45,8 @@ mod tests;
 
 pub use error::{CodecError, CodecErrorCode};
 pub use message::{
-    ConfigPayload, Decoded, MemRegion, MemTable, Reply, Request, VringAddr, VringFd, VringState,
-    decode_reply, decode_request, decode_request_payload,
+    Ack, ConfigPayload, Decoded, MemRegion, MemTable, Reply, Request, VringAddr, VringFd,
+    VringState, decode_reply, decode_request, decode_request_payload,
 };
 #[cfg(target_os = "linux")]
 pub use transport_error::{TransportError, TransportErrorCode};
@@ -85,15 +85,18 @@ pub const VRING_INDEX_MASK: u64 = 0xff;
 pub const VRING_NOFD: u64 = 1 << 8;
 /// virtio feature の `VHOST_USER_F_PROTOCOL_FEATURES`（bit 30）。
 pub const F_PROTOCOL_FEATURES: u64 = 1 << 30;
-/// protocol feature の MQ（bit 0）。治具が広告する想定（F1.4 が実際に広告する）。
+/// protocol feature の MQ（bit 0）。治具が広告する（F1.4）。
 pub const PROTOCOL_F_MQ: u64 = 1 << 0;
+/// protocol feature の REPLY_ACK（bit 3）。確定すると、frontend が NEED_REPLY を立てた要求へ backend が応答する義務を負う
+/// （GPU-6・TASK-172 F5.2b.1・#1639。応答規則は `docs/design/venus-decoder-poc.md` 10.8）。
+pub const PROTOCOL_F_REPLY_ACK: u64 = 1 << 3;
 /// protocol feature の CONFIG（bit 9）。virtio-gpu config の読み出しに要る。
 pub const PROTOCOL_F_CONFIG: u64 = 1 << 9;
 
 /// 治具が扱う最小の要求種別（16 種）。値は QEMU rst と crosvm で一致する要求 ID。
 ///
-/// 前提: 治具は virtio feature の bit 30 を立て、protocol feature は CONFIG と MQ だけを広告する。
-/// REPLY_ACK・BACKEND_REQ・SHMEM・DEVICE_STATE・CONFIGURE_MEM_SLOTS は host-visible 共有メモリの方式（#1057）が
+/// 前提: 治具は virtio feature の bit 30 を立て、protocol feature は MQ・REPLY_ACK・CONFIG だけを広告する。
+/// BACKEND_REQ・SHMEM・DEVICE_STATE・CONFIGURE_MEM_SLOTS は host-visible 共有メモリの方式（#1057）が
 /// 決まるまで後送りで、それらの要求は `UNKNOWN_REQUEST` で拒否する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -159,6 +162,23 @@ impl RequestCode {
     /// ワイヤー上の要求 ID。
     pub fn as_u32(self) -> u32 {
         self as u32
+    }
+
+    /// この要求がもともと明示的な応答本体を持つなら真（`GET_*`）。
+    ///
+    /// QEMU `docs/interop/vhost-user.rst`（v10.1.0）の Communication 節は応答を求める要求として `GET_FEATURES`・
+    /// `GET_PROTOCOL_FEATURES`・`GET_QUEUE_NUM`・`GET_VRING_BASE`・`GET_CONFIG` を挙げ、REPLY_ACK 節は「応答本体を持つ要求は
+    /// NEED_REPLY があっても挙動が変わらない」とする。このため真の要求には追加の ack を返さず、既存の応答で兼ねる
+    /// （GPU-6・TASK-172 F5.2b.1・#1639）。
+    pub fn has_reply_body(self) -> bool {
+        matches!(
+            self,
+            Self::GetFeatures
+                | Self::GetProtocolFeatures
+                | Self::GetQueueNum
+                | Self::GetVringBase
+                | Self::GetConfig
+        )
     }
 }
 

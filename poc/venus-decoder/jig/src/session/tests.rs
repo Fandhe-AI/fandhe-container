@@ -92,7 +92,7 @@ fn gpu6_protocol_negotiation_values() {
     assert_eq!(
         s.handle(Request::GetProtocolFeatures, Vec::new())
             .expect("ok"),
-        Some(Reply::ProtocolFeatures(0x201))
+        Some(Reply::ProtocolFeatures(0x209))
     );
     assert_eq!(
         code_of(s.handle(Request::SetProtocolFeatures(0x203), Vec::new())),
@@ -360,4 +360,24 @@ fn repair5_worker_ends_on_deadline_when_op_keeps_would_block() {
     .expect("worker reports before the grace period");
     assert_eq!(r.expect_err("never completes").kind(), ErrorKind::TimedOut);
     assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// GPU-6・TASK-172 F5.2b.1（#1639）: `reply_ack()` は REPLY_ACK を含む確定の後だけ真になり、広告外の確定失敗では変わらない。
+#[test]
+fn f5_2b_1_gpu6_reply_ack_follows_confirmed_protocol_features() {
+    let mut s = State::new();
+    assert!(!s.reply_ack());
+    s.handle(Request::GetProtocolFeatures, Vec::new())
+        .expect("ok");
+    s.handle(Request::SetProtocolFeatures(0x201), Vec::new())
+        .expect("ok");
+    assert!(!s.reply_ack());
+    s.handle(Request::SetProtocolFeatures(0x209), Vec::new())
+        .expect("ok");
+    assert!(s.reply_ack());
+    assert_eq!(
+        code_of(s.handle(Request::SetProtocolFeatures(0x20b), Vec::new())),
+        (SessionErrorCode::FeatureNotOffered, Some(16))
+    );
+    assert!(s.reply_ack());
 }

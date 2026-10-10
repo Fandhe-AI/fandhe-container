@@ -5232,8 +5232,8 @@ mod tests {
             return;
         }
         let exe = std::env::current_exe().expect("current_exe");
-        let mut child = std::process::Command::new("unshare")
-            .args(["--user", "--map-root-user", "--mount", "--"])
+        let mut cmd = std::process::Command::new("unshare");
+        cmd.args(["--user", "--map-root-user", "--mount", "--"])
             .arg(exe)
             .args([
                 "--exact",
@@ -5242,21 +5242,11 @@ mod tests {
                 "--nocapture",
                 "--test-threads=1",
             ])
-            .env(OPEN_TREE_CHILD_ENV, "1")
-            .spawn()
-            .expect("spawn unshare");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let status = loop {
-            if let Some(s) = child.try_wait().expect("try_wait") {
-                break s;
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("child did not finish in 60s");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        };
+            .env(OPEN_TREE_CHILD_ENV, "1");
+        // 子の終了待ちには期限を設け、期限超過時の kill の失敗・回収猶予（5 秒）の超過も無期限に待たず
+        // 明示的に失敗させる（REPAIR-5）。同モジュールの `run_with_deadline`・`reap_bounded` を再利用する。
+        let status = run_with_deadline(cmd, std::time::Duration::from_secs(60))
+            .expect("spawn unshare and reap the inner open_tree test within the 60s deadline");
         assert!(status.success(), "child failed: {status:?}");
     }
 

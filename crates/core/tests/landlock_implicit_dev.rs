@@ -161,8 +161,27 @@ mod linux {
                     return;
                 }
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    // kill 失敗は握りつぶさず明示的に失敗させ、回収にも有限の猶予を設ける（REPAIR-5）。
+                    if let Err(e) = child.kill() {
+                        panic!(
+                            "child did not exit within {:?} and kill failed: {e}",
+                            timeout()
+                        );
+                    }
+                    let reap_deadline = Instant::now() + Duration::from_secs(10);
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) if Instant::now() < reap_deadline => {
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
+                            Ok(None) => panic!(
+                                "child could not be reaped after kill (timeout {:?})",
+                                timeout()
+                            ),
+                            Err(e) => panic!("try_wait failed while reaping child: {e}"),
+                        }
+                    }
                     panic!("child did not exit within {:?}", timeout());
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),

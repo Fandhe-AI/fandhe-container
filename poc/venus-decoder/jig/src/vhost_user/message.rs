@@ -417,7 +417,49 @@ impl Request {
     }
 }
 
-/// backend から frontend への応答（値を返す 5 種）。
+/// ack の失敗値（非 0 の固定値）。仕様は成功 0・失敗は非 0 とだけ定め、値の意味は無い。
+const ACK_FAILURE: u64 = 1;
+
+/// REPLY_ACK 確定後に、応答本体を持たない要求へ NEED_REPLY が立っていたとき返す u64 の ack。
+///
+/// `GET_*`（`RequestCode::has_reply_body` が真）の要求 ID では作れない。そうしないと frontend が ack の値を
+/// features 等の応答値として解釈しうる（REPAIR-2・GPU-6・TASK-172 F5.2b.1・#1639）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ack {
+    request: RequestCode,
+    value: u64,
+}
+
+impl Ack {
+    fn new(request: RequestCode, value: u64) -> Result<Self, CodecError> {
+        if request.has_reply_body() {
+            return Err(err(CodecErrorCode::InvalidValue, request));
+        }
+        Ok(Self { request, value })
+    }
+
+    /// 成功（値 0）の ack。
+    pub fn success(request: RequestCode) -> Result<Self, CodecError> {
+        Self::new(request, 0)
+    }
+
+    /// 失敗（非 0 の固定値）の ack。
+    pub fn failure(request: RequestCode) -> Result<Self, CodecError> {
+        Self::new(request, ACK_FAILURE)
+    }
+
+    /// 対応する要求種別。
+    pub fn request(&self) -> RequestCode {
+        self.request
+    }
+
+    /// 応答の u64（0 が成功）。
+    pub fn value(&self) -> u64 {
+        self.value
+    }
+}
+
+/// backend から frontend への応答（値を返す 5 種と、REPLY_ACK の ack）。
 // 固定長配列で持ちヒープ確保をしない設計（REPAIR-2）のため、バリアント間のサイズ差は許容する。
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,6 +476,8 @@ pub enum Reply {
     Config(ConfigPayload),
     /// `GET_CONFIG` のエラー応答（仕様どおりヘッダ size = 0 の空ペイロード）。
     ConfigError,
+    /// NEED_REPLY への ack（REPLY_ACK 確定後。応答本体を持たない要求のみ）。
+    Ack(Ack),
 }
 
 impl Reply {
@@ -445,6 +489,7 @@ impl Reply {
             Self::QueueNum(_) => RequestCode::GetQueueNum,
             Self::VringBase(_) => RequestCode::GetVringBase,
             Self::Config(_) | Self::ConfigError => RequestCode::GetConfig,
+            Self::Ack(a) => a.request(),
         }
     }
 
@@ -452,13 +497,14 @@ impl Reply {
     pub fn encode(&self) -> Result<EncodedMessage, CodecError> {
         let len = match self {
             Self::Features(_) | Self::ProtocolFeatures(_) | Self::QueueNum(_) => 8,
-            Self::VringBase(_) => 8,
+            Self::VringBase(_) | Self::Ack(_) => 8,
             Self::Config(c) => c.payload_len(),
             Self::ConfigError => 0,
         };
         let header = Header::new(self.code(), true, false, len)?;
         EncodedMessage::build(&header, |w| match self {
             Self::Features(v) | Self::ProtocolFeatures(v) | Self::QueueNum(v) => w.u64(*v),
+            Self::Ack(a) => w.u64(a.value()),
             Self::VringBase(s) => write_state(w, s),
             Self::Config(c) => c.write(w),
             Self::ConfigError => Ok(()),
@@ -492,8 +538,12 @@ pub fn decode_reply(buf: &[u8], expected: RequestCode) -> Result<Reply, CodecErr
         // ペイロード長 0 は GET_CONFIG のエラー応答（仕様）。
         RequestCode::GetConfig if payload.is_empty() => Reply::ConfigError,
         RequestCode::GetConfig => Reply::Config(ConfigPayload::read(&mut r, code)?),
-        // 応答を返さない要求（SET_* 等）への応答は最小集合に無い。
-        _ => return Err(err(CodecErrorCode::UnknownRequest, code)),
+        // 応答本体を持たない要求（SET_* 等）への応答は ack（u64）。frontend 視点の復号なので値は任意の u64 を受ける。
+        // 長さは上の total 照合で確定済みで、u64 が 8 バイトでなければ `r.u64()` / `finish` が LENGTH_MISMATCH にする。
+        _ => Reply::Ack(Ack {
+            request: code,
+            value: r.u64()?,
+        }),
     };
     r.finish()?;
     Ok(reply)

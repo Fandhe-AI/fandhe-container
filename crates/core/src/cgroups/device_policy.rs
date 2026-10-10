@@ -8,8 +8,9 @@
 //! GPU 以外のコンテナでも許可リスト外のデバイスノードを開けなくするための層（SEC-1）。
 //!
 //! # 呼び出し文脈・契約
-//! - 呼び出し元: 起動フロー。`IsolationPrivilege` から [`DevicePolicyMode`] を決める配線と launcher への結線は
-//!   #1314（本 issue では未結線。REPAIR-3）。GPU の `deviceNodes` を足したプログラムでの再利用（#562）は、
+//! - 呼び出し元: start 経路。`IsolationPrivilege` からの [`DevicePolicyMode`] の決定（`From` 実装）と
+//!   `cgroups::CgroupPrepared::apply_limits` の制限の段（#1716）は実装済みで、supervisor・launcher からの
+//!   呼び出しの結線は #1717・#1715（未結線。REPAIR-3）。GPU の `deviceNodes` を足したプログラムでの再利用（#562）は、
 //!   内部の `apply_device_policy_at` に別の `DeviceProgram` を渡す形で行う
 //! - コンテナのプロセスが cgroup に入る（`CgroupJoin` 段）**前**に、cgroup を作った runtime 側のプロセスから
 //!   呼ぶ。コンテナ側の seccomp は `bpf` を拒否するため、子プロセスからは呼べない
@@ -76,6 +77,7 @@ use std::os::fd::BorrowedFd;
 use super::{
     CgroupError, CgroupStep, ContainerCgroup, DeviceAllowList, DeviceProgram, record_cgroup_op,
 };
+use crate::exec::IsolationPrivilege;
 use crate::observability::OpRecorder;
 use crate::sys::{self, SysError, bpf};
 use crate::traits::ErrorCode;
@@ -93,6 +95,23 @@ pub enum DevicePolicyMode {
     Rootful,
     /// rootless。何も試さず [`DevicePolicyNotApplied::Rootless`] を返す。
     Rootless,
+}
+
+/// 権限モデルから適用経路を決める（#1716・SEC-1）。`match` は網羅（ワイルドカード無し）で、variant を足すと
+/// コンパイルエラーになり見直しを強制できる。
+///
+/// 渡すのは子の `isolate` が返す `IsolationReport` ではなく、launcher が **これから使う** 権限モデルである
+/// （デバイス許可プログラムは fork の前に親で付ける必要があるため）。申告と実際の euid の食い違いは
+/// `DeviceCgroupPolicy` 段の事前検証が fail-closed で拒否する。
+impl From<IsolationPrivilege> for DevicePolicyMode {
+    fn from(privilege: IsolationPrivilege) -> Self {
+        match privilege {
+            IsolationPrivilege::RootfulHostRoot => Self::Rootful,
+            IsolationPrivilege::RootlessSingleId | IsolationPrivilege::RootlessSubordinateIds => {
+                Self::Rootless
+            }
+        }
+    }
 }
 
 /// 適用結果。真偽値にせず、適用しなかった理由を型で返す（REPAIR-3）。
@@ -504,6 +523,23 @@ mod dry_run {
 
 #[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod tests {
+    /// SEC-1（#1716）: 権限モデルから適用経路への写像（rootful のみ `Rootful`）。
+    #[test]
+    fn sec1_task32_isolation_privilege_maps_to_device_policy_mode() {
+        assert_eq!(
+            DevicePolicyMode::from(IsolationPrivilege::RootfulHostRoot),
+            DevicePolicyMode::Rootful
+        );
+        assert_eq!(
+            DevicePolicyMode::from(IsolationPrivilege::RootlessSingleId),
+            DevicePolicyMode::Rootless
+        );
+        assert_eq!(
+            DevicePolicyMode::from(IsolationPrivilege::RootlessSubordinateIds),
+            DevicePolicyMode::Rootless
+        );
+    }
+
     use super::dry_run::{BpfCall, BpfScript, install, take_calls};
     use super::*;
     use crate::cgroups::{CGROUP_VERIFIER_LOG_MAX_BYTES, CgroupName};

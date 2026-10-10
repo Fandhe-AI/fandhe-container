@@ -46,8 +46,9 @@
 //!
 //! remover は自分の委譲スコープの下でコンテナ用 cgroup を探すため、create と別の委譲スコープから呼ばれると
 //! 実在する cgroup を見つけられず `NotPresent` を返す。照合なしにそれを成功扱いにすると、cgroup を
-//! 残したまま再試行の手掛かりである状態記録だけを消してしまう。そこで作成時のスコープを状態に記録し
-//! （`CreateStateRequest::with_cgroup_scope`）、削除側のスコープが一致したときだけ `NotPresent` を
+//! 残したまま再試行の手掛かりである状態記録だけを消してしまう。そこでスコープを状態に記録し
+//! （本番の経路では start で supervisor が `UpdateStateRequest::with_cgroup_scope` により追記する。#1314・
+//! TASK-32 追補。create 時の `CreateStateRequest::with_cgroup_scope` も有効）、削除側のスコープが一致したときだけ `NotPresent` を
 //! 「cgroup 無し」の確認として扱う。一致しなければ正しいスコープでの再実行を促す
 //! `FailedPrecondition` を返し、状態記録は残す（fail-closed）。
 //!

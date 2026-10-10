@@ -109,8 +109,8 @@ use super::rlimits::apply_rlimits;
 use super::sealed_copy::{SealPolicy, check_not_on_noexec_mount, seal_entrypoint_copy};
 use super::stages::{LaunchNotReady, LaunchReady};
 use super::{
-    ExecError, IsolationStage, MountIsolation, PivotReport, StagePipeline, ViolationReason,
-    describe, fd_mount_id, pivot_root, prepare_rootfs,
+    DevptsGidSource, ExecError, IsolationStage, MountIsolation, PivotReport, StagePipeline,
+    ViolationReason, create_default_devices, describe, fd_mount_id, pivot_root, prepare_rootfs,
 };
 
 /// argv の要素数の上限（アロケーション前に検証する）。
@@ -1651,7 +1651,7 @@ fn parse_setup_report(text: &str) -> Option<ExecChildSetupReport> {
 /// ノード（#834）の差し込み位置は、pivot 後・exec 前（`exec_entrypoint` の直前）を想定する。
 /// デバイスノードを pivot の前後どちらで作るかは #834 で決める（本 PR では決めない）。
 fn child_main(rootfs: &Path, entry: &Entrypoint, stages: StagePipeline) -> i32 {
-    match run_child(rootfs, entry, stages) {
+    match run_child(rootfs, entry, stages, None) {
         Ok(never) => match never {},
         Err(err) => {
             // env の値は message に含めない（パスと errno のみ）。stderr が閉じていても panic しない。
@@ -1665,8 +1665,9 @@ fn run_child(
     rootfs: &Path,
     entry: &Entrypoint,
     stages: StagePipeline,
+    devices: Option<DevptsGidSource<'_>>,
 ) -> Result<Infallible, ExecError> {
-    run_child_then(rootfs, stages, |isolation, report, evidence| {
+    run_child_then(rootfs, devices, stages, |isolation, report, evidence| {
         // `exec_entrypoint` と同じ検証を、ステージ列が作った証跡を添えて行う。
         isolation.verify_caller(IsolationStage::Exec)?;
         require_restriction_evidence(evidence)?;
@@ -1682,6 +1683,7 @@ fn run_child(
 /// は変わらない。
 fn run_child_then<T>(
     rootfs: &Path,
+    devices: Option<DevptsGidSource<'_>>,
     stages: StagePipeline,
     terminal: impl FnOnce(
         &MountIsolation,
@@ -1691,6 +1693,11 @@ fn run_child_then<T>(
 ) -> Result<T, ExecError> {
     let isolation = MountIsolation::establish()?;
     let prepared = prepare_rootfs(&isolation, rootfs)?;
+    // 専用 /dev（基本デバイス 1:3 の null を含む）を pivot 前に載せる経路は結合試験専用（`devices` が `Some`）。
+    // 本番の配線は #1314。None なら従来どおり何も載せない。
+    if let Some(source) = devices {
+        create_default_devices(&isolation, &prepared, source)?;
+    }
     let report = pivot_root(&isolation, prepared)?;
     // pivot 後・終端前にステージ列を固定順で実行する。
     stages.run_then(|_stage_report, _capability_report, evidence| {
@@ -1700,7 +1707,7 @@ fn run_child_then<T>(
 
 /// 子のメイン（プローブ版）。失敗は `child_main` と同じ規約で stderr へ 1 行出して終了コードにする。
 fn child_main_probe(rootfs: &Path, stages: StagePipeline) -> i32 {
-    let result = run_child_then(rootfs, stages, |_isolation, _report, _evidence| {
+    let result = run_child_then(rootfs, None, stages, |_isolation, _report, _evidence| {
         let record = super::seccomp::probe_denied_syscalls()?;
         publish_probe_record(&record.render())
     });
@@ -1801,7 +1808,7 @@ where
 {
     let pid = sys::fork_single_threaded(
         move || {
-            let result = run_child_then(rootfs, stages, |isolation, _report, _evidence| {
+            let result = run_child_then(rootfs, None, stages, |isolation, _report, _evidence| {
                 // 本番 `run_child` と同じ呼び出し元検証（PID 1・入れ子 PID namespace・シングルスレッド）を
                 // プローブ実行前に行う。`require_restriction_evidence` は意図的に呼ばない（下記の例外）。
                 isolation.verify_caller(IsolationStage::Exec)?;
@@ -1848,6 +1855,35 @@ pub fn spawn_container_with_stages(
 ) -> Result<ContainerChild, ExecError> {
     let pid = sys::fork_single_threaded(|| child_main(rootfs, entry, stages), EXIT_SETUP_FAILED)
         .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
+    Ok(ContainerChild::new(pid))
+}
+
+/// 結合試験専用: `spawn_container_with_stages` に、pivot 前の専用 `/dev`（`create_default_devices`）を足した版
+/// （CORE-5・SEC-1・REPAIR-12・#1714）。
+///
+/// `LaunchReady` がそろった後の `redirect_stdio_to_null` が検証済みの `/dev/null`（文字デバイス 1:3）を開けることを、
+/// 実 exec（`execveat`）の成功で照合するための入口。`/dev` の本番配線（#1314）までの暫定で、
+/// 制限適用の証跡の要求（`require_restriction_evidence`）は `spawn_container_with_stages` と同じく行う。
+/// 通常の利用者は呼ばない。
+#[doc(hidden)]
+#[cfg(feature = "exec-test-support")]
+pub fn spawn_container_with_stages_and_devices(
+    rootfs: &Path,
+    entry: &Entrypoint,
+    stages: StagePipeline,
+    devices: DevptsGidSource<'_>,
+) -> Result<ContainerChild, ExecError> {
+    let pid = sys::fork_single_threaded(
+        || match run_child(rootfs, entry, stages, Some(devices)) {
+            Ok(never) => match never {},
+            Err(err) => {
+                let _ = writeln!(std::io::stderr(), "fandhe-container: {err}");
+                exit_code_for(&err)
+            }
+        },
+        EXIT_SETUP_FAILED,
+    )
+    .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
     Ok(ContainerChild::new(pid))
 }
 

@@ -161,6 +161,10 @@ pub use process::spawn_container_probe;
 /// 結合試験 `tests/seccomp.rs` 専用の再公開（CORE-5・TASK-38.4・#179。通常の利用者は呼ばない。詳細は定義側）。
 #[doc(hidden)]
 pub use process::spawn_container_seccomp_probe;
+/// 結合試験 `tests/fork_exec_isolation.rs` 専用の再公開（CORE-5・SEC-1・REPAIR-12・#1714。通常の利用者は呼ばない。詳細は定義側）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use process::spawn_container_with_stages_and_devices;
 pub use process::{
     ChildExit, ContainerChild, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV,
     ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES, EXIT_EXEC_NOT_EXECUTABLE,

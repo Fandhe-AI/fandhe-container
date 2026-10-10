@@ -361,6 +361,8 @@ mod linux {
         let is_root = is_root();
         // 環境（docker 等）が既に NO_NEW_PRIVS=1 のことがあるため、適用前の値を記録して期待値にする。
         let inherited_nnp = no_new_privs_flag();
+        // user namespace に入ると 0 に見えるため、分離の前に実効 gid を控える（rootless の devpts の gid 判定に使う）。
+        let host_egid = host_egid();
         if inherited_nnp == 1 {
             // 継承済みだと設定操作の有無を nnp ログで区別できない（順序のみの検証になる）。
             println!(
@@ -471,7 +473,7 @@ mod linux {
                         r#"[{"destination":"/no-such-landlock-dir","options":["rw"]}]"#,
                     ),
                 };
-                let ruleset = landlock_ruleset(readonly, mounts);
+                let ruleset = landlock_ruleset(readonly, mounts, ImplicitDevMounts::None);
                 let stages = StagePipeline::new()
                     .with_hook(StageKind::CgroupJoin, logging_hook(StageKind::CgroupJoin))
                     .and_then(|p| p.with_landlock(ruleset))
@@ -489,13 +491,16 @@ mod linux {
                 // `LaunchReady` がそろい、エントリポイントの検査・標準 fd の置換を経て `execveat` へ到達する。
                 // プローブ ELF の終了コード 42 は exec が実際に行われた場合にだけ得られる（拒否は 126）。
                 // 読み取り専用 rootfs でも実行権限は許可される。
-                let ruleset = landlock_ruleset(true, "[]");
+                // 標準 fd の置換は検証済みの `/dev/null`（文字デバイス 1:3）を開くため、子の pivot 前に専用の `/dev`
+                // （`create_default_devices`。rootless はホストのノードの bind）を載せ、Landlock には暗黙の `/dev`・
+                // `/dev/pts` の許可を足す（`/dev/shm` は載せないので `WithoutShm`）。
+                let ruleset = landlock_ruleset(true, "[]", ImplicitDevMounts::WithoutShm);
                 let stages = StagePipeline::new()
                     .with_hook(StageKind::CgroupJoin, logging_hook(StageKind::CgroupJoin))
                     .and_then(|p| p.with_landlock(ruleset))
                     .unwrap_or_else(|e| panic!("register landlock: {e}"));
                 want = ChildExit::Exited(PROBE_EXIT);
-                spawn_container_with_stages(rootfs, &entry, stages)
+                spawn_with_dev(rootfs, &entry, stages, host_egid, is_root)
             }
             _ => spawn_container(rootfs, &entry),
         }
@@ -612,8 +617,53 @@ mod linux {
         }
     }
 
+    /// 分離の前の実効 gid（`/proc/self/status` の `Gid:` の 2 列目）。
+    fn host_egid() -> u32 {
+        std::fs::read_to_string("/proc/self/status")
+            .expect("read status")
+            .lines()
+            .find(|l| l.starts_with("Gid:"))
+            .and_then(|l| l.split_whitespace().nth(2).map(str::to_string))
+            .and_then(|v| v.parse().ok())
+            .expect("parse egid")
+    }
+
+    /// 専用 `/dev` を pivot 前に載せて起動する（`landlock-exec`。#1714）。
+    #[cfg(feature = "exec-test-support")]
+    fn spawn_with_dev(
+        rootfs: &Path,
+        entry: &Entrypoint,
+        stages: StagePipeline,
+        host_egid: u32,
+        is_root: bool,
+    ) -> Result<fandhe_container_core::exec::ContainerChild, ExecError> {
+        use fandhe_container_core::exec::{
+            DevptsGidSource, spawn_container_with_stages_and_devices,
+        };
+        use fandhe_container_core::rootless::single_id_mapping;
+        let gid_map = single_id_mapping(host_egid).expect("single id mapping");
+        let source = if is_root {
+            DevptsGidSource::Rootful
+        } else {
+            DevptsGidSource::Rootless(&gid_map)
+        };
+        spawn_container_with_stages_and_devices(rootfs, entry, stages, source)
+    }
+
+    /// feature なしのビルドでは入口が無い。検証せずに成功しない（fail-closed）。
+    #[cfg(not(feature = "exec-test-support"))]
+    fn spawn_with_dev(
+        _rootfs: &Path,
+        _entry: &Entrypoint,
+        _stages: StagePipeline,
+        _host_egid: u32,
+        _is_root: bool,
+    ) -> Result<fandhe_container_core::exec::ContainerChild, ExecError> {
+        panic!("not verified; the exec-test-support feature is not enabled (landlock-exec)");
+    }
+
     /// `root.readonly` と mounts から実カーネルの ABI を検出して Landlock ruleset を作る（親・fork 前）。
-    fn landlock_ruleset(readonly: bool, mounts: &str) -> LandlockRuleset {
+    fn landlock_ruleset(readonly: bool, mounts: &str, dev: ImplicitDevMounts) -> LandlockRuleset {
         let json = format!(
             r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":{readonly}}},"mounts":{mounts}}}"#
         );
@@ -621,15 +671,10 @@ mod linux {
         let support = detect_landlock_abi()
             .unwrap_or_else(|e| panic!("Landlock ABI 6+ is required for this test: {e}"));
         // rootfs に dev が無い最小フロー（`spawn_container` は `create_default_devices` を呼ばない。#1314 未配線）
-        // では暗黙の `/dev` 系のルールを足せない（存在しないパスは適用時に拒否される）ため含めない。ルールは
-        // 従来と同じで弱体化ではない。#1314 で配線したら `ImplicitDevMounts::All` に戻す（#1657）。
-        build_path_rules_with_dev(
-            &support,
-            config.root(),
-            config.mounts(),
-            ImplicitDevMounts::None,
-        )
-        .unwrap_or_else(|e| panic!("rules: {e}"))
+        // では暗黙の `/dev` 系のルールを足せない（存在しないパスは適用時に拒否される）ため `None` を渡す。
+        // 専用 `/dev` を載せる `landlock-exec` だけ `WithoutShm` を渡す。#1314 で配線したら `All` に戻す（#1657）。
+        build_path_rules_with_dev(&support, config.root(), config.mounts(), dev)
+            .unwrap_or_else(|e| panic!("rules: {e}"))
     }
 
     /// 自プロセスの `/proc/self/status` の `NoNewPrivs:` の値（0 または 1）。

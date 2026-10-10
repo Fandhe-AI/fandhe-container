@@ -69,7 +69,7 @@
 use crate::seccomp::{BpfInstruction, SeccompProgram};
 use std::ffi::{CStr, CString};
 use std::io;
-use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, IntoRawFd as _, OwnedFd};
+use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd};
 
 /// syscall 失敗の分類。`crate::exec` が `ErrorCode` へ写す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1374,17 +1374,24 @@ pub(crate) fn move_mount_empty_path(
     from: BorrowedFd<'_>,
     to: BorrowedFd<'_>,
 ) -> Result<(), SysError> {
+    move_mount_empty_path_raw(from.as_raw_fd(), to.as_raw_fd())
+}
+
+/// [`move_mount_empty_path`] の本体。fd 番号（`RawFd`）を受ける非公開部分で、無効 fd の拒否（`EBADF`）を
+/// `BorrowedFd` の契約に反せず単体テストで確かめるために切り出している。呼び出し側は生存中の fd を渡す。
+#[cfg_attr(test, allow(dead_code))]
+fn move_mount_empty_path_raw(from: RawFd, to: RawFd) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
-    // SAFETY: `from`・`to` は生存中の `BorrowedFd`。パスは静的な空文字列で、`*_EMPTY_PATH` により fd 自身が
+    // SAFETY: `from`・`to` は fd 番号の整数で、カーネルが検証する（無効なら `EBADF`）。パスは静的な空文字列で、`*_EMPTY_PATH` により fd 自身が
     // 対象になる（パス解決なし）。副作用は呼び出しスレッドの mount namespace へのマウント 1 件の追加に限る。
     let rc = unsafe {
         syscall(
             consts::SYS_MOVE_MOUNT,
-            i64::from(from.as_raw_fd()),
+            i64::from(from),
             c"".as_ptr(),
-            i64::from(to.as_raw_fd()),
+            i64::from(to),
             c"".as_ptr(),
             i64::from(move_mount_empty_path_flags()),
         )
@@ -1423,16 +1430,23 @@ fn open_tree_clone_flags() -> u32 {
 // #1660 で呼び出し元を足すまでの間のみ許可する（配線時に外す）。
 #[allow(dead_code)]
 pub(crate) fn open_tree_clone(node: BorrowedFd<'_>) -> Result<OwnedFd, SysError> {
+    open_tree_clone_raw(node.as_raw_fd())
+}
+
+/// [`open_tree_clone`] の本体。fd 番号（`RawFd`）を受ける非公開部分で、無効 fd の拒否（`EBADF`）を
+/// `BorrowedFd` の契約に反せず単体テストで確かめるために切り出している。
+#[allow(dead_code)]
+fn open_tree_clone_raw(node: RawFd) -> Result<OwnedFd, SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
-    // SAFETY: `node` は生存中の `BorrowedFd`。パスは静的な空文字列（NUL 終端）で、`AT_EMPTY_PATH` により fd 自身が
+    // SAFETY: `node` は fd 番号の整数で、カーネルが検証する（無効なら `EBADF`）。パスは静的な空文字列（NUL 終端）で、`AT_EMPTY_PATH` により fd 自身が
     // 対象になる（パス解決なし）。`AT_RECURSIVE` は付けない。成功時の戻り値は新規 fd で、直後に
     // `new_mount_api_fd` が唯一の所有者にする。副作用は未接続の複製マウントの作成に限る（fd を閉じれば破棄される）。
     new_mount_api_fd(unsafe {
         syscall(
             consts::SYS_OPEN_TREE,
-            i64::from(node.as_raw_fd()),
+            i64::from(node),
             c"".as_ptr(),
             i64::from(open_tree_clone_flags()),
         )
@@ -4517,13 +4531,9 @@ mod tests {
         assert_eq!(effective_uid(), euid);
     }
 
-    /// 存在しない fd 番号（`RLIMIT_NOFILE` を超える値）を `BorrowedFd` にして `open_tree_clone` へ渡す。
+    /// 存在しない fd 番号（`RLIMIT_NOFILE` を超える値）。`BorrowedFd` は作らず `RawFd` のまま非公開部分へ渡す。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    fn bogus_fd() -> BorrowedFd<'static> {
-        // SAFETY: 1_000_000 は通常の `RLIMIT_NOFILE` を超える番号で、このプロセスの有効な fd ではない。
-        // 渡す先は `open_tree(2)` のみで、失敗（EBADF）するだけであり、fd への I/O も close もしない。
-        unsafe { BorrowedFd::borrow_raw(1_000_000) }
-    }
+    const BOGUS_FD: RawFd = 1_000_000;
 
     /// CORE-6・SEC-5（TASK-29 追補・#1659）: 失敗経路。無効な fd は `Os(EBADF)`（非特権では先に
     /// 特権検査で `Os(EPERM)`）で返り、パニックも縮退（`mount(2)` への切り替え）もしない。`move_mount_empty_path` も同様。
@@ -4532,10 +4542,10 @@ mod tests {
     fn core6_sec5_open_tree_and_move_mount_fail_with_ebadf_on_invalid_fd() {
         // 特権チェックが fd 検証より先に走るため、非特権では EPERM になる（どちらも拒否で、成功しない）。
         let accepted = [SysError::Os(EBADF), SysError::Os(EPERM)];
-        let err = open_tree_clone(bogus_fd()).unwrap_err();
+        let err = open_tree_clone_raw(BOGUS_FD).unwrap_err();
         assert!(accepted.contains(&err), "unexpected error: {err:?}");
         let null = std::fs::File::open("/dev/null").expect("open /dev/null");
-        let err = move_mount_empty_path(bogus_fd(), null.as_fd()).unwrap_err();
+        let err = move_mount_empty_path_raw(BOGUS_FD, null.as_raw_fd()).unwrap_err();
         assert!(accepted.contains(&err), "unexpected error: {err:?}");
     }
 
@@ -4618,11 +4628,37 @@ mod tests {
     fn open_tree_bind_checks() {
         use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 
-        let dir = std::env::temp_dir().join(format!("fandhe-open-tree-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create dir");
-        let target_file = dir.join("null");
-        std::fs::write(&target_file, b"").expect("create target file");
+        // 共有の一時領域で予測可能な名前・既存ディレクトリの受け入れ・symlink 追従を避ける: 0700 で排他的に
+        // `create_dir` し（既存は拒否して名前を変えて再試行）、対象ファイルは `create_new`（O_EXCL。
+        // symlink は追従せず既存なら失敗）で作る。
+        let (dir, target_file) = {
+            use std::os::unix::fs::DirBuilderExt as _;
+            let mut attempt = 0u32;
+            let dir = loop {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos())
+                    .unwrap_or(0);
+                let candidate = std::env::temp_dir().join(format!(
+                    "fandhe-open-tree-{}-{nanos}-{attempt}",
+                    std::process::id()
+                ));
+                match std::fs::DirBuilder::new().mode(0o700).create(&candidate) {
+                    Ok(()) => break candidate,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 16 => {
+                        attempt += 1;
+                    }
+                    Err(e) => panic!("create dir: {e}"),
+                }
+            };
+            let target_file = dir.join("null");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target_file)
+                .expect("create target file exclusively");
+            (dir, target_file)
+        };
 
         // fd 起点で /dev/null を複製できる。fd は close-on-exec（fdinfo の flags が O_CLOEXEC = 02000000）。
         let node = open_o_path("/dev/null");

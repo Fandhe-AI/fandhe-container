@@ -13,7 +13,8 @@
 //! これによりノードがホスト側の rootfs に残らず、イメージ同梱の `dev` 配下（偽ノード等）は tmpfs に
 //! 覆い隠されてコンテナから見えない。覆い隠す効果は `dev` 配下に限る（#1667 の事後監査 P2）: rootfs の残りの
 //! 部分にイメージが同梱したデバイスノードは、rootful では `prepare_rootfs` が自己 bind に付ける `nodev`
-//! （#1676）で開けない。rootless は従来どおり。汎用のデバイス cgroup は #1677 で扱う（SEC-1）。
+//! （#1676）で開けない。rootless の rootfs には足さない。`nodev` は rootfs の mount top 1 枚だけに掛かり、本モジュールが
+//! 後から載せる `/dev` の tmpfs・devpts・rootless の bind（#1660）には及ばない。汎用のデバイス cgroup は #1677 で扱う（SEC-1）。
 //! tmpfs の作成は `sys::mount_dev_tmpfs_on`（#1652。mode 0755・64 MiB・`nosuid|strictatime`・`nodev`/`noexec`
 //! なし）を使う。
 //!

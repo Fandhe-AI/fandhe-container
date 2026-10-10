@@ -113,6 +113,9 @@ fn frontend(b: UnixStream, replies: Vec<u64>) -> JoinHandle<Vec<Seen>> {
                 fds.len(),
                 meta,
             ));
+            // 受け取った fd は応答の前に閉じる。応答後に残すと、治具側の試験が応答を受けた直後に数える memfd に
+            // この dup が混ざり、fd 数の照合が競合する。
+            drop(fds);
             send_with_fds(&b, &encode_backend_reply(d.request, v), &[], T).expect("reply");
         }
         seen

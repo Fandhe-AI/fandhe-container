@@ -4516,4 +4516,149 @@ mod tests {
         let euid: u32 = line.split_whitespace().nth(2).unwrap().parse().unwrap();
         assert_eq!(effective_uid(), euid);
     }
+
+    /// 存在しない fd 番号（`RLIMIT_NOFILE` を超える値）を `BorrowedFd` にして `open_tree_clone` へ渡す。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn bogus_fd() -> BorrowedFd<'static> {
+        // SAFETY: 1_000_000 は通常の `RLIMIT_NOFILE` を超える番号で、このプロセスの有効な fd ではない。
+        // 渡す先は `open_tree(2)` のみで、失敗（EBADF）するだけであり、fd への I/O も close もしない。
+        unsafe { BorrowedFd::borrow_raw(1_000_000) }
+    }
+
+    /// CORE-6・SEC-5（TASK-29 追補・#1659）: 失敗経路。無効な fd は `Os(EBADF)`（非特権では先に
+    /// 特権検査で `Os(EPERM)`）で返り、パニックも縮退（`mount(2)` への切り替え）もしない。`move_mount_empty_path` も同様。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core6_sec5_open_tree_and_move_mount_fail_with_ebadf_on_invalid_fd() {
+        // 特権チェックが fd 検証より先に走るため、非特権では EPERM になる（どちらも拒否で、成功しない）。
+        let accepted = [SysError::Os(EBADF), SysError::Os(EPERM)];
+        let err = open_tree_clone(bogus_fd()).unwrap_err();
+        assert!(accepted.contains(&err), "unexpected error: {err:?}");
+        let null = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let err = move_mount_empty_path(bogus_fd(), null.as_fd()).unwrap_err();
+        assert!(accepted.contains(&err), "unexpected error: {err:?}");
+    }
+
+    /// CORE-6・SEC-5（TASK-29 追補・#1659）: 特権（`CAP_SYS_ADMIN`）を持たない呼び出しは、ホストのノードを
+    /// 複製できず `Os(EPERM)`（Linux 5.2 未満なら `Unsupported`）で拒否される。非 root のときのみ検証する
+    /// （root では成功し得るため。成功経路は下の実機前提テストが user namespace 内で検証する）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core6_sec5_open_tree_clone_without_privilege_is_rejected() {
+        if effective_uid() == 0 {
+            return;
+        }
+        let node = open_o_path("/dev/null");
+        let err = open_tree_clone(node.as_fd()).unwrap_err();
+        assert!(
+            err == SysError::Os(EPERM) || err == SysError::Unsupported,
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// `path` を `O_PATH | O_NOFOLLOW` で開く（実機前提テストと特権なしテストの共通部品）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn open_o_path(path: &str) -> OwnedFd {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let flags = path_nofollow_open_flags().expect("supported arch");
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags)
+            .open(path)
+            .expect("open O_PATH")
+            .into()
+    }
+
+    /// 実機前提テストの子側であることを示す環境変数。
+    const OPEN_TREE_CHILD_ENV: &str = "FANDHE_OPEN_TREE_CHILD";
+
+    /// CORE-6・SEC-5（TASK-29 追補・#1659）: 実機前提（非特権 user namespace を許可するホスト。util-linux の
+    /// `unshare`）。`unshare --user --map-root-user --mount` で隔離した子として自身（`--ignored`）を再実行し、
+    /// 子の中で `open_tree_clone` → `move_mount_empty_path` の成功経路を照合する。実行:
+    /// `cargo test -p fandhe-container-core --lib core6_sec5_open_tree_binds -- --ignored`
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires unprivileged user+mount namespaces and util-linux unshare (CORE-6, SEC-5)"]
+    fn core6_sec5_open_tree_binds_host_device_node_in_userns() {
+        if std::env::var_os(OPEN_TREE_CHILD_ENV).is_some() {
+            open_tree_bind_checks();
+            return;
+        }
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut child = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "--"])
+            .arg(exe)
+            .args([
+                "--exact",
+                "sys::tests::core6_sec5_open_tree_binds_host_device_node_in_userns",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(OPEN_TREE_CHILD_ENV, "1")
+            .spawn()
+            .expect("spawn unshare");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            if let Some(s) = child.try_wait().expect("try_wait") {
+                break s;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child did not finish in 60s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(status.success(), "child failed: {status:?}");
+    }
+
+    /// 子側の照合。fd 起点の複製・close-on-exec・ファイルへの接続・失敗時の未接続を具体値で確かめる。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn open_tree_bind_checks() {
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+        let dir = std::env::temp_dir().join(format!("fandhe-open-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let target_file = dir.join("null");
+        std::fs::write(&target_file, b"").expect("create target file");
+
+        // fd 起点で /dev/null を複製できる。fd は close-on-exec（fdinfo の flags が O_CLOEXEC = 02000000）。
+        let node = open_o_path("/dev/null");
+        let clone = open_tree_clone(node.as_fd()).expect("open_tree_clone");
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", clone.as_raw_fd()))
+            .expect("read fdinfo");
+        let flags = info
+            .lines()
+            .find_map(|l| l.strip_prefix("flags:"))
+            .map(|v| i64::from_str_radix(v.trim(), 8).expect("octal flags"))
+            .expect("flags line");
+        assert_eq!(flags & 0o2_000_000, 0o2_000_000, "fdinfo: {info}");
+
+        // 失敗時: ディレクトリ（ファイルの複製の接続先として不正）へ接続すると拒否され、何も接続されない。
+        let dir_fd = open_o_path(dir.to_str().expect("utf8 path"));
+        let err = move_mount_empty_path(clone.as_fd(), dir_fd.as_fd()).unwrap_err();
+        assert!(matches!(err, SysError::Os(_)), "{err:?}");
+        let before = std::fs::metadata(&target_file).expect("stat");
+        assert!(
+            before.file_type().is_file(),
+            "target must stay a regular file"
+        );
+
+        // 成功: 通常ファイルへ接続すると、そのパスが /dev/null（文字デバイス 1:3）として見える。
+        let to = open_o_path(target_file.to_str().expect("utf8 path"));
+        move_mount_empty_path(clone.as_fd(), to.as_fd()).expect("move_mount_empty_path");
+        let meta = std::fs::metadata(&target_file).expect("stat after attach");
+        assert!(meta.file_type().is_char_device());
+        let rdev = meta.rdev();
+        // major = 1, minor = 3（Linux の dev_t エンコード: major は bit 8..19、minor は下位 8bit）。
+        assert_eq!(((rdev >> 8) & 0xfff, rdev & 0xff), (1, 3));
+        // 読み書きが通る（/dev/null として機能している）。
+        std::fs::write(&target_file, b"x").expect("write to attached /dev/null");
+
+        // 後始末（mount namespace は子の終了で破棄される）。
+        drop(clone);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

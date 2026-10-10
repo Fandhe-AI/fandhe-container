@@ -773,9 +773,12 @@ fn describe(err: SysError) -> String {
     }
 }
 
-/// errno を `ErrorCode` に写す。`EPERM`/`EACCES` → `PermissionDenied`、
+/// [`SysError`] を `ErrorCode` に写す。`EPERM`/`EACCES` → `PermissionDenied`、
 /// `EINVAL`（例: マルチスレッドからの `CLONE_NEWUSER`）→ `FailedPrecondition`、
-/// 対応外 arch → `Unimplemented`、その他 → `Internal`。
+/// `MultiThreaded`（fork 前のシングルスレッド確認の失敗）→ `FailedPrecondition`、
+/// `Unsupported`（対応外 arch、または新マウント API の `ENOSYS`〔古いカーネル〕。経路の一覧は
+/// [`SysError::Unsupported`] の doc）→ `Unimplemented`、その他の errno（新マウント API 以外の
+/// `ENOSYS` を含む）→ `Internal`。
 fn errno_to_code(err: SysError) -> ErrorCode {
     match err {
         SysError::Unsupported => ErrorCode::Unimplemented,
@@ -2211,9 +2214,18 @@ mod tests {
         );
     }
 
-    /// errno 写像の具体値。
+    /// errno 写像の具体値。`Unsupported` に写らない `ENOSYS`（新マウント API 以外）は `Internal` のまま、
+    /// `MultiThreaded` は `FailedPrecondition`（`errno_to_code` の doc の写像。#1690 第 2 回監査 P3-6・REPAIR-12）。
     #[test]
     fn errno_maps_to_error_code() {
+        assert_eq!(
+            errno_to_code(SysError::Os(sys::ENOSYS)),
+            ErrorCode::Internal
+        );
+        assert_eq!(
+            errno_to_code(SysError::MultiThreaded),
+            ErrorCode::FailedPrecondition
+        );
         assert_eq!(
             errno_to_code(SysError::Os(sys::EPERM)),
             ErrorCode::PermissionDenied
@@ -2240,6 +2252,44 @@ mod tests {
         /// `mount_is_shared` に返させる値（テストスレッドごと。`None` は実際の propagation を読む）。
         pub(super) static DRY_RUN_SHARED: std::cell::Cell<Option<bool>> =
             const { std::cell::Cell::new(None) };
+    }
+
+    /// [`DRY_RUN_SHARED`] の差し込み値を保持するガード。スコープを抜けると（panic で巻き戻る場合も）
+    /// 必ず `None` へ戻し、同じテストスレッドの後続テストへ差し込み値を残さない（#1690 第 2 回監査 P3-7・
+    /// REPAIR-12）。`rootfs::tests::prepare_with_shared` が使う。
+    #[must_use = "the override is cleared when the guard is dropped"]
+    pub(super) struct SharedOverride(());
+
+    impl Drop for SharedOverride {
+        fn drop(&mut self) {
+            DRY_RUN_SHARED.with(|s| s.set(None));
+        }
+    }
+
+    /// `mount_is_shared` の判定を `shared` に固定し、戻すためのガードを返す。
+    pub(super) fn override_shared(shared: bool) -> SharedOverride {
+        DRY_RUN_SHARED.with(|s| s.set(Some(shared)));
+        SharedOverride(())
+    }
+
+    /// REPAIR-12・CORE-1（#1690 第 2 回監査 P3-7・#1676）: 差し込み値はガードの drop で戻る。正常に
+    /// スコープを抜けた場合も、panic で巻き戻った場合も `None` になる（後続テストへ漏れない）。
+    #[test]
+    fn repair12_shared_override_is_cleared_on_drop_and_panic() {
+        DRY_RUN_SHARED.with(|s| s.set(None));
+        {
+            let _guard = override_shared(false);
+            assert_eq!(DRY_RUN_SHARED.with(std::cell::Cell::get), Some(false));
+        }
+        assert_eq!(DRY_RUN_SHARED.with(std::cell::Cell::get), None);
+
+        let caught = std::panic::catch_unwind(|| {
+            let _guard = override_shared(true);
+            assert_eq!(DRY_RUN_SHARED.with(std::cell::Cell::get), Some(true));
+            panic!("injected panic while the override is held");
+        });
+        assert!(caught.is_err());
+        assert_eq!(DRY_RUN_SHARED.with(std::cell::Cell::get), None);
     }
 
     /// dry-run の記録を取り出して空にする。libtest のワーカースレッドが再利用されても、

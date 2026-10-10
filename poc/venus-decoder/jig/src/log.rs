@@ -5,6 +5,7 @@
 //!
 //! 書き出し側の [`LogSink`] は起動 bin（`launch`。#1598）が使い、照合器の上限に収まるよう総量・行長・行数を抑える（REPAIR-5）。
 //! 読み取り側の [`read_log_file`] は通常ファイル以外を open 前に拒否する（FIFO で open が止まるのを防ぐ。事後監査 #1528 D2）。
+//! Unix では open 後に `dev` / `ino` を open 前の値と比べ、間に別のファイルへ差し替えられたものを拒否する（事後監査 PR #1611）。
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -439,6 +440,9 @@ impl<W: Write> LogSink<W> {
 pub enum LogFileError {
     /// 通常ファイルでない（symlink・FIFO・ディレクトリ等）。open する前に拒否する。
     NotRegularFile,
+    /// open 前に確かめたファイルと open したファイルが違う（`dev` / `ino` の不一致。間に rename や symlink で
+    /// 差し替えられた。Unix のみ検出する）。
+    Replaced,
     /// 状態の取得または open に失敗した。
     Open,
     /// 読み取りに失敗した。
@@ -452,18 +456,33 @@ pub enum LogFileError {
 /// 治具のログファイルを上限つきで読む（事後監査 #1528 D2。実機前提テストが使う）。
 ///
 /// 手順: (1) `symlink_metadata` で通常ファイル以外を open 前に拒否する（FIFO は書き手が現れるまで open が止まるため）。
-/// (2) open する。(3) 開いた fd の `metadata` で通常ファイルとサイズ上限を確かめ直す。(4) `MAX_LOG_BYTES + 1` で打ち切って読む。
-/// 限界: (1) と (2) の間に FIFO へ差し替えられる競合は残る（`O_NONBLOCK` / `O_NOFOLLOW` の値はアーキごとに異なり、
-/// ここでは扱わない）。呼び出し側は読み取りを期限つきで待つこと（REPAIR-5）。
+/// (2) open する。(3) 開いた fd の `metadata` で通常ファイルであることと、Unix では `dev` / `ino` が (1) と同じであること
+/// （間に別のファイルへ rename・symlink で差し替えられていないこと。不一致は `Replaced`）を確かめ、サイズ上限を見る。
+/// (4) `MAX_LOG_BYTES + 1` で打ち切って読む。
+/// 限界: (1) と (2) の間に FIFO へ差し替えられると (2) の open が止まり、(3) の照合まで進まない（`O_NONBLOCK` /
+/// `O_NOFOLLOW` の値はアーキごとに異なり、ここでは扱わない）。呼び出し側は読み取りを期限つきで待つこと（REPAIR-5）。
+/// Unix 以外は std の stable API にファイルの同一性（`dev` / `ino` 相当）が無いため (3) の同一性の照合をしない。
 pub fn read_log_file(path: &Path) -> Result<String, LogFileError> {
+    read_log_file_with(path, || {})
+}
+
+/// [`read_log_file`] の本体。`between` は (1) と (2) の間に呼ばれ、差し替えの試験だけが中身を渡す（本番は空）。
+pub(crate) fn read_log_file_with(
+    path: &Path,
+    between: impl FnOnce(),
+) -> Result<String, LogFileError> {
     let before = fs::symlink_metadata(path).map_err(|_| LogFileError::Open)?;
     if !before.file_type().is_file() {
         return Err(LogFileError::NotRegularFile);
     }
+    between();
     let file = fs::File::open(path).map_err(|_| LogFileError::Open)?;
     let meta = file.metadata().map_err(|_| LogFileError::Open)?;
     if !meta.file_type().is_file() {
         return Err(LogFileError::NotRegularFile);
+    }
+    if !same_file(&before, &meta) {
+        return Err(LogFileError::Replaced);
     }
     if meta.len() > MAX_LOG_BYTES as u64 {
         return Err(LogFileError::TooLarge);
@@ -476,4 +495,17 @@ pub fn read_log_file(path: &Path) -> Result<String, LogFileError> {
         return Err(LogFileError::TooLarge);
     }
     String::from_utf8(bytes).map_err(|_| LogFileError::NotUtf8)
+}
+
+/// open 前（`symlink_metadata`）と open 後（fd の `metadata`）が同じファイルか（`dev` と `ino` の一致）。
+#[cfg(unix)]
+fn same_file(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    before.dev() == after.dev() && before.ino() == after.ino()
+}
+
+/// Unix 以外は同一性を確かめる stable API が無いので照合しない（[`read_log_file`] の限界。実装済みを装わない）。
+#[cfg(not(unix))]
+fn same_file(_before: &fs::Metadata, _after: &fs::Metadata) -> bool {
+    true
 }

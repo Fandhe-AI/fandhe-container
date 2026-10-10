@@ -59,6 +59,9 @@ pub enum LaunchErrorCode {
     PeerUidMismatch,
     /// 接続元の UID を取得できない（PLUG-12。fail-closed で接続を閉じた）。
     PeerCredUnavailable,
+    /// 実行ユーザーの effective UID が overflowuid（既定 65534）で、マッピング外の接続元と区別できない
+    /// （PLUG-12。fail-closed で接続を閉じた）。
+    PeerUidUnverifiable,
     /// セッションがエラーで終わった（`cause` にセッションの code）。
     SessionFailed,
     /// Linux 以外では実行できない。
@@ -95,6 +98,7 @@ impl LaunchErrorCode {
             Self::SocketRemoveFailed => "SOCKET_REMOVE_FAILED",
             Self::PeerUidMismatch => "PEER_UID_MISMATCH",
             Self::PeerCredUnavailable => "PEER_CRED_UNAVAILABLE",
+            Self::PeerUidUnverifiable => "PEER_UID_UNVERIFIABLE",
             Self::SessionFailed => "SESSION_FAILED",
             Self::Unsupported => "UNSUPPORTED",
         }
@@ -135,6 +139,9 @@ impl LaunchErrorCode {
             Self::SocketRemoveFailed => "cannot remove the socket file created by this process",
             Self::PeerUidMismatch => "peer uid differs from the current user; connection rejected",
             Self::PeerCredUnavailable => "cannot determine the peer uid; connection rejected",
+            Self::PeerUidUnverifiable => {
+                "the current uid is the overflow uid 65534; the peer uid cannot be verified; connection rejected"
+            }
             Self::SessionFailed => "vhost-user session ended with an error",
             Self::Unsupported => "venus-jig requires Linux",
         }

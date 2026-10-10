@@ -41,10 +41,11 @@ pub mod vhost_user;
 pub mod virtqueue;
 
 /// syscall の薄いラッパー。`unsafe` はここにだけ置く（Linux 限定）。
-// 理由: `sys` は #1517 の個別承認 U1〜U10 の unsafe（syscall・fd 所有・mmap・境界検査後のコピー）を持つ唯一の
-// モジュールで、この allow はオーナーが承認条件として指定した配置（U1〜U8:
+// 理由: `sys` は #1517 の個別承認 U1〜U11 の unsafe（syscall・fd 所有・mmap・境界検査後のコピー・peer credential の
+// 取得）を持つ唯一のモジュールで、この allow はオーナーが承認条件として指定した配置（U1〜U8:
 // https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6074351741 、U9・U10 と lint 構成:
-// https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6075711404 ）。各 unsafe ブロックには
+// https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6075711404 、U11〔追認〕:
+// https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6092697332 ）。各 unsafe ブロックには
 // `// SAFETY:` を付け、`unsafe fn` を外へ公開しない。外部入力の検証は `sys` の外の safe コードと `sys` の境界検査で行う。
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]

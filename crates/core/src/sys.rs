@@ -1865,6 +1865,10 @@ fn open_tree_clone_raw(node: RawFd) -> Result<OwnedFd, SysError> {
 
 /// `mount_setattr(2)` の `struct mount_attr`（include/uapi/linux/mount.h。`MOUNT_ATTR_SIZE_VER0` = 32 バイト）。
 /// 値は [`rootfs_nodev_mount_attr`]・[`read_only_mount_attr`] だけが作る（任意のビットを渡す経路を持たない。REPAIR-2・SEC-1）。
+///
+/// 構築子はどれも private な固定の `const fn` で、`attr_clr`・`propagation`・`userns_fd` は 0（属性を足すだけ）。
+/// 構築子を足す・変えるときは、[`mount_setattr_empty_path_raw`] の `// SAFETY:` と、構築子の一覧と値を具体値で
+/// 照合する単体テスト `sec1_sup12_mount_attr_constructors_are_exhaustive` を合わせて更新すること（#1693 の事後監査 P3）。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MountAttr {
@@ -1978,8 +1982,11 @@ fn set_mount_read_only_raw(fd: RawFd) -> Result<(), SysError> {
     mount_setattr_empty_path_raw(fd, read_only_mount_attr())
 }
 
-/// `mount_setattr(fd, "", AT_EMPTY_PATH, attr, 32)` の共通本体。`attr` は固定の const 構築子
-/// （[`rootfs_nodev_mount_attr`]・[`read_only_mount_attr`]）の値だけが渡る（本関数は private）。
+/// `mount_setattr(fd, "", AT_EMPTY_PATH, attr, 32)` の共通本体。`attr` は `attr_clr` = 0 の private な固定 const
+/// 構築子（[`rootfs_nodev_mount_attr`]・[`read_only_mount_attr`]）の値だけが渡る（本関数は private）。
+///
+/// 構築子を足すときは、下の `// SAFETY:` と構築子一覧の単体テスト `sec1_sup12_mount_attr_constructors_are_exhaustive`
+/// を合わせて更新する（[`MountAttr`] の doc を参照）。
 #[cfg_attr(test, allow(dead_code))]
 fn mount_setattr_empty_path_raw(fd: RawFd, attr: MountAttr) -> Result<(), SysError> {
     if !consts::SUPPORTED {
@@ -1988,8 +1995,9 @@ fn mount_setattr_empty_path_raw(fd: RawFd, attr: MountAttr) -> Result<(), SysErr
     let nr = consts::SYS_MOUNT_SETATTR.get()?;
     // SAFETY: `fd` は fd 番号の整数で、カーネルが検証する（無効なら `EBADF`）。パスは静的な空文字列（NUL 終端）で、
     // `AT_EMPTY_PATH` により fd 自身が対象になる。`attr` は呼び出しの間生存する 32 バイトの `repr(C)` で、
-    // カーネルは読むだけ（`size` は構造体の大きさ）。属性は `attr_clr` = 0 の固定構築子由来で、
-    // 副作用は fd が指す 1 マウントへの属性の追加（nodev または rdonly）に限る。
+    // カーネルは読むだけ（`size` は構造体の大きさ）。`attr` は `attr_clr` = 0 の private な固定 const 構築子
+    // （`rootfs_nodev_mount_attr`・`read_only_mount_attr`）の値だけが渡り、副作用は fd が指す 1 マウントへの
+    // 属性の追加に限る（既存の属性は外さない）。構築子を足すときは本コメントと構築子一覧の試験を更新する。
     let rc = unsafe {
         syscall(
             nr,
@@ -4503,9 +4511,11 @@ mod tests {
         );
     }
 
-    /// SUP-12（TASK-169.2）: tmpfs のフラグは nosuid・nodev を常に含み、可変なのは ro / exec だけ。
+    /// SUP-12（TASK-169.2）: tmpfs の `statfs.f_type`（`TMPFS_MAGIC`）の具体値。tmpfs の `fsmount` の attr フラグ
+    /// （nosuid・nodev 固定、ro / exec の 4 通り）は `sup12_task169_tmpfs_attr_bits_are_exact` が照合する
+    /// （`MS_*` 側の `TmpfsMountFlags::bits` は #1693 で削除。#1693 の事後監査 P3・REPAIR-12）。
     #[test]
-    fn sup12_task169_2_tmpfs_flags_are_exact() {
+    fn sup12_task169_2_tmpfs_magic_is_exact() {
         assert_eq!(TMPFS_MAGIC, 0x0102_1994);
     }
 
@@ -4783,6 +4793,50 @@ mod tests {
             assert_eq!(mount_setattr_flags() & 0x8000, 0);
         }
         assert_eq!(std::mem::size_of::<MountAttr>(), 32);
+    }
+
+    /// SEC-1・SUP-12（#1676・#1620・#1693 の事後監査 P3）: `MountAttr` の構築子は `rootfs_nodev_mount_attr`・
+    /// `read_only_mount_attr` の 2 つだけで、どちらも `attr_clr`・`propagation`・`userns_fd` が 0（属性を足すだけ）。
+    /// `mount_setattr_empty_path_raw` の `// SAFETY:` はこの一覧を前提にするため、構築子を足すと本テストが落ちる
+    /// （ソースを走査して `-> MountAttr` を返す `const fn` と `MountAttr {` の構築式を数える）。
+    #[test]
+    fn sec1_sup12_mount_attr_constructors_are_exhaustive() {
+        let fields = |a: MountAttr| (a.attr_set, a.attr_clr, a.propagation, a.userns_fd);
+        let listed = [
+            ("rootfs_nodev_mount_attr", fields(rootfs_nodev_mount_attr())),
+            ("read_only_mount_attr", fields(read_only_mount_attr())),
+        ];
+        assert_eq!(
+            listed,
+            [
+                ("rootfs_nodev_mount_attr", (0x4, 0, 0, 0)),
+                ("read_only_mount_attr", (0x1, 0, 0, 0)),
+            ],
+            "attr_set, attr_clr, propagation, userns_fd"
+        );
+        // テスト以外のソース（`mod tests` より前）を走査する。本テスト自身の行は対象外になる。
+        let src = include_str!("sys.rs");
+        let body = src.split("\nmod tests {").next().unwrap_or(src);
+        let constructors: Vec<&str> = body
+            .lines()
+            .filter(|l| l.trim_end().ends_with("-> MountAttr {"))
+            .filter_map(|l| l.trim_start().strip_prefix("const fn "))
+            .filter_map(|l| l.split('(').next())
+            .collect();
+        assert_eq!(
+            constructors,
+            vec!["rootfs_nodev_mount_attr", "read_only_mount_attr"]
+        );
+        let functions_returning_attr = body.lines().filter(|l| l.contains("-> MountAttr")).count();
+        assert_eq!(
+            functions_returning_attr, 2,
+            "no other MountAttr constructor"
+        );
+        let literals = body.lines().filter(|l| l.trim() == "MountAttr {").count();
+        assert_eq!(
+            literals, 2,
+            "MountAttr is built only in the listed constructors"
+        );
     }
 
     /// SEC-1（#1676）: `is_nodev` は `ST_NODEV`（0x4）だけを見る。

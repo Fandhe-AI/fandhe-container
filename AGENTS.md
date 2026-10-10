@@ -73,7 +73,8 @@ make idle-memory-supervised-selftest   # 監視プロセス込みアイドル常
 make idle-memory-supervised DRIVER=<abs-path> [EXPECTED_DIR=<dir>] [OUTPUT=<file>] [IDLE_MEMORY_SUPERVISED_TIMEOUT=<秒>]  # 0 個 → 監視プロセス込み 1 個 → 0 個の常駐メモリを計測し 0 へ戻ることを判定（実機前提・make ci 対象外。Linux・root の操作者が明示実行し、スクリプト内で sudo は呼ばない。DRIVER は `up` / `down` を受ける実行可能ファイルの絶対パスで、製品バイナリ〔TASK-79〕未提供のため現状は実 driver なし。実機では EXPECTED_DIR に配置ディレクトリを渡す）。終了コードは idle-memory と同じ契約（0 = 成功、1 = 期待違反、2 = 引数・入力エラー、3 = 計測失敗・driver 失敗）。make は失敗時に自身は 2 で終わるため、レシピの値は `Error <n>` 行で確認する
 make supervisor-independence-selftest   # 監視プロセス独立性実証スクリプトの自己テスト（TASK-162・SUP-5・REPAIR-12。スタブ launcher のみで実コンテナ・root は使わない。終了コード 0 かつ FAIL 行なし。Linux・非 root 限定）
 make supervisor-independence LAUNCHER=<abs-path> BUNDLE=<dir> [COUNT=<n>] [TARGET_INDEX=<k>] [OUTPUT=<新規ファイル>] [SUPERVISOR_INDEPENDENCE_TIMEOUT=<秒>]  # N（既定 50）個の監視プロセスのうち 1 個を SIGKILL し、残りの生存・継続と孤児化したコンテナの稼働継続を確認する（実機前提・make ci 対象外。TASK-162・SUP-5。スクリプト内で sudo は呼ばない）
-make cli-parity-native-reclaim-check   # capture のタイムアウトでネイティブ exe の子孫が回収されるかの実測（#1548・TASK-125.1・CLI-1・REPAIR-5。rustc で一時ヘルパーをビルド。`cli-parity native reclaim:` 行を出力）
+make cli-parity-native-reclaim-check   # capture のタイムアウトでネイティブ exe の子孫が回収されるかの実測（#1548・TASK-125.1・CLI-1・REPAIR-5。rustc で一時ヘルパーをビルド。`cli-parity native reclaim:` 行を出力。全体期限 150 秒〔`CLI_PARITY_RECLAIM_DEADLINE_SECS`〕を超えると `deadline_exceeded` の行つきで失敗し、段ごとの経過を `phase=` 行で stderr に出す。#1688）
+make cli-parity-native-reclaim-selftest   # 回収確認スクリプトの全体期限の自己テスト（#1688・REPAIR-5・REPAIR-12。ハングを注入し、期限以上・期限 + 猶予 30 秒以内の非ゼロ終了と `deadline_exceeded` の行を経過秒で照合。rustc でヘルパーをビルド。約 90 秒。終了コード 0 かつ FAIL 行なし）
 make cli-parity-selftest   # CLI 3 OS 比較スクリプトの自己テスト（TASK-125.1・CLI-1・REPAIR-12。スタブ CLI のみで製品バイナリ・root は使わない。終了コード 0 かつ FAIL 行なし）
 make commit-msg-line-length-selftest   # commit-msg フックの本文行長検査（100 文字）スクリプトの自己テスト（Issue #1295・REPAIR-12。一時ファイルのみ。終了コード 0 かつ FAIL 行なし）
 make cli-parity CLI=<abs-path> OUTPUT=<新規ファイル>  # 基本 6 コマンドの終了コード・code・stdout 形式を正規化して記録する（実機前提・make ci 対象外。TASK-125.1。判定は #661）
@@ -129,7 +130,7 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 | `test-integration` | `platform-ci`（PR は ubuntu・main は 3 OS） |
 | `poc-venus-jig-check` | `platform-ci`（PR は ubuntu・main は 3 OS）。PR の macOS 向けは `cross-target-check` が `aarch64-apple-darwin` で check / clippy） |
 | `deny-poc-venus-jig`（`deny` からも呼ぶ） | `platform-ci`（ubuntu のみ。結果が OS に依らない依存監査のため） |
-| `plug4-core-invariance-selftest`・`cli-parity-selftest`・`cli-parity-native-reclaim-check`・`vz-virtio-gpu-guest-check-selftest` | `platform-ci`（PR は ubuntu・main は 3 OS。Windows は Git Bash） |
+| `plug4-core-invariance-selftest`・`cli-parity-selftest`・`cli-parity-native-reclaim-check`・`cli-parity-native-reclaim-selftest`・`vz-virtio-gpu-guest-check-selftest` | `platform-ci`（PR は ubuntu・main は 3 OS。Windows は Git Bash） |
 | `bench-check-selftest`・`bench-baseline-selftest`・`bench-check`・`bench-plugin-boundary`・`plugin-feature-size` | `bench-regression` |
 | （対応 target なし。`rustup target add aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc` の後に、`<target>` をこの 3 つに置き換えて `cargo check --workspace --all-targets --all-features --target <target>` と `cargo clippy --workspace --all-targets --all-features --target <target> -- -D warnings`。`aarch64-apple-darwin`・`x86_64-pc-windows-msvc` は加えて既定 feature の `cargo clippy --workspace --all-targets --target <target> -- -D warnings` と `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --target <target>`。venus 試験治具は `cargo check` / `cargo clippy --manifest-path poc/venus-decoder/jig/Cargo.toml --locked --all-targets --target aarch64-apple-darwin`〔clippy は `-- -D warnings`〕） | `cross-target-check` |
 | `lint-docs` | `lint-docs` |

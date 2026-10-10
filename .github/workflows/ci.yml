@@ -46,6 +46,20 @@ on:
           （既定 false 相当）
         type: boolean
         default: false
+      reclaim-hang-probe:
+        description: >-
+          platform-ci の cli-parity 回収確認（scripts/cli-parity-native-reclaim-check.sh）に
+          ハングを注入し、止まり方を実証する（#1688・REPAIR-5）。step-timeout = スクリプトの期限を
+          実質無効にしてステップの timeout-minutes だけで止まるかを見る / script-deadline =
+          スクリプトの期限（150 秒）で止まることを見る。どちらもプローブ step は必ず失敗で終わる
+          （期待どおり止まった証拠は job の時刻とログ）。PR ブランチへ --ref で dispatch すれば 3 OS で回り、
+          concurrency group が PR 自身の CI と衝突しない。PR・push では存在しない（none 相当）
+        type: choice
+        options:
+          - none
+          - step-timeout
+          - script-deadline
+        default: none
   pull_request:
   push:
     branches: [main]
@@ -351,6 +365,8 @@ jobs:
       # github.event_name で明示的に絞る。値は env 経由でのみ受け取り、
       # run: スクリプトへ `${{ }}` を直接埋め込まない（スクリプトインジェクション対策）
       HANG_PROBE: ${{ github.event_name == 'workflow_dispatch' && inputs.hang-probe == true }}
+      # #1688: choice 入力も env 経由で受け渡す（run: へ ${{ }} を埋め込まない。HANG_PROBE と同じ対策）
+      RECLAIM_HANG_PROBE: ${{ github.event_name == 'workflow_dispatch' && inputs.reclaim-hang-probe || 'none' }}
       # 個別テスト 1 件ごとの推奨タイムアウト値（秒。PoC-8 実測に基づく
       # 5〜10 秒のレンジの上限寄り。TASK-87.1・#40・REPAIR-5）。この値を読んで
       # 使う消費側は `crates/io/tests/responsiveness.rs` と
@@ -549,6 +565,37 @@ jobs:
           EOF
           cargo test --manifest-path "${probe_dir}/Cargo.toml" --no-run
 
+      # cli-parity 回収確認のハングプローブ（#1688・REPAIR-5。workflow_dispatch の reclaim-hang-probe 指定時のみ）。
+      # 本番 step と同じ timeout-minutes 5 で、ハング注入（capture 段で内側の監視を無効化）が (a) ステップの
+      # timeout-minutes だけで止まるか（step-timeout。期限 3600 秒・寿命 3600 秒で実質無効）、(b) スクリプトの
+      # 期限 150 秒で止まるか（script-deadline）を実証する。コマンドが戻った場合も false-green を防ぐため
+      # exit 1 にする。失敗すると後続 step は既定の success() 条件で skip される（本ジョブに always() の step は無い）。
+      # 新ジョブにせず既存ジョブの step とする（check-run 件数は不変）
+      - name: cli-parity 回収確認のハングプローブ（#1688。workflow_dispatch の reclaim-hang-probe 指定時のみ）
+        if: env.RECLAIM_HANG_PROBE != 'none'
+        timeout-minutes: 5
+        run: |
+          set -uo pipefail
+          case "${RECLAIM_HANG_PROBE}" in
+            step-timeout)
+              CLI_PARITY_RECLAIM_TEST_HANG=capture CLI_PARITY_RECLAIM_DEADLINE_SECS=3600 STUB_NATIVE_TICKS=3600 \
+                make cli-parity-native-reclaim-check
+              ;;
+            script-deadline)
+              CLI_PARITY_RECLAIM_TEST_HANG=capture STUB_NATIVE_TICKS=3600 \
+                make cli-parity-native-reclaim-check 2>&1 | tee "${RUNNER_TEMP}/reclaim-probe.log"
+              if grep -q 'deadline_exceeded phase=capture' "${RUNNER_TEMP}/reclaim-probe.log"; then
+                echo "::notice::reclaim probe: script deadline fired (expected)"
+              fi
+              ;;
+            *)
+              echo "invalid reclaim-hang-probe: ${RECLAIM_HANG_PROBE}" >&2
+              exit 1
+              ;;
+          esac
+          echo "reclaim hang probe returned (the probe is expected to fail by timeout or deadline)" >&2
+          exit 1
+
       - name: 結合試験の実行（ステージ 3・タイムアウト保護。REPAIR-5 / REPAIR-7）
         timeout-minutes: 10
         env:
@@ -596,11 +643,21 @@ jobs:
         run: make cli-parity-selftest
 
       # capture のタイムアウトでネイティブ exe の子孫が回収されるかの実測（#1548・TASK-125・CLI-1・REPAIR-5）。
-      # ログの `cli-parity native reclaim:` 行が Windows での確認結果。既存ジョブのステップ（check-run 件数は不変）
+      # ログの `cli-parity native reclaim:` 行が Windows での確認結果。既存ジョブのステップ（check-run 件数は不変）。
+      # #1688: Windows でこの step が止まり timeout-minutes が効かずジョブ上限まで続いた。スクリプト自身が全体の
+      # 期限（150 秒）を持ち、期限切れ時は子孫を回収して `deadline_exceeded` の行つきで失敗する。段ごとの経過は
+      # `phase=<段> event=start|end elapsed=<秒>` で stderr に出る
       - name: CLI 比較スクリプトのタイムアウト回収確認（ネイティブ exe・#1548）
         if: env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: make cli-parity-native-reclaim-check
+
+      # 回収確認スクリプトの全体期限の自己テスト（#1688・REPAIR-5・REPAIR-12）。ハングを注入して期限以上・期限 +
+      # 猶予以内に非ゼロで終わることを経過秒で照合する。約 90 秒。既存ジョブの step（check-run 件数は不変）
+      - name: CLI 比較スクリプトの期限・回収の自己テスト（#1688・REPAIR-5・REPAIR-12。PR は ubuntu・main は 3 OS）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make cli-parity-native-reclaim-selftest
 
       # virtio-gpu ゲスト側確認スクリプト（poc/vz-custom-virtio-gpu/guest/check-virtio-gpu.sh）の自己テスト
       # （TASK-172.6・GPU-6・REPAIR-12・#1056）。合成 fixture（testdata/）と偽の dmesg だけを使い、

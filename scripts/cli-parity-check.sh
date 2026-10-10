@@ -36,6 +36,8 @@
 # Windows（Git Bash）のネイティブ exe の子は POSIX の pgid を持たないため、未回収の CLI に限り
 # taskkill /T でツリーごと回収する（kill_win_tree。#1548）。CLI の正常終了後に残った子孫と、期限前に
 # 親が死んで孤児になった子孫は辿れない。CI での確認は scripts/cli-parity-native-reclaim-check.sh。
+# taskkill と run_cli の wait には wall clock の上限が無い（kill が届かないと塞がる。#1688）。CI では
+# reclaim-check 側の全体期限（既定 150 秒）で外から止めている。
 #
 # 動作環境: bash 3.2 以上（macOS 標準）。GNU / BSD 双方のツールで動く書き方にしている。
 # Windows は Git Bash で実行する。自己テスト（スタブ CLI）は CI の windows runner でも実行するが、

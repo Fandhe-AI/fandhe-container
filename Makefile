@@ -407,6 +407,12 @@ cli-parity-selftest: ## CLI 3 OS 比較スクリプトの自己テスト（TASK-
 cli-parity-native-reclaim-check: ## capture のタイムアウトでネイティブ exe の子孫が回収されるかの確認（#1548）
 	bash scripts/cli-parity-native-reclaim-check.sh
 
+# 回収確認の全体期限の自己テスト（#1688・REPAIR-5・REPAIR-12）。ハングを注入して期限で止まることを経過秒で照合する。
+# rustc でヘルパーをビルドしハングするプロセスを起動するため make ci には含めない。CI の platform-ci（PR は ubuntu・main は 3 OS）が実行する。
+.PHONY: cli-parity-native-reclaim-selftest
+cli-parity-native-reclaim-selftest: ## 回収確認スクリプトの全体期限の自己テスト（#1688・REPAIR-5・REPAIR-12）
+	bash scripts/cli-parity-native-reclaim-check-selftest.sh
+
 # commit-msg フックの本文行長検査（Issue #1295）。一時ファイルのみで完結する。make ci には含めない。
 .PHONY: commit-msg-line-length-selftest
 commit-msg-line-length-selftest: ## commit-msg 行長検査スクリプトの自己テスト（Issue #1295・REPAIR-12）

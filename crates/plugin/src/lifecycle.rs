@@ -31,7 +31,7 @@
 //!   孫が残り得る）または直接の子の未回収（`Unreaped`）が起きた場合、stderr へ 1 行の JSON
 //!   （`{"event":"plugin_child_cleanup","op":"drop","outcome":"error","reason":"group_kill_failed"|"unreaped"}`。
 //!   `unreaped` のみ保持中の `pid` を整数で付す）を 1 回だけ出す。ブロックしないことを保証できる出力先（Linux の
-//!   socket。`crate::sys` の `write_nonblocking`）でだけ書き、それ以外（pipe・端末・通常ファイル・macOS）は捨てる。書き込み失敗は無視し、plugin 由来の文字列は
+//!   AF_UNIX の socket。`crate::sys` の `write_nonblocking`）でだけ書き、それ以外（TCP 等の他の socket・pipe・端末・通常ファイル・macOS）は捨てる。書き込み失敗は無視し、plugin 由来の文字列は
 //!   載せない。`unreaped_error` で報告済みの子と、`Drop` の前に明示的な経路で手放した子（回収済み・他所で回収された
 //!   `Lost`。そこで返したグループ停止の失敗を含む）は記録しない。
 //! - 子の環境変数は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ設定する（資格情報を継承させない）。

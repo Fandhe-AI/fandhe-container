@@ -313,7 +313,8 @@ const SEND_LOG_LINE_FIXED_OVERHEAD_BYTES: usize = 256;
 /// エスケープ後の `message` フィールドが取りうる最大バイト数の見積もり。
 /// [`escape_json_string`] は 1 文字を最大でも `\u00xx` の 6 バイトへ展開するため、
 /// 切り詰め後のメッサージ長（バイト単位。[`MAX_SEND_LOG_MESSAGE_BYTES`]）に対して
-/// 6 倍を上限とみなす（実際に 6 倍へ達するのは制御文字が連続する病的な入力のみ）。
+/// 6 倍を上限とみなす（実際に 6 倍へ達するのは C0 制御文字が連続する病的な入力のみ。
+/// DEL・C1・Cf 等の置換は 1〜4 バイトを 1 バイトへ縮めるだけで上限に影響しない）。
 const MAX_ESCAPED_MESSAGE_BYTES: usize = MAX_SEND_LOG_MESSAGE_BYTES * 6;
 
 /// [`JsonLinesSendObserver`] がためる 1 行の JSON がとりうる最大バイト数の見積もり。
@@ -624,7 +625,8 @@ fn outcome_reason_str(outcome: SendOutcome) -> &'static str {
     }
 }
 
-/// 制御文字・`"`・`\` を JSON 文字列リテラルとして安全な形へエスケープする。
+/// 制御文字・`"`・`\` を JSON 文字列リテラルとして安全な形へエスケープし、DEL・C1・Cf・Zl・Zp・
+/// U+2065 は空白へ置換する（判定は `display_sanitize`。表示順の偽装・不可視文字の防止。ERR-1）。
 ///
 /// 依存を追加せず手書きで JSON を組み立てるための最小実装（serde_json 相当の
 /// 完全な仕様準拠は目指さない。ERR-1 の `message` を出力する用途に限る）。
@@ -642,6 +644,7 @@ fn escape_json_string(input: &str) -> String {
             c if (c as u32) < 0x20 => {
                 escaped.push_str(&format!("\\u{:04x}", c as u32));
             }
+            c if crate::display_sanitize::is_display_unsafe_char(c) => escaped.push(' '),
             c => escaped.push(c),
         }
     }
@@ -1641,6 +1644,31 @@ mod tests {
                  \"latency_us\":0}"
             ]
         );
+    }
+
+    /// ERR-1: DEL・C1・Cf・Zl・Zp・U+2065 は空白へ置換され、C0 は従来どおり `\u00xx`、結合文字等は素通し。
+    #[test]
+    fn err1_repair4_json_lines_observer_replaces_display_unsafe_chars() {
+        let mut observer = JsonLinesSendObserver::new();
+        observer.on_send(&failure_event(
+            FrameKind::Flush,
+            SendOutcome::RejectedInvalidFrameKind,
+            IoErrorCode::InvalidArgument,
+            "a\u{7f}b\u{85}c\u{200b}d\u{202e}e\u{2028}f\u{2029}g\u{feff}h\u{e0001}i\u{2065}j\u{1}k\u{301}\u{3164}",
+            0,
+        ));
+
+        assert_eq!(
+            observer.drain_lines(),
+            vec![
+                "{\"event\":\"io_send\",\"kind\":\"FLUSH\",\"outcome\":\"error\",\
+                 \"reason\":\"rejected_invalid_frame_kind\",\"code\":\"INVALID_ARGUMENT\",\
+                 \"message\":\"a b c d e f g h i j\\u0001k\u{301}\u{3164}\",\
+                 \"latency_us\":0}"
+            ]
+        );
+        // ACK 側・サーバー側のエンコーダも同じ `escape_json_string` を通る。
+        assert_eq!(escape_json_string("x\u{202e}y\u{85}z"), "x y z");
     }
 
     /// REPAIR-5: `with_capacity(0)` と `MAX_SEND_LOG_CAPACITY + 1` は

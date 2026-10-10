@@ -429,6 +429,42 @@ fn plug12_peer_cred_failure_is_rejected() {
     assert_eq!(e.exit_code(), 1);
 }
 
+/// PLUG-12: 実行ユーザーの euid が overflowuid（65534）なら、接続元も 65534 に見えて一致しても
+/// `PEER_UID_UNVERIFIABLE` で拒否する（マッピング外の接続元と区別できないため。fail-closed）。
+#[test]
+fn plug12_overflow_uid_is_rejected_even_if_peer_matches() {
+    let e = verify_peer(Ok(65534), 65534).expect_err("reject");
+    assert_eq!(e.code.as_str(), "PEER_UID_UNVERIFIABLE");
+    assert_eq!(e.exit_code(), 1);
+    assert_eq!(
+        e.to_json_line(),
+        "{\"code\":\"PEER_UID_UNVERIFIABLE\",\"message\":\"the current uid is the overflow uid 65534; the peer uid cannot be verified; connection rejected\"}"
+    );
+    assert_eq!(
+        verify_peer(Ok(1000), 65534)
+            .expect_err("reject")
+            .code
+            .as_str(),
+        "PEER_UID_UNVERIFIABLE"
+    );
+    assert_eq!(
+        verify_peer(Err(sys::SysError::Invalid), 65534)
+            .expect_err("reject")
+            .code
+            .as_str(),
+        "PEER_UID_UNVERIFIABLE"
+    );
+    // 実行ユーザーが overflowuid でなければ、接続元の 65534 は従来どおり不一致で拒否する。
+    assert_eq!(
+        verify_peer(Ok(65534), 1000)
+            .expect_err("reject")
+            .code
+            .as_str(),
+        "PEER_UID_MISMATCH"
+    );
+    assert_eq!(verify_peer(Ok(65533), 65533), Ok(()));
+}
+
 /// 自分のソケットの削除に失敗したら `SOCKET_REMOVE_FAILED` を返す（GPU-6・#1598。結果を捨てない）。
 #[test]
 fn socket_remove_failure_is_reported() {

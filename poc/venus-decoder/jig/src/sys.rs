@@ -14,8 +14,9 @@
 //! - U9・U10（追加承認）: <https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6075711404>。
 //!   U9 `fcntl`（`F_GET_SEALS` / `F_ADD_SEALS`。`syscall(2)` 経由。メモリに触れない。受け取った memfd の縮小封じ込めの確認）・
 //!   U10 `ppoll`（`syscall(2)` 経由の期限つき待機。カーネルは `pollfd` の `revents` と、残り時間を `timespec` へ書き戻す）。
-//! - U11（PLUG-12 の peer credential 検証。PR #1611 のレビュー指摘 P0 への対応。coding-rust.md の `sys` モジュールの事前承認の
-//!   条件に沿って追加）: `getsockopt(SO_PEERCRED)`（`syscall(2)` 経由）。カーネルが `struct ucred` へ書くだけ。
+//! - U11（PLUG-12 の peer credential 検証。PR #1611。#1517 の個別承認〔追認〕）:
+//!   <https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6092697332>。
+//!   `getsockopt(SO_PEERCRED)`（`syscall(2)` 経由）。カーネルが `struct ucred` へ書くだけ。
 //! これを超える `unsafe`（`extern` 宣言の追加を含む）は書かない。`recvmsg` 等を直接 `extern` で宣言せず、すべて
 //! `syscall(2)` 経由にする。
 //!
@@ -870,7 +871,6 @@ mod imp {
         use super::*;
         use std::mem::{align_of, offset_of, size_of};
 
-        /// GPU-6: カーネル ABI の構造体レイアウト（LP64）。
         /// PLUG-12: 同一プロセスの socketpair の相手 UID は自分の euid。
         #[test]
         fn plug12_peer_uid_of_socketpair_is_own_euid() {
@@ -886,12 +886,17 @@ mod imp {
             assert_eq!(peer_uid(f.as_fd()), Err(SysError::Os(88)));
         }
 
-        /// PLUG-12: `struct ucred` のレイアウト。
+        /// PLUG-12: `struct ucred` のレイアウト（`{__u32 pid, uid, gid}` と同じ 12 バイト・整列 4・`uid` は 4 バイト目）。
         #[test]
         fn plug12_ucred_layout() {
             assert_eq!(size_of::<Ucred>(), 12);
+            assert_eq!(align_of::<Ucred>(), 4);
+            assert_eq!(offset_of!(Ucred, pid), 0);
+            assert_eq!(offset_of!(Ucred, uid), 4);
+            assert_eq!(offset_of!(Ucred, gid), 8);
         }
 
+        /// GPU-6: カーネル ABI の構造体レイアウト（LP64）。
         #[test]
         fn gpu6_struct_layout_matches_kernel_abi() {
             assert_eq!(size_of::<Iovec>(), 16);
@@ -1054,10 +1059,11 @@ mod imp {
             assert_eq!(align_of::<CmsgBuf>(), 8);
         }
 
-        /// GPU-6: 実行中アーキの定数の固定値（一次情報との照合結果）。
+        /// GPU-6・PLUG-12: 実行中アーキの定数の固定値（一次情報との照合結果。`SO_PEERCRED` と `NR_GETSOCKOPT` は U11）。
         #[test]
         fn gpu6_constants_fixed_values() {
             assert_eq!(SOL_SOCKET, 1);
+            assert_eq!(SO_PEERCRED, 17);
             assert_eq!(SCM_RIGHTS, 1);
             assert_eq!(SCM_PIDFD, 4);
             assert_eq!(MSG_CTRUNC, 0x8);
@@ -1084,9 +1090,10 @@ mod imp {
                     NR_MUNMAP,
                     NR_MEMFD_CREATE,
                     NR_FCNTL,
-                    NR_PPOLL
+                    NR_PPOLL,
+                    NR_GETSOCKOPT
                 ),
-                (46, 47, 9, 11, 319, 72, 271)
+                (46, 47, 9, 11, 319, 72, 271, 55)
             );
             #[cfg(target_arch = "aarch64")]
             assert_eq!(
@@ -1097,9 +1104,10 @@ mod imp {
                     NR_MUNMAP,
                     NR_MEMFD_CREATE,
                     NR_FCNTL,
-                    NR_PPOLL
+                    NR_PPOLL,
+                    NR_GETSOCKOPT
                 ),
-                (211, 212, 222, 215, 279, 25, 73)
+                (211, 212, 222, 215, 279, 25, 73, 209)
             );
         }
     }

@@ -36,8 +36,8 @@ cargo run --manifest-path poc/venus-decoder/jig/Cargo.toml --bin venus-jig -- \
 - 任意: `--message-timeout-ms`（既定 5000）・`--idle-timeout-ms`（既定 60000）・`--poll-slice-ms`・`--accept-timeout-ms`（既定 60000）。
 - VMM（vhost-user frontend）側から指定するのは `--socket` に渡した絶対パス。crosvm の `--vhost-user` の構文・最小カーネル版数・render server の要否は未確認（実機で確かめる。#725）。
 - ログは `0600` で新規作成し、4 MiB・1 行 512 バイト・10 万行を超えたら `log_truncated` の行を残して止める。エラーは stderr に 1 行の JSON（`code` / `message`）。終了コードは 0 が正常、2 が引数・パス・ディレクトリの検証エラー、1 がそれ以外。
-- 接続元は accept 直後に `SO_PEERCRED` で取得した UID と実行ユーザーの effective UID を照合する（取得失敗は `PEER_CRED_UNAVAILABLE`、不一致は `PEER_UID_MISMATCH` で拒否）。受理するのは実行ユーザーと同じ UID のみ（同じ UID の別プロセスは接続できる）。終了時のソケット削除に失敗した場合は `SOCKET_REMOVE_FAILED` で失敗する。ソケットディレクトリは `/` までの祖先も検査する（存在しない祖先・symlink・他 UID 所有・sticky なしの書き込み可は `SOCKET_DIR_ANCESTOR_UNSAFE`。新規作成を許すのは検証済みの親の直下のソケットディレクトリ 1 段だけ）。限界と承認事項は設計書 10.9。
-- ログを読む側（`log::read_log_file`）は通常ファイル以外（FIFO・symlink）を open 前に拒否する。
+- 接続元は accept 直後に `SO_PEERCRED` で取得した UID と実行ユーザーの effective UID を照合する（取得失敗は `PEER_CRED_UNAVAILABLE`、不一致は `PEER_UID_MISMATCH` で拒否。実行ユーザーの euid が overflowuid〔既定 65534〕ならマッピング外の接続元と区別できないので `PEER_UID_UNVERIFIABLE` で拒否）。受理するのは実行ユーザーと同じ UID のみ（同じ UID の別プロセスは接続できる）。終了時のソケット削除に失敗した場合は `SOCKET_REMOVE_FAILED` で失敗する。ソケットディレクトリは `/` までの祖先も検査する（存在しない祖先・symlink・他 UID 所有・sticky なしの書き込み可は `SOCKET_DIR_ANCESTOR_UNSAFE`。新規作成を許すのは検証済みの親の直下のソケットディレクトリ 1 段だけ）。限界と承認事項は設計書 10.9。
+- ログを読む側（`log::read_log_file`）は通常ファイル以外（FIFO・symlink）を open 前に拒否し、Unix では open 後に `dev` / `ino` を open 前の値と比べて差し替えを拒否する（`Replaced`）。
 
 ## 実行
 

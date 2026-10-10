@@ -449,3 +449,161 @@ fn socket_remove_missing_is_ok() {
     SocketGuard::new(dir.join("gone")).remove().expect("ok");
     fs::remove_dir_all(&dir).expect("cleanup");
 }
+fn cfg_rec(socket: &Path, log: &Path, rec: &Path, extra: &[&str]) -> Result<Config, LaunchError> {
+    let mut e = vec!["--record".to_string(), rec.display().to_string()];
+    e.extend(extra.iter().map(|s| s.to_string()));
+    let refs: Vec<&str> = e.iter().map(String::as_str).collect();
+    cfg(socket, log, &refs)
+}
+
+/// GPU-6・TASK-172 F6・#1602: `--record` は受理され、重複・相対・`..`・他パスとの衝突は拒否される。
+#[test]
+fn task1602_gpu6_parse_args_record_option() {
+    let c = parse_args(&args(&[
+        "--socket",
+        "/tmp/a.sock",
+        "--log",
+        "/tmp/a.log",
+        "--record",
+        "/tmp/a.rec",
+    ]))
+    .unwrap();
+    assert_eq!(c.record, Some(PathBuf::from("/tmp/a.rec")));
+    assert_eq!(c.record_limits, RecorderLimits::default());
+    let base = ["--socket", "/tmp/a.sock", "--log", "/tmp/a.log"];
+    let with = |extra: &[&str]| {
+        let mut v: Vec<&str> = base.to_vec();
+        v.extend_from_slice(extra);
+        parse_args(&args(&v)).expect_err("reject").code.as_str()
+    };
+    assert_eq!(
+        with(&["--record", "/tmp/r1", "--record", "/tmp/r2"]),
+        "INVALID_ARGUMENT"
+    );
+    assert_eq!(with(&["--record", "rel.rec"]), "PATH_NOT_ABSOLUTE");
+    assert_eq!(with(&["--record", "/tmp/../tmp/r"]), "PATH_INVALID");
+    assert_eq!(with(&["--record", "/tmp/a.log"]), "PATH_INVALID");
+    assert_eq!(with(&["--record", "/tmp/a.sock"]), "PATH_INVALID");
+}
+
+/// 既存の記録先は上書きせず、ログもソケットも作らない（検証で拒否したら何も作らない）。
+#[test]
+fn task1602_gpu6_existing_record_path_is_rejected_and_kept() {
+    let dir = scratch("er");
+    let rec = dir.join("r.fcvns");
+    fs::write(&rec, b"keep").unwrap();
+    let (sock, log) = (dir.join("s.sock"), dir.join("j.log"));
+    let c = cfg_rec(&sock, &log, &rec, &[]).unwrap();
+    let e = run(&c).expect_err("reject");
+    assert_eq!(e.code.as_str(), "RECORD_PATH_EXISTS");
+    assert_eq!(e.exit_code(), 2);
+    assert_eq!(fs::read(&rec).unwrap(), b"keep");
+    assert!(fs::symlink_metadata(&log).is_err(), "no log");
+    assert!(fs::symlink_metadata(&sock).is_err(), "no socket");
+    // 末尾が symlink でも辿らず拒否する。
+    let target = dir.join("target");
+    let link = dir.join("link.rec");
+    symlink(&target, &link).unwrap();
+    let c = cfg_rec(&sock, &log, &link, &[]).unwrap();
+    assert_eq!(code_of(run(&c)), "RECORD_PATH_EXISTS");
+    assert!(
+        fs::symlink_metadata(&target).is_err(),
+        "symlink not followed"
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn task1602_gpu6_unsafe_record_ancestor_is_rejected_without_side_effects() {
+    let top = scratch("rd");
+    let mid = top.join("mid");
+    DirBuilder::new().mode(0o700).create(&mid).unwrap();
+    let recdir = mid.join("recs");
+    DirBuilder::new().mode(0o700).create(&recdir).unwrap();
+    fs::set_permissions(&mid, fs::Permissions::from_mode(0o777)).unwrap();
+    let (sock, log) = (top.join("s.sock"), top.join("j.log"));
+    let c = cfg_rec(&sock, &log, &recdir.join("r"), &[]).unwrap();
+    let e = run(&c).expect_err("reject");
+    assert_eq!(e.code.as_str(), "RECORD_DIR_UNSAFE");
+    assert_eq!(e.exit_code(), 2);
+    assert!(fs::symlink_metadata(&log).is_err());
+    assert!(fs::symlink_metadata(recdir.join("r")).is_err());
+    // symlink の親も拒否する。
+    let real = top.join("real");
+    DirBuilder::new().mode(0o700).create(&real).unwrap();
+    let link = top.join("link");
+    symlink(&real, &link).unwrap();
+    let c = cfg_rec(&sock, &log, &link.join("r"), &[]).unwrap();
+    assert_eq!(code_of(run(&c)), "RECORD_DIR_UNSAFE");
+    fs::set_permissions(&mid, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::remove_dir_all(&top).unwrap();
+}
+
+/// セッションがエラー（accept の期限切れ）で終わっても記録ファイルを 0600 で作り、`finish` して空の記録として検証できる。
+#[test]
+fn task1602_gpu6_record_file_is_finished_even_when_session_fails() {
+    use fandhe_container_plugin_macos::gpu::venus::replay::{read_recording_file, validate};
+    let dir = scratch("rf");
+    let (sock, log, rec) = (dir.join("s.sock"), dir.join("j.log"), dir.join("r.fcvns"));
+    let c = cfg_rec(&sock, &log, &rec, &["--accept-timeout-ms", "50"]).unwrap();
+    assert_eq!(code_of(run(&c)), "ACCEPT_TIMEOUT");
+    assert_eq!(fs::metadata(&rec).unwrap().mode() & 0o777, 0o600);
+    let bytes = read_recording_file(&rec).expect("read");
+    assert_eq!(validate(&bytes).expect("validate").records().len(), 0);
+    let text = fs::read_to_string(&log).unwrap();
+    let want = "venus_jig event=launch_error code=ACCEPT_TIMEOUT";
+    assert!(text.lines().any(|l| l == want), "log: {text}");
+    assert!(
+        text.lines()
+            .any(|l| l
+                == "venus_jig event=record_summary records=0 skipped=0 stopped=none result=ok"),
+        "log: {text}"
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn task1602_gpu6_record_error_codes_are_fixed_vocabulary() {
+    let cases = [
+        (LaunchErrorCode::RecordDirUnsafe, "RECORD_DIR_UNSAFE", 2),
+        (LaunchErrorCode::RecordPathExists, "RECORD_PATH_EXISTS", 2),
+        (LaunchErrorCode::RecordOpenFailed, "RECORD_OPEN_FAILED", 1),
+        (LaunchErrorCode::RecordWriteFailed, "RECORD_WRITE_FAILED", 1),
+    ];
+    for (code, word, exit) in cases {
+        assert_eq!(code.as_str(), word);
+        assert_eq!(LaunchError::new(code).exit_code(), exit);
+        let line = LaunchError::new(code).to_json_line();
+        assert!(
+            line.starts_with(&format!("{{\"code\":\"{word}\",")),
+            "{line}"
+        );
+    }
+}
+
+/// 記録先の拒否（親が危険・既存パス）では、ソケット親ディレクトリも作らない。
+#[test]
+fn task1602_gpu6_record_rejection_creates_no_socket_parent_dir() {
+    let top = scratch("rnodir");
+    let recdir = top.join("recs");
+    DirBuilder::new().mode(0o700).create(&recdir).unwrap();
+    let existing = recdir.join("r");
+    fs::write(&existing, b"x").unwrap();
+    let sockdir = top.join("sockdir");
+    let (sock, log) = (sockdir.join("s.sock"), top.join("j.log"));
+    let c = cfg_rec(&sock, &log, &existing, &[]).unwrap();
+    assert_eq!(code_of(run(&c)), "RECORD_PATH_EXISTS");
+    assert!(fs::symlink_metadata(&sockdir).is_err(), "no socket dir");
+    assert!(fs::symlink_metadata(&log).is_err(), "no log");
+    // 危険な親でも同様。
+    let mid = top.join("mid");
+    DirBuilder::new().mode(0o700).create(&mid).unwrap();
+    let unsafe_rec = mid.join("recs");
+    DirBuilder::new().mode(0o700).create(&unsafe_rec).unwrap();
+    fs::set_permissions(&mid, fs::Permissions::from_mode(0o777)).unwrap();
+    let c = cfg_rec(&sock, &log, &unsafe_rec.join("r"), &[]).unwrap();
+    assert_eq!(code_of(run(&c)), "RECORD_DIR_UNSAFE");
+    assert!(fs::symlink_metadata(&sockdir).is_err(), "no socket dir");
+    fs::set_permissions(&mid, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::remove_dir_all(&top).unwrap();
+}

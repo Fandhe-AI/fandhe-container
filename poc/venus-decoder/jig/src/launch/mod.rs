@@ -5,7 +5,15 @@
 //! 実機での疎通（治具 VMM = crosvm 等の vhost-user frontend との接続）は #725（人間担当）。
 //!
 //! 処理の順序: 引数解析 → パス検証 → UID 取得 → ソケットディレクトリの検証・作成 → 既存パスの検査 → ログファイル作成 →
-//! bind → 期限つき accept → `session::run` → 後始末。検証で拒否した場合はログファイルを作らず、既存のパスは消さない。
+//! 記録ファイル作成（`--record` 指定時） → bind → 期限つき accept → `session::run_with_submit_hook` → 記録の書き出し →
+//! 後始末。検証で拒否した場合はログファイルも記録ファイルも作らず、既存のパスは消さない。
+//!
+//! 記録（`--record`。GPU-6・TASK-172 F6・#1602）: 受理した `SUBMIT_3D` の本体を `recording::SubmitRecorder` で
+//! `create_new` + `0600` のファイルへ書く。セッションが正常・エラーのどちらで終わっても `finish` と `sync_all` を行い、
+//! 集計行（`record_summary`）を残す。書き出しに失敗したら `RECORD_WRITE_FAILED`（セッションが先に失敗していればそちらを優先）。
+//! 上限による停止はセッションの失敗ではなく、終了コードは 0 のまま。記録先の親〜`/` はログと同じ規則で検査する。限界は
+//! ログと同じ（同じ UID と root による差し替え、検査と open の間の TOCTOU）。記録にはワークロード由来のデータが入りうるので、
+//! リポジトリにコミットしない。
 //!
 //! 接続元の制限（PLUG-12）: accept 直後、セッションに渡す前に `SO_PEERCRED`（`sys::peer_uid`）で接続元 UID を取得し、
 //! 実行ユーザーの effective UID と照合する。不一致・取得失敗は接続を閉じて拒否する（fail-closed。`PEER_UID_MISMATCH` /
@@ -35,8 +43,9 @@ use std::time::{Duration, Instant};
 
 pub use error::{LaunchError, LaunchErrorCode};
 
-use crate::log::LogSink;
-use crate::session::{SessionEnd, SessionLimits, run as run_session};
+use crate::log::{self, LogSink};
+use crate::recording::{RecorderLimits, SubmitRecorder};
+use crate::session::{SessionEnd, SessionLimits, run_with_submit_hook};
 use crate::sys;
 
 /// `sun_path` に入るバイト数の上限（`UNIX_PATH_MAX` = 108 から終端 NUL を除いた値）。
@@ -58,6 +67,10 @@ pub struct Config {
     pub socket: PathBuf,
     /// 作成するログファイルの絶対パス。
     pub log: PathBuf,
+    /// 作成する記録ファイルの絶対パス（`--record`。省略時は記録しない）。
+    pub record: Option<PathBuf>,
+    /// 記録の上限（CLI からは変えられず、既定値。lib 経由の試験が小さな値を入れる）。
+    pub record_limits: RecorderLimits,
     /// セッションの時間制限。
     pub limits: SessionLimits,
     /// accept の期限。
@@ -80,13 +93,14 @@ fn parse_ms(v: &OsStr) -> Result<Duration, LaunchError> {
 /// コマンドライン引数（プログラム名を除く）を解析して検証する。
 ///
 /// 必須: `--socket <絶対パス>`・`--log <絶対パス>`。任意: `--message-timeout-ms`（既定 5000）・`--idle-timeout-ms`
-/// （既定 60000）・`--poll-slice-ms`・`--accept-timeout-ms`（既定 60000）。未知・重複・値の欠落・範囲外は
+/// （既定 60000）・`--poll-slice-ms`・`--accept-timeout-ms`（既定 60000）・`--record <絶対パス>`（SUBMIT_3D の本体を
+/// 記録ファイルへ書く。省略時は記録しない）。未知・重複・値の欠落・範囲外は
 /// `INVALID_ARGUMENT`。パスの形式（絶対・成分・長さ）もここで検証する。
 pub fn parse_args(args: &[OsString]) -> Result<Config, LaunchError> {
     if args.len() > MAX_ARGS || !args.len().is_multiple_of(2) {
         return Err(invalid());
     }
-    let (mut socket, mut logp) = (None, None);
+    let (mut socket, mut logp, mut recp) = (None, None, None);
     let (mut msg, mut idle, mut slice, mut acc) = (None, None, None, None);
     for pair in args.chunks(2) {
         let (Some(k), Some(v)) = (pair.first(), pair.get(1)) else {
@@ -96,6 +110,7 @@ pub fn parse_args(args: &[OsString]) -> Result<Config, LaunchError> {
         let dup = match key {
             "--socket" => socket.replace(PathBuf::from(v)).is_some(),
             "--log" => logp.replace(PathBuf::from(v)).is_some(),
+            "--record" => recp.replace(PathBuf::from(v)).is_some(),
             "--message-timeout-ms" => msg.replace(parse_ms(v)?).is_some(),
             "--idle-timeout-ms" => idle.replace(parse_ms(v)?).is_some(),
             "--poll-slice-ms" => slice.replace(parse_ms(v)?).is_some(),
@@ -120,13 +135,18 @@ pub fn parse_args(args: &[OsString]) -> Result<Config, LaunchError> {
     validate_accept_timeout(accept_timeout)?;
     validate_path(&socket)?;
     validate_path(&log)?;
+    if let Some(r) = &recp {
+        validate_path(r)?;
+    }
     if socket.as_os_str().len() > SUN_PATH_MAX {
         return Err(LaunchError::new(LaunchErrorCode::PathTooLong));
     }
-    check_path_collision(&socket, &log)?;
+    check_path_collision(&socket, &log, recp.as_deref())?;
     Ok(Config {
         socket,
         log,
+        record: recp,
+        record_limits: RecorderLimits::default(),
         limits,
         accept_timeout,
     })
@@ -251,9 +271,23 @@ fn check_log_dir(log: &Path, uid: u32) -> Result<(), LaunchError> {
     check_ancestors(dir, uid, true, LaunchErrorCode::LogDirUnsafe)
 }
 
-/// ソケットとログのパスの衝突（同一パス）を拒否する。`parse_args` と、公開フィールドから組み立てた `Config` を受ける `run` の両方で使う。
-fn check_path_collision(config_socket: &Path, config_log: &Path) -> Result<(), LaunchError> {
-    if config_socket == config_log {
+/// 記録ファイルの置き場所（親〜`/`）を検査する。ワークロード由来のデータを別 UID が読める場所へ書かせない。
+fn check_record_dir(record: &Path, uid: u32) -> Result<(), LaunchError> {
+    let dir = record
+        .parent()
+        .ok_or_else(|| LaunchError::new(LaunchErrorCode::PathInvalid))?;
+    check_ancestors(dir, uid, true, LaunchErrorCode::RecordDirUnsafe)
+}
+
+/// ソケット・ログ・記録のパスの衝突（どれか 2 つが同一パス）を拒否する。`parse_args` と、公開フィールドから組み立てた
+/// `Config` を受ける `run` の両方で使う。
+fn check_path_collision(
+    config_socket: &Path,
+    config_log: &Path,
+    config_record: Option<&Path>,
+) -> Result<(), LaunchError> {
+    let record_clash = config_record.is_some_and(|r| r == config_socket || r == config_log);
+    if config_socket == config_log || record_clash {
         return Err(LaunchError::new(LaunchErrorCode::PathInvalid));
     }
     Ok(())
@@ -319,6 +353,22 @@ fn open_log(path: &Path) -> Result<File, LaunchError> {
         })
 }
 
+/// 記録ファイルを `create_new` + `0600` で作る。既存のパス（末尾の symlink を含む）は上書きしない。
+fn open_record(path: &Path) -> Result<File, LaunchError> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == ErrorKind::AlreadyExists {
+                LaunchError::new(LaunchErrorCode::RecordPathExists)
+            } else {
+                LaunchError::new(LaunchErrorCode::RecordOpenFailed)
+            }
+        })
+}
+
 /// 非ブロックの accept を期限まで試し直す。
 fn accept_with_deadline(
     listener: &UnixListener,
@@ -349,22 +399,33 @@ pub fn run(config: &Config) -> Result<SessionEnd, LaunchError> {
     validate_accept_timeout(config.accept_timeout)?;
     validate_path(&config.socket)?;
     validate_path(&config.log)?;
+    if let Some(r) = &config.record {
+        validate_path(r)?;
+    }
     if config.socket.as_os_str().len() > SUN_PATH_MAX {
         return Err(LaunchError::new(LaunchErrorCode::PathTooLong));
     }
     // 副作用（ディレクトリ作成・ログ作成）の前に衝突を拒否する。
-    check_path_collision(&config.socket, &config.log)?;
+    check_path_collision(&config.socket, &config.log, config.record.as_deref())?;
     let uid = effective_uid()?;
     check_log_dir(&config.log, uid)?;
+    // 記録先の検証は、ソケット親ディレクトリを作る前に済ませる（検証で拒否したら何も作らない）。
+    if let Some(r) = &config.record {
+        check_record_dir(r, uid)?;
+        // 既存のパスはログを作る前に拒否する。open の `create_new` が最終判定。
+        if fs::symlink_metadata(r).is_ok() {
+            return Err(LaunchError::new(LaunchErrorCode::RecordPathExists));
+        }
+    }
     check_socket_dir(&config.socket, uid)?;
     if fs::symlink_metadata(&config.socket).is_ok() {
         return Err(LaunchError::new(LaunchErrorCode::SocketPathExists));
     }
     let file = open_log(&config.log)?;
     let mut sink = LogSink::new(file);
-    let result = serve(config, uid, &mut sink);
+    let result = run_logged(config, uid, &mut sink);
     if let Err(e) = &result {
-        sink.write_line(&format!(
+        sink.write_priority(&format!(
             "venus_jig event=launch_error code={}",
             e.code.as_str()
         ));
@@ -377,7 +438,38 @@ pub fn run(config: &Config) -> Result<SessionEnd, LaunchError> {
     result
 }
 
-fn serve(config: &Config, uid: u32, sink: &mut LogSink<File>) -> Result<SessionEnd, LaunchError> {
+/// ログ作成後の本体。記録ファイルの作成 → `serve` → 記録の書き出し（セッションの成否によらず必ず行う）。
+fn run_logged(
+    config: &Config,
+    uid: u32,
+    sink: &mut LogSink<File>,
+) -> Result<SessionEnd, LaunchError> {
+    let mut recorder = match &config.record {
+        Some(p) => Some(SubmitRecorder::new(open_record(p)?, config.record_limits)),
+        None => None,
+    };
+    let result = serve(config, uid, sink, recorder.as_mut());
+    let Some(recorder) = recorder else {
+        return result;
+    };
+    let (finished, summary) = recorder.finish();
+    let write_ok = match finished {
+        Ok(file) => file.sync_all().is_ok(),
+        Err(_) => false,
+    };
+    sink.write_priority(&log::record_summary_line(&summary, write_ok));
+    match result {
+        Ok(_) if !write_ok => Err(LaunchError::new(LaunchErrorCode::RecordWriteFailed)),
+        other => other,
+    }
+}
+
+fn serve(
+    config: &Config,
+    uid: u32,
+    sink: &mut LogSink<File>,
+    mut recorder: Option<&mut SubmitRecorder<File>>,
+) -> Result<SessionEnd, LaunchError> {
     let listener = UnixListener::bind(&config.socket)
         .map_err(|_| LaunchError::new(LaunchErrorCode::BindFailed))?;
     let guard = SocketGuard::new(config.socket.clone());
@@ -393,7 +485,18 @@ fn serve(config: &Config, uid: u32, sink: &mut LogSink<File>) -> Result<SessionE
         .set_nonblocking(false)
         .map_err(|_| LaunchError::new(LaunchErrorCode::AcceptFailed))?;
     sink.write_line("venus_jig event=accepted");
-    let outcome = run_session(&stream, &config.limits, &mut |l| sink.write_line(l));
+    let outcome = run_with_submit_hook(
+        &stream,
+        &config.limits,
+        &mut |l| {
+            if log::is_priority_line(l) {
+                sink.write_priority(l);
+            } else {
+                sink.write_line(l);
+            }
+        },
+        &mut |s| recorder.as_mut().and_then(|r| r.on_submit(s)),
+    );
     outcome.map_err(|e| LaunchError {
         code: LaunchErrorCode::SessionFailed,
         cause: Some(e.code.as_str()),

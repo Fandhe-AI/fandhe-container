@@ -33,10 +33,12 @@ mod linux {
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
+    use fandhe_container_plugin_macos::gpu::venus::replay::validate;
     use fandhe_container_poc_venus_jig::adapter::CtrlAdapter;
     use fandhe_container_poc_venus_jig::log::find_capset_queries;
+    use fandhe_container_poc_venus_jig::recording::{RecorderLimits, SubmitRecorder};
     use fandhe_container_poc_venus_jig::session::{
-        SessionEnd, SessionError, SessionErrorCode, SessionLimits, run,
+        SessionEnd, SessionError, SessionErrorCode, SessionLimits, run, run_with_submit_hook,
     };
     use fandhe_container_poc_venus_jig::vhost_user::fd_passing::recv_with_fds;
     use fandhe_container_poc_venus_jig::vhost_user::{Request, TransportErrorCode, VringFd};
@@ -154,66 +156,6 @@ mod linux {
         assert_eq!(end, Ok(SessionEnd::PeerClosed));
     }
 
-    /// n 番目（0..4）の要求を ring 0 へ積んで kick し、call を待つ。descriptor は 2n（readable・NEXT）と 2n+1（writable）。
-    fn post(fe: &Frontend, n: u16, req: &[u8], writable_len: u32) {
-        let desc = |addr: u64, len: u32, flags: u16, next: u16| {
-            let mut d = Vec::new();
-            d.extend_from_slice(&addr.to_le_bytes());
-            d.extend_from_slice(&len.to_le_bytes());
-            d.extend_from_slice(&flags.to_le_bytes());
-            d.extend_from_slice(&next.to_le_bytes());
-            d
-        };
-        let req_addr = 0x4000 + u64::from(n) * 0x400;
-        let resp_addr = 0x5000 + u64::from(n) * 0x400;
-        let head = 2 * n;
-        let readable = u32::try_from(req.len()).expect("len");
-        fe.mem
-            .write_at(&desc(req_addr, readable, 1, head + 1), u64::from(head) * 16)
-            .expect("desc r");
-        fe.mem
-            .write_at(
-                &desc(resp_addr, writable_len, 2, 0),
-                u64::from(head + 1) * 16,
-            )
-            .expect("desc w");
-        fe.mem.write_at(req, req_addr).expect("req");
-        fe.mem
-            .write_at(&head.to_le_bytes(), 0x1004 + u64::from(n) * 2)
-            .expect("ring");
-        fe.mem
-            .write_at(&(n + 1).to_le_bytes(), 0x1002)
-            .expect("idx");
-        (&fe.kick).write_all(&1u64.to_le_bytes()).expect("kick");
-        wait_call(fe);
-    }
-
-    fn resp_type(fe: &Frontend, n: u16) -> u32 {
-        let mut b = [0u8; 4];
-        fe.mem
-            .read_at(&mut b, 0x5000 + u64::from(n) * 0x400)
-            .expect("resp");
-        u32::from_le_bytes(b)
-    }
-
-    fn used_len(fe: &Frontend, n: u16) -> u32 {
-        let mut b = [0u8; 4];
-        fe.mem
-            .read_at(&mut b, 0x2000 + 4 + u64::from(n) * 8 + 4)
-            .expect("used len");
-        u32::from_le_bytes(b)
-    }
-
-    fn ctrl_req(cmd: u32, ctx: u32, total: usize, words: &[(usize, u32)]) -> Vec<u8> {
-        let mut v = vec![0u8; total];
-        v[..4].copy_from_slice(&cmd.to_le_bytes());
-        v[16..20].copy_from_slice(&ctx.to_le_bytes());
-        for (off, x) in words {
-            v[*off..*off + 4].copy_from_slice(&x.to_le_bytes());
-        }
-        v
-    }
-
     /// GPU-6・TASK-172.4・#1601: 応答を書き戻せず捨てた `RESOURCE_CREATE_BLOB` は資源表を残さない。
     /// 同じ resource_id の再送が `ERR_INVALID_RESOURCE_ID`（0x1203）にならず `OK_NODATA`（0x1100）になり、
     /// 続く `CTX_ATTACH_RESOURCE` も成功する。
@@ -265,6 +207,95 @@ mod linux {
         assert_eq!(end, Ok(SessionEnd::PeerClosed));
         let want = "venus_jig event=submit_3d cmd=SUBMIT_3D ctx_id=1 ring_idx=0 size=256 venus_cmd=188 wire=ok result=ok";
         assert!(lines.iter().any(|l| l == want), "log: {lines:?}");
+    }
+
+    type RecOutcome = (
+        Result<SessionEnd, SessionError>,
+        Vec<String>,
+        SubmitRecorder<Vec<u8>>,
+    );
+
+    /// backend を提出フック（記録器）つきで別スレッドで動かす。終了後に記録器を返す。
+    fn pair_recording(
+        limits: SessionLimits,
+        rec_limits: RecorderLimits,
+    ) -> (UnixStream, JoinHandle<RecOutcome>) {
+        let (front, back) = UnixStream::pair().expect("pair");
+        let h = std::thread::spawn(move || {
+            let mut lines = Vec::new();
+            let mut rec = SubmitRecorder::new(Vec::new(), rec_limits);
+            let r = run_with_submit_hook(
+                &back,
+                &limits,
+                &mut |l| lines.push(l.to_string()),
+                &mut |s| rec.on_submit(s),
+            );
+            (r, lines, rec)
+        });
+        (front, h)
+    }
+
+    fn body(first: u32, len: usize) -> Vec<u8> {
+        let mut b = vec![0u8; len];
+        b[..4].copy_from_slice(&first.to_le_bytes());
+        b
+    }
+
+    /// GPU-6・TASK-172 F6・#1602: 上限に達したら記録だけ止まり、セッションは続き、停止の行は 1 回だけ出る。
+    #[test]
+    fn task1602_gpu6_recording_stops_at_limit_and_session_continues() {
+        let rec_limits = RecorderLimits::new(4096, 1, 1 << 20).expect("limits");
+        let (front, backend) = pair_recording(limits(5000, 5000), rec_limits);
+        let fe = setup_ring0(front, 408, "reclim");
+        post(&fe, 0, &ctx_create_req(1), 408);
+        let bodies = [body(188, 64), body(189, 32), body(190, 16)];
+        for (i, b) in bodies.iter().enumerate() {
+            let n = u16::try_from(i + 1).expect("n");
+            post(&fe, n, &submit_3d_req(1, b), 408);
+            assert_eq!(resp_type(&fe, n), 0x1100);
+            assert_eq!(used_len(&fe, n), 24);
+        }
+        drop(fe);
+        let (end, lines, rec) = backend.join().expect("join");
+        assert_eq!(end, Ok(SessionEnd::PeerClosed));
+        let stop = "venus_jig event=record_stopped reason=too_many_records records=1";
+        assert_eq!(lines.iter().filter(|l| l.as_str() == stop).count(), 1);
+        assert_eq!(report_malformed(&lines), 0);
+        let (out, summary) = rec.finish();
+        assert_eq!(summary.records, 1);
+        assert_eq!(summary.skipped, 1);
+        let bytes = out.expect("finish");
+        let v = validate(&bytes).expect("validate");
+        assert_eq!(v.records().len(), 1);
+        assert_eq!(v.records()[0].payload, bodies[0].as_slice());
+    }
+
+    fn report_malformed(lines: &[String]) -> usize {
+        find_capset_queries(&lines.join("\n"))
+            .expect("report")
+            .malformed_lines
+    }
+
+    /// GPU-6・TASK-172 F6・#1602: 応答を書き戻せず捨てた提出は記録しない（ゲストが ACK を見ていない）。
+    #[test]
+    fn task1602_gpu6_dropped_submit_is_not_recorded() {
+        let (front, backend) = pair_recording(limits(5000, 5000), RecorderLimits::default());
+        let fe = setup_ring0(front, 408, "recdrop");
+        post(&fe, 0, &ctx_create_req(1), 408);
+        // writable が 8 バイトで 24 バイトの応答が入らない -> len=0 で捨てられ、記録もされない。
+        post(&fe, 1, &submit_3d_req(1, &body(188, 100)), 8);
+        assert_eq!(used_len(&fe, 1), 0);
+        let kept = body(191, 48);
+        post(&fe, 2, &submit_3d_req(1, &kept), 408);
+        assert_eq!(used_len(&fe, 2), 24);
+        drop(fe);
+        let (end, _lines, rec) = backend.join().expect("join");
+        assert_eq!(end, Ok(SessionEnd::PeerClosed));
+        let bytes = rec.finish().0.expect("finish");
+        let v = validate(&bytes).expect("validate");
+        assert_eq!(v.records().len(), 1);
+        assert_eq!(v.records()[0].header.seqno, 0);
+        assert_eq!(v.records()[0].payload, kept.as_slice());
     }
 
     #[test]

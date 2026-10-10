@@ -10,12 +10,18 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
+use crate::recording::{RecordSummary, StopReason};
+
 /// ログ全体の上限（バイト）。
 pub const MAX_LOG_BYTES: usize = 4 * 1024 * 1024;
 /// 1 行の上限（バイト）。超えた行は壊れた行として数える。
 pub const MAX_LINE_BYTES: usize = 512;
 /// 行数の上限。
 pub const MAX_LINES: usize = 100_000;
+/// 優先行（[`LogSink::write_priority`]）のために通常行から取り置くバイト数。
+pub const PRIORITY_RESERVE_BYTES: usize = 2048;
+/// 優先行のために通常行から取り置く行数。
+pub const PRIORITY_RESERVE_LINES: usize = 8;
 
 /// ctrl 応答の結果語彙（capset クエリ・display info・ctx 操作で共用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +203,37 @@ pub fn session_end_line() -> String {
     "venus_jig event=session_end result=peer_closed".to_string()
 }
 
+/// 記録（`--record`）が上限で止まったことを示すログ行。理由は固定語彙、件数は数値だけを出す（パスは出さない）。
+/// 照合器（`find_capset_queries`）では `Other` に分類され、壊れた行に数えられない。停止ごとに 1 回だけ出る。
+pub fn record_stopped_line(reason: StopReason, records: u32) -> String {
+    format!(
+        "venus_jig event=record_stopped reason={} records={records}",
+        reason.as_str()
+    )
+}
+
+/// 打ち切り後も [`LogSink::write_priority`] で書く行か（記録の停止通知・集計・起動エラー）。`event=` の値が固定語彙と
+/// 完全一致するときだけ真（`record_stopped_x` のような接頭辞一致は優先しない）。
+pub fn is_priority_line(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("venus_jig event=") else {
+        return false;
+    };
+    let event = rest.split(' ').next().unwrap_or_default();
+    matches!(event, "record_stopped" | "record_summary" | "launch_error")
+}
+
+/// 終了時の記録の集計行。`write_ok` が偽なら `result=write_failed`（書き出しの失敗を成功と装わない）。
+/// 照合器では `Other` に分類される。
+pub fn record_summary_line(summary: &RecordSummary, write_ok: bool) -> String {
+    format!(
+        "venus_jig event=record_summary records={} skipped={} stopped={} result={}",
+        summary.records,
+        summary.skipped,
+        summary.stopped.map_or("none", StopReason::as_str),
+        if write_ok { "ok" } else { "write_failed" }
+    )
+}
+
 /// 照合結果。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CapsetLogReport {
@@ -347,8 +384,8 @@ impl<W: Write> LogSink<W> {
         let need = line.len() + 1;
         let fits = line.len() <= MAX_LINE_BYTES
             && !line.contains(['\n', '\r'])
-            && self.bytes + need + reserve <= MAX_LOG_BYTES
-            && self.lines + 2 <= MAX_LINES;
+            && self.bytes + need + reserve + PRIORITY_RESERVE_BYTES <= MAX_LOG_BYTES
+            && self.lines + 2 + PRIORITY_RESERVE_LINES <= MAX_LINES;
         if fits {
             self.put(line, need);
         } else {
@@ -356,6 +393,20 @@ impl<W: Write> LogSink<W> {
             let t = log_truncated_line();
             let n = t.len() + 1;
             self.put(&t, n);
+        }
+    }
+
+    /// 打ち切り後も届く優先行（記録の停止通知・集計・起動エラー）を書く。通常行が取り置いた領域だけを使い、
+    /// 領域も尽きたとき・不正な行（長すぎる・改行を含む）は捨てる（REPAIR-4）。
+    pub fn write_priority(&mut self, line: &str) {
+        let need = line.len() + 1;
+        let fits = self.error.is_none()
+            && line.len() <= MAX_LINE_BYTES
+            && !line.contains(['\n', '\r'])
+            && self.bytes + need <= MAX_LOG_BYTES
+            && self.lines < MAX_LINES;
+        if fits {
+            self.put(line, need);
         }
     }
 

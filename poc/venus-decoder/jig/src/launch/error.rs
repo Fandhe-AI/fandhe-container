@@ -11,7 +11,7 @@ pub enum LaunchErrorCode {
     InvalidArgument,
     /// パスが絶対パスでない。
     PathNotAbsolute,
-    /// パスに `.` / `..`・NUL・ファイル名なし等がある、またはソケットとログが同じパス。
+    /// パスに `.` / `..`・NUL・ファイル名なし等がある、またはソケット・ログ・記録のいずれかが同じパス。
     PathInvalid,
     /// ソケットパスが `sun_path` の上限（107 バイト）を超える。
     PathTooLong,
@@ -31,6 +31,8 @@ pub enum LaunchErrorCode {
     SocketDirCreateFailed,
     /// ログファイルの親〜`/` に symlink・他ユーザー所有・他ユーザーが差し替えられるディレクトリがある。
     LogDirUnsafe,
+    /// 記録ファイルの親〜`/` に symlink・他ユーザー所有・他ユーザーが差し替えられるディレクトリがある。
+    RecordDirUnsafe,
     /// ソケットパスに既に何かある（消さずに拒否する）。
     SocketPathExists,
     /// ログファイルのパスに既に何かある（上書きしない）。
@@ -39,6 +41,12 @@ pub enum LaunchErrorCode {
     LogOpenFailed,
     /// ログへの書き込みまたは同期に失敗した。
     LogWriteFailed,
+    /// 記録ファイルのパスに既に何かある（上書きしない）。
+    RecordPathExists,
+    /// 記録ファイルを作れない。
+    RecordOpenFailed,
+    /// 記録ファイルの書き出しまたは同期に失敗した。
+    RecordWriteFailed,
     /// bind に失敗した。
     BindFailed,
     /// accept に失敗した。
@@ -73,10 +81,14 @@ impl LaunchErrorCode {
             Self::SocketDirAncestorUnsafe => "SOCKET_DIR_ANCESTOR_UNSAFE",
             Self::SocketDirCreateFailed => "SOCKET_DIR_CREATE_FAILED",
             Self::LogDirUnsafe => "LOG_DIR_UNSAFE",
+            Self::RecordDirUnsafe => "RECORD_DIR_UNSAFE",
             Self::SocketPathExists => "SOCKET_PATH_EXISTS",
             Self::LogPathExists => "LOG_PATH_EXISTS",
             Self::LogOpenFailed => "LOG_OPEN_FAILED",
             Self::LogWriteFailed => "LOG_WRITE_FAILED",
+            Self::RecordPathExists => "RECORD_PATH_EXISTS",
+            Self::RecordOpenFailed => "RECORD_OPEN_FAILED",
+            Self::RecordWriteFailed => "RECORD_WRITE_FAILED",
             Self::BindFailed => "BIND_FAILED",
             Self::AcceptFailed => "ACCEPT_FAILED",
             Self::AcceptTimeout => "ACCEPT_TIMEOUT",
@@ -107,10 +119,16 @@ impl LaunchErrorCode {
             Self::LogDirUnsafe => {
                 "the log directory or an ancestor is a symlink or can be replaced by another user"
             }
+            Self::RecordDirUnsafe => {
+                "the record directory or an ancestor is a symlink or can be replaced by another user"
+            }
             Self::SocketPathExists => "socket path already exists; remove it manually",
             Self::LogPathExists => "log path already exists; it is never overwritten",
             Self::LogOpenFailed => "cannot create the log file",
             Self::LogWriteFailed => "cannot write or sync the log file",
+            Self::RecordPathExists => "record path already exists; it is never overwritten",
+            Self::RecordOpenFailed => "cannot create the record file",
+            Self::RecordWriteFailed => "cannot write or sync the record file",
             Self::BindFailed => "cannot bind the unix socket",
             Self::AcceptFailed => "accept failed",
             Self::AcceptTimeout => "no connection before the accept deadline",
@@ -136,8 +154,10 @@ impl LaunchErrorCode {
                 | Self::SocketDirNotPrivate
                 | Self::SocketDirAncestorUnsafe
                 | Self::LogDirUnsafe
+                | Self::RecordDirUnsafe
                 | Self::SocketPathExists
                 | Self::LogPathExists
+                | Self::RecordPathExists
         )
     }
 }

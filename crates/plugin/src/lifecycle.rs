@@ -1557,7 +1557,10 @@ mod tests {
 
     /// REPAIR-5・PLUG-7・#1605: 満杯の fd でも診断出力が期限内に戻る。
     #[test]
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     fn repair4_drop_log_does_not_block_on_full_fd_and_leaves_no_thread() {
         // 満杯のソケットを stderr に見立てる。ブロックしない保証のある経路（MSG_DONTWAIT）で即座に戻り、スレッドを作らない
         // （#1605・REPAIR-5・PLUG-7）。
@@ -1682,7 +1685,10 @@ mod tests {
         assert_eq!(r.unwrap_err().kind(), io::ErrorKind::Unsupported);
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn repair4_drop_log_writes_line_when_fd_ready() {
         use std::io::Read;
@@ -1693,6 +1699,26 @@ mod tests {
         let mut got = vec![0u8; line.len()];
         b.read_exact(&mut got).unwrap();
         assert_eq!(got, line);
+    }
+
+    /// REPAIR-5・PLUG-7・#1605: macOS は socket でも書かず `Unsupported`（満杯のブロッキング socket への
+    /// `send(MSG_DONTWAIT)` が戻らないことを CI で観測したため。診断は捨て、相手には何も届かない）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn repair5_drop_log_discards_on_socket_on_macos() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let start = Instant::now();
+        let r = crate::sys::write_nonblocking(&a, GROUP_KILL_FAILED_LINE.as_bytes());
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::Unsupported);
+        b.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            b.read(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
     }
 
     /// REPAIR-4・#1605: `Reap` から記録への写像と JSON 行の全文。

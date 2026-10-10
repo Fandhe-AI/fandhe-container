@@ -586,7 +586,7 @@ mod tests {
 
     use super::*;
     use crate::landlock::AccessFs;
-    use crate::test_support::{TestTempDir, kernel_at_least};
+    use crate::test_support::{TestTempDir, kernel_at_least, write_file_in_child};
 
     fn assess(lsm: &str) -> LsmEnvironment {
         assess_lsm_environment(Ok(lsm.to_owned()))
@@ -775,10 +775,11 @@ mod tests {
             Self(TestTempDir::new(&format!("sealed-copy-{label}")).expect("temp dir"))
         }
 
-        /// `mode` の通常ファイルを作り、読み取り専用で開いて返す。
+        /// `mode` の通常ファイルを作り、読み取り専用で開いて返す。書き込みは子プロセスで行い、試験プロセスに
+        /// 書き込み用 fd を持たせない（他スレッドの fork が継承して `AT_EXECVE_CHECK` が `ETXTBSY` になるのを防ぐ。#1686）。
         fn file(&self, name: &str, content: &[u8], mode: u32) -> File {
             let path = self.0.path().join(name);
-            std::fs::write(&path, content).expect("write");
+            write_file_in_child(&path, content).expect("write in child");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
             File::open(&path).expect("open")
         }
@@ -1180,7 +1181,7 @@ mod tests {
         for sub in ["allowed", "denied"] {
             std::fs::create_dir(root.join(sub)).expect("mkdir");
             let path = root.join(sub).join("script");
-            std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write");
+            write_file_in_child(&path, b"#!/bin/sh\nexit 0\n").expect("write in child");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
         let supported = kernel_at_least(6, 14);

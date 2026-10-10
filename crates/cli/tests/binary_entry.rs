@@ -486,7 +486,8 @@ fn cli1_list_logs_flow_on_linux() {
     );
 }
 
-/// SEC-1・PLUG-4: Linux 以外では list / logs も plugin 候補なしの fail-closed で FAILED_PRECONDITION（5）。
+/// SEC-1・PLUG-4・C1: Linux 以外では list / logs も plugin 候補なしの fail-closed で FAILED_PRECONDITION（5）。
+/// 文言は「未導入」の識別子（信頼性検証の拒否とは別。TASK-79.4 追補）。
 /// logs の ID 不正は plugin 解決より先に 2 で弾く。
 #[cfg(not(target_os = "linux"))]
 #[test]
@@ -502,7 +503,7 @@ fn sec1_list_logs_fail_closed_off_linux() {
         assert_eq!(out.status.code(), Some(5));
         assert_eq!(
             String::from_utf8_lossy(&out.stderr),
-            "{\"code\":\"FAILED_PRECONDITION\",\"message\":\"failed precondition\"}\n"
+            "{\"code\":\"FAILED_PRECONDITION\",\"message\":\"platform backend plugin is not installed\"}\n"
         );
         assert!(out.stdout.is_empty());
     }
@@ -551,7 +552,7 @@ fn plug11_path_search_is_off_by_default_off_linux() {
     assert_eq!(path_warning_lines(&out), 0);
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "{\"code\":\"FAILED_PRECONDITION\",\"message\":\"failed precondition\"}\n"
+        "{\"code\":\"FAILED_PRECONDITION\",\"message\":\"platform backend plugin is not installed\"}\n"
     );
     assert!(out.stdout.is_empty());
 }
@@ -577,7 +578,11 @@ fn plug11_path_search_flag_warns_and_rejects_off_linux() {
     assert_eq!(path_warning_lines(&out), 2);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let last = stderr.lines().last().expect("last line");
-    assert!(last.contains("\"code\":\"UNIMPLEMENTED\""), "{last}");
+    // 「未導入」（FAILED_PRECONDITION）とは別の識別子で、パス・plugin 名を含まない（C1）。
+    assert_eq!(
+        last,
+        "{\"code\":\"UNIMPLEMENTED\",\"message\":\"plugin trust verification is not implemented on this platform\"}"
+    );
     assert!(out.stdout.is_empty());
 }
 
@@ -599,6 +604,11 @@ fn plug11_path_search_env_warns_and_rejects_off_linux() {
     );
     assert_eq!(out.status.code(), Some(8));
     assert_eq!(path_warning_lines(&out), 2);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        stderr.lines().last().expect("last line"),
+        "{\"code\":\"UNIMPLEMENTED\",\"message\":\"plugin trust verification is not implemented on this platform\"}"
+    );
     assert!(out.stdout.is_empty());
 }
 

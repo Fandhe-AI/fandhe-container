@@ -17,7 +17,8 @@
 //! 2. `pivot_root` による rootfs 切替と旧 root の後始末（#135・TASK-27.3。**実装済み**。
 //!    [`prepare_rootfs`]〔自己 bind と rootfs 配下への `/proc` マウント〕→ [`pivot_root`]）
 //! 3. rootfs の `dev` への専用 tmpfs のマウント（#1653）と、その上への基本デバイスノード 6 種・
-//!    default symlink 4 本の作成（#834・TASK-27.6。**実装済み**。[`create_default_devices`] を
+//!    default symlink 4 本・`/dev/pts` の独立した devpts・`/dev/ptmx`（`pts/ptmx` への symlink）の作成
+//!    （#834・TASK-27.6・#1656。**実装済み**。[`create_default_devices`] を
 //!    [`prepare_rootfs`] の後・[`pivot_root`] の前に呼ぶ。rootless では tmpfs までは載るが `mknod` が
 //!    `EPERM` になり `PermissionDenied` で fail-closed し、載せた tmpfs は外す。ホスト `/dev` の bind mount
 //!    による代替は未実装〔#1660〕）
@@ -136,7 +137,7 @@ pub use cgroup_join::{remove_exec_child_cgroup_in, sweep_stale_exec_child_cgroup
 pub use container_env::{ContainerEnv, ExecCommand};
 pub use devices::{
     DeviceLinkOutcome, DeviceLinkStatus, DeviceNodeOutcome, DeviceNodeStatus, DeviceReport,
-    create_default_devices,
+    DevptsDirStatus, DevptsGidSource, DevptsOutcome, create_default_devices,
 };
 /// 封印した複製の上限（結合試験が上限超過を再現するための再公開。TASK-163 追補・#1531）。
 pub use entrypoint_mode::{EntrypointExecMode, IntegrityLsm, PathBoundLsm, SealedCopyUnavailable};
@@ -561,7 +562,7 @@ pub enum IsolationStage {
     /// 子の終了待ち（`waitpid(2)`）と、期限超過時の `kill(2)`。
     Wait,
     /// rootfs 配下の `dev` への専用 tmpfs のマウントと、基本デバイスノード・default symlink の作成
-    /// （`mknodat(2)`・`symlink(2)`。#1653）。
+    /// （`mknodat(2)`・`symlink(2)`。#1653）、`/dev/pts` の devpts のマウントと `/dev/ptmx` の symlink の作成（#1656）。
     CreateDevices,
     /// cgroup 参加ステージ（TASK-32。#832 のステージ列の第 1 段）。
     CgroupJoin,

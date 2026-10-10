@@ -48,10 +48,11 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::exec::{
-        DeviceLinkStatus, DeviceNodeStatus, IsolationConfig, IsolationStage, MountIsolation,
-        Namespace, NamespaceSet, create_default_devices, isolate, isolate_rootful_host_root,
-        pivot_root, plan, plan_rootful_host_root, prepare_rootfs,
+        DeviceLinkStatus, DeviceNodeStatus, DevptsDirStatus, DevptsGidSource, IsolationConfig,
+        IsolationStage, MountIsolation, Namespace, NamespaceSet, create_default_devices, isolate,
+        isolate_rootful_host_root, pivot_root, plan, plan_rootful_host_root, prepare_rootfs,
     };
+    use fandhe_container_core::rootless::single_id_mapping;
     use fandhe_container_core::traits::types::ErrorCode;
 
     /// 期待する `(name, major, minor)`。OCI Runtime Spec の default devices（モードは全て 0666）。
@@ -82,6 +83,17 @@ mod linux {
             == Some("0")
     }
 
+    /// 親（user namespace に入る前）の実効 gid。user namespace の中では 0 に見えるため、親が子へ渡す。
+    fn egid() -> u32 {
+        std::fs::read_to_string("/proc/self/status")
+            .expect("read status")
+            .lines()
+            .find(|l| l.starts_with("Gid:"))
+            .and_then(|l| l.split_whitespace().nth(2).map(str::to_string))
+            .and_then(|v| v.parse().ok())
+            .expect("parse egid")
+    }
+
     fn timeout() -> Duration {
         let secs = std::env::var("FANDHE_CONTAINER_TEST_TIMEOUT_SECS")
             .ok()
@@ -99,7 +111,12 @@ mod linux {
                 // user namespace 内では写像後の euid が 0 になり is_root() で判別できないため、
                 // 親が決めた rootful / rootless を引数で受け取る。
                 let rootful = args.iter().any(|a| a == "--rootful");
-                child(Path::new(rootfs), rootful);
+                let egid = args
+                    .iter()
+                    .position(|a| a == "--egid")
+                    .and_then(|j| args.get(j + 1))
+                    .and_then(|v| v.parse::<u32>().ok());
+                child(Path::new(rootfs), rootful, egid);
             }
             None => parent(),
         }
@@ -164,7 +181,7 @@ mod linux {
                         .collect();
                     assert_eq!(entries, vec![std::ffi::OsString::from("null")]);
                     println!(
-                        "default_devices: /dev tmpfs, basic device nodes and default links verified (root=true)"
+                        "default_devices: /dev tmpfs, basic device nodes, default links, /dev/pts and /dev/ptmx verified (root=true)"
                     );
                 } else {
                     // この呼び出しが作った `dev` は後始末で消えている。
@@ -188,6 +205,8 @@ mod linux {
             .arg("--child")
             .arg(rootfs)
             .arg(if rootful { "--rootful" } else { "--rootless" })
+            .arg("--egid")
+            .arg(egid().to_string())
             .stdin(Stdio::null())
             .spawn()
             .expect("spawn child");
@@ -208,7 +227,7 @@ mod linux {
         }
     }
 
-    fn child(rootfs: &Path, rootful: bool) {
+    fn child(rootfs: &Path, rootful: bool, egid: Option<u32>) {
         assert_eq!(
             std::process::id(),
             1,
@@ -218,8 +237,12 @@ mod linux {
         let prepared = prepare_rootfs(&isolation, rootfs).expect("prepare rootfs");
 
         if !rootful {
-            let err = create_default_devices(&isolation, &prepared)
-                .expect_err("rootless mknod of character devices must be rejected");
+            // 単一 ID 経路の gid の写像（自 gid → コンテナ内 0）。コンテナ内 gid 5 は写像されない。
+            let gid_map = single_id_mapping(egid.expect("--egid for rootless child"))
+                .expect("single id mapping");
+            let err =
+                create_default_devices(&isolation, &prepared, DevptsGidSource::Rootless(&gid_map))
+                    .expect_err("rootless mknod of character devices must be rejected");
             assert_eq!(err.code, ErrorCode::PermissionDenied);
             assert_eq!(err.stage, IsolationStage::CreateDevices);
             assert!(err.violation.is_none());
@@ -234,11 +257,22 @@ mod linux {
                     .any(|l| l.split_whitespace().nth(4) == dev_mount.to_str()),
                 "the /dev tmpfs must be unmounted after failure"
             );
+            // rootless はノード作成（`mknodat(null)`）で止まり、`/dev/pts` の段へは進まない。そのため
+            // 「gid 5 を写像しない rootless の devpts が `gid=` を含まない」ことの実機照合は、rootless の基本
+            // デバイスの供給（#1660）が入るまでできない（単体テストと `sys` の実マウント試験で補っている）。
+            let pts_mount = rootfs.join("dev/pts");
+            assert!(
+                !mountinfo
+                    .lines()
+                    .any(|l| l.split_whitespace().nth(4) == pts_mount.to_str()),
+                "no devpts may remain after failure"
+            );
             return;
         }
 
         // 1 回だけ呼ぶ（同じ PreparedRootfs への 2 回目は tmpfs が重なるため契約外）。
-        let first = create_default_devices(&isolation, &prepared).expect("create devices");
+        let first = create_default_devices(&isolation, &prepared, DevptsGidSource::Rootful)
+            .expect("create devices");
         assert_eq!(first.nodes.len(), 6);
         for (n, (name, major, minor)) in first.nodes.iter().zip(EXPECTED) {
             assert_eq!(
@@ -254,6 +288,9 @@ mod linux {
                 .iter()
                 .all(|l| l.status == DeviceLinkStatus::Created)
         );
+        assert_eq!(first.devpts.gid, Some(5));
+        assert_eq!(first.devpts.pts_dir, DevptsDirStatus::Created);
+        assert_eq!(first.devpts.ptmx.status, DeviceLinkStatus::Created);
 
         pivot_root(&isolation, prepared).expect("pivot_root");
 
@@ -294,5 +331,56 @@ mod linux {
                 "{path} target"
             );
         }
+
+        verify_devpts();
+    }
+
+    /// pivot 後の `/dev/pts`（独立した devpts）と `/dev/ptmx` の照合（#1656。CORE-1・SEC-1）。
+    fn verify_devpts() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").expect("read mountinfo");
+        let pts_lines: Vec<_> = mountinfo
+            .lines()
+            .filter(|l| l.split_whitespace().nth(4) == Some("/dev/pts"))
+            .collect();
+        assert_eq!(pts_lines.len(), 1, "exactly one mount at /dev/pts");
+        let fields: Vec<_> = pts_lines[0].split_whitespace().collect();
+        let options: Vec<_> = fields[5].split(',').collect();
+        assert!(options.contains(&"nosuid"), "{}", pts_lines[0]);
+        assert!(options.contains(&"noexec"), "{}", pts_lines[0]);
+        // pty は文字デバイスのため nodev を付けない。
+        assert!(!options.contains(&"nodev"), "{}", pts_lines[0]);
+        let sep = fields.iter().position(|f| *f == "-").expect("separator");
+        assert_eq!(fields[sep + 1], "devpts", "{}", pts_lines[0]);
+        let super_options: Vec<_> = fields[sep + 3].split(',').collect();
+        for want in ["mode=620", "ptmxmode=666", "gid=5"] {
+            assert!(super_options.contains(&want), "{want}: {}", pts_lines[0]);
+        }
+
+        // ホストの pty が見えない独立 instance なので、開く前のエントリは `ptmx` だけ。
+        let entries: Vec<_> = std::fs::read_dir("/dev/pts")
+            .expect("read /dev/pts")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("ptmx")]);
+
+        assert_eq!(
+            std::fs::read_link("/dev/ptmx").expect("readlink /dev/ptmx"),
+            std::path::PathBuf::from("pts/ptmx")
+        );
+        let meta = std::fs::metadata("/dev/pts/ptmx").expect("stat /dev/pts/ptmx");
+        assert!(meta.file_type().is_char_device());
+        assert_eq!(meta.rdev(), makedev(5, 2), "/dev/pts/ptmx rdev");
+
+        // `O_NOCTTY`（0o400）で開けること（libc の依存を足さないため定数をここで定義する）。
+        const O_NOCTTY: i32 = 0o400;
+        let master = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(O_NOCTTY)
+            .open("/dev/ptmx")
+            .expect("open /dev/ptmx");
+        drop(master);
     }
 }

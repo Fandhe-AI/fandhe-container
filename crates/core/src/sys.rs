@@ -1483,8 +1483,7 @@ fn mount_tmpfs_impl(target_dir: BorrowedFd<'_>, params: &TmpfsParams) -> Result<
 }
 
 /// devpts の `statfs.f_type`（include/uapi/linux/magic.h の `DEVPTS_SUPER_MAGIC`。アーキテクチャ非依存）。
-/// [`mount_devpts_on`] が返す fd の事後検証で使う（#1656 で `crate::exec` から配線予定。CORE-1・SEC-1）。
-#[cfg_attr(not(test), allow(dead_code))]
+/// [`mount_devpts_on`] が返す fd の事後検証で使う（`crate::exec::create_default_devices` が呼ぶ。CORE-1・SEC-1・#1656）。
 pub(crate) const DEVPTS_MAGIC: i64 = 0x1cd1;
 
 /// [`mount_devpts_on`] の作成パラメータ。`/dev/pts` の devpts は OCI runtime-spec の Default Filesystems で
@@ -1492,16 +1491,14 @@ pub(crate) const DEVPTS_MAGIC: i64 = 0x1cd1;
 ///
 /// 可変なのは `gid` だけで、`mode`（0o620）・`ptmxmode`（0o666）・マウント属性（nosuid・noexec）は型の外から
 /// 変えられない。カーネルへ渡す文字列は本モジュール内で整数から生成し、利用者文字列や `mount(2)` の data を
-/// 渡す経路を持たない。呼び出し元（#1656 の `crate::exec`）が rootless で gid 5 が写像されていないときに
+/// 渡す経路を持たない。呼び出し元（`crate::exec::create_default_devices`。#1656）が rootless で gid 5 が写像されていないときに
 /// `gid` を `None` にする（判定はここでは行わない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct DevptsCreate {
     /// pty スレーブの所有グループ。`None` のときは `gid` のキー自体を渡さない（カーネル既定）。
     pub(crate) gid: Option<u32>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl DevptsCreate {
     /// pty スレーブのモード（`mode=`）。
     pub(crate) const MODE: u32 = 0o620;
@@ -1544,16 +1541,14 @@ impl DevptsCreate {
 /// `fsopen("devpts")` → `fsconfig`（[`DevptsCreate`] のキーを 1 つずつ SET_STRING）→ `fsconfig(CMD_CREATE)`
 /// → `fsmount`（nosuid・noexec）→ `move_mount(.., target_dir, "", *_EMPTY_PATH)`。syscall 境界ではキー単位で
 /// 渡し、利用者の文字列や `mount(2)` の data は渡さない。返す fd は自分のマウントを一意に指し、呼び出し元
-/// （#1656 の `crate::exec`）が `DEVPTS_MAGIC` による事後検証と失敗時の後始末に使う。
+/// （`crate::exec::create_default_devices`。#1656）が `DEVPTS_MAGIC` による事後検証と失敗時の後始末に使う。
 ///
 /// `nodev` は付けない（pty は文字デバイスのため）。`newinstance` は渡さない（Linux 4.7 以降は devpts の
 /// mount がすべて独立 instance で、本 API の前提は 5.2 以降）。instance ごとの `max=` も付けない
 /// （全体上限は `kernel.pty.max` が担う）。未対応（`ENOSYS`）は [`SysError::Unsupported`] で返し、
 /// `mount(2)` へは縮退しない（fail-closed）。実マウントは `sys::tests::core1_sec1_task29_devpts_real_mount`（実機前提・`--ignored`）が
-/// user + mount namespace 内で確認し、`crate::exec` への配線後の検証は #1656 で行う。
+/// user + mount namespace 内で確認し、`crate::exec` からの呼び出しは `tests/default_devices.rs` が確認する（#1656）。
 /// ビヘイビア: CORE-1・SEC-1・REPAIR-2（TASK-29 追補・#1655）。
-// 呼び出し元は #1656 で配線するまで存在しないため dead_code を許可する。
-#[allow(dead_code)]
 pub(crate) fn mount_devpts_on(
     target_dir: BorrowedFd<'_>,
     create: DevptsCreate,

@@ -1519,7 +1519,7 @@ fn move_mount_empty_path_flags() -> u32 {
 /// 切り離したマウント `from` を、`to`（検証済みの O_PATH fd）の上へ `move_mount(2)` で載せる。
 ///
 /// 両端とも fd を指し、パス文字列は渡さない（`*_EMPTY_PATH`）ため、パスの再解決・symlink 追従が起きない。
-/// `mount_tmpfs_on`（tmpfs の載せ替え）と、rootless のデバイスノード bind（#1660 が呼ぶ。CORE-6・SEC-5）が
+/// `mount_tmpfs_on`（tmpfs の載せ替え）と、rootless のデバイスノード bind（`crate::exec::devices` が呼ぶ。CORE-6・SEC-5・#1660）が
 /// 共有する。`ENOSYS`（Linux 5.2 未満）は [`SysError::Unsupported`] で返し、`mount(2)` へは縮退しない。
 /// ファイルの bind では `to` もファイルである必要がある（ディレクトリ同士かファイル同士のみ成功する）。
 ///
@@ -1565,8 +1565,6 @@ fn move_mount_empty_path_raw(from: RawFd, to: RawFd) -> Result<(), SysError> {
 ///
 /// [`verify_device_node_fd`] だけが作る（フィールドは `sys` の外から触れない）。保持するのは検証に使った fd
 /// そのもので、検証後にパスを開き直さないため、検証と複製の対象は同じ inode になる（TOCTOU なし）。
-// #1660 で呼び出し元を足すまでの間のみ許可する（配線時に外す）。
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct VerifiedDeviceNodeFd(OwnedFd);
 
@@ -1576,8 +1574,8 @@ impl std::os::fd::AsFd for VerifiedDeviceNodeFd {
     }
 }
 
-/// [`verify_device_node_fd`] の拒否理由。照合した実値を持ち、呼び出し側（#1660）が構造化エラーへ写す。
-#[allow(dead_code)]
+/// [`verify_device_node_fd`] の拒否理由。照合した実値を持ち、呼び出し側（`crate::exec::devices`。#1660）が
+/// 構造化エラーへ写す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeviceNodeError {
     /// 文字デバイスではない（ディレクトリ・通常ファイル・`O_NOFOLLOW` で開いた symlink 等）。`mode` は `st_mode` の実値。
@@ -1595,8 +1593,6 @@ pub(crate) enum DeviceNodeError {
 /// `sys` は上位層（`crate::exec::devices`）に依存しないため表を自前で持ち、`DEFAULT_DEVICES` との一致は
 /// `exec::devices` 側の単体テストが順序込みで照合する（どちらかだけを変えるとテストが落ちる）。
 /// CDI の deviceNodes は別責務（TASK-127）で、ここへ列挙子を足して受け付けない。
-// #1660 で呼び出し元を足すまでの間のみ許可する（配線時に外す）。
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HostDeviceNode {
     /// `/dev/null`（1:3）。
@@ -1626,7 +1622,6 @@ impl HostDeviceNode {
     ];
 
     /// `(major, minor)`。
-    #[allow(dead_code)]
     pub(crate) const fn major_minor(self) -> (u32, u32) {
         match self {
             Self::Null => (1, 3),
@@ -1646,7 +1641,6 @@ impl HostDeviceNode {
 /// `DEFAULT_DEVICES` の要素に対応する列挙子を渡す）。パスの `stat` ではなく fd の `fstat`（std の
 /// `File::metadata`。fd は複製して見るだけで、元の fd をそのまま保持する）で見るため、検証後の差し替えは効かない。
 /// 照合は `crate::exec::devices` の既存ノードの検証と同じ形（種別と `rdev` の完全一致）。
-#[allow(dead_code)]
 pub(crate) fn verify_device_node_fd(
     fd: OwnedFd,
     node: HostDeviceNode,
@@ -1686,7 +1680,7 @@ fn open_tree_clone_flags() -> u32 {
 ///
 /// rootless（user namespace）では `mknod` できないため、ホストのノードを fd 起点で `open_tree` +
 /// `move_mount_empty_path` により bind する（方式 (a)。`docs/design/dev-default-mounts.md` §3.6・
-/// 判断 4。CORE-6・SEC-5・#1659。呼び出し元は #1660）。戻り値は未接続のマウントを指す close-on-exec の fd で、
+/// 判断 4。CORE-6・SEC-5・#1659。呼び出し元は `crate::exec::devices` の rootless 経路。#1660）。戻り値は未接続のマウントを指す close-on-exec の fd で、
 /// 途中で失敗して drop すればカーネルが破棄する。
 ///
 /// 引数は [`verify_device_node_fd`] だけが作れる [`VerifiedDeviceNodeFd`] に限る。文字デバイス（`S_IFCHR`）で
@@ -1705,7 +1699,7 @@ fn open_tree_clone_flags() -> u32 {
 /// 必要なカーネルは Linux 5.2 以降。`ENOSYS` は [`SysError::Unsupported`] で返し、`mount(2)` へは縮退しない。
 /// user namespace では自分の mount namespace を所有する userns の `CAP_SYS_ADMIN` が要る。
 ///
-/// 呼び出し順の前提（#1660 が固定し結合試験で照合する）:
+/// 呼び出し順の前提（`crate::exec::devices` が固定し結合試験 `default_devices` で照合する。#1660）:
 /// - ホストのノードは `unshare(CLONE_NEWNS)` の後・`pivot_root` の前に、呼び出しと同じ mount namespace の中で
 ///   開き、同じ namespace の中で本関数を呼ぶ。fs/namespace.c の `__do_loopback`（v5.2・v6.12 で確認）は
 ///   `check_mnt(old)`（fd のマウントの `mnt_ns` が呼び出しスレッドの mount namespace と一致）を満たさないと
@@ -1713,15 +1707,15 @@ fn open_tree_clone_flags() -> u32 {
 ///   `umount2(MNT_DETACH)` で切り離すと `umount_tree` が `mnt_ns` を NULL にするため、どちらも複製できない。
 /// - seccomp フィルタの適用前に呼ぶ。`crate::seccomp` の既定の拒否集合は `open_tree`（`DeniedSyscall::OpenTree`）と
 ///   `move_mount`（`DeniedSyscall::MoveMount`）を含み、適用後は失敗する。
-// #1660 で呼び出し元を足すまでの間のみ許可する（配線時に外す）。
-#[allow(dead_code)]
+// テストビルドでは `crate::exec::devices` の dry-run 差し込み点が呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) fn open_tree_clone(node: &VerifiedDeviceNodeFd) -> Result<OwnedFd, SysError> {
     open_tree_clone_raw(node.0.as_raw_fd())
 }
 
 /// [`open_tree_clone`] の本体。fd 番号（`RawFd`）を受ける非公開部分で、無効 fd の拒否（`EBADF`）を
 /// `BorrowedFd` の契約に反せず単体テストで確かめるために切り出している。
-#[allow(dead_code)]
+#[cfg_attr(test, allow(dead_code))]
 fn open_tree_clone_raw(node: RawFd) -> Result<OwnedFd, SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);

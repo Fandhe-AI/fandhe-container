@@ -662,7 +662,11 @@ pub fn run_command(
             run_with_target(proof, &target, request, deadline, child)
         },
     );
-    audit_worker_result(attach_sweep(result, sweep), audit)
+    audit_worker_result(
+        attach_sweep(result, sweep),
+        Some(record.status().id()),
+        audit,
+    )
 }
 
 /// worker の結果を受け、拒否なら 1 件記録して返す（親プロセス側の記録点。SEC-4・SUP-6・#1465・#1595）。
@@ -676,8 +680,12 @@ pub fn run_command(
 /// - 1 つの拒否が写る層は 1 つだけ（`err` 行と `ok` 行の理由の一覧は交わらない。core の
 ///   `exec/violation_scan.rs` の単体テストが固定する）
 /// - 違反の理由を持たないもの（タイムアウト・システムエラー・前提不成立・コマンドの終了）は記録せず `NotApplicable`
+/// - `container` は記録の `container_id` に載せる検証済みの ID（公開の入口は `record.id()` を渡す）。記録の `pid` は
+///   この親プロセスのもので、worker・コンテナ内のコマンド・pid1 ではない。対象 pid1 の PID は未検証の候補しか
+///   無いため載せない（#1618）
 fn audit_worker_result(
     result: Result<ExecOutcome, WorkerFailure>,
+    container: Option<&ContainerId>,
     audit: &dyn AuditSink,
 ) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
     match result {
@@ -686,7 +694,7 @@ fn audit_worker_result(
                 violation: Some(reason),
                 ..
             } => {
-                let rejected = record_entrypoint_rejection(outcome, reason, audit);
+                let rejected = record_entrypoint_rejection(outcome, reason, container, audit);
                 Ok(AuditedOutcome {
                     outcome: rejected.error,
                     audit: rejected.delivery,
@@ -698,7 +706,7 @@ fn audit_worker_result(
             }),
         },
         Err(failure) => Err(match failure.violation {
-            Some(reason) => record_exec_worker_rejection(failure.error, reason, audit),
+            Some(reason) => record_exec_worker_rejection(failure.error, reason, container, audit),
             None => AuditedRejection::not_applicable(failure.error),
         }),
     }
@@ -732,7 +740,11 @@ pub fn run_command_with_pidfd(
             run_with_target(proof, &target, request, deadline, child)
         },
     );
-    audit_worker_result(attach_sweep(result, sweep), audit)
+    audit_worker_result(
+        attach_sweep(result, sweep),
+        Some(record.status().id()),
+        audit,
+    )
 }
 
 /// 実機結合試験専用の入口: [`run_command`] の対象特定だけを [`identify_pid1_in`]（期待 cgroup パスを呼び出し側
@@ -773,7 +785,11 @@ pub fn run_command_in(
             run_with_target(proof, &target, request, deadline, child)
         },
     );
-    audit_worker_result(attach_sweep(result, sweep), audit)
+    audit_worker_result(
+        attach_sweep(result, sweep),
+        Some(record.status().id()),
+        audit,
+    )
 }
 
 /// exec 開始時の掃除（自分の子 cgroup を作る前）の結果。失敗しても exec は止めない（#1596）。
@@ -1086,6 +1102,7 @@ pub fn run_in_worker_for_test(
 pub fn run_in_worker_audited_for_test(
     timeout: Duration,
     work: impl FnOnce() -> Result<ExecOutcome, ExecError>,
+    container: Option<&ContainerId>,
     audit: &dyn AuditSink,
 ) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
     let result = run_in_worker_with(
@@ -1094,7 +1111,7 @@ pub fn run_in_worker_audited_for_test(
         || Ok(()),
         |_| work().map_err(from_exec_error),
     );
-    audit_worker_result(result, audit)
+    audit_worker_result(result, container, audit)
 }
 
 /// worker の結果を pipe 用の 1 行へ符号化する。成功は `ok <command|setup> <違反の理由コードまたは -> <exited|signaled>
@@ -2239,7 +2256,7 @@ mod tests {
             let failure =
                 decode_worker_result(&encode_worker_result(&Err(err.clone()))).unwrap_err();
             assert_eq!(failure.violation, Some(reason));
-            let rejected = audit_worker_result(Err(failure), &sink).unwrap_err();
+            let rejected = audit_worker_result(Err(failure), Some(&cid()), &sink).unwrap_err();
             assert_eq!(rejected.error, err);
             assert_eq!(rejected.delivery, AuditDelivery::Recorded);
             let recs = sink.snapshot();
@@ -2254,13 +2271,14 @@ mod tests {
             assert_eq!(recs[0].path(), None);
             assert_eq!(recs[0].syscall(), None);
             assert_eq!(recs[0].pid().get(), std::process::id());
+            assert_eq!(recs[0].container_id().map(|c| c.as_str()), Some("c1"));
 
             let failing = RecordingSink::new(true);
             let failure = WorkerFailure {
                 error: err.clone(),
                 violation: Some(reason),
             };
-            let rejected = audit_worker_result(Err(failure), &failing).unwrap_err();
+            let rejected = audit_worker_result(Err(failure), Some(&cid()), &failing).unwrap_err();
             assert_eq!(rejected.error, err);
             assert_eq!(
                 rejected.delivery,
@@ -2269,7 +2287,8 @@ mod tests {
         }
         let sink = RecordingSink::new(false);
         let timeout = TraitError::new(ErrorCode::Timeout, "exec timed out");
-        let rejected = audit_worker_result(Err(timeout.clone().into()), &sink).unwrap_err();
+        let rejected =
+            audit_worker_result(Err(timeout.clone().into()), Some(&cid()), &sink).unwrap_err();
         assert_eq!(rejected.error, timeout);
         assert_eq!(rejected.delivery, AuditDelivery::NotApplicable);
         assert_eq!(sink.snapshot().len(), 0);
@@ -2301,7 +2320,7 @@ mod tests {
         for reason in exec_child_violation_reasons() {
             let outcome = setup_failed(Some(*reason));
             let sink = RecordingSink::new(false);
-            let got = audit_worker_result(Ok(outcome), &sink).unwrap();
+            let got = audit_worker_result(Ok(outcome), Some(&cid()), &sink).unwrap();
             assert_eq!(got.outcome, outcome);
             assert_eq!(got.audit, AuditDelivery::Recorded);
             let recs = sink.snapshot();
@@ -2310,9 +2329,10 @@ mod tests {
             assert_eq!(recs[0].reason().map(|r| r.as_str()), Some(reason.as_str()));
             assert_eq!(recs[0].path(), None);
             assert_eq!(recs[0].pid().get(), std::process::id());
+            assert_eq!(recs[0].container_id().map(|c| c.as_str()), Some("c1"));
 
             let failing = RecordingSink::new(true);
-            let got = audit_worker_result(Ok(outcome), &failing).unwrap();
+            let got = audit_worker_result(Ok(outcome), Some(&cid()), &failing).unwrap();
             assert_eq!(got.outcome, outcome);
             assert_eq!(
                 got.audit,
@@ -2327,7 +2347,7 @@ mod tests {
             },
         ] {
             let sink = RecordingSink::new(false);
-            let got = audit_worker_result(Ok(outcome), &sink).unwrap();
+            let got = audit_worker_result(Ok(outcome), Some(&cid()), &sink).unwrap();
             assert_eq!(got.outcome, outcome);
             assert_eq!(got.audit, AuditDelivery::NotApplicable);
             assert_eq!(sink.snapshot().len(), 0);

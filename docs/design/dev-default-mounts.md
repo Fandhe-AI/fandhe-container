@@ -30,7 +30,7 @@ OCI 既定の `/dev` のうち、基本デバイスノード 6 種と default sy
 - `process.terminal: true` と `mounts[]` は拒否する。`/proc` と基本 6 デバイスは `mounts[]` を使わず暗黙の固定集合
 - Landlock のルールは `root` に加え、暗黙の `/dev`・`/dev/pts`・`/dev/shm` を実マウントの属性から導いた権利で足す（#1657）。定義は `dev_mounts` モジュールの1か所で、exec 側と共有する。`mounts[]` が同じマウント先を指す場合は統合せず拒否する（統合の規則は TASK-127）。`PSEUDO_FS` に devpts は入れない（pty への書き込みに `WRITE_FILE` が要り、書き込み制限に VFS の裏付けがあるため）。利用者指定の tmpfs（`--tmpfs`・`/dev/shm` の上書き）は反映しない。ruleset は fork 前に親で作るため、適用時に各パスが期待する fs（tmpfs / devpts）の独立したマウントのルートであることを確かめ、無ければ `landlock_implicit_mount_missing`、素のディレクトリ等なら `landlock_implicit_mount_mismatch`（どちらも `FailedPrecondition`）で拒否する。`/dev/shm` を載せない `--ipc=host` では `ImplicitDevMounts::WithoutShm`（supervisor の `ContainerOptions::implicit_dev_mounts`）を使う（#1672 の事後監査 P2）
 - 読み取り専用の root（`root.readonly=true`）でも、`/dev` は書き込みと実行が可能な tmpfs で、Landlock でも `/dev` に `WRITE` を許す（`EXECUTE` は `/` のルールから継承され、`/dev` だけ外せない。VFS 側も `noexec` なし）。runc・Docker と同じだが、「読み取り専用の root で `mounts[]` が空なら書き込めるパスが無い」という #1657 以前の性質は成り立たない（#1672 の事後監査 P2）。`/dev/shm` も書き込みは可能（`noexec`・`nodev`）
-- rootless は tmpfs までは載るが `mknod` が `EPERM` になり `PermissionDenied` で fail-closed（載せた tmpfs は外す）。ホスト `/dev` の bind は未実装（#1660）
+- rootless は `mknod` を使わず、ホストの `/dev/<名前>` を `open_tree(2)` + `move_mount(2)` で tmpfs 上の空ファイルへ fd 起点で bind する（#1660 で実装。供給方式は `DevptsGidSource` の申告で決め、`mknod` の `EPERM` では切り替えない。ホスト側ノードの不一致は `host_device_node_unexpected`〔SEC-5〕で拒否し、新マウント API が無いカーネルは縮退せず `Unimplemented`）。実機での確認は結合試験 `default_devices`（人間担当）
 
 ## 3. 方式の比較
 

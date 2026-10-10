@@ -30,7 +30,8 @@
 //! 4K / 16K / 64K ページのいずれでも表示が変わらない 64 KiB の倍数を使う。rootless でも tmpfs は user
 //! namespace 内で作れるため両経路とも成功を要求する（`create_default_devices` には依存しない）。
 //! 本試験の rootfs の `dev` は素のディレクトリで、`create_default_devices`（#1653）の tmpfs の上には載らない
-//! （rootless では `mknod` が EPERM になり使えないため）。`/dev` の tmpfs の上に載る組み合わせは本番の起動順
+//! （本試験は rootless でも `create_default_devices` に依存しない構成のため。rootless の基本デバイスの供給は
+//! #1660 で bind になった）。`/dev` の tmpfs の上に載る組み合わせは本番の起動順
 //! （`create_default_devices` → `mount_tmpfs`）でのみ成り立ち、`mount_tmpfs` は `/dev` 配下の宛先に順序の証跡
 //! （`DeviceReport`）を要求する。そのため成功経路は、順序の検査だけを省く `exec-test-support` の入口
 //! `mount_tmpfs_over_bare_dev_for_test` で載せる（他の検証・後始末は `mount_tmpfs` と同一）。
@@ -331,7 +332,7 @@ mod linux {
             !rootfs.join("dev/shm").exists(),
             "no dev/shm before the order check"
         );
-        // 本試験の `dev` は素のディレクトリ（rootless では `create_default_devices` が使えない。#1660）のため、
+        // 本試験の `dev` は素のディレクトリ（`create_default_devices` に依存しない構成。#1660）のため、
         // 順序の検査だけを省く試験専用の入口でフラグ・サイズ・モードを照合する。
         let report =
             mount_tmpfs_over_bare_dev_for_test(&isolation, &prepared, &set).expect("mount tmpfs");

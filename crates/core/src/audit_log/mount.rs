@@ -22,7 +22,7 @@
 
 use std::path::Path;
 
-use crate::traits::TraitError;
+use crate::traits::{ContainerId, TraitError};
 
 use super::{
     AuditEvent, AuditPath, AuditPid, AuditRecord, AuditRecordError, AuditSink, AuditTimestamp,
@@ -62,14 +62,23 @@ impl<E> AuditedRejection<E> {
     }
 }
 
-/// 自プロセスの PID。`i32` に収まらない値は `PidNotPositive`（panic しない）。
+/// 自プロセス（記録を行うプロセス）の PID。`i32` に収まらない値は `PidNotPositive`（panic しない）。
+///
+/// 違反したプロセスや pid1 の PID ではない。コンテナとの対応はレコードの `container_id` で取る（#1618）。
 pub fn current_pid() -> Result<AuditPid, AuditRecordError> {
     let raw = i32::try_from(std::process::id()).unwrap_or(0);
     AuditPid::new(raw)
 }
 
 /// 現在時刻・自 PID でレコードを組み立てて sink へ 1 回だけ渡す。
-pub(crate) fn deliver(event: AuditEvent, sink: &dyn AuditSink) -> AuditDelivery {
+///
+/// 記録の `pid` は**記録を行うプロセス**（supervisor・exec の親・launch の側）のもので、違反した
+/// プロセスや pid1 ではない。対象のコンテナは検証済みの `container`（不明なら `None`）で示す（#1618）。
+pub(crate) fn deliver(
+    event: AuditEvent,
+    container: Option<&ContainerId>,
+    sink: &dyn AuditSink,
+) -> AuditDelivery {
     let timestamp = match AuditTimestamp::now() {
         Ok(t) => t,
         Err(e) => return AuditDelivery::RecordUnavailable(e),
@@ -78,7 +87,11 @@ pub(crate) fn deliver(event: AuditEvent, sink: &dyn AuditSink) -> AuditDelivery 
         Ok(p) => p,
         Err(e) => return AuditDelivery::RecordUnavailable(e),
     };
-    match sink.record(&AuditRecord::new(timestamp, pid, event)) {
+    let mut record = AuditRecord::new(timestamp, pid, event);
+    if let Some(id) = container {
+        record = record.with_container_id(id.clone());
+    }
+    match sink.record(&record) {
         Ok(()) => AuditDelivery::Recorded,
         Err(e) => AuditDelivery::SinkFailed(e),
     }
@@ -87,15 +100,19 @@ pub(crate) fn deliver(event: AuditEvent, sink: &dyn AuditSink) -> AuditDelivery 
 /// マウント拒否 `error` を `Mount` レコードとして記録し、`error` をそのまま返す。
 ///
 /// `path` は分かる場合のみ（計画段階の拒否は `None`）。
+///
+/// 移行（#1618）: 引数 `container` を `sink` の直前に追加した。対象のコンテナ ID が無い呼び出し側は
+/// `None` を渡す（記録の `container_id` は null になる）。
 pub fn record_mount_rejection<E>(
     error: E,
     path: Option<&Path>,
+    container: Option<&ContainerId>,
     sink: &dyn AuditSink,
 ) -> AuditedRejection<E> {
     let event = AuditEvent::Mount {
         path: path.map(AuditPath::new),
     };
-    let delivery = deliver(event, sink);
+    let delivery = deliver(event, container, sink);
     AuditedRejection { error, delivery }
 }
 
@@ -145,7 +162,7 @@ pub(crate) mod tests {
     #[test]
     fn sec4_task41_4_records_one_mount_record_with_path() {
         let sink = VecSink::new(false);
-        let r = record_mount_rejection("denied", Some(Path::new("/proc/sys")), &sink);
+        let r = record_mount_rejection("denied", Some(Path::new("/proc/sys")), None, &sink);
         assert_eq!(r.error, "denied");
         assert_eq!(r.delivery, AuditDelivery::Recorded);
         let recs = sink.snapshot();
@@ -154,13 +171,26 @@ pub(crate) mod tests {
         assert_eq!(recs[0].syscall(), None);
         assert_eq!(recs[0].path(), Some(Path::new("/proc/sys")));
         assert_eq!(recs[0].pid().get(), std::process::id());
+        assert_eq!(recs[0].container_id(), None);
+    }
+
+    /// SEC-4・#1618: 検証済みのコンテナ ID が記録に載る。pid は記録したプロセス自身のまま。
+    #[test]
+    fn sec4_1618_records_container_id() {
+        let sink = VecSink::new(false);
+        let id = ContainerId::new("c1").unwrap();
+        let r = record_mount_rejection("denied", None, Some(&id), &sink);
+        assert_eq!(r.delivery, AuditDelivery::Recorded);
+        let recs = sink.snapshot();
+        assert_eq!(recs[0].container_id().map(ContainerId::as_str), Some("c1"));
+        assert_eq!(recs[0].pid().get(), std::process::id());
     }
 
     /// SEC-4: パス無しの拒否は path なしで記録される。
     #[test]
     fn sec4_task41_4_records_without_path() {
         let sink = VecSink::new(false);
-        let r = record_mount_rejection(7u8, None, &sink);
+        let r = record_mount_rejection(7u8, None, None, &sink);
         assert_eq!(r.delivery, AuditDelivery::Recorded);
         assert_eq!(sink.snapshot()[0].path(), None);
     }
@@ -169,7 +199,7 @@ pub(crate) mod tests {
     #[test]
     fn sec4_task41_4_sink_failure_keeps_rejection() {
         let sink = VecSink::new(true);
-        let r = record_mount_rejection("denied", None, &sink);
+        let r = record_mount_rejection("denied", None, None, &sink);
         assert_eq!(r.error, "denied");
         assert_eq!(
             r.delivery,

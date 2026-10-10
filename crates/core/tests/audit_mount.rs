@@ -42,7 +42,7 @@ fn sec4_task41_4_rejected_destination_is_recorded() {
     let sink = VecSink(Mutex::new(Vec::new()));
     let json = config(r#"[{"destination":"/../etc"}]"#, r#"["/bin/sh"]"#);
     let err = parse_config_bytes(json.as_bytes()).expect_err("rejected");
-    let r = audit_mount_config_error(err, &sink);
+    let r = audit_mount_config_error(err, None, &sink);
     assert_eq!(r.delivery, AuditDelivery::Recorded);
     assert_eq!(r.error.code(), ErrorCode::InvalidArgument);
     let g = sink.0.lock().expect("lock");
@@ -59,7 +59,7 @@ fn sec4_task41_4_non_mount_rejection_not_recorded() {
     let sink = VecSink(Mutex::new(Vec::new()));
     let json = config(r#"[{"destination":"/proc"}]"#, "[]");
     let err = parse_config_bytes(json.as_bytes()).expect_err("rejected");
-    let r = audit_mount_config_error(err, &sink);
+    let r = audit_mount_config_error(err, None, &sink);
     assert_eq!(r.delivery, AuditDelivery::NotApplicable);
     assert_eq!(sink.0.lock().expect("lock").len(), 0);
 }
@@ -68,7 +68,7 @@ fn sec4_task41_4_non_mount_rejection_not_recorded() {
 #[test]
 fn sec4_task41_4_record_mount_rejection_with_path() {
     let sink = VecSink(Mutex::new(Vec::new()));
-    let r = record_mount_rejection((), Some(Path::new("/etc")), &sink);
+    let r = record_mount_rejection((), Some(Path::new("/etc")), None, &sink);
     assert_eq!(r.delivery, AuditDelivery::Recorded);
     assert_eq!(
         sink.0.lock().expect("lock")[0].path(),

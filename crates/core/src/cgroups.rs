@@ -61,7 +61,8 @@
 //!   名前（`fc-<id>@<n>`）で削除・不存在確認を行う。削除の直前に、コンテナ cgroup 直下に残った exec 用の
 //!   子 cgroup（`exec-*`）を `cgroup.kill` で止めて消す（全体で 5 秒の期限つき。失敗・件数上限の超過は
 //!   `Err` で返し、コンテナ cgroup の `rmdir` は試みない。#1596・SUP-6。コンテナ cgroup 自体には `cgroup.kill`
-//!   を書かない）
+//!   を書かない）。`remove` は停止済みのコンテナに対してだけ呼ぶ前提で、kill の前にコンテナ cgroup 自身の
+//!   `cgroup.procs` が空であることを確かめ、空でなければ何も kill せず `FailedPrecondition` を返す（OCI-6・CORE-2）
 //!
 //! # 資源制限 setter の計装（REPAIR-4・TASK-170 追補・#1535）
 //! 資源制限の各 setter は `recorder: &OpRecorder` を受け取り、setter の内部で全終了経路（controller 未有効・
@@ -111,7 +112,6 @@ pub use pids::{PIDS_MAX_LIMIT, PidsMax};
 mod exec_join;
 mod exec_kill;
 pub(crate) use exec_join::{ExecJoinFds, contains_pid, open_cgroup_by_path};
-pub use exec_kill::exec_cgroup_sweep_recorder;
 pub(crate) use exec_kill::{
     EXEC_SWEEP_DELETE_TIMEOUT, ExecChildCgroupFds, ExecChildRemoval, ExecChildSweep, SweepMode,
     remove_exec_child_cgroup_at, sweep_exec_children_at, validate_exec_child_name,
@@ -178,6 +178,10 @@ pub enum CgroupStep {
     JoinContainer,
     /// `memory.current` / `cpu.stat` / `io.stat` の読み取り（SUP-10・TASK-167.1）。
     ReadStats,
+    /// 名前指定の削除の直前に、親直下の同名エントリが保持 fd と同一の cgroup であることの確認
+    /// （差し替えの検出。`rmdir` のカーネル拒否〔`Cleanup` 段の `EBUSY` / `ENOTEMPTY`〕と区別する。
+    /// #1596・REPAIR-4）。
+    VerifyIdentity,
 }
 
 /// cgroup 操作のエラー。`code` は ERR 系の機械可読コード、`message` は英語の説明。
@@ -1274,10 +1278,7 @@ fn remove_verified_at(
     if dir_identity(step, entry.as_fd(), "stat cgroup entry")?
         != dir_identity(step, held, "stat held cgroup")?
     {
-        return Err(CgroupError::precondition(
-            step,
-            "cgroup entry no longer matches the held handle",
-        ));
+        return Err(identity_mismatch_error());
     }
     drop(entry);
     let c = cstring(step, name)?;
@@ -1294,10 +1295,24 @@ fn remove_verified_at(
     }
 }
 
+/// [`remove_verified_at`] の同一性不一致（名前のエントリが保持 fd と別の cgroup に差し替えられた）のエラー。
+///
+/// `code` は従来どおり `FailedPrecondition`（delete の再試行の判定を変えない）で、段を
+/// [`CgroupStep::VerifyIdentity`] にして `rmdir` のカーネル拒否（`Cleanup` 段の `EBUSY` / `ENOTEMPTY`）と
+/// 区別する。exec 用の子 cgroup の掃除はこれを「使用中で残す」ではなく失敗に数える（#1596・REPAIR-4・SUP-6）。
+fn identity_mismatch_error() -> CgroupError {
+    CgroupError::precondition(
+        CgroupStep::VerifyIdentity,
+        "cgroup entry no longer matches the held handle",
+    )
+}
+
 /// `oci_runtime::delete` が使う cgroup 削除（TASK-30.3・OCI-6）。対象は `fc-<id>@<instance>`（CORE-3 で作った子）だけ。
 ///
 /// 削除の直前に、直下の残留 `exec-*` を `cgroup.kill` で止めて消す。その待機は掃除全体で
-/// `EXEC_SWEEP_DELETE_TIMEOUT`（5 秒）の上限つき（REPAIR-5。超過は `Timeout`。#1596）。
+/// `EXEC_SWEEP_DELETE_TIMEOUT`（5 秒）の上限つき（REPAIR-5。超過は `Timeout`。#1596）。停止済みのコンテナに
+/// 対してだけ呼ぶ前提で、kill の前にコンテナ cgroup 自身の `cgroup.procs` が空であることを確かめ、空でなければ
+/// 何も kill せず `FailedPrecondition` を返す（OCI-6・CORE-2・SUP-6）。
 impl ContainerCgroupRemover for DelegatedCgroup {
     /// 検出した委譲パス（[`DelegatedCgroup::path`]。ルートは `"/"`）を [`CgroupScope`] にして返す。
     ///
@@ -1308,10 +1323,34 @@ impl ContainerCgroupRemover for DelegatedCgroup {
         CgroupScope::new(&self.path.display())
     }
 
+    /// [`Self::remove_with_recorder`] と同じ削除。記録器を受けないため、残留 `exec-*` の掃除の件数は記録しない。
     fn remove(
         &self,
         id: &ContainerId,
         instance: StateRevision,
+    ) -> Result<CgroupRemoval, TraitError> {
+        self.remove_container_cgroup(id, instance, None)
+    }
+
+    /// 残留 `exec-*` の掃除の成否・レイテンシ・件数（`removed` / `left_*` / `failed`）を、`oci_runtime::delete`
+    /// に注入された `recorder` へ記録して削除する（REPAIR-4・#1596。操作名は `exec_cgroup_sweep_kill_all*`）。
+    fn remove_with_recorder(
+        &self,
+        id: &ContainerId,
+        instance: StateRevision,
+        recorder: &OpRecorder,
+    ) -> Result<CgroupRemoval, TraitError> {
+        self.remove_container_cgroup(id, instance, Some(recorder))
+    }
+}
+
+impl DelegatedCgroup {
+    /// [`ContainerCgroupRemover`] の 2 つの入口の実体（`recorder` は残留 `exec-*` の掃除の記録先）。
+    fn remove_container_cgroup(
+        &self,
+        id: &ContainerId,
+        instance: StateRevision,
+        recorder: Option<&OpRecorder>,
     ) -> Result<CgroupRemoval, TraitError> {
         // 名前を作れない（長さ超過）cgroup は `prepare` に渡す名前も同じ規則で作れないため存在し得ない。
         // 失敗にすると該当レコードが永久に削除不能になるので NotPresent とする。
@@ -1322,10 +1361,16 @@ impl ContainerCgroupRemover for DelegatedCgroup {
             None => Ok(CgroupRemoval::NotPresent),
             Some(child) => {
                 // コンテナは停止済みなので、残った exec 用の子 cgroup はすべて止めて消す。残すと下の
-                // `rmdir` が EBUSY になり、何度再試行しても成功しない。
+                // `rmdir` が EBUSY になり、何度再試行しても成功しない。停止済みでない（コンテナ cgroup 自身に
+                // プロセスが居る）ときは掃除が何も kill せず `FailedPrecondition` を返す。
                 let deadline = std::time::Instant::now() + EXEC_SWEEP_DELETE_TIMEOUT;
-                let swept = sweep_exec_children_at(child.fd.as_fd(), SweepMode::KillAll, deadline)
-                    .map_err(removal_error)?;
+                let swept = sweep_exec_children_at(
+                    child.fd.as_fd(),
+                    SweepMode::KillAll,
+                    deadline,
+                    recorder,
+                )
+                .map_err(removal_error)?;
                 if swept.failed > 0 || swept.truncated {
                     return Err(sweep_removal_error(&swept));
                 }

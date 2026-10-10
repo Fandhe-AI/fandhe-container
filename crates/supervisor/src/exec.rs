@@ -205,10 +205,13 @@
 //!   launch 経路（`spawn_container` の子・launcher）で同じ理由が生じたときの記録の配線（#1314。core の
 //!   `exec::audit_entrypoint_violation`）。worker の経路の違反（種別 `exec_target` の 10 理由と種別 `rootfs_pivot` の
 //!   `rootfs_is_host_root`）と exec の子の違反（種別 `entrypoint` の 8 理由）は、いずれもこの入口で記録する（「監査記録」）。
-//!   この入口の記録の対象外は、exec の経路で生じない理由だけ: 種別 `mount_target` の `target_moved` は launch の
-//!   `pivot_root` 前だけで生じ、種別 `rootfs_pivot` のうち `rootfs_is_host_root` 以外（`rootfs_moved` 等）は launch の
-//!   `prepare_rootfs` / `pivot_root` だけで生じる（どちらも worker の結果行に載らず、載っても許可リスト外として
-//!   拒否し記録しない）。層 `mount` のレコードに理由コードを載せること（`AuditEvent::Mount` の拡張。#652 の共通ログ型と
+//!   この入口の記録の対象外: 種別 `mount_target` の `target_moved` は launch の `pivot_root` 前だけで生じ、種別
+//!   `rootfs_pivot` のうち `rootfs_is_host_root` 以外（`rootfs_moved` 等）は launch の `prepare_rootfs` / `pivot_root`
+//!   だけで生じる（どちらも worker の結果行に載らず、載っても許可リスト外として拒否し記録しない）。worker の
+//!   bundle の rootfs の固定（`load_exec_bundle` → core の `pin_bundle_rootfs` / `RootfsDir::pin`。start と共有）は、
+//!   検証後の差し替え等によるパス検証の違反（`path_symlink_or_not_directory`・`path_missing` 等）を固定文言の
+//!   `TraitError` へ写して違反の情報を落とすため記録されない（start の経路でも同じ。bundle は supervisor と同じ
+//!   信頼境界にある前提。記録するには `pin` が違反を運べる形にする必要がある）。層 `mount` のレコードに理由コードを載せること（`AuditEvent::Mount` の拡張。#652 の共通ログ型と
 //!   合わせて決める）、再起動を越えて残る置き場所・ローテーション・常時の二重記録も未実装（`FileAuditSink` の doc）
 //! - `--ulimit` の指定値の `state.json` への記録。現状は pid1 の実効値を写して代替する（hard は launch を
 //!   超えないが、soft は pid1 が hard の範囲で上げていれば launch の指定より高くなり得る。core の

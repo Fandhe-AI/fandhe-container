@@ -17,7 +17,9 @@
 //! `process.rs`・`interpreter.rs`・`sealed_copy.rs`）の違反は `ok` 行の `SetupFailed` で運ばれ、層 `entrypoint` に
 //! 記録される（`EXEC_CHILD_VIOLATIONS`）。照合の限界: worker が別ファイルの違反生成ヘルパを呼ぶように
 //! なったら、そのファイルを照合対象に加えること（`rootfs.rs`・`inject.rs`・`tmpfs.rs` は launch の経路の違反を
-//! 多数作るため `exec/` 全体は走査しない）。
+//! 多数作るため `exec/` 全体は走査しない）。worker が呼ぶ `oci_runtime` の bundle の rootfs の固定
+//! （`RootfsDir::pin`）は `open_dir_beneath` の違反を固定文言の `TraitError` へ写して違反の情報を落とすため、
+//! `ExecError::violation` として worker の結果行へは届かない（記録の対象外。supervisor の `exec.rs` の「未実装」）。
 
 use std::collections::BTreeSet;
 

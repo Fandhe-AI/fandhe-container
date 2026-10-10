@@ -1588,18 +1588,68 @@ pub(crate) enum DeviceNodeError {
     Sys(SysError),
 }
 
+/// [`verify_device_node_fd`] が受け付けるホストのデバイスノード（OCI default devices の 6 種。CORE-6・SEC-1・#1659）。
+///
+/// 許可する `(major, minor)` の集合を型で閉じる固定表。列挙子以外の値（例: `/dev/mem` = 1:1）は表現できないため、
+/// 呼び出し側が誤っても任意の文字デバイスを [`open_tree_clone`] へ渡す経路はできない（fail-closed）。
+/// `sys` は上位層（`crate::exec::devices`）に依存しないため表を自前で持ち、`DEFAULT_DEVICES` との一致は
+/// `exec::devices` 側の単体テストが順序込みで照合する（どちらかだけを変えるとテストが落ちる）。
+/// CDI の deviceNodes は別責務（TASK-127）で、ここへ列挙子を足して受け付けない。
+// #1660 で呼び出し元を足すまでの間のみ許可する（配線時に外す）。
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostDeviceNode {
+    /// `/dev/null`（1:3）。
+    Null,
+    /// `/dev/zero`（1:5）。
+    Zero,
+    /// `/dev/full`（1:7）。
+    Full,
+    /// `/dev/random`（1:8）。
+    Random,
+    /// `/dev/urandom`（1:9）。
+    Urandom,
+    /// `/dev/tty`（5:0）。
+    Tty,
+}
+
+impl HostDeviceNode {
+    /// 全列挙子（`DEFAULT_DEVICES` と同じ順）。`exec::devices` の照合テストが使う。
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Null,
+        Self::Zero,
+        Self::Full,
+        Self::Random,
+        Self::Urandom,
+        Self::Tty,
+    ];
+
+    /// `(major, minor)`。
+    #[allow(dead_code)]
+    pub(crate) const fn major_minor(self) -> (u32, u32) {
+        match self {
+            Self::Null => (1, 3),
+            Self::Zero => (1, 5),
+            Self::Full => (1, 7),
+            Self::Random => (1, 8),
+            Self::Urandom => (1, 9),
+            Self::Tty => (5, 0),
+        }
+    }
+}
+
 /// `fd`（呼び出し側が `O_PATH|O_NOFOLLOW` で開いたホストのデバイスノード）を、同じ fd の `fstat` で照合する。
 ///
-/// 文字デバイス（`S_IFCHR`）かつ `rdev == makedev(major, minor)` のときだけ [`VerifiedDeviceNodeFd`] を返す。
-/// `major`・`minor` は呼び出し側の固定表（`crate::exec::devices` の `DEFAULT_DEVICES`。任意の major/minor を
-/// 受け付ける経路は作らない。TASK-127）から渡す。パスの `stat` ではなく fd の `fstat`（std の
+/// 文字デバイス（`S_IFCHR`）かつ `rdev == makedev(node.major_minor())` のときだけ [`VerifiedDeviceNodeFd`] を返す。
+/// 期待値は [`HostDeviceNode`] の固定表に限り、任意の major/minor は受け付けない（SEC-1。呼び出し側〔#1660〕は
+/// `DEFAULT_DEVICES` の要素に対応する列挙子を渡す）。パスの `stat` ではなく fd の `fstat`（std の
 /// `File::metadata`。fd は複製して見るだけで、元の fd をそのまま保持する）で見るため、検証後の差し替えは効かない。
 /// 照合は `crate::exec::devices` の既存ノードの検証と同じ形（種別と `rdev` の完全一致）。
 #[allow(dead_code)]
 pub(crate) fn verify_device_node_fd(
     fd: OwnedFd,
-    major: u32,
-    minor: u32,
+    node: HostDeviceNode,
 ) -> Result<VerifiedDeviceNodeFd, DeviceNodeError> {
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
     if !consts::SUPPORTED {
@@ -1613,6 +1663,7 @@ pub(crate) fn verify_device_node_fd(
     if !meta.file_type().is_char_device() {
         return Err(DeviceNodeError::NotCharDevice { mode: meta.mode() });
     }
+    let (major, minor) = node.major_minor();
     let expected = makedev(major, minor);
     if meta.rdev() != expected {
         return Err(DeviceNodeError::UnexpectedRdev {
@@ -1639,8 +1690,9 @@ fn open_tree_clone_flags() -> u32 {
 /// 途中で失敗して drop すればカーネルが破棄する。
 ///
 /// 引数は [`verify_device_node_fd`] だけが作れる [`VerifiedDeviceNodeFd`] に限る。文字デバイス（`S_IFCHR`）で
-/// `rdev` が期待値と一致することを同じ fd の `fstat` で確かめた fd しか渡せないため、ディレクトリ・通常ファイルを
-/// 複製して nosuid・noexec なしでコンテナへ渡す経路は型で塞がれる（SEC-1）。symlink を辿らないこと
+/// `rdev` が [`HostDeviceNode`] の固定表の値と一致することを同じ fd の `fstat` で確かめた fd しか渡せないため、
+/// ディレクトリ・通常ファイル・表にない文字デバイス（`/dev/mem` 等）を複製して nosuid・noexec なしでコンテナへ
+/// 渡す経路は型で塞がれる（SEC-1）。symlink を辿らないこと
 /// （`O_PATH|O_NOFOLLOW` で開くこと）は fd を開く呼び出し側の責務で、辿らずに開いた symlink 自体は
 /// `S_IFCHR` でないため検証で拒否される。
 ///
@@ -4315,11 +4367,20 @@ mod tests {
         let reopened = open_dir_path_nofollow(None, &cdir).unwrap();
         assert_eq!(fs_type(reopened.as_fd()).unwrap(), 0x1cd1);
 
-        // mountinfo: 指定先に fstype devpts・nosuid・noexec で現れ、nodev は付かない。
+        // mountinfo: 指定先に fstype devpts・nosuid・noexec で現れ、nodev は付かない。5 列目は 8 進エスケープを
+        // 戻してから比べる（`TMPDIR` が空白等を含んでも見落とさない。`is_mount_point` と同じ扱い）。
         let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        let dir_bytes = {
+            use std::os::unix::ffi::OsStrExt as _;
+            dir.as_os_str().as_bytes().to_vec()
+        };
         let line = mountinfo
             .lines()
-            .find(|l| l.split(' ').nth(4) == dir.to_str())
+            .find(|l| {
+                l.split(' ')
+                    .nth(4)
+                    .is_some_and(|f| unescape_mountinfo_field(f.as_bytes()) == dir_bytes)
+            })
             .expect("mountinfo entry for the target");
         let (pre, post) = line.split_once(" - ").unwrap();
         let opts: Vec<&str> = pre.split(' ').nth(5).unwrap().split(',').collect();
@@ -5470,7 +5531,8 @@ mod tests {
         const CAP_SYS_ADMIN_BIT: u32 = 1 << 21;
         let caps = cap_get_thread().expect("capget");
         let privileged = caps.effective[0] & CAP_SYS_ADMIN_BIT != 0;
-        let node = verify_device_node_fd(open_o_path("/dev/null"), 1, 3).expect("verify /dev/null");
+        let node = verify_device_node_fd(open_o_path("/dev/null"), HostDeviceNode::Null)
+            .expect("verify /dev/null");
         match (privileged, open_tree_clone(&node)) {
             (_, Err(SysError::Unsupported)) => {}
             (false, Err(err)) => assert_eq!(err, SysError::Os(EPERM)),
@@ -5479,16 +5541,97 @@ mod tests {
         }
     }
 
-    /// `path` が呼び出しスレッドの mount namespace でマウントポイントか（`/proc/self/mountinfo` の 5 列目と完全一致）。
-    /// 一時領域のパスは空白等のエスケープ対象を含まない前提（`fandhe-open-tree-…` で作る）。
+    /// `path` が呼び出しスレッドの mount namespace でマウントポイントか（`/proc/self/mountinfo` の 5 列目を
+    /// [`unescape_mountinfo_field`] で戻した値と、正規化したパスのバイト列が完全一致）。`TMPDIR` が空白・タブ・
+    /// 改行・`\` を含んでも誤判定しない（カーネルはこれらを 8 進エスケープして出力する）。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn is_mount_point(path: &std::path::Path) -> bool {
+        use std::os::unix::ffi::OsStrExt as _;
         let real = std::fs::canonicalize(path).expect("canonicalize");
-        let real = real.to_str().expect("utf8 path");
-        std::fs::read_to_string("/proc/self/mountinfo")
+        let real = real.as_os_str().as_bytes();
+        // バイト列のまま読む（他のマウントポイントが UTF-8 でなくても panic しない）。
+        std::fs::read("/proc/self/mountinfo")
             .expect("read mountinfo")
-            .lines()
-            .any(|l| l.split(' ').nth(4) == Some(real))
+            .split(|&c| c == b'\n')
+            .filter_map(|l| l.split(|&c| c == b' ').nth(4))
+            .any(|field| unescape_mountinfo_field(field) == real)
+    }
+
+    /// mountinfo の 1 列を戻す。カーネル（fs/proc_namespace.c の `show_mountinfo` → `seq_path_root` の
+    /// `" \t\n\\"`）は空白・タブ・改行・`\` を `\` + 8 進 3 桁（`\040`・`\011`・`\012`・`\134`）で出力する。
+    /// 1 回の走査で戻し、戻した結果は再走査しない（`\134040` は `\040` の 4 バイトになる）。`\` の後が 8 進
+    /// 3 桁でなければそのまま残す（カーネルはそうした列を出さない）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn unescape_mountinfo_field(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while let Some(&b) = bytes.get(i) {
+            let octal = bytes
+                .get(i + 1..i + 4)
+                .filter(|d| b == b'\\' && d.iter().all(|c| (b'0'..=b'7').contains(c)))
+                .map(|d| d.iter().fold(0u32, |acc, c| acc * 8 + u32::from(c - b'0')))
+                .and_then(|v| u8::try_from(v).ok());
+            match octal {
+                Some(v) => {
+                    out.push(v);
+                    i += 4;
+                }
+                None => {
+                    out.push(b);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// CORE-6・REPAIR-12（TASK-29 追補・#1659）: mountinfo の 8 進エスケープ（空白 `\040`・タブ `\011`・
+    /// 改行 `\012`・`\` の `\134`）を具体値で戻す。1 回だけ戻し（`\134040` → `\040`）、8 進 3 桁でない
+    /// `\` の並びと 255 を超える値（`\777`）はそのまま残す。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core6_unescape_mountinfo_field_decodes_octal_escapes_once() {
+        assert_eq!(
+            unescape_mountinfo_field(b"/tmp/plain"),
+            b"/tmp/plain".to_vec()
+        );
+        assert_eq!(
+            unescape_mountinfo_field(b"/tmp/a\\040b"),
+            b"/tmp/a b".to_vec()
+        );
+        assert_eq!(
+            unescape_mountinfo_field(b"/t\\011m\\012p"),
+            b"/t\tm\np".to_vec()
+        );
+        assert_eq!(unescape_mountinfo_field(b"/x\\134y"), b"/x\\y".to_vec());
+        assert_eq!(unescape_mountinfo_field(b"/\\134040"), b"/\\040".to_vec());
+        assert_eq!(unescape_mountinfo_field(b"/a\\04"), b"/a\\04".to_vec());
+        assert_eq!(unescape_mountinfo_field(b"/a\\089"), b"/a\\089".to_vec());
+        assert_eq!(unescape_mountinfo_field(b"/a\\777"), b"/a\\777".to_vec());
+        assert_eq!(unescape_mountinfo_field(b"\\"), b"\\".to_vec());
+    }
+
+    /// CORE-6・REPAIR-12（TASK-29 追補・#1659）: 実機前提テストが使う `is_mount_point` を、特権なしで実際の
+    /// `/proc/self/mountinfo` に当てる。`/proc`（procfs のマウントポイント）は真、作ったばかりの一時ディレクトリ
+    /// （空白を含む名前の子を含む）は偽になる。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core6_is_mount_point_reads_real_mountinfo() {
+        assert!(
+            is_mount_point(std::path::Path::new("/proc")),
+            "/proc must be a mount point"
+        );
+        let guard = crate::test_support::TestTempDir::new("sys-mountinfo").expect("temp dir");
+        let spaced = guard.path().join("with space");
+        std::fs::create_dir(&spaced).expect("create dir");
+        assert!(
+            !is_mount_point(&spaced),
+            "fresh dir must not be a mount point"
+        );
+        assert!(
+            !is_mount_point(guard.path()),
+            "fresh dir must not be a mount point"
+        );
     }
 
     /// CORE-6・SEC-5・SEC-1（TASK-29 追補・#1659）: `/dev/null`（文字デバイス 1:3）は期待値 (1, 3) で検証を通り、
@@ -5498,16 +5641,17 @@ mod tests {
     fn core6_sec5_verify_device_node_fd_accepts_dev_null_and_keeps_the_fd() {
         let fd = open_o_path("/dev/null");
         let raw = fd.as_raw_fd();
-        let node = verify_device_node_fd(fd, 1, 3).expect("verify /dev/null");
+        let node = verify_device_node_fd(fd, HostDeviceNode::Null).expect("verify /dev/null");
         assert_eq!(node.as_fd().as_raw_fd(), raw);
     }
 
     /// CORE-6・SEC-5・SEC-1（TASK-29 追補・#1659）: 文字デバイスでも `rdev` が期待値と違えば、実値と期待値を
-    /// 持つ `UnexpectedRdev` で拒否する（`/dev/null` = 0x103 を (1, 5) = 0x105 として検証）。
+    /// 持つ `UnexpectedRdev` で拒否する（`/dev/null` = 0x103 を `Zero`〔1:5〕= 0x105 として検証）。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn core6_sec5_verify_device_node_fd_rejects_unexpected_rdev() {
-        let err = verify_device_node_fd(open_o_path("/dev/null"), 1, 5).unwrap_err();
+        let err =
+            verify_device_node_fd(open_o_path("/dev/null"), HostDeviceNode::Zero).unwrap_err();
         assert_eq!(
             err,
             DeviceNodeError::UnexpectedRdev {
@@ -5523,13 +5667,39 @@ mod tests {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn core6_sec5_verify_device_node_fd_rejects_directory_and_regular_file() {
-        let kind = |path: &str| match verify_device_node_fd(open_o_path(path), 1, 3) {
+        let kind = |path: &str| match verify_device_node_fd(open_o_path(path), HostDeviceNode::Null)
+        {
             Err(DeviceNodeError::NotCharDevice { mode }) => mode & 0o170_000,
             other => panic!("{path}: unexpected result: {other:?}"),
         };
         assert_eq!(kind("/"), 0o040_000);
         let exe = std::env::current_exe().expect("current_exe");
         assert_eq!(kind(exe.to_str().expect("utf8 path")), 0o100_000);
+    }
+
+    /// CORE-6・SEC-1・REPAIR-12（TASK-29 追補・#1659）: `/dev/null` を指す symlink を `O_PATH|O_NOFOLLOW` で
+    /// 開いた fd は symlink 自体を指し、`NotCharDevice` で拒否される。`mode` の種別ビット（`S_IFMT`）は
+    /// symlink の 0o120000。リンク先が実在する文字デバイスであること（辿れば検証を通る値であること）も先に
+    /// 確かめ、拒否の理由が `O_NOFOLLOW` で辿らなかったことにあると示す（ぶら下がりリンクでの偶然の一致を除く）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core6_sec1_verify_device_node_fd_rejects_symlink_opened_with_nofollow() {
+        use std::os::unix::fs::{FileTypeExt as _, symlink};
+        let guard = crate::test_support::TestTempDir::new("sys-devnode-symlink").expect("temp dir");
+        let link = guard.path().join("null-link");
+        symlink("/dev/null", &link).expect("symlink");
+        let followed = std::fs::metadata(&link).expect("stat through link");
+        assert!(
+            followed.file_type().is_char_device(),
+            "link target must be a char device"
+        );
+        match verify_device_node_fd(
+            open_o_path(link.to_str().expect("utf8 path")),
+            HostDeviceNode::Null,
+        ) {
+            Err(DeviceNodeError::NotCharDevice { mode }) => assert_eq!(mode & 0o170_000, 0o120_000),
+            other => panic!("unexpected result: {other:?}"),
+        }
     }
 
     /// `path` を `O_PATH | O_NOFOLLOW` で開く（実機前提テストと特権なしテストの共通部品）。
@@ -5617,7 +5787,8 @@ mod tests {
         };
 
         // fd 起点で /dev/null を複製できる。fd は close-on-exec（fdinfo の flags が O_CLOEXEC = 02000000）。
-        let node = verify_device_node_fd(open_o_path("/dev/null"), 1, 3).expect("verify /dev/null");
+        let node = verify_device_node_fd(open_o_path("/dev/null"), HostDeviceNode::Null)
+            .expect("verify /dev/null");
         let clone = open_tree_clone(&node).expect("open_tree_clone");
         assert_eq!(fd_flags(&clone) & 0o2_000_000, 0o2_000_000);
 

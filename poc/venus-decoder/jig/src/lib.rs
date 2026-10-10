@@ -20,7 +20,7 @@
 //! 記録するのは提出の本体だけで、共有メモリ上のリングの中身は記録しない（F5.2b の後）。
 //!
 //! 共有メモリの前提（F5.2b.2・#1641）: protocol feature `SHMEM`・`BACKEND_REQ` の広告と、`GET_SHMEM_CONFIG`・`SET_BACKEND_REQ_FD` の受け付けは
-//! `session` / `vhost_user` に実装済み。backend 要求（`SHMEM_MAP`）の送信は #1642、`MAP_BLOB` は #1643。
+//! `session` / `vhost_user` に実装済み。backend 要求（`SHMEM_MAP` / `SHMEM_UNMAP`）の期限つき送信は F5.2b.3（#1642）で `session` に実装済み（呼び出しは #1643 の `MAP_BLOB`）。
 //!
 //! 未実装（実装済みを装わない。REPAIR-3）: cursorq の処理、
 //! `observe::snapshot_lines` の定期出力（終了時の集計出力は実装済み）と virtqueue 個別の観測カウンタ、`RESOURCE_MAP_BLOB` / `UNMAP_BLOB` と共有メモリ（F5.2b。未対応は `ERR_UNSPEC`）、`SUBMIT_3D` の dispatch（TASK-177.x）、

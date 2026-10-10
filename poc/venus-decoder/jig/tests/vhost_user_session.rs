@@ -472,6 +472,29 @@ mod linux {
         assert_eq!(report.malformed_lines, 0);
     }
 
+    /// GPU-6・TASK-172 F5.2b.1（#1639）: REPLY_ACK を解除する NEED_REPLY つき SET_PROTOCOL_FEATURES にも ack を返す。
+    #[test]
+    fn f5_2b_1_gpu6_need_reply_set_protocol_features_dropping_reply_ack_is_acked() {
+        let (front, backend) = pair(limits(5000, 5000));
+        confirm_protocol(&front, 0x209);
+        // REPLY_ACK ビット（0x008）を外した 0x201 へ再設定する。従前の応答義務で ack が返る。
+        send_need_reply(&front, &Request::SetProtocolFeatures(0x201), &[]);
+        assert_eq!(recv_raw(&front, 20), ack_bytes(16, 0));
+        // 解除後の NEED_REPLY には応答しない。
+        send_need_reply(&front, &Request::SetOwner, &[]);
+        drop(front);
+        let (end, lines) = backend.join().expect("join");
+        assert_eq!(end, Ok(SessionEnd::PeerClosed));
+        assert!(
+            lines.contains(&"venus_jig event=need_reply_ack request=16 result=ok".to_string()),
+            "log: {lines:?}"
+        );
+        assert!(
+            lines.contains(&"venus_jig event=need_reply_ignored request=3".to_string()),
+            "log: {lines:?}"
+        );
+    }
+
     /// 確定済みで失敗する SET_*: 値 1 の ack を返してからセッションを終える（fail-closed）。
     #[test]
     fn f5_2b_1_gpu6_failing_set_with_need_reply_gets_nonzero_ack_then_closes() {

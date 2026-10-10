@@ -304,11 +304,13 @@ impl Session {
         let Incoming { decoded, fds } = incoming;
         let code = decoded.request.code();
         let need_reply = decoded.need_reply;
-        // REPLY_ACK の判定は handle の後（NEED_REPLY つき SET_PROTOCOL_FEATURES 自体にも応答するため。#1639）。
+        // NEED_REPLY つき SET_PROTOCOL_FEATURES 自体にも応答するため、処理前後どちらかで REPLY_ACK が
+        // 確定していれば応答義務ありとする（初回有効化の ACK と、解除要求への従前義務の ACK。#1639）。
+        let ack_before = self.state.reply_ack();
         match self.state.handle(decoded.request, fds) {
             Ok(Some(reply)) => self.send_reply(sock, &reply.encode()?, code),
             // 応答本体を持たない要求の成功。REPLY_ACK 確定済みで NEED_REPLY が立っていれば u64 の 0 を返す。
-            Ok(None) if need_reply && self.state.reply_ack() => {
+            Ok(None) if need_reply && (ack_before || self.state.reply_ack()) => {
                 self.send_reply(sock, &Reply::Ack(Ack::success(code)?).encode()?, code)?;
                 sink(&log::need_reply_ack_line(code.as_u32(), true));
                 Ok(())
@@ -323,7 +325,7 @@ impl Session {
             // GET_* の失敗には応答しない（ack の値が応答値と誤解されうる）。送信失敗でも元のエラーを優先する。
             Err(e) => {
                 if need_reply
-                    && self.state.reply_ack()
+                    && (ack_before || self.state.reply_ack())
                     && !code.has_reply_body()
                     && let Ok(ack) = Ack::failure(code)
                     && let Ok(msg) = Reply::Ack(ack).encode()

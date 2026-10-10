@@ -20,7 +20,8 @@
 //!   3. **順序の証跡**: `/dev` 配下の宛先（既定の `/dev/shm`）を含む集合を `create_default_devices` の結果なしで
 //!      `mount_tmpfs` に渡すと、`failed_precondition` で拒否され `dev/shm` も作られないこと（#1669 事後監査 P2）
 //!   4. **成功経路**: `/dev/shm`（未指定の既定 64 MiB。`ensure_default_dev_shm`・#1654）・`/scratch`（128 KiB）・`/roexec`（`ro,exec`・64 KiB）・
-//!      `/nosize`（サイズ未指定）を適用 → `pivot_root` の後、`/proc/self/mountinfo` で 4 件が fstype
+//!      `/nosize`（サイズ未指定）を適用 → `pivot_root` の後、rootfs の自己 bind の `/` に `nodev` が付いていること
+//!      （`PivotReport::rootfs_nodev` と mountinfo。#1676 で rootful・rootless とも常に付与）、`/proc/self/mountinfo` で 4 件が fstype
 //!      `tmpfs`・`nosuid,nodev` で存在し、`noexec` / `ro` が指定どおりであること、サイズ指定の 3 件が
 //!      指定サイズであること、サイズ未指定の件に `size=` が出ないこと（カーネル既定のまま）、マウント先の
 //!      `stat` のモードが 1777 であることを具体値で照合する
@@ -351,9 +352,22 @@ mod linux {
             ]
         );
 
-        pivot_root(&isolation, prepared).expect("pivot_root");
+        let report = pivot_root(&isolation, prepared).expect("pivot_root");
 
         let info = std::fs::read_to_string("/proc/self/mountinfo").expect("mountinfo");
+        // `prepare_rootfs` は rootful・rootless とも rootfs の自己 bind に `nodev` を付ける（#1676。オーナー判断
+        // 2026-10-10）。CI の integration-test は本試験を rootless で走らせるため、rootless で `mount_setattr(2)` が
+        // 通り `nodev` が `/` に付くことの照合を兼ねる。
+        assert!(report.rootfs_nodev, "rootfs self-bind must be nodev");
+        let (_, root_opts, _, _) = info
+            .lines()
+            .filter_map(parse_line)
+            .find(|l| l.0 == "/")
+            .unwrap_or_else(|| panic!("/ must be mounted:\n{info}"));
+        assert!(
+            root_opts.split(',').any(|o| o == "nodev"),
+            "/ must be nodev: {root_opts}"
+        );
         // (マウント先, 表示サイズ, 読み取り専用か, noexec か)
         for (point, size, read_only, noexec) in [
             ("/dev/shm", Some("size=65536k"), false, true),

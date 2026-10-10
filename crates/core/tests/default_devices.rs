@@ -24,8 +24,8 @@
 //!   （#1660。6 種すべてが `BoundFromHost`）。`pivot_root` の後、6 種の種別・`rdev`、`/dev/null` への書き込み、
 //!   `/dev/zero` の 16 バイトの読み出し、mountinfo のマウントポイント 6 件、devpts に `gid=` が無いことを照合する。
 //!   親は、ホスト側の `dev` が空のまま残っている（空ファイルは tmpfs 上にありホスト側には現れない）ことを照合する。
-//!   rootful の `nodev`（#1676）が rootless に及ばないことは、mountinfo の `/` の `nodev` の有無が、親が
-//!   ホスト側で rootfs を含むマウントについて読んだ値（`--host-nodev`）と同じであることで照合する
+//!   rootless でも rootfs の自己 bind に `nodev` が付く（#1676。オーナー判断 2026-10-10 で常に付与）ことを、
+//!   `PivotReport::rootfs_nodev` と mountinfo の `/` の `nodev` で照合する（bind した 6 種は別マウントで使える）
 //!
 //! # 実機前提テストとしての分離
 //! root もしくは非特権 user namespace を許可するホストが必要で、GitHub ホステッド runner では
@@ -179,16 +179,7 @@ mod linux {
                     .position(|a| a == "--egid")
                     .and_then(|j| args.get(j + 1))
                     .and_then(|v| v.parse::<u32>().ok());
-                let host_nodev = args
-                    .iter()
-                    .position(|a| a == "--host-nodev")
-                    .and_then(|j| args.get(j + 1))
-                    .and_then(|v| match v.as_str() {
-                        "1" => Some(true),
-                        "0" => Some(false),
-                        _ => None,
-                    });
-                child(Path::new(rootfs), rootful, egid, host_nodev);
+                child(Path::new(rootfs), rootful, egid);
             }
             None => parent(),
         }
@@ -235,8 +226,6 @@ mod linux {
         let root = is_root();
         // user namespace に入る前にホスト側の実効 gid を控える（入った後は写像後の 0 に見える）。
         let host_egid = egid();
-        // rootless の `/` の `nodev` の照合の基準（#1676）。分離の前にホストの mount namespace で読む。
-        let host_nodev = host_mount_is_nodev(&rootfs.0);
         // euid 0 での自 ID 写像は SEC-5 で拒否されるため、root では User を除く rootful 構成にする。
         let mut namespaces = NamespaceSet::empty()
             .with(Namespace::Pid)
@@ -257,7 +246,7 @@ mod linux {
         };
         match result {
             Ok(_) => {
-                run_child(&rootfs.0, root, host_egid, host_nodev);
+                run_child(&rootfs.0, root, host_egid);
                 if root {
                     // 偽ノードは tmpfs に覆い隠されただけで、ホスト側は内容ごと不変・新エントリなし。
                     assert_eq!(
@@ -289,7 +278,7 @@ mod linux {
                         "host-side dev must stay empty"
                     );
                     println!(
-                        "default_devices: rootless basic device nodes bound from host, default links, /dev/pts and /dev/ptmx verified; rootfs nodev unchanged (root=false)"
+                        "default_devices: rootless basic device nodes bound from host, default links, /dev/pts and /dev/ptmx verified; rootfs self-bind nodev verified (root=false)"
                     );
                 }
             }
@@ -297,55 +286,8 @@ mod linux {
         }
     }
 
-    /// ホストの mount namespace で、`path` を含むマウント（mountinfo のマウントポイントが `path` の最長の
-    /// 祖先。同じマウントポイントに重なるときは後の行）のマウント単位のオプションに `nodev` があるか（#1676）。
-    /// mountinfo のマウントポイントは空白等を 8 進でエスケープするため戻してから比べる。
-    fn host_mount_is_nodev(path: &Path) -> bool {
-        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").expect("read mountinfo");
-        let mut best: Option<(usize, bool)> = None;
-        for line in mountinfo.lines() {
-            let fields: Vec<_> = line.split_whitespace().collect();
-            let (Some(point), Some(options)) = (fields.get(4), fields.get(5)) else {
-                panic!("malformed mountinfo line: {line}");
-            };
-            let point = PathBuf::from(unescape_mountinfo(point));
-            if !path.starts_with(&point) {
-                continue;
-            }
-            let depth = point.components().count();
-            if best.is_none_or(|(d, _)| depth >= d) {
-                best = Some((depth, options.split(',').any(|o| o == "nodev")));
-            }
-        }
-        best.expect("a mount containing the rootfs").1
-    }
-
-    /// mountinfo の 8 進エスケープ（`\040` 等）を戻す。
-    fn unescape_mountinfo(field: &str) -> String {
-        let bytes = field.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len());
-        let mut i = 0;
-        while i < bytes.len() {
-            match (bytes.get(i), bytes.get(i + 1..i + 4)) {
-                (Some(b'\\'), Some(oct)) if oct.iter().all(|b| (b'0'..=b'7').contains(b)) => {
-                    let v = oct
-                        .iter()
-                        .fold(0u32, |acc, b| acc * 8 + u32::from(b - b'0'));
-                    out.push(u8::try_from(v).expect("octal escape fits in a byte"));
-                    i += 4;
-                }
-                (Some(&b), _) => {
-                    out.push(b);
-                    i += 1;
-                }
-                (None, _) => break,
-            }
-        }
-        String::from_utf8(out).expect("utf-8 mount point")
-    }
-
     /// 自身を `--child <rootfs>` で起動する。分離後の最初の子なので新しい PID namespace の PID 1 になる。
-    fn run_child(rootfs: &Path, rootful: bool, host_egid: u32, host_nodev: bool) {
+    fn run_child(rootfs: &Path, rootful: bool, host_egid: u32) {
         let exe = std::env::current_exe().expect("current_exe");
         let mut child = Command::new(exe)
             .arg("--child")
@@ -353,8 +295,6 @@ mod linux {
             .arg(if rootful { "--rootful" } else { "--rootless" })
             .arg("--egid")
             .arg(host_egid.to_string())
-            .arg("--host-nodev")
-            .arg(if host_nodev { "1" } else { "0" })
             .stdin(Stdio::null())
             .spawn()
             .expect("spawn child");
@@ -374,7 +314,7 @@ mod linux {
         }
     }
 
-    fn child(rootfs: &Path, rootful: bool, egid: Option<u32>, host_nodev: Option<bool>) {
+    fn child(rootfs: &Path, rootful: bool, egid: Option<u32>) {
         assert_eq!(
             std::process::id(),
             1,
@@ -420,8 +360,8 @@ mod linux {
         assert_eq!(first.devpts.ptmx.status, DeviceLinkStatus::Created);
 
         let report = pivot_root(&isolation, prepared).expect("pivot_root");
-        // rootfs の `nodev` の判定結果（#1676・REPAIR-4）。rootful だけが付与・事後検証済み。
-        assert_eq!(report.rootfs_nodev, rootful);
+        // rootfs の `nodev` は rootful・rootless とも付与・事後検証済み（#1676・REPAIR-4）。
+        assert!(report.rootfs_nodev);
 
         // `/dev` は専用の tmpfs。rootful は `nosuid` あり・`nodev` なしまで照合する（rootless の user namespace
         // が載せたマウントのフラグはカーネルの扱いに依存するため、種別だけを照合する）。
@@ -474,9 +414,7 @@ mod linux {
         if rootful {
             verify_rootfs_nodev();
         } else {
-            verify_rootless_rootfs_nodev_unchanged(
-                host_nodev.expect("--host-nodev for rootless child"),
-            );
+            verify_rootless_rootfs_nodev();
         }
     }
 
@@ -540,16 +478,17 @@ mod linux {
         );
     }
 
-    /// rootless では `prepare_rootfs` が `nodev` を足さない（#1676 は rootful 限定。CORE-6・SEC-5）。自己 bind は
-    /// 元のマウントのフラグを引き継ぐため、`/` の `nodev` の有無はホスト側で rootfs を含むマウントと同じになる。
-    fn verify_rootless_rootfs_nodev_unchanged(host_nodev: bool) {
+    /// rootless でも rootfs の自己 bind に `nodev` が付く（#1676。オーナー判断 2026-10-10 で常に付与。CORE-6・SEC-5）。
+    /// bind した基本デバイス 6 種は別マウントのため使えること（`verify_bound_nodes`）と併せて、`nodev` が `/` に
+    /// 付き、bind 側へ及ばないことを確かめる。rootless は偽のデバイスノードを `mknod` で置けないため、`EACCES` の
+    /// 照合は rootful だけで行う。
+    fn verify_rootless_rootfs_nodev() {
         let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").expect("read mountinfo");
-        assert_eq!(
+        assert!(
             mount_options_at(&mountinfo, "/")
                 .iter()
                 .any(|o| o == "nodev"),
-            host_nodev,
-            "rootless / must keep the nodev flag of the host-side mount"
+            "rootless / must be nodev"
         );
     }
 

@@ -14,6 +14,9 @@
 //! - 未回収の子が上限に達していても、両経路失敗の通知 1 行はスレッドでの出し直しで必ず出る。上限の子を
 //!   解放すると回収されて fork が再開する
 //! - 通知の子が異常終了（panic）しても、通知 1 行はスレッドでの出し直しで出る（1 行だけ）
+//! - 通知の子が書き込みに達する前に時間切れになっても（開始の印が無い）、通知 1 行はスレッドで出し直す。
+//!   書き込みを始めた後に詰まった子は出し直さない（上の「通知先も止まる」）
+//! - 通知の子が行の途中で書き込みに失敗すると、出し直しは改行を 1 つ付けてから 1 行を出す（断片と連結しない）
 //! - 複数スレッドのプロセス: fork できないため主経路は試行せず `isolation_unavailable` で代替経路へ進む
 //! - `SIGCHLD` が `SIG_IGN`（子が自動回収され `waitpid` が `ECHILD`）: 主経路の成功を失敗と取り違えず代替経路へ
 //!   二重に記録しない。失敗種別・時間切れ・通知も同じく届く（最後に実行し、終わったら `SIG_DFL` に戻す）
@@ -124,6 +127,31 @@ mod linux {
         File(PathBuf),
         /// 子プロセスの中では panic し、親（試験プロセス）ではファイルへ追記する。
         PanicInChild(PathBuf),
+        /// 子プロセスの中では出力先を作る段階（開始の印の前）で止まり、親ではファイルへ追記する。
+        StuckBeforeStartInChild(PathBuf),
+        /// 子プロセスの中では先頭の `n` バイトだけ書いて失敗し、親ではファイルへ追記する。
+        FragmentInChild(PathBuf, usize),
+    }
+
+    /// 先頭の `left` バイトだけファイルへ書き、それ以降の書き込みを失敗させる（行の途中での書き込み失敗）。
+    struct Fragment {
+        file: std::fs::File,
+        left: usize,
+    }
+
+    impl Write for Fragment {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.left == 0 {
+                return Err(std::io::Error::other("fragment budget exhausted"));
+            }
+            let n = buf.len().min(self.left);
+            let written = self.file.write(&buf[..n])?;
+            self.left -= written;
+            Ok(written)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.file.flush()
+        }
     }
 
     fn append_to(path: &Path) -> Box<dyn Write> {
@@ -159,6 +187,25 @@ mod linux {
                         if std::process::id() != parent {
                             // 子だけ異常終了させる（panic フックを通さず標準エラーを汚さない）。
                             std::panic::resume_unwind(Box::new("notify child aborts"));
+                        }
+                        append_to(path)
+                    }
+                    Notify::StuckBeforeStartInChild(path) => {
+                        if std::process::id() != parent {
+                            hang();
+                        }
+                        append_to(path)
+                    }
+                    Notify::FragmentInChild(path, n) => {
+                        if std::process::id() != parent {
+                            return Box::new(Fragment {
+                                file: std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(path)
+                                    .unwrap(),
+                                left: *n,
+                            });
                         }
                         append_to(path)
                     }
@@ -219,6 +266,8 @@ mod linux {
         stuck_notifier_leaves_no_thread_and_next_record_works();
         too_many_unreaped_still_emits_the_notice();
         panicking_notify_child_is_retried_on_a_thread();
+        notify_child_timed_out_before_writing_is_retried();
+        notify_child_failing_mid_line_is_retried_after_a_newline();
         multi_threaded_process_skips_the_primary();
         // `SIGCHLD` の disposition を変えるため最後に実行する。
         assert!(FileAuditSink::set_child_signal_ignored_for_test(true));
@@ -410,6 +459,57 @@ mod linux {
             vec![AuditWriteErrorKind::RelativePath]
         );
         assert_eq!(std::fs::read_to_string(&notice).unwrap(), RELATIVE_NOTICE);
+        wait_single_threaded();
+        let _ = std::fs::remove_file(&notice);
+    }
+
+    /// SEC-4・REPAIR-4・#1616: 通知の子が書き込みに達する前（開始の印の前）に時間切れになると、子は何も書いて
+    /// いないので通知 1 行をスレッドで出し直す（1 行だけ）。期限内に戻り、スレッドは残らない。
+    fn notify_child_timed_out_before_writing_is_retried() {
+        let notice = tmp_marker("before-start-notice");
+        let _ = std::fs::remove_file(&notice);
+        let (sink, seen) = sink(
+            relative_primary(),
+            false,
+            Notify::StuckBeforeStartInChild(notice.clone()),
+            tmp_marker("before-start"),
+        );
+        let start = Instant::now();
+        let e = sink.record(&record()).unwrap_err();
+        let took = start.elapsed();
+        assert_eq!(e.code(), ErrorCode::Internal);
+        // 通知の子の期限（200 ms）までは待ち、上限（kill 後の回収待ちを含め 5 秒）を超えない。
+        assert!(took >= Duration::from_millis(200), "{took:?}");
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![AuditWriteErrorKind::RelativePath]
+        );
+        assert_eq!(std::fs::read_to_string(&notice).unwrap(), RELATIVE_NOTICE);
+        wait_single_threaded();
+        assert_eq!(FileAuditSink::unreaped_children_for_test(), 0);
+        let _ = std::fs::remove_file(&notice);
+    }
+
+    /// REPAIR-4・SEC-4・#1616: 通知の子が行の途中（先頭 10 バイト）で書き込みに失敗すると、出し直しは改行を 1 つ
+    /// 付けてから 1 行を出す。断片と完全な行が 1 行に連結されない。
+    fn notify_child_failing_mid_line_is_retried_after_a_newline() {
+        let notice = tmp_marker("fragment-notice");
+        let _ = std::fs::remove_file(&notice);
+        let (sink, _seen) = sink(
+            relative_primary(),
+            false,
+            Notify::FragmentInChild(notice.clone(), 10),
+            tmp_marker("fragment"),
+        );
+        let e = sink.record(&record()).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Internal);
+        let expect = format!("{}\n{RELATIVE_NOTICE}", &RELATIVE_NOTICE[..10]);
+        assert_eq!(std::fs::read_to_string(&notice).unwrap(), expect);
+        assert_eq!(
+            std::fs::read_to_string(&notice).unwrap().lines().last(),
+            Some(RELATIVE_NOTICE.trim_end())
+        );
         wait_single_threaded();
         let _ = std::fs::remove_file(&notice);
     }

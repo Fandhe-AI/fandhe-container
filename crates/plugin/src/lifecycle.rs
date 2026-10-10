@@ -2792,6 +2792,41 @@ mod tests {
         assert_eq!(guard.kill_and_reap(), Reap::GroupKillFailed);
     }
 
+    /// REPAIR-4・PLUG-7・#1605: 自発終了の観測後のグループ送信失敗を `wait_or_kill` が返した後（子は手放し済み）、
+    /// `Drop` は同じ失敗を再記録しない。子を保持したまま印が立っている場合は `Drop` が 1 回だけ記録する。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_drop_does_not_relog_group_kill_failure_already_reported() {
+        use std::os::unix::process::CommandExt;
+        let spawn_exit0 = || {
+            Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let mut reported = ChildGuard::new(spawn_exit0());
+        reported.group_kill_failed_after_exit = true;
+        assert_eq!(
+            reported.wait_or_kill(Duration::from_secs(5)),
+            OneShotTermination::GroupKillFailed
+        );
+        assert!(reported.child.is_none());
+        let mut lines: Vec<String> = Vec::new();
+        reported.finish_on_drop(&mut |rec| lines.push(rec.to_json_line()));
+        assert_eq!(lines, Vec::<String>::new());
+
+        // 陽性対照: 子を保持したまま印が立っている（呼び出し側へ未報告）なら `Drop` が 1 回記録する。
+        let mut unreported = ChildGuard::new(spawn_exit0());
+        unreported.group_kill_failed_after_exit = true;
+        unreported.finish_on_drop(&mut |rec| lines.push(rec.to_json_line()));
+        assert_eq!(lines, vec![GROUP_KILL_FAILED_LINE.to_string()]);
+        assert_eq!(unreported.pid(), None);
+    }
+
     /// PLUG-7・#1513: `kill_and_reap` の kill 前の確認で `ECHILD` を受けたら kill を送らず `Lost` で終える
     /// （再利用され得る pid へ SIGKILL を送らない）。`Drop` も再び kill しない。
     #[cfg(unix)]

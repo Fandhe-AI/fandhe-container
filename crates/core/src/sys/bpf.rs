@@ -598,9 +598,10 @@ mod tests {
                     or an ancestor cgroup already holds a flags-0 device program";
         let prog = bpf_prog_load_cgroup_device(&default_program())
             .unwrap_or_else(|e| panic!("load failed: {e:?} ({hint})"));
-        // F_GETFD = 1（全 arch 共通）。
-        // SAFETY: 生存中の fd に対する副作用の無い `fcntl(F_GETFD)`。
-        let fd_flags = unsafe { fcntl(prog.as_fd().as_raw_fd(), 1) };
+        // SAFETY: 生存中の fd に対する副作用の無い `fcntl(F_GETFD)`（整数引数のみでポインタを渡さない）。
+        let fd_flags = unsafe { fcntl(prog.as_fd().as_raw_fd(), consts::F_GETFD) };
+        // 失敗（-1）は全ビットが立つため、マスク照合より先に弾く（偽陽性の防止）。
+        assert!(fd_flags >= 0, "fcntl(F_GETFD) failed: {:?}", last_error());
         assert_eq!(fd_flags & consts::FD_CLOEXEC, consts::FD_CLOEXEC);
 
         bpf_prog_attach_cgroup_device(child.as_fd(), &prog)

@@ -348,7 +348,9 @@ mod consts {
     pub const F_SEAL_WRITE: u32 = 0x8;
     #[cfg_attr(not(test), allow(dead_code))]
     pub const F_SEAL_EXEC: u32 = 0x20;
-    // include/uapi/asm-generic/fcntl.h の `F_SETFD` と `FD_CLOEXEC`。
+    // include/uapi/asm-generic/fcntl.h の `F_GETFD`・`F_SETFD` と `FD_CLOEXEC`。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const F_GETFD: i32 = 1;
     pub const F_SETFD: i32 = 2;
     pub const FD_CLOEXEC: i32 = 1;
     // include/uapi/linux/fcntl.h の `F_DUPFD_CLOEXEC`（`F_LINUX_SPECIFIC_BASE` 1024 + 6）。
@@ -603,7 +605,9 @@ mod consts {
     pub const F_SEAL_WRITE: u32 = 0x8;
     #[cfg_attr(not(test), allow(dead_code))]
     pub const F_SEAL_EXEC: u32 = 0x20;
-    // include/uapi/asm-generic/fcntl.h の `F_SETFD` と `FD_CLOEXEC`。
+    // include/uapi/asm-generic/fcntl.h の `F_GETFD`・`F_SETFD` と `FD_CLOEXEC`。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const F_GETFD: i32 = 1;
     pub const F_SETFD: i32 = 2;
     pub const FD_CLOEXEC: i32 = 1;
     // include/uapi/linux/fcntl.h の `F_DUPFD_CLOEXEC`（`F_LINUX_SPECIFIC_BASE` 1024 + 6）。
@@ -824,6 +828,8 @@ mod consts {
     pub const F_SEAL_WRITE: u32 = 0;
     #[cfg_attr(not(test), allow(dead_code))]
     pub const F_SEAL_EXEC: u32 = 0;
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const F_GETFD: i32 = 0;
     pub const F_SETFD: i32 = 0;
     pub const FD_CLOEXEC: i32 = 0;
     pub const F_DUPFD_CLOEXEC: i32 = 0;
@@ -5526,7 +5532,10 @@ mod tests {
         assert_eq!(consts::AT_EMPTY_PATH, 0x1000);
         assert_eq!(consts::O_NONBLOCK, 0o4_000);
         assert_eq!(consts::O_RDWR, 2);
-        assert_eq!((consts::F_SETFD, consts::FD_CLOEXEC), (2, 1));
+        assert_eq!(
+            (consts::F_GETFD, consts::F_SETFD, consts::FD_CLOEXEC),
+            (1, 2, 1)
+        );
         assert_eq!(consts::F_DUPFD_CLOEXEC, 1030);
         #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
         assert_eq!(

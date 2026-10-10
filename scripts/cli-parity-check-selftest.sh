@@ -5,7 +5,7 @@
 # スクリプト）だけで capture / compare の挙動を具体値で照合する。実機での 3 OS 比較そのものは
 # #661（人間担当）の範囲で、本テストはその道具が壊れていないことだけを確かめる。
 #
-# 呼び出し元: Makefile の `cli-parity-selftest`（CI の integration-test ジョブもこのターゲットを使う。ubuntu・macos・windows の
+# 呼び出し元: Makefile の `cli-parity-selftest`（CI の platform-ci ジョブもこのターゲットを使う。ubuntu・macos・windows の
 # 3 OS。Windows は Git Bash）。make ci には含めない。
 # 失敗は `FAIL:` 行を出し、最後に非 0 で終了する。bash 3.2 以上で動く。
 #

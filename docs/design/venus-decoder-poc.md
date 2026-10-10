@@ -230,7 +230,7 @@ GPU-6 の決定（ヘッドレス compute のみ・2D スキャンアウト非�
 
 macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なしの最小 virtio-gpu を TASK-64（#350。完了済み）の最小 VM に登録できるかの確認ハーネス（GPU-6・MAC-5）。配置は `poc/vz-custom-virtio-gpu/`（製品 crate 外・workspace 外）。判定は #1057（TASK-172.h5。人間担当）。
 
-- 実装したもの: ゲスト側確認スクリプト `poc/vz-custom-virtio-gpu/guest/check-virtio-gpu.sh`（dmesg の virtio_gpu 行から probe・feature・KMS・capset・host memory window を判定）、自己テスト（合成 fixture。`make vz-virtio-gpu-guest-check-selftest`。CI の `integration-test` ジョブが 3 OS で実行）、README（デバイス契約・実機手順）
+- 実装したもの: ゲスト側確認スクリプト `poc/vz-custom-virtio-gpu/guest/check-virtio-gpu.sh`（dmesg の virtio_gpu 行から probe・feature・KMS・capset・host memory window を判定）、自己テスト（合成 fixture。`make vz-virtio-gpu-guest-check-selftest`。CI の `platform-ci` ジョブが 3 OS で実行）、README（デバイス契約・実機手順）
 - **ホスト側のデバイス登録コードは未実装（REPAIR-3）**。計画フェーズの調査（確認日 2026-10-08）で、受け入れ条件の「新規依存・`unsafe` が要る場合は止めて承認事項として報告」に当たったため
 - 調査結果:
   - 採用済み `objc2-virtualization =0.3.2`（承認 #356）は `VZCustomVirtioDevice`・`VZVirtioQueue`・`VZVirtioSharedMemoryRegion*` を含まない。crates.io の最新も 0.3.2（2025-10-04）で、macOS 27 対応版は未リリース
@@ -272,7 +272,7 @@ macOS 27 の `VZCustomVirtioDevice` で、VENUS capset のみ・scanout なし�
 - 実装済み（F5.2b.1〜F5.2b.3・#1639・#1641・#1642）: REPLY_ACK の応答、protocol feature `SHMEM` / `BACKEND_REQ` の広告と `GET_SHMEM_CONFIG` / `SET_BACKEND_REQ_FD`、backend 要求 `SHMEM_MAP` / `SHMEM_UNMAP` の期限つき送信（10.4.4・10.8）
 - 実装済み（F5.2b.4a・#1643）: ctrl の `RESOURCE_MAP_BLOB` / `UNMAP_BLOB`（blob ごとに memfd を作り、`SHMEM_MAP` で frontend へ渡す）。10.3・10.4.4
 - 実装済み（F5.2b.4b・#1645）: map 中の資源の解放の確定（map 中の `UNREF` は拒否、`CTX_DESTROY` は map を残す、map が残ったままの終了では期限つきで `SHMEM_UNMAP` を送ってから memfd を閉じる。10.4.3）と、ネゴシエーションから解放までの結合試験（`tests/shmem_lifecycle.rs`）
-- CI: `make poc-venus-jig-check`（fmt-check・clippy・test）は CI の `rust-ci-default-features` ジョブが 3 OS で実行し、`crates/plugin-macos` 側の変更による治具の破損を検出する（実機前提テストは `#[ignore]` で分離済みで CI では走らない）
+- CI: `make poc-venus-jig-check`（fmt-check・clippy・test）は CI の `platform-ci` ジョブが 3 OS で実行し、`crates/plugin-macos` 側の変更による治具の破損を検出する（実機前提テストは `#[ignore]` で分離済みで CI では走らない）
 
 ### 10.2 候補比較
 

@@ -21,15 +21,15 @@ make ci          # 上記 + lint-docs + deny を一括実行
 4. ベンチ回帰チェック（15% 超の悪化で fail。REPAIR-8）
 5. セキュリティチェック（`cargo deny`・禁止 API / 禁止クレート検査。REPAIR-9・MVM-4）
 
-現状の `.github/workflows/ci.yml` は lint-docs・1・2・3（`integration-test` ジョブ）・4 の比較の仕組み（`bench-regression` ジョブ）・5（rust-base-ci）相当のすべてに加え、アーキ網羅の型検査ゲート（`aarch64-linux-check` ジョブ）を持ち、発火条件は `workflow_dispatch`・`pull_request`・`push`（main）で稼働している（TASK-86.1・TASK-86.2・TASK-86.3・REPAIR-7）。
+現状の `.github/workflows/ci.yml` は lint-docs・1・2（`rust-ci`〔ubuntu〕・`platform-ci`〔3 OS〕）・3（`platform-ci` ジョブ）・4 の比較の仕組み（`bench-regression` ジョブ）・5（rust-base-ci）相当のすべてに加え、アーキ網羅の型検査ゲート（`aarch64-linux-check` ジョブ）を持ち、発火条件は `workflow_dispatch`・`pull_request`・`push`（main）で稼働している（TASK-86.1・TASK-86.2・TASK-86.3・REPAIR-7）。
 
-ステージ 3（タイムアウト保護された結合試験）は `integration-test` ジョブ（3 OS matrix。実行ステップ 10 分・ジョブ全体 30 分の timeout-minutes）が担う（TASK-86.2・#36）。
+ステージ 3（タイムアウト保護された結合試験）は `platform-ci` ジョブ（3 OS matrix。実行ステップ 10 分・ジョブ全体 60 分の timeout-minutes）が担う（TASK-86.2・#36。旧 `integration-test` ジョブ）。
 
-`integration-test` ジョブは結合試験に続けて、スクリプトの自己テストを 3 OS（Windows は Git Bash）で実行する: `make plug4-core-invariance-selftest`（PLUG-4 判定スクリプト。TASK-109.4）・`make cli-parity-selftest`（CLI 3 OS 比較。TASK-125.1・CLI-1）・`make vz-virtio-gpu-guest-check-selftest`（virtio-gpu ゲスト側確認スクリプト。合成 fixture のみ。TASK-172.6・GPU-6）。いずれもステップごとに timeout-minutes 5 を付け、新しいジョブ・check-run 名は増やさない。
+`platform-ci` ジョブは結合試験に続けて、スクリプトの自己テストを 3 OS（Windows は Git Bash）で実行する: `make plug4-core-invariance-selftest`（PLUG-4 判定スクリプト。TASK-109.4）・`make cli-parity-selftest`（CLI 3 OS 比較。TASK-125.1・CLI-1）・`make vz-virtio-gpu-guest-check-selftest`（virtio-gpu ゲスト側確認スクリプト。合成 fixture のみ。TASK-172.6・GPU-6）。いずれもステップごとに timeout-minutes 5 を付け、新しいジョブ・check-run 名は増やさない。
 
-ルート workspace 外の PoC パッケージ `poc/venus-decoder/jig`（venus 試験治具。`crates/plugin-macos` へ path 依存。TASK-172.4・GPU-6）は `cargo build` / `cargo test --workspace` の対象に入らないため、`rust-ci-default-features` ジョブ（3 OS）の末尾で `make poc-venus-jig-check`（fmt-check・clippy・test。clippy / test は `--locked` で治具の `Cargo.lock` を固定。timeout-minutes 15）を実行し、plugin-macos 側の変更による治具の破損を検出する。実機前提テストは `#[ignore]` で分離済みで CI では走らない。治具の `Cargo.lock` は rust-ci の `cargo deny`（ルート workspace のみ）の対象外のため、同ジョブの ubuntu で `make deny-poc-venus-jig`（ルートの `deny.toml` を共有し 4 種を `--locked` で検査。timeout-minutes 20）を実行する（ステージ 5）。ローカルの `make deny`（`make ci`）も治具の検査を含む。
+ルート workspace 外の PoC パッケージ `poc/venus-decoder/jig`（venus 試験治具。`crates/plugin-macos` へ path 依存。TASK-172.4・GPU-6）は `cargo build` / `cargo test --workspace` の対象に入らないため、`platform-ci` ジョブ（3 OS）の既定 feature 側ステップの末尾で `make poc-venus-jig-check`（fmt-check・clippy・test。clippy / test は `--locked` で治具の `Cargo.lock` を固定。timeout-minutes 15）を実行し、plugin-macos 側の変更による治具の破損を検出する。実機前提テストは `#[ignore]` で分離済みで CI では走らない。治具の `Cargo.lock` は rust-ci の `cargo deny`（ルート workspace のみ）の対象外のため、同ジョブの ubuntu で `make deny-poc-venus-jig`（ルートの `deny.toml` を共有し 4 種を `--locked` で検査。timeout-minutes 20）を実行する（ステージ 5）。ローカルの `make deny`（`make ci`）も治具の検査を含む。
 
-rustdoc の警告（壊れた intra-doc リンク・private 項目へのリンク等。REPAIR-3）は `rust-ci-default-features` ジョブ（3 OS）の `make doc` ステップ（`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`。既定 feature。timeout-minutes 10）で fail させる（#1300）。新ジョブにせず既存ジョブのステップとしたのは check-run 件数を変えないため。3 OS で実行するのは、`cfg(target_os)` 限定の項目へのリンクが OS ごとに解決結果を変えるため。doc コメントでは他 OS で存在しない項目・private 項目へリンクせず、コード表記（バッククォートのみ）にする。
+rustdoc の警告（壊れた intra-doc リンク・private 項目へのリンク等。REPAIR-3）は `platform-ci` ジョブ（3 OS）の `make doc` ステップ（`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`。既定 feature。timeout-minutes 10）で fail させる（#1300）。新ジョブにせず既存ジョブのステップとしたのは check-run 件数を変えないため。3 OS で実行するのは、`cfg(target_os)` 限定の項目へのリンクが OS ごとに解決結果を変えるため。doc コメントでは他 OS で存在しない項目・private 項目へリンクせず、コード表記（バッククォートのみ）にする。
 
 macOS cold start 上乗せ確認（TASK-113.4・PLUG-6・MAC-2）は `benches/tests/macos_cold_start.rs` の結合試験（`cfg(target_os = "macos")`。他 OS は skip を明示）として 3 OS matrix の macos で実行する。`bench-regression`（ubuntu 単独）のジョブ構成は変えず、基準値比較にも接続しない（模擬制御コアの計測で、実バックエンドは TASK-115）。
 
@@ -51,7 +51,7 @@ macOS cold start 上乗せ確認（TASK-113.4・PLUG-6・MAC-2）は `benches/te
 14. `make bench-check`（ベンチ実行・基準値比較。現状はプレースホルダの配線確認のみ）
 15. `make bench-plugin-boundary`（plugin 境界ベンチの計測と CORE-10 比のログ出力のみ。基準値比較なし。TASK-113.3）
 16. `make plugin-feature-size`（core の plugin feature 除外 release ビルドと rlib サイズの記録。PLUG-3・TASK-111.2。最終バイナリ未実装のため rlib 計測で、サイズ差に閾値は設けない）
-17. `make plug4-core-invariance`（plugin の追加で core が変わらないことの判定。pull_request では base ブランチを fetch して比較する。自己テスト `make plug4-core-invariance-selftest` は `integration-test` ジョブ側で実行する。TASK-109.4・PLUG-4）
+17. `make plug4-core-invariance`（plugin の追加で core が変わらないことの判定。pull_request では base ブランチを fetch して比較する。自己テスト `make plug4-core-invariance-selftest` は `platform-ci` ジョブ側で実行する。TASK-109.4・PLUG-4）
 
 `make bench-baseline` は登録ベンチと `benches/metrics.json`（direction・unit の SSOT）から baseline.json を再生成する道具である。ベンチ・基準値の現状は次のとおり（spec 側の判断は先取りしない）。
 
@@ -67,9 +67,10 @@ plugin 境界ベンチの Δp50（`plugin_boundary_*_delta_p50`。TASK-113.3）�
 
 - 各 OS のネイティブランナーでビルド・テストする（クロスコンパイル前提にしない）
 - matrix は ubuntu / macos / windows の 3 OS を必須とし、特定 OS のみの skip で CI を通さない
-- OS 依存のファイルシステム挙動（パス・大文字小文字・ロック・改行）のテストは 3 OS すべてで実行する
+- ジョブ構成（2026-10-10 の再構成。オーナー承認）: 3 OS のビルド・テストは `platform-ci`（3 OS matrix）の 1 ジョブに集約する。旧 `rust-ci-default-features`（既定 feature の `make lint` / `make test` / `make doc` 等）と旧 `integration-test`（結合試験・スクリプトの自己テスト・Linux 限定の実機前提テスト）のステップをそのまま移し、macOS・Windows では reusable の `rust-ci` が担っていた `cargo clippy --workspace --all-targets --all-features -- -D warnings` と `cargo test --workspace --all-features` もステップとして実行する。`rust-ci`（fmt・clippy / test の `--all-features`・deny）は ubuntu-latest のみ（1 要素の matrix で check-run 名 `rust-ci (ubuntu-latest) / ...` を保つ）。fmt・deny は結果が OS に依らない
+- 集約の理由: macOS ランナーの同時実行枠が 1 枠程度しかなく、1 回の CI で macOS ジョブが 7 本（reusable の fmt・clippy・test・deny・complete の 5 本＋旧 2 ジョブ）並び、待ち行列で全 PR の CI が詰まったため。各ジョブ自体は 2〜5 分で、問題はジョブ本数だった。集約後の macOS ジョブは 1 回の CI で 1 本。ジョブを増やす・3 OS に分ける変更は macOS ジョブの本数を増やすため、既存の `platform-ci` のステップとして追加する
 - ベンチ回帰チェック（`bench-regression` ジョブ）は例外として ubuntu-latest 単独で実行する。ベンチの数値は OS 間の実行環境差で比較できず、3 OS matrix にしても意味のある回帰検出にならないため（本節の「3 OS 必須」はビルド・テストのゲートを対象とする規則であり、ベンチ回帰チェックはその対象外）
-- venus 試験治具の依存監査（`rust-ci-default-features` の `make deny-poc-venus-jig` ステップ）も例外として ubuntu-latest のみで実行する。`deny.toml` に `targets` の指定が無く cargo-deny は実行ホストに関係なく全ターゲットの依存グラフ（macOS 専用の objc2 系を含む）を検査するため結果が OS に依らず、ビルド・テストのゲートではなく依存監査であるため「3 OS 必須」の対象外とする（cargo-deny の導入ビルドを 3 重に払わない）
+- venus 試験治具の依存監査（`platform-ci` の `make deny-poc-venus-jig` ステップ）も例外として ubuntu-latest のみで実行する。`deny.toml` に `targets` の指定が無く cargo-deny は実行ホストに関係なく全ターゲットの依存グラフ（macOS 専用の objc2 系を含む）を検査するため結果が OS に依らず、ビルド・テストのゲートではなく依存監査であるため「3 OS 必須」の対象外とする（cargo-deny の導入ビルドを 3 重に払わない）
 - Linux aarch64 向けクロス型検査（`aarch64-linux-check` ジョブ。#1120・REPAIR-7）も例外として ubuntu-latest（x86_64）単独で実行する。`cargo check` / `cargo clippy --all-features --target aarch64-unknown-linux-gnu` で `cfg(target_arch = "aarch64")` 分岐をコンパイル検査するだけで（`--all-features` は `crash-test-server` 等の feature を要する target も型検査の対象に含めるため。`cfg(not(feature = "exec-test-support"))` 分岐と plugin 無効構成は aarch64 では未検査。x86_64 でも lib 側の `cfg_attr` は `cargo build --workspace`、plugin 無効構成は `make test-core-no-plugin` が検査するのみで、テスト側の `cfg(not(feature))` 分岐は feature 統一によりどの CI ジョブでも型検査されない）、リンクもテスト実行もしないアーキ網羅の型検査ゲートであり、ビルド・テストのゲートではないため「ネイティブランナーでビルド・テスト」「3 OS 必須」の対象外とする。aarch64 での実行時の正しさの検証はネイティブ arm64 ランナーでのテスト実行がフォローアップ課題であり、現状は保証しない。外部依存は純 Rust のみ（serde / serde_json / sha2 と推移依存。proc-macro はホスト側でビルドされる）でクロスリンカ不要という前提のため、`cc` 等ネイティブビルドを伴う依存を追加する場合は見直す
 
 ## 実機前提テスト

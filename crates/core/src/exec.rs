@@ -762,7 +762,9 @@ impl std::error::Error for ExecError {}
 
 fn describe(err: SysError) -> String {
     match err {
-        SysError::Unsupported => "unsupported target architecture".to_string(),
+        SysError::Unsupported => {
+            "not supported by the kernel or the target architecture".to_string()
+        }
         SysError::MultiThreaded => {
             "the process is multi-threaded or its thread count is unknown; refusing to fork"
                 .to_string()

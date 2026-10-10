@@ -30,8 +30,12 @@
 //! - `Unimplemented` は「未実装」、`Unavailable` は「実装はあるが環境上到達できない」の区別
 //! - ACK は untrusted として扱い、`get()`・`try_into()` だけで解析する。送信元 `nl_pid == 0`（カーネル）・
 //!   `nlmsg_seq` 一致のものだけを受理し、他は破棄して締め切りまでに限り再受信する（上限回数あり）
-//! - ペイロードの値は英数字・`.`・`-`・`?` と hex のみ。カーネルが `msg='…'` で囲むため、`'`・空白・改行・
+//! - ペイロードの値は英数字・`.`・`-`・`_`・`?` と hex のみ（`container_id` は検証済みの `ContainerId` の生の値で、
+//!   文字種 `[A-Za-z0-9._-]` が型で保証される。#1618）。カーネルが `msg='…'` で囲むため、`'`・空白・改行・
 //!   NUL を含みうるパスは生バイト列を大文字 hex にして出す（auditd の untrusted string の慣例。ログ注入対策）
+//! - 本文は末尾に `container_id=<id>`（不明なら `?`）を持つ。メッセージ上限に収めるため、パスの hex は残りの予算まで
+//!   切り詰めることがある（`path_truncated=1`、`path_original_len` は元の長さ）。主経路〔JSON〕のパスは 4096 バイトを保つので、
+//!   この経路だけ短くなりうる
 //! - `audit_enabled` が無効なカーネルでも ACK は 0（成功）で返るため、「ACK 成功 = 監査ログへ必ず出た」
 //!   ではなく「カーネルが受理した」を意味する
 //! - 両経路が失敗したときの扱いは [`AuditWriteFailure`](super::AuditWriteFailure) の rustdoc を参照
@@ -155,27 +159,68 @@ fn push_hex(out: &mut String, bytes: &[u8]) {
     }
 }
 
-/// パス関連 3 項目（`path`・`path_truncated`・`path_original_len`）を追記する。
-fn push_path_fields(out: &mut String, path: Option<&AuditPath>) {
-    match path {
-        Some(p) => {
+/// 本文の組み立て結果の「パス以外」の部分と、パス欄に使えるバイト数の予算を求めるための部品。
+///
+/// `path` 欄（hex）だけが可変長で、残りは上限が型で決まっている。メッセージ上限
+/// [`AUDIT_MESSAGE_TEXT_MAX`] に収めるため、先にパス以外を確定し、余った予算でパスの hex を切る。
+#[derive(Clone, Copy)]
+struct PathFields<'a> {
+    /// hex にする生バイト（`path` が無ければ `None`）。
+    bytes: Option<&'a [u8]>,
+    /// 記録時点で既に切り詰められているか（[`AuditPath::is_truncated`]）。
+    truncated: bool,
+    /// 元の長さ（[`AuditPath::original_len`]）。
+    original_len: Option<usize>,
+}
+
+impl<'a> PathFields<'a> {
+    fn new(path: Option<&'a AuditPath>) -> Self {
+        match path {
+            Some(p) => Self {
+                bytes: Some(p.as_path().as_os_str().as_encoded_bytes()),
+                truncated: p.is_truncated(),
+                original_len: Some(p.original_len()),
+            },
+            None => Self {
+                bytes: None,
+                truncated: false,
+                original_len: None,
+            },
+        }
+    }
+}
+
+/// パス関連 3 項目（`path`・`path_truncated`・`path_original_len`）を、パスの生バイトを
+/// 高々 `max_path_bytes` バイトまでに切って追記する。切った場合は `path_truncated=1` にする
+/// （`path_original_len` は元の長さのまま。切り詰めを隠さない）。
+fn push_path_fields(out: &mut String, fields: &PathFields<'_>, max_path_bytes: usize) {
+    match (fields.bytes, fields.original_len) {
+        (Some(bytes), Some(original_len)) => {
+            let keep = bytes.len().min(max_path_bytes);
+            // `keep` は 1 バイト単位（hex は常に偶数文字で、バイトの途中では切れない）。
+            let kept = bytes.get(..keep).unwrap_or(bytes);
             out.push_str(" path=");
-            push_hex(out, p.as_path().as_os_str().as_encoded_bytes());
-            out.push_str(if p.is_truncated() {
+            push_hex(out, kept);
+            out.push_str(if fields.truncated || keep < bytes.len() {
                 " path_truncated=1"
             } else {
                 " path_truncated=0"
             });
-            out.push_str(&format!(" path_original_len={}", p.original_len()));
+            out.push_str(&format!(" path_original_len={original_len}"));
         }
-        None => out.push_str(" path=? path_truncated=? path_original_len=?"),
+        _ => out.push_str(" path=? path_truncated=? path_original_len=?"),
     }
 }
 
 /// レコードをカーネル監査向けの key=value 本文へエンコードする（REPAIR-2・ログ注入対策）。
 ///
-/// `pid` はレコード側（違反したプロセス）の PID で、送信者の PID はカーネルが別に付ける。
-/// 本文が [`AUDIT_MESSAGE_TEXT_MAX`] を超える場合は切り詰めず `LineTooLong` で拒否する。
+/// `pid` は**記録を組み立てたプロセス**の PID（違反したプロセスや pid1 とは限らない。層ごとの意味は
+/// [`AuditRecord`] の rustdoc）で、送信者の PID はカーネルが別に付ける。コンテナとの対応は末尾の
+/// `container_id`（検証済みの `ContainerId`。不明なら `?`）で取る（#1618）。
+///
+/// 本文が [`AUDIT_MESSAGE_TEXT_MAX`] を超えないよう、パス以外を先に確定し、残りの予算でパスの hex を
+/// 切る（切ったら `path_truncated=1`。主経路〔JSON〕は切らないので、この経路だけ短くなりうる）。
+/// パス以外だけで上限を超える場合は切り詰めず `LineTooLong` で拒否する。
 fn encode_payload(record: &AuditRecord) -> Result<String, AuditWriteError> {
     let ts = record.timestamp().as_unix_duration();
     let mut out = format!(
@@ -201,12 +246,42 @@ fn encode_payload(record: &AuditRecord) -> Result<String, AuditWriteError> {
         AuditEvent::Mount { path } => path.as_ref(),
         AuditEvent::PluginTrust { path, .. } => Some(path),
     };
-    push_path_fields(&mut out, path);
-    // plugin 信頼検証と exec 対象のみ末尾に理由を追記する（他レイヤーの本文は従来と同一）。
+    let fields = PathFields::new(path);
+    // 末尾: plugin 信頼検証・exec 対象・entrypoint のみ理由、続けてコンテナ ID（全層）。
+    // ID は `[A-Za-z0-9._-]` のみ（`'`・空白・改行・NUL・`=` を含まない）と型が保証するので、
+    // `msg='…'` 内の key=value を壊さず生の値で出せる。
+    let mut tail = String::new();
     if let Some(reason) = record.reason() {
-        out.push_str(" reason=");
-        out.push_str(reason.as_str());
+        tail.push_str(" reason=");
+        tail.push_str(reason.as_str());
     }
+    match record.container_id() {
+        Some(id) => {
+            tail.push_str(" container_id=");
+            tail.push_str(id.as_str());
+        }
+        None => tail.push_str(" container_id=?"),
+    }
+    // パス欄の予算 = 上限 - (ここまで + パス以外の固定部 + 末尾)。hex は 1 バイトにつき 2 文字。
+    let mut no_hex = String::new();
+    push_path_fields(
+        &mut no_hex,
+        &PathFields {
+            bytes: fields.bytes.map(|_| &[][..]),
+            ..fields
+        },
+        0,
+    );
+    let used = out
+        .len()
+        .checked_add(no_hex.len())
+        .and_then(|n| n.checked_add(tail.len()))
+        .ok_or_else(|| AuditWriteError::new(Kind::LineTooLong))?;
+    let budget = AUDIT_MESSAGE_TEXT_MAX
+        .checked_sub(used)
+        .ok_or_else(|| AuditWriteError::new(Kind::LineTooLong))?;
+    push_path_fields(&mut out, &fields, budget / 2);
+    out.push_str(&tail);
     if out.len() > AUDIT_MESSAGE_TEXT_MAX {
         return Err(AuditWriteError::new(Kind::LineTooLong));
     }
@@ -522,7 +597,7 @@ mod tests {
         assert_eq!(
             encode_payload(&seccomp()).unwrap(),
             "op=fandhe-audit layer=seccomp ts=1700000000.000000005 pid=1234 syscall=272 \
-             arch=c000003e path=? path_truncated=? path_original_len=?"
+             arch=c000003e path=? path_truncated=? path_original_len=? container_id=?"
         );
     }
 
@@ -535,7 +610,7 @@ mod tests {
         assert_eq!(
             encode_payload(&r).unwrap(),
             "op=fandhe-audit layer=landlock ts=1700000000.000000005 pid=1234 syscall=2 \
-             arch=? path=2F612062270A00 path_truncated=0 path_original_len=7"
+             arch=? path=2F612062270A00 path_truncated=0 path_original_len=7 container_id=?"
         );
     }
 
@@ -548,7 +623,7 @@ mod tests {
         assert_eq!(
             encode_payload(&r).unwrap(),
             "op=fandhe-audit layer=plugin_trust ts=1700000000.000000005 pid=1234 syscall=? arch=? \
-             path=2F70 path_truncated=0 path_original_len=2 reason=untrusted_owner"
+             path=2F70 path_truncated=0 path_original_len=2 reason=untrusted_owner container_id=?"
         );
     }
 
@@ -560,7 +635,7 @@ mod tests {
         assert_eq!(
             encode_payload(&r).unwrap(),
             "op=fandhe-audit layer=exec_target ts=1700000000.000000005 pid=1234 syscall=? arch=? \
-             path=? path_truncated=? path_original_len=? reason=exec_target_cgroup_mismatch"
+             path=? path_truncated=? path_original_len=? reason=exec_target_cgroup_mismatch container_id=?"
         );
     }
 
@@ -572,7 +647,7 @@ mod tests {
         assert_eq!(
             encode_payload(&r).unwrap(),
             "op=fandhe-audit layer=entrypoint ts=1700000000.000000005 pid=1234 syscall=? arch=? \
-             path=? path_truncated=? path_original_len=? reason=entrypoint_is_runtime_binary"
+             path=? path_truncated=? path_original_len=? reason=entrypoint_is_runtime_binary container_id=?"
         );
     }
 
@@ -582,7 +657,7 @@ mod tests {
         assert_eq!(
             encode_payload(&r).unwrap(),
             "op=fandhe-audit layer=mount ts=1700000000.000000005 pid=1234 syscall=? arch=? \
-             path=? path_truncated=? path_original_len=?"
+             path=? path_truncated=? path_original_len=? container_id=?"
         );
     }
 
@@ -595,7 +670,7 @@ mod tests {
         assert!(
             encode_payload(&r)
                 .unwrap()
-                .ends_with("path=2F78FFFE path_truncated=0 path_original_len=4")
+                .ends_with("path=2F78FFFE path_truncated=0 path_original_len=4 container_id=?")
         );
     }
 
@@ -612,12 +687,80 @@ mod tests {
             path: Some(AuditPath::new(&"a".repeat(10_000))),
         });
         let t = encode_payload(&long).unwrap();
-        assert!(t.ends_with("path_truncated=1 path_original_len=10000"));
+        assert!(t.ends_with("path_truncated=1 path_original_len=10000 container_id=?"));
         assert!(t.len() <= AUDIT_MESSAGE_TEXT_MAX);
     }
 
+    fn cid(v: &str) -> crate::traits::ContainerId {
+        crate::traits::ContainerId::new(v).unwrap()
+    }
+
+    /// SEC-4・SUP-6・REPAIR-2・#1618: exec_target の本文は末尾に検証済みのコンテナ ID を持つ（本文まるごと一致）。
+    #[test]
+    fn sec4_sup6_1618_payload_exec_target_with_container_id() {
+        let r = rec(AuditEvent::ExecTarget {
+            reason: crate::audit_log::AuditReason::new("exec_target_cgroup_mismatch"),
+        })
+        .with_container_id(cid("c1"));
+        assert_eq!(
+            encode_payload(&r).unwrap(),
+            "op=fandhe-audit layer=exec_target ts=1700000000.000000005 pid=1234 syscall=? arch=? \
+             path=? path_truncated=? path_original_len=? reason=exec_target_cgroup_mismatch container_id=c1"
+        );
+    }
+
+    /// SEC-4・#1618: mount の本文は末尾が ` container_id=c1`。
+    #[test]
+    fn sec4_1618_payload_mount_with_container_id() {
+        let r = rec(AuditEvent::Mount { path: None }).with_container_id(cid("c1"));
+        assert!(
+            encode_payload(&r)
+                .unwrap()
+                .ends_with(" path_original_len=? container_id=c1")
+        );
+    }
+
+    /// SEC-4・#1618: ID が無い本文は ` container_id=?`（既存の `?` の慣例）。
+    #[test]
+    fn sec4_1618_payload_without_container_id_is_question_mark() {
+        let r = rec(AuditEvent::Mount { path: None });
+        assert!(encode_payload(&r).unwrap().ends_with(" container_id=?"));
+    }
+
+    /// SEC-4・#1618: 最悪ケースでもメッセージ上限に収まり、パスの hex は偶数文字で切り詰めを明示する。
+    #[test]
+    fn sec4_1618_payload_worst_case_fits_message_limit() {
+        let id = "a".repeat(255);
+        let r = rec(AuditEvent::Mount {
+            path: Some(AuditPath::new(&"a".repeat(4096))),
+        })
+        .with_container_id(cid(&id));
+        let t = encode_payload(&r).unwrap();
+        assert!(t.len() <= AUDIT_MESSAGE_TEXT_MAX, "{}", t.len());
+        assert!(
+            t.ends_with(&format!(
+                " path_truncated=1 path_original_len=4096 container_id={id}"
+            )),
+            "{t}"
+        );
+        let hex = t
+            .split(" path=")
+            .nth(1)
+            .and_then(|r| r.split(' ').next())
+            .unwrap();
+        assert_eq!(hex.len() % 2, 0);
+        assert!(hex.len() < 8192);
+
+        let r = rec(AuditEvent::PluginTrust {
+            path: AuditPath::new(&"a".repeat(4096)),
+            reason: crate::audit_log::AuditReason::new("untrusted_owner"),
+        });
+        let t = encode_payload(&r).unwrap();
+        assert!(t.len() <= AUDIT_MESSAGE_TEXT_MAX, "{}", t.len());
+    }
+
     /// 4096 バイトのパス（hex 8192 文字）を含む Mount レコードの本文長。
-    const PAYLOAD_LEN_FOR_4096_BYTE_PATH: usize = 8315;
+    const PAYLOAD_LEN_FOR_4096_BYTE_PATH: usize = 8315 + " container_id=?".len();
 
     fn ack_bytes(seq: u32, ty: u16, error: i32) -> Vec<u8> {
         let mut v = Vec::new();

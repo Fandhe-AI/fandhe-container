@@ -164,6 +164,8 @@ struct DefaultDevice {
     major: u32,
     minor: u32,
     mode: u32,
+    /// rootless の bind で照合に使う `sys` の固定表の対応する列挙子（`major`/`minor` と一致する。試験で照合）。
+    node: sys::HostDeviceNode,
 }
 
 /// OCI Runtime Spec の default devices（文字デバイス・モード 0666）。CDI の deviceNodes は
@@ -174,36 +176,42 @@ const DEFAULT_DEVICES: [DefaultDevice; 6] = [
         major: 1,
         minor: 3,
         mode: 0o666,
+        node: sys::HostDeviceNode::Null,
     },
     DefaultDevice {
         name: c"zero",
         major: 1,
         minor: 5,
         mode: 0o666,
+        node: sys::HostDeviceNode::Zero,
     },
     DefaultDevice {
         name: c"full",
         major: 1,
         minor: 7,
         mode: 0o666,
+        node: sys::HostDeviceNode::Full,
     },
     DefaultDevice {
         name: c"random",
         major: 1,
         minor: 8,
         mode: 0o666,
+        node: sys::HostDeviceNode::Random,
     },
     DefaultDevice {
         name: c"urandom",
         major: 1,
         minor: 9,
         mode: 0o666,
+        node: sys::HostDeviceNode::Urandom,
     },
     DefaultDevice {
         name: c"tty",
         major: 5,
         minor: 0,
         mode: 0o666,
+        node: sys::HostDeviceNode::Tty,
     },
 ];
 
@@ -700,7 +708,7 @@ fn verify_host_node(
     fd: OwnedFd,
     d: &DefaultDevice,
 ) -> Result<sys::VerifiedDeviceNodeFd, sys::DeviceNodeError> {
-    sys::verify_device_node_fd(fd, d.major, d.minor)
+    sys::verify_device_node_fd(fd, d.node)
 }
 
 /// dry-run: 照合の事実を記録し、`VERIFY_SCRIPT` に積んだ拒否を先頭から返せる（非特権では `null` の位置に
@@ -726,7 +734,7 @@ fn verify_host_node(
     if let Some(e) = scripted {
         return Err(e);
     }
-    sys::verify_device_node_fd(fd, d.major, d.minor)
+    sys::verify_device_node_fd(fd, d.node)
 }
 
 /// ホスト側ノードの検証失敗をエラーにする。文字デバイスでない・`rdev` 違いは bind 元の不正として違反記録つきで
@@ -3149,5 +3157,23 @@ mod tests {
         assert_eq!(std::fs::read(t.0.join("dev/null")).unwrap(), b"other");
         assert!(t.0.join("dev/null-moved").exists());
         take_calls();
+    }
+
+    /// CORE-6・SEC-1（TASK-29 追補・#1659）: rootless の bind（#1660）で検証に使う `sys::HostDeviceNode` の固定表は、
+    /// 作成対象の `DEFAULT_DEVICES` と順序込みで同じ `(major, minor)` の集合である。`sys` は上位層に依存しないため
+    /// 表を 2 か所に持ち、どちらかだけを変えた（任意の major/minor を足した）ときにここで落とす。
+    #[test]
+    fn core6_sec1_host_device_node_table_matches_default_devices() {
+        let defaults: Vec<(u32, u32)> =
+            DEFAULT_DEVICES.iter().map(|d| (d.major, d.minor)).collect();
+        let allowed: Vec<(u32, u32)> = sys::HostDeviceNode::ALL
+            .iter()
+            .map(|n| n.major_minor())
+            .collect();
+        assert_eq!(
+            allowed,
+            vec![(1, 3), (1, 5), (1, 7), (1, 8), (1, 9), (5, 0)]
+        );
+        assert_eq!(defaults, allowed);
     }
 }

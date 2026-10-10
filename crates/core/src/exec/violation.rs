@@ -1312,7 +1312,7 @@ mod tests {
 
         for r in ViolationReason::ENTRYPOINT_REASONS {
             let sink = VecSink::new(false);
-            let out = record_entrypoint_rejection("rejected", r, &sink);
+            let out = record_entrypoint_rejection("rejected", r, None, &sink);
             assert_eq!(out.delivery, AuditDelivery::Recorded, "{r:?}");
             assert_eq!(out.error, "rejected");
             let recs = sink.snapshot();
@@ -1323,7 +1323,7 @@ mod tests {
             assert_eq!(recs[0].pid().get(), std::process::id());
 
             let failing = VecSink::new(true);
-            let out = record_entrypoint_rejection("rejected", r, &failing);
+            let out = record_entrypoint_rejection("rejected", r, None, &failing);
             assert!(
                 matches!(out.delivery, AuditDelivery::SinkFailed(_)),
                 "{r:?}"
@@ -1335,7 +1335,7 @@ mod tests {
             ViolationReason::TargetMoved,
         ] {
             let sink = VecSink::new(false);
-            let out = record_entrypoint_rejection("x", r, &sink);
+            let out = record_entrypoint_rejection("x", r, None, &sink);
             assert_eq!(out.delivery, AuditDelivery::NotApplicable);
             assert_eq!(sink.snapshot().len(), 0);
         }
@@ -1351,7 +1351,7 @@ mod tests {
 
         for r in ViolationReason::EXEC_WORKER_REASONS {
             let sink = VecSink::new(false);
-            let out = record_exec_worker_rejection("rejected", r, &sink);
+            let out = record_exec_worker_rejection("rejected", r, None, &sink);
             assert_eq!(out.delivery, AuditDelivery::Recorded, "{r:?}");
             assert_eq!(out.error, "rejected");
             let recs = sink.snapshot();
@@ -1365,9 +1365,10 @@ mod tests {
             assert_eq!(recs[0].reason().map(AuditReason::as_str), reason);
             assert_eq!(recs[0].path(), None);
             assert_eq!(recs[0].pid().get(), std::process::id());
+            assert_eq!(recs[0].container_id(), None);
 
             let failing = VecSink::new(true);
-            let out = record_exec_worker_rejection("rejected", r, &failing);
+            let out = record_exec_worker_rejection("rejected", r, None, &failing);
             assert!(
                 matches!(out.delivery, AuditDelivery::SinkFailed(_)),
                 "{r:?}"
@@ -1380,7 +1381,7 @@ mod tests {
             ViolationReason::EntrypointIsRuntimeBinary,
         ] {
             let sink = VecSink::new(false);
-            let out = record_exec_worker_rejection("x", r, &sink);
+            let out = record_exec_worker_rejection("x", r, None, &sink);
             assert_eq!(out.delivery, AuditDelivery::NotApplicable, "{r:?}");
             assert_eq!(sink.snapshot().len(), 0);
         }
@@ -1399,7 +1400,7 @@ mod tests {
             None,
             IsolationStage::Exec,
         );
-        let r = audit_entrypoint_violation(err, &sink);
+        let r = audit_entrypoint_violation(err, None, &sink);
         assert_eq!(r.delivery, AuditDelivery::Recorded);
         assert_eq!(
             r.error.violation.as_ref().map(|v| v.reason),
@@ -1410,14 +1411,14 @@ mod tests {
         assert_eq!(recs[0].layer(), AuditLayer::Entrypoint);
 
         let sys = ExecError::new(ErrorCode::Internal, IsolationStage::Exec, "sys");
-        let r = audit_entrypoint_violation(sys, &sink);
+        let r = audit_entrypoint_violation(sys, None, &sink);
         assert_eq!(r.delivery, AuditDelivery::NotApplicable);
         let mount = ExecError::from_violation_at(
             ViolationReason::PathParentComponent,
             Some(Path::new("/a/../b")),
             IsolationStage::PrepareRootfs,
         );
-        let r = audit_entrypoint_violation(mount, &sink);
+        let r = audit_entrypoint_violation(mount, None, &sink);
         assert_eq!(r.delivery, AuditDelivery::NotApplicable);
         assert_eq!(sink.snapshot().len(), 1);
     }
@@ -1435,7 +1436,8 @@ mod tests {
             Some(Path::new("/tmp/a/../b")),
             IsolationStage::PrepareRootfs,
         );
-        let r = audit_mount_violation(err, &sink);
+        let cid = crate::traits::ContainerId::new("c1").unwrap();
+        let r = audit_mount_violation(err, Some(&cid), &sink);
         assert_eq!(r.delivery, AuditDelivery::Recorded);
         assert_eq!(
             r.error.violation.as_ref().map(|v| v.reason),
@@ -1445,9 +1447,10 @@ mod tests {
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].layer(), AuditLayer::Mount);
         assert_eq!(recs[0].path(), Some(Path::new("/tmp/a/../b")));
+        assert_eq!(recs[0].container_id().map(|c| c.as_str()), Some("c1"));
 
         let sys = ExecError::new(ErrorCode::Internal, IsolationStage::MountProc, "sys");
-        let r = audit_mount_violation(sys, &sink);
+        let r = audit_mount_violation(sys, None, &sink);
         assert_eq!(r.delivery, AuditDelivery::NotApplicable);
         assert_eq!(sink.snapshot().len(), 1);
     }

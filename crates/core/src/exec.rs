@@ -245,8 +245,13 @@ pub use violation::{
 ///
 /// 本番の `spawn_container` 子プロセス・launcher への配線は未実装（`AuditSink` を fork 後へ渡す設計が
 /// 未決定。TASK-29 / TASK-157 系。REPAIR-3）。ファイル永続化は `audit_log::AuditFileWriter`（#839）で実装済み。
+///
+/// 移行（#1618）: 引数 `container` を `sink` の直前に追加した。記録の `container_id` に載せる検証済みの
+/// コンテナ ID で、ID が無い呼び出し側は `None` を渡す（ワイヤーでは null）。記録の `pid` は記録を行った
+/// プロセスのもので、違反したプロセスや pid1 ではない。
 pub fn audit_mount_violation(
     err: ExecError,
+    container: Option<&crate::traits::ContainerId>,
     sink: &dyn crate::audit_log::AuditSink,
 ) -> crate::audit_log::AuditedRejection<ExecError> {
     let event = err
@@ -255,7 +260,7 @@ pub fn audit_mount_violation(
         .and_then(IsolationViolation::mount_audit_event);
     match event {
         Some(event) => {
-            let delivery = crate::audit_log::mount::deliver(event, sink);
+            let delivery = crate::audit_log::mount::deliver(event, container, sink);
             crate::audit_log::AuditedRejection {
                 error: err,
                 delivery,
@@ -271,8 +276,13 @@ pub fn audit_mount_violation(
 /// システムエラー）は `NotApplicable`。`err` は常にそのまま返り、記録の失敗で拒否は覆らない（fail-closed）。
 /// プロセス内で `ExecError` を直接扱う呼び出し側向けで、supervisor の通しの入口は
 /// [`record_exec_worker_rejection`] を使う。
+///
+/// 移行（#1618）: 引数 `container` を `sink` の直前に追加した。記録の `container_id` に載せる検証済みの
+/// コンテナ ID で、ID が無い呼び出し側は `None` を渡す（ワイヤーでは null）。記録の `pid` は記録を行った
+/// プロセスのもので、違反したプロセスや pid1 ではない。
 pub fn audit_exec_violation(
     err: ExecError,
+    container: Option<&crate::traits::ContainerId>,
     sink: &dyn crate::audit_log::AuditSink,
 ) -> crate::audit_log::AuditedRejection<ExecError> {
     let event = err
@@ -281,7 +291,7 @@ pub fn audit_exec_violation(
         .and_then(IsolationViolation::exec_audit_event);
     match event {
         Some(event) => {
-            let delivery = crate::audit_log::mount::deliver(event, sink);
+            let delivery = crate::audit_log::mount::deliver(event, container, sink);
             crate::audit_log::AuditedRejection {
                 error: err,
                 delivery,
@@ -296,14 +306,19 @@ pub fn audit_exec_violation(
 ///
 /// `reason` が exec 対象の理由でなければ記録せず `NotApplicable`。時刻と PID は呼び出したプロセスのもの。
 /// 記録の成否で `error` は変わらない（fail-closed）。
+///
+/// 移行（#1618）: 引数 `container` を `sink` の直前に追加した。記録の `container_id` に載せる検証済みの
+/// コンテナ ID で、ID が無い呼び出し側は `None` を渡す（ワイヤーでは null）。記録の `pid` は記録を行った
+/// プロセスのもので、違反したプロセスや pid1 ではない。
 pub fn record_exec_target_rejection<E>(
     error: E,
     reason: ViolationReason,
+    container: Option<&crate::traits::ContainerId>,
     sink: &dyn crate::audit_log::AuditSink,
 ) -> crate::audit_log::AuditedRejection<E> {
     match reason.exec_target_audit_event() {
         Some(event) => {
-            let delivery = crate::audit_log::mount::deliver(event, sink);
+            let delivery = crate::audit_log::mount::deliver(event, container, sink);
             crate::audit_log::AuditedRejection { error, delivery }
         }
         None => crate::audit_log::AuditedRejection::not_applicable(error),
@@ -318,14 +333,19 @@ pub fn record_exec_target_rejection<E>(
 /// [`audit_mount_violation`] と同じ写像で層 `mount` のパスなしのレコードにする（`ViolationReason::exec_worker_audit_event`）。
 /// 一覧外の理由は記録せず `NotApplicable`。時刻と PID は呼び出したプロセスのもの。記録の成否で `error` は
 /// 変わらない（fail-closed）。
+///
+/// 移行（#1618）: 引数 `container` を `sink` の直前に追加した。記録の `container_id` に載せる検証済みの
+/// コンテナ ID で、ID が無い呼び出し側は `None` を渡す（ワイヤーでは null）。記録の `pid` は記録を行った
+/// プロセスのもので、違反したプロセスや pid1 ではない。
 pub fn record_exec_worker_rejection<E>(
     error: E,
     reason: ViolationReason,
+    container: Option<&crate::traits::ContainerId>,
     sink: &dyn crate::audit_log::AuditSink,
 ) -> crate::audit_log::AuditedRejection<E> {
     match reason.exec_worker_audit_event() {
         Some(event) => {
-            let delivery = crate::audit_log::mount::deliver(event, sink);
+            let delivery = crate::audit_log::mount::deliver(event, container, sink);
             crate::audit_log::AuditedRejection { error, delivery }
         }
         None => crate::audit_log::AuditedRejection::not_applicable(error),
@@ -339,8 +359,13 @@ pub fn record_exec_worker_rejection<E>(
 /// `ExecError` を直接扱う launch 側の入口で、理由コードだけを持つ supervisor の親プロセスは
 /// [`record_entrypoint_rejection`] を使う。launch 経路（`spawn_container` の子・launcher）への配線は
 /// 未実装（#1314。TASK-29 / TASK-157 系。REPAIR-3）。
+///
+/// 移行（#1618）: 引数 `container` を `sink` の直前に追加した。記録の `container_id` に載せる検証済みの
+/// コンテナ ID で、ID が無い呼び出し側は `None` を渡す（ワイヤーでは null）。記録の `pid` は記録を行った
+/// プロセスのもので、違反したプロセスや pid1 ではない。
 pub fn audit_entrypoint_violation(
     err: ExecError,
+    container: Option<&crate::traits::ContainerId>,
     sink: &dyn crate::audit_log::AuditSink,
 ) -> crate::audit_log::AuditedRejection<ExecError> {
     let event = err
@@ -349,7 +374,7 @@ pub fn audit_entrypoint_violation(
         .and_then(IsolationViolation::entrypoint_audit_event);
     match event {
         Some(event) => {
-            let delivery = crate::audit_log::mount::deliver(event, sink);
+            let delivery = crate::audit_log::mount::deliver(event, container, sink);
             crate::audit_log::AuditedRejection {
                 error: err,
                 delivery,
@@ -364,14 +389,19 @@ pub fn audit_entrypoint_violation(
 ///
 /// `reason` がエントリポイント検証の理由でなければ記録せず `NotApplicable`。時刻と PID は呼び出した
 /// プロセスのもの。記録の成否で `error` は変わらない（fail-closed）。
+///
+/// 移行（#1618）: 引数 `container` を `sink` の直前に追加した。記録の `container_id` に載せる検証済みの
+/// コンテナ ID で、ID が無い呼び出し側は `None` を渡す（ワイヤーでは null）。記録の `pid` は記録を行った
+/// プロセスのもので、違反したプロセスや pid1 ではない。
 pub fn record_entrypoint_rejection<E>(
     error: E,
     reason: ViolationReason,
+    container: Option<&crate::traits::ContainerId>,
     sink: &dyn crate::audit_log::AuditSink,
 ) -> crate::audit_log::AuditedRejection<E> {
     match reason.entrypoint_audit_event() {
         Some(event) => {
-            let delivery = crate::audit_log::mount::deliver(event, sink);
+            let delivery = crate::audit_log::mount::deliver(event, container, sink);
             crate::audit_log::AuditedRejection { error, delivery }
         }
         None => crate::audit_log::AuditedRejection::not_applicable(error),

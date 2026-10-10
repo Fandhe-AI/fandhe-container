@@ -1729,7 +1729,7 @@ mod linux {
                         ErrorCode::InvalidArgument,
                         "mount rejection must be InvalidArgument"
                     );
-                    let audited = audit_mount_config_error(err, rec);
+                    let audited = audit_mount_config_error(err, None, rec);
                     assert_eq!(
                         audited.delivery,
                         AuditDelivery::Recorded,

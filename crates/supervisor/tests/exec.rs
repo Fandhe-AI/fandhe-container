@@ -106,9 +106,9 @@ mod linux {
     use fandhe_container_core::audit_log::{AuditDelivery, AuditRecord, AuditSink};
     use fandhe_container_core::cgroups::CgroupName;
     use fandhe_container_core::exec::{
-        ChildExit, ContainerEnv, ExecExit, IsolationConfig, MountIsolation, Namespace,
-        NamespaceSet, ViolationReason, create_default_devices, isolate_rootful_host_root,
-        pivot_root, plan_rootful_host_root, prepare_rootfs,
+        ChildExit, ContainerEnv, DevptsGidSource, ExecExit, IsolationConfig, MountIsolation,
+        Namespace, NamespaceSet, ViolationReason, create_default_devices,
+        isolate_rootful_host_root, pivot_root, plan_rootful_host_root, prepare_rootfs,
     };
     use fandhe_container_core::oci_runtime::load_config;
     use fandhe_container_core::traits::{
@@ -380,7 +380,8 @@ mod linux {
         assert_eq!(std::process::id(), 1, "must be PID 1 of the new namespace");
         let isolation = MountIsolation::establish().expect("establish mount isolation");
         let prepared = prepare_rootfs(&isolation, rootfs).expect("prepare rootfs");
-        create_default_devices(&isolation, &prepared).expect("create default devices");
+        create_default_devices(&isolation, &prepared, DevptsGidSource::Rootful)
+            .expect("create default devices");
         pivot_root(&isolation, prepared).expect("pivot_root");
         fs::write(format!("/{ready}"), b"ready").expect("write ready marker");
         // 親が stdin 経由で pid1 を kill するまで待機する（上限つき。REPAIR-5）。

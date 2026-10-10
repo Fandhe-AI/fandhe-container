@@ -9,7 +9,7 @@
 //! `dev` の tmpfs に覆い隠される。
 //!
 //! ```text
-//! prepare_rootfs -> create_default_devices（dev に tmpfs → ノード → symlink） -> mount_tmpfs(&isolation, &prepared, &set) -> pivot_root
+//! prepare_rootfs -> create_default_devices（dev に tmpfs → ノード → symlink → pts に devpts → ptmx） -> mount_tmpfs(&isolation, &prepared, &set) -> pivot_root
 //! ```
 //!
 //! # 契約
@@ -425,12 +425,25 @@ pub(super) fn check_new_tmpfs(
     destination: &str,
     stage: IsolationStage,
 ) -> Result<(), ExecError> {
+    check_new_mount(observed, sys::TMPFS_MAGIC, "tmpfs", destination, stage)
+}
+
+/// [`check_new_tmpfs`] の fs 種別を引数にした共通本体。`expected_magic` は期待する `statfs.f_type`、
+/// `fs_label` は message に出す fs 名。`/dev/pts` の devpts（#1656。`DEVPTS_MAGIC`）も同じ 3 点判定を
+/// 段 `CreateDevices` で再利用する。message の書式は fs 名以外 tmpfs 版と同一。
+pub(super) fn check_new_mount(
+    observed: MountObservation,
+    expected_magic: i64,
+    fs_label: &str,
+    destination: &str,
+    stage: IsolationStage,
+) -> Result<(), ExecError> {
     let destination = display_destination(destination);
-    if observed.magic != sys::TMPFS_MAGIC {
+    if observed.magic != expected_magic {
         return Err(ExecError::new(
             ErrorCode::FailedPrecondition,
             stage,
-            format!("the mount at {destination} is not tmpfs after mount"),
+            format!("the mount at {destination} is not {fs_label} after mount"),
         ));
     }
     if observed.after_mnt_id == observed.before_mnt_id {
@@ -792,6 +805,40 @@ pub(super) mod tests {
             err.message,
             "the mount at /run is not the mount created by this call"
         );
+    }
+
+    /// CORE-1・SEC-1（#1656）: 共通本体 `check_new_mount` は期待 magic と fs 名を引数に取り、3 分岐の message
+    /// が devpts 用の表記になる（tmpfs 版と書式は同一）。
+    #[test]
+    fn core1_1656_check_new_mount_reports_devpts_messages() {
+        let obs = |magic, before_mnt_id, after_mnt_id, own_mnt_id| MountObservation {
+            magic,
+            before_mnt_id,
+            after_mnt_id,
+            own_mnt_id,
+        };
+        let stage = IsolationStage::CreateDevices;
+        let check = |o| check_new_mount(o, sys::DEVPTS_MAGIC, "devpts", "/dev/pts", stage);
+        assert!(check(obs(sys::DEVPTS_MAGIC, 1, 2, 2)).is_ok());
+        for (o, msg) in [
+            (
+                obs(sys::TMPFS_MAGIC, 1, 2, 2),
+                "the mount at /dev/pts is not devpts after mount",
+            ),
+            (
+                obs(sys::DEVPTS_MAGIC, 2, 2, 2),
+                "no new mount is present at /dev/pts after mount",
+            ),
+            (
+                obs(sys::DEVPTS_MAGIC, 1, 2, 3),
+                "the mount at /dev/pts is not the mount created by this call",
+            ),
+        ] {
+            let err = check(o).unwrap_err();
+            assert_eq!(err.code, ErrorCode::FailedPrecondition);
+            assert_eq!(err.stage, stage);
+            assert_eq!(err.message, msg);
+        }
     }
 
     /// SUP-12・TASK-169 追補（#1472）: 未対応カーネル（`ENOSYS` 由来の `Unsupported`）は縮退せず

@@ -1,5 +1,5 @@
-//! コンテナ起動時の `/dev` 用 tmpfs のマウントと、基本デバイスノード 6 種・default symlink 4 本の作成
-//! （CORE-1・SEC-1・TASK-27.6・TASK-29 追補・#834・#1297・#1653・MS-2）。
+//! コンテナ起動時の `/dev` 用 tmpfs のマウントと、基本デバイスノード 6 種・default symlink 4 本・`/dev/pts` の devpts・`/dev/ptmx` の作成
+//! （CORE-1・SEC-1・TASK-27.6・TASK-29 追補・#834・#1297・#1653・#1656・MS-2）。
 //!
 //! # 役割と呼び出し文脈
 //!
@@ -19,14 +19,19 @@
 //! 無いと `exec` 前検査（`process.rs` の `verify_script_fd_path`）が新 root の `/dev/fd/N` を解決できず、
 //! シェバン付きスクリプトを拒否する。参照先は pivot 後のコンテナ内で解決され、作成時にホスト側では辿らない。
 //!
+//! 続けて、OCI Runtime Spec の Default Filesystems の `/dev/pts`（devpts）を暗黙の固定集合として常に載せ
+//! （#1656。設計ドラフト `dev-default-mounts.md` 3.3・オーナー判断 2026-10-10 の判断 2）、`/dev/ptmx` を
+//! `pts/ptmx` への相対 symlink にする（runc の `setupPtmx` と同じ。ただし既存エントリの unlink はしない）。
+//! devpts は毎回新しい独立 instance で、ホストの pty は見えない。
+//!
 //! `crate::exec` の最小実行フロー第 3 段。呼び出し元は TASK-29 の `oci_runtime` と fork 段（#831）を
 //! 想定し、次の順で通す。
 //!
 //! ```text
 //! prepare_rootfs(&isolation, rootfs) -> PreparedRootfs
 //!   -> create_default_devices(&isolation, &prepared) -> DeviceReport   // 本モジュール
-//!        （dev に tmpfs → ノード 6 種 → symlink 4 本）
-//!   -> [/dev/shm は `mount_tmpfs` が集合（既定 64 MiB を含む。#1654）から、/dev/pts・/dev/ptmx は #1656 が本モジュールの tmpfs の上に載せる]
+//!        （dev に tmpfs → ノード 6 種 → symlink 4 本 → pts に devpts → ptmx の symlink）
+//!   -> [/dev/shm は `mount_tmpfs` が集合（既定 64 MiB を含む。#1654）から載せる]
 //!   -> mount_tmpfs / inject_files
 //!   -> pivot_root(&isolation, prepared)
 //! ```
@@ -64,10 +69,25 @@
 //!   `EPERM` になり `PermissionDenied`（段 `CreateDevices`）で拒否する。黙ってデバイス無しで起動させない。
 //!   この場合も載せた tmpfs は外す
 //! - **失敗時の後始末**: どこかで失敗したら、この呼び出しが載せたマウントを fd 経由で `umount2(MNT_DETACH)` で
-//!   外し（名前から開き直した先は外さない）、この呼び出しの `mkdirat` が成功した `dev` だけを
-//!   `unlinkat(AT_REMOVEDIR)` で消す（空ディレクトリしか消えないため既存の内容は壊さない）。tmpfs ごと外す
-//!   のでノードは残らない。後始末は最善努力で、失敗しても元のエラーを返す。呼び出し後もプロセスは
+//!   外し（名前から開き直した先は外さない）、この呼び出しが作った `ptmx`（参照先が一致するときだけ）・`pts`
+//!   （同じ inode のときだけ）・`dev` を消す（`unlinkat(AT_REMOVEDIR)` は空ディレクトリしか消えないため既存の
+//!   内容は壊さない）。順序は devpts → `ptmx` → `pts` → `/dev` の tmpfs → `dev`。tmpfs ごと外すのでノードは
+//!   残らない。後始末は最善努力で、失敗しても元のエラーを返す。呼び出し後もプロセスは
 //!   破棄する（`crate::exec` のモジュール doc の契約）
+//! - **`/dev/pts` は `/dev` のマウントのルート fd 起点**: `pts` を 0755 で作り、`O_PATH|O_NOFOLLOW|O_DIRECTORY` で
+//!   固定した fd にだけ devpts を載せる（`sys::mount_devpts_on`。`mode=620`・`ptmxmode=666`・`nosuid|noexec` は
+//!   固定）。`nodev` は付けない（pty のスレーブと `ptmx` は文字デバイスで、`nodev` では開けない。devpts の中に
+//!   置けるのはカーネルが作る pty ノードだけで、利用者が任意のデバイスを作る経路は無い）。`pts` が symlink・
+//!   非ディレクトリなら違反記録付きで何もマウントせず拒否する。マウント後は tmpfs と同じ 3 点（devpts であること・
+//!   別マウントであること・自分のマウントそのものであること）で事後検証する
+//! - **`gid=` の決定**: [`DevptsGidSource`] で呼び出し元が申告する。rootful は常に 5、rootless は検証済みの gid の
+//!   写像でコンテナ内 gid 5 が写像されているときだけ 5、いなければ `gid=` を渡さない（判断 3）。省いたときは
+//!   固定語彙の構造化ログを標準エラーへ 1 行出し、[`DevptsOutcome::gid`] も `None` になる。申告がずれても
+//!   緩む方向には働かない（rootless で `Rootful` を渡せばカーネルが `EINVAL` で拒否し、rootful で `Rootless` を
+//!   渡せば `gid=` が付かないだけ）
+//! - **`ptmx` は完全一致のみ受け入れる**: devpts のマウント後に `ptmx` → `pts/ptmx` を default symlink と同じ
+//!   fd 起点の magic link 方式で作る。`EEXIST` は参照先が完全一致のときだけ受け入れ、別の参照先・通常ファイル・
+//!   デバイスノードは上書きも unlink もせず `FailedPrecondition` で拒否する
 //! - **1 プロセス 1 回**: 同じ [`PreparedRootfs`] に 2 回呼ぶと tmpfs が重なる（2 回目は新しい tmpfs 上で
 //!   再び `Created` になり、rootfs の外へは書かない）。重ね掛けの検出（拒否）は行わない
 //! - **同一スレッド**: `MountIsolation::establish` と同じスレッドで呼ぶ
@@ -77,14 +97,18 @@
 //! - rootless 向けのホスト `/dev/*` の bind mount による供給（runc 相当。CORE-6・SEC-5。#1660）。
 //!   本実装の rootless 経路は `PermissionDenied` で止まる。user namespace が載せたマウント上のデバイスが
 //!   開けるか（`nodev` 相当の扱い）は本モジュールでは確かめておらず、#1660 で一次情報を確認する（未確認）
-//! - `/dev/pts`・`/dev/ptmx`（#1656）。`/dev/console` は端末機能の親 issue で
-//!   別途設計する（設計ドラフト 3.5）
+//! - rootless での `/dev/pts` の実機照合。rootless は上の基本デバイス作成で止まり devpts の段へ進めないため、
+//!   gid 5 が写像されない rootless の devpts が `gid=` を含まないことの実機での確認は #1660 の後になる
+//!   （単体テストと `sys` の実マウント試験が補う）
+//! - `/dev/console` は端末機能の親 issue で別途設計する（設計ドラフト 3.5）。`process.terminal: true` も
+//!   従来どおり拒否のまま
 //! - `spawn_container` の最小フローへの本関数の配線（#1314）
 //!
 //! # 単体テストの安全策
 //!
 //! `mknodat(2)`・tmpfs のマウント・解除・マウント観測は `cfg(test)` では dry-run に差し替わる
-//! （`mknod_syscall`・`mount_dev_tmpfs_syscall`・`umount_dev_syscall`・`observe_dev_mount`）。root で
+//! （`mknod_syscall`・`mount_dev_tmpfs_syscall`・`mount_devpts_syscall`・`umount_dev_syscall`・
+//! `observe_dev_mount`・`observe_pts_mount`）。root で
 //! `cargo test` を実行してもホストへ実ノードやマウントを作らない。symlink は特権不要で一時ディレクトリ内
 //! にしか作られないため dry-run にせず実ファイルシステムで照合する。実機での挙動は結合試験
 //! `tests/default_devices.rs`（`-- --ignored`）で確認する。
@@ -94,10 +118,11 @@ use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
+use crate::rootless::IdMapSet;
 use crate::sys::{self, SysError};
 use crate::traits::types::ErrorCode;
 
-use super::tmpfs::{MountObservation, check_new_tmpfs};
+use super::tmpfs::{MountObservation, check_new_mount, check_new_tmpfs};
 use super::{
     ExecError, IsolationStage, MountIsolation, PreparedRootfs, ViolationReason, fd_still_at,
     mount_is_shared, open_error,
@@ -183,6 +208,60 @@ const DEFAULT_LINKS: [DefaultLink; 4] = [
     },
 ];
 
+/// `/dev/ptmx` → `pts/ptmx` の symlink（OCI Runtime Spec の Default Filesystems。#1656）。`DEFAULT_LINKS` に
+/// 入れないのは、参照先の `pts/ptmx` が devpts のマウント後でないと意味を持たず、作成順が後になるため。
+/// 参照先は相対パスで、pivot 後のコンテナ内で解決される（作成時にホスト側では辿らない）。
+const PTMX_LINK: DefaultLink = DefaultLink {
+    name: c"ptmx",
+    target: "pts/ptmx",
+};
+
+/// devpts の `gid=` に渡す tty グループ（runc の既定と同じ。設計ドラフト `dev-default-mounts.md` 3.3）。
+const DEVPTS_GID: u32 = 5;
+
+/// devpts の `gid=` を決めるための権限モデルの入力（オーナー判断 2026-10-10 の判断 3。CORE-6・SEC-5）。
+///
+/// 呼び出し元（#1314 で配線する `oci_runtime` / fork 段）が、すでに検証済みの写像を渡す。子（PID 1）側で
+/// `/proc/self/gid_map` を独自に解析し直さない。申告が実態とずれた場合も緩む方向には働かない:
+/// rootless で `Rootful` を渡すと `gid=5` が写像されずカーネルが `EINVAL` で拒否し（fail-closed）、
+/// rootful で `Rootless` を渡すと `gid=` が付かないだけで権限は広がらない。
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum DevptsGidSource<'a> {
+    /// rootful（`isolate_rootful_host_root`）。常に gid 5 を渡す。
+    Rootful,
+    /// rootless。検証済みの gid の写像（単一 ID 経路は `rootless::single_id_mapping(egid)`、範囲写像の経路は
+    /// その gid の集合）。コンテナ内 gid 5 が写像されているときだけ gid 5 を渡し、いなければ `gid=` を渡さない。
+    Rootless(&'a IdMapSet),
+}
+
+/// devpts の `gid=` の決定（純粋関数）。rootful は `Some(5)`、rootless は gid 5 が写像されていれば
+/// `Some(5)`、されていなければ `None`（`gid=` のキー自体を渡さない）。
+fn devpts_gid(source: DevptsGidSource<'_>) -> Option<u32> {
+    match source {
+        DevptsGidSource::Rootful => Some(DEVPTS_GID),
+        DevptsGidSource::Rootless(gid_map) => gid_map.host_id_of(DEVPTS_GID).map(|_| DEVPTS_GID),
+    }
+}
+
+/// `gid=` を省いたときに出す構造化ログの 1 行（固定の語彙と数値だけ。利用者の値・パスは含めない）。
+fn devpts_gid_omitted_log_line() -> &'static str {
+    r#"{"event":"devpts_gid_omitted","container_gid":5,"reason":"rootless_gid_unmapped"}"#
+}
+
+#[cfg(not(test))]
+fn emit_devpts_gid_omitted() {
+    use std::io::Write as _;
+    // 書き込みの失敗でコンテナの起動を止めない（診断用のログのため結果は捨てる）。
+    let _ = writeln!(std::io::stderr(), "{}", devpts_gid_omitted_log_line());
+}
+
+/// dry-run: 標準エラーへは出さず、出力した事実を記録する。
+#[cfg(test)]
+fn emit_devpts_gid_omitted() {
+    tests::EVENTS.with(|e| e.borrow_mut().push(tests::Event::GidOmittedLog));
+}
+
 /// 1 symlink の結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -231,6 +310,28 @@ pub struct DeviceNodeOutcome {
     pub status: DeviceNodeStatus,
 }
 
+/// `/dev/pts` ディレクトリの結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DevptsDirStatus {
+    /// 今回作成した（新しい tmpfs 上では通常これ）。
+    Created,
+    /// 既に存在していた（種別はディレクトリと検証済みで、その上に devpts を載せた）。
+    AlreadyPresent,
+}
+
+/// `/dev/pts`（devpts の独立 instance）と `/dev/ptmx` の結果（#1656。CORE-1・SEC-1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DevptsOutcome {
+    /// devpts の `gid=` に渡した値。`None` は `gid=` を渡さなかった（rootless で gid 5 が未写像）ことを表す。
+    pub gid: Option<u32>,
+    /// `/dev/pts` ディレクトリを作成したか、既存だったか。
+    pub pts_dir: DevptsDirStatus,
+    /// `/dev/ptmx` → `pts/ptmx` の symlink の結果。
+    pub ptmx: DeviceLinkOutcome,
+}
+
 /// [`create_default_devices`] の成功結果（将来の拡張に備えた非網羅の構造体）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -239,19 +340,28 @@ pub struct DeviceReport {
     pub nodes: Vec<DeviceNodeOutcome>,
     /// default symlink 4 本の結果（定義順: fd・stdin・stdout・stderr。#1297）。
     pub links: Vec<DeviceLinkOutcome>,
+    /// `/dev/pts` の devpts と `/dev/ptmx` の結果（#1656）。
+    pub devpts: DevptsOutcome,
 }
 
-/// rootfs の `dev` に専用の tmpfs を載せ、その上へ基本デバイスノード 6 種と default symlink 4 本を作る。
+/// rootfs の `dev` に専用の tmpfs を載せ、その上へ基本デバイスノード 6 種・default symlink 4 本・
+/// `/dev/pts` の devpts（独立 instance）・`/dev/ptmx` の symlink を作る。
 ///
 /// [`prepare_rootfs`](super::prepare_rootfs) の後、[`pivot_root`](super::pivot_root) の前に呼ぶ。
 /// [`MountIsolation`] の証跡が現在の状態と一致しなければ副作用なしに拒否する（fail-closed）。
+/// `gid_source` は devpts の `gid=` の決定に使う（[`DevptsGidSource`]）。
 /// 詳細な契約はモジュール doc を参照。
 pub fn create_default_devices(
     isolation: &MountIsolation,
     prepared: &PreparedRootfs,
+    gid_source: DevptsGidSource<'_>,
 ) -> Result<DeviceReport, ExecError> {
     isolation.verify_caller(STAGE)?;
-    create_default_devices_at(prepared.new_root(), &|dir| mount_is_shared(dir, STAGE))
+    create_default_devices_at(
+        prepared.new_root(),
+        &|dir| mount_is_shared(dir, STAGE),
+        gid_source,
+    )
 }
 
 /// この呼び出しが rootfs・mount namespace に加えた変更の記録（失敗時の [`roll_back_dev`] が使う）。
@@ -261,6 +371,20 @@ struct DevState {
     created_dev: Option<OwnedFd>,
     /// 載せた「自分のマウントのルート」を指す fd（付け替え直後に保持し、事後検証に通らなくても外せる）。
     mounted: Option<OwnedFd>,
+    /// `/dev/pts` と `/dev/ptmx` の変更記録（`mounted` を借りたまま更新できるよう別の構造体に分ける）。
+    pts: PtsState,
+}
+
+/// [`mount_pts`] がこの呼び出しで加えた変更の記録（失敗時の [`roll_back_dev`] が使う）。
+#[derive(Default)]
+struct PtsState {
+    /// この呼び出しの `mkdirat` が成功して作った `pts` を指す fd（既存の `pts` は `None`）。後始末で名前 `pts` が
+    /// 今も同じ inode かを確かめる識別情報（差し替え対策）。
+    created: Option<OwnedFd>,
+    /// 載せた devpts のマウントのルートを指す fd（付け替え直後に保持し、事後検証に通らなくても外せる）。
+    mounted: Option<OwnedFd>,
+    /// この呼び出しが `ptmx` の symlink を作ったか（`EEXIST` の既存を受け入れた場合は偽。消さない）。
+    ptmx_created: bool,
 }
 
 /// [`create_default_devices`] の証跡検証後の本体。`root` は rootfs（新しい mount top）の fd、`is_shared` は
@@ -269,13 +393,16 @@ struct DevState {
 fn create_default_devices_at(
     root: BorrowedFd<'_>,
     is_shared: &dyn Fn(&OwnedFd) -> Result<bool, ExecError>,
+    gid_source: DevptsGidSource<'_>,
 ) -> Result<DeviceReport, ExecError> {
     let rootfs = root_display(root);
     let mut state = DevState {
         created_dev: None,
         mounted: None,
+        pts: PtsState::default(),
     };
-    let result = populate_dev(root, &rootfs, is_shared, &mut state);
+    let gid = devpts_gid(gid_source);
+    let result = populate_dev(root, &rootfs, is_shared, gid, &mut state);
     if result.is_err() {
         roll_back_dev(root, &state);
     }
@@ -287,6 +414,7 @@ fn populate_dev(
     root: BorrowedFd<'_>,
     rootfs: &Path,
     is_shared: &dyn Fn(&OwnedFd) -> Result<bool, ExecError>,
+    gid: Option<u32>,
     state: &mut DevState,
 ) -> Result<DeviceReport, ExecError> {
     let (opened, created) = open_dev_dir(root, rootfs)?;
@@ -362,7 +490,103 @@ fn populate_dev(
             status,
         });
     }
-    Ok(DeviceReport { nodes, links })
+    let devpts = mount_pts(mount, rootfs, gid, &mut state.pts)?;
+    Ok(DeviceReport {
+        nodes,
+        links,
+        devpts,
+    })
+}
+
+/// `/dev` の tmpfs のルート fd 起点で `pts` を作り、独立した devpts を載せ、事後検証してから
+/// `ptmx` → `pts/ptmx` の symlink を作る（#1656。CORE-1・SEC-1）。変更は `state` に記録する。
+///
+/// `pts` は `O_PATH|O_NOFOLLOW|O_DIRECTORY` で固定した fd にだけ載せ、パス文字列を連結して mount API へ渡さない。
+/// 名前から開き直した fd は事後検証専用。devpts は毎回新しい instance なのでホストの pty は見えない。
+fn mount_pts(
+    mount: BorrowedFd<'_>,
+    rootfs: &Path,
+    gid: Option<u32>,
+    state: &mut PtsState,
+) -> Result<DevptsOutcome, ExecError> {
+    let names = [OsStr::new("dev"), OsStr::new("pts")];
+    let created = match mkdir_pts(mount) {
+        Ok(()) => true,
+        // 新しい tmpfs 上では通常起きない。先に作られていても自分が作った扱いにせず、開き直しで種別を検証する。
+        Err(SysError::Os(sys::EEXIST)) => false,
+        Err(e) => return Err(ExecError::from_sys(e, STAGE, "mkdirat(dev/pts)")),
+    };
+    let opened = match sys::open_dir_path_nofollow(Some(mount), c"pts") {
+        Ok(fd) => fd,
+        Err(e) => {
+            // 開き直し失敗は識別用の fd が得られないため後始末に渡せない。ここで空ディレクトリだけを消す。
+            if created {
+                let _ = sys::remove_dir_at(mount, c"pts");
+            }
+            return Err(open_error(e, true, rootfs, &names).at_stage(STAGE));
+        }
+    };
+    let local;
+    let pts: &OwnedFd = if created {
+        &*state.created.insert(opened)
+    } else {
+        local = opened;
+        &local
+    };
+    let pts_mount =
+        mount_devpts_syscall(pts.as_fd(), sys::DevptsCreate { gid }).map_err(devpts_mount_error)?;
+    let pts_mount = &*state.mounted.insert(pts_mount);
+    // 事後検証専用の開き直し（作成の起点にはしない）。
+    let after = sys::open_dir_path_nofollow(Some(mount), c"pts")
+        .map_err(|e| open_error(e, true, rootfs, &names).at_stage(STAGE))?;
+    let observed = observe_pts_mount(pts, &after, pts_mount)?;
+    check_new_mount(observed, sys::DEVPTS_MAGIC, "devpts", "/dev/pts", STAGE)?;
+
+    let ptmx_status = create_link(mount, &PTMX_LINK)?;
+    if ptmx_status == DeviceLinkStatus::Created {
+        state.ptmx_created = true;
+    }
+    if gid.is_none() {
+        emit_devpts_gid_omitted();
+    }
+    Ok(DevptsOutcome {
+        gid,
+        pts_dir: if created {
+            DevptsDirStatus::Created
+        } else {
+            DevptsDirStatus::AlreadyPresent
+        },
+        ptmx: DeviceLinkOutcome {
+            name: "ptmx",
+            target: PTMX_LINK.target,
+            status: ptmx_status,
+        },
+    })
+}
+
+/// `pts` ディレクトリを 0755 で作る。`cfg(test)` でも実ファイルシステム（一時ディレクトリ）に作り、
+/// 順序の照合のため作成の事実を記録する。
+fn mkdir_pts(mount: BorrowedFd<'_>) -> Result<(), SysError> {
+    #[cfg(test)]
+    tests::EVENTS.with(|e| {
+        e.borrow_mut().push(tests::Event::Mkdir {
+            dirfd: mount.as_raw_fd(),
+            name: "pts".to_owned(),
+        })
+    });
+    sys::mkdir_at(mount, c"pts", 0o755)
+}
+
+/// devpts の新マウント API の失敗をエラーにする。`Unsupported` は `mount(2)` へ縮退せず `Unimplemented`。
+fn devpts_mount_error(e: SysError) -> ExecError {
+    if matches!(e, SysError::Unsupported) {
+        return ExecError::new(
+            ErrorCode::Unimplemented,
+            STAGE,
+            "the /dev/pts devpts mount requires the new mount API (fsopen, fsconfig, fsmount, move_mount; Linux 5.2 or later)",
+        );
+    }
+    ExecError::from_sys(e, STAGE, "mount(devpts on /dev/pts)")
 }
 
 /// 新マウント API の失敗をエラーにする。`Unsupported`（`ENOSYS`・対応外アーキテクチャ）は縮退せず
@@ -378,28 +602,50 @@ fn dev_mount_error(e: SysError) -> ExecError {
     ExecError::from_sys(e, STAGE, "mount(tmpfs on /dev)")
 }
 
-/// 失敗時の後始末（最善努力）。載せたマウントを fd 経由で外してから、この呼び出しが作った `dev` を消す。
+/// 失敗時の後始末（最善努力）。新しく作ったものから順に、devpts のマウント → `ptmx` → `pts` → `/dev` の
+/// tmpfs → `dev` を片付ける。
 ///
 /// 外すのは付け替え時に得た自分のマウントの fd が指すマウントだけで、名前から開き直した先は外さない。
-/// `unlinkat(AT_REMOVEDIR)` は空ディレクトリしか消さないため、既存の `dev` の内容は壊さない。
+/// `unlinkat(AT_REMOVEDIR)` は空ディレクトリしか消さないため既存の内容は壊さない。`ptmx` は自分が作り、かつ
+/// 参照先が今も `pts/ptmx` のときだけ消す（差し替えられていれば残す）。`pts` と `dev` は名前が作成時と同じ
+/// inode を指すときだけ消す。
 fn roll_back_dev(root: BorrowedFd<'_>, state: &DevState) {
-    if let Some(mount) = &state.mounted
-        && let Ok(target) = CString::new(format!("/proc/thread-self/fd/{}", mount.as_raw_fd()))
+    if let Some(pts_mount) = &state.pts.mounted
+        && let Ok(target) = CString::new(format!("/proc/thread-self/fd/{}", pts_mount.as_raw_fd()))
     {
         let _ = umount_dev_syscall(&target);
+    }
+    if let Some(mount) = &state.mounted {
+        if state.pts.ptmx_created {
+            let path = fd_magic_path(mount.as_raw_fd()).join("ptmx");
+            let is_ours = std::fs::read_link(&path)
+                .is_ok_and(|t| t.as_os_str() == OsStr::new(PTMX_LINK.target));
+            if is_ours {
+                // `remove_file` は最後の要素を辿らず symlink 自身を消す。
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        if let Some(created) = &state.pts.created
+            && name_is_same_inode(mount.as_fd(), c"pts", created)
+        {
+            let _ = sys::remove_dir_at(mount.as_fd(), c"pts");
+        }
+        if let Ok(target) = CString::new(format!("/proc/thread-self/fd/{}", mount.as_raw_fd())) {
+            let _ = umount_dev_syscall(&target);
+        }
     }
     // 名前 `dev` が作成時と同じ inode を指すと確認できたときだけ消す。差し替え・移動・確認不能は残す
     // （fail-closed。別プロセスが置いた別ディレクトリを消さない）。
     if let Some(created) = &state.created_dev
-        && name_dev_is_same_inode(root, created)
+        && name_is_same_inode(root, c"dev", created)
     {
         let _ = sys::remove_dir_at(root, c"dev");
     }
 }
 
-/// `root` 直下の名前 `dev` が `created` と同じ inode（st_dev・st_ino）を指すか。開けない・取得できない場合は偽。
-fn name_dev_is_same_inode(root: BorrowedFd<'_>, created: &OwnedFd) -> bool {
-    let Ok(now) = sys::open_dir_path_nofollow(Some(root), c"dev") else {
+/// `dir` 直下の名前 `name` が `created` と同じ inode（st_dev・st_ino）を指すか。開けない・取得できない場合は偽。
+fn name_is_same_inode(dir: BorrowedFd<'_>, name: &CStr, created: &OwnedFd) -> bool {
+    let Ok(now) = sys::open_dir_path_nofollow(Some(dir), name) else {
         return false;
     };
     let identity = |fd: &OwnedFd| {
@@ -698,6 +944,75 @@ fn observe_dev_mount(
         }))
 }
 
+#[cfg(not(test))]
+fn mount_devpts_syscall(
+    target_dir: BorrowedFd<'_>,
+    create: sys::DevptsCreate,
+) -> Result<OwnedFd, SysError> {
+    sys::mount_devpts_on(target_dir, create)
+}
+
+/// dry-run: 新マウント API を呼ばず、(付け替え先の実体・`gid`・attr フラグ・返す fd) を記録し、付け替え先の
+/// fd の複製を「自分のマウント」として返す。`DEVPTS_MOUNT_SCRIPT` に積んだ失敗を先に返せる。
+#[cfg(test)]
+fn mount_devpts_syscall(
+    target_dir: BorrowedFd<'_>,
+    create: sys::DevptsCreate,
+) -> Result<OwnedFd, SysError> {
+    let scripted = tests::DEVPTS_MOUNT_SCRIPT.with(|s| s.borrow_mut().take());
+    if let Some(e) = scripted {
+        return Err(e);
+    }
+    let resolved = std::fs::read_link(fd_magic_path(target_dir.as_raw_fd()))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let fd = target_dir
+        .try_clone_to_owned()
+        .map_err(|_| SysError::Os(sys::EBADF))?;
+    tests::EVENTS.with(|e| {
+        e.borrow_mut().push(tests::Event::MountDevpts {
+            target: resolved,
+            gid: create.gid,
+            attr_bits: create.attr_bits(),
+            fd: fd.as_raw_fd(),
+        })
+    });
+    Ok(fd)
+}
+
+#[cfg(not(test))]
+fn observe_pts_mount(
+    before: &OwnedFd,
+    after: &OwnedFd,
+    own: &OwnedFd,
+) -> Result<MountObservation, ExecError> {
+    Ok(MountObservation {
+        magic: sys::fs_type(after.as_fd())
+            .map_err(|e| ExecError::from_sys(e, STAGE, "fstatfs(/dev/pts)"))?,
+        before_mnt_id: super::fd_mount_id(before, STAGE)?,
+        after_mnt_id: super::fd_mount_id(after, STAGE)?,
+        own_mnt_id: super::fd_mount_id(own, STAGE)?,
+    })
+}
+
+/// dry-run: 既定は「別マウントの devpts で自分のマウント」を観測したことにする。`OBSERVE_PTS_SCRIPT` で異常値を
+/// 差し込める（実機の検証は結合試験で行う）。
+#[cfg(test)]
+fn observe_pts_mount(
+    _before: &OwnedFd,
+    _after: &OwnedFd,
+    _own: &OwnedFd,
+) -> Result<MountObservation, ExecError> {
+    Ok(tests::OBSERVE_PTS_SCRIPT
+        .with(|s| s.borrow_mut().take())
+        .unwrap_or(MountObservation {
+            magic: sys::DEVPTS_MAGIC,
+            before_mnt_id: 1,
+            after_mnt_id: 2,
+            own_mnt_id: 2,
+        }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -728,6 +1043,17 @@ mod tests {
             name: String,
             target: String,
         },
+        /// `mkdirat`（`pts`。`dev` の作成は記録しない）。
+        Mkdir { dirfd: i32, name: String },
+        /// devpts のマウント（`target` は付け替え先の解決パス、`fd` は返したマウント fd の raw 値）。
+        MountDevpts {
+            target: String,
+            gid: Option<u32>,
+            attr_bits: u32,
+            fd: i32,
+        },
+        /// `gid=` を省いたときの構造化ログの出力。
+        GidOmittedLog,
         /// `umount2(MNT_DETACH)`（解決した対象パス）。
         Umount(String),
     }
@@ -742,6 +1068,12 @@ mod tests {
         /// dry-run の事後観測が次に返す値（消費される。無ければ正常値）。
         pub(super) static OBSERVE_SCRIPT: RefCell<Option<MountObservation>> =
             const { RefCell::new(None) };
+        /// dry-run の devpts マウントが次に返す失敗（消費される）。
+        pub(super) static DEVPTS_MOUNT_SCRIPT: RefCell<Option<SysError>> =
+            const { RefCell::new(None) };
+        /// dry-run の devpts 事後観測が次に返す値（消費される。無ければ正常値）。
+        pub(super) static OBSERVE_PTS_SCRIPT: RefCell<Option<MountObservation>> =
+            const { RefCell::new(None) };
     }
 
     /// 記録とスクリプトをすべて消し、記録済みの `mknodat` 呼び出しを返す。
@@ -749,6 +1081,8 @@ mod tests {
         MKNOD_SCRIPT.with(|s| s.borrow_mut().clear());
         MOUNT_SCRIPT.with(|s| *s.borrow_mut() = None);
         OBSERVE_SCRIPT.with(|s| *s.borrow_mut() = None);
+        DEVPTS_MOUNT_SCRIPT.with(|s| *s.borrow_mut() = None);
+        OBSERVE_PTS_SCRIPT.with(|s| *s.borrow_mut() = None);
         take_events()
             .into_iter()
             .filter_map(|e| match e {
@@ -769,7 +1103,7 @@ mod tests {
     }
 
     fn run_at(root: BorrowedFd<'_>) -> Result<DeviceReport, ExecError> {
-        create_default_devices_at(root, &|_| Ok(false))
+        create_default_devices_at(root, &|_| Ok(false), DevptsGidSource::Rootful)
     }
 
     /// `.0` は guard と同じパス（`t.0.join(..)` 用）。削除は guard の drop が行う（#1298）。
@@ -1117,6 +1451,10 @@ mod tests {
                     name,
                     target,
                 } => (*dirfd, format!("symlink {name} {target}")),
+                Event::Mkdir { dirfd, name } => (*dirfd, format!("mkdir {name}")),
+                // devpts のマウントは dirfd を持たない（付け替え先の実体は専用のテストで照合する）ため、
+                // ここでは順序だけを見る。
+                Event::MountDevpts { .. } => (fd, "mount devpts".to_owned()),
                 other => panic!("unexpected event {other:?}"),
             })
             .collect();
@@ -1133,6 +1471,9 @@ mod tests {
                 "symlink stdin /proc/self/fd/0",
                 "symlink stdout /proc/self/fd/1",
                 "symlink stderr /proc/self/fd/2",
+                "mkdir pts",
+                "mount devpts",
+                "symlink ptmx pts/ptmx",
             ]
         );
         assert!(names.iter().all(|(d, _)| *d == fd), "dirfd must be {fd}");
@@ -1210,6 +1551,7 @@ mod tests {
         let state = DevState {
             created_dev: Some(created),
             mounted: None,
+            pts: PtsState::default(),
         };
         std::fs::rename(t.0.join("dev"), t.0.join("dev-moved")).unwrap();
         std::fs::create_dir(t.0.join("dev")).unwrap();
@@ -1228,6 +1570,7 @@ mod tests {
         let state = DevState {
             created_dev: Some(created),
             mounted: None,
+            pts: PtsState::default(),
         };
         roll_back_dev(root.as_fd(), &state);
         assert!(!t.0.join("dev").exists());
@@ -1304,7 +1647,12 @@ mod tests {
     fn core1_1653_shared_or_moved_dev_is_rejected_before_mount() {
         take_calls();
         let t = Tmp::new("shared");
-        let err = create_default_devices_at(open_root(&t.0).as_fd(), &|_| Ok(true)).unwrap_err();
+        let err = create_default_devices_at(
+            open_root(&t.0).as_fd(),
+            &|_| Ok(true),
+            DevptsGidSource::Rootful,
+        )
+        .unwrap_err();
         assert_eq!(
             err.violation.as_ref().unwrap().reason.as_str(),
             "target_on_shared_mount"
@@ -1315,10 +1663,14 @@ mod tests {
         let t = Tmp::new("moved");
         let dev = t.0.join("dev");
         let moved = t.0.join("dev-moved");
-        let err = create_default_devices_at(open_root(&t.0).as_fd(), &|_| {
-            std::fs::rename(&dev, &moved).unwrap();
-            Ok(false)
-        })
+        let err = create_default_devices_at(
+            open_root(&t.0).as_fd(),
+            &|_| {
+                std::fs::rename(&dev, &moved).unwrap();
+                Ok(false)
+            },
+            DevptsGidSource::Rootful,
+        )
         .unwrap_err();
         assert_eq!(
             err.violation.as_ref().unwrap().reason.as_str(),
@@ -1326,5 +1678,319 @@ mod tests {
         );
         assert_eq!(take_events(), Vec::<Event>::new());
         take_calls();
+    }
+
+    /// CORE-1・SEC-5・#1656: devpts の `gid=` の決定（rootful は 5、rootless は gid 5 が写像されたときだけ 5）。
+    #[test]
+    fn core1_sec5_1656_devpts_gid_decision_is_exact() {
+        use crate::exec::IdMapping;
+        let map = |entries: Vec<(u32, u32, u32)>| {
+            IdMapSet::new(
+                entries
+                    .into_iter()
+                    .map(|(container_id, host_id, count)| IdMapping {
+                        container_id,
+                        host_id,
+                        count,
+                    })
+                    .collect(),
+            )
+            .unwrap()
+        };
+        assert_eq!(devpts_gid(DevptsGidSource::Rootful), Some(5));
+        // 範囲写像でコンテナ 1..65537 が写る → 5 は写像される。
+        let ranged = map(vec![(0, 1000, 1), (1, 100_000, 65_536)]);
+        assert_eq!(devpts_gid(DevptsGidSource::Rootless(&ranged)), Some(5));
+        // 単一 ID の写像（コンテナ 0 のみ）→ 5 は写像されない。
+        let single = crate::rootless::single_id_mapping(1000).unwrap();
+        assert_eq!(devpts_gid(DevptsGidSource::Rootless(&single)), None);
+        // 境界: 1..=4 までなら 5 は範囲外、5 だけを別行で写せば範囲内。
+        let short = map(vec![(0, 1000, 1), (1, 100_000, 4)]);
+        assert_eq!(devpts_gid(DevptsGidSource::Rootless(&short)), None);
+        let only5 = map(vec![(0, 1000, 1), (5, 200_005, 1)]);
+        assert_eq!(devpts_gid(DevptsGidSource::Rootless(&only5)), Some(5));
+    }
+
+    /// CORE-1・#1656: `gid=` を省いたときの構造化ログはバイト単位で固定（固定の語彙と数値だけ）。
+    #[test]
+    fn core1_1656_gid_omitted_log_line_is_exact() {
+        assert_eq!(
+            devpts_gid_omitted_log_line(),
+            "{\"event\":\"devpts_gid_omitted\",\"container_gid\":5,\"reason\":\"rootless_gid_unmapped\"}"
+        );
+    }
+
+    /// CORE-1・SEC-1・OCI-4・#1656: tmpfs → ノード → symlink の後に `pts` を作り、devpts を載せ、
+    /// 最後に `ptmx` → `pts/ptmx` を `/dev` のマウント fd 起点で作る。
+    #[test]
+    fn core1_oci4_1656_order_mkdir_pts_then_devpts_then_ptmx() {
+        take_calls();
+        let t = Tmp::new("pts-order");
+        let report = run_at(open_root(&t.0).as_fd()).unwrap();
+        let events = take_events();
+        let Some(Event::MountDev { fd, .. }) = events.first().cloned() else {
+            panic!("first event must be the tmpfs mount: {events:?}");
+        };
+        let tail = &events[events.len() - 3..];
+        assert_eq!(
+            tail[0],
+            Event::Mkdir {
+                dirfd: fd,
+                name: "pts".into()
+            }
+        );
+        let Event::MountDevpts {
+            target,
+            gid,
+            attr_bits,
+            ..
+        } = tail[1].clone()
+        else {
+            panic!("devpts mount must follow mkdir: {tail:?}");
+        };
+        assert_eq!(target, format!("{}/dev/pts", t.0.display()));
+        assert_eq!(gid, Some(5));
+        assert_eq!(attr_bits, 0xA);
+        assert_eq!(
+            tail[2],
+            Event::Symlink {
+                dirfd: fd,
+                name: "ptmx".into(),
+                target: "pts/ptmx".into()
+            }
+        );
+        assert_eq!(count(&events, |e| matches!(e, Event::Umount(_))), 0);
+        assert_eq!(count(&events, |e| matches!(e, Event::GidOmittedLog)), 0);
+        assert_eq!(report.devpts.gid, Some(5));
+        assert_eq!(report.devpts.pts_dir, DevptsDirStatus::Created);
+        assert_eq!(report.devpts.ptmx.name, "ptmx");
+        assert_eq!(report.devpts.ptmx.target, "pts/ptmx");
+        assert_eq!(report.devpts.ptmx.status, DeviceLinkStatus::Created);
+        assert_eq!(
+            std::fs::read_link(t.0.join("dev/ptmx")).unwrap(),
+            PathBuf::from("pts/ptmx")
+        );
+        assert!(t.0.join("dev/pts").is_dir());
+    }
+
+    /// CORE-1・SEC-5・#1656: gid 5 が写像されない rootless では `gid=` を渡さず、構造化ログを 1 件出す。
+    #[test]
+    fn core1_sec5_1656_unmapped_gid_omits_gid_and_logs_once() {
+        take_calls();
+        let t = Tmp::new("pts-nogid");
+        let single = crate::rootless::single_id_mapping(1000).unwrap();
+        let report = create_default_devices_at(
+            open_root(&t.0).as_fd(),
+            &|_| Ok(false),
+            DevptsGidSource::Rootless(&single),
+        )
+        .unwrap();
+        let events = take_events();
+        assert_eq!(report.devpts.gid, None);
+        let gids: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::MountDevpts { gid, .. } => Some(*gid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gids, vec![None]);
+        assert_eq!(count(&events, |e| matches!(e, Event::GidOmittedLog)), 1);
+    }
+
+    /// CORE-1・SEC-1・#1656: 既存の `ptmx` が別の参照先・通常ファイルなら上書きも unlink もせず拒否し、
+    /// 載せた devpts と作った `pts` だけを巻き戻す。
+    #[test]
+    fn core1_1656_existing_ptmx_other_target_or_file_is_rejected() {
+        for (label, kind) in [("abs", 0), ("escape", 1), ("file", 2)] {
+            take_calls();
+            let t = Tmp::new(&format!("ptmx-{label}"));
+            let outside = t.0.join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            let rootfs = t.0.join("root");
+            std::fs::create_dir_all(rootfs.join("dev")).unwrap();
+            let ptmx = rootfs.join("dev/ptmx");
+            match kind {
+                0 => std::os::unix::fs::symlink("/dev/pts/ptmx", &ptmx).unwrap(),
+                1 => std::os::unix::fs::symlink("../outside", &ptmx).unwrap(),
+                _ => std::fs::write(&ptmx, b"keep").unwrap(),
+            }
+            let err = run_at(open_root(&rootfs).as_fd()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::FailedPrecondition);
+            assert_eq!(err.stage, IsolationStage::CreateDevices);
+            assert_eq!(
+                err.message,
+                "the existing entry dev/ptmx is not a symlink to pts/ptmx"
+            );
+            match kind {
+                0 => assert_eq!(
+                    std::fs::read_link(&ptmx).unwrap(),
+                    PathBuf::from("/dev/pts/ptmx")
+                ),
+                1 => assert_eq!(
+                    std::fs::read_link(&ptmx).unwrap(),
+                    PathBuf::from("../outside")
+                ),
+                _ => assert_eq!(std::fs::read(&ptmx).unwrap(), b"keep"),
+            }
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+            let events = take_events();
+            let umounts: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Umount(p) => Some(p.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                umounts,
+                vec![
+                    format!("{}/dev/pts", rootfs.display()),
+                    format!("{}/dev", rootfs.display())
+                ]
+            );
+            // 自分が作った `pts` は消え、既存の `ptmx` は残る。
+            assert!(!rootfs.join("dev/pts").exists());
+        }
+    }
+
+    /// CORE-1・#1656: 期待どおりの既存 `ptmx` は `AlreadyPresent` で受け入れ、作成扱いにしない。
+    #[test]
+    fn core1_1656_existing_ptmx_exact_is_accepted() {
+        take_calls();
+        let t = Tmp::new("ptmx-present");
+        std::fs::create_dir(t.0.join("dev")).unwrap();
+        std::os::unix::fs::symlink("pts/ptmx", t.0.join("dev/ptmx")).unwrap();
+        let report = run_at(open_root(&t.0).as_fd()).unwrap();
+        assert_eq!(report.devpts.ptmx.status, DeviceLinkStatus::AlreadyPresent);
+        take_calls();
+    }
+
+    /// CORE-1・SEC-1・#1656: devpts の事後検証（devpts でない）に通らなければ拒否し、devpts → `pts` →
+    /// `/dev` の順で巻き戻す。無関係な既存エントリは残す。
+    #[test]
+    fn core1_1656_post_verification_failure_rolls_back_only_created() {
+        take_calls();
+        let t = Tmp::new("pts-postverify");
+        std::fs::create_dir(t.0.join("dev")).unwrap();
+        std::fs::write(t.0.join("dev/keep"), b"data").unwrap();
+        OBSERVE_PTS_SCRIPT.with(|s| {
+            *s.borrow_mut() = Some(MountObservation {
+                magic: sys::TMPFS_MAGIC,
+                before_mnt_id: 1,
+                after_mnt_id: 2,
+                own_mnt_id: 2,
+            })
+        });
+        let err = run_at(open_root(&t.0).as_fd()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(err.stage, IsolationStage::CreateDevices);
+        assert_eq!(
+            err.message,
+            "the mount at /dev/pts is not devpts after mount"
+        );
+        let events = take_events();
+        assert_eq!(
+            events[events.len() - 2..],
+            [
+                Event::Umount(format!("{}/dev/pts", t.0.display())),
+                Event::Umount(format!("{}/dev", t.0.display())),
+            ]
+        );
+        assert!(!t.0.join("dev/pts").exists());
+        assert!(!t.0.join("dev/ptmx").exists());
+        assert_eq!(std::fs::read(t.0.join("dev/keep")).unwrap(), b"data");
+    }
+
+    /// CORE-1・#1656: devpts の新マウント API 未対応は `Unimplemented`。作った `pts` は消え、devpts は
+    /// 載っていないので外さない（`/dev` の tmpfs だけ外す）。
+    #[test]
+    fn core1_1656_devpts_unsupported_is_unimplemented() {
+        take_calls();
+        let t = Tmp::new("pts-unsupported");
+        DEVPTS_MOUNT_SCRIPT.with(|s| *s.borrow_mut() = Some(SysError::Unsupported));
+        let err = run_at(open_root(&t.0).as_fd()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unimplemented);
+        assert_eq!(err.stage, IsolationStage::CreateDevices);
+        let events = take_events();
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Umount(p) => Some(p.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![format!("{}/dev", t.0.display())]
+        );
+        // `pts` は消える。`dev` 自体は dry-run で実体のある symlink 4 本が残るため消えない（実機では tmpfs ごと外れる）。
+        assert!(!t.0.join("dev/pts").exists());
+        take_calls();
+    }
+
+    /// CORE-1・SEC-1・#1656: 既存の `pts` が外側への symlink なら違反記録付きで拒否し、devpts を載せず、
+    /// 外側に何も作らない。
+    #[test]
+    fn core1_1656_symlinked_pts_is_rejected() {
+        take_calls();
+        let t = Tmp::new("pts-symlink");
+        let outside = t.0.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let rootfs = t.0.join("root");
+        std::fs::create_dir_all(rootfs.join("dev")).unwrap();
+        std::os::unix::fs::symlink(&outside, rootfs.join("dev/pts")).unwrap();
+        let err = run_at(open_root(&rootfs).as_fd()).unwrap_err();
+        assert_eq!(err.stage, IsolationStage::CreateDevices);
+        assert_eq!(
+            err.violation.as_ref().unwrap().reason.as_str(),
+            "path_symlink_or_not_directory"
+        );
+        let events = take_events();
+        assert_eq!(
+            count(&events, |e| matches!(e, Event::MountDevpts { .. })),
+            0
+        );
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        assert!(
+            std::fs::symlink_metadata(rootfs.join("dev/pts"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    /// CORE-1・#1656: `ptmx` 作成後の失敗でも、自分が作った `ptmx` と `pts` は消え、既存の内容は残る。
+    /// 差し替えられた `ptmx`（参照先が違う）は消さない。
+    #[test]
+    fn core1_1656_rollback_removes_created_ptmx_and_pts_only() {
+        for swapped in [false, true] {
+            let t = Tmp::new(&format!("pts-rollback-{swapped}"));
+            std::fs::create_dir(t.0.join("dev")).unwrap();
+            std::fs::write(t.0.join("dev/keep"), b"data").unwrap();
+            let root = open_root(&t.0);
+            let dev = sys::open_dir_path_nofollow(Some(root.as_fd()), c"dev").unwrap();
+            sys::mkdir_at(dev.as_fd(), c"pts", 0o755).unwrap();
+            let pts = sys::open_dir_path_nofollow(Some(dev.as_fd()), c"pts").unwrap();
+            let target = if swapped { "elsewhere" } else { "pts/ptmx" };
+            std::os::unix::fs::symlink(target, t.0.join("dev/ptmx")).unwrap();
+            let state = DevState {
+                created_dev: None,
+                mounted: Some(dev),
+                pts: PtsState {
+                    created: Some(pts),
+                    mounted: None,
+                    ptmx_created: true,
+                },
+            };
+            roll_back_dev(root.as_fd(), &state);
+            assert!(!t.0.join("dev/pts").exists());
+            assert_eq!(std::fs::read(t.0.join("dev/keep")).unwrap(), b"data");
+            assert_eq!(
+                std::fs::symlink_metadata(t.0.join("dev/ptmx")).is_ok(),
+                swapped,
+                "swapped ptmx must be kept"
+            );
+            take_events();
+        }
     }
 }

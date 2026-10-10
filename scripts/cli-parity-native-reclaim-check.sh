@@ -2,7 +2,7 @@
 # cli-parity-check.sh のタイムアウト時に、ネイティブ exe の子孫が回収されるかを確かめる（#1548・
 # TASK-125.1・CLI-1・REPAIR-5）。Git Bash（MSYS2）ではネイティブ exe の子が POSIX の pgid を持たず、
 # プロセスグループ宛ての kill が届かない可能性があるため、CI の 3 OS で実測する。
-# CI の integration-test ジョブが `make cli-parity-native-reclaim-check` で呼ぶ。make ci には含めない。
+# CI の platform-ci ジョブが `make cli-parity-native-reclaim-check` で呼ぶ。make ci には含めない。
 # 結果は `cli-parity native reclaim: ...` の行で出す（CI ログから grep できる）。
 set -euo pipefail
 export LC_ALL=C

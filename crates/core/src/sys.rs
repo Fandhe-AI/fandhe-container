@@ -1424,7 +1424,8 @@ impl DevptsCreate {
 /// `nodev` は付けない（pty は文字デバイスのため）。`newinstance` は渡さない（Linux 4.7 以降は devpts の
 /// mount がすべて独立 instance で、本 API の前提は 5.2 以降）。instance ごとの `max=` も付けない
 /// （全体上限は `kernel.pty.max` が担う）。未対応（`ENOSYS`）は [`SysError::Unsupported`] で返し、
-/// `mount(2)` へは縮退しない（fail-closed）。実マウントの確認は #1656 の結合試験で行う。
+/// `mount(2)` へは縮退しない（fail-closed）。実マウントは `sys::tests::core1_sec1_task29_devpts_real_mount`（実機前提・`--ignored`）が
+/// user + mount namespace 内で確認し、`crate::exec` への配線後の検証は #1656 で行う。
 /// ビヘイビア: CORE-1・SEC-1・REPAIR-2（TASK-29 追補・#1655）。
 // 呼び出し元は #1656 で配線するまで存在しないため dead_code を許可する。
 #[allow(dead_code)]
@@ -3757,6 +3758,129 @@ mod tests {
         assert_eq!(DEVPTS_MAGIC, 0x1cd1);
     }
 
+    /// CORE-1・SEC-1・REPAIR-2（TASK-29 追補・#1655）: [`mount_devpts_on`] の実マウント経路の結合試験。
+    ///
+    /// 実機前提のため `#[ignore]` で既定のテスト集合から分離する（実行は
+    /// `cargo test -p fandhe-container-core --lib -- --ignored core1_sec1_task29_devpts_real_mount`）。
+    /// 必要環境は Linux 5.2 以降（新マウント API）・util-linux の `unshare`・非特権 user namespace を許可する
+    /// ホスト（または root）。libtest はテストをスレッドで動かし `CLONE_NEWUSER` が `EINVAL` になるため、
+    /// 外側のテストが `unshare --user --map-root-user --mount` で自身を再実行し、内側（環境変数で判別）が
+    /// その namespace 内でマウントする。ホストのマウントは変えない。内側は (1) カーネルがパラメータを受理して
+    /// 成功する、(2) 返された fd が devpts（magic 0x1cd1）を指す、(3) 指定先へ接続され mountinfo に
+    /// `nosuid,noexec` の devpts として現れる、(4) `ptmx` が 0666 の独立 instance で pty を確保できる、
+    /// ことを具体値で照合する。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    #[ignore = "real-machine test: needs Linux 5.2+, util-linux unshare and unprivileged user namespaces (or root). CORE-1/SEC-1"]
+    fn core1_sec1_task29_devpts_real_mount() {
+        const INNER_ENV: &str = "FANDHE_DEVPTS_MOUNT_INNER";
+        if std::env::var_os(INNER_ENV).is_some() {
+            devpts_real_mount_inner();
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new("unshare")
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--propagation",
+                "private",
+            ])
+            .arg(exe)
+            .args([
+                "--exact",
+                "sys::tests::core1_sec1_task29_devpts_real_mount",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(INNER_ENV, "1")
+            .spawn()
+            .expect("spawn unshare (util-linux required)");
+        // 相手の終了待ちには必ず期限を設ける（REPAIR-5）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break st;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("inner devpts mount test timed out after 60s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        // 内側が作った空のマウント先（子の pid 名）を後始末する。マウントは namespace と共に消えている。
+        let _ =
+            std::fs::remove_dir(std::env::temp_dir().join(format!("fandhe-devpts-{}", child.id())));
+        assert!(
+            status.success(),
+            "inner devpts mount test failed: {status:?}"
+        );
+    }
+
+    /// [`core1_sec1_task29_devpts_real_mount`] の内側（新しい user + mount namespace の中）。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn devpts_real_mount_inner() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = std::env::temp_dir().join(format!("fandhe-devpts-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let cdir = CString::new(dir.to_str().unwrap()).unwrap();
+        let target = open_dir_path_nofollow(None, &cdir).unwrap();
+        // マウント前は devpts ではない。
+        assert_ne!(fs_type(target.as_fd()).unwrap(), DEVPTS_MAGIC);
+
+        // gid=None: user namespace 内で gid 5 が写像されているとは限らない。
+        let mnt = mount_devpts_on(target.as_fd(), DevptsCreate { gid: None }).unwrap();
+        // 返された fd が devpts のマウントを指す。
+        assert_eq!(fs_type(mnt.as_fd()).unwrap(), 0x1cd1);
+        // 指定先へ接続された（パスを開き直しても devpts）。
+        let reopened = open_dir_path_nofollow(None, &cdir).unwrap();
+        assert_eq!(fs_type(reopened.as_fd()).unwrap(), 0x1cd1);
+
+        // mountinfo: 指定先に fstype devpts・nosuid・noexec で現れ、nodev は付かない。
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        let line = mountinfo
+            .lines()
+            .find(|l| l.split(' ').nth(4) == dir.to_str())
+            .expect("mountinfo entry for the target");
+        let (pre, post) = line.split_once(" - ").unwrap();
+        let opts: Vec<&str> = pre.split(' ').nth(5).unwrap().split(',').collect();
+        assert!(
+            opts.contains(&"nosuid") && opts.contains(&"noexec"),
+            "{line}"
+        );
+        assert!(!opts.contains(&"nodev"), "{line}");
+        assert_eq!(post.split(' ').next(), Some("devpts"), "{line}");
+
+        // ptmx は ptmxmode=0666。開くと独立 instance 側にスレーブ（数字名）が現れ、モードは 0620。
+        let ptmx = dir.join("ptmx");
+        assert_eq!(std::fs::metadata(&ptmx).unwrap().mode() & 0o7777, 0o666);
+        let master = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&ptmx)
+            .unwrap();
+        let slaves: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.chars().all(|c| c.is_ascii_digit()))
+            .collect();
+        assert_eq!(slaves.len(), 1, "slaves: {slaves:?}");
+        assert_eq!(
+            std::fs::metadata(dir.join(&slaves[0])).unwrap().mode() & 0o7777,
+            0o620
+        );
+        drop(master);
+        drop(mnt);
+    }
     /// SUP-12（TASK-169 追補・#1472）: `fsmount` の attr フラグは nosuid・nodev を常に含み、可変なのは
     /// ro / exec だけ（`MOUNT_ATTR_*` は `MS_*` と別の名前つき定数から組む）。
     #[test]

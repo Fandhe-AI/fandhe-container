@@ -69,7 +69,8 @@ fandhe-container/
 │   │   ├── macos-vm-strategy.md   # macOS の VM 利用方式（既定: 常駐 VM 共用＋軽量プロセス分離／オプション: 1 コンテナ = 1 VM。TASK-66・MAC-4）
 │   │   ├── crate-naming.md        # crate 短縮名・plugin crate 配置の確定内容（TASK-1・REPAIR-1）
 │   │   ├── rootless-network.md    # rootless ネットワーク外部ヘルパー選択肢の設計ドラフト（TASK-147・NET-9。採否未決）
-│   │   └── privilege-separation.md  # 権限分離方式の比較と必要最小権限の設計ドラフト（TASK-171.1.1・SUP-14。採否未決）
+│   │   ├── privilege-separation.md  # 権限分離方式の比較と必要最小権限の設計ドラフト（TASK-171.1.1・SUP-14。採否未決）
+│   │   └── dev-default-mounts.md  # OCI 既定の /dev の残り（/dev/pts・/dev/ptmx・/dev/shm・/dev/console）と rootless の /dev 供給方式の設計ドラフト（TASK-29 追補・#1609。採否未決）
 │   ├── setup/                     # 利用者向けセットアップ手順
 │   │   └── windows.md             # Windows セットアップ前提条件（WSL2・Developer Mode・`.wslconfig` の virtiofs。TASK-69・WIN-5。NTFS セマンティクス差異への対応〔TASK-68・WIN-4〕を統合）
 │   ├── verification/              # 実機確認の記録雛形（cli-cross-platform-parity.md: CLI 基本 6 コマンドの 3 OS 同一構文・挙動チェックリスト。TASK-125.1・CLI-1。結果記入は #661）

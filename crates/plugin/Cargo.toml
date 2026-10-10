@@ -16,11 +16,14 @@
 # 承認: #138・#246）のみ。依存の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 # core からは `fandhe-container-core` の `plugin` feature 経由で optional に参照される（PLUG-3・TASK-111.1・#262）。
 # 本 crate 内に feature は未定義（gRPC 等の重い optional 機能の導入時に検討。TASK-108）。
+# license は workspace 継承（Apache-2.0）をやめ、本 crate だけ `MIT OR Apache-2.0` にする
+# （#13 のオーナー判断 2026-10-10・TASK-3・OSS-3。外部の plugin の作者もリンクする境界ライブラリのため）。
+# 全文はルートの LICENSE-MIT・LICENSE-APACHE。依存の serde / serde_json も MIT OR Apache-2.0。
 
 [package]
 name = "fandhe-container-plugin"
 edition.workspace = true
-license.workspace = true
+license = "MIT OR Apache-2.0"
 repository.workspace = true
 publish = false
 

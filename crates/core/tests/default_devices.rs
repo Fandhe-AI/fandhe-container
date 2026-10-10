@@ -148,6 +148,8 @@ mod linux {
     fn parent() {
         let rootfs = make_rootfs();
         let root = is_root();
+        // user namespace に入る前にホスト側の実効 gid を控える（入った後は写像後の 0 に見える）。
+        let host_egid = egid();
         // euid 0 での自 ID 写像は SEC-5 で拒否されるため、root では User を除く rootful 構成にする。
         let mut namespaces = NamespaceSet::empty()
             .with(Namespace::Pid)
@@ -168,7 +170,7 @@ mod linux {
         };
         match result {
             Ok(_) => {
-                run_child(&rootfs.0, root);
+                run_child(&rootfs.0, root, host_egid);
                 if root {
                     // 偽ノードは tmpfs に覆い隠されただけで、ホスト側は内容ごと不変・新エントリなし。
                     assert_eq!(
@@ -199,14 +201,14 @@ mod linux {
     }
 
     /// 自身を `--child <rootfs>` で起動する。分離後の最初の子なので新しい PID namespace の PID 1 になる。
-    fn run_child(rootfs: &Path, rootful: bool) {
+    fn run_child(rootfs: &Path, rootful: bool, host_egid: u32) {
         let exe = std::env::current_exe().expect("current_exe");
         let mut child = Command::new(exe)
             .arg("--child")
             .arg(rootfs)
             .arg(if rootful { "--rootful" } else { "--rootless" })
             .arg("--egid")
-            .arg(egid().to_string())
+            .arg(host_egid.to_string())
             .stdin(Stdio::null())
             .spawn()
             .expect("spawn child");

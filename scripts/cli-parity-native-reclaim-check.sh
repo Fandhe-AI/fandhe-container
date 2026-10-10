@@ -63,7 +63,18 @@ reclaim_tree() {
         until_s=$((SECONDS + 10))
         while kill -0 "$tk" 2>/dev/null && [ "$SECONDS" -lt "$until_s" ]; do sleep 0.2; done
         kill -KILL "$tk" 2>/dev/null || true
-        wait "$tk" 2>/dev/null || true
+        # KILL 後も期限つきで終了を確認し、消えたときだけ wait する。消えなければ wait せず回収失敗として
+        # 続行する（ハングした taskkill が deadline_exceeded の出力を塞がないため。REPAIR-5・#1709）。
+        n=0
+        while kill -0 "$tk" 2>/dev/null && [ "$n" -lt 20 ]; do
+          sleep 0.1
+          n=$((n + 1))
+        done
+        if kill -0 "$tk" 2>/dev/null; then
+          printf 'cli-parity native reclaim: taskkill_unreaped pid=%s\n' "$tk" >&2
+        else
+          wait "$tk" 2>/dev/null || true
+        fi
         ;;
     esac
   fi

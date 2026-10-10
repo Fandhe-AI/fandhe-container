@@ -2,9 +2,11 @@
 //! （CORE-5・TASK-29 追補・#1657）。
 //!
 //! 読み取り専用の root（`root.readonly=true`）・`mounts[]` が空の config でも、Landlock 適用後に
-//! `/dev/null` への書き込みと `/dev/shm` でのファイル・ディレクトリ作成が通り、許可外のパス
-//! （`/etc`・`/`）への作成は従来どおり `EACCES` で拒否されることを errno で照合する。拒否 2 件に対する
-//! 監査レコード 2 件とパス一致も照合する（SEC-4）。
+//! `/dev/null` への書き込みと `/dev/shm` でのファイル・ディレクトリ作成が通り、`/dev/ptmx` を `O_NOCTTY` で
+//! 開け、許可外のパス（`/etc`・`/`）への作成は従来どおり `EACCES` で拒否されることを errno で照合する。
+//! rootful では `CAP_MKNOD` があり `/dev` の tmpfs に `nodev` が無いため、`/dev`・`/dev/shm` での文字デバイスの
+//! 作成（`mknodat(2)`）を止めるのは Landlock の `MAKE_CHAR` 不許可だけで、それが `EACCES` になることも通しで
+//! 照合する（#1672 事後監査 P2）。拒否 4 件に対する監査レコード 4 件とパス一致も照合する（SEC-4）。
 //!
 //! # 流れ
 //! - 親（root 必須）: `proc/`・`etc/` のみの一時 rootfs を作り、rootful 分離 → 自身を `--child <rootfs>` で
@@ -140,7 +142,7 @@ mod linux {
             .unwrap_or_else(|e| panic!("isolate failed: {e}"));
         run_child(&rootfs.0);
         println!(
-            "landlock_implicit_dev: /dev/null write, /dev/shm create allowed and outside write denied (root=true)"
+            "landlock_implicit_dev: /dev/null write, /dev/shm create, /dev/ptmx open allowed; mknod and outside write denied (root=true)"
         );
     }
 
@@ -224,6 +226,9 @@ mod linux {
             probe(K::WriteExisting, "/dev/null"),
             probe(K::CreateFile, "/dev/shm/landlock-probe"),
             probe(K::MakeDir, "/dev/shm/landlock-dir"),
+            probe(K::OpenNoCtty, "/dev/ptmx"),
+            probe(K::MakeCharDevice, "/dev/landlock-mknod"),
+            probe(K::MakeCharDevice, "/dev/shm/landlock-mknod"),
             probe(K::CreateFile, "/etc/landlock-denied"),
             probe(K::CreateFile, "/landlock-denied"),
         ];
@@ -235,14 +240,32 @@ mod linux {
         let got: Vec<Option<i32>> = o.results.iter().map(|(_, r)| *r).collect();
         assert_eq!(
             got,
-            vec![None, None, None, Some(EACCES), Some(EACCES)],
+            vec![
+                None,
+                None,
+                None,
+                None,
+                Some(EACCES),
+                Some(EACCES),
+                Some(EACCES),
+                Some(EACCES)
+            ],
             "results: {:?}",
             o.results
         );
-        // SEC-4: 拒否 2 件に対して監査レコードがちょうど 2 件・パス一致。
+        // mknod の拒否でノードが作られていない（Landlock が `mknodat(2)` の前に止める）。
+        for p in ["/dev/landlock-mknod", "/dev/shm/landlock-mknod"] {
+            assert!(
+                std::fs::symlink_metadata(p).is_err(),
+                "{p} must not be created"
+            );
+        }
+        // SEC-4: 拒否 4 件に対して監査レコードがちょうど 4 件・パス一致。
         assert!(o.audit_error.is_none(), "{:?}", o.audit_error);
-        assert_eq!(o.audit_records.len(), 2, "{:?}", o.audit_records);
+        assert_eq!(o.audit_records.len(), 4, "{:?}", o.audit_records);
         let want = [
+            Path::new("/dev/landlock-mknod"),
+            Path::new("/dev/shm/landlock-mknod"),
             Path::new("/etc/landlock-denied"),
             Path::new("/landlock-denied"),
         ];

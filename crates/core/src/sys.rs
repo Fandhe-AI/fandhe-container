@@ -3428,6 +3428,13 @@ pub(crate) fn nonblock_open_flag() -> Option<i32> {
     consts::SUPPORTED.then_some(consts::O_NONBLOCK)
 }
 
+/// `O_NOCTTY` 単体（アーキテクチャ別の値）。結合試験用の観測（`crate::exec` の `LandlockAccessKind::OpenNoCtty`）が、
+/// `/dev/ptmx` を制御端末にせずに開くために使う（#1672 事後監査 P2）。対応外アーキテクチャでは `None`（fail-closed）。
+/// 定数を返すだけで syscall を呼ばない。
+pub(crate) fn noctty_open_flag() -> Option<i32> {
+    consts::SUPPORTED.then_some(consts::O_NOCTTY)
+}
+
 /// `O_NONBLOCK | O_NOFOLLOW | O_DIRECTORY`。親ディレクトリを 1 要素ずつ symlink 非追従で開くための値。
 ///
 /// `crate::open_flags` が呼ぶ。対応外アーキテクチャでは `None`（fail-closed）。`unsafe` を含まない。

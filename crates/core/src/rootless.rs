@@ -37,7 +37,7 @@
 //! | `setgroups` | Direct は `deny` を書く。Helper は `newgidmap` に任せる |
 //! | unshare（PID / mount / UTS / IPC）・`MS_PRIVATE`・`sethostname` | 写像後の user namespace 内 uid 0 で実行 |
 //! | 自己 bind・`/proc` マウント・`pivot_root` | user namespace が所有する mount namespace 内で実行 |
-//! | `mknod` によるデバイスノード作成 | 代替しない（`PermissionDenied` で fail-closed。ホスト `/dev` の bind は未実装） |
+//! | `mknod` によるデバイスノード作成 | 代替しない（`PermissionDenied` で fail-closed。ホスト `/dev` の bind は未実装。#1660） |
 //! | cgroup 参加 | 対象外（TASK-32・CORE-3） |
 //!
 //! # 未実装（REPAIR-3）

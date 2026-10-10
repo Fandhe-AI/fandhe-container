@@ -42,7 +42,8 @@
 //! `cfg(test)` では `bpf(2)` を呼ばず、3 つの差し込み点（`device_prog_query` / `device_prog_load` /
 //! `device_prog_attach`）が呼び出しを記録して差し込み値を返す。root で単体テストを走らせてもホストの
 //! cgroup には届かない。このため lib の試験バイナリでは入口の本番経路（実際の `bpf(2)`）は通らず、
-//! 入口の実機試験は `crates/core/tests/` に置く必要がある（#1681 の範囲）。
+//! 入口の結合試験は `crates/core/tests/cgroup_device_policy_rootless.rs` / `cgroup_device_policy_rootful.rs`
+//! （委譲 cgroup・root を要するため `#[ignore]` の実機前提テスト）に置く。
 
 use std::os::fd::BorrowedFd;
 

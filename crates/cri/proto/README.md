@@ -19,7 +19,7 @@ CRI（Container Runtime Interface）の `.proto` 定義を置くディレクト�
 
 ## ライセンス
 
-Apache-2.0（本リポジトリの `LICENSE` と同一）。著作権表記（`Copyright 2020 The Kubernetes Authors`）は `api.proto` 冒頭のヘッダをそのまま保持している。upstream のルートに NOTICE ファイルは無い。
+Apache-2.0（本リポジトリの `LICENSE-APACHE` と同一）。著作権表記（`Copyright 2020 The Kubernetes Authors`）は `api.proto` 冒頭のヘッダをそのまま保持している。upstream のルートに NOTICE ファイルは無い。
 
 ## 改変の有無
 

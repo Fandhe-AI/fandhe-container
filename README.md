@@ -58,4 +58,6 @@ make docker-ci                # 開発コンテナ内で make ci を実行（環
 
 ## ライセンス
 
-Apache License 2.0 です（[LICENSE](./LICENSE)）。spec の OSS-3 に従い中核 crate は Apache-2.0 単独とし、汎用再利用可能な補助 crate は `MIT OR Apache-2.0` を選択肢として残します。
+Apache License 2.0 です（[LICENSE-APACHE](./LICENSE-APACHE)）。spec の OSS-3 に従い中核 crate は Apache-2.0 単独とし、汎用再利用可能な補助 crate は `MIT OR Apache-2.0` を選択肢として残します。
+
+補助 crate のうち、plugin 境界機構のライブラリ `fandhe-container-plugin`（`crates/plugin/`）は `MIT OR Apache-2.0` です（[LICENSE-MIT](./LICENSE-MIT) または [LICENSE-APACHE](./LICENSE-APACHE) のいずれかを選べます）。

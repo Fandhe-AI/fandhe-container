@@ -8,7 +8,8 @@
     "^\\.claude/",
     "^\\.agents/skills/",
     "^docs/spec/",
-    "^LICENSE$",
+    "^LICENSE-APACHE$",
+    "^LICENSE-MIT$",
     "^crates/cri/proto/.*\\.proto$"
   ]
 }

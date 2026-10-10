@@ -399,7 +399,9 @@ if [ "$s_pc" -lt 1 ]; then
   exit 1
 fi
 # process_count >= 1 だけでは CLI 等の同系名プロセスでも通るため、processes に監視プロセス名があることを確かめる。
-if ! printf '%s\n' "$phase_out" | grep -Eq '"name": "fandhe-container-supervisor"'; then
+# printf から grep -q へパイプすると、出力がパイプ容量を超えたとき grep が先に終わった後の書き込みが
+# SIGPIPE（141）になり pipefail で誤って失敗するため、ヒアストリングで渡す（#1726）。
+if ! grep -Eq '"name": "fandhe-container-supervisor"' <<<"$phase_out"; then
   err "supervised-zero" "no fandhe-container-supervisor process while a container is up; not a supervised configuration"
   exit 1
 fi

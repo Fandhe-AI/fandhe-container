@@ -44,7 +44,7 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 | -------- | ---------- | ---- | ----- |
 | `libc` | =0.2.189 | syscall 宣言（全 OS） | #86 |
 | `nix` | =0.31.3 | syscall wrapper（Unix のみ cfg(unix)・feature 最小） | #86 |
-| `unicode-normalization` | =0.1.25 | パス正規化（io crate のみ） | #798 |
+| `unicode-normalization` | =0.1.25 | NFC / NFD の別表記の衝突検出（IO-5。io crate のみ。名前は正規化せず、`nfd()` で比べて衝突を構造化エラーで拒否する。#103 の決定） | #798（#1720 でそのまま使うと決定） |
 | `serde` | =1.0.229 | データシリアライズ | #138 |
 | `serde_json` | =1.0.151 | JSON（ペイロード・設定） | #138 |
 | `sha2` | =0.11.0 | SHA-256（digest 検証） | #278 |

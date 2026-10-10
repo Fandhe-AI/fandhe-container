@@ -468,7 +468,12 @@ build_launch_cmd() {
 collect_reported() {
   local -a rep=()
   [ -s "$workdir/err.log" ] || return 0
-  if jq -Rre 'fromjson? | select(type=="object" and .component=="supervisor.monitor" and .operation=="restart" and .result=="error") | "x"' "$workdir/err.log" 2>/dev/null | grep -q x; then
+  # jq の出力を grep -q へ直接パイプすると、失敗行が多く出力が複数回の書き込みになったとき、grep が先に
+  # 終わった後の jq の書き込みが SIGPIPE（141）になり、pipefail で判定が偽（失敗の見落とし）になる。
+  # 変数に取ってから照合する（#1726）。
+  local err_hits=""
+  if err_hits="$(jq -Rre 'fromjson? | select(type=="object" and .component=="supervisor.monitor" and .operation=="restart" and .result=="error") | "x"' "$workdir/err.log" 2>/dev/null)" &&
+    grep -q x <<<"$err_hits"; then
     reported_err=1
     return 0
   fi

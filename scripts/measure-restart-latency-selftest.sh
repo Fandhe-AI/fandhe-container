@@ -592,8 +592,10 @@ chk2 bad_budget_arg --print-budget --trials 0
 chk2 unknown_opt --bogus
 chk2 missing_launcher --bundle "${root}/bundle"
 
-# --help は冒頭コメントを出し、SUP-3 を明記している
-if bash "$target" --help | grep -q 'SUP-3'; then pass "help: mentions SUP-3"; else fail "help: SUP-3 missing"; fi
+# --help は冒頭コメントを出し、SUP-3 を明記している。出力（約 10 KB）を grep -q へ直接パイプすると、
+# grep が一致して先に終わった後の sed の書き込みが SIGPIPE（141）になり pipefail で偶発的に失敗するため、
+# 変数に取ってから照合する（#1726）。
+if help_out="$(bash "$target" --help)" && grep -q 'SUP-3' <<<"$help_out"; then pass "help: mentions SUP-3"; else fail "help: SUP-3 missing"; fi
 
 # --output は新規ファイルにだけ書く
 if run_case output_file 0 normal "" --trials 1 --warmup 0 --timeout 10 --output "${root}/result.json"; then

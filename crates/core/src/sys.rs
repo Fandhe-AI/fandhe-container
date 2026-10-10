@@ -5438,6 +5438,31 @@ mod tests {
         assert_eq!(kind(exe.to_str().expect("utf8 path")), 0o100_000);
     }
 
+    /// CORE-6・SEC-1・REPAIR-12（TASK-29 追補・#1659）: `/dev/null` を指す symlink を `O_PATH|O_NOFOLLOW` で
+    /// 開いた fd は symlink 自体を指し、`NotCharDevice` で拒否される。`mode` の種別ビット（`S_IFMT`）は
+    /// symlink の 0o120000。リンク先が実在する文字デバイスであること（辿れば検証を通る値であること）も先に
+    /// 確かめ、拒否の理由が `O_NOFOLLOW` で辿らなかったことにあると示す（ぶら下がりリンクでの偶然の一致を除く）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core6_sec1_verify_device_node_fd_rejects_symlink_opened_with_nofollow() {
+        use std::os::unix::fs::{FileTypeExt as _, symlink};
+        let guard = crate::test_support::TestTempDir::new("sys-devnode-symlink").expect("temp dir");
+        let link = guard.path().join("null-link");
+        symlink("/dev/null", &link).expect("symlink");
+        let followed = std::fs::metadata(&link).expect("stat through link");
+        assert!(
+            followed.file_type().is_char_device(),
+            "link target must be a char device"
+        );
+        match verify_device_node_fd(
+            open_o_path(link.to_str().expect("utf8 path")),
+            HostDeviceNode::Null,
+        ) {
+            Err(DeviceNodeError::NotCharDevice { mode }) => assert_eq!(mode & 0o170_000, 0o120_000),
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
     /// `path` を `O_PATH | O_NOFOLLOW` で開く（実機前提テストと特権なしテストの共通部品）。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn open_o_path(path: &str) -> OwnedFd {

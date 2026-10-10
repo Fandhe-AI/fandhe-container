@@ -194,6 +194,7 @@ fn f5_2b_1_gpu6_ack_rejects_requests_with_reply_body() {
         RequestCode::GetQueueNum,
         RequestCode::GetVringBase,
         RequestCode::GetConfig,
+        RequestCode::GetShmemConfig,
     ] {
         assert!(code.has_reply_body());
         assert_eq!(

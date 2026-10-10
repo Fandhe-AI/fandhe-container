@@ -26,6 +26,8 @@ pub enum SessionErrorCode {
     FdCountMismatch,
     /// fd を取らない要求に fd が付いていた。
     UnexpectedFds,
+    /// `SET_BACKEND_REQ_FD` の fd が UNIX ドメインソケットではない。
+    InvalidBackendReqFd,
     /// `VRING_NOFD`（polling モード）は未対応。
     NofdUnsupported,
     /// 未対応の要求（`SET_CONFIG`）。
@@ -65,6 +67,7 @@ impl SessionErrorCode {
             Self::InvalidValue => "INVALID_VALUE",
             Self::FdCountMismatch => "FD_COUNT_MISMATCH",
             Self::UnexpectedFds => "UNEXPECTED_FDS",
+            Self::InvalidBackendReqFd => "INVALID_BACKEND_REQ_FD",
             Self::NofdUnsupported => "NOFD_UNSUPPORTED",
             Self::UnsupportedRequest => "UNSUPPORTED_REQUEST",
             Self::KickClosed => "KICK_CLOSED",
@@ -91,6 +94,7 @@ impl SessionErrorCode {
             Self::InvalidValue => "request value is out of range",
             Self::FdCountMismatch => "attached fd count does not match the request",
             Self::UnexpectedFds => "fds are attached to a request that takes none",
+            Self::InvalidBackendReqFd => "backend request fd is not a unix domain socket",
             Self::NofdUnsupported => "VRING_NOFD (polling mode) is not supported",
             Self::UnsupportedRequest => "request is not supported by this backend",
             Self::KickClosed => "kick fd was closed",

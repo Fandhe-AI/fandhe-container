@@ -43,10 +43,14 @@
 //! - **失敗時の後始末**: rootfs はホスト上のディレクトリの bind mount のため、自動作成したマウント先
 //!   ディレクトリはプロセスを破棄しても残る。失敗時は、この呼び出しでマウントした tmpfs を逆順に
 //!   `umount2(MNT_DETACH)` で外し、この呼び出しの `mkdirat` が成功した要素だけを逆順に `unlinkat(AT_REMOVEDIR)`
-//!   で削除する（空ディレクトリしか消えないため、既存の内容は消さない）。後始末は最善努力で、失敗しても
-//!   元のエラーを返す。fd 固定後に第三者が改名した要素は追跡しない。呼び出し後もプロセスは破棄する
-//!   （`crate::exec` のモジュール doc の契約）。自分のマウントは付け替え直後に fd を保持するため、事後検証に
-//!   通らなかった件も外せる
+//!   で削除する（空ディレクトリしか消えないため、既存の内容は消さない）。後始末は最善努力で、元のエラー
+//!   （code・stage・violation）を保って返す。fd 固定後に第三者が改名した要素は追跡しない。呼び出し後もプロセスは
+//!   破棄する（`crate::exec` のモジュール doc の契約）。自分のマウントは付け替え直後に fd を保持するため、事後検証に
+//!   通らなかった件も外せる。umount は fd を直接指す syscall が無いため `/proc/thread-self/fd/N` 経由になり、
+//!   `/proc` が見えない等で **umount に失敗したら黙らず**、元のエラーの message に
+//!   `; cleanup failed: umount2(<dest>) failed: <reason>` を併記する（失敗するとマウント先ディレクトリの削除も
+//!   `EBUSY` で残るため、成功を装わない。REPAIR-4・#1620）。ディレクトリ削除の失敗は従来どおり併記せず打ち切る
+//!   （umount が成功していれば残るのは自分で作った空ディレクトリだけのため）
 //! - **同一スレッド**: `MountIsolation::establish` と同じスレッドで呼ぶ
 //!
 //! # 未対応（REPAIR-3: 実装済みを装わない）
@@ -235,8 +239,8 @@ fn mount_tmpfs_at(
         let result = apply_one(root, &rootfs, spec, &mut state, is_shared, before_attach);
         applied.push(state);
         if let Err(e) = result {
-            roll_back(root, &rootfs, &applied);
-            return Err(e);
+            let failures = roll_back(root, &rootfs, &applied);
+            return Err(with_rollback_failures(e, &failures));
         }
         mounts.push(TmpfsMountOutcome {
             destination: spec.destination.as_str().to_owned(),
@@ -259,19 +263,66 @@ pub(super) struct Applied<'a> {
     pub(super) mounted: Option<OwnedFd>,
 }
 
+/// 後始末で umount に失敗した 1 件（宛先の表示形と失敗理由）。元のエラーへの併記に使う（#1620）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RollbackFailure {
+    /// [`display_destination`] を通した宛先（エスケープ・切り詰め済み）。
+    pub(super) destination: String,
+    /// 失敗理由。
+    pub(super) error: SysError,
+}
+
+/// 後始末の umount 失敗を、元のエラーの message に併記する（`code`・`stage`・`violation` は保つ）。
+///
+/// 件数は集合側の上限で抑えられている。失敗が無ければ `err` をそのまま返す。
+pub(super) fn with_rollback_failures(
+    mut err: ExecError,
+    failures: &[RollbackFailure],
+) -> ExecError {
+    for f in failures {
+        err.message.push_str(&format!(
+            "; cleanup failed: umount2({}) failed: {}",
+            f.destination,
+            super::describe(f.error)
+        ));
+    }
+    err
+}
+
 /// 失敗時の後始末（最善努力）。新しい順に、マウントした tmpfs を外してから、作成した要素を深い順に消す。
 ///
 /// 解除するのは、付け替え時に得た自分のマウントの fd が指すマウントだけで、名前から開き直した先は
 /// 解除しない（適用後に名前の位置が差し替わっていても、別のマウントを外さない）。作成した要素は `root` から名前で辿り
 /// （symlink は辿らない）、`unlinkat(AT_REMOVEDIR)` は空ディレクトリしか消さないため既存の内容は壊さない。
 /// 途中で失敗した件はそこで打ち切り、残りの件は続ける。
-pub(super) fn roll_back(root: BorrowedFd<'_>, rootfs: &std::path::Path, applied: &[Applied<'_>]) {
+///
+/// umount の失敗は戻り値で返し、呼び出し元が [`with_rollback_failures`] で元のエラーに併記する（黙って捨てない。
+/// fd を直接指す umount が無く `/proc/thread-self/fd/N` 経由のため、`/proc` が見えないと失敗する）。
+/// ディレクトリ削除の失敗は従来どおり返さない。
+pub(super) fn roll_back(
+    root: BorrowedFd<'_>,
+    rootfs: &std::path::Path,
+    applied: &[Applied<'_>],
+) -> Vec<RollbackFailure> {
     use std::os::unix::ffi::OsStrExt as _;
+    let mut failures = Vec::new();
     for state in applied.iter().rev() {
-        if let Some(dir) = &state.mounted
-            && let Ok(target) = CString::new(format!("/proc/thread-self/fd/{}", dir.as_raw_fd()))
-        {
-            let _ = umount_tmpfs_syscall(&target);
+        if let Some(dir) = &state.mounted {
+            let destination = display_destination(&format!(
+                "/{}",
+                state
+                    .names
+                    .iter()
+                    .map(|n| n.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            ));
+            let result = CString::new(format!("/proc/thread-self/fd/{}", dir.as_raw_fd()))
+                .map_err(|_| SysError::Os(sys::EINVAL))
+                .and_then(|target| umount_tmpfs_syscall(&target));
+            if let Err(error) = result {
+                failures.push(RollbackFailure { destination, error });
+            }
         }
         for &index in state.created.iter().rev() {
             let (Some(name), Some(prefix)) = (state.names.get(index), state.names.get(..index))
@@ -295,6 +346,7 @@ pub(super) fn roll_back(root: BorrowedFd<'_>, rootfs: &std::path::Path, applied:
             }
         }
     }
+    failures
 }
 
 fn apply_one(
@@ -579,6 +631,9 @@ fn umount_tmpfs_syscall(target: &std::ffi::CStr) -> Result<(), SysError> {
 /// dry-run: `umount2(2)` を呼ばず、解決した対象を記録する。
 #[cfg(test)]
 fn umount_tmpfs_syscall(target: &std::ffi::CStr) -> Result<(), SysError> {
+    if let Some(e) = tests::UMOUNT_FAIL.with(|f| f.take()) {
+        return Err(e);
+    }
     let resolved = std::fs::read_link(target.to_string_lossy().as_ref())
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -600,6 +655,12 @@ pub(super) mod tests {
     thread_local! {
         pub(in crate::exec) static UMOUNTS: std::cell::RefCell<Vec<String>> =
             const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    thread_local! {
+        /// 次の `umount_tmpfs_syscall` に返させる失敗（後始末の失敗の注入用）。
+        pub(in crate::exec) static UMOUNT_FAIL: std::cell::Cell<Option<SysError>> =
+            const { std::cell::Cell::new(None) };
     }
 
     pub(in crate::exec) fn take_umounts() -> Vec<String> {
@@ -996,11 +1057,75 @@ pub(super) mod tests {
                 mounted: None,
             },
         ];
-        roll_back(fd.as_fd(), &tmp.0, &applied);
+        assert!(roll_back(fd.as_fd(), &tmp.0, &applied).is_empty());
         assert_eq!(
             take_umounts(),
             vec![tmp.0.join("moved").to_string_lossy().into_owned()]
         );
         assert!(tmp.0.join("ours").is_dir());
+    }
+
+    /// REPAIR-4・SUP-12・TASK-169（#1620）: 後始末の umount 失敗は黙って捨てず、元のエラー（code・stage・
+    /// violation）を保ったまま message に併記する。
+    #[test]
+    fn repair4_sup12_task169_roll_back_failure_is_appended_to_original_error() {
+        let tmp = Tmp::new("rbfail");
+        let _ = take_umounts();
+        std::fs::create_dir_all(tmp.0.join("outside")).expect("outside");
+        symlink(tmp.0.join("outside"), tmp.0.join("link")).expect("symlink");
+        let fd = tmp.fd();
+        let s = set(&[("/scratch/a", None), ("/link/x", None)]);
+        let plain = mount_tmpfs_at(fd.as_fd(), &s, &not_shared, &|| {}).expect_err("symlink");
+        // 先頭の後始末で作った scratch は消えているので、同じ条件でもう一度、umount を失敗させて実行する。
+        assert!(!plain.message.contains("cleanup failed"));
+        UMOUNT_FAIL.with(|f| f.set(Some(SysError::Os(sys::EPERM))));
+        let err = mount_tmpfs_at(fd.as_fd(), &s, &not_shared, &|| {}).expect_err("symlink");
+        UMOUNT_FAIL.with(|f| f.set(None));
+        assert_eq!(err.stage, IsolationStage::MountTmpfs);
+        assert_eq!(err.code, plain.code);
+        assert_eq!(
+            err.violation.as_ref().map(|v| v.reason),
+            Some(ViolationReason::PathSymlinkOrNotDirectory)
+        );
+        assert_eq!(
+            err.message,
+            format!(
+                "{}; cleanup failed: umount2(/scratch/a) failed: Operation not permitted (os error 1)",
+                plain.message
+            )
+        );
+    }
+
+    /// REPAIR-4（#1620）: 併記する宛先は違反記録と同じエスケープを通す（ログ注入の防止）。
+    #[test]
+    fn repair4_roll_back_failure_destination_is_escaped() {
+        let tmp = Tmp::new("rbesc");
+        let _ = take_umounts();
+        std::fs::create_dir_all(tmp.0.join("ours")).expect("ours");
+        let fd = tmp.fd();
+        let ours = open_chain(fd.as_fd(), &tmp.0, &[OsStr::new("ours")], None).expect("open");
+        let applied = [Applied {
+            names: vec![OsStr::new("a\nlevel=error"), OsStr::new("b")],
+            created: Vec::new(),
+            mounted: Some(ours),
+        }];
+        UMOUNT_FAIL.with(|f| f.set(Some(SysError::Unsupported)));
+        let failures = roll_back(fd.as_fd(), &tmp.0, &applied);
+        UMOUNT_FAIL.with(|f| f.set(None));
+        assert_eq!(
+            failures,
+            vec![RollbackFailure {
+                destination: "/a\\nlevel=error/b".to_owned(),
+                error: SysError::Unsupported,
+            }]
+        );
+        let err = with_rollback_failures(
+            ExecError::new(ErrorCode::Internal, STAGE, "orig"),
+            &failures,
+        );
+        assert_eq!(
+            err.message,
+            "orig; cleanup failed: umount2(/a\\nlevel=error/b) failed: not supported by the kernel or the target architecture"
+        );
     }
 }

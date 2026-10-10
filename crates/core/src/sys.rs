@@ -240,12 +240,9 @@ mod consts {
     pub const CLONE_NEWUSER: i32 = 0x1000_0000;
     pub const CLONE_NEWPID: i32 = 0x2000_0000;
     pub const CLONE_NEWNET: i32 = 0x4000_0000;
-    pub const MS_RDONLY: u64 = 1;
     pub const MS_NOSUID: u64 = 2;
     pub const MS_NODEV: u64 = 4;
     pub const MS_NOEXEC: u64 = 8;
-    // include/uapi/linux/mount.h の `MS_REMOUNT`（全アーキテクチャ共通）。
-    pub const MS_REMOUNT: u64 = 0x20;
     pub const MS_BIND: u64 = 0x1000;
     pub const MS_REC: u64 = 0x4000;
     pub const MS_PRIVATE: u64 = 0x4_0000;
@@ -476,12 +473,9 @@ mod consts {
     pub const CLONE_NEWUSER: i32 = 0x1000_0000;
     pub const CLONE_NEWPID: i32 = 0x2000_0000;
     pub const CLONE_NEWNET: i32 = 0x4000_0000;
-    pub const MS_RDONLY: u64 = 1;
     pub const MS_NOSUID: u64 = 2;
     pub const MS_NODEV: u64 = 4;
     pub const MS_NOEXEC: u64 = 8;
-    // include/uapi/linux/mount.h の `MS_REMOUNT`（全アーキテクチャ共通）。
-    pub const MS_REMOUNT: u64 = 0x20;
     pub const MS_BIND: u64 = 0x1000;
     pub const MS_REC: u64 = 0x4000;
     pub const MS_PRIVATE: u64 = 0x4_0000;
@@ -723,11 +717,9 @@ mod consts {
     pub const CLONE_NEWUSER: i32 = 0;
     pub const CLONE_NEWPID: i32 = 0;
     pub const CLONE_NEWNET: i32 = 0;
-    pub const MS_RDONLY: u64 = 0;
     pub const MS_NOSUID: u64 = 0;
     pub const MS_NODEV: u64 = 0;
     pub const MS_NOEXEC: u64 = 0;
-    pub const MS_REMOUNT: u64 = 0;
     pub const MS_BIND: u64 = 0;
     pub const MS_REC: u64 = 0;
     pub const MS_PRIVATE: u64 = 0;
@@ -1344,7 +1336,7 @@ pub(crate) const TMPFS_MAGIC: i64 = 0x0102_1994;
 /// `crate::exec` の exec 再適用が、スレッド数の取得元が本物の procfs であることを確かめるのに使う（SUP-6）。
 pub(crate) const PROC_MAGIC: i64 = 0x9fa0;
 
-/// [`mount_tmpfs_on`]・[`remount_read_only_at`] に渡せるフラグ。可変なのは読み取り専用と実行許可の 2 値だけで、
+/// [`mount_tmpfs_on`] に渡せるフラグ。可変なのは読み取り専用と実行許可の 2 値だけで、
 /// `nosuid`・`nodev` は常に付与する（任意のビットを渡せない型にして SEC-1 の fail-closed を保つ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TmpfsMountFlags {
@@ -1353,19 +1345,6 @@ pub(crate) struct TmpfsMountFlags {
 }
 
 impl TmpfsMountFlags {
-    /// `mount(2)`（`MS_REMOUNT` による再マウント）の flags 値（`MS_NOSUID|MS_NODEV` は固定）。
-    /// 最初のマウントは新マウント API で [`Self::attr_bits`] を使う。
-    pub(crate) fn bits(self) -> u64 {
-        let mut f = consts::MS_NOSUID | consts::MS_NODEV;
-        if self.read_only {
-            f |= consts::MS_RDONLY;
-        }
-        if !self.exec {
-            f |= consts::MS_NOEXEC;
-        }
-        f
-    }
-
     /// `fsmount(2)` の `attr_flags` 値（`MOUNT_ATTR_NOSUID|MOUNT_ATTR_NODEV` は固定）。
     /// `MS_*` と数値が同じでも別の名前つき定数から組む（流用しない）。
     pub(crate) fn attr_bits(self) -> u32 {
@@ -1885,7 +1864,7 @@ fn open_tree_clone_raw(node: RawFd) -> Result<OwnedFd, SysError> {
 }
 
 /// `mount_setattr(2)` の `struct mount_attr`（include/uapi/linux/mount.h。`MOUNT_ATTR_SIZE_VER0` = 32 バイト）。
-/// 値は [`rootfs_nodev_mount_attr`] だけが作る（任意のビットを渡す経路を持たない。REPAIR-2・SEC-1）。
+/// 値は [`rootfs_nodev_mount_attr`]・[`read_only_mount_attr`] だけが作る（任意のビットを渡す経路を持たない。REPAIR-2・SEC-1）。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MountAttr {
@@ -1906,6 +1885,18 @@ const fn rootfs_nodev_mount_attr() -> MountAttr {
     }
 }
 
+/// inject の tmpfs に足す属性。`rdonly` を足すだけで、ロック済みの `nosuid`・`nodev`・`noexec` を含め既存の属性は
+/// 外さない（`attr_clr` = 0）。`MS_REMOUNT` と違い superblock ではなくマウント単位の ro になる（SUP-12・SEC-1・#1620）。
+#[cfg_attr(test, allow(dead_code))]
+const fn read_only_mount_attr() -> MountAttr {
+    MountAttr {
+        attr_set: consts::MOUNT_ATTR_RDONLY as u64,
+        attr_clr: 0,
+        propagation: 0,
+        userns_fd: 0,
+    }
+}
+
 /// `mount_setattr(2)` の `flags`。`AT_EMPTY_PATH` のみで、`AT_RECURSIVE` は付けない（mount top 1 枚だけに掛ける）。
 #[cfg_attr(test, allow(dead_code))]
 const fn mount_setattr_flags() -> u32 {
@@ -1917,6 +1908,20 @@ const fn mount_setattr_flags() -> u32 {
 #[cfg(test)]
 pub(crate) fn rootfs_nodev_call_params() -> (u64, u64, u64, u64, u32, usize) {
     let a = rootfs_nodev_mount_attr();
+    (
+        a.attr_set,
+        a.attr_clr,
+        a.propagation,
+        a.userns_fd,
+        mount_setattr_flags(),
+        std::mem::size_of::<MountAttr>(),
+    )
+}
+
+/// 単体テストの dry-run が記録する、[`set_mount_read_only`] と同じ値の組（[`rootfs_nodev_call_params`] と同形）。
+#[cfg(test)]
+pub(crate) fn read_only_call_params() -> (u64, u64, u64, u64, u32, usize) {
+    let a = read_only_mount_attr();
     (
         a.attr_set,
         a.attr_clr,
@@ -1946,14 +1951,45 @@ pub(crate) fn set_mount_nodev(mount_top: BorrowedFd<'_>) -> Result<(), SysError>
 /// [`set_mount_nodev`] の本体。無効 fd の拒否（`EBADF`）を単体テストで確かめるために `RawFd` を受ける。
 #[cfg_attr(test, allow(dead_code))]
 fn set_mount_nodev_raw(fd: RawFd) -> Result<(), SysError> {
+    mount_setattr_empty_path_raw(fd, rootfs_nodev_mount_attr())
+}
+
+/// `mount_root`（マウントのルートを指す fd）のマウントを読み取り専用にする（`mount_setattr(2)` +
+/// `MOUNT_ATTR_RDONLY`。再帰なし）。
+///
+/// `crate::exec::inject_files` が、secrets / configs を書き終えた tmpfs を read-only にするために呼ぶ
+/// （SUP-12・TASK-169.4.2・SEC-1・#1620）。`/proc/thread-self/fd/N` のパス文字列を経由せず、`AT_EMPTY_PATH` で
+/// fd 自身を対象にするため、パスの再解決の余地がない。属性は足すだけ（`attr_clr` = 0）で、user namespace 内で
+/// ロックされた `nosuid`・`nodev`・`noexec` を落とさない。
+///
+/// 意味論: `MS_REMOUNT` が superblock ごと ro にするのに対し、本関数はこのマウントの `MNT_READONLY` だけを立てる。
+/// 呼び出し側は同じ superblock の別マウントを作らないため、コンテナから見た保証（`EROFS`）は変わらない。
+/// 書き込み中の fd が残っていると `EBUSY` になるので、呼び出し前にすべて閉じておくこと。
+/// fd がマウントのルートでないと `EINVAL`。必要なカーネルは Linux 5.12 以降で、`ENOSYS` は
+/// [`SysError::Unsupported`] で返し `mount(2)` へは縮退しない。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn set_mount_read_only(mount_root: BorrowedFd<'_>) -> Result<(), SysError> {
+    set_mount_read_only_raw(mount_root.as_raw_fd())
+}
+
+/// [`set_mount_read_only`] の本体。無効 fd の拒否を単体テストで確かめるために `RawFd` を受ける。
+#[cfg_attr(test, allow(dead_code))]
+fn set_mount_read_only_raw(fd: RawFd) -> Result<(), SysError> {
+    mount_setattr_empty_path_raw(fd, read_only_mount_attr())
+}
+
+/// `mount_setattr(fd, "", AT_EMPTY_PATH, attr, 32)` の共通本体。`attr` は固定の const 構築子
+/// （[`rootfs_nodev_mount_attr`]・[`read_only_mount_attr`]）の値だけが渡る（本関数は private）。
+#[cfg_attr(test, allow(dead_code))]
+fn mount_setattr_empty_path_raw(fd: RawFd, attr: MountAttr) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
     let nr = consts::SYS_MOUNT_SETATTR.get()?;
-    let attr = rootfs_nodev_mount_attr();
     // SAFETY: `fd` は fd 番号の整数で、カーネルが検証する（無効なら `EBADF`）。パスは静的な空文字列（NUL 終端）で、
     // `AT_EMPTY_PATH` により fd 自身が対象になる。`attr` は呼び出しの間生存する 32 バイトの `repr(C)` で、
-    // カーネルは読むだけ（`size` は構造体の大きさ）。副作用は fd が指す 1 マウントへの nodev 追加に限る。
+    // カーネルは読むだけ（`size` は構造体の大きさ）。属性は `attr_clr` = 0 の固定構築子由来で、
+    // 副作用は fd が指す 1 マウントへの属性の追加（nodev または rdonly）に限る。
     let rc = unsafe {
         syscall(
             nr,
@@ -2143,43 +2179,11 @@ pub(crate) fn mount_devpts_on(
     Ok(mnt_fd)
 }
 
-/// `target`（マウントのルート）の tmpfs を、読み取り専用へ再マウントする（`MS_REMOUNT`）。
-///
-/// `crate::exec::inject_files` が、secrets / configs を書き終えた tmpfs を read-only にするために呼ぶ
-/// （SUP-12・TASK-169.4.2）。`flags` は最初のマウントと同じ [`TmpfsMountFlags`] を渡し、`read_only` は
-/// 本関数が強制的に真にする。user namespace 内ではロックされたフラグ（`nosuid`・`nodev`・`noexec`）を
-/// 落とす再マウントが `EPERM` になるため、最初のマウントと同じビットを必ず併せて渡す。data は NULL
-/// （既存の size / mode を保持する）。`target` は検証済みの fd を指す `/proc/thread-self/fd/N`。
-// テストビルドでは `crate::exec` の dry-run 差し込み点が本関数を呼ばないため dead_code を許可する。
-#[cfg_attr(test, allow(dead_code))]
-pub(crate) fn remount_read_only_at(target: &CStr, flags: TmpfsMountFlags) -> Result<(), SysError> {
-    if !consts::SUPPORTED {
-        return Err(SysError::Unsupported);
-    }
-    let flags = TmpfsMountFlags {
-        read_only: true,
-        ..flags
-    };
-    // SAFETY: `target` は `&CStr` の借用で NUL 終端かつ呼び出しの間生存する。source / fstype / data は
-    // NULL（`MS_REMOUNT` ではカーネルが参照しない。data が NULL のため既存のマウントオプションを保つ）。
-    // flags は `TmpfsMountFlags::bits` で組んだ値に `MS_REMOUNT` を足したのみ。副作用は呼び出しスレッドの
-    // mount namespace 内の 1 マウントのフラグ変更に限る。
-    let rc = unsafe {
-        mount(
-            core::ptr::null(),
-            target.as_ptr(),
-            core::ptr::null(),
-            consts::MS_REMOUNT | flags.bits(),
-            core::ptr::null(),
-        )
-    };
-    if rc == -1 { Err(last_error()) } else { Ok(()) }
-}
-
 /// `target` のマウントを `MNT_DETACH` で切り離す（`umount2(target, MNT_DETACH)`）。
 ///
-/// `crate::exec::mount_tmpfs` の失敗時の後始末が、自分でマウントした tmpfs のルートを開き直した
-/// O_PATH fd を指す `/proc/thread-self/fd/N` を渡す（magic link を fd の実体へ解決させるため
+/// `crate::exec::mount_tmpfs`・`inject_files` の失敗時の後始末が、自分でマウントした tmpfs のルートを指す
+/// fd の `/proc/thread-self/fd/N` を渡す（fd を直接指定して外す syscall が無いためパス経由になり、`/proc` が
+/// 見えないと失敗する。呼び出し元は失敗を元のエラーに併記する。#1620）（magic link を fd の実体へ解決させるため
 /// `UMOUNT_NOFOLLOW` は付けない）。`target` がマウントのルートでなければカーネルが `EINVAL` で拒否する。
 // テストビルドでは `crate::exec` の dry-run 差し込み点が本関数を呼ばないため dead_code を許可する。
 #[cfg_attr(test, allow(dead_code))]
@@ -4502,11 +4506,6 @@ mod tests {
     /// SUP-12（TASK-169.2）: tmpfs のフラグは nosuid・nodev を常に含み、可変なのは ro / exec だけ。
     #[test]
     fn sup12_task169_2_tmpfs_flags_are_exact() {
-        let f = |read_only, exec| TmpfsMountFlags { read_only, exec }.bits();
-        assert_eq!(f(false, false), 2 | 4 | 8);
-        assert_eq!(f(true, false), 1 | 2 | 4 | 8);
-        assert_eq!(f(false, true), 2 | 4);
-        assert_eq!(f(true, true), 1 | 2 | 4);
         assert_eq!(TMPFS_MAGIC, 0x0102_1994);
     }
 
@@ -4775,6 +4774,11 @@ mod tests {
                 (0x4, 0, 0, 0, 0x1000, 32),
                 "attr_set, attr_clr, propagation, userns_fd, flags, size"
             );
+            assert_eq!(
+                read_only_call_params(),
+                (0x1, 0, 0, 0, 0x1000, 32),
+                "SUP-12 #1620: rdonly だけを足す"
+            );
             // AT_RECURSIVE（0x8000）は付けない。
             assert_eq!(mount_setattr_flags() & 0x8000, 0);
         }
@@ -4801,6 +4805,16 @@ mod tests {
     #[test]
     fn sec1_set_mount_nodev_rejects_invalid_fd() {
         match set_mount_nodev_raw(-1) {
+            Err(SysError::Os(e)) => assert!(e == EBADF || e == EPERM, "errno {e}"),
+            Err(SysError::Unsupported) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// SUP-12（#1620）: 無効 fd は失敗する（検査順の事情は `sec1_set_mount_nodev_rejects_invalid_fd` と同じ）。
+    #[test]
+    fn sup12_set_mount_read_only_rejects_invalid_fd() {
+        match set_mount_read_only_raw(-1) {
             Err(SysError::Os(e)) => assert!(e == EBADF || e == EPERM, "errno {e}"),
             Err(SysError::Unsupported) => {}
             other => panic!("unexpected: {other:?}"),
@@ -5004,10 +5018,9 @@ mod tests {
         );
     }
 
-    /// SUP-12（TASK-169.4.2）: 再マウント・作成系フラグの定数値（x86_64・aarch64 共通）。
+    /// SUP-12（TASK-169.4.2）: 作成系フラグの定数値（x86_64・aarch64 共通）。
     #[test]
     fn sup12_task169_4_2_inject_consts_are_exact() {
-        assert_eq!(consts::MS_REMOUNT, 0x20);
         assert_eq!(
             (consts::O_CREAT, consts::O_EXCL, consts::O_WRONLY),
             (0o100, 0o200, 1)

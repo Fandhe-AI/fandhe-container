@@ -5,8 +5,8 @@
 //! CLI（TASK-79）や stack（TOML）が渡す Docker 互換の指定（名前・内容の出所・マウント先・モード）を検証して
 //! 保持し、[`ContainerOptions::injected_files`](super::ContainerOptions::injected_files) が core の
 //! [`InjectedFileSet`]（検証済みの仕様型）へ変換する。実注入は core の `exec::inject_files` が
-//! 「`mount_tmpfs` の後・`pivot_root` の前」で行う（親ディレクトリごとの専用 tmpfs へ書き込み、read-only へ
-//! 再マウントする。supervisor → core の一方向依存）。OS 非依存の純粋な解析・読み取りのみで、`cfg` 分岐も
+//! 「`mount_tmpfs` の後・`pivot_root` の前」で行う（親ディレクトリごとの専用 tmpfs へ書き込み、read-only に
+//! する）。supervisor → core の一方向依存）。OS 非依存の純粋な解析・読み取りのみで、`cfg` 分岐も
 //! `unsafe` も持たない。
 //!
 //! # 文法

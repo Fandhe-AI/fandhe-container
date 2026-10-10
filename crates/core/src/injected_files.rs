@@ -4,7 +4,7 @@
 //!
 //! supervisor の `container_options`（Docker 互換の指定モデル）が secrets / configs を解析して本モジュールの
 //! 型へ変換し、`crate::exec` の `inject_files`（Linux 限定・`mount_tmpfs` の後・`pivot_root` の前）が
-//! 「親ディレクトリごとの専用 tmpfs を作る → 内容を書く → read-only へ再マウントする」で実際に注入する。
+//! 「親ディレクトリごとの専用 tmpfs を作る → 内容を書く → read-only にする」で実際に注入する。
 //! 本モジュールは OS 非依存の純粋な型だけを持つ（[`crate::tmpfs`] と同じ位置づけ）。
 //!
 //! # 契約

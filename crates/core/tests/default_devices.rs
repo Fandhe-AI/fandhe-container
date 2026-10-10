@@ -419,7 +419,9 @@ mod linux {
         assert_eq!(first.devpts.pts_dir, DevptsDirStatus::Created);
         assert_eq!(first.devpts.ptmx.status, DeviceLinkStatus::Created);
 
-        pivot_root(&isolation, prepared).expect("pivot_root");
+        let report = pivot_root(&isolation, prepared).expect("pivot_root");
+        // rootfs の `nodev` の判定結果（#1676・REPAIR-4）。rootful だけが付与・事後検証済み。
+        assert_eq!(report.rootfs_nodev, rootful);
 
         // `/dev` は専用の tmpfs。rootful は `nosuid` あり・`nodev` なしまで照合する（rootless の user namespace
         // が載せたマウントのフラグはカーネルの扱いに依存するため、種別だけを照合する）。

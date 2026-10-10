@@ -89,6 +89,8 @@ pub struct PreparedRootfs {
     new_root: OwnedFd,
     /// `new_root` が属するマウントの ID（bind 前の下層マウントとは異なる）。
     new_root_mnt_id: u64,
+    /// mount top に `nodev` を足して事後検証したか（#1676）。[`PivotReport::rootfs_nodev`] へ渡す。
+    nodev: RootfsNodev,
     /// `!Send`・`!Sync` にするための印。
     _not_send: std::marker::PhantomData<*const ()>,
 }
@@ -111,6 +113,9 @@ pub struct PivotReport {
     pub old_root_detached: bool,
     /// pivot 前にマウントした `/proc` が新しい `/proc` になっているか。成功時は常に真。
     pub proc_mounted: bool,
+    /// rootfs の自己 bind に `nodev` を足して `ST_NODEV` を事後検証したか（#1676・SEC-1・REPAIR-4）。
+    /// rootful（初期 user namespace）で真、rootless で偽。判定の結果を呼び出し側が記録・照合できるよう残す。
+    pub rootfs_nodev: bool,
 }
 
 /// rootfs を pivot 可能にする（自己 bind + rootfs 配下への `/proc` マウント）。
@@ -258,6 +263,7 @@ fn prepare_rootfs_verified(rootfs: &Path, nodev: RootfsNodev) -> Result<Prepared
     Ok(PreparedRootfs {
         new_root,
         new_root_mnt_id,
+        nodev,
         _not_send: std::marker::PhantomData,
     })
 }
@@ -564,6 +570,7 @@ fn pivot_root_verified(prepared: PreparedRootfs) -> Result<PivotReport, ExecErro
         new_root_mnt_id: prepared.new_root_mnt_id,
         old_root_detached: true,
         proc_mounted: true,
+        rootfs_nodev: prepared.nodev == RootfsNodev::Apply,
     })
 }
 
@@ -963,6 +970,7 @@ mod tests {
         let prepared = PreparedRootfs {
             new_root: sys::open_dir_path_nofollow(None, c"/").unwrap(),
             new_root_mnt_id: 0,
+            nodev: RootfsNodev::Skip,
             _not_send: std::marker::PhantomData,
         };
         let err = pivot_root(&iso, prepared).unwrap_err();
@@ -989,6 +997,7 @@ mod tests {
         let prepared = PreparedRootfs {
             new_root: root,
             new_root_mnt_id: mnt_id,
+            nodev: RootfsNodev::Skip,
             _not_send: std::marker::PhantomData,
         };
         let err = pivot_root_verified(prepared).unwrap_err();

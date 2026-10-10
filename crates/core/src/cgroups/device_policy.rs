@@ -21,6 +21,13 @@
 //!   置き換え後もどちらも数 1 を返し検出できない）
 //! - `target_fd` には [`ContainerCgroup::as_fd`]（O_PATH）をそのまま渡す。`cgroup_get_from_fd` が `fdget_raw`
 //!   を使うため通る（`sys::bpf` の一次情報）。開き直しや同一性の再確認はしない
+//! - エラーの写像（PR #1705 事後監査 P3-3・ERR 系・REPAIR-4）: `EINVAL` は「型が未対応・
+//!   `CONFIG_CGROUP_BPF` が無効」と「verifier による拒否」の両方を含む。ロードでは verifier ログの有無で
+//!   分け、ログつき（verifier まで進んで拒否）は本リポの命令列の不具合として `Internal`、ログ無し（verifier
+//!   の前で失敗）はカーネルの制限として `Unimplemented` にする。`EPERM` は capability 不足・祖先の
+//!   flags 0 のプログラム（アタッチのみ）・seccomp / LSM の拒否を含むため、コードは `PermissionDenied`
+//!   1 つにまとめ、段ごとに原因の候補を message に書く。verifier のシグナル保留中の `EAGAIN` は再試行せず
+//!   `Internal` で失敗する（fail-closed）
 //! - verifier ログ（PR #1705 事後監査 P3-4）: `message` と `Display` には入れず、1 行に整えた上限つきの
 //!   写しを [`CgroupError::verifier_log`] に持たせる。呼び出し側は構造化ログへ 1 フィールドとして出し、
 //!   CRI / MCP 等の外部応答には出さない
@@ -202,10 +209,11 @@ fn apply_device_policy_at(
     verify_post_attach(&post).map(DevicePolicyOutcome::Applied)
 }
 
-const QUERY_EPERM_HINT: &str =
-    " (missing CAP_NET_ADMIN or CAP_SYS_ADMIN in the init user namespace)";
-const ATTACH_EPERM_HINT: &str =
-    " (missing capability, or an ancestor cgroup already holds a flags-0 device program)";
+/// `EPERM` の原因の候補（モジュール doc の「エラーの写像」）。ロードは `CAP_BPF` と `CAP_NET_ADMIN`
+/// （どちらも `CAP_SYS_ADMIN` で代替可）、問い合わせは `CAP_NET_ADMIN` か `CAP_SYS_ADMIN` を要する。
+const LOAD_EPERM_HINT: &str = " (missing CAP_BPF and CAP_NET_ADMIN, or CAP_SYS_ADMIN, in the init user namespace; or denied by seccomp/LSM)";
+const QUERY_EPERM_HINT: &str = " (missing CAP_NET_ADMIN or CAP_SYS_ADMIN in the init user namespace; or denied by seccomp/LSM)";
+const ATTACH_EPERM_HINT: &str = " (missing capability, an ancestor cgroup already holds a flags-0 device program, or denied by seccomp/LSM)";
 
 /// アタッチ前の照合: 既存プログラムがあれば拒否する（黙って置き換えない）。
 fn verify_pre_attach(q: &bpf::CgroupDeviceQuery) -> Result<(), CgroupError> {
@@ -296,7 +304,7 @@ fn bpf_load_error(e: &bpf::BpfProgLoadError) -> CgroupError {
         )
         .with_verifier_log(log);
     }
-    bpf_sys_error(step, "BPF_PROG_LOAD", e.cause, QUERY_EPERM_HINT)
+    bpf_sys_error(step, "BPF_PROG_LOAD", e.cause, LOAD_EPERM_HINT)
 }
 
 // ---------------------------------------------------------------------------------------------

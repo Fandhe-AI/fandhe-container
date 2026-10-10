@@ -31,7 +31,8 @@
 //!   孫が残り得る）または直接の子の未回収（`Unreaped`）が起きた場合、stderr へ 1 行の JSON
 //!   （`{"event":"plugin_child_cleanup","op":"drop","outcome":"error","reason":"group_kill_failed"|"unreaped"}`。
 //!   `unreaped` のみ保持中の `pid` を整数で付す）を 1 回だけ出す。書き込み失敗は無視し、plugin 由来の文字列は
-//!   載せない。`unreaped_error` で報告済みの子と、回収済み・他所で回収された（`Lost`）子は記録しない。
+//!   載せない。`unreaped_error` で報告済みの子と、`Drop` の前に明示的な経路で手放した子（回収済み・他所で回収された
+//!   `Lost`。そこで返したグループ停止の失敗を含む）は記録しない。
 //! - 子の環境変数は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ設定する（資格情報を継承させない）。
 //!   stdin / stdout は null。stderr は親へ継承させず、専用の UNIX ソケット対で受けて
 //!   [`OneShotStderr`] として返す（untrusted。保持は [`ONE_SHOT_STDERR_MAX_BYTES`] まで。超過分は
@@ -891,8 +892,14 @@ impl ChildGuard {
     ///
     /// 報告済み（`reported_unreaped`）のときは何もしない。`Unreaped` を記録したら報告済みにして登録を
     /// 解放し、以後の `Drop` で再記録・再 kill をしない（`unreaped_error` と同じ扱い）。
+    ///
+    /// `Drop` の前に子を手放していた（`child` が `None`。回収済み・終端）ときも何もしない。手放すのは明示的な
+    /// 経路（`wait_or_kill`・`kill_and_reap` の呼び出し側・常駐の `call` / `fail_session`）だけで、そこで
+    /// 残った失敗（自発終了の観測後のグループ送信の失敗の印 `group_kill_failed_after_exit` を含む）は既に
+    /// 呼び出し側へ返している。ここで `kill_and_reap` を呼ぶと印から `GroupKillFailed` が再び返り、同じ
+    /// 失敗を 2 回記録するため呼ばない（子を持たない `kill_and_reap` は何も送らないので後始末は変わらない）。
     fn finish_on_drop(&mut self, emit: &mut dyn FnMut(&ChildGuardDropFailure)) {
-        if self.reported_unreaped {
+        if self.reported_unreaped || self.child.is_none() {
             return;
         }
         let pid = self.pid();

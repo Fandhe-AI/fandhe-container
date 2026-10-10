@@ -49,6 +49,7 @@ pub use mounts::{DEFAULT_SHM_SIZE_BYTES, MountOptions, ShmSize, TmpfsOption};
 pub use secrets::{InjectedFileOption, InjectedFileOptions, InjectedKind, InjectedSource};
 
 use self::env::EnvSet;
+use fandhe_container_core::dev_mounts::ImplicitDevMounts;
 use fandhe_container_core::injected_files::InjectedFileSet;
 use fandhe_container_core::rlimits::{RLIMIT_INFINITY, Rlimit, RlimitKind, Rlimits};
 use fandhe_container_core::tmpfs::TmpfsMountSet;
@@ -172,6 +173,15 @@ impl ContainerOptions {
     /// `--ipc=host` 以外では `/dev/shm` の指定が無くても既定 64 MiB の `/dev/shm` を含む（#1654）。
     pub fn tmpfs_set(&self) -> Result<TmpfsMountSet, TraitError> {
         self.mounts.to_tmpfs_set(self.ipc)
+    }
+
+    /// Landlock のルールに含める暗黙の `/dev` 系マウントを、実際に載せる tmpfs 集合（[`Self::tmpfs_set`]）から
+    /// 選ぶ（CORE-5・SUP-12・#1672 事後監査 P2）。`--ipc=host` では `/dev/shm` を載せないため
+    /// `ImplicitDevMounts::WithoutShm` になり、適用時に無い `/dev/shm` のルールで起動を拒否しない。
+    /// `tmpfs_set` と同じ検証を通し、同じ指定の矛盾はここでも拒否する。core の `landlock::build_path_rules_with_dev`
+    /// へ渡す想定で、本番の launcher からの結線は #1314 の後続（REPAIR-3）。
+    pub fn implicit_dev_mounts(&self) -> Result<ImplicitDevMounts, TraitError> {
+        Ok(ImplicitDevMounts::for_tmpfs_set(&self.tmpfs_set()?))
     }
 
     /// secrets / configs を設定する（SUP-12・TASK-169.4.2）。
@@ -394,6 +404,35 @@ mod tests {
             clash.injected_files().unwrap_err().message(),
             "injected file directory overlaps a tmpfs mount"
         );
+    }
+
+    /// CORE-5・SUP-12（#1672 事後監査 P2）: Landlock の暗黙の `/dev` 系は、`--ipc=host`（`/dev/shm` を載せない）
+    /// では `WithoutShm`、それ以外（既定 64 MiB の `/dev/shm` が載る）では `All`。`tmpfs_set` と同じ矛盾は拒否する。
+    #[test]
+    fn core5_sup12_implicit_dev_mounts_follow_ipc_mode() {
+        assert_eq!(
+            ContainerOptions::new()
+                .with_ipc_mode(IpcMode::Host)
+                .implicit_dev_mounts()
+                .unwrap(),
+            ImplicitDevMounts::WithoutShm
+        );
+        for m in [IpcMode::Private, IpcMode::Shareable] {
+            assert_eq!(
+                ContainerOptions::new()
+                    .with_ipc_mode(m)
+                    .implicit_dev_mounts()
+                    .unwrap(),
+                ImplicitDevMounts::All
+            );
+        }
+        let e = ContainerOptions::new()
+            .with_ipc_mode(IpcMode::Host)
+            .with_mounts(MountOptions::default().with_shm_size(ShmSize::parse("64m").unwrap()))
+            .implicit_dev_mounts()
+            .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "--shm-size cannot be combined with --ipc=host");
     }
 
     /// SUP-12・TASK-169.5.2: Host と --shm-size の併用は順序によらず拒否し、他の組み合わせは許可する。

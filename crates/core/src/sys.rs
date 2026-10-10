@@ -144,6 +144,19 @@ mod sysno {
     )]
     pub(super) struct SyscallNumber(i64);
 
+    impl SyscallNumber {
+        /// 固定値テスト専用の生の番号（対応 arch のみ）。`consts` の固定値テストが `ArchSysNo::get` を
+        /// 通した値（`get().map(SyscallNumber::raw)`）を照合するために使い、本体のコードからは使わない。
+        #[cfg(all(
+            test,
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        pub(super) const fn raw(self) -> i64 {
+            self.0
+        }
+    }
+
     /// `consts` に置く、この arch での syscall 番号の定義。取り出し口は [`ArchSysNo::get`] のみ。
     #[derive(Clone, Copy)]
     pub(super) struct ArchSysNo(
@@ -202,16 +215,6 @@ mod sysno {
         pub(super) const fn get(self) -> Result<SyscallNumber, SysError> {
             let () = self.0;
             Err(SysError::Unsupported)
-        }
-
-        /// 固定値テスト専用の生の番号（対応 arch のみ）。
-        #[cfg(all(
-            test,
-            target_pointer_width = "64",
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ))]
-        pub(super) const fn raw(self) -> Option<i64> {
-            Some(self.0)
         }
     }
 }
@@ -3843,8 +3846,11 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
     #[test]
     fn core5_probe_consts_are_exact_x86_64() {
-        assert_eq!(consts::SYS_PTRACE.raw(), Some(101));
-        assert_eq!(consts::SYS_KEXEC_LOAD.raw(), Some(246));
+        assert_eq!(consts::SYS_PTRACE.get().map(SyscallNumber::raw), Ok(101));
+        assert_eq!(
+            consts::SYS_KEXEC_LOAD.get().map(SyscallNumber::raw),
+            Ok(246)
+        );
         assert_eq!(consts::PTRACE_CONT, 7);
         assert_eq!(consts::KEXEC_SEGMENT_MAX, 16);
     }
@@ -3853,10 +3859,77 @@ mod tests {
     #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
     #[test]
     fn core5_probe_consts_are_exact_aarch64() {
-        assert_eq!(consts::SYS_PTRACE.raw(), Some(117));
-        assert_eq!(consts::SYS_KEXEC_LOAD.raw(), Some(104));
+        assert_eq!(consts::SYS_PTRACE.get().map(SyscallNumber::raw), Ok(117));
+        assert_eq!(
+            consts::SYS_KEXEC_LOAD.get().map(SyscallNumber::raw),
+            Ok(104)
+        );
         assert_eq!(consts::PTRACE_CONT, 7);
         assert_eq!(consts::KEXEC_SEGMENT_MAX, 16);
+    }
+
+    /// CORE-1・CORE-2・TASK-30.1（#1619）: pidfd 系の syscall 番号を `ArchSysNo::get` 経由で照合する。
+    /// 424・434 は全アーキテクチャ共通の番号帯（x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h）。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn core1_task30_pidfd_syscall_numbers_are_exact() {
+        assert_eq!(
+            (
+                consts::SYS_PIDFD_SEND_SIGNAL.get().map(SyscallNumber::raw),
+                consts::SYS_PIDFD_OPEN.get().map(SyscallNumber::raw)
+            ),
+            (Ok(424), Ok(434))
+        );
+    }
+
+    /// SEC-1・CORE-5（#1619）: 対応 arch の `ArchSysNo::new` は 0 以下を拒否する。`SYS_*` の `const` では
+    /// コンパイルエラーになり、`const` 文脈の外で呼んだ場合も番号を作らずに panic する。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    #[should_panic(expected = "syscall number must be positive")]
+    fn sec1_issue1619_arch_sysno_new_rejects_zero() {
+        let zero = std::hint::black_box(0_i64);
+        let _ = ArchSysNo::new(zero);
+    }
+
+    /// SEC-1・CORE-5（#1619）: 対応外 arch（x32・aarch64 ILP32・riscv64 等）では、どの番号も `get` が
+    /// `Unsupported` を返し発行されない。CI の 3 OS では対象外で、対応外 target の型検査でだけ確かめる。
+    #[cfg(not(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
+    #[test]
+    fn sec1_issue1619_unsupported_arch_get_is_unsupported() {
+        let numbers = [
+            consts::SYS_PIVOT_ROOT,
+            consts::SYS_CLOSE_RANGE,
+            consts::SYS_MOVE_MOUNT,
+            consts::SYS_FSOPEN,
+            consts::SYS_FSCONFIG,
+            consts::SYS_FSMOUNT,
+            consts::SYS_OPEN_TREE,
+            consts::SYS_PIDFD_SEND_SIGNAL,
+            consts::SYS_PIDFD_OPEN,
+            consts::SYS_EXECVEAT,
+            consts::SYS_MEMFD_CREATE,
+            consts::SYS_LANDLOCK_CREATE_RULESET,
+            consts::SYS_LANDLOCK_ADD_RULE,
+            consts::SYS_LANDLOCK_RESTRICT_SELF,
+            consts::SYS_CAPGET,
+            consts::SYS_CAPSET,
+            consts::SYS_GETGROUPS,
+            consts::SYS_SETGROUPS,
+            consts::SYS_PTRACE,
+            consts::SYS_KEXEC_LOAD,
+        ];
+        let errors: Vec<_> = numbers.iter().map(|n| n.get().err()).collect();
+        assert_eq!(errors, vec![Some(SysError::Unsupported); 20]);
     }
 
     /// CORE-5・TASK-39.1: Landlock 関連定数の固定値照合（arch ごとに個別定義した値の誤り検出）。
@@ -3866,7 +3939,12 @@ mod tests {
     ))]
     #[test]
     fn core5_landlock_consts_are_exact() {
-        assert_eq!(consts::SYS_LANDLOCK_CREATE_RULESET.raw(), Some(444));
+        assert_eq!(
+            consts::SYS_LANDLOCK_CREATE_RULESET
+                .get()
+                .map(SyscallNumber::raw),
+            Ok(444)
+        );
         assert_eq!(consts::LANDLOCK_CREATE_RULESET_VERSION, 1);
         assert_eq!(consts::EOPNOTSUPP, 95);
     }
@@ -3878,8 +3956,16 @@ mod tests {
     ))]
     #[test]
     fn core5_landlock_apply_consts_and_layout_are_exact() {
-        assert_eq!(consts::SYS_LANDLOCK_ADD_RULE.raw(), Some(445));
-        assert_eq!(consts::SYS_LANDLOCK_RESTRICT_SELF.raw(), Some(446));
+        assert_eq!(
+            consts::SYS_LANDLOCK_ADD_RULE.get().map(SyscallNumber::raw),
+            Ok(445)
+        );
+        assert_eq!(
+            consts::SYS_LANDLOCK_RESTRICT_SELF
+                .get()
+                .map(SyscallNumber::raw),
+            Ok(446)
+        );
         assert_eq!(consts::LANDLOCK_RULE_PATH_BENEATH, 1);
         assert_eq!(core::mem::size_of::<LandlockRulesetAttr>(), 24);
         assert_eq!(core::mem::size_of::<LandlockPathBeneathAttr>(), 12);
@@ -4062,13 +4148,19 @@ mod tests {
     fn sup6_task163_group_syscall_numbers_and_count_are_exact() {
         #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
         assert_eq!(
-            (consts::SYS_GETGROUPS.raw(), consts::SYS_SETGROUPS.raw()),
-            (Some(115), Some(116))
+            (
+                consts::SYS_GETGROUPS.get().map(SyscallNumber::raw),
+                consts::SYS_SETGROUPS.get().map(SyscallNumber::raw)
+            ),
+            (Ok(115), Ok(116))
         );
         #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
         assert_eq!(
-            (consts::SYS_GETGROUPS.raw(), consts::SYS_SETGROUPS.raw()),
-            (Some(158), Some(159))
+            (
+                consts::SYS_GETGROUPS.get().map(SyscallNumber::raw),
+                consts::SYS_SETGROUPS.get().map(SyscallNumber::raw)
+            ),
+            (Ok(158), Ok(159))
         );
         let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
         let groups = status
@@ -4084,8 +4176,8 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
     #[test]
     fn sec1_capability_consts_are_exact_x86_64() {
-        assert_eq!(consts::SYS_CAPGET.raw(), Some(125));
-        assert_eq!(consts::SYS_CAPSET.raw(), Some(126));
+        assert_eq!(consts::SYS_CAPGET.get().map(SyscallNumber::raw), Ok(125));
+        assert_eq!(consts::SYS_CAPSET.get().map(SyscallNumber::raw), Ok(126));
         assert_eq!(consts::LINUX_CAPABILITY_VERSION_3, 0x2008_0522);
         assert_eq!(consts::PR_CAPBSET_READ, 23);
         assert_eq!(consts::PR_CAPBSET_DROP, 24);
@@ -4097,8 +4189,8 @@ mod tests {
     #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
     #[test]
     fn sec1_capability_consts_are_exact_aarch64() {
-        assert_eq!(consts::SYS_CAPGET.raw(), Some(90));
-        assert_eq!(consts::SYS_CAPSET.raw(), Some(91));
+        assert_eq!(consts::SYS_CAPGET.get().map(SyscallNumber::raw), Ok(90));
+        assert_eq!(consts::SYS_CAPSET.get().map(SyscallNumber::raw), Ok(91));
         assert_eq!(consts::LINUX_CAPABILITY_VERSION_3, 0x2008_0522);
         assert_eq!(consts::PR_CAPBSET_READ, 23);
         assert_eq!(consts::PR_CAPBSET_DROP, 24);
@@ -4515,7 +4607,7 @@ mod tests {
             any(target_arch = "x86_64", target_arch = "aarch64")
         ))]
         {
-            assert_eq!(consts::SYS_OPEN_TREE.raw(), Some(428));
+            assert_eq!(consts::SYS_OPEN_TREE.get().map(SyscallNumber::raw), Ok(428));
             assert_eq!(
                 (
                     consts::OPEN_TREE_CLONE,
@@ -4683,22 +4775,22 @@ mod tests {
         #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
         assert_eq!(
             (
-                consts::SYS_MOVE_MOUNT.raw(),
-                consts::SYS_FSOPEN.raw(),
-                consts::SYS_FSCONFIG.raw(),
-                consts::SYS_FSMOUNT.raw()
+                consts::SYS_MOVE_MOUNT.get().map(SyscallNumber::raw),
+                consts::SYS_FSOPEN.get().map(SyscallNumber::raw),
+                consts::SYS_FSCONFIG.get().map(SyscallNumber::raw),
+                consts::SYS_FSMOUNT.get().map(SyscallNumber::raw)
             ),
-            (Some(429), Some(430), Some(431), Some(432))
+            (Ok(429), Ok(430), Ok(431), Ok(432))
         );
         #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
         assert_eq!(
             (
-                consts::SYS_MOVE_MOUNT.raw(),
-                consts::SYS_FSOPEN.raw(),
-                consts::SYS_FSCONFIG.raw(),
-                consts::SYS_FSMOUNT.raw()
+                consts::SYS_MOVE_MOUNT.get().map(SyscallNumber::raw),
+                consts::SYS_FSOPEN.get().map(SyscallNumber::raw),
+                consts::SYS_FSCONFIG.get().map(SyscallNumber::raw),
+                consts::SYS_FSMOUNT.get().map(SyscallNumber::raw)
             ),
-            (Some(429), Some(430), Some(431), Some(432))
+            (Ok(429), Ok(430), Ok(431), Ok(432))
         );
         assert_eq!(
             (
@@ -4781,9 +4873,12 @@ mod tests {
         assert_eq!(consts::MS_REC, 0x4000);
         assert_eq!(consts::MNT_DETACH, 2);
         #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-        assert_eq!(consts::SYS_PIVOT_ROOT.raw(), Some(155));
+        assert_eq!(
+            consts::SYS_PIVOT_ROOT.get().map(SyscallNumber::raw),
+            Ok(155)
+        );
         #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
-        assert_eq!(consts::SYS_PIVOT_ROOT.raw(), Some(41));
+        assert_eq!(consts::SYS_PIVOT_ROOT.get().map(SyscallNumber::raw), Ok(41));
     }
 
     /// aarch64: O_DIRECTORY / O_NOFOLLOW は arch/arm64/include/uapi/asm/fcntl.h の上書き値
@@ -4855,9 +4950,15 @@ mod tests {
     #[test]
     fn sup6_task163_sealed_copy_consts_are_exact() {
         #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-        assert_eq!(consts::SYS_MEMFD_CREATE.raw(), Some(319));
+        assert_eq!(
+            consts::SYS_MEMFD_CREATE.get().map(SyscallNumber::raw),
+            Ok(319)
+        );
         #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
-        assert_eq!(consts::SYS_MEMFD_CREATE.raw(), Some(279));
+        assert_eq!(
+            consts::SYS_MEMFD_CREATE.get().map(SyscallNumber::raw),
+            Ok(279)
+        );
         assert_eq!(consts::MFD_CLOEXEC, 0x1);
         assert_eq!(consts::MFD_ALLOW_SEALING, 0x2);
         assert_eq!(consts::MFD_EXEC, 0x10);
@@ -5128,18 +5229,24 @@ mod tests {
     #[test]
     fn core1_fork_exec_consts_are_exact() {
         #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-        assert_eq!(consts::SYS_EXECVEAT.raw(), Some(322));
+        assert_eq!(consts::SYS_EXECVEAT.get().map(SyscallNumber::raw), Ok(322));
         #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
-        assert_eq!(consts::SYS_EXECVEAT.raw(), Some(281));
+        assert_eq!(consts::SYS_EXECVEAT.get().map(SyscallNumber::raw), Ok(281));
         assert_eq!(consts::AT_EMPTY_PATH, 0x1000);
         assert_eq!(consts::O_NONBLOCK, 0o4_000);
         assert_eq!(consts::O_RDWR, 2);
         assert_eq!((consts::F_SETFD, consts::FD_CLOEXEC), (2, 1));
         assert_eq!(consts::F_DUPFD_CLOEXEC, 1030);
         #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-        assert_eq!(consts::SYS_CLOSE_RANGE.raw(), Some(436));
+        assert_eq!(
+            consts::SYS_CLOSE_RANGE.get().map(SyscallNumber::raw),
+            Ok(436)
+        );
         #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
-        assert_eq!(consts::SYS_CLOSE_RANGE.raw(), Some(436));
+        assert_eq!(
+            consts::SYS_CLOSE_RANGE.get().map(SyscallNumber::raw),
+            Ok(436)
+        );
         assert_eq!(consts::CLOSE_RANGE_CLOEXEC, 4);
         assert_eq!(consts::WNOHANG, 1);
         assert_eq!((consts::SIGKILL, consts::SIGPIPE), (9, 13));

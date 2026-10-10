@@ -252,10 +252,13 @@ fn prog_load_raw(attr: &BpfProgLoadAttr) -> Result<OwnedFd, SysError> {
     // `struct bpf_insn` と同レイアウト）、`license` は静的な NUL 終端文字列、`log_buf` は `log_size`
     // 以下だけカーネルが書くスタック上のバッファ（または 0）を指し、いずれも呼び出し元の関数が
     // 呼び出しの間保持する。`insn_cnt` は実際の命令数に一致する。未使用の領域は 0。ポインタは
-    // カーネルが複写するだけで保持しない。属性そのものへの書き戻しは無いため const ポインタでよい
-    // （v6.12: `__sys_bpf` は属性を複写して読むだけで、`bpf_prog_load` は属性へ書かない。唯一の
-    // 書き戻しである `bpf_check` の `log_true_size` は `uattr_size >= offsetofend(union bpf_attr,
-    // log_true_size)` のときだけで、size 72 はこのオフセットに届かない）。
+    // カーネルが複写するだけで保持しない。size 72 では属性そのものへの書き戻しが起きないため const
+    // ポインタでよい（v6.12: `__sys_bpf` は属性を複写して読むだけで、`bpf_prog_load` は属性へ書かない。
+    // 属性への書き戻しは `bpf_check` の `log_true_size`〔`uattr_size >= offsetofend(union bpf_attr,
+    // log_true_size)` のとき〕と、BTF / CO-RE の `func_info_rec_size`・`line_info_rec_size`・
+    // `core_relo_rec_size`〔それぞれ `func_info_cnt`・`line_info_cnt`・`core_relo_cnt` が 0 でない
+    // とき〕だけ。size 72 では `log_true_size` のオフセットに届かず、各 cnt は 72 バイトの外にあって
+    // カーネルが 0 で埋めるため、どちらの条件も成り立たない）。
     let rc = unsafe {
         syscall(
             nr,

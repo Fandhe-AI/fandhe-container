@@ -67,3 +67,7 @@ dispatch2 = { version = "=0.3.1", default-features = false }
 # Windows API の FFI 宣言（WIN-1・TASK-67.3）。承認: Issue #371・TASK-67.hdep1。
 # crates/platform-windows から cfg(windows) ターゲット限定で参照し、features はメンバー側で使う名前空間のみ列挙する。
 windows-sys = { version = "=0.61.2", default-features = false }
+# NFC/NFD の別表記の衝突検出（IO-5・TASK-21.1）。承認: Issue #798（2026-09-26）、#1720（2026-10-10）で再確認。
+# 配置は crates/io に限る。使うのは正準分解（nfd()）だけで、互換分解・合成は使わない。
+# 純 Rust・MIT OR Apache-2.0。推移依存は tinyvec（alloc）のみ。nfd() は alloc だけで動くため std を無効化する。
+unicode-normalization = { version = "=0.1.25", default-features = false }

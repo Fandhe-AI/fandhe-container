@@ -16,6 +16,22 @@ use fandhe_container_io::{
     CaseCollisionSet, IoErrorCode, check_case_collisions, check_host_path_length,
 };
 
+/// IO-5・TASK-21.1: 公開 API 経由でも NFC/NFD の別表記を衝突として検出し、
+/// 親が違えば衝突しない。
+#[test]
+fn io5_public_api_detects_nfc_nfd_collision() {
+    let mut set = CaseCollisionSet::new();
+    set.try_insert("caf\u{e9}/a.txt").expect("first insert");
+    let err = set
+        .try_insert("cafe\u{301}/b.txt")
+        .expect_err("NFD ancestor must collide with NFC ancestor");
+    assert_eq!(err.code(), IoErrorCode::AlreadyExists);
+    assert_eq!(err.code().as_str(), "ALREADY_EXISTS");
+    set.try_insert("x/\u{e9}").expect("different parent");
+    set.try_insert("y/e\u{301}").expect("different parent");
+    assert_eq!(set.len(), 3);
+}
+
 /// IO-5: 公開 API 経由でも大文字小文字だけの衝突を検出できる。
 #[test]
 fn io5_public_api_detects_case_collision() {

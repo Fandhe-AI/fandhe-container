@@ -39,12 +39,18 @@
 //! エラーで済むため。この方針により `ß` は `"SS"`/`"ss"` と衝突検出される
 //! （Unicode の simple case folding では非衝突だが、意図して過検出側に倒す）。
 //!
-//! # 未決事項: Unicode 正規化（NFC / NFD）
-//! 本モジュールは Unicode 正規化を行わない。合成済み `é`（U+00E9）と分解形
-//! `e` + U+0301 は別名として扱い、衝突として検出しない。APFS（正規化非区別）
-//! と ext4（バイト列で区別）の差をどう扱うか（正規化を統一するか、差異を検出
-//! してエラーにするか）は #103（TASK-21.h1・IO-5。担当は人間）で方針決定待ち
-//! であり、本モジュールでは先取りしない。
+//! # Unicode 正規化（NFC / NFD）の衝突検出（TASK-21.1・IO-5・#103）
+//! 名前は正規化せず（バイト列を書き換えない）、同じ親の下で正準等価（NFD が一致）な
+//! 別表記になる名前は、大文字小文字の衝突と同じく `ALREADY_EXISTS` で拒否する。
+//! ゲスト（ext4）は合成済み `é`（U+00E9）と `e` + U+0301 を別ファイルにできるが、
+//! APFS は書かれたとおりに保存しつつ比較では正規化の違いを区別しないため、
+//! 後から作った方が先の内容を黙って上書きするのを防ぐ（見逃しより過検出）。
+//! 衝突キーは `NFD → 大文字小文字の畳み込み → NFD`（`fold_component` 参照）で、
+//! 使う正規化は正準分解だけ。互換分解（NFKC/NFKD）は扱わない（`①` と `1` は衝突しない）。
+//! ただし大文字小文字の畳み込みで展開される合字（`ﬁ` → `FI` など）は `fi` と同一視される。
+//! 表の版は Unicode 17.0.0 で、割り当て済み文字の正準分解は版が上がっても変わらない
+//! （Unicode の正規化の安定性方針）。3 OS のすべてで同じ検出をする。
+//! 方針の文書化（`docs/design/fs-normalization.md`）は #106（TASK-21.2）の担当。
 //!
 //! # 入力表現がゲスト相対パスの `&str` である理由
 //! 入力はワイヤープロトコル上のゲスト（Linux）側 `/` 区切り相対パス表現であり、
@@ -71,7 +77,8 @@
 //!   （[`check_host_path_length`]）。書き込み経路への組み込みは後続（REPAIR-3）。
 //!   WIN-4 の per-directory case-sensitive フラグとの関係は記載済み
 //!   （[`check_host_path_length`] の doc の `# WIN-4 との関係` 節。TASK-20.2・#797）
-//! - NFC / NFD の Unicode 正規化方針 → #103（TASK-21.h1）で決定後に TASK-21
+//! - NFC / NFD の方針の文書化（`docs/design/fs-normalization.md`）→ #106（TASK-21.2）。
+//!   名前の正規化（書き換え）は行わない（#103）
 //! - APFS / NTFS の実際の case folding 表との厳密な一致・非 UTF-8 ファイル名の
 //!   扱い → TASK-21 以降
 //! - Windows（Win32 API 経由）固有の名前の同一視（末尾の `.` / 空白の除去・
@@ -124,10 +131,10 @@ pub const MAX_COLLISION_MESSAGE_PATH_CHARS: usize = 128;
 /// （#1116・IO-5）。
 pub const MAX_COLLISION_MESSAGE_PATH_BYTES: usize = 200;
 
-// 4 パス × (上限 + 引用符 2 + `...` 3) + 固定文言（約 100 バイト）が IoError の上限に
+// 4 パス × (上限 + 引用符 2 + `...` 3) + 固定文言（約 150 バイト）が IoError の上限に
 // 収まることを固定する。
 const _: () = assert!(
-    4 * (MAX_COLLISION_MESSAGE_PATH_BYTES + 5) + 128 <= crate::error::MAX_IO_ERROR_MESSAGE_BYTES
+    4 * (MAX_COLLISION_MESSAGE_PATH_BYTES + 5) + 192 <= crate::error::MAX_IO_ERROR_MESSAGE_BYTES
 );
 
 /// ホストパスの長さ上限（UTF-16 コード単位。IO-5・WIN-4・TASK-20.1）。
@@ -243,7 +250,7 @@ type NodeId = usize;
 /// 根ノードの識別子。実ノードには 1 以降を割り当てる。
 const ROOT_NODE: NodeId = 0;
 
-/// 1 コンポーネントを大文字小文字について畳み込む（IO-5）。
+/// 1 コンポーネントを大文字小文字についてだけ畳み込む（IO-5）。`fold_component` の内部段。
 ///
 /// 各文字へ `to_lowercase` → `to_uppercase` → `to_lowercase` を順に適用する。
 /// 2 段階（upper → lower）や lower のみでは見逃す衝突があるため 3 段階にしている:
@@ -268,13 +275,35 @@ const ROOT_NODE: NodeId = 0;
 /// （Unicode simple case folding では非衝突）。モジュール doc の方針
 /// 「見逃しよりも過検出を選ぶ」どおりの意図した挙動であり、
 /// `io5_sharp_s_is_detected_as_collision` で固定する。
-pub(crate) fn fold_component(component: &str) -> String {
+fn case_fold_chars(component: &str) -> String {
     component
         .chars()
         .flat_map(char::to_lowercase)
         .flat_map(char::to_uppercase)
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+/// 1 コンポーネントを衝突判定用のキーへ畳み込む（IO-5・TASK-21.1）。
+///
+/// `NFD → 大文字小文字の畳み込み（[`case_fold_chars`]）→ NFD` の順で適用する。
+/// Unicode の canonical caseless matching（`NFD(toCasefold(NFD(X)))`）と同じ形で、
+/// 大文字小文字の変換で合成済み文字が現れる場合や正準順序が崩れる場合にも、
+/// 正準等価な別表記（合成済み `é` と `e` + U+0301 など）が同じキーになる。
+/// 使う正規化は正準分解（`nfd()`）だけで、互換分解（NFKC/NFKD）は扱わない
+/// （`①` と `1` は衝突しない。大文字化で展開される合字 `ﬁ` は `fi` と衝突する）。
+///
+/// 名前そのものは書き換えず、このキーは衝突判定にだけ使う（#103 の方針: 検出のみ・
+/// 過検出側に倒す）。`CaseFoldKey` と `guest_files` の衝突判定（実在項目の分類・
+/// 作成後の再検証）が共通で呼ぶため、ここを直すだけで両経路に反映される。
+/// キーの長さは入力の定数倍に収まる（NFD の展開は文字あたり有界）。
+///
+/// 末尾の NFD は、Unicode 17.0.0 の全スカラー値の実測では無くても結果が変わらなかった
+/// （`io5_trailing_nfd_difference_is_pinned`）。表の更新に備えた過検出側の安全策として残す。
+pub(crate) fn fold_component(component: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let decomposed: String = component.nfd().collect();
+    case_fold_chars(&decomposed).nfd().collect()
 }
 
 /// 衝突判定の索引キー（非公開 newtype）: 親ノード＋畳み込み済みコンポーネント。
@@ -402,15 +431,23 @@ pub(crate) fn collision_error(
     component: &str,
     existing_component: &str,
 ) -> IoError {
+    // 大文字小文字の畳み込みだけで一致する組は従来の文言を保つ。正規化を経て初めて
+    // 一致する組は、NFC/NFD の別表記を含むことを文言に出す（TASK-21.1）。
+    let reason = if case_fold_chars(component) == case_fold_chars(existing_component) {
+        "case"
+    } else {
+        "case or Unicode normalization (NFC/NFD)"
+    };
     IoError::new(
         IoErrorCode::AlreadyExists,
         format!(
             "case-insensitive path collision: {} conflicts with existing {} \
-             (components {} and {} differ only by case)",
+             (components {} and {} differ only by {})",
             quote_for_message(path),
             quote_for_message(existing_path),
             quote_for_message(component),
             quote_for_message(existing_component),
+            reason,
         ),
     )
 }
@@ -979,8 +1016,32 @@ mod tests {
             let original = c.to_string();
             let lowered: String = c.to_lowercase().collect();
             let uppered: String = c.to_uppercase().collect();
+            let folded = case_fold_chars(&original);
+            if case_fold_chars(&lowered) != folded
+                || case_fold_chars(&uppered) != folded
+                || case_fold_chars(&folded) != folded
+            {
+                violations.push(format!("U+{:04X}", u32::from(c)));
+            }
+        }
+        assert_eq!(violations, Vec::<String>::new());
+    }
+
+    /// IO-5・TASK-21.1: 全 Unicode スカラー値について、`fold_component` が
+    /// NFD・小文字化・大文字化の前後で同じキーを返し、冪等であることを確認する。
+    /// 最後の NFD の要否は `io5_trailing_nfd_is_needed_for_some_chars` で確かめる。
+    #[test]
+    fn io5_fold_component_is_invariant_for_all_chars() {
+        use unicode_normalization::UnicodeNormalization;
+        let mut violations = Vec::new();
+        for c in (0u32..=0x10_FFFF).filter_map(char::from_u32) {
+            let original = c.to_string();
+            let decomposed: String = c.nfd().collect();
+            let lowered: String = c.to_lowercase().collect();
+            let uppered: String = c.to_uppercase().collect();
             let folded = fold_component(&original);
-            if fold_component(&lowered) != folded
+            if fold_component(&decomposed) != folded
+                || fold_component(&lowered) != folded
                 || fold_component(&uppered) != folded
                 || fold_component(&folded) != folded
             {
@@ -988,6 +1049,108 @@ mod tests {
             }
         }
         assert_eq!(violations, Vec::<String>::new());
+    }
+
+    /// 表の版が黙って上がったら気づけるように固定する（TASK-21.1）。
+    #[test]
+    fn io5_unicode_normalization_table_version_is_pinned() {
+        assert_eq!(unicode_normalization::UNICODE_VERSION, (17, 0, 0));
+    }
+
+    fn collide(first: &str, second: &str) -> Result<(), IoError> {
+        let mut set = CaseCollisionSet::new();
+        set.try_insert(first).expect("first insert must succeed");
+        let result = set.try_insert(second);
+        if result.is_err() {
+            assert_eq!(set.len(), 1, "failed insert must not change the index");
+        }
+        result
+    }
+
+    /// IO-5・TASK-21.1: 合成済みと結合文字列の別表記は、どちらの順序でも衝突する。
+    #[test]
+    fn io5_nfc_and_nfd_spellings_collide() {
+        let pairs = [
+            ("\u{e9}", "e\u{301}"),
+            ("e\u{301}", "\u{e9}"),
+            ("\u{c5}", "A\u{30a}"),
+            ("\u{212b}", "A\u{30a}"),
+            ("\u{ac00}", "\u{1100}\u{1161}"),
+            ("a\u{323}\u{307}", "a\u{307}\u{323}"),
+            ("\u{c9}", "e\u{301}"),
+            ("caf\u{e9}/a.txt", "cafe\u{301}/b.txt"),
+        ];
+        for (first, second) in pairs {
+            let err = collide(first, second).expect_err("must collide");
+            assert_eq!(
+                err.code(),
+                IoErrorCode::AlreadyExists,
+                "{first:?} {second:?}"
+            );
+            assert!(
+                err.message()
+                    .starts_with("case-insensitive path collision: "),
+                "{}",
+                err.message()
+            );
+            assert!(
+                err.message()
+                    .ends_with("differ only by case or Unicode normalization (NFC/NFD))"),
+                "{}",
+                err.message()
+            );
+        }
+    }
+
+    /// IO-5・TASK-21.1: 衝突しない組（別の結合記号・別の親・同一バイト列・互換分解のみ）。
+    #[test]
+    fn io5_distinct_names_do_not_collide_under_normalization() {
+        assert!(collide("e\u{301}", "e\u{300}").is_ok());
+        assert!(collide("x/\u{e9}", "y/e\u{301}").is_ok());
+        assert!(collide("\u{2460}", "1").is_ok());
+        let mut set = CaseCollisionSet::new();
+        set.try_insert("\u{e9}").expect("first");
+        set.try_insert("\u{e9}").expect("same bytes");
+        assert_eq!(set.len(), 1);
+    }
+
+    /// 大文字小文字だけの組は従来の文言のまま（TASK-21.1）。
+    #[test]
+    fn io5_case_only_collision_keeps_legacy_message() {
+        let err = collide("Foo.txt", "foo.txt").expect_err("must collide");
+        assert_eq!(
+            err.message(),
+            "case-insensitive path collision: \"foo.txt\" conflicts with existing \"Foo.txt\" \
+             (components \"foo.txt\" and \"Foo.txt\" differ only by case)"
+        );
+    }
+
+    /// 衝突メッセージには受理済みの元の表記がそのまま（エスケープして）入る。
+    #[test]
+    fn io5_collision_message_keeps_original_spellings() {
+        let err = collide("\u{e9}", "e\u{301}").expect_err("must collide");
+        assert_eq!(
+            err.message(),
+            "case-insensitive path collision: \"e\\u{301}\" conflicts with existing \"\u{e9}\" \
+             (components \"e\\u{301}\" and \"\u{e9}\" differ only by case or Unicode normalization (NFC/NFD))"
+        );
+    }
+
+    /// 末尾の NFD を外した `case_fold_chars(NFD(c))` が `fold_component(c)` と食い違う文字の
+    /// 一覧を固定する。実測では例外が 1 件でもあれば末尾の NFD が必要、空なら過検出側の
+    /// 安全策として残しているだけ（Unicode 17.0.0 時点の結果を下で固定する）。
+    #[test]
+    fn io5_trailing_nfd_difference_is_pinned() {
+        use unicode_normalization::UnicodeNormalization;
+        let differing: Vec<String> = (0u32..=0x10_FFFF)
+            .filter_map(char::from_u32)
+            .filter(|c| {
+                let d: String = c.nfd().collect();
+                case_fold_chars(&d) != fold_component(&c.to_string())
+            })
+            .map(|c| format!("U+{:04X}", u32::from(c)))
+            .collect();
+        assert_eq!(differing, Vec::<String>::new());
     }
 
     /// IO-5: 不正な形式のパスはすべて `InvalidArgument` で拒否される。

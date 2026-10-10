@@ -85,6 +85,36 @@ fn io5_concurrent_case_only_creates_one_is_rejected() {
     }
 }
 
+/// IO-5・TASK-21.1: NFC の `café.txt` を作った後に NFD の `café.txt`（`e` + U+0301）を
+/// 作ろうとすると、衝突の構造化エラーになり 2 つ目のファイルは作られない。
+#[test]
+fn io5_nfc_then_nfd_create_is_rejected_without_creating_second_file() {
+    let dir = TempDir::new("gf-nfc-nfd");
+    let (creator, root) = creator_in(&dir, "root");
+    creator.create_file("caf\u{e9}.txt").expect("first create");
+    let err = creator
+        .create_file("cafe\u{301}.txt")
+        .err()
+        .expect("NFD spelling must collide with the NFC one");
+    assert_eq!(err.code().as_str(), "ALREADY_EXISTS");
+    assert!(
+        err.message().starts_with("case-insensitive path collision"),
+        "{}",
+        err.message()
+    );
+    assert!(
+        err.message()
+            .ends_with("differ only by case or Unicode normalization (NFC/NFD))"),
+        "{}",
+        err.message()
+    );
+    let names: Vec<_> = std::fs::read_dir(&root)
+        .expect("read_dir")
+        .map(|e| e.expect("entry").file_name())
+        .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("caf\u{e9}.txt")]);
+}
+
 /// IO-5・TASK-19.2（Codex P1 指摘）: 同じ共有ルートに別々の
 /// [`GuestFileCreator`] インスタンス（プロセス間の競合を模す。`Mutex` は共有
 /// しない）から大文字小文字だけが違う作成を同時に出しても、大小違いの項目が

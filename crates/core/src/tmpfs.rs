@@ -13,6 +13,11 @@
 //! - `nosuid`・`nodev` は常に付与し、外せない（SEC-1 の fail-closed）
 //! - マウント先は [`MountDestination`]（字句正規化・`..` 拒否）で検証する。`/proc` とその配下・`/dev`
 //!   そのものは覆い隠しになるため拒否する。重複と件数上限（[`TMPFS_MAX_MOUNTS`]）も拒否する
+//! - `/dev/shm` は暗黙の固定集合として常に載せる（オーナー判断 2・`docs/design/dev-default-mounts.md` 3.4・
+//!   TASK-29 追補・#1654）。[`TmpfsMountSet::ensure_default_dev_shm`] が、集合に `/dev/shm` が無いときだけ
+//!   既定（[`DEFAULT_DEV_SHM_SIZE_BYTES`]）の件を足す。`--shm-size` も `--tmpfs /dev/shm` も利用者の指定として
+//!   優先し、既定は足さない（同じマウント先に 2 枚重ねない）。`--tmpfs /dev/shm` でサイズを省くとカーネル既定になる。
+//!   既定の件も [`TMPFS_MAX_MOUNTS`] に数える。`--ipc=host` で足すかどうかは呼び出し側（supervisor）が決める
 //! - サイズ未指定（`None`）はカーネル既定（物理メモリの 50%）で、Docker と同じ挙動。tmpfs のページは
 //!   コンテナの memory cgroup に課金されるため `memory.max`（CORE-3）で抑えられる
 //!
@@ -36,6 +41,21 @@ pub const TMPFS_MAX_DESTINATION_DEPTH: usize = 32;
 
 /// `/dev/shm` のマウント先。
 pub const DEV_SHM_PATH: &str = "/dev/shm";
+
+/// `--shm-size` 未指定時の `/dev/shm` の既定サイズ（64 MiB）。既定値の唯一の定義。
+///
+/// Docker の既定 64 MiB と runc v1.5.2 の `size=65536k` に揃える（SUP-12・TASK-29 追補・#1654）。
+pub const DEFAULT_DEV_SHM_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// [`TmpfsMountSet::ensure_default_dev_shm`] の結果（既定を足したかを呼び出し側のログ・報告へ渡す）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DevShmOrigin {
+    /// 利用者の指定が既にあり、既定は足していない。
+    Specified,
+    /// 既定の `/dev/shm`（64 MiB）を足した。
+    Default,
+}
 
 fn invalid(msg: impl Into<String>) -> TraitError {
     TraitError::new(ErrorCode::InvalidArgument, msg)
@@ -134,6 +154,11 @@ impl TmpfsMountSpec {
         Self::new(DEV_SHM_PATH, Some(size))
     }
 
+    /// `--shm-size` 未指定時の既定の `/dev/shm`（[`DEFAULT_DEV_SHM_SIZE_BYTES`]・`noexec`・mode 1777）。
+    pub fn default_dev_shm() -> Result<Self, TraitError> {
+        Self::dev_shm(TmpfsSize::from_bytes(DEFAULT_DEV_SHM_SIZE_BYTES)?)
+    }
+
     /// 表示・照合用の表現（`mode=1777,size=67108864`）。型付きフィールドからのみ組み立てる。カーネルへは
     /// 渡さない（`crate::exec::mount_tmpfs` は新マウント API へ `mode`・`size` を型付きで渡す。SUP-12・TASK-169 追補・#1472）。
     pub fn data_string(&self) -> String {
@@ -189,6 +214,28 @@ impl TmpfsMountSet {
         }
         self.mounts.push(spec);
         Ok(())
+    }
+
+    /// `/dev/shm` が無ければ既定の件（64 MiB）を足す。何度呼んでも同じ結果になる（冪等）。
+    ///
+    /// 利用者の指定（`--shm-size`・`--tmpfs /dev/shm`）が既にあれば何もしない。supervisor の
+    /// `to_tmpfs_set` が `--ipc=host` 以外のときに呼ぶ（SUP-12・#1654）。件数上限は挿入の前に確かめる。
+    /// 既定の件は先頭へ挿入する。末尾へ足すと、先にある `/dev/shm/sub` を親が後から覆い隠すか
+    /// 「親を子より後に指定」の不変条件に反するため。`/dev/shm` の親になりうる `/dev`・`/` は
+    /// `push` と `MountDestination` で拒否済みなので、先頭挿入で親子順序は崩れない。
+    pub fn ensure_default_dev_shm(&mut self) -> Result<DevShmOrigin, TraitError> {
+        if self
+            .mounts
+            .iter()
+            .any(|m| m.destination.as_str() == DEV_SHM_PATH)
+        {
+            return Ok(DevShmOrigin::Specified);
+        }
+        if self.mounts.len() >= TMPFS_MAX_MOUNTS {
+            return Err(invalid("too many tmpfs mounts"));
+        }
+        self.mounts.insert(0, TmpfsMountSpec::default_dev_shm()?);
+        Ok(DevShmOrigin::Default)
     }
 
     /// 指定順のマウント一覧。
@@ -373,5 +420,88 @@ mod tests {
             invalid("too many tmpfs mounts")
         );
         assert_eq!(full.mounts().len(), 64);
+    }
+
+    /// SUP-12・TASK-29 追補（#1654）: 空の集合へ既定の `/dev/shm`（64 MiB）を足す。
+    #[test]
+    fn sup12_task29_default_dev_shm_added_when_unspecified() {
+        assert_eq!(DEFAULT_DEV_SHM_SIZE_BYTES, 67_108_864);
+        let mut set = TmpfsMountSet::new();
+        assert_eq!(set.ensure_default_dev_shm(), Ok(DevShmOrigin::Default));
+        assert_eq!(set.mounts().len(), 1);
+        let m = &set.mounts()[0];
+        assert_eq!(m.destination.as_str(), "/dev/shm");
+        assert_eq!(m.data_string(), "mode=1777,size=67108864");
+        assert!(!m.exec);
+        assert!(!m.read_only);
+        // 冪等: 2 回目は既存扱いで件数は 1 のまま。
+        assert_eq!(set.ensure_default_dev_shm(), Ok(DevShmOrigin::Specified));
+        assert_eq!(set.mounts().len(), 1);
+    }
+
+    /// SUP-12・TASK-29 追補（#1654）: 利用者の `--shm-size` が既定より優先される。
+    #[test]
+    fn sup12_task29_default_dev_shm_yields_to_shm_size() {
+        let mut set = TmpfsMountSet::new();
+        let size = TmpfsSize::from_bytes(131_072).expect("size");
+        set.push(TmpfsMountSpec::dev_shm(size).expect("spec"))
+            .expect("push");
+        assert_eq!(set.ensure_default_dev_shm(), Ok(DevShmOrigin::Specified));
+        let shm: Vec<_> = set
+            .mounts()
+            .iter()
+            .filter(|m| m.destination.as_str() == "/dev/shm")
+            .collect();
+        assert_eq!(shm.len(), 1);
+        assert_eq!(shm[0].data_string(), "mode=1777,size=131072");
+    }
+
+    /// SUP-12・TASK-29 追補（#1654）: `--tmpfs /dev/shm`（サイズ省略）も利用者の指定として扱う。
+    #[test]
+    fn sup12_task29_default_dev_shm_yields_to_tmpfs_flag() {
+        let mut set = TmpfsMountSet::new();
+        set.push(TmpfsMountSpec::new("/dev/shm", None).expect("spec"))
+            .expect("push");
+        assert_eq!(set.ensure_default_dev_shm(), Ok(DevShmOrigin::Specified));
+        assert_eq!(set.mounts().len(), 1);
+        assert_eq!(set.mounts()[0].data_string(), "mode=1777");
+    }
+
+    /// SUP-12・TASK-29 追補（#1654）: 既定は先頭へ入り、子 `/dev/shm/sub` との親子順序を保つ。
+    #[test]
+    fn sup12_task29_default_dev_shm_inserted_before_child() {
+        let mut set = TmpfsMountSet::new();
+        set.push(TmpfsMountSpec::new("/dev/shm/sub", None).expect("spec"))
+            .expect("push");
+        assert_eq!(set.ensure_default_dev_shm(), Ok(DevShmOrigin::Default));
+        let dests: Vec<_> = set
+            .mounts()
+            .iter()
+            .map(|m| m.destination.as_str().to_owned())
+            .collect();
+        assert_eq!(dests, ["/dev/shm", "/dev/shm/sub"]);
+    }
+
+    /// SUP-12・TASK-29 追補（#1654）: 既定の件も上限 64 に数える。
+    #[test]
+    fn sup12_task29_default_dev_shm_counts_toward_limit() {
+        let mk = |n: usize| {
+            let mut set = TmpfsMountSet::new();
+            for i in 0..n {
+                set.push(TmpfsMountSpec::new(&format!("/m{i}"), None).expect("spec"))
+                    .expect("push");
+            }
+            set
+        };
+        let mut full = mk(TMPFS_MAX_MOUNTS);
+        assert_eq!(
+            full.ensure_default_dev_shm().expect_err("limit").message(),
+            "too many tmpfs mounts"
+        );
+        assert_eq!(full.mounts().len(), 64);
+        let mut almost = mk(TMPFS_MAX_MOUNTS - 1);
+        assert_eq!(almost.ensure_default_dev_shm(), Ok(DevShmOrigin::Default));
+        assert_eq!(almost.mounts().len(), 64);
+        assert_eq!(almost.mounts()[0].destination.as_str(), "/dev/shm");
     }
 }

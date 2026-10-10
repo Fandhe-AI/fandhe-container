@@ -26,7 +26,7 @@
 //! prepare_rootfs(&isolation, rootfs) -> PreparedRootfs
 //!   -> create_default_devices(&isolation, &prepared) -> DeviceReport   // 本モジュール
 //!        （dev に tmpfs → ノード 6 種 → symlink 4 本）
-//!   -> [/dev/shm は #1654、/dev/pts・/dev/ptmx は #1656 が本モジュールの tmpfs の上に載せる]
+//!   -> [/dev/shm は `mount_tmpfs` が集合（既定 64 MiB を含む。#1654）から、/dev/pts・/dev/ptmx は #1656 が本モジュールの tmpfs の上に載せる]
 //!   -> mount_tmpfs / inject_files
 //!   -> pivot_root(&isolation, prepared)
 //! ```
@@ -77,7 +77,7 @@
 //! - rootless 向けのホスト `/dev/*` の bind mount による供給（runc 相当。CORE-6・SEC-5。#1660）。
 //!   本実装の rootless 経路は `PermissionDenied` で止まる。user namespace が載せたマウント上のデバイスが
 //!   開けるか（`nodev` 相当の扱い）は本モジュールでは確かめておらず、#1660 で一次情報を確認する（未確認）
-//! - `/dev/shm` の既定（#1654）、`/dev/pts`・`/dev/ptmx`（#1656）。`/dev/console` は端末機能の親 issue で
+//! - `/dev/pts`・`/dev/ptmx`（#1656）。`/dev/console` は端末機能の親 issue で
 //!   別途設計する（設計ドラフト 3.5）
 //! - `spawn_container` の最小フローへの本関数の配線（#1314）
 //!

@@ -14,6 +14,8 @@
 //!
 //! # 契約
 //!
+//! - **既定の `/dev/shm`**: `--shm-size` 未指定時の既定 64 MiB は集合側（`TmpfsMountSet::ensure_default_dev_shm`・
+//!   #1654）が足す。本段は既定の件と利用者指定の件を区別せず、同じ検証・後始末を通す
 //! - **fd 起点**: [`PreparedRootfs`] の新しい mount top の fd から、正規化済みのマウント先を 1 要素ずつ
 //!   `O_PATH|O_DIRECTORY|O_NOFOLLOW` で辿る。存在しない要素は 0755 で作り、同じ方法で開き直す。
 //!   symlink・非ディレクトリは `path_symlink_or_not_directory` の違反記録付きで拒否する（rootfs の外へ
@@ -593,6 +595,29 @@ pub(super) mod tests {
         assert_eq!(report.mounts[0].destination, "/dev/shm");
         assert_eq!(report.mounts[0].size, Some(65536));
         assert_eq!(report.mounts[1].size, None);
+    }
+
+    /// SUP-12・TASK-29 追補（#1654）: 既定の `/dev/shm`（64 MiB）も利用者指定と同じ検証経路で適用される。
+    #[test]
+    fn sup12_task29_default_dev_shm_goes_through_same_path() {
+        let tmp = Tmp::new("defshm");
+        let _ = take_calls();
+        let fd = tmp.fd();
+        let mut s = TmpfsMountSet::new();
+        s.ensure_default_dev_shm().expect("default");
+        let report = mount_tmpfs_at(fd.as_fd(), &s, &not_shared, &|| {}).expect("mount");
+        assert_eq!(
+            take_calls(),
+            vec![(
+                tmp.0.join("dev/shm").to_string_lossy().into_owned(),
+                2 | 4 | 8,
+                "mode=1777,size=67108864".to_owned()
+            )]
+        );
+        assert_eq!(report.mounts[0].destination, "/dev/shm");
+        assert_eq!(report.mounts[0].size, Some(67_108_864));
+        assert!(!report.mounts[0].read_only);
+        assert!(!report.mounts[0].exec);
     }
 
     /// SUP-12・TASK-169.2: 途中要素が symlink なら rootfs の外へ出さず違反記録付きで拒否する。

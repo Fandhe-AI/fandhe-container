@@ -119,8 +119,10 @@ readonly LOG_TAIL_LINES=20
 # 収集プロセスがランタイム 1 呼び出しあたりログファイルへ記録する最大サイズ（KiB）。
 # 超過分は読み捨てる（ディスク枯渇防止。REPAIR-5）。書き手は止めない。
 readonly LOG_MAX_KIB=1024
-# 状態・一覧など出力を解析する呼び出しの後に、その出力の収集プロセスの終了を待つ上限（マイクロ秒）。
-# 超えたら出力が不完全になり得るので、その呼び出しを失敗として扱う（fail-closed）。
+# docker の一覧など出力を解析する呼び出しの後に、その出力の収集プロセスの終了を待つ既定の上限
+# （マイクロ秒）。超えたら出力が不完全になり得るので、その呼び出しを失敗として扱う（fail-closed）。
+# state の照会（query_state）はこの固定値でなく、呼び出しの期限（--timeout）に基づく上限を渡す
+# （負荷の高い runner で収集プロセスの終了が 200ms を超えて偶発的に失敗するのを防ぐ。Issue #1687）。
 readonly LOG_FLUSH_WAIT_US=200000
 # 後始末で収集プロセスの自然終了を待つ上限（マイクロ秒）。超えたら SIGKILL で回収する。
 readonly LOG_REAP_WAIT_US=500000
@@ -441,8 +443,21 @@ create_rc=0
 # 残り時間だけを渡す（実行開始の観測ループと finish_container が設定・解除する。REPAIR-5）。
 rt_deadline_us=""
 # query_state の結果（終了コード・status）。
+# state_rc: 0 で成功。失敗時はランタイムの終了コード、収集の未完了・不完全・切り詰めは 125
+#   （is_runtime_error の範囲外なので不存在とは扱わない。fail-closed）。
+# state_reason: 失敗の理由コード（成功時は空）。先に当てはまったものを採る（Issue #1687・REPAIR-4）。
+#   call-timeout       run_rt が 124（期限切れ、または残り時間が無く呼ばなかった）
+#   collector-timeout  収集プロセスが上限内に終わらなかった
+#   output-truncated   出力が上限超過で切り詰められた
+#   collector-incomplete 完了目印が無い（書き込み失敗など）
+#   exit-125           ランタイムまたは GNU timeout 自身が 125 を返した（両者は終了コードから区別できない）
+#   runtime-exit       それ以外の 0 でない終了コード
+#   unexpected-status  rc は 0 だが JSON が不正・id 不一致・想定外の status
+# state_raw_rc: 125 に上書きする前のランタイム呼び出しの生の終了コード。
 state_rc=0
 state_status=""
+state_reason=""
+state_raw_rc=0
 # run_rt が起動した収集プロセスの pid（全件は cleanup が回収する。直前の 1 呼び出し分は flush_last_call が待つ）。
 collector_pids=()
 last_collector_pids=()
@@ -473,6 +488,13 @@ log_collect() {
     : >"$1.truncated" 2>/dev/null || ok=0
     echo "warning: runtime-log-truncated: ${1##*/} limit_kib=$LOG_MAX_KIB" >&2
   fi
+  # 自己テストだけが、指定ファイル名の完了目印を遅らせる（形: <ファイル名>:<秒>）。内容は完全で完了だけが
+  # 遅れる状態を作り、上限内の遅れは成功・上限超過は理由つきで失敗することを照合する。本番では未設定で、
+  # 効果は完了を遅らせる方向だけ（受理する方向には働かない）。値は数値だけを受け付ける。
+  if [ -n "${STARTUP_LATENCY_TEST_COLLECT_DELAY:-}" ] && [ "${1##*/}" = "${STARTUP_LATENCY_TEST_COLLECT_DELAY%%:*}" ]; then
+    local delay="${STARTUP_LATENCY_TEST_COLLECT_DELAY#*:}"
+    if [[ "$delay" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then sleep "$delay"; fi
+  fi
   # 完了目印は記録に成功したときだけ置く。置けなければ未完了として扱われる。
   if [ "$ok" -eq 1 ]; then : >"$1.done" 2>/dev/null || true; fi
 }
@@ -498,14 +520,16 @@ child_alive() {
   [ "$ppid" = "$$" ] && [ "$st" != "Z" ]
 }
 
-# 引数の pid がすべて終了するのを最大 <budget_us> 待つ（時計に依存せず、回数で上限を掛ける）。
+# 引数の pid がすべて終了するのを最大 <budget_us> 待つ。上限は回数（時計が止まっても必ず終わる）と
+# 単調時計の経過（外部 sleep の fork の遅れで実時間が予算を大きく超えない）の二重で掛ける。
 # 終了していれば 0、時間切れなら 1。引数: <budget_us> <pid...>
 wait_children() {
-  local budget="$1" p alive spins=0 sleeps
+  local budget="$1" p alive spins=0 sleeps start_us now_us
   shift
   [ "$#" -gt 0 ] || return 0
   [ "$budget" -gt 0 ] || budget=0
   sleeps=$((budget / 5000))
+  start_us="$(mono_us)" || start_us=""
   while :; do
     alive=0
     for p in "$@"; do
@@ -519,17 +543,21 @@ wait_children() {
     fi
     [ "$sleeps" -gt 0 ] || return 1
     sleeps=$((sleeps - 1))
+    if [ -n "$start_us" ] && now_us="$(mono_us)" && [ $((now_us - start_us)) -ge "$budget" ]; then
+      return 1
+    fi
     sleep 0.005
   done
 }
 
 # 直前の run_rt の収集プロセスの終了を待つ。出力を解析する呼び出しの直後にだけ使う。
-# 待機の上限は LOG_FLUSH_WAIT_US と、期限（rt_deadline_us）までの残りの小さい方。
+# 待機の上限は引数 <budget_us>（省略時は LOG_FLUSH_WAIT_US）と、期限（rt_deadline_us）までの残りの
+# 小さい方。引数: [<budget_us>]
 # create / start / delete 等の直後には使わない: runc 系の create は init がランタイムの stdio を
 # 保持するため収集プロセスがコンテナの終了まで EOF にならず、待つと create_us が待機上限分だけ
 # 水増しされる（それらの出力は失敗時の診断にしか使わない）。
 flush_last_call() {
-  local budget="$LOG_FLUSH_WAIT_US" rem
+  local budget="${1:-$LOG_FLUSH_WAIT_US}" rem
   if [ -n "$rt_deadline_us" ]; then
     rem=$((rt_deadline_us - $(mono_us)))
     [ "$rem" -lt "$budget" ] && budget="$rem"
@@ -575,7 +603,9 @@ run_rt() {
   if [ "$out" = "$errf" ]; then
     timeout --kill-after="$grace" "$limit" "$runtime" "$@" </dev/null >&"$ofd" 2>&1 {ofd}>&- || status=$?
   else
-    exec {efd}> >(log_collect "$errf" >/dev/null)
+    # stderr 側の収集プロセスは stdout のパイプの書き込み端（ofd）を継承しないよう閉じる。継承すると
+    # stdout 側の収集プロセスが stderr 側の終了まで EOF にならず、flush の待ちが直列化される（Issue #1687）。
+    exec {efd}> >(log_collect "$errf" {ofd}>&- >/dev/null)
     last_collector_pids+=("$!")
     collector_pids+=("$!")
     timeout --kill-after="$grace" "$limit" "$runtime" "$@" </dev/null >&"$ofd" 2>&"$efd" {ofd}>&- {efd}>&- || status=$?
@@ -616,35 +646,57 @@ rt_is_not_found() {
 }
 # ---------------------------------------------------------------------------
 
-# 失敗したコマンドのログ末尾を stderr へ出す。
+# 失敗したコマンドのログ末尾を stderr へ出す。失敗した呼び出しの収集プロセスはまだ書き込み中の
+# ことがあり、負荷下では末尾が欠けるため、診断出力の前に上限付き（1 秒）で収集の終了を待つ。
+# 診断専用なので待ちが時間切れでも判定には使わない（Issue #1687）。
 show_log() {
+  flush_last_call 1000000 || true
   echo "--- last output of failed runtime command ---" >&2
   tail -n "$LOG_TAIL_LINES" -- "$1" >&2 || true
 }
 
-# state を 1 回呼び、state_rc・state_status を設定する。state_status は stdout が単一の
-# OCI state JSON で id が一致するときだけその status、それ以外は空文字。
+# state を 1 回呼び、state_rc・state_status・state_reason・state_raw_rc を設定する。state_status は
+# stdout が単一の OCI state JSON で id が一致するときだけその status、それ以外は空文字。
+# 収集の完了待ちの上限は呼び出しの期限に基づく（観測ループでは期限までの残り、create 前の照会では
+# --timeout 秒。REPAIR-5）。観測点は待ちの前に取るので、待ちは計測値に乗らない。
 query_state() {
-  local id="$1" out="$tmpdir/state.out"
+  local id="$1" out="$tmpdir/state.out" flush_us
   state_rc=0
+  state_reason=""
   rt_state "$out" "$tmpdir/state.err" "$id" || state_rc=$?
+  state_raw_rc="$state_rc"
   # 観測点は state の復帰直後に取る（下の収集の完了待ちを区間に含めない）。
   state_wall_us="$(wall_us)"
   state_mono_us="$(mono_us)"
+  flush_us=$((timeout_secs * 1000000))
   # 出力（stdout の JSON と、不存在判定に使う stderr）を読む前に収集の完了を待つ。上限内に
   # 終わらなければ出力が不完全になり得るので失敗として扱う（fail-closed。124 は維持する）。
-  if ! flush_last_call && [ "$state_rc" -ne 124 ]; then
+  if [ "$state_rc" -eq 124 ]; then
+    state_reason="call-timeout"
+    flush_last_call "$flush_us" || true
+  elif ! flush_last_call "$flush_us"; then
     state_rc=125
+    state_reason="collector-timeout"
   fi
   # 切り詰められた応答は不完全なので解析しない（先頭が有効でも後続が捨てられている）。
-  if { log_truncated "$out" || log_incomplete "$out" || log_incomplete "$tmpdir/state.err"; } && [ "$state_rc" -ne 124 ]; then
-    state_rc=125
+  if [ "$state_rc" -ne 124 ] && [ -z "$state_reason" ]; then
+    if log_truncated "$out"; then
+      state_rc=125
+      state_reason="output-truncated"
+    elif log_incomplete "$out" || log_incomplete "$tmpdir/state.err"; then
+      state_rc=125
+      state_reason="collector-incomplete"
+    fi
+  fi
+  if [ -z "$state_reason" ] && [ "$state_rc" -ne 0 ]; then
+    if [ "$state_rc" -eq 125 ]; then state_reason="exit-125"; else state_reason="runtime-exit"; fi
   fi
   state_status=""
   if [ "$state_rc" -eq 0 ]; then
     state_status="$(jq -rs --arg id "$id" \
       'if length == 1 and (.[0] | type) == "object" and .[0].id == $id and (.[0].status | type) == "string" then .[0].status else "" end' \
       <"$out" 2>/dev/null)" || state_status=""
+    [ -n "$state_status" ] || state_reason="unexpected-status"
   fi
 }
 
@@ -701,7 +753,7 @@ finish_container_within_deadline() {
     if create_not_made; then
       return 0
     fi
-    echo "warning: create did not succeed for $id and its absence could not be confirmed (state exit $state_rc, create exit $create_rc); not touching it because ownership cannot be proven, inspect it manually" >&2
+    echo "warning: create did not succeed for $id and its absence could not be confirmed (state exit $state_rc, reason=$state_reason, runtime_exit=$state_raw_rc, create exit $create_rc); not touching it because ownership cannot be proven, inspect it manually" >&2
     leftover_ids+=("$id")
     return 1
   fi
@@ -978,6 +1030,12 @@ measure_once() {
   # （既存コンテナとの衝突を分かりやすく報告するため。安全性は finish_container が
   # create 未成功の ID に破壊的操作を送らないことで担保する）。
   query_state "$id"
+  case "$state_reason" in
+    collector-timeout | collector-incomplete | output-truncated | exit-125)
+      # 制御は変えない（安全性は finish_container の所有の証明が担保する）。原因調査のため理由だけ残す。
+      echo "warning: runtime-state-unverified: pre-create state for $id could not be verified (reason=$state_reason, runtime_exit=$state_raw_rc); continuing" >&2
+      ;;
+  esac
   if [ "$state_rc" -eq 0 ]; then
     err "container-id-in-use" "container $id already exists; refusing to touch it"
     return 1
@@ -1027,7 +1085,7 @@ measure_once() {
       running | stopped) break ;;
       created) ;;
       *)
-        err "runtime-state-failed" "state for $id failed or returned an unexpected status (exit $state_rc)"
+        err "runtime-state-failed" "state for $id failed or returned an unexpected status (exit $state_rc, reason=$state_reason, runtime_exit=$state_raw_rc)"
         show_log "$tmpdir/state.err"
         return 1
         ;;

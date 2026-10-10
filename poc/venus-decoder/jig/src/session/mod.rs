@@ -12,7 +12,7 @@
 //!
 //! 待機はすべて期限つき（REPAIR-5）。単一 fd 用の `sys::wait_fd` を socket と ctrl の kick で交互に短く待つ方式のため、
 //! kick への反応には最大 [`SessionLimits::poll_slice`] の遅延が乗る（複数 fd の ppoll 化は unsafe の承認範囲外）。
-//! 未実装（REPAIR-3）: cursorq（ring 1）の要求処理・`SET_CONFIG`・`VRING_NOFD`・REPLY_ACK・inflight・
+//! 未実装（REPAIR-3）: cursorq（ring 1）の要求処理・`SET_CONFIG`・`VRING_NOFD`・inflight・
 //! `observe::snapshot_lines` の定期出力（終了時の集計出力は実装済み。定期出力と virtqueue 個別の観測カウンタは未実装）。
 //!
 //! kick / call の fd は frontend が複製を持ち得るため、`O_NONBLOCK` を含む open file description のフラグと counter は
@@ -47,8 +47,8 @@ use crate::sys;
 use crate::vhost_user::fd_passing::{MAX_FDS, MAX_TIMEOUT, recv_with_fds, send_with_fds};
 use crate::vhost_user::observe;
 use crate::vhost_user::{
-    Decoded, HEADER_LEN, Header, MAX_PAYLOAD_LEN, TransportError, TransportErrorCode,
-    decode_request_payload,
+    Ack, Decoded, EncodedMessage, HEADER_LEN, Header, MAX_PAYLOAD_LEN, Reply, RequestCode,
+    TransportError, TransportErrorCode, decode_request_payload,
 };
 use crate::virtqueue::VirtqueueErrorCode;
 use metrics::{SessionMetrics, SessionOp};
@@ -303,26 +303,60 @@ impl Session {
     ) -> Result<(), SessionError> {
         let Incoming { decoded, fds } = incoming;
         let code = decoded.request.code();
-        match self.state.handle(decoded.request, fds)? {
-            Some(reply) => {
-                let msg = reply.encode()?;
-                let deadline = Instant::now()
-                    .checked_add(self.limits.message_timeout)
-                    .ok_or_else(|| SessionError::new(SessionErrorCode::InvalidArgument, None))?;
-                let bytes = msg.as_bytes();
-                let mut off = 0usize;
-                while off < bytes.len() {
-                    let rest = bytes
-                        .get(off..)
-                        .ok_or_else(|| SessionError::new(SessionErrorCode::InvalidValue, None))?;
-                    let sent = send_with_fds(sock, rest, &[], remaining(deadline)?)
-                        .map_err(|e| SessionError::transport(e, Some(code.as_u32())))?;
-                    off += sent.len;
-                }
+        let need_reply = decoded.need_reply;
+        // NEED_REPLY つき SET_PROTOCOL_FEATURES 自体にも応答するため、処理前後どちらかで REPLY_ACK が
+        // 確定していれば応答義務ありとする（初回有効化の ACK と、解除要求への従前義務の ACK。#1639）。
+        let ack_before = self.state.reply_ack();
+        match self.state.handle(decoded.request, fds) {
+            Ok(Some(reply)) => self.send_reply(sock, &reply.encode()?, code),
+            // 応答本体を持たない要求の成功。REPLY_ACK 確定済みで NEED_REPLY が立っていれば u64 の 0 を返す。
+            Ok(None) if need_reply && (ack_before || self.state.reply_ack()) => {
+                self.send_reply(sock, &Reply::Ack(Ack::success(code)?).encode()?, code)?;
+                sink(&log::need_reply_ack_line(code.as_u32(), true));
+                Ok(())
             }
-            // REPLY_ACK を広告していないので、`SET_*` に NEED_REPLY が付いていても応答しない。
-            None if decoded.need_reply => sink(&log::need_reply_ignored_line(code.as_u32())),
-            None => {}
+            // REPLY_ACK が確定していないセッションでは NEED_REPLY に応答しない。
+            Ok(None) if need_reply => {
+                sink(&log::need_reply_ignored_line(code.as_u32()));
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            // 失敗した SET_* に NEED_REPLY があれば非 0 を返してからセッションを終える（fail-closed。#1639 D2）。
+            // GET_* の失敗には応答しない（ack の値が応答値と誤解されうる）。送信失敗でも元のエラーを優先する。
+            Err(e) => {
+                if need_reply
+                    && (ack_before || self.state.reply_ack())
+                    && !code.has_reply_body()
+                    && let Ok(ack) = Ack::failure(code)
+                    && let Ok(msg) = Reply::Ack(ack).encode()
+                    && self.send_reply(sock, &msg, code).is_ok()
+                {
+                    sink(&log::need_reply_ack_line(code.as_u32(), false));
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// 符号化済みの応答を fd なしで期限内に送り切る（REPAIR-5）。`GET_*` の応答と ack で共有する。
+    fn send_reply(
+        &self,
+        sock: &UnixStream,
+        msg: &EncodedMessage,
+        code: RequestCode,
+    ) -> Result<(), SessionError> {
+        let deadline = Instant::now()
+            .checked_add(self.limits.message_timeout)
+            .ok_or_else(|| SessionError::new(SessionErrorCode::InvalidArgument, None))?;
+        let bytes = msg.as_bytes();
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let rest = bytes
+                .get(off..)
+                .ok_or_else(|| SessionError::new(SessionErrorCode::InvalidValue, None))?;
+            let sent = send_with_fds(sock, rest, &[], remaining(deadline)?)
+                .map_err(|e| SessionError::transport(e, Some(code.as_u32())))?;
+            off += sent.len;
         }
         Ok(())
     }

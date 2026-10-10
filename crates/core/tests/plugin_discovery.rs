@@ -562,3 +562,31 @@ fn plug4_core_sha256_unchanged_after_plugin_add() {
 
     assert_eq!(src_before, src_after, "core source sha256 list changed");
 }
+
+/// ERR-1・PLUG-11: `discover_with_options` → `write_path_warnings` の公開経路で、PATH 上の
+/// ディレクトリ名に含まれる表示を乱す文字（ESC・双方向制御・行区切り等）が空白へ置換され、
+/// 1 警告 1 行の JSON に収まる。
+#[cfg(unix)]
+#[test]
+fn err1_plug11_path_warning_replaces_display_unsafe_chars_in_path() {
+    let (tmp, managed, _pdir) = path_fixture("path-sanitize");
+    let weird = tmp.0.join("d\u{1b}x\u{202e}y\u{2028}z\u{7f}");
+    fs::create_dir_all(&weird).unwrap();
+    touch(&weird, &exe("cri"));
+    let value = std::env::join_paths([&weird]).unwrap();
+    let opts = DiscoveryOptions::new().with_path_search(PathSearchPolicy::Enabled);
+    let report = discover_with_options(&managed, Some(&value), &opts).unwrap();
+    let mut out = Vec::new();
+    write_path_warnings(&report, &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(text.matches('\n').count(), 1, "{text}");
+    let v: serde_json::Value = serde_json::from_str(text.trim_end()).unwrap();
+    let path = v["path"].as_str().unwrap();
+    let expected = weird
+        .join(exe("cri"))
+        .to_string_lossy()
+        .replace(['\u{1b}', '\u{202e}', '\u{2028}', '\u{7f}'], " ");
+    assert_eq!(path, expected);
+    assert_eq!(v["name"], "cri");
+    assert_eq!(v["level"], "warn");
+}

@@ -200,6 +200,21 @@ pub fn need_reply_ignored_line(request: u32) -> String {
     format!("venus_jig event=need_reply_ignored request={request}")
 }
 
+/// `GET_SHMEM_CONFIG` に答えたことを示すログ行（#1641）。固定語彙と数値だけを出す。
+pub fn shmem_config_line(nregions: u32, shmid: u8, size: u64) -> String {
+    format!("venus_jig event=shmem_config request=44 nregions={nregions} shmid={shmid} size={size}")
+}
+
+/// `SET_BACKEND_REQ_FD` を受理した（UDS を保持した）ことを示すログ行（#1641）。fd 番号は出さない。
+pub fn backend_req_line() -> String {
+    "venus_jig event=backend_req request=21 result=accepted".to_string()
+}
+
+/// セッション終了時の host-visible 共有メモリの成立状況（#1641）。`status` は固定語彙（`ready` ほか）。
+pub fn host_visible_line(status: &str) -> String {
+    format!("venus_jig event=host_visible status={status}")
+}
+
 /// writable の容量が応答に足りず、応答を書かずに len=0 で返したことを示すログ行。
 pub fn response_dropped_line() -> String {
     "venus_jig event=response_dropped reason=writable_too_small".to_string()

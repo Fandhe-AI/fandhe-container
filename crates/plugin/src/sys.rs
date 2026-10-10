@@ -357,7 +357,8 @@ pub(crate) enum ChildExitProbe {
     Exited,
 }
 
-/// `waitid(2)` の ABI。OS・アーキテクチャごとに個別定義し、他の定義を流用しない。値の出典は各定義の注記。
+/// `waitid(2)` の ABI。OS・アーキテクチャごとに個別定義し、他の定義を流用しない（値が同じでも他の
+/// OS・アーキテクチャの定義を借りない。REPAIR-2）。値の出典は各定義の注記。
 /// 定義を持たない OS・アーキテクチャは [`probe_child_exit`] が `Unsupported` を返す（fail-closed）。
 #[cfg(any(
     all(
@@ -367,84 +368,152 @@ pub(crate) enum ChildExitProbe {
     target_os = "macos"
 ))]
 mod waitid_abi {
-    /// `idtype_t` の `P_PID`（pid 指定）。Linux（`linux/wait.h`・`bits/types/idtype_t.h`）・macOS
-    /// （`sys/wait.h`）とも 1。
-    pub(super) const P_PID: i32 = 1;
-    /// `WNOHANG`（待機せず戻る）。Linux・macOS とも 1。
-    pub(super) const WNOHANG: i32 = 1;
-    /// `WEXITED`（終了した子を対象にする）。Linux・macOS とも 4。
-    pub(super) const WEXITED: i32 = 4;
-    /// `WNOWAIT`（子を回収せず状態を残す）。Linux は `linux/wait.h` の `0x0100_0000`。
-    #[cfg(target_os = "linux")]
-    pub(super) const WNOWAIT: i32 = 0x0100_0000;
-    /// macOS は `sys/wait.h` の `0x20`（Linux と値が異なる）。
-    #[cfg(target_os = "macos")]
-    pub(super) const WNOWAIT: i32 = 0x20;
-
-    /// Linux の `siginfo_t`（`bits/types/siginfo_t.h`。`__SI_MAX_SIZE` = 128 バイト）。
-    /// 先頭が `si_signo`・`si_errno`・`si_code`、64 bit では union が 8 バイト境界に置かれ、
-    /// `_sigchld.si_pid` はオフセット 16。x86_64 と aarch64 は同じ asm-generic レイアウトだが、
-    /// アーキテクチャごとに個別に定義する。
-    /// C の `siginfo_t` は union に 8 バイト整列の要素を含むため `align(8)` を明示する（`MaybeUninit` で確保した領域を `waitid` に渡すための整列保証）。
+    /// Linux x86_64 の定数と `siginfo_t`。
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    #[repr(C, align(8))]
-    #[allow(dead_code)] // カーネルが書く領域を写すだけで、読むのは `si_pid` のみ
-    pub(super) struct SigInfo {
-        pub(super) si_signo: i32,
-        pub(super) si_errno: i32,
-        pub(super) si_code: i32,
-        pub(super) pad0: i32,
-        pub(super) si_pid: i32,
-        pub(super) si_uid: u32,
-        pub(super) rest: [u8; 128 - 24],
-    }
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    const _: () = {
-        assert!(size_of::<SigInfo>() == 128);
-        assert!(std::mem::offset_of!(SigInfo, si_pid) == 16);
-        assert!(align_of::<SigInfo>() == 8);
-    };
+    mod imp {
+        /// `idtype_t` の `P_PID`（pid 指定）。`linux/wait.h`・`bits/types/idtype_t.h` の 1。
+        pub(in super::super) const P_PID: i32 = 1;
+        /// `WNOHANG`（待機せず戻る）。`linux/wait.h`・`bits/waitflags.h` の 1。
+        pub(in super::super) const WNOHANG: i32 = 1;
+        /// `WEXITED`（終了した子を対象にする）。`linux/wait.h`・`bits/waitflags.h` の 4。
+        pub(in super::super) const WEXITED: i32 = 4;
+        /// `WNOWAIT`（子を回収せず状態を残す）。`linux/wait.h` の `0x0100_0000`。
+        pub(in super::super) const WNOWAIT: i32 = 0x0100_0000;
 
-    /// Linux aarch64 の `siginfo_t`（x86_64 と同じ 128 バイト・`si_pid` はオフセット 16）。
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    #[repr(C, align(8))]
-    #[allow(dead_code)] // カーネルが書く領域を写すだけで、読むのは `si_pid` のみ
-    pub(super) struct SigInfo {
-        pub(super) si_signo: i32,
-        pub(super) si_errno: i32,
-        pub(super) si_code: i32,
-        pub(super) pad0: i32,
-        pub(super) si_pid: i32,
-        pub(super) si_uid: u32,
-        pub(super) rest: [u8; 128 - 24],
-    }
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    const _: () = {
-        assert!(size_of::<SigInfo>() == 128);
-        assert!(std::mem::offset_of!(SigInfo, si_pid) == 16);
-        assert!(align_of::<SigInfo>() == 8);
-    };
+        /// Linux x86_64 の `siginfo_t`（`bits/types/siginfo_t.h`。`__SI_MAX_SIZE` = 128 バイト）。
+        /// 先頭が `si_signo`・`si_errno`・`si_code`、64 bit では union が 8 バイト境界に置かれ、
+        /// `_sigchld.si_pid` はオフセット 16。C の `siginfo_t` は union に 8 バイト整列の要素を含むため
+        /// `align(8)` を明示する（`waitid` に渡す領域の整列保証）。フィールドは整数のみでパディングを持たない
+        /// （4 × 6 + 104 = 128）ため、どのバイト列も有効な値である。
+        #[repr(C, align(8))]
+        #[allow(dead_code)] // カーネルが書く領域を写すだけで、読むのは `si_pid` のみ
+        pub(in super::super) struct SigInfo {
+            pub(in super::super) si_signo: i32,
+            pub(in super::super) si_errno: i32,
+            pub(in super::super) si_code: i32,
+            pub(in super::super) pad0: i32,
+            pub(in super::super) si_pid: i32,
+            pub(in super::super) si_uid: u32,
+            pub(in super::super) rest: [u8; 128 - 24],
+        }
+        const _: () = {
+            assert!(size_of::<SigInfo>() == 128);
+            assert!(std::mem::offset_of!(SigInfo, si_pid) == 16);
+            assert!(align_of::<SigInfo>() == 8);
+        };
 
-    /// macOS の `siginfo_t`（`sys/signal.h` の `struct __siginfo`。LP64 で 104 バイト）。
-    /// `si_signo`・`si_errno`・`si_code`・`si_pid`・`si_uid`・`si_status` の順で、`si_pid` はオフセット 12。
-    /// 以降（`si_addr`・`si_value`・`si_band`・`__pad[7]`）は 80 バイトを不透明に写す。
-    #[cfg(target_os = "macos")]
-    #[repr(C)]
-    #[allow(dead_code)] // カーネルが書く領域を写すだけで、読むのは `si_pid` のみ
-    pub(super) struct SigInfo {
-        pub(super) si_signo: i32,
-        pub(super) si_errno: i32,
-        pub(super) si_code: i32,
-        pub(super) si_pid: i32,
-        pub(super) si_uid: u32,
-        pub(super) si_status: i32,
-        pub(super) rest: [u64; 10],
+        impl SigInfo {
+            /// 全フィールド 0 の値（`unsafe` なしで組み立てる。`si_pid == 0` を「未終了」と読むための初期値）。
+            pub(in super::super) const fn zeroed() -> Self {
+                Self {
+                    si_signo: 0,
+                    si_errno: 0,
+                    si_code: 0,
+                    pad0: 0,
+                    si_pid: 0,
+                    si_uid: 0,
+                    rest: [0; 128 - 24],
+                }
+            }
+        }
     }
+
+    /// Linux aarch64 の定数と `siginfo_t`（x86_64 と同じ値・asm-generic レイアウトだが個別に定義する）。
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    mod imp {
+        /// `idtype_t` の `P_PID`（pid 指定）。`linux/wait.h`・`bits/types/idtype_t.h` の 1。
+        pub(in super::super) const P_PID: i32 = 1;
+        /// `WNOHANG`（待機せず戻る）。`linux/wait.h`・`bits/waitflags.h` の 1。
+        pub(in super::super) const WNOHANG: i32 = 1;
+        /// `WEXITED`（終了した子を対象にする）。`linux/wait.h`・`bits/waitflags.h` の 4。
+        pub(in super::super) const WEXITED: i32 = 4;
+        /// `WNOWAIT`（子を回収せず状態を残す）。`linux/wait.h` の `0x0100_0000`。
+        pub(in super::super) const WNOWAIT: i32 = 0x0100_0000;
+
+        /// Linux aarch64 の `siginfo_t`（128 バイト・`si_pid` はオフセット 16・整列 8。整数のみでパディングなし）。
+        #[repr(C, align(8))]
+        #[allow(dead_code)] // カーネルが書く領域を写すだけで、読むのは `si_pid` のみ
+        pub(in super::super) struct SigInfo {
+            pub(in super::super) si_signo: i32,
+            pub(in super::super) si_errno: i32,
+            pub(in super::super) si_code: i32,
+            pub(in super::super) pad0: i32,
+            pub(in super::super) si_pid: i32,
+            pub(in super::super) si_uid: u32,
+            pub(in super::super) rest: [u8; 128 - 24],
+        }
+        const _: () = {
+            assert!(size_of::<SigInfo>() == 128);
+            assert!(std::mem::offset_of!(SigInfo, si_pid) == 16);
+            assert!(align_of::<SigInfo>() == 8);
+        };
+
+        impl SigInfo {
+            /// 全フィールド 0 の値（`unsafe` なしで組み立てる。`si_pid == 0` を「未終了」と読むための初期値）。
+            pub(in super::super) const fn zeroed() -> Self {
+                Self {
+                    si_signo: 0,
+                    si_errno: 0,
+                    si_code: 0,
+                    pad0: 0,
+                    si_pid: 0,
+                    si_uid: 0,
+                    rest: [0; 128 - 24],
+                }
+            }
+        }
+    }
+
+    /// macOS の定数と `siginfo_t`（x86_64・arm64 で同じ ABI のため `target_arch` 分岐は持たない）。
     #[cfg(target_os = "macos")]
-    const _: () = {
-        assert!(size_of::<SigInfo>() == 104);
-        assert!(std::mem::offset_of!(SigInfo, si_pid) == 12);
-    };
+    mod imp {
+        /// `idtype_t` の `P_PID`（pid 指定）。`sys/wait.h` の 1。
+        pub(in super::super) const P_PID: i32 = 1;
+        /// `WNOHANG`（待機せず戻る）。`sys/wait.h` の 1。
+        pub(in super::super) const WNOHANG: i32 = 1;
+        /// `WEXITED`（終了した子を対象にする）。`sys/wait.h` の 4。
+        pub(in super::super) const WEXITED: i32 = 4;
+        /// `WNOWAIT`（子を回収せず状態を残す）。`sys/wait.h` の `0x20`（Linux と値が異なる）。
+        pub(in super::super) const WNOWAIT: i32 = 0x20;
+
+        /// macOS の `siginfo_t`（`sys/signal.h` の `struct __siginfo`。LP64 で 104 バイト）。
+        /// `si_signo`・`si_errno`・`si_code`・`si_pid`・`si_uid`・`si_status` の順で、`si_pid` はオフセット 12。
+        /// 以降（`si_addr`・`si_value`・`si_band`・`__pad[7]`）は 80 バイトを不透明に写す。整数のみで
+        /// パディングを持たない（4 × 6 + 80 = 104。`rest` はオフセット 24 で 8 バイト境界）。
+        #[repr(C)]
+        #[allow(dead_code)] // カーネルが書く領域を写すだけで、読むのは `si_pid` のみ
+        pub(in super::super) struct SigInfo {
+            pub(in super::super) si_signo: i32,
+            pub(in super::super) si_errno: i32,
+            pub(in super::super) si_code: i32,
+            pub(in super::super) si_pid: i32,
+            pub(in super::super) si_uid: u32,
+            pub(in super::super) si_status: i32,
+            pub(in super::super) rest: [u64; 10],
+        }
+        const _: () = {
+            assert!(size_of::<SigInfo>() == 104);
+            assert!(std::mem::offset_of!(SigInfo, si_pid) == 12);
+            assert!(align_of::<SigInfo>() == 8);
+        };
+
+        impl SigInfo {
+            /// 全フィールド 0 の値（`unsafe` なしで組み立てる。`si_pid == 0` を「未終了」と読むための初期値）。
+            pub(in super::super) const fn zeroed() -> Self {
+                Self {
+                    si_signo: 0,
+                    si_errno: 0,
+                    si_code: 0,
+                    si_pid: 0,
+                    si_uid: 0,
+                    si_status: 0,
+                    rest: [0; 10],
+                }
+            }
+        }
+    }
+
+    pub(super) use imp::{P_PID, SigInfo, WEXITED, WNOHANG, WNOWAIT};
 
     unsafe extern "C" {
         // SAFETY（宣言そのものの妥当性）: POSIX の `int waitid(idtype_t idtype, id_t id, siginfo_t *infop,
@@ -484,26 +553,27 @@ const PROBE_EINTR_RETRIES: usize = 3;
     target_os = "macos"
 ))]
 pub(crate) fn probe_child_exit(pid: u32) -> io::Result<ChildExitProbe> {
-    use std::mem::MaybeUninit;
     let checked = i32::try_from(pid)
         .ok()
         .filter(|p| *p > 1)
         .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
     let mut attempts = 0;
     loop {
-        // 待機可能な子がいないときの `infop` の中身は実装依存のため、0 初期化して `si_pid == 0` を
-        // 「未終了」と読む。
-        let mut info = MaybeUninit::<waitid_abi::SigInfo>::zeroed();
-        // SAFETY: `info` は呼び出し中有効な、`siginfo_t` 全体と同じ大きさ（コンパイル時に検査）の書き込み可能な
-        // スタック領域で、0 初期化済み（整数のみの `#[repr(C)]` 型は 0 が有効値）。`pid` は 1 より大きい値に
-        // 限定済みで `P_PID` により 1 プロセスだけを対象にする。`WNOWAIT` により子の状態を消費しないので、
-        // std の `Child` が前提にする「未回収の子だけを `waitpid` する」不変条件を崩さない。呼び出し側が
-        // 自プロセスの子の pid だけを渡すことが前提。
+        // 待機可能な子がいないときの `infop` の中身は実装依存のため、全フィールド 0 の値から始めて
+        // `si_pid == 0` を「未終了」と読む（`MaybeUninit` と `assume_init` を使わない。PLUG-7）。
+        let mut info = waitid_abi::SigInfo::zeroed();
+        // SAFETY: `&raw mut info` は呼び出し中有効で整列済み（`SigInfo` は `siginfo_t` と同じ整列）の、
+        // 初期化済みの `SigInfo` を指す。大きさは `siginfo_t` 全体と同じ（コンパイル時に検査）で、
+        // カーネルが書くのは `siginfo_t` の範囲内だけ。`SigInfo` は整数フィールドのみでパディングを持たない
+        // ため、カーネルがどのバイトを書いても（書かなくても）有効な値のままで、呼び出し後に safe に読める。
+        // `pid` は 1 より大きい値に限定済みで `P_PID` により 1 プロセスだけを対象にする。`WNOWAIT` により
+        // 子の状態を消費しないので、std の `Child` が前提にする「未回収の子だけを `waitpid` する」不変条件を
+        // 崩さない。呼び出し側が自プロセスの子の pid だけを渡すことが前提。
         let rc = unsafe {
             waitid_abi::waitid(
                 waitid_abi::P_PID,
                 pid,
-                info.as_mut_ptr(),
+                &raw mut info,
                 waitid_abi::WEXITED | waitid_abi::WNOHANG | waitid_abi::WNOWAIT,
             )
         };
@@ -515,8 +585,6 @@ pub(crate) fn probe_child_exit(pid: u32) -> io::Result<ChildExitProbe> {
             }
             return Err(e);
         }
-        // SAFETY: 0 初期化済みで、カーネルが書いた場合も整数フィールドのみ。
-        let info = unsafe { info.assume_init() };
         return match info.si_pid {
             0 => Ok(ChildExitProbe::Running),
             p if p == checked => Ok(ChildExitProbe::Exited),
@@ -2911,5 +2979,82 @@ mod write_nonblocking_flag_tests {
         drop(b);
         let e = write_nonblocking(&a, b"x\n").unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
+    }
+}
+
+/// REPAIR-2・#1604: `waitid_abi` の定数は OS・アーキテクチャごとの個別定義で、ヘッダの値と一致する
+/// （Linux: `linux/wait.h`・`bits/waitflags.h`・`bits/types/idtype_t.h`、macOS: `sys/wait.h`）。
+/// 誤った `WNOWAIT` は子を回収してしまい、pgid の再利用を許すため具体値で固定する（PLUG-7）。
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+mod waitid_abi_linux_x86_64_tests {
+    use super::waitid_abi;
+
+    #[test]
+    fn repair2_waitid_constants_match_linux_x86_64_headers() {
+        assert_eq!(waitid_abi::P_PID, 1);
+        assert_eq!(waitid_abi::WNOHANG, 1);
+        assert_eq!(waitid_abi::WEXITED, 4);
+        assert_eq!(waitid_abi::WNOWAIT, 0x0100_0000);
+    }
+
+    /// PLUG-7: `zeroed` は `si_pid == 0`（「未終了」の読み）を含む全フィールド 0 の値を返す。
+    #[test]
+    fn plug7_siginfo_zeroed_has_all_fields_zero() {
+        let info = waitid_abi::SigInfo::zeroed();
+        assert_eq!(
+            (info.si_signo, info.si_errno, info.si_code, info.pad0),
+            (0, 0, 0, 0)
+        );
+        assert_eq!((info.si_pid, info.si_uid), (0, 0));
+        assert_eq!(info.rest, [0u8; 104]);
+    }
+}
+
+/// REPAIR-2・#1604: Linux aarch64 の `waitid_abi` 定数（x86_64 と同じ値だが個別に定義・検査する）。
+#[cfg(all(test, target_os = "linux", target_arch = "aarch64"))]
+mod waitid_abi_linux_aarch64_tests {
+    use super::waitid_abi;
+
+    #[test]
+    fn repair2_waitid_constants_match_linux_aarch64_headers() {
+        assert_eq!(waitid_abi::P_PID, 1);
+        assert_eq!(waitid_abi::WNOHANG, 1);
+        assert_eq!(waitid_abi::WEXITED, 4);
+        assert_eq!(waitid_abi::WNOWAIT, 0x0100_0000);
+    }
+
+    /// PLUG-7: `zeroed` は `si_pid == 0`（「未終了」の読み）を含む全フィールド 0 の値を返す。
+    #[test]
+    fn plug7_siginfo_zeroed_has_all_fields_zero() {
+        let info = waitid_abi::SigInfo::zeroed();
+        assert_eq!(
+            (info.si_signo, info.si_errno, info.si_code, info.pad0),
+            (0, 0, 0, 0)
+        );
+        assert_eq!((info.si_pid, info.si_uid), (0, 0));
+        assert_eq!(info.rest, [0u8; 104]);
+    }
+}
+
+/// REPAIR-2・#1604: macOS の `waitid_abi` 定数（`WNOWAIT` は Linux と異なる 0x20）。
+#[cfg(all(test, target_os = "macos"))]
+mod waitid_abi_macos_tests {
+    use super::waitid_abi;
+
+    #[test]
+    fn repair2_waitid_constants_match_macos_headers() {
+        assert_eq!(waitid_abi::P_PID, 1);
+        assert_eq!(waitid_abi::WNOHANG, 1);
+        assert_eq!(waitid_abi::WEXITED, 4);
+        assert_eq!(waitid_abi::WNOWAIT, 0x20);
+    }
+
+    /// PLUG-7: `zeroed` は `si_pid == 0`（「未終了」の読み）を含む全フィールド 0 の値を返す。
+    #[test]
+    fn plug7_siginfo_zeroed_has_all_fields_zero() {
+        let info = waitid_abi::SigInfo::zeroed();
+        assert_eq!((info.si_signo, info.si_errno, info.si_code), (0, 0, 0));
+        assert_eq!((info.si_pid, info.si_uid, info.si_status), (0, 0, 0));
+        assert_eq!(info.rest, [0u64; 10]);
     }
 }

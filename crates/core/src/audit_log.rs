@@ -13,7 +13,8 @@
 //!   本番 sink `FileAuditSink`〔#1594〕は実装済み。launcher・CLI・healthcheck 等への配線は未実装）
 //! - exec の対象の拒否（層 `exec_target`）は `exec::audit_exec_violation` / `exec::record_exec_target_rejection`
 //!   が [`AuditEvent::ExecTarget`] として記録する。supervisor の通しの入口 `run_command` が親プロセス側で
-//!   1 拒否 1 件を記録する（#1465）。パスは持たない（型で保証）
+//!   1 拒否 1 件を記録する（#1465。worker の経路の拒否は `exec::record_exec_worker_rejection` で、種別 `rootfs_pivot`
+//!   の `rootfs_is_host_root` は層 `mount` のパスなし〔理由コードの欄なし〕の 1 件になる）。パスは持たない（型で保証）
 //! - エントリポイント検証の拒否（層 `entrypoint`。#1595）は `exec::audit_entrypoint_violation` /
 //!   `exec::record_entrypoint_rejection` が [`AuditEvent::Entrypoint`] として記録する。launch と exec の
 //!   子が共有する検証（`exec_checked_entrypoint` 等）の拒否理由 8 種を載せる層で、exec の

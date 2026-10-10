@@ -582,6 +582,10 @@ fn combine_group_outcomes(
 
 /// `rootfs` が呼び出しプロセス自身の `/` と別のディレクトリであることを確かめる
 /// （Landlock の検出より先に判定する）。
+///
+/// 拒否は違反 `rootfs_is_host_root`（種別 `rootfs_pivot`）で、supervisor の worker から `err` 行で親へ運ばれ、
+/// 親が層 `mount`（パスなし）に 1 件記録する（`ViolationReason::EXEC_WORKER_REASONS`・`record_exec_worker_rejection`。
+/// SEC-4・SEC-1）。
 fn reject_own_root(rootfs: BorrowedFd<'_>, own_root: BorrowedFd<'_>) -> Result<(), ExecError> {
     if same_directory(rootfs, own_root).map_err(|e| e.at_stage(IsolationStage::Validate))? {
         return Err(ExecError::from_violation_at(

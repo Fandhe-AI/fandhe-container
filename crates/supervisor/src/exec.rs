@@ -137,7 +137,12 @@
 //! - **監査記録**（SEC-4・SUP-6・TASK-163 追補・#1465）: [`run_command`] は監査の記録先 [`AuditSink`] を必須の
 //!   引数に取り、exec の対象の拒否（種別 `exec_target`。理由 `exec_target_*`・`exec_root_not_container_rootfs`・
 //!   `exec_joined_*`・`exec_target_pidfd_mismatch` の 10 種）を層 `exec_target` のレコードとして **1 拒否につき 1 件**
-//!   記録する。`execve` 前の子の拒否（`ExecExit::SetupFailed` の `violation`。種別 `entrypoint` の 8 理由）も
+//!   記録する。worker の制限の準備で生じる rootfs の拒否（種別 `rootfs_pivot` の `rootfs_is_host_root`。worker 自身の
+//!   `/` が bundle の rootfs と同じディレクトリ。SEC-1）も、core の `IsolationViolation::mount_audit_event` と同じ写像で
+//!   層 `mount` のレコード（パスなし。`AuditEvent::Mount` は理由コードの欄を持たないため `reason` も無い）として
+//!   1 拒否につき 1 件記録する（#1614 の事後監査の P2）。worker の `err` 行が運ぶ理由はこの 11 種（core の
+//!   `ViolationReason::EXEC_WORKER_REASONS`）だけで、一覧と worker の経路のソースの一致は core の単体テストが固定する。
+//!   `execve` 前の子の拒否（`ExecExit::SetupFailed` の `violation`。種別 `entrypoint` の 8 理由）も
 //!   層 `entrypoint` のレコードとして 1 拒否につき 1 件記録し（#1595）、結果は [`AuditedOutcome::audit`] で返す
 //!   （`SetupFailed` は `Err` ではなく `Ok` のまま返り、拒否は変わらない）。監査なしで通す入口は無い。記録点は worker の結果を復号した直後の **親プロセス（exec を起動したプロセス）** の 1 箇所で、
 //!   worker の中では記録しない（worker は `setns` 後にコンテナの mount namespace と cgroup に入っており、そこで
@@ -198,9 +203,13 @@
 //!   [`run_command`] での 1 拒否 1 件の記録は実装済み（#1465）。`ExecOutcome::exit` が運ぶ `execve` 前の違反
 //!   （`SetupFailed`。種別 `entrypoint`）の層 `entrypoint` での記録も実装済み（#1595）。未実装なのは
 //!   launch 経路（`spawn_container` の子・launcher）で同じ理由が生じたときの記録の配線（#1314。core の
-//!   `exec::audit_entrypoint_violation`）。種別 `mount_target` の `target_moved` は launch の `pivot_root` 前だけで
-//!   生じ、exec の子では生じない（worker の結果行にも載らない）ため、この入口の記録の対象外。再起動を越えて残る
-//!   置き場所・ローテーション・常時の二重記録も未実装（`FileAuditSink` の doc）
+//!   `exec::audit_entrypoint_violation`）。worker の経路の違反（種別 `exec_target` の 10 理由と種別 `rootfs_pivot` の
+//!   `rootfs_is_host_root`）と exec の子の違反（種別 `entrypoint` の 8 理由）は、いずれもこの入口で記録する（「監査記録」）。
+//!   この入口の記録の対象外は、exec の経路で生じない理由だけ: 種別 `mount_target` の `target_moved` は launch の
+//!   `pivot_root` 前だけで生じ、種別 `rootfs_pivot` のうち `rootfs_is_host_root` 以外（`rootfs_moved` 等）は launch の
+//!   `prepare_rootfs` / `pivot_root` だけで生じる（どちらも worker の結果行に載らず、載っても許可リスト外として
+//!   拒否し記録しない）。層 `mount` のレコードに理由コードを載せること（`AuditEvent::Mount` の拡張。#652 の共通ログ型と
+//!   合わせて決める）、再起動を越えて残る置き場所・ローテーション・常時の二重記録も未実装（`FileAuditSink` の doc）
 //! - `--ulimit` の指定値の `state.json` への記録。現状は pid1 の実効値を写して代替する（hard は launch を
 //!   超えないが、soft は pid1 が hard の範囲で上げていれば launch の指定より高くなり得る。core の
 //!   `exec/reapply.rs` のモジュール doc）
@@ -220,7 +229,7 @@ use fandhe_container_core::exec::{
     join_namespaces, prepare_cgroup_join as core_prepare_cgroup_join,
     prepare_exec_restrictions as core_prepare_exec_restrictions,
     reapply_restrictions as core_reapply_restrictions, record_entrypoint_rejection,
-    record_exec_target_rejection, remove_exec_child_cgroup, spawn_exec_command, spawn_exec_worker,
+    record_exec_worker_rejection, remove_exec_child_cgroup, spawn_exec_command, spawn_exec_worker,
     sweep_stale_exec_child_cgroups,
 };
 use fandhe_container_core::oci_runtime::{OciConfig, RootfsDir, load_config, pin_bundle_rootfs};
@@ -626,7 +635,7 @@ impl Deadline {
 /// 呼べば `setns` が拒否される）。失敗時は状態を戻せないため、呼び出し側は続行せずプロセスを終了する。
 /// エラーメッセージへホスト側パス・ルール内容・期待 cgroup パスを載せない。
 ///
-/// `audit` は exec の対象の拒否の記録先（SEC-4・#1465。契約はモジュール doc「監査記録」。本番用は [`default_audit_sink`]）。拒否は `Err` の
+/// `audit` は分離違反による拒否の記録先（SEC-4・#1465。契約はモジュール doc「監査記録」。本番用は [`default_audit_sink`]）。拒否は `Err` の
 /// [`AuditedRejection`] で返り、`error` は記録の成否に関わらず元の拒否、`delivery` が記録の結果。移行: 呼び出しへ
 /// sink を渡し、`Err` は `.error` / `.delivery` を見る。`audit` の実装はブロックし得る I/O にタイムアウトを持つこと
 /// （REPAIR-5。`AuditSink` の契約）。記録は worker を回収した後に行うため、sink が詰まっても worker・コマンドは残らない。
@@ -655,9 +664,14 @@ pub fn run_command(
 
 /// worker の結果を受け、拒否なら 1 件記録して返す（親プロセス側の記録点。SEC-4・SUP-6・#1465・#1595）。
 ///
-/// - `Err` で exec の対象の違反の理由があれば層 `exec_target` で 1 件記録する
+/// - `Err` で worker の経路の違反の理由があれば 1 件記録する（core の `record_exec_worker_rejection`）。種別
+///   `exec_target` は層 `exec_target`（理由コードつき）、種別 `rootfs_pivot` の `rootfs_is_host_root`（worker 自身の
+///   `/` が bundle の rootfs と同じ。`prepare_exec_restrictions` の拒否）は層 `mount`（パスなし。core の
+///   `IsolationViolation::mount_audit_event` と同じ写像）
 /// - `Ok` で `SetupFailed { violation: Some(_) }` なら層 `entrypoint` で 1 件記録する。`Ok` のまま返し、
 ///   記録の成否で結果は変わらない（`AuditedOutcome::audit` に結果を載せる）
+/// - 1 つの拒否が写る層は 1 つだけ（`err` 行と `ok` 行の理由の一覧は交わらない。core の
+///   `exec/violation_scan.rs` の単体テストが固定する）
 /// - 違反の理由を持たないもの（タイムアウト・システムエラー・前提不成立・コマンドの終了）は記録せず `NotApplicable`
 fn audit_worker_result(
     result: Result<ExecOutcome, WorkerFailure>,
@@ -681,7 +695,7 @@ fn audit_worker_result(
             }),
         },
         Err(failure) => Err(match failure.violation {
-            Some(reason) => record_exec_target_rejection(failure.error, reason, audit),
+            Some(reason) => record_exec_worker_rejection(failure.error, reason, audit),
             None => AuditedRejection::not_applicable(failure.error),
         }),
     }
@@ -828,10 +842,11 @@ fn attach_sweep(
     }
 }
 
-/// worker の失敗。拒否のエラーと、exec の対象の違反だった場合のその理由（監査記録の入力。#1465）。
+/// worker の失敗。拒否のエラーと、worker の経路の違反だった場合のその理由（監査記録の入力。SEC-4・#1465）。
 ///
-/// `violation` は worker の結果行の理由コードを core の許可リスト（`ViolationReason::EXEC_TARGET_REASONS`）で
-/// 引き直した値だけを持つ。未知の文字列は結果行の不正として `Internal`（fail-closed）になりここへ来ない。
+/// `violation` は worker の結果行の `<種別>/<理由>` を core の許可リスト（`ViolationReason::EXEC_WORKER_REASONS`。
+/// 種別 `exec_target` の 10 理由と種別 `rootfs_pivot` の `rootfs_is_host_root`）で引き直した値だけを持つ。
+/// 未知・一覧外の文字列は結果行の不正として `Internal`（fail-closed）になりここへ来ない。
 #[derive(Debug)]
 struct WorkerFailure {
     error: TraitError,
@@ -1060,7 +1075,8 @@ pub fn run_in_worker_for_test(
 /// worker の結果を pipe 用の 1 行へ符号化する。成功は `ok <command|setup> <違反の理由コードまたは -> <exited|signaled>
 /// <値> <適用した rlimit 数> <子へ持ち越した rlimit 数（0 か 1）> <capability 数> <Landlock 数> <seccomp 命令数>
 /// <補助グループの扱い> <その件数> <実行方式（sealed_copy|pinned_inode）> <現行方式の理由コードまたは ->`、失敗は
-/// `err <ERR-1 コード> <exec 対象の違反の理由コードまたは -> <メッセージ>`（改行は空白へ置換）。
+/// `err <ERR-1 コード> <worker の経路の違反の 種別/理由コード または -> <メッセージ>`（改行は空白へ置換。違反の欄は
+/// `exec_target/exec_target_not_nested_pid1`・`rootfs_pivot/rootfs_is_host_root` の形）。
 fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
     let line = match result {
         Ok(o) => {
@@ -1094,12 +1110,17 @@ fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
                     .map_or("-", SealedCopyUnavailable::as_str),
             )
         }
-        Err(e) => format!(
-            "err {} {} {}\n",
-            e.code().as_str(),
-            exec_target_reason_of(e).map_or("-", ViolationReason::as_str),
-            e.message().replace(['\n', '\r'], " ")
-        ),
+        Err(e) => {
+            let violation = exec_worker_reason_of(e).map_or_else(
+                || "-".to_owned(),
+                |r| format!("{}/{}", r.kind().as_str(), r.as_str()),
+            );
+            format!(
+                "err {} {violation} {}\n",
+                e.code().as_str(),
+                e.message().replace(['\n', '\r'], " ")
+            )
+        }
     };
     let mut line = line;
     if line.len() > WORKER_LINE_MAX {
@@ -1114,15 +1135,20 @@ fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
     line.into_bytes()
 }
 
-/// [`from_exec_error`] が exec の対象の違反の末尾へ付ける目印（種別と理由コードの前まで）。
-const EXEC_TARGET_VIOLATION_MARKER: &str = " (violation: exec_target/";
+/// [`from_exec_error`] が分離違反の末尾へ付ける目印（`<種別>/<理由コード>, <ビヘイビア ID>)` の前まで）。
+const VIOLATION_MARKER: &str = " (violation: ";
 
-/// `err` が exec の対象の違反による拒否なら、その理由を返す（[`from_exec_error`] の末尾の目印を許可リストで
-/// 引き直す。メッセージは core の静的トークンだけから組み立てられ、外部入力は載らない。#1465）。
-fn exec_target_reason_of(err: &TraitError) -> Option<ViolationReason> {
-    let tail = err.message().rsplit_once(EXEC_TARGET_VIOLATION_MARKER)?.1;
+/// `err` が worker の経路の違反による拒否なら、その理由を返す（SEC-4・SUP-6・SEC-1・#1465）。
+///
+/// [`from_exec_error`] の末尾の `<種別>/<理由コード>` を core の許可リスト（`ViolationReason::EXEC_WORKER_REASONS`。
+/// 種別 `exec_target` の 10 理由と種別 `rootfs_pivot` の `rootfs_is_host_root`）で引き直す。一覧外の種別・理由
+/// （worker の経路では生じない。core の `exec/violation_scan.rs` の単体テストが固定する）は `None`。メッセージは
+/// core の静的トークンだけから組み立てられ、外部入力は載らない。
+fn exec_worker_reason_of(err: &TraitError) -> Option<ViolationReason> {
+    let tail = err.message().rsplit_once(VIOLATION_MARKER)?.1;
     let (token, _) = tail.split_once(", ")?;
-    ViolationReason::from_exec_target_token(token)
+    let (kind, reason) = token.split_once('/')?;
+    ViolationReason::from_exec_worker_token(kind, reason)
 }
 
 /// [`encode_worker_result`] の逆変換。形式に合わない入力（空・切れた行・未知の種別）は `Internal`（fail-closed）。
@@ -1140,7 +1166,16 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
         let (violation, message) = rest.split_once(' ').unwrap_or((rest, ""));
         let violation = match violation {
             "-" => None,
-            token => Some(ViolationReason::from_exec_target_token(token).ok_or_else(malformed)?),
+            // 許可リスト（core の `EXEC_WORKER_REASONS`）で `<種別>/<理由>` を静的トークンへ引き直す。未知・一覧外・
+            // 種別の食い違いは記録せず結果行の不正として拒否する（fail-closed）。
+            token => Some(
+                token
+                    .split_once('/')
+                    .and_then(|(kind, reason)| {
+                        ViolationReason::from_exec_worker_token(kind, reason)
+                    })
+                    .ok_or_else(malformed)?,
+            ),
         };
         let code = [
             ErrorCode::InvalidArgument,
@@ -1386,9 +1421,9 @@ fn load_exec_bundle(bundle: &std::path::Path) -> Result<(OciConfig, RootfsDir), 
 /// `ExecError` を `code` を保ったまま `TraitError` へ写す（段名はメッセージへ含める）。
 ///
 /// 分離違反による拒否（`ExecError::violation`。SEC-4）は、種別・理由コード・ビヘイビア ID をメッセージの
-/// 末尾に機械可読な形で残す（`TraitError` は違反記録を運べないため）。違反の対象（期待 cgroup パス）は
-/// メッセージへ含めない。exec の対象の違反の監査記録は通しの入口 [`run_command`] が親プロセスで行い、worker は
-/// 末尾の目印から理由を結果行へ載せる（[`exec_target_reason_of`]。#1465）。
+/// 末尾に機械可読な形で残す（`TraitError` は違反記録を運べないため）。違反の対象（期待 cgroup パス・rootfs の
+/// パス）はメッセージへ含めない。worker の経路の違反の監査記録は通しの入口 [`run_command`] が親プロセスで行い、
+/// worker は末尾の目印から `<種別>/<理由>` を結果行へ載せる（[`exec_worker_reason_of`]。#1465）。
 fn from_exec_error(err: ExecError) -> TraitError {
     let violation = err.violation.as_ref().map_or_else(String::new, |v| {
         format!(
@@ -1981,10 +2016,20 @@ mod tests {
             b"ok setup exec_target_cgroup_mismatch exited 126 1 0 2 3 4 cleared 1 sealed_copy -\n",
             b"ok setup bogus exited 126 1 0 2 3 4 cleared 1 sealed_copy -\n",
             b"hello\n",
-            // 失敗行: 理由の欄が無い旧形式・未知の理由・exec 対象でない理由。
+            // 失敗行: 理由の欄が無い旧形式・未知の理由・種別の無い旧形式の理由・worker の経路で生じない理由・
+            // 種別の食い違い（どれも記録せず `Internal`。#1614 の事後監査）。
             b"err TIMEOUT\n",
             b"err INTERNAL unknown_reason boom\n",
             b"err INTERNAL entrypoint_is_runtime_binary boom\n",
+            b"err FAILED_PRECONDITION exec_target_not_nested_pid1 boom\n",
+            b"err INVALID_ARGUMENT rootfs_is_host_root boom\n",
+            b"err INTERNAL entrypoint/entrypoint_is_runtime_binary boom\n",
+            b"err INVALID_ARGUMENT rootfs_pivot/rootfs_moved boom\n",
+            b"err INVALID_ARGUMENT mount_target/target_moved boom\n",
+            b"err INVALID_ARGUMENT exec_target/rootfs_is_host_root boom\n",
+            b"err FAILED_PRECONDITION rootfs_pivot/exec_target_not_nested_pid1 boom\n",
+            b"err FAILED_PRECONDITION exec_target/ boom\n",
+            b"err FAILED_PRECONDITION / boom\n",
         ] {
             let e = decode_worker_result(bad).unwrap_err().error;
             assert_eq!(e.code(), ErrorCode::Internal, "{bad:?}");
@@ -2070,68 +2115,119 @@ mod tests {
         }
     }
 
-    /// `from_exec_error` が exec 対象の違反へ付ける末尾と同じ形のエラー（実経路は結合試験 `exec_audit` が通す）。
+    /// `from_exec_error` が違反へ付ける末尾と同じ形を手で組んだエラー（段・本文は実物と異なる。実経路の
+    /// exec の対象の拒否は結合試験 `exec_audit` が通す）。
     fn exec_target_failure(reason: ViolationReason) -> TraitError {
         TraitError::new(
             ErrorCode::FailedPrecondition,
             format!(
-                "exec stage SetNs: rejected (violation: exec_target/{}, SUP-6)",
-                reason.as_str()
+                "exec stage SetNs: rejected (violation: {}/{}, {})",
+                reason.kind().as_str(),
+                reason.as_str(),
+                reason.behavior_id()
             ),
         )
     }
 
-    /// SEC-4・SUP-6・TASK-163 追補（#1465）: 9 理由すべてが結果行へ理由コードとして載り、往復で同じ理由に戻る。
-    /// 期待 cgroup パスのような対象はメッセージにも結果行にも載らない。
+    /// worker の経路の実際の拒否（core の `ExecError::from_violation` を `from_exec_error` で写したもの）。
+    /// subject にホスト側パスを持たせ、結果行・メッセージ・記録のどこにも載らないことを確かめるために使う。
+    fn worker_violation_failure(reason: ViolationReason) -> TraitError {
+        from_exec_error(fandhe_container_core::exec::path_violation_error_for_test(
+            reason,
+            std::path::Path::new(HOST_SUBJECT),
+        ))
+    }
+
+    /// 違反の subject に持たせるホスト側パス（結果行・記録に現れてはならない）。
+    const HOST_SUBJECT: &str = "/srv/fandhe/bundles/c1/rootfs";
+
+    /// SEC-4・SUP-6・SEC-1・TASK-163 追補（#1465）・#1614 の事後監査: worker の経路の 11 理由すべてが結果行へ
+    /// `<種別>/<理由>` として載り、往復で同じ理由に戻る。期待 cgroup パス・rootfs のパスはメッセージにも結果行にも載らない。
     #[test]
-    fn sec4_sup6_task163_worker_line_carries_exec_target_reason() {
-        for reason in ViolationReason::EXEC_TARGET_REASONS {
-            let err = exec_target_failure(reason);
-            assert_eq!(exec_target_reason_of(&err), Some(reason), "{reason:?}");
-            let line = encode_worker_result(&Err(err.clone()));
-            let text = String::from_utf8(line.clone()).unwrap();
-            assert!(
-                text.starts_with(&format!("err FAILED_PRECONDITION {} ", reason.as_str())),
-                "{text}"
-            );
-            let back = decode_worker_result(&line).unwrap_err();
-            assert_eq!(back.violation, Some(reason));
-            assert_eq!(back.error, err);
+    fn sec4_sup6_task163_worker_line_carries_worker_violation_reason() {
+        assert_eq!(ViolationReason::EXEC_WORKER_REASONS.len(), 11);
+        for reason in ViolationReason::EXEC_WORKER_REASONS {
+            for err in [
+                exec_target_failure(reason),
+                worker_violation_failure(reason),
+            ] {
+                assert_eq!(exec_worker_reason_of(&err), Some(reason), "{err:?}");
+                let line = encode_worker_result(&Err(err.clone()));
+                let text = String::from_utf8(line.clone()).unwrap();
+                assert!(
+                    text.starts_with(&format!(
+                        "err {} {}/{} ",
+                        err.code().as_str(),
+                        reason.kind().as_str(),
+                        reason.as_str()
+                    )),
+                    "{text}"
+                );
+                assert!(!text.contains(HOST_SUBJECT), "{text}");
+                let back = decode_worker_result(&line).unwrap_err();
+                assert_eq!(back.violation, Some(reason));
+                assert_eq!(back.error, err);
+            }
         }
-        // exec 対象でない違反・違反なしは理由を持たない。
-        let other = TraitError::new(
-            ErrorCode::FailedPrecondition,
-            "exec stage Spawn: x (violation: entrypoint/entrypoint_is_runtime_binary, SEC-1)",
-        );
-        assert_eq!(exec_target_reason_of(&other), None);
+        // 実際の拒否の形: `reject_own_root` の `rootfs_is_host_root` は `InvalidArgument`・種別 `rootfs_pivot`。
+        let err = worker_violation_failure(ViolationReason::RootfsIsHostRoot);
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(
-            exec_target_reason_of(&TraitError::new(
-                ErrorCode::Internal,
-                "x (violation: exec_target/bogus, SUP-6)"
-            )),
-            None
+            String::from_utf8(encode_worker_result(&Err(err))).unwrap(),
+            "err INVALID_ARGUMENT rootfs_pivot/rootfs_is_host_root exec stage PrepareRootfs: \
+             rootfs must not be the host root '/' (violation: rootfs_pivot/rootfs_is_host_root, CORE-1)\n"
+        );
+        // worker の経路で生じない違反（exec の子の entrypoint・launch だけの rootfs_pivot / mount_target）・
+        // 種別の食い違い・未知の理由・違反なしは理由を持たない（結果行は `-` で、記録しない）。
+        for message in [
+            "exec stage Spawn: x (violation: entrypoint/entrypoint_is_runtime_binary, SEC-1)",
+            "exec stage PrepareRootfs: x (violation: rootfs_pivot/rootfs_moved, SEC-1)",
+            "exec stage MountProc: x (violation: mount_target/target_moved, SEC-1)",
+            "exec stage Validate: x (violation: exec_target/rootfs_is_host_root, SEC-1)",
+            "exec stage SetNs: x (violation: rootfs_pivot/exec_target_not_nested_pid1, SUP-6)",
+            "x (violation: exec_target/bogus, SUP-6)",
+            "x (violation: exec_target_not_nested_pid1, SUP-6)",
+            "exec stage SetNs: no violation here",
+        ] {
+            let err = TraitError::new(ErrorCode::FailedPrecondition, message);
+            assert_eq!(exec_worker_reason_of(&err), None, "{message}");
+            let line = encode_worker_result(&Err(err));
+            let text = String::from_utf8(line.clone()).unwrap();
+            assert!(text.starts_with("err FAILED_PRECONDITION - "), "{text}");
+            assert_eq!(decode_worker_result(&line).unwrap_err().violation, None);
+        }
+        assert_eq!(
+            worker_violation_failure(ViolationReason::ExecTargetCgroupMismatch).message(),
+            "exec stage SetNs: the exec target does not belong to the recorded container cgroup \
+             (violation: exec_target/exec_target_cgroup_mismatch, SEC-1)"
         );
     }
 
-    /// SEC-4・SUP-6・TASK-163 追補（#1465）: 親側の記録は 9 理由それぞれ 1 件・層 `exec_target`・理由コード一致・
-    /// パスなし・自 PID。違反なしの失敗は 0 件で `NotApplicable`、失敗する sink でも拒否は元のまま。
+    /// SEC-4・SUP-6・SEC-1・TASK-163 追補（#1465）・#1614 の事後監査: 親側の記録は worker の経路の 11 理由それぞれ
+    /// 1 件・パスなし・自 PID。種別 `exec_target` は層 `exec_target` と理由コード、`rootfs_is_host_root` は層 `mount`
+    /// （理由コードの欄なし）。違反なしの失敗は 0 件で `NotApplicable`、失敗する sink でも拒否は元のまま。
     #[test]
-    fn sec4_sup6_task163_parent_records_one_audit_per_exec_target_rejection() {
-        for reason in ViolationReason::EXEC_TARGET_REASONS {
-            let err = exec_target_failure(reason);
+    fn sec4_sup6_task163_parent_records_one_audit_per_worker_rejection() {
+        for reason in ViolationReason::EXEC_WORKER_REASONS {
+            let err = worker_violation_failure(reason);
             let sink = RecordingSink::new(false);
-            let failure = WorkerFailure {
-                error: err.clone(),
-                violation: Some(reason),
-            };
+            let failure =
+                decode_worker_result(&encode_worker_result(&Err(err.clone()))).unwrap_err();
+            assert_eq!(failure.violation, Some(reason));
             let rejected = audit_worker_result(Err(failure), &sink).unwrap_err();
             assert_eq!(rejected.error, err);
             assert_eq!(rejected.delivery, AuditDelivery::Recorded);
             let recs = sink.snapshot();
             assert_eq!(recs.len(), 1, "{reason:?}");
-            assert_eq!(recs[0].layer(), AuditLayer::ExecTarget);
-            assert_eq!(recs[0].reason().map(|r| r.as_str()), Some(reason.as_str()));
+            let (layer, token) = if reason == ViolationReason::RootfsIsHostRoot {
+                (AuditLayer::Mount, None)
+            } else {
+                (AuditLayer::ExecTarget, Some(reason.as_str()))
+            };
+            assert_eq!(recs[0].layer(), layer, "{reason:?}");
+            assert_eq!(recs[0].reason().map(|r| r.as_str()), token);
             assert_eq!(recs[0].path(), None);
+            assert_eq!(recs[0].syscall(), None);
             assert_eq!(recs[0].pid().get(), std::process::id());
 
             let failing = RecordingSink::new(true);

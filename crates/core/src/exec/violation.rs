@@ -15,6 +15,9 @@
 //! 監査イベントへの写像は [`IsolationViolation::exec_audit_event`]（SUP-6・TASK-163 追補・#1465）で実装済み。
 //! エントリポイント検証の拒否（種別 `entrypoint` の 8 理由。launch と exec の子が共有する）から `Entrypoint`
 //! 監査イベントへの写像は [`IsolationViolation::entrypoint_audit_event`]（SEC-4・SUP-6・SEC-1・TASK-163 追補・#1595）。
+//! supervisor の exec の worker が返し得る違反（[`ViolationReason::EXEC_WORKER_REASONS`]。種別 `exec_target` の 10 理由と
+//! 種別 `rootfs_pivot` の `rootfs_is_host_root`）から監査イベントへの写像は [`ViolationReason::exec_worker_audit_event`]
+//! （`exec_target` は `ExecTarget`、`rootfs_is_host_root` は `mount_audit_event` と同じ `Mount` のパスなし。#1614 の事後監査）。
 //! ファイルへの永続化（TASK-41.5.1・#839）とカーネル監査フォールバック（#840）も `audit_log` に実装済みで、
 //! 本モジュールの記録を実際の sink へ流す本番経路（launcher・CLI への配線）は未実装
 //! （REPAIR-3: 実装済みを装わない）。
@@ -293,6 +296,56 @@ impl ViolationReason {
         (self.kind() == ViolationKind::ExecTarget).then(|| AuditEvent::ExecTarget {
             reason: AuditReason::new(self.as_str()),
         })
+    }
+
+    /// exec の worker（supervisor が core の `spawn_exec_worker` で fork し、対象の特定から制限の再適用・コマンドの
+    /// fork までを行うプロセス）が `ExecError::violation` として返し得る理由の全一覧（SEC-4・SUP-6・SEC-1）。
+    ///
+    /// supervisor の親プロセスが worker の結果行（`err` 行）の `<種別>/<理由>` を引き直す許可リストの SSOT。
+    /// [`Self::EXEC_TARGET_REASONS`] の 10 理由と、`prepare_exec_restrictions` の `reject_own_root` が返す
+    /// 種別 `rootfs_pivot` の `rootfs_is_host_root`（worker 自身の `/` が bundle の rootfs と同じディレクトリ）から成る。
+    /// 一覧と worker の経路のソースが作る理由の一致は `exec/violation_scan.rs` の単体テストが固定する。
+    /// exec の子が `execve` 前に報告する違反（種別 `entrypoint`）は `ok` 行の `SetupFailed` で運ばれるためここに含めない。
+    pub const EXEC_WORKER_REASONS: [ViolationReason; 11] = [
+        Self::ExecTargetNotNestedPid1,
+        Self::ExecTargetCgroupMismatch,
+        Self::ExecTargetSharesPidNamespace,
+        Self::ExecTargetSharesMountNamespace,
+        Self::ExecTargetInOtherUserNamespace,
+        Self::ExecRootNotContainerRootfs,
+        Self::ExecJoinedNamespaceMismatch,
+        Self::ExecJoinedPidNamespaceMismatch,
+        Self::ExecJoinedCgroupMismatch,
+        Self::ExecTargetPidfdMismatch,
+        Self::RootfsIsHostRoot,
+    ];
+
+    /// worker の結果行の種別名 `kind` と理由コード `reason` から理由を引き直す（許可リスト照合。SEC-4・SUP-6）。
+    ///
+    /// [`Self::EXEC_WORKER_REASONS`] にあり、かつ種別名がその理由の種別と一致するときだけ `Some`。未知の理由・
+    /// 一覧外の理由・種別の食い違いは `None`（呼び出し側は記録せず fail-closed で扱う）。外部（worker の結果行）から
+    /// 届いた文字列を、監査レコードへ入る静的トークンへ変換する唯一の入口。
+    pub fn from_exec_worker_token(kind: &str, reason: &str) -> Option<Self> {
+        Self::EXEC_WORKER_REASONS
+            .into_iter()
+            .find(|r| r.as_str() == reason && r.kind().as_str() == kind)
+    }
+
+    /// worker の経路の拒否 1 件に対応する監査イベント（SEC-4・SUP-6・SEC-1）。
+    ///
+    /// [`Self::EXEC_WORKER_REASONS`] の理由だけが対象で、それ以外は `None`。種別 `exec_target` は
+    /// [`Self::exec_target_audit_event`] と同じ `ExecTarget`、種別 `rootfs_pivot` は
+    /// [`IsolationViolation::mount_audit_event`] と同じ層 `Mount` へ写す（理由コードだけを持つ呼び出し側のため
+    /// パスなし。`AuditEvent::Mount` は理由コードの欄を持たない）。1 理由が写る層は 1 つだけ（二重に記録しない）。
+    pub fn exec_worker_audit_event(self) -> Option<AuditEvent> {
+        if !Self::EXEC_WORKER_REASONS.contains(&self) {
+            return None;
+        }
+        match self.kind() {
+            ViolationKind::ExecTarget => self.exec_target_audit_event(),
+            ViolationKind::RootfsPivot => Some(AuditEvent::Mount { path: None }),
+            _ => None,
+        }
     }
 
     /// 機械可読な理由コード（snake_case）。

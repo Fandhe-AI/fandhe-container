@@ -13,7 +13,10 @@
 //! 待機はすべて期限つき（REPAIR-5）。単一 fd 用の `sys::wait_fd` を socket と ctrl の kick で交互に短く待つ方式のため、
 //! kick への反応には最大 [`SessionLimits::poll_slice`] の遅延が乗る（複数 fd の ppoll 化は unsafe の承認範囲外）。
 //! 共有メモリ（F5.2b.2・#1641）: `GET_SHMEM_CONFIG` への応答と `SET_BACKEND_REQ_FD` の fd の保持は `negotiation` が担い、終了時に
-//! host-visible の成立状況（`host_visible` 行）を出す。backend 要求（`SHMEM_MAP` / `SHMEM_UNMAP`）の期限つき送信は `Session::shmem_map` / `shmem_unmap`（#1642。呼び出しは #1643 の ctrl）。
+//! host-visible の成立状況（`host_visible` 行）を出す。backend 要求（`SHMEM_MAP` / `SHMEM_UNMAP`）の期限つき送信は `Session::shmem_map` / `shmem_unmap`（#1642）で、
+//! ctrl の `RESOURCE_MAP_BLOB` / `UNMAP_BLOB` から呼ぶ（F5.2b.4a・#1643）。MAP は resource の大きさの memfd を作って frontend へ渡し、
+//! UNMAP が成功するまで fd を保持する。frontend の失敗・期限切れ・切断ではゲストへ ERR を返し adapter を巻き戻す（無応答にしない）。
+//! map 中の資源の解放の確定（UNREF の暫定拒否・channel 破損後の残存・セッション終了時の扱い）と一連の結合試験は #1645。
 //! 未実装（REPAIR-3）: cursorq（ring 1）の要求処理・`SET_CONFIG`・`VRING_NOFD`・inflight・
 //! `observe::snapshot_lines` の定期出力（終了時の集計出力は実装済み。定期出力と virtqueue 個別の観測カウンタは未実装）。
 //!
@@ -43,13 +46,18 @@ use std::time::{Duration, Instant};
 
 pub use error::{Cause, SessionError, SessionErrorCode};
 
-use crate::adapter::{CtrlAdapter, Submit3d};
+use crate::adapter::{CtrlAdapter, ShmemOp, ShmemOpKind, Submit3d};
 use crate::ctrl::{CtrlResponse, RESP_ERR_INVALID_PARAMETER};
 use crate::device;
 use crate::log::{self, QueryResult};
+use crate::resource::MAX_RESOURCES;
 use crate::sys;
-use crate::vhost_user::backend_req::{BackendRequest, ShmemMapRequest, ShmemMapping};
-use crate::vhost_user::fd_passing::{MAX_FDS, MAX_TIMEOUT, recv_with_fds, send_with_fds};
+use crate::vhost_user::backend_req::{
+    BackendRequest, BackendRequestCode, ShmemMapRequest, ShmemMapping,
+};
+use crate::vhost_user::fd_passing::{
+    MAX_FDS, MAX_TIMEOUT, create_memfd, recv_with_fds, send_with_fds,
+};
 use crate::vhost_user::observe;
 use crate::vhost_user::{
     Ack, Decoded, EncodedMessage, HEADER_LEN, Header, MAX_PAYLOAD_LEN, Reply, RequestCode,
@@ -58,7 +66,7 @@ use crate::vhost_user::{
 use crate::virtqueue::VirtqueueErrorCode;
 use backend_req::{BackendAck, BackendReqError};
 use metrics::{SessionMetrics, SessionOp};
-use negotiation::{State, expected_fds};
+use negotiation::{State, expected_fds, host_visible_config};
 
 /// ctrl 要求として受け付ける readable の最大長（固定長のスタックバッファの大きさ）。`CTX_CREATE`（96 バイト）より十分大きい。
 pub const MAX_CTRL_REQ_LEN: usize = 4096;
@@ -151,6 +159,7 @@ pub fn run_with_submit_hook(
         adapter: CtrlAdapter::default(),
         limits: *limits,
         metrics: SessionMetrics::default(),
+        blobs: BlobMemTable::default(),
     };
     let result = session.serve(sock, sink, on_submit);
     // #1641: host-visible 共有メモリが成立したか（しない場合は理由）。#725 の実機確認でログから直接読めるようにする。
@@ -178,6 +187,86 @@ struct Session {
     adapter: CtrlAdapter,
     limits: SessionLimits,
     metrics: SessionMetrics,
+    /// map 中の blob の実メモリ（memfd）。`UNMAP_BLOB` の成功まで保持し、セッション終了時に `Drop` で閉じる。
+    blobs: BlobMemTable,
+}
+
+/// blob の memfd の名前（`/proc/self/maps` に出るため固定文字列。ゲスト由来の値を入れない）。
+const BLOB_MEMFD_NAME: &std::ffi::CStr = c"venus-jig-blob";
+
+/// map 中の blob 1 件分（資源表は `File` を持てないので `session` が持つ。F5.2b.4a・#1643）。
+#[derive(Debug)]
+struct BlobMem {
+    res_id: u32,
+    /// frontend へ `SHMEM_MAP` で渡した memfd。治具自身は map しない。保持と `Drop` での close が目的。
+    _memfd: File,
+    mapping: ShmemMapping,
+}
+
+/// 固定長（資源表と同じ上限 [`MAX_RESOURCES`]）の副表。ゲスト入力でアロケーションは増えない。
+#[derive(Debug)]
+struct BlobMemTable {
+    slots: [Option<BlobMem>; MAX_RESOURCES],
+}
+
+impl Default for BlobMemTable {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| None),
+        }
+    }
+}
+
+impl BlobMemTable {
+    fn has_free_slot(&self) -> bool {
+        self.slots.iter().any(Option::is_none)
+    }
+
+    /// 空きスロットにだけ入れる。満杯なら渡された値を返す。
+    fn insert(&mut self, blob: BlobMem) -> Result<(), BlobMem> {
+        match self.slots.iter_mut().find(|s| s.is_none()) {
+            Some(slot) => {
+                *slot = Some(blob);
+                Ok(())
+            }
+            None => Err(blob),
+        }
+    }
+
+    fn mapping_of(&self, res_id: u32) -> Option<ShmemMapping> {
+        self.slots
+            .iter()
+            .flatten()
+            .find(|b| b.res_id == res_id)
+            .map(|b| b.mapping)
+    }
+
+    /// 該当を外す（memfd は drop で閉じる）。
+    fn remove(&mut self, res_id: u32) {
+        for slot in self.slots.iter_mut() {
+            if slot.as_ref().is_some_and(|b| b.res_id == res_id) {
+                *slot = None;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.slots.iter().flatten().count()
+    }
+}
+
+/// `service_ctrl` の 1 要求分の処理結果（応答の書き戻し前）。
+struct Processed {
+    response: CtrlResponse,
+    log_line: String,
+    submit: Option<Submit3d>,
+    /// frontend へ渡した map / unmap があったか（あれば応答の書き戻し失敗は巻き戻せない）。
+    had_shmem: bool,
+    /// 応答を書き戻せない要求として捨てる（adapter は巻き戻し済み）。
+    dropped: bool,
+    /// 応答を書き戻せなかったときに戻す adapter。
+    adapter_before: CtrlAdapter,
 }
 
 /// 受信した要求と添付 fd。
@@ -236,14 +325,10 @@ fn fill(
 }
 
 impl Session {
-    /// `SHMEM_MAP` を frontend へ送り、応答を確かめる（#1642。呼び出し元は #1643 の ctrl `MAP_BLOB`）。
+    /// `SHMEM_MAP` を frontend へ送り、応答を確かめる（#1642。呼び出し元は `execute_shmem`＝ctrl `MAP_BLOB`。#1643）。
     ///
     /// ゲート（REPLY_ACK 確定・host-visible 成立）を通らなければ送らずに `Err`（ログも出さない。呼び出し側が ctrl の
     /// エラーとして記録する）。送った場合は結果を 1 行ログに出し、治具側の失敗なら channel を閉じる。`fd` は借りるだけ。
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "#1643 の ctrl（MAP_BLOB）から呼ぶ")
-    )]
     fn shmem_map(
         &mut self,
         req: &ShmemMapRequest,
@@ -254,10 +339,6 @@ impl Session {
     }
 
     /// `SHMEM_UNMAP` を送る（#1642。MAP と同じ区間。fd なし）。
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "#1643 の ctrl（UNMAP_BLOB）から呼ぶ")
-    )]
     fn shmem_unmap(
         &mut self,
         mapping: &ShmemMapping,
@@ -266,10 +347,6 @@ impl Session {
         self.backend_exchange(&BackendRequest::ShmemUnmap(*mapping), None, sink)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "#1643 の ctrl（MAP_BLOB / UNMAP_BLOB）から呼ぶ")
-    )]
     fn backend_exchange(
         &mut self,
         req: &BackendRequest,
@@ -474,77 +551,88 @@ impl Session {
     }
 
     /// ctrl キュー（ring 0）の kick を待ち、積まれた要求を空にして call で通知する。処理したら真。
+    ///
+    /// 1 要求ごとに 3 段に分ける。(a) ring を借りて取り出し・読み取り、(b) `state` の借用を手放して `process_ctrl`
+    /// （`MAP_BLOB` / `UNMAP_BLOB` が backend channel を使うため）、(c) もう一度 ring を借りて応答を書き戻す。
     fn service_ctrl(
         &mut self,
         sink: &mut dyn FnMut(&str),
         on_submit: SubmitHook<'_>,
     ) -> Result<bool, SessionError> {
-        let Session {
-            state,
-            adapter,
-            limits,
-            metrics,
-        } = self;
-        let Some((ring, mem)) = state.ctrl_parts() else {
+        let poll_slice = self.limits.poll_slice;
+        let message_timeout = self.limits.message_timeout;
+        let Some((ring, _)) = self.state.ctrl_parts() else {
             return Ok(false);
         };
-        if !wait(
-            ring.kick.as_fd(),
-            sys::Interest::Readable,
-            limits.poll_slice,
-        )? {
+        if !wait(ring.kick.as_fd(), sys::Interest::Readable, poll_slice)? {
             return Ok(false);
         }
         // 相手が poll の後に counter を読み切っていれば処理するものが無い（次の kick を待つ）。
-        let kick = read_kick(&ring.kick, limits.poll_slice)?;
+        let kick = read_kick(&ring.kick, poll_slice)?;
         if kick == KickRead::Drained {
             return Ok(false);
         }
+        let depth = ring.depth();
+        let vq = |e| SessionError::virtqueue(e, None);
         let mut done = 0usize;
-        for _ in 0..ring.depth() {
-            let chain = match ring.queue.pop(mem) {
-                Ok(Some(c)) => c,
-                Ok(None) => break,
-                Err(e) => return Err(SessionError::virtqueue(e, None)),
+        for _ in 0..depth {
+            // (a) 取り出しと読み取り。
+            let mut buf = [0u8; MAX_CTRL_REQ_LEN];
+            let (chain, req_len, writable_len) = {
+                let Some((ring, mem)) = self.state.ctrl_parts() else {
+                    break;
+                };
+                let chain = match ring.queue.pop(mem) {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break,
+                    Err(e) => return Err(vq(e)),
+                };
+                let req_len = if chain.readable_len() > MAX_CTRL_REQ_LEN as u64 {
+                    None
+                } else {
+                    Some(chain.read_readable(mem, &mut buf).map_err(vq)?)
+                };
+                let writable_len = chain.writable_len();
+                (chain, req_len, writable_len)
             };
-            let vq = |e| SessionError::virtqueue(e, None);
-            // 応答を書き戻せず捨てる場合に adapter の状態変更（CTX の作成・破棄）を取り消すための控え。
-            let adapter_before = adapter.clone();
-            let (response, log_line, submit) = if chain.readable_len() > MAX_CTRL_REQ_LEN as u64 {
-                (
-                    CtrlResponse::new(None, RESP_ERR_INVALID_PARAMETER, &[]),
-                    log::rejected_line(None, QueryResult::InvalidParameter),
-                    None,
-                )
+            // (b) 処理。
+            let req = match req_len {
+                Some(n) => Some(
+                    buf.get(..n)
+                        .ok_or_else(|| SessionError::new(SessionErrorCode::InvalidValue, None))?,
+                ),
+                None => None,
+            };
+            let p = self.process_ctrl(req, writable_len, sink);
+            // (c) 書き戻し。
+            let Some((ring, mem)) = self.state.ctrl_parts() else {
+                return Err(SessionError::new(SessionErrorCode::InvalidValue, None));
+            };
+            let mut dropped = p.dropped;
+            let len = if dropped {
+                0
             } else {
-                let mut buf = [0u8; MAX_CTRL_REQ_LEN];
-                let n = chain.read_readable(mem, &mut buf).map_err(vq)?;
-                let req = buf
-                    .get(..n)
-                    .ok_or_else(|| SessionError::new(SessionErrorCode::InvalidValue, None))?;
-                let h = adapter.handle_ctrl(req);
-                // `h.submit`（受理した SUBMIT_3D の受け渡し点）は、応答を書き戻せた場合だけフックへ渡す
-                // （`dropped` で adapter を巻き戻した要求の提出は、ゲストが ACK を見ていないので捨てる。#1602）。
-                (h.response, h.log_line, h.submit)
-            };
-            let mut dropped = false;
-            let len = match chain.write_writable(mem, response.as_bytes()) {
-                Ok(n) => n,
-                // 書き戻し先が足りない要求は応答を捨て（len=0）、セッションは続ける。
-                // frontend が結果を確認できないため、この要求による adapter の状態変更も取り消す
-                // （取り消さないと同じ ID の再送が重複エラーになる）。
-                Err(e) if e.code == VirtqueueErrorCode::UsedLenExceedsWritable => {
-                    dropped = true;
-                    *adapter = adapter_before;
-                    0
+                match chain.write_writable(mem, p.response.as_bytes()) {
+                    Ok(n) => n,
+                    // 書き戻し先が足りない要求は応答を捨て（len=0）、セッションは続ける。
+                    // frontend が結果を確認できないため、この要求による adapter の状態変更も取り消す
+                    // （取り消さないと同じ ID の再送が重複エラーになる）。
+                    // frontend へ渡した map / unmap があるときは事前検査で起きないはずで、起きたら不整合を残さず終える。
+                    Err(e)
+                        if e.code == VirtqueueErrorCode::UsedLenExceedsWritable && !p.had_shmem =>
+                    {
+                        dropped = true;
+                        self.adapter = p.adapter_before.clone();
+                        0
+                    }
+                    Err(e) => return Err(vq(e)),
                 }
-                Err(e) => return Err(vq(e)),
             };
             ring.queue.add_used(mem, chain, len).map_err(vq)?;
-            sink(&log_line);
+            sink(&p.log_line);
             if dropped {
                 sink(&log::response_dropped_line());
-            } else if let Some(s) = submit
+            } else if let Some(s) = p.submit
                 && let Some(line) = on_submit(&s)
             {
                 sink(&line);
@@ -553,12 +641,136 @@ impl Session {
         }
         if done > 0 {
             let started = Instant::now();
-            let notified = notify(&ring.call, limits.message_timeout);
-            metrics.record(SessionOp::Notify, notified.is_ok(), started.elapsed());
+            let Some((ring, _)) = self.state.ctrl_parts() else {
+                return Err(SessionError::new(SessionErrorCode::InvalidValue, None));
+            };
+            let notified = notify(&ring.call, message_timeout);
+            self.metrics
+                .record(SessionOp::Notify, notified.is_ok(), started.elapsed());
             notified?;
         }
         // `Lost` では kick を読めたか不明なので ring は走査済み。処理が無ければ偽。
         Ok(done > 0 || kick == KickRead::Read)
+    }
+
+    /// ctrl 要求 1 件（`None` は長すぎて読まなかった要求）を処理する。ring・ゲストメモリには触れない。
+    ///
+    /// `MAP_BLOB` / `UNMAP_BLOB` は adapter の実行指示（[`ShmemOp`]）に従い frontend とやりとりする。応答を書き戻せない
+    /// （`writable_len` が応答の最大長に満たない）要求は、frontend へ**送る前に**捨てる（送ってから捨てると frontend にだけ
+    /// map が残る）。成功以外の結果は adapter を巻き戻す（資源表の map 状態も戻る）。
+    fn process_ctrl(
+        &mut self,
+        req: Option<&[u8]>,
+        writable_len: u64,
+        sink: &mut dyn FnMut(&str),
+    ) -> Processed {
+        // 応答を書き戻せず捨てる場合に adapter の状態変更（CTX の作成・破棄、map 状態）を取り消すための控え。
+        let adapter_before = self.adapter.clone();
+        let Some(req) = req else {
+            return Processed {
+                response: CtrlResponse::new(None, RESP_ERR_INVALID_PARAMETER, &[]),
+                log_line: log::rejected_line(None, QueryResult::InvalidParameter),
+                submit: None,
+                had_shmem: false,
+                dropped: false,
+                adapter_before,
+            };
+        };
+        let h = self.adapter.handle_ctrl(req);
+        let Some(op) = h.shmem else {
+            // `h.submit`（受理した SUBMIT_3D の受け渡し点）は、応答を書き戻せた場合だけフックへ渡す
+            // （`dropped` で adapter を巻き戻した要求の提出は、ゲストが ACK を見ていないので捨てる。#1602）。
+            return Processed {
+                response: h.response,
+                log_line: h.log_line,
+                submit: h.submit,
+                had_shmem: false,
+                dropped: false,
+                adapter_before,
+            };
+        };
+        let writable_ok = u64::try_from(op.max_response_len()).is_ok_and(|m| writable_len >= m);
+        if !writable_ok {
+            self.adapter = adapter_before.clone();
+            return Processed {
+                response: h.response,
+                log_line: h.log_line,
+                submit: None,
+                had_shmem: false,
+                dropped: true,
+                adapter_before,
+            };
+        }
+        let result = self.execute_shmem(&op, sink);
+        if result != QueryResult::Ok {
+            self.adapter = adapter_before.clone();
+        }
+        Processed {
+            response: op.response(result),
+            log_line: op.log_line(result),
+            submit: None,
+            had_shmem: true,
+            dropped: false,
+            adapter_before,
+        }
+    }
+
+    /// `MAP_BLOB` / `UNMAP_BLOB` の実体。frontend とのやりとりの結果を ctrl の結果語彙で返す。
+    ///
+    /// 共有メモリが未成立・frontend の失敗・期限切れ・切断は `Unspec`、memfd を作れないときは `OutOfMemory`。
+    /// 失敗した MAP の memfd は捨てる。失敗した UNMAP は副表の memfd を残す（frontend 側に map が残っているかもしれず、
+    /// 区間を再利用させない。解放の扱いは #1645）。channel の破損は `backend_exchange` が扱う。
+    fn execute_shmem(&mut self, op: &ShmemOp, sink: &mut dyn FnMut(&str)) -> QueryResult {
+        match op.kind {
+            ShmemOpKind::Map => {
+                if self
+                    .state
+                    .backend_channel(BackendRequestCode::ShmemMap)
+                    .is_err()
+                    || !self.blobs.has_free_slot()
+                {
+                    return QueryResult::Unspec;
+                }
+                let Ok(cfg) = host_visible_config() else {
+                    return QueryResult::Unspec;
+                };
+                let Ok(mapping) =
+                    ShmemMapping::new(&cfg, device::SHM_ID_HOST_VISIBLE, op.shm_offset, op.len)
+                else {
+                    return QueryResult::Unspec;
+                };
+                let Ok(req) = ShmemMapRequest::new(mapping, 0) else {
+                    return QueryResult::Unspec;
+                };
+                let Ok(memfd) = create_memfd(BLOB_MEMFD_NAME, op.len) else {
+                    return QueryResult::OutOfMemory;
+                };
+                if self.shmem_map(&req, memfd.as_fd(), sink).is_err() {
+                    return QueryResult::Unspec;
+                }
+                let kept = self.blobs.insert(BlobMem {
+                    res_id: op.res_id,
+                    _memfd: memfd,
+                    mapping,
+                });
+                if kept.is_err() {
+                    // 事前に空きを確かめているので到達しない。到達したら frontend に map が残るため UNMAP で戻す。
+                    let _ = self.shmem_unmap(&mapping, sink);
+                    return QueryResult::Unspec;
+                }
+                QueryResult::Ok
+            }
+            ShmemOpKind::Unmap => {
+                let Some(mapping) = self.blobs.mapping_of(op.res_id) else {
+                    return QueryResult::Unspec;
+                };
+                if self.shmem_unmap(&mapping, sink).is_err() {
+                    return QueryResult::Unspec;
+                }
+                self.blobs.remove(op.res_id);
+                QueryResult::Ok
+            }
+        }
     }
 }
 
@@ -722,5 +934,7 @@ fn notify(call: &File, timeout: Duration) -> Result<(), SessionError> {
 
 #[cfg(test)]
 mod backend_req_tests;
+#[cfg(test)]
+mod map_blob_tests;
 #[cfg(test)]
 mod tests;

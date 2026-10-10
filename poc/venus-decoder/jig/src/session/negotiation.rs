@@ -8,7 +8,7 @@
 //! 共有メモリ（host-visible。GPU-6・TASK-172 F5.2b.2・#1641）: protocol feature の SHMEM を確定した接続だけ `GET_SHMEM_CONFIG` に
 //! 応じ（shmid 1 を 1 個、`device::HOST_VISIBLE_SHM_SIZE`）、BACKEND_REQ を確定した接続だけ `SET_BACKEND_REQ_FD` の UDS を 1 回保持する。
 //! 保持した fd は [`State`] の drop（セッションの終了。正常もエラーも）で閉じる。確定の食い違いは [`State::host_visible`] が理由つきで表し、
-//! 拒否はしない（寛容。`MAP_BLOB` の ERR 化は #1643）。
+//! 拒否はしない（寛容）。`MAP_BLOB` は未成立なら `ERR_UNSPEC` で拒否する（#1643）。
 //! backend 要求の送信（F5.2b.3・#1642）: 送ってよいかの判定は [`State::backend_channel`]、失敗後の閉鎖は
 //! [`State::mark_backend_broken`]（`BackendChannel::Broken`。同期が崩れたストリームを使い続けない）。送受信は `super::backend_req`。
 //! 未実装（REPAIR-3）: `SET_CONFIG`・`VRING_NOFD`（polling）・inflight・cursorq（ring 1）の要求処理、
@@ -185,7 +185,7 @@ impl HostVisible {
 }
 
 /// `GET_SHMEM_CONFIG` の応答（shmid 1 を 1 個、大きさは `device::HOST_VISIBLE_SHM_SIZE`）。
-fn host_visible_config() -> Result<ShmemConfig, SessionError> {
+pub(super) fn host_visible_config() -> Result<ShmemConfig, SessionError> {
     ShmemConfig::new(&[ShmemRegion {
         id: device::SHM_ID_HOST_VISIBLE,
         size: device::HOST_VISIBLE_SHM_SIZE,
@@ -256,10 +256,6 @@ impl State {
     /// backend 要求を送ってよいときだけ UDS を返す（#1642）。順序は固定: REPLY_ACK 未確定（`REPLY_ACK_NOT_NEGOTIATED`）→
     /// host-visible 未成立（`HOST_VISIBLE_UNAVAILABLE`。理由は `cause`）。`Ready` は SHMEM の確定・`GET_SHMEM_CONFIG` への
     /// 回答・ソケットの保持をまとめて満たす。
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "#1643 の ctrl（MAP_BLOB / UNMAP_BLOB）から呼ぶ")
-    )]
     pub(crate) fn backend_channel(
         &self,
         request: BackendRequestCode,
@@ -286,10 +282,6 @@ impl State {
     }
 
     /// 送受信の失敗後に channel を閉じる（stream を drop する）。
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "#1643 の ctrl（MAP_BLOB / UNMAP_BLOB）から呼ぶ")
-    )]
     pub(crate) fn mark_backend_broken(&mut self) {
         self.backend_req = BackendChannel::Broken;
     }

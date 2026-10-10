@@ -142,6 +142,40 @@ pub fn resource_unref_line(res_id: Option<u32>, result: QueryResult) -> String {
     )
 }
 
+/// `RESOURCE_MAP_BLOB` のログ行（F5.2b.4a・#1643）。数値と固定語彙のみ。復号できなかった値と、成功以外の `map_info` は -1 で出す。
+pub fn resource_map_blob_line(
+    res_id: Option<u32>,
+    offset: Option<u64>,
+    size: Option<u64>,
+    map_info: Option<u32>,
+    result: QueryResult,
+) -> String {
+    format!(
+        "venus_jig event=resource cmd=RESOURCE_MAP_BLOB res_id={} offset={} size={} map_info={} result={}",
+        res_id.map_or(-1, i128::from),
+        offset.map_or(-1, i128::from),
+        size.map_or(-1, i128::from),
+        map_info.map_or(-1, i128::from),
+        result.word()
+    )
+}
+
+/// `RESOURCE_UNMAP_BLOB` のログ行（[`resource_map_blob_line`] から `map_info` を除いた形）。
+pub fn resource_unmap_blob_line(
+    res_id: Option<u32>,
+    offset: Option<u64>,
+    size: Option<u64>,
+    result: QueryResult,
+) -> String {
+    format!(
+        "venus_jig event=resource cmd=RESOURCE_UNMAP_BLOB res_id={} offset={} size={} result={}",
+        res_id.map_or(-1, i128::from),
+        offset.map_or(-1, i128::from),
+        size.map_or(-1, i128::from),
+        result.word()
+    )
+}
+
 /// `SUBMIT_3D` のログ行の材料。本体のバイト列は含めない（数値と固定語彙のみ）。
 #[derive(Debug, Clone, Copy)]
 pub struct Submit3dLog {

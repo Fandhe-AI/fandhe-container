@@ -4,7 +4,7 @@
 //! 入力はゲスト由来の untrusted バイト列で、全読み取りを `get` / `try_into` で境界検査する。応答は固定長の
 //! [`CtrlResponse`] で組み立て、生の `Vec` を手で組まない（REPAIR-2）。
 //!
-//! 出典: Linux `include/uapi/linux/virtio_gpu.h`（タグ `v6.12`、確認日 2026-10-08。取得時 SHA-256
+//! 出典: Linux `include/uapi/linux/virtio_gpu.h`（タグ `v6.12`、確認日 2026-10-10。取得時 SHA-256
 //! `7c9e2f7d47fa0b1a2c737fc5a741f57c5cf25303dd5c68c2c9738e9bb761eee6`）。値（事実情報）のみ転記しコードは流用していない。
 //! ライセンス: ファイル先頭に SPDX 行は無く、BSD 系の許諾文（3 条項。Copyright Red Hat, Inc. 2013-2014）が
 //! 書かれている。帰属表示の要否は未決（#1603）。
@@ -31,9 +31,9 @@ pub const CMD_CTX_ATTACH_RESOURCE: u32 = 0x0202;
 pub const CMD_CTX_DETACH_RESOURCE: u32 = 0x0203;
 /// `VIRTIO_GPU_CMD_SUBMIT_3D`。
 pub const CMD_SUBMIT_3D: u32 = 0x0207;
-/// `VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB`（共有メモリが前提のため治具は未実装で `ERR_UNSPEC`。F5.2b）。
+/// `VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB`（host-visible 領域への map。adapter が検証し、実メモリの受け渡しは `session`。F5.2b.4a・#1643）。
 pub const CMD_RESOURCE_MAP_BLOB: u32 = 0x0208;
-/// `VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB`（同上）。
+/// `VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB`（map の解除。同上）。
 pub const CMD_RESOURCE_UNMAP_BLOB: u32 = 0x0209;
 /// `VIRTIO_GPU_RESP_OK_NODATA`。
 pub const RESP_OK_NODATA: u32 = 0x1100;
@@ -43,6 +43,10 @@ pub const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 pub const RESP_OK_CAPSET_INFO: u32 = 0x1102;
 /// `VIRTIO_GPU_RESP_OK_CAPSET`。
 pub const RESP_OK_CAPSET: u32 = 0x1103;
+/// `VIRTIO_GPU_RESP_OK_MAP_INFO`（`OK_RESOURCE_UUID` の次。Linux v6.12 の列挙で 0x1106）。
+pub const RESP_OK_MAP_INFO: u32 = 0x1106;
+/// `VIRTIO_GPU_MAP_CACHE_CACHED`。memfd は通常のページキャッシュなので、`OK_MAP_INFO` ではこれを返す。
+pub const MAP_CACHE_CACHED: u32 = 0x01;
 /// `VIRTIO_GPU_RESP_ERR_UNSPEC`。
 pub const RESP_ERR_UNSPEC: u32 = 0x1200;
 /// `VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY`。
@@ -94,6 +98,12 @@ pub const RESOURCE_ID_REQ_LEN: usize = HDR_LEN + 8;
 pub const BLOB_MEM_HOST3D: u32 = 0x0002;
 /// `VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE`。治具が受理する blob_flags はこれだけ。
 pub const BLOB_FLAG_USE_MAPPABLE: u32 = 0x0001;
+/// `RESOURCE_MAP_BLOB` 要求の長さ（ヘッダ + resource_id 4 + padding 4 + offset 8）。
+pub const RESOURCE_MAP_BLOB_REQ_LEN: usize = HDR_LEN + 16;
+/// `RESOURCE_UNMAP_BLOB` 要求の長さ（ヘッダ + resource_id 4 + padding 4）。
+pub const RESOURCE_UNMAP_BLOB_REQ_LEN: usize = HDR_LEN + 8;
+/// `OK_MAP_INFO` の本体長（map_info 4 + padding 4）。
+pub const MAP_INFO_BODY_LEN: usize = 8;
 /// 応答の最大長（ヘッダ + capset データ または display info 本体の大きい方）。
 pub const MAX_RESP_LEN: usize = HDR_LEN
     + if VENUS_CAPSET_LEN > DISPLAY_INFO_BODY_LEN {
@@ -276,6 +286,51 @@ pub fn parse_resource_id(req: &[u8]) -> Option<u32> {
     le32(req, HDR_LEN)
 }
 
+/// 復号済みの `RESOURCE_MAP_BLOB` 本体。`hdr.ctx_id` は見ない（Linux のドライバは常に 0 で送る。F5.2b.4a・#1643）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceMapBlob {
+    /// map する resource_id。
+    pub res_id: u32,
+    /// padding（治具は 0 だけ受理する）。
+    pub padding: u32,
+    /// host-visible 領域内のバイトオフセット。
+    pub offset: u64,
+}
+
+impl ResourceMapBlob {
+    /// 要求全体（ヘッダ込み）を復号する。長さがちょうど `RESOURCE_MAP_BLOB_REQ_LEN` でなければ `None`。
+    pub fn parse(req: &[u8]) -> Option<Self> {
+        if req.len() != RESOURCE_MAP_BLOB_REQ_LEN {
+            return None;
+        }
+        Some(Self {
+            res_id: le32(req, HDR_LEN)?,
+            padding: le32(req, HDR_LEN + 4)?,
+            offset: le64(req, HDR_LEN + 8)?,
+        })
+    }
+}
+
+/// 復号済みの `RESOURCE_UNMAP_BLOB` 本体。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceUnmapBlob {
+    /// unmap する resource_id。
+    pub res_id: u32,
+    /// padding（治具は 0 だけ受理する）。
+    pub padding: u32,
+}
+
+/// `RESOURCE_UNMAP_BLOB` 要求（ヘッダ込み）を復号する。長さがちょうど `RESOURCE_UNMAP_BLOB_REQ_LEN` でなければ `None`。
+pub fn parse_resource_unmap_blob(req: &[u8]) -> Option<ResourceUnmapBlob> {
+    if req.len() != RESOURCE_UNMAP_BLOB_REQ_LEN {
+        return None;
+    }
+    Some(ResourceUnmapBlob {
+        res_id: le32(req, HDR_LEN)?,
+        padding: le32(req, HDR_LEN + 4)?,
+    })
+}
+
 /// `SUBMIT_3D` の復号失敗理由。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Submit3dError {
@@ -309,6 +364,52 @@ pub(crate) fn le64(buf: &[u8], off: usize) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 要求の合成: 先頭 4 バイトに種別、残りは 0。
+    fn synth(cmd: u32, len: usize) -> Vec<u8> {
+        let mut v = vec![0u8; len];
+        v[..4].copy_from_slice(&cmd.to_le_bytes());
+        v
+    }
+
+    #[test]
+    fn f5_2b_4a_gpu6_map_blob_parse_exact_lengths() {
+        let mut req = synth(CMD_RESOURCE_MAP_BLOB, 40);
+        req[24..28].copy_from_slice(&7u32.to_le_bytes());
+        req[28..32].copy_from_slice(&3u32.to_le_bytes());
+        req[32..40].copy_from_slice(&0x1000u64.to_le_bytes());
+        assert_eq!(
+            ResourceMapBlob::parse(&req),
+            Some(ResourceMapBlob {
+                res_id: 7,
+                padding: 3,
+                offset: 4096
+            })
+        );
+        assert_eq!(ResourceMapBlob::parse(&req[..39]), None);
+        assert_eq!(
+            ResourceMapBlob::parse(&synth(CMD_RESOURCE_MAP_BLOB, 41)),
+            None
+        );
+    }
+
+    #[test]
+    fn f5_2b_4a_gpu6_unmap_blob_parse_exact_lengths() {
+        let mut req = synth(CMD_RESOURCE_UNMAP_BLOB, 32);
+        req[24..28].copy_from_slice(&9u32.to_le_bytes());
+        assert_eq!(
+            parse_resource_unmap_blob(&req),
+            Some(ResourceUnmapBlob {
+                res_id: 9,
+                padding: 0
+            })
+        );
+        assert_eq!(parse_resource_unmap_blob(&req[..31]), None);
+        assert_eq!(
+            parse_resource_unmap_blob(&synth(CMD_RESOURCE_UNMAP_BLOB, 33)),
+            None
+        );
+    }
 
     #[test]
     fn task1601_gpu6_response_body_boundary() {

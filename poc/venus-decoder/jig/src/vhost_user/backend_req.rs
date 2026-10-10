@@ -3,7 +3,7 @@
 //! 役割: 治具（backend）が `SET_BACKEND_REQ_FD` の UDS で frontend（crosvm 等）へ送る要求と、その応答（REPLY）を、
 //! 固定長配列と「壊れた値を表現できない型」で組み立て・検査する。呼び出し元は `crate::session` の backend 要求送信
 //! （`Session::shmem_map` / `shmem_unmap`。Linux 限定）と、偽 frontend を動かす試験。実際の送受信・期限・fd の受け渡しは
-//! `session` と `fd_passing` が担い、ここは I/O を持たない。ctrl の `MAP_BLOB` / `UNMAP_BLOB` からの呼び出しは #1643。
+//! `session` と `fd_passing` が担い、ここは I/O を持たない。ctrl の `MAP_BLOB` / `UNMAP_BLOB` からの呼び出しは `session`（#1643）。
 //!
 //! 名前空間の分離: backend 要求の ID（9 = `SHMEM_MAP`、10 = `SHMEM_UNMAP`）は frontend 要求の 9（`SET_VRING_ADDR`）・
 //! 10（`SET_VRING_BASE`）と数値が重なる。そのため既存の `RequestCode` / `Header` / `decode_reply` は使わず

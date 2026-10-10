@@ -7,8 +7,13 @@
 //! 上限（件数・1 件の大きさ・合計）は確保・計上より前に検査し、加算は `checked_add` で行う。表は固定長配列で、
 //! ゲスト入力によってアロケーションは増えない。上限値は設計書 10.4.3 の案で、実機（#725）で見直す。
 //!
-//! 未実装（REPAIR-3）: 実メモリの確保（memfd 等）と `RESOURCE_MAP_BLOB` / `UNMAP_BLOB`。共有メモリの対応（F5.2b・承認待ち）で
-//! 実確保と結び付け、上限もそのとき実確保の上限として扱う。本モジュールの上限は計上上のものにとどまる。
+//! `RESOURCE_MAP_BLOB` / `UNMAP_BLOB`（F5.2b.4a・#1643）の map 状態（host-visible 領域内の offset）も本表が持つ。実メモリ
+//! （memfd）の確保と frontend への `SHMEM_MAP` は `session` が行い、本表は検証と重なり検査だけを担う（I/O を持たない）。
+//! 本表の上限（1 件 16 MiB・合計 64 MiB）は `CREATE_BLOB` の時点で検査済みなので、memfd の長さはその範囲に収まる。
+//!
+//! 暫定（REPAIR-3）: map 中の resource への `RESOURCE_UNREF` は `ERR_INVALID_PARAMETER` で拒否する。実ゲストは
+//! `UNMAP` → `UNREF` の順に出すので通常の流れは妨げない。channel 破損後に map 中で残る resource・セッション終了時の扱いなど、
+//! map 中の資源の解放の確定は #1645 で行う。
 
 /// 同時に持つ resource の上限件数。
 pub const MAX_RESOURCES: usize = 256;
@@ -33,6 +38,15 @@ pub enum ResourceError {
     Full,
 }
 
+/// host-visible 領域内の 1 区間（`MAP_BLOB` / `UNMAP_BLOB` の対象。`session` が `SHMEM_MAP` / `SHMEM_UNMAP` へ渡す）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShmemRange {
+    /// 領域内のバイトオフセット（ページ境界）。
+    pub offset: u64,
+    /// 長さ（resource の大きさ）。
+    pub len: u64,
+}
+
 /// 表の 1 スロット（`res_id == 0` は空き）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ResourceEntry {
@@ -40,12 +54,15 @@ struct ResourceEntry {
     size: u64,
     /// attach 中の ctx のスロット番号の集合。
     attached: u64,
+    /// map 中なら host-visible 領域内の offset（長さは `size`）。
+    mapped: Option<u64>,
 }
 
 const EMPTY: ResourceEntry = ResourceEntry {
     res_id: 0,
     size: 0,
     attached: 0,
+    mapped: None,
 };
 
 /// 固定長の資源表。
@@ -109,6 +126,7 @@ impl ResourceTable {
             res_id,
             size,
             attached: 0,
+            mapped: None,
         };
         self.total_size = new_total;
         Ok(())
@@ -136,10 +154,67 @@ impl ResourceTable {
         Ok(())
     }
 
-    /// resource を消す。attach 中は `InvalidParameter`。
+    /// resource を host-visible 領域（大きさ `region_size`）へ map したことにする。検査順は固定: id（`InvalidId`）→
+    /// map 済み → offset のページ境界 → `offset + size` が領域内（`checked_add`）→ 他の map との区間の重なり
+    /// （いずれも `InvalidParameter`）。ctx への attach は要求しない（Linux のドライバは `CTX_ATTACH` より先に MAP を出す）。
+    pub fn map(
+        &mut self,
+        res_id: u32,
+        offset: u64,
+        region_size: u64,
+    ) -> Result<ShmemRange, ResourceError> {
+        let e = self.find_mut(res_id).ok_or(ResourceError::InvalidId)?;
+        if e.mapped.is_some() {
+            return Err(ResourceError::InvalidParameter);
+        }
+        let len = e.size;
+        if !offset.is_multiple_of(RESOURCE_SIZE_ALIGN) {
+            return Err(ResourceError::InvalidParameter);
+        }
+        let end = offset
+            .checked_add(len)
+            .filter(|end| *end <= region_size)
+            .ok_or(ResourceError::InvalidParameter)?;
+        let overlaps = self.slots.iter().any(|o| {
+            o.res_id != res_id
+                && o.mapped.is_some_and(|start| {
+                    // 既存の区間は map 時に検査済みで溢れないが、溢れる場合は重なりとして拒否する（fail-closed）。
+                    start
+                        .checked_add(o.size)
+                        .is_none_or(|o_end| offset < o_end && start < end)
+                })
+        });
+        if overlaps {
+            return Err(ResourceError::InvalidParameter);
+        }
+        let e = self.find_mut(res_id).ok_or(ResourceError::InvalidId)?;
+        e.mapped = Some(offset);
+        Ok(ShmemRange { offset, len })
+    }
+
+    /// map 中の resource の map を外す。未作成は `InvalidId`、map していなければ `InvalidParameter`。
+    pub fn unmap(&mut self, res_id: u32) -> Result<ShmemRange, ResourceError> {
+        let e = self.find_mut(res_id).ok_or(ResourceError::InvalidId)?;
+        let offset = e.mapped.take().ok_or(ResourceError::InvalidParameter)?;
+        Ok(ShmemRange {
+            offset,
+            len: e.size,
+        })
+    }
+
+    /// map 中の offset（試験用の参照）。
+    #[cfg(test)]
+    pub fn mapped(&self, res_id: u32) -> Option<u64> {
+        self.slots
+            .iter()
+            .find(|e| e.res_id == res_id && res_id != 0)
+            .and_then(|e| e.mapped)
+    }
+
+    /// resource を消す。attach 中・map 中は `InvalidParameter`（map 中の拒否は暫定。#1645 で確定する）。
     pub fn unref(&mut self, res_id: u32) -> Result<(), ResourceError> {
         let e = self.find_mut(res_id).ok_or(ResourceError::InvalidId)?;
-        if e.attached != 0 {
+        if e.attached != 0 || e.mapped.is_some() {
             return Err(ResourceError::InvalidParameter);
         }
         let size = e.size;

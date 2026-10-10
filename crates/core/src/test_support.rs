@@ -432,7 +432,7 @@ pub(crate) fn run_with_private_fs<T: Send>(f: impl FnOnce() -> T + Send) -> T {
 mod private_fs_tests {
     use super::run_with_private_fs;
 
-    /// #1685: 私有 fs のスレッドでの `chdir` は、試験プロセスの他スレッド（呼び出し元）の cwd を変えない。
+    /// #1685（REPAIR-7・REPAIR-12）: 私有 fs のスレッドでの `chdir` は、試験プロセスの他スレッド（呼び出し元）の cwd を変えない。
     #[test]
     fn task1685_private_fs_thread_does_not_share_cwd() {
         let before = std::env::current_dir().expect("cwd");

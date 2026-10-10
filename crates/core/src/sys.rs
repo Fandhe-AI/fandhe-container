@@ -40,6 +40,8 @@
 //! `PR_SET_PDEATHSIG`）を呼ぶ。
 //! tmpfs のマウント（`crate::exec::mount_tmpfs`。SUP-12・TASK-169 追補・#1472）は、新マウント API（`fsopen(2)`・`fsconfig(2)`・
 //! `fsmount(2)`・`move_mount(2)`。Linux 5.2 以降）で検証済みの O_PATH fd の上へ直接載せる。未対応カーネルは拒否する（縮退しない）。
+//! 同じ経路で rootfs の `/dev` 用の nodev なし tmpfs も載せる入口（`mount_dev_tmpfs_on`。TASK-29 追補・#1652）を持つ。
+//! 呼び出しの配線は #1653 で行う。
 //! exec 入口の前提（TASK-163 追補・#1456〜#1460）は、exec 直前の子でセッションを切り離す `setsid(2)`、補助グループを
 //! 空にする `getgroups(2)` / `setgroups(2)`、`/dev/null` とインタープリタを検証済みの `O_PATH` fd から開き直す
 //! `openat(2)`（`O_NOCTTY`）、状態を返す pipe だけを残して fd を閉じる `close_range(2)` を呼ぶ。
@@ -134,7 +136,7 @@ mod consts {
     pub const SYS_FSOPEN: i64 = 430;
     pub const SYS_FSCONFIG: i64 = 431;
     pub const SYS_FSMOUNT: i64 = 432;
-    // include/uapi/linux/mount.h の `FSOPEN_CLOEXEC`・`FSMOUNT_CLOEXEC`・`fsconfig_command`・`MOUNT_ATTR_*`・`MOVE_MOUNT_*`（全アーキテクチャ共通）。
+    // include/uapi/linux/mount.h の `FSOPEN_CLOEXEC`・`FSMOUNT_CLOEXEC`・`fsconfig_command`・`MOUNT_ATTR_*`（`MOUNT_ATTR_STRICTATIME` を含む）・`MOVE_MOUNT_*`（全アーキテクチャ共通）。
     pub const FSOPEN_CLOEXEC: u32 = 1;
     pub const FSMOUNT_CLOEXEC: u32 = 1;
     pub const FSCONFIG_SET_FLAG: u32 = 0;
@@ -144,6 +146,7 @@ mod consts {
     pub const MOUNT_ATTR_NOSUID: u32 = 2;
     pub const MOUNT_ATTR_NODEV: u32 = 4;
     pub const MOUNT_ATTR_NOEXEC: u32 = 8;
+    pub const MOUNT_ATTR_STRICTATIME: u32 = 0x20;
     pub const MOVE_MOUNT_F_EMPTY_PATH: u32 = 4;
     pub const MOVE_MOUNT_T_EMPTY_PATH: u32 = 64;
     // arch/x86/entry/syscalls/syscall_64.tbl の `pidfd_send_signal`（424）・`pidfd_open`（434）。
@@ -353,7 +356,7 @@ mod consts {
     pub const SYS_FSOPEN: i64 = 430;
     pub const SYS_FSCONFIG: i64 = 431;
     pub const SYS_FSMOUNT: i64 = 432;
-    // include/uapi/linux/mount.h の `FSOPEN_CLOEXEC`・`FSMOUNT_CLOEXEC`・`fsconfig_command`・`MOUNT_ATTR_*`・`MOVE_MOUNT_*`（全アーキテクチャ共通）。
+    // include/uapi/linux/mount.h の `FSOPEN_CLOEXEC`・`FSMOUNT_CLOEXEC`・`fsconfig_command`・`MOUNT_ATTR_*`（`MOUNT_ATTR_STRICTATIME` を含む）・`MOVE_MOUNT_*`（全アーキテクチャ共通）。
     pub const FSOPEN_CLOEXEC: u32 = 1;
     pub const FSMOUNT_CLOEXEC: u32 = 1;
     pub const FSCONFIG_SET_FLAG: u32 = 0;
@@ -363,6 +366,7 @@ mod consts {
     pub const MOUNT_ATTR_NOSUID: u32 = 2;
     pub const MOUNT_ATTR_NODEV: u32 = 4;
     pub const MOUNT_ATTR_NOEXEC: u32 = 8;
+    pub const MOUNT_ATTR_STRICTATIME: u32 = 0x20;
     pub const MOVE_MOUNT_F_EMPTY_PATH: u32 = 4;
     pub const MOVE_MOUNT_T_EMPTY_PATH: u32 = 64;
     // include/uapi/asm-generic/unistd.h の `__NR_pidfd_send_signal`・`__NR_pidfd_open`（arm64 は
@@ -571,7 +575,7 @@ mod consts {
     pub const SYS_FSOPEN: i64 = 0;
     pub const SYS_FSCONFIG: i64 = 0;
     pub const SYS_FSMOUNT: i64 = 0;
-    // include/uapi/linux/mount.h の `FSOPEN_CLOEXEC`・`FSMOUNT_CLOEXEC`・`fsconfig_command`・`MOUNT_ATTR_*`・`MOVE_MOUNT_*`（全アーキテクチャ共通）。
+    // include/uapi/linux/mount.h の `FSOPEN_CLOEXEC`・`FSMOUNT_CLOEXEC`・`fsconfig_command`・`MOUNT_ATTR_*`（`MOUNT_ATTR_STRICTATIME` を含む）・`MOVE_MOUNT_*`（全アーキテクチャ共通）。
     pub const FSOPEN_CLOEXEC: u32 = 0;
     pub const FSMOUNT_CLOEXEC: u32 = 0;
     pub const FSCONFIG_SET_FLAG: u32 = 0;
@@ -581,6 +585,7 @@ mod consts {
     pub const MOUNT_ATTR_NOSUID: u32 = 0;
     pub const MOUNT_ATTR_NODEV: u32 = 0;
     pub const MOUNT_ATTR_NOEXEC: u32 = 0;
+    pub const MOUNT_ATTR_STRICTATIME: u32 = 0;
     pub const MOVE_MOUNT_F_EMPTY_PATH: u32 = 0;
     pub const MOVE_MOUNT_T_EMPTY_PATH: u32 = 0;
     pub const SYS_PIDFD_SEND_SIGNAL: i64 = 0;
@@ -1241,6 +1246,121 @@ fn new_mount_api_fd(rc: i64) -> Result<OwnedFd, SysError> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// `fsconfig(2)` へ渡す 1 件のパラメータ。key は静的文字列、value は整数から生成した数字のみ
+/// （NUL・カンマを含み得ない。SEC-1）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FsconfigParam {
+    /// `FSCONFIG_SET_STRING`（キーと文字列値）。
+    String(&'static CStr, CString),
+    /// `FSCONFIG_SET_FLAG`（値なしのフラグ）。
+    Flag(&'static CStr),
+}
+
+/// tmpfs 作成の内部パラメータ。`mount_tmpfs_impl` の唯一の入力で、本モジュールの外へ公開しない。
+///
+/// 生成は [`TmpfsCreate`]（`TmpfsMountFlags::attr_bits` 由来で nodev 固定）と [`DevTmpfsCreate`]
+/// （`/dev` 専用の固定値）からの変換だけに限り、呼び出し側が任意の `attr` ビットを渡す経路を作らない
+/// （SEC-1・CORE-1・REPAIR-2）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TmpfsParams {
+    mode: u32,
+    size: Option<u64>,
+    read_only: bool,
+    /// `fsmount(2)` の `attr_flags`。名前つき定数の和のみ。
+    attr: u32,
+}
+
+impl From<TmpfsCreate> for TmpfsParams {
+    fn from(create: TmpfsCreate) -> Self {
+        Self {
+            mode: create.mode,
+            size: create.size,
+            read_only: create.flags.read_only,
+            attr: create.flags.attr_bits(),
+        }
+    }
+}
+
+impl From<DevTmpfsCreate> for TmpfsParams {
+    fn from(_: DevTmpfsCreate) -> Self {
+        Self {
+            mode: DevTmpfsCreate::MODE,
+            size: Some(DevTmpfsCreate::SIZE_BYTES),
+            read_only: false,
+            attr: DevTmpfsCreate::ATTR_BITS,
+        }
+    }
+}
+
+impl TmpfsParams {
+    /// `fsconfig` へ流すパラメータ列（`source` → `mode` → `size`（`Some` のみ）→ `ro`（読み取り専用のみ））。
+    /// 実マウントなしでキーと値を単体テストで照合するため純関数にしてある。
+    #[cfg_attr(test, allow(dead_code))]
+    fn fsconfig_params(&self) -> Result<Vec<FsconfigParam>, SysError> {
+        let mut params = vec![FsconfigParam::String(
+            c"source",
+            CString::new("tmpfs").map_err(|_| SysError::Os(EINVAL))?,
+        )];
+        // 値は整数から生成した数字のみで、NUL・カンマを含み得ない。
+        let mode = CString::new(format!("{:o}", self.mode)).map_err(|_| SysError::Os(EINVAL))?;
+        params.push(FsconfigParam::String(c"mode", mode));
+        if let Some(size) = self.size {
+            let size = CString::new(size.to_string()).map_err(|_| SysError::Os(EINVAL))?;
+            params.push(FsconfigParam::String(c"size", size));
+        }
+        if self.read_only {
+            params.push(FsconfigParam::Flag(c"ro"));
+        }
+        Ok(params)
+    }
+}
+
+/// rootfs の `/dev` に載せる tmpfs の固定作成パラメータ（TASK-29 追補・#1652。設計ドラフト
+/// `docs/design/dev-default-mounts.md` 3.1・オーナー判断 2026-10-10）。
+///
+/// 値は固定で、利用者から受け取る経路を持たない。`nodev` を外せるのは本型だけで、[`TmpfsMountFlags`]
+/// （`nodev` 固定）は変更しない（SEC-1）。出典は runc v1.5.2 `libcontainer/specconv/example.go` の
+/// `nosuid,strictatime,mode=755,size=65536k`。
+///
+/// - `nodev` を付けない: tmpfs の上に作る文字デバイスを開けるようにするため。
+/// - `noexec` を付けない: runc に合わせる。`noexec` のマウント上のデバイスノードは `mmap(PROT_EXEC)` が
+///   `EPERM` になり `/dev/zero` の実行可能マップが壊れるおそれがあり、付ける根拠となるビヘイビアも無い。
+/// - `strictatime` を付ける: runc と同じ。既定の relatime に任せず明示する。
+///
+/// 呼び出しは #1653 で `crate::exec` から配線する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // #1653 で配線するまで呼び出し元が無い。配線時に外す。
+pub(crate) struct DevTmpfsCreate {
+    _private: (),
+}
+
+#[allow(dead_code)] // 同上（#1653）。
+impl DevTmpfsCreate {
+    const MODE: u32 = 0o755;
+    const SIZE_BYTES: u64 = 64 * 1024 * 1024;
+    const ATTR_BITS: u32 = consts::MOUNT_ATTR_NOSUID | consts::MOUNT_ATTR_STRICTATIME;
+
+    /// 固定値の作成パラメータを返す。
+    pub(crate) const fn new() -> Self {
+        Self { _private: () }
+    }
+
+    /// ルートディレクトリのモード（0o755）。
+    pub(crate) const fn mode(&self) -> u32 {
+        Self::MODE
+    }
+
+    /// サイズ（バイト。64 MiB）。
+    pub(crate) const fn size_bytes(&self) -> u64 {
+        Self::SIZE_BYTES
+    }
+
+    /// `fsmount(2)` の `attr_flags`（`MOUNT_ATTR_NOSUID|MOUNT_ATTR_STRICTATIME`。nodev・noexec・rdonly なし）。
+    pub(crate) const fn attr_bits(&self) -> u32 {
+        Self::ATTR_BITS
+    }
+}
+
 /// `target_dir`（検証済みのマウント先ディレクトリの O_PATH fd）の上へ、新マウント API で tmpfs を載せ、
 /// 載せたマウントのルートを指す fd（close-on-exec）を返す。
 ///
@@ -1258,9 +1378,29 @@ pub(crate) fn mount_tmpfs_on(
     target_dir: BorrowedFd<'_>,
     create: TmpfsCreate,
 ) -> Result<OwnedFd, SysError> {
+    mount_tmpfs_impl(target_dir, &TmpfsParams::from(create))
+}
+
+/// `/dev` 用の nodev なし tmpfs を [`mount_tmpfs_on`] と同じ契約で載せる（TASK-29 追補・#1652）。
+///
+/// マウント先は検証済みの `O_PATH` fd で受け取り、パス文字列の再解決も `data` 文字列も使わない。返す fd は
+/// 載せたマウントのルートを指す close-on-exec の fd。`ENOSYS` は [`SysError::Unsupported`] で返し縮退しない。
+/// 途中失敗は drop で破棄される。Linux 5.2 以降。実マウントの確認と配線は #1653。
+#[allow(dead_code)] // #1653 で `crate::exec` から配線する。配線時に `cfg_attr(test, allow(dead_code))` へ戻す。
+pub(crate) fn mount_dev_tmpfs_on(
+    target_dir: BorrowedFd<'_>,
+    create: DevTmpfsCreate,
+) -> Result<OwnedFd, SysError> {
+    mount_tmpfs_impl(target_dir, &TmpfsParams::from(create))
+}
+
+/// [`mount_tmpfs_on`] と [`mount_dev_tmpfs_on`] の共通手順。`params` は型付きの入口からしか作られない。
+#[cfg_attr(test, allow(dead_code))]
+fn mount_tmpfs_impl(target_dir: BorrowedFd<'_>, params: &TmpfsParams) -> Result<OwnedFd, SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
+    let fsconfig_params = params.fsconfig_params()?;
     // SAFETY: 静的な NUL 終端文字列のポインタと定数フラグのみ。カーネルは呼び出し中に文字列を複写するだけで
     // ポインタを保持しない。可変長引数は register 幅（`i64` / ポインタ）で渡す。成功時の戻り値は新規 fd で、
     // 直後に `new_mount_api_fd` が唯一の所有者にする。
@@ -1271,41 +1411,31 @@ pub(crate) fn mount_tmpfs_on(
             i64::from(consts::FSOPEN_CLOEXEC),
         )
     })?;
-    let set_string = |key: &CStr, value: &CStr| -> Result<(), SysError> {
-        // SAFETY: `fs_fd` は生存中の fsopen の fd。`key`・`value` は借用した NUL 終端文字列で呼び出しの間
-        // 生存し、カーネルは保持しない。aux は 0。副作用はこの fs コンテキストへのパラメータ設定に限る。
-        fsconfig_result(unsafe {
-            syscall(
-                consts::SYS_FSCONFIG,
-                i64::from(fs_fd.as_raw_fd()),
-                i64::from(consts::FSCONFIG_SET_STRING),
-                key.as_ptr(),
-                value.as_ptr(),
-                0i64,
-            )
-        })
-    };
-    set_string(c"source", c"tmpfs")?;
-    // 値は整数から生成した数字のみで、NUL・カンマを含み得ない。
-    let mode = CString::new(format!("{:o}", create.mode)).map_err(|_| SysError::Os(EINVAL))?;
-    set_string(c"mode", &mode)?;
-    if let Some(size) = create.size {
-        let size = CString::new(size.to_string()).map_err(|_| SysError::Os(EINVAL))?;
-        set_string(c"size", &size)?;
-    }
-    if create.flags.read_only {
-        // SAFETY: `fs_fd` は生存中の fsopen の fd。key は静的な NUL 終端文字列、value は NULL（フラグ形式）、
-        // aux は 0。副作用はこの fs コンテキストへのフラグ設定に限る。
-        fsconfig_result(unsafe {
-            syscall(
-                consts::SYS_FSCONFIG,
-                i64::from(fs_fd.as_raw_fd()),
-                i64::from(consts::FSCONFIG_SET_FLAG),
-                c"ro".as_ptr(),
-                core::ptr::null::<core::ffi::c_char>(),
-                0i64,
-            )
-        })?;
+    for param in &fsconfig_params {
+        // SAFETY: `fs_fd` は生存中の fsopen の fd。key は静的な NUL 終端文字列、value は `fsconfig_params` が
+        // 保持する NUL 終端文字列（文字列形式）または NULL（フラグ形式）で、ループの間生存しカーネルは保持しない。
+        // aux は 0。副作用はこの fs コンテキストへのパラメータ設定に限る。
+        let rc = unsafe {
+            match param {
+                FsconfigParam::String(key, value) => syscall(
+                    consts::SYS_FSCONFIG,
+                    i64::from(fs_fd.as_raw_fd()),
+                    i64::from(consts::FSCONFIG_SET_STRING),
+                    key.as_ptr(),
+                    value.as_ptr(),
+                    0i64,
+                ),
+                FsconfigParam::Flag(key) => syscall(
+                    consts::SYS_FSCONFIG,
+                    i64::from(fs_fd.as_raw_fd()),
+                    i64::from(consts::FSCONFIG_SET_FLAG),
+                    key.as_ptr(),
+                    core::ptr::null::<core::ffi::c_char>(),
+                    0i64,
+                ),
+            }
+        };
+        fsconfig_result(rc)?;
     }
     // SAFETY: `fs_fd` は生存中の fsopen の fd。key・value は NULL、aux は 0（`FSCONFIG_CMD_CREATE` の仕様）。
     // 副作用は superblock の作成（まだどこにも接続されない）に限る。
@@ -1319,7 +1449,7 @@ pub(crate) fn mount_tmpfs_on(
             0i64,
         )
     })?;
-    // SAFETY: `fs_fd` は生存中の fd。flags・attr は定数と `attr_bits`（nosuid・nodev 固定）のみ。
+    // SAFETY: `fs_fd` は生存中の fd。flags は定数、attr は `TmpfsParams::attr`（`TmpfsMountFlags::attr_bits` か `DevTmpfsCreate::attr_bits` だけから作られる名前つき定数の和）のみ。
     // 成功時の戻り値は新規 fd で、直後に `new_mount_api_fd` が唯一の所有者にする。副作用は未接続の
     // マウントの作成に限る（fd を閉じればカーネルが破棄する）。
     let mnt_fd = new_mount_api_fd(unsafe {
@@ -1327,7 +1457,7 @@ pub(crate) fn mount_tmpfs_on(
             consts::SYS_FSMOUNT,
             i64::from(fs_fd.as_raw_fd()),
             i64::from(consts::FSMOUNT_CLOEXEC),
-            i64::from(create.flags.attr_bits()),
+            i64::from(params.attr),
         )
     })?;
     // SAFETY: `mnt_fd`・`target_dir` は生存中の fd（`OwnedFd` と `BorrowedFd`）。パスは静的な空文字列で、
@@ -3548,6 +3678,113 @@ mod tests {
         assert_eq!(f(true, true), 1 | 2 | 4);
     }
 
+    /// CORE-1・SEC-1（TASK-29 追補・#1652）: `/dev` 用 tmpfs の attr は nosuid|strictatime のみ。
+    #[test]
+    fn core1_sec1_dev_tmpfs_attr_bits_are_exact() {
+        let c = DevTmpfsCreate::new();
+        assert_eq!(c.attr_bits(), 0x22);
+        assert_eq!(c.attr_bits() & consts::MOUNT_ATTR_NODEV, 0);
+        assert_eq!(c.attr_bits() & consts::MOUNT_ATTR_NOEXEC, 0);
+        assert_eq!(c.attr_bits() & consts::MOUNT_ATTR_RDONLY, 0);
+        assert_eq!(c.attr_bits() & consts::MOUNT_ATTR_NOSUID, 0x2);
+        assert_eq!(c.attr_bits() & 0x70, 0x20);
+    }
+
+    /// CORE-1・SEC-1（TASK-29 追補・#1652）: `/dev` 用 tmpfs の固定値と fsconfig へ渡すキー・値。
+    #[test]
+    fn core1_sec1_dev_tmpfs_fsconfig_params_are_exact() {
+        let c = DevTmpfsCreate::new();
+        assert_eq!(c.mode(), 0o755);
+        assert_eq!(c.size_bytes(), 67_108_864);
+        let params = TmpfsParams::from(c).fsconfig_params().expect("params");
+        assert_eq!(
+            params,
+            vec![
+                FsconfigParam::String(c"source", CString::new("tmpfs").unwrap()),
+                FsconfigParam::String(c"mode", CString::new("755").unwrap()),
+                FsconfigParam::String(c"size", CString::new("67108864").unwrap()),
+            ]
+        );
+    }
+
+    /// SEC-1（回帰）: 既存の `TmpfsMountFlags::attr_bits` は 4 通りすべてで nodev を含む。
+    #[test]
+    fn sup12_task169_tmpfs_attr_bits_always_include_nodev() {
+        for (read_only, exec, want) in [
+            (false, false, 0xE),
+            (false, true, 0x6),
+            (true, false, 0xF),
+            (true, true, 0x7),
+        ] {
+            let bits = TmpfsMountFlags { read_only, exec }.attr_bits();
+            assert_eq!(bits, want);
+            assert_eq!(bits & consts::MOUNT_ATTR_NODEV, 0x4);
+        }
+    }
+
+    /// SUP-12・SEC-1: 既存の呼び出し（`exec/tmpfs.rs`・`inject.rs` の形）が渡す attr と文字列は変わらない。
+    #[test]
+    fn sup12_task169_tmpfs_params_unchanged_for_existing_callers() {
+        for (read_only, exec, want) in [
+            (false, false, 0xE),
+            (false, true, 0x6),
+            (true, false, 0xF),
+            (true, true, 0x7),
+        ] {
+            let p = TmpfsParams::from(TmpfsCreate {
+                mode: 0o1777,
+                size: Some(67_108_864),
+                flags: TmpfsMountFlags { read_only, exec },
+            });
+            assert_eq!(p.attr, want);
+            let params = p.fsconfig_params().expect("params");
+            assert_eq!(
+                params.get(1),
+                Some(&FsconfigParam::String(
+                    c"mode",
+                    CString::new("1777").unwrap()
+                ))
+            );
+            assert_eq!(
+                params.last() == Some(&FsconfigParam::Flag(c"ro")),
+                read_only
+            );
+        }
+        let inject = TmpfsParams::from(TmpfsCreate {
+            mode: 0o755,
+            size: Some(4096),
+            flags: TmpfsMountFlags {
+                read_only: false,
+                exec: false,
+            },
+        });
+        assert_eq!(inject.attr, 0xE);
+        assert_eq!(
+            inject.fsconfig_params().expect("params"),
+            vec![
+                FsconfigParam::String(c"source", CString::new("tmpfs").unwrap()),
+                FsconfigParam::String(c"mode", CString::new("755").unwrap()),
+                FsconfigParam::String(c"size", CString::new("4096").unwrap()),
+            ]
+        );
+        let no_size = TmpfsParams::from(TmpfsCreate {
+            mode: 0o755,
+            size: None,
+            flags: TmpfsMountFlags {
+                read_only: true,
+                exec: false,
+            },
+        });
+        assert_eq!(
+            no_size.fsconfig_params().expect("params"),
+            vec![
+                FsconfigParam::String(c"source", CString::new("tmpfs").unwrap()),
+                FsconfigParam::String(c"mode", CString::new("755").unwrap()),
+                FsconfigParam::Flag(c"ro"),
+            ]
+        );
+    }
+
     /// SUP-12（TASK-169 追補・#1472）: 新マウント API の syscall 番号・フラグの具体値。番号は x86_64 と
     /// aarch64（asm-generic）で個別に定義し、どちらも 429〜432。
     #[test]
@@ -3591,6 +3828,8 @@ mod tests {
             ),
             (1, 2, 4, 8)
         );
+        // include/uapi/linux/mount.h の `MOUNT_ATTR_STRICTATIME`（x86_64・aarch64 共通）。
+        assert_eq!(consts::MOUNT_ATTR_STRICTATIME, 0x20);
         assert_eq!(
             (
                 consts::MOVE_MOUNT_F_EMPTY_PATH,

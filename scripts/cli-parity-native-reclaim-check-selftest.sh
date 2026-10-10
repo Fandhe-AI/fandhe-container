@@ -20,36 +20,54 @@ GRACE=30
 failures=0
 fail() { printf 'FAIL: %s\n' "$1"; failures=$((failures + 1)); }
 
-# 対象を独立グループでバックグラウンド起動し、自己テスト自身の外側の期限（$1 秒）で監視する（REPAIR-5・#1709）。
+# bash は終了した子を SIGCHLD で回収して状態だけ保持するため、wait していなくても OS の pid は再利用されうる
+# （#1709 の Codex P1）。pid 単体への送信・生存確認は bash のジョブ表で実行中の子（`jobs -rp`）のときに限り、
+# グループ宛ての送信はグループが存在するときだけ行う（対象スクリプトの child_running 等と同じ規則）。
+child_running() { # <pid>
+  [[ $'\n'"$(jobs -rp)"$'\n' == *$'\n'"$1"$'\n'* ]]
+}
+signal_child() { # <シグナル> <pid>
+  if child_running "$2"; then kill "-$1" "$2" 2>/dev/null || true; fi
+}
+signal_group() { # <シグナル> <pgid>
+  if kill -0 -- "-$2" 2>/dev/null; then kill "-$1" -- "-$2" 2>/dev/null || true; fi
+}
+
+# コマンドを独立グループでバックグラウンド起動し、自己テスト自身の外側の期限（$1 秒）で監視する（REPAIR-5・#1709）。
 # 対象の期限処理や回収がハングしても自己テストは止まらない。外側の期限を超えたら対象を強制回収し、
 # outer_rc=124 とする。終了していなければ wait しない（上限の無い wait を使わない）。結果は outer_rc に入る。
 outer_rc=0
-run_outer() { # <外側の期限秒> <名前> <env...>
+run_outer_cmd() { # <外側の期限秒> <名前> <cmd...>
   local limit="$1" name="$2" pid n until_s
   shift 2
   outer_rc=0
   set -m
-  env "$@" bash "$target" >"$tmp/$name.out" 2>"$tmp/$name.err" </dev/null &
+  "$@" >"$tmp/$name.out" 2>"$tmp/$name.err" </dev/null &
   pid=$!
   set +m
   until_s=$((SECONDS + limit))
-  while kill -0 "$pid" 2>/dev/null && [ "$SECONDS" -lt "$until_s" ]; do sleep 0.2; done
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -TERM -- "-$pid" 2>/dev/null || true
-    kill -TERM "$pid" 2>/dev/null || true
+  while child_running "$pid" && [ "$SECONDS" -lt "$until_s" ]; do sleep 0.2; done
+  if child_running "$pid"; then
+    signal_group TERM "$pid"
+    signal_child TERM "$pid"
     sleep 0.5
-    kill -KILL -- "-$pid" 2>/dev/null || true
-    kill -KILL "$pid" 2>/dev/null || true
+    signal_group KILL "$pid"
+    signal_child KILL "$pid"
     n=0
-    while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 50 ]; do
+    while child_running "$pid" && [ "$n" -lt 50 ]; do
       sleep 0.1
       n=$((n + 1))
     done
-    if ! kill -0 "$pid" 2>/dev/null; then wait "$pid" 2>/dev/null || true; fi
+    if ! child_running "$pid"; then wait "$pid" 2>/dev/null || true; fi
     outer_rc=124
     return 0
   fi
   wait "$pid" || outer_rc=$?
+}
+run_outer() { # <外側の期限秒> <名前> <env...>。対象スクリプトを env つきで run_outer_cmd に通す
+  local limit="$1" name="$2"
+  shift 2
+  run_outer_cmd "$limit" "$name" env "$@" bash "$target"
 }
 
 # <名前> <期待 rc> <期限> <段> <env...>: 外側から経過秒を測り、rc・出力行・経過秒の上下限を照合する。
@@ -65,7 +83,9 @@ hang_case() {
   [ "$el" -ge "$dl" ] || fail "$name: finished before the deadline (elapsed=${el}s, deadline=${dl}s)"
   [ "$el" -le $((dl + GRACE)) ] || fail "$name: exceeded deadline + grace (elapsed=${el}s, deadline=${dl}s, grace=${GRACE}s)"
   while IFS= read -r l; do
-    case "$l" in *"deadline_exceeded phase="*) line="$l" ;; esac
+    case "$l" in
+      *"deadline_exceeded phase="*) line="$l" ;;
+    esac
   done <"$tmp/$name.err"
   case "$line" in
     "cli-parity native reclaim: deadline_exceeded phase=$phase elapsed="*" deadline=$dl descendant_alive=0") ;;

@@ -44,6 +44,19 @@ work="$(mktemp -d)"
 tracked_pid="" # 起動済みで未回収の子。EXIT trap と期限切れ回収の対象（回収済みの pid には何も送らない）
 bounded_rc=0
 
+# bash は終了した子を SIGCHLD で回収して状態だけ保持するため、wait していなくても OS の pid は再利用されうる
+# （#1709 の Codex P1）。pid 単体への送信・生存確認は、bash のジョブ表で実行中の子（`jobs -rp` に載る）のときに
+# 限る。プロセスグループ宛ての送信はグループが存在するときだけ行う（メンバーが残る間は pgid の番号は再利用されない）。
+child_running() { # <pid>
+  [[ $'\n'"$(jobs -rp)"$'\n' == *$'\n'"$1"$'\n'* ]]
+}
+signal_child() { # <シグナル> <pid>
+  if child_running "$2"; then kill "-$1" "$2" 2>/dev/null || true; fi
+}
+signal_group() { # <シグナル> <pgid>
+  if kill -0 -- "-$2" 2>/dev/null; then kill "-$1" -- "-$2" 2>/dev/null || true; fi
+}
+
 log_phase() { # <段> <event>
   printf 'cli-parity native reclaim: phase=%s event=%s elapsed=%s\n' "$1" "$2" "$((SECONDS - started_all))" >&2
 }
@@ -61,16 +74,16 @@ reclaim_tree() {
         taskkill //F //T //PID "$w" >/dev/null 2>&1 &
         tk=$!
         until_s=$((SECONDS + 10))
-        while kill -0 "$tk" 2>/dev/null && [ "$SECONDS" -lt "$until_s" ]; do sleep 0.2; done
-        kill -KILL "$tk" 2>/dev/null || true
+        while child_running "$tk" && [ "$SECONDS" -lt "$until_s" ]; do sleep 0.2; done
+        signal_child KILL "$tk"
         # KILL 後も期限つきで終了を確認し、消えたときだけ wait する。消えなければ wait せず回収失敗として
         # 続行する（ハングした taskkill が deadline_exceeded の出力を塞がないため。REPAIR-5・#1709）。
         n=0
-        while kill -0 "$tk" 2>/dev/null && [ "$n" -lt 20 ]; do
+        while child_running "$tk" && [ "$n" -lt 20 ]; do
           sleep 0.1
           n=$((n + 1))
         done
-        if kill -0 "$tk" 2>/dev/null; then
+        if child_running "$tk"; then
           printf 'cli-parity native reclaim: taskkill_unreaped pid=%s\n' "$tk" >&2
         else
           wait "$tk" 2>/dev/null || true
@@ -78,17 +91,17 @@ reclaim_tree() {
         ;;
     esac
   fi
-  kill -TERM -- "-$pid" 2>/dev/null || true
+  signal_group TERM "$pid"
   sleep 0.5
-  kill -KILL -- "-$pid" 2>/dev/null || true
-  kill -KILL "$pid" 2>/dev/null || true # 未回収の子なので pid は再利用されていない
+  signal_group KILL "$pid"
+  signal_child KILL "$pid"
   n=0
-  while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 50 ]; do
+  while child_running "$pid" && [ "$n" -lt 50 ]; do
     sleep 0.1
     n=$((n + 1))
   done
   # 消えていなければ wait で塞がらない（上限の無い wait を使わない）。
-  if ! kill -0 "$pid" 2>/dev/null; then wait "$pid" 2>/dev/null || true; fi
+  if ! child_running "$pid"; then wait "$pid" 2>/dev/null || true; fi
 }
 
 cleanup() {
@@ -139,7 +152,7 @@ expire() { # <段> <pid> <tick ディレクトリまたは空>
 # 追跡中の tracked_pid の終了を期限つきで待つ。終了コードは bounded_rc。
 wait_bounded() { # <段> <tick ディレクトリまたは空>
   local pid="$tracked_pid"
-  while kill -0 "$pid" 2>/dev/null; do
+  while child_running "$pid"; do
     if [ "$SECONDS" -ge "$deadline" ]; then expire "$1" "$pid" "$2"; fi
     sleep 0.2
   done
@@ -188,9 +201,9 @@ while [ "$(count_role "$base" child)" -lt 1 ] && [ "$w" -lt 50 ] && [ "$SECONDS"
   w=$((w + 1))
 done
 if [ "$test_hang" != "baseline" ]; then
-  kill -TERM -- "-$bpid" 2>/dev/null || true
+  signal_group TERM "$bpid"
   sleep 0.5
-  kill -KILL -- "-$bpid" 2>/dev/null || true
+  signal_group KILL "$bpid"
 fi
 wait_bounded baseline "$base"
 log_phase baseline end

@@ -1004,7 +1004,7 @@ mod tests {
     fn sec4_task163_both_fail_keeps_rejection() {
         let f: FallbackFactory = Arc::new(|| Box::new(NoAuditFallback));
         let sink = FileAuditSink::with_parts(missing_path(), f, Arc::new(|_| {}));
-        let r = record_mount_rejection("denied", None, &sink);
+        let r = record_mount_rejection("denied", None, None, &sink);
         assert_eq!(r.error, "denied");
         assert!(matches!(
             r.delivery,

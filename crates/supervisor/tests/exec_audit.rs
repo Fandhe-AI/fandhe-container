@@ -130,6 +130,8 @@ mod linux {
         assert_eq!(recs[0].path(), None);
         assert_eq!(recs[0].syscall(), None);
         assert_eq!(recs[0].pid().get(), std::process::id());
+        // #1618: pid は記録した親プロセスのもの。対象のコンテナは検証済みの ID で示す。
+        assert_eq!(recs[0].container_id().map(|c| c.as_str()), Some("c1"));
     }
 
     /// 0700 の使い捨てディレクトリ（状態ルートとして使う。`FileAuditSink` の親ディレクトリ検査を満たす）。
@@ -216,6 +218,7 @@ mod linux {
             line.contains(&format!("\"pid\":{}", std::process::id())),
             "{line}"
         );
+        assert!(line.ends_with("\"container_id\":\"c1\"}"), "{line}");
 
         let second =
             run_command(&record, &req, Duration::from_secs(30), &sink).expect_err("rejected");
@@ -275,6 +278,7 @@ mod linux {
                 reject_own_root_for_test(Path::new("/"))?;
                 panic!("the host root must be rejected as the rootfs");
             },
+            Some(&cid()),
             sink,
         )
         .expect_err("the host root must be rejected")
@@ -295,6 +299,7 @@ mod linux {
         assert_eq!(recs[0].path(), None);
         assert_eq!(recs[0].syscall(), None);
         assert_eq!(recs[0].pid().get(), std::process::id());
+        assert_eq!(recs[0].container_id().map(|c| c.as_str()), Some("c1"));
 
         // 記録の失敗で拒否は覆らない（fail-closed）。
         let failing = VecSink::new(true);
@@ -325,6 +330,7 @@ mod linux {
                 line.contains(&format!("\"pid\":{}", std::process::id())),
                 "{line}"
             );
+            assert!(line.ends_with("\"container_id\":\"c1\"}"), "{line}");
             assert!(!line.contains("exec_target"), "{line}");
             assert!(!line.contains("entrypoint"), "{line}");
         });

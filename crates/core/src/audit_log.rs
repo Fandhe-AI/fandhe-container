@@ -44,7 +44,9 @@
 //!
 //! syscall 番号はアーキテクチャ相対（x86_64 / aarch64 で異なる）ため、seccomp レコードは
 //! アーキ識別子（`AUDIT_ARCH_*`。[`AuditSyscallArch`]）を併せて持つ（#193 で決定）。
-//! コンテナ ID を持たせるかは #194 以降で決める。フィールドは非公開かつ `#[non_exhaustive]` なので、
+//! コンテナ ID は #1618 で [`AuditRecord::container_id`] として追加済み（検証済みの `ContainerId` のみ。
+//! mount・exec_target・entrypoint の配送ヘルパが載せる。seccomp・landlock・plugin_trust への配線は未実装）。
+//! pid1 の PID は未検証の候補しか得られないため載せない。フィールドは非公開かつ `#[non_exhaustive]` なので、
 //! 後から追加しても破壊的変更にならない。
 
 mod file_sink;
@@ -67,7 +69,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::seccomp::{AuditArch, SyscallNr};
-use crate::traits::ErrorCode;
+use crate::traits::{ContainerId, ErrorCode};
 
 pub mod mount;
 mod seccomp_hook;
@@ -203,7 +205,8 @@ impl From<SyscallNr> for AuditSyscallNr {
 
 /// 監査対象のプロセス ID（`pid_t` の有効範囲 `1..=i32::MAX`）。
 ///
-/// 記録したプロセス自身の PID namespace から見た PID。他の namespace（例: seccomp USER_NOTIF の
+/// 記録したプロセス自身の PID namespace から見た PID。違反したプロセスの PID とは限らない
+/// （層ごとの意味は [`AuditRecord`] の doc。コンテナとの対応は `container_id` で取る）。他の namespace（例: seccomp USER_NOTIF の
 /// listener 側 PID）の値は、呼び出し側が変換してから渡す契約（SEC-4。`seccomp_hook` 参照）。
 /// ホスト側 PID との突き合わせはカーネル監査経路の担当（#840 の `KernelAuditFallback` は本 PID を本文に載せるだけで、変換はしない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -441,12 +444,30 @@ impl AuditEvent {
 }
 
 /// 固定スキーマの監査レコード（SEC-4）。
+///
+/// # `pid` と `container_id` の意味（#1618）
+///
+/// - [`AuditRecord::pid`] は**記録を組み立てたプロセス**の PID であり、違反した側とは限らない。
+///   mount・exec_target・entrypoint の層（`mount::deliver` 経由）では supervisor・exec の親・launch の側の
+///   PID で、違反したプロセスでも pid1 でもない。seccomp は報告元（ハンドラ / listener）が伝えた
+///   違反プロセスの PID（[`SeccompDenialReport`] の契約）、landlock は `landlock_denial_record_now` を
+///   呼んだプロセスの PID
+/// - 「どのコンテナに対する試行か」は [`AuditRecord::container_id`] で取る。検証済みの
+///   [`ContainerId`]（文字種 `[A-Za-z0-9._-]`・255 バイト以下）だけを載せるので、ログ注入の
+///   経路にならず、パスなどホスト構成も出ない（REPAIR-2）。ID が不明な呼び出し側は載せない（`None`）
+///
+/// # 将来仕様（REPAIR-3）
+///
+/// 対象 pid1 の PID は載せない。`StateRecord` の pid は `identify_pid1` を通るまで未検証の候補で、
+/// exec_target の拒否はその検証が失敗した場合なので、載せると未検証の値を「対象」と誤記する
+/// 恐れがある（PID の再利用もあり得る）。検証済み pid1 の記録は別設計（TASK-41 追補・TASK-163）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct AuditRecord {
     timestamp: AuditTimestamp,
     pid: AuditPid,
     event: AuditEvent,
+    container_id: Option<ContainerId>,
 }
 
 impl AuditRecord {
@@ -456,7 +477,24 @@ impl AuditRecord {
             timestamp,
             pid,
             event,
+            container_id: None,
         }
+    }
+
+    /// 検証済みのコンテナ ID を載せる（#1618）。
+    ///
+    /// [`ContainerId`] は構築時に文字種・長さが検証済みなので、ファイル（JSON Lines）にも
+    /// カーネル監査の key=value にも生の値で出せる。`new` のシグネチャは変えず、ID を知る
+    /// 呼び出し側（`mount::deliver` 等）だけがこれで足す。
+    #[must_use]
+    pub fn with_container_id(mut self, id: ContainerId) -> Self {
+        self.container_id = Some(id);
+        self
+    }
+
+    /// 記録に載せたコンテナ ID。不明な呼び出し側の記録は `None`（ワイヤーでは null / `?`）。
+    pub fn container_id(&self) -> Option<&ContainerId> {
+        self.container_id.as_ref()
     }
 
     /// 発生時刻。
@@ -464,7 +502,9 @@ impl AuditRecord {
         self.timestamp
     }
 
-    /// 違反したプロセスの PID。
+    /// 記録を組み立てたプロセスの PID（層ごとの意味は [`AuditRecord`] の doc）。
+    ///
+    /// 「違反したプロセス」とは限らない。コンテナとの対応は [`AuditRecord::container_id`] で取る。
     pub fn pid(&self) -> AuditPid {
         self.pid
     }
@@ -650,6 +690,14 @@ mod tests {
         assert_eq!(r.syscall(), None);
         assert_eq!(r.seccomp_arch(), None);
         assert_eq!(r.pid().get(), 11);
+    }
+
+    #[test]
+    fn sec4_task41_1618_record_container_id_accessor() {
+        let rec = AuditRecord::new(ts(), pid(7), AuditEvent::Mount { path: None });
+        assert_eq!(rec.container_id(), None);
+        let with = rec.with_container_id(ContainerId::new("c1").unwrap());
+        assert_eq!(with.container_id().map(ContainerId::as_str), Some("c1"));
     }
 
     #[test]

@@ -1481,6 +1481,158 @@ fn mount_tmpfs_impl(target_dir: BorrowedFd<'_>, params: &TmpfsParams) -> Result<
     }
     Ok(mnt_fd)
 }
+
+/// devpts の `statfs.f_type`（include/uapi/linux/magic.h の `DEVPTS_SUPER_MAGIC`。アーキテクチャ非依存）。
+/// [`mount_devpts_on`] が返す fd の事後検証で使う（#1656 で `crate::exec` から配線予定。CORE-1・SEC-1）。
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const DEVPTS_MAGIC: i64 = 0x1cd1;
+
+/// [`mount_devpts_on`] の作成パラメータ。`/dev/pts` の devpts は OCI runtime-spec の Default Filesystems で
+/// SHOULD とされ、常に載せる暗黙の固定集合である（TASK-29 追補・CORE-1・SEC-1）。
+///
+/// 可変なのは `gid` だけで、`mode`（0o620）・`ptmxmode`（0o666）・マウント属性（nosuid・noexec）は型の外から
+/// 変えられない。カーネルへ渡す文字列は本モジュール内で整数から生成し、利用者文字列や `mount(2)` の data を
+/// 渡す経路を持たない。呼び出し元（#1656 の `crate::exec`）が rootless で gid 5 が写像されていないときに
+/// `gid` を `None` にする（判定はここでは行わない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct DevptsCreate {
+    /// pty スレーブの所有グループ。`None` のときは `gid` のキー自体を渡さない（カーネル既定）。
+    pub(crate) gid: Option<u32>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl DevptsCreate {
+    /// pty スレーブのモード（`mode=`）。
+    pub(crate) const MODE: u32 = 0o620;
+    /// `/dev/pts/ptmx` のモード（`ptmxmode=`）。0o666 でないと非特権プロセスが pty を確保できない。
+    pub(crate) const PTMXMODE: u32 = 0o666;
+
+    /// `fsmount(2)` の `attr_flags`。`nosuid`・`noexec` を固定で付ける。pty は文字デバイスなので
+    /// `nodev` は付けない（付けるとスレーブを open できなくなる）。
+    pub(crate) fn attr_bits(self) -> u32 {
+        consts::MOUNT_ATTR_NOSUID | consts::MOUNT_ATTR_NOEXEC
+    }
+
+    /// `fsconfig(SET_STRING)` へ渡すキーと値の列（順序固定）。`gid` が `u32::MAX`（`(gid_t)-1`、
+    /// 有効な gid になり得ない）の場合は `EINVAL` で拒否する。`unsafe` を含まない純粋関数で、
+    /// マウント権限なしに具体値で照合できる。
+    fn fsconfig_params(self) -> Result<Vec<FsconfigParam>, SysError> {
+        let make = |key: &'static CStr, value: String| -> Result<FsconfigParam, SysError> {
+            // 値は整数から生成した数字（または静的な識別子）のみで、NUL・カンマを含み得ない。
+            let value = CString::new(value).map_err(|_| SysError::Os(EINVAL))?;
+            Ok(FsconfigParam::String(key, value))
+        };
+        let mut params = vec![
+            make(c"source", "devpts".to_owned())?,
+            make(c"mode", format!("{:04o}", Self::MODE))?,
+            make(c"ptmxmode", format!("{:04o}", Self::PTMXMODE))?,
+        ];
+        if let Some(gid) = self.gid {
+            if gid == u32::MAX {
+                return Err(SysError::Os(EINVAL));
+            }
+            params.push(make(c"gid", gid.to_string())?);
+        }
+        Ok(params)
+    }
+}
+
+/// `target_dir`（検証済みのマウント先ディレクトリの O_PATH fd）の上へ、新マウント API で devpts を載せ、
+/// 載せたマウントのルートを指す fd（close-on-exec）を返す。
+///
+/// `fsopen("devpts")` → `fsconfig`（[`DevptsCreate`] のキーを 1 つずつ SET_STRING）→ `fsconfig(CMD_CREATE)`
+/// → `fsmount`（nosuid・noexec）→ `move_mount(.., target_dir, "", *_EMPTY_PATH)`。syscall 境界ではキー単位で
+/// 渡し、利用者の文字列や `mount(2)` の data は渡さない。返す fd は自分のマウントを一意に指し、呼び出し元
+/// （#1656 の `crate::exec`）が `DEVPTS_MAGIC` による事後検証と失敗時の後始末に使う。
+///
+/// `nodev` は付けない（pty は文字デバイスのため）。`newinstance` は渡さない（Linux 4.7 以降は devpts の
+/// mount がすべて独立 instance で、本 API の前提は 5.2 以降）。instance ごとの `max=` も付けない
+/// （全体上限は `kernel.pty.max` が担う）。未対応（`ENOSYS`）は [`SysError::Unsupported`] で返し、
+/// `mount(2)` へは縮退しない（fail-closed）。実マウントは `sys::tests::core1_sec1_task29_devpts_real_mount`（実機前提・`--ignored`）が
+/// user + mount namespace 内で確認し、`crate::exec` への配線後の検証は #1656 で行う。
+/// ビヘイビア: CORE-1・SEC-1・REPAIR-2（TASK-29 追補・#1655）。
+// 呼び出し元は #1656 で配線するまで存在しないため dead_code を許可する。
+#[allow(dead_code)]
+pub(crate) fn mount_devpts_on(
+    target_dir: BorrowedFd<'_>,
+    create: DevptsCreate,
+) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // 検証エラーは fd を作る前に返す。
+    let params = create.fsconfig_params()?;
+    // SAFETY: 静的な NUL 終端文字列のポインタと定数フラグのみ。カーネルは呼び出し中に文字列を複写するだけで
+    // ポインタを保持しない。可変長引数は register 幅（`i64` / ポインタ）で渡す。成功時の戻り値は新規 fd で、
+    // 直後に `new_mount_api_fd` が唯一の所有者にする。
+    let fs_fd = new_mount_api_fd(unsafe {
+        syscall(
+            consts::SYS_FSOPEN,
+            c"devpts".as_ptr(),
+            i64::from(consts::FSOPEN_CLOEXEC),
+        )
+    })?;
+    for param in &params {
+        // devpts のパラメータは文字列形式のみ（`fsconfig_params` が `String` しか作らない）。
+        let FsconfigParam::String(key, value) = param else {
+            return Err(SysError::Os(EINVAL));
+        };
+        // SAFETY: `fs_fd` は生存中の fsopen の fd。`key`・`value` は借用した NUL 終端文字列で
+        // 呼び出しの間生存し、カーネルは保持しない。aux は 0。副作用はこの fs コンテキストへのパラメータ設定に限る。
+        fsconfig_result(unsafe {
+            syscall(
+                consts::SYS_FSCONFIG,
+                i64::from(fs_fd.as_raw_fd()),
+                i64::from(consts::FSCONFIG_SET_STRING),
+                key.as_ptr(),
+                value.as_ptr(),
+                0i64,
+            )
+        })?;
+    }
+    // SAFETY: `fs_fd` は生存中の fsopen の fd。key・value は NULL、aux は 0（`FSCONFIG_CMD_CREATE` の仕様）。
+    // 副作用は superblock の作成（まだどこにも接続されない）に限る。
+    fsconfig_result(unsafe {
+        syscall(
+            consts::SYS_FSCONFIG,
+            i64::from(fs_fd.as_raw_fd()),
+            i64::from(consts::FSCONFIG_CMD_CREATE),
+            core::ptr::null::<core::ffi::c_char>(),
+            core::ptr::null::<core::ffi::c_char>(),
+            0i64,
+        )
+    })?;
+    // SAFETY: `fs_fd` は生存中の fd。flags・attr は定数と `attr_bits`（nosuid・noexec 固定、nodev なし）のみ。
+    // 成功時の戻り値は新規 fd で、直後に `new_mount_api_fd` が唯一の所有者にする。副作用は未接続の
+    // マウントの作成に限る（fd を閉じればカーネルが破棄する）。
+    let mnt_fd = new_mount_api_fd(unsafe {
+        syscall(
+            consts::SYS_FSMOUNT,
+            i64::from(fs_fd.as_raw_fd()),
+            i64::from(consts::FSMOUNT_CLOEXEC),
+            i64::from(create.attr_bits()),
+        )
+    })?;
+    // SAFETY: `mnt_fd`・`target_dir` は生存中の fd（`OwnedFd` と `BorrowedFd`）。パスは静的な空文字列で、
+    // `*_EMPTY_PATH` により fd 自身が対象になる（パス解決なし）。副作用は呼び出しスレッドの mount namespace への
+    // マウント 1 件の追加に限る。
+    let rc = unsafe {
+        syscall(
+            consts::SYS_MOVE_MOUNT,
+            i64::from(mnt_fd.as_raw_fd()),
+            c"".as_ptr(),
+            i64::from(target_dir.as_raw_fd()),
+            c"".as_ptr(),
+            i64::from(consts::MOVE_MOUNT_F_EMPTY_PATH | consts::MOVE_MOUNT_T_EMPTY_PATH),
+        )
+    };
+    if rc == -1 {
+        return Err(new_mount_api_error());
+    }
+    Ok(mnt_fd)
+}
+
 /// `target`（マウントのルート）の tmpfs を、読み取り専用へ再マウントする（`MS_REMOUNT`）。
 ///
 /// `crate::exec::inject_files` が、secrets / configs を書き終えた tmpfs を read-only にするために呼ぶ
@@ -3670,6 +3822,197 @@ mod tests {
         assert_eq!(TMPFS_MAGIC, 0x0102_1994);
     }
 
+    /// CORE-1・SEC-1（TASK-29 追補・#1655）: devpts の fsconfig 列は具体値で固定され、`gid=None` では
+    /// `gid` のキーを渡さない。`mode`・`ptmxmode` は 4 桁 8 進表記（runc と同じ）。
+    #[test]
+    fn core1_sec1_task29_devpts_fsconfig_params_are_exact() {
+        let to_strs = |c: DevptsCreate| -> Vec<(String, String)> {
+            c.fsconfig_params()
+                .unwrap()
+                .iter()
+                .map(|p| match p {
+                    FsconfigParam::String(k, v) => (
+                        k.to_str().unwrap().to_owned(),
+                        v.to_str().unwrap().to_owned(),
+                    ),
+                    FsconfigParam::Flag(k) => panic!("unexpected flag param: {k:?}"),
+                })
+                .collect()
+        };
+        let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+        assert_eq!(DevptsCreate::MODE, 0o620);
+        assert_eq!(DevptsCreate::PTMXMODE, 0o666);
+        assert_eq!(
+            to_strs(DevptsCreate { gid: Some(5) }),
+            vec![
+                pair("source", "devpts"),
+                pair("mode", "0620"),
+                pair("ptmxmode", "0666"),
+                pair("gid", "5"),
+            ]
+        );
+        assert_eq!(
+            to_strs(DevptsCreate { gid: None }),
+            vec![
+                pair("source", "devpts"),
+                pair("mode", "0620"),
+                pair("ptmxmode", "0666"),
+            ]
+        );
+        assert_eq!(
+            to_strs(DevptsCreate { gid: Some(0) }).last(),
+            Some(&pair("gid", "0"))
+        );
+        assert_eq!(
+            DevptsCreate {
+                gid: Some(u32::MAX)
+            }
+            .fsconfig_params(),
+            Err(SysError::Os(EINVAL))
+        );
+    }
+
+    /// CORE-1・SEC-1（TASK-29 追補・#1655）: devpts の fsmount attr は nosuid|noexec（0xA）で nodev を含まない。
+    /// syscall 番号は `sup12_task169_new_mount_api_consts_are_exact` が x86_64・aarch64 で照合する。
+    #[test]
+    fn core1_sec1_task29_devpts_attr_bits_are_exact() {
+        let bits = DevptsCreate { gid: None }.attr_bits();
+        assert_eq!(bits, 0xA);
+        assert_eq!(bits & consts::MOUNT_ATTR_NODEV, 0);
+        assert_eq!(bits & 0x4, 0);
+    }
+
+    /// CORE-1（TASK-29 追補・#1655）: devpts の `statfs.f_type`（`DEVPTS_SUPER_MAGIC`）。
+    #[test]
+    fn core1_task29_devpts_magic_is_exact() {
+        assert_eq!(DEVPTS_MAGIC, 0x1cd1);
+    }
+
+    /// CORE-1・SEC-1・REPAIR-2（TASK-29 追補・#1655）: [`mount_devpts_on`] の実マウント経路の結合試験。
+    ///
+    /// 実機前提のため `#[ignore]` で既定のテスト集合から分離する（実行は
+    /// `cargo test -p fandhe-container-core --lib -- --ignored core1_sec1_task29_devpts_real_mount`）。
+    /// 必要環境は Linux 5.2 以降（新マウント API）・util-linux の `unshare`・非特権 user namespace を許可する
+    /// ホスト（または root）。libtest はテストをスレッドで動かし `CLONE_NEWUSER` が `EINVAL` になるため、
+    /// 外側のテストが `unshare --user --map-root-user --mount` で自身を再実行し、内側（環境変数で判別）が
+    /// その namespace 内でマウントする。ホストのマウントは変えない。内側は (1) カーネルがパラメータを受理して
+    /// 成功する、(2) 返された fd が devpts（magic 0x1cd1）を指す、(3) 指定先へ接続され mountinfo に
+    /// `nosuid,noexec` の devpts として現れる、(4) `ptmx` が 0666 の独立 instance で pty を確保できる、
+    /// ことを具体値で照合する。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    #[ignore = "real-machine test: needs Linux 5.2+, util-linux unshare and unprivileged user namespaces (or root). CORE-1/SEC-1"]
+    fn core1_sec1_task29_devpts_real_mount() {
+        const INNER_ENV: &str = "FANDHE_DEVPTS_MOUNT_INNER";
+        if std::env::var_os(INNER_ENV).is_some() {
+            devpts_real_mount_inner();
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new("unshare")
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--propagation",
+                "private",
+            ])
+            .arg(exe)
+            .args([
+                "--exact",
+                "sys::tests::core1_sec1_task29_devpts_real_mount",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(INNER_ENV, "1")
+            .spawn()
+            .expect("spawn unshare (util-linux required)");
+        // 相手の終了待ちには必ず期限を設ける（REPAIR-5）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break st;
+            }
+            if std::time::Instant::now() >= deadline {
+                // kill の失敗・回収猶予の超過も無期限に待たず、明示的に失敗させる（REPAIR-5）。
+                child.kill().expect("kill timed-out inner devpts test");
+                reap_bounded(&mut child, std::time::Duration::from_secs(5))
+                    .expect("reap timed-out inner devpts test within the grace period");
+                panic!("inner devpts mount test timed out after 60s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        // 内側が作った空のマウント先（子の pid 名）を後始末する。マウントは namespace と共に消えている。
+        let _ =
+            std::fs::remove_dir(std::env::temp_dir().join(format!("fandhe-devpts-{}", child.id())));
+        assert!(
+            status.success(),
+            "inner devpts mount test failed: {status:?}"
+        );
+    }
+
+    /// [`core1_sec1_task29_devpts_real_mount`] の内側（新しい user + mount namespace の中）。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn devpts_real_mount_inner() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = std::env::temp_dir().join(format!("fandhe-devpts-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let cdir = CString::new(dir.to_str().unwrap()).unwrap();
+        let target = open_dir_path_nofollow(None, &cdir).unwrap();
+        // マウント前は devpts ではない。
+        assert_ne!(fs_type(target.as_fd()).unwrap(), DEVPTS_MAGIC);
+
+        // gid=None: user namespace 内で gid 5 が写像されているとは限らない。
+        let mnt = mount_devpts_on(target.as_fd(), DevptsCreate { gid: None }).unwrap();
+        // 返された fd が devpts のマウントを指す。
+        assert_eq!(fs_type(mnt.as_fd()).unwrap(), 0x1cd1);
+        // 指定先へ接続された（パスを開き直しても devpts）。
+        let reopened = open_dir_path_nofollow(None, &cdir).unwrap();
+        assert_eq!(fs_type(reopened.as_fd()).unwrap(), 0x1cd1);
+
+        // mountinfo: 指定先に fstype devpts・nosuid・noexec で現れ、nodev は付かない。
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        let line = mountinfo
+            .lines()
+            .find(|l| l.split(' ').nth(4) == dir.to_str())
+            .expect("mountinfo entry for the target");
+        let (pre, post) = line.split_once(" - ").unwrap();
+        let opts: Vec<&str> = pre.split(' ').nth(5).unwrap().split(',').collect();
+        assert!(
+            opts.contains(&"nosuid") && opts.contains(&"noexec"),
+            "{line}"
+        );
+        assert!(!opts.contains(&"nodev"), "{line}");
+        assert_eq!(post.split(' ').next(), Some("devpts"), "{line}");
+
+        // ptmx は ptmxmode=0666。開くと独立 instance 側にスレーブ（数字名）が現れ、モードは 0620。
+        let ptmx = dir.join("ptmx");
+        assert_eq!(std::fs::metadata(&ptmx).unwrap().mode() & 0o7777, 0o666);
+        let master = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&ptmx)
+            .unwrap();
+        let slaves: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.chars().all(|c| c.is_ascii_digit()))
+            .collect();
+        assert_eq!(slaves.len(), 1, "slaves: {slaves:?}");
+        assert_eq!(
+            std::fs::metadata(dir.join(&slaves[0])).unwrap().mode() & 0o7777,
+            0o620
+        );
+        drop(master);
+        drop(mnt);
+    }
     /// SUP-12（TASK-169 追補・#1472）: `fsmount` の attr フラグは nosuid・nodev を常に含み、可変なのは
     /// ro / exec だけ（`MOUNT_ATTR_*` は `MS_*` と別の名前つき定数から組む）。
     #[test]

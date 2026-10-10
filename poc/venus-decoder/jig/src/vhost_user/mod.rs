@@ -32,6 +32,7 @@
 #[cfg(target_endian = "big")]
 compile_error!("vhost-user codec supports little-endian targets only");
 
+pub mod backend_req;
 mod error;
 mod message;
 

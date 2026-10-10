@@ -8,18 +8,22 @@
 //! 共有メモリ（host-visible。GPU-6・TASK-172 F5.2b.2・#1641）: protocol feature の SHMEM を確定した接続だけ `GET_SHMEM_CONFIG` に
 //! 応じ（shmid 1 を 1 個、`device::HOST_VISIBLE_SHM_SIZE`）、BACKEND_REQ を確定した接続だけ `SET_BACKEND_REQ_FD` の UDS を 1 回保持する。
 //! 保持した fd は [`State`] の drop（セッションの終了。正常もエラーも）で閉じる。確定の食い違いは [`State::host_visible`] が理由つきで表し、
-//! 拒否はしない（寛容。`MAP_BLOB` の ERR 化は #1643、`SHMEM_MAP` の送信は #1642）。
+//! 拒否はしない（寛容。`MAP_BLOB` の ERR 化は #1643）。
+//! backend 要求の送信（F5.2b.3・#1642）: 送ってよいかの判定は [`State::backend_channel`]、失敗後の閉鎖は
+//! [`State::mark_backend_broken`]（`BackendChannel::Broken`。同期が崩れたストリームを使い続けない）。送受信は `super::backend_req`。
 //! 未実装（REPAIR-3）: `SET_CONFIG`・`VRING_NOFD`（polling）・inflight・cursorq（ring 1）の要求処理、
 //! `SET_BACKEND_REQ_FD` の fd が SOCK_STREAM かの検査（`getsockopt(SO_TYPE)` は `sys` の承認範囲外の unsafe になる。種類違いは #1642 の
-//! 期限つき送受信で失敗する）。
+//! 期限つき送受信で `TRANSPORT` か `TIMEOUT` になる）。
 
 use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 
+use super::backend_req::{BackendReqCause, BackendReqError, BackendReqErrorCode};
 use super::error::{SessionError, SessionErrorCode};
 use crate::device;
+use crate::vhost_user::backend_req::BackendRequestCode;
 use crate::vhost_user::guest_memory::GuestMemory;
 use crate::vhost_user::{
     ConfigPayload, F_PROTOCOL_FEATURES, PROTOCOL_F_BACKEND_REQ, PROTOCOL_F_CONFIG, PROTOCOL_F_MQ,
@@ -103,6 +107,21 @@ impl Default for Ring {
     }
 }
 
+/// backend 要求用 UDS の状態（GPU-6・TASK-172 F5.2b.3・#1642）。
+///
+/// 期限切れ・切断・応答の形式不正の後はストリームの同期が崩れ、遅れて届く応答が次の要求の応答に見える。そこで
+/// `Broken` にして stream を閉じ、以後送らない（fail-closed）。`Broken` からは戻らない。
+#[derive(Debug, Default)]
+enum BackendChannel {
+    /// `SET_BACKEND_REQ_FD` がまだ来ていない。
+    #[default]
+    Missing,
+    /// 使える。
+    Open(UnixStream),
+    /// 同期が崩れたため閉じた。
+    Broken,
+}
+
 /// セッション 1 本分のネゴシエーション状態。`GuestMemory` を持つので `!Send`。
 #[derive(Debug, Default)]
 pub(crate) struct State {
@@ -112,8 +131,8 @@ pub(crate) struct State {
     protocol: Option<u64>,
     mem: Option<GuestMemory>,
     rings: [Ring; NUM_RINGS],
-    /// `SET_BACKEND_REQ_FD` で受けた backend 要求用の UDS（接続の間は保持し、`State` の drop で閉じる。送信は #1642）。
-    backend_req: Option<UnixStream>,
+    /// `SET_BACKEND_REQ_FD` で受けた backend 要求用の UDS（接続の間は保持し、`State` の drop で閉じる）。
+    backend_req: BackendChannel,
     /// `GET_SHMEM_CONFIG` に答えたか（frontend が領域を知っているか）。
     shmem_config_sent: bool,
 }
@@ -141,6 +160,8 @@ pub(crate) enum HostVisibleUnavailable {
     BackendReqNotNegotiated,
     /// BACKEND_REQ は確定したが `SET_BACKEND_REQ_FD` が来ていない。
     BackendChannelMissing,
+    /// backend 要求の送受信に失敗して channel を閉じた（#1642。同期が崩れたため以後送らない）。
+    BackendChannelBroken,
 }
 
 impl HostVisible {
@@ -155,6 +176,9 @@ impl HostVisible {
             }
             Self::Unavailable(HostVisibleUnavailable::BackendChannelMissing) => {
                 "backend_channel_missing"
+            }
+            Self::Unavailable(HostVisibleUnavailable::BackendChannelBroken) => {
+                "backend_channel_broken"
             }
         }
     }
@@ -219,12 +243,55 @@ impl State {
             HostVisibleUnavailable::ConfigNotQueried
         } else if !negotiated(PROTOCOL_F_BACKEND_REQ) {
             HostVisibleUnavailable::BackendReqNotNegotiated
-        } else if self.backend_req.is_none() {
-            HostVisibleUnavailable::BackendChannelMissing
         } else {
-            return HostVisible::Ready;
+            match self.backend_req {
+                BackendChannel::Missing => HostVisibleUnavailable::BackendChannelMissing,
+                BackendChannel::Broken => HostVisibleUnavailable::BackendChannelBroken,
+                BackendChannel::Open(_) => return HostVisible::Ready,
+            }
         };
         HostVisible::Unavailable(reason)
+    }
+
+    /// backend 要求を送ってよいときだけ UDS を返す（#1642）。順序は固定: REPLY_ACK 未確定（`REPLY_ACK_NOT_NEGOTIATED`）→
+    /// host-visible 未成立（`HOST_VISIBLE_UNAVAILABLE`。理由は `cause`）。`Ready` は SHMEM の確定・`GET_SHMEM_CONFIG` への
+    /// 回答・ソケットの保持をまとめて満たす。
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "#1643 の ctrl（MAP_BLOB / UNMAP_BLOB）から呼ぶ")
+    )]
+    pub(crate) fn backend_channel(
+        &self,
+        request: BackendRequestCode,
+    ) -> Result<&UnixStream, BackendReqError> {
+        if !self.reply_ack() {
+            return Err(BackendReqError::new(
+                BackendReqErrorCode::ReplyAckNotNegotiated,
+                request,
+            ));
+        }
+        if let HostVisible::Unavailable(why) = self.host_visible() {
+            return Err(
+                BackendReqError::new(BackendReqErrorCode::HostVisibleUnavailable, request)
+                    .with_cause(BackendReqCause::Unavailable(why)),
+            );
+        }
+        match &self.backend_req {
+            BackendChannel::Open(s) => Ok(s),
+            _ => Err(BackendReqError::new(
+                BackendReqErrorCode::HostVisibleUnavailable,
+                request,
+            )),
+        }
+    }
+
+    /// 送受信の失敗後に channel を閉じる（stream を drop する）。
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "#1643 の ctrl（MAP_BLOB / UNMAP_BLOB）から呼ぶ")
+    )]
+    pub(crate) fn mark_backend_broken(&mut self) {
+        self.backend_req = BackendChannel::Broken;
     }
 
     fn any_running(&self) -> bool {
@@ -364,14 +431,14 @@ impl State {
                     return Err(ooo(code));
                 }
                 // 2 回目は拒否（fail-closed）。置き換えを許すと #1642 で送信中の要求と応答がずれうる。
-                if self.backend_req.is_some() {
+                if !matches!(self.backend_req, BackendChannel::Missing) {
                     return Err(ooo(code));
                 }
                 let mut it = fds.into_iter();
                 let (Some(fd), None) = (it.next(), it.next()) else {
                     return Err(fail(SessionErrorCode::FdCountMismatch, code));
                 };
-                self.backend_req = Some(backend_req_stream(fd, code)?);
+                self.backend_req = BackendChannel::Open(backend_req_stream(fd, code)?);
                 Ok(None)
             }
             Request::SetFeatures(v) => {

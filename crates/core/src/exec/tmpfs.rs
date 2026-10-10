@@ -5,13 +5,17 @@
 //! supervisor の `container_options` が解析した [`TmpfsMountSet`] を、`crate::exec` の最小実行フローの
 //! 「[`prepare_rootfs`](super::prepare_rootfs) の後・[`pivot_root`](super::pivot_root) の前」で実マウントする。
 //! `/dev/shm` を含む場合は [`create_default_devices`](super::create_default_devices) の後に呼ぶ。
+//! `create_default_devices` が rootfs の `dev` に専用の tmpfs を載せる（#1653）ため、先に `/dev/shm` を載せると
+//! `dev` の tmpfs に覆い隠される。
 //!
 //! ```text
-//! prepare_rootfs -> create_default_devices -> mount_tmpfs(&isolation, &prepared, &set) -> pivot_root
+//! prepare_rootfs -> create_default_devices（dev に tmpfs → ノード → symlink → pts に devpts → ptmx） -> mount_tmpfs(&isolation, &prepared, &set) -> pivot_root
 //! ```
 //!
 //! # 契約
 //!
+//! - **既定の `/dev/shm`**: `--shm-size` 未指定時の既定 64 MiB は集合側（`TmpfsMountSet::ensure_default_dev_shm`・
+//!   #1654）が足す。本段は既定の件と利用者指定の件を区別せず、同じ検証・後始末を通す
 //! - **fd 起点**: [`PreparedRootfs`] の新しい mount top の fd から、正規化済みのマウント先を 1 要素ずつ
 //!   `O_PATH|O_DIRECTORY|O_NOFOLLOW` で辿る。存在しない要素は 0755 で作り、同じ方法で開き直す。
 //!   symlink・非ディレクトリは `path_symlink_or_not_directory` の違反記録付きで拒否する（rootfs の外へ
@@ -355,20 +359,20 @@ pub(super) fn verify_mounted(
 ) -> Result<(), ExecError> {
     let after = open_chain(root, rootfs, names, None)?;
     let observed = observe_mount(before, &after, mount_fd)?;
-    check_new_tmpfs(observed, destination)
+    check_new_tmpfs(observed, destination, STAGE)
 }
 
 /// マウント前後の fd の観測値（[`check_new_tmpfs`] の入力）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MountObservation {
+pub(super) struct MountObservation {
     /// 開き直した fd の `statfs.f_type`。
-    magic: i64,
+    pub(super) magic: i64,
     /// マウント前に固定した fd が属するマウントの ID。
-    before_mnt_id: u64,
+    pub(super) before_mnt_id: u64,
     /// 開き直した fd が属するマウントの ID。
-    after_mnt_id: u64,
+    pub(super) after_mnt_id: u64,
     /// 自分のマウント（`fsmount` の fd）の ID。
-    own_mnt_id: u64,
+    pub(super) own_mnt_id: u64,
 }
 
 #[cfg(not(test))]
@@ -413,26 +417,46 @@ pub(super) fn display_destination(destination: &str) -> String {
 /// 事後条件の判定（純関数）。開き直した先が tmpfs で、マウント前とは別のマウントで、かつ自分のマウントで
 /// なければ拒否する（rootfs 自体が tmpfs の場合に、マウントが名前の位置に無いのを tmpfs と誤認しないため。
 /// 別の tmpfs が名前の位置に差し込まれていても、自分のマウントでなければ通さない）。
-fn check_new_tmpfs(observed: MountObservation, destination: &str) -> Result<(), ExecError> {
+///
+/// `stage` は失敗を報告する段。`/dev` の tmpfs を載せる `create_default_devices`（#1653）も同じ判定を
+/// 段 `CreateDevices` で再利用する。
+pub(super) fn check_new_tmpfs(
+    observed: MountObservation,
+    destination: &str,
+    stage: IsolationStage,
+) -> Result<(), ExecError> {
+    check_new_mount(observed, sys::TMPFS_MAGIC, "tmpfs", destination, stage)
+}
+
+/// [`check_new_tmpfs`] の fs 種別を引数にした共通本体。`expected_magic` は期待する `statfs.f_type`、
+/// `fs_label` は message に出す fs 名。`/dev/pts` の devpts（#1656。`DEVPTS_MAGIC`）も同じ 3 点判定を
+/// 段 `CreateDevices` で再利用する。message の書式は fs 名以外 tmpfs 版と同一。
+pub(super) fn check_new_mount(
+    observed: MountObservation,
+    expected_magic: i64,
+    fs_label: &str,
+    destination: &str,
+    stage: IsolationStage,
+) -> Result<(), ExecError> {
     let destination = display_destination(destination);
-    if observed.magic != sys::TMPFS_MAGIC {
+    if observed.magic != expected_magic {
         return Err(ExecError::new(
             ErrorCode::FailedPrecondition,
-            STAGE,
-            format!("the mount at {destination} is not tmpfs after mount"),
+            stage,
+            format!("the mount at {destination} is not {fs_label} after mount"),
         ));
     }
     if observed.after_mnt_id == observed.before_mnt_id {
         return Err(ExecError::new(
             ErrorCode::FailedPrecondition,
-            STAGE,
+            stage,
             format!("no new mount is present at {destination} after mount"),
         ));
     }
     if observed.after_mnt_id != observed.own_mnt_id {
         return Err(ExecError::new(
             ErrorCode::FailedPrecondition,
-            STAGE,
+            stage,
             format!("the mount at {destination} is not the mount created by this call"),
         ));
     }
@@ -584,6 +608,29 @@ pub(super) mod tests {
         assert_eq!(report.mounts[0].destination, "/dev/shm");
         assert_eq!(report.mounts[0].size, Some(65536));
         assert_eq!(report.mounts[1].size, None);
+    }
+
+    /// SUP-12・TASK-29 追補（#1654）: 既定の `/dev/shm`（64 MiB）も利用者指定と同じ検証経路で適用される。
+    #[test]
+    fn sup12_task29_default_dev_shm_goes_through_same_path() {
+        let tmp = Tmp::new("defshm");
+        let _ = take_calls();
+        let fd = tmp.fd();
+        let mut s = TmpfsMountSet::new();
+        s.ensure_default_dev_shm().expect("default");
+        let report = mount_tmpfs_at(fd.as_fd(), &s, &not_shared, &|| {}).expect("mount");
+        assert_eq!(
+            take_calls(),
+            vec![(
+                tmp.0.join("dev/shm").to_string_lossy().into_owned(),
+                2 | 4 | 8,
+                "mode=1777,size=67108864".to_owned()
+            )]
+        );
+        assert_eq!(report.mounts[0].destination, "/dev/shm");
+        assert_eq!(report.mounts[0].size, Some(67_108_864));
+        assert!(!report.mounts[0].read_only);
+        assert!(!report.mounts[0].exec);
     }
 
     /// SUP-12・TASK-169.2: 途中要素が symlink なら rootfs の外へ出さず違反記録付きで拒否する。
@@ -751,13 +798,47 @@ pub(super) mod tests {
             after_mnt_id: 31,
             own_mnt_id: 32,
         };
-        let err = check_new_tmpfs(obs, "/run").expect_err("other tmpfs");
+        let err = check_new_tmpfs(obs, "/run", STAGE).expect_err("other tmpfs");
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
         assert_eq!(err.stage, IsolationStage::MountTmpfs);
         assert_eq!(
             err.message,
             "the mount at /run is not the mount created by this call"
         );
+    }
+
+    /// CORE-1・SEC-1（#1656）: 共通本体 `check_new_mount` は期待 magic と fs 名を引数に取り、3 分岐の message
+    /// が devpts 用の表記になる（tmpfs 版と書式は同一）。
+    #[test]
+    fn core1_1656_check_new_mount_reports_devpts_messages() {
+        let obs = |magic, before_mnt_id, after_mnt_id, own_mnt_id| MountObservation {
+            magic,
+            before_mnt_id,
+            after_mnt_id,
+            own_mnt_id,
+        };
+        let stage = IsolationStage::CreateDevices;
+        let check = |o| check_new_mount(o, sys::DEVPTS_MAGIC, "devpts", "/dev/pts", stage);
+        assert!(check(obs(sys::DEVPTS_MAGIC, 1, 2, 2)).is_ok());
+        for (o, msg) in [
+            (
+                obs(sys::TMPFS_MAGIC, 1, 2, 2),
+                "the mount at /dev/pts is not devpts after mount",
+            ),
+            (
+                obs(sys::DEVPTS_MAGIC, 2, 2, 2),
+                "no new mount is present at /dev/pts after mount",
+            ),
+            (
+                obs(sys::DEVPTS_MAGIC, 1, 2, 3),
+                "the mount at /dev/pts is not the mount created by this call",
+            ),
+        ] {
+            let err = check(o).unwrap_err();
+            assert_eq!(err.code, ErrorCode::FailedPrecondition);
+            assert_eq!(err.stage, stage);
+            assert_eq!(err.message, msg);
+        }
     }
 
     /// SUP-12・TASK-169 追補（#1472）: 未対応カーネル（`ENOSYS` 由来の `Unsupported`）は縮退せず
@@ -779,13 +860,16 @@ pub(super) mod tests {
             after_mnt_id,
             own_mnt_id: after_mnt_id,
         };
-        assert_eq!(check_new_tmpfs(obs(0x0102_1994, 30, 31), "/run"), Ok(()));
-        let err = check_new_tmpfs(obs(0xEF53, 30, 31), "/run").expect_err("ext4");
+        assert_eq!(
+            check_new_tmpfs(obs(0x0102_1994, 30, 31), "/run", STAGE),
+            Ok(())
+        );
+        let err = check_new_tmpfs(obs(0xEF53, 30, 31), "/run", STAGE).expect_err("ext4");
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
         assert_eq!(err.stage, IsolationStage::MountTmpfs);
         assert_eq!(err.message, "the mount at /run is not tmpfs after mount");
         // rootfs 自体が tmpfs でも、同じマウントのままなら新しいマウントは無い。
-        let err = check_new_tmpfs(obs(0x0102_1994, 30, 30), "/run").expect_err("same mount");
+        let err = check_new_tmpfs(obs(0x0102_1994, 30, 30), "/run", STAGE).expect_err("same mount");
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
         assert_eq!(err.message, "no new mount is present at /run after mount");
     }
@@ -807,6 +891,7 @@ pub(super) mod tests {
                 own_mnt_id: 2,
             },
             "/run\nlevel=error msg=forged",
+            STAGE,
         )
         .expect_err("not tmpfs");
         assert_eq!(

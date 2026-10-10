@@ -18,6 +18,9 @@
 //!   疑似 FS の書き込み禁止は VFS の裏付けが無く Landlock だけが担うため、記録だけでは守れない
 //! - 実行・`IOCTL_DEV` だけが祖先で広がる箇所（`/dev` 配下の `noexec,nodev` mount 等）は、VFS の
 //!   `noexec` / `nodev` が必ず効くため許容し、[`LandlockRuleset::shadowed`] に記録する（監査は TASK-41・SEC-4）
+//! - 暗黙の固定集合（`/dev`・`/dev/pts`・`/dev/shm`。オーナー判断 #1609）は `mounts[]` に関係なく常に載るため、
+//!   [`crate::dev_mounts`] の定義（実マウントの属性）から導いた権利のルールを rootfs の次に足す（#1657）。
+//!   `mounts[]` が同じマウント先を指す場合は拒否する（統合の規則は TASK-127）
 //! - `linux.readonlyPaths` / `maskedPaths` は参照しない（`unapplied_fields` 扱いで create が拒否する）
 //!
 //! # 未実装範囲（REPAIR-3）
@@ -29,13 +32,14 @@
 use std::fmt;
 
 use super::LandlockSupport;
+use crate::dev_mounts::{IMPLICIT_DEV_MOUNT_COUNT, ImplicitDevMount, ImplicitDevMounts};
 use crate::oci_runtime::{
     CONFIG_MAX_MOUNTS, CONFIG_MAX_PATH_BYTES, MountDestination, OciConfig, OciMount, OciRoot,
 };
 use crate::traits::ErrorCode;
 
-/// 生成するルール本数の上限（mount 上限 + rootfs 1 本。DoS 防止）。
-pub const MAX_LANDLOCK_RULES: usize = CONFIG_MAX_MOUNTS + 1;
+/// 生成するルール本数の上限（mount 上限 + rootfs 1 本 + 暗黙の `/dev` 系 3 本。DoS 防止）。
+pub const MAX_LANDLOCK_RULES: usize = CONFIG_MAX_MOUNTS + 1 + IMPLICIT_DEV_MOUNT_COUNT;
 
 /// Landlock の fs アクセス権ビット集合。既知の 16 ビット以外を表現できない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +166,8 @@ pub enum RulePath {
     Root,
     /// mount の destination（正規化済み）。
     Beneath(MountDestination),
+    /// ランタイムが暗黙に載せるマウントの宛先（静的なパス。#1657）。
+    ImplicitDev(ImplicitDevMount),
 }
 
 impl RulePath {
@@ -170,6 +176,7 @@ impl RulePath {
         match self {
             Self::Root => "/",
             Self::Beneath(d) => d.as_str(),
+            Self::ImplicitDev(m) => m.destination(),
         }
     }
 }
@@ -184,6 +191,11 @@ pub enum RuleOrigin {
     Mount {
         /// `mounts` 内の位置。
         index: usize,
+    },
+    /// ランタイムが暗黙に載せるマウント（`/dev`・`/dev/pts`・`/dev/shm`。#1657）。
+    Implicit {
+        /// 対象のマウント。
+        mount: ImplicitDevMount,
     },
 }
 
@@ -239,7 +251,7 @@ impl LandlockRuleset {
         self.handled_access_fs
     }
 
-    /// パスごとのルール（先頭が rootfs、以降は config 順。後のマウントに覆い隠されたマウントは含めない）。
+    /// パスごとのルール（先頭が rootfs、次に暗黙の `/dev` 系、以降は config 順。後のマウントに覆い隠されたマウントは含めない）。
     pub fn rules(&self) -> &[PathRule] {
         &self.rules
     }
@@ -277,6 +289,12 @@ pub enum LandlockRuleErrorKind {
         /// 祖先ルールによって許可されてしまう書き込み系の権利。
         granted: AccessFs,
     },
+    /// `mounts[index]` が暗黙の固定集合（`/dev`・`/dev/pts`・`/dev/shm`）と同じマウント先を指している。
+    /// 後勝ちで統合すると固定集合が黙って崩れるため拒否する（統合の規則は TASK-127 で決める）。
+    ImplicitMountConflict {
+        /// config の `mounts` 内の位置。
+        index: usize,
+    },
 }
 
 impl LandlockRuleErrorKind {
@@ -287,6 +305,7 @@ impl LandlockRuleErrorKind {
             Self::PathTooLong { .. } => "path_too_long",
             Self::RightsExceedHandled => "rights_exceed_handled",
             Self::WriteRestrictionShadowed { .. } => "write_restriction_shadowed",
+            Self::ImplicitMountConflict { .. } => "implicit_mount_conflict",
         }
     }
 }
@@ -326,6 +345,13 @@ impl LandlockRuleError {
                     granted.bits()
                 ),
             ),
+            LandlockRuleErrorKind::ImplicitMountConflict { index } => (
+                ErrorCode::InvalidArgument,
+                format!(
+                    "mounts[{index}] targets a mount point the runtime provides implicitly \
+                     (/dev, /dev/pts or /dev/shm)"
+                ),
+            ),
         };
         Self {
             code,
@@ -344,6 +370,11 @@ impl fmt::Display for LandlockRuleError {
 impl std::error::Error for LandlockRuleError {}
 
 /// カーネル疑似 FS（書き込み権を Landlock 側でも付けない）。
+///
+/// devpts は含めない。pty のスレーブへの書き込みには `WRITE_FILE` が要り、devpts に置けるのはカーネルが作る
+/// pty ノードだけで `WRITE` の `MAKE_*`・`REMOVE_*` 等は VFS 側で効かない（書き込み制限に VFS の裏付けがある）。
+/// 含めると将来の明示の devpts mount が読み取り専用になり、書き込み可能な祖先の下で
+/// `WriteRestrictionShadowed` で拒否されてしまう（#1657）。
 const PSEUDO_FS: [&str; 8] = [
     "proc",
     "sysfs",
@@ -361,6 +392,23 @@ fn root_rights(readonly: bool) -> AccessFs {
     } else {
         AccessFs::READ.union(AccessFs::WRITE)
     }
+}
+
+/// 暗黙マウントの権利。実マウントの属性（[`ImplicitDevMount::attrs`]）から導き、実マウントより広くしない。
+/// `MAKE_CHAR` / `MAKE_BLOCK` は付けない。
+fn implicit_rights(m: ImplicitDevMount) -> AccessFs {
+    let a = m.attrs();
+    let mut rights = AccessFs::READ;
+    if !a.read_only {
+        rights = rights.union(AccessFs::WRITE);
+    }
+    if a.noexec {
+        rights = rights.difference(AccessFs::EXECUTE);
+    }
+    if !a.nodev && is_dev_path(m.destination()) {
+        rights = rights.union(AccessFs::IOCTL_DEV);
+    }
+    rights
 }
 
 fn is_dev_path(p: &str) -> bool {
@@ -435,16 +483,43 @@ fn is_ancestor(a: &str, b: &str) -> bool {
     a != b && (a == "/" || b.strip_prefix(a).is_some_and(|r| r.starts_with('/')))
 }
 
-/// `root` と `mounts` から Landlock ルールを生成する（CORE-5・TASK-39.2）。
-///
-/// 件数を先に検証してから確保する。検出を通過した `support` なしでは呼べない（fail-closed）。
+/// `root` と `mounts` に、暗黙の `/dev`・`/dev/pts`・`/dev/shm`（[`ImplicitDevMounts::All`]）を加えて
+/// Landlock ルールを生成する（CORE-5・TASK-39.2・#1657）。[`build_path_rules_with_dev`] の薄いラッパー。
 pub fn build_path_rules(
     support: &LandlockSupport,
     root: &OciRoot,
     mounts: &[OciMount],
 ) -> Result<LandlockRuleset, LandlockRuleError> {
+    build_path_rules_with_dev(support, root, mounts, ImplicitDevMounts::All)
+}
+
+/// [`build_path_rules`] で暗黙マウントの含め方を選べる版（CORE-5・#1657）。
+///
+/// 暗黙分は実マウントの属性から導いた最小の権利で `root` の次に置く（順序は root → 暗黙分 → `mounts[]`）。
+/// `mounts[]` の destination が暗黙分（`All` のとき）と完全一致したら
+/// [`LandlockRuleErrorKind::ImplicitMountConflict`] で拒否する。
+///
+/// Landlock はマウントをまたいでパス階層をさかのぼって評価するため、`/dev/pts`・`/dev/shm` に実際に効く
+/// 権利は `/dev` の権利を含む。子の 2 本は意図した権利を明示し、広がった差分を [`LandlockRuleset::shadowed`]
+/// に監査用の記録として残す（SEC-4）。実行・`IOCTL_DEV` の差分は VFS の `noexec` / `nodev` が効く。
+///
+/// `ImplicitDevMounts::None` は rootfs にこれらのマウントが無い経路（#1314 未配線の最小フロー）向けで、
+/// ルールが減るだけで権利は広がらない。このとき `mounts` は上限 +3 件まで通るが、`mounts[]` の件数は
+/// config のパース時に [`CONFIG_MAX_MOUNTS`] で制限済みのため確保量は抑えられる。
+///
+/// 件数を先に検証してから確保する。検出を通過した `support` なしでは呼べない（fail-closed）。
+pub fn build_path_rules_with_dev(
+    support: &LandlockSupport,
+    root: &OciRoot,
+    mounts: &[OciMount],
+    implicit: ImplicitDevMounts,
+) -> Result<LandlockRuleset, LandlockRuleError> {
     let handled = handled_for_abi(support.abi.get());
-    let count = mounts.len().saturating_add(1);
+    let implicit_mounts = implicit.entries();
+    let count = mounts
+        .len()
+        .saturating_add(1)
+        .saturating_add(implicit_mounts.len());
     if count > MAX_LANDLOCK_RULES {
         return Err(LandlockRuleError::new(
             LandlockRuleErrorKind::TooManyRules {
@@ -459,6 +534,13 @@ pub fn build_path_rules(
         allowed: root_rights(root.readonly()),
         origin: RuleOrigin::Root,
     });
+    for &mount in implicit_mounts {
+        rules.push(PathRule {
+            path: RulePath::ImplicitDev(mount),
+            allowed: implicit_rights(mount),
+            origin: RuleOrigin::Implicit { mount },
+        });
+    }
     for (index, m) in mounts.iter().enumerate() {
         let dest = m.mount_destination();
         let len = dest.as_str().len();
@@ -467,6 +549,14 @@ pub fn build_path_rules(
                 len,
                 max: CONFIG_MAX_PATH_BYTES,
             }));
+        }
+        if implicit_mounts
+            .iter()
+            .any(|i| i.destination() == dest.as_str())
+        {
+            return Err(LandlockRuleError::new(
+                LandlockRuleErrorKind::ImplicitMountConflict { index },
+            ));
         }
         // 後のマウントは同一 destination とその配下にある先のマウントを覆い隠す（OCI の適用順）。
         // 隠れたマウントのルールを残すと、後のマウント内の同名パスへ先の権利を与えるため除外する。
@@ -484,9 +574,9 @@ pub fn build_path_rules(
     let mut shadowed = Vec::new();
     for r in &rules {
         // rootfs には祖先が無い。
-        let RuleOrigin::Mount { index } = r.origin else {
+        if r.origin == RuleOrigin::Root {
             continue;
-        };
+        }
         let effective = rules
             .iter()
             .filter(|a| is_ancestor(a.path.as_str(), r.path.as_str()))
@@ -495,6 +585,13 @@ pub fn build_path_rules(
         let granted_writes = widened.intersection(AccessFs::WRITE);
         if !granted_writes.is_empty() {
             // Landlock は祖先の許可を子で取り消せないため、書き込み制限を黙って失わせず拒否する。
+            // 暗黙分は 3 本とも `WRITE` を持つので構造上ここへ来ない。来たら内部不変条件違反として扱う
+            // （`index` は `mounts[]` の位置を表すため暗黙分には流用しない）。
+            let RuleOrigin::Mount { index } = r.origin else {
+                return Err(LandlockRuleError::new(
+                    LandlockRuleErrorKind::RightsExceedHandled,
+                ));
+            };
             return Err(LandlockRuleError::new(
                 LandlockRuleErrorKind::WriteRestrictionShadowed {
                     index,
@@ -527,7 +624,7 @@ pub fn build_path_rules(
     })
 }
 
-/// [`build_path_rules`] の `OciConfig` 版の薄いラッパー。
+/// [`build_path_rules`] の `OciConfig` 版の薄いラッパー（暗黙の `/dev` 系を含める。#1657）。
 pub fn path_rules_from_config(
     support: &LandlockSupport,
     config: &OciConfig,
@@ -551,9 +648,30 @@ mod tests {
         parse_config_bytes(v.to_string().as_bytes()).expect("valid config")
     }
 
+    /// 暗黙の `/dev` 系を含めない版（mount オプションの解釈など、`mounts[]` だけを照合するテスト用）。
     fn build(c: &OciConfig) -> LandlockRuleset {
         let s = evaluate_abi(6).expect("abi6");
+        build_path_rules_with_dev(&s, c.root(), c.mounts(), ImplicitDevMounts::None).expect("rules")
+    }
+
+    /// 暗黙の `/dev` 系を含める版（本番の入口 `path_rules_from_config` と同じ）。
+    fn build_all(c: &OciConfig) -> LandlockRuleset {
+        let s = evaluate_abi(6).expect("abi6");
         path_rules_from_config(&s, c).expect("rules")
+    }
+
+    fn summary(rs: &LandlockRuleset) -> Vec<(&str, RuleOrigin, u64)> {
+        rs.rules()
+            .iter()
+            .map(|r| (r.path.as_str(), r.origin, r.allowed.bits()))
+            .collect()
+    }
+
+    fn shadowed_summary(rs: &LandlockRuleset) -> Vec<(&str, u64, u64)> {
+        rs.shadowed()
+            .iter()
+            .map(|s| (s.path.as_str(), s.intended.bits(), s.effective.bits()))
+            .collect()
     }
 
     fn rule<'a>(rs: &'a LandlockRuleset, p: &str) -> &'a PathRule {
@@ -789,7 +907,9 @@ mod tests {
         ];
         assert_eq!(AccessFs::WRITE.bits(), 0x77B2);
         for (readonly, mounts, index) in cases {
-            let e = path_rules_from_config(&s, &cfg(readonly, mounts)).expect_err("rejected");
+            let c = cfg(readonly, mounts);
+            let e = build_path_rules_with_dev(&s, c.root(), c.mounts(), ImplicitDevMounts::None)
+                .expect_err("rejected");
             assert_eq!(
                 e.kind,
                 LandlockRuleErrorKind::WriteRestrictionShadowed {
@@ -883,20 +1003,167 @@ mod tests {
         let m = one.mounts()[0].clone();
         let many = vec![m.clone(); CONFIG_MAX_MOUNTS];
         let rs = build_path_rules(&s, one.root(), &many).expect("at limit");
-        // 同一 destination は後勝ちで 1 本にまとまる。
-        assert_eq!(rs.rules().len(), 2);
+        // 同一 destination は後勝ちで 1 本にまとまる（root・暗黙 3 本・/a）。
+        assert_eq!(rs.rules().len(), 5);
         let over = vec![m; CONFIG_MAX_MOUNTS + 1];
         let e = build_path_rules(&s, one.root(), &over).expect_err("over limit");
         assert_eq!(
             e.kind,
             LandlockRuleErrorKind::TooManyRules {
-                count: 1026,
-                max: 1025
+                count: 1029,
+                max: 1028
             }
         );
         assert_eq!(e.code, ErrorCode::InvalidArgument);
         assert!(e.to_string().starts_with("INVALID_ARGUMENT: "), "{e}");
-        assert_eq!(MAX_LANDLOCK_RULES, 1025);
+        assert_eq!(MAX_LANDLOCK_RULES, 1028);
+    }
+
+    /// CORE-5（#1657）: 暗黙分を含めない版は root のみで、上限は暗黙分を含めた値のまま。
+    #[test]
+    fn core5_build_without_implicit_matches_previous_behavior() {
+        let rs = build(&cfg(true, json!([])));
+        assert_eq!(summary(&rs), vec![("/", RuleOrigin::Root, 0x000D)]);
+        assert!(rs.shadowed().is_empty());
+        assert_eq!(MAX_LANDLOCK_RULES, 1028);
+    }
+
+    /// CORE-5（#1657）: `mounts[]` が空でも暗黙の `/dev` 系のルールが具体的な権利で付く。
+    /// 読み取り専用 root でも `/dev` には書き込みが付く。
+    #[test]
+    fn core5_implicit_dev_rules_readonly_root() {
+        let rs = build_all(&cfg(true, json!([])));
+        let dev = |m| RuleOrigin::Implicit { mount: m };
+        assert_eq!(
+            summary(&rs),
+            vec![
+                ("/", RuleOrigin::Root, 0x000D),
+                ("/dev", dev(ImplicitDevMount::Dev), 0xF7BF),
+                ("/dev/pts", dev(ImplicitDevMount::DevPts), 0xF7BE),
+                ("/dev/shm", dev(ImplicitDevMount::DevShm), 0x77BE),
+            ]
+        );
+        assert!(rule(&rs, "/dev").allowed.contains(AccessFs::WRITE_FILE));
+        assert_eq!(
+            shadowed_summary(&rs),
+            vec![("/dev/pts", 0xF7BE, 0xF7BF), ("/dev/shm", 0x77BE, 0xF7BF)]
+        );
+    }
+
+    #[test]
+    fn core5_implicit_dev_rules_writable_root() {
+        let rs = build_all(&cfg(false, json!([])));
+        let got = summary(&rs);
+        assert_eq!(got[0], ("/", RuleOrigin::Root, 0x77BF));
+        assert_eq!(got[1].2, 0xF7BF);
+        assert_eq!(got[2].2, 0xF7BE);
+        assert_eq!(got[3].2, 0x77BE);
+        assert_eq!(
+            shadowed_summary(&rs),
+            vec![("/dev/pts", 0xF7BE, 0xF7BF), ("/dev/shm", 0x77BE, 0xF7BF)]
+        );
+    }
+
+    /// CORE-5（#1657）: `IOCTL_DEV` は `/dev`・`/dev/pts` だけ。`/dev2` 等の類似パスや `/dev/shm` には付かない。
+    #[test]
+    fn core5_ioctl_dev_only_on_implicit_dev_and_pts() {
+        let rs = build_all(&cfg(
+            true,
+            json!([
+                {"destination": "/dev2"},
+                {"destination": "/devices"},
+                {"destination": "/data"},
+            ]),
+        ));
+        for p in ["/dev", "/dev/pts"] {
+            assert!(rule(&rs, p).allowed.contains(AccessFs::IOCTL_DEV), "{p}");
+        }
+        for p in ["/", "/dev/shm", "/dev2", "/devices", "/data"] {
+            assert!(!rule(&rs, p).allowed.contains(AccessFs::IOCTL_DEV), "{p}");
+        }
+    }
+
+    /// CORE-5・SEC-1（#1657）: 暗黙分に `MAKE_CHAR` / `MAKE_BLOCK` は付かず、handled の部分集合である。
+    #[test]
+    fn core5_implicit_dev_rights_exclude_make_char_block() {
+        let rs = build_all(&cfg(true, json!([])));
+        for p in ["/dev", "/dev/pts", "/dev/shm"] {
+            let a = rule(&rs, p).allowed;
+            assert!(a.intersection(AccessFs::MAKE_CHAR).is_empty(), "{p}");
+            assert!(a.intersection(AccessFs::MAKE_BLOCK).is_empty(), "{p}");
+            assert!(a.is_subset_of(rs.handled_access_fs()), "{p}");
+        }
+    }
+
+    /// CORE-5（#1657）: `mounts[]` が暗黙のマウント先と一致したら統合せず拒否する。配下（`/dev/fuse`）は受け付ける。
+    #[test]
+    fn core5_mount_conflicting_with_implicit_dev_is_rejected() {
+        let s = evaluate_abi(6).expect("abi6");
+        for dest in ["/dev", "/dev/pts", "/dev/shm", "/dev//shm/"] {
+            let c = cfg(
+                true,
+                json!([{"destination": "/data"}, {"destination": dest}]),
+            );
+            let e = path_rules_from_config(&s, &c).expect_err("conflict");
+            assert_eq!(
+                e.kind,
+                LandlockRuleErrorKind::ImplicitMountConflict { index: 1 },
+                "{dest}"
+            );
+            assert_eq!(e.code, ErrorCode::InvalidArgument);
+            assert_eq!(
+                e.to_string(),
+                "INVALID_ARGUMENT: mounts[1] targets a mount point the runtime provides \
+                 implicitly (/dev, /dev/pts or /dev/shm)"
+            );
+        }
+        let c = cfg(true, json!([{"destination": "/dev/fuse"}]));
+        let rs = path_rules_from_config(&s, &c).expect("under implicit /dev is accepted");
+        assert_eq!(
+            rule(&rs, "/dev/fuse").origin,
+            RuleOrigin::Mount { index: 0 }
+        );
+    }
+
+    /// CORE-5（#1657）: 暗黙の `/dev` は書き込みを許すため、その配下の `ro` mount は狭められず拒否する。
+    #[test]
+    fn core5_mount_under_implicit_dev_write_restriction_rejected() {
+        let s = evaluate_abi(6).expect("abi6");
+        let c = cfg(true, json!([{"destination": "/dev/x", "options": ["ro"]}]));
+        let e = path_rules_from_config(&s, &c).expect_err("rejected");
+        assert_eq!(
+            e.kind,
+            LandlockRuleErrorKind::WriteRestrictionShadowed {
+                index: 0,
+                granted: AccessFs::WRITE,
+            }
+        );
+        assert_eq!(AccessFs::WRITE.bits(), 0x77B2);
+    }
+
+    /// CORE-5（#1657）: 件数は `CONFIG_MAX_MOUNTS` 件 + 暗黙分でちょうど上限、1 件超えると拒否する。
+    #[test]
+    fn core5_rule_count_limit_with_implicit() {
+        let s = evaluate_abi(6).expect("abi6");
+        let one = cfg(true, json!([{"destination": "/a"}]));
+        let m = one.mounts()[0].clone();
+        let at = vec![m.clone(); CONFIG_MAX_MOUNTS];
+        assert_eq!(
+            build_path_rules(&s, one.root(), &at)
+                .expect("at limit")
+                .rules()
+                .len(),
+            5
+        );
+        let over = vec![m; CONFIG_MAX_MOUNTS + 1];
+        let e = build_path_rules(&s, one.root(), &over).expect_err("over");
+        assert_eq!(
+            e.kind,
+            LandlockRuleErrorKind::TooManyRules {
+                count: 1029,
+                max: 1028
+            }
+        );
     }
 
     #[test]

@@ -20,10 +20,12 @@
 //! 記録するのは提出の本体だけで、共有メモリ上のリングの中身は記録しない（F5.2b の後）。
 //!
 //! 共有メモリの前提（F5.2b.2・#1641）: protocol feature `SHMEM`・`BACKEND_REQ` の広告と、`GET_SHMEM_CONFIG`・`SET_BACKEND_REQ_FD` の受け付けは
-//! `session` / `vhost_user` に実装済み。backend 要求（`SHMEM_MAP` / `SHMEM_UNMAP`）の期限つき送信は F5.2b.3（#1642）で `session` に実装済み（呼び出しは #1643 の `MAP_BLOB`）。
+//! `session` / `vhost_user` に実装済み。backend 要求（`SHMEM_MAP` / `SHMEM_UNMAP`）の期限つき送信は F5.2b.3（#1642）で `session` に実装済み。
+//! ctrl の `RESOURCE_MAP_BLOB` / `UNMAP_BLOB` は F5.2b.4a（#1643）で実装済み（adapter が検証、`session` が memfd を作って frontend へ `SHMEM_MAP` / `SHMEM_UNMAP`。
+//! 共有メモリが未成立・frontend の失敗は `ERR_UNSPEC`）。map 中の資源の解放は F5.2b.4b（#1645）で確定済み（map 中の UNREF は拒否、`CTX_DESTROY` は map を残す、map が残ったままの終了では `SHMEM_UNMAP` を送ってから memfd を閉じる）。
 //!
 //! 未実装（実装済みを装わない。REPAIR-3）: cursorq の処理、
-//! `observe::snapshot_lines` の定期出力（終了時の集計出力は実装済み）と virtqueue 個別の観測カウンタ、`RESOURCE_MAP_BLOB` / `UNMAP_BLOB` と共有メモリ（F5.2b。未対応は `ERR_UNSPEC`）、`SUBMIT_3D` の dispatch（TASK-177.x）、
+//! `observe::snapshot_lines` の定期出力（終了時の集計出力は実装済み）と virtqueue 個別の観測カウンタ、`SUBMIT_3D` の dispatch（TASK-177.x）、
 //! 実機での疎通（F3・#725）。
 
 // unsafe の配置制約（#1517 の個別承認の条件）: crate 全体で unsafe を禁止し、syscall の薄いラッパーを置く `sys`

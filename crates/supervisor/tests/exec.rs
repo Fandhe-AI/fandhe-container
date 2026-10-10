@@ -106,11 +106,12 @@ mod linux {
     use fandhe_container_core::audit_log::{AuditDelivery, AuditRecord, AuditSink};
     use fandhe_container_core::cgroups::CgroupName;
     use fandhe_container_core::exec::{
-        ChildExit, ContainerEnv, ExecExit, IsolationConfig, MountIsolation, Namespace,
-        NamespaceSet, ViolationReason, create_default_devices, isolate_rootful_host_root,
-        pivot_root, plan_rootful_host_root, prepare_rootfs,
+        ChildExit, ContainerEnv, DevptsGidSource, ExecExit, IsolationConfig, MountIsolation,
+        Namespace, NamespaceSet, ViolationReason, create_default_devices,
+        isolate_rootful_host_root, mount_tmpfs, pivot_root, plan_rootful_host_root, prepare_rootfs,
     };
     use fandhe_container_core::oci_runtime::load_config;
+    use fandhe_container_core::tmpfs::TmpfsMountSet;
     use fandhe_container_core::traits::{
         CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, StateRecord, StateRevision,
         TraitError,
@@ -319,7 +320,7 @@ mod linux {
         .expect("chmod script");
         fs::write(
             bundle.dir.join("config.json"),
-            br#"{"ociVersion":"1.2.0","root":{"path":"rootfs","readonly":true},"process":{"user":{"uid":0,"gid":0},"cwd":"/","args":["/probe"],"env":["FANDHE_EXEC_ENV=from-config","OVERRIDDEN=config"]},"mounts":[{"destination":"/dev","options":["rw"]},{"destination":"/data","options":["rw"]}]}"#,
+            br#"{"ociVersion":"1.2.0","root":{"path":"rootfs","readonly":true},"process":{"user":{"uid":0,"gid":0},"cwd":"/","args":["/probe"],"env":["FANDHE_EXEC_ENV=from-config","OVERRIDDEN=config"]},"mounts":[{"destination":"/data","options":["rw"]}]}"#,
         )
         .expect("write config.json");
         bundle
@@ -380,7 +381,15 @@ mod linux {
         assert_eq!(std::process::id(), 1, "must be PID 1 of the new namespace");
         let isolation = MountIsolation::establish().expect("establish mount isolation");
         let prepared = prepare_rootfs(&isolation, rootfs).expect("prepare rootfs");
-        create_default_devices(&isolation, &prepared).expect("create default devices");
+        create_default_devices(&isolation, &prepared, DevptsGidSource::Rootful)
+            .expect("create default devices");
+        // 暗黙の `/dev/shm` を載せる（本番の順序: create_default_devices の後。#1654）。Landlock の暗黙分の
+        // ルール（`/dev/shm`。#1657）が存在するパスを指すために必要。
+        let mut tmpfs = TmpfsMountSet::new();
+        tmpfs
+            .ensure_default_dev_shm()
+            .expect("default /dev/shm spec");
+        mount_tmpfs(&isolation, &prepared, &tmpfs).expect("mount default /dev/shm");
         pivot_root(&isolation, prepared).expect("pivot_root");
         fs::write(format!("/{ready}"), b"ready").expect("write ready marker");
         // 親が stdin 経由で pid1 を kill するまで待機する（上限つき。REPAIR-5）。
@@ -961,7 +970,7 @@ mod linux {
         assert_eq!(
             out.trim_end(),
             format!(
-                "outcome exit={:?} rlimits=15 rlimits_deferred=1 caps_dropped={} landlock_rules=3 seccomp_instructions={} groups={} entrypoint_mode={mode} reason={outcome_reason}",
+                "outcome exit={:?} rlimits=15 rlimits_deferred=1 caps_dropped={} landlock_rules=5 seccomp_instructions={} groups={} entrypoint_mode={mode} reason={outcome_reason}",
                 ExecExit::Command(ChildExit::Signaled(15)),
                 parse_after(&out, "caps_dropped="),
                 parse_after(&out, "seccomp_instructions="),
@@ -1113,11 +1122,13 @@ mod linux {
     /// TASK-163 追補（#1459・SEC-1・SEC-4）: コンテナの `/dev/null` が symlink・別のデバイスノード（1:5）へ
     /// 差し替えられていたら、exec の子は差し替え先を開かずに拒否し、コマンドは起動しない（終了コード 126）。
     ///
-    /// rootfs の `dev/` は pid1 が `create_default_devices` で作ったホスト側のディレクトリそのものなので、
-    /// ホスト側から差し替える（コンテナが `CAP_MKNOD` で行う差し替えと同じ結果になる）。照合の前に必ず元へ戻す。
+    /// コンテナの `/dev` は pid1 が `create_default_devices` で載せた tmpfs（#1653）で、ホスト側の rootfs の
+    /// `dev/` ではない。ホストからは `/proc/<pid1>/root/dev` で到達できるので、そこで差し替える（コンテナが
+    /// `CAP_MKNOD` で行う差し替えと同じ結果になる）。照合の前に必ず元へ戻す。
     fn replaced_dev_null_is_rejected(bundle: &Bundle, c: &Container) {
-        let null = bundle.rootfs().join("dev/null");
-        let saved = bundle.rootfs().join("dev/null.saved");
+        let pid1_root = PathBuf::from(format!("/proc/{}/root", c.pid1));
+        let null = pid1_root.join("dev/null");
+        let saved = pid1_root.join("dev/null.saved");
         for kind in ["symlink", "device"] {
             clean_probe_files(bundle);
             fs::rename(&null, &saved).expect("move the real /dev/null aside");

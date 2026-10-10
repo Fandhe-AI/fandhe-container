@@ -142,6 +142,40 @@ pub fn resource_unref_line(res_id: Option<u32>, result: QueryResult) -> String {
     )
 }
 
+/// `RESOURCE_MAP_BLOB` のログ行（F5.2b.4a・#1643）。数値と固定語彙のみ。復号できなかった値と、成功以外の `map_info` は -1 で出す。
+pub fn resource_map_blob_line(
+    res_id: Option<u32>,
+    offset: Option<u64>,
+    size: Option<u64>,
+    map_info: Option<u32>,
+    result: QueryResult,
+) -> String {
+    format!(
+        "venus_jig event=resource cmd=RESOURCE_MAP_BLOB res_id={} offset={} size={} map_info={} result={}",
+        res_id.map_or(-1, i128::from),
+        offset.map_or(-1, i128::from),
+        size.map_or(-1, i128::from),
+        map_info.map_or(-1, i128::from),
+        result.word()
+    )
+}
+
+/// `RESOURCE_UNMAP_BLOB` のログ行（[`resource_map_blob_line`] から `map_info` を除いた形）。
+pub fn resource_unmap_blob_line(
+    res_id: Option<u32>,
+    offset: Option<u64>,
+    size: Option<u64>,
+    result: QueryResult,
+) -> String {
+    format!(
+        "venus_jig event=resource cmd=RESOURCE_UNMAP_BLOB res_id={} offset={} size={} result={}",
+        res_id.map_or(-1, i128::from),
+        offset.map_or(-1, i128::from),
+        size.map_or(-1, i128::from),
+        result.word()
+    )
+}
+
 /// `SUBMIT_3D` のログ行の材料。本体のバイト列は含めない（数値と固定語彙のみ）。
 #[derive(Debug, Clone, Copy)]
 pub struct Submit3dLog {
@@ -187,6 +221,13 @@ pub fn session_error_line(code: &str, request: Option<u32>) -> String {
         "venus_jig event=session_error code={code} request={}",
         request.map_or(-1, i64::from)
     )
+}
+
+/// セッション終了時の blob の片づけの集計行（#1645）。数値だけを出す（ゲスト・frontend 由来のバイト列や fd 番号は出さない）。
+/// `mapped` は片づけ前の map 中の件数、`unmapped` は frontend が 0 を返した `SHMEM_UNMAP` の件数、`memfds` は閉じた memfd の数。
+/// 照合器（`find_capset_queries`）では `Other` に分類され、壊れた行に数えられない。
+pub fn blob_release_line(mapped: usize, unmapped: usize, memfds: usize) -> String {
+    format!("venus_jig event=blob_release mapped={mapped} unmapped={unmapped} memfds={memfds}")
 }
 
 /// REPLY_ACK 確定後に、NEED_REPLY が付いた要求へ ack を返したことを示すログ行（#1639）。固定語彙と要求 ID だけを出す。

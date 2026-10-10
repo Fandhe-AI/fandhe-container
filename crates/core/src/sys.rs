@@ -1346,14 +1346,12 @@ impl TmpfsParams {
 ///   `EPERM` になり `/dev/zero` の実行可能マップが壊れるおそれがあり、付ける根拠となるビヘイビアも無い。
 /// - `strictatime` を付ける: runc と同じ。既定の relatime に任せず明示する。
 ///
-/// 呼び出しは #1653 で `crate::exec` から配線する。
+/// `crate::exec::create_default_devices` が呼ぶ（#1653）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // #1653 で配線するまで呼び出し元が無い。配線時に外す。
 pub(crate) struct DevTmpfsCreate {
     _private: (),
 }
 
-#[allow(dead_code)] // 同上（#1653）。
 impl DevTmpfsCreate {
     const MODE: u32 = 0o755;
     const SIZE_BYTES: u64 = 64 * 1024 * 1024;
@@ -1364,17 +1362,21 @@ impl DevTmpfsCreate {
         Self { _private: () }
     }
 
-    /// ルートディレクトリのモード（0o755）。
+    /// ルートディレクトリのモード（0o755）。dry-run の記録（`cfg(test)`）だけが読む。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn mode(&self) -> u32 {
         Self::MODE
     }
 
-    /// サイズ（バイト。64 MiB）。
+    /// サイズ（バイト。64 MiB）。dry-run の記録（`cfg(test)`）だけが読む。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn size_bytes(&self) -> u64 {
         Self::SIZE_BYTES
     }
 
     /// `fsmount(2)` の `attr_flags`（`MOUNT_ATTR_NOSUID|MOUNT_ATTR_STRICTATIME`。nodev・noexec・rdonly なし）。
+    /// dry-run の記録（`cfg(test)`）だけが読む。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn attr_bits(&self) -> u32 {
         Self::ATTR_BITS
     }
@@ -1404,8 +1406,9 @@ pub(crate) fn mount_tmpfs_on(
 ///
 /// マウント先は検証済みの `O_PATH` fd で受け取り、パス文字列の再解決も `data` 文字列も使わない。返す fd は
 /// 載せたマウントのルートを指す close-on-exec の fd。`ENOSYS` は [`SysError::Unsupported`] で返し縮退しない。
-/// 途中失敗は drop で破棄される。Linux 5.2 以降。実マウントの確認と配線は #1653。
-#[allow(dead_code)] // #1653 で `crate::exec` から配線する。配線時に `cfg_attr(test, allow(dead_code))` へ戻す。
+/// 途中失敗は drop で破棄される。Linux 5.2 以降。`crate::exec::create_default_devices` が呼ぶ（#1653）。
+// テストビルドでは `crate::exec` の dry-run 差し込み点が本関数を呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) fn mount_dev_tmpfs_on(
     target_dir: BorrowedFd<'_>,
     create: DevTmpfsCreate,
@@ -1584,8 +1587,7 @@ fn open_tree_clone_raw(node: RawFd) -> Result<OwnedFd, SysError> {
 }
 
 /// devpts の `statfs.f_type`（include/uapi/linux/magic.h の `DEVPTS_SUPER_MAGIC`。アーキテクチャ非依存）。
-/// [`mount_devpts_on`] が返す fd の事後検証で使う（#1656 で `crate::exec` から配線予定。CORE-1・SEC-1）。
-#[cfg_attr(not(test), allow(dead_code))]
+/// [`mount_devpts_on`] が返す fd の事後検証で使う（`crate::exec::create_default_devices` が呼ぶ。CORE-1・SEC-1・#1656）。
 pub(crate) const DEVPTS_MAGIC: i64 = 0x1cd1;
 
 /// [`mount_devpts_on`] の作成パラメータ。`/dev/pts` の devpts は OCI runtime-spec の Default Filesystems で
@@ -1593,16 +1595,14 @@ pub(crate) const DEVPTS_MAGIC: i64 = 0x1cd1;
 ///
 /// 可変なのは `gid` だけで、`mode`（0o620）・`ptmxmode`（0o666）・マウント属性（nosuid・noexec）は型の外から
 /// 変えられない。カーネルへ渡す文字列は本モジュール内で整数から生成し、利用者文字列や `mount(2)` の data を
-/// 渡す経路を持たない。呼び出し元（#1656 の `crate::exec`）が rootless で gid 5 が写像されていないときに
+/// 渡す経路を持たない。呼び出し元（`crate::exec::create_default_devices`。#1656）が rootless で gid 5 が写像されていないときに
 /// `gid` を `None` にする（判定はここでは行わない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct DevptsCreate {
     /// pty スレーブの所有グループ。`None` のときは `gid` のキー自体を渡さない（カーネル既定）。
     pub(crate) gid: Option<u32>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl DevptsCreate {
     /// pty スレーブのモード（`mode=`）。
     pub(crate) const MODE: u32 = 0o620;
@@ -1645,16 +1645,14 @@ impl DevptsCreate {
 /// `fsopen("devpts")` → `fsconfig`（[`DevptsCreate`] のキーを 1 つずつ SET_STRING）→ `fsconfig(CMD_CREATE)`
 /// → `fsmount`（nosuid・noexec）→ `move_mount(.., target_dir, "", *_EMPTY_PATH)`。syscall 境界ではキー単位で
 /// 渡し、利用者の文字列や `mount(2)` の data は渡さない。返す fd は自分のマウントを一意に指し、呼び出し元
-/// （#1656 の `crate::exec`）が `DEVPTS_MAGIC` による事後検証と失敗時の後始末に使う。
+/// （`crate::exec::create_default_devices`。#1656）が `DEVPTS_MAGIC` による事後検証と失敗時の後始末に使う。
 ///
 /// `nodev` は付けない（pty は文字デバイスのため）。`newinstance` は渡さない（Linux 4.7 以降は devpts の
 /// mount がすべて独立 instance で、本 API の前提は 5.2 以降）。instance ごとの `max=` も付けない
 /// （全体上限は `kernel.pty.max` が担う）。未対応（`ENOSYS`）は [`SysError::Unsupported`] で返し、
 /// `mount(2)` へは縮退しない（fail-closed）。実マウントは `sys::tests::core1_sec1_task29_devpts_real_mount`（実機前提・`--ignored`）が
-/// user + mount namespace 内で確認し、`crate::exec` への配線後の検証は #1656 で行う。
+/// user + mount namespace 内で確認し、`crate::exec` からの呼び出しは `tests/default_devices.rs` が確認する（#1656）。
 /// ビヘイビア: CORE-1・SEC-1・REPAIR-2（TASK-29 追補・#1655）。
-// 呼び出し元は #1656 で配線するまで存在しないため dead_code を許可する。
-#[allow(dead_code)]
 pub(crate) fn mount_devpts_on(
     target_dir: BorrowedFd<'_>,
     create: DevptsCreate,
@@ -1855,11 +1853,25 @@ pub(crate) fn change_dir_fd(fd: BorrowedFd<'_>) -> Result<(), SysError> {
 /// 行が無い・数値でない場合は `false`（fail-closed）。`crate::exec` の `status_threads` は
 /// 上位モジュールのため呼ばず（依存方向を保つ）、ここに最小の解析を持つ。
 fn threads_is_one(status: &str) -> bool {
+    status_thread_count(status) == Some(1)
+}
+
+/// `/proc/self/status` の内容から `Threads:` の値を読む純関数。行が無い・数値でない場合は `None`。
+fn status_thread_count(status: &str) -> Option<u64> {
     status
         .lines()
         .find_map(|l| l.strip_prefix("Threads:"))
         .and_then(|v| v.trim().parse::<u64>().ok())
-        == Some(1)
+}
+
+/// 呼び出しプロセスの現在のスレッド数（`/proc/self/status` の `Threads:`）。読めない・解釈できなければ `None`。
+///
+/// `crate::audit_log` の `FileAuditSink` が、通知の出し直しスレッドを join した後にスレッド数が元へ戻るのを
+/// 上限付きで待つために使う（join の完了からスレッドの解放までの短い間は増えたまま読めるため。REPAIR-5・SUP-6）。
+pub(crate) fn current_thread_count() -> Option<u64> {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| status_thread_count(&status))
 }
 
 /// `child` をシングルスレッドの呼び出し元から `fork(2)` した子で実行し、親には子の PID を返す。
@@ -4149,6 +4161,39 @@ mod tests {
         }
     }
 
+    /// CORE-5（TASK-29 追補・#1657）: `/dev`・`/dev/pts` の fsmount 属性ビットが、Landlock 側と共有する
+    /// 暗黙の固定集合の定義（`dev_mounts`）と一致する。片方だけが変わったらここで検出する。
+    #[test]
+    fn core5_implicit_dev_mount_attrs_match_fsmount_bits() {
+        use crate::dev_mounts::ImplicitDevMount;
+        let bits = |m: ImplicitDevMount| {
+            let a = m.attrs();
+            let mut b = 0;
+            if a.read_only {
+                b |= consts::MOUNT_ATTR_RDONLY;
+            }
+            if a.nosuid {
+                b |= consts::MOUNT_ATTR_NOSUID;
+            }
+            if a.nodev {
+                b |= consts::MOUNT_ATTR_NODEV;
+            }
+            if a.noexec {
+                b |= consts::MOUNT_ATTR_NOEXEC;
+            }
+            b
+        };
+        // `/dev` は strictatime が加わる（定義側に atime の属性は無い）。
+        assert_eq!(
+            DevTmpfsCreate::new().attr_bits() & !consts::MOUNT_ATTR_STRICTATIME,
+            bits(ImplicitDevMount::Dev)
+        );
+        assert_eq!(
+            DevptsCreate { gid: None }.attr_bits(),
+            bits(ImplicitDevMount::DevPts)
+        );
+    }
+
     /// CORE-1・SEC-1（TASK-29 追補・#1652）: `/dev` 用 tmpfs の attr は nosuid|strictatime のみ。
     #[test]
     fn core1_sec1_dev_tmpfs_attr_bits_are_exact() {
@@ -4734,6 +4779,16 @@ mod tests {
         assert!(!threads_is_one("Name:\tx\n"));
         assert!(!threads_is_one("Threads:\tmany\n"));
         assert!(!threads_is_one(""));
+    }
+
+    /// REPAIR-5・SUP-6・#1616: `Threads:` の値を数で読み、行が無い・数値でなければ `None`。
+    #[test]
+    fn repair5_status_thread_count_reads_the_number() {
+        assert_eq!(status_thread_count("Name:\tx\nThreads:\t3\n"), Some(3));
+        assert_eq!(status_thread_count("Threads:\tmany\n"), None);
+        assert_eq!(status_thread_count("Name:\tx\n"), None);
+        // libtest のプロセスは複数スレッドで、少なくとも 1。
+        assert!(current_thread_count().is_some_and(|n| n >= 1));
     }
 
     /// CORE-1（TASK-27.4.1）: libtest はマルチスレッドなので、fork は子を作らず `MultiThreaded` で拒否する。

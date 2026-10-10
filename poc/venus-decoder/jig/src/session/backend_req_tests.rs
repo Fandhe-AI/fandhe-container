@@ -19,7 +19,7 @@ use crate::vhost_user::backend_req::{
 use crate::vhost_user::fd_passing::{create_memfd, recv_with_fds, send_with_fds};
 use crate::vhost_user::{Request, ShmemConfig, ShmemRegion};
 
-const T: Duration = Duration::from_secs(5);
+pub(super) const T: Duration = Duration::from_secs(5);
 
 fn config() -> ShmemConfig {
     ShmemConfig::new(&[ShmemRegion {
@@ -37,7 +37,7 @@ fn map_req() -> ShmemMapRequest {
     ShmemMapRequest::new(mapping(), 0).expect("req")
 }
 
-fn session(protocol: u64, connect: bool, timeout: Duration) -> (Session, UnixStream) {
+pub(super) fn session(protocol: u64, connect: bool, timeout: Duration) -> (Session, UnixStream) {
     let mut state = State::new();
     state
         .handle(Request::GetProtocolFeatures, Vec::new())
@@ -60,16 +60,17 @@ fn session(protocol: u64, connect: bool, timeout: Duration) -> (Session, UnixStr
         adapter: CtrlAdapter::default(),
         limits,
         metrics: SessionMetrics::default(),
+        blobs: BlobMemTable::default(),
     };
     (s, b)
 }
 
-fn ready(timeout: Duration) -> (Session, UnixStream) {
+pub(super) fn ready(timeout: Duration) -> (Session, UnixStream) {
     session(0x0040_0229, true, timeout)
 }
 
 /// 偽 frontend: 要求を 1 回受ける（添付 fd は最大 1 本）。
-fn recv_request(b: &UnixStream) -> (DecodedBackendRequest, Vec<OwnedFd>) {
+pub(super) fn recv_request(b: &UnixStream) -> (DecodedBackendRequest, Vec<OwnedFd>) {
     let mut buf = [0u8; 64];
     let r = recv_with_fds(b, &mut buf, 1, T).expect("recv");
     let d = decode_backend_request(buf.get(..r.len).expect("len")).expect("decode");

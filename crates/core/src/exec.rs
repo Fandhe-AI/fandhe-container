@@ -640,7 +640,7 @@ pub enum IsolationStage {
     SetNs,
     /// rootfs 配下への tmpfs マウント（SUP-12・TASK-169.2。`--shm-size` / `--tmpfs`）。
     MountTmpfs,
-    /// secrets / configs の注入（専用 tmpfs への書き込みと read-only 再マウント。SUP-12・TASK-169.4.2）。
+    /// secrets / configs の注入（専用 tmpfs への書き込みと read-only 化。SUP-12・TASK-169.4.2）。
     InjectFiles,
 }
 
@@ -1859,7 +1859,7 @@ const MOUNTINFO_FIXED_FIELDS: usize = 6;
 const MOUNTINFO_TAIL_FIELDS: usize = 3;
 
 /// `mnt_id` のマウントが read-only（mountinfo の per-mount options に `ro`）か判定する純関数。
-/// `inject_files` が read-only 再マウントの事後検証に使う（SUP-12・TASK-169.4.2）。書式に反する行・
+/// `inject_files` が read-only 化の事後検証に使う（SUP-12・TASK-169.4.2）。書式に反する行・
 /// 該当行なし・複数行はエラー（fail-closed。`mount_is_shared_in` と同じ姿勢）。
 fn mount_is_read_only_in(info: &str, mnt_id: u64) -> Result<bool, ExecError> {
     let malformed = || mountinfo_error("malformed line in /proc/thread-self/mountinfo");

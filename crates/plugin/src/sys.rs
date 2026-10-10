@@ -2882,3 +2882,34 @@ mod probe_child_exit_tests {
         }
     }
 }
+
+/// #1605・REPAIR-5・PLUG-7: Drop 診断の送信フラグの固定値（Linux x86_64 / aarch64）。
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod write_nonblocking_flag_tests {
+    use super::*;
+
+    #[test]
+    fn repair5_send_flags_are_fixed_values() {
+        assert_eq!(MSG_DONTWAIT, 0x40);
+        assert_eq!(MSG_NOSIGNAL, 0x4000);
+        assert_eq!(MSG_DONTWAIT | MSG_NOSIGNAL, 0x4040);
+        assert_eq!(SOL_SOCKET, 1);
+        assert_eq!(SO_TYPE, 3);
+        assert_eq!(F_GETPIPE_SZ, 1032);
+        assert_eq!(O_NONBLOCK_NOCTTY, 0o4400);
+    }
+
+    /// 相手が閉じた socket への送信は `EPIPE`（`BrokenPipe`）で戻る。`SIGPIPE` が出ないことそのものは、試験の実行時が
+    /// `SIGPIPE` を無視しているため本試験では照合できない（フラグの付与は上の固定値試験と呼び出し箇所で担保する）。
+    #[test]
+    fn repair5_send_to_closed_peer_returns_epipe() {
+        let (a, b) = UnixStream::pair().unwrap();
+        drop(b);
+        let e = write_nonblocking(&a, b"x\n").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
+    }
+}

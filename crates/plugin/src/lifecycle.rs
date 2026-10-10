@@ -1555,14 +1555,33 @@ mod tests {
         assert_eq!(guard.pid(), None);
     }
 
-    /// REPAIR-5・PLUG-7・#1605: 満杯の fd でも診断出力が期限内に戻る。
+    /// Drop 診断の試験用に、一時ディレクトリ直下へ新しいディレクトリを作る（REPAIR-12）。`create_dir` は既存の
+    /// 名前（先置きされた symlink を含む）で失敗するため、予測可能な名前でも他者の置いたものを辿らない。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn drop_log_test_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "fc-droplog-{tag}-{}-{nanos}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    /// REPAIR-5・PLUG-7・#1605: 満杯の socket（ブロッキングのまま）でも診断出力が期限内に `WouldBlock` で戻る。
     #[test]
     #[cfg(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
-    fn repair4_drop_log_does_not_block_on_full_fd_and_leaves_no_thread() {
-        // 満杯のソケットを stderr に見立てる。ブロックしない保証のある経路（MSG_DONTWAIT）で即座に戻り、スレッドを作らない
+    fn repair5_drop_log_does_not_block_on_full_socket() {
+        // 満杯のソケットを stderr に見立てる。ブロックしない保証のある経路（MSG_DONTWAIT）で即座に戻る
         // （#1605・REPAIR-5・PLUG-7）。
         use std::io::Write;
         use std::os::unix::net::UnixStream;
@@ -1633,9 +1652,7 @@ mod tests {
         use std::io::Read;
         use std::os::unix::fs::OpenOptionsExt;
         const O_NONBLOCK: i32 = 0o4000;
-        let dir = std::env::temp_dir().join(format!("fc-droplog-fifo-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir(&dir).unwrap();
+        let dir = drop_log_test_dir("fifo");
         let path = dir.join("fifo");
         let status = Command::new("mkfifo").arg(&path).status().unwrap();
         assert!(status.success(), "mkfifo failed: {status}");
@@ -1663,12 +1680,13 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn repair5_drop_log_discards_on_regular_file() {
-        let path = std::env::temp_dir().join(format!("fc-droplog-{}", std::process::id()));
-        let f = std::fs::File::create(&path).unwrap();
+        let dir = drop_log_test_dir("file");
+        let path = dir.join("log");
+        let f = std::fs::File::create_new(&path).unwrap();
         let r = crate::sys::write_nonblocking(&f, b"x\n");
         drop(f);
         let len = std::fs::metadata(&path).unwrap().len();
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(r.unwrap_err().kind(), io::ErrorKind::Unsupported);
         assert_eq!(len, 0);
     }

@@ -1573,18 +1573,68 @@ pub(crate) enum DeviceNodeError {
     Sys(SysError),
 }
 
+/// [`verify_device_node_fd`] が受け付けるホストのデバイスノード（OCI default devices の 6 種。CORE-6・SEC-1・#1659）。
+///
+/// 許可する `(major, minor)` の集合を型で閉じる固定表。列挙子以外の値（例: `/dev/mem` = 1:1）は表現できないため、
+/// 呼び出し側が誤っても任意の文字デバイスを [`open_tree_clone`] へ渡す経路はできない（fail-closed）。
+/// `sys` は上位層（`crate::exec::devices`）に依存しないため表を自前で持ち、`DEFAULT_DEVICES` との一致は
+/// `exec::devices` 側の単体テストが順序込みで照合する（どちらかだけを変えるとテストが落ちる）。
+/// CDI の deviceNodes は別責務（TASK-127）で、ここへ列挙子を足して受け付けない。
+// #1660 で呼び出し元を足すまでの間のみ許可する（配線時に外す）。
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostDeviceNode {
+    /// `/dev/null`（1:3）。
+    Null,
+    /// `/dev/zero`（1:5）。
+    Zero,
+    /// `/dev/full`（1:7）。
+    Full,
+    /// `/dev/random`（1:8）。
+    Random,
+    /// `/dev/urandom`（1:9）。
+    Urandom,
+    /// `/dev/tty`（5:0）。
+    Tty,
+}
+
+impl HostDeviceNode {
+    /// 全列挙子（`DEFAULT_DEVICES` と同じ順）。`exec::devices` の照合テストが使う。
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Null,
+        Self::Zero,
+        Self::Full,
+        Self::Random,
+        Self::Urandom,
+        Self::Tty,
+    ];
+
+    /// `(major, minor)`。
+    #[allow(dead_code)]
+    pub(crate) const fn major_minor(self) -> (u32, u32) {
+        match self {
+            Self::Null => (1, 3),
+            Self::Zero => (1, 5),
+            Self::Full => (1, 7),
+            Self::Random => (1, 8),
+            Self::Urandom => (1, 9),
+            Self::Tty => (5, 0),
+        }
+    }
+}
+
 /// `fd`（呼び出し側が `O_PATH|O_NOFOLLOW` で開いたホストのデバイスノード）を、同じ fd の `fstat` で照合する。
 ///
-/// 文字デバイス（`S_IFCHR`）かつ `rdev == makedev(major, minor)` のときだけ [`VerifiedDeviceNodeFd`] を返す。
-/// `major`・`minor` は呼び出し側の固定表（`crate::exec::devices` の `DEFAULT_DEVICES`。任意の major/minor を
-/// 受け付ける経路は作らない。TASK-127）から渡す。パスの `stat` ではなく fd の `fstat`（std の
+/// 文字デバイス（`S_IFCHR`）かつ `rdev == makedev(node.major_minor())` のときだけ [`VerifiedDeviceNodeFd`] を返す。
+/// 期待値は [`HostDeviceNode`] の固定表に限り、任意の major/minor は受け付けない（SEC-1。呼び出し側〔#1660〕は
+/// `DEFAULT_DEVICES` の要素に対応する列挙子を渡す）。パスの `stat` ではなく fd の `fstat`（std の
 /// `File::metadata`。fd は複製して見るだけで、元の fd をそのまま保持する）で見るため、検証後の差し替えは効かない。
 /// 照合は `crate::exec::devices` の既存ノードの検証と同じ形（種別と `rdev` の完全一致）。
 #[allow(dead_code)]
 pub(crate) fn verify_device_node_fd(
     fd: OwnedFd,
-    major: u32,
-    minor: u32,
+    node: HostDeviceNode,
 ) -> Result<VerifiedDeviceNodeFd, DeviceNodeError> {
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
     if !consts::SUPPORTED {
@@ -1598,6 +1648,7 @@ pub(crate) fn verify_device_node_fd(
     if !meta.file_type().is_char_device() {
         return Err(DeviceNodeError::NotCharDevice { mode: meta.mode() });
     }
+    let (major, minor) = node.major_minor();
     let expected = makedev(major, minor);
     if meta.rdev() != expected {
         return Err(DeviceNodeError::UnexpectedRdev {
@@ -1624,8 +1675,9 @@ fn open_tree_clone_flags() -> u32 {
 /// 途中で失敗して drop すればカーネルが破棄する。
 ///
 /// 引数は [`verify_device_node_fd`] だけが作れる [`VerifiedDeviceNodeFd`] に限る。文字デバイス（`S_IFCHR`）で
-/// `rdev` が期待値と一致することを同じ fd の `fstat` で確かめた fd しか渡せないため、ディレクトリ・通常ファイルを
-/// 複製して nosuid・noexec なしでコンテナへ渡す経路は型で塞がれる（SEC-1）。symlink を辿らないこと
+/// `rdev` が [`HostDeviceNode`] の固定表の値と一致することを同じ fd の `fstat` で確かめた fd しか渡せないため、
+/// ディレクトリ・通常ファイル・表にない文字デバイス（`/dev/mem` 等）を複製して nosuid・noexec なしでコンテナへ
+/// 渡す経路は型で塞がれる（SEC-1）。symlink を辿らないこと
 /// （`O_PATH|O_NOFOLLOW` で開くこと）は fd を開く呼び出し側の責務で、辿らずに開いた symlink 自体は
 /// `S_IFCHR` でないため検証で拒否される。
 ///
@@ -5321,7 +5373,8 @@ mod tests {
         const CAP_SYS_ADMIN_BIT: u32 = 1 << 21;
         let caps = cap_get_thread().expect("capget");
         let privileged = caps.effective[0] & CAP_SYS_ADMIN_BIT != 0;
-        let node = verify_device_node_fd(open_o_path("/dev/null"), 1, 3).expect("verify /dev/null");
+        let node = verify_device_node_fd(open_o_path("/dev/null"), HostDeviceNode::Null)
+            .expect("verify /dev/null");
         match (privileged, open_tree_clone(&node)) {
             (_, Err(SysError::Unsupported)) => {}
             (false, Err(err)) => assert_eq!(err, SysError::Os(EPERM)),
@@ -5349,16 +5402,17 @@ mod tests {
     fn core6_sec5_verify_device_node_fd_accepts_dev_null_and_keeps_the_fd() {
         let fd = open_o_path("/dev/null");
         let raw = fd.as_raw_fd();
-        let node = verify_device_node_fd(fd, 1, 3).expect("verify /dev/null");
+        let node = verify_device_node_fd(fd, HostDeviceNode::Null).expect("verify /dev/null");
         assert_eq!(node.as_fd().as_raw_fd(), raw);
     }
 
     /// CORE-6・SEC-5・SEC-1（TASK-29 追補・#1659）: 文字デバイスでも `rdev` が期待値と違えば、実値と期待値を
-    /// 持つ `UnexpectedRdev` で拒否する（`/dev/null` = 0x103 を (1, 5) = 0x105 として検証）。
+    /// 持つ `UnexpectedRdev` で拒否する（`/dev/null` = 0x103 を `Zero`〔1:5〕= 0x105 として検証）。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn core6_sec5_verify_device_node_fd_rejects_unexpected_rdev() {
-        let err = verify_device_node_fd(open_o_path("/dev/null"), 1, 5).unwrap_err();
+        let err =
+            verify_device_node_fd(open_o_path("/dev/null"), HostDeviceNode::Zero).unwrap_err();
         assert_eq!(
             err,
             DeviceNodeError::UnexpectedRdev {
@@ -5374,7 +5428,8 @@ mod tests {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn core6_sec5_verify_device_node_fd_rejects_directory_and_regular_file() {
-        let kind = |path: &str| match verify_device_node_fd(open_o_path(path), 1, 3) {
+        let kind = |path: &str| match verify_device_node_fd(open_o_path(path), HostDeviceNode::Null)
+        {
             Err(DeviceNodeError::NotCharDevice { mode }) => mode & 0o170_000,
             other => panic!("{path}: unexpected result: {other:?}"),
         };
@@ -5468,7 +5523,8 @@ mod tests {
         };
 
         // fd 起点で /dev/null を複製できる。fd は close-on-exec（fdinfo の flags が O_CLOEXEC = 02000000）。
-        let node = verify_device_node_fd(open_o_path("/dev/null"), 1, 3).expect("verify /dev/null");
+        let node = verify_device_node_fd(open_o_path("/dev/null"), HostDeviceNode::Null)
+            .expect("verify /dev/null");
         let clone = open_tree_clone(&node).expect("open_tree_clone");
         assert_eq!(fd_flags(&clone) & 0o2_000_000, 0o2_000_000);
 

@@ -2222,4 +2222,22 @@ mod tests {
             vec!["exec/devices.rs".to_owned(), "sys.rs".to_owned()]
         );
     }
+
+    /// CORE-6・SEC-1（TASK-29 追補・#1659）: rootless の bind（#1660）で検証に使う `sys::HostDeviceNode` の固定表は、
+    /// 作成対象の `DEFAULT_DEVICES` と順序込みで同じ `(major, minor)` の集合である。`sys` は上位層に依存しないため
+    /// 表を 2 か所に持ち、どちらかだけを変えた（任意の major/minor を足した）ときにここで落とす。
+    #[test]
+    fn core6_sec1_host_device_node_table_matches_default_devices() {
+        let defaults: Vec<(u32, u32)> =
+            DEFAULT_DEVICES.iter().map(|d| (d.major, d.minor)).collect();
+        let allowed: Vec<(u32, u32)> = sys::HostDeviceNode::ALL
+            .iter()
+            .map(|n| n.major_minor())
+            .collect();
+        assert_eq!(
+            allowed,
+            vec![(1, 3), (1, 5), (1, 7), (1, 8), (1, 9), (5, 0)]
+        );
+        assert_eq!(defaults, allowed);
+    }
 }

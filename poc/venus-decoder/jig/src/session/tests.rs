@@ -10,7 +10,10 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use super::negotiation::{OFFERED_FEATURES, State, check_features};
+use super::negotiation::{
+    HostVisible, HostVisibleUnavailable, OFFERED_FEATURES, OFFERED_PROTOCOL, State, check_features,
+    expected_fds,
+};
 use super::*;
 use crate::vhost_user::{
     ConfigPayload, MemRegion, MemTable, Reply, Request, RequestCode, VringFd, VringState,
@@ -92,8 +95,9 @@ fn gpu6_protocol_negotiation_values() {
     assert_eq!(
         s.handle(Request::GetProtocolFeatures, Vec::new())
             .expect("ok"),
-        Some(Reply::ProtocolFeatures(0x209))
+        Some(Reply::ProtocolFeatures(0x0040_0229))
     );
+    // 広告外のビット（bit 1）を含む確定は拒否する。
     assert_eq!(
         code_of(s.handle(Request::SetProtocolFeatures(0x203), Vec::new())),
         (SessionErrorCode::FeatureNotOffered, Some(16))
@@ -380,4 +384,130 @@ fn f5_2b_1_gpu6_reply_ack_follows_confirmed_protocol_features() {
         (SessionErrorCode::FeatureNotOffered, Some(16))
     );
     assert!(s.reply_ack());
+}
+
+// ---- GPU-6・TASK-172 F5.2b.2（#1641） ----
+
+fn uds() -> OwnedFd {
+    let (a, _b) = UnixStream::pair().expect("pair");
+    OwnedFd::from(a)
+}
+
+fn proto(s: &mut State, v: u64) {
+    s.handle(Request::GetProtocolFeatures, Vec::new())
+        .expect("query");
+    s.handle(Request::SetProtocolFeatures(v), Vec::new())
+        .expect("set");
+}
+
+#[test]
+fn f5_2b_2_gpu6_offered_protocol_and_fd_counts() {
+    assert_eq!(OFFERED_PROTOCOL, 0x0040_0229);
+    assert_eq!(expected_fds(&Request::SetBackendReqFd), 1);
+    assert_eq!(expected_fds(&Request::GetShmemConfig), 0);
+    assert_eq!(
+        SessionErrorCode::InvalidBackendReqFd.as_str(),
+        "INVALID_BACKEND_REQ_FD"
+    );
+}
+
+#[test]
+fn f5_2b_2_gpu6_gates_reject_without_negotiation() {
+    let mut s = State::new();
+    // 確定前はどちらも OUT_OF_ORDER。
+    assert_eq!(
+        code_of(s.handle(Request::GetShmemConfig, Vec::new())),
+        (SessionErrorCode::OutOfOrder, Some(44))
+    );
+    assert_eq!(
+        code_of(s.handle(Request::SetBackendReqFd, vec![uds()])),
+        (SessionErrorCode::OutOfOrder, Some(21))
+    );
+    // MQ・REPLY_ACK・CONFIG だけを確定した場合も同じ。
+    proto(&mut s, 0x209);
+    assert_eq!(
+        code_of(s.handle(Request::GetShmemConfig, Vec::new())),
+        (SessionErrorCode::OutOfOrder, Some(44))
+    );
+    assert_eq!(
+        code_of(s.handle(Request::SetBackendReqFd, vec![uds()])),
+        (SessionErrorCode::OutOfOrder, Some(21))
+    );
+}
+
+#[test]
+fn f5_2b_2_gpu6_backend_req_fd_must_be_unix_socket_and_only_once() {
+    let mut s = State::new();
+    proto(&mut s, 0x0040_0229);
+    // memfd（socket でない）。
+    let mem = crate::vhost_user::fd_passing::create_memfd(c"f5-2b-2", 4096).expect("memfd");
+    assert_eq!(
+        code_of(s.handle(Request::SetBackendReqFd, vec![OwnedFd::from(mem)])),
+        (SessionErrorCode::InvalidBackendReqFd, Some(21))
+    );
+    // UDP socket（socket だが AF_UNIX でない）。
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp");
+    assert_eq!(
+        code_of(s.handle(Request::SetBackendReqFd, vec![OwnedFd::from(udp)])),
+        (SessionErrorCode::InvalidBackendReqFd, Some(21))
+    );
+    // 個数違いは FD_COUNT_MISMATCH。
+    assert_eq!(
+        code_of(s.handle(Request::SetBackendReqFd, Vec::new())),
+        (SessionErrorCode::FdCountMismatch, Some(21))
+    );
+    assert_eq!(
+        s.handle(Request::SetBackendReqFd, vec![uds()]).expect("ok"),
+        None
+    );
+    // 2 回目は拒否。
+    assert_eq!(
+        code_of(s.handle(Request::SetBackendReqFd, vec![uds()])),
+        (SessionErrorCode::OutOfOrder, Some(21))
+    );
+}
+
+#[test]
+fn f5_2b_2_gpu6_host_visible_states() {
+    use HostVisibleUnavailable::*;
+    let un = HostVisible::Unavailable;
+    let mut s = State::new();
+    assert_eq!(s.host_visible(), un(ShmemNotNegotiated));
+    proto(&mut s, 0x0040_0221);
+    assert_eq!(s.host_visible(), un(ConfigNotQueried));
+    s.handle(Request::GetShmemConfig, Vec::new()).expect("44");
+    assert_eq!(s.host_visible(), un(BackendChannelMissing));
+    s.handle(Request::SetBackendReqFd, vec![uds()]).expect("21");
+    assert_eq!(s.host_visible(), HostVisible::Ready);
+    assert_eq!(HostVisible::Ready.as_str(), "ready");
+    // BACKEND_REQ を外して再確定すると使えない（保持した fd は閉じない）。
+    proto(&mut s, 0x0040_0201);
+    assert_eq!(s.host_visible(), un(BackendReqNotNegotiated));
+    assert_eq!(
+        un(BackendReqNotNegotiated).as_str(),
+        "backend_req_not_negotiated"
+    );
+    // SHMEM を外した再確定。
+    proto(&mut s, 0x201);
+    assert_eq!(s.host_visible(), un(ShmemNotNegotiated));
+    assert_eq!(un(ConfigNotQueried).as_str(), "config_not_queried");
+    assert_eq!(
+        un(BackendChannelMissing).as_str(),
+        "backend_channel_missing"
+    );
+}
+
+#[test]
+fn f5_2b_2_gpu6_shmem_config_reply_is_stable() {
+    let mut s = State::new();
+    proto(&mut s, 0x0040_0201);
+    let a = s.handle(Request::GetShmemConfig, Vec::new()).expect("a");
+    let b = s.handle(Request::GetShmemConfig, Vec::new()).expect("b");
+    assert_eq!(a, b);
+    let Some(Reply::ShmemConfig(cfg)) = a else {
+        panic!("shmem config expected");
+    };
+    assert_eq!((cfg.nregions(), cfg.size(1)), (1, 134_217_728));
+    assert_eq!(crate::device::HOST_VISIBLE_SHM_SIZE, 134_217_728);
+    assert_eq!(crate::device::SHM_ID_HOST_VISIBLE, 1);
 }

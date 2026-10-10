@@ -42,6 +42,9 @@ use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
+use crate::oci_runtime::OCI_ERROR_MESSAGE_MAX_BYTES;
+use crate::sanitize::sanitize_display_bounded;
+
 use crate::traits::{ErrorCode, TraitError};
 
 pub mod registry;
@@ -419,15 +422,20 @@ impl PathSearchWarning {
         &self.path
     }
 
-    /// JSON Lines 1 行（末尾 `\n`）で書き出す。`serde_json` でエスケープするため、パスに改行や
-    /// 制御文字があっても 1 行に収まる（ログ行の偽造防止）。
+    /// JSON Lines 1 行（末尾 `\n`）で書き出す。`path` は表示を乱す文字（制御・書式・行区切り）を
+    /// 空白へ置換し 4096 バイトで打ち切ってから `serde_json` でエスケープするため、改行・双方向制御
+    /// による行の偽造や表示順の偽装、無制限の出力を防ぐ（ERR-1・PLUG-11・SEC-4）。`name` は
+    /// `plugin_name_from_file_name` が 64 バイト以下の `[a-z0-9-]` に限るためサニタイズしない。
+    /// キーを増やさないため打ち切りの有無は出力しない（構造化ログの統一は #653・TASK-98.2）。
     pub fn write_line(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        let path =
+            sanitize_display_bounded(&self.path.to_string_lossy(), OCI_ERROR_MESSAGE_MAX_BYTES);
         let line = serde_json::json!({
             "level": "warn",
             "code": PATH_WARNING_CODE,
             "message": PATH_WARNING_MESSAGE,
             "name": self.name,
-            "path": self.path.to_string_lossy(),
+            "path": path.as_str(),
         });
         serde_json::to_writer(&mut *out, &line).map_err(std::io::Error::from)?;
         out.write_all(b"\n")
@@ -556,6 +564,29 @@ pub fn write_path_warnings(report: &DiscoveryReport, out: &mut dyn Write) -> std
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ERR-1・PLUG-11: PATH 警告の `path` は表示を乱す文字を空白へ置換し 4096 バイトで打ち切る。
+    #[test]
+    fn plug11_err1_path_warning_sanitizes_and_bounds_path() {
+        let w = PathSearchWarning {
+            name: "cri".to_string(),
+            path: PathBuf::from(format!(
+                "/x\u{202E}y\u{0007}z\u{200B}\u{2028}/{}",
+                "a".repeat(5000)
+            )),
+        };
+        let mut buf = Vec::new();
+        w.write_line(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text.matches('\n').count(), 1);
+        let v: serde_json::Value = serde_json::from_str(text.trim_end()).unwrap();
+        let path = v["path"].as_str().unwrap();
+        assert!(path.starts_with("/x y z  /aaa"), "{path}");
+        assert_eq!(path.len(), 4096);
+        assert_eq!(v["level"], "warn");
+        assert_eq!(v["code"], PATH_WARNING_CODE);
+        assert_eq!(v["name"], "cri");
+    }
 
     #[test]
     fn plug11_name_filter_accepts_and_rejects() {

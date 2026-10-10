@@ -12,6 +12,8 @@
 //!
 //! 待機はすべて期限つき（REPAIR-5）。単一 fd 用の `sys::wait_fd` を socket と ctrl の kick で交互に短く待つ方式のため、
 //! kick への反応には最大 [`SessionLimits::poll_slice`] の遅延が乗る（複数 fd の ppoll 化は unsafe の承認範囲外）。
+//! 共有メモリ（F5.2b.2・#1641）: `GET_SHMEM_CONFIG` への応答と `SET_BACKEND_REQ_FD` の fd の保持は `negotiation` が担い、終了時に
+//! host-visible の成立状況（`host_visible` 行）を出す。保持した fd へ backend 要求を送る処理は未実装（#1642）。
 //! 未実装（REPAIR-3）: cursorq（ring 1）の要求処理・`SET_CONFIG`・`VRING_NOFD`・inflight・
 //! `observe::snapshot_lines` の定期出力（終了時の集計出力は実装済み。定期出力と virtqueue 個別の観測カウンタは未実装）。
 //!
@@ -42,6 +44,7 @@ pub use error::{Cause, SessionError, SessionErrorCode};
 
 use crate::adapter::{CtrlAdapter, Submit3d};
 use crate::ctrl::{CtrlResponse, RESP_ERR_INVALID_PARAMETER};
+use crate::device;
 use crate::log::{self, QueryResult};
 use crate::sys;
 use crate::vhost_user::fd_passing::{MAX_FDS, MAX_TIMEOUT, recv_with_fds, send_with_fds};
@@ -147,6 +150,10 @@ pub fn run_with_submit_hook(
         metrics: SessionMetrics::default(),
     };
     let result = session.serve(sock, sink, on_submit);
+    // #1641: host-visible 共有メモリが成立したか（しない場合は理由）。#725 の実機確認でログから直接読めるようにする。
+    sink(&log::host_visible_line(
+        session.state.host_visible().as_str(),
+    ));
     // REPAIR-4: 操作ごとの成功 / 失敗件数と所要時間、fd 受け渡し・ゲストメモリ I/O の集計を終了時に出す。
     for line in session
         .metrics
@@ -308,8 +315,20 @@ impl Session {
         // 確定していれば応答義務ありとする（初回有効化の ACK と、解除要求への従前義務の ACK。#1639）。
         let ack_before = self.state.reply_ack();
         match self.state.handle(decoded.request, fds) {
-            Ok(Some(reply)) => self.send_reply(sock, &reply.encode()?, code),
+            Ok(Some(reply)) => {
+                self.send_reply(sock, &reply.encode()?, code)?;
+                if let Reply::ShmemConfig(cfg) = &reply {
+                    let id = device::SHM_ID_HOST_VISIBLE;
+                    sink(&log::shmem_config_line(cfg.nregions(), id, cfg.size(id)));
+                }
+                Ok(())
+            }
             // 応答本体を持たない要求の成功。REPLY_ACK 確定済みで NEED_REPLY が立っていれば u64 の 0 を返す。
+            Ok(None) if code == RequestCode::SetBackendReqFd => {
+                // 受理の記録は ack より先に出す（ack の送信に失敗しても受理した事実は残る）。
+                sink(&log::backend_req_line());
+                self.ack_success(sock, code, need_reply, ack_before, sink)
+            }
             Ok(None) if need_reply && (ack_before || self.state.reply_ack()) => {
                 self.send_reply(sock, &Reply::Ack(Ack::success(code)?).encode()?, code)?;
                 sink(&log::need_reply_ack_line(code.as_u32(), true));
@@ -336,6 +355,27 @@ impl Session {
                 Err(e)
             }
         }
+    }
+
+    /// 応答本体を持たない要求の成功への ack（REPLY_ACK 確定済みで NEED_REPLY のときだけ送る）。
+    fn ack_success(
+        &self,
+        sock: &UnixStream,
+        code: RequestCode,
+        need_reply: bool,
+        ack_before: bool,
+        sink: &mut dyn FnMut(&str),
+    ) -> Result<(), SessionError> {
+        if !need_reply {
+            return Ok(());
+        }
+        if ack_before || self.state.reply_ack() {
+            self.send_reply(sock, &Reply::Ack(Ack::success(code)?).encode()?, code)?;
+            sink(&log::need_reply_ack_line(code.as_u32(), true));
+        } else {
+            sink(&log::need_reply_ignored_line(code.as_u32()));
+        }
+        Ok(())
     }
 
     /// 符号化済みの応答を fd なしで期限内に送り切る（REPAIR-5）。`GET_*` の応答と ack で共有する。

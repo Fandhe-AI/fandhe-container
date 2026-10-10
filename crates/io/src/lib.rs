@@ -74,6 +74,7 @@ pub mod barrier;
 pub mod batch;
 mod checksum;
 pub mod client;
+mod display_sanitize;
 pub mod error;
 pub mod fs_normalize;
 pub mod guest_files;

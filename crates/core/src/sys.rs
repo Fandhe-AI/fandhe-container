@@ -5275,8 +5275,14 @@ mod tests {
         // 読み書きが通る（/dev/null として機能している）。
         std::fs::write(&target_file, b"x").expect("write to attached /dev/null");
 
-        // 後始末（mount namespace は子の終了で破棄される）。
+        // 後始末: clone の fd を閉じても接続済みのマウントは解除されない。マウントポイントのまま
+        // `remove_dir_all` すると EBUSY で一時領域（ホスト側の dir と空ファイル）が残るため、先に
+        // 切り離してから削除し、どちらの失敗も検出する。
         drop(clone);
-        let _ = std::fs::remove_dir_all(&dir);
+        let target_c = std::ffi::CString::new(target_file.to_str().expect("utf8 path"))
+            .expect("no interior NUL");
+        umount_detach_at(&target_c).expect("detach attached mount");
+        std::fs::remove_dir_all(&dir).expect("remove temp dir after detach");
+        assert!(!dir.exists(), "temp dir must be removed");
     }
 }

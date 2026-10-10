@@ -773,9 +773,12 @@ fn describe(err: SysError) -> String {
     }
 }
 
-/// errno を `ErrorCode` に写す。`EPERM`/`EACCES` → `PermissionDenied`、
+/// [`SysError`] を `ErrorCode` に写す。`EPERM`/`EACCES` → `PermissionDenied`、
 /// `EINVAL`（例: マルチスレッドからの `CLONE_NEWUSER`）→ `FailedPrecondition`、
-/// 対応外 arch → `Unimplemented`、その他 → `Internal`。
+/// `MultiThreaded`（fork 前のシングルスレッド確認の失敗）→ `FailedPrecondition`、
+/// `Unsupported`（対応外 arch、または新マウント API の `ENOSYS`〔古いカーネル〕。経路の一覧は
+/// [`SysError::Unsupported`] の doc）→ `Unimplemented`、その他の errno（新マウント API 以外の
+/// `ENOSYS` を含む）→ `Internal`。
 fn errno_to_code(err: SysError) -> ErrorCode {
     match err {
         SysError::Unsupported => ErrorCode::Unimplemented,

@@ -32,10 +32,10 @@
 //!   対応外の OS・アーキテクチャは `Unsupported`
 //! - macOS の RSS 取得（TASK-112.1・#265）: `proc_pidinfo(PROC_PIDTASKINFO)`（`resident_size_bytes`。`crate::rss` から呼ばれる）
 //! - Linux・macOS: `killpg(2)`（`kill_process_group`。plugin の子のプロセスグループへ `SIGKILL`。#1311。それ以外の unix は `Unsupported`）
-//! - Linux（x86_64 / aarch64）: ブロックしないことを保証できる socket（`getsockopt(SO_TYPE)` で判定し
+//! - Linux（x86_64 / aarch64）: ブロックしないことを保証できる AF_UNIX の socket（`getsockopt(SO_DOMAIN)` で判定し
 //!   `send(MSG_DONTWAIT | MSG_NOSIGNAL)`。パス解決・`fstat`・fd の複製をしない）でだけ fd へ書く（`write_nonblocking`。
-//!   `ChildGuard::drop` の診断出力がブロックしない。#1605）。socket 以外と、macOS を含むそれ以外の OS は保証できる
-//!   経路が無いため常に捨てる（`Unsupported`）
+//!   `ChildGuard::drop` の診断出力がブロックしない。#1605）。AF_UNIX 以外の socket（TCP 等）・socket 以外と、macOS を
+//!   含むそれ以外の OS は保証できる経路が無いため常に捨てる（`Unsupported`）
 //! - Linux（x86_64 / aarch64）・macOS: `waitid(2)`（`WEXITED | WNOHANG | WNOWAIT`。`probe_child_exit`。自発終了した plugin を回収せずに
 //!   観測し、グループへ送ってから回収するため。#1604・PLUG-7・REPAIR-5。それ以外は `Unsupported`）
 //! - いずれの unix: `kill(2)` で起動中の plugin へ SIGINT・SIGTERM・SIGHUP を転送する（`send_signal`。
@@ -165,18 +165,28 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-/// `SOL_SOCKET` / `SO_TYPE`（Linux の x86_64・aarch64 とも 1 / 3。`asm-generic/socket.h`。値の異なるアーキテクチャ
+/// `SOL_SOCKET`（Linux の x86_64・aarch64 とも 1。`asm-generic/socket.h`。値の異なるアーキテクチャ
 /// 〔mips 等〕へ流用しない）。
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 const SOL_SOCKET: i32 = 1;
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-const SO_TYPE: i32 = 3;
+
+/// `SO_DOMAIN`（socket のアドレスファミリを返す。Linux 2.6.32 以降）。Linux x86_64 は `asm-generic/socket.h` の 39。
+/// アーキテクチャごとに個別定義する（mips・sparc 等は値が異なるため流用しない）。
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const SO_DOMAIN: i32 = 39;
+/// Linux aarch64 の `SO_DOMAIN`（x86_64 と同じ `asm-generic/socket.h` の 39。値が同じでも流用せず個別に定義する）。
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const SO_DOMAIN: i32 = 39;
+
+/// `AF_UNIX`（Linux x86_64 は `linux/socket.h` の 1）。アーキテクチャごとに個別定義する。
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const AF_UNIX: i32 = 1;
+/// Linux aarch64 の `AF_UNIX`（x86_64 と同じ 1。値が同じでも流用せず個別に定義する）。
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const AF_UNIX: i32 = 1;
 
 /// `MSG_DONTWAIT`（呼び出し 1 回限りの非ブロッキング送信。Linux の x86_64・aarch64 とも 0x40）。
 #[cfg(all(
@@ -193,13 +203,16 @@ const MSG_NOSIGNAL: i32 = 0x4000;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const MSG_NOSIGNAL: i32 = 0x4000;
 
-/// fd が socket か（`getsockopt(SO_TYPE)`）。fd 単位のカーネル内判定で、ファイルシステムへ問い合わせない
-/// （`fstat` は FUSE / NFS で無期限に止まり得るため使わない。#1605・REPAIR-5）。socket 以外は `ENOTSOCK` で `false`。
+/// fd が AF_UNIX の socket か（`getsockopt(SO_DOMAIN)` の 1 回）。fd 単位のカーネル内判定で、ファイルシステムへ
+/// 問い合わせない（`fstat` は FUSE / NFS で無期限に止まり得るため使わない。#1605・REPAIR-5）。
+///
+/// socket 以外は `ENOTSOCK`、`SO_DOMAIN` を持たない古いカーネルは `ENOPROTOOPT` で、いずれも `false`（fail-closed）。
+/// AF_UNIX 以外の socket（AF_INET の TCP・UDP、AF_NETLINK 等）も `false`。
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-fn is_socket_fd(fd: i32) -> bool {
+fn is_unix_socket_fd(fd: i32) -> bool {
     let mut val: i32 = 0;
     let mut len: u32 = 4;
     // SAFETY: `val`・`len` はこの関数のスタック上の有効な書き込み先で、`len` は `val` の大きさ（4）と一致する。
@@ -208,23 +221,29 @@ fn is_socket_fd(fd: i32) -> bool {
         c_getsockopt(
             fd,
             SOL_SOCKET,
-            SO_TYPE,
+            SO_DOMAIN,
             (&raw mut val).cast::<core::ffi::c_void>(),
             &raw mut len,
         )
     };
-    rc == 0
+    // カーネルが書き戻した長さが `int` の幅でなければ値を信用しない。
+    rc == 0 && len == 4 && val == AF_UNIX
 }
 
 /// ブロックしないことを保証できる経路でだけ `fd` へ `buf` を 1 回書く。保証できなければ書かない（#1605・REPAIR-5・PLUG-7）。
 ///
-/// `crate::lifecycle` の `ChildGuard::drop` が診断 1 行を stderr へ出すために呼ぶ。書くのは `fd` が socket
-/// （journald 等）のときだけで、`send(MSG_DONTWAIT | MSG_NOSIGNAL)` の 1 回限りの指定で待たず、相手が閉じていても
-/// `SIGPIPE` を出さない（共有 fd の open file description の状態は変えない）。判定は fd 単位のカーネル内問い合わせ
-/// （`getsockopt(SO_TYPE)`）だけで、パス解決・`fstat` を一切行わず、fd も複製しない（複製の close は NFS の書き戻し・
-/// `FUSE_FLUSH` で止まり得るため）。
+/// `crate::lifecycle` の `ChildGuard::drop` が診断 1 行を stderr へ出すために呼ぶ。書くのは `fd` が AF_UNIX の socket
+/// （journald の stream 等）のときだけで、`send(MSG_DONTWAIT | MSG_NOSIGNAL)` の 1 回限りの指定で待たず、相手が閉じて
+/// いても `SIGPIPE` を出さない（共有 fd の open file description の状態は変えない）。判定は fd 単位のカーネル内問い合わせ
+/// （`getsockopt(SO_DOMAIN)`）だけで、パス解決・`fstat` を一切行わず、fd も複製しない（複製の close は NFS の書き戻し・
+/// `FUSE_FLUSH` で止まり得るため）。AF_UNIX の送信経路（`net/unix/af_unix.c`）は stream・datagram・seqpacket のいずれも
+/// `MSG_DONTWAIT` で送信バッファ・相手の受信キューの空きを待たず `EAGAIN` で戻る（datagram の満杯は下の試験で確認する）。
+/// 待たないと言えるのはこの空き待ちについてで、`unix_state_lock` 等の短い内部ロック・LSM フック・未 bind の datagram の
+/// autobind（`SO_PASSCRED` 時）が取るロックの上限ある待ちは残る（他スレッドの送信の停止に巻き込まれる性質ではない）。
 ///
-/// socket 以外は書かず `Unsupported`（診断は捨てる）。待たないことを保証できないため:
+/// 書かず `Unsupported`（診断は捨てる）。待たないことを保証できないため:
+/// - AF_UNIX 以外の socket（TCP 等）: `MSG_DONTWAIT` で待たないかはプロトコル実装に依存する。TCP は他スレッドが
+///   socket のロックを持つ間待ち、kTLS 等の送信側 mutex を持つ実装は他スレッドの送信の停止に巻き込まれ得る（REPAIR-5）
 /// - 通常ファイル: 応答しない FUSE / NFS・FS freeze で同期 write が止まり、`O_NONBLOCK` でも防げない
 /// - キャラクタデバイス: CUSE 等で open / write がユーザー空間のデーモンを待ち得る
 /// - pipe / FIFO: 共有 description を変えずに待たないには `/proc` 経由で開き直す必要があり、その絶対パスの
@@ -236,14 +255,15 @@ fn is_socket_fd(fd: i32) -> bool {
 ///
 /// 満杯なら `WouldBlock`。部分書き込みも有り得るため書けたバイト数を返す。std の stderr ロックは取らない。
 /// 前提: 判定と送信の間に別スレッドが同じ fd 番号を `dup2` 等で socket 以外へ差し替えると、`send` は
-/// `ENOTSOCK` のエラーで戻る（待たず、書きもしない）。
+/// `ENOTSOCK` のエラーで戻る（待たず、書きもしない）。AF_UNIX 以外の socket へ差し替わる窓は残る（判定を
+/// 送信と不可分にできないため）。その場合の送信も `MSG_DONTWAIT` の 1 回で、待ち得る範囲は上の TCP 等と同じ。
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub(crate) fn write_nonblocking(fd: &impl AsFd, buf: &[u8]) -> io::Result<usize> {
     let raw = fd.as_fd().as_raw_fd();
-    if is_socket_fd(raw) {
+    if is_unix_socket_fd(raw) {
         // SAFETY: `buf` は有効な読み取り専用スライスで、渡す長さは `buf.len()`。fd は呼び出し側の借用が
         // 呼び出し中開いていることを保証する。`MSG_DONTWAIT` で待たず、`MSG_NOSIGNAL` で相手が閉じた socket でも
         // `SIGPIPE` を出さない（library としてホストのシグナル設定に依存しない）。
@@ -257,7 +277,7 @@ pub(crate) fn write_nonblocking(fd: &impl AsFd, buf: &[u8]) -> io::Result<usize>
 ///
 /// macOS は socket の `send(MSG_DONTWAIT)` でも満杯のブロッキング socket で戻らないことを CI で観測した
 /// （#1605。xnu の送信経路が `MSG_DONTWAIT` を非ブロッキング指定として扱わないためとみられる）。共有 fd の
-/// 状態（`O_NONBLOCK`・`SO_SNDTIMEO`）を変えずに待たない手段が無く、`/proc/self/fd` の開き直しも無いため捨てる。
+/// 状態（`O_NONBLOCK`・`SO_SNDTIMEO`）を変えずに待たない手段が無いため捨てる。
 #[cfg(not(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -2684,7 +2704,8 @@ mod pdeathsig_tests {
     use std::time::{Duration, Instant};
 
     /// 子の回収を `try_wait` のポーリングと期限で行う（REPAIR-5。期限超過時は kill 後も有限期限で回収を試み失敗にする）。
-    fn wait_bounded(mut child: Child) -> ExitStatus {
+    /// `write_nonblocking_flag_tests` の `SIGPIPE` 試験も使う。
+    pub(super) fn wait_bounded(mut child: Child) -> ExitStatus {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(status) = child.try_wait().unwrap() {
@@ -2870,7 +2891,8 @@ mod probe_child_exit_tests {
     }
 }
 
-/// #1605・REPAIR-5・PLUG-7: Drop 診断の送信フラグの固定値（Linux x86_64 / aarch64）。
+/// #1605・REPAIR-5・PLUG-7: Drop 診断の送信フラグ・判定定数の固定値と、書く socket の種類（AF_UNIX だけ）の
+/// 照合（Linux x86_64 / aarch64）。
 #[cfg(all(
     test,
     target_os = "linux",
@@ -2885,17 +2907,147 @@ mod write_nonblocking_flag_tests {
         assert_eq!(MSG_NOSIGNAL, 0x4000);
         assert_eq!(MSG_DONTWAIT | MSG_NOSIGNAL, 0x4040);
         assert_eq!(SOL_SOCKET, 1);
-        assert_eq!(SO_TYPE, 3);
+        assert_eq!(SO_DOMAIN, 39);
+        assert_eq!(AF_UNIX, 1);
     }
 
-    /// 相手が閉じた socket への送信は `EPIPE`（`BrokenPipe`）で戻る。`SIGPIPE` が出ないことそのものは、試験の実行時が
-    /// `SIGPIPE` を無視しているため本試験では照合できない（フラグの付与は上の固定値試験と呼び出し箇所で担保する）。
+    /// 相手が閉じた socket への送信は `EPIPE`（`BrokenPipe`）で戻る。試験プロセスは `SIGPIPE` を無視しているため、
+    /// `SIGPIPE` が出ないことそのものは下の `repair5_send_to_shut_down_socket_raises_no_sigpipe_under_sig_dfl` で照合する。
     #[test]
     fn repair5_send_to_closed_peer_returns_epipe() {
         let (a, b) = UnixStream::pair().unwrap();
         drop(b);
         let e = write_nonblocking(&a, b"x\n").unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    /// 子プロセスで送信側を閉じた socket へ書く方法。
+    #[derive(Clone, Copy)]
+    enum ChildWrite {
+        /// 同じ socket を `File` として `write(2)` で書く（`MSG_NOSIGNAL` 相当の抑止が無い）。`SIG_DFL` が効いていることの
+        /// 対照に使う（std の `UnixStream` の書き込みは自前で `MSG_NOSIGNAL` を付けるため対照にならない）。
+        PlainWrite,
+        /// 本体の `write_nonblocking`（`send(MSG_DONTWAIT | MSG_NOSIGNAL)`）。
+        WriteNonblocking,
+    }
+
+    /// `SIGPIPE` が `SIG_DFL` の子プロセスで、送信側を `shutdown(Write)` した AF_UNIX stream へ `how` で 1 回書き、
+    /// 終了状態を返す。
+    ///
+    /// 相手の close ではなく自分側の `shutdown` で `EPIPE` を作るのは、並行する他の試験の fork（exec 前の子）が
+    /// 相手側の fd の複製を一時的に持っても結果が変わらないようにするため（`shutdown` は socket そのものの状態で、
+    /// fd の複製の有無に依らない。Linux の `unix_stream_sendmsg` は `SEND_SHUTDOWN` で `EPIPE` と `SIGPIPE` を返す）。
+    ///
+    /// std の `Command` は fork 後・exec 前の子で `SIGPIPE` を `SIG_DFL` に戻してから `pre_exec` のクロージャを
+    /// 実行する（std `sys/process/unix/unix.rs` の `do_exec`。`-Zon-broken-pipe` 不使用時）。そのため書き込みが
+    /// `SIGPIPE` を出せば子は exec 前にシグナル 13 で終わり、`EPIPE` で戻れば `/bin/true` を exec して終了コード 0 になる。
+    /// それ以外の結果はクロージャが `EPROTO` を返し、spawn の失敗として親へ届く。
+    fn write_to_shut_down_socket_in_child(how: ChildWrite) -> std::process::ExitStatus {
+        use std::io::Write;
+        use std::os::unix::process::CommandExt;
+        const EPROTO: i32 = 71;
+        let (a, _b) = UnixStream::pair().unwrap();
+        a.shutdown(std::net::Shutdown::Write).unwrap();
+        // 同じ socket を `write(2)` で書くための `File`（安全な所有の変換で、unsafe を使わない）。
+        let raw = File::from(std::os::fd::OwnedFd::from(a.try_clone().unwrap()));
+        let mut cmd = std::process::Command::new("/bin/true");
+        // SAFETY: クロージャは fork 後・exec 前の子（親の呼び出しスレッドだけの複製）で実行される。呼ぶのは
+        // `getsockopt(2)`・`send(2)`・`write(2)` と errno の読み出しだけで、割り当て・ロック・panic をしない
+        // （`io::Error` は `Repr::Os`・`Simple` で割り当てない）。捕捉する `a`（`UnixStream`）・`raw`（`File`）は
+        // `Send + Sync` を所有で移し、`how` は Copy 値のため `Send + Sync + 'static` を満たす。fd は所有中（`Command` の
+        // 破棄まで）開いている。
+        // 試験専用（`cfg(test)`）で、本体の経路は `pre_exec` を使わない。
+        unsafe {
+            cmd.pre_exec(move || {
+                let r = match how {
+                    ChildWrite::PlainWrite => (&raw).write(b"x\n"),
+                    ChildWrite::WriteNonblocking => write_nonblocking(&a, b"x\n"),
+                };
+                match r {
+                    Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+                    _ => Err(io::Error::from_raw_os_error(EPROTO)),
+                }
+            });
+        }
+        super::pdeathsig_tests::wait_bounded(cmd.spawn().unwrap())
+    }
+
+    /// 対照: `SIG_DFL` の子で送信側を閉じた socket へ `write(2)` を呼ぶとシグナル 13（`SIGPIPE`）で終わる。下の試験が
+    /// `SIG_DFL` の下で行われていること（std が子で `SIGPIPE` を戻していること）を実行時に確かめる。
+    #[test]
+    fn repair12_plain_write_to_shut_down_socket_raises_sigpipe_under_sig_dfl() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = write_to_shut_down_socket_in_child(ChildWrite::PlainWrite);
+        assert_eq!((status.code(), status.signal()), (None, Some(13)));
+    }
+
+    /// PLUG-7・REPAIR-5・REPAIR-12: `SIGPIPE` が `SIG_DFL` でも `write_nonblocking` は送信側を閉じた socket へ `EPIPE` で戻り、
+    /// プロセスを終わらせない（`MSG_NOSIGNAL` が送信の呼び出しから外れると、子がシグナル 13 で終わりこの試験が落ちる）。
+    #[test]
+    fn repair5_send_to_shut_down_socket_raises_no_sigpipe_under_sig_dfl() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = write_to_shut_down_socket_in_child(ChildWrite::WriteNonblocking);
+        assert_eq!((status.code(), status.signal()), (Some(0), None));
+    }
+
+    /// AF_INET の TCP socket は `MSG_DONTWAIT` で待たないかがプロトコル実装に依存するため書かず `Unsupported`
+    /// （fail-closed）。相手には何も届かない。
+    #[test]
+    fn repair5_tcp_socket_is_not_written() {
+        use std::io::Read;
+        use std::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let e = write_nonblocking(&client, b"x\n").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::Unsupported);
+        server.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            server.read(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    /// AF_INET の UDP socket（接続済み）も AF_UNIX ではないため書かず `Unsupported`。自分宛てにも何も届かない。
+    #[test]
+    fn repair5_udp_socket_is_not_written() {
+        use std::net::UdpSocket;
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.connect(sock.local_addr().unwrap()).unwrap();
+        let e = write_nonblocking(&sock, b"x\n").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::Unsupported);
+        sock.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            sock.recv(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    /// AF_UNIX の datagram socket は書く。相手の受信キューが満杯になっても、ブロッキングの fd のまま
+    /// `MSG_DONTWAIT` で待たず `WouldBlock`（`EAGAIN`）で戻る。
+    #[test]
+    fn repair5_unix_datagram_socket_is_written_and_does_not_block_when_full() {
+        use std::os::unix::net::UnixDatagram;
+        use std::time::{Duration, Instant};
+        let (a, b) = UnixDatagram::pair().unwrap();
+        assert_eq!(write_nonblocking(&a, b"x\n").unwrap(), 2);
+        let mut buf = [0u8; 8];
+        assert_eq!(b.recv(&mut buf).unwrap(), 2);
+        assert_eq!(&buf[..2], b"x\n");
+        // 読まずに送り続け、受信キュー（`max_dgram_qlen`）か送信バッファの上限で `EAGAIN` になるまで。
+        // 上限は既定で数百件のため、10 万回で打ち切る（REPAIR-5）。
+        let start = Instant::now();
+        let mut last = Ok(0);
+        for _ in 0..100_000 {
+            last = write_nonblocking(&a, b"x\n");
+            if last.is_err() {
+                break;
+            }
+        }
+        assert_eq!(last.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 }
 

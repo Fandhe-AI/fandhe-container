@@ -58,19 +58,19 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 | `rustls` | =0.23.45 | TLS（crates/oci のみ。default-features 無効・`std`/`tls12`/`logging`。RUSTSEC-2026-0285 の修正版のため 0.23.45 未満へ固定しない） | #399 |
 | `rustls-graviola` | =0.4.0 | rustls の暗号実装（純 Rust・C ビルドなし。crates/oci のみ。CPU 機能不足は panic させず構造化エラーで返す） | #399 |
 | `rustls-native-certs` | =0.8.4 | OS のルート証明書の読み込み（crates/oci のみ。webpki-roots の代わり） | #399 |
-| `flate2` | =1.1.10 | gzip 展開（OCI-1。crates/oci のみ。default-features 無効・`zlib-rs` backend で純 Rust。展開後サイズの上限は呼び出し側で検証。#678 の SPDY ヘッダの zlib 辞書も同じ backend を使う） | #406 |
+| `flate2` | =1.1.10 | gzip 展開（OCI-1。crates/oci。展開後サイズの上限は呼び出し側で検証）と、CRI ストリーミングの SPDY/3.1 ヘッダの zlib 辞書（CRI-6。crates/cri。`set_dictionary`）。default-features 無効・`zlib-rs` backend で純 Rust。参照は crates/oci と crates/cri のみ | #406・#678 |
 | `tar` | =0.4.46 | tar ヘッダ・PAX の解析のみ（OCI-1。crates/oci のみ。default-features 無効。`Entry::unpack`/`unpack_in` は使わず、展開は crates/oci で fd 起点に自作） | #408 |
 | `tonic` | =0.14.6 | gRPC サーバー / クライアント（CRI-3・PLUG-2。cri / plugin の gRPC 面のみ。default-features 無効・`codegen`/`transport`/`router`） | #425 |
 | `tonic-prost` | =0.14.6 | tonic の prost 連携（cri / plugin の gRPC 面のみ） | #425 |
-| `prost` | =0.14.4 | protobuf メッセージ（cri / plugin の gRPC 面のみ。#670 の ttrpc 自作のメッセージ生成にも使う） | #425 |
-| `tokio` | =1.53.2 | 非同期ランタイム（LTS。cri / plugin の gRPC 面のみで core には入れない。features は資料の案で `rt`/`net`/`time`/`macros`） | #425 |
+| `prost` | =0.14.4 | protobuf メッセージ（cri / plugin の gRPC 面と、crates/cri で自作する ttrpc の Task API メッセージ〔CRI-5〕のみ） | #425・#670 |
+| `tokio` | =1.53.2 | 非同期ランタイム（LTS。cri / plugin の gRPC 面と、#678 の crates/cri のストリーミングサーバーのみで core には入れない。features は資料の案で `rt`/`net`/`time`/`macros`） | #425・#678 |
 | `tokio-stream` | =0.1.19 | UDS 上の tonic の接続（#454。cri / plugin の gRPC 面のみ。`net`） | #425 |
 | `tower-service` | =0.3.3 | UDS 上の tonic の接続（#454。cri / plugin の gRPC 面のみ） | #425 |
 | `hyper` | =1.12.0 | CRI ストリーミングサーバーの HTTP/1.1 Upgrade（CRI-6。crates/cri の直接依存。`server`/`http1`。SPDY/3.1 は自作） | #678 |
 | `hyper-util` | =0.1.21 | UDS 上の tonic の接続（#425）・ストリーミングサーバー（#678。crates/cri の直接依存。`server`/`http1`/`tokio`） | #425・#678 |
 | `http` | =1.5.0 | UDS 上の tonic の接続（#454。cri / plugin の gRPC 面のみ） | #425 |
 | `tonic-prost-build` | =0.14.6 | build 時のみ: cri-api の `.proto` からのコード生成（CRI-3。default-features 無効・`transport`） | #425 |
-| `protox` | =0.9.1 | build 時のみ: 純 Rust の `.proto` 解析（`protoc` 不要） | #425 |
+| `protox` | =0.9.1 | build 時のみ: 純 Rust の `.proto` 解析（`protoc` 不要。#670 の Task API メッセージの生成にも使う） | #425・#670 |
 | `serde-saphyr` | =1.3.0 | YAML（CDI spec・compose.yaml。GPU-1・STACK-3。crates/gpu と crates/compose-convert のみで core には入れない。default-features 無効・`deserialize`。`from_str_with_options` で `Budget` を用途ごとに明示・`duplicate_keys: Error`・compose は `strict_booleans: true`） | #540 |
 | `toml` | =1.1.8 | 独自 TOML スタック定義の parse / serialize（STACK-1・CLI-4。default-features 無効・`std`/`serde`/`parse`/`display`、`unbounded` は無効。crates.io 上の版は `1.1.8+spec-1.1.0`。配置は資料の案で crates/stack、必要なら crates/compose-convert） | #582 |
 
@@ -78,7 +78,7 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 
 2026-10-10 承認分（#399・#406・#408・#425・#540・#582・#678）は、まだ `Cargo.toml` に入っていない。追加は各実装 issue（#400・#407・#409・#426・#453・#454・#541・TASK-151・#583・#679）で行う。「cri / plugin の gRPC 面」は crates/cri・`fandhe-container-plugin-cri`・crates/plugin の gRPC 面（TASK-108）を指す。`prost-build`・`tonic-build` は `tonic-prost-build` から推移的に入るため直接の依存には書かない（版は `Cargo.lock` で固定される）。
 
-**非同期ランタイム**: tokio を承認（#425・2026-10-10）。使ってよいのは cri / plugin の gRPC 面だけで、core には入れない（PLUG-1・CORE-1）。tokio の上で動く hyper・hyper-util も同じ範囲に限る。
+**非同期ランタイム**: tokio を承認（#425・2026-10-10）。使ってよいのは cri / plugin の gRPC 面だけで、core には入れない（PLUG-1・CORE-1）。例外は #678 で crates/cri の直接依存として承認した CRI ストリーミングサーバー（hyper・hyper-util の `tokio` feature。CRI-6）で、crates/cri の中で同じ tokio を使う。hyper・hyper-util の参照も cri / plugin に限る。
 
 ## 不採用の記録
 

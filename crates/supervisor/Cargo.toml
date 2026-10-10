@@ -99,7 +99,9 @@ harness = false
 
 # exec の対象の拒否が層 exec_target の監査レコードとして 1 拒否 1 件記録されることの結合試験（SEC-4・SUP-6・
 # TASK-163 追補・#1465）。fork は単一スレッドの呼び出し元を要求するため harness = false。root・実コンテナ不要で、
-# 既定のテスト集合で実行する（依存は不変）。
+# 既定のテスト集合で実行する（依存は不変）。worker の rootfs_is_host_root の拒否が層 mount に 1 件記録される
+# シナリオ（#1614 の事後監査）は exec-test-support の入口（run_in_worker_audited_for_test・core の
+# reject_own_root_for_test）を使う（上の自己参照の dev-dependency で有効になる）。
 [[test]]
 name = "exec_audit"
 path = "tests/exec_audit.rs"

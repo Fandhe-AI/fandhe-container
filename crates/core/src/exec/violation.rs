@@ -15,6 +15,9 @@
 //! 監査イベントへの写像は [`IsolationViolation::exec_audit_event`]（SUP-6・TASK-163 追補・#1465）で実装済み。
 //! エントリポイント検証の拒否（種別 `entrypoint` の 8 理由。launch と exec の子が共有する）から `Entrypoint`
 //! 監査イベントへの写像は [`IsolationViolation::entrypoint_audit_event`]（SEC-4・SUP-6・SEC-1・TASK-163 追補・#1595）。
+//! supervisor の exec の worker が返し得る違反（[`ViolationReason::EXEC_WORKER_REASONS`]。種別 `exec_target` の 10 理由と
+//! 種別 `rootfs_pivot` の `rootfs_is_host_root`）から監査イベントへの写像は [`ViolationReason::exec_worker_audit_event`]
+//! （`exec_target` は `ExecTarget`、`rootfs_is_host_root` は `mount_audit_event` と同じ `Mount` のパスなし。#1614 の事後監査）。
 //! ファイルへの永続化（TASK-41.5.1・#839）とカーネル監査フォールバック（#840）も `audit_log` に実装済みで、
 //! 本モジュールの記録を実際の sink へ流す本番経路（launcher・CLI への配線）は未実装
 //! （REPAIR-3: 実装済みを装わない）。
@@ -293,6 +296,56 @@ impl ViolationReason {
         (self.kind() == ViolationKind::ExecTarget).then(|| AuditEvent::ExecTarget {
             reason: AuditReason::new(self.as_str()),
         })
+    }
+
+    /// exec の worker（supervisor が core の `spawn_exec_worker` で fork し、対象の特定から制限の再適用・コマンドの
+    /// fork までを行うプロセス）が `ExecError::violation` として返し得る理由の全一覧（SEC-4・SUP-6・SEC-1）。
+    ///
+    /// supervisor の親プロセスが worker の結果行（`err` 行）の `<種別>/<理由>` を引き直す許可リストの SSOT。
+    /// [`Self::EXEC_TARGET_REASONS`] の 10 理由と、`prepare_exec_restrictions` の `reject_own_root` が返す
+    /// 種別 `rootfs_pivot` の `rootfs_is_host_root`（worker 自身の `/` が bundle の rootfs と同じディレクトリ）から成る。
+    /// 一覧と worker の経路のソースが作る理由の一致は `exec/violation_scan.rs` の単体テストが固定する。
+    /// exec の子が `execve` 前に報告する違反（種別 `entrypoint`）は `ok` 行の `SetupFailed` で運ばれるためここに含めない。
+    pub const EXEC_WORKER_REASONS: [ViolationReason; 11] = [
+        Self::ExecTargetNotNestedPid1,
+        Self::ExecTargetCgroupMismatch,
+        Self::ExecTargetSharesPidNamespace,
+        Self::ExecTargetSharesMountNamespace,
+        Self::ExecTargetInOtherUserNamespace,
+        Self::ExecRootNotContainerRootfs,
+        Self::ExecJoinedNamespaceMismatch,
+        Self::ExecJoinedPidNamespaceMismatch,
+        Self::ExecJoinedCgroupMismatch,
+        Self::ExecTargetPidfdMismatch,
+        Self::RootfsIsHostRoot,
+    ];
+
+    /// worker の結果行の種別名 `kind` と理由コード `reason` から理由を引き直す（許可リスト照合。SEC-4・SUP-6）。
+    ///
+    /// [`Self::EXEC_WORKER_REASONS`] にあり、かつ種別名がその理由の種別と一致するときだけ `Some`。未知の理由・
+    /// 一覧外の理由・種別の食い違いは `None`（呼び出し側は記録せず fail-closed で扱う）。外部（worker の結果行）から
+    /// 届いた文字列を、監査レコードへ入る静的トークンへ変換する唯一の入口。
+    pub fn from_exec_worker_token(kind: &str, reason: &str) -> Option<Self> {
+        Self::EXEC_WORKER_REASONS
+            .into_iter()
+            .find(|r| r.as_str() == reason && r.kind().as_str() == kind)
+    }
+
+    /// worker の経路の拒否 1 件に対応する監査イベント（SEC-4・SUP-6・SEC-1）。
+    ///
+    /// [`Self::EXEC_WORKER_REASONS`] の理由だけが対象で、それ以外は `None`。種別 `exec_target` は
+    /// [`Self::exec_target_audit_event`] と同じ `ExecTarget`、種別 `rootfs_pivot` は
+    /// [`IsolationViolation::mount_audit_event`] と同じ層 `Mount` へ写す（理由コードだけを持つ呼び出し側のため
+    /// パスなし。`AuditEvent::Mount` は理由コードの欄を持たない）。1 理由が写る層は 1 つだけ（二重に記録しない）。
+    pub fn exec_worker_audit_event(self) -> Option<AuditEvent> {
+        if !Self::EXEC_WORKER_REASONS.contains(&self) {
+            return None;
+        }
+        match self.kind() {
+            ViolationKind::ExecTarget => self.exec_target_audit_event(),
+            ViolationKind::RootfsPivot => Some(AuditEvent::Mount { path: None }),
+            _ => None,
+        }
     }
 
     /// 機械可読な理由コード（snake_case）。
@@ -1101,6 +1154,61 @@ mod tests {
         );
     }
 
+    /// SEC-4・SUP-6・SEC-1: worker の経路の 11 理由は `<種別>/<理由>` で往復でき、層は exec_target か mount の
+    /// どちらか 1 つだけ（パスなし）。一覧外・種別の食い違い・未知は引けず、監査イベントも作らない。
+    #[test]
+    fn sec4_sup6_exec_worker_token_allowlist_maps_each_reason_to_one_layer() {
+        assert_eq!(ViolationReason::EXEC_WORKER_REASONS.len(), 11);
+        for r in ViolationReason::EXEC_TARGET_REASONS {
+            assert!(ViolationReason::EXEC_WORKER_REASONS.contains(&r), "{r:?}");
+        }
+        for r in ViolationReason::EXEC_WORKER_REASONS {
+            assert_eq!(
+                ViolationReason::from_exec_worker_token(r.kind().as_str(), r.as_str()),
+                Some(r)
+            );
+            let expected = match r.kind() {
+                ViolationKind::ExecTarget => AuditEvent::ExecTarget {
+                    reason: AuditReason::new(r.as_str()),
+                },
+                ViolationKind::RootfsPivot => AuditEvent::Mount { path: None },
+                other => panic!("unexpected worker violation kind {other:?}"),
+            };
+            assert_eq!(r.exec_worker_audit_event(), Some(expected), "{r:?}");
+            // 二重記録なし: entrypoint 層には写らない。
+            assert_eq!(r.entrypoint_audit_event(), None, "{r:?}");
+        }
+        assert_eq!(
+            ViolationReason::RootfsIsHostRoot.exec_target_audit_event(),
+            None
+        );
+        for (kind, reason) in [
+            // 種別の食い違い。
+            ("exec_target", "rootfs_is_host_root"),
+            ("rootfs_pivot", "exec_target_not_nested_pid1"),
+            // 同じ種別だが worker の経路では生じない理由（一覧外）。
+            ("rootfs_pivot", "rootfs_moved"),
+            ("rootfs_pivot", "rootfs_has_submounts"),
+            ("mount_target", "target_moved"),
+            ("entrypoint", "entrypoint_is_runtime_binary"),
+            ("exec_target", "bogus"),
+            ("", ""),
+        ] {
+            assert_eq!(
+                ViolationReason::from_exec_worker_token(kind, reason),
+                None,
+                "{kind}/{reason}"
+            );
+        }
+        for r in [
+            ViolationReason::RootfsMoved,
+            ViolationReason::TargetMoved,
+            ViolationReason::EntrypointIsRuntimeBinary,
+        ] {
+            assert_eq!(r.exec_worker_audit_event(), None, "{r:?}");
+        }
+    }
+
     /// SEC-4・SUP-6・TASK-163 追補: 期待 cgroup パスを subject に持つ違反でもレコードにパスは載らない。
     #[test]
     fn sec4_sup6_task163_exec_audit_event_has_no_path() {
@@ -1195,6 +1303,51 @@ mod tests {
             let sink = VecSink::new(false);
             let out = record_entrypoint_rejection("x", r, &sink);
             assert_eq!(out.delivery, AuditDelivery::NotApplicable);
+            assert_eq!(sink.snapshot().len(), 0);
+        }
+    }
+
+    /// SEC-4・SUP-6・SEC-1: worker の経路の 11 理由はそれぞれ 1 件だけ記録される（exec 対象は層 exec_target と理由
+    /// コード、`rootfs_is_host_root` は層 mount で理由コードなし。どちらもパスなし）。一覧外は 0 件、失敗でも error は不変。
+    #[test]
+    fn sec4_sup6_record_exec_worker_rejection_records_once_per_reason() {
+        use crate::audit_log::mount::tests::VecSink;
+        use crate::audit_log::{AuditDelivery, AuditLayer};
+        use crate::exec::record_exec_worker_rejection;
+
+        for r in ViolationReason::EXEC_WORKER_REASONS {
+            let sink = VecSink::new(false);
+            let out = record_exec_worker_rejection("rejected", r, &sink);
+            assert_eq!(out.delivery, AuditDelivery::Recorded, "{r:?}");
+            assert_eq!(out.error, "rejected");
+            let recs = sink.snapshot();
+            assert_eq!(recs.len(), 1, "{r:?}");
+            let (layer, reason) = if r == ViolationReason::RootfsIsHostRoot {
+                (AuditLayer::Mount, None)
+            } else {
+                (AuditLayer::ExecTarget, Some(r.as_str()))
+            };
+            assert_eq!(recs[0].layer(), layer, "{r:?}");
+            assert_eq!(recs[0].reason().map(AuditReason::as_str), reason);
+            assert_eq!(recs[0].path(), None);
+            assert_eq!(recs[0].pid().get(), std::process::id());
+
+            let failing = VecSink::new(true);
+            let out = record_exec_worker_rejection("rejected", r, &failing);
+            assert!(
+                matches!(out.delivery, AuditDelivery::SinkFailed(_)),
+                "{r:?}"
+            );
+            assert_eq!(out.error, "rejected");
+        }
+        for r in [
+            ViolationReason::RootfsMoved,
+            ViolationReason::TargetMoved,
+            ViolationReason::EntrypointIsRuntimeBinary,
+        ] {
+            let sink = VecSink::new(false);
+            let out = record_exec_worker_rejection("x", r, &sink);
+            assert_eq!(out.delivery, AuditDelivery::NotApplicable, "{r:?}");
             assert_eq!(sink.snapshot().len(), 0);
         }
     }

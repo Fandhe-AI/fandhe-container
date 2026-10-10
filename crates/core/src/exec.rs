@@ -56,7 +56,8 @@
 //!   マウント層の監査レコード化は [`audit_mount_violation`]（TASK-41.4）、exec の対象の拒否の監査レコード化
 //!   （層 `exec_target`）は [`audit_exec_violation`]・[`record_exec_target_rejection`]（#1465）、
 //!   エントリポイント検証の拒否（層 `entrypoint`）は [`audit_entrypoint_violation`]・
-//!   [`record_entrypoint_rejection`]（#1595）が担う。
+//!   [`record_entrypoint_rejection`]（#1595）、supervisor の exec の worker の経路の拒否（層 `exec_target`、
+//!   または種別 `rootfs_pivot` の `rootfs_is_host_root` を層 `mount` のパスなし）は [`record_exec_worker_rejection`] が担う。
 //!   ファイルへの保存は `audit_log::AuditFileWriter`（#839）で実装済みで、本番経路への sink の配線は未実装
 //!   （REPAIR-3）。システムエラーには付かない
 //!
@@ -120,6 +121,8 @@ mod setns;
 mod stages;
 mod tmpfs;
 mod violation;
+#[cfg(test)]
+mod violation_scan;
 
 /// 結合試験 `tests/exec_child_setup.rs`・supervisor の `tests/exec_setns_join.rs` 専用の再公開
 /// （SUP-6・TASK-163 追補・#1457。通常の利用者は呼ばない。詳細は定義側）。
@@ -178,6 +181,11 @@ pub use process::{
 #[cfg(all(feature = "exec-test-support", not(test)))]
 #[doc(hidden)]
 pub use process::{StandardFd, close_standard_fds_for_test};
+/// supervisor の結合試験 `tests/exec_audit.rs` 専用の再公開（SEC-4・SEC-1・#1614 の事後監査。通常の利用者は
+/// 呼ばない。詳細は定義側）。`exec-test-support` feature を付けたビルドにだけ存在する。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use reapply::reject_own_root_for_test;
 pub use reapply::{
     ExecReady, ExecRestrictionReport, ExecRestrictions, UnappliedExecRestriction,
     prepare_exec_restrictions, reapply_restrictions,
@@ -263,7 +271,7 @@ pub fn audit_mount_violation(
 /// `err.violation` が種別 `ExecTarget` のときだけ 1 件 `sink` へ渡す。それ以外（マウント層の違反・
 /// システムエラー）は `NotApplicable`。`err` は常にそのまま返り、記録の失敗で拒否は覆らない（fail-closed）。
 /// プロセス内で `ExecError` を直接扱う呼び出し側向けで、supervisor の通しの入口は
-/// [`record_exec_target_rejection`] を使う。
+/// [`record_exec_worker_rejection`] を使う。
 pub fn audit_exec_violation(
     err: ExecError,
     sink: &dyn crate::audit_log::AuditSink,
@@ -295,6 +303,28 @@ pub fn record_exec_target_rejection<E>(
     sink: &dyn crate::audit_log::AuditSink,
 ) -> crate::audit_log::AuditedRejection<E> {
     match reason.exec_target_audit_event() {
+        Some(event) => {
+            let delivery = crate::audit_log::mount::deliver(event, sink);
+            crate::audit_log::AuditedRejection { error, delivery }
+        }
+        None => crate::audit_log::AuditedRejection::not_applicable(error),
+    }
+}
+
+/// 理由コードだけを持つ呼び出し側（supervisor が worker の `err` 行を復号した親プロセス）向けに、worker の経路の
+/// 拒否 `error` を 1 件記録して返す（SEC-4・SUP-6・SEC-1）。
+///
+/// `reason` は `ViolationReason::EXEC_WORKER_REASONS` で引き直した値を渡す。種別 `exec_target` は層 `exec_target`
+/// （[`record_exec_target_rejection`] と同じレコード）、種別 `rootfs_pivot`（`rootfs_is_host_root`）は
+/// [`audit_mount_violation`] と同じ写像で層 `mount` のパスなしのレコードにする（`ViolationReason::exec_worker_audit_event`）。
+/// 一覧外の理由は記録せず `NotApplicable`。時刻と PID は呼び出したプロセスのもの。記録の成否で `error` は
+/// 変わらない（fail-closed）。
+pub fn record_exec_worker_rejection<E>(
+    error: E,
+    reason: ViolationReason,
+    sink: &dyn crate::audit_log::AuditSink,
+) -> crate::audit_log::AuditedRejection<E> {
+    match reason.exec_worker_audit_event() {
         Some(event) => {
             let delivery = crate::audit_log::mount::deliver(event, sink);
             crate::audit_log::AuditedRejection { error, delivery }

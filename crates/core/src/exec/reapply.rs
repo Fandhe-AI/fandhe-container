@@ -582,6 +582,10 @@ fn combine_group_outcomes(
 
 /// `rootfs` が呼び出しプロセス自身の `/` と別のディレクトリであることを確かめる
 /// （Landlock の検出より先に判定する）。
+///
+/// 拒否は違反 `rootfs_is_host_root`（種別 `rootfs_pivot`）で、supervisor の worker から `err` 行で親へ運ばれ、
+/// 親が層 `mount`（パスなし）に 1 件記録する（`ViolationReason::EXEC_WORKER_REASONS`・`record_exec_worker_rejection`。
+/// SEC-4・SEC-1）。
 fn reject_own_root(rootfs: BorrowedFd<'_>, own_root: BorrowedFd<'_>) -> Result<(), ExecError> {
     if same_directory(rootfs, own_root).map_err(|e| e.at_stage(IsolationStage::Validate))? {
         return Err(ExecError::from_violation_at(
@@ -591,6 +595,26 @@ fn reject_own_root(rootfs: BorrowedFd<'_>, own_root: BorrowedFd<'_>) -> Result<(
         ));
     }
     Ok(())
+}
+
+/// 結合試験 `tests/exec_audit.rs`（supervisor）専用の入口: `rootfs` を symlink 非追従で開き、
+/// [`prepare_exec_restrictions`] と同じ `reject_own_root` の判定だけを行う（SEC-4・SEC-1・#1614 の事後監査）。
+///
+/// 本番の経路で `rootfs_is_host_root` に届くには対象の特定（入れ子の PID 1・cgroup の一致）を通る必要があり、
+/// 非特権の結合試験では起こせない。そこで判定の関数そのものを worker の中から呼べるようにし、実際の拒否が
+/// worker の結果行を経て親の監査記録になることを確かめる。通常の利用者は呼ばない。`exec-test-support`
+/// feature を付けたビルドにだけ存在する（リリースビルドでは `compile_error!` で止まる）。
+#[cfg(feature = "exec-test-support")]
+pub fn reject_own_root_for_test(rootfs: &Path) -> Result<(), ExecError> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let stage = IsolationStage::Validate;
+    let path = std::ffi::CString::new(rootfs.as_os_str().as_bytes())
+        .map_err(|_| ExecError::new(ErrorCode::InvalidArgument, stage, "invalid rootfs path"))?;
+    let dir = sys::open_dir_path_nofollow(None, &path)
+        .map_err(|e| ExecError::from_sys(e, stage, "open rootfs"))?;
+    let own_root = sys::open_dir_path_nofollow(None, c"/")
+        .map_err(|e| ExecError::from_sys(e, stage, "open own root"))?;
+    reject_own_root(dir.as_fd(), own_root.as_fd())
 }
 
 /// 自プロセスの procfs ディレクトリ（pid 指定。`O_PATH`）を開き、本物の procfs であることを確かめる。

@@ -6,6 +6,11 @@
 //! レコード 1 件になること、本番の記録先（`default_audit_sink` の `FileAuditSink`。`<状態ルート>/@audit.log`）の JSON Lines 1 行まで届くこと、記録の失敗で拒否が
 //! 覆らないこと、記録の対象外（稼働中でない記録）は 0 件であることを具体値で照合する。
 //!
+//! worker の制限の準備で生じる rootfs の拒否（種別 `rootfs_pivot` の `rootfs_is_host_root`。#1614 の事後監査 P2）は、
+//! 本番の経路では対象の特定を通った後でしか起きないため、試験専用の入口（`exec-test-support`）で core の判定
+//! `reject_own_root`（`reject_own_root_for_test`）を本番と同じ worker の中で呼び、結果行を経た親側の記録が層 `mount`・
+//! パスなし・1 件になること、本番の記録先の JSON Lines に同じ 1 行が届くことを照合する。
+//!
 //! fork は呼び出しプロセスが単一スレッドであることを要求するため、`harness = false` の単一スレッド `main` で動かす
 //! （`exec_timeout` と同じ。root・実コンテナ不要で既定のテスト集合で実行する）。
 
@@ -27,11 +32,14 @@ mod linux {
     use std::time::Duration;
 
     use fandhe_container_core::audit_log::{AuditDelivery, AuditLayer, AuditRecord, AuditSink};
+    use fandhe_container_core::exec::reject_own_root_for_test;
     use fandhe_container_core::traits::{
         CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, ErrorCode, StateRecord,
         StateRevision, TraitError,
     };
-    use fandhe_container_supervisor::exec::{ExecRequest, default_audit_sink, run_command};
+    use fandhe_container_supervisor::exec::{
+        ExecOutcome, ExecRequest, default_audit_sink, run_command, run_in_worker_audited_for_test,
+    };
 
     pub fn run() {
         rejection_is_recorded_once_with_reason_and_no_path();
@@ -39,6 +47,8 @@ mod linux {
         failing_sink_keeps_the_process_single_threaded_for_repeated_exec();
         sink_failure_does_not_overturn_the_rejection();
         non_running_record_is_not_audited();
+        worker_rootfs_rejection_is_recorded_once_as_mount_without_path();
+        worker_rootfs_rejection_reaches_the_audit_file_as_one_mount_line();
         println!("exec_audit: all scenarios passed");
     }
 
@@ -249,5 +259,78 @@ mod linux {
             "container is not running or has no recorded pid; cannot identify pid1"
         );
         assert_eq!(sink.snapshot().len(), 0);
+    }
+
+    /// worker の中で `reject_own_root` を `/` に対して呼んだときの実際の拒否（種別 `rootfs_pivot`）。
+    const ROOTFS_REJECTION: &str = "exec stage Validate: rootfs must not be the host root '/' \
+         (violation: rootfs_pivot/rootfs_is_host_root, CORE-1)";
+
+    /// 本番と同じ worker の中で、core の `reject_own_root` に自分の `/` を rootfs として渡す（必ず拒否される）。
+    fn rootfs_is_host_root_in_worker(
+        sink: &dyn AuditSink,
+    ) -> fandhe_container_core::audit_log::AuditedRejection<TraitError> {
+        run_in_worker_audited_for_test(
+            Duration::from_secs(30),
+            || -> Result<ExecOutcome, _> {
+                reject_own_root_for_test(Path::new("/"))?;
+                panic!("the host root must be rejected as the rootfs");
+            },
+            sink,
+        )
+        .expect_err("the host root must be rejected")
+    }
+
+    /// SEC-4・SEC-1・SUP-6・#1614 の事後監査 P2: worker の `rootfs_is_host_root` の拒否は結果行を経て親側で 1 件だけ
+    /// 記録される（層 `mount`・理由コードの欄なし・パスなし・親〔自〕プロセスの PID）。拒否の内容は元のまま。
+    fn worker_rootfs_rejection_is_recorded_once_as_mount_without_path() {
+        let sink = VecSink::new(false);
+        let rejected = rootfs_is_host_root_in_worker(&sink);
+        assert_eq!(rejected.error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(rejected.error.message(), ROOTFS_REJECTION);
+        assert_eq!(rejected.delivery, AuditDelivery::Recorded);
+        let recs = sink.snapshot();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].layer(), AuditLayer::Mount);
+        assert_eq!(recs[0].reason(), None);
+        assert_eq!(recs[0].path(), None);
+        assert_eq!(recs[0].syscall(), None);
+        assert_eq!(recs[0].pid().get(), std::process::id());
+
+        // 記録の失敗で拒否は覆らない（fail-closed）。
+        let failing = VecSink::new(true);
+        let rejected = rootfs_is_host_root_in_worker(&failing);
+        assert_eq!(rejected.error.message(), ROOTFS_REJECTION);
+        assert_eq!(
+            rejected.delivery,
+            AuditDelivery::SinkFailed(TraitError::new(ErrorCode::Internal, "sink failed"))
+        );
+        assert_eq!(failing.snapshot().len(), 0);
+    }
+
+    /// SEC-4・#1614 の事後監査 P2: 本番の記録先（`FileAuditSink`）の JSON Lines に層 `mount`・`path` null の 1 行が届き、
+    /// exec_target・entrypoint の層の行は増えない（二重記録なし）。
+    fn worker_rootfs_rejection_reaches_the_audit_file_as_one_mount_line() {
+        let dir = private_dir();
+        let result = std::panic::catch_unwind(|| {
+            let sink = default_audit_sink(Some(dir.clone())).expect("production audit sink");
+            let rejected = rootfs_is_host_root_in_worker(&sink);
+            assert_eq!(rejected.error.message(), ROOTFS_REJECTION);
+            assert_eq!(rejected.delivery, AuditDelivery::Recorded);
+            let text = std::fs::read_to_string(dir.join("@audit.log")).expect("read audit file");
+            assert_eq!(text.lines().count(), 1, "{text}");
+            let line = text.lines().next().expect("one line");
+            assert!(line.contains("\"layer\":\"mount\""), "{line}");
+            assert!(line.contains("\"path\":null"), "{line}");
+            assert!(
+                line.contains(&format!("\"pid\":{}", std::process::id())),
+                "{line}"
+            );
+            assert!(!line.contains("exec_target"), "{line}");
+            assert!(!line.contains("entrypoint"), "{line}");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 }

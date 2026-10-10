@@ -5,7 +5,7 @@
 //! `GET_PROTOCOL_FEATURES` の位置が違うため。根拠は `docs/design/venus-decoder-poc.md` 10.8）。違反は `OUT_OF_ORDER`。
 //! ring は [`Ring::Setup`]（設定中）と [`Ring::Running`]（ADDR・KICK・CALL・ENABLE がそろった）の enum で表し、
 //! 「実行中なのに設定が欠けている」状態を型として作れないようにする。
-//! 未実装（REPAIR-3）: `SET_CONFIG`・`VRING_NOFD`（polling）・REPLY_ACK・inflight・cursorq（ring 1）の要求処理。
+//! 未実装（REPAIR-3）: `SET_CONFIG`・`VRING_NOFD`（polling）・inflight・cursorq（ring 1）の要求処理。
 
 use std::fs::File;
 use std::os::fd::OwnedFd;
@@ -14,8 +14,8 @@ use super::error::{SessionError, SessionErrorCode};
 use crate::device;
 use crate::vhost_user::guest_memory::GuestMemory;
 use crate::vhost_user::{
-    ConfigPayload, F_PROTOCOL_FEATURES, PROTOCOL_F_CONFIG, PROTOCOL_F_MQ, Reply, Request,
-    RequestCode, VringAddr, VringState,
+    ConfigPayload, F_PROTOCOL_FEATURES, PROTOCOL_F_CONFIG, PROTOCOL_F_MQ, PROTOCOL_F_REPLY_ACK,
+    Reply, Request, RequestCode, VringAddr, VringState,
 };
 use crate::virtqueue::{MAX_QUEUE_SIZE, QueueConfig, SplitQueue};
 
@@ -25,7 +25,7 @@ pub(crate) const OFFERED_FEATURES: u64 = device::FEATURES | F_PROTOCOL_FEATURES;
 /// bit 30 が無いと `SET_VRING_ENABLE` の意味が変わるため、広告した全ビットを必須にして fail-closed にする。
 pub(crate) const REQUIRED_FEATURES: u64 = OFFERED_FEATURES;
 /// `GET_PROTOCOL_FEATURES` で広告する値。
-pub(crate) const OFFERED_PROTOCOL: u64 = PROTOCOL_F_MQ | PROTOCOL_F_CONFIG;
+pub(crate) const OFFERED_PROTOCOL: u64 = PROTOCOL_F_MQ | PROTOCOL_F_REPLY_ACK | PROTOCOL_F_CONFIG;
 /// ring の本数（0 = controlq、1 = cursorq）。
 pub(crate) const NUM_RINGS: usize = 2;
 
@@ -118,6 +118,14 @@ fn ring_index(index: u32, code: RequestCode) -> Result<usize, SessionError> {
 impl State {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// REPLY_ACK が確定済みなら真（NEED_REPLY への応答義務がある。#1639）。
+    ///
+    /// 呼び出し側は [`State::handle`] の**後**に判定する。NEED_REPLY つきの `SET_PROTOCOL_FEATURES` 自体にも応答するため
+    /// で、失敗した `SET_PROTOCOL_FEATURES` は状態を変えないので直前の確定値で判定される。
+    pub(crate) fn reply_ack(&self) -> bool {
+        self.protocol.is_some_and(|p| p & PROTOCOL_F_REPLY_ACK != 0)
     }
 
     fn any_running(&self) -> bool {

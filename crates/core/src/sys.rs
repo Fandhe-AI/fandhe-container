@@ -1865,6 +1865,10 @@ fn open_tree_clone_raw(node: RawFd) -> Result<OwnedFd, SysError> {
 
 /// `mount_setattr(2)` の `struct mount_attr`（include/uapi/linux/mount.h。`MOUNT_ATTR_SIZE_VER0` = 32 バイト）。
 /// 値は [`rootfs_nodev_mount_attr`]・[`read_only_mount_attr`] だけが作る（任意のビットを渡す経路を持たない。REPAIR-2・SEC-1）。
+///
+/// 構築子はどれも private な固定の `const fn` で、`attr_clr`・`propagation`・`userns_fd` は 0（属性を足すだけ）。
+/// 構築子を足す・変えるときは、[`mount_setattr_empty_path_raw`] の `// SAFETY:` と、構築子の一覧と値を具体値で
+/// 照合する単体テスト `sec1_sup12_mount_attr_constructors_are_exhaustive` を合わせて更新すること（#1693 の事後監査 P3）。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MountAttr {
@@ -1978,8 +1982,11 @@ fn set_mount_read_only_raw(fd: RawFd) -> Result<(), SysError> {
     mount_setattr_empty_path_raw(fd, read_only_mount_attr())
 }
 
-/// `mount_setattr(fd, "", AT_EMPTY_PATH, attr, 32)` の共通本体。`attr` は固定の const 構築子
-/// （[`rootfs_nodev_mount_attr`]・[`read_only_mount_attr`]）の値だけが渡る（本関数は private）。
+/// `mount_setattr(fd, "", AT_EMPTY_PATH, attr, 32)` の共通本体。`attr` は `attr_clr` = 0 の private な固定 const
+/// 構築子（[`rootfs_nodev_mount_attr`]・[`read_only_mount_attr`]）の値だけが渡る（本関数は private）。
+///
+/// 構築子を足すときは、下の `// SAFETY:` と構築子一覧の単体テスト `sec1_sup12_mount_attr_constructors_are_exhaustive`
+/// を合わせて更新する（[`MountAttr`] の doc を参照）。
 #[cfg_attr(test, allow(dead_code))]
 fn mount_setattr_empty_path_raw(fd: RawFd, attr: MountAttr) -> Result<(), SysError> {
     if !consts::SUPPORTED {
@@ -1988,8 +1995,9 @@ fn mount_setattr_empty_path_raw(fd: RawFd, attr: MountAttr) -> Result<(), SysErr
     let nr = consts::SYS_MOUNT_SETATTR.get()?;
     // SAFETY: `fd` は fd 番号の整数で、カーネルが検証する（無効なら `EBADF`）。パスは静的な空文字列（NUL 終端）で、
     // `AT_EMPTY_PATH` により fd 自身が対象になる。`attr` は呼び出しの間生存する 32 バイトの `repr(C)` で、
-    // カーネルは読むだけ（`size` は構造体の大きさ）。属性は `attr_clr` = 0 の固定構築子由来で、
-    // 副作用は fd が指す 1 マウントへの属性の追加（nodev または rdonly）に限る。
+    // カーネルは読むだけ（`size` は構造体の大きさ）。`attr` は `attr_clr` = 0 の private な固定 const 構築子
+    // （`rootfs_nodev_mount_attr`・`read_only_mount_attr`）の値だけが渡り、副作用は fd が指す 1 マウントへの
+    // 属性の追加に限る（既存の属性は外さない）。構築子を足すときは本コメントと構築子一覧の試験を更新する。
     let rc = unsafe {
         syscall(
             nr,

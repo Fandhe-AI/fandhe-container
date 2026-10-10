@@ -14,8 +14,9 @@
 //! - U9・U10（追加承認）: <https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6075711404>。
 //!   U9 `fcntl`（`F_GET_SEALS` / `F_ADD_SEALS`。`syscall(2)` 経由。メモリに触れない。受け取った memfd の縮小封じ込めの確認）・
 //!   U10 `ppoll`（`syscall(2)` 経由の期限つき待機。カーネルは `pollfd` の `revents` と、残り時間を `timespec` へ書き戻す）。
-//! - U11（PLUG-12 の peer credential 検証。PR #1611 のレビュー指摘 P0 への対応。coding-rust.md の `sys` モジュールの事前承認の
-//!   条件に沿って追加）: `getsockopt(SO_PEERCRED)`（`syscall(2)` 経由）。カーネルが `struct ucred` へ書くだけ。
+//! - U11（PLUG-12 の peer credential 検証。PR #1611。#1517 の個別承認〔追認〕）:
+//!   <https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6092697332>。
+//!   `getsockopt(SO_PEERCRED)`（`syscall(2)` 経由）。カーネルが `struct ucred` へ書くだけ。
 //! これを超える `unsafe`（`extern` 宣言の追加を含む）は書かない。`recvmsg` 等を直接 `extern` で宣言せず、すべて
 //! `syscall(2)` 経由にする。
 //!
@@ -870,7 +871,6 @@ mod imp {
         use super::*;
         use std::mem::{align_of, offset_of, size_of};
 
-        /// GPU-6: カーネル ABI の構造体レイアウト（LP64）。
         /// PLUG-12: 同一プロセスの socketpair の相手 UID は自分の euid。
         #[test]
         fn plug12_peer_uid_of_socketpair_is_own_euid() {
@@ -892,6 +892,7 @@ mod imp {
             assert_eq!(size_of::<Ucred>(), 12);
         }
 
+        /// GPU-6: カーネル ABI の構造体レイアウト（LP64）。
         #[test]
         fn gpu6_struct_layout_matches_kernel_abi() {
             assert_eq!(size_of::<Iovec>(), 16);

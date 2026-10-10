@@ -88,7 +88,8 @@ pub(crate) enum SysError {
 /// errno の値（アーキテクチャごとに `consts` で個別定義。alpha / mips / sparc 等は値が違う）。
 pub(crate) use consts::{
     E2BIG, EACCES, EAFNOSUPPORT, EBADF, EBUSY, ECHILD, ECONNREFUSED, EEXIST, EINTR, EINVAL, ELOOP,
-    ENOENT, ENOEXEC, ENOSYS, ENOTDIR, ENOTEMPTY, EOPNOTSUPP, EPERM, EPROTONOSUPPORT, ESRCH,
+    EMFILE, ENFILE, ENOENT, ENOEXEC, ENOMEM, ENOSYS, ENOTDIR, ENOTEMPTY, EOPNOTSUPP, EPERM,
+    EPROTONOSUPPORT, ESRCH,
 };
 
 // # `open(2)` フラグのアーキテクチャ差（Codex P0 指摘〔aarch64 の値が誤り〕への確認記録）
@@ -250,6 +251,10 @@ mod consts {
     pub const ENOEXEC: i32 = 8;
     pub const EBADF: i32 = 9;
     pub const ENOSYS: i32 = 38;
+    // errno-base.h の ENOMEM（12）・ENFILE（23）・EMFILE（24）（`pidfd_open` の失敗理由の分類。#1617）。
+    pub const ENOMEM: i32 = 12;
+    pub const ENFILE: i32 = 23;
+    pub const EMFILE: i32 = 24;
     // include/uapi/linux/stat.h の `S_IFCHR`（文字デバイス。全アーキテクチャ共通）。
     pub const S_IFCHR: u32 = 0o020_000;
 
@@ -483,6 +488,10 @@ mod consts {
     pub const ENOEXEC: i32 = 8;
     pub const EBADF: i32 = 9;
     pub const ENOSYS: i32 = 38;
+    // errno-base.h の ENOMEM（12）・ENFILE（23）・EMFILE（24）（`pidfd_open` の失敗理由の分類。#1617）。
+    pub const ENOMEM: i32 = 12;
+    pub const ENFILE: i32 = 23;
+    pub const EMFILE: i32 = 24;
     // include/uapi/linux/stat.h の `S_IFCHR`（文字デバイス。全アーキテクチャ共通）。
     pub const S_IFCHR: u32 = 0o020_000;
 
@@ -670,6 +679,9 @@ mod consts {
     pub const E2BIG: i32 = -10;
     pub const ENOEXEC: i32 = -11;
     pub const ENOSYS: i32 = -12;
+    pub const ENOMEM: i32 = -18;
+    pub const ENFILE: i32 = -19;
+    pub const EMFILE: i32 = -20;
     pub const EBADF: i32 = -13;
     pub const S_IFCHR: u32 = 0;
 
@@ -3000,7 +3012,8 @@ pub(crate) fn kill_pid(pid: u32, sig: Signal) -> Result<(), SysError> {
 /// fork 直後（回収前）に呼ぶと、以後 `pid` が回収・再利用されても fd は元のプロセスを指し続ける。
 /// [`pidfd_send_signal`] で送れば、契約外の回収者による回収後の pid 再利用でも無関係なプロセスへ
 /// シグナルが届かない（CORE-1・CORE-2・TASK-30.1）。未対応カーネル・seccomp 等で開けない場合は
-/// `ENOSYS` / `EPERM` 等を返す（呼び出し側が `kill(2)` へ退避する）。fd は close-on-exec で返る。
+/// `ENOSYS` / `EPERM` 等を返す（呼び出し側が `kill(2)` へ退避する）。失敗理由の分類（未対応・拒否・資源枯渇）と
+/// 観測は呼び出し側（`exec::ContainerChild`。#1617）が行い、ここでは errno をそのまま返す。fd は close-on-exec で返る。
 pub(crate) fn pidfd_open(pid: u32) -> Result<OwnedFd, SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);

@@ -165,8 +165,8 @@ pub use process::spawn_container_seccomp_probe;
 pub use process::{
     ChildExit, ContainerChild, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV,
     ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES, EXIT_EXEC_NOT_EXECUTABLE,
-    EXIT_EXEC_NOT_FOUND, EXIT_SETUP_FAILED, Entrypoint, ExecExit, SignalDelivery, exec_entrypoint,
-    spawn_container, spawn_container_with_stages,
+    EXIT_EXEC_NOT_FOUND, EXIT_SETUP_FAILED, Entrypoint, ExecExit, LaunchPidfdUnavailable,
+    SignalDelivery, exec_entrypoint, spawn_container, spawn_container_with_stages,
 };
 /// 結合試験 `tests/exec_child_setup.rs` 専用の再公開（SUP-6・TASK-163 追補・#1456。通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(all(feature = "exec-test-support", not(test)))]

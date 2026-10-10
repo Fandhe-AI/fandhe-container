@@ -2910,7 +2910,7 @@ mod write_nonblocking_flag_tests {
     }
 
     /// 相手が閉じた socket への送信は `EPIPE`（`BrokenPipe`）で戻る。試験プロセスは `SIGPIPE` を無視しているため、
-    /// `SIGPIPE` が出ないことそのものは下の `repair5_send_to_closed_peer_raises_no_sigpipe_under_sig_dfl` で照合する。
+    /// `SIGPIPE` が出ないことそのものは下の `repair5_send_to_shut_down_socket_raises_no_sigpipe_under_sig_dfl` で照合する。
     #[test]
     fn repair5_send_to_closed_peer_returns_epipe() {
         let (a, b) = UnixStream::pair().unwrap();
@@ -2919,43 +2919,46 @@ mod write_nonblocking_flag_tests {
         assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
     }
 
-    /// 子プロセスで閉じた相手へ書く方法。
+    /// 子プロセスで送信側を閉じた socket へ書く方法。
     #[derive(Clone, Copy)]
     enum ChildWrite {
-        /// 読み手を閉じた無名 pipe への std の `write(2)`（`SIGPIPE` の抑止手段が無い）。`SIG_DFL` が効いていることの
+        /// 同じ socket を `File` として `write(2)` で書く（`MSG_NOSIGNAL` 相当の抑止が無い）。`SIG_DFL` が効いていることの
         /// 対照に使う（std の `UnixStream` の書き込みは自前で `MSG_NOSIGNAL` を付けるため対照にならない）。
-        PlainPipeWrite,
+        PlainWrite,
         /// 本体の `write_nonblocking`（`send(MSG_DONTWAIT | MSG_NOSIGNAL)`）。
         WriteNonblocking,
     }
 
-    /// `SIGPIPE` が `SIG_DFL` の子プロセスで、相手が閉じた出力先（`how` に応じて AF_UNIX stream か無名 pipe）へ
-    /// 1 回書き、終了状態を返す。
+    /// `SIGPIPE` が `SIG_DFL` の子プロセスで、送信側を `shutdown(Write)` した AF_UNIX stream へ `how` で 1 回書き、
+    /// 終了状態を返す。
+    ///
+    /// 相手の close ではなく自分側の `shutdown` で `EPIPE` を作るのは、並行する他の試験の fork（exec 前の子）が
+    /// 相手側の fd の複製を一時的に持っても結果が変わらないようにするため（`shutdown` は socket そのものの状態で、
+    /// fd の複製の有無に依らない。Linux の `unix_stream_sendmsg` は `SEND_SHUTDOWN` で `EPIPE` と `SIGPIPE` を返す）。
     ///
     /// std の `Command` は fork 後・exec 前の子で `SIGPIPE` を `SIG_DFL` に戻してから `pre_exec` のクロージャを
     /// 実行する（std `sys/process/unix/unix.rs` の `do_exec`。`-Zon-broken-pipe` 不使用時）。そのため書き込みが
     /// `SIGPIPE` を出せば子は exec 前にシグナル 13 で終わり、`EPIPE` で戻れば `/bin/true` を exec して終了コード 0 になる。
     /// それ以外の結果はクロージャが `EPROTO` を返し、spawn の失敗として親へ届く。
-    fn write_to_closed_peer_in_child(how: ChildWrite) -> std::process::ExitStatus {
+    fn write_to_shut_down_socket_in_child(how: ChildWrite) -> std::process::ExitStatus {
         use std::io::Write;
         use std::os::unix::process::CommandExt;
         const EPROTO: i32 = 71;
-        let (a, b) = UnixStream::pair().unwrap();
-        let (r, w) = io::pipe().unwrap();
-        // exec 前の子から見ても相手が閉じているよう、spawn の前に閉じる。
-        drop(b);
-        drop(r);
+        let (a, _b) = UnixStream::pair().unwrap();
+        a.shutdown(std::net::Shutdown::Write).unwrap();
+        // 同じ socket を `write(2)` で書くための `File`（安全な所有の変換で、unsafe を使わない）。
+        let raw = File::from(std::os::fd::OwnedFd::from(a.try_clone().unwrap()));
         let mut cmd = std::process::Command::new("/bin/true");
         // SAFETY: クロージャは fork 後・exec 前の子（親の呼び出しスレッドだけの複製）で実行される。呼ぶのは
         // `getsockopt(2)`・`send(2)`・`write(2)` と errno の読み出しだけで、割り当て・ロック・panic をしない
-        // （`io::Error` は `Repr::Os`・`Simple` で割り当てない）。捕捉する `a`（`UnixStream`）・`w`（`PipeWriter`）は
+        // （`io::Error` は `Repr::Os`・`Simple` で割り当てない）。捕捉する `a`（`UnixStream`）・`raw`（`File`）は
         // `Send + Sync` を所有で移し、`how` は Copy 値のため `Send + Sync + 'static` を満たす。fd は所有中（`Command` の
         // 破棄まで）開いている。
         // 試験専用（`cfg(test)`）で、本体の経路は `pre_exec` を使わない。
         unsafe {
             cmd.pre_exec(move || {
                 let r = match how {
-                    ChildWrite::PlainPipeWrite => (&w).write(b"x\n"),
+                    ChildWrite::PlainWrite => (&raw).write(b"x\n"),
                     ChildWrite::WriteNonblocking => write_nonblocking(&a, b"x\n"),
                 };
                 match r {
@@ -2967,21 +2970,21 @@ mod write_nonblocking_flag_tests {
         super::pdeathsig_tests::wait_bounded(cmd.spawn().unwrap())
     }
 
-    /// 対照: `SIG_DFL` の子で読み手を閉じた pipe へ `write(2)` を呼ぶとシグナル 13（`SIGPIPE`）で終わる。下の試験が
+    /// 対照: `SIG_DFL` の子で送信側を閉じた socket へ `write(2)` を呼ぶとシグナル 13（`SIGPIPE`）で終わる。下の試験が
     /// `SIG_DFL` の下で行われていること（std が子で `SIGPIPE` を戻していること）を実行時に確かめる。
     #[test]
-    fn repair12_plain_write_to_closed_peer_raises_sigpipe_under_sig_dfl() {
+    fn repair12_plain_write_to_shut_down_socket_raises_sigpipe_under_sig_dfl() {
         use std::os::unix::process::ExitStatusExt;
-        let status = write_to_closed_peer_in_child(ChildWrite::PlainPipeWrite);
+        let status = write_to_shut_down_socket_in_child(ChildWrite::PlainWrite);
         assert_eq!((status.code(), status.signal()), (None, Some(13)));
     }
 
-    /// PLUG-7・REPAIR-5・REPAIR-12: `SIGPIPE` が `SIG_DFL` でも `write_nonblocking` は閉じた相手へ `EPIPE` で戻り、
+    /// PLUG-7・REPAIR-5・REPAIR-12: `SIGPIPE` が `SIG_DFL` でも `write_nonblocking` は送信側を閉じた socket へ `EPIPE` で戻り、
     /// プロセスを終わらせない（`MSG_NOSIGNAL` が送信の呼び出しから外れると、子がシグナル 13 で終わりこの試験が落ちる）。
     #[test]
-    fn repair5_send_to_closed_peer_raises_no_sigpipe_under_sig_dfl() {
+    fn repair5_send_to_shut_down_socket_raises_no_sigpipe_under_sig_dfl() {
         use std::os::unix::process::ExitStatusExt;
-        let status = write_to_closed_peer_in_child(ChildWrite::WriteNonblocking);
+        let status = write_to_shut_down_socket_in_child(ChildWrite::WriteNonblocking);
         assert_eq!((status.code(), status.signal()), (Some(0), None));
     }
 

@@ -886,10 +886,14 @@ mod imp {
             assert_eq!(peer_uid(f.as_fd()), Err(SysError::Os(88)));
         }
 
-        /// PLUG-12: `struct ucred` のレイアウト。
+        /// PLUG-12: `struct ucred` のレイアウト（`{__u32 pid, uid, gid}` と同じ 12 バイト・整列 4・`uid` は 4 バイト目）。
         #[test]
         fn plug12_ucred_layout() {
             assert_eq!(size_of::<Ucred>(), 12);
+            assert_eq!(align_of::<Ucred>(), 4);
+            assert_eq!(offset_of!(Ucred, pid), 0);
+            assert_eq!(offset_of!(Ucred, uid), 4);
+            assert_eq!(offset_of!(Ucred, gid), 8);
         }
 
         /// GPU-6: カーネル ABI の構造体レイアウト（LP64）。
@@ -1055,10 +1059,11 @@ mod imp {
             assert_eq!(align_of::<CmsgBuf>(), 8);
         }
 
-        /// GPU-6: 実行中アーキの定数の固定値（一次情報との照合結果）。
+        /// GPU-6・PLUG-12: 実行中アーキの定数の固定値（一次情報との照合結果。`SO_PEERCRED` と `NR_GETSOCKOPT` は U11）。
         #[test]
         fn gpu6_constants_fixed_values() {
             assert_eq!(SOL_SOCKET, 1);
+            assert_eq!(SO_PEERCRED, 17);
             assert_eq!(SCM_RIGHTS, 1);
             assert_eq!(SCM_PIDFD, 4);
             assert_eq!(MSG_CTRUNC, 0x8);
@@ -1085,9 +1090,10 @@ mod imp {
                     NR_MUNMAP,
                     NR_MEMFD_CREATE,
                     NR_FCNTL,
-                    NR_PPOLL
+                    NR_PPOLL,
+                    NR_GETSOCKOPT
                 ),
-                (46, 47, 9, 11, 319, 72, 271)
+                (46, 47, 9, 11, 319, 72, 271, 55)
             );
             #[cfg(target_arch = "aarch64")]
             assert_eq!(
@@ -1098,9 +1104,10 @@ mod imp {
                     NR_MUNMAP,
                     NR_MEMFD_CREATE,
                     NR_FCNTL,
-                    NR_PPOLL
+                    NR_PPOLL,
+                    NR_GETSOCKOPT
                 ),
-                (211, 212, 222, 215, 279, 25, 73)
+                (211, 212, 222, 215, 279, 25, 73, 209)
             );
         }
     }

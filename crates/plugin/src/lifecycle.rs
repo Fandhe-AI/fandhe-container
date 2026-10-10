@@ -31,7 +31,7 @@
 //!   孫が残り得る）または直接の子の未回収（`Unreaped`）が起きた場合、stderr へ 1 行の JSON
 //!   （`{"event":"plugin_child_cleanup","op":"drop","outcome":"error","reason":"group_kill_failed"|"unreaped"}`。
 //!   `unreaped` のみ保持中の `pid` を整数で付す）を 1 回だけ出す。ブロックしないことを保証できる出力先（Linux の
-//!   socket・無名 pipe。`crate::sys` の `write_nonblocking`）でだけ書き、それ以外（macOS を含む）は捨てる。書き込み失敗は無視し、plugin 由来の文字列は
+//!   socket。`crate::sys` の `write_nonblocking`）でだけ書き、それ以外（pipe・端末・通常ファイル・macOS）は捨てる。書き込み失敗は無視し、plugin 由来の文字列は
 //!   載せない。`unreaped_error` で報告済みの子と、`Drop` の前に明示的な経路で手放した子（回収済み・他所で回収された
 //!   `Lost`。そこで返したグループ停止の失敗を含む）は記録しない。
 //! - 子の環境変数は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ設定する（資格情報を継承させない）。
@@ -1612,43 +1612,42 @@ mod tests {
         assert!(start.elapsed() < Duration::from_millis(100));
     }
 
-    /// REPAIR-5・PLUG-7・#1605: 満杯の pipe（ブロッキングのまま）でも戻り、共有 fd を非ブロッキング化しない。
-    /// 試験の実行時は `SIGPIPE` が無視されている（Rust の実行時の既定）ため、pipe 経路が書き込みまで進む。
+    /// REPAIR-5・PLUG-7・#1605: 無名 pipe は `/proc` 経由の開き直し（絶対パスの解決が止まり得る）と `SIGPIPE` を
+    /// 避けられないため書かず `Unsupported`。期限内に戻り、読み手には何も届かず、共有 fd も非ブロッキング化しない。
     #[test]
     #[cfg(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
-    fn repair5_drop_log_does_not_block_on_full_pipe() {
+    fn repair5_drop_log_discards_on_anonymous_pipe() {
+        use std::io::Read;
         use std::os::unix::io::AsRawFd;
-        let (_r, w) = io::pipe().unwrap();
-        // `write_nonblocking` 自身で満杯にする（書けなくなった時点で `WouldBlock`）。ブロックするなら
-        // ここで固まるため、テスト全体の timeout が検出する。
-        let start = Instant::now();
+        let (mut r, w) = io::pipe().unwrap();
         let line = GROUP_KILL_FAILED_LINE.as_bytes();
-        loop {
-            match crate::sys::write_nonblocking(&w, line) {
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => panic!("write failed: {e}"),
-            }
-            assert!(start.elapsed() < Duration::from_secs(10));
-        }
+        let start = Instant::now();
+        let res = crate::sys::write_nonblocking(&w, line);
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::Unsupported);
         let start = Instant::now();
         write_drop_log(&w, line);
-        assert!(start.elapsed() < Duration::from_millis(500));
+        assert!(start.elapsed() < Duration::from_millis(100));
         // 共有 description のフラグ（`O_NONBLOCK` = 0o4000）は変わっていない。
-        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", w.as_raw_fd())).unwrap();
-        let flags = info
-            .lines()
-            .find_map(|l| l.strip_prefix("flags:"))
-            .map(|v| i64::from_str_radix(v.trim(), 8).unwrap())
-            .unwrap();
-        assert_eq!(flags & 0o4000, 0);
+        let flags_of = |fd: i32| {
+            let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).unwrap();
+            info.lines()
+                .find_map(|l| l.strip_prefix("flags:"))
+                .map(|v| i64::from_str_radix(v.trim(), 8).unwrap())
+                .unwrap()
+        };
+        assert_eq!(flags_of(w.as_raw_fd()) & 0o4000, 0);
+        // 何も書かれていない（書き込み端を閉じた後の読み出しは即座に EOF の 0 バイト）。
+        drop(w);
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, Vec::<u8>::new());
     }
 
-    /// REPAIR-5・PLUG-7・#1605: 名前付き FIFO は置き場所の NFS / FUSE で開き直しが止まり得るため、
-    /// 無名 pipe と違い開き直さず `Unsupported`（診断は捨て、読み手には何も届かない）。
+    /// REPAIR-5・PLUG-7・#1605: 名前付き FIFO も書かず `Unsupported`（診断は捨て、読み手には何も届かない）。
     #[test]
     #[cfg(all(
         target_os = "linux",

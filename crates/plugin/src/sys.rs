@@ -32,10 +32,10 @@
 //!   対応外の OS・アーキテクチャは `Unsupported`
 //! - macOS の RSS 取得（TASK-112.1・#265）: `proc_pidinfo(PROC_PIDTASKINFO)`（`resident_size_bytes`。`crate::rss` から呼ばれる）
 //! - Linux・macOS: `killpg(2)`（`kill_process_group`。plugin の子のプロセスグループへ `SIGKILL`。#1311。それ以外の unix は `Unsupported`）
-//! - Linux（x86_64 / aarch64）: ブロックしないことを保証できる経路（ソケットは `send(MSG_DONTWAIT)`、無名 pipe は
-//!   `/proc/self/fd` の `O_NONBLOCK` 開き直し。種別判定は `getsockopt` / `fcntl` / procfs の readlink で `fstat` は
-//!   使わず、fd も複製しない）でだけ fd へ書く（`write_nonblocking`。`ChildGuard::drop` の診断出力がブロックしない。
-//!   #1605。保証できなければ捨てる）。macOS を含むそれ以外は保証できる経路が無いため常に捨てる（`Unsupported`）
+//! - Linux（x86_64 / aarch64）: ブロックしないことを保証できる socket（`getsockopt(SO_TYPE)` で判定し
+//!   `send(MSG_DONTWAIT | MSG_NOSIGNAL)`。パス解決・`fstat`・fd の複製をしない）でだけ fd へ書く（`write_nonblocking`。
+//!   `ChildGuard::drop` の診断出力がブロックしない。#1605）。socket 以外と、macOS を含むそれ以外の OS は保証できる
+//!   経路が無いため常に捨てる（`Unsupported`）
 //! - Linux（x86_64 / aarch64）・macOS: `waitid(2)`（`WEXITED | WNOHANG | WNOWAIT`。`probe_child_exit`。自発終了した plugin を回収せずに
 //!   観測し、グループへ送ってから回収するため。#1604・PLUG-7・REPAIR-5。それ以外は `Unsupported`）
 //! - いずれの unix: `kill(2)` で起動中の plugin へ SIGINT・SIGTERM・SIGHUP を転送する（`send_signal`。
@@ -178,23 +178,6 @@ const SOL_SOCKET: i32 = 1;
 ))]
 const SO_TYPE: i32 = 3;
 
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-unsafe extern "C" {
-    // SAFETY（宣言そのものの妥当性）: `int fcntl(int fd, int cmd, ...)`。`F_GETPIPE_SZ` は追加引数を取らない。
-    #[link_name = "fcntl"]
-    fn c_fcntl(fd: i32, cmd: i32, ...) -> i32;
-}
-
-/// Linux の `F_GETPIPE_SZ`（`F_LINUX_SPECIFIC_BASE` 1024 + 8。x86_64・aarch64 共通）。
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-const F_GETPIPE_SZ: i32 = 1032;
-
 /// `MSG_DONTWAIT`（呼び出し 1 回限りの非ブロッキング送信。Linux の x86_64・aarch64 とも 0x40）。
 #[cfg(all(
     target_os = "linux",
@@ -209,13 +192,6 @@ const MSG_NOSIGNAL: i32 = 0x4000;
 /// Linux aarch64 の `MSG_NOSIGNAL`（x86_64 と同じ 0x4000。値が同じでも流用せず個別に定義する）。
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const MSG_NOSIGNAL: i32 = 0x4000;
-
-/// `O_NONBLOCK | O_NOCTTY`（Linux の x86_64・aarch64 とも `O_NONBLOCK` は 0o4000、`O_NOCTTY` は 0o400）。
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-const O_NONBLOCK_NOCTTY: i32 = 0o4000 | 0o400;
 
 /// fd が socket か（`getsockopt(SO_TYPE)`）。fd 単位のカーネル内判定で、ファイルシステムへ問い合わせない
 /// （`fstat` は FUSE / NFS で無期限に止まり得るため使わない。#1605・REPAIR-5）。socket 以外は `ENOTSOCK` で `false`。
@@ -240,102 +216,27 @@ fn is_socket_fd(fd: i32) -> bool {
     rc == 0
 }
 
-/// fd が pipe / FIFO か（Linux の `fcntl(F_GETPIPE_SZ)`。pipe 以外は `EBADF` / `EINVAL`）。`fstat` を使わない。
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-fn is_pipe_fd(fd: i32) -> bool {
-    // SAFETY: 引数は整数のみで、fd 単位のカーネル内問い合わせ（読み取りのみ）。メモリ安全性の前提は無い。
-    unsafe { c_fcntl(fd, F_GETPIPE_SZ) >= 0 }
-}
-
-/// `/proc/thread-self/fd/<fd>` のリンク先が無名 pipe（pipefs の `pipe:[<ino>]`）か。名前付き FIFO は絶対パスになり
-/// `false`（#1605・REPAIR-5）。
-///
-/// procfs の fd リンクの readlink はメモリ上の dentry から名前を組み立てるだけで（`d_path`）、リンク先の
-/// ファイルシステムへ問い合わせない。名前付き FIFO を開き直すと、その FIFO が置かれた NFS / FUSE の
-/// 権限確認・属性再検証で止まり得るため、この判定を通った無名 pipe だけを開き直す。
-///
-/// 残存リスク（未対策・実機未確認）: パス解決ではルート FS 上の `/proc` 要素を辿るため、ルートが FUSE / NFS
-/// （chroot・rootless の rootfs 等）だと `proc` の dentry の再検証で問い合わせが起き得る。対策案は起動時に
-/// `/proc/thread-self/fd` の dirfd を保持して `openat` 基準で解決すること。
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-fn is_anonymous_pipe_link(proc_fd_path: &std::path::Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    std::fs::read_link(proc_fd_path)
-        .map(|target| target.as_os_str().as_bytes().starts_with(b"pipe:["))
-        .unwrap_or(false)
-}
-
-/// `/proc/thread-self/status` の内容から、`SIGPIPE` が無視（`SIG_IGN`）されているかを読む（#1605・REPAIR-5・PLUG-7）。
-///
-/// `SigIgn:` 行の 16 進のマスクで、`SIGPIPE`（Linux の x86_64・aarch64 とも 13）は bit 12。行が無い・読めない
-/// 場合は `false`（無視されていない側に倒す。fail-closed）。
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-fn sigpipe_ignored_in_status(status: &str) -> bool {
-    /// `SIGPIPE` のシグナル番号（Linux x86_64・aarch64 とも 13。`asm-generic/signal.h`）。
-    const SIGPIPE: u32 = 13;
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("SigIgn:"))
-        .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
-        .is_some_and(|mask| mask & (1u64 << (SIGPIPE - 1)) != 0)
-}
-
-/// 呼び出し時点で自プロセスの `SIGPIPE` が無視されているか（`/proc/thread-self/status` の `SigIgn`）。
-/// シグナルの処分はプロセス全体で共有されるため、どのスレッドの status でも同じ値になる。読めなければ `false`。
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-fn sigpipe_ignored() -> bool {
-    std::fs::read_to_string("/proc/thread-self/status")
-        .map(|status| sigpipe_ignored_in_status(&status))
-        .unwrap_or(false)
-}
-
 /// ブロックしないことを保証できる経路でだけ `fd` へ `buf` を 1 回書く。保証できなければ書かない（#1605・REPAIR-5・PLUG-7）。
 ///
-/// `crate::lifecycle` の `ChildGuard::drop` が診断 1 行を stderr へ出すために呼ぶ。共有 fd の
-/// open file description（親・他プロセスと共有される）の状態は変えない。`poll(POLLOUT)` は空き容量を
-/// 予約せず poll と write の間に他者が満たし得るため使わない。種別判定は `fstat` / `metadata()` を使わず
-/// fd 単位のカーネル内問い合わせ（`getsockopt` / `fcntl`）と procfs の readlink だけで行い、応答しない
-/// FUSE / NFS 上の fd でも判定自体が止まらない。
+/// `crate::lifecycle` の `ChildGuard::drop` が診断 1 行を stderr へ出すために呼ぶ。書くのは `fd` が socket
+/// （journald 等）のときだけで、`send(MSG_DONTWAIT | MSG_NOSIGNAL)` の 1 回限りの指定で待たず、相手が閉じていても
+/// `SIGPIPE` を出さない（共有 fd の open file description の状態は変えない）。判定は fd 単位のカーネル内問い合わせ
+/// （`getsockopt(SO_TYPE)`）だけで、パス解決・`fstat` を一切行わず、fd も複製しない（複製の close は NFS の書き戻し・
+/// `FUSE_FLUSH` で止まり得るため）。
 ///
-/// `fd` は複製しない。複製を閉じると NFS（未書き出しページの書き戻し）・FUSE（`FUSE_FLUSH`）では close の
-/// たびにファイルシステムの flush が走り、捨てる経路でも止まり得るため。閉じるのは無名 pipe を開き直した
-/// fd（pipefs。flush を持たない）だけである。
-/// - ソケット（journald 等への stderr）: `send(MSG_DONTWAIT)`。この呼び出しだけ非ブロッキング
-/// - ソケットへは `MSG_NOSIGNAL` も付け、相手が閉じていても `SIGPIPE` を出さず `EPIPE` を返す
-/// - Linux の無名 pipe: `/proc/thread-self/fd/N` を `O_NONBLOCK` で開き直した別 description へ書く
-///   （共有側のフラグは変わらない。満杯なら `WouldBlock`、読み手が無ければ open が `ENXIO`）。`/proc/self` は
-///   スレッドグループのリーダーの fd 表を指し、`unshare(CLONE_FILES)` したスレッドでは別の fd になるため
-///   呼び出しスレッド自身の fd 表を指す `thread-self` を使う。開いた fd が pipe でなければ書かない。
-///   open と write の間に読み手が閉じると `EPIPE` と `SIGPIPE` になり、write 1 回だけに効く `MSG_NOSIGNAL`
-///   相当の手段が無いため、`SIGPIPE` が無視されている（`/proc/thread-self/status` の `SigIgn`）ときだけ書き、
-///   既定動作・ハンドラ登録のときは書かず `Unsupported`（library としてホストの設定を仮定しない）
-/// - 上記以外（通常ファイル・キャラクタデバイス・名前付き FIFO 等）: 通常ファイルは
-///   FUSE / NFS・FS freeze で、キャラクタデバイスは CUSE 等の open / write で、名前付き FIFO は置き場所の
-///   NFS / FUSE での開き直し時の権限確認で無期限に止まり得て `O_NONBLOCK` でも防げず、保証できないため
-///   書かず `Unsupported`（診断は捨てる）
+/// socket 以外は書かず `Unsupported`（診断は捨てる）。待たないことを保証できないため:
+/// - 通常ファイル: 応答しない FUSE / NFS・FS freeze で同期 write が止まり、`O_NONBLOCK` でも防げない
+/// - キャラクタデバイス: CUSE 等で open / write がユーザー空間のデーモンを待ち得る
+/// - pipe / FIFO: 共有 description を変えずに待たないには `/proc` 経由で開き直す必要があり、その絶対パスの
+///   解決がルート FS（FUSE / NFS の rootfs 等）の再検証で止まり得る。加えて write の直前に読み手が閉じると
+///   `SIGPIPE` になり、write 1 回だけに効く抑止手段が無い
 ///
 /// Linux（x86_64 / aarch64）以外は常に書かず `Unsupported`（下の別定義）。macOS では満杯のブロッキング socket への
 /// `send(MSG_DONTWAIT)` が戻らないことを CI で観測した（#1605）ため、socket も含めて保証できる経路が無い。
 ///
 /// 満杯なら `WouldBlock`。部分書き込みも有り得るため書けたバイト数を返す。std の stderr ロックは取らない。
-/// 前提:
-/// - 呼び出し中に別スレッドが同じ fd 番号を `dup2` 等で差し替えない。崩れた場合、判定と開き直しの間に
-///   差し替わった対象を辿り、対象が NFS / FUSE 上なら open で止まり得る（開いた fd が pipe でなければ書かない
-///   ため、通常ファイルを上書きすることはない）
-/// - pipe 経路で `SigIgn` を確かめてから write するまでの間に、別スレッドが `SIGPIPE` の処分を変えない
-///   （崩れた場合、その間に読み手も閉じると `SIGPIPE` が届き得る。`dup2` の前提と同じ種類の窓）
+/// 前提: 判定と送信の間に別スレッドが同じ fd 番号を `dup2` 等で socket 以外へ差し替えると、`send` は
+/// `ENOTSOCK` のエラーで戻る（待たず、書きもしない）。
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -348,21 +249,6 @@ pub(crate) fn write_nonblocking(fd: &impl AsFd, buf: &[u8]) -> io::Result<usize>
         // `SIGPIPE` を出さない（library としてホストのシグナル設定に依存しない）。
         let w = unsafe { c_send(raw, buf.as_ptr(), buf.len(), MSG_DONTWAIT | MSG_NOSIGNAL) };
         return usize::try_from(w).map_err(|_| io::Error::last_os_error());
-    }
-    if is_pipe_fd(raw) && sigpipe_ignored() {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let path = std::path::PathBuf::from(format!("/proc/thread-self/fd/{raw}"));
-        if is_anonymous_pipe_link(&path) {
-            let mut private = std::fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(O_NONBLOCK_NOCTTY)
-                .open(path)?;
-            // 判定と open の間に fd が差し替わった場合に、pipe 以外（通常ファイル等）へ書かない。
-            if is_pipe_fd(private.as_raw_fd()) {
-                return private.write(buf);
-            }
-        }
     }
     Err(io::Error::from(io::ErrorKind::Unsupported))
 }
@@ -3000,32 +2886,6 @@ mod write_nonblocking_flag_tests {
         assert_eq!(MSG_DONTWAIT | MSG_NOSIGNAL, 0x4040);
         assert_eq!(SOL_SOCKET, 1);
         assert_eq!(SO_TYPE, 3);
-        assert_eq!(F_GETPIPE_SZ, 1032);
-        assert_eq!(O_NONBLOCK_NOCTTY, 0o4400);
-    }
-
-    /// `SigIgn` の bit 12（`SIGPIPE` = 13）だけを見る。隣の bit・欠けた行・壊れた値は無視されていない側に倒す。
-    #[test]
-    fn repair5_sigpipe_ignored_parses_sigign_bit_12() {
-        let status = |mask: &str| {
-            format!("Name:\tx\nSigBlk:\t0000000000001000\nSigIgn:\t{mask}\nSigCgt:\t0\n")
-        };
-        assert!(sigpipe_ignored_in_status(&status("0000000000001000")));
-        assert!(sigpipe_ignored_in_status(&status("0000000000001001")));
-        assert!(!sigpipe_ignored_in_status(&status("0000000000000000")));
-        assert!(!sigpipe_ignored_in_status(&status("0000000000000800")));
-        assert!(!sigpipe_ignored_in_status(&status("0000000000002000")));
-        assert!(!sigpipe_ignored_in_status(&status("zz")));
-        assert!(!sigpipe_ignored_in_status(
-            "Name:\tx\nSigBlk:\t0000000000001000\n"
-        ));
-    }
-
-    /// 試験の実行時（Rust の実行時は起動時に `SIGPIPE` を `SIG_IGN` にする）では実際の status から真を読む。
-    /// これが pipe 経路の試験（`lifecycle` の満杯 pipe 試験）が書き込みまで進む前提になる（陽性対照）。
-    #[test]
-    fn repair5_sigpipe_is_ignored_in_test_process() {
-        assert!(sigpipe_ignored());
     }
 
     /// 相手が閉じた socket への送信は `EPIPE`（`BrokenPipe`）で戻る。`SIGPIPE` が出ないことそのものは、試験の実行時が

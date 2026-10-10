@@ -739,8 +739,11 @@ jobs:
           echo "::notice::tmpfs_mount verified"
 
       # inject_files（`crates/core/tests/inject_files.rs`。SUP-12・TASK-169.4.2・#1473）:
-      # secrets / configs の専用 tmpfs への注入・read-only 再マウント・EROFS による書き込み拒否・
+      # secrets / configs の専用 tmpfs への注入・`mount_setattr(2)` による読み取り専用化
+      # （`MOUNT_ATTR_RDONLY`。fsmount で得たマウントのルート fd 起点・`AT_EMPTY_PATH`。#1620）・
+      # 同じ superblock のマウントが注入先の 1 枚だけであること・EROFS による書き込み拒否・
       # 失敗時の後始末・内容がホストのディスクへ出ないことを検証する実機前提テスト（harness = false）。
+      # Linux 5.12 以降が要る（未対応カーネルは mount(2) へ縮退せず unimplemented で拒否する）。
       # tmpfs_mount と同じく上で緩和した sysctl を再利用し、新しい check-run・sudo・permissions は
       # 追加しない（rootless 経路のみ。rootful 経路は未検証）。成功行を grep で照合する。
       - name: inject_files のビルド（実行タイムアウトの時間枠を消費しないよう分離）

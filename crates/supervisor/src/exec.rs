@@ -125,6 +125,15 @@
 //!   失敗時は所属が不定のため、呼び出し側は続行せず終了する（fail-closed）。保持 fd は子が `execve` の前に
 //!   `close_range` で閉じる（core の `exec/process.rs`）
 //!
+//! - **本番の記録先**（SEC-4・SUP-6・TASK-163 追補・#1594）: [`default_audit_sink`] が状態ルート（`StateRoot::resolve` の規則）
+//!   を開き、`<状態ルート>/@audit.log` へ追記する core の `FileAuditSink`（主経路: ファイル、代替: カーネル監査）を返す。
+//!   両経路が失敗したときの固定スキーマ 1 行の stderr 通知は sink が 1 回だけ出す責務を持ち、呼び出し側は
+//!   `AuditDelivery::SinkFailed` を受けても二重に出さない。拒否は覆らない
+//! - **`entrypoint_mode` の縮退は監査ログに残さない**（#1594 の判断）: 監査ログは分離違反の **試行** の記録で、
+//!   現行方式への縮退は実行環境による方式の選択であり違反ではない。`AuditEvent::ExecTarget` は拒否専用で、載せるには
+//!   層・ワイヤー DTO の変更が要る（#652 の共通ログ型と合わせて決める）。縮退の事実は worker の構造化ログ
+//!   （`supervisor.exec` / `entrypoint_mode`）と [`ExecOutcome::entrypoint_mode`] で観測できる。worker で sink の I/O を
+//!   しない契約にも反する。entrypoint 種別の違反の記録は #1595
 //! - **監査記録**（SEC-4・SUP-6・TASK-163 追補・#1465）: [`run_command`] は監査の記録先 [`AuditSink`] を必須の
 //!   引数に取り、exec の対象の拒否（種別 `exec_target`。理由 `exec_target_*`・`exec_root_not_container_rootfs`・
 //!   `exec_joined_*`・`exec_target_pidfd_mismatch` の 10 種）を層 `exec_target` のレコードとして **1 拒否につき 1 件**
@@ -183,13 +192,15 @@
 //!   同じく `/dev/null` へ固定し、cwd・ユーザーの指定も未対応（cwd はコンテナの rootfs の根。`config.json` の
 //!   `process.user.additionalGids` の解釈〔指定したグループの付与〕も launch・exec とも未実装で、補助グループは
 //!   常に空）
-//! - 違反記録（SEC-4）の監査ログへの保存のうち、本番の `AuditSink` の実体（`AuditFileWriter` とカーネル監査
-//!   フォールバックを束ねたもの）の生成と、CLI・supervisor から [`run_command`] へ渡す配線（TASK-29 / TASK-157 系）。
-//!   層 `exec_target` と [`run_command`] での 1 拒否 1 件の記録は実装済み（#1465）。`ExecOutcome::exit` が運ぶ
-//!   `execve` 前の違反（`SetupFailed`。種別 `entrypoint`）の層 `entrypoint` での記録も実装済み（#1595）。未実装なのは
+//! - 違反記録（SEC-4）の監査ログへの保存のうち、CLI の exec コマンド・TASK-161 の healthcheck（#492・#495）から
+//!   [`run_command`] へ [`default_audit_sink`] の sink を渡す配線（本番 launcher の構成〔#1314〕に従う）。本番の
+//!   `AuditSink` の実体（`FileAuditSink`）と生成の入口 [`default_audit_sink`] は実装済み（#1594）。層 `exec_target` と
+//!   [`run_command`] での 1 拒否 1 件の記録は実装済み（#1465）。`ExecOutcome::exit` が運ぶ `execve` 前の違反
+//!   （`SetupFailed`。種別 `entrypoint`）の層 `entrypoint` での記録も実装済み（#1595）。未実装なのは
 //!   launch 経路（`spawn_container` の子・launcher）で同じ理由が生じたときの記録の配線（#1314。core の
 //!   `exec::audit_entrypoint_violation`）。種別 `mount_target` の `target_moved` は launch の `pivot_root` 前だけで
-//!   生じ、exec の子では生じない（worker の結果行にも載らない）ため、この入口の記録の対象外
+//!   生じ、exec の子では生じない（worker の結果行にも載らない）ため、この入口の記録の対象外。再起動を越えて残る
+//!   置き場所・ローテーション・常時の二重記録も未実装（`FileAuditSink` の doc）
 //! - `--ulimit` の指定値の `state.json` への記録。現状は pid1 の実効値を写して代替する（hard は launch を
 //!   超えないが、soft は pid1 が hard の範囲で上げていれば launch の指定より高くなり得る。core の
 //!   `exec/reapply.rs` のモジュール doc）
@@ -199,7 +210,7 @@ use std::io::{BufRead as _, Read as _, Write as _};
 use std::os::fd::BorrowedFd;
 use std::time::{Duration, Instant};
 
-use fandhe_container_core::audit_log::{AuditDelivery, AuditSink, AuditedRejection};
+use fandhe_container_core::audit_log::{AuditDelivery, AuditSink, AuditedRejection, FileAuditSink};
 use fandhe_container_core::exec::{
     ChildExit, ContainerEnv, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV, ENTRYPOINT_MAX_STRING_BYTES,
     ENTRYPOINT_MAX_TOTAL_BYTES, EntrypointExecMode, ExecCgroupJoin, ExecCgroupJoinReport,
@@ -213,6 +224,7 @@ use fandhe_container_core::exec::{
     sweep_stale_exec_child_cgroups,
 };
 use fandhe_container_core::oci_runtime::{OciConfig, RootfsDir, load_config, pin_bundle_rootfs};
+use fandhe_container_core::state_store::{FileStateStore, StateRoot};
 use fandhe_container_core::traits::{
     CgroupPlacement, ContainerId, ContainerState, ErrorCode, StateRecord, TraitError,
 };
@@ -372,6 +384,21 @@ pub fn prepare_restrictions(
     core_prepare_exec_restrictions(worker, &target.pid1, &config, &rootfs).map_err(from_exec_error)
 }
 
+/// exec の拒否を永続化する本番の記録先を作る（SEC-4・SUP-6・TASK-163 追補・#1594）。
+///
+/// `root_override` が `None` なら core の既定ルート解決に従い（`state::open_default_store` と同じ規則）、状態ストアを
+/// 開いてから `<状態ルート>/@audit.log` を主経路とする `FileAuditSink` を返す。返す sink はファイルを開いたまま
+/// 持たないので、fork 前に作っても worker へ fd は継承されない。[`run_command`] / [`run_command_with_pidfd`] の
+/// `audit` へ渡す。Linux 以外では core が `Unimplemented` を返す（fail-closed）。CLI・healthcheck からの配線は
+/// 本番 launcher の構成（#1314）に従う。
+pub fn default_audit_sink(
+    root_override: Option<std::path::PathBuf>,
+) -> Result<FileAuditSink, TraitError> {
+    let root = StateRoot::resolve(root_override)?;
+    let store = FileStateStore::open(root)?;
+    Ok(FileAuditSink::in_state_store(&store))
+}
+
 /// 稼働中コンテナの中で実行するコマンドの要求（コンテナ内の絶対パス・argv・明示の環境変数。
 /// SUP-6・SEC-1・TASK-163 追補・#1457）。
 ///
@@ -529,6 +556,8 @@ pub struct ExecOutcome {
     pub supplementary_groups: SupplementaryGroups,
     /// エントリポイントの実行方式（封印した複製か現行方式と、現行方式を選んだ理由。オーナー判断 2026-10-09
     /// 「条件付き切り替え」・#1531・REPAIR-4）。同じ値を worker が構造化ログ（`supervisor.exec` の `entrypoint_mode`）に出す。
+    ///
+    /// 縮退（現行方式）は分離違反ではないため監査ログには記録しない（#1594。モジュール doc「本番の記録先」）。
     pub entrypoint_mode: EntrypointExecMode,
     /// exec 開始時に行った、残った `exec-*` 子 cgroup の掃除の結果（#1596・SUP-6）。呼び出しプロセスが worker の
     /// 結果を受けた後で載せる値で、worker の結果行には含まれない。掃除を行わなかった場合は既定値（未実施）。
@@ -597,7 +626,7 @@ impl Deadline {
 /// 呼べば `setns` が拒否される）。失敗時は状態を戻せないため、呼び出し側は続行せずプロセスを終了する。
 /// エラーメッセージへホスト側パス・ルール内容・期待 cgroup パスを載せない。
 ///
-/// `audit` は exec の対象の拒否の記録先（SEC-4・#1465。契約はモジュール doc「監査記録」）。拒否は `Err` の
+/// `audit` は exec の対象の拒否の記録先（SEC-4・#1465。契約はモジュール doc「監査記録」。本番用は [`default_audit_sink`]）。拒否は `Err` の
 /// [`AuditedRejection`] で返り、`error` は記録の成否に関わらず元の拒否、`delivery` が記録の結果。移行: 呼び出しへ
 /// sink を渡し、`Err` は `.error` / `.delivery` を見る。`audit` の実装はブロックし得る I/O にタイムアウトを持つこと
 /// （REPAIR-5。`AuditSink` の契約）。記録は worker を回収した後に行うため、sink が詰まっても worker・コマンドは残らない。

@@ -10,7 +10,7 @@
 //!
 //! - マウント検証/API レイヤーの記録ヘルパと記録先トレイトは [`mount`]・[`AuditSink`]（TASK-41.4・#195。
 //!   `exec::audit_mount_violation` と `oci_runtime::audit_mount_config_error` がここを使う。
-//!   ファイルへの永続化は実装済みで、本番経路への sink の配線は未実装）
+//!   本番 sink `FileAuditSink`〔#1594〕は実装済み。launcher・CLI・healthcheck 等への配線は未実装）
 //! - exec の対象の拒否（層 `exec_target`）は `exec::audit_exec_violation` / `exec::record_exec_target_rejection`
 //!   が [`AuditEvent::ExecTarget`] として記録する。supervisor の通しの入口 `run_command` が親プロセス側で
 //!   1 拒否 1 件を記録する（#1465）。パスは持たない（型で保証）
@@ -32,8 +32,9 @@
 //! - ローカルファイルへの JSON Lines 書き込み（主経路）は `file_writer` で実装済み（TASK-41.5.1・#839）。
 //!   型自体に `serde` の derive は付けず、非公開 DTO でワイヤースキーマへ写す（#652 で共通ログ型へ統一予定）。
 //!   主経路の失敗時のカーネル監査（NETLINK_AUDIT）フォールバックは `kernel_audit` で実装済み（TASK-41.5.2・#840）。
-//!   一方、常時の二重記録（tee）によるクラッシュ・改ざん時の記録保持、本番経路（supervisor / CLI）への配線は
-//!   **未実装**（REPAIR-3: 実装済みを装わない）
+//!   両者を束ねる本番 sink `FileAuditSink`（`AuditSink` 実装。#1594）も実装済みで、supervisor の exec は
+//!   `exec::default_audit_sink` で構築する。一方、常時の二重記録（tee）によるクラッシュ・改ざん時の記録保持、
+//!   CLI・healthcheck・mount・plugin 信頼検証への配線は **未実装**（REPAIR-3: 実装済みを装わない）
 //! - レイヤーごとのペイロードを [`AuditEvent`] の enum で持ち、「syscall の無い seccomp 違反」のような
 //!   不正な組み合わせを構築できない（REPAIR-2）。値は各 newtype の構築子が検証する
 //! - 秘密情報（資格情報・環境変数・namespace 識別子）は含めない。ホスト側の実パスを載せるかは各フックで判断する
@@ -45,10 +46,12 @@
 //! コンテナ ID を持たせるかは #194 以降で決める。フィールドは非公開かつ `#[non_exhaustive]` なので、
 //! 後から追加しても破壊的変更にならない。
 
+mod file_sink;
 mod file_writer;
 mod kernel_audit;
 mod landlock;
 
+pub use file_sink::{AUDIT_LOG_FILE_NAME, FileAuditSink};
 pub use file_writer::{
     AUDIT_LINE_MAX_BYTES, AuditFallback, AuditFileWriter, AuditWriteError, AuditWriteErrorKind,
     AuditWriteFailure, AuditWriteOutcome, NoAuditFallback, encode_json_line, write_with_fallback,

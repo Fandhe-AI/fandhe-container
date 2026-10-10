@@ -3,7 +3,7 @@
 //! 本番の `exec::run_command` を、自プロセスの pid を「稼働中コンテナの pid」とした記録に対して呼ぶ。自プロセスは
 //! 入れ子の PID namespace の PID 1 ではないため、worker 内の `identify_pid1` が違反 `exec_target_not_nested_pid1`
 //! で拒否する（`setns` の前に拒否されるので root・実コンテナは不要）。この拒否が親プロセス側で層 `exec_target` の
-//! レコード 1 件になること、ファイル主経路（`AuditFileWriter`）の JSON Lines 1 行まで届くこと、記録の失敗で拒否が
+//! レコード 1 件になること、本番の記録先（`default_audit_sink` の `FileAuditSink`。`<状態ルート>/@audit.log`）の JSON Lines 1 行まで届くこと、記録の失敗で拒否が
 //! 覆らないこと、記録の対象外（稼働中でない記録）は 0 件であることを具体値で照合する。
 //!
 //! fork は呼び出しプロセスが単一スレッドであることを要求するため、`harness = false` の単一スレッド `main` で動かす
@@ -26,18 +26,17 @@ mod linux {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    use fandhe_container_core::audit_log::{
-        AuditDelivery, AuditFileWriter, AuditLayer, AuditRecord, AuditSink,
-    };
+    use fandhe_container_core::audit_log::{AuditDelivery, AuditLayer, AuditRecord, AuditSink};
     use fandhe_container_core::traits::{
         CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, ErrorCode, StateRecord,
         StateRevision, TraitError,
     };
-    use fandhe_container_supervisor::exec::{ExecRequest, run_command};
+    use fandhe_container_supervisor::exec::{ExecRequest, default_audit_sink, run_command};
 
     pub fn run() {
         rejection_is_recorded_once_with_reason_and_no_path();
         rejection_reaches_the_audit_file_one_line_per_rejection();
+        failing_sink_keeps_the_process_single_threaded_for_repeated_exec();
         sink_failure_does_not_overturn_the_rejection();
         non_running_record_is_not_audited();
         println!("exec_audit: all scenarios passed");
@@ -69,19 +68,6 @@ mod linux {
             }
             self.records.lock().expect("sink lock").push(record.clone());
             Ok(())
-        }
-    }
-
-    /// 一時ディレクトリの監査ファイルへ書く sink（`AuditFileWriter` を `Mutex` で包む本番相当のアダプタ）。
-    struct FileSink(Mutex<AuditFileWriter>);
-
-    impl AuditSink for FileSink {
-        fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
-            self.0
-                .lock()
-                .map_err(|_| TraitError::new(ErrorCode::Internal, "poisoned"))?
-                .write_record(record)
-                .map_err(|_| TraitError::new(ErrorCode::Internal, "audit write failed"))
         }
     }
 
@@ -136,7 +122,7 @@ mod linux {
         assert_eq!(recs[0].pid().get(), std::process::id());
     }
 
-    /// 0700 の使い捨てディレクトリ（`AuditFileWriter::open` の親ディレクトリ検査を満たす）。
+    /// 0700 の使い捨てディレクトリ（状態ルートとして使う。`FileAuditSink` の親ディレクトリ検査を満たす）。
     fn private_dir() -> PathBuf {
         use std::os::unix::fs::DirBuilderExt as _;
         let base = std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp dir");
@@ -164,10 +150,43 @@ mod linux {
         }
     }
 
+    /// 現在のプロセスのスレッド数（`/proc/self/status` の `Threads:`）。
+    fn thread_count() -> u32 {
+        std::fs::read_to_string("/proc/self/status")
+            .expect("read status")
+            .lines()
+            .find_map(|l| l.strip_prefix("Threads:"))
+            .and_then(|v| v.trim().parse().ok())
+            .expect("Threads line")
+    }
+
+    /// SEC-4・SUP-6・REPAIR-5: 記録が失敗する sink（主経路が symlink で拒否される）でも、sink 生成後・失敗通知後の
+    /// どの時点でも通知用スレッドが残らず、同一 sink での複数回の exec が単一スレッド検証（fork 前）を通る。
+    fn failing_sink_keeps_the_process_single_threaded_for_repeated_exec() {
+        let dir = private_dir();
+        let result = std::panic::catch_unwind(|| {
+            let sink = default_audit_sink(Some(dir.clone())).expect("production audit sink");
+            std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("@audit.log"))
+                .expect("symlink");
+            assert_eq!(thread_count(), 1, "sink creation must not spawn threads");
+            let record = running_record_of_self();
+            let req = request();
+            for _ in 0..3 {
+                let rejected = run_command(&record, &req, Duration::from_secs(30), &sink)
+                    .expect_err("rejected");
+                assert_eq!(rejected.error.message(), REJECTION);
+                assert_eq!(thread_count(), 1, "no notifier thread may remain");
+            }
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
     fn audit_file_scenario(dir: &Path) {
-        let path = dir.join("audit.log");
-        let writer = AuditFileWriter::open(&path).expect("open audit file");
-        let sink = FileSink(Mutex::new(writer));
+        let sink = default_audit_sink(Some(dir.to_path_buf())).expect("production audit sink");
+        let path = dir.join("@audit.log");
         let record = running_record_of_self();
         let req = request();
 

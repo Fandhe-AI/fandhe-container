@@ -1,6 +1,6 @@
 //! exec の対象の拒否が監査ログへ 1 件ずつ記録されることの結合試験（SEC-4・SUP-6・TASK-163 追補・#1465・REPAIR-12）。
 //!
-//! 本番の `exec::run_command` を、自プロセスの pid を「稼働中コンテナの pid」とした記録に対して呼ぶ。自プロセスは
+//! 縮退経路の試験専用入口 `exec::run_command`（`exec-test-support`。記録・照合の経路は本番と共有）を、自プロセスの pid を「稼働中コンテナの pid」とした記録に対して呼ぶ。自プロセスは
 //! 入れ子の PID namespace の PID 1 ではないため、worker 内の `identify_pid1` が違反 `exec_target_not_nested_pid1`
 //! で拒否する（`setns` の前に拒否されるので root・実コンテナは不要）。この拒否が親プロセス側で層 `exec_target` の
 //! レコード 1 件になること、本番の記録先（`default_audit_sink` の `FileAuditSink`。`<状態ルート>/@audit.log`）の JSON Lines 1 行まで届くこと、記録の失敗で拒否が

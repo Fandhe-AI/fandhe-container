@@ -49,7 +49,8 @@ fandhe-container-core = { path = "../core" }
 # 公開 API にする（SEC-1。crates/io の crash-test-server と同じ仕組み。依存は増えない）。core 側の同名 feature
 # （`Pid1Target::open_with_cgroup_path`）を連動して有効にする。
 # worker 機構を任意の `work` で直接呼ぶ `exec::run_in_worker_for_test`（tests/exec_timeout.rs）も同じ feature の下に
-# 置く（TASK-163 追補・#1460）。リリースビルドで有効にするとコンパイルが止まる（src/lib.rs の `compile_error!`）。
+# 置く（TASK-163 追補・#1460）。縮退経路の通しの入口 `exec::run_command` も同じ feature の下に置く（#1617。本番の通しの
+# 入口は `run_command_with_pidfd` だけ）。リリースビルドで有効にするとコンパイルが止まる（src/lib.rs の `compile_error!`）。
 [features]
 exec-test-support = ["fandhe-container-core/exec-test-support"]
 

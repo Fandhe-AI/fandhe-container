@@ -1908,6 +1908,18 @@ type Observed = (ChildExit, bool);
 /// 回収・pid 再利用後は `ESRCH` になり無関係なプロセスへ届かない）。pidfd を開けない環境（Linux 5.3 未満・
 /// seccomp 等）でのみ `kill(2)` へ退避し、その場合は上記の前提に依存する。
 ///
+/// # pidfd を開けなかったときの扱い（#1617・SUP-6・SEC-1・REPAIR-4）
+///
+/// `pidfd_open` の失敗は [`LaunchPidfdUnavailable`] に分類して保持し（[`ContainerChild::pidfd_unavailable`]）、
+/// 未対応（`ENOSYS`）以外は [`LaunchPidfdUnavailable::log_line`] で構造化ログ 1 行にできる（`EMFILE`・`ENFILE`・
+/// `ENOMEM`・`EPERM` 等を未対応と取り違えない。出力は未配線）。`new` 自身は I/O をしない（停止した stderr で
+/// ブロックしない。REPAIR-5）。起動自体は失敗させない: `new` は fork の後に呼ばれ、失敗しうる構成にすると全 fork 箇所
+/// （`spawn_container*`・各 probe・exec の worker・rootless mapper・`observe_*`）で子の kill と回収が要り、
+/// 一時的な `EMFILE` がコンテナの起動まで落とすことになるため。代わりに本番の exec の入口
+/// （supervisor の `run_command_with_pidfd`）が pidfd を必須の引数にしており、`pidfd()` が `None` のハンドル
+/// からは exec できない（fail-closed が型で強制される）。シグナル送信は `kill(2)` へ退避し、回収済み pid へ
+/// 送らない排他は上記の `Mutex` が保つ。
+///
 /// `Drop` では kill / wait しない（コンテナの寿命を親ハンドルに暗黙で縛らない）。回収の責任は
 /// 呼び出し元にあり、放置すると子はゾンビとして残る。
 #[must_use]
@@ -1916,17 +1928,122 @@ pub struct ContainerChild {
     pid: u32,
     /// fork 直後に開いた pidfd（プロセス同一性の保持。開けない環境では `None` で `kill(2)` へ退避）。
     pidfd: Option<OwnedFd>,
+    /// `pidfd` が `None` の理由（`pidfd` が `Some` なら `None`）。
+    pidfd_unavailable: Option<LaunchPidfdUnavailable>,
     reap: Mutex<ReapCell>,
+}
+
+/// 起動時の `pidfd_open` が失敗した理由の分類（観測用。#1617・SUP-6・SEC-1・REPAIR-4）。
+///
+/// [`ContainerChild::pidfd_unavailable`] が返す。exec の可否は理由に依らず「pidfd 無し」で同じ（fail-closed）だが、
+/// 運用者が原因を追えるよう未対応・拒否・資源枯渇等を区別する。errno 名は固定語彙で、カーネル由来の自由文字列を
+/// 持たない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LaunchPidfdUnavailable {
+    /// カーネルが `pidfd_open` を知らない（`ENOSYS`。Linux 5.3 未満）。想定内の環境のためログは出さない。
+    Unsupported,
+    /// `EPERM`。exec worker 自身の seccomp 許可リストは `pidfd_open` を許すため、外側のポリシー（ホスト側
+    /// seccomp・LSM）による拒否を意味する。
+    Denied,
+    /// 上記以外の失敗（`EMFILE`・`ENFILE`・`ENOMEM` 等）。`errno` は既知名か、一覧外は `"other"`。
+    Failed {
+        /// errno の固定語彙名。
+        errno: &'static str,
+    },
+}
+
+impl LaunchPidfdUnavailable {
+    /// ログの `reason` に使う固定語彙。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::Denied => "denied",
+            Self::Failed { .. } => "failed",
+        }
+    }
+
+    /// 縮退理由の構造化ログ 1 行（`Unsupported` は想定内なので `None`）。固定語彙のみで、pid・パス・数値を載せない。
+    ///
+    /// 出力は呼び出し側の責務（`ContainerChild::new` は書かない。#1683 の指摘: 停止した stderr への同期書き込みが
+    /// ハンドル返却と期限管理を止めるため。REPAIR-5・REPAIR-4）。
+    ///
+    /// 現状は本番の呼び出し元が無く、行は組み立てられるだけで出力されない（未配線）。止まった stderr でも
+    /// 待たない出力経路（plugin の `ChildGuard::drop` の診断と同じ AF_UNIX 限定の非ブロッキング送信等）が core に
+    /// 無く、spawn から `wait_timeout` までの経路へ同期書き込みを置くと同じ停止が再発するため。配線は後続の課題。
+    pub fn log_line(self) -> Option<String> {
+        if self == Self::Unsupported {
+            return None;
+        }
+        Some(format!(
+            "{{\"component\":\"core.exec\",\"operation\":\"launch_pidfd\",\"outcome\":\"unavailable\",\"reason\":\"{}\",\"errno\":\"{}\"}}",
+            self.as_str(),
+            self.errno_name()
+        ))
+    }
+
+    /// ログの `errno` に使う固定語彙名（`Unsupported` は `ENOSYS`）。
+    pub fn errno_name(self) -> &'static str {
+        match self {
+            Self::Unsupported => "ENOSYS",
+            Self::Denied => "EPERM",
+            Self::Failed { errno } => errno,
+        }
+    }
+}
+
+/// errno を固定語彙名へ写す（ログへカーネル由来の値をそのまま載せない。一覧外は `"other"`）。
+fn pidfd_errno_name(errno: i32) -> &'static str {
+    match errno {
+        e if e == sys::EMFILE => "EMFILE",
+        e if e == sys::ENFILE => "ENFILE",
+        e if e == sys::ENOMEM => "ENOMEM",
+        e if e == sys::EPERM => "EPERM",
+        e if e == sys::ENOSYS => "ENOSYS",
+        e if e == sys::EINVAL => "EINVAL",
+        e if e == sys::ESRCH => "ESRCH",
+        e if e == sys::EACCES => "EACCES",
+        _ => "other",
+    }
+}
+
+/// `pidfd_open` の結果を fd か失敗理由に分類する（純関数。`ContainerChild::new` が使う）。
+fn classify_pidfd_open(
+    result: Result<OwnedFd, SysError>,
+) -> Result<OwnedFd, LaunchPidfdUnavailable> {
+    match result {
+        Ok(fd) => Ok(fd),
+        Err(SysError::Unsupported) => Err(LaunchPidfdUnavailable::Unsupported),
+        Err(SysError::Os(e)) if e == sys::ENOSYS => Err(LaunchPidfdUnavailable::Unsupported),
+        Err(SysError::Os(e)) if e == sys::EPERM => Err(LaunchPidfdUnavailable::Denied),
+        Err(SysError::Os(e)) => Err(LaunchPidfdUnavailable::Failed {
+            errno: pidfd_errno_name(e),
+        }),
+        // `pidfd_open` は fork の単一スレッド検査を通らないため到達しない。到達しても理由を捏造しない。
+        Err(SysError::MultiThreaded) => Err(LaunchPidfdUnavailable::Failed { errno: "other" }),
+    }
 }
 
 impl ContainerChild {
     /// fork 直後の未回収の子のハンドルを作る（`exec` の rootless mapper の回収にも使う）。
     pub(super) fn new(pid: u32) -> Self {
+        // 回収前（fork 直後）に開くので、以後 pid が再利用されても元のプロセスを指し続ける。
+        // 未対応カーネル・seccomp 等で開けなければ `None`（`signal_child` が `kill(2)` へ退避）。
+        // 縮退の理由は分類して保持するだけで、ここでは I/O をしない（stderr が満杯 pipe 等で停止していても
+        // ハンドルの返却と子の回収を妨げない。REPAIR-5）。通知は `pidfd_unavailable()` を見た呼び出し側が行う。
+        Self::from_pidfd_result(pid, sys::pidfd_open(pid))
+    }
+
+    /// `pidfd_open` の結果から組み立てる（`new` の本体。結果を注入できるようにして単体で照合する）。
+    fn from_pidfd_result(pid: u32, result: Result<OwnedFd, SysError>) -> Self {
+        let (pidfd, pidfd_unavailable) = match classify_pidfd_open(result) {
+            Ok(fd) => (Some(fd), None),
+            Err(reason) => (None, Some(reason)),
+        };
         Self {
             pid,
-            // 回収前（fork 直後）に開くので、以後 pid が再利用されても元のプロセスを指し続ける。
-            // 未対応カーネル・seccomp 等で開けなければ `None`（`signal_child` が `kill(2)` へ退避）。
-            pidfd: sys::pidfd_open(pid).ok(),
+            pidfd,
+            pidfd_unavailable,
             reap: Mutex::new(ReapCell {
                 state: ReapState::Running,
                 kills_sent: 0,
@@ -1949,10 +2066,17 @@ impl ContainerChild {
     ///
     /// 回収前に開いているため、以後 pid が再利用されても元のプロセスを指し続ける。supervisor が exec の
     /// 対象（pid1）をこの pidfd で固定するために使う（記録 pid からの `pidfd_open` や cgroup の所属に
-    /// 同一性を依存させない。SUP-6・SEC-1・CORE-1・TASK-163 追補・#1461）。`None` は pidfd 未対応の環境
-    /// （Linux 5.3 未満・seccomp 等）で、その場合に呼び出し側は fail-closed にすること。
+    /// 同一性を依存させない。SUP-6・SEC-1・CORE-1・TASK-163 追補・#1461）。`None` は pidfd を開けなかった環境
+    /// （Linux 5.3 未満・seccomp・fd 枯渇等。理由は [`ContainerChild::pidfd_unavailable`]）で、その場合に呼び出し側は
+    /// fail-closed にすること。本番の exec の入口（`run_command_with_pidfd`）は pidfd を必須の引数にしており、
+    /// `None` のハンドルからは exec できない（#1617）。
     pub fn pidfd(&self) -> Option<BorrowedFd<'_>> {
         self.pidfd.as_ref().map(|fd| fd.as_fd())
+    }
+
+    /// [`ContainerChild::pidfd`] が `None` の理由（pidfd を持つなら `None`。#1617・REPAIR-4）。
+    pub fn pidfd_unavailable(&self) -> Option<LaunchPidfdUnavailable> {
+        self.pidfd_unavailable
     }
 
     /// 子の終了を `timeout` まで待つ（REPAIR-5）。
@@ -3250,6 +3374,231 @@ mod tests {
         assert_eq!(handle.send_signal(term).unwrap(), SignalDelivery::Gone);
         // 終端状態のため 2 回目以降も `waitpid` / `kill` を行わず状態は変わらない。
         assert_eq!(reap_snapshot(&handle), (ReapState::Lost, 0));
+    }
+
+    /// SUP-6・REPAIR-4（#1617）: `pidfd_open` の失敗は理由ごとに分類される（具体値）。
+    #[test]
+    fn sup6_rep4_1617_classify_pidfd_open_errno() {
+        let cls = |e: SysError| classify_pidfd_open(Err(e)).unwrap_err();
+        assert_eq!(
+            cls(SysError::Os(sys::EMFILE)),
+            LaunchPidfdUnavailable::Failed { errno: "EMFILE" }
+        );
+        assert_eq!(
+            cls(SysError::Os(sys::ENFILE)),
+            LaunchPidfdUnavailable::Failed { errno: "ENFILE" }
+        );
+        assert_eq!(
+            cls(SysError::Os(sys::ENOMEM)),
+            LaunchPidfdUnavailable::Failed { errno: "ENOMEM" }
+        );
+        assert_eq!(
+            cls(SysError::Os(sys::EPERM)),
+            LaunchPidfdUnavailable::Denied
+        );
+        assert_eq!(
+            cls(SysError::Os(sys::ENOSYS)),
+            LaunchPidfdUnavailable::Unsupported
+        );
+        assert_eq!(
+            cls(SysError::Unsupported),
+            LaunchPidfdUnavailable::Unsupported
+        );
+        assert_eq!(
+            cls(SysError::Os(sys::EBADF)),
+            LaunchPidfdUnavailable::Failed { errno: "other" }
+        );
+    }
+
+    /// SUP-6・REPAIR-4（#1617）: 縮退理由のログ行は固定語彙で、未対応では出さない（バイト一致）。
+    #[test]
+    fn sup6_rep4_1617_launch_pidfd_log_line_bytes() {
+        assert_eq!(
+            LaunchPidfdUnavailable::Failed { errno: "EMFILE" }
+                .log_line()
+                .as_deref(),
+            Some(
+                "{\"component\":\"core.exec\",\"operation\":\"launch_pidfd\",\"outcome\":\"unavailable\",\"reason\":\"failed\",\"errno\":\"EMFILE\"}"
+            )
+        );
+        assert_eq!(
+            LaunchPidfdUnavailable::Denied.log_line().as_deref(),
+            Some(
+                "{\"component\":\"core.exec\",\"operation\":\"launch_pidfd\",\"outcome\":\"unavailable\",\"reason\":\"denied\",\"errno\":\"EPERM\"}"
+            )
+        );
+        assert_eq!(LaunchPidfdUnavailable::Unsupported.log_line(), None);
+    }
+
+    /// SUP-6・REPAIR-4・REPAIR-5（#1617）: `EMFILE` を注入すると pidfd は `None` のまま理由が保持される。
+    /// 組み立ては出力先を取らず I/O をしない（停止した stderr でハンドル返却が止まらない。通知は呼び出し側）。
+    #[test]
+    fn sup6_rep4_1617_pidfd_open_failure_keeps_none_without_io() {
+        let child = ContainerChild::from_pidfd_result(1, Err(SysError::Os(sys::EMFILE)));
+        assert!(child.pidfd().is_none());
+        assert_eq!(
+            child.pidfd_unavailable(),
+            Some(LaunchPidfdUnavailable::Failed { errno: "EMFILE" })
+        );
+
+        let child = ContainerChild::from_pidfd_result(1, Err(SysError::Os(sys::ENOSYS)));
+        assert!(child.pidfd().is_none());
+        assert_eq!(
+            child.pidfd_unavailable(),
+            Some(LaunchPidfdUnavailable::Unsupported)
+        );
+
+        // 自プロセスの pidfd が開けるカーネルでの成功経路（未対応カーネルでは検証対象外）。
+        if let Ok(fd) = sys::pidfd_open(std::process::id()) {
+            let child = ContainerChild::from_pidfd_result(1, Ok(fd));
+            assert!(child.pidfd().is_some());
+            assert_eq!(child.pidfd_unavailable(), None);
+        }
+    }
+
+    /// 満杯 pipe 試験の子役を選ぶ環境変数（値は任意。親役が付けて自身のテストバイナリを再実行する）。
+    const FULL_STDERR_CHILD_ENV: &str = "FANDHE_TEST_1617_FULL_STDERR_CHILD";
+
+    /// 満杯 pipe 試験で `pidfd_open` を確実に失敗させる pid（`pid_max` の上限 4194304 を超え `ESRCH` になる）。
+    const FULL_STDERR_MISSING_PID: u32 = 2_147_483_647;
+
+    /// 満杯 pipe 試験の子役（親が読まない pipe を stderr に繋いで起動される）。
+    ///
+    /// 1. 埋め込みスレッドが stderr へ 4096 バイトずつ書き、書けた量が 300ms 増えなくなる（pipe 満杯で
+    ///    `write(2)` が止まる）まで待つ（上限 5 秒）。
+    /// 2. 対照として、`1471036b` より前の `new` と同じ `writeln!(std::io::stderr().lock(), ..)` を別スレッドで呼び、
+    ///    300ms 以内に戻らないこと（stderr が実際に停止していること）を確かめる。
+    /// 3. `ContainerChild::new` を存在しない pid で呼び（`pidfd_open` が失敗する縮退経路）、所要時間を測る。
+    ///
+    /// 結果は stdout の `RESULT ...` 1 行で返し、`process::exit` で終える（止まったスレッドを待たない。
+    /// stderr は止まっているので panic のメッセージも出せない。失敗は終了コードで返す）。
+    fn full_stderr_child_main() -> ! {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static WRITTEN: AtomicU64 = AtomicU64::new(0);
+        std::thread::spawn(|| {
+            let chunk = [b'x'; 4096];
+            loop {
+                match std::io::stderr().write(&chunk) {
+                    Ok(n) => {
+                        WRITTEN.fetch_add(u64::try_from(n).unwrap_or(0), Ordering::SeqCst);
+                    }
+                    // 読み手が閉じた等で満杯にできない（試験の前提が崩れた）。
+                    Err(_) => std::process::exit(3),
+                }
+            }
+        });
+        let fill_deadline = Instant::now() + Duration::from_secs(5);
+        let mut last = WRITTEN.load(Ordering::SeqCst);
+        let mut stable_since = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(20));
+            let now = WRITTEN.load(Ordering::SeqCst);
+            if now != last {
+                last = now;
+                stable_since = Instant::now();
+            } else if now > 0 && stable_since.elapsed() >= Duration::from_millis(300) {
+                break;
+            }
+            if Instant::now() >= fill_deadline {
+                std::process::exit(4);
+            }
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _ = writeln!(std::io::stderr().lock(), "control line");
+            let _ = tx.send(());
+        });
+        let control_blocked = rx.recv_timeout(Duration::from_millis(300)).is_err();
+
+        let start = Instant::now();
+        let handle = ContainerChild::new(FULL_STDERR_MISSING_PID);
+        let elapsed = start.elapsed();
+
+        let reason = handle.pidfd_unavailable().map_or_else(
+            || "none".to_owned(),
+            |r| format!("{}:{}", r.as_str(), r.errno_name()),
+        );
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(
+            out,
+            // libtest が改行なしで出す `test <名前> ... ` の後ろに続かないよう、先頭で改行する。
+            "\nRESULT control_blocked={control_blocked} pidfd_none={} reason={reason} within_1s={}",
+            handle.pidfd().is_none(),
+            elapsed < Duration::from_secs(1)
+        );
+        let _ = out.flush();
+        std::process::exit(0);
+    }
+
+    /// SUP-6・REPAIR-5・REPAIR-4（#1617・#1683 の Codex P0）: stderr が読み手の止まった満杯 pipe でも、
+    /// `pidfd_open` が失敗する縮退経路の `ContainerChild::new` は 1 秒未満で子ハンドルを返す（stderr へ同期
+    /// 書き込みせず、呼び出し側の `wait_timeout` による期限管理と回収へ到達できる）。
+    ///
+    /// テストバイナリ自身を `--exact` で再実行し、子役の stderr を親が読まない pipe にする（自プロセスの
+    /// fd 2 を差し替えない）。子役は対照として修正前の書き込み方が実際に止まることも確かめる。親は子役の
+    /// 終了を 10 秒の上限で待ち、超えたら kill して回収してから失敗させる（修正前の実装ではここで落ちる）。
+    #[test]
+    fn sup6_rep5_1617_container_child_new_returns_with_full_stderr_pipe() {
+        use std::io::Read as _;
+
+        if std::env::var_os(FULL_STDERR_CHILD_ENV).is_some() {
+            full_stderr_child_main();
+        }
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "exec::process::tests::sup6_rep5_1617_container_child_new_returns_with_full_stderr_pipe",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(FULL_STDERR_CHILD_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            // 読まない（子役の stderr を満杯で止める）。`child` を drop するまで読み端を開いたまま保つ。
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child with a full stderr pipe did not finish within 10s (REPAIR-5)");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        assert_eq!(status.code(), Some(0), "child stdout: {stdout}");
+        let result = stdout
+            .lines()
+            .find(|l| l.starts_with("RESULT "))
+            .unwrap_or_else(|| panic!("no RESULT line in child stdout: {stdout}"));
+        // `pidfd_open` が使える（自プロセスで開ける）カーネルでは、存在しない pid は `ESRCH` の失敗に分類される
+        // （修正前はこの分類でログを stderr へ書いていた）。未対応・拒否される環境では理由の照合だけを外す。
+        if sys::pidfd_open(std::process::id()).is_ok() {
+            assert_eq!(
+                result,
+                "RESULT control_blocked=true pidfd_none=true reason=failed:ESRCH within_1s=true"
+            );
+        } else {
+            assert!(
+                result.starts_with("RESULT control_blocked=true pidfd_none=true reason="),
+                "{result}"
+            );
+            assert!(result.ends_with(" within_1s=true"), "{result}");
+        }
     }
 
     /// CORE-1・CORE-2（TASK-30.1）: pidfd を保持していれば、契約外の回収者が子を回収した後の

@@ -55,12 +55,15 @@
 //! - すべての `unsafe` ブロック・`unsafe extern "C"` 宣言に `// SAFETY:` で理由と
 //!   維持すべき不変条件を明記する
 //! - syscall(2) の番号は `ArchSysNo::get` を通した `SyscallNumber` でしか `syscall` に渡せない
-//!   （型で強制。対応外アーキテクチャでは `get` が常に `Unsupported` を返し番号 0 を発行しない。
-//!   #1619）。フラグ定数（`MS_*` 等）は対応外 arch で 0 のままで、libc 経由ラッパーの
+//!   （型で強制。対応外アーキテクチャ〔x32・aarch64 ILP32 を含む〕では `get` が常に
+//!   `Unsupported` を返し、仮置きの番号 0 を発行しない。対応 arch の番号の値は固定値テストで
+//!   照合する。#1619）。フラグ定数（`MS_*` 等）は対応外 arch で 0 のままで、libc 経由ラッパーの
 //!   `SUPPORTED` 検査は引き続き慣習で保つ（型では強制しない）
 //! - syscall の定数は `cfg(target_arch = ...)` ごとに個別に定義し、値が同じでも
-//!   他アーキテクチャの定義を流用しない。対応外アーキテクチャでは各ラッパーが
-//!   [`SysError::Unsupported`] を返す（fail-closed。`ErrorCode::Unimplemented` に写す）
+//!   他アーキテクチャの定義を流用しない。対応 arch は LP64 の x86_64・aarch64 に限り
+//!   （`target_pointer_width = "64"` を条件に含める）、x32 などの 32 bit ABI は対応外とする。
+//!   対応外アーキテクチャでは各ラッパーが [`SysError::Unsupported`] を返す
+//!   （fail-closed。`ErrorCode::Unimplemented` に写す）
 //! - `extern "C"` の型幅は glibc / musl の宣言に合わせる（`c_int` = `i32`・
 //!   `c_ulong` = `u64`・`uid_t`/`gid_t` = `u32`）。戻り値が `-1` のときは直後に
 //!   `std::io::Error::last_os_error()` で errno を確保する
@@ -112,20 +115,28 @@ pub(crate) use consts::{
 
 /// syscall(2) の番号を型で守る小さなサブモジュール（#1619・SUP-12・SEC-1・CORE-5・REPAIR-3）。
 ///
+/// 対応 arch は LP64 の x86_64・aarch64 だけ（`cfg(all(target_pointer_width = "64", any(target_arch =
+/// "x86_64", target_arch = "aarch64")))`）。x32 ABI（`x86_64-unknown-linux-gnux32`）と aarch64 の ILP32
+/// （`aarch64-unknown-linux-gnu_ilp32`）は `target_arch` が同じでも `long` が 32 bit で、x32 の番号には
+/// `__X32_SYSCALL_BIT` が付く（arm64 の ILP32 はカーネル本体に無い）ため、64 bit の表をそのまま使えず対応外に含める。
 /// 対応外アーキテクチャでは `consts` の番号が実在せず、素の整数 0 を `syscall` に渡すと別の
 /// syscall（x86_64 以外では 0 番が何に当たるかは arch 依存）を発行し得る。各ラッパー冒頭の
 /// `SUPPORTED` 検査が慣習で止めていたのを、`extern` の `syscall` が [`SyscallNumber`] しか
 /// 受けず、その唯一の入手経路が [`ArchSysNo::get`]（対応外 arch では常に `Unsupported`）に
 /// なる形で型に強制する。構築子は本モジュールの外へ出さない（フィールドは非公開）。
+/// 対応 arch の番号の値そのもの（表との一致）は型では守らず、`consts` の固定値テストで照合する。
 mod sysno {
     use super::SysError;
 
     /// カーネルへ渡せる syscall 番号。`extern` の `syscall` の第 1 引数はこの型だけを受ける。
-    /// `repr(transparent)` により ABI は C の `long`（LP64 で i64）と同一。
+    /// `repr(transparent)` により ABI は C の `long`（対応 arch は LP64 のみのため i64）と同一。
     #[repr(transparent)]
     #[derive(Clone, Copy)]
     #[cfg_attr(
-        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        not(all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
         allow(dead_code, reason = "対応外 arch では構築されない（常に Unsupported）")
     )]
     pub(super) struct SyscallNumber(i64);
@@ -133,23 +144,45 @@ mod sysno {
     /// `consts` に置く、この arch での syscall 番号の定義。取り出し口は [`ArchSysNo::get`] のみ。
     #[derive(Clone, Copy)]
     pub(super) struct ArchSysNo(
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))] i64,
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))] (),
+        #[cfg(all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        i64,
+        #[cfg(not(all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        (),
     );
 
     impl ArchSysNo {
-        /// 対応 arch の番号定義。対応外 arch には存在しない（直書きはコンパイルエラー）。
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        /// 対応 arch の番号定義。対応外 arch には存在しない（対応外 arch での直書きはコンパイルエラー）。
+        ///
+        /// 対応 arch では任意の正の番号を書ける（値の正しさは固定値テストで照合する）。0 以下は
+        /// `const` の初期化式で評価される `assert!` によりコンパイルエラーになる（`SYS_*` はすべて
+        /// `const` 項目のため、実行時に到達しない）。
+        #[cfg(all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
         pub(super) const fn new(nr: i64) -> Self {
+            assert!(nr > 0, "syscall number must be positive");
             Self(nr)
         }
 
         /// 対応外 arch の番号定義。`get` は常に `Unsupported` を返し、番号は発行されない。
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(not(all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
         pub(super) const UNSUPPORTED: Self = Self(());
 
         /// 発行可能な番号を返す。対応外 arch では `Err(Unsupported)`（fail-closed）。
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
         #[expect(
             clippy::unnecessary_wraps,
             reason = "対応外 arch と同じシグネチャにして呼び出し側の `?` を強制するため"
@@ -159,14 +192,21 @@ mod sysno {
         }
 
         /// 対応外 arch では番号を持たないため常に `Unsupported`。
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(not(all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
         pub(super) const fn get(self) -> Result<SyscallNumber, SysError> {
             let () = self.0;
             Err(SysError::Unsupported)
         }
 
         /// 固定値テスト専用の生の番号（対応 arch のみ）。
-        #[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(
+            test,
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
         pub(super) const fn raw(self) -> Option<i64> {
             Some(self.0)
         }
@@ -175,7 +215,7 @@ mod sysno {
 use sysno::{ArchSysNo, SyscallNumber};
 
 /// アーキテクチャごとの clone / mount / open 定数。値が同一でも arch ごとに個別定義する。
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 mod consts {
     use super::ArchSysNo;
     pub const SUPPORTED: bool = true;
@@ -401,7 +441,7 @@ mod consts {
     pub const ECONNREFUSED: i32 = 111;
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
 mod consts {
     use super::ArchSysNo;
     pub const SUPPORTED: bool = true;
@@ -635,7 +675,10 @@ mod consts {
 
 /// 対応外アーキテクチャ: 定数は 0 で、ラッパーは `Unsupported` を返す。errno は実在しない
 /// 負の値にして、`std::io::Error` 由来の実 errno と誤って一致させない（分類は `Internal`）。
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(not(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 mod consts {
     use super::ArchSysNo;
     pub const SUPPORTED: bool = false;
@@ -975,7 +1018,7 @@ struct PollFd {
 /// `f_bavail`・`f_files`・`f_ffree`・`f_fsid`（`int` × 2）・`f_namelen`・`f_frsize`・`f_flags`・`f_spare[4]` の順で
 /// 全体 120 バイト（arch/x86/include/uapi/asm/statfs.h → asm-generic/statfs.h の 64 ビット版。各語は `long`）。
 /// 使うのは `f_type` と `f_flags`（`f_flags` は先頭から 11 語目 = オフセット 80）だけで、間は名前を付けずに確保する。
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[repr(C)]
 struct StatFs {
     f_type: i64,
@@ -986,7 +1029,7 @@ struct StatFs {
 
 /// `fstatfs(2)` の出力バッファ（aarch64）。レイアウトは asm-generic/statfs.h の 64 ビット版で、
 /// x86_64 と同値だが他 arch の定義を流用せず個別に持つ（`f_type` が先頭・`f_flags` がオフセット 80、全体 120 バイト）。
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
 #[repr(C)]
 struct StatFs {
     f_type: i64,
@@ -996,7 +1039,10 @@ struct StatFs {
 }
 
 /// 対応外アーキテクチャ: レイアウト未確認のためラッパーは `Unsupported` を返し、カーネルには渡さない。
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(not(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 #[repr(C)]
 struct StatFs {
     f_type: i64,
@@ -2897,10 +2943,16 @@ fn statfs_of(fd: BorrowedFd<'_>) -> Result<StatFs, SysError> {
     }
     let mut buf = StatFs {
         f_type: 0,
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
         _before_flags: [0; 9],
         f_flags: 0,
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
         _spare: [0; 4],
     };
     // SAFETY: `buf` は `struct statfs`（120 バイト）と同じレイアウトの書き込み可能な領域で、
@@ -3796,7 +3848,7 @@ mod tests {
     use super::*;
 
     /// CORE-5・TASK-38.4: プローブ用定数の固定値照合（x86_64。arch ごとの個別定義の誤り検出）。
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
     #[test]
     fn core5_probe_consts_are_exact_x86_64() {
         assert_eq!(consts::SYS_PTRACE.raw(), Some(101));
@@ -3806,7 +3858,7 @@ mod tests {
     }
 
     /// CORE-5・TASK-38.4: プローブ用定数の固定値照合（aarch64）。
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
     #[test]
     fn core5_probe_consts_are_exact_aarch64() {
         assert_eq!(consts::SYS_PTRACE.raw(), Some(117));
@@ -3816,7 +3868,10 @@ mod tests {
     }
 
     /// CORE-5・TASK-39.1: Landlock 関連定数の固定値照合（arch ごとに個別定義した値の誤り検出）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core5_landlock_consts_are_exact() {
         assert_eq!(consts::SYS_LANDLOCK_CREATE_RULESET.raw(), Some(444));
@@ -3825,7 +3880,10 @@ mod tests {
     }
 
     /// CORE-5・TASK-39.3: Landlock 適用系の定数・構造体レイアウトの固定値照合。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core5_landlock_apply_consts_and_layout_are_exact() {
         assert_eq!(consts::SYS_LANDLOCK_ADD_RULE.raw(), Some(445));
@@ -3877,7 +3935,10 @@ mod tests {
     use std::os::fd::AsFd as _;
 
     /// SEC-4・TASK-41.5.2: netlink 監査用の定数・構造体レイアウトの具体値（kernel の uapi と照合）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sec4_task41_5_2_netlink_consts_and_layout_are_exact() {
         assert_eq!((consts::AF_NETLINK, consts::SOCK_RAW), (16, 3));
@@ -3890,7 +3951,10 @@ mod tests {
     }
 
     /// CORE-3・TASK-32.1: cgroup 操作用の定数・`statfs` バッファの具体値。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core3_task32_1_cgroup_consts_are_exact() {
         assert_eq!((consts::O_RDONLY, consts::O_WRONLY), (0, 1));
@@ -3901,7 +3965,10 @@ mod tests {
     }
 
     /// SEC-1（TASK-163 追補・#1531）: `statfs.f_flags` の位置と `ST_*` の具体値（include/linux/statfs.h）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sec1_task163_statfs_flags_layout_and_consts_are_exact() {
         assert_eq!(std::mem::offset_of!(StatFs, f_flags), 80);
@@ -3928,7 +3995,10 @@ mod tests {
     /// `noexec` と確かめたうえで）は `ST_NOEXEC` 付き、`noexec` でない `/` は付かない。どちらも `ST_VALID` が立つ。
     /// mountinfo の値と照合するため、前提（`/proc` が `noexec`・`/` が `noexec` でない）が崩れた環境では失敗する
     /// （skip しない。systemd・コンテナ実行環境の既定はどちらもこの前提を満たす）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sec1_task163_mount_flags_report_noexec_of_the_fd_mount() {
         let has_noexec = |opts: &str| opts.split(',').any(|o| o == "noexec");
@@ -3951,7 +4021,10 @@ mod tests {
     }
 
     /// CORE-3・TASK-32.1: `/proc` が procfs と判定され、cgroup2 とは区別されること。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core3_task32_1_fs_type_identifies_procfs_not_cgroup2() {
         let proc_dir = std::fs::File::open("/proc").unwrap();
@@ -3962,7 +4035,10 @@ mod tests {
     }
 
     /// CORE-3・TASK-32.1: `mkdir_at` / `remove_dir_at` / `open_*_at` の往復（一時ディレクトリ）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core3_task32_1_mkdir_open_remove_roundtrip() {
         use std::io::Write as _;
@@ -3992,12 +4068,12 @@ mod tests {
     /// syscall_64.tbl、aarch64 は asm-generic/unistd.h）と、件数の取得が実プロセスの `Groups:` と一致すること。
     #[test]
     fn sup6_task163_group_syscall_numbers_and_count_are_exact() {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
         assert_eq!(
             (consts::SYS_GETGROUPS.raw(), consts::SYS_SETGROUPS.raw()),
             (Some(115), Some(116))
         );
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
         assert_eq!(
             (consts::SYS_GETGROUPS.raw(), consts::SYS_SETGROUPS.raw()),
             (Some(158), Some(159))
@@ -4013,7 +4089,7 @@ mod tests {
     }
 
     /// SEC-1・TASK-37.1: capability 関連の定数の具体値。
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
     #[test]
     fn sec1_capability_consts_are_exact_x86_64() {
         assert_eq!(consts::SYS_CAPGET.raw(), Some(125));
@@ -4026,7 +4102,7 @@ mod tests {
     }
 
     /// SEC-1・TASK-37.1: capability 関連の定数の具体値（aarch64）。
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
     #[test]
     fn sec1_capability_consts_are_exact_aarch64() {
         assert_eq!(consts::SYS_CAPGET.raw(), Some(90));
@@ -4039,7 +4115,10 @@ mod tests {
     }
 
     /// `/proc/thread-self/status` の `field:` 行（16 進 64 bit）を 2 語にする。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     fn status_caps(field: &str) -> [u32; 2] {
         let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
         let line = status
@@ -4051,7 +4130,10 @@ mod tests {
     }
 
     /// SEC-1・TASK-37.1: `capget` の結果が `/proc/thread-self/status` と一致する。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sec1_cap_get_thread_reads_v3() {
         std::thread::spawn(|| {
@@ -4065,7 +4147,10 @@ mod tests {
     }
 
     /// SEC-1・TASK-37.1: カーネルの最後の capability 以降の番号は `EINVAL`。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sec1_cap_bounding_read_beyond_last_cap_is_einval() {
         assert_eq!(cap_bounding_contains(63), Err(SysError::Os(EINVAL)));
@@ -4073,7 +4158,10 @@ mod tests {
     }
 
     /// CORE-5・TASK-38.2: seccomp 適用の定数とレイアウトの具体値。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core5_seccomp_prctl_consts_and_layout_are_exact() {
         assert_eq!(consts::PR_GET_SECCOMP, 21);
@@ -4085,7 +4173,10 @@ mod tests {
     }
 
     /// CORE-1・TASK-27.4.3: `prctl` オプションの具体値（include/uapi/linux/prctl.h）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core1_prctl_no_new_privs_consts_are_exact() {
         assert_eq!(consts::PR_SET_NO_NEW_PRIVS, 38);
@@ -4093,7 +4184,10 @@ mod tests {
     }
 
     /// SUP-6・TASK-163.4: `prctl` の dumpable・親死亡シグナルのオプションの具体値（include/uapi/linux/prctl.h）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup6_task163_4_prctl_dumpable_consts_are_exact() {
         assert_eq!(consts::PR_GET_DUMPABLE, 3);
@@ -4108,7 +4202,10 @@ mod tests {
     /// 所有者は自分の euid。dumpable はプロセス単位で元へ戻すと他のテストと競合するため、ここでは読み取り
     /// だけを確かめる。`set_non_dumpable` の実 syscall と読み戻しは、単一スレッドの使い捨て worker で行う
     /// supervisor の結合試験 `exec_timeout`（既定のテスト集合）が照合する。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup6_task163_4_test_process_is_dumpable() {
         use std::os::unix::fs::MetadataExt as _;
@@ -4119,7 +4216,10 @@ mod tests {
 
     /// CORE-1・TASK-27.4.3: 専用スレッドで set し、GET と /proc の値で確認する（冪等）。
     /// フラグはスレッド単位なので、libtest の他スレッドに影響を残さないよう使い捨てスレッドで行う。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core1_set_no_new_privs_sets_calling_thread_flag() {
         std::thread::spawn(|| {
@@ -4166,7 +4266,7 @@ mod tests {
 
     /// x86_64: open フラグ・errno は asm-generic の値（include/uapi/asm-generic/fcntl.h・
     /// errno-base.h・errno.h）。
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
     #[test]
     fn core1_open_flags_and_errno_are_exact_x86_64() {
         assert_eq!(consts::O_DIRECTORY, 0o200_000);
@@ -4274,6 +4374,7 @@ mod tests {
     /// ことを具体値で照合する。
     #[cfg(all(
         target_os = "linux",
+        target_pointer_width = "64",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     #[test]
@@ -4331,6 +4432,7 @@ mod tests {
     /// [`core1_sec1_task29_devpts_real_mount`] の内側（新しい user + mount namespace の中）。
     #[cfg(all(
         target_os = "linux",
+        target_pointer_width = "64",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     fn devpts_real_mount_inner() {
@@ -4416,7 +4518,10 @@ mod tests {
     /// フラグの具体値。`AT_RECURSIVE` は付けず、`move_mount` の空パス指定は 0x44。
     #[test]
     fn core6_sec5_open_tree_consts_and_flags_are_exact() {
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
         {
             assert_eq!(consts::SYS_OPEN_TREE.raw(), Some(428));
             assert_eq!(
@@ -4583,7 +4688,7 @@ mod tests {
     /// aarch64（asm-generic）で個別に定義し、どちらも 429〜432。
     #[test]
     fn sup12_task169_new_mount_api_consts_are_exact() {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
         assert_eq!(
             (
                 consts::SYS_MOVE_MOUNT.raw(),
@@ -4593,7 +4698,7 @@ mod tests {
             ),
             (Some(429), Some(430), Some(431), Some(432))
         );
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
         assert_eq!(
             (
                 consts::SYS_MOVE_MOUNT.raw(),
@@ -4683,15 +4788,15 @@ mod tests {
         assert_eq!(consts::MS_BIND, 0x1000);
         assert_eq!(consts::MS_REC, 0x4000);
         assert_eq!(consts::MNT_DETACH, 2);
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
         assert_eq!(consts::SYS_PIVOT_ROOT.raw(), Some(155));
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
         assert_eq!(consts::SYS_PIVOT_ROOT.raw(), Some(41));
     }
 
     /// aarch64: O_DIRECTORY / O_NOFOLLOW は arch/arm64/include/uapi/asm/fcntl.h の上書き値
     /// （asm-generic の 0o200000 / 0o400000 は arm64 では O_DIRECT / O_LARGEFILE）。
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
     #[test]
     fn core1_open_flags_and_errno_are_exact_aarch64() {
         assert_eq!(consts::O_DIRECTORY, 0o40_000);
@@ -4714,7 +4819,10 @@ mod tests {
     /// procfs の fd エントリ名の組み立て（アロケーションなし）の具体値。
     #[test]
     fn sup6_task163_noctty_const_and_proc_fd_entry_are_exact() {
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
         assert_eq!(consts::O_NOCTTY, 0o400);
         let mut buf = [0u8; 32];
         assert_eq!(proc_fd_entry(0, &mut buf), Some(c"thread-self/fd/0"));
@@ -4754,9 +4862,9 @@ mod tests {
     /// arch ごとに個別定義する（x86_64 = syscall_64.tbl の 319、aarch64 = asm-generic/unistd.h の 279）。
     #[test]
     fn sup6_task163_sealed_copy_consts_are_exact() {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
         assert_eq!(consts::SYS_MEMFD_CREATE.raw(), Some(319));
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
         assert_eq!(consts::SYS_MEMFD_CREATE.raw(), Some(279));
         assert_eq!(consts::MFD_CLOEXEC, 0x1);
         assert_eq!(consts::MFD_ALLOW_SEALING, 0x2);
@@ -5027,18 +5135,18 @@ mod tests {
     /// arch ごとに個別定義する（x86_64 = syscall_64.tbl、aarch64 = asm-generic/unistd.h）。
     #[test]
     fn core1_fork_exec_consts_are_exact() {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
         assert_eq!(consts::SYS_EXECVEAT.raw(), Some(322));
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
         assert_eq!(consts::SYS_EXECVEAT.raw(), Some(281));
         assert_eq!(consts::AT_EMPTY_PATH, 0x1000);
         assert_eq!(consts::O_NONBLOCK, 0o4_000);
         assert_eq!(consts::O_RDWR, 2);
         assert_eq!((consts::F_SETFD, consts::FD_CLOEXEC), (2, 1));
         assert_eq!(consts::F_DUPFD_CLOEXEC, 1030);
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
         assert_eq!(consts::SYS_CLOSE_RANGE.raw(), Some(436));
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
         assert_eq!(consts::SYS_CLOSE_RANGE.raw(), Some(436));
         assert_eq!(consts::CLOSE_RANGE_CLOEXEC, 4);
         assert_eq!(consts::WNOHANG, 1);
@@ -5345,7 +5453,10 @@ mod tests {
     #[test]
     fn core1_device_consts_and_makedev_are_exact() {
         assert_eq!(consts::S_IFCHR, 0o020_000);
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
         assert_eq!(EEXIST, 17);
         assert_eq!(makedev(1, 3), 0x103);
         assert_eq!(makedev(1, 5), 0x105);
@@ -5447,12 +5558,18 @@ mod tests {
     }
 
     /// 存在しない fd 番号（`RLIMIT_NOFILE` を超える値）。`BorrowedFd` は作らず `RawFd` のまま非公開部分へ渡す。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     const BOGUS_FD: RawFd = 1_000_000;
 
     /// CORE-6・SEC-5（TASK-29 追補・#1659）: 失敗経路。無効な fd は `Os(EBADF)`（非特権では先に
     /// 特権検査で `Os(EPERM)`）で返り、パニックも縮退（`mount(2)` への切り替え）もしない。`move_mount_empty_path` も同様。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core6_sec5_open_tree_and_move_mount_fail_with_ebadf_on_invalid_fd() {
         // 特権チェックが fd 検証より先に走るため、非特権では EPERM になる（どちらも拒否で、成功しない）。
@@ -5471,7 +5588,10 @@ mod tests {
     /// コンテナ内では EPERM 側になる）。Linux 5.2 未満は両分岐とも `Unsupported`。前提: テストプロセスの
     /// user namespace が自分の mount namespace を所有する（`unshare --user` だけで走らせた場合は対象外）。
     /// user namespace 内での接続まで含む成功経路は下の実機前提テストが検証する。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core6_sec5_open_tree_clone_result_follows_cap_sys_admin() {
         const CAP_SYS_ADMIN_BIT: u32 = 1 << 21;
@@ -5490,7 +5610,10 @@ mod tests {
     /// `path` が呼び出しスレッドの mount namespace でマウントポイントか（`/proc/self/mountinfo` の 5 列目を
     /// [`unescape_mountinfo_field`] で戻した値と、正規化したパスのバイト列が完全一致）。`TMPDIR` が空白・タブ・
     /// 改行・`\` を含んでも誤判定しない（カーネルはこれらを 8 進エスケープして出力する）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     fn is_mount_point(path: &std::path::Path) -> bool {
         use std::os::unix::ffi::OsStrExt as _;
         let real = std::fs::canonicalize(path).expect("canonicalize");
@@ -5507,7 +5630,10 @@ mod tests {
     /// `" \t\n\\"`）は空白・タブ・改行・`\` を `\` + 8 進 3 桁（`\040`・`\011`・`\012`・`\134`）で出力する。
     /// 1 回の走査で戻し、戻した結果は再走査しない（`\134040` は `\040` の 4 バイトになる）。`\` の後が 8 進
     /// 3 桁でなければそのまま残す（カーネルはそうした列を出さない）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     fn unescape_mountinfo_field(bytes: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(bytes.len());
         let mut i = 0;
@@ -5534,7 +5660,10 @@ mod tests {
     /// CORE-6・REPAIR-12（TASK-29 追補・#1659）: mountinfo の 8 進エスケープ（空白 `\040`・タブ `\011`・
     /// 改行 `\012`・`\` の `\134`）を具体値で戻す。1 回だけ戻し（`\134040` → `\040`）、8 進 3 桁でない
     /// `\` の並びと 255 を超える値（`\777`）はそのまま残す。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core6_unescape_mountinfo_field_decodes_octal_escapes_once() {
         assert_eq!(
@@ -5560,7 +5689,10 @@ mod tests {
     /// CORE-6・REPAIR-12（TASK-29 追補・#1659）: 実機前提テストが使う `is_mount_point` を、特権なしで実際の
     /// `/proc/self/mountinfo` に当てる。`/proc`（procfs のマウントポイント）は真、作ったばかりの一時ディレクトリ
     /// （空白を含む名前の子を含む）は偽になる。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core6_is_mount_point_reads_real_mountinfo() {
         assert!(
@@ -5582,7 +5714,10 @@ mod tests {
 
     /// CORE-6・SEC-5・SEC-1（TASK-29 追補・#1659）: `/dev/null`（文字デバイス 1:3）は期待値 (1, 3) で検証を通り、
     /// 検証に使った fd そのもの（開き直さない）を保持する。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core6_sec5_verify_device_node_fd_accepts_dev_null_and_keeps_the_fd() {
         let fd = open_o_path("/dev/null");
@@ -5593,7 +5728,10 @@ mod tests {
 
     /// CORE-6・SEC-5・SEC-1（TASK-29 追補・#1659）: 文字デバイスでも `rdev` が期待値と違えば、実値と期待値を
     /// 持つ `UnexpectedRdev` で拒否する（`/dev/null` = 0x103 を `Zero`〔1:5〕= 0x105 として検証）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core6_sec5_verify_device_node_fd_rejects_unexpected_rdev() {
         let err =
@@ -5610,7 +5748,10 @@ mod tests {
     /// CORE-6・SEC-5・SEC-1（TASK-29 追補・#1659）: ディレクトリ（`/`）と通常ファイル（テストバイナリ自身）は
     /// 文字デバイスでないため `NotCharDevice` で拒否する。`mode` は `st_mode` の実値で、種別ビット
     /// （`S_IFMT` = 0o170000）がディレクトリ 0o040000・通常ファイル 0o100000 になる。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core6_sec5_verify_device_node_fd_rejects_directory_and_regular_file() {
         let kind = |path: &str| match verify_device_node_fd(open_o_path(path), HostDeviceNode::Null)
@@ -5627,7 +5768,10 @@ mod tests {
     /// 開いた fd は symlink 自体を指し、`NotCharDevice` で拒否される。`mode` の種別ビット（`S_IFMT`）は
     /// symlink の 0o120000。リンク先が実在する文字デバイスであること（辿れば検証を通る値であること）も先に
     /// 確かめ、拒否の理由が `O_NOFOLLOW` で辿らなかったことにあると示す（ぶら下がりリンクでの偶然の一致を除く）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core6_sec1_verify_device_node_fd_rejects_symlink_opened_with_nofollow() {
         use std::os::unix::fs::{FileTypeExt as _, symlink};
@@ -5649,7 +5793,10 @@ mod tests {
     }
 
     /// `path` を `O_PATH | O_NOFOLLOW` で開く（実機前提テストと特権なしテストの共通部品）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     fn open_o_path(path: &str) -> OwnedFd {
         use std::os::unix::fs::OpenOptionsExt as _;
         let flags = path_nofollow_open_flags().expect("supported arch");
@@ -5668,7 +5815,10 @@ mod tests {
     /// `unshare`）。`unshare --user --map-root-user --mount` で隔離した子として自身（`--ignored`）を再実行し、
     /// 子の中で `open_tree_clone` → `move_mount_empty_path` の成功経路を照合する。実行:
     /// `cargo test -p fandhe-container-core --lib core6_sec5_open_tree_binds -- --ignored`
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     #[ignore = "requires unprivileged user+mount namespaces and util-linux unshare (CORE-6, SEC-5)"]
     fn core6_sec5_open_tree_binds_host_device_node_in_userns() {
@@ -5696,7 +5846,10 @@ mod tests {
     }
 
     /// 子側の照合。fd 起点の複製・close-on-exec・ファイルへの接続・失敗時の未接続を具体値で確かめる。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     fn open_tree_bind_checks() {
         use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 

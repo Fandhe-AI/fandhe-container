@@ -13,6 +13,9 @@
 //! - `delete` の cgroup 削除は [`UnavailableCgroupRemover`] が `Unimplemented` で失敗する。cgroup 配置が
 //!   記録されたレコードに出会った場合だけ呼ばれ、cgroup も状態記録も残したまま 8 で失敗する（OCI-6・CORE-3）。
 //!
+//! 状態ルートが無ければ `production_runtime` の状態ストアを開く段階で親の下に 0700 で作る（親は作らない）。
+//! list / logs と同じ判断で、読み取り専用 open は足さない（理由は `list_logs` の module doc。#1607 E2）。
+//!
 //! 未実装・簡易実装（REPAIR-3）:
 //! - stop の失敗 JSON の `op` は `kill` になる（core に `LifecycleOp::Stop` が無いため。core 到達前の失敗も
 //!   `kill` に揃える）。猶予待ち → SIGKILL・Stopped への遷移確認・本番 signaler / cgroup remover

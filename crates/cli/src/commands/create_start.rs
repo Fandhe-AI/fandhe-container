@@ -127,15 +127,19 @@ pub(super) fn production_runtime<R>(
 /// 状態ストアを開く。Linux は core を直接使い、非 Linux は plugin 発見機構経由（TASK-79.4・PLUG-4）で
 /// 解決を試みて、現状は必ず失敗する（`plugin_backend` の未実装範囲を参照。REPAIR-3）。
 /// これは OS 別のバックエンド振り分けであり OS 固有設定（CLI-2）ではない。setup module は参照しない。
+///
+/// 状態ルートが無ければ親の下に 0700 で作る副作用がある（core の `FileStateStore::open`）。これは
+/// create / start / stop / delete / list / logs の 6 コマンドで共通で、親は作らない（#1607 E2。理由は
+/// `list_logs` の module doc）。`list_logs` の破損診断（`find_corrupted`）からも同じ解決で再度呼ばれる。
 #[cfg(target_os = "linux")]
-fn open_store(global: &GlobalArgs) -> Result<FileStateStore, TraitError> {
+pub(super) fn open_store(global: &GlobalArgs) -> Result<FileStateStore, TraitError> {
     use fandhe_container_core::state_store::StateRoot;
     let root = StateRoot::resolve(global.root.clone())?;
     FileStateStore::open(root)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_store(global: &GlobalArgs) -> Result<FileStateStore, TraitError> {
+pub(super) fn open_store(global: &GlobalArgs) -> Result<FileStateStore, TraitError> {
     Err(super::plugin_backend::unavailable(global))
 }
 

@@ -63,7 +63,7 @@
 //!   fsync・残骸掃除の強化は TASK-31.2（#156）、結合テスト（ライフサイクル経由の `state.json` 照合）は TASK-31.3（#157）で実装済み。CLI と supervisor の書き込み排他（`@lock`＋期限つき `try_lock`＋revision による楽観的排他）の検証・明文化は TASK-157.9（#1069）
 //! - `cgroups`: 委譲 cgroup v2 の検出・コンテナ用子 cgroup 作成・自プロセス退避の検証・controller
 //!   有効化・`memory.max` / `memory.swap.max` 設定・`cpu.max` 設定（Linux 限定。TASK-32.1・TASK-32.2・
-//!   TASK-32.3・CORE-3 は実装済み。TASK-32.4 は fork 後の子の `cgroup.procs` 参加フック `CgroupJoin` まで実装済み。本番 launcher からの結線は未実装）
+//!   TASK-32.3・CORE-3 は実装済み。TASK-32.4 は fork 後の子の `cgroup.procs` 参加フック `CgroupJoin` まで実装済み。本番 launcher からの結線は未実装。デバイス cgroup の eBPF 命令列の組み立て〔#1678〕まで実装済みで、ロード・アタッチは未実装）
 //! - `plugin`: `plugin` feature 配下の境界基盤型の再エクスポート（PLUG-3・TASK-111.1・#262）。
 //!   発見・登録は未実装
 //! - `plugin_discovery`: 管理ディレクトリ（system / user）からの plugin 候補探索（TASK-109.1・PLUG-4・PLUG-11）と `PATH` 探索の opt-in・警告ログ（TASK-109.2）、同名重複を解決する候補レジストリ（TASK-109.3。登録は未検証）は実装済み・OS 非依存。

@@ -51,7 +51,7 @@
 //!   `exec-test-support` の `close_standard_fds_for_test`）: 分離後・起動直前に自プロセスの fd `{0}`・`{0,1}`・`{0,1,2}`
 //!   を閉じてから `spawn_container` する。閉じた親からでも exec は fail-closed（`Exited(126)`・フックのログは空）で、
 //!   `all` は stderr も閉じるため marker を空にし、panic の診断だけを退避した複製へ出す。実行用 fd が 3 以上へ移る
-//!   具体値は launch 経路では観測できず（証跡未配線のため `execveat` の手前で拒否）、`tests/exec_child_setup.rs` で照合する
+//!   具体値は launch 経路では観測できず（`with_landlock` を載せないため `LaunchReady` が作られず `execveat` の手前で拒否）、`tests/exec_child_setup.rs` で照合する
 //!
 //! # 実機前提テストとしての分離
 //! 実行には root もしくは非特権 user namespace を許可するホストが必要（AppArmor の
@@ -537,7 +537,7 @@ mod linux {
     ///
     /// 閉じた親から `spawn_container` しても、実行用の fd が 0〜2 に入り込まず fail-closed のまま
     /// （`Exited(126)`）であることを固定する。fd 移動そのものの具体値（実行用 fd が 3 以上・標準入出力が 1:3）は、
-    /// launch 経路が制限適用の証跡未配線で `prepare_exec_child` の手前で拒否されるため観測できず、
+    /// launch 経路が `with_landlock` を載せず `LaunchReady` が作られないため `prepare_exec_child` の手前で拒否されるため観測できず、
     /// `tests/exec_child_setup.rs` の観測用の入口で照合している。証跡が配線されたら、本シナリオの期待を
     /// プローブの `Exited(42)` へ戻す（他シナリオと同じ扱い）。他のシナリオでは何もしない。
     #[cfg(feature = "exec-test-support")]

@@ -30,11 +30,18 @@
 //!   （`Rlimits`・`CapabilityDrop`・`NoNewPrivs`・`Seccomp`）は `with_hook` で `InvalidArgument` になり、`run_then` はフック配列を読まず
 //!   組み込み処理へ直接振り分ける
 //! - **[`StageReport`] と `Applied` は制限適用の証跡ではない**: 「フックが `Ok` を返した」事実の
-//!   記録にすぎない。`process.rs::require_restriction_evidence` の判定には使わず、フック無し・
-//!   ダミーフックのどちらでも exec は `PermissionDenied` のまま拒否される（SEC-1・CORE-5）。
-//!   将来の証跡は、各ビルトインのステージが返す型付きトークンで表す（REPAIR-3: 実装済みを装わない）。
-//!   capability 削減の [`CapabilityReport`] は終端クロージャへ渡すが、最終的な証跡型は
-//!   TASK-38・TASK-39 で決めるため、現時点では exec の許可には使われない
+//!   記録にすぎない。exec の許可には使わない（SEC-1・CORE-5）
+//! - **制限適用の証跡は型付きトークン `LaunchReady`**（#1714・TASK-29 追補・#1314 の決定）: 組み込みの
+//!   各段（`Rlimits`・`CapabilityDrop`・`NoNewPrivs`・`Seccomp`）と、`with_landlock` で登録した core の
+//!   Landlock 適用が `Ok` を返した直後に、このモジュール内だけで作れる段ごとの証跡（`exec/reapply.rs` の
+//!   `ExecReady` と同じ流儀）を、`run_then` が束ねて終端クロージャへ値で渡す。`process.rs` の
+//!   `require_restriction_evidence` が `LaunchReady` を受け取ったときだけ exec を許す。
+//!   - **Landlock は必須**: `with_landlock` を通らない（独自フックだけ・未登録）パイプラインでは作られない
+//!   - **`CgroupJoin` は条件に入れない**: cgroup を使う設定なのに join していない場合の拒否は
+//!     本番 launcher 側の責務（#1715）
+//!   - **`/proc/self/status` の読み戻しは証跡にしない**: 親から継承した制限と区別できないため
+//!   - 段が 1 つでも失敗したら打ち切るので `LaunchReady` は作られず、終端も呼ばれない（fail-closed）
+//!   - capability 削減の [`CapabilityReport`] は終端クロージャへ別途渡すが、exec の許可には使わない
 //! - **フックは fork 前に親で構築し、fork で子へコピーされて子で実行される**。シングルスレッドの
 //!   まま実行するため `Send` は要求しない。panic は `sys::fork_single_threaded` の
 //!   `catch_unwind` により `EXIT_SETUP_FAILED` で `_exit` する（fail-closed）
@@ -43,7 +50,7 @@
 //! # cgroup 参加（TASK-32.4）
 //!
 //! pivot 後はホストの `/sys/fs/cgroup` が見えないため、参加フックは fork 前に確保した cgroup
-//! ディレクトリの `OwnedFd` 経由で `cgroup.procs` へ書く。本番 launcher からの結線は未実装（REPAIR-3）。
+//! ディレクトリの `OwnedFd` 経由で `cgroup.procs` へ書く。本番 launcher からの結線は未実装（#1715。REPAIR-3）。
 
 use std::fmt;
 
@@ -64,6 +71,131 @@ use super::seccomp::testing::apply_default_seccomp;
 use crate::landlock::LandlockRuleset;
 use crate::rlimits::Rlimits;
 use crate::traits::types::ErrorCode;
+
+/// 段ごとの適用証跡（#1714・SEC-1・CORE-5）。
+///
+/// どれもこのモジュールの外では作れない（型自体が非公開）。`run_then` が各段の関数の `Ok` を受けた
+/// 直後にだけ作る。`Clone`・`Copy`・`Default` は持たせず、複製・既定値での偽造経路を作らない。
+/// 段の関数の戻り値は変えない（`exec/reapply.rs` も同系統の関数を使い、戻り値を広げると証跡を作る手段が
+/// exec の再適用の経路へ漏れるため）。
+///
+/// `Rlimits` は「呼び出し側が指定した集合（未指定・空を含む）を組み込み段が処理し終えた」ことを表す
+/// （SUP-12。launch では OCI の `process.rlimits` が空でもよい。必須にするかは spec の判断）。
+struct RlimitsApplied {
+    _private: (),
+}
+/// capability 削減が `Ok` を返した証跡。
+struct CapabilitiesDropped {
+    _private: (),
+}
+/// `PR_SET_NO_NEW_PRIVS` の設定が `Ok` を返した証跡。
+struct NoNewPrivsSet {
+    _private: (),
+}
+/// core の Landlock 適用（`with_landlock` 経由の `apply_landlock_stage`）が `Ok` を返した証跡。
+/// 独自の Landlock フックでは作られない。
+struct LandlockApplied {
+    _private: (),
+}
+/// 組み込み seccomp が `Ok` を返した証跡。
+struct SeccompApplied {
+    _private: (),
+}
+
+/// 制限ステージの適用証跡（#1714・TASK-29 追補・SEC-1・CORE-5）。
+///
+/// `exec/reapply.rs` の `ExecReady` と同じ流儀の型付きトークン。作るのは `StagePipeline::run_then` が
+/// 呼ぶ `bundle_launch_evidence` だけで、`for_test` のようなテスト用コンストラクタ・`Clone`・`Default` は
+/// 持たない。`process.rs` の `require_restriction_evidence` が値で受け取ったときだけ exec を許す。
+/// フィールドは「どの段が通ったか」を型で保持するだけで読み出さない。
+#[must_use]
+pub(crate) struct LaunchReady {
+    _rlimits: RlimitsApplied,
+    _capabilities: CapabilitiesDropped,
+    _no_new_privs: NoNewPrivsSet,
+    _landlock: LandlockApplied,
+    _seccomp: SeccompApplied,
+}
+
+/// 証跡がそろわなかったこと。欠けた段を `StageKind::ORDER` の順で持つ（最大 5 件）。
+///
+/// `require_restriction_evidence` が exec を拒否する理由（`PermissionDenied`・段 `Exec`）に変換する。
+#[derive(Debug)]
+pub(crate) struct LaunchNotReady {
+    missing: Vec<StageKind>,
+}
+
+impl LaunchNotReady {
+    /// 欠けた段（`ORDER` 順）。
+    pub(crate) fn missing(&self) -> &[StageKind] {
+        &self.missing
+    }
+
+    /// ステージ列を通していない入口（`exec_entrypoint`）用。証跡を持つ 5 段をすべて欠落として返す。
+    pub(super) fn pipeline_not_run() -> Self {
+        Self {
+            missing: StageKind::ORDER
+                .iter()
+                .copied()
+                .filter(|k| *k != StageKind::CgroupJoin)
+                .collect(),
+        }
+    }
+
+    /// exec 拒否のエラーへ変換する。段を `Exec` に保つのは、終了コード 126 を変えないため。
+    pub(super) fn into_exec_error(self) -> ExecError {
+        let names: Vec<&str> = self.missing().iter().map(|k| k.as_str()).collect();
+        ExecError::new(
+            ErrorCode::PermissionDenied,
+            IsolationStage::Exec,
+            format!(
+                "refusing to exec: no evidence that the isolation restrictions were applied; missing: {}",
+                names.join(",")
+            ),
+        )
+    }
+}
+
+/// 5 つの段ごとの証跡を `LaunchReady` に束ねる。1 つでも欠ければ欠けた段を列挙して `Err`。
+///
+/// 呼び出し元は `StagePipeline::run_then` だけ。関数に切り出してあるのは、パイプラインでは起こせない
+/// 欠落（例: seccomp だけ無い）も表で試験するため（`CgroupJoin` は条件に入れない）。
+fn bundle_launch_evidence(
+    rlimits: Option<RlimitsApplied>,
+    capabilities: Option<CapabilitiesDropped>,
+    no_new_privs: Option<NoNewPrivsSet>,
+    landlock: Option<LandlockApplied>,
+    seccomp: Option<SeccompApplied>,
+) -> Result<LaunchReady, LaunchNotReady> {
+    match (rlimits, capabilities, no_new_privs, landlock, seccomp) {
+        (Some(r), Some(c), Some(n), Some(l), Some(s)) => Ok(LaunchReady {
+            _rlimits: r,
+            _capabilities: c,
+            _no_new_privs: n,
+            _landlock: l,
+            _seccomp: s,
+        }),
+        (r, c, n, l, s) => {
+            let mut missing = Vec::new();
+            if r.is_none() {
+                missing.push(StageKind::Rlimits);
+            }
+            if c.is_none() {
+                missing.push(StageKind::CapabilityDrop);
+            }
+            if n.is_none() {
+                missing.push(StageKind::NoNewPrivs);
+            }
+            if l.is_none() {
+                missing.push(StageKind::Landlock);
+            }
+            if s.is_none() {
+                missing.push(StageKind::Seccomp);
+            }
+            Err(LaunchNotReady { missing })
+        }
+    }
+}
 
 /// ステージの種別。`ORDER` の順が実行順（固定）。
 ///
@@ -203,6 +335,8 @@ impl StageReport {
 pub struct StagePipeline {
     hooks: [Option<Box<dyn StageHook>>; 6],
     rlimits: Option<Rlimits>,
+    /// core の Landlock 適用（`with_landlock`）。これだけが `LandlockApplied` 証跡を作れる。
+    landlock: Option<LandlockRuleset>,
 }
 
 impl Default for StagePipeline {
@@ -220,6 +354,17 @@ impl fmt::Debug for StagePipeline {
                 continue;
             }
             let registered = self.hooks.get(kind.index()).is_some_and(Option::is_some);
+            if kind == StageKind::Landlock {
+                let state = if self.landlock.is_some() {
+                    "ruleset"
+                } else if registered {
+                    "custom_hook"
+                } else {
+                    "none"
+                };
+                d.field(kind.as_str(), &state);
+                continue;
+            }
             d.field(kind.as_str(), &registered);
         }
         d.finish()
@@ -232,6 +377,7 @@ impl StagePipeline {
         Self {
             hooks: [None, None, None, None, None, None],
             rlimits: None,
+            landlock: None,
         }
     }
 
@@ -243,11 +389,30 @@ impl StagePipeline {
     /// 以降の段と exec に進まない（fail-closed）。Landlock スロットを占有するため、独自の Landlock
     /// フックとは排他で、どちらが先でも 2 回目は `InvalidArgument`（`Validate` 段）になる。
     ///
-    /// 適用結果は制限適用の証跡ではなく捨てる（証跡型の確定は後続作業。REPAIR-3）。
-    pub fn with_landlock(self, ruleset: LandlockRuleset) -> Result<Self, ExecError> {
-        self.with_hook(StageKind::Landlock, move || {
-            apply_landlock_stage(&ruleset).map(|_report| ())
-        })
+    /// 適用が `Ok` なら、この段の証跡（`LandlockApplied`）を `run_then` が作る。独自の Landlock フックでは
+    /// 証跡は作られず、`LaunchReady` もそろわない（Landlock は必須。#1714・CORE-5）。適用結果
+    /// `LandlockApplyReport` 自体は証跡ではなく捨てる。
+    ///
+    /// `ruleset` は検出済みの Landlock ABI（`MIN_LANDLOCK_ABI` 以上）からしか作れないため、ABI 不足の
+    /// カーネルでは本関数へ到達する前に `landlock_ruleset_from_config` が起動を拒否する。
+    pub fn with_landlock(mut self, ruleset: LandlockRuleset) -> Result<Self, ExecError> {
+        let hook_set = self
+            .hooks
+            .get(StageKind::Landlock.index())
+            .is_some_and(Option::is_some);
+        if self.landlock.is_some() || hook_set {
+            return Err(Self::already_registered(StageKind::Landlock));
+        }
+        self.landlock = Some(ruleset);
+        Ok(self)
+    }
+
+    fn already_registered(kind: StageKind) -> ExecError {
+        ExecError::new(
+            ErrorCode::InvalidArgument,
+            IsolationStage::Validate,
+            format!("stage hook already registered: {}", kind.as_str()),
+        )
     }
 
     /// rlimit 集合（SUP-12・TASK-169.1・#526）を `Rlimits` 段へ設定する。
@@ -285,6 +450,9 @@ impl StagePipeline {
                 ),
             ));
         }
+        if kind == StageKind::Landlock && self.landlock.is_some() {
+            return Err(Self::already_registered(kind));
+        }
         let slot = self.hooks.get_mut(kind.index()).ok_or_else(|| {
             ExecError::new(
                 ErrorCode::Internal,
@@ -293,11 +461,7 @@ impl StagePipeline {
             )
         })?;
         if slot.is_some() {
-            return Err(ExecError::new(
-                ErrorCode::InvalidArgument,
-                IsolationStage::Validate,
-                format!("stage hook already registered: {}", kind.as_str()),
-            ));
+            return Err(Self::already_registered(kind));
         }
         *slot = Some(Box::new(hook));
         Ok(self)
@@ -306,7 +470,9 @@ impl StagePipeline {
     /// `ORDER` の順に各段のフックを実行し、全段成功したときだけ最後に `exec` を呼ぶ。
     ///
     /// 最初の `Err` で打ち切る（後続段と `exec` は呼ばない）。フックの `Err` は `stage` を
-    /// その段へ付け替えて返す。`exec` へは [`StageReport`] を渡す（証跡ではない）。
+    /// その段へ付け替えて返す。`exec` へは [`StageReport`]（証跡ではない）・capability 削減の結果・
+    /// 制限適用の証跡 `Result<LaunchReady, LaunchNotReady>`（#1714）を渡す。全段が成功しても Landlock が
+    /// `with_landlock` 経由でなければ `Err`（欠けた段つき）で、終端は exec を拒否する。
     ///
     /// # 呼び出し契約
     ///
@@ -353,39 +519,69 @@ impl StagePipeline {
     ///   `spawn_container_with_stages` 経由の結合試験（`fork_exec_isolation` の `stages-order`）へ移す。
     pub(crate) fn run_then<T>(
         mut self,
-        exec: impl FnOnce(&StageReport, Option<&CapabilityReport>) -> Result<T, ExecError>,
+        exec: impl FnOnce(
+            &StageReport,
+            Option<&CapabilityReport>,
+            Result<LaunchReady, LaunchNotReady>,
+        ) -> Result<T, ExecError>,
     ) -> Result<T, ExecError> {
         let mut statuses = [StageStatus::Skipped; 6];
         let mut capability_report = None;
+        // 証跡は各段の `Ok` の直後（`?` を越えた後）にここでだけ作る。
+        let mut rlimits_ev = None;
+        let mut capabilities_ev = None;
+        let mut no_new_privs_ev = None;
+        let mut landlock_ev = None;
+        let mut seccomp_ev = None;
         for kind in StageKind::ORDER {
             let idx = kind.index();
             match kind {
                 // 組み込み: フック配列のスロットは読まない（差し替えも無効化もできない）。
                 StageKind::Rlimits => {
                     // 未設定・空集合なら syscall を呼ばず `Skipped` のまま次の段へ進む。
+                    // 組み込み段の処理は完了しているので、証跡は両方の分岐で作る。
                     match self.rlimits.as_ref() {
                         Some(set) if !set.is_empty() => {
                             rlimits::apply_rlimits(set)
                                 .map_err(|e| e.at_stage(kind.isolation_stage()))?;
+                            rlimits_ev = Some(RlimitsApplied { _private: () });
                         }
-                        _ => continue,
+                        _ => {
+                            rlimits_ev = Some(RlimitsApplied { _private: () });
+                            continue;
+                        }
                     }
                 }
                 StageKind::CapabilityDrop => {
                     let r = apply_default_capabilities()
                         .map_err(|e| e.at_stage(kind.isolation_stage()))?;
                     capability_report = Some(r);
+                    capabilities_ev = Some(CapabilitiesDropped { _private: () });
                 }
                 StageKind::NoNewPrivs => {
                     no_new_privs::apply_no_new_privs()
                         .map_err(|e| e.at_stage(kind.isolation_stage()))?;
+                    no_new_privs_ev = Some(NoNewPrivsSet { _private: () });
                 }
                 StageKind::Seccomp => {
-                    // 証跡型の確定と配線は後続作業（スコープ外）のため、終端へは渡さない（REPAIR-3）。
                     let _report =
                         apply_default_seccomp().map_err(|e| e.at_stage(kind.isolation_stage()))?;
+                    seccomp_ev = Some(SeccompApplied { _private: () });
                 }
-                StageKind::CgroupJoin | StageKind::Landlock => {
+                StageKind::Landlock => {
+                    if let Some(ruleset) = self.landlock.as_ref() {
+                        apply_landlock_stage(ruleset)
+                            .map_err(|e| e.at_stage(kind.isolation_stage()))?;
+                        landlock_ev = Some(LandlockApplied { _private: () });
+                    } else if let Some(Some(hook)) = self.hooks.get_mut(idx) {
+                        // 独自フックは `Applied` になるが証跡は作らない。
+                        hook.apply()
+                            .map_err(|e| e.at_stage(kind.isolation_stage()))?;
+                    } else {
+                        continue;
+                    }
+                }
+                StageKind::CgroupJoin => {
                     let Some(Some(hook)) = self.hooks.get_mut(idx) else {
                         continue;
                     };
@@ -397,7 +593,18 @@ impl StagePipeline {
                 *s = StageStatus::Applied;
             }
         }
-        exec(&StageReport { statuses }, capability_report.as_ref())
+        let evidence = bundle_launch_evidence(
+            rlimits_ev,
+            capabilities_ev,
+            no_new_privs_ev,
+            landlock_ev,
+            seccomp_ev,
+        );
+        exec(
+            &StageReport { statuses },
+            capability_report.as_ref(),
+            evidence,
+        )
     }
 }
 
@@ -422,7 +629,11 @@ mod tests {
         Rlimits::new(vec![Rlimit::new(RlimitKind::Nofile, 256, 512).unwrap()]).unwrap()
     }
 
-    fn exec_ok(_: &StageReport, _: Option<&CapabilityReport>) -> Result<(), ExecError> {
+    fn exec_ok(
+        _: &StageReport,
+        _: Option<&CapabilityReport>,
+        _: Result<LaunchReady, LaunchNotReady>,
+    ) -> Result<(), ExecError> {
         rec("exec");
         Ok(())
     }
@@ -461,7 +672,7 @@ mod tests {
         take();
         take_sets();
         let report = all_hooks_reversed()
-            .run_then(|r, _| {
+            .run_then(|r, _, _| {
                 rec("exec");
                 Ok(r.clone())
             })
@@ -510,7 +721,7 @@ mod tests {
             .with_hook(StageKind::Landlock, ok_hook(StageKind::Landlock))
             .unwrap();
         let report = p
-            .run_then(|r, _| {
+            .run_then(|r, _, _| {
                 rec("exec");
                 Ok(r.clone())
             })
@@ -544,7 +755,7 @@ mod tests {
     fn core1_empty_pipeline_applies_builtin_stages() {
         take();
         let report = StagePipeline::new()
-            .run_then(|r, _| {
+            .run_then(|r, _, _| {
                 rec("exec");
                 Ok(r.clone())
             })
@@ -632,7 +843,7 @@ mod tests {
             .unwrap()
             .with_rlimits(rlimit_fixture())
             .unwrap()
-            .run_then(|r, _| {
+            .run_then(|r, _, _| {
                 rec("exec");
                 Ok(r.clone())
             })
@@ -664,7 +875,7 @@ mod tests {
                 .unwrap(),
         ] {
             let report = p
-                .run_then(|r, _| {
+                .run_then(|r, _, _| {
                     rec("exec");
                     Ok(r.clone())
                 })
@@ -1001,12 +1212,194 @@ mod tests {
     fn sec1_terminal_receives_capability_report() {
         take();
         let granted = StagePipeline::new()
-            .run_then(|_, caps| Ok(caps.map(|c| c.granted)))
+            .run_then(|_, caps, _| Ok(caps.map(|c| c.granted)))
             .unwrap();
         assert_eq!(
             granted,
             Some(crate::capabilities::CapabilitySet::oci_default())
         );
         take();
+    }
+
+    use super::super::landlock::testing::fake_landlock_err;
+
+    fn ev_of(stages: StagePipeline) -> Result<(Vec<StageKind>, bool), ExecError> {
+        stages.run_then(|_, _, ev| match ev {
+            Ok(_ready) => Ok((Vec::new(), true)),
+            Err(n) => Ok((n.missing().to_vec(), false)),
+        })
+    }
+
+    /// SEC-1・CORE-5・#1714: 5 つの証跡のうち 1 つでも欠ければ `LaunchReady` は作られず、欠けた段が
+    /// `ORDER` 順で具体値として報告される（Landlock 無し・Seccomp 無しを含む）。
+    #[test]
+    fn sec1_core5_bundle_requires_every_evidence() {
+        let r = || Some(RlimitsApplied { _private: () });
+        let c = || Some(CapabilitiesDropped { _private: () });
+        let n = || Some(NoNewPrivsSet { _private: () });
+        let l = || Some(LandlockApplied { _private: () });
+        let s = || Some(SeccompApplied { _private: () });
+        assert!(bundle_launch_evidence(r(), c(), n(), l(), s()).is_ok());
+        let cases = [
+            (
+                bundle_launch_evidence(None, c(), n(), l(), s()),
+                StageKind::Rlimits,
+            ),
+            (
+                bundle_launch_evidence(r(), None, n(), l(), s()),
+                StageKind::CapabilityDrop,
+            ),
+            (
+                bundle_launch_evidence(r(), c(), None, l(), s()),
+                StageKind::NoNewPrivs,
+            ),
+            (
+                bundle_launch_evidence(r(), c(), n(), None, s()),
+                StageKind::Landlock,
+            ),
+            (
+                bundle_launch_evidence(r(), c(), n(), l(), None),
+                StageKind::Seccomp,
+            ),
+        ];
+        for (got, missing) in cases {
+            let err = got.err().expect("must be not ready");
+            assert_eq!(err.missing(), [missing]);
+        }
+        let all = bundle_launch_evidence(None, None, None, None, None)
+            .err()
+            .expect("must be not ready");
+        assert_eq!(all.missing(), &StageKind::ORDER[1..]);
+    }
+
+    /// CORE-5・#1714: Landlock の段を通らないパイプライン（`with_landlock` 無し）では `LaunchReady` が作られない。
+    #[test]
+    fn core5_pipeline_without_landlock_yields_no_launch_ready() {
+        take();
+        let (missing, ready) = ev_of(
+            StagePipeline::new()
+                .with_hook(StageKind::CgroupJoin, ok_hook(StageKind::CgroupJoin))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!ready);
+        assert_eq!(missing, [StageKind::Landlock]);
+        take();
+        let (missing, ready) = ev_of(StagePipeline::new()).unwrap();
+        assert!(!ready);
+        assert_eq!(missing, [StageKind::Landlock]);
+        assert_eq!(take(), ["capability_drop", "no_new_privs", "seccomp"]);
+    }
+
+    /// SEC-1・#1714: 独自の Landlock フックは `Applied` になっても証跡ではない。
+    #[test]
+    fn sec1_custom_landlock_hook_is_not_evidence() {
+        take();
+        let p = StagePipeline::new()
+            .with_hook(StageKind::Landlock, ok_hook(StageKind::Landlock))
+            .unwrap();
+        let (missing, ready, status) = p
+            .run_then(|r, _, ev| {
+                Ok((
+                    ev.as_ref().err().map(|n| n.missing().to_vec()),
+                    ev.is_ok(),
+                    r.status(StageKind::Landlock),
+                ))
+            })
+            .map(|(m, r, st)| (m.unwrap_or_default(), r, st))
+            .unwrap();
+        assert!(!ready);
+        assert_eq!(missing, [StageKind::Landlock]);
+        assert_eq!(status, StageStatus::Applied);
+        take();
+    }
+
+    /// SEC-1・CORE-5・#1714・SUP-12: `with_landlock` を含む全段の成功でだけ `LaunchReady` が作られる。
+    /// CgroupJoin の有無・rlimit の有無（未指定は `Skipped` のまま）は条件に入らない。
+    #[test]
+    fn sec1_core5_full_pipeline_yields_launch_ready() {
+        for (with_cgroup, with_rlimit) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            take();
+            take_sets();
+            let mut p = StagePipeline::new()
+                .with_landlock(landlock_fixture())
+                .unwrap();
+            let mut expected = Vec::new();
+            if with_cgroup {
+                p = p
+                    .with_hook(StageKind::CgroupJoin, ok_hook(StageKind::CgroupJoin))
+                    .unwrap();
+                expected.push("cgroup_join");
+            }
+            if with_rlimit {
+                p = p.with_rlimits(rlimit_fixture()).unwrap();
+                expected.push("rlimits");
+            }
+            expected.extend([
+                "capability_drop",
+                "no_new_privs",
+                "landlock",
+                "seccomp",
+                "exec",
+            ]);
+            let rlimits_status = p
+                .run_then(|r, _, ev| {
+                    rec("exec");
+                    assert!(ev.is_ok());
+                    Ok(r.status(StageKind::Rlimits))
+                })
+                .unwrap();
+            assert_eq!(take(), expected);
+            assert_eq!(
+                rlimits_status,
+                if with_rlimit {
+                    StageStatus::Applied
+                } else {
+                    StageStatus::Skipped
+                }
+            );
+            take_sets();
+        }
+    }
+
+    /// SEC-1・CORE-5・#1714（fail-closed）: どの組み込み段・Landlock が失敗しても終端は呼ばれず、
+    /// `LaunchReady` は作られない。エラーの段と code は失敗した段のまま。
+    #[test]
+    fn sec1_stage_failure_never_reaches_launch_ready() {
+        let boom = |code| ExecError::new(code, IsolationStage::Validate, "boom");
+        for failing in [
+            StageKind::Rlimits,
+            StageKind::CapabilityDrop,
+            StageKind::NoNewPrivs,
+            StageKind::Landlock,
+            StageKind::Seccomp,
+        ] {
+            take();
+            take_sets();
+            let code = match failing {
+                StageKind::Landlock | StageKind::Seccomp => ErrorCode::FailedPrecondition,
+                _ => ErrorCode::PermissionDenied,
+            };
+            match failing {
+                StageKind::Rlimits => fake_rlimits(Err(SysError::Os(sys::EPERM)), None),
+                StageKind::CapabilityDrop => fake_capability_drop_err(SysError::Os(sys::EPERM)),
+                StageKind::NoNewPrivs => fake(Err(SysError::Os(sys::EPERM)), Ok(true)),
+                StageKind::Landlock => fake_landlock_err(boom(code)),
+                _ => fake_seccomp_err(boom(code)),
+            }
+            let err = StagePipeline::new()
+                .with_rlimits(rlimit_fixture())
+                .unwrap()
+                .with_landlock(landlock_fixture())
+                .unwrap()
+                .run_then(exec_ok)
+                .unwrap_err();
+            assert_eq!(err.stage, failing.isolation_stage(), "{}", failing.as_str());
+            assert_eq!(err.code, code, "{}", failing.as_str());
+            assert!(!take().contains(&"exec"), "{}", failing.as_str());
+            take_sets();
+        }
     }
 }

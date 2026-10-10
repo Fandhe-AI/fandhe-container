@@ -38,7 +38,7 @@
 //!   errno 分類を再利用するため（`exec/devices.rs` と同じ判断）。ステージ列へは #173（TASK-37.2）で組み込み済み
 //! - `observability`: メトリクス集計型 `OpStats` 等（TASK-84.1）と記録 API `OpRecorder`
 //!   （TASK-84.2）は実装済み（REPAIR-4）。JSON Lines 出力（TASK-84.3）も実装済み。create / start / kill の計装は実装済み（TASK-84.4）、delete も TASK-30.2 で同じパターンにより計装済み。io 向け連携点は io 側に定義済み（TASK-84.5）
-//! - `landlock`: Landlock ABI 検出（TASK-39.1・#181）とパスルール生成（TASK-39.2・#182）と ruleset 適用（TASK-39.3・#183）を実装済み（Linux 限定。CORE-5）。ステージ列への組み込み口（`StagePipeline::with_landlock`・TASK-39.4・#184）は実装済みで、本番 launcher からの呼び出しと制限適用の証跡配線は後続作業。
+//! - `landlock`: Landlock ABI 検出（TASK-39.1・#181）とパスルール生成（TASK-39.2・#182）と ruleset 適用（TASK-39.3・#183）を実装済み（Linux 限定。CORE-5）。ステージ列への組み込み口（`StagePipeline::with_landlock`・TASK-39.4・#184）は実装済みで、制限適用の証跡は `LaunchReady`（#1714）で配線済み。本番 launcher からの呼び出しは後続作業（#1715）。
 //! - `rlimits`: rlimit（`process.rlimits`・`--ulimit`）の検証済み型 `Rlimit`・`Rlimits`（SUP-12・TASK-169.1・#526。OS 非依存）。適用は `exec::StagePipeline::with_rlimits`（Linux 限定）で、OCI config からの結線は未実装（REPAIR-3）
 //! - `rootless`: user namespace の UID/GID 写像の設定・読み戻し検証（Linux 限定。CORE-6・SEC-5・
 //!   TASK-40.1）。検証済み写像型・subuid/subgid 解析・`Direct` / `newuidmap` 経由の書き込みが実装済みで、

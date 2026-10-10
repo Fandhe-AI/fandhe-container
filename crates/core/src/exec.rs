@@ -9,7 +9,7 @@
 //! `exec/no_new_privs.rs`）、capability 削減（#173）と seccomp（#178・TASK-38.3）も同様に組み込み済み。
 //! cgroup 参加は `cgroups::CgroupJoin`（TASK-32.4・#161）が `StageHook` として実装済み（登録は呼び出し側）。
 //! exec 経路（SUP-6）の制限の再適用は [`prepare_exec_restrictions`] / [`reapply_restrictions`]
-//! （TASK-163.3・TASK-163.4・#502・#503。`exec/reapply.rs`。`setns` の後に使えるよう status fd と rootfs の固定を事前に保持する二段階 API。参加後の対象束縛と `/` を照合してから、rlimit・capability 削減・`NO_NEW_PRIVS`・Landlock・seccomp を launch と同じ順で適用する）。稼働中コンテナでのコマンド実行は、再適用の完了の証跡 [`ExecReady`] だけを受け取る [`spawn_exec_command`]（`exec/exec_command.rs`。fork → `close_range` → `execveat`。TASK-163.4・#503）が担う。launch 経路の制限適用の証跡は未実装（Landlock は `StagePipeline::with_landlock` で差し込み可能。#184）で、後続の sub-issue（#137、TASK-39・40）が追記する（REPAIR-3: 実装済みを装わない）。
+//! （TASK-163.3・TASK-163.4・#502・#503。`exec/reapply.rs`。`setns` の後に使えるよう status fd と rootfs の固定を事前に保持する二段階 API。参加後の対象束縛と `/` を照合してから、rlimit・capability 削減・`NO_NEW_PRIVS`・Landlock・seccomp を launch と同じ順で適用する）。稼働中コンテナでのコマンド実行は、再適用の完了の証跡 [`ExecReady`] だけを受け取る [`spawn_exec_command`]（`exec/exec_command.rs`。fork → `close_range` → `execveat`。TASK-163.4・#503）が担う。launch 経路の制限適用の証跡は型付きトークン `LaunchReady`（#1714。`StagePipeline::run_then` が作り、`with_landlock` を含む全段の成功時にだけ exec を許す）。本番 launcher からの結線は #1715（REPAIR-3）。
 //!
 //! # 目指すフロー（Linux 専用）
 //!
@@ -27,8 +27,8 @@
 //!    常に適用する。capability の絞り込み処理 `apply_default_capabilities`（crate 内限定。SEC-1・TASK-37.1・#172）
 //!    も #173（TASK-37.2）で同じく差し替え不可の組み込み段になった。seccomp の適用処理 `apply_default_seccomp`
 //!    （crate 内限定。CORE-5・TASK-38.2・#177）も #178（TASK-38.3）で同じく差し替え不可の組み込み段になり、
-//!    exec 直前に必ず適用される。最終的な制限の証跡は未実装（Landlock は `StagePipeline::with_landlock` で差し込み可能。
-//!    組み込み段ではない）のため exec は引き続き拒否される。cgroup 参加は `cgroups::CgroupJoin` を呼び出し側が登録して使う。
+//!    exec 直前に必ず適用される。制限適用の証跡は型付きトークン `LaunchReady`（#1714。`run_then` だけが作る）で、`StagePipeline::with_landlock` を載せて
+//!    全段が成功したときだけ exec へ進む（挙動の変更: 従来は常に拒否）。Landlock 無しのパイプラインは拒否される。cgroup 参加は `cgroups::CgroupJoin` を呼び出し側が登録して使う。
 //!    他の段の実体は未実装で、後続の TASK-39・40 が [`StageHook`] として
 //!    差し込む）。
 //!    `NO_NEW_PRIVS` を Landlock / seccomp より前に固定する順序は fail-closed の前提で、
@@ -36,8 +36,8 @@
 //! 5. `fork` / `exec`（#831・TASK-27.4.1。**最小構成のみ実装済み**。[`spawn_container`] が分離済みの
 //!    親から子を fork し、子が `establish` → [`prepare_rootfs`] → [`pivot_root`] →
 //!    [`exec_entrypoint`] を行う。上の第 3・4 段〔デバイスノード・ステージ列・`NO_NEW_PRIVS`〕のうち
-//!    制限適用の証跡配線が未実装のため**この最小構成は exec を許可せず、[`exec_entrypoint`] は
-//!    制限の適用証跡が無い限り rootful・rootless を問わず `PermissionDenied` で exec を拒否する**
+//!    Landlock を載せない**この最小構成（[`spawn_container`]）は `LaunchReady` が作られず exec を許可せず、
+//!    ステージ列を通さない [`exec_entrypoint`] は rootful・rootless を問わず常に `PermissionDenied` で exec を拒否する**
 //!    （SEC-1・CORE-5。fail-closed）。親子間の同期・構造化エラーパイプも未実装で、子の失敗は
 //!    終了コードと stderr で伝える〔TASK-29/30 で扱う〕）
 //!

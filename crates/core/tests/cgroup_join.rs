@@ -9,7 +9,7 @@
 //!    `/proc/self/cgroup` が既に子 cgroup を指す）
 //!
 //! # 観測点
-//! 制限の証跡が無い間は exec が常に拒否される（fail-closed。REPAIR-3）ため、組み込みでない Landlock 段の
+//! `with_landlock` を載せないため `LaunchReady` が作られず exec が拒否される（fail-closed。#1714）ため、組み込みでない Landlock 段の
 //! フックを観測点にして、親と合図ファイルで同期する。TASK-39.4 で Landlock が組み込み段になるとこの登録は
 //! `InvalidArgument` で失敗する（意図した仕掛け。そのとき観測点を `CgroupJoin` 段の実フックを包む
 //! ラッパーへ移し、`Exited(126)` の期待値も見直す）。

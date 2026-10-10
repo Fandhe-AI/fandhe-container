@@ -175,7 +175,7 @@
 //!   - 残るものは Landlock（ルール外のバイナリの `EXECUTE` を拒否する）が塞ぐ前提で、Landlock に依存しない形で塞ぐには
 //!     方式 B が要る
 //! - **launch の実プロセスでの照合は証跡配線の後**: launch と exec は同じ `prepare_exec_child` を通るため同じ照合が
-//!   掛かるが、launch の実プロセスは制限適用の証跡（`require_restriction_evidence`）が配線されるまで常に拒否され、
+//!   掛かるが、launch の実プロセスは `with_landlock` を載せない構成では制限適用の証跡（`LaunchReady`。#1714）がそろわず常に拒否され、
 //!   照合まで到達しない。現時点の確認は共有手順を実プロセスで通す結合試験（`tests/exec_child_setup.rs`）と単体
 //!   テストに依る。証跡の配線後に launch の実プロセス照合を足す（SUP-6・SEC-1）
 //! - **`binfmt_misc` は対象外**: ホスト側に登録された `binfmt_misc` のインタープリタ（拡張子・マジックで選ばれる）

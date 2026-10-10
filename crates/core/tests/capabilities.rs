@@ -15,8 +15,8 @@
 //!   ディスパッチャが自身を `--scenario capabilities <rootfs>` で再起動した別プロセスで行う。
 //!
 //! # 観測点
-//! 現状は Landlock（TASK-39）が未実装で、制限の証跡が無い間は exec が常に拒否される
-//! （fail-closed。REPAIR-3）ため、exec 後のプロセスは観測できない。そこで組み込みでない最後の段
+//! `with_landlock` を載せない構成では `LaunchReady` が作られず exec が拒否される
+//! （fail-closed。#1714）ため、exec 後のプロセスは観測できない。そこで組み込みでない最後の段
 //! （`StageKind::Landlock` のフック）を、組み込みの `CapabilityDrop`・`NoNewPrivs` の後・組み込みの
 //! seccomp（#178。観測点の後に適用される）と exec の前の観測点として使う。フックは親と合図ファイルで
 //! 同期し、親は子が停止している間に `/proc/<pid>/status` を読む。TASK-39.4 で Landlock が組み込み段に

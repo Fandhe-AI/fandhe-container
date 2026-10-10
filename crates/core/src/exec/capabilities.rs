@@ -6,8 +6,8 @@
 //! capability を OCI 既定集合（[`CapabilitySet::oci_default`]。SEC-1）へ絞り込み、結果を読み戻して
 //! 検証する。ステージ列（`StagePipeline`）へは #173（TASK-37.2）で組み込み済みで、`StagePipeline::run_then`
 //! が差し替え不可の組み込み段として呼ぶ（返す [`CapabilityReport`] は終端クロージャへ渡る）。
-//! 最終的な制限適用の証跡型は TASK-38・TASK-39 で決めるため、`process.rs::require_restriction_evidence`
-//! は本関数の成否によらず exec を拒否し続ける（REPAIR-3）。実プロセスでの `/proc/<pid>/status` 検証は
+//! 制限適用の証跡は `stages.rs` の `run_then` が本関数の成功後に作る `LaunchReady`（#1714）で、[`CapabilityReport`]
+//! 自体は exec の許可に使わない。実プロセスでの `/proc/<pid>/status` 検証は
 //! #174（TASK-37.3）が担う。
 //!
 //! # 契約

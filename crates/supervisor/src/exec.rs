@@ -5,7 +5,8 @@
 //! `state.json` のレコードから対象を決め、`fandhe_container_core::exec` の安全 API（`Pid1Target` /
 //! `join_namespaces` / `prepare_cgroup_join` / `join_cgroup` / `prepare_exec_restrictions` /
 //! `reapply_restrictions`）へ配線するだけの薄い層で、`unsafe` も OS 分岐も持たない（OS 局所化は core。CLI-1）。
-//! 通しの入口は [`run_command`]（#503）。exec 専用プロセスと TASK-161（SUP-4）の healthcheck が同じ関数を使う
+//! 本番の通しの入口は [`run_command_with_pidfd`] だけ（#503・#1617。縮退経路の `run_command` は `exec-test-support` の試験専用で、
+//! 既定ビルドに存在しない）。exec 専用プロセスと TASK-161（SUP-4）の healthcheck が同じ関数を使う
 //! （`health.rs` の `HealthProbe` が期待する共通コードパス）。
 //!
 //! # 契約
@@ -25,9 +26,9 @@
 //!   SEC-1 の同一性照合を迂回できるため。TASK-163 追補・#1460）。supervisor 自身のテストでは dev-dependency の
 //!   自己参照で有効になり、試験専用の入口を使う結合試験は既定のテスト集合に残る
 //! - [`enter_namespaces`] は呼び出しスレッドの namespace を不可逆に変える。単一スレッドのプロセスから
-//!   のみ呼べる。logs 捕捉スレッドを持つ supervisor 本体からは呼ばず、exec 専用プロセスから呼ぶ（[`run_command`]。#503）
+//!   のみ呼べる。logs 捕捉スレッドを持つ supervisor 本体からは呼ばず、exec 専用プロセスから呼ぶ（[`run_command_with_pidfd`]。#503）
 //! - 順序: [`prepare_cgroup_join`]（cgroup.procs の fd 確保。#501）は [`enter_namespaces`] の **前**、
-//!   [`join_cgroup`] は準備の後（`enter_namespaces` の後・seccomp の前。[`run_command`] が固定する）。
+//!   [`join_cgroup`] は準備の後（`enter_namespaces` の後・seccomp の前。[`run_command_with_pidfd`] が固定する）。
 //!   `/proc/self/cgroup` の fd も準備で確保する（`setns` 後は自プロセスを procfs から解決できないため）
 //! - 制限の再適用（#502・#503）: [`prepare_restrictions`]（ホスト側の `config.json` を読み、
 //!   コンテナの rootfs を固定し、自プロセスの `/proc/self/status` の fd を確保）は [`enter_namespaces`] の **前**、
@@ -50,7 +51,7 @@
 //!   `ExecReady` で、[`require_exec_ready`]（core の `ExecRestrictionReport::into_complete`）だけが作る。
 //!   core の `spawn_exec_command`（fork → `close_range` → `execveat`）は `ExecReady` を値で受け取り、
 //!   `ExecRestrictionReport`・真偽値を受け取る入口はない（SEC-1）
-//! - **コマンドの環境と補助グループ**（SEC-1・SEC-5・TASK-163 追補・#1457）: [`run_command`] はコマンドを
+//! - **コマンドの環境と補助グループ**（SEC-1・SEC-5・TASK-163 追補・#1457）: [`run_command_with_pidfd`] はコマンドを
 //!   [`ExecRequest`]（コンテナ内の絶対パス・argv・明示の環境変数）で受け取る。**環境変数の基底は呼び出し側から
 //!   渡せず**、worker が対象の bundle の `config.json` の `process.env`（コンテナ定義。launch がエントリポイントへ
 //!   渡すのと同じ出所）から組み立てる。呼び出し側が足せるのは、利用者がその exec に対して明示した値
@@ -58,7 +59,7 @@
 //!   起動したプロセス（CLI・supervisor）の環境は 1 つも渡らず、既定値の補完もしない（入口が `std::env::vars()` を
 //!   渡す形は型で書けない。core の `exec/container_env.rs`）。補助グループは launch と同じく空にする（core の
 //!   capability 削減が `setgroups(0)` を呼ぶ。exec を起動したプロセスのホスト側の補助グループを持ち越さない）。
-//!   **消去は namespace へ参加する前にも行う**（[`prepare_restrictions`]・[`run_command`] の準備の最後。不可逆。
+//!   **消去は namespace へ参加する前にも行う**（[`prepare_restrictions`]・[`run_command_with_pidfd`] の準備の最後。不可逆。
 //!   worker の証跡 `ExecWorkerProof` がなければ呼べない。#1532）:
 //!   対象の user namespace へ入った後は `setgroups` が `deny` で消せなくなり、exec を起動したプロセス（root・
 //!   `sudo` 経由・別のグループ集合のセッション）のグループをコンテナへ持ち込むため。消去できず `deny` も確認
@@ -82,7 +83,7 @@
 //! - **制限は対象へ束縛される**: [`prepare_restrictions`] が対象 pid1 の mount namespace の識別子を記録し、
 //!   [`reapply_restrictions`] が参加後の自プロセスのものと照合する。同じ rootfs を共有する別コンテナへ参加した
 //!   場合は違反 `exec_joined_namespace_mismatch` で拒否し、何も適用しない（`/` の照合だけでは検出できない）
-//! - **全体の上限時間**: [`run_command`] は対象の特定から終了待ちまでの全体に上限時間を課す（REPAIR-5）。
+//! - **全体の上限時間**: [`run_command_with_pidfd`] は対象の特定から終了待ちまでの全体に上限時間を課す（REPAIR-5）。
 //!   `setns`・cgroup join・制限の再適用・procfs / cgroupfs の読み書きは単一スレッドでブロックし得るため、
 //!   同一プロセス内の期限確認では途中のハングを止められない。そこで **準備から実行までを worker プロセスへ
 //!   隔離** する: 呼び出しプロセス（単一スレッド）が core の `spawn_exec_worker` で worker を fork し、全体の
@@ -134,7 +135,7 @@
 //!   層・ワイヤー DTO の変更が要る（#652 の共通ログ型と合わせて決める）。縮退の事実は worker の構造化ログ
 //!   （`supervisor.exec` / `entrypoint_mode`）と [`ExecOutcome::entrypoint_mode`] で観測できる。worker で sink の I/O を
 //!   しない契約にも反する。entrypoint 種別の違反の記録は #1595
-//! - **監査記録**（SEC-4・SUP-6・TASK-163 追補・#1465）: [`run_command`] は監査の記録先 [`AuditSink`] を必須の
+//! - **監査記録**（SEC-4・SUP-6・TASK-163 追補・#1465）: [`run_command_with_pidfd`] は監査の記録先 [`AuditSink`] を必須の
 //!   引数に取り、exec の対象の拒否（種別 `exec_target`。理由 `exec_target_*`・`exec_root_not_container_rootfs`・
 //!   `exec_joined_*`・`exec_target_pidfd_mismatch` の 10 種）を層 `exec_target` のレコードとして **1 拒否につき 1 件**
 //!   記録する。worker の制限の準備で生じる rootfs の拒否（種別 `rootfs_pivot` の `rootfs_is_host_root`。worker 自身の
@@ -165,7 +166,7 @@
 //!    `tests/exec_setns_join.rs` が非特権の user namespace で照合する
 //!    （既定の入口 [`identify_pid1`] が実 cgroup の記録から成功すること・別 instance と特定後の cgroup 移動を拒否
 //!    することは、委譲 cgroup を要する実機前提の `tests/exec_identify_cgroup.rs` が照合する。#1464）
-//! 5. exec 専用プロセス全体のタイムアウトと、`execve` 前の `close_range`（[`run_command`] と core の
+//! 5. exec 専用プロセス全体のタイムアウトと、`execve` 前の `close_range`（[`run_command_with_pidfd`] と core の
 //!    `exec/exec_command.rs`）
 //!
 //! # 対象の固定: 起動時の pidfd と縮退経路（#1461）
@@ -175,8 +176,10 @@
 //!   記録 pid との一致で確かめる。cgroup の所属に依存しないため、コンテナ内から cgroupfs に書ける構成でも
 //!   兄弟コンテナの cgroup への偽装で別コンテナを対象にされない（SEC-1）。pidfd が得られない
 //!   （未対応カーネル・seccomp・起動ハンドルなし）場合、この入口の内部では記録 pid へ縮退せず拒否する
-//! - **縮退経路**: [`identify_pid1`] / [`run_command`] は記録 pid から開き、cgroup の所属で同一性を照合する。
-//!   supervisor 不在（孤児化・再起動後で起動時の pidfd を失った）場合の明示された縮退経路で、「コンテナの中から
+//! - **縮退経路**: [`identify_pid1`]（段単位の API）と試験専用の通しの入口 `run_command`（`exec-test-support` feature の下だけ。
+//!   既定ビルドには無く、呼ぶとコンパイルが通らない。#1617）は記録 pid から開き、cgroup の所属で同一性を照合する。
+//!   本番の通しの入口は [`run_command_with_pidfd`] だけなので、supervisor 不在（孤児化・再起動後で起動時の pidfd を失った）
+//!   場合の exec は現状拒否される（fail-closed）。この場合の再設計は #1314・#492・#495 の配線時に行う。この縮退経路は、「コンテナの中から
 //!   cgroupfs に書けない」前提（core の `exec/setns.rs` のモジュール doc）が成り立つ間だけ使う。cgroupfs の
 //!   マウント・cgroup namespace・`/sys/fs/cgroup` の bind mount を導入する変更は、この縮退経路を拒否へ切り替える
 //!   こと
@@ -198,9 +201,9 @@
 //!   `process.user.additionalGids` の解釈〔指定したグループの付与〕も launch・exec とも未実装で、補助グループは
 //!   常に空）
 //! - 違反記録（SEC-4）の監査ログへの保存のうち、CLI の exec コマンド・TASK-161 の healthcheck（#492・#495）から
-//!   [`run_command`] へ [`default_audit_sink`] の sink を渡す配線（本番 launcher の構成〔#1314〕に従う）。本番の
+//!   [`run_command_with_pidfd`] へ [`default_audit_sink`] の sink を渡す配線（本番 launcher の構成〔#1314〕に従う）。本番の
 //!   `AuditSink` の実体（`FileAuditSink`）と生成の入口 [`default_audit_sink`] は実装済み（#1594）。層 `exec_target` と
-//!   [`run_command`] での 1 拒否 1 件の記録は実装済み（#1465）。`ExecOutcome::exit` が運ぶ `execve` 前の違反
+//!   [`run_command_with_pidfd`] での 1 拒否 1 件の記録は実装済み（#1465）。`ExecOutcome::exit` が運ぶ `execve` 前の違反
 //!   （`SetupFailed`。種別 `entrypoint`）の層 `entrypoint` での記録も実装済み（#1595）。未実装なのは
 //!   launch 経路（`spawn_container` の子・launcher）で同じ理由が生じたときの記録の配線（#1314。core の
 //!   `exec::audit_entrypoint_violation`）。worker の経路の違反（種別 `exec_target` の 10 理由と種別 `rootfs_pivot` の
@@ -400,7 +403,7 @@ pub fn prepare_restrictions(
 ///
 /// `root_override` が `None` なら core の既定ルート解決に従い（`state::open_default_store` と同じ規則）、状態ストアを
 /// 開いてから `<状態ルート>/@audit.log` を主経路とする `FileAuditSink` を返す。返す sink はファイルを開いたまま
-/// 持たないので、fork 前に作っても worker へ fd は継承されない。[`run_command`] / [`run_command_with_pidfd`] の
+/// 持たないので、fork 前に作っても worker へ fd は継承されない。[`run_command_with_pidfd`] / `run_command_in` の
 /// `audit` へ渡す。Linux 以外では core が `Unimplemented` を返す（fail-closed）。CLI・healthcheck からの配線は
 /// 本番 launcher の構成（#1314）に従う。
 pub fn default_audit_sink(
@@ -414,7 +417,7 @@ pub fn default_audit_sink(
 /// 稼働中コンテナの中で実行するコマンドの要求（コンテナ内の絶対パス・argv・明示の環境変数。
 /// SUP-6・SEC-1・TASK-163 追補・#1457）。
 ///
-/// [`run_command`] の入力。**環境変数の基底は呼び出し側から渡せない**: 基底は常に、対象の記録の bundle の
+/// [`run_command_with_pidfd`] の入力。**環境変数の基底は呼び出し側から渡せない**: 基底は常に、対象の記録の bundle の
 /// `config.json` の `process.env`（コンテナ定義。launch 経路がエントリポイントへ渡すのと同じ出所）で、worker が
 /// 読み込んで組み立てる。呼び出し側が足せるのは、利用者がその exec に対して明示した値（[`Self::with_env`]。
 /// CLI の `-e KEY=VALUE` 相当）だけで、検証済みの [`EnvVar`]（値なしの `-e KEY` によるホスト環境の継承を拒否する型。
@@ -534,13 +537,13 @@ pub fn reapply_restrictions(
 /// 再適用の結果を、exec へ進んでよいことの証跡 `ExecReady` に変える（SUP-6・SEC-1・#502）。
 ///
 /// launch 経路と同じ制限のうち未適用のものが 1 つでも残っていれば `FailedPrecondition`。#503 で capability 削減と
-/// rlimit 適用を実装したため、通常の再適用の結果は成功する。fork / execve の入口（[`run_command`] が呼ぶ
+/// rlimit 適用を実装したため、通常の再適用の結果は成功する。fork / execve の入口（[`run_command_with_pidfd`] が呼ぶ
 /// core の `spawn_exec_command`）は、この関数が返す `ExecReady` を値で受け取る（契約はモジュール doc）。
 pub fn require_exec_ready(report: ExecRestrictionReport) -> Result<ExecReady, TraitError> {
     report.into_complete().map_err(from_exec_error)
 }
 
-/// [`run_command`] の結果（将来拡張できる構造。REPAIR-3）。
+/// [`run_command_with_pidfd`] の結果（将来拡張できる構造。REPAIR-3）。
 ///
 /// コマンドの終了状態と、exec プロセスへ載せた制限の件数（実行前に確認した証跡の要約）を持つ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -576,7 +579,7 @@ pub struct ExecOutcome {
     pub stale_exec_cgroups: ExecCgroupSweep,
 }
 
-/// [`run_command`] 系の成功側の戻り値: コマンドの結果と、`execve` 前の拒否の監査記録の結果（SEC-4・SUP-6・#1595）。
+/// [`run_command_with_pidfd`] 系の成功側の戻り値: コマンドの結果と、`execve` 前の拒否の監査記録の結果（SEC-4・SUP-6・#1595）。
 ///
 /// `ExecOutcome` は worker から pipe 越しに復号した値で `Copy`。`AuditDelivery` は親が記録した後に決まる値で
 /// worker は埋められないため、`ExecOutcome` のフィールドにせず親側の包み型で返す（REPAIR-2）。
@@ -622,26 +625,14 @@ impl Deadline {
     }
 }
 
-/// 稼働中コンテナ `record` の中で `request` のコマンドを実行し、終了を待つ（SUP-6・TASK-163.4・#503）。
+/// 縮退経路（記録 pid から開き cgroup の所属で同一性を照合する [`identify_pid1`]）で通す試験専用の入口
+/// （SUP-6・SEC-1・TASK-163 追補・#1617 の P3）。
 ///
-/// コマンドの環境は、記録の bundle の `config.json` の `process.env` へ `request` の明示の指定を重ねたもので、
-/// 呼び出しプロセスの環境は使わない（TASK-163 追補・#1457。契約はモジュール doc）。
-///
-/// 順序は固定: [`identify_pid1`] → [`prepare_cgroup_join`] → [`prepare_restrictions`] → [`enter_namespaces`] →
-/// [`join_cgroup`] → [`reapply_restrictions`] → [`require_exec_ready`] → core の `spawn_exec_command`
-/// （cwd を照合済み root へ → fork → 子で `close_range` → `execveat`）→ `wait_timeout`。
-/// 制限は fork / execve を越えて子へ継承される（「適用 → fork → execve」）。
-///
-/// `timeout` は準備から終了待ちまでの全体の上限（REPAIR-5）。段の間で期限を確かめ、fork 後は残り時間で
-/// `wait_timeout` する（期限超過は子を `SIGKILL` して回収し `Timeout`）。**不可逆な `setns` を行うため、
-/// 単一スレッドの exec 専用プロセスからのみ呼ぶこと**（logs 捕捉スレッドを持つ supervisor 本体からは呼ばない。
-/// 呼べば `setns` が拒否される）。失敗時は状態を戻せないため、呼び出し側は続行せずプロセスを終了する。
-/// エラーメッセージへホスト側パス・ルール内容・期待 cgroup パスを載せない。
-///
-/// `audit` は分離違反による拒否の記録先（SEC-4・#1465。契約はモジュール doc「監査記録」。本番用は [`default_audit_sink`]）。拒否は `Err` の
-/// [`AuditedRejection`] で返り、`error` は記録の成否に関わらず元の拒否、`delivery` が記録の結果。移行: 呼び出しへ
-/// sink を渡し、`Err` は `.error` / `.delivery` を見る。`audit` の実装はブロックし得る I/O にタイムアウトを持つこと
-/// （REPAIR-5。`AuditSink` の契約）。記録は worker を回収した後に行うため、sink が詰まっても worker・コマンドは残らない。
+/// `exec-test-support` feature を付けたビルドにだけ存在し、既定のビルド（リリース成果物を含む）の公開 API
+/// には含まれない。pidfd を持つ呼び出し側がこちらを誤って選べないよう、型（存在そのもの）で防ぐ。本番の通しの
+/// 入口は [`run_command_with_pidfd`] だけで、契約（順序・`timeout`・単一スレッド・`audit`・`AuditedRejection`）は
+/// そちらの doc に書く。記録・照合の経路は本番と共有で、対象特定だけが異なる。
+#[cfg(feature = "exec-test-support")]
 pub fn run_command(
     record: &StateRecord,
     request: &ExecRequest,
@@ -704,14 +695,42 @@ fn audit_worker_result(
     }
 }
 
-/// [`run_command`] の対象特定だけを [`identify_pid1_with_pidfd`]（起動時から保持する pidfd で対象を固定）に
-/// 替えたもの（SUP-6・SEC-1・CORE-1・TASK-163 追補・#1461）。契約（`audit` の扱いと `Err` の
-/// [`AuditedRejection`] を含む）は [`run_command`] と同じ。exec の対象の拒否は必ず `audit` へ記録する（SEC-4・#1465）。
+/// 稼働中コンテナ `record` の中で `request` のコマンドを実行し、終了を待つ。本番の通しの入口（SUP-6・TASK-163.4・#503・#1461）。
+///
+/// 対象の特定は [`identify_pid1_with_pidfd`]（起動時から保持する pidfd で pid1 を固定。SEC-1・CORE-1・TASK-163 追補・#1461）。
+/// pidfd を必須の引数にしているため、pidfd が得られない（未対応カーネル・seccomp・起動ハンドルなし）ときは呼べず、
+/// exec は拒否される（fail-closed）。縮退経路の入口 `run_command` は `exec-test-support` feature の試験専用で、
+/// 既定ビルドには存在せず、呼ぶとコンパイルが通らない。supervisor 不在時（孤児化・再起動後）の exec の再設計と
+/// 本番の呼び出し元（#492・#495・#1314）の配線は未実装（モジュール doc）。
+///
+/// コマンドの環境は、記録の bundle の `config.json` の `process.env` へ `request` の明示の指定を重ねたもので、
+/// 呼び出しプロセスの環境は使わない（TASK-163 追補・#1457。契約はモジュール doc）。
+///
+/// 順序は固定: [`identify_pid1_with_pidfd`] → [`prepare_cgroup_join`] → [`prepare_restrictions`] → [`enter_namespaces`] →
+/// [`join_cgroup`] → [`reapply_restrictions`] → [`require_exec_ready`] → core の `spawn_exec_command`
+/// （cwd を照合済み root へ → fork → 子で `close_range` → `execveat`）→ `wait_timeout`。
+/// 制限は fork / execve を越えて子へ継承される（「適用 → fork → execve」）。
 ///
 /// worker は fork で親の fd を継承するため、pidfd は呼び出しプロセスが保持するものをそのまま worker が使う
-/// （追加の syscall なし。呼び出しプロセスは単一スレッドであること）。pidfd はコンテナ内コマンドへ渡らない
-/// （core が `execveat` の前に `close_range` で閉じ、複製は close-on-exec）。別プロセスの exec 専用プロセスへ
-/// 渡す 1 段目（execve 越しの継承・`SCM_RIGHTS`）は未実装（モジュール doc）。
+/// （追加の syscall なし）。pidfd はコンテナ内コマンドへ渡らない（core が `execveat` の前に `close_range` で閉じ、
+/// 複製は close-on-exec）。別プロセスの exec 専用プロセスへ渡す 1 段目（execve 越しの継承・`SCM_RIGHTS`）は未実装
+/// （モジュール doc）。
+///
+/// `timeout` は準備から終了待ちまでの全体の上限（REPAIR-5）。段の間で期限を確かめ、fork 後は残り時間で
+/// `wait_timeout` する（期限超過は子を `SIGKILL` して回収し `Timeout`）。**不可逆な `setns` を行うため、
+/// 単一スレッドの exec 専用プロセスからのみ呼ぶこと**（logs 捕捉スレッドを持つ supervisor 本体からは呼ばない）。
+/// 単一スレッドは実行時にも強制される: 本関数 → `run_owning_child_cgroup` → `run_in_worker_with` → core の
+/// `spawn_exec_worker` → `sys::fork_single_threaded` が fork の直前に `/proc/self/status` の `Threads: 1` を確かめ、
+/// 満たさなければ `MultiThreaded`（`FailedPrecondition`）で fork を拒否する（`setns` も拒否する）。ただしこの検査より
+/// 前に呼び出しプロセスで `sweep_before_create`（掃除）と `create_child_cgroup`（作成）が走る。どちらも冪等で、
+/// 作成物は `run_owning_child_cgroup` が後始末で消す。入口で先に検査して失敗を早める選択肢は将来の課題（現状は
+/// 変更しない）。失敗時は状態を戻せないため、呼び出し側は続行せずプロセスを終了する。
+/// エラーメッセージへホスト側パス・ルール内容・期待 cgroup パスを載せない。
+///
+/// `audit` は分離違反による拒否の記録先（SEC-4・#1465。契約はモジュール doc「監査記録」。本番用は [`default_audit_sink`]）。拒否は `Err` の
+/// [`AuditedRejection`] で返り、`error` は記録の成否に関わらず元の拒否、`delivery` が記録の結果。移行: 呼び出しへ
+/// sink を渡し、`Err` は `.error` / `.delivery` を見る。`audit` の実装はブロックし得る I/O にタイムアウトを持つこと
+/// （REPAIR-5。`AuditSink` の契約）。記録は worker を回収した後に行うため、sink が詰まっても worker・コマンドは残らない。
 pub fn run_command_with_pidfd(
     record: &StateRecord,
     pidfd: BorrowedFd<'_>,
@@ -735,9 +754,9 @@ pub fn run_command_with_pidfd(
     audit_worker_result(attach_sweep(result, sweep), audit)
 }
 
-/// 実機結合試験専用の入口: [`run_command`] の対象特定だけを [`identify_pid1_in`]（期待 cgroup パスを呼び出し側
+/// 実機結合試験専用の入口: [`run_command_with_pidfd`] の対象特定だけを [`identify_pid1_in`]（期待 cgroup パスを呼び出し側
 /// から受け取る）に替えたもの。`exec-test-support` feature を付けたビルドにだけ存在し、既定のビルドの公開
-/// API には含まれない。本番経路は必ず [`run_command`] を使う（SEC-1）。
+/// API には含まれない。本番経路は必ず [`run_command_with_pidfd`] を使う（SEC-1）。
 #[cfg(feature = "exec-test-support")]
 pub fn run_command_in(
     record: &StateRecord,
@@ -1025,6 +1044,20 @@ fn run_owning_child_cgroup(
 
 /// 記録から導いたコンテナ cgroup の直下に exec 用の子 cgroup を作る。cgroup 配置の記録が無ければ `None`
 /// （worker の `identify_pid1` が拒否する）。
+///
+/// # 作成順の前提（#1486 P3-B・#1617）
+///
+/// 対象の特定（`identify_pid1*`）より前に、記録から導いたパスへ `exec-*` を作る。
+///
+/// - **前に作る理由**: 対象の特定は fork 後の worker の中で行うが、子 cgroup の作成と後始末は所有者である呼び出し
+///   プロセスが fork の前後で行う必要がある（`reapply_restrictions` の後の worker は Landlock で cgroupfs を開けない。
+///   コマンドの子が `execve` の前に参加する先も事前に用意しておく）
+/// - **記録が不正な場合**: 別コンテナの instance を指す記録なら、その配置の `<scope>/fc-<id>@<instance>` の直下に
+///   空の `exec-*` が作られ得る。ただし本体は worker の `identify_pid1*` が pid1 の所属 cgroup との照合で拒否し、
+///   作成物は同じ導出パスの [`cleanup_child_cgroup`] で消える。コンテナ cgroup が無ければ `NotFound` で何も作らない
+/// - **掃除との関係**（#1596）: `sweep_before_create` も同じ前提（記録から導いたパス）で走り、空かつ持ち主が居ない
+///   `exec-*` だけを消す。呼び出しプロセスが `SIGKILL` された場合の残骸は、次回の exec 開始時の掃除か、delete 前の
+///   `ContainerCgroupRemover` で消える
 fn create_child_cgroup(
     record: &StateRecord,
     name: &ExecCgroupName,
@@ -1080,7 +1113,7 @@ pub fn run_in_worker_for_test(
 ///
 /// `work` の `ExecError` は本番と同じ `from_exec_error` で写す。対象の特定を要する違反（`rootfs_is_host_root` 等）を
 /// 非特権で起こし、worker の結果行を経た記録を確かめるためだけに使う。`exec-test-support` feature を付けた
-/// ビルドにだけ存在し、本番経路は必ず [`run_command`] 系を使う。
+/// ビルドにだけ存在し、本番経路は必ず [`run_command_with_pidfd`] を使う。
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
 pub fn run_in_worker_audited_for_test(
@@ -1287,7 +1320,7 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
     })
 }
 
-/// 特定済みの対象に対して、参加 → 制限の再適用 → 実行 → 待機を順に行う（[`run_command`] の本体）。
+/// 特定済みの対象に対して、参加 → 制限の再適用 → 実行 → 待機を順に行う（[`run_command_with_pidfd`] の本体）。
 fn run_with_target(
     proof: &ExecWorkerProof,
     target: &ExecTarget,
@@ -1447,7 +1480,7 @@ fn load_exec_bundle(bundle: &std::path::Path) -> Result<(OciConfig, RootfsDir), 
 ///
 /// 分離違反による拒否（`ExecError::violation`。SEC-4）は、種別・理由コード・ビヘイビア ID をメッセージの
 /// 末尾に機械可読な形で残す（`TraitError` は違反記録を運べないため）。違反の対象（期待 cgroup パス・rootfs の
-/// パス）はメッセージへ含めない。worker の経路の違反の監査記録は通しの入口 [`run_command`] が親プロセスで行い、
+/// パス）はメッセージへ含めない。worker の経路の違反の監査記録は通しの入口 [`run_command_with_pidfd`] が親プロセスで行い、
 /// worker は末尾の目印から `<種別>/<理由>` を結果行へ載せる（[`exec_worker_reason_of`]。#1465）。
 fn from_exec_error(err: ExecError) -> TraitError {
     let violation = err.violation.as_ref().map_or_else(String::new, |v| {

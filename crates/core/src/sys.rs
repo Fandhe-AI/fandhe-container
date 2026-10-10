@@ -3638,8 +3638,8 @@ mod tests {
         assert_eq!(f(true, true), 1 | 2 | 4);
     }
 
-    /// SUP-12（TASK-169 追補・#1472）: 新マウント API の syscall 番号・フラグの具体値。番号は x86_64 と
-    /// aarch64（asm-generic）で個別に定義し、どちらも 429〜432。
+    /// CORE-6・SEC-5（TASK-29 追補・#1659）: `open_tree` の syscall 番号（x86_64・aarch64 とも 428）と
+    /// フラグの具体値。`AT_RECURSIVE` は付けず、`move_mount` の空パス指定は 0x44。
     #[test]
     fn core6_sec5_open_tree_consts_and_flags_are_exact() {
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -3662,6 +3662,8 @@ mod tests {
         }
     }
 
+    /// SUP-12（TASK-169 追補・#1472）: 新マウント API の syscall 番号・フラグの具体値。番号は x86_64 と
+    /// aarch64（asm-generic）で個別に定義し、どちらも 429〜432。
     #[test]
     fn sup12_task169_new_mount_api_consts_are_exact() {
         #[cfg(target_arch = "x86_64")]

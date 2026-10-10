@@ -149,8 +149,8 @@ pub fn mount_tmpfs_with_attach_hook(
 }
 
 /// 結合試験専用: `check_dev_order` だけを省いて [`mount_tmpfs`] と同じ検査・マウントを行う（#1669 事後監査
-/// P2 の後の `tests/tmpfs_mount.rs` 用）。rootless では [`create_default_devices`](super::create_default_devices) が
-/// `mknod(2)` の `EPERM` で止まる（#1660）ため、素の `dev` ディレクトリの上で既定の `/dev/shm` の実マウント
+/// P2 の後の `tests/tmpfs_mount.rs` 用）。結合試験 `tests/tmpfs_mount.rs` は rootless でも `create_default_devices`
+/// に依存しない構成（素の `dev` ディレクトリ）で動かすため、その上で既定の `/dev/shm` の実マウント
 /// （フラグ・サイズ・モード）を照合するのに使う。本番の起動順（`create_default_devices` → `mount_tmpfs`）の
 /// 代わりにはならない。`exec-test-support` feature を付けたビルドにだけ存在し、通常の利用者は呼ばない。
 #[cfg(feature = "exec-test-support")]

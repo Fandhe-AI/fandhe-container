@@ -25,7 +25,9 @@ fandhe-container-plugin = { path = "../plugin" }
 
 # signal-test-support: 結合試験（tests/signal_forward.rs）の plugin 役が使う、固定の記録ハンドラ（受信番号を
 # 原子変数へ store するだけ）の登録と読み出し（`signals::install_recording_handler_for_test`・
-# `signals::recorded_signal_for_test`）を公開する（#1513・PLUG-7・PR #1572 事後監査の P2）。既定のビルドには
+# `signals::recorded_signal_for_test`）と、継承した SIG_IGN を上書きする記録ハンドラの登録・fork した子でシグナルを
+# 受ける入口（`signals::install_recording_handler_overriding_ignore_for_test`・`signals::fork_and_raise_for_test`。
+# #1605）を公開する（#1513・PLUG-7・PR #1572 事後監査の P2）。既定のビルドには
 # 含めない。リリースビルドで有効にするとコンパイルが止まる（src/lib.rs の `compile_error!`）。依存は増えない。
 [features]
 signal-test-support = []

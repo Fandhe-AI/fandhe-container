@@ -32,6 +32,10 @@
 //!   対応外の OS・アーキテクチャは `Unsupported`
 //! - macOS の RSS 取得（TASK-112.1・#265）: `proc_pidinfo(PROC_PIDTASKINFO)`（`resident_size_bytes`。`crate::rss` から呼ばれる）
 //! - Linux・macOS: `killpg(2)`（`kill_process_group`。plugin の子のプロセスグループへ `SIGKILL`。#1311。それ以外の unix は `Unsupported`）
+//! - Linux（x86_64 / aarch64）: ブロックしないことを保証できる socket（`getsockopt(SO_TYPE)` で判定し
+//!   `send(MSG_DONTWAIT | MSG_NOSIGNAL)`。パス解決・`fstat`・fd の複製をしない）でだけ fd へ書く（`write_nonblocking`。
+//!   `ChildGuard::drop` の診断出力がブロックしない。#1605）。socket 以外と、macOS を含むそれ以外の OS は保証できる
+//!   経路が無いため常に捨てる（`Unsupported`）
 //! - Linux（x86_64 / aarch64）・macOS: `waitid(2)`（`WEXITED | WNOHANG | WNOWAIT`。`probe_child_exit`。自発終了した plugin を回収せずに
 //!   観測し、グループへ送ってから回収するため。#1604・PLUG-7・REPAIR-5。それ以外は `Unsupported`）
 //! - いずれの unix: `kill(2)` で起動中の plugin へ SIGINT・SIGTERM・SIGHUP を転送する（`send_signal`。
@@ -52,7 +56,7 @@
 //!
 //! # 契約
 //! - `unsafe fn` は公開しない。公開するのは安全な [`send_signal`]・[`peer_uid`]・[`effective_uid`]・[`fchmodat_nofollow`]・
-//!   [`unlinkat`]・[`mkdirat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・[`kill_process_group`]・[`probe_child_exit`]・（Linux のみ）`set_parent_death_sigkill`・[`DirStream`]（`open_at`・`next_entry`・`position`）・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
+//!   [`unlinkat`]・[`mkdirat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・[`kill_process_group`]・[`probe_child_exit`]・[`write_nonblocking`]・（Linux のみ）`set_parent_death_sigkill`・[`DirStream`]（`open_at`・`next_entry`・`position`）・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
 //! - fd は `&UnixStream` の借用中のみ渡す（呼び出し中にクローズされない）
 //! - SOL_SOCKET / SO_PEERCRED の定数は `cfg(target_arch)` ごとに個別定義し、流用しない
 //! - OS ごとに値・幅が異なる定数・型（`ModeT`・`AT_SYMLINK_NOFOLLOW`・`O_*` 等）は対応 OS ごとに個別定義し、
@@ -64,7 +68,6 @@
 use std::ffi::CStr;
 use std::fs::File;
 use std::io;
-use std::os::unix::io::AsRawFd;
 #[cfg(any(
     target_os = "macos",
     all(
@@ -73,6 +76,7 @@ use std::os::unix::io::AsRawFd;
     )
 ))]
 use std::os::unix::io::FromRawFd;
+use std::os::unix::io::{AsFd, AsRawFd};
 use std::os::unix::net::UnixStream;
 
 use crate::error::{PluginError, PluginErrorCode};
@@ -137,6 +141,129 @@ pub(crate) fn kill_process_group(pgid: u32) -> io::Result<()> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn kill_process_group(pgid: u32) -> io::Result<()> {
     let _ = pgid;
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+unsafe extern "C" {
+    // SAFETY（宣言そのものの妥当性）: POSIX の `ssize_t send(int socket, const void *buffer, size_t length, int flags)`。
+    // `ssize_t` / `size_t` は対応ターゲットでポインタ幅、`int` は 32 bit 符号付き。
+    #[link_name = "send"]
+    fn c_send(fd: i32, buf: *const u8, len: usize, flags: i32) -> isize;
+    // SAFETY（宣言そのものの妥当性）: POSIX の `int getsockopt(int, int, int, void *, socklen_t *)`
+    // （`socklen_t` は対応ターゲットで 32 bit 符号なし）。
+    #[link_name = "getsockopt"]
+    fn c_getsockopt(
+        fd: i32,
+        level: i32,
+        name: i32,
+        val: *mut core::ffi::c_void,
+        len: *mut u32,
+    ) -> i32;
+}
+
+/// `SOL_SOCKET` / `SO_TYPE`（Linux の x86_64・aarch64 とも 1 / 3。`asm-generic/socket.h`。値の異なるアーキテクチャ
+/// 〔mips 等〕へ流用しない）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const SOL_SOCKET: i32 = 1;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const SO_TYPE: i32 = 3;
+
+/// `MSG_DONTWAIT`（呼び出し 1 回限りの非ブロッキング送信。Linux の x86_64・aarch64 とも 0x40）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const MSG_DONTWAIT: i32 = 0x40;
+
+/// `MSG_NOSIGNAL`（相手が閉じた socket への送信で `SIGPIPE` を出さず `EPIPE` だけを返す。呼び出し 1 回限り）。
+/// Linux x86_64 は `asm-generic` 由来の 0x4000（`include/linux/socket.h`）。アーキテクチャごとに個別定義する。
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const MSG_NOSIGNAL: i32 = 0x4000;
+/// Linux aarch64 の `MSG_NOSIGNAL`（x86_64 と同じ 0x4000。値が同じでも流用せず個別に定義する）。
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const MSG_NOSIGNAL: i32 = 0x4000;
+
+/// fd が socket か（`getsockopt(SO_TYPE)`）。fd 単位のカーネル内判定で、ファイルシステムへ問い合わせない
+/// （`fstat` は FUSE / NFS で無期限に止まり得るため使わない。#1605・REPAIR-5）。socket 以外は `ENOTSOCK` で `false`。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn is_socket_fd(fd: i32) -> bool {
+    let mut val: i32 = 0;
+    let mut len: u32 = 4;
+    // SAFETY: `val`・`len` はこの関数のスタック上の有効な書き込み先で、`len` は `val` の大きさ（4）と一致する。
+    // fd は呼び出し側の借用（`BorrowedFd`）が呼び出し中開いていることを保証する。fd 単位の問い合わせで副作用は無い。
+    let rc = unsafe {
+        c_getsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_TYPE,
+            (&raw mut val).cast::<core::ffi::c_void>(),
+            &raw mut len,
+        )
+    };
+    rc == 0
+}
+
+/// ブロックしないことを保証できる経路でだけ `fd` へ `buf` を 1 回書く。保証できなければ書かない（#1605・REPAIR-5・PLUG-7）。
+///
+/// `crate::lifecycle` の `ChildGuard::drop` が診断 1 行を stderr へ出すために呼ぶ。書くのは `fd` が socket
+/// （journald 等）のときだけで、`send(MSG_DONTWAIT | MSG_NOSIGNAL)` の 1 回限りの指定で待たず、相手が閉じていても
+/// `SIGPIPE` を出さない（共有 fd の open file description の状態は変えない）。判定は fd 単位のカーネル内問い合わせ
+/// （`getsockopt(SO_TYPE)`）だけで、パス解決・`fstat` を一切行わず、fd も複製しない（複製の close は NFS の書き戻し・
+/// `FUSE_FLUSH` で止まり得るため）。
+///
+/// socket 以外は書かず `Unsupported`（診断は捨てる）。待たないことを保証できないため:
+/// - 通常ファイル: 応答しない FUSE / NFS・FS freeze で同期 write が止まり、`O_NONBLOCK` でも防げない
+/// - キャラクタデバイス: CUSE 等で open / write がユーザー空間のデーモンを待ち得る
+/// - pipe / FIFO: 共有 description を変えずに待たないには `/proc` 経由で開き直す必要があり、その絶対パスの
+///   解決がルート FS（FUSE / NFS の rootfs 等）の再検証で止まり得る。加えて write の直前に読み手が閉じると
+///   `SIGPIPE` になり、write 1 回だけに効く抑止手段が無い
+///
+/// Linux（x86_64 / aarch64）以外は常に書かず `Unsupported`（下の別定義）。macOS では満杯のブロッキング socket への
+/// `send(MSG_DONTWAIT)` が戻らないことを CI で観測した（#1605）ため、socket も含めて保証できる経路が無い。
+///
+/// 満杯なら `WouldBlock`。部分書き込みも有り得るため書けたバイト数を返す。std の stderr ロックは取らない。
+/// 前提: 判定と送信の間に別スレッドが同じ fd 番号を `dup2` 等で socket 以外へ差し替えると、`send` は
+/// `ENOTSOCK` のエラーで戻る（待たず、書きもしない）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) fn write_nonblocking(fd: &impl AsFd, buf: &[u8]) -> io::Result<usize> {
+    let raw = fd.as_fd().as_raw_fd();
+    if is_socket_fd(raw) {
+        // SAFETY: `buf` は有効な読み取り専用スライスで、渡す長さは `buf.len()`。fd は呼び出し側の借用が
+        // 呼び出し中開いていることを保証する。`MSG_DONTWAIT` で待たず、`MSG_NOSIGNAL` で相手が閉じた socket でも
+        // `SIGPIPE` を出さない（library としてホストのシグナル設定に依存しない）。
+        let w = unsafe { c_send(raw, buf.as_ptr(), buf.len(), MSG_DONTWAIT | MSG_NOSIGNAL) };
+        return usize::try_from(w).map_err(|_| io::Error::last_os_error());
+    }
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
+/// Linux（x86_64 / aarch64）以外の unix 向け。ブロックしない保証がないため書かず `Unsupported`（fail-closed）。
+///
+/// macOS は socket の `send(MSG_DONTWAIT)` でも満杯のブロッキング socket で戻らないことを CI で観測した
+/// （#1605。xnu の送信経路が `MSG_DONTWAIT` を非ブロッキング指定として扱わないためとみられる）。共有 fd の
+/// 状態（`O_NONBLOCK`・`SO_SNDTIMEO`）を変えずに待たない手段が無く、`/proc/self/fd` の開き直しも無いため捨てる。
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+pub(crate) fn write_nonblocking(fd: &impl AsFd, buf: &[u8]) -> io::Result<usize> {
+    let _ = (fd, buf);
     Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
@@ -2740,6 +2867,35 @@ mod probe_child_exit_tests {
             let e = probe_child_exit(bad).unwrap_err();
             assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "pid={bad}");
         }
+    }
+}
+
+/// #1605・REPAIR-5・PLUG-7: Drop 診断の送信フラグの固定値（Linux x86_64 / aarch64）。
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod write_nonblocking_flag_tests {
+    use super::*;
+
+    #[test]
+    fn repair5_send_flags_are_fixed_values() {
+        assert_eq!(MSG_DONTWAIT, 0x40);
+        assert_eq!(MSG_NOSIGNAL, 0x4000);
+        assert_eq!(MSG_DONTWAIT | MSG_NOSIGNAL, 0x4040);
+        assert_eq!(SOL_SOCKET, 1);
+        assert_eq!(SO_TYPE, 3);
+    }
+
+    /// 相手が閉じた socket への送信は `EPIPE`（`BrokenPipe`）で戻る。`SIGPIPE` が出ないことそのものは、試験の実行時が
+    /// `SIGPIPE` を無視しているため本試験では照合できない（フラグの付与は上の固定値試験と呼び出し箇所で担保する）。
+    #[test]
+    fn repair5_send_to_closed_peer_returns_epipe() {
+        let (a, b) = UnixStream::pair().unwrap();
+        drop(b);
+        let e = write_nonblocking(&a, b"x\n").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
     }
 }
 

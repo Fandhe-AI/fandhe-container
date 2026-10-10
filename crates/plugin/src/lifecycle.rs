@@ -27,6 +27,13 @@
 //!   自発終了の観測後のグループ送信が Linux で失敗した場合に同じ形で現れ得る（#1604）。macOS はゾンビだけのグループへの
 //!   `killpg` にも `EPERM` を返すため、接続後・応答前に plugin が終了した場合は孫がいなくても付記が付き得る
 //!   （`EPERM` を許容しない理由は `group_kill_tolerated` の doc）。
+//! - `Drop` 経路の記録（#1605・REPAIR-4）: `ChildGuard` の破棄時にグループ停止の失敗（`GroupKillFailed`。
+//!   孫が残り得る）または直接の子の未回収（`Unreaped`）が起きた場合、stderr へ 1 行の JSON
+//!   （`{"event":"plugin_child_cleanup","op":"drop","outcome":"error","reason":"group_kill_failed"|"unreaped"}`。
+//!   `unreaped` のみ保持中の `pid` を整数で付す）を 1 回だけ出す。ブロックしないことを保証できる出力先（Linux の
+//!   socket。`crate::sys` の `write_nonblocking`）でだけ書き、それ以外（pipe・端末・通常ファイル・macOS）は捨てる。書き込み失敗は無視し、plugin 由来の文字列は
+//!   載せない。`unreaped_error` で報告済みの子と、`Drop` の前に明示的な経路で手放した子（回収済み・他所で回収された
+//!   `Lost`。そこで返したグループ停止の失敗を含む）は記録しない。
 //! - 子の環境変数は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ設定する（資格情報を継承させない）。
 //!   stdin / stdout は null。stderr は親へ継承させず、専用の UNIX ソケット対で受けて
 //!   [`OneShotStderr`] として返す（untrusted。保持は [`ONE_SHOT_STDERR_MAX_BYTES`] まで。超過分は
@@ -849,13 +856,92 @@ fn termination_after_kill(reap: Reap) -> OneShotTermination {
     }
 }
 
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if !self.reported_unreaped {
-            let _ = self.kill_and_reap();
+/// `ChildGuard` の `Drop` 経路で後始末に失敗したときの記録（#1605・PLUG-7・REPAIR-4）。
+///
+/// `Drop` は `Result` を返せないため、呼び出し側へ報告できない失敗を stderr へ 1 行の JSON で残す。
+/// 値は固定文字列と整数のみで、plugin 由来の untrusted な文字列（stderr・パス）は載せない
+/// （ログ行の偽装を防ぐ。エスケープ不要）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildGuardDropFailure {
+    /// 直接の子は回収したが、グループ宛て SIGKILL が許容外のエラーで失敗し、孫が残り得る。
+    /// 直接の子は解放済みのため pid は載せない（`group_kill_failed_error` と同じ扱い）。
+    GroupKillFailed,
+    /// 直接の子を回収できなかった（孤児の可能性）。保持中の pid を載せる（`unreaped_error` と同じ）。
+    Unreaped { pid: Option<u32> },
+}
+
+impl ChildGuardDropFailure {
+    /// 構造化ログの 1 行（キーは `audit` の `event` / `op` / `outcome` / `reason` の流儀に揃える）。
+    fn to_json_line(self) -> String {
+        match self {
+            Self::GroupKillFailed => "{\"event\":\"plugin_child_cleanup\",\"op\":\"drop\",\"outcome\":\"error\",\"reason\":\"group_kill_failed\"}".to_string(),
+            Self::Unreaped { pid: Some(pid) } => format!(
+                "{{\"event\":\"plugin_child_cleanup\",\"op\":\"drop\",\"outcome\":\"error\",\"reason\":\"unreaped\",\"pid\":{pid}}}"
+            ),
+            Self::Unreaped { pid: None } => "{\"event\":\"plugin_child_cleanup\",\"op\":\"drop\",\"outcome\":\"error\",\"reason\":\"unreaped\"}".to_string(),
         }
     }
 }
+
+/// `Drop` 時の `Reap` を記録対象へ写す。孫が残り得る `GroupKillFailed` と未回収の `Unreaped` だけが対象で、
+/// `Lost`（他所で回収済み。孤児ではない）や回収成功は記録しない。
+fn drop_failure(reap: Reap, pid: Option<u32>) -> Option<ChildGuardDropFailure> {
+    match reap {
+        Reap::GroupKillFailed => Some(ChildGuardDropFailure::GroupKillFailed),
+        Reap::Unreaped => Some(ChildGuardDropFailure::Unreaped { pid }),
+        Reap::Reaped(_) | Reap::AlreadyReaped | Reap::Lost => None,
+    }
+}
+
+impl ChildGuard {
+    /// `Drop` の本体。後始末の失敗があれば `emit` を 1 回だけ呼ぶ。
+    ///
+    /// 報告済み（`reported_unreaped`）のときは何もしない。`Unreaped` を記録したら報告済みにして登録を
+    /// 解放し、以後の `Drop` で再記録・再 kill をしない（`unreaped_error` と同じ扱い）。
+    ///
+    /// `Drop` の前に子を手放していた（`child` が `None`。回収済み・終端）ときも何もしない。手放すのは明示的な
+    /// 経路（`wait_or_kill`・`kill_and_reap` の呼び出し側・常駐の `call` / `fail_session`）だけで、そこで
+    /// 残った失敗（自発終了の観測後のグループ送信の失敗の印 `group_kill_failed_after_exit` を含む）は既に
+    /// 呼び出し側へ返している。ここで `kill_and_reap` を呼ぶと印から `GroupKillFailed` が再び返り、同じ
+    /// 失敗を 2 回記録するため呼ばない（子を持たない `kill_and_reap` は何も送らないので後始末は変わらない）。
+    fn finish_on_drop(&mut self, emit: &mut dyn FnMut(&ChildGuardDropFailure)) {
+        if self.reported_unreaped || self.child.is_none() {
+            return;
+        }
+        let pid = self.pid();
+        let reap = self.kill_and_reap();
+        if let Some(failure) = drop_failure(reap, pid) {
+            if matches!(failure, ChildGuardDropFailure::Unreaped { .. }) {
+                self.reported_unreaped = true;
+                self.slot = None;
+            }
+            emit(&failure);
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        // 書き込み失敗は無視する（`Drop`・panic の unwinding 中でも panic しない）。
+        // stderr が満杯の pipe 等でも後始末を止めないため、ブロックしないことを保証できる経路でだけ 1 回書き、
+        // 書けなければ記録を捨てる（スレッドもロックも残さない。REPAIR-5・PLUG-7）。
+        self.finish_on_drop(&mut |rec| {
+            let mut line = rec.to_json_line();
+            line.push('\n');
+            write_drop_log(&io::stderr(), line.as_bytes());
+        });
+    }
+}
+
+/// `Drop` の診断 1 行を `fd` へ非ブロッキングで書く。書けなければ捨てる（#1605・REPAIR-5）。
+#[cfg(unix)]
+fn write_drop_log(fd: &impl std::os::unix::io::AsFd, line: &[u8]) {
+    let _ = crate::sys::write_nonblocking(fd, line);
+}
+
+/// 非 unix ではブロックしない書き込み手段を持たないため診断出力を捨てる（fail-closed）。
+#[cfg(not(unix))]
+fn write_drop_log(_fd: &io::Stderr, _line: &[u8]) {}
 
 /// `EPERM` が出た間だけ短時間再送する上限（#1311・PLUG-7・REPAIR-5）。
 #[cfg(unix)]
@@ -871,6 +957,11 @@ const GROUP_KILL_EPERM_RETRY: Duration = Duration::from_millis(200);
 #[cfg(unix)]
 fn kill_group_retrying_eperm(pgid: u32) -> io::Result<()> {
     const EPERM: i32 = 1;
+    // テスト専用: 非特権では再現できない許容外のエラーを注入する（本番ビルドには存在しない）。
+    #[cfg(test)]
+    if let Some(e) = tests::FORCED_GROUP_KILL_ERRNO.with(|c| c.get()) {
+        return Err(io::Error::from_raw_os_error(e));
+    }
     let start = Instant::now();
     let mut interval = Duration::from_millis(1);
     loop {
@@ -1417,6 +1508,268 @@ fn check_termination_after_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// `kill_group_retrying_eperm` へ注入する errno（スレッドローカルで並列テストに影響しない）。
+        pub(super) static FORCED_GROUP_KILL_ERRNO: std::cell::Cell<Option<i32>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    const GROUP_KILL_FAILED_LINE: &str = "{\"event\":\"plugin_child_cleanup\",\"op\":\"drop\",\"outcome\":\"error\",\"reason\":\"group_kill_failed\"}";
+
+    #[cfg(unix)]
+    fn spawn_sleeper_group() -> ChildGuard {
+        use std::os::unix::process::CommandExt;
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        ChildGuard::new(child)
+    }
+
+    /// REPAIR-4・PLUG-7・#1605: Drop でグループ停止に失敗したとき、記録がちょうど 1 件出る。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_drop_records_group_kill_failure_once() {
+        let mut guard = spawn_sleeper_group();
+        FORCED_GROUP_KILL_ERRNO.with(|c| c.set(Some(22)));
+        let mut lines: Vec<String> = Vec::new();
+        guard.finish_on_drop(&mut |rec| lines.push(rec.to_json_line()));
+        FORCED_GROUP_KILL_ERRNO.with(|c| c.set(None));
+        assert_eq!(lines, vec![GROUP_KILL_FAILED_LINE.to_string()]);
+        // 直接の子はフォールバックの `Child::kill` で回収済み。
+        assert_eq!(guard.pid(), None);
+        // 2 回目は AlreadyReaped で記録しない。
+        guard.finish_on_drop(&mut |rec| lines.push(rec.to_json_line()));
+        assert_eq!(lines.len(), 1);
+        drop(guard);
+    }
+
+    /// REPAIR-4・#1605: 通常の破棄は何も記録せず、子を回収する。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_drop_of_running_child_records_nothing() {
+        let mut guard = spawn_sleeper_group();
+        let mut lines: Vec<String> = Vec::new();
+        guard.finish_on_drop(&mut |rec| lines.push(rec.to_json_line()));
+        assert!(lines.is_empty());
+        assert_eq!(guard.pid(), None);
+    }
+
+    /// Drop 診断の試験用に、一時ディレクトリ直下へ新しいディレクトリを作る（REPAIR-12）。`create_dir` は既存の
+    /// 名前（先置きされた symlink を含む）で失敗するため、予測可能な名前でも他者の置いたものを辿らない。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn drop_log_test_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "fc-droplog-{tag}-{}-{nanos}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    /// REPAIR-5・PLUG-7・#1605: 満杯の socket（ブロッキングのまま）でも診断出力が期限内に `WouldBlock` で戻る。
+    #[test]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn repair5_drop_log_does_not_block_on_full_socket() {
+        // 満杯のソケットを stderr に見立てる。ブロックしない保証のある経路（MSG_DONTWAIT）で即座に戻る
+        // （#1605・REPAIR-5・PLUG-7）。
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        let (a, _b) = UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        let chunk = [0u8; 4096];
+        loop {
+            match (&a).write(&chunk) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("fill failed: {e}"),
+            }
+        }
+        // 非ブロッキングに戻さない（ブロッキング fd なら無条件 write は永久に止まる状況）。
+        a.set_nonblocking(false).unwrap();
+        let start = Instant::now();
+        let r = crate::sys::write_nonblocking(&a, GROUP_KILL_FAILED_LINE.as_bytes());
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        // `Drop` 経路の入口も同様に期限内に戻る。
+        let start = Instant::now();
+        write_drop_log(&a, GROUP_KILL_FAILED_LINE.as_bytes());
+        assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    /// REPAIR-5・PLUG-7・#1605: 無名 pipe は `/proc` 経由の開き直し（絶対パスの解決が止まり得る）と `SIGPIPE` を
+    /// 避けられないため書かず `Unsupported`。期限内に戻り、読み手には何も届かず、共有 fd も非ブロッキング化しない。
+    #[test]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn repair5_drop_log_discards_on_anonymous_pipe() {
+        use std::io::Read;
+        use std::os::unix::io::AsRawFd;
+        let (mut r, w) = io::pipe().unwrap();
+        let line = GROUP_KILL_FAILED_LINE.as_bytes();
+        let start = Instant::now();
+        let res = crate::sys::write_nonblocking(&w, line);
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::Unsupported);
+        let start = Instant::now();
+        write_drop_log(&w, line);
+        assert!(start.elapsed() < Duration::from_millis(100));
+        // 共有 description のフラグ（`O_NONBLOCK` = 0o4000）は変わっていない。
+        let flags_of = |fd: i32| {
+            let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).unwrap();
+            info.lines()
+                .find_map(|l| l.strip_prefix("flags:"))
+                .map(|v| i64::from_str_radix(v.trim(), 8).unwrap())
+                .unwrap()
+        };
+        assert_eq!(flags_of(w.as_raw_fd()) & 0o4000, 0);
+        // 何も書かれていない（書き込み端を閉じた後の読み出しは即座に EOF の 0 バイト）。
+        drop(w);
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, Vec::<u8>::new());
+    }
+
+    /// REPAIR-5・PLUG-7・#1605: 名前付き FIFO も書かず `Unsupported`（診断は捨て、読み手には何も届かない）。
+    #[test]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn repair5_drop_log_discards_on_named_fifo() {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NONBLOCK: i32 = 0o4000;
+        let dir = drop_log_test_dir("fifo");
+        let path = dir.join("fifo");
+        let status = Command::new("mkfifo").arg(&path).status().unwrap();
+        assert!(status.success(), "mkfifo failed: {status}");
+        let mut reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        let r = crate::sys::write_nonblocking(&writer, b"x\n");
+        let mut buf = [0u8; 8];
+        let read = reader.read(&mut buf);
+        drop(writer);
+        drop(reader);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::Unsupported);
+        assert_eq!(read.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+
+    /// REPAIR-5・PLUG-7・#1605: 通常ファイルは待たない保証がないため書かず `Unsupported`（診断は捨てる）。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn repair5_drop_log_discards_on_regular_file() {
+        let dir = drop_log_test_dir("file");
+        let path = dir.join("log");
+        let f = std::fs::File::create_new(&path).unwrap();
+        let r = crate::sys::write_nonblocking(&f, b"x\n");
+        drop(f);
+        let len = std::fs::metadata(&path).unwrap().len();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::Unsupported);
+        assert_eq!(len, 0);
+    }
+
+    /// REPAIR-5・PLUG-7・#1605: キャラクタデバイスは CUSE 等で open / write が止まり得るため書かず `Unsupported`。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn repair5_drop_log_discards_on_char_device() {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let r = crate::sys::write_nonblocking(&f, b"x\n");
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn repair4_drop_log_writes_line_when_fd_ready() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let line = b"{\"event\":\"x\"}\n";
+        assert_eq!(crate::sys::write_nonblocking(&a, line).unwrap(), line.len());
+        let mut got = vec![0u8; line.len()];
+        b.read_exact(&mut got).unwrap();
+        assert_eq!(got, line);
+    }
+
+    /// REPAIR-5・PLUG-7・#1605: macOS は socket でも書かず `Unsupported`（満杯のブロッキング socket への
+    /// `send(MSG_DONTWAIT)` が戻らないことを CI で観測したため。診断は捨て、相手には何も届かない）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn repair5_drop_log_discards_on_socket_on_macos() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let start = Instant::now();
+        let r = crate::sys::write_nonblocking(&a, GROUP_KILL_FAILED_LINE.as_bytes());
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::Unsupported);
+        b.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            b.read(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    /// REPAIR-4・#1605: `Reap` から記録への写像と JSON 行の全文。
+    #[test]
+    fn repair4_drop_failure_mapping() {
+        assert_eq!(
+            drop_failure(Reap::GroupKillFailed, Some(7)),
+            Some(ChildGuardDropFailure::GroupKillFailed)
+        );
+        assert_eq!(
+            drop_failure(Reap::Unreaped, Some(1234)),
+            Some(ChildGuardDropFailure::Unreaped { pid: Some(1234) })
+        );
+        assert_eq!(drop_failure(Reap::AlreadyReaped, Some(1)), None);
+        assert_eq!(drop_failure(Reap::Lost, Some(1)), None);
+        assert_eq!(
+            ChildGuardDropFailure::GroupKillFailed.to_json_line(),
+            GROUP_KILL_FAILED_LINE
+        );
+        assert_eq!(
+            ChildGuardDropFailure::Unreaped { pid: Some(1234) }.to_json_line(),
+            "{\"event\":\"plugin_child_cleanup\",\"op\":\"drop\",\"outcome\":\"error\",\"reason\":\"unreaped\",\"pid\":1234}"
+        );
+        assert_eq!(
+            ChildGuardDropFailure::Unreaped { pid: None }.to_json_line(),
+            "{\"event\":\"plugin_child_cleanup\",\"op\":\"drop\",\"outcome\":\"error\",\"reason\":\"unreaped\"}"
+        );
+    }
 
     /// PLUG-7・#1311: グループ送信エラーの許容は ESRCH と Unsupported（送信非対応 unix で直接の子の
     /// 回収結果を Unreaped に変えない）のみ。InvalidInput は許容しない。
@@ -2487,6 +2840,41 @@ mod tests {
             OneShotTermination::GroupKillFailed
         );
         assert_eq!(guard.kill_and_reap(), Reap::GroupKillFailed);
+    }
+
+    /// REPAIR-4・PLUG-7・#1605: 自発終了の観測後のグループ送信失敗を `wait_or_kill` が返した後（子は手放し済み）、
+    /// `Drop` は同じ失敗を再記録しない。子を保持したまま印が立っている場合は `Drop` が 1 回だけ記録する。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_drop_does_not_relog_group_kill_failure_already_reported() {
+        use std::os::unix::process::CommandExt;
+        let spawn_exit0 = || {
+            Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let mut reported = ChildGuard::new(spawn_exit0());
+        reported.group_kill_failed_after_exit = true;
+        assert_eq!(
+            reported.wait_or_kill(Duration::from_secs(5)),
+            OneShotTermination::GroupKillFailed
+        );
+        assert!(reported.child.is_none());
+        let mut lines: Vec<String> = Vec::new();
+        reported.finish_on_drop(&mut |rec| lines.push(rec.to_json_line()));
+        assert_eq!(lines, Vec::<String>::new());
+
+        // 陽性対照: 子を保持したまま印が立っている（呼び出し側へ未報告）なら `Drop` が 1 回記録する。
+        let mut unreported = ChildGuard::new(spawn_exit0());
+        unreported.group_kill_failed_after_exit = true;
+        unreported.finish_on_drop(&mut |rec| lines.push(rec.to_json_line()));
+        assert_eq!(lines, vec![GROUP_KILL_FAILED_LINE.to_string()]);
+        assert_eq!(unreported.pid(), None);
     }
 
     /// PLUG-7・#1513: `kill_and_reap` の kill 前の確認で `ECHILD` を受けたら kill を送らず `Lost` で終える

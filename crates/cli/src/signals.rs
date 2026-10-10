@@ -14,6 +14,9 @@
 //! - 転送後、ハンドラ進入時に `SA_RESETHAND` で既定動作へ戻っている当該シグナルを自分へ再送する。ハンドラ中は
 //!   当該シグナルがブロックされるため保留となり、ハンドラから戻った時点で配送されて親は
 //!   シグナル終了（`ExitStatus::signal()` がそのシグナル）になる。errno は再送で終了するため退避しない。
+//! - 転送は登録したプロセス自身だけが行う。fork した子が exec 前にシグナルを受けても、親の登録表のコピーで
+//!   plugin へ誤転送せず、再送だけで終了する（#1605）。ハンドラの `sa_mask` には転送対象の 3 シグナルを入れ、
+//!   実行中の割り込みを防ぐ。
 //! - 起動時に `SIG_IGN` を継承したシグナルは上書きしない（nohup・バックグラウンドジョブの慣行を壊さない）。
 //! - 例外として、継承した `SIGCHLD` の `SIG_IGN` は `SIG_DFL` へ戻す（PR #1572 事後監査の P2）。`SIG_IGN` の
 //!   ままだとカーネルが plugin の子を自動回収し、登録表に残った pid が再利用されて転送が無関係なプロセス
@@ -36,7 +39,7 @@ use crate::sys;
 use fandhe_container_core::traits::ErrorCode;
 
 /// 転送対象のシグナル番号（SIGHUP・SIGINT・SIGTERM。Linux・macOS 共通）。
-const FORWARDED: [i32; 3] = [1, 2, 15];
+const FORWARDED: [i32; 3] = sys::FORWARDED_SIGNALS;
 
 /// SIGINT・SIGTERM・SIGHUP のハンドラを登録する。失敗は構造化エラー（`INTERNAL`）で返す。
 ///
@@ -75,6 +78,31 @@ pub fn install_recording_handler_for_test(sig: i32) -> std::io::Result<()> {
         return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
     }
     sys::install_recording_handler(sig).map(|_| ())
+}
+
+/// 結合試験専用: 継承した `SIG_IGN` を上書きして記録用ハンドラを登録する（#1605・PLUG-7。feature
+/// `signal-test-support` のときだけ存在する）。plugin 役が親から SIGHUP の `SIG_IGN` を継承しても、転送された
+/// SIGHUP を記録できるようにするための入口で、`sig` は転送対象の 3 シグナルに限る。
+#[cfg(feature = "signal-test-support")]
+#[doc(hidden)]
+pub fn install_recording_handler_overriding_ignore_for_test(sig: i32) -> std::io::Result<()> {
+    if !FORWARDED.contains(&sig) {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    sys::install_recording_handler_overriding_ignore(sig).map(|_| ())
+}
+
+/// 結合試験専用: fork した子（exec 前）で `sig` を自分へ送り、子がシグナル終了した番号（通常終了は `None`）を
+/// 返す（#1605・PLUG-7。feature `signal-test-support` のときだけ存在する）。子は転送ハンドラの登録表の
+/// コピーを持つが、所有者照合により plugin へは転送しない。待ちは 10 秒の期限付きで、超過は `TimedOut`。
+/// `sig` は転送対象の 3 シグナルに限る。
+#[cfg(feature = "signal-test-support")]
+#[doc(hidden)]
+pub fn fork_and_raise_for_test(sig: i32) -> std::io::Result<Option<i32>> {
+    if !FORWARDED.contains(&sig) {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    sys::fork_and_raise_for_test(sig, std::time::Duration::from_secs(10))
 }
 
 /// 記録用の固定ハンドラが最後に受けたシグナル番号（未受信は 0。feature `signal-test-support`）。

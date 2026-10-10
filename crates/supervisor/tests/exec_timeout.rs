@@ -1,6 +1,6 @@
 //! exec の全体上限時間（worker プロセス隔離）の結合試験（REPAIR-5・REPAIR-12・SUP-6・TASK-163.4・#503）。
 //!
-//! `run_command` は `setns`・cgroup join・制限の再適用などの割り込めない段を worker プロセスへ隔離し、親が
+//! 本番の入口 `run_command_with_pidfd`（と試験専用の `run_command`）は `setns`・cgroup join・制限の再適用などの割り込めない段を worker プロセスへ隔離し、親が
 //! 全体の期限で待つ。ここでは各段が固まった状況を模した `work`（永久に眠る・panic する・エラーを返す）を
 //! `run_in_worker_for_test` に渡し、期限内に構造化エラーが返ること・worker が回収されることを具体値で照合する。
 //! あわせて、worker が `work` を実行する前に non-dumpable になっていること（SEC-1。稼働中コンテナの PID

@@ -1,4 +1,4 @@
-//! 稼働中コンテナへのコマンド実行（`run_command`）の通し結合試験（TASK-163.4・#503・SUP-6・SEC-1・REPAIR-12）。
+//! 稼働中コンテナへのコマンド実行（縮退経路の試験専用入口 `run_command` と本番の `run_command_with_pidfd`）の通し結合試験（TASK-163.4・#503・SUP-6・SEC-1・REPAIR-12）。
 //!
 //! 実コンテナ（`pivot_root` 済みの pid1）へ `setns` で参加し、cgroup へ join し、rlimit・capability 削減・
 //! `NO_NEW_PRIVS`・Landlock・seccomp を再適用して `execve` するまでを、本番の `fandhe_container_supervisor::exec`

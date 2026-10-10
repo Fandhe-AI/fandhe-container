@@ -67,9 +67,9 @@ pub(crate) fn kernel_at_least(major: u32, minor: u32) -> bool {
     (got_major, got_minor) >= (major, minor)
 }
 
-/// 子プロセスの待ち時間の上限（REPAIR-5。超過したら kill して回収する）。
+/// 子プロセスの待ち時間の上限（REPAIR-5・REPAIR-10 (c) の推奨 5〜10 秒の上限。超過したら kill して回収する）。
 #[cfg(target_os = "linux")]
-const CHILD_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+const CHILD_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 送信スレッドの結果を待つ猶予の上限（REPAIR-5）。
 #[cfg(target_os = "linux")]

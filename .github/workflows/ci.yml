@@ -178,8 +178,8 @@ jobs:
   # - push（main）・workflow_dispatch: ubuntu・macos・windows の 3 OS（従来どおり全ステップ。
   #   macOS・Windows の `--all-features` の clippy / test を含む）。release 前の 3 OS 確認は
   #   workflow_dispatch で本 workflow を実行して行う
-  # PR で見落とすのは macOS・Windows 固有の実行時の誤り（テストの失敗・BSD / Git Bash のツール差・
-  # cfg(target_os) 限定項目への rustdoc リンク）で、main への push 後の 3 OS 実行で検出する。
+  # PR で見落とすのは macOS・Windows 固有の実行時の誤り（テストの失敗・BSD / Git Bash のツール差）で、
+  # main への push 後の 3 OS 実行で検出する（rustdoc のリンクは cross-target-check が PR で検出する）。
   # main への新しい push は古い main の実行を取り消す（concurrency のコメント参照）。
   # check-run 名 `platform-ci (ubuntu-latest)` はどのイベントでも変わらない。
   #
@@ -424,7 +424,7 @@ jobs:
       # push（main）・workflow_dispatch では 3 OS で実行する: cfg(target_os) 限定の項目へのリンクは
       # OS ごとに解決結果が変わり、Linux では通るが macOS / Windows でだけ壊れる（またはその逆の）
       # リンクがあるため。pull_request では ubuntu のみのため、macOS / Windows でだけ壊れるリンクは
-      # main への push 後に検出する（cross-target-check は rustdoc を実行しない）
+      # cross-target-check が aarch64-apple-darwin・x86_64-pc-windows-msvc 向けの cargo doc で検出する
       - name: cargo doc（既定 feature・-D warnings）
         shell: bash
         timeout-minutes: 10
@@ -880,7 +880,7 @@ jobs:
   #     objc2 系 FFI 等）。macOS ランナー（GitHub ホステッドの macos-latest）は arm64 のため
   #   - x86_64-pc-windows-msvc: `cfg(target_os = "windows")` 分岐（platform-windows の windows-sys 等）。
   #     windows-latest ランナーと同じターゲット
-  # check / clippy のみでリンクもテスト実行もしないため、実行時の正しさ（struct のレイアウト・
+  # check / clippy / doc のみでリンクもテスト実行もしないため、実行時の正しさ（struct のレイアウト・
   # OS の挙動差・BSD / Git Bash のツール差）は保証しない。macOS・Windows の実行時の検証は
   # push（main）・workflow_dispatch の platform-ci（3 OS ネイティブ）が担い、aarch64 Linux での
   # 実行はネイティブ arm64 ランナーでのテスト実行が将来の課題（ci.md「3 OS CI」参照）。
@@ -902,10 +902,20 @@ jobs:
   # default = ["plugin"]・plugin・escape-probe・exec-test-support、supervisor の
   # exec-test-support、platform-windows の wsl2-test-support。exec-test-support は
   # 最適化ビルドで compile_error! になるが、check / clippy は dev プロファイルなので影響しない。
-  # 未検査の範囲（REPAIR-3）: 既定 feature（--all-features なし）の構成・cfg(not(feature = "exec-test-support"))
+  #
+  # aarch64-apple-darwin・x86_64-pc-windows-msvc の 2 ターゲットには、pull_request で main の platform-ci
+  # （macOS・Windows）の代わりになるよう、既定 feature（--all-features なし）の検査も加える（オーナー指示）:
+  #   - `cargo clippy --workspace --all-targets --target <target> -- -D warnings`（platform-ci の既定 feature の
+  #     clippy〔make lint〕と同じ構成の型検査）
+  #   - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --target <target>`（make doc と同じ構成。
+  #     cfg(target_os) 限定の項目へのリンクが OS ごとに解決結果を変えるため。REPAIR-3・#1300）
+  # rustdoc はターゲット向けの型検査のみでリンクしないため、クロス実行でも SDK は不要。
+  # aarch64-unknown-linux-gnu は旧 aarch64-linux-check と同じ --all-features の check / clippy のみとする。
+  # 未検査の範囲（REPAIR-3）: aarch64 Linux の既定 feature の構成・cfg(not(feature = "exec-test-support"))
   # 分岐（supervisor/tests/exec_setns_join.rs・core/tests/exec_child_setup.rs・
-  # core/src/exec/reapply.rs の cfg_attr）・plugin を無効にした構成（--no-default-features）・rustdoc は
-  # 本ジョブでは型検査されない（macOS・Windows では main の platform-ci が検査する）。x86_64 Linux でも、
+  # core/src/exec/reapply.rs の cfg_attr）・plugin を無効にした構成（--no-default-features）は
+  # 本ジョブでは型検査されない（macOS・Windows の plugin 無効構成は main の platform-ci が検査する）。
+  # x86_64 Linux でも、
   # lib 側の cfg_attr（core/src/exec/reapply.rs）は cargo build --workspace が、plugin 無効構成は
   # make test-core-no-plugin が検査するのみで、テスト側の cfg(not(feature)) 分岐は
   # 自己参照 dev-dependency による feature 統一で常に有効になるため、どの CI ジョブでも
@@ -938,10 +948,22 @@ jobs:
         run: cargo check --workspace --all-targets --all-features --target aarch64-apple-darwin
       - name: cargo clippy（aarch64-apple-darwin）
         run: cargo clippy --workspace --all-targets --all-features --target aarch64-apple-darwin -- -D warnings
+      - name: cargo clippy（aarch64-apple-darwin・既定 feature）
+        run: cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings
+      - name: cargo doc（aarch64-apple-darwin・既定 feature・-D warnings）
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --target aarch64-apple-darwin
       - name: cargo check（x86_64-pc-windows-msvc・クロス型検査）
         run: cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-msvc
       - name: cargo clippy（x86_64-pc-windows-msvc）
         run: cargo clippy --workspace --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings
+      - name: cargo clippy（x86_64-pc-windows-msvc・既定 feature）
+        run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+      - name: cargo doc（x86_64-pc-windows-msvc・既定 feature・-D warnings）
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --target x86_64-pc-windows-msvc
       - name: venus 試験治具の cargo check（aarch64-apple-darwin・GPU-6・TASK-172.4）
         run: >-
           cargo check --manifest-path poc/venus-decoder/jig/Cargo.toml --locked --all-targets

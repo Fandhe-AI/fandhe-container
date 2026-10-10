@@ -87,18 +87,32 @@ pub(crate) fn write_file_in_child(path: &Path, content: &[u8]) -> io::Result<()>
     use std::process::{Command, Stdio};
 
     let mut child = Command::new("/bin/sh")
-        .args(["-c", r#"cat > "$1""#, "sh"])
+        .args(["-c", r#"exec cat > "$1""#, "sh"])
         .arg(path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    let write_result = match child.stdin.take() {
-        Some(mut stdin) => stdin.write_all(content),
-        None => Err(io::Error::other("child stdin was not piped")),
-    };
-    // stdin はここで drop 済み（EOF）。書き込みの成否に関わらず子を期限付きで回収する。
-    let status = wait_bounded(&mut child, CHILD_WRITE_DEADLINE)?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("child stdin was not piped"))?;
+    // 送信は別スレッドで行い、送信と終了待ちを同じ期限で保護する（REPAIR-5）。子が stdin を読まず pipe が
+    // 満杯になっても、親は wait_bounded の期限で子を kill して回収し、pipe の閉鎖で送信スレッドも解放される。
+    // `exec cat` によりシェルが cat 自身に置き換わるため、kill の対象が書き込み用 fd の保持者そのものになる。
+    let (wait_result, write_result) = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || {
+            let mut stdin = stdin;
+            stdin.write_all(content)
+            // stdin はここで drop（EOF）
+        });
+        let wait_result = wait_bounded(&mut child, CHILD_WRITE_DEADLINE);
+        let write_result = writer
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("writer thread panicked")));
+        (wait_result, write_result)
+    });
+    let status = wait_result?;
     write_result?;
     if !status.success() {
         return Err(io::Error::other(format!(

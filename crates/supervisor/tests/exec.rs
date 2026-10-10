@@ -381,7 +381,7 @@ mod linux {
         assert_eq!(std::process::id(), 1, "must be PID 1 of the new namespace");
         let isolation = MountIsolation::establish().expect("establish mount isolation");
         let prepared = prepare_rootfs(&isolation, rootfs).expect("prepare rootfs");
-        create_default_devices(&isolation, &prepared, DevptsGidSource::Rootful)
+        let devices = create_default_devices(&isolation, &prepared, DevptsGidSource::Rootful)
             .expect("create default devices");
         // 暗黙の `/dev/shm` を載せる（本番の順序: create_default_devices の後。#1654）。Landlock の暗黙分の
         // ルール（`/dev/shm`。#1657）が存在するパスを指すために必要。
@@ -389,7 +389,7 @@ mod linux {
         tmpfs
             .ensure_default_dev_shm()
             .expect("default /dev/shm spec");
-        mount_tmpfs(&isolation, &prepared, &tmpfs).expect("mount default /dev/shm");
+        mount_tmpfs(&isolation, &prepared, Some(&devices), &tmpfs).expect("mount default /dev/shm");
         pivot_root(&isolation, prepared).expect("pivot_root");
         fs::write(format!("/{ready}"), b"ready").expect("write ready marker");
         // 親が stdin 経由で pid1 を kill するまで待機する（上限つき。REPAIR-5）。

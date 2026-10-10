@@ -205,12 +205,13 @@ pub use seccomp::{ProbeOutcome, SeccompProbeRecord};
 pub use seccomp::{SeccompEnforcementObservation, observe_default_seccomp_enforcement};
 pub use setns::{JoinNamespace, NamespaceJoinReport, Pid1Target, join_namespaces};
 pub use stages::{StageHook, StageKind, StagePipeline, StageReport, StageStatus};
-/// 結合試験 `tests/tmpfs_mount.rs` 専用の再公開（SUP-12・TASK-169 追補・#1472。通常の利用者は呼ばない。詳細は定義側）。
+pub use tmpfs::{TmpfsMountOutcome, TmpfsReport, mount_tmpfs};
+/// 結合試験 `tests/tmpfs_mount.rs` 専用の再公開（SUP-12・TASK-169 追補・#1472・#1669 事後監査 P2。通常の利用者は呼ばない。
+/// 詳細は定義側）。
 /// `exec-test-support` feature を付けたビルドにだけ存在する。
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
-pub use tmpfs::mount_tmpfs_with_attach_hook;
-pub use tmpfs::{TmpfsMountOutcome, TmpfsReport, mount_tmpfs};
+pub use tmpfs::{mount_tmpfs_over_bare_dev_for_test, mount_tmpfs_with_attach_hook};
 
 /// 結合試験 `tests/sanitize_integration.rs` 専用の入口: パス検証の拒否（対象パス付きの違反記録）を
 /// 作る（SEC-4・TASK-96.1・REPAIR-12。通常の利用者は呼ばない）。

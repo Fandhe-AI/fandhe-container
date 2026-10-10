@@ -205,14 +205,14 @@ mod linux {
         );
         let isolation = MountIsolation::establish().expect("establish mount isolation");
         let prepared = prepare_rootfs(&isolation, rootfs).expect("prepare rootfs");
-        create_default_devices(&isolation, &prepared, DevptsGidSource::Rootful)
+        let devices = create_default_devices(&isolation, &prepared, DevptsGidSource::Rootful)
             .expect("create default devices");
         // 本番の順序: create_default_devices の後に既定の `/dev/shm`（#1654）。
         let mut tmpfs = TmpfsMountSet::new();
         tmpfs
             .ensure_default_dev_shm()
             .expect("default /dev/shm spec");
-        mount_tmpfs(&isolation, &prepared, &tmpfs).expect("mount default /dev/shm");
+        mount_tmpfs(&isolation, &prepared, Some(&devices), &tmpfs).expect("mount default /dev/shm");
         pivot_root(&isolation, prepared).expect("pivot_root");
 
         // 読み取り専用 root・`mounts[]` が空。暗黙の `/dev` 系だけが書き込みを許す。

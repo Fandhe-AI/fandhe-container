@@ -17,7 +17,9 @@
 //!   2. **検査後の差し替え**: `exec-test-support` の入口 `mount_tmpfs_with_attach_hook` で、移動検査の後・
 //!      付け替えの直前に `/swap` を改名して同名の新ディレクトリを作る。`failed_precondition` で失敗し、
 //!      `swap`・`swapped` のどちらにもマウントが残らず（自分のマウントを fd で外す）、両方が空のまま残ること
-//!   3. **成功経路**: `/dev/shm`（未指定の既定 64 MiB。`ensure_default_dev_shm`・#1654）・`/scratch`（128 KiB）・`/roexec`（`ro,exec`・64 KiB）・
+//!   3. **順序の証跡**: `/dev` 配下の宛先（既定の `/dev/shm`）を含む集合を `create_default_devices` の結果なしで
+//!      `mount_tmpfs` に渡すと、`failed_precondition` で拒否され `dev/shm` も作られないこと（#1669 事後監査 P2）
+//!   4. **成功経路**: `/dev/shm`（未指定の既定 64 MiB。`ensure_default_dev_shm`・#1654）・`/scratch`（128 KiB）・`/roexec`（`ro,exec`・64 KiB）・
 //!      `/nosize`（サイズ未指定）を適用 → `pivot_root` の後、`/proc/self/mountinfo` で 4 件が fstype
 //!      `tmpfs`・`nosuid,nodev` で存在し、`noexec` / `ro` が指定どおりであること、サイズ指定の 3 件が
 //!      指定サイズであること、サイズ未指定の件に `size=` が出ないこと（カーネル既定のまま）、マウント先の
@@ -29,7 +31,9 @@
 //! namespace 内で作れるため両経路とも成功を要求する（`create_default_devices` には依存しない）。
 //! 本試験の rootfs の `dev` は素のディレクトリで、`create_default_devices`（#1653）の tmpfs の上には載らない
 //! （rootless では `mknod` が EPERM になり使えないため）。`/dev` の tmpfs の上に載る組み合わせは本番の起動順
-//! （`create_default_devices` → `mount_tmpfs`）でのみ成り立つ。
+//! （`create_default_devices` → `mount_tmpfs`）でのみ成り立ち、`mount_tmpfs` は `/dev` 配下の宛先に順序の証跡
+//! （`DeviceReport`）を要求する。そのため成功経路は、順序の検査だけを省く `exec-test-support` の入口
+//! `mount_tmpfs_over_bare_dev_for_test` で載せる（他の検証・後始末は `mount_tmpfs` と同一）。
 //! 失敗後に同じ分離を使い続けるのは後始末の照合のためで、本番の契約（失敗時はプロセスを破棄）とは別。
 //!
 //! # 実機前提テストとしての分離
@@ -67,7 +71,8 @@ mod linux {
     use fandhe_container_core::exec::{
         IsolationConfig, IsolationStage, MountIsolation, Namespace, NamespaceSet, PreparedRootfs,
         ViolationReason, isolate, isolate_rootful_host_root, mount_tmpfs,
-        mount_tmpfs_with_attach_hook, pivot_root, plan, plan_rootful_host_root, prepare_rootfs,
+        mount_tmpfs_over_bare_dev_for_test, mount_tmpfs_with_attach_hook, pivot_root, plan,
+        plan_rootful_host_root, prepare_rootfs,
     };
     use fandhe_container_core::tmpfs::{DevShmOrigin, TmpfsMountSet, TmpfsMountSpec, TmpfsSize};
 
@@ -205,7 +210,8 @@ mod linux {
             .expect("push rb");
         set.push(TmpfsMountSpec::new("/link/x", None).expect("link spec"))
             .expect("push link");
-        let err = mount_tmpfs(isolation, prepared, &set).expect_err("symlink must be rejected");
+        let err =
+            mount_tmpfs(isolation, prepared, None, &set).expect_err("symlink must be rejected");
         assert_eq!(err.stage, IsolationStage::MountTmpfs);
         assert_eq!(
             err.violation.as_ref().map(|v| v.reason),
@@ -249,7 +255,7 @@ mod linux {
         set.push(TmpfsMountSpec::new("/swap", None).expect("swap spec"))
             .expect("push swap");
         let (from, to) = (rootfs.join("swap"), rootfs.join("swapped"));
-        let err = mount_tmpfs_with_attach_hook(isolation, prepared, &set, &|| {
+        let err = mount_tmpfs_with_attach_hook(isolation, prepared, None, &set, &|| {
             std::fs::rename(&from, &to).expect("rename swap");
             std::fs::create_dir(&from).expect("recreate swap");
         })
@@ -309,7 +315,26 @@ mod linux {
             set.ensure_default_dev_shm().expect("default shm"),
             DevShmOrigin::Default
         );
-        let report = mount_tmpfs(&isolation, &prepared, &set).expect("mount tmpfs");
+        // 順序の証跡（SUP-12・CORE-1・#1669 事後監査 P2）: `/dev` 配下の宛先を含む集合は、同じ rootfs に対する
+        // `create_default_devices` の結果なしでは何も作らずに拒否される（`dev/shm` も作られない）。
+        let err = mount_tmpfs(&isolation, &prepared, None, &set).expect_err("order evidence");
+        assert_eq!(err.stage, IsolationStage::MountTmpfs);
+        assert_eq!(
+            err.code,
+            fandhe_container_core::traits::types::ErrorCode::FailedPrecondition
+        );
+        assert_eq!(
+            err.message,
+            "tmpfs mounts under /dev require create_default_devices to run first on the same rootfs"
+        );
+        assert!(
+            !rootfs.join("dev/shm").exists(),
+            "no dev/shm before the order check"
+        );
+        // 本試験の `dev` は素のディレクトリ（rootless では `create_default_devices` が使えない。#1660）のため、
+        // 順序の検査だけを省く試験専用の入口でフラグ・サイズ・モードを照合する。
+        let report =
+            mount_tmpfs_over_bare_dev_for_test(&isolation, &prepared, &set).expect("mount tmpfs");
         let applied: Vec<(&str, Option<u64>, bool, bool)> = report
             .mounts
             .iter()

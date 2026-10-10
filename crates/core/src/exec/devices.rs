@@ -31,8 +31,9 @@
 //! prepare_rootfs(&isolation, rootfs) -> PreparedRootfs
 //!   -> create_default_devices(&isolation, &prepared) -> DeviceReport   // 本モジュール
 //!        （dev に tmpfs → ノード 6 種 → symlink 4 本 → pts に devpts → ptmx の symlink）
-//!   -> [/dev/shm は `mount_tmpfs` が集合（既定 64 MiB を含む。#1654）から載せる]
-//!   -> mount_tmpfs / inject_files
+//!   -> [/dev/shm は `mount_tmpfs` が集合（既定 64 MiB を含む。#1654）から載せる。`/dev` 配下の宛先には
+//!       `DeviceReport` を順序の証跡として渡す（#1669 事後監査 P2）]
+//!   -> mount_tmpfs(.., Some(&report), ..) / inject_files
 //!   -> pivot_root(&isolation, prepared)
 //! ```
 //!
@@ -349,6 +350,34 @@ pub struct DeviceReport {
     pub links: Vec<DeviceLinkOutcome>,
     /// `/dev/pts` の devpts と `/dev/ptmx` の結果（#1656）。
     pub devpts: DevptsOutcome,
+    /// 載せた `/dev` の tmpfs のルートの識別情報。`mount_tmpfs` が `/dev` 配下の宛先（`/dev/shm` 等）を載せる前に、
+    /// rootfs の `dev` が今もこのマウントであることを確かめる証跡に使う（#1669 事後監査 P2。SUP-12・CORE-1）。
+    /// crate の外からは読めず、`DeviceReport` 自体も `non_exhaustive` のため crate の外では作れない。
+    pub(super) dev_mount: DevMountIdentity,
+}
+
+/// マウントのルートを指す fd の識別情報（`st_dev`・`st_ino`）。tmpfs は instance ごとに別の `st_dev` を持つため、
+/// 同じ値の `dev` は同じ tmpfs のルートを指す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DevMountIdentity {
+    pub(super) dev: u64,
+    pub(super) ino: u64,
+}
+
+impl DevMountIdentity {
+    /// `fd` の `fstat` から作る（`O_PATH` fd でも取れる。fd は消費しない）。
+    pub(super) fn of(fd: &OwnedFd, stage: IsolationStage) -> Result<Self, ExecError> {
+        let dup = fd
+            .try_clone()
+            .map_err(|e| ExecError::from_io(&e, stage, "dup"))?;
+        let meta = std::fs::File::from(dup)
+            .metadata()
+            .map_err(|e| ExecError::from_io(&e, stage, "fstat(/dev mount)"))?;
+        Ok(Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
 }
 
 /// rootfs の `dev` に専用の tmpfs を載せ、その上へ基本デバイスノード 6 種・default symlink 4 本・
@@ -445,6 +474,7 @@ fn populate_dev(
         .map_err(|e| open_error(e, true, rootfs, &[OsStr::new("dev")]).at_stage(STAGE))?;
     let observed = observe_dev_mount(dev, &after, mount_fd)?;
     check_new_tmpfs(observed, ImplicitDevMount::Dev.destination(), STAGE)?;
+    let dev_mount = DevMountIdentity::of(mount_fd, STAGE)?;
 
     let mount = mount_fd.as_fd();
     let mut nodes = Vec::with_capacity(DEFAULT_DEVICES.len());
@@ -488,6 +518,7 @@ fn populate_dev(
         nodes,
         links,
         devpts,
+        dev_mount,
     })
 }
 
@@ -2058,6 +2089,69 @@ mod tests {
             );
             take_events();
         }
+    }
+
+    /// SUP-12・CORE-1（#1669 事後監査 P2）: `/dev` 配下の宛先（既定の `/dev/shm`）を載せるには、同じ rootfs に
+    /// 対する `create_default_devices` の結果を要求し、rootfs の `dev` が今もその tmpfs のルートであることを
+    /// 確かめる。証跡なし・差し替え・不在・別の rootfs の結果は、何も作らずに `FailedPrecondition` で拒否する。
+    #[test]
+    fn sup12_core1_dev_shm_requires_device_report_of_same_dev() {
+        use super::super::tmpfs::check_dev_order;
+        use crate::tmpfs::{TmpfsMountSet, TmpfsMountSpec};
+        let missing = "tmpfs mounts under /dev require create_default_devices to run first on the same rootfs";
+        let mismatch = "the rootfs /dev is not the tmpfs mounted by create_default_devices";
+        let expect_rejected = |e: ExecError, message: &str| {
+            assert_eq!(e.code, ErrorCode::FailedPrecondition);
+            assert_eq!(e.stage, IsolationStage::MountTmpfs);
+            assert_eq!(e.message, message);
+            assert!(e.violation.is_none());
+        };
+        let mut shm = TmpfsMountSet::new();
+        shm.ensure_default_dev_shm().expect("default /dev/shm");
+        let mut scratch = TmpfsMountSet::new();
+        scratch
+            .push(TmpfsMountSpec::new("/scratch", None).expect("spec"))
+            .expect("push");
+
+        let t = Tmp::new("order-evidence");
+        let root = open_root(&t.0);
+        // `/dev` 配下の宛先が無い集合は証跡を見ない。
+        check_dev_order(root.as_fd(), &scratch, None).expect("no /dev destination");
+        check_dev_order(root.as_fd(), &TmpfsMountSet::new(), None).expect("empty set");
+        // 証跡なしは何も作らずに拒否する。
+        expect_rejected(
+            check_dev_order(root.as_fd(), &shm, None).expect_err("no evidence"),
+            missing,
+        );
+        assert!(!t.0.join("dev").exists());
+
+        let report = run_at(root.as_fd()).expect("default devices");
+        take_events();
+        check_dev_order(root.as_fd(), &shm, Some(&report)).expect("same /dev");
+
+        // 別の rootfs の結果は通さない。
+        let other = Tmp::new("order-evidence-other");
+        let other_root = open_root(&other.0);
+        let other_report = run_at(other_root.as_fd()).expect("other default devices");
+        take_events();
+        expect_rejected(
+            check_dev_order(root.as_fd(), &shm, Some(&other_report)).expect_err("other rootfs"),
+            mismatch,
+        );
+
+        // `dev` を差し替えたら通さない（逆順の配線・重ね掛けで覆われた場合も同じ判定になる）。
+        std::fs::rename(t.0.join("dev"), t.0.join("dev-old")).unwrap();
+        std::fs::create_dir(t.0.join("dev")).unwrap();
+        expect_rejected(
+            check_dev_order(root.as_fd(), &shm, Some(&report)).expect_err("replaced /dev"),
+            mismatch,
+        );
+        // `dev` が無ければ通さない。
+        std::fs::remove_dir(t.0.join("dev")).unwrap();
+        expect_rejected(
+            check_dev_order(root.as_fd(), &shm, Some(&report)).expect_err("missing /dev"),
+            mismatch,
+        );
     }
 
     /// crate の `src` 配下の `.rs` を再帰的に集め、`(src からの相対パス, 内容)` を返す（ソース走査の試験用）。

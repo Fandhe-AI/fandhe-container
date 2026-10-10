@@ -2742,3 +2742,80 @@ mod probe_child_exit_tests {
         }
     }
 }
+
+/// REPAIR-2・#1604: `waitid_abi` の定数は OS・アーキテクチャごとの個別定義で、ヘッダの値と一致する
+/// （Linux: `linux/wait.h`・`bits/waitflags.h`・`bits/types/idtype_t.h`、macOS: `sys/wait.h`）。
+/// 誤った `WNOWAIT` は子を回収してしまい、pgid の再利用を許すため具体値で固定する（PLUG-7）。
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+mod waitid_abi_linux_x86_64_tests {
+    use super::waitid_abi;
+
+    #[test]
+    fn repair2_waitid_constants_match_linux_x86_64_headers() {
+        assert_eq!(waitid_abi::P_PID, 1);
+        assert_eq!(waitid_abi::WNOHANG, 1);
+        assert_eq!(waitid_abi::WEXITED, 4);
+        assert_eq!(waitid_abi::WNOWAIT, 0x0100_0000);
+    }
+
+    /// PLUG-7: `zeroed` は `si_pid == 0`（「未終了」の読み）を含む全フィールド 0 の値を返す。
+    #[test]
+    fn plug7_siginfo_zeroed_has_all_fields_zero() {
+        let info = waitid_abi::SigInfo::zeroed();
+        assert_eq!(
+            (info.si_signo, info.si_errno, info.si_code, info.pad0),
+            (0, 0, 0, 0)
+        );
+        assert_eq!((info.si_pid, info.si_uid), (0, 0));
+        assert_eq!(info.rest, [0u8; 104]);
+    }
+}
+
+/// REPAIR-2・#1604: Linux aarch64 の `waitid_abi` 定数（x86_64 と同じ値だが個別に定義・検査する）。
+#[cfg(all(test, target_os = "linux", target_arch = "aarch64"))]
+mod waitid_abi_linux_aarch64_tests {
+    use super::waitid_abi;
+
+    #[test]
+    fn repair2_waitid_constants_match_linux_aarch64_headers() {
+        assert_eq!(waitid_abi::P_PID, 1);
+        assert_eq!(waitid_abi::WNOHANG, 1);
+        assert_eq!(waitid_abi::WEXITED, 4);
+        assert_eq!(waitid_abi::WNOWAIT, 0x0100_0000);
+    }
+
+    /// PLUG-7: `zeroed` は `si_pid == 0`（「未終了」の読み）を含む全フィールド 0 の値を返す。
+    #[test]
+    fn plug7_siginfo_zeroed_has_all_fields_zero() {
+        let info = waitid_abi::SigInfo::zeroed();
+        assert_eq!(
+            (info.si_signo, info.si_errno, info.si_code, info.pad0),
+            (0, 0, 0, 0)
+        );
+        assert_eq!((info.si_pid, info.si_uid), (0, 0));
+        assert_eq!(info.rest, [0u8; 104]);
+    }
+}
+
+/// REPAIR-2・#1604: macOS の `waitid_abi` 定数（`WNOWAIT` は Linux と異なる 0x20）。
+#[cfg(all(test, target_os = "macos"))]
+mod waitid_abi_macos_tests {
+    use super::waitid_abi;
+
+    #[test]
+    fn repair2_waitid_constants_match_macos_headers() {
+        assert_eq!(waitid_abi::P_PID, 1);
+        assert_eq!(waitid_abi::WNOHANG, 1);
+        assert_eq!(waitid_abi::WEXITED, 4);
+        assert_eq!(waitid_abi::WNOWAIT, 0x20);
+    }
+
+    /// PLUG-7: `zeroed` は `si_pid == 0`（「未終了」の読み）を含む全フィールド 0 の値を返す。
+    #[test]
+    fn plug7_siginfo_zeroed_has_all_fields_zero() {
+        let info = waitid_abi::SigInfo::zeroed();
+        assert_eq!((info.si_signo, info.si_errno, info.si_code), (0, 0, 0));
+        assert_eq!((info.si_pid, info.si_uid, info.si_status), (0, 0, 0));
+        assert_eq!(info.rest, [0u64; 10]);
+    }
+}

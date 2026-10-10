@@ -5266,21 +5266,38 @@ mod tests {
         assert!(accepted.contains(&err), "unexpected error: {err:?}");
     }
 
-    /// CORE-6・SEC-5（TASK-29 追補・#1659）: 特権（`CAP_SYS_ADMIN`）を持たない呼び出しは、ホストのノードを
-    /// 複製できず `Os(EPERM)`（Linux 5.2 未満なら `Unsupported`）で拒否される。非 root のときのみ検証する
-    /// （root では成功し得るため。成功経路は下の実機前提テストが user namespace 内で検証する）。
+    /// CORE-6・SEC-5（TASK-29 追補・#1659）: `open_tree` の複製は呼び出しスレッドの実効 `CAP_SYS_ADMIN`
+    /// （`capget` で読む。bit 21）で結果が決まる。持たなければ `Os(EPERM)` で拒否され、持てば（root で走らせた
+    /// 場合）未接続の複製が close-on-exec の fd で返る（接続しないため drop でカーネルが破棄し、ホストへの副作用は
+    /// 無い）。どちらの分岐も具体値を照合する（euid だけで判定しない。root でも `CAP_SYS_ADMIN` を落とした
+    /// コンテナ内では EPERM 側になる）。Linux 5.2 未満は両分岐とも `Unsupported`。前提: テストプロセスの
+    /// user namespace が自分の mount namespace を所有する（`unshare --user` だけで走らせた場合は対象外）。
+    /// user namespace 内での接続まで含む成功経路は下の実機前提テストが検証する。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
-    fn core6_sec5_open_tree_clone_without_privilege_is_rejected() {
-        if effective_uid() == 0 {
-            return;
-        }
+    fn core6_sec5_open_tree_clone_result_follows_cap_sys_admin() {
+        const CAP_SYS_ADMIN_BIT: u32 = 1 << 21;
+        let caps = cap_get_thread().expect("capget");
+        let privileged = caps.effective[0] & CAP_SYS_ADMIN_BIT != 0;
         let node = verify_device_node_fd(open_o_path("/dev/null"), 1, 3).expect("verify /dev/null");
-        let err = open_tree_clone(&node).unwrap_err();
-        assert!(
-            err == SysError::Os(EPERM) || err == SysError::Unsupported,
-            "unexpected error: {err:?}"
-        );
+        match (privileged, open_tree_clone(&node)) {
+            (_, Err(SysError::Unsupported)) => {}
+            (false, Err(err)) => assert_eq!(err, SysError::Os(EPERM)),
+            (true, Ok(clone)) => assert_eq!(fd_flags(&clone) & 0o2_000_000, 0o2_000_000),
+            (privileged, other) => panic!("privileged={privileged}: unexpected result: {other:?}"),
+        }
+    }
+
+    /// `path` が呼び出しスレッドの mount namespace でマウントポイントか（`/proc/self/mountinfo` の 5 列目と完全一致）。
+    /// 一時領域のパスは空白等のエスケープ対象を含まない前提（`fandhe-open-tree-…` で作る）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn is_mount_point(path: &std::path::Path) -> bool {
+        let real = std::fs::canonicalize(path).expect("canonicalize");
+        let real = real.to_str().expect("utf8 path");
+        std::fs::read_to_string("/proc/self/mountinfo")
+            .expect("read mountinfo")
+            .lines()
+            .any(|l| l.split(' ').nth(4) == Some(real))
     }
 
     /// CORE-6・SEC-5・SEC-1（TASK-29 追補・#1659）: `/dev/null`（文字デバイス 1:3）は期待値 (1, 3) で検証を通り、
@@ -5411,19 +5428,17 @@ mod tests {
         // fd 起点で /dev/null を複製できる。fd は close-on-exec（fdinfo の flags が O_CLOEXEC = 02000000）。
         let node = verify_device_node_fd(open_o_path("/dev/null"), 1, 3).expect("verify /dev/null");
         let clone = open_tree_clone(&node).expect("open_tree_clone");
-        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", clone.as_raw_fd()))
-            .expect("read fdinfo");
-        let flags = info
-            .lines()
-            .find_map(|l| l.strip_prefix("flags:"))
-            .map(|v| i64::from_str_radix(v.trim(), 8).expect("octal flags"))
-            .expect("flags line");
-        assert_eq!(flags & 0o2_000_000, 0o2_000_000, "fdinfo: {info}");
+        assert_eq!(fd_flags(&clone) & 0o2_000_000, 0o2_000_000);
 
-        // 失敗時: ディレクトリ（ファイルの複製の接続先として不正）へ接続すると拒否され、何も接続されない。
+        // 失敗時: ディレクトリ（ファイルの複製の接続先として不正）へ接続すると `EINVAL` で拒否される
+        // （fs/namespace.c の `do_move_mount` は `err = -EINVAL` のまま `d_is_dir(new) != d_is_dir(old)` で抜ける。
+        // v5.2・v6.12 で確認。`ENOTDIR` は `mount(2)` 側の `graft_tree` の値）。接続を試みたディレクトリにも、
+        // まだ接続していないファイルにも何も載っていない。
         let dir_fd = open_o_path(dir.to_str().expect("utf8 path"));
         let err = move_mount_empty_path(clone.as_fd(), dir_fd.as_fd()).unwrap_err();
-        assert!(matches!(err, SysError::Os(_)), "{err:?}");
+        assert_eq!(err, SysError::Os(EINVAL));
+        assert!(!is_mount_point(&dir), "dir must stay unattached");
+        assert!(!is_mount_point(&target_file), "file must stay unattached");
         let before = std::fs::metadata(&target_file).expect("stat");
         assert!(
             before.file_type().is_file(),
@@ -5433,6 +5448,11 @@ mod tests {
         // 成功: 通常ファイルへ接続すると、そのパスが /dev/null（文字デバイス 1:3）として見える。
         let to = open_o_path(target_file.to_str().expect("utf8 path"));
         move_mount_empty_path(clone.as_fd(), to.as_fd()).expect("move_mount_empty_path");
+        assert!(
+            is_mount_point(&target_file),
+            "file must be a mount point after attach"
+        );
+        assert!(!is_mount_point(&dir), "dir must stay unattached");
         let meta = std::fs::metadata(&target_file).expect("stat after attach");
         assert!(meta.file_type().is_char_device());
         let rdev = meta.rdev();

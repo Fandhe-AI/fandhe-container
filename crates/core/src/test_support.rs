@@ -71,6 +71,10 @@ pub(crate) fn kernel_at_least(major: u32, minor: u32) -> bool {
 #[cfg(target_os = "linux")]
 const CHILD_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// 送信スレッドの結果を待つ猶予の上限（REPAIR-5）。
+#[cfg(target_os = "linux")]
+const WRITER_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// `path` へ `content` を「子プロセス（`/bin/sh` の `cat`）」に書かせる（#1686・REPAIR-7・REPAIR-12）。
 ///
 /// `exec::sealed_copy`・`sys` の `AT_EXECVE_CHECK` 系試験がフィクスチャ作成に使う。試験プロセス自身が
@@ -100,17 +104,23 @@ pub(crate) fn write_file_in_child(path: &Path, content: &[u8]) -> io::Result<()>
     // 送信は別スレッドで行い、送信と終了待ちを同じ期限で保護する（REPAIR-5）。子が stdin を読まず pipe が
     // 満杯になっても、親は wait_bounded の期限で子を kill して回収し、pipe の閉鎖で送信スレッドも解放される。
     // `exec cat` によりシェルが cat 自身に置き換わるため、kill の対象が書き込み用 fd の保持者そのものになる。
-    let (wait_result, write_result) = std::thread::scope(|scope| {
-        let writer = scope.spawn(move || {
-            let mut stdin = stdin;
-            stdin.write_all(content)
-            // stdin はここで drop（EOF）
-        });
-        let wait_result = wait_bounded(&mut child, CHILD_WRITE_DEADLINE);
-        let write_result = writer
-            .join()
-            .unwrap_or_else(|_| Err(io::Error::other("writer thread panicked")));
-        (wait_result, write_result)
+    // 送信スレッドの終了待ちも有限にするため join はせず、チャネルの `recv_timeout` で結果を受ける。
+    // 期限内に結果が来ない（kill 後も cat が割り込み不能の I/O 待ちで残る等）場合は、スレッドを切り離して
+    // `TimedOut` を返す（試験専用。切り離したスレッドは pipe の閉鎖で自然に終了する）。
+    let data = content.to_vec();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stdin = stdin;
+        let result = stdin.write_all(&data);
+        drop(stdin); // EOF
+        let _ = tx.send(result);
+    });
+    let wait_result = wait_bounded(&mut child, CHILD_WRITE_DEADLINE);
+    let write_result = rx.recv_timeout(WRITER_JOIN_GRACE).unwrap_or_else(|_| {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "writer thread did not finish in time",
+        ))
     });
     let status = wait_result?;
     write_result?;

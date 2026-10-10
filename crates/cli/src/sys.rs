@@ -200,7 +200,7 @@ mod imp {
         fn raise(sig: i32) -> i32;
     }
 
-    // 試験専用の fork ラッパー用宣言（feature `signal-test-support` のときだけ）。POSIX の
+    // SAFETY（宣言そのものの妥当性）: 試験専用の fork ラッパー用宣言（feature `signal-test-support` のときだけ）。POSIX の
     // `pid_t fork(void)`・`void _exit(int)`・`pid_t waitpid(pid_t, int *, int)`・`int kill(pid_t, int)`。
     // `pid_t` は Linux・macOS とも `int`（32 ビット）。
     #[cfg(feature = "signal-test-support")]

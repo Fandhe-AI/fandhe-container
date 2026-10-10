@@ -616,3 +616,26 @@ fn f5_2b_1_gpu6_need_reply_ack_line_is_fixed_vocabulary() {
     assert_eq!(report.malformed_lines, 0);
     assert_eq!(report.venus_get_capset_ok, 0);
 }
+
+/// GPU-6・TASK-172 F5.2b.3（#1642）: backend 要求のログ行は固定語彙と数値だけで、照合器に壊れた行と見なされない。
+#[test]
+fn f5_2b_3_gpu6_backend_req_result_line_is_fixed_vocabulary() {
+    use crate::log::{BackendReqOutcome as O, backend_req_result_line as line};
+    let ok = line("SHMEM_MAP", 1, 4096, 8192, O::Ok);
+    let st = line("SHMEM_UNMAP", 1, 4096, 8192, O::Status(u64::MAX - 21));
+    let code = line("SHMEM_MAP", 1, 0, 4096, O::Code("TIMEOUT"));
+    assert_eq!(
+        ok,
+        "venus_jig event=backend_req cmd=SHMEM_MAP shmid=1 shm_offset=4096 len=8192 result=ok status=0"
+    );
+    assert_eq!(
+        st,
+        "venus_jig event=backend_req cmd=SHMEM_UNMAP shmid=1 shm_offset=4096 len=8192 result=err status=18446744073709551594"
+    );
+    assert_eq!(
+        code,
+        "venus_jig event=backend_req cmd=SHMEM_MAP shmid=1 shm_offset=0 len=4096 result=err code=TIMEOUT"
+    );
+    let report = crate::log::find_capset_queries(&format!("{ok}\n{st}\n{code}")).expect("report");
+    assert_eq!(report.malformed_lines, 0);
+}

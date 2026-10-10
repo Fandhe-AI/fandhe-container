@@ -210,6 +210,36 @@ pub fn backend_req_line() -> String {
     "venus_jig event=backend_req request=21 result=accepted".to_string()
 }
 
+/// backend 要求（`SHMEM_MAP` / `SHMEM_UNMAP`）の結果（#1642）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendReqOutcome<'a> {
+    /// frontend が 0 を返した。
+    Ok,
+    /// frontend が非 0 を返した（u64 を 10 進で出す。`-errno as u64` もそのまま）。
+    Status(u64),
+    /// 治具側の失敗（固定語彙の code。`TIMEOUT` など）。
+    Code(&'a str),
+}
+
+/// backend 要求を送った結果のログ行（#1642）。固定語彙と数値だけを出し、fd 番号・frontend 由来のバイト列は出さない。
+/// `backend_req_line`（`request=21`。frontend 要求 `SET_BACKEND_REQ_FD` の受理）とはキー（`cmd=`）で区別する。
+pub fn backend_req_result_line(
+    cmd: &str,
+    shmid: u8,
+    shm_offset: u64,
+    len: u64,
+    outcome: BackendReqOutcome<'_>,
+) -> String {
+    let tail = match outcome {
+        BackendReqOutcome::Ok => "result=ok status=0".to_string(),
+        BackendReqOutcome::Status(v) => format!("result=err status={v}"),
+        BackendReqOutcome::Code(c) => format!("result=err code={c}"),
+    };
+    format!(
+        "venus_jig event=backend_req cmd={cmd} shmid={shmid} shm_offset={shm_offset} len={len} {tail}"
+    )
+}
+
 /// セッション終了時の host-visible 共有メモリの成立状況（#1641）。`status` は固定語彙（`ready` ほか）。
 pub fn host_visible_line(status: &str) -> String {
     format!("venus_jig event=host_visible status={status}")

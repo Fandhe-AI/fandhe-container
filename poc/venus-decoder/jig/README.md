@@ -16,8 +16,9 @@ virtio-gpu 外部バックエンドの仕組みへ、自前の最小 venus デ�
 - 実装済み（F4・#1598。Linux 限定）: 起動入口（`launch` と bin `venus-jig`。UDS の bind・ソケットディレクトリの検証・期限つき accept・ログのファイル出力）。設計は `docs/design/venus-decoder-poc.md` 10.9。
 - 実装済み: accept 直後の peer credential（`SO_PEERCRED`）による接続元 UID の照合（PLUG-12。不一致・取得失敗は拒否。`sys::peer_uid`＝U11）。
 - 実装済み（F6・#1602。Linux 限定）: 受理した `SUBMIT_3D` の本体（32 バイトの ctrl 固定部より後ろ）を 1 提出 1 レコードで記録ファイル（FCVNSREC 形式。`replay::validate` で検証できる）へ書き出す `--record`（`recording`）。リングの中身（共有メモリ）は記録しない（F5.2b の後）。reply・期待出力も記録しない。
+- 実装済み（F5.2b.3・#1642。Linux 限定）: backend 要求 `SHMEM_MAP` / `SHMEM_UNMAP` を NEED_REPLY つき・期限つきで送り、frontend の u64 応答を検査する部品（呼び出しは #1643。失敗後は channel を閉じる。10.4.4 節）
 - 実装済み（F5.2b.2・#1641。Linux 限定）: protocol feature `SHMEM`・`BACKEND_REQ` の広告（`0x0040_0229`）と、`GET_SHMEM_CONFIG`（shmid 1 を 128 MiB で 1 個）・`SET_BACKEND_REQ_FD`（UDS を保持し、セッション終了で閉じる）の受け付け。確定の食い違いは終了時の `host_visible` 行で理由を残す。設計は 10.4.4 節。
-- 未実装: cursorq の処理・`observe` の定期出力。backend 要求 `SHMEM_MAP` の送信（#1642）。
+- 未実装: cursorq の処理・`observe` の定期出力。
 - 未達: 「Linux ゲストの Mesa venus の capset クエリが自前デコーダに届いたことをログで確認」は
   実機実行（#725。人間担当）の完了まで満たせない。
 
@@ -52,6 +53,6 @@ FANDHE_VENUS_JIG_LOG=<ログファイル> cargo test --manifest-path poc/venus-d
 ## 後続
 
 - F1: vhost-user トランスポート（F1.1 メッセージ codec は実装済み／F1.2 fd 受け渡しと mmap のラッパーは実装済み〔#1517〕／F1.3 split virtqueue は実装済み〔#1518〕／F1.4 セッションは実装済み〔#1519〕）
-- `SHMEM_MAP` の送信（#1642）、`RESOURCE_MAP_BLOB` / `UNMAP_BLOB`（F5.2b.3 の #1643。未対応は `ERR_UNSPEC`。設計書 10.4 節）
+- `RESOURCE_MAP_BLOB` / `UNMAP_BLOB`（F5.2b.3 の #1643。未対応は `ERR_UNSPEC`。設計書 10.4 節）
 - F4: 起動入口（実装済み。#1598）。記録ファイル（`--record`）は #1602 で実装済み。capset より後の ctrl 応答は #1599
 - F3: 実機での疎通実行（#725）

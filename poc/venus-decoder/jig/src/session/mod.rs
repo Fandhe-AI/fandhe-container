@@ -13,7 +13,7 @@
 //! 待機はすべて期限つき（REPAIR-5）。単一 fd 用の `sys::wait_fd` を socket と ctrl の kick で交互に短く待つ方式のため、
 //! kick への反応には最大 [`SessionLimits::poll_slice`] の遅延が乗る（複数 fd の ppoll 化は unsafe の承認範囲外）。
 //! 共有メモリ（F5.2b.2・#1641）: `GET_SHMEM_CONFIG` への応答と `SET_BACKEND_REQ_FD` の fd の保持は `negotiation` が担い、終了時に
-//! host-visible の成立状況（`host_visible` 行）を出す。保持した fd へ backend 要求を送る処理は未実装（#1642）。
+//! host-visible の成立状況（`host_visible` 行）を出す。backend 要求（`SHMEM_MAP` / `SHMEM_UNMAP`）の期限つき送信は `Session::shmem_map` / `shmem_unmap`（#1642。呼び出しは #1643 の ctrl）。
 //! 未実装（REPAIR-3）: cursorq（ring 1）の要求処理・`SET_CONFIG`・`VRING_NOFD`・inflight・
 //! `observe::snapshot_lines` の定期出力（終了時の集計出力は実装済み。定期出力と virtqueue 個別の観測カウンタは未実装）。
 //!
@@ -28,6 +28,7 @@
 //! 未対応（REPAIR-3・将来仕様）: kick / call の fd の種類（eventfd）検査。eventfd の生成は `sys` の承認範囲（U1〜U10）外の
 //! `unsafe` を要し、結合試験の偽 frontend が `UnixStream` で代用しているため、現状は種類によらず期限つき poll で守る。
 
+mod backend_req;
 mod error;
 mod metrics;
 mod negotiation;
@@ -47,6 +48,7 @@ use crate::ctrl::{CtrlResponse, RESP_ERR_INVALID_PARAMETER};
 use crate::device;
 use crate::log::{self, QueryResult};
 use crate::sys;
+use crate::vhost_user::backend_req::{BackendRequest, ShmemMapRequest, ShmemMapping};
 use crate::vhost_user::fd_passing::{MAX_FDS, MAX_TIMEOUT, recv_with_fds, send_with_fds};
 use crate::vhost_user::observe;
 use crate::vhost_user::{
@@ -54,6 +56,7 @@ use crate::vhost_user::{
     TransportError, TransportErrorCode, decode_request_payload,
 };
 use crate::virtqueue::VirtqueueErrorCode;
+use backend_req::{BackendAck, BackendReqError};
 use metrics::{SessionMetrics, SessionOp};
 use negotiation::{State, expected_fds};
 
@@ -233,6 +236,75 @@ fn fill(
 }
 
 impl Session {
+    /// `SHMEM_MAP` を frontend へ送り、応答を確かめる（#1642。呼び出し元は #1643 の ctrl `MAP_BLOB`）。
+    ///
+    /// ゲート（REPLY_ACK 確定・host-visible 成立）を通らなければ送らずに `Err`（ログも出さない。呼び出し側が ctrl の
+    /// エラーとして記録する）。送った場合は結果を 1 行ログに出し、治具側の失敗なら channel を閉じる。`fd` は借りるだけ。
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "#1643 の ctrl（MAP_BLOB）から呼ぶ")
+    )]
+    fn shmem_map(
+        &mut self,
+        req: &ShmemMapRequest,
+        fd: BorrowedFd<'_>,
+        sink: &mut dyn FnMut(&str),
+    ) -> Result<BackendAck, BackendReqError> {
+        self.backend_exchange(&BackendRequest::ShmemMap(*req), Some(fd), sink)
+    }
+
+    /// `SHMEM_UNMAP` を送る（#1642。MAP と同じ区間。fd なし）。
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "#1643 の ctrl（UNMAP_BLOB）から呼ぶ")
+    )]
+    fn shmem_unmap(
+        &mut self,
+        mapping: &ShmemMapping,
+        sink: &mut dyn FnMut(&str),
+    ) -> Result<BackendAck, BackendReqError> {
+        self.backend_exchange(&BackendRequest::ShmemUnmap(*mapping), None, sink)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "#1643 の ctrl（MAP_BLOB / UNMAP_BLOB）から呼ぶ")
+    )]
+    fn backend_exchange(
+        &mut self,
+        req: &BackendRequest,
+        fd: Option<BorrowedFd<'_>>,
+        sink: &mut dyn FnMut(&str),
+    ) -> Result<BackendAck, BackendReqError> {
+        let timeout = self.limits.message_timeout;
+        let result = {
+            let sock = self.state.backend_channel(req.code())?;
+            backend_req::exchange(sock, req, fd, timeout)
+        };
+        let m = req.mapping();
+        let (shmid, off, len) = (m.shmid(), m.shm_offset(), m.len());
+        let outcome = match &result {
+            Ok(_) => log::BackendReqOutcome::Ok,
+            Err(e) => match e.status {
+                Some(v) => log::BackendReqOutcome::Status(v),
+                None => log::BackendReqOutcome::Code(e.code.as_str()),
+            },
+        };
+        sink(&log::backend_req_result_line(
+            req.code().as_str(),
+            shmid,
+            off,
+            len,
+            outcome,
+        ));
+        if let Err(e) = &result
+            && e.desyncs_channel()
+        {
+            self.state.mark_backend_broken();
+        }
+        result
+    }
+
     fn serve(
         &mut self,
         sock: &UnixStream,
@@ -648,5 +720,7 @@ fn notify(call: &File, timeout: Duration) -> Result<(), SessionError> {
     }
 }
 
+#[cfg(test)]
+mod backend_req_tests;
 #[cfg(test)]
 mod tests;

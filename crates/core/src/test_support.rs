@@ -67,6 +67,156 @@ pub(crate) fn kernel_at_least(major: u32, minor: u32) -> bool {
     (got_major, got_minor) >= (major, minor)
 }
 
+/// 子プロセスの待ち時間の上限（REPAIR-5・REPAIR-10 (c) の推奨 5〜10 秒の上限。超過したら kill して回収する）。
+#[cfg(target_os = "linux")]
+const CHILD_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 送信スレッドの結果を待つ猶予の上限（REPAIR-5）。
+#[cfg(target_os = "linux")]
+const WRITER_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `path` へ `content` を「子プロセス（`/bin/sh` の `cat`）」に書かせる（#1686・REPAIR-7・REPAIR-12）。
+///
+/// `exec::sealed_copy`・`sys` の `AT_EXECVE_CHECK` 系試験がフィクスチャ作成に使う。試験プロセス自身が
+/// 書き込み用 fd を開くと、同じ libtest バイナリの他スレッドの `fork` がその複製を一瞬継承し、その間の
+/// `execveat(AT_EXECVE_CHECK)` が `ETXTBSY` で不安定に失敗する。ここでは書き込み用 fd を子だけが持つため、
+/// 試験プロセスの fd 表には対象 inode の書き込み用 fd が一度も現れず、他スレッドの fork も継承できない。
+///
+/// 契約: 返った時点で書き込んだ子は回収済みで、書き込み用 fd はどのプロセスにも残らない。mode は呼び出し側が
+/// `set_permissions`（パス指定で fd を開かない）で付ける。子の失敗・期限超過・`/bin/sh` 不在は skip せずエラーにする。
+/// パスは argv（`$1`）、内容は stdin の pipe で渡し、シェル文字列へ連結しない。
+#[cfg(target_os = "linux")]
+pub(crate) fn write_file_in_child(path: &Path, content: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", r#"exec cat > "$1""#, "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("child stdin was not piped"))?;
+    // 送信は別スレッドで行い、送信と終了待ちを同じ期限で保護する（REPAIR-5）。子が stdin を読まず pipe が
+    // 満杯になっても、親は wait_bounded の期限で子を kill して回収し、pipe の閉鎖で送信スレッドも解放される。
+    // `exec cat` によりシェルが cat 自身に置き換わるため、kill の対象が書き込み用 fd の保持者そのものになる。
+    // 送信スレッドの終了待ちも有限にするため join はせず、チャネルの `recv_timeout` で結果を受ける。
+    // 期限内に結果が来ない（kill 後も cat が割り込み不能の I/O 待ちで残る等）場合は、スレッドを切り離して
+    // `TimedOut` を返す（試験専用。切り離したスレッドは pipe の閉鎖で自然に終了する）。
+    let data = content.to_vec();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stdin = stdin;
+        let result = stdin.write_all(&data);
+        drop(stdin); // EOF
+        let _ = tx.send(result);
+    });
+    let wait_result = wait_bounded(&mut child, CHILD_WRITE_DEADLINE);
+    let write_result = rx.recv_timeout(WRITER_JOIN_GRACE).unwrap_or_else(|_| {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "writer thread did not finish in time",
+        ))
+    });
+    let status = wait_result?;
+    write_result?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "writer child exited with {status} for {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// 期限付きの `try_wait`。超過したら kill し、有限の猶予で回収して `TimedOut` を返す（REPAIR-5）。
+#[cfg(target_os = "linux")]
+fn wait_bounded(
+    child: &mut std::process::Child,
+    deadline: std::time::Duration,
+) -> io::Result<std::process::ExitStatus> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if start.elapsed() >= deadline {
+            child.kill()?;
+            let reap_start = std::time::Instant::now();
+            while child.try_wait()?.is_none() {
+                if reap_start.elapsed() >= std::time::Duration::from_secs(5) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "killed child was not reaped in time",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "child did not exit before the deadline",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// 自プロセスが開いている fd のうち、指定 inode を指すものの数（アクセスモード別）。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FdCounts {
+    /// `O_WRONLY` または `O_RDWR` で開いている fd 数。
+    pub(crate) writable: usize,
+    /// `O_RDONLY` で開いている fd 数。
+    pub(crate) read_only: usize,
+}
+
+/// `/proc/self/fd` を走査し、`(dev, ino)` を指す fd を書き込み用／読み取り専用に分けて数える（#1686）。
+///
+/// `write_file_in_child` の後に書き込み用 fd が残っていないことを具体値で照合するための独立した検査器。
+/// 走査中に他スレッドが閉じた fd（`NotFound`）だけを読み飛ばし、それ以外の失敗・解釈不能はエラーにする。
+#[cfg(target_os = "linux")]
+pub(crate) fn open_fds_on(dev: u64, ino: u64) -> io::Result<FdCounts> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let mut counts = FdCounts {
+        writable: 0,
+        read_only: 0,
+    };
+    for entry in std::fs::read_dir("/proc/self/fd")? {
+        let name = entry?.file_name();
+        let fd_path = Path::new("/proc/self/fd").join(&name);
+        let meta = match std::fs::metadata(&fd_path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if meta.dev() != dev || meta.ino() != ino {
+            continue;
+        }
+        let info = match std::fs::read_to_string(Path::new("/proc/self/fdinfo").join(&name)) {
+            Ok(t) => t,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let flags = info
+            .lines()
+            .find_map(|l| l.strip_prefix("flags:"))
+            .and_then(|v| u32::from_str_radix(v.trim(), 8).ok())
+            .ok_or_else(|| io::Error::other("cannot parse flags in fdinfo"))?;
+        if flags & 0o3 == 0 {
+            counts.read_only += 1;
+        } else {
+            counts.writable += 1;
+        }
+    }
+    Ok(counts)
+}
+
 /// `6.14.0-1-generic` 形式の先頭 2 要素を数値で返す（純関数）。
 fn parse_release(text: &str) -> Option<(u32, u32)> {
     let mut parts = text.trim().split(['.', '-']);
@@ -126,6 +276,47 @@ fn create_unique_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REPAIR-7・REPAIR-12・SEC-1・SUP-6・TASK-163 追補・#1686: 子で書いたフィクスチャは、作成後に自プロセスへ
+    /// 書き込み用 fd を残さず（0 件）、内容が一致し、`AT_EXECVE_CHECK` の判定がカーネル版どおりになる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair12_issue1686_child_written_fixture_leaves_no_writable_fd() {
+        use std::io::Read as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let tmp = TestTempDir::new("child-write").expect("temp dir");
+        let path = tmp.path().join("script");
+        let big = vec![0xA5u8; 64 * 1024 * 2 + 123];
+        for content in [&b"#!/bin/sh\nexit 0\n"[..], &big[..]] {
+            write_file_in_child(&path, content).expect("write in child");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            let mut file = std::fs::File::open(&path).expect("open");
+            let meta = file.metadata().expect("metadata");
+            let mut got = Vec::new();
+            file.read_to_end(&mut got).expect("read");
+            assert_eq!(got, content);
+            assert_eq!(
+                open_fds_on(meta.dev(), meta.ino()).expect("count fds"),
+                FdCounts {
+                    writable: 0,
+                    read_only: 1
+                }
+            );
+            // 対照: 検査器が書き込み用 fd を実際に数えられること。
+            let writer = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open for write");
+            assert_eq!(
+                open_fds_on(meta.dev(), meta.ino()).expect("count fds"),
+                FdCounts {
+                    writable: 1,
+                    read_only: 1
+                }
+            );
+            drop(writer);
+        }
+    }
 
     fn names(v: &[&str]) -> impl Iterator<Item = String> {
         v.iter()

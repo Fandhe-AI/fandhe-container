@@ -5281,7 +5281,8 @@ mod tests {
         let dir = tmp.path().to_path_buf();
         let file_with_mode = |mode: u32| {
             let path = dir.join(format!("f{mode:o}"));
-            std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write");
+            crate::test_support::write_file_in_child(&path, b"#!/bin/sh\nexit 0\n")
+                .expect("write in child");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
             std::fs::File::open(&path).expect("open")
         };

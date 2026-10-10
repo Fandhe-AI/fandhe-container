@@ -1327,7 +1327,12 @@ impl TmpfsParams {
 ///   `EPERM` になり `/dev/zero` の実行可能マップが壊れるおそれがあり、付ける根拠となるビヘイビアも無い。
 /// - `strictatime` を付ける: runc と同じ。既定の relatime に任せず明示する。
 ///
-/// `crate::exec::create_default_devices` が呼ぶ（#1653）。
+/// その結果、コンテナの `/dev` は書き込み可能かつ実行可能な領域になり、読み取り専用でない rootfs と同じ扱いに
+/// なる（`root.readonly=true` でも `/dev` は書き込める。Landlock も `/dev` に `WRITE` を許す。#1664・#1672 の
+/// 事後監査）。新たなデバイスノードの作成は Landlock の `MAKE_CHAR`・`MAKE_BLOCK` 不許可が止める（SEC-1）。
+///
+/// `crate::exec::create_default_devices` が呼ぶ（#1653）。付け替え先は `exec::devices` の検証済みの型からしか
+/// 渡さない（#1664 の事後監査 P2）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DevTmpfsCreate {
     _private: (),

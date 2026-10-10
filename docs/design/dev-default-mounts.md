@@ -24,11 +24,12 @@ OCI 既定の `/dev` のうち、基本デバイスノード 6 種と default sy
 
 ## 2. 現状（本リポ）
 
-- `create_default_devices` は rootfs の `dev` に専用の nodev なし tmpfs（`sys::mount_dev_tmpfs_on`・#1652）を載せてから、基本 6 デバイスと default symlink 4 本をそのマウントのルート fd 起点で作る（#1653）。ノードはホストの rootfs に残らず、イメージ同梱の `dev` 配下は覆い隠される。起動順序は `prepare_rootfs` → `create_default_devices`（`dev` に tmpfs → ノード → symlink → `pts` に devpts → `ptmx` の symlink。devpts と `ptmx` は #1656）→ `mount_tmpfs` → `pivot_root`
+- `create_default_devices` は rootfs の `dev` に専用の nodev なし tmpfs（`sys::mount_dev_tmpfs_on`・#1652）を載せてから、基本 6 デバイスと default symlink 4 本をそのマウントのルート fd 起点で作る（#1653）。ノードはホストの rootfs に残らず、イメージ同梱の `dev` 配下は覆い隠される（覆い隠す効果は `dev` 配下に限る。3.1 の注記）。起動順序は `prepare_rootfs` → `create_default_devices`（`dev` に tmpfs → ノード → symlink → `pts` に devpts → `ptmx` の symlink。devpts と `ptmx` は #1656）→ `mount_tmpfs` → `pivot_root`。`/dev` の tmpfs の付け替え先は、検証を通った `dev` の fd を表す型（`exec::devices` の `DevMountTarget`）でしか渡せず、`sys::mount_dev_tmpfs_on` の呼び出しが 1 か所であることを単体テストがソースの走査で確かめる（#1664 の事後監査 P2）。`mount_tmpfs` は `/dev` 配下の宛先（`/dev/shm` 等）に、同じ rootfs に対する `create_default_devices` の結果（`DeviceReport`）を順序の証跡として要求し、rootfs の `dev` が今もその tmpfs のルートでなければ何も作らずに拒否する（#1669 の事後監査 P2）
 - `/dev/shm` は `TmpfsMountSet::ensure_default_dev_shm` が、利用者の指定（`--shm-size`・`--tmpfs /dev/shm`）が無いとき既定 64 MiB（`DEFAULT_DEV_SHM_SIZE_BYTES`）の件を足す（#1654）。supervisor の `to_tmpfs_set` が `--ipc=host` 以外で呼ぶ。`--ipc=host` でのホストの `/dev/shm` の bind は未実装
 - `sys` の新マウント API ラッパーは tmpfs（`mount_tmpfs_on`・`mount_dev_tmpfs_on`）と devpts（`mount_devpts_on`・#1655）があり、devpts は `create_default_devices` が呼ぶ（#1656）
 - `process.terminal: true` と `mounts[]` は拒否する。`/proc` と基本 6 デバイスは `mounts[]` を使わず暗黙の固定集合
-- Landlock のルールは `root` に加え、暗黙の `/dev`・`/dev/pts`・`/dev/shm` を実マウントの属性から導いた権利で足す（#1657）。定義は `dev_mounts` モジュールの1か所で、exec 側と共有する。`mounts[]` が同じマウント先を指す場合は統合せず拒否する（統合の規則は TASK-127）。`PSEUDO_FS` に devpts は入れない（pty への書き込みに `WRITE_FILE` が要り、書き込み制限に VFS の裏付けがあるため）。利用者指定の tmpfs（`--tmpfs`・`/dev/shm` の上書き）は反映しない
+- Landlock のルールは `root` に加え、暗黙の `/dev`・`/dev/pts`・`/dev/shm` を実マウントの属性から導いた権利で足す（#1657）。定義は `dev_mounts` モジュールの1か所で、exec 側と共有する。`mounts[]` が同じマウント先を指す場合は統合せず拒否する（統合の規則は TASK-127）。`PSEUDO_FS` に devpts は入れない（pty への書き込みに `WRITE_FILE` が要り、書き込み制限に VFS の裏付けがあるため）。利用者指定の tmpfs（`--tmpfs`・`/dev/shm` の上書き）は反映しない。ruleset は fork 前に親で作るため、適用時に各パスが期待する fs（tmpfs / devpts）の独立したマウントのルートであることを確かめ、無ければ `landlock_implicit_mount_missing`、素のディレクトリ等なら `landlock_implicit_mount_mismatch`（どちらも `FailedPrecondition`）で拒否する。`/dev/shm` を載せない `--ipc=host` では `ImplicitDevMounts::WithoutShm`（supervisor の `ContainerOptions::implicit_dev_mounts`）を使う（#1672 の事後監査 P2）
+- 読み取り専用の root（`root.readonly=true`）でも、`/dev` は書き込みと実行が可能な tmpfs で、Landlock でも `/dev` に `WRITE` を許す（`EXECUTE` は `/` のルールから継承され、`/dev` だけ外せない。VFS 側も `noexec` なし）。runc・Docker と同じだが、「読み取り専用の root で `mounts[]` が空なら書き込めるパスが無い」という #1657 以前の性質は成り立たない（#1672 の事後監査 P2）。`/dev/shm` も書き込みは可能（`noexec`・`nodev`）
 - rootless は tmpfs までは載るが `mknod` が `EPERM` になり `PermissionDenied` で fail-closed（載せた tmpfs は外す）。ホスト `/dev` の bind は未実装（#1660）
 
 ## 3. 方式の比較
@@ -41,6 +42,8 @@ OCI 既定の `/dev` のうち、基本デバイスノード 6 種と default sy
 | 現状維持 | 変更が小さい | ホスト側にノードが残る |
 
 tmpfs にする（runc 方式）に確定（4 章の判断 1）。実装は #1652・#1653。
+
+イメージ同梱の偽ノードを覆い隠せるのは `dev` 配下に限る（#1667 の事後監査 P2）。rootfs の残りの部分（例: イメージが `/dev` 以外に同梱したブロックデバイスのノード）は、rootful では rootfs の自己 bind に `nodev` が無く、汎用のデバイス cgroup（`BPF_CGROUP_DEVICE`）も core に無いため、Landlock の `READ_FILE`・`WRITE_FILE` の範囲で開けてしまう。rootfs の自己 bind の `nodev` 化と、既定のデバイス cgroup の許可リストは別の Issue で追跡する（GPU 向けの TASK-129 とは別）。新たなノードの作成（mknod）は Landlock の `MAKE_CHAR`・`MAKE_BLOCK` 不許可が止め、`/dev`・`/dev/shm` での拒否は `tests/landlock_implicit_dev.rs` が照合する
 
 ### 3.2 暗黙の固定集合か `mounts[]` の汎用処理か
 
@@ -56,7 +59,7 @@ tmpfs にする（runc 方式）に確定（4 章の判断 1）。実装は #165
 
 ### 3.4 `/dev/shm`
 
-`--shm-size` 未指定でも 64 MiB（`nosuid,noexec,nodev,mode=1777`）を常にマウントする。利用者指定との重複は指定を優先する。`--ipc=host` はホストの `/dev/shm` の bind が要り、別の関心事として切り出す。
+`--shm-size` 未指定でも 64 MiB（`nosuid,noexec,nodev,mode=1777`）を常にマウントする。利用者指定との重複は指定を優先する。`--ipc=host` はホストの `/dev/shm` の bind が要り、別の関心事として切り出す。bind を実装するまでは `--ipc=host` で `/dev/shm` を載せず、Landlock の暗黙分も `ImplicitDevMounts::WithoutShm` にする（#1672 の事後監査 P2）。
 
 ### 3.5 `/dev/console`
 

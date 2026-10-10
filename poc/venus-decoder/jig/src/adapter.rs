@@ -424,8 +424,8 @@ impl CtrlAdapter {
 
     /// resource の大きさ（`session` が実メモリの副表を資源表と突き合わせる）。無ければ `None`。
     ///
-    /// 呼び出し元の `session` は Linux 限定のため、他 OS では dead_code になるので同じ cfg で絞る。
-    #[cfg(target_os = "linux")]
+    /// 呼び出し元の `session` は Linux 限定のため、他 OS では試験以外で dead_code になるので cfg で絞る（試験は全 OS で使う）。
+    #[cfg(any(test, target_os = "linux"))]
     pub(crate) fn resource_size(&self, res_id: u32) -> Option<u64> {
         self.resources.size_of(res_id)
     }

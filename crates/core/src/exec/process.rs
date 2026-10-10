@@ -3456,6 +3456,151 @@ mod tests {
         }
     }
 
+    /// 満杯 pipe 試験の子役を選ぶ環境変数（値は任意。親役が付けて自身のテストバイナリを再実行する）。
+    const FULL_STDERR_CHILD_ENV: &str = "FANDHE_TEST_1617_FULL_STDERR_CHILD";
+
+    /// 満杯 pipe 試験で `pidfd_open` を確実に失敗させる pid（`pid_max` の上限 4194304 を超え `ESRCH` になる）。
+    const FULL_STDERR_MISSING_PID: u32 = 2_147_483_647;
+
+    /// 満杯 pipe 試験の子役（親が読まない pipe を stderr に繋いで起動される）。
+    ///
+    /// 1. 埋め込みスレッドが stderr へ 4096 バイトずつ書き、書けた量が 300ms 増えなくなる（pipe 満杯で
+    ///    `write(2)` が止まる）まで待つ（上限 5 秒）。
+    /// 2. 対照として、`1471036b` より前の `new` と同じ `writeln!(std::io::stderr().lock(), ..)` を別スレッドで呼び、
+    ///    300ms 以内に戻らないこと（stderr が実際に停止していること）を確かめる。
+    /// 3. `ContainerChild::new` を存在しない pid で呼び（`pidfd_open` が失敗する縮退経路）、所要時間を測る。
+    ///
+    /// 結果は stdout の `RESULT ...` 1 行で返し、`process::exit` で終える（止まったスレッドを待たない。
+    /// stderr は止まっているので panic のメッセージも出せない。失敗は終了コードで返す）。
+    fn full_stderr_child_main() -> ! {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static WRITTEN: AtomicU64 = AtomicU64::new(0);
+        std::thread::spawn(|| {
+            let chunk = [b'x'; 4096];
+            loop {
+                match std::io::stderr().write(&chunk) {
+                    Ok(n) => {
+                        WRITTEN.fetch_add(u64::try_from(n).unwrap_or(0), Ordering::SeqCst);
+                    }
+                    // 読み手が閉じた等で満杯にできない（試験の前提が崩れた）。
+                    Err(_) => std::process::exit(3),
+                }
+            }
+        });
+        let fill_deadline = Instant::now() + Duration::from_secs(5);
+        let mut last = WRITTEN.load(Ordering::SeqCst);
+        let mut stable_since = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(20));
+            let now = WRITTEN.load(Ordering::SeqCst);
+            if now != last {
+                last = now;
+                stable_since = Instant::now();
+            } else if now > 0 && stable_since.elapsed() >= Duration::from_millis(300) {
+                break;
+            }
+            if Instant::now() >= fill_deadline {
+                std::process::exit(4);
+            }
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _ = writeln!(std::io::stderr().lock(), "control line");
+            let _ = tx.send(());
+        });
+        let control_blocked = rx.recv_timeout(Duration::from_millis(300)).is_err();
+
+        let start = Instant::now();
+        let handle = ContainerChild::new(FULL_STDERR_MISSING_PID);
+        let elapsed = start.elapsed();
+
+        let reason = handle.pidfd_unavailable().map_or_else(
+            || "none".to_owned(),
+            |r| format!("{}:{}", r.as_str(), r.errno_name()),
+        );
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(
+            out,
+            // libtest が改行なしで出す `test <名前> ... ` の後ろに続かないよう、先頭で改行する。
+            "\nRESULT control_blocked={control_blocked} pidfd_none={} reason={reason} within_1s={}",
+            handle.pidfd().is_none(),
+            elapsed < Duration::from_secs(1)
+        );
+        let _ = out.flush();
+        std::process::exit(0);
+    }
+
+    /// SUP-6・REPAIR-5・REPAIR-4（#1617・#1683 の Codex P0）: stderr が読み手の止まった満杯 pipe でも、
+    /// `pidfd_open` が失敗する縮退経路の `ContainerChild::new` は 1 秒未満で子ハンドルを返す（stderr へ同期
+    /// 書き込みせず、呼び出し側の `wait_timeout` による期限管理と回収へ到達できる）。
+    ///
+    /// テストバイナリ自身を `--exact` で再実行し、子役の stderr を親が読まない pipe にする（自プロセスの
+    /// fd 2 を差し替えない）。子役は対照として修正前の書き込み方が実際に止まることも確かめる。親は子役の
+    /// 終了を 10 秒の上限で待ち、超えたら kill して回収してから失敗させる（修正前の実装ではここで落ちる）。
+    #[test]
+    fn sup6_rep5_1617_container_child_new_returns_with_full_stderr_pipe() {
+        use std::io::Read as _;
+
+        if std::env::var_os(FULL_STDERR_CHILD_ENV).is_some() {
+            full_stderr_child_main();
+        }
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "exec::process::tests::sup6_rep5_1617_container_child_new_returns_with_full_stderr_pipe",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(FULL_STDERR_CHILD_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            // 読まない（子役の stderr を満杯で止める）。`child` を drop するまで読み端を開いたまま保つ。
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child with a full stderr pipe did not finish within 10s (REPAIR-5)");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        assert_eq!(status.code(), Some(0), "child stdout: {stdout}");
+        let result = stdout
+            .lines()
+            .find(|l| l.starts_with("RESULT "))
+            .unwrap_or_else(|| panic!("no RESULT line in child stdout: {stdout}"));
+        // `pidfd_open` が使える（自プロセスで開ける）カーネルでは、存在しない pid は `ESRCH` の失敗に分類される
+        // （修正前はこの分類でログを stderr へ書いていた）。未対応・拒否される環境では理由の照合だけを外す。
+        if sys::pidfd_open(std::process::id()).is_ok() {
+            assert_eq!(
+                result,
+                "RESULT control_blocked=true pidfd_none=true reason=failed:ESRCH within_1s=true"
+            );
+        } else {
+            assert!(
+                result.starts_with("RESULT control_blocked=true pidfd_none=true reason="),
+                "{result}"
+            );
+            assert!(result.ends_with(" within_1s=true"), "{result}");
+        }
+    }
+
     /// CORE-1・CORE-2（TASK-30.1）: pidfd を保持していれば、契約外の回収者が子を回収した後の
     /// シグナル送信は pid ではなくプロセス同一性で判定され、`ESRCH` になる（再利用 pid へ届かない）。
     #[test]

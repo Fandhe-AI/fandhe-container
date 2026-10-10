@@ -243,6 +243,12 @@ mod linux {
             Some(ViolationReason::PathSymlinkOrNotDirectory)
         );
         assert!(!err.message.contains(SENTINEL));
+        // 実マウントでは後始末の umount が成功するため、失敗の併記（REPAIR-4・#1620）は付かない。
+        assert!(
+            !err.message.contains("cleanup failed"),
+            "rollback must succeed on a real mount: {}",
+            err.message
+        );
         // pivot 前なので、呼び出しスレッドの mount namespace を元の procfs 経由で読む。
         let info = std::fs::read_to_string("/proc/thread-self/mountinfo").expect("mountinfo");
         let leftover: Vec<String> = info

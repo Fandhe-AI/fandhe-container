@@ -10,8 +10,8 @@
 //! ```
 //!
 //! 親ディレクトリごとに専用 tmpfs を 1 つ作り（rw・`nosuid,nodev,noexec`）、その tmpfs のルート fd の直下へ
-//! 内容を書いてから read-only へ再マウントする。コンテナ内からは書き込み・削除・`chmod` がすべて `EROFS` で
-//! 拒否される（`CAP_SYS_ADMIN` は既定拒否のため再マウントで戻せない。SEC-1）。
+//! 内容を書いてから read-only にする。コンテナ内からは書き込み・削除・`chmod` がすべて `EROFS` で
+//! 拒否される（`CAP_SYS_ADMIN` と `mount_setattr`・`mount` の seccomp 拒否により ro を外せない。SEC-1）。
 //!
 //! # 契約
 //!
@@ -21,13 +21,17 @@
 //! - **fd 起点・移動検査**: 親ディレクトリは [`mount_tmpfs`](super::mount_tmpfs) と同じ `open_chain` で 1 要素ずつ
 //!   辿り（symlink・非ディレクトリは違反記録付きで拒否）、shared propagation 上へはマウントせず、固定後の
 //!   移動を検査する。既存の**空でない**ディレクトリは覆い隠さず拒否する（fail-closed）
-//! - **read-only 再マウント**: 最初のマウントと同じ `nosuid,nodev,noexec` を併せて渡す（user namespace 内では
-//!   ロックされたフラグを落とす再マウントが `EPERM` になるため）。再マウント後に mountinfo の per-mount
-//!   options に `ro` があることを確かめ、無ければ失敗する
+//! - **read-only 化**: `mount_setattr(2)` + `MOUNT_ATTR_RDONLY` を、`fsmount` で得た自分のマウントのルート fd に
+//!   `AT_EMPTY_PATH` で掛ける（#1620）。パス文字列（`/proc/thread-self/fd/N`）を経由せず再解決の余地がない。
+//!   `attr_clr` = 0 のためロック済みの `nosuid,nodev,noexec` を落とさない。立つのはマウント単位の `ro` で、同じ
+//!   superblock の別マウントは作らないため `EROFS` の保証は変わらない。書き込み用の fd は閉じてから呼ぶ
+//!   （残っていると `EBUSY`）。未対応カーネル（Linux 5.12 未満）は `unimplemented` で拒否し `mount(2)` へ縮退しない。
+//!   ro 化した後に mountinfo の per-mount options に `ro` があることを確かめ、無ければ失敗する
 //! - **エラー message**: 内容は含めない。マウント先・ファイル名は [`display_destination`] のエスケープと
 //!   切り詰めを通す（ログ注入の防止）
 //! - **失敗時の後始末**: [`mount_tmpfs`](super::mount_tmpfs) と同じ（`roll_back`）。この呼び出しでマウントした
-//!   tmpfs を新しい順に外し、自分で作ったディレクトリだけを消す。呼び出し後もプロセスは破棄する
+//!   tmpfs を新しい順に外し、自分で作ったディレクトリだけを消す。umount の失敗は元のエラーの message に
+//!   `; cleanup failed: ...` として併記する（REPAIR-4）。呼び出し後もプロセスは破棄する
 //! - **同一スレッド**: `MountIsolation::establish` と同じスレッドで呼ぶ
 //!
 //! # 未対応（REPAIR-3: 実装済みを装わない）
@@ -39,7 +43,7 @@
 //!
 //! # 単体テストの安全策
 //!
-//! `mount(2)`・再マウント・`umount2(2)` は `cfg(test)` では dry-run に差し替わる。このとき実 tmpfs が無いため、
+//! `mount(2)` 系・`mount_setattr(2)`・`umount2(2)` は `cfg(test)` では dry-run に差し替わる。このとき実 tmpfs が無いため、
 //! ファイルは一時ディレクトリ配下（rootfs の代わり）へ作られる（単体テスト限定の挙動）。実機での挙動は結合試験
 //! `tests/inject_files.rs`（`-- --ignored`）で確認する。
 
@@ -54,7 +58,7 @@ use crate::traits::types::ErrorCode;
 
 use super::tmpfs::{
     Applied, display_destination, mount_tmpfs_syscall, open_chain, roll_back, root_display,
-    tmpfs_mount_error, verify_mounted,
+    tmpfs_mount_error, verify_mounted, with_rollback_failures,
 };
 use super::{
     ExecError, IsolationStage, MountIsolation, PreparedRootfs, ViolationReason, fd_still_at,
@@ -139,8 +143,8 @@ fn inject_files_at(
         match result {
             Ok(outcome) => directories.push(outcome),
             Err(e) => {
-                roll_back(root, &rootfs, &applied);
-                return Err(e);
+                let failures = roll_back(root, &rootfs, &applied);
+                return Err(with_rollback_failures(e, &failures));
             }
         }
     }
@@ -209,14 +213,19 @@ fn apply_group(
         });
     }
 
-    let target = fd_path(tmpfs_root)?;
-    remount_read_only_syscall(&target, create.flags)
-        .map_err(|e| ExecError::from_sys(e, STAGE, &format!("remount read-only({shown})")))?;
+    // 書き込み用の fd は `write_file` が閉じ済み（残っていると `EBUSY`）。fd 起点で ro にする（#1620）。
+    read_only_syscall(tmpfs_root.as_fd()).map_err(|e| {
+        ExecError::from_sys(
+            e,
+            STAGE,
+            &format!("mount_setattr(MOUNT_ATTR_RDONLY on {shown})"),
+        )
+    })?;
     if !observe_read_only(tmpfs_root)? {
         return Err(ExecError::new(
             ErrorCode::FailedPrecondition,
             STAGE,
-            format!("the mount at {shown} is not read-only after remount"),
+            format!("the mount at {shown} is not read-only after mount_setattr"),
         ));
     }
     Ok(InjectedDirectoryOutcome {
@@ -298,16 +307,6 @@ fn ensure_empty(dir: &OwnedFd, shown: &str) -> Result<(), ExecError> {
     }
 }
 
-fn fd_path(fd: &OwnedFd) -> Result<CString, ExecError> {
-    CString::new(format!("/proc/thread-self/fd/{}", fd.as_raw_fd())).map_err(|_| {
-        ExecError::new(
-            ErrorCode::Internal,
-            STAGE,
-            "failed to build the fd path of the injected files mount target",
-        )
-    })
-}
-
 /// `dir` が属するマウントが read-only かを観測する（cfg で差し替わる）。
 #[cfg(not(test))]
 fn observe_read_only(dir: &OwnedFd) -> Result<bool, ExecError> {
@@ -322,29 +321,26 @@ fn observe_read_only(_dir: &OwnedFd) -> Result<bool, ExecError> {
     Ok(!tests::FORCE_RW.with(|c| c.get()))
 }
 
+/// `tmpfs_root`（自分のマウントのルート fd）のマウントを fd 起点で read-only にする（cfg で差し替わる）。
 #[cfg(not(test))]
-fn remount_read_only_syscall(
-    target: &std::ffi::CStr,
-    flags: sys::TmpfsMountFlags,
-) -> Result<(), SysError> {
-    sys::remount_read_only_at(target, flags)
+fn read_only_syscall(tmpfs_root: BorrowedFd<'_>) -> Result<(), SysError> {
+    sys::set_mount_read_only(tmpfs_root)
 }
 
-/// dry-run: 再マウントを呼ばず、(解決した対象・フラグ) を記録する。
+/// dry-run: `mount_setattr(2)` を呼ばず、(fd の実体・本番と同じ引数の組) を記録する。
+/// 故障注入（`READ_ONLY_FAIL`）で未対応カーネル等の失敗も作れる。
 #[cfg(test)]
-fn remount_read_only_syscall(
-    target: &std::ffi::CStr,
-    flags: sys::TmpfsMountFlags,
-) -> Result<(), SysError> {
-    let resolved = std::fs::read_link(target.to_string_lossy().as_ref())
+fn read_only_syscall(tmpfs_root: BorrowedFd<'_>) -> Result<(), SysError> {
+    if let Some(e) = tests::READ_ONLY_FAIL.with(|f| f.take()) {
+        return Err(e);
+    }
+    let resolved = std::fs::read_link(format!("/proc/thread-self/fd/{}", tmpfs_root.as_raw_fd()))
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let bits = sys::TmpfsMountFlags {
-        read_only: true,
-        ..flags
-    }
-    .bits();
-    tests::REMOUNTS.with(|c| c.borrow_mut().push((resolved, bits)));
+    tests::READ_ONLY_CALLS.with(|c| {
+        c.borrow_mut()
+            .push((resolved, sys::read_only_call_params()))
+    });
     Ok(())
 }
 
@@ -356,13 +352,19 @@ mod tests {
     use std::os::unix::fs::{MetadataExt as _, symlink};
 
     thread_local! {
-        pub(super) static REMOUNTS: std::cell::RefCell<Vec<(String, u64)>> =
+        pub(super) static READ_ONLY_CALLS: std::cell::RefCell<Vec<(String, ReadOnlyParams)>> =
             const { std::cell::RefCell::new(Vec::new()) };
+        /// 次の `read_only_syscall` に返させる失敗（未対応カーネル等の注入用）。
+        pub(super) static READ_ONLY_FAIL: std::cell::Cell<Option<SysError>> =
+            const { std::cell::Cell::new(None) };
         pub(super) static FORCE_RW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
-    fn take_remounts() -> Vec<(String, u64)> {
-        REMOUNTS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    /// `(attr_set, attr_clr, propagation, userns_fd, flags, size)`。
+    type ReadOnlyParams = (u64, u64, u64, u64, u32, usize);
+
+    fn take_read_only_calls() -> Vec<(String, ReadOnlyParams)> {
+        READ_ONLY_CALLS.with(|c| std::mem::take(&mut *c.borrow_mut()))
     }
 
     const SENTINEL: &str = "SENTINEL-DUMMY-VALUE";
@@ -386,14 +388,15 @@ mod tests {
     }
 
     fn reset() {
-        let _ = (take_calls(), take_umounts(), take_remounts());
+        let _ = (take_calls(), take_umounts(), take_read_only_calls());
         FORCE_RW.with(|c| c.set(false));
+        READ_ONLY_FAIL.with(|c| c.set(None));
     }
 
-    /// SUP-12・TASK-169.4.2: ディレクトリごとに rw マウント → 書き込み → ro 再マウントし、
+    /// SUP-12・TASK-169.4.2・#1620: ディレクトリごとに rw マウント → 書き込み → `mount_setattr` で ro にし、
     /// フラグ・data・モード・内容が具体値で一致する。
     #[test]
-    fn sup12_task169_4_2_mounts_writes_and_remounts_read_only() {
+    fn sup12_task169_4_2_mounts_writes_and_sets_read_only() {
         let tmp = Tmp::new("inject-ok");
         reset();
         let fd = tmp.fd();
@@ -420,13 +423,16 @@ mod tests {
             ]
         );
         assert_eq!(
-            take_remounts(),
+            take_read_only_calls(),
             vec![
                 (
                     tmp.0.join("run/secrets").to_string_lossy().into_owned(),
-                    1 | rw
+                    (1, 0, 0, 0, 0x1000, 32)
                 ),
-                (tmp.0.join("etc/app").to_string_lossy().into_owned(), 1 | rw),
+                (
+                    tmp.0.join("etc/app").to_string_lossy().into_owned(),
+                    (1, 0, 0, 0, 0x1000, 32)
+                ),
             ]
         );
         assert_eq!(
@@ -559,9 +565,9 @@ mod tests {
         .expect("empty existing");
     }
 
-    /// SUP-12・TASK-169.4.2: 再マウント後に read-only を観測できなければ失敗する（fail-closed）。
+    /// SUP-12・TASK-169.4.2: ro 化の後に read-only を観測できなければ失敗する（fail-closed）。
     #[test]
-    fn sup12_task169_4_2_fails_when_not_read_only_after_remount() {
+    fn sup12_task169_4_2_fails_when_not_read_only_after_mount_setattr() {
         let tmp = Tmp::new("inject-rw");
         reset();
         FORCE_RW.with(|c| c.set(true));
@@ -576,7 +582,7 @@ mod tests {
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
         assert_eq!(
             err.message,
-            "the mount at /run/s is not read-only after remount"
+            "the mount at /run/s is not read-only after mount_setattr"
         );
         // 失敗したので、マウントした tmpfs を外す。
         assert_eq!(
@@ -639,5 +645,67 @@ mod tests {
         assert_eq!(unsupported.code, ErrorCode::Unimplemented);
         let denied = inject_mount_error(SysError::Os(sys::EPERM), "/d");
         assert_eq!(denied.stage, IsolationStage::InjectFiles);
+    }
+
+    /// SUP-12・TASK-169・#1620: 未対応カーネル（`ENOSYS`）は `unimplemented` で拒否し、`mount(2)` へ縮退せず、
+    /// この呼び出しでマウントした tmpfs は外す。
+    #[test]
+    fn sup12_task169_read_only_unsupported_kernel_is_unimplemented() {
+        let tmp = Tmp::new("inject-ro-unsupported");
+        reset();
+        READ_ONLY_FAIL.with(|c| c.set(Some(SysError::Unsupported)));
+        let fd = tmp.fd();
+        let err = inject_files_at(
+            fd.as_fd(),
+            &set(&[("/run/s/f", SENTINEL, 0o444)]),
+            &not_shared,
+        )
+        .expect_err("unsupported");
+        READ_ONLY_FAIL.with(|c| c.set(None));
+        assert_eq!(err.code, ErrorCode::Unimplemented);
+        assert_eq!(err.stage, IsolationStage::InjectFiles);
+        assert_eq!(
+            err.message,
+            "mount_setattr(MOUNT_ATTR_RDONLY on /run/s) failed: not supported by the kernel or the target architecture"
+        );
+        assert!(take_read_only_calls().is_empty());
+        assert_eq!(
+            take_umounts(),
+            vec![tmp.0.join("run/s").to_string_lossy().into_owned()]
+        );
+    }
+
+    /// SUP-12・TASK-169・#1620: 権限不足は `permission_denied` で報告する。
+    #[test]
+    fn sup12_task169_read_only_eperm_is_reported() {
+        let tmp = Tmp::new("inject-ro-eperm");
+        reset();
+        READ_ONLY_FAIL.with(|c| c.set(Some(SysError::Os(sys::EPERM))));
+        let fd = tmp.fd();
+        let err = inject_files_at(fd.as_fd(), &set(&[("/run/s/f", "x", 0o444)]), &not_shared)
+            .expect_err("eperm");
+        READ_ONLY_FAIL.with(|c| c.set(None));
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert_eq!(err.stage, IsolationStage::InjectFiles);
+    }
+
+    /// REPAIR-4・SUP-12・TASK-169・#1620: 後始末の umount 失敗は inject の元のエラーにも併記される。
+    #[test]
+    fn repair4_sup12_inject_roll_back_failure_is_appended() {
+        let tmp = Tmp::new("inject-rbfail");
+        reset();
+        FORCE_RW.with(|c| c.set(true));
+        super::super::tmpfs::tests::UMOUNT_FAIL.with(|f| f.set(Some(SysError::Os(sys::EPERM))));
+        let fd = tmp.fd();
+        let err = inject_files_at(fd.as_fd(), &set(&[("/run/s/f", "x", 0o444)]), &not_shared)
+            .expect_err("rw");
+        super::super::tmpfs::tests::UMOUNT_FAIL.with(|f| f.set(None));
+        FORCE_RW.with(|c| c.set(false));
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(err.stage, IsolationStage::InjectFiles);
+        assert_eq!(
+            err.message,
+            "the mount at /run/s is not read-only after mount_setattr; cleanup failed: umount2(/run/s) failed: Operation not permitted (os error 1)"
+        );
     }
 }

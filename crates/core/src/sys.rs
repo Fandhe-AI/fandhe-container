@@ -136,7 +136,7 @@ mod consts {
     pub const SYS_FSOPEN: i64 = 430;
     pub const SYS_FSCONFIG: i64 = 431;
     pub const SYS_FSMOUNT: i64 = 432;
-    // `open_tree`（428）。syscall_64.tbl / asm-generic/unistd.h の `__NR_open_tree`（#1659）。
+    // arch/x86/entry/syscalls/syscall_64.tbl の `open_tree`（428。#1659）。
     pub const SYS_OPEN_TREE: i64 = 428;
     // include/uapi/linux/mount.h の `FSOPEN_CLOEXEC`・`FSMOUNT_CLOEXEC`・`fsconfig_command`・`MOUNT_ATTR_*`（`MOUNT_ATTR_STRICTATIME` を含む）・`MOVE_MOUNT_*`（全アーキテクチャ共通）。
     pub const FSOPEN_CLOEXEC: u32 = 1;
@@ -363,7 +363,8 @@ mod consts {
     pub const SYS_FSOPEN: i64 = 430;
     pub const SYS_FSCONFIG: i64 = 431;
     pub const SYS_FSMOUNT: i64 = 432;
-    // `open_tree`（428）。syscall_64.tbl / asm-generic/unistd.h の `__NR_open_tree`（#1659）。
+    // include/uapi/asm-generic/unistd.h の `__NR_open_tree`（428。arm64 は asm-generic の表。
+    // x86_64 と値が同じでも流用せず個別に定義する。#1659）。
     pub const SYS_OPEN_TREE: i64 = 428;
     // include/uapi/linux/mount.h の `FSOPEN_CLOEXEC`・`FSMOUNT_CLOEXEC`・`fsconfig_command`・`MOUNT_ATTR_*`（`MOUNT_ATTR_STRICTATIME` を含む）・`MOVE_MOUNT_*`（全アーキテクチャ共通）。
     pub const FSOPEN_CLOEXEC: u32 = 1;
@@ -1501,6 +1502,10 @@ fn move_mount_empty_path_flags() -> u32 {
 /// `mount_tmpfs_on`（tmpfs の載せ替え）と、rootless のデバイスノード bind（#1660 が呼ぶ。CORE-6・SEC-5）が
 /// 共有する。`ENOSYS`（Linux 5.2 未満）は [`SysError::Unsupported`] で返し、`mount(2)` へは縮退しない。
 /// ファイルの bind では `to` もファイルである必要がある（ディレクトリ同士かファイル同士のみ成功する）。
+///
+/// 前提: `to` が属するマウントは shared でない（`crate::exec::MountIsolation::establish` が `/` を
+/// `MS_REC|MS_PRIVATE` にした mount namespace の中で呼ぶ）。shared のままでは接続が peer へ伝播し、
+/// ホスト側にもマウントが現れる。seccomp フィルタ（`DeniedSyscall::MoveMount`）の適用前に呼ぶ。
 // テストビルドでは `crate::exec` の dry-run 差し込み点が呼ばないため dead_code を許可する。
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn move_mount_empty_path(
@@ -1518,7 +1523,8 @@ fn move_mount_empty_path_raw(from: RawFd, to: RawFd) -> Result<(), SysError> {
         return Err(SysError::Unsupported);
     }
     // SAFETY: `from`・`to` は fd 番号の整数で、カーネルが検証する（無効なら `EBADF`）。パスは静的な空文字列で、`*_EMPTY_PATH` により fd 自身が
-    // 対象になる（パス解決なし）。副作用は呼び出しスレッドの mount namespace へのマウント 1 件の追加に限る。
+    // 対象になる（パス解決なし）。副作用は呼び出しスレッドの mount namespace へのマウント 1 件の追加に限る
+    // （接続先は private であること〔`MountIsolation::establish` の `MS_REC|MS_PRIVATE` 済み〕が前提。shared なら peer へ伝播する）。
     let rc = unsafe {
         syscall(
             consts::SYS_MOVE_MOUNT,
@@ -1625,6 +1631,15 @@ fn open_tree_clone_flags() -> u32 {
 ///
 /// 必要なカーネルは Linux 5.2 以降。`ENOSYS` は [`SysError::Unsupported`] で返し、`mount(2)` へは縮退しない。
 /// user namespace では自分の mount namespace を所有する userns の `CAP_SYS_ADMIN` が要る。
+///
+/// 呼び出し順の前提（#1660 が固定し結合試験で照合する）:
+/// - ホストのノードは `unshare(CLONE_NEWNS)` の後・`pivot_root` の前に、呼び出しと同じ mount namespace の中で
+///   開き、同じ namespace の中で本関数を呼ぶ。fs/namespace.c の `__do_loopback`（v5.2・v6.12 で確認）は
+///   `check_mnt(old)`（fd のマウントの `mnt_ns` が呼び出しスレッドの mount namespace と一致）を満たさないと
+///   `EINVAL` を返す。unshare 前に開いた fd のマウントは元の namespace に属し、`pivot_root` 後に旧ルートを
+///   `umount2(MNT_DETACH)` で切り離すと `umount_tree` が `mnt_ns` を NULL にするため、どちらも複製できない。
+/// - seccomp フィルタの適用前に呼ぶ。`crate::seccomp` の既定の拒否集合は `open_tree`（`DeniedSyscall::OpenTree`）と
+///   `move_mount`（`DeniedSyscall::MoveMount`）を含み、適用後は失敗する。
 // #1660 で呼び出し元を足すまでの間のみ許可する（配線時に外す）。
 #[allow(dead_code)]
 pub(crate) fn open_tree_clone(node: &VerifiedDeviceNodeFd) -> Result<OwnedFd, SysError> {

@@ -1912,7 +1912,8 @@ type Observed = (ChildExit, bool);
 ///
 /// `pidfd_open` の失敗は [`LaunchPidfdUnavailable`] に分類して保持し（[`ContainerChild::pidfd_unavailable`]）、
 /// 未対応（`ENOSYS`）以外は [`LaunchPidfdUnavailable::log_line`] で構造化ログ 1 行にできる（`EMFILE`・`ENFILE`・
-/// `ENOMEM`・`EPERM` 等を未対応と取り違えない）。`new` 自身は I/O をしない（停止した stderr でブロックしない。REPAIR-5）。起動自体は失敗させない: `new` は fork の後に呼ばれ、失敗しうる構成にすると全 fork 箇所
+/// `ENOMEM`・`EPERM` 等を未対応と取り違えない。出力は未配線）。`new` 自身は I/O をしない（停止した stderr で
+/// ブロックしない。REPAIR-5）。起動自体は失敗させない: `new` は fork の後に呼ばれ、失敗しうる構成にすると全 fork 箇所
 /// （`spawn_container*`・各 probe・exec の worker・rootless mapper・`observe_*`）で子の kill と回収が要り、
 /// 一時的な `EMFILE` がコンテナの起動まで落とすことになるため。代わりに本番の exec の入口
 /// （supervisor の `run_command_with_pidfd`）が pidfd を必須の引数にしており、`pidfd()` が `None` のハンドル
@@ -1966,6 +1967,10 @@ impl LaunchPidfdUnavailable {
     ///
     /// 出力は呼び出し側の責務（`ContainerChild::new` は書かない。#1683 の指摘: 停止した stderr への同期書き込みが
     /// ハンドル返却と期限管理を止めるため。REPAIR-5・REPAIR-4）。
+    ///
+    /// 現状は本番の呼び出し元が無く、行は組み立てられるだけで出力されない（未配線）。止まった stderr でも
+    /// 待たない出力経路（plugin の `ChildGuard::drop` の診断と同じ AF_UNIX 限定の非ブロッキング送信等）が core に
+    /// 無く、spawn から `wait_timeout` までの経路へ同期書き込みを置くと同じ停止が再発するため。配線は後続の課題。
     pub fn log_line(self) -> Option<String> {
         if self == Self::Unsupported {
             return None;

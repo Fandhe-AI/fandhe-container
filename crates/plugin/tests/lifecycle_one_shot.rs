@@ -120,6 +120,9 @@ mod unix {
                 .unwrap();
                 std::thread::sleep(Duration::from_secs(60));
             }
+            // 孫（`/bin/sleep 60`。同じプロセスグループ）を起動して pid をファイルへ書き、接続前に自発終了する
+            // （`check_child` 経路。#1604）。
+            "grandchild_exit_early" => spawn_grandchild_and_record_pid(&sock),
             "silent_no_connect" => std::thread::sleep(Duration::from_secs(60)),
             mode => {
                 // 接続前に書く。親が stderr を読み続けていなければバッファが埋まって子はここで止まる。
@@ -131,14 +134,23 @@ mod unix {
                 }
                 // stderr を引き継いだ孫プロセスを残したまま応答して終了する（孫は 5 秒で自然終了）。
                 // この子はすぐ終了するため孫は wait しない（孫は init に引き取られ、終了後に回収される）。
+                // 孫は `process_group(0)` で plugin のグループの外へ出す。自発終了後のグループ停止（#1604）は
+                // 同じグループの孫を止めるため、stderr を保持し続ける状況（REPAIR-5 の打ち切り）を保つには
+                // グループ外が要る。グループを抜けた孫は対象外（`lifecycle` のモジュール doc）。
                 #[allow(clippy::zombie_processes)]
                 if mode == "stderr_held_by_grandchild" {
+                    use std::os::unix::process::CommandExt;
                     std::process::Command::new("/bin/sleep")
                         .arg("5")
                         .stdin(std::process::Stdio::null())
                         .stdout(std::process::Stdio::null())
+                        .process_group(0)
                         .spawn()
                         .unwrap();
+                }
+                // 同じグループの孫を残して応答し、自発終了する（#1604）。
+                if mode == "grandchild_then_exit" {
+                    spawn_grandchild_and_record_pid(&sock);
                 }
                 let mut s = UdsStream::connect(
                     &sock,
@@ -166,6 +178,30 @@ mod unix {
                 }
             }
         }
+    }
+
+    /// 孫（`/bin/sleep 60`。plugin と同じプロセスグループ。stdout・stderr は閉じる）を起動し、pid を
+    /// `grandchild.pid` へ原子的に書く（#1604）。孫は wait せず、plugin の終了後は init に引き取られる。
+    #[allow(clippy::zombie_processes)]
+    fn spawn_grandchild_and_record_pid(sock: &std::path::Path) {
+        let gc = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let dir = sock.parent().unwrap();
+        std::fs::write(dir.join("gc.tmp"), gc.id().to_string()).unwrap();
+        std::fs::rename(dir.join("gc.tmp"), dir.join("grandchild.pid")).unwrap();
+    }
+
+    fn grandchild_pid(dir: &TempDir) -> u32 {
+        std::fs::read_to_string(dir.0.join("grandchild.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
     }
 
     fn plugin_for(dir: &TempDir) -> OneShotPlugin {
@@ -275,6 +311,30 @@ mod unix {
             .parse()
             .unwrap();
         assert_process_gone_within(pid, Duration::from_secs(5));
+    }
+
+    /// #1604・PLUG-7・REPAIR-5: 応答後に自発終了（終了コード 0）した plugin の孫も、回収の前にグループへ
+    /// 送る `SIGKILL` で止まる。pid の消滅を Linux は `/proc`、macOS は `kill -0` で確かめる。
+    #[test]
+    fn plug7_one_shot_stops_grandchild_of_self_exited_plugin() {
+        let (res, _, dir) = run("grandchild_then_exit", 5000);
+        let out = res.unwrap();
+        assert_eq!(
+            out.termination(),
+            OneShotTermination::Exited { code: Some(0) }
+        );
+        assert_process_gone_within(grandchild_pid(&dir), Duration::from_secs(5));
+    }
+
+    /// #1604・PLUG-7・REPAIR-5: 接続前に自発終了した plugin（`check_child` 経路）の孫も止まり、元の
+    /// `Unavailable` が保たれる（グループ停止の付記が付かない）。
+    #[test]
+    fn plug7_one_shot_stops_grandchild_when_plugin_exits_before_connecting() {
+        let (res, _, dir) = run("grandchild_exit_early", 8000);
+        let e = res.unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Unavailable);
+        assert_eq!(e.message(), "plugin exited before connecting");
+        assert_process_gone_within(grandchild_pid(&dir), Duration::from_secs(5));
     }
 
     fn no_socket_left(dir: &TempDir) {

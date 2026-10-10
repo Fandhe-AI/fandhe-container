@@ -127,6 +127,10 @@ pub enum CgroupRemoval {
 /// - 直下に残った exec 用の子 cgroup（`exec-*`）は、実装が上限つきの待機（`cgroup.kill` の後に空になるまで。
 ///   全体で 5 秒）で止めて消してから、コンテナ cgroup を削除してよい（#1596・SUP-6）。待機の超過は
 ///   [`ErrorCode::Timeout`]、掃除が完了しなければ `remove` はエラーを返し、コンテナ cgroup には触れない
+/// - **`remove` は停止済み（[`delete`] の状態判定で `Stopped` か pid なしの `Created`）のコンテナに対してだけ
+///   呼ぶ**。実装は呼び出し側の判定に頼らず、`exec-*` を止める前にコンテナ cgroup 自身にプロセスが居ないことを
+///   確かめ、居れば何も止めずに [`ErrorCode::FailedPrecondition`] を返す（稼働中の exec コマンドを止めない。
+///   OCI-6・CORE-2・SUP-6）
 /// - エラーのメッセージにパス・errno を含めない（`code` だけを機械可読な判定に使う）
 pub trait ContainerCgroupRemover: Send + Sync {
     /// `remove` が対象とする委譲スコープ（コンテナ用子 cgroup の親）を返す。
@@ -140,6 +144,21 @@ pub trait ContainerCgroupRemover: Send + Sync {
         id: &ContainerId,
         instance: StateRevision,
     ) -> Result<CgroupRemoval, TraitError>;
+
+    /// [`Self::remove`] と同じ削除を、[`delete`] に注入された `recorder` へ観測値を記録しながら行う
+    /// （REPAIR-4・#1596。[`delete`] はこちらを呼ぶ）。
+    ///
+    /// 既定実装は `recorder` を使わず [`Self::remove`] へ委ねる。削除の途中に記録すべき観測値を持つ実装
+    /// （Linux の `cgroups::DelegatedCgroup` は残留 `exec-*` の掃除の成否・件数）だけが上書きする。
+    fn remove_with_recorder(
+        &self,
+        id: &ContainerId,
+        instance: StateRevision,
+        recorder: &OpRecorder,
+    ) -> Result<CgroupRemoval, TraitError> {
+        let _ = recorder;
+        self.remove(id, instance)
+    }
 }
 
 /// 停止済みまたは未起動のコンテナの cgroup と状態記録を削除する。
@@ -152,7 +171,9 @@ pub trait ContainerCgroupRemover: Send + Sync {
 /// 未 create・削除済みの ID は [`ErrorCode::NotFound`]（二重 delete は 2 回目が `NotFound`）、
 /// 生きている可能性のある状態は [`ErrorCode::FailedPrecondition`]、`force` で生きているコンテナを
 /// 削除する要求は [`ErrorCode::Unimplemented`]。成功・失敗の件数と所要時間は `recorder` へ操作名
-/// `delete` で記録する（全終了経路。REPAIR-4）。
+/// `delete` で記録する（全終了経路。REPAIR-4）。同じ `recorder` を
+/// [`ContainerCgroupRemover::remove_with_recorder`] にも渡し、cgroup 削除中の観測値（残留 `exec-*` の掃除の
+/// 件数等）を同じ記録器へ集める。
 ///
 /// 失敗は [`OciRuntimeError`]（op = delete・内部エラーと同一の code・非ゼロの `exit_code`）で返す。標準エラーへの
 /// 書き出しとプロセス終了は呼び出し元（CLI・plugin）の責務（ERR-2・TASK-96.3）。
@@ -165,11 +186,14 @@ pub fn delete(
     // 変換は最上位 1 か所のみ。内部関数は `TraitError` のまま（波及最小）。
     let to_err = |e: TraitError| OciRuntimeError::from_trait_error(LifecycleOp::Delete, e);
     let name = OpName::new(DELETE_OP_NAME).map_err(to_err)?;
-    recorder.record_op(&name, || delete_inner(store, cgroups, req).map_err(to_err))
+    recorder.record_op(&name, || {
+        delete_inner(store, recorder, cgroups, req).map_err(to_err)
+    })
 }
 
 fn delete_inner(
     store: &dyn StateStore,
+    recorder: &OpRecorder,
     cgroups: &dyn ContainerCgroupRemover,
     req: &DeleteRequest,
 ) -> Result<DeleteResponse, TraitError> {
@@ -196,7 +220,7 @@ fn delete_inner(
         }
         // Removed / NotPresent はどちらも記録されたスコープ・instance で「cgroup が無い」状態に到達したので
         // 次へ進む。失敗はレコードを残して返す。
-        match cgroups.remove(req.id(), placement.instance())? {
+        match cgroups.remove_with_recorder(req.id(), placement.instance(), recorder)? {
             CgroupRemoval::Removed | CgroupRemoval::NotPresent => {}
         }
     }
@@ -809,6 +833,60 @@ mod tests {
             .snapshot_op(&OpName::new("delete").expect("name"))
             .expect("recorded");
         assert_eq!((stats.success(), stats.failure()), (1, 1));
+    }
+
+    /// REPAIR-4・#1596: delete は注入された記録器を `remove_with_recorder` へ渡し、cgroup 削除中の観測値
+    /// （ここでは試験用の操作名 `cgroup_sweep_probe`）が操作名 `delete` と同じ記録器に載る。
+    #[test]
+    fn repair4_delete_passes_its_recorder_to_cgroup_removal() {
+        struct ProbeRemover;
+        impl ContainerCgroupRemover for ProbeRemover {
+            fn scope(&self) -> Result<CgroupScope, TraitError> {
+                CgroupScope::new(SCOPE)
+            }
+            fn remove(
+                &self,
+                _id: &ContainerId,
+                _instance: StateRevision,
+            ) -> Result<CgroupRemoval, TraitError> {
+                Err(TraitError::new(
+                    ErrorCode::Internal,
+                    "delete must call remove_with_recorder",
+                ))
+            }
+            fn remove_with_recorder(
+                &self,
+                _id: &ContainerId,
+                _instance: StateRevision,
+                recorder: &OpRecorder,
+            ) -> Result<CgroupRemoval, TraitError> {
+                let name = OpName::new("cgroup_sweep_probe")?;
+                recorder.record(
+                    &name,
+                    crate::observability::OpOutcome::Success,
+                    std::time::Duration::from_millis(1),
+                )?;
+                Ok(CgroupRemoval::Removed)
+            }
+        }
+        let store = MemStateStore::with_scope(ContainerStatus::stopped(cid("c1"), Some(0)), SCOPE);
+        let recorder = OpRecorder::new();
+        delete(
+            &store,
+            &recorder,
+            &ProbeRemover,
+            &DeleteRequest::new(cid("c1")),
+        )
+        .expect("ok");
+        let count = |n: &str| {
+            let s = recorder
+                .snapshot_op(&OpName::new(n).expect("name"))
+                .expect("recorded");
+            (s.success(), s.failure())
+        };
+        assert_eq!(count("cgroup_sweep_probe"), (1, 0));
+        assert_eq!(count("delete"), (1, 0));
+        assert!(!store.has("c1"));
     }
 
     /// OCI-6・CORE-3（TASK-30.3）: 記録と異なる委譲スコープからの delete は `FailedPrecondition` で、

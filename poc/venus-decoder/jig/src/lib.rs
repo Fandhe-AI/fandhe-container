@@ -16,6 +16,9 @@
 //!
 //! 起動入口（UDS の bind・期限つき accept・ログのファイル出力。F4・#1598）は `launch` と bin `venus-jig` に実装済み（Linux 限定）。
 //!
+//! 受理した `SUBMIT_3D` の本体の記録（`recording`。`--record` で記録ファイルへ書き出す。F6・#1602）は実装済み。
+//! 記録するのは提出の本体だけで、共有メモリ上のリングの中身は記録しない（F5.2b の後）。
+//!
 //! 未実装（実装済みを装わない。REPAIR-3）: cursorq の処理、
 //! `observe::snapshot_lines` の定期出力（終了時の集計出力は実装済み）と virtqueue 個別の観測カウンタ、`RESOURCE_MAP_BLOB` / `UNMAP_BLOB` と共有メモリ（F5.2b。未対応は `ERR_UNSPEC`）、`SUBMIT_3D` の dispatch（TASK-177.x）、
 //! 実機での疎通（F3・#725）。
@@ -30,6 +33,7 @@ pub mod device;
 #[cfg(target_os = "linux")]
 pub mod launch;
 pub mod log;
+pub mod recording;
 pub mod resource;
 #[cfg(target_os = "linux")]
 pub mod session;

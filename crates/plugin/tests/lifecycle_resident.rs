@@ -116,6 +116,10 @@ mod unix {
             }
             "silent_no_connect" => std::thread::sleep(Duration::from_secs(60)),
             mode => {
+                // 同じグループの孫を残して自発終了する plugin（#1604）。pid ファイルは接続より前に書く。
+                if mode == "grandchild_exit_after_first" || mode == "grandchild_exit_on_eof" {
+                    spawn_grandchild_and_record_pid(&sock);
+                }
                 if mode == "stderr_small" || mode == "stderr_exit3_after_first" {
                     write_stderr(b"plugin-diagnostic\n");
                 }
@@ -141,7 +145,9 @@ mod unix {
                     let body = format!("pid={} seq={seq}", std::process::id());
                     s.write_frame(&Frame::new(body.into_bytes()).unwrap(), rpc(5000))
                         .unwrap();
-                    if mode == "exit_after_first" && seq == 1 {
+                    if (mode == "exit_after_first" || mode == "grandchild_exit_after_first")
+                        && seq == 1
+                    {
                         return;
                     }
                     if (mode == "exit3_after_first" || mode == "stderr_exit3_after_first")
@@ -154,6 +160,39 @@ mod unix {
                     std::thread::sleep(Duration::from_secs(60));
                 }
             }
+        }
+    }
+
+    /// 孫（`/bin/sleep 60`。plugin と同じプロセスグループ。stdout・stderr は閉じる）を起動し、pid を
+    /// `grandchild.pid` へ原子的に書く（#1604）。孫は wait しない。
+    #[allow(clippy::zombie_processes)]
+    fn spawn_grandchild_and_record_pid(sock: &std::path::Path) {
+        let gc = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let dir = sock.parent().unwrap();
+        std::fs::write(dir.join("gc.tmp"), gc.id().to_string()).unwrap();
+        std::fs::rename(dir.join("gc.tmp"), dir.join("grandchild.pid")).unwrap();
+    }
+
+    /// 孫が有限時間内に存在しなくなることを確かめる（REPAIR-5。Linux は `/proc`、macOS は `kill -0`）。
+    fn assert_grandchild_gone(dir: &TempDir) {
+        let pid: u32 = std::fs::read_to_string(dir.0.join("grandchild.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let t = Instant::now();
+        while crate::is_alive(pid) {
+            assert!(
+                t.elapsed() < Duration::from_secs(5),
+                "grandchild {pid} alive"
+            );
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -330,6 +369,34 @@ mod unix {
             e.message()
         );
         assert_eq!(session.state(), ResidentState::Exited { code: Some(0) });
+    }
+
+    /// #1604・PLUG-7・REPAIR-5: 呼び出し間で自発終了した plugin の孫も、次の `call` の生存確認が回収の前に
+    /// グループへ送る `SIGKILL` で止まる。
+    #[test]
+    fn plug7_resident_call_stops_grandchild_of_self_exited_plugin() {
+        let dir = TempDir::new("grandchild_exit_after_first");
+        let mut session = start(&dir, 5000).unwrap();
+        session.call(&ping(), rpc(5000)).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let e = session.call(&ping(), rpc(5000)).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Unavailable);
+        assert_eq!(session.state(), ResidentState::Exited { code: Some(0) });
+        assert_grandchild_gone(&dir);
+    }
+
+    /// #1604・PLUG-7・REPAIR-5: EOF を受けて自発終了（終了コード 0）した plugin の孫も、`shutdown` で止まる。
+    #[test]
+    fn plug7_resident_shutdown_stops_grandchild_of_self_exited_plugin() {
+        let dir = TempDir::new("grandchild_exit_on_eof");
+        let mut session = start(&dir, 5000).unwrap();
+        session.call(&ping(), rpc(5000)).unwrap();
+        let done = session.shutdown().unwrap();
+        assert_eq!(
+            done.termination(),
+            OneShotTermination::Exited { code: Some(0) }
+        );
+        assert_grandchild_gone(&dir);
     }
 
     /// 呼び出し間で自発終了した子を、次の呼び出しの前に検知して Unavailable にする。

@@ -11,7 +11,8 @@ use crate::ctrl::{
 };
 use crate::device;
 use crate::log::{
-    LogError, LogFileError, LogSink, MAX_LINES, MAX_LOG_BYTES, find_capset_queries, read_log_file,
+    LogError, LogFileError, LogSink, MAX_LINES, MAX_LOG_BYTES, PRIORITY_RESERVE_LINES,
+    find_capset_queries, is_priority_line, read_log_file,
 };
 
 /// 状態を持たない単発要求用（ctx 表は毎回空）。
@@ -392,7 +393,7 @@ fn gpu6_log_sink_truncates_once_at_line_count_limit_and_matcher_accepts() {
     assert!(sink.truncated());
     let (out, _) = sink.into_inner();
     let text = String::from_utf8(out).unwrap();
-    assert_eq!(text.lines().count(), MAX_LINES);
+    assert_eq!(text.lines().count(), MAX_LINES - PRIORITY_RESERVE_LINES);
     assert_eq!(text.matches("event=log_truncated").count(), 1);
     assert_eq!(
         text.lines().last(),
@@ -493,4 +494,79 @@ fn d2_read_log_file_rejects_non_regular_without_opening() {
     std::fs::write(&bad, [0xff, 0xfe]).unwrap();
     assert_eq!(read_log_file(&bad), Err(LogFileError::NotUtf8));
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// GPU-6・TASK-172 F6・#1602: 記録の 2 行は固定語彙と数値だけで、照合器は壊れた行に数えない。
+#[test]
+fn task1602_gpu6_record_lines_are_fixed_vocabulary_and_not_malformed() {
+    use crate::log::{find_capset_queries, record_stopped_line, record_summary_line};
+    use crate::recording::{RecordSummary, StopReason};
+    let stopped = record_stopped_line(StopReason::TooManyRecords, 3);
+    assert_eq!(
+        stopped,
+        "venus_jig event=record_stopped reason=too_many_records records=3"
+    );
+    let ok = RecordSummary {
+        records: 2,
+        skipped: 0,
+        stopped: None,
+    };
+    let done = record_summary_line(&ok, true);
+    assert_eq!(
+        done,
+        "venus_jig event=record_summary records=2 skipped=0 stopped=none result=ok"
+    );
+    let cut = RecordSummary {
+        records: 1,
+        skipped: 4,
+        stopped: Some(StopReason::RecordingTooLarge),
+    };
+    let failed = record_summary_line(&cut, false);
+    assert_eq!(
+        failed,
+        "venus_jig event=record_summary records=1 skipped=4 stopped=recording_too_large result=write_failed"
+    );
+    let report = find_capset_queries(&[stopped, done, failed].join("\n")).expect("report");
+    assert_eq!(report.malformed_lines, 0);
+    assert_eq!(report.venus_get_capset_ok, 0);
+}
+
+/// ログが上限で打ち切られた後も、優先行（record_stopped / record_summary）は取り置き領域に書かれる（REPAIR-4）。
+#[test]
+fn task1602_gpu6_priority_lines_survive_log_truncation() {
+    let mut sink = LogSink::new(Vec::new());
+    let line = format!("venus_jig event=x pad={}", "a".repeat(400));
+    for _ in 0..(MAX_LOG_BYTES / line.len() + 10) {
+        sink.write_line(&line);
+    }
+    assert!(sink.truncated());
+    sink.write_priority("venus_jig event=record_stopped reason=too_many_records records=3");
+    sink.write_priority(
+        "venus_jig event=record_summary records=3 skipped=1 stopped=too_many_records result=ok",
+    );
+    let (out, err) = sink.into_inner();
+    assert!(err.is_none());
+    assert!(out.len() <= MAX_LOG_BYTES, "total {}", out.len());
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(text.matches("event=record_stopped").count(), 1);
+    assert_eq!(text.matches("event=record_summary").count(), 1);
+    assert_eq!(text.matches("event=log_truncated").count(), 1);
+}
+
+/// 優先行の判定は固定語彙の接頭辞だけで行う。
+#[test]
+fn task1602_gpu6_is_priority_line_matches_only_known_events() {
+    assert!(is_priority_line(
+        "venus_jig event=record_stopped reason=x records=1"
+    ));
+    assert!(is_priority_line("venus_jig event=record_summary records=1"));
+    assert!(is_priority_line("venus_jig event=launch_error code=X"));
+    assert!(!is_priority_line("venus_jig event=submit_3d"));
+    assert!(!is_priority_line("record_stopped"));
+    // event の値は完全一致で判定する（接頭辞一致・語彙の後続文字は優先しない）。
+    assert!(is_priority_line("venus_jig event=record_stopped"));
+    assert!(!is_priority_line(
+        "venus_jig event=record_stopped_x records=1"
+    ));
+    assert!(!is_priority_line("venus_jig event=launch_errors code=X"));
 }

@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 
 pub use error::{Cause, SessionError, SessionErrorCode};
 
-use crate::adapter::CtrlAdapter;
+use crate::adapter::{CtrlAdapter, Submit3d};
 use crate::ctrl::{CtrlResponse, RESP_ERR_INVALID_PARAMETER};
 use crate::log::{self, QueryResult};
 use crate::sys;
@@ -123,13 +123,30 @@ pub fn run(
     limits: &SessionLimits,
     sink: &mut dyn FnMut(&str),
 ) -> Result<SessionEnd, SessionError> {
+    run_with_submit_hook(sock, limits, sink, &mut |_| None)
+}
+
+/// 受理した `SUBMIT_3D` の受け渡し点を受けるフック。返した行は `sink` へそのまま流す（停止の通知など）。
+pub type SubmitHook<'a> = &'a mut dyn FnMut(&Submit3d) -> Option<String>;
+
+/// [`run`] に、受理した `SUBMIT_3D` ごとに呼ぶフックを足したもの（`--record` の記録。GPU-6・TASK-172 F6・#1602）。
+///
+/// 呼び出し元は `launch`（`recording::SubmitRecorder::on_submit` を渡す）と結合試験。フックを呼ぶのは、応答を used ring へ
+/// 書き戻せた提出だけで、応答を捨てて adapter を巻き戻した提出（ゲストが ACK を見ていない）は呼ばない。ファイルや記録器の
+/// 後始末は呼び出し側が行い、session はファイルに触れない。
+pub fn run_with_submit_hook(
+    sock: &UnixStream,
+    limits: &SessionLimits,
+    sink: &mut dyn FnMut(&str),
+    on_submit: SubmitHook<'_>,
+) -> Result<SessionEnd, SessionError> {
     let mut session = Session {
         state: State::new(),
         adapter: CtrlAdapter::default(),
         limits: *limits,
         metrics: SessionMetrics::default(),
     };
-    let result = session.serve(sock, sink);
+    let result = session.serve(sock, sink, on_submit);
     // REPAIR-4: 操作ごとの成功 / 失敗件数と所要時間、fd 受け渡し・ゲストメモリ I/O の集計を終了時に出す。
     for line in session
         .metrics
@@ -213,6 +230,7 @@ impl Session {
         &mut self,
         sock: &UnixStream,
         sink: &mut dyn FnMut(&str),
+        on_submit: SubmitHook<'_>,
     ) -> Result<SessionEnd, SessionError> {
         let mut last_activity = Instant::now();
         loop {
@@ -236,7 +254,7 @@ impl Session {
                 last_activity = Instant::now();
             }
             let started = Instant::now();
-            let serviced = self.service_ctrl(sink);
+            let serviced = self.service_ctrl(sink, on_submit);
             if !matches!(serviced, Ok(false)) {
                 self.metrics
                     .record(SessionOp::CtrlKick, serviced.is_ok(), started.elapsed());
@@ -310,7 +328,11 @@ impl Session {
     }
 
     /// ctrl キュー（ring 0）の kick を待ち、積まれた要求を空にして call で通知する。処理したら真。
-    fn service_ctrl(&mut self, sink: &mut dyn FnMut(&str)) -> Result<bool, SessionError> {
+    fn service_ctrl(
+        &mut self,
+        sink: &mut dyn FnMut(&str),
+        on_submit: SubmitHook<'_>,
+    ) -> Result<bool, SessionError> {
         let Session {
             state,
             adapter,
@@ -342,10 +364,11 @@ impl Session {
             let vq = |e| SessionError::virtqueue(e, None);
             // 応答を書き戻せず捨てる場合に adapter の状態変更（CTX の作成・破棄）を取り消すための控え。
             let adapter_before = adapter.clone();
-            let (response, log_line) = if chain.readable_len() > MAX_CTRL_REQ_LEN as u64 {
+            let (response, log_line, submit) = if chain.readable_len() > MAX_CTRL_REQ_LEN as u64 {
                 (
                     CtrlResponse::new(None, RESP_ERR_INVALID_PARAMETER, &[]),
                     log::rejected_line(None, QueryResult::InvalidParameter),
+                    None,
                 )
             } else {
                 let mut buf = [0u8; MAX_CTRL_REQ_LEN];
@@ -354,10 +377,9 @@ impl Session {
                     .get(..n)
                     .ok_or_else(|| SessionError::new(SessionErrorCode::InvalidValue, None))?;
                 let h = adapter.handle_ctrl(req);
-                // `h.submit`（受理した SUBMIT_3D の受け渡し点）は、応答を書き戻せた場合だけ記録へ渡す契約
-                // （`dropped` で adapter を巻き戻した要求の提出は、ゲストが ACK を見ていないので捨てる）。
-                // 配線は #1602（F6）で行うため、ここでは消費しない。
-                (h.response, h.log_line)
+                // `h.submit`（受理した SUBMIT_3D の受け渡し点）は、応答を書き戻せた場合だけフックへ渡す
+                // （`dropped` で adapter を巻き戻した要求の提出は、ゲストが ACK を見ていないので捨てる。#1602）。
+                (h.response, h.log_line, h.submit)
             };
             let mut dropped = false;
             let len = match chain.write_writable(mem, response.as_bytes()) {
@@ -376,6 +398,10 @@ impl Session {
             sink(&log_line);
             if dropped {
                 sink(&log::response_dropped_line());
+            } else if let Some(s) = submit
+                && let Some(line) = on_submit(&s)
+            {
+                sink(&line);
             }
             done += 1;
         }

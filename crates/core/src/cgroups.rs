@@ -53,8 +53,11 @@
 //!   書く `exec_join` サブモジュール（`exec::prepare_cgroup_join` / `join_cgroup` の実体。起動経路の
 //!   [`CgroupJoin`] とは別の入口）
 //! - デバイス cgroup の eBPF 命令列の組み立て（TASK-32 追補・#1678・SEC-1）: OCI default devices の許可リスト
-//!   から `BPF_PROG_TYPE_CGROUP_DEVICE` の命令列を作る `device` サブモジュール。ロード・アタッチ・起動経路への
-//!   結線は未実装（#1679・#1680・#1314）
+//!   から `BPF_PROG_TYPE_CGROUP_DEVICE` の命令列を作る `device` サブモジュール
+//! - デバイス cgroup のロード・アタッチ・事後検証（TASK-32 追補・#1680・SEC-1・CORE-1・CORE-4）:
+//!   [`ContainerCgroup::apply_default_device_policy`]（`device_policy` サブモジュール）。rootful では事前問い合わせ →
+//!   ロード → アタッチ（flags 0）→ 事後問い合わせの照合を行い、rootless では何も試さず
+//!   [`DevicePolicyOutcome::NotApplied`] を返す。起動経路からは呼ばれておらず #1314 で結線する（未結線）
 //!
 //! - delete 時の cgroup 削除（TASK-30.3・OCI-6）: [`DelegatedCgroup::open_child`] で名前から既存の子 cgroup を
 //!   検証つきで開き、`oci_runtime::ContainerCgroupRemover` の実装として [`DelegatedCgroup::remove_child`] へ渡す
@@ -71,13 +74,16 @@
 //! 資源制限の各 setter は `recorder: &OpRecorder` を受け取り、setter の内部で全終了経路（controller 未有効・
 //! 事前検証・open / write 失敗・読み戻し不一致・成功）の成否とレイテンシを記録する。操作名は
 //! `cgroup.set_cpu_max` / `cgroup.set_pids_max` / `cgroup.set_io_max` / `cgroup.set_io_weight` /
-//! `cgroup.set_blkio_weight` / `cgroup.set_memory_limits`（1 setter = 1 操作。`memory.max` と
+//! `cgroup.set_blkio_weight` / `cgroup.set_memory_limits` / `cgroup.apply_default_device_policy`
+//! （1 setter = 1 操作。`memory.max` と
 //! `memory.swap.max` の 2 書き込みは 1 操作）。
 //! 呼び出し側で包まず setter 側で計装する理由: (a) `oci_runtime::kill` と同じ依存注入の形に揃う、
 //! (b) 本番 launcher が未実装で操作名の所有者が setter 側にしか置けず、呼び出し箇所ごとに名前と計装の
 //! 有無が分かれる非対称の再発を防ぐ、(c) 事前検証を含む全終了経路を漏れなく数えられる。
 //!
 //! # 未実装（REPAIR-3）
+//! - デバイス cgroup の起動経路への結線（`IsolationPrivilege` からの [`DevicePolicyMode`] の決定。#1314）・
+//!   入口の実機試験と verifier・EPERM の実機照合（#1681）・GPU の `deviceNodes` の追加（#562）
 //! - OCI `linux.resources` から `set_memory_limits` / `set_cpu_max` への反映、本番 launcher での
 //!   `detect` → `prepare` → `join_hook` の結線（TASK-29 / TASK-157 系）
 //! - OCI `linux.cgroupsPath` の反映・create での委譲スコープの記録（`CreateStateRequest::with_cgroup_scope`）と
@@ -116,6 +122,10 @@ mod device;
 pub use device::{
     DEVICE_PROGRAM_LICENSE, DEVICE_PROGRAM_MAX_INSNS, DeviceAccess, DeviceAllowList, DeviceMinor,
     DeviceProgram, DeviceRule, DeviceType, EbpfInstruction, EbpfOpcode, EbpfReg,
+};
+mod device_policy;
+pub use device_policy::{
+    AppliedDevicePolicy, DevicePolicyMode, DevicePolicyNotApplied, DevicePolicyOutcome,
 };
 mod exec_join;
 mod exec_kill;
@@ -192,6 +202,17 @@ pub enum CgroupStep {
     VerifyIdentity,
     /// デバイス cgroup の eBPF 命令列の組み立て（命令数の上限超過等。#1678・SEC-1）。
     BuildDeviceProgram,
+    /// デバイス cgroup 入口の事前検証（rootless と申告したのに euid 0 の不整合等。#1680・SEC-1）。
+    DeviceCgroupPolicy,
+    /// デバイス cgroup 用プログラムのアタッチ前の問い合わせ（`BPF_PROG_QUERY`）と、既存プログラムがある
+    /// 場合の拒否（#1680・SEC-1）。
+    QueryDeviceProgram,
+    /// デバイス cgroup 用プログラムのロード（`BPF_PROG_LOAD`。#1680・SEC-1）。
+    LoadDeviceProgram,
+    /// デバイス cgroup 用プログラムのアタッチ（`BPF_PROG_ATTACH`。#1680・SEC-1）。
+    AttachDeviceProgram,
+    /// アタッチ後の問い合わせと照合（プログラム数 1・attach flags 0。#1680・SEC-1）。
+    VerifyDeviceProgram,
 }
 
 /// cgroup 操作のエラー。`code` は ERR 系の機械可読コード、`message` は英語の説明。

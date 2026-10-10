@@ -5,8 +5,9 @@
 //! `crate::cgroups` が組み立てた封印済みの命令列（`DeviceProgram`。#1678）を、カーネルへロード
 //! （[`bpf_prog_load_cgroup_device`]）し、コンテナの cgroup に付け（[`bpf_prog_attach_cgroup_device`]）、
 //! 付いたことを問い合わせる（[`bpf_prog_query_cgroup_device`]）低レベル層。`ContainerCgroup` への入口・
-//! 事後検証・rootless 判定・`CgroupError` への写像は #1680、起動経路への結線は #1314、GPU の
-//! `deviceNodes` 追加（TASK-129・#562）は本ラッパーの再利用側で、現状は未結線（REPAIR-3）。
+//! 事後検証・rootless 判定・`CgroupError` への写像は `cgroups::device_policy`
+//! （`ContainerCgroup::apply_default_device_policy`。#1680）から結線済み。起動経路への結線は #1314、GPU の
+//! `deviceNodes` 追加（TASK-129・#562）は本ラッパーの再利用側で、未結線（REPAIR-3）。
 //! `libbpf` 系の依存は使わず `syscall(2)` から直接呼ぶ（フルスクラッチ。dependency-policy）。
 //! コンテナ側の seccomp は `bpf` を拒否する（`DeniedSyscall::Bpf`）ため、cgroup を作る runtime 側の
 //! プロセスで呼ぶ前提で、コンテナの子プロセスからは呼ばない。
@@ -25,7 +26,7 @@
 //!   flags 0 でプログラムを持つと子孫への attach は `EPERM` になる。つまり子孫（exec 用の `exec-*`）は
 //!   上書きも追加もできない。逆に祖先が既に flags 0 のプログラムを持つ環境では本 attach が `EPERM`
 //!   になる（capability 不足の `EPERM` とは別原因）。同じ cgroup に flags 0 のプログラムが既にあると
-//!   黙って置き換わる（扱いは #1680 で決める）
+//!   黙って置き換わる（#1680 の入口は、付ける前の問い合わせでプログラム数が 0 でなければ拒否する）
 //! - verifier のログは `log_level != 0` のときだけ書かれ、切り詰められると検証に成功しても `ENOSPC` で
 //!   ロードが失敗する。このため 1 回目はログ無しでロードし、`EINVAL`・`EACCES`（verifier の拒否）のときだけ
 //!   固定上限のバッファ付きで再実行して診断ログを取る
@@ -34,11 +35,6 @@
 //!   `prog_cnt` を書き戻す
 //!
 //! エラーは `SysError` のまま返し、縮退しない（`ENOSYS`・`EINVAL`・`EPERM` を区別できる）。
-
-#![cfg_attr(
-    not(test),
-    allow(dead_code, reason = "#1680 で ContainerCgroup から結線するまで未使用")
-)]
 
 use super::{ENOSPC, SysError, consts, last_error, syscall};
 use crate::cgroups::{DEVICE_PROGRAM_LICENSE, DeviceProgram};
@@ -52,7 +48,14 @@ pub(crate) const BPF_VERIFIER_LOG_CAP: usize = 4096;
 pub(crate) const BPF_QUERY_MAX_PROG_IDS: usize = 64;
 
 /// アタッチの attach flags。0 固定（`BPF_F_ALLOW_OVERRIDE`・`BPF_F_ALLOW_MULTI` を付けない。SEC-1）。
-const DEVICE_ATTACH_FLAGS: u32 = 0;
+pub(crate) const DEVICE_ATTACH_FLAGS: u32 = 0;
+
+/// ロードするプログラム型（`BPF_PROG_TYPE_CGROUP_DEVICE`）。`cgroups::device_policy` の dry-run が配線の
+/// 照合に使う（値の正しさは本モジュールの試験で照合済み）。
+pub(crate) const DEVICE_PROG_TYPE: u32 = consts::BPF_PROG_TYPE_CGROUP_DEVICE;
+
+/// アタッチ・問い合わせの attach type（`BPF_CGROUP_DEVICE`）。用途は [`DEVICE_PROG_TYPE`] と同じ。
+pub(crate) const DEVICE_ATTACH_TYPE: u32 = consts::BPF_CGROUP_DEVICE;
 
 /// `union bpf_attr` の `BPF_PROG_LOAD` 用の先頭部分（72 バイト）。暗黙のパディングを作らず全バイトを
 /// 名前付きで持つ。
@@ -114,6 +117,13 @@ impl CgroupDeviceProgFd {
     pub(crate) fn as_fd(&self) -> BorrowedFd<'_> {
         self.0.as_fd()
     }
+
+    /// テスト専用: 任意の fd を包む（`cgroups::device_policy` の dry-run がロード結果の代わりに使う）。
+    /// 本番ビルドには存在しないため、任意の fd をアタッチへ渡す経路は作れない。
+    #[cfg(test)]
+    pub(crate) fn from_fd_for_test(fd: OwnedFd) -> Self {
+        Self(fd)
+    }
 }
 
 /// ロード失敗。`cause` は 1 回目の errno、`verifier_log` は verifier が拒否した場合の切り詰め済み
@@ -142,6 +152,16 @@ impl CgroupDeviceQuery {
             prog_count,
             prog_ids,
         }
+    }
+
+    /// テスト専用: 問い合わせ結果を組み立てる（`prog_ids` は先頭から詰め、上限で切る）。
+    #[cfg(test)]
+    pub(crate) fn new_for_test(attach_flags: u32, prog_count: u32, ids: &[u32]) -> Self {
+        let mut arr = [0u32; BPF_QUERY_MAX_PROG_IDS];
+        for (slot, id) in arr.iter_mut().zip(ids) {
+            *slot = *id;
+        }
+        Self::new(attach_flags, prog_count, arr)
     }
 
     /// cgroup に付いているプログラムの数。
@@ -182,7 +202,7 @@ fn load_attr(
         None => (0, 0, 0),
     };
     Ok(BpfProgLoadAttr {
-        prog_type: consts::BPF_PROG_TYPE_CGROUP_DEVICE,
+        prog_type: DEVICE_PROG_TYPE,
         insn_cnt,
         insns: program.instructions().as_ptr() as u64,
         license: DEVICE_PROGRAM_LICENSE.as_ptr() as u64,
@@ -193,7 +213,7 @@ fn load_attr(
         prog_flags: 0,
         prog_name: [0; 16],
         prog_ifindex: 0,
-        expected_attach_type: consts::BPF_CGROUP_DEVICE,
+        expected_attach_type: DEVICE_ATTACH_TYPE,
     })
 }
 
@@ -204,7 +224,7 @@ fn attach_attr(
     Ok(BpfProgAttachAttr {
         target_fd: fd_u32(cgroup.as_raw_fd())?,
         attach_bpf_fd: fd_u32(prog.as_fd().as_raw_fd())?,
-        attach_type: consts::BPF_CGROUP_DEVICE,
+        attach_type: DEVICE_ATTACH_TYPE,
         attach_flags: DEVICE_ATTACH_FLAGS,
         replace_bpf_fd: 0,
         relative_fd: 0,
@@ -218,7 +238,7 @@ fn query_attr(
 ) -> Result<BpfProgQueryAttr, SysError> {
     Ok(BpfProgQueryAttr {
         target_fd: fd_u32(cgroup.as_raw_fd())?,
-        attach_type: consts::BPF_CGROUP_DEVICE,
+        attach_type: DEVICE_ATTACH_TYPE,
         query_flags: 0,
         attach_flags: 0,
         prog_ids: ids.as_mut_ptr() as u64,
@@ -525,6 +545,19 @@ mod tests {
         assert_eq!(verifier_log_text(b"\xffx\0").as_deref(), Some("\u{fffd}x"));
         let full = [b'a'; BPF_VERIFIER_LOG_CAP];
         assert_eq!(verifier_log_text(&full).map(|s| s.len()), Some(4095));
+    }
+
+    /// SEC-1・TASK-32（#1680）: 試験専用の構築子は ID を先頭から詰め、上限を超える分は切る。
+    #[test]
+    fn sec1_task32_new_for_test_packs_and_truncates_ids() {
+        let q = CgroupDeviceQuery::new_for_test(0, 2, &[42, 43]);
+        assert_eq!(q.prog_ids(), &[42, 43]);
+        let many = [5u32; 100];
+        let q = CgroupDeviceQuery::new_for_test(2, 1, &many);
+        assert_eq!((q.attach_flags(), q.prog_ids()), (2, &[5u32][..]));
+        assert_eq!(DEVICE_PROG_TYPE, 15);
+        assert_eq!(DEVICE_ATTACH_TYPE, 6);
+        assert_eq!(DEVICE_ATTACH_FLAGS, 0);
     }
 
     /// SEC-1・TASK-32: `prog_ids()` は `min(count, 上限)` 個を返す。

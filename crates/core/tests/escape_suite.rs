@@ -1150,12 +1150,13 @@ mod linux {
     use fandhe_container_core::audit_log::{
         AuditDelivery, AuditRecord, AuditSink, encode_json_line, landlock_denial_record_now,
     };
+    use fandhe_container_core::dev_mounts::ImplicitDevMounts;
     use fandhe_container_core::exec::{
         ChildExit, EscapeSyscallProbe, IsolationConfig, Namespace, NamespaceSet, ProbeOutcome,
         StagePipeline, escape_probe_mount, isolate, isolate_rootful_host_root, plan,
         plan_rootful_host_root, probe_escape_syscall, spawn_container_probe,
     };
-    use fandhe_container_core::landlock::{detect_landlock_abi, path_rules_from_config};
+    use fandhe_container_core::landlock::{build_path_rules_with_dev, detect_landlock_abi};
     use fandhe_container_core::oci_runtime::{audit_mount_config_error, parse_config_bytes};
     use fandhe_container_core::traits::{ErrorCode, TraitError};
 
@@ -1382,8 +1383,16 @@ mod linux {
         let config = parse_config_bytes(json).expect("valid config");
         let support = detect_landlock_abi()
             .unwrap_or_else(|e| panic!("Landlock ABI 6+ is required for ESC-01: {e}"));
-        let ruleset =
-            path_rules_from_config(&support, &config).unwrap_or_else(|e| panic!("rules: {e}"));
+        // rootfs に dev が無い最小フロー（`spawn_container` は `create_default_devices` を呼ばない。#1314 未配線）
+        // では暗黙の `/dev` 系のルールを足せない（存在しないパスは適用時に拒否される）ため含めない。ルールは
+        // 従来と同じで弱体化ではない。#1314 で配線したら `ImplicitDevMounts::All` に戻す（#1657）。
+        let ruleset = build_path_rules_with_dev(
+            &support,
+            config.root(),
+            config.mounts(),
+            ImplicitDevMounts::None,
+        )
+        .unwrap_or_else(|e| panic!("rules: {e}"));
         StagePipeline::new()
             .with_landlock(ruleset)
             .unwrap_or_else(|e| panic!("with_landlock: {e}"))
@@ -1540,8 +1549,16 @@ mod linux {
         let config = parse_config_bytes(json).unwrap_or_else(|e| panic!("valid config: {e}"));
         let support = detect_landlock_abi()
             .unwrap_or_else(|e| panic!("Landlock ABI 6+ is required for this case: {e}"));
-        let ruleset = path_rules_from_config(&support, &config)
-            .unwrap_or_else(|e| panic!("landlock rules: {e}"));
+        // rootfs に dev が無い最小フロー（`spawn_container` は `create_default_devices` を呼ばない。#1314 未配線）
+        // では暗黙の `/dev` 系のルールを足せない（存在しないパスは適用時に拒否される）ため含めない。ルールは
+        // 従来と同じで弱体化ではない。#1314 で配線したら `ImplicitDevMounts::All` に戻す（#1657）。
+        let ruleset = build_path_rules_with_dev(
+            &support,
+            config.root(),
+            config.mounts(),
+            ImplicitDevMounts::None,
+        )
+        .unwrap_or_else(|e| panic!("landlock rules: {e}"));
         StagePipeline::new()
             .with_landlock(ruleset)
             .unwrap_or_else(|e| panic!("with_landlock: {e}"))
@@ -1563,8 +1580,16 @@ mod linux {
         let config = parse_config_bytes(ESC10_CONFIG).expect("valid config");
         let support = detect_landlock_abi()
             .unwrap_or_else(|e| panic!("Landlock ABI 6+ is required for ESC-10: {e}"));
-        let ruleset =
-            path_rules_from_config(&support, &config).unwrap_or_else(|e| panic!("rules: {e}"));
+        // rootfs に dev が無い最小フロー（`spawn_container` は `create_default_devices` を呼ばない。#1314 未配線）
+        // では暗黙の `/dev` 系のルールを足せない（存在しないパスは適用時に拒否される）ため含めない。ルールは
+        // 従来と同じで弱体化ではない。#1314 で配線したら `ImplicitDevMounts::All` に戻す（#1657）。
+        let ruleset = build_path_rules_with_dev(
+            &support,
+            config.root(),
+            config.mounts(),
+            ImplicitDevMounts::None,
+        )
+        .unwrap_or_else(|e| panic!("rules: {e}"));
         StagePipeline::new()
             .with_landlock(ruleset)
             .unwrap_or_else(|e| panic!("with_landlock: {e}"))

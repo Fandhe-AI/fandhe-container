@@ -118,6 +118,7 @@ use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
+use crate::dev_mounts::ImplicitDevMount;
 use crate::rootless::IdMapSet;
 use crate::sys::{self, SysError};
 use crate::traits::types::ErrorCode;
@@ -451,7 +452,7 @@ fn populate_dev(
     let after = sys::open_dir_path_nofollow(Some(root), c"dev")
         .map_err(|e| open_error(e, true, rootfs, &[OsStr::new("dev")]).at_stage(STAGE))?;
     let observed = observe_dev_mount(dev, &after, mount_fd)?;
-    check_new_tmpfs(observed, "/dev", STAGE)?;
+    check_new_tmpfs(observed, ImplicitDevMount::Dev.destination(), STAGE)?;
 
     let mount = mount_fd.as_fd();
     let mut nodes = Vec::with_capacity(DEFAULT_DEVICES.len());
@@ -540,7 +541,13 @@ fn mount_pts(
     let after = sys::open_dir_path_nofollow(Some(mount), c"pts")
         .map_err(|e| open_error(e, true, rootfs, &names).at_stage(STAGE))?;
     let observed = observe_pts_mount(pts, &after, pts_mount)?;
-    check_new_mount(observed, sys::DEVPTS_MAGIC, "devpts", "/dev/pts", STAGE)?;
+    check_new_mount(
+        observed,
+        sys::DEVPTS_MAGIC,
+        ImplicitDevMount::DevPts.fs_type(),
+        ImplicitDevMount::DevPts.destination(),
+        STAGE,
+    )?;
 
     let ptmx_status = create_link(mount, &PTMX_LINK)?;
     if ptmx_status == DeviceLinkStatus::Created {

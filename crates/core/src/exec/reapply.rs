@@ -1823,7 +1823,8 @@ mod tests {
                     .iter()
                     .map(|rule| rule.path.as_str())
                     .collect();
-                assert_eq!(paths, vec!["/", dest]);
+                // 暗黙の /dev 系（#1657）は root の次に入る。
+                assert_eq!(paths, vec!["/", "/dev", "/dev/pts", "/dev/shm", dest]);
                 // 準備（`join_namespaces` 前）でホストへ解決されていないこと: destination は実在しない。
                 assert!(!std::path::Path::new(dest).exists());
             }

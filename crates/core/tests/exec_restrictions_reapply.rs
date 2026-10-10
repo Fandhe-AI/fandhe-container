@@ -161,8 +161,8 @@ fn main() {
         }
         assert!(o.reapply_error.is_none(), "{:?}", o.reapply_error);
         let report = o.report.expect("report");
-        // root（`/`）と `allowed` の 2 ルール。
-        assert_eq!(report.landlock_rules(), 2, "{report:?}");
+        // root（`/`）・暗黙の `/dev`・`/dev/pts`・`/dev/shm`（#1657。ホストの同名パスを起点にする）・`allowed` の 5 ルール。
+        assert_eq!(report.landlock_rules(), 5, "{report:?}");
         assert!(report.seccomp_instructions() > 0, "{report:?}");
         // SEC-1: 観測関数は `CAP_SETPCAP` を持たない非特権の子でも動くよう capability 削減を省き、rlimit も
         // 変えない（空集合）。省いた制限は launch の段の順で未適用に残り（TASK-163 追補・#1460。空集合の rlimit を

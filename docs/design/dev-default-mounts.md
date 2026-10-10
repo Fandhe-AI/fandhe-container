@@ -28,7 +28,7 @@ OCI 既定の `/dev` のうち、基本デバイスノード 6 種と default sy
 - `/dev/shm` は `TmpfsMountSet::ensure_default_dev_shm` が、利用者の指定（`--shm-size`・`--tmpfs /dev/shm`）が無いとき既定 64 MiB（`DEFAULT_DEV_SHM_SIZE_BYTES`）の件を足す（#1654）。supervisor の `to_tmpfs_set` が `--ipc=host` 以外で呼ぶ。`--ipc=host` でのホストの `/dev/shm` の bind は未実装
 - `sys` の新マウント API ラッパーは tmpfs（`mount_tmpfs_on`・`mount_dev_tmpfs_on`）と devpts（`mount_devpts_on`・#1655）があり、devpts は `create_default_devices` が呼ぶ（#1656）
 - `process.terminal: true` と `mounts[]` は拒否する。`/proc` と基本 6 デバイスは `mounts[]` を使わず暗黙の固定集合
-- Landlock のルールは `config.json` の `root` と `mounts[]` のみから作る。暗黙の `/dev/pts`・`/dev/shm` に対するルールは無い。`PSEUDO_FS` に devpts は入っていない
+- Landlock のルールは `root` に加え、暗黙の `/dev`・`/dev/pts`・`/dev/shm` を実マウントの属性から導いた権利で足す（#1657）。定義は `dev_mounts` モジュールの1か所で、exec 側と共有する。`mounts[]` が同じマウント先を指す場合は統合せず拒否する（統合の規則は TASK-127）。`PSEUDO_FS` に devpts は入れない（pty への書き込みに `WRITE_FILE` が要り、書き込み制限に VFS の裏付けがあるため）。利用者指定の tmpfs（`--tmpfs`・`/dev/shm` の上書き）は反映しない
 - rootless は tmpfs までは載るが `mknod` が `EPERM` になり `PermissionDenied` で fail-closed（載せた tmpfs は外す）。ホスト `/dev` の bind は未実装（#1660）
 
 ## 3. 方式の比較

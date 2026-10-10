@@ -503,6 +503,10 @@ pub fn build_path_rules(
 /// 権利は `/dev` の権利を含む。子の 2 本は意図した権利を明示し、広がった差分を [`LandlockRuleset::shadowed`]
 /// に監査用の記録として残す（SEC-4）。実行・`IOCTL_DEV` の差分は VFS の `noexec` / `nodev` が効く。
 ///
+/// `ImplicitDevMounts::WithoutShm` は `/dev/shm` を載せない構成（`--ipc=host`）向けで、
+/// `ImplicitDevMounts::for_tmpfs_set` で実際に載せる tmpfs 集合から選ぶ（#1672 事後監査 P2）。どの variant でも、
+/// 暗黙分のパスが実際に期待する fs の独立したマウントであることは適用時に確かめる（`apply` の `check_implicit_mount`）。
+///
 /// `ImplicitDevMounts::None` は rootfs にこれらのマウントが無い経路（#1314 未配線の最小フロー）向けで、
 /// ルールが減るだけで権利は広がらない。このとき `mounts` は上限 +3 件まで通るが、`mounts[]` の件数は
 /// config のパース時に [`CONFIG_MAX_MOUNTS`] で制限済みのため確保量は抑えられる。

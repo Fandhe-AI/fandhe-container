@@ -1327,7 +1327,12 @@ impl TmpfsParams {
 ///   `EPERM` になり `/dev/zero` の実行可能マップが壊れるおそれがあり、付ける根拠となるビヘイビアも無い。
 /// - `strictatime` を付ける: runc と同じ。既定の relatime に任せず明示する。
 ///
-/// `crate::exec::create_default_devices` が呼ぶ（#1653）。
+/// その結果、コンテナの `/dev` は書き込み可能かつ実行可能な領域になり、読み取り専用でない rootfs と同じ扱いに
+/// なる（`root.readonly=true` でも `/dev` は書き込める。Landlock も `/dev` に `WRITE` を許す。#1664・#1672 の
+/// 事後監査）。新たなデバイスノードの作成は Landlock の `MAKE_CHAR`・`MAKE_BLOCK` 不許可が止める（SEC-1）。
+///
+/// `crate::exec::create_default_devices` が呼ぶ（#1653）。付け替え先は `exec::devices` の検証済みの型からしか
+/// 渡さない（#1664 の事後監査 P2）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DevTmpfsCreate {
     _private: (),
@@ -1495,8 +1500,33 @@ pub(crate) const DEVPTS_MAGIC: i64 = 0x1cd1;
 /// `gid` を `None` にする（判定はここでは行わない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DevptsCreate {
-    /// pty スレーブの所有グループ。`None` のときは `gid` のキー自体を渡さない（カーネル既定）。
-    pub(crate) gid: Option<u32>,
+    /// pty スレーブの所有グループ（tty グループの 5 か、`gid` のキー自体を渡さないかの 2 通り）。
+    pub(crate) gid: DevptsGid,
+}
+
+/// devpts の `gid=` の指定（#1663 事後監査 P3。SEC-1・SEC-5）。
+///
+/// runc と同じ tty グループ（5）を渡すか、`gid` のキー自体を渡さない（カーネル既定。rootless で gid 5 が
+/// 写像されていないとき）かの 2 通りに型で限り、crate 内からも任意の gid を渡せないようにする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DevptsGid {
+    /// `gid=5`（tty グループ）。
+    Tty,
+    /// `gid` のキーを渡さない。
+    Omitted,
+}
+
+impl DevptsGid {
+    /// tty グループの gid（runc の既定と同じ。設計ドラフト `dev-default-mounts.md` 3.3）。
+    pub(crate) const TTY_GID: u32 = 5;
+
+    /// `gid=` に渡す値（`Omitted` は `None`）。
+    pub(crate) const fn value(self) -> Option<u32> {
+        match self {
+            Self::Tty => Some(Self::TTY_GID),
+            Self::Omitted => None,
+        }
+    }
 }
 
 impl DevptsCreate {
@@ -1511,9 +1541,9 @@ impl DevptsCreate {
         consts::MOUNT_ATTR_NOSUID | consts::MOUNT_ATTR_NOEXEC
     }
 
-    /// `fsconfig(SET_STRING)` へ渡すキーと値の列（順序固定）。`gid` が `u32::MAX`（`(gid_t)-1`、
-    /// 有効な gid になり得ない）の場合は `EINVAL` で拒否する。`unsafe` を含まない純粋関数で、
-    /// マウント権限なしに具体値で照合できる。
+    /// `fsconfig(SET_STRING)` へ渡すキーと値の列（順序固定）。`gid` は [`DevptsGid`] で 5 か省略に限られる
+    /// ため、無効な gid（`(gid_t)-1` 等）を表せない。安全なコードだけの純粋関数で、マウント権限なしに
+    /// 具体値で照合できる。
     fn fsconfig_params(self) -> Result<Vec<FsconfigParam>, SysError> {
         let make = |key: &'static CStr, value: String| -> Result<FsconfigParam, SysError> {
             // 値は整数から生成した数字（または静的な識別子）のみで、NUL・カンマを含み得ない。
@@ -1525,10 +1555,7 @@ impl DevptsCreate {
             make(c"mode", format!("{:04o}", Self::MODE))?,
             make(c"ptmxmode", format!("{:04o}", Self::PTMXMODE))?,
         ];
-        if let Some(gid) = self.gid {
-            if gid == u32::MAX {
-                return Err(SysError::Os(EINVAL));
-            }
+        if let Some(gid) = self.gid.value() {
             params.push(make(c"gid", gid.to_string())?);
         }
         Ok(params)
@@ -3406,6 +3433,13 @@ pub(crate) fn nonblock_open_flag() -> Option<i32> {
     consts::SUPPORTED.then_some(consts::O_NONBLOCK)
 }
 
+/// `O_NOCTTY` 単体（アーキテクチャ別の値）。結合試験用の観測（`crate::exec` の `LandlockAccessKind::OpenNoCtty`）が、
+/// `/dev/ptmx` を制御端末にせずに開くために使う（#1672 事後監査 P2）。対応外アーキテクチャでは `None`（fail-closed）。
+/// 定数を返すだけで syscall を呼ばない。
+pub(crate) fn noctty_open_flag() -> Option<i32> {
+    consts::SUPPORTED.then_some(consts::O_NOCTTY)
+}
+
 /// `O_NONBLOCK | O_NOFOLLOW | O_DIRECTORY`。親ディレクトリを 1 要素ずつ symlink 非追従で開くための値。
 ///
 /// `crate::open_flags` が呼ぶ。対応外アーキテクチャでは `None`（fail-closed）。`unsafe` を含まない。
@@ -3831,7 +3865,7 @@ mod tests {
         assert_eq!(TMPFS_MAGIC, 0x0102_1994);
     }
 
-    /// CORE-1・SEC-1（TASK-29 追補・#1655）: devpts の fsconfig 列は具体値で固定され、`gid=None` では
+    /// CORE-1・SEC-1（TASK-29 追補・#1655）: devpts の fsconfig 列は具体値で固定され、`DevptsGid::Omitted` では
     /// `gid` のキーを渡さない。`mode`・`ptmxmode` は 4 桁 8 進表記（runc と同じ）。
     #[test]
     fn core1_sec1_task29_devpts_fsconfig_params_are_exact() {
@@ -3851,8 +3885,13 @@ mod tests {
         let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
         assert_eq!(DevptsCreate::MODE, 0o620);
         assert_eq!(DevptsCreate::PTMXMODE, 0o666);
+        assert_eq!(DevptsGid::TTY_GID, 5);
+        assert_eq!(DevptsGid::Tty.value(), Some(5));
+        assert_eq!(DevptsGid::Omitted.value(), None);
         assert_eq!(
-            to_strs(DevptsCreate { gid: Some(5) }),
+            to_strs(DevptsCreate {
+                gid: DevptsGid::Tty
+            }),
             vec![
                 pair("source", "devpts"),
                 pair("mode", "0620"),
@@ -3861,23 +3900,14 @@ mod tests {
             ]
         );
         assert_eq!(
-            to_strs(DevptsCreate { gid: None }),
+            to_strs(DevptsCreate {
+                gid: DevptsGid::Omitted
+            }),
             vec![
                 pair("source", "devpts"),
                 pair("mode", "0620"),
                 pair("ptmxmode", "0666"),
             ]
-        );
-        assert_eq!(
-            to_strs(DevptsCreate { gid: Some(0) }).last(),
-            Some(&pair("gid", "0"))
-        );
-        assert_eq!(
-            DevptsCreate {
-                gid: Some(u32::MAX)
-            }
-            .fsconfig_params(),
-            Err(SysError::Os(EINVAL))
         );
     }
 
@@ -3885,7 +3915,10 @@ mod tests {
     /// syscall 番号は `sup12_task169_new_mount_api_consts_are_exact` が x86_64・aarch64 で照合する。
     #[test]
     fn core1_sec1_task29_devpts_attr_bits_are_exact() {
-        let bits = DevptsCreate { gid: None }.attr_bits();
+        let bits = DevptsCreate {
+            gid: DevptsGid::Omitted,
+        }
+        .attr_bits();
         assert_eq!(bits, 0xA);
         assert_eq!(bits & consts::MOUNT_ATTR_NODEV, 0);
         assert_eq!(bits & 0x4, 0);
@@ -3978,8 +4011,14 @@ mod tests {
         // マウント前は devpts ではない。
         assert_ne!(fs_type(target.as_fd()).unwrap(), DEVPTS_MAGIC);
 
-        // gid=None: user namespace 内で gid 5 が写像されているとは限らない。
-        let mnt = mount_devpts_on(target.as_fd(), DevptsCreate { gid: None }).unwrap();
+        // DevptsGid::Omitted: user namespace 内で gid 5 が写像されているとは限らない。
+        let mnt = mount_devpts_on(
+            target.as_fd(),
+            DevptsCreate {
+                gid: DevptsGid::Omitted,
+            },
+        )
+        .unwrap();
         // 返された fd が devpts のマウントを指す。
         assert_eq!(fs_type(mnt.as_fd()).unwrap(), 0x1cd1);
         // 指定先へ接続された（パスを開き直しても devpts）。
@@ -4061,7 +4100,10 @@ mod tests {
             bits(ImplicitDevMount::Dev)
         );
         assert_eq!(
-            DevptsCreate { gid: None }.attr_bits(),
+            DevptsCreate {
+                gid: DevptsGid::Omitted,
+            }
+            .attr_bits(),
             bits(ImplicitDevMount::DevPts)
         );
     }

@@ -99,6 +99,13 @@ pub enum LandlockAccessKind {
     MakeDir,
     /// ファイルの削除。
     RemoveFile,
+    /// 文字デバイス（1:3。`/dev/null` と同じ番号）の作成（`mknodat(2)`。親ディレクトリを開いてから最終要素を
+    /// 作る）。rootful では `CAP_MKNOD` があり、`/dev` の tmpfs には `nodev` が無いため、拒否するのは Landlock の
+    /// `MAKE_CHAR` 不許可だけで、それを通しで確かめるのに使う（#1672 事後監査 P2・CORE-5・SEC-1）。
+    MakeCharDevice,
+    /// 既存のファイルを読み書きで `O_NOCTTY` 付きで開く（`/dev/ptmx` を制御端末にせずに開けることの確認。
+    /// #1672 事後監査 P2）。
+    OpenNoCtty,
 }
 
 /// 1 件の観測対象（種別とパス）。
@@ -239,8 +246,49 @@ pub(super) fn run_probe(p: &LandlockAccessProbe) -> Option<i32> {
             .map(|_| ()),
         LandlockAccessKind::MakeDir => std::fs::create_dir(&p.path),
         LandlockAccessKind::RemoveFile => std::fs::remove_file(&p.path),
+        LandlockAccessKind::MakeCharDevice => return make_char_device_probe(&p.path),
+        LandlockAccessKind::OpenNoCtty => {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let Some(noctty) = sys::noctty_open_flag() else {
+                return Some(-1);
+            };
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(noctty)
+                .open(&p.path)
+                .map(|_| ())
+        }
     };
     res.err().map(|e| e.raw_os_error().unwrap_or(-1))
+}
+
+/// [`LandlockAccessKind::MakeCharDevice`] の本体。親ディレクトリを `O_PATH|O_NOFOLLOW|O_DIRECTORY` で開き、
+/// その fd 起点で最終要素に 1:3 の文字デバイス（モード 0666）を作る。成功は `None`、失敗は `Some(errno)`
+/// （親・名前が取れない・NUL を含む・対応外アーキテクチャは `-1`）。`O_NOFOLLOW` が効くのは親の最終要素だけで、
+/// 親までの中間要素の symlink は辿る（結合試験が固定のリストで渡すパス専用で、外部入力は受けない）。
+fn make_char_device_probe(path: &std::path::Path) -> Option<i32> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let errno = |e: sys::SysError| match e {
+        sys::SysError::Os(e) => e,
+        _ => -1,
+    };
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Some(-1);
+    };
+    let (Ok(parent), Ok(name)) = (
+        std::ffi::CString::new(parent.as_os_str().as_bytes()),
+        std::ffi::CString::new(name.as_bytes()),
+    ) else {
+        return Some(-1);
+    };
+    let dir = match sys::open_dir_path_nofollow(None, &parent) {
+        Ok(fd) => fd,
+        Err(e) => return Some(errno(e)),
+    };
+    sys::make_char_device(std::os::fd::AsFd::as_fd(&dir), &name, 0o666, 1, 3)
+        .err()
+        .map(errno)
 }
 
 fn from_landlock_apply(e: LandlockApplyError) -> ExecError {
@@ -294,6 +342,7 @@ pub(super) mod testing {
                 rules_added: ruleset.rules().len(),
                 file_rules: 0,
                 skipped_empty: 0,
+                implicit_mounts_verified: 0,
             }),
         }
     }
@@ -331,6 +380,52 @@ mod tests {
         assert_eq!(e.code, ErrorCode::InvalidArgument);
         assert_eq!(e.stage, IsolationStage::Landlock);
         assert_eq!(e.message, "too many access probes");
+    }
+
+    /// CORE-5・SEC-1（#1672 事後監査 P2）: 追加した 2 種のプローブが、権限や環境に依らない入力で errno を
+    /// 具体値で返す（親が無ければ `ENOENT`、既存の通常ファイルは `O_NOCTTY` で開ける）。Landlock の下での
+    /// 拒否・許可は結合試験 `tests/landlock_implicit_dev.rs`（実機前提）が照合する。
+    #[test]
+    fn core5_sec1_mknod_and_noctty_probes_report_errno() {
+        let dir = std::env::temp_dir().join(format!(
+            "fandhe-landlock-probe-kinds-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = dir.join("file");
+        std::fs::write(&file, b"x").expect("file");
+        let probe = |kind, path: PathBuf| LandlockAccessProbe {
+            kind,
+            path,
+            expected_content: None,
+        };
+        let enoent = Some(sys::ENOENT);
+        assert_eq!(
+            run_probe(&probe(
+                LandlockAccessKind::MakeCharDevice,
+                dir.join("missing/node")
+            )),
+            enoent
+        );
+        assert_eq!(
+            run_probe(&probe(
+                LandlockAccessKind::MakeCharDevice,
+                PathBuf::from("/")
+            )),
+            Some(-1)
+        );
+        assert_eq!(
+            run_probe(&probe(LandlockAccessKind::OpenNoCtty, file.clone())),
+            None
+        );
+        assert_eq!(
+            run_probe(&probe(LandlockAccessKind::OpenNoCtty, dir.join("missing"))),
+            enoent
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// CORE-5・TASK-39.4: 適用失敗は code を保ち stage を Landlock にする。

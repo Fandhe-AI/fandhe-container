@@ -23,6 +23,11 @@
 //!   （[`apply_landlock_ruleset_with`]。照合した実体と辿る起点を同じ fd にする）。ルールのパスは
 //!   `..` を含まない正規化済みの要素列（`RulePath`）で、各要素を symlink 非追従で開くため、起点の
 //!   ディレクトリの外へは解決されない
+//! - 暗黙のマウント（`RuleOrigin::Implicit`。`/dev`・`/dev/pts`・`/dev/shm`）のルールは、ruleset が fork 前に親で
+//!   作られ子のマウントの証跡と結びつかないため、適用時に開いた fd（開き直さない）が期待する fs（tmpfs / devpts）
+//!   の独立したマウントのルート（`st_dev` が `..` と異なる）であることを確かめてから足す。パスが無ければ
+//!   `ImplicitMountMissing`、別の fs・素のディレクトリなら `ImplicitMountMismatch`（どちらも `FailedPrecondition`）で
+//!   拒否する（#1672 事後監査 P2。exec の再適用でも同じ判定を通る）
 //! - syscall は `crate::sys` の安全なラッパーのみを使い、`unsafe` を持たない。実カーネルは
 //!   [`LandlockKernel`] の差し込み点で隔離し、単体テストは偽カーネルで呼び出し順を照合する
 //! - 分離違反の試行の監査ログ記録（SEC-4）は TASK-41 の範囲で、本モジュールは記録しない
@@ -38,6 +43,7 @@ use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::path::Path;
 
 use super::rules::{AccessFs, LandlockRuleset, PathRule, RuleOrigin, RulePath};
+use crate::dev_mounts::ImplicitDevMount;
 use crate::exec::ThreadCountSource;
 use crate::sys::{self, SysError};
 use crate::traits::ErrorCode;
@@ -88,6 +94,23 @@ pub enum LandlockApplyErrorKind {
     BecameMultiThreaded,
     /// 対応外アーキテクチャ。
     UnsupportedArchitecture,
+    /// 暗黙のマウント（`/dev`・`/dev/pts`・`/dev/shm`）のパスが無い（#1672 事後監査 P2）。ランタイムが
+    /// そのマウントを載せていない（例: `--ipc=host` で `/dev/shm` を載せない構成に
+    /// `ImplicitDevMounts::All` の ruleset を使った）ことを表し、`Internal` と区別する。
+    ImplicitMountMissing {
+        /// ルールの位置。
+        index: usize,
+        /// 対象のマウント。
+        mount: ImplicitDevMount,
+    },
+    /// 暗黙のマウントのパスはあるが、期待する fs（tmpfs / devpts）の独立したマウントのルートではない
+    /// （#1672 事後監査 P2。イメージ同梱の `dev` ディレクトリのままで、ランタイムがマウントしていない等）。
+    ImplicitMountMismatch {
+        /// ルールの位置。
+        index: usize,
+        /// 対象のマウント。
+        mount: ImplicitDevMount,
+    },
     /// 内部不整合（パスに NUL が含まれる等。型により通常は起こらない）。
     Internal,
 }
@@ -106,6 +129,8 @@ impl LandlockApplyErrorKind {
             Self::RestrictSelfFailed { .. } => "landlock_restrict_self_failed",
             Self::BecameMultiThreaded => "became_multi_threaded",
             Self::UnsupportedArchitecture => "unsupported_architecture",
+            Self::ImplicitMountMissing { .. } => "landlock_implicit_mount_missing",
+            Self::ImplicitMountMismatch { .. } => "landlock_implicit_mount_mismatch",
             Self::Internal => "internal",
         }
     }
@@ -182,6 +207,8 @@ pub struct LandlockApplyReport {
     pub file_rules: usize,
     /// 絞った結果が空になり追加しなかったルール数（「配下を全拒否」と同じ意味）。
     pub skipped_empty: usize,
+    /// 実在（期待する fs の独立したマウントのルート）を確かめた暗黙のマウントの数（#1672 事後監査 P2）。
+    pub implicit_mounts_verified: usize,
 }
 
 /// ルール対象の実体の種別。
@@ -189,6 +216,17 @@ pub struct LandlockApplyReport {
 pub(crate) enum PathKind {
     Dir,
     File,
+}
+
+/// 暗黙のマウントのルール対象 fd の観測値（[`check_implicit_mount`] の入力。#1672 事後監査 P2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MountProbe {
+    /// `statfs.f_type`。
+    pub(crate) magic: i64,
+    /// 対象の `st_dev`。
+    pub(crate) dev: u64,
+    /// 対象の `..`（マウントのルートなら、マウント先の親ディレクトリ）の `st_dev`。
+    pub(crate) parent_dev: u64,
 }
 
 /// パスを開く処理の失敗。
@@ -217,6 +255,8 @@ pub(crate) trait LandlockKernel {
         path: &Self::PathFd,
     ) -> Result<(), SysError>;
     fn restrict_self(&self, ruleset: &Self::Ruleset) -> Result<(), SysError>;
+    /// 暗黙のマウントのルール対象（`open_rule_path` が返した fd。開き直さない）を観測する。
+    fn probe_mount(&self, path: &Self::PathFd) -> Result<MountProbe, SysError>;
 }
 
 /// 実カーネルへの適用（`crate::sys` の安全なラッパーを呼ぶだけ）。
@@ -298,6 +338,56 @@ impl LandlockKernel for RealKernel<'_> {
     fn restrict_self(&self, ruleset: &OwnedFd) -> Result<(), SysError> {
         sys::landlock_restrict_self(ruleset.as_fd())
     }
+
+    fn probe_mount(&self, path: &OwnedFd) -> Result<MountProbe, SysError> {
+        // `..` はマウントのルートから辿るとマウント先の親（親マウント側）になるため、別の fs のマウントの
+        // ルートなら `st_dev` が異なる。イメージ同梱の素のディレクトリなら親と同じ `st_dev` になる。
+        let parent = sys::open_dir_path_nofollow(Some(path.as_fd()), c"..")?;
+        Ok(MountProbe {
+            magic: sys::fs_type(path.as_fd())?,
+            dev: st_dev(path)?,
+            parent_dev: st_dev(&parent)?,
+        })
+    }
+}
+
+/// fd の `st_dev`（`O_PATH` fd への `fstat`。fd は消費しない）。
+fn st_dev(fd: &OwnedFd) -> Result<u64, SysError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let io = |e: std::io::Error| SysError::Os(e.raw_os_error().unwrap_or(sys::EINVAL));
+    let dup = fd.try_clone().map_err(io)?;
+    Ok(std::fs::File::from(dup).metadata().map_err(io)?.dev())
+}
+
+/// 暗黙のマウントの実在の判定（純粋関数。#1672 事後監査 P2・CORE-5・SEC-1）。
+///
+/// `ImplicitDevMounts::All` 等の ruleset は fork 前に親で作るため、子で実際に `/dev`・`/dev/pts`・`/dev/shm` が
+/// 載ったことの証跡とは結びつかない。適用の時点で、ルール対象が期待する fs（`/dev`・`/dev/shm` は tmpfs、
+/// `/dev/pts` は devpts）で、かつ親と別の fs のマウントのルート（`st_dev` が `..` と異なる）であることを確かめ、
+/// 満たさなければ拒否する（fail-closed）。これにより、マウントを載せる前に Landlock だけを配線しても、
+/// イメージ同梱の `dev` ディレクトリ（ホスト側 rootfs の実ディレクトリ）へ `WRITE`・`IOCTL_DEV`・`EXECUTE` を
+/// 付けない。
+fn check_implicit_mount(
+    index: usize,
+    mount: ImplicitDevMount,
+    probe: MountProbe,
+) -> Result<(), LandlockApplyError> {
+    let expected = match mount {
+        ImplicitDevMount::Dev | ImplicitDevMount::DevShm => sys::TMPFS_MAGIC,
+        ImplicitDevMount::DevPts => sys::DEVPTS_MAGIC,
+    };
+    if probe.magic == expected && probe.dev != probe.parent_dev {
+        return Ok(());
+    }
+    Err(LandlockApplyError::new(
+        ErrorCode::FailedPrecondition,
+        LandlockApplyErrorKind::ImplicitMountMismatch { index, mount },
+        &format!(
+            "implicit mount {} is not a separate {} mount at apply time",
+            mount.destination(),
+            mount.fs_type()
+        ),
+    ))
 }
 
 /// 生成済みの ruleset を呼び出しスレッドへ適用する（CORE-5・TASK-39.3・#183。不可逆）。
@@ -376,25 +466,62 @@ fn apply_with<K: LandlockKernel>(
         rules_added: 0,
         file_rules: 0,
         skipped_empty: 0,
+        implicit_mounts_verified: 0,
     };
     for (index, rule) in ruleset.rules().iter().enumerate() {
-        let (fd, kind) = kernel.open_rule_path(&rule.path).map_err(|e| match e {
-            OpenError::Symlink => LandlockApplyError::new(
-                ErrorCode::FailedPrecondition,
-                Kind::SymlinkRejected { index },
-                "rule path resolves to a symlink",
-            ),
-            OpenError::Invalid => LandlockApplyError::new(
-                ErrorCode::Internal,
-                Kind::Internal,
-                "rule path could not be opened safely",
-            ),
-            OpenError::Sys(s) => LandlockApplyError::from_sys(
-                s,
-                |errno| Kind::OpenPathFailed { index, errno },
-                "failed to open rule path",
-            ),
-        })?;
+        let implicit = match rule.origin {
+            RuleOrigin::Implicit { mount } => Some(mount),
+            _ => None,
+        };
+        let (fd, kind) = kernel
+            .open_rule_path(&rule.path)
+            .map_err(|e| match (e, implicit) {
+                // 暗黙のマウントが無いのは設定・起動順の問題で、内部エラーにしない（`--ipc=host` 等。#1672 事後監査 P2）。
+                (OpenError::Sys(SysError::Os(errno)), Some(mount)) if errno == sys::ENOENT => {
+                    LandlockApplyError::new(
+                        ErrorCode::FailedPrecondition,
+                        Kind::ImplicitMountMissing { index, mount },
+                        &format!(
+                            "implicit mount {} is missing; it must be mounted before Landlock \
+                         (use ImplicitDevMounts::WithoutShm when /dev/shm is not mounted)",
+                            mount.destination()
+                        ),
+                    )
+                }
+                (OpenError::Symlink, _) => LandlockApplyError::new(
+                    ErrorCode::FailedPrecondition,
+                    Kind::SymlinkRejected { index },
+                    "rule path resolves to a symlink",
+                ),
+                (OpenError::Invalid, _) => LandlockApplyError::new(
+                    ErrorCode::Internal,
+                    Kind::Internal,
+                    "rule path could not be opened safely",
+                ),
+                (OpenError::Sys(s), _) => LandlockApplyError::from_sys(
+                    s,
+                    |errno| Kind::OpenPathFailed { index, errno },
+                    "failed to open rule path",
+                ),
+            })?;
+        if let Some(mount) = implicit {
+            if kind != PathKind::Dir {
+                return Err(LandlockApplyError::new(
+                    ErrorCode::FailedPrecondition,
+                    Kind::ImplicitMountMismatch { index, mount },
+                    &format!("implicit mount {} is not a directory", mount.destination()),
+                ));
+            }
+            let probe = kernel.probe_mount(&fd).map_err(|e| {
+                LandlockApplyError::from_sys(
+                    e,
+                    |errno| Kind::OpenPathFailed { index, errno },
+                    "failed to inspect implicit mount",
+                )
+            })?;
+            check_implicit_mount(index, mount, probe)?;
+            report.implicit_mounts_verified += 1;
+        }
         let allowed = effective_allowed(rule, kind);
         if kind == PathKind::File {
             report.file_rules += 1;
@@ -543,7 +670,23 @@ mod tests {
         open: Vec<Result<PathKind, OpenError>>,
         add: Result<(), SysError>,
         restrict: Result<(), SysError>,
+        /// `probe_mount` の応答を呼び出し順に返す（尽きたら tmpfs の独立したマウントのルート）。
+        probes: RefCell<Vec<Result<MountProbe, SysError>>>,
     }
+
+    /// 期待どおりの tmpfs の独立したマウントのルート。
+    const TMPFS_ROOT: MountProbe = MountProbe {
+        magic: sys::TMPFS_MAGIC,
+        dev: 0x2a,
+        parent_dev: 0x801,
+    };
+
+    /// 期待どおりの devpts の独立したマウントのルート。
+    const DEVPTS_ROOT: MountProbe = MountProbe {
+        magic: sys::DEVPTS_MAGIC,
+        dev: 0x2b,
+        parent_dev: 0x2a,
+    };
 
     impl Fake {
         fn ok(n_paths: usize) -> Self {
@@ -555,6 +698,7 @@ mod tests {
                 open: vec![Ok(PathKind::Dir); n_paths],
                 add: Ok(()),
                 restrict: Ok(()),
+                probes: RefCell::new(Vec::new()),
             }
         }
         fn log(&self, s: impl Into<String>) {
@@ -599,6 +743,32 @@ mod tests {
             self.log("restrict");
             self.restrict
         }
+        fn probe_mount(&self, path: &usize) -> Result<MountProbe, SysError> {
+            self.log(format!("probe:{path}"));
+            let mut p = self.probes.borrow_mut();
+            if p.is_empty() {
+                Ok(TMPFS_ROOT)
+            } else {
+                p.remove(0)
+            }
+        }
+    }
+
+    /// root と暗黙のマウント（`mounts` の順）からなる ruleset。権利は実マウントから導いた値を使う。
+    fn implicit_rs(mounts: &[ImplicitDevMount]) -> LandlockRuleset {
+        let mut rules = vec![PathRule {
+            path: RulePath::Root,
+            allowed: AccessFs::READ,
+            origin: RuleOrigin::Root,
+        }];
+        for &mount in mounts {
+            rules.push(PathRule {
+                path: RulePath::ImplicitDev(mount),
+                allowed: AccessFs::READ.union(AccessFs::WRITE),
+                origin: RuleOrigin::Implicit { mount },
+            });
+        }
+        LandlockRuleset::for_observation(6, rules)
     }
 
     /// 実体の解決は偽カーネルが決めるため、パスはすべて `RulePath::Root` で足りる（権利だけを変える）。
@@ -807,6 +977,219 @@ mod tests {
             }
         );
         assert_eq!(e.code, ErrorCode::Internal);
+    }
+
+    /// CORE-5・SEC-1（#1672 事後監査 P2）: 暗黙のマウントは、開いた fd が期待する fs（`/dev`・`/dev/shm` は tmpfs、
+    /// `/dev/pts` は devpts）の独立したマウントのルートであることを、ルールを足す前に確かめる。
+    #[test]
+    fn core5_sec1_apply_verifies_implicit_mounts_before_adding_rules() {
+        let mut k = Fake::ok(4);
+        k.probes = RefCell::new(vec![
+            Ok(TMPFS_ROOT),
+            Ok(DEVPTS_ROOT),
+            Ok(MountProbe {
+                magic: sys::TMPFS_MAGIC,
+                dev: 0x2c,
+                parent_dev: 0x2a,
+            }),
+        ]);
+        let r = apply_with(&k, &implicit_rs(&ImplicitDevMount::ALL)).expect("applied");
+        assert_eq!(
+            (r.rules_added, r.implicit_mounts_verified, r.skipped_empty),
+            (4, 3, 0)
+        );
+        assert_eq!(
+            k.calls(),
+            vec![
+                "nnp".to_string(),
+                "threads".into(),
+                "create:0xffff".into(),
+                "open:/".into(),
+                "add:0:0xd".into(),
+                "open:/dev".into(),
+                "probe:1".into(),
+                "add:1:0x77bf".into(),
+                "open:/dev/pts".into(),
+                "probe:2".into(),
+                "add:2:0x77bf".into(),
+                "open:/dev/shm".into(),
+                "probe:3".into(),
+                "add:3:0x77bf".into(),
+                "restrict".into(),
+                "threads".into(),
+            ]
+        );
+        // root と `mounts[]` 由来のルールは観測しない（従来どおり）。
+        let k = Fake::ok(2);
+        let r = apply_with(&k, &rs(&[AccessFs::READ, AccessFs::READ])).expect("applied");
+        assert_eq!(r.implicit_mounts_verified, 0);
+        assert!(!k.calls().iter().any(|c| c.starts_with("probe")));
+    }
+
+    /// CORE-5・SEC-1（#1672 事後監査 P2）: 暗黙のマウントが別の fs・親と同じ fs（素のディレクトリ）・
+    /// 非ディレクトリなら、ルールを足さず `FailedPrecondition` の `landlock_implicit_mount_mismatch` で拒否する。
+    #[test]
+    fn core5_sec1_apply_rejects_implicit_mount_that_is_not_mounted() {
+        let ext4 = 0xEF53;
+        let cases = [
+            (
+                ImplicitDevMount::Dev,
+                Ok(PathKind::Dir),
+                MountProbe {
+                    magic: ext4,
+                    dev: 0x801,
+                    parent_dev: 0x801,
+                },
+                "implicit mount /dev is not a separate tmpfs mount at apply time",
+            ),
+            (
+                // rootfs 自体が tmpfs でも、親と同じ `st_dev` の素のディレクトリは通さない。
+                ImplicitDevMount::Dev,
+                Ok(PathKind::Dir),
+                MountProbe {
+                    magic: sys::TMPFS_MAGIC,
+                    dev: 0x2a,
+                    parent_dev: 0x2a,
+                },
+                "implicit mount /dev is not a separate tmpfs mount at apply time",
+            ),
+            (
+                ImplicitDevMount::DevPts,
+                Ok(PathKind::Dir),
+                MountProbe {
+                    magic: sys::TMPFS_MAGIC,
+                    dev: 0x2b,
+                    parent_dev: 0x2a,
+                },
+                "implicit mount /dev/pts is not a separate devpts mount at apply time",
+            ),
+            (
+                ImplicitDevMount::DevShm,
+                Ok(PathKind::File),
+                TMPFS_ROOT,
+                "implicit mount /dev/shm is not a directory",
+            ),
+        ];
+        for (mount, kind, probe, message) in cases {
+            let mut k = Fake::ok(2);
+            k.open = vec![Ok(PathKind::Dir), kind];
+            k.probes = RefCell::new(vec![Ok(probe)]);
+            let e = apply_with(&k, &implicit_rs(&[mount])).expect_err("not mounted");
+            assert_eq!(e.code, ErrorCode::FailedPrecondition, "{mount:?}");
+            assert_eq!(
+                e.kind,
+                LandlockApplyErrorKind::ImplicitMountMismatch { index: 1, mount }
+            );
+            assert_eq!(e.kind.as_str(), "landlock_implicit_mount_mismatch");
+            assert_eq!(e.message, message);
+            let calls = k.calls();
+            assert!(!calls.contains(&"add:1:0x77bf".to_string()), "{calls:?}");
+            assert!(!calls.contains(&"restrict".to_string()), "{calls:?}");
+        }
+        // 観測自体の失敗は errno を保って拒否する。
+        let k = Fake::ok(2);
+        k.probes.borrow_mut().push(Err(SysError::Os(sys::EACCES)));
+        let e = apply_with(&k, &implicit_rs(&[ImplicitDevMount::Dev])).expect_err("probe");
+        assert_eq!(e.code, ErrorCode::PermissionDenied);
+        assert_eq!(
+            e.kind,
+            LandlockApplyErrorKind::OpenPathFailed {
+                index: 1,
+                errno: sys::EACCES
+            }
+        );
+    }
+
+    /// SUP-12・CORE-5（#1672 事後監査 P2）: 暗黙のマウントのパスが無い（`--ipc=host` で `/dev/shm` を載せない
+    /// 構成に `All` を使った等）ときは `Internal` ではなく、原因の分かる `FailedPrecondition` の
+    /// `landlock_implicit_mount_missing` で拒否する。`mounts[]` 由来のパスの不在は従来どおり `Internal`。
+    #[test]
+    fn sup12_core5_apply_reports_missing_implicit_mount_as_failed_precondition() {
+        let mut k = Fake::ok(4);
+        k.open = vec![
+            Ok(PathKind::Dir),
+            Ok(PathKind::Dir),
+            Ok(PathKind::Dir),
+            Err(OpenError::Sys(SysError::Os(sys::ENOENT))),
+        ];
+        k.probes = RefCell::new(vec![Ok(TMPFS_ROOT), Ok(DEVPTS_ROOT)]);
+        let e = apply_with(&k, &implicit_rs(&ImplicitDevMount::ALL)).expect_err("no /dev/shm");
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.kind,
+            LandlockApplyErrorKind::ImplicitMountMissing {
+                index: 3,
+                mount: ImplicitDevMount::DevShm
+            }
+        );
+        assert_eq!(e.kind.as_str(), "landlock_implicit_mount_missing");
+        assert_eq!(
+            e.message,
+            "implicit mount /dev/shm is missing; it must be mounted before Landlock \
+             (use ImplicitDevMounts::WithoutShm when /dev/shm is not mounted)"
+        );
+        assert!(!k.calls().contains(&"restrict".to_string()));
+        // `WithoutShm` の ruleset なら `/dev/shm` を開かない。
+        let mut k = Fake::ok(3);
+        k.probes = RefCell::new(vec![Ok(TMPFS_ROOT), Ok(DEVPTS_ROOT)]);
+        let r = apply_with(
+            &k,
+            &implicit_rs(crate::dev_mounts::ImplicitDevMounts::WithoutShm.entries()),
+        )
+        .expect("applied");
+        assert_eq!(r.implicit_mounts_verified, 2);
+        assert!(!k.calls().contains(&"open:/dev/shm".to_string()));
+        // 暗黙のマウントでも ENOENT 以外の errno は従来どおり写す。
+        let mut k = Fake::ok(2);
+        k.open = vec![
+            Ok(PathKind::Dir),
+            Err(OpenError::Sys(SysError::Os(sys::EACCES))),
+        ];
+        let e = apply_with(&k, &implicit_rs(&[ImplicitDevMount::Dev])).expect_err("eacces");
+        assert_eq!(e.code, ErrorCode::PermissionDenied);
+        assert_eq!(
+            e.kind,
+            LandlockApplyErrorKind::OpenPathFailed {
+                index: 1,
+                errno: sys::EACCES
+            }
+        );
+    }
+
+    /// CORE-5・SEC-1（#1672 事後監査 P2）: 実カーネルの観測で、マウントでない素のディレクトリは `st_dev` が
+    /// `..` と同じになり、暗黙のマウントとして通らない（イメージ同梱の `dev` に権利を付けない）。
+    #[test]
+    fn core5_sec1_real_probe_rejects_plain_directory() {
+        let base = std::env::temp_dir().join(format!(
+            "fandhe-landlock-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(base.join("dev")).expect("tree");
+        let root_fd = OwnedFd::from(std::fs::File::open(&base).expect("open root"));
+        let mut threads = ThreadCountSource::ProcSelf;
+        let kernel = RealKernel {
+            threads: std::cell::RefCell::new(&mut threads),
+            root: Some(root_fd.as_fd()),
+        };
+        let (fd, kind) = kernel
+            .open_rule_path(&RulePath::ImplicitDev(ImplicitDevMount::Dev))
+            .expect("open dev");
+        assert_eq!(kind, PathKind::Dir);
+        let probe = kernel.probe_mount(&fd).expect("probe");
+        assert_eq!(probe.dev, probe.parent_dev);
+        assert_eq!(probe.magic, sys::fs_type(root_fd.as_fd()).expect("statfs"));
+        let e = check_implicit_mount(1, ImplicitDevMount::Dev, probe).expect_err("plain dir");
+        assert_eq!(
+            e.kind,
+            LandlockApplyErrorKind::ImplicitMountMismatch {
+                index: 1,
+                mount: ImplicitDevMount::Dev
+            }
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// CORE-5・TASK-39.3: add / restrict / create の errno がコードへ写る。

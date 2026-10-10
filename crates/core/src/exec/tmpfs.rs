@@ -4,16 +4,21 @@
 //!
 //! supervisor の `container_options` が解析した [`TmpfsMountSet`] を、`crate::exec` の最小実行フローの
 //! 「[`prepare_rootfs`](super::prepare_rootfs) の後・[`pivot_root`](super::pivot_root) の前」で実マウントする。
-//! `/dev/shm` を含む場合は [`create_default_devices`](super::create_default_devices) の後に呼ぶ。
-//! `create_default_devices` が rootfs の `dev` に専用の tmpfs を載せる（#1653）ため、先に `/dev/shm` を載せると
-//! `dev` の tmpfs に覆い隠される。
+//! `/dev/shm` を含む場合は [`create_default_devices`](super::create_default_devices) の後に呼び、その結果
+//! （[`DeviceReport`]）を渡す。`create_default_devices` が rootfs の `dev` に専用の tmpfs を載せる（#1653）ため、
+//! 先に `/dev/shm` を載せると `dev` の tmpfs に覆い隠される。この順序は `check_dev_order` が証跡で強制する
+//! （#1669 事後監査 P2）。
 //!
 //! ```text
-//! prepare_rootfs -> create_default_devices（dev に tmpfs → ノード → symlink → pts に devpts → ptmx） -> mount_tmpfs(&isolation, &prepared, &set) -> pivot_root
+//! prepare_rootfs -> create_default_devices（dev に tmpfs → ノード → symlink → pts に devpts → ptmx）-> DeviceReport
+//!   -> mount_tmpfs(&isolation, &prepared, Some(&report), &set) -> pivot_root
 //! ```
 //!
 //! # 契約
 //!
+//! - **`/dev` 配下の順序の証跡**: `/dev` 配下の宛先（既定の `/dev/shm` 等）を含む集合は、同じ rootfs に対する
+//!   `create_default_devices` の結果を要求し、rootfs の `dev` が今もその tmpfs のルート（`st_dev`・`st_ino`）である
+//!   ことを確かめてから何かを作る。証跡なし・別の rootfs の結果・`dev` の差し替えは `FailedPrecondition` で拒否する
 //! - **既定の `/dev/shm`**: `--shm-size` 未指定時の既定 64 MiB は集合側（`TmpfsMountSet::ensure_default_dev_shm`・
 //!   #1654）が足す。本段は既定の件と利用者指定の件を区別せず、同じ検証・後始末を通す
 //! - **fd 起点**: [`PreparedRootfs`] の新しい mount top の fd から、正規化済みのマウント先を 1 要素ずつ
@@ -62,9 +67,10 @@ use crate::sys::{self, SysError};
 use crate::tmpfs::{TmpfsMountSet, TmpfsMountSpec};
 use crate::traits::types::ErrorCode;
 
+use super::devices::DevMountIdentity;
 use super::{
-    ExecError, IsolationStage, MountIsolation, PreparedRootfs, ViolationReason, ViolationSubject,
-    fd_still_at, mount_is_shared, open_error,
+    DeviceReport, ExecError, IsolationStage, MountIsolation, PreparedRootfs, ViolationReason,
+    ViolationSubject, fd_still_at, mount_is_shared, open_error,
 };
 
 /// 結合試験専用の入口 [`mount_tmpfs_with_attach_hook`] が、検査後・付け替え前に呼ぶ処理の型。
@@ -100,13 +106,17 @@ pub struct TmpfsReport {
 /// `set` の tmpfs を rootfs（`prepared` の新しい mount top）配下へ指定順にマウントする。
 ///
 /// [`MountIsolation`] の証跡が現在の状態と一致しなければ副作用なしに拒否する（fail-closed）。
+/// `devices` は同じ rootfs に対する [`create_default_devices`](super::create_default_devices) の結果で、
+/// `set` に `/dev` 配下の宛先（既定の `/dev/shm` 等）があるときは必須になる（`check_dev_order`）。
 /// 詳細な契約はモジュール doc を参照。
 pub fn mount_tmpfs(
     isolation: &MountIsolation,
     prepared: &PreparedRootfs,
+    devices: Option<&DeviceReport>,
     set: &TmpfsMountSet,
 ) -> Result<TmpfsReport, ExecError> {
     isolation.verify_caller(STAGE)?;
+    check_dev_order(prepared.new_root(), set, devices)?;
     mount_tmpfs_at(
         prepared.new_root(),
         set,
@@ -124,16 +134,77 @@ pub fn mount_tmpfs(
 pub fn mount_tmpfs_with_attach_hook(
     isolation: &MountIsolation,
     prepared: &PreparedRootfs,
+    devices: Option<&DeviceReport>,
     set: &TmpfsMountSet,
     hook: &dyn Fn(),
 ) -> Result<TmpfsReport, ExecError> {
     isolation.verify_caller(STAGE)?;
+    check_dev_order(prepared.new_root(), set, devices)?;
     mount_tmpfs_at(
         prepared.new_root(),
         set,
         &|dir| mount_is_shared(dir, STAGE),
         hook,
     )
+}
+
+/// 結合試験専用: `check_dev_order` だけを省いて [`mount_tmpfs`] と同じ検査・マウントを行う（#1669 事後監査
+/// P2 の後の `tests/tmpfs_mount.rs` 用）。rootless では [`create_default_devices`](super::create_default_devices) が
+/// `mknod(2)` の `EPERM` で止まる（#1660）ため、素の `dev` ディレクトリの上で既定の `/dev/shm` の実マウント
+/// （フラグ・サイズ・モード）を照合するのに使う。本番の起動順（`create_default_devices` → `mount_tmpfs`）の
+/// 代わりにはならない。`exec-test-support` feature を付けたビルドにだけ存在し、通常の利用者は呼ばない。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn mount_tmpfs_over_bare_dev_for_test(
+    isolation: &MountIsolation,
+    prepared: &PreparedRootfs,
+    set: &TmpfsMountSet,
+) -> Result<TmpfsReport, ExecError> {
+    isolation.verify_caller(STAGE)?;
+    mount_tmpfs_at(
+        prepared.new_root(),
+        set,
+        &|dir| mount_is_shared(dir, STAGE),
+        &|| {},
+    )
+}
+
+/// `/dev` 配下の宛先を載せる順序の検査（#1669 事後監査 P2。SUP-12・CORE-1）。副作用は持たない。
+///
+/// `create_default_devices` は rootfs の `dev` に専用の tmpfs を載せるため、それより先に `/dev/shm` 等を載せると、
+/// ホスト側の rootfs に `dev/shm` を作ってそこへ tmpfs を載せた後で `/dev` の tmpfs に覆い隠され、ホストに空の
+/// ディレクトリが残り、コンテナから `/dev/shm` が消える。これを順序の証跡で防ぐ: `set` に `/dev` 配下の宛先が
+/// あるときは、`devices`（同じ rootfs に対する `create_default_devices` の結果）を要求し、rootfs の `dev` が今も
+/// その呼び出しが載せた tmpfs のルート（[`DeviceReport`] に記録した `st_dev`・`st_ino`）であることを確かめる。
+/// `devices` が無い・別の rootfs の結果・`dev` が差し替えられた／重ねて覆われた場合は `FailedPrecondition` で
+/// 拒否する（fail-closed）。`/dev` 配下の宛先が無い集合では `devices` を見ない。
+pub(super) fn check_dev_order(
+    root: BorrowedFd<'_>,
+    set: &TmpfsMountSet,
+    devices: Option<&DeviceReport>,
+) -> Result<(), ExecError> {
+    let under_dev = set
+        .mounts()
+        .iter()
+        .any(|m| m.destination.as_str().starts_with("/dev/"));
+    if !under_dev {
+        return Ok(());
+    }
+    let order_error = |msg: &str| ExecError::new(ErrorCode::FailedPrecondition, STAGE, msg);
+    let Some(devices) = devices else {
+        return Err(order_error(
+            "tmpfs mounts under /dev require create_default_devices to run first on the same rootfs",
+        ));
+    };
+    let dev = sys::open_dir_path_nofollow(Some(root), c"dev").map_err(|_| {
+        order_error("the rootfs /dev is not the tmpfs mounted by create_default_devices")
+    })?;
+    if DevMountIdentity::of(&dev, STAGE)? != devices.dev_mount {
+        return Err(order_error(
+            "the rootfs /dev is not the tmpfs mounted by create_default_devices",
+        ));
+    }
+    Ok(())
 }
 
 /// [`mount_tmpfs`] の証跡検証後の本体。`root` は rootfs（新しい mount top）の fd、`is_shared` は

@@ -11,8 +11,11 @@
 //! 作成先はホスト上の rootfs ディレクトリの `dev` ではなく、本モジュールが `dev` に載せる専用の tmpfs
 //! （runc 方式。設計ドラフト `docs/design/dev-default-mounts.md` 3.1・オーナー判断 2026-10-10）である。
 //! これによりノードがホスト側の rootfs に残らず、イメージ同梱の `dev` 配下（偽ノード等）は tmpfs に
-//! 覆い隠されてコンテナから見えない。tmpfs の作成は `sys::mount_dev_tmpfs_on`（#1652。mode 0755・
-//! 64 MiB・`nosuid|strictatime`・`nodev`/`noexec` なし）を使う。
+//! 覆い隠されてコンテナから見えない。覆い隠す効果は `dev` 配下に限る（#1667 の事後監査 P2）: rootfs の残りの
+//! 部分にイメージが同梱したデバイスノードは、rootful では rootfs の自己 bind に `nodev` が無く、汎用のデバイス
+//! cgroup も無いため開けてしまう（rootfs の `nodev` 化とデバイス cgroup は別の Issue で追跡する。SEC-1）。
+//! tmpfs の作成は `sys::mount_dev_tmpfs_on`（#1652。mode 0755・64 MiB・`nosuid|strictatime`・`nodev`/`noexec`
+//! なし）を使う。
 //!
 //! あわせて OCI Runtime Spec の default symlink 4 本（`dev/fd` → `/proc/self/fd`、`dev/stdin`・
 //! `dev/stdout`・`dev/stderr` → `/proc/self/fd/{0,1,2}`。#1297）も同じマウントのルート fd 起点で作る。これが
@@ -31,8 +34,9 @@
 //! prepare_rootfs(&isolation, rootfs) -> PreparedRootfs
 //!   -> create_default_devices(&isolation, &prepared) -> DeviceReport   // 本モジュール
 //!        （dev に tmpfs → ノード 6 種 → symlink 4 本 → pts に devpts → ptmx の symlink）
-//!   -> [/dev/shm は `mount_tmpfs` が集合（既定 64 MiB を含む。#1654）から載せる]
-//!   -> mount_tmpfs / inject_files
+//!   -> [/dev/shm は `mount_tmpfs` が集合（既定 64 MiB を含む。#1654）から載せる。`/dev` 配下の宛先には
+//!       `DeviceReport` を順序の証跡として渡す（#1669 事後監査 P2）]
+//!   -> mount_tmpfs(.., Some(&report), ..) / inject_files
 //!   -> pivot_root(&isolation, prepared)
 //! ```
 //!
@@ -218,7 +222,7 @@ const PTMX_LINK: DefaultLink = DefaultLink {
 };
 
 /// devpts の `gid=` に渡す tty グループ（runc の既定と同じ。設計ドラフト `dev-default-mounts.md` 3.3）。
-const DEVPTS_GID: u32 = 5;
+const DEVPTS_GID: u32 = sys::DevptsGid::TTY_GID;
 
 /// devpts の `gid=` を決めるための権限モデルの入力（オーナー判断 2026-10-10 の判断 3。CORE-6・SEC-5）。
 ///
@@ -236,12 +240,18 @@ pub enum DevptsGidSource<'a> {
     Rootless(&'a IdMapSet),
 }
 
-/// devpts の `gid=` の決定（純粋関数）。rootful は `Some(5)`、rootless は gid 5 が写像されていれば
-/// `Some(5)`、されていなければ `None`（`gid=` のキー自体を渡さない）。
-fn devpts_gid(source: DevptsGidSource<'_>) -> Option<u32> {
-    match source {
-        DevptsGidSource::Rootful => Some(DEVPTS_GID),
-        DevptsGidSource::Rootless(gid_map) => gid_map.host_id_of(DEVPTS_GID).map(|_| DEVPTS_GID),
+/// devpts の `gid=` の決定（純粋関数）。rootful は `Tty`（5）、rootless は gid 5 が写像されていれば
+/// `Tty`、されていなければ `Omitted`（`gid=` のキー自体を渡さない）。結果は [`sys::DevptsGid`] の 2 通りに
+/// 限られ、任意の gid を作る経路は無い（#1663 事後監査 P3）。
+fn devpts_gid(source: DevptsGidSource<'_>) -> sys::DevptsGid {
+    let mapped = match source {
+        DevptsGidSource::Rootful => true,
+        DevptsGidSource::Rootless(gid_map) => gid_map.host_id_of(DEVPTS_GID).is_some(),
+    };
+    if mapped {
+        sys::DevptsGid::Tty
+    } else {
+        sys::DevptsGid::Omitted
     }
 }
 
@@ -343,6 +353,34 @@ pub struct DeviceReport {
     pub links: Vec<DeviceLinkOutcome>,
     /// `/dev/pts` の devpts と `/dev/ptmx` の結果（#1656）。
     pub devpts: DevptsOutcome,
+    /// 載せた `/dev` の tmpfs のルートの識別情報。`mount_tmpfs` が `/dev` 配下の宛先（`/dev/shm` 等）を載せる前に、
+    /// rootfs の `dev` が今もこのマウントであることを確かめる証跡に使う（#1669 事後監査 P2。SUP-12・CORE-1）。
+    /// crate の外からは読めず、`DeviceReport` 自体も `non_exhaustive` のため crate の外では作れない。
+    pub(super) dev_mount: DevMountIdentity,
+}
+
+/// マウントのルートを指す fd の識別情報（`st_dev`・`st_ino`）。tmpfs は instance ごとに別の `st_dev` を持つため、
+/// 同じ値の `dev` は同じ tmpfs のルートを指す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DevMountIdentity {
+    pub(super) dev: u64,
+    pub(super) ino: u64,
+}
+
+impl DevMountIdentity {
+    /// `fd` の `fstat` から作る（`O_PATH` fd でも取れる。fd は消費しない）。
+    pub(super) fn of(fd: &OwnedFd, stage: IsolationStage) -> Result<Self, ExecError> {
+        let dup = fd
+            .try_clone()
+            .map_err(|e| ExecError::from_io(&e, stage, "dup"))?;
+        let meta = std::fs::File::from(dup)
+            .metadata()
+            .map_err(|e| ExecError::from_io(&e, stage, "fstat(/dev mount)"))?;
+        Ok(Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
 }
 
 /// rootfs の `dev` に専用の tmpfs を載せ、その上へ基本デバイスノード 6 種・default symlink 4 本・
@@ -415,7 +453,7 @@ fn populate_dev(
     root: BorrowedFd<'_>,
     rootfs: &Path,
     is_shared: &dyn Fn(&OwnedFd) -> Result<bool, ExecError>,
-    gid: Option<u32>,
+    gid: sys::DevptsGid,
     state: &mut DevState,
 ) -> Result<DeviceReport, ExecError> {
     let (opened, created) = open_dev_dir(root, rootfs)?;
@@ -428,31 +466,18 @@ fn populate_dev(
         local = opened;
         &local
     };
-    let subject = rootfs.join("dev");
-    if is_shared(dev)? {
-        return Err(ExecError::from_violation_at(
-            ViolationReason::TargetOnSharedMount,
-            Some(&subject),
-            STAGE,
-        ));
-    }
-    // fd 固定後に別プロセスが `dev`（または祖先）を改名・移動・削除していれば拒否する（`mount_tmpfs` と同じ）。
-    if !fd_still_at(dev, &subject) {
-        return Err(ExecError::from_violation_at(
-            ViolationReason::TargetMoved,
-            Some(&subject),
-            STAGE,
-        ));
-    }
+    // shared propagation でないこと・移動していないことを確かめた fd だけが付け替え先の型になる。
+    let target = target::DevMountTarget::check(dev, &rootfs.join("dev"), is_shared)?;
     // 付け替え直後に自分のマウントの fd を保持する（事後検証に通らなくても後始末が外せる）。
-    let mount_fd = mount_dev_tmpfs_syscall(dev.as_fd(), sys::DevTmpfsCreate::new())
-        .map_err(dev_mount_error)?;
+    let mount_fd =
+        mount_dev_tmpfs_syscall(target, sys::DevTmpfsCreate::new()).map_err(dev_mount_error)?;
     let mount_fd = &*state.mounted.insert(mount_fd);
     // 事後検証専用の開き直し（作成の起点にはしない）。
     let after = sys::open_dir_path_nofollow(Some(root), c"dev")
         .map_err(|e| open_error(e, true, rootfs, &[OsStr::new("dev")]).at_stage(STAGE))?;
     let observed = observe_dev_mount(dev, &after, mount_fd)?;
     check_new_tmpfs(observed, ImplicitDevMount::Dev.destination(), STAGE)?;
+    let dev_mount = DevMountIdentity::of(mount_fd, STAGE)?;
 
     let mount = mount_fd.as_fd();
     let mut nodes = Vec::with_capacity(DEFAULT_DEVICES.len());
@@ -496,7 +521,62 @@ fn populate_dev(
         nodes,
         links,
         devpts,
+        dev_mount,
     })
+}
+
+/// `/dev` 用の nodev なし tmpfs の付け替え先（#1664 事後監査 P2。SEC-1・CORE-1）。
+///
+/// `sys::mount_dev_tmpfs_on` は付け替え先を任意の `BorrowedFd` で受けるため、型で固定しているのは作成
+/// パラメータ（[`sys::DevTmpfsCreate`]）だけで、crate 内の別の箇所から利用者の `--tmpfs` の行き先などへ
+/// nodev なしの tmpfs を載せる誤配線を防げない。そこで本モジュールの呼び出しを、検証を通った `dev` の fd
+/// を表す [`target::DevMountTarget`] でしか渡せないようにする。フィールドは子モジュールに閉じているため、
+/// 本モジュールの他の箇所からもリテラルでは作れず、[`target::DevMountTarget::check`] を通すしかない。
+/// `sys::mount_dev_tmpfs_on` の呼び出しが本モジュールの 1 か所だけであることは、単体テスト
+/// `sec1_core1_dev_tmpfs_mount_has_single_call_site` がソースを走査して機械的に確かめる。
+mod target {
+    use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
+    use std::path::Path;
+
+    use super::{ExecError, STAGE, ViolationReason, fd_still_at};
+
+    /// 検証済みの rootfs 直下の `dev` を指す `O_PATH` fd の借用。
+    pub(super) struct DevMountTarget<'a> {
+        fd: BorrowedFd<'a>,
+    }
+
+    impl<'a> DevMountTarget<'a> {
+        /// `dev`（`open_dev_dir` が rootfs の root fd 起点に `O_PATH|O_NOFOLLOW|O_DIRECTORY` で固定した fd）が
+        /// shared propagation でなく、固定後に改名・移動・削除されていないことを確かめて包む。違反は
+        /// `target_on_shared_mount`・`target_moved` の記録付きで拒否する（`mount_tmpfs` と同じ判定）。
+        pub(super) fn check(
+            dev: &'a OwnedFd,
+            subject: &Path,
+            is_shared: &dyn Fn(&OwnedFd) -> Result<bool, ExecError>,
+        ) -> Result<Self, ExecError> {
+            if is_shared(dev)? {
+                return Err(ExecError::from_violation_at(
+                    ViolationReason::TargetOnSharedMount,
+                    Some(subject),
+                    STAGE,
+                ));
+            }
+            // fd 固定後に別プロセスが `dev`（または祖先）を改名・移動・削除していれば拒否する。
+            if !fd_still_at(dev, subject) {
+                return Err(ExecError::from_violation_at(
+                    ViolationReason::TargetMoved,
+                    Some(subject),
+                    STAGE,
+                ));
+            }
+            Ok(Self { fd: dev.as_fd() })
+        }
+
+        /// 付け替え先の fd。
+        pub(super) fn fd(&self) -> BorrowedFd<'a> {
+            self.fd
+        }
+    }
 }
 
 /// `/dev` の tmpfs のルート fd 起点で `pts` を作り、独立した devpts を載せ、事後検証してから
@@ -507,7 +587,7 @@ fn populate_dev(
 fn mount_pts(
     mount: BorrowedFd<'_>,
     rootfs: &Path,
-    gid: Option<u32>,
+    gid: sys::DevptsGid,
     state: &mut PtsState,
 ) -> Result<DevptsOutcome, ExecError> {
     let names = [OsStr::new("dev"), OsStr::new("pts")];
@@ -553,11 +633,11 @@ fn mount_pts(
     if ptmx_status == DeviceLinkStatus::Created {
         state.ptmx_created = true;
     }
-    if gid.is_none() {
+    if gid == sys::DevptsGid::Omitted {
         emit_devpts_gid_omitted();
     }
     Ok(DevptsOutcome {
-        gid,
+        gid: gid.value(),
         pts_dir: if created {
             DevptsDirStatus::Created
         } else {
@@ -868,19 +948,20 @@ fn mknod_syscall(dir: BorrowedFd<'_>, d: &DefaultDevice) -> Result<(), SysError>
 
 #[cfg(not(test))]
 fn mount_dev_tmpfs_syscall(
-    target_dir: BorrowedFd<'_>,
+    target: target::DevMountTarget<'_>,
     create: sys::DevTmpfsCreate,
 ) -> Result<OwnedFd, SysError> {
-    sys::mount_dev_tmpfs_on(target_dir, create)
+    sys::mount_dev_tmpfs_on(target.fd(), create)
 }
 
 /// dry-run: 新マウント API を呼ばず、(付け替え先の実体・固定パラメータ・返す fd) を記録し、付け替え先の
 /// fd の複製を「自分のマウント」として返す。`MOUNT_SCRIPT` に積んだ失敗を先に返せる。
 #[cfg(test)]
 fn mount_dev_tmpfs_syscall(
-    target_dir: BorrowedFd<'_>,
+    target: target::DevMountTarget<'_>,
     create: sys::DevTmpfsCreate,
 ) -> Result<OwnedFd, SysError> {
+    let target_dir = target.fd();
     let scripted = tests::MOUNT_SCRIPT.with(|s| s.borrow_mut().take());
     if let Some(e) = scripted {
         return Err(e);
@@ -979,7 +1060,7 @@ fn mount_devpts_syscall(
     tests::EVENTS.with(|e| {
         e.borrow_mut().push(tests::Event::MountDevpts {
             target: resolved,
-            gid: create.gid,
+            gid: create.gid.value(),
             attr_bits: create.attr_bits(),
             fd: fd.as_raw_fd(),
         })
@@ -1704,18 +1785,30 @@ mod tests {
             )
             .unwrap()
         };
-        assert_eq!(devpts_gid(DevptsGidSource::Rootful), Some(5));
+        assert_eq!(devpts_gid(DevptsGidSource::Rootful), sys::DevptsGid::Tty);
         // 範囲写像でコンテナ 1..65537 が写る → 5 は写像される。
         let ranged = map(vec![(0, 1000, 1), (1, 100_000, 65_536)]);
-        assert_eq!(devpts_gid(DevptsGidSource::Rootless(&ranged)), Some(5));
+        assert_eq!(
+            devpts_gid(DevptsGidSource::Rootless(&ranged)),
+            sys::DevptsGid::Tty
+        );
         // 単一 ID の写像（コンテナ 0 のみ）→ 5 は写像されない。
         let single = crate::rootless::single_id_mapping(1000).unwrap();
-        assert_eq!(devpts_gid(DevptsGidSource::Rootless(&single)), None);
+        assert_eq!(
+            devpts_gid(DevptsGidSource::Rootless(&single)),
+            sys::DevptsGid::Omitted
+        );
         // 境界: 1..=4 までなら 5 は範囲外、5 だけを別行で写せば範囲内。
         let short = map(vec![(0, 1000, 1), (1, 100_000, 4)]);
-        assert_eq!(devpts_gid(DevptsGidSource::Rootless(&short)), None);
+        assert_eq!(
+            devpts_gid(DevptsGidSource::Rootless(&short)),
+            sys::DevptsGid::Omitted
+        );
         let only5 = map(vec![(0, 1000, 1), (5, 200_005, 1)]);
-        assert_eq!(devpts_gid(DevptsGidSource::Rootless(&only5)), Some(5));
+        assert_eq!(
+            devpts_gid(DevptsGidSource::Rootless(&only5)),
+            sys::DevptsGid::Tty
+        );
     }
 
     /// CORE-1・#1656: `gid=` を省いたときの構造化ログはバイト単位で固定（固定の語彙と数値だけ）。
@@ -1999,5 +2092,134 @@ mod tests {
             );
             take_events();
         }
+    }
+
+    /// SUP-12・CORE-1（#1669 事後監査 P2）: `/dev` 配下の宛先（既定の `/dev/shm`）を載せるには、同じ rootfs に
+    /// 対する `create_default_devices` の結果を要求し、rootfs の `dev` が今もその tmpfs のルートであることを
+    /// 確かめる。証跡なし・差し替え・不在・別の rootfs の結果は、何も作らずに `FailedPrecondition` で拒否する。
+    #[test]
+    fn sup12_core1_dev_shm_requires_device_report_of_same_dev() {
+        use super::super::tmpfs::check_dev_order;
+        use crate::tmpfs::{TmpfsMountSet, TmpfsMountSpec};
+        let missing = "tmpfs mounts under /dev require create_default_devices to run first on the same rootfs";
+        let mismatch = "the rootfs /dev is not the tmpfs mounted by create_default_devices";
+        let expect_rejected = |e: ExecError, message: &str| {
+            assert_eq!(e.code, ErrorCode::FailedPrecondition);
+            assert_eq!(e.stage, IsolationStage::MountTmpfs);
+            assert_eq!(e.message, message);
+            assert!(e.violation.is_none());
+        };
+        let mut shm = TmpfsMountSet::new();
+        shm.ensure_default_dev_shm().expect("default /dev/shm");
+        let mut scratch = TmpfsMountSet::new();
+        scratch
+            .push(TmpfsMountSpec::new("/scratch", None).expect("spec"))
+            .expect("push");
+
+        let t = Tmp::new("order-evidence");
+        let root = open_root(&t.0);
+        // `/dev` 配下の宛先が無い集合は証跡を見ない。
+        check_dev_order(root.as_fd(), &scratch, None).expect("no /dev destination");
+        check_dev_order(root.as_fd(), &TmpfsMountSet::new(), None).expect("empty set");
+        // 証跡なしは何も作らずに拒否する。
+        expect_rejected(
+            check_dev_order(root.as_fd(), &shm, None).expect_err("no evidence"),
+            missing,
+        );
+        assert!(!t.0.join("dev").exists());
+
+        let report = run_at(root.as_fd()).expect("default devices");
+        take_events();
+        check_dev_order(root.as_fd(), &shm, Some(&report)).expect("same /dev");
+
+        // 別の rootfs の結果は通さない。
+        let other = Tmp::new("order-evidence-other");
+        let other_root = open_root(&other.0);
+        let other_report = run_at(other_root.as_fd()).expect("other default devices");
+        take_events();
+        expect_rejected(
+            check_dev_order(root.as_fd(), &shm, Some(&other_report)).expect_err("other rootfs"),
+            mismatch,
+        );
+
+        // `dev` を差し替えたら通さない（逆順の配線・重ね掛けで覆われた場合も同じ判定になる）。
+        std::fs::rename(t.0.join("dev"), t.0.join("dev-old")).unwrap();
+        std::fs::create_dir(t.0.join("dev")).unwrap();
+        expect_rejected(
+            check_dev_order(root.as_fd(), &shm, Some(&report)).expect_err("replaced /dev"),
+            mismatch,
+        );
+        // `dev` が無ければ通さない。
+        std::fs::remove_dir(t.0.join("dev")).unwrap();
+        expect_rejected(
+            check_dev_order(root.as_fd(), &shm, Some(&report)).expect_err("missing /dev"),
+            mismatch,
+        );
+    }
+
+    /// crate の `src` 配下の `.rs` を再帰的に集め、`(src からの相対パス, 内容)` を返す（ソース走査の試験用）。
+    fn crate_sources() -> Vec<(String, String)> {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![src.clone()];
+        let mut out = Vec::new();
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let rel = path
+                        .strip_prefix(&src)
+                        .expect("under src")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.push((rel, std::fs::read_to_string(&path).expect("read source")));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// SEC-1・CORE-1（#1664 事後監査 P2）: nodev なしの tmpfs を載せる `sys::mount_dev_tmpfs_on` の呼び出しは
+    /// 本モジュールの 1 か所（[`target::DevMountTarget`] を受ける `mount_dev_tmpfs_syscall`）だけで、固定パラメータ
+    /// `DevTmpfsCreate::new` も本モジュールと `sys` の単体テストからしか作られない。crate 内の別の箇所から
+    /// 利用者の `--tmpfs` の行き先などへ nodev なしの tmpfs を載せる誤配線を、ソースの走査で機械的に検出する
+    /// （Rust の可視性は兄弟モジュールへの限定を表せないため。plugin の `sys.rs` のソース照合と同じ方式）。
+    #[test]
+    fn sec1_core1_dev_tmpfs_mount_has_single_call_site() {
+        // 走査する語を分割して書き、本試験の行自体が一致しないようにする。
+        let call = concat!("mount_dev_tmpfs", "_on(");
+        let create = concat!("DevTmpfsCreate", "::new()");
+        let mut calls = Vec::new();
+        let mut creates = Vec::new();
+        for (rel, text) in crate_sources() {
+            for line in text.lines() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                if code.contains(call) {
+                    calls.push((rel.clone(), code.to_owned()));
+                }
+                if code.contains(create) && !creates.contains(&rel) {
+                    creates.push(rel.clone());
+                }
+            }
+        }
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "exec/devices.rs".to_owned(),
+                    format!("sys::{call}target.fd(), create)")
+                ),
+                ("sys.rs".to_owned(), format!("pub(crate) fn {call}")),
+            ]
+        );
+        assert_eq!(
+            creates,
+            vec!["exec/devices.rs".to_owned(), "sys.rs".to_owned()]
+        );
     }
 }

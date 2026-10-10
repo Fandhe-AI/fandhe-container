@@ -257,7 +257,7 @@ pub(crate) fn write_nonblocking(fd: &impl AsFd, buf: &[u8]) -> io::Result<usize>
 ///
 /// macOS は socket の `send(MSG_DONTWAIT)` でも満杯のブロッキング socket で戻らないことを CI で観測した
 /// （#1605。xnu の送信経路が `MSG_DONTWAIT` を非ブロッキング指定として扱わないためとみられる）。共有 fd の
-/// 状態（`O_NONBLOCK`・`SO_SNDTIMEO`）を変えずに待たない手段が無く、`/proc/self/fd` の開き直しも無いため捨てる。
+/// 状態（`O_NONBLOCK`・`SO_SNDTIMEO`）を変えずに待たない手段が無いため捨てる。
 #[cfg(not(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")

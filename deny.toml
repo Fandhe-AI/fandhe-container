@@ -1,7 +1,9 @@
 # cargo-deny 設定。`make deny` が本ファイルと Cargo.toml の両方が存在する時点で
 # 自動有効化され、`cargo deny --locked check advisories bans licenses sources` として
-# 実行される（実装未着手のため現時点では Makefile 側の HAS_CARGO / HAS_MEMBERS 判定で
-# スキップされる。workspace とメンバー crate の作成後に有効化）。
+# 実行される。Makefile 側の HAS_CARGO / HAS_DENY / HAS_MEMBERS 判定は、必要なファイルや
+# メンバー crate が欠けた場合のみ skip する仕様。workspace とメンバー crate が揃った現在は
+# 有効化済みで skip されない（TASK-90.1・#126 で確認。OSS-4・OSS-5・REPAIR-9）。
+# 出力に `skip:` が出た場合は異常であり、合格の根拠にしない。
 # 依存方針（.claude/rules/dependency-policy.md）: 依存最小・`=x.y.z` 完全固定・
 # 追加はユーザー承認制。Fandhe-AI/rust-ai-library の deny.toml と同一方針。
 
@@ -30,6 +32,8 @@ include-dev = true
 # 依存もこれと互換な permissive ライセンスのみ許可する。allow には互換 permissive の代表集合（rust-ai-library の
 # Cargo.lock 全域実測で出現した SPDX 識別子集合と同一）を事前許可しておき、推移的依存が
 # BSD/ISC 等の一般的な permissive を持つだけで make deny が不要に失敗しないようにする。
+# 現在の依存に出現しない識別子は `license-not-encountered` 警告になるが、事前許可による
+# 想定内の警告であり fail 対象ではない。
 # ここに無い識別子の追加は依存追加のユーザー承認
 # （dependency-policy.md）とセットで行い、コピーレフト（GPL/LGPL/MPL 等）は列挙しない
 # ことで fail-closed に検出する。

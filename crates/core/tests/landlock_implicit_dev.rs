@@ -4,21 +4,23 @@
 //! 読み取り専用の root（`root.readonly=true`）・`mounts[]` が空の config でも、Landlock 適用後に
 //! `/dev/null` への書き込みと `/dev/shm` でのファイル・ディレクトリ作成が通り、`/dev/ptmx` を `O_NOCTTY` で
 //! 開け、許可外のパス（`/etc`・`/`）への作成は従来どおり `EACCES` で拒否されることを errno で照合する。
-//! rootful では `CAP_MKNOD` があり `/dev` の tmpfs に `nodev` が無いため、`/dev`・`/dev/shm` での文字デバイスの
-//! 作成（`mknodat(2)`）を止めるのは Landlock の `MAKE_CHAR` 不許可だけで、それが `EACCES` になることも通しで
-//! 照合する（#1672 事後監査 P2）。拒否 4 件に対する監査レコード 4 件とパス一致も照合する（SEC-4）。
+//! `/dev`・`/dev/shm` での文字デバイスの作成（`mknodat(2)`）は `EACCES` で拒否される。Linux の `do_mknodat()` は
+//! `security_path_mknod()`（Landlock の `MAKE_CHAR` 検査）を `vfs_mknod()` の `CAP_MKNOD` 検査（`EPERM`）より先に呼ぶため、
+//! `CAP_MKNOD` を持つ rootful でも持たない rootless（非特権 user namespace）でも同じ `EACCES` になる。`EPERM` でないことが
+//! 拒否の主体が Landlock であることの判別で、期待値は両経路で共有する。拒否 4 件に対する監査レコード 4 件とパス一致も照合する（SEC-4）。
 //!
 //! # 流れ
-//! - 親（root 必須）: `proc/`・`etc/` のみの一時 rootfs を作り、rootful 分離 → 自身を `--child <rootfs>` で
+//! - 親: `proc/`・`etc/` のみの一時 rootfs を作り、root なら rootful 分離（`plan_rootful_host_root`）、非 root なら
+//!   User namespace を足した分離（`plan`）→ 自身を `--child <rootfs> --rootful|--rootless --egid <n>` で
 //!   起動（新しい PID namespace の PID 1）→ タイムアウト付きで終了コード 0 を待つ（REPAIR-5）
-//! - 子: `establish` → `prepare_rootfs` → `create_default_devices` → 既定の `/dev/shm`
+//! - 子: `establish` → `prepare_rootfs` → `create_default_devices`（rootful は mknod、rootless はホストのノードの bind。#1660）→ 既定の `/dev/shm`
 //!   （`TmpfsMountSet::ensure_default_dev_shm` → `mount_tmpfs`）→ `pivot_root` → `observe_landlock_path_access`
 //!
 //! # 実機前提テストとしての分離
-//! root・Linux 6.12+（Landlock ABI 6+）が必要で、GitHub ホステッド runner では保証できないため
-//! `-- --ignored` 指定時のみ実行する（ci.md「実機前提テスト」・AGENTS.md）。非 root は本試験が rootful 専用
-//! （`mknod` の拒否の照合が前提）のため、検証せずに成功せず失敗として扱う（rootless の基本デバイスは #1660 で
-//! bind 供給になったが、本試験を rootless で通す形への追従は別 Issue）。root 権限コマンドのため実行は明示指示のもとで行い、結果を PR に記録する。
+//! root もしくは非特権 user namespace を許すホスト（AppArmor の `kernel.apparmor_restrict_unprivileged_userns=1` 等が無い環境）と
+//! Linux 6.12+（Landlock ABI 6+）が必要で、GitHub ホステッド runner では保証できないため
+//! `-- --ignored` 指定時のみ実行する（ci.md「実機前提テスト」・AGENTS.md）。非 root で user namespace を拒否された場合も
+//! 検証せずに成功せず失敗として扱う。root 権限コマンドのため root での実行は明示指示のもとで行い、結果を PR に記録する。
 //! pty の ioctl（`IOCTL_DEV`）の実機照合は安全なラッパーが無く本試験の範囲外で、ルールのビット照合は
 //! `landlock::rules` の単体テストが担う。
 //!
@@ -64,11 +66,12 @@ mod linux {
     use fandhe_container_core::audit_log::AuditLayer;
     use fandhe_container_core::exec::{
         DevptsGidSource, IsolationConfig, LandlockAccessKind as K, LandlockAccessProbe,
-        MountIsolation, Namespace, NamespaceSet, create_default_devices, isolate_rootful_host_root,
-        mount_tmpfs, observe_landlock_path_access, pivot_root, plan_rootful_host_root,
-        prepare_rootfs,
+        MountIsolation, Namespace, NamespaceSet, create_default_devices, isolate,
+        isolate_rootful_host_root, mount_tmpfs, observe_landlock_path_access, pivot_root, plan,
+        plan_rootful_host_root, prepare_rootfs,
     };
     use fandhe_container_core::oci_runtime::parse_config_bytes;
+    use fandhe_container_core::rootless::single_id_mapping;
     use fandhe_container_core::tmpfs::TmpfsMountSet;
 
     /// Linux の `EACCES`（x86_64・aarch64 共通で 13）。
@@ -84,6 +87,17 @@ mod linux {
             == Some("0")
     }
 
+    /// 親（user namespace に入る前）の実効 gid。user namespace の中では 0 に見えるため、親が子へ渡す。
+    fn egid() -> u32 {
+        std::fs::read_to_string("/proc/self/status")
+            .expect("read status")
+            .lines()
+            .find(|l| l.starts_with("Gid:"))
+            .and_then(|l| l.split_whitespace().nth(2).map(str::to_string))
+            .and_then(|v| v.parse().ok())
+            .expect("parse egid")
+    }
+
     fn timeout() -> Duration {
         let secs = std::env::var("FANDHE_CONTAINER_TEST_TIMEOUT_SECS")
             .ok()
@@ -96,9 +110,18 @@ mod linux {
     pub fn run() {
         let args: Vec<String> = std::env::args().collect();
         match args.iter().position(|a| a == "--child") {
-            Some(i) => child(Path::new(
-                args.get(i + 1).expect("rootfs path after --child"),
-            )),
+            Some(i) => {
+                let rootfs = args.get(i + 1).expect("rootfs path after --child");
+                // user namespace 内では写像後の euid が 0 になり is_root() で判別できないため、
+                // 親が決めた rootful / rootless を引数で受け取る。
+                let rootful = args.iter().any(|a| a == "--rootful");
+                let egid = args
+                    .iter()
+                    .position(|a| a == "--egid")
+                    .and_then(|j| args.get(j + 1))
+                    .and_then(|v| v.parse::<u32>().ok());
+                child(Path::new(rootfs), rootful, egid);
+            }
             None => parent(),
         }
     }
@@ -124,34 +147,45 @@ mod linux {
     }
 
     fn parent() {
-        assert!(
-            is_root(),
-            "landlock_implicit_dev is rootful only: run as root (rootless is not covered: the mknod denial checks need CAP_MKNOD, see #1660)"
-        );
         let rootfs = make_rootfs();
+        let root = is_root();
+        // user namespace に入る前にホスト側の実効 gid を控える（入った後は写像後の 0 に見える）。
+        let host_egid = egid();
+        // euid 0 での自 ID 写像は SEC-5 で拒否されるため、root では User を除く rootful 構成にする。
+        let mut namespaces = NamespaceSet::empty()
+            .with(Namespace::Pid)
+            .with(Namespace::Mount)
+            .with(Namespace::Uts)
+            .with(Namespace::Ipc);
+        if !root {
+            namespaces = namespaces.with(Namespace::User);
+        }
         let config = IsolationConfig {
-            namespaces: NamespaceSet::empty()
-                .with(Namespace::Pid)
-                .with(Namespace::Mount)
-                .with(Namespace::Uts)
-                .with(Namespace::Ipc),
+            namespaces,
             hostname: None,
         };
-        plan_rootful_host_root(&config)
-            .and_then(|p| isolate_rootful_host_root(&p))
-            .unwrap_or_else(|e| panic!("isolate failed: {e}"));
-        run_child(&rootfs.0);
+        // 非 root で user namespace を拒否されるホストでも skip・成功扱いにせず失敗にする（fail-closed）。
+        if root {
+            plan_rootful_host_root(&config).and_then(|p| isolate_rootful_host_root(&p))
+        } else {
+            plan(&config).and_then(|p| isolate(&p))
+        }
+        .unwrap_or_else(|e| panic!("isolate failed: {e}"));
+        run_child(&rootfs.0, root, host_egid);
         println!(
-            "landlock_implicit_dev: /dev/null write, /dev/shm create, /dev/ptmx open allowed; mknod and outside write denied (root=true)"
+            "landlock_implicit_dev: /dev/null write, /dev/shm create, /dev/ptmx open allowed; mknod and outside write denied (root={root})"
         );
     }
 
     /// 自身を `--child <rootfs>` で起動する。分離後の最初の子なので新しい PID namespace の PID 1 になる。
-    fn run_child(rootfs: &Path) {
+    fn run_child(rootfs: &Path, rootful: bool, host_egid: u32) {
         let exe = std::env::current_exe().expect("current_exe");
         let mut child = Command::new(exe)
             .arg("--child")
             .arg(rootfs)
+            .arg(if rootful { "--rootful" } else { "--rootless" })
+            .arg("--egid")
+            .arg(host_egid.to_string())
             .stdin(Stdio::null())
             .spawn()
             .expect("spawn child");
@@ -199,7 +233,7 @@ mod linux {
         }
     }
 
-    fn child(rootfs: &Path) {
+    fn child(rootfs: &Path, rootful: bool, egid: Option<u32>) {
         assert_eq!(
             std::process::id(),
             1,
@@ -207,8 +241,17 @@ mod linux {
         );
         let isolation = MountIsolation::establish().expect("establish mount isolation");
         let prepared = prepare_rootfs(&isolation, rootfs).expect("prepare rootfs");
-        let devices = create_default_devices(&isolation, &prepared, DevptsGidSource::Rootful)
-            .expect("create default devices");
+        // rootful は mknod で、rootless は単一 ID 写像（自 gid → コンテナ内 0）の下でホストのノードを bind で供給する。
+        let gid_map;
+        let source = if rootful {
+            DevptsGidSource::Rootful
+        } else {
+            gid_map = single_id_mapping(egid.expect("--egid for rootless child"))
+                .expect("single id mapping");
+            DevptsGidSource::Rootless(&gid_map)
+        };
+        let devices =
+            create_default_devices(&isolation, &prepared, source).expect("create default devices");
         // 本番の順序: create_default_devices の後に既定の `/dev/shm`（#1654）。
         let mut tmpfs = TmpfsMountSet::new();
         tmpfs

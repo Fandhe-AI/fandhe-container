@@ -420,6 +420,11 @@ impl CtrlAdapter {
         }
     }
 
+    /// resource の大きさ（`session` が実メモリの副表を資源表と突き合わせる）。無ければ `None`。
+    pub(crate) fn resource_size(&self, res_id: u32) -> Option<u64> {
+        self.resources.size_of(res_id)
+    }
+
     /// map 中の offset（試験用の参照）。
     #[cfg(test)]
     pub(crate) fn mapped_offset(&self, res_id: u32) -> Option<u64> {

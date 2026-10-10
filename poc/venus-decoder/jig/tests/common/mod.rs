@@ -79,6 +79,7 @@ pub fn recv_reply(f: &UnixStream, expected: RequestCode) -> Reply {
     decode_reply(&msg, expected).expect("decode reply")
 }
 
+#[allow(dead_code)]
 pub fn cfg_req(offset: u32, size: usize) -> Request {
     Request::GetConfig(
         ConfigPayload::new(RequestCode::GetConfig, offset, 0, &vec![0u8; size]).expect("cfg"),
@@ -86,6 +87,7 @@ pub fn cfg_req(offset: u32, size: usize) -> Request {
 }
 
 /// `SET_FEATURES` まで済ませる（広告値・protocol feature・queue 数・config も具体値で照合）。
+#[allow(dead_code)]
 pub fn negotiate(f: &UnixStream) {
     send(f, &Request::GetFeatures, &[]);
     assert_eq!(
@@ -123,8 +125,43 @@ pub struct Frontend {
 }
 
 /// ring 0 を設定して起動する。desc1（writable）の長さは `writable_len`。
+#[allow(dead_code)]
 pub fn setup_ring0(sock: UnixStream, writable_len: u32, tag: &str) -> Frontend {
     negotiate(&sock);
+    configure_ring0(sock, writable_len, tag)
+}
+
+/// `negotiate` の SHMEM・BACKEND_REQ 版: protocol feature 0x0040_0229（REPLY_ACK を含む）を確定し、`GET_SHMEM_CONFIG` と
+/// `SET_BACKEND_REQ_FD`（`backend` の複製を渡す）まで済ませて ring 0 を設定する（F5.2b.4a・#1643）。
+#[allow(dead_code)]
+pub fn setup_ring0_shmem(
+    sock: UnixStream,
+    writable_len: u32,
+    tag: &str,
+    backend: std::os::fd::BorrowedFd<'_>,
+) -> Frontend {
+    send(&sock, &Request::GetFeatures, &[]);
+    assert_eq!(
+        recv_reply(&sock, RequestCode::GetFeatures),
+        Reply::Features(FEATURES)
+    );
+    send(&sock, &Request::SetOwner, &[]);
+    send(&sock, &Request::GetProtocolFeatures, &[]);
+    assert_eq!(
+        recv_reply(&sock, RequestCode::GetProtocolFeatures),
+        Reply::ProtocolFeatures(0x0040_0229)
+    );
+    send(&sock, &Request::SetProtocolFeatures(0x0040_0229), &[]);
+    send(&sock, &Request::GetShmemConfig, &[]);
+    let Reply::ShmemConfig(_) = recv_reply(&sock, RequestCode::GetShmemConfig) else {
+        panic!("shmem config reply expected");
+    };
+    send(&sock, &Request::SetBackendReqFd, &[backend]);
+    send(&sock, &Request::SetFeatures(FEATURES), &[]);
+    configure_ring0(sock, writable_len, tag)
+}
+
+fn configure_ring0(sock: UnixStream, writable_len: u32, tag: &str) -> Frontend {
     let mem = memfd(&unique_name(tag), MEM_LEN);
     let table = MemTable::new(&[MemRegion {
         guest_phys_addr: 0,
@@ -184,6 +221,7 @@ pub fn setup_ring0(sock: UnixStream, writable_len: u32, tag: &str) -> Frontend {
 }
 
 /// GET_CAPSET（capset_id=4・version=0）の 32 バイトを ring 0 に積んで kick する。
+#[allow(dead_code)]
 pub fn submit_get_capset(fe: &Frontend) -> Vec<u8> {
     let mut req = vec![0u8; 32];
     req[..4].copy_from_slice(&0x0109u32.to_le_bytes());
@@ -201,6 +239,7 @@ pub fn wait_call(fe: &Frontend) {
     assert_eq!(u64::from_le_bytes(b), 1);
 }
 
+#[allow(dead_code)]
 pub fn used(fe: &Frontend) -> [u8; 12] {
     let mut u = [0u8; 12];
     fe.mem.read_at(&mut u, 0x2000).expect("used");

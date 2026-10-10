@@ -15,7 +15,7 @@
 //! 共有メモリ（F5.2b.2・#1641）: `GET_SHMEM_CONFIG` への応答と `SET_BACKEND_REQ_FD` の fd の保持は `negotiation` が担い、終了時に
 //! host-visible の成立状況（`host_visible` 行）を出す。backend 要求（`SHMEM_MAP` / `SHMEM_UNMAP`）の期限つき送信は `Session::shmem_map` / `shmem_unmap`（#1642）で、
 //! ctrl の `RESOURCE_MAP_BLOB` / `UNMAP_BLOB` から呼ぶ（F5.2b.4a・#1643）。MAP は resource の大きさの memfd を作って frontend へ渡し、
-//! UNMAP が成功するまで fd を保持する。frontend の失敗・期限切れ・切断ではゲストへ ERR を返し adapter を巻き戻す（無応答にしない）。
+//! UNMAP 後も memfd は resource の寿命（UNREF・セッション終了）まで保持して再 MAP で再利用する。frontend の失敗・期限切れ・切断ではゲストへ ERR を返し adapter を巻き戻す（無応答にしない）。
 //! map 中の資源の解放の確定（UNREF の暫定拒否・channel 破損後の残存・セッション終了時の扱い）と一連の結合試験は #1645。
 //! 未実装（REPAIR-3）: cursorq（ring 1）の要求処理・`SET_CONFIG`・`VRING_NOFD`・inflight・
 //! `observe::snapshot_lines` の定期出力（終了時の集計出力は実装済み。定期出力と virtqueue 個別の観測カウンタは未実装）。
@@ -194,13 +194,17 @@ struct Session {
 /// blob の memfd の名前（`/proc/self/maps` に出るため固定文字列。ゲスト由来の値を入れない）。
 const BLOB_MEMFD_NAME: &std::ffi::CStr = c"venus-jig-blob";
 
-/// map 中の blob 1 件分（資源表は `File` を持てないので `session` が持つ。F5.2b.4a・#1643）。
+/// blob の実メモリ 1 件分（資源表は `File` を持てないので `session` が持つ。F5.2b.4a・#1643）。
 #[derive(Debug)]
 struct BlobMem {
     res_id: u32,
     /// frontend へ `SHMEM_MAP` で渡した memfd。治具自身は map しない。保持と `Drop` での close が目的。
-    _memfd: File,
+    memfd: File,
+    /// 直近の（または現在の）host-visible 領域内の区間。`mapped == false` の間は参照しない。
     mapping: ShmemMapping,
+    /// frontend へ map 中か。`UNMAP_BLOB` の成功で偽になるが、memfd は resource の寿命（`UNREF`・セッション終了）まで保持し、
+    /// 再 MAP では同じ memfd を渡す（UNMAP をまたいで blob の内容を失わない）。
+    mapped: bool,
 }
 
 /// 固定長（資源表と同じ上限 [`MAX_RESOURCES`]）の副表。ゲスト入力でアロケーションは増えない。
@@ -233,18 +237,40 @@ impl BlobMemTable {
         }
     }
 
-    fn mapping_of(&self, res_id: u32) -> Option<ShmemMapping> {
+    /// map 中の区間（UNMAP の対象）。
+    fn mapped_of(&self, res_id: u32) -> Option<ShmemMapping> {
         self.slots
             .iter()
             .flatten()
-            .find(|b| b.res_id == res_id)
+            .find(|b| b.res_id == res_id && b.mapped)
             .map(|b| b.mapping)
     }
 
-    /// 該当を外す（memfd は drop で閉じる）。
-    fn remove(&mut self, res_id: u32) {
+    /// 該当 resource の実メモリを取り出す（再 MAP で memfd を再利用するため。空きができるので `insert` は必ず成功する）。
+    fn take(&mut self, res_id: u32) -> Option<BlobMem> {
+        self.slots
+            .iter_mut()
+            .find(|s| s.as_ref().is_some_and(|b| b.res_id == res_id))
+            .and_then(Option::take)
+    }
+
+    /// UNMAP の成功を記録する。memfd は残す。
+    fn mark_unmapped(&mut self, res_id: u32) {
+        for b in self.slots.iter_mut().flatten() {
+            if b.res_id == res_id {
+                b.mapped = false;
+            }
+        }
+    }
+
+    /// 資源表に無い（`UNREF` 済み）・大きさが違う（作り直された）resource の実メモリを閉じる。map 中のものは
+    /// `UNREF` が拒否されるので残る。
+    fn prune(&mut self, adapter: &CtrlAdapter) {
         for slot in self.slots.iter_mut() {
-            if slot.as_ref().is_some_and(|b| b.res_id == res_id) {
+            let stale = slot.as_ref().is_some_and(|b| {
+                !b.mapped && adapter.resource_size(b.res_id) != Some(b.mapping.len())
+            });
+            if stale {
                 *slot = None;
             }
         }
@@ -629,6 +655,10 @@ impl Session {
                 }
             };
             ring.queue.add_used(mem, chain, len).map_err(vq)?;
+            // 応答が確定した（巻き戻しが無い）ので、`UNREF` 済み resource の実メモリをここで閉じる。
+            if !dropped {
+                self.blobs.prune(&self.adapter);
+            }
             sink(&p.log_line);
             if dropped {
                 sink(&log::response_dropped_line());
@@ -715,10 +745,18 @@ impl Session {
         }
     }
 
+    /// 取り出した実メモリを（あれば）表へ戻して `result` を返す。
+    fn restore_blob(&mut self, blob: Option<BlobMem>, result: QueryResult) -> QueryResult {
+        if let Some(b) = blob {
+            let _ = self.blobs.insert(b);
+        }
+        result
+    }
+
     /// `MAP_BLOB` / `UNMAP_BLOB` の実体。frontend とのやりとりの結果を ctrl の結果語彙で返す。
     ///
     /// 共有メモリが未成立・frontend の失敗・期限切れ・切断は `Unspec`、memfd を作れないときは `OutOfMemory`。
-    /// 失敗した MAP の memfd は捨てる。失敗した UNMAP は副表の memfd を残す（frontend 側に map が残っているかもしれず、
+    /// 失敗した MAP の新規 memfd は捨てる（UNMAP 後に残した memfd は保つ）。失敗した UNMAP は map 中のまま残す（frontend 側に map が残っているかもしれず、
     /// 区間を再利用させない。解放の扱いは #1645）。channel の破損は `backend_exchange` が扱う。
     fn execute_shmem(&mut self, op: &ShmemOp, sink: &mut dyn FnMut(&str)) -> QueryResult {
         match op.kind {
@@ -727,47 +765,70 @@ impl Session {
                     .state
                     .backend_channel(BackendRequestCode::ShmemMap)
                     .is_err()
-                    || !self.blobs.has_free_slot()
                 {
                     return QueryResult::Unspec;
                 }
-                let Ok(cfg) = host_visible_config() else {
+                // 再 MAP なら UNMAP 後も残した memfd を使う。無ければ新しく作る（空きが無ければ拒否）。
+                self.blobs.prune(&self.adapter);
+                let kept = self
+                    .blobs
+                    .take(op.res_id)
+                    .filter(|b| !b.mapped && b.memfd.metadata().is_ok_and(|m| m.len() == op.len));
+                if kept.is_none() && !self.blobs.has_free_slot() {
                     return QueryResult::Unspec;
+                }
+                let Ok(cfg) = host_visible_config() else {
+                    return self.restore_blob(kept, QueryResult::Unspec);
                 };
                 let Ok(mapping) =
                     ShmemMapping::new(&cfg, device::SHM_ID_HOST_VISIBLE, op.shm_offset, op.len)
                 else {
-                    return QueryResult::Unspec;
+                    return self.restore_blob(kept, QueryResult::Unspec);
                 };
                 let Ok(req) = ShmemMapRequest::new(mapping, 0) else {
-                    return QueryResult::Unspec;
+                    return self.restore_blob(kept, QueryResult::Unspec);
                 };
-                let Ok(memfd) = create_memfd(BLOB_MEMFD_NAME, op.len) else {
-                    return QueryResult::OutOfMemory;
+                let reused = kept.is_some();
+                let memfd = match kept {
+                    Some(b) => b.memfd,
+                    None => match create_memfd(BLOB_MEMFD_NAME, op.len) {
+                        Ok(f) => f,
+                        Err(_) => return QueryResult::OutOfMemory,
+                    },
                 };
-                if self.shmem_map(&req, memfd.as_fd(), sink).is_err() {
+                let blob = BlobMem {
+                    res_id: op.res_id,
+                    memfd,
+                    mapping,
+                    mapped: false,
+                };
+                if self.shmem_map(&req, blob.memfd.as_fd(), sink).is_err() {
+                    // 失敗した MAP でも再利用できる memfd（内容を持つ）は unmapped で残す。新規の memfd は捨てる。
+                    if reused {
+                        let _ = self.blobs.insert(blob);
+                    }
                     return QueryResult::Unspec;
                 }
-                let kept = self.blobs.insert(BlobMem {
-                    res_id: op.res_id,
-                    _memfd: memfd,
-                    mapping,
-                });
-                if kept.is_err() {
+                let blob = BlobMem {
+                    mapped: true,
+                    ..blob
+                };
+                if let Err(blob) = self.blobs.insert(blob) {
                     // 事前に空きを確かめているので到達しない。到達したら frontend に map が残るため UNMAP で戻す。
-                    let _ = self.shmem_unmap(&mapping, sink);
+                    let _ = self.shmem_unmap(&blob.mapping, sink);
                     return QueryResult::Unspec;
                 }
                 QueryResult::Ok
             }
             ShmemOpKind::Unmap => {
-                let Some(mapping) = self.blobs.mapping_of(op.res_id) else {
+                let Some(mapping) = self.blobs.mapped_of(op.res_id) else {
                     return QueryResult::Unspec;
                 };
                 if self.shmem_unmap(&mapping, sink).is_err() {
                     return QueryResult::Unspec;
                 }
-                self.blobs.remove(op.res_id);
+                // memfd は閉じない（再 MAP で同じ内容を渡す）。`UNREF` / セッション終了で閉じる。
+                self.blobs.mark_unmapped(op.res_id);
                 QueryResult::Ok
             }
         }

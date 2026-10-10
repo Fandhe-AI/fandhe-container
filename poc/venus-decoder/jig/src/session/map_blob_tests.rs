@@ -130,7 +130,7 @@ fn memfd_count() -> usize {
 
 fn blob_meta(s: &Session) -> (u64, u64, u64) {
     let b = s.blobs.slots.iter().flatten().next().expect("blob");
-    let m = b._memfd.metadata().expect("meta");
+    let m = b.memfd.metadata().expect("meta");
     (m.dev(), m.ino(), m.len())
 }
 
@@ -269,7 +269,7 @@ fn f5_2b_4a_gpu6_host_visible_unavailable_sends_nothing() {
 }
 
 #[test]
-fn f5_2b_4a_gpu6_unmap_sends_unmap_closes_memfd_and_allows_remap() {
+fn f5_2b_4a_gpu6_unmap_sends_unmap_keeps_memfd_and_allows_remap() {
     let _g = FD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut s, b) = ready(T);
     prepare(&mut s);
@@ -290,8 +290,10 @@ fn f5_2b_4a_gpu6_unmap_sends_unmap_closes_memfd_and_allows_remap() {
         p.log_line,
         "venus_jig event=resource cmd=RESOURCE_UNMAP_BLOB res_id=7 offset=4096 size=8192 result=ok"
     );
-    assert_eq!(s.blobs.len(), 0);
-    assert_eq!(memfd_count(), base);
+    // memfd は resource の寿命まで残る（map 状態だけ外れる）。
+    assert_eq!(s.blobs.len(), 1);
+    assert_eq!(s.blobs.mapped_of(7), None);
+    assert_eq!(memfd_count(), base + 1);
     // 同じ offset への再 MAP が成功する。
     assert_eq!(
         resp_type(&s.process_ctrl(Some(&map_blob(7, 4096)), 4096, &mut sink)),
@@ -372,4 +374,55 @@ fn f5_2b_4a_gpu6_oversized_request_is_rejected_without_adapter() {
     let p = s.process_ctrl(None, 4096, &mut sink);
     assert_eq!(resp_type(&p), BAD);
     assert!(!p.dropped);
+}
+
+#[test]
+fn f5_2b_4a_gpu6_remap_reuses_memfd_and_keeps_contents() {
+    use std::os::unix::fs::FileExt;
+    let _g = FD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut s, b) = ready(T);
+    prepare(&mut s);
+    let base = memfd_count();
+    let h = frontend(b, vec![0, 0, 0]);
+    let mut sink = |_: &str| {};
+    let map = |s: &mut Session, off: u64, sink: &mut dyn FnMut(&str)| {
+        resp_type(&s.process_ctrl(Some(&map_blob(7, off)), 4096, sink))
+    };
+    assert_eq!(map(&mut s, 4096, &mut sink), RESP_OK_MAP_INFO);
+    // frontend が map した共有メモリへゲストが書いた内容の代わりに、同じ memfd へ書く。
+    let slot = s.blobs.slots.iter().flatten().next().expect("blob");
+    slot.memfd.write_all_at(b"guest-data", 100).expect("write");
+    let before = blob_meta(&s);
+    let p = s.process_ctrl(Some(&unmap_blob(7)), 4096, &mut sink);
+    assert_eq!(resp_type(&p), RESP_OK_NODATA);
+    // 別の offset へ再 MAP しても同じ memfd（同じ inode）で内容が残る。
+    assert_eq!(map(&mut s, 8192, &mut sink), RESP_OK_MAP_INFO);
+    assert_eq!(blob_meta(&s), before);
+    let mut got = [0u8; 10];
+    let slot = s.blobs.slots.iter().flatten().next().expect("blob");
+    slot.memfd.read_exact_at(&mut got, 100).expect("read");
+    assert_eq!(&got, b"guest-data");
+    assert_eq!(memfd_count(), base + 1);
+    let seen = h.join().expect("join");
+    assert_eq!(seen[0].6, seen[2].6);
+    assert_eq!((seen[2].0, seen[2].1), (BackendRequestCode::ShmemMap, 8192));
+}
+
+#[test]
+fn f5_2b_4a_gpu6_unref_after_unmap_closes_memfd() {
+    let _g = FD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut s, b) = ready(T);
+    prepare(&mut s);
+    let base = memfd_count();
+    let h = frontend(b, vec![0, 0]);
+    let mut sink = |_: &str| {};
+    let _ = s.process_ctrl(Some(&map_blob(7, 4096)), 4096, &mut sink);
+    let _ = s.process_ctrl(Some(&unmap_blob(7)), 4096, &mut sink);
+    assert_eq!(memfd_count(), base + 1);
+    let p = s.process_ctrl(Some(&unref(7)), 4096, &mut sink);
+    assert_eq!(resp_type(&p), RESP_OK_NODATA);
+    s.blobs.prune(&s.adapter);
+    assert_eq!(s.blobs.len(), 0);
+    assert_eq!(memfd_count(), base);
+    h.join().expect("join");
 }

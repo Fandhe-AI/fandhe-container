@@ -202,6 +202,14 @@ impl ResourceTable {
         })
     }
 
+    /// resource の大きさ。無ければ `None`。
+    pub fn size_of(&self, res_id: u32) -> Option<u64> {
+        self.slots
+            .iter()
+            .find(|e| e.res_id == res_id && res_id != 0)
+            .map(|e| e.size)
+    }
+
     /// map 中の offset（試験用の参照）。
     #[cfg(test)]
     pub fn mapped(&self, res_id: u32) -> Option<u64> {

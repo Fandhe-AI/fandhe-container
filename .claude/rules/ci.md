@@ -25,7 +25,9 @@ make ci          # 上記 + lint-docs + deny を一括実行
 
 ステージ 3（タイムアウト保護された結合試験）は `integration-test` ジョブ（3 OS matrix。実行ステップ 10 分・ジョブ全体 30 分の timeout-minutes）が担う（TASK-86.2・#36）。
 
-`integration-test` ジョブは結合試験に続けて、スクリプトの自己テストを 3 OS（Windows は Git Bash）で実行する: `make plug4-core-invariance-selftest`（PLUG-4 判定スクリプト。TASK-109.4）・`make cli-parity-selftest`（CLI 3 OS 比較。TASK-125.1・CLI-1）・`make vz-virtio-gpu-guest-check-selftest`（virtio-gpu ゲスト側確認スクリプト。合成 fixture のみ。TASK-172.6・GPU-6）。いずれもステップごとに timeout-minutes 5 を付け、新しいジョブ・check-run 名は増やさない。
+`integration-test` ジョブは結合試験に続けて、スクリプトの自己テストを 3 OS（Windows は Git Bash）で実行する: `make plug4-core-invariance-selftest`（PLUG-4 判定スクリプト。TASK-109.4）・`make cli-parity-selftest`（CLI 3 OS 比較。TASK-125.1・CLI-1）・`make vz-virtio-gpu-guest-check-selftest`（virtio-gpu ゲスト側確認スクリプト。合成 fixture のみ。TASK-172.6・GPU-6）。あわせて `make cli-parity-native-reclaim-check`（タイムアウト回収のネイティブ exe 実測。#1548）と `make cli-parity-native-reclaim-selftest`（その全体期限の自己テスト。#1688・REPAIR-5・REPAIR-12）も実行する。いずれもステップごとに timeout-minutes 5 を付け、新しいジョブ・check-run 名は増やさない。
+
+`cli-parity-native-reclaim-check` はスクリプト自身が wall clock の全体期限（既定 150 秒。`CLI_PARITY_RECLAIM_DEADLINE_SECS`）を持ち、超えたら子孫を回収して `deadline_exceeded` の行つきで失敗する（Windows でステップの timeout-minutes が効かずジョブ上限まで止まらなかったため。#1688）。ハング注入は `CLI_PARITY_RECLAIM_TEST_HANG`、止まり方の実証は `workflow_dispatch` の `reclaim-hang-probe` 入力（none / step-timeout / script-deadline。PR ブランチへ `--ref` で dispatch すると concurrency group が PR の CI と衝突しない）で行う。
 
 ルート workspace 外の PoC パッケージ `poc/venus-decoder/jig`（venus 試験治具。`crates/plugin-macos` へ path 依存。TASK-172.4・GPU-6）は `cargo build` / `cargo test --workspace` の対象に入らないため、`rust-ci-default-features` ジョブ（3 OS）の末尾で `make poc-venus-jig-check`（fmt-check・clippy・test。clippy / test は `--locked` で治具の `Cargo.lock` を固定。timeout-minutes 15）を実行し、plugin-macos 側の変更による治具の破損を検出する。実機前提テストは `#[ignore]` で分離済みで CI では走らない。治具の `Cargo.lock` は rust-ci の `cargo deny`（ルート workspace のみ）の対象外のため、同ジョブの ubuntu で `make deny-poc-venus-jig`（ルートの `deny.toml` を共有し 4 種を `--locked` で検査。timeout-minutes 20）を実行する（ステージ 5）。ローカルの `make deny`（`make ci`）も治具の検査を含む。
 

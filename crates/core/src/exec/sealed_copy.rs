@@ -807,15 +807,19 @@ mod tests {
     ) -> Result<SealedReadOnlyCopy, ExecError> {
         let procfs = procfs();
         let file_type = file.metadata().expect("stat").file_type();
-        seal_copy_bounded(
-            file,
-            file_type,
-            size,
-            limit,
-            procfs.as_fd(),
-            Path::new("/script"),
-            policy,
-        )
+        // `AT_EXECVE_CHECK` は判定中に同一 fs_struct のスレッド生成を EAGAIN にするため、私有 fs のスレッドで
+        // 呼ぶ（#1685）。
+        crate::test_support::run_with_private_fs(|| {
+            seal_copy_bounded(
+                file,
+                file_type,
+                size,
+                limit,
+                procfs.as_fd(),
+                Path::new("/script"),
+                policy,
+            )
+        })
     }
 
     /// SUP-6・SEC-1・TASK-163 追補・#1531: 環境が維持できないと判定された場合、複製の手順に入らず

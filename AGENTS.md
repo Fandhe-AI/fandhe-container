@@ -25,6 +25,7 @@
 - PR 本文にこれらのコマンドの実行結果（終了コードと要点）が記載されているか（同じ PR で CI 設定を変更する場合はその diff にこれらのコマンドが含まれているか）を確認する。本節の未達は、個別に優先度を明記した項目を除き既定で P1 とする
 - clippy 警告は 0 件を維持する。理由コメントなしで `#[allow(...)]` により警告を握りつぶす差分は P1。crate・モジュール全体に及ぶ広範な `#[allow(...)]`（`#![allow(...)]` 等）や、`unsafe` 関連 lint（`unsafe_code`・`clippy::undocumented_unsafe_blocks` 等）・外部入力の検証を隠す lint（`clippy::unwrap_used`・`clippy::expect_used`・`clippy::indexing_slicing` 等。下記「外部入力の検証」観点）の外部入力経路での抑止は、理由コメントの有無を問わず P0
 - テストの skip・ignore・アサーション弱体化で CI を通す差分は P0（回帰検出の後退を招くため）
+- 試験プロセスの中で実行可能ファイルへ `execveat`（`AT_EXECVE_CHECK`）を呼ぶ試験は、`crate::test_support::run_with_private_fs`（`unshare(CLONE_FS)` 済みの専用スレッド）経由にする。共有 `fs_struct` のままでは判定中（`in_exec`）に他試験の `std::thread::spawn` が `EAGAIN`（`failed to spawn thread`）で落ちる。経由せず直接呼ぶ差分は P1（#1685・REPAIR-7）
 
 ### ビルドコマンドと成功基準（REPAIR-10 (a)）
 

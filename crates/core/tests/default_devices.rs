@@ -1,5 +1,5 @@
 //! 基本デバイスノード作成（`fandhe_container_core::exec::create_default_devices`）の結合試験
-//! （CORE-1・CORE-6・SEC-5・TASK-27.6・#834・#1660）。
+//! （CORE-1・CORE-6・SEC-1・SEC-5・TASK-27.6・#834・#1660・#1676）。
 //!
 //! `harness = false` の単一スレッド `main` で動かす理由・流れは `pivot_root_isolation.rs` と同じ
 //! （`Cargo.toml` の `[[test]]`）。非 Linux では `exec` モジュール自体がビルド対象外。
@@ -13,11 +13,19 @@
 //!   から 6 種と symlink 4 本を作る。#1653）→ `pivot_root` の後、`/dev` の mountinfo（tmpfs・`nosuid` あり・
 //!   `nodev` なし）、6 種の種別・`rdev`・モード、symlink 4 本の参照先を具体値で照合する。親は、ホスト側の
 //!   偽ノードが内容ごと不変で、`dev` に新エントリが増えていないことを照合する
+//! - rootfs の自己 bind の `nodev`（#1676・SEC-1・CORE-1）: 親（root）は `dev` の外にも偽のデバイスノード
+//!   `opt/fake-null`（c 1:3）・`root/fake-zero`（c 1:5）を `mknod` で置き、ホスト側で開けること（試験の前提。
+//!   ホストの一時領域が `nodev` だと空振りするため開けなければ panic）を自己検証する。子（root）は `pivot_root` の後、
+//!   この 2 個が `EACCES`（13）で開けないこと（Landlock は適用しないので `nodev` 由来）、`/dev/null` への書き込みと
+//!   `/dev/zero` の 16 バイト読みが成功すること、mountinfo の `/` に `nodev` があり `/dev` に無いことを照合する。
+//!   親は、子の終了後にホスト側の 2 個が同じ `rdev` の文字デバイスのまま残っていることを照合する
 //! - 子（非 root）: 非特権 user namespace では文字デバイスの `mknod(2)` が `EPERM` になるため、ホストの
 //!   `/dev/<名前>` を `open_tree(2)` + `move_mount(2)` で `dev` の tmpfs 上の空ファイルへ bind する
 //!   （#1660。6 種すべてが `BoundFromHost`）。`pivot_root` の後、6 種の種別・`rdev`、`/dev/null` への書き込み、
 //!   `/dev/zero` の 16 バイトの読み出し、mountinfo のマウントポイント 6 件、devpts に `gid=` が無いことを照合する。
-//!   親は、ホスト側の `dev` が空のまま残っている（空ファイルは tmpfs 上にありホスト側には現れない）ことを照合する
+//!   親は、ホスト側の `dev` が空のまま残っている（空ファイルは tmpfs 上にありホスト側には現れない）ことを照合する。
+//!   rootless でも rootfs の自己 bind に `nodev` が付く（#1676。オーナー判断 2026-10-10 で常に付与）ことを、
+//!   `PivotReport::rootfs_nodev` と mountinfo の `/` の `nodev` で照合する（bind した 6 種は別マウントで使える）
 //!
 //! # 実機前提テストとしての分離
 //! root もしくは非特権 user namespace を許可するホストが必要で、GitHub ホステッド runner では
@@ -69,6 +77,38 @@ mod linux {
     /// ホスト側 rootfs の `dev/null` に置く偽ノード（通常ファイル）の内容。
     const FAKE_NULL: &[u8] = b"fake-null";
 
+    /// `dev` の外に置く偽のデバイスノード `(rootfs からの相対パス, major, minor)`（#1676）。
+    const FAKE_DEVICES: [(&str, u64, u64); 2] = [("opt/fake-null", 1, 3), ("root/fake-zero", 1, 5)];
+
+    /// coreutils の `mknod` で文字デバイスを作る（core のテストに `unsafe` を書かないため）。
+    /// 子の待ちには期限を付ける（REPAIR-5）。
+    fn mknod_char(path: &Path, major: u64, minor: u64) {
+        let mut child = Command::new("mknod")
+            .arg("-m")
+            .arg("0666")
+            .arg(path)
+            .arg("c")
+            .arg(major.to_string())
+            .arg(minor.to_string())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn mknod");
+        let deadline = Instant::now() + timeout();
+        loop {
+            match child.try_wait().expect("try_wait") {
+                Some(status) => {
+                    assert_eq!(status.code(), Some(0), "mknod must succeed");
+                    return;
+                }
+                None if Instant::now() >= deadline => {
+                    kill_and_reap_bounded(&mut child);
+                    panic!("mknod did not exit within {:?}", timeout());
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
     /// glibc の `gnu_dev_makedev` と同じ配置（下位 8 ビットの minor と 8..20 ビットの major）。
     fn makedev(major: u64, minor: u64) -> u64 {
         (major << 8) | minor
@@ -93,6 +133,28 @@ mod linux {
             .and_then(|l| l.split_whitespace().nth(2).map(str::to_string))
             .and_then(|v| v.parse().ok())
             .expect("parse egid")
+    }
+
+    /// 期限超過した子を kill し、回収も有限の猶予で打ち切る（REPAIR-5）。
+    /// SIGKILL は終了完了を保証せず（割り込み不能待機等）、無期限 `wait()` は
+    /// 期限超過の報告に到達できなくなるため `try_wait()` をポーリングする。
+    /// 回収できない場合は明示的に panic して失敗を報告する。
+    fn kill_and_reap_bounded(child: &mut std::process::Child) {
+        if let Err(e) = child.kill() {
+            // 既に終了済みの場合などは回収確認へ進む。それ以外は回収の成否で判定する。
+            eprintln!("kill failed: {e}");
+        }
+        let reap_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() >= reap_deadline => {
+                    panic!("child could not be reaped within 5s after kill");
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => panic!("try_wait after kill failed: {e}"),
+            }
+        }
     }
 
     fn timeout() -> Duration {
@@ -142,6 +204,19 @@ mod linux {
             // イメージ同梱の偽ノード。tmpfs に覆い隠され、コンテナからは見えずホスト側は不変であること。
             std::fs::create_dir_all(base.join("dev")).expect("create rootfs/dev");
             std::fs::write(base.join("dev/null"), FAKE_NULL).expect("write fake node");
+            // `dev` の外のデバイスノード（rootfs の自己 bind の `nodev` で開けなくなること。#1676）。
+            for (rel, major, minor) in FAKE_DEVICES {
+                let path = base.join(rel);
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+                mknod_char(&path, major, minor);
+                // 試験の前提: ホスト側（`nodev` でないマウント）では開ける。開けないなら空振りになる。
+                if let Err(e) = std::fs::File::open(&path) {
+                    panic!(
+                        "host cannot open {}: {e}; set TMPDIR to a mount that is not nodev",
+                        path.display()
+                    );
+                }
+            }
         }
         Rootfs(base)
     }
@@ -183,8 +258,15 @@ mod linux {
                         .map(|e| e.expect("entry").file_name())
                         .collect();
                     assert_eq!(entries, vec![std::ffi::OsString::from("null")]);
+                    // ホスト側の `dev` 外のノードは変わらない。
+                    for (rel, major, minor) in FAKE_DEVICES {
+                        let meta =
+                            std::fs::symlink_metadata(rootfs.0.join(rel)).expect("stat fake");
+                        assert!(meta.file_type().is_char_device(), "{rel}");
+                        assert_eq!(meta.rdev(), makedev(major, minor), "{rel} rdev");
+                    }
                     println!(
-                        "default_devices: /dev tmpfs, basic device nodes, default links, /dev/pts and /dev/ptmx verified (root=true)"
+                        "default_devices: /dev tmpfs, basic device nodes, default links, /dev/pts and /dev/ptmx verified; rootfs self-bind nodev verified (root=true)"
                     );
                 } else {
                     // 空ファイルは子の mount namespace の tmpfs 上にあり、ホスト側の `dev` は空のまま残る。
@@ -196,7 +278,7 @@ mod linux {
                         "host-side dev must stay empty"
                     );
                     println!(
-                        "default_devices: rootless basic device nodes bound from host, default links, /dev/pts and /dev/ptmx verified (root=false)"
+                        "default_devices: rootless basic device nodes bound from host, default links, /dev/pts and /dev/ptmx verified; rootfs self-bind nodev verified (root=false)"
                     );
                 }
             }
@@ -224,8 +306,7 @@ mod linux {
                     return;
                 }
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_and_reap_bounded(&mut child);
                     panic!("child did not exit within {:?}", timeout());
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),
@@ -278,7 +359,9 @@ mod linux {
         assert_eq!(first.devpts.pts_dir, DevptsDirStatus::Created);
         assert_eq!(first.devpts.ptmx.status, DeviceLinkStatus::Created);
 
-        pivot_root(&isolation, prepared).expect("pivot_root");
+        let report = pivot_root(&isolation, prepared).expect("pivot_root");
+        // rootfs の `nodev` は rootful・rootless とも付与・事後検証済み（#1676・REPAIR-4）。
+        assert!(report.rootfs_nodev);
 
         // `/dev` は専用の tmpfs。rootful は `nosuid` あり・`nodev` なしまで照合する（rootless の user namespace
         // が載せたマウントのフラグはカーネルの扱いに依存するため、種別だけを照合する）。
@@ -328,13 +411,18 @@ mod linux {
         }
 
         verify_devpts(rootful);
+        if rootful {
+            verify_rootfs_nodev();
+        } else {
+            verify_rootless_rootfs_nodev();
+        }
     }
 
-    /// rootless の bind で供給したノードの実使用と、bind が 6 件ちょうどであることの照合（#1660。CORE-6・SEC-5）。
-    fn verify_bound_nodes(mountinfo: &str) {
+    /// `/dev/null` へ書き込めて、`/dev/zero` から読んだ 16 バイトがすべて 0 であること（rootful の作成・
+    /// rootless の bind の双方で、`nodev` 相当で拒まれずにノードを実際に使えること。#1660・#1676）。
+    fn verify_null_zero_usable() {
         use std::io::{Read as _, Write as _};
 
-        // 書き込める（ホストの devtmpfs の superblock を保つため `nodev` 相当で拒まれない）。
         std::fs::OpenOptions::new()
             .write(true)
             .open("/dev/null")
@@ -347,6 +435,67 @@ mod linux {
             .read_exact(&mut zeros)
             .expect("read /dev/zero");
         assert_eq!(zeros, [0u8; 16], "/dev/zero must read 16 zero bytes");
+    }
+
+    /// pivot 後のマウントポイント `target` のマウント単位のオプション（mountinfo の 6 列目）。ちょうど 1 件を要求する。
+    fn mount_options_at(mountinfo: &str, target: &str) -> Vec<String> {
+        let lines: Vec<_> = mountinfo
+            .lines()
+            .filter(|l| l.split_whitespace().nth(4) == Some(target))
+            .collect();
+        assert_eq!(lines.len(), 1, "exactly one mount at {target}");
+        lines[0]
+            .split_whitespace()
+            .nth(5)
+            .expect("options")
+            .split(',')
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// pivot 後の rootfs の `nodev`（#1676。SEC-1・CORE-1）。Landlock は適用していないため、`EACCES` は
+    /// `nodev` 由来。`/dev` の既定ノードは専用の tmpfs 上にあるので使える。
+    fn verify_rootfs_nodev() {
+        const EACCES: i32 = 13;
+        for (rel, _, _) in FAKE_DEVICES {
+            let err = std::fs::File::open(format!("/{rel}")).expect_err("must not open on nodev");
+            assert_eq!(err.raw_os_error(), Some(EACCES), "/{rel}");
+        }
+        verify_null_zero_usable();
+
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").expect("read mountinfo");
+        assert!(
+            mount_options_at(&mountinfo, "/")
+                .iter()
+                .any(|o| o == "nodev"),
+            "/ must be nodev"
+        );
+        assert!(
+            !mount_options_at(&mountinfo, "/dev")
+                .iter()
+                .any(|o| o == "nodev"),
+            "/dev must not be nodev"
+        );
+    }
+
+    /// rootless でも rootfs の自己 bind に `nodev` が付く（#1676。オーナー判断 2026-10-10 で常に付与。CORE-6・SEC-5）。
+    /// bind した基本デバイス 6 種は別マウントのため使えること（`verify_bound_nodes`）と併せて、`nodev` が `/` に
+    /// 付き、bind 側へ及ばないことを確かめる。rootless は偽のデバイスノードを `mknod` で置けないため、`EACCES` の
+    /// 照合は rootful だけで行う。
+    fn verify_rootless_rootfs_nodev() {
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").expect("read mountinfo");
+        assert!(
+            mount_options_at(&mountinfo, "/")
+                .iter()
+                .any(|o| o == "nodev"),
+            "rootless / must be nodev"
+        );
+    }
+
+    /// rootless の bind で供給したノードの実使用と、bind が 6 件ちょうどであることの照合（#1660。CORE-6・SEC-5）。
+    fn verify_bound_nodes(mountinfo: &str) {
+        // 書き込める（ホストの devtmpfs の superblock を保つため `nodev` 相当で拒まれない）。
+        verify_null_zero_usable();
         // マウントポイントが基本デバイス 6 種の名前である行がちょうど 6 件（fs 種別はホスト依存のため照合しない）。
         let mut points: Vec<_> = mountinfo
             .lines()

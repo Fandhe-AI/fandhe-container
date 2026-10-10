@@ -762,7 +762,9 @@ impl std::error::Error for ExecError {}
 
 fn describe(err: SysError) -> String {
     match err {
-        SysError::Unsupported => "unsupported target architecture".to_string(),
+        SysError::Unsupported => {
+            "not supported by the kernel or the target architecture".to_string()
+        }
         SysError::MultiThreaded => {
             "the process is multi-threaded or its thread count is unknown; refusing to fork"
                 .to_string()
@@ -1809,7 +1811,14 @@ fn parse_fdinfo_mnt_id(fdinfo: &str) -> Option<u64> {
 /// `establish` 後の別スレッドでは一致しないため）。読み取り・解析
 /// できない場合は安全側（エラー）に倒す。
 /// 失敗は `stage` の段として返す（proc マウントは `MountProc`、rootfs 切替は `PrepareRootfs`）。
+///
+/// `cfg(test)` では `tests::DRY_RUN_SHARED` に値があればそれを返す（既定の `None` は実際に読む）。実行環境
+/// （CI の ubuntu は shared）に依らず `rootfs::prepare_rootfs` の bind 以降の経路を照合するため（#1676）。
 fn mount_is_shared(dir: &OwnedFd, stage: IsolationStage) -> Result<bool, ExecError> {
+    #[cfg(test)]
+    if let Some(shared) = tests::DRY_RUN_SHARED.with(std::cell::Cell::get) {
+        return Ok(shared);
+    }
     let mnt_id = fd_mount_id(dir, stage)?;
     let info = read_thread_mountinfo(stage)?;
     mount_is_shared_in(&info, mnt_id).map_err(|e| e.at_stage(stage))
@@ -2228,12 +2237,20 @@ mod tests {
         /// dry-run の `mount_proc_syscall` が記録したマウント先（テストスレッドごと）。
         pub(super) static DRY_RUN_MOUNTS: std::cell::RefCell<Vec<String>> =
             const { std::cell::RefCell::new(Vec::new()) };
+        /// `mount_is_shared` に返させる値（テストスレッドごと。`None` は実際の propagation を読む）。
+        pub(super) static DRY_RUN_SHARED: std::cell::Cell<Option<bool>> =
+            const { std::cell::Cell::new(None) };
     }
 
     /// dry-run の記録を取り出して空にする。libtest のワーカースレッドが再利用されても、
     /// 前のテストの記録が後続のテストへ漏れないよう、照合は必ずこの関数で取り出して行う。
     pub(super) fn take_dry_run_mounts() -> Vec<String> {
         DRY_RUN_MOUNTS.with(|m| std::mem::take(&mut *m.borrow_mut()))
+    }
+
+    /// dry-run の記録を消費せずに件数だけ返す（`rootfs` の nodev の順序照合用。#1676）。
+    pub(super) fn peek_dry_run_mounts_len() -> usize {
+        DRY_RUN_MOUNTS.with(|m| m.borrow().len())
     }
 
     /// パス検証は相対パス・NUL を副作用なしで拒否する。

@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! MountIsolation::establish()
-//!   -> prepare_rootfs(&isolation, rootfs) -> PreparedRootfs   // 自己 bind + rootfs/proc へ procfs
+//!   -> prepare_rootfs(&isolation, rootfs) -> PreparedRootfs   // 自己 bind -> nodev -> rootfs/proc へ procfs
 //!   -> pivot_root(&isolation, prepared)   -> PivotReport      // rootfs 切替 + 旧 root 切り離し
 //! ```
 //!
@@ -35,6 +35,19 @@
 //! - **外部 inode へのハードリンクは拒否する**: rootfs 内の非ディレクトリが rootfs の外にもリンク
 //!   を持つ（`st_nlink` が rootfs 内のリンク数を超える）と、pivot 後の書き込みで外部ファイルが
 //!   変わる。bind 前に走査し `ViolationReason::RootfsHasExternalHardlink` で拒否する
+//! - **自己 bind のマウントは常に `nodev`（#1676・SEC-1・CORE-1・TASK-27.3）**: 初回の `MS_BIND` は
+//!   フラグを無視するため、イメージが `/dev` 以外に同梱したデバイスノードが開けてしまう。そこで bind 後に
+//!   開き直した mount top の fd へ `mount_setattr(2)`（`sys::set_mount_nodev`。Linux 5.12 以降。`ENOSYS` は
+//!   `Unimplemented` で拒否し `mount(2)` へ縮退しない）で `nodev` を足し、`fstatfs` の `ST_NODEV` で事後検証する。
+//!   - mount top 1 枚だけ・再帰なし。submount は拒否済みのため rootfs 全体を覆う。`/dev` の tmpfs・devpts・
+//!     rootless の基本デバイスの bind（#1660）は後から別のマウントとして載るので `nodev` にならず、既定の
+//!     デバイスノード 6 種は使える。procfs も同様
+//!   - rootful・rootless を問わず常に掛ける（オーナー判断 2026-10-10）。user namespace の種類で分岐しないため、
+//!     入れ子の user namespace の中で動く構成でも黙って外れない。rootless（非初期 user ns）では mount namespace を
+//!     所有する user ns の `CAP_SYS_ADMIN` で足せる。付与・事後検証の失敗は `EPERM` を含め fail-closed で拒否する
+//!   - Linux 5.12 の要件は Landlock ABI 6（Linux 6.12 以降。CORE-5）の前提に含まれる
+//!   - CDI `deviceNodes`（TASK-127・#547）を `/dev` 以外へ置くと、この `nodev` で開けなくなる。配置先は TASK-127 で決める
+//!   - 多層防御のもう一方であるデバイス cgroup は #1677 で扱う
 //! - **同一スレッド**: 呼び出しスレッドだけが新しい mount namespace にいるため、
 //!   [`MountIsolation::establish`]・[`prepare_rootfs`]・[`pivot_root`] は同じスレッドで呼ぶ
 //! - **失敗時はプロセスを破棄する**: bind mount・procfs マウント・pivot の途中で失敗しても
@@ -45,8 +58,10 @@
 //!
 //! # 単体テストの安全策
 //!
-//! `mount(2)`・`pivot_root(2)` は `cfg(test)` では dry-run に差し替わる（`bind_syscall`・
-//! `switch_root`）。root で `cargo test` を実行してもホストの mount namespace へは届かない。
+//! `mount(2)`・`mount_setattr(2)`・`pivot_root(2)` は `cfg(test)` では dry-run に差し替わる
+//! （`bind_syscall`・`nodev_syscall`・`switch_root`）。root で `cargo test` を実行してもホストの mount namespace へは届かない。
+//! shared propagation の判定（`mount_is_shared`）も `cfg(test)` で差し込めるようにし、実行環境（CI の ubuntu は shared）に
+//! 依らず nodev の順序・値・失敗経路を照合する（#1676）。
 //! 実機での挙動は結合試験 `tests/pivot_root_isolation.rs`（`-- --ignored`）で確認する。
 
 use std::ffi::{CStr, CString, OsStr};
@@ -96,6 +111,10 @@ pub struct PivotReport {
     pub old_root_detached: bool,
     /// pivot 前にマウントした `/proc` が新しい `/proc` になっているか。成功時は常に真。
     pub proc_mounted: bool,
+    /// rootfs の自己 bind に `nodev` を足し、`ST_NODEV` を事後検証済みか（#1676・SEC-1・REPAIR-4）。
+    /// rootful・rootless を問わず常に付与する（オーナー判断 2026-10-10）ため、成功した [`pivot_root`] では常に真。
+    /// 付与済みであることの証跡として呼び出し側が記録・照合できるよう残す。
+    pub rootfs_nodev: bool,
 }
 
 /// rootfs を pivot 可能にする（自己 bind + rootfs 配下への `/proc` マウント）。
@@ -112,14 +131,27 @@ pub struct PivotReport {
 /// 6. bind 前に得た fd は下層の dentry を指すため、保持した親 fd から同じ名前で開き直し、bind で
 ///    できた新しい mount top を得る（マウント ID が変わったこと、開き直した fd が bind 対象と同じ
 ///    `(st_dev, st_ino)` であること、新マウントの親が bind 元のマウントであることを確認する）
-/// 7. bind が複製した rootfs 配下の既存マウントが 1 つでもあれば拒否する（`RootfsHasSubmounts`）
-/// 8. 新しい mount top 起点で `proc` を開き直し、procfs をマウントする
+/// 7. mount top に `nodev` を足し、`ST_NODEV` を事後検証する（#1676。rootful・rootless とも）
+/// 8. bind が複製した rootfs 配下の既存マウントが 1 つでもあれば拒否する（`RootfsHasSubmounts`）
+/// 9. 新しい mount top 起点で `proc` を開き直し、procfs をマウントする
 pub fn prepare_rootfs(
     isolation: &MountIsolation,
     rootfs: &Path,
 ) -> Result<PreparedRootfs, ExecError> {
     isolation.verify_caller(IsolationStage::PrepareRootfs)?;
     prepare_rootfs_verified(rootfs)
+}
+
+/// rootfs の mount top が `nodev` であることの事後検証（純関数。fail-closed）。`ST_VALID` が無い値は信用しない。
+fn check_rootfs_is_nodev(flags: sys::MountFlags) -> Result<(), ExecError> {
+    if !flags.is_valid() || !flags.is_nodev() {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::PrepareRootfs,
+            "the rootfs mount is not nodev after mount_setattr",
+        ));
+    }
+    Ok(())
 }
 
 /// [`prepare_rootfs`] の証跡検証後の本体。単体テストは証跡を偽造せずに直接呼ぶ
@@ -171,6 +203,18 @@ fn prepare_rootfs_verified(rootfs: &Path) -> Result<PreparedRootfs, ExecError> {
         new_root_mnt_id,
         rootfs,
     )?;
+
+    // 初回の `MS_BIND` はフラグを無視するため、検証済みの mount top の fd へ `nodev` を足す（#1676・SEC-1）。
+    // rootful・rootless を問わず常に掛ける（オーナー判断 2026-10-10）。`/dev` の tmpfs を載せる前に済ませる。
+    // submount は下で拒否するので mount top 1 枚で rootfs 全体を覆う。失敗（`EPERM`・`ENOSYS` 等）は縮退しない。
+    nodev_syscall(new_root.as_fd())
+        .map_err(|e| ExecError::from_sys(e, STAGE, "mount_setattr(MOUNT_ATTR_NODEV)"))?;
+    // dry-run（`cfg(test)`）では実マウントが無く、ホストの一時領域の nodev 有無で結果が揺れるため検証しない。
+    if !cfg!(test) {
+        let flags = sys::mount_flags(new_root.as_fd())
+            .map_err(|e| ExecError::from_sys(e, STAGE, "fstatfs(rootfs)"))?;
+        check_rootfs_is_nodev(flags)?;
+    }
 
     // `MS_BIND | MS_REC` は rootfs 配下の既存マウントも新しい mount 木へ複製する。ホスト領域への
     // bind mount が含まれていると pivot 後も到達できてしまうため、複製されたサブマウントは
@@ -492,6 +536,7 @@ fn pivot_root_verified(prepared: PreparedRootfs) -> Result<PivotReport, ExecErro
         new_root_mnt_id: prepared.new_root_mnt_id,
         old_root_detached: true,
         proc_mounted: true,
+        rootfs_nodev: true,
     })
 }
 
@@ -551,6 +596,28 @@ fn bind_syscall(target: &CStr) -> Result<(), SysError> {
     Ok(())
 }
 
+/// [`prepare_rootfs`] の `nodev` 付与。本番ビルドでは [`sys::set_mount_nodev`]。
+#[cfg(not(test))]
+fn nodev_syscall(mount_top: BorrowedFd<'_>) -> Result<(), SysError> {
+    sys::set_mount_nodev(mount_top)
+}
+
+/// テストビルドの dry-run 差し込み点。`mount_setattr(2)` を呼ばず、呼び出しの文脈を記録するだけにする。
+#[cfg(test)]
+fn nodev_syscall(mount_top: BorrowedFd<'_>) -> Result<(), SysError> {
+    if let Some(e) = tests::DRY_RUN_NODEV_FAIL.with(|f| f.take()) {
+        return Err(e);
+    }
+    let rec = tests::NodevCall {
+        fd: mount_top.as_raw_fd(),
+        params: sys::rootfs_nodev_call_params(),
+        binds_seen: tests::DRY_RUN_BINDS.with(|b| b.borrow().len()),
+        mounts_seen: crate::exec::tests::peek_dry_run_mounts_len(),
+    };
+    tests::DRY_RUN_NODEV.with(|n| n.borrow_mut().push(rec));
+    Ok(())
+}
+
 /// 切替の syscall 列（`fchdir(new)` → `pivot_root(".", ".")` → `fchdir(old)` →
 /// `umount2(".", MNT_DETACH)` → `chdir("/")`）。本番ビルドの実装。
 #[cfg(not(test))]
@@ -585,6 +652,36 @@ mod tests {
         pub(super) static DRY_RUN_BINDS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         /// dry-run の `switch_root` が呼ばれた回数（テストスレッドごと）。
         pub(super) static DRY_RUN_SWITCHES: RefCell<u32> = const { RefCell::new(0) };
+        /// dry-run の `nodev_syscall` の記録（テストスレッドごと）。
+        pub(super) static DRY_RUN_NODEV: RefCell<Vec<NodevCall>> = const { RefCell::new(Vec::new()) };
+        /// 次の `nodev_syscall` に返させる失敗（`ENOSYS` 相当の注入用）。
+        pub(super) static DRY_RUN_NODEV_FAIL: std::cell::Cell<Option<SysError>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// shared propagation の判定を `shared` に固定して `prepare_rootfs_verified` を呼ぶ（呼び出し後に戻す）。
+    fn prepare_with_shared(rootfs: &Path, shared: bool) -> Result<PreparedRootfs, ExecError> {
+        crate::exec::tests::DRY_RUN_SHARED.with(|s| s.set(Some(shared)));
+        let result = prepare_rootfs_verified(rootfs);
+        crate::exec::tests::DRY_RUN_SHARED.with(|s| s.set(None));
+        result
+    }
+
+    /// dry-run の `nodev_syscall` が記録した 1 回分の呼び出し。
+    #[derive(Debug)]
+    pub(super) struct NodevCall {
+        pub(super) fd: i32,
+        /// `(attr_set, attr_clr, propagation, userns_fd, flags, size)`。
+        pub(super) params: (u64, u64, u64, u64, u32, usize),
+        /// 呼び出し時点の bind の dry-run 件数。
+        pub(super) binds_seen: usize,
+        /// 呼び出し時点の procfs の dry-run マウント件数。
+        pub(super) mounts_seen: usize,
+    }
+
+    fn take_nodev_calls() -> Vec<NodevCall> {
+        DRY_RUN_NODEV_FAIL.with(|f| f.set(None));
+        DRY_RUN_NODEV.with(|n| std::mem::take(&mut *n.borrow_mut()))
     }
 
     /// dry-run の記録を取り出して空にする（libtest のワーカースレッド再利用で前のテストの記録が
@@ -698,37 +795,109 @@ mod tests {
         assert_eq!(take_dry_runs(), (vec![], vec![], 0));
     }
 
-    /// CORE-1: 有効な rootfs は shared propagation 上なら違反記録付きで拒否し、そうでなければ
-    /// dry-run の bind と procfs マウントまで進む（実行環境の propagation に応じてどちらかを照合）。
+    /// CORE-1・SEC-1（#1676）: 有効な rootfs は（shared でなければ）dry-run の bind と procfs マウントまで進む。
+    /// 順序は bind -> nodev -> procfs で、nodev はちょうど 1 回・mount top の fd 起点・固定値（rootful・rootless の
+    /// 区別なく常に掛ける。オーナー判断 2026-10-10）。shared の判定は差し込み点で固定し、実行環境の propagation に
+    /// 依らず必ずこの分岐を照合する。
     #[test]
-    fn core1_prepare_rootfs_reaches_dry_run_mounts_or_rejects_shared() {
+    fn core1_prepare_rootfs_reaches_dry_run_mounts() {
         take_dry_runs();
+        take_nodev_calls();
         let t = Tmp::new("valid");
         let rootfs = t.0.join("root");
         std::fs::create_dir_all(rootfs.join("proc")).unwrap();
-        match prepare_rootfs_verified(&rootfs) {
-            Ok(prepared) => {
-                let (binds, mounts, switches) = take_dry_runs();
-                assert_eq!(binds.len(), 1, "{binds:?}");
-                assert!(binds[0].starts_with("/proc/thread-self/fd/"), "{binds:?}");
-                assert_eq!(mounts.len(), 1, "{mounts:?}");
-                assert!(mounts[0].starts_with("/proc/thread-self/fd/"), "{mounts:?}");
-                assert_eq!(switches, 0);
-                drop(prepared);
-            }
-            Err(err) => {
-                assert_eq!(err.stage, IsolationStage::PrepareRootfs);
-                assert_eq!(
-                    violation_of(&err),
-                    (
-                        "shared_propagation",
-                        "rootfs_on_shared_mount",
-                        "CORE-1",
-                        Some(rootfs.to_str().unwrap().to_string())
-                    )
-                );
-                assert_eq!(take_dry_runs(), (vec![], vec![], 0));
-            }
+        let prepared = prepare_with_shared(&rootfs, false).expect("prepare");
+        let (binds, mounts, switches) = take_dry_runs();
+        let calls = take_nodev_calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!((calls[0].binds_seen, calls[0].mounts_seen), (1, 0));
+        assert_eq!(calls[0].fd, prepared.new_root.as_raw_fd());
+        assert_eq!(calls[0].params, (0x4, 0, 0, 0, 0x1000, 32));
+        assert_eq!(calls[0].params.4 & 0x8000, 0);
+        assert_eq!(binds.len(), 1, "{binds:?}");
+        assert!(binds[0].starts_with("/proc/thread-self/fd/"), "{binds:?}");
+        assert_eq!(mounts.len(), 1, "{mounts:?}");
+        assert!(mounts[0].starts_with("/proc/thread-self/fd/"), "{mounts:?}");
+        assert_eq!(switches, 0);
+    }
+
+    /// CORE-1・SEC-1（#1676）: shared propagation 上の rootfs は違反記録付きで拒否し、bind・nodev・procfs の
+    /// いずれも呼ばない（副作用の前に止まる）。
+    #[test]
+    fn core1_prepare_rootfs_rejects_shared_before_nodev() {
+        take_dry_runs();
+        take_nodev_calls();
+        let t = Tmp::new("shared");
+        let rootfs = t.0.join("root");
+        std::fs::create_dir_all(rootfs.join("proc")).unwrap();
+        let err = prepare_with_shared(&rootfs, true).unwrap_err();
+        assert_eq!(err.stage, IsolationStage::PrepareRootfs);
+        assert_eq!(
+            violation_of(&err),
+            (
+                "shared_propagation",
+                "rootfs_on_shared_mount",
+                "CORE-1",
+                Some(rootfs.to_str().unwrap().to_string())
+            )
+        );
+        assert_eq!(take_dry_runs(), (vec![], vec![], 0));
+        assert_eq!(take_nodev_calls().len(), 0);
+    }
+
+    /// SEC-1（#1676）: nodev 付与の失敗は縮退せず拒否し、procfs へ進まない。`ENOSYS`（`Unsupported`）は
+    /// `Unimplemented`、rootless で起こり得る `EPERM` は `PermissionDenied`（`mount(2)` へ縮退せず、nodev なしでも
+    /// 進まない。オーナー判断 2026-10-10 の fail-closed）。bind は済んでいる（プロセスごと破棄する契約）。
+    #[test]
+    fn core1_prepare_rootfs_nodev_failure_is_fail_closed() {
+        const EPERM: i32 = 1;
+        let cases = [
+            (
+                SysError::Unsupported,
+                ErrorCode::Unimplemented,
+                "mount_setattr(MOUNT_ATTR_NODEV) failed: not supported by the kernel or the target architecture"
+                    .to_string(),
+            ),
+            (
+                SysError::Os(EPERM),
+                ErrorCode::PermissionDenied,
+                format!(
+                    "mount_setattr(MOUNT_ATTR_NODEV) failed: {}",
+                    std::io::Error::from_raw_os_error(EPERM)
+                ),
+            ),
+        ];
+        for (injected, code, message) in cases {
+            take_dry_runs();
+            take_nodev_calls();
+            let t = Tmp::new("nodev-fail");
+            let rootfs = t.0.join("root");
+            std::fs::create_dir_all(rootfs.join("proc")).unwrap();
+            DRY_RUN_NODEV_FAIL.with(|f| f.set(Some(injected)));
+            let err = prepare_with_shared(&rootfs, false).unwrap_err();
+            DRY_RUN_NODEV_FAIL.with(|f| f.set(None));
+            assert_eq!(err.stage, IsolationStage::PrepareRootfs, "{injected:?}");
+            assert_eq!(err.code, code, "{injected:?}");
+            assert!(err.violation.is_none(), "{err:?}");
+            assert_eq!(err.message, message, "{injected:?}");
+            let (binds, mounts, switches) = take_dry_runs();
+            assert_eq!(
+                (binds.len(), mounts.len(), switches),
+                (1, 0, 0),
+                "{injected:?}"
+            );
+            assert_eq!(take_nodev_calls().len(), 0, "{injected:?}");
+        }
+    }
+
+    /// SEC-1（#1676）: 事後検証は `ST_NODEV` と `ST_VALID` の両方を要求する。
+    #[test]
+    fn core1_sec1_check_rootfs_is_nodev() {
+        assert!(check_rootfs_is_nodev(sys::MountFlags::from_bits(0x20 | 0x4)).is_ok());
+        for bits in [0x20, 0x4, 0] {
+            let err = check_rootfs_is_nodev(sys::MountFlags::from_bits(bits)).unwrap_err();
+            assert_eq!(err.code, ErrorCode::FailedPrecondition, "{bits:#x}");
+            assert_eq!(err.stage, IsolationStage::PrepareRootfs, "{bits:#x}");
         }
     }
 

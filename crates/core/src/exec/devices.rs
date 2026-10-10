@@ -12,8 +12,9 @@
 //! （runc 方式。設計ドラフト `docs/design/dev-default-mounts.md` 3.1・オーナー判断 2026-10-10）である。
 //! これによりノードがホスト側の rootfs に残らず、イメージ同梱の `dev` 配下（偽ノード等）は tmpfs に
 //! 覆い隠されてコンテナから見えない。覆い隠す効果は `dev` 配下に限る（#1667 の事後監査 P2）: rootfs の残りの
-//! 部分にイメージが同梱したデバイスノードは、rootful では rootfs の自己 bind に `nodev` が無く、汎用のデバイス
-//! cgroup も無いため開けてしまう（rootfs の `nodev` 化とデバイス cgroup は別の Issue で追跡する。SEC-1）。
+//! 部分にイメージが同梱したデバイスノードは、`prepare_rootfs` が rootful・rootless を問わず自己 bind に付ける `nodev`
+//! （#1676。オーナー判断 2026-10-10）で開けない。`nodev` は rootfs の mount top 1 枚だけに掛かり、本モジュールが
+//! 後から載せる `/dev` の tmpfs・devpts・rootless の bind（#1660）には及ばない。汎用のデバイス cgroup は #1677 で扱う（SEC-1）。
 //! tmpfs の作成は `sys::mount_dev_tmpfs_on`（#1652。mode 0755・64 MiB・`nosuid|strictatime`・`nodev`/`noexec`
 //! なし）を使う。
 //!
@@ -2754,6 +2755,49 @@ mod tests {
             creates,
             vec!["exec/devices.rs".to_owned(), "sys.rs".to_owned()]
         );
+    }
+
+    /// SEC-1・CORE-6（#1676・#1660）: rootfs の `nodev`（`sys::set_mount_nodev`）の呼び出しは
+    /// `exec/rootfs.rs` の `nodev_syscall` の 1 か所だけで、`mount_setattr(2)` の syscall 番号を使うのも `sys` だけ。
+    /// 本モジュールの `/dev` の tmpfs・devpts・rootless の bind（ホストのノードの複製）へ `nodev` を掛ける経路が
+    /// 無いことを、ソースの走査で機械的に確かめる（`nodev` が及ぶとノードを開けなくなる）。
+    #[test]
+    fn sec1_core6_rootfs_nodev_has_single_call_site() {
+        // 走査する語を分割して書き、本試験の行自体が一致しないようにする。
+        let call = concat!("set_mount", "_nodev(");
+        let number = concat!("SYS_MOUNT", "_SETATTR");
+        let mut calls = Vec::new();
+        let mut numbers = Vec::new();
+        for (rel, text) in crate_sources() {
+            for line in text.lines() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                if code.contains(call) {
+                    calls.push((rel.clone(), code.to_owned()));
+                }
+                if code.contains(number) && !numbers.contains(&rel) {
+                    numbers.push(rel.clone());
+                }
+            }
+        }
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "exec/rootfs.rs".to_owned(),
+                    format!("sys::{call}mount_top)")
+                ),
+                (
+                    "sys.rs".to_owned(),
+                    format!(
+                        "pub(crate) fn {call}mount_top: BorrowedFd<'_>) -> Result<(), SysError> {{"
+                    )
+                ),
+            ]
+        );
+        assert_eq!(numbers, vec!["sys.rs".to_owned()]);
     }
 
     // ---- rootless 経路: ホストのノードの bind（#1660。CORE-6・SEC-5・CORE-1）----

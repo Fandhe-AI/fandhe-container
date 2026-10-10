@@ -272,6 +272,10 @@ mod consts {
     pub const OPEN_TREE_CLONE: u32 = 1;
     pub const OPEN_TREE_CLOEXEC: u32 = 0o2_000_000;
     pub const OPEN_TREE_AT_EMPTY_PATH: u32 = 0x1000;
+    // mount_setattr(2)（#1676・rootfs の nodev。CORE-1・SEC-1）。arch/x86/entry/syscalls/syscall_64.tbl の 442。
+    // `AT_EMPTY_PATH` は `mount_setattr` 用に u32 で持つ。
+    pub const SYS_MOUNT_SETATTR: ArchSysNo = ArchSysNo::new(442);
+    pub const MOUNT_SETATTR_AT_EMPTY_PATH: u32 = 0x1000;
     // arch/x86/entry/syscalls/syscall_64.tbl の `pidfd_send_signal`（424）・`pidfd_open`（434）。
     pub const SYS_PIDFD_SEND_SIGNAL: ArchSysNo = ArchSysNo::new(424);
     pub const SYS_PIDFD_OPEN: ArchSysNo = ArchSysNo::new(434);
@@ -310,6 +314,8 @@ mod consts {
     pub const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
     // include/linux/statfs.h の `ST_NOEXEC`・`ST_VALID`（`statfs.f_flags`。全アーキテクチャ共通）。
     pub const ST_NOEXEC: i64 = 0x0008;
+    // include/linux/statfs.h の `ST_NODEV`（#1676・rootfs の nodev の事後検証）。
+    pub const ST_NODEV: i64 = 0x0004;
     pub const ST_VALID: i64 = 0x0020;
     // arch/x86/entry/syscalls/syscall_64.tbl の `execveat`。
     pub const SYS_EXECVEAT: ArchSysNo = ArchSysNo::new(322);
@@ -505,6 +511,10 @@ mod consts {
     pub const OPEN_TREE_CLONE: u32 = 1;
     pub const OPEN_TREE_CLOEXEC: u32 = 0o2_000_000;
     pub const OPEN_TREE_AT_EMPTY_PATH: u32 = 0x1000;
+    // mount_setattr(2)（#1676・rootfs の nodev。CORE-1・SEC-1）。include/uapi/asm-generic/unistd.h の
+    // `__NR_mount_setattr`（442）。`AT_EMPTY_PATH` は `mount_setattr` 用に u32 で持つ。
+    pub const SYS_MOUNT_SETATTR: ArchSysNo = ArchSysNo::new(442);
+    pub const MOUNT_SETATTR_AT_EMPTY_PATH: u32 = 0x1000;
     // include/uapi/asm-generic/unistd.h の `__NR_pidfd_send_signal`・`__NR_pidfd_open`（arm64 は
     // asm-generic の表。x86_64 と値が同じでも流用せず個別に定義する）。
     pub const SYS_PIDFD_SEND_SIGNAL: ArchSysNo = ArchSysNo::new(424);
@@ -547,6 +557,8 @@ mod consts {
     pub const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
     // include/linux/statfs.h の `ST_NOEXEC`・`ST_VALID`（`statfs.f_flags`。全アーキテクチャ共通）。
     pub const ST_NOEXEC: i64 = 0x0008;
+    // include/linux/statfs.h の `ST_NODEV`（#1676・rootfs の nodev の事後検証）。
+    pub const ST_NODEV: i64 = 0x0004;
     pub const ST_VALID: i64 = 0x0020;
     // include/uapi/asm-generic/unistd.h の `__NR_execveat`（arm64 は asm-generic の表。
     // x86_64 の 322 を流用しない）。
@@ -737,6 +749,8 @@ mod consts {
     pub const OPEN_TREE_CLONE: u32 = 0;
     pub const OPEN_TREE_CLOEXEC: u32 = 0;
     pub const OPEN_TREE_AT_EMPTY_PATH: u32 = 0;
+    pub const SYS_MOUNT_SETATTR: ArchSysNo = ArchSysNo::UNSUPPORTED;
+    pub const MOUNT_SETATTR_AT_EMPTY_PATH: u32 = 0;
     pub const SYS_PIDFD_SEND_SIGNAL: ArchSysNo = ArchSysNo::UNSUPPORTED;
     pub const SYS_PIDFD_OPEN: ArchSysNo = ArchSysNo::UNSUPPORTED;
     pub const CLOSE_RANGE_CLOEXEC: i64 = 0;
@@ -761,6 +775,7 @@ mod consts {
     pub const ENOTEMPTY: i32 = -17;
     pub const CGROUP2_SUPER_MAGIC: i64 = 0;
     pub const ST_NOEXEC: i64 = 0;
+    pub const ST_NODEV: i64 = 0;
     pub const ST_VALID: i64 = 0;
     pub const SYS_EXECVEAT: ArchSysNo = ArchSysNo::UNSUPPORTED;
     pub const AT_EMPTY_PATH: i64 = 0;
@@ -1820,7 +1835,8 @@ fn open_tree_clone_flags() -> u32 {
 /// マウントフラグは緩めも追加もしない。複製はホスト側マウントのフラグ（locked flag 含む）を継承する。
 /// `nosuid`・`noexec` を付与しない理由は、マウントのルートが文字デバイス 1 個（上の型で強制）で他のファイルへ届かず、exec と
 /// setuid が通常ファイルにしか効かないため守る対象が無いこと（runc の `bindMountDeviceNode` も `MS_BIND` のみ）。
-/// `nodev` はノードが使えなくなるため付けてはならない。よって `mount_setattr` は本 Issue では足さない。
+/// `nodev` はノードが使えなくなるため付けてはならない。よってデバイスノードの bind には `mount_setattr` を掛けない
+/// （[`set_mount_nodev`] は rootfs 専用で nodev 固定。#1676）。
 ///
 /// 必要なカーネルは Linux 5.2 以降。`ENOSYS` は [`SysError::Unsupported`] で返し、`mount(2)` へは縮退しない。
 /// user namespace では自分の mount namespace を所有する userns の `CAP_SYS_ADMIN` が要る。
@@ -1858,6 +1874,92 @@ fn open_tree_clone_raw(node: RawFd) -> Result<OwnedFd, SysError> {
             i64::from(open_tree_clone_flags()),
         )
     })
+}
+
+/// `mount_setattr(2)` の `struct mount_attr`（include/uapi/linux/mount.h。`MOUNT_ATTR_SIZE_VER0` = 32 バイト）。
+/// 値は [`rootfs_nodev_mount_attr`] だけが作る（任意のビットを渡す経路を持たない。REPAIR-2・SEC-1）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MountAttr {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
+}
+
+/// rootfs の自己 bind に足す属性。`nodev` を足すだけで、既存の属性は外さない（`attr_clr` = 0）。
+#[cfg_attr(test, allow(dead_code))]
+const fn rootfs_nodev_mount_attr() -> MountAttr {
+    MountAttr {
+        attr_set: consts::MOUNT_ATTR_NODEV as u64,
+        attr_clr: 0,
+        propagation: 0,
+        userns_fd: 0,
+    }
+}
+
+/// `mount_setattr(2)` の `flags`。`AT_EMPTY_PATH` のみで、`AT_RECURSIVE` は付けない（mount top 1 枚だけに掛ける）。
+#[cfg_attr(test, allow(dead_code))]
+const fn mount_setattr_flags() -> u32 {
+    consts::MOUNT_SETATTR_AT_EMPTY_PATH
+}
+
+/// 単体テストの dry-run が記録する、本番ラッパーと同じ値の組
+/// `(attr_set, attr_clr, propagation, userns_fd, flags, size)`。
+#[cfg(test)]
+pub(crate) fn rootfs_nodev_call_params() -> (u64, u64, u64, u64, u32, usize) {
+    let a = rootfs_nodev_mount_attr();
+    (
+        a.attr_set,
+        a.attr_clr,
+        a.propagation,
+        a.userns_fd,
+        mount_setattr_flags(),
+        std::mem::size_of::<MountAttr>(),
+    )
+}
+
+/// `mount_top`（マウントのルートを指す fd）のマウントに `nodev` を足す（`mount_setattr(2)`。再帰なし）。
+///
+/// rootfs の自己 bind は初回の `MS_BIND` がフラグを無視するため `nodev` が付かない。イメージが
+/// `/dev` 以外へ同梱したデバイスノードを開けないよう、`crate::exec::prepare_rootfs` が検証済みの mount top の
+/// fd に対して `/dev` の tmpfs を載せる前に、rootful・rootless を問わず常に呼ぶ（#1676・SEC-1・CORE-1・TASK-27.3。
+/// オーナー判断 2026-10-10）。rootless では mount namespace を所有する user namespace の `CAP_SYS_ADMIN` で通る。値は nodev 固定で、
+/// 既存の属性は変えない。パスは渡さず `AT_EMPTY_PATH` で fd 自身を対象にする。
+///
+/// fd がマウントのルートでない、または呼び出し側の mount namespace の外にあると `EINVAL`。必要なカーネルは
+/// Linux 5.12 以降で、`ENOSYS` は [`SysError::Unsupported`] で返し `mount(2)` へは縮退しない。seccomp の既定の
+/// 拒否集合は `mount_setattr`（`DeniedSyscall::MountSetattr`）を含むため、フィルタの適用前に呼ぶ。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn set_mount_nodev(mount_top: BorrowedFd<'_>) -> Result<(), SysError> {
+    set_mount_nodev_raw(mount_top.as_raw_fd())
+}
+
+/// [`set_mount_nodev`] の本体。無効 fd の拒否（`EBADF`）を単体テストで確かめるために `RawFd` を受ける。
+#[cfg_attr(test, allow(dead_code))]
+fn set_mount_nodev_raw(fd: RawFd) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let nr = consts::SYS_MOUNT_SETATTR.get()?;
+    let attr = rootfs_nodev_mount_attr();
+    // SAFETY: `fd` は fd 番号の整数で、カーネルが検証する（無効なら `EBADF`）。パスは静的な空文字列（NUL 終端）で、
+    // `AT_EMPTY_PATH` により fd 自身が対象になる。`attr` は呼び出しの間生存する 32 バイトの `repr(C)` で、
+    // カーネルは読むだけ（`size` は構造体の大きさ）。副作用は fd が指す 1 マウントへの nodev 追加に限る。
+    let rc = unsafe {
+        syscall(
+            nr,
+            i64::from(fd),
+            c"".as_ptr(),
+            i64::from(mount_setattr_flags()),
+            &raw const attr,
+            std::mem::size_of::<MountAttr>(),
+        )
+    };
+    if rc == -1 {
+        return Err(new_mount_api_error());
+    }
+    Ok(())
 }
 
 /// devpts の `statfs.f_type`（include/uapi/linux/magic.h の `DEVPTS_SUPER_MAGIC`。アーキテクチャ非依存）。
@@ -2942,6 +3044,12 @@ impl MountFlags {
         self.0 & consts::ST_VALID != 0
     }
 
+    /// マウントが `nodev`（`ST_NODEV`。`MNT_NODEV` 由来）か。rootfs の nodev 付与の事後検証に使う
+    /// （`crate::exec::prepare_rootfs`。#1676・SEC-1）。
+    pub(crate) fn is_nodev(self) -> bool {
+        self.0 & consts::ST_NODEV != 0
+    }
+
     /// マウントが `noexec`（`ST_NOEXEC`。`MNT_NOEXEC` 由来）か。
     pub(crate) fn is_noexec(self) -> bool {
         self.0 & consts::ST_NOEXEC != 0
@@ -3927,6 +4035,7 @@ mod tests {
             consts::SYS_FSCONFIG,
             consts::SYS_FSMOUNT,
             consts::SYS_OPEN_TREE,
+            consts::SYS_MOUNT_SETATTR,
             consts::SYS_PIDFD_SEND_SIGNAL,
             consts::SYS_PIDFD_OPEN,
             consts::SYS_EXECVEAT,
@@ -3942,7 +4051,7 @@ mod tests {
             consts::SYS_KEXEC_LOAD,
         ];
         let errors: Vec<_> = numbers.iter().map(|n| n.get().err()).collect();
-        assert_eq!(errors, vec![Some(SysError::Unsupported); 20]);
+        assert_eq!(errors, vec![Some(SysError::Unsupported); 21]);
     }
 
     /// CORE-5・TASK-39.1: Landlock 関連定数の固定値照合（arch ごとに個別定義した値の誤り検出）。
@@ -4635,6 +4744,58 @@ mod tests {
             assert_eq!(open_tree_clone_flags() & 0x8000, 0);
             assert_eq!(open_tree_clone_flags() & 0x2, 0);
             assert_eq!(move_mount_empty_path_flags(), 0x44);
+        }
+    }
+
+    /// CORE-1・SEC-1（TASK-27.3 追補・#1676）: `mount_setattr` の syscall 番号（x86_64・aarch64 とも 442）、
+    /// `struct mount_attr` の大きさ（32 バイト）、渡す値（nodev を足すだけ・`AT_RECURSIVE` なし）の具体値。
+    #[test]
+    fn core1_sec1_mount_setattr_consts_and_attr_are_exact() {
+        #[cfg(all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            assert_eq!(
+                consts::SYS_MOUNT_SETATTR.get().map(SyscallNumber::raw),
+                Ok(442)
+            );
+            assert_eq!(consts::MOUNT_SETATTR_AT_EMPTY_PATH, 0x1000);
+            assert_eq!(consts::ST_NODEV, 4);
+            assert_eq!(
+                rootfs_nodev_call_params(),
+                (0x4, 0, 0, 0, 0x1000, 32),
+                "attr_set, attr_clr, propagation, userns_fd, flags, size"
+            );
+            // AT_RECURSIVE（0x8000）は付けない。
+            assert_eq!(mount_setattr_flags() & 0x8000, 0);
+        }
+        assert_eq!(std::mem::size_of::<MountAttr>(), 32);
+    }
+
+    /// SEC-1（#1676）: `is_nodev` は `ST_NODEV`（0x4）だけを見る。
+    #[test]
+    fn sec1_mount_flags_is_nodev_boundaries() {
+        #[cfg(all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            assert!(MountFlags::from_bits(0x4).is_nodev());
+            assert!(!MountFlags::from_bits(0x20).is_nodev());
+            assert!(MountFlags::from_bits(0x20 | 0x4).is_nodev());
+            assert!(!MountFlags::from_bits(0).is_nodev());
+        }
+    }
+
+    /// SEC-1（#1676）: 無効 fd は失敗する。特権の有無でカーネルの検査順が変わるため、非特権では `may_mount` の
+    /// `EPERM` が `EBADF` より先に返り得る。`ENOSYS` の旧カーネルでは `Unsupported` が先に返るため受け入れる。
+    #[test]
+    fn sec1_set_mount_nodev_rejects_invalid_fd() {
+        match set_mount_nodev_raw(-1) {
+            Err(SysError::Os(e)) => assert!(e == EBADF || e == EPERM, "errno {e}"),
+            Err(SysError::Unsupported) => {}
+            other => panic!("unexpected: {other:?}"),
         }
     }
 

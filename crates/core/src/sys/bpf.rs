@@ -563,6 +563,177 @@ mod tests {
         assert_eq!(CgroupDeviceQuery::new(0, 1000, ids).prog_ids().len(), 64);
     }
 
+    /// SEC-1・CORE-4・TASK-32: verifier ログ付きで再実行するのは `EINVAL`（22）・`EACCES`（13）だけ。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn sec1_core4_task32_retry_errnos_are_exact() {
+        assert_eq!((consts::EINVAL, consts::EACCES), (22, 13));
+        assert!(retries_with_verifier_log(SysError::Os(22)));
+        assert!(retries_with_verifier_log(SysError::Os(13)));
+        // EPERM（1）・E2BIG（7）・EAGAIN（11）・ENOSPC（28）・ENOSYS（38）・対応外は再実行しない。
+        for cause in [
+            SysError::Os(1),
+            SysError::Os(7),
+            SysError::Os(11),
+            SysError::Os(28),
+            SysError::Os(38),
+            SysError::Unsupported,
+        ] {
+            assert!(!retries_with_verifier_log(cause), "{cause:?}");
+        }
+    }
+
+    /// 再試行の試験用の偽ローダー。呼ばれるたびに「ログバッファを渡されたか」を記録し、`log` が
+    /// `Some` なら `log_text` をバッファの先頭へ書いて（カーネルの verifier ログの代わり）、`results` を
+    /// 先頭から順に返す。syscall は呼ばない。
+    struct FakeLoader {
+        results: std::collections::VecDeque<Result<OwnedFd, SysError>>,
+        log_text: &'static [u8],
+        calls: Vec<bool>,
+    }
+
+    impl FakeLoader {
+        fn new(results: Vec<Result<OwnedFd, SysError>>, log_text: &'static [u8]) -> Self {
+            Self {
+                results: results.into(),
+                log_text,
+                calls: Vec::new(),
+            }
+        }
+
+        fn load(
+            &mut self,
+            log: Option<&mut [u8; BPF_VERIFIER_LOG_CAP]>,
+        ) -> Result<OwnedFd, SysError> {
+            self.calls.push(log.is_some());
+            if let Some(buf) = log {
+                buf[..self.log_text.len()].copy_from_slice(self.log_text);
+            }
+            self.results
+                .pop_front()
+                .expect("unexpected extra BPF_PROG_LOAD call")
+        }
+    }
+
+    fn dev_null_fd() -> OwnedFd {
+        OwnedFd::from(std::fs::File::open("/dev/null").unwrap())
+    }
+
+    /// SEC-1・CORE-4・TASK-32: 1 回目が成功すればその fd を返し、再実行もログも無い。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn sec1_core4_task32_load_success_does_not_retry() {
+        let program = default_program();
+        let fd = dev_null_fd();
+        let raw = fd.as_raw_fd();
+        let mut fake = FakeLoader::new(vec![Ok(fd)], b"unused\0");
+        let prog = load_with_verifier_log_retry(&program, |p, log| {
+            assert!(std::ptr::eq(p, &program));
+            fake.load(log)
+        })
+        .unwrap();
+        assert_eq!(prog.as_fd().as_raw_fd(), raw);
+        assert_eq!(fake.calls, vec![false]);
+    }
+
+    /// SEC-1・CORE-4・TASK-32: `EINVAL`・`EACCES` 以外の失敗は再実行せず、ログ無しで 1 回目の errno を返す。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn sec1_core4_task32_load_other_errnos_do_not_retry() {
+        let program = default_program();
+        // EPERM（1）・E2BIG（7）・EAGAIN（11）・ENOSPC（28）・ENOSYS（38）。
+        for errno in [1, 7, 11, 28, 38] {
+            let mut fake = FakeLoader::new(vec![Err(SysError::Os(errno))], b"unused\0");
+            let e = load_with_verifier_log_retry(&program, |_, log| fake.load(log)).unwrap_err();
+            assert_eq!(
+                e,
+                BpfProgLoadError {
+                    cause: SysError::Os(errno),
+                    verifier_log: None,
+                }
+            );
+            assert_eq!(fake.calls, vec![false], "errno {errno}");
+        }
+    }
+
+    /// SEC-1・CORE-4・TASK-32: `EINVAL` ではログ付きで 1 回だけ再実行し、再実行の errno（ENOSPC＝ログの
+    /// 切り詰めを含む）に関わらず 1 回目の `EINVAL` とバッファのログを返す。ログが空なら `None`。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn sec1_core4_task32_load_einval_retries_with_log_and_keeps_first_error() {
+        let program = default_program();
+        for retry_errno in [22, 28] {
+            let mut fake = FakeLoader::new(
+                vec![Err(SysError::Os(22)), Err(SysError::Os(retry_errno))],
+                b"0: (b7) r0 = 0\nR0 !read_ok\0",
+            );
+            let e = load_with_verifier_log_retry(&program, |_, log| fake.load(log)).unwrap_err();
+            assert_eq!(
+                e,
+                BpfProgLoadError {
+                    cause: SysError::Os(22),
+                    verifier_log: Some("0: (b7) r0 = 0\nR0 !read_ok".to_owned()),
+                }
+            );
+            assert_eq!(fake.calls, vec![false, true], "retry errno {retry_errno}");
+        }
+
+        let mut fake = FakeLoader::new(vec![Err(SysError::Os(22)), Err(SysError::Os(22))], b"");
+        let e = load_with_verifier_log_retry(&program, |_, log| fake.load(log)).unwrap_err();
+        assert_eq!(
+            e,
+            BpfProgLoadError {
+                cause: SysError::Os(22),
+                verifier_log: None,
+            }
+        );
+        assert_eq!(fake.calls, vec![false, true]);
+    }
+
+    /// SEC-1・CORE-4・TASK-32: `EACCES` の再実行が成功しても 1 回目の `EACCES` を返し（fail-closed）、
+    /// 再実行で得た fd は直ちに閉じる。fd を UNIX ソケット対の片側にして、相手側の読み出しが EOF（0 バイト）
+    /// になることで close を照合する。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn sec1_core4_task32_load_eacces_retry_success_is_closed_and_rejected() {
+        use std::io::Read as _;
+
+        let program = default_program();
+        let (ours, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut fake = FakeLoader::new(
+            vec![Err(SysError::Os(13)), Ok(OwnedFd::from(ours))],
+            b"invalid access\0",
+        );
+        let e = load_with_verifier_log_retry(&program, |_, log| fake.load(log)).unwrap_err();
+        assert_eq!(
+            e,
+            BpfProgLoadError {
+                cause: SysError::Os(13),
+                verifier_log: Some("invalid access".to_owned()),
+            }
+        );
+        assert_eq!(fake.calls, vec![false, true]);
+        let mut buf = [0u8; 1];
+        assert_eq!(peer.read(&mut buf).unwrap(), 0);
+    }
+
     /// 対応外 arch ではロードは `Unsupported`（fail-closed）。
     #[cfg(not(all(
         target_pointer_width = "64",

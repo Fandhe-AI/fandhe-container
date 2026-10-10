@@ -159,6 +159,10 @@ pub enum ViolationReason {
     TargetOnSharedMount,
     /// fd で固定した後にマウント先が改名・移動・削除された。
     TargetMoved,
+    /// rootless の基本デバイスノードの bind 元（ホストの `/dev/<名前>`）が、期待する文字デバイスではない
+    /// （symlink・通常ファイル・ディレクトリ、または `rdev` が固定表と違う）。bind せずに拒否する
+    /// （TASK-29 追補・#1660。CORE-6・SEC-5）。
+    HostDeviceNodeUnexpected,
     /// rootfs が `/`（ホスト root）そのもの。ホスト root への pivot は無意味かつ危険なため拒否する。
     RootfsIsHostRoot,
     /// rootfs が shared propagation 上にある（pivot_root は EINVAL になり、bind もホストへ伝播し得る）。
@@ -379,6 +383,7 @@ impl ViolationReason {
             Self::PathMissing => "path_missing",
             Self::TargetOnSharedMount => "target_on_shared_mount",
             Self::TargetMoved => "target_moved",
+            Self::HostDeviceNodeUnexpected => "host_device_node_unexpected",
             Self::RootfsIsHostRoot => "rootfs_is_host_root",
             Self::RootfsOnSharedMount => "rootfs_on_shared_mount",
             Self::RootfsMoved => "rootfs_moved",
@@ -436,7 +441,8 @@ impl ViolationReason {
             | Self::TargetIsRootfs
             | Self::PathSymlinkOrNotDirectory
             | Self::PathMissing
-            | Self::TargetMoved => ViolationKind::MountTarget,
+            | Self::TargetMoved
+            | Self::HostDeviceNodeUnexpected => ViolationKind::MountTarget,
             Self::TargetOnSharedMount | Self::RootfsOnSharedMount => {
                 ViolationKind::SharedPropagation
             }
@@ -468,9 +474,10 @@ impl ViolationReason {
     /// 違反した前提のビヘイビア ID（SSOT: spec `04-behavior/`）。
     pub fn behavior_id(self) -> &'static str {
         match self {
-            Self::UserNamespaceRequired | Self::HostRootIdentityMapping | Self::IdentityChanged => {
-                "SEC-5"
-            }
+            Self::UserNamespaceRequired
+            | Self::HostRootIdentityMapping
+            | Self::IdentityChanged
+            | Self::HostDeviceNodeUnexpected => "SEC-5",
             Self::ExecTargetCgroupMismatch
             | Self::StdioNullNotNullDevice
             | Self::EntrypointInterpreterIsRuntimeBinary
@@ -525,6 +532,7 @@ impl ViolationReason {
             | Self::EvidencePidNamespaceMismatch
             | Self::TargetOnSharedMount
             | Self::TargetMoved
+            | Self::HostDeviceNodeUnexpected
             | Self::RootfsOnSharedMount
             | Self::RootfsMoved
             | Self::RootfsHasSubmounts
@@ -627,6 +635,9 @@ impl ViolationReason {
                 "mount target is on a shared mount; isolate the mount namespace first"
             }
             Self::TargetMoved => "mount target was moved or removed after validation",
+            Self::HostDeviceNodeUnexpected => {
+                "host device node is not the expected character device; refusing to bind it"
+            }
             Self::RootfsIsHostRoot => "rootfs must not be the host root '/'",
             Self::RootfsOnSharedMount => {
                 "rootfs is on a shared mount; isolate the mount namespace first"
@@ -1131,6 +1142,29 @@ mod tests {
         );
     }
 
+    /// CORE-6・SEC-5・SEC-4（TASK-29 追補・#1660）: ホストのデバイスノードの不一致の理由コード・種別・ビヘイビア ID・
+    /// `ErrorCode`・メッセージの具体値と、層 Mount へのパス付きの写像。
+    #[test]
+    fn core6_sec5_1660_host_device_node_unexpected_metadata_is_exact() {
+        let r = ViolationReason::HostDeviceNodeUnexpected;
+        assert_eq!(r.as_str(), "host_device_node_unexpected");
+        assert_eq!(r.kind().as_str(), "mount_target");
+        assert_eq!(r.behavior_id(), "SEC-5");
+        assert_eq!(r.error_code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            r.message(),
+            "host device node is not the expected character device; refusing to bind it"
+        );
+        let v = IsolationViolation::new(r, Some(Path::new("/dev/null")));
+        assert_eq!(
+            v.mount_audit_event(),
+            Some(AuditEvent::Mount {
+                path: Some(AuditPath::new(Path::new("/dev/null")))
+            })
+        );
+        assert_eq!(v.exec_audit_event(), None);
+    }
+
     /// SEC-4・SUP-6・TASK-163 追補: exec 対象の 10 理由は許可リスト往復でき、対象外・未知は引けない。
     #[test]
     fn sec4_sup6_task163_exec_target_token_allowlist() {
@@ -1278,7 +1312,7 @@ mod tests {
 
         for r in ViolationReason::ENTRYPOINT_REASONS {
             let sink = VecSink::new(false);
-            let out = record_entrypoint_rejection("rejected", r, &sink);
+            let out = record_entrypoint_rejection("rejected", r, None, &sink);
             assert_eq!(out.delivery, AuditDelivery::Recorded, "{r:?}");
             assert_eq!(out.error, "rejected");
             let recs = sink.snapshot();
@@ -1289,7 +1323,7 @@ mod tests {
             assert_eq!(recs[0].pid().get(), std::process::id());
 
             let failing = VecSink::new(true);
-            let out = record_entrypoint_rejection("rejected", r, &failing);
+            let out = record_entrypoint_rejection("rejected", r, None, &failing);
             assert!(
                 matches!(out.delivery, AuditDelivery::SinkFailed(_)),
                 "{r:?}"
@@ -1301,7 +1335,7 @@ mod tests {
             ViolationReason::TargetMoved,
         ] {
             let sink = VecSink::new(false);
-            let out = record_entrypoint_rejection("x", r, &sink);
+            let out = record_entrypoint_rejection("x", r, None, &sink);
             assert_eq!(out.delivery, AuditDelivery::NotApplicable);
             assert_eq!(sink.snapshot().len(), 0);
         }
@@ -1317,7 +1351,7 @@ mod tests {
 
         for r in ViolationReason::EXEC_WORKER_REASONS {
             let sink = VecSink::new(false);
-            let out = record_exec_worker_rejection("rejected", r, &sink);
+            let out = record_exec_worker_rejection("rejected", r, None, &sink);
             assert_eq!(out.delivery, AuditDelivery::Recorded, "{r:?}");
             assert_eq!(out.error, "rejected");
             let recs = sink.snapshot();
@@ -1331,9 +1365,10 @@ mod tests {
             assert_eq!(recs[0].reason().map(AuditReason::as_str), reason);
             assert_eq!(recs[0].path(), None);
             assert_eq!(recs[0].pid().get(), std::process::id());
+            assert_eq!(recs[0].container_id(), None);
 
             let failing = VecSink::new(true);
-            let out = record_exec_worker_rejection("rejected", r, &failing);
+            let out = record_exec_worker_rejection("rejected", r, None, &failing);
             assert!(
                 matches!(out.delivery, AuditDelivery::SinkFailed(_)),
                 "{r:?}"
@@ -1346,7 +1381,7 @@ mod tests {
             ViolationReason::EntrypointIsRuntimeBinary,
         ] {
             let sink = VecSink::new(false);
-            let out = record_exec_worker_rejection("x", r, &sink);
+            let out = record_exec_worker_rejection("x", r, None, &sink);
             assert_eq!(out.delivery, AuditDelivery::NotApplicable, "{r:?}");
             assert_eq!(sink.snapshot().len(), 0);
         }
@@ -1365,7 +1400,7 @@ mod tests {
             None,
             IsolationStage::Exec,
         );
-        let r = audit_entrypoint_violation(err, &sink);
+        let r = audit_entrypoint_violation(err, None, &sink);
         assert_eq!(r.delivery, AuditDelivery::Recorded);
         assert_eq!(
             r.error.violation.as_ref().map(|v| v.reason),
@@ -1376,14 +1411,14 @@ mod tests {
         assert_eq!(recs[0].layer(), AuditLayer::Entrypoint);
 
         let sys = ExecError::new(ErrorCode::Internal, IsolationStage::Exec, "sys");
-        let r = audit_entrypoint_violation(sys, &sink);
+        let r = audit_entrypoint_violation(sys, None, &sink);
         assert_eq!(r.delivery, AuditDelivery::NotApplicable);
         let mount = ExecError::from_violation_at(
             ViolationReason::PathParentComponent,
             Some(Path::new("/a/../b")),
             IsolationStage::PrepareRootfs,
         );
-        let r = audit_entrypoint_violation(mount, &sink);
+        let r = audit_entrypoint_violation(mount, None, &sink);
         assert_eq!(r.delivery, AuditDelivery::NotApplicable);
         assert_eq!(sink.snapshot().len(), 1);
     }
@@ -1401,7 +1436,8 @@ mod tests {
             Some(Path::new("/tmp/a/../b")),
             IsolationStage::PrepareRootfs,
         );
-        let r = audit_mount_violation(err, &sink);
+        let cid = crate::traits::ContainerId::new("c1").unwrap();
+        let r = audit_mount_violation(err, Some(&cid), &sink);
         assert_eq!(r.delivery, AuditDelivery::Recorded);
         assert_eq!(
             r.error.violation.as_ref().map(|v| v.reason),
@@ -1411,9 +1447,10 @@ mod tests {
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].layer(), AuditLayer::Mount);
         assert_eq!(recs[0].path(), Some(Path::new("/tmp/a/../b")));
+        assert_eq!(recs[0].container_id().map(|c| c.as_str()), Some("c1"));
 
         let sys = ExecError::new(ErrorCode::Internal, IsolationStage::MountProc, "sys");
-        let r = audit_mount_violation(sys, &sink);
+        let r = audit_mount_violation(sys, None, &sink);
         assert_eq!(r.delivery, AuditDelivery::NotApplicable);
         assert_eq!(sink.snapshot().len(), 1);
     }

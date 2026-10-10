@@ -15,7 +15,7 @@
 #         不一致は「前提未達」の事実であり、合格に見せてはならない。
 #
 # 呼び出し元: Makefile の `cli-parity`（操作者が明示実行。make ci には含めない）。自己テストは
-# scripts/cli-parity-check-selftest.sh（`make cli-parity-selftest`。CI の integration-test ジョブ）。
+# scripts/cli-parity-check-selftest.sh（`make cli-parity-selftest`。CI の platform-ci ジョブ）。
 # 本スクリプトは sudo を呼ばない。状態ルートは毎回 mktemp -d の専用ディレクトリで、全ケースで --root を
 # 明示する（既定の状態ルートやホスト設定に触れない）。
 #

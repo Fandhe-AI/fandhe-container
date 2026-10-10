@@ -57,7 +57,7 @@ cargo run --manifest-path poc/venus-decoder/jig/Cargo.toml --bin venus-jig -- \
 ## 実行
 
 ```bash
-make poc-venus-jig-check   # CI は rust-ci-default-features ジョブが 3 OS で実行
+make poc-venus-jig-check   # CI は platform-ci ジョブが実行（PR は ubuntu・main は 3 OS）
 # 実機前提テスト（既定の集合から分離。GPU 付き Linux・治具 VMM・Mesa venus ゲストが必要）
 FANDHE_VENUS_JIG_LOG=<ログファイル> cargo test --manifest-path poc/venus-decoder/jig/Cargo.toml \
   --test real_machine_capset_log -- --ignored

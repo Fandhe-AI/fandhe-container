@@ -5,8 +5,8 @@
 # 作り、判定スクリプトを実際に走らせて終了コードと出力を具体値で照合する。実リポのファイルは使わない。
 # 判定スクリプトは自身の位置からリポジトリを決めるため、fixture の scripts/ へ複製して実行する。
 # 呼び出し元は Makefile の `plug4-core-invariance-selftest` と `.github/workflows/ci.yml` の
-# `integration-test` ジョブ（ubuntu・macos・windows の 3 OS。GNU / BSD 双方のツールと Windows の Git Bash で
-# 動くことを実行で確かめる）。
+# `platform-ci` ジョブ（main への push では ubuntu・macos・windows の 3 OS、PR では ubuntu。GNU / BSD 双方の
+# ツールと Windows の Git Bash で動くことを実行で確かめる）。
 #
 # 照合する内容:
 #   - plugin crate を追加しない場合・plugin crate だけを追加する PR は成功する

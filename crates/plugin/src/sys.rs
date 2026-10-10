@@ -202,6 +202,14 @@ const F_GETPIPE_SZ: i32 = 1032;
 ))]
 const MSG_DONTWAIT: i32 = 0x40;
 
+/// `MSG_NOSIGNAL`（相手が閉じた socket への送信で `SIGPIPE` を出さず `EPIPE` だけを返す。呼び出し 1 回限り）。
+/// Linux x86_64 は `asm-generic` 由来の 0x4000（`include/linux/socket.h`）。アーキテクチャごとに個別定義する。
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const MSG_NOSIGNAL: i32 = 0x4000;
+/// Linux aarch64 の `MSG_NOSIGNAL`（x86_64 と同じ 0x4000。値が同じでも流用せず個別に定義する）。
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const MSG_NOSIGNAL: i32 = 0x4000;
+
 /// `O_NONBLOCK | O_NOCTTY`（Linux の x86_64・aarch64 とも `O_NONBLOCK` は 0o4000、`O_NOCTTY` は 0o400）。
 #[cfg(all(
     target_os = "linux",
@@ -242,12 +250,16 @@ fn is_pipe_fd(fd: i32) -> bool {
     unsafe { c_fcntl(fd, F_GETPIPE_SZ) >= 0 }
 }
 
-/// `/proc/self/fd/<fd>` のリンク先が無名 pipe（pipefs の `pipe:[<ino>]`）か。名前付き FIFO は絶対パスになり
+/// `/proc/thread-self/fd/<fd>` のリンク先が無名 pipe（pipefs の `pipe:[<ino>]`）か。名前付き FIFO は絶対パスになり
 /// `false`（#1605・REPAIR-5）。
 ///
 /// procfs の fd リンクの readlink はメモリ上の dentry から名前を組み立てるだけで（`d_path`）、リンク先の
 /// ファイルシステムへ問い合わせない。名前付き FIFO を開き直すと、その FIFO が置かれた NFS / FUSE の
 /// 権限確認・属性再検証で止まり得るため、この判定を通った無名 pipe だけを開き直す。
+///
+/// 残存リスク（未対策・実機未確認）: パス解決ではルート FS 上の `/proc` 要素を辿るため、ルートが FUSE / NFS
+/// （chroot・rootless の rootfs 等）だと `proc` の dentry の再検証で問い合わせが起き得る。対策案は起動時に
+/// `/proc/thread-self/fd` の dirfd を保持して `openat` 基準で解決すること。
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -271,8 +283,11 @@ fn is_anonymous_pipe_link(proc_fd_path: &std::path::Path) -> bool {
 /// たびにファイルシステムの flush が走り、捨てる経路でも止まり得るため。閉じるのは無名 pipe を開き直した
 /// fd（pipefs。flush を持たない）だけである。
 /// - ソケット（journald 等への stderr）: `send(MSG_DONTWAIT)`。この呼び出しだけ非ブロッキング
-/// - Linux の無名 pipe: `/proc/self/fd/N` を `O_NONBLOCK` で開き直した別 description へ書く
-///   （共有側のフラグは変わらない。満杯なら `WouldBlock`、読み手が無ければ open が `ENXIO`）
+/// - ソケットへは `MSG_NOSIGNAL` も付け、相手が閉じていても `SIGPIPE` を出さず `EPIPE` を返す
+/// - Linux の無名 pipe: `/proc/thread-self/fd/N` を `O_NONBLOCK` で開き直した別 description へ書く
+///   （共有側のフラグは変わらない。満杯なら `WouldBlock`、読み手が無ければ open が `ENXIO`）。`/proc/self` は
+///   スレッドグループのリーダーの fd 表を指し、`unshare(CLONE_FILES)` したスレッドでは別の fd になるため
+///   呼び出しスレッド自身の fd 表を指す `thread-self` を使う。開いた fd が pipe でなければ書かない
 /// - 上記以外（通常ファイル・キャラクタデバイス・名前付き FIFO 等）: 通常ファイルは
 ///   FUSE / NFS・FS freeze で、キャラクタデバイスは CUSE 等の open / write で、名前付き FIFO は置き場所の
 ///   NFS / FUSE での開き直し時の権限確認で無期限に止まり得て `O_NONBLOCK` でも防げず、保証できないため
@@ -282,7 +297,12 @@ fn is_anonymous_pipe_link(proc_fd_path: &std::path::Path) -> bool {
 /// `send(MSG_DONTWAIT)` が戻らないことを CI で観測した（#1605）ため、socket も含めて保証できる経路が無い。
 ///
 /// 満杯なら `WouldBlock`。部分書き込みも有り得るため書けたバイト数を返す。std の stderr ロックは取らない。
-/// 前提: 呼び出し中に別スレッドが同じ fd 番号を `dup2` 等で差し替えない（判定と書き込みが別の対象を指さないため）。
+/// 前提:
+/// - 呼び出し中に別スレッドが同じ fd 番号を `dup2` 等で差し替えない。崩れた場合、判定と開き直しの間に
+///   差し替わった対象を辿り、対象が NFS / FUSE 上なら open で止まり得る（開いた fd が pipe でなければ書かない
+///   ため、通常ファイルを上書きすることはない）
+/// - pipe 経路は open と write の間に読み手が閉じると `EPIPE` と `SIGPIPE` になり得る。write 1 回だけに効く
+///   `MSG_NOSIGNAL` 相当の手段が無いため、ホストが `SIGPIPE` を無視している（Rust の実行時の既定）ことを前提にする
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -291,21 +311,24 @@ pub(crate) fn write_nonblocking(fd: &impl AsFd, buf: &[u8]) -> io::Result<usize>
     let raw = fd.as_fd().as_raw_fd();
     if is_socket_fd(raw) {
         // SAFETY: `buf` は有効な読み取り専用スライスで、渡す長さは `buf.len()`。fd は呼び出し側の借用が
-        // 呼び出し中開いていることを保証する。`MSG_DONTWAIT` で待たない。`MSG_NOSIGNAL` は付けないが
-        // Rust ランタイムは `SIGPIPE` を無視している。
-        let w = unsafe { c_send(raw, buf.as_ptr(), buf.len(), MSG_DONTWAIT) };
+        // 呼び出し中開いていることを保証する。`MSG_DONTWAIT` で待たず、`MSG_NOSIGNAL` で相手が閉じた socket でも
+        // `SIGPIPE` を出さない（library としてホストのシグナル設定に依存しない）。
+        let w = unsafe { c_send(raw, buf.as_ptr(), buf.len(), MSG_DONTWAIT | MSG_NOSIGNAL) };
         return usize::try_from(w).map_err(|_| io::Error::last_os_error());
     }
     if is_pipe_fd(raw) {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let path = std::path::PathBuf::from(format!("/proc/self/fd/{raw}"));
+        let path = std::path::PathBuf::from(format!("/proc/thread-self/fd/{raw}"));
         if is_anonymous_pipe_link(&path) {
             let mut private = std::fs::OpenOptions::new()
                 .write(true)
                 .custom_flags(O_NONBLOCK_NOCTTY)
                 .open(path)?;
-            return private.write(buf);
+            // 判定と open の間に fd が差し替わった場合に、pipe 以外（通常ファイル等）へ書かない。
+            if is_pipe_fd(private.as_raw_fd()) {
+                return private.write(buf);
+            }
         }
     }
     Err(io::Error::from(io::ErrorKind::Unsupported))

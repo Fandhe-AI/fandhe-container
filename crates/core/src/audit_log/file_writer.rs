@@ -94,6 +94,10 @@ pub enum AuditWriteErrorKind {
     /// 主経路を隔離するプロセスを作れなかった（呼び出しプロセスが複数スレッドで fork できない等）。
     /// 期限を保証できないため主経路は試行せず、代替経路へ進む（fail-closed。`FileAuditSink`）。
     IsolationUnavailable,
+    /// 主経路を隔離した子プロセスが、継承した fd（3 以上）を閉じられなかった（`close_range(2)` が無い Linux 5.11
+    /// 未満のカーネル等）。子は I/O せずに終わり、代替経路へ進む（fail-closed。`FileAuditSink`。fork 不能の
+    /// `IsolationUnavailable` と運用で見分けるための別種別）。
+    IsolationFdsNotClosed,
 }
 
 impl AuditWriteErrorKind {
@@ -119,6 +123,7 @@ impl AuditWriteErrorKind {
             Self::KernelAuditIo => "kernel_audit_io",
             Self::IsolationTimeout => "isolation_timeout",
             Self::IsolationUnavailable => "isolation_unavailable",
+            Self::IsolationFdsNotClosed => "isolation_fds_not_closed",
         }
     }
 }
@@ -158,7 +163,8 @@ impl AuditWriteError {
             AuditWriteErrorKind::Lock
             | AuditWriteErrorKind::KernelAuditTimeout
             | AuditWriteErrorKind::IsolationTimeout => ErrorCode::Timeout,
-            AuditWriteErrorKind::IsolationUnavailable => ErrorCode::Unavailable,
+            AuditWriteErrorKind::IsolationUnavailable
+            | AuditWriteErrorKind::IsolationFdsNotClosed => ErrorCode::Unavailable,
             // 環境上カーネル監査へ到達できない状態（未実装ではない）。`Unimplemented` と区別する。
             AuditWriteErrorKind::KernelAuditUnavailable => ErrorCode::Unavailable,
             AuditWriteErrorKind::KernelAuditPermissionDenied => ErrorCode::PermissionDenied,
@@ -199,6 +205,9 @@ impl AuditWriteError {
             }
             AuditWriteErrorKind::IsolationUnavailable => {
                 "audit log write could not be isolated in a bounded child process"
+            }
+            AuditWriteErrorKind::IsolationFdsNotClosed => {
+                "isolated audit log writer could not close inherited file descriptors"
             }
         }
     }

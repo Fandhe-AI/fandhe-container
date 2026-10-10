@@ -1749,11 +1749,25 @@ pub(crate) fn change_dir_fd(fd: BorrowedFd<'_>) -> Result<(), SysError> {
 /// 行が無い・数値でない場合は `false`（fail-closed）。`crate::exec` の `status_threads` は
 /// 上位モジュールのため呼ばず（依存方向を保つ）、ここに最小の解析を持つ。
 fn threads_is_one(status: &str) -> bool {
+    status_thread_count(status) == Some(1)
+}
+
+/// `/proc/self/status` の内容から `Threads:` の値を読む純関数。行が無い・数値でない場合は `None`。
+fn status_thread_count(status: &str) -> Option<u64> {
     status
         .lines()
         .find_map(|l| l.strip_prefix("Threads:"))
         .and_then(|v| v.trim().parse::<u64>().ok())
-        == Some(1)
+}
+
+/// 呼び出しプロセスの現在のスレッド数（`/proc/self/status` の `Threads:`）。読めない・解釈できなければ `None`。
+///
+/// `crate::audit_log` の `FileAuditSink` が、通知の出し直しスレッドを join した後にスレッド数が元へ戻るのを
+/// 上限付きで待つために使う（join の完了からスレッドの解放までの短い間は増えたまま読めるため。REPAIR-5・SUP-6）。
+pub(crate) fn current_thread_count() -> Option<u64> {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| status_thread_count(&status))
 }
 
 /// `child` をシングルスレッドの呼び出し元から `fork(2)` した子で実行し、親には子の PID を返す。
@@ -4637,6 +4651,16 @@ mod tests {
         assert!(!threads_is_one("Name:\tx\n"));
         assert!(!threads_is_one("Threads:\tmany\n"));
         assert!(!threads_is_one(""));
+    }
+
+    /// REPAIR-5・SUP-6・#1616: `Threads:` の値を数で読み、行が無い・数値でなければ `None`。
+    #[test]
+    fn repair5_status_thread_count_reads_the_number() {
+        assert_eq!(status_thread_count("Name:\tx\nThreads:\t3\n"), Some(3));
+        assert_eq!(status_thread_count("Threads:\tmany\n"), None);
+        assert_eq!(status_thread_count("Name:\tx\n"), None);
+        // libtest のプロセスは複数スレッドで、少なくとも 1。
+        assert!(current_thread_count().is_some_and(|n| n >= 1));
     }
 
     /// CORE-1（TASK-27.4.1）: libtest はマルチスレッドなので、fork は子を作らず `MultiThreaded` で拒否する。

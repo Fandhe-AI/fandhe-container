@@ -238,6 +238,8 @@ fn is_unix_socket_fd(fd: i32) -> bool {
 /// （`getsockopt(SO_DOMAIN)`）だけで、パス解決・`fstat` を一切行わず、fd も複製しない（複製の close は NFS の書き戻し・
 /// `FUSE_FLUSH` で止まり得るため）。AF_UNIX の送信経路（`net/unix/af_unix.c`）は stream・datagram・seqpacket のいずれも
 /// `MSG_DONTWAIT` で送信バッファ・相手の受信キューの空きを待たず `EAGAIN` で戻る（datagram の満杯は下の試験で確認する）。
+/// 待たないと言えるのはこの空き待ちについてで、`unix_state_lock` 等の短い内部ロック・LSM フック・未 bind の datagram の
+/// autobind（`SO_PASSCRED` 時）が取るロックの上限ある待ちは残る（他スレッドの送信の停止に巻き込まれる性質ではない）。
 ///
 /// 書かず `Unsupported`（診断は捨てる）。待たないことを保証できないため:
 /// - AF_UNIX 以外の socket（TCP 等）: `MSG_DONTWAIT` で待たないかはプロトコル実装に依存する。TCP は他スレッドが

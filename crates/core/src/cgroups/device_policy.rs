@@ -15,6 +15,18 @@
 //!   呼ぶ。コンテナ側の seccomp は `bpf` を拒否するため、子プロセスからは呼べない
 //! - 付けたプログラムは子孫の cgroup（exec 用の `exec-*`）にも効く。attach flags は 0 固定のため、子孫で
 //!   上書きも追加もできない（子孫へのアタッチは `EPERM`）
+//! - 祖先のプログラムとの関係（PR #1705 事後監査 P3-2・SEC-1・CORE-4）: 実効集合は
+//!   `compute_effective_progs`（v6.12 `kernel/bpf/cgroup.c`）が、自身にプログラムがあれば以降の祖先は
+//!   `BPF_F_ALLOW_MULTI` のものだけを足す形で作る。このため祖先が `BPF_F_ALLOW_MULTI` で付けたもの
+//!   （systemd のデバイス制限等）は残り、本プログラムと両方が評価される（どちらかが拒否すれば拒否）。
+//!   祖先が flags 0 で持つ場合は本アタッチが `EPERM` で失敗する。祖先が `BPF_F_ALLOW_OVERRIDE` で付けた
+//!   ものは本アタッチで実効集合から外れ、本 cgroup と子孫では本プログラム（OCI default devices と pty の
+//!   許可リスト）だけが効く。つまり委譲された cgroup より上位の `BPF_F_ALLOW_OVERRIDE` の制限は上書き
+//!   しうる。これは「上書きを許す」と付けた側が宣言した挙動として受け入れる方針とし、
+//!   `BPF_F_QUERY_EFFECTIVE` による実効集合の確認は行わない（`sys::bpf` の問い合わせは自 cgroup に
+//!   付いたものだけを数え、事前問い合わせの「数 0 でなければ拒否」もこの意味で判定する）
+//! - `BPF_PROG_ATTACH` を使い `BPF_LINK_CREATE` は使わない。プログラムの fd を閉じても外れず、cgroup の
+//!   削除で外れる（常駐デーモンを持たない CORE-1）
 //! - 1 つの cgroup につき 1 回だけ呼ぶ。同じ cgroup に flags 0 のプログラムがあるとアタッチは黙って置き換える
 //!   ため、アタッチ前に問い合わせてプログラム数が 0 でなければ `FailedPrecondition` で拒否する
 //!   （`open_child` が既存の cgroup を開き直す経路でも置き換えを検出するため。付けた後の問い合わせは

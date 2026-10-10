@@ -26,7 +26,9 @@
 //!   flags 0 でプログラムを持つと子孫への attach は `EPERM` になる。つまり子孫（exec 用の `exec-*`）は
 //!   上書きも追加もできない。逆に祖先が既に flags 0 のプログラムを持つ環境では本 attach が `EPERM`
 //!   になる（capability 不足の `EPERM` とは別原因）。同じ cgroup に flags 0 のプログラムが既にあると
-//!   黙って置き換わる（#1680 の入口は、付ける前の問い合わせでプログラム数が 0 でなければ拒否する）
+//!   黙って置き換わる（#1680 の入口は、付ける前の問い合わせでプログラム数が 0 でなければ拒否する）。
+//!   祖先が `BPF_F_ALLOW_OVERRIDE` で付けたものは本 attach で実効集合から外れ、`BPF_F_ALLOW_MULTI` の
+//!   ものは残る（`compute_effective_progs`。扱いの方針は `cgroups::device_policy` のモジュール doc）
 //! - verifier のログは `log_level != 0` のときだけ書かれ、切り詰められると検証に成功しても `ENOSPC` で
 //!   ロードが失敗する。このため 1 回目はログ無しでロードし、`EINVAL`・`EACCES`（verifier の拒否）のときだけ
 //!   固定上限のバッファ付きで再実行して診断ログを取る

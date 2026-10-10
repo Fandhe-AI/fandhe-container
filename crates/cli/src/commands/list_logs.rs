@@ -115,7 +115,16 @@ fn record_op(recorder: &OpRecorder, op_name: &str, ok: bool, started: Instant) {
 
 /// 状態ストアを開く段階の失敗を終了値へ写す。コンテナ ID を参照していない段階の `NotFound` は
 /// 状態ルート不在であり、コンテナ不在（`container not found`）と誤報しない。
+///
+/// 非 Linux では plugin 解決の失敗（`plugin_backend::BackendFailure`）を先に拾い、「未導入」と「信頼性検証の
+/// 拒否」などを区別できる固定文言の識別子で出す（C1・TASK-79.4 追補）。照合は `plugin_backend` の固定文言表との
+/// 完全一致のみで、一致時に出すのはその `&'static str` 定数だけ。core の `TraitError::message`
+/// （`--root` 不正・発見の I/O エラー等を含む）は出力へ流さず、表に無い失敗は従来の汎用文言に落とす。
 fn store_open_failure(e: &TraitError) -> CliExit {
+    #[cfg(not(target_os = "linux"))]
+    if let Some(kind) = super::plugin_backend::BackendFailure::classify(e) {
+        return CliExit::Error(crate::error::CliError::new(kind.code(), kind.message()));
+    }
     match e.code() {
         ErrorCode::NotFound => CliExit::state_root_not_found(),
         c => CliExit::failed(c),
@@ -215,6 +224,31 @@ mod tests {
         assert_eq!(
             stderr_line(&e),
             "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"invalid argument\"}\n"
+        );
+    }
+
+    /// C1: 非 Linux の plugin 解決失敗は「未導入」と「検証未実装」で別の固定文言になる。
+    /// 表に無い失敗（任意文言）は汎用文言のまま。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn c1_plugin_failures_have_distinct_identifiers_off_linux() {
+        use super::super::plugin_backend::BackendFailure;
+        let e = store_open_failure(&BackendFailure::NotInstalled.into_error());
+        assert_eq!(e.exit_code(), 5);
+        assert_eq!(
+            stderr_line(&e),
+            "{\"code\":\"FAILED_PRECONDITION\",\"message\":\"platform backend plugin is not installed\"}\n"
+        );
+        let e = store_open_failure(&BackendFailure::TrustUnsupported.into_error());
+        assert_eq!(e.exit_code(), 8);
+        assert_eq!(
+            stderr_line(&e),
+            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"plugin trust verification is not implemented on this platform\"}\n"
+        );
+        let e = store_open_failure(&TraitError::new(ErrorCode::FailedPrecondition, "detail"));
+        assert_eq!(
+            stderr_line(&e),
+            "{\"code\":\"FAILED_PRECONDITION\",\"message\":\"failed precondition\"}\n"
         );
     }
 

@@ -20,7 +20,10 @@
 //! - `PATH` は既定で探索しない。環境変数 [`PATH_SEARCH_ENV`]`=1` または呼び出し側が渡す
 //!   [`PathSearchPolicy::Enabled`] の opt-in があるときだけ探索し、`PATH` 上で見つけた候補 1 件
 //!   ごとに警告ログ 1 行を出す（[`PathSearchWarning`]）。**`PATH` 上の名前一致のみでは登録しない**
-//!   （`PluginDirKind::Path` の候補は未検証で、登録可否は TASK-122・#255 が決める）
+//!   （`PluginDirKind::Path` の候補は未検証。レジストリ〔#255〕は origin を区別せずに登録するが、優先度は
+//!   最も低い〔System < User < Path〕ため管理ディレクトリの同名を shadow しない。現状は許可済みハッシュ
+//!   一覧が空で全件拒否になる。許可一覧の読み込みを配線する際〔TASK-114・TASK-122〕は、`PATH` 由来も
+//!   ハッシュ一致で採用され得るため、**登録前に除外するか採用するかを配線時に再評価し、明示的に決める**）
 //! - CLI フラグ（opt-in の CLI 側入口）の配線は CLI 実装（TASK-79）で行う。未実装（REPAIR-3）。
 //!   CLI は `PathSearchPolicy::Enabled` を [`DiscoveryOptions`] 経由で渡す想定
 //! - 探索先ディレクトリが存在しない場合はエラーにせず候補なしとする。それ以外の I/O エラーは
@@ -60,7 +63,15 @@ pub const MAX_SCANNED_ENTRIES_PER_PATH_DIR: usize = 65536;
 
 /// 探索全体（管理ディレクトリ + `PATH`）で保持する候補数の上限。超過は切り捨てず fail-closed で
 /// 拒否する（多数のディレクトリに名前一致ファイルを置かれた場合の無制限なメモリ確保・警告複製を防ぐ）。
+///
+/// レジストリの容量 [`MAX_REGISTRY_ENTRIES`] 以下でなければならない（下の const アサートで固定。
+/// 発見結果を全件 `PluginRegistry::from_candidates` へ渡しても容量超過に到達しない前提。PLUG-11・REPAIR-12）。
 pub const MAX_TOTAL_CANDIDATES: usize = 4096;
+
+// 候補 1 件はレジストリで登録 1 件か shadowed 1 件にしかならず、`PATH` 由来も候補列に残る。
+// 候補総数の上限がレジストリ容量を超えると、発見は成功しても登録で `FailedPrecondition` になるため、
+// どちらか片方だけの変更をビルドで検出する。
+const _: () = assert!(MAX_TOTAL_CANDIDATES <= MAX_REGISTRY_ENTRIES);
 
 /// `PATH` から採用するディレクトリ数の上限。超過は切り捨てず fail-closed で拒否する。
 pub const MAX_PATH_SEARCH_DIRS: usize = 256;
@@ -85,6 +96,7 @@ pub enum PluginDirKind {
     /// ユーザー単位の管理ディレクトリ。
     User,
     /// `PATH` 由来（opt-in 時のみ）。未検証で、名前一致のみでは登録しない（PLUG-11・TASK-122）。
+    /// 許可一覧の配線時に採否を再評価する（モジュール doc の契約を参照。TASK-114）。
     Path,
 }
 

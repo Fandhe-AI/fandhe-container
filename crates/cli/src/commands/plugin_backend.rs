@@ -17,6 +17,24 @@
 //!   TASK-114、CLI 経由の 3 OS 最終確認は TASK-125。RPC を配線する際は REPAIR-5 のタイムアウトを必須とする。
 //!
 //! したがって [`backend_failure`] は現状必ず失敗を返す。
+//!
+//! # 失敗の識別子（C1・TASK-79.4 追補）
+//!
+//! plugin 解決の失敗は [`BackendFailure`] の閉じた列挙と固定文言表（SSOT）に集約する。create 系は文言がそのまま
+//! stderr へ届き、`list` / `logs` は `list_logs::store_open_failure` が [`BackendFailure::classify`] で
+//! 表との完全一致を確かめたときだけ同じ定数を出す（「未導入」と「信頼性検証の拒否」を区別できる）。
+//! 表に無い失敗（`--root` 不正・発見の I/O エラー等）は従来どおり汎用文言に落とし、core の
+//! `TraitError::message` を出力へ流さない。
+//!
+//! # 配線時に再評価する事項（TASK-114・TASK-122）
+//!
+//! - PATH 由来の候補の扱い（A1）: [`backend_failure`] は `PluginDirKind::Path` の候補も
+//!   `PluginRegistry::from_candidates` へ渡しており、現状は許可一覧が空で全件拒否になることに頼っている。
+//!   許可済みハッシュ一覧を配線すると PATH 由来もハッシュ一致で採用され得るため、登録前に除外するか
+//!   採用するかをその時点で明示的に決める（core の `plugin_discovery` の契約も参照）。
+//! - `PluginTrustError` の写像（C2）: その `Display` と `From<PluginTrustError> for TraitError` は拒否対象の
+//!   パスを含む。出力へ流すときは `?` で `TraitError` へ変換せず、`kind()` だけを本 module の固定文言表へ
+//!   写し、パス・plugin 名を出力へ反射しないこと（配線時のレビュー観点）。
 
 use std::io::Write;
 
@@ -31,6 +49,61 @@ use fandhe_container_core::state_store::StateRoot;
 use fandhe_container_core::traits::{ErrorCode, TraitError};
 
 use super::args::GlobalArgs;
+
+/// plugin 解決の失敗種別（閉じた列挙）。コードと固定文言の対応表の SSOT。
+///
+/// `backend_failure` / `unavailable` が生成し、`list_logs::store_open_failure` が
+/// [`BackendFailure::classify`] で逆引きする。文言はエスケープ不要の英語定数のみで、パス・plugin 名を含まない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BackendFailure {
+    NotInstalled,
+    TrustUnsupported,
+    Untrusted,
+    NotInvokable,
+    NoBackend,
+}
+
+impl BackendFailure {
+    /// 全 variant（`classify` の走査対象。表の追加漏れをテストで検出する）。
+    pub(super) const ALL: [Self; 5] = [
+        Self::NotInstalled,
+        Self::TrustUnsupported,
+        Self::Untrusted,
+        Self::NotInvokable,
+        Self::NoBackend,
+    ];
+
+    pub(super) fn code(self) -> ErrorCode {
+        match self {
+            Self::NotInstalled => ErrorCode::FailedPrecondition,
+            Self::TrustUnsupported | Self::NotInvokable | Self::NoBackend => {
+                ErrorCode::Unimplemented
+            }
+            Self::Untrusted => ErrorCode::PermissionDenied,
+        }
+    }
+
+    pub(super) fn message(self) -> &'static str {
+        match self {
+            Self::NotInstalled => MSG_NOT_INSTALLED,
+            Self::TrustUnsupported => MSG_TRUST_UNSUPPORTED,
+            Self::Untrusted => MSG_UNTRUSTED,
+            Self::NotInvokable => MSG_NOT_INVOKABLE,
+            Self::NoBackend => MSG_NO_BACKEND,
+        }
+    }
+
+    pub(super) fn into_error(self) -> TraitError {
+        TraitError::new(self.code(), self.message())
+    }
+
+    /// コードと文言が表と完全一致するときだけ種別を返す（それ以外は `None`）。
+    pub(super) fn classify(e: &TraitError) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|k| k.code() == e.code() && k.message() == e.message())
+    }
+}
 
 const MSG_NOT_INSTALLED: &str = "platform backend plugin is not installed";
 const MSG_TRUST_UNSUPPORTED: &str = "plugin trust verification is not implemented on this platform";
@@ -75,6 +148,8 @@ pub(super) fn host_backend() -> Option<BackendPlugin> {
 /// 対応表: 候補なし → `FailedPrecondition`、非 Linux の検証未実装 → `Unimplemented`、
 /// 検証・ハッシュ照合の拒否 → `PermissionDenied`、全検証通過後（起動未実装）→ `Unimplemented`。
 /// 同名候補の shadowed へは自動フォールバックしない（レジストリの契約どおり）。
+///
+/// PATH 由来の候補もレジストリへ渡す。許可一覧の配線時に採否を再評価する（モジュール doc 参照。TASK-114・TASK-122）。
 pub(super) fn backend_failure(backend: BackendPlugin, report: DiscoveryReport) -> TraitError {
     let (candidates, _warnings) = report.into_parts();
     let registry = match PluginRegistry::from_candidates(candidates) {
@@ -82,23 +157,23 @@ pub(super) fn backend_failure(backend: BackendPlugin, report: DiscoveryReport) -
         Err(e) => return e,
     };
     let Some(candidate) = registry.get(backend.name()) else {
-        return TraitError::new(ErrorCode::FailedPrecondition, MSG_NOT_INSTALLED);
+        return BackendFailure::NotInstalled.into_error();
     };
     let verified = match verify_candidate(candidate) {
         Ok(v) => v,
         Err(e) if e.kind() == PluginTrustErrorKind::Unsupported => {
-            return TraitError::new(ErrorCode::Unimplemented, MSG_TRUST_UNSUPPORTED);
+            return BackendFailure::TrustUnsupported.into_error();
         }
-        Err(_) => return TraitError::new(ErrorCode::PermissionDenied, MSG_UNTRUSTED),
+        Err(_) => return BackendFailure::Untrusted.into_error(),
     };
     // 既定は空の許可一覧（全件拒否）。一覧の読み込み経路は仕様確定まで作らない。
     if PluginVerificationMethod::default()
         .verify(verified)
         .is_err()
     {
-        return TraitError::new(ErrorCode::PermissionDenied, MSG_UNTRUSTED);
+        return BackendFailure::Untrusted.into_error();
     }
-    TraitError::new(ErrorCode::Unimplemented, MSG_NOT_INVOKABLE)
+    BackendFailure::NotInvokable.into_error()
 }
 
 /// 非 Linux の本番経路。`--root` 検証 → 発見（`PATH` 警告は stderr へ）→ [`backend_failure`]。
@@ -113,7 +188,7 @@ pub(super) fn unavailable(global: &GlobalArgs) -> TraitError {
         return e;
     }
     let Some(backend) = host_backend() else {
-        return TraitError::new(ErrorCode::Unimplemented, MSG_NO_BACKEND);
+        return BackendFailure::NoBackend.into_error();
     };
     let policy = if global.plugin_path_search {
         PathSearchPolicy::Enabled
@@ -160,6 +235,14 @@ mod tests {
         }
     }
 
+    /// C2: 失敗の message は一時ディレクトリのパスも plugin 名も含まない（出力へ反射しない）。
+    fn assert_no_path_or_name(e: &TraitError, tmp: &Tmp) {
+        let dir = tmp.0.to_string_lossy();
+        assert!(!e.message().contains(dir.as_ref()), "{}", e.message());
+        assert!(!e.message().contains("fandhe-container-plugin"));
+        assert!(!e.message().contains("macos"));
+    }
+
     fn exe_name(name: &str) -> String {
         let suffix = if cfg!(windows) { ".exe" } else { "" };
         format!("fandhe-container-plugin-{name}{suffix}")
@@ -198,6 +281,7 @@ mod tests {
         let e = backend_failure(BackendPlugin::Macos, report_with(&tmp, &["macos"]));
         assert_eq!(e.code(), ErrorCode::PermissionDenied);
         assert_eq!(e.message(), MSG_UNTRUSTED);
+        assert_no_path_or_name(&e, &tmp);
     }
 
     /// PLUG-11（非 Linux）: 信頼性検証が未実装のため Unimplemented（fail-closed）。
@@ -208,6 +292,7 @@ mod tests {
         let e = backend_failure(BackendPlugin::Macos, report_with(&tmp, &["macos"]));
         assert_eq!(e.code(), ErrorCode::Unimplemented);
         assert_eq!(e.message(), MSG_TRUST_UNSUPPORTED);
+        assert_no_path_or_name(&e, &tmp);
     }
 
     /// PLUG-11: PATH opt-in の候補は警告 1 行ずつ出て、名前一致だけでは採用されない（検証で拒否される）。
@@ -223,6 +308,11 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
         assert_eq!(text.lines().count(), 2);
         assert!(text.lines().all(|l| l.contains(PATH_WARNING_CODE)));
+        // A1 の前提固定（配線時に再評価: この前提を変えたら doc も見直す）。PATH 由来の候補もレジストリに登録される。
+        let registered =
+            PluginRegistry::from_candidates(report.candidates().iter().cloned()).expect("registry");
+        let entry = registered.get("macos").expect("macos registered");
+        assert_eq!(entry.origin(), PluginDirKind::Path);
         // PATH 由来の候補も信頼性検証を通る。Linux では一時ディレクトリが不適格、非 Linux は未実装で拒否。
         let e = backend_failure(BackendPlugin::Macos, report);
         assert!(matches!(
@@ -259,17 +349,81 @@ mod tests {
         }
     }
 
-    /// 固定文言は引用符・バックスラッシュ・改行を含まない（出力への反射・エスケープ不要）。
+    /// 固定文言は引用符・バックスラッシュ・制御文字を含まない（出力への反射・エスケープ不要）。
     #[test]
     fn fixed_messages_need_no_escaping() {
-        for m in [
-            MSG_NOT_INSTALLED,
-            MSG_TRUST_UNSUPPORTED,
-            MSG_UNTRUSTED,
-            MSG_NOT_INVOKABLE,
-            MSG_NO_BACKEND,
+        for k in BackendFailure::ALL {
+            assert!(!k.message().contains(['"', '\\']));
+            assert!(!k.message().chars().any(char::is_control));
+        }
+    }
+
+    /// C1・REPAIR-12: 失敗種別ごとのコードと文言を具体値で固定する。
+    #[test]
+    fn c1_backend_failure_table_is_exact() {
+        let table = [
+            (
+                BackendFailure::NotInstalled,
+                ErrorCode::FailedPrecondition,
+                "platform backend plugin is not installed",
+            ),
+            (
+                BackendFailure::TrustUnsupported,
+                ErrorCode::Unimplemented,
+                "plugin trust verification is not implemented on this platform",
+            ),
+            (
+                BackendFailure::Untrusted,
+                ErrorCode::PermissionDenied,
+                "platform backend plugin failed trust verification",
+            ),
+            (
+                BackendFailure::NotInvokable,
+                ErrorCode::Unimplemented,
+                "plugin backend invocation is not implemented",
+            ),
+            (
+                BackendFailure::NoBackend,
+                ErrorCode::Unimplemented,
+                "no platform backend plugin exists for this platform",
+            ),
+        ];
+        assert_eq!(table.len(), BackendFailure::ALL.len());
+        for (k, code, msg) in table {
+            assert_eq!(k.code(), code);
+            assert_eq!(k.message(), msg);
+        }
+    }
+
+    /// C1: 表の逆引きは完全一致のみ。任意の文言・別コードは `None`（出力へ素通ししない）。
+    #[test]
+    fn c1_classify_round_trips_and_rejects_others() {
+        for k in BackendFailure::ALL {
+            assert_eq!(BackendFailure::classify(&k.into_error()), Some(k));
+        }
+        for e in [
+            TraitError::new(ErrorCode::FailedPrecondition, "failed precondition"),
+            TraitError::new(
+                ErrorCode::Unimplemented,
+                "platform backend plugin is not installed",
+            ),
+            TraitError::new(ErrorCode::FailedPrecondition, "detail"),
         ] {
-            assert!(!m.contains(['"', '\\', '\n', '\r']));
+            assert_eq!(BackendFailure::classify(&e), None);
+        }
+    }
+
+    /// C1: 5 文言は互いに異なり、汎用文言（`failure_message`）とも一致しない。
+    #[test]
+    fn c1_backend_messages_are_distinct() {
+        let msgs: Vec<&str> = BackendFailure::ALL.iter().map(|k| k.message()).collect();
+        for (i, a) in msgs.iter().enumerate() {
+            for b in &msgs[i + 1..] {
+                assert_ne!(a, b);
+            }
+            for k in BackendFailure::ALL {
+                assert_ne!(*a, crate::commands::failure_message(k.code()));
+            }
         }
     }
 }

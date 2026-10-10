@@ -261,21 +261,26 @@ poc-venus-jig-check: ## venus 試験治具（poc/venus-decoder/jig）の fmt-che
 	cargo clippy --manifest-path $(POC_VENUS_JIG_MANIFEST) --locked --all-targets -- -D warnings
 	cargo test --manifest-path $(POC_VENUS_JIG_MANIFEST) --locked
 
-# CLI が macOS / Windows のバックエンド実装へ直接依存しないことの機械判定（CLI-1・PLUG-4・TASK-79.4）。
-# macOS / Windows は core の plugin 発見・登録機構経由で呼ぶ。`cargo tree` の通常依存に
-# platform-* / plugin-macos / plugin-windows が現れたら NG（cargo tree の失敗も NG）。
+# CLI が macOS / Windows / microVM のバックエンド実装へ直接依存しないことの機械判定（CLI-1・PLUG-1・PLUG-4・TASK-79.4）。
+# macOS / Windows は core の plugin 発見・登録機構経由で呼ぶ。`cargo tree` に platform-macos / platform-windows /
+# plugin-macos / plugin-windows / microvm / plugin-microvm が現れたら NG（cargo tree の失敗も NG）。
+# - 辺は normal,build,dev: build 依存の推移的な混入と、cli 自身のテスト（dev）からの境界の迂回を防ぐ。
+# - `--target all`: 実行ランナーの OS に依らず `[target.'cfg(...)'.dependencies]` の辺も検査する。
+# - microvm 系を含める理由: platform 層であり plugin-microvm 経由で呼ぶ対象のため。
+# - plugin-cri / plugin-mcp は CLI のバックエンドではないため本検査の範囲外。
+# - 行頭アンカーと ` v` 接尾辞で境界機構 crate（fandhe-container-plugin）やパス文字列への誤一致を避ける。
 .PHONY: check-cli-backend-deps
-check-cli-backend-deps: ## cli の依存ツリーに platform-* / plugin-macos / plugin-windows が含まれないことを検証する
+check-cli-backend-deps: ## cli の依存ツリー（normal/build/dev・全ターゲット）に platform-* / plugin-macos / plugin-windows / microvm 系が含まれないことを検証する
 ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
-	@tree=$$(cargo tree -p fandhe-container-cli -e normal --locked) || { \
+	@tree=$$(cargo tree -p fandhe-container-cli -e normal,build,dev --target all --prefix none --format '{p}' --locked) || { \
 		echo "NG: cargo tree の実行に失敗しました" >&2; \
 		exit 1; \
 	}; \
-	if printf '%s\n' "$$tree" | grep -Eq 'fandhe-container-(platform|plugin)-(macos|windows)'; then \
-		echo "NG: cli の依存ツリーに macOS / Windows のバックエンド crate が含まれています" >&2; \
+	if printf '%s\n' "$$tree" | grep -Eq '^fandhe-container-(platform-(macos|windows)|plugin-(macos|windows|microvm)|microvm) v'; then \
+		echo "NG: cli の依存ツリーに macOS / Windows / microVM のバックエンド crate が含まれています" >&2; \
 		exit 1; \
 	fi; \
-	echo "OK: cli は platform-macos / platform-windows / plugin-macos / plugin-windows に依存しません"
+	echo "OK: cli は platform-macos / platform-windows / plugin-macos / plugin-windows / microvm / plugin-microvm に依存しません"
 else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため check-cli-backend-deps をスキップ"
 endif

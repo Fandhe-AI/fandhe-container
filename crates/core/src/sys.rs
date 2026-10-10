@@ -1535,6 +1535,68 @@ fn move_mount_empty_path_raw(from: RawFd, to: RawFd) -> Result<(), SysError> {
     Ok(())
 }
 
+/// [`open_tree_clone`] へ渡せる、文字デバイスと確かめたホストのデバイスノードの fd（CORE-6・SEC-5・SEC-1・#1659）。
+///
+/// [`verify_device_node_fd`] だけが作る（フィールドは `sys` の外から触れない）。保持するのは検証に使った fd
+/// そのもので、検証後にパスを開き直さないため、検証と複製の対象は同じ inode になる（TOCTOU なし）。
+// #1660 で呼び出し元を足すまでの間のみ許可する（配線時に外す）。
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct VerifiedDeviceNodeFd(OwnedFd);
+
+impl std::os::fd::AsFd for VerifiedDeviceNodeFd {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.0)
+    }
+}
+
+/// [`verify_device_node_fd`] の拒否理由。照合した実値を持ち、呼び出し側（#1660）が構造化エラーへ写す。
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeviceNodeError {
+    /// 文字デバイスではない（ディレクトリ・通常ファイル・`O_NOFOLLOW` で開いた symlink 等）。`mode` は `st_mode` の実値。
+    NotCharDevice { mode: u32 },
+    /// 文字デバイスだが `rdev` が期待値と違う。
+    UnexpectedRdev { actual: u64, expected: u64 },
+    /// `fstat`（fd の複製を含む）の失敗、または対応外アーキテクチャ（[`SysError::Unsupported`]）。
+    Sys(SysError),
+}
+
+/// `fd`（呼び出し側が `O_PATH|O_NOFOLLOW` で開いたホストのデバイスノード）を、同じ fd の `fstat` で照合する。
+///
+/// 文字デバイス（`S_IFCHR`）かつ `rdev == makedev(major, minor)` のときだけ [`VerifiedDeviceNodeFd`] を返す。
+/// `major`・`minor` は呼び出し側の固定表（`crate::exec::devices` の `DEFAULT_DEVICES`。任意の major/minor を
+/// 受け付ける経路は作らない。TASK-127）から渡す。パスの `stat` ではなく fd の `fstat`（std の
+/// `File::metadata`。fd は複製して見るだけで、元の fd をそのまま保持する）で見るため、検証後の差し替えは効かない。
+/// 照合は `crate::exec::devices` の既存ノードの検証と同じ形（種別と `rdev` の完全一致）。
+#[allow(dead_code)]
+pub(crate) fn verify_device_node_fd(
+    fd: OwnedFd,
+    major: u32,
+    minor: u32,
+) -> Result<VerifiedDeviceNodeFd, DeviceNodeError> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+    if !consts::SUPPORTED {
+        return Err(DeviceNodeError::Sys(SysError::Unsupported));
+    }
+    let os = |e: io::Error| DeviceNodeError::Sys(SysError::Os(e.raw_os_error().unwrap_or(EINVAL)));
+    let dup = std::os::fd::AsFd::as_fd(&fd)
+        .try_clone_to_owned()
+        .map_err(os)?;
+    let meta = std::fs::File::from(dup).metadata().map_err(os)?;
+    if !meta.file_type().is_char_device() {
+        return Err(DeviceNodeError::NotCharDevice { mode: meta.mode() });
+    }
+    let expected = makedev(major, minor);
+    if meta.rdev() != expected {
+        return Err(DeviceNodeError::UnexpectedRdev {
+            actual: meta.rdev(),
+            expected,
+        });
+    }
+    Ok(VerifiedDeviceNodeFd(fd))
+}
+
 /// `open_tree(2)` に渡すフラグ（`OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_EMPTY_PATH`）。
 ///
 /// `AT_RECURSIVE` は付けない（複製をノード 1 個に限り、ホスト側の子マウントを持ち込まない）。
@@ -1550,11 +1612,14 @@ fn open_tree_clone_flags() -> u32 {
 /// 判断 4。CORE-6・SEC-5・#1659。呼び出し元は #1660）。戻り値は未接続のマウントを指す close-on-exec の fd で、
 /// 途中で失敗して drop すればカーネルが破棄する。
 ///
-/// 前提（呼び出し側の責務。本関数は検証しない）: `node` は `O_PATH|O_NOFOLLOW` で開き `S_IFCHR`・`rdev` を
-/// 検証済みであること。
+/// 引数は [`verify_device_node_fd`] だけが作れる [`VerifiedDeviceNodeFd`] に限る。文字デバイス（`S_IFCHR`）で
+/// `rdev` が期待値と一致することを同じ fd の `fstat` で確かめた fd しか渡せないため、ディレクトリ・通常ファイルを
+/// 複製して nosuid・noexec なしでコンテナへ渡す経路は型で塞がれる（SEC-1）。symlink を辿らないこと
+/// （`O_PATH|O_NOFOLLOW` で開くこと）は fd を開く呼び出し側の責務で、辿らずに開いた symlink 自体は
+/// `S_IFCHR` でないため検証で拒否される。
 ///
 /// マウントフラグは緩めも追加もしない。複製はホスト側マウントのフラグ（locked flag 含む）を継承する。
-/// `nosuid`・`noexec` を付与しない理由は、マウントのルートが文字デバイス 1 個で他のファイルへ届かず、exec と
+/// `nosuid`・`noexec` を付与しない理由は、マウントのルートが文字デバイス 1 個（上の型で強制）で他のファイルへ届かず、exec と
 /// setuid が通常ファイルにしか効かないため守る対象が無いこと（runc の `bindMountDeviceNode` も `MS_BIND` のみ）。
 /// `nodev` はノードが使えなくなるため付けてはならない。よって `mount_setattr` は本 Issue では足さない。
 ///
@@ -1562,8 +1627,8 @@ fn open_tree_clone_flags() -> u32 {
 /// user namespace では自分の mount namespace を所有する userns の `CAP_SYS_ADMIN` が要る。
 // #1660 で呼び出し元を足すまでの間のみ許可する（配線時に外す）。
 #[allow(dead_code)]
-pub(crate) fn open_tree_clone(node: BorrowedFd<'_>) -> Result<OwnedFd, SysError> {
-    open_tree_clone_raw(node.as_raw_fd())
+pub(crate) fn open_tree_clone(node: &VerifiedDeviceNodeFd) -> Result<OwnedFd, SysError> {
+    open_tree_clone_raw(node.0.as_raw_fd())
 }
 
 /// [`open_tree_clone`] の本体。fd 番号（`RawFd`）を受ける非公開部分で、無効 fd の拒否（`EBADF`）を
@@ -5195,12 +5260,53 @@ mod tests {
         if effective_uid() == 0 {
             return;
         }
-        let node = open_o_path("/dev/null");
-        let err = open_tree_clone(node.as_fd()).unwrap_err();
+        let node = verify_device_node_fd(open_o_path("/dev/null"), 1, 3).expect("verify /dev/null");
+        let err = open_tree_clone(&node).unwrap_err();
         assert!(
             err == SysError::Os(EPERM) || err == SysError::Unsupported,
             "unexpected error: {err:?}"
         );
+    }
+
+    /// CORE-6・SEC-5・SEC-1（TASK-29 追補・#1659）: `/dev/null`（文字デバイス 1:3）は期待値 (1, 3) で検証を通り、
+    /// 検証に使った fd そのもの（開き直さない）を保持する。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core6_sec5_verify_device_node_fd_accepts_dev_null_and_keeps_the_fd() {
+        let fd = open_o_path("/dev/null");
+        let raw = fd.as_raw_fd();
+        let node = verify_device_node_fd(fd, 1, 3).expect("verify /dev/null");
+        assert_eq!(node.as_fd().as_raw_fd(), raw);
+    }
+
+    /// CORE-6・SEC-5・SEC-1（TASK-29 追補・#1659）: 文字デバイスでも `rdev` が期待値と違えば、実値と期待値を
+    /// 持つ `UnexpectedRdev` で拒否する（`/dev/null` = 0x103 を (1, 5) = 0x105 として検証）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core6_sec5_verify_device_node_fd_rejects_unexpected_rdev() {
+        let err = verify_device_node_fd(open_o_path("/dev/null"), 1, 5).unwrap_err();
+        assert_eq!(
+            err,
+            DeviceNodeError::UnexpectedRdev {
+                actual: 0x103,
+                expected: 0x105
+            }
+        );
+    }
+
+    /// CORE-6・SEC-5・SEC-1（TASK-29 追補・#1659）: ディレクトリ（`/`）と通常ファイル（テストバイナリ自身）は
+    /// 文字デバイスでないため `NotCharDevice` で拒否する。`mode` は `st_mode` の実値で、種別ビット
+    /// （`S_IFMT` = 0o170000）がディレクトリ 0o040000・通常ファイル 0o100000 になる。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn core6_sec5_verify_device_node_fd_rejects_directory_and_regular_file() {
+        let kind = |path: &str| match verify_device_node_fd(open_o_path(path), 1, 3) {
+            Err(DeviceNodeError::NotCharDevice { mode }) => mode & 0o170_000,
+            other => panic!("{path}: unexpected result: {other:?}"),
+        };
+        assert_eq!(kind("/"), 0o040_000);
+        let exe = std::env::current_exe().expect("current_exe");
+        assert_eq!(kind(exe.to_str().expect("utf8 path")), 0o100_000);
     }
 
     /// `path` を `O_PATH | O_NOFOLLOW` で開く（実機前提テストと特権なしテストの共通部品）。
@@ -5288,8 +5394,8 @@ mod tests {
         };
 
         // fd 起点で /dev/null を複製できる。fd は close-on-exec（fdinfo の flags が O_CLOEXEC = 02000000）。
-        let node = open_o_path("/dev/null");
-        let clone = open_tree_clone(node.as_fd()).expect("open_tree_clone");
+        let node = verify_device_node_fd(open_o_path("/dev/null"), 1, 3).expect("verify /dev/null");
+        let clone = open_tree_clone(&node).expect("open_tree_clone");
         let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", clone.as_raw_fd()))
             .expect("read fdinfo");
         let flags = info

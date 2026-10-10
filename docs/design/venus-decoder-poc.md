@@ -419,7 +419,7 @@ Mesa は 2 層で読む。Mesa は ctrl を直接出さず、DRM ioctl を呼ぶ
 - crosvm の frontend（`mod.rs` 514〜543 行）は、バックエンドが protocol feature `SHMEM`（bit 22、`0x0040_0000`。`message.rs` 384 行）をネゴシエーションしたときだけ `GET_SHMEM_CONFIG`（要求 ID 44。`message.rs` 154 行）で領域を取得し、領域が 0 個なら共有メモリ無し、1 個ならそれを使い、2 個以上はエラーにする。ネゴシエーションの前提として crosvm は `BACKEND_REQ`（bit 5、`0x20`）と `REPLY_ACK`（bit 3、`0x08`）も広告する（`mod.rs` 143〜151 行）
 - バックエンドから frontend への要求は `SET_BACKEND_REQ_FD`（要求 ID 21。ancillary data で fd を渡す。QEMU の rst と crosvm で同じ）で張ったソケットで送る。`SHMEM_MAP` = 9、`SHMEM_UNMAP` = 10（`message.rs` 192・194 行）。`SHMEM_MAP` のペイロードは `shmid`（u8）+ padding 7 バイト、`fd_offset`（u64）、`shm_offset`（u64）、`len`（u64）、`flags`（u64。`MAP_RW` = 0x1）の 40 バイトで、map する fd は ancillary data で渡す（`message.rs` 776〜815 行）
 - crosvm には非標準の `GPU_MAP`（1006）と `EXTERNAL_MAP`（1007）もある（`message.rs` 200〜204 行）。ring・reply・cs 用の HOST3D・`blob_id` 0 の共有メモリに `SHMEM_MAP` と `GPU_MAP` のどちらを使うかは**未確認**（crosvm の gpu backend 側の呼び出しは取得していない）。`GET_SHMEM_CONFIG` の応答ペイロードの配置も**未確認**
-- crosvm は `REPLY_ACK` を広告するが、`need_reply` は立てない（`SHMEM_MAP` の競合を避けるためという旨のコメント。`mod.rs` 146〜151 行）。治具が `REPLY_ACK` を広告するかは F5.2b で決める
+- crosvm は `REPLY_ACK` を広告するが、`need_reply` は立てない（`SHMEM_MAP` の競合を避けるためという旨のコメント。`mod.rs` 146〜151 行）。治具は F5.2b.1（#1639）で `REPLY_ACK` を広告し、確定したセッションでは NEED_REPLY の要求に応答する（10.8 節）。これは後続の F5.2b で backend から frontend への要求（`SHMEM_MAP`）の成否を確かめる前提になる
 - **QEMU v10.1.0 の `docs/interop/vhost-user.rst` には `SHMEM` の protocol feature も `GET_SHMEM_CONFIG`・`SHMEM_MAP` / `SHMEM_UNMAP` も見当たらない**（語 `shmem` で検索して 0 件）。10.5 節の「QEMU と crosvm で ID が一致」は最小要求集合 16 種の範囲の話で、共有メモリの要求は crosvm 側だけの拡張になる。10.2 節の暫定選定（crosvm）はこの点でも補強される
 - バックエンド側の設計の見込み: memfd を作り、`SHMEM_MAP` で frontend に渡す。fd の送受信（`SCM_RIGHTS`）・`memfd_create`・`mmap` の `sys` ラッパーは 10.6 節で実装済みで、既存の範囲に収まる見込み。ただし、バックエンドが frontend 宛にバックエンド要求を**送る**経路（`SET_BACKEND_REQ_FD` で受けた fd へ書く）は新規で、新しい `unsafe` が要るかどうかは F5.2b の承認事項（10.6 節の `sys` ラッパーで足りれば不要）
 
@@ -466,7 +466,7 @@ Mesa は 2 層で読む。Mesa は ctrl を直接出さず、DRM ioctl を呼ぶ
 | crosvm `third_party/vmm_vhost/src/backend_client.rs` | 同上 | `709fe08830a38c5e15a00c0c5af47ef7dabf19a784c0694abf8c10d335dec7c2` |
 | crosvm `devices/src/virtio/vhost_user_frontend/mod.rs` | 同上 | `9506fcaae2e7e4aec09baa1374cbbd0a3807c5f38f8566b5c4f5856e4ea22266` |
 
-前提（実際に広告するのは F1.4・#1519）: virtio feature は bit 30（`VHOST_USER_F_PROTOCOL_FEATURES`）を立て、protocol feature は CONFIG（bit 9。virtio-gpu config の読み出しに要る）と MQ（bit 0）だけにする。REPLY_ACK・BACKEND_REQ・SHMEM・DEVICE_STATE・CONFIGURE_MEM_SLOTS は host-visible 共有メモリの方式が決まる #1057 まで後送りで、追加する場合は対応する要求を codec に足す。最小要求集合に SHMEM 系は無く、crosvm だけの拡張は 10.4.4 節で扱う。
+前提（実際に広告するのは F1.4・#1519）: virtio feature は bit 30（`VHOST_USER_F_PROTOCOL_FEATURES`）を立て、protocol feature は CONFIG（bit 9。virtio-gpu config の読み出しに要る）・MQ（bit 0）・REPLY_ACK（bit 3。F5.2b.1・#1639。QEMU `docs/interop/vhost-user.rst` v10.1.0 の REPLY_ACK 節で確認、SHA-256 は 2 章の固定値と同じ）だけにする。BACKEND_REQ・SHMEM・DEVICE_STATE・CONFIGURE_MEM_SLOTS は host-visible 共有メモリの方式が決まる #1057 まで後送りで、追加する場合は対応する要求を codec に足す。最小要求集合に SHMEM 系は無く、crosvm だけの拡張は 10.4.4 節で扱う。
 
 最小要求集合（16 種。QEMU と crosvm で ID が一致）。これ以外は既知 ID も含め `UNKNOWN_REQUEST` で拒否する。
 
@@ -494,7 +494,7 @@ F1.1 の範囲外（申し送り）: 値の意味の検証（vring addr のア�
 
 ### 10.6 fd の受け渡しと共有メモリ（F1.2・#1517）
 
-frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲストメモリ領域の fd と eventfd を渡し、backend は `SET_MEM_TABLE` の領域を `mmap` して GPA 経由でアクセスする。rust-vmm 系は MVM-4 で使えないため自作し、crosvm の構造体やロジックは写していない。`unsafe` は `src/sys.rs` にだけ置く（個別承認: [#1517 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6074351741)。U1 `syscall` 宣言・U2 `recvmsg`・U3 受信 fd の所有・U4 `sendmsg`・U5 `memfd_create`・U6 `mmap`・U7 `Drop` の `munmap`・U8 境界検査後のコピー。レビュー指摘への対応で U9 `fcntl`〔`F_GET_SEALS` / `F_ADD_SEALS`〕・U10 `ppoll` を #1517 の追加承認〔[#1517 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6075711404)〕で加えた。#4 の `sys` モジュールの事前承認は根拠にしない）。lint は `lib.rs` に crate 全体の `#![deny(unsafe_code)]` を置き、`sys` にだけ `#[allow(unsafe_code)]` を付ける（承認条件）。
+frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲストメモリ領域の fd と eventfd を渡し、backend は `SET_MEM_TABLE` の領域を `mmap` して GPA 経由でアクセスする。rust-vmm 系は MVM-4 で使えないため自作し、crosvm の構造体やロジックは写していない。`unsafe` は `src/sys.rs` にだけ置く（個別承認: [#1517 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6074351741)。U1 `syscall` 宣言・U2 `recvmsg`・U3 受信 fd の所有・U4 `sendmsg`・U5 `memfd_create`・U6 `mmap`・U7 `Drop` の `munmap`・U8 境界検査後のコピー。レビュー指摘への対応で U9 `fcntl`〔`F_GET_SEALS` / `F_ADD_SEALS`〕・U10 `ppoll` を #1517 の追加承認〔[#1517 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6075711404)〕で加えた。U11 `getsockopt(SO_PEERCRED)`（PLUG-12・PR #1611）は #1517 の個別承認〔追認。[#1517 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6092697332)〕に拠る。#4 の `sys` モジュールの事前承認は根拠にしない）。lint は `lib.rs` に crate 全体の `#![deny(unsafe_code)]` を置き、`sys` にだけ `#[allow(unsafe_code)]` を付ける（承認条件）。
 
 出典（確認日 2026-10-09。値だけを転記）: Linux UAPI ヘッダ（`linux-libc-dev`）の `asm-generic/socket.h`（SHA-256 `e833d32d3d8d03732021da6968665431d693ab4effdd4d39965ff05115a4ed21`）・`linux/socket.h`（`f4331fd201269894f63242a2521b3d5b3290ca556969011d7858908d5fe658c4`）・`asm-generic/mman-common.h`・`linux/memfd.h`、`linux/fcntl.h`（`F_ADD_SEALS` / `F_GET_SEALS` / `F_SEAL_*`）・`asm-generic/poll.h`（`POLLIN` / `POLLOUT`）、syscall 番号は `asm/unistd_64.h`（x86_64）と asm-generic `unistd.h`（aarch64）、man `recvmsg(2)`・`unix(7)`・`cmsg(3)`・`mmap(2)`・`memfd_create(2)`・`fcntl(2)`・`ppoll(2)`。
 
@@ -555,7 +555,7 @@ frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲスト
 
 実装は `poc/venus-decoder/jig/src/session/`（Linux 限定。`unsafe` は追加せず `sys.rs` も変更していない。依存の追加なし）。入口は `session::run(&UnixStream, &SessionLimits, sink)`。接続 1 本分を最後まで処理し、ログ（1 要求 1 行）を `sink` へ流す。
 
-- 広告値: `GET_FEATURES` は `0x0000_0001_4000_0019`（VIRGL・RESOURCE_BLOB・CONTEXT_INIT・VERSION_1・PROTOCOL_FEATURES）、`GET_PROTOCOL_FEATURES` は `0x201`（MQ・CONFIG）、`GET_QUEUE_NUM` は 2（controlq・cursorq）。`GET_CONFIG` は 16 バイトの config（`num_capsets` = 1）の `offset + size <= 16` を返し、範囲外は空ペイロードのエラー応答でセッションは続ける
+- 広告値: `GET_FEATURES` は `0x0000_0001_4000_0019`（VIRGL・RESOURCE_BLOB・CONTEXT_INIT・VERSION_1・PROTOCOL_FEATURES）、`GET_PROTOCOL_FEATURES` は `0x209`（MQ・REPLY_ACK・CONFIG）、`GET_QUEUE_NUM` は 2（controlq・cursorq）。`GET_CONFIG` は 16 バイトの config（`num_capsets` = 1）の `offset + size <= 16` を返し、範囲外は空ペイロードのエラー応答でセッションは続ける
 - `SET_FEATURES`: 広告外のビットは `FEATURE_NOT_OFFERED`、広告した 5 ビットのどれかが欠ければ `REQUIRED_FEATURE_MISSING`（Mesa venus が capset 取得前に中止するため、PoC では fail-closed）
 - 順序のゲート（違反は `OUT_OF_ORDER` で要求 ID を載せる）。本当の依存関係だけを判定し、一本道は強制しない（QEMU と crosvm で `SET_OWNER` / `GET_PROTOCOL_FEATURES` の位置が違うため）。根拠は 10.5 で固定済みの crosvm コミット `044c3e3fc53d` の `backend_client.rs` / `vhost_user_frontend/mod.rs` と QEMU `vhost-user.rst`（v10.1.0）だが、**この節の表は PR 作成時点で両者の再取得による照合を行っていない（未照合）**。F3 で食い違えばここを直す
 
@@ -578,8 +578,14 @@ frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲスト
 - fd の個数: `SET_MEM_TABLE` は領域数、NOFD でない kick / call は 1、それ以外は 0。復号の後に照合し、合わなければ `FD_COUNT_MISMATCH` / `UNEXPECTED_FDS`。受け取った fd は `OwnedFd` で、どのエラー経路でも `Drop` で閉じる。fd は各メッセージの最初の受信でだけ受け付ける
 - タイムアウト（REPAIR-5）: `SessionLimits` の `message_timeout`（1 メッセージの受信・応答送信・call の書き込み。超過は `TIMEOUT`）と `idle_timeout`（無通信。超過は `IDLE_TIMEOUT`）。どちらも 0 より大きく 1 時間以下
 - 応答ループ: socket と ctrl キューの kick を、単一 fd 用の `sys::wait_fd` で `poll_slice`（既定 10ms）ずつ交互に待つ。1 回の kick で最大 `num` 件を処理して used へ書き、1 件以上なら call へ 1 を書く。`pop` / `add_used` の失敗はセッションを終了する（壊れたキューを黙って続けない）。writable が応答に足りない要求は応答を捨てて len=0 で返し、`response_dropped` の行を出してセッションは続ける。readable が 4 KiB を超える要求はアダプタへ渡さず `ERR_INVALID_PARAMETER`
-- ログ: 既存の `venus_jig event=...` 形式を保つ。追加は `session_error`（`code`・`request`）・`need_reply_ignored`・`response_dropped`・`session_end`。固定語彙と数値だけで、frontend やゲスト由来のバイト列・fd 番号・GPA は出さない
-- 扱わない（REPAIR-3）: `NEED_REPLY`（REPLY_ACK を広告しないので `SET_*` には応答せず、ログに 1 行出す）、cursorq（ring 1）の要求処理、`SET_CONFIG`、`VRING_NOFD`、inflight、`INDIRECT` / `EVENT_IDX`、`observe::snapshot_lines` の定期出力と virtqueue 個別の観測カウンタ（終了時の集計出力は `session::run` で実装済み）
+- ログ: 既存の `venus_jig event=...` 形式を保つ。追加は `session_error`（`code`・`request`）・`need_reply_ack`（`request`・`result=ok|err`）・`need_reply_ignored`・`response_dropped`・`session_end`。固定語彙と数値だけで、frontend やゲスト由来のバイト列・fd 番号・GPA は出さない
+- NEED_REPLY への応答（F5.2b.1・#1639）: `REPLY_ACK` の確定は `State::handle` の後で判定する（NEED_REPLY つきの `SET_PROTOCOL_FEATURES` 自体にも応答する）。確定済みなら次のとおり。確定していないセッションは従来どおり `SET_*` に応答せず `need_reply_ignored` を 1 行出す。応答は fd なしの既存送信経路で、`message_timeout` の期限を守る
+  - 応答本体を持たない要求（`SET_*`）の成功: size 8・REPLY の u64 で値 0 を返し、`need_reply_ack ... result=ok` を出す
+  - `GET_*`（`GET_FEATURES`・`GET_PROTOCOL_FEATURES`・`GET_QUEUE_NUM`・`GET_VRING_BASE`・`GET_CONFIG`）: rst の REPLY_ACK 節（応答本体を持つ要求は挙動が変わらない）に従い、既存の応答で兼ねる。追加の u64 は送らない。ack の型は `GET_*` の要求 ID では作れない
+  - `SET_*` の失敗: 値 1 の ack を返してから既存のエラーでセッションを終える（rst は非 0 を受けた QEMU が終了すると想定）。ログは `need_reply_ack ... result=err` の後に `session_error`。ack の送信に失敗しても元のエラーを優先し、その場合 `need_reply_ack` は出さない
+  - `GET_*` の失敗: 応答せずセッションを終える（ack の値が応答値と誤解されるのを避ける）
+  - メッセージの読み取り段階の失敗（codec の復号エラー・`UNKNOWN_REQUEST`・fd 個数の不一致）には応答しない。信頼できない、または不整合なメッセージへ応答しない fail-closed の判断で、相手には切断（EOF）が見える
+- 扱わない（REPAIR-3）: cursorq（ring 1）の要求処理、`SET_CONFIG`、`VRING_NOFD`、inflight、`INDIRECT` / `EVENT_IDX`、`observe::snapshot_lines` の定期出力と virtqueue 個別の観測カウンタ（終了時の集計出力は `session::run` で実装済み）
 - peer credential の検証（PLUG-12）は起動入口が accept 直後に `SO_PEERCRED`（`sys::peer_uid`＝U11）で行い、`session::run` は照合済みの `UnixStream` を受け取る API に留める。UDS の bind と所有者・権限・symlink の検証は起動入口（10.9）が行う。治具は PoC で、実機の実行は人間が担当する閉じた環境という前提
 - 承認事項: socket と kick を同時に待つ複数 fd の `ppoll` は `sys.rs` の `unsafe`（U10）の変更になるため行っていない。kick への反応に最大 `poll_slice` の遅延が乗る
 
@@ -592,8 +598,8 @@ frontend（crosvm 等）は UDS の補助データ（`SCM_RIGHTS`）でゲスト
 - ログ: `create_new` + `0600`（既存は `LOG_PATH_EXISTS`、symlink も `O_EXCL` で失敗）。`log::LogSink` が総量 4 MiB・1 行 512 バイト・10 万行の照合器の上限に収め、超えたら `venus_jig event=log_truncated reason=limit` を 1 回だけ書いて以降を捨てる。パス文字列・ゲスト由来のバイト列は出さない
 - 実行時エラーは stderr に 1 行の JSON `{"code","message"}`（`SESSION_FAILED` のみ `cause` にセッションの code）。終了コードは検証エラー 2、それ以外の失敗 1、正常終了 0
 - accept は非ブロックの sleep ループ（10ms 刻み、期限切れは `ACCEPT_TIMEOUT`）。`sys::wait_fd`（ppoll）の listener fd への別用途の呼び出しは承認範囲外のため採らなかった（承認されれば置き換え可能な改善案）。1 接続を受けたら listener を閉じてソケットファイルを消す
-- peer credential（PLUG-12）: accept 直後に `sys::peer_uid`（`getsockopt(SO_PEERCRED)`。U11）で接続元 UID を取得し、実行ユーザーの effective UID と照合する。不一致（`PEER_UID_MISMATCH`）・取得失敗（`PEER_CRED_UNAVAILABLE`）は接続を閉じて拒否する（fail-closed）。加えてソケットディレクトリを自 UID 所有・`0700` に限る。限界は、同じ UID の別プロセスは接続できること、検査と bind の間の TOCTOU は、祖先が他 UID に差し替え不能であることと所有者が自分で `0700` のディレクトリであることで抑えるに留まること（同じ UID と root は差し替えられる。祖先に symlink がある環境は拒否される）。別 UID の接続拒否は別 UID を用意できないため実機前提で、単体試験は期待 UID をずらして照合関数を検証する。U11 は `sys` モジュールの事前承認（coding-rust.md）の条件で追加した。
-- ログ読み取り側（事後監査 #1528 D2）: `log::read_log_file` が open 前に `symlink_metadata` で通常ファイル以外（FIFO・symlink・ディレクトリ）を拒否し、open 後も `metadata` で確かめ直し、上限つきで読む。(1) と open の間に FIFO へ差し替える競合は残る。実機前提テストは読み取りを補助スレッドで動かし 30 秒の `recv_timeout` で待つ
+- peer credential（PLUG-12）: accept 直後に `sys::peer_uid`（`getsockopt(SO_PEERCRED)`。U11）で接続元 UID を取得し、実行ユーザーの effective UID と照合する。不一致（`PEER_UID_MISMATCH`）・取得失敗（`PEER_CRED_UNAVAILABLE`）は接続を閉じて拒否する（fail-closed）。実行ユーザーの euid が overflowuid（既定 65534。sysctl で変えた値は扱わない）なら、マッピング外の接続元も同じ値に見えて区別できないので照合せずに拒否する（`PEER_UID_UNVERIFIABLE`。事後監査 PR #1611）。加えてソケットディレクトリを自 UID 所有・`0700` に限る。限界は、同じ UID の別プロセスは接続できること、検査と bind の間の TOCTOU は、祖先が他 UID に差し替え不能であることと所有者が自分で `0700` のディレクトリであることで抑えるに留まること（同じ UID と root は差し替えられる。祖先に symlink がある環境は拒否される）。別 UID の接続拒否は別 UID を用意できないため実機前提で、単体試験は期待 UID をずらして照合関数を検証する。U11 の根拠は #1517 の個別承認（追認: <https://github.com/Fandhe-AI/fandhe-container/issues/1517#issuecomment-6092697332>）で、`sys` モジュールの事前承認（#4・coding-rust.md）には拠らない。
+- ログ読み取り側（事後監査 #1528 D2）: `log::read_log_file` が open 前に `symlink_metadata` で通常ファイル以外（FIFO・symlink・ディレクトリ）を拒否し、open 後も `metadata` で確かめ直し（Unix では `dev` / `ino` を open 前の値と比べ、rename・symlink による差し替えを `Replaced` で拒否する。事後監査 PR #1611）、上限つきで読む。(1) と open の間に FIFO へ差し替えると open が止まる競合は残る。Unix 以外は std の stable API にファイルの同一性が無いため同一性を照合しない。実機前提テストは読み取りを補助スレッドで動かし 30 秒の `recv_timeout` で待つ
 
 ## 11. 以降の章（未着手。10 章は #888 の範囲）
 

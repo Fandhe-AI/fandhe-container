@@ -3,7 +3,7 @@
 //! 要求・応答の具体バイト列の照合と、不正入力の拒否（検査順を含む）を確認する。ソケット I/O は含まない（F1.2）。
 
 use fandhe_container_poc_venus_jig::vhost_user::{
-    CodecErrorCode, ConfigPayload, HEADER_LEN, Header, MemRegion, MemTable, Reply, Request,
+    Ack, CodecErrorCode, ConfigPayload, HEADER_LEN, Header, MemRegion, MemTable, Reply, Request,
     RequestCode, VringFd, VringState, decode_reply, decode_request, decode_request_payload,
 };
 
@@ -156,6 +156,73 @@ fn f1_1_gpu6_length_is_checked_before_value() {
     assert_eq!(code(&hdr(24, 1, &p)), CodecErrorCode::InvalidValue);
     assert_eq!(
         code(&hdr(5, 1, &u32s(&[0, 0]))),
+        CodecErrorCode::InvalidValue
+    );
+}
+
+/// GPU-6・REPAIR-2・TASK-172 F5.2b.1（#1639）: ack は size 8・REPLY の u64 で、成功は 0、失敗は 1。復号で往復する。
+#[test]
+fn f5_2b_1_gpu6_ack_encodes_exact_bytes_and_roundtrips() {
+    let ok = Reply::Ack(Ack::success(RequestCode::SetOwner).unwrap());
+    let m = ok.encode().unwrap();
+    assert_eq!(
+        m.as_bytes(),
+        &[3, 0, 0, 0, 5, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..]
+    );
+    assert_eq!(
+        decode_reply(m.as_bytes(), RequestCode::SetOwner).unwrap(),
+        ok
+    );
+    let bad = Reply::Ack(Ack::failure(RequestCode::SetVringNum).unwrap());
+    let m = bad.encode().unwrap();
+    assert_eq!(
+        m.as_bytes(),
+        &[8, 0, 0, 0, 5, 0, 0, 0, 8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0][..]
+    );
+    assert_eq!(
+        decode_reply(m.as_bytes(), RequestCode::SetVringNum).unwrap(),
+        bad
+    );
+}
+
+/// 応答本体を持つ `GET_*` の要求 ID では ack を作れない（値が応答値と誤解されるのを型で防ぐ）。
+#[test]
+fn f5_2b_1_gpu6_ack_rejects_requests_with_reply_body() {
+    for code in [
+        RequestCode::GetFeatures,
+        RequestCode::GetProtocolFeatures,
+        RequestCode::GetQueueNum,
+        RequestCode::GetVringBase,
+        RequestCode::GetConfig,
+    ] {
+        assert!(code.has_reply_body());
+        assert_eq!(
+            Ack::success(code).unwrap_err().code,
+            CodecErrorCode::InvalidValue
+        );
+        assert_eq!(
+            Ack::failure(code).unwrap_err().code,
+            CodecErrorCode::InvalidValue
+        );
+    }
+    assert!(!RequestCode::SetMemTable.has_reply_body());
+}
+
+/// ack の size が 8 でない・要求 ID が食い違う応答は拒否する。
+#[test]
+fn f5_2b_1_gpu6_decode_ack_rejects_bad_length_and_id() {
+    let short = hdr(3, 5, &[0, 0, 0, 0]);
+    assert_eq!(
+        decode_reply(&short, RequestCode::SetOwner)
+            .unwrap_err()
+            .code,
+        CodecErrorCode::LengthMismatch
+    );
+    let ok = hdr(3, 5, &[0u8; 8]);
+    assert_eq!(
+        decode_reply(&ok, RequestCode::SetVringNum)
+            .unwrap_err()
+            .code,
         CodecErrorCode::InvalidValue
     );
 }

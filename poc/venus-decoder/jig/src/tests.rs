@@ -496,6 +496,40 @@ fn d2_read_log_file_rejects_non_regular_without_opening() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// GPU-6（事後監査 PR #1611）: `symlink_metadata` と open の間に、別の通常ファイルへの rename と、通常ファイルへの
+/// symlink に差し替えられたら `Replaced` で拒否する。元のファイルは別名で残し、inode 番号の再利用で一致しないようにする。
+#[cfg(unix)]
+#[test]
+fn gpu6_read_log_file_rejects_replacement_between_stat_and_open() {
+    use crate::log::read_log_file_with;
+    let dir = scratch_dir("swap");
+    let path = dir.join("j.log");
+    let aside = dir.join("aside.log");
+    let other = dir.join("other.log");
+    std::fs::write(&path, format!("{OK_LINE}\n")).unwrap();
+    std::fs::write(&other, "other\n").unwrap();
+    // 別の通常ファイルを rename で上書きする。
+    let r = read_log_file_with(&path, || {
+        std::fs::rename(&path, &aside).unwrap();
+        std::fs::copy(&other, dir.join("copy.log")).unwrap();
+        std::fs::rename(dir.join("copy.log"), &path).unwrap();
+    });
+    assert_eq!(r, Err(LogFileError::Replaced));
+    // 通常ファイルへの symlink に差し替える（open は symlink を辿り、通常ファイルとして開ける）。
+    std::fs::remove_file(&path).unwrap();
+    std::fs::rename(&aside, &path).unwrap();
+    let r = read_log_file_with(&path, || {
+        std::fs::rename(&path, &aside).unwrap();
+        std::os::unix::fs::symlink(&other, &path).unwrap();
+    });
+    assert_eq!(r, Err(LogFileError::Replaced));
+    // 差し替えがなければ同じ経路で読める。
+    std::fs::remove_file(&path).unwrap();
+    std::fs::rename(&aside, &path).unwrap();
+    assert_eq!(read_log_file_with(&path, || {}), Ok(format!("{OK_LINE}\n")));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// GPU-6・TASK-172 F6・#1602: 記録の 2 行は固定語彙と数値だけで、照合器は壊れた行に数えない。
 #[test]
 fn task1602_gpu6_record_lines_are_fixed_vocabulary_and_not_malformed() {
@@ -569,4 +603,16 @@ fn task1602_gpu6_is_priority_line_matches_only_known_events() {
         "venus_jig event=record_stopped_x records=1"
     ));
     assert!(!is_priority_line("venus_jig event=launch_errors code=X"));
+}
+
+/// GPU-6・TASK-172 F5.2b.1（#1639）: ack のログ行は固定語彙と要求 ID だけで、照合器に壊れた行と見なされない。
+#[test]
+fn f5_2b_1_gpu6_need_reply_ack_line_is_fixed_vocabulary() {
+    let ok = crate::log::need_reply_ack_line(16, true);
+    let err = crate::log::need_reply_ack_line(8, false);
+    assert_eq!(ok, "venus_jig event=need_reply_ack request=16 result=ok");
+    assert_eq!(err, "venus_jig event=need_reply_ack request=8 result=err");
+    let report = crate::log::find_capset_queries(&format!("{ok}\n{err}")).expect("report");
+    assert_eq!(report.malformed_lines, 0);
+    assert_eq!(report.venus_get_capset_ok, 0);
 }

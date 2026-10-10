@@ -23,8 +23,8 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! - 制限適用の証跡型の確定と `require_restriction_evidence` への配線（exec の許可）は未実装の
-//!   後続作業で、適用結果 [`LandlockApplyReport`] は証跡ではなく捨てる
+//! - 適用結果 [`LandlockApplyReport`] 自体は証跡ではなく捨てる。制限適用の証跡は、`with_landlock` 経由の
+//!   適用が `Ok` を返したときに `stages.rs` の `run_then` だけが作る（`LaunchReady`。#1714）
 //! - Landlock の組み込み固定段への昇格（`with_hook(Landlock)` の拒否）は後続作業
 //! - 本番 launcher（`oci_runtime`）からの本関数の呼び出しは後続
 
@@ -34,7 +34,7 @@ use super::{ExecError, IsolationStage, ThreadCountSource};
 use crate::audit_log::{AuditRecord, AuditRecordError, landlock_denial_record_now};
 use crate::landlock::{
     LandlockApplyError, LandlockApplyReport, LandlockError, LandlockRuleError, LandlockRuleset,
-    detect_landlock_abi, path_rules_from_config,
+    LandlockSupport, detect_landlock_abi, path_rules_from_config,
 };
 use crate::oci_runtime::OciConfig;
 use crate::sys;
@@ -70,13 +70,31 @@ pub(super) fn apply_landlock_stage_with(
 /// fork 前に親で呼び、得た ruleset を `StagePipeline::with_landlock` へ渡す。
 /// ABI 不足・生成失敗は `stage = Landlock` の `ExecError` になる（起動拒否。fail-closed）。
 ///
+/// # ABI 6 未満の扱い（CORE-5・#1714・#1314 のオーナー判断 2026-10-10）
+///
+/// CORE-5 は Landlock ABI 6 以上でパス単位のアクセス制御が有効であることを期待しており、満たさない場合に
+/// 縮退して続ける規定は無いので、起動を拒否する（fail-closed）と読む。拒否は段（`run_then`）の手前、fork の前に
+/// 行い、コードは `FailedPrecondition`（段 `Landlock`、理由コード `landlock_abi_too_old` 等）。`PermissionDenied` は
+/// exec 段での証跡欠落だけを表す。ruleset は検出済みの ABI からしか作れないため、ABI 不足では `with_landlock` も
+/// `LaunchReady` も得られない。本番 launcher（#1715）はこのエラーをそのまま返して起動を拒否し、Landlock 無しで
+/// 続けてはならない。
+///
 /// # 将来仕様（記録のみ）
 ///
-/// 本番 launcher（`oci_runtime`）からの呼び出しは後続作業（REPAIR-3）。
+/// 本番 launcher（`oci_runtime`）からの呼び出しは後続作業（#1715。REPAIR-3）。
 pub(crate) fn landlock_ruleset_from_config(
     config: &OciConfig,
 ) -> Result<LandlockRuleset, ExecError> {
-    let support = detect_landlock_abi().map_err(from_landlock_unavailable)?;
+    ruleset_from_detection(detect_landlock_abi(), config)
+}
+
+/// [`landlock_ruleset_from_config`] の ABI 検出結果を差し替えられる版（試験用の継ぎ目。本番は
+/// `detect_landlock_abi()` の結果を渡すだけ）。
+fn ruleset_from_detection(
+    detected: Result<LandlockSupport, LandlockError>,
+    config: &OciConfig,
+) -> Result<LandlockRuleset, ExecError> {
+    let support = detected.map_err(from_landlock_unavailable)?;
     path_rules_from_config(&support, config).map_err(from_landlock_rule)
 }
 
@@ -362,6 +380,24 @@ mod tests {
     use super::*;
     use crate::landlock::{LandlockApplyErrorKind, LandlockRuleErrorKind, LandlockUnavailable};
     use crate::traits::types::ErrorCode;
+
+    /// CORE-5・#1714: ABI 6 未満は段に入る前（ruleset を作る前）に `FailedPrecondition` で起動を拒否し、
+    /// 縮退して続けない。ABI 6 なら ruleset が作れる。
+    #[test]
+    fn core5_abi_below_min_refuses_before_stage() {
+        let json = br#"{"ociVersion":"1.2.0","root":{"path":"rootfs"}}"#;
+        let config = crate::oci_runtime::parse_config_bytes(json).expect("config");
+        let e = ruleset_from_detection(crate::landlock::evaluate_abi(5), &config)
+            .expect_err("abi 5 must be refused");
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.stage, IsolationStage::Landlock);
+        assert!(
+            e.message.starts_with("landlock_abi_too_old"),
+            "{}",
+            e.message
+        );
+        assert!(ruleset_from_detection(crate::landlock::evaluate_abi(6), &config).is_ok());
+    }
 
     /// CORE-5・TASK-39.5: プローブ件数の上限超過は適用前に InvalidArgument で拒否する。
     #[test]

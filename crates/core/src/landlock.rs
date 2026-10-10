@@ -19,7 +19,7 @@
 //! # 未実装範囲（REPAIR-3）
 //!
 //! ステージ列への組み込み口（`StagePipeline::with_landlock`・#184）は実装済みだが、本番 launcher からの呼び出しと
-//! 制限適用の証跡配線は後続作業（スコープ外）。本モジュールは検出と拒否判定、純粋関数によるルール生成
+//! 制限適用の証跡（`LaunchReady`）は #1714 で配線済み。本モジュールは検出と拒否判定、純粋関数によるルール生成
 //! （`rules` 子モジュール・#182）、ruleset の適用（`apply` 子モジュール・#183。`landlock_create_ruleset` →
 //! `landlock_add_rule` → `landlock_restrict_self`）を提供する。適用関数 `apply_landlock_ruleset` は #184 の
 //! `exec/landlock.rs` が呼ぶ前提で crate 内公開に留める。
@@ -189,7 +189,7 @@ impl AbiProbe for RealProbe {
 }
 
 /// 生の ABI 値を評価する（純粋関数）。[`MIN_LANDLOCK_ABI`] 以上のみ `Ok`。
-fn evaluate_abi(raw: u32) -> Result<LandlockSupport, LandlockError> {
+pub(crate) fn evaluate_abi(raw: u32) -> Result<LandlockSupport, LandlockError> {
     let (Some(abi), Some(required)) = (NonZeroU32::new(raw), NonZeroU32::new(MIN_LANDLOCK_ABI))
     else {
         return Err(LandlockError::new(

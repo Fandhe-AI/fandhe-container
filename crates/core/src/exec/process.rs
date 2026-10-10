@@ -21,14 +21,13 @@
 //! - **最小構成（フック無し）**: 子はステージ列（[`StagePipeline`]。#832）を `run_child` の pivot 後・
 //!   exec 前で固定順に実行する。組み込みの `PR_SET_NO_NEW_PRIVS`（#833）は空のパイプラインでも適用される
 //!   が、**Landlock は `with_landlock` 指定時のみ適用（本番 launcher からの指定は後続）、cgroup 参加は呼び出し側が `cgroups::CgroupJoin` を登録した場合のみ適用**（rootless の実体は TASK-40 が差し込む。capability 削減は #173、seccomp は #178 で組み込み済み）。
-//!   そのため制限が未適用の子（rootful 経路のホスト root 権限のままの子を含む）は、
-//!   `exec_entrypoint` が `PermissionDenied` で exec を拒否する（SEC-1・CORE-5。制限を適用できる
-//!   ようになるまで fail-closed。REPAIR-3: 実装済みを装わない）
-//! - **rootless 経路も同様に拒否する**: 制限ステージの適用証跡が無い限り exec しない。
+//!   Landlock を載せない構成では制限適用の証跡 `LaunchReady`（#1714）が作られないため、`run_child` の終端と
+//!   `exec_entrypoint` は `PermissionDenied` で exec を拒否する（SEC-1・CORE-5。fail-closed）。`with_landlock` を載せた
+//!   `spawn_container_with_stages` は全段の成功で exec へ進む（挙動の変更: 従来は常に拒否）
+//! - **rootless 経路も同様**: 制限ステージの適用証跡（`LaunchReady`）が無い限り exec しない。
 //!   `/proc/self/status` の `NoNewPrivs`・`Seccomp`・`CapEff` は親から継承した制限と区別できず、
-//!   seccomp の内容も確認できないため証跡にしない。残りのステージの実体（TASK-37〜39）が証跡型を返すように
-//!   なるまで常に `PermissionDenied`（`NO_NEW_PRIVS` 単独は証跡にしない。SEC-1・CORE-5）。したがって現時点では実 exec は成功せず、
-//!   成功経路は dry-run の単体テストで検証する
+//!   seccomp の内容も確認できないため証跡にしない（`NO_NEW_PRIVS` 単独も証跡にしない。SEC-1・CORE-5）。
+//!   成功経路の実 exec は root の実機が要るため、単体テストは証跡の検査（`require_restriction_evidence`）と dry-run で検証する
 //! - **継承 fd は開く前に閉じる**: エントリポイントを開く前に fd 3 以上をすべて閉じ、fd 0〜2 と同一の
 //!   実体（rootfs 内の `/proc/self/fd/N` 経由）は拒否する（fd 0〜2 の実体を確認できなければ拒否）。
 //!   継承したホスト fd の実体を開く経路を断つ
@@ -108,9 +107,10 @@ use super::entrypoint_mode::EntrypointExecMode;
 use super::interpreter::reject_runtime_interpreter;
 use super::rlimits::apply_rlimits;
 use super::sealed_copy::{SealPolicy, check_not_on_noexec_mount, seal_entrypoint_copy};
+use super::stages::{LaunchNotReady, LaunchReady};
 use super::{
-    CapabilityReport, ExecError, IsolationStage, MountIsolation, PivotReport, StagePipeline,
-    ViolationReason, describe, fd_mount_id, pivot_root, prepare_rootfs,
+    DevptsGidSource, ExecError, IsolationStage, MountIsolation, PivotReport, StagePipeline,
+    ViolationReason, create_default_devices, describe, fd_mount_id, pivot_root, prepare_rootfs,
 };
 
 /// argv の要素数の上限（アロケーション前に検証する）。
@@ -302,25 +302,23 @@ fn exit_code_for(err: &ExecError) -> i32 {
     }
 }
 
-/// 制限ステージの適用証跡が無いままの exec を拒否する（SEC-1・CORE-5。fail-closed）。
+/// 制限ステージの適用証跡が無いままの exec を拒否する（SEC-1・CORE-5。fail-closed。#1714）。
 ///
+/// `StagePipeline::run_then` が全段の成功後に作る型付きトークン `LaunchReady` を値で受け取ったとき
+/// だけ `Ok` を返す。トークンは組み込みの 4 段（rlimit・capability 削減・`NO_NEW_PRIVS`・seccomp）と、
+/// `with_landlock` で登録した core の Landlock 適用の成功を束ねたもので、このモジュールからは作れない。
+/// 真偽値・`StageReport`・`CapabilityReport` を受け取る入口は作らない（独自フックやダミーフックの
+/// `Applied` では exec を許さない）。`CgroupJoin` は条件に入れない（cgroup を使う設定なのに join して
+/// いない場合の拒否は本番 launcher の責務。#1715）。
 /// `/proc/self/status` の `NoNewPrivs`・`Seccomp`・`CapEff` は、親から継承した制限と子のステージが
 /// 適用した制限を区別できず、seccomp フィルタの中身も確認できないため、証跡として扱わない。
-/// `PR_SET_NO_NEW_PRIVS` は #833 で組み込みステージとして実装済みだが単独では証跡にせず、
-/// capability 削減は #173（TASK-37.2）で組み込み段になり、その [`CapabilityReport`] を引数で受け取る
-/// が、制限適用の証跡配線（Landlock の適用は #184 の `with_landlock` で差し込み可能だが証跡型が未確定。後続作業）が未実装の間は引数の有無によらず
-/// 常に `PermissionDenied` を返す。seccomp は #178（TASK-38.3）で組み込み段として適用されるが、
-/// 証跡型が未確定のため本関数へは配線しない（Landlock も同様。確定と配線は後続作業）。ステージ実装時は、各ステージが
-/// 適用完了を示す証跡型（形は TASK-38・TASK-39 で決める）を返し、それを本関数の引数に取って
-/// 初めて許可する形へ置き換える（REPAIR-3: 実装済みを装わない）。
 fn require_restriction_evidence(
-    _capability_report: Option<&CapabilityReport>,
+    evidence: Result<LaunchReady, LaunchNotReady>,
 ) -> Result<(), ExecError> {
-    Err(ExecError::new(
-        ErrorCode::PermissionDenied,
-        IsolationStage::Exec,
-        "refusing to exec: no evidence that the isolation restrictions were applied (wiring of restriction-applied evidence into exec is not implemented yet)",
-    ))
+    match evidence {
+        Ok(_ready) => Ok(()),
+        Err(not_ready) => Err(not_ready.into_exec_error()),
+    }
 }
 
 /// pivot 済みの PID 1 から、エントリポイントへ `execve` する（成功時は戻らないため戻り値の
@@ -329,13 +327,17 @@ fn require_restriction_evidence(
 /// [`MountIsolation::establish`]・[`prepare_rootfs`]・[`pivot_root`] と同じスレッドから呼ぶ。
 /// 失敗しても状態は戻せないため、呼び出し元はプロセスを破棄する（子の `child_main` は終了コードで
 /// 終わる）。手順は非公開の `exec_entrypoint_verified` を参照。
+///
+/// ステージ列を通さない入口なので制限適用の証跡（`LaunchReady`）が無く、**常に `PermissionDenied`
+/// （段 `Exec`）で拒否する**（#1714）。exec を許すのは、`with_landlock` を含む全段が成功した
+/// `spawn_container_with_stages` の子（`run_child`）だけ。
 pub fn exec_entrypoint(
     isolation: &MountIsolation,
     pivot: &PivotReport,
     entry: &Entrypoint,
 ) -> Result<Infallible, ExecError> {
     isolation.verify_caller(IsolationStage::Exec)?;
-    require_restriction_evidence(None)?;
+    require_restriction_evidence(Err(LaunchNotReady::pipeline_not_run()))?;
     exec_entrypoint_verified(pivot.new_root_mnt_id, entry)
 }
 
@@ -1649,7 +1651,7 @@ fn parse_setup_report(text: &str) -> Option<ExecChildSetupReport> {
 /// ノード（#834）の差し込み位置は、pivot 後・exec 前（`exec_entrypoint` の直前）を想定する。
 /// デバイスノードを pivot の前後どちらで作るかは #834 で決める（本 PR では決めない）。
 fn child_main(rootfs: &Path, entry: &Entrypoint, stages: StagePipeline) -> i32 {
-    match run_child(rootfs, entry, stages) {
+    match run_child(rootfs, entry, stages, None) {
         Ok(never) => match never {},
         Err(err) => {
             // env の値は message に含めない（パスと errno のみ）。stderr が閉じていても panic しない。
@@ -1663,11 +1665,12 @@ fn run_child(
     rootfs: &Path,
     entry: &Entrypoint,
     stages: StagePipeline,
+    devices: Option<DevptsGidSource<'_>>,
 ) -> Result<Infallible, ExecError> {
-    run_child_then(rootfs, stages, |isolation, report, capability_report| {
-        // `exec_entrypoint` と同じ検証を、capability 削減の結果を添えて行う。
+    run_child_then(rootfs, devices, stages, |isolation, report, evidence| {
+        // `exec_entrypoint` と同じ検証を、ステージ列が作った証跡を添えて行う。
         isolation.verify_caller(IsolationStage::Exec)?;
-        require_restriction_evidence(capability_report)?;
+        require_restriction_evidence(evidence)?;
         exec_entrypoint_verified(report.new_root_mnt_id, entry)
     })
 }
@@ -1680,25 +1683,31 @@ fn run_child(
 /// は変わらない。
 fn run_child_then<T>(
     rootfs: &Path,
+    devices: Option<DevptsGidSource<'_>>,
     stages: StagePipeline,
     terminal: impl FnOnce(
         &MountIsolation,
         &PivotReport,
-        Option<&CapabilityReport>,
+        Result<LaunchReady, LaunchNotReady>,
     ) -> Result<T, ExecError>,
 ) -> Result<T, ExecError> {
     let isolation = MountIsolation::establish()?;
     let prepared = prepare_rootfs(&isolation, rootfs)?;
+    // 専用 /dev（基本デバイス 1:3 の null を含む）を pivot 前に載せる経路は結合試験専用（`devices` が `Some`）。
+    // 本番の配線は #1314。None なら従来どおり何も載せない。
+    if let Some(source) = devices {
+        create_default_devices(&isolation, &prepared, source)?;
+    }
     let report = pivot_root(&isolation, prepared)?;
     // pivot 後・終端前にステージ列を固定順で実行する。
-    stages.run_then(|_stage_report, capability_report| {
-        terminal(&isolation, &report, capability_report)
+    stages.run_then(|_stage_report, _capability_report, evidence| {
+        terminal(&isolation, &report, evidence)
     })
 }
 
 /// 子のメイン（プローブ版）。失敗は `child_main` と同じ規約で stderr へ 1 行出して終了コードにする。
 fn child_main_probe(rootfs: &Path, stages: StagePipeline) -> i32 {
-    let result = run_child_then(rootfs, stages, |_isolation, _report, _caps| {
+    let result = run_child_then(rootfs, None, stages, |_isolation, _report, _evidence| {
         let record = super::seccomp::probe_denied_syscalls()?;
         publish_probe_record(&record.render())
     });
@@ -1745,7 +1754,7 @@ fn publish_probe_record(text: &str) -> Result<(), ExecError> {
 ///
 /// # 将来仕様（記録のみ）
 ///
-/// exec が許可されたら（証跡配線後。後続作業）、エントリポイント内のプローブへ移して本関数は廃止する（REPAIR-3）。
+/// プローブの成功は証跡ではない。エントリポイント内のプローブへ移して本関数を廃止する（REPAIR-3。#1714 の範囲外）。
 #[doc(hidden)]
 pub fn spawn_container_seccomp_probe(
     rootfs: &Path,
@@ -1765,12 +1774,13 @@ pub fn spawn_container_seccomp_probe(
 ///
 /// # 制限適用証跡の例外（SEC-1・REPAIR-3）
 ///
-/// 本番の `run_child` は終端で `verify_caller` と `require_restriction_evidence` を行うが、後者は証跡型が
-/// 未確定の間は常に拒否するため、本関数では `verify_caller` のみ行い `require_restriction_evidence` は
-/// 呼ばない（呼ぶとプローブが永久に実行できない）。これは exec を伴わない検証専用経路に限った明示的な例外で、
+/// 本番の `run_child` は終端で `verify_caller` と `require_restriction_evidence` を行うが、本関数では
+/// `verify_caller` のみ行い `require_restriction_evidence` は呼ばない。プローブ用の構成（Landlock を載せない
+/// `escape_suite` / `fork_exec_isolation` のシナリオ等）では `LaunchReady` がそろわず、呼ぶとプローブが
+/// 実行できないため。これは exec を伴わない検証専用経路に限った明示的な例外で、
 /// 本関数の成功（終了コード 0）は「制限が適用された証跡」ではなく、本番経路の成功判定・exec 許可の根拠に
 /// 使ってはならない。攻撃が拒否されたことの判定は probe 側の観測（fd 経由の結果）だけで行う。
-/// 証跡配線後は `require_restriction_evidence` を呼ぶ形へ置き換える。
+/// プローブにも `LaunchReady` を要求する形への置き換えは、シナリオの構成の見直しと併せて後続で行う（#1714 の範囲外）。
 ///
 /// # 契約
 ///
@@ -1781,7 +1791,7 @@ pub fn spawn_container_seccomp_probe(
 ///
 /// # 将来仕様（記録のみ）
 ///
-/// exec が許可されたら（証跡配線後。後続作業）、エントリポイント内の攻撃プローブへ移して本関数は
+/// プローブの成功は証跡ではない。エントリポイント内の攻撃プローブへ移して本関数は
 /// 廃止する（REPAIR-3）。
 ///
 /// 任意クロージャを分離後の子で実行できるため、cargo feature `escape-probe`（結合試験用に dev-dependency の
@@ -1798,7 +1808,7 @@ where
 {
     let pid = sys::fork_single_threaded(
         move || {
-            let result = run_child_then(rootfs, stages, |isolation, _report, _caps| {
+            let result = run_child_then(rootfs, None, stages, |isolation, _report, _evidence| {
                 // 本番 `run_child` と同じ呼び出し元検証（PID 1・入れ子 PID namespace・シングルスレッド）を
                 // プローブ実行前に行う。`require_restriction_evidence` は意図的に呼ばない（下記の例外）。
                 isolation.verify_caller(IsolationStage::Exec)?;
@@ -1834,8 +1844,10 @@ pub fn spawn_container(rootfs: &Path, entry: &Entrypoint) -> Result<ContainerChi
 /// [`spawn_container`] にステージ列（#832・TASK-27.4.2）を渡す版。
 ///
 /// `stages` は親（fork 前）で構築し、fork で子へコピーされて子の pivot 後・exec 前に固定順で
-/// 実行される。フックの失敗・panic では exec に進まず `EXIT_SETUP_FAILED` で終わる。フック無し・
-/// ダミーフックでも制限適用の証跡にはならず、exec は引き続き拒否される（fail-closed）。
+/// 実行される。フックの失敗・panic では exec に進まず `EXIT_SETUP_FAILED` で終わる。
+/// 挙動の変更（#1714）: `stages` に `with_landlock` を載せて全段が成功したときだけ制限適用の証跡
+/// （`LaunchReady`）がそろい exec へ進む。Landlock 無し・独自の Landlock フック・ダミーフックだけでは
+/// 証跡にならず exec は拒否される（fail-closed）。
 pub fn spawn_container_with_stages(
     rootfs: &Path,
     entry: &Entrypoint,
@@ -1843,6 +1855,35 @@ pub fn spawn_container_with_stages(
 ) -> Result<ContainerChild, ExecError> {
     let pid = sys::fork_single_threaded(|| child_main(rootfs, entry, stages), EXIT_SETUP_FAILED)
         .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
+    Ok(ContainerChild::new(pid))
+}
+
+/// 結合試験専用: `spawn_container_with_stages` に、pivot 前の専用 `/dev`（`create_default_devices`）を足した版
+/// （CORE-5・SEC-1・REPAIR-12・#1714）。
+///
+/// `LaunchReady` がそろった後の `redirect_stdio_to_null` が検証済みの `/dev/null`（文字デバイス 1:3）を開けることを、
+/// 実 exec（`execveat`）の成功で照合するための入口。`/dev` の本番配線（#1314）までの暫定で、
+/// 制限適用の証跡の要求（`require_restriction_evidence`）は `spawn_container_with_stages` と同じく行う。
+/// 通常の利用者は呼ばない。
+#[doc(hidden)]
+#[cfg(feature = "exec-test-support")]
+pub fn spawn_container_with_stages_and_devices(
+    rootfs: &Path,
+    entry: &Entrypoint,
+    stages: StagePipeline,
+    devices: DevptsGidSource<'_>,
+) -> Result<ContainerChild, ExecError> {
+    let pid = sys::fork_single_threaded(
+        || match run_child(rootfs, entry, stages, Some(devices)) {
+            Ok(never) => match never {},
+            Err(err) => {
+                let _ = writeln!(std::io::stderr(), "fandhe-container: {err}");
+                exit_code_for(&err)
+            }
+        },
+        EXIT_SETUP_FAILED,
+    )
+    .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
     Ok(ContainerChild::new(pid))
 }
 
@@ -2555,13 +2596,19 @@ mod tests {
         );
     }
 
-    /// SEC-1・CORE-5: 制限ステージの証跡が無い間は、継承された制限の有無にかかわらず exec を拒否する。
+    /// SEC-1・CORE-5・#1714: 証跡が無い（ステージ列を通さない）入口は、継承された制限の有無にかかわらず
+    /// exec を拒否する。段は `Exec` のまま終了コード 126 で、欠けた段が理由に載る。
     #[test]
     fn sec1_exec_is_denied_without_restriction_evidence() {
-        let err = require_restriction_evidence(None).unwrap_err();
+        let err =
+            require_restriction_evidence(Err(LaunchNotReady::pipeline_not_run())).unwrap_err();
         assert_eq!(err.code, ErrorCode::PermissionDenied);
         assert_eq!(err.stage, IsolationStage::Exec);
         assert_eq!(exit_code_for(&err), EXIT_EXEC_NOT_EXECUTABLE);
+        assert_eq!(
+            err.message,
+            "refusing to exec: no evidence that the isolation restrictions were applied; missing: rlimits,capability_drop,no_new_privs,landlock,seccomp"
+        );
     }
 
     /// CORE-1・TASK-27.4.2: ステージの失敗（各段）は子の終了コード 125 になる。
@@ -2579,7 +2626,8 @@ mod tests {
         }
     }
 
-    /// CORE-1・SEC-1（TASK-27.4.2）: 全段のダミーフックが `Ok` でも、exec の拒否（証跡要求）は解除されない。
+    /// CORE-1・SEC-1・CORE-5（TASK-27.4.2・#1714）: 組み込みでない段にダミーフックを全部登録し、Landlock に
+    /// 独自フックを載せても、証跡はそろわず exec の拒否は解除されない（欠けるのは `landlock` だけ）。
     #[test]
     fn core1_stage_report_is_not_restriction_evidence() {
         use crate::exec::StageKind;
@@ -2588,10 +2636,36 @@ mod tests {
             p = p.with_hook(kind, || Ok(())).unwrap();
         }
         let err = p
-            .run_then(|_report, caps| require_restriction_evidence(caps))
+            .run_then(|_report, _caps, ev| require_restriction_evidence(ev))
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::PermissionDenied);
         assert_eq!(err.stage, IsolationStage::Exec);
+        assert!(
+            err.message.ends_with("missing: landlock"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// SEC-1・CORE-5・#1714: `with_landlock` を載せた全段の成功で、exec の前段（証跡の検査）を通る。
+    /// 単体テストで確かめられるのは証跡の検査までで、`exec_entrypoint_verified` は pivot 直後のマウント ID と
+    /// 実際の `/` を要するため呼ばない（dry-run の既存テストが別に担う）。
+    #[test]
+    fn sec1_core5_full_pipeline_permits_exec_prestage() {
+        use crate::landlock::{AccessFs, LandlockRuleset, PathRule, RuleOrigin, RulePath};
+        let ruleset = LandlockRuleset::for_observation(
+            6,
+            vec![PathRule {
+                path: RulePath::Root,
+                allowed: AccessFs::READ,
+                origin: RuleOrigin::Root,
+            }],
+        );
+        let result = StagePipeline::new()
+            .with_landlock(ruleset)
+            .unwrap()
+            .run_then(|_report, _caps, ev| require_restriction_evidence(ev));
+        assert!(matches!(result, Ok(())));
     }
 
     /// CORE-1・SEC-1: 継承した標準入出力と同一 inode の判定は `(dev, ino)` の完全一致だけを真にする。

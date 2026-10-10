@@ -35,7 +35,7 @@
 //! # 未実装範囲（REPAIR-3）
 //!
 //! ステージ列への組み込み口（`with_landlock`・#184）は実装済み。[`LandlockApplyReport`] は制限適用の証跡では
-//! なく、`require_restriction_evidence` の判定には使えない（証跡型の確定は後続作業）。
+//! なく、`require_restriction_evidence` の判定には使えない（証跡は `with_landlock` 経由の適用成功時に `run_then` が作る `LaunchReady`。#1714）。
 
 use std::ffi::CString;
 use std::fmt;

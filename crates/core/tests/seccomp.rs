@@ -5,8 +5,8 @@
 //! `spawn_container_seccomp_probe` が fork した実際のコンテナプロセス（新しい PID namespace の PID 1・
 //! pivot_root 後・capability 削減・`NO_NEW_PRIVS` 設定済み）の中で、ステージ列の**組み込み `Seccomp` 段**が
 //! 載せたフィルタが禁止 syscall を `EPERM` で拒否することを、子が pivot 後の `/seccomp-probe` へ書いた
-//! 記録（`SeccompProbeRecord`）の具体値で照合する。exec は証跡が無い間は常に拒否される（fail-closed。
-//! REPAIR-3）ため、プローブ用 API は exec の代わりに終端でプローブを実行する。
+//! 記録（`SeccompProbeRecord`）の具体値で照合する。Landlock を載せない構成では `LaunchReady` が作られず exec は拒否される（fail-closed。
+//! #1714）ため、プローブ用 API は exec の代わりに終端でプローブを実行する。
 //!
 //! # 識別的な検査と網羅確認
 //! - 識別的（capability 不足ではなく seccomp が拒否したことを示せる）: `unshare(0)`（フィルタが無ければ

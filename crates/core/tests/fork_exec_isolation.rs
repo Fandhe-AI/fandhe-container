@@ -51,7 +51,10 @@
 //!   `exec-test-support` の `close_standard_fds_for_test`）: 分離後・起動直前に自プロセスの fd `{0}`・`{0,1}`・`{0,1,2}`
 //!   を閉じてから `spawn_container` する。閉じた親からでも exec は fail-closed（`Exited(126)`・フックのログは空）で、
 //!   `all` は stderr も閉じるため marker を空にし、panic の診断だけを退避した複製へ出す。実行用 fd が 3 以上へ移る
-//!   具体値は launch 経路では観測できず（証跡未配線のため `execveat` の手前で拒否）、`tests/exec_child_setup.rs` で照合する
+//!   具体値は launch 経路では観測できず（`with_landlock` を載せないため `LaunchReady` が作られず `execveat` の手前で拒否）、`tests/exec_child_setup.rs` で照合する
+//!
+//! - シナリオ `landlock-exec`（#1714・CORE-5・SEC-1・REPAIR-12。`with_landlock` + `spawn_container_with_stages`）: 制限適用の証跡
+//!   `LaunchReady` がそろった launch 経路が実際に `execveat` まで到達する。プローブの終了コード 42 を照合する（拒否なら 126）
 //!
 //! # 実機前提テストとしての分離
 //! 実行には root もしくは非特権 user namespace を許可するホストが必要（AppArmor の
@@ -118,7 +121,7 @@ mod linux {
     /// 子が pivot 後の `/` に追記するステージ実行ログ（親からは `<rootfs>/stage-log`）。
     const STAGE_LOG: &str = "stage-log";
     /// (シナリオ名, stderr に含まれるべき文字列)。
-    const SCENARIOS: [(&str, &str); 13] = [
+    const SCENARIOS: [(&str, &str); 14] = [
         ("ok", "PERMISSION_DENIED"),
         ("missing", "PERMISSION_DENIED"),
         ("not-executable", "PERMISSION_DENIED"),
@@ -129,6 +132,8 @@ mod linux {
         ("landlock-apply-ro", "Permission denied"),
         ("landlock-apply-rw", ""),
         ("landlock-fail", "landlock_open_path_failed"),
+        // 制限適用の証跡 `LaunchReady`（#1714）がそろった launch 経路の実 exec。stderr に診断は出ない。
+        ("landlock-exec", ""),
         // 標準 fd を閉じた親からの起動（#1299）。fd 2 を閉じると子の診断が届かないため、`all` の marker は空。
         ("stdio-closed-one", "PERMISSION_DENIED"),
         ("stdio-closed-many", "PERMISSION_DENIED"),
@@ -356,6 +361,8 @@ mod linux {
         let is_root = is_root();
         // 環境（docker 等）が既に NO_NEW_PRIVS=1 のことがあるため、適用前の値を記録して期待値にする。
         let inherited_nnp = no_new_privs_flag();
+        // user namespace に入ると 0 に見えるため、分離の前に実効 gid を控える（rootless の devpts の gid 判定に使う）。
+        let host_egid = host_egid();
         if inherited_nnp == 1 {
             // 継承済みだと設定操作の有無を nnp ログで区別できない（順序のみの検証になる）。
             println!(
@@ -386,8 +393,8 @@ mod linux {
             "missing" => "/no-such-entrypoint".to_string(),
             "not-executable" => format!("/{NOT_EXEC}"),
             "stages-order" | "stage-fail" | "landlock-apply-ro" | "landlock-apply-rw"
-            | "landlock-fail" | "rlimits-apply" | "rlimit-fail" | "stdio-closed-one"
-            | "stdio-closed-many" | "stdio-closed-all" => format!("/{PROBE}"),
+            | "landlock-fail" | "landlock-exec" | "rlimits-apply" | "rlimit-fail"
+            | "stdio-closed-one" | "stdio-closed-many" | "stdio-closed-all" => format!("/{PROBE}"),
             other => panic!("unknown scenario {other}"),
         };
         // SEC-1・CORE-5: Landlock が未適用の間は、root / 非 root を問わず
@@ -466,7 +473,7 @@ mod linux {
                         r#"[{"destination":"/no-such-landlock-dir","options":["rw"]}]"#,
                     ),
                 };
-                let ruleset = landlock_ruleset(readonly, mounts);
+                let ruleset = landlock_ruleset(readonly, mounts, ImplicitDevMounts::None);
                 let stages = StagePipeline::new()
                     .with_hook(StageKind::CgroupJoin, logging_hook(StageKind::CgroupJoin))
                     .and_then(|p| p.with_landlock(ruleset))
@@ -477,6 +484,23 @@ mod linux {
                     _ => ChildExit::Exited(125),
                 };
                 spawn_container_seccomp_probe(rootfs, stages)
+            }
+            "landlock-exec" => {
+                // CORE-5・SEC-1・REPAIR-12・#1714: `with_landlock` を載せた構成は、全段（cgroup 参加 → 組み込みの
+                // capability 削減・NO_NEW_PRIVS → 実カーネルの Landlock → 組み込みの seccomp）の成功後に
+                // `LaunchReady` がそろい、エントリポイントの検査・標準 fd の置換を経て `execveat` へ到達する。
+                // プローブ ELF の終了コード 42 は exec が実際に行われた場合にだけ得られる（拒否は 126）。
+                // 読み取り専用 rootfs でも実行権限は許可される。
+                // 標準 fd の置換は検証済みの `/dev/null`（文字デバイス 1:3）を開くため、子の pivot 前に専用の `/dev`
+                // （`create_default_devices`。rootless はホストのノードの bind）を載せ、Landlock には暗黙の `/dev`・
+                // `/dev/pts` の許可を足す（`/dev/shm` は載せないので `WithoutShm`）。
+                let ruleset = landlock_ruleset(true, "[]", ImplicitDevMounts::WithoutShm);
+                let stages = StagePipeline::new()
+                    .with_hook(StageKind::CgroupJoin, logging_hook(StageKind::CgroupJoin))
+                    .and_then(|p| p.with_landlock(ruleset))
+                    .unwrap_or_else(|e| panic!("register landlock: {e}"));
+                want = ChildExit::Exited(PROBE_EXIT);
+                spawn_with_dev(rootfs, &entry, stages, host_egid, is_root)
             }
             _ => spawn_container(rootfs, &entry),
         }
@@ -514,6 +538,11 @@ mod linux {
                 format!("cgroup_join root=1 nnp={inherited_nnp}\n"),
                 "no stage after the failed one may run"
             ),
+            "landlock-exec" => assert_eq!(
+                log,
+                format!("cgroup_join root=1 nnp={inherited_nnp}\n"),
+                "the pre-landlock stage must run before restriction, then the entrypoint must be exec'd"
+            ),
             "landlock-apply-ro" | "landlock-apply-rw" | "landlock-fail" => {
                 // Landlock の前段（cgroup 参加）は、制限が掛かる前に pivot 後の `/` へ書けている。
                 assert_eq!(
@@ -537,7 +566,7 @@ mod linux {
     ///
     /// 閉じた親から `spawn_container` しても、実行用の fd が 0〜2 に入り込まず fail-closed のまま
     /// （`Exited(126)`）であることを固定する。fd 移動そのものの具体値（実行用 fd が 3 以上・標準入出力が 1:3）は、
-    /// launch 経路が制限適用の証跡未配線で `prepare_exec_child` の手前で拒否されるため観測できず、
+    /// launch 経路が `with_landlock` を載せず `LaunchReady` が作られないため `prepare_exec_child` の手前で拒否されるため観測できず、
     /// `tests/exec_child_setup.rs` の観測用の入口で照合している。証跡が配線されたら、本シナリオの期待を
     /// プローブの `Exited(42)` へ戻す（他シナリオと同じ扱い）。他のシナリオでは何もしない。
     #[cfg(feature = "exec-test-support")]
@@ -588,8 +617,53 @@ mod linux {
         }
     }
 
+    /// 分離の前の実効 gid（`/proc/self/status` の `Gid:` の 2 列目）。
+    fn host_egid() -> u32 {
+        std::fs::read_to_string("/proc/self/status")
+            .expect("read status")
+            .lines()
+            .find(|l| l.starts_with("Gid:"))
+            .and_then(|l| l.split_whitespace().nth(2).map(str::to_string))
+            .and_then(|v| v.parse().ok())
+            .expect("parse egid")
+    }
+
+    /// 専用 `/dev` を pivot 前に載せて起動する（`landlock-exec`。#1714）。
+    #[cfg(feature = "exec-test-support")]
+    fn spawn_with_dev(
+        rootfs: &Path,
+        entry: &Entrypoint,
+        stages: StagePipeline,
+        host_egid: u32,
+        is_root: bool,
+    ) -> Result<fandhe_container_core::exec::ContainerChild, ExecError> {
+        use fandhe_container_core::exec::{
+            DevptsGidSource, spawn_container_with_stages_and_devices,
+        };
+        use fandhe_container_core::rootless::single_id_mapping;
+        let gid_map = single_id_mapping(host_egid).expect("single id mapping");
+        let source = if is_root {
+            DevptsGidSource::Rootful
+        } else {
+            DevptsGidSource::Rootless(&gid_map)
+        };
+        spawn_container_with_stages_and_devices(rootfs, entry, stages, source)
+    }
+
+    /// feature なしのビルドでは入口が無い。検証せずに成功しない（fail-closed）。
+    #[cfg(not(feature = "exec-test-support"))]
+    fn spawn_with_dev(
+        _rootfs: &Path,
+        _entry: &Entrypoint,
+        _stages: StagePipeline,
+        _host_egid: u32,
+        _is_root: bool,
+    ) -> Result<fandhe_container_core::exec::ContainerChild, ExecError> {
+        panic!("not verified; the exec-test-support feature is not enabled (landlock-exec)");
+    }
+
     /// `root.readonly` と mounts から実カーネルの ABI を検出して Landlock ruleset を作る（親・fork 前）。
-    fn landlock_ruleset(readonly: bool, mounts: &str) -> LandlockRuleset {
+    fn landlock_ruleset(readonly: bool, mounts: &str, dev: ImplicitDevMounts) -> LandlockRuleset {
         let json = format!(
             r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":{readonly}}},"mounts":{mounts}}}"#
         );
@@ -597,15 +671,10 @@ mod linux {
         let support = detect_landlock_abi()
             .unwrap_or_else(|e| panic!("Landlock ABI 6+ is required for this test: {e}"));
         // rootfs に dev が無い最小フロー（`spawn_container` は `create_default_devices` を呼ばない。#1314 未配線）
-        // では暗黙の `/dev` 系のルールを足せない（存在しないパスは適用時に拒否される）ため含めない。ルールは
-        // 従来と同じで弱体化ではない。#1314 で配線したら `ImplicitDevMounts::All` に戻す（#1657）。
-        build_path_rules_with_dev(
-            &support,
-            config.root(),
-            config.mounts(),
-            ImplicitDevMounts::None,
-        )
-        .unwrap_or_else(|e| panic!("rules: {e}"))
+        // では暗黙の `/dev` 系のルールを足せない（存在しないパスは適用時に拒否される）ため `None` を渡す。
+        // 専用 `/dev` を載せる `landlock-exec` だけ `WithoutShm` を渡す。#1314 で配線したら `All` に戻す（#1657）。
+        build_path_rules_with_dev(&support, config.root(), config.mounts(), dev)
+            .unwrap_or_else(|e| panic!("rules: {e}"))
     }
 
     /// 自プロセスの `/proc/self/status` の `NoNewPrivs:` の値（0 または 1）。

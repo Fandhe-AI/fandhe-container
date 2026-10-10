@@ -26,7 +26,7 @@
 //! # 実機前提テストとしての分離
 //! root もしくは非特権 user namespace を許可するホストが必要で、GitHub ホステッド runner では
 //! 保証できないため `-- --ignored` 指定時のみ実行する（ci.md「実機前提テスト」）。CI では
-//! `integration-test` ジョブ（ubuntu-latest）が AppArmor の制限を緩和した後に rootless 経路で実行し、
+//! `platform-ci` ジョブ（ubuntu-latest）が AppArmor の制限を緩和した後に rootless 経路で実行し、
 //! 成功行 `inject_files: content, read-only and rollback verified (root=false)` を照合する。rootful 経路
 //! （root）の実行は root 権限コマンドのため明示指示のもとで行い、結果を PR に記録する。
 

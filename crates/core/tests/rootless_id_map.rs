@@ -16,7 +16,7 @@
 //! 非特権 user namespace を許可するホストが必要（AppArmor の
 //! `kernel.apparmor_restrict_unprivileged_userns=1` 等では `PermissionDenied`）。
 //! `-- --ignored` 指定時のみ実行し、未指定時は「ignored」を出力して成功終了する（ci.md
-//! 「実機前提テスト」）。CI の `integration-test` への組み込みは別 PR（ci.yml は infra-builder 担当）。
+//! 「実機前提テスト」）。CI の `platform-ci` への組み込みは別 PR（ci.yml は infra-builder 担当）。
 //! 実行された場合は拒否を含むあらゆる失敗を失敗として扱い、検証せずに成功する分岐は持たない。
 //! Helper ケースは env の opt-in 時のみ実行し、opt-in 時に前提（uidmap・subuid/subgid 行）が
 //! 無ければ失敗とする。root で実行された場合は euid 0 の自 ID 写像が SEC-5 で拒否されることを照合する。

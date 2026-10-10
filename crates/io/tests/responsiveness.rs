@@ -51,7 +51,7 @@
 //!
 //! タイムアウト秒数は環境変数 `FANDHE_CONTAINER_TEST_TIMEOUT_SECS` で上書きでき、
 //! 未設定時の既定値は [`DEFAULT_TEST_TIMEOUT_SECS`]（10 秒）。CI の
-//! `integration-test` ジョブはこの env に `"10"` を渡す（TASK-87.1・#40）。
+//! `platform-ci` ジョブはこの env に `"10"` を渡す（TASK-87.1・#40）。
 //! 本ファイルが、この env を読んで `Duration` を組み立てる最初の消費側コードに
 //! なる（AGENTS.md 78 行の「消費側コードは存在せず」は本 PR で解消される）。
 
@@ -71,7 +71,7 @@ const TEST_TIMEOUT_ENV: &str = "FANDHE_CONTAINER_TEST_TIMEOUT_SECS";
 
 /// 環境変数未設定時の既定タイムアウト秒数。AGENTS.md「推奨タイムアウト値」
 /// （REPAIR-5・REPAIR-10 (c)）の推奨レンジ（5〜10 秒）の上限で、CI の
-/// `integration-test` ジョブが渡す値（TASK-87.1・#40）とも一致する。
+/// `platform-ci` ジョブが渡す値（TASK-87.1・#40）とも一致する。
 const DEFAULT_TEST_TIMEOUT_SECS: u64 = 10;
 
 /// 許容するタイムアウト秒数の下限（AGENTS.md「推奨タイムアウト値」の下限。

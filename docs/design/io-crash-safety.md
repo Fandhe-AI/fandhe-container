@@ -81,6 +81,8 @@ TMPDIR=<dir> cargo test -p fandhe-container-io --features crash-test-server --te
 | `rust-ci (macos-latest) / cargo test` | 109386549792 | 同 9 件 ok |
 | `rust-ci (windows-latest) / cargo test` | 109386550127 | `other::io3_crash_test_server_reports_unsupported_platform` のみ ok |
 
+注記（2026-10-10）: 表のジョブ名は記録時点の CI 構成のもの。ジョブ再構成（macOS ランナー待ちの解消）で、`integration-test (<os>)` と `rust-ci (macos-latest|windows-latest) / cargo test` は `platform-ci (<os>)` のステップに統合され、`rust-ci` は ubuntu のみで実行する。さらに 2 段階目の再構成で、pull_request の `platform-ci` は ubuntu のみになり、macOS・Windows での実行は main への push と `workflow_dispatch` で行う（`.claude/rules/ci.md`「3 OS CI」）。記録自体は書き換えない。
+
 ```text
 test unix::io3_flushed_data_survives_10_valid_sigkills ... ok
 test unix::io3_unflushed_control_records_loss_without_asserting ... ok

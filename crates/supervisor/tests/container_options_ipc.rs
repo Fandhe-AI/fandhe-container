@@ -13,7 +13,7 @@
 //! # 実機前提テストとしての分離
 //! root もしくは非特権 user namespace を許可するホストが必要（AppArmor の
 //! `kernel.apparmor_restrict_unprivileged_userns=1` 等では `PermissionDenied` になる）。`-- --ignored`
-//! 指定時のみ実行し、CI では `integration-test`（ubuntu-latest）が実行する（AGENTS.md）。
+//! 指定時のみ実行し、CI では `platform-ci`（ubuntu-latest）が実行する（AGENTS.md）。
 //! 実行された場合は分離の拒否を含むあらゆる失敗を失敗として扱い、検証せず成功する分岐は持たない。
 
 #[cfg(not(target_os = "linux"))]

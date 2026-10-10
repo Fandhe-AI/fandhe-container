@@ -256,8 +256,9 @@ pub fn create_default_devices(
 
 /// この呼び出しが rootfs・mount namespace に加えた変更の記録（失敗時の [`roll_back_dev`] が使う）。
 struct DevState {
-    /// この呼び出しの `mkdirat` が成功して `dev` を作ったか（既存・競合で先に作られた `dev` は偽）。
-    created_dev: bool,
+    /// この呼び出しの `mkdirat` が成功して作った `dev` を指す fd（既存・競合で先に作られた `dev` は `None`）。
+    /// 後始末で名前 `dev` が今も同じ inode を指すか（dev・ino）を確かめる識別情報として使う（差し替え対策）。
+    created_dev: Option<OwnedFd>,
     /// 載せた「自分のマウントのルート」を指す fd（付け替え直後に保持し、事後検証に通らなくても外せる）。
     mounted: Option<OwnedFd>,
 }
@@ -271,7 +272,7 @@ fn create_default_devices_at(
 ) -> Result<DeviceReport, ExecError> {
     let rootfs = root_display(root);
     let mut state = DevState {
-        created_dev: false,
+        created_dev: None,
         mounted: None,
     };
     let result = populate_dev(root, &rootfs, is_shared, &mut state);
@@ -288,7 +289,14 @@ fn populate_dev(
     is_shared: &dyn Fn(&OwnedFd) -> Result<bool, ExecError>,
     state: &mut DevState,
 ) -> Result<DeviceReport, ExecError> {
-    let dev = open_dev_dir(root, rootfs, &mut state.created_dev)?;
+    let mut created = false;
+    let dev = open_dev_dir(root, rootfs, &mut created)?;
+    if created {
+        state.created_dev = Some(
+            dev.try_clone()
+                .map_err(|e| ExecError::from_io(&e, STAGE, "dup(dev)"))?,
+        );
+    }
     let subject = rootfs.join("dev");
     if is_shared(&dev)? {
         return Err(ExecError::from_violation_at(
@@ -378,9 +386,25 @@ fn roll_back_dev(root: BorrowedFd<'_>, state: &DevState) {
     {
         let _ = umount_dev_syscall(&target);
     }
-    if state.created_dev {
+    // 名前 `dev` が作成時と同じ inode を指すと確認できたときだけ消す。差し替え・移動・確認不能は残す
+    // （fail-closed。別プロセスが置いた別ディレクトリを消さない）。
+    if let Some(created) = &state.created_dev
+        && name_dev_is_same_inode(root, created)
+    {
         let _ = sys::remove_dir_at(root, c"dev");
     }
+}
+
+/// `root` 直下の名前 `dev` が `created` と同じ inode（st_dev・st_ino）を指すか。開けない・取得できない場合は偽。
+fn name_dev_is_same_inode(root: BorrowedFd<'_>, created: &OwnedFd) -> bool {
+    let Ok(now) = sys::open_dir_path_nofollow(Some(root), c"dev") else {
+        return false;
+    };
+    let identity = |fd: &OwnedFd| {
+        let meta = std::fs::File::from(fd.try_clone().ok()?).metadata().ok()?;
+        Some((meta.dev(), meta.ino()))
+    };
+    matches!((identity(created), identity(&now)), (Some(a), Some(b)) if a == b)
 }
 
 /// マウントのルート fd の magic link を起点に symlink 1 本を作る。`symlink(2)` は最終要素を辿らないため、
@@ -1165,6 +1189,39 @@ mod tests {
         assert_eq!(count(&events, |e| matches!(e, Event::Umount(_))), 1);
         assert!(!t.0.join("dev").exists());
         take_calls();
+    }
+
+    /// CORE-1・#1653: 作成後に `dev` が別ディレクトリへ差し替えられたら、後始末は差し替え後を消さず残す。
+    #[test]
+    fn core1_1653_rollback_keeps_swapped_dev() {
+        let t = Tmp::new("swapped");
+        std::fs::create_dir(t.0.join("dev")).unwrap();
+        let root = open_root(&t.0);
+        let created = sys::open_dir_path_nofollow(Some(root.as_fd()), c"dev").unwrap();
+        let state = DevState {
+            created_dev: Some(created),
+            mounted: None,
+        };
+        std::fs::rename(t.0.join("dev"), t.0.join("dev-moved")).unwrap();
+        std::fs::create_dir(t.0.join("dev")).unwrap();
+        roll_back_dev(root.as_fd(), &state);
+        assert!(t.0.join("dev").is_dir());
+        assert!(t.0.join("dev-moved").is_dir());
+    }
+
+    /// CORE-1・#1653: `dev` が作成時と同じ inode のままなら後始末で消す。
+    #[test]
+    fn core1_1653_rollback_removes_same_dev() {
+        let t = Tmp::new("same");
+        std::fs::create_dir(t.0.join("dev")).unwrap();
+        let root = open_root(&t.0);
+        let created = sys::open_dir_path_nofollow(Some(root.as_fd()), c"dev").unwrap();
+        let state = DevState {
+            created_dev: Some(created),
+            mounted: None,
+        };
+        roll_back_dev(root.as_fd(), &state);
+        assert!(!t.0.join("dev").exists());
     }
 
     /// CORE-1・#1653: 既存の `dev`（内容あり）は、失敗してもマウントを外すだけで消さない。

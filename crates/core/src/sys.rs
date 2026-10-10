@@ -39,7 +39,7 @@
 //! non-dumpable にし、子を親の生存に結び付けるために `prctl(2)`（`PR_SET_DUMPABLE` / `PR_GET_DUMPABLE` /
 //! `PR_SET_PDEATHSIG`）を呼ぶ。
 //! tmpfs のマウント（`crate::exec::mount_tmpfs`。SUP-12・TASK-169 追補・#1472）は、新マウント API（`fsopen(2)`・`fsconfig(2)`・
-//! `fsmount(2)`・`move_mount(2)`。Linux 5.2 以降）で検証済みの O_PATH fd の上へ直接載せる。未対応カーネルは拒否する（縮退しない）。
+//! `fsmount(2)`・`move_mount(2)`。Linux 5.2 以降）で検証済みの O_PATH fd の上へ直接載せる。未対応カーネルは拒否する（縮退しない）。rootless の基本デバイスは `open_tree(2)` + `move_mount(2)` でホストのノードを fd 起点で bind する（CORE-6・SEC-5・#1659・#1660）。
 //! exec 入口の前提（TASK-163 追補・#1456〜#1460）は、exec 直前の子でセッションを切り離す `setsid(2)`、補助グループを
 //! 空にする `getgroups(2)` / `setgroups(2)`、`/dev/null` とインタープリタを検証済みの `O_PATH` fd から開き直す
 //! `openat(2)`（`O_NOCTTY`）、状態を返す pipe だけを残して fd を閉じる `close_range(2)` を呼ぶ。
@@ -134,6 +134,8 @@ mod consts {
     pub const SYS_FSOPEN: i64 = 430;
     pub const SYS_FSCONFIG: i64 = 431;
     pub const SYS_FSMOUNT: i64 = 432;
+    // `open_tree`（428）。syscall_64.tbl / asm-generic/unistd.h の `__NR_open_tree`（#1659）。
+    pub const SYS_OPEN_TREE: i64 = 428;
     // include/uapi/linux/mount.h の `FSOPEN_CLOEXEC`・`FSMOUNT_CLOEXEC`・`fsconfig_command`・`MOUNT_ATTR_*`・`MOVE_MOUNT_*`（全アーキテクチャ共通）。
     pub const FSOPEN_CLOEXEC: u32 = 1;
     pub const FSMOUNT_CLOEXEC: u32 = 1;
@@ -146,6 +148,11 @@ mod consts {
     pub const MOUNT_ATTR_NOEXEC: u32 = 8;
     pub const MOVE_MOUNT_F_EMPTY_PATH: u32 = 4;
     pub const MOVE_MOUNT_T_EMPTY_PATH: u32 = 64;
+    // include/uapi/linux/mount.h の `OPEN_TREE_CLONE`（1 << 0）・`OPEN_TREE_CLOEXEC`（`O_CLOEXEC` と同値で、`FSOPEN_CLOEXEC` の 1 とは別）と、
+    // include/uapi/linux/fcntl.h の `AT_EMPTY_PATH`（`open_tree` 用に u32 で持つ）。rootless のデバイスノード bind 用（#1659・CORE-6・SEC-5）。
+    pub const OPEN_TREE_CLONE: u32 = 1;
+    pub const OPEN_TREE_CLOEXEC: u32 = 0o2_000_000;
+    pub const OPEN_TREE_AT_EMPTY_PATH: u32 = 0x1000;
     // arch/x86/entry/syscalls/syscall_64.tbl の `pidfd_send_signal`（424）・`pidfd_open`（434）。
     pub const SYS_PIDFD_SEND_SIGNAL: i64 = 424;
     pub const SYS_PIDFD_OPEN: i64 = 434;
@@ -353,6 +360,8 @@ mod consts {
     pub const SYS_FSOPEN: i64 = 430;
     pub const SYS_FSCONFIG: i64 = 431;
     pub const SYS_FSMOUNT: i64 = 432;
+    // `open_tree`（428）。syscall_64.tbl / asm-generic/unistd.h の `__NR_open_tree`（#1659）。
+    pub const SYS_OPEN_TREE: i64 = 428;
     // include/uapi/linux/mount.h の `FSOPEN_CLOEXEC`・`FSMOUNT_CLOEXEC`・`fsconfig_command`・`MOUNT_ATTR_*`・`MOVE_MOUNT_*`（全アーキテクチャ共通）。
     pub const FSOPEN_CLOEXEC: u32 = 1;
     pub const FSMOUNT_CLOEXEC: u32 = 1;
@@ -365,6 +374,11 @@ mod consts {
     pub const MOUNT_ATTR_NOEXEC: u32 = 8;
     pub const MOVE_MOUNT_F_EMPTY_PATH: u32 = 4;
     pub const MOVE_MOUNT_T_EMPTY_PATH: u32 = 64;
+    // include/uapi/linux/mount.h の `OPEN_TREE_CLONE`（1 << 0）・`OPEN_TREE_CLOEXEC`（`O_CLOEXEC` と同値で、`FSOPEN_CLOEXEC` の 1 とは別）と、
+    // include/uapi/linux/fcntl.h の `AT_EMPTY_PATH`（`open_tree` 用に u32 で持つ）。rootless のデバイスノード bind 用（#1659・CORE-6・SEC-5）。
+    pub const OPEN_TREE_CLONE: u32 = 1;
+    pub const OPEN_TREE_CLOEXEC: u32 = 0o2_000_000;
+    pub const OPEN_TREE_AT_EMPTY_PATH: u32 = 0x1000;
     // include/uapi/asm-generic/unistd.h の `__NR_pidfd_send_signal`・`__NR_pidfd_open`（arm64 は
     // asm-generic の表。x86_64 と値が同じでも流用せず個別に定義する）。
     pub const SYS_PIDFD_SEND_SIGNAL: i64 = 424;
@@ -571,6 +585,7 @@ mod consts {
     pub const SYS_FSOPEN: i64 = 0;
     pub const SYS_FSCONFIG: i64 = 0;
     pub const SYS_FSMOUNT: i64 = 0;
+    pub const SYS_OPEN_TREE: i64 = 0;
     // include/uapi/linux/mount.h の `FSOPEN_CLOEXEC`・`FSMOUNT_CLOEXEC`・`fsconfig_command`・`MOUNT_ATTR_*`・`MOVE_MOUNT_*`（全アーキテクチャ共通）。
     pub const FSOPEN_CLOEXEC: u32 = 0;
     pub const FSMOUNT_CLOEXEC: u32 = 0;
@@ -583,6 +598,10 @@ mod consts {
     pub const MOUNT_ATTR_NOEXEC: u32 = 0;
     pub const MOVE_MOUNT_F_EMPTY_PATH: u32 = 0;
     pub const MOVE_MOUNT_T_EMPTY_PATH: u32 = 0;
+    // 対応外アーキテクチャ（各ラッパーが SUPPORTED で弾く）の `open_tree` 用定数。
+    pub const OPEN_TREE_CLONE: u32 = 0;
+    pub const OPEN_TREE_CLOEXEC: u32 = 0;
+    pub const OPEN_TREE_AT_EMPTY_PATH: u32 = 0;
     pub const SYS_PIDFD_SEND_SIGNAL: i64 = 0;
     pub const SYS_PIDFD_OPEN: i64 = 0;
     pub const CLOSE_RANGE_CLOEXEC: i64 = 0;
@@ -1226,7 +1245,7 @@ fn fsconfig_result(rc: i64) -> Result<(), SysError> {
     }
 }
 
-/// fd を返す新マウント API の戻り値（`fsopen` / `fsmount`）を検証して `OwnedFd` にする。
+/// fd を返す新マウント API の戻り値（`fsopen` / `fsmount` / `open_tree`）を検証して `OwnedFd` にする。
 #[cfg_attr(test, allow(dead_code))]
 fn new_mount_api_fd(rc: i64) -> Result<OwnedFd, SysError> {
     if rc == -1 {
@@ -1237,7 +1256,7 @@ fn new_mount_api_fd(rc: i64) -> Result<OwnedFd, SysError> {
         return Err(SysError::Os(EINVAL));
     }
     // SAFETY: `fd` は直前に成功した新マウント API の syscall が返した、他に所有者のいない有効な fd
-    // （`fsopen` / `fsmount` の戻り値）。`OwnedFd` が唯一の所有者になる（二重 close なし）。
+    // （`fsopen` / `fsmount` / `open_tree` の戻り値）。`OwnedFd` が唯一の所有者になる（二重 close なし）。
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -1330,23 +1349,94 @@ pub(crate) fn mount_tmpfs_on(
             i64::from(create.flags.attr_bits()),
         )
     })?;
-    // SAFETY: `mnt_fd`・`target_dir` は生存中の fd（`OwnedFd` と `BorrowedFd`）。パスは静的な空文字列で、
-    // `*_EMPTY_PATH` により fd 自身が対象になる（パス解決なし）。副作用は呼び出しスレッドの mount namespace への
-    // マウント 1 件の追加に限る。
+    move_mount_empty_path(std::os::fd::AsFd::as_fd(&mnt_fd), target_dir)?;
+    Ok(mnt_fd)
+}
+
+/// `move_mount(2)` に渡すフラグ（`MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH`）。
+///
+/// `mount_tmpfs_on` とデバイスノード bind が同じフラグを使うことを、単体テストで具体値（0x44）として
+/// 固定するために `unsafe` から切り出している。
+#[cfg_attr(test, allow(dead_code))]
+fn move_mount_empty_path_flags() -> u32 {
+    consts::MOVE_MOUNT_F_EMPTY_PATH | consts::MOVE_MOUNT_T_EMPTY_PATH
+}
+
+/// 切り離したマウント `from` を、`to`（検証済みの O_PATH fd）の上へ `move_mount(2)` で載せる。
+///
+/// 両端とも fd を指し、パス文字列は渡さない（`*_EMPTY_PATH`）ため、パスの再解決・symlink 追従が起きない。
+/// `mount_tmpfs_on`（tmpfs の載せ替え）と、rootless のデバイスノード bind（#1660 が呼ぶ。CORE-6・SEC-5）が
+/// 共有する。`ENOSYS`（Linux 5.2 未満）は [`SysError::Unsupported`] で返し、`mount(2)` へは縮退しない。
+/// ファイルの bind では `to` もファイルである必要がある（ディレクトリ同士かファイル同士のみ成功する）。
+// テストビルドでは `crate::exec` の dry-run 差し込み点が呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn move_mount_empty_path(
+    from: BorrowedFd<'_>,
+    to: BorrowedFd<'_>,
+) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `from`・`to` は生存中の `BorrowedFd`。パスは静的な空文字列で、`*_EMPTY_PATH` により fd 自身が
+    // 対象になる（パス解決なし）。副作用は呼び出しスレッドの mount namespace へのマウント 1 件の追加に限る。
     let rc = unsafe {
         syscall(
             consts::SYS_MOVE_MOUNT,
-            i64::from(mnt_fd.as_raw_fd()),
+            i64::from(from.as_raw_fd()),
             c"".as_ptr(),
-            i64::from(target_dir.as_raw_fd()),
+            i64::from(to.as_raw_fd()),
             c"".as_ptr(),
-            i64::from(consts::MOVE_MOUNT_F_EMPTY_PATH | consts::MOVE_MOUNT_T_EMPTY_PATH),
+            i64::from(move_mount_empty_path_flags()),
         )
     };
     if rc == -1 {
         return Err(new_mount_api_error());
     }
-    Ok(mnt_fd)
+    Ok(())
+}
+
+/// `open_tree(2)` に渡すフラグ（`OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_EMPTY_PATH`）。
+///
+/// `AT_RECURSIVE` は付けない（複製をノード 1 個に限り、ホスト側の子マウントを持ち込まない）。
+#[cfg_attr(test, allow(dead_code))]
+fn open_tree_clone_flags() -> u32 {
+    consts::OPEN_TREE_CLONE | consts::OPEN_TREE_CLOEXEC | consts::OPEN_TREE_AT_EMPTY_PATH
+}
+
+/// `node`（呼び出し側が検証したホストのデバイスノードの O_PATH fd）を、切り離したマウントとして複製する。
+///
+/// rootless（user namespace）では `mknod` できないため、ホストのノードを fd 起点で `open_tree` +
+/// `move_mount_empty_path` により bind する（方式 (a)。`docs/design/dev-default-mounts.md` §3.6・
+/// 判断 4。CORE-6・SEC-5・#1659。呼び出し元は #1660）。戻り値は未接続のマウントを指す close-on-exec の fd で、
+/// 途中で失敗して drop すればカーネルが破棄する。
+///
+/// 前提（呼び出し側の責務。本関数は検証しない）: `node` は `O_PATH|O_NOFOLLOW` で開き `S_IFCHR`・`rdev` を
+/// 検証済みであること。
+///
+/// マウントフラグは緩めも追加もしない。複製はホスト側マウントのフラグ（locked flag 含む）を継承する。
+/// `nosuid`・`noexec` を付与しない理由は、マウントのルートが文字デバイス 1 個で他のファイルへ届かず、exec と
+/// setuid が通常ファイルにしか効かないため守る対象が無いこと（runc の `bindMountDeviceNode` も `MS_BIND` のみ）。
+/// `nodev` はノードが使えなくなるため付けてはならない。よって `mount_setattr` は本 Issue では足さない。
+///
+/// 必要なカーネルは Linux 5.2 以降。`ENOSYS` は [`SysError::Unsupported`] で返し、`mount(2)` へは縮退しない。
+/// user namespace では自分の mount namespace を所有する userns の `CAP_SYS_ADMIN` が要る。
+// #1660 で呼び出し元を足すまでの間のみ許可する（配線時に外す）。
+#[allow(dead_code)]
+pub(crate) fn open_tree_clone(node: BorrowedFd<'_>) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `node` は生存中の `BorrowedFd`。パスは静的な空文字列（NUL 終端）で、`AT_EMPTY_PATH` により fd 自身が
+    // 対象になる（パス解決なし）。`AT_RECURSIVE` は付けない。成功時の戻り値は新規 fd で、直後に
+    // `new_mount_api_fd` が唯一の所有者にする。副作用は未接続の複製マウントの作成に限る（fd を閉じれば破棄される）。
+    new_mount_api_fd(unsafe {
+        syscall(
+            consts::SYS_OPEN_TREE,
+            i64::from(node.as_raw_fd()),
+            c"".as_ptr(),
+            i64::from(open_tree_clone_flags()),
+        )
+    })
 }
 /// `target`（マウントのルート）の tmpfs を、読み取り専用へ再マウントする（`MS_REMOUNT`）。
 ///
@@ -3550,6 +3640,28 @@ mod tests {
 
     /// SUP-12（TASK-169 追補・#1472）: 新マウント API の syscall 番号・フラグの具体値。番号は x86_64 と
     /// aarch64（asm-generic）で個別に定義し、どちらも 429〜432。
+    #[test]
+    fn core6_sec5_open_tree_consts_and_flags_are_exact() {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        {
+            assert_eq!(consts::SYS_OPEN_TREE, 428);
+            assert_eq!(
+                (
+                    consts::OPEN_TREE_CLONE,
+                    consts::OPEN_TREE_CLOEXEC,
+                    consts::OPEN_TREE_AT_EMPTY_PATH
+                ),
+                (1, 0o2_000_000, 0x1000)
+            );
+            assert_eq!(consts::OPEN_TREE_CLOEXEC, 0x8_0000);
+            assert_eq!(open_tree_clone_flags(), 0x8_1001);
+            // AT_RECURSIVE（0x8000）と OPEN_TREE_NAMESPACE（2）は付けない。
+            assert_eq!(open_tree_clone_flags() & 0x8000, 0);
+            assert_eq!(open_tree_clone_flags() & 0x2, 0);
+            assert_eq!(move_mount_empty_path_flags(), 0x44);
+        }
+    }
+
     #[test]
     fn sup12_task169_new_mount_api_consts_are_exact() {
         #[cfg(target_arch = "x86_64")]

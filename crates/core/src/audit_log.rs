@@ -51,7 +51,7 @@ mod file_writer;
 mod kernel_audit;
 mod landlock;
 
-pub use file_sink::{AUDIT_LOG_FILE_NAME, FileAuditSink};
+pub use file_sink::{AUDIT_LOG_FILE_NAME, FileAuditSink, RECORD_WAIT_LIMIT};
 pub use file_writer::{
     AUDIT_LINE_MAX_BYTES, AuditFallback, AuditFileWriter, AuditWriteError, AuditWriteErrorKind,
     AuditWriteFailure, AuditWriteOutcome, NoAuditFallback, encode_json_line, write_with_fallback,

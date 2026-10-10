@@ -42,6 +42,9 @@ use super::{PluginCandidate, PluginDirKind};
 use crate::traits::{ErrorCode, TraitError};
 
 /// 登録済み候補と shadowed 候補の合計件数の上限。超過は fail-closed で拒否する（無制限確保の防止）。
+///
+/// 発見の候補総数の上限 [`MAX_TOTAL_CANDIDATES`](super::MAX_TOTAL_CANDIDATES) 以上でなければならない
+/// （`plugin_discovery` の const アサートで固定。PLUG-11・REPAIR-12）。
 pub const MAX_REGISTRY_ENTRIES: usize = 4096;
 
 /// [`PluginRegistry::register`] の結果区分。
@@ -277,7 +280,7 @@ impl PluginRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin_discovery::PluginFileKind;
+    use crate::plugin_discovery::{MAX_TOTAL_CANDIDATES, PluginFileKind};
 
     fn cand(name: &str, origin: PluginDirKind, dir: &str) -> PluginCandidate {
         PluginCandidate {
@@ -409,6 +412,16 @@ mod tests {
         assert_eq!(r.len(), 0);
         assert_eq!(r.iter().count(), 0);
         assert!(r.shadowed().is_empty());
+    }
+
+    /// 発見が返し得る最大件数（`MAX_TOTAL_CANDIDATES`）を `from_candidates` が受理できる（PLUG-11・REPAIR-12）。
+    #[test]
+    fn plug11_registry_accepts_max_total_candidates() {
+        let cands: Vec<PluginCandidate> = (0..MAX_TOTAL_CANDIDATES)
+            .map(|i| cand(&format!("p{i}"), PluginDirKind::System, "/s"))
+            .collect();
+        let r = PluginRegistry::from_candidates(cands).expect("max total candidates fit");
+        assert_eq!(r.len(), MAX_TOTAL_CANDIDATES);
     }
 
     #[test]

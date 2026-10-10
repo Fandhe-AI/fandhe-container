@@ -45,6 +45,22 @@ pub fn send(f: &UnixStream, req: &Request, fds: &[std::os::fd::BorrowedFd<'_>]) 
     assert_eq!(sent.len, msg.as_bytes().len());
 }
 
+/// NEED_REPLY を立てて送る（REPLY_ACK の試験用。#1639）。
+#[allow(dead_code)]
+pub fn send_need_reply(f: &UnixStream, req: &Request, fds: &[std::os::fd::BorrowedFd<'_>]) {
+    let msg = req.encode(true).expect("encode");
+    let sent = send_with_fds(f, msg.as_bytes(), fds, T).expect("send");
+    assert_eq!(sent.len, msg.as_bytes().len());
+}
+
+/// ちょうど `n` バイトを受ける（ack の生バイト照合用。#1639）。
+#[allow(dead_code)]
+pub fn recv_raw(f: &UnixStream, n: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; n];
+    read_exact(f, &mut buf);
+    buf
+}
+
 pub fn read_exact(f: &UnixStream, buf: &mut [u8]) {
     let mut done = 0;
     while done < buf.len() {
@@ -80,8 +96,9 @@ pub fn negotiate(f: &UnixStream) {
     send(f, &Request::GetProtocolFeatures, &[]);
     assert_eq!(
         recv_reply(f, RequestCode::GetProtocolFeatures),
-        Reply::ProtocolFeatures(0x201)
+        Reply::ProtocolFeatures(0x209)
     );
+    // 確定は REPLY_ACK を含まない 0x201 のままにする（NEED_REPLY を立てない既定の流れと、未確定セッションの挙動を保つ）。
     send(f, &Request::SetProtocolFeatures(0x201), &[]);
     send(f, &Request::GetQueueNum, &[]);
     assert_eq!(recv_reply(f, RequestCode::GetQueueNum), Reply::QueueNum(2));

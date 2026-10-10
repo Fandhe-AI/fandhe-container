@@ -188,7 +188,13 @@ pub fn session_error_line(code: &str, request: Option<u32>) -> String {
     )
 }
 
-/// `NEED_REPLY` が付いた `SET_*` に応答しなかった（REPLY_ACK を広告していない）ことを示すログ行。
+/// REPLY_ACK 確定後に、NEED_REPLY が付いた要求へ ack を返したことを示すログ行（#1639）。固定語彙と要求 ID だけを出す。
+pub fn need_reply_ack_line(request: u32, ok: bool) -> String {
+    let result = if ok { "ok" } else { "err" };
+    format!("venus_jig event=need_reply_ack request={request} result={result}")
+}
+
+/// `NEED_REPLY` が付いた `SET_*` に応答しなかった（REPLY_ACK が確定していないセッション）ことを示すログ行。
 pub fn need_reply_ignored_line(request: u32) -> String {
     format!("venus_jig event=need_reply_ignored request={request}")
 }

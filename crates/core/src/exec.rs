@@ -19,9 +19,8 @@
 //! 3. rootfs の `dev` への専用 tmpfs のマウント（#1653）と、その上への基本デバイスノード 6 種・
 //!    default symlink 4 本・`/dev/pts` の独立した devpts・`/dev/ptmx`（`pts/ptmx` への symlink）の作成
 //!    （#834・TASK-27.6・#1656。**実装済み**。[`create_default_devices`] を
-//!    [`prepare_rootfs`] の後・[`pivot_root`] の前に呼ぶ。rootless では tmpfs までは載るが `mknod` が
-//!    `EPERM` になり `PermissionDenied` で fail-closed し、載せた tmpfs は外す。ホスト `/dev` の bind mount
-//!    による代替は未実装〔#1660〕）
+//!    [`prepare_rootfs`] の後・[`pivot_root`] の前に呼ぶ。rootful は `mknod`、rootless はホストの
+//!    `/dev/<名前>` の bind で基本デバイスを供給する〔#1660〕）
 //! 4. 順序固定のステージ列: cgroup 参加 → capability 削減 → `PR_SET_NO_NEW_PRIVS`
 //!    → Landlock → seccomp（#136・#832・#833。**枠・`NO_NEW_PRIVS`・capability 削減・seccomp は実装済み**: [`StagePipeline`] が
 //!    [`StageKind::ORDER`] の固定順でフックを呼び、`NO_NEW_PRIVS` は差し替え不可の組み込み段として
@@ -84,8 +83,8 @@
 //!   （TASK-40.2・CORE-6。**実装済み**）が担う。呼び出したプロセス自身を分離する契約は [`isolate`]
 //!   と同じで、写像だけを fork した mapper（外側の user namespace に残る）が
 //!   [`crate::rootless`] で書く。rootless 経路で root 権限を要する操作をどう回避・代替するかの対応表は
-//!   [`crate::rootless`] のモジュール doc を参照。`mknod` によるデバイスノード作成は代替せず
-//!   `PermissionDenied` で fail-closed する
+//!   [`crate::rootless`] のモジュール doc を参照。`mknod` によるデバイスノード作成は代替せず、
+//!   [`create_default_devices`] がホストの `/dev/<名前>` を fd 起点で bind して供給する（#1660）
 
 use std::ffi::{CString, OsStr};
 use std::fmt;

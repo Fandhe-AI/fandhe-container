@@ -16,9 +16,9 @@
 //!
 //! # 実機前提テストとしての分離
 //! root・Linux 6.12+（Landlock ABI 6+）が必要で、GitHub ホステッド runner では保証できないため
-//! `-- --ignored` 指定時のみ実行する（ci.md「実機前提テスト」・AGENTS.md）。非 root は rootless では
-//! `create_default_devices` が `mknod(2)` の `EPERM` で止まり照合まで進めない（#1660 の後に対応）ため、
-//! 検証せずに成功せず失敗として扱う。root 権限コマンドのため実行は明示指示のもとで行い、結果を PR に記録する。
+//! `-- --ignored` 指定時のみ実行する（ci.md「実機前提テスト」・AGENTS.md）。非 root は本試験が rootful 専用
+//! （`mknod` の拒否の照合が前提）のため、検証せずに成功せず失敗として扱う（rootless の基本デバイスは #1660 で
+//! bind 供給になったが、本試験を rootless で通す形への追従は別 Issue）。root 権限コマンドのため実行は明示指示のもとで行い、結果を PR に記録する。
 //! pty の ioctl（`IOCTL_DEV`）の実機照合は安全なラッパーが無く本試験の範囲外で、ルールのビット照合は
 //! `landlock::rules` の単体テストが担う。
 //!
@@ -126,7 +126,7 @@ mod linux {
     fn parent() {
         assert!(
             is_root(),
-            "landlock_implicit_dev is rootful only: run as root (rootless stops at mknod, see #1660)"
+            "landlock_implicit_dev is rootful only: run as root (rootless is not covered: the mknod denial checks need CAP_MKNOD, see #1660)"
         );
         let rootfs = make_rootfs();
         let config = IsolationConfig {

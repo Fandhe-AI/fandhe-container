@@ -159,6 +159,10 @@ pub enum ViolationReason {
     TargetOnSharedMount,
     /// fd で固定した後にマウント先が改名・移動・削除された。
     TargetMoved,
+    /// rootless の基本デバイスノードの bind 元（ホストの `/dev/<名前>`）が、期待する文字デバイスではない
+    /// （symlink・通常ファイル・ディレクトリ、または `rdev` が固定表と違う）。bind せずに拒否する
+    /// （TASK-29 追補・#1660。CORE-6・SEC-5）。
+    HostDeviceNodeUnexpected,
     /// rootfs が `/`（ホスト root）そのもの。ホスト root への pivot は無意味かつ危険なため拒否する。
     RootfsIsHostRoot,
     /// rootfs が shared propagation 上にある（pivot_root は EINVAL になり、bind もホストへ伝播し得る）。
@@ -379,6 +383,7 @@ impl ViolationReason {
             Self::PathMissing => "path_missing",
             Self::TargetOnSharedMount => "target_on_shared_mount",
             Self::TargetMoved => "target_moved",
+            Self::HostDeviceNodeUnexpected => "host_device_node_unexpected",
             Self::RootfsIsHostRoot => "rootfs_is_host_root",
             Self::RootfsOnSharedMount => "rootfs_on_shared_mount",
             Self::RootfsMoved => "rootfs_moved",
@@ -436,7 +441,8 @@ impl ViolationReason {
             | Self::TargetIsRootfs
             | Self::PathSymlinkOrNotDirectory
             | Self::PathMissing
-            | Self::TargetMoved => ViolationKind::MountTarget,
+            | Self::TargetMoved
+            | Self::HostDeviceNodeUnexpected => ViolationKind::MountTarget,
             Self::TargetOnSharedMount | Self::RootfsOnSharedMount => {
                 ViolationKind::SharedPropagation
             }
@@ -468,9 +474,10 @@ impl ViolationReason {
     /// 違反した前提のビヘイビア ID（SSOT: spec `04-behavior/`）。
     pub fn behavior_id(self) -> &'static str {
         match self {
-            Self::UserNamespaceRequired | Self::HostRootIdentityMapping | Self::IdentityChanged => {
-                "SEC-5"
-            }
+            Self::UserNamespaceRequired
+            | Self::HostRootIdentityMapping
+            | Self::IdentityChanged
+            | Self::HostDeviceNodeUnexpected => "SEC-5",
             Self::ExecTargetCgroupMismatch
             | Self::StdioNullNotNullDevice
             | Self::EntrypointInterpreterIsRuntimeBinary
@@ -525,6 +532,7 @@ impl ViolationReason {
             | Self::EvidencePidNamespaceMismatch
             | Self::TargetOnSharedMount
             | Self::TargetMoved
+            | Self::HostDeviceNodeUnexpected
             | Self::RootfsOnSharedMount
             | Self::RootfsMoved
             | Self::RootfsHasSubmounts
@@ -627,6 +635,9 @@ impl ViolationReason {
                 "mount target is on a shared mount; isolate the mount namespace first"
             }
             Self::TargetMoved => "mount target was moved or removed after validation",
+            Self::HostDeviceNodeUnexpected => {
+                "host device node is not the expected character device; refusing to bind it"
+            }
             Self::RootfsIsHostRoot => "rootfs must not be the host root '/'",
             Self::RootfsOnSharedMount => {
                 "rootfs is on a shared mount; isolate the mount namespace first"
@@ -1129,6 +1140,29 @@ mod tests {
             v.mount_audit_event(),
             Some(AuditEvent::Mount { path: None })
         );
+    }
+
+    /// CORE-6・SEC-5・SEC-4（TASK-29 追補・#1660）: ホストのデバイスノードの不一致の理由コード・種別・ビヘイビア ID・
+    /// `ErrorCode`・メッセージの具体値と、層 Mount へのパス付きの写像。
+    #[test]
+    fn core6_sec5_1660_host_device_node_unexpected_metadata_is_exact() {
+        let r = ViolationReason::HostDeviceNodeUnexpected;
+        assert_eq!(r.as_str(), "host_device_node_unexpected");
+        assert_eq!(r.kind().as_str(), "mount_target");
+        assert_eq!(r.behavior_id(), "SEC-5");
+        assert_eq!(r.error_code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            r.message(),
+            "host device node is not the expected character device; refusing to bind it"
+        );
+        let v = IsolationViolation::new(r, Some(Path::new("/dev/null")));
+        assert_eq!(
+            v.mount_audit_event(),
+            Some(AuditEvent::Mount {
+                path: Some(AuditPath::new(Path::new("/dev/null")))
+            })
+        );
+        assert_eq!(v.exec_audit_event(), None);
     }
 
     /// SEC-4・SUP-6・TASK-163 追補: exec 対象の 10 理由は許可リスト往復でき、対象外・未知は引けない。

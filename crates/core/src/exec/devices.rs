@@ -1,5 +1,5 @@
 //! コンテナ起動時の `/dev` 用 tmpfs のマウントと、基本デバイスノード 6 種・default symlink 4 本・`/dev/pts` の devpts・`/dev/ptmx` の作成
-//! （CORE-1・SEC-1・TASK-27.6・TASK-29 追補・#834・#1297・#1653・#1656・MS-2）。
+//! （CORE-1・CORE-6・SEC-1・SEC-5・TASK-27.6・TASK-29 追補・#834・#1297・#1653・#1656・#1660・MS-2）。
 //!
 //! # 役割と呼び出し文脈
 //!
@@ -69,14 +69,36 @@
 //!   の magic link 起点で `symlink(2)` する（最終要素は辿らない）。`EEXIST` は `readlink(2)` の結果が
 //!   期待する参照先と 1 バイトも違わず一致するときだけ [`DeviceLinkStatus::AlreadyPresent`] とし、別の
 //!   参照先・通常ファイル・ディレクトリは上書きせず `FailedPrecondition`（段 `CreateDevices`）で拒否する
-//! - **rootless は fail-closed**: 非特権 user namespace では tmpfs までは載るが、文字デバイスの `mknod(2)` が
-//!   `EPERM` になり `PermissionDenied`（段 `CreateDevices`）で拒否する。黙ってデバイス無しで起動させない。
-//!   この場合も載せた tmpfs は外す
+//! - **供給方式は申告で決める（#1660）**: [`DevptsGidSource`] が `Rootful` なら `mknodat(2)`、`Rootless` なら
+//!   ホストのノードの bind で基本デバイスを供給する。`mknod` の `EPERM` を見て経路を切り替えない。rootful の
+//!   `EPERM` は `PermissionDenied`（段 `CreateDevices`）のまま拒否し、rootless の bind へ縮退しない
+//! - **rootless は bind で供給する（#1660。オーナー判断 2026-10-10 の判断 4・方式 (a)。CORE-6・SEC-5）**:
+//!   非特権 user namespace では `mknod(2)` が `EPERM` になる。そこで 6 種それぞれについて、(1) `pivot_root` の前に
+//!   開いたホストの `/dev` の fd 起点で `<名前>` を `O_PATH|O_NOFOLLOW` で開き、(2) その fd の `fstat` で文字
+//!   デバイスと `rdev`（固定表の major/minor）を確かめ（不一致は `host_device_node_unexpected` の違反記録付きで
+//!   bind せず拒否する。種別 `mount_target`・層 Mount にホスト側の `/dev/<名前>` を記録）、(3) tmpfs のルート fd
+//!   起点でモード 0 の空ファイルを `O_CREAT|O_EXCL|O_NOFOLLOW` で作って（`EEXIST` は受け入れず拒否し、既存の
+//!   エントリは消さない）`O_PATH` で固定し、作成時の fd との同一 inode を照合し、(4) 検証した fd を
+//!   `open_tree(2)` で複製して `move_mount(2)` で空ファイルの上へ載せ、(5) 載せた後に名前を `O_PATH|O_NOFOLLOW` で
+//!   開き直して文字デバイス・`rdev`・自分のマウントであることを再確認する（不一致は違反なしの
+//!   `FailedPrecondition`。rootful の作成直後の検証と同じ扱い）。結果は [`DeviceNodeStatus::BoundFromHost`]。
+//!   bind 元は固定表の名前だけで、任意のパス・major/minor を受け付ける経路は作らない（CDI の deviceNodes は
+//!   TASK-127）。`AT_RECURSIVE` は付けずホスト側の子マウントを持ち込まない。`nosuid`・`noexec`・`nodev` は付与しない
+//!   （ルートが文字デバイス 1 個で守る対象が無く、`nodev` はノードを使えなくする。`sys::open_tree_clone` の doc）。
+//!   ホストの `/dev` は `unshare(CLONE_NEWNS)` の後・`pivot_root` の前に開く（`open_tree` の `check_mnt` が、
+//!   fd のマウントが呼び出しスレッドの mount namespace に属することを要求するため）。`open_tree`・`move_mount` は
+//!   seccomp の適用前に呼ぶ（既定の拒否集合に含まれるため）。user namespace が載せた tmpfs 上の `mknod` は仮に
+//!   できても `nodev` 相当で開けないと考えられる一方、bind はホストの devtmpfs の superblock を保つため開ける
+//!   はずだが、カーネルのソース（`may_open_dev`・`alloc_super`）での確認は本実装では行っておらず、実機での
+//!   `/dev/null` への書き込みと `/dev/zero` の読み出しの結合試験（`default_devices`）が裏付ける（未確認）
+//! - **新マウント API が無いカーネルは fail-closed（#1660）**: `open_tree`・`move_mount` の `ENOSYS` は `mount(2)` の
+//!   `MS_BIND` へ縮退せず `Unimplemented`（段 `CreateDevices`。Linux 5.2 以降が必要）で拒否する
 //! - **失敗時の後始末**: どこかで失敗したら、この呼び出しが載せたマウントを fd 経由で `umount2(MNT_DETACH)` で
 //!   外し（名前から開き直した先は外さない）、この呼び出しが作った `ptmx`（参照先が一致するときだけ）・`pts`
 //!   （同じ inode のときだけ）・`dev` を消す（`unlinkat(AT_REMOVEDIR)` は空ディレクトリしか消えないため既存の
-//!   内容は壊さない）。順序は devpts → `ptmx` → `pts` → `/dev` の tmpfs → `dev`。tmpfs ごと外すのでノードは
-//!   残らない。後始末は最善努力で、失敗しても元のエラーを返す。呼び出し後もプロセスは
+//!   内容は壊さない）。順序は devpts → `ptmx` → `pts` → rootless の bind（作成の逆順に外し、外した後に名前が
+//!   作った空ファイルと同じ inode のときだけ空ファイルを消す。#1660）→ `/dev` の tmpfs → `dev`。tmpfs ごと外すので
+//!   ノードは残らない。後始末は最善努力で、失敗しても元のエラーを返す。呼び出し後もプロセスは
 //!   破棄する（`crate::exec` のモジュール doc の契約）
 //! - **`/dev/pts` は `/dev` のマウントのルート fd 起点**: `pts` を 0755 で作り、`O_PATH|O_NOFOLLOW|O_DIRECTORY` で
 //!   固定した fd にだけ devpts を載せる（`sys::mount_devpts_on`。`mode=620`・`ptmxmode=666`・`nosuid|noexec` は
@@ -84,7 +106,7 @@
 //!   置けるのはカーネルが作る pty ノードだけで、利用者が任意のデバイスを作る経路は無い）。`pts` が symlink・
 //!   非ディレクトリなら違反記録付きで何もマウントせず拒否する。マウント後は tmpfs と同じ 3 点（devpts であること・
 //!   別マウントであること・自分のマウントそのものであること）で事後検証する
-//! - **`gid=` の決定**: [`DevptsGidSource`] で呼び出し元が申告する。rootful は常に 5、rootless は検証済みの gid の
+//! - **`gid=` の決定**: [`DevptsGidSource`] で呼び出し元が申告する（基本デバイスの供給方式と同じ入力）。rootful は常に 5、rootless は検証済みの gid の
 //!   写像でコンテナ内 gid 5 が写像されているときだけ 5、いなければ `gid=` を渡さない（判断 3）。省いたときは
 //!   固定語彙の構造化ログを標準エラーへ 1 行出し、[`DevptsOutcome::gid`] も `None` になる。申告がずれても
 //!   緩む方向には働かない（rootless で `Rootful` を渡せばカーネルが `EINVAL` で拒否し、rootful で `Rootless` を
@@ -98,12 +120,9 @@
 //!
 //! # 未対応（REPAIR-3: 実装済みを装わない）
 //!
-//! - rootless 向けのホスト `/dev/*` の bind mount による供給（runc 相当。CORE-6・SEC-5。#1660）。
-//!   本実装の rootless 経路は `PermissionDenied` で止まる。user namespace が載せたマウント上のデバイスが
-//!   開けるか（`nodev` 相当の扱い）は本モジュールでは確かめておらず、#1660 で一次情報を確認する（未確認）
-//! - rootless での `/dev/pts` の実機照合。rootless は上の基本デバイス作成で止まり devpts の段へ進めないため、
-//!   gid 5 が写像されない rootless の devpts が `gid=` を含まないことの実機での確認は #1660 の後になる
-//!   （単体テストと `sys` の実マウント試験が補う）
+//! - rootless の bind を実機で通した記録。本モジュールの rootless 経路は dry-run の単体テストで呼び出し列・
+//!   拒否・後始末を照合しており、実マウントでの確認（非特権 user namespace・Linux 5.2 以降）は結合試験
+//!   `tests/default_devices.rs`（人間担当・`-- --ignored`）が担う
 //! - `/dev/console` は端末機能の親 issue で別途設計する（設計ドラフト 3.5）。`process.terminal: true` も
 //!   従来どおり拒否のまま
 //! - `spawn_container` の最小フローへの本関数の配線（#1314）
@@ -112,7 +131,10 @@
 //!
 //! `mknodat(2)`・tmpfs のマウント・解除・マウント観測は `cfg(test)` では dry-run に差し替わる
 //! （`mknod_syscall`・`mount_dev_tmpfs_syscall`・`mount_devpts_syscall`・`umount_dev_syscall`・
-//! `observe_dev_mount`・`observe_pts_mount`）。root で
+//! `observe_dev_mount`・`observe_pts_mount`）。rootless の bind も同様に、`open_tree`・`move_mount`・bind 後の
+//! 再確認（`open_tree_syscall`・`move_mount_syscall`・`observe_bound_node`）が dry-run になり、ホストの `/dev` は
+//! 一時ディレクトリへ差し替えられる（`open_host_dev_syscall`）。ホストのノードの検証（`sys::verify_device_node_fd`）と
+//! 空ファイルの作成・削除は実ファイルシステムで行う。root で
 //! `cargo test` を実行してもホストへ実ノードやマウントを作らない。symlink は特権不要で一時ディレクトリ内
 //! にしか作られないため dry-run にせず実ファイルシステムで照合する。実機での挙動は結合試験
 //! `tests/default_devices.rs`（`-- --ignored`）で確認する。
@@ -224,7 +246,11 @@ const PTMX_LINK: DefaultLink = DefaultLink {
 /// devpts の `gid=` に渡す tty グループ（runc の既定と同じ。設計ドラフト `dev-default-mounts.md` 3.3）。
 const DEVPTS_GID: u32 = sys::DevptsGid::TTY_GID;
 
-/// devpts の `gid=` を決めるための権限モデルの入力（オーナー判断 2026-10-10 の判断 3。CORE-6・SEC-5）。
+/// devpts の `gid=` と基本デバイスノードの供給方式を決めるための権限モデルの入力（オーナー判断 2026-10-10 の
+/// 判断 3・4。CORE-6・SEC-5）。
+///
+/// `Rootful` は基本デバイスを `mknodat(2)` で作り、`Rootless` はホストのノードを bind で供給する
+/// （`DeviceSupply`。#1660）。`mknod` の `EPERM` を見て経路を切り替える方式にはせず、この申告で明示的に決める。
 ///
 /// 呼び出し元（#1314 で配線する `oci_runtime` / fork 段）が、すでに検証済みの写像を渡す。子（PID 1）側で
 /// `/proc/self/gid_map` を独自に解析し直さない。申告が実態とずれた場合も緩む方向には働かない:
@@ -303,6 +329,10 @@ pub enum DeviceNodeStatus {
     Created,
     /// 既に存在し、文字デバイス・`rdev`・モードが期待どおりと検証済みのため何も変更していない。
     AlreadyPresent,
+    /// rootless 経路で、ホストの `/dev/<名前>` を `open_tree(2)` + `move_mount(2)` で bind して供給した
+    /// （#1660。CORE-6・SEC-5）。ホストのノードの所有者ではないためモードの補正はせず、
+    /// [`DeviceNodeOutcome::mode`] は固定表の期待値で強制していない。
+    BoundFromHost,
 }
 
 /// [`create_default_devices`] が処理した 1 ノードの結果。
@@ -412,6 +442,38 @@ struct DevState {
     mounted: Option<OwnedFd>,
     /// `/dev/pts` と `/dev/ptmx` の変更記録（`mounted` を借りたまま更新できるよう別の構造体に分ける）。
     pts: PtsState,
+    /// rootless 経路でこの呼び出しが加えたデバイスノードの bind の記録（作成順。後始末は逆順に外す。#1660）。
+    binds: Vec<BoundNode>,
+}
+
+/// rootless 経路の 1 ノードの bind でこの呼び出しが加えた変更の記録（失敗時の [`roll_back_dev`] が使う。#1660）。
+struct BoundNode {
+    device: &'static DefaultDevice,
+    /// この呼び出しの `O_EXCL` 作成が成功して得た空ファイルを指す fd（作成直後に保持する）。後始末で名前が今も
+    /// 同じ inode を指すか（dev・ino）を確かめる識別情報として使う（差し替え対策）。
+    target: Option<OwnedFd>,
+    /// `move_mount` が成功した後の、載せたマウントを指す fd。未接続の複製は drop でカーネルが破棄するため、
+    /// 成功してから記録する。
+    mounted: Option<OwnedFd>,
+}
+
+/// 基本デバイスノードの供給方式（[`DevptsGidSource`] の申告から [`device_supply`] が決める。#1660）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceSupply {
+    /// `mknodat(2)` で作る（rootful）。
+    Mknod,
+    /// ホストの `/dev/<名前>` を fd 起点で bind する（rootless。オーナー判断 2026-10-10 の判断 4）。
+    BindFromHost,
+}
+
+/// 供給方式の決定（純粋関数）。申告が実態とずれても権限は広がらない: rootless なのに `Rootful` なら
+/// `mknodat` が `EPERM` で拒否され、rootful なのに `Rootless` なら固定表と `rdev` を検証したホストの
+/// 同じ 6 ノードを bind するだけ。
+fn device_supply(source: DevptsGidSource<'_>) -> DeviceSupply {
+    match source {
+        DevptsGidSource::Rootful => DeviceSupply::Mknod,
+        DevptsGidSource::Rootless(_) => DeviceSupply::BindFromHost,
+    }
 }
 
 /// [`mount_pts`] がこの呼び出しで加えた変更の記録（失敗時の [`roll_back_dev`] が使う）。
@@ -439,9 +501,11 @@ fn create_default_devices_at(
         created_dev: None,
         mounted: None,
         pts: PtsState::default(),
+        binds: Vec::new(),
     };
     let gid = devpts_gid(gid_source);
-    let result = populate_dev(root, &rootfs, is_shared, gid, &mut state);
+    let supply = device_supply(gid_source);
+    let result = populate_dev(root, &rootfs, is_shared, gid, supply, &mut state);
     if result.is_err() {
         roll_back_dev(root, &state);
     }
@@ -454,6 +518,7 @@ fn populate_dev(
     rootfs: &Path,
     is_shared: &dyn Fn(&OwnedFd) -> Result<bool, ExecError>,
     gid: sys::DevptsGid,
+    supply: DeviceSupply,
     state: &mut DevState,
 ) -> Result<DeviceReport, ExecError> {
     let (opened, created) = open_dev_dir(root, rootfs)?;
@@ -481,31 +546,35 @@ fn populate_dev(
 
     let mount = mount_fd.as_fd();
     let mut nodes = Vec::with_capacity(DEFAULT_DEVICES.len());
-    for d in &DEFAULT_DEVICES {
-        let status = match mknod_syscall(mount, d) {
-            Ok(()) => {
-                finalize_node(mount, d)?;
-                DeviceNodeStatus::Created
+    match supply {
+        DeviceSupply::Mknod => {
+            for d in &DEFAULT_DEVICES {
+                let status = match mknod_syscall(mount, d) {
+                    Ok(()) => {
+                        finalize_node(mount, d)?;
+                        DeviceNodeStatus::Created
+                    }
+                    Err(SysError::Os(sys::EEXIST)) => {
+                        verify_existing_node(mount, d)?;
+                        DeviceNodeStatus::AlreadyPresent
+                    }
+                    Err(e) => {
+                        return Err(ExecError::from_sys(
+                            e,
+                            STAGE,
+                            &format!("mknodat({})", d.name.to_string_lossy()),
+                        ));
+                    }
+                };
+                nodes.push(node_outcome(d, status));
             }
-            Err(SysError::Os(sys::EEXIST)) => {
-                verify_existing_node(mount, d)?;
-                DeviceNodeStatus::AlreadyPresent
+        }
+        DeviceSupply::BindFromHost => {
+            bind_host_devices(mount, &mut state.binds)?;
+            for d in &DEFAULT_DEVICES {
+                nodes.push(node_outcome(d, DeviceNodeStatus::BoundFromHost));
             }
-            Err(e) => {
-                return Err(ExecError::from_sys(
-                    e,
-                    STAGE,
-                    &format!("mknodat({})", d.name.to_string_lossy()),
-                ));
-            }
-        };
-        nodes.push(DeviceNodeOutcome {
-            name: d.name.to_str().unwrap_or("?"),
-            major: d.major,
-            minor: d.minor,
-            mode: d.mode,
-            status,
-        });
+        }
     }
     let mut links = Vec::with_capacity(DEFAULT_LINKS.len());
     for l in &DEFAULT_LINKS {
@@ -523,6 +592,388 @@ fn populate_dev(
         devpts,
         dev_mount,
     })
+}
+
+/// 1 ノードの結果の組み立て。
+fn node_outcome(d: &DefaultDevice, status: DeviceNodeStatus) -> DeviceNodeOutcome {
+    DeviceNodeOutcome {
+        name: d.name.to_str().unwrap_or("?"),
+        major: d.major,
+        minor: d.minor,
+        mode: d.mode,
+        status,
+    }
+}
+
+/// bind 元（ホストの `/dev/<名前>`）の表示パス。違反記録の対象に使う（固定表の名前だけ）。
+fn host_node_path(d: &DefaultDevice) -> PathBuf {
+    Path::new("/dev").join(d.name.to_string_lossy().as_ref())
+}
+
+/// rootless 経路: ホストの基本デバイス 6 種を、`/dev` の tmpfs 上の空ファイルへ fd 起点で bind する
+/// （方式 (a)。`docs/design/dev-default-mounts.md` 3.6・オーナー判断 2026-10-10 の判断 4。CORE-6・SEC-5・#1660）。
+///
+/// ホストの `/dev` は `MountIsolation::establish` の `unshare(CLONE_NEWNS)` の後・`pivot_root` の前に開く
+/// （`open_tree` の `check_mnt` が、fd のマウントが呼び出しスレッドの mount namespace に属することを要求するため。
+/// `sys::open_tree_clone` の doc）。bind 元は固定表の名前だけで、任意のパス・major/minor を受け付ける経路は
+/// 作らない（CDI の deviceNodes は TASK-127 の別経路）。`open_tree`・`move_mount` は seccomp の適用前に呼ぶ。
+fn bind_host_devices(mount: BorrowedFd<'_>, binds: &mut Vec<BoundNode>) -> Result<(), ExecError> {
+    let host_dev =
+        open_host_dev_syscall().map_err(|e| ExecError::from_sys(e, STAGE, "open(host /dev)"))?;
+    for d in &DEFAULT_DEVICES {
+        bind_one(host_dev.as_fd(), mount, d, binds)?;
+    }
+    Ok(())
+}
+
+/// 1 ノードの bind: ホストのノードを開いて検証 → 空ファイルを作って固定 → 複製 → 接続 → 再確認。
+/// 変更は作成の直後から `binds` に記録し、どこで失敗しても [`roll_back_dev`] が外せる。
+fn bind_one(
+    host_dev: BorrowedFd<'_>,
+    mount: BorrowedFd<'_>,
+    d: &'static DefaultDevice,
+    binds: &mut Vec<BoundNode>,
+) -> Result<(), ExecError> {
+    let name = d.name.to_string_lossy();
+    // 検証した fd そのものを複製する（開き直さない）。不一致は bind せずに拒否する。
+    let host_fd = open_host_node_syscall(host_dev, d)
+        .map_err(|e| ExecError::from_sys(e, STAGE, &format!("openat(host /dev/{name})")))?;
+    let verified = verify_host_node(host_fd, d).map_err(|e| host_node_error(e, d))?;
+
+    // 空ファイルを `O_EXCL` で作り、作成の fd を識別情報として直ちに記録する。
+    let created = match create_bind_target(mount, d) {
+        Ok(fd) => fd,
+        Err(SysError::Os(sys::EEXIST)) => {
+            return Err(ExecError::new(
+                ErrorCode::FailedPrecondition,
+                STAGE,
+                format!("the bind target dev/{name} already exists"),
+            ));
+        }
+        Err(e) => {
+            return Err(ExecError::from_sys(
+                e,
+                STAGE,
+                &format!("openat(create dev/{name})"),
+            ));
+        }
+    };
+    binds.push(BoundNode {
+        device: d,
+        target: Some(created),
+        mounted: None,
+    });
+    let target = sys::open_path_nofollow(mount, d.name)
+        .map_err(|e| ExecError::from_sys(e, STAGE, &format!("openat(bind target dev/{name})")))?;
+    // 作成と開き直しの間の差し替えを同一 inode の照合で塞ぐ。
+    let same = binds
+        .last()
+        .and_then(|b| b.target.as_ref())
+        .and_then(fd_identity)
+        .is_some_and(|id| fd_identity(&target) == Some(id));
+    if !same {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            STAGE,
+            format!("the bind target dev/{name} was replaced right after creation"),
+        ));
+    }
+
+    // 複製して空ファイルの上へ載せる。接続に成功してから fd を記録する。
+    let tree =
+        open_tree_syscall(&verified, d).map_err(|e| bind_api_error(e, "open_tree", &name))?;
+    move_mount_syscall(tree.as_fd(), target.as_fd(), d)
+        .map_err(|e| bind_api_error(e, "move_mount", &name))?;
+    let Some(record) = binds.last_mut() else {
+        return Ok(());
+    };
+    let own = &*record.mounted.insert(tree);
+
+    // 載せた後に名前を開き直し、文字デバイス・`rdev`・自分のマウントであることを再確認する。
+    let observed = observe_bound_node(mount, d, own)?;
+    check_bound_node(observed, d)
+}
+
+/// ホストのノードの種別と `rdev` の照合は `sys::verify_device_node_fd`（fd の `fstat`）で行う。
+#[cfg(not(test))]
+fn verify_host_node(
+    fd: OwnedFd,
+    d: &DefaultDevice,
+) -> Result<sys::VerifiedDeviceNodeFd, sys::DeviceNodeError> {
+    sys::verify_device_node_fd(fd, d.major, d.minor)
+}
+
+/// dry-run: 照合の事実を記録し、`VERIFY_SCRIPT` に積んだ拒否を先頭から返せる（非特権では `null` の位置に
+/// 別 `rdev` のデバイスを置けないため）。積んでいなければ実際の照合を行う。
+#[cfg(test)]
+fn verify_host_node(
+    fd: OwnedFd,
+    d: &DefaultDevice,
+) -> Result<sys::VerifiedDeviceNodeFd, sys::DeviceNodeError> {
+    tests::EVENTS.with(|e| {
+        e.borrow_mut().push(tests::Event::VerifyHostNode {
+            name: d.name.to_string_lossy().into_owned(),
+        })
+    });
+    let scripted = tests::VERIFY_SCRIPT.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.remove(0))
+        }
+    });
+    if let Some(e) = scripted {
+        return Err(e);
+    }
+    sys::verify_device_node_fd(fd, d.major, d.minor)
+}
+
+/// ホスト側ノードの検証失敗をエラーにする。文字デバイスでない・`rdev` 違いは bind 元の不正として違反記録つきで
+/// 拒否し（種別 `mount_target`。層 Mount にホスト側のパスを記録）、その他は `fstat` の失敗として写す。
+fn host_node_error(e: sys::DeviceNodeError, d: &DefaultDevice) -> ExecError {
+    match e {
+        sys::DeviceNodeError::NotCharDevice { .. }
+        | sys::DeviceNodeError::UnexpectedRdev { .. } => ExecError::from_violation_at(
+            ViolationReason::HostDeviceNodeUnexpected,
+            Some(&host_node_path(d)),
+            STAGE,
+        ),
+        sys::DeviceNodeError::Sys(SysError::Unsupported) => ExecError::new(
+            ErrorCode::Unimplemented,
+            STAGE,
+            "the rootless device bind is not supported on this platform",
+        ),
+        sys::DeviceNodeError::Sys(e) => ExecError::from_sys(
+            e,
+            STAGE,
+            &format!("fstat(host /dev/{})", d.name.to_string_lossy()),
+        ),
+    }
+}
+
+/// `open_tree`・`move_mount` の失敗をエラーにする。`Unsupported`（`ENOSYS`）は `mount(2)` の `MS_BIND` へ
+/// 縮退せず `Unimplemented`（Linux 5.2 以降が必要）で拒否する。
+fn bind_api_error(e: SysError, op: &str, name: &str) -> ExecError {
+    if matches!(e, SysError::Unsupported) {
+        return ExecError::new(
+            ErrorCode::Unimplemented,
+            STAGE,
+            "the rootless device bind requires the new mount API (open_tree, move_mount; Linux 5.2 or later)",
+        );
+    }
+    ExecError::from_sys(e, STAGE, &format!("{op}(dev/{name})"))
+}
+
+/// bind 後に名前を開き直して観測した値（[`check_bound_node`] の入力）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BoundObservation {
+    /// 開き直した fd が文字デバイスか。
+    is_char: bool,
+    /// 開き直した fd の `rdev`。
+    rdev: u64,
+    /// 自分のマウント（`open_tree` の fd）のマウント ID。
+    own_mnt_id: u64,
+    /// 開き直した fd が属するマウントの ID。
+    after_mnt_id: u64,
+}
+
+/// bind 後の再確認（純粋関数）。文字デバイス・`rdev` 一致・自分のマウントのときだけ通る。違反記録なしの
+/// `FailedPrecondition` で拒否する（rootful の [`check_created_node`] と同じ扱い。名前の差し替えの兆候）。
+fn check_bound_node(o: BoundObservation, d: &DefaultDevice) -> Result<(), ExecError> {
+    let name = d.name.to_string_lossy();
+    if !o.is_char || o.rdev != sys::makedev(d.major, d.minor) {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            STAGE,
+            format!(
+                "the bound device node {name} does not match {}:{} after bind",
+                d.major, d.minor
+            ),
+        ));
+    }
+    if o.after_mnt_id != o.own_mnt_id {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            STAGE,
+            format!("the bound device node {name} is not the mount created by this call"),
+        ));
+    }
+    Ok(())
+}
+
+/// `fd` の識別情報（`st_dev`・`st_ino`）。取得できなければ `None`。
+fn fd_identity(fd: &OwnedFd) -> Option<(u64, u64)> {
+    let meta = std::fs::File::from(fd.try_clone().ok()?).metadata().ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(test))]
+fn observe_bound_node(
+    mount: BorrowedFd<'_>,
+    d: &DefaultDevice,
+    own: &OwnedFd,
+) -> Result<BoundObservation, ExecError> {
+    let name = d.name.to_string_lossy();
+    let after = sys::open_path_nofollow(mount, d.name)
+        .map_err(|e| ExecError::from_sys(e, STAGE, &format!("openat(bound dev/{name})")))?;
+    let meta = std::fs::File::from(
+        after
+            .try_clone()
+            .map_err(|e| ExecError::from_io(&e, STAGE, "dup"))?,
+    )
+    .metadata()
+    .map_err(|e| ExecError::from_io(&e, STAGE, "fstat(bound device node)"))?;
+    Ok(BoundObservation {
+        is_char: meta.file_type().is_char_device(),
+        rdev: meta.rdev(),
+        own_mnt_id: super::fd_mount_id(own, STAGE)?,
+        after_mnt_id: super::fd_mount_id(&after, STAGE)?,
+    })
+}
+
+/// dry-run: 実際の開き直しは省き（何も載っていないため）、再確認の事実を記録する。既定は「文字デバイスで
+/// `rdev` 一致・自分のマウント」を観測したことにし、`OBSERVE_BOUND_SCRIPT` で異常値を差し込める。
+#[cfg(test)]
+fn observe_bound_node(
+    _mount: BorrowedFd<'_>,
+    d: &DefaultDevice,
+    _own: &OwnedFd,
+) -> Result<BoundObservation, ExecError> {
+    tests::EVENTS.with(|e| {
+        e.borrow_mut().push(tests::Event::RecheckBound {
+            name: d.name.to_string_lossy().into_owned(),
+        })
+    });
+    let scripted = tests::OBSERVE_BOUND_SCRIPT.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.remove(0))
+        }
+    });
+    Ok(scripted.unwrap_or(BoundObservation {
+        is_char: true,
+        rdev: sys::makedev(d.major, d.minor),
+        own_mnt_id: 2,
+        after_mnt_id: 2,
+    }))
+}
+
+#[cfg(not(test))]
+fn open_host_dev_syscall() -> Result<OwnedFd, SysError> {
+    sys::open_dir_path_nofollow(None, c"/dev")
+}
+
+/// dry-run: `HOST_DEV_SCRIPT` に積んだ一時ディレクトリを「ホストの `/dev`」として開く（無ければ実 `/dev` を
+/// `O_PATH` で開くだけで副作用はない）。
+#[cfg(test)]
+fn open_host_dev_syscall() -> Result<OwnedFd, SysError> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let dir = tests::HOST_DEV_SCRIPT.with(|s| s.borrow().clone());
+    match dir {
+        Some(p) => {
+            let c =
+                CString::new(p.as_os_str().as_bytes()).map_err(|_| SysError::Os(sys::EINVAL))?;
+            sys::open_dir_path_nofollow(None, &c)
+        }
+        None => sys::open_dir_path_nofollow(None, c"/dev"),
+    }
+}
+
+/// ホストの `/dev` 直下の名前を `O_PATH|O_NOFOLLOW` で開く（種別は問わない。検証は [`verify_host_node`]）。
+fn open_host_node_syscall(
+    host_dev: BorrowedFd<'_>,
+    d: &DefaultDevice,
+) -> Result<OwnedFd, SysError> {
+    #[cfg(test)]
+    tests::EVENTS.with(|e| {
+        e.borrow_mut().push(tests::Event::OpenHostNode {
+            name: d.name.to_string_lossy().into_owned(),
+        })
+    });
+    sys::open_path_nofollow(host_dev, d.name)
+}
+
+/// bind 先の空ファイルをモード 0・`O_EXCL|O_NOFOLLOW` で作る。`cfg(test)` でも実ファイルシステム
+/// （一時ディレクトリ）に作り、順序の照合のため作成の事実を記録する。
+fn create_bind_target(mount: BorrowedFd<'_>, d: &DefaultDevice) -> Result<OwnedFd, SysError> {
+    #[cfg(test)]
+    tests::EVENTS.with(|e| {
+        e.borrow_mut().push(tests::Event::CreateBindTarget {
+            name: d.name.to_string_lossy().into_owned(),
+        })
+    });
+    sys::create_file_excl_at(mount, d.name, 0)
+}
+
+#[cfg(not(test))]
+fn open_tree_syscall(
+    node: &sys::VerifiedDeviceNodeFd,
+    _d: &DefaultDevice,
+) -> Result<OwnedFd, SysError> {
+    sys::open_tree_clone(node)
+}
+
+/// dry-run: 新マウント API を呼ばず、複製の代わりに検証済みの fd の複製を返す。`OPEN_TREE_SCRIPT` に積んだ失敗を
+/// 先頭から返せる。
+#[cfg(test)]
+fn open_tree_syscall(
+    node: &sys::VerifiedDeviceNodeFd,
+    d: &DefaultDevice,
+) -> Result<OwnedFd, SysError> {
+    let scripted = tests::OPEN_TREE_SCRIPT.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.remove(0))
+        }
+    });
+    tests::EVENTS.with(|e| {
+        e.borrow_mut().push(tests::Event::OpenTree {
+            name: d.name.to_string_lossy().into_owned(),
+        })
+    });
+    if let Some(Err(e)) = scripted {
+        return Err(e);
+    }
+    std::os::fd::AsFd::as_fd(node)
+        .try_clone_to_owned()
+        .map_err(|_| SysError::Os(sys::EBADF))
+}
+
+#[cfg(not(test))]
+fn move_mount_syscall(
+    from: BorrowedFd<'_>,
+    to: BorrowedFd<'_>,
+    _d: &DefaultDevice,
+) -> Result<(), SysError> {
+    sys::move_mount_empty_path(from, to)
+}
+
+/// dry-run: 新マウント API を呼ばず記録する。`MOVE_MOUNT_SCRIPT` に積んだ失敗を先頭から返せる。
+#[cfg(test)]
+fn move_mount_syscall(
+    _from: BorrowedFd<'_>,
+    _to: BorrowedFd<'_>,
+    d: &DefaultDevice,
+) -> Result<(), SysError> {
+    tests::EVENTS.with(|e| {
+        e.borrow_mut().push(tests::Event::MoveMount {
+            name: d.name.to_string_lossy().into_owned(),
+        })
+    });
+    let scripted = tests::MOVE_MOUNT_SCRIPT.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.remove(0))
+        }
+    });
+    scripted.unwrap_or(Ok(()))
 }
 
 /// `/dev` 用の nodev なし tmpfs の付け替え先（#1664 事後監査 P2。SEC-1・CORE-1）。
@@ -713,9 +1164,27 @@ fn roll_back_dev(root: BorrowedFd<'_>, state: &DevState) {
             }
         }
         if let Some(created) = &state.pts.created
-            && name_is_same_inode(mount.as_fd(), c"pts", created)
+            && name_is_same_inode(mount.as_fd(), c"pts", created, |d, n| {
+                sys::open_dir_path_nofollow(Some(d), n)
+            })
         {
             let _ = sys::remove_dir_at(mount.as_fd(), c"pts");
+        }
+        // rootless の bind は作成の逆順に外し、外した後に名前が自分の作った空ファイルのままのときだけ消す
+        // （外せなかった場合、名前はデバイスを指すため同一 inode にならず消さない）。
+        for b in state.binds.iter().rev() {
+            if let Some(m) = &b.mounted
+                && let Ok(target) = CString::new(format!("/proc/thread-self/fd/{}", m.as_raw_fd()))
+            {
+                let _ = umount_dev_syscall(&target);
+            }
+            if let Some(created) = &b.target
+                && name_is_same_inode(mount.as_fd(), b.device.name, created, |d, n| {
+                    sys::open_path_nofollow(d, n)
+                })
+            {
+                remove_bind_target(mount, b.device);
+            }
         }
         if let Ok(target) = CString::new(format!("/proc/thread-self/fd/{}", mount.as_raw_fd())) {
             let _ = umount_dev_syscall(&target);
@@ -724,22 +1193,40 @@ fn roll_back_dev(root: BorrowedFd<'_>, state: &DevState) {
     // 名前 `dev` が作成時と同じ inode を指すと確認できたときだけ消す。差し替え・移動・確認不能は残す
     // （fail-closed。別プロセスが置いた別ディレクトリを消さない）。
     if let Some(created) = &state.created_dev
-        && name_is_same_inode(root, c"dev", created)
+        && name_is_same_inode(root, c"dev", created, |d, n| {
+            sys::open_dir_path_nofollow(Some(d), n)
+        })
     {
         let _ = sys::remove_dir_at(root, c"dev");
     }
 }
 
-/// `dir` 直下の名前 `name` が `created` と同じ inode（st_dev・st_ino）を指すか。開けない・取得できない場合は偽。
-fn name_is_same_inode(dir: BorrowedFd<'_>, name: &CStr, created: &OwnedFd) -> bool {
-    let Ok(now) = sys::open_dir_path_nofollow(Some(dir), name) else {
+/// `dir` 直下の名前 `name` を `open` で固定し、`created` と同じ inode（st_dev・st_ino）を指すか。
+/// 開けない・取得できない場合は偽。`open` は種別に応じた開き方（ディレクトリは `O_DIRECTORY` 付き、空ファイルは
+/// 付けない）を呼び出し側が選ぶ。
+fn name_is_same_inode(
+    dir: BorrowedFd<'_>,
+    name: &CStr,
+    created: &OwnedFd,
+    open: impl Fn(BorrowedFd<'_>, &CStr) -> Result<OwnedFd, SysError>,
+) -> bool {
+    let Ok(now) = open(dir, name) else {
         return false;
     };
-    let identity = |fd: &OwnedFd| {
-        let meta = std::fs::File::from(fd.try_clone().ok()?).metadata().ok()?;
-        Some((meta.dev(), meta.ino()))
-    };
-    matches!((identity(created), identity(&now)), (Some(a), Some(b)) if a == b)
+    matches!((fd_identity(created), fd_identity(&now)), (Some(a), Some(b)) if a == b)
+}
+
+/// 後始末で、この呼び出しが作った空ファイルを消す（同一 inode と確認済みの名前だけ。`remove_file` は
+/// 最後の要素を辿らない）。`cfg(test)` では順序の照合のため削除の事実を記録する。
+fn remove_bind_target(mount: &OwnedFd, d: &DefaultDevice) {
+    #[cfg(test)]
+    tests::EVENTS.with(|e| {
+        e.borrow_mut().push(tests::Event::RemoveBindTarget {
+            name: d.name.to_string_lossy().into_owned(),
+        })
+    });
+    let path = fd_magic_path(mount.as_raw_fd()).join(d.name.to_string_lossy().as_ref());
+    let _ = std::fs::remove_file(path);
 }
 
 /// マウントのルート fd の magic link を起点に symlink 1 本を作る。`symlink(2)` は最終要素を辿らないため、
@@ -1144,6 +1631,20 @@ mod tests {
         GidOmittedLog,
         /// `umount2(MNT_DETACH)`（解決した対象パス）。
         Umount(String),
+        /// rootless 経路: ホストの `/dev/<名前>` を `O_PATH|O_NOFOLLOW` で開いた。
+        OpenHostNode { name: String },
+        /// rootless 経路: 開いたホストのノードを fd の `fstat` で照合した。
+        VerifyHostNode { name: String },
+        /// rootless 経路: bind 先の空ファイルを `O_EXCL` で作った。
+        CreateBindTarget { name: String },
+        /// rootless 経路: `open_tree` でホストのノードを複製した。
+        OpenTree { name: String },
+        /// rootless 経路: `move_mount` で空ファイルの上へ載せた。
+        MoveMount { name: String },
+        /// rootless 経路: 載せた後に名前を開き直して再確認した。
+        RecheckBound { name: String },
+        /// 後始末でこの呼び出しが作った空ファイルを消した。
+        RemoveBindTarget { name: String },
     }
 
     thread_local! {
@@ -1162,6 +1663,21 @@ mod tests {
         /// dry-run の devpts 事後観測が次に返す値（消費される。無ければ正常値）。
         pub(super) static OBSERVE_PTS_SCRIPT: RefCell<Option<MountObservation>> =
             const { RefCell::new(None) };
+        /// ホストの `/dev` として開く一時ディレクトリ（`None` なら実 `/dev` を開く）。
+        pub(super) static HOST_DEV_SCRIPT: RefCell<Option<PathBuf>> =
+            const { RefCell::new(None) };
+        /// ホストのノードの照合が次に返す拒否（先頭から消費。空なら実際の照合）。
+        pub(super) static VERIFY_SCRIPT: RefCell<Vec<sys::DeviceNodeError>> =
+            const { RefCell::new(Vec::new()) };
+        /// `open_tree` が次に返す結果（先頭から消費。空なら `Ok`）。
+        pub(super) static OPEN_TREE_SCRIPT: RefCell<Vec<Result<(), SysError>>> =
+            const { RefCell::new(Vec::new()) };
+        /// `move_mount` が次に返す結果（先頭から消費。空なら `Ok`）。
+        pub(super) static MOVE_MOUNT_SCRIPT: RefCell<Vec<Result<(), SysError>>> =
+            const { RefCell::new(Vec::new()) };
+        /// bind 後の再確認が次に観測する値（先頭から消費。空なら正常値）。
+        pub(super) static OBSERVE_BOUND_SCRIPT: RefCell<Vec<BoundObservation>> =
+            const { RefCell::new(Vec::new()) };
     }
 
     /// 記録とスクリプトをすべて消し、記録済みの `mknodat` 呼び出しを返す。
@@ -1171,6 +1687,11 @@ mod tests {
         OBSERVE_SCRIPT.with(|s| *s.borrow_mut() = None);
         DEVPTS_MOUNT_SCRIPT.with(|s| *s.borrow_mut() = None);
         OBSERVE_PTS_SCRIPT.with(|s| *s.borrow_mut() = None);
+        HOST_DEV_SCRIPT.with(|s| *s.borrow_mut() = None);
+        VERIFY_SCRIPT.with(|s| s.borrow_mut().clear());
+        OPEN_TREE_SCRIPT.with(|s| s.borrow_mut().clear());
+        MOVE_MOUNT_SCRIPT.with(|s| s.borrow_mut().clear());
+        OBSERVE_BOUND_SCRIPT.with(|s| s.borrow_mut().clear());
         take_events()
             .into_iter()
             .filter_map(|e| match e {
@@ -1474,7 +1995,8 @@ mod tests {
         }
     }
 
-    /// CORE-1: rootless 等で `EPERM` なら `PermissionDenied`（段 `CreateDevices`）で fail-closed。
+    /// CORE-1: rootful の `mknod` が `EPERM` なら `PermissionDenied`（段 `CreateDevices`）で fail-closed
+    /// （rootless 経路へは縮退しない。rootless は #1660 で bind 供給になった）。
     #[test]
     fn core1_devices_eperm_fails_closed() {
         take_calls();
@@ -1640,6 +2162,7 @@ mod tests {
             created_dev: Some(created),
             mounted: None,
             pts: PtsState::default(),
+            binds: Vec::new(),
         };
         std::fs::rename(t.0.join("dev"), t.0.join("dev-moved")).unwrap();
         std::fs::create_dir(t.0.join("dev")).unwrap();
@@ -1659,6 +2182,7 @@ mod tests {
             created_dev: Some(created),
             mounted: None,
             pts: PtsState::default(),
+            binds: Vec::new(),
         };
         roll_back_dev(root.as_fd(), &state);
         assert!(!t.0.join("dev").exists());
@@ -2081,6 +2605,7 @@ mod tests {
                     mounted: None,
                     ptmx_created: true,
                 },
+                binds: Vec::new(),
             };
             roll_back_dev(root.as_fd(), &state);
             assert!(!t.0.join("dev/pts").exists());
@@ -2221,5 +2746,408 @@ mod tests {
             creates,
             vec!["exec/devices.rs".to_owned(), "sys.rs".to_owned()]
         );
+    }
+
+    // ---- rootless 経路: ホストのノードの bind（#1660。CORE-6・SEC-5・CORE-1）----
+
+    /// rootless の呼び出し（単一 ID 写像。gid 5 は未写像）。
+    fn run_rootless_at(root: BorrowedFd<'_>) -> Result<DeviceReport, ExecError> {
+        let map = crate::rootless::single_id_mapping(1000).unwrap();
+        create_default_devices_at(root, &|_| Ok(false), DevptsGidSource::Rootless(&map))
+    }
+
+    const NODE_NAMES: [&str; 6] = ["null", "zero", "full", "random", "urandom", "tty"];
+
+    /// 出来事の列から rootless 経路の bind 系だけを `<種別> <名前>` で取り出す。
+    fn bind_trace(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::OpenHostNode { name } => Some(format!("open-host {name}")),
+                Event::VerifyHostNode { name } => Some(format!("verify {name}")),
+                Event::CreateBindTarget { name } => Some(format!("create {name}")),
+                Event::OpenTree { name } => Some(format!("open-tree {name}")),
+                Event::MoveMount { name } => Some(format!("move-mount {name}")),
+                Event::RecheckBound { name } => Some(format!("recheck {name}")),
+                Event::RemoveBindTarget { name } => Some(format!("remove {name}")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// CORE-6・SEC-5・#1660: rootless は 6 種それぞれを「開く → 検証 → 空ファイル作成 → 複製 → 接続 → 再確認」の
+    /// 順で bind し、`mknodat` は呼ばない。報告はすべて `BoundFromHost`。symlink 4 本と devpts は rootful と同じ。
+    #[test]
+    fn core6_sec5_1660_rootless_binds_six_nodes_in_order() {
+        take_calls();
+        let t = Tmp::new("bind-order");
+        let report = run_rootless_at(open_root(&t.0).as_fd()).unwrap();
+        let events = take_events();
+        let mut expected = Vec::new();
+        for n in NODE_NAMES {
+            for step in [
+                "open-host",
+                "verify",
+                "create",
+                "open-tree",
+                "move-mount",
+                "recheck",
+            ] {
+                expected.push(format!("{step} {n}"));
+            }
+        }
+        assert_eq!(bind_trace(&events), expected);
+        assert_eq!(count(&events, |e| matches!(e, Event::Mknod { .. })), 0);
+        assert_eq!(count(&events, |e| matches!(e, Event::Umount(_))), 0);
+        assert_eq!(report.nodes.len(), 6);
+        for (n, name) in report.nodes.iter().zip(NODE_NAMES) {
+            assert_eq!(n.name, name);
+            assert_eq!(n.status, DeviceNodeStatus::BoundFromHost);
+            assert_eq!(n.mode, 0o666);
+        }
+        // symlink 4 本・devpts・ptmx は rootful と同じ（gid 5 は未写像のため `gid=` なし）。
+        let links: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Symlink { name, target, .. } => Some((name.as_str(), target.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            links,
+            vec![
+                ("fd", "/proc/self/fd"),
+                ("stdin", "/proc/self/fd/0"),
+                ("stdout", "/proc/self/fd/1"),
+                ("stderr", "/proc/self/fd/2"),
+                ("ptmx", "pts/ptmx"),
+            ]
+        );
+        assert_eq!(report.devpts.gid, None);
+        // bind 先の空ファイルが tmpfs 上（dry-run では `dev` ディレクトリ）に実在する。
+        for n in NODE_NAMES {
+            let meta = std::fs::symlink_metadata(t.0.join("dev").join(n)).unwrap();
+            assert!(meta.file_type().is_file(), "{n}");
+            assert_eq!(meta.len(), 0, "{n}");
+            assert_eq!(meta.mode() & 0o777, 0, "{n}");
+        }
+        take_calls();
+    }
+
+    /// CORE-1・#1660: rootful は従来どおり `mknodat` で作り、bind 系の出来事を一切起こさない。
+    #[test]
+    fn core1_1660_rootful_keeps_mknod_path() {
+        take_calls();
+        let t = Tmp::new("rootful-path");
+        let report = run_at(open_root(&t.0).as_fd()).unwrap();
+        let events = take_events();
+        assert_eq!(count(&events, |e| matches!(e, Event::Mknod { .. })), 6);
+        assert_eq!(bind_trace(&events), Vec::<String>::new());
+        assert!(
+            report
+                .nodes
+                .iter()
+                .all(|n| n.status == DeviceNodeStatus::Created)
+        );
+        take_calls();
+    }
+
+    /// CORE-6・SEC-5・#1660: 供給方式は申告から明示的に決まり、`mknod` の失敗では切り替わらない。
+    #[test]
+    fn core6_1660_device_supply_follows_declared_model() {
+        let map = crate::rootless::single_id_mapping(1000).unwrap();
+        assert_eq!(device_supply(DevptsGidSource::Rootful), DeviceSupply::Mknod);
+        assert_eq!(
+            device_supply(DevptsGidSource::Rootless(&map)),
+            DeviceSupply::BindFromHost
+        );
+        // rootful の `EPERM` は rootless 経路へ縮退せず、bind 系の出来事も起きない。
+        take_calls();
+        let t = Tmp::new("no-fallback");
+        MKNOD_SCRIPT.with(|s| *s.borrow_mut() = vec![Err(SysError::Os(sys::EPERM))]);
+        let err = run_at(open_root(&t.0).as_fd()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert_eq!(bind_trace(&take_events()), Vec::<String>::new());
+        take_calls();
+    }
+
+    /// 期待と違うホストのノードを `null` の位置に置いた rootless の実行結果（出来事と拒否）を返す。
+    fn run_with_bad_host_null(label: &str, setup: impl Fn(&Path)) -> (Vec<Event>, ExecError) {
+        take_calls();
+        let host = Tmp::new(&format!("host-{label}"));
+        setup(&host.0);
+        HOST_DEV_SCRIPT.with(|s| *s.borrow_mut() = Some(host.0.clone()));
+        let t = Tmp::new(&format!("bind-reject-{label}"));
+        let err = run_rootless_at(open_root(&t.0).as_fd()).unwrap_err();
+        let events = take_events();
+        take_calls();
+        assert!(
+            !t.0.join("dev").exists(),
+            "{label}: created dev must be removed"
+        );
+        (events, err)
+    }
+
+    fn assert_host_node_rejected(label: &str, events: &[Event], err: &ExecError) {
+        assert_eq!(err.code, ErrorCode::FailedPrecondition, "{label}");
+        assert_eq!(err.stage, IsolationStage::CreateDevices, "{label}");
+        let v = err.violation.as_ref().expect("violation record");
+        assert_eq!(v.reason.as_str(), "host_device_node_unexpected", "{label}");
+        assert_eq!(v.behavior_id, "SEC-5", "{label}");
+        assert_eq!(
+            v.audit_path().map(|p| p.as_path()),
+            Some(Path::new("/dev/null")),
+            "{label}"
+        );
+        assert_eq!(
+            bind_trace(events),
+            vec!["open-host null".to_owned(), "verify null".to_owned()],
+            "{label}: nothing may be created or bound"
+        );
+        // 載せた tmpfs だけが外れる。
+        assert_eq!(
+            count(events, |e| matches!(e, Event::Umount(_))),
+            1,
+            "{label}"
+        );
+    }
+
+    /// SEC-5・#1660: ホスト側の `null` が通常ファイル・実 `/dev/null` への symlink（辿らない）・`rdev` 違いなら、
+    /// 違反つきで拒否し、空ファイルも bind も作らない。
+    #[test]
+    fn core6_sec5_1660_host_node_unexpected_is_rejected_without_bind() {
+        let (events, err) = run_with_bad_host_null("regular", |dir| {
+            std::fs::write(dir.join("null"), b"not a device").unwrap();
+        });
+        assert_host_node_rejected("regular", &events, &err);
+
+        let (events, err) = run_with_bad_host_null("symlink", |dir| {
+            std::os::unix::fs::symlink("/dev/null", dir.join("null")).unwrap();
+        });
+        assert_host_node_rejected("symlink", &events, &err);
+
+        // `rdev` 違い（1:5）。非特権ではノードを作れないため、照合の拒否を差し込む。
+        take_calls();
+        VERIFY_SCRIPT.with(|s| {
+            *s.borrow_mut() = vec![sys::DeviceNodeError::UnexpectedRdev {
+                actual: sys::makedev(1, 5),
+                expected: sys::makedev(1, 3),
+            }]
+        });
+        let t = Tmp::new("bind-reject-rdev");
+        let err = run_rootless_at(open_root(&t.0).as_fd()).unwrap_err();
+        let events = take_events();
+        assert_host_node_rejected("rdev", &events, &err);
+        take_calls();
+    }
+
+    /// 照合以外の失敗の写し方: `fstat` の失敗は違反なしの OS エラー、未対応は `Unimplemented`。
+    #[test]
+    fn core6_sec5_1660_host_node_error_mapping_is_exact() {
+        let d = &DEFAULT_DEVICES[1];
+        let err = host_node_error(sys::DeviceNodeError::Sys(SysError::Os(sys::EBADF)), d);
+        assert!(err.violation.is_none());
+        assert_eq!(err.stage, IsolationStage::CreateDevices);
+        assert!(
+            err.message.starts_with("fstat(host /dev/zero) failed"),
+            "{}",
+            err.message
+        );
+        let err = host_node_error(sys::DeviceNodeError::Sys(SysError::Unsupported), d);
+        assert_eq!(err.code, ErrorCode::Unimplemented);
+        let err = host_node_error(sys::DeviceNodeError::NotCharDevice { mode: 0o100_644 }, d);
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        let v = err.violation.as_ref().expect("violation record");
+        assert_eq!(
+            v.audit_path().map(|p| p.as_path()),
+            Some(Path::new("/dev/zero"))
+        );
+    }
+
+    /// CORE-1・#1660: 4 番目（random）の `move_mount` が失敗したら、接続済みの bind を逆順に外し、
+    /// 作った 4 つの空ファイルだけを消し、tmpfs と `dev` も片付ける。
+    #[test]
+    fn core6_sec5_1660_failure_midway_detaches_binds_and_removes_created_targets() {
+        take_calls();
+        let t = Tmp::new("bind-midway");
+        MOVE_MOUNT_SCRIPT.with(|s| {
+            *s.borrow_mut() = vec![Ok(()), Ok(()), Ok(()), Err(SysError::Os(sys::EINVAL))];
+        });
+        let err = run_rootless_at(open_root(&t.0).as_fd()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(err.stage, IsolationStage::CreateDevices);
+        assert!(
+            err.message.starts_with("move_mount(dev/random) failed"),
+            "{}",
+            err.message
+        );
+        let events = take_events();
+        // 逆順: random（未接続。空ファイルだけ消す）→ full → zero → null（外してから消す）→ tmpfs。
+        let tail: Vec<String> = events
+            .iter()
+            .skip_while(|e| !matches!(e, Event::MoveMount { name } if name == "random"))
+            .skip(1)
+            .map(|e| match e {
+                Event::RemoveBindTarget { name } => format!("remove {name}"),
+                Event::Umount(p) => {
+                    let leaf = Path::new(p)
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    format!("umount {leaf}")
+                }
+                other => panic!("unexpected event {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                "remove random",
+                "umount full",
+                "remove full",
+                "umount zero",
+                "remove zero",
+                "umount null",
+                "remove null",
+                "umount dev",
+            ]
+        );
+        assert!(!t.0.join("dev").exists());
+        take_calls();
+    }
+
+    /// CORE-1・SEC-1・#1660: 名前が既に存在する（`EEXIST`）ときは受け入れず拒否し、既存のエントリは消さない。
+    /// この呼び出しが作った空ファイルだけが消える。
+    #[test]
+    fn core6_sec5_1660_existing_bind_target_is_rejected_and_kept() {
+        take_calls();
+        let t = Tmp::new("bind-eexist");
+        std::fs::create_dir(t.0.join("dev")).unwrap();
+        std::fs::write(t.0.join("dev/urandom"), b"keep").unwrap();
+        let err = run_rootless_at(open_root(&t.0).as_fd()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(err.stage, IsolationStage::CreateDevices);
+        assert!(err.violation.is_none());
+        assert_eq!(err.message, "the bind target dev/urandom already exists");
+        let events = take_events();
+        let removed: Vec<_> = bind_trace(&events)
+            .into_iter()
+            .filter(|l| l.starts_with("remove "))
+            .collect();
+        assert_eq!(
+            removed,
+            vec!["remove random", "remove full", "remove zero", "remove null"]
+        );
+        for n in ["null", "zero", "full", "random"] {
+            assert!(!t.0.join("dev").join(n).exists(), "{n}");
+        }
+        assert_eq!(std::fs::read(t.0.join("dev/urandom")).unwrap(), b"keep");
+        take_calls();
+    }
+
+    /// CORE-1・#1660: 新マウント API が無い（`ENOSYS`）カーネルでは `Unimplemented` で拒否し、`mknodat` 等へ縮退しない。
+    #[test]
+    fn core6_sec5_1660_bind_api_unsupported_is_unimplemented() {
+        for open_tree_fails in [true, false] {
+            take_calls();
+            let t = Tmp::new("bind-enosys");
+            if open_tree_fails {
+                OPEN_TREE_SCRIPT.with(|s| *s.borrow_mut() = vec![Err(SysError::Unsupported)]);
+            } else {
+                MOVE_MOUNT_SCRIPT.with(|s| *s.borrow_mut() = vec![Err(SysError::Unsupported)]);
+            }
+            let err = run_rootless_at(open_root(&t.0).as_fd()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Unimplemented);
+            assert_eq!(err.stage, IsolationStage::CreateDevices);
+            assert_eq!(
+                err.message,
+                "the rootless device bind requires the new mount API (open_tree, move_mount; Linux 5.2 or later)"
+            );
+            assert!(err.violation.is_none());
+            let events = take_events();
+            assert_eq!(count(&events, |e| matches!(e, Event::Mknod { .. })), 0);
+            assert!(!t.0.join("dev").exists());
+            take_calls();
+        }
+    }
+
+    /// SEC-5・#1660: bind 後の再確認（文字デバイスでない・`rdev` 違い・別マウント）で拒否して巻き戻す。
+    #[test]
+    fn core6_sec5_1660_post_bind_recheck_mismatch_rolls_back() {
+        let ok = BoundObservation {
+            is_char: true,
+            rdev: sys::makedev(1, 3),
+            own_mnt_id: 7,
+            after_mnt_id: 7,
+        };
+        for (obs, msg) in [
+            (
+                BoundObservation {
+                    is_char: false,
+                    ..ok
+                },
+                "the bound device node null does not match 1:3 after bind",
+            ),
+            (
+                BoundObservation {
+                    rdev: sys::makedev(1, 5),
+                    ..ok
+                },
+                "the bound device node null does not match 1:3 after bind",
+            ),
+            (
+                BoundObservation {
+                    after_mnt_id: 8,
+                    ..ok
+                },
+                "the bound device node null is not the mount created by this call",
+            ),
+        ] {
+            take_calls();
+            OBSERVE_BOUND_SCRIPT.with(|s| *s.borrow_mut() = vec![obs]);
+            let t = Tmp::new("bind-recheck");
+            let err = run_rootless_at(open_root(&t.0).as_fd()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::FailedPrecondition);
+            assert_eq!(err.stage, IsolationStage::CreateDevices);
+            assert!(err.violation.is_none());
+            assert_eq!(err.message, msg);
+            let events = take_events();
+            assert_eq!(
+                bind_trace(&events).last().map(String::as_str),
+                Some("remove null")
+            );
+            assert_eq!(count(&events, |e| matches!(e, Event::Umount(_))), 2);
+            assert!(!t.0.join("dev").exists());
+            take_calls();
+        }
+        assert!(check_bound_node(ok, &DEFAULT_DEVICES[0]).is_ok());
+    }
+
+    /// 後始末は、名前が差し替えられていたら（作った空ファイルと別 inode）消さない。
+    #[test]
+    fn core6_sec5_1660_rollback_keeps_swapped_bind_target() {
+        take_calls();
+        let t = Tmp::new("bind-swapped");
+        std::fs::create_dir(t.0.join("dev")).unwrap();
+        let root = open_root(&t.0);
+        let dev = sys::open_dir_path_nofollow(Some(root.as_fd()), c"dev").unwrap();
+        let created = sys::create_file_excl_at(dev.as_fd(), c"null", 0).unwrap();
+        std::fs::rename(t.0.join("dev/null"), t.0.join("dev/null-moved")).unwrap();
+        std::fs::write(t.0.join("dev/null"), b"other").unwrap();
+        let state = DevState {
+            created_dev: None,
+            mounted: Some(dev),
+            pts: PtsState::default(),
+            binds: vec![BoundNode {
+                device: &DEFAULT_DEVICES[0],
+                target: Some(created),
+                mounted: None,
+            }],
+        };
+        roll_back_dev(root.as_fd(), &state);
+        assert_eq!(std::fs::read(t.0.join("dev/null")).unwrap(), b"other");
+        assert!(t.0.join("dev/null-moved").exists());
+        take_calls();
     }
 }

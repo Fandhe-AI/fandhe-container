@@ -153,7 +153,7 @@ harness = false
 
 # 暗黙の /dev・/dev/pts・/dev/shm を Landlock のルールに反映する結合試験（CORE-5・TASK-29 追補・#1657）。
 # Landlock の適用は不可逆・単一スレッド前提のため harness = false。`-- --ignored` 指定時のみ実行する
-# 実機前提テスト（root・Landlock ABI 6+。AGENTS.md）。
+# 実機前提テスト（root もしくは非特権 user namespace を許すホスト・Landlock ABI 6+。AGENTS.md）。
 [[test]]
 name = "landlock_implicit_dev"
 path = "tests/landlock_implicit_dev.rs"

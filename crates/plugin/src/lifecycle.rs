@@ -1611,6 +1611,43 @@ mod tests {
         assert_eq!(flags & 0o4000, 0);
     }
 
+    /// REPAIR-5・PLUG-7・#1605: 名前付き FIFO は置き場所の NFS / FUSE で開き直しが止まり得るため、
+    /// 無名 pipe と違い開き直さず `Unsupported`（診断は捨て、読み手には何も届かない）。
+    #[test]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn repair5_drop_log_discards_on_named_fifo() {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NONBLOCK: i32 = 0o4000;
+        let dir = std::env::temp_dir().join(format!("fc-droplog-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("fifo");
+        let status = Command::new("mkfifo").arg(&path).status().unwrap();
+        assert!(status.success(), "mkfifo failed: {status}");
+        let mut reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        let r = crate::sys::write_nonblocking(&writer, b"x\n");
+        let mut buf = [0u8; 8];
+        let read = reader.read(&mut buf);
+        drop(writer);
+        drop(reader);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::Unsupported);
+        assert_eq!(read.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+
     /// REPAIR-5・PLUG-7・#1605: 通常ファイルは待たない保証がないため書かず `Unsupported`（診断は捨てる）。
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]

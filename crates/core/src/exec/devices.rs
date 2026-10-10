@@ -289,16 +289,18 @@ fn populate_dev(
     is_shared: &dyn Fn(&OwnedFd) -> Result<bool, ExecError>,
     state: &mut DevState,
 ) -> Result<DeviceReport, ExecError> {
-    let mut created = false;
-    let dev = open_dev_dir(root, rootfs, &mut created)?;
-    if created {
-        state.created_dev = Some(
-            dev.try_clone()
-                .map_err(|e| ExecError::from_io(&e, STAGE, "dup(dev)"))?,
-        );
-    }
+    let (opened, created) = open_dev_dir(root, rootfs)?;
+    // 作成した `dev` の fd は複製せず所有権ごと `state` へ移す（複製の失敗で記録漏れが起きないように）。
+    // 以降の処理はこの fd を借りて使い、どの失敗経路でも後始末が識別情報を参照できる。
+    let local;
+    let dev: &OwnedFd = if created {
+        &*state.created_dev.insert(opened)
+    } else {
+        local = opened;
+        &local
+    };
     let subject = rootfs.join("dev");
-    if is_shared(&dev)? {
+    if is_shared(dev)? {
         return Err(ExecError::from_violation_at(
             ViolationReason::TargetOnSharedMount,
             Some(&subject),
@@ -306,7 +308,7 @@ fn populate_dev(
         ));
     }
     // fd 固定後に別プロセスが `dev`（または祖先）を改名・移動・削除していれば拒否する（`mount_tmpfs` と同じ）。
-    if !fd_still_at(&dev, &subject) {
+    if !fd_still_at(dev, &subject) {
         return Err(ExecError::from_violation_at(
             ViolationReason::TargetMoved,
             Some(&subject),
@@ -320,7 +322,7 @@ fn populate_dev(
     // 事後検証専用の開き直し（作成の起点にはしない）。
     let after = sys::open_dir_path_nofollow(Some(root), c"dev")
         .map_err(|e| open_error(e, true, rootfs, &[OsStr::new("dev")]).at_stage(STAGE))?;
-    let observed = observe_dev_mount(&dev, &after, mount_fd)?;
+    let observed = observe_dev_mount(dev, &after, mount_fd)?;
     check_new_tmpfs(observed, "/dev", STAGE)?;
 
     let mount = mount_fd.as_fd();
@@ -474,26 +476,33 @@ fn fd_magic_path(fd: i32) -> PathBuf {
 }
 
 /// `root` 直下の `dev` を `O_PATH|O_NOFOLLOW|O_DIRECTORY` で開く。無ければ rootfs 配下に作って開き直し、
-/// 自分で作ったときだけ `created` を真にする。symlink・非ディレクトリは違反記録付きで拒否する
+/// 自分で作ったときだけ戻り値の第 2 要素を真にする。symlink・非ディレクトリは違反記録付きで拒否する
 /// （rootfs の外へ作らない）。
-fn open_dev_dir(
-    root: BorrowedFd<'_>,
-    rootfs: &Path,
-    created: &mut bool,
-) -> Result<OwnedFd, ExecError> {
+fn open_dev_dir(root: BorrowedFd<'_>, rootfs: &Path) -> Result<(OwnedFd, bool), ExecError> {
     let names = [OsStr::new("dev")];
     let open = || sys::open_dir_path_nofollow(Some(root), c"dev");
     match open() {
-        Ok(fd) => Ok(fd),
+        Ok(fd) => Ok((fd, false)),
         Err(SysError::Os(sys::ENOENT)) => {
             // `mkdirat` は最終要素の symlink を辿らない。競合で先に作られた（EEXIST）場合は自分が作った
             // 扱いにせず、開き直しで種別を検証する。
-            match sys::mkdir_at(root, c"dev", 0o755) {
-                Ok(()) => *created = true,
-                Err(SysError::Os(sys::EEXIST)) => {}
+            let created = match sys::mkdir_at(root, c"dev", 0o755) {
+                Ok(()) => true,
+                Err(SysError::Os(sys::EEXIST)) => false,
                 Err(e) => return Err(ExecError::from_sys(e, STAGE, "mkdirat(dev)")),
+            };
+            match open() {
+                Ok(fd) => Ok((fd, created)),
+                Err(e) => {
+                    // 作成直後の開き直し失敗は識別用の fd が得られないため、呼び出し元の後始末に
+                    // 渡せない。ここで空ディレクトリだけを消す（`AT_REMOVEDIR` は空でない dev・symlink を
+                    // 消さない）。ホスト側 rootfs に作成物を残さない。
+                    if created {
+                        let _ = sys::remove_dir_at(root, c"dev");
+                    }
+                    Err(open_error(e, true, rootfs, &names).at_stage(STAGE))
+                }
             }
-            open().map_err(|e| open_error(e, true, rootfs, &names).at_stage(STAGE))
         }
         Err(e) => Err(open_error(e, true, rootfs, &names).at_stage(STAGE)),
     }

@@ -27,6 +27,14 @@
 //! supervisor が結果を書くまでの内部上限は [`result_deadline`]、CLI の受信期限は [`cli_receive_deadline`]。
 //! CLI が期限内に 1 行を受け取れなければ `TIMEOUT`（結果不明。supervisor は遅れて成功しても監視を続けるので、
 //! 利用者は `state` で確かめる）。行が無いまま EOF なら `INTERNAL`（supervisor が報告の前に落ちた）。
+//!
+//! # 報告の後の後始末
+//! supervisor は報告を期限内に 1 回書いてから、失敗の後始末（予約を Created へ戻す・cgroup の削除・terminate・
+//! `Stopped` の記録）を行う。起動処理が期限に間に合わなかったときは `INTERNAL`（期限超過の message）を報告し、
+//! 起動処理が後から成功していれば起動したプロセスを terminate して `Stopped` を記録する。
+//! **ERR（`INTERNAL` を含む）の報告の後、後始末が終わるまで同じ ID は予約中**で、その間の同じ ID の start は
+//! 記録済みの cgroup スコープ・起動権の予約（revision 照合）・bundle の所有ロックの照合で `FAILED_PRECONDITION`
+//! として拒否される。後始末を確かめられなければ supervisor は `INTERNAL` の終了コードで終わる。
 
 use std::ffi::OsString;
 use std::num::{NonZeroU8, NonZeroU32};
@@ -295,9 +303,9 @@ impl StartArgs {
 /// supervisor が結果を書くまでの内部上限: `launch + terminate + confirm + 3 × LAUNCHER_REPLY_GRACE + 5s`
 /// （既定値で 33s。あふれたら `Duration::MAX` に張り付く）。
 ///
-/// supervisor（`start_entry::run_start`）は開始時刻にこの値を足した期限を処理全体で共有し、失敗後の回復の再試行・
-/// 未回収ハンドルの terminate は、1 回の待ちの上限が残り時間に収まるときだけ行う。収まらなければ回復・回収を
-/// 確かめられなかった扱い（`INTERNAL`）で報告するため、報告はこの上限内に届く（REPAIR-5）。
+/// supervisor（`start_entry::run_start`）は起動処理を作業スレッドで行い、開始時刻にこの値を足した期限から報告の
+/// 書き込み分（`start_entry::REPORT_RESERVE`）を引いた時点まで結果を待つ。間に合わなければ `INTERNAL`
+/// （期限超過）を報告するため、報告はこの上限内に届く。失敗後の後始末は報告の後に行う（REPAIR-5）。
 pub fn result_deadline(timeouts: &StartTimeouts) -> Duration {
     timeouts
         .launch()

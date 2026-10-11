@@ -26,7 +26,10 @@ use fandhe_container_core::traits::{
 use fandhe_container_supervisor::restart::RestartPolicy;
 use fandhe_container_supervisor::run::StopToken;
 use fandhe_container_supervisor::start_contract::{StartReport, result_deadline};
-use fandhe_container_supervisor::start_entry::{Running, StartDeps, run_start, run_supervised};
+use fandhe_container_supervisor::start_entry::{
+    DEADLINE_EXCEEDED_MESSAGE, Running, START_OP, StartDeps, run_start, run_start_until,
+    run_supervised, start_metrics_line,
+};
 use fandhe_container_supervisor::state::open_default_store;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -86,15 +89,11 @@ fn cid(s: &str) -> ContainerId {
     ContainerId::new(s).unwrap()
 }
 
-/// 起動待ち 100ms・終了待ち 8s・確認待ち 500ms の上限。
-///
-/// 終了待ちを長めにとるのは、失敗後の回復 1 回の見積もり（状態ストアのロック待ち 2 × 5s ＋ 確認＋猶予）が
-/// `result_deadline` の残りに収まるようにするため（収まらなければ回復せず INTERNAL を報告する。REPAIR-5）。
-/// フェイクの terminate は即座に戻るため、試験の所要時間は延びない。
+/// 起動待ち 100ms・終了待ち 1s・確認待ち 500ms の短い上限。
 fn short_timeouts() -> StartTimeouts {
     StartTimeouts::new(
         Duration::from_millis(100),
-        Duration::from_secs(8),
+        Duration::from_secs(1),
         Duration::from_millis(500),
     )
     .unwrap()
@@ -229,6 +228,10 @@ struct FakeDeps {
     unavailable: bool,
     /// `prepare_cgroup` が返す準備した世代（既定 `None` = スコープを記録しない）。
     prepared_instance: Option<StateRevision>,
+    /// `true` なら `prepare_cgroup` が本番と同じくスコープを状態へ記録し、その instance を返す。
+    record_scope: bool,
+    /// `prepare_cgroup` の所要時間（期限超過の試験で起動処理を止める）。
+    prepare_delay: Duration,
 }
 
 impl FakeDeps {
@@ -258,10 +261,19 @@ impl StartDeps for FakeDeps {
 
     fn prepare_cgroup(
         &mut self,
-        _store: &dyn StateStore,
-        _observed: &StateRecord,
+        store: &dyn StateStore,
+        observed: &StateRecord,
     ) -> Result<Option<StateRevision>, TraitError> {
-        self.step("prepare").map(|()| self.prepared_instance)
+        self.step("prepare")?;
+        let instance = if self.record_scope {
+            let req = UpdateStateRequest::new(observed.status().clone(), observed.revision())
+                .with_cgroup_scope(CgroupScope::new("/sys/fs/cgroup/user/fandhe").unwrap());
+            store.update(&req)?.cgroup().map(|c| c.instance())
+        } else {
+            self.prepared_instance
+        };
+        std::thread::sleep(self.prepare_delay);
+        Ok(instance)
     }
 
     fn build_audit_sink(&mut self) -> Result<(), TraitError> {
@@ -287,6 +299,8 @@ fn deps(calls: &Calls, launcher: FakeLauncher) -> (FakeDeps, Arc<FakeLauncher>) 
             fail_at: None,
             unavailable: false,
             prepared_instance: None,
+            record_scope: false,
+            prepare_delay: Duration::ZERO,
         },
         launcher,
     )
@@ -298,15 +312,15 @@ fn new_calls() -> Calls {
 
 fn start_with(
     env: &Env,
-    deps: &mut FakeDeps,
+    deps: FakeDeps,
     id: &str,
     timeouts: &StartTimeouts,
     out: &mut dyn Write,
 ) -> Result<Running, std::num::NonZeroU8> {
     run_start(
-        deps,
+        Box::new(deps),
         &env.store,
-        &OpRecorder::new(),
+        &Arc::new(OpRecorder::new()),
         &StartRequest::new(cid(id)),
         timeouts,
         out,
@@ -323,9 +337,9 @@ fn sup1_start_order_on_success() {
     let env = Env::new("order");
     env.create(&env.id);
     let calls = new_calls();
-    let (mut d, _l) = deps(&calls, FakeLauncher::new(&calls));
+    let (d, _l) = deps(&calls, FakeLauncher::new(&calls));
     let mut out = Vec::new();
-    let running = start_with(&env, &mut d, &env.id, &short_timeouts(), &mut out)
+    let running = start_with(&env, d, &env.id, &short_timeouts(), &mut out)
         .unwrap_or_else(|_| panic!("started: {}", String::from_utf8_lossy(&out)));
     assert_eq!(
         calls_of(&calls),
@@ -348,7 +362,7 @@ fn repair3_start_stops_before_side_effects_when_launcher_unavailable() {
     let (mut d, _l) = deps(&calls, FakeLauncher::new(&calls));
     d.unavailable = true;
     let mut out = Vec::new();
-    let code = start_with(&env, &mut d, &env.id, &short_timeouts(), &mut out)
+    let code = start_with(&env, d, &env.id, &short_timeouts(), &mut out)
         .err()
         .expect("must fail");
     assert_eq!(calls_of(&calls), ["check"]);
@@ -383,7 +397,7 @@ fn core3_start_failure_in_prepare_cgroup_does_not_launch() {
     let (mut d, l) = deps(&calls, FakeLauncher::new(&calls));
     d.fail_at = Some("prepare");
     let mut out = Vec::new();
-    assert!(start_with(&env, &mut d, &env.id, &short_timeouts(), &mut out).is_err());
+    assert!(start_with(&env, d, &env.id, &short_timeouts(), &mut out).is_err());
     assert_eq!(calls_of(&calls), ["check", "prepare", "release"]);
     assert_eq!(l.launches(), 0);
     assert_eq!(
@@ -404,9 +418,9 @@ fn core2_launch_failure_releases_cgroup_and_reverts() {
     let calls = new_calls();
     let mut fl = FakeLauncher::new(&calls);
     fl.launch_error = Some(ErrorCode::Internal);
-    let (mut d, l) = deps(&calls, fl);
+    let (d, l) = deps(&calls, fl);
     let mut out = Vec::new();
-    assert!(start_with(&env, &mut d, &env.id, &short_timeouts(), &mut out).is_err());
+    assert!(start_with(&env, d, &env.id, &short_timeouts(), &mut out).is_err());
     assert_eq!(
         calls_of(&calls),
         ["check", "prepare", "audit", "build", "launch", "release"]
@@ -429,9 +443,9 @@ fn repair5_launch_timeout_terminates_late_process_and_recovers() {
     let calls = new_calls();
     let mut fl = FakeLauncher::new(&calls);
     fl.delay = Duration::from_millis(2500);
-    let (mut d, l) = deps(&calls, fl);
+    let (d, l) = deps(&calls, fl);
     let mut out = Vec::new();
-    assert!(start_with(&env, &mut d, &env.id, &short_timeouts(), &mut out).is_err());
+    assert!(start_with(&env, d, &env.id, &short_timeouts(), &mut out).is_err());
     assert_eq!(l.terminated.load(Ordering::SeqCst), 1);
     assert!(l.confirms.load(Ordering::SeqCst) >= 1);
     assert_eq!(
@@ -445,28 +459,65 @@ fn repair5_launch_timeout_terminates_late_process_and_recovers() {
     }
 }
 
-/// REPAIR-5: 生存プロセスが無いと確認できなければ予約を残し、cgroup も消さずに INTERNAL を報告する。
+/// REPAIR-5: launch の Timeout はそのまま報告し、報告の後の後始末で生存プロセスが無いと確認できなければ予約を残し、
+/// cgroup も消さずに INTERNAL の終了コードで終わる（報告は後始末を待たない）。
 #[test]
-fn repair5_launch_timeout_without_confirmation_reports_internal() {
+fn repair5_launch_timeout_without_confirmation_exits_internal() {
     let env = Env::new("noconfirm");
     env.create(&env.id);
     let calls = new_calls();
     let mut fl = FakeLauncher::new(&calls);
     fl.delay = Duration::from_millis(2500);
     fl.confirm_ok = false;
-    let (mut d, _l) = deps(&calls, fl);
-    let mut out = Vec::new();
+    let (d, _l) = deps(&calls, fl);
+    let mut out = TimedWriter::default();
     let started = std::time::Instant::now();
-    assert!(start_with(&env, &mut d, &env.id, &short_timeouts(), &mut out).is_err());
-    // 回復の再試行を含めても、報告は契約の内部上限内に届く（REPAIR-5）。
-    assert!(started.elapsed() <= result_deadline(&short_timeouts()));
+    let code = start_with(&env, d, &env.id, &short_timeouts(), &mut out)
+        .err()
+        .expect("start must fail");
+    assert_eq!(code, exit_code_for(ErrorCode::Internal));
+    // 報告は契約の内部上限内に届く（REPAIR-5）。
+    assert!(out.reported_at().unwrap() - started <= result_deadline(&short_timeouts()));
     let rec = env.record(&env.id);
     assert_eq!(rec.status().state(), ContainerState::Running);
     assert!(rec.status().pid().is_none());
     assert!(!calls_of(&calls).contains(&"release"));
-    match report_of(&out) {
-        StartReport::Failed { code, .. } => assert_eq!(code, ErrorCode::Internal),
+    match report_of(&out.bytes()) {
+        StartReport::Failed { code, .. } => assert_eq!(code, ErrorCode::Timeout),
         other => panic!("unexpected report: {other:?}"),
+    }
+}
+
+/// 書いた内容と、最初に書いた時刻を記録する書き手（報告が後始末より前に出たかの照合用）。
+#[derive(Default)]
+struct TimedWriter {
+    buf: Vec<u8>,
+    at: Option<std::time::Instant>,
+    signal: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl TimedWriter {
+    fn reported_at(&self) -> Option<std::time::Instant> {
+        self.at
+    }
+    fn bytes(&self) -> Vec<u8> {
+        self.buf.clone()
+    }
+}
+
+impl Write for TimedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.at.is_none() {
+            self.at = Some(std::time::Instant::now());
+        }
+        self.buf.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(tx) = self.signal.take() {
+            let _ = tx.send(());
+        }
+        Ok(())
     }
 }
 
@@ -485,9 +536,8 @@ fn sup1_report_write_failure_keeps_monitoring() {
     let env = Env::new("broken");
     env.create(&env.id);
     let calls = new_calls();
-    let (mut d, _l) = deps(&calls, FakeLauncher::new(&calls));
-    let running =
-        start_with(&env, &mut d, &env.id, &short_timeouts(), &mut Broken).expect("started");
+    let (d, _l) = deps(&calls, FakeLauncher::new(&calls));
+    let running = start_with(&env, d, &env.id, &short_timeouts(), &mut Broken).expect("started");
     assert_eq!(running.process.pid().get(), 4242);
     assert_eq!(
         env.record(&env.id).status().state(),
@@ -505,9 +555,9 @@ fn sup1_recorded_scope_rejects_restart() {
         .with_cgroup_scope(CgroupScope::new("/sys/fs/cgroup/user/fandhe").unwrap());
     env.store.update(&req).unwrap();
     let calls = new_calls();
-    let (mut d, _l) = deps(&calls, FakeLauncher::new(&calls));
+    let (d, _l) = deps(&calls, FakeLauncher::new(&calls));
     let mut out = Vec::new();
-    assert!(start_with(&env, &mut d, &env.id, &short_timeouts(), &mut out).is_err());
+    assert!(start_with(&env, d, &env.id, &short_timeouts(), &mut out).is_err());
     assert!(calls_of(&calls).is_empty());
     match report_of(&out) {
         StartReport::Failed { code, message, .. } => {
@@ -526,9 +576,9 @@ fn sup1_recorded_scope_rejects_restart() {
 fn sup1_unknown_container_reports_not_found() {
     let env = Env::new("nf");
     let calls = new_calls();
-    let (mut d, _l) = deps(&calls, FakeLauncher::new(&calls));
+    let (d, _l) = deps(&calls, FakeLauncher::new(&calls));
     let mut out = Vec::new();
-    assert!(start_with(&env, &mut d, "nope", &short_timeouts(), &mut out).is_err());
+    assert!(start_with(&env, d, "nope", &short_timeouts(), &mut out).is_err());
     assert!(calls_of(&calls).is_empty());
     match report_of(&out) {
         StartReport::Failed { code, .. } => assert_eq!(code, ErrorCode::NotFound),
@@ -545,9 +595,9 @@ fn sup1_monitor_exit_disposes_returned_handles() {
     let calls = new_calls();
     let mut fl = FakeLauncher::new(&calls);
     fl.wait_mode = WaitMode::Error(ErrorCode::Timeout);
-    let (mut d, l) = deps(&calls, fl);
+    let (d, l) = deps(&calls, fl);
     let running =
-        start_with(&env, &mut d, &env.id, &short_timeouts(), &mut Vec::new()).expect("started");
+        start_with(&env, d, &env.id, &short_timeouts(), &mut Vec::new()).expect("started");
     let code = run_supervised(
         env.store.clone(),
         cid(&env.id),
@@ -567,9 +617,9 @@ fn sup1_monitor_exit_disposes_returned_handles() {
     let mut fl = FakeLauncher::new(&calls);
     fl.wait_mode = WaitMode::Error(ErrorCode::Timeout);
     fl.fail_terminate = true;
-    let (mut d, l) = deps(&calls, fl);
+    let (d, l) = deps(&calls, fl);
     let running =
-        start_with(&env, &mut d, &env.id, &short_timeouts(), &mut Vec::new()).expect("started");
+        start_with(&env, d, &env.id, &short_timeouts(), &mut Vec::new()).expect("started");
     let code = run_supervised(
         env.store.clone(),
         cid(&env.id),
@@ -590,9 +640,9 @@ fn sup1_supervised_exit_is_recorded_and_returns_zero() {
     let calls = new_calls();
     let mut fl = FakeLauncher::new(&calls);
     fl.wait_mode = WaitMode::ExitedOk;
-    let (mut d, l) = deps(&calls, fl);
+    let (d, l) = deps(&calls, fl);
     let running =
-        start_with(&env, &mut d, &env.id, &short_timeouts(), &mut Vec::new()).expect("started");
+        start_with(&env, d, &env.id, &short_timeouts(), &mut Vec::new()).expect("started");
     let code = run_supervised(
         env.store.clone(),
         cid(&env.id),
@@ -616,9 +666,9 @@ fn sup3_launcher_relauncher_uses_same_launcher_and_spec() {
     let env = Env::new("relaunch");
     env.create(&env.id);
     let calls = new_calls();
-    let (mut d, l) = deps(&calls, FakeLauncher::new(&calls));
+    let (d, l) = deps(&calls, FakeLauncher::new(&calls));
     let running =
-        start_with(&env, &mut d, &env.id, &short_timeouts(), &mut Vec::new()).expect("started");
+        start_with(&env, d, &env.id, &short_timeouts(), &mut Vec::new()).expect("started");
     let again = running
         .relauncher
         .relaunch(Duration::from_millis(1234))
@@ -674,7 +724,7 @@ fn core2_recreated_after_prepare_is_not_launched() {
     // 準備した世代はあるが、レコードにはスコープが無い（再作成された別世代のレコード）。
     d.prepared_instance = Some(StateRevision::from_raw(1));
     let mut out = Vec::new();
-    assert!(start_with(&env, &mut d, &env.id, &short_timeouts(), &mut out).is_err());
+    assert!(start_with(&env, d, &env.id, &short_timeouts(), &mut out).is_err());
     assert_eq!(
         calls_of(&calls),
         ["check", "prepare", "audit", "build", "release"]
@@ -693,4 +743,125 @@ fn core2_recreated_after_prepare_is_not_launched() {
         }
         other => panic!("unexpected report: {other:?}"),
     }
+}
+
+/// REPAIR-5・CORE-1・SUP-1: 起動処理が期限までに終わらなければ、期限内に INTERNAL（期限超過）を報告し、
+/// 後始末は報告の後に行う。報告の後・後始末の前に同じ ID の start を試みても、記録済みのスコープ（予約）の照合で
+/// FailedPrecondition として拒否される。起動処理が後から成功したら、起動したプロセスを terminate して Stopped を記録する。
+#[test]
+fn repair5_deadline_exceeded_reports_first_and_cleans_up_late_start() {
+    let env = Env::new("overdue");
+    env.create(&env.id);
+    let calls = new_calls();
+    let (mut d, l) = deps(&calls, FakeLauncher::new(&calls));
+    d.record_scope = true;
+    d.prepare_delay = Duration::from_millis(1500);
+    let (signal, reported) = std::sync::mpsc::channel();
+    let store = env.store.clone();
+    let id = env.id.clone();
+    let t0 = std::time::Instant::now();
+    // 報告の待ちは deadline − REPORT_RESERVE（1s）まで。起動処理は prepare で 1.5s 止まる。
+    let deadline = t0.checked_add(Duration::from_millis(1300));
+    let first = std::thread::spawn(move || {
+        let mut out = TimedWriter {
+            signal: Some(signal),
+            ..TimedWriter::default()
+        };
+        let r = run_start_until(
+            Box::new(d),
+            &store,
+            &Arc::new(OpRecorder::new()),
+            &StartRequest::new(cid(&id)),
+            &short_timeouts(),
+            deadline,
+            &mut out,
+        );
+        (r.err(), out)
+    });
+    reported
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the report must be written before cleanup");
+    // 報告の後・後始末の前の再試行は、記録済みのスコープで拒否される（同じ ID は予約中）。
+    let retry_calls = new_calls();
+    let (d2, l2) = deps(&retry_calls, FakeLauncher::new(&retry_calls));
+    let mut out2 = Vec::new();
+    assert!(start_with(&env, d2, &env.id, &short_timeouts(), &mut out2).is_err());
+    match report_of(&out2) {
+        StartReport::Failed { code, message, .. } => {
+            assert_eq!(code, ErrorCode::FailedPrecondition);
+            assert_eq!(
+                message.as_str(),
+                "cgroup scope is already recorded; delete and recreate the container"
+            );
+        }
+        other => panic!("unexpected report: {other:?}"),
+    }
+    assert!(l2.specs.lock().unwrap().is_empty());
+    let (code, out) = first.join().unwrap();
+    // 報告は期限内で、起動処理（1.5s）の完了より前。
+    let at = out.reported_at().unwrap() - t0;
+    assert!(at < Duration::from_millis(1300), "reported at {at:?}");
+    assert!(at < Duration::from_millis(1500), "reported at {at:?}");
+    match report_of(&out.bytes()) {
+        StartReport::Failed { code, message, .. } => {
+            assert_eq!(code, ErrorCode::Internal);
+            assert_eq!(message.as_str(), DEADLINE_EXCEEDED_MESSAGE);
+        }
+        other => panic!("unexpected report: {other:?}"),
+    }
+    assert_eq!(code, Some(exit_code_for(ErrorCode::Internal)));
+    // 後から成功した起動は terminate され、Stopped が記録される。
+    assert_eq!(l.specs.lock().unwrap().len(), 1);
+    assert_eq!(l.terminated.load(Ordering::SeqCst), 1);
+    let rec = env.record(&env.id);
+    assert_eq!(rec.status().state(), ContainerState::Stopped);
+    assert!(rec.supervision().supervisor_pid().is_none());
+}
+
+/// REPAIR-4: 起動の計測結果は英語のキーの 1 行 JSON で、操作ごとの成功・失敗数とレイテンシを載せる。
+#[test]
+fn repair4_start_metrics_line_has_counts_and_latency() {
+    let recorder = OpRecorder::new();
+    assert_eq!(
+        start_metrics_line(&recorder),
+        "{\"component\":\"supervisor\",\"event\":\"start_metrics\",\"ops\":[],\"dropped_records\":0}\n"
+    );
+    let name = fandhe_container_core::observability::OpName::new(START_OP).unwrap();
+    recorder
+        .record(
+            &name,
+            fandhe_container_core::observability::OpOutcome::Failure,
+            Duration::from_micros(250),
+        )
+        .unwrap();
+    assert_eq!(
+        start_metrics_line(&recorder),
+        "{\"component\":\"supervisor\",\"event\":\"start_metrics\",\"ops\":[{\"op\":\"supervisor.start\",\"success\":0,\"failure\":1,\"p95_us\":250,\"max_us\":250}],\"dropped_records\":0}\n"
+    );
+}
+
+/// REPAIR-4: run_start は起動の成否を START_OP に記録する（事前確認で止まった失敗も数える）。
+#[test]
+fn repair4_run_start_records_start_outcome() {
+    let env = Env::new("metrics");
+    env.create(&env.id);
+    let calls = new_calls();
+    let (mut d, _l) = deps(&calls, FakeLauncher::new(&calls));
+    d.unavailable = true;
+    let recorder = Arc::new(OpRecorder::new());
+    let mut out = Vec::new();
+    assert!(
+        run_start(
+            Box::new(d),
+            &env.store,
+            &recorder,
+            &StartRequest::new(cid(&env.id)),
+            &short_timeouts(),
+            &mut out,
+        )
+        .is_err()
+    );
+    let name = fandhe_container_core::observability::OpName::new(START_OP).unwrap();
+    let stats = recorder.snapshot_op(&name).expect("recorded");
+    assert_eq!((stats.success(), stats.failure()), (0, 1));
 }

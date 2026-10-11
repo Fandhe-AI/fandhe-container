@@ -7,7 +7,7 @@
 //!
 //! # 処理順（[`run_start`] と [`run_supervised`]）
 //! 0. 結果チャネルの検証（stdout が FIFO か。`run_main`）／1. argv の解析（[`crate::start_contract::StartArgs`]）／
-//!    2. スレッド数が 1 か（`oci_runtime::start` の前提。以後ログ捕捉・restart のワーカーは手順 10 以降に限る）／
+//!    2. スレッド数が 1 か（`oci_runtime::start` の前提。以後のスレッドは手順 3〜8 の作業スレッド〔入口は待つだけ〕と手順 10 以降のログ捕捉・restart のワーカーに限る）／
 //! 3. 状態の事前確認（Created・pid なし・cgroup 未記録。副作用なし）／4. [`StartDeps::check_launcher_available`]
 //!    （副作用なし。本番 launcher が無い間はここで `UNIMPLEMENTED` で止まる）／5. cgroup の連鎖
 //!    （[`StartDeps::prepare_cgroup`]）／6. 監査 sink（[`StartDeps::build_audit_sink`]。fork の前）／7. launcher の構築と
@@ -17,13 +17,19 @@
 //! 手順 3・4 は cgroup の連鎖（手順 5）より前に置く。スコープの追記は 1 回限りで取り消す API が無いため、
 //! launcher が使えない場合や状態が Created でない場合に、スコープを残さずに止める。
 //!
-//! # 報告より前の失敗の後始末（fail-closed。#1541 と同じ要求）
-//! - `Timeout` 以外: 予約を Created へ戻すことと子の terminate は core の `start` が行う。本入口は作った cgroup を
-//!   [`StartDeps::release_cgroup`] で消してから ERR を報告する。
+//! # 期限と報告の後の後始末（fail-closed。#1541 と同じ要求・REPAIR-5）
+//! 手順 3〜8 は作業スレッドで行い、入口は `result_deadline` から [`REPORT_RESERVE`] を引いた時点まで結果を待つ
+//! （手順 2 の確認の後に作るスレッドで、入口は Condvar で待つだけでロックを持たない）。報告は期限までに必ず 1 回書き、
+//! 後始末は報告の後に行う（契約は [`crate::start_contract`] の「報告の後の後始末」）。
+//! - 手順 5〜7 の失敗: 作った cgroup を [`StartDeps::release_cgroup`] で消す。
+//! - `start` が `Timeout` 以外: 予約を Created へ戻すことと子の terminate は core の `start` が行う。本入口は予約の解放と
+//!   core のワーカー完了を確かめてから cgroup を消す。
 //! - `start` が `Timeout`: 予約（Running・pid なし）が残る。本入口が終了すると core の後始末スレッドごと消えるため、
 //!   `recover_interrupted_start` を約 50ms 刻みで再試行して Created へ戻し、`take_unreaped_processes` で引き取った
-//!   ハンドルを terminate する。戻せたら cgroup を消して ERR `TIMEOUT`、戻せなければ cgroup を消さずに ERR `INTERNAL`。
-//! - 後始末自体の失敗は元のエラーを隠さず、構造化ログ（stderr）に出す。
+//!   ハンドルを terminate する。戻せたら cgroup を消し、戻せなければ cgroup を消さない。
+//! - 期限超過: `INTERNAL`（[`DEADLINE_EXCEEDED_MESSAGE`]）を報告し、作業スレッドの完了を有限の期限まで待って、
+//!   後から成功していれば起動したプロセスを terminate して `Stopped` を記録する。
+//! - 後始末を確かめられなければ終了コードは `INTERNAL`。後始末自体の失敗は元のエラーを隠さず、構造化ログ（stderr）に出す。
 //! - 失敗した start の後もスコープは記録されたまま残る（core に記録済みの配置から連鎖を再開する API が無い）。
 //!   同じコンテナの再 start は手順 3 で `FailedPrecondition` になる。
 //!
@@ -39,13 +45,12 @@ use std::num::{NonZeroU8, NonZeroU32};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use fandhe_container_core::observability::OpRecorder;
+use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
 use fandhe_container_core::oci_runtime::{
     LAUNCHER_REPLY_GRACE, LaunchSpec, LaunchedProcess, LifecycleOp, OciRuntimeError,
     ProcessLauncher, StartTimeouts, exit_code_for, recover_interrupted_start, start,
     take_unreaped_processes,
 };
-use fandhe_container_core::state_store::STATE_LOCK_TIMEOUT;
 use fandhe_container_core::traits::{
     ContainerId, ContainerState, ContainerStatus, ErrorCode, GetStateRequest, StartRequest,
     StateRecord, StateRevision, StateStore, SupervisionState, TraitError, UpdateStateRequest,
@@ -300,21 +305,10 @@ fn terminate_bounded(
 /// [`terminate_bounded`] を、`Err` で戻ったハンドルについて 1 回だけ再試行する。回収できたらその pid。
 ///
 /// 再試行も失敗したハンドルは [`STRANDED`] に保管する（`Drop` で捨てて子を孤児化させない）。
-/// `deadline` が `Some` なら、1 回の待ちの上限（`timeout` ＋猶予）が残り時間に収まるときだけ呼ぶ。収まらなければ
-/// 呼ばずに保管して `None`（報告の期限を守る。REPAIR-5）。
-fn terminate_retrying(
-    process: Box<dyn LaunchedProcess>,
-    timeout: Duration,
-    deadline: Option<Instant>,
-) -> Option<NonZeroU32> {
-    let need = terminate_need(timeout);
+/// 1 回の待ちは `timeout`＋猶予で打ち切るため、全体も有限時間で終わる（REPAIR-5）。
+fn terminate_retrying(process: Box<dyn LaunchedProcess>, timeout: Duration) -> Option<NonZeroU32> {
     let mut process = process;
     for _ in 0..2 {
-        if !fits(deadline, need) {
-            log_event("terminate_budget_exhausted", Some(ErrorCode::Timeout));
-            keep_stranded(process);
-            return None;
-        }
         match terminate_bounded(process, timeout) {
             Ok(pid) => return Some(pid),
             Err(TerminateFailure::Pending) => return None,
@@ -323,21 +317,6 @@ fn terminate_retrying(
     }
     keep_stranded(process);
     None
-}
-
-/// terminate 1 回の待ちの最悪時間（`timeout`＋猶予。[`terminate_bounded`] が呼び出し境界で強制する上限）。
-fn terminate_need(timeout: Duration) -> Duration {
-    timeout.saturating_add(LAUNCHER_REPLY_GRACE)
-}
-
-/// `deadline` までの残りが `need` 以上あるか（`None` は期限なし）。
-fn fits(deadline: Option<Instant>, need: Duration) -> bool {
-    fits_at(deadline, need, Instant::now())
-}
-
-/// [`fits`] の時刻を注入できる版（見積もりの試験用）。
-fn fits_at(deadline: Option<Instant>, need: Duration, now: Instant) -> bool {
-    deadline.is_none_or(|d| now.checked_add(need).is_some_and(|t| t <= d))
 }
 
 fn op_err(e: TraitError) -> OciRuntimeError {
@@ -357,17 +336,32 @@ fn release_logged(deps: &mut dyn StartDeps) {
     }
 }
 
-/// 手順 3〜9（報告まで）。成功なら `Running`、失敗なら報告済みの終了コード。
+/// 期限までに起動の結果が出なかったときの報告の message。
+pub const DEADLINE_EXCEEDED_MESSAGE: &str = "start did not finish within the result deadline; the container stays reserved until cleanup ends";
+
+/// 期限超過の報告を書くために、結果待ちを `result_deadline` より手前で打ち切る幅（報告の書き込みに残す時間）。
+pub const REPORT_RESERVE: Duration = Duration::from_secs(1);
+
+/// 起動の計測に使う操作名（`OpRecorder`。REPAIR-4）。
+pub const START_OP: &str = "supervisor.start";
+
+/// 手順 3〜9（報告まで）と、報告の後の後始末。成功なら `Running`、失敗なら終了コード。
 ///
-/// 報告（`out` への 1 行）は成功・失敗とも本関数が書く。報告の書き込みに失敗しても（EPIPE 等）監視は続けるため
-/// 成功は `Ok(Running)` を返し、ログに `report_failed` を出す。
+/// 起動処理（手順 3〜8）は作業スレッドで行い、本関数は `deadline` から [`REPORT_RESERVE`] を引いた時点まで結果を
+/// 待つ。報告（`out` への 1 行）は期限までに必ず 1 回書き、失敗後の後始末（予約・cgroup の解放・terminate・
+/// `Stopped` の記録）は報告の後に行う（REPAIR-5。core の API を変えずに起動処理全体へ期限を課す）。
+/// - 期限内に成功: `OK <pid>` を報告して `Ok(Running)`（報告の書き込みに失敗しても監視は続ける）。
+/// - 期限内に失敗: そのエラーを報告してから後始末する。後始末を確かめられなければ終了コードは `Internal`。
+/// - 期限超過: `INTERNAL`（[`DEADLINE_EXCEEDED_MESSAGE`]）を報告し、作業スレッドの完了を `result_deadline` の長さ
+///   まで待つ。後から成功していれば起動したプロセスを terminate して `Stopped` を記録し、失敗していれば同じ後始末を
+///   する。終了コードは `Internal`。それでも戻らなければ待つのをやめる（プロセスの終了で作業スレッドも終わる）。
 ///
-/// 失敗後の回復・回収は、本関数の開始から [`crate::start_contract::result_deadline`] までの残り時間の範囲でだけ
-/// 行う。足りなければ確かめられなかった扱い（`Internal`）で報告し、報告の期限を守る（REPAIR-5）。
+/// 起動の成否とレイテンシは `recorder` の [`START_OP`] に記録し、本関数の最後に構造化ログ 1 行
+/// （[`start_metrics_line`]）で出す。
 pub fn run_start(
-    deps: &mut dyn StartDeps,
+    deps: Box<dyn StartDeps + Send>,
     store: &Arc<dyn StateStore>,
-    recorder: &OpRecorder,
+    recorder: &Arc<OpRecorder>,
     req: &StartRequest,
     timeouts: &StartTimeouts,
     out: &mut dyn Write,
@@ -378,79 +372,340 @@ pub fn run_start(
 
 /// [`run_start`] の全体の期限を呼び出し側が渡す版（bin の入口は同じ期限で報告の書き込みも切り詰める）。
 pub fn run_start_until(
-    deps: &mut dyn StartDeps,
+    deps: Box<dyn StartDeps + Send>,
     store: &Arc<dyn StateStore>,
-    recorder: &OpRecorder,
+    recorder: &Arc<OpRecorder>,
     req: &StartRequest,
     timeouts: &StartTimeouts,
     deadline: Option<Instant>,
     out: &mut dyn Write,
 ) -> Result<Running, NonZeroU8> {
-    match start_sequence(deps, store, recorder, req, timeouts, deadline) {
-        Ok(running) => {
-            let report = StartReport::Started {
-                pid: running.process.pid(),
-            };
-            if write_report(out, &report).is_err() {
-                log_event("report_failed", None);
-            }
-            Ok(running)
+    let result = start_reporting(deps, store, recorder, req, timeouts, deadline, out);
+    // 満杯・書き込み失敗でも処理は止めない（ログの欠落は許す）。
+    let _ = crate::stderr_sink::stderr().emit(start_metrics_line(recorder).into_bytes());
+    result
+}
+
+/// [`run_start_until`] の本体（計測ログの出力を除く）。
+fn start_reporting(
+    deps: Box<dyn StartDeps + Send>,
+    store: &Arc<dyn StateStore>,
+    recorder: &Arc<OpRecorder>,
+    req: &StartRequest,
+    timeouts: &StartTimeouts,
+    deadline: Option<Instant>,
+    out: &mut dyn Write,
+) -> Result<Running, NonZeroU8> {
+    let worker = match StartWorker::spawn(deps, store, recorder, req, *timeouts) {
+        Ok(w) => w,
+        Err(e) => {
+            let err = op_err(e);
+            report(out, &StartReport::failed(&err));
+            return Err(err.exit_code());
         }
-        Err(err) => {
-            if write_report(out, &StartReport::failed(&err)).is_err() {
-                log_event("report_failed", None);
+    };
+    let wait_until = deadline.map(|d| d.checked_sub(REPORT_RESERVE).unwrap_or(d));
+    if let Some((deps, attempt)) = worker.wait_until(wait_until) {
+        return match attempt {
+            Attempt::Started(running) => {
+                report(
+                    out,
+                    &StartReport::Started {
+                        pid: running.process.pid(),
+                    },
+                );
+                Ok(running)
             }
-            Err(err.exit_code())
+            Attempt::Failed { error, cleanup } => {
+                report(out, &StartReport::failed(&error));
+                if cleanup_after_report(deps, store.as_ref(), req.id(), timeouts, cleanup) {
+                    Err(error.exit_code())
+                } else {
+                    Err(exit_code_for(ErrorCode::Internal))
+                }
+            }
+        };
+    }
+    // 期限超過: 先に報告し、作業スレッドの結果を有限の期限まで待ってから後始末する。
+    let overdue = OciRuntimeError::new(
+        LifecycleOp::Start,
+        ErrorCode::Internal,
+        DEADLINE_EXCEEDED_MESSAGE,
+    );
+    log_event("start_deadline_exceeded", Some(ErrorCode::Timeout));
+    report(out, &StartReport::failed(&overdue));
+    let late_until = Instant::now().checked_add(crate::start_contract::result_deadline(timeouts));
+    match worker.wait_until(late_until) {
+        Some((_deps, Attempt::Started(running))) => {
+            // 報告済みは INTERNAL のため、起動したものを残さない（CORE-1・SUP-1）。
+            let Running {
+                process, instance, ..
+            } = running;
+            match terminate_retrying(process, timeouts.terminate()) {
+                Some(pid) => {
+                    log_event("late_start_terminated", None);
+                    mark_stopped(store, req.id(), instance, &[pid]);
+                }
+                None => log_event("late_start_terminate_failed", None),
+            }
+        }
+        Some((deps, Attempt::Failed { cleanup, .. })) => {
+            let _ = cleanup_after_report(deps, store.as_ref(), req.id(), timeouts, cleanup);
+        }
+        None => {
+            // 作業スレッドがまだ戻らない。以後に戻った結果は作業スレッドが後始末する（プロセスの終了まで）。
+            worker.abandon();
+            log_event("start_worker_abandoned", Some(ErrorCode::Timeout));
+        }
+    }
+    Err(exit_code_for(ErrorCode::Internal))
+}
+
+/// 報告 1 行を書く（失敗はログに出すだけで、監視・後始末は続ける）。
+fn report(out: &mut dyn Write, report: &StartReport) {
+    if write_report(out, report).is_err() {
+        log_event("report_failed", None);
+    }
+}
+
+/// 起動の計測結果の構造化ログ 1 行（JSON。キーは英語・値は検証済みの操作名と数値のみ。REPAIR-4）。
+///
+/// `{"component":"supervisor","event":"start_metrics","ops":[{"op":"supervisor.start","success":1,"failure":0,
+/// "p95_us":120,"max_us":150}],"dropped_records":0}` の形（標本が無ければ `p95_us`・`max_us` は `null`）。
+pub fn start_metrics_line(recorder: &OpRecorder) -> String {
+    let ops: Vec<String> = recorder
+        .snapshot()
+        .iter()
+        .map(|op| {
+            let (p95, max) = op
+                .latency()
+                .map_or(("null".to_owned(), "null".to_owned()), |l| {
+                    (
+                        l.p95().as_micros().to_string(),
+                        l.max().as_micros().to_string(),
+                    )
+                });
+            format!(
+                "{{\"op\":\"{}\",\"success\":{},\"failure\":{},\"p95_us\":{p95},\"max_us\":{max}}}",
+                op.name().as_str(),
+                op.success(),
+                op.failure()
+            )
+        })
+        .collect();
+    format!(
+        "{{\"component\":\"supervisor\",\"event\":\"start_metrics\",\"ops\":[{}],\"dropped_records\":{}}}\n",
+        ops.join(","),
+        recorder.dropped_records()
+    )
+}
+
+/// 作業スレッドで行った起動の結果（報告の材料と、報告の後の後始末に要るもの）。
+enum Attempt {
+    Started(Running),
+    Failed {
+        error: OciRuntimeError,
+        cleanup: Cleanup,
+    },
+}
+
+/// 報告の後に行う後始末の種類。
+enum Cleanup {
+    /// cgroup の準備より前の失敗（後始末なし）。
+    Nothing,
+    /// cgroup の準備・監査 sink・launcher の構築の失敗（作った cgroup を消す）。
+    ReleaseCgroup,
+    /// `start` が `Timeout`（予約を Created へ戻し、未回収のハンドルを terminate してから cgroup を消す）。
+    AfterTimeout(Arc<dyn ProcessLauncher>),
+    /// `start` が Timeout 以外で失敗（予約の解放と core のワーカー完了を確かめてから cgroup を消す）。
+    AfterFailure(Arc<dyn ProcessLauncher>, Vec<Box<dyn LaunchedProcess>>),
+}
+
+/// 起動の作業スレッドと入口の間の受け渡し状態（同じ Mutex で守る）。
+enum WorkerSlot {
+    Pending,
+    Done(Box<dyn StartDeps + Send>, Attempt),
+    /// 入口が結果を取り出した、または待つのをやめた（以後の結果は作業スレッドが後始末する）。
+    Abandoned,
+}
+
+/// 起動処理（手順 3〜8）を行う作業スレッド。
+struct StartWorker {
+    shared: Arc<(Mutex<WorkerSlot>, Condvar)>,
+}
+
+impl StartWorker {
+    fn spawn(
+        deps: Box<dyn StartDeps + Send>,
+        store: &Arc<dyn StateStore>,
+        recorder: &Arc<OpRecorder>,
+        req: &StartRequest,
+        timeouts: StartTimeouts,
+    ) -> Result<Self, TraitError> {
+        let shared = Arc::new((Mutex::new(WorkerSlot::Pending), Condvar::new()));
+        let worker_shared = Arc::clone(&shared);
+        let (store, recorder, req) = (Arc::clone(store), Arc::clone(recorder), req.clone());
+        // 起動は作業スレッドが行い、入口は Condvar で待つだけでロックを持たない（core の launch も別スレッドで行われる）。
+        std::thread::Builder::new()
+            .name("supervisor-start".into())
+            .spawn(move || {
+                let mut deps = deps;
+                let started = Instant::now();
+                let attempt = attempt_start(deps.as_mut(), &store, &recorder, &req, &timeouts);
+                let outcome = if matches!(attempt, Attempt::Started(_)) {
+                    OpOutcome::Success
+                } else {
+                    OpOutcome::Failure
+                };
+                if let Ok(name) = OpName::new(START_OP) {
+                    let _ = recorder.record(&name, outcome, started.elapsed());
+                }
+                let (lock, cvar) = &*worker_shared;
+                let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
+                if matches!(*slot, WorkerSlot::Abandoned) {
+                    drop(slot);
+                    abandoned_cleanup(deps, store.as_ref(), req.id(), &timeouts, attempt);
+                    return;
+                }
+                *slot = WorkerSlot::Done(deps, attempt);
+                cvar.notify_all();
+            })
+            .map_err(|_| {
+                TraitError::new(ErrorCode::Internal, "failed to spawn the start worker")
+            })?;
+        Ok(Self { shared })
+    }
+
+    /// `until` まで結果を待ち、出ていれば取り出す（`None` は無期限）。
+    fn wait_until(&self, until: Option<Instant>) -> Option<(Box<dyn StartDeps + Send>, Attempt)> {
+        let (lock, cvar) = &*self.shared;
+        let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if matches!(*slot, WorkerSlot::Done(..)) {
+                // 取り出した後は Abandoned にして二重に取り出さない。
+                return match std::mem::replace(&mut *slot, WorkerSlot::Abandoned) {
+                    WorkerSlot::Done(deps, attempt) => Some((deps, attempt)),
+                    _ => None,
+                };
+            }
+            let wait = match until {
+                Some(u) => match u.checked_duration_since(Instant::now()) {
+                    Some(r) if !r.is_zero() => r,
+                    _ => return None,
+                },
+                None => Duration::from_secs(3600),
+            };
+            slot = cvar
+                .wait_timeout(slot, wait)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    /// 結果を待つのをやめる（同じロックの下で記す。以後に戻った結果は作業スレッドが後始末する）。
+    fn abandon(&self) {
+        let (lock, _) = &*self.shared;
+        *lock.lock().unwrap_or_else(PoisonError::into_inner) = WorkerSlot::Abandoned;
+    }
+}
+
+/// 入口が待つのをやめた後に作業スレッドが戻ったときの後始末（best effort。プロセスの終了までに終われば行う）。
+fn abandoned_cleanup(
+    deps: Box<dyn StartDeps + Send>,
+    store: &dyn StateStore,
+    id: &ContainerId,
+    timeouts: &StartTimeouts,
+    attempt: Attempt,
+) {
+    match attempt {
+        Attempt::Started(running) => {
+            let _ = terminate_retrying(running.process, timeouts.terminate());
+        }
+        Attempt::Failed { cleanup, .. } => {
+            let _ = cleanup_after_report(deps, store, id, timeouts, cleanup);
         }
     }
 }
 
-fn start_sequence(
+/// 報告の後の後始末。確かめられたら `true`（確かめられなければ cgroup は消さない。CORE-1・CORE-2）。
+fn cleanup_after_report(
+    mut deps: Box<dyn StartDeps + Send>,
+    store: &dyn StateStore,
+    id: &ContainerId,
+    timeouts: &StartTimeouts,
+    cleanup: Cleanup,
+) -> bool {
+    let confirmed = match cleanup {
+        Cleanup::Nothing => return true,
+        Cleanup::ReleaseCgroup => true,
+        Cleanup::AfterTimeout(launcher) => {
+            recover_after_timeout(store, &launcher, id, timeouts, Vec::new())
+        }
+        Cleanup::AfterFailure(launcher, pending) => {
+            settle_failed_start(store, &launcher, id, timeouts, pending)
+        }
+    };
+    if confirmed {
+        release_logged(deps.as_mut());
+    } else {
+        // 予約か子が残り得る。cgroup は消さない（子が入っている可能性がある）。
+        log_event("start_cleanup_unconfirmed", Some(ErrorCode::Internal));
+    }
+    confirmed
+}
+
+/// 手順 3〜8（作業スレッドで実行）。後始末は行わず、要る後始末の種類を返す。
+fn attempt_start(
     deps: &mut dyn StartDeps,
     store_arc: &Arc<dyn StateStore>,
     recorder: &OpRecorder,
     req: &StartRequest,
     timeouts: &StartTimeouts,
-    deadline: Option<Instant>,
-) -> Result<Running, OciRuntimeError> {
+) -> Attempt {
+    let fail = |e: TraitError, cleanup: Cleanup| Attempt::Failed {
+        error: op_err(e),
+        cleanup,
+    };
     let store: &dyn StateStore = store_arc.as_ref();
     // 3: 副作用なしの事前確認。
-    let observed = store
-        .get(&GetStateRequest::new(req.id().clone()))
-        .map_err(op_err)?;
+    let observed = match store.get(&GetStateRequest::new(req.id().clone())) {
+        Ok(r) => r,
+        Err(e) => return fail(e, Cleanup::Nothing),
+    };
     let status = observed.status();
     if status.state() != ContainerState::Created || status.pid().is_some() {
-        return Err(op_err(TraitError::new(
-            ErrorCode::FailedPrecondition,
-            "container is not in created state",
-        )));
+        return fail(
+            TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "container is not in created state",
+            ),
+            Cleanup::Nothing,
+        );
     }
     if observed.cgroup().is_some() {
-        return Err(op_err(TraitError::new(
-            ErrorCode::FailedPrecondition,
-            "cgroup scope is already recorded; delete and recreate the container",
-        )));
+        return fail(
+            TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "cgroup scope is already recorded; delete and recreate the container",
+            ),
+            Cleanup::Nothing,
+        );
     }
     // 4: 副作用なしで launcher の可用性を確かめる。
-    deps.check_launcher_available().map_err(op_err)?;
-    // 5〜7: ここから先の失敗は、作った cgroup を消してから返す。
+    if let Err(e) = deps.check_launcher_available() {
+        return fail(e, Cleanup::Nothing);
+    }
+    // 5〜7: ここから先の失敗は、作った cgroup を報告の後に消す。
     let prepared = match deps.prepare_cgroup(store, &observed) {
         Ok(instance) => instance,
-        Err(e) => {
-            release_logged(deps);
-            return Err(op_err(e));
-        }
+        Err(e) => return fail(e, Cleanup::ReleaseCgroup),
     };
     if let Err(e) = deps.build_audit_sink() {
-        release_logged(deps);
-        return Err(op_err(e));
+        return fail(e, Cleanup::ReleaseCgroup);
     }
     let inner = match deps.build_launcher() {
         Ok(l) => l,
-        Err(e) => {
-            release_logged(deps);
-            return Err(op_err(e));
-        }
+        Err(e) => return fail(e, Cleanup::ReleaseCgroup),
     };
     let checked: Arc<dyn ProcessLauncher> = Arc::new(InstanceCheckedLauncher {
         inner: Arc::clone(&inner),
@@ -469,53 +724,25 @@ fn start_sequence(
                 Some(spec) => Arc::new(LauncherRelauncher::new(inner, spec)),
                 None => Arc::new(NoSpecRelauncher),
             };
-            Ok(Running {
+            Attempt::Started(Running {
                 process,
                 relauncher,
                 instance,
             })
         }
-        Err(e) if e.code() == ErrorCode::Timeout => {
-            if recover_after_timeout(store, &launcher, req.id(), timeouts, Vec::new(), deadline) {
-                release_logged(deps);
-                Err(e)
-            } else {
-                // 予約か子が残り得る。cgroup は消さない（子が入っている可能性がある）。
-                Err(OciRuntimeError::new(
-                    LifecycleOp::Start,
-                    ErrorCode::Internal,
-                    "start timed out and cleanup could not be confirmed; a reservation or child process may remain",
-                ))
-            }
-        }
-        Err(e) => {
-            // 記録の失敗後に terminate も失敗・超過した場合、core はハンドルを未回収レジストリに残して返す。
-            // レジストリが空でも、core の後始末スレッドがハンドルを保持中・予約が Running のまま残る場合があるため、
-            // 状態と core の予約の解放を確かめてから cgroup を消す。確かめられなければ cgroup を残す（CORE-1・CORE-2）。
-            let pending = take_unreaped_processes();
-            if settle_failed_start(store, &launcher, req.id(), timeouts, pending, deadline) {
-                release_logged(deps);
-                Err(e)
-            } else {
-                Err(OciRuntimeError::new(
-                    LifecycleOp::Start,
-                    ErrorCode::Internal,
-                    "start failed and cleanup could not be confirmed; a reservation or child process may remain",
-                ))
-            }
-        }
+        Err(e) if e.code() == ErrorCode::Timeout => Attempt::Failed {
+            error: e,
+            cleanup: Cleanup::AfterTimeout(launcher),
+        },
+        // 記録の失敗後に terminate も失敗・超過した場合、core はハンドルを未回収レジストリに残して返す。
+        // レジストリが空でも、core の後始末スレッドがハンドルを保持中・予約が Running のまま残る場合があるため、
+        // 報告の後に状態と core の予約の解放を確かめてから cgroup を消す（CORE-1・CORE-2）。
+        Err(e) => Attempt::Failed {
+            error: e,
+            cleanup: Cleanup::AfterFailure(launcher, take_unreaped_processes()),
+        },
     }
 }
-
-/// `recover_interrupted_start` 1 回の最悪時間: 状態ストアの get と update（既定のファイル実装のロック待ちが各
-/// [`STATE_LOCK_TIMEOUT`]）＋`confirm_no_process` の上限＋猶予。
-fn recover_need(timeouts: &StartTimeouts) -> Duration {
-    STATE_LOCK_TIMEOUT
-        .saturating_mul(2)
-        .saturating_add(timeouts.confirm())
-        .saturating_add(LAUNCHER_REPLY_GRACE)
-}
-
 /// launch の時点で、レコードの cgroup の instance が [`StartDeps::prepare_cgroup`] の準備した世代と一致するかを
 /// 確かめてから内側の launcher へ委ねる（CORE-2・CORE-3・SEC-1）。
 ///
@@ -559,7 +786,6 @@ fn recover_after_timeout(
     id: &ContainerId,
     timeouts: &StartTimeouts,
     extra: Vec<Box<dyn LaunchedProcess>>,
-    deadline: Option<Instant>,
 ) -> bool {
     let limit = timeouts
         .terminate()
@@ -568,10 +794,6 @@ fn recover_after_timeout(
     let started = Instant::now();
     let mut recovered = false;
     loop {
-        if !fits(deadline, recover_need(timeouts)) {
-            log_event("recover_budget_exhausted", Some(ErrorCode::Timeout));
-            break;
-        }
         match recover_interrupted_start(store, launcher, id, timeouts) {
             Ok(_) => {
                 recovered = true;
@@ -589,7 +811,7 @@ fn recover_after_timeout(
     }
     let mut all_reaped = true;
     for p in extra.into_iter().chain(take_unreaped_processes()) {
-        if terminate_retrying(p, timeouts.terminate(), deadline).is_none() {
+        if terminate_retrying(p, timeouts.terminate()).is_none() {
             all_reaped = false;
         }
     }
@@ -608,32 +830,18 @@ fn settle_failed_start(
     id: &ContainerId,
     timeouts: &StartTimeouts,
     pending: Vec<Box<dyn LaunchedProcess>>,
-    deadline: Option<Instant>,
 ) -> bool {
-    // 状態の読み取り（ロック待ちの最悪時間）も期限に含める。収まらなければ確かめられなかった扱い。
-    // 引き取った未回収ハンドルは `Drop` で捨てず保管する（`Drop` は回収しない。CORE-1・REPAIR-5）。
-    if !fits(deadline, STATE_LOCK_TIMEOUT) {
-        log_event("start_settle_budget_exhausted", Some(ErrorCode::Timeout));
-        for p in pending.into_iter().chain(take_unreaped_processes()) {
-            keep_stranded(p);
-        }
-        return false;
-    }
     let reverted = store
         .get(&GetStateRequest::new(id.clone()))
         .is_ok_and(|r| r.status().state() == ContainerState::Created && r.status().pid().is_none());
     if !reverted {
-        return recover_after_timeout(store, launcher, id, timeouts, pending, deadline);
+        return recover_after_timeout(store, launcher, id, timeouts, pending);
     }
     let limit = timeouts
         .terminate()
         .saturating_add(LAUNCHER_REPLY_GRACE.saturating_mul(2));
     let started = Instant::now();
     let idle = loop {
-        if !fits(deadline, recover_need(timeouts)) {
-            log_event("start_settle_budget_exhausted", Some(ErrorCode::Timeout));
-            break false;
-        }
         match recover_interrupted_start(store, launcher, id, timeouts) {
             // Created のため回復対象は無い。予約が解放済みで、core のワーカーも残っていない。
             Err(e)
@@ -655,7 +863,7 @@ fn settle_failed_start(
     };
     let mut all_reaped = true;
     for p in pending.into_iter().chain(take_unreaped_processes()) {
-        if terminate_retrying(p, timeouts.terminate(), deadline).is_none() {
+        if terminate_retrying(p, timeouts.terminate()).is_none() {
             all_reaped = false;
         }
     }
@@ -673,7 +881,7 @@ fn dispose(
     let mut ok = true;
     let mut reaped = Vec::new();
     if let Some(p) = process {
-        match terminate_retrying(p, timeouts.terminate(), None) {
+        match terminate_retrying(p, timeouts.terminate()) {
             Some(pid) => {
                 log_event("handle_terminated", None);
                 reaped.push(pid);
@@ -690,7 +898,7 @@ fn dispose(
         // 照合つきの Stopped 記録の対象に含める（SUP-1・CORE-2）。
         reaped.extend(late.take_reaped());
         for (p, _reason) in late.take() {
-            match terminate_retrying(p, timeouts.terminate(), None) {
+            match terminate_retrying(p, timeouts.terminate()) {
                 Some(pid) => {
                     log_event("handle_terminated", None);
                     reaped.push(pid);
@@ -1079,15 +1287,15 @@ mod linux {
             Err(e) => return fail(&mut out, op_err(e)),
         };
         let req = StartRequest::new(args.id.clone());
-        let mut deps = ProductionStartDeps::new(args.root);
+        let deps = Box::new(ProductionStartDeps::new(args.root));
         // 回復・回収と報告の書き込みで同じ期限を共有し、報告を内部上限内に収める（REPAIR-5）。
         let deadline =
             Instant::now().checked_add(crate::start_contract::result_deadline(&timeouts));
         out.limit_until(deadline);
         let running = match run_start_until(
-            &mut deps,
+            deps,
             &store,
-            &OpRecorder::new(),
+            &Arc::new(OpRecorder::new()),
             &req,
             &timeouts,
             deadline,
@@ -1114,82 +1322,6 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::start_contract::result_deadline;
-
-    /// 回収されずに捨てられたかを数える起動ハンドル。
-    struct DropCounted(Arc<std::sync::atomic::AtomicU32>);
-
-    impl LaunchedProcess for DropCounted {
-        fn pid(&self) -> NonZeroU32 {
-            NonZeroU32::MIN
-        }
-        fn wait(
-            &self,
-            _: Duration,
-        ) -> Result<Option<fandhe_container_core::oci_runtime::ProcessExit>, TraitError> {
-            Ok(None)
-        }
-        fn terminate(&self, _: Duration) -> Result<(), TraitError> {
-            Ok(())
-        }
-    }
-
-    impl Drop for DropCounted {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    struct NoLauncher;
-
-    impl ProcessLauncher for NoLauncher {
-        fn launch(
-            &self,
-            _: &LaunchSpec,
-            _: Duration,
-        ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
-            Err(TraitError::new(ErrorCode::Unimplemented, "no launcher"))
-        }
-    }
-
-    /// CORE-1・REPAIR-5: 状態の読み取りが期限に収まらず回復を諦めるときも、引き取った未回収ハンドルを捨てず保管する。
-    #[test]
-    fn core1_settle_budget_miss_keeps_pending_handles() {
-        let root = std::env::temp_dir().join(format!("fcsup-settle-budget-{}", std::process::id()));
-        let store = crate::state::open_default_store(Some(root.clone())).expect("store");
-        let launcher: Arc<dyn ProcessLauncher> = Arc::new(NoLauncher);
-        let dropped = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let expired = Instant::now().checked_sub(Duration::from_secs(1));
-        let before = STRANDED
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .len();
-        let settled = settle_failed_start(
-            store.as_ref(),
-            &launcher,
-            &ContainerId::new("c1").unwrap(),
-            &StartTimeouts::default(),
-            vec![Box::new(DropCounted(Arc::clone(&dropped)))],
-            expired,
-        );
-        assert!(!settled);
-        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 0);
-        let after = STRANDED
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .len();
-        assert!(after > before, "before = {before}, after = {after}");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// REPAIR-5: 既定値の見積もり（回復 1 回 = get / update のロック待ち 2 × 5s ＋ confirm 10s ＋ 猶予 1s）。
-    #[test]
-    fn repair5_recover_need_includes_store_lock_waits() {
-        let t = StartTimeouts::default();
-        assert_eq!(recover_need(&t), Duration::from_secs(21));
-        assert_eq!(terminate_need(t.terminate()), Duration::from_secs(6));
-        assert_eq!(result_deadline(&t), Duration::from_secs(33));
-    }
 
     /// REPAIR-5: 報告の書き込み上限は `min(5s, 残り)`。期限を過ぎていれば 0、期限が無ければ 5s。
     #[test]
@@ -1209,40 +1341,5 @@ mod tests {
             write_limit(base, Some(now), now + Duration::from_secs(1)),
             Duration::ZERO
         );
-    }
-
-    /// REPAIR-5: 失敗した start の後に、回復と terminate をそれぞれ最悪時間で使い切っても（収まるときだけ行い）、
-    /// 続く報告の書き込みを含めた合計は内部上限（`result_deadline`）を超えない。開始時刻を 0〜上限＋2s で振る。
-    #[test]
-    fn repair5_worst_case_recovery_and_report_stay_within_result_deadline() {
-        let t = StartTimeouts::default();
-        let t0 = Instant::now();
-        let deadline = t0.checked_add(result_deadline(&t));
-        let end_of_budget = deadline.unwrap();
-        let base = Duration::from_secs(5);
-        let step = Duration::from_millis(250);
-        let mut elapsed = Duration::ZERO;
-        while elapsed <= result_deadline(&t) + Duration::from_secs(2) {
-            let mut now = t0 + elapsed;
-            // 回復の再試行（毎回最悪時間を使う）→ 未回収ハンドル 3 件の terminate（初回＋再試行）→ 報告。
-            while fits_at(deadline, recover_need(&t), now) {
-                now += recover_need(&t);
-            }
-            for _ in 0..6 {
-                if fits_at(deadline, terminate_need(t.terminate()), now) {
-                    now += terminate_need(t.terminate());
-                }
-            }
-            let limit = write_limit(base, deadline, now);
-            assert!(limit <= base);
-            if now <= end_of_budget {
-                assert!(now + limit <= end_of_budget, "elapsed = {elapsed:?}");
-            } else {
-                // 開始時点で既に期限を過ぎていた（回復・回収は行っていない）。
-                assert_eq!(now, t0 + elapsed);
-                assert_eq!(limit, Duration::ZERO);
-            }
-            elapsed += step;
-        }
     }
 }

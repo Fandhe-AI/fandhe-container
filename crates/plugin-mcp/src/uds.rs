@@ -11,13 +11,16 @@
 //! TASK-114 で確定する。確定したら本モジュールのフレーミングを差し替える。
 //!
 //! 期限（REPAIR-5）: アイドル待ち（次のメッセージの先頭バイトまで）は EOF まで無期限（stdio と同じ）。
-//! 実装は `UdsStream::set_io_timeout` を周期（[`IDLE_POLL`]）に使うポーリングで、周期ごとの
-//! `WouldBlock` / `TimedOut` は無視して再試行する。先頭バイトを受けてからは `Limits::message_timeout`、
-//! 応答の書き込み・flush は `Limits::write_timeout` の合計期限で打ち切る。単一スレッドで動くため
-//! `UdsStream`（`try_clone` を持たない）をそのまま使える。
+//! 実装は `UdsStream::read_within` / `write_within`（1 回の I/O を指定時間だけ待つ。期限の掛け方は
+//! `fandhe-container-plugin` のフレーム I/O と同じ共有経路）を周期（[`IDLE_POLL`]）で呼ぶポーリングで、
+//! 周期ごとの `WouldBlock` / `TimedOut` は無視して再試行する。先頭バイトを受けてからは
+//! `Limits::message_timeout`、応答の書き込みは `Limits::write_timeout` の合計期限で打ち切る。
+//! macOS で相手切断後に socket の期限設定が EINVAL になる場合も、境界基盤が non-blocking で 1 回だけ
+//! 読んで残りデータか EOF を返すため、正常切断は `Ok(())` で終わる（無期限には待たない）。
+//! 単一スレッドで動くため `UdsStream`（`try_clone` を持たない）をそのまま使える。
 
 use std::cell::Cell;
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Read};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -32,17 +35,23 @@ use crate::server::{
 /// アイドル待ちのポーリング周期。切断・期限の検知がこの粒度になる。
 pub const IDLE_POLL: Duration = Duration::from_secs(1);
 
-/// 読み書きの期限を周期設定できる接続。`UdsStream` と単体試験のフェイクが実装する。
-pub trait PollStream: Read + Write {
-    /// 1 回の read / write が待つ最大時間を設定する。
-    fn set_poll_timeout(&self, timeout: Duration) -> io::Result<()>;
+/// 1 回の read / write を指定時間だけ待って行える接続。`UdsStream` と単体試験のフェイクが実装する。
+///
+/// 契約: 待機は `timeout` 以内に戻る。時間切れは `WouldBlock` / `TimedOut`（呼び出し側が再試行する）、
+/// EOF は `Ok(0)`。期限を掛けられない場合は再試行対象でない kind で失敗させる（REPAIR-5）。
+pub trait PollStream {
+    /// 最大 `timeout` 待って 1 回 read する。
+    fn read_within(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize>;
+    /// 最大 `timeout` 待って 1 回 write する。
+    fn write_within(&mut self, buf: &[u8], timeout: Duration) -> io::Result<usize>;
 }
 
 impl PollStream for UdsStream {
-    fn set_poll_timeout(&self, timeout: Duration) -> io::Result<()> {
-        // PluginError の文言は環境依存でありうるため、固定の io エラーへ写す。
-        self.set_io_timeout(timeout)
-            .map_err(|_| io::Error::other("failed to set socket timeout"))
+    fn read_within(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
+        UdsStream::read_within(self, buf, timeout)
+    }
+    fn write_within(&mut self, buf: &[u8], timeout: Duration) -> io::Result<usize> {
+        UdsStream::write_within(self, buf, timeout)
     }
 }
 
@@ -93,17 +102,17 @@ impl<S: PollStream> Read for PollReader<S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             let deadline = self.state.deadline.get();
-            if let Some(d) = deadline {
+            let wait = if let Some(d) = deadline {
                 let Some(slice) = slice_until(d, self.poll) else {
                     return Err(self.expire());
                 };
-                self.stream.set_poll_timeout(slice)?;
+                slice
             } else {
                 // アイドル待機では周期を IDLE_POLL 系の `poll` へ戻す。直前の受信や応答書き込みで
-                // 残り時間に絞った短い待機が残ると、通知・空行の直後に高頻度で起床し続ける。
-                self.stream.set_poll_timeout(self.poll)?;
-            }
-            match self.stream.read(buf) {
+                // 残り時間に絞った短い待機を使い続けると、通知・空行の直後に高頻度で起床し続ける。
+                self.poll
+            };
+            match self.stream.read_within(buf, wait) {
                 Err(e) if is_retry(e.kind()) => {
                     if deadline.is_some_and(|d| Instant::now() >= d) {
                         return Err(self.expire());
@@ -121,10 +130,11 @@ impl<S: PollStream> Read for PollReader<S> {
     }
 }
 
-/// 応答 1 件（末尾に改行を付ける）を `timeout` の合計期限で書いて flush する。
+/// 応答 1 件（末尾に改行を付ける）を `timeout` の合計期限で書く。
 ///
-/// 各 write・flush の前に残り時間を確認して待機を残り時間以下に絞り、成功後にも確認する。
-/// 部分書き込みが進み続けても、flush が成功しても、合計期限を超えたら `WriteTimeout`（REPAIR-5）。
+/// 各 write の前に残り時間を確認して待機を残り時間以下に絞り、成功後にも確認する。
+/// 部分書き込みが進み続けても、合計期限を超えたら `WriteTimeout`（REPAIR-5）。UDS の write は
+/// バッファを持たないため flush は不要。
 fn write_line<S: PollStream>(
     stream: &mut S,
     text: &str,
@@ -138,8 +148,7 @@ fn write_line<S: PollStream>(
     let mut rest: &[u8] = &data;
     while !rest.is_empty() {
         let slice = slice_until(deadline, poll).ok_or(ServeError::WriteTimeout)?;
-        stream.set_poll_timeout(slice).map_err(ServeError::Write)?;
-        match stream.write(rest) {
+        match stream.write_within(rest, slice) {
             Ok(0) => {
                 return Err(ServeError::Write(io::Error::from(io::ErrorKind::WriteZero)));
             }
@@ -148,21 +157,11 @@ fn write_line<S: PollStream>(
             Err(e) => return Err(ServeError::Write(e)),
         }
     }
-    loop {
-        let slice = slice_until(deadline, poll).ok_or(ServeError::WriteTimeout)?;
-        stream.set_poll_timeout(slice).map_err(ServeError::Write)?;
-        match stream.flush() {
-            Ok(()) => {
-                return if Instant::now() >= deadline {
-                    Err(ServeError::WriteTimeout)
-                } else {
-                    Ok(())
-                };
-            }
-            Err(e) if is_retry(e.kind()) => {}
-            Err(e) => return Err(ServeError::Write(e)),
-        }
+    // 最後の write が期限後に成功した場合も合計期限超過として扱う。
+    if Instant::now() >= deadline {
+        return Err(ServeError::WriteTimeout);
     }
+    Ok(())
 }
 
 /// 標準の上限・期限で相手の切断（EOF）まで処理する。ログは stderr へ 1 行 JSON で出す。
@@ -182,10 +181,6 @@ pub fn serve_uds_with<S: PollStream>(
         .min(limits.message_timeout)
         .min(limits.write_timeout)
         .max(Duration::from_millis(1));
-    if let Err(e) = stream.set_poll_timeout(poll) {
-        log_transport(log, "UNAVAILABLE");
-        return Err(ServeError::Read(e));
-    }
     let state = Rc::new(RecvState::default());
     let mut reader = BufReader::new(PollReader {
         stream,
@@ -258,6 +253,7 @@ mod tests {
     use super::*;
     use crate::backend::UnavailableBackend;
     use std::collections::VecDeque;
+    use std::io::Write;
     use std::sync::{Arc, Mutex};
 
     /// 読み出しの台本の 1 手。
@@ -278,7 +274,7 @@ mod tests {
         slow: Duration,
         /// 台本が尽きたあとも TimedOut を返し続けるか（EOF を返さない停止相手）。
         stall_forever: bool,
-        /// `set_poll_timeout` に渡された値の履歴。
+        /// `read_within` / `write_within` に渡された待機時間の履歴。
         timeouts: Arc<Mutex<Vec<Duration>>>,
     }
 
@@ -343,9 +339,13 @@ mod tests {
     }
 
     impl PollStream for Fake {
-        fn set_poll_timeout(&self, t: Duration) -> io::Result<()> {
+        fn read_within(&mut self, buf: &mut [u8], t: Duration) -> io::Result<usize> {
             self.timeouts.lock().unwrap().push(t);
-            Ok(())
+            self.read(buf)
+        }
+        fn write_within(&mut self, buf: &[u8], t: Duration) -> io::Result<usize> {
+            self.timeouts.lock().unwrap().push(t);
+            self.write(buf)
         }
     }
 

@@ -310,6 +310,45 @@ mod uds {
         assert!(!err.contains(sock.to_str().expect("utf8")), "{err}");
     }
 
+    /// MCP-1・REPAIR-5 / TASK-118.4: 要求を送ってすぐ切断した相手でも、受信済みの要求を処理してから
+    /// EOF で正常終了する（終了コード 0）。macOS では相手切断後の socket 期限の設定が EINVAL に
+    /// なるため、境界基盤の non-blocking 1 回読みで残りデータと EOF を受け取れることを照合する。
+    #[test]
+    fn mcp1_repair5_peer_close_right_after_request_exits_zero() {
+        let dir = TempDir::new();
+        assert_non_root(&dir);
+        let runtime = dir.0.join("run");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&runtime)
+            .unwrap();
+        let sock = dir.0.join("p.sock");
+        let listener = UdsListener::bind(&sock).expect("bind");
+        let child = ChildGuard(Some(spawn_with(
+            listener.path().as_os_str(),
+            Some(&runtime),
+        )));
+        let mut obs = JsonLinesPeerAuthObserver::new();
+        let mut stream = listener
+            .accept(Duration::from_secs(20), &mut obs)
+            .expect("accept");
+        stream
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .expect("write notification");
+        drop(stream);
+        let (code, out, err) = wait_exit(child.into_inner());
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(out, "", "stdout must stay empty in UDS mode");
+        let ops: Vec<String> = err
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["event"] == "mcp.request")
+            .map(|v| v["op"].as_str().unwrap_or("").to_owned())
+            .collect();
+        assert_eq!(ops, ["notification"], "{err}");
+        assert!(!err.contains("mcp.transport"), "{err}");
+    }
+
     /// PLUG-12 / TASK-118.4: 相対パス・`..` 含みの socket 指定は終了コード 2 で拒否し、入力値を出力へ反射しない。
     #[test]
     fn plug12_uds_mode_rejects_invalid_socket_env_without_echo() {

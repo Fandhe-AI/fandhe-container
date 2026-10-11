@@ -56,6 +56,8 @@ make docker-ci                # 開発コンテナ内で make ci を実行（環
 
 `docs/spec`（`fandhe-container-spec`）は private リポジトリのため、アクセス権のない環境では submodule 取得が失敗します（`make setup` は警告のみで続行します）。実装コードのビルド・テストは `docs/spec` 抜きでも成立するよう維持します。
 
+ビルド成果物（`target/`）は数十 GB に膨らみやすいため、ルート `Cargo.toml` の `[profile.dev.package."*"]` で依存クレート（workspace 外）のデバッグ情報を行番号のみにしています（`dev`・`test` に効き、本リポの crate は full debuginfo のままです。panic 位置・バックトレースの行番号は残り、デバッガで依存の変数・型を見られなくなるだけです）。溜まった古い成果物は `cargo install cargo-sweep` のうえ `cargo sweep --time 14`（14 日以上使われていない成果物を削除）や `cargo sweep --installed`（rustup に現存しないツールチェーンでビルドした成果物を削除）で消せます。
+
 ## ライセンス
 
 Apache License 2.0 です（[LICENSE-APACHE](./LICENSE-APACHE)）。spec の OSS-3 に従い中核 crate は Apache-2.0 単独とし、汎用再利用可能な補助 crate は `MIT OR Apache-2.0` を選択肢として残します。

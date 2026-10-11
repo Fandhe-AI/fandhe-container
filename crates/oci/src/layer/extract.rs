@@ -152,6 +152,9 @@ fn escapes() -> OciError {
 
 /// tar 解析 / 読み取りの `io::Error` を構造化エラーへ写す。分類不能なものは tar 構文違反として `DataLoss`。
 fn map_stream_err(e: std::io::Error) -> OciError {
+    if let Some(v) = e.get_ref().and_then(|i| i.downcast_ref::<GuardViolation>()) {
+        return err(v.code, v.msg);
+    }
     let m = oci_error_from_layer_io(e);
     if m.code() == OciErrorCode::Internal {
         return err(OciErrorCode::DataLoss, "layer tar stream is malformed");
@@ -159,6 +162,136 @@ fn map_stream_err(e: std::io::Error) -> OciError {
     m
 }
 
+/// 拡張ヘッダ（GNU long name / long link・PAX）本体 1 件あたりの上限バイト数。
+///
+/// `max_total_bytes` は通常ファイル本体のみを制限するため、メタデータには独立した有限の上限を課す（OCI-1）。
+/// パスは `MAX_PATH_BYTES` が上限であり、これを超える拡張ヘッダは正当なレイヤーに現れない。
+const MAX_META_BYTES: u64 = 1024 * 1024;
+
+/// `TarGuard` が返す検査違反（`io::Error` の内包値。`map_stream_err` が構造化エラーへ戻す）。
+#[derive(Debug)]
+struct GuardViolation {
+    code: OciErrorCode,
+    msg: &'static str,
+}
+
+impl std::fmt::Display for GuardViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.msg)
+    }
+}
+
+impl std::error::Error for GuardViolation {}
+
+fn guard_error(code: OciErrorCode, msg: &'static str) -> std::io::Error {
+    std::io::Error::new(ErrorKind::InvalidData, GuardViolation { code, msg })
+}
+
+/// `tar` クレートが拡張ヘッダ本体をメモリへ確保する前に、宣言サイズを検査する読み取りアダプタ。
+///
+/// 512 バイトのヘッダブロック境界で自前に追跡し（データはそのまま通す）、次を拒否する。
+/// - GNU long name / long link / PAX の宣言サイズが `MAX_META_BYTES` を超えるもの（確保前に中断する）。
+/// - GNU sparse（`S`）: 拡張ヘッダブロックで追跡がずれるうえ、展開でも拒否する種別のため。
+/// - PAX の `size` 上書き: ヘッダのサイズと食い違い、追跡をすり抜けて拡張ヘッダを隠せるため。
+struct TarGuard<R> {
+    inner: R,
+    header: [u8; 512],
+    filled: usize,
+    /// 現在のエントリの本体（拡張ヘッダなら内容）の残りバイト数。
+    payload_left: u64,
+    /// 本体の後ろの 512 バイト境界パディングの残りバイト数。
+    pad_left: u64,
+    /// PAX ヘッダ本体の収集先（`size` 上書きの検出用。`MAX_META_BYTES` 以下）。
+    pax: Option<Vec<u8>>,
+}
+
+impl<R> TarGuard<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            header: [0; 512],
+            filled: 0,
+            payload_left: 0,
+            pad_left: 0,
+            pax: None,
+        }
+    }
+
+    fn on_header(&mut self) -> std::io::Result<()> {
+        let h = tar::Header::from_byte_slice(&self.header);
+        let ty = h.entry_type();
+        // サイズが読めないヘッダは tar 側が構文違反として拒否する。
+        let size = h.size().unwrap_or(0);
+        if ty == EntryType::GNUSparse {
+            return Err(guard_error(
+                OciErrorCode::DataLoss,
+                "sparse entries are not supported",
+            ));
+        }
+        let is_pax = matches!(ty, EntryType::XHeader | EntryType::XGlobalHeader);
+        let is_meta = is_pax || matches!(ty, EntryType::GNULongName | EntryType::GNULongLink);
+        if is_meta && size > MAX_META_BYTES {
+            return Err(guard_error(
+                OciErrorCode::ResourceExhausted,
+                "extended header exceeds the metadata size limit",
+            ));
+        }
+        self.payload_left = size;
+        self.pad_left = size.div_ceil(512).saturating_mul(512) - size;
+        self.pax = is_pax.then(Vec::new);
+        self.filled = 0;
+        Ok(())
+    }
+
+    fn after_payload(&mut self) -> std::io::Result<()> {
+        if let Some(p) = self.pax.take()
+            && p.windows(6).any(|w| w == b" size=")
+        {
+            return Err(guard_error(
+                OciErrorCode::InvalidArgument,
+                "pax size override is not supported",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read> Read for TarGuard<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.payload_left > 0 {
+            let n = usize::try_from(self.payload_left).map_or(buf.len(), |l| l.min(buf.len()));
+            let r = self.inner.read(&mut buf[..n])?;
+            if let (Some(p), Some(got)) = (self.pax.as_mut(), buf.get(..r)) {
+                p.extend_from_slice(got);
+            }
+            self.payload_left -= r as u64;
+            if self.payload_left == 0 {
+                self.after_payload()?;
+            }
+            return Ok(r);
+        }
+        if self.pad_left > 0 {
+            let n = usize::try_from(self.pad_left).map_or(buf.len(), |l| l.min(buf.len()));
+            let r = self.inner.read(&mut buf[..n])?;
+            self.pad_left -= r as u64;
+            return Ok(r);
+        }
+        let n = (512 - self.filled).min(buf.len());
+        let r = self.inner.read(&mut buf[..n])?;
+        self.header[self.filled..self.filled + r].copy_from_slice(&buf[..r]);
+        self.filled += r;
+        if self.filled == 512 {
+            self.on_header()?;
+            if self.payload_left == 0 {
+                self.after_payload()?;
+            }
+        }
+        Ok(r)
+    }
+}
 /// ファイルシステム操作の `io::Error` を写す（パス・OS メッセージは載せない）。
 fn map_fs_err(e: &std::io::Error) -> OciError {
     match e.kind() {
@@ -175,6 +308,7 @@ fn map_fs_err(e: &std::io::Error) -> OciError {
 }
 
 #[cfg(unix)]
+// 非 unix ホストと unix ホストで関数シグネチャ（Result）をそろえ、呼び出し側を cfg 分岐させないため。
 #[allow(clippy::unnecessary_wraps)]
 fn bytes_to_os(b: &[u8]) -> Result<OsString, OciError> {
     use std::os::unix::ffi::OsStringExt as _;
@@ -316,6 +450,7 @@ fn apply_file_mode(f: &fs::File, mode: u32) -> Result<(), OciError> {
 }
 
 #[cfg(not(unix))]
+// 非 unix ホストと unix ホストで関数シグネチャ（Result）をそろえ、呼び出し側を cfg 分岐させないため。
 #[allow(clippy::unnecessary_wraps)]
 fn apply_file_mode(_f: &fs::File, _mode: u32) -> Result<(), OciError> {
     Ok(())
@@ -327,6 +462,7 @@ fn apply_dir_mode(path: &Path, mode: u32) -> Result<(), OciError> {
 }
 
 #[cfg(not(unix))]
+// 非 unix ホストと unix ホストで関数シグネチャ（Result）をそろえ、呼び出し側を cfg 分岐させないため。
 #[allow(clippy::unnecessary_wraps)]
 fn apply_dir_mode(_path: &Path, _mode: u32) -> Result<(), OciError> {
     Ok(())
@@ -381,6 +517,8 @@ impl Extractor<'_> {
             }
             Err(e) => return Err(map_fs_err(&e)),
         }
+        // 同じディレクトリの再定義は後勝ち。先の遅延 mode を残すと finish_dirs が後の mode を上書きする。
+        self.deferred_dirs.retain(|(p, _)| *p != path);
         if needs_deferral(mode) {
             self.deferred_dirs.push((path, mode));
             Ok(())
@@ -547,7 +685,7 @@ fn extract_inner<R: Read>(
         deferred_dirs: Vec::new(),
     };
     {
-        let mut archive = Archive::new(&mut src);
+        let mut archive = Archive::new(TarGuard::new(&mut src));
         for entry in archive.entries().map_err(map_stream_err)? {
             let mut entry = entry.map_err(map_stream_err)?;
             let ty = entry.header().entry_type();
@@ -836,6 +974,60 @@ mod tests {
             .mode()
             & 0o7777;
         assert_eq!(m, 0o555);
+    }
+
+    /// OCI-1: 同じディレクトリの再定義は後勝ち（0555 の後に 0755 を定義すると最終 mode は 0755）。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_directory_redefinition_is_last_wins() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode_of = |sb: &Sandbox| {
+            fs::metadata(sb.root.join("d"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        let sb = Sandbox::new();
+        run(&sb, &[dir("d/", 0o555), dir("d/", 0o755)]).unwrap();
+        assert_eq!(mode_of(&sb), 0o755);
+        let sb = Sandbox::new();
+        run(&sb, &[dir("d/", 0o755), dir("d/", 0o555)]).unwrap();
+        assert_eq!(mode_of(&sb), 0o555);
+    }
+
+    /// OCI-1: 巨大な拡張ヘッダ（GNU long name / PAX）は本体を確保する前にメタデータ上限で拒否する。
+    #[test]
+    fn oci1_oversized_extended_header_is_rejected_before_read() {
+        for ty in [
+            EntryType::GNULongName,
+            EntryType::GNULongLink,
+            EntryType::XHeader,
+        ] {
+            let sb = Sandbox::new();
+            // 宣言サイズだけ巨大で本体は無い。確保前に拒否されなければ DataLoss（切り詰め）になる。
+            let e = raw_entry(b"././@LongLink", ty, b"", 0o644, 1 << 40, b"");
+            assert_eq!(code(run(&sb, &[e])), OciErrorCode::ResourceExhausted);
+        }
+    }
+
+    /// OCI-1: PAX の size 上書きは追跡をずらせるため拒否する。
+    #[test]
+    fn oci1_pax_size_override_is_rejected() {
+        let sb = Sandbox::new();
+        let rec = b"12 size=999\n";
+        let e = raw_entry(
+            b"pax",
+            EntryType::XHeader,
+            b"",
+            0o644,
+            rec.len() as u64,
+            rec,
+        );
+        assert_eq!(
+            code(run(&sb, &[e, file("f", 0o644, b"x")])),
+            OciErrorCode::InvalidArgument
+        );
     }
 
     /// OCI-1: symlink のターゲットがルートより上へ出るものは拒否、収まるものは成功する。

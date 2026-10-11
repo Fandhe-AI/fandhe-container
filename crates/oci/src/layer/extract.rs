@@ -287,6 +287,14 @@ impl<R> TarGuard<R> {
                 "sparse entries are not supported",
             ));
         }
+        // 旧 GNU sparse は typeflag が通常のまま、isextended（offset 482）で sparse map ブロックが後続し、
+        // 512 バイト境界の追跡がずれる。GNU magic のヘッダで isextended が立つものは拒否する。
+        if h.as_gnu().is_some_and(tar::GnuHeader::is_extended) {
+            return Err(guard_error(
+                OciErrorCode::DataLoss,
+                "old GNU sparse entries are not supported",
+            ));
+        }
         let is_pax = matches!(ty, EntryType::XHeader | EntryType::XGlobalHeader);
         let is_meta = is_pax || matches!(ty, EntryType::GNULongName | EntryType::GNULongLink);
         if is_meta && size > MAX_META_BYTES {
@@ -429,8 +437,39 @@ fn bytes_to_os(b: &[u8]) -> Result<OsString, OciError> {
     Ok(OsString::from(s))
 }
 
+/// Windows の予約デバイス名（拡張子付きの形を含む。大文字小文字を区別しない）か。
+fn is_windows_reserved_name(c: &[u8]) -> bool {
+    let stem = c.split(|b| *b == b'.').next().unwrap_or(c);
+    let stem = stem.trim_ascii_end();
+    let upper = stem.to_ascii_uppercase();
+    matches!(upper.as_slice(), b"CON" | b"PRN" | b"AUX" | b"NUL")
+        || matches!(upper.as_slice(), [b'C', b'O', b'M', b'1'..=b'9'])
+        || matches!(upper.as_slice(), [b'L', b'P', b'T', b'1'..=b'9'])
+}
+
+/// コンポーネントが Win32 の名前正規化で展開 root を脱出または別物になりうるかを判定する。
+///
+/// 末尾の `.` と空白を除いた結果が `.` / `..` になるもの（`".. "`・`"..."` 等）は全 OS で拒否する。
+/// `windows_names` が真（Windows ホスト）では、末尾が `.` / 空白のもの（Win32 が除去して別名になる）と
+/// 予約デバイス名（`CON`・`NUL`・`COM1`〜`COM9`・`LPT1`〜`LPT9` 等）も拒否する（OCI-1）。
+fn component_is_unsafe(c: &[u8], windows_names: bool) -> bool {
+    let trimmed = c.trim_ascii_end();
+    let trimmed = trimmed
+        .iter()
+        .rposition(|b| *b != b'.')
+        .map_or(&[][..], |i| trimmed.get(..=i).unwrap_or(&[]));
+    let stripped_is_dots = trimmed.is_empty() && c.first() == Some(&b'.');
+    let trailing = matches!(c.last(), Some(b'.' | b' '));
+    stripped_is_dots && c != b"." || windows_names && (trailing || is_windows_reserved_name(c))
+}
+
 /// アーカイブ内のパスを、`.` を除いたコンポーネント列へ正規化する（`..`・絶対パス・NUL・過大な長さを拒否）。
 fn normalize_entry_path(raw: &[u8]) -> Result<Vec<OsString>, OciError> {
+    normalize_entry_path_for(raw, cfg!(windows))
+}
+
+/// `normalize_entry_path` の本体。`windows_names` でホスト依存の名前規則を切り替える（テストで両方を検証する）。
+fn normalize_entry_path_for(raw: &[u8], windows_names: bool) -> Result<Vec<OsString>, OciError> {
     if raw.is_empty() {
         return Err(err(OciErrorCode::InvalidArgument, "entry path is empty"));
     }
@@ -445,7 +484,7 @@ fn normalize_entry_path(raw: &[u8]) -> Result<Vec<OsString>, OciError> {
         if c.is_empty() || c == b"." {
             continue;
         }
-        if c == b".." {
+        if c == b".." || component_is_unsafe(c, windows_names) {
             return Err(escapes());
         }
         if c.len() > MAX_COMPONENT_BYTES || out.len() >= MAX_COMPONENTS {
@@ -626,6 +665,8 @@ impl Extractor<'_> {
         // 同じディレクトリの再定義は後勝ち。先の遅延 mode を残すと finish_dirs が後の mode を上書きする。
         self.deferred_dirs.remove(&path);
         if needs_deferral(mode) {
+            // umask 等で所有者の rwx が欠けても子を作れるよう、finish_dirs まで一時的に 0700 にする。
+            apply_dir_mode(&path, 0o700)?;
             self.deferred_dirs.insert(path, mode);
             Ok(())
         } else {
@@ -1479,6 +1520,76 @@ mod tests {
         let e = raw_entry(b"sp", EntryType::GNUSparse, b"", 0o644, 0, b"");
         assert_eq!(code(run(&sb, &[e])), OciErrorCode::DataLoss);
         assert!(!sb.root.join("sp").exists());
+    }
+
+    /// OCI-1: 旧 GNU sparse（通常 typeflag + isextended）は拒否する（ヘッダ境界の追跡ずれを防ぐ）。
+    #[test]
+    fn oci1_old_gnu_sparse_isextended_is_rejected() {
+        let sb = Sandbox::new();
+        let mut e = file("old", 0o644, b"");
+        // GNU ヘッダの isextended は offset 482。チェックサムを再計算する。
+        e[482] = 1;
+        let mut h = tar::Header::from_byte_slice(&e[..512]).clone();
+        h.set_cksum();
+        e[..512].copy_from_slice(h.as_bytes());
+        assert_eq!(code(run(&sb, &[e])), OciErrorCode::DataLoss);
+    }
+
+    /// OCI-1: 末尾ドット・空白付きの `..` は全 OS で脱出として拒否する。
+    #[test]
+    fn oci1_dotdot_variants_are_rejected() {
+        for p in ["a/.. /b", "a/.../b", "a/... /b", ".. "] {
+            for win in [false, true] {
+                assert!(
+                    normalize_entry_path_for(p.as_bytes(), win).is_err(),
+                    "{p} win={win}"
+                );
+            }
+        }
+        assert!(normalize_entry_path_for(b"a/./b", false).is_ok());
+        assert!(normalize_entry_path_for(b"a/.hidden", false).is_ok());
+        assert!(normalize_entry_path_for(b"a/foo.", false).is_ok());
+    }
+
+    /// OCI-1: Windows ホストでは末尾ドット・空白と予約デバイス名を拒否する。他 OS では通す。
+    #[test]
+    fn oci1_windows_names_are_rejected_on_windows_only() {
+        for p in [
+            "CON",
+            "con.txt",
+            "a/Nul",
+            "AUX.tar.gz",
+            "COM1",
+            "lpt9.x",
+            "prn ",
+            "foo.",
+            "bar ",
+        ] {
+            assert!(normalize_entry_path_for(p.as_bytes(), true).is_err(), "{p}");
+        }
+        for p in ["CON", "aux.c", "foo.", "COM0", "COM10", "console", "nul2"] {
+            assert!(normalize_entry_path_for(p.as_bytes(), false).is_ok(), "{p}");
+        }
+        for p in ["COM0", "COM10", "console", "nul2"] {
+            assert!(normalize_entry_path_for(p.as_bytes(), true).is_ok(), "{p}");
+        }
+    }
+
+    /// OCI-1: 所有者権限のないディレクトリの下にも子を作れ、最終 mode は元の値になる。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_zero_mode_directory_accepts_children_then_restores() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let sb = Sandbox::new();
+        run(&sb, &[dir("z/", 0o000), file("z/child", 0o644, b"c")]).unwrap();
+        let m = fs::metadata(sb.root.join("z"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(m, 0);
+        restore_perms(&sb.root);
+        assert_eq!(fs::read(sb.root.join("z/child")).unwrap(), b"c");
     }
 
     /// OCI-1: 後勝ち・ディレクトリ上へのファイルは拒否・長いパス（GNU long name）。

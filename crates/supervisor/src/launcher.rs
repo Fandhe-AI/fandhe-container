@@ -729,6 +729,23 @@ mod tests {
         (e.code, e.reason, e.message)
     }
 
+    /// エラーメッセージに埋まるパスの表示（期待値の組み立て用）。
+    ///
+    /// [`verify_install_chain`] は検証中のパスを `PathBuf::from("/")` へ要素を 1 つずつ `join` して作り、
+    /// `display()` でメッセージへ埋める。パスはホスト OS の `Path` として扱う設計のため、区切りはホスト OS の
+    /// ものになる（Linux・macOS では入力と同じ文字列、Windows では 2 要素目以降の前が `\`。CLI-1）。
+    /// 期待値を `/` 固定の文字列にすると Windows でだけ食い違うため、実装と同じ手順で組み立てる。
+    /// 具体値は `sup14_task1719_message_paths_use_host_separator` で OS ごとに固定する。
+    fn shown(p: &str) -> String {
+        let mut out = PathBuf::from("/");
+        for c in Path::new(p).components() {
+            if let Component::Normal(n) = c {
+                out.push(n);
+            }
+        }
+        out.display().to_string()
+    }
+
     // ---- 環境 ----
 
     /// SUP-14・SEC-1: 危険な環境変数は残らず、固定の PATH だけが渡る。
@@ -781,6 +798,25 @@ mod tests {
 
     // ---- パス検証 ----
 
+    /// SUP-14・CLI-1: メッセージへ埋まるパスの表示の具体値を OS ごとに固定する。Linux・macOS では入力の文字列
+    /// そのもの（プログラムの出力は `/` 区切り）で、Windows では `Path::join` が足す区切りだけが `\` になる
+    /// （根の直後は `/` のまま）。ランチャーの実 FS 参照と起動は Linux 限定で、Windows では純ロジックの試験だけが走る。
+    #[test]
+    fn sup14_task1719_message_paths_use_host_separator() {
+        let (sup, dir) = if cfg!(windows) {
+            (r"/opt\fandhe\fandhe-container-supervisor", r"/opt\fandhe")
+        } else {
+            ("/opt/fandhe/fandhe-container-supervisor", "/opt/fandhe")
+        };
+        assert_eq!(shown(SUP), sup);
+        assert_eq!(shown("/opt/fandhe"), dir);
+        assert_eq!(shown("/opt"), "/opt");
+        assert_eq!(shown("/"), "/");
+        // 実装が組み立てて返す実体パスの表示と一致する。
+        let fs = FakeFs::base().file(SUP, 0, 0o755);
+        assert_eq!(verify(&fs, SUP).unwrap().display().to_string(), sup);
+    }
+
     #[test]
     fn sup14_task1719_accepts_root_owned_chain() {
         for mode in [0o755, 0o555, 0o750, 0o500] {
@@ -797,7 +833,7 @@ mod tests {
         assert_eq!(reason, LauncherErrorReason::WritableByGroupOrOther);
         assert_eq!(
             msg,
-            format!("{SUP} is writable by group or other (mode 0666)")
+            format!("{} is writable by group or other (mode 0666)", shown(SUP))
         );
         let fs = FakeFs::base().file(SUP, 0, 0o664);
         assert_eq!(
@@ -832,7 +868,10 @@ mod tests {
                 LauncherErrorReason::OwnerNotRoot
             )
         );
-        assert_eq!(msg, format!("{SUP} is owned by uid 1000, not root"));
+        assert_eq!(
+            msg,
+            format!("{} is owned by uid 1000, not root", shown(SUP))
+        );
     }
 
     #[test]
@@ -851,7 +890,13 @@ mod tests {
                 LauncherErrorReason::AncestorNotTrusted
             )
         );
-        assert_eq!(msg, "directory /opt/fandhe is owned by uid 1000, not root");
+        assert_eq!(
+            msg,
+            format!(
+                "directory {} is owned by uid 1000, not root",
+                shown("/opt/fandhe")
+            )
+        );
         // 親ディレクトリが 0o777。
         let fs = FakeFs::default()
             .dir("/", 0, 0o755)
@@ -862,7 +907,10 @@ mod tests {
         assert_eq!(reason, LauncherErrorReason::AncestorNotTrusted);
         assert_eq!(
             msg,
-            "directory /opt/fandhe is writable by group or other (mode 0777)"
+            format!(
+                "directory {} is writable by group or other (mode 0777)",
+                shown("/opt/fandhe")
+            )
         );
         // 深い祖先の 1 要素だけが不正（sticky でも免除しない: /tmp 相当）。
         let fs = FakeFs::default()
@@ -938,7 +986,10 @@ mod tests {
                 LauncherErrorReason::SymlinkNotRootOwned
             )
         );
-        assert_eq!(msg, format!("symlink {SUP} is owned by uid 1000, not root"));
+        assert_eq!(
+            msg,
+            format!("symlink {} is owned by uid 1000, not root", shown(SUP))
+        );
         // 先の実体が不正。
         let fs = FakeFs::base()
             .dir("/usr", 0, 0o755)

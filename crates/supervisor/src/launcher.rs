@@ -311,7 +311,7 @@ pub fn check_final_file(path: &Path, meta: &NodeMeta) -> Result<(), LauncherErro
 /// 検証は `elevate` より前に行い、失敗しても権限を縮退させない。呼び出し側は返された実体パスを `open` し、
 /// その fd の `fstat` を [`check_final_file`] で再検査してから exec する。
 pub fn verify_install_chain(probe: &dyn PathProbe, path: &Path) -> Result<PathBuf, LauncherError> {
-    if !path.is_absolute() || path.as_os_str().len() > MAX_PATH_LEN {
+    if !path.has_root() || path.as_os_str().len() > MAX_PATH_LEN {
         return Err(LauncherError::denied(
             LauncherErrorReason::PathNotAbsolute,
             "path must be absolute and at most 4096 bytes",
@@ -375,7 +375,7 @@ pub fn verify_install_chain(probe: &dyn PathProbe, path: &Path) -> Result<PathBu
                         "symlink target is too long",
                     ));
                 }
-                if target.is_absolute() {
+                if target.has_root() {
                     resolved = PathBuf::from("/");
                 }
                 // 先頭から順に処理するため、先の要素を pending の前へ積む。
@@ -418,7 +418,7 @@ pub fn verify_install_chain(probe: &dyn PathProbe, path: &Path) -> Result<PathBu
 pub fn supervisor_path_beside(launcher_exe: &Path) -> Result<PathBuf, LauncherError> {
     let dir = launcher_exe
         .parent()
-        .filter(|d| d.is_absolute())
+        .filter(|d| d.has_root())
         .ok_or_else(|| {
             LauncherError::new(
                 ErrorCode::FailedPrecondition,
@@ -625,7 +625,8 @@ mod linux {
             let oci = err.to_oci_error();
             let mut line = Vec::new();
             if oci.write_json_line(&mut line).is_ok() {
-                let _ = io::Write::write_all(&mut io::stderr(), &line);
+                // 昇格前の早期拒否。stderr が満杯 pipe でも期限で終わる（REPAIR-5）。
+                let _ = stderr().emit_and_wait(line, REPORT_DEADLINE);
             }
             return ExitCode::from(oci.exit_code().get());
         }

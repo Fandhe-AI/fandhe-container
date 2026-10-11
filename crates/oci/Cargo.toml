@@ -25,3 +25,5 @@ serde.workspace = true
 serde_json.workspace = true
 # 承認: Issue #278・TASK-122.hdep1（workspace 承認済みの用途「OCI blob の digest 検証」）。TASK-52.1（#405）で利用。
 sha2.workspace = true
+# 承認: Issue #406・TASK-52.hdep2（workspace 承認済みの用途「レイヤー gzip 展開」）。TASK-52.2（#407）で利用。
+flate2.workspace = true

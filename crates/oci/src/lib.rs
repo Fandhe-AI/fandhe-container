@@ -16,7 +16,11 @@
 //! 実装済み: 取得済み blob の sha256 digest 検証（TASK-52.1・OCI-1・MS-4・#405。`layer::verify_blob_digest`）。
 //! `fetch_blob` への組み込みと manifest 本文の digest 突合は未実装。
 //!
-//! 未実装（スタブではなく後続 issue の担当）: layer 展開、
+//! 実装済み: レイヤー blob の gzip 展開（TASK-52.2・OCI-1・MS-4・#407。`layer::decompress_layer_to_writer`・
+//! `layer::GzipLayerReader`）。展開後サイズの上限を必須引数とし、超過で中断する（decompression bomb 対策）。
+//! 展開後 tar の diff_id 検証は未実装。
+//!
+//! 未実装（スタブではなく後続 issue の担当）: tar 展開（TASK-52.3）、whiteout、
 //! キャッシュ・`image ls`/`rm`/`tag`（TASK-52〜55・TASK-183〜184）。`RegistryClient` の通信は匿名トークン取得・
 //! manifest 取得・blob 取得のみ。
 //! PLUG-1 区分は core（crate-naming.md）。

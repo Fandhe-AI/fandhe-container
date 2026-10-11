@@ -103,6 +103,11 @@ tokio = { version = "=1.53.2", default-features = false }
 # crates/plugin の feature `grpc` のみで使い、core には入れない（PLUG-1・CORE-1・PLUG-4）。features はメンバー側で列挙する。
 hyper-util = { version = "=0.1.21", default-features = false }
 
+# OCI レイヤー blob の gzip 展開（OCI-1・TASK-52.2）。承認: Issue #406・TASK-52.hdep2（オーナー判断 2026-10-10）。
+# 配置は crates/oci に限る。backend は純 Rust の zlib-rs（libz-sys / cc を引かない）。展開後サイズの上限は呼び出し側で検証する。
+# 純 Rust・MIT OR Apache-2.0（zlib-rs は Zlib）。default-features を無効化する。
+flate2 = { version = "=1.1.10", default-features = false, features = ["zlib-rs"] }
+
 # 依存クレート（workspace メンバー以外）のデバッグ情報を行番号のみにする。
 # ローカルの `target/` は依存グラフ全体（tonic / prost・protox・objc2 系等）の full debuginfo が
 # 容量とリンク時間を押し上げる。開発時に依存の内部変数・型をデバッガで追う必要は薄いため、

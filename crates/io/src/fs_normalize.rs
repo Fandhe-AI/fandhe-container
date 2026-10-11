@@ -50,7 +50,7 @@
 //! ただし大文字小文字の畳み込みで展開される合字（`ﬁ` → `FI` など）は `fi` と同一視される。
 //! 表の版は Unicode 17.0.0 で、割り当て済み文字の正準分解は版が上がっても変わらない
 //! （Unicode の正規化の安定性方針）。3 OS のすべてで同じ検出をする。
-//! 方針の文書化（`docs/design/fs-normalization.md`）は #106（TASK-21.2）の担当。
+//! 方針決定の経緯と実装の詳細は `docs/design/fs-normalization.md`（TASK-21.2・#106）。
 //!
 //! # 入力表現がゲスト相対パスの `&str` である理由
 //! 入力はワイヤープロトコル上のゲスト（Linux）側 `/` 区切り相対パス表現であり、
@@ -77,7 +77,7 @@
 //!   （[`check_host_path_length`]）。書き込み経路への組み込みは後続（REPAIR-3）。
 //!   WIN-4 の per-directory case-sensitive フラグとの関係は記載済み
 //!   （[`check_host_path_length`] の doc の `# WIN-4 との関係` 節。TASK-20.2・#797）
-//! - NFC / NFD の方針の文書化（`docs/design/fs-normalization.md`）→ #106（TASK-21.2）。
+//! - NFC / NFD の方針の文書化は `docs/design/fs-normalization.md`（TASK-21.2・#106）に作成済み。
 //!   名前の正規化（書き換え）は行わない（#103）
 //! - APFS / NTFS の実際の case folding 表との厳密な一致・非 UTF-8 ファイル名の
 //!   扱い → TASK-21 以降

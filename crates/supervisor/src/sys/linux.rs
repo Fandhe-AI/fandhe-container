@@ -17,6 +17,7 @@
 //! - 引数はすべて整数または呼び出しの間有効なスタック上の `#[repr(C)]` 値で、`-1` 戻り時は直後に
 //!   `io::Error::last_os_error()` を取る。
 
+use std::ffi::CString;
 use std::io;
 
 /// `capget(2)` / `capset(2)` の syscall 番号（`syscall(2)` 経由。glibc にラッパーが無い）。
@@ -27,12 +28,14 @@ mod arch {
     #[cfg(test)]
     pub(super) const SYS_CAPGET: Option<i64> = Some(125);
     pub(super) const SYS_CAPSET: Option<i64> = Some(126);
+    pub(super) const SYS_EXECVEAT: Option<i64> = Some(322);
 }
 #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
 mod arch {
     #[cfg(test)]
     pub(super) const SYS_CAPGET: Option<i64> = Some(90);
     pub(super) const SYS_CAPSET: Option<i64> = Some(91);
+    pub(super) const SYS_EXECVEAT: Option<i64> = Some(281);
 }
 #[cfg(not(any(
     all(target_arch = "x86_64", target_pointer_width = "64"),
@@ -42,9 +45,11 @@ mod arch {
     #[cfg(test)]
     pub(super) const SYS_CAPGET: Option<i64> = None;
     pub(super) const SYS_CAPSET: Option<i64> = None;
+    pub(super) const SYS_EXECVEAT: Option<i64> = None;
 }
 
 /// include/uapi/linux/prctl.h の値。
+const PR_SET_DUMPABLE: i32 = 4;
 const PR_GET_KEEPCAPS: i32 = 7;
 const PR_SET_KEEPCAPS: i32 = 8;
 const PR_CAPBSET_DROP: i32 = 24;
@@ -53,6 +58,14 @@ const PR_CAP_AMBIENT_RAISE: u64 = 2;
 const PR_CAP_AMBIENT_CLEAR_ALL: u64 = 4;
 /// include/uapi/linux/capability.h の `_LINUX_CAPABILITY_VERSION_3`（2 語・64 bit 形式）。
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+/// `execveat(2)` の `AT_EMPTY_PATH`（include/uapi/linux/fcntl.h）。pathname が空のとき dirfd 自体を実行対象にする。
+const AT_EMPTY_PATH: i64 = 0x1000;
+/// `close_range(2)` の syscall 番号（全 arch 共通の統一番号表の値。Linux 5.9 以降）。
+const SYS_CLOSE_RANGE: i64 = 436;
+/// `fcntl(2)` の `F_GETFD`（fd が開いているかの確認に使う）。
+const F_GETFD: i32 = 1;
+/// execveat に渡す argv / envp の要素数の上限（無制限確保の防止）。
+const MAX_EXEC_VECTOR: usize = 4096;
 /// capability 番号の上限（排他）。カーネルの `CAP_LAST_CAP` は 63 以下で、64 以上は ambient / bounding に渡さない。
 const CAP_NUMBER_LIMIT: u8 = 64;
 
@@ -69,6 +82,10 @@ unsafe extern "C" {
     fn setresgid(rgid: u32, egid: u32, sgid: u32) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int setresuid(uid_t ruid, uid_t euid, uid_t suid)`。
     fn setresuid(ruid: u32, euid: u32, suid: u32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int fcntl(int fd, int cmd, ...)`。可変長部は使わない。
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int close(int fd)`。
+    fn close(fd: i32) -> i32;
 }
 
 /// `capget(2)` / `capset(2)` のヘッダ（`struct __user_cap_header_struct`）。
@@ -257,6 +274,82 @@ pub(crate) fn set_resuid(real: u32, effective: u32, saved: u32) -> io::Result<()
     check(i64::from(rc)).map(|_| ())
 }
 
+/// 検証済みの実行ファイルの fd を `execveat(fd, "", argv, envp, AT_EMPTY_PATH)` で実行する（SUP-14・TASK-171 追補・#1719）。
+///
+/// パス文字列で検証して別途パスで exec する方式の TOCTOU を避けるため、呼び出し元が `fstat` で検証した fd をそのまま
+/// 渡す。成功時は戻らない。戻るのは失敗（`io::Error`）のときだけで、`Unsupported`（対応外 arch）・`EINVAL`
+/// （要素数の上限超過）を含む。`argv` / `envp` は NUL 終端済みの `CString` で受け、ポインタ配列は本関数内で組む。
+pub(crate) fn execveat_fd(fd: i32, argv: &[CString], envp: &[CString]) -> io::Result<()> {
+    let nr = arch::SYS_EXECVEAT.ok_or_else(unsupported)?;
+    if argv.len() > MAX_EXEC_VECTOR || envp.len() > MAX_EXEC_VECTOR {
+        return Err(io::Error::from_raw_os_error(22)); // EINVAL
+    }
+    let mut argv_ptrs: Vec<*const std::ffi::c_char> = argv.iter().map(|s| s.as_ptr()).collect();
+    argv_ptrs.push(std::ptr::null());
+    let mut envp_ptrs: Vec<*const std::ffi::c_char> = envp.iter().map(|s| s.as_ptr()).collect();
+    envp_ptrs.push(std::ptr::null());
+    let empty = c"";
+    // SAFETY: `empty`・`argv_ptrs`・`envp_ptrs` と各 `CString` は呼び出しの間有効で、ポインタ配列は NULL 終端、
+    // 各要素は NUL 終端の C 文字列を指す。カーネルは読み取りのみ行う。成功時はプロセス像が置き換わって戻らず、
+    // 失敗時は何も変えずに -1 を返す（直後に errno を取る）。
+    let rc = unsafe {
+        syscall(
+            nr,
+            i64::from(fd),
+            empty.as_ptr(),
+            argv_ptrs.as_ptr(),
+            envp_ptrs.as_ptr(),
+            AT_EMPTY_PATH,
+        )
+    };
+    check(rc).map(|_| ())
+}
+
+/// `first` 以降の fd をすべて閉じる（`close_range(first, !0, 0)`。Linux 5.9 以降）。`ENOSYS` のときは
+/// `/proc/self/fd` を列挙して閉じる。継承 fd を supervisor へ渡さないために exec の前に呼ぶ。
+pub(crate) fn close_fds_from(first: u32) -> io::Result<()> {
+    // SAFETY: 引数は整数のみでポインタを渡さない。影響は呼び出しプロセスの fd 表の縮小のみ。
+    let rc = unsafe { syscall(SYS_CLOSE_RANGE, i64::from(first), i64::from(u32::MAX), 0i64) };
+    match check(rc) {
+        Ok(_) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(38) => close_fds_from_proc(first), // ENOSYS
+        Err(e) => Err(e),
+    }
+}
+
+/// `close_range` が無いカーネル向けの代替。`/proc/self/fd` の列挙を先に集めてから閉じる（列挙中の fd を閉じない）。
+fn close_fds_from_proc(first: u32) -> io::Result<()> {
+    let mut fds: Vec<i32> = Vec::new();
+    for entry in std::fs::read_dir("/proc/self/fd")? {
+        let name = entry?.file_name();
+        if let Some(fd) = name.to_str().and_then(|s| s.parse::<i32>().ok())
+            && u32::try_from(fd).is_ok_and(|v| v >= first)
+        {
+            fds.push(fd);
+        }
+    }
+    for fd in fds {
+        // 列挙に使った fd は閉じた時点で EBADF になり得る。それは無視する。
+        // SAFETY: `close(2)` の引数は整数のみ。影響は呼び出しプロセスの fd 表の縮小のみ。
+        let _ = unsafe { close(fd) };
+    }
+    Ok(())
+}
+
+/// `fd` が開いているか（`fcntl(F_GETFD)`）。
+pub(crate) fn fd_is_open(fd: i32) -> bool {
+    // SAFETY: 引数は整数のみでポインタを渡さない。読み取りだけで状態を変えない。
+    unsafe { fcntl(fd, F_GETFD) != -1 }
+}
+
+/// `PR_SET_DUMPABLE` を設定する。0 にすると ptrace attach・core dump・`/proc/<pid>/mem` 等の読み取りを
+/// 同一 uid の別プロセスから受けない（昇格中の窓の防御）。
+pub(crate) fn set_dumpable(on: bool) -> io::Result<()> {
+    // SAFETY: 引数は整数のみでポインタを渡さない。影響は呼び出しプロセスの dumpable 属性のみ。
+    let rc = unsafe { prctl(PR_SET_DUMPABLE, u64::from(on), 0u64, 0u64, 0u64) };
+    check(i64::from(rc)).map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +416,61 @@ mod tests {
         assert_eq!(caps.permitted, field("CapPrm:"));
         assert_eq!(caps.effective, field("CapEff:"));
         assert_eq!(caps.inheritable, field("CapInh:"));
+    }
+
+    /// SUP-14・TASK-171 追補(#1719): execveat / close_range / dumpable の番号と値を固定する。
+    #[test]
+    fn sup14_task1719_launcher_constants_are_fixed() {
+        assert_eq!(PR_SET_DUMPABLE, 4);
+        assert_eq!(AT_EMPTY_PATH, 0x1000);
+        assert_eq!(SYS_CLOSE_RANGE, 436);
+        assert_eq!(F_GETFD, 1);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    #[test]
+    fn sup14_task1719_execveat_number_x86_64() {
+        assert_eq!(arch::SYS_EXECVEAT, Some(322));
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+    #[test]
+    fn sup14_task1719_execveat_number_aarch64() {
+        assert_eq!(arch::SYS_EXECVEAT, Some(281));
+    }
+
+    /// 存在しない fd への execveat は exec せず EBADF で戻る。
+    #[test]
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
+    fn sup14_task1719_execveat_bad_fd_returns_ebadf() {
+        let argv = [CString::new("x").unwrap()];
+        let e = execveat_fd(i32::MAX, &argv, &[]).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(9));
+    }
+
+    #[test]
+    fn sup14_task1719_execveat_rejects_oversized_vectors() {
+        let argv = vec![CString::new("x").unwrap(); MAX_EXEC_VECTOR + 1];
+        let e = execveat_fd(i32::MAX, &argv, &[]).unwrap_err();
+        // 対応 arch では EINVAL、対応外 arch では Unsupported。いずれも exec しない。
+        assert!(e.raw_os_error() == Some(22) || e.kind() == io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn sup14_task1719_fd_is_open_and_close_range() {
+        use std::os::fd::AsRawFd;
+        let f = std::fs::File::open("/proc/self/status").unwrap();
+        let fd = f.as_raw_fd();
+        assert!(fd_is_open(fd));
+        assert!(!fd_is_open(i32::MAX));
+        // 閉じる範囲に fd を含めない（他テストの fd を壊さないよう、自分の fd より大きい未使用範囲を指定する）。
+        close_fds_from(u32::try_from(fd).unwrap() + 10_000).unwrap();
+        assert!(fd_is_open(fd));
+        // /proc フォールバックも、範囲外なら何も閉じない。
+        close_fds_from_proc(u32::try_from(fd).unwrap() + 10_000).unwrap();
+        assert!(fd_is_open(fd));
     }
 }

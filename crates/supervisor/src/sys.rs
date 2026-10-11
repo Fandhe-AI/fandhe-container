@@ -5,7 +5,9 @@
 //! OS ごとの子モジュールへ振り分け、公開は `pub(crate)` の安全な関数だけにする（`unsafe fn` を外へ出さない）。
 //! - `windows`: ローテーション sink のロックファイル同一性照合（`logs::rotating`。SUP-7・TASK-164 追補・#1470）
 //! - `linux`: 権限昇格の縮退に使う capability / credential の syscall ラッパー
-//!   （`privilege::elevate`。SUP-14・TASK-171.1.3・#1475。方式は #1454 のオーナー判断 2026-10-10）
+//!   （`privilege::elevate`。SUP-14・TASK-171.1.3・#1475。方式は #1454 のオーナー判断 2026-10-10）。特権ランチャー
+//!   （`launcher`。#1719）向けに、検証済み fd の `execveat`・継承 fd の整理（`close_range`）・fd 開閉の確認・
+//!   `PR_SET_DUMPABLE` も持つ
 //!
 //! macOS は本モジュールを持たない（`unsafe` を要する機能が無い）。
 

@@ -736,6 +736,14 @@ jobs:
         timeout-minutes: 5
         run: make commit-msg-line-length-selftest
 
+      # scripts/lib.sh の workspace 判定（has_members 等）の回帰テスト（PR #1756 の指摘）。一時ディレクトリだけを
+      # 使う。Makefile の cargo 系ターゲットの skip 判定を担うため、macOS（/bin/bash 3.2 も回す）・Windows の
+      # Git Bash でも確かめる。既存ジョブのステップ（check-run 件数は不変）
+      - name: scripts/lib.sh の判定の回帰テスト（ubuntu・macos・windows）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make lib-selftest
+
       - name: AppArmor の非特権 user namespace 制限を緩和（unshare_isolation 用・Linux のみ。CORE-1・SEC-5）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 2

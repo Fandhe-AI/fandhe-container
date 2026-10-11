@@ -67,6 +67,8 @@ cat <<'EOF'
                                         capture のタイムアウトでネイティブ exe の子孫が回収されるかの確認（#1548）
   cli-parity-native-reclaim-selftest  scripts/cli-parity-native-reclaim-check-selftest.sh
                                         回収確認スクリプトの全体期限の自己テスト（#1688・REPAIR-5・REPAIR-12）
+  lib-selftest                        scripts/lib-selftest.sh
+                                        scripts/lib.sh の workspace 判定の回帰テスト（bash 3.2 を含む。一時ディレクトリのみ）
   commit-msg-line-length-selftest     scripts/check-commit-msg-line-length-selftest.sh
                                         commit-msg 行長検査スクリプトの自己テスト（Issue #1295・REPAIR-12）
   vz-virtio-gpu-guest-check-selftest  poc/vz-custom-virtio-gpu/guest/check-virtio-gpu-selftest.sh

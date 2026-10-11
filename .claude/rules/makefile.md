@@ -40,6 +40,7 @@ paths:
 ## 新規スクリプトの規約
 
 - 先頭は `#!/usr/bin/env bash` と役割コメント（日本語。呼び出し元・入力・終了コードの契約を書く）。`set -euo pipefail` を付け、`scripts/lib.sh` を source する（`# shellcheck source=` ディレクティブ付き）
+- `scripts/lib.sh` の判定（`has_cargo`・`has_members`・`skip_unless_workspace`）を変えたら `make lib-selftest`（`scripts/lib-selftest.sh`。PATH の bash と `/bin/bash` の両方で照合する）を通し、ケースを追加する
 - 実行権限を付ける（`chmod +x`。git の mode 100755）。Makefile は `@scripts/...` で直接実行するため、権限が無いと失敗する
 - shellcheck をエラー・警告なしで通す。macOS 標準の bash 3.2 でも動く書き方にする（`local -n`・連想配列・`wait -n`・`${var,,}` を使わない。空配列の展開は `${arr[@]+"${arr[@]}"}`）。例外は CI 専用の `scripts/run-parallel.sh`（bash 4.3 以上）
 - プログラムの出力文字列（エラーメッセージ・ログ）は英語、コメントは日本語（[japanese-style](japanese-style.md)）

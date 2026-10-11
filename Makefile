@@ -27,7 +27,7 @@ SHELL := /bin/bash
 	check-workspace-manifest fmt fmt-check lint test doc poc-venus-jig-check check-cli-backend-deps \
 	test-core-no-plugin plugin-feature-size plug4-core-invariance plug4-core-invariance-selftest \
 	test-integration cli-parity-selftest cli-parity-native-reclaim-check \
-	cli-parity-native-reclaim-selftest commit-msg-line-length-selftest \
+	cli-parity-native-reclaim-selftest commit-msg-line-length-selftest lib-selftest \
 	vz-virtio-gpu-guest-check-selftest third-party-licenses-selftest deny-license-fail-closed-selftest \
 	bench-check-selftest bench-baseline-selftest fio-bench-selftest fio-baseline-ratio-selftest \
 	startup-latency-selftest net-setup-timing-selftest dns-helper-measure-selftest idle-memory-selftest \
@@ -136,6 +136,9 @@ cli-parity-native-reclaim-check: ## capture のタイムアウトでネイティ
 
 cli-parity-native-reclaim-selftest: ## 回収確認スクリプトの全体期限の自己テスト（#1688・REPAIR-5・REPAIR-12）
 	@scripts/cli-parity-native-reclaim-check-selftest.sh
+
+lib-selftest: ## scripts/lib.sh の workspace 判定の回帰テスト（bash 3.2 を含む。一時ディレクトリのみ）
+	@scripts/lib-selftest.sh
 
 commit-msg-line-length-selftest: ## commit-msg 行長検査スクリプトの自己テスト（Issue #1295・REPAIR-12）
 	@scripts/check-commit-msg-line-length-selftest.sh

@@ -22,6 +22,7 @@
 
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -439,11 +440,13 @@ enum Line {
 
 /// 読み取りスレッドからの通知。
 enum Event {
-    /// メッセージの先頭バイトを受けた（ここから [`Limits::message_timeout`] を数える）。
-    /// 値は読み取りスレッドが先頭バイトを観測した時刻（絶対期限の起点）。
-    Started(Instant),
-    /// 値は 1 行を読み切った時刻。キューに滞留しただけの行と実際の期限超過を区別する。
-    Line(Line, Instant),
+    /// メッセージの先頭バイトを受けた合図。期限の起点は共有スロットが持つ。
+    /// キューが満杯なら捨てる（`try_send`）。メイン側はイベントを処理するたびに
+    /// スロットを読み直すため、取りこぼしても期限監視は失われない（REPAIR-5）。
+    Started,
+    /// 値は (先頭バイトの受信時刻, 1 行を読み切った時刻)。
+    /// キューに滞留しただけの行と実際の期限超過を区別する。
+    Line(Line, Instant, Instant),
     Eof,
     Failed(io::Error),
 }
@@ -551,21 +554,37 @@ where
         log_transport(log, "UNAVAILABLE");
         return Err(ServeError::Spawn(e));
     }
+    // 受信中メッセージの先頭バイト受信時刻。読み取りスレッドが書き、メインが期限計算に読む。
+    // 受信完了の観測を Started の配送待ち（キュー満杯時のブロック）に依存させない（REPAIR-5）。
+    let slot: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    let reader_slot = Arc::clone(&slot);
     let reader_spawn = thread::Builder::new()
         .name("mcp-read".into())
         .spawn(move || {
             loop {
                 let started_tx = ev_tx.clone();
+                let start_slot = Arc::clone(&reader_slot);
                 let mut on_start = move || {
-                    let _ = started_tx.send(Event::Started(Instant::now()));
+                    if let Ok(mut g) = start_slot.lock() {
+                        *g = Some(Instant::now());
+                    }
+                    // 満杯なら捨てる。読み取りを止めない。
+                    let _ = started_tx.try_send(Event::Started);
                 };
-                match read_line(&mut reader, max_line, &mut on_start) {
+                let res = read_line(&mut reader, max_line, &mut on_start);
+                let done = Instant::now();
+                let start = reader_slot
+                    .lock()
+                    .ok()
+                    .and_then(|mut g| g.take())
+                    .unwrap_or(done);
+                match res {
                     Ok(None) => {
                         let _ = ev_tx.send(Event::Eof);
                         break;
                     }
                     Ok(Some(line)) => {
-                        if ev_tx.send(Event::Line(line, Instant::now())).is_err() {
+                        if ev_tx.send(Event::Line(line, start, done)).is_err() {
                             break;
                         }
                     }
@@ -584,40 +603,53 @@ where
     }
 
     loop {
-        // アイドル待ちは無期限。メッセージの先頭バイトが来てからは期限付き。
-        let Ok(first) = ev_rx.recv() else {
-            return Ok(());
+        // アイドル待ちは無期限。メッセージの先頭バイトが来てからは、その受信時刻からの
+        // 絶対期限で待つ。直前の応答書き込み中に始まった受信でも数え直さない（REPAIR-5）。
+        let overdue_at = slot
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .map(|t0| t0 + limits.message_timeout);
+        let ev = match overdue_at {
+            None => match ev_rx.recv() {
+                Ok(ev) => ev,
+                Err(_) => return Ok(()),
+            },
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match ev_rx.recv_timeout(remaining) {
+                    Ok(ev) => ev,
+                    Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                    Err(RecvTimeoutError::Timeout) => match ev_rx.try_recv() {
+                        Ok(ev) => ev,
+                        Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+                        Err(mpsc::TryRecvError::Empty) => {
+                            // 同じ受信が未完のまま期限を過ぎていれば超過。完了済みなら再評価する。
+                            let still = slot.lock().ok().and_then(|g| *g);
+                            if still.is_some_and(|t| t + limits.message_timeout <= Instant::now()) {
+                                log_transport(log, "DEADLINE_EXCEEDED");
+                                return Err(ServeError::ReadTimeout);
+                            }
+                            continue;
+                        }
+                    },
+                }
+            }
         };
-        let line = match first {
+        let line = match ev {
+            Event::Started => continue,
             Event::Eof => return Ok(()),
             Event::Failed(e) => {
                 log_transport(log, "UNAVAILABLE");
                 return Err(ServeError::Read(e));
             }
-            Event::Line(l, _) => l,
-            Event::Started(t0) => {
-                // 期限は読み取りスレッドが先頭バイトを見た時刻からの絶対時刻。
-                // 直前の応答書き込み中にキューへ積まれた Started でも数え直さない（REPAIR-5）。
-                let deadline = t0 + limits.message_timeout;
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                let next = match ev_rx.recv_timeout(remaining) {
-                    Err(RecvTimeoutError::Timeout) => ev_rx.try_recv().ok(),
-                    Ok(ev) => Some(ev),
-                    Err(RecvTimeoutError::Disconnected) => return Ok(()),
-                };
-                match next {
-                    // 期限内に読み切った行は、キューで待たされていても受理する。
-                    Some(Event::Line(l, done)) if done <= deadline => l,
-                    Some(Event::Failed(e)) => {
-                        log_transport(log, "UNAVAILABLE");
-                        return Err(ServeError::Read(e));
-                    }
-                    Some(Event::Eof | Event::Started(_)) => return Ok(()),
-                    Some(Event::Line(..)) | None => {
-                        log_transport(log, "DEADLINE_EXCEEDED");
-                        return Err(ServeError::ReadTimeout);
-                    }
+            Event::Line(l, start, done) => {
+                // 期限内に読み切った行は、キューで待たされていても受理する。
+                if done > start + limits.message_timeout {
+                    log_transport(log, "DEADLINE_EXCEEDED");
+                    return Err(ServeError::ReadTimeout);
                 }
+                l
             }
         };
         let began = Instant::now();
@@ -1116,5 +1148,29 @@ mod tests {
         let r = serve_with(reader, SlowWriter, limits, &mut |l| logs.push(l.to_owned()));
         assert!(matches!(r, Err(ServeError::ReadTimeout)), "{r:?}");
         assert!(logs.iter().any(|l| l.contains("DEADLINE_EXCEEDED")));
+    }
+
+    /// 応答書き込みが遅くキューが満杯でも、受信済みの正常な要求は ReadTimeout にならない
+    /// （REPAIR-5。受信期限と送信期限は独立。Started の配送待ちで受信完了の観測を止めない）。
+    #[test]
+    fn serve_does_not_time_out_buffered_requests_while_queue_is_full() {
+        let limits = Limits {
+            message_timeout: Duration::from_millis(100),
+            write_timeout: Duration::from_secs(1),
+            ..Limits::default()
+        };
+        let mut input = String::new();
+        for i in 1..=10 {
+            input.push_str(&format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{i},\"method\":\"ping\"}}\n"
+            ));
+        }
+        let r = serve_with(
+            Cursor::new(input.into_bytes()),
+            SlowWriter,
+            limits,
+            &mut |_| {},
+        );
+        assert!(r.is_ok(), "{r:?}");
     }
 }

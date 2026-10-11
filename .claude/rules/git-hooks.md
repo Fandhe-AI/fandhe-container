@@ -66,7 +66,10 @@ secrets-content-guard は staged diff（`git diff --cached`）を走査するた
 - diff の行数・ファイル数に比例してプロセスを起動するループを書かない。awk / grep を 1 回だけ起動して一括で判定する
   （行 × パターンごとに grep を起動していた旧 secrets-content-guard は 3000 行の diff で約 47 秒、
   ファイルごとに grep を起動していた旧 secrets-guard は `--all-files` で約 7 秒かかった）
-- 秘密情報の検査は fail-closed にする（diff の取得・抽出に失敗したら検査済み扱いにせず拒否する）
+- 秘密情報の検査は fail-closed にする（diff の取得・抽出に失敗したら検査済み扱いにせず拒否する。
+  grep の終了状態 2 以上〔検査エラー〕を「一致なし」と同一視しない）
+- 利用者の環境で出力・挙動が変わらないようにする（`git diff` に `--no-color --no-ext-diff --no-renames` を付ける。
+  非 UTF-8 の内容で BSD awk / grep が異常終了しないよう `LC_ALL=C` で実行し、grep は `-a` を付ける）
 - 実体が長くなる場合は `scripts/` へ切り出し、`lefthook.yml` は呼び出しのみにする（例: `scripts/check-commit-msg-line-length.sh`）
 - 条件付き実行が必要な場合は lefthook の `skip` / `only` を使ってよい
   （`.claude/skills/lefthook/references/examples/skip.md`）

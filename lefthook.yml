@@ -34,15 +34,21 @@ pre-commit:
     # 検出範囲を維持するため追加している）
     - name: secrets-guard
       run: |
-        # プロセス起動回数をファイル数に比例させないため、全ファイル名を 1 回の
-        # grep パイプラインで判定する（ファイルごとのループは --all-files で約 7 秒かかった）。
-        # 拒否パターンに一致し、かつ許可リストに一致しない行が 1 行でもあれば拒否する
-        # （grep の「一致なし」の終了コード 1 は正常扱いにし、出力の有無で判定する）
+        # プロセス起動回数をファイル数に比例させないため、awk 1 本で全パスを判定する
+        # （旧実装の「1 ファイルごとに grep を 3 回」は --all-files で約 7 秒かかっていた）。
+        # 正規表現は awk -v ではなく ENVIRON で渡す（-v はバックスラッシュをエスケープとして
+        # 解釈し `\.` が崩れるため）。BSD awk は UTF-8 ロケールで不正なマルチバイト列に
+        # 当たると異常終了するため LC_ALL=C で照合する（パターンは ASCII のみ）。
+        # awk 自体が失敗した場合は判定できていないパスが残るため fail-closed で拒否する
         re='(^|/)\.env(\..+)?$|(^|/)(id_rsa|id_ed25519)(\..+)?$|\.(pem|p12|pfx|key|env)$'
         re_ok='\.(example|sample|template|pub)$'
-        bad="$(printf '%s\n' {staged_files} | grep -E "$re" | grep -vE "$re_ok")"
-        if [ -n "$bad" ]; then
-          printf '%s\n' "$bad" | while IFS= read -r f; do
+        if ! hits=$(printf '%s\n' {staged_files} \
+          | LC_ALL=C RE="$re" RE_OK="$re_ok" awk '$0 ~ ENVIRON["RE"] && $0 !~ ENVIRON["RE_OK"]'); then
+          echo "NG: ファイル名の判定に失敗したため秘密情報の検査を完了できません" >&2
+          exit 1
+        fi
+        if [ -n "$hits" ]; then
+          printf '%s\n' "$hits" | while IFS= read -r f; do
             echo "NG: 秘密情報ファイルがステージされています: $f" >&2
           done
           exit 1
@@ -53,8 +59,9 @@ pre-commit:
     # サーバー側の最終防御線は GitHub の secret scanning + push protection
     # （リポジトリ設定で有効化済み）。誤検知した場合も --no-verify での回避は
     # 行わず、該当箇所の値を除去してから再ステージする）。
-    # staged diff の追加行（`+` 始まり。削除行・`+++` ヘッダ行は対象外）のみを
-    # 走査する。バイナリファイルは git diff が +/- 行を出力しないため自然に
+    # staged diff の hunk 内の追加行（`+` 始まり。削除行は対象外）のみを走査する。
+    # `+++ b/...` のファイルヘッダは `diff --git` から最初の `@@` までの間だけで
+    # 解釈する。バイナリファイルは git diff が +/- 行を出力しないため自然に
     # 除外される。検出時はファイル名とパターン種別のみを表示し、値そのものは
     # 出力しない。
     - name: secrets-content-guard
@@ -78,15 +85,26 @@ pre-commit:
         # diff の取得・追加行の抽出のどちらかが失敗した場合（一時領域の容量不足等）は、
         # 検査できていない行が残るため fail-closed でコミットを拒否する。パイプの左辺の
         # 終了状態は sh では取れないため、diff を一度ファイルへ書き出してから awk に渡す。
-        # awk は書き出した件数と行数を照合し、書き込み失敗（close の失敗）も非ゼロで返す
-        if ! git diff --cached --diff-filter=ACMR -U0 -- . > "$tmp/diff"; then
+        # 利用者の git 設定（color.diff=always・外部 diff ドライバ・リネーム検出）で出力形式が
+        # 変わると追加行を取りこぼすため、--no-color --no-ext-diff --no-renames で固定する
+        # （リネームは追加側として新パスの全行を走査する）
+        if ! git diff --cached --no-color --no-ext-diff --no-renames --diff-filter=ACMR -U0 -- . > "$tmp/diff"; then
           echo "NG: staged diff を取得できないため秘密情報の検査を完了できません" >&2
           exit 1
         fi
-        if ! awk -v cf="$tmp/content" -v nf="$tmp/names" '
-          /^\+\+\+ b\// { file = substr($0, 7); next }
-          /^\+\+\+ /    { next }
-          /^\+/         { print substr($0, 2) > cf; print (file == "" ? "(unknown)" : file) > nf; n++ }
+        # hunk 内の追加行の本文が `++ b/` で始まると diff 上は `+++ b/...` になるため、
+        # ヘッダの解釈は hunk の外（`diff --git` から最初の `@@` まで）に限る。空白を含む
+        # パスに git が付ける末尾のタブと、特殊文字を含むパスの二重引用符（`+++ "b/..."`）も
+        # 外す。BSD awk は UTF-8 ロケールで不正なマルチバイト列を含む行に当たると異常終了
+        # するため LC_ALL=C で走査する。書き込み失敗（close の失敗）は非ゼロで返し、件数は
+        # stderr 経由で受け取って書き出した行数と照合する（抽出漏れのまま合格させない）
+        if ! LC_ALL=C awk -v cf="$tmp/content" -v nf="$tmp/names" '
+          /^diff --git / { inhunk = 0; file = ""; next }
+          /^@@ /         { inhunk = 1; next }
+          !inhunk && /^\+\+\+ "b\// { file = substr($0, 8); sub(/\t$/, "", file); sub(/"$/, "", file); next }
+          !inhunk && /^\+\+\+ b\//  { file = substr($0, 7); sub(/\t$/, "", file); next }
+          !inhunk        { next }
+          /^\+/          { print substr($0, 2) > cf; print (file == "" ? "(unknown)" : file) > nf; n++ }
           END {
             if (n > 0 && (close(cf) != 0 || close(nf) != 0)) exit 2
             print n + 0 > "/dev/stderr"
@@ -96,21 +114,36 @@ pre-commit:
           exit 1
         fi
         n="$(cat "$tmp/count")"
-        if [ "$n" -eq 0 ] 2>/dev/null; then
+        case "$n" in
+          ''|*[!0-9]*)
+            echo "NG: 追加行の件数を取得できないため秘密情報の検査を完了できません" >&2
+            exit 1
+            ;;
+        esac
+        if [ "$n" -eq 0 ]; then
           exit 0
         fi
         if [ "$(wc -l < "$tmp/content" | tr -d ' ')" != "$n" ]; then
           echo "NG: 追加行の抽出結果が不完全なため秘密情報の検査を完了できません" >&2
           exit 1
         fi
+        # grep の終了状態は 0=一致あり・1=一致なし・2 以上=検査エラー。エラーを「一致なし」と
+        # 同一視すると検査できないまま合格するため、2 以上も NG にする（fail-closed）。
+        # パターンは ASCII のみのため LC_ALL=C で照合し、非 UTF-8 の行で grep が失敗・
+        # バイナリ扱いしないようにする（-a は NUL 等を含む行をバイナリ扱いさせないため）
         rc=0
         printf '%s\n' "$patterns" | {
           while IFS='|' read -r pat kind; do
             [ -z "$pat" ] && continue
-            ln="$(grep -En -m1 -- "$pat" "$tmp/content" | head -n1 | cut -d: -f1)"
-            if [ -n "$ln" ]; then
+            LC_ALL=C grep -aEn -m1 -- "$pat" "$tmp/content" > "$tmp/hit"
+            grc=$?
+            if [ "$grc" -gt 1 ]; then
+              echo "NG: 秘密情報の判定でエラーが発生しました: pattern=$kind" >&2
+              rc=1
+            elif [ "$grc" -eq 0 ]; then
+              ln="$(head -n1 "$tmp/hit" | cut -d: -f1)"
               file="$(sed -n "${ln}p" "$tmp/names")"
-              echo "NG: 秘密情報らしき文字列を検出しました: file=${file} pattern=$kind" >&2
+              echo "NG: 秘密情報らしき文字列を検出しました: file=${file:-(unknown)} pattern=$kind" >&2
               rc=1
             fi
           done

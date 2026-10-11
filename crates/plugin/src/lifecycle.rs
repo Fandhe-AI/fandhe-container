@@ -1487,6 +1487,8 @@ mod tests {
     }
 
     /// 他の試験と混ざらない専用の延期表（プロセス全体の表は共有しない）。
+    // 使う試験は `cfg(unix)`・Linux 限定などで OS ごとに有効な集合が違い、Windows 等では
+    // 呼び出し元が 1 つも残らず dead_code 警告になる。cfg を試験側と二重管理しないため抑止する。
     #[allow(dead_code)]
     fn local_table() -> &'static drop_report::DropReportTable {
         let slots: &'static [AtomicU64] = Box::leak(
@@ -1900,13 +1902,18 @@ mod tests {
     fn repair4_drop_report_roundtrip_pipe() {
         use std::io::Read;
         let (mut r, w) = io::pipe().unwrap();
-        let reader = std::thread::spawn(move || {
+        // 書き込み端が別プロセスに残ると EOF が来ないため、収集は完了を期限付きで待つ（REPAIR-5）。
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _reader = std::thread::spawn(move || {
             let mut text = String::new();
-            r.read_to_string(&mut text).unwrap();
-            text
+            let res = r.read_to_string(&mut text).map(|_| text);
+            let _ = tx.send(res);
         });
         run_roundtrip_child(Stdio::from(w));
-        let text = reader.join().unwrap();
+        let text = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("pipe collection did not finish in time")
+            .unwrap();
         assert_eq!(
             only_cleanup_lines(&text),
             vec![GROUP_KILL_FAILED_LINE.to_string()]
@@ -1926,6 +1933,8 @@ mod tests {
         use std::io::Read;
         use std::os::unix::net::UnixStream;
         let (a, mut b) = UnixStream::pair().unwrap();
+        // 継承された書き込み端が残っても無期限に待たない（REPAIR-5）。
+        b.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         run_roundtrip_child(Stdio::from(std::os::fd::OwnedFd::from(a)));
         let mut text = String::new();
         b.read_to_string(&mut text).unwrap();

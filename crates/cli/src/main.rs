@@ -22,19 +22,26 @@ fn main() -> ExitCode {
         return ExitCode::from(e.exit_code().get());
     }
     let exit = fandhe_container_cli::commands::run(std::env::args_os().skip(1));
-    // `Drop` の即時書き込みが途中で切れた断片が stderr に残っていれば、コマンド結果の JSON が連結しないよう
-    // 結果の前に改行で分離する（#1673）。
+    let code = exit.exit_code();
     let mut pending = fandhe_container_plugin::take_pending_child_cleanup_failures();
-    if pending.take_partial_write_mark() {
-        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"\n");
-    }
-    // stderr 書き込み失敗では panic せず、終了コードは書き込みの成否に依存させない。
-    let _ = exit.write_stderr(&mut std::io::stderr());
-    // `ChildGuard` の `Drop` で書けなかった後始末の失敗記録を stderr へ出す。終了コードには影響させない。
-    // stderr が満杯の pipe / socket だと write が永久にブロックし得るため、別スレッドで書いて有限の期限で待つ（REPAIR-5）。
-    // 期限内に終わらなければスレッドを置き去りにして終了する（main の return でプロセスごと破棄される）。
-    report_deferred(pending, DEFERRED_REPORT_TIMEOUT, spawn_thread, write_stderr);
-    ExitCode::from(exit.exit_code())
+    // `Drop` の即時書き込みが途中で切れた断片が stderr に残っていれば、結果の JSON が連結しないよう
+    // 結果の前に改行で分離する（#1673）。
+    let partial = pending.take_partial_write_mark();
+    // 断片分離の改行・コマンド結果・延期した後始末の記録は、順序を保ったまま 1 つの別スレッドで書く。
+    // stderr が満杯の pipe / socket だと write が永久にブロックし得るため、main では一切 stderr へ書かず
+    // 有限の期限で待つ（REPAIR-5）。期限内に終わらなければスレッドを置き去りにして終了する
+    // （main の return でプロセスごと破棄される）。終了コードは書き込みの成否に依存させない。
+    report_deferred(
+        Report {
+            partial,
+            exit,
+            pending,
+        },
+        DEFERRED_REPORT_TIMEOUT,
+        spawn_thread,
+        write_stderr,
+    );
+    ExitCode::from(code)
 }
 
 /// スレッドを起動する関数（テストで失敗を注入するため差し替え可能にする）。
@@ -66,8 +73,20 @@ fn report_deferred<T: Send + 'static>(
     }
 }
 
-fn write_stderr(p: &fandhe_container_plugin::PendingChildCleanup) {
-    let _ = p.write_json_lines(&mut std::io::stderr());
+/// 終了時に stderr へ出す内容一式（改行・結果・延期した記録の順）。
+struct Report {
+    partial: bool,
+    exit: fandhe_container_cli::commands::CliExit,
+    pending: fandhe_container_plugin::PendingChildCleanup,
+}
+
+fn write_stderr(r: &Report) {
+    let mut err = std::io::stderr();
+    if r.partial {
+        let _ = std::io::Write::write_all(&mut err, b"\n");
+    }
+    let _ = r.exit.write_stderr(&mut err);
+    let _ = r.pending.write_json_lines(&mut err);
 }
 
 #[cfg(test)]
@@ -81,6 +100,8 @@ mod tests {
         Err(std::io::Error::other("injected spawn failure"))
     }
 
+    // `report_deferred` の `write: fn(&T)` に `T = Vec<u8>` で渡すため、引数型は `&Vec<u8>` でなければならず
+    // `&[u8]` へ変えると関数ポインタの型が合わない。clippy::ptr_arg の提案には従えない。
     #[allow(clippy::ptr_arg)]
     fn count(s: &Vec<u8>) {
         WRITTEN.fetch_add(s.len(), Ordering::SeqCst);

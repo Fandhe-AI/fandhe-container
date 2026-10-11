@@ -283,11 +283,17 @@ mod uds {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            // Linux 以外は状態ストアの実装が無く UNIMPLEMENTED を isError で返す。
+            // Linux 以外は core の状態ストアが状態ルートを検査できず UNIMPLEMENTED を返す（fail-closed）。
+            // 業務エラーの result は `structuredContent` を持たず、`{code, message}` を
+            // `content[0].text` の JSON 文字列に載せる（server.rs の `tool_error_result`）。
             assert_eq!(call["result"]["isError"], json!(true), "{call}");
+            let text = call["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_else(|| panic!("content[0].text is a string: {call}"));
+            let body: Value = serde_json::from_str(text).expect("content[0].text is JSON");
             assert_eq!(
-                call["result"]["structuredContent"]["code"],
-                json!("UNIMPLEMENTED"),
+                body,
+                json!({"code": "UNIMPLEMENTED", "message": "Not implemented"}),
                 "{call}"
             );
         }

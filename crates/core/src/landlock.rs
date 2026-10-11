@@ -34,6 +34,7 @@ pub use apply::{
     LandlockEnforcementObservation, observe_landlock_enforcement,
 };
 pub(crate) use apply::{apply_landlock_ruleset, apply_landlock_ruleset_with};
+pub(crate) use rules::handled_for_abi;
 pub use rules::{
     AccessFs, LandlockRuleError, LandlockRuleErrorKind, LandlockRuleset, MAX_LANDLOCK_RULES,
     PathRule, RuleOrigin, RulePath, ShadowedRestriction, build_path_rules,

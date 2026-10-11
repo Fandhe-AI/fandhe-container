@@ -25,6 +25,16 @@
 //!   launcher 契約どおりの対象では通ることの根拠になる。制限の再適用以降は Landlock ABI 6 以上を要し、
 //!   hosted runner では実行できないため、ここでは照合しない（`tests/exec.rs`。実機前提）
 //!
+//! TASK-163 追補（#1468）で次を足した（同じく非特権の user namespace に閉じる）。
+//!
+//! - **rootfs を mount namespace の中で組み立てる構成での `/` の照合（SEC-1・SUP-6）**: pid1 が自分の mount
+//!   namespace の中でだけ、rootfs ディレクトリへ tmpfs をマウントし（overlay の代わり。どちらも匿名の `st_dev` を持ち、
+//!   ホスト側のディレクトリとは別の実体になる）、launcher と同じ手順で `pivot_root` する（`--pid1-pivot-tmpfs`）。pid1 が
+//!   pivot 後の `/` の識別子を事前に開いたファイルへ書き、joiner はそれを launch 時の記録として本番の
+//!   `enter_namespaces` で参加した後、本番と同じ照合（`verify_joined_root_for_test`）が通ること、ホスト側の bundle
+//!   ディレクトリの識別子とは **一致しない** こと（ホスト側の bundle 起点の照合では拒否されていた構成）を具体値で照合する。
+//!   記録は `launch_isolation` の `root` に載せる値で、exec の `/` の照合の基準になる
+//!
 //! TASK-163 追補（#1457）で次を足した（同じく非特権の user namespace に閉じる）。
 //!
 //! - **`setgroups` が `deny` の user namespace での補助グループ（SEC-5）**: launch・exec が共有する補助グループの
@@ -95,8 +105,24 @@ fn main() {
             .expect("flag position");
         let rootfs = args.get(i + 2).expect("joiner requires the rootfs path");
         linux::joiner_pivoted(pid, std::path::Path::new(rootfs));
+    } else if let Some(pid) = pid_after(linux::JOINER_TMPFS) {
+        let i = args
+            .iter()
+            .position(|a| a == linux::JOINER_TMPFS)
+            .expect("flag position");
+        let rootfs = args.get(i + 2).expect("joiner requires the rootfs path");
+        let identity = args.get(i + 3).expect("joiner requires the identity file");
+        linux::joiner_tmpfs(
+            pid,
+            std::path::Path::new(rootfs),
+            std::path::Path::new(identity),
+        );
     } else if pid_after(linux::JOINER_GROUPS).is_some() {
         linux::joiner_groups();
+    } else if let Some(i) = args.iter().position(|a| a == linux::PID1_PIVOT_TMPFS) {
+        let rootfs = args.get(i + 1).expect("pid1 requires the rootfs path");
+        let identity = args.get(i + 2).expect("pid1 requires the identity file");
+        linux::pid1_pivot_tmpfs(std::path::Path::new(rootfs), std::path::Path::new(identity));
     } else if let Some(i) = args.iter().position(|a| a == linux::PID1_PIVOT) {
         let rootfs = args.get(i + 1).expect("pid1 requires the rootfs path");
         linux::pid1_pivot(std::path::Path::new(rootfs));
@@ -120,8 +146,12 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::exec::{
-        JoinNamespace, MountIsolation, SupplementaryGroups, apply_join_credentials_for_test,
-        clear_supplementary_groups_for_test, pivot_root, prepare_rootfs,
+        JoinNamespace, MountIsolation, SupplementaryGroups, ViolationReason,
+        apply_join_credentials_for_test, clear_supplementary_groups_for_test, pivot_root,
+        prepare_rootfs, verify_joined_root_for_test,
+    };
+    use fandhe_container_core::launch_isolation::{
+        LaunchIsolationRecord, RecordedLandlock, RecordedRule, RecordedTarget, RootIdentity,
     };
     use fandhe_container_core::traits::{
         ContainerId, ContainerStatus, ErrorCode, StateRecord, StateRevision,
@@ -176,6 +206,11 @@ mod linux {
     pub const JOINER_GROUPS: &str = "--joiner-groups";
     /// launcher と同じ手順で `pivot_root` まで進んで待機する pid1 の再入フラグ（引数: rootfs）。
     pub const PID1_PIVOT: &str = "--pid1-pivot";
+    /// rootfs へ tmpfs をマウントしてから `pivot_root` まで進んで待機する pid1 の再入フラグ（引数: rootfs・pivot 後の
+    /// `/` の識別子の書き出し先。#1468）。
+    pub const PID1_PIVOT_TMPFS: &str = "--pid1-pivot-tmpfs";
+    /// tmpfs で組み立てた rootfs の pid1 へ参加する joiner の再入フラグ（引数: pid・rootfs・識別子ファイル。#1468）。
+    pub const JOINER_TMPFS: &str = "--joiner-tmpfs";
     /// pid1 が pivot の後に新しい `/` へ置く合図ファイルの名前と内容。
     const READY: &str = "ready";
     /// rootfs に置く目印ファイルの名前と内容（参加後の `/` から読めることを照合する）。
@@ -222,6 +257,37 @@ mod linux {
             &[rootfs_arg],
         );
         println!("exec_setns_join: root after joining a pivoted target equals the pinned rootfs");
+        // 成功経路（#1468）: rootfs を mount namespace の中で組み立てる構成（tmpfs。overlay の代わり）。参加後の `/` は
+        // 記録した pivot 後の `/` と一致し、ホスト側の bundle ディレクトリとは一致しない。
+        let tmpfs_rootfs = Rootfs::create();
+        let identity_file = tmpfs_rootfs.dir.with_extension("identity");
+        fs::write(&identity_file, b"").expect("create the identity file");
+        let _identity_guard = FileGuard(identity_file.clone());
+        let exe = std::env::current_exe().expect("current_exe");
+        let pid1 = vec![
+            exe.into_os_string(),
+            OsString::from(PID1_PIVOT_TMPFS),
+            tmpfs_rootfs.dir.clone().into_os_string(),
+            identity_file.clone().into_os_string(),
+        ];
+        run_scenario(
+            &ALL_NS,
+            pid1,
+            Some(&identity_file),
+            true,
+            JOINER_TMPFS,
+            &[
+                tmpfs_rootfs
+                    .dir
+                    .to_str()
+                    .expect("utf-8 rootfs path")
+                    .to_owned(),
+                identity_file.to_str().expect("utf-8 path").to_owned(),
+            ],
+        );
+        println!(
+            "exec_setns_join: root after joining a mount-namespace-built rootfs equals the recorded root"
+        );
         // TASK-163 追補（#1457）: `setgroups` が `deny` の user namespace（rootless。`--map-root-user`）では、
         // `CAP_SETGID` を持っていても補助グループを消去できない。launch・exec が共有する関数は拒否にも成功の偽装にも
         // せず、現状維持として記録する（SEC-5。rootless の launch を壊さない）。
@@ -230,6 +296,15 @@ mod linux {
             "exec_setns_join: supplementary groups kept and recorded where setgroups is denied"
         );
         println!("exec_setns_join: namespace join verified");
+    }
+
+    /// 使い捨てのファイル。drop で削除する。
+    struct FileGuard(PathBuf);
+
+    impl Drop for FileGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
     }
 
     /// 使い捨ての rootfs（`proc/` と目印ファイル）。drop で削除する。
@@ -304,7 +379,7 @@ mod linux {
 
         if let Some(ready) = ready {
             let deadline = Instant::now() + timeout();
-            while !ready.exists() {
+            while !fs::metadata(ready).is_ok_and(|m| m.len() > 0) {
                 assert!(
                     Instant::now() < deadline,
                     "pid1 did not become ready in time"
@@ -372,8 +447,18 @@ mod linux {
         .expect("rlimits")
     }
 
+    /// launch 時の分離の記録（`root` は参加後の `/` の照合の基準。ルールは rootfs だけ。#1468）。
+    fn launch_isolation(root: RootIdentity) -> LaunchIsolationRecord {
+        LaunchIsolationRecord::from_parts(
+            root,
+            RecordedLandlock::new(0xFFFF, vec![RecordedRule::new(RecordedTarget::Root, 0x7)])
+                .expect("recorded landlock"),
+        )
+    }
+
     /// 試験用のレコード（Running・記録 pid あり）と、pid1 が実際に属する cgroup の絶対パス。
-    fn record_and_cgroup_path(pid: u32) -> (StateRecord, String) {
+    /// `root` は記録する launch 時の `/` の識別子（`enter_namespaces` までの試験では照合しないので任意の値）。
+    fn record_and_cgroup_path(pid: u32, root: RootIdentity) -> (StateRecord, String) {
         let status =
             ContainerStatus::running(ContainerId::new("c1").expect("id"), NonZeroU32::new(pid));
         let rec = StateRecord::new(
@@ -382,7 +467,8 @@ mod linux {
             StateRevision::from_raw(1),
         )
         .expect("record")
-        .with_rlimits(full_rlimits());
+        .with_rlimits(full_rlimits())
+        .with_launch_isolation(launch_isolation(root));
         let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("read cgroup");
         let path = cgroup
             .lines()
@@ -409,7 +495,7 @@ mod linux {
             link(&format!("/proc/{pid}/ns/pid")),
             "the target must be in another PID namespace"
         );
-        let (rec, path) = record_and_cgroup_path(pid);
+        let (rec, path) = record_and_cgroup_path(pid, RootIdentity::new(44, 1234));
         let err = identify_pid1_in(&rec, &path).unwrap_err();
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(
@@ -452,7 +538,7 @@ mod linux {
         let groups_before = field(&status(), "Groups:");
         let group_count = groups_before.split_whitespace().count();
 
-        let (rec, path) = record_and_cgroup_path(pid);
+        let (rec, path) = record_and_cgroup_path(pid, RootIdentity::new(44, 1234));
         let target =
             identify_pid1_in(&rec, &path).expect("identify pid1 in another user namespace");
         let report = enter_namespaces(&target).expect("enter namespaces including the user one");
@@ -570,11 +656,15 @@ mod linux {
             link(&format!("/proc/{pid}/ns/mnt"))
         );
 
-        let (rec, path) = record_and_cgroup_path(pid);
+        // 記録する launch 時の `/` は、bind で自己 pivot する launcher の契約どおり、固定した rootfs の識別子。
+        let (rec, path) = record_and_cgroup_path(pid, RootIdentity::new(pinned.0, pinned.1));
         let target = identify_pid1_in(&rec, &path).expect("identify pid1");
         let report = enter_namespaces(&target).expect("enter namespaces");
         assert_eq!(report.joined, JoinNamespace::SUP6_SET.to_vec());
         assert!(!report.user_namespace_joined);
+        // 本番と同じ `/` の照合（記録した識別子との一致）が通る。
+        verify_joined_root_for_test(RootIdentity::new(pinned.0, pinned.1))
+            .expect("the joined root equals the recorded root");
 
         // 参加後: `/` と cwd は、固定した rootfs と同じディレクトリ（`st_dev`・`st_ino`）。`setns` は root と cwd を
         // 参加先 mount namespace のルートへ付け替えるため、明示的な chroot / chdir をしなくても一致する。
@@ -605,6 +695,79 @@ mod linux {
                 .expect_err("host path must not resolve")
                 .kind(),
             std::io::ErrorKind::NotFound
+        );
+    }
+
+    /// `--pid1-pivot-tmpfs`: 新しい PID namespace の PID 1 として、自分の mount namespace の中でだけ `rootfs` へ tmpfs を
+    /// マウントし、launcher と同じ手順で `pivot_root` する（overlay のように rootfs を mount namespace の中で
+    /// 組み立てる構成の代わり。#1468）。pivot 後の `/` の `st_dev`・`st_ino` を、pivot の前に開いておいた
+    /// `identity_out` へ 1 回の書き込みで残して待機する（ホスト側のパスは pivot 後に解決できないため）。
+    pub fn pid1_pivot_tmpfs(rootfs: &Path, identity_out: &Path) {
+        use std::io::Write as _;
+        assert_eq!(std::process::id(), 1, "must be PID 1 of the new namespace");
+        let mut out = fs::OpenOptions::new()
+            .write(true)
+            .open(identity_out)
+            .expect("open the identity file before pivoting");
+        let isolation = MountIsolation::establish().expect("establish mount isolation");
+        // 自分の mount namespace（`establish` が `/` を再帰 private にした後）の中でだけ tmpfs をマウントする。
+        let mounted = Command::new("mount")
+            .args(["-n", "-t", "tmpfs", "tmpfs"])
+            .arg(rootfs)
+            .status()
+            .expect("run mount");
+        assert!(mounted.success(), "mount tmpfs over the rootfs directory");
+        fs::create_dir(rootfs.join("proc")).expect("mkdir proc in the tmpfs rootfs");
+        let prepared = prepare_rootfs(&isolation, rootfs).expect("prepare rootfs");
+        let report = pivot_root(&isolation, prepared).expect("pivot_root");
+        assert!(report.old_root_detached, "the old root must be detached");
+        let root = fs::metadata("/").expect("stat the new root");
+        out.write_all(format!("{} {}\n", root.dev(), root.ino()).as_bytes())
+            .expect("write the recorded root identity");
+        out.sync_all().expect("sync the identity file");
+        // `unshare --kill-child` が親の終了に連動して落とすまで待機する（上限つき。REPAIR-5）。
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// 対象の user namespace に入った単一スレッドで、tmpfs で組み立てた rootfs の pid1 へ参加し、参加後の `/` が
+    /// 記録した pivot 後の `/` と一致すること、ホスト側の bundle ディレクトリの識別子とは一致しないことを照合する
+    /// （SEC-1・SUP-6・TASK-163 追補・#1468）。
+    pub fn joiner_tmpfs(pid: u32, rootfs: &Path, identity_file: &Path) {
+        // 参加前（ホスト側のパスが見えるうち）に、記録の識別子とホスト側の rootfs の識別子を読む。
+        let text = fs::read_to_string(identity_file).expect("read the recorded root identity");
+        let mut fields = text.split_whitespace().map(|t| t.parse::<u64>());
+        let recorded = RootIdentity::new(
+            fields.next().expect("dev").expect("dev is a number"),
+            fields.next().expect("ino").expect("ino is a number"),
+        );
+        let host = fs::metadata(rootfs).expect("stat the host-side rootfs directory");
+        let host_identity = RootIdentity::new(host.dev(), host.ino());
+        assert_ne!(
+            recorded, host_identity,
+            "a mount-namespace-built rootfs must differ from the host-side directory"
+        );
+
+        let (rec, path) = record_and_cgroup_path(pid, recorded);
+        let target = identify_pid1_in(&rec, &path).expect("identify pid1");
+        let report = enter_namespaces(&target).expect("enter namespaces");
+        assert_eq!(report.joined, JoinNamespace::SUP6_SET.to_vec());
+
+        // 本番と同じ照合: 記録した識別子とは一致し、ホスト側の bundle ディレクトリの識別子とは不一致（違反つき）。
+        verify_joined_root_for_test(recorded).expect("the joined root equals the recorded root");
+        let e = verify_joined_root_for_test(host_identity)
+            .expect_err("the host-side directory is not the joined root");
+        assert_eq!(
+            e.violation.expect("violation recorded").reason,
+            ViolationReason::ExecRootNotContainerRootfs
+        );
+        // 参加後の `/` を直接 stat しても記録と同じ。
+        let joined = fs::metadata("/").expect("stat the joined root");
+        assert_eq!(
+            (joined.dev(), joined.ino()),
+            (recorded.dev(), recorded.ino())
         );
     }
 
@@ -644,7 +807,7 @@ mod linux {
         // コンテナ用 cgroup は作れないため、pid1 が実際に属する cgroup の絶対パスを期待値にする
         // （本番は記録の配置から導く。`identify_pid1`）。別コンテナの cgroup・配下の子 cgroup・親 cgroup・
         // リーフ名だけの指定では、pid 再利用対策として拒否されることも確認する（SEC-1）。
-        let (rec, path) = record_and_cgroup_path(pid);
+        let (rec, path) = record_and_cgroup_path(pid, RootIdentity::new(44, 1234));
         let (parent, leaf) = path.rsplit_once('/').expect("cgroup leaf");
         let mut rejected = vec![
             (

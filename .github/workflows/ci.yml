@@ -809,6 +809,7 @@ jobs:
           for line in \
             'exec_setns_join: rootless join into the target user namespace verified' \
             'exec_setns_join: root after joining a pivoted target equals the pinned rootfs' \
+            'exec_setns_join: root after joining a mount-namespace-built rootfs equals the recorded root' \
             'exec_setns_join: supplementary groups kept and recorded where setgroups is denied' \
             'exec_setns_join: namespace join verified'; do
             if ! grep -Fxq "${line}" "${log}"; then

@@ -85,6 +85,12 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::dev_mounts::ImplicitDevMount;
+use crate::launch_isolation::{
+    LaunchIsolationRecord, MAX_RECORDED_RULES, RecordedLandlock, RecordedRule, RecordedTarget,
+    RootIdentity,
+};
+use crate::oci_runtime::MountDestination;
 use crate::rlimits::{Rlimit, RlimitKind, Rlimits};
 use crate::traits::{
     Annotations, CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, CreateStateRequest,
@@ -748,6 +754,10 @@ impl StateStore for FileStateStore {
         if let Some(r) = req.rlimits() {
             record = record.with_rlimits(r.clone());
         }
+        // launch 時の分離の記録も同じ形（トレイト契約 12。#1468）。
+        if let Some(l) = req.launch_isolation() {
+            record = record.with_launch_isolation(l.clone());
+        }
         self.write_record(&record)?;
         Ok(record)
     }
@@ -797,6 +807,11 @@ impl StateStore for FileStateStore {
         // 消さない。#1467）。
         if let Some(r) = req.rlimits().or(existing.rlimits()) {
             record = record.with_rlimits(r.clone());
+        }
+        // launch 時の分離の記録は指定があれば置き換え（restart の再 launch で記録し直す）、なければ引き継ぐ
+        // （トレイト契約 12。#1468）。
+        if let Some(l) = req.launch_isolation().or(existing.launch_isolation()) {
+            record = record.with_launch_isolation(l.clone());
         }
         self.write_record(&record)?;
         Ok(record)
@@ -1277,6 +1292,14 @@ fn open_nowait(path: &Path, opts: &mut OpenOptions) -> std::io::Result<File> {
 /// 重複・17 件以上は破損（`Internal`）とする。キーの無い既存ファイルは `None`（記録なし）として読む。16 種そろって
 /// いない集合は破損にしない（完全性の判定は exec 側。トレイト契約 11）。最悪でも 16 件 × 約 80 B（約 1.3 KiB）で、
 /// [`MAX_STATE_FILE_BYTES`] の余裕に収まる。
+/// `launchIsolation`（SUP-6・CORE-5・SEC-1・TASK-163 追補・#1468。launch 時の分離の記録）は `None` なら書かない。
+/// `{"root":{"dev":N,"ino":N},"landlock":{"handled":N,"rules":[{"path":"/","allowed":N,"origin":"root"},
+/// {"path":"/data","allowed":N,"origin":"mount","index":3},{"path":"/dev","allowed":N,"origin":"implicit"}]}}` で、
+/// 読み込み側は件数を確保の前に [`MAX_RECORDED_RULES`] で検証し、`/` → ルート・`MountDestination::parse` →
+/// マウント・暗黙の表（`ImplicitDevMount::ALL`）→ 暗黙マウントとして組み直し、`RecordedLandlock::new` で
+/// ビット範囲・先頭・重複を検証する。種別と由来の不一致・未知の origin・`mount` の `index` 欠落は破損（`Internal`）。
+/// キーの無い既存ファイルは `None`（記録なし）として読む。ルール数が上限に近い構成は [`MAX_STATE_FILE_BYTES`]
+/// を超えうる。その場合は書き込みが `InvalidArgument` で拒否され launch も失敗する（黙って上限を上げない）。
 /// 3 つとも持たない既存の `state.json`（導入前の版が書いたもの）は PID なし・未設定・0 回として読む
 /// （導入前は supervisor がこれらを書いていないため、破損にしない）。
 #[derive(Debug, Serialize, Deserialize)]
@@ -1305,6 +1328,108 @@ struct StateDto {
     annotations: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rlimits: Option<Vec<RlimitDto>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launch_isolation: Option<LaunchIsolationDto>,
+}
+
+/// `state.json` の launch 時の分離の記録（`launchIsolation`）。
+#[derive(Debug, Serialize, Deserialize)]
+struct LaunchIsolationDto {
+    root: RootDto,
+    landlock: LandlockDto,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RootDto {
+    dev: u64,
+    ino: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LandlockDto {
+    handled: u64,
+    rules: Vec<LandlockRuleDto>,
+}
+
+/// Landlock ルール 1 件。`origin` は `root` / `mount`（`index` 必須）/ `implicit`。
+#[derive(Debug, Serialize, Deserialize)]
+struct LandlockRuleDto {
+    path: String,
+    allowed: u64,
+    origin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    index: Option<u64>,
+}
+
+impl LaunchIsolationDto {
+    fn from_record(record: &LaunchIsolationRecord) -> Self {
+        let rules = record
+            .landlock()
+            .rules()
+            .iter()
+            .map(|r| {
+                let (origin, index) = match r.target() {
+                    RecordedTarget::Root => ("root", None),
+                    RecordedTarget::Mount { index, .. } => ("mount", Some(*index as u64)),
+                    RecordedTarget::Implicit(_) => ("implicit", None),
+                };
+                LandlockRuleDto {
+                    path: r.target().as_str().to_owned(),
+                    allowed: r.allowed(),
+                    origin: origin.to_owned(),
+                    index,
+                }
+            })
+            .collect();
+        Self {
+            root: RootDto {
+                dev: record.root().dev(),
+                ino: record.root().ino(),
+            },
+            landlock: LandlockDto {
+                handled: record.landlock().handled(),
+                rules,
+            },
+        }
+    }
+
+    /// untrusted な入力を検証つきのコンストラクタだけで組み直す。件数は確保の前に検証する。
+    fn into_record(self) -> Result<LaunchIsolationRecord, ()> {
+        if self.landlock.rules.len() > MAX_RECORDED_RULES {
+            return Err(());
+        }
+        let rules = self
+            .landlock
+            .rules
+            .into_iter()
+            .map(LandlockRuleDto::into_rule)
+            .collect::<Result<Vec<_>, _>>()?;
+        let landlock = RecordedLandlock::new(self.landlock.handled, rules).map_err(|_| ())?;
+        Ok(LaunchIsolationRecord::from_parts(
+            RootIdentity::new(self.root.dev, self.root.ino),
+            landlock,
+        ))
+    }
+}
+
+impl LandlockRuleDto {
+    fn into_rule(self) -> Result<RecordedRule, ()> {
+        let target = match (self.origin.as_str(), self.index) {
+            ("root", None) if self.path == "/" => RecordedTarget::Root,
+            ("mount", Some(index)) => RecordedTarget::Mount {
+                destination: MountDestination::parse(&self.path).map_err(|_| ())?,
+                index: usize::try_from(index).map_err(|_| ())?,
+            },
+            ("implicit", None) => RecordedTarget::Implicit(
+                ImplicitDevMount::ALL
+                    .into_iter()
+                    .find(|m| m.destination() == self.path)
+                    .ok_or(())?,
+            ),
+            _ => return Err(()),
+        };
+        Ok(RecordedRule::new(target, self.allowed))
+    }
 }
 
 /// `state.json` の rlimit 1 件（OCI `process.rlimits` の `type`・`soft`・`hard` と同じ名前）。
@@ -1355,6 +1480,9 @@ impl StateDto {
             rlimits: record
                 .rlimits()
                 .map(|set| set.iter().map(RlimitDto::from_rlimit).collect()),
+            launch_isolation: record
+                .launch_isolation()
+                .map(LaunchIsolationDto::from_record),
         })
     }
 
@@ -1420,6 +1548,11 @@ impl StateDto {
                 Some(Rlimits::new(items).map_err(|_| corrupted())?)
             }
         };
+        // launch 時の分離の記録も untrusted。破損は `Internal`（exec が壊れた記録を信用しない）。
+        let launch_isolation = match self.launch_isolation {
+            None => None,
+            Some(dto) => Some(dto.into_record().map_err(|()| corrupted())?),
+        };
         let record = StateRecord::new(
             status,
             PathBuf::from(self.bundle),
@@ -1434,6 +1567,10 @@ impl StateDto {
         .with_annotations(annotations);
         let record = match rlimits {
             Some(r) => record.with_rlimits(r),
+            None => record,
+        };
+        let record = match launch_isolation {
+            Some(l) => record.with_launch_isolation(l),
             None => record,
         };
         Ok(match cgroup {
@@ -2193,6 +2330,166 @@ mod tests {
         let got = store.get(&GetStateRequest::new(cid("full"))).unwrap();
         assert_eq!(got.rlimits(), Some(&full));
         assert!(got.rlimits().unwrap().is_complete());
+    }
+
+    fn iso(ino: u64) -> LaunchIsolationRecord {
+        let rules = vec![
+            RecordedRule::new(RecordedTarget::Root, 0x7),
+            RecordedRule::new(
+                RecordedTarget::Mount {
+                    destination: MountDestination::parse("/data").unwrap(),
+                    index: 3,
+                },
+                0x1FF,
+            ),
+            RecordedRule::new(RecordedTarget::Implicit(ImplicitDevMount::Dev), 0xFFFF),
+        ];
+        LaunchIsolationRecord::from_parts(
+            RootIdentity::new(44, ino),
+            RecordedLandlock::new(0xFFFF, rules).unwrap(),
+        )
+    }
+
+    /// SUP-6・TASK-163 追補・#1468: launch 時の分離の記録が `state.json` に書かれ（形を具体値で照合）、update で
+    /// 引き継がれ・置き換えられ、再オープン後の get でも同じ値で読める（契約 12）。
+    #[test]
+    fn sup6_task163_1468_launch_isolation_persists_survives_update_and_replaces() {
+        let t = TmpDir::new("iso");
+        let store = t.open();
+        let req = CreateStateRequest::new(ContainerStatus::created(cid("web"), None), bundle())
+            .unwrap()
+            .with_launch_isolation(iso(100));
+        let rec = store.create(&req).unwrap();
+        assert_eq!(rec.launch_isolation(), Some(&iso(100)));
+        assert_eq!(
+            read_json(&t, "web")["launchIsolation"],
+            serde_json::json!({
+                "root": {"dev": 44, "ino": 100},
+                "landlock": {"handled": 0xFFFF, "rules": [
+                    {"path": "/", "allowed": 7, "origin": "root"},
+                    {"path": "/data", "allowed": 0x1FF, "origin": "mount", "index": 3},
+                    {"path": "/dev", "allowed": 0xFFFF, "origin": "implicit"},
+                ]},
+            })
+        );
+        let updated = store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::running(cid("web"), NonZeroU32::new(100)),
+                rec.revision(),
+            ))
+            .unwrap();
+        assert_eq!(updated.launch_isolation(), Some(&iso(100)));
+        let got = t.open().get(&GetStateRequest::new(cid("web"))).unwrap();
+        assert_eq!(got.launch_isolation(), Some(&iso(100)));
+        let replaced = store
+            .update(
+                &UpdateStateRequest::new(
+                    ContainerStatus::running(cid("web"), NonZeroU32::new(100)),
+                    updated.revision(),
+                )
+                .with_launch_isolation(iso(200)),
+            )
+            .unwrap();
+        assert_eq!(replaced.launch_isolation(), Some(&iso(200)));
+    }
+
+    /// 後方互換（#1468）: 記録しないレコードは `launchIsolation` キーを書かず、キーの無い既存 `state.json` は
+    /// `None` として読める。
+    #[test]
+    fn sup6_task163_1468_absent_launch_isolation_is_omitted_and_legacy_reads_none() {
+        let t = TmpDir::new("isonone");
+        let store = t.open();
+        let rec = create(&store, "plain");
+        assert!(rec.launch_isolation().is_none());
+        assert!(read_json(&t, "plain").get("launchIsolation").is_none());
+        let got = store.get(&GetStateRequest::new(cid("plain"))).unwrap();
+        assert!(got.launch_isolation().is_none());
+    }
+
+    /// #1468: 不正な launchIsolation は破損（Internal）。未知の origin・パスと origin の不一致・`..` を含む
+    /// destination・index 欠落・ビット範囲外・handled 外の allowed・先頭が root でない・重複・件数超過。
+    #[test]
+    fn sup6_task163_1468_invalid_launch_isolation_is_corrupted() {
+        let t = TmpDir::new("isobad");
+        let store = t.open();
+        let rule = |path: &str, allowed: u64, origin: &str, index: Option<u64>| {
+            let mut v = serde_json::json!({"path": path, "allowed": allowed, "origin": origin});
+            if let Some(i) = index {
+                v["index"] = serde_json::json!(i);
+            }
+            v
+        };
+        let root = || rule("/", 7, "root", None);
+        let many: Vec<_> = std::iter::once(root())
+            .chain((0..MAX_RECORDED_RULES).map(|i| rule(&format!("/m{i}"), 0, "mount", Some(0))))
+            .collect();
+        let cases: Vec<(&str, u64, Vec<serde_json::Value>)> = vec![
+            ("a", 0xFFFF, vec![root(), rule("/x", 1, "bogus", None)]),
+            ("b", 0xFFFF, vec![root(), rule("/dev", 1, "mount", None)]),
+            (
+                "c",
+                0xFFFF,
+                vec![root(), rule("/a/../b", 1, "mount", Some(0))],
+            ),
+            (
+                "d",
+                0xFFFF,
+                vec![root(), rule("/nodev-here", 1, "implicit", None)],
+            ),
+            ("e", 0x1_0000, vec![root()]),
+            ("f", 0x3, vec![rule("/", 7, "root", None)]),
+            ("g", 0xFFFF, vec![rule("/data", 1, "mount", Some(0))]),
+            ("h", 0xFFFF, vec![root(), root()]),
+            ("i", 0xFFFF, many),
+            ("j", 0xFFFF, vec![rule("/x", 1, "root", None)]),
+            (
+                "k",
+                0xFFFF,
+                vec![root(), rule("/x", 1, "mount", Some(1 << 40))],
+            ),
+        ];
+        for (id, handled, rules) in cases {
+            create(&store, id);
+            let body = serde_json::json!({
+                "ociVersion": "1.2.0", "id": id, "status": "stopped", "bundle": "/b", "revision": 10,
+                "launchIsolation": {
+                    "root": {"dev": 1, "ino": 2},
+                    "landlock": {"handled": handled, "rules": rules},
+                },
+            });
+            fs::write(t.path().join(id).join("state.json"), body.to_string()).unwrap();
+            let e = store.get(&GetStateRequest::new(cid(id))).unwrap_err();
+            assert_eq!(e.code().as_str(), "INTERNAL", "{id}");
+        }
+    }
+
+    /// #1468: 上限（`MAX_STATE_FILE_BYTES`）を超える記録の書き込みは構造化エラーで拒否する（黙って切り詰めない）。
+    #[test]
+    fn sup6_task163_1468_oversized_launch_isolation_write_is_rejected() {
+        let t = TmpDir::new("isobig");
+        let store = t.open();
+        let long = format!("/{}", "a".repeat(200));
+        let mut rules = vec![RecordedRule::new(RecordedTarget::Root, 0)];
+        for i in 0..400usize {
+            rules.push(RecordedRule::new(
+                RecordedTarget::Mount {
+                    destination: MountDestination::parse(&format!("{long}{i}")).unwrap(),
+                    index: i,
+                },
+                0,
+            ));
+        }
+        let big = LaunchIsolationRecord::from_parts(
+            RootIdentity::new(1, 2),
+            RecordedLandlock::new(0xFFFF, rules).unwrap(),
+        );
+        let req = CreateStateRequest::new(ContainerStatus::created(cid("big"), None), bundle())
+            .unwrap()
+            .with_launch_isolation(big);
+        let e = store.create(&req).unwrap_err();
+        assert_eq!(e.code().as_str(), "INVALID_ARGUMENT");
+        assert_eq!(e.message(), "state file exceeds the size limit");
+        assert!(store.get(&GetStateRequest::new(cid("big"))).is_err());
     }
 
     fn ann(pairs: &[(&str, &str)]) -> Annotations {

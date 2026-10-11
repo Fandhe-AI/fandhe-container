@@ -69,6 +69,15 @@
 //!     `get` / `list` で返す。plugin 実装も同じく往復させる。ストアは集合の完全性を課さない
 //!     （任意の集合を往復させる）。完全性（16 種）の判定は exec 側の責務で、記録が無い・不完全なら
 //!     exec は `FailedPrecondition` で拒否する
+//! 12. [`StateRecord::launch_isolation`]（launch 時の分離の記録。コンテナの `/` の同一性と、適用した Landlock の
+//!     handled access・ルール。SUP-6・CORE-5・SEC-1・TASK-163 追補・#1468）は、`create` で
+//!     [`CreateStateRequest::with_launch_isolation`] の指定があればその値、なければ `None` で記録する。`update` は
+//!     [`UpdateStateRequest::with_launch_isolation`] の指定があれば置き換え、なければ既存の値を引き継ぐ
+//!     （supervisor の status 更新で記録を消さないため）。**restart の再 launch は mount namespace を作り直す
+//!     （overlay なら `/` の inode も変わる）ため、再 launch の担当は必ず指定付きの `update` で記録し直す**
+//!     （しないと restart 後の exec は `/` の照合で拒否される。fail-closed）。`get` / `list` で返す。plugin 実装も
+//!     同じく往復させる。ストアは中身の正しさを判定しない（型が検証済みの値しか作らせない）。記録が無い場合の
+//!     拒否は exec 側の責務
 //!
 //! メソッドは同期（`&self`、`async fn` を使わない）にし、ジェネリクスも持たない。
 //! `ContainerRuntime`（TASK-4.1）と同じく dyn 互換（object safety）を保つ。
@@ -84,6 +93,7 @@ use std::path::{Path, PathBuf};
 
 use super::container_runtime::ContainerStatus;
 use super::types::{ContainerId, ErrorCode, TraitError};
+use crate::launch_isolation::LaunchIsolationRecord;
 use crate::rlimits::Rlimits;
 
 /// コンテナ状態の作成・更新・取得・一覧・削除を抽象化する拡張点。
@@ -467,6 +477,8 @@ pub struct StateRecord {
     annotations: Annotations,
     /// launch 時の rlimit の記録（契約 11。SUP-12・SUP-6・TASK-169 追補・#1467）。
     rlimits: Option<Rlimits>,
+    /// launch 時の分離の記録（契約 12。SUP-6・TASK-163 追補・#1468）。
+    launch_isolation: Option<LaunchIsolationRecord>,
 }
 
 impl StateRecord {
@@ -496,7 +508,20 @@ impl StateRecord {
             restart_count: 0,
             annotations: Annotations::default(),
             rlimits: None,
+            launch_isolation: None,
         })
+    }
+
+    /// launch 時の分離の記録を設定する（[`Self::launch_isolation`]）。ストア実装が create・update・読み込みで使う。
+    #[must_use]
+    pub fn with_launch_isolation(mut self, launch_isolation: LaunchIsolationRecord) -> Self {
+        self.launch_isolation = Some(launch_isolation);
+        self
+    }
+
+    /// launch 時の分離の記録を返す（契約 12）。`None` は記録が無いことを表し、exec は拒否する。
+    pub fn launch_isolation(&self) -> Option<&LaunchIsolationRecord> {
+        self.launch_isolation.as_ref()
     }
 
     /// launch 時の rlimit の記録を設定する（[`Self::rlimits`]）。ストア実装が create・update・読み込みで使う。
@@ -608,6 +633,7 @@ pub struct CreateStateRequest {
     supervision: Option<SupervisionState>,
     annotations: Option<Annotations>,
     rlimits: Option<Rlimits>,
+    launch_isolation: Option<LaunchIsolationRecord>,
 }
 
 impl CreateStateRequest {
@@ -628,7 +654,21 @@ impl CreateStateRequest {
             supervision: None,
             annotations: None,
             rlimits: None,
+            launch_isolation: None,
         })
+    }
+
+    /// 記録する launch 時の分離（`/` の同一性と Landlock ルール）を指定する（SUP-6・TASK-163 追補・#1468。
+    /// 契約 12）。未指定なら記録しない。
+    #[must_use]
+    pub fn with_launch_isolation(mut self, launch_isolation: LaunchIsolationRecord) -> Self {
+        self.launch_isolation = Some(launch_isolation);
+        self
+    }
+
+    /// 指定された launch 時の分離の記録を返す（未指定なら `None`）。
+    pub fn launch_isolation(&self) -> Option<&LaunchIsolationRecord> {
+        self.launch_isolation.as_ref()
     }
 
     /// 記録する launch 時の rlimit を指定する（SUP-12・TASK-169 追補・#1467。契約 11）。未指定なら記録しない。
@@ -709,6 +749,7 @@ pub struct UpdateStateRequest {
     supervision: Option<SupervisionState>,
     cgroup_scope: Option<CgroupScope>,
     rlimits: Option<Rlimits>,
+    launch_isolation: Option<LaunchIsolationRecord>,
 }
 
 impl UpdateStateRequest {
@@ -720,7 +761,21 @@ impl UpdateStateRequest {
             supervision: None,
             cgroup_scope: None,
             rlimits: None,
+            launch_isolation: None,
         }
+    }
+
+    /// 更新後の launch 時の分離の記録を指定する（契約 12。SUP-6・TASK-163 追補・#1468）。restart の再 launch は
+    /// mount namespace を作り直すため、再 launch の担当は必ず指定して記録し直す。未指定の update は既存の値を引き継ぐ。
+    #[must_use]
+    pub fn with_launch_isolation(mut self, launch_isolation: LaunchIsolationRecord) -> Self {
+        self.launch_isolation = Some(launch_isolation);
+        self
+    }
+
+    /// 指定された launch 時の分離の記録を返す（未指定なら `None`。その場合は既存の値を引き継ぐ）。
+    pub fn launch_isolation(&self) -> Option<&LaunchIsolationRecord> {
+        self.launch_isolation.as_ref()
     }
 
     /// 更新後の rlimit の記録を指定する（契約 11。SUP-12・TASK-169 追補・#1467）。
@@ -1054,6 +1109,10 @@ mod tests {
             if let Some(r) = req.rlimits() {
                 record = record.with_rlimits(r.clone());
             }
+            // 契約 12: launch 時の分離の記録も同じ形。
+            if let Some(l) = req.launch_isolation() {
+                record = record.with_launch_isolation(l.clone());
+            }
             records.insert(req.id().clone(), record.clone());
             Ok(record)
         }
@@ -1095,6 +1154,10 @@ mod tests {
             // 契約 11: rlimit の記録は指定があれば置き換え、なければ引き継ぐ。
             if let Some(r) = req.rlimits().or(current.rlimits()) {
                 updated = updated.with_rlimits(r.clone());
+            }
+            // 契約 12: launch 時の分離の記録は指定があれば置き換え、なければ引き継ぐ。
+            if let Some(l) = req.launch_isolation().or(current.launch_isolation()) {
+                updated = updated.with_launch_isolation(l.clone());
             }
             records.insert(req.id().clone(), updated.clone());
             Ok(updated)
@@ -1636,6 +1699,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!(replaced.rlimits(), Some(&mk(800)));
+    }
+
+    /// SUP-6・TASK-163 追補・#1468: 契約 12（create で記録・指定なしの update は引き継ぎ・指定ありは置き換え）。
+    #[test]
+    fn sup6_task163_1468_launch_isolation_round_trips_through_trait_store() {
+        use crate::launch_isolation::{
+            LaunchIsolationRecord, RecordedLandlock, RecordedRule, RecordedTarget, RootIdentity,
+        };
+        let mk = |ino| {
+            let landlock =
+                RecordedLandlock::new(0xFFFF, vec![RecordedRule::new(RecordedTarget::Root, 0x7)])
+                    .unwrap();
+            LaunchIsolationRecord::from_parts(RootIdentity::new(5, ino), landlock)
+        };
+        let store = StubStateStore::new();
+        let id = ContainerId::new("iso".to_string()).unwrap();
+        let req = CreateStateRequest::new(
+            ContainerStatus::created(id.clone(), None),
+            std::env::temp_dir(),
+        )
+        .unwrap();
+        assert_eq!(req.launch_isolation(), None);
+        let plain = store.create(&req).unwrap();
+        assert_eq!(plain.launch_isolation(), None);
+        let id2 = ContainerId::new("iso2".to_string()).unwrap();
+        let rec = store
+            .create(
+                &CreateStateRequest::new(
+                    ContainerStatus::created(id2.clone(), None),
+                    std::env::temp_dir(),
+                )
+                .unwrap()
+                .with_launch_isolation(mk(10)),
+            )
+            .unwrap();
+        assert_eq!(rec.launch_isolation(), Some(&mk(10)));
+        let kept = store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::stopped(id2.clone(), Some(0)),
+                rec.revision(),
+            ))
+            .unwrap();
+        assert_eq!(kept.launch_isolation(), Some(&mk(10)));
+        let replaced = store
+            .update(
+                &UpdateStateRequest::new(ContainerStatus::stopped(id2, Some(0)), kept.revision())
+                    .with_launch_isolation(mk(11)),
+            )
+            .unwrap();
+        assert_eq!(replaced.launch_isolation(), Some(&mk(11)));
     }
 
     /// TASK-30.3・OCI-6: `CgroupScope` はルート `/` と `/a/b` 形式だけを受理し、相対・空要素・`.`・`..`・

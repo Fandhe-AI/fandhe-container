@@ -116,10 +116,10 @@ mod linux {
     use fandhe_container_core::exec::{
         ChildExit, ContainerEnv, DevptsGidSource, ExecExit, IsolationConfig, MountIsolation,
         Namespace, NamespaceSet, ViolationReason, create_default_devices,
-        isolate_rootful_host_root, launch_rlimits_from_self, mount_tmpfs, pivot_root,
-        plan_rootful_host_root, prepare_rootfs,
+        isolate_rootful_host_root, launch_isolation_from_bundle, launch_rlimits_from_self,
+        mount_tmpfs, pivot_root, plan_rootful_host_root, prepare_rootfs,
     };
-    use fandhe_container_core::oci_runtime::load_config;
+    use fandhe_container_core::oci_runtime::{load_config, pin_bundle_rootfs};
     use fandhe_container_core::rlimits::{Rlimit, RlimitKind, Rlimits};
     use fandhe_container_core::tmpfs::TmpfsMountSet;
     use fandhe_container_core::traits::{
@@ -486,7 +486,17 @@ mod linux {
         launch_rlimits_from_self(&specified).expect("launch rlimits")
     }
 
-    /// 記録（Running・pid1 の host 側 pid・cgroup 配置・launch 時の rlimit つき）。joiner も同じ関数で作る。
+    /// launch 時の分離の記録（#1468）。コンテナは bundle の rootfs を自分自身へ bind して pivot する（launcher の
+    /// 契約）ため、固定した rootfs の識別子と `config.json` 由来の Landlock ルールが pivot 後の `/` と一致する。
+    fn launch_isolation(
+        bundle: &Path,
+    ) -> fandhe_container_core::launch_isolation::LaunchIsolationRecord {
+        let config = load_config(&bundle.join("config.json")).expect("config");
+        let rootfs = pin_bundle_rootfs(bundle, &config).expect("pin rootfs");
+        launch_isolation_from_bundle(&config, &rootfs).expect("launch isolation")
+    }
+
+    /// 記録（Running・pid1 の host 側 pid・cgroup 配置・launch 時の rlimit と分離つき）。joiner も同じ関数で作る。
     fn make_record(pid1: u32, bundle: &Path, scope: &str, instance: u64) -> StateRecord {
         let status = ContainerStatus::running(
             ContainerId::new(CONTAINER_ID).expect("id"),
@@ -499,6 +509,7 @@ mod linux {
                 StateRevision::from_raw(instance),
             ))
             .with_rlimits(launch_rlimits())
+            .with_launch_isolation(launch_isolation(bundle))
     }
 
     /// コンテナ（pivot 済みの pid1）を起動して cgroup へ入れる。`tag` は合図・pid ファイルの識別子。

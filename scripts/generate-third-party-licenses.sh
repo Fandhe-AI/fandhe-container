@@ -19,16 +19,21 @@
 #   --timeout  cargo fetch と cargo about generate それぞれの上限秒（既定 600。1〜3600。REPAIR-5）
 # 環境変数: CARGO（cargo コマンドの差し替え。自己テストがスタブを渡す）
 #
-# 前提ツール: cargo・cargo-about・mktemp・mv・sleep・kill（Git Bash でも動く bash 構文に限る）
+# タイムアウト（REPAIR-5）: cargo は独立したプロセスグループで起動し、期限超過時はグループ全体
+# （cargo が起動した cargo-about・補助プロセスを含む）へ TERM、猶予 2 秒後に KILL を送り、
+# 終了を確かめる。
 #
-# 出力先の安全性（security.md）: 出力先とその親が symlink なら拒否し、既存の出力先が
-# 通常ファイル以外でも拒否する。同じディレクトリの一時ファイルへ生成し、空でないことを
+# 前提ツール: cargo・cargo-about・mktemp・mv・find・id・sleep・kill（Git Bash でも動く bash 構文に限る）
+#
+# 出力先の安全性（security.md）: 出力先ディレクトリの祖先を含むパス要素のどれかが symlink
+# なら（mkdir・書き込みより前に）拒否する。ただし非 root 実行時に限り root 所有の symlink
+# （macOS の /var・/tmp 等のシステム設定）は許容する。既存の出力先が通常ファイル以外でも拒否する。同じディレクトリの一時ファイルへ生成し、空でないことを
 # 確かめてから mv で置き換える（途中までのファイルを残さない）。
 #
 # 終了コード（呼び出し元はこの具体値で分岐する）:
 #   0: 成功（stdout に出力先のパスを 1 行出す）
 #   1: cargo fetch / cargo about generate が失敗した（ライセンスを確定できない crate を含む）
-#   2: 引数・環境・ツール未導入・出力先が不正
+#   2: 引数・環境・ツール未導入・出力先が不正（mktemp・mkdir・mv の失敗を含む）
 #   3: タイムアウト
 # エラーは stderr に `error: code=<code> message=<英語>` の 1 行で出す。
 set -euo pipefail
@@ -71,16 +76,40 @@ for f in Cargo.toml about.toml about.hbs; do
     [ -f "$root/$f" ] || { err bad-environment "missing $f in repository root"; exit 2; }
 done
 
+# 一時領域（タイムアウト印の置き場）。後始末は cleanup が行う。
+work_dir=""
+tmp=""
+child_pid=""
+wd_pid=""
+cleanup() {
+    if [ -n "$child_pid" ]; then
+        kill -TERM -- "-$child_pid" 2>/dev/null || true
+        kill -KILL -- "-$child_pid" 2>/dev/null || true
+    fi
+    if [ -n "$wd_pid" ]; then
+        kill "$wd_pid" 2>/dev/null || true
+    fi
+    [ -z "$tmp" ] || rm -f "$tmp"
+    [ -z "$work_dir" ] || rm -rf "$work_dir"
+}
+trap cleanup EXIT
+trap 'exit 143' INT TERM
+
+work_dir="$(mktemp -d)" || { work_dir=""; err bad-environment "cannot create a temporary directory"; exit 2; }
+
 # 子プロセスを上限秒で打ち切る（macOS に timeout が無いため見張り役方式）。
-# 超過時は 124 を返す。
+# 子は job control（set -m）で独立したプロセスグループにし、超過時はグループ全体へ
+# TERM → 猶予後 KILL を送って終了を確認する。超過時は 124 を返す。
 run_limited() {
     local limit="$1"
     shift
-    local marker
-    marker="$(mktemp)"
+    local marker="$work_dir/timeout-marker"
     rm -f "$marker"
+    set -m
     "$@" &
     local pid=$!
+    set +m
+    child_pid="$pid"
     (
         i=0
         while [ "$i" -lt "$limit" ]; do
@@ -89,20 +118,59 @@ run_limited() {
             i=$((i + 1))
         done
         : >"$marker"
-        kill -TERM "$pid" 2>/dev/null || true
-        sleep 1
-        kill -KILL "$pid" 2>/dev/null || true
+        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+        sleep 2
+        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
     ) &
-    local wd=$!
+    wd_pid=$!
     local rc=0
     wait "$pid" || rc=$?
-    kill "$wd" 2>/dev/null || true
-    wait "$wd" 2>/dev/null || true
     if [ -e "$marker" ]; then
+        # 見張り役が KILL まで送り終えるのを待ち、グループの消滅を確認する。
+        wait "$wd_pid" 2>/dev/null || true
+        local n=0
+        while kill -0 -- "-$pid" 2>/dev/null && [ "$n" -lt 5 ]; do
+            sleep 1
+            n=$((n + 1))
+        done
+        wd_pid=""
+        child_pid=""
         rm -f "$marker"
         return 124
     fi
+    kill "$wd_pid" 2>/dev/null || true
+    wait "$wd_pid" 2>/dev/null || true
+    wd_pid=""
+    child_pid=""
     return "$rc"
+}
+
+# パス要素のいずれかが symlink なら 1（symlink なし・未存在なら 0）を返す（存在する要素のみ検査し、無い要素で打ち切る）。
+# 非 root 実行時は root 所有の symlink（システム設定）を許容する。".." は字句的に畳む
+# （手前の要素が symlink でないことを検査済みのため意味が変わらない）。
+path_is_symlink_free() {
+    local path="$1" cur="" part
+    local -a parts
+    case "$path" in
+        /*) ;;
+        *) path="$PWD/$path" ;;
+    esac
+    IFS=/ read -r -a parts <<<"${path#/}"
+    for part in "${parts[@]}"; do
+        case "$part" in
+            "" | .) continue ;;
+            ..) cur="${cur%/*}"; continue ;;
+        esac
+        cur="$cur/$part"
+        [ -e "$cur" ] || [ -L "$cur" ] || return 0
+        if [ -L "$cur" ]; then
+            if [ "$(id -u)" -ne 0 ] && [ -n "$(find "$cur" -maxdepth 0 -user 0 2>/dev/null)" ]; then
+                continue
+            fi
+            return 1
+        fi
+    done
+    return 0
 }
 
 # ツール確認は入力検証より先に行い、未導入を別の失敗と誤分類しない。
@@ -114,18 +182,23 @@ fi
 default_dir="$root/target/third-party-licenses"
 if [ -z "$output" ]; then
     output="$default_dir/THIRD-PARTY-LICENSES.md"
-    mkdir -p "$default_dir"
+    # mkdir より前に祖先（target 等）の symlink を検査する。
+    if ! path_is_symlink_free "$default_dir"; then
+        err bad-output "output directory path must not contain a symlink"
+        exit 2
+    fi
+    mkdir -p "$default_dir" 2>/dev/null || { err bad-output "cannot create the default output directory"; exit 2; }
 fi
 out_dir="$(dirname "$output")"
-if [ -L "$out_dir" ]; then
-    err bad-output "output directory must not be a symlink"
+if ! path_is_symlink_free "$out_dir"; then
+    err bad-output "output directory path must not contain a symlink"
     exit 2
 fi
 if [ ! -d "$out_dir" ]; then
     err bad-output "output directory does not exist"
     exit 2
 fi
-out_dir="$(cd "$out_dir" && pwd)"
+out_dir="$(cd "$out_dir" && pwd)" || { err bad-output "cannot enter the output directory"; exit 2; }
 output="$out_dir/$(basename "$output")"
 if [ -L "$output" ]; then
     err bad-output "output path must not be a symlink"
@@ -136,8 +209,8 @@ if [ -e "$output" ] && [ ! -f "$output" ]; then
     exit 2
 fi
 
-tmp="$(mktemp "$out_dir/.third-party-licenses.XXXXXX")"
-trap 'rm -f "$tmp"' EXIT
+tmp="$(mktemp "$out_dir/.third-party-licenses.XXXXXX" 2>/dev/null)" \
+    || { tmp=""; err bad-output "cannot create a temporary file in the output directory"; exit 2; }
 
 rc=0
 run_limited "$timeout_s" "$cargo" fetch --locked --manifest-path "$root/Cargo.toml" >&2 || rc=$?
@@ -167,5 +240,6 @@ if [ ! -s "$tmp" ]; then
     exit 1
 fi
 
-mv -f "$tmp" "$output"
+mv -f "$tmp" "$output" 2>/dev/null || { err bad-output "cannot move the generated file to the output path"; exit 2; }
+tmp=""
 printf '%s\n' "$output"

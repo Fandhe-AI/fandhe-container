@@ -25,6 +25,12 @@ case "$1" in
         fi
         [ "$STUB_MODE" = "fail" ] && exit 1
         [ "$STUB_MODE" = "hang" ] && exec sleep 30
+        if [ "$STUB_MODE" = "orphan" ]; then
+            # TERM を無視する孫プロセスを残す（グループ KILL まで届くかの検証用）。
+            (trap '' TERM; exec sleep 300) &
+            echo $! >"$STUB_PIDFILE"
+            wait
+        fi
         out=""
         while [ $# -gt 0 ]; do
             if [ "$1" = "-o" ]; then out="$2"; fi
@@ -38,6 +44,18 @@ exit 0
 STUB
 chmod +x "$work/cargo"
 
+real_mktemp="$(command -v mktemp)"
+mkdir "$work/bin-mktemp" "$work/bin-mv"
+# 出力先の一時ファイル作成だけ失敗する mktemp / 常に失敗する mv（ファイル操作失敗の検証用）。
+cat >"$work/bin-mktemp/mktemp" <<STUB
+#!/usr/bin/env bash
+case "\$*" in *third-party-licenses*) exit 1 ;; esac
+exec "$real_mktemp" "\$@"
+STUB
+printf '#!/usr/bin/env bash\nexit 1\n' >"$work/bin-mv/mv"
+chmod +x "$work/bin-mktemp/mktemp" "$work/bin-mv/mv"
+PATH_PREFIX=""
+
 fails=0
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; fails=$((fails + 1)); }
@@ -48,7 +66,8 @@ run() {
     shift
     : >"$work/log"
     rc=0
-    CARGO="$work/cargo" STUB_MODE="$mode" STUB_LOG="$work/log" \
+    CARGO="$work/cargo" STUB_MODE="$mode" STUB_LOG="$work/log" STUB_PIDFILE="$work/pid" \
+        PATH="${PATH_PREFIX:+$PATH_PREFIX:}$PATH" \
         bash "$target" "$@" >"$work/out" 2>"$work/err" || rc=$?
 }
 
@@ -127,6 +146,52 @@ if [ "$rc" -eq 3 ] && grep -q "code=timeout" "$work/err" && [ "$elapsed" -le 10 
     pass "timeout (${elapsed}s)"
 else
     fail "timeout (rc=$rc, ${elapsed}s)"
+fi
+
+# 8 タイムアウト時に孫プロセス（TERM 無視）も停止する
+mkdir "$work/o8"
+rm -f "$work/pid"
+run orphan --output "$work/o8/L.md" --timeout 2
+gc="$(cat "$work/pid" 2>/dev/null || true)"
+sleep 1
+if [ "$rc" -eq 3 ] && [ -n "$gc" ] && ! kill -0 "$gc" 2>/dev/null; then
+    pass "timeout kills descendants"
+else
+    [ -z "$gc" ] || kill -KILL "$gc" 2>/dev/null || true
+    fail "timeout kills descendants (rc=$rc, pid=$gc)"
+fi
+
+# 9 出力先の祖先ディレクトリが symlink なら拒否し、リンク先へ書かない
+mkdir -p "$work/o9/real/sub"
+ln -s "$work/o9/real" "$work/o9/link"
+run ok --output "$work/o9/link/sub/L.md"
+if [ "$rc" -eq 2 ] && grep -q "code=bad-output" "$work/err" \
+    && [ -z "$(ls -A "$work/o9/real/sub")" ]; then
+    pass "ancestor symlink rejected"
+else
+    fail "ancestor symlink rejected (rc=$rc)"
+fi
+
+# 10 一時ファイル作成の失敗は構造化エラー（exit 2）
+mkdir "$work/o10"
+PATH_PREFIX="$work/bin-mktemp"
+run ok --output "$work/o10/L.md"
+PATH_PREFIX=""
+if [ "$rc" -eq 2 ] && grep -q "code=bad-output message=" "$work/err" && [ -z "$(ls -A "$work/o10")" ]; then
+    pass "mktemp failure structured"
+else
+    fail "mktemp failure structured (rc=$rc)"
+fi
+
+# 11 mv の失敗は構造化エラー（exit 2）で一時ファイルを残さない
+mkdir "$work/o11"
+PATH_PREFIX="$work/bin-mv"
+run ok --output "$work/o11/L.md"
+PATH_PREFIX=""
+if [ "$rc" -eq 2 ] && grep -q "code=bad-output message=" "$work/err" && [ -z "$(ls -A "$work/o11")" ]; then
+    pass "mv failure structured"
+else
+    fail "mv failure structured (rc=$rc)"
 fi
 
 if [ "$fails" -ne 0 ]; then

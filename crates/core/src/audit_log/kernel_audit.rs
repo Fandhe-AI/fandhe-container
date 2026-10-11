@@ -243,11 +243,11 @@ fn encode_payload(record: &AuditRecord) -> Result<String, AuditWriteError> {
         | AuditEvent::ExecTarget { .. }
         | AuditEvent::Entrypoint { .. } => None,
         AuditEvent::Landlock { path, .. } => Some(path),
-        AuditEvent::Mount { path } => path.as_ref(),
+        AuditEvent::Mount { path, .. } => path.as_ref(),
         AuditEvent::PluginTrust { path, .. } => Some(path),
     };
     let fields = PathFields::new(path);
-    // 末尾: plugin 信頼検証・exec 対象・entrypoint のみ理由、続けてコンテナ ID（全層）。
+    // 末尾: plugin 信頼検証・exec 対象・entrypoint・理由つき mount のみ理由、続けてコンテナ ID（全層）。
     // ID は `[A-Za-z0-9._-]` のみ（`'`・空白・改行・NUL・`=` を含まない）と型が保証するので、
     // `msg='…'` 内の key=value を壊さず生の値で出せる。
     let mut tail = String::new();
@@ -653,7 +653,10 @@ mod tests {
 
     #[test]
     fn sec4_task41_5_2_payload_mount_without_path() {
-        let r = rec(AuditEvent::Mount { path: None });
+        let r = rec(AuditEvent::Mount {
+            path: None,
+            reason: None,
+        });
         assert_eq!(
             encode_payload(&r).unwrap(),
             "op=fandhe-audit layer=mount ts=1700000000.000000005 pid=1234 syscall=? arch=? \
@@ -666,7 +669,10 @@ mod tests {
     fn sec4_task41_5_2_payload_non_utf8_path_is_raw_hex() {
         use std::os::unix::ffi::OsStrExt as _;
         let p = AuditPath::new(std::ffi::OsStr::from_bytes(b"/x\xff\xfe"));
-        let r = rec(AuditEvent::Mount { path: Some(p) });
+        let r = rec(AuditEvent::Mount {
+            path: Some(p),
+            reason: None,
+        });
         assert!(
             encode_payload(&r)
                 .unwrap()
@@ -678,6 +684,7 @@ mod tests {
     fn sec4_task41_5_2_payload_max_path_fits_in_message_limit() {
         let r = rec(AuditEvent::Mount {
             path: Some(AuditPath::new(&"a".repeat(4096))),
+            reason: None,
         });
         let text = encode_payload(&r).unwrap();
         assert_eq!(text.len(), PAYLOAD_LEN_FOR_4096_BYTE_PATH);
@@ -685,6 +692,7 @@ mod tests {
         // 上限超過で切り詰められたパスも同じ上限に収まる。
         let long = rec(AuditEvent::Mount {
             path: Some(AuditPath::new(&"a".repeat(10_000))),
+            reason: None,
         });
         let t = encode_payload(&long).unwrap();
         assert!(t.ends_with("path_truncated=1 path_original_len=10000 container_id=?"));
@@ -712,7 +720,11 @@ mod tests {
     /// SEC-4・#1618: mount の本文は末尾が ` container_id=c1`。
     #[test]
     fn sec4_1618_payload_mount_with_container_id() {
-        let r = rec(AuditEvent::Mount { path: None }).with_container_id(cid("c1"));
+        let r = rec(AuditEvent::Mount {
+            path: None,
+            reason: None,
+        })
+        .with_container_id(cid("c1"));
         assert!(
             encode_payload(&r)
                 .unwrap()
@@ -720,10 +732,49 @@ mod tests {
         );
     }
 
+    /// SEC-4・#1701: 理由つきの mount（パスなし）は ` reason=<トークン>` を container_id の直前に付ける。
+    #[test]
+    fn sec4_1701_payload_mount_with_reason_is_exact() {
+        let r = rec(AuditEvent::Mount {
+            path: None,
+            reason: Some(crate::audit_log::AuditReason::new("rootfs_is_host_root")),
+        })
+        .with_container_id(cid("c1"));
+        assert_eq!(
+            encode_payload(&r).unwrap(),
+            "op=fandhe-audit layer=mount ts=1700000000.000000005 pid=1234 syscall=? arch=? path=? \
+             path_truncated=? path_original_len=? reason=rootfs_is_host_root container_id=c1"
+        );
+    }
+
+    /// SEC-4・#1701: 最悪ケース（4096 バイトのパス・最長の mount 層の理由・255 バイトの ID）でも上限に収まる。
+    #[test]
+    fn sec4_1701_payload_mount_reason_worst_case_fits() {
+        let id = "a".repeat(255);
+        let r = rec(AuditEvent::Mount {
+            path: Some(AuditPath::new(&"a".repeat(4096))),
+            reason: Some(crate::audit_log::AuditReason::new(
+                "rootfs_symlink_or_not_directory",
+            )),
+        })
+        .with_container_id(cid(&id));
+        let t = encode_payload(&r).unwrap();
+        assert!(t.len() <= AUDIT_MESSAGE_TEXT_MAX, "{}", t.len());
+        assert!(
+            t.ends_with(&format!(
+                " reason=rootfs_symlink_or_not_directory container_id={id}"
+            )),
+            "{t}"
+        );
+    }
+
     /// SEC-4・#1618: ID が無い本文は ` container_id=?`（既存の `?` の慣例）。
     #[test]
     fn sec4_1618_payload_without_container_id_is_question_mark() {
-        let r = rec(AuditEvent::Mount { path: None });
+        let r = rec(AuditEvent::Mount {
+            path: None,
+            reason: None,
+        });
         assert!(encode_payload(&r).unwrap().ends_with(" container_id=?"));
     }
 
@@ -733,6 +784,7 @@ mod tests {
         let id = "a".repeat(255);
         let r = rec(AuditEvent::Mount {
             path: Some(AuditPath::new(&"a".repeat(4096))),
+            reason: None,
         })
         .with_container_id(cid(&id));
         let t = encode_payload(&r).unwrap();

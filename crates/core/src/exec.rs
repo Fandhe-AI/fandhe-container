@@ -256,7 +256,7 @@ pub use violation::{
 /// マウント層の分離違反を監査レコードとして記録する（SEC-4・CORE-1・TASK-41.4・#195）。
 ///
 /// `err.violation` が `MountTarget` / `SharedPropagation` / `RootfsPivot` のときだけ `Mount`
-/// レコードを 1 件 `sink` へ渡す（時刻・PID は呼び出し時点）。システムエラー・それ以外の種別は
+/// レコードを 1 件 `sink` へ渡す（時刻・PID は呼び出し時点。理由コード＝違反の `as_str()` つき。#1701）。システムエラー・それ以外の種別は
 /// 記録せず `NotApplicable`。`err` は常にそのまま返り、記録の失敗で拒否は覆らない（fail-closed）。
 ///
 /// 本番の `spawn_container` 子プロセス・launcher への配線は未実装（`AuditSink` を fork 後へ渡す設計が
@@ -346,7 +346,7 @@ pub fn record_exec_target_rejection<E>(
 ///
 /// `reason` は `ViolationReason::EXEC_WORKER_REASONS` で引き直した値を渡す。種別 `exec_target` は層 `exec_target`
 /// （[`record_exec_target_rejection`] と同じレコード）、種別 `rootfs_pivot`（`rootfs_is_host_root`）は
-/// [`audit_mount_violation`] と同じ写像で層 `mount` のパスなしのレコードにする（`ViolationReason::exec_worker_audit_event`）。
+/// [`audit_mount_violation`] と同じ写像で層 `mount` のパスなし・理由コードつきのレコードにする（`ViolationReason::exec_worker_audit_event`）。
 /// 一覧外の理由は記録せず `NotApplicable`。時刻と PID は呼び出したプロセスのもの。記録の成否で `error` は
 /// 変わらない（fail-closed）。
 ///

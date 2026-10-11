@@ -269,24 +269,28 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     fn sec4_task41_2_table_numbers_match_recorded_numbers() {
         use crate::seccomp::{DeniedSyscall, SyscallLookup, table_for_target_arch};
         let table = table_for_target_arch().unwrap();
         let arch = table.audit_arch().get();
-        let expected: [(DeniedSyscall, u32); 3] = if cfg!(target_arch = "x86_64") {
-            [
-                (DeniedSyscall::Unshare, 272),
-                (DeniedSyscall::Ptrace, 101),
-                (DeniedSyscall::KexecLoad, 246),
-            ]
-        } else {
-            [
-                (DeniedSyscall::Unshare, 97),
-                (DeniedSyscall::Ptrace, 117),
-                (DeniedSyscall::KexecLoad, 104),
-            ]
-        };
+        let expected: [(DeniedSyscall, u32); 3] =
+            if cfg!(all(target_arch = "x86_64", target_pointer_width = "64")) {
+                [
+                    (DeniedSyscall::Unshare, 272),
+                    (DeniedSyscall::Ptrace, 101),
+                    (DeniedSyscall::KexecLoad, 246),
+                ]
+            } else {
+                [
+                    (DeniedSyscall::Unshare, 97),
+                    (DeniedSyscall::Ptrace, 117),
+                    (DeniedSyscall::KexecLoad, 104),
+                ]
+            };
         for (d, want) in expected {
             let SyscallLookup::Present(nr) = table.number_of(d) else {
                 panic!("syscall must be present in the host table");

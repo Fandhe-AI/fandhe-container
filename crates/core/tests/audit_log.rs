@@ -21,7 +21,10 @@ use std::path::Path;
 use std::sync::Mutex;
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -65,7 +68,14 @@ fn sec4_task41_1_three_layers_are_representable() {
     assert_eq!(landlock.layer(), AuditLayer::Landlock);
     assert_eq!(landlock.path(), Some(Path::new("/etc/passwd")));
 
-    let mount = AuditRecord::new(ts(), pid, AuditEvent::Mount { path: None });
+    let mount = AuditRecord::new(
+        ts(),
+        pid,
+        AuditEvent::Mount {
+            path: None,
+            reason: None,
+        },
+    );
     assert_eq!(mount.layer().as_str(), "mount");
     assert_eq!(mount.pid().get(), 1234);
     assert_eq!(
@@ -342,7 +352,10 @@ fn sec4_task41_6_exec_non_mount_violation_is_not_recorded() {
 /// 件数・arch・layer・syscall 番号だけを数える sink（レコードを保持しない）。
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 struct CountingSink {
     count: AtomicUsize,
@@ -353,7 +366,10 @@ struct CountingSink {
 
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 impl AuditSink for CountingSink {
     fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
@@ -376,7 +392,10 @@ impl AuditSink for CountingSink {
 /// SEC-4・CORE-5・TASK-41.6: 禁止 syscall 一覧の全件が seccomp レコード 1 件ずつになる。
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 #[test]
 fn sec4_task41_6_every_denied_syscall_yields_one_record() {

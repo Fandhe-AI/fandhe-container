@@ -711,7 +711,10 @@ mod imp {
                 target_os = "macos",
                 all(
                     target_os = "linux",
-                    any(target_arch = "x86_64", target_arch = "aarch64")
+                    all(
+                        target_pointer_width = "64",
+                        any(target_arch = "x86_64", target_arch = "aarch64")
+                    )
                 )
             )
         ))]
@@ -762,7 +765,10 @@ mod imp {
                 target_os = "macos",
                 all(
                     target_os = "linux",
-                    any(target_arch = "x86_64", target_arch = "aarch64")
+                    all(
+                        target_pointer_width = "64",
+                        any(target_arch = "x86_64", target_arch = "aarch64")
+                    )
                 )
             )
         ))]
@@ -787,7 +793,10 @@ mod imp {
                 target_os = "macos",
                 all(
                     target_os = "linux",
-                    any(target_arch = "x86_64", target_arch = "aarch64")
+                    all(
+                        target_pointer_width = "64",
+                        any(target_arch = "x86_64", target_arch = "aarch64")
+                    )
                 )
             )
         ))]
@@ -1334,7 +1343,10 @@ mod tests {
             target_os = "macos",
             all(
                 target_os = "linux",
-                any(target_arch = "x86_64", target_arch = "aarch64")
+                all(
+                    target_pointer_width = "64",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )
             )
         )
     ))]
@@ -1766,7 +1778,10 @@ mod tests {
         target_os = "macos",
         all(
             target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
         )
     ))]
     #[derive(Default)]
@@ -1776,7 +1791,10 @@ mod tests {
         target_os = "macos",
         all(
             target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
         )
     ))]
     #[derive(Debug, PartialEq, Eq)]
@@ -1795,7 +1813,10 @@ mod tests {
         target_os = "macos",
         all(
             target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
         )
     ))]
     impl PeerAuthObserver for Recorder {
@@ -1818,7 +1839,10 @@ mod tests {
         target_os = "macos",
         all(
             target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
         )
     ))]
     fn audit_listener(tag: &str) -> (UdsListener, std::path::PathBuf) {
@@ -1835,7 +1859,10 @@ mod tests {
         target_os = "macos",
         all(
             target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
         )
     ))]
     fn rejection(
@@ -1862,7 +1889,10 @@ mod tests {
         target_os = "macos",
         all(
             target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
         )
     ))]
     mod peercred {

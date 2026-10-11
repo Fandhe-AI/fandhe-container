@@ -254,7 +254,10 @@ enum Mismatch {
     /// シナリオ側の失敗（ディスパッチャが子プロセスの失敗を報告する）。実プロセス部（Linux）でのみ構築される。
     #[cfg(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ))]
     ScenarioFailed {
         detail: String,
@@ -262,7 +265,10 @@ enum Mismatch {
     /// ホスト視点の検査（`EscapeCase::host_check`）の失敗。実プロセス部（Linux）でのみ構築される。
     #[cfg(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ))]
     HostCheckFailed {
         detail: String,
@@ -270,7 +276,10 @@ enum Mismatch {
     /// ホスト側の canary が攻撃後に変化した（ホスト FS へ到達・書き込めた = エスケープ。ESC-01）。
     #[cfg(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ))]
     HostTargetModified {
         detail: String,
@@ -746,7 +755,10 @@ fn sec2_task42_2_selftest() {
 /// Linux asm-generic の errno 値（x86_64・aarch64 共通。syscall 番号ではないため arch 分岐は不要）。
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 const ENOENT: i32 = 2;
 const ETXTBSY: i32 = 26;
@@ -757,7 +769,10 @@ const ETXTBSY: i32 = 26;
 #[cfg_attr(
     not(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )),
     allow(dead_code)
 )]
@@ -776,7 +791,10 @@ const ESC07_WRITE_EXPECT: Expectation = Expectation {
 #[cfg_attr(
     not(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )),
     allow(dead_code)
 )]
@@ -790,7 +808,10 @@ const ESC07_LANDLOCK_EXPECT: Expectation = Expectation {
 #[cfg_attr(
     not(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )),
     allow(dead_code)
 )]
@@ -1106,7 +1127,10 @@ fn main() {
 
 #[cfg(all(
     target_os = "linux",
-    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    not(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))
 ))]
 fn main() {
     always();
@@ -1117,7 +1141,10 @@ fn main() {
 
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 fn main() {
     // シナリオ再入時は常に走る部分を繰り返さない。
@@ -1137,7 +1164,10 @@ fn main() {
 
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 mod linux {
     use std::io::{PipeWriter, Read as _, Write as _};

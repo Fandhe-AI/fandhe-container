@@ -1583,7 +1583,10 @@ mod tests {
     #[test]
     #[cfg(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ))]
     fn repair5_drop_log_does_not_block_on_full_socket() {
         // 満杯のソケットを stderr に見立てる。ブロックしない保証のある経路（MSG_DONTWAIT）で即座に戻る
@@ -1617,7 +1620,10 @@ mod tests {
     #[test]
     #[cfg(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ))]
     fn repair5_drop_log_discards_on_anonymous_pipe() {
         use std::io::Read;
@@ -1651,7 +1657,10 @@ mod tests {
     #[test]
     #[cfg(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ))]
     fn repair5_drop_log_discards_on_named_fifo() {
         use std::io::Read;
@@ -1710,7 +1719,10 @@ mod tests {
 
     #[cfg(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ))]
     #[test]
     fn repair4_drop_log_writes_line_when_fd_ready() {

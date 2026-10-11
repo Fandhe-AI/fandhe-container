@@ -237,7 +237,7 @@ struct AuditLineDto<'a> {
     path: Option<String>,
     path_truncated: Option<bool>,
     path_original_len: Option<usize>,
-    /// plugin 信頼検証と exec 対象のみ: 拒否理由トークン（他レイヤーでは出力しない＝既存行は不変）。
+    /// 理由を持つレイヤー（plugin 信頼検証・exec 対象・entrypoint、理由つきの mount）のみ: 拒否理由トークン（他レイヤーでは出力しない＝既存行は不変）。
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'static str>,
     /// 検証済みの `ContainerId`（`[A-Za-z0-9._-]`・255 バイト以下）の生の値。不明なら `null`（省略しない）。
@@ -664,7 +664,13 @@ mod tests {
             text(&l),
             "{\"event\":\"audit\",\"layer\":\"landlock\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":7,\"syscall\":null,\"arch\":null,\"path\":\"/etc/shadow\",\"path_truncated\":false,\"path_original_len\":11,\"container_id\":null}\n"
         );
-        let m = rec(8, AuditEvent::Mount { path: None });
+        let m = rec(
+            8,
+            AuditEvent::Mount {
+                path: None,
+                reason: None,
+            },
+        );
         assert_eq!(
             text(&m),
             "{\"event\":\"audit\",\"layer\":\"mount\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":8,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null,\"container_id\":null}\n"
@@ -744,6 +750,7 @@ mod tests {
             8,
             AuditEvent::Mount {
                 path: Some(AuditPath::new("/proc/sys")),
+                reason: None,
             },
         )
         .with_container_id(cid("c1"));
@@ -752,7 +759,14 @@ mod tests {
             "{}",
             text(&with_path)
         );
-        let no_path = rec(8, AuditEvent::Mount { path: None }).with_container_id(cid("c1"));
+        let no_path = rec(
+            8,
+            AuditEvent::Mount {
+                path: None,
+                reason: None,
+            },
+        )
+        .with_container_id(cid("c1"));
         assert!(
             text(&no_path).ends_with("\"path_original_len\":null,\"container_id\":\"c1\"}\n"),
             "{}",
@@ -772,7 +786,10 @@ mod tests {
                 path: AuditPath::new("/etc/shadow"),
                 syscall: None,
             },
-            AuditEvent::Mount { path: None },
+            AuditEvent::Mount {
+                path: None,
+                reason: None,
+            },
             AuditEvent::PluginTrust {
                 path: AuditPath::new("/p/plugin"),
                 reason: crate::audit_log::AuditReason::new("hash_mismatch"),
@@ -790,6 +807,55 @@ mod tests {
         }
     }
 
+    /// SEC-4・#1701: 理由つきの mount の 1 行（パスなし／パスあり）の具体値。`reason` は `container_id` の直前。
+    #[test]
+    fn sec4_1701_encode_mount_with_reason_is_exact() {
+        let no_path = rec(
+            8,
+            AuditEvent::Mount {
+                path: None,
+                reason: Some(crate::audit_log::AuditReason::new("rootfs_is_host_root")),
+            },
+        )
+        .with_container_id(cid("c1"));
+        assert_eq!(
+            text(&no_path),
+            "{\"event\":\"audit\",\"layer\":\"mount\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":8,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null,\"reason\":\"rootfs_is_host_root\",\"container_id\":\"c1\"}\n"
+        );
+        let with_path = rec(
+            8,
+            AuditEvent::Mount {
+                path: Some(AuditPath::new("/proc/sys")),
+                reason: Some(crate::audit_log::AuditReason::new("target_on_shared_mount")),
+            },
+        )
+        .with_container_id(cid("c1"));
+        let t = text(&with_path);
+        assert!(t.contains("\"path\":\"/proc/sys\""), "{t}");
+        assert!(
+            t.ends_with("\"reason\":\"target_on_shared_mount\",\"container_id\":\"c1\"}\n"),
+            "{t}"
+        );
+    }
+
+    /// SEC-4・#1701: 理由つきの mount の最悪ケースでも 1 行の上限に収まる。
+    #[test]
+    fn sec4_1701_mount_reason_worst_case_line_fits() {
+        let id = "a".repeat(255);
+        let r = rec(
+            2_000_000_000,
+            AuditEvent::Mount {
+                path: Some(AuditPath::new(&"\u{1}".repeat(4096))),
+                reason: Some(crate::audit_log::AuditReason::new(
+                    "rootfs_symlink_or_not_directory",
+                )),
+            },
+        )
+        .with_container_id(cid(&id));
+        let line = encode_json_line(&r).expect("worst case encodes");
+        assert!(line.len() <= AUDIT_LINE_MAX_BYTES, "{}", line.len());
+    }
+
     /// SEC-4・#1618: 最悪ケース（制御文字だけの 4096 バイトのパス＋255 バイトの ID）でも 1 行の上限に収まる。
     #[test]
     fn sec4_1618_worst_case_line_fits() {
@@ -799,6 +865,7 @@ mod tests {
             2_000_000_000,
             AuditEvent::Mount {
                 path: Some(AuditPath::new(&path)),
+                reason: None,
             },
         )
         .with_container_id(cid(&id));
@@ -818,6 +885,7 @@ mod tests {
             1,
             AuditEvent::Mount {
                 path: Some(AuditPath::new("/a\nb\0c")),
+                reason: None,
             },
         );
         let s = text(&r);
@@ -834,6 +902,7 @@ mod tests {
             1,
             AuditEvent::Mount {
                 path: Some(AuditPath::new(&long)),
+                reason: None,
             },
         );
         let s = text(&r);
@@ -854,6 +923,7 @@ mod tests {
             1,
             AuditEvent::Mount {
                 path: Some(AuditPath::new(p)),
+                reason: None,
             },
         );
         assert!(text(&r).contains("\"path\":\"/x\u{fffd}y\""));
@@ -865,7 +935,13 @@ mod tests {
     }
 
     fn sample() -> AuditRecord {
-        rec(1, AuditEvent::Mount { path: None })
+        rec(
+            1,
+            AuditEvent::Mount {
+                path: None,
+                reason: None,
+            },
+        )
     }
 
     struct Recorder {
@@ -1087,6 +1163,7 @@ mod tests {
                             t + 1,
                             AuditEvent::Mount {
                                 path: Some(AuditPath::new(&long)),
+                                reason: None,
                             },
                         );
                         w.write_record(&r).unwrap();

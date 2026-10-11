@@ -22,6 +22,8 @@
 //!   維持すべき不変条件を明記する
 //! - 定数は `cfg(target_arch = ...)` ごとに個別に定義し、値が同じでも他アーキテクチャの定義を
 //!   流用しない。対応外アーキテクチャでは各ラッパーが [`SysError::Unsupported`] を返す（fail-closed）
+//! - 対応 arch は LP64 の x86_64・aarch64 だけで、各 `cfg` に `target_pointer_width = "64"` を含める。
+//!   x32 ABI・aarch64 ILP32 は対応外（#1700・REPAIR-2）
 //! - 戻り値が `-1` のときは直後に `std::io::Error::last_os_error()` で errno を確保する
 //! - 送信・受信とも `MSG_DONTWAIT` で、待つのは期限つきの `poll(2)` だけ。残り時間は [`Deadline`]
 //!   （単調時計の開始時刻＋全体 timeout）から毎回計算し直し、無期限に待つ経路を持たない（REPAIR-5）
@@ -125,7 +127,7 @@ pub(crate) enum Readiness {
 
 // include/linux/socket.h・uapi/linux/netlink.h・uapi/asm-generic/socket.h・poll.h・errno.h の値。
 // `SOCK_CLOEXEC` は `O_CLOEXEC` と同値。
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 mod consts {
     pub const SUPPORTED: bool = true;
     pub const AF_NETLINK: u16 = 16;
@@ -181,7 +183,7 @@ mod consts {
     pub const AT_FDCWD: i32 = -100;
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
 mod consts {
     pub const SUPPORTED: bool = true;
     pub const AF_NETLINK: u16 = 16;
@@ -243,7 +245,10 @@ mod consts {
 ///
 /// errno は実在しない負値を 1 つずつ割り当てる（カーネルの errno は正なので何にも一致せず、
 /// 上位の `match` で互いに重複もしない）。それ以外は使われないプレースホルダの 0。
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(not(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 #[allow(dead_code)]
 mod consts {
     pub const SUPPORTED: bool = false;
@@ -569,7 +574,10 @@ pub(crate) fn send_to_kernel(fd: BorrowedFd<'_>, buf: &[u8]) -> Result<usize, Sy
 // 対応外アーキテクチャでは `POLLIN` がプレースホルダの 0 で、先頭の `SUPPORTED` 判定により
 // マスク演算へ到達しない。その構成でだけ出る lint を、その構成に限って許可する。
 #[cfg_attr(
-    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    not(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )),
     allow(clippy::bad_bit_mask)
 )]
 pub(crate) fn wait_readable(
@@ -867,12 +875,12 @@ mod tests {
         assert_eq!(consts::O_CLOEXEC, 0o2_000_000);
         assert_eq!(consts::AT_FDCWD, -100);
         assert_eq!(consts::O_PATH, 0o10_000_000);
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
         assert_eq!(
             (consts::O_DIRECTORY, consts::O_NOFOLLOW),
             (0o200_000, 0o400_000)
         );
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
         assert_eq!(
             (consts::O_DIRECTORY, consts::O_NOFOLLOW),
             (0o40_000, 0o100_000)

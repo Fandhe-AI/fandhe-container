@@ -28,7 +28,8 @@
 //!
 //! エントリポイントの実行方式（#1531。オーナー判断 2026-10-09「条件付き切り替え」）: ホストの環境で封印した複製
 //! （`sealed_copy`）か現行方式（`pinned_inode`）が選ばれる。どちらでも exec は成功することを期待し、joiner の
-//! 構造化ログ（stderr の `supervisor.exec` / `entrypoint_mode` の 1 行）・`ExecOutcome::entrypoint_mode`・稼働中の
+//! 構造化ログ（joiner の stderr に繋いだ AF_UNIX の socket pair に届く `supervisor.exec` / `entrypoint_mode` の 1 行。
+//! pipe・ファイルには出ない。#1698）・`ExecOutcome::entrypoint_mode`・稼働中の
 //! プローブの `/proc/<pid>/exe`（封印した複製なら `/memfd:fandhe-exec-entrypoint (deleted)`、現行方式ならプローブの
 //! inode）の三つが同じ方式を示すことを照合する。
 //!
@@ -58,7 +59,10 @@ fn main() {
     println!("exec: Linux only, not applicable on this OS");
 }
 
-#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+#[cfg(all(
+    target_os = "linux",
+    not(all(target_arch = "x86_64", target_pointer_width = "64"))
+))]
 fn main() {
     println!(
         "exec: x86_64 only (hand-made machine-code probe), not applicable on this architecture"
@@ -68,6 +72,7 @@ fn main() {
 #[cfg(all(
     target_os = "linux",
     target_arch = "x86_64",
+    target_pointer_width = "64",
     not(feature = "exec-test-support")
 ))]
 fn main() {
@@ -83,6 +88,7 @@ fn main() {
 #[cfg(all(
     target_os = "linux",
     target_arch = "x86_64",
+    target_pointer_width = "64",
     feature = "exec-test-support"
 ))]
 fn main() {
@@ -92,6 +98,7 @@ fn main() {
 #[cfg(all(
     target_os = "linux",
     target_arch = "x86_64",
+    target_pointer_width = "64",
     feature = "exec-test-support"
 ))]
 mod linux {
@@ -769,6 +776,19 @@ mod linux {
 
     /// joiner を起動する（標準出力は 1 行を読むためパイプ）。
     fn spawn_joiner(args: &[String]) -> Child {
+        spawn_joiner_with_stderr(args, Stdio::null())
+    }
+
+    /// [`spawn_joiner`] に、構造化ログ（実行方式の 1 行。#1531）を受ける AF_UNIX の socket pair の読み端を足したもの。
+    /// 診断ログは pipe・ファイルには出ず（待たない出力経路は socket にだけ送る。#1698）、joiner の stderr を
+    /// socket にしたときだけ 1 行届く。
+    fn spawn_joiner_logged(args: &[String]) -> (Child, std::os::unix::net::UnixStream) {
+        let (tx, rx) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        let joiner = spawn_joiner_with_stderr(args, Stdio::from(std::os::fd::OwnedFd::from(tx)));
+        (joiner, rx)
+    }
+
+    fn spawn_joiner_with_stderr(args: &[String], stderr: Stdio) -> Child {
         let exe = std::env::current_exe().expect("current_exe");
         Command::new(exe)
             .arg("--joiner")
@@ -777,20 +797,22 @@ mod linux {
             .env(HOST_ONLY_ENV, "must-not-leak")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            // 構造化ログ（実行方式の 1 行。#1531）を照合するためパイプにする（数行で、パイプの容量を超えない）。
-            .stderr(Stdio::piped())
+            .stderr(stderr)
             .spawn()
             .expect("spawn joiner")
     }
 
     /// joiner の終了を待ち、`(終了コード, 標準出力)` を返す。期限超過は kill して panic（REPAIR-5）。
     fn finish_joiner(joiner: Child) -> (Option<i32>, String) {
-        let (code, out, _) = finish_joiner_with_stderr(joiner);
+        let (code, out, _) = finish_joiner_with_stderr(joiner, None);
         (code, out)
     }
 
-    /// [`finish_joiner`] に標準エラー出力（パイプにしていなければ空）を足したもの。
-    fn finish_joiner_with_stderr(mut joiner: Child) -> (Option<i32>, String, String) {
+    /// [`finish_joiner`] に標準エラー出力（`log_rx` の socket から読む。無ければ空）を足したもの。
+    fn finish_joiner_with_stderr(
+        mut joiner: Child,
+        log_rx: Option<std::os::unix::net::UnixStream>,
+    ) -> (Option<i32>, String, String) {
         let deadline = Instant::now() + timeout();
         let status = loop {
             if let Some(s) = joiner.try_wait().expect("try_wait") {
@@ -808,8 +830,10 @@ mod linux {
             let _ = std::io::Read::read_to_string(&mut s, &mut out);
         }
         let mut err = String::new();
-        if let Some(mut s) = joiner.stderr.take() {
-            let _ = std::io::Read::read_to_string(&mut s, &mut err);
+        if let Some(mut s) = log_rx {
+            // joiner は終了済みで書き手は閉じている。EOF に頼り切らず読み取りにも期限を付ける（REPAIR-5）。
+            s.set_read_timeout(Some(timeout())).expect("read timeout");
+            std::io::Read::read_to_string(&mut s, &mut err).expect("read joiner log socket");
         }
         (status.code(), out, err)
     }
@@ -836,7 +860,7 @@ mod linux {
         clean_probe_files(bundle);
         let probe = bundle.rootfs().join(PROBE);
         let scope = own_cgroup_path();
-        let joiner = spawn_joiner(&[
+        let (joiner, log_rx) = spawn_joiner_logged(&[
             "run".into(),
             bundle.dir.display().to_string(),
             scope,
@@ -958,7 +982,7 @@ mod linux {
             .expect("run kill");
         // 期限つきで待つ（REPAIR-5）。
         assert_eq!(finish_joiner(killed).0, Some(0), "{ctx}");
-        let (code, out, err) = finish_joiner_with_stderr(joiner);
+        let (code, out, err) = finish_joiner_with_stderr(joiner, Some(log_rx));
         assert_eq!(code, Some(0), "joiner output: {out}; stderr: {err}; {ctx}");
         // 実行方式（#1531）: ログ・`ExecOutcome`・実行中のプローブの `exe` が同じ方式を示す。どちらの方式でも成功する。
         let (mode, reason) = logged_entrypoint_mode(&err);

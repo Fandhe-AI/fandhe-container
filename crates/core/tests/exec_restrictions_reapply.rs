@@ -33,7 +33,10 @@ fn main() {
 
 #[cfg(all(
     target_os = "linux",
-    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    not(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))
 ))]
 fn main() {
     println!("exec_restrictions_reapply: x86_64/aarch64 only, not applicable on this architecture");
@@ -41,7 +44,10 @@ fn main() {
 
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 fn main() {
     use fandhe_container_core::exec::{

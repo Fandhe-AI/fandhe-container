@@ -505,7 +505,13 @@ fn apply_filter(
     })
 }
 
-#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    test,
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 mod tests {
     use super::*;
     use crate::seccomp::build_filter_for_target_arch;

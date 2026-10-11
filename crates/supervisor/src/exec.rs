@@ -133,14 +133,15 @@
 //! - **`entrypoint_mode` の縮退は監査ログに残さない**（#1594 の判断）: 監査ログは分離違反の **試行** の記録で、
 //!   現行方式への縮退は実行環境による方式の選択であり違反ではない。`AuditEvent::ExecTarget` は拒否専用で、載せるには
 //!   層・ワイヤー DTO の変更が要る（#652 の共通ログ型と合わせて決める）。縮退の事実は worker の構造化ログ
-//!   （`supervisor.exec` / `entrypoint_mode`）と [`ExecOutcome::entrypoint_mode`] で観測できる。worker で sink の I/O を
+//!   （`supervisor.exec` / `entrypoint_mode`。stderr が AF_UNIX socket のときだけ届く。#1698）と
+//!   [`ExecOutcome::entrypoint_mode`]（確かな観測口）で観測できる。worker で sink の I/O を
 //!   しない契約にも反する。entrypoint 種別の違反の記録は #1595
 //! - **監査記録**（SEC-4・SUP-6・TASK-163 追補・#1465）: [`run_command_with_pidfd`] は監査の記録先 [`AuditSink`] を必須の
 //!   引数に取り、exec の対象の拒否（種別 `exec_target`。理由 `exec_target_*`・`exec_root_not_container_rootfs`・
 //!   `exec_joined_*`・`exec_target_pidfd_mismatch` の 10 種）を層 `exec_target` のレコードとして **1 拒否につき 1 件**
 //!   記録する。worker の制限の準備で生じる rootfs の拒否（種別 `rootfs_pivot` の `rootfs_is_host_root`。worker 自身の
 //!   `/` が bundle の rootfs と同じディレクトリ。SEC-1）も、core の `IsolationViolation::mount_audit_event` と同じ写像で
-//!   層 `mount` のレコード（パスなし。`AuditEvent::Mount` は理由コードの欄を持たないため `reason` も無い）として
+//!   層 `mount` のレコード（パスなし・理由コード `rootfs_is_host_root` つき。#1701）として
 //!   1 拒否につき 1 件記録する（#1614 の事後監査の P2）。worker の `err` 行が運ぶ理由はこの 11 種（core の
 //!   `ViolationReason::EXEC_WORKER_REASONS`）だけで、一覧と worker の経路のソースの一致は core の単体テストが固定する。
 //!   `execve` 前の子の拒否（`ExecExit::SetupFailed` の `violation`。種別 `entrypoint` の 8 理由）も
@@ -214,25 +215,25 @@
 //!   bundle の rootfs の固定（`load_exec_bundle` → core の `pin_bundle_rootfs` / `RootfsDir::pin`。start と共有）は、
 //!   検証後の差し替え等によるパス検証の違反（`path_symlink_or_not_directory`・`path_missing` 等）を固定文言の
 //!   `TraitError` へ写して違反の情報を落とすため記録されない（start の経路でも同じ。bundle は supervisor と同じ
-//!   信頼境界にある前提。記録するには `pin` が違反を運べる形にする必要がある）。層 `mount` のレコードに理由コードを載せること（`AuditEvent::Mount` の拡張。#652 の共通ログ型と
-//!   合わせて決める）、再起動を越えて残る置き場所・ローテーション・常時の二重記録も未実装（`FileAuditSink` の doc）
+//!   信頼境界にある前提。記録するには `pin` が違反を運べる形にする必要がある）。再起動を越えて残る置き場所・ローテーション・常時の二重記録も未実装（`FileAuditSink` の doc）
 //! - `--ulimit` の指定値の `state.json` への記録。現状は pid1 の実効値を写して代替する（hard は launch を
 //!   超えないが、soft は pid1 が hard の範囲で上げていれば launch の指定より高くなり得る。core の
 //!   `exec/reapply.rs` のモジュール doc）
 //! - 実機前提の通し試験 `tests/exec.rs` の実行結果の記録（root を要し、CI ではビルドのみで実行していない）
 
 use std::io::{BufRead as _, Read as _, Write as _};
-use std::os::fd::BorrowedFd;
+use std::os::fd::{AsFd as _, BorrowedFd};
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::audit_log::{AuditDelivery, AuditSink, AuditedRejection, FileAuditSink};
 use fandhe_container_core::exec::{
-    ChildExit, ContainerEnv, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV, ENTRYPOINT_MAX_STRING_BYTES,
-    ENTRYPOINT_MAX_TOTAL_BYTES, EntrypointExecMode, ExecCgroupJoin, ExecCgroupJoinReport,
-    ExecCgroupName, ExecCgroupSweep, ExecChildCgroup, ExecCommand, ExecError, ExecExit, ExecReady,
-    ExecRestrictionReport, ExecRestrictions, ExecWorkerProof, NamespaceJoinReport, Pid1Target,
-    SealedCopyUnavailable, SupplementaryGroups, ViolationReason, join_cgroup as core_join_cgroup,
-    join_namespaces, prepare_cgroup_join as core_prepare_cgroup_join,
+    ChildExit, ContainerEnv, DiagnosticDelivery, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV,
+    ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES, EntrypointExecMode, ExecCgroupJoin,
+    ExecCgroupJoinReport, ExecCgroupName, ExecCgroupSweep, ExecChildCgroup, ExecCommand, ExecError,
+    ExecExit, ExecReady, ExecRestrictionReport, ExecRestrictions, ExecWorkerProof,
+    NamespaceJoinReport, Pid1Target, SealedCopyUnavailable, SupplementaryGroups, ViolationReason,
+    emit_diagnostic_line_to, join_cgroup as core_join_cgroup, join_namespaces,
+    prepare_cgroup_join as core_prepare_cgroup_join,
     prepare_exec_restrictions as core_prepare_exec_restrictions,
     reapply_restrictions as core_reapply_restrictions, record_entrypoint_rejection,
     record_exec_worker_rejection, remove_exec_child_cgroup, spawn_exec_command, spawn_exec_worker,
@@ -570,7 +571,8 @@ pub struct ExecOutcome {
     /// 記録する。TASK-163 追補・#1457）。
     pub supplementary_groups: SupplementaryGroups,
     /// エントリポイントの実行方式（封印した複製か現行方式と、現行方式を選んだ理由。オーナー判断 2026-10-09
-    /// 「条件付き切り替え」・#1531・REPAIR-4）。同じ値を worker が構造化ログ（`supervisor.exec` の `entrypoint_mode`）に出す。
+    /// 「条件付き切り替え」・#1531・REPAIR-4）。同じ値を worker が構造化ログ（`supervisor.exec` の `entrypoint_mode`）に出す
+    /// （出力先が AF_UNIX socket の場合のみ。#1698）。
     ///
     /// 縮退（現行方式）は分離違反ではないため監査ログには記録しない（#1594。モジュール doc「本番の記録先」）。
     pub entrypoint_mode: EntrypointExecMode,
@@ -664,7 +666,7 @@ pub fn run_command(
 ///
 /// - `Err` で worker の経路の違反の理由があれば 1 件記録する（core の `record_exec_worker_rejection`）。種別
 ///   `exec_target` は層 `exec_target`（理由コードつき）、種別 `rootfs_pivot` の `rootfs_is_host_root`（worker 自身の
-///   `/` が bundle の rootfs と同じ。`prepare_exec_restrictions` の拒否）は層 `mount`（パスなし。core の
+///   `/` が bundle の rootfs と同じ。`prepare_exec_restrictions` の拒否）は層 `mount`（パスなし・理由コードつき。core の
 ///   `IsolationViolation::mount_audit_event` と同じ写像）
 /// - `Ok` で `SetupFailed { violation: Some(_) }` なら層 `entrypoint` で 1 件記録する。`Ok` のまま返し、
 ///   記録の成否で結果は変わらない（`AuditedOutcome::audit` に結果を載せる）
@@ -1378,7 +1380,8 @@ fn run_in_child_cgroup(
         .map_err(from_exec_error)?;
     // 方式の切り替えを黙って行わない（オーナー判断 2026-10-09・#1531・REPAIR-4）。判定の直後に 1 回だけ出す。
     let entrypoint_mode = restrictions.entrypoint_mode();
-    log_entrypoint_mode(entrypoint_mode);
+    // 送信は待たない best-effort で結果は捨てる（#1698）。縮退の事実の確かな観測口は `ExecOutcome::entrypoint_mode`。
+    let _ = log_entrypoint_mode(entrypoint_mode);
     deadline.remaining("joining namespaces")?;
     enter_namespaces(target)?;
     deadline.remaining("joining the cgroup")?;
@@ -1437,14 +1440,19 @@ fn entrypoint_mode_log_line(mode: EntrypointExecMode) -> String {
     )
 }
 
-/// [`entrypoint_mode_log_line`] を stderr へ出す（`eprintln!` は書き込み失敗で panic するため、結果を無視する
-/// `writeln!` を使う。`logs::rotating` と同じ）。
-fn log_entrypoint_mode(mode: EntrypointExecMode) {
-    let _ = writeln!(
-        std::io::stderr().lock(),
-        "{}",
-        entrypoint_mode_log_line(mode)
-    );
+/// [`entrypoint_mode_log_line`] を stderr へ待たずに出す（`run_in_child_cgroup` の worker から呼ばれる）。
+///
+/// core の `emit_diagnostic_line`（#1697・#1698・REPAIR-5）経由で、stderr が AF_UNIX socket のときだけ
+/// `send(MSG_DONTWAIT | MSG_NOSIGNAL)` を 1 回送る。pipe・ファイル・端末へは出さない（読み手の止まった満杯の
+/// pipe で worker が namespace 参加の前に止まらないための後退。確かな観測口は `ExecOutcome::entrypoint_mode`）。
+/// stderr のロックは取らない（fork 時に別スレッドが持っていたロックでのデッドロックを避ける）。
+fn log_entrypoint_mode(mode: EntrypointExecMode) -> DiagnosticDelivery {
+    log_entrypoint_mode_to(std::io::stderr().as_fd(), mode)
+}
+
+/// [`log_entrypoint_mode`] の出力先を差し替えられる版（試験用に socket pair を渡す）。
+fn log_entrypoint_mode_to(out: BorrowedFd<'_>, mode: EntrypointExecMode) -> DiagnosticDelivery {
+    emit_diagnostic_line_to(out, &entrypoint_mode_log_line(mode))
 }
 
 /// 起動後の子に対する期限内の待機。期限が既に切れていれば待たずに直ちに `kill` で停止・回収してから `Timeout`
@@ -1556,6 +1564,164 @@ mod tests {
                 reason: SealedCopyUnavailable::KernelTooOld,
             }),
             r#"{"component":"supervisor.exec","operation":"entrypoint_mode","mode":"pinned_inode","reason":"kernel_too_old"}"#
+        );
+    }
+
+    /// REPAIR-4・REPAIR-5（#1698）: 出力先が AF_UNIX socket なら、実行方式の構造化ログがちょうど 1 行届く。
+    #[test]
+    fn rep4_rep5_1698_entrypoint_mode_log_reaches_unix_socket_exactly_once() {
+        use std::os::unix::net::UnixStream;
+
+        fn run(mode: EntrypointExecMode) -> String {
+            let (tx, mut rx) = UnixStream::pair().unwrap();
+            assert_eq!(
+                log_entrypoint_mode_to(tx.as_fd(), mode),
+                DiagnosticDelivery::Sent
+            );
+            rx.set_nonblocking(true).unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 1024];
+            while let Ok(n @ 1..) = rx.read(&mut buf) {
+                got.extend_from_slice(&buf[..n]);
+            }
+            String::from_utf8(got).unwrap()
+        }
+
+        assert_eq!(
+            run(EntrypointExecMode::PinnedInode {
+                reason: SealedCopyUnavailable::PathBoundLsm(PathBoundLsm::AppArmor),
+            }),
+            "{\"component\":\"supervisor.exec\",\"operation\":\"entrypoint_mode\",\"mode\":\"pinned_inode\",\"reason\":\"lsm_apparmor\"}\n"
+        );
+        assert_eq!(
+            run(EntrypointExecMode::SealedCopy),
+            "{\"component\":\"supervisor.exec\",\"operation\":\"entrypoint_mode\",\"mode\":\"sealed_copy\",\"reason\":\"\"}\n"
+        );
+        assert_eq!(
+            run(EntrypointExecMode::PinnedInode {
+                reason: SealedCopyUnavailable::KernelTooOld,
+            }),
+            "{\"component\":\"supervisor.exec\",\"operation\":\"entrypoint_mode\",\"mode\":\"pinned_inode\",\"reason\":\"kernel_too_old\"}\n"
+        );
+    }
+
+    /// 満杯 pipe 試験の子役を示す環境変数（#1698）。
+    const FULL_STDERR_CHILD_ENV: &str = "FANDHE_TEST_1698_FULL_STDERR_CHILD";
+
+    /// 子役: stderr を満杯で止め、対照の旧来の出力が戻らないこと・新しい出力が 1 秒未満で捨てて戻ることを
+    /// stdout の `RESULT` 行で返す（`process::exit` で終える。止まったスレッドを待たない）。
+    fn full_stderr_child_main() -> ! {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static WRITTEN: AtomicU64 = AtomicU64::new(0);
+        std::thread::spawn(|| {
+            let chunk = [b'x'; 4096];
+            loop {
+                match std::io::stderr().write(&chunk) {
+                    Ok(n) => {
+                        WRITTEN.fetch_add(u64::try_from(n).unwrap_or(0), Ordering::SeqCst);
+                    }
+                    // 読み手が閉じた等で満杯にできない（試験の前提が崩れた）。
+                    Err(_) => std::process::exit(3),
+                }
+            }
+        });
+        let fill_deadline = Instant::now() + Duration::from_secs(5);
+        let mut last = WRITTEN.load(Ordering::SeqCst);
+        let mut stable_since = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(20));
+            let now = WRITTEN.load(Ordering::SeqCst);
+            if now != last {
+                last = now;
+                stable_since = Instant::now();
+            } else if now > 0 && stable_since.elapsed() >= Duration::from_millis(300) {
+                break;
+            }
+            if Instant::now() >= fill_deadline {
+                std::process::exit(4);
+            }
+        }
+
+        // 対照: 旧来の `writeln!(stderr().lock(), ..)` は 1 秒以内に戻らない。
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _ = writeln!(std::io::stderr().lock(), "control line");
+            let _ = tx.send(());
+        });
+        let control_blocked = rx.recv_timeout(Duration::from_secs(1)).is_err();
+
+        let start = Instant::now();
+        let delivery = log_entrypoint_mode(EntrypointExecMode::PinnedInode {
+            reason: SealedCopyUnavailable::PathBoundLsm(PathBoundLsm::AppArmor),
+        });
+        let within_1s = start.elapsed() < Duration::from_secs(1);
+        let dropped = delivery
+            == DiagnosticDelivery::Dropped(
+                fandhe_container_core::exec::DiagnosticDropReason::NotUnixSocket,
+            );
+
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(
+            out,
+            // libtest が改行なしで出す `test <名前> ... ` の後ろに続かないよう、先頭で改行する。
+            "\nRESULT control_blocked={control_blocked} within_1s={within_1s} dropped={dropped}"
+        );
+        let _ = out.flush();
+        std::process::exit(0);
+    }
+
+    /// REPAIR-5・SUP-6（#1698）: stderr が読み手の止まった満杯 pipe でも、実行方式のログは 1 秒未満で戻る。
+    /// 対照として、旧来の `writeln!(stderr().lock(), ..)` は同じ条件で戻らない。テストバイナリ自身を再実行した子役で照合する。
+    #[test]
+    fn rep5_sup6_1698_entrypoint_mode_log_returns_with_full_stderr_pipe() {
+        use std::process::{Command, Stdio};
+
+        if std::env::var_os(FULL_STDERR_CHILD_ENV).is_some() {
+            full_stderr_child_main();
+        }
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "exec::tests::rep5_sup6_1698_entrypoint_mode_log_returns_with_full_stderr_pipe",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(FULL_STDERR_CHILD_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            // 読まない（子役の stderr を満杯で止める）。`child` を drop するまで読み端を開いたまま保つ。
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child with a full stderr pipe did not finish within 10s (REPAIR-5)");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        assert_eq!(status.code(), Some(0), "child stdout: {stdout}");
+        let result = stdout
+            .lines()
+            .find(|l| l.starts_with("RESULT "))
+            .unwrap_or_else(|| panic!("no RESULT line in child stdout: {stdout}"));
+        assert_eq!(
+            result,
+            "RESULT control_blocked=true within_1s=true dropped=true"
         );
     }
 
@@ -2280,7 +2446,7 @@ mod tests {
 
     /// SEC-4・SUP-6・SEC-1・TASK-163 追補（#1465）・#1614 の事後監査: 親側の記録は worker の経路の 11 理由それぞれ
     /// 1 件・パスなし・自 PID。種別 `exec_target` は層 `exec_target` と理由コード、`rootfs_is_host_root` は層 `mount`
-    /// （理由コードの欄なし）。違反なしの失敗は 0 件で `NotApplicable`、失敗する sink でも拒否は元のまま。
+    /// （理由コード `rootfs_is_host_root` つき）。違反なしの失敗は 0 件で `NotApplicable`、失敗する sink でも拒否は元のまま。
     #[test]
     fn sec4_sup6_task163_parent_records_one_audit_per_worker_rejection() {
         for reason in ViolationReason::EXEC_WORKER_REASONS {
@@ -2294,13 +2460,17 @@ mod tests {
             assert_eq!(rejected.delivery, AuditDelivery::Recorded);
             let recs = sink.snapshot();
             assert_eq!(recs.len(), 1, "{reason:?}");
-            let (layer, token) = if reason == ViolationReason::RootfsIsHostRoot {
-                (AuditLayer::Mount, None)
+            let layer = if reason == ViolationReason::RootfsIsHostRoot {
+                AuditLayer::Mount
             } else {
-                (AuditLayer::ExecTarget, Some(reason.as_str()))
+                AuditLayer::ExecTarget
             };
             assert_eq!(recs[0].layer(), layer, "{reason:?}");
-            assert_eq!(recs[0].reason().map(|r| r.as_str()), token);
+            assert_eq!(
+                recs[0].reason().map(|r| r.as_str()),
+                Some(reason.as_str()),
+                "{reason:?}"
+            );
             assert_eq!(recs[0].path(), None);
             assert_eq!(recs[0].syscall(), None);
             assert_eq!(recs[0].pid().get(), std::process::id());

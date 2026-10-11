@@ -23,7 +23,7 @@ pre-commit:
           ed=$(sed -n 's/^edition *= *"\([0-9]\{4\}\)".*/\1/p' Cargo.toml | head -n1)
           rustfmt --edition "${ed:-2024}" --check -- {staged_files}
         else
-          echo "skip: Cargo.toml 未追加または rustfmt 未導入"
+          echo "skip: Cargo.toml not found or rustfmt not installed"
         fi
 
     # 秘密情報の混入検査（.claude/rules/security.md）。資格情報ファイルの stage を拒否する。
@@ -165,8 +165,8 @@ commit-msg:
           Merge*|Revert*|fixup!*|squash!*) exit 0 ;;
         esac
         if ! printf '%s' "$msg" | grep -qE '^(feat|fix|perf|refactor|test|docs|build|ci|chore)(\([^)]+\))?!?: .+'; then
-          echo "NG: Conventional Commits 形式ではありません: $msg" >&2
-          echo "形式: <type>(<scope>): <説明>  （type: feat|fix|perf|refactor|test|docs|build|ci|chore）" >&2
+          echo "NG: commit message header is not in Conventional Commits format: $msg" >&2
+          echo "expected: <type>(<scope>): <description>  (type: feat|fix|perf|refactor|test|docs|build|ci|chore)" >&2
           exit 1
         fi
         sh scripts/check-commit-msg-line-length.sh {1}

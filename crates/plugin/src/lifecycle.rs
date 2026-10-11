@@ -1726,6 +1726,8 @@ mod tests {
         let line = b"{\"event\":\"x\"}\n";
         assert_eq!(crate::sys::write_nonblocking(&a, line).unwrap(), line.len());
         let mut got = vec![0u8; line.len()];
+        // 診断が届かない場合に無期限停止しないよう受信側に期限を設ける（REPAIR-5）。
+        b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         b.read_exact(&mut got).unwrap();
         assert_eq!(got, line);
     }
@@ -1767,6 +1769,8 @@ mod tests {
         record_drop_failure(&a, table, ChildCleanupFailure::GroupKillFailed);
         let want = format!("{GROUP_KILL_FAILED_LINE}\n");
         let mut got = vec![0u8; want.len()];
+        // 診断が届かない場合に無期限停止しないよう受信側に期限を設ける（REPAIR-5）。
+        b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         b.read_exact(&mut got).unwrap();
         assert_eq!(got, want.as_bytes());
         let p = table.take();

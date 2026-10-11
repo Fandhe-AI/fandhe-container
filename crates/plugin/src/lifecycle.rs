@@ -27,11 +27,15 @@
 //!   自発終了の観測後のグループ送信が Linux で失敗した場合に同じ形で現れ得る（#1604）。macOS はゾンビだけのグループへの
 //!   `killpg` にも `EPERM` を返すため、接続後・応答前に plugin が終了した場合は孫がいなくても付記が付き得る
 //!   （`EPERM` を許容しない理由は `group_kill_tolerated` の doc）。
-//! - `Drop` 経路の記録（#1605・REPAIR-4）: `ChildGuard` の破棄時にグループ停止の失敗（`GroupKillFailed`。
-//!   孫が残り得る）または直接の子の未回収（`Unreaped`）が起きた場合、stderr へ 1 行の JSON
+//! - `Drop` 経路の記録（#1605・#1673・REPAIR-4）: `ChildGuard` の破棄時にグループ停止の失敗（`GroupKillFailed`。
+//!   孫が残り得る）または直接の子の未回収（`Unreaped`）が起きた場合、1 行の JSON
 //!   （`{"event":"plugin_child_cleanup","op":"drop","outcome":"error","reason":"group_kill_failed"|"unreaped"}`。
-//!   `unreaped` のみ保持中の `pid` を整数で付す）を 1 回だけ出す。ブロックしないことを保証できる出力先（Linux の
-//!   AF_UNIX の socket。`crate::sys` の `write_nonblocking`）でだけ書き、それ以外（TCP 等の他の socket・pipe・端末・通常ファイル・macOS）は捨てる。書き込み失敗は無視し、plugin 由来の文字列は
+//!   `unreaped` のみ保持中の `pid` を整数で付す）を 1 回だけ残す。ブロックしないことを保証できる出力先（Linux の
+//!   AF_UNIX の socket。`crate::sys` の `write_nonblocking`）へは `Drop` の中で stderr へ即時に書く。それ以外（TCP 等の
+//!   他の socket・pipe・端末・通常ファイル・macOS）と、即時書き込みが全部は書けなかった場合は、固定長の延期表
+//!   （`drop_report`）へ積み、ホストが終了時に `take_pending_child_cleanup_failures` で取り出して出す。
+//!   即時に全部書けた記録は表へ積まない（重複させない）。SIGKILL・abort・シグナル再送出による終了と、取り出しを
+//!   呼ばないホスト（core の plugin proxy は TASK-114 で配線予定）では延期した記録は残らない（REPAIR-3）。plugin 由来の文字列は
 //!   載せない。`unreaped_error` で報告済みの子と、`Drop` の前に明示的な経路で手放した子（回収済み・他所で回収された
 //!   `Lost`。そこで返したグループ停止の失敗を含む）は記録しない。
 //! - 子の環境変数は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ設定する（資格情報を継承させない）。
@@ -76,6 +80,7 @@
 //!   残留し得る。macOS では plugin 本体も孫も残留し得る（kqueue `NOTE_EXIT` は将来課題）。
 //! - 要求 ID と応答 ID の対応づけ（TASK-114）。
 
+mod drop_report;
 mod mode;
 mod resident;
 
@@ -94,6 +99,11 @@ use crate::error::{PluginError, PluginErrorCode};
 use crate::frame::Frame;
 use crate::signal_forward::{PLUGIN_REGISTRY, Registry, SlotToken};
 use crate::transport::{RpcTimeout, UdsListener};
+pub use drop_report::{
+    ChildCleanupFailure, DROP_REPORT_CAPACITY, PendingChildCleanup,
+    take_pending_child_cleanup_failures,
+};
+use drop_report::{GLOBAL_TABLE, record_drop_failure};
 use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -856,39 +866,12 @@ fn termination_after_kill(reap: Reap) -> OneShotTermination {
     }
 }
 
-/// `ChildGuard` の `Drop` 経路で後始末に失敗したときの記録（#1605・PLUG-7・REPAIR-4）。
-///
-/// `Drop` は `Result` を返せないため、呼び出し側へ報告できない失敗を stderr へ 1 行の JSON で残す。
-/// 値は固定文字列と整数のみで、plugin 由来の untrusted な文字列（stderr・パス）は載せない
-/// （ログ行の偽装を防ぐ。エスケープ不要）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChildGuardDropFailure {
-    /// 直接の子は回収したが、グループ宛て SIGKILL が許容外のエラーで失敗し、孫が残り得る。
-    /// 直接の子は解放済みのため pid は載せない（`group_kill_failed_error` と同じ扱い）。
-    GroupKillFailed,
-    /// 直接の子を回収できなかった（孤児の可能性）。保持中の pid を載せる（`unreaped_error` と同じ）。
-    Unreaped { pid: Option<u32> },
-}
-
-impl ChildGuardDropFailure {
-    /// 構造化ログの 1 行（キーは `audit` の `event` / `op` / `outcome` / `reason` の流儀に揃える）。
-    fn to_json_line(self) -> String {
-        match self {
-            Self::GroupKillFailed => "{\"event\":\"plugin_child_cleanup\",\"op\":\"drop\",\"outcome\":\"error\",\"reason\":\"group_kill_failed\"}".to_string(),
-            Self::Unreaped { pid: Some(pid) } => format!(
-                "{{\"event\":\"plugin_child_cleanup\",\"op\":\"drop\",\"outcome\":\"error\",\"reason\":\"unreaped\",\"pid\":{pid}}}"
-            ),
-            Self::Unreaped { pid: None } => "{\"event\":\"plugin_child_cleanup\",\"op\":\"drop\",\"outcome\":\"error\",\"reason\":\"unreaped\"}".to_string(),
-        }
-    }
-}
-
 /// `Drop` 時の `Reap` を記録対象へ写す。孫が残り得る `GroupKillFailed` と未回収の `Unreaped` だけが対象で、
 /// `Lost`（他所で回収済み。孤児ではない）や回収成功は記録しない。
-fn drop_failure(reap: Reap, pid: Option<u32>) -> Option<ChildGuardDropFailure> {
+fn drop_failure(reap: Reap, pid: Option<u32>) -> Option<ChildCleanupFailure> {
     match reap {
-        Reap::GroupKillFailed => Some(ChildGuardDropFailure::GroupKillFailed),
-        Reap::Unreaped => Some(ChildGuardDropFailure::Unreaped { pid }),
+        Reap::GroupKillFailed => Some(ChildCleanupFailure::GroupKillFailed),
+        Reap::Unreaped => Some(ChildCleanupFailure::Unreaped { pid }),
         Reap::Reaped(_) | Reap::AlreadyReaped | Reap::Lost => None,
     }
 }
@@ -904,14 +887,14 @@ impl ChildGuard {
     /// 残った失敗（自発終了の観測後のグループ送信の失敗の印 `group_kill_failed_after_exit` を含む）は既に
     /// 呼び出し側へ返している。ここで `kill_and_reap` を呼ぶと印から `GroupKillFailed` が再び返り、同じ
     /// 失敗を 2 回記録するため呼ばない（子を持たない `kill_and_reap` は何も送らないので後始末は変わらない）。
-    fn finish_on_drop(&mut self, emit: &mut dyn FnMut(&ChildGuardDropFailure)) {
+    fn finish_on_drop(&mut self, emit: &mut dyn FnMut(&ChildCleanupFailure)) {
         if self.reported_unreaped || self.child.is_none() {
             return;
         }
         let pid = self.pid();
         let reap = self.kill_and_reap();
         if let Some(failure) = drop_failure(reap, pid) {
-            if matches!(failure, ChildGuardDropFailure::Unreaped { .. }) {
+            if matches!(failure, ChildCleanupFailure::Unreaped { .. }) {
                 self.reported_unreaped = true;
                 self.slot = None;
             }
@@ -922,26 +905,14 @@ impl ChildGuard {
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        // 書き込み失敗は無視する（`Drop`・panic の unwinding 中でも panic しない）。
-        // stderr が満杯の pipe 等でも後始末を止めないため、ブロックしないことを保証できる経路でだけ 1 回書き、
-        // 書けなければ記録を捨てる（スレッドもロックも残さない。REPAIR-5・PLUG-7）。
+        // `Result` を返せないため、ブロックしないことを保証できる経路（Linux の AF_UNIX socket）でだけ即時に
+        // 1 回書き、書けなければ固定長の延期表へ積む。ホストが終了時に取り出して出す（#1673・REPAIR-4・
+        // REPAIR-5・PLUG-7）。スレッドもロックも確保も残さない。
         self.finish_on_drop(&mut |rec| {
-            let mut line = rec.to_json_line();
-            line.push('\n');
-            write_drop_log(&io::stderr(), line.as_bytes());
+            record_drop_failure(&io::stderr(), &GLOBAL_TABLE, *rec);
         });
     }
 }
-
-/// `Drop` の診断 1 行を `fd` へ非ブロッキングで書く。書けなければ捨てる（#1605・REPAIR-5）。
-#[cfg(unix)]
-fn write_drop_log(fd: &impl std::os::unix::io::AsFd, line: &[u8]) {
-    let _ = crate::sys::write_nonblocking(fd, line);
-}
-
-/// 非 unix ではブロックしない書き込み手段を持たないため診断出力を捨てる（fail-closed）。
-#[cfg(not(unix))]
-fn write_drop_log(_fd: &io::Stderr, _line: &[u8]) {}
 
 /// `EPERM` が出た間だけ短時間再送する上限（#1311・PLUG-7・REPAIR-5）。
 #[cfg(unix)]
@@ -1515,6 +1486,18 @@ mod tests {
             const { std::cell::Cell::new(None) };
     }
 
+    /// 他の試験と混ざらない専用の延期表（プロセス全体の表は共有しない）。
+    #[allow(dead_code)]
+    fn local_table() -> &'static drop_report::DropReportTable {
+        let slots: &'static [AtomicU64] = Box::leak(
+            (0..8)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        Box::leak(Box::new(drop_report::DropReportTable::over(slots)))
+    }
+
     const GROUP_KILL_FAILED_LINE: &str = "{\"event\":\"plugin_child_cleanup\",\"op\":\"drop\",\"outcome\":\"error\",\"reason\":\"group_kill_failed\"}";
 
     #[cfg(unix)]
@@ -1611,8 +1594,14 @@ mod tests {
         assert_eq!(r.unwrap_err().kind(), io::ErrorKind::WouldBlock);
         // `Drop` 経路の入口も同様に期限内に戻る。
         let start = Instant::now();
-        write_drop_log(&a, GROUP_KILL_FAILED_LINE.as_bytes());
+        let table = local_table();
+        record_drop_failure(&a, table, ChildCleanupFailure::GroupKillFailed);
         assert!(start.elapsed() < Duration::from_millis(100));
+        // 書けなかった記録は延期表へ積まれる（#1673）。
+        assert_eq!(
+            table.take().failures(),
+            &[ChildCleanupFailure::GroupKillFailed]
+        );
     }
 
     /// REPAIR-5・PLUG-7・#1605: 無名 pipe は `/proc` 経由の開き直し（絶対パスの解決が止まり得る）と `SIGPIPE` を
@@ -1635,8 +1624,13 @@ mod tests {
         assert!(start.elapsed() < Duration::from_millis(100));
         assert_eq!(res.unwrap_err().kind(), io::ErrorKind::Unsupported);
         let start = Instant::now();
-        write_drop_log(&w, line);
+        let table = local_table();
+        record_drop_failure(&w, table, ChildCleanupFailure::GroupKillFailed);
         assert!(start.elapsed() < Duration::from_millis(100));
+        assert_eq!(
+            table.take().failures(),
+            &[ChildCleanupFailure::GroupKillFailed]
+        );
         // 共有 description のフラグ（`O_NONBLOCK` = 0o4000）は変わっていない。
         let flags_of = |fd: i32| {
             let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).unwrap();
@@ -1756,29 +1750,210 @@ mod tests {
         );
     }
 
+    /// REPAIR-4・#1673: AF_UNIX socket へ全部書けた記録は延期表へ積まない（重複させない）。
+    #[cfg(all(
+        target_os = "linux",
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    #[test]
+    fn repair4_drop_log_full_write_on_socket_not_deferred() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let table = local_table();
+        record_drop_failure(&a, table, ChildCleanupFailure::GroupKillFailed);
+        let want = format!("{GROUP_KILL_FAILED_LINE}\n");
+        let mut got = vec![0u8; want.len()];
+        b.read_exact(&mut got).unwrap();
+        assert_eq!(got, want.as_bytes());
+        let p = table.take();
+        assert_eq!(p.failures().len(), 0);
+        assert_eq!(p.dropped(), 0);
+    }
+
+    /// REPAIR-4・REPAIR-5・#1673: 通常ファイル・キャラクタデバイスへは書かず、延期表へ積んで期限内に戻る。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn repair5_drop_log_defers_on_regular_file_and_char_device() {
+        let dir = drop_log_test_dir("defer-file");
+        let path = dir.join("log");
+        let f = std::fs::File::create_new(&path).unwrap();
+        let table = local_table();
+        let start = Instant::now();
+        record_drop_failure(&f, table, ChildCleanupFailure::Unreaped { pid: Some(4321) });
+        assert!(start.elapsed() < Duration::from_millis(100));
+        drop(f);
+        let len = std::fs::metadata(&path).unwrap().len();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(len, 0);
+        assert_eq!(
+            table.take().failures(),
+            &[ChildCleanupFailure::Unreaped { pid: Some(4321) }]
+        );
+        let null = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        record_drop_failure(&null, table, ChildCleanupFailure::GroupKillFailed);
+        assert_eq!(
+            table.take().failures(),
+            &[ChildCleanupFailure::GroupKillFailed]
+        );
+    }
+
+    /// REPAIR-4・#1673: 報告済みの `Unreaped` は `Drop` で再記録せず、延期表にも積まない。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_reported_unreaped_is_not_deferred() {
+        let mut guard = spawn_sleeper_group();
+        guard.reported_unreaped = true;
+        let table = local_table();
+        guard.finish_on_drop(&mut |rec| table.push(*rec));
+        assert_eq!(table.take().failures().len(), 0);
+        guard.reported_unreaped = false;
+    }
+
+    #[cfg(unix)]
+    const DROP_REPORT_CHILD_ENV: &str = "FANDHE_DROP_REPORT_CHILD_1673";
+
+    /// 往復試験の子の役（環境変数が無ければ何もしない）。実際の `Drop` を通し、期限内に戻ることを確かめ、
+    /// 最後にプロセス全体の延期表を stderr へ出す（ホストの終了時の取り出しの模擬。#1673）。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_drop_report_roundtrip_child_role() {
+        if std::env::var_os(DROP_REPORT_CHILD_ENV).is_none() {
+            return;
+        }
+        let guard = spawn_sleeper_group();
+        FORCED_GROUP_KILL_ERRNO.with(|c| c.set(Some(22)));
+        let start = Instant::now();
+        drop(guard);
+        let elapsed = start.elapsed();
+        FORCED_GROUP_KILL_ERRNO.with(|c| c.set(None));
+        assert!(elapsed < Duration::from_secs(5), "drop took {elapsed:?}");
+        let _ = take_pending_child_cleanup_failures().write_json_lines(&mut io::stderr());
+    }
+
+    /// 子の役を `stderr` を向け先に付けて再実行し、期限内の正常終了を確かめる。
+    #[cfg(unix)]
+    fn run_roundtrip_child(stderr: Stdio) {
+        let exe = std::env::current_exe().unwrap();
+        let mut child = Command::new(exe)
+            .args([
+                "--exact",
+                "lifecycle::tests::repair4_drop_report_roundtrip_child_role",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(DROP_REPORT_CHILD_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(stderr)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                assert!(st.success(), "child failed: {st}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "child did not exit in time");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn only_cleanup_lines(text: &str) -> Vec<String> {
+        text.lines()
+            .filter(|l| l.contains("plugin_child_cleanup"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// REPAIR-4・REPAIR-5・PLUG-7・#1673: stderr が通常ファイルでも、Drop は期限内に戻り、終了時の取り出しで
+    /// 記録がちょうど 1 行（全文一致）残る。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_drop_report_roundtrip_regular_file() {
+        let dir = drop_log_test_dir("roundtrip-file");
+        let path = dir.join("stderr");
+        let f = std::fs::File::create_new(&path).unwrap();
+        run_roundtrip_child(Stdio::from(f));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            only_cleanup_lines(&text),
+            vec![GROUP_KILL_FAILED_LINE.to_string()]
+        );
+    }
+
+    /// REPAIR-4・REPAIR-5・PLUG-7・#1673: stderr が pipe（読み手あり）でも記録がちょうど 1 行残る。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_drop_report_roundtrip_pipe() {
+        use std::io::Read;
+        let (mut r, w) = io::pipe().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut text = String::new();
+            r.read_to_string(&mut text).unwrap();
+            text
+        });
+        run_roundtrip_child(Stdio::from(w));
+        let text = reader.join().unwrap();
+        assert_eq!(
+            only_cleanup_lines(&text),
+            vec![GROUP_KILL_FAILED_LINE.to_string()]
+        );
+    }
+
+    /// REPAIR-4・#1673: stderr が AF_UNIX socket（Linux）なら Drop 時に即時に届き、取り出しで重複しない。
+    #[cfg(all(
+        target_os = "linux",
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    #[test]
+    fn repair4_drop_report_roundtrip_socket_not_duplicated() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        let (a, mut b) = UnixStream::pair().unwrap();
+        run_roundtrip_child(Stdio::from(std::os::fd::OwnedFd::from(a)));
+        let mut text = String::new();
+        b.read_to_string(&mut text).unwrap();
+        assert_eq!(
+            only_cleanup_lines(&text),
+            vec![GROUP_KILL_FAILED_LINE.to_string()]
+        );
+    }
+
     /// REPAIR-4・#1605: `Reap` から記録への写像と JSON 行の全文。
     #[test]
     fn repair4_drop_failure_mapping() {
         assert_eq!(
             drop_failure(Reap::GroupKillFailed, Some(7)),
-            Some(ChildGuardDropFailure::GroupKillFailed)
+            Some(ChildCleanupFailure::GroupKillFailed)
         );
         assert_eq!(
             drop_failure(Reap::Unreaped, Some(1234)),
-            Some(ChildGuardDropFailure::Unreaped { pid: Some(1234) })
+            Some(ChildCleanupFailure::Unreaped { pid: Some(1234) })
         );
         assert_eq!(drop_failure(Reap::AlreadyReaped, Some(1)), None);
         assert_eq!(drop_failure(Reap::Lost, Some(1)), None);
         assert_eq!(
-            ChildGuardDropFailure::GroupKillFailed.to_json_line(),
+            ChildCleanupFailure::GroupKillFailed.to_json_line(),
             GROUP_KILL_FAILED_LINE
         );
         assert_eq!(
-            ChildGuardDropFailure::Unreaped { pid: Some(1234) }.to_json_line(),
+            ChildCleanupFailure::Unreaped { pid: Some(1234) }.to_json_line(),
             "{\"event\":\"plugin_child_cleanup\",\"op\":\"drop\",\"outcome\":\"error\",\"reason\":\"unreaped\",\"pid\":1234}"
         );
         assert_eq!(
-            ChildGuardDropFailure::Unreaped { pid: None }.to_json_line(),
+            ChildCleanupFailure::Unreaped { pid: None }.to_json_line(),
             "{\"event\":\"plugin_child_cleanup\",\"op\":\"drop\",\"outcome\":\"error\",\"reason\":\"unreaped\"}"
         );
     }

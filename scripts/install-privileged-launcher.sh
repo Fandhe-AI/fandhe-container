@@ -20,7 +20,8 @@
 # fail-closed: setuid root への切り替えは「setcap が非 0 かつ stderr が `not supported`（ENOTSUP/EOPNOTSUPP。xattr 非対応）」
 #   のときだけ。EPERM・EINVAL・setcap 未導入・読み戻し不一致では切り替えず止まる（権限の多い方式へ黙って降格しない）。
 #   配置先は祖先を含む全要素が root 所有・g/o 書き込み不可でなければ、補修も上書きもせず止まる。置換は同一ディレクトリの
-#   一時ファイルで検証を済ませてから rename する。入力元は 1 回だけ読んで複製し、以降は複製に対して操作する。
+#   一時ファイルで検証を済ませてから rename する。入力元は 1 回だけ開いた fd を検査して同じ fd から複製し、以降は複製に対して操作する。
+#   子プロセス（getcap・複製・setcap）は timeout(1) で期限を付け、無ければ実行前に拒否する。2 つの置換は失敗時に旧 supervisor へ戻す。
 # 既知の未実装（実装済みを装わない）: 入力元のハッシュ・署名の照合は行わない（PLUG-11 との整合は設計書 12 章の未確認事項）。
 #   nosuid マウント上の配置先では file capability / setuid が効かない（ランチャーが実行時に fail-closed で拒否する）。
 # 注意: scripts/lib.sh は source しない（cwd がリポジトリルートへ移り、postinst からの相対パス解釈が変わるため）。
@@ -105,12 +106,29 @@ export LC_ALL=C
 
 [ "${CALLER_UID}" = "0" ] || die 3 not-root "must be run as root"
 
-# 入力元の検査（通常ファイルで symlink でない）。
-for src in "${LAUNCHER_SRC}" "${SUPERVISOR_SRC}"; do
-  if [ -L "${src}" ] || [ ! -f "${src}" ] || [ ! -r "${src}" ]; then
+# 子プロセス（getcap・複製・setcap）の待機には必ず期限を設ける（REPAIR-5）。期限を保護できない環境では実行前に拒否する。
+command -v timeout >/dev/null 2>&1 || die 3 timeout-unavailable "timeout(1) is required to bound child processes"
+CHILD_TIMEOUT=30
+# 期限つきで子を実行する。期限超過後 5 秒で KILL し、回収まで待つ。
+run_bounded() { timeout -k 5 "${CHILD_TIMEOUT}" "$@"; }
+
+# 入力元は 1 回だけ開き、開いた fd 自体を検査して同じ fd から複製する（検査後の再オープンによる TOCTOU を作らない）。
+# パスが symlink でないこと（lstat）と、fd の指す実体（fstat）が通常ファイルで lstat と同一 inode であることを確かめる。
+SRC_FD_LAUNCHER=""
+SRC_FD_SUPERVISOR=""
+open_source() { # <path> <fd 番号を入れる変数名>
+  local path="$1" fd lst fst
+  [ ! -L "${path}" ] || die 3 invalid-source "source must be a readable regular file and not a symlink"
+  { exec {fd}<"${path}"; } 2>/dev/null || die 3 invalid-source "source must be a readable regular file and not a symlink"
+  lst="$(stat -c '%F %d:%i' -- "${path}")" || die 3 invalid-source "cannot stat source"
+  fst="$(stat -L -c '%F %d:%i' -- "/proc/self/fd/${fd}")" || die 3 invalid-source "cannot stat opened source"
+  if [ "${lst}" != "${fst}" ] || [ "${fst%% [0-9]*}" != "regular file" ]; then
     die 3 invalid-source "source must be a readable regular file and not a symlink"
   fi
-done
+  printf -v "$2" '%s' "${fd}"
+}
+open_source "${LAUNCHER_SRC}" SRC_FD_LAUNCHER
+open_source "${SUPERVISOR_SRC}" SRC_FD_SUPERVISOR
 
 # 配置先の 1 要素が信頼条件（ディレクトリ・非 symlink・信頼する所有者・g/o 書き込み不可）を満たすか確かめる。
 check_dir() { # <path>
@@ -171,7 +189,7 @@ CAPS_READ=""
 read_caps() { # <file>
   local out rest names flags
   CAPS_READ=""
-  out="$(getcap "$1")" || die 1 capability-mismatch "getcap failed for $1"
+  out="$(run_bounded getcap "$1")" || die 1 capability-mismatch "getcap failed for $1"
   [ -n "${out}" ] || return 0
   rest="${out#"$1"}"
   flags="${rest##*[=+]}"
@@ -204,8 +222,9 @@ expect_stat() { # <file> <mode>
 # 一時ファイルへ複製して属性を整える（chown を先、setcap / chmod を後にして属性消失を避ける）。
 TMP_LAUNCHER="$(mktemp "${DEST_DIR}/.launcher.XXXXXX")" || die 1 install-failed "mktemp failed"
 TMP_SUPERVISOR="$(mktemp "${DEST_DIR}/.supervisor.XXXXXX")" || die 1 install-failed "mktemp failed"
-cat <"${LAUNCHER_SRC}" >"${TMP_LAUNCHER}" || die 1 install-failed "copy failed"
-cat <"${SUPERVISOR_SRC}" >"${TMP_SUPERVISOR}" || die 1 install-failed "copy failed"
+run_bounded cat <&"${SRC_FD_LAUNCHER}" >"${TMP_LAUNCHER}" || die 1 install-failed "copy failed"
+run_bounded cat <&"${SRC_FD_SUPERVISOR}" >"${TMP_SUPERVISOR}" || die 1 install-failed "copy failed"
+exec {SRC_FD_LAUNCHER}<&- {SRC_FD_SUPERVISOR}<&-
 chown root:root "${TMP_LAUNCHER}" || die 1 install-failed "chown failed"
 chmod 0755 "${TMP_LAUNCHER}" || die 1 install-failed "chmod failed"
 chown root:root "${TMP_SUPERVISOR}" || die 1 install-failed "chown failed"
@@ -224,11 +243,7 @@ is_xattr_unsupported() { # <setcap の終了コード> <stderr>
 
 METHOD="file-capability"
 rc=0
-if command -v timeout >/dev/null 2>&1; then
-  err="$(timeout 30 setcap "${LAUNCHER_CAPS}" "${TMP_LAUNCHER}" 2>&1 >/dev/null)" || rc=$?
-else
-  err="$(setcap "${LAUNCHER_CAPS}" "${TMP_LAUNCHER}" 2>&1 >/dev/null)" || rc=$?
-fi
+err="$(run_bounded setcap "${LAUNCHER_CAPS}" "${TMP_LAUNCHER}" 2>&1 >/dev/null)" || rc=$?
 if [ "${rc}" -eq 0 ]; then
   expect_launcher_caps "${TMP_LAUNCHER}"
 elif is_xattr_unsupported "${rc}" "${err}"; then
@@ -244,11 +259,28 @@ fi
 expect_no_caps "${TMP_SUPERVISOR}"
 expect_stat "${TMP_SUPERVISOR}" 755
 
-# 失敗しうる処理がすべて成功してから最終名へ置換する（rename は xattr を保つ）。
-mv -f -- "${TMP_SUPERVISOR}" "${SUPERVISOR_DST}" || die 1 install-failed "rename failed"
+# 失敗しうる処理がすべて成功してから最終名へ置換する（rename は xattr を保つ）。2 つの置換は一組として扱い、
+# 2 つ目が失敗したら旧ファイル（ハードリンクで保持した退避。xattr も保つ）へ戻す（旧 launcher と新 supervisor の不整合を残さない）。
+BAK_SUPERVISOR=""
+if [ -e "${SUPERVISOR_DST}" ]; then
+  BAK_SUPERVISOR="${DEST_DIR}/.supervisor.bak.$$"
+  ln -- "${SUPERVISOR_DST}" "${BAK_SUPERVISOR}" || die 1 install-failed "backup failed"
+fi
+mv -f -- "${TMP_SUPERVISOR}" "${SUPERVISOR_DST}" || {
+  [ -z "${BAK_SUPERVISOR}" ] || rm -f -- "${BAK_SUPERVISOR}"
+  die 1 install-failed "rename failed"
+}
 TMP_SUPERVISOR=""
-mv -f -- "${TMP_LAUNCHER}" "${LAUNCHER_DST}" || die 1 install-failed "rename failed"
+if ! mv -f -- "${TMP_LAUNCHER}" "${LAUNCHER_DST}"; then
+  if [ -n "${BAK_SUPERVISOR}" ]; then
+    mv -f -- "${BAK_SUPERVISOR}" "${SUPERVISOR_DST}" || true
+  else
+    rm -f -- "${SUPERVISOR_DST}"
+  fi
+  die 1 install-failed "rename failed (previous supervisor restored)"
+fi
 TMP_LAUNCHER=""
+[ -z "${BAK_SUPERVISOR}" ] || rm -f -- "${BAK_SUPERVISOR}"
 
 expect_no_caps "${SUPERVISOR_DST}"
 expect_stat "${SUPERVISOR_DST}" 755

@@ -23,3 +23,6 @@ path = "src/main.rs"
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+# workspace 内 path 依存。外部クレートの追加ではない（cli→core と同じ。TASK-118.3・#466: 状態ストアの読み出し）。
+fandhe-container-core = { path = "../core" }

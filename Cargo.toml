@@ -49,6 +49,7 @@ undocumented_unsafe_blocks = "deny"
 # 採用済みは serde / serde_json（承認: Issue #138・TASK-29.hdep1。OCI config.json のパース用）・sha2（#278）・
 # objc2 系 5 件（#356・TASK-64.hdep1）・windows-sys（#371・TASK-67.hdep1）・
 # ureq / rustls / rustls-graviola / rustls-native-certs（#399・TASK-51.hdep1。crates/oci のレジストリクライアント用）。
+# tonic-prost-build / protox（#425・TASK-56.hdep1。build 時のみ）。
 # workspace 内 crate の path 依存は外部クレートの追加ではない（TASK-111.1・#262・PLUG-3。core の optional 依存用）。
 [workspace.dependencies]
 fandhe-container-plugin = { path = "crates/plugin" }
@@ -82,3 +83,8 @@ ureq = { version = "=3.4.2", default-features = false, features = ["rustls-no-pr
 rustls = { version = "=0.23.45", default-features = false, features = ["std", "tls12", "logging"] }
 rustls-graviola = { version = "=0.4.0" }
 rustls-native-certs = { version = "=0.8.4" }
+# cri-api の .proto から gRPC コードを生成する build.rs 用（CRI-3・TASK-56.3）。承認: Issue #425・TASK-56.hdep1。
+# crates/cri の [build-dependencies] だけで使う（実行時の依存ではない）。protoc は使わず protox が純 Rust で .proto を解析する。
+# cleanup-markdown（既定 feature）は外す。prost-build / tonic-build は推移依存として入り Cargo.lock で固定される。
+tonic-prost-build = { version = "=0.14.6", default-features = false, features = ["transport"] }
+protox = "=0.9.1"

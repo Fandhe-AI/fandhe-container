@@ -76,3 +76,16 @@ wildcards = "deny"
 # 限り wildcards の対象外とする（cargo-deny の仕様上、公開対象クレートの path 依存は
 # 引き続き検出される。crates.io 公開する crate はバージョン併記の path 依存にする）。
 allow-wildcard-paths = true
+
+# C/C++ ネイティブビルドを引き込む暗号実装とビルドヘルパーを依存グラフ（normal・build・dev）から
+# 締め出す（#1779）。TLS の暗号実装は純 Rust の rustls-graviola に限る #399 の採用方針と、
+# docs/design/from-scratch-policy.md「不採用の記録」の `ring`・`aws-lc-rs`（#399）を機械的に守る。
+# Cargo.lock には rustls-webpki の optional 依存（`ring?/alloc` の弱い参照）として `ring`・`cc` の
+# 項目が残るが、cargo-deny は有効な feature で解決した依存グラフだけを見るため現状は通る。
+# feature の変更等で実際にビルド対象へ入った時点で fail する（fail-closed）。
+# 解除・例外の追加は依存追加のユーザー承認（dependency-policy.md）とセットで行う。
+deny = [
+  { crate = "ring", reason = "C/assembly native build; TLS crypto must be rustls-graviola (#399, #1779)" },
+  { crate = "cc", reason = "C/C++ native build helper; dependencies must stay pure Rust (#399, #1779)" },
+  { crate = "aws-lc-rs", reason = "C/C++ native build (aws-lc-sys); TLS crypto must be rustls-graviola (#399, #1779)" },
+]

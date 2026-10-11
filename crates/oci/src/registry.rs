@@ -4,7 +4,8 @@
 //! 匿名トークン取得の `RegistryClient::authenticate_anonymous`（TASK-51.2・#401）と manifest 取得の
 //! `RegistryClient::fetch_manifest`（TASK-51.3・#402）と、blob のストリーミング取得
 //! `RegistryClient::fetch_blob`（TASK-51.4・#403）。blob は `fetch_blob` では digest 未検証（`layer::verify_blob_digest` で別途検証する。#405。REPAIR-3）。
-//! OCI-3（資格情報つき認証）は未実装で、匿名のみ。
+//! Basic 認証の検証 `RegistryClient::authenticate_basic`（TASK-54.1・OCI-3・#416）も持つ。Bearer の資格情報つき
+//! 交換は #417、チャレンジに応じた統一入口は #418 で未実装。
 //!
 //! 安全側の既定値:
 //! - 平文 HTTP の経路を持たない（`https_only`。scheme は `https` 固定）
@@ -17,7 +18,10 @@
 //! `blob_request_timeout`（全体期限）と `max_blob_bytes`（許容サイズ）で縛る。
 //! CA ファイルを指定する経路は範囲外（OS のストアと `SSL_CERT_FILE` / `SSL_CERT_DIR` のみ）。
 
-use crate::auth::{RegistryAuth, parse_token_response, parse_www_authenticate};
+use crate::auth::{
+    BasicCredentials, RegistryAuth, challenge_offers_basic, parse_token_response,
+    parse_www_authenticate,
+};
 use crate::error::{OciError, OciErrorCode, code_for_http_status};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
 use crate::manifest::{
@@ -223,6 +227,25 @@ impl RegistryClient {
         )
     }
 
+    /// Basic 認証の資格情報を検証して `RegistryAuth::Basic` を得る（TASK-54.1・OCI-3・#416）。
+    ///
+    /// まず資格情報なしで `/v2/` を叩き、200 なら認証不要として `RegistryAuth::None`（資格情報は送らない）。
+    /// 401 で Basic が提示されていれば、`Authorization: Basic` を付けて同じ `/v2/` を再度叩き、200 なら
+    /// `RegistryAuth::Basic`。資格情報の送出先は `endpoint`（https 固定）の `/v2/` だけで、応答由来の
+    /// `realm`・`Location` へは送らない。リダイレクトは追従しない。401 / 403 は `PermissionDenied`
+    /// （message は固定文で、資格情報・応答本文を載せない）。Bearer のみの提示は `Unimplemented`
+    /// （Bearer の資格情報つき交換は #417、統一入口は #418）。再試行はしない。成功・失敗とエラー code・
+    /// 所要時間は `with_recorder` の記録先へ 1 件記録する（REPAIR-4。資格情報は記録しない）。
+    pub fn authenticate_basic(
+        &self,
+        endpoint: &RegistryEndpoint,
+        credentials: &BasicCredentials,
+    ) -> Result<RegistryAuth, OciError> {
+        record_oci_op(self.recorder.as_ref(), OciOpKind::AuthenticateBasic, || {
+            basic_flow(self.transport.as_ref(), &self.config, endpoint, credentials)
+        })
+    }
+
     /// manifest を取得し、image index なら対象 platform の manifest まで解決する（TASK-51.3・OCI-1）。
     ///
     /// `reference` が tag / digest の image manifest ならそのまま、index / manifest list なら `platform` に
@@ -351,6 +374,57 @@ fn anonymous_flow(
     Ok(RegistryAuth::Bearer(token))
 }
 
+/// Basic 認証の検証手順（通信は `transport` に委ねる。テストでは差し替える）。
+fn basic_flow(
+    transport: &dyn RegistryTransport,
+    config: &RegistryClientConfig,
+    endpoint: &RegistryEndpoint,
+    credentials: &BasicCredentials,
+) -> Result<RegistryAuth, OciError> {
+    let timeout = config.token_request_timeout;
+    let base_url = endpoint.base_url();
+    let probe = transport.get(&TransportRequest {
+        url: &base_url,
+        query: &[],
+        public_only: false,
+        body_limit: None,
+        timeout,
+        headers: &[],
+    })?;
+    match probe.status {
+        200 => return Ok(RegistryAuth::None),
+        401 => {}
+        s => return Err(status_error(s)),
+    }
+    let values: Vec<&str> = probe.www_authenticate.iter().map(String::as_str).collect();
+    if !challenge_offers_basic(&values)? {
+        // Bearer のみ（または challenge なし）。Basic を送らず、匿名経路の解析で分類する。
+        parse_www_authenticate(&values, &endpoint.host)?;
+        return Err(OciError::new(
+            OciErrorCode::Unimplemented,
+            "registry requires bearer token authentication (OCI-3, see TASK-54.2)",
+        ));
+    }
+    let header = credentials.authorization_header_value();
+    let resp = transport.get(&TransportRequest {
+        url: &base_url,
+        query: &[],
+        public_only: false,
+        body_limit: None,
+        timeout,
+        headers: &[("Authorization", header)],
+    })?;
+    match resp.status {
+        200 => Ok(RegistryAuth::Basic(credentials.clone())),
+        s @ (401 | 403) => Err(OciError::new(
+            OciErrorCode::PermissionDenied,
+            "registry rejected the credentials",
+        )
+        .with_http_status(s)),
+        s => Err(status_error(s)),
+    }
+}
+
 /// `fetch_manifest` の結果（将来の項目追加に備え `non_exhaustive`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -384,16 +458,7 @@ fn fetch_manifest_flow(
     auth: &RegistryAuth,
     platform: &Platform,
 ) -> Result<ResolvedManifest, OciError> {
-    let authorization = match auth {
-        RegistryAuth::Bearer(t) if t.is_expired(Instant::now()) => {
-            return Err(OciError::new(
-                OciErrorCode::PermissionDenied,
-                "registry token has expired",
-            ));
-        }
-        RegistryAuth::Bearer(t) => Some(t.authorization_header_value()),
-        _ => None,
-    };
+    let authorization = auth.authorization_header(Instant::now())?;
     let accept = manifest_accept();
     let mut headers: Vec<(&str, &str)> = vec![("Accept", accept.as_str())];
     if let Some(a) = &authorization {
@@ -563,16 +628,7 @@ fn fetch_blob_flow(
             "blob size exceeds the configured limit",
         ));
     }
-    let authorization = match auth {
-        RegistryAuth::Bearer(t) if t.is_expired(Instant::now()) => {
-            return Err(OciError::new(
-                OciErrorCode::PermissionDenied,
-                "registry token has expired",
-            ));
-        }
-        RegistryAuth::Bearer(t) => Some(t.authorization_header_value()),
-        _ => None,
-    };
+    let authorization = auth.authorization_header(Instant::now())?;
     if dest.exists() {
         return Err(OciError::new(
             OciErrorCode::FailedPrecondition,
@@ -1486,6 +1542,136 @@ mod tests {
         );
     }
 
+    const BASIC_CHALLENGE: &str = r#"Basic realm="Registry Realm""#;
+    const ALADDIN: &str = "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==";
+
+    fn aladdin() -> BasicCredentials {
+        BasicCredentials::new("Aladdin", "open sesame").expect("credentials")
+    }
+
+    fn run_basic(t: &FakeTransport) -> Result<RegistryAuth, OciError> {
+        let (ep, _) = alpine();
+        basic_flow(t, &RegistryClientConfig::default(), &ep, &aladdin())
+    }
+
+    /// OCI-3: 401 Basic チャレンジ → 資格情報つき再要求で成功し、続く manifest 取得にも Basic が載る。
+    #[test]
+    fn basic_challenge_then_credentials_succeeds() {
+        let t = FakeTransport::new(vec![resp(401, &[BASIC_CHALLENGE], ""), resp(200, &[], "")]);
+        let auth = run_basic(&t).expect("basic");
+        assert!(matches!(auth, RegistryAuth::Basic(_)));
+        {
+            let seen = t.seen.lock().expect("lock");
+            assert_eq!(seen.len(), 2);
+            for s in seen.iter() {
+                assert_eq!(s.0, "https://registry-1.docker.io/v2/");
+                assert!(!s.2, "must not use the public-only path");
+            }
+            let h = t.seen_headers.lock().expect("lock");
+            assert!(h[0].is_empty(), "probe must not carry credentials");
+            assert_eq!(
+                h[1],
+                vec![("Authorization".to_string(), ALADDIN.to_string())]
+            );
+        }
+        let t2 = FakeTransport::new(vec![manifest_resp(200, &image_body())]);
+        fetch(&t2, &auth, "x86_64").expect("fetch");
+        let h = t2.seen_headers.lock().expect("lock");
+        assert!(
+            h[0].contains(&("Authorization".to_string(), ALADDIN.to_string())),
+            "{:?}",
+            h[0]
+        );
+    }
+
+    /// OCI-3: /v2/ が 200 なら資格情報を送らず認証不要として扱う。
+    #[test]
+    fn basic_probe_200_sends_no_credentials() {
+        let t = FakeTransport::new(vec![resp(200, &[], "")]);
+        assert!(matches!(run_basic(&t), Ok(RegistryAuth::None)));
+        assert_eq!(t.seen.lock().expect("lock").len(), 1);
+    }
+
+    /// OCI-3・SEC: 誤った資格情報は PermissionDenied。message に資格情報・本文を載せない。
+    #[test]
+    fn basic_rejected_credentials() {
+        for status in [401u16, 403] {
+            let t = FakeTransport::new(vec![
+                resp(401, &[BASIC_CHALLENGE], ""),
+                resp(status, &[], "open sesame"),
+            ]);
+            let e = run_basic(&t).expect_err("rejected");
+            assert_eq!(e.code(), OciErrorCode::PermissionDenied);
+            assert_eq!(e.http_status(), Some(status));
+            assert_eq!(e.message(), "registry rejected the credentials");
+        }
+    }
+
+    /// OCI-3: Bearer のみの提示は資格情報を送らず Unimplemented。challenge なしの 401 は DataLoss。
+    #[test]
+    fn basic_other_challenges_send_no_credentials() {
+        let t = FakeTransport::new(vec![resp(401, &[HUB_CHALLENGE], "")]);
+        let e = run_basic(&t).expect_err("bearer");
+        assert_eq!(e.code(), OciErrorCode::Unimplemented);
+        assert_eq!(t.seen.lock().expect("lock").len(), 1);
+        let t = FakeTransport::new(vec![resp(401, &[], "")]);
+        assert_eq!(
+            run_basic(&t).expect_err("none").code(),
+            OciErrorCode::DataLoss
+        );
+        assert_eq!(t.seen.lock().expect("lock").len(), 1);
+    }
+
+    /// OCI-3: 想定外ステータスとトランスポートエラーの分類。
+    #[test]
+    fn basic_abnormal_responses() {
+        let t = FakeTransport::new(vec![resp(500, &[], "")]);
+        let e = run_basic(&t).expect_err("500");
+        assert_eq!(e.code(), OciErrorCode::Unavailable);
+        let t = FakeTransport::new(vec![resp(401, &[BASIC_CHALLENGE], ""), resp(302, &[], "")]);
+        assert_eq!(run_basic(&t).expect_err("302").http_status(), Some(302));
+        let t = FakeTransport::new(vec![Err(OciError::new(OciErrorCode::Timeout, "t"))]);
+        assert_eq!(
+            run_basic(&t).expect_err("timeout").code(),
+            OciErrorCode::Timeout
+        );
+        let t = FakeTransport::new(vec![
+            resp(401, &[BASIC_CHALLENGE], ""),
+            Err(OciError::new(OciErrorCode::Unavailable, "u")),
+        ]);
+        assert_eq!(
+            run_basic(&t).expect_err("second").code(),
+            OciErrorCode::Unavailable
+        );
+    }
+
+    /// OCI-3・REPAIR-4: 公開メソッド `authenticate_basic` の成功と失敗が 1 件ずつ記録される。
+    #[test]
+    fn authenticate_basic_public_api_records_outcomes() {
+        use crate::instrument::OciOpOutcome;
+        let (ep, _) = alpine();
+        let rec = Arc::new(crate::instrument::testing::Collect::default());
+        let ok = client_with(
+            FakeTransport::new(vec![resp(401, &[BASIC_CHALLENGE], ""), resp(200, &[], "")]),
+            rec.clone(),
+        );
+        assert!(matches!(
+            ok.authenticate_basic(&ep, &aladdin()),
+            Ok(RegistryAuth::Basic(_))
+        ));
+        let bad = client_with(
+            FakeTransport::new(vec![resp(401, &[BASIC_CHALLENGE], ""), resp(401, &[], "")]),
+            rec.clone(),
+        );
+        bad.authenticate_basic(&ep, &aladdin()).expect_err("401");
+        let items = rec.items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind(), OciOpKind::AuthenticateBasic);
+        assert_eq!(items[0].outcome(), OciOpOutcome::Success);
+        assert_eq!(items[1].outcome(), OciOpOutcome::Failure);
+        assert_eq!(items[1].error_code(), Some(OciErrorCode::PermissionDenied));
+    }
+
     /// OCI-1: 認証なしでは Authorization を送らない。
     #[test]
     fn manifest_without_auth_sends_no_authorization() {
@@ -2064,6 +2250,30 @@ mod tests {
             "no Authorization to the redirect target"
         );
         assert_eq!(std::fs::read(tmp.dest()).expect("read"), b"abc");
+    }
+
+    /// OCI-3・SEC: Basic でも最初のホップだけに Authorization を付け、CDN 側へは送らない。
+    #[test]
+    fn blob_redirect_drops_basic_authorization() {
+        let tmp = TmpDir::new("basic-redirect");
+        let t = FakeStream::new(vec![
+            step(307, Some(CDN), vec![]),
+            step(200, None, vec![b"abc".to_vec()]),
+        ]);
+        let auth = RegistryAuth::Basic(
+            BasicCredentials::new("Aladdin", "open sesame").expect("credentials"),
+        );
+        blob(&t, &auth, &desc(3), &tmp.dest()).expect("blob");
+        let seen = t.seen.lock().expect("lock");
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            seen[0].2,
+            vec![(
+                "Authorization".to_string(),
+                "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==".to_string()
+            )]
+        );
+        assert!(seen[1].1 && seen[1].2.is_empty());
     }
 
     /// OCI-1・SEC: 不正な Location（http・相対・userinfo・制御文字）は追従せず DataLoss。ファイルは残らない。

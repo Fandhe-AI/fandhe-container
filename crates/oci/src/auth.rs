@@ -49,10 +49,15 @@ fn data_loss(message: &str) -> OciError {
 /// レジストリ応答由来の非信頼値のため、生成時に次を検証する: `https://` 固定・userinfo / IPv6 リテラル
 /// 不可（`RegistryHost::parse`）・IP リテラルと単一ラベル名（`localhost` 等）の拒否・path の文字種制限
 /// （`..` 成分・`?`・`#`・`%` 不可）。ただし接続先レジストリ自身のホストと一致する場合は許可する。
-/// **名前ベースの最小防御**であり、DNS 解決後にプライベート IP を指すホスト名は防げない（ureq の範囲外。
-/// 接続先 IP の検査は将来課題）。
+/// **名前ベースの防御**であり、DNS 解決後にプライベート IP を指すホスト名は本型では防げない。そのため
+/// 接続先レジストリと別ホストの realm へは、解決済み IP を検査して公開アドレスだけへ接続するリゾルバを
+/// 持つ別 `Agent` で通信する（`registry` モジュールの `PublicOnlyResolver`。解決と接続が同じ結果を使うため
+/// DNS rebinding の隙間がない）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TokenRealm(String);
+pub(crate) struct TokenRealm {
+    url: String,
+    same_as_registry: bool,
+}
 
 impl TokenRealm {
     /// `realm` を検証して作る。`registry` はこの realm を提示したレジストリのホスト。
@@ -89,12 +94,21 @@ impl TokenRealm {
                 return Err(bad("invalid token realm path"));
             }
         }
-        Ok(Self(format!("https://{}{}", host.authority(), path)))
+        Ok(Self {
+            url: format!("https://{}{}", host.authority(), path),
+            same_as_registry: host == *registry,
+        })
+    }
+
+    /// 接続先レジストリ自身のホストなら true。false のとき呼び出し側は公開 IP のみへ接続する
+    /// 経路で通信する（SSRF 対策）。
+    pub(crate) fn is_registry_host(&self) -> bool {
+        self.same_as_registry
     }
 
     /// 検証済みの URL 文字列。
     pub(crate) fn as_str(&self) -> &str {
-        &self.0
+        &self.url
     }
 }
 
@@ -337,7 +351,18 @@ fn parse_rfc3339_unix_secs(s: &str) -> Option<u64> {
     }
     let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
     let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+    if !(1..=12).contains(&mo) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    // 月ごとの日数と閏年を検証する（2026-02-31 のような存在しない日付は別の日付へ化けるため拒否）。
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let days_in_month = match mo {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=days_in_month).contains(&d) {
         return None;
     }
     let mut i = 19;
@@ -607,6 +632,11 @@ mod tests {
             parse_rfc3339_unix_secs("2024-02-29T00:00:00Z"),
             Some(1_709_164_800)
         );
+        // 400 で割り切れる年は閏年。
+        assert_eq!(
+            parse_rfc3339_unix_secs("2000-02-29T00:00:00Z"),
+            Some(951_782_400)
+        );
         for bad in [
             "x",
             "",
@@ -614,6 +644,11 @@ mod tests {
             "2026-13-11T12:34:56Z",
             "2026-10-11T12:34:56",
             "1969-12-31T23:59:59Z",
+            "2026-02-31T00:00:00Z",
+            "2026-04-31T00:00:00Z",
+            "2026-02-29T00:00:00Z",
+            "2100-02-29T00:00:00Z",
+            "2026-10-00T00:00:00Z",
         ] {
             assert_eq!(parse_rfc3339_unix_secs(bad), None, "{bad}");
         }

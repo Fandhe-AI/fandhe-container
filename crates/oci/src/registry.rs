@@ -20,11 +20,16 @@ use crate::error::{OciError, OciErrorCode, code_for_http_status};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
 use crate::reference::{Digest, Reference, RegistryHost, Repository};
 use crate::tls;
+use std::fmt::Debug;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use ureq::Agent;
-use ureq::config::RedirectAuthHeaders;
+use ureq::config::{Config, RedirectAuthHeaders};
+use ureq::http::Uri;
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 
 /// レジストリの接続先（`https://{host}[:port]/v2/` のベース）。
 ///
@@ -110,6 +115,7 @@ impl Default for RegistryClientConfig {
 #[derive(Debug)]
 pub struct RegistryClient {
     agent: Agent,
+    transport: Arc<dyn RegistryTransport>,
     config: RegistryClientConfig,
     recorder: Arc<dyn OciOpRecorder>,
 }
@@ -139,22 +145,21 @@ impl RegistryClient {
             .unversioned_rustls_crypto_provider(provider)
             .root_certs(RootCerts::new_with_certs(&certs))
             .build();
-        let agent: Agent = Agent::config_builder()
-            .tls_config(tls_config)
-            .https_only(true)
-            .http_status_as_error(false)
-            .redirect_auth_headers(RedirectAuthHeaders::Never)
-            .max_redirects(config.max_redirects)
-            .max_response_header_size(config.max_response_header_bytes)
-            .timeout_resolve(Some(config.resolve_timeout))
-            .timeout_connect(Some(config.connect_timeout))
-            .timeout_send_request(Some(config.send_request_timeout))
-            .timeout_recv_response(Some(config.recv_response_timeout))
-            .user_agent(concat!("fandhe-container/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .into();
+        let agent = build_agent(config, tls_config.clone(), true, None);
+        // 接続先レジストリと別ホストの realm 専用。解決済み IP が公開アドレスのものだけへ接続する（SSRF 対策）。
+        let public_only_agent = build_agent(
+            config,
+            tls_config,
+            true,
+            Some(PublicOnlyResolver::default()),
+        );
+        let transport = Arc::new(UreqTransport {
+            agent: agent.clone(),
+            public_only_agent,
+        });
         Ok(Self {
             agent,
+            transport,
             config: config.clone(),
             recorder: Arc::new(NoopOciOpRecorder),
         })
@@ -201,55 +206,241 @@ impl RegistryClient {
         endpoint: &RegistryEndpoint,
         repository: &Repository,
     ) -> Result<RegistryAuth, OciError> {
-        let started = Instant::now();
-        let timeout = Some(self.config.token_request_timeout);
-        let probe = self
-            .agent
-            .get(endpoint.base_url())
+        anonymous_flow(self.transport.as_ref(), &self.config, endpoint, repository)
+    }
+}
+
+/// 匿名トークン取得の手順（通信は `transport` に委ねる。テストでは差し替える）。
+fn anonymous_flow(
+    transport: &dyn RegistryTransport,
+    config: &RegistryClientConfig,
+    endpoint: &RegistryEndpoint,
+    repository: &Repository,
+) -> Result<RegistryAuth, OciError> {
+    let timeout = config.token_request_timeout;
+    let base_url = endpoint.base_url();
+    let probe = transport.get(&TransportRequest {
+        url: &base_url,
+        query: &[],
+        public_only: false,
+        body_limit: None,
+        timeout,
+    })?;
+    match probe.status {
+        200 => return Ok(RegistryAuth::None),
+        401 => {}
+        s => return Err(status_error(s)),
+    }
+    let values: Vec<&str> = probe.www_authenticate.iter().map(String::as_str).collect();
+    let challenge = parse_www_authenticate(&values, &endpoint.host)?;
+
+    let scope = format!("repository:{}:pull", repository.as_str());
+    let mut query: Vec<(&str, &str)> = vec![("scope", scope.as_str())];
+    if let Some(service) = &challenge.service {
+        query.push(("service", service.as_str()));
+    }
+    // トークンの寿命から差し引く経過時間は、トークン要求そのもの（送信から本文受信まで）に限る。
+    // 直前の `/v2/` プローブの所要時間を含めると、新規発行のトークンが即失効扱いになりうる。
+    let token_started = Instant::now();
+    let resp = transport.get(&TransportRequest {
+        url: challenge.realm.as_str(),
+        query: &query,
+        public_only: !challenge.realm.is_registry_host(),
+        body_limit: Some(config.max_token_response_bytes),
+        timeout,
+    })?;
+    if resp.status != 200 {
+        return Err(status_error(resp.status));
+    }
+    let token = parse_token_response(
+        &resp.body,
+        Instant::now(),
+        SystemTime::now(),
+        token_started.elapsed(),
+    )?;
+    Ok(RegistryAuth::Bearer(token))
+}
+
+/// 1 回の GET の指定（redirect は常に追従しない）。
+struct TransportRequest<'a> {
+    url: &'a str,
+    query: &'a [(&'a str, &'a str)],
+    /// true なら解決済み IP が公開アドレスのものにだけ接続する（SSRF 対策）。
+    public_only: bool,
+    /// `Some` なら 200 のとき本文をこの上限まで読む。`None` は本文を読まない。
+    body_limit: Option<u64>,
+    /// リクエスト全体の期限（REPAIR-5）。
+    timeout: Duration,
+}
+
+// 本文にトークンが含まれうるため、Debug はテストでのみ導出する（security.md）。
+#[cfg_attr(test, derive(Debug))]
+struct TransportResponse {
+    status: u16,
+    www_authenticate: Vec<String>,
+    body: Vec<u8>,
+}
+
+/// トークン取得が使う通信の境界。実体は ureq、テストでは差し替える。
+trait RegistryTransport: Debug + Send + Sync {
+    fn get(&self, req: &TransportRequest<'_>) -> Result<TransportResponse, OciError>;
+}
+
+#[derive(Debug)]
+struct UreqTransport {
+    agent: Agent,
+    public_only_agent: Agent,
+}
+
+impl RegistryTransport for UreqTransport {
+    fn get(&self, req: &TransportRequest<'_>) -> Result<TransportResponse, OciError> {
+        let agent = if req.public_only {
+            &self.public_only_agent
+        } else {
+            &self.agent
+        };
+        let mut builder = agent
+            .get(req.url)
             .config()
-            .timeout_global(timeout)
+            .timeout_global(Some(req.timeout))
             .max_redirects(0)
-            .build()
-            .call()
-            .map_err(map_ureq_error)?;
-        match probe.status().as_u16() {
-            200 => return Ok(RegistryAuth::None),
-            401 => {}
-            s => return Err(status_error(s)),
+            .build();
+        for (k, v) in req.query {
+            builder = builder.query(*k, *v);
         }
-        let values: Vec<&str> = probe
+        let mut resp = builder.call().map_err(map_ureq_error)?;
+        let status = resp.status().as_u16();
+        let www_authenticate = resp
             .headers()
             .get_all("www-authenticate")
             .iter()
-            .filter_map(|v| v.to_str().ok())
+            .filter_map(|v| v.to_str().ok().map(str::to_string))
             .collect();
-        let challenge = parse_www_authenticate(&values, &endpoint.host)?;
+        let body = match req.body_limit {
+            Some(limit) if status == 200 => resp
+                .body_mut()
+                .with_config()
+                .limit(limit)
+                .read_to_vec()
+                .map_err(map_ureq_error)?,
+            _ => Vec::new(),
+        };
+        Ok(TransportResponse {
+            status,
+            www_authenticate,
+            body,
+        })
+    }
+}
 
-        let mut req = self
-            .agent
-            .get(challenge.realm.as_str())
-            .config()
-            .timeout_global(timeout)
-            .max_redirects(0)
-            .build()
-            .query("scope", format!("repository:{}:pull", repository.as_str()));
-        if let Some(service) = &challenge.service {
-            req = req.query("service", service);
+/// 共通設定の `Agent` を作る。`resolver` があれば名前解決をそれに置き換える。
+fn build_agent(
+    config: &RegistryClientConfig,
+    tls_config: TlsConfig,
+    https_only: bool,
+    resolver: Option<PublicOnlyResolver>,
+) -> Agent {
+    let cfg: Config = Agent::config_builder()
+        .tls_config(tls_config)
+        .https_only(https_only)
+        .http_status_as_error(false)
+        .redirect_auth_headers(RedirectAuthHeaders::Never)
+        .max_redirects(config.max_redirects)
+        .max_response_header_size(config.max_response_header_bytes)
+        .timeout_resolve(Some(config.resolve_timeout))
+        .timeout_connect(Some(config.connect_timeout))
+        .timeout_send_request(Some(config.send_request_timeout))
+        .timeout_recv_response(Some(config.recv_response_timeout))
+        .user_agent(concat!("fandhe-container/", env!("CARGO_PKG_VERSION")))
+        .build();
+    match resolver {
+        Some(r) => Agent::with_parts(cfg, DefaultConnector::default(), r),
+        None => Agent::new_with_config(cfg),
+    }
+}
+
+/// 公開アドレス以外（ループバック・プライベート・リンクローカル・CGNAT・予約・マルチキャスト等）なら false。
+/// IPv4 を埋め込む IPv6（v4-mapped・NAT64・6to4・v4-compatible）は埋め込まれた IPv4 を検査する。
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_public_v4(v4),
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            if v6.is_unspecified() || v6.is_loopback() || v6.is_multicast() {
+                return false;
+            }
+            // fc00::/7（ULA）・fe80::/10（リンクローカル）・fec0::/10（旧サイトローカル）。
+            if s[0] & 0xfe00 == 0xfc00 || s[0] & 0xffc0 == 0xfe80 || s[0] & 0xffc0 == 0xfec0 {
+                return false;
+            }
+            // 2001:db8::/32（文書化用）。
+            if s[0] == 0x2001 && s[1] == 0x0db8 {
+                return false;
+            }
+            let embedded = |hi: u16, lo: u16| {
+                let [a, b] = hi.to_be_bytes();
+                let [c, d] = lo.to_be_bytes();
+                is_public_v4(Ipv4Addr::new(a, b, c, d))
+            };
+            if s[..6] == [0, 0, 0, 0, 0, 0xffff] || s[..6] == [0; 6] {
+                // ::ffff:a.b.c.d（v4-mapped）と ::a.b.c.d（v4-compatible）。
+                return embedded(s[6], s[7]);
+            }
+            if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                // 64:ff9b::/96（NAT64）。
+                return embedded(s[6], s[7]);
+            }
+            if s[0] == 0x2002 {
+                // 2002::/16（6to4）。
+                return embedded(s[1], s[2]);
+            }
+            true
         }
-        let mut resp = req.call().map_err(map_ureq_error)?;
-        let status = resp.status().as_u16();
-        if status != 200 {
-            return Err(status_error(status));
+    }
+}
+
+fn is_public_v4(v4: Ipv4Addr) -> bool {
+    let [a, b, c, _] = v4.octets();
+    !(v4.is_unspecified()
+        || v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        || v4.is_documentation()
+        || a == 0
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 198 && (18..=19).contains(&b))
+        || a >= 240)
+}
+
+/// 既定の名前解決の結果から公開アドレスだけを残すリゾルバ。1 件も残らなければ接続しない。
+/// 検査した結果をそのまま接続に使うため、検査後に DNS 応答が差し替わる攻撃（rebinding）を受けない。
+#[derive(Debug, Default)]
+struct PublicOnlyResolver {
+    inner: DefaultResolver,
+}
+
+impl Resolver for PublicOnlyResolver {
+    fn resolve(
+        &self,
+        uri: &Uri,
+        config: &Config,
+        timeout: NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        let all = self.inner.resolve(uri, config, timeout)?;
+        let mut out = self.empty();
+        for addr in all.iter().filter(|a| is_public_ip(a.ip())) {
+            out.push(*addr);
         }
-        let body = resp
-            .body_mut()
-            .with_config()
-            .limit(self.config.max_token_response_bytes)
-            .read_to_vec()
-            .map_err(map_ureq_error)?;
-        let token =
-            parse_token_response(&body, Instant::now(), SystemTime::now(), started.elapsed())?;
-        Ok(RegistryAuth::Bearer(token))
+        if out.is_empty() {
+            return Err(ureq::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "resolved address is not public",
+            )));
+        }
+        Ok(out)
     }
 }
 
@@ -272,6 +463,12 @@ fn map_ureq_error(e: ureq::Error) -> OciError {
             OciErrorCode::ResourceExhausted,
             "registry response body is too large",
         ),
+        ureq::Error::Io(ref io) if io.kind() == std::io::ErrorKind::PermissionDenied => {
+            OciError::new(
+                OciErrorCode::PermissionDenied,
+                "registry host resolves to a non-public address",
+            )
+        }
         ureq::Error::Protocol(_)
         | ureq::Error::LargeResponseHeader(_, _)
         | ureq::Error::TooManyRedirects
@@ -367,6 +564,390 @@ mod tests {
         )
         .expect_err("fail");
         assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+    }
+
+    // ---- 匿名トークン取得フローの照合（OCI-1・REPAIR-12。外部通信なし）----
+
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Mutex;
+
+    type SeenRequest = (String, Vec<(String, String)>, bool, Option<u64>);
+
+    /// 台本どおりに応答し、受けた要求（url・query・public_only・body_limit）を記録する偽の通信。
+    #[derive(Debug)]
+    struct FakeTransport {
+        script: Mutex<Vec<Result<TransportResponse, OciError>>>,
+        seen: Mutex<Vec<SeenRequest>>,
+        delay_first: Duration,
+    }
+
+    impl FakeTransport {
+        fn new(script: Vec<Result<TransportResponse, OciError>>) -> Self {
+            Self {
+                script: Mutex::new(script),
+                seen: Mutex::new(Vec::new()),
+                delay_first: Duration::ZERO,
+            }
+        }
+    }
+
+    impl RegistryTransport for FakeTransport {
+        fn get(&self, req: &TransportRequest<'_>) -> Result<TransportResponse, OciError> {
+            let first = self.seen.lock().expect("lock").is_empty();
+            self.seen.lock().expect("lock").push((
+                req.url.to_string(),
+                req.query
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                req.public_only,
+                req.body_limit,
+            ));
+            if first {
+                std::thread::sleep(self.delay_first);
+            }
+            self.script.lock().expect("lock").remove(0)
+        }
+    }
+
+    fn resp(status: u16, www: &[&str], body: &str) -> Result<TransportResponse, OciError> {
+        Ok(TransportResponse {
+            status,
+            www_authenticate: www.iter().map(|s| s.to_string()).collect(),
+            body: body.as_bytes().to_vec(),
+        })
+    }
+
+    const HUB_CHALLENGE: &str =
+        r#"Bearer realm="https://auth.docker.io/token",service="registry.docker.io""#;
+
+    fn alpine() -> (RegistryEndpoint, Repository) {
+        let r = ImageReference::parse("alpine").expect("parse");
+        (
+            RegistryEndpoint::new(r.registry().clone()),
+            r.repository().clone(),
+        )
+    }
+
+    fn run(t: &FakeTransport) -> Result<RegistryAuth, OciError> {
+        let (ep, repo) = alpine();
+        anonymous_flow(t, &RegistryClientConfig::default(), &ep, &repo)
+    }
+
+    /// OCI-1: /v2/ が 200 なら認証不要で、トークン要求は送らない。
+    #[test]
+    fn probe_200_needs_no_token() {
+        let t = FakeTransport::new(vec![resp(200, &[], "")]);
+        assert!(matches!(run(&t), Ok(RegistryAuth::None)));
+        let seen = t.seen.lock().expect("lock");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "https://registry-1.docker.io/v2/");
+        assert_eq!(seen[0].3, None);
+    }
+
+    /// OCI-1: 401 → realm へ scope / service を実際に付けて GET し、別ホスト宛は公開 IP のみの経路を使う。
+    #[test]
+    fn challenge_then_token_sends_scope_and_service() {
+        let t = FakeTransport::new(vec![
+            resp(401, &[HUB_CHALLENGE], ""),
+            resp(200, &[], r#"{"token":"tok","expires_in":300}"#),
+        ]);
+        let auth = run(&t).expect("auth");
+        let RegistryAuth::Bearer(tok) = auth else {
+            panic!("expected bearer");
+        };
+        assert_eq!(tok.authorization_header_value(), "Bearer tok");
+        assert!(!tok.is_expired(Instant::now()));
+        let seen = t.seen.lock().expect("lock");
+        assert_eq!(seen[1].0, "https://auth.docker.io/token");
+        assert_eq!(
+            seen[1].1,
+            vec![
+                (
+                    "scope".to_string(),
+                    "repository:library/alpine:pull".to_string()
+                ),
+                ("service".to_string(), "registry.docker.io".to_string()),
+            ]
+        );
+        assert!(
+            seen[1].2,
+            "separate realm host must use the public-only path"
+        );
+        assert!(!seen[0].2);
+        assert_eq!(seen[1].3, Some(65536));
+    }
+
+    /// OCI-1: service の無いチャレンジでは service を送らない。realm がレジストリ自身なら通常経路。
+    #[test]
+    fn no_service_and_same_host_realm() {
+        let t = FakeTransport::new(vec![
+            resp(
+                401,
+                &[r#"Bearer realm="https://registry-1.docker.io/token""#],
+                "",
+            ),
+            resp(200, &[], r#"{"access_token":"x"}"#),
+        ]);
+        run(&t).expect("auth");
+        let seen = t.seen.lock().expect("lock");
+        assert_eq!(seen[1].1.len(), 1);
+        assert!(!seen[1].2);
+    }
+
+    /// OCI-1: 異常応答は分類つきのエラー（Basic のみ・非 200・壊れた JSON・不正 realm・通信失敗）。
+    #[test]
+    fn abnormal_responses() {
+        let t = FakeTransport::new(vec![resp(401, &[r#"Basic realm="x""#], "")]);
+        assert_eq!(
+            run(&t).expect_err("basic").code(),
+            OciErrorCode::Unimplemented
+        );
+        let t = FakeTransport::new(vec![resp(500, &[], "")]);
+        let e = run(&t).expect_err("probe 500");
+        assert_eq!(
+            (e.code(), e.http_status()),
+            (OciErrorCode::Unavailable, Some(500))
+        );
+        let t = FakeTransport::new(vec![resp(401, &[HUB_CHALLENGE], ""), resp(403, &[], "")]);
+        let e = run(&t).expect_err("token 403");
+        assert_eq!(
+            (e.code(), e.http_status()),
+            (OciErrorCode::PermissionDenied, Some(403))
+        );
+        let t = FakeTransport::new(vec![resp(401, &[HUB_CHALLENGE], ""), resp(302, &[], "")]);
+        assert_eq!(run(&t).expect_err("302").http_status(), Some(302));
+        let t = FakeTransport::new(vec![
+            resp(401, &[HUB_CHALLENGE], ""),
+            resp(200, &[], "not json"),
+        ]);
+        assert_eq!(run(&t).expect_err("json").code(), OciErrorCode::DataLoss);
+        let t = FakeTransport::new(vec![resp(
+            401,
+            &[r#"Bearer realm="https://127.0.0.1/token""#],
+            "",
+        )]);
+        assert_eq!(run(&t).expect_err("realm").code(), OciErrorCode::DataLoss);
+        assert_eq!(
+            t.seen.lock().expect("lock").len(),
+            1,
+            "no request to a rejected realm"
+        );
+        let t = FakeTransport::new(vec![Err(OciError::new(OciErrorCode::Timeout, "t"))]);
+        assert_eq!(run(&t).expect_err("timeout").code(), OciErrorCode::Timeout);
+    }
+
+    /// OCI-1: 発行時刻が古い応答は取得直後でも失効扱い（期限切れの照合）。
+    #[test]
+    fn expired_token_is_reported_expired() {
+        let t = FakeTransport::new(vec![
+            resp(401, &[HUB_CHALLENGE], ""),
+            resp(
+                200,
+                &[],
+                r#"{"token":"a","expires_in":60,"issued_at":"2020-01-01T00:00:00Z"}"#,
+            ),
+        ]);
+        let RegistryAuth::Bearer(tok) = run(&t).expect("auth") else {
+            panic!("expected bearer");
+        };
+        assert!(tok.is_expired(Instant::now()));
+    }
+
+    /// OCI-1: プローブの所要時間はトークン寿命から差し引かない（遅いプローブの直後でも新規トークンは有効）。
+    #[test]
+    fn slow_probe_does_not_shorten_token_lifetime() {
+        let mut t = FakeTransport::new(vec![
+            resp(401, &[HUB_CHALLENGE], ""),
+            resp(200, &[], r#"{"token":"a","expires_in":1}"#),
+        ]);
+        t.delay_first = Duration::from_millis(1200);
+        let RegistryAuth::Bearer(tok) = run(&t).expect("auth") else {
+            panic!("expected bearer");
+        };
+        assert!(!tok.is_expired(Instant::now()));
+    }
+
+    /// 1 接続だけ受けて、要求ヘッダを読み、`respond` の返す生の応答を書いて閉じる使い捨てサーバー。
+    fn serve_once(respond: impl FnOnce(&str) -> Vec<u8> + Send + 'static) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(buf.get(..n).unwrap_or(&[])).to_string();
+                let out = respond(&head);
+                let _ = s.write_all(&out);
+                let _ = s.flush();
+            }
+        });
+        format!("http://127.0.0.1:{port}/token")
+    }
+
+    /// テスト用: 平文 HTTP を許す（本番経路は https_only 固定）以外は本番と同じ設定の通信。
+    fn loopback_transport(config: &RegistryClientConfig) -> UreqTransport {
+        let agent = build_agent(config, TlsConfig::default(), false, None);
+        UreqTransport {
+            public_only_agent: agent.clone(),
+            agent,
+        }
+    }
+
+    fn get(
+        t: &UreqTransport,
+        url: &str,
+        limit: Option<u64>,
+        timeout: Duration,
+    ) -> Result<TransportResponse, OciError> {
+        t.get(&TransportRequest {
+            url,
+            query: &[("scope", "repository:a/b:pull"), ("service", "svc")],
+            public_only: false,
+            body_limit: limit,
+            timeout,
+        })
+    }
+
+    fn http_ok(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    /// OCI-1: 実 HTTP で scope / service が query として送られ、本文が返る。
+    #[test]
+    fn ureq_transport_sends_query_and_reads_body() {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let url = serve_once(move |head| {
+            let _ = tx.send(head.to_string());
+            http_ok(r#"{"token":"t"}"#)
+        });
+        let t = loopback_transport(&RegistryClientConfig::default());
+        let r = get(&t, &url, Some(1024), Duration::from_secs(5)).expect("get");
+        // サーバースレッド内の assert は失敗が伝わらないため、受けた要求を本スレッドで照合する。
+        let head = rx.recv_timeout(Duration::from_secs(5)).expect("request");
+        let line = head.lines().next().unwrap_or("").to_string();
+        assert!(line.starts_with("GET /token?"), "{line}");
+        assert!(
+            line.contains("scope=repository%3Aa%2Fb%3Apull")
+                || line.contains("scope=repository:a/b:pull"),
+            "{line}"
+        );
+        assert!(line.contains("service=svc"), "{line}");
+        assert!(!head.to_ascii_lowercase().contains("authorization:"));
+        assert_eq!(
+            (r.status, r.body.as_slice()),
+            (200, br#"{"token":"t"}"#.as_slice())
+        );
+    }
+
+    /// OCI-1・SEC: リダイレクトは追従せず、成功扱いにもしない。
+    #[test]
+    fn ureq_transport_does_not_follow_redirects() {
+        let url = serve_once(|_| {
+            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+        });
+        let t = loopback_transport(&RegistryClientConfig::default());
+        match get(&t, &url, Some(1024), Duration::from_secs(5)) {
+            Ok(r) => assert_eq!(r.status, 302),
+            Err(e) => assert_eq!(e.code(), OciErrorCode::DataLoss),
+        }
+    }
+
+    /// OCI-1・REPAIR-5: 本文が上限を超えれば ResourceExhausted。
+    #[test]
+    fn ureq_transport_enforces_body_limit() {
+        let url = serve_once(|_| http_ok(&"a".repeat(2000)));
+        let t = loopback_transport(&RegistryClientConfig::default());
+        let e = get(&t, &url, Some(1000), Duration::from_secs(5)).expect_err("limit");
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+    }
+
+    /// OCI-1・REPAIR-5: 応答が来なければ全体期限で Timeout。
+    #[test]
+    fn ureq_transport_times_out() {
+        let url = serve_once(|_| {
+            std::thread::sleep(Duration::from_secs(3));
+            Vec::new()
+        });
+        let t = loopback_transport(&RegistryClientConfig::default());
+        let e = get(&t, &url, Some(1024), Duration::from_millis(300)).expect_err("timeout");
+        assert_eq!(e.code(), OciErrorCode::Timeout);
+    }
+
+    /// OCI-1・SEC: 公開 IP のみの経路は、ループバックへ解決されるホストへ接続しない（SSRF）。
+    #[test]
+    fn public_only_agent_refuses_loopback() {
+        let url = serve_once(|_| Vec::new());
+        let config = RegistryClientConfig::default();
+        let agent = build_agent(
+            &config,
+            TlsConfig::default(),
+            false,
+            Some(PublicOnlyResolver::default()),
+        );
+        let t = UreqTransport {
+            public_only_agent: agent.clone(),
+            agent,
+        };
+        let e = t
+            .get(&TransportRequest {
+                url: &url,
+                query: &[],
+                public_only: true,
+                body_limit: Some(1024),
+                timeout: Duration::from_secs(5),
+            })
+            .expect_err("loopback");
+        assert_eq!(e.code(), OciErrorCode::PermissionDenied);
+    }
+
+    /// SEC: 公開 / 非公開アドレスの判定（具体値）。
+    #[test]
+    fn public_ip_classification() {
+        let private = [
+            "0.0.0.0",
+            "10.1.2.3",
+            "127.0.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "192.168.1.1",
+            "100.64.0.1",
+            "198.18.0.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "fe80::1",
+            "fc00::1",
+            "fd00::1",
+            "ff02::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::10.0.0.1",
+            "64:ff9b::a00:1",
+            "2002:7f00:1::1",
+            "2001:db8::1",
+        ];
+        for a in private {
+            assert!(!is_public_ip(a.parse().expect("ip")), "{a}");
+        }
+        let public = [
+            "8.8.8.8",
+            "104.16.0.1",
+            "100.63.255.255",
+            "2606:4700::1111",
+            "::ffff:8.8.8.8",
+            "2002:0808:0808::1",
+        ];
+        for a in public {
+            assert!(is_public_ip(a.parse().expect("ip")), "{a}");
+        }
     }
 
     /// OCI-1・ERR-1: 実 CPU・実 OS ストアでの構築は panic せず、Ok か想定内の分類のエラーを返す。

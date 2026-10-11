@@ -13,7 +13,7 @@
 //!
 //! - core の `OpRecorder` との接続アダプタ（`fandhe-container-plugin-cri` の担当。TASK-108）。それまでは
 //!   既定の [`NoopCriOpRecorder`] が使われ、記録先を注入しない限り何も出力されない
-//! - `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox` 以外の RPC の種別は、RPC の実装（TASK-58 以降）と一緒に [`CriOpKind`] へ追加する
+//! - `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`ListImages` 以外の RPC の種別は、RPC の実装（TASK-58 以降・TASK-61.2 以降）と一緒に [`CriOpKind`] へ追加する
 //!
 //! # 機微情報
 //!
@@ -42,6 +42,8 @@ pub enum CriOpKind {
     PodSandboxStatus,
     /// `RuntimeService.ListPodSandbox` 1 回（レジストリの絞り込み一覧。CRI-1・TASK-57.3）。
     ListPodSandbox,
+    /// `ImageService.ListImages` 1 回（ローカルキャッシュの絞り込み一覧。CRI-4・TASK-61.1）。
+    ListImages,
 }
 
 impl CriOpKind {
@@ -53,6 +55,7 @@ impl CriOpKind {
             CriOpKind::RemovePodSandbox => "cri.remove_pod_sandbox",
             CriOpKind::PodSandboxStatus => "cri.pod_sandbox_status",
             CriOpKind::ListPodSandbox => "cri.list_pod_sandbox",
+            CriOpKind::ListImages => "cri.list_images",
         }
     }
 }
@@ -257,12 +260,13 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [CriOpKind; 5] = [
+    const ALL_KINDS: [CriOpKind; 6] = [
         CriOpKind::RunPodSandbox,
         CriOpKind::StopPodSandbox,
         CriOpKind::RemovePodSandbox,
         CriOpKind::PodSandboxStatus,
         CriOpKind::ListPodSandbox,
+        CriOpKind::ListImages,
     ];
 
     /// REPAIR-4: 操作名は安定した固定文字列。
@@ -279,6 +283,7 @@ mod tests {
             "cri.pod_sandbox_status"
         );
         assert_eq!(CriOpKind::ListPodSandbox.as_str(), "cri.list_pod_sandbox");
+        assert_eq!(CriOpKind::ListImages.as_str(), "cri.list_images");
     }
 
     /// REPAIR-4: 操作名は core の `OpName::new` と同じ規則に収まる（cri は core に依存できないため

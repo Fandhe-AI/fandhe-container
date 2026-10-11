@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 pub enum OciOpKind {
     /// 匿名トークン取得（`/v2/` プローブからトークンエンドポイントまでの全体。TASK-51.2）。
     AuthenticateAnonymous,
+    /// マニフェスト取得（image index の場合は platform 解決後の取得まで。TASK-51.3）。
+    FetchManifest,
 }
 
 impl OciOpKind {
@@ -27,6 +29,7 @@ impl OciOpKind {
     pub fn as_str(self) -> &'static str {
         match self {
             OciOpKind::AuthenticateAnonymous => "oci.auth.anonymous",
+            OciOpKind::FetchManifest => "oci.manifest.fetch",
         }
     }
 }
@@ -199,6 +202,7 @@ mod tests {
         assert_eq!(items[1].outcome(), OciOpOutcome::Failure);
         assert_eq!(items[1].error_code(), Some(OciErrorCode::Timeout));
         assert_eq!(items[1].kind().as_str(), "oci.auth.anonymous");
+        assert_eq!(OciOpKind::FetchManifest.as_str(), "oci.manifest.fetch");
     }
 
     /// REPAIR-4: panic で巻き戻されても Failure が 1 件残る。

@@ -315,6 +315,7 @@ dependencies = [
 name = "fandhe-container-plugin"
 version = "0.0.0"
 dependencies = [
+ "hyper-util",
  "prost",
  "serde",
  "serde_json",

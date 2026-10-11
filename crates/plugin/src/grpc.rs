@@ -13,13 +13,18 @@
 //!
 //! - トランスポート（UDS / TCP）の選択は呼び出し側に委ねる。本モジュールは TCP を待ち受ける公開 API を
 //!   持たない（PLUG-12・既定で外部へ公開しない）。
-//! - 本基盤は認証を持たない。peer 認証・配置検証は `uds_security` の責務で、UDS 統合時に呼び出し側が
-//!   通す（PLUG-12）。gRPC の内容検証（リクエストの意味検証）も上位の責務で、入力は untrusted として扱う。
+//! - UDS 上の tonic 統合は `UdsIncoming`（サーバー側。`UdsListener` の配置検証・0600 化を再利用し、accept 直後・
+//!   最初の read より前に peer UID を検証する）と `connect_uds_channel`（クライアント側。再接続のたびに
+//!   server の peer UID を検証する）が担う（TASK-108.2・#454・PLUG-2・PLUG-12。いずれも unix のみ。WIN-1）。
+//!   peer 認証の限界（fd の受け渡し・pid 再利用等）は `uds_security`・`sys` の「限界」節に従う。
+//! - [`serve_router`]・[`connect_channel`] 自体は認証を持たない。gRPC の内容検証（リクエストの意味検証）は
+//!   上位の責務で、入力は untrusted として扱う。
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - UDS 上の tonic 統合（connector・listener・peer 認証との接続）は TASK-108.2（#454）。
 //! - CRI proto の RPC による疎通は TASK-108.3（#455）。
+//! - UDS サーバーの同時接続数の上限は未実装（同一 UID のみ接続可。接続あたりの並列・ストリーム数は
+//!   [`GrpcServerConfig`] で制限される）。
 //!
 //! # 期限（REPAIR-5）
 //!
@@ -56,6 +61,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
 
 use tonic::codegen::tokio_stream::Stream;
 
@@ -611,7 +619,7 @@ const FORCE_RECLAIM_WAIT: Duration = Duration::from_secs(2);
 /// `Router` を任意の incoming ストリームで起動し、`shutdown` の完了で graceful shutdown する。
 ///
 /// shutdown 信号の後、`config` の shutdown 猶予内にサーバーが終わらなければ、受け付け済みの全接続を
-/// 強制的に閉じ（tonic が起動した接続タスクの IO を打ち切る）、タスクの終了を [`FORCE_RECLAIM_WAIT`]
+/// 強制的に閉じ（tonic が起動した接続タスクの IO を打ち切る）、タスクの終了を `FORCE_RECLAIM_WAIT`
 /// まで待って回収を確認したうえで `Timeout` を返す（接続が居座っても無期限に待たず、タスクも残さない。
 /// REPAIR-5）。トランスポートの listener は呼び出し側が作る。結果は [`grpc_stats`] の `serve` に記録する。
 pub async fn serve_router<I, IO, IE, F>(
@@ -730,25 +738,37 @@ where
 
 /// 接続を確立する。`connect_timeout` で二重に保護し、期限切れは `Timeout`、接続失敗は `Unavailable`。
 ///
-/// 結果は [`grpc_stats`] の `connect` に記録する。UDS 用の connector 経由の接続は TASK-108.2（#454）で
-/// 追加する（未実装。PLUG-2・PLUG-12）。
+/// 結果は [`grpc_stats`] の `connect` に記録する。UDS 経由の接続は `connect_uds_channel`
+/// （TASK-108.2・#454。PLUG-2・PLUG-12）を使う。
 pub async fn connect_channel(
     endpoint: Endpoint,
     connect_timeout: Duration,
 ) -> Result<Channel, PluginError> {
+    connect_recorded(connect_timeout, async {
+        endpoint
+            .connect()
+            .await
+            .map_err(|e| transport_error_to_plugin(&e))
+    })
+    .await
+}
+
+/// 接続 future を二重の期限で包み、結果を `connect` の集計へ記録する（`connect_channel` と
+/// `connect_uds_channel` の共通部。REPAIR-4・REPAIR-5）。`fut` は期間の検証に通った場合のみ poll する。
+async fn connect_recorded<F>(connect_timeout: Duration, fut: F) -> Result<Channel, PluginError>
+where
+    F: Future<Output = Result<Channel, PluginError>>,
+{
     let started = Instant::now();
     let r = match check_duration(connect_timeout, "connect timeout") {
         Err(e) => Err(e),
-        Ok(connect_timeout) => {
-            match tokio::time::timeout(connect_timeout, endpoint.connect()).await {
-                Err(_) => Err(PluginError::new(
-                    PluginErrorCode::Timeout,
-                    "grpc connect timed out",
-                )),
-                Ok(Err(e)) => Err(transport_error_to_plugin(&e)),
-                Ok(Ok(ch)) => Ok(ch),
-            }
-        }
+        Ok(connect_timeout) => match tokio::time::timeout(connect_timeout, fut).await {
+            Err(_) => Err(PluginError::new(
+                PluginErrorCode::Timeout,
+                "grpc connect timed out",
+            )),
+            Ok(r) => r,
+        },
     };
     STATS_CONNECT.record(
         started.elapsed(),
@@ -756,6 +776,282 @@ pub async fn connect_channel(
     );
     r
 }
+
+#[cfg(unix)]
+mod uds {
+    use super::*;
+
+    // ---------------------------------------------------------------------------------------------
+    // UDS 上の tonic 統合（TASK-108.2・#454・PLUG-2・PLUG-12）。unix のみ（WIN-1）。
+    // ---------------------------------------------------------------------------------------------
+
+    /// UDS の待ち受けを tonic の incoming ストリームにする（サーバー側。PLUG-2・PLUG-12）。
+    ///
+    /// 呼び出し元は将来の `fandhe-container-plugin-cri`（TASK-114 周辺）で、[`serve_router`] へ渡す。
+    /// 配置検証（自 UID 所有・0700 相当・symlink 不可）・0600 化・stale 掃除・`sun_path` 長検査は
+    /// `UdsListener::bind` が行い、本型は再実装しない。`UdsListener` を所有するため、drop で
+    /// socket ファイルと bind ロックが後始末される。
+    ///
+    /// accept ごとに、tonic が最初の read をする前に peer UID を `uds_security::verify_peer` で検証する。
+    /// 不一致・取得不能は切断し、監査イベントを `observer` へ 1 件通知して次の accept に進む（サーバーは
+    /// 止まらない。UID 値は返却エラーにもログにも載せない）。`observer` は受付の中で同期に呼ばれるため
+    /// ブロックしない実装であること（`PeerAuthObserver` の契約）。
+    ///
+    /// accept の I/O エラー（fd 枯渇等）は `Err` として流し、tonic が記録して継続する。直後は 10ms の
+    /// バックオフを挟み busy loop を避ける（REPAIR-5）。
+    ///
+    /// `new` は tokio ランタイムの内側で呼ぶこと（reactor へ登録するため）。
+    pub struct UdsIncoming {
+        /// 非同期 accept 用（`listener` の fd を dup したもの）。
+        inner: tokio::net::UnixListener,
+        /// socket ファイル・bind ロックの所有者（RAII）。
+        listener: crate::UdsListener,
+        expected_uid: u32,
+        observer: Box<dyn crate::PeerAuthObserver>,
+        backoff: Option<Pin<Box<tokio::time::Sleep>>>,
+    }
+
+    /// accept エラー後のバックオフ。
+    const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
+
+    impl UdsIncoming {
+        /// bind 済みの `listener` を incoming にする。fd の dup・tokio 化に失敗したら `Internal`。
+        pub fn new(
+            listener: crate::UdsListener,
+            observer: Box<dyn crate::PeerAuthObserver>,
+        ) -> Result<Self, PluginError> {
+            let expected_uid = listener.expected_uid();
+            Self::with_expected_uid(listener, observer, expected_uid)
+        }
+
+        /// 期待 UID を指定して作る。公開経路は常に bind 時の実効 UID を渡す `new`。
+        /// 検証を省く経路ではなく、テストで期待値だけをずらして拒否経路を再現するために分けている。
+        pub(super) fn with_expected_uid(
+            listener: crate::UdsListener,
+            observer: Box<dyn crate::PeerAuthObserver>,
+            expected_uid: u32,
+        ) -> Result<Self, PluginError> {
+            let internal = |msg: &'static str| PluginError::new(PluginErrorCode::Internal, msg);
+            let std_listener = listener.try_clone_std_listener()?;
+            std_listener
+                .set_nonblocking(true)
+                .map_err(|_| internal("failed to configure listener"))?;
+            let inner = tokio::net::UnixListener::from_std(std_listener)
+                .map_err(|_| internal("failed to register listener with the runtime"))?;
+            Ok(Self {
+                inner,
+                listener,
+                expected_uid,
+                observer,
+                backoff: None,
+            })
+        }
+
+        /// client が接続に使う socket のパス（`UdsListener::path`）。
+        pub fn path(&self) -> &Path {
+            self.listener.path()
+        }
+    }
+
+    impl Stream for UdsIncoming {
+        type Item = Result<tokio::net::UnixStream, std::io::Error>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let this = &mut *self;
+            if let Some(sleep) = this.backoff.as_mut() {
+                if sleep.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                this.backoff = None;
+            }
+            loop {
+                match this.inner.poll_accept(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => {
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::WouldBlock
+                        ) {
+                            continue;
+                        }
+                        this.backoff = Some(Box::pin(tokio::time::sleep(ACCEPT_ERROR_BACKOFF)));
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                    Poll::Ready(Ok((stream, _))) => {
+                        // peer 認証は std の stream に対して行い、合格後に tokio へ戻す。
+                        // 最初の read より前に検証が終わる（PLUG-12・TASK-124.6 と同じ不変条件）。
+                        let Ok(std_stream) = stream.into_std() else {
+                            continue;
+                        };
+                        if let Err(rej) =
+                            crate::uds_security::verify_peer(&std_stream, this.expected_uid)
+                        {
+                            // 「切断 → 監査通知」の順（`transport` の accept と同じ。SEC-4）。
+                            drop(std_stream);
+                            this.observer.on_rejection(&crate::PeerAuthRejection {
+                                op: crate::PeerAuthOp::Accept,
+                                reason: rej.reason,
+                                code: rej.error.code(),
+                                expected_uid: this.expected_uid,
+                                peer_uid: rej.peer_uid,
+                                expected_pid: None,
+                                peer_pid: None,
+                                socket_path: this.listener.path(),
+                            });
+                            continue;
+                        }
+                        match tokio::net::UnixStream::from_std(std_stream) {
+                            Ok(s) => return Poll::Ready(Some(Ok(s))),
+                            Err(_) => continue,
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// UDS へつなぐ tonic の connector（クライアント側。PLUG-2・PLUG-12）。
+    ///
+    /// `Channel` が再接続するたびに呼ばれるため、接続ごとに server の peer UID を検証する。不一致・取得不能は
+    /// 何も送らず切断し、監査イベントを通知する。失敗の `PluginError` は `last_error` へ残し、
+    /// [`connect_uds_channel`] が tonic の汎用エラーの代わりに返す（コード契約を `UdsStream::connect` と揃える）。
+    #[derive(Clone)]
+    struct UdsConnector {
+        path: Arc<PathBuf>,
+        expected_uid: u32,
+        connect_timeout: Duration,
+        observer: Arc<Mutex<Box<dyn crate::PeerAuthObserver>>>,
+        last_error: Arc<Mutex<Option<PluginError>>>,
+    }
+
+    impl UdsConnector {
+        async fn connect_verified(&self) -> Result<tokio::net::UnixStream, PluginError> {
+            let stream = match tokio::time::timeout(
+                self.connect_timeout,
+                tokio::net::UnixStream::connect(self.path.as_path()),
+            )
+            .await
+            {
+                Err(_) => {
+                    return Err(crate::transport::map_connect_io_error(
+                        std::io::ErrorKind::TimedOut,
+                    ));
+                }
+                Ok(Err(e)) => return Err(crate::transport::map_connect_io_error(e.kind())),
+                Ok(Ok(s)) => s,
+            };
+            let internal = || {
+                PluginError::new(
+                    PluginErrorCode::Internal,
+                    "failed to configure connected stream",
+                )
+            };
+            let std_stream = stream.into_std().map_err(|_| internal())?;
+            // 偽 listener への誘導対策（PLUG-12）。最初の送信より前に検証し、不一致は何も送らず切断する。
+            if let Err(rej) = crate::uds_security::verify_peer(&std_stream, self.expected_uid) {
+                drop(std_stream);
+                lock(&self.observer).on_rejection(&crate::PeerAuthRejection {
+                    op: crate::PeerAuthOp::Connect,
+                    reason: rej.reason,
+                    code: rej.error.code(),
+                    expected_uid: self.expected_uid,
+                    peer_uid: rej.peer_uid,
+                    expected_pid: None,
+                    peer_pid: None,
+                    socket_path: self.path.as_path(),
+                });
+                return Err(rej.error);
+            }
+            tokio::net::UnixStream::from_std(std_stream).map_err(|_| internal())
+        }
+    }
+
+    impl tonic::codegen::Service<tonic::codegen::http::Uri> for UdsConnector {
+        type Response = hyper_util::rt::TokioIo<tokio::net::UnixStream>;
+        type Error = std::io::Error;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        /// URI は使わない（接続先は保持する socket パスのみ）。
+        fn call(&mut self, _uri: tonic::codegen::http::Uri) -> Self::Future {
+            let this = self.clone();
+            Box::pin(async move {
+                match this.connect_verified().await {
+                    Ok(s) => Ok(hyper_util::rt::TokioIo::new(s)),
+                    Err(e) => {
+                        *lock(&this.last_error) = Some(e);
+                        Err(std::io::Error::other("uds connect failed"))
+                    }
+                }
+            })
+        }
+    }
+
+    /// UDS 経由で gRPC の `Channel` を確立する（クライアント側。PLUG-2・PLUG-12・REPAIR-5）。
+    ///
+    /// 呼び出し元は core 側 proxy（TASK-114）。`path` は `UdsListener::path` 相当で、空・NUL・
+    /// `sun_path` 超過は `InvalidArgument`。存在しなければ `NotFound`、listener 不在の stale socket は
+    /// `Unavailable`、期限切れは `Timeout`、server の peer UID が自 UID でない場合は `PermissionDenied`
+    /// （取得不能な環境は `Unimplemented`。fail-closed）。再接続のたびに peer UID を再検証する。
+    /// 拒否は `observer` へ通知する（`UdsStream::connect` と同じ契約）。結果は [`grpc_stats`] の `connect` に記録する。
+    pub async fn connect_uds_channel(
+        path: &Path,
+        config: &GrpcClientConfig,
+        observer: Box<dyn crate::PeerAuthObserver>,
+    ) -> Result<Channel, PluginError> {
+        connect_uds_channel_with_uid(path, config, observer, crate::sys::effective_uid()).await
+    }
+
+    /// `connect_uds_channel` の本体。期待 UID を引数に取るのはテストで期待値をずらすためで、公開経路は
+    /// 常に自 euid を渡す。
+    pub(super) async fn connect_uds_channel_with_uid(
+        path: &Path,
+        config: &GrpcClientConfig,
+        observer: Box<dyn crate::PeerAuthObserver>,
+        expected_uid: u32,
+    ) -> Result<Channel, PluginError> {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        let precheck = if bytes.is_empty() || bytes.contains(&0) {
+            Err(invalid("invalid socket path"))
+        } else {
+            crate::transport::check_sun_path_len(path)
+        };
+        let last_error = Arc::new(Mutex::new(None));
+        let connector = UdsConnector {
+            path: Arc::new(path.to_path_buf()),
+            expected_uid,
+            connect_timeout: config.connect_timeout,
+            observer: Arc::new(Mutex::new(observer)),
+            last_error: Arc::clone(&last_error),
+        };
+        connect_recorded(config.connect_timeout, async {
+            precheck?;
+            // URI は connector が無視するダミー（HTTP/2 の :authority にだけ使われる）。
+            let endpoint = Endpoint::from_shared("http://localhost")
+                .map_err(|_| PluginError::new(PluginErrorCode::Internal, "invalid endpoint"))?;
+            match config
+                .apply(endpoint)
+                .connect_with_connector(connector)
+                .await
+            {
+                Ok(ch) => Ok(ch),
+                Err(e) => Err(lock(&last_error)
+                    .take()
+                    .unwrap_or_else(|| transport_error_to_plugin(&e))),
+            }
+        })
+        .await
+    }
+}
+
+#[cfg(unix)]
+pub use uds::{UdsIncoming, connect_uds_channel};
 
 /// RPC 全体を期限で包む（REPAIR-5）。
 ///
@@ -950,5 +1246,124 @@ mod tests {
             PluginErrorCode::ResourceExhausted
         );
         assert_eq!(m(tonic::Code::Unknown), PluginErrorCode::Internal);
+    }
+}
+
+/// UDS 統合の peer 認証拒否経路（PLUG-12・SEC-4・TASK-108.2）。別 UID を実際には作れないため、
+/// 期待 UID だけをずらして拒否を再現する（検証を省く経路ではない）。`peer_uid` が取得できる
+/// 環境（`transport` のテストと同じ cfg）に限る。
+#[cfg(all(
+    test,
+    any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
+mod uds_peer_auth_tests {
+    use super::uds::{UdsIncoming, connect_uds_channel_with_uid};
+    use super::*;
+    use crate::{
+        PeerAuthObserver, PeerAuthOp, PeerAuthRejectReason, PeerAuthRejection, UdsListener,
+    };
+    use std::io::{Read, Write};
+    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::net::UnixStream as StdStream;
+    use std::sync::atomic::AtomicU32;
+
+    type Events = Arc<Mutex<Vec<(PeerAuthOp, PeerAuthRejectReason)>>>;
+
+    struct Recorder(Events);
+    impl PeerAuthObserver for Recorder {
+        fn on_rejection(&mut self, e: &PeerAuthRejection<'_>) {
+            self.0.lock().unwrap().push((e.op, e.reason));
+        }
+    }
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "fcgp-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+            Self(p)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn other_uid() -> u32 {
+        crate::sys::effective_uid().wrapping_add(1)
+    }
+
+    /// サーバー側: 不一致の接続は切断され、Accept 拒否が 1 件通知され、
+    /// incoming は終了せず継続する（PLUG-12・SEC-4）。
+    #[tokio::test]
+    async fn plug12_server_rejects_mismatched_peer_and_keeps_serving() {
+        let dir = TempDir::new();
+        let listener = UdsListener::bind(&dir.0.join("s.sock")).unwrap();
+        let events: Events = Arc::default();
+        let mut incoming = UdsIncoming::with_expected_uid(
+            listener,
+            Box::new(Recorder(Arc::clone(&events))),
+            other_uid(),
+        )
+        .unwrap();
+        let path = incoming.path().to_path_buf();
+        let client = std::thread::spawn(move || {
+            let mut c = StdStream::connect(path).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            // 先送りしたバイトは読まれない。切断されると EOF（Ok(0)）か reset になる。
+            let _ = c.write_all(b"early");
+            let mut buf = [0u8; 8];
+            c.read(&mut buf).unwrap_or(0)
+        });
+        // 拒否されるので stream は yield されず、Pending のまま（終了も Err もしない）。
+        let polled = tokio::time::timeout(
+            Duration::from_millis(500),
+            poll_fn(|cx| Pin::new(&mut incoming).poll_next(cx)),
+        )
+        .await;
+        assert!(polled.is_err(), "rejected peer must not be yielded");
+        assert_eq!(client.join().unwrap(), 0);
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![(PeerAuthOp::Accept, PeerAuthRejectReason::UidMismatch)]
+        );
+    }
+
+    /// クライアント側: 期待 UID と server の peer が不一致なら PermissionDenied で失敗し、
+    /// Connect 拒否が 1 件通知される（偽 listener 対策。PLUG-12）。
+    #[tokio::test]
+    async fn plug12_client_rejects_mismatched_server() {
+        let dir = TempDir::new();
+        let listener = UdsListener::bind(&dir.0.join("s.sock")).unwrap();
+        let events: Events = Arc::default();
+        let cfg = GrpcClientConfig::new()
+            .with_connect_timeout(Duration::from_secs(2))
+            .unwrap();
+        let e = connect_uds_channel_with_uid(
+            listener.path(),
+            &cfg,
+            Box::new(Recorder(Arc::clone(&events))),
+            other_uid(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::PermissionDenied, "{e:?}");
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![(PeerAuthOp::Connect, PeerAuthRejectReason::UidMismatch)]
+        );
     }
 }

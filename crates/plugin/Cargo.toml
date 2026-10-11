@@ -17,6 +17,7 @@
 # core からは `fandhe-container-core` の `plugin` feature 経由で optional に参照される（PLUG-3・TASK-111.1・#262）。
 # gRPC 面（`grpc` モジュール。TASK-108.1・#453・PLUG-2）は非既定 feature `grpc` の背後に置く。tonic / tokio（承認: #425 の
 # オーナー判断 2026-10-10）は optional で、core が既定 feature で本 crate を引いても tokio / tonic は core に入らない（PLUG-3・PLUG-4）。
+# UDS 上の tonic 統合（TASK-108.2・#454）は hyper-util（承認: #425 のオーナー判断。同 feature `grpc` のみ・Cargo.lock に既存）を追加。
 # license は workspace 継承（Apache-2.0）をやめ、本 crate だけ `MIT OR Apache-2.0` にする
 # （#13 のオーナー判断 2026-10-10・TASK-3・OSS-3。外部の plugin の作者もリンクする境界ライブラリのため）。
 # 全文はルートの LICENSE-MIT・LICENSE-APACHE。依存の serde / serde_json も MIT OR Apache-2.0。
@@ -30,13 +31,14 @@ publish = false
 
 [features]
 default = []
-grpc = ["dep:tonic", "dep:tokio"]
+grpc = ["dep:tonic", "dep:tokio", "dep:hyper-util"]
 
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 tonic = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true, features = ["time"] }
+tokio = { workspace = true, optional = true, features = ["time", "net"] }
+hyper-util = { workspace = true, optional = true, features = ["tokio"] }
 
 # grpc の結合試験用（hand-written な prost メッセージ・codec と `#[tokio::test]`）。
 [dev-dependencies]
@@ -46,6 +48,10 @@ tokio = { workspace = true, features = ["rt", "macros", "time", "net"] }
 
 [[test]]
 name = "grpc_basic"
+required-features = ["grpc"]
+
+[[test]]
+name = "grpc_uds"
 required-features = ["grpc"]
 
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。

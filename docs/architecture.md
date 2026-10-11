@@ -127,6 +127,8 @@ cargo metadata --format-version 1 --no-deps | jq '[.packages[] | {name, deps: [.
 
 依存は各 TASK の実装が進むにつれて追加される。追加時は「設計上の依存方向」の表を更新する。
 
+なお `plugin` → `cri` は `[dev-dependencies]` のみの test 専用辺（TASK-108.3・#455。生成済み CRI サービスの UDS 疎通試験用）で、通常依存の方向規則（plugin が最下位の境界基盤）と PLUG-4 の core 不変性は変えない。cri → plugin の通常依存は足さない。
+
 ### 設計上の依存方向
 
 以下は各 TASK・crate-naming.md の決定に基づく設計上の依存方向であり、現状の `Cargo.toml` には未反映の辺を含む。各辺には「確定（出典）」「想定（未確定・該当 TASK で確定）」「未確定（方向を決めない）」のいずれかのラベルを付ける。

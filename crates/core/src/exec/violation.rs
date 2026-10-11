@@ -17,7 +17,7 @@
 //! 監査イベントへの写像は [`IsolationViolation::entrypoint_audit_event`]（SEC-4・SUP-6・SEC-1・TASK-163 追補・#1595）。
 //! supervisor の exec の worker が返し得る違反（[`ViolationReason::EXEC_WORKER_REASONS`]。種別 `exec_target` の 10 理由と
 //! 種別 `rootfs_pivot` の `rootfs_is_host_root`）から監査イベントへの写像は [`ViolationReason::exec_worker_audit_event`]
-//! （`exec_target` は `ExecTarget`、`rootfs_is_host_root` は `mount_audit_event` と同じ `Mount` のパスなし。#1614 の事後監査）。
+//! （`exec_target` は `ExecTarget`、`rootfs_is_host_root` は `mount_audit_event` と同じ `Mount` のパスなし・理由コードつき。#1614 の事後監査）。
 //! ファイルへの永続化（TASK-41.5.1・#839）とカーネル監査フォールバック（#840）も `audit_log` に実装済みで、
 //! 本モジュールの記録を実際の sink へ流す本番経路（launcher・CLI への配線）は未実装
 //! （REPAIR-3: 実装済みを装わない）。
@@ -340,15 +340,36 @@ impl ViolationReason {
     /// [`Self::EXEC_WORKER_REASONS`] の理由だけが対象で、それ以外は `None`。種別 `exec_target` は
     /// [`Self::exec_target_audit_event`] と同じ `ExecTarget`、種別 `rootfs_pivot` は
     /// [`IsolationViolation::mount_audit_event`] と同じ層 `Mount` へ写す（理由コードだけを持つ呼び出し側のため
-    /// パスなし。`AuditEvent::Mount` は理由コードの欄を持たない）。1 理由が写る層は 1 つだけ（二重に記録しない）。
+    /// パスなし・理由コードつき。#1701）。1 理由が写る層は 1 つだけ（二重に記録しない）。
     pub fn exec_worker_audit_event(self) -> Option<AuditEvent> {
         if !Self::EXEC_WORKER_REASONS.contains(&self) {
             return None;
         }
         match self.kind() {
             ViolationKind::ExecTarget => self.exec_target_audit_event(),
-            ViolationKind::RootfsPivot => Some(AuditEvent::Mount { path: None }),
+            ViolationKind::RootfsPivot => self.mount_layer_audit_event(None),
             _ => None,
+        }
+    }
+
+    /// マウント層（`MountTarget`・`SharedPropagation`・`RootfsPivot`）の理由なら、理由コードつきの
+    /// `Mount` 監査イベントを返す。それ以外の種別は `None`（#1701）。
+    ///
+    /// [`IsolationViolation::mount_audit_event`]（パスあり/なし）と worker の経路
+    /// （[`Self::exec_worker_audit_event`]。パスなし）が共有する写像の唯一の実装。
+    fn mount_layer_audit_event(self, path: Option<AuditPath>) -> Option<AuditEvent> {
+        match self.kind() {
+            ViolationKind::MountTarget
+            | ViolationKind::SharedPropagation
+            | ViolationKind::RootfsPivot => Some(AuditEvent::Mount {
+                path,
+                reason: Some(AuditReason::new(self.as_str())),
+            }),
+            ViolationKind::PlanRejected
+            | ViolationKind::EstablishPrecondition
+            | ViolationKind::EvidenceMismatch
+            | ViolationKind::Entrypoint
+            | ViolationKind::ExecTarget => None,
         }
     }
 
@@ -816,18 +837,7 @@ impl IsolationViolation {
     /// エントリポイントはマウント層の拒否ではないため `None`（エントリポイントは [`Self::entrypoint_audit_event`]、
     /// exec の対象の拒否は [`Self::exec_audit_event`] が記録する）。
     pub fn mount_audit_event(&self) -> Option<AuditEvent> {
-        match self.kind {
-            ViolationKind::MountTarget
-            | ViolationKind::SharedPropagation
-            | ViolationKind::RootfsPivot => Some(AuditEvent::Mount {
-                path: self.audit_path.clone(),
-            }),
-            ViolationKind::PlanRejected
-            | ViolationKind::EstablishPrecondition
-            | ViolationKind::EvidenceMismatch
-            | ViolationKind::Entrypoint
-            | ViolationKind::ExecTarget => None,
-        }
+        self.reason.mount_layer_audit_event(self.audit_path.clone())
     }
 }
 
@@ -1138,8 +1148,125 @@ mod tests {
         let v = IsolationViolation::new(ViolationReason::RootfsMissing, None);
         assert_eq!(
             v.mount_audit_event(),
-            Some(AuditEvent::Mount { path: None })
+            Some(AuditEvent::Mount {
+                path: None,
+                reason: Some(AuditReason::new("rootfs_missing")),
+            })
         );
+    }
+
+    /// SEC-4・TASK-41.4 追補（#1701）: マウント層に写る全 17 理由が、パスあり・なしのどちらでも
+    /// 理由コード（静的トークンの具体値）つきの `Mount` になる。他の種別は `None` のまま。
+    #[test]
+    fn sec4_task41_4_1701_mount_audit_event_carries_reason_token() {
+        use ViolationKind::{MountTarget, RootfsPivot, SharedPropagation};
+        let table = [
+            (
+                ViolationReason::PathNotAbsolute,
+                "path_not_absolute",
+                MountTarget,
+            ),
+            (
+                ViolationReason::PathContainsNul,
+                "path_contains_nul",
+                MountTarget,
+            ),
+            (
+                ViolationReason::PathParentComponent,
+                "path_parent_component",
+                MountTarget,
+            ),
+            (
+                ViolationReason::TargetOutsideRootfs,
+                "target_outside_rootfs",
+                MountTarget,
+            ),
+            (
+                ViolationReason::RootfsMissing,
+                "rootfs_missing",
+                MountTarget,
+            ),
+            (
+                ViolationReason::RootfsSymlinkOrNotDirectory,
+                "rootfs_symlink_or_not_directory",
+                MountTarget,
+            ),
+            (
+                ViolationReason::TargetIsRootfs,
+                "target_is_rootfs",
+                MountTarget,
+            ),
+            (
+                ViolationReason::PathSymlinkOrNotDirectory,
+                "path_symlink_or_not_directory",
+                MountTarget,
+            ),
+            (ViolationReason::PathMissing, "path_missing", MountTarget),
+            (ViolationReason::TargetMoved, "target_moved", MountTarget),
+            (
+                ViolationReason::HostDeviceNodeUnexpected,
+                "host_device_node_unexpected",
+                MountTarget,
+            ),
+            (
+                ViolationReason::TargetOnSharedMount,
+                "target_on_shared_mount",
+                SharedPropagation,
+            ),
+            (
+                ViolationReason::RootfsOnSharedMount,
+                "rootfs_on_shared_mount",
+                SharedPropagation,
+            ),
+            (
+                ViolationReason::RootfsIsHostRoot,
+                "rootfs_is_host_root",
+                RootfsPivot,
+            ),
+            (ViolationReason::RootfsMoved, "rootfs_moved", RootfsPivot),
+            (
+                ViolationReason::RootfsHasSubmounts,
+                "rootfs_has_submounts",
+                RootfsPivot,
+            ),
+            (
+                ViolationReason::RootfsHasExternalHardlink,
+                "rootfs_has_external_hardlink",
+                RootfsPivot,
+            ),
+        ];
+        assert_eq!(table.len(), 17);
+        for (reason, token, kind) in table {
+            assert_eq!(reason.kind(), kind, "{reason:?}");
+            assert_eq!(reason.as_str(), token, "{reason:?}");
+            let with_path = IsolationViolation::new(reason, Some(Path::new("/x")));
+            assert_eq!(
+                with_path.mount_audit_event(),
+                Some(AuditEvent::Mount {
+                    path: Some(AuditPath::new(Path::new("/x"))),
+                    reason: Some(AuditReason::new(token)),
+                }),
+                "{reason:?}"
+            );
+            let no_path = IsolationViolation::new(reason, None);
+            assert_eq!(
+                no_path.mount_audit_event(),
+                Some(AuditEvent::Mount {
+                    path: None,
+                    reason: Some(AuditReason::new(token)),
+                }),
+                "{reason:?}"
+            );
+        }
+        for reason in [
+            ViolationReason::NoNamespaces,
+            ViolationReason::EstablishNotPid1,
+            ViolationReason::EvidenceCallerNotPid1,
+            ViolationReason::EntrypointIsRuntimeBinary,
+        ] {
+            let v = IsolationViolation::new(reason, Some(Path::new("/x")));
+            assert_eq!(v.mount_audit_event(), None, "{reason:?}");
+        }
     }
 
     /// CORE-6・SEC-5・SEC-4（TASK-29 追補・#1660）: ホストのデバイスノードの不一致の理由コード・種別・ビヘイビア ID・
@@ -1159,7 +1286,8 @@ mod tests {
         assert_eq!(
             v.mount_audit_event(),
             Some(AuditEvent::Mount {
-                path: Some(AuditPath::new(Path::new("/dev/null")))
+                path: Some(AuditPath::new(Path::new("/dev/null"))),
+                reason: Some(AuditReason::new("host_device_node_unexpected")),
             })
         );
         assert_eq!(v.exec_audit_event(), None);
@@ -1205,7 +1333,10 @@ mod tests {
                 ViolationKind::ExecTarget => AuditEvent::ExecTarget {
                     reason: AuditReason::new(r.as_str()),
                 },
-                ViolationKind::RootfsPivot => AuditEvent::Mount { path: None },
+                ViolationKind::RootfsPivot => AuditEvent::Mount {
+                    path: None,
+                    reason: Some(AuditReason::new(r.as_str())),
+                },
                 other => panic!("unexpected worker violation kind {other:?}"),
             };
             assert_eq!(r.exec_worker_audit_event(), Some(expected), "{r:?}");
@@ -1342,7 +1473,7 @@ mod tests {
     }
 
     /// SEC-4・SUP-6・SEC-1: worker の経路の 11 理由はそれぞれ 1 件だけ記録される（exec 対象は層 exec_target と理由
-    /// コード、`rootfs_is_host_root` は層 mount で理由コードなし。どちらもパスなし）。一覧外は 0 件、失敗でも error は不変。
+    /// コード、`rootfs_is_host_root` は層 mount で理由コードつき。どちらもパスなし）。一覧外は 0 件、失敗でも error は不変。
     #[test]
     fn sec4_sup6_record_exec_worker_rejection_records_once_per_reason() {
         use crate::audit_log::mount::tests::VecSink;
@@ -1356,13 +1487,13 @@ mod tests {
             assert_eq!(out.error, "rejected");
             let recs = sink.snapshot();
             assert_eq!(recs.len(), 1, "{r:?}");
-            let (layer, reason) = if r == ViolationReason::RootfsIsHostRoot {
-                (AuditLayer::Mount, None)
+            let layer = if r == ViolationReason::RootfsIsHostRoot {
+                AuditLayer::Mount
             } else {
-                (AuditLayer::ExecTarget, Some(r.as_str()))
+                AuditLayer::ExecTarget
             };
             assert_eq!(recs[0].layer(), layer, "{r:?}");
-            assert_eq!(recs[0].reason().map(AuditReason::as_str), reason);
+            assert_eq!(recs[0].reason().map(AuditReason::as_str), Some(r.as_str()));
             assert_eq!(recs[0].path(), None);
             assert_eq!(recs[0].pid().get(), std::process::id());
             assert_eq!(recs[0].container_id(), None);

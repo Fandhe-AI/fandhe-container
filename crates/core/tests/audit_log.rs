@@ -65,7 +65,14 @@ fn sec4_task41_1_three_layers_are_representable() {
     assert_eq!(landlock.layer(), AuditLayer::Landlock);
     assert_eq!(landlock.path(), Some(Path::new("/etc/passwd")));
 
-    let mount = AuditRecord::new(ts(), pid, AuditEvent::Mount { path: None });
+    let mount = AuditRecord::new(
+        ts(),
+        pid,
+        AuditEvent::Mount {
+            path: None,
+            reason: None,
+        },
+    );
     assert_eq!(mount.layer().as_str(), "mount");
     assert_eq!(mount.pid().get(), 1234);
     assert_eq!(

@@ -141,7 +141,7 @@
 //!   `exec_joined_*`・`exec_target_pidfd_mismatch` の 10 種）を層 `exec_target` のレコードとして **1 拒否につき 1 件**
 //!   記録する。worker の制限の準備で生じる rootfs の拒否（種別 `rootfs_pivot` の `rootfs_is_host_root`。worker 自身の
 //!   `/` が bundle の rootfs と同じディレクトリ。SEC-1）も、core の `IsolationViolation::mount_audit_event` と同じ写像で
-//!   層 `mount` のレコード（パスなし。`AuditEvent::Mount` は理由コードの欄を持たないため `reason` も無い）として
+//!   層 `mount` のレコード（パスなし・理由コード `rootfs_is_host_root` つき。#1701）として
 //!   1 拒否につき 1 件記録する（#1614 の事後監査の P2）。worker の `err` 行が運ぶ理由はこの 11 種（core の
 //!   `ViolationReason::EXEC_WORKER_REASONS`）だけで、一覧と worker の経路のソースの一致は core の単体テストが固定する。
 //!   `execve` 前の子の拒否（`ExecExit::SetupFailed` の `violation`。種別 `entrypoint` の 8 理由）も
@@ -215,8 +215,7 @@
 //!   bundle の rootfs の固定（`load_exec_bundle` → core の `pin_bundle_rootfs` / `RootfsDir::pin`。start と共有）は、
 //!   検証後の差し替え等によるパス検証の違反（`path_symlink_or_not_directory`・`path_missing` 等）を固定文言の
 //!   `TraitError` へ写して違反の情報を落とすため記録されない（start の経路でも同じ。bundle は supervisor と同じ
-//!   信頼境界にある前提。記録するには `pin` が違反を運べる形にする必要がある）。層 `mount` のレコードに理由コードを載せること（`AuditEvent::Mount` の拡張。#652 の共通ログ型と
-//!   合わせて決める）、再起動を越えて残る置き場所・ローテーション・常時の二重記録も未実装（`FileAuditSink` の doc）
+//!   信頼境界にある前提。記録するには `pin` が違反を運べる形にする必要がある）。再起動を越えて残る置き場所・ローテーション・常時の二重記録も未実装（`FileAuditSink` の doc）
 //! - `--ulimit` の指定値の `state.json` への記録。現状は pid1 の実効値を写して代替する（hard は launch を
 //!   超えないが、soft は pid1 が hard の範囲で上げていれば launch の指定より高くなり得る。core の
 //!   `exec/reapply.rs` のモジュール doc）
@@ -667,7 +666,7 @@ pub fn run_command(
 ///
 /// - `Err` で worker の経路の違反の理由があれば 1 件記録する（core の `record_exec_worker_rejection`）。種別
 ///   `exec_target` は層 `exec_target`（理由コードつき）、種別 `rootfs_pivot` の `rootfs_is_host_root`（worker 自身の
-///   `/` が bundle の rootfs と同じ。`prepare_exec_restrictions` の拒否）は層 `mount`（パスなし。core の
+///   `/` が bundle の rootfs と同じ。`prepare_exec_restrictions` の拒否）は層 `mount`（パスなし・理由コードつき。core の
 ///   `IsolationViolation::mount_audit_event` と同じ写像）
 /// - `Ok` で `SetupFailed { violation: Some(_) }` なら層 `entrypoint` で 1 件記録する。`Ok` のまま返し、
 ///   記録の成否で結果は変わらない（`AuditedOutcome::audit` に結果を載せる）
@@ -2447,7 +2446,7 @@ mod tests {
 
     /// SEC-4・SUP-6・SEC-1・TASK-163 追補（#1465）・#1614 の事後監査: 親側の記録は worker の経路の 11 理由それぞれ
     /// 1 件・パスなし・自 PID。種別 `exec_target` は層 `exec_target` と理由コード、`rootfs_is_host_root` は層 `mount`
-    /// （理由コードの欄なし）。違反なしの失敗は 0 件で `NotApplicable`、失敗する sink でも拒否は元のまま。
+    /// （理由コード `rootfs_is_host_root` つき）。違反なしの失敗は 0 件で `NotApplicable`、失敗する sink でも拒否は元のまま。
     #[test]
     fn sec4_sup6_task163_parent_records_one_audit_per_worker_rejection() {
         for reason in ViolationReason::EXEC_WORKER_REASONS {
@@ -2461,13 +2460,17 @@ mod tests {
             assert_eq!(rejected.delivery, AuditDelivery::Recorded);
             let recs = sink.snapshot();
             assert_eq!(recs.len(), 1, "{reason:?}");
-            let (layer, token) = if reason == ViolationReason::RootfsIsHostRoot {
-                (AuditLayer::Mount, None)
+            let layer = if reason == ViolationReason::RootfsIsHostRoot {
+                AuditLayer::Mount
             } else {
-                (AuditLayer::ExecTarget, Some(reason.as_str()))
+                AuditLayer::ExecTarget
             };
             assert_eq!(recs[0].layer(), layer, "{reason:?}");
-            assert_eq!(recs[0].reason().map(|r| r.as_str()), token);
+            assert_eq!(
+                recs[0].reason().map(|r| r.as_str()),
+                Some(reason.as_str()),
+                "{reason:?}"
+            );
             assert_eq!(recs[0].path(), None);
             assert_eq!(recs[0].syscall(), None);
             assert_eq!(recs[0].pid().get(), std::process::id());

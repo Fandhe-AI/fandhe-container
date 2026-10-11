@@ -1,6 +1,6 @@
 # cargo-deny 設定。`make deny` が本ファイルと Cargo.toml の両方が存在する時点で
 # 自動有効化され、`cargo deny --locked check advisories bans licenses sources` として
-# 実行される。Makefile 側の HAS_CARGO / HAS_DENY / HAS_MEMBERS 判定は、必要なファイルや
+# 実行される。scripts/targets/deny.sh の Cargo.toml / deny.toml / member crate の有無の判定は、必要なファイルや
 # メンバー crate が欠けた場合のみ skip する仕様。workspace とメンバー crate が揃った現在は
 # 有効化済みで skip されない（TASK-90.1・#126 で確認。OSS-4・OSS-5・REPAIR-9）。
 # 出力に `skip:` が出た場合は異常であり、合格の根拠にしない。

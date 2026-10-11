@@ -364,6 +364,8 @@ pub struct LateOrphans {
 #[derive(Default)]
 struct LateInner {
     orphans: Vec<LateOrphan>,
+    /// [`terminate_bounded`] の実行スレッドが終了を確認できたプロセスの pid（期限の内外を問わない）。
+    reaped: Vec<NonZeroU32>,
     /// 動作中の再 launch 実行スレッドの数（0 なら以後ハンドルが積まれない）。
     active_workers: u32,
 }
@@ -389,6 +391,10 @@ impl LateOrphans {
 
     fn push(&self, process: Box<dyn LaunchedProcess>, error: TraitError) {
         self.lock().orphans.push((process, error));
+    }
+
+    fn push_reaped(&self, pid: NonZeroU32) {
+        self.lock().reaped.push(pid);
     }
 
     /// 再 launch の実行スレッドがすべて終了済みで、以後ハンドルが積まれないとき `true`。
@@ -422,6 +428,13 @@ impl LateOrphans {
     /// 積まれている（terminate に失敗した）プロセスとその失敗理由をすべて取り出す。
     pub fn take(&self) -> Vec<LateOrphan> {
         std::mem::take(&mut self.lock().orphans)
+    }
+
+    /// terminate で終了を確認できたプロセスの pid をすべて取り出す（呼び出し側の待ちが期限を過ぎた後に成功した
+    /// 分を含む）。記録が `Running(この pid)` のまま残り得るため、呼び出し側が照合つきで `Stopped` に落とすのに使う
+    /// （SUP-1・CORE-2）。[`LateOrphans::wait_settled`] の後に呼べば最終結果になる。
+    pub fn take_reaped(&self) -> Vec<NonZeroU32> {
+        std::mem::take(&mut self.lock().reaped)
     }
 }
 
@@ -677,9 +690,12 @@ fn terminate_bounded(
         let Some(proc) = taken else {
             return;
         };
+        let pid = proc.pid();
         let r = proc.terminate(timeout);
-        if let Err(e) = &r {
-            worker_late.push(proc, e.clone());
+        match &r {
+            Err(e) => worker_late.push(proc, e.clone()),
+            // 呼び出し側が期限で待ちをやめた後に成功しても、回収済みの pid を受け皿に残す。
+            Ok(()) => worker_late.push_reaped(pid),
         }
         let (lock, cvar) = &*worker_result;
         *lock.lock().unwrap_or_else(PoisonError::into_inner) = Some(r);
@@ -2113,6 +2129,42 @@ mod tests {
         assert!(process.is_none());
         assert_eq!(restarts, 0);
         assert_eq!(q.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// terminate が呼び出し側の期限より遅れて成功する起動ハンドル。
+    struct SlowOkProc(u32, Duration);
+
+    impl LaunchedProcess for SlowOkProc {
+        fn pid(&self) -> NonZeroU32 {
+            pidn(self.0)
+        }
+        fn wait(&self, _: Duration) -> Result<Option<ProcessExit>, TraitError> {
+            Ok(None)
+        }
+        fn terminate(&self, _: Duration) -> Result<(), TraitError> {
+            std::thread::sleep(self.1);
+            Ok(())
+        }
+    }
+
+    /// SUP-1・CORE-2・REPAIR-5: 呼び出し側の待ちが期限を過ぎた後に terminate が成功しても、回収済みの pid を
+    /// 受け皿に残す（`take_reaped`）。失敗ハンドルは積まない。
+    #[test]
+    fn sup1_late_successful_terminate_records_reaped_pid() {
+        let late = LateOrphans::default();
+        let timeout = Duration::from_millis(10);
+        let slow = timeout + RELAUNCH_REPLY_GRACE + Duration::from_millis(300);
+        let r = terminate_bounded(
+            Box::new(SlowOkProc(77, slow)),
+            timeout,
+            &late,
+            spawn_os_thread,
+        );
+        assert_eq!(r.unwrap_err().code(), ErrorCode::Timeout);
+        assert!(late.wait_settled(Duration::from_secs(5)));
+        assert!(late.take().is_empty());
+        assert_eq!(late.take_reaped(), vec![pidn(77)]);
+        assert!(late.take_reaped().is_empty());
     }
 
     /// terminate が必ず失敗する起動ハンドル。

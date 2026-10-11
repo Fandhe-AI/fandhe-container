@@ -64,7 +64,9 @@
 //! - syscall の定数（`SOL_SOCKET`・`SO_PEERCRED`）はアーキテクチャごとに
 //!   `cfg(target_arch = ...)` で個別に定義し、値が同じであっても他アーキ
 //!   テクチャの定義を流用しない（coding-rust.md）。対応していない
-//!   アーキテクチャでは [`IoErrorCode::Unimplemented`] を返す（fail-closed）。
+//!   アーキテクチャでは [`IoErrorCode::Unimplemented`] を返す（fail-closed）。対応 arch は LP64 の x86_64・
+//!   aarch64 だけで、各 `cfg` に `target_pointer_width = "64"` を含める。x32 ABI・aarch64 ILP32 は
+//!   構造体レイアウトと `long` 幅が異なるため対応外とする（#1700・REPAIR-2）。
 //!   `syncfs` はこの分岐が不要（下記「`syncfs` の定数について」参照）
 //! - `extern "C"` の引数の型・幅は Linux の glibc/musl・macOS の libSystem の
 //!   宣言に合わせる（`socklen_t` は `u32`、`uid_t`/`gid_t` は `u32`、`c_int` は
@@ -124,7 +126,10 @@ mod linux {
 
     /// `linux/socket.h` の `struct ucred` と同じレイアウト（`#[repr(C)]` で
     /// 固定）。フィールド名・型は glibc/musl と一致させる。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[repr(C)]
     pub(super) struct Ucred {
         pub pid: i32,
@@ -133,7 +138,10 @@ mod linux {
     }
 
     /// `struct ucred` のバイト長（コンパイル時定数）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     pub(super) const UCRED_SIZE: usize = core::mem::size_of::<Ucred>();
 
     // UCRED_SIZE は u32 に収まらなければならない不変条件をコンパイル時に
@@ -142,14 +150,20 @@ mod linux {
     // フィールドが増えても `optlen` に渡す `u32` の範囲を超えないことを
     // 明示し、`peer_uid` 側で実行時に panic しうる
     // `u32::try_from(...).expect(...)` を使わずに済むようにする）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     const _: () = assert!(UCRED_SIZE <= u32::MAX as usize);
 
     /// `getsockopt` の `optlen` に渡す `struct ucred` のバイト長（`u32`）。
     /// 上記の `const assert` により `as u32` での切り捨ては発生しない
     /// （コンパイル時に不変条件を保証済みのキャストであり、実行時に
     /// panic する経路を持たない。H5・#820 security-auditor 指摘対応）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     pub(super) const UCRED_LEN: u32 = UCRED_SIZE as u32;
 
     // SOL_SOCKET・SO_PEERCRED の値は asm-generic の socket.h 由来で x86_64・
@@ -157,14 +171,14 @@ mod linux {
     // しない」方針に従い、アーキテクチャごとに個別の定数として定義する
     // （どちらかの値を将来アーキ固有に変更した場合、もう一方の cfg 分岐は
     // 影響を受けない）。
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
     pub(super) const SOL_SOCKET: i32 = 1;
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
     pub(super) const SO_PEERCRED: i32 = 17;
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
     pub(super) const SOL_SOCKET: i32 = 1;
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
     pub(super) const SO_PEERCRED: i32 = 17;
 
     unsafe extern "C" {
@@ -210,7 +224,10 @@ unsafe extern "C" {
 /// （`crate::server::imp::verify_peer_credential`）が fail-closed に扱う）。
 #[cfg(target_os = "linux")]
 pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, IoError> {
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     {
         let fd = stream.as_raw_fd();
         let mut ucred = linux::Ucred {
@@ -249,7 +266,10 @@ pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, IoError> {
         }
         Ok(ucred.uid)
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
     {
         // このアーキテクチャ向けの SOL_SOCKET/SO_PEERCRED 定数を持たないため、
         // 検証できない接続は fail-closed で拒否する（モジュール doc参照）。
@@ -466,7 +486,10 @@ pub(crate) fn full_fsync(file: &std::fs::File) -> io::Result<()> {
         target_os = "macos",
         all(
             target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
         )
     )),
     allow(
@@ -509,7 +532,10 @@ pub(crate) enum DirMode {
         target_os = "macos",
         all(
             target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
         )
     )),
     allow(
@@ -538,7 +564,11 @@ pub(crate) struct DirEntryName {
 /// `open(2)` フラグ・`unlinkat(2)` フラグ・errno・`mode_t`・`dirent` の
 /// オフセット（Linux はアーキテクチャごと、macOS は共通。上記「アーキテクチャ差」
 /// 参照）。値は `sys::tests::io5_beneath_consts_*` で固定値として照合する。
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_pointer_width = "64"
+))]
 mod beneath_consts {
     // include/uapi/asm-generic/fcntl.h（x86_64 は上書きしない）。
     pub(super) const O_WRONLY: i32 = 0o1;
@@ -564,7 +594,11 @@ mod beneath_consts {
     pub(super) const DIRENT_NAME_OFFSET: usize = 19;
 }
 
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "aarch64",
+    target_pointer_width = "64"
+))]
 mod beneath_consts {
     // include/uapi/asm-generic/fcntl.h（arm64 が上書きしない値）。
     pub(super) const O_WRONLY: i32 = 0o1;
@@ -626,7 +660,10 @@ pub(crate) use beneath::{
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 ))]
 mod beneath {
@@ -1080,7 +1117,10 @@ mod beneath {
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 )))]
 mod beneath {
@@ -1244,14 +1284,25 @@ mod tests {
     /// 拒否する）に対する `syncfs` は `EBADF` で失敗し、`Internal` になる。
     /// `O_PATH` の値はアーキテクチャごとに個別定義する（coding-rust.md
     /// 「定数を流用しない」。値自体はどちらも `0o10000000`）。
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
     const TEST_O_PATH: i32 = 0o10_000_000;
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "aarch64",
+        target_pointer_width = "64"
+    ))]
     const TEST_O_PATH: i32 = 0o10_000_000;
 
     #[cfg(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ))]
     #[test]
     fn io2_syncfs_on_o_path_fd_returns_ebadf() {
@@ -1298,7 +1349,11 @@ mod tests {
 
     /// IO-5・TASK-19.2（Codex P0 指摘の照合）: Linux x86_64 の `open(2)` 等の
     /// 定数は asm-generic の値（`include/uapi/asm-generic/fcntl.h`）。
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
     #[test]
     fn io5_beneath_consts_linux_x86_64() {
         use super::beneath_consts as c;
@@ -1326,7 +1381,11 @@ mod tests {
     /// `arch/arm64/include/uapi/asm/fcntl.h` が `O_DIRECTORY`・`O_NOFOLLOW` を
     /// asm-generic と異なる値（0o40000・0o100000）で定義し直す。asm-generic の
     /// 0o200000・0o400000 は arm64 では `O_DIRECT`・`O_LARGEFILE` にあたる。
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "aarch64",
+        target_pointer_width = "64"
+    ))]
     #[test]
     fn io5_beneath_consts_linux_aarch64() {
         use super::beneath_consts as c;
@@ -1383,7 +1442,10 @@ mod tests {
         target_os = "macos",
         all(
             target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
         )
     ))]
     mod beneath_runtime {

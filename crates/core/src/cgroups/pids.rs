@@ -230,7 +230,10 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     fn scratch(tag: &str) -> std::path::PathBuf {
         let base = std::env::temp_dir().join(format!("fc-pidsmax-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -240,7 +243,10 @@ mod tests {
 
     /// SUP-13・TASK-170 追補・REPAIR-4: `set_pids_max` が成功と失敗（pids.max 不在）を
     /// 操作名 `cgroup.set_pids_max` へ具体値で記録し、他 setter の名前は増えない。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup13_task170_pids_max_operations_are_recorded() {
         use crate::observability::OpName;
@@ -265,7 +271,10 @@ mod tests {
     }
 
     /// SUP-13・TASK-170.2: 通常ファイル上で書き込みと読み戻しが具体値で一致する（受け入れ条件の機械照合）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup13_task170_2_pids_write_and_read_back() {
         let base = scratch("ok");
@@ -281,7 +290,10 @@ mod tests {
     }
 
     /// SUP-13・TASK-170.2: `pids.max` が無い（controller 未有効）場合は `FailedPrecondition`。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup13_task170_2_pids_missing_file_is_failed_precondition() {
         let base = scratch("missing");
@@ -293,7 +305,10 @@ mod tests {
     }
 
     /// SUP-13・TASK-170.2: 読み戻しが要求と食い違えば成功扱いにしない。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup13_task170_2_pids_read_back_mismatch_fails() {
         let base = scratch("mismatch");
@@ -305,7 +320,10 @@ mod tests {
     }
 
     /// SUP-13・TASK-170.2: `pids.max` が symlink なら `O_NOFOLLOW` で拒否され、リンク先へは書かれない。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup13_task170_2_pids_symlink_is_rejected() {
         let base = scratch("symlink");

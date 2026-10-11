@@ -645,7 +645,10 @@ mod tests {
     /// Linux 以外は計測のファイル出力を拒否するため対象外（SEC-1）。
     #[cfg(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ))]
     #[test]
     fn repair4_export_ops_appends_json_lines() {
@@ -797,7 +800,10 @@ mod tests {
     /// 未存在からの同時作成でも出力を落とさず、各出力の 2 行（op_stats・メタ）は連続して並ぶ。
     #[cfg(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ))]
     #[test]
     fn repair4_export_ops_concurrent_appends_keep_lines_intact() {
@@ -859,7 +865,10 @@ mod tests {
     /// 読み手がいない場合と、読み手が open しただけで読まない場合の両方を具体値で検証する。
     #[cfg(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ))]
     #[test]
     fn repair5_export_ops_rejects_fifo_without_blocking() {
@@ -939,7 +948,10 @@ mod tests {
     /// SEC-1: 最終要素が symlink なら辿らず拒否し、リンク先は書き換えない。
     #[cfg(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ))]
     #[test]
     fn sec1_open_op_log_rejects_symlink_and_hardlink() {
@@ -967,7 +979,10 @@ mod tests {
     /// SEC-1: 信頼できない（非 root 所有の）親 symlink は辿らず拒否し、リンク先へ書かない。
     #[cfg(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ))]
     #[test]
     fn sec1_open_op_log_rejects_parent_symlink() {
@@ -989,7 +1004,10 @@ mod tests {
     /// SEC-1: デバイスノードは O_PATH で固定して種別検査で拒否し、書き込み用に開かない。
     #[cfg(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ))]
     #[test]
     fn sec1_open_op_log_rejects_device_node() {
@@ -999,7 +1017,10 @@ mod tests {
     /// SEC-1: 親の `..` は検査済み fd のスタックで解決でき、ルートより上へ出る経路は拒否する。
     #[cfg(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ))]
     #[test]
     fn sec1_open_trusted_parent_resolves_parent_dir() {
@@ -1022,7 +1043,10 @@ mod tests {
 
     #[cfg(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ))]
     mod op_log_file_tests {
         use super::super::op_log_file::{
@@ -1131,9 +1155,9 @@ mod tests {
             use fandhe_container_core::open_flags::NofollowOpenFlags;
             let f = NofollowOpenFlags::current().expect("supported arch");
             // [nonblock, directory|nofollow|nonblock, path|nofollow, file nofollow|nonblock]
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
             let want = [0o4000, 0o604_000, 0o10_400_000, 0o404_000];
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
             let want = [0o4000, 0o144_000, 0o10_100_000, 0o104_000];
             assert_eq!(
                 [
@@ -1174,7 +1198,10 @@ mod tests {
     /// SEC-1: 対応外の OS・アーキテクチャは計測のファイル出力を拒否し、ファイルを作らない（fail-closed）。
     #[cfg(not(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )))]
     #[test]
     fn sec1_open_op_log_refused_on_unsupported_target() {

@@ -428,7 +428,10 @@ mod tests {
         assert_invalid(CpuMax::parse_cpus("1", 1_000_001));
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     fn scratch(tag: &str) -> std::path::PathBuf {
         let base = std::env::temp_dir().join(format!("fc-cpumax-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -438,7 +441,10 @@ mod tests {
 
     /// SUP-13・TASK-170 追補・REPAIR-4: `set_cpu_max` が成功と失敗（cpu.max 不在）を
     /// 操作名 `cgroup.set_cpu_max` へ具体値で記録し、他 setter の名前は増えない。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup13_task170_cpu_max_operations_are_recorded() {
         use crate::observability::OpName;
@@ -463,7 +469,10 @@ mod tests {
     }
 
     /// CORE-3・TASK-32.3: 通常ファイル上で書き込みと読み戻しが具体値で一致する。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core3_task32_3_write_and_read_back() {
         let base = scratch("ok");
@@ -479,7 +488,10 @@ mod tests {
     }
 
     /// SUP-13・TASK-170.1: 変換結果を書き込み経路へ渡すと `150000 100000` が書かれる。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup13_task170_1_converted_value_is_written() {
         let base = scratch("cpus");
@@ -495,7 +507,10 @@ mod tests {
     }
 
     /// CORE-3・TASK-32.3: `cpu.max` が無い（controller 未有効）場合は `FailedPrecondition`。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core3_task32_3_missing_file_is_failed_precondition() {
         let base = scratch("missing");
@@ -508,7 +523,10 @@ mod tests {
 
     /// CORE-3・TASK-32.3: 読み戻しが要求と食い違えば成功扱いにしない（通常ファイルは O_TRUNC なしのため
     /// 長い既存内容が残り、読み戻しが不一致になる）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core3_task32_3_read_back_mismatch_fails() {
         let base = scratch("mismatch");
@@ -520,7 +538,10 @@ mod tests {
     }
 
     /// CORE-3・TASK-32.3: `cpu.max` が symlink なら `O_NOFOLLOW` で拒否され、リンク先へは書かれない。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core3_task32_3_symlink_is_rejected() {
         let base = scratch("symlink");

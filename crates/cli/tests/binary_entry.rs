@@ -297,7 +297,10 @@ fn cli1_stop_delete_flow_on_linux() {
 /// 計測のファイル出力は Linux の x86_64 / aarch64 のみ（他は出力しない。SEC-1）。
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 #[test]
 fn repair4_concurrent_processes_keep_op_log_lines_intact() {

@@ -71,7 +71,10 @@ fn main() {
 
 #[cfg(all(
     target_os = "linux",
-    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    not(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))
 ))]
 fn main() {
     println!("fork_exec_isolation: x86_64/aarch64 only, not applicable on this architecture");
@@ -79,7 +82,10 @@ fn main() {
 
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 fn main() {
     // `-- --ignored` を付けたときだけ実行する。シナリオは `--scenario <name> <rootfs>` で再入する。
@@ -94,7 +100,10 @@ fn main() {
 
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 mod linux {
     use std::io::Read as _;
@@ -166,7 +175,7 @@ mod linux {
     /// 動的ローダ不要の静的 ELF64 を組み立てる。終了コード 42 で `exit(2)` するだけ。
     /// ヘッダ 64 バイト + PT_LOAD 1 本（56 バイト）+ 機械語。
     fn probe_elf() -> Vec<u8> {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
         let (machine, code): (u16, &[u8]) = (
             62,
             // mov edi, 42 ; mov eax, 60 (exit) ; syscall
@@ -174,7 +183,7 @@ mod linux {
                 0xbf, 0x2a, 0x00, 0x00, 0x00, 0xb8, 0x3c, 0x00, 0x00, 0x00, 0x0f, 0x05,
             ],
         );
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
         let (machine, code): (u16, &[u8]) = (
             183,
             // movz x0, #42 ; movz x8, #93 (exit) ; svc #0

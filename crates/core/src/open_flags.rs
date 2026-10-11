@@ -73,14 +73,26 @@ impl NofollowOpenFlags {
 #[cfg(test)]
 mod tests {
     #[cfg(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "aarch64"),
+        all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        ),
+        all(
+            target_os = "linux",
+            target_arch = "aarch64",
+            target_pointer_width = "64"
+        ),
         not(target_os = "linux")
     ))]
     use super::*;
 
     /// SEC-1: x86_64 の合成済みフラグの具体値。
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
     #[test]
     fn sec1_nofollow_open_flags_exact_x86_64() {
         let f = NofollowOpenFlags::current().expect("supported");
@@ -91,7 +103,11 @@ mod tests {
     }
 
     /// SEC-1: aarch64 の合成済みフラグの具体値（O_DIRECTORY / O_NOFOLLOW は arm64 固有値）。
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "aarch64",
+        target_pointer_width = "64"
+    ))]
     #[test]
     fn sec1_nofollow_open_flags_exact_aarch64() {
         let f = NofollowOpenFlags::current().expect("supported");

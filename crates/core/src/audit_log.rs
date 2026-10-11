@@ -771,14 +771,17 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     fn sec4_task41_1_from_table_syscall_nr() {
         use crate::seccomp::{DeniedSyscall, SyscallLookup};
         let table = crate::seccomp::table_for_target_arch().unwrap();
         let SyscallLookup::Present(nr) = table.number_of(DeniedSyscall::Unshare) else {
             panic!("unshare must be present in the host table");
         };
-        let expected = if cfg!(target_arch = "x86_64") {
+        let expected = if cfg!(all(target_arch = "x86_64", target_pointer_width = "64")) {
             272
         } else {
             97

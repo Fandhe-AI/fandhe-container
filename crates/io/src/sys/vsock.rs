@@ -18,7 +18,8 @@
 //!   （所有者は `OwnedFd` ただ 1 つ）。作成時に `SOCK_CLOEXEC` を付け、exec 先へ漏らさない
 //! - カーネルが返す `sockaddr_vm` は、長さ（`addrlen`）と `svm_family` を検証してから読む
 //! - 定数・構造体レイアウトは `cfg(target_arch = ...)` ごとに個別定義し、他アーキの定義を流用しない。
-//!   対応外アーキテクチャでは各ラッパーが [`IoErrorCode::Unimplemented`] を返す（fail-closed）
+//!   対応外アーキテクチャでは各ラッパーが [`IoErrorCode::Unimplemented`] を返す（fail-closed）。
+//!   対応 arch は LP64 の x86_64・aarch64 だけで、x32 ABI・aarch64 ILP32 は対応外（#1700）
 //! - 待機はすべて期限（`Instant`）つきの `poll(2)`。無期限にブロックしない（REPAIR-5）
 //!
 //! # 定数の出典（一次確認済み）
@@ -60,7 +61,7 @@ pub(crate) enum AcceptStep {
     TimedOut,
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 mod consts {
     pub(super) const SUPPORTED: bool = true;
     pub(super) const AF_VSOCK: i32 = 40;
@@ -73,7 +74,7 @@ mod consts {
     pub(super) const POLLOUT: i16 = 0x0004;
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
 mod consts {
     pub(super) const SUPPORTED: bool = true;
     pub(super) const AF_VSOCK: i32 = 40;
@@ -87,7 +88,10 @@ mod consts {
 }
 
 /// 対応外アーキテクチャ。値は使われない（先頭の `SUPPORTED` 判定で `Unimplemented` を返す）。
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(not(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 mod consts {
     pub(super) const SUPPORTED: bool = false;
     pub(super) const AF_VSOCK: i32 = 0;

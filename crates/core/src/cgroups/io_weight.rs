@@ -388,7 +388,10 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     fn scratch(tag: &str) -> std::path::PathBuf {
         let base = std::env::temp_dir().join(format!("fc-ioweight-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -397,7 +400,10 @@ mod tests {
     }
 
     /// SUP-13・TASK-170.4: 通常ファイル上で書き込みと読み戻しが具体値で一致する。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup13_task170_4_io_weight_write_and_read_back() {
         let base = scratch("ok");
@@ -413,7 +419,10 @@ mod tests {
     }
 
     /// SUP-13・TASK-170.4・REPAIR-4: 成功と失敗（open 失敗）の双方が件数として記録される。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup13_task170_4_io_weight_operations_are_recorded() {
         let name = OpName::new(SET_IO_WEIGHT_OP_NAME).unwrap();
@@ -432,7 +441,10 @@ mod tests {
     }
 
     /// SUP-13・TASK-170.4: `io.weight` が無い（controller 未有効等）場合は `FailedPrecondition`。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup13_task170_4_io_weight_missing_file_is_failed_precondition() {
         let base = scratch("missing");
@@ -447,7 +459,10 @@ mod tests {
     ///
     /// 書き込みは `O_TRUNC` なしの上書きのため、`default 9999\n` へ `default 1` を書くと
     /// `default 1999\n` が残る。形式は正しいので解析を通り、値の不一致として検出される。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup13_task170_4_io_weight_read_back_mismatch_fails() {
         let base = scratch("mismatch");
@@ -468,7 +483,10 @@ mod tests {
     }
 
     /// SUP-13・TASK-170.4: 読み戻した内容が形式不正なら、値の比較より前に解析エラーで失敗する。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup13_task170_4_io_weight_read_back_malformed_fails() {
         let base = scratch("malformed");
@@ -489,7 +507,10 @@ mod tests {
     }
 
     /// SUP-13・TASK-170.4: `io.weight` が symlink なら `O_NOFOLLOW` で拒否され、リンク先へは書かれない。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup13_task170_4_io_weight_symlink_is_rejected() {
         let base = scratch("symlink");
@@ -525,7 +546,10 @@ mod tests {
     }
 
     /// SUP-13・#1534: `io.bfq.weight` があればそこへ無変換で書き、`io.weight` は触らない。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup13_issue1534_bfq_present_writes_bfq_only() {
         let base = scratch("bfq-ok");
@@ -540,7 +564,10 @@ mod tests {
     }
 
     /// SUP-13・#1534: `io.bfq.weight` が無ければ変換して `io.weight` へ書く。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup13_issue1534_bfq_absent_falls_back_to_io_weight() {
         let base = scratch("bfq-absent");
@@ -557,7 +584,10 @@ mod tests {
     }
 
     /// SUP-13・#1534: 両方とも無ければ `io.weight` 側の `FailedPrecondition`。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup13_issue1534_both_absent_is_failed_precondition() {
         let base = scratch("both-absent");
@@ -570,7 +600,10 @@ mod tests {
 
     /// SUP-13・#1534: `io.bfq.weight` が ENOENT 以外（ここでは EISDIR）で開けないときは
     /// `io.weight` へフォールバックせずエラーにする。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup13_issue1534_bfq_open_failure_does_not_fall_back() {
         let base = scratch("bfq-eisdir");
@@ -584,7 +617,10 @@ mod tests {
     }
 
     /// SUP-13・#1534: `io.bfq.weight` が symlink なら拒否し、リンク先も `io.weight` も変えない。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup13_issue1534_bfq_symlink_is_rejected_without_fallback() {
         let base = scratch("bfq-symlink");
@@ -601,7 +637,10 @@ mod tests {
 
     /// SUP-13・#1534: 読み戻しの不一致は成功扱いにせず、巻き戻さない。
     /// `999\n` へ `10` を書くと `O_TRUNC` なしの上書きで `109\n` が残る。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup13_issue1534_bfq_read_back_mismatch_fails() {
         let base = scratch("bfq-mismatch");
@@ -619,7 +658,10 @@ mod tests {
     }
 
     /// SUP-13・#1534: 読み戻しが形式不正なら解析エラーで失敗する。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup13_issue1534_bfq_read_back_malformed_fails() {
         let base = scratch("bfq-malformed");
@@ -637,7 +679,10 @@ mod tests {
 
     /// SUP-13・#1534・REPAIR-4: `set_blkio_weight` の成功・失敗が `cgroup.set_blkio_weight` に記録される。
     /// 記録はラッパー経由（record_op）で、ここでは同じ名前と実体で直接確かめる。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup13_issue1534_blkio_weight_operations_are_recorded() {
         let name = OpName::new(SET_BLKIO_WEIGHT_OP_NAME).unwrap();

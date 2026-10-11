@@ -59,6 +59,9 @@
 //!   [`unlinkat`]・[`mkdirat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・[`kill_process_group`]・[`probe_child_exit`]・[`write_nonblocking`]・（Linux のみ）`set_parent_death_sigkill`・[`DirStream`]（`open_at`・`next_entry`・`position`）・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
 //! - fd は `&UnixStream` の借用中のみ渡す（呼び出し中にクローズされない）
 //! - SOL_SOCKET / SO_PEERCRED の定数は `cfg(target_arch)` ごとに個別定義し、流用しない
+//! - Linux の対応 arch は LP64 の x86_64・aarch64 だけ。各 `cfg` は `target_pointer_width = "64"` を併せて条件にし、
+//!   x32 ABI・aarch64 ILP32 は対応外とする（LP64 の定義を黙って選ばない。#1700・REPAIR-2）。
+//!   構造体レイアウトと `long` / ポインタ幅が変わるため、対応外では `Unsupported` で fail-closed
 //! - OS ごとに値・幅が異なる定数・型（`ModeT`・`AT_SYMLINK_NOFOLLOW`・`O_*` 等）は対応 OS ごとに個別定義し、
 //!   対応外 OS 向けの仮置き（他 OS の値の流用）を置かない。値を持たない OS の経路は `Unsupported` で fail-closed
 //!   （誤った flags で symlink を追従する経路を作らない。PLUG-12・#1308）
@@ -72,7 +75,10 @@ use std::io;
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 ))]
 use std::os::unix::io::FromRawFd;
@@ -146,7 +152,10 @@ pub(crate) fn kill_process_group(pgid: u32) -> io::Result<()> {
 
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: POSIX の `ssize_t send(int socket, const void *buffer, size_t length, int flags)`。
@@ -169,38 +178,68 @@ unsafe extern "C" {
 /// 〔mips 等〕へ流用しない）。
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 const SOL_SOCKET: i32 = 1;
 
 /// `SO_DOMAIN`（socket のアドレスファミリを返す。Linux 2.6.32 以降）。Linux x86_64 は `asm-generic/socket.h` の 39。
 /// アーキテクチャごとに個別定義する（mips・sparc 等は値が異なるため流用しない）。
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_pointer_width = "64"
+))]
 const SO_DOMAIN: i32 = 39;
 /// Linux aarch64 の `SO_DOMAIN`（x86_64 と同じ `asm-generic/socket.h` の 39。値が同じでも流用せず個別に定義する）。
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "aarch64",
+    target_pointer_width = "64"
+))]
 const SO_DOMAIN: i32 = 39;
 
 /// `AF_UNIX`（Linux x86_64 は `linux/socket.h` の 1）。アーキテクチャごとに個別定義する。
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_pointer_width = "64"
+))]
 const AF_UNIX: i32 = 1;
 /// Linux aarch64 の `AF_UNIX`（x86_64 と同じ 1。値が同じでも流用せず個別に定義する）。
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "aarch64",
+    target_pointer_width = "64"
+))]
 const AF_UNIX: i32 = 1;
 
 /// `MSG_DONTWAIT`（呼び出し 1 回限りの非ブロッキング送信。Linux の x86_64・aarch64 とも 0x40）。
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 const MSG_DONTWAIT: i32 = 0x40;
 
 /// `MSG_NOSIGNAL`（相手が閉じた socket への送信で `SIGPIPE` を出さず `EPIPE` だけを返す。呼び出し 1 回限り）。
 /// Linux x86_64 は `asm-generic` 由来の 0x4000（`include/linux/socket.h`）。アーキテクチャごとに個別定義する。
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_pointer_width = "64"
+))]
 const MSG_NOSIGNAL: i32 = 0x4000;
 /// Linux aarch64 の `MSG_NOSIGNAL`（x86_64 と同じ 0x4000。値が同じでも流用せず個別に定義する）。
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "aarch64",
+    target_pointer_width = "64"
+))]
 const MSG_NOSIGNAL: i32 = 0x4000;
 
 /// fd が AF_UNIX の socket か（`getsockopt(SO_DOMAIN)` の 1 回）。fd 単位のカーネル内判定で、ファイルシステムへ
@@ -210,7 +249,10 @@ const MSG_NOSIGNAL: i32 = 0x4000;
 /// AF_UNIX 以外の socket（AF_INET の TCP・UDP、AF_NETLINK 等）も `false`。
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 fn is_unix_socket_fd(fd: i32) -> bool {
     let mut val: i32 = 0;
@@ -259,7 +301,10 @@ fn is_unix_socket_fd(fd: i32) -> bool {
 /// 送信と不可分にできないため）。その場合の送信も `MSG_DONTWAIT` の 1 回で、待ち得る範囲は上の TCP 等と同じ。
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 pub(crate) fn write_nonblocking(fd: &impl AsFd, buf: &[u8]) -> io::Result<usize> {
     let raw = fd.as_fd().as_raw_fd();
@@ -280,7 +325,10 @@ pub(crate) fn write_nonblocking(fd: &impl AsFd, buf: &[u8]) -> io::Result<usize>
 /// 状態（`O_NONBLOCK`・`SO_SNDTIMEO`）を変えずに待たない手段が無いため捨てる。
 #[cfg(not(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 )))]
 pub(crate) fn write_nonblocking(fd: &impl AsFd, buf: &[u8]) -> io::Result<usize> {
     let _ = (fd, buf);
@@ -296,7 +344,10 @@ pub(crate) fn write_nonblocking(fd: &impl AsFd, buf: &[u8]) -> io::Result<usize>
     not(any(
         all(
             target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
         ),
         target_os = "macos"
     )),
@@ -316,13 +367,20 @@ pub(crate) enum ChildExitProbe {
 #[cfg(any(
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ),
     target_os = "macos"
 ))]
 mod waitid_abi {
     /// Linux x86_64 の定数と `siginfo_t`。
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
     mod imp {
         /// `idtype_t` の `P_PID`（pid 指定）。`linux/wait.h`・`bits/types/idtype_t.h` の 1。
         pub(in super::super) const P_PID: i32 = 1;
@@ -372,7 +430,11 @@ mod waitid_abi {
     }
 
     /// Linux aarch64 の定数と `siginfo_t`（x86_64 と同じ値・asm-generic レイアウトだが個別に定義する）。
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "aarch64",
+        target_pointer_width = "64"
+    ))]
     mod imp {
         /// `idtype_t` の `P_PID`（pid 指定）。`linux/wait.h`・`bits/types/idtype_t.h` の 1。
         pub(in super::super) const P_PID: i32 = 1;
@@ -480,7 +542,10 @@ mod waitid_abi {
 #[cfg(any(
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ),
     target_os = "macos"
 ))]
@@ -501,7 +566,10 @@ const PROBE_EINTR_RETRIES: usize = 3;
 #[cfg(any(
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ),
     target_os = "macos"
 ))]
@@ -550,7 +618,10 @@ pub(crate) fn probe_child_exit(pid: u32) -> io::Result<ChildExitProbe> {
 #[cfg(not(any(
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ),
     target_os = "macos"
 )))]
@@ -561,7 +632,11 @@ pub(crate) fn probe_child_exit(pid: u32) -> io::Result<ChildExitProbe> {
 
 /// Linux（x86_64 / aarch64）の親死亡シグナル設定用の定数。アーキテクチャごとに個別定義し流用しない
 /// （値が同じでも他アーキテクチャの定義を借りない）。
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_pointer_width = "64"
+))]
 mod pdeathsig_abi {
     // include/uapi/linux/prctl.h の `PR_SET_PDEATHSIG`（1）。
     pub const PR_SET_PDEATHSIG: i32 = 1;
@@ -570,7 +645,11 @@ mod pdeathsig_abi {
     // include/uapi/asm-generic/errno-base.h の `ESRCH`（3）。
     pub const ESRCH: i32 = 3;
 }
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "aarch64",
+    target_pointer_width = "64"
+))]
 mod pdeathsig_abi {
     // include/uapi/linux/prctl.h の `PR_SET_PDEATHSIG`（1）。
     pub const PR_SET_PDEATHSIG: i32 = 1;
@@ -582,7 +661,10 @@ mod pdeathsig_abi {
 
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: `int prctl(int option, ...)`（glibc / musl）。可変長部は
@@ -614,7 +696,10 @@ unsafe extern "C" {
 /// `expected_parent` が `i32` に収まらない場合は `InvalidInput`（spawn 前に親側で返す）。
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 pub(crate) fn set_parent_death_sigkill(
     cmd: &mut std::process::Command,
@@ -657,7 +742,10 @@ pub(crate) fn set_parent_death_sigkill(
 /// spawn を失敗させると plugin が使えなくなるため、設定の省略を選ぶ（#1514）。
 #[cfg(all(
     target_os = "linux",
-    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    not(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))
 ))]
 pub(crate) fn set_parent_death_sigkill(
     _cmd: &mut std::process::Command,
@@ -711,7 +799,10 @@ pub(crate) fn fchmodat_nofollow(dir: &File, name: &CStr, mode: u32) -> io::Resul
     let err = io::Error::last_os_error();
     #[cfg(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ))]
     {
         // ENOSYS=38・EINVAL=22・EOPNOTSUPP=95（Linux の errno は x86_64 / aarch64 で共通）。
@@ -735,7 +826,10 @@ pub(crate) fn fchmodat_nofollow(dir: &File, name: &CStr, mode: u32) -> io::Resul
 /// `/proc` が使えない場合は失敗する（fail-closed）。
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 fn fchmodat_via_opath(dir: &File, name: &CStr, mode: ModeT) -> io::Result<()> {
     // O_PATH は x86_64 / aarch64 とも 0o10000000。
@@ -909,7 +1003,10 @@ fn statx_ident(dirfd: i32, name: &CStr, flags: i32) -> io::Result<FileIdent> {
 /// `statfs` と同じ流儀）。参照元: apple-oss-distributions/xnu `bsd/sys/stat.h`。
 #[cfg(target_os = "macos")]
 mod stat_abi {
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
     compile_error!("macOS の struct stat レイアウトは x86_64 / aarch64 のみ確認済み（#1307）");
 
     /// `struct timespec`（`time_t` = `long` と `long`。16 バイト）。
@@ -1077,23 +1174,45 @@ pub(crate) fn lstat_at(dir: &File, name: &CStr) -> io::Result<FileIdent> {
 // （aarch64 では 0o200000 は `O_DIRECT`、0o400000 は `O_LARGEFILE`。x86_64 の値を aarch64 へ
 // 流用すると symlink を辿るうえに `O_DIRECT` 付きで開いてしまうため、揃えてはならない）。
 // `O_CLOEXEC`・`O_PATH`・`AT_FDCWD` は両アーキテクチャで共通。
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_pointer_width = "64"
+))]
 const O_DIRECTORY: i32 = 0o200000;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_pointer_width = "64"
+))]
 const O_NOFOLLOW: i32 = 0o400000;
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "aarch64",
+    target_pointer_width = "64"
+))]
 const O_DIRECTORY: i32 = 0o40000;
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "aarch64",
+    target_pointer_width = "64"
+))]
 const O_NOFOLLOW: i32 = 0o100000;
 // 対応アーキテクチャ（x86_64 / aarch64）以外の Linux では、使う側が fail-closed のため定義しない（#1538）。
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 const O_CLOEXEC: i32 = 0o2000000;
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 const AT_FDCWD: i32 = -100;
 #[cfg(target_os = "macos")]
@@ -1109,7 +1228,10 @@ const AT_FDCWD: i32 = -2;
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 ))]
 unsafe extern "C" {
@@ -1123,7 +1245,10 @@ unsafe extern "C" {
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 ))]
 unsafe extern "C" {
@@ -1139,7 +1264,10 @@ unsafe extern "C" {
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 ))]
 fn openat_dir_nofollow(dirfd: i32, name: &CStr) -> io::Result<File> {
@@ -1162,7 +1290,10 @@ pub(crate) fn open_dir_nofollow(abs: &std::path::Path) -> io::Result<File> {
         target_os = "macos",
         all(
             target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
         )
     ))]
     {
@@ -1188,7 +1319,10 @@ pub(crate) fn open_dir_nofollow(abs: &std::path::Path) -> io::Result<File> {
         target_os = "macos",
         all(
             target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
         )
     )))]
     {
@@ -1199,21 +1333,53 @@ pub(crate) fn open_dir_nofollow(abs: &std::path::Path) -> io::Result<File> {
 
 // ロックファイル作成用の open(2) フラグ。値は OS ごとに異なる。Linux の 4 値は asm-generic の既定値で、
 // x86_64・aarch64 とも上書きしないため同値だが、流用せず対応アーキテクチャごとに定義する。
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_pointer_width = "64"
+))]
 const O_RDWR: i32 = 0o2;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_pointer_width = "64"
+))]
 const O_CREAT: i32 = 0o100;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_pointer_width = "64"
+))]
 const O_EXCL: i32 = 0o200;
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "aarch64",
+    target_pointer_width = "64"
+))]
 const O_RDWR: i32 = 0o2;
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "aarch64",
+    target_pointer_width = "64"
+))]
 const O_CREAT: i32 = 0o100;
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "aarch64",
+    target_pointer_width = "64"
+))]
 const O_EXCL: i32 = 0o200;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_pointer_width = "64"
+))]
 const O_NONBLOCK: i32 = 0o4000;
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "aarch64",
+    target_pointer_width = "64"
+))]
 const O_NONBLOCK: i32 = 0o4000;
 #[cfg(target_os = "macos")]
 const O_RDWR: i32 = 0x2;
@@ -1333,7 +1499,10 @@ enum LockFileOpen {
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 ))]
 fn open_lock_file(dir: &File, name: &CStr, how: LockFileOpen) -> io::Result<File> {
@@ -1364,7 +1533,10 @@ fn open_lock_file(dir: &File, name: &CStr, how: LockFileOpen) -> io::Result<File
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 )))]
 fn open_lock_file(dir: &File, name: &CStr, how: LockFileOpen) -> io::Result<File> {
@@ -1468,7 +1640,10 @@ pub(crate) fn lock_file_at(
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 ))]
 /// `dir`（検証済みの開いたディレクトリ fd）基準で、単一要素 `name` のディレクトリを作成する
@@ -1494,7 +1669,10 @@ pub(crate) fn mkdirat(dir: &File, name: &CStr, mode: u32) -> io::Result<()> {
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 )))]
 pub(crate) fn mkdirat(dir: &File, name: &CStr, mode: u32) -> io::Result<()> {
@@ -1520,7 +1698,10 @@ pub(crate) fn unlinkat(dir: &File, name: &CStr) -> io::Result<()> {
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 ))]
 mod dir_abi {
@@ -1578,7 +1759,10 @@ mod dir_abi {
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 ))]
 pub(crate) struct DirStream {
@@ -1592,7 +1776,10 @@ pub(crate) struct DirStream {
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 ))]
 impl DirStream {
@@ -1674,7 +1861,10 @@ impl DirStream {
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 ))]
 impl Drop for DirStream {
@@ -1691,7 +1881,10 @@ impl Drop for DirStream {
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 )))]
 pub(crate) struct DirStream(());
@@ -1700,7 +1893,10 @@ pub(crate) struct DirStream(());
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 )))]
 impl DirStream {
@@ -1725,7 +1921,10 @@ impl DirStream {
 // 使うのは `peer_ucred`（対応アーキテクチャのみ実装）だけのため、同じ cfg に揃える（#1538）。
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 mod linux {
     /// `struct ucred` と同じレイアウト。
@@ -1742,14 +1941,14 @@ mod linux {
     const _: () = assert!(UCRED_SIZE == 12);
     pub(super) const UCRED_LEN: u32 = UCRED_SIZE as u32;
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
     pub(super) const SOL_SOCKET: i32 = 1;
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
     pub(super) const SO_PEERCRED: i32 = 17;
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
     pub(super) const SOL_SOCKET: i32 = 1;
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
     pub(super) const SO_PEERCRED: i32 = 17;
 
     unsafe extern "C" {
@@ -1777,7 +1976,10 @@ unsafe extern "C" {
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 ))]
 const PEER_ID_SENTINEL: u32 = u32::MAX;
@@ -1788,7 +1990,10 @@ const PEER_ID_SENTINEL: u32 = u32::MAX;
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 ))]
 fn peer_uid_from_raw(raw: u32) -> Result<u32, PluginError> {
@@ -1805,7 +2010,10 @@ fn peer_uid_from_raw(raw: u32) -> Result<u32, PluginError> {
 /// バッファは番兵値（pid は -1、uid・gid は `u32::MAX`）で初期化する。
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 fn peer_ucred(stream: &UnixStream) -> Result<linux::Ucred, PluginError> {
     use std::os::unix::io::AsRawFd;
@@ -1843,7 +2051,10 @@ fn peer_ucred(stream: &UnixStream) -> Result<linux::Ucred, PluginError> {
 /// 一致して受理される（overflowuid を特別扱いしない。現状挙動）。取得値が番兵値のままなら `Internal`。
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, PluginError> {
     peer_uid_from_raw(peer_ucred(stream)?.uid)
@@ -1853,7 +2064,10 @@ pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, PluginError> {
 /// 呼び出し側の pid 照合は数値比較で、対象終了後の PID 再利用の窓が残る（モジュール doc「限界」）。
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 pub(crate) fn peer_pid(stream: &UnixStream) -> Result<u32, PluginError> {
     u32::try_from(peer_ucred(stream)?.pid).map_err(|_| {
@@ -1944,7 +2158,10 @@ pub(crate) fn peer_pid(stream: &UnixStream) -> Result<u32, PluginError> {
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 ))]
 mod connect_abi {
@@ -2023,7 +2240,10 @@ mod connect_abi {
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 ))]
 const SUN_PATH_OFFSET: usize = 2;
@@ -2034,7 +2254,10 @@ const SUN_PATH_OFFSET: usize = 2;
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 ))]
 fn connected_within_deadline(
@@ -2062,7 +2285,10 @@ pub(crate) fn connect_unix(
         target_os = "macos",
         all(
             target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
         )
     ))]
     {
@@ -2144,7 +2370,10 @@ pub(crate) fn connect_unix(
         target_os = "macos",
         all(
             target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
         )
     )))]
     {
@@ -2158,7 +2387,10 @@ pub(crate) fn connect_unix(
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 )))]
 pub(crate) fn peer_uid(_stream: &UnixStream) -> Result<u32, PluginError> {
@@ -2173,7 +2405,10 @@ pub(crate) fn peer_uid(_stream: &UnixStream) -> Result<u32, PluginError> {
     target_os = "macos",
     all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 )))]
 pub(crate) fn peer_pid(_stream: &UnixStream) -> Result<u32, PluginError> {
@@ -2185,7 +2420,10 @@ pub(crate) fn peer_pid(_stream: &UnixStream) -> Result<u32, PluginError> {
 #[cfg(all(
     test,
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 mod tests {
     use super::*;
@@ -2300,7 +2538,10 @@ mod tests {
     /// PLUG-12・TASK-124.1: 自己接続の peer uid / pid は自プロセスの値と一致する。
     #[cfg(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ))]
     #[test]
     fn plug12_linux_peer_uid_of_socketpair_equals_effective_uid() {
@@ -2317,7 +2558,10 @@ mod tests {
         target_os = "macos",
         all(
             target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
         )
     )
 ))]
@@ -2568,7 +2812,10 @@ pub(crate) fn resident_size_bytes(pid: u32) -> io::Result<u64> {
         target_os = "macos",
         all(
             target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
         )
     )
 ))]
@@ -2710,7 +2957,10 @@ pub(crate) fn reap_child_for_test(pid: u32) -> std::io::Result<bool> {
 #[cfg(all(
     test,
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 mod pdeathsig_tests {
     use super::*;
@@ -2910,7 +3160,10 @@ mod probe_child_exit_tests {
 #[cfg(all(
     test,
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 mod write_nonblocking_flag_tests {
     use super::*;
@@ -3068,7 +3321,12 @@ mod write_nonblocking_flag_tests {
 /// REPAIR-2・#1604: `waitid_abi` の定数は OS・アーキテクチャごとの個別定義で、ヘッダの値と一致する
 /// （Linux: `linux/wait.h`・`bits/waitflags.h`・`bits/types/idtype_t.h`、macOS: `sys/wait.h`）。
 /// 誤った `WNOWAIT` は子を回収してしまい、pgid の再利用を許すため具体値で固定する（PLUG-7）。
-#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    test,
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_pointer_width = "64"
+))]
 mod waitid_abi_linux_x86_64_tests {
     use super::waitid_abi;
 
@@ -3094,7 +3352,12 @@ mod waitid_abi_linux_x86_64_tests {
 }
 
 /// REPAIR-2・#1604: Linux aarch64 の `waitid_abi` 定数（x86_64 と同じ値だが個別に定義・検査する）。
-#[cfg(all(test, target_os = "linux", target_arch = "aarch64"))]
+#[cfg(all(
+    test,
+    target_os = "linux",
+    target_arch = "aarch64",
+    target_pointer_width = "64"
+))]
 mod waitid_abi_linux_aarch64_tests {
     use super::waitid_abi;
 

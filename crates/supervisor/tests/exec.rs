@@ -59,7 +59,10 @@ fn main() {
     println!("exec: Linux only, not applicable on this OS");
 }
 
-#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+#[cfg(all(
+    target_os = "linux",
+    not(all(target_arch = "x86_64", target_pointer_width = "64"))
+))]
 fn main() {
     println!(
         "exec: x86_64 only (hand-made machine-code probe), not applicable on this architecture"
@@ -69,6 +72,7 @@ fn main() {
 #[cfg(all(
     target_os = "linux",
     target_arch = "x86_64",
+    target_pointer_width = "64",
     not(feature = "exec-test-support")
 ))]
 fn main() {
@@ -84,6 +88,7 @@ fn main() {
 #[cfg(all(
     target_os = "linux",
     target_arch = "x86_64",
+    target_pointer_width = "64",
     feature = "exec-test-support"
 ))]
 fn main() {
@@ -93,6 +98,7 @@ fn main() {
 #[cfg(all(
     target_os = "linux",
     target_arch = "x86_64",
+    target_pointer_width = "64",
     feature = "exec-test-support"
 ))]
 mod linux {

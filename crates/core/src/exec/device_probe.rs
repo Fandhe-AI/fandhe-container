@@ -1,4 +1,4 @@
-//! デバイスノードの作成・pty の slave の open を errno つきで観測する入口（SEC-1・CORE-4・TASK-32 追補・#1681）。
+//! デバイスノードの作成・pty の slave の open を errno つきで観測する入口（SEC-1・CORE-4・TASK-32 追補・MS-2・#1681）。
 //!
 //! # 役割・呼び出し文脈
 //! 結合試験 `tests/device_cgroup_layers.rs` が、デバイス cgroup（`EPERM`）と rootfs の `nodev`（`EACCES`）を

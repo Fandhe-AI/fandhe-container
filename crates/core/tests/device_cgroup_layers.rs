@@ -1,4 +1,4 @@
-//! 既定のデバイス制限を層ごとに実機照合する結合試験（SEC-1・CORE-1・CORE-4・TASK-32 追補・#1681。関連 CORE-5・REPAIR-7・REPAIR-12）。
+//! 既定のデバイス制限を層ごとに実機照合する結合試験（SEC-1・CORE-1・CORE-4・TASK-32 追補・MS-2・#1681。関連 CORE-5・REPAIR-7・REPAIR-12）。
 //!
 //! Landlock と seccomp を**適用しない**構成で、rootful のコンテナ用 cgroup に既定のデバイス許可プログラム
 //! （`apply_default_device_policy`。#1680）を付け、デバイス cgroup の拒否（`EPERM`=1）と rootfs の自己 bind の

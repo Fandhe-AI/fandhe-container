@@ -1,0 +1,178 @@
+//! `fandhe-container-oci` が返す共通の構造化エラー型（TASK-51.1・OCI-1・ERR-1）。
+//!
+//! レジストリクライアント基盤（`registry` モジュール）と、後続のトークン取得（#401）・manifest 取得（#402）・
+//! blob 取得（#403）が返すエラーをここに集約する。機械可読な `code` と英語の `message` を持つ（ERR-1）。
+//! `fandhe-container-plugin` へは依存せず、文字列表現のみ `PluginErrorCode::as_str` と揃えて独立に定義する。
+//!
+//! `message` の契約: 英語で書き、トークン・`Authorization` ヘッダ・資格情報・レジストリ応答の本文を載せない
+//! （security.md）。HTTP ステータスは `message` に埋めず `http_status` に数値で持つ。長さは
+//! [`OCI_ERROR_MESSAGE_MAX_BYTES`] で切り詰め、制御文字は空白へ置換する。
+
+use std::error::Error;
+use std::fmt;
+
+/// `message` の最大バイト数。超過分は UTF-8 の文字境界で切り詰める。
+pub const OCI_ERROR_MESSAGE_MAX_BYTES: usize = 1024;
+
+/// `OciError` の機械可読な分類（ERR-1）。
+///
+/// `#[non_exhaustive]` のため、呼び出し側の `match` は `_` 分岐を持つこと。
+/// HTTP ステータスとの対応表は #401〜#403 で決める（本 issue では決めない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum OciErrorCode {
+    /// イメージ参照・URL 部品の構文違反。
+    InvalidArgument,
+    /// CPU 機能の不足・対応外のアーキテクチャ（fail-closed）。
+    Unimplemented,
+    /// 接続失敗（#401 以降で使う）。
+    Unavailable,
+    /// 期限内に応答が得られなかった（REPAIR-5）。
+    Timeout,
+    /// 認可の拒否。
+    PermissionDenied,
+    /// 対象が存在しない。
+    NotFound,
+    /// 応答の破損。
+    DataLoss,
+    /// 上限超過。
+    ResourceExhausted,
+    /// ルート証明書が 0 件など、前提が満たされていない。
+    FailedPrecondition,
+    /// 上記以外の内部エラー。
+    Internal,
+}
+
+impl OciErrorCode {
+    /// 機械可読な `code` 文字列を返す（ERR-1）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::InvalidArgument => "INVALID_ARGUMENT",
+            Self::Unimplemented => "UNIMPLEMENTED",
+            Self::Unavailable => "UNAVAILABLE",
+            Self::Timeout => "TIMEOUT",
+            Self::PermissionDenied => "PERMISSION_DENIED",
+            Self::NotFound => "NOT_FOUND",
+            Self::DataLoss => "DATA_LOSS",
+            Self::ResourceExhausted => "RESOURCE_EXHAUSTED",
+            Self::FailedPrecondition => "FAILED_PRECONDITION",
+            Self::Internal => "INTERNAL",
+        }
+    }
+}
+
+/// `fandhe-container-oci` 共通のエラー（`code` と `message`、任意の HTTP ステータス）。
+///
+/// フィールドは非公開で、各 getter から読む。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OciError {
+    code: OciErrorCode,
+    message: String,
+    http_status: Option<u16>,
+}
+
+impl OciError {
+    /// 分類とメッセージ（英語。資格情報・応答本文を含めない）からエラーを作る。
+    ///
+    /// 制御文字は空白へ置換し、[`OCI_ERROR_MESSAGE_MAX_BYTES`] を超える分は文字境界で切り詰める。
+    pub fn new(code: OciErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: sanitize_message(&message.into()),
+            http_status: None,
+        }
+    }
+
+    /// レジストリ応答の HTTP ステータスを付ける（#401〜#403 が使う）。
+    pub fn with_http_status(mut self, status: u16) -> Self {
+        self.http_status = Some(status);
+        self
+    }
+
+    /// 機械可読な分類を返す。
+    pub fn code(&self) -> OciErrorCode {
+        self.code
+    }
+
+    /// 人間可読なメッセージを返す。
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// 起因した HTTP ステータス（あれば）を返す。
+    pub fn http_status(&self) -> Option<u16> {
+        self.http_status
+    }
+}
+
+/// 制御文字を空白へ置換し、上限バイト数で文字境界に切り詰める。
+fn sanitize_message(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(OCI_ERROR_MESSAGE_MAX_BYTES));
+    for c in raw.chars() {
+        let c = if c.is_control() { ' ' } else { c };
+        if out.len().saturating_add(c.len_utf8()) > OCI_ERROR_MESSAGE_MAX_BYTES {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+impl fmt::Display for OciError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.code.as_str(), self.message)
+    }
+}
+
+impl Error for OciError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// OCI-1・ERR-1: code 文字列と Display の具体値。
+    #[test]
+    fn code_strings_and_display() {
+        let table = [
+            (OciErrorCode::InvalidArgument, "INVALID_ARGUMENT"),
+            (OciErrorCode::Unimplemented, "UNIMPLEMENTED"),
+            (OciErrorCode::Unavailable, "UNAVAILABLE"),
+            (OciErrorCode::Timeout, "TIMEOUT"),
+            (OciErrorCode::PermissionDenied, "PERMISSION_DENIED"),
+            (OciErrorCode::NotFound, "NOT_FOUND"),
+            (OciErrorCode::DataLoss, "DATA_LOSS"),
+            (OciErrorCode::ResourceExhausted, "RESOURCE_EXHAUSTED"),
+            (OciErrorCode::FailedPrecondition, "FAILED_PRECONDITION"),
+            (OciErrorCode::Internal, "INTERNAL"),
+        ];
+        for (code, s) in table {
+            assert_eq!(code.as_str(), s);
+        }
+        let e = OciError::new(OciErrorCode::InvalidArgument, "bad reference");
+        assert_eq!(e.to_string(), "INVALID_ARGUMENT: bad reference");
+        assert_eq!(e.http_status(), None);
+    }
+
+    /// ERR-1: HTTP ステータスは message と別に数値で保持する。
+    #[test]
+    fn http_status_is_kept_separately() {
+        let e = OciError::new(OciErrorCode::NotFound, "manifest unknown").with_http_status(404);
+        assert_eq!(e.http_status(), Some(404));
+        assert_eq!(e.message(), "manifest unknown");
+    }
+
+    /// 制御文字は空白へ置換される。
+    #[test]
+    fn control_chars_are_replaced() {
+        let e = OciError::new(OciErrorCode::Internal, "a\nb\u{1b}[0mc");
+        assert_eq!(e.message(), "a b [0mc");
+    }
+
+    /// 上限で UTF-8 の境界に切り詰める（3 バイト文字で境界を跨ぐ）。
+    #[test]
+    fn message_is_truncated_on_char_boundary() {
+        let e = OciError::new(OciErrorCode::Internal, "あ".repeat(400));
+        assert_eq!(e.message().len(), 1023);
+        assert_eq!(e.message().chars().count(), 341);
+    }
+}

@@ -6,7 +6,7 @@
 //!
 //! **Status/List の扱い（CRI-1・ERR-3・TASK-57.3）**: `PodSandboxStatus` は未知 ID を `NOT_FOUND`、空 ID を
 //! `INVALID_ARGUMENT` にする。`ListPodSandbox` は未知の ID や一致なしをエラーにせず空の一覧を返し、
-//! 未知の state 値と過大な `label_selector` だけを `INVALID_ARGUMENT` にする。並びは `(created_at, id)` の昇順。
+//! 未知の state 値と過大な `label_selector`（件数・文字列長・合計バイト数） だけを `INVALID_ARGUMENT` にする。並びは `(created_at, id)` の昇順。
 //! どちらも読み取り専用で、labels・annotations は保持した値を無改変で返す。`network`・`linux`・`info`・
 //! `containers_statuses` は空のスタブで、Container 連携（TASK-58）・net 連携（TASK-59 以降）で埋める（REPAIR-3）。
 //!
@@ -64,6 +64,15 @@ pub use config_limits::{
 /// 根拠: kubelet の既定の Pod 数上限は 1 ノード 110（`--max-pods`）で、1024 はその約 9 倍。
 /// 終了済みで未削除のサンドボックスが残る分を見込んでも届かない値とした。
 pub const MAX_SANDBOXES: usize = 1024;
+
+/// `ListPodSandbox` の `label_selector` 1 つのキー・値の最大バイト数（CRI-1・TASK-57.3）。
+///
+/// レジストリのロック中に各サンドボックスでハッシュされるため、入力サイズ×登録件数の処理に
+/// なる。公開トレイトの直接呼び出しでは gRPC の受信上限が効かないので、走査前に自前で拒否する。
+pub const MAX_LABEL_SELECTOR_STRING_BYTES: usize = 1024;
+
+/// `label_selector` 全体（全キー・全値・`id` の合計）の最大バイト数（CRI-1・TASK-57.3）。
+pub const MAX_LABEL_SELECTOR_TOTAL_BYTES: usize = 16 * 1024;
 
 /// サポートする `runtime_handler`。空文字（既定ハンドラ）のみ。未知のハンドラは拒否する（CRI の規定）。
 const SUPPORTED_RUNTIME_HANDLERS: &[&str] = &[""];
@@ -451,6 +460,20 @@ impl ValidatedFilter {
             return Err(Status::invalid_argument(
                 "label_selector has too many entries",
             ));
+        }
+        let mut total = filter.id.len();
+        for (k, v) in &filter.label_selector {
+            if k.len() > MAX_LABEL_SELECTOR_STRING_BYTES
+                || v.len() > MAX_LABEL_SELECTOR_STRING_BYTES
+            {
+                return Err(Status::invalid_argument(
+                    "label_selector key or value is too long",
+                ));
+            }
+            total = total.saturating_add(k.len()).saturating_add(v.len());
+        }
+        if total > MAX_LABEL_SELECTOR_TOTAL_BYTES {
+            return Err(Status::invalid_argument("label_selector is too large"));
         }
         let state = match filter.state {
             None => None,
@@ -1483,6 +1506,26 @@ mod tests {
 
         for bad in [
             f("", Some(99), &[]),
+            v1::PodSandboxFilter {
+                label_selector: [(
+                    "k".repeat(MAX_LABEL_SELECTOR_STRING_BYTES + 1),
+                    String::new(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            v1::PodSandboxFilter {
+                label_selector: (0..16)
+                    .map(|i| {
+                        (
+                            format!("{i:0>2}"),
+                            "v".repeat(MAX_LABEL_SELECTOR_STRING_BYTES),
+                        )
+                    })
+                    .collect(),
+                ..Default::default()
+            },
             v1::PodSandboxFilter {
                 label_selector: (0..=MAX_CONFIG_COLLECTION_ENTRIES)
                     .map(|i| (format!("k{i}"), String::new()))

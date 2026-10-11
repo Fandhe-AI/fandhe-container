@@ -425,14 +425,12 @@ fn status(service: &CriRuntimeService, id: &str) -> Result<v1::PodSandboxStatusR
 fn list_ids(service: &CriRuntimeService) -> Vec<(String, i32)> {
     let request = Request::new(v1::ListPodSandboxRequest { filter: None });
     block_on(RuntimeService::list_pod_sandbox(service, request))
-        .map(|r| {
-            r.into_inner()
-                .items
-                .into_iter()
-                .map(|i| (i.id, i.state))
-                .collect()
-        })
-        .unwrap_or_default()
+        .expect("ListPodSandbox must succeed")
+        .into_inner()
+        .items
+        .into_iter()
+        .map(|i| (i.id, i.state))
+        .collect()
 }
 /// CRI-1・TASK-57.3: Run -> List -> Stop -> Status -> Remove -> List/Status の一連が整合する。
 #[test]

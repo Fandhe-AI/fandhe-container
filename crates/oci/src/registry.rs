@@ -2,9 +2,9 @@
 //!
 //! #402（manifest 取得）・#403（blob のストリーミング取得）が共通で使う土台。通信する公開メソッドは
 //! 匿名トークン取得の `RegistryClient::authenticate_anonymous`（TASK-51.2・#401）と manifest 取得の
-//! `RegistryClient::fetch_manifest`（TASK-51.3・#402）で、blob の取得は未実装（#403 が `pub(crate)` の
-//! accessor を通して `Agent` を使う。digest 検証は #405。REPAIR-3）。
-//! OCI-3（資格情報つき認証）も未実装で、匿名のみ。
+//! `RegistryClient::fetch_manifest`（TASK-51.3・#402）と、blob のストリーミング取得
+//! `RegistryClient::fetch_blob`（TASK-51.4・#403）。blob は digest 未検証（検証は #405。REPAIR-3）。
+//! OCI-3（資格情報つき認証）は未実装で、匿名のみ。
 //!
 //! 安全側の既定値:
 //! - 平文 HTTP の経路を持たない（`https_only`。scheme は `https` 固定）
@@ -13,21 +13,25 @@
 //! - DNS 解決・connect・リクエスト送信・応答ヘッダ待ちのタイムアウトは `Duration` 必須で、未設定にできない（REPAIR-5）
 //!
 //! 本文受信（`recv_body`）と全体（`global`）のタイムアウトは Agent 既定では無制限のまま。トークン取得は
-//! リクエスト単位で全体期限（`token_request_timeout`）と本文上限を設ける。blob の長時間転送の設定は #403。
+//! リクエスト単位で全体期限（`token_request_timeout`）と本文上限を設ける。blob の長時間転送は
+//! `blob_request_timeout`（全体期限）と `max_blob_bytes`（許容サイズ）で縛る。
 //! CA ファイルを指定する経路は範囲外（OS のストアと `SSL_CERT_FILE` / `SSL_CERT_DIR` のみ）。
 
 use crate::auth::{RegistryAuth, parse_token_response, parse_www_authenticate};
 use crate::error::{OciError, OciErrorCode, code_for_http_status};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
 use crate::manifest::{
-    ImageManifest, MANIFEST_MAX_BYTES, MEDIA_TYPE_DOCKER_LIST, MEDIA_TYPE_DOCKER_MANIFEST,
-    MEDIA_TYPE_OCI_INDEX, MEDIA_TYPE_OCI_MANIFEST, ParsedManifest, Platform, parse_manifest,
-    select_manifest,
+    Descriptor, ImageManifest, MANIFEST_MAX_BYTES, MEDIA_TYPE_DOCKER_LIST,
+    MEDIA_TYPE_DOCKER_MANIFEST, MEDIA_TYPE_OCI_INDEX, MEDIA_TYPE_OCI_MANIFEST, ParsedManifest,
+    Platform, parse_manifest, select_manifest,
 };
 use crate::reference::{Digest, Reference, RegistryHost, Repository};
 use crate::tls;
 use std::fmt::Debug;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use ureq::Agent;
@@ -102,6 +106,10 @@ pub struct RegistryClientConfig {
     pub manifest_request_timeout: Duration,
     /// manifest 応答本文の最大バイト数。
     pub max_manifest_bytes: u64,
+    /// blob 取得 1 リクエスト（リダイレクトの 1 ホップ）あたりの全体期限（REPAIR-5）。長時間転送を許す値。
+    pub blob_request_timeout: Duration,
+    /// 1 blob の許容最大バイト数。`Descriptor::size` がこれを超えると通信前に `ResourceExhausted`。
+    pub max_blob_bytes: u64,
 }
 
 impl Default for RegistryClientConfig {
@@ -117,13 +125,15 @@ impl Default for RegistryClientConfig {
             max_token_response_bytes: 64 * 1024,
             manifest_request_timeout: Duration::from_secs(30),
             max_manifest_bytes: MANIFEST_MAX_BYTES,
+            blob_request_timeout: Duration::from_secs(30 * 60),
+            max_blob_bytes: 8 * 1024 * 1024 * 1024,
         }
     }
 }
 
 /// レジストリ通信の土台となる HTTP クライアント（TLS 設定済みの ureq `Agent` を保持する）。
 ///
-/// 匿名トークン取得（#401）と manifest 取得（#402）は実装済み。blob（#403）の取得は未実装（OCI-1）。
+/// 匿名トークン取得（#401）・manifest 取得（#402）・blob のストリーミング取得（#403）は実装済み（OCI-1）。
 #[derive(Debug)]
 pub struct RegistryClient {
     agent: Agent,
@@ -184,7 +194,7 @@ impl RegistryClient {
         self
     }
 
-    /// 後続の取得処理（#402・#403）が使う `Agent`（呼び出し元が入るまで未使用）。
+    /// 後続の取得処理が使う `Agent`（呼び出し元が入るまで未使用）。
     #[allow(dead_code)]
     pub(crate) fn agent(&self) -> &Agent {
         &self.agent
@@ -240,6 +250,41 @@ impl RegistryClient {
                 reference,
                 auth,
                 platform,
+            )
+        })
+    }
+
+    /// blob（レイヤー・config）を `dest` へストリーミング保存する（TASK-51.4・OCI-1）。
+    ///
+    /// `descriptor.size` を期待サイズの正とし、`max_blob_bytes` 超過は通信前に `ResourceExhausted`。応答の
+    /// `Content-Length` が期待サイズと食い違えば本文に触れず `DataLoss`。本文は固定長バッファで流し、
+    /// `Content-Length` の値でアロケーションしない。書き込みは `dest` + `.part` へ行い、サイズ一致を確認して
+    /// `rename` する（失敗時は `.part` を削除し、部分ファイルを `dest` に公開しない）。`dest` が既に存在すれば
+    /// `FailedPrecondition`。親ディレクトリは呼び出し側（ステージング領域）が用意する。
+    ///
+    /// CDN へのリダイレクト（301/302/303/307/308）は `max_redirects` 回まで手動で追従する。遷移先は絶対 https
+    /// URL のみ許可し、`Authorization` を送らず公開 IP のみへ接続する（SSRF・資格情報漏えい対策）。Location は
+    /// 署名付きで秘密を含みうるためエラー・記録に載せない。相対 Location は未対応（拒否）。
+    ///
+    /// 戻り値は digest 未検証（検証は #405・TASK-52）。Range による再開は未対応。トークンの期限検査は開始時のみ。
+    /// 成功・失敗とエラー code・所要時間は `with_recorder` の記録先へ 1 件記録する（REPAIR-4）。
+    pub fn fetch_blob(
+        &self,
+        endpoint: &RegistryEndpoint,
+        repository: &Repository,
+        descriptor: &Descriptor,
+        auth: &RegistryAuth,
+        dest: &Path,
+    ) -> Result<FetchedBlob, OciError> {
+        record_oci_op(self.recorder.as_ref(), OciOpKind::FetchBlob, || {
+            fetch_blob_flow(
+                self.transport.as_ref(),
+                &self.config,
+                endpoint,
+                repository,
+                descriptor,
+                auth,
+                dest,
             )
         })
     }
@@ -392,6 +437,227 @@ fn fetch_manifest_flow(
     }
 }
 
+/// `fetch_blob` の結果（将来の項目追加に備え `non_exhaustive`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FetchedBlob {
+    /// 保存先（呼び出し側が指定した `dest`）。
+    pub path: PathBuf,
+    /// 書き込んだバイト数（`Descriptor::size` と一致を確認済み）。
+    pub size: u64,
+    /// 要求した digest。**本文のハッシュとは未突合**（検証は #405・TASK-52。検証前のファイルを信頼しない）。
+    pub digest: Digest,
+}
+
+/// リダイレクトとして追従するステータス。
+fn is_redirect(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+/// リダイレクト先 Location の検証。絶対 `https://` のみ許可する（レジストリ応答は非信頼。SSRF 対策）。
+/// 相対・`http`・userinfo・空白 / 制御文字 / 非 ASCII・バックスラッシュ・過大な長さは `DataLoss`。
+fn validate_redirect_location(location: &str) -> Result<(), OciError> {
+    const MAX_LOCATION_BYTES: usize = 8 * 1024;
+    let bad = || OciError::new(OciErrorCode::DataLoss, "invalid redirect from registry");
+    if location.len() > MAX_LOCATION_BYTES
+        || !location.is_ascii()
+        || location
+            .bytes()
+            .any(|b| b <= 0x20 || b == 0x7f || b == b'\\')
+    {
+        return Err(bad());
+    }
+    let rest = location.strip_prefix("https://").ok_or_else(bad)?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return Err(bad());
+    }
+    Ok(())
+}
+
+/// `.part` への書き込みを最初の書き込み時に遅延作成する `Write`。リダイレクト応答で空ファイルを作らず、
+/// `create_new`（O_EXCL）で既存ファイル・シンボリックリンクを辿らない。Unix では 0600。
+struct LazyPartFile {
+    path: PathBuf,
+    file: Option<File>,
+}
+
+impl LazyPartFile {
+    fn open(&mut self) -> std::io::Result<&mut File> {
+        if self.file.is_none() {
+            let mut o = OpenOptions::new();
+            o.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                o.mode(0o600);
+            }
+            self.file = Some(o.open(&self.path)?);
+        }
+        self.file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("part file is not open"))
+    }
+
+    /// 書き込みが無かった（サイズ 0 の blob）場合も含めてファイルを作り、永続化して閉じる。
+    fn finish(&mut self) -> std::io::Result<()> {
+        let f = self.open()?;
+        f.sync_all()?;
+        self.file = None;
+        Ok(())
+    }
+}
+
+impl Write for LazyPartFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.open()?.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.file.as_mut() {
+            Some(f) => f.flush(),
+            None => Ok(()),
+        }
+    }
+}
+
+/// 失敗時（panic 含む）に `.part` を必ず消すガード。成功時だけ `armed` を落とす。
+struct PartGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for PartGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// blob 取得の手順（通信は `transport` に委ねる。テストでは差し替える）。
+fn fetch_blob_flow(
+    transport: &dyn RegistryTransport,
+    config: &RegistryClientConfig,
+    endpoint: &RegistryEndpoint,
+    repository: &Repository,
+    descriptor: &Descriptor,
+    auth: &RegistryAuth,
+    dest: &Path,
+) -> Result<FetchedBlob, OciError> {
+    if descriptor.size > config.max_blob_bytes {
+        return Err(OciError::new(
+            OciErrorCode::ResourceExhausted,
+            "blob size exceeds the configured limit",
+        ));
+    }
+    let authorization = match auth {
+        RegistryAuth::Bearer(t) if t.is_expired(Instant::now()) => {
+            return Err(OciError::new(
+                OciErrorCode::PermissionDenied,
+                "registry token has expired",
+            ));
+        }
+        RegistryAuth::Bearer(t) => Some(t.authorization_header_value()),
+        _ => None,
+    };
+    if dest.exists() {
+        return Err(OciError::new(
+            OciErrorCode::FailedPrecondition,
+            "blob destination already exists",
+        ));
+    }
+    let file_name = dest.file_name().ok_or_else(|| {
+        OciError::new(
+            OciErrorCode::InvalidArgument,
+            "blob destination has no file name",
+        )
+    })?;
+    let mut part_name = file_name.to_os_string();
+    part_name.push(".part");
+    let part_path = dest.with_file_name(part_name);
+
+    let mut guard = PartGuard {
+        path: part_path.clone(),
+        armed: true,
+    };
+    let mut sink = LazyPartFile {
+        path: part_path,
+        file: None,
+    };
+
+    let mut url = endpoint.blob_url(repository, &descriptor.digest);
+    let mut hop: u32 = 0;
+    let written = loop {
+        // 資格情報は接続先レジストリへの最初のホップだけ。CDN 側（署名付き URL）へは送らない。
+        let first = hop == 0;
+        let mut headers: Vec<(&str, &str)> = Vec::new();
+        if let (true, Some(a)) = (first, &authorization) {
+            headers.push(("Authorization", a.as_str()));
+        }
+        let resp = transport.get_stream(
+            &StreamRequest {
+                url: &url,
+                public_only: !first,
+                headers: &headers,
+                timeout: config.blob_request_timeout,
+                expected_len: descriptor.size,
+            },
+            &mut sink,
+        )?;
+        if resp.status == 200 {
+            break resp.bytes_written;
+        }
+        if is_redirect(resp.status) {
+            let location = resp.location.ok_or_else(|| {
+                OciError::new(OciErrorCode::DataLoss, "invalid redirect from registry")
+            })?;
+            if hop >= config.max_redirects {
+                return Err(OciError::new(
+                    OciErrorCode::DataLoss,
+                    "too many redirects from registry",
+                ));
+            }
+            validate_redirect_location(&location)?;
+            url = location;
+            hop += 1;
+            continue;
+        }
+        return Err(status_error(resp.status));
+    };
+    if written != descriptor.size {
+        return Err(OciError::new(
+            OciErrorCode::DataLoss,
+            "blob size does not match the descriptor",
+        ));
+    }
+    sink.finish().map_err(map_sink_error)?;
+    std::fs::rename(&guard.path, dest).map_err(map_sink_error)?;
+    guard.armed = false;
+    Ok(FetchedBlob {
+        path: dest.to_path_buf(),
+        size: written,
+        digest: descriptor.digest.clone(),
+    })
+}
+
+/// ローカルファイル書き込み失敗の分類（message は固定文。パスは載せない）。
+fn map_sink_error(e: std::io::Error) -> OciError {
+    match e.kind() {
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded => OciError::new(
+            OciErrorCode::ResourceExhausted,
+            "no space left for the blob",
+        ),
+        std::io::ErrorKind::AlreadyExists => OciError::new(
+            OciErrorCode::FailedPrecondition,
+            "blob staging file already exists",
+        ),
+        std::io::ErrorKind::PermissionDenied => {
+            OciError::new(OciErrorCode::PermissionDenied, "cannot write the blob file")
+        }
+        _ => OciError::new(OciErrorCode::Internal, "cannot write the blob file"),
+    }
+}
+
 /// 1 回の GET の指定（redirect は常に追従しない）。
 struct TransportRequest<'a> {
     url: &'a str,
@@ -415,9 +681,40 @@ struct TransportResponse {
     body: Vec<u8>,
 }
 
-/// トークン取得が使う通信の境界。実体は ureq、テストでは差し替える。
+/// blob のストリーミング GET の指定（redirect は常に追従しない。追従は呼び出し側が検証して行う）。
+struct StreamRequest<'a> {
+    url: &'a str,
+    /// true なら解決済み IP が公開アドレスのものにだけ接続する（SSRF 対策）。
+    public_only: bool,
+    /// 追加のリクエストヘッダ（`Authorization` は呼び出し側が最初のホップにだけ付ける）。
+    headers: &'a [(&'a str, &'a str)],
+    /// リクエスト全体の期限（REPAIR-5）。
+    timeout: Duration,
+    /// 期待する本文長（`Descriptor::size`）。`Content-Length` との突合と読み取り上限に使う。
+    expected_len: u64,
+}
+
+/// ストリーミング GET の結果。本文は `sink` へ流し済みで、ここには持たない。
+#[cfg_attr(test, derive(Debug))]
+struct StreamResponse {
+    status: u16,
+    /// 3xx のときの `Location`（本文は読まない）。
+    location: Option<String>,
+    /// 200 のとき `sink` へ書いたバイト数。
+    bytes_written: u64,
+}
+
+/// レジストリ通信の境界。実体は ureq、テストでは差し替える。
 trait RegistryTransport: Debug + Send + Sync {
     fn get(&self, req: &TransportRequest<'_>) -> Result<TransportResponse, OciError>;
+
+    /// 200 の本文を固定長バッファで `sink` へ流す。`Content-Length` が `expected_len` と食い違う、
+    /// または本文が `expected_len` を超える / 満たないなら `DataLoss`。
+    fn get_stream(
+        &self,
+        req: &StreamRequest<'_>,
+        sink: &mut dyn Write,
+    ) -> Result<StreamResponse, OciError>;
 }
 
 #[derive(Debug)]
@@ -472,6 +769,117 @@ impl RegistryTransport for UreqTransport {
             content_type,
             body,
         })
+    }
+
+    fn get_stream(
+        &self,
+        req: &StreamRequest<'_>,
+        sink: &mut dyn Write,
+    ) -> Result<StreamResponse, OciError> {
+        self.stream(req, sink)
+    }
+}
+
+impl UreqTransport {
+    fn stream(
+        &self,
+        req: &StreamRequest<'_>,
+        sink: &mut dyn Write,
+    ) -> Result<StreamResponse, OciError> {
+        let agent = if req.public_only {
+            &self.public_only_agent
+        } else {
+            &self.agent
+        };
+        let mut builder = agent
+            .get(req.url)
+            .config()
+            .timeout_global(Some(req.timeout))
+            .max_redirects(0)
+            .build();
+        for (k, v) in req.headers {
+            builder = builder.header(*k, *v);
+        }
+        let mut resp = builder.call().map_err(map_ureq_error)?;
+        let status = resp.status().as_u16();
+        let mismatch = || {
+            OciError::new(
+                OciErrorCode::DataLoss,
+                "blob size does not match the descriptor",
+            )
+        };
+        if (300..400).contains(&status) {
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok().map(str::to_string));
+            return Ok(StreamResponse {
+                status,
+                location,
+                bytes_written: 0,
+            });
+        }
+        if status != 200 {
+            return Ok(StreamResponse {
+                status,
+                location: None,
+                bytes_written: 0,
+            });
+        }
+        // アロケーション・書き込みの前に Content-Length を期待サイズと突合する。
+        if let Some(v) = resp.headers().get("content-length") {
+            let len = v.to_str().ok().and_then(|s| s.trim().parse::<u64>().ok());
+            if len != Some(req.expected_len) {
+                return Err(mismatch());
+            }
+        }
+        let limit = req.expected_len.saturating_add(1);
+        let mut reader = resp.body_mut().with_config().limit(limit).reader();
+        // Content-Length の値ではなく固定長バッファで流す。
+        let mut buf = vec![0u8; STREAM_BUF_BYTES];
+        let mut total: u64 = 0;
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => return Err(map_stream_read_error(e)),
+            };
+            total = total.saturating_add(n as u64);
+            if total > req.expected_len {
+                return Err(mismatch());
+            }
+            let chunk = buf.get(..n).ok_or_else(mismatch)?;
+            sink.write_all(chunk).map_err(map_sink_error)?;
+        }
+        if total != req.expected_len {
+            return Err(mismatch());
+        }
+        Ok(StreamResponse {
+            status,
+            location: None,
+            bytes_written: total,
+        })
+    }
+}
+
+/// ストリーミング用の読み取りバッファ長。
+const STREAM_BUF_BYTES: usize = 64 * 1024;
+
+/// 本文読み取り中の `io::Error` を分類する（ureq が包んだエラーは元の分類へ戻す）。
+fn map_stream_read_error(e: std::io::Error) -> OciError {
+    let kind = e.kind();
+    match e.into_inner() {
+        Some(inner) => match inner.downcast::<ureq::Error>() {
+            Ok(ue) => map_ureq_error(*ue),
+            Err(_) if kind == std::io::ErrorKind::TimedOut => {
+                OciError::new(OciErrorCode::Timeout, "registry request timed out")
+            }
+            Err(_) => OciError::new(OciErrorCode::Unavailable, "registry is unreachable"),
+        },
+        None if kind == std::io::ErrorKind::TimedOut => {
+            OciError::new(OciErrorCode::Timeout, "registry request timed out")
+        }
+        None => OciError::new(OciErrorCode::Unavailable, "registry is unreachable"),
     }
 }
 
@@ -661,6 +1069,8 @@ mod tests {
         assert_eq!(c.max_token_response_bytes, 65536);
         assert_eq!(c.manifest_request_timeout, Duration::from_secs(30));
         assert_eq!(c.max_manifest_bytes, 4 * 1024 * 1024);
+        assert_eq!(c.blob_request_timeout, Duration::from_secs(1800));
+        assert_eq!(c.max_blob_bytes, 8 * 1024 * 1024 * 1024);
     }
 
     /// OCI-1: ureq エラーの写像は固定文で、分類が具体値どおり。
@@ -766,6 +1176,14 @@ mod tests {
                 std::thread::sleep(self.delay_first);
             }
             self.script.lock().expect("lock").remove(0)
+        }
+
+        fn get_stream(
+            &self,
+            _req: &StreamRequest<'_>,
+            _sink: &mut dyn Write,
+        ) -> Result<StreamResponse, OciError> {
+            Err(OciError::new(OciErrorCode::Internal, "unexpected stream"))
         }
     }
 
@@ -1458,6 +1876,457 @@ mod tests {
         }
     }
 
+    // ---- blob 取得フローの照合（OCI-1・TASK-51.4・REPAIR-12。外部通信なし）----
+
+    /// 台本 1 ステップ: 応答ステータス・Location・sink へ流すチャンク。
+    struct StreamStep {
+        status: u16,
+        location: Option<&'static str>,
+        chunks: Vec<Vec<u8>>,
+    }
+
+    fn step(status: u16, location: Option<&'static str>, chunks: Vec<Vec<u8>>) -> StreamStep {
+        StreamStep {
+            status,
+            location,
+            chunks,
+        }
+    }
+
+    type SeenStream = (String, bool, Vec<(String, String)>, u64);
+
+    /// `get_stream` の台本どおりに応答し、受けた要求を記録する偽の通信。
+    #[derive(Debug)]
+    struct FakeStream {
+        script: Mutex<Vec<StreamStep>>,
+        seen: Mutex<Vec<SeenStream>>,
+    }
+
+    impl Debug for StreamStep {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("StreamStep")
+        }
+    }
+
+    impl FakeStream {
+        fn new(script: Vec<StreamStep>) -> Self {
+            Self {
+                script: Mutex::new(script),
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl RegistryTransport for FakeStream {
+        fn get(&self, _req: &TransportRequest<'_>) -> Result<TransportResponse, OciError> {
+            Err(OciError::new(OciErrorCode::Internal, "unexpected get"))
+        }
+
+        fn get_stream(
+            &self,
+            req: &StreamRequest<'_>,
+            sink: &mut dyn Write,
+        ) -> Result<StreamResponse, OciError> {
+            self.seen.lock().expect("lock").push((
+                req.url.to_string(),
+                req.public_only,
+                req.headers
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                req.expected_len,
+            ));
+            let s = self.script.lock().expect("lock").remove(0);
+            let mut n = 0u64;
+            for c in &s.chunks {
+                sink.write_all(c)
+                    .map_err(|e| OciError::new(OciErrorCode::Internal, e.to_string()))?;
+                n += c.len() as u64;
+            }
+            Ok(StreamResponse {
+                status: s.status,
+                location: s.location.map(str::to_string),
+                bytes_written: n,
+            })
+        }
+    }
+
+    /// 一意な一時ディレクトリ（drop で削除）。
+    struct TmpDir(PathBuf);
+
+    impl TmpDir {
+        fn new(tag: &str) -> Self {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "fandhe-oci-blob-{tag}-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::SeqCst)
+            ));
+            std::fs::create_dir_all(&p).expect("mkdir");
+            Self(p)
+        }
+        fn dest(&self) -> PathBuf {
+            self.0.join("blob.bin")
+        }
+        fn part(&self) -> PathBuf {
+            self.0.join("blob.bin.part")
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn desc(size: u64) -> Descriptor {
+        Descriptor {
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+            digest: Digest::parse(&format!("sha256:{HX}")).expect("digest"),
+            size,
+            platform: None,
+        }
+    }
+
+    fn blob(
+        t: &FakeStream,
+        auth: &RegistryAuth,
+        d: &Descriptor,
+        dest: &Path,
+    ) -> Result<FetchedBlob, OciError> {
+        let (ep, repo) = alpine();
+        fetch_blob_flow(
+            t,
+            &RegistryClientConfig::default(),
+            &ep,
+            &repo,
+            d,
+            auth,
+            dest,
+        )
+    }
+
+    const CDN: &str = "https://cdn.example.com/signed/abc?sig=1";
+
+    /// OCI-1: 200 の本文がファイルへ書かれ、`.part` は残らず、固定の URL・ヘッダで 1 回だけ要求する。
+    #[test]
+    fn blob_direct_200_writes_file() {
+        let tmp = TmpDir::new("direct");
+        let t = FakeStream::new(vec![step(
+            200,
+            None,
+            vec![b"hello ".to_vec(), b"world".to_vec()],
+        )]);
+        let got = blob(&t, &bearer(300), &desc(11), &tmp.dest()).expect("blob");
+        assert_eq!(got.size, 11);
+        assert_eq!(got.path, tmp.dest());
+        assert_eq!(got.digest.as_str(), format!("sha256:{HX}"));
+        assert_eq!(std::fs::read(tmp.dest()).expect("read"), b"hello world");
+        assert!(!tmp.part().exists());
+        let seen = t.seen.lock().expect("lock");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].0,
+            format!("https://registry-1.docker.io/v2/library/alpine/blobs/sha256:{HX}")
+        );
+        assert!(!seen[0].1);
+        assert_eq!(
+            seen[0].2,
+            vec![("Authorization".to_string(), "Bearer tok".to_string())]
+        );
+        assert_eq!(seen[0].3, 11);
+    }
+
+    /// OCI-1・SEC: CDN へのリダイレクトでは Authorization を送らず、公開 IP のみの経路を使う。
+    #[test]
+    fn blob_redirect_drops_authorization_and_uses_public_only() {
+        let tmp = TmpDir::new("redirect");
+        let t = FakeStream::new(vec![
+            step(307, Some(CDN), vec![]),
+            step(200, None, vec![b"abc".to_vec()]),
+        ]);
+        blob(&t, &bearer(300), &desc(3), &tmp.dest()).expect("blob");
+        let seen = t.seen.lock().expect("lock");
+        assert_eq!(seen.len(), 2);
+        assert!(!seen[0].1 && seen[0].2.len() == 1);
+        assert_eq!(seen[1].0, CDN);
+        assert!(seen[1].1, "redirect target must use the public-only path");
+        assert!(
+            seen[1].2.is_empty(),
+            "no Authorization to the redirect target"
+        );
+        assert_eq!(std::fs::read(tmp.dest()).expect("read"), b"abc");
+    }
+
+    /// OCI-1・SEC: 不正な Location（http・相対・userinfo・制御文字）は追従せず DataLoss。ファイルは残らない。
+    #[test]
+    fn blob_rejects_bad_redirect_locations() {
+        for loc in [
+            "http://cdn.example.com/x",
+            "/relative/path",
+            "//cdn.example.com/x",
+            "https://user@cdn.example.com/x",
+            "https://cdn.example.com/x y",
+            "https://cdn.example.com/x\r\nHost: evil",
+            "https:///x",
+        ] {
+            let tmp = TmpDir::new("badloc");
+            let t = FakeStream::new(vec![step(302, Some(loc), vec![])]);
+            let e = blob(&t, &RegistryAuth::None, &desc(3), &tmp.dest()).expect_err(loc);
+            assert_eq!(e.code(), OciErrorCode::DataLoss, "{loc:?}");
+            assert_eq!(t.seen.lock().expect("lock").len(), 1);
+            assert!(!tmp.dest().exists() && !tmp.part().exists());
+        }
+        let tmp = TmpDir::new("noloc");
+        let t = FakeStream::new(vec![step(302, None, vec![])]);
+        let e = blob(&t, &RegistryAuth::None, &desc(3), &tmp.dest()).expect_err("no location");
+        assert_eq!(e.code(), OciErrorCode::DataLoss);
+    }
+
+    /// OCI-1・REPAIR-5: リダイレクト回数が上限を超えたら DataLoss。
+    #[test]
+    fn blob_redirect_limit() {
+        let tmp = TmpDir::new("loop");
+        let n = RegistryClientConfig::default().max_redirects as usize + 1;
+        let t = FakeStream::new((0..n).map(|_| step(302, Some(CDN), vec![])).collect());
+        let e = blob(&t, &RegistryAuth::None, &desc(3), &tmp.dest()).expect_err("loop");
+        assert_eq!(e.code(), OciErrorCode::DataLoss);
+        assert_eq!(t.seen.lock().expect("lock").len(), n);
+    }
+
+    /// OCI-1・REPAIR-5: 事前検査（サイズ上限・期限切れトークン・dest 既存）は通信 0 回で失敗する。
+    #[test]
+    fn blob_precondition_failures_make_no_request() {
+        let tmp = TmpDir::new("pre");
+        let (ep, repo) = alpine();
+        let cfg = RegistryClientConfig::default();
+        let t = FakeStream::new(vec![]);
+        let e = fetch_blob_flow(
+            &t,
+            &cfg,
+            &ep,
+            &repo,
+            &desc(cfg.max_blob_bytes + 1),
+            &RegistryAuth::None,
+            &tmp.dest(),
+        )
+        .expect_err("too big");
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+
+        let expired = {
+            let t = FakeTransport::new(vec![
+                resp(401, &[HUB_CHALLENGE], ""),
+                resp(
+                    200,
+                    &[],
+                    r#"{"token":"a","expires_in":60,"issued_at":"2020-01-01T00:00:00Z"}"#,
+                ),
+            ]);
+            run(&t).expect("auth")
+        };
+        let e = blob(&t, &expired, &desc(3), &tmp.dest()).expect_err("expired");
+        assert_eq!(e.code(), OciErrorCode::PermissionDenied);
+
+        std::fs::write(tmp.dest(), b"x").expect("write");
+        let e = blob(&t, &RegistryAuth::None, &desc(3), &tmp.dest()).expect_err("exists");
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(std::fs::read(tmp.dest()).expect("read"), b"x");
+        assert!(t.seen.lock().expect("lock").is_empty());
+    }
+
+    /// OCI-1: 401 / 403 / 404 は分類つきのエラー。ファイルは作られない。
+    #[test]
+    fn blob_status_errors() {
+        for (status, code) in [
+            (401, OciErrorCode::PermissionDenied),
+            (403, OciErrorCode::PermissionDenied),
+            (404, OciErrorCode::NotFound),
+            (500, OciErrorCode::Unavailable),
+        ] {
+            let tmp = TmpDir::new("status");
+            let t = FakeStream::new(vec![step(status, None, vec![])]);
+            let e = blob(&t, &RegistryAuth::None, &desc(3), &tmp.dest()).expect_err("status");
+            assert_eq!((e.code(), e.http_status()), (code, Some(status)));
+            assert!(!tmp.dest().exists() && !tmp.part().exists());
+        }
+    }
+
+    /// OCI-1: 書いたサイズが descriptor と違えば DataLoss で、`.part` も dest も残らない。
+    #[test]
+    fn blob_size_mismatch_leaves_nothing() {
+        for body in [b"toolong!".to_vec(), b"ab".to_vec()] {
+            let tmp = TmpDir::new("mismatch");
+            let t = FakeStream::new(vec![step(200, None, vec![body])]);
+            let e = blob(&t, &RegistryAuth::None, &desc(3), &tmp.dest()).expect_err("mismatch");
+            assert_eq!(e.code(), OciErrorCode::DataLoss);
+            assert!(!tmp.dest().exists() && !tmp.part().exists());
+        }
+    }
+
+    /// OCI-1: サイズ 0 の blob でも空ファイルが作られる。
+    #[test]
+    fn blob_zero_length_creates_empty_file() {
+        let tmp = TmpDir::new("zero");
+        let t = FakeStream::new(vec![step(200, None, vec![])]);
+        let got = blob(&t, &RegistryAuth::None, &desc(0), &tmp.dest()).expect("blob");
+        assert_eq!(got.size, 0);
+        assert_eq!(std::fs::read(tmp.dest()).expect("read"), b"");
+        assert!(!tmp.part().exists());
+    }
+
+    /// OCI-1・REPAIR-4: 公開メソッド `fetch_blob` の成功と失敗が `oci.blob.fetch` として 1 件ずつ記録される。
+    #[test]
+    fn fetch_blob_public_api_records_outcomes() {
+        use crate::instrument::{OciOpKind, OciOpOutcome};
+        let (ep, repo) = alpine();
+        let tmp = TmpDir::new("record");
+        let rec = Arc::new(crate::instrument::testing::Collect::default());
+        let mk = |t: FakeStream| RegistryClient {
+            agent: Agent::new_with_config(Config::default()),
+            transport: Arc::new(t),
+            config: RegistryClientConfig::default(),
+            recorder: rec.clone(),
+        };
+        mk(FakeStream::new(vec![step(
+            200,
+            None,
+            vec![b"abc".to_vec()],
+        )]))
+        .fetch_blob(&ep, &repo, &desc(3), &RegistryAuth::None, &tmp.dest())
+        .expect("ok");
+        let other = tmp.0.join("other.bin");
+        mk(FakeStream::new(vec![step(404, None, vec![])]))
+            .fetch_blob(&ep, &repo, &desc(3), &RegistryAuth::None, &other)
+            .expect_err("404");
+        let items = rec.items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind(), OciOpKind::FetchBlob);
+        assert_eq!(items[0].outcome(), OciOpOutcome::Success);
+        assert_eq!(items[1].outcome(), OciOpOutcome::Failure);
+        assert_eq!(items[1].error_code(), Some(OciErrorCode::NotFound));
+    }
+
+    // ---- UreqTransport::get_stream の実 HTTP 照合（ループバック）----
+
+    fn stream_get(
+        t: &UreqTransport,
+        url: &str,
+        expected_len: u64,
+        timeout: Duration,
+        sink: &mut Vec<u8>,
+    ) -> Result<StreamResponse, OciError> {
+        t.get_stream(
+            &StreamRequest {
+                url,
+                public_only: false,
+                headers: &[],
+                timeout,
+                expected_len,
+            },
+            sink,
+        )
+    }
+
+    /// OCI-1: 64 KiB を超える本文（バッファ複数周回）が欠けず書かれる。
+    #[test]
+    fn stream_writes_large_body() {
+        let body = "a".repeat(200_000);
+        let b = body.clone();
+        let (url, _srv) = serve_once(move |_| http_ok(&b));
+        let t = loopback_transport(&RegistryClientConfig::default());
+        let mut out = Vec::new();
+        let r = stream_get(&t, &url, 200_000, Duration::from_secs(5), &mut out).expect("get");
+        assert_eq!((r.status, r.bytes_written), (200, 200_000));
+        assert_eq!(out, body.as_bytes());
+    }
+
+    /// OCI-1・REPAIR-5: Content-Length が期待サイズと違えば本文を書かずに DataLoss。
+    #[test]
+    fn stream_rejects_content_length_mismatch() {
+        let (url, _srv) = serve_once(|_| http_ok("hello"));
+        let t = loopback_transport(&RegistryClientConfig::default());
+        let mut out = Vec::new();
+        let e = stream_get(&t, &url, 3, Duration::from_secs(5), &mut out).expect_err("cl");
+        assert_eq!(e.code(), OciErrorCode::DataLoss);
+        assert!(out.is_empty());
+    }
+
+    /// OCI-1: Content-Length の無い（close 終端）応答でも期待サイズ超過・不足を検出する。
+    #[test]
+    fn stream_detects_overrun_and_underrun_without_content_length() {
+        let raw = |n: usize| {
+            let mut v = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+            v.extend(std::iter::repeat_n(b'a', n));
+            v
+        };
+        for (sent, expected) in [(2000usize, 1000u64), (500, 1000)] {
+            let (url, _srv) = serve_once(move |_| raw(sent));
+            let t = loopback_transport(&RegistryClientConfig::default());
+            let mut out = Vec::new();
+            let e =
+                stream_get(&t, &url, expected, Duration::from_secs(5), &mut out).expect_err("size");
+            assert_eq!(e.code(), OciErrorCode::DataLoss);
+            assert!(out.len() as u64 <= expected);
+        }
+    }
+
+    /// OCI-1: 3xx は Location を返し、追従も本文の読み取りもしない。
+    #[test]
+    fn stream_returns_location_without_following() {
+        let (url, _srv) = serve_once(|_| {
+            b"HTTP/1.1 307 Temporary Redirect\r\nLocation: https://cdn.example.com/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+        });
+        let t = loopback_transport(&RegistryClientConfig::default());
+        let mut out = Vec::new();
+        let r = stream_get(&t, &url, 3, Duration::from_secs(5), &mut out).expect("get");
+        assert_eq!(r.status, 307);
+        assert_eq!(r.location.as_deref(), Some("https://cdn.example.com/x"));
+        assert!(out.is_empty());
+    }
+
+    /// OCI-1・REPAIR-5: 応答が来なければ全体期限で Timeout。
+    #[test]
+    fn stream_times_out() {
+        let (url, _srv) = serve_once(|_| {
+            std::thread::sleep(Duration::from_secs(3));
+            Vec::new()
+        });
+        let t = loopback_transport(&RegistryClientConfig::default());
+        let mut out = Vec::new();
+        let e = stream_get(&t, &url, 3, Duration::from_millis(300), &mut out).expect_err("to");
+        assert_eq!(e.code(), OciErrorCode::Timeout);
+    }
+
+    /// OCI-1・SEC: 公開 IP のみの経路は、ループバックのリダイレクト先へ接続しない（SSRF）。
+    #[test]
+    fn stream_public_only_refuses_loopback() {
+        let (url, _srv) = serve_once(|_| Vec::new());
+        let config = RegistryClientConfig::default();
+        let agent = build_agent(
+            &config,
+            TlsConfig::default(),
+            false,
+            Some(PublicOnlyResolver::default()),
+        );
+        let t = UreqTransport {
+            public_only_agent: agent.clone(),
+            agent,
+        };
+        let mut out = Vec::new();
+        let e = t
+            .get_stream(
+                &StreamRequest {
+                    url: &url,
+                    public_only: true,
+                    headers: &[],
+                    timeout: Duration::from_secs(5),
+                    expected_len: 3,
+                },
+                &mut out,
+            )
+            .expect_err("loopback");
+        assert_eq!(e.code(), OciErrorCode::PermissionDenied);
+    }
     /// OCI-1・ERR-1: 実 CPU・実 OS ストアでの構築は panic せず、Ok か想定内の分類のエラーを返す。
     #[test]
     fn real_construction_does_not_panic() {

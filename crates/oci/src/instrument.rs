@@ -22,6 +22,8 @@ pub enum OciOpKind {
     AuthenticateAnonymous,
     /// マニフェスト取得（image index の場合は platform 解決後の取得まで。TASK-51.3）。
     FetchManifest,
+    /// blob（レイヤー・config）のストリーミング取得（TASK-51.4）。
+    FetchBlob,
 }
 
 impl OciOpKind {
@@ -30,6 +32,7 @@ impl OciOpKind {
         match self {
             OciOpKind::AuthenticateAnonymous => "oci.auth.anonymous",
             OciOpKind::FetchManifest => "oci.manifest.fetch",
+            OciOpKind::FetchBlob => "oci.blob.fetch",
         }
     }
 }
@@ -203,6 +206,7 @@ mod tests {
         assert_eq!(items[1].error_code(), Some(OciErrorCode::Timeout));
         assert_eq!(items[1].kind().as_str(), "oci.auth.anonymous");
         assert_eq!(OciOpKind::FetchManifest.as_str(), "oci.manifest.fetch");
+        assert_eq!(OciOpKind::FetchBlob.as_str(), "oci.blob.fetch");
     }
 
     /// REPAIR-4: panic で巻き戻されても Failure が 1 件残る。

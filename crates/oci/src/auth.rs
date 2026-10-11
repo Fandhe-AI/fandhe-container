@@ -10,8 +10,12 @@
 //! 使わない（coding-rust.md）。`realm` は接続先を決めるため SSRF の入口になる。`TokenRealm` に検証を閉じ
 //! 込め、不正な値を表現できないようにする（REPAIR-2）。
 //!
-//! 未実装（将来仕様）: Basic / OAuth2 など資格情報つき認証（OCI-3）、トークンのキャッシュと失効時の再取得。
-//! 本モジュールは資格情報を一切扱わない。
+//! 実装済み: Basic 認証の資格情報型 `BasicCredentials` とチャレンジ判定（TASK-54.1・OCI-3・MS-4・#416）。
+//! 資格情報は生成時に検証し（REPAIR-2）、`Authorization` ヘッダ値は `Debug` / エラーに出さない。
+//!
+//! 未実装（将来仕様）: Bearer の資格情報つきトークン交換と OAuth2（OCI-3・#417）、`registry` への統一入口
+//! （チャレンジに応じた Basic / Bearer の自動選択。OCI-3・#418）、トークンのキャッシュと失効時の再取得。
+//! 資格情報の保管（docker config・credential helper）も範囲外。
 
 use crate::error::{OciError, OciErrorCode};
 use crate::reference::RegistryHost;
@@ -235,14 +239,8 @@ fn split_challenges(value: &str) -> Result<Vec<RawChallenge>, OciError> {
     Ok(out)
 }
 
-/// 401 応答の `WWW-Authenticate` ヘッダ値群から、最初の Bearer チャレンジを取り出す（OCI-1）。
-///
-/// Bearer が無く Basic のみなら `Unimplemented`（資格情報つき認証は OCI-3 で未実装）。チャレンジの
-/// `scope` は無視する（スコープは検証済み `Repository` から呼び出し側が組み立てる）。
-pub(crate) fn parse_www_authenticate(
-    values: &[&str],
-    registry: &RegistryHost,
-) -> Result<BearerChallenge, OciError> {
+/// `WWW-Authenticate` ヘッダ値群の件数・合計バイト数を検査する（匿名経路と Basic 判定で共有）。
+fn check_challenge_limits(values: &[&str]) -> Result<(), OciError> {
     if values.len() > CHALLENGE_MAX_HEADERS
         || values.iter().map(|v| v.len()).sum::<usize>() > CHALLENGE_TOTAL_MAX_BYTES
     {
@@ -251,6 +249,36 @@ pub(crate) fn parse_www_authenticate(
             "www-authenticate headers are too large",
         ));
     }
+    Ok(())
+}
+
+/// 401 応答の `WWW-Authenticate` ヘッダ値群が Basic チャレンジを含むか判定する（OCI-3・#416）。
+///
+/// Basic の `realm` は表示用で接続先を決めないため読み捨てる（資格情報の送出先は常に検証済みの
+/// `RegistryEndpoint` であり、応答由来の URL ではない）。件数・長さの上限は匿名経路と共通。
+pub(crate) fn challenge_offers_basic(values: &[&str]) -> Result<bool, OciError> {
+    check_challenge_limits(values)?;
+    for v in values {
+        if split_challenges(v)?
+            .iter()
+            .any(|ch| ch.scheme.eq_ignore_ascii_case("basic"))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// 401 応答の `WWW-Authenticate` ヘッダ値群から、最初の Bearer チャレンジを取り出す（OCI-1）。
+///
+/// Bearer が無く Basic のみなら `Unimplemented`（匿名取得では満たせない。資格情報つきは
+/// `RegistryClient::authenticate_basic`）。チャレンジの
+/// `scope` は無視する（スコープは検証済み `Repository` から呼び出し側が組み立てる）。
+pub(crate) fn parse_www_authenticate(
+    values: &[&str],
+    registry: &RegistryHost,
+) -> Result<BearerChallenge, OciError> {
+    check_challenge_limits(values)?;
     let mut saw_other = false;
     for v in values {
         for ch in split_challenges(v)? {
@@ -283,7 +311,7 @@ pub(crate) fn parse_www_authenticate(
     if saw_other {
         Err(OciError::new(
             OciErrorCode::Unimplemented,
-            "basic authentication is not supported yet (OCI-3)",
+            "registry requires credentials; anonymous access is not enough (OCI-3)",
         ))
     } else {
         Err(data_loss("no authentication challenge in 401 response"))
@@ -316,7 +344,81 @@ impl fmt::Debug for BearerToken {
     }
 }
 
-/// レジストリへの認証状態（OCI-1）。将来 Basic / OAuth2 の変種を足すため `non_exhaustive`（OCI-3）。
+/// ユーザー名の最大バイト数。
+const BASIC_USERNAME_MAX_BYTES: usize = 256;
+/// パスワードの最大バイト数（レジストリのトークン型パスワードを許容する大きさ）。
+const BASIC_PASSWORD_MAX_BYTES: usize = 4096;
+
+/// 標準 base64（RFC 4648 §4、パディングあり）。依存を増やさないための最小実装。
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let sym = |v: u32| char::from(ALPHABET.get((v & 0x3f) as usize).copied().unwrap_or(b'A'));
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = u32::from(chunk.first().copied().unwrap_or(0));
+        let b1 = u32::from(chunk.get(1).copied().unwrap_or(0));
+        let b2 = u32::from(chunk.get(2).copied().unwrap_or(0));
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(sym(n >> 18));
+        out.push(sym(n >> 12));
+        out.push(if chunk.len() > 1 { sym(n >> 6) } else { '=' });
+        out.push(if chunk.len() > 2 { sym(n) } else { '=' });
+    }
+    out
+}
+
+/// Basic 認証の資格情報（RFC 7617。OCI-3・TASK-54.1・#416）。
+///
+/// 生成時に検証し（REPAIR-2）、ヘッダインジェクション（制御文字）と RFC 7617 違反（ユーザー名の `:`）を
+/// 表現できなくする。保持するのは組み立て済みの `Authorization` ヘッダ値のみで、`Debug` は値を出さず
+/// `Display` は持たない（security.md）。ユーザー名・パスワードを含む中間 `String` は組み立て後すぐ
+/// drop するが、zeroize 用の依存は未導入のため、解放後のメモリ上の残存までは消さない。
+#[derive(Clone)]
+pub struct BasicCredentials {
+    header_value: String,
+}
+
+impl BasicCredentials {
+    /// 資格情報を検証して作る。違反は `InvalidArgument`（message は固定文で、入力値を載せない）。
+    ///
+    /// ユーザー名は 1〜256 バイトで `:` を含まない。パスワードは 1〜4096 バイト。どちらも ASCII 制御文字
+    /// （0x00-0x1f・0x7f）を含まない。UTF-8 は許可する。
+    pub fn new(username: &str, password: &str) -> Result<Self, OciError> {
+        let bad = |m: &str| OciError::new(OciErrorCode::InvalidArgument, m);
+        if username.is_empty() || username.len() > BASIC_USERNAME_MAX_BYTES {
+            return Err(bad("invalid basic auth username length"));
+        }
+        if password.is_empty() || password.len() > BASIC_PASSWORD_MAX_BYTES {
+            return Err(bad("invalid basic auth password length"));
+        }
+        if username.contains(':') {
+            return Err(bad("basic auth username must not contain a colon"));
+        }
+        if username.chars().any(char::is_control) || password.chars().any(char::is_control) {
+            return Err(bad("basic auth credentials contain control characters"));
+        }
+        let mut raw = String::with_capacity(username.len() + 1 + password.len());
+        raw.push_str(username);
+        raw.push(':');
+        raw.push_str(password);
+        let header_value = format!("Basic {}", base64_encode(raw.as_bytes()));
+        drop(raw);
+        Ok(Self { header_value })
+    }
+
+    /// `Authorization` ヘッダ値（`Basic <base64>`）。
+    pub(crate) fn authorization_header_value(&self) -> &str {
+        &self.header_value
+    }
+}
+
+impl fmt::Debug for BasicCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BasicCredentials(<redacted>)")
+    }
+}
+
+/// レジストリへの認証状態（OCI-1・OCI-3）。OAuth2 などの変種を足すため `non_exhaustive`。
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum RegistryAuth {
@@ -324,6 +426,26 @@ pub enum RegistryAuth {
     None,
     /// 匿名 Bearer トークン。
     Bearer(BearerToken),
+    /// Basic 認証の資格情報（`RegistryClient::authenticate_basic` が検証済み。期限は持たない）。
+    Basic(BasicCredentials),
+}
+
+impl RegistryAuth {
+    /// 接続先レジストリへ送る `Authorization` ヘッダ値。認証不要なら `None`。
+    ///
+    /// 期限切れの Bearer は通信させず `PermissionDenied`（再取得は呼び出し側）。manifest 取得と
+    /// blob 取得が共有する。
+    pub(crate) fn authorization_header(&self, now: Instant) -> Result<Option<String>, OciError> {
+        match self {
+            RegistryAuth::None => Ok(None),
+            RegistryAuth::Bearer(t) if t.is_expired(now) => Err(OciError::new(
+                OciErrorCode::PermissionDenied,
+                "registry token has expired",
+            )),
+            RegistryAuth::Bearer(t) => Ok(Some(t.authorization_header_value())),
+            RegistryAuth::Basic(c) => Ok(Some(c.authorization_header_value().to_string())),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -508,7 +630,7 @@ mod tests {
         assert_eq!(e.code(), OciErrorCode::Unimplemented);
         assert_eq!(
             e.message(),
-            "basic authentication is not supported yet (OCI-3)"
+            "registry requires credentials; anonymous access is not enough (OCI-3)"
         );
     }
 
@@ -723,5 +845,121 @@ mod tests {
         assert_eq!(format!("{t:?}"), "BearerToken(<redacted>)");
         let a = format!("{:?}", RegistryAuth::Bearer(t));
         assert!(!a.contains("SECRET-VALUE"));
+    }
+
+    /// OCI-3: base64 の RFC 4648 テストベクタ。
+    #[test]
+    fn base64_rfc4648_vectors() {
+        for (i, o) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_encode(i.as_bytes()), o, "{i}");
+        }
+    }
+
+    /// OCI-3: RFC 7617 の例と UTF-8 の資格情報のヘッダ値。
+    #[test]
+    fn basic_header_values() {
+        let c = BasicCredentials::new("Aladdin", "open sesame").expect("c");
+        assert_eq!(
+            c.authorization_header_value(),
+            "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+        );
+        let c = BasicCredentials::new("ユーザー", "パス").expect("utf8");
+        assert_eq!(
+            c.authorization_header_value(),
+            "Basic 44Om44O844K244O8OuODkeOCuQ=="
+        );
+    }
+
+    /// OCI-3・SEC: 不正な資格情報は InvalidArgument で拒否し、message に入力値を載せない。
+    #[test]
+    fn basic_rejects_invalid_credentials() {
+        let long_user = "u".repeat(BASIC_USERNAME_MAX_BYTES + 1);
+        let long_pw = "p".repeat(BASIC_PASSWORD_MAX_BYTES + 1);
+        let cases: [(&str, &str); 8] = [
+            ("", "pw"),
+            ("us:er", "SECRET-PW"),
+            ("us\ner", "SECRET-PW"),
+            ("user", "SECRET\r\nX: y"),
+            ("user", "SECRET\u{7f}"),
+            (&long_user, "pw"),
+            ("user", ""),
+            ("user", &long_pw),
+        ];
+        for (u, p) in cases {
+            let e = BasicCredentials::new(u, p).expect_err(u);
+            assert_eq!(e.code(), OciErrorCode::InvalidArgument);
+            assert!(!e.message().contains("SECRET"));
+        }
+        assert!(BasicCredentials::new(&"u".repeat(BASIC_USERNAME_MAX_BYTES), "pw").is_ok());
+        assert!(BasicCredentials::new("u", &"p".repeat(BASIC_PASSWORD_MAX_BYTES)).is_ok());
+    }
+
+    /// OCI-3・security.md: Debug に資格情報を出さない。
+    #[test]
+    fn basic_debug_redacts() {
+        let c = BasicCredentials::new("alice", "SECRET-PW").expect("c");
+        assert_eq!(format!("{c:?}"), "BasicCredentials(<redacted>)");
+        let a = format!("{:?}", RegistryAuth::Basic(c));
+        assert!(!a.contains("SECRET-PW") && !a.contains("alice") && !a.contains("QWxp"));
+    }
+
+    /// OCI-3: Basic チャレンジの判定と上限。
+    #[test]
+    fn challenge_offers_basic_cases() {
+        assert!(challenge_offers_basic(&[r#"Basic realm="x""#]).expect("a"));
+        assert!(challenge_offers_basic(&[r#"basic realm="x""#]).expect("b"));
+        assert!(
+            challenge_offers_basic(&[r#"Bearer realm="https://a.example.com/t", Basic realm="x""#])
+                .expect("c")
+        );
+        assert!(
+            !challenge_offers_basic(&[r#"Bearer realm="https://a.example.com/t""#]).expect("d")
+        );
+        assert!(!challenge_offers_basic(&[]).expect("e"));
+        let many = ["Basic"; 9];
+        assert_eq!(
+            challenge_offers_basic(&many).expect_err("n").code(),
+            OciErrorCode::ResourceExhausted
+        );
+    }
+
+    /// OCI-3: Authorization ヘッダ値の共通生成（None / Bearer 有効・期限切れ / Basic）。
+    #[test]
+    fn authorization_header_by_variant() {
+        let now = Instant::now();
+        assert_eq!(
+            RegistryAuth::None.authorization_header(now).expect("n"),
+            None
+        );
+        let tok = parse_token_response(
+            br#"{"token":"tok","expires_in":300}"#,
+            now,
+            SystemTime::now(),
+            Duration::ZERO,
+        )
+        .expect("t");
+        let bearer = RegistryAuth::Bearer(tok);
+        assert_eq!(
+            bearer.authorization_header(now).expect("b").as_deref(),
+            Some("Bearer tok")
+        );
+        let e = bearer
+            .authorization_header(now + Duration::from_secs(301))
+            .expect_err("expired");
+        assert_eq!(e.code(), OciErrorCode::PermissionDenied);
+        let basic =
+            RegistryAuth::Basic(BasicCredentials::new("Aladdin", "open sesame").expect("c"));
+        assert_eq!(
+            basic.authorization_header(now).expect("basic").as_deref(),
+            Some("Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==")
+        );
     }
 }

@@ -21,6 +21,8 @@ use fandhe_container_plugin::PLUGIN_SOCKET_ENV;
 const BIN: &str = env!("CARGO_BIN_EXE_fandhe-container-plugin-mcp");
 /// 子プロセスの終了・応答 1 行を待つ上限。
 const WAIT: Duration = Duration::from_secs(30);
+/// kill 後の子の回収を待つ猶予。超過しても待ち続けず失敗にする。
+const REAP_GRACE: Duration = Duration::from_secs(5);
 
 /// 子の終了を期限内に待ち、(終了コード, stdout, stderr) を返す。超過時は kill して失敗にする。
 fn wait_exit(mut child: Child) -> (i32, String, String) {
@@ -32,9 +34,20 @@ fn wait_exit(mut child: Child) -> (i32, String, String) {
             break s;
         }
         if start.elapsed() > WAIT {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("plugin binary did not exit within deadline");
+            let kill_result = child.kill();
+            // 回収も有限の猶予で行う（期限なしの wait は割り込み不能な待ちで無期限に止まる。REPAIR-5）。
+            let reap_start = Instant::now();
+            let mut reaped = false;
+            while reap_start.elapsed() < REAP_GRACE {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    reaped = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!(
+                "plugin binary did not exit within deadline (kill: {kill_result:?}, reaped: {reaped})"
+            );
         }
         std::thread::sleep(Duration::from_millis(10));
     };

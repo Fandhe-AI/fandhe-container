@@ -45,6 +45,8 @@ tmpfs にする（runc 方式）に確定（4 章の判断 1）。実装は #165
 
 イメージ同梱の偽ノードを覆い隠せるのは `dev` 配下に限る（#1667 の事後監査 P2）。rootfs の残りの部分（例: イメージが `/dev` 以外に同梱したブロックデバイスのノード）は、rootful では rootfs の自己 bind に `nodev` が無く、汎用のデバイス cgroup（`BPF_CGROUP_DEVICE`）も core に無いため、Landlock の `READ_FILE`・`WRITE_FILE` の範囲で開けてしまっていた。そこで rootfs の自己 bind に、rootful・rootless を問わず常に `nodev` を付けた（#1676。オーナー判断 2026-10-10。`mount_setattr(2)`〔Linux 5.12 以降。Landlock ABI 6 の前提の Linux 6.12 に含まれる〕で mount top 1 枚だけに足し、失敗は rootless の `EPERM` を含め縮退せず拒否する。`/dev` の tmpfs・devpts・基本デバイスのホストのノードの bind〔#1660〕は別マウントのため `nodev` は及ばない）。既定のデバイス cgroup の許可リストは #1677 で追跡する（GPU 向けの TASK-129 とは別）。CDI `deviceNodes`（TASK-127・#547）が `/dev` 以外を指すと、この `nodev` で開けなくなる。配置先の扱いは TASK-127 で決める。新たなノードの作成（mknod）は Landlock の `MAKE_CHAR`・`MAKE_BLOCK` 不許可が止め、`/dev`・`/dev/shm` での拒否は `tests/landlock_implicit_dev.rs` が照合する
 
+既定のデバイス制限の層（rootfs の `nodev`・Landlock・デバイス cgroup）の一覧と errno（`EACCES`／`EPERM`）は [cgroups.md](./cgroups.md) の「デバイス cgroup」の節にまとめ、`tests/device_cgroup_layers.rs` が層ごとに実機照合する（#1681）。
+
 ### 3.2 暗黙の固定集合か `mounts[]` の汎用処理か
 
 暗黙の固定集合は `/proc`・基本 6 デバイスと揃い、小さく入れられる。`mounts[]` 経由は汎用だが `mounts[]` の受け入れ処理（TASK-127 系）に依存する。Landlock のルール生成が `mounts[]` 前提のため、暗黙集合を採るなら暗黙分のルールを別途足す必要がある。

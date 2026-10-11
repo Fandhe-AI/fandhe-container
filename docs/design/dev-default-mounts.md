@@ -20,7 +20,7 @@ OCI 既定の `/dev` のうち、基本デバイスノード 6 種と default sy
 | runc `libcontainer/rootfs_linux.go` | v1.5.2 | `createDevices`・`bindMountDeviceNode`・`setupPtmx` | user namespace では mknod 不可のためホストのノードを bind。bind 先は fd 起点で `O_CREAT\|O_NOFOLLOW` により作る。`/dev/ptmx` は `pts/ptmx` への相対 symlink（既存を unlink してから作る） |
 | Linux `Documentation/filesystems/devpts.rst` | v6.12 | 全体 | devpts は mount ごとに独立し、`/dev/pts/ptmx`（0000）を作る。`/dev/ptmx` を symlink または bind にする場合は `ptmxmode=0666` が要る。`max=<count>` で instance ごとの上限を設けられる |
 
-未確認（実装 issue の着手時に確かめる）: `user_namespaces(7)` / `mount_namespaces(7)` における userns 内での devpts・mqueue マウント条件、`dev.tty.legacy_tiocsti`（6.2 以降）、Docker の `/dev/shm` 既定 64 MiB と `--ipc=host` の扱い。本書では確認できていないため、確定扱いしない。
+未確認（実装 issue の着手時に確かめる）: `user_namespaces(7)` / `mount_namespaces(7)` における userns 内での devpts・mqueue マウント条件、Docker の `/dev/shm` 既定 64 MiB と `--ipc=host` の扱い。本書では確認できていないため、確定扱いしない。
 
 ## 2. 現状（本リポ）
 
@@ -30,6 +30,7 @@ OCI 既定の `/dev` のうち、基本デバイスノード 6 種と default sy
 - `process.terminal: true` と `mounts[]` は拒否する。`/proc` と基本 6 デバイスは `mounts[]` を使わず暗黙の固定集合
 - Landlock のルールは `root` に加え、暗黙の `/dev`・`/dev/pts`・`/dev/shm` を実マウントの属性から導いた権利で足す（#1657）。定義は `dev_mounts` モジュールの1か所で、exec 側と共有する。`mounts[]` が同じマウント先を指す場合は統合せず拒否する（統合の規則は TASK-127）。`PSEUDO_FS` に devpts は入れない（pty への書き込みに `WRITE_FILE` が要り、書き込み制限に VFS の裏付けがあるため）。利用者指定の tmpfs（`--tmpfs`・`/dev/shm` の上書き）は反映しない。ruleset は fork 前に親で作るため、適用時に各パスが期待する fs（tmpfs / devpts）の独立したマウントのルートであることを確かめ、無ければ `landlock_implicit_mount_missing`、素のディレクトリ等なら `landlock_implicit_mount_mismatch`（どちらも `FailedPrecondition`）で拒否する。`/dev/shm` を載せない `--ipc=host` では `ImplicitDevMounts::WithoutShm`（supervisor の `ContainerOptions::implicit_dev_mounts`）を使う（#1672 の事後監査 P2）
 - 読み取り専用の root（`root.readonly=true`）でも、`/dev` は書き込みと実行が可能な tmpfs で、Landlock でも `/dev` に `WRITE` を許す（`EXECUTE` は `/` のルールから継承され、`/dev` だけ外せない。VFS 側も `noexec` なし）。runc・Docker と同じだが、「読み取り専用の root で `mounts[]` が空なら書き込めるパスが無い」という #1657 以前の性質は成り立たない（#1672 の事後監査 P2）。`/dev/shm` も書き込みは可能（`noexec`・`nodev`）
+- 起動時（`exec::spawn_container_with_stages` の fork 後の親）に `/proc/sys/dev/tty/legacy_tiocsti` を読み、`1` のときだけ `legacy_tiocsti_enabled` の警告を 1 行出す。観測だけで起動は止めない（`legacy_tiocsti` モジュール。#1658 の案 A＋C・案 B〔seccomp で ioctl を request 単位で拒否〕は不採用・#1739）。本番 launcher への配線は未実装
 - rootless は `mknod` を使わず、ホストの `/dev/<名前>` を `open_tree(2)` + `move_mount(2)` で tmpfs 上の空ファイルへ fd 起点で bind する（#1660 で実装。供給方式は `DevptsGidSource` の申告で決め、`mknod` の `EPERM` では切り替えない。ホスト側ノードの不一致は `host_device_node_unexpected`〔SEC-5〕で拒否し、新マウント API が無いカーネルは縮退せず `Unimplemented`）。実機での確認は結合試験 `default_devices`（人間担当）
 
 ## 3. 方式の比較

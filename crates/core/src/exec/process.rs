@@ -2040,8 +2040,24 @@ pub fn spawn_container_with_stages(
         EXIT_SETUP_FAILED,
     )
     .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
+    // 実際に起動したときだけ、親の側で 1 回観測する（fork 失敗時は出さない）。
+    report_legacy_tiocsti();
     Ok(ContainerChild::spawned(pid))
 }
+
+/// 起動時に `dev.tty.legacy_tiocsti` を読み、`1` のときだけ警告 1 行を標準エラーへ出す（CORE-5・SEC-1・
+/// REPAIR-4・#1739。契約は `legacy_tiocsti` モジュール）。観測だけで起動は止めず、書き込み失敗も捨てる。
+/// 子は exec 直前に fd 0〜2 を `/dev/null` へ差し替えるため、運用者へ確実に届く親の側で出す。短い固定 1 行で、
+/// 前例（`child_main` のエラー出力）と同じ標準エラーへの書き込み（REPAIR-5）。
+#[cfg(not(test))]
+fn report_legacy_tiocsti() {
+    let state = crate::legacy_tiocsti::read_host();
+    let _ = crate::legacy_tiocsti::write_warning(state, &mut std::io::stderr());
+}
+
+/// 単体試験: 試験プロセスの標準エラーを汚さず、ホストの値にも左右されないよう何もしない。
+#[cfg(test)]
+fn report_legacy_tiocsti() {}
 
 /// 結合試験専用: `spawn_container_with_stages` に、pivot 前の専用 `/dev`（`create_default_devices`）を足した版
 /// （CORE-5・SEC-1・REPAIR-12・#1714）。

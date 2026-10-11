@@ -12,6 +12,7 @@ make ci          # 上記 + lint-docs + deny を一括実行
 
 - テストは変更のたびに全件実行し、失敗・警告を 1 件でも残したまま進めない（fail-closed）
 - Cargo.toml・メンバー crate が未作成の間、cargo 系ターゲットは Makefile 側で skip される（HAS_CARGO / HAS_MEMBERS）
+- git hooks（lefthook）はこれらを実行しない（CI と重複するため。[git-hooks](git-hooks.md)）。ローカルゲートは手動で通す
 
 ## CI の構成（REPAIR-7 の 5 段階ゲート）
 

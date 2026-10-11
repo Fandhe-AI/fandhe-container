@@ -1,10 +1,14 @@
 # Git hooks 定義（lefthook）。`make hooks`（lefthook install）で導入する。
 #
-# 方針（.claude/rules/conventional-commits.md・security.md。Fandhe-AI/rust-ai-library と同一）:
+# 方針（.claude/rules/git-hooks.md・conventional-commits.md・security.md）:
 # - --no-verify によるスキップは禁止
 # - Cargo.toml 未追加（workspace 作成予定）の間、cargo 系ジョブはスキップする
 #   （Makefile の HAS_CARGO 判定と同一方針）
-# - 重いチェック（clippy・test）は pre-push に置き、pre-commit は整形チェックのみで軽量に保つ
+# - フックの追加・変更時は .claude/rules/git-hooks.md の方針（時間予算・CI との役割分担）に従う
+# - GitHub Actions（ci.yml の rust-ci・platform-ci 等）で実行する検査はフックで重複実行しない。
+#   フックは CI に無い秘密情報検査と、staged 限定の軽量な整形・コミットメッセージ検査に限る
+#   （開発速度を落とさないため clippy・test は pre-push に置かない）
+# - ローカルゲート（make ci。.claude/rules/ci.md）の規約自体は変わらず、フックで強制しないだけ
 
 pre-commit:
   parallel: true
@@ -30,16 +34,19 @@ pre-commit:
     # 検出範囲を維持するため追加している）
     - name: secrets-guard
       run: |
-        # 末尾の `grep -q .` は「拒否パターンに一致し、かつ許可リストに一致しない行が
-        # 実在するか」の判定（BSD grep は空入力への `-qv` が 0 を返すため `-qv` は使わない）
+        # プロセス起動回数をファイル数に比例させないため、全ファイル名を 1 回の
+        # grep パイプラインで判定する（ファイルごとのループは --all-files で約 7 秒かかった）。
+        # 拒否パターンに一致し、かつ許可リストに一致しない行が 1 行でもあれば拒否する
+        # （grep の「一致なし」の終了コード 1 は正常扱いにし、出力の有無で判定する）
         re='(^|/)\.env(\..+)?$|(^|/)(id_rsa|id_ed25519)(\..+)?$|\.(pem|p12|pfx|key|env)$'
         re_ok='\.(example|sample|template|pub)$'
-        for f in {staged_files}; do
-          if printf '%s\n' "$f" | grep -E "$re" | grep -vE "$re_ok" | grep -q .; then
+        bad="$(printf '%s\n' {staged_files} | grep -E "$re" | grep -vE "$re_ok")"
+        if [ -n "$bad" ]; then
+          printf '%s\n' "$bad" | while IFS= read -r f; do
             echo "NG: 秘密情報ファイルがステージされています: $f" >&2
-            exit 1
-          fi
-        done
+          done
+          exit 1
+        fi
 
     # ファイル名パターンだけでは検出できない、内容そのものに秘密情報らしき
     # 文字列が含まれるケースの「うっかり」防止（網羅的な検出ではない。
@@ -52,6 +59,11 @@ pre-commit:
     # 出力しない。
     - name: secrets-content-guard
       run: |
+        # プロセス起動回数を diff 行数に比例させないため、awk 1 本で追加行の本文と
+        # ファイル名を行対応の一時ファイルへ書き出し、パターンごとに grep -E を 1 回だけ
+        # 実行する（追加行 × パターンごとに grep を起動する旧実装は 3000 行の diff で
+        # 約 47 秒かかった。awk の `{n}` 区間指定は古い mawk / BSD awk で使えないため
+        # grep -E 側で照合する。BSD / GNU の両方で動く。Fandhe-AI/fandhe-browser と同一実装）
         patterns='
         -----BEGIN [A-Z ]*PRIVATE KEY-----|private-key
         AKIA[0-9A-Z]{16}|aws-access-key-id
@@ -61,26 +73,49 @@ pre-commit:
         xox[abprs]-[A-Za-z0-9-]{10,}|slack-token
         AIza[0-9A-Za-z_-]{35}|google-api-key
         '
-        file=""
-        git diff --cached --diff-filter=ACMR -U0 -- . | while IFS= read -r line; do
-          case "$line" in
-            "+++ b/"*)
-              file="${line#+++ b/}"
-              ;;
-            "+++ "*)
-              ;;
-            "+"*)
-              content="${line#+}"
-              printf '%s\n' "$patterns" | while IFS='|' read -r pat kind; do
-                [ -z "$pat" ] && continue
-                if printf '%s' "$content" | grep -Eq -- "$pat"; then
-                  echo "NG: 秘密情報らしき文字列を検出しました: file=${file:-(unknown)} pattern=$kind" >&2
-                  exit 1
-                fi
-              done || exit 1
-              ;;
-          esac
-        done
+        tmp="$(mktemp -d)" || exit 1
+        trap 'rm -rf "$tmp"' EXIT
+        # diff の取得・追加行の抽出のどちらかが失敗した場合（一時領域の容量不足等）は、
+        # 検査できていない行が残るため fail-closed でコミットを拒否する。パイプの左辺の
+        # 終了状態は sh では取れないため、diff を一度ファイルへ書き出してから awk に渡す。
+        # awk は書き出した件数と行数を照合し、書き込み失敗（close の失敗）も非ゼロで返す
+        if ! git diff --cached --diff-filter=ACMR -U0 -- . > "$tmp/diff"; then
+          echo "NG: staged diff を取得できないため秘密情報の検査を完了できません" >&2
+          exit 1
+        fi
+        if ! awk -v cf="$tmp/content" -v nf="$tmp/names" '
+          /^\+\+\+ b\// { file = substr($0, 7); next }
+          /^\+\+\+ /    { next }
+          /^\+/         { print substr($0, 2) > cf; print (file == "" ? "(unknown)" : file) > nf; n++ }
+          END {
+            if (n > 0 && (close(cf) != 0 || close(nf) != 0)) exit 2
+            print n + 0 > "/dev/stderr"
+          }
+        ' "$tmp/diff" 2> "$tmp/count"; then
+          echo "NG: 追加行の抽出に失敗したため秘密情報の検査を完了できません" >&2
+          exit 1
+        fi
+        n="$(cat "$tmp/count")"
+        if [ "$n" -eq 0 ] 2>/dev/null; then
+          exit 0
+        fi
+        if [ "$(wc -l < "$tmp/content" | tr -d ' ')" != "$n" ]; then
+          echo "NG: 追加行の抽出結果が不完全なため秘密情報の検査を完了できません" >&2
+          exit 1
+        fi
+        rc=0
+        printf '%s\n' "$patterns" | {
+          while IFS='|' read -r pat kind; do
+            [ -z "$pat" ] && continue
+            ln="$(grep -En -m1 -- "$pat" "$tmp/content" | head -n1 | cut -d: -f1)"
+            if [ -n "$ln" ]; then
+              file="$(sed -n "${ln}p" "$tmp/names")"
+              echo "NG: 秘密情報らしき文字列を検出しました: file=${file} pattern=$kind" >&2
+              rc=1
+            fi
+          done
+          exit "$rc"
+        }
 
 commit-msg:
   jobs:
@@ -102,24 +137,3 @@ commit-msg:
           exit 1
         fi
         sh scripts/check-commit-msg-line-length.sh {1}
-
-pre-push:
-  jobs:
-    # clippy・test は Makefile の lint / test ターゲットへ委譲し、既定 feature のみで
-    # 実行する（`--all-features` 込みの検証は CI の rust-ci ジョブが担う）。
-    # Cargo.toml 未追加・メンバー crate 未作成なら make 側の HAS_CARGO / HAS_MEMBERS
-    # 判定で skip する
-    - name: clippy
-      run: |
-        if [ -f Cargo.toml ]; then
-          make lint
-        else
-          echo "skip: Cargo.toml 未追加"
-        fi
-    - name: test
-      run: |
-        if [ -f Cargo.toml ]; then
-          make test
-        else
-          echo "skip: Cargo.toml 未追加"
-        fi

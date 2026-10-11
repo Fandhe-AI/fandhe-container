@@ -8,9 +8,9 @@
 //! - 平文 HTTP の経路を持たない（`https_only`。scheme は `https` 固定）
 //! - HTTP の 4xx / 5xx を ureq のエラーにしない（`http_status_as_error(false)`。401 チャレンジを #401 が扱うため）
 //! - リダイレクト先へ `Authorization` を送らない（`RedirectAuthHeaders::Never`）。回数・ヘッダサイズに上限
-//! - connect / 応答待ちのタイムアウトは `Duration` 必須で、未設定にできない（REPAIR-5）
+//! - DNS 解決・connect・リクエスト送信・応答ヘッダ待ちのタイムアウトは `Duration` 必須で、未設定にできない（REPAIR-5）
 //!
-//! 操作ごとのタイムアウト調整（blob の長時間転送の `global` / `recv_body`）は #401〜#403 で行う。
+//! 本文受信（`recv_body`）と全体（`global`）のタイムアウトは既定では無制限のまま。操作ごとの設定（blob の長時間転送を含む）は #401〜#403 で行う。
 //! CA ファイルを指定する経路は範囲外（OS のストアと `SSL_CERT_FILE` / `SSL_CERT_DIR` のみ）。
 
 use crate::error::OciError;
@@ -68,6 +68,10 @@ impl RegistryEndpoint {
 pub struct RegistryClientConfig {
     /// TCP / TLS 接続のタイムアウト。
     pub connect_timeout: Duration,
+    /// DNS 解決のタイムアウト。
+    pub resolve_timeout: Duration,
+    /// リクエスト送信（ヘッダ書き出し）のタイムアウト。
+    pub send_request_timeout: Duration,
     /// リクエスト送信後、応答ヘッダを受け取るまでのタイムアウト。
     pub recv_response_timeout: Duration,
     /// 追従するリダイレクトの最大回数。
@@ -80,6 +84,8 @@ impl Default for RegistryClientConfig {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(30),
+            resolve_timeout: Duration::from_secs(30),
+            send_request_timeout: Duration::from_secs(30),
             recv_response_timeout: Duration::from_secs(60),
             max_redirects: 5,
             max_response_header_bytes: 64 * 1024,
@@ -127,7 +133,9 @@ impl RegistryClient {
             .redirect_auth_headers(RedirectAuthHeaders::Never)
             .max_redirects(config.max_redirects)
             .max_response_header_size(config.max_response_header_bytes)
+            .timeout_resolve(Some(config.resolve_timeout))
             .timeout_connect(Some(config.connect_timeout))
+            .timeout_send_request(Some(config.send_request_timeout))
             .timeout_recv_response(Some(config.recv_response_timeout))
             .user_agent(concat!("fandhe-container/", env!("CARGO_PKG_VERSION")))
             .build()

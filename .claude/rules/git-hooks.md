@@ -38,7 +38,7 @@ secrets-content-guard は staged diff（`git diff --cached`）を走査するた
 - リポジトリ全体を走査する lint / fmt チェック（`cargo fmt --all --check`・`make lint-docs` 全体の呼び出しを含む。lint-docs は `lint-docs` ジョブが担う）
 - 依存パッケージのインストール・ネットワークアクセス（`npx` 経由の commitlint 等。正式な commitlint は `lint-docs` ジョブと `make lint-commits` が担う）
 - `ci.yml` のジョブと同じコマンドを同じ範囲で実行するもの
-- フックスクリプト自体のテスト（`make commit-msg-line-length-selftest`）。手元で実行する
+- フックスクリプト自体のテスト（`make commit-msg-line-length-selftest`）。`platform-ci` ジョブのステップとして実行する
 
 ## フックに置いてよいもの
 
@@ -81,6 +81,7 @@ secrets-content-guard は staged diff（`git diff --cached`）を走査するた
 2. staged ファイルに限定できるか
     - できない → CI へ置く
 3. CI へ置く場合は既存ジョブ（`platform-ci` 等）のステップとして追加する
+    - フックスクリプトを追加・変更したら、その自己テストも `platform-ci` のステップに置く
     - ジョブを増やすと check-run 名と ruleset の必須チェックに影響するため、[ci](ci.md)「3 OS CI」の方針に従う
     - 新しいジョブを追加する場合は、集約ジョブ `ci-complete` の `needs` にも必ず追加する
 4. 編集後に以下を実行し、summary の合計時間をユーザーへ報告する（予算を超えるなら構成を見直す）

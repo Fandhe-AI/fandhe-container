@@ -3,7 +3,7 @@
 #
 # 役割: 境界値（100 / 101）を ASCII・全角・絵文字（UTF-16 で 2 単位）・URL・CRLF・コメント行・
 # scissors・footer で具体値照合する。期待値は commitlint（body/footer-max-line-length = 100）の判定。
-# 呼び出し元: Makefile の `commit-msg-line-length-selftest`。make ci には含めない。
+# 呼び出し元: Makefile の `commit-msg-line-length-selftest`（CI の platform-ci ジョブが実行）。make ci には含めない。
 # 一時ファイルは mktemp -d の中だけに作り trap で消す。失敗は FAIL: 行と非 0 終了。
 set -uo pipefail
 

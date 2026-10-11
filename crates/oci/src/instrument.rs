@@ -26,6 +26,8 @@ pub enum OciOpKind {
     FetchBlob,
     /// 取得済み blob の sha256 digest 検証（open 失敗を含む操作全体。TASK-52.1）。
     VerifyBlobDigest,
+    /// レイヤー blob の gzip 展開（open 失敗を含む操作全体。TASK-52.2）。
+    DecompressLayer,
 }
 
 impl OciOpKind {
@@ -36,6 +38,7 @@ impl OciOpKind {
             OciOpKind::FetchManifest => "oci.manifest.fetch",
             OciOpKind::FetchBlob => "oci.blob.fetch",
             OciOpKind::VerifyBlobDigest => "oci.blob.verify",
+            OciOpKind::DecompressLayer => "oci.layer.decompress",
         }
     }
 }

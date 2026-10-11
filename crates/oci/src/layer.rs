@@ -6,13 +6,22 @@
 //!
 //! 呼び出し契約: layer 展開（TASK-52.x）やキャッシュ公開の前に、呼び出し側が本検証を通すこと。
 //! 検証対象は呼び出し側が管理するステージング領域のファイルとし、パスはエラー文言に載せない。
-//! 未実装（後続 issue）: `fetch_blob` 内への組み込み、manifest 本文の digest 突合、展開・キャッシュ格納。
+//! 未実装（後続 issue）: `fetch_blob` 内への組み込み、manifest 本文の digest 突合、tar 展開・キャッシュ格納。
+//!
+//! gzip 展開（TASK-52.2・OCI-1・#407）: digest 検証済みの圧縮 blob を `GzipLayerReader` で逐次展開し、
+//! 後続の tar 展開（TASK-52.3）へ tar バイトストリームとして渡す。展開後サイズの上限は必須引数で、
+//! 超過した最初の読み取りで中断する（decompression bomb 対策。メモリ使用量は展開サイズに依存しない）。
+//! 呼び出し契約: 展開の前に `verify_blob_digest` を通すこと。digest は圧縮 blob に対する値であり、
+//! 展開後 tar の diff_id（config の `rootfs.diff_ids`）との突合は未実装（後続 issue）。gzip トレーラ
+//! （CRC32・ISIZE）は EOF まで読み切ったときにだけ検証されるため、tar 側は EOF まで読むこと。
+//! zstd 圧縮・非圧縮レイヤーの分岐は本モジュールの対象外。
 
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
-use std::io::{ErrorKind, Read};
+use std::io::{ErrorKind, Read, Write};
 use std::path::Path;
 
+use flate2::read::MultiGzDecoder;
 use sha2::{Digest as _, Sha256};
 
 use crate::error::{OciError, OciErrorCode};
@@ -68,6 +77,19 @@ fn open_blob(path: &Path) -> std::io::Result<File> {
     opts.open(path)
 }
 
+/// blob ファイルを開き、同一ハンドルで通常ファイルであることを確認する（FIFO 等で読みがブロックするのを避ける）。
+fn open_regular_blob(path: &Path) -> Result<File, OciError> {
+    let file = open_blob(path).map_err(map_io_error)?;
+    let meta = file.metadata().map_err(map_io_error)?;
+    if !meta.is_file() {
+        return Err(OciError::new(
+            OciErrorCode::InvalidArgument,
+            "blob path is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 /// 計装なしの `verify_blob_digest_with`（`NoopOciOpRecorder`）。
 pub fn verify_blob_digest(
     path: &Path,
@@ -98,15 +120,7 @@ fn verify_blob_digest_inner(
     expected: &Digest,
     max_bytes: u64,
 ) -> Result<VerifiedBlob, OciError> {
-    let file = open_blob(path).map_err(map_io_error)?;
-    // 同一ハンドルで種別を確認する（FIFO 等で読みがブロックするのを避ける）。
-    let meta = file.metadata().map_err(map_io_error)?;
-    if !meta.is_file() {
-        return Err(OciError::new(
-            OciErrorCode::InvalidArgument,
-            "blob path is not a regular file",
-        ));
-    }
+    let file = open_regular_blob(path)?;
     let (hex, size) = sha256_hex_of_reader(file, max_bytes)?;
     let actual = format!("sha256:{hex}");
     if actual != expected.as_str() {
@@ -175,6 +189,174 @@ fn map_io_error(e: std::io::Error) -> OciError {
         }
         _ => OciError::new(OciErrorCode::Internal, "failed to read blob file"),
     }
+}
+
+/// 展開後サイズ上限の参考既定値（`RegistryClientConfig::max_blob_bytes` と同オーダーの 8 GiB）。
+/// API は上限を必須引数にしており、上限なしの経路は提供しない。
+pub const DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// gzip 展開に成功したレイヤーの結果（将来の項目追加に備え `non_exhaustive`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DecompressedLayer {
+    /// 展開後（tar）のバイト数。
+    pub size: u64,
+}
+
+/// 展開後サイズ上限の超過を `io::Error` の source として運ぶ内部マーカー。
+#[derive(Debug)]
+struct LayerLimitExceeded;
+
+impl std::fmt::Display for LayerLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("layer exceeds the uncompressed size limit")
+    }
+}
+
+impl std::error::Error for LayerLimitExceeded {}
+
+fn limit_exceeded_io_error() -> std::io::Error {
+    std::io::Error::other(LayerLimitExceeded)
+}
+
+/// gzip（マルチメンバ対応）を逐次展開し、展開後サイズ上限を強制する `Read`（TASK-52.2・OCI-1）。
+///
+/// 後続の tar 展開（TASK-52.3）が tar パイプラインの入力として使う。上限と同じサイズは成功し、
+/// 1 バイトでも超えると `io::Error` を返して以降も同じエラーを返し続ける（中断後に再開しない）。
+/// I/O エラーは `oci_error_from_layer_io` で `OciError` へ写せる。tar 側は EOF まで読み切ること
+/// （gzip トレーラの CRC32・ISIZE は EOF で検証される）。
+pub struct GzipLayerReader<R: Read> {
+    inner: MultiGzDecoder<R>,
+    max: u64,
+    total: u64,
+    exceeded: bool,
+}
+
+impl<R: Read> GzipLayerReader<R> {
+    /// 圧縮ストリーム `src` と展開後サイズの上限 `max_uncompressed_bytes` から作る。
+    pub fn new(src: R, max_uncompressed_bytes: u64) -> Self {
+        Self {
+            inner: MultiGzDecoder::new(src),
+            max: max_uncompressed_bytes,
+            total: 0,
+            exceeded: false,
+        }
+    }
+
+    /// これまでに展開して返したバイト数。
+    pub fn total_out(&self) -> u64 {
+        self.total
+    }
+}
+
+impl<R: Read> Read for GzipLayerReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.exceeded {
+            return Err(limit_exceeded_io_error());
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let remaining = self.max.saturating_sub(self.total);
+        if remaining == 0 {
+            // 上限ちょうどまで読んだ後。続きが 1 バイトでもあれば超過、EOF なら成功（トレーラも検証される）。
+            let mut probe = [0u8; 1];
+            return match self.inner.read(&mut probe)? {
+                0 => Ok(0),
+                _ => {
+                    self.exceeded = true;
+                    Err(limit_exceeded_io_error())
+                }
+            };
+        }
+        let cap = usize::try_from(remaining).map_or(buf.len(), |r| r.min(buf.len()));
+        let Some(dst) = buf.get_mut(..cap) else {
+            return Ok(0);
+        };
+        let n = self.inner.read(dst)?;
+        self.total = self.total.saturating_add(n as u64);
+        Ok(n)
+    }
+}
+
+/// レイヤー読み取りの `io::Error` を構造化エラーへ写す（tar 展開側も共用できる）。
+///
+/// 上限超過は `ResourceExhausted`、gzip の形式不正・CRC32 / ISIZE 不一致・途中切れは `DataLoss`、
+/// それ以外は `Internal`。メッセージにパス・OS メッセージは載せない。
+pub fn oci_error_from_layer_io(e: std::io::Error) -> OciError {
+    if e.get_ref()
+        .is_some_and(|s| s.downcast_ref::<LayerLimitExceeded>().is_some())
+    {
+        return OciError::new(
+            OciErrorCode::ResourceExhausted,
+            "layer exceeds the uncompressed size limit",
+        );
+    }
+    match e.kind() {
+        ErrorKind::InvalidData | ErrorKind::InvalidInput | ErrorKind::UnexpectedEof => {
+            OciError::new(OciErrorCode::DataLoss, "layer gzip stream is corrupt")
+        }
+        _ => OciError::new(OciErrorCode::Internal, "failed to read layer stream"),
+    }
+}
+
+/// 圧縮レイヤー blob を開いて `GzipLayerReader` を返す。通常ファイル以外は `InvalidArgument`。
+pub fn open_gzip_layer(
+    path: &Path,
+    max_uncompressed_bytes: u64,
+) -> Result<GzipLayerReader<File>, OciError> {
+    let file = open_regular_blob(path)?;
+    Ok(GzipLayerReader::new(file, max_uncompressed_bytes))
+}
+
+/// 計装なしの `decompress_layer_to_writer_with`（`NoopOciOpRecorder`）。
+pub fn decompress_layer_to_writer<W: Write>(
+    path: &Path,
+    max_uncompressed_bytes: u64,
+    dst: &mut W,
+) -> Result<DecompressedLayer, OciError> {
+    decompress_layer_to_writer_with(&NoopOciOpRecorder, path, max_uncompressed_bytes, dst)
+}
+
+/// 展開全体（open 失敗を含む）を `OciOpKind::DecompressLayer` として記録する（REPAIR-4）。
+///
+/// 失敗時（上限超過・破損）に `dst` へ書かれた分は不完全なため、呼び出し側が破棄する
+/// （ステージング領域の一時ファイルへ書き、成功時のみ公開する契約）。`dst` への書き込みは
+/// 上限以下に収まる。書き込み先のエラーは `Internal`。
+pub fn decompress_layer_to_writer_with<W: Write>(
+    recorder: &dyn OciOpRecorder,
+    path: &Path,
+    max_uncompressed_bytes: u64,
+    dst: &mut W,
+) -> Result<DecompressedLayer, OciError> {
+    record_oci_op(recorder, OciOpKind::DecompressLayer, || {
+        let mut r = open_gzip_layer(path, max_uncompressed_bytes)?;
+        copy_decompressed(&mut r, dst)
+    })
+}
+
+/// `r` を EOF まで固定長バッファで `dst` へ複写する。
+fn copy_decompressed<R: Read, W: Write>(
+    r: &mut GzipLayerReader<R>,
+    dst: &mut W,
+) -> Result<DecompressedLayer, OciError> {
+    let mut buf = vec![0u8; HASH_BUF_LEN];
+    loop {
+        let n = match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(oci_error_from_layer_io(e)),
+        };
+        if let Some(chunk) = buf.get(..n) {
+            dst.write_all(chunk).map_err(|_| {
+                OciError::new(OciErrorCode::Internal, "failed to write decompressed layer")
+            })?;
+        }
+    }
+    Ok(DecompressedLayer {
+        size: r.total_out(),
+    })
 }
 
 #[cfg(test)]
@@ -374,5 +556,176 @@ mod tests {
         assert_eq!(v[1].error_code(), Some(OciErrorCode::DataLoss));
         assert_eq!(v[2].error_code(), Some(OciErrorCode::NotFound));
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    // ---- gzip 展開（TASK-52.2・OCI-1） ----
+
+    fn gz(data: &[u8]) -> Vec<u8> {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    fn decompress_bytes(
+        gzdata: &[u8],
+        max: u64,
+        tag: &str,
+    ) -> (Result<DecompressedLayer, OciError>, Vec<u8>) {
+        let d = tmp_dir(tag);
+        let p = d.join("l");
+        std::fs::write(&p, gzdata).unwrap();
+        let mut out = Vec::new();
+        let r = decompress_layer_to_writer(&p, max, &mut out);
+        std::fs::remove_dir_all(&d).unwrap();
+        (r, out)
+    }
+
+    /// OCI-1: tar 風 512 バイトブロックとチャンク境界をまたぐ入力が一致して展開される。
+    #[test]
+    fn oci1_gzip_roundtrip() {
+        for len in [
+            0usize,
+            512,
+            1536,
+            HASH_BUF_LEN - 1,
+            HASH_BUF_LEN,
+            HASH_BUF_LEN + 1,
+        ] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let (r, out) = decompress_bytes(&gz(&data), u64::MAX, &format!("gzrt{len}"));
+            assert_eq!(r.unwrap().size, len as u64);
+            assert_eq!(out, data);
+        }
+    }
+
+    /// OCI-1: マルチメンバ gzip は連結結果として展開される。
+    #[test]
+    fn oci1_gzip_multi_member() {
+        let mut z = gz(b"hello ");
+        z.extend(gz(b"world"));
+        let (r, out) = decompress_bytes(&z, 100, "gzmm");
+        assert_eq!(r.unwrap().size, 11);
+        assert_eq!(out, b"hello world");
+    }
+
+    /// OCI-1: 上限と同じサイズは成功し、上限 + 1 は ResourceExhausted。
+    #[test]
+    fn oci1_gzip_limit_boundary() {
+        let z = gz(&[7u8; 1000]);
+        let (r, out) = decompress_bytes(&z, 1000, "gzlb1");
+        assert_eq!(r.unwrap().size, 1000);
+        assert_eq!(out.len(), 1000);
+        let (r, out) = decompress_bytes(&z, 999, "gzlb2");
+        let e = r.unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+        assert_eq!(e.message(), "layer exceeds the uncompressed size limit");
+        assert_eq!(out.len(), 999);
+    }
+
+    /// OCI-1: decompression bomb は上限で中断し、書き込み量が上限を超えない。
+    #[test]
+    fn oci1_gzip_bomb_is_aborted() {
+        let z = gz(&vec![0u8; 8 * 1024 * 1024]);
+        assert!(z.len() < 64 * 1024);
+        let max = 1024 * 1024;
+        let (r, out) = decompress_bytes(&z, max, "gzbomb");
+        assert_eq!(r.unwrap_err().code(), OciErrorCode::ResourceExhausted);
+        assert_eq!(out.len() as u64, max);
+    }
+
+    /// OCI-1: 破損入力（マジック違い・途中切れ・CRC32/ISIZE 改ざん・平文）は DataLoss。
+    #[test]
+    fn oci1_gzip_corrupt_inputs() {
+        let good = gz(&vec![1u8; 4096]);
+        let n = good.len();
+        let mut bad_magic = good.clone();
+        bad_magic[0] ^= 0xff;
+        let mut bad_crc = good.clone();
+        bad_crc[n - 8] ^= 1;
+        let mut bad_isize = good.clone();
+        bad_isize[n - 1] ^= 1;
+        let cases = [
+            bad_magic,
+            good[..5].to_vec(),
+            good[..n / 2].to_vec(),
+            bad_crc,
+            bad_isize,
+            vec![b'x'; 1024],
+        ];
+        for (i, c) in cases.iter().enumerate() {
+            let (r, _) = decompress_bytes(c, u64::MAX, &format!("gzbad{i}"));
+            let e = r.unwrap_err();
+            assert_eq!(e.code(), OciErrorCode::DataLoss, "case={i}");
+            assert_eq!(e.message(), "layer gzip stream is corrupt");
+        }
+    }
+
+    /// OCI-1: 上限超過後の read は再開せずエラーを返し続ける。
+    #[test]
+    fn oci1_gzip_reader_does_not_resume_after_limit() {
+        let z = gz(&[3u8; 100]);
+        let mut r = GzipLayerReader::new(&z[..], 10);
+        let mut buf = [0u8; 64];
+        assert_eq!(r.read(&mut buf).unwrap(), 10);
+        for _ in 0..3 {
+            let e = r.read(&mut buf).unwrap_err();
+            assert_eq!(
+                oci_error_from_layer_io(e).code(),
+                OciErrorCode::ResourceExhausted
+            );
+        }
+    }
+
+    /// OCI-1・REPAIR-4: open 失敗と計装（成功・上限超過・破損が 1 件ずつ）。
+    #[test]
+    fn oci1_gzip_paths_and_recording() {
+        use crate::instrument::OciOpOutcome;
+        let d = tmp_dir("gzrec");
+        let p = d.join("l");
+        std::fs::write(&p, gz(b"abc")).unwrap();
+        let c = Collect::default();
+        let mut out = Vec::new();
+        decompress_layer_to_writer_with(&c, &p, 10, &mut out).unwrap();
+        decompress_layer_to_writer_with(&c, &p, 2, &mut out).unwrap_err();
+        std::fs::write(&p, b"not gzip").unwrap();
+        decompress_layer_to_writer_with(&c, &p, 10, &mut out).unwrap_err();
+        let e = decompress_layer_to_writer(&d.join("none"), 10, &mut out).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::NotFound);
+        let v = c.0.lock().unwrap();
+        assert_eq!(v.len(), 3);
+        assert!(v.iter().all(|s| s.kind() == OciOpKind::DecompressLayer));
+        assert_eq!(v[0].outcome(), OciOpOutcome::Success);
+        assert_eq!(v[1].error_code(), Some(OciErrorCode::ResourceExhausted));
+        assert_eq!(v[2].error_code(), Some(OciErrorCode::DataLoss));
+        drop(v);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// REPAIR-5: 書き手のいない FIFO でも gzip 展開は停止せず InvalidArgument。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn oci1_gzip_fifo_does_not_hang() {
+        let d = tmp_dir("gzfifo");
+        let p = d.join("f");
+        let st = std::process::Command::new("mkfifo").arg(&p).status();
+        assert!(matches!(st, Ok(s) if s.success()), "mkfifo is required");
+        let e = open_gzip_layer(&p, 10).err().expect("must reject a FIFO");
+        assert_eq!(e.code(), OciErrorCode::InvalidArgument);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// 下位 reader の I/O エラーは Internal、正常系の複写は具体値で一致する。
+    #[test]
+    fn oci1_gzip_io_error_mapping() {
+        let e = oci_error_from_layer_io(io::Error::from(ErrorKind::BrokenPipe));
+        assert_eq!(e.code(), OciErrorCode::Internal);
+        let mut r = GzipLayerReader::new(Broken, 10);
+        let e = r.read(&mut [0u8; 8]).unwrap_err();
+        assert_eq!(oci_error_from_layer_io(e).code(), OciErrorCode::Internal);
+        let z = gz(b"abc");
+        let mut ok = GzipLayerReader::new(&z[..], 10);
+        let mut out = Vec::new();
+        assert_eq!(copy_decompressed(&mut ok, &mut out).unwrap().size, 3);
+        assert_eq!(out, b"abc");
     }
 }

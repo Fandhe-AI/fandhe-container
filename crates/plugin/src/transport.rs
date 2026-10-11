@@ -244,6 +244,22 @@ impl UdsListener {
     pub fn path(&self) -> &Path {
         self.inner.path()
     }
+
+    /// 検証済み listener の fd を dup した std listener を返す（`grpc::UdsIncoming` が tokio 化に使う。
+    /// PLUG-2・PLUG-12・TASK-108.2）。ファイル記述は共有されるため nonblocking 状態も共有する。
+    /// socket の削除・bind ロックの解放は引き続き本 `UdsListener` の Drop が担う。
+    #[cfg(all(unix, feature = "grpc"))]
+    pub(crate) fn try_clone_std_listener(
+        &self,
+    ) -> Result<std::os::unix::net::UnixListener, PluginError> {
+        self.inner.try_clone_listener()
+    }
+
+    /// bind 時点の実効 UID（peer 照合の基準。`grpc::UdsIncoming` が accept ごとに使う）。
+    #[cfg(all(unix, feature = "grpc"))]
+    pub(crate) fn expected_uid(&self) -> u32 {
+        self.inner.expected_uid()
+    }
 }
 
 impl Drop for UdsListener {
@@ -749,6 +765,20 @@ mod imp {
         /// 公開パス（検証済み配置ディレクトリの解決後パス＋socket 名。PLUG-12）。
         pub(super) fn path(&self) -> &Path {
             &self.path
+        }
+
+        /// listener の fd を dup した std listener を返す（`grpc` の非同期 accept 用。TASK-108.2）。
+        #[cfg(feature = "grpc")]
+        pub(super) fn try_clone_listener(&self) -> Result<UnixListener, PluginError> {
+            self.listener.try_clone().map_err(|_| {
+                PluginError::new(PluginErrorCode::Internal, "failed to duplicate listener")
+            })
+        }
+
+        /// bind 時点の実効 UID。
+        #[cfg(feature = "grpc")]
+        pub(super) fn expected_uid(&self) -> u32 {
+            self.euid
         }
 
         /// bind 直後の設定（nonblocking 化・0600 化。PLUG-12）。
@@ -1329,6 +1359,12 @@ mod imp {
 /// （PLUG-12・TASK-123.3・#288）。ロジックは `imp` 側の 1 箇所に置き、重複させない。
 #[cfg(unix)]
 pub(crate) use imp::check_sun_path_len;
+
+/// `grpc` の UDS connector が `UdsStream::connect` と同じエラー写像を使うための公開口（TASK-108.2）。
+#[cfg(all(unix, feature = "grpc"))]
+pub(crate) fn map_connect_io_error(kind: io::ErrorKind) -> PluginError {
+    map_connect_error(kind)
+}
 
 #[cfg(not(unix))]
 mod imp {

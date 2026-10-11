@@ -17,7 +17,8 @@
 //! - `root` は呼び出し側が排他的に所有する既存の空ディレクトリ（ステージング）で、`root` 自体が
 //!   symlink であってはならない。別プロセスが同時に `root` を書き換える競合（TOCTOU）は防げない。
 //! - 失敗時は部分的な展開物が残るため、呼び出し側が `root` ごと破棄すること。
-//! - tar の終端後に入力を EOF まで読み捨てる（gzip トレーラの CRC32・ISIZE 検証のため）。
+//! - tar の終端後に入力を EOF まで読み捨てる（gzip トレーラの CRC32・ISIZE 検証のため）。読み捨てを含む
+//!   入力全体は `ExtractLimits::max_input_bytes` で上限を課す（超過は `ResourceExhausted`）。
 //!
 //! # 未実装（実装済みを装わない。REPAIR-3）
 //!
@@ -65,21 +66,29 @@ pub struct ExtractLimits {
     pub max_entries: u64,
     /// 累積展開バイト数の上限（ヘッダ宣言サイズで書き込み前に検査。超過は `ResourceExhausted`）。
     pub max_total_bytes: u64,
+    /// 入力 tar ストリーム全体（ヘッダ・パディング・終端後の読み捨てを含む）の読み取り上限バイト数
+    /// （超過は `ResourceExhausted`）。`max_total_bytes` は通常ファイル本体しか数えないため別に必須とする。
+    pub max_input_bytes: u64,
 }
 
 impl ExtractLimits {
     /// 上限を指定して作る。
-    pub fn new(max_entries: u64, max_total_bytes: u64) -> Self {
+    pub fn new(max_entries: u64, max_total_bytes: u64, max_input_bytes: u64) -> Self {
         Self {
             max_entries,
             max_total_bytes,
+            max_input_bytes,
         }
     }
 }
 
 impl Default for ExtractLimits {
     fn default() -> Self {
-        Self::new(DEFAULT_MAX_LAYER_ENTRIES, DEFAULT_MAX_EXTRACTED_BYTES)
+        Self::new(
+            DEFAULT_MAX_LAYER_ENTRIES,
+            DEFAULT_MAX_EXTRACTED_BYTES,
+            DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES,
+        )
     }
 }
 
@@ -205,6 +214,36 @@ impl std::error::Error for GuardViolation {}
 
 fn guard_error(code: OciErrorCode, msg: &'static str) -> std::io::Error {
     std::io::Error::new(ErrorKind::InvalidData, GuardViolation { code, msg })
+}
+
+/// 読み取った総バイト数を数え、`limit` を超えたら `ResourceExhausted` で中断する読み取りアダプタ。
+///
+/// tar 解析中と終端後の読み捨ての両方を同じ計数で覆い、終端後に巨大データを付加された入力でも
+/// 無制限に読み続けないようにする（OCI-1）。ちょうど `limit` バイトまでは許容する。
+struct LimitedReader<R> {
+    inner: R,
+    read: u64,
+    limit: u64,
+}
+
+impl<R: Read> Read for LimitedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // 超過検出のため、残りより 1 バイト多く読めるようにする。
+        let room = self.limit.saturating_sub(self.read).saturating_add(1);
+        let cap = usize::try_from(room).unwrap_or(usize::MAX).min(buf.len());
+        let Some(dst) = buf.get_mut(..cap) else {
+            return Ok(0);
+        };
+        let n = self.inner.read(dst)?;
+        self.read = self.read.saturating_add(n as u64);
+        if self.read > self.limit {
+            return Err(guard_error(
+                OciErrorCode::ResourceExhausted,
+                "layer tar stream exceeds the input size limit",
+            ));
+        }
+        Ok(n)
+    }
 }
 
 /// `tar` クレートが拡張ヘッダ本体をメモリへ確保する前に、宣言サイズを検査する読み取りアダプタ。
@@ -736,7 +775,7 @@ impl Extractor<'_> {
 }
 
 fn extract_inner<R: Read>(
-    mut src: R,
+    src: R,
     root: &Path,
     limits: ExtractLimits,
 ) -> Result<ExtractedLayer, OciError> {
@@ -750,6 +789,11 @@ fn extract_inner<R: Read>(
         }
         Err(e) => return Err(map_fs_err(&e)),
     }
+    let mut src = LimitedReader {
+        inner: src,
+        read: 0,
+        limit: limits.max_input_bytes,
+    };
     let mut x = Extractor {
         root,
         limits,
@@ -820,7 +864,12 @@ fn extract_inner<R: Read>(
             Ok(0) => break,
             Ok(_) => {}
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(e) => return Err(oci_error_from_layer_io(e)),
+            Err(e) => {
+                if let Some(v) = e.get_ref().and_then(|i| i.downcast_ref::<GuardViolation>()) {
+                    return Err(err(v.code, v.msg));
+                }
+                return Err(oci_error_from_layer_io(e));
+            }
         }
     }
     Ok(ExtractedLayer {
@@ -967,7 +1016,7 @@ mod tests {
         extract_tar(
             archive(entries).as_slice(),
             &sb.root,
-            ExtractLimits::new(1000, 1 << 20),
+            ExtractLimits::new(1000, 1 << 20, 1 << 30),
         )
     }
 
@@ -1003,7 +1052,12 @@ mod tests {
         h.set_cksum();
         b.append_data(&mut h, &long, &b"x"[..]).unwrap();
         let bytes = b.into_inner().unwrap();
-        let e = extract_tar(bytes.as_slice(), &sb.root, ExtractLimits::new(10, 100)).unwrap_err();
+        let e = extract_tar(
+            bytes.as_slice(),
+            &sb.root,
+            ExtractLimits::new(10, 100, 1 << 30),
+        )
+        .unwrap_err();
         assert_eq!(e.code(), OciErrorCode::InvalidArgument);
         sb.assert_outside_untouched();
     }
@@ -1283,7 +1337,7 @@ mod tests {
         let r = extract_tar(
             archive(&es).as_slice(),
             &sb.root,
-            ExtractLimits::new(3, 100),
+            ExtractLimits::new(3, 100, 1 << 30),
         )
         .unwrap();
         assert_eq!(r.entries, 3);
@@ -1292,7 +1346,7 @@ mod tests {
         let e = extract_tar(
             archive(&es).as_slice(),
             &sb.root,
-            ExtractLimits::new(2, 100),
+            ExtractLimits::new(2, 100, 1 << 30),
         )
         .expect_err("limit");
         assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
@@ -1305,12 +1359,21 @@ mod tests {
     fn oci1_total_bytes_limit() {
         let es = [file("a", 0o644, b"1234"), file("b", 0o644, b"5678")];
         let sb = Sandbox::new();
-        let r = extract_tar(archive(&es).as_slice(), &sb.root, ExtractLimits::new(10, 8)).unwrap();
+        let r = extract_tar(
+            archive(&es).as_slice(),
+            &sb.root,
+            ExtractLimits::new(10, 8, 1 << 30),
+        )
+        .unwrap();
         assert_eq!(r.bytes, 8);
 
         let sb = Sandbox::new();
-        let e = extract_tar(archive(&es).as_slice(), &sb.root, ExtractLimits::new(10, 7))
-            .expect_err("limit");
+        let e = extract_tar(
+            archive(&es).as_slice(),
+            &sb.root,
+            ExtractLimits::new(10, 7, 1 << 30),
+        )
+        .expect_err("limit");
         assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
         assert!(!sb.root.join("b").exists());
 
@@ -1415,7 +1478,12 @@ mod tests {
         h.set_cksum();
         b.append_data(&mut h, &long, &b"ok"[..]).unwrap();
         let bytes = b.into_inner().unwrap();
-        extract_tar(bytes.as_slice(), &sb.root, ExtractLimits::new(10, 100)).unwrap();
+        extract_tar(
+            bytes.as_slice(),
+            &sb.root,
+            ExtractLimits::new(10, 100, 1 << 30),
+        )
+        .unwrap();
         assert_eq!(fs::read(sb.root.join(&long)).unwrap(), b"ok");
     }
 
@@ -1425,8 +1493,12 @@ mod tests {
         let sb = Sandbox::new();
         let mut bytes = archive(&[file("f", 0o644, &[7u8; 2000])]);
         bytes.truncate(512 + 700);
-        let e = extract_tar(bytes.as_slice(), &sb.root, ExtractLimits::new(10, 1 << 20))
-            .expect_err("truncated");
+        let e = extract_tar(
+            bytes.as_slice(),
+            &sb.root,
+            ExtractLimits::new(10, 1 << 20, 1 << 30),
+        )
+        .expect_err("truncated");
         assert_eq!(e.code(), OciErrorCode::DataLoss);
     }
 
@@ -1443,7 +1515,7 @@ mod tests {
         let r = extract_tar(
             GzipLayerReader::new(gz.as_slice(), 1 << 20),
             &sb.root,
-            ExtractLimits::new(10, 100),
+            ExtractLimits::new(10, 100, 1 << 30),
         )
         .unwrap();
         assert_eq!(r.bytes, 5);
@@ -1455,7 +1527,7 @@ mod tests {
         let e = extract_tar(
             GzipLayerReader::new(bad.as_slice(), 1 << 20),
             &sb.root,
-            ExtractLimits::new(10, 100),
+            ExtractLimits::new(10, 100, 1 << 30),
         )
         .expect_err("crc");
         assert_eq!(e.code(), OciErrorCode::DataLoss);
@@ -1464,7 +1536,7 @@ mod tests {
         let e = extract_tar(
             GzipLayerReader::new(gz.as_slice(), 600),
             &sb.root,
-            ExtractLimits::new(10, 100),
+            ExtractLimits::new(10, 100, 1 << 30),
         )
         .expect_err("gzip limit");
         assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
@@ -1479,14 +1551,14 @@ mod tests {
             &c,
             archive(&[file("f", 0o644, b"x")]).as_slice(),
             &sb.root,
-            ExtractLimits::new(10, 10),
+            ExtractLimits::new(10, 10, 1 << 30),
         )
         .unwrap();
         extract_tar_with(
             &c,
             archive(&[file("../f", 0o644, b"x")]).as_slice(),
             &sb.root,
-            ExtractLimits::new(10, 10),
+            ExtractLimits::new(10, 10, 1 << 30),
         )
         .unwrap_err();
         let items = c.items();
@@ -1503,8 +1575,14 @@ mod tests {
         let c = Collect::default();
         let sb = Sandbox::new();
         let missing = sb.base.join("no-such-blob");
-        let e = extract_layer_blob_with(&c, &missing, &sb.root, 1 << 20, ExtractLimits::new(1, 1))
-            .unwrap_err();
+        let e = extract_layer_blob_with(
+            &c,
+            &missing,
+            &sb.root,
+            1 << 20,
+            ExtractLimits::new(1, 1, 1 << 30),
+        )
+        .unwrap_err();
         let items = c.items();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind().as_str(), "oci.layer.extract");
@@ -1512,12 +1590,49 @@ mod tests {
         assert_eq!(items[0].error_code(), Some(e.code()));
     }
 
+    /// 終端後に巨大データを付加した入力は、ファイル本体が 0 件でも入力上限で打ち切る（OCI-1）。
+    #[test]
+    fn trailing_garbage_exceeding_input_limit_is_rejected() {
+        let sb = Sandbox::new();
+        let mut bytes = archive(&[]);
+        bytes.extend(std::iter::repeat_n(0u8, 1 << 20));
+        let e = extract_tar(
+            bytes.as_slice(),
+            &sb.root,
+            ExtractLimits::new(0, 0, 64 * 1024),
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+    }
+
+    /// 入力がちょうど上限バイトなら受理する（境界）。
+    #[test]
+    fn input_exactly_at_limit_is_accepted() {
+        let sb = Sandbox::new();
+        let bytes = archive(&[]);
+        let len = bytes.len() as u64;
+        extract_tar(bytes.as_slice(), &sb.root, ExtractLimits::new(0, 0, len)).unwrap();
+        let sb2 = Sandbox::new();
+        let e = extract_tar(
+            bytes.as_slice(),
+            &sb2.root,
+            ExtractLimits::new(0, 0, len - 1),
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+    }
+
     /// root が通常ファイルなら InvalidArgument。
     #[test]
     fn root_must_be_directory() {
         let sb = Sandbox::new();
         let f = sb.base.join("sentinel");
-        let e = extract_tar(archive(&[]).as_slice(), &f, ExtractLimits::new(1, 1)).unwrap_err();
+        let e = extract_tar(
+            archive(&[]).as_slice(),
+            &f,
+            ExtractLimits::new(1, 1, 1 << 30),
+        )
+        .unwrap_err();
         assert_eq!(e.code(), OciErrorCode::InvalidArgument);
     }
 

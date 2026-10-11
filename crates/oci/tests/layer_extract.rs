@@ -48,7 +48,8 @@ fn oci1_verify_then_extract() {
     std::fs::write(&blob, &z).unwrap();
 
     verify_blob_digest(&blob, &sha(&z), 1 << 20).unwrap();
-    let r = extract_layer_blob(&blob, &root, 1 << 20, ExtractLimits::new(10, 100)).unwrap();
+    let r =
+        extract_layer_blob(&blob, &root, 1 << 20, ExtractLimits::new(10, 100, 1 << 30)).unwrap();
     assert_eq!((r.entries, r.bytes), (2, 10));
     assert_eq!(
         std::fs::read(root.join("etc/os-release")).unwrap(),
@@ -58,7 +59,8 @@ fn oci1_verify_then_extract() {
 
     let root2 = base.join("root2");
     std::fs::create_dir_all(&root2).unwrap();
-    let e = extract_layer_blob(&blob, &root2, 1 << 20, ExtractLimits::new(1, 100)).unwrap_err();
+    let e = extract_layer_blob(&blob, &root2, 1 << 20, ExtractLimits::new(1, 100, 1 << 30))
+        .unwrap_err();
     assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
     std::fs::remove_dir_all(&base).unwrap();
 }

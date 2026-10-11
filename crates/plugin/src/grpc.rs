@@ -1075,16 +1075,17 @@ mod uds {
         } else {
             crate::transport::check_sun_path_len(path)
         };
-        let last_error = Arc::new(Mutex::new(None));
-        let connector = UdsConnector {
-            path: Arc::new(path.to_path_buf()),
-            expected_uid,
-            connect_timeout: config.connect_timeout,
-            observer: Arc::new(Mutex::new(observer)),
-            last_error: Arc::clone(&last_error),
-        };
         connect_recorded(config.connect_timeout, async {
+            // 検証を通る前に入力を複製しない（長さ上限検証 → アロケーションの順。巨大パスでの確保を防ぐ）。
             precheck?;
+            let last_error = Arc::new(Mutex::new(None));
+            let connector = UdsConnector {
+                path: Arc::new(path.to_path_buf()),
+                expected_uid,
+                connect_timeout: config.connect_timeout,
+                observer: Arc::new(Mutex::new(observer)),
+                last_error: Arc::clone(&last_error),
+            };
             // URI は connector が無視するダミー（HTTP/2 の :authority にだけ使われる）。
             let endpoint = Endpoint::from_shared("http://localhost")
                 .map_err(|_| PluginError::new(PluginErrorCode::Internal, "invalid endpoint"))?;

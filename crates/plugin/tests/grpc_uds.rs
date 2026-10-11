@@ -300,6 +300,15 @@ async fn uds_connect_errors_are_mapped_and_bounded() {
         let long = dir.0.join("x".repeat(200));
         let e = connect_uds_channel(&long, &cfg, obs()).await.unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::InvalidArgument, "{e:?}");
+        // NUL を含むパスと巨大パス（検証前に複製せず InvalidArgument。PLUG-2・REPAIR-5）。
+        let nul = Path::new(
+            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b"/tmp/a\0b.sock"),
+        );
+        let e = connect_uds_channel(nul, &cfg, obs()).await.unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::InvalidArgument, "{e:?}");
+        let huge = dir.0.join("y".repeat(1 << 20));
+        let e = connect_uds_channel(&huge, &cfg, obs()).await.unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::InvalidArgument, "{e:?}");
     })
     .await
     .expect("watchdog");

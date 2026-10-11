@@ -40,25 +40,36 @@ BAK_SUPERVISOR=""
 SUPERVISOR_DST=""
 # 1 のとき supervisor は置換済みで launcher は未置換（更新途中）。EXIT trap が旧 supervisor へ戻す。
 SUP_REPLACED=0
+# 1 のとき旧 supervisor の復元に失敗している（退避ファイルを残す）。
+RESTORE_FAILED=0
 # 更新途中の状態を旧 supervisor へ戻す（旧 launcher と新 supervisor の組み合わせを残さない）。
 restore_supervisor() {
   [ "${SUP_REPLACED}" -eq 1 ] || return 0
   # 復元中に再度シグナルを受けて中断しないよう、捕捉可能な信号を無視する（完遂を優先する）。
   trap '' INT HUP TERM
   if [ -n "${BAK_SUPERVISOR}" ]; then
-    mv -f -- "${BAK_SUPERVISOR}" "${SUPERVISOR_DST}" || true
-    BAK_SUPERVISOR=""
-  else
-    rm -f -- "${SUPERVISOR_DST}"
+    if mv -f -- "${BAK_SUPERVISOR}" "${SUPERVISOR_DST}"; then
+      BAK_SUPERVISOR=""
+    else
+      # 復元に失敗したら状態を消さない。退避ファイル（旧 supervisor）は削除せず場所を明示する。
+      RESTORE_FAILED=1
+      printf 'error: restore-failed: could not restore previous supervisor; it is kept at %s (new one at %s)\n' \
+        "${BAK_SUPERVISOR}" "${SUPERVISOR_DST}" >&2
+      return 0
+    fi
+  elif ! rm -f -- "${SUPERVISOR_DST}"; then
+    RESTORE_FAILED=1
+    printf 'error: restore-failed: could not remove new supervisor at %s\n' "${SUPERVISOR_DST}" >&2
+    return 0
   fi
-  # 復元の完了後にフラグを落とす（途中で再入しても復元をやり直せる順序）。
+  # 復元の成功後にだけフラグを落とす（途中で再入しても復元をやり直せる順序）。
   SUP_REPLACED=0
 }
 cleanup() {
   restore_supervisor
   [ -z "${TMP_LAUNCHER}" ] || rm -f -- "${TMP_LAUNCHER}"
   [ -z "${TMP_SUPERVISOR}" ] || rm -f -- "${TMP_SUPERVISOR}"
-  [ -z "${BAK_SUPERVISOR}" ] || rm -f -- "${BAK_SUPERVISOR}"
+  [ "${RESTORE_FAILED}" -eq 1 ] || [ -z "${BAK_SUPERVISOR}" ] || rm -f -- "${BAK_SUPERVISOR}"
 }
 trap cleanup EXIT
 # 捕捉可能な中断は終了コード付きで抜け、EXIT trap（cleanup）に復元させる。SIGKILL は捕捉できない。
@@ -137,23 +148,37 @@ CHILD_TIMEOUT=30
 # 期限つきで子を実行する。期限超過後 5 秒で KILL し、回収まで待つ。
 run_bounded() { timeout -k 5 "${CHILD_TIMEOUT}" "$@"; }
 
+# メタデータ検査（stat）も期限つきの子プロセスで行う（NFS / FUSE の停止で無期限に待たない。REPAIR-5）。結果は
+# STAT_OUT、失敗時の終了コードは STAT_RC に入れる。stat 固有の stderr は捨て、呼び出し側が構造化エラー 1 行にする。
+STAT_OUT=""
+STAT_RC=0
+stat_read() { # <stat の引数...>
+  STAT_OUT=""
+  STAT_RC=0
+  STAT_OUT="$(run_bounded stat "$@" 2>/dev/null)" || { STAT_RC=$?; return 1; }
+}
+
 # 入力元は 1 回だけ開き、開いた fd 自体を検査して同じ fd から複製する（検査後の再オープンによる TOCTOU を作らない）。
 # パスが symlink でないこと（lstat）と、fd の指す実体（fstat）が通常ファイルで lstat と同一 inode であることを確かめる。
 SRC_FD_LAUNCHER=""
 SRC_FD_SUPERVISOR=""
 open_source() { # <path> <fd 番号を入れる変数名>
-  local path="$1" fd lst fst
-  [ ! -L "${path}" ] || die 3 invalid-source "source must be a readable regular file and not a symlink"
-  # open 前に通常ファイルであることを確かめ、FIFO 等を open せずに拒否する（書き手のいない FIFO の open は無期限に止まる）。
-  [ -f "${path}" ] || die 3 invalid-source "source must be a readable regular file and not a symlink"
+  local path="$1" fd lst fst kind
+  # open 前に symlink でない通常ファイルであることを期限つき stat（lstat）で確かめ、FIFO 等を open せずに拒否する
+  # （書き手のいない FIFO の open は無期限に止まる）。
+  stat_read -c '%F' -- "${path}" || die 3 invalid-source "cannot stat source (exit code ${STAT_RC})"
+  kind="${STAT_OUT}"
+  [ "${kind}" = "regular file" ] || die 3 invalid-source "source must be a readable regular file and not a symlink"
   # 事前検査と open の間の差し替え競合に備え、open 自体にも期限を付ける（REPAIR-5）。この時点では一時ファイルも
   # 更新途中の状態も無いため、期限切れは watchdog が KILL して終了してよい。
   ( sleep "${CHILD_TIMEOUT}" && { printf 'error: source-open-timeout: opening source timed out\n' >&2; kill -KILL $$; } ) &
   local wd=$!
   { exec {fd}<"${path}"; } 2>/dev/null || { kill "${wd}" 2>/dev/null || true; die 3 invalid-source "source must be a readable regular file and not a symlink"; }
   kill "${wd}" 2>/dev/null || true
-  lst="$(stat -c '%F %d:%i' -- "${path}")" || die 3 invalid-source "cannot stat source"
-  fst="$(stat -L -c '%F %d:%i' -- "/proc/self/fd/${fd}")" || die 3 invalid-source "cannot stat opened source"
+  stat_read -c '%F %d:%i' -- "${path}" || die 3 invalid-source "cannot stat source (exit code ${STAT_RC})"
+  lst="${STAT_OUT}"
+  stat_read -L -c '%F %d:%i' -- "/proc/self/fd/${fd}" || die 3 invalid-source "cannot stat opened source (exit code ${STAT_RC})"
+  fst="${STAT_OUT}"
   if [ "${lst}" != "${fst}" ] || [ "${fst%% [0-9]*}" != "regular file" ]; then
     die 3 invalid-source "source must be a readable regular file and not a symlink"
   fi
@@ -168,7 +193,8 @@ check_dir() { # <path>
   if [ -L "${p}" ] || [ ! -d "${p}" ]; then
     die 3 untrusted-dest-dir "not a plain directory: ${p}"
   fi
-  info="$(stat -c '%u %a' -- "${p}")"
+  stat_read -c '%u %a' -- "${p}" || die 3 untrusted-dest-dir "cannot stat ${p} (exit code ${STAT_RC})"
+  info="${STAT_OUT}"
   uid="${info%% *}"
   mode="${info##* }"
   [ "${uid}" = "${TRUSTED_UID}" ] || die 3 untrusted-dest-dir "not owned by the trusted owner: ${p}"
@@ -242,7 +268,8 @@ expect_launcher_caps() { # <file>
 # 所有者と権限ビットの読み戻し。gid は信頼する所有者が root のとき（本番）のみ照合する。
 expect_stat() { # <file> <mode>
   local info
-  info="$(stat -c '%u %g %a' -- "$1")"
+  stat_read -c '%u %g %a' -- "$1" || die 1 install-failed "cannot stat $1 (exit code ${STAT_RC})"
+  info="${STAT_OUT}"
   [ "${info%% *}" = "${TRUSTED_UID}" ] || die 1 install-failed "owner mismatch on $1"
   [ "${info##* }" = "$2" ] || die 1 install-failed "mode mismatch on $1"
   if [ "${TRUSTED_UID}" = "0" ]; then
@@ -319,7 +346,7 @@ if ! mv -f -- "${TMP_LAUNCHER}" "${LAUNCHER_DST}"; then
   trap 'exit 130' INT
   trap 'exit 129' HUP
   trap 'exit 143' TERM
-  die 1 install-failed "rename failed (previous supervisor restored)"
+  die 1 install-failed "rename failed"
 fi
 TMP_LAUNCHER=""
 SUP_REPLACED=0

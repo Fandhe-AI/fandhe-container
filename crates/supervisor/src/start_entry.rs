@@ -611,8 +611,12 @@ fn settle_failed_start(
     deadline: Option<Instant>,
 ) -> bool {
     // 状態の読み取り（ロック待ちの最悪時間）も期限に含める。収まらなければ確かめられなかった扱い。
+    // 引き取った未回収ハンドルは `Drop` で捨てず保管する（`Drop` は回収しない。CORE-1・REPAIR-5）。
     if !fits(deadline, STATE_LOCK_TIMEOUT) {
         log_event("start_settle_budget_exhausted", Some(ErrorCode::Timeout));
+        for p in pending.into_iter().chain(take_unreaped_processes()) {
+            keep_stranded(p);
+        }
         return false;
     }
     let reverted = store
@@ -1111,6 +1115,72 @@ mod linux {
 mod tests {
     use super::*;
     use crate::start_contract::result_deadline;
+
+    /// 回収されずに捨てられたかを数える起動ハンドル。
+    struct DropCounted(Arc<std::sync::atomic::AtomicU32>);
+
+    impl LaunchedProcess for DropCounted {
+        fn pid(&self) -> NonZeroU32 {
+            NonZeroU32::MIN
+        }
+        fn wait(
+            &self,
+            _: Duration,
+        ) -> Result<Option<fandhe_container_core::oci_runtime::ProcessExit>, TraitError> {
+            Ok(None)
+        }
+        fn terminate(&self, _: Duration) -> Result<(), TraitError> {
+            Ok(())
+        }
+    }
+
+    impl Drop for DropCounted {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    struct NoLauncher;
+
+    impl ProcessLauncher for NoLauncher {
+        fn launch(
+            &self,
+            _: &LaunchSpec,
+            _: Duration,
+        ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "no launcher"))
+        }
+    }
+
+    /// CORE-1・REPAIR-5: 状態の読み取りが期限に収まらず回復を諦めるときも、引き取った未回収ハンドルを捨てず保管する。
+    #[test]
+    fn core1_settle_budget_miss_keeps_pending_handles() {
+        let root = std::env::temp_dir().join(format!("fcsup-settle-budget-{}", std::process::id()));
+        let store = crate::state::open_default_store(Some(root.clone())).expect("store");
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(NoLauncher);
+        let dropped = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let expired = Instant::now().checked_sub(Duration::from_secs(1));
+        let before = STRANDED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        let settled = settle_failed_start(
+            store.as_ref(),
+            &launcher,
+            &ContainerId::new("c1").unwrap(),
+            &StartTimeouts::default(),
+            vec![Box::new(DropCounted(Arc::clone(&dropped)))],
+            expired,
+        );
+        assert!(!settled);
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let after = STRANDED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        assert!(after > before, "before = {before}, after = {after}");
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     /// REPAIR-5: 既定値の見積もり（回復 1 回 = get / update のロック待ち 2 × 5s ＋ confirm 10s ＋ 猶予 1s）。
     #[test]

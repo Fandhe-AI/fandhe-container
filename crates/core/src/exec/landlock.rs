@@ -281,32 +281,10 @@ pub(super) fn run_probe(p: &LandlockAccessProbe) -> Option<i32> {
     res.err().map(|e| e.raw_os_error().unwrap_or(-1))
 }
 
-/// [`LandlockAccessKind::MakeCharDevice`] の本体。親ディレクトリを `O_PATH|O_NOFOLLOW|O_DIRECTORY` で開き、
-/// その fd 起点で最終要素に 1:3 の文字デバイス（モード 0666）を作る。成功は `None`、失敗は `Some(errno)`
-/// （親・名前が取れない・NUL を含む・対応外アーキテクチャは `-1`）。`O_NOFOLLOW` が効くのは親の最終要素だけで、
-/// 親までの中間要素の symlink は辿る（結合試験が固定のリストで渡すパス専用で、外部入力は受けない）。
+/// [`LandlockAccessKind::MakeCharDevice`] の本体。1:3 の文字デバイス（モード 0666）を `path` に作る
+/// （`device_probe::make_char_device_errno` の 1:3 固定の呼び出し）。成功は `None`、失敗は `Some(errno)`。
 fn make_char_device_probe(path: &std::path::Path) -> Option<i32> {
-    use std::os::unix::ffi::OsStrExt as _;
-    let errno = |e: sys::SysError| match e {
-        sys::SysError::Os(e) => e,
-        _ => -1,
-    };
-    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
-        return Some(-1);
-    };
-    let (Ok(parent), Ok(name)) = (
-        std::ffi::CString::new(parent.as_os_str().as_bytes()),
-        std::ffi::CString::new(name.as_bytes()),
-    ) else {
-        return Some(-1);
-    };
-    let dir = match sys::open_dir_path_nofollow(None, &parent) {
-        Ok(fd) => fd,
-        Err(e) => return Some(errno(e)),
-    };
-    sys::make_char_device(std::os::fd::AsFd::as_fd(&dir), &name, 0o666, 1, 3)
-        .err()
-        .map(errno)
+    super::device_probe::make_char_device_errno(path, 1, 3)
 }
 
 fn from_landlock_apply(e: LandlockApplyError) -> ExecError {

@@ -34,6 +34,8 @@
 //! `execveat(2)` の `AT_EXECVE_CHECK`（`syscall(2)` 経由。Linux 6.14 以降）と、元のファイルのマウントの `noexec` を
 //! 見る `fstatfs(2)` を呼ぶ。実行そのものは既存の `execveat(2)`（`exec_fd`）を使う。
 //! 基本デバイスノード作成は、`mknodat(2)`・`O_PATH` での `openat(2)` を呼ぶために使う。
+//! デバイス cgroup の層ごとの実機照合（TASK-32 追補・#1681）は、`ptmx` を開いた pty の slave を開けるよう
+//! `ioctl(2)`（`TIOCSPTLCK`・`TIOCGPTN`）を呼ぶ（`pty_unlock_and_index`）。
 //! 委譲 cgroup の検出と子 cgroup 作成（`crate::cgroups`。CORE-3・TASK-32.1・#158）は、
 //! `mkdirat(2)`・`unlinkat(2)`・`fstatfs(2)`（cgroup2 判定）と `O_NOFOLLOW` 付きの `openat(2)` を呼ぶために使う。
 //! rlimit の適用（`exec/rlimits.rs` の `apply_rlimits`。SUP-12・TASK-169.1・#526）は、fork 後の子で `prlimit(2)` を呼ぶために使う。
@@ -308,6 +310,12 @@ mod consts {
     pub const O_RDWR: i32 = 2;
     // include/uapi/asm-generic/fcntl.h の `O_NOCTTY`（x86_64 は上書きしない。TASK-163 追補・#1459）。
     pub const O_NOCTTY: i32 = 0o400;
+    // include/uapi/asm-generic/ioctls.h の `TIOCGPTN`（_IOR('T', 0x30, unsigned int)）と
+    // `TIOCSPTLCK`（_IOW('T', 0x31, int)）。x86_64 は asm/ioctls.h が asm-generic を取り込むだけで上書きしない。
+    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
+    pub const TIOCGPTN: u64 = 0x8004_5430;
+    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
+    pub const TIOCSPTLCK: u64 = 0x4004_5431;
     // include/uapi/asm-generic/fcntl.h の `O_RDONLY`・`O_WRONLY`（全アーキテクチャ共通）。
     pub const O_RDONLY: i32 = 0;
     pub const O_WRONLY: i32 = 1;
@@ -566,6 +574,12 @@ mod consts {
     // include/uapi/asm-generic/fcntl.h の `O_NOCTTY`（arm64 の arch/arm64/include/uapi/asm/fcntl.h は
     // `O_DIRECTORY`・`O_NOFOLLOW`・`O_DIRECT`・`O_LARGEFILE` だけを上書きし、`O_NOCTTY` は上書きしない）。
     pub const O_NOCTTY: i32 = 0o400;
+    // include/uapi/asm-generic/ioctls.h の `TIOCGPTN`（_IOR('T', 0x30, unsigned int)）と
+    // `TIOCSPTLCK`（_IOW('T', 0x31, int)）。arm64 は asm/ioctls.h が asm-generic を取り込むだけで上書きしない。
+    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
+    pub const TIOCGPTN: u64 = 0x8004_5430;
+    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
+    pub const TIOCSPTLCK: u64 = 0x4004_5431;
     // include/uapi/asm-generic/fcntl.h の `O_RDONLY`・`O_WRONLY`（全アーキテクチャ共通）。
     pub const O_RDONLY: i32 = 0;
     pub const O_WRONLY: i32 = 1;
@@ -806,6 +820,10 @@ mod consts {
     pub const O_NONBLOCK: i32 = 0;
     pub const O_RDWR: i32 = 0;
     pub const O_NOCTTY: i32 = 0;
+    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
+    pub const TIOCGPTN: u64 = 0;
+    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
+    pub const TIOCSPTLCK: u64 = 0;
     pub const O_RDONLY: i32 = 0;
     pub const O_WRONLY: i32 = 0;
     pub const O_CREAT: i32 = 0;
@@ -1002,6 +1020,10 @@ unsafe extern "C" {
     fn mknodat(dirfd: i32, path: *const core::ffi::c_char, mode: u32, dev: u64) -> i32;
     // SAFETY（宣言そのものの妥当性）: `uid_t geteuid(void)`（Linux の `uid_t` は u32）。
     fn geteuid() -> u32;
+    // SAFETY（宣言そのものの妥当性）: `int ioctl(int fd, unsigned long request, ...)`（glibc。musl は
+    // `request` が `int`）。可変長引数として宣言する（非可変長で宣言して呼ぶと、可変長引数の渡し方が
+    // 異なる ABI で未定義動作になる）。`c_ulong` は LP64 で u64。pty の unlock と番号の取得だけに使う。
+    fn ioctl(fd: i32, request: u64, ...) -> i32;
     // SAFETY（宣言そのものの妥当性）: `gid_t getegid(void)`（Linux の `gid_t` は u32）。
     fn getegid() -> u32;
     // SAFETY（宣言そのものの妥当性）: `pid_t fork(void)`（Linux の `pid_t` は i32）。
@@ -4036,6 +4058,48 @@ pub(crate) fn noctty_open_flag() -> Option<i32> {
     consts::SUPPORTED.then_some(consts::O_NOCTTY)
 }
 
+/// pty の master を開いた `fd` の slave をロック解除し（`TIOCSPTLCK` = 0）、slave の番号（`/dev/pts/<N>` の N。
+/// `TIOCGPTN`）を返す。
+///
+/// 結合試験用の観測（`crate::exec` の `open_pty_slave_for_test`。TASK-32 追補・#1681）が、`/dev/ptmx` を開いた
+/// 直後の slave（`ptmx_open` が `TTY_PTY_LOCK` を立てるため、解除前の open は `EIO`）を、デバイス cgroup の
+/// 許可リスト（c 136:*）の照合のために開けるようにする。`TIOCGPTPEER` は `may_open` を通らず照合にならないため使わない。
+/// 副作用はその pty のロック解除だけ。対応外アーキテクチャでは `Unsupported`（fail-closed）。
+#[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
+pub(crate) fn pty_unlock_and_index(master: BorrowedFd<'_>) -> Result<u32, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let unlock: i32 = 0;
+    // SAFETY: `master` は生存中の `BorrowedFd`。`TIOCSPTLCK` はスタック上の `i32` を指すポインタを取り、
+    // カーネルはそこから 4 バイトを読むだけ（`unlock` は呼び出しの間生存し、読み取り専用で渡す）。
+    // 他の副作用は対象 pty のロックの解除だけ。
+    let rc = unsafe {
+        ioctl(
+            master.as_raw_fd(),
+            consts::TIOCSPTLCK,
+            std::ptr::from_ref(&unlock),
+        )
+    };
+    if rc == -1 {
+        return Err(last_error());
+    }
+    let mut index: u32 = 0;
+    // SAFETY: `master` は生存中の `BorrowedFd`。`TIOCGPTN` はスタック上の `u32` を指す書き込み可能な
+    // ポインタを取り、カーネルはそこへ 4 バイトだけを書く（`index` は呼び出しの間生存する）。
+    let rc = unsafe {
+        ioctl(
+            master.as_raw_fd(),
+            consts::TIOCGPTN,
+            std::ptr::from_mut(&mut index),
+        )
+    };
+    if rc == -1 {
+        return Err(last_error());
+    }
+    Ok(index)
+}
+
 /// `O_NONBLOCK | O_NOFOLLOW | O_DIRECTORY`。親ディレクトリを 1 要素ずつ symlink 非追従で開くための値。
 ///
 /// `crate::open_flags` が呼ぶ。対応外アーキテクチャでは `None`（fail-closed）。`unsafe` を含まない。
@@ -6378,5 +6442,54 @@ mod tests {
         umount_detach_at(&target_c).expect("detach attached mount");
         std::fs::remove_dir_all(&dir).expect("remove temp dir after detach");
         assert!(!dir.exists(), "temp dir must be removed");
+    }
+
+    /// SEC-1・TASK-32 追補（#1681）: pty の ioctl 番号の固定値（x86_64・aarch64 とも asm-generic の値）。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn sec1_task32_pty_ioctl_consts_are_exact() {
+        assert_eq!(consts::TIOCGPTN, 0x8004_5430);
+        assert_eq!(consts::TIOCSPTLCK, 0x4004_5431);
+    }
+
+    /// SEC-1・TASK-32 追補（#1681）: `/dev/ptmx` を開いて unlock と番号の取得ができ、返った番号の
+    /// `/dev/pts/<N>`（slave）を開ける（unlock 前は `EIO`）。特権を要さず非 root で動く。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn sec1_task32_pty_unlock_and_index_opens_slave() {
+        use std::os::fd::AsFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let master = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(consts::O_NOCTTY)
+            .open("/dev/ptmx")
+            .expect("open /dev/ptmx");
+        let index = pty_unlock_and_index(master.as_fd()).expect("unlock and index");
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(consts::O_NOCTTY)
+            .open(format!("/dev/pts/{index}"))
+            .expect("open unlocked slave");
+        drop(slave);
+    }
+
+    /// 非 pty の fd への ioctl は `ENOTTY`（25）で失敗し、値を返さない。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn sec1_task32_pty_unlock_on_regular_file_is_enotty() {
+        use std::os::fd::AsFd as _;
+        let f = std::fs::File::open("/proc/self/status").expect("open");
+        assert_eq!(pty_unlock_and_index(f.as_fd()), Err(SysError::Os(25)));
     }
 }

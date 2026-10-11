@@ -53,6 +53,47 @@ exec のコマンドは、コンテナ cgroup（`<scope>/fc-<id>@<instance>`）�
 - 名前は `exec-` 接頭辞で、コンテナ用の `fc-` と衝突しない（`Pid1Target` の cgroup 完全一致照合に影響しない）
 - 実装は `crates/core/src/cgroups/exec_kill.rs`・`crates/core/src/exec/cgroup_join.rs`。実機前提テストは `crates/core/tests/exec_cgroup_kill.rs`（AGENTS.md）
 
+## デバイス cgroup（`BPF_CGROUP_DEVICE`。SEC-1・CORE-4・TASK-32 追補・#1677〜#1681）
+
+GPU 以外のコンテナでも、許可リスト外のデバイスノードの open と `mknod` を止める。`CAP_MKNOD` は rootful の既定に残すため（オーナー判断 2026-10-10）、`mknod` と既存ノードの open を止める多層防御を層ごとに実機で照合する。
+
+### 既定の許可リスト
+
+OCI の default devices と同じ固定表（`DeviceAllowList::oci_default()`。#1678）。アクセスはすべて `rwm`。表にないもの（ブロックデバイス・c 5:1 console・c 10:200 tun・c 10:229 fuse 等）はすべて拒否する。mknod（`m`）も表にあるものだけに許し、runc の `c *:* m`・`b *:* m` は採らない。
+
+| 種別 | major:minor | 名前 |
+| ---- | ----------- | ---- |
+| c | 1:3 | null |
+| c | 1:5 | zero |
+| c | 1:7 | full |
+| c | 1:8 | random |
+| c | 1:9 | urandom |
+| c | 5:0 | tty |
+| c | 5:2 | ptmx |
+| c | 136:* | pts（devpts の slave） |
+
+### 付け方
+
+- `BPF_PROG_ATTACH`・attach flags 0 で付ける。子孫の `exec-*` は上書きも追加もできず、祖先の実効集合で継承される（`exec-*` 自身には付かない）。`BPF_LINK_CREATE` は使わない（CORE-1）
+- 付ける前に問い合わせ、既存のプログラムがあれば拒否する。祖先の `BPF_F_ALLOW_MULTI`・`BPF_F_ALLOW_OVERRIDE` の扱いは `crates/core/src/cgroups/device_policy.rs` のモジュール doc を参照する
+- rootless では適用しない（`DevicePolicyOutcome::NotApplied(Rootless)`。失敗にはしない）。ロードに init user namespace の `CAP_BPF`+`CAP_NET_ADMIN`（または `CAP_SYS_ADMIN`）が要り、BPF token を使わないため。rootless ではホストのノードの bind（#1660）・rootfs の `nodev`（#1676）・Landlock が残る（SEC-5）
+- ローダーは core（`sys::bpf`・`cgroups::device_policy`）に置き、gpu が再利用する。GPU 付きのコンテナは既定の表に CDI の `deviceNodes` を足す（#562・TASK-129）
+
+### 層の一覧
+
+| 層 | 止めるもの | errno | 照合する試験 |
+| -- | ---------- | ----- | ------------ |
+| rootfs の自己 bind の `nodev`（#1676） | rootfs の `/dev` 以外にあるノードの open | `EACCES`（13） | `tests/default_devices.rs`・`tests/device_cgroup_layers.rs` |
+| `/dev` の専用 tmpfs（#1653。`nodev` なし） | 基本の 6 種と devpts だけを置く供給の層（制限は下の 2 層が担う） | — | `tests/default_devices.rs` |
+| Landlock（#1657・PR #1675） | `/dev`・`/dev/shm` での `mknod`（`MAKE_CHAR`） | `EACCES`（13） | `tests/landlock_implicit_dev.rs` |
+| デバイス cgroup（#1680） | 許可リスト外の open と `mknod` | `EPERM`（1） | `tests/device_cgroup_layers.rs`（実機・root）・`tests/cgroup_device_policy_rootful.rs`／`_rootless.rs`（入口）・`tests/cgroup_device_program.rs`（評価器。ブロックデバイスの拒否は実機の試験になく、ここで照合する） |
+
+- 順序: open は `fs/namei.c` の `may_open()` が `may_open_dev()`（`MNT_NODEV`）を `inode_permission()` 内の `devcgroup_inode_permission()` より先に評価するため、nodev の `EACCES` がデバイス cgroup の `EPERM` より先に働く。許可リストにない c 120:0 を rootfs の `opt/` で開いても `EPERM` ではなく `EACCES` になる
+- `mknod`: `vfs_mknod()` が `CAP_MKNOD`（`EPERM`）の後に `devcgroup_inode_mknod()`（`EPERM`）を評価する。試験は root（`CAP_MKNOD` あり）で行うため `EPERM` はデバイス cgroup 由来で、許可リストにある c 1:3 の `mknod` が成功することを対照にする
+- errno で層を区別できるのは Landlock を適用しない構成に限る（Landlock も `EACCES` を返すため）。`tests/device_cgroup_layers.rs` は Landlock・seccomp を適用しない
+- 試験用の major に 120 を使う理由: 当初想定の 240 はカーネルの動的 major 割り当て（`find_dynamic_major()` は 254 から 234 へ向けて割り当てる）と重なり、開発ホストの `/proc/devices` にも `240 ttyDBC` が実在した。devices.txt で char 120-127 は LOCAL/EXPERIMENTAL USE で動的割り当ての範囲の外にある
+- 実機での実行は人間担当で、結果は #1621 に記録する（AGENTS.md「実機前提テスト」）
+
 ## 関連・後続
 
 - TASK-35（SEC-6・CORE-4）で release_agent 悪用手法の無効化確認を記録する。本書は当該確認が済んでいるとは主張しない

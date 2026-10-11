@@ -37,6 +37,8 @@ include-dev = true
 # ここに無い識別子の追加は依存追加のユーザー承認
 # （dependency-policy.md）とセットで行い、コピーレフト（GPL/LGPL/MPL 等）は列挙しない
 # ことで fail-closed に検出する。
+# この fail-closed は `make deny-license-fail-closed-selftest`（scripts/deny-license-fail-closed-selftest.sh）が
+# 使い捨て workspace で機械的に確認する（TASK-90.2・#127）。
 allow = [
   "MIT",
   "Apache-2.0",

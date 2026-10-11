@@ -142,11 +142,12 @@ pub use devices::{
     DeviceLinkOutcome, DeviceLinkStatus, DeviceNodeOutcome, DeviceNodeStatus, DeviceReport,
     DevptsDirStatus, DevptsGidSource, DevptsOutcome, create_default_devices,
 };
-/// 封印した複製の上限（結合試験が上限超過を再現するための再公開。TASK-163 追補・#1531）。
+/// 待たない診断ログ出力の再公開（止まった stderr で呼び出し側を止めない。#1697）。
 pub use diagnostic::{
     DiagnosticDelivery, DiagnosticDropReason, MAX_DIAGNOSTIC_LINE, emit_diagnostic_line,
     emit_diagnostic_line_to,
 };
+/// 封印した複製の上限（結合試験が上限超過を再現するための再公開。TASK-163 追補・#1531）。
 pub use entrypoint_mode::{EntrypointExecMode, IntegrityLsm, PathBoundLsm, SealedCopyUnavailable};
 pub use exec_command::{ExecChild, ExecWorkerProof, spawn_exec_command, spawn_exec_worker};
 pub use inject::{InjectReport, InjectedDirectoryOutcome, InjectedFileOutcome, inject_files};

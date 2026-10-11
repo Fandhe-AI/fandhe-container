@@ -10,6 +10,7 @@
 //! 都度起動モード（`lifecycle`。TASK-110.1・#258）と
 //! OS 別 RSS サンプラー（`rss`。TASK-112.1・#265）と
 //! 起動中 plugin の登録表と親が受けたシグナルの転送 API（`signal_forward`。#1513・PLUG-7）と
+//! `ChildGuard` の `Drop` で書けなかった後始末の失敗記録の延期表と取り出し API・ブロックしないと保証できる場合だけの stderr 書き込み（`lifecycle`。#1673・REPAIR-4・REPAIR-5）と
 //! XDG 未設定時のフォールバック（TASK-123.4・#289）と常駐モード（`lifecycle`。TASK-110.2・#259）のみ実装済み。
 //! モード選択 API（`lifecycle`。TASK-110.3・#260）は実装済み。gRPC と
 //! PLUG-12 の peer 認証（TASK-124）は Linux の SO_PEERCRED（`uds_security::verify_peer`。TASK-124.1・#292）と
@@ -51,14 +52,16 @@ pub use frame::{
     MAX_PAYLOAD_LEN, PROTOCOL_VERSION, PayloadLen,
 };
 pub use lifecycle::{
-    ONE_SHOT_ARGS_MAX_BYTES, ONE_SHOT_ARGS_MAX_COUNT, ONE_SHOT_EXIT_TIMEOUT, ONE_SHOT_REAP_TIMEOUT,
-    ONE_SHOT_STDERR_DRAIN_TIMEOUT, ONE_SHOT_STDERR_MAX_BYTES, ONE_SHOT_STDERR_STOP_TIMEOUT,
-    ONE_SHOT_TIMEOUT_DEFAULT, ONE_SHOT_TIMEOUT_MAX, OneShotOutcome, OneShotPlugin, OneShotRecord,
-    OneShotStderr, OneShotSummary, OneShotTermination, OneShotTimeout, PLUGIN_SOCKET_ENV,
+    ChildCleanupFailure, DROP_REPORT_CAPACITY, ONE_SHOT_ARGS_MAX_BYTES, ONE_SHOT_ARGS_MAX_COUNT,
+    ONE_SHOT_EXIT_TIMEOUT, ONE_SHOT_REAP_TIMEOUT, ONE_SHOT_STDERR_DRAIN_TIMEOUT,
+    ONE_SHOT_STDERR_MAX_BYTES, ONE_SHOT_STDERR_STOP_TIMEOUT, ONE_SHOT_TIMEOUT_DEFAULT,
+    ONE_SHOT_TIMEOUT_MAX, OneShotOutcome, OneShotPlugin, OneShotRecord, OneShotStderr,
+    OneShotSummary, OneShotTermination, OneShotTimeout, PLUGIN_SOCKET_ENV, PendingChildCleanup,
     PluginCallOutcome, PluginCallRecord, PluginMode, PluginModeKind, PluginSession,
     PluginSessionShutdown, RESIDENT_EXIT_DETECT_TIMEOUT, RESIDENT_START_TIMEOUT_DEFAULT,
     RESIDENT_START_TIMEOUT_MAX, ResidentCallRecord, ResidentPlugin, ResidentShutdown,
     ResidentShutdownError, ResidentStartTimeout, ResidentState, call_once, call_once_observed,
+    take_pending_child_cleanup_failures, write_stderr_nonblocking,
 };
 pub use message::{ControlMessage, MessageId, decode_message, encode_message};
 pub use rss::{RssSample, RssSource};

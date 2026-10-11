@@ -35,7 +35,8 @@
 //! - Linux（x86_64 / aarch64）: ブロックしないことを保証できる AF_UNIX の socket（`getsockopt(SO_DOMAIN)` で判定し
 //!   `send(MSG_DONTWAIT | MSG_NOSIGNAL)`。パス解決・`fstat`・fd の複製をしない）でだけ fd へ書く（`write_nonblocking`。
 //!   `ChildGuard::drop` の診断出力がブロックしない。#1605）。AF_UNIX 以外の socket（TCP 等）・socket 以外と、macOS を
-//!   含むそれ以外の OS は保証できる経路が無いため常に捨てる（`Unsupported`）
+//!   含むそれ以外の OS は保証できる経路が無いため常に書かず `Unsupported` を返す（呼び出し側が記録を延期表へ積み、
+//!   ホストが終了時に出す。#1673）
 //! - Linux（x86_64 / aarch64）・macOS: `waitid(2)`（`WEXITED | WNOHANG | WNOWAIT`。`probe_child_exit`。自発終了した plugin を回収せずに
 //!   観測し、グループへ送ってから回収するため。#1604・PLUG-7・REPAIR-5。それ以外は `Unsupported`）
 //! - いずれの unix: `kill(2)` で起動中の plugin へ SIGINT・SIGTERM・SIGHUP を転送する（`send_signal`。

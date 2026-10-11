@@ -365,7 +365,7 @@ fn is_public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_public_v4(v4),
         IpAddr::V6(v6) => {
-            let s = v6.segments();
+            let [s0, s1, s2, s3, s4, s5, s6, s7] = v6.segments();
             if v6.is_unspecified() || v6.is_loopback() || v6.is_multicast() {
                 return false;
             }
@@ -374,30 +374,30 @@ fn is_public_ip(ip: IpAddr) -> bool {
                 let [c, d] = lo.to_be_bytes();
                 is_public_v4(Ipv4Addr::new(a, b, c, d))
             };
-            if s[..6] == [0, 0, 0, 0, 0, 0xffff] || s[..6] == [0; 6] {
+            if [s0, s1, s2, s3, s4, s5] == [0, 0, 0, 0, 0, 0xffff]
+                || [s0, s1, s2, s3, s4, s5] == [0; 6]
+            {
                 // ::ffff:a.b.c.d（v4-mapped）と ::a.b.c.d（v4-compatible）。
-                return embedded(s[6], s[7]);
+                return embedded(s6, s7);
             }
-            if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+            if [s0, s1, s2, s3, s4, s5] == [0x64, 0xff9b, 0, 0, 0, 0] {
                 // 64:ff9b::/96（well-known NAT64。RFC 6052）。埋め込まれた IPv4 を検査する。
                 // 64:ff9b:1::/48（local-use NAT64。RFC 8215）は下の 2000::/3 判定で拒否される。
-                return embedded(s[6], s[7]);
+                return embedded(s6, s7);
             }
             // fail-closed: グローバルユニキャスト 2000::/3 以外（ULA・リンクローカル・サイトローカル・
             // local-use NAT64・SRv6 SID・予約等）はすべて非公開として扱う。
-            if s[0] & 0xe000 != 0x2000 {
+            if s0 & 0xe000 != 0x2000 {
                 return false;
             }
             // 2001::/23（IETF プロトコル割り当て。Teredo 2001::/32 を含む）・2001:db8::/32（文書化用）・
             // 3fff::/20（文書化用。RFC 9637）。
-            if (s[0] == 0x2001 && (s[1] < 0x0200 || s[1] == 0x0db8))
-                || (s[0] == 0x3fff && s[1] < 0x1000)
-            {
+            if (s0 == 0x2001 && (s1 < 0x0200 || s1 == 0x0db8)) || (s0 == 0x3fff && s1 < 0x1000) {
                 return false;
             }
-            if s[0] == 0x2002 {
+            if s0 == 0x2002 {
                 // 2002::/16（6to4）。
-                return embedded(s[1], s[2]);
+                return embedded(s1, s2);
             }
             true
         }
@@ -576,6 +576,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     type SeenRequest = (String, Vec<(String, String)>, bool, Option<u64>);
 
@@ -818,21 +819,57 @@ mod tests {
         assert!(!tok.is_expired(Instant::now()));
     }
 
+    /// `serve_once` のサーバースレッドの回収用ガード。drop で停止を通知して join する
+    /// （接続が来なかったテストでもスレッドを残さない。REPAIR-5）。
+    struct ServerGuard {
+        stop: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for ServerGuard {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
     /// 1 接続だけ受けて、要求ヘッダを読み、`respond` の返す生の応答を書いて閉じる使い捨てサーバー。
-    fn serve_once(respond: impl FnOnce(&str) -> Vec<u8> + Send + 'static) -> String {
+    /// accept は非ブロッキングの定期確認で 10 秒の期限と停止通知を持ち、読み書きにも期限を付ける（REPAIR-5）。
+    fn serve_once(respond: impl FnOnce(&str) -> Vec<u8> + Send + 'static) -> (String, ServerGuard) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
         let port = listener.local_addr().expect("addr").port();
-        std::thread::spawn(move || {
-            if let Ok((mut s, _)) = listener.accept() {
-                let mut buf = [0u8; 4096];
-                let n = s.read(&mut buf).unwrap_or(0);
-                let head = String::from_utf8_lossy(buf.get(..n).unwrap_or(&[])).to_string();
-                let out = respond(&head);
-                let _ = s.write_all(&out);
-                let _ = s.flush();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_in = stop.clone();
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !stop_in.load(Ordering::SeqCst) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        let _ = s.set_nonblocking(false);
+                        let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+                        let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
+                        let mut buf = [0u8; 4096];
+                        let n = s.read(&mut buf).unwrap_or(0);
+                        let head = String::from_utf8_lossy(buf.get(..n).unwrap_or(&[])).to_string();
+                        let out = respond(&head);
+                        let _ = s.write_all(&out);
+                        let _ = s.flush();
+                        return;
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
             }
         });
-        format!("http://127.0.0.1:{port}/token")
+        (
+            format!("http://127.0.0.1:{port}/token"),
+            ServerGuard {
+                stop,
+                handle: Some(handle),
+            },
+        )
     }
 
     /// テスト用: 平文 HTTP を許す（本番経路は https_only 固定）以外は本番と同じ設定の通信。
@@ -871,7 +908,7 @@ mod tests {
     #[test]
     fn ureq_transport_sends_query_and_reads_body() {
         let (tx, rx) = std::sync::mpsc::channel::<String>();
-        let url = serve_once(move |head| {
+        let (url, _srv) = serve_once(move |head| {
             let _ = tx.send(head.to_string());
             http_ok(r#"{"token":"t"}"#)
         });
@@ -897,7 +934,7 @@ mod tests {
     /// OCI-1・SEC: リダイレクトは追従せず、成功扱いにもしない。
     #[test]
     fn ureq_transport_does_not_follow_redirects() {
-        let url = serve_once(|_| {
+        let (url, _srv) = serve_once(|_| {
             b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
         });
         let t = loopback_transport(&RegistryClientConfig::default());
@@ -910,7 +947,7 @@ mod tests {
     /// OCI-1・REPAIR-5: 本文が上限を超えれば ResourceExhausted。
     #[test]
     fn ureq_transport_enforces_body_limit() {
-        let url = serve_once(|_| http_ok(&"a".repeat(2000)));
+        let (url, _srv) = serve_once(|_| http_ok(&"a".repeat(2000)));
         let t = loopback_transport(&RegistryClientConfig::default());
         let e = get(&t, &url, Some(1000), Duration::from_secs(5)).expect_err("limit");
         assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
@@ -919,7 +956,7 @@ mod tests {
     /// OCI-1・REPAIR-5: 応答が来なければ全体期限で Timeout。
     #[test]
     fn ureq_transport_times_out() {
-        let url = serve_once(|_| {
+        let (url, _srv) = serve_once(|_| {
             std::thread::sleep(Duration::from_secs(3));
             Vec::new()
         });
@@ -931,7 +968,7 @@ mod tests {
     /// OCI-1・SEC: 公開 IP のみの経路は、ループバックへ解決されるホストへ接続しない（SSRF）。
     #[test]
     fn public_only_agent_refuses_loopback() {
-        let url = serve_once(|_| Vec::new());
+        let (url, _srv) = serve_once(|_| Vec::new());
         let config = RegistryClientConfig::default();
         let agent = build_agent(
             &config,

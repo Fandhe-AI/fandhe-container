@@ -4,7 +4,7 @@
 //! イメージ参照の検証と正規化（`reference`）、接続先 URL の組み立てと TLS 設定済み HTTP `Agent` の構築
 //! （`registry`・`tls`）。
 //!
-//! 実装済み: 匿名トークン取得（TASK-51.2・OCI-1・#401。`auth` と `RegistryClient::authenticate_anonymous`）。
+//! 実装済み: 匿名トークン取得（TASK-51.2・OCI-1・MS-4・#401。`auth` と `RegistryClient::authenticate_anonymous`）。
 //! 資格情報つき認証（OCI-3）とトークンのキャッシュ・再取得は未実装。
 //!
 //! 未実装（スタブではなく後続 issue の担当）: manifest の

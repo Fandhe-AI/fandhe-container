@@ -1,4 +1,4 @@
-//! oci 操作の計装連携点（REPAIR-4・OCI-1・TASK-51.2・#401）。
+//! oci 操作の計装連携点（REPAIR-4・OCI-1・TASK-51.2・MS-4・#401）。
 //!
 //! `RegistryClient::authenticate_anonymous` が、1 回の操作ごとの結果（成功 / 失敗とエラー code）と
 //! 所要時間を記録先へ渡すための境界。集計と構造化ログへの出力は上位 crate が `OciOpRecorder` を

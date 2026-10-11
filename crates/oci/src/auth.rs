@@ -1,5 +1,5 @@
 //! 匿名トークン取得の純粋な部分: `WWW-Authenticate` の解析・`realm` の検証・トークン応答のパース
-//! （TASK-51.2・OCI-1）。
+//! （TASK-51.2・OCI-1・MS-4）。
 //!
 //! 通信は行わない。`registry` モジュールの `RegistryClient::authenticate_anonymous` が 401 チャレンジの
 //! ヘッダ値と、トークンエンドポイントの応答本文をここへ渡し、得た `RegistryAuth` を後続の manifest 取得

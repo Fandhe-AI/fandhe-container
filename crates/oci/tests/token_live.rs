@@ -1,4 +1,4 @@
-//! Docker Hub への匿名トークン取得の実接続テスト（TASK-51.2・OCI-1 の受け入れ基準 1）。
+//! Docker Hub への匿名トークン取得の実接続テスト（TASK-51.2・OCI-1・MS-4 の受け入れ基準 1）。
 //!
 //! 外向き HTTPS が必要でレート制限の影響も受けるため既定のテスト集合から外す。
 //! 実行: `cargo test -p fandhe-container-oci --test token_live -- --ignored`

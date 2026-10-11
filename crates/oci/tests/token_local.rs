@@ -1,5 +1,5 @@
 //! 匿名トークン取得の公開 API（`RegistryClient::authenticate_anonymous`）をローカルの制御可能な
-//! サーバーに対して通す結合試験（TASK-51.2・OCI-1・REPAIR-4・REPAIR-12。外向き通信なし）。
+//! サーバーに対して通す結合試験（TASK-51.2・OCI-1・MS-4・REPAIR-4・REPAIR-12。外向き通信なし）。
 //!
 //! 本番経路は https 固定で、ローカルに TLS サーバーを立てる依存は持たないため、ここでは
 //! 「TLS を話さないサーバーに接続した」失敗経路（拒否）と、その計測記録を公開 API だけで確認する。
@@ -13,7 +13,7 @@ use fandhe_container_oci::registry::{RegistryClient, RegistryClientConfig, Regis
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Default)]
 struct Collect(Mutex<Vec<OciOpSample>>);
@@ -30,12 +30,22 @@ impl OciOpRecorder for Collect {
 #[test]
 fn non_tls_registry_is_rejected_and_recorded() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
     let port = listener.local_addr().expect("addr").port();
-    std::thread::spawn(move || {
-        if let Ok((mut s, _)) = listener.accept() {
-            let mut buf = [0u8; 1024];
-            let _ = s.read(&mut buf);
-            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    // accept・read・write に期限を付け、試験の終わりに join して回収する（REPAIR-5）。
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Ok((mut s, _)) = listener.accept() {
+                let _ = s.set_nonblocking(false);
+                let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+                let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     });
     let config = RegistryClientConfig {
@@ -58,4 +68,5 @@ fn non_tls_registry_is_rejected_and_recorded() {
     assert_eq!(items[0].outcome(), OciOpOutcome::Failure);
     assert_eq!(items[0].error_code(), Some(e.code()));
     assert_ne!(e.code(), OciErrorCode::Unimplemented);
+    server.join().expect("server thread");
 }

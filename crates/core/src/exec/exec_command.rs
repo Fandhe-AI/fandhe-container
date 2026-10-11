@@ -382,13 +382,22 @@ pub fn spawn_exec_worker<F: FnOnce(ExecWorkerProof) -> i32>(
 /// dumpable も `fs.suid_dumpable` の値へ戻すため、切り替えの **後** に worker を親の生存へ結び直す必要がある
 /// （#1462・REPAIR-5・SEC-1）。結び直しで親の生存を再確認するのにこの pidfd を使う。fork した子の中だけで
 /// 設定され、親プロセスでは未設定のまま。
-static PARENT_PIDFD: std::sync::OnceLock<OwnedFd> = std::sync::OnceLock::new();
+///
+/// 入れ子の `spawn_exec_worker`（worker の中からさらに worker を fork する）では、子が継承した設定済みの
+/// 値を **上書き** する（`OnceLock` では 2 回目の設定が失敗し、入れ子の worker が常に
+/// `EXIT_SETUP_FAILED` になる）。
+static PARENT_PIDFD: std::sync::Mutex<Option<OwnedFd>> = std::sync::Mutex::new(None);
 
 /// fork した worker の中で、親の pidfd の複製を [`PARENT_PIDFD`] へ保持する。失敗時は何も書かず
 /// `EXIT_SETUP_FAILED` を返す（fail-closed）。
 fn keep_parent_pidfd(parent: &OwnedFd) -> Result<(), i32> {
     let dup = parent.try_clone().map_err(|_| EXIT_SETUP_FAILED)?;
-    PARENT_PIDFD.set(dup).map_err(|_| EXIT_SETUP_FAILED)
+    // fork 直後の単一スレッドなので毒化していても中身（Option）は一貫している。上書きで古い値の fd は閉じる。
+    let mut slot = PARENT_PIDFD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = Some(dup);
+    Ok(())
 }
 
 /// 資格情報の切り替えの後に、worker を親の生存へ結び直す（#1462・REPAIR-5・SEC-1）。
@@ -405,7 +414,10 @@ pub(super) fn rebind_worker_after_credential_switch() -> Result<(), ExecError> {
             what,
         )
     };
-    let parent = PARENT_PIDFD.get().ok_or_else(|| {
+    let slot = PARENT_PIDFD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let parent = slot.as_ref().ok_or_else(|| {
         fail("the exec worker has no parent handle to re-bind to after the credential switch")
     })?;
     bind_to_parent_lifetime(parent.as_fd())

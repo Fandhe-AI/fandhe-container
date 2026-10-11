@@ -234,7 +234,7 @@ pub fn spawn_exec_command(
     // 親の書き込み側を閉じる（子の終了後に読み取りが EOF で終わるようにする）。
     drop(status_write);
     Ok(ExecChild {
-        child: ContainerChild::new(pid),
+        child: ContainerChild::spawned(pid),
         status: status_read,
         outcome: std::sync::Mutex::new(None),
     })
@@ -370,7 +370,7 @@ pub fn spawn_exec_worker<F: FnOnce(ExecWorkerProof) -> i32>(
         EXIT_SETUP_FAILED,
     )
     .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
-    Ok(ContainerChild::new(pid))
+    Ok(ContainerChild::spawned(pid))
 }
 
 /// worker（fork した子）を non-dumpable にし、読み戻して確認する。失敗時は stderr に英語 1 行を出し、

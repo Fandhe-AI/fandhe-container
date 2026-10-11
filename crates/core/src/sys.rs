@@ -51,6 +51,8 @@
 //! `openat(2)`（`O_NOCTTY`）、状態を返す pipe だけを残して fd を閉じる `close_range(2)` を呼ぶ。
 //! さらに `crate::audit_log` のカーネル監査フォールバック（SEC-4・TASK-41.5.2・#840）が、
 //! `socket(2)`（NETLINK_AUDIT）・`sendto(2)`・`recvfrom(2)`・`poll(2)` を呼ぶ。
+//! 診断ログの待たない出力（`crate::exec::emit_diagnostic_line`。#1697・REPAIR-5）は、出力先が AF_UNIX の socket かを
+//! `getsockopt(2)`（`SO_DOMAIN`）で判定し、そうなら `send(2)`（`MSG_DONTWAIT | MSG_NOSIGNAL`）を 1 回だけ呼ぶ。
 //! std だけでは提供されない syscall のみを持ち、検証（hostname の文字種・パス形式等）は呼び出し側の型
 //! （`Hostname` 等）が済ませた値だけを受け取る。
 //!
@@ -108,6 +110,8 @@ pub(crate) use consts::{
     EMFILE, ENFILE, ENOENT, ENOEXEC, ENOMEM, ENOSPC, ENOSYS, ENOTDIR, ENOTEMPTY, EOPNOTSUPP, EPERM,
     EPROTONOSUPPORT, ESRCH,
 };
+// 診断ログの待たない送信（`send_nonblocking_unix`）の失敗分類に使う errno（`crate::exec::diagnostic`）。
+pub(crate) use consts::{EAGAIN, EPIPE};
 
 // # `open(2)` フラグのアーキテクチャ差（Codex P0 指摘〔aarch64 の値が誤り〕への確認記録）
 //
@@ -486,6 +490,14 @@ mod consts {
     pub const POLLIN: i16 = 1;
     /// `MSG_DONTWAIT`（送信側を非ブロッキングにする。x86_64・aarch64 とも 0x40）。
     pub const MSG_DONTWAIT: i32 = 0x40;
+    // include/uapi/asm-generic/socket.h・linux/socket.h・errno-base.h の値（診断ログの待たない送信。AF_UNIX の判定と
+    // `MSG_NOSIGNAL` 付き `send`。#1697・REPAIR-5）。値が同じでも他アーキテクチャの定義は流用せず個別に持つ。
+    pub const SOL_SOCKET: i32 = 1;
+    pub const SO_DOMAIN: i32 = 39;
+    pub const AF_UNIX: i32 = 1;
+    pub const MSG_NOSIGNAL: i32 = 0x4000;
+    pub const EAGAIN: i32 = 11;
+    pub const EPIPE: i32 = 32;
     pub const EPROTONOSUPPORT: i32 = 93;
     pub const EAFNOSUPPORT: i32 = 97;
     pub const ECONNREFUSED: i32 = 111;
@@ -749,6 +761,14 @@ mod consts {
     pub const POLLIN: i16 = 1;
     /// `MSG_DONTWAIT`（送信側を非ブロッキングにする。x86_64・aarch64 とも 0x40）。
     pub const MSG_DONTWAIT: i32 = 0x40;
+    // include/uapi/asm-generic/socket.h・linux/socket.h・errno-base.h の値（診断ログの待たない送信。AF_UNIX の判定と
+    // `MSG_NOSIGNAL` 付き `send`。#1697・REPAIR-5）。値が同じでも他アーキテクチャの定義は流用せず個別に持つ。
+    pub const SOL_SOCKET: i32 = 1;
+    pub const SO_DOMAIN: i32 = 39;
+    pub const AF_UNIX: i32 = 1;
+    pub const MSG_NOSIGNAL: i32 = 0x4000;
+    pub const EAGAIN: i32 = 11;
+    pub const EPIPE: i32 = 32;
     pub const EPROTONOSUPPORT: i32 = 93;
     pub const EAFNOSUPPORT: i32 = 97;
     pub const ECONNREFUSED: i32 = 111;
@@ -948,6 +968,12 @@ mod consts {
     pub const NETLINK_AUDIT: i32 = 0;
     pub const POLLIN: i16 = 0;
     pub const MSG_DONTWAIT: i32 = 0;
+    pub const SOL_SOCKET: i32 = 0;
+    pub const SO_DOMAIN: i32 = 0;
+    pub const AF_UNIX: i32 = 0;
+    pub const MSG_NOSIGNAL: i32 = 0;
+    pub const EAGAIN: i32 = -25;
+    pub const EPIPE: i32 = -26;
     pub const EPROTONOSUPPORT: i32 = -22;
     pub const EAFNOSUPPORT: i32 = -23;
     pub const ECONNREFUSED: i32 = -24;
@@ -1071,6 +1097,19 @@ unsafe extern "C" {
         addr: *const SockaddrNl,
         addrlen: u32,
     ) -> isize;
+    // SAFETY（宣言そのものの妥当性）: POSIX の `ssize_t send(int socket, const void *buffer, size_t length,
+    // int flags)`（LP64 で `ssize_t` は i64）。診断ログの待たない送信専用（#1697）。型が netlink 専用の
+    // `sendto` 宣言とは分け、アドレスを取らないことを型で表す。
+    fn send(fd: i32, buf: *const core::ffi::c_void, len: usize, flags: i32) -> isize;
+    // SAFETY（宣言そのものの妥当性）: POSIX の `int getsockopt(int socket, int level, int option_name,
+    // void *option_value, socklen_t *option_len)`（`socklen_t` は u32）。
+    fn getsockopt(
+        fd: i32,
+        level: i32,
+        name: i32,
+        val: *mut core::ffi::c_void,
+        len: *mut u32,
+    ) -> i32;
     // SAFETY（宣言そのものの妥当性）: `ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
     // struct sockaddr *addr, socklen_t *addrlen)`。
     fn recvfrom(
@@ -1205,6 +1244,59 @@ pub(crate) fn netlink_send_to_kernel(fd: BorrowedFd<'_>, buf: &[u8]) -> Result<u
             consts::MSG_DONTWAIT,
             &raw const addr,
             core::mem::size_of::<SockaddrNl>() as u32,
+        )
+    };
+    usize::try_from(n).map_err(|_| last_error())
+}
+
+/// fd が AF_UNIX の socket か（`getsockopt(SO_DOMAIN)` の 1 回）。fd 単位のカーネル内判定で、ファイルシステムへ
+/// 問い合わせない（`fstat` は FUSE / NFS で無期限に止まり得るため使わない。#1697・REPAIR-5）。
+///
+/// socket 以外（`ENOTSOCK`）・`SO_DOMAIN` を持たない古いカーネル（`ENOPROTOOPT`）・AF_UNIX 以外の socket は `false`
+/// （fail-closed）。対応外アーキテクチャでは FFI を呼ばず `false`。
+fn is_unix_socket_fd(fd: BorrowedFd<'_>) -> bool {
+    if !consts::SUPPORTED {
+        return false;
+    }
+    let mut val: i32 = 0;
+    let mut len: u32 = 4;
+    // SAFETY: `val`・`len` はこの関数のスタック上の有効な書き込み先で、`len` は `val` の大きさ（4）と一致する。
+    // `fd` は生存中の `BorrowedFd`。fd 単位の問い合わせで副作用は無い。
+    let rc = unsafe {
+        getsockopt(
+            fd.as_raw_fd(),
+            consts::SOL_SOCKET,
+            consts::SO_DOMAIN,
+            (&raw mut val).cast(),
+            &raw mut len,
+        )
+    };
+    // カーネルが書き戻した長さが `int` の幅でなければ値を信用しない。
+    rc == 0 && len == 4 && val == consts::AF_UNIX
+}
+
+/// AF_UNIX の socket に限り、`buf` を `MSG_DONTWAIT | MSG_NOSIGNAL` の `send(2)` 1 回で送る（診断ログ用。
+/// `crate::exec::emit_diagnostic_line_to` から呼ぶ。#1697・REPAIR-5・REPAIR-4）。送れたバイト数を返す。
+///
+/// 待たないことを保証できる経路に限る。AF_UNIX 以外（pipe・通常ファイル・端末・TCP 等）は書かず
+/// [`SysError::Unsupported`]、満杯は `Os(EAGAIN)`、相手が閉じていれば `SIGPIPE` を出さず `Os(EPIPE)`。
+/// 共有 fd の open file description の状態（`O_NONBLOCK` 等）は変えず、fd の複製・パス解決・`fstat` もしない。
+/// 判定と送信の間に別スレッドが同じ fd 番号を `dup2` で差し替えると、`send` は socket 以外なら `ENOTSOCK` で
+/// 待たずに戻るが、AF_UNIX 以外の socket へ差し替わる窓は残る（判定と送信を不可分にできない。plugin の
+/// `write_nonblocking` と同じ限界）。
+pub(crate) fn send_nonblocking_unix(fd: BorrowedFd<'_>, buf: &[u8]) -> Result<usize, SysError> {
+    if !consts::SUPPORTED || !is_unix_socket_fd(fd) {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `buf` は借用したスライスで、渡す長さは `buf.len()`（呼び出しの間読み出し可能）。`fd` は生存中の
+    // `BorrowedFd`。`MSG_DONTWAIT` で送信バッファの空きを待たず、`MSG_NOSIGNAL` で相手が閉じた socket でも
+    // `SIGPIPE` を出さない（ホストのシグナル設定に依存しない）。
+    let n = unsafe {
+        send(
+            fd.as_raw_fd(),
+            buf.as_ptr().cast(),
+            buf.len(),
+            consts::MSG_DONTWAIT | consts::MSG_NOSIGNAL,
         )
     };
     usize::try_from(n).map_err(|_| last_error())
@@ -4301,6 +4393,47 @@ mod tests {
     }
     use std::os::fd::AsFd as _;
 
+    /// REPAIR-5・#1697: AF_UNIX の socket だけが送信対象と判定され、pipe・通常ファイル・`/dev/null`・TCP・UDP は
+    /// `Unsupported` で何も書かれない。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn repair5_1697_send_nonblocking_unix_accepts_only_unix_sockets() {
+        use std::io::Read as _;
+        use std::os::fd::AsFd as _;
+        let (a, mut b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        assert_eq!(send_nonblocking_unix(a.as_fd(), b"hi\n"), Ok(3));
+        let mut got = [0u8; 3];
+        b.read_exact(&mut got).expect("read");
+        assert_eq!(&got, b"hi\n");
+        let (d1, d2) = std::os::unix::net::UnixDatagram::pair().expect("dgram");
+        assert_eq!(send_nonblocking_unix(d1.as_fd(), b"x"), Ok(1));
+        drop(d2);
+        let (r, w) = std::io::pipe().expect("pipe");
+        assert_eq!(
+            send_nonblocking_unix(w.as_fd(), b"x"),
+            Err(SysError::Unsupported)
+        );
+        drop(r);
+        let null = std::fs::File::open("/dev/null").expect("null");
+        assert_eq!(
+            send_nonblocking_unix(null.as_fd(), b"x"),
+            Err(SysError::Unsupported)
+        );
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("tcp");
+        assert_eq!(
+            send_nonblocking_unix(tcp.as_fd(), b"x"),
+            Err(SysError::Unsupported)
+        );
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp");
+        assert_eq!(
+            send_nonblocking_unix(udp.as_fd(), b"x"),
+            Err(SysError::Unsupported)
+        );
+    }
+
     /// SEC-4・TASK-41.5.2: netlink 監査用の定数・構造体レイアウトの具体値（kernel の uapi と照合）。
     #[cfg(all(
         target_pointer_width = "64",
@@ -4312,6 +4445,11 @@ mod tests {
         assert_eq!(consts::SOCK_CLOEXEC, 0o2_000_000);
         assert_eq!((consts::NETLINK_AUDIT, consts::POLLIN), (9, 1));
         assert_eq!(consts::MSG_DONTWAIT, 0x40);
+        assert_eq!(
+            (consts::SOL_SOCKET, consts::SO_DOMAIN, consts::AF_UNIX),
+            (1, 39, 1)
+        );
+        assert_eq!((consts::MSG_NOSIGNAL, EAGAIN, EPIPE), (0x4000, 11, 32));
         assert_eq!((EAFNOSUPPORT, EPROTONOSUPPORT, ECONNREFUSED), (97, 93, 111));
         assert_eq!(std::mem::size_of::<SockaddrNl>(), 12);
         assert_eq!(std::mem::size_of::<PollFd>(), 8);

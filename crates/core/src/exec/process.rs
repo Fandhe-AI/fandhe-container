@@ -1855,7 +1855,7 @@ pub fn spawn_container_with_stages(
 ) -> Result<ContainerChild, ExecError> {
     let pid = sys::fork_single_threaded(|| child_main(rootfs, entry, stages), EXIT_SETUP_FAILED)
         .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
-    Ok(ContainerChild::new(pid))
+    Ok(ContainerChild::spawned(pid))
 }
 
 /// 結合試験専用: `spawn_container_with_stages` に、pivot 前の専用 `/dev`（`create_default_devices`）を足した版
@@ -1884,7 +1884,7 @@ pub fn spawn_container_with_stages_and_devices(
         EXIT_SETUP_FAILED,
     )
     .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
-    Ok(ContainerChild::new(pid))
+    Ok(ContainerChild::spawned(pid))
 }
 
 /// 待ちのポーリング間隔。
@@ -1953,7 +1953,7 @@ type Observed = (ChildExit, bool);
 ///
 /// `pidfd_open` の失敗は [`LaunchPidfdUnavailable`] に分類して保持し（[`ContainerChild::pidfd_unavailable`]）、
 /// 未対応（`ENOSYS`）以外は [`LaunchPidfdUnavailable::log_line`] で構造化ログ 1 行にできる（`EMFILE`・`ENFILE`・
-/// `ENOMEM`・`EPERM` 等を未対応と取り違えない。出力は未配線）。`new` 自身は I/O をしない（停止した stderr で
+/// `ENOMEM`・`EPERM` 等を未対応と取り違えない。出力は `spawned` が待たない経路で行う）。`new` 自身は I/O をしない（停止した stderr で
 /// ブロックしない。REPAIR-5）。起動自体は失敗させない: `new` は fork の後に呼ばれ、失敗しうる構成にすると全 fork 箇所
 /// （`spawn_container*`・各 probe・exec の worker・rootless mapper・`observe_*`）で子の kill と回収が要り、
 /// 一時的な `EMFILE` がコンテナの起動まで落とすことになるため。代わりに本番の exec の入口
@@ -2009,9 +2009,9 @@ impl LaunchPidfdUnavailable {
     /// 出力は呼び出し側の責務（`ContainerChild::new` は書かない。#1683 の指摘: 停止した stderr への同期書き込みが
     /// ハンドル返却と期限管理を止めるため。REPAIR-5・REPAIR-4）。
     ///
-    /// 現状は本番の呼び出し元が無く、行は組み立てられるだけで出力されない（未配線）。止まった stderr でも
-    /// 待たない出力経路（plugin の `ChildGuard::drop` の診断と同じ AF_UNIX 限定の非ブロッキング送信等）が core に
-    /// 無く、spawn から `wait_timeout` までの経路へ同期書き込みを置くと同じ停止が再発するため。配線は後続の課題。
+    /// 本番の spawn 経路では `ContainerChild::spawned` が fork 直後の親で 1 回だけ、待たない出力経路
+    /// （`exec::emit_diagnostic_line_to`。AF_UNIX の socket 以外へは書かず、満杯でも待たない）へ出す（#1697）。
+    /// spawn から `wait_timeout` までの経路に同期書き込みを置かないため、止まった stderr でも停止しない。
     pub fn log_line(self) -> Option<String> {
         if self == Self::Unsupported {
             return None;
@@ -2073,6 +2073,33 @@ impl ContainerChild {
         // 縮退の理由は分類して保持するだけで、ここでは I/O をしない（stderr が満杯 pipe 等で停止していても
         // ハンドルの返却と子の回収を妨げない。REPAIR-5）。通知は `pidfd_unavailable()` を見た呼び出し側が行う。
         Self::from_pidfd_result(pid, sys::pidfd_open(pid))
+    }
+
+    /// fork 直後の親で子のハンドルを作り、`pidfd_open` の縮退理由があれば待たない経路で 1 行だけ出す
+    /// （#1697・SUP-6・REPAIR-4・REPAIR-5）。本番の spawn 経路（`spawn_container_with_stages`・
+    /// `spawn_exec_worker`・`spawn_exec_command`・rootless の id マップ mapper）はこちらを使う。
+    ///
+    /// 出力は `emit_diagnostic_line`（AF_UNIX の socket 以外へは書かず、満杯でも待たず、再試行しない）の 1 回だけで、
+    /// stderr が停止していても返却を妨げない。出力の成否で起動の可否は変えない（最善努力）。`new` は I/O をしない
+    /// 契約のまま残し、`spawn_container_probe`・`spawn_container_seccomp_probe`・内部の回収（結合試験と内部用）は
+    /// `new` を使う（診断ログを出す対象にしない）。
+    pub(super) fn spawned(pid: u32) -> Self {
+        Self::from_pidfd_result_reported(pid, sys::pidfd_open(pid), std::io::stderr().as_fd()).0
+    }
+
+    /// [`ContainerChild::spawned`] の本体。`pidfd_open` の結果と出力先を注入して単体で照合する。
+    /// ログを出す縮退（`Denied`・`Failed`）のときだけ出力結果を `Some` で返す（`Unsupported` と pidfd ありは `None`）。
+    pub(super) fn from_pidfd_result_reported(
+        pid: u32,
+        result: Result<OwnedFd, SysError>,
+        out: BorrowedFd<'_>,
+    ) -> (Self, Option<super::DiagnosticDelivery>) {
+        let child = Self::from_pidfd_result(pid, result);
+        let delivery = child
+            .pidfd_unavailable
+            .and_then(LaunchPidfdUnavailable::log_line)
+            .map(|line| super::emit_diagnostic_line_to(out, &line));
+        (child, delivery)
     }
 
     /// `pidfd_open` の結果から組み立てる（`new` の本体。結果を注入できるようにして単体で照合する）。
@@ -3536,17 +3563,9 @@ mod tests {
     /// 満杯 pipe 試験で `pidfd_open` を確実に失敗させる pid（`pid_max` の上限 4194304 を超え `ESRCH` になる）。
     const FULL_STDERR_MISSING_PID: u32 = 2_147_483_647;
 
-    /// 満杯 pipe 試験の子役（親が読まない pipe を stderr に繋いで起動される）。
-    ///
-    /// 1. 埋め込みスレッドが stderr へ 4096 バイトずつ書き、書けた量が 300ms 増えなくなる（pipe 満杯で
-    ///    `write(2)` が止まる）まで待つ（上限 5 秒）。
-    /// 2. 対照として、`1471036b` より前の `new` と同じ `writeln!(std::io::stderr().lock(), ..)` を別スレッドで呼び、
-    ///    300ms 以内に戻らないこと（stderr が実際に停止していること）を確かめる。
-    /// 3. `ContainerChild::new` を存在しない pid で呼び（`pidfd_open` が失敗する縮退経路）、所要時間を測る。
-    ///
-    /// 結果は stdout の `RESULT ...` 1 行で返し、`process::exit` で終える（止まったスレッドを待たない。
-    /// stderr は止まっているので panic のメッセージも出せない。失敗は終了コードで返す）。
-    fn full_stderr_child_main() -> ! {
+    /// 満杯 pipe 試験の子役の前半: stderr を満杯にして停止させ、対照として旧来の `writeln!(stderr().lock(), ..)` が
+    /// 300ms 以内に戻らないこと（stderr が実際に停止していること）を返す。前提が崩れたら終了コード 3・4 で終える。
+    fn fill_stderr_until_blocked() -> bool {
         use std::io::Write as _;
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3585,7 +3604,22 @@ mod tests {
             let _ = writeln!(std::io::stderr().lock(), "control line");
             let _ = tx.send(());
         });
-        let control_blocked = rx.recv_timeout(Duration::from_millis(300)).is_err();
+        rx.recv_timeout(Duration::from_millis(300)).is_err()
+    }
+
+    /// 満杯 pipe 試験の子役（親が読まない pipe を stderr に繋いで起動される）。
+    ///
+    /// 1. 埋め込みスレッドが stderr へ 4096 バイトずつ書き、書けた量が 300ms 増えなくなる（pipe 満杯で
+    ///    `write(2)` が止まる）まで待つ（上限 5 秒）。
+    /// 2. 対照として、`1471036b` より前の `new` と同じ `writeln!(std::io::stderr().lock(), ..)` を別スレッドで呼び、
+    ///    300ms 以内に戻らないこと（stderr が実際に停止していること）を確かめる。
+    /// 3. `ContainerChild::new` を存在しない pid で呼び（`pidfd_open` が失敗する縮退経路）、所要時間を測る。
+    ///
+    /// 結果は stdout の `RESULT ...` 1 行で返し、`process::exit` で終える（止まったスレッドを待たない。
+    /// stderr は止まっているので panic のメッセージも出せない。失敗は終了コードで返す）。
+    fn full_stderr_child_main() -> ! {
+        use std::io::Write as _;
+        let control_blocked = fill_stderr_until_blocked();
 
         let start = Instant::now();
         let handle = ContainerChild::new(FULL_STDERR_MISSING_PID);
@@ -3672,6 +3706,141 @@ mod tests {
                 "{result}"
             );
             assert!(result.ends_with(" within_1s=true"), "{result}");
+        }
+    }
+
+    /// 診断出力の満杯 pipe 試験の子役を選ぶ環境変数（値は任意）。
+    const FULL_STDERR_EMIT_CHILD_ENV: &str = "FANDHE_TEST_1697_FULL_STDERR_EMIT_CHILD";
+
+    /// 診断出力の満杯 pipe 試験の子役。stderr を満杯にして停止させ（対照の旧来の書き方が戻らないことも確認）、
+    /// 本物の `emit_diagnostic_line`（devpts の gid 省略ログ）と `from_pidfd_result_reported`（`EMFILE` の
+    /// 縮退ログ）が 1 秒未満で `Dropped(NotUnixSocket)` を返すことを `RESULT ..` 行で返す。
+    fn full_stderr_emit_child_main() -> ! {
+        use super::super::{DiagnosticDelivery, DiagnosticDropReason, emit_diagnostic_line};
+        use std::io::Write as _;
+
+        let control_blocked = fill_stderr_until_blocked();
+        let dropped = Some(DiagnosticDelivery::Dropped(
+            DiagnosticDropReason::NotUnixSocket,
+        ));
+
+        let start = Instant::now();
+        let devpts = emit_diagnostic_line(super::super::devices::devpts_gid_omitted_log_line());
+        let devpts_ok = Some(devpts) == dropped && start.elapsed() < Duration::from_secs(1);
+
+        let start = Instant::now();
+        let (_child, pidfd) = ContainerChild::from_pidfd_result_reported(
+            FULL_STDERR_MISSING_PID,
+            Err(SysError::Os(sys::EMFILE)),
+            std::io::stderr().as_fd(),
+        );
+        let pidfd_ok = pidfd == dropped && start.elapsed() < Duration::from_secs(1);
+
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(
+            out,
+            "\nRESULT control_blocked={control_blocked} devpts_within_1s_dropped={devpts_ok} pidfd_within_1s_dropped={pidfd_ok}"
+        );
+        let _ = out.flush();
+        std::process::exit(0);
+    }
+
+    /// REPAIR-5・REPAIR-4・SUP-6（#1697）: stderr が読み手の止まった満杯 pipe でも、診断ログの 2 経路（devpts の
+    /// gid 省略・launch pidfd の縮退）は 1 秒未満で戻る。対照として、旧来の `writeln!(stderr().lock(), ..)` は同じ条件で
+    /// 戻らない（`control_blocked=true`）。テストバイナリ自身を `--exact` で再実行した子役で照合する。
+    #[test]
+    fn rep5_1697_diagnostic_emit_returns_with_full_stderr_pipe() {
+        use std::io::Read as _;
+
+        if std::env::var_os(FULL_STDERR_EMIT_CHILD_ENV).is_some() {
+            full_stderr_emit_child_main();
+        }
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "exec::process::tests::rep5_1697_diagnostic_emit_returns_with_full_stderr_pipe",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(FULL_STDERR_EMIT_CHILD_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            // 読まない（子役の stderr を満杯で止める）。`child` を drop するまで読み端を開いたまま保つ。
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child with a full stderr pipe did not finish within 10s (REPAIR-5)");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        assert_eq!(status.code(), Some(0), "child stdout: {stdout}");
+        let result = stdout
+            .lines()
+            .find(|l| l.starts_with("RESULT "))
+            .unwrap_or_else(|| panic!("no RESULT line in child stdout: {stdout}"));
+        assert_eq!(
+            result,
+            "RESULT control_blocked=true devpts_within_1s_dropped=true pidfd_within_1s_dropped=true"
+        );
+    }
+
+    /// SUP-6・REPAIR-4（#1697）: `pidfd_open` の縮退ログは `Denied`（`EPERM`）と `Failed`（`EMFILE`）のときだけ
+    /// 出力先へ 1 行届き、`Unsupported`（`ENOSYS`・未対応カーネル）と pidfd ありのときは何も出ない。
+    #[test]
+    fn sup6_rep4_1697_launch_pidfd_log_emitted_only_for_denied_and_failed() {
+        use super::super::DiagnosticDelivery;
+        use std::io::Read as _;
+        use std::os::unix::net::UnixStream;
+
+        fn run(result: Result<OwnedFd, SysError>) -> (Option<DiagnosticDelivery>, Vec<u8>) {
+            let (tx, mut rx) = UnixStream::pair().unwrap();
+            let (_child, delivery) =
+                ContainerChild::from_pidfd_result_reported(1, result, tx.as_fd());
+            rx.set_nonblocking(true).unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 1024];
+            while let Ok(n @ 1..) = rx.read(&mut buf) {
+                got.extend_from_slice(&buf[..n]);
+            }
+            (delivery, got)
+        }
+
+        let (d, got) = run(Err(SysError::Os(sys::EMFILE)));
+        assert_eq!(d, Some(DiagnosticDelivery::Sent));
+        assert_eq!(
+            String::from_utf8(got).unwrap(),
+            "{\"component\":\"core.exec\",\"operation\":\"launch_pidfd\",\"outcome\":\"unavailable\",\"reason\":\"failed\",\"errno\":\"EMFILE\"}\n"
+        );
+        let (d, got) = run(Err(SysError::Os(sys::EPERM)));
+        assert_eq!(d, Some(DiagnosticDelivery::Sent));
+        assert_eq!(
+            String::from_utf8(got).unwrap(),
+            "{\"component\":\"core.exec\",\"operation\":\"launch_pidfd\",\"outcome\":\"unavailable\",\"reason\":\"denied\",\"errno\":\"EPERM\"}\n"
+        );
+        for unsupported in [Err(SysError::Os(sys::ENOSYS)), Err(SysError::Unsupported)] {
+            let (d, got) = run(unsupported);
+            assert_eq!((d, got), (None, Vec::new()));
+        }
+        // 自プロセスの pidfd が開けるカーネルでは、pidfd ありの経路で何も出ない（開けない環境は上の
+        // `Unsupported` 系と同じ扱いで、既存の `sup6_rep4_1617_*` と同じく照合対象から外れる）。
+        if let Ok(own) = sys::pidfd_open(std::process::id()) {
+            let (d, got) = run(Ok(own));
+            assert_eq!((d, got), (None, Vec::new()));
         }
     }
 

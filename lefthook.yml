@@ -44,12 +44,12 @@ pre-commit:
         re_ok='\.(example|sample|template|pub)$'
         if ! hits=$(printf '%s\n' {staged_files} \
           | LC_ALL=C RE="$re" RE_OK="$re_ok" awk '$0 ~ ENVIRON["RE"] && $0 !~ ENVIRON["RE_OK"]'); then
-          echo "NG: ファイル名の判定に失敗したため秘密情報の検査を完了できません" >&2
+          echo "NG: secrets check incomplete: failed to evaluate staged file names" >&2
           exit 1
         fi
         if [ -n "$hits" ]; then
           printf '%s\n' "$hits" | while IFS= read -r f; do
-            echo "NG: 秘密情報ファイルがステージされています: $f" >&2
+            echo "NG: credential file is staged: $f" >&2
           done
           exit 1
         fi
@@ -89,7 +89,7 @@ pre-commit:
         # 変わると追加行を取りこぼすため、--no-color --no-ext-diff --no-renames で固定する
         # （リネームは追加側として新パスの全行を走査する）
         if ! git diff --cached --no-color --no-ext-diff --no-renames --diff-filter=ACMR -U0 -- . > "$tmp/diff"; then
-          echo "NG: staged diff を取得できないため秘密情報の検査を完了できません" >&2
+          echo "NG: secrets check incomplete: failed to read the staged diff" >&2
           exit 1
         fi
         # hunk 内の追加行の本文が `++ b/` で始まると diff 上は `+++ b/...` になるため、
@@ -110,13 +110,13 @@ pre-commit:
             print n + 0 > "/dev/stderr"
           }
         ' "$tmp/diff" 2> "$tmp/count"; then
-          echo "NG: 追加行の抽出に失敗したため秘密情報の検査を完了できません" >&2
+          echo "NG: secrets check incomplete: failed to extract added lines" >&2
           exit 1
         fi
         n="$(cat "$tmp/count")"
         case "$n" in
           ''|*[!0-9]*)
-            echo "NG: 追加行の件数を取得できないため秘密情報の検査を完了できません" >&2
+            echo "NG: secrets check incomplete: failed to count added lines" >&2
             exit 1
             ;;
         esac
@@ -124,7 +124,7 @@ pre-commit:
           exit 0
         fi
         if [ "$(wc -l < "$tmp/content" | tr -d ' ')" != "$n" ]; then
-          echo "NG: 追加行の抽出結果が不完全なため秘密情報の検査を完了できません" >&2
+          echo "NG: secrets check incomplete: extracted added lines are incomplete" >&2
           exit 1
         fi
         # grep の終了状態は 0=一致あり・1=一致なし・2 以上=検査エラー。エラーを「一致なし」と
@@ -138,12 +138,12 @@ pre-commit:
             LC_ALL=C grep -aEn -m1 -- "$pat" "$tmp/content" > "$tmp/hit"
             grc=$?
             if [ "$grc" -gt 1 ]; then
-              echo "NG: 秘密情報の判定でエラーが発生しました: pattern=$kind" >&2
+              echo "NG: secrets check failed with an error: pattern=$kind" >&2
               rc=1
             elif [ "$grc" -eq 0 ]; then
               ln="$(head -n1 "$tmp/hit" | cut -d: -f1)"
               file="$(sed -n "${ln}p" "$tmp/names")"
-              echo "NG: 秘密情報らしき文字列を検出しました: file=${file:-(unknown)} pattern=$kind" >&2
+              echo "NG: possible secret detected: file=${file:-(unknown)} pattern=$kind" >&2
               rc=1
             fi
           done

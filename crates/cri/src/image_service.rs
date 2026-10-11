@@ -51,6 +51,8 @@ pub enum ImageStoreError {
     TooManyRefs,
     /// ストアの件数が [`MAX_IMAGES`] に達している。
     StoreFull,
+    /// `uid` と非空の `username` が同時に指定された（proto の `Image.uid` / `username` は排他）。
+    ConflictingUser,
     /// 内部状態の破損（ロックの毒化）。
     Poisoned,
 }
@@ -63,6 +65,7 @@ impl fmt::Display for ImageStoreError {
             ImageStoreError::FieldTooLong => "image field exceeds the length limit",
             ImageStoreError::TooManyRefs => "image has too many references",
             ImageStoreError::StoreFull => "image store is full",
+            ImageStoreError::ConflictingUser => "image uid and username are mutually exclusive",
             ImageStoreError::Poisoned => "image store is unavailable",
         })
     }
@@ -115,8 +118,12 @@ impl ImageRecord {
         })
     }
 
-    /// 既定ユーザー（uid / username）を設定する。username が長すぎれば拒否する。
+    /// 既定ユーザー（uid / username）を設定する。username が長すぎる場合、および
+    /// uid と非空 username の同時指定（proto で mutually exclusive）は拒否する。
     pub fn with_user(mut self, uid: Option<i64>, username: &str) -> Result<Self, ImageStoreError> {
+        if uid.is_some() && !username.is_empty() {
+            return Err(ImageStoreError::ConflictingUser);
+        }
         if username.len() > MAX_USERNAME_BYTES {
             return Err(ImageStoreError::FieldTooLong);
         }
@@ -362,6 +369,18 @@ mod tests {
             ImageRecord::new("a", tags, vec![], 1),
             Err(ImageStoreError::TooManyRefs)
         );
+    }
+
+    /// CRI-4: uid と username の同時指定は拒否する（api.proto の排他契約）。
+    #[test]
+    fn cri4_user_uid_and_username_are_exclusive() {
+        let base = || rec("a", "t", "d", 1);
+        assert_eq!(
+            base().with_user(Some(1000), "app").err(),
+            Some(ImageStoreError::ConflictingUser)
+        );
+        assert!(base().with_user(Some(1000), "").is_ok());
+        assert!(base().with_user(None, "app").is_ok());
     }
 
     /// CRI-4: ストアの件数上限。同一 ID の置換は上限に達していても許可する。

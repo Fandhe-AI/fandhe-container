@@ -155,6 +155,12 @@ impl PendingChildCleanup {
         self.dropped
     }
 
+    /// 即時書き込みが途中で切れた印を取り出して消す。真のとき、呼び出し元は次の出力（コマンド結果の行等）の前に
+    /// 改行を 1 つ出して断片を分離する。消すので [`Self::write_json_lines`] は先頭の改行を重ねて出さない。
+    pub fn take_partial_write_mark(&mut self) -> bool {
+        std::mem::take(&mut self.partial_write_seen)
+    }
+
     /// 出すものが無いとき真。
     pub fn is_empty(&self) -> bool {
         self.failures.is_empty() && self.dropped == 0
@@ -319,6 +325,19 @@ mod tests {
         assert!(out.starts_with("\n{\"event\""));
         t.push(ChildCleanupFailure::GroupKillFailed);
         assert!(render(&t.take()).starts_with("{\"event\""));
+    }
+
+    /// #1673: 印を呼び出し側が取り出すと 1 回だけ真で、以後の出力は先頭の改行を重ねない。
+    #[cfg(unix)]
+    #[test]
+    fn partial_write_mark_taken_once_and_not_repeated() {
+        let t = leaked_table(2);
+        t.mark_partial_write();
+        t.push(ChildCleanupFailure::GroupKillFailed);
+        let mut p = t.take();
+        assert!(p.take_partial_write_mark());
+        assert!(!p.take_partial_write_mark());
+        assert!(render(&p).starts_with("{\"event\""));
     }
 
     /// REPAIR-2・#1673: 不明なタグは捨て、pid は往復する。

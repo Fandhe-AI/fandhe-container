@@ -22,12 +22,17 @@ fn main() -> ExitCode {
         return ExitCode::from(e.exit_code().get());
     }
     let exit = fandhe_container_cli::commands::run(std::env::args_os().skip(1));
+    // `Drop` の即時書き込みが途中で切れた断片が stderr に残っていれば、コマンド結果の JSON が連結しないよう
+    // 結果の前に改行で分離する（#1673）。
+    let mut pending = fandhe_container_plugin::take_pending_child_cleanup_failures();
+    if pending.take_partial_write_mark() {
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"\n");
+    }
     // stderr 書き込み失敗では panic せず、終了コードは書き込みの成否に依存させない。
     let _ = exit.write_stderr(&mut std::io::stderr());
     // `ChildGuard` の `Drop` で書けなかった後始末の失敗記録を stderr へ出す。終了コードには影響させない。
     // stderr が満杯の pipe / socket だと write が永久にブロックし得るため、別スレッドで書いて有限の期限で待つ（REPAIR-5）。
     // 期限内に終わらなければスレッドを置き去りにして終了する（main の return でプロセスごと破棄される）。
-    let pending = fandhe_container_plugin::take_pending_child_cleanup_failures();
     report_deferred(pending, DEFERRED_REPORT_TIMEOUT, spawn_thread, write_stderr);
     ExitCode::from(exit.exit_code())
 }
@@ -43,34 +48,21 @@ fn spawn_thread(job: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
 }
 
 /// 延期した記録を `write` で出す。別スレッドで書き有限の期限で待つ。スレッド起動に失敗したら
-/// 記録を失わないよう呼び出し元のスレッドで同期的に書く（#1673・REPAIR-4・REPAIR-5）。
+/// 呼び出し元のスレッドでは書かず記録を諦める（満杯の pipe / socket で無期限にブロックし得るため。
+/// 診断は記録であり、期限内の終了を優先する。#1673・REPAIR-4・REPAIR-5）。
 fn report_deferred<T: Send + 'static>(
     pending: T,
     timeout: Duration,
     spawn: Spawner,
     write: fn(&T),
 ) {
-    // spawn 失敗時にクロージャごと破棄されないよう、共有スロット経由で渡す。
-    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(pending)));
     let (tx, rx) = std::sync::mpsc::channel();
-    let job_slot = std::sync::Arc::clone(&slot);
     let job: Box<dyn FnOnce() + Send> = Box::new(move || {
-        let taken = job_slot.lock().ok().and_then(|mut g| g.take());
-        if let Some(p) = taken {
-            write(&p);
-        }
+        write(&pending);
         let _ = tx.send(());
     });
-    match spawn(job) {
-        Ok(()) => {
-            let _ = rx.recv_timeout(timeout);
-        }
-        Err(_) => {
-            let taken = slot.lock().ok().and_then(|mut g| g.take());
-            if let Some(p) = taken {
-                write(&p);
-            }
-        }
+    if spawn(job).is_ok() {
+        let _ = rx.recv_timeout(timeout);
     }
 }
 
@@ -94,9 +86,9 @@ mod tests {
         WRITTEN.fetch_add(s.len(), Ordering::SeqCst);
     }
 
-    /// スレッド起動失敗でも記録が同期的に書き出される（#1673・REPAIR-4）。
+    /// スレッド起動失敗では呼び出し元で書かず（無期限ブロックの回避）、即座に戻る（#1673・REPAIR-5）。
     #[test]
-    fn spawn_failure_falls_back_to_synchronous_write() {
+    fn spawn_failure_skips_write_and_returns() {
         WRITTEN.store(0, Ordering::SeqCst);
         report_deferred(
             b"record".to_vec(),
@@ -104,6 +96,6 @@ mod tests {
             fail_spawn,
             count,
         );
-        assert_eq!(WRITTEN.load(Ordering::SeqCst), 6);
+        assert_eq!(WRITTEN.load(Ordering::SeqCst), 0);
     }
 }

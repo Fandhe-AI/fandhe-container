@@ -440,8 +440,10 @@ enum Line {
 /// 読み取りスレッドからの通知。
 enum Event {
     /// メッセージの先頭バイトを受けた（ここから [`Limits::message_timeout`] を数える）。
-    Started,
-    Line(Line),
+    /// 値は読み取りスレッドが先頭バイトを観測した時刻（絶対期限の起点）。
+    Started(Instant),
+    /// 値は 1 行を読み切った時刻。キューに滞留しただけの行と実際の期限超過を区別する。
+    Line(Line, Instant),
     Eof,
     Failed(io::Error),
 }
@@ -555,7 +557,7 @@ where
             loop {
                 let started_tx = ev_tx.clone();
                 let mut on_start = move || {
-                    let _ = started_tx.send(Event::Started);
+                    let _ = started_tx.send(Event::Started(Instant::now()));
                 };
                 match read_line(&mut reader, max_line, &mut on_start) {
                     Ok(None) => {
@@ -563,7 +565,7 @@ where
                         break;
                     }
                     Ok(Some(line)) => {
-                        if ev_tx.send(Event::Line(line)).is_err() {
+                        if ev_tx.send(Event::Line(line, Instant::now())).is_err() {
                             break;
                         }
                     }
@@ -592,21 +594,31 @@ where
                 log_transport(log, "UNAVAILABLE");
                 return Err(ServeError::Read(e));
             }
-            Event::Line(l) => l,
-            Event::Started => match ev_rx.recv_timeout(limits.message_timeout) {
-                Ok(Event::Line(l)) => l,
-                Ok(Event::Failed(e)) => {
-                    log_transport(log, "UNAVAILABLE");
-                    return Err(ServeError::Read(e));
+            Event::Line(l, _) => l,
+            Event::Started(t0) => {
+                // 期限は読み取りスレッドが先頭バイトを見た時刻からの絶対時刻。
+                // 直前の応答書き込み中にキューへ積まれた Started でも数え直さない（REPAIR-5）。
+                let deadline = t0 + limits.message_timeout;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let next = match ev_rx.recv_timeout(remaining) {
+                    Err(RecvTimeoutError::Timeout) => ev_rx.try_recv().ok(),
+                    Ok(ev) => Some(ev),
+                    Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                };
+                match next {
+                    // 期限内に読み切った行は、キューで待たされていても受理する。
+                    Some(Event::Line(l, done)) if done <= deadline => l,
+                    Some(Event::Failed(e)) => {
+                        log_transport(log, "UNAVAILABLE");
+                        return Err(ServeError::Read(e));
+                    }
+                    Some(Event::Eof | Event::Started(_)) => return Ok(()),
+                    Some(Event::Line(..)) | None => {
+                        log_transport(log, "DEADLINE_EXCEEDED");
+                        return Err(ServeError::ReadTimeout);
+                    }
                 }
-                Ok(Event::Eof | Event::Started) | Err(RecvTimeoutError::Disconnected) => {
-                    return Ok(());
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    log_transport(log, "DEADLINE_EXCEEDED");
-                    return Err(ServeError::ReadTimeout);
-                }
-            },
+            }
         };
         let began = Instant::now();
         let outcome = match line {
@@ -1037,5 +1049,72 @@ mod tests {
         let input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
         let r = serve_with(Cursor::new(input), StallWriter, limits, &mut |_| {});
         assert!(matches!(r, Err(ServeError::WriteTimeout)));
+    }
+
+    /// 1 通目の完結行 → 2 通目の先頭断片 → 遅延 → 残りと改行、の順に返す reader。
+    struct SplitReader {
+        stage: usize,
+        chunks: Vec<(Duration, Vec<u8>)>,
+    }
+    impl io::Read for SplitReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+    impl BufRead for SplitReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            match self.chunks.get(self.stage) {
+                Some((delay, data)) => {
+                    if self.stage > 0 && !delay.is_zero() && !data.is_empty() {
+                        thread::sleep(*delay);
+                    }
+                    Ok(data.as_slice())
+                }
+                None => Ok(&[]),
+            }
+        }
+        fn consume(&mut self, n: usize) {
+            if n > 0 {
+                self.stage += 1;
+            }
+        }
+    }
+
+    /// 応答書き込みに 300ms かかる writer。
+    struct SlowWriter;
+    impl Write for SlowWriter {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            thread::sleep(Duration::from_millis(300));
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 先読みされた次リクエストの期限は、メインスレッドがキューから取り出した時刻ではなく
+    /// 先頭バイトの受信時刻から数える（REPAIR-5。前応答の書き込み中に受信が始まる 9s + 9s の縮小版）。
+    #[test]
+    fn serve_counts_message_deadline_from_first_byte_not_dequeue() {
+        let limits = Limits {
+            message_timeout: Duration::from_millis(500),
+            ..Limits::default()
+        };
+        let ping = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n".to_vec();
+        let reader = SplitReader {
+            stage: 0,
+            chunks: vec![
+                (Duration::ZERO, ping),
+                (Duration::ZERO, b"{\"jsonrpc\":\"2.0\",".to_vec()),
+                (
+                    Duration::from_millis(600),
+                    b"\"id\":2,\"method\":\"ping\"}\n".to_vec(),
+                ),
+            ],
+        };
+        let mut logs = Vec::new();
+        let r = serve_with(reader, SlowWriter, limits, &mut |l| logs.push(l.to_owned()));
+        assert!(matches!(r, Err(ServeError::ReadTimeout)), "{r:?}");
+        assert!(logs.iter().any(|l| l.contains("DEADLINE_EXCEEDED")));
     }
 }

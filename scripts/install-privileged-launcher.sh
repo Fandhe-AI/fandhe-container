@@ -165,24 +165,29 @@ done
 sorted_caps() { # <カンマ区切り>
   printf '%s\n' "${1//,/$'\n'}" | sort | paste -sd, -
 }
-# getcap の読み戻し。$1 のファイルの付与状態を `<sorted names>|<flags>` で返す（無ければ空）。
+# getcap の読み戻し。$1 のファイルの付与状態を `<sorted names>|<flags>` として大域変数 CAPS_READ へ入れる（無ければ空）。
+# コマンド置換のサブシェルでは die が親を止めないため、結果は変数で返し getcap 失敗でも必ず親で止める。
+CAPS_READ=""
 read_caps() { # <file>
   local out rest names flags
+  CAPS_READ=""
   out="$(getcap "$1")" || die 1 capability-mismatch "getcap failed for $1"
   [ -n "${out}" ] || return 0
   rest="${out#"$1"}"
   flags="${rest##*[=+]}"
   names="${rest%[=+]*}"
   names="${names//[ =]/}"
-  printf '%s|%s' "$(sorted_caps "${names}")" "${flags// /}"
+  CAPS_READ="$(sorted_caps "${names}")|${flags// /}"
 }
 expect_no_caps() { # <file>
-  [ -z "$(read_caps "$1")" ] || die 1 capability-mismatch "unexpected capabilities on $1"
+  read_caps "$1"
+  [ -z "${CAPS_READ}" ] || die 1 capability-mismatch "unexpected capabilities on $1"
 }
 expect_launcher_caps() { # <file>
   local want
   want="$(sorted_caps "${LAUNCHER_CAPS%+ep}")|ep"
-  [ "$(read_caps "$1")" = "${want}" ] || die 1 capability-mismatch "capabilities read back do not match on $1"
+  read_caps "$1"
+  [ "${CAPS_READ}" = "${want}" ] || die 1 capability-mismatch "capabilities read back do not match on $1"
 }
 # 所有者と権限ビットの読み戻し。gid は信頼する所有者が root のとき（本番）のみ照合する。
 expect_stat() { # <file> <mode>

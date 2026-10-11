@@ -76,6 +76,8 @@ EOS
 #!/bin/bash
 echo "getcap $*" >>"${FANDHE_INSTALL_TEST_SANDBOX}/calls.log"
 file="$1"
+[ "${STUB_GETCAP_MODE:-match}" = "fail" ] && exit 1
+[ "${STUB_GETCAP_MODE:-match}" = "fail-supervisor" ] && case "$file" in *supervisor*) exit 1 ;; esac
 caps="cap_kill,cap_setgid,cap_mknod,cap_setpcap,cap_net_admin,cap_audit_write,cap_dac_override,cap_sys_admin"
 emit() { # <caps>
   if [ "${STUB_GETCAP_FORMAT:-old}" = "new" ]; then echo "$file = $1+ep"; else echo "$file $1=ep"; fi
@@ -235,6 +237,8 @@ stop_case "setcap EINVAL" setcap-failed STUB_SETCAP_MODE=einval
 stop_case "setcap silent failure" setcap-failed STUB_SETCAP_MODE=empty
 stop_case "setcap not installed (127)" setcap-failed STUB_SETCAP_MODE=notfound
 stop_case "getcap mismatch" capability-mismatch STUB_GETCAP_MODE=mismatch
+stop_case "getcap fails (launcher readback)" capability-mismatch STUB_GETCAP_MODE=fail
+stop_case "getcap fails (no-caps readback)" capability-mismatch STUB_GETCAP_MODE=fail-supervisor
 stop_case "supervisor has capabilities" capability-mismatch STUB_GETCAP_MODE=supervisor-has-caps
 
 # --- 6. 引数エラー・入力元 ---

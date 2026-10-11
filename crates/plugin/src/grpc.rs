@@ -285,8 +285,19 @@ pub fn server_builder(config: &GrpcServerConfig) -> Server {
         .http2_max_header_list_size(config.header_list_max_bytes)
 }
 
+/// レイテンシ分布のバケット数。保持量は操作ごとに固定（無制限に増えない）。
+pub const LATENCY_BUCKETS: usize = 24;
+
+/// マイクロ秒のレイテンシをバケット番号へ写す。0 は 0、`[2^(i-1), 2^i)` は `i`、
+/// `2^(LATENCY_BUCKETS-2)`（約 4.2 秒）以上は最終バケットに集める。
+fn latency_bucket(us: u64) -> usize {
+    let i = (u64::BITS - us.leading_zeros()) as usize;
+    i.min(LATENCY_BUCKETS - 1)
+}
+
 /// 操作ごとの成功・失敗・期限切れ件数とレイテンシの集計（REPAIR-4）。ロックを持たない。
 struct OpCounters {
+    buckets: [AtomicU64; LATENCY_BUCKETS],
     success: AtomicU64,
     failure: AtomicU64,
     timeout: AtomicU64,
@@ -297,6 +308,7 @@ struct OpCounters {
 impl OpCounters {
     const fn new() -> Self {
         Self {
+            buckets: [const { AtomicU64::new(0) }; LATENCY_BUCKETS],
             success: AtomicU64::new(0),
             failure: AtomicU64::new(0),
             timeout: AtomicU64::new(0),
@@ -314,6 +326,9 @@ impl OpCounters {
         };
         self.total_us.fetch_add(us, Ordering::Relaxed);
         self.max_us.fetch_max(us, Ordering::Relaxed);
+        if let Some(b) = self.buckets.get(latency_bucket(us)) {
+            b.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn snapshot(&self, op: &'static str) -> GrpcOpStats {
@@ -324,6 +339,9 @@ impl OpCounters {
             timeout: self.timeout.load(Ordering::Relaxed),
             total_us: self.total_us.load(Ordering::Relaxed),
             max_us: self.max_us.load(Ordering::Relaxed),
+            latency_buckets: std::array::from_fn(|i| {
+                self.buckets.get(i).map_or(0, |b| b.load(Ordering::Relaxed))
+            }),
         }
     }
 }
@@ -349,6 +367,8 @@ pub struct GrpcOpStats {
     pub total_us: u64,
     /// 最大レイテンシ（マイクロ秒）。
     pub max_us: u64,
+    /// レイテンシ分布（件数）。番号 0 は 0us、`i` は `[2^(i-1), 2^i)` us、最終番号は上限以上を含む。
+    pub latency_buckets: [u64; LATENCY_BUCKETS],
 }
 
 /// 全操作の集計スナップショットを返す（順序は `serve`・`connect`・`call`）。
@@ -363,10 +383,16 @@ pub fn grpc_stats() -> Vec<GrpcOpStats> {
 /// 集計を JSON Lines（1 操作 1 行・LF 終端）で書き出す。書き込み失敗は `Internal`。
 pub fn export_stats_json_lines<W: std::io::Write>(w: &mut W) -> Result<(), PluginError> {
     for s in grpc_stats() {
+        let buckets = s
+            .latency_buckets
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         writeln!(
             w,
-            "{{\"event\":\"grpc_op_stats\",\"op\":\"{}\",\"success\":{},\"failure\":{},\"timeout\":{},\"total_us\":{},\"max_us\":{}}}",
-            s.op, s.success, s.failure, s.timeout, s.total_us, s.max_us
+            "{{\"event\":\"grpc_op_stats\",\"op\":\"{}\",\"success\":{},\"failure\":{},\"timeout\":{},\"total_us\":{},\"max_us\":{},\"latency_buckets\":[{}]}}",
+            s.op, s.success, s.failure, s.timeout, s.total_us, s.max_us, buckets
         )
         .map_err(|e| PluginError::new(PluginErrorCode::Internal, format!("stats write failed: {e}")))?;
     }
@@ -432,6 +458,15 @@ impl KillSwitch {
                 w.wake();
             }
         }
+    }
+}
+
+/// future の破棄（timeout・select!・abort）でも接続を強制停止する RAII ガード（REPAIR-5）。
+struct KillOnDrop(Arc<KillSwitch>);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        self.0.kill();
     }
 }
 
@@ -611,6 +646,7 @@ where
     F: Future<Output = ()>,
 {
     let switch = KillSwitch::new();
+    let _kill_on_drop = KillOnDrop(Arc::clone(&switch));
     let wrapped = KillableIncoming {
         inner: Box::pin(incoming),
         switch: Arc::clone(&switch),
@@ -822,6 +858,32 @@ mod tests {
                 .code(),
             PluginErrorCode::InvalidArgument
         );
+    }
+
+    /// ガードの破棄で KillSwitch が kill される（future 破棄経路。REPAIR-5）。
+    #[test]
+    fn kill_on_drop_kills_switch() {
+        let switch = KillSwitch::new();
+        assert!(!switch.is_killed());
+        drop(KillOnDrop(Arc::clone(&switch)));
+        assert!(switch.is_killed());
+    }
+
+    /// レイテンシ分布のバケット境界（REPAIR-4）。
+    #[test]
+    fn latency_bucket_boundaries() {
+        assert_eq!(latency_bucket(0), 0);
+        assert_eq!(latency_bucket(1), 1);
+        assert_eq!(latency_bucket(2), 2);
+        assert_eq!(latency_bucket(3), 2);
+        assert_eq!(latency_bucket(4), 3);
+        assert_eq!(latency_bucket(u64::MAX), LATENCY_BUCKETS - 1);
+        let c = OpCounters::new();
+        c.record(Duration::from_micros(3), Ok(()));
+        c.record(Duration::from_micros(3), Ok(()));
+        let snap = c.snapshot("t");
+        assert_eq!(snap.latency_buckets[2], 2);
+        assert_eq!(snap.latency_buckets.iter().sum::<u64>(), 2);
     }
 
     /// Status のコード対応表（モジュール doc の表）。

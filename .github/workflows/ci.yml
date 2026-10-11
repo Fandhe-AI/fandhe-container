@@ -386,7 +386,7 @@ jobs:
       FANDHE_CONTAINER_TEST_TIMEOUT_SECS: "10"
       # crash_safety 等 required-features 付き結合試験を有効化する feature。
       # ビルド・存在確認・実行の全ステップで同一値を参照する（#827）
-      INTEGRATION_TEST_FEATURES: fandhe-container-io/crash-test-server
+      INTEGRATION_TEST_FEATURES: fandhe-container-io/crash-test-server,fandhe-container-plugin/grpc
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       # REPAIR-7 ステージ 5（セキュリティチェック・依存監査。TASK-86.4・#38）の

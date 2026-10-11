@@ -10,7 +10,7 @@
 //!
 //! 呼び出し元: `devices.rs` の `emit_devpts_gid_omitted`（fork した子の `create_default_devices`）、
 //! `process.rs` の `ContainerChild::spawned`（fork 直後の親）。supervisor の `log_entrypoint_mode` の載せ替えは
-//! #1698 でこの公開関数を使う。
+//! `supervisor` の exec の `log_entrypoint_mode` がこの公開関数を使う（#1698）。
 //!
 //! # 出力先の種別ごとの扱い（fd 2 の実体）
 //!

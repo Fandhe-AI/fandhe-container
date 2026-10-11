@@ -69,6 +69,11 @@ trait CapKernel {
     fn get_res_gid(&mut self) -> Result<[u32; 3], SysError>;
     /// (実, 実効, 保存) uid の読み戻し（`getresuid`）。
     fn get_res_uid(&mut self) -> Result<[u32; 3], SysError>;
+    /// `SECBIT_KEEP_CAPS` の設定・解除（`PR_SET_KEEPCAPS`。#1462）。
+    fn set_keep_caps(&mut self, keep: bool) -> Result<(), SysError>;
+    /// 資格情報の切り替えの後に、worker を親の生存へ結び直す（親死亡シグナルの再設定・親の pidfd での生存確認・
+    /// non-dumpable の再設定。#1462・REPAIR-5・SEC-1）。
+    fn rebind_to_parent(&mut self) -> Result<(), ExecError>;
 }
 
 /// 参加後に呼び出しスレッドを揃える uid・gid（`process.user` の値。名前空間内から見た値。SUP-6・SEC-5・
@@ -161,6 +166,12 @@ impl CapKernel for RealKernel<'_> {
     }
     fn get_res_uid(&mut self) -> Result<[u32; 3], SysError> {
         sys::get_res_uid()
+    }
+    fn set_keep_caps(&mut self, keep: bool) -> Result<(), SysError> {
+        sys::set_keep_caps(keep)
+    }
+    fn rebind_to_parent(&mut self) -> Result<(), ExecError> {
+        super::exec_command::rebind_worker_after_credential_switch()
     }
 }
 
@@ -323,8 +334,10 @@ fn apply_capabilities(
 
     // 0b. uid・gid の切り替え（rootless の exec が参加した後だけ。gid → uid の順。bounding set の削減より前に
     // 行い、参加で得た全 capability を使って切り替える。#1462）。
+    // 切り替えでカーネルが解除する親死亡シグナルと dumpable を、直後に結び直す（#1462・REPAIR-5・SEC-1）。
     if let Some(ids) = ids {
         set_process_ids(kernel, ids)?;
+        kernel.rebind_to_parent()?;
     }
 
     // 1. bounding set の削減（許可集合に無い番号を、カーネルが知る最後の番号まですべて drop する）。
@@ -565,9 +578,16 @@ fn set_process_ids(kernel: &mut impl CapKernel, ids: ProcessIds) -> Result<(), E
             "gids differ from the target after setresgid",
         ));
     }
+    // ホストの root（uid 0）から別ユーザーの rootless コンテナへ exec すると uid が 0 から非 0 へ変わり、
+    // `SECBIT_KEEP_CAPS` が無ければ permitted が全消去されて後続の bounding set の削減・`capset` が `EPERM` に
+    // なる。切り替えの間だけ有効にし、結果にかかわらず直後に解除する（#1462）。
     kernel
-        .set_res_uid(ids.uid)
-        .map_err(|e| fail(e, "setresuid"))?;
+        .set_keep_caps(true)
+        .map_err(|e| fail(e, "prctl(PR_SET_KEEPCAPS)"))?;
+    let switched = kernel.set_res_uid(ids.uid);
+    let unkept = kernel.set_keep_caps(false);
+    switched.map_err(|e| fail(e, "setresuid"))?;
+    unkept.map_err(|e| fail(e, "prctl(PR_SET_KEEPCAPS)"))?;
     if kernel.get_res_uid().map_err(|e| fail(e, "getresuid"))? != [ids.uid; 3] {
         return Err(ExecError::new(
             ErrorCode::Internal,
@@ -575,6 +595,16 @@ fn set_process_ids(kernel: &mut impl CapKernel, ids: ProcessIds) -> Result<(), E
             "uids differ from the target after setresuid",
         ));
     }
+    // 実効 uid が 0 から非 0 へ変わると effective が空になる（`KEEP_CAPS` は permitted だけを残す）。bounding set の
+    // 削減（`CAP_SETPCAP`）と `capset` の前に、残った permitted へ effective を戻す。permitted・inheritable は
+    // 変えない（権限を増やさない）。
+    let current = kernel.get().map_err(|e| fail(e, "capget"))?;
+    kernel
+        .set(ThreadCaps {
+            effective: current.permitted,
+            ..current
+        })
+        .map_err(|e| fail(e, "capset"))?;
     Ok(())
 }
 
@@ -789,6 +819,10 @@ pub(super) mod testing {
         pub(super) setresuid_err: Option<SysError>,
         /// `setresuid` / `setresgid` が成功を返すが値を反映しない（読み戻し検証の不一致を作る）。
         pub(super) setres_noop: bool,
+        /// `PR_SET_KEEPCAPS`（有効化）に返させるエラー。
+        pub(super) keepcaps_err: Option<SysError>,
+        /// 親への結び直しに返させるエラーの code。
+        pub(super) rebind_err: Option<crate::traits::types::ErrorCode>,
     }
 
     impl Fake {
@@ -819,6 +853,8 @@ pub(super) mod testing {
                 setresgid_err: None,
                 setresuid_err: None,
                 setres_noop: false,
+                keepcaps_err: None,
+                rebind_err: None,
             }
         }
     }
@@ -914,6 +950,27 @@ pub(super) mod testing {
         fn get_res_uid(&mut self) -> Result<[u32; 3], SysError> {
             self.calls.push("getresuid");
             Ok(self.uids)
+        }
+
+        fn set_keep_caps(&mut self, keep: bool) -> Result<(), SysError> {
+            self.calls
+                .push(if keep { "keepcaps_on" } else { "keepcaps_off" });
+            if keep && let Some(e) = self.keepcaps_err {
+                return Err(e);
+            }
+            Ok(())
+        }
+
+        fn rebind_to_parent(&mut self) -> Result<(), ExecError> {
+            self.calls.push("rebind");
+            match self.rebind_err {
+                Some(code) => Err(ExecError::new(
+                    code,
+                    super::IsolationStage::CapabilityDrop,
+                    "rebind failed",
+                )),
+                None => Ok(()),
+            }
         }
 
         fn set(&mut self, caps: ThreadCaps) -> Result<(), SysError> {
@@ -1264,8 +1321,13 @@ mod tests {
                 "setgroups",
                 "setresgid",
                 "getresgid",
+                "keepcaps_on",
                 "setresuid",
+                "keepcaps_off",
                 "getresuid",
+                "capget",
+                "capset",
+                "rebind",
                 "drop",
                 "ambient",
                 "capget",
@@ -1343,6 +1405,53 @@ mod tests {
                 assert!(!k.calls.contains(&"setresuid"), "{name}");
             }
         }
+    }
+
+    /// SUP-6・SEC-5・REPAIR-5・TASK-163.h2・#1462: uid の切り替えは `KEEP_CAPS` を立てた間だけ行い、失敗しても必ず
+    /// 解除する。切り替えで消えた effective は permitted へ戻す（permitted・inheritable は変えない）。
+    /// 親への結び直しが失敗したら bounding set の削減へ進まない。
+    #[test]
+    fn sup6_sec5_task163_h2_keep_caps_around_uid_switch_and_rebind_is_required() {
+        let ids = Some(ProcessIds {
+            uid: 1000,
+            gid: 1000,
+        });
+        // 切り替えで effective が消えた状況を作る（ホスト root からの exec）。
+        let mut k = Fake::new();
+        k.caps.effective = [0, 0];
+        apply_capabilities(CapabilitySet::oci_default(), ids, &mut k).unwrap();
+        let on = k.calls.iter().position(|c| *c == "keepcaps_on").unwrap();
+        let uid = k.calls.iter().position(|c| *c == "setresuid").unwrap();
+        let off = k.calls.iter().position(|c| *c == "keepcaps_off").unwrap();
+        let rebind = k.calls.iter().position(|c| *c == "rebind").unwrap();
+        let drop_pos = k.calls.iter().position(|c| *c == "drop").unwrap();
+        assert!(on < uid && uid < off && off < rebind && rebind < drop_pos);
+
+        // uid の切り替えが失敗しても KEEP_CAPS は解除される。
+        let mut k = Fake::new();
+        k.setresuid_err = Some(SysError::Os(EPERM));
+        apply_capabilities(CapabilitySet::oci_default(), ids, &mut k).unwrap_err();
+        assert!(k.calls.contains(&"keepcaps_off"));
+        assert!(!k.calls.contains(&"drop"));
+
+        // KEEP_CAPS を立てられなければ uid を切り替えない。
+        let mut k = Fake::new();
+        k.keepcaps_err = Some(SysError::Os(EPERM));
+        let e = apply_capabilities(CapabilitySet::oci_default(), ids, &mut k).unwrap_err();
+        assert_eq!(e.code, ErrorCode::PermissionDenied);
+        assert!(!k.calls.contains(&"setresuid"));
+
+        // 結び直しの失敗（親が消えた等）は fail-closed。
+        let mut k = Fake::new();
+        k.rebind_err = Some(ErrorCode::FailedPrecondition);
+        let e = apply_capabilities(CapabilitySet::oci_default(), ids, &mut k).unwrap_err();
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert!(!k.calls.contains(&"drop") && !k.calls.contains(&"ambient"));
+
+        // ids が None（launch）なら KEEP_CAPS も結び直しも呼ばない。
+        let mut k = Fake::new();
+        run(&mut k).unwrap();
+        assert!(!k.calls.contains(&"keepcaps_on") && !k.calls.contains(&"rebind"));
     }
 
     /// SEC-1: capset に渡る値は effective = permitted = 既定集合、inheritable = 空。

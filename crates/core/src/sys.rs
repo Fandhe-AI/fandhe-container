@@ -430,6 +430,10 @@ mod consts {
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
     pub const PR_SET_PDEATHSIG: i32 = 1;
 
+    // include/uapi/linux/prctl.h の `PR_SET_KEEPCAPS`（8）。SUP-6・SEC-5・TASK-163 追補・#1462。
+    // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const PR_SET_KEEPCAPS: i32 = 8;
+
     // include/uapi/asm-generic/resource.h の `RLIMIT_*`（0〜15。SUP-12・TASK-169.1）。
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
     pub const RLIMIT_CPU: i32 = 0;
@@ -711,6 +715,10 @@ mod consts {
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
     pub const PR_SET_PDEATHSIG: i32 = 1;
 
+    // include/uapi/linux/prctl.h の `PR_SET_KEEPCAPS`（8）。SUP-6・SEC-5・TASK-163 追補・#1462。
+    // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const PR_SET_KEEPCAPS: i32 = 8;
+
     // include/uapi/asm-generic/resource.h の `RLIMIT_*`（0〜15。SUP-12・TASK-169.1）。
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
     pub const RLIMIT_CPU: i32 = 0;
@@ -929,6 +937,7 @@ mod consts {
     pub const PR_GET_DUMPABLE: i32 = 0;
     pub const PR_SET_DUMPABLE: i32 = 0;
     pub const PR_SET_PDEATHSIG: i32 = 0;
+    pub const PR_SET_KEEPCAPS: i32 = 0;
 
     // rlimit の定数（対応外アーキテクチャでは各ラッパーが SUPPORTED で弾くため未使用）。
     pub const RLIMIT_CPU: i32 = 0;
@@ -3858,6 +3867,23 @@ pub(crate) fn set_parent_death_sigkill() -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// 呼び出したスレッドの `SECBIT_KEEP_CAPS` を設定・解除する（`PR_SET_KEEPCAPS`。SUP-6・SEC-5・TASK-163 追補・#1462）。
+///
+/// `exec/capabilities.rs` の uid 切り替えが `setresuid` の前後に呼ぶ。ホストの root から rootless のコンテナへ
+/// exec すると uid が 0 から非 0 へ変わり、このフラグが無ければ permitted が全消去されて後続の bounding set の
+/// 削減・`capset` が `EPERM` になるため、切り替えの間だけ有効にする。フラグは `execve` で自動的に解除され、
+/// 呼び出し側は切り替えの直後に必ず解除する（権限を残す方向のフラグなので、有効のまま先へ進めない）。
+pub(crate) fn set_keep_caps(keep: bool) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す
+    // （arg2 が 0 / 1。arg3〜5 はカーネルが参照しないが 0 に揃える）。呼び出したスレッドの securebits の
+    // KEEP_CAPS ビットを変えるだけで、メモリ・fd には触れない。
+    let rc = unsafe { prctl(consts::PR_SET_KEEPCAPS, u64::from(keep), 0u64, 0u64, 0u64) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
 /// 呼び出したプロセスが dumpable か（`PR_GET_DUMPABLE`。SUP-6・SEC-1・TASK-163.4・#503）。
 ///
 /// `0`（`SUID_DUMP_DISABLE`）だけを non-dumpable として `Ok(false)` を返す。`1`（`SUID_DUMP_USER`）と
@@ -4860,6 +4886,7 @@ mod tests {
         assert_eq!(consts::PR_GET_DUMPABLE, 3);
         assert_eq!(consts::PR_SET_DUMPABLE, 4);
         assert_eq!(consts::PR_SET_PDEATHSIG, 1);
+        assert_eq!(consts::PR_SET_KEEPCAPS, 8);
         // 親死亡シグナルの実 syscall は単体テストでは呼ばない（設定はスレッド単位で、テストプロセスを起動した
         // スレッドが先に終わるとテストプロセス全体へ SIGKILL が届く）。実プロセスでの照合は supervisor の
         // 結合試験 `exec_timeout` が行う。

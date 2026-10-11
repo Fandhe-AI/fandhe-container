@@ -361,7 +361,10 @@ pub fn spawn_exec_worker<F: FnOnce(ExecWorkerProof) -> i32>(
 ) -> Result<ContainerChild, ExecError> {
     let own = own_pidfd()?;
     let pid = sys::fork_single_threaded(
-        || match bind_to_parent_lifetime(own.as_fd()).and_then(|()| make_worker_non_dumpable()) {
+        || match keep_parent_pidfd(&own)
+            .and_then(|()| bind_to_parent_lifetime(own.as_fd()))
+            .and_then(|()| make_worker_non_dumpable())
+        {
             // 上の 2 つが成功した後にだけ証跡を作る（証跡の意味を「親の生存に結合済みで non-dumpable な
             // worker の中にいる」に固定する。#1532）。
             Ok(()) => worker(ExecWorkerProof::new()),
@@ -371,6 +374,45 @@ pub fn spawn_exec_worker<F: FnOnce(ExecWorkerProof) -> i32>(
     )
     .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
     Ok(ContainerChild::spawned(pid))
+}
+
+/// worker が保持する「親（`spawn_exec_worker` の呼び出し元）の pidfd」（fork で継承した fd の複製）。
+///
+/// 資格情報の切り替え（`setresuid` / `setresgid`）はカーネルが親死亡シグナルを解除し（`commit_creds`）、
+/// dumpable も `fs.suid_dumpable` の値へ戻すため、切り替えの **後** に worker を親の生存へ結び直す必要がある
+/// （#1462・REPAIR-5・SEC-1）。結び直しで親の生存を再確認するのにこの pidfd を使う。fork した子の中だけで
+/// 設定され、親プロセスでは未設定のまま。
+static PARENT_PIDFD: std::sync::OnceLock<OwnedFd> = std::sync::OnceLock::new();
+
+/// fork した worker の中で、親の pidfd の複製を [`PARENT_PIDFD`] へ保持する。失敗時は何も書かず
+/// `EXIT_SETUP_FAILED` を返す（fail-closed）。
+fn keep_parent_pidfd(parent: &OwnedFd) -> Result<(), i32> {
+    let dup = parent.try_clone().map_err(|_| EXIT_SETUP_FAILED)?;
+    PARENT_PIDFD.set(dup).map_err(|_| EXIT_SETUP_FAILED)
+}
+
+/// 資格情報の切り替えの後に、worker を親の生存へ結び直す（#1462・REPAIR-5・SEC-1）。
+///
+/// `exec/capabilities.rs` の uid・gid 切り替え（ホストの root から別ユーザーの rootless コンテナへ exec する
+/// とき実効 ID が変わる）の直後に呼ぶ。親死亡シグナル（`SIGKILL`）を設定し直して保持した親の pidfd で親が
+/// 終了していないことを確かめ、dumpable も落とし直して読み戻す。worker の外（親の pidfd を保持していない）から
+/// 呼ばれた場合・設定に失敗した場合・親が既に終了していた場合は `Err` を返し、呼び出し側は先へ進まない。
+pub(super) fn rebind_worker_after_credential_switch() -> Result<(), ExecError> {
+    let fail = |what: &'static str| {
+        ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::CapabilityDrop,
+            what,
+        )
+    };
+    let parent = PARENT_PIDFD.get().ok_or_else(|| {
+        fail("the exec worker has no parent handle to re-bind to after the credential switch")
+    })?;
+    bind_to_parent_lifetime(parent.as_fd())
+        .and_then(|()| make_worker_non_dumpable())
+        .map_err(|_| {
+            fail("the exec worker could not be re-bound to its parent after the credential switch")
+        })
 }
 
 /// worker（fork した子）を non-dumpable にし、読み戻して確認する。失敗時は stderr に英語 1 行を出し、

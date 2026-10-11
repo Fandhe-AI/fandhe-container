@@ -177,6 +177,10 @@ pub use process::spawn_container_seccomp_probe;
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
 pub use process::spawn_container_with_stages_and_devices;
+/// 結合試験 `tests/legacy_tiocsti_launch.rs` 専用の再公開（CORE-5・SEC-1・REPAIR-12・#1739。通常の利用者は呼ばない）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use process::spawn_container_with_stages_reporting_for_test;
 pub use process::{
     ChildExit, ContainerChild, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV,
     ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES, EXIT_EXEC_NOT_EXECUTABLE,
@@ -191,6 +195,7 @@ pub use process::{
     observe_exec_child_setup, observe_exec_child_setup_pinned, observe_exec_child_setup_with,
     observe_exec_child_setup_with_fsize,
 };
+pub use process::{LegacyTiocstiReport, report_legacy_tiocsti_to};
 /// 結合試験 `tests/exec_child_setup.rs`・`tests/fork_exec_isolation.rs` 専用の再公開（SEC-1・CORE-1・TASK-27.4.1・#1299。
 /// 通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(all(feature = "exec-test-support", not(test)))]

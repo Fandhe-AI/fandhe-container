@@ -530,7 +530,7 @@ mod linux {
         let sep = fields.iter().position(|f| *f == "-").expect("separator");
         assert_eq!(fields[sep + 1], "devpts", "{}", pts_lines[0]);
         let super_options: Vec<_> = fields[sep + 3].split(',').collect();
-        for want in ["mode=620", "ptmxmode=666"] {
+        for want in ["mode=620", "ptmxmode=666", "max=61"] {
             assert!(super_options.contains(&want), "{want}: {}", pts_lines[0]);
         }
         if rootful {

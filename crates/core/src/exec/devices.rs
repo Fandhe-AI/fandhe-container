@@ -102,7 +102,7 @@
 //!   ノードは残らない。後始末は最善努力で、失敗しても元のエラーを返す。呼び出し後もプロセスは
 //!   破棄する（`crate::exec` のモジュール doc の契約）
 //! - **`/dev/pts` は `/dev` のマウントのルート fd 起点**: `pts` を 0755 で作り、`O_PATH|O_NOFOLLOW|O_DIRECTORY` で
-//!   固定した fd にだけ devpts を載せる（`sys::mount_devpts_on`。`mode=620`・`ptmxmode=666`・`nosuid|noexec` は
+//!   固定した fd にだけ devpts を載せる（`sys::mount_devpts_on`。`mode=620`・`ptmxmode=666`・`max=61`・`nosuid|noexec` は
 //!   固定）。`nodev` は付けない（pty のスレーブと `ptmx` は文字デバイスで、`nodev` では開けない。devpts の中に
 //!   置けるのはカーネルが作る pty ノードだけで、利用者が任意のデバイスを作る経路は無い）。`pts` が symlink・
 //!   非ディレクトリなら違反記録付きで何もマウントせず拒否する。マウント後は tmpfs と同じ 3 点（devpts であること・

@@ -9,9 +9,13 @@
 //!
 //! TASK-163.4（#503）で次の 2 つを足した（どちらも非特権の user namespace に閉じ、root を要さない）。
 //!
-//! - **別の user namespace の対象の拒否（SEC-5・SEC-1）**: 対象の user namespace へ入っていない joiner からの
-//!   特定は、違反 `exec_target_in_other_user_namespace` で拒否される（user namespace への参加は未実装のため、
-//!   `setns` が成功し得る rootful の呼び出し側でも、参加の前に拒否する。`exec/setns.rs` のモジュール doc）
+//! - **別の user namespace の対象への参加（SEC-5・SEC-1・TASK-163.h2・#1462）**: 対象の user namespace へ入って
+//!   いない（`nsenter` を通さない）joiner が、5 種に先立って対象の user namespace にも参加する（rootless の
+//!   exec）。参加後の `ns/user` が対象と一致すること、`NamespaceJoinReport` が user namespace への参加を報告する
+//!   こと、続く補助グループ・gid・uid の処理（`apply_join_credentials_for_test`）が参加先の namespace 内で
+//!   `Uid:` / `Gid:` を 0 に揃え、`setgroups` が `deny` の補助グループを現状維持として記録することを具体値で
+//!   照合する。`nsenter --user` で先に同じ user namespace へ入った joiner（rootful 相当）は user namespace へ
+//!   参加せず、報告もそのとおりであることも照合する
 //! - **`pivot_root` 済みの対象へ参加した後の `/`（SEC-1）**: launcher と同じ手順（`establish` →
 //!   `prepare_rootfs` → `pivot_root`。本バイナリの `--pid1-pivot` 再入）で rootfs へ切り替えた pid1 へ、本番の
 //!   `enter_namespaces` で参加し、参加後の `/` と cwd が、参加前にホスト側のパスで調べた rootfs と **同じ
@@ -82,8 +86,8 @@ fn main() {
         linux::joiner(pid);
     } else if let Some(pid) = pid_after(linux::JOINER_SHARED_MNT) {
         linux::joiner_shared_mnt(pid);
-    } else if let Some(pid) = pid_after(linux::JOINER_OTHER_USERNS) {
-        linux::joiner_other_userns(pid);
+    } else if let Some(pid) = pid_after(linux::JOINER_ROOTLESS) {
+        linux::joiner_rootless(pid);
     } else if let Some(pid) = pid_after(linux::JOINER_PIVOTED) {
         let i = args
             .iter()
@@ -116,8 +120,8 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::exec::{
-        JoinNamespace, MountIsolation, SupplementaryGroups, clear_supplementary_groups_for_test,
-        pivot_root, prepare_rootfs,
+        JoinNamespace, MountIsolation, SupplementaryGroups, apply_join_credentials_for_test,
+        clear_supplementary_groups_for_test, pivot_root, prepare_rootfs,
     };
     use fandhe_container_core::traits::{
         ContainerId, ContainerStatus, ErrorCode, StateRecord, StateRevision,
@@ -163,8 +167,9 @@ mod linux {
     pub const JOINER: &str = "--joiner";
     /// 「呼び出し側と同じ mount namespace」の拒否経路の joiner の再入フラグ。
     pub const JOINER_SHARED_MNT: &str = "--joiner-shared-mnt";
-    /// 「呼び出し側と別の user namespace」の拒否経路の joiner の再入フラグ（`nsenter` を通さない）。
-    pub const JOINER_OTHER_USERNS: &str = "--joiner-other-userns";
+    /// 「呼び出し側と別の user namespace」の対象へ、user namespace にも参加する joiner の再入フラグ（`nsenter` を
+    /// 通さない。rootless の exec。#1462）。
+    pub const JOINER_ROOTLESS: &str = "--joiner-rootless";
     /// `pivot_root` 済みの pid1 へ参加し、参加後の `/` を照合する joiner の再入フラグ（引数: pid・rootfs）。
     pub const JOINER_PIVOTED: &str = "--joiner-pivoted";
     /// `setgroups` が `deny` の user namespace で補助グループの扱いを照合する joiner の再入フラグ（引数: pid。未使用）。
@@ -194,10 +199,10 @@ mod linux {
             JOINER_SHARED_MNT,
             &[],
         );
-        // 拒否経路: 対象の user namespace へ入っていない呼び出し側は、5 種すべてを分離した pid1 でも対象に
-        // しない（SEC-5・SEC-1・TASK-163.4。user namespace への参加は未実装）。
-        run_scenario(&ALL_NS, sleep(), None, false, JOINER_OTHER_USERNS, &[]);
-        println!("exec_setns_join: target in another user namespace rejected");
+        // 成功経路: 対象の user namespace へ入っていない（`nsenter` を通さない）呼び出し側は、5 種に先立って対象の
+        // user namespace にも参加し、参加後の資格情報を名前空間内の root へ揃える（SEC-5・SEC-1・TASK-163.h2・#1462）。
+        run_scenario(&ALL_NS, sleep(), None, false, JOINER_ROOTLESS, &[]);
+        println!("exec_setns_join: rootless join into the target user namespace verified");
         // 成功経路: launcher と同じ手順で pivot_root した pid1 へ参加した後の `/` は、固定した rootfs と同じ
         // ディレクトリになる（SEC-1・TASK-163.4）。
         let rootfs = Rootfs::create();
@@ -393,30 +398,77 @@ mod linux {
         );
     }
 
-    /// 対象の user namespace へ入っていない単一スレッドで、5 種すべてを分離した pid1 が「別の user namespace」を
-    /// 理由に拒否されることを照合する（入れ子の PID 1・cgroup 一致・pid / mnt namespace は別、の条件で user
-    /// namespace の検査に届く。SEC-5・SEC-1・SEC-4・TASK-163.4）。
-    pub fn joiner_other_userns(pid: u32) {
-        assert_ne!(
-            link("/proc/thread-self/ns/user"),
-            link(&format!("/proc/{pid}/ns/user")),
-            "the target must be in another user namespace"
-        );
-        for ns in ["mnt", "pid"] {
+    /// 対象の user namespace へ入っていない（初期 user namespace の非特権ユーザー = 対象の所有者）単一スレッドで、
+    /// 5 種すべてを分離した pid1 へ、user namespace を先頭に 1 回の `setns` で参加する（rootless の exec。
+    /// SEC-5・SEC-1・TASK-163.h2・#1462）。
+    ///
+    /// 参加前は user / mnt / pid が対象と異なり、参加後は user を含む 5 種が対象と一致する。続けて本番と同じ関数・
+    /// 実 syscall で補助グループ → gid・uid の処理を通し、補助グループが `setgroups` = `deny` のため現状維持として
+    /// 記録されること（0 件なら `AlreadyEmpty`）と、`Uid:` / `Gid:` が名前空間内から見て 0 になることを照合する。
+    pub fn joiner_rootless(pid: u32) {
+        let status = || fs::read_to_string("/proc/thread-self/status").expect("read own status");
+        let field = |status: &str, name: &str| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(name))
+                .unwrap_or_else(|| panic!("{name} missing in status"))
+                .trim()
+                .to_owned()
+        };
+        let entries = ["user", "mnt", "uts", "ipc", "net"];
+        let want: Vec<String> = entries
+            .iter()
+            .map(|n| link(&format!("/proc/{pid}/ns/{n}")))
+            .collect();
+        let want_pid = link(&format!("/proc/{pid}/ns/pid"));
+        for (i, n) in entries.iter().enumerate() {
             assert_ne!(
-                link(&format!("/proc/thread-self/ns/{ns}")),
-                link(&format!("/proc/{pid}/ns/{ns}")),
-                "the target must be in another {ns} namespace"
+                link(&format!("/proc/thread-self/ns/{n}")),
+                want[i],
+                "{n} namespace must differ before join"
             );
         }
+        let groups_before = field(&status(), "Groups:");
+        let group_count = groups_before.split_whitespace().count();
+
         let (rec, path) = record_and_cgroup_path(pid);
-        let err = identify_pid1_in(&rec, &path).unwrap_err();
-        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        let target =
+            identify_pid1_in(&rec, &path).expect("identify pid1 in another user namespace");
+        let report = enter_namespaces(&target).expect("enter namespaces including the user one");
+        assert_eq!(report.target_pid.get(), pid);
+        assert!(report.user_namespace_joined);
+        let mut expected = vec![JoinNamespace::User];
+        expected.extend(JoinNamespace::SUP6_SET);
+        assert_eq!(report.joined, expected);
+
+        for (i, n) in entries.iter().enumerate() {
+            assert_eq!(
+                link(&format!("/proc/thread-self/ns/{n}")),
+                want[i],
+                "{n} namespace must equal the target after join"
+            );
+        }
+        assert_eq!(link("/proc/thread-self/ns/pid_for_children"), want_pid);
+
+        // 参加後の処理（補助グループ → gid・uid）。参加先は `unshare --map-root-user` の namespace で、`setgroups` は
+        // `deny`。呼び出し側の補助グループは消去できず、現状維持として記録される。
         assert_eq!(
-            err.message(),
-            "exec stage SetNs: the exec target is in another user namespace than the caller; \
-             refusing to join (violation: exec_target/exec_target_in_other_user_namespace, SUP-6)"
+            fs::read_to_string("/proc/thread-self/setgroups").expect("read setgroups"),
+            "deny\n",
+            "setgroups must be denied in the joined user namespace"
         );
+        let want_groups = if group_count == 0 {
+            SupplementaryGroups::AlreadyEmpty
+        } else {
+            SupplementaryGroups::KeptSetgroupsDenied { kept: group_count }
+        };
+        assert_eq!(
+            apply_join_credentials_for_test(0, 0).expect("switch to the container root"),
+            want_groups
+        );
+        let after = status();
+        assert_eq!(field(&after, "Uid:"), "0\t0\t0\t0");
+        assert_eq!(field(&after, "Gid:"), "0\t0\t0\t0");
     }
 
     /// 対象の user namespace（`unshare --map-root-user` が作る。`setgroups` は `deny`）に入った単一スレッドで、
@@ -501,6 +553,7 @@ mod linux {
         let target = identify_pid1_in(&rec, &path).expect("identify pid1");
         let report = enter_namespaces(&target).expect("enter namespaces");
         assert_eq!(report.joined, JoinNamespace::SUP6_SET.to_vec());
+        assert!(!report.user_namespace_joined);
 
         // 参加後: `/` と cwd は、固定した rootfs と同じディレクトリ（`st_dev`・`st_ino`）。`setns` は root と cwd を
         // 参加先 mount namespace のルートへ付け替えるため、明示的な chroot / chdir をしなくても一致する。
@@ -599,7 +652,9 @@ mod linux {
         assert_eq!(target.pid1().pid().get(), pid);
         let report = enter_namespaces(&target).expect("enter namespaces");
         assert_eq!(report.target_pid.get(), pid);
+        // 呼び出し側は `nsenter --user` で対象と同じ user namespace にいるため、user namespace には参加しない。
         assert_eq!(report.joined, JoinNamespace::SUP6_SET.to_vec());
+        assert!(!report.user_namespace_joined);
 
         for (i, n) in NS_ENTRIES.iter().enumerate() {
             assert_eq!(

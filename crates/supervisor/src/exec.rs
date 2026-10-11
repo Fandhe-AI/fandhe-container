@@ -65,7 +65,11 @@
 //!   `sudo` 経由・別のグループ集合のセッション）のグループをコンテナへ持ち込むため。消去できず `deny` も確認
 //!   できなければ、参加せずに拒否する。起動者自身が既に `setgroups` を禁じた user namespace の中にいる場合
 //!   （rootless）だけは残し、[`ExecOutcome`] の `supplementary_groups` に記録する（残るのは **exec を起動した
-//!   プロセスの** 補助グループで、user namespace の作成者と同じとは限らない）。uid / gid は変更しない（launch も同じ）
+//!   プロセスの** 補助グループで、user namespace の作成者と同じとは限らない）。補助グループを持つ非特権の起動者が
+//!   コンテナの所有者自身の場合に限り、参加前の消去は参加後へ回る（初期 user namespace で `CAP_SETGID` を持たないため。
+//!   core の `exec/reapply.rs`。#1462）。別の user namespace へ参加したときは、補助グループの後・capability 削減の
+//!   前に gid → uid を `process.user` の値へ揃えて読み戻す（rootless の exec。同じ user namespace では uid / gid を
+//!   変更しない。launch は `uid_map` の結果として既に root）
 //! - **`execve` 前の失敗とコマンドの終了を区別する**（REPAIR-3・TASK-163 追補・#1460）: [`ExecOutcome`] の `exit` は
 //!   core の `ExecExit` で、`Command`（コマンドが起動して終了した）と `SetupFailed`（コマンドは起動していない。
 //!   子が `execve` より前の手順か `execve` 自体で失敗した）を分ける。子の終了コード 125 / 126 / 127 は実行された
@@ -192,11 +196,10 @@
 //!   検証と core `sys` の cmsg ラッパーの設計を要する。fork 継承（[`run_command_with_pidfd`]）は pidfd を保持する
 //!   単一スレッドのプロセスが呼ぶ場合に限り成立し、logs 捕捉スレッドを持つ supervisor 本体は直接呼べない
 //!   （`setns` が拒否する）
-//! - user namespace への参加。既定の rootless（コンテナが user namespace を持つ）では、対象が呼び出し側と別の
-//!   user namespace にいることを理由に [`identify_pid1`] が違反 `exec_target_in_other_user_namespace` で拒否する
-//!   （[`enter_namespaces`] も `setns` の直前に再照合する。rootful の呼び出し側では `setns` 自体は成功して
-//!   しまい、exec したコマンドがコンテナより強い権限で動くため、カーネルの拒否には依存しない。fail-closed。
-//!   rootless の exec には必須。通しの結合試験は rootful のみ）
+//! - rootless の exec の通しの確認。user namespace への参加（[`enter_namespaces`] が、対象が別の user namespace に
+//!   いるときだけ 5 種に先立って参加する。#1462）と参加後の資格情報は `tests/exec_setns_join.rs` が非特権の
+//!   user namespace で照合するが、制限の再適用を含む通しの経路（Landlock ABI 6+）は実機前提の `tests/exec.rs`
+//!   （rootful）のみで、rootless での通しは未確認
 //! - コマンドの標準入出力の受け渡し（CLI の exec・TASK-161 / SUP-4 の healthcheck の出力取得）。現状は launch と
 //!   同じく `/dev/null` へ固定し、cwd・ユーザーの指定も未対応（cwd はコンテナの rootfs の根。`config.json` の
 //!   `process.user.additionalGids` の解釈〔指定したグループの付与〕も launch・exec とも未実装で、補助グループは
@@ -369,7 +372,8 @@ pub fn identify_pid1_in(
     })
 }
 
-/// SUP-6 の 5 種（pid / mnt / uts / ipc / net）の namespace へ参加する。単一スレッドからのみ呼ぶこと。
+/// SUP-6 の 5 種（pid / mnt / uts / ipc / net）の namespace へ参加する。対象が呼び出し側と別の user namespace に
+/// いるとき（rootless）は、5 種に先立って user namespace にも参加する（#1462）。単一スレッドからのみ呼ぶこと。
 pub fn enter_namespaces(target: &ExecTarget) -> Result<NamespaceJoinReport, TraitError> {
     join_namespaces(&target.pid1).map_err(from_exec_error)
 }

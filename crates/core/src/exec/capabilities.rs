@@ -61,6 +61,31 @@ trait CapKernel {
     /// 呼び出しプロセスの user namespace が `setgroups` を禁じているか（procfs の `setgroups` が `deny`）。
     /// 確認できない（procfs でない・読めない・`allow` / `deny` 以外の内容）場合は `None`。
     fn setgroups_denied(&mut self) -> Option<bool>;
+    /// 実・実効・保存 gid を `gid` に揃える（`setresgid`。#1462）。
+    fn set_res_gid(&mut self, gid: u32) -> Result<(), SysError>;
+    /// 実・実効・保存 uid を `uid` に揃える（`setresuid`。#1462）。
+    fn set_res_uid(&mut self, uid: u32) -> Result<(), SysError>;
+    /// (実, 実効, 保存) gid の読み戻し（`getresgid`）。
+    fn get_res_gid(&mut self) -> Result<[u32; 3], SysError>;
+    /// (実, 実効, 保存) uid の読み戻し（`getresuid`）。
+    fn get_res_uid(&mut self) -> Result<[u32; 3], SysError>;
+    /// `SECBIT_KEEP_CAPS` の設定・解除（`PR_SET_KEEPCAPS`。#1462）。
+    fn set_keep_caps(&mut self, keep: bool) -> Result<(), SysError>;
+    /// 資格情報の切り替えの後に、worker を親の生存へ結び直す（親死亡シグナルの再設定・親の pidfd での生存確認・
+    /// non-dumpable の再設定。#1462・REPAIR-5・SEC-1）。
+    fn rebind_to_parent(&mut self) -> Result<(), ExecError>;
+}
+
+/// 参加後に呼び出しスレッドを揃える uid・gid（`process.user` の値。名前空間内から見た値。SUP-6・SEC-5・
+/// TASK-163 追補・#1462）。
+///
+/// rootless の exec（対象の user namespace へ参加した場合）だけが `Some` で渡す。launch は `None` を渡す
+/// （`uid_map` の結果として既に名前空間内の uid 0・gid 0 で、`process.user` は root だけを許すため。ユーザー
+/// 切り替え自体は launch・exec とも root 以外が未実装 = REPAIR-3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcessIds {
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
 }
 
 /// 本物の syscall を呼ぶ実装。スレッド数の取得元（`/proc/self/status` か、`setns` 前に開いた fd）を持つ。
@@ -129,6 +154,24 @@ impl CapKernel for RealKernel<'_> {
     }
     fn setgroups_denied(&mut self) -> Option<bool> {
         read_setgroups_denied(self.own_proc_dir)
+    }
+    fn set_res_gid(&mut self, gid: u32) -> Result<(), SysError> {
+        sys::set_res_gid(gid)
+    }
+    fn set_res_uid(&mut self, uid: u32) -> Result<(), SysError> {
+        sys::set_res_uid(uid)
+    }
+    fn get_res_gid(&mut self) -> Result<[u32; 3], SysError> {
+        sys::get_res_gid()
+    }
+    fn get_res_uid(&mut self) -> Result<[u32; 3], SysError> {
+        sys::get_res_uid()
+    }
+    fn set_keep_caps(&mut self, keep: bool) -> Result<(), SysError> {
+        sys::set_keep_caps(keep)
+    }
+    fn rebind_to_parent(&mut self) -> Result<(), ExecError> {
+        super::exec_command::rebind_worker_after_credential_switch()
     }
 }
 
@@ -223,7 +266,7 @@ pub struct CapabilityReport {
 /// - 事後確認: 適用後にもう一度 `Threads: 1` を確認する。万一増えていれば（呼び出し側の
 ///   別経路の不具合等）`Ok` を返さず `Internal` で失敗し、権限が残った可能性を呼び出し側へ伝える
 pub(crate) fn apply_default_capabilities() -> Result<CapabilityReport, ExecError> {
-    apply_default_capabilities_with(&mut ThreadCountSource::ProcSelf, None)
+    apply_default_capabilities_with(&mut ThreadCountSource::ProcSelf, None, None)
 }
 
 /// [`apply_default_capabilities`] の、スレッド数の取得元を差し替えられる版（SUP-6・TASK-163.4・#503）。
@@ -233,12 +276,17 @@ pub(crate) fn apply_default_capabilities() -> Result<CapabilityReport, ExecError
 ///
 /// `own_proc_dir` は呼び出しプロセス自身の procfs ディレクトリ（`setns` の前に開き、procfs と確認した fd）で、
 /// 補助グループを消去できなかったときに user namespace の `setgroups` の設定を読むために使う（#1457）。
+///
+/// `ids` が `Some` なら、補助グループの消去の後・bounding set の削減の前に、gid → uid の順で `process.user` の値へ
+/// 揃えて読み戻す（rootless の exec が user namespace へ参加した後。#1462）。launch は `None`。
 pub(crate) fn apply_default_capabilities_with(
     threads: &mut ThreadCountSource,
     own_proc_dir: Option<BorrowedFd<'_>>,
+    ids: Option<ProcessIds>,
 ) -> Result<CapabilityReport, ExecError> {
     apply_capabilities_single_threaded(
         CapabilitySet::oci_default(),
+        ids,
         &mut RealKernel {
             threads,
             own_proc_dir,
@@ -249,6 +297,7 @@ pub(crate) fn apply_default_capabilities_with(
 /// 単一スレッド条件を適用の前後で検査して [`apply_capabilities`] を呼ぶ。事前検査は副作用の前に行う。
 fn apply_capabilities_single_threaded(
     allowed: CapabilitySet,
+    ids: Option<ProcessIds>,
     kernel: &mut impl CapKernel,
 ) -> Result<CapabilityReport, ExecError> {
     if kernel.thread_count() != Some(1) {
@@ -258,7 +307,7 @@ fn apply_capabilities_single_threaded(
             "capability drop requires a single-threaded process (Threads: 1)",
         ));
     }
-    let report = apply_capabilities(allowed, kernel)?;
+    let report = apply_capabilities(allowed, ids, kernel)?;
     if kernel.thread_count() != Some(1) {
         return Err(ExecError::new(
             ErrorCode::Internal,
@@ -274,6 +323,7 @@ const CAP_INDEX_LIMIT: u8 = 64;
 
 fn apply_capabilities(
     allowed: CapabilitySet,
+    ids: Option<ProcessIds>,
     kernel: &mut impl CapKernel,
 ) -> Result<CapabilityReport, ExecError> {
     let stage = IsolationStage::CapabilityDrop;
@@ -281,6 +331,14 @@ fn apply_capabilities(
 
     // 0. 補助グループの消去（`CAP_SETGID` を落とす前に行う。失敗したら何も削減しないまま拒否する）。
     let supplementary_groups = drop_supplementary_groups(kernel)?;
+
+    // 0b. uid・gid の切り替え（rootless の exec が参加した後だけ。gid → uid の順。bounding set の削減より前に
+    // 行い、参加で得た全 capability を使って切り替える。#1462）。
+    // 切り替えでカーネルが解除する親死亡シグナルと dumpable を、直後に結び直す（#1462・REPAIR-5・SEC-1）。
+    if let Some(ids) = ids {
+        set_process_ids(kernel, ids)?;
+        kernel.rebind_to_parent()?;
+    }
 
     // 1. bounding set の削減（許可集合に無い番号を、カーネルが知る最後の番号まですべて drop する）。
     let mut dropped = Vec::new();
@@ -393,8 +451,19 @@ fn apply_capabilities(
     })
 }
 
+/// 参加前の補助グループの消去の結果（SUP-6・SEC-1・SEC-5・TASK-163 追補・#1457・#1462）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PreJoinGroups {
+    /// 参加前に処理を終えた（消去した・元から空・`setgroups` が `deny` で現状維持）。
+    Done(SupplementaryGroups),
+    /// 消去を参加の **後** に回す。初期 user namespace で `CAP_SETGID` を持たない非特権の呼び出し側が、別の
+    /// user namespace（rootless のコンテナ）へ入る場合に限る。参加後は参加先の全 capability で消去を試み、
+    /// 参加先が `setgroups` を `deny` にしていれば現状維持として記録する。
+    DeferredUntilJoin,
+}
+
 /// 稼働中コンテナへの exec が、namespace へ参加する **前** に補助グループを空にする
-/// （SUP-6・SEC-1・SEC-5・TASK-163 追補・#1457）。本番ビルドの実装。
+/// （SUP-6・SEC-1・SEC-5・TASK-163 追補・#1457・#1462）。本番ビルドの実装。
 ///
 /// `reapply::prepare_exec_restrictions` が準備の最後に呼ぶ。exec 専用プロセスは、対象の user namespace へ
 /// `setns` した後では（その user namespace が `setgroups` を `deny` にしていれば）補助グループを消せず、exec を
@@ -403,22 +472,32 @@ fn apply_capabilities(
 /// 消去しておけば、参加後の capability 削減は「元から空」になる。
 ///
 /// 契約は [`drop_supplementary_groups`] と同じ（消去できず `deny` も確認できなければ拒否 = 準備の失敗で、
-/// 参加しない）。スレッド単位の syscall のため、前後で `Threads: 1` を確かめる。capability は変更しない。
+/// 参加しない）。ただし `defer_on_denied_allow` が真のとき、`EPERM` かつ呼び出し側の user namespace が
+/// `setgroups` を許している（`allow`）場合は拒否せず [`PreJoinGroups::DeferredUntilJoin`] を返す: 補助グループを
+/// 持つ非特権ユーザーは初期 user namespace で `CAP_SETGID` を持たず、参加の前には消去できないが、参加後は参加先で
+/// 全 capability を得て消去できる（#1462）。呼び出し側（`reapply`）が、別の user namespace へ入り、かつ呼び出し側の
+/// 実効 uid がコンテナの user namespace の所有者と一致する場合だけ真にする。スレッド単位の syscall のため、
+/// 前後で `Threads: 1` を確かめる。capability は変更しない。
 #[cfg(not(test))]
 pub(super) fn clear_supplementary_groups_before_join(
     threads: &mut ThreadCountSource,
     own_proc_dir: BorrowedFd<'_>,
-) -> Result<SupplementaryGroups, ExecError> {
-    clear_groups_single_threaded(&mut RealKernel {
-        threads,
-        own_proc_dir: Some(own_proc_dir),
-    })
+    defer_on_denied_allow: bool,
+) -> Result<PreJoinGroups, ExecError> {
+    clear_groups_single_threaded(
+        &mut RealKernel {
+            threads,
+            own_proc_dir: Some(own_proc_dir),
+        },
+        defer_on_denied_allow,
+    )
 }
 
-/// 単一スレッド条件を前後で検査して [`drop_supplementary_groups`] を呼ぶ（事前検査は副作用の前）。
+/// 単一スレッド条件を前後で検査して消去を呼ぶ（事前検査は副作用の前）。
 fn clear_groups_single_threaded(
     kernel: &mut impl CapKernel,
-) -> Result<SupplementaryGroups, ExecError> {
+    defer_on_denied_allow: bool,
+) -> Result<PreJoinGroups, ExecError> {
     let stage = IsolationStage::CapabilityDrop;
     if kernel.thread_count() != Some(1) {
         return Err(ExecError::new(
@@ -427,7 +506,7 @@ fn clear_groups_single_threaded(
             "clearing the supplementary groups requires a single-threaded process (Threads: 1)",
         ));
     }
-    let outcome = drop_supplementary_groups(kernel)?;
+    let outcome = clear_supplementary_groups_inner(kernel, defer_on_denied_allow)?;
     if kernel.thread_count() != Some(1) {
         return Err(ExecError::new(
             ErrorCode::Internal,
@@ -455,6 +534,80 @@ pub fn clear_supplementary_groups_for_test() -> Result<SupplementaryGroups, Exec
     })
 }
 
+/// 結合試験専用: user namespace への参加の **後** に本番が通る「補助グループの消去 → gid・uid の切り替え」だけを、
+/// 本番と同じ関数・本物の syscall で通す（SUP-6・SEC-5・TASK-163 追補・#1462）。
+///
+/// 呼び出し文脈は supervisor の `tests/exec_setns_join.rs` の **使い捨ての子プロセス**（単一スレッドの `main`。
+/// `join_namespaces` で対象の user namespace へ参加した直後）。capability は削減しない（`CAP_SETPCAP` を要さず、
+/// 参加後の資格情報の読み戻しだけを観測するため）。成功時は補助グループの扱いを返し、`uid`・`gid` への切り替えと
+/// 読み戻しの一致は関数内で確認済み。`exec-test-support` feature を付けたビルドにだけ存在する。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+#[doc(hidden)]
+pub fn apply_join_credentials_for_test(
+    uid: u32,
+    gid: u32,
+) -> Result<SupplementaryGroups, ExecError> {
+    let mut kernel = RealKernel {
+        threads: &mut ThreadCountSource::ProcSelf,
+        own_proc_dir: None,
+    };
+    let groups = drop_supplementary_groups(&mut kernel)?;
+    set_process_ids(&mut kernel, ProcessIds { uid, gid })?;
+    Ok(groups)
+}
+
+/// gid → uid の順で `ids` へ揃え、読み戻して (実, 実効, 保存) の 3 値すべてが一致することを確かめる
+/// （SUP-6・SEC-5・TASK-163 追補・#1462）。
+///
+/// 参加した user namespace に写像されていない id は `EINVAL`（`FailedPrecondition`）、`CAP_SETGID` / `CAP_SETUID`
+/// の不足は `EPERM`（`PermissionDenied`）。一致しなければ `Internal` で拒否する（fail-closed）。この段が要る理由:
+/// 非特権ユーザーが自分で作ったコンテナへ exec する場合は何も変わらない（ホスト側の uid が名前空間内の 0 に写る）
+/// が、ホストの root から rootless のコンテナへ exec すると、名前空間内では写像されていない uid（overflow uid）の
+/// まま参加先の全 capability を持ち、kuid 0 として root 所有のホスト側ファイルの所有者判定を通ってしまう。
+/// コンテナの所有者の uid・gid へ揃えることで、launch がコンテナへ与えた資格情報と一致させる。
+fn set_process_ids(kernel: &mut impl CapKernel, ids: ProcessIds) -> Result<(), ExecError> {
+    let stage = IsolationStage::CapabilityDrop;
+    let fail = |e: SysError, what: &str| ExecError::from_sys(e, stage, what);
+    kernel
+        .set_res_gid(ids.gid)
+        .map_err(|e| fail(e, "setresgid"))?;
+    if kernel.get_res_gid().map_err(|e| fail(e, "getresgid"))? != [ids.gid; 3] {
+        return Err(ExecError::new(
+            ErrorCode::Internal,
+            stage,
+            "gids differ from the target after setresgid",
+        ));
+    }
+    // ホストの root（uid 0）から別ユーザーの rootless コンテナへ exec すると uid が 0 から非 0 へ変わり、
+    // `SECBIT_KEEP_CAPS` が無ければ permitted が全消去されて後続の bounding set の削減・`capset` が `EPERM` に
+    // なる。切り替えの間だけ有効にし、結果にかかわらず直後に解除する（#1462）。
+    kernel
+        .set_keep_caps(true)
+        .map_err(|e| fail(e, "prctl(PR_SET_KEEPCAPS)"))?;
+    let switched = kernel.set_res_uid(ids.uid);
+    let unkept = kernel.set_keep_caps(false);
+    switched.map_err(|e| fail(e, "setresuid"))?;
+    unkept.map_err(|e| fail(e, "prctl(PR_SET_KEEPCAPS)"))?;
+    if kernel.get_res_uid().map_err(|e| fail(e, "getresuid"))? != [ids.uid; 3] {
+        return Err(ExecError::new(
+            ErrorCode::Internal,
+            stage,
+            "uids differ from the target after setresuid",
+        ));
+    }
+    // 実効 uid が 0 から非 0 へ変わると effective が空になる（`KEEP_CAPS` は permitted だけを残す）。bounding set の
+    // 削減（`CAP_SETPCAP`）と `capset` の前に、残った permitted へ effective を戻す。permitted・inheritable は
+    // 変えない（権限を増やさない）。
+    let current = kernel.get().map_err(|e| fail(e, "capget"))?;
+    kernel
+        .set(ThreadCaps {
+            effective: current.permitted,
+            ..current
+        })
+        .map_err(|e| fail(e, "capset"))?;
+    Ok(())
+}
+
 /// 呼び出したスレッドの補助グループを空にする（SUP-6・SEC-1・SEC-5・TASK-163 追補・#1457）。
 ///
 /// launch・exec の両経路で、capability の削減より前に呼ぶ。契約:
@@ -474,13 +627,30 @@ pub fn clear_supplementary_groups_for_test() -> Result<SupplementaryGroups, Exec
 fn drop_supplementary_groups(
     kernel: &mut impl CapKernel,
 ) -> Result<SupplementaryGroups, ExecError> {
+    match clear_supplementary_groups_inner(kernel, false)? {
+        PreJoinGroups::Done(groups) => Ok(groups),
+        // `defer_on_denied_allow = false` では延期を返さない。
+        PreJoinGroups::DeferredUntilJoin => Err(ExecError::new(
+            ErrorCode::Internal,
+            IsolationStage::CapabilityDrop,
+            "unexpected deferral of the supplementary groups",
+        )),
+    }
+}
+
+/// [`drop_supplementary_groups`] の本体。`defer_on_denied_allow` が真なら、`EPERM` かつ `setgroups` が `allow` の
+/// ときに拒否せず [`PreJoinGroups::DeferredUntilJoin`] を返す（#1462。参加前の準備だけが真にする）。
+fn clear_supplementary_groups_inner(
+    kernel: &mut impl CapKernel,
+    defer_on_denied_allow: bool,
+) -> Result<PreJoinGroups, ExecError> {
     let stage = IsolationStage::CapabilityDrop;
     let fail = |e: SysError, what: &str| ExecError::from_sys(e, stage, what);
     let before = kernel
         .supplementary_group_count()
         .map_err(|e| fail(e, "getgroups"))?;
     if before == 0 {
-        return Ok(SupplementaryGroups::AlreadyEmpty);
+        return Ok(PreJoinGroups::Done(SupplementaryGroups::AlreadyEmpty));
     }
     match kernel.clear_supplementary_groups() {
         Ok(()) => {
@@ -494,12 +664,17 @@ fn drop_supplementary_groups(
                     "supplementary groups remain after setgroups(0)",
                 ));
             }
-            Ok(SupplementaryGroups::Cleared { cleared: before })
+            Ok(PreJoinGroups::Done(SupplementaryGroups::Cleared {
+                cleared: before,
+            }))
         }
         // `EPERM` だけでは理由を特定できない（`CAP_SETGID` が無い・継承した seccomp フィルタ・LSM でも `EPERM` に
         // なる）。信頼できる procfs で user namespace の `setgroups` が `deny` と確認できた場合だけ残す。
         Err(SysError::Os(e)) if e == EPERM => match kernel.setgroups_denied() {
-            Some(true) => Ok(SupplementaryGroups::KeptSetgroupsDenied { kept: before }),
+            Some(true) => Ok(PreJoinGroups::Done(
+                SupplementaryGroups::KeptSetgroupsDenied { kept: before },
+            )),
+            Some(false) if defer_on_denied_allow => Ok(PreJoinGroups::DeferredUntilJoin),
             _ => Err(ExecError::new(
                 ErrorCode::PermissionDenied,
                 stage,
@@ -522,8 +697,11 @@ fn without(set: CapabilitySet, minus: CapabilitySet) -> CapabilitySet {
 pub(super) mod testing {
     use std::cell::Cell;
 
-    use super::{CapabilityReport, CapabilitySet, ExecError, apply_capabilities_single_threaded};
-    use crate::sys::{EINVAL, SysError, ThreadCaps};
+    use super::{
+        CapabilityReport, CapabilitySet, ExecError, PreJoinGroups, ProcessIds,
+        apply_capabilities_single_threaded,
+    };
+    use crate::sys::{EINVAL, EPERM, SysError, ThreadCaps};
 
     thread_local! {
         static DROP_ERR: Cell<Option<SysError>> = const { Cell::new(None) };
@@ -538,10 +716,14 @@ pub(super) mod testing {
     /// `stages.rs` の組み込み段が `cfg(test)` で呼ぶ偽物。本物の絞り込みロジックを偽カーネルで走らせる
     /// （本物は `Threads: 1` を要求し、マルチスレッドの libtest では動かないため）。
     pub(in crate::exec) fn apply_default_capabilities() -> Result<CapabilityReport, ExecError> {
+        apply_with_ids(None)
+    }
+
+    fn apply_with_ids(ids: Option<ProcessIds>) -> Result<CapabilityReport, ExecError> {
         crate::exec::no_new_privs::testing::rec("capability_drop");
         let mut k = Fake::new();
         k.drop_err = DROP_ERR.with(Cell::take);
-        apply_capabilities_single_threaded(CapabilitySet::oci_default(), &mut k)
+        apply_capabilities_single_threaded(CapabilitySet::oci_default(), ids, &mut k)
     }
 
     thread_local! {
@@ -553,24 +735,55 @@ pub(super) mod testing {
         GROUPS_BEFORE_JOIN.with(|c| c.set(count));
     }
 
+    thread_local! {
+        static GROUPS_EPERM_ALLOW: Cell<bool> = const { Cell::new(false) };
+        static DEFER_REQUESTED: Cell<Option<bool>> = const { Cell::new(None) };
+        static IDS_SEEN: Cell<Option<Option<ProcessIds>>> = const { Cell::new(None) };
+    }
+
+    /// 次の 1 回だけ、参加前の補助グループの偽物が `setgroups` に `EPERM`（`allow` のまま）を返すようにする。
+    pub(in crate::exec) fn fake_groups_before_join_eperm_allow() {
+        GROUPS_EPERM_ALLOW.with(|c| c.set(true));
+    }
+
+    /// 直近の `clear_supplementary_groups_before_join` に渡された `defer_on_denied_allow`（読むと消える）。
+    pub(in crate::exec) fn take_defer_requested() -> Option<bool> {
+        DEFER_REQUESTED.with(Cell::take)
+    }
+
+    /// 直近の `apply_default_capabilities_with` に渡された `ids`（呼ばれていなければ `None`、呼ばれて `ids` が
+    /// なければ `Some(None)`。読むと消える）。
+    pub(in crate::exec) fn take_ids_seen() -> Option<Option<ProcessIds>> {
+        IDS_SEEN.with(Cell::take)
+    }
+
     /// `reapply.rs` が `cfg(test)` で呼ぶ偽物（libtest のプロセスの資格情報は変えない）。本物の判定ロジックを
     /// 偽カーネルで走らせ、呼ばれたことを記録する。
     pub(in crate::exec) fn clear_supplementary_groups_before_join(
         _threads: &mut super::ThreadCountSource,
         _own_proc_dir: std::os::fd::BorrowedFd<'_>,
-    ) -> Result<super::SupplementaryGroups, ExecError> {
+        defer_on_denied_allow: bool,
+    ) -> Result<PreJoinGroups, ExecError> {
         crate::exec::no_new_privs::testing::rec("setgroups_before_join");
+        DEFER_REQUESTED.with(|c| c.set(Some(defer_on_denied_allow)));
         let mut k = Fake::new();
         k.groups = GROUPS_BEFORE_JOIN.with(Cell::take);
-        super::clear_groups_single_threaded(&mut k)
+        if GROUPS_EPERM_ALLOW.with(Cell::take) {
+            k.setgroups_err = Some(SysError::Os(EPERM));
+            k.setgroups_denied = Some(false);
+        }
+        super::clear_groups_single_threaded(&mut k, defer_on_denied_allow)
     }
 
-    /// `reapply.rs` が `cfg(test)` で呼ぶ偽物（スレッド数の取得元は偽カーネルが持つため無視する）。
+    /// `reapply.rs` が `cfg(test)` で呼ぶ偽物（スレッド数の取得元は偽カーネルが持つため無視する）。渡された
+    /// `ids` を記録し、本物の判定ロジックを偽カーネルで走らせる。
     pub(in crate::exec) fn apply_default_capabilities_with(
         _threads: &mut super::ThreadCountSource,
         _own_proc_dir: Option<std::os::fd::BorrowedFd<'_>>,
+        ids: Option<ProcessIds>,
     ) -> Result<CapabilityReport, ExecError> {
-        apply_default_capabilities()
+        IDS_SEEN.with(|c| c.set(Some(ids)));
+        apply_with_ids(ids)
     }
 
     /// 偽カーネルの状態と、呼び出し記録・注入するエラー。
@@ -598,6 +811,18 @@ pub(super) mod testing {
         pub(super) setgroups_noop: bool,
         /// procfs の `setgroups` の確認結果（既定は `allow` = `Some(false)`）。
         pub(super) setgroups_denied: Option<bool>,
+        /// 偽の (実, 実効, 保存) uid・gid。`setresuid` / `setresgid` が書き換える。
+        pub(super) uids: [u32; 3],
+        pub(super) gids: [u32; 3],
+        /// `setresgid` / `setresuid` に返させるエラー。
+        pub(super) setresgid_err: Option<SysError>,
+        pub(super) setresuid_err: Option<SysError>,
+        /// `setresuid` / `setresgid` が成功を返すが値を反映しない（読み戻し検証の不一致を作る）。
+        pub(super) setres_noop: bool,
+        /// `PR_SET_KEEPCAPS`（有効化）に返させるエラー。
+        pub(super) keepcaps_err: Option<SysError>,
+        /// 親への結び直しに返させるエラーの code。
+        pub(super) rebind_err: Option<crate::traits::types::ErrorCode>,
     }
 
     impl Fake {
@@ -623,6 +848,13 @@ pub(super) mod testing {
                 setgroups_err: None,
                 setgroups_noop: false,
                 setgroups_denied: Some(false),
+                uids: [4242; 3],
+                gids: [4343; 3],
+                setresgid_err: None,
+                setresuid_err: None,
+                setres_noop: false,
+                keepcaps_err: None,
+                rebind_err: None,
             }
         }
     }
@@ -688,6 +920,59 @@ pub(super) mod testing {
             Ok(())
         }
 
+        fn set_res_gid(&mut self, gid: u32) -> Result<(), SysError> {
+            self.calls.push("setresgid");
+            if let Some(e) = self.setresgid_err {
+                return Err(e);
+            }
+            if !self.setres_noop {
+                self.gids = [gid; 3];
+            }
+            Ok(())
+        }
+
+        fn set_res_uid(&mut self, uid: u32) -> Result<(), SysError> {
+            self.calls.push("setresuid");
+            if let Some(e) = self.setresuid_err {
+                return Err(e);
+            }
+            if !self.setres_noop {
+                self.uids = [uid; 3];
+            }
+            Ok(())
+        }
+
+        fn get_res_gid(&mut self) -> Result<[u32; 3], SysError> {
+            self.calls.push("getresgid");
+            Ok(self.gids)
+        }
+
+        fn get_res_uid(&mut self) -> Result<[u32; 3], SysError> {
+            self.calls.push("getresuid");
+            Ok(self.uids)
+        }
+
+        fn set_keep_caps(&mut self, keep: bool) -> Result<(), SysError> {
+            self.calls
+                .push(if keep { "keepcaps_on" } else { "keepcaps_off" });
+            if keep && let Some(e) = self.keepcaps_err {
+                return Err(e);
+            }
+            Ok(())
+        }
+
+        fn rebind_to_parent(&mut self) -> Result<(), ExecError> {
+            self.calls.push("rebind");
+            match self.rebind_err {
+                Some(code) => Err(ExecError::new(
+                    code,
+                    super::IsolationStage::CapabilityDrop,
+                    "rebind failed",
+                )),
+                None => Ok(()),
+            }
+        }
+
         fn set(&mut self, caps: ThreadCaps) -> Result<(), SysError> {
             self.calls.push("capset");
             self.capset_arg = Some(caps);
@@ -712,7 +997,7 @@ mod tests {
 
     /// 偽カーネルへ既定集合を適用する。
     fn run(fake: &mut Fake) -> Result<CapabilityReport, ExecError> {
-        apply_capabilities(CapabilitySet::oci_default(), fake)
+        apply_capabilities(CapabilitySet::oci_default(), None, fake)
     }
 
     /// SEC-1: 既定集合以外（41 - 14 = 27 個）をすべて drop し、bounding が既定集合になる。
@@ -932,8 +1217,8 @@ mod tests {
         let mut k = Fake::new();
         k.groups = 5;
         assert_eq!(
-            clear_groups_single_threaded(&mut k).unwrap(),
-            SupplementaryGroups::Cleared { cleared: 5 }
+            clear_groups_single_threaded(&mut k, false).unwrap(),
+            PreJoinGroups::Done(SupplementaryGroups::Cleared { cleared: 5 })
         );
         assert_eq!(k.calls, ["setgroups"]);
         assert_eq!(k.bounding, (1u64 << 41) - 1);
@@ -944,14 +1229,14 @@ mod tests {
         k.setgroups_err = Some(SysError::Os(EPERM));
         k.setgroups_denied = Some(true);
         assert_eq!(
-            clear_groups_single_threaded(&mut k).unwrap(),
-            SupplementaryGroups::KeptSetgroupsDenied { kept: 5 }
+            clear_groups_single_threaded(&mut k, false).unwrap(),
+            PreJoinGroups::Done(SupplementaryGroups::KeptSetgroupsDenied { kept: 5 })
         );
 
         let mut k = Fake::new();
         k.groups = 5;
         k.setgroups_err = Some(SysError::Os(EPERM));
-        let e = clear_groups_single_threaded(&mut k).unwrap_err();
+        let e = clear_groups_single_threaded(&mut k, false).unwrap_err();
         assert_eq!(
             (e.code, e.stage),
             (ErrorCode::PermissionDenied, IsolationStage::CapabilityDrop)
@@ -961,10 +1246,212 @@ mod tests {
         let mut k = Fake::new();
         k.groups = 5;
         k.threads = Some(2);
-        let e = clear_groups_single_threaded(&mut k).unwrap_err();
+        let e = clear_groups_single_threaded(&mut k, false).unwrap_err();
         assert_eq!(e.code, ErrorCode::FailedPrecondition);
         assert_eq!(k.calls, Vec::<&str>::new());
         assert_eq!(k.groups, 5);
+    }
+
+    /// SUP-6・SEC-1・SEC-5・TASK-163.h2・#1462: 参加前の消去を参加後へ回すのは、延期が許され（`defer_on_denied_allow`）、
+    /// かつ `EPERM` で `setgroups` が `allow` と確認できたときだけ。延期不可・`deny` 確認不能・`deny`（現状維持）・
+    /// 消去成功の各場合は延期しない。延期するときは `setgroups` を 1 回だけ呼び、補助グループは変えない。
+    #[test]
+    fn sup6_sec1_task163_h2_pre_join_clearing_defers_only_on_eperm_with_allow() {
+        let mut k = Fake::new();
+        k.groups = 5;
+        k.setgroups_err = Some(SysError::Os(EPERM));
+        k.setgroups_denied = Some(false);
+        assert_eq!(
+            clear_groups_single_threaded(&mut k, true).unwrap(),
+            PreJoinGroups::DeferredUntilJoin
+        );
+        assert_eq!(k.groups, 5);
+        assert_eq!(k.calls, ["setgroups", "read_setgroups"]);
+
+        // `deny` の確認不能は延期せず拒否する。
+        let mut k = Fake::new();
+        k.groups = 5;
+        k.setgroups_err = Some(SysError::Os(EPERM));
+        k.setgroups_denied = None;
+        let e = clear_groups_single_threaded(&mut k, true).unwrap_err();
+        assert_eq!(e.code, ErrorCode::PermissionDenied);
+
+        // `deny` は延期せず、参加前に現状維持として記録する。
+        let mut k = Fake::new();
+        k.groups = 5;
+        k.setgroups_err = Some(SysError::Os(EPERM));
+        k.setgroups_denied = Some(true);
+        assert_eq!(
+            clear_groups_single_threaded(&mut k, true).unwrap(),
+            PreJoinGroups::Done(SupplementaryGroups::KeptSetgroupsDenied { kept: 5 })
+        );
+
+        // 消去できるなら延期せず消す。
+        let mut k = Fake::new();
+        k.groups = 2;
+        assert_eq!(
+            clear_groups_single_threaded(&mut k, true).unwrap(),
+            PreJoinGroups::Done(SupplementaryGroups::Cleared { cleared: 2 })
+        );
+
+        // EPERM 以外の errno は延期しない。
+        let mut k = Fake::new();
+        k.groups = 2;
+        k.setgroups_err = Some(SysError::Os(EINVAL));
+        assert!(clear_groups_single_threaded(&mut k, true).is_err());
+    }
+
+    /// SUP-6・SEC-5・TASK-163.h2・#1462: `ids` を渡すと補助グループの消去の後・bounding set の削減の前に、
+    /// `setresgid` → 読み戻し → `setresuid` → 読み戻しの順で切り替える。`None` なら setres 系を一切呼ばない
+    /// （launch の回帰防止）。
+    #[test]
+    fn sup6_sec5_task163_h2_ids_switch_between_groups_and_bounding() {
+        let mut k = Fake::new();
+        k.groups = 2;
+        k.bounding = 0xFF;
+        apply_capabilities(
+            CapabilitySet::oci_default(),
+            Some(ProcessIds { uid: 0, gid: 0 }),
+            &mut k,
+        )
+        .unwrap();
+        assert_eq!(
+            k.calls,
+            [
+                "setgroups",
+                "setresgid",
+                "getresgid",
+                "keepcaps_on",
+                "setresuid",
+                "keepcaps_off",
+                "getresuid",
+                "capget",
+                "capset",
+                "rebind",
+                "drop",
+                "ambient",
+                "capget",
+                "capset",
+                "capget"
+            ]
+        );
+        assert_eq!((k.uids, k.gids), ([0; 3], [0; 3]));
+
+        let mut k = Fake::new();
+        run(&mut k).unwrap();
+        assert!(!k.calls.iter().any(|c| c.starts_with("setres")));
+        assert_eq!((k.uids, k.gids), ([4242; 3], [4343; 3]));
+    }
+
+    /// SUP-6・SEC-5・TASK-163.h2・#1462: 切り替えの失敗は errno を写像して拒否する（写像されていない id の `EINVAL` は
+    /// `FailedPrecondition`、`EPERM` は `PermissionDenied`）。読み戻しが一致しなければ `Internal`。いずれも
+    /// bounding set の削減に進まない（段は `CapabilityDrop`）。uid の切り替えは gid の後なので、gid が失敗すれば
+    /// uid は呼ばれない。
+    #[test]
+    fn sup6_sec5_task163_h2_id_switch_failures_are_fail_closed() {
+        let ids = Some(ProcessIds { uid: 0, gid: 0 });
+        type Case = (
+            &'static str,
+            Option<SysError>,
+            Option<SysError>,
+            bool,
+            ErrorCode,
+        );
+        let cases: [Case; 5] = [
+            (
+                "gid EINVAL",
+                Some(SysError::Os(EINVAL)),
+                None,
+                false,
+                ErrorCode::FailedPrecondition,
+            ),
+            (
+                "gid EPERM",
+                Some(SysError::Os(EPERM)),
+                None,
+                false,
+                ErrorCode::PermissionDenied,
+            ),
+            (
+                "uid EINVAL",
+                None,
+                Some(SysError::Os(EINVAL)),
+                false,
+                ErrorCode::FailedPrecondition,
+            ),
+            (
+                "uid EPERM",
+                None,
+                Some(SysError::Os(EPERM)),
+                false,
+                ErrorCode::PermissionDenied,
+            ),
+            ("noop readback", None, None, true, ErrorCode::Internal),
+        ];
+        for (name, gid_err, uid_err, noop, code) in cases {
+            let mut k = Fake::new();
+            k.setresgid_err = gid_err;
+            k.setresuid_err = uid_err;
+            k.setres_noop = noop;
+            let e = apply_capabilities(CapabilitySet::oci_default(), ids, &mut k).unwrap_err();
+            assert_eq!(
+                (e.code, e.stage),
+                (code, IsolationStage::CapabilityDrop),
+                "{name}"
+            );
+            assert!(!k.calls.contains(&"drop"), "{name}");
+            assert!(!k.calls.contains(&"capset"), "{name}");
+            if gid_err.is_some() {
+                assert!(!k.calls.contains(&"setresuid"), "{name}");
+            }
+        }
+    }
+
+    /// SUP-6・SEC-5・REPAIR-5・TASK-163.h2・#1462: uid の切り替えは `KEEP_CAPS` を立てた間だけ行い、失敗しても必ず
+    /// 解除する。切り替えで消えた effective は permitted へ戻す（permitted・inheritable は変えない）。
+    /// 親への結び直しが失敗したら bounding set の削減へ進まない。
+    #[test]
+    fn sup6_sec5_task163_h2_keep_caps_around_uid_switch_and_rebind_is_required() {
+        let ids = Some(ProcessIds {
+            uid: 1000,
+            gid: 1000,
+        });
+        // 切り替えで effective が消えた状況を作る（ホスト root からの exec）。
+        let mut k = Fake::new();
+        k.caps.effective = [0, 0];
+        apply_capabilities(CapabilitySet::oci_default(), ids, &mut k).unwrap();
+        let on = k.calls.iter().position(|c| *c == "keepcaps_on").unwrap();
+        let uid = k.calls.iter().position(|c| *c == "setresuid").unwrap();
+        let off = k.calls.iter().position(|c| *c == "keepcaps_off").unwrap();
+        let rebind = k.calls.iter().position(|c| *c == "rebind").unwrap();
+        let drop_pos = k.calls.iter().position(|c| *c == "drop").unwrap();
+        assert!(on < uid && uid < off && off < rebind && rebind < drop_pos);
+
+        // uid の切り替えが失敗しても KEEP_CAPS は解除される。
+        let mut k = Fake::new();
+        k.setresuid_err = Some(SysError::Os(EPERM));
+        apply_capabilities(CapabilitySet::oci_default(), ids, &mut k).unwrap_err();
+        assert!(k.calls.contains(&"keepcaps_off"));
+        assert!(!k.calls.contains(&"drop"));
+
+        // KEEP_CAPS を立てられなければ uid を切り替えない。
+        let mut k = Fake::new();
+        k.keepcaps_err = Some(SysError::Os(EPERM));
+        let e = apply_capabilities(CapabilitySet::oci_default(), ids, &mut k).unwrap_err();
+        assert_eq!(e.code, ErrorCode::PermissionDenied);
+        assert!(!k.calls.contains(&"setresuid"));
+
+        // 結び直しの失敗（親が消えた等）は fail-closed。
+        let mut k = Fake::new();
+        k.rebind_err = Some(ErrorCode::FailedPrecondition);
+        let e = apply_capabilities(CapabilitySet::oci_default(), ids, &mut k).unwrap_err();
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert!(!k.calls.contains(&"drop") && !k.calls.contains(&"ambient"));
+
+        // ids が None（launch）なら KEEP_CAPS も結び直しも呼ばない。
+        let mut k = Fake::new();
+        run(&mut k).unwrap();
+        assert!(!k.calls.contains(&"keepcaps_on") && !k.calls.contains(&"rebind"));
     }
 
     /// SEC-1: capset に渡る値は effective = permitted = 既定集合、inheritable = 空。
@@ -1030,7 +1517,7 @@ mod tests {
         for threads in [Some(2), Some(0), None] {
             let mut k = Fake::new();
             k.threads = threads;
-            let e = apply_capabilities_single_threaded(CapabilitySet::oci_default(), &mut k)
+            let e = apply_capabilities_single_threaded(CapabilitySet::oci_default(), None, &mut k)
                 .unwrap_err();
             assert_eq!(e.code, ErrorCode::FailedPrecondition, "{threads:?}");
             assert_eq!(e.stage, IsolationStage::CapabilityDrop);
@@ -1045,7 +1532,7 @@ mod tests {
         for later in [Some(2), None] {
             let mut k = Fake::new();
             k.threads_later = Some(later);
-            let e = apply_capabilities_single_threaded(CapabilitySet::oci_default(), &mut k)
+            let e = apply_capabilities_single_threaded(CapabilitySet::oci_default(), None, &mut k)
                 .unwrap_err();
             assert_eq!(e.code, ErrorCode::Internal, "{later:?}");
             assert_eq!(e.stage, IsolationStage::CapabilityDrop);
@@ -1097,7 +1584,7 @@ mod tests {
             ThreadCountSource::PreOpened(std::fs::File::open("/dev/null").expect("null")),
         ];
         for source in &mut sources {
-            let e = apply_default_capabilities_with(source, None).unwrap_err();
+            let e = apply_default_capabilities_with(source, None, None).unwrap_err();
             assert_eq!(e.code, ErrorCode::FailedPrecondition);
             assert_eq!(e.stage, IsolationStage::CapabilityDrop);
             assert_eq!(
@@ -1191,6 +1678,7 @@ mod tests {
                     let mut threads = ThreadCountSource::ProcSelf;
                     let e = apply_capabilities(
                         CapabilitySet::oci_default(),
+                        None,
                         &mut RealKernel {
                             threads: &mut threads,
                             own_proc_dir: None,
@@ -1220,6 +1708,7 @@ mod tests {
                 let mut threads = ThreadCountSource::ProcSelf;
                 let report = apply_capabilities(
                     CapabilitySet::oci_default(),
+                    None,
                     &mut RealKernel {
                         threads: &mut threads,
                         own_proc_dir: None,

@@ -22,14 +22,14 @@
 `make` ターゲットを正とする（括弧内に実行される cargo コマンドを併記する）。本節は REPAIR-10 が求める 4 項目 (a) ビルドコマンドと成功基準・(b) 回帰確認コマンド一覧・(c) 推奨タイムアウト値・(d) 新機能追加時に更新すべきテスト一覧をすべて扱う。(d) は下記「新機能追加時に更新すべきテスト一覧」節で扱う。
 
 - `Cargo.toml`（workspace）と `crates/*/Cargo.toml`（メンバー crate）は現在すべて揃っており、`deny.toml` も存在するため、下記の `fmt`/`lint`/`test`/`deny` は Makefile 側で skip されず常に実行される（`HAS_CARGO`/`HAS_MEMBERS`/`HAS_DENY` はいずれも真）。`skip: ...` という出力が現れた場合は本来実行されるはずのターゲットが実行されていない異常事態であり、**合格の根拠にしない**（false-green 防止）。`check-workspace-manifest`（`cargo verify-project`）は `Cargo.toml` の存在のみで判定し、メンバー crate 未追加の中間状態でも実行される仕組みだった名残で、現状は常に実行される
-- PR 本文にこれらのコマンドの実行結果（終了コードと要点）が記載されているか（同じ PR で CI 設定を変更する場合はその diff にこれらのコマンドが含まれているか）を確認する。本節の未達は、個別に優先度を明記した項目を除き既定で P1 とする
+- PR 本文にローカルで実行した確認の結果（実行したコマンド・終了コードと要点）が記載されているか（同じ PR で CI 設定を変更する場合はその diff に下記のコマンドが含まれているか）を確認する。ローカルの確認は変更範囲に限った軽量なもの（`make fmt`・変更した crate の `cargo clippy -p <パッケージ名> --all-targets -- -D warnings` と `cargo test -p <パッケージ名>`・変更したスクリプトの自己テスト・波及しうる変更での `cargo check --workspace --all-targets`。[ci](.claude/rules/ci.md)「ローカルゲート」）で足り、ワークスペース全体の `make lint`・`make test`・`make ci` の実行結果は要件としない（全体は CI が検証する）。docs のみの変更ではビルド・テストの記載を省略してよい。本節の未達は、個別に優先度を明記した項目を除き既定で P1 とする
 - clippy 警告は 0 件を維持する。理由コメントなしで `#[allow(...)]` により警告を握りつぶす差分は P1。crate・モジュール全体に及ぶ広範な `#[allow(...)]`（`#![allow(...)]` 等）や、`unsafe` 関連 lint（`unsafe_code`・`clippy::undocumented_unsafe_blocks` 等）・外部入力の検証を隠す lint（`clippy::unwrap_used`・`clippy::expect_used`・`clippy::indexing_slicing` 等。下記「外部入力の検証」観点）の外部入力経路での抑止は、理由コメントの有無を問わず P0
 - テストの skip・ignore・アサーション弱体化で CI を通す差分は P0（回帰検出の後退を招くため）
 - 試験プロセスの中で実行可能ファイルへ `execveat`（`AT_EXECVE_CHECK`）を呼ぶ試験は、`crate::test_support::run_with_private_fs`（`unshare(CLONE_FS)` 済みの専用スレッド）経由にする。共有 `fs_struct` のままでは判定中（`in_exec`）に他試験の `std::thread::spawn` が `EAGAIN`（`failed to spawn thread`）で落ちる。経由せず直接呼ぶ差分は P1（#1685・REPAIR-7）
 
 ### ビルドコマンドと成功基準（REPAIR-10 (a)）
 
-合格は共通して「終了コード 0」とする。`skip: ...` が出力された場合は実行されていないため合格扱いにしない（上記の注意を参照）。
+下表は各ターゲットを実行した場合の合格条件である（ローカルでの実行の要否は上記のとおりで、`make ci` はローカル必須ではない）。合格は共通して「終了コード 0」とする。`skip: ...` が出力された場合は実行されていないため合格扱いにしない（上記の注意を参照）。
 
 | ターゲット | 実行内容 | 成功基準 |
 | ---- | ---- | ---- |
@@ -40,7 +40,7 @@
 | `make deny` | `cargo deny --locked check advisories bans licenses sources`（続けて `make deny-poc-venus-jig` で venus 試験治具の `Cargo.lock` も同じ 4 種で検査する） | 終了コード 0 かつ advisories・bans・licenses・sources の 4 チェックすべて ok（`--locked` により `Cargo.lock` の更新が必要な状態も失敗として検出する） |
 | `make ci` | `lint-docs` → `check-workspace-manifest` → `fmt-check` → `lint` → `test` → `doc` → `deny` の順に実行 | 7 サブターゲットすべてが終了コード 0（make は最初の失敗で停止する）。`lint-docs` は markdownlint・yamllint・editorconfig-checker・commitlint（`origin/main` からの分岐点以降のコミット）を含む |
 
-**`make ci` の合格はローカルゲート（[ci](.claude/rules/ci.md)）であり、PR のマージゲートである CI 全体と同一ではない。** `make ci` は `--all-features` での検証・`test-integration`・`bench-check`・3 OS matrix を含まない。PR のマージゲートは `ci.yml` の集約ジョブ `ci-complete` が `lint-docs`・`rust-ci`・`platform-ci`・`bench-regression`・`cross-target-check` の全ジョブの成功を fail-closed で検証した上で成功することである。PR の CI は macOS・Windows のネイティブランナーを使わず（`platform-ci` は ubuntu のみ。macOS・Windows は `cross-target-check` の型検査）、3 OS のネイティブ実行は main への push と `workflow_dispatch`（release 前を含む）で行う（[ci](.claude/rules/ci.md)「3 OS CI」）。
+**PR のマージゲートは CI であり、ローカルでの `make ci` の合格は PR の要件ではない。** ローカルは変更範囲の確認（[ci](.claude/rules/ci.md)「ローカルゲート」）で足り、`make ci` は CI の失敗の再現・リリース前の手元確認などに使う任意のターゲットである。また `make ci` は `--all-features` での検証・`test-integration`・`bench-check`・3 OS matrix を含まない。マージゲートの具体的な条件は、`ci.yml` の集約ジョブ `ci-complete` が `lint-docs`・`rust-ci`・`platform-ci`・`bench-regression`・`cross-target-check` の全ジョブの成功を fail-closed で検証した上で成功することである。PR の CI は macOS・Windows のネイティブランナーを使わず（`platform-ci` は ubuntu のみ。macOS・Windows は `cross-target-check` の型検査）、3 OS のネイティブ実行は main への push と `workflow_dispatch`（release 前を含む）で行う（[ci](.claude/rules/ci.md)「3 OS CI」）。
 
 ### 回帰確認コマンド一覧（REPAIR-7・REPAIR-10 (b)）
 
@@ -140,7 +140,7 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 | `bench-check-selftest`・`bench-baseline-selftest`・`bench-check`・`bench-plugin-boundary`・`plugin-feature-size` | `bench-regression` |
 | （対応 target なし。`rustup target add aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc` の後に、`<target>` をこの 3 つに置き換えて `cargo check --workspace --all-targets --all-features --target <target>` と `cargo clippy --workspace --all-targets --all-features --target <target> -- -D warnings`。`aarch64-apple-darwin`・`x86_64-pc-windows-msvc` は加えて既定 feature の `cargo clippy --workspace --all-targets --target <target> -- -D warnings` と `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --target <target>`。venus 試験治具は `cargo check` / `cargo clippy --manifest-path poc/venus-decoder/jig/Cargo.toml --locked --all-targets --target aarch64-apple-darwin`〔clippy は `-- -D warnings`〕） | `cross-target-check` |
 | `lint-docs` | `lint-docs` |
-| `check-workspace-manifest`（`make ci` の一部） | 専用の CI ジョブはない（ローカルゲート専用）。workspace manifest が不正なら各 cargo ジョブのビルドが失敗するため、CI では間接的に検出される |
+| `check-workspace-manifest`（`make ci` の一部） | 専用の CI ジョブはない（手元で `make ci` を実行したときだけ走る。`make ci` はローカル任意）。workspace manifest が不正なら各 cargo ジョブのビルドが失敗するため、CI では間接的に検出される |
 
 ### 推奨タイムアウト値（REPAIR-5・REPAIR-10 (c)）
 

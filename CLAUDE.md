@@ -155,7 +155,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 | [spec-reference.md](.claude/rules/spec-reference.md) | **リポ固有**: spec（SSOT）の参照・ID 併記・編集禁止 |
 | [dependency-policy.md](.claude/rules/dependency-policy.md) | **リポ固有**: フルスクラッチ・禁止クレート・`=x.y.z` 固定・ユーザー承認制 |
 | [licensing.md](.claude/rules/licensing.md) | **リポ固有**: 中核 Apache-2.0 単独・補助 crate の選択肢・コピーレフト禁止 |
-| [ci.md](.claude/rules/ci.md) | **リポ固有**: ローカルゲート・5 段階 CI ゲート・3 OS CI・実機前提テストの扱い |
+| [ci.md](.claude/rules/ci.md) | **リポ固有**: ローカルゲート（変更範囲に限った確認。全体は CI）・5 段階 CI ゲート・3 OS CI・実機前提テストの扱い |
 | [git-hooks.md](.claude/rules/git-hooks.md) | **リポ固有**: lefthook の時間予算・CI との役割分担（CI と重複する検査をフックに置かない） |
 
 ## Current Skills
@@ -168,7 +168,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 
 ## Conventions
 
-- **ローカル検証**: `make fmt-check`・`make lint`・`make test`・`make doc`（まとめて `make ci`）を通してからコミットする（[ci](.claude/rules/ci.md)）。ビルド・テストは `docs/spec` 抜きで成立させる
+- **ローカル検証**: 変更範囲に限った軽量な確認に留める。`make fmt` で整形し、変更した crate の `cargo clippy -p <パッケージ名> --all-targets -- -D warnings`・`cargo test -p <パッケージ名>` を通してからコミットする（共有の型・公開トレイト・`Cargo.toml`・feature・`cfg` を変えたら `cargo check --workspace --all-targets` も）。ワークスペース全体の検証は CI がマージゲートとして担い、`make ci` は任意（[ci](.claude/rules/ci.md)「ローカルゲート」）。ビルド・テストは `docs/spec` 抜きで成立させる
 - **日本語**: やりとり・報告・コミット説明文・コード内コメントは日本語（プログラム出力文字列は英語）
 - **Conventional Commits**: `--no-verify` 禁止
 - **セキュリティレビュー**: PR 作成前に OWASP Top 10＋コンテナ分離・plugin 信頼境界を確認

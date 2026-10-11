@@ -74,6 +74,9 @@ windows-sys = { version = "=0.61.2", default-features = false }
 unicode-normalization = { version = "=0.1.25", default-features = false }
 # OCI レジストリクライアントの HTTP/TLS（OCI-1・TASK-51.1）。承認: Issue #399・TASK-51.hdep1（2026-10-10）。
 # 配置は crates/oci に限る。暗号は rustls-graviola（純 Rust）に固定し、ring / aws-lc-rs / webpki-roots は引かない。
+# Cargo.lock には rustls-webpki の optional 依存として ring / cc の項目が残るが、これは rustls-webpki 側の
+# `ring?/alloc`（weak feature）をロック解決が拾うためで、有効な feature には ring が無く、
+# `cargo tree -e normal,build -i ring --target all` は何も出力しない（ビルド・リンクされない）。
 # rustls は RUSTSEC-2026-0285 の修正版 0.23.45。ルート証明書は OS のストア（rustls-native-certs）から読む。
 ureq = { version = "=3.4.2", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "=0.23.45", default-features = false, features = ["std", "tls12", "logging"] }

@@ -153,10 +153,8 @@ fn valid_repository_component(c: &str) -> bool {
             seen_alnum = true;
             sep.clear();
         } else if matches!(b, b'.' | b'_' | b'-') {
+            // 連続ハイフンの個数に独自の上限は設けない（文法上は無制限。全体は 255 バイト上限で抑える）。
             sep.push(b as char);
-            if sep.len() > 64 {
-                return false;
-            }
         } else {
             return false;
         }
@@ -381,6 +379,13 @@ mod tests {
                 "v2".into()
             )
         );
+    }
+
+    /// OCI-1: 文法上有効な長い連続ハイフンを受理する（全体の 255 バイト上限は別途検証される）。
+    #[test]
+    fn long_hyphen_run_is_accepted() {
+        let name = format!("a{}b", "-".repeat(65));
+        assert_eq!(Repository::parse(&name).expect("parse").as_str(), name);
     }
 
     /// OCI-1: 他レジストリ・digest 指定・localhost。

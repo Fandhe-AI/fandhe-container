@@ -88,8 +88,8 @@ Actions のキャッシュはリポジトリあたり **10 GB** が上限（Org 
 
 | キャッシュ | 場所 | key | 中身・サイズ（2026-10-11） |
 | ---------- | ---- | --- | -------------------------- |
-| `fandhe-container-<os>-clippy-v3-*`・`-test-v3-*` | `rust-ci`（reusable `rust-base-ci` の `cache: true`） | `Cargo.lock` のハッシュ（[#165](https://github.com/Fandhe-AI/actions/pull/165) 以降は `-v4-<rustc の release>-<commit-hash 先頭 12 桁>-<ルート Cargo.lock のハッシュ>`）。`restore-keys` は前方一致 | `~/.cargo/registry`・`target`（workspace メンバーの成果物は保存前に prune）。各 105〜145 MB |
-| `fandhe-container-<os>-deny-*` | 同上の deny ジョブ | 同上 | `~/.cargo/registry` のみ。30〜41 MB |
+| `fandhe-container-<os>-clippy-v4-*`・`-test-v4-*` | `rust-ci`（reusable `rust-base-ci` の `cache: true`） | `-v4-<rustc の release>-<commit-hash 先頭 12 桁>-<ルート Cargo.lock のハッシュ>`（[#165](https://github.com/Fandhe-AI/actions/pull/165) で `-v3-<Cargo.lock のハッシュ>` から変更。`v3` は移行期間の `restore-keys` のみ）。`Cargo.toml` は含まない。`restore-keys` は前方一致 | `~/.cargo/registry`・`target`（workspace メンバーの成果物は保存前に prune）。各 105〜145 MB |
+| `fandhe-container-<os>-deny-*` | 同上の deny ジョブ | `-deny-<ルート Cargo.lock のハッシュ>`（rustc の版は含まない） | `~/.cargo/registry` のみ。30〜41 MB |
 | `cargo-tools-Linux-*` | `platform-ci`（ubuntu のみ） | `scripts/versions.sh` のハッシュ | cargo-deny・cargo-about のバイナリ。10 MB |
 
 - **保存は main の push だけにし、PR は restore のみにする**（大きい blob が対象）。PR の cache は `refs/pull/<N>/merge` スコープに保存され、他の PR・main からは読めない。`Cargo.lock` を変えた PR や、main の保存より先に走った PR が main と同内容の blob を PR ごとに重複保存し、容量を消費する。`rust-ci` は reusable の `cache-save` 入力（`Fandhe-AI/actions` [#165](https://github.com/Fandhe-AI/actions/pull/165) で追加。`ci.yml` の `rust-ci` は `cache-save: ${{ github.ref == 'refs/heads/main' }}` を渡し済み）、自前の `actions/cache` は `actions/cache/restore` と、main だけで走る `actions/cache/save` に分ける。トレードオフ: PR は 2 回目以降の push でも自分の保存を使えず、main の blob からの部分復元になる。main への push が続くと古い実行は concurrency で取り消されて保存されないが、最後の実行が保存するため PR はその blob を読む

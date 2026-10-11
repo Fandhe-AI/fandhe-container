@@ -97,4 +97,10 @@ WORKDIR /work
 # rust-ci.with.cargo-deny-version（REPAIR-7 ステージ 5）と同期させる）。
 RUN cargo install cargo-deny@0.20.2 --locked
 
+# make third-party-licenses（cargo-about。TASK-103.2・OSS-5）が即実行できるよう、cargo-about を
+# 版固定で導入する。make 側は自動導入しない（fail-closed）ため、ここで先行導入する。バイナリは
+# feature `cli` が要る。ビルドに C コンパイラ（ring 等）が要るが、本イメージは build-essential を導入済み。
+# バージョンは Makefile の CARGO_ABOUT_VERSION と同期させる。
+RUN cargo install cargo-about@0.9.2 --locked --features cli
+
 CMD ["bash"]

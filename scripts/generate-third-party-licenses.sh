@@ -9,7 +9,7 @@
 #
 # 依存承認との関係: cargo-about は cargo のサブコマンドで Cargo.toml の dependencies に入らない
 # ため、dependency-policy の依存承認の対象外。本スクリプトは cargo-about を導入しない
-# （版を固定した導入と版のユーザー承認は #830〔TASK-103.2〕の範囲）。未導入なら
+# （導入は Dockerfile と `make install-cargo-about`。TASK-103.2）。未導入なら
 # 自動導入も黙ってスキップもせず、tool-missing で止まる（fail-closed）。
 #
 # 使い方:
@@ -179,7 +179,7 @@ path_is_symlink_free() {
 
 # ツール確認は入力検証より先に行い、未導入を別の失敗と誤分類しない。
 if ! run_limited 30 "$cargo" about --version >/dev/null 2>&1; then
-    err tool-missing "cargo-about is not installed (installation is tracked in #830)"
+    err tool-missing "cargo-about is not installed (run `make install-cargo-about`)"
     exit 2
 fi
 

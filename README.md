@@ -42,7 +42,7 @@ cargo build --workspace  # ビルド
 make test                # テスト（lint・deny まで含めた一括検証は make ci）
 ```
 
-`make help` でターゲット一覧を表示します。コントリビュートの流れは [CONTRIBUTING.md](./CONTRIBUTING.md)、crate 境界は [docs/architecture.md](./docs/architecture.md)、ビルド・回帰確認コマンドは [AGENTS.md](./AGENTS.md) を参照してください。
+`make help` でターゲット一覧を表示します（Makefile は薄い入口で、実体は `scripts/` 配下のスクリプトです。Make を使わない場合は `scripts/help.sh` を参照。編集規約は [.claude/rules/makefile.md](./.claude/rules/makefile.md)）。コントリビュートの流れは [CONTRIBUTING.md](./CONTRIBUTING.md)、crate 境界は [docs/architecture.md](./docs/architecture.md)、ビルド・回帰確認コマンドは [AGENTS.md](./AGENTS.md) を参照してください。
 
 ## 開発環境構築
 

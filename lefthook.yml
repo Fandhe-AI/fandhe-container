@@ -3,7 +3,7 @@
 # 方針（.claude/rules/git-hooks.md・conventional-commits.md・security.md）:
 # - --no-verify によるスキップは禁止
 # - Cargo.toml 未追加（workspace 作成予定）の間、cargo 系ジョブはスキップする
-#   （Makefile の HAS_CARGO 判定と同一方針）
+#   （scripts/lib.sh の skip_unless_workspace の判定と同一方針）
 # - フックの追加・変更時は .claude/rules/git-hooks.md の方針（時間予算・CI との役割分担）に従う
 # - GitHub Actions（ci.yml の rust-ci・platform-ci 等）で実行する検査はフックで重複実行しない。
 #   フックは CI に無い秘密情報検査と、staged 限定の軽量な整形・コミットメッセージ検査に限る

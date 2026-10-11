@@ -1,8 +1,14 @@
-//! `RuntimeService` の CRI 実装（TASK-57.1・TASK-57.2・#429・#430・CRI-1・ERR-3）。
+//! `RuntimeService` の CRI 実装（TASK-57.1・TASK-57.2・TASK-57.3・#429・#430・#431・CRI-1・ERR-3）。
 //!
 //! `fandhe-container-plugin-cri`（TASK-108）が gRPC サーバーへ載せる `RuntimeService` 実装の本体。
-//! 本ファイルの時点で実装済みなのは `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox` で、
-//! 他の RPC は `Unimplemented` を返す（Status/List は #431、Container 系は TASK-58 で追加する）。
+//! 本ファイルの時点で実装済みなのは `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・
+//! `PodSandboxStatus`・`ListPodSandbox` で、他の RPC は `Unimplemented` を返す（Container 系は TASK-58 で追加する）。
+//!
+//! **Status/List の扱い（CRI-1・ERR-3・TASK-57.3）**: `PodSandboxStatus` は未知 ID を `NOT_FOUND`、空 ID を
+//! `INVALID_ARGUMENT` にする。`ListPodSandbox` は未知の ID や一致なしをエラーにせず空の一覧を返し、
+//! 未知の state 値と過大な `label_selector`（件数・文字列長・合計バイト数） だけを `INVALID_ARGUMENT` にする。並びは `(created_at, id)` の昇順。
+//! どちらも読み取り専用で、labels・annotations は保持した値を無改変で返す。`network`・`linux`・`info`・
+//! `containers_statuses` は空のスタブで、Container 連携（TASK-58）・net 連携（TASK-59 以降）で埋める（REPAIR-3）。
 //!
 //! **Stop/Remove の未知 ID の扱い（ERR-3）**: `StopPodSandbox` は存在しない ID を `NOT_FOUND` にする
 //! （受け入れ基準）。cri-api の proto コメントは回収済みならエラーにしない冪等性を求めるため差異があり、
@@ -24,7 +30,7 @@
 //! 直接呼ぶ経路にも効かせるためと、受信上限では累積を縛れないため。検証の詳細は `config_limits`
 //! サブモジュール。
 //!
-//! **可観測性（REPAIR-4）**: `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox` は全終了経路（成功・入力不正・上限超過・内部エラー）で、
+//! **可観測性（REPAIR-4）**: `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox` は全終了経路（成功・入力不正・上限超過・内部エラー）で、
 //! 結果のステータスコードと所要時間を [`CriOpRecorder`] へ 1 件渡す。記録先は
 //! [`CriRuntimeService::with_recorder`] で注入する（既定は記録しない）。`config`・labels・annotations・
 //! エラー文言は記録先へ渡さない。
@@ -58,6 +64,15 @@ pub use config_limits::{
 /// 根拠: kubelet の既定の Pod 数上限は 1 ノード 110（`--max-pods`）で、1024 はその約 9 倍。
 /// 終了済みで未削除のサンドボックスが残る分を見込んでも届かない値とした。
 pub const MAX_SANDBOXES: usize = 1024;
+
+/// `ListPodSandbox` の `label_selector` 1 つのキー・値の最大バイト数（CRI-1・TASK-57.3）。
+///
+/// レジストリのロック中に各サンドボックスでハッシュされるため、入力サイズ×登録件数の処理に
+/// なる。公開トレイトの直接呼び出しでは gRPC の受信上限が効かないので、走査前に自前で拒否する。
+pub const MAX_LABEL_SELECTOR_STRING_BYTES: usize = 1024;
+
+/// `label_selector` 全体（全キー・全値・`id` の合計）の最大バイト数（CRI-1・TASK-57.3）。
+pub const MAX_LABEL_SELECTOR_TOTAL_BYTES: usize = 16 * 1024;
 
 /// サポートする `runtime_handler`。空文字（既定ハンドラ）のみ。未知のハンドラは拒否する（CRI の規定）。
 const SUPPORTED_RUNTIME_HANDLERS: &[&str] = &[""];
@@ -116,7 +131,7 @@ impl SandboxLimits {
 
 /// サンドボックスの内部状態（CRI の `PodSandboxState` に対応）。
 ///
-/// `NotReady` への遷移は StopPodSandbox（#430）が行う。
+/// `NotReady` への遷移は StopPodSandbox（#430）が行い、Status/List（#431）が応答へ写す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SandboxState {
     Ready,
@@ -124,8 +139,7 @@ enum SandboxState {
 }
 
 impl SandboxState {
-    /// CRI の列挙値へ変換する（Status/List〔#431〕が使うまで未使用）。
-    #[allow(dead_code)]
+    /// CRI の列挙値へ変換する（Status/List〔TASK-57.3〕が応答に使う）。
     fn to_proto(self) -> PodSandboxState {
         match self {
             Self::Ready => PodSandboxState::SandboxReady,
@@ -141,7 +155,6 @@ impl SandboxState {
 /// `retained_bytes` はこの記録がレジストリの保持量へ計上した見積もりで、削除（#430）のときに
 /// `SandboxRegistry::retained_bytes` から同じ値を引く。
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct SandboxRecord {
     config: PodSandboxConfig,
     state: SandboxState,
@@ -241,12 +254,7 @@ impl CriRuntimeService {
         } = validate_run_request(req)?;
         let retained_bytes = config.retained_bytes();
 
-        let created_at_nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()
-            .and_then(|d| i64::try_from(d.as_nanos()).ok())
-            .filter(|n| *n > 0)
-            .ok_or_else(|| Status::internal("system clock is invalid"))?;
+        let created_at_nanos = now_nanos()?;
 
         let mut registry = self
             .registry
@@ -333,6 +341,162 @@ impl CriRuntimeService {
         registry.records.remove(&req.pod_sandbox_id);
         registry.retained_bytes = remaining;
         Ok(v1::RemovePodSandboxResponse {})
+    }
+
+    /// `PodSandboxStatus` の本体。読み取り専用（CRI-1・ERR-3・TASK-57.3）。
+    ///
+    /// 空 ID は `INVALID_ARGUMENT`、未知 ID は `NOT_FOUND`（文言に入力 ID を含めない）。
+    /// `verbose` でも `info` は空のスタブ（詳細情報は TASK-58 / TASK-59 で追加。REPAIR-3）。
+    fn status_sandbox(
+        &self,
+        req: v1::PodSandboxStatusRequest,
+    ) -> Result<v1::PodSandboxStatusResponse, Status> {
+        if req.pod_sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("pod_sandbox_id is required"));
+        }
+        let status = {
+            let registry = self
+                .registry
+                .lock()
+                .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+            let record = registry
+                .records
+                .get(&req.pod_sandbox_id)
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            record.to_status(&req.pod_sandbox_id)
+        };
+        let timestamp = now_nanos()?;
+        Ok(v1::PodSandboxStatusResponse {
+            status: Some(status),
+            info: HashMap::new(),
+            containers_statuses: Vec::new(),
+            timestamp,
+        })
+    }
+
+    /// `ListPodSandbox` の本体。フィルタは AND、並びは `(created_at, id)` の昇順（CRI-1・TASK-57.3）。
+    ///
+    /// 一致なしは空の一覧。未知の state 値と、件数が [`MAX_CONFIG_COLLECTION_ENTRIES`] を超える
+    /// `label_selector` は `INVALID_ARGUMENT`。
+    fn list_sandboxes(
+        &self,
+        req: v1::ListPodSandboxRequest,
+    ) -> Result<v1::ListPodSandboxResponse, Status> {
+        let filter = ValidatedFilter::new(req.filter)?;
+        let mut items = {
+            let registry = self
+                .registry
+                .lock()
+                .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+            registry
+                .records
+                .iter()
+                .filter(|(id, record)| filter.matches(id, record))
+                .map(|(id, record)| record.to_summary(id))
+                .collect::<Vec<_>>()
+        };
+        items.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        Ok(v1::ListPodSandboxResponse { items })
+    }
+}
+
+/// 現在時刻（UNIX epoch からの ns）。0 以下・変換不能は `INTERNAL`。
+fn now_nanos() -> Result<i64, Status> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_nanos()).ok())
+        .filter(|n| *n > 0)
+        .ok_or_else(|| Status::internal("system clock is invalid"))
+}
+
+impl SandboxRecord {
+    /// Status 応答用の変換。labels・annotations は保持した値を無改変でコピーする。
+    fn to_status(&self, id: &str) -> v1::PodSandboxStatus {
+        v1::PodSandboxStatus {
+            id: id.to_owned(),
+            metadata: self.config.metadata.clone(),
+            state: self.state.to_proto() as i32,
+            created_at: self.created_at_nanos,
+            network: None,
+            linux: None,
+            labels: self.config.labels.clone(),
+            annotations: self.config.annotations.clone(),
+            runtime_handler: self.runtime_handler.to_owned(),
+        }
+    }
+
+    /// List 応答用の変換（Status と同じ項目の部分集合）。
+    fn to_summary(&self, id: &str) -> v1::PodSandbox {
+        v1::PodSandbox {
+            id: id.to_owned(),
+            metadata: self.config.metadata.clone(),
+            state: self.state.to_proto() as i32,
+            created_at: self.created_at_nanos,
+            labels: self.config.labels.clone(),
+            annotations: self.config.annotations.clone(),
+            runtime_handler: self.runtime_handler.to_owned(),
+        }
+    }
+}
+
+/// 検証済みの `ListPodSandbox` フィルタ（全条件 AND）。
+struct ValidatedFilter {
+    id: String,
+    state: Option<SandboxState>,
+    label_selector: HashMap<String, String>,
+}
+
+impl ValidatedFilter {
+    fn new(filter: Option<v1::PodSandboxFilter>) -> Result<Self, Status> {
+        let Some(filter) = filter else {
+            return Ok(Self {
+                id: String::new(),
+                state: None,
+                label_selector: HashMap::new(),
+            });
+        };
+        if filter.label_selector.len() > MAX_CONFIG_COLLECTION_ENTRIES {
+            return Err(Status::invalid_argument(
+                "label_selector has too many entries",
+            ));
+        }
+        let mut total = filter.id.len();
+        for (k, v) in &filter.label_selector {
+            if k.len() > MAX_LABEL_SELECTOR_STRING_BYTES
+                || v.len() > MAX_LABEL_SELECTOR_STRING_BYTES
+            {
+                return Err(Status::invalid_argument(
+                    "label_selector key or value is too long",
+                ));
+            }
+            total = total.saturating_add(k.len()).saturating_add(v.len());
+        }
+        if total > MAX_LABEL_SELECTOR_TOTAL_BYTES {
+            return Err(Status::invalid_argument("label_selector is too large"));
+        }
+        let state = match filter.state {
+            None => None,
+            Some(value) => match PodSandboxState::try_from(value.state) {
+                Ok(PodSandboxState::SandboxReady) => Some(SandboxState::Ready),
+                Ok(PodSandboxState::SandboxNotready) => Some(SandboxState::NotReady),
+                Err(_) => return Err(Status::invalid_argument("unknown state filter")),
+            },
+        };
+        Ok(Self {
+            id: filter.id,
+            state,
+            label_selector: filter.label_selector,
+        })
+    }
+
+    fn matches(&self, id: &str, record: &SandboxRecord) -> bool {
+        (self.id.is_empty() || self.id == id)
+            && self.state.is_none_or(|s| s == record.state)
+            && self
+                .label_selector
+                .iter()
+                .all(|(k, v)| record.config.labels.get(k) == Some(v))
     }
 }
 
@@ -444,17 +608,27 @@ impl RuntimeService for CriRuntimeService {
         timer.finish_with(&result);
         result.map(Response::new)
     }
+
+    /// サンドボックスの状態を返す（読み取り専用。未知 ID は `NOT_FOUND`。CRI-1・ERR-3・TASK-57.3）。
     async fn pod_sandbox_status(
         &self,
-        _request: Request<v1::PodSandboxStatusRequest>,
+        request: Request<v1::PodSandboxStatusRequest>,
     ) -> Result<Response<v1::PodSandboxStatusResponse>, Status> {
-        Err(Status::unimplemented("pod_sandbox_status"))
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::PodSandboxStatus);
+        let result = self.status_sandbox(request.into_inner());
+        timer.finish_with(&result);
+        result.map(Response::new)
     }
+
+    /// フィルタに一致するサンドボックスを `(created_at, id)` 昇順で返す（CRI-1・TASK-57.3）。
     async fn list_pod_sandbox(
         &self,
-        _request: Request<v1::ListPodSandboxRequest>,
+        request: Request<v1::ListPodSandboxRequest>,
     ) -> Result<Response<v1::ListPodSandboxResponse>, Status> {
-        Err(Status::unimplemented("list_pod_sandbox"))
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ListPodSandbox);
+        let result = self.list_sandboxes(request.into_inner());
+        timer.finish_with(&result);
+        result.map(Response::new)
     }
     async fn stream_pod_sandboxes(
         &self,
@@ -936,7 +1110,7 @@ mod tests {
     fn task_57_1_unimplemented_rpcs_are_not_recorded() {
         let collect = Arc::new(Collect::default());
         let svc = CriRuntimeService::with_recorder(collect.clone());
-        block_on(svc.pod_sandbox_status(Request::new(v1::PodSandboxStatusRequest::default())))
+        block_on(svc.container_status(Request::new(v1::ContainerStatusRequest::default())))
             .unwrap_err();
         assert_eq!(collect.outcomes(), vec![]);
     }
@@ -954,12 +1128,12 @@ mod tests {
         assert!(!debug.contains("do-not-print"));
     }
 
-    /// 未実装の RPC は Unimplemented のまま（#431 で pod_sandbox_status を実装する際にこのテストを差し替える）。
+    /// 未実装の RPC は Unimplemented のまま（TASK-58 で container_status を実装する際にこのテストを差し替える）。
     #[test]
     fn task_57_1_other_rpcs_remain_unimplemented() {
         let svc = CriRuntimeService::new();
         let err =
-            block_on(svc.pod_sandbox_status(Request::new(v1::PodSandboxStatusRequest::default())))
+            block_on(svc.container_status(Request::new(v1::ContainerStatusRequest::default())))
                 .unwrap_err();
         assert_eq!(err.code(), Code::Unimplemented);
     }
@@ -1157,5 +1331,264 @@ mod tests {
                 (r, CriOpOutcome::Failure, Code::Internal),
             ]
         );
+    }
+
+    fn ids_of(svc: &CriRuntimeService, filter: Option<v1::PodSandboxFilter>) -> Vec<String> {
+        block_on(svc.list_pod_sandbox(Request::new(v1::ListPodSandboxRequest { filter })))
+            .unwrap()
+            .into_inner()
+            .items
+            .into_iter()
+            .map(|i| i.id)
+            .collect()
+    }
+
+    fn status_of(
+        svc: &CriRuntimeService,
+        id: &str,
+    ) -> Result<v1::PodSandboxStatusResponse, Status> {
+        block_on(
+            svc.pod_sandbox_status(Request::new(v1::PodSandboxStatusRequest {
+                pod_sandbox_id: id.into(),
+                verbose: false,
+            })),
+        )
+        .map(Response::into_inner)
+    }
+
+    fn stop_id(svc: &CriRuntimeService, id: &str) {
+        block_on(
+            svc.stop_pod_sandbox(Request::new(v1::StopPodSandboxRequest {
+                pod_sandbox_id: id.into(),
+            })),
+        )
+        .unwrap();
+    }
+
+    fn remove_id(svc: &CriRuntimeService, id: &str) {
+        block_on(
+            svc.remove_pod_sandbox(Request::new(v1::RemovePodSandboxRequest {
+                pod_sandbox_id: id.into(),
+            })),
+        )
+        .unwrap();
+    }
+
+    /// 作成順（created_at, id）の ID 列をレジストリから期待値として作る。
+    fn expected_order(svc: &CriRuntimeService) -> Vec<String> {
+        let reg = svc.registry.lock().unwrap();
+        let mut v: Vec<(i64, String)> = reg
+            .records
+            .iter()
+            .map(|(id, r)| (r.created_at_nanos, id.clone()))
+            .collect();
+        v.sort();
+        v.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// CRI-1・TASK-57.3: Run 直後の Status は ready で config を無改変で返す。Stop で notready、Remove で NOT_FOUND。
+    #[test]
+    fn task_57_3_status_reflects_lifecycle() {
+        let svc = CriRuntimeService::new();
+        let cfg = config("p");
+        let id = run(&svc, Some(cfg.clone()), "")
+            .unwrap()
+            .into_inner()
+            .pod_sandbox_id;
+        let resp = status_of(&svc, &id).unwrap();
+        let st = resp.status.unwrap();
+        assert_eq!(st.id, id);
+        assert_eq!(st.metadata, cfg.metadata);
+        assert_eq!(st.state, PodSandboxState::SandboxReady as i32);
+        assert_eq!(st.labels, cfg.labels);
+        assert_eq!(st.annotations, cfg.annotations);
+        assert_eq!(st.runtime_handler, "");
+        assert!(st.created_at > 0 && resp.timestamp >= st.created_at);
+        assert!(resp.containers_statuses.is_empty() && resp.info.is_empty());
+        assert!(st.network.is_none() && st.linux.is_none());
+
+        stop_id(&svc, &id);
+        let st2 = status_of(&svc, &id).unwrap().status.unwrap();
+        assert_eq!(st2.state, PodSandboxState::SandboxNotready as i32);
+        assert_eq!(st2.created_at, st.created_at);
+        assert_eq!(st2.annotations, st.annotations);
+
+        remove_id(&svc, &id);
+        assert_eq!(status_of(&svc, &id).unwrap_err().code(), Code::NotFound);
+    }
+
+    /// ERR-3・TASK-57.3: 空 ID は INVALID_ARGUMENT、未知 ID は NOT_FOUND で、文言に入力 ID を含めない。
+    #[test]
+    fn task_57_3_status_rejects_bad_ids() {
+        let svc = CriRuntimeService::new();
+        assert_eq!(
+            status_of(&svc, "").unwrap_err().code(),
+            Code::InvalidArgument
+        );
+        let err = status_of(&svc, "secret-id-xyz").unwrap_err();
+        assert_eq!(err.code(), Code::NotFound);
+        assert!(!err.message().contains("secret-id-xyz"));
+        assert_eq!(svc.sandbox_count(), 0);
+    }
+
+    /// CRI-1・TASK-57.3（受け入れ基準）: 作成・停止・削除の後の List がレジストリの状態と整合する。
+    #[test]
+    fn task_57_3_list_matches_registry_after_create_stop_remove() {
+        let svc = CriRuntimeService::new();
+        let ids: Vec<String> = (0..3)
+            .map(|i| {
+                run(&svc, Some(config(&format!("p{i}"))), "")
+                    .unwrap()
+                    .into_inner()
+                    .pod_sandbox_id
+            })
+            .collect();
+        assert_eq!(ids_of(&svc, None), expected_order(&svc));
+        assert_eq!(ids_of(&svc, None).len(), 3);
+
+        stop_id(&svc, &ids[1]);
+        let items = block_on(
+            svc.list_pod_sandbox(Request::new(v1::ListPodSandboxRequest { filter: None })),
+        )
+        .unwrap()
+        .into_inner()
+        .items;
+        for item in &items {
+            let expect = if item.id == ids[1] {
+                PodSandboxState::SandboxNotready
+            } else {
+                PodSandboxState::SandboxReady
+            };
+            assert_eq!(item.state, expect as i32);
+        }
+
+        remove_id(&svc, &ids[0]);
+        remove_id(&svc, &ids[0]);
+        let after = ids_of(&svc, None);
+        assert_eq!(after.len(), 2);
+        assert!(!after.contains(&ids[0]));
+        assert_eq!(after, expected_order(&svc));
+        assert_eq!(after.len(), svc.sandbox_count());
+    }
+
+    /// CRI-1・TASK-57.3: フィルタは AND で、一致なしは空の一覧、不正な値は INVALID_ARGUMENT。
+    #[test]
+    fn task_57_3_list_filters() {
+        let svc = CriRuntimeService::new();
+        let mut c1 = config("a");
+        c1.labels.insert("tier".into(), "web".into());
+        let a = run(&svc, Some(c1), "").unwrap().into_inner().pod_sandbox_id;
+        let b = run(&svc, Some(config("b")), "")
+            .unwrap()
+            .into_inner()
+            .pod_sandbox_id;
+        stop_id(&svc, &b);
+        let f = |id: &str, state: Option<i32>, labels: &[(&str, &str)]| v1::PodSandboxFilter {
+            id: id.into(),
+            state: state.map(|state| v1::PodSandboxStateValue { state }),
+            label_selector: labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        assert_eq!(ids_of(&svc, Some(f(&a, None, &[]))), vec![a.clone()]);
+        assert_eq!(ids_of(&svc, Some(f("", Some(0), &[]))), vec![a.clone()]);
+        assert_eq!(ids_of(&svc, Some(f("", Some(1), &[]))), vec![b.clone()]);
+        assert_eq!(
+            ids_of(&svc, Some(f("", None, &[("tier", "web")]))),
+            vec![a.clone()]
+        );
+        assert_eq!(ids_of(&svc, Some(f("", None, &[("k", "v")]))).len(), 2);
+        assert!(ids_of(&svc, Some(f("", None, &[("k", "other")]))).is_empty());
+        assert!(ids_of(&svc, Some(f("", None, &[("k", "v"), ("tier", "db")]))).is_empty());
+        assert!(ids_of(&svc, Some(f(&a, Some(1), &[]))).is_empty());
+        assert!(ids_of(&svc, Some(f("unknown", None, &[]))).is_empty());
+
+        for bad in [
+            f("", Some(99), &[]),
+            v1::PodSandboxFilter {
+                label_selector: [(
+                    "k".repeat(MAX_LABEL_SELECTOR_STRING_BYTES + 1),
+                    String::new(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            v1::PodSandboxFilter {
+                label_selector: (0..16)
+                    .map(|i| {
+                        (
+                            format!("{i:0>2}"),
+                            "v".repeat(MAX_LABEL_SELECTOR_STRING_BYTES),
+                        )
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            v1::PodSandboxFilter {
+                label_selector: (0..=MAX_CONFIG_COLLECTION_ENTRIES)
+                    .map(|i| (format!("k{i}"), String::new()))
+                    .collect(),
+                ..Default::default()
+            },
+        ] {
+            let err = block_on(
+                svc.list_pod_sandbox(Request::new(v1::ListPodSandboxRequest {
+                    filter: Some(bad),
+                })),
+            )
+            .unwrap_err();
+            assert_eq!(err.code(), Code::InvalidArgument);
+        }
+        assert_eq!(svc.sandbox_count(), 2);
+    }
+
+    /// REPAIR-4・TASK-57.3: Status/List は成功・失敗の双方で 1 件ずつ記録され、機微情報を含まない。
+    #[test]
+    fn task_57_3_status_and_list_are_recorded() {
+        let collect = Arc::new(Collect::default());
+        let svc = CriRuntimeService::with_recorder(collect.clone());
+        let id = run(&svc, Some(config("p")), "")
+            .unwrap()
+            .into_inner()
+            .pod_sandbox_id;
+        status_of(&svc, &id).unwrap();
+        status_of(&svc, "nope").unwrap_err();
+        ids_of(&svc, None);
+        let bad = v1::PodSandboxFilter {
+            state: Some(v1::PodSandboxStateValue { state: 99 }),
+            ..Default::default()
+        };
+        block_on(
+            svc.list_pod_sandbox(Request::new(v1::ListPodSandboxRequest {
+                filter: Some(bad),
+            })),
+        )
+        .unwrap_err();
+        let samples = collect.items();
+        let lines: Vec<(&str, CriOpOutcome, Code)> = samples
+            .iter()
+            .skip(1)
+            .map(|s| (s.kind().as_str(), s.outcome(), s.code()))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                ("cri.pod_sandbox_status", CriOpOutcome::Success, Code::Ok),
+                (
+                    "cri.pod_sandbox_status",
+                    CriOpOutcome::Failure,
+                    Code::NotFound
+                ),
+                ("cri.list_pod_sandbox", CriOpOutcome::Success, Code::Ok),
+                (
+                    "cri.list_pod_sandbox",
+                    CriOpOutcome::Failure,
+                    Code::InvalidArgument
+                ),
+            ]
+        );
+        assert!(!format!("{samples:?}").contains(&id));
     }
 }

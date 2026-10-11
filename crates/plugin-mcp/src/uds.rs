@@ -69,6 +69,10 @@ struct RecvState {
     deadline: Cell<Option<Instant>>,
     /// 期限超過で受信を打ち切ったか。
     expired: Cell<bool>,
+    /// 最後に 1 バイト以上を受信した read の完了時刻。`BufReader` は内部バッファが空のときだけ
+    /// read するため、バッファに残る未消費バイトはすべてこの時刻に受信したものである。
+    /// 先読み済みの次メッセージの期限の起点と、行の受信完了時刻の判定に使う（REPAIR-5）。
+    last_read: Cell<Option<Instant>>,
 }
 
 /// 期限までの残り時間を、周期 `poll` を上限・1ms を下限にして返す。期限超過なら `None`。
@@ -119,7 +123,11 @@ impl<S: PollStream> Read for PollReader<S> {
                     }
                 }
                 Ok(n) => {
-                    if deadline.is_some_and(|d| Instant::now() >= d) {
+                    let now = Instant::now();
+                    if n > 0 {
+                        self.state.last_read.set(Some(now));
+                    }
+                    if deadline.is_some_and(|d| now >= d) {
                         return Err(self.expire());
                     }
                     return Ok(n);
@@ -189,17 +197,33 @@ pub fn serve_uds_with<S: PollStream>(
     });
     loop {
         state.deadline.set(None);
+        // 前のメッセージと同じ read で先読みした次のメッセージの先頭バイトは、その read の時点で
+        // 受信済みである。期限（先頭バイトの受信から読み切りまで。`Limits::message_timeout`）は
+        // その受信時刻を起点にし、前のメッセージの処理・応答送信に掛かった時間も含めて数える
+        // （REPAIR-5）。バッファが空なら、これから読む先頭バイトの受信時（`on_start`）が起点。
+        let buffered_at = if reader.buffer().is_empty() {
+            None
+        } else {
+            state.last_read.get()
+        };
         let start_state = Rc::clone(&state);
         let message_timeout = limits.message_timeout;
         let mut on_start = move || {
+            let first_byte_at = buffered_at.unwrap_or_else(Instant::now);
             start_state
                 .deadline
-                .set(Some(Instant::now() + message_timeout));
+                .set(Some(first_byte_at + message_timeout));
         };
         let line = match read_line(&mut reader, limits.max_line_bytes, &mut on_start) {
             Ok(Some(line)) => {
-                // バッファ済みの行で完結した場合も、受信の期限超過なら拒否する。
-                if state.deadline.get().is_some_and(|d| Instant::now() >= d) {
+                // 行の最後のバイトを受信した時刻（`last_read`）が期限以後なら拒否する。先読み済みの
+                // バッファだけで完結した行は、期限内に受信し終えているため受理する。
+                let completed_late = match (state.deadline.get(), state.last_read.get()) {
+                    (Some(d), Some(t)) => t >= d,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                };
+                if completed_late {
                     log_transport(log, "DEADLINE_EXCEEDED");
                     return Err(ServeError::ReadTimeout);
                 }
@@ -274,6 +298,8 @@ mod tests {
         slow: Duration,
         /// 台本が尽きたあとも TimedOut を返し続けるか（EOF を返さない停止相手）。
         stall_forever: bool,
+        /// 成功する write 1 回ごとに眠る時間（前のメッセージの応答送信に掛かる時間の再現）。
+        write_delay: Duration,
         /// `read_within` / `write_within` に渡された待機時間の履歴。
         timeouts: Arc<Mutex<Vec<Duration>>>,
     }
@@ -289,6 +315,7 @@ mod tests {
                     write_chunk: usize::MAX,
                     slow: Duration::ZERO,
                     stall_forever: false,
+                    write_delay: Duration::ZERO,
                     timeouts: Arc::new(Mutex::new(Vec::new())),
                 },
                 written,
@@ -326,6 +353,7 @@ mod tests {
                 return Err(io::Error::from(io::ErrorKind::WouldBlock));
             }
             std::thread::sleep(self.slow);
+            std::thread::sleep(self.write_delay);
             let n = buf.len().min(self.write_chunk);
             self.written
                 .lock()
@@ -464,6 +492,55 @@ mod tests {
             "shortened slice expected: {t:?}"
         );
         assert_eq!(t.last(), Some(&poll));
+    }
+
+    /// 前の要求と同じ read で先頭だけ先読みした次の要求は、その受信時刻から message_timeout で
+    /// 打ち切る。前の要求の応答送信で期限を過ぎていれば、残りを待たず ReadTimeout（REPAIR-5）。
+    #[test]
+    fn pipelined_partial_message_deadline_starts_at_its_receipt() {
+        const CHUNK: &[u8] =
+            b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\"";
+        let (mut fake, written) = Fake::new(vec![
+            Step::Data(CHUNK),
+            Step::Data(b",\"id\":8,\"method\":\"ping\"}\n"),
+            Step::Eof,
+        ]);
+        fake.write_delay = Duration::from_millis(120);
+        let limits = Limits {
+            write_timeout: Duration::from_secs(5),
+            ..quick()
+        };
+        let mut logs = Vec::new();
+        let r = serve_uds_with(fake, limits, &UnavailableBackend, &mut |l| {
+            logs.push(l.to_owned());
+        });
+        assert!(matches!(r, Err(ServeError::ReadTimeout)), "{r:?}");
+        let out = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(out.contains("\"id\":7"), "{out}");
+        assert_eq!(logs.len(), 2, "{logs:?}");
+        assert!(logs[1].contains("DEADLINE_EXCEEDED"), "{}", logs[1]);
+    }
+
+    /// 期限内に全量を先読み済みの次の要求は、前の要求の応答送信が期限を超えても受理する
+    /// （受信完了は期限内。REPAIR-5）。
+    #[test]
+    fn pipelined_complete_message_is_accepted_after_slow_reply() {
+        const CHUNK: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"ping\"}\n";
+        let (mut fake, written) = Fake::new(vec![Step::Data(CHUNK), Step::Eof]);
+        fake.write_delay = Duration::from_millis(120);
+        let limits = Limits {
+            write_timeout: Duration::from_secs(5),
+            ..quick()
+        };
+        let r = serve_uds_with(fake, limits, &UnavailableBackend, &mut |_| {});
+        assert!(r.is_ok(), "{r:?}");
+        let out = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        let ids: Vec<Value> = out
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap()["id"].clone())
+            .collect();
+        assert_eq!(ids, [serde_json::json!(7), serde_json::json!(8)]);
     }
 
     /// 1 バイトずつ成功し続ける遅い相手でも message_timeout で ReadTimeout（REPAIR-5）。

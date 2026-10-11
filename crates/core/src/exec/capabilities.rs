@@ -1053,7 +1053,10 @@ mod tests {
     }
 
     /// SEC-1: 内部関数はマルチスレッドの本物のプロセスで拒否し、何も変更しない。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sec1_public_api_rejects_multithreaded_process() {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
@@ -1070,7 +1073,10 @@ mod tests {
 
     /// SUP-6・SEC-1・TASK-163.4: スレッド数の取得元を `setns` 前に開いた status fd に替えても、`Threads:` が 1 で
     /// なければ何も変更せず `FailedPrecondition`（検査は弱まらない）。読めない取得元も同じ（fail-closed）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sup6_task163_4_pre_opened_thread_source_is_enforced() {
         use std::io::{Seek as _, Write as _};
@@ -1146,7 +1152,10 @@ mod tests {
     }
 
     /// `/proc/thread-self/status` の `field:` 行（16 進 64 bit）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     fn status_value(field: &str) -> u64 {
         let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
         let v = status
@@ -1159,7 +1168,10 @@ mod tests {
     /// SEC-1: 本物の syscall（使い捨てスレッド。スレッド単位なので libtest の他スレッドに影響しない）。
     /// `CAP_SETPCAP` が effective にあれば適用が成功して /proc の値が既定集合に絞られ、無ければ
     /// `PR_CAPBSET_DROP` が EPERM で PermissionDenied になる（root 権限は要求しない）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn sec1_apply_default_capabilities_real_thread() {
         std::thread::spawn(|| {

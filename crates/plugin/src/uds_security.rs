@@ -3133,7 +3133,10 @@ mod tests {
         target_os = "macos",
         all(
             target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
         )
     ))]
     #[test]

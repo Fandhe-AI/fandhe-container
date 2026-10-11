@@ -2066,7 +2066,10 @@ mod tests {
 
     /// CORE-3・TASK-32.1: `remove_verified` が頼るカーネルの挙動（削除済みディレクトリの保持 fd を起点に
     /// した lookup は `ENOENT`）を一時ディレクトリで具体値照合する。削除前は同じ fd 起点で開ける。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core3_task32_1_lookup_under_removed_dir_is_enoent() {
         let base = std::env::temp_dir().join(format!("fc-cgroups-rm-{}", std::process::id()));

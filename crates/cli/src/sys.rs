@@ -84,10 +84,16 @@ pub(crate) enum Disposition {
 #[cfg(all(
     target_os = "linux",
     target_env = "gnu",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 mod layout {
-    /// glibc の `struct sigaction`（x86_64 / aarch64 共通。152 バイト）。
+    /// glibc の `struct sigaction`（LP64 の x86_64 / aarch64 共通。152 バイト）。
+    ///
+    /// `handler` / `restorer` は `usize` のため x32 ABI・aarch64 ILP32 ではサイズが 152 にならず、
+    /// この定義は選ばれない（`imp` の対応外版で `Unsupported`。#1700・REPAIR-2）。
     #[repr(C)]
     pub(super) struct SigAction {
         pub(super) handler: usize,
@@ -180,7 +186,10 @@ mod layout {
     all(
         target_os = "linux",
         target_env = "gnu",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 ))]
 mod imp {
@@ -522,7 +531,10 @@ mod imp {
     all(
         target_os = "linux",
         target_env = "gnu",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )
 )))]
 mod imp {
@@ -591,7 +603,10 @@ pub(crate) use imp::{install_forwarding_handler, reset_child_signal_if_ignored};
         all(
             target_os = "linux",
             target_env = "gnu",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
         )
     )
 ))]

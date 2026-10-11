@@ -565,7 +565,13 @@ mod dry_run {
     }
 }
 
-#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    test,
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 mod tests {
     /// SEC-1（#1716）: 権限モデルから適用経路への写像（rootful のみ `Rootful`）。
     #[test]

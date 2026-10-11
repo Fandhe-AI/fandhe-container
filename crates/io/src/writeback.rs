@@ -2250,7 +2250,10 @@ mod tests {
     /// どのカーネル版数でも照合する（EBADF はカーネル版数に依存しない）。
     #[cfg(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ))]
     #[test]
     fn io2_writeback_real_syncfs_failure_sends_no_flush_ack_and_poisons() {

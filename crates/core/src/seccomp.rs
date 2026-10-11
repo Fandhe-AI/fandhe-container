@@ -38,7 +38,8 @@
 //!
 //! 値は Linux カーネル ABI の番号だが、syscall を発行しないデータであり、3 OS の CI
 //! （macOS arm64 runner が aarch64 テーブルを検証する）で固定値テストを走らせるため、
-//! `target_os` では分岐せず `target_arch` のみで分ける。適用（`prctl(PR_SET_SECCOMP)`）は
+//! `target_os` では分岐せず、`target_arch` と `target_pointer_width = "64"` で分ける（x32 ABI・aarch64 ILP32 は
+//! 対応外で `UnsupportedArch`。#1700）。適用（`prctl(PR_SET_SECCOMP)`）は
 //! Linux 限定の `exec` / `sys` 側に置く（TASK-38.2・#177）。
 //!
 //! # 範囲外
@@ -250,7 +251,10 @@ pub struct SyscallNr(u32);
 
 impl SyscallNr {
     /// 本モジュールのテーブル定義専用の構築子。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     const fn new(nr: u32) -> Self {
         SyscallNr(nr)
     }
@@ -268,7 +272,10 @@ impl SyscallNr {
 pub struct AuditArch(u32);
 
 impl AuditArch {
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     const fn new(v: u32) -> Self {
         AuditArch(v)
     }
@@ -596,7 +603,7 @@ pub fn build_filter_for_target_arch() -> Result<SeccompProgram, SeccompBuildErro
 }
 
 /// x86_64 の番号（出典: `arch/x86/entry/syscalls/syscall_64.tbl`。`AUDIT_ARCH_X86_64` = EM_X86_64(62) | 64BIT | LE）。
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 mod nr {
     use super::{ArchSyscallTable, AuditArch, DeniedSyscall as D, SyscallNr as N};
 
@@ -660,7 +667,7 @@ mod nr {
 }
 
 /// aarch64 の番号（出典: `include/uapi/asm-generic/unistd.h`（arm64 は汎用テーブル）。`AUDIT_ARCH_AARCH64` = EM_AARCH64(183) | 64BIT | LE）。
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
 mod nr {
     use super::{ArchSyscallTable, AuditArch, DeniedSyscall as D, SyscallNr as N};
 
@@ -722,7 +729,10 @@ mod nr {
 }
 
 /// 対応外アーキ（fail-closed。空テーブルで全許可にしない）。
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(not(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 mod nr {
     use super::ArchSyscallTable;
 
@@ -734,12 +744,15 @@ mod tests {
     use super::*;
 
     /// ネイティブアーキのテーブル（対応アーキのテストでのみ使用）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     fn native() -> &'static ArchSyscallTable {
         table_for_target_arch().expect("supported arch")
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
     const EXPECTED: &[(DeniedSyscall, u32)] = &[
         (DeniedSyscall::Unshare, 272),
         (DeniedSyscall::Setns, 308),
@@ -786,7 +799,7 @@ mod tests {
         (DeniedSyscall::Ioperm, 173),
     ];
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
     const EXPECTED: &[(DeniedSyscall, u32)] = &[
         (DeniedSyscall::Unshare, 97),
         (DeniedSyscall::Setns, 268),
@@ -832,21 +845,27 @@ mod tests {
     ];
 
     /// CORE-5・TASK-38.1.1: 全エントリの番号と AUDIT_ARCH を具体値で照合する。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core5_task38_1_1_native_table_numbers() {
         let t = native();
         let got: Vec<(DeniedSyscall, u32)> =
             t.entries().iter().map(|(d, n)| (*d, n.get())).collect();
         assert_eq!(got, EXPECTED.to_vec());
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
         assert_eq!(t.audit_arch().get(), 0xC000_003E);
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
         assert_eq!(t.audit_arch().get(), 0xC000_00B7);
     }
 
     /// 各 variant が entries と absent のちょうど一方に現れる。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core5_task38_1_1_table_is_complete() {
         let t = native();
@@ -862,7 +881,10 @@ mod tests {
     }
 
     /// 番号の重複が無い。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core5_task38_1_1_no_duplicate_numbers() {
         let t = native();
@@ -874,7 +896,10 @@ mod tests {
     }
 
     /// ランタイム自身が seccomp 適用後に使う syscall を禁止していない（契約）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core5_task38_1_1_runtime_required_syscalls_not_denied() {
         // execve・execveat・prctl・capget・capset・close_range・exit・exit_group・
@@ -882,11 +907,11 @@ mod tests {
         // （memfd_create・fcntl は封印した複製からの実行。TASK-163 追補・#1530・SUP-6）、
         // pread64・pwrite64（複製の読み書き。TASK-163 追補・#1531・SEC-1。複製の前の `AT_EXECVE_CHECK` は既出の
         // execveat を使う）、fstatfs（複製の前のマウントの `noexec` の判定。#1531。x86_64 = 138・aarch64 = 44）
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
         let required: [u32; 16] = [
             59, 322, 157, 125, 126, 436, 60, 231, 434, 424, 15, 319, 72, 17, 18, 138,
         ];
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
         let required: [u32; 16] = [
             221, 281, 167, 90, 91, 436, 93, 94, 434, 424, 139, 279, 25, 67, 68, 44,
         ];
@@ -897,11 +922,14 @@ mod tests {
     }
 
     /// iopl / ioperm は x86_64 にのみ存在する。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core5_task38_1_1_absent_on_arch() {
         let t = native();
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
         {
             assert_eq!(
                 t.number_of(DeniedSyscall::Iopl),
@@ -912,7 +940,7 @@ mod tests {
                 SyscallLookup::Present(SyscallNr::new(173))
             );
         }
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
         {
             assert_eq!(
                 t.number_of(DeniedSyscall::Iopl),
@@ -926,7 +954,10 @@ mod tests {
     }
 
     /// 対応外アーキは fail-closed。
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
     #[test]
     fn core5_task38_1_1_unsupported_arch_is_fail_closed() {
         assert_eq!(
@@ -1124,19 +1155,22 @@ mod bpf_tests {
         );
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
     #[test]
     fn core5_task38_1_2_native_x86_64() {
         assert_eq!(build_filter_for_target_arch().unwrap().len(), 93);
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
     #[test]
     fn core5_task38_1_2_native_aarch64() {
         assert_eq!(build_filter_for_target_arch().unwrap().len(), 87);
     }
 
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
     #[test]
     fn core5_task38_1_2_unsupported_arch_is_fail_closed() {
         assert_eq!(

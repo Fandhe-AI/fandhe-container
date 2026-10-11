@@ -23,3 +23,5 @@ rustls-graviola.workspace = true
 rustls-native-certs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# 承認: Issue #278・TASK-122.hdep1（workspace 承認済みの用途「OCI blob の digest 検証」）。TASK-52.1（#405）で利用。
+sha2.workspace = true

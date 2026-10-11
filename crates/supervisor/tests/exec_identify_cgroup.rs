@@ -16,8 +16,8 @@
 //!   何の namespace にも参加しない
 //!
 //! # joiner が状態ストアを直接開かない理由
-//! joiner は pid1 の user namespace へ `nsenter` で先に入る（user namespace への参加は未実装。`exec_setns_join`
-//! と同じ構成）。その中からは `FileStateStore::open` が通らない（祖先ディレクトリの所有者がホストの root として
+//! joiner は pid1 の user namespace へ `nsenter` で先に入る（rootful 相当の同じ user namespace では参加しない
+//! 構成。rootless の user namespace 参加は `exec_setns_join` が照合する。#1462）。その中からは `FileStateStore::open` が通らない（祖先ディレクトリの所有者がホストの root として
 //! 見えず、overflow uid になるため、祖先検証が fail-closed で拒否する）。そのため、ストアの読み書きは orchestrator
 //! （初期 user namespace）が行い、読み戻した配置（scope・instance）と pid を引数で joiner へ渡し、joiner が
 //! `StateRecord` を再構成して `identify_pid1` へ渡す（`tests/exec.rs` の `make_record` と同じ方式）。

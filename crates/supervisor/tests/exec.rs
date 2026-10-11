@@ -52,7 +52,7 @@
 //! root・cgroup v2 の書き込み（`/sys/fs/cgroup`）・Landlock（Linux 6.12+・ABI 6+）・`unshare`（util-linux）が必要で、
 //! x86_64 のみ（手組みのプローブが x86_64 の機械語のため）。GitHub ホステッド runner では保証できないため
 //! `-- --ignored` 指定時のみ実行する（ci.md「実機前提テスト」。AGENTS.md に実行コマンドを記す）。実行された
-//! 場合は拒否を含むあらゆる失敗を失敗として扱う。rootless は user namespace への参加が未実装のため対象外。
+//! 場合は拒否を含むあらゆる失敗を失敗として扱う。rootless（user namespace への参加。#1462）は非特権で動く `exec_setns_join` が照合し、本試験は rootful のみ。
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -684,8 +684,8 @@ mod linux {
         let err = reapply_restrictions(restrictions_for_a).expect_err("A's restrictions on B");
         assert_eq!(
             err.message(),
-            "exec stage SetNs: the mount namespace after joining is not the one of the prepared exec \
-             target (violation: exec_target/exec_joined_namespace_mismatch, SEC-1)"
+            "exec stage SetNs: the user or mount namespace after joining is not the one of the prepared \
+             exec target (violation: exec_target/exec_joined_namespace_mismatch, SEC-1)"
         );
         // 何も適用していない（seccomp・NO_NEW_PRIVS とも未適用のまま）。
         own_status.rewind().expect("rewind own status");

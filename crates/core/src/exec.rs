@@ -125,12 +125,12 @@ mod violation;
 #[cfg(test)]
 mod violation_scan;
 
+pub use capabilities::{CapabilityReport, SupplementaryGroups};
 /// 結合試験 `tests/exec_child_setup.rs`・supervisor の `tests/exec_setns_join.rs` 専用の再公開
 /// （SUP-6・TASK-163 追補・#1457。通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(all(feature = "exec-test-support", not(test)))]
 #[doc(hidden)]
-pub use capabilities::clear_supplementary_groups_for_test;
-pub use capabilities::{CapabilityReport, SupplementaryGroups};
+pub use capabilities::{apply_join_credentials_for_test, clear_supplementary_groups_for_test};
 pub use cgroup_join::{
     ExecCgroupJoin, ExecCgroupJoinReport, ExecCgroupName, ExecCgroupRemoval, ExecCgroupSweep,
     ExecChildCgroup, join_cgroup, prepare_cgroup_join, remove_exec_child_cgroup,

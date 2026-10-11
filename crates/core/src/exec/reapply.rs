@@ -16,7 +16,7 @@
 //!   [`prepare_exec_restrictions`] は **`join_namespaces` の前**、[`reapply_restrictions`] は
 //!   `join_namespaces` と `join_cgroup` の **後** に呼ぶ。seccomp の既定フィルタは `setns` を拒否するため、
 //!   再適用を `setns` の前に置くと namespace 参加が失敗する（cgroup join を seccomp の前に置く既存の順序と一致）。
-//!   [`reapply_restrictions`] の内部は「準備したプロセスの確認 → 参加後の mount namespace・子が入る PID namespace・所属 cgroup が準備時の対象のもの
+//!   [`reapply_restrictions`] の内部は「準備したプロセスの確認 → 参加後の user namespace・mount namespace・子が入る PID namespace・所属 cgroup が準備時の対象のもの
 //!   であることの照合 → 参加後の `/` の照合 → 適用」の順で、確認・照合で拒否したときは何も適用していない
 //! - 全体の順序（exec 専用プロセス内。supervisor の `run_command` が固定する）: `identify_pid1` →
 //!   `prepare_cgroup_join` → [`prepare_exec_restrictions`] → `join_namespaces` → `join_cgroup` →
@@ -52,7 +52,8 @@
 //!   `config.json` の `process.capabilities` を解釈せず同じ固定集合を使うため、exec が launch より広い
 //!   集合を与えることはない（設定による絞り込みは launch・exec とも未実装）。pid1 が起動後に自分の
 //!   capability をさらに落としていても、exec は launch がコンテナへ与えた集合（OCI 既定）で動く。uid / gid・
-//!   securebits は launch・exec とも変更しない（呼び出しプロセスの値を引き継ぐ）。spec（SUP-6）が
+//!   securebits は launch・exec とも変更しない（呼び出しプロセスの値を引き継ぐ）。ただし user namespace へ参加した
+//!   場合（下記）は、補助グループの消去の後・bounding set の削減の前に、gid → uid の順で `process.user` の値へ揃える。spec（SUP-6）が
 //!   exec での capability 削減に言及しない点は確認事項で、「launch より弱くしない」側に倒している
 //! - **補助グループは launch・exec とも空にする**（SEC-1・SEC-5・TASK-163 追補・#1457）: capability 削減の関数が
 //!   先頭で `setgroups(0)` を呼び、読み戻して確かめる（`exec/capabilities.rs` の `SupplementaryGroups`）。launch の
@@ -65,13 +66,27 @@
 //!   namespace が `setgroups` を `deny` にしている場合（rootless。`setns` の前に開いた自分の procfs の `setgroups` で
 //!   確認する。`EPERM` という errno だけでは判断しない）は消去できないため現状のまま残し、結果
 //!   （[`ExecRestrictionReport::supplementary_groups`]）へ記録する。それ以外の理由で消去できなければ拒否する
-//! - **user namespace は対象と同じであること**: capability は user namespace に対する相対的な権限なので、
-//!   同じ集合でも exec プロセスが対象より外側の user namespace にいれば launch より強い。`Pid1Target::open` と
-//!   `join_namespaces` が、対象と呼び出し側の user namespace の一致を要求する（`exec/setns.rs`。不一致は違反
-//!   `exec_target_in_other_user_namespace`）
-//! - **制限を exec の対象へ束縛する**: [`prepare_exec_restrictions`] が対象の mount namespace の識別子（nsfs の
-//!   `st_dev`・`st_ino`）と自プロセスの procfs ディレクトリの fd（`setns` 後は `/proc/self` を解決できないため）を
-//!   保持し、[`reapply_restrictions`] が参加後の自プロセスの識別子と照合する。不一致は違反記録
+//! - **user namespace は対象のものへ参加する（SUP-6・SEC-5・TASK-163.h2・#1462）**: capability は user namespace に
+//!   対する相対的な権限なので、同じ集合でも exec プロセスが対象より外側の user namespace にいれば launch より
+//!   強い。対象が呼び出し側と別の user namespace にいる（既定の rootless）ときは、`join_namespaces` が他の
+//!   namespace より先に user namespace へ参加する（`exec/setns.rs`）。参加で参加先の全 capability を得るため、
+//!   参加後の処理は launch と同じ関数・同じ順序「補助グループ → gid・uid → capability 削減（bounding set・ambient・
+//!   permitted/effective/inheritable）→ `NO_NEW_PRIVS` → Landlock → seccomp」で省かない（SEC-5）。gid・uid は
+//!   `process.user`（`config.json`。launch と同じく root だけを許し、それ以外は `Unimplemented`）の値へ
+//!   `setresgid` → `setresuid` で揃えて読み戻す。非特権ユーザーが自分で作ったコンテナへの exec では名前空間内の
+//!   値が変わらないが、ホストの root から rootless のコンテナへ入ると名前空間内では写像されていない uid のまま
+//!   全 capability を持つため、コンテナの所有者の uid・gid へ揃えることが権限境界になる。同じ user namespace
+//!   （rootful 相当）では参加せず、uid / gid は呼び出しプロセスの値を引き継ぐ
+//! - **参加前の補助グループの消去の順序（#1457・#1462）**: 参加の前、初期 user namespace で `CAP_SETGID` を持つ間に消去
+//!   する（root・`sudo` 経由の起動者のグループをコンテナへ持ち込まない）。補助グループを持つ非特権ユーザーは
+//!   `CAP_SETGID` を持たず `EPERM` かつ `setgroups` が `allow` になるが、別の user namespace へ入り、呼び出し側の
+//!   実効 uid が対象の実効 uid と一致する（= コンテナの所有者自身の exec）場合に限り、消去を参加の **後** に回す
+//!   （参加先の全 capability で消去し、`deny` なら現状維持として記録する）。それ以外は従来どおり拒否する
+//!   （コンテナの所有者と別の uid の補助グループを持ち込まない。fail-closed）
+//! - **制限を exec の対象へ束縛する**: [`prepare_exec_restrictions`] が対象の user namespace・mount namespace の
+//!   識別子（nsfs の `st_dev`・`st_ino`）と自プロセスの procfs ディレクトリの fd（`setns` 後は `/proc/self` を
+//!   解決できないため）を保持し、[`reapply_restrictions`] が参加後の自プロセスの識別子と照合する（user namespace を
+//!   先に照合する。rootful で参加しない場合も「呼び出し側 = 対象」の一致を確かめる）。不一致は違反記録
 //!   `exec_joined_namespace_mismatch`（何も適用しない）。同じ rootfs を共有する別コンテナへ参加した場合は `/` の
 //!   照合だけでは検出できないため、`/` の照合より先に行う。[`ExecReady`] の作成後に対象が変わらないのは、
 //!   seccomp が `setns`・`unshare` を拒否するため
@@ -143,8 +158,8 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - user namespace への参加（rootless の exec に必須。現状は対象が別の user namespace にいれば参加の前に
-//!   拒否する。fail-closed）
+//! - `process.user` が root 以外の場合のユーザー切り替え（launch・exec とも未実装。exec は別の user namespace へ
+//!   参加するとき、launch と同じく root 以外を `Unimplemented` で拒否する）
 //! - ルールパスの解決の起点とプロセスの `/` が食い違う状況での照合専用の試験（上記 4）
 //! - 本番 launcher（`oci_runtime` の `ProcessLauncher` 実装）は未結線で、launch 経路の Landlock も本番では
 //!   まだ適用されない（`exec/landlock.rs`）。exec と launch の一致は「同じ `config.json` から同じ関数で導いた
@@ -152,20 +167,23 @@
 //! - 拒否の違反記録（種別 `exec_target`）の監査ログへの保存のうち、本番の sink の実体の生成と CLI からの
 //!   受け渡し（SEC-4）。層 `AuditLayer::ExecTarget` と supervisor `run_command`（親プロセス側）の 1 拒否 1 件の
 //!   記録は実装済み（#1465）。この段関数単体は記録せず、`ExecError::violation` に載せて返す
-//! - `--ulimit` の指定値の記録（`state.json`）。現状は pid1 の実効値を写して代替する（限界は上記）
+//! - `--ulimit` の指定値の記録（`state.json`）。現状は pid1 の実効値を写して代替する（限界は上記。#1467）
 //! - 実機前提の通し試験 `tests/exec.rs` の実行結果の記録（CI ではビルドのみ）
 
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
+use super::capabilities::{PreJoinGroups, ProcessIds};
 use super::entrypoint_mode::EntrypointExecMode;
 use super::landlock::landlock_ruleset_from_config;
 #[cfg(feature = "exec-test-support")]
 use super::landlock::{LandlockAccessProbe, run_probe};
 use super::rlimits::{apply_rlimits, parse_proc_limits, widen_fsize_for_copy};
 use super::sealed_copy::SealPolicy;
-use super::setns::{NsIdentity, cgroup_path_matches, read_bounded_from};
+use super::setns::{
+    NsIdentity, UserNsRelation, cgroup_path_matches, read_bounded_from, status_effective_uid,
+};
 use super::{
     ExecError, ExecWorkerProof, IsolationStage, Pid1Target, StageKind, SupplementaryGroups,
     ThreadCountSource, ViolationReason, no_new_privs,
@@ -210,6 +228,9 @@ pub struct ExecRestrictions {
     /// namespace へ参加する前に補助グループを空にした結果（[`prepare_exec_restrictions`] が行う。#1457）。
     /// 観測用の経路・単体テストが直接組み立てた値では `None`（参加前の消去をしていない）。
     groups_before_join: Option<SupplementaryGroups>,
+    /// 参加後に呼び出しスレッドを揃える uid・gid（`process.user`）。対象が別の user namespace にいて参加する
+    /// ときだけ `Some`（SUP-6・SEC-5・TASK-163.h2・#1462）。同じ user namespace・観測用の経路は `None`。
+    ids: Option<ProcessIds>,
     /// 封印した複製が元のファイルの実行時ポリシー（複製では維持できない LSM・`AT_EXECVE_CHECK` の要否）を
     /// 迂回しないかの判定材料。`setns` の前（ホスト側の securityfs が見えるうち）に作る（#1531）。
     seal_policy: SealPolicy,
@@ -223,6 +244,10 @@ pub struct ExecRestrictions {
 /// 同じ rootfs を共有する別コンテナへ参加していても何も適用しない。
 struct TargetBinding {
     proc_dir: OwnedFd,
+    /// 対象の user namespace の識別子（`Pid1Target::open` が記録し、`join_namespaces` が参加の直前に再照合した
+    /// もの）。参加後の自プロセスの `ns/user` と照合する（別の user namespace へ参加する場合も、参加しない
+    /// 場合も。#1462）。
+    target_user_ns: NsIdentity,
     target_mnt_ns: NsIdentity,
     /// 対象の PID namespace の識別子。参加後に子が入る PID namespace（`ns/pid_for_children`）と照合する。
     target_pid_ns: NsIdentity,
@@ -541,6 +566,7 @@ pub fn prepare_exec_restrictions(
     let own_root = sys::open_dir_path_nofollow(None, c"/")
         .map_err(|e| ExecError::from_sys(e, IsolationStage::Validate, "open own root"))?;
     reject_own_root(rootfs.as_fd(), own_root.as_fd())?;
+    let relation = target.user_ns_relation();
     let target_mnt_ns = target.mnt_ns_identity()?;
     let target_pid_ns = target.pid_ns_identity()?;
     let rlimits = parse_proc_limits(&target.read_limits()?)?;
@@ -548,19 +574,87 @@ pub fn prepare_exec_restrictions(
     require_rlimits(&rlimits)?;
     let binding = TargetBinding {
         proc_dir: open_own_proc_dir()?,
+        target_user_ns: relation.target_identity(),
         target_mnt_ns,
         target_pid_ns,
         expected_cgroup: target.expected_cgroup_path().to_owned(),
     };
+    // 別の user namespace へ参加するときだけ、参加後に揃える uid・gid（`process.user`）を決める。root 以外は
+    // launch と同じく未実装として、副作用（補助グループの消去）の前に拒否する。
+    let ids = match relation {
+        UserNsRelation::Shared { .. } => None,
+        UserNsRelation::Distinct { .. } => Some(process_ids_from_config(config)?),
+    };
     let mut restrictions = prepare_with_rootfs(config, rootfs, rlimits, binding)?;
+    restrictions.ids = ids;
     // 準備の最後（ここまでの失敗では何も変えない）に、補助グループを参加の **前** に空にする。対象の user
     // namespace へ入った後では `setgroups` が `deny` で消せず、exec を起動したプロセスのホスト側の補助グループを
     // 持ち込んでしまうため（#1457）。不可逆で、以後このプロセスは exec 専用として使い捨てる。
-    restrictions.groups_before_join = Some(clear_supplementary_groups_before_join(
+    // 補助グループを持つ非特権の呼び出し側は初期 user namespace で消去できないが、コンテナの所有者自身の exec
+    // （別の user namespace で、呼び出し側の実効 uid が対象の実効 uid と一致）に限り参加後へ回す（#1462）。
+    let defer = defer_group_clearing(&relation, own_effective_uid());
+    restrictions.groups_before_join = match clear_supplementary_groups_before_join(
         &mut restrictions.threads,
         restrictions.binding.proc_dir.as_fd(),
-    )?);
+        defer,
+    )? {
+        PreJoinGroups::Done(groups) => Some(groups),
+        PreJoinGroups::DeferredUntilJoin => None,
+    };
     Ok(restrictions)
+}
+
+/// 参加前の補助グループの消去を参加後へ回してよいか（副作用の前に判定するテスト可能な純関数。SUP-6・SEC-1・
+/// SEC-5・TASK-163.h2・#1462）。
+///
+/// 別の user namespace へ参加し（`Distinct`）、かつ呼び出し側の実効 uid（`own_euid`。読めなければ `None`）が対象の
+/// 実効 uid と一致する場合だけ真。一致しない呼び出し側（コンテナの所有者と別の uid、たとえば別ユーザーの
+/// 補助グループを持つプロセス）は、参加後の消去が `deny` で現状維持になるとそのグループをコンテナへ持ち込むため、
+/// 従来どおり参加前の消去の失敗として拒否させる。
+fn defer_group_clearing(relation: &UserNsRelation, own_euid: Option<u32>) -> bool {
+    match *relation {
+        UserNsRelation::Shared { .. } => false,
+        UserNsRelation::Distinct { target_euid, .. } => own_euid == Some(target_euid),
+    }
+}
+
+/// 呼び出しプロセスの実効 uid（`/proc/self/status` の `Uid:`。呼び出し側の user namespace から見た値）。
+/// 読めない・解釈できない場合は `None`。
+fn own_effective_uid() -> Option<u32> {
+    let file = std::fs::File::open("/proc/self/status").ok()?;
+    let text = read_bounded_from(file, OWN_STATUS_READ_LIMIT).ok()?;
+    status_effective_uid(&text)
+}
+
+/// 自プロセスの `status` の読み取り上限（バイト）。
+const OWN_STATUS_READ_LIMIT: u64 = 64 * 1024;
+
+/// `config.json` の `process.user` から、参加後に揃える uid・gid を導く（SUP-6・SEC-5・TASK-163.h2・#1462）。
+///
+/// launch（`oci_runtime/start.rs`）と同じ制約を検査する: uid・gid が 0 でない、または `additionalGids` が空でない
+/// 指定は、ユーザー切り替えが未実装のため `Unimplemented`（段 `Validate`）で拒否する。値は定数にせず config から
+/// 導き、将来 launch が root 以外を扱うときに exec も同じ値へ揃える。`process` が無い config は `InvalidArgument`。
+fn process_ids_from_config(config: &OciConfig) -> Result<ProcessIds, ExecError> {
+    let stage = IsolationStage::Validate;
+    let process = config.process().ok_or_else(|| {
+        ExecError::new(
+            ErrorCode::InvalidArgument,
+            stage,
+            "config.json: process is required",
+        )
+    })?;
+    let user = process.user();
+    if user.uid() != 0 || user.gid() != 0 || !user.additional_gids().is_empty() {
+        return Err(ExecError::new(
+            ErrorCode::Unimplemented,
+            stage,
+            "process.user other than root is not supported",
+        ));
+    }
+    Ok(ProcessIds {
+        uid: user.uid(),
+        gid: user.gid(),
+    })
 }
 
 /// 参加前の消去の結果 `before` と、参加後の capability 削減の中での結果 `after` から、報告する値を決める。
@@ -644,6 +738,13 @@ fn current_mnt_ns_identity(proc_dir: BorrowedFd<'_>) -> Result<NsIdentity, ExecE
     own_ns_identity(proc_dir, c"ns/mnt", "mount")
 }
 
+/// 保持した procfs ディレクトリ `proc_dir` から、呼び出しプロセスの現在の user namespace の識別子を読む。
+///
+/// `ns/user` は参照のたびにタスクの現在の資格情報の user namespace へ解決されるため、`setns` の後は参加先を返す。
+fn current_user_ns_identity(proc_dir: BorrowedFd<'_>) -> Result<NsIdentity, ExecError> {
+    own_ns_identity(proc_dir, c"ns/user", "user")
+}
+
 /// 保持した procfs ディレクトリ `proc_dir` から、呼び出しプロセスの子が入る PID namespace の識別子を読む。
 ///
 /// `setns(CLONE_NEWPID)` は呼び出しプロセス自身の PID namespace を変えず、以後の子だけを移す。コマンドは
@@ -696,11 +797,19 @@ fn own_cgroup_path(proc_dir: BorrowedFd<'_>) -> Result<String, ExecError> {
 /// 自プロセスの `cgroup` の読み取り上限（バイト）。
 const OWN_CGROUP_READ_LIMIT: u64 = 64 * 1024;
 
-/// 参加後の mount namespace・子が入る PID namespace・所属 cgroup が、準備時に記録した対象のものと一致する
-/// ことをこの順で確かめる（SEC-1）。不一致は違反記録（`exec_joined_namespace_mismatch` /
-/// `exec_joined_pid_namespace_mismatch` / `exec_joined_cgroup_mismatch`。何も適用しない）。
+/// 参加後の user namespace・mount namespace・子が入る PID namespace・所属 cgroup が、準備時に記録した対象の
+/// ものと一致することをこの順で確かめる（SEC-1・SEC-5）。不一致は違反記録（user / mount は
+/// `exec_joined_namespace_mismatch`、他は `exec_joined_pid_namespace_mismatch` / `exec_joined_cgroup_mismatch`。
+/// 何も適用しない）。user namespace は別の user namespace へ参加した場合も参加しない場合も照合する（#1462。
+/// 参加しない場合は「呼び出し側 = 対象」の一致の確認になる）。
 fn verify_target_binding(binding: &TargetBinding) -> Result<(), ExecError> {
     let proc_dir = binding.proc_dir.as_fd();
+    if current_user_ns_identity(proc_dir)? != binding.target_user_ns {
+        return Err(ExecError::from_violation(
+            ViolationReason::ExecJoinedNamespaceMismatch,
+            None,
+        ));
+    }
     if current_mnt_ns_identity(proc_dir)? != binding.target_mnt_ns {
         return Err(ExecError::from_violation(
             ViolationReason::ExecJoinedNamespaceMismatch,
@@ -750,6 +859,7 @@ fn prepare_with_rootfs(
         rlimits,
         binding,
         groups_before_join: None,
+        ids: None,
         seal_policy,
     })
 }
@@ -854,6 +964,7 @@ fn reapply_inner(
         rlimits,
         binding,
         groups_before_join,
+        ids,
         seal_policy,
     } = restrictions;
     if owner_pid != std::process::id() {
@@ -886,7 +997,7 @@ fn reapply_inner(
     // capability 削減は、先頭で補助グループも空にする（launch 経路と同じ関数。#1457）。
     let capabilities = if drop_capabilities {
         Some(
-            apply_default_capabilities_with(&mut threads, Some(binding.proc_dir.as_fd()))
+            apply_default_capabilities_with(&mut threads, Some(binding.proc_dir.as_fd()), ids)
                 .map_err(|e| e.at_stage(IsolationStage::CapabilityDrop))?,
         )
     } else {
@@ -1042,6 +1153,8 @@ pub fn observe_exec_restriction_reapply(
     );
     // `setns` をしないため、対象の mount namespace は自分自身（束縛は常に一致する）。rlimit は変えない。
     let proc_dir = open_own_proc_dir().map_err(|_| internal("cannot open own procfs directory"))?;
+    let target_user_ns = current_user_ns_identity(proc_dir.as_fd())
+        .map_err(|_| internal("cannot read own user namespace"))?;
     let target_mnt_ns = current_mnt_ns_identity(proc_dir.as_fd())
         .map_err(|_| internal("cannot read own mount namespace"))?;
     let target_pid_ns = current_pid_ns_for_children_identity(proc_dir.as_fd())
@@ -1050,6 +1163,7 @@ pub fn observe_exec_restriction_reapply(
         own_cgroup_path(proc_dir.as_fd()).map_err(|_| internal("cannot read own cgroup"))?;
     let binding = TargetBinding {
         proc_dir,
+        target_user_ns,
         target_mnt_ns,
         target_pid_ns,
         expected_cgroup,
@@ -1118,6 +1232,7 @@ mod tests {
             rlimits: one_rlimit(),
             binding: own_binding(),
             groups_before_join: None,
+            ids: None,
             seal_policy: SealPolicy::unrestricted(),
         }
     }
@@ -1125,12 +1240,14 @@ mod tests {
     /// 対象の mount namespace を自分自身にした束縛（単体テストは `setns` をしないため照合が通る）。
     fn own_binding() -> TargetBinding {
         let proc_dir = open_own_proc_dir().expect("own procfs dir");
+        let target_user_ns = current_user_ns_identity(proc_dir.as_fd()).expect("own user ns");
         let target_mnt_ns = current_mnt_ns_identity(proc_dir.as_fd()).expect("own mnt ns");
         let target_pid_ns =
             current_pid_ns_for_children_identity(proc_dir.as_fd()).expect("own pid ns");
         let expected_cgroup = own_cgroup_path(proc_dir.as_fd()).expect("own cgroup");
         TargetBinding {
             proc_dir,
+            target_user_ns,
             target_mnt_ns,
             target_pid_ns,
             expected_cgroup,
@@ -1303,10 +1420,16 @@ mod tests {
         let _ = take();
         let mut r = restrictions(std::process::id());
         crate::exec::capabilities::testing::fake_groups_before_join(4);
-        r.groups_before_join = Some(
-            clear_supplementary_groups_before_join(&mut r.threads, r.binding.proc_dir.as_fd())
-                .expect("clear before join"),
-        );
+        r.groups_before_join = match clear_supplementary_groups_before_join(
+            &mut r.threads,
+            r.binding.proc_dir.as_fd(),
+            false,
+        )
+        .expect("clear before join")
+        {
+            PreJoinGroups::Done(groups) => Some(groups),
+            PreJoinGroups::DeferredUntilJoin => None,
+        };
         assert_eq!(r.groups_before_join, Some(Cleared { cleared: 4 }));
         let report = reapply_restrictions(r).expect("ok");
         assert_eq!(report.supplementary_groups(), Some(Cleared { cleared: 4 }));
@@ -1433,7 +1556,7 @@ mod tests {
         assert_eq!(e.stage, IsolationStage::SetNs);
         assert_eq!(
             e.message,
-            "the mount namespace after joining is not the one of the prepared exec target"
+            "the user or mount namespace after joining is not the one of the prepared exec target"
         );
         let v = e.violation.expect("violation recorded");
         assert_eq!(v.reason, ViolationReason::ExecJoinedNamespaceMismatch);
@@ -1464,6 +1587,151 @@ mod tests {
         assert_eq!(v.behavior_id, "SEC-1");
         assert_eq!(take(), Vec::<&str>::new());
         let _ = crate::exec::rlimits::testing::take_sets();
+    }
+
+    /// SUP-6・SEC-5・SEC-4・TASK-163.h2・#1462: 参加後の user namespace が準備時に記録した対象のものと違えば
+    /// （別の user namespace へ参加し損ねた・rootful が user namespace に入らずに参加した場合を想定）、何も適用せず
+    /// 違反記録つきの `FailedPrecondition`（理由 `exec_joined_namespace_mismatch`・段 `SetNs`）。mount namespace の
+    /// 照合より先に判定する（mount namespace も食い違わせて、user namespace の方で止まることを確かめる）。
+    #[test]
+    fn sup6_task163_h2_other_user_namespace_applies_nothing() {
+        let _ = take();
+        let mut r = restrictions(std::process::id());
+        let (dev, ino) = r.binding.target_user_ns;
+        r.binding.target_user_ns = (dev, ino.wrapping_add(1));
+        let (dev, ino) = r.binding.target_mnt_ns;
+        r.binding.target_mnt_ns = (dev, ino.wrapping_add(1));
+        let e = reapply_restrictions(r).expect_err("other user ns");
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.stage, IsolationStage::SetNs);
+        assert_eq!(
+            e.message,
+            "the user or mount namespace after joining is not the one of the prepared exec target"
+        );
+        let v = e.violation.expect("violation recorded");
+        assert_eq!(v.reason, ViolationReason::ExecJoinedNamespaceMismatch);
+        assert_eq!(v.behavior_id, "SEC-1");
+        assert_eq!(take(), Vec::<&str>::new());
+        let _ = crate::exec::rlimits::testing::take_sets();
+    }
+
+    /// SUP-6・SEC-5・TASK-163.h2・#1462: 参加前の補助グループの消去を参加後へ回してよいのは、別の user namespace
+    /// （`Distinct`）で、呼び出し側の実効 uid が対象の実効 uid と一致するときだけ。同じ user namespace・uid 不一致・
+    /// uid を読めない場合は回さない（fail-closed）。
+    #[test]
+    fn sup6_task163_h2_defer_group_clearing_truth_table() {
+        let own: NsIdentity = (4, 10);
+        let shared = UserNsRelation::Shared { identity: own };
+        let distinct = UserNsRelation::Distinct {
+            target: (4, 11),
+            own,
+            target_euid: 1000,
+        };
+        assert!(!defer_group_clearing(&shared, Some(1000)));
+        assert!(!defer_group_clearing(&shared, None));
+        assert!(defer_group_clearing(&distinct, Some(1000)));
+        assert!(!defer_group_clearing(&distinct, Some(0)));
+        assert!(!defer_group_clearing(&distinct, Some(1001)));
+        assert!(!defer_group_clearing(&distinct, None));
+    }
+
+    /// `process.user` を指定した最小の config（`process_ids_from_config` の入力）。
+    fn config_with_user(user: &str) -> OciConfig {
+        let json = format!(
+            r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":false}},"mounts":[],
+            "process":{{"terminal":false,"user":{user},"args":["/bin/true"],"cwd":"/"}}}}"#
+        );
+        crate::oci_runtime::parse_config_bytes(json.as_bytes()).expect("config")
+    }
+
+    /// SUP-6・SEC-5・TASK-163.h2・#1462: 参加後に揃える uid・gid は `process.user` から導く。launch と同じく root
+    /// （uid 0・gid 0・追加グループなし）だけを許し、それ以外は `Unimplemented`（段 `Validate`）。`process` の無い
+    /// config は `InvalidArgument`。
+    #[test]
+    fn sup6_task163_h2_process_ids_come_from_process_user() {
+        let ok = process_ids_from_config(&config_with_user(r#"{"uid":0,"gid":0}"#)).expect("root");
+        assert_eq!(ok, ProcessIds { uid: 0, gid: 0 });
+        for user in [
+            r#"{"uid":1000,"gid":0}"#,
+            r#"{"uid":0,"gid":100}"#,
+            r#"{"uid":0,"gid":0,"additionalGids":[5]}"#,
+        ] {
+            let e = process_ids_from_config(&config_with_user(user)).unwrap_err();
+            assert_eq!(
+                (e.code, e.stage),
+                (ErrorCode::Unimplemented, IsolationStage::Validate),
+                "{user}"
+            );
+            assert_eq!(e.message, "process.user other than root is not supported");
+            assert_eq!(e.violation, None);
+        }
+        let e = process_ids_from_config(&config(false, "[]")).unwrap_err();
+        assert_eq!(
+            (e.code, e.stage),
+            (ErrorCode::InvalidArgument, IsolationStage::Validate)
+        );
+    }
+
+    /// SUP-6・SEC-5・TASK-163.h2・#1462: 再適用は準備で決めた `ids` を capability 段へ渡す。別の user namespace へ
+    /// 参加した場合（`Some`）は gid・uid の切り替えが載り、同じ user namespace（`None`）では渡さない。
+    #[test]
+    fn sup6_task163_h2_ids_reach_capability_stage_only_when_set() {
+        use crate::exec::capabilities::testing::take_ids_seen;
+        let _ = take();
+        let _ = take_ids_seen();
+        let mut r = restrictions(std::process::id());
+        r.ids = Some(ProcessIds { uid: 0, gid: 0 });
+        let _ = reapply_restrictions(r).expect("ok with ids");
+        assert_eq!(take_ids_seen(), Some(Some(ProcessIds { uid: 0, gid: 0 })));
+        let _ = take();
+        let _ = reapply_restrictions(restrictions(std::process::id())).expect("ok without ids");
+        assert_eq!(take_ids_seen(), Some(None));
+        let _ = take();
+        let _ = crate::exec::rlimits::testing::take_sets();
+    }
+
+    /// SUP-6・SEC-1・SEC-5・TASK-163.h2・#1462: 参加前の消去を延期してよい場合（`EPERM` かつ `allow`）は、延期の
+    /// 可否が下位の関数へ渡り、延期可なら `DeferredUntilJoin`（`groups_before_join` は `None` になり、参加後の結果が
+    /// 報告に使われる）。延期不可なら従来どおり `PermissionDenied` で準備が失敗する。
+    #[test]
+    fn sup6_task163_h2_pre_join_group_clearing_can_be_deferred() {
+        use crate::exec::capabilities::testing::{
+            fake_groups_before_join, fake_groups_before_join_eperm_allow, take_defer_requested,
+        };
+        let _ = take();
+        let mut r = restrictions(std::process::id());
+        fake_groups_before_join(3);
+        fake_groups_before_join_eperm_allow();
+        let out = clear_supplementary_groups_before_join(
+            &mut r.threads,
+            r.binding.proc_dir.as_fd(),
+            true,
+        )
+        .expect("deferred");
+        assert_eq!(out, PreJoinGroups::DeferredUntilJoin);
+        assert_eq!(take_defer_requested(), Some(true));
+        fake_groups_before_join(3);
+        fake_groups_before_join_eperm_allow();
+        let e = clear_supplementary_groups_before_join(
+            &mut r.threads,
+            r.binding.proc_dir.as_fd(),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            (e.code, e.stage),
+            (ErrorCode::PermissionDenied, IsolationStage::CapabilityDrop)
+        );
+        assert_eq!(take_defer_requested(), Some(false));
+        // 延期した場合、参加後の結果が報告に使われる。
+        assert_eq!(
+            combine_group_outcomes(
+                None,
+                Some(SupplementaryGroups::KeptSetgroupsDenied { kept: 3 })
+            ),
+            Some(SupplementaryGroups::KeptSetgroupsDenied { kept: 3 })
+        );
+        let _ = take();
     }
 
     /// SUP-6・SEC-1・SEC-4・TASK-163.4: mount・PID namespace が同じでも、参加後の所属 cgroup が準備時の対象の

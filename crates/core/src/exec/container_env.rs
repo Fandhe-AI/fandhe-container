@@ -37,7 +37,8 @@
 //!
 //! - 作業ディレクトリ・ユーザーの指定（OCI `process.cwd`・`process.user`）。cwd は rootfs の根で固定し、uid / gid は
 //!   exec を起動したプロセスのものを引き継ぐ（launch 経路も同じ。補助グループだけは launch・exec とも空にする。
-//!   `exec/capabilities.rs` の `SupplementaryGroups`）
+//!   `exec/capabilities.rs` の `SupplementaryGroups`）。ただし rootless の exec（別の user namespace へ参加した場合）は、
+//!   参加後に `process.user`（root のみ許可）の uid・gid へ揃える（`exec/reapply.rs`・#1462）
 
 use std::ffi::OsStr;
 use std::path::Path;

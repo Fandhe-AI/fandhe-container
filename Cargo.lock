@@ -287,6 +287,8 @@ dependencies = [
  "rustls",
  "rustls-graviola",
  "rustls-native-certs",
+ "serde",
+ "serde_json",
  "ureq",
 ]
 

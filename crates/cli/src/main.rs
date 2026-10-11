@@ -40,6 +40,7 @@ fn main() -> ExitCode {
         DEFERRED_REPORT_TIMEOUT,
         spawn_thread,
         write_stderr,
+        write_stderr_fallback,
     );
     ExitCode::from(code)
 }
@@ -55,21 +56,30 @@ fn spawn_thread(job: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
 }
 
 /// 延期した記録を `write` で出す。別スレッドで書き有限の期限で待つ。スレッド起動に失敗したら
-/// 呼び出し元のスレッドでは書かず記録を諦める（満杯の pipe / socket で無期限にブロックし得るため。
-/// 診断は記録であり、期限内の終了を優先する。#1673・REPAIR-4・REPAIR-5）。
+/// 延期した記録は諦めるが、必須のコマンド結果（`code` / `message`）は `fallback` で呼び出し元のスレッドから書く
+/// （ERR 系の構造化エラー契約を保つ。#1673・REPAIR-4・REPAIR-5）。
 fn report_deferred<T: Send + 'static>(
     pending: T,
     timeout: Duration,
     spawn: Spawner,
     write: fn(&T),
+    fallback: fn(&T),
 ) {
     let (tx, rx) = std::sync::mpsc::channel();
+    // 起動失敗時に呼び出し元へ値を戻せるよう、スレッドとは共有スロット経由で受け渡す。
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(pending)));
+    let job_slot = std::sync::Arc::clone(&slot);
     let job: Box<dyn FnOnce() + Send> = Box::new(move || {
-        write(&pending);
+        let taken = job_slot.lock().ok().and_then(|mut g| g.take());
+        if let Some(p) = taken {
+            write(&p);
+        }
         let _ = tx.send(());
     });
     if spawn(job).is_ok() {
         let _ = rx.recv_timeout(timeout);
+    } else if let Some(p) = slot.lock().ok().and_then(|mut g| g.take()) {
+        fallback(&p);
     }
 }
 
@@ -87,6 +97,15 @@ fn write_stderr(r: &Report) {
     }
     let _ = r.exit.write_stderr(&mut err);
     let _ = r.pending.write_json_lines(&mut err);
+}
+
+/// スレッドを起動できなかったときの縮退出力。延期した記録は出さず、断片分離の改行とコマンド結果だけを書く。
+fn write_stderr_fallback(r: &Report) {
+    let mut err = std::io::stderr();
+    if r.partial {
+        let _ = std::io::Write::write_all(&mut err, b"\n");
+    }
+    let _ = r.exit.write_stderr(&mut err);
 }
 
 #[cfg(test)]
@@ -107,16 +126,27 @@ mod tests {
         WRITTEN.fetch_add(s.len(), Ordering::SeqCst);
     }
 
-    /// スレッド起動失敗では呼び出し元で書かず（無期限ブロックの回避）、即座に戻る（#1673・REPAIR-5）。
+    static FALLBACK: AtomicUsize = AtomicUsize::new(0);
+
+    #[allow(clippy::ptr_arg)]
+    fn count_fallback(s: &Vec<u8>) {
+        FALLBACK.fetch_add(s.len(), Ordering::SeqCst);
+    }
+
+    /// スレッド起動失敗では延期した記録は書かず、コマンド結果の縮退出力を呼び出し元で実行して即座に戻る
+    /// （構造化エラーを捨てない。#1673・REPAIR-5）。
     #[test]
-    fn spawn_failure_skips_write_and_returns() {
+    fn spawn_failure_runs_fallback_and_skips_deferred_write() {
         WRITTEN.store(0, Ordering::SeqCst);
+        FALLBACK.store(0, Ordering::SeqCst);
         report_deferred(
             b"record".to_vec(),
             Duration::from_secs(1),
             fail_spawn,
             count,
+            count_fallback,
         );
         assert_eq!(WRITTEN.load(Ordering::SeqCst), 0);
+        assert_eq!(FALLBACK.load(Ordering::SeqCst), 6);
     }
 }

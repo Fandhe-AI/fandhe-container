@@ -244,7 +244,8 @@ mod linux {
         container: Option<ContainerCgroup>,
         container_path: String,
         exec_name: Option<ExecCgroupName>,
-        rootfs: PathBuf,
+        /// 排他的に確保した一時 rootfs（確保前は `None`）。後始末はこの領域だけを対象にする。
+        rootfs: Option<PathBuf>,
         done: bool,
     }
 
@@ -267,7 +268,8 @@ mod linux {
             {
                 errors.push(format!("remove container cgroup: {e}"));
             }
-            if let Err(e) = std::fs::remove_dir_all(&self.rootfs)
+            if let Some(rootfs) = self.rootfs.take()
+                && let Err(e) = std::fs::remove_dir_all(&rootfs)
                 && e.kind() != std::io::ErrorKind::NotFound
             {
                 errors.push(format!("remove rootfs: {e}"));
@@ -311,6 +313,35 @@ mod linux {
         }
     }
 
+    /// root 用の一時 rootfs を排他的に作る。既存パスは削除も採用もしない。名前は PID・時刻・`/dev/urandom` の
+    /// 乱数で推測困難にし、`DirBuilder` の mode 0700 で `create`（既存なら `AlreadyExists` で失敗）する。
+    /// 共有の一時領域での削除→再作成の競合（他ユーザーの symlink 差し込みで root の `mknod` が領域外へ出る）を防ぐ。
+    fn create_private_rootfs() -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let base = std::fs::canonicalize(std::env::temp_dir()).expect("canonicalize temp_dir");
+        for _ in 0..16 {
+            let mut rnd = [0u8; 8];
+            File::open("/dev/urandom")
+                .and_then(|mut f| f.read_exact(&mut rnd))
+                .expect("read /dev/urandom");
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let path = base.join(format!(
+                "fandhe-devcg-{}-{nanos:x}-{:016x}",
+                std::process::id(),
+                u64::from_le_bytes(rnd)
+            ));
+            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => return path,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("create private rootfs {path:?}: {e}"),
+            }
+        }
+        panic!("could not create a private rootfs after 16 attempts");
+    }
+
     fn query_ids(fd: std::os::fd::BorrowedFd<'_>, what: &str) -> Vec<u32> {
         query_device_programs_for_test(fd)
             .unwrap_or_else(|e| panic!("query {what}: {e}"))
@@ -334,24 +365,23 @@ mod linux {
         let (container, _proof) = delegated.prepare(&name).expect("prepare");
         let container_path = format!("{}/{}", delegated_path.trim_end_matches('/'), name.as_str());
         let container_dir = cgroup_base.join(name.as_str());
-
-        // 事前の問い合わせ（後始末の後にホストの cgroup へプログラムが残らないことの基準）。
-        let runtime_leaf = File::open(cgroup_base.join("fc-runtime")).expect("open fc-runtime");
-        let before_parent = query_ids(delegated.as_fd(), "delegated parent (before)");
-        let before_runtime = query_ids(runtime_leaf.as_fd(), "fc-runtime (before)");
-
-        let rootfs = std::fs::canonicalize(std::env::temp_dir())
-            .expect("canonicalize temp_dir")
-            .join(format!("fandhe-devcg-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&rootfs);
+        // cgroup 作成の直後に回収ガードを作る。以降のどの失敗経路（panic）でも Drop が `remove_child` を呼ぶ。
         let mut scope = Scope {
             delegated,
             container: Some(container),
             container_path: container_path.clone(),
             exec_name: None,
-            rootfs: rootfs.clone(),
+            rootfs: None,
             done: false,
         };
+
+        // 事前の問い合わせ（後始末の後にホストの cgroup へプログラムが残らないことの基準）。
+        let runtime_leaf = File::open(cgroup_base.join("fc-runtime")).expect("open fc-runtime");
+        let before_parent = query_ids(scope.delegated.as_fd(), "delegated parent (before)");
+        let before_runtime = query_ids(runtime_leaf.as_fd(), "fc-runtime (before)");
+
+        let rootfs = create_private_rootfs();
+        scope.rootfs = Some(rootfs.clone());
 
         // 2. 既定のポリシーを付ける。
         let applied = {
@@ -386,7 +416,7 @@ mod linux {
 
         // 4. 一時 rootfs とホスト側の自己検証。
         for d in ["proc", "opt", "dev"] {
-            std::fs::create_dir_all(rootfs.join(d)).expect("create rootfs dir");
+            std::fs::create_dir(rootfs.join(d)).expect("create rootfs dir");
         }
         let fake_null = rootfs.join("opt/fake-null");
         let fake_local = rootfs.join("opt/fake-local");

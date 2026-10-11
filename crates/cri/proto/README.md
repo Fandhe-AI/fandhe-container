@@ -2,7 +2,7 @@
 
 CRI（Container Runtime Interface）の `.proto` 定義を置くディレクトリ。CRI-3（公式 `kubernetes/cri-api` の `.proto` から wire 互換な Rust コードを生成する）の入力であり、TASK-56.2（#424）で配置した。
 
-現時点ではどこからも読まれていない。コード生成（`build.rs`）は TASK-56.3（#426）で実装する。
+`crates/cri/build.rs`（TASK-56.3・#426）が protox + tonic-prost-build で読み、`OUT_DIR/runtime.v1.rs` へ生成する。
 
 ## 出典
 

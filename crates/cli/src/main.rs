@@ -28,15 +28,82 @@ fn main() -> ExitCode {
     // stderr が満杯の pipe / socket だと write が永久にブロックし得るため、別スレッドで書いて有限の期限で待つ（REPAIR-5）。
     // 期限内に終わらなければスレッドを置き去りにして終了する（main の return でプロセスごと破棄される）。
     let pending = fandhe_container_plugin::take_pending_child_cleanup_failures();
-    let (tx, rx) = std::sync::mpsc::channel();
-    let spawned = std::thread::Builder::new()
-        .name("deferred-report".to_string())
-        .spawn(move || {
-            let _ = pending.write_json_lines(&mut std::io::stderr());
-            let _ = tx.send(());
-        });
-    if spawned.is_ok() {
-        let _ = rx.recv_timeout(DEFERRED_REPORT_TIMEOUT);
-    }
+    report_deferred(pending, DEFERRED_REPORT_TIMEOUT, spawn_thread, write_stderr);
     ExitCode::from(exit.exit_code())
+}
+
+/// スレッドを起動する関数（テストで失敗を注入するため差し替え可能にする）。
+type Spawner = fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>;
+
+fn spawn_thread(job: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("deferred-report".to_string())
+        .spawn(job)
+        .map(|_| ())
+}
+
+/// 延期した記録を `write` で出す。別スレッドで書き有限の期限で待つ。スレッド起動に失敗したら
+/// 記録を失わないよう呼び出し元のスレッドで同期的に書く（#1673・REPAIR-4・REPAIR-5）。
+fn report_deferred<T: Send + 'static>(
+    pending: T,
+    timeout: Duration,
+    spawn: Spawner,
+    write: fn(&T),
+) {
+    // spawn 失敗時にクロージャごと破棄されないよう、共有スロット経由で渡す。
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(pending)));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let job_slot = std::sync::Arc::clone(&slot);
+    let job: Box<dyn FnOnce() + Send> = Box::new(move || {
+        let taken = job_slot.lock().ok().and_then(|mut g| g.take());
+        if let Some(p) = taken {
+            write(&p);
+        }
+        let _ = tx.send(());
+    });
+    match spawn(job) {
+        Ok(()) => {
+            let _ = rx.recv_timeout(timeout);
+        }
+        Err(_) => {
+            let taken = slot.lock().ok().and_then(|mut g| g.take());
+            if let Some(p) = taken {
+                write(&p);
+            }
+        }
+    }
+}
+
+fn write_stderr(p: &fandhe_container_plugin::PendingChildCleanup) {
+    let _ = p.write_json_lines(&mut std::io::stderr());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static WRITTEN: AtomicUsize = AtomicUsize::new(0);
+
+    fn fail_spawn(_job: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+        Err(std::io::Error::other("injected spawn failure"))
+    }
+
+    #[allow(clippy::ptr_arg)]
+    fn count(s: &Vec<u8>) {
+        WRITTEN.fetch_add(s.len(), Ordering::SeqCst);
+    }
+
+    /// スレッド起動失敗でも記録が同期的に書き出される（#1673・REPAIR-4）。
+    #[test]
+    fn spawn_failure_falls_back_to_synchronous_write() {
+        WRITTEN.store(0, Ordering::SeqCst);
+        report_deferred(
+            b"record".to_vec(),
+            Duration::from_secs(1),
+            fail_spawn,
+            count,
+        );
+        assert_eq!(WRITTEN.load(Ordering::SeqCst), 6);
+    }
 }

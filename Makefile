@@ -417,6 +417,7 @@ cli-parity-native-reclaim-selftest: ## 回収確認スクリプトの全体期�
 	bash scripts/cli-parity-native-reclaim-check-selftest.sh
 
 # commit-msg フックの本文行長検査（Issue #1295）。一時ファイルのみで完結する。make ci には含めない。
+# CI の platform-ci ジョブ（PR は ubuntu・main は 3 OS）が実行する。
 .PHONY: commit-msg-line-length-selftest
 commit-msg-line-length-selftest: ## commit-msg 行長検査スクリプトの自己テスト（Issue #1295・REPAIR-12）
 	bash scripts/check-commit-msg-line-length-selftest.sh

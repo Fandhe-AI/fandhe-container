@@ -303,6 +303,30 @@ impl UdsStream {
         self.inner.set_io_timeout(timeout)
     }
 
+    /// 生の read を 1 回、最大 `timeout` だけ待って行う（フレームを使わない上位プロトコル向け。
+    /// REPAIR-5）。呼び出し元は `fandhe-container-plugin-mcp` の UDS ループ（改行区切り JSON-RPC）。
+    ///
+    /// 期限の掛け方はフレーム受信（[`Self::read_frame`]）と同じ共有経路を使う: read 期限を `timeout` に
+    /// 設定してから読み、macOS で相手切断後に設定が EINVAL になる場合は non-blocking で 1 回だけ読む
+    /// （受信バッファの残りデータか EOF の `Ok(0)` を即返す）。その経路で何も読めない（`WouldBlock`）
+    /// 場合は期限を保証できないため、再試行対象でない `ErrorKind::Other` で失敗させる
+    /// （呼び出し側の再試行ループが期限なしで空回りしないため）。期限切れは `WouldBlock` /
+    /// `TimedOut`。`timeout` が 0 なら `InvalidInput`（無期限にしない）。
+    /// 設定した read 期限は呼び出し後も残る（[`Self::set_io_timeout`] と同じく既定期限を上書きする）。
+    /// 失敗後・期限未復元の接続は生 I/O と同じく `NotConnected` で拒否する。
+    pub fn read_within(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
+        self.check_raw_io()?;
+        self.inner.read_within(buf, timeout)
+    }
+
+    /// 生の write を 1 回、最大 `timeout` だけ待って行う（REPAIR-5）。期限の掛け方・失敗の写像・
+    /// 期限が残る点は [`Self::read_within`] と同じ（EINVAL 時の non-blocking write は切断済みなら
+    /// `BrokenPipe` 等を即返す）。
+    pub fn write_within(&mut self, buf: &[u8], timeout: Duration) -> io::Result<usize> {
+        self.check_raw_io()?;
+        self.inner.write_within(buf, timeout)
+    }
+
     /// 相手からのフレーム 1 つ（ACK・RPC 応答・要求のいずれも）を合計 `timeout` 以内に受ける
     /// （PLUG-2・PLUG-5・REPAIR-5）。
     ///
@@ -1144,19 +1168,8 @@ mod imp {
             while filled < buf.len() {
                 let remaining = remaining_until(deadline, FrameOp::Read)?;
                 let slice = buf.get_mut(filled..).ok_or_else(internal_read)?;
-                // macOS は peer close 後の UDS で set_read_timeout が EINVAL を返す。期限を掛けられない
-                // まま blocking read に進むと上限を超えて待ちうるため、EINVAL のときは non-blocking
-                // read で 1 回だけ試す（切断済みなら残りバイトか EOF を即返す。何も来なければ
-                // 期限を保証できないので失敗させる）。それ以外の失敗も読まずに失敗させる
-                // （PLUG-2・REPAIR-5）。
-                let res = match self.stream.set_read_timeout(Some(remaining)) {
-                    Ok(()) => self.stream.read(slice),
-                    Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
-                        self.nonblocking_once(FrameOp::Read, |mut s| s.read(slice))?
-                    }
-                    Err(_) => return Err(internal_read()),
-                };
-                match res {
+                let set = self.stream.set_read_timeout(Some(remaining));
+                match self.read_once_after(slice, set)? {
                     Ok(0) => {
                         return Err(map_frame_io_error(
                             io::ErrorKind::UnexpectedEof,
@@ -1171,6 +1184,63 @@ mod imp {
             // 最後の read が期限後に成功した場合も合計期限超過として扱う（REPAIR-5）。
             remaining_until(deadline, FrameOp::Read)?;
             Ok(())
+        }
+
+        /// read 期限の設定結果 `set` に応じて read を 1 回だけ試す（フレーム受信と
+        /// `UdsStream::read_within` が共有する経路。PLUG-2・REPAIR-5）。
+        ///
+        /// macOS は peer close 後の UDS で set_read_timeout が EINVAL を返す。期限を掛けられない
+        /// まま blocking read に進むと上限を超えて待ちうるため、EINVAL のときは non-blocking
+        /// read で 1 回だけ試す（切断済みなら残りバイトか EOF を即返す。何も来なければ
+        /// 期限を保証できないので失敗させる）。それ以外の設定失敗も読まずに失敗させる。
+        /// `set` を引数で受けるのは、EINVAL を返さない OS でもこの分岐を単体試験で注入するため。
+        pub(super) fn read_once_after(
+            &self,
+            slice: &mut [u8],
+            set: io::Result<()>,
+        ) -> Result<io::Result<usize>, PluginError> {
+            match set {
+                Ok(()) => Ok((&self.stream).read(slice)),
+                Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                    self.nonblocking_once(FrameOp::Read, |mut s| s.read(slice))
+                }
+                Err(_) => Err(internal_read()),
+            }
+        }
+
+        /// write 版の `Self::read_once_after`。EINVAL のときは non-blocking write で 1 回だけ試す
+        /// （切断済みなら EPIPE 等を即返す）。他の設定失敗は書かずに失敗させる。
+        pub(super) fn write_once_after(
+            &self,
+            slice: &[u8],
+            set: io::Result<()>,
+        ) -> Result<io::Result<usize>, PluginError> {
+            match set {
+                Ok(()) => Ok((&self.stream).write(slice)),
+                Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                    self.nonblocking_once(FrameOp::Write, |mut s| s.write(slice))
+                }
+                Err(_) => Err(internal_write()),
+            }
+        }
+
+        /// `UdsStream::read_within` の本体。
+        pub(super) fn read_within(
+            &mut self,
+            buf: &mut [u8],
+            timeout: Duration,
+        ) -> io::Result<usize> {
+            check_raw_timeout(timeout)?;
+            let set = self.stream.set_read_timeout(Some(timeout));
+            self.read_once_after(buf, set).map_err(raw_deadline_error)?
+        }
+
+        /// `UdsStream::write_within` の本体。
+        pub(super) fn write_within(&mut self, buf: &[u8], timeout: Duration) -> io::Result<usize> {
+            check_raw_timeout(timeout)?;
+            let set = self.stream.set_write_timeout(Some(timeout));
+            self.write_once_after(buf, set)
+                .map_err(raw_deadline_error)?
         }
 
         /// socket を一時的に non-blocking にして `op` を 1 回だけ実行する。期限を設定できない
@@ -1201,16 +1271,8 @@ mod imp {
             while sent < bytes.len() {
                 let remaining = remaining_until(deadline, FrameOp::Write)?;
                 let slice = bytes.get(sent..).ok_or_else(internal_write)?;
-                // 読み取り側と同様、EINVAL のときは non-blocking write で 1 回だけ試す
-                // （切断済みなら EPIPE 等が Unavailable に写像される）。他の失敗は書かずに失敗させる。
-                let res = match self.stream.set_write_timeout(Some(remaining)) {
-                    Ok(()) => self.stream.write(slice),
-                    Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
-                        self.nonblocking_once(FrameOp::Write, |mut s| s.write(slice))?
-                    }
-                    Err(_) => return Err(internal_write()),
-                };
-                match res {
+                let set = self.stream.set_write_timeout(Some(remaining));
+                match self.write_once_after(slice, set)? {
                     Ok(0) => {
                         return Err(map_frame_io_error(
                             io::ErrorKind::BrokenPipe,
@@ -1234,6 +1296,24 @@ mod imp {
 
     fn internal_write() -> PluginError {
         map_frame_io_error(io::ErrorKind::Other, FrameOp::Write)
+    }
+
+    /// 生 I/O の期限 0 を拒否する（0 は std では設定エラーで、無期限にもしない。REPAIR-5）。
+    fn check_raw_timeout(timeout: Duration) -> io::Result<()> {
+        if timeout.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "io timeout must be non-zero",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 期限を掛けられなかった生 I/O の失敗を io エラーへ写す。kind は再試行対象
+    /// （`WouldBlock` / `TimedOut` / `Interrupted`）にしない。呼び出し側の再試行ループが期限を
+    /// 掛けられない socket で空回りしないため（REPAIR-5）。メッセージは固定文言。
+    pub(super) fn raw_deadline_error(_: PluginError) -> io::Error {
+        io::Error::other("failed to apply io deadline")
     }
 
     /// 期限までの残り時間（0 なら `Timeout`）。
@@ -1311,6 +1391,20 @@ mod imp {
             match *self {}
         }
         pub(super) fn flush(&mut self) -> io::Result<()> {
+            match *self {}
+        }
+        pub(super) fn read_within(
+            &mut self,
+            _buf: &mut [u8],
+            _timeout: Duration,
+        ) -> io::Result<usize> {
+            match *self {}
+        }
+        pub(super) fn write_within(
+            &mut self,
+            _buf: &[u8],
+            _timeout: Duration,
+        ) -> io::Result<usize> {
             match *self {}
         }
         pub(super) fn read_frame(
@@ -1580,6 +1674,127 @@ mod tests {
         assert_eq!(e.code(), PluginErrorCode::Unavailable);
         assert!(stream.poisoned);
     }
+
+    /// PLUG-2・REPAIR-5: 期限の設定が EINVAL（macOS の peer close 後）になった場合、共有経路は
+    /// non-blocking で 1 回だけ読み、切断済みなら残りデータ → EOF（`Ok(0)`）を即返す。EINVAL は
+    /// Linux では起きないため、設定結果を注入して分岐を照合する（REPAIR-12）。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_einval_read_falls_back_to_nonblocking_read_until_eof() {
+        let (stream, mut peer) = stream_pair();
+        peer.write_all(b"tail").unwrap();
+        drop(peer);
+        let einval = || Err(io::Error::from(io::ErrorKind::InvalidInput));
+        let mut buf = [0u8; 16];
+        let n = stream
+            .inner
+            .read_once_after(&mut buf, einval())
+            .unwrap()
+            .unwrap();
+        assert_eq!(buf.get(..n), Some(&b"tail"[..]));
+        let n = stream
+            .inner
+            .read_once_after(&mut buf, einval())
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// PLUG-2・REPAIR-5: EINVAL で non-blocking read しても何も来ない（相手が生きている）場合は
+    /// 期限を保証できないため失敗させる。生 I/O 向けの写像は再試行対象でない `Other` になる
+    /// （再試行ループが期限なしで空回りしない）。socket は blocking へ戻っている。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_einval_read_without_data_fails_with_non_retry_kind() {
+        let (stream, _peer) = stream_pair();
+        let mut buf = [0u8; 4];
+        let e = stream
+            .inner
+            .read_once_after(&mut buf, Err(io::Error::from(io::ErrorKind::InvalidInput)))
+            .unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Internal);
+        let raw = imp::raw_deadline_error(e);
+        assert_eq!(raw.kind(), io::ErrorKind::Other);
+        assert_eq!(raw.to_string(), "failed to apply io deadline");
+        // 他の設定失敗は読まずに失敗する。
+        let e = stream
+            .inner
+            .read_once_after(&mut buf, Err(io::Error::from(io::ErrorKind::Other)))
+            .unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Internal);
+    }
+
+    /// PLUG-2・REPAIR-5: EINVAL 時の write は non-blocking で 1 回だけ試し、切断済みなら
+    /// EPIPE 系を即返す（blocking write へ進まない）。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_einval_write_to_closed_peer_returns_broken_pipe() {
+        let (stream, peer) = stream_pair();
+        drop(peer);
+        let e = stream
+            .inner
+            .write_once_after(b"x", Err(io::Error::from(io::ErrorKind::InvalidInput)))
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(
+                e.kind(),
+                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+            ),
+            "{e:?}"
+        );
+    }
+
+    /// REPAIR-5: `read_within` / `write_within` は 1 回の I/O を期限内に終える。データ・期限切れ・
+    /// EOF・期限 0 の拒否を具体値で照合する。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_read_write_within_obey_timeout() {
+        let (mut stream, mut peer) = stream_pair();
+        let mut buf = [0u8; 8];
+        let e = stream
+            .read_within(&mut buf, Duration::from_millis(20))
+            .unwrap_err();
+        assert!(
+            matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            "{e:?}"
+        );
+        let e = stream.read_within(&mut buf, Duration::ZERO).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        let e = stream.write_within(b"x", Duration::ZERO).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+
+        assert_eq!(stream.write_within(b"ping", WITHIN).unwrap(), 4);
+        let mut got = [0u8; 4];
+        peer.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"ping");
+
+        peer.write_all(b"pong").unwrap();
+        drop(peer);
+        let n = stream.read_within(&mut buf, WITHIN).unwrap();
+        assert_eq!(buf.get(..n), Some(&b"pong"[..]));
+        assert_eq!(stream.read_within(&mut buf, WITHIN).unwrap(), 0);
+    }
+
+    /// REPAIR-5: 失敗後・期限未復元の接続では `read_within` / `write_within` も生 I/O と同じく拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_within_io_rejected_on_unusable_connection() {
+        let (mut stream, _peer) = stream_pair();
+        stream.io_timeout_unrestored = true;
+        let mut buf = [0u8; 1];
+        let e = stream.read_within(&mut buf, WITHIN).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotConnected);
+        let e = stream.write_within(b"x", WITHIN).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotConnected);
+    }
+
+    /// `*_within` テストの期限（成功経路が待たない十分な長さ）。
+    #[cfg(unix)]
+    const WITHIN: Duration = Duration::from_secs(5);
 
     /// REPAIR-5: `PeerClosed` を観測済みの接続では、以後の復元失敗で成功した操作を失敗に変えない。
     /// 未観測の接続での復元失敗（`Failed`）は従来どおり全面的に使用不可にしてエラーを返す。

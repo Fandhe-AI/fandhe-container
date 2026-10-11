@@ -170,6 +170,7 @@ flowchart LR
 | `cli` → `plugin`（境界基盤） | バイナリ `fandhe-container` が受けた SIGINT・SIGTERM・SIGHUP を、起動中の plugin へ転送する API（`signal_forward`）を呼ぶ。シグナルハンドラの登録はバイナリの責務（PLUG-7・#1513・#1403。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。`plugin` は境界基盤で `plugin-*` バイナリ crate ではないため規則 2 に抵触しない | 確定 |
 | `cli` → `stack` | 統一 CLI が TOML スキーマを呼ぶ想定（G6・TASK-155） | 想定 |
 | `plugin-mcp` → `core` | `tools/call` の `list_containers` が core の `FileStateStore`（OCI-5）を読む（MCP-2・TASK-118.3・#466。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。向きはバックエンド → core で、規則 2 の逆向きのため抵触しない。他の `plugin-*` は個別に確定するまで下行の想定のまま | 確定 |
+| `plugin-mcp` → `plugin`（境界基盤） | core が bind した UDS へ peer 認証つき（`UdsStream::connect`）で接続して JSON-RPC を処理する（PLUG-12・MCP-1・TASK-118.4・#467。workspace 内 path 依存で実装済み。外部クレートの追加ではない。core 側 proxy との結線とフレーミングの確定は TASK-114） | 確定 |
 | `plugin-*`（バイナリ群） → `core` | トレイト型（`ContainerRuntime` 等の共通型）を参照する想定（TASK-114〜118） | 想定 |
 | `core` → `plugin`（境界基盤） | core の `plugin` feature（既定で有効）で optional 依存。`--no-default-features` で除外できる（PLUG-3・TASK-111.1・#262）。plugin 候補の探索は core 側の `crates/core/src/plugin_discovery.rs` に実装済み。登録の成果物も core 側に置く想定（TASK-109） | 確定（optional 辺。探索は実装済み・登録は未実装） |
 | `stack` → `core` | `up` コマンドが core の CLI／ライブラリ API を呼ぶ想定（PLUG-1 境界表の stack 行・TASK-155） | 想定 |

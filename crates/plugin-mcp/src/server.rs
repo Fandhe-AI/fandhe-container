@@ -21,7 +21,7 @@
 //! 未実装・簡易実装（REPAIR-3）: エラー応答の生成は `error_outcome` / `tool_error_result` の仮実装で、
 //! ERR-5 の対応表に沿った `error.rs` への置き換えは TASK-120（#469・#470）。`start_container` の
 //! 本番起動は未実装（`crate::backend` の doc を参照。#1718）。
-//! UDS 経由の疎通と peer 認証（PLUG-12）は TASK-118.4（#467）。
+//! UDS 経由の疎通と peer 認証（PLUG-12）は `crate::uds`（TASK-118.4・#467）が持つ。
 
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -500,33 +500,7 @@ where
     W: Write + Send + 'static,
 {
     let backend = CoreBackend::production();
-    // stderr が詰まっても要求処理を止めないよう、ログは専用スレッドへ非ブロッキングで渡す（REPAIR-5）。
-    let (tx, rx) = mpsc::sync_channel::<String>(LOG_QUEUE_DEPTH);
-    // 配送完了の合図。終了時に未配送ログを期限付きで待つために使う（REPAIR-4・REPAIR-5）。
-    let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
-    let spawned = thread::Builder::new()
-        .name("mcp-log".into())
-        .spawn(move || {
-            for line in rx {
-                // 壊れた stderr で panic しない。詰まった場合はこのスレッドだけが止まる。
-                let _ = writeln!(io::stderr(), "{line}");
-            }
-            let _ = done_tx.send(());
-        });
-    let logger_alive = spawned.is_ok();
-    let result = serve_with(reader, writer, Limits::default(), &backend, &mut |line| {
-        if logger_alive {
-            // 満杯・切断時は捨てる（try_send は待たない）。
-            let _ = tx.try_send(line.to_owned());
-        }
-    });
-    // Sender を drop してキューを閉じ、ログスレッドが drain し終えるのを DIAG_TIMEOUT まで待つ。
-    // stderr が停止していれば期限で打ち切り、終了は止めない。
-    drop(tx);
-    if logger_alive {
-        let _ = done_rx.recv_timeout(DIAG_TIMEOUT);
-    }
-    result
+    with_stderr_log(|log| serve_with(reader, writer, Limits::default(), &backend, log))
 }
 
 /// 診断 1 行を stderr へ書く。書き込みを専用スレッドで行い [`DIAG_TIMEOUT`] で打ち切る（REPAIR-5）。
@@ -547,7 +521,7 @@ pub fn write_diagnostic(line: &str) {
 }
 
 /// 1 行の読み取り結果。
-enum Line {
+pub(crate) enum Line {
     Data(Vec<u8>),
     Overflow,
 }
@@ -567,7 +541,7 @@ enum Event {
 
 /// 1 行を読む。上限超過分は積まずに改行まで読み捨て `Overflow` を返す。EOF のみなら `None`。
 /// 先頭バイトを受けた時点で `on_start` を 1 度呼ぶ。
-fn read_line<R: BufRead>(
+pub(crate) fn read_line<R: BufRead>(
     reader: &mut R,
     limit: usize,
     on_start: &mut dyn FnMut(),
@@ -611,7 +585,7 @@ fn read_line<R: BufRead>(
 }
 
 /// 構造化ログ 1 行（REPAIR-4）。`op` は固定名のみで入力値を含まない。
-fn log_request(log: &mut dyn FnMut(&str), outcome: &Outcome, started: Instant) {
+pub(crate) fn log_request(log: &mut dyn FnMut(&str), outcome: &Outcome, started: Instant) {
     let result = match (&outcome.reply, outcome.error_code) {
         (None, _) => "no_reply",
         (Some(_), None) => "ok",
@@ -634,8 +608,63 @@ fn log_request(log: &mut dyn FnMut(&str), outcome: &Outcome, started: Instant) {
 }
 
 /// トランスポート障害のログ 1 行。
-fn log_transport(log: &mut dyn FnMut(&str), code: &str) {
+pub(crate) fn log_transport(log: &mut dyn FnMut(&str), code: &str) {
     log(&json!({"event": "mcp.transport", "result": "error", "code": code}).to_string());
+}
+
+/// 読み切った 1 行を JSON-RPC として処理する。空白のみの行は読み飛ばして `None`。
+///
+/// stdio の [`serve_with`] と UDS の `crate::uds::serve_uds_with` が共有する。末尾の `\r` は除去し、
+/// 上限超過は `-32600` にする（MCP-1。入力内容は応答へ反射させない）。
+pub(crate) fn process_line(line: Line, backend: &dyn ToolBackend) -> Option<Outcome> {
+    match line {
+        Line::Overflow => Some(error_outcome(
+            "other",
+            Value::Null,
+            INVALID_REQUEST,
+            "Invalid Request",
+            None,
+        )),
+        Line::Data(mut data) => {
+            if data.last() == Some(&b'\r') {
+                data.pop();
+            }
+            if data.iter().all(u8::is_ascii_whitespace) {
+                return None;
+            }
+            Some(handle_message_with(&data, backend))
+        }
+    }
+}
+
+/// ログを専用スレッド経由で stderr へ非ブロッキングに出しながら `f` を実行する。
+///
+/// stderr が詰まっても要求処理を止めず、終了時は未配送ログを [`DIAG_TIMEOUT`] まで待つ
+/// （REPAIR-4・REPAIR-5）。[`serve`] と `crate::uds::serve_uds` が使う。
+pub(crate) fn with_stderr_log<T>(f: impl FnOnce(&mut dyn FnMut(&str)) -> T) -> T {
+    let (tx, rx) = mpsc::sync_channel::<String>(LOG_QUEUE_DEPTH);
+    let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
+    let spawned = thread::Builder::new()
+        .name("mcp-log".into())
+        .spawn(move || {
+            for line in rx {
+                // 壊れた stderr で panic しない。詰まった場合はこのスレッドだけが止まる。
+                let _ = writeln!(io::stderr(), "{line}");
+            }
+            let _ = done_tx.send(());
+        });
+    let logger_alive = spawned.is_ok();
+    let result = f(&mut |line| {
+        if logger_alive {
+            // 満杯・切断時は捨てる（try_send は待たない）。
+            let _ = tx.try_send(line.to_owned());
+        }
+    });
+    drop(tx);
+    if logger_alive {
+        let _ = done_rx.recv_timeout(DIAG_TIMEOUT);
+    }
+    result
 }
 
 /// 上限・期限・ログ sink を指定して EOF まで処理する。
@@ -774,23 +803,8 @@ where
             }
         };
         let began = Instant::now();
-        let outcome = match line {
-            Line::Overflow => error_outcome(
-                "other",
-                Value::Null,
-                INVALID_REQUEST,
-                "Invalid Request",
-                None,
-            ),
-            Line::Data(mut data) => {
-                if data.last() == Some(&b'\r') {
-                    data.pop();
-                }
-                if data.iter().all(u8::is_ascii_whitespace) {
-                    continue;
-                }
-                handle_message_with(&data, backend)
-            }
+        let Some(outcome) = process_line(line, backend) else {
+            continue;
         };
         if let Some(reply) = &outcome.reply {
             let Ok(text) = serde_json::to_string(reply) else {

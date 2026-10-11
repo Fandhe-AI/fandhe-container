@@ -566,8 +566,20 @@ impl<IO: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for KillableIo<IO>
         r
     }
 
+    /// 強制停止後は内側の shutdown を待たず終了させる。内側が Pending のままでも
+    /// `kill` の waker で起こして `Ready(Err)` を返す（REPAIR-5）。
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        if self.switch.is_killed() {
+            return Poll::Ready(Err(killed_error()));
+        }
+        let r = Pin::new(&mut self.inner).poll_shutdown(cx);
+        if r.is_pending() {
+            *lock(&self.slot.write) = Some(cx.waker().clone());
+            if self.switch.is_killed() {
+                return Poll::Ready(Err(killed_error()));
+            }
+        }
+        r
     }
 }
 
@@ -867,6 +879,43 @@ mod tests {
         assert!(!switch.is_killed());
         drop(KillOnDrop(Arc::clone(&switch)));
         assert!(switch.is_killed());
+    }
+
+    /// shutdown が永久に Pending の内側 IO でも kill で解除される（REPAIR-5）。
+    #[tokio::test]
+    async fn poll_shutdown_released_by_kill() {
+        use tokio::io::AsyncWriteExt;
+        struct Stuck;
+        impl tokio::io::AsyncWrite for Stuck {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                b: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Ok(b.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Pending
+            }
+        }
+        let switch = KillSwitch::new();
+        let mut io = KillableIo::new(Stuck, Arc::clone(&switch));
+        let killer = Arc::clone(&switch);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            killer.kill();
+        });
+        let r = tokio::time::timeout(Duration::from_secs(5), io.shutdown())
+            .await
+            .expect("shutdown must be released by kill");
+        assert!(r.is_err());
+        assert_eq!(r.unwrap_err().kind(), killed_error().kind());
     }
 
     /// レイテンシ分布のバケット境界（REPAIR-4）。

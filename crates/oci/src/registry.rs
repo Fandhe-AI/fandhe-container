@@ -17,9 +17,11 @@
 
 use crate::auth::{RegistryAuth, parse_token_response, parse_www_authenticate};
 use crate::error::{OciError, OciErrorCode, code_for_http_status};
+use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
 use crate::reference::{Digest, Reference, RegistryHost, Repository};
 use crate::tls;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 use ureq::Agent;
 use ureq::config::RedirectAuthHeaders;
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
@@ -109,6 +111,7 @@ impl Default for RegistryClientConfig {
 pub struct RegistryClient {
     agent: Agent,
     config: RegistryClientConfig,
+    recorder: Arc<dyn OciOpRecorder>,
 }
 
 impl RegistryClient {
@@ -153,7 +156,15 @@ impl RegistryClient {
         Ok(Self {
             agent,
             config: config.clone(),
+            recorder: Arc::new(NoopOciOpRecorder),
         })
+    }
+
+    /// 計測の記録先を差し替える（REPAIR-4。既定は何も記録しない）。
+    #[must_use]
+    pub fn with_recorder(mut self, recorder: Arc<dyn OciOpRecorder>) -> Self {
+        self.recorder = recorder;
+        self
     }
 
     /// 後続の取得処理（#402・#403）が使う `Agent`（呼び出し元が入るまで未使用）。
@@ -169,17 +180,35 @@ impl RegistryClient {
     /// scope は検証済みの `repository` から作り、レジストリ提示の scope は使わない。資格情報・
     /// `Authorization` は送らない。各リクエストに `token_request_timeout` の全体期限と応答本文の上限がある。
     /// Basic のみの提示は `Unimplemented`（OCI-3）。トークンのキャッシュ・再取得は未実装。
+    ///
+    /// プローブ・トークン要求ともリダイレクトは追従しない（`max_redirects(0)`。3xx は想定外ステータスの
+    /// エラー）。realm 検証（`TokenRealm`）を通っていない遷移先へ接続しないため。成功・失敗とエラー code・
+    /// 所要時間は `with_recorder` の記録先へ 1 件記録する（REPAIR-4。トークン値・URL は記録しない）。
     pub fn authenticate_anonymous(
         &self,
         endpoint: &RegistryEndpoint,
         repository: &Repository,
     ) -> Result<RegistryAuth, OciError> {
+        record_oci_op(
+            self.recorder.as_ref(),
+            OciOpKind::AuthenticateAnonymous,
+            || self.authenticate_anonymous_inner(endpoint, repository),
+        )
+    }
+
+    fn authenticate_anonymous_inner(
+        &self,
+        endpoint: &RegistryEndpoint,
+        repository: &Repository,
+    ) -> Result<RegistryAuth, OciError> {
+        let started = Instant::now();
         let timeout = Some(self.config.token_request_timeout);
         let probe = self
             .agent
             .get(endpoint.base_url())
             .config()
             .timeout_global(timeout)
+            .max_redirects(0)
             .build()
             .call()
             .map_err(map_ureq_error)?;
@@ -201,6 +230,7 @@ impl RegistryClient {
             .get(challenge.realm.as_str())
             .config()
             .timeout_global(timeout)
+            .max_redirects(0)
             .build()
             .query("scope", format!("repository:{}:pull", repository.as_str()));
         if let Some(service) = &challenge.service {
@@ -217,7 +247,8 @@ impl RegistryClient {
             .limit(self.config.max_token_response_bytes)
             .read_to_vec()
             .map_err(map_ureq_error)?;
-        let token = parse_token_response(&body, std::time::Instant::now())?;
+        let token =
+            parse_token_response(&body, Instant::now(), SystemTime::now(), started.elapsed())?;
         Ok(RegistryAuth::Bearer(token))
     }
 }

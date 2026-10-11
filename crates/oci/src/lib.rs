@@ -14,6 +14,7 @@
 
 pub mod auth;
 pub mod error;
+pub mod instrument;
 pub mod reference;
 pub mod registry;
 mod tls;

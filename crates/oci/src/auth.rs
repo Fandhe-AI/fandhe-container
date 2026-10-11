@@ -17,7 +17,7 @@ use crate::error::{OciError, OciErrorCode};
 use crate::reference::RegistryHost;
 use serde::Deserialize;
 use std::fmt;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// `WWW-Authenticate` ヘッダ値 1 件の最大バイト数。
 const CHALLENGE_HEADER_MAX_BYTES: usize = 4096;
@@ -309,10 +309,85 @@ struct TokenResponse {
     token: Option<String>,
     access_token: Option<String>,
     expires_in: Option<u64>,
+    issued_at: Option<String>,
 }
 
-/// トークンエンドポイントの応答本文を `BearerToken` へ変換する。`now` は有効期限の起点。
-pub(crate) fn parse_token_response(body: &[u8], now: Instant) -> Result<BearerToken, OciError> {
+/// RFC 3339 の日時（`2026-01-02T03:04:05[.frac](Z|±HH:MM)`）を UNIX 秒へ変換する。
+/// 形式が不正・1970 年より前・範囲外なら `None`（非信頼値のため寛容に解釈せず、失敗は呼び出し側で保守側へ倒す）。
+fn parse_rfc3339_unix_secs(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.len() < 20 || b.len() > 40 {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<i64> {
+        let part = b.get(from..to)?;
+        if !part.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(part).ok()?.parse().ok()
+    };
+    let sep = |i: usize, c: u8| b.get(i).copied() == Some(c);
+    if !(sep(4, b'-')
+        && sep(7, b'-')
+        && (sep(10, b'T') || sep(10, b't'))
+        && sep(13, b':')
+        && sep(16, b':'))
+    {
+        return None;
+    }
+    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    let mut i = 19;
+    if sep(i, b'.') {
+        i += 1;
+        let start = i;
+        while b.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+    }
+    let offset_secs: i64 = match b.get(i).copied()? {
+        b'Z' | b'z' if i + 1 == b.len() => 0,
+        sign @ (b'+' | b'-') if i + 6 == b.len() && sep(i + 3, b':') => {
+            let oh = num(i + 1, i + 3)?;
+            let om = num(i + 4, i + 6)?;
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let v = oh * 3600 + om * 60;
+            if sign == b'+' { v } else { -v }
+        }
+        _ => return None,
+    };
+    // 民法日（proleptic Gregorian）→ 1970-01-01 からの日数。
+    let yy = if mo <= 2 { y - 1 } else { y };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let total = days * 86_400 + h * 3600 + mi * 60 + sec - offset_secs;
+    u64::try_from(total).ok()
+}
+
+/// トークンエンドポイントの応答本文を `BearerToken` へ変換する。
+///
+/// 有効期限は `now`（受信後の単調時刻）から `expires_in`（既定 60 秒・上限 3600 秒）の**残存分**とする。
+/// `issued_at`（RFC 3339）が読めれば `wall_now` との差（発行からの経過）を、読めない・省略なら
+/// `request_elapsed`（トークン要求開始からの経過）を差し引く。両方あるときは大きい方を引く（保守側。
+/// 時計ずれで発行時刻が未来でも要求経過分は引く）。残りが 0 以下なら即失効扱いにする。
+pub(crate) fn parse_token_response(
+    body: &[u8],
+    now: Instant,
+    wall_now: SystemTime,
+    request_elapsed: Duration,
+) -> Result<BearerToken, OciError> {
     let resp: TokenResponse =
         serde_json::from_slice(body).map_err(|_| data_loss("invalid token response"))?;
     let value = [resp.token, resp.access_token]
@@ -333,7 +408,18 @@ pub(crate) fn parse_token_response(body: &[u8], now: Instant) -> Result<BearerTo
         None | Some(0) => DEFAULT_EXPIRES_SECS,
         Some(n) => n.min(MAX_EXPIRES_SECS),
     };
-    let expires_at = now.checked_add(Duration::from_secs(secs)).unwrap_or(now);
+    let wall_age = resp
+        .issued_at
+        .as_deref()
+        .and_then(parse_rfc3339_unix_secs)
+        .and_then(|issued| {
+            let wall = wall_now.duration_since(UNIX_EPOCH).ok()?.as_secs();
+            Some(Duration::from_secs(wall.saturating_sub(issued)))
+        })
+        .unwrap_or(Duration::ZERO);
+    let age = wall_age.max(request_elapsed);
+    let remaining = Duration::from_secs(secs).saturating_sub(age);
+    let expires_at = now.checked_add(remaining).unwrap_or(now);
     Ok(BearerToken { value, expires_at })
 }
 
@@ -440,7 +526,12 @@ mod tests {
     }
 
     fn token(json: &str) -> Result<BearerToken, OciError> {
-        parse_token_response(json.as_bytes(), Instant::now())
+        parse_token_response(
+            json.as_bytes(),
+            Instant::now(),
+            SystemTime::now(),
+            Duration::ZERO,
+        )
     }
 
     /// OCI-1: token / access_token の選択とヘッダ値。
@@ -477,15 +568,87 @@ mod tests {
     fn token_expiry() {
         let now = Instant::now();
         let at = |s: u64| now + Duration::from_secs(s);
-        let t = parse_token_response(br#"{"token":"a"}"#, now).expect("t");
+        let t = parse_token_response(br#"{"token":"a"}"#, now, SystemTime::now(), Duration::ZERO)
+            .expect("t");
         assert!(!t.is_expired(at(59)));
         assert!(t.is_expired(at(60)));
-        let t = parse_token_response(br#"{"token":"a","expires_in":0}"#, now).expect("t");
+        let t = parse_token_response(
+            br#"{"token":"a","expires_in":0}"#,
+            now,
+            SystemTime::now(),
+            Duration::ZERO,
+        )
+        .expect("t");
         assert!(t.is_expired(at(60)));
-        let t =
-            parse_token_response(br#"{"token":"a","expires_in":999999999999}"#, now).expect("t");
+        let t = parse_token_response(
+            br#"{"token":"a","expires_in":999999999999}"#,
+            now,
+            SystemTime::now(),
+            Duration::ZERO,
+        )
+        .expect("t");
         assert!(!t.is_expired(at(3599)));
         assert!(t.is_expired(at(3600)));
+    }
+
+    /// RFC 3339 の変換（具体値）。
+    #[test]
+    fn rfc3339_parsing() {
+        assert_eq!(parse_rfc3339_unix_secs("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_rfc3339_unix_secs("2026-10-11T12:34:56.789Z"),
+            Some(1_791_722_096)
+        );
+        assert_eq!(
+            parse_rfc3339_unix_secs("2026-10-11T21:34:56+09:00"),
+            Some(1_791_722_096)
+        );
+        assert_eq!(
+            parse_rfc3339_unix_secs("2024-02-29T00:00:00Z"),
+            Some(1_709_164_800)
+        );
+        for bad in [
+            "x",
+            "",
+            "2026-10-11 12:34:56Z",
+            "2026-13-11T12:34:56Z",
+            "2026-10-11T12:34:56",
+            "1969-12-31T23:59:59Z",
+        ] {
+            assert_eq!(parse_rfc3339_unix_secs(bad), None, "{bad}");
+        }
+    }
+
+    /// OCI-1: issued_at が古ければ残存期間だけ有効、失効済みなら即失効。省略時は要求経過を差し引く。
+    #[test]
+    fn token_expiry_accounts_for_issue_time() {
+        let now = Instant::now();
+        let at = |s: u64| now + Duration::from_secs(s);
+        let wall = UNIX_EPOCH + Duration::from_secs(1_791_722_096);
+        let body = br#"{"token":"a","expires_in":300,"issued_at":"2026-10-11T12:30:56Z"}"#;
+        // 発行から 240 秒経過 → 残り 60 秒。
+        let t = parse_token_response(body, now, wall, Duration::ZERO).expect("t");
+        assert!(!t.is_expired(at(59)));
+        assert!(t.is_expired(at(60)));
+        // 発行から 300 秒以上経過 → 即失効。
+        let old = br#"{"token":"a","expires_in":300,"issued_at":"2026-10-11T12:00:00Z"}"#;
+        let t = parse_token_response(old, now, wall, Duration::ZERO).expect("t");
+        assert!(t.is_expired(now));
+        // issued_at 省略 → 要求経過 100 秒を差し引く。
+        let t = parse_token_response(
+            br#"{"token":"a","expires_in":300}"#,
+            now,
+            wall,
+            Duration::from_secs(100),
+        )
+        .expect("t");
+        assert!(!t.is_expired(at(199)));
+        assert!(t.is_expired(at(200)));
+        // issued_at が未来でも要求経過は引く。
+        let fut = br#"{"token":"a","expires_in":300,"issued_at":"2030-01-01T00:00:00Z"}"#;
+        let t = parse_token_response(fut, now, wall, Duration::from_secs(100)).expect("t");
+        assert!(t.is_expired(at(200)));
+        assert!(!t.is_expired(at(199)));
     }
 
     /// security.md: Debug にトークン値を出さない。

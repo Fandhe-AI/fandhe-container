@@ -141,3 +141,37 @@ fn mcp1_any_argument_is_rejected_without_echo() {
     assert!(!stderr.contains("/tmp/x"));
     assert!(out.stdout.is_empty(), "stdout must be empty");
 }
+
+/// MCP-2: bin 経由の `tools/call`。start_container は本番起動が未実装のため `isError` の UNIMPLEMENTED、
+/// 未知ツールは `-32602`。list_containers は既定の状態ルートを作る副作用があるため bin 経由では呼ばない。
+#[test]
+fn mcp2_tools_call_start_container_and_unknown_tool_over_stdio() {
+    let input = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"start_container","arguments":{"container_id":"c1"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"nope"}}"#,
+        "\n",
+    );
+    let out = run(&[], input.as_bytes());
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stdout).expect("stdout is UTF-8");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 3, "stdout: {text}");
+    let start: serde_json::Value = serde_json::from_str(lines[1]).expect("line 2 is JSON");
+    assert_eq!(start["id"], 2);
+    assert_eq!(start["result"]["isError"], true);
+    let body: serde_json::Value = serde_json::from_str(
+        start["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text is a string"),
+    )
+    .expect("text is JSON");
+    assert_eq!(body["code"], "UNIMPLEMENTED");
+    let unknown: serde_json::Value = serde_json::from_str(lines[2]).expect("line 3 is JSON");
+    assert_eq!(unknown["error"]["code"], -32602);
+    assert_eq!(unknown["error"]["data"]["code"], "INVALID_ARGUMENT");
+}

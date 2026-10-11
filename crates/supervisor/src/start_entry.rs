@@ -329,10 +329,14 @@ fn write_report(out: &mut dyn Write, report: &StartReport) -> std::io::Result<()
     out.flush()
 }
 
-/// 後始末の失敗を、元のエラーを隠さずにログへ出す。
-fn release_logged(deps: &mut dyn StartDeps) {
-    if let Err(e) = deps.release_cgroup() {
-        log_event("cgroup_release_failed", Some(e.code()));
+/// cgroup を消す。失敗は元のエラーを隠さずにログへ出し、`false` を返す（後始末の成否へ反映する）。
+fn release_logged(deps: &mut dyn StartDeps) -> bool {
+    match deps.release_cgroup() {
+        Ok(()) => true,
+        Err(e) => {
+            log_event("cgroup_release_failed", Some(e.code()));
+            false
+        }
     }
 }
 
@@ -435,7 +439,7 @@ fn start_reporting(
     log_event("start_deadline_exceeded", Some(ErrorCode::Timeout));
     report(out, &StartReport::failed(&overdue));
     let late_until = Instant::now().checked_add(crate::start_contract::result_deadline(timeouts));
-    match worker.wait_until(late_until) {
+    match worker.wait_or_abandon(late_until) {
         Some((_deps, Attempt::Started(running))) => {
             // 報告済みは INTERNAL のため、起動したものを残さない（CORE-1・SUP-1）。
             let Running {
@@ -453,8 +457,8 @@ fn start_reporting(
             let _ = cleanup_after_report(deps, store.as_ref(), req.id(), timeouts, cleanup);
         }
         None => {
-            // 作業スレッドがまだ戻らない。以後に戻った結果は作業スレッドが後始末する（プロセスの終了まで）。
-            worker.abandon();
+            // 作業スレッドがまだ戻らない（放棄は待ちの打ち切りと同じロックの下で記した）。以後に戻った結果は
+            // 作業スレッドが後始末する（プロセスの終了まで）。
             log_event("start_worker_abandoned", Some(ErrorCode::Timeout));
         }
     }
@@ -564,7 +568,7 @@ impl StartWorker {
                 let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
                 if matches!(*slot, WorkerSlot::Abandoned) {
                     drop(slot);
-                    abandoned_cleanup(deps, store.as_ref(), req.id(), &timeouts, attempt);
+                    abandoned_cleanup(deps, &store, req.id(), &timeouts, attempt);
                     return;
                 }
                 *slot = WorkerSlot::Done(deps, attempt);
@@ -602,27 +606,56 @@ impl StartWorker {
         }
     }
 
-    /// 結果を待つのをやめる（同じロックの下で記す。以後に戻った結果は作業スレッドが後始末する）。
-    fn abandon(&self) {
-        let (lock, _) = &*self.shared;
-        *lock.lock().unwrap_or_else(PoisonError::into_inner) = WorkerSlot::Abandoned;
+    /// [`Self::wait_until`] と同じだが、期限までに結果が出なければ同じロックの下で放棄を記して `None` を返す
+    /// （打ち切りと放棄の間に格納された結果を捨てない。以後の結果は作業スレッドが後始末する）。
+    fn wait_or_abandon(
+        &self,
+        until: Option<Instant>,
+    ) -> Option<(Box<dyn StartDeps + Send>, Attempt)> {
+        let (lock, cvar) = &*self.shared;
+        let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if matches!(*slot, WorkerSlot::Done(..)) {
+                return match std::mem::replace(&mut *slot, WorkerSlot::Abandoned) {
+                    WorkerSlot::Done(deps, attempt) => Some((deps, attempt)),
+                    _ => None,
+                };
+            }
+            let wait = match until {
+                Some(u) => match u.checked_duration_since(Instant::now()) {
+                    Some(r) if !r.is_zero() => r,
+                    _ => {
+                        *slot = WorkerSlot::Abandoned;
+                        return None;
+                    }
+                },
+                None => Duration::from_secs(3600),
+            };
+            slot = cvar
+                .wait_timeout(slot, wait)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
     }
 }
 
 /// 入口が待つのをやめた後に作業スレッドが戻ったときの後始末（best effort。プロセスの終了までに終われば行う）。
 fn abandoned_cleanup(
     deps: Box<dyn StartDeps + Send>,
-    store: &dyn StateStore,
+    store: &Arc<dyn StateStore>,
     id: &ContainerId,
     timeouts: &StartTimeouts,
     attempt: Attempt,
 ) {
     match attempt {
         Attempt::Started(running) => {
-            let _ = terminate_retrying(running.process, timeouts.terminate());
+            // 入口の期限後の成功と同じく、terminate できたら照合つきで Stopped を記録する（SUP-1・CORE-2）。
+            if let Some(pid) = terminate_retrying(running.process, timeouts.terminate()) {
+                mark_stopped(store, id, running.instance, &[pid]);
+            }
         }
         Attempt::Failed { cleanup, .. } => {
-            let _ = cleanup_after_report(deps, store, id, timeouts, cleanup);
+            let _ = cleanup_after_report(deps, store.as_ref(), id, timeouts, cleanup);
         }
     }
 }
@@ -637,7 +670,7 @@ fn cleanup_after_report(
 ) -> bool {
     let confirmed = match cleanup {
         Cleanup::Nothing => return true,
-        Cleanup::ReleaseCgroup => true,
+        Cleanup::ReleaseCgroup => return release_logged(deps.as_mut()),
         Cleanup::AfterTimeout(launcher) => {
             recover_after_timeout(store, &launcher, id, timeouts, Vec::new())
         }
@@ -646,12 +679,13 @@ fn cleanup_after_report(
         }
     };
     if confirmed {
-        release_logged(deps.as_mut());
+        // cgroup の削除の失敗も後始末の失敗として返す（終了コードを INTERNAL にする。CORE-3）。
+        release_logged(deps.as_mut())
     } else {
         // 予約か子が残り得る。cgroup は消さない（子が入っている可能性がある）。
         log_event("start_cleanup_unconfirmed", Some(ErrorCode::Internal));
+        false
     }
-    confirmed
 }
 
 /// 手順 3〜8（作業スレッドで実行）。後始末は行わず、要る後始末の種類を返す。

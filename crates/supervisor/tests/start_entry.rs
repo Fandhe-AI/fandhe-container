@@ -232,6 +232,8 @@ struct FakeDeps {
     record_scope: bool,
     /// `prepare_cgroup` の所要時間（期限超過の試験で起動処理を止める）。
     prepare_delay: Duration,
+    /// `true` なら `release_cgroup` が失敗する。
+    release_fails: bool,
 }
 
 impl FakeDeps {
@@ -286,7 +288,11 @@ impl StartDeps for FakeDeps {
     }
 
     fn release_cgroup(&mut self) -> Result<(), TraitError> {
-        self.step("release")
+        self.step("release")?;
+        if self.release_fails {
+            return Err(TraitError::new(ErrorCode::Internal, "release failed"));
+        }
+        Ok(())
     }
 }
 
@@ -301,6 +307,7 @@ fn deps(calls: &Calls, launcher: FakeLauncher) -> (FakeDeps, Arc<FakeLauncher>) 
             prepared_instance: None,
             record_scope: false,
             prepare_delay: Duration::ZERO,
+            release_fails: false,
         },
         launcher,
     )
@@ -864,4 +871,25 @@ fn repair4_run_start_records_start_outcome() {
     let name = fandhe_container_core::observability::OpName::new(START_OP).unwrap();
     let stats = recorder.snapshot_op(&name).expect("recorded");
     assert_eq!((stats.success(), stats.failure()), (0, 1));
+}
+
+/// CORE-3: 報告の後の cgroup の削除に失敗したら、元のエラーを報告したまま終了コードは INTERNAL にする。
+#[test]
+fn core3_release_failure_after_report_exits_internal() {
+    let env = Env::new("relfail");
+    env.create(&env.id);
+    let calls = new_calls();
+    let (mut d, _l) = deps(&calls, FakeLauncher::new(&calls));
+    d.fail_at = Some("audit");
+    d.release_fails = true;
+    let mut out = Vec::new();
+    let code = start_with(&env, d, &env.id, &short_timeouts(), &mut out)
+        .err()
+        .expect("start must fail");
+    assert_eq!(code, exit_code_for(ErrorCode::Internal));
+    assert_eq!(calls_of(&calls), ["check", "prepare", "audit", "release"]);
+    match report_of(&out) {
+        StartReport::Failed { code, .. } => assert_eq!(code, ErrorCode::PermissionDenied),
+        other => panic!("unexpected report: {other:?}"),
+    }
 }

@@ -177,7 +177,8 @@ fn log_event(event: &'static str, code: Option<ErrorCode>) {
     let code = code.map(|c| c.as_str()).unwrap_or("");
     let line =
         format!("{{\"component\":\"supervisor\",\"event\":\"{event}\",\"code\":\"{code}\"}}\n");
-    crate::stderr_sink::stderr().emit(line.into_bytes());
+    // 満杯・書き込み失敗でも処理は止めない（ログの欠落は許す）。
+    let _ = crate::stderr_sink::stderr().emit(line.into_bytes());
 }
 
 /// 回収を確かめられなかったハンドルの保管先（`Drop` は回収しないため、捨てずに保持する。REPAIR-5）。

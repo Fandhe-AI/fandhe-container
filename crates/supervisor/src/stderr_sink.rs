@@ -16,16 +16,49 @@
 
 use std::io::Write;
 use std::sync::OnceLock;
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::time::Duration;
 
 /// キューに溜められる行数の上限（読み手が止まっても無制限に溜めない）。
 pub const QUEUE_CAPACITY: usize = 256;
 
-/// キューの 1 要素。`ack` があれば書き込みの成功後に通知する。
+/// 出口への 1 回の依頼（`emit`・`emit_and_wait`・`flush`）の結果（REPAIR-4）。
+///
+/// 待つ依頼（`emit_and_wait`・`flush`）は、前回の待つ依頼より後にキューへ入った行の書き込み結果をまとめて返す
+/// （キュー満杯で捨てた行は呼び出し側が `emit` の [`EmitOutcome::QueueFull`] で知るため、ここには含めない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EmitOutcome {
+    /// キューへ入れた（書けたかは待たない。`emit` のみ）。
+    Queued,
+    /// 書き手へ書けた（待つ依頼では、前回の待つ依頼以降の行がすべて書けた）。
+    Written,
+    /// 書き手への書き込みが失敗した。`failed_lines` は前回の待つ依頼以降に失敗した行数（この依頼の行を含む）。
+    WriteFailed {
+        /// 失敗した行数（1 以上）。
+        failed_lines: u64,
+    },
+    /// キューが満杯のため捨てた。
+    QueueFull,
+    /// 専用スレッドが無い（作れなかった・終了した）ため捨てた。
+    WorkerUnavailable,
+    /// 期限内に書き終わりを確かめられなかった（専用スレッドが書き込みで止まっている等）。
+    TimedOut,
+    /// 共有の出口を一度も使っていないため、待つ行が無い（[`flush_stderr`] のみ）。
+    NothingQueued,
+}
+
+impl EmitOutcome {
+    /// 行が書き手まで届いた（または届けるべき行が無い）か。
+    pub fn is_delivered(self) -> bool {
+        matches!(self, Self::Written | Self::NothingQueued)
+    }
+}
+
+/// キューの 1 要素。`ack` があれば、前回の通知以降の書き込み結果を通知する。
 struct Line {
     bytes: Vec<u8>,
-    ack: Option<SyncSender<()>>,
+    ack: Option<SyncSender<EmitOutcome>>,
 }
 
 /// 専用スレッド 1 本で書き手へ書く、待たない出口。
@@ -46,45 +79,69 @@ impl StderrSink {
         }
     }
 
-    /// 1 行を待たずにキューへ入れる。入れられたら `true`（満杯・スレッド無しなら捨てて `false`）。
-    pub fn emit(&self, bytes: Vec<u8>) -> bool {
-        self.enqueue(Line { bytes, ack: None })
+    /// 1 行を待たずにキューへ入れる。入れられたら [`EmitOutcome::Queued`]。
+    pub fn emit(&self, bytes: Vec<u8>) -> EmitOutcome {
+        match self.enqueue(Line { bytes, ack: None }) {
+            Ok(()) => EmitOutcome::Queued,
+            Err(rejected) => rejected,
+        }
     }
 
-    /// 1 行をキューへ入れ、書けたことを `deadline` まで待つ。期限内に書けたら `true`。
+    /// 1 行をキューへ入れ、書けたことを `deadline` まで待つ。
     ///
-    /// 先に入れた行はこの行より前に書かれる（キューは FIFO）。
-    pub fn emit_and_wait(&self, bytes: Vec<u8>, deadline: Duration) -> bool {
+    /// 先に入れた行はこの行より前に書かれる（キューは FIFO）。結果は前回の待つ依頼以降の行をまとめたもの。
+    pub fn emit_and_wait(&self, bytes: Vec<u8>, deadline: Duration) -> EmitOutcome {
         let (ack, done) = sync_channel(1);
-        if !self.enqueue(Line {
+        if let Err(rejected) = self.enqueue(Line {
             bytes,
             ack: Some(ack),
         }) {
-            return false;
+            return rejected;
         }
-        done.recv_timeout(deadline).is_ok()
+        match done.recv_timeout(deadline) {
+            Ok(outcome) => outcome,
+            Err(RecvTimeoutError::Timeout) => EmitOutcome::TimedOut,
+            // 通知の前に専用スレッドが終わった。
+            Err(RecvTimeoutError::Disconnected) => EmitOutcome::WorkerUnavailable,
+        }
     }
 
-    /// それまでに入れた行が書かれるのを `deadline` まで待つ。期限内に書き終えたら `true`。
-    pub fn flush(&self, deadline: Duration) -> bool {
+    /// それまでに入れた行が書かれるのを `deadline` まで待つ（前回の待つ依頼以降の失敗も結果に載る）。
+    pub fn flush(&self, deadline: Duration) -> EmitOutcome {
         self.emit_and_wait(Vec::new(), deadline)
     }
 
-    fn enqueue(&self, line: Line) -> bool {
-        self.tx.as_ref().is_some_and(|tx| tx.try_send(line).is_ok())
+    fn enqueue(&self, line: Line) -> Result<(), EmitOutcome> {
+        let Some(tx) = self.tx.as_ref() else {
+            return Err(EmitOutcome::WorkerUnavailable);
+        };
+        tx.try_send(line).map_err(|e| match e {
+            TrySendError::Full(_) => EmitOutcome::QueueFull,
+            TrySendError::Disconnected(_) => EmitOutcome::WorkerUnavailable,
+        })
     }
 }
 
-/// 専用スレッドの本体。全送り手が無くなるまで 1 行ずつ書く。
+/// 専用スレッドの本体。全送り手が無くなるまで 1 行ずつ書き、待つ依頼には前回以降の結果を返す。
 fn drain<W: Write>(mut writer: W, rx: Receiver<Line>) {
+    let mut failed_lines: u64 = 0;
     for line in rx {
         let written = line.bytes.is_empty()
             || writer
                 .write_all(&line.bytes)
                 .and_then(|()| writer.flush())
                 .is_ok();
-        if written && let Some(ack) = line.ack {
-            let _ = ack.try_send(());
+        if !written {
+            failed_lines = failed_lines.saturating_add(1);
+        }
+        if let Some(ack) = line.ack {
+            let outcome = if failed_lines == 0 {
+                EmitOutcome::Written
+            } else {
+                EmitOutcome::WriteFailed { failed_lines }
+            };
+            failed_lines = 0;
+            let _ = ack.try_send(outcome);
         }
     }
 }
@@ -98,9 +155,11 @@ pub fn stderr() -> &'static StderrSink {
 
 /// 共有の出口を使っていれば、それまでの行が書かれるのを `deadline` まで待つ（プロセス終了の直前に呼ぶ）。
 ///
-/// 一度も使っていなければ何もせず `true`（終了のためだけにスレッドを作らない）。
-pub fn flush_stderr(deadline: Duration) -> bool {
-    STDERR.get().is_none_or(|sink| sink.flush(deadline))
+/// 一度も使っていなければ何もせず [`EmitOutcome::NothingQueued`]（終了のためだけにスレッドを作らない）。
+pub fn flush_stderr(deadline: Duration) -> EmitOutcome {
+    STDERR
+        .get()
+        .map_or(EmitOutcome::NothingQueued, |sink| sink.flush(deadline))
 }
 
 #[cfg(test)]
@@ -155,27 +214,32 @@ mod tests {
         }
     }
 
-    /// REPAIR-5: 書き手が止まっても `emit` は待たずに戻り、キューの上限を超えた行は捨てる。
+    /// REPAIR-5: 書き手が止まっても `emit` は待たずに戻り、キューの上限を超えた行は `QueueFull` で捨てる。
     #[test]
     fn repair5_emit_does_not_block_on_stuck_writer() {
         let (release, writer) = stuck();
         let sink = StderrSink::spawn(writer, 2);
         let started = Instant::now();
-        let accepted = (0..10).filter(|_| sink.emit(b"x\n".to_vec())).count();
+        let accepted = (0..10)
+            .filter(|_| sink.emit(b"x\n".to_vec()) == EmitOutcome::Queued)
+            .count();
         assert!(started.elapsed() < Duration::from_secs(1));
         // 専用スレッドが止まった 1 行＋キューの 2 行まで。
         assert!((2..=3).contains(&accepted), "accepted = {accepted}");
-        assert!(!sink.emit(b"y\n".to_vec()));
+        assert_eq!(sink.emit(b"y\n".to_vec()), EmitOutcome::QueueFull);
         drop(release);
     }
 
-    /// REPAIR-5: 書き手が止まっていれば `emit_and_wait` は期限で `false` を返す。
+    /// REPAIR-5: 書き手が止まっていれば `emit_and_wait` は期限で `TimedOut` を返す。
     #[test]
     fn repair5_emit_and_wait_times_out_on_stuck_writer() {
         let (release, writer) = stuck();
         let sink = StderrSink::spawn(writer, 4);
         let started = Instant::now();
-        assert!(!sink.emit_and_wait(b"x\n".to_vec(), Duration::from_millis(100)));
+        assert_eq!(
+            sink.emit_and_wait(b"x\n".to_vec(), Duration::from_millis(100)),
+            EmitOutcome::TimedOut
+        );
         assert!(started.elapsed() < Duration::from_secs(5));
         drop(release);
     }
@@ -185,19 +249,54 @@ mod tests {
     fn repair4_lines_are_written_in_order_and_flush_waits() {
         let buf = SharedBuf::default();
         let sink = StderrSink::spawn(buf.clone(), 8);
-        assert!(sink.emit(b"a\n".to_vec()));
-        assert!(sink.emit_and_wait(b"b\n".to_vec(), Duration::from_secs(5)));
-        assert!(sink.emit(b"c\n".to_vec()));
-        assert!(sink.flush(Duration::from_secs(5)));
+        assert_eq!(sink.emit(b"a\n".to_vec()), EmitOutcome::Queued);
+        assert_eq!(
+            sink.emit_and_wait(b"b\n".to_vec(), Duration::from_secs(5)),
+            EmitOutcome::Written
+        );
+        assert_eq!(sink.emit(b"c\n".to_vec()), EmitOutcome::Queued);
+        assert_eq!(sink.flush(Duration::from_secs(5)), EmitOutcome::Written);
         assert_eq!(buf.0.lock().unwrap().as_slice(), b"a\nb\nc\n");
     }
 
-    /// 書き込みに失敗した行は `emit_and_wait` が期限を待たずに `false` を返す。
+    /// REPAIR-4: 書き込みに失敗した行は、待つ依頼が期限を待たずに失敗した行数つきで返す。
     #[test]
-    fn repair5_emit_and_wait_reports_write_failure() {
+    fn repair4_emit_and_wait_reports_write_failure() {
         let sink = StderrSink::spawn(BrokenWriter, 4);
         let started = Instant::now();
-        assert!(!sink.emit_and_wait(b"x\n".to_vec(), Duration::from_secs(30)));
+        assert_eq!(
+            sink.emit_and_wait(b"x\n".to_vec(), Duration::from_secs(30)),
+            EmitOutcome::WriteFailed { failed_lines: 1 }
+        );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// REPAIR-4: `flush` は前回の待つ依頼以降に `emit` で入れた行の失敗を反映し、反映後は数え直す。
+    #[test]
+    fn repair4_flush_reports_preceding_write_failures() {
+        let sink = StderrSink::spawn(BrokenWriter, 4);
+        assert_eq!(sink.emit(b"x\n".to_vec()), EmitOutcome::Queued);
+        assert_eq!(sink.emit(b"y\n".to_vec()), EmitOutcome::Queued);
+        assert_eq!(
+            sink.flush(Duration::from_secs(5)),
+            EmitOutcome::WriteFailed { failed_lines: 2 }
+        );
+        assert_eq!(sink.flush(Duration::from_secs(5)), EmitOutcome::Written);
+    }
+
+    /// 結果の区別: 届いた（または届ける行が無い）ものだけが `is_delivered`。
+    #[test]
+    fn repair4_is_delivered_distinguishes_outcomes() {
+        assert!(EmitOutcome::Written.is_delivered());
+        assert!(EmitOutcome::NothingQueued.is_delivered());
+        for o in [
+            EmitOutcome::Queued,
+            EmitOutcome::WriteFailed { failed_lines: 1 },
+            EmitOutcome::QueueFull,
+            EmitOutcome::WorkerUnavailable,
+            EmitOutcome::TimedOut,
+        ] {
+            assert!(!o.is_delivered(), "{o:?}");
+        }
     }
 }

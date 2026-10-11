@@ -314,7 +314,8 @@ impl MonitorObserver for StderrLogObserver {
             code,
             event.elapsed.as_micros()
         );
-        crate::stderr_sink::stderr().emit(line.into_bytes());
+        // 満杯・書き込み失敗でも監視は止めない（ログの欠落は許す）。
+        let _ = crate::stderr_sink::stderr().emit(line.into_bytes());
     }
 }
 

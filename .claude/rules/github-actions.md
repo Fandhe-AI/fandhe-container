@@ -82,7 +82,7 @@ reusable workflow の `rust-ci (ubuntu-latest) / cargo deny check`（約 120 秒
 
 ## キャッシュ方針
 
-Actions のキャッシュはリポジトリあたり **10 GB** が上限で、超えると最終アクセスの古いものから追い出され（LRU）、7 日間アクセスの無いものは削除される。上限超過分の課金の予算は $0 のため、**10 GB の中でヒット率を保つ**ことを目的にする。
+Actions のキャッシュは本リポジトリの上限が **10 GB**（既定値のまま）で、超えると最終アクセスの古いものから追い出され（LRU）、7 日間アクセスの無いものは削除される。Org の Actions の予算は $10（超過で停止）で、リポジトリの上限を 10 GB より上げた場合は 10 GB を超えた分が 1 GB あたり月 $0.07 の課金になる。本リポジトリは上限を上げず、**10 GB の中でヒット率を保つ**ことを目的にする（上限の引き上げはリポジトリ設定の変更のためオーナー判断）。
 
 | キャッシュ | 場所 | key | 中身・サイズ（2026-10-11） |
 | ---------- | ---- | --- | -------------------------- |
@@ -90,11 +90,11 @@ Actions のキャッシュはリポジトリあたり **10 GB** が上限で、�
 | `fandhe-container-<os>-deny-*` | 同上の deny ジョブ | 同上 | `~/.cargo/registry` のみ。30〜41 MB |
 | `cargo-tools-Linux-*` | `platform-ci`（ubuntu のみ） | `scripts/versions.sh` のハッシュ | cargo-deny・cargo-about のバイナリ。10 MB |
 
-- **保存は main の push だけにし、PR は restore のみにする**（大きい blob が対象）。PR の cache は `refs/pull/<N>/merge` スコープに保存され、他の PR・main からは読めない。`Cargo.lock` を変えた PR や、main の保存より先に走った PR が main と同内容の blob を PR ごとに重複保存し、容量を消費する。`rust-ci` は reusable の `cache-save` 入力（`Fandhe-AI/actions` [#165](https://github.com/Fandhe-AI/actions/pull/165) で追加。マージ後に `cache-save: ${{ github.ref == 'refs/heads/main' }}` を渡す）、自前の `actions/cache` は `actions/cache/restore` と、main だけで走る `actions/cache/save` に分ける
+- **保存は main の push だけにし、PR は restore のみにする**（大きい blob が対象）。PR の cache は `refs/pull/<N>/merge` スコープに保存され、他の PR・main からは読めない。`Cargo.lock` を変えた PR や、main の保存より先に走った PR が main と同内容の blob を PR ごとに重複保存し、容量を消費する。`rust-ci` は reusable の `cache-save` 入力（`Fandhe-AI/actions` [#165](https://github.com/Fandhe-AI/actions/pull/165) で追加。`ci.yml` の `rust-ci` は `cache-save: ${{ github.ref == 'refs/heads/main' }}` を渡し済み）、自前の `actions/cache` は `actions/cache/restore` と、main だけで走る `actions/cache/save` に分ける。トレードオフ: PR は 2 回目以降の push でも自分の保存を使えず、main の blob からの部分復元になる。main への push が続くと古い実行は concurrency で取り消されて保存されないが、最後の実行が保存するため PR はその blob を読む
 - 例外: 版だけで決まる小さいツールのバイナリ（`cargo-tools-Linux-*`）は既定の保存のままでよい。PR に重複が出るのは `scripts/versions.sh` を変えた PR だけで、main の `platform-ci` は concurrency の取り消しで保存まで届かないことがあるため、PR 側で保存できるほうが再ビルド（約 220 秒）を避けられる
 - **key には中身を決める入力だけを入れる**。SHA・`run_id`・日付など毎回変わる値を入れない（再利用されない blob が溜まる）。ハッシュの入力は必要なファイルに絞る（`**/Cargo.lock` は `.agents/skills/make/samples/**`（`.claude/skills` の symlink 経由も）や `poc/venus-decoder/jig` の `Cargo.lock` の変更でもキーを変える。#1758 でスキルのサンプルが入っただけで clippy・test・deny のキーが変わった。reusable は [#165](https://github.com/Fandhe-AI/actions/pull/165) でルートの `Cargo.lock` だけにした）。`target/` のようにコンパイラの版で中身が変わるものは key に rustc の版（`rustc -vV` の release・commit-hash）を入れる。`rust-toolchain.toml` は stable 追従のため runner イメージの更新で rustc が変わり、key に無いと旧 rustc の blob に exact hit し続けて依存を毎回全再ビルドし、exact hit のため保存もされない（#165 で対応）
 - `restore-keys` で前方一致の部分復元を必ず効かせる（key が変わっても cold にしない）。追い出しが起きても、最新の main の blob は毎回アクセスされるため LRU の最後まで残り、ヒットは続く
-- OS・ジョブをまたいで中身が同じなら key を共有する。中身が OS で変わるものは `runner.os` を入れる。使わなくなった key（2026-10-10 のジョブ再構成で `rust-ci` が ubuntu のみになった後の `fandhe-container-macOS-*`）は 7 日で消えるのを待つか、`gh cache delete` で消す
+- OS・ジョブをまたいで中身が同じなら key を共有する。中身が OS で変わるものは `runner.os` を入れる。使わなくなった key（2026-10-10 のジョブ再構成で `rust-ci` が ubuntu のみになった後の `fandhe-container-macOS-*`）は 7 日で消えるのを待つか、`gh cache delete` で消す（読むジョブが無いことを `ci.yml` で確かめてから消す）
 - 新しいキャッシュを足すときは、blob サイズ × key が変わる頻度（1 日あたり）× 7 日 で容量を見積もり、他のキャッシュと合わせて 10 GB に収まることを確かめる。復元時間が節約時間より長いジョブにはキャッシュを付けない
 
 計測方法:
@@ -112,7 +112,7 @@ gh api repos/Fandhe-AI/fandhe-container/actions/jobs/<job-id>/logs \
 2026-10-11 の実測（変更前。main の push 5 件・PR 14 件の `rust-ci` の clippy・test・deny 57 ステップ）:
 
 - 使用量 5.4 GB・177 件（上限の約半分）。最古の blob は 7 日前で、追い出しは起きていない。miss は 0 件（exact hit 39・部分復元 18）。部分復元は `Cargo.lock` を変えた PR と、main の保存前に走った PR
-- 件数が多い原因は、`Cargo.lock` が 8 日で 14 回変わり（workspace 内の依存追加でも変わる）、そのたびに main と PR の両方で新しい key を保存していたこと。PR スコープの blob が約 3.1 GB（約 6 割）で、同じ key の blob が main と PR 3 件で 4 重に保存された例がある（#1759 のマージ直後）。macOS の blob（約 1.4 GB）は 2026-10-10 以降どのジョブも読まない
+- 件数が多い原因は、`Cargo.lock` が 8 日で 14 回変わり（workspace 内の依存追加でも変わる）、そのたびに main と PR の両方で新しい key を保存していたこと。PR スコープの blob が約 3.1 GB（約 6 割）で、同じ key の blob が main と PR 3 件で 4 重に保存された例がある（#1759 のマージ直後）。macOS の blob（約 1.4 GB）は 2026-10-10 以降どのジョブも読まないため、2026-10-11 に `gh cache delete` で削除した（`fandhe-container-macOS-*` の 63 件・約 1.39 GB）
 - #1759（gRPC のコード生成）以降、blob は clippy 30→105 MB・test 45→120 MB に増えた。この増え方で key が 1 日 2 回変わり PR の重複も続くと、7 日分で 10 GB に近づく
 - `cargo-tools-Linux-*`（#1756）は main の保存（run 38119539753）以降の PR がすべて exact hit し、`platform-ci (ubuntu-latest)` は約 590〜700 秒から約 360〜430 秒になった
 - `rust-ci / cargo deny check`（約 100〜130 秒）の大半（84 秒）は cargo-deny のソースビルド。[#165](https://github.com/Fandhe-AI/actions/pull/165) で reusable がバイナリを cache するようにし、検証用 PR（#1763）で約 93 秒 → 10 秒になった

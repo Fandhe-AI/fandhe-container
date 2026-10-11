@@ -17,7 +17,8 @@
 //! create / start / kill / delete の失敗は `OciRuntimeError` で返し、標準エラー向け 1 行 JSON は `write_json_line` で
 //! 出せる（TASK-96.2・TASK-96.3）。実 stderr への書き出しとプロセス終了は CLI 側（TASK-79・TASK-95）の
 //! 責務で未結線である（REPAIR-3）。
-//! 例外は start の rootfs 固定（`RootfsDir::pin`。`exec::open_dir_beneath` を使う）と
+//! 例外は start の rootfs 固定（`RootfsDir::pin`。`exec::open_dir_beneath` を使う。検証後の差し替えの違反は
+//! `RootfsPinError` で運び、exec の経路が監査ログの層 `mount` へ記録する。start の経路は記録しない〔#1314〕。#1702）と
 //! `ContainerChildProcess` で、`launch.rs` 内に `cfg(target_os = "linux")` で局所化している。Linux 以外の
 //! start は rootfs を固定できないため、起動前に `Unimplemented` で拒否する（fail-closed）。
 
@@ -49,9 +50,12 @@ pub use error::{
 pub use kill::{KillTimeout, ProcessSignaler, kill};
 #[cfg(target_os = "linux")]
 pub use launch::ContainerChildProcess;
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use launch::pin_bundle_rootfs_with_swap_for_test;
 pub use launch::{
-    LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher, RootfsDir, START_TIMEOUT_MAX,
-    StartTimeouts, pin_bundle_rootfs,
+    LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher, RootfsDir, RootfsPinError,
+    START_TIMEOUT_MAX, StartTimeouts, pin_bundle_rootfs, pin_bundle_rootfs_audited,
 };
 pub use mount_destination::{MountDestination, audit_mount_config_error};
 pub use start::{

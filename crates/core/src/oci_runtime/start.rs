@@ -667,7 +667,8 @@ fn build_spec(bundle: &Path) -> Result<LaunchSpec, TraitError> {
     }
     // 検査済みの rootfs を、`/` から祖先を含む全要素を symlink 非追従で辿って fd で固定する（SEC-1）。
     // 以後の使用はこの fd に限るため、検査後に祖先や rootfs を差し替えても固定した実体は変わらない。
-    let rootfs_dir = RootfsDir::pin(bundle, &rootfs)?;
+    // 違反の理由（`RootfsPinError::violation`）は start の経路では記録しない（`AuditSink` の配線が無い。#1314・#1702）。
+    let rootfs_dir = RootfsDir::pin(bundle, &rootfs).map_err(TraitError::from)?;
     Ok(LaunchSpec::new(
         rootfs,
         rootfs_dir,

@@ -18,8 +18,11 @@
 //! 記録される（`EXEC_CHILD_VIOLATIONS`）。照合の限界: worker が別ファイルの違反生成ヘルパを呼ぶように
 //! なったら、そのファイルを照合対象に加えること（`rootfs.rs`・`inject.rs`・`tmpfs.rs` は launch の経路の違反を
 //! 多数作るため `exec/` 全体は走査しない）。worker が呼ぶ `oci_runtime` の bundle の rootfs の固定
-//! （`RootfsDir::pin`）は `open_dir_beneath` の違反を固定文言の `TraitError` へ写して違反の情報を落とすため、
-//! `ExecError::violation` として worker の結果行へは届かない（記録の対象外。supervisor の `exec.rs` の「未実装」）。
+//! （`RootfsDir::pin`。`launch.rs`）は、`open_dir_beneath` の違反のうち `rootfs changed after validation` に写る
+//! 2 理由（`path_symlink_or_not_directory`・`path_missing`）だけを `RootfsPinError` で運び、supervisor の
+//! `load_exec_bundle` が目印つきの `TraitError` にして `err` 行へ載せる（#1702）。照合の限界: `launch.rs` は
+//! pin 以外のコードも含むため、そこに `ViolationReason::` を足すと照合に混ざる（足すなら一覧との関係を決めること）。
+//! start の経路は `AuditSink` の配線が無く記録しない（#1314）。
 
 use std::collections::BTreeSet;
 
@@ -79,7 +82,7 @@ pub(super) fn violation_list_gaps(
 }
 
 /// worker の経路のソース（ファイル名と内容）。モジュール doc「worker の経路」の一覧と同じ。
-const WORKER_PATH_SOURCES: [(&str, &str); 11] = [
+const WORKER_PATH_SOURCES: [(&str, &str); 12] = [
     ("setns.rs", include_str!("setns.rs")),
     ("cgroup_join.rs", include_str!("cgroup_join.rs")),
     ("reapply.rs", include_str!("reapply.rs")),
@@ -91,6 +94,8 @@ const WORKER_PATH_SOURCES: [(&str, &str); 11] = [
     ("entrypoint_mode.rs", include_str!("entrypoint_mode.rs")),
     ("container_env.rs", include_str!("container_env.rs")),
     ("exec_command.rs", include_str!("exec_command.rs")),
+    // bundle の rootfs の固定（`RootfsDir::pin`）。`rootfs changed after validation` の 2 理由を運ぶ（#1702）。
+    ("launch.rs", include_str!("../oci_runtime/launch.rs")),
 ];
 
 /// SEC-4・SUP-6・SEC-1・REPAIR-12: worker の経路のソースが作る違反理由と `EXEC_WORKER_REASONS` が一致し、
@@ -115,7 +120,15 @@ fn sec4_sup6_exec_worker_reasons_match_worker_path_sources() {
         stale.is_empty(),
         "EXEC_WORKER_REASONS entries not produced by worker-path sources: {stale:?}"
     );
-    assert_eq!(found.len(), 11);
+    assert_eq!(found.len(), 13);
+    // launch.rs が作る理由は pin の 2 理由だけ（他の理由を足すと一覧との照合に混ざる）。
+    assert_eq!(
+        violation_names(include_str!("../oci_runtime/launch.rs")),
+        BTreeSet::from([
+            "PathMissing".to_owned(),
+            "PathSymlinkOrNotDirectory".to_owned()
+        ])
+    );
     for r in ViolationReason::EXEC_WORKER_REASONS {
         assert!(
             r.exec_worker_audit_event().is_some(),

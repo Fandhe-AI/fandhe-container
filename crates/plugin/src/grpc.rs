@@ -23,8 +23,13 @@
 //! # 未実装（REPAIR-3）
 //!
 //! - CRI proto の RPC による疎通は TASK-108.3（#455）。
-//! - UDS サーバーの同時接続数の上限は未実装（同一 UID のみ接続可。接続あたりの並列・ストリーム数は
-//!   [`GrpcServerConfig`] で制限される）。
+//!
+//! # 同時接続数の上限（PLUG-12）
+//!
+//! UDS サーバーの同時接続数は既定 [`GRPC_MAX_CONNECTIONS_DEFAULT`]（64）で、
+//! [`GrpcServerConfig::with_max_connections`] で変更する。上限到達時の追加接続は拒否され
+//! （構造化ログ `grpc_connection_rejected`）、既存接続が閉じると枠が戻る。
+//! 接続あたりの並列・ストリーム数も [`GrpcServerConfig`] で制限される。
 //!
 //! # 期限（REPAIR-5）
 //!

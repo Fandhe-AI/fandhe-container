@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# Pinned tool versions shared by scripts/targets/*.sh (sourced via scripts/lib.sh).
+# scripts/targets/*.sh が使う固定バージョン（scripts/lib.sh 経由で source される）。直接実行しない。
 #
-# Single source of truth (previously the Makefile variables). Keep in sync with:
-#   - lint tools: the defaults of the Fandhe-AI/actions lint-docs reusable workflow
-#     (CI is authoritative; follow it when they drift). EC_NPM_VERSION is the npm wrapper
-#     version (CI fetches the Go binary release v3.8.0 directly, so the numbering differs).
-#   - CARGO_DENY_VERSION: Dockerfile, .github/workflows/ci.yml (rust-ci.with.cargo-deny-version).
-#   - CARGO_ABOUT_VERSION: Dockerfile (cargo install cargo-about@x.y.z), .github/workflows/ci.yml.
-#   - LEFTHOOK_VERSION: exact-pinned npx fallback for `make hooks`.
-# Do not execute directly.
+# 単一の定義元（旧 Makefile の変数）。以下と同期させる:
+#   - lint ツール: Fandhe-AI/actions の lint-docs reusable workflow の既定値（CI 側が正。乖離したら追従する）。
+#     EC_NPM_VERSION は npm ラッパーパッケージの版（CI は Go バイナリの release v3.8.0 を直接取得するため版番号体系が異なる）
+#   - CARGO_DENY_VERSION: Dockerfile・.github/workflows/ci.yml（rust-ci の cargo-deny-version）
+#   - CARGO_ABOUT_VERSION: Dockerfile（cargo install cargo-about@x.y.z）・.github/workflows/ci.yml
+#   - LEFTHOOK_VERSION: `make hooks` の npx フォールバック用の exact 固定版
+# 環境変数で上書きできる（未設定時のみ既定値を入れる）。
 
 MARKDOWNLINT_VERSION="${MARKDOWNLINT_VERSION:-0.49.1}"
 YAMLLINT_VERSION="${YAMLLINT_VERSION:-1.38.0}"

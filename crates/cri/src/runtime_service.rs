@@ -10,22 +10,46 @@
 //! リスナー（UDS・peer credential 検証。PLUG-12）や gRPC のメッセージ長上限の設定は TASK-108 の責務で、
 //! ここでは作らない。`config` のパス類（`log_directory` 等）は保持するだけで検証していない。
 //! 実際にファイルへ触れる TASK-58 / TASK-59 で検証する。
+//!
+//! **保持量の上限**: レジストリは件数（[`MAX_SANDBOXES`]）と、保持する `config` の量
+//! （1 件の符号化長 [`MAX_CONFIG_ENCODED_BYTES`]・可変長要素の件数と長さ・合計の見積もり
+//! [`MAX_RETAINED_CONFIG_BYTES`]）の両方で有限に保つ。gRPC の受信上限に頼らないのは、本トレイトを
+//! 直接呼ぶ経路にも効かせるためと、受信上限では累積を縛れないため。検証の詳細は `config_limits`
+//! サブモジュール。
+//!
+//! **可観測性（REPAIR-4）**: `RunPodSandbox` は全終了経路（成功・入力不正・上限超過・内部エラー）で、
+//! 結果のステータスコードと所要時間を [`CriOpRecorder`] へ 1 件渡す。記録先は
+//! [`CriRuntimeService::with_recorder`] で注入する（既定は記録しない）。`config`・labels・annotations・
+//! エラー文言は記録先へ渡さない。
+
+mod config_limits;
 
 use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
+use std::fmt;
 use std::hash::{BuildHasher, Hasher};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tonic::codegen::tokio_stream::Empty;
 use tonic::{Request, Response, Status};
 
+use crate::instrument::{CriOpKind, CriOpRecorder, CriOpTimer, NoopCriOpRecorder};
 use crate::runtime::v1::{
     self, PodSandboxConfig, PodSandboxState, runtime_service_server::RuntimeService,
 };
+use config_limits::BoundedConfig;
+
+pub use config_limits::{
+    MAX_CONFIG_COLLECTION_ENTRIES, MAX_CONFIG_ENCODED_BYTES, MAX_METADATA_FIELD_BYTES,
+    MAX_RETAINED_CONFIG_BYTES, RETAINED_BYTES_PER_ENTRY, RETAINED_BYTES_PER_RECORD,
+};
 
 /// 受け付けるサンドボックス数の上限（無制限確保の防止。ERR-3 の `FAILED_PRECONDITION`）。
+///
+/// 根拠: kubelet の既定の Pod 数上限は 1 ノード 110（`--max-pods`）で、1024 はその約 9 倍。
+/// 終了済みで未削除のサンドボックスが残る分を見込んでも届かない値とした。
 pub const MAX_SANDBOXES: usize = 1024;
 
 /// サポートする `runtime_handler`。空文字（既定ハンドラ）のみ。未知のハンドラは拒否する（CRI の規定）。
@@ -33,6 +57,55 @@ const SUPPORTED_RUNTIME_HANDLERS: &[&str] = &[""];
 
 /// ID 採番の衝突時に再試行する回数の上限。
 const ID_RETRY_LIMIT: usize = 8;
+
+/// レジストリの保持量の上限（件数と `config` の保持量の見積もりの合計）。
+///
+/// 既定値（[`MAX_SANDBOXES`]・[`MAX_RETAINED_CONFIG_BYTES`]）より大きい値は指定できない（既定値へ丸める）。
+/// 設定で上限を外せると「保持量が有限」という前提が崩れるため、絞る方向にだけ変えられる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SandboxLimits {
+    max_sandboxes: usize,
+    max_retained_bytes: usize,
+}
+
+impl Default for SandboxLimits {
+    fn default() -> Self {
+        Self {
+            max_sandboxes: MAX_SANDBOXES,
+            max_retained_bytes: MAX_RETAINED_CONFIG_BYTES,
+        }
+    }
+}
+
+impl SandboxLimits {
+    /// 既定の上限。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// サンドボックス数の上限を絞る（[`MAX_SANDBOXES`] を超える値は [`MAX_SANDBOXES`] になる）。
+    pub fn with_max_sandboxes(mut self, max_sandboxes: usize) -> Self {
+        self.max_sandboxes = max_sandboxes.min(MAX_SANDBOXES);
+        self
+    }
+
+    /// `config` の保持量の見積もりの合計の上限を絞る（[`MAX_RETAINED_CONFIG_BYTES`] を超える値は
+    /// [`MAX_RETAINED_CONFIG_BYTES`] になる）。
+    pub fn with_max_retained_bytes(mut self, max_retained_bytes: usize) -> Self {
+        self.max_retained_bytes = max_retained_bytes.min(MAX_RETAINED_CONFIG_BYTES);
+        self
+    }
+
+    /// サンドボックス数の上限。
+    pub fn max_sandboxes(&self) -> usize {
+        self.max_sandboxes
+    }
+
+    /// `config` の保持量の見積もりの合計の上限（バイト）。
+    pub fn max_retained_bytes(&self) -> usize {
+        self.max_retained_bytes
+    }
+}
 
 /// サンドボックスの内部状態（CRI の `PodSandboxState` に対応）。
 ///
@@ -57,31 +130,46 @@ impl SandboxState {
 
 /// レジストリに保持するサンドボックス 1 件分の記録。
 ///
-/// `config` は無加工で保持する（annotations を書き換えない CRI の要件。Status/List〔#431〕と
-/// TASK-58 が再利用する）。
+/// `config` は内容を変えずに保持する（annotations を書き換えない CRI の要件。Status/List〔#431〕と
+/// TASK-58 が再利用する）。サイズ・件数の検証を通過したものだけが入る（`config_limits`）。
+/// `retained_bytes` はこの記録がレジストリの保持量へ計上した見積もりで、削除（#430）のときに
+/// `SandboxRegistry::retained_bytes` から同じ値を引く。
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct SandboxRecord {
     config: PodSandboxConfig,
     state: SandboxState,
     created_at_nanos: i64,
-    runtime_handler: String,
+    runtime_handler: &'static str,
+    retained_bytes: usize,
 }
 
 /// サンドボックスのメモリ上レジストリ（TASK-59 で `StateStore` に置換するスタブ。REPAIR-3）。
+///
+/// 不変条件: `retained_bytes` は `records` の各記録の `retained_bytes` の合計に等しい。
 #[derive(Debug, Default)]
 struct SandboxRegistry {
     records: HashMap<String, SandboxRecord>,
+    retained_bytes: usize,
 }
 
 /// CRI `RuntimeService` の実装（TASK-57.1）。
 ///
 /// `fandhe-container-plugin-cri`（TASK-108）が `RuntimeServiceServer` で包んで公開する。
 /// 状態はプロセス内メモリのみのスタブで、実行層へは接続していない（REPAIR-3）。
-#[derive(Debug)]
 pub struct CriRuntimeService {
     registry: Mutex<SandboxRegistry>,
-    max_sandboxes: usize,
+    limits: SandboxLimits,
+    recorder: Arc<dyn CriOpRecorder>,
+}
+
+impl fmt::Debug for CriRuntimeService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // レジストリの中身（config・labels・annotations）は出さない。
+        f.debug_struct("CriRuntimeService")
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for CriRuntimeService {
@@ -91,16 +179,33 @@ impl Default for CriRuntimeService {
 }
 
 impl CriRuntimeService {
-    /// 既定の上限（`MAX_SANDBOXES`）で作る。
+    /// 既定の上限（[`SandboxLimits::default`]）・計測なしで作る。
     pub fn new() -> Self {
-        Self::with_max_sandboxes(MAX_SANDBOXES)
+        Self::with_recorder(Arc::new(NoopCriOpRecorder))
     }
 
-    /// サンドボックス数の上限を指定して作る（上限超過の検証用）。
+    /// サンドボックス数の上限を指定して、計測なしで作る（上限超過の検証用）。
     pub fn with_max_sandboxes(max_sandboxes: usize) -> Self {
+        Self::with_limits_and_recorder(
+            SandboxLimits::default().with_max_sandboxes(max_sandboxes),
+            Arc::new(NoopCriOpRecorder),
+        )
+    }
+
+    /// 既定の上限で、操作の結果と所要時間の記録先を指定して作る（REPAIR-4）。
+    pub fn with_recorder(recorder: Arc<dyn CriOpRecorder>) -> Self {
+        Self::with_limits_and_recorder(SandboxLimits::default(), recorder)
+    }
+
+    /// 上限と記録先の両方を指定して作る。
+    pub fn with_limits_and_recorder(
+        limits: SandboxLimits,
+        recorder: Arc<dyn CriOpRecorder>,
+    ) -> Self {
         Self {
             registry: Mutex::new(SandboxRegistry::default()),
-            max_sandboxes,
+            limits,
+            recorder,
         }
     }
 
@@ -108,6 +213,69 @@ impl CriRuntimeService {
     #[cfg(test)]
     fn sandbox_count(&self) -> usize {
         self.registry.lock().map(|r| r.records.len()).unwrap_or(0)
+    }
+
+    /// レジストリの保持量の見積もりの合計（テスト用）。
+    #[cfg(test)]
+    fn retained_bytes(&self) -> usize {
+        self.registry.lock().map(|r| r.retained_bytes).unwrap_or(0)
+    }
+
+    /// `RunPodSandbox` の本体。検証・採番・登録を行い、失敗時はレジストリを変更しない。
+    ///
+    /// 計測（[`CriOpTimer`]）の内側で呼ばれる。レジストリのロックは本関数の中で解放するため、
+    /// 記録先はロックの外で呼ばれる。
+    fn reserve_sandbox(
+        &self,
+        req: v1::RunPodSandboxRequest,
+    ) -> Result<v1::RunPodSandboxResponse, Status> {
+        let ValidatedRun {
+            config,
+            runtime_handler,
+        } = validate_run_request(req)?;
+        let retained_bytes = config.retained_bytes();
+
+        let created_at_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_nanos()).ok())
+            .filter(|n| *n > 0)
+            .ok_or_else(|| Status::internal("system clock is invalid"))?;
+
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+        if registry.records.len() >= self.limits.max_sandboxes {
+            return Err(Status::failed_precondition("too many sandboxes"));
+        }
+        let total_retained_bytes = registry
+            .retained_bytes
+            .checked_add(retained_bytes)
+            .filter(|total| *total <= self.limits.max_retained_bytes)
+            .ok_or_else(|| Status::failed_precondition("sandbox config storage is full"))?;
+        let mut pod_sandbox_id = None;
+        for _ in 0..ID_RETRY_LIMIT {
+            let candidate = generate_sandbox_id();
+            if !registry.records.contains_key(&candidate) {
+                pod_sandbox_id = Some(candidate);
+                break;
+            }
+        }
+        let pod_sandbox_id =
+            pod_sandbox_id.ok_or_else(|| Status::internal("failed to allocate sandbox id"))?;
+        registry.records.insert(
+            pod_sandbox_id.clone(),
+            SandboxRecord {
+                config: config.into_config(),
+                state: SandboxState::Ready,
+                created_at_nanos,
+                runtime_handler,
+                retained_bytes,
+            },
+        );
+        registry.retained_bytes = total_retained_bytes;
+        Ok(v1::RunPodSandboxResponse { pod_sandbox_id })
     }
 }
 
@@ -131,12 +299,25 @@ fn generate_sandbox_id() -> String {
     id
 }
 
-/// `RunPodSandbox` の入力検証（ERR-3: 必須欠落・値域外は `INVALID_ARGUMENT`）。
-fn validate_run_request(req: &v1::RunPodSandboxRequest) -> Result<(), Status> {
-    let config = req
-        .config
-        .as_ref()
-        .ok_or_else(|| Status::invalid_argument("config is required"))?;
+/// 入力検証を通過した `RunPodSandbox` の要求。
+///
+/// `runtime_handler` は要求の文字列を持ち回さず、一致したサポート済みハンドラの定数を持つ
+/// （要求側の文字列の容量を保持しないため）。
+struct ValidatedRun {
+    config: BoundedConfig,
+    runtime_handler: &'static str,
+}
+
+/// `RunPodSandbox` の入力検証（ERR-3: 必須欠落・値域外・サイズ超過は `INVALID_ARGUMENT`）。
+///
+/// 必須フィールドとハンドラを先に確かめ、最後に `config` のサイズ・件数を検証して保持用に作り直す
+/// （`BoundedConfig::new`）。状態には触れない。
+fn validate_run_request(req: v1::RunPodSandboxRequest) -> Result<ValidatedRun, Status> {
+    let v1::RunPodSandboxRequest {
+        config,
+        runtime_handler,
+    } = req;
+    let config = config.ok_or_else(|| Status::invalid_argument("config is required"))?;
     let metadata = config
         .metadata
         .as_ref()
@@ -144,10 +325,16 @@ fn validate_run_request(req: &v1::RunPodSandboxRequest) -> Result<(), Status> {
     if metadata.name.is_empty() {
         return Err(Status::invalid_argument("config.metadata.name is required"));
     }
-    if !SUPPORTED_RUNTIME_HANDLERS.contains(&req.runtime_handler.as_str()) {
-        return Err(Status::invalid_argument("unknown runtime_handler"));
-    }
-    Ok(())
+    let runtime_handler = SUPPORTED_RUNTIME_HANDLERS
+        .iter()
+        .copied()
+        .find(|supported| *supported == runtime_handler.as_str())
+        .ok_or_else(|| Status::invalid_argument("unknown runtime_handler"))?;
+    let config = BoundedConfig::new(config)?;
+    Ok(ValidatedRun {
+        config,
+        runtime_handler,
+    })
 }
 
 #[tonic::async_trait]
@@ -161,51 +348,16 @@ impl RuntimeService for CriRuntimeService {
 
     /// サンドボックス ID を採番し、状態 ready で登録する（CRI-1・TASK-57.1）。
     ///
-    /// 失敗時はレジストリを変更しない。
+    /// 失敗時はレジストリを変更しない。成功・失敗のどちらでも、結果のステータスコードと所要時間を
+    /// 記録先へ 1 件渡す（REPAIR-4。未確定のまま抜けた場合はガードが `Internal` として記録する）。
     async fn run_pod_sandbox(
         &self,
         request: Request<v1::RunPodSandboxRequest>,
     ) -> Result<Response<v1::RunPodSandboxResponse>, Status> {
-        let req = request.into_inner();
-        validate_run_request(&req)?;
-        let config = req
-            .config
-            .ok_or_else(|| Status::invalid_argument("config is required"))?;
-
-        let created_at_nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()
-            .and_then(|d| i64::try_from(d.as_nanos()).ok())
-            .filter(|n| *n > 0)
-            .ok_or_else(|| Status::internal("system clock is invalid"))?;
-
-        let mut registry = self
-            .registry
-            .lock()
-            .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
-        if registry.records.len() >= self.max_sandboxes {
-            return Err(Status::failed_precondition("too many sandboxes"));
-        }
-        let mut pod_sandbox_id = None;
-        for _ in 0..ID_RETRY_LIMIT {
-            let candidate = generate_sandbox_id();
-            if !registry.records.contains_key(&candidate) {
-                pod_sandbox_id = Some(candidate);
-                break;
-            }
-        }
-        let pod_sandbox_id =
-            pod_sandbox_id.ok_or_else(|| Status::internal("failed to allocate sandbox id"))?;
-        registry.records.insert(
-            pod_sandbox_id.clone(),
-            SandboxRecord {
-                config,
-                state: SandboxState::Ready,
-                created_at_nanos,
-                runtime_handler: req.runtime_handler,
-            },
-        );
-        Ok(Response::new(v1::RunPodSandboxResponse { pod_sandbox_id }))
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::RunPodSandbox);
+        let result = self.reserve_sandbox(request.into_inner());
+        timer.finish_with(&result);
+        result.map(Response::new)
     }
 
     async fn version(
@@ -429,6 +581,9 @@ impl RuntimeService for CriRuntimeService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instrument::CriOpOutcome;
+    use crate::instrument::testing::Collect;
+    use prost::Message;
     use std::future::Future;
     use std::pin::pin;
     use std::task::{Context, Poll, Waker};
@@ -547,6 +702,190 @@ mod tests {
         let err = run(&svc, Some(config("p")), "").unwrap_err();
         assert_eq!(err.code(), Code::FailedPrecondition);
         assert_eq!(svc.sandbox_count(), 1);
+    }
+
+    /// ERR-3・TASK-57.1: サイズ・件数の上限を超える config は INVALID_ARGUMENT で、レジストリは変わらない
+    /// （境界値と全フィールドの照合は `config_limits` のユニットテスト）。
+    #[test]
+    fn task_57_1_oversized_config_is_rejected_without_state_change() {
+        let svc = CriRuntimeService::new();
+
+        let mut too_large = config("p");
+        too_large.log_directory = "d".repeat(MAX_CONFIG_ENCODED_BYTES);
+        let encoded_len = too_large.encoded_len();
+        let err = run(&svc, Some(too_large), "").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            format!("config is too large: {encoded_len} bytes exceeds the limit of 524288 bytes")
+        );
+
+        let mut too_many = config("p");
+        too_many.annotations = (0..=MAX_CONFIG_COLLECTION_ENTRIES)
+            .map(|i| (i.to_string(), String::new()))
+            .collect();
+        let err = run(&svc, Some(too_many), "").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "config.annotations has too many entries: 1025 exceeds the limit of 1024"
+        );
+
+        let err = run(&svc, Some(config(&"n".repeat(254))), "").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "config.metadata.name is too long: 254 bytes exceeds the limit of 253 bytes"
+        );
+
+        assert_eq!(svc.sandbox_count(), 0);
+        assert_eq!(svc.retained_bytes(), 0);
+    }
+
+    /// TASK-57.1: 登録のたびに保持量の見積もり（符号化長＋要素数×256＋4096）が積算され、
+    /// 合計は各記録の計上分の和に等しい。
+    #[test]
+    fn task_57_1_retained_bytes_are_accounted() {
+        let svc = CriRuntimeService::new();
+        let cfg = config("p");
+        // `config()` は labels 1 件・annotations 1 件を持つ。
+        let per_sandbox = cfg.encoded_len() + 2 * 256 + 4096;
+        run(&svc, Some(cfg.clone()), "").unwrap();
+        assert_eq!(svc.retained_bytes(), per_sandbox);
+        run(&svc, Some(cfg), "").unwrap();
+        assert_eq!(svc.retained_bytes(), 2 * per_sandbox);
+        let reg = svc.registry.lock().unwrap();
+        let sum: usize = reg.records.values().map(|r| r.retained_bytes).sum();
+        assert_eq!(sum, reg.retained_bytes);
+    }
+
+    /// ERR-3・TASK-57.1: 保持量の合計は上限ちょうどまで受け付け、1 バイトでも超えると
+    /// FAILED_PRECONDITION でレジストリは変わらない。
+    #[test]
+    fn task_57_1_retained_bytes_limit_returns_failed_precondition() {
+        let cfg = config("p");
+        let per_sandbox = cfg.encoded_len() + 2 * 256 + 4096;
+        let service = |max_retained_bytes: usize| {
+            CriRuntimeService::with_limits_and_recorder(
+                SandboxLimits::default().with_max_retained_bytes(max_retained_bytes),
+                Arc::new(NoopCriOpRecorder),
+            )
+        };
+
+        let exact = service(2 * per_sandbox);
+        run(&exact, Some(cfg.clone()), "").unwrap();
+        run(&exact, Some(cfg.clone()), "").unwrap();
+        let err = run(&exact, Some(cfg.clone()), "").unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(err.message(), "sandbox config storage is full");
+        assert_eq!(exact.sandbox_count(), 2);
+        assert_eq!(exact.retained_bytes(), 2 * per_sandbox);
+
+        let one_short = service(2 * per_sandbox - 1);
+        run(&one_short, Some(cfg.clone()), "").unwrap();
+        let err = run(&one_short, Some(cfg), "").unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(one_short.sandbox_count(), 1);
+        assert_eq!(one_short.retained_bytes(), per_sandbox);
+    }
+
+    /// TASK-57.1: 上限は絞る方向にだけ変えられる（既定値を超える指定は既定値へ丸める）。
+    #[test]
+    fn task_57_1_limits_cannot_exceed_defaults() {
+        let default = SandboxLimits::new();
+        assert_eq!(default.max_sandboxes(), 1024);
+        assert_eq!(default.max_retained_bytes(), 64 * 1024 * 1024);
+        let raised = SandboxLimits::new()
+            .with_max_sandboxes(usize::MAX)
+            .with_max_retained_bytes(usize::MAX);
+        assert_eq!(raised, default);
+        let lowered = SandboxLimits::new()
+            .with_max_sandboxes(3)
+            .with_max_retained_bytes(8192);
+        assert_eq!(lowered.max_sandboxes(), 3);
+        assert_eq!(lowered.max_retained_bytes(), 8192);
+    }
+
+    /// TASK-57.1: 1 件あたりの固定の上乗せ（4096 バイト）は、レジストリのスロット（伸長分を見込んで
+    /// 3 倍）と ID の文字列（64 バイト）を収める。構造体が大きくなって収まらなくなったら検出する。
+    #[test]
+    fn task_57_1_record_overhead_covers_registry_slot() {
+        let slot = std::mem::size_of::<(String, SandboxRecord)>();
+        assert!(
+            3 * slot + 64 <= RETAINED_BYTES_PER_RECORD,
+            "registry slot is {slot} bytes"
+        );
+    }
+
+    /// REPAIR-4・TASK-57.1: 成功・入力不正・件数超過・保持量超過・内部エラーの全終了経路で、
+    /// 結果とステータスコードが 1 回の呼び出しにつき 1 件記録される。
+    #[test]
+    fn task_57_1_every_exit_path_is_recorded() {
+        let collect = Arc::new(Collect::default());
+        let cfg = config("p");
+        let per_sandbox = cfg.encoded_len() + 2 * 256 + 4096;
+        let service = |limits: SandboxLimits| {
+            CriRuntimeService::with_limits_and_recorder(limits, collect.clone())
+        };
+
+        let svc = service(SandboxLimits::new().with_max_sandboxes(1));
+        run(&svc, Some(cfg.clone()), "").unwrap();
+        run(&svc, None, "").unwrap_err();
+        run(&svc, Some(cfg.clone()), "").unwrap_err();
+
+        let svc = service(SandboxLimits::new().with_max_retained_bytes(per_sandbox - 1));
+        run(&svc, Some(cfg.clone()), "").unwrap_err();
+
+        // レジストリのロックを保持したまま panic させ、ロックを poison して内部エラーの経路を通す。
+        let svc = service(SandboxLimits::new());
+        let poisoned = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = svc.registry.lock().unwrap();
+                    panic!("poison the registry lock");
+                })
+                .join()
+        });
+        assert!(poisoned.is_err());
+        let err = run(&svc, Some(cfg), "").unwrap_err();
+        assert_eq!(err.code(), Code::Internal);
+        assert_eq!(err.message(), "sandbox registry is unavailable");
+
+        let kind = CriOpKind::RunPodSandbox;
+        assert_eq!(
+            collect.outcomes(),
+            vec![
+                (kind, CriOpOutcome::Success, Code::Ok),
+                (kind, CriOpOutcome::Failure, Code::InvalidArgument),
+                (kind, CriOpOutcome::Failure, Code::FailedPrecondition),
+                (kind, CriOpOutcome::Failure, Code::FailedPrecondition),
+                (kind, CriOpOutcome::Failure, Code::Internal),
+            ]
+        );
+    }
+
+    /// REPAIR-4・TASK-57.1: 未実装の RPC は計測の対象外で、記録先へ何も渡さない
+    /// （種別は RPC の実装と一緒に追加する）。
+    #[test]
+    fn task_57_1_unimplemented_rpcs_are_not_recorded() {
+        let collect = Arc::new(Collect::default());
+        let svc = CriRuntimeService::with_recorder(collect.clone());
+        block_on(svc.stop_pod_sandbox(Request::new(v1::StopPodSandboxRequest::default())))
+            .unwrap_err();
+        assert_eq!(collect.outcomes(), vec![]);
+    }
+
+    /// `Debug` 出力はレジストリの中身（config・labels・annotations）を含まない。
+    #[test]
+    fn task_57_1_debug_output_omits_registry_contents() {
+        let svc = CriRuntimeService::new();
+        let mut cfg = config("p");
+        cfg.annotations
+            .insert("token".into(), "do-not-print".into());
+        run(&svc, Some(cfg), "").unwrap();
+        let debug = format!("{svc:?}");
+        assert!(debug.starts_with("CriRuntimeService { limits: SandboxLimits {"));
+        assert!(!debug.contains("do-not-print"));
     }
 
     /// 未実装の RPC は Unimplemented のまま（#430 で stop_pod_sandbox を実装する際にこのテストを差し替える）。

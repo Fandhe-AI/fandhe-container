@@ -50,7 +50,7 @@ undocumented_unsafe_blocks = "deny"
 # objc2 系 5 件（#356・TASK-64.hdep1）・windows-sys（#371・TASK-67.hdep1）・
 # ureq / rustls / rustls-graviola / rustls-native-certs（#399・TASK-51.hdep1。crates/oci のレジストリクライアント用）。
 # tonic-prost-build / protox（#425・TASK-56.hdep1。build 時のみ）・tonic / tonic-prost / prost（#425。crates/cri の実行時依存。TASK-56.4）・
-# tokio（#425 のオーナー判断 2026-10-10 で承認、workspace への追加は #453・TASK-108.1。crates/plugin の feature `grpc` のみ）。
+# tokio（#425 のオーナー判断 2026-10-10 で承認、workspace への追加は #453・TASK-108.1。crates/plugin の feature `grpc` のみ）・hyper-util（#425 の承認、追加は #454・TASK-108.2。同 feature のみ）。
 # workspace 内 crate の path 依存は外部クレートの追加ではない（TASK-111.1・#262・PLUG-3。core の optional 依存用）。
 [workspace.dependencies]
 fandhe-container-plugin = { path = "crates/plugin" }
@@ -98,6 +98,11 @@ prost = "=0.14.4"
 # cri / plugin の gRPC 面に限り使い、core には入れない（PLUG-1・CORE-1・PLUG-4）。features はメンバー側で
 # 承認範囲（rt / net / time / macros）から必要なものだけ列挙する。
 tokio = { version = "=1.53.2", default-features = false }
+# gRPC 面の UDS 接続（connector の `TokioIo`。PLUG-2・TASK-108.2）。承認: Issue #425 のオーナー判断（2026-10-10。依存要点に
+# 「UDS の接続（#454）に hyper-util」と明記）、追加は #454。tonic の推移依存として Cargo.lock に既存（新規パッケージなし）。
+# crates/plugin の feature `grpc` のみで使い、core には入れない（PLUG-1・CORE-1・PLUG-4）。features はメンバー側で列挙する。
+hyper-util = { version = "=0.1.21", default-features = false }
+
 # OCI レイヤー blob の gzip 展開（OCI-1・TASK-52.2）。承認: Issue #406・TASK-52.hdep2（オーナー判断 2026-10-10）。
 # 配置は crates/oci に限る。backend は純 Rust の zlib-rs（libz-sys / cc を引かない）。展開後サイズの上限は呼び出し側で検証する。
 # 純 Rust・MIT OR Apache-2.0（zlib-rs は Zlib）。default-features を無効化する。

@@ -11,7 +11,7 @@
 //! OS 別 RSS サンプラー（`rss`。TASK-112.1・#265）と
 //! 起動中 plugin の登録表と親が受けたシグナルの転送 API（`signal_forward`。#1513・PLUG-7）と
 //! `ChildGuard` の `Drop` で書けなかった後始末の失敗記録の延期表と取り出し API・ブロックしないと保証できる場合だけの stderr 書き込み（`lifecycle`。#1673・REPAIR-4・REPAIR-5）と
-//! gRPC（tonic）サーバー/クライアント基盤（`grpc`。非既定 feature `grpc`。TASK-108.1・#453・PLUG-2・MS-3。UDS 統合は TASK-108.2・#454、CRI proto 疎通は TASK-108.3・#455 で未実装）と
+//! gRPC（tonic）サーバー/クライアント基盤（`grpc`。非既定 feature `grpc`。TASK-108.1・#453・PLUG-2・MS-3。UDS 統合は TASK-108.2・#454 で実装済み、CRI proto 疎通は TASK-108.3・#455 で未実装）と
 //! XDG 未設定時のフォールバック（TASK-123.4・#289）と常駐モード（`lifecycle`。TASK-110.2・#259）のみ実装済み。
 //! モード選択 API（`lifecycle`。TASK-110.3・#260）は実装済み。gRPC と
 //! PLUG-12 の peer 認証（TASK-124）は Linux の SO_PEERCRED（`uds_security::verify_peer`。TASK-124.1・#292）と

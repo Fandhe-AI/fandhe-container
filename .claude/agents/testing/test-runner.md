@@ -13,6 +13,7 @@ tools: [Bash, Read, Glob, Grep]
 
 - `make test`（`cargo test --workspace`）の実行と失敗テストの原因解析
 - `make lint`（`cargo clippy --workspace --all-targets -- -D warnings`）の実行と警告の整理
+- 既定では変更範囲に絞って実行する（変更した crate の `cargo test -p <パッケージ名>`・`cargo clippy -p <パッケージ名> --all-targets -- -D warnings`。CI の失敗の再現ではそのジョブ・テストの範囲）。ワークスペース全体（`make test`・`make lint`）は依頼されたときだけ実行する（`.claude/rules/ci.md`「ローカルゲート」）
 - 実機前提テスト（root・KVM・GPU・特定カーネル版数）が実行環境で走ったか・未実行だったかの区別（`.claude/rules/ci.md`）
 - ハング・タイムアウト（ACK 未送信等。REPAIR-5）と通常の失敗の区別
 - 失敗の再現手順・該当箇所（`path:line`）・推定原因・関連ビヘイビア ID の報告

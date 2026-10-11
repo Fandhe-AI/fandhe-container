@@ -56,7 +56,7 @@ paths:
 | 環境構築 | `setup`・`hooks`・`install-cargo-about` | 再実行しても安全（冪等）。`rustup` は確認のみで自動導入しない（`curl \| sh` を作らない。[security](security.md)） |
 | 生成 | `third-party-licenses`・`bench-baseline` | 出力先は `target/` 配下か `OUTPUT` / `BENCH_BASELINE_OUT` で指定した 1 ファイルのみ |
 | 実機前提 | `cli-parity`・`fio-bench`・`startup-latency*`・`net-setup-timing`・`dns-helper-measure`・`idle-memory*`・`supervisor-*`・`concurrent-memory*`・`restart-latency` | `make ci` に含めない。必須変数が無ければ usage を出して終了コード 2。sudo をスクリプト内で呼ばない（root 実行は操作者の明示操作）。timeout で包み、終了コードは契約の値へ変換する |
-| 集約 | `ci` | ローカルゲート（[ci](ci.md)）。CI 全体とは同一ではない |
+| 集約 | `ci` | ワークスペース全体の任意の一括確認（CI の失敗の再現・リリース前。ローカル必須ではない。[ci](ci.md)「ローカルゲート」）。CI 全体とは同一ではない |
 
 - `clean` ターゲットは無い。追加する場合は `target/` など自分が作った生成物だけを消し、共有ディレクトリ（`$HOME`・リポジトリ外・`docs/spec` submodule）を消さない
 - cargo 系ターゲットは `Cargo.toml` 未追加・member crate 無しなら `skip:` を出して成功終了する（冪等セルフヒール。`scripts/lib.sh` の `skip_unless_workspace`）

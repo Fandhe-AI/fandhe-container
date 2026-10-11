@@ -14,6 +14,7 @@ tools: [Bash, Read]
 - `make fmt-check`・`make lint`（clippy）の実行と結果集計
 - `make deny`（`cargo deny check advisories bans licenses sources`。設定は `deny.toml`）の実行
 - `make lint-docs`（markdownlint・yamllint・editorconfig-checker・commitlint）の実行
+- 既定では変更範囲に絞って実行する（`make fmt-check`、変更した crate の `cargo clippy -p <パッケージ名> --all-targets -- -D warnings`、変更した Markdown / YAML だけの lint）。ワークスペース全体（`make lint`・`make deny`・`make lint-docs`）は依頼されたときだけ実行する（`.claude/rules/ci.md`「ローカルゲート」）
 
 ## 制約
 

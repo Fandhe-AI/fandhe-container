@@ -5,7 +5,11 @@
 //! （`registry`・`tls`）。
 //!
 //! 実装済み: 匿名トークン取得（TASK-51.2・OCI-1・MS-4・#401。`auth` と `RegistryClient::authenticate_anonymous`）。
-//! 資格情報つき認証（OCI-3）とトークンのキャッシュ・再取得は未実装。
+//! トークンのキャッシュ・再取得は未実装。
+//!
+//! 実装済み: Basic 認証（TASK-54.1・OCI-3・MS-4・#416。`auth::BasicCredentials` と
+//! `RegistryClient::authenticate_basic`。`RegistryAuth::Basic` を manifest / blob 取得へ渡せる）。
+//! Bearer の資格情報つきトークン交換と OAuth2 は #417、統一入口は #418 で未実装。
 //!
 //! 実装済み: manifest の取得・パースと platform 解決（TASK-51.3・OCI-1・MS-4・#402。`manifest` と
 //! `RegistryClient::fetch_manifest`）。取得した manifest は本文 digest 未検証（突合は未実装）。

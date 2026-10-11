@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 pub enum OciOpKind {
     /// 匿名トークン取得（`/v2/` プローブからトークンエンドポイントまでの全体。TASK-51.2）。
     AuthenticateAnonymous,
+    /// Basic 認証の検証（`/v2/` プローブと資格情報つき再要求の全体。TASK-54.1・OCI-3）。
+    AuthenticateBasic,
     /// マニフェスト取得（image index の場合は platform 解決後の取得まで。TASK-51.3）。
     FetchManifest,
     /// blob（レイヤー・config）のストリーミング取得（TASK-51.4）。
@@ -37,6 +39,7 @@ impl OciOpKind {
     pub fn as_str(self) -> &'static str {
         match self {
             OciOpKind::AuthenticateAnonymous => "oci.auth.anonymous",
+            OciOpKind::AuthenticateBasic => "oci.auth.basic",
             OciOpKind::FetchManifest => "oci.manifest.fetch",
             OciOpKind::FetchBlob => "oci.blob.fetch",
             OciOpKind::VerifyBlobDigest => "oci.blob.verify",

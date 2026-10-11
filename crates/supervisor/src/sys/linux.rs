@@ -1,0 +1,327 @@
+//! Linux 向け capability / credential syscall の薄いラッパー（`unsafe` 事前承認の範囲。coding-rust.md「unsafe・FFI・
+//! syscall」節・オーナー決定 2026-09-27〔[#4](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-5856057084)・
+//! [範囲限定](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-5856167174)〕）。
+//!
+//! # 役割と呼び出し文脈
+//! `privilege::elevate`（SUP-14・SEC-1・TASK-171.1.3・#1475・MS-9）が縮退計画（`ReductionPlan::steps`）を適用する際に
+//! 呼ぶ。方式（特権ランチャー + ambient〔file capability〕／setuid root）は #1454 のオーナー判断（2026-10-10）で承認済み。
+//! `crates/core/src/sys.rs` の同等関数は `pub(crate)` で crate をまたげないため、supervisor 側に同等のものを持つ
+//! （重複は #1454 で許容済み。依存は増やさない）。
+//!
+//! # 不変条件
+//! - `unsafe` は本モジュール内に閉じ、公開するのは安全な関数のみ（`unsafe fn` を外へ出さない）。
+//! - capability / keepcaps の操作は呼び出したスレッドだけに効く。`setresuid` 等は glibc / musl のラッパーが全スレッドへ
+//!   配る。呼び出し元（`privilege::elevate`）が単一スレッドであることを確認してから使う。
+//! - 対応 arch は LP64 の x86_64・aarch64 のみ。その他では `capget` / `capset` の syscall 番号を持たず、
+//!   仮の番号を発行せず `Unsupported` を返す（fail-closed）。他 arch の番号を流用しない。
+//! - 引数はすべて整数または呼び出しの間有効なスタック上の `#[repr(C)]` 値で、`-1` 戻り時は直後に
+//!   `io::Error::last_os_error()` を取る。
+
+use std::io;
+
+/// `capget(2)` / `capset(2)` の syscall 番号（`syscall(2)` 経由。glibc にラッパーが無い）。
+/// 出典: x86_64 は arch/x86/entry/syscalls/syscall_64.tbl、aarch64 は include/uapi/asm-generic/unistd.h。
+/// 値が同じでも arch ごとに別定義にし、他 arch の定義を流用しない。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+mod arch {
+    #[cfg(test)]
+    pub(super) const SYS_CAPGET: Option<i64> = Some(125);
+    pub(super) const SYS_CAPSET: Option<i64> = Some(126);
+}
+#[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+mod arch {
+    #[cfg(test)]
+    pub(super) const SYS_CAPGET: Option<i64> = Some(90);
+    pub(super) const SYS_CAPSET: Option<i64> = Some(91);
+}
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_pointer_width = "64"),
+    all(target_arch = "aarch64", target_pointer_width = "64")
+)))]
+mod arch {
+    #[cfg(test)]
+    pub(super) const SYS_CAPGET: Option<i64> = None;
+    pub(super) const SYS_CAPSET: Option<i64> = None;
+}
+
+/// include/uapi/linux/prctl.h の値。
+const PR_GET_KEEPCAPS: i32 = 7;
+const PR_SET_KEEPCAPS: i32 = 8;
+const PR_CAPBSET_DROP: i32 = 24;
+const PR_CAP_AMBIENT: i32 = 47;
+const PR_CAP_AMBIENT_RAISE: u64 = 2;
+const PR_CAP_AMBIENT_CLEAR_ALL: u64 = 4;
+/// include/uapi/linux/capability.h の `_LINUX_CAPABILITY_VERSION_3`（2 語・64 bit 形式）。
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+/// capability 番号の上限（排他）。カーネルの `CAP_LAST_CAP` は 63 以下で、64 以上は ambient / bounding に渡さない。
+const CAP_NUMBER_LIMIT: u8 = 64;
+
+unsafe extern "C" {
+    // SAFETY（宣言そのものの妥当性）: `int prctl(int option, ...)`（glibc / musl）。可変長引数として宣言する
+    // （非可変長で宣言して呼ぶと、可変長引数の渡し方が異なる ABI で未定義動作になる）。可変長部は
+    // `unsigned long`（LP64 で u64）に合わせて渡す。
+    fn prctl(option: i32, ...) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `long syscall(long number, ...)`（glibc / musl。LP64 で `long` は i64）。
+    fn syscall(number: i64, ...) -> i64;
+    // SAFETY（宣言そのものの妥当性）: `int setgroups(size_t size, const gid_t *list)`（Linux の `gid_t` は u32）。
+    fn setgroups(size: usize, list: *const u32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int setresgid(gid_t rgid, gid_t egid, gid_t sgid)`。
+    fn setresgid(rgid: u32, egid: u32, sgid: u32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int setresuid(uid_t ruid, uid_t euid, uid_t suid)`。
+    fn setresuid(ruid: u32, euid: u32, suid: u32) -> i32;
+}
+
+/// `capget(2)` / `capset(2)` のヘッダ（`struct __user_cap_header_struct`）。
+#[repr(C)]
+struct CapUserHeader {
+    version: u32,
+    pid: i32,
+}
+
+/// `capget(2)` / `capset(2)` のデータ 1 語分（`struct __user_cap_data_struct`）。v3 は 2 要素の配列。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapUserData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+/// 呼び出したスレッドの capability（ビット位置は capability 番号。v3 の 2 語を 64 bit に束ねた値）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ThreadCaps {
+    pub(crate) effective: u64,
+    pub(crate) permitted: u64,
+    pub(crate) inheritable: u64,
+}
+
+fn unsupported() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "capability syscalls are not supported on this architecture",
+    )
+}
+
+/// `-1` なら直後の errno を `io::Error` にする（`-1` の直後に呼ぶこと）。
+fn check(rc: i64) -> io::Result<i64> {
+    if rc == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(rc)
+    }
+}
+
+fn check_cap_number(cap: u8) -> io::Result<()> {
+    if cap >= CAP_NUMBER_LIMIT {
+        return Err(io::Error::from_raw_os_error(22)); // EINVAL
+    }
+    Ok(())
+}
+
+fn split(v: u64) -> [u32; 2] {
+    // 下位 32 bit と上位 32 bit への分割（意図的な切り詰め）。
+    [(v & 0xffff_ffff) as u32, (v >> 32) as u32]
+}
+
+#[cfg(test)]
+fn join(lo: u32, hi: u32) -> u64 {
+    u64::from(lo) | (u64::from(hi) << 32)
+}
+
+/// 呼び出したスレッドの effective / permitted / inheritable を読む（pid 0 の `capget(2)`）。
+///
+/// 単体テストで `capset` のレイアウトと `/proc/self/status` の整合を照合するために使う。カーネルが v3 以外を
+/// 返したら `EINVAL` として fail-closed にする。
+#[cfg(test)]
+pub(crate) fn cap_get_thread() -> io::Result<ThreadCaps> {
+    let nr = arch::SYS_CAPGET.ok_or_else(unsupported)?;
+    let mut header = CapUserHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapUserData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: `header` と `data`（v3 が要求する 2 要素）はこの関数のスタック上の `#[repr(C)]` 値で、呼び出しの
+    // 間有効かつ排他的に借用されている。カーネルは `CapUserHeader` と `[CapUserData; 2]` の大きさだけ書く。
+    // 影響は呼び出したスレッドの読み取りのみ。
+    let rc = unsafe { syscall(nr, &raw mut header, data.as_mut_ptr()) };
+    check(rc)?;
+    if header.version != LINUX_CAPABILITY_VERSION_3 {
+        return Err(io::Error::from_raw_os_error(22)); // EINVAL
+    }
+    Ok(ThreadCaps {
+        effective: join(data[0].effective, data[1].effective),
+        permitted: join(data[0].permitted, data[1].permitted),
+        inheritable: join(data[0].inheritable, data[1].inheritable),
+    })
+}
+
+/// 呼び出したスレッドの effective / permitted / inheritable を設定する（pid 0 の `capset(2)`）。
+pub(crate) fn cap_set_thread(caps: ThreadCaps) -> io::Result<()> {
+    let nr = arch::SYS_CAPSET.ok_or_else(unsupported)?;
+    let header = CapUserHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let (e, p, i) = (
+        split(caps.effective),
+        split(caps.permitted),
+        split(caps.inheritable),
+    );
+    let data = [0usize, 1].map(|n| CapUserData {
+        effective: e.get(n).copied().unwrap_or(0),
+        permitted: p.get(n).copied().unwrap_or(0),
+        inheritable: i.get(n).copied().unwrap_or(0),
+    });
+    // SAFETY: `header` と `data`（v3 が要求する 2 要素）はスタック上の `#[repr(C)]` 値で、呼び出しの間有効。
+    // カーネルは読み取りのみ行う。資格情報の変更は呼び出したスレッドに限られ、メモリ安全性には影響しない。
+    let rc = unsafe { syscall(nr, &raw const header, data.as_ptr()) };
+    check(rc).map(|_| ())
+}
+
+/// `cap` を呼び出したスレッドの bounding set から外す（`PR_CAPBSET_DROP`。不可逆。`CAP_SETPCAP` が effective に必要）。
+pub(crate) fn cap_bounding_drop(cap: u8) -> io::Result<()> {
+    check_cap_number(cap)?;
+    // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す。
+    // 影響は呼び出したスレッドの bounding set の縮小のみ（権限を減らす方向にしか働かない）。
+    let rc = unsafe { prctl(PR_CAPBSET_DROP, u64::from(cap), 0u64, 0u64, 0u64) };
+    check(i64::from(rc)).map(|_| ())
+}
+
+/// `cap` を ambient 集合へ載せる（`PR_CAP_AMBIENT_RAISE`。permitted かつ inheritable に含まれる必要がある）。
+pub(crate) fn cap_ambient_raise(cap: u8) -> io::Result<()> {
+    check_cap_number(cap)?;
+    // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す。
+    // 影響は呼び出したスレッドの ambient 集合の拡大のみで、permitted ∩ inheritable を超えてはカーネルが拒否する。
+    let rc = unsafe {
+        prctl(
+            PR_CAP_AMBIENT,
+            PR_CAP_AMBIENT_RAISE,
+            u64::from(cap),
+            0u64,
+            0u64,
+        )
+    };
+    check(i64::from(rc)).map(|_| ())
+}
+
+/// ambient capability をすべて消す（`PR_CAP_AMBIENT_CLEAR_ALL`）。
+pub(crate) fn cap_ambient_clear_all() -> io::Result<()> {
+    // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す。
+    // 影響は呼び出したスレッドの ambient 集合の縮小のみ。
+    let rc = unsafe { prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0u64, 0u64, 0u64) };
+    check(i64::from(rc)).map(|_| ())
+}
+
+/// `PR_SET_KEEPCAPS` を設定 / 解除する（`setresuid` をまたいで permitted を保持するための一時設定。
+/// 呼び出したスレッドのみ）。
+pub(crate) fn set_keep_caps(on: bool) -> io::Result<()> {
+    // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す。
+    // 影響は呼び出したスレッドの securebits の `SECBIT_KEEP_CAPS` のみ。
+    let rc = unsafe { prctl(PR_SET_KEEPCAPS, u64::from(on), 0u64, 0u64, 0u64) };
+    check(i64::from(rc)).map(|_| ())
+}
+
+/// `PR_GET_KEEPCAPS` を読む。戻り値が 0 / 1 以外なら `EINVAL` として扱う。
+pub(crate) fn get_keep_caps() -> io::Result<bool> {
+    // SAFETY: 引数は整数のみでポインタを渡さない。読み取りだけで状態を変えない。
+    let rc = unsafe { prctl(PR_GET_KEEPCAPS, 0u64, 0u64, 0u64, 0u64) };
+    match check(i64::from(rc))? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(io::Error::from_raw_os_error(22)), // EINVAL
+    }
+}
+
+/// 補助グループを全消去する（`setgroups(0, NULL)`。`CAP_SETGID` が effective に必要）。
+pub(crate) fn clear_supplementary_groups() -> io::Result<()> {
+    // SAFETY: サイズ 0 のため `list` は読まれず、NULL を渡してよい。影響はプロセスの補助グループの消去のみ。
+    let rc = unsafe { setgroups(0, std::ptr::null()) };
+    check(i64::from(rc)).map(|_| ())
+}
+
+/// `setresgid(r, e, s)`。fs gid は effective に追従する。呼び出し元は単一スレッドに限る。
+pub(crate) fn set_resgid(real: u32, effective: u32, saved: u32) -> io::Result<()> {
+    // SAFETY: 引数は整数のみでポインタを渡さない。影響はプロセスの gid の変更のみ（メモリ安全性に影響しない）。
+    let rc = unsafe { setresgid(real, effective, saved) };
+    check(i64::from(rc)).map(|_| ())
+}
+
+/// `setresuid(r, e, s)`。fs uid は effective に追従する。呼び出し元は単一スレッドに限る。
+pub(crate) fn set_resuid(real: u32, effective: u32, saved: u32) -> io::Result<()> {
+    // SAFETY: 引数は整数のみでポインタを渡さない。影響はプロセスの uid の変更のみ（メモリ安全性に影響しない）。
+    let rc = unsafe { setresuid(real, effective, saved) };
+    check(i64::from(rc)).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SUP-14・TASK-171.1.3: prctl の番号と capability ABI の値を固定する（include/uapi の値との照合）。
+    #[test]
+    fn sup14_task171_1_3_constants_are_fixed() {
+        assert_eq!(PR_GET_KEEPCAPS, 7);
+        assert_eq!(PR_SET_KEEPCAPS, 8);
+        assert_eq!(PR_CAPBSET_DROP, 24);
+        assert_eq!(PR_CAP_AMBIENT, 47);
+        assert_eq!(PR_CAP_AMBIENT_RAISE, 2);
+        assert_eq!(PR_CAP_AMBIENT_CLEAR_ALL, 4);
+        assert_eq!(LINUX_CAPABILITY_VERSION_3, 0x2008_0522);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    #[test]
+    fn sup14_task171_1_3_syscall_numbers_x86_64() {
+        assert_eq!(arch::SYS_CAPGET, Some(125));
+        assert_eq!(arch::SYS_CAPSET, Some(126));
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+    #[test]
+    fn sup14_task171_1_3_syscall_numbers_aarch64() {
+        assert_eq!(arch::SYS_CAPGET, Some(90));
+        assert_eq!(arch::SYS_CAPSET, Some(91));
+    }
+
+    #[test]
+    fn sup14_task171_1_3_split_join_roundtrip() {
+        assert_eq!(split(0x0000_0000_2820_1122), [0x2820_1122, 0]);
+        assert_eq!(split(0x0000_0001_0000_0002), [2, 1]);
+        assert_eq!(join(0x2820_1122, 1), 0x0000_0001_2820_1122);
+    }
+
+    #[test]
+    fn sup14_task171_1_3_out_of_range_capability_is_einval() {
+        let e = cap_bounding_drop(64).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(22));
+        let e = cap_ambient_raise(255).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(22));
+    }
+
+    /// 状態を変えない読み取りだけを実際に呼ぶ。keepcaps は既定で 0、capget は `/proc/self/status` と一致する。
+    #[test]
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
+    fn sup14_task171_1_3_reads_match_proc_status() {
+        assert!(!get_keep_caps().unwrap());
+        // libtest はテストごとにスレッドを作るため、`/proc/thread-self/status` が呼び出しスレッドの値になる。
+        let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+        let field = |name: &str| -> u64 {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(name))
+                .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+                .unwrap()
+        };
+        let caps = cap_get_thread().unwrap();
+        assert_eq!(caps.permitted, field("CapPrm:"));
+        assert_eq!(caps.effective, field("CapEff:"));
+        assert_eq!(caps.inheritable, field("CapInh:"));
+    }
+}

@@ -45,6 +45,7 @@ use fandhe_container_core::oci_runtime::{
     ProcessLauncher, StartTimeouts, exit_code_for, recover_interrupted_start, start,
     take_unreaped_processes,
 };
+use fandhe_container_core::state_store::STATE_LOCK_TIMEOUT;
 use fandhe_container_core::traits::{
     ContainerId, ContainerState, ContainerStatus, ErrorCode, GetStateRequest, StartRequest,
     StateRecord, StateRevision, StateStore, SupervisionState, TraitError, UpdateStateRequest,
@@ -124,6 +125,8 @@ impl Relauncher for NoSpecRelauncher {
 pub struct BoundedWriter<W: Write + Send + 'static> {
     inner: Arc<Mutex<W>>,
     deadline: Duration,
+    /// 全体の期限（`Some` なら 1 回の上限を残り時間で切り詰める）。
+    until: Option<Instant>,
 }
 
 impl<W: Write + Send + 'static> BoundedWriter<W> {
@@ -132,8 +135,19 @@ impl<W: Write + Send + 'static> BoundedWriter<W> {
         Self {
             inner: Arc::new(Mutex::new(inner)),
             deadline,
+            until: None,
         }
     }
+
+    /// 以後の書き込みの上限を `min(deadline, until までの残り)` にする（報告を内部上限内に収める。REPAIR-5）。
+    pub fn limit_until(&mut self, until: Option<Instant>) {
+        self.until = until;
+    }
+}
+
+/// 1 回の書き込みの上限: `min(base, until までの残り)`（`until` が `None` なら `base`、過ぎていれば 0）。
+fn write_limit(base: Duration, until: Option<Instant>, now: Instant) -> Duration {
+    until.map_or(base, |u| base.min(u.saturating_duration_since(now)))
 }
 
 impl<W: Write + Send + 'static> Write for BoundedWriter<W> {
@@ -154,7 +168,7 @@ impl<W: Write + Send + 'static> Write for BoundedWriter<W> {
                 let _ = tx.send(result);
             })
             .map_err(|_| std::io::Error::other("failed to spawn the write thread"))?;
-        match rx.recv_timeout(self.deadline) {
+        match rx.recv_timeout(write_limit(self.deadline, self.until, Instant::now())) {
             Ok(result) => result,
             Err(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -293,7 +307,7 @@ fn terminate_retrying(
     timeout: Duration,
     deadline: Option<Instant>,
 ) -> Option<NonZeroU32> {
-    let need = timeout.saturating_add(LAUNCHER_REPLY_GRACE);
+    let need = terminate_need(timeout);
     let mut process = process;
     for _ in 0..2 {
         if !fits(deadline, need) {
@@ -311,9 +325,19 @@ fn terminate_retrying(
     None
 }
 
+/// terminate 1 回の待ちの最悪時間（`timeout`＋猶予。[`terminate_bounded`] が呼び出し境界で強制する上限）。
+fn terminate_need(timeout: Duration) -> Duration {
+    timeout.saturating_add(LAUNCHER_REPLY_GRACE)
+}
+
 /// `deadline` までの残りが `need` 以上あるか（`None` は期限なし）。
 fn fits(deadline: Option<Instant>, need: Duration) -> bool {
-    deadline.is_none_or(|d| Instant::now().checked_add(need).is_some_and(|t| t <= d))
+    fits_at(deadline, need, Instant::now())
+}
+
+/// [`fits`] の時刻を注入できる版（見積もりの試験用）。
+fn fits_at(deadline: Option<Instant>, need: Duration, now: Instant) -> bool {
+    deadline.is_none_or(|d| now.checked_add(need).is_some_and(|t| t <= d))
 }
 
 fn op_err(e: TraitError) -> OciRuntimeError {
@@ -349,6 +373,19 @@ pub fn run_start(
     out: &mut dyn Write,
 ) -> Result<Running, NonZeroU8> {
     let deadline = Instant::now().checked_add(crate::start_contract::result_deadline(timeouts));
+    run_start_until(deps, store, recorder, req, timeouts, deadline, out)
+}
+
+/// [`run_start`] の全体の期限を呼び出し側が渡す版（bin の入口は同じ期限で報告の書き込みも切り詰める）。
+pub fn run_start_until(
+    deps: &mut dyn StartDeps,
+    store: &Arc<dyn StateStore>,
+    recorder: &OpRecorder,
+    req: &StartRequest,
+    timeouts: &StartTimeouts,
+    deadline: Option<Instant>,
+    out: &mut dyn Write,
+) -> Result<Running, NonZeroU8> {
     match start_sequence(deps, store, recorder, req, timeouts, deadline) {
         Ok(running) => {
             let report = StartReport::Started {
@@ -470,9 +507,13 @@ fn start_sequence(
     }
 }
 
-/// `recover_interrupted_start` 1 回の待ちの上限（`confirm_no_process` の上限＋猶予）。
+/// `recover_interrupted_start` 1 回の最悪時間: 状態ストアの get と update（既定のファイル実装のロック待ちが各
+/// [`STATE_LOCK_TIMEOUT`]）＋`confirm_no_process` の上限＋猶予。
 fn recover_need(timeouts: &StartTimeouts) -> Duration {
-    timeouts.confirm().saturating_add(LAUNCHER_REPLY_GRACE)
+    STATE_LOCK_TIMEOUT
+        .saturating_mul(2)
+        .saturating_add(timeouts.confirm())
+        .saturating_add(LAUNCHER_REPLY_GRACE)
 }
 
 /// launch の時点で、レコードの cgroup の instance が [`StartDeps::prepare_cgroup`] の準備した世代と一致するかを
@@ -569,6 +610,11 @@ fn settle_failed_start(
     pending: Vec<Box<dyn LaunchedProcess>>,
     deadline: Option<Instant>,
 ) -> bool {
+    // 状態の読み取り（ロック待ちの最悪時間）も期限に含める。収まらなければ確かめられなかった扱い。
+    if !fits(deadline, STATE_LOCK_TIMEOUT) {
+        log_event("start_settle_budget_exhausted", Some(ErrorCode::Timeout));
+        return false;
+    }
     let reverted = store
         .get(&GetStateRequest::new(id.clone()))
         .is_ok_and(|r| r.status().state() == ContainerState::Created && r.status().pid().is_none());
@@ -636,6 +682,9 @@ fn dispose(
             log_event("late_orphans_unsettled", None);
             ok = false;
         }
+        // supervise_with_restart の待ちが期限を過ぎた後に terminate が成功した分（記録が Running のまま残り得る）も
+        // 照合つきの Stopped 記録の対象に含める（SUP-1・CORE-2）。
+        reaped.extend(late.take_reaped());
         for (p, _reason) in late.take() {
             match terminate_retrying(p, timeouts.terminate(), None) {
                 Some(pid) => {
@@ -1027,12 +1076,17 @@ mod linux {
         };
         let req = StartRequest::new(args.id.clone());
         let mut deps = ProductionStartDeps::new(args.root);
-        let running = match run_start(
+        // 回復・回収と報告の書き込みで同じ期限を共有し、報告を内部上限内に収める（REPAIR-5）。
+        let deadline =
+            Instant::now().checked_add(crate::start_contract::result_deadline(&timeouts));
+        out.limit_until(deadline);
+        let running = match run_start_until(
             &mut deps,
             &store,
             &OpRecorder::new(),
             &req,
             &timeouts,
+            deadline,
             &mut out,
         ) {
             Ok(r) => r,
@@ -1050,5 +1104,75 @@ mod linux {
             &StopToken::new(),
         );
         ExitCode::from(code)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::start_contract::result_deadline;
+
+    /// REPAIR-5: 既定値の見積もり（回復 1 回 = get / update のロック待ち 2 × 5s ＋ confirm 10s ＋ 猶予 1s）。
+    #[test]
+    fn repair5_recover_need_includes_store_lock_waits() {
+        let t = StartTimeouts::default();
+        assert_eq!(recover_need(&t), Duration::from_secs(21));
+        assert_eq!(terminate_need(t.terminate()), Duration::from_secs(6));
+        assert_eq!(result_deadline(&t), Duration::from_secs(33));
+    }
+
+    /// REPAIR-5: 報告の書き込み上限は `min(5s, 残り)`。期限を過ぎていれば 0、期限が無ければ 5s。
+    #[test]
+    fn repair5_write_limit_is_capped_by_remaining_time() {
+        let base = Duration::from_secs(5);
+        let now = Instant::now();
+        assert_eq!(write_limit(base, None, now), base);
+        assert_eq!(
+            write_limit(base, Some(now + Duration::from_secs(9)), now),
+            base
+        );
+        assert_eq!(
+            write_limit(base, Some(now + Duration::from_secs(2)), now),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            write_limit(base, Some(now), now + Duration::from_secs(1)),
+            Duration::ZERO
+        );
+    }
+
+    /// REPAIR-5: 失敗した start の後に、回復と terminate をそれぞれ最悪時間で使い切っても（収まるときだけ行い）、
+    /// 続く報告の書き込みを含めた合計は内部上限（`result_deadline`）を超えない。開始時刻を 0〜上限＋2s で振る。
+    #[test]
+    fn repair5_worst_case_recovery_and_report_stay_within_result_deadline() {
+        let t = StartTimeouts::default();
+        let t0 = Instant::now();
+        let deadline = t0.checked_add(result_deadline(&t));
+        let end_of_budget = deadline.unwrap();
+        let base = Duration::from_secs(5);
+        let step = Duration::from_millis(250);
+        let mut elapsed = Duration::ZERO;
+        while elapsed <= result_deadline(&t) + Duration::from_secs(2) {
+            let mut now = t0 + elapsed;
+            // 回復の再試行（毎回最悪時間を使う）→ 未回収ハンドル 3 件の terminate（初回＋再試行）→ 報告。
+            while fits_at(deadline, recover_need(&t), now) {
+                now += recover_need(&t);
+            }
+            for _ in 0..6 {
+                if fits_at(deadline, terminate_need(t.terminate()), now) {
+                    now += terminate_need(t.terminate());
+                }
+            }
+            let limit = write_limit(base, deadline, now);
+            assert!(limit <= base);
+            if now <= end_of_budget {
+                assert!(now + limit <= end_of_budget, "elapsed = {elapsed:?}");
+            } else {
+                // 開始時点で既に期限を過ぎていた（回復・回収は行っていない）。
+                assert_eq!(now, t0 + elapsed);
+                assert_eq!(limit, Duration::ZERO);
+            }
+            elapsed += step;
+        }
     }
 }

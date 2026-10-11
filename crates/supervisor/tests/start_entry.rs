@@ -86,11 +86,15 @@ fn cid(s: &str) -> ContainerId {
     ContainerId::new(s).unwrap()
 }
 
-/// 起動待ち 100ms・終了待ち 1s・確認待ち 500ms の短い上限。
+/// 起動待ち 100ms・終了待ち 8s・確認待ち 500ms の上限。
+///
+/// 終了待ちを長めにとるのは、失敗後の回復 1 回の見積もり（状態ストアのロック待ち 2 × 5s ＋ 確認＋猶予）が
+/// `result_deadline` の残りに収まるようにするため（収まらなければ回復せず INTERNAL を報告する。REPAIR-5）。
+/// フェイクの terminate は即座に戻るため、試験の所要時間は延びない。
 fn short_timeouts() -> StartTimeouts {
     StartTimeouts::new(
         Duration::from_millis(100),
-        Duration::from_secs(1),
+        Duration::from_secs(8),
         Duration::from_millis(500),
     )
     .unwrap()

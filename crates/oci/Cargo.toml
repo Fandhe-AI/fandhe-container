@@ -3,6 +3,7 @@
 # version は未指定（Cargo の既定で 0.0.0）。公開方針は未決定のため publish = false を明記する。
 # 依存は #399（TASK-51.hdep1）で承認済みの 4 件（レジストリクライアント基盤。TASK-51.1・#400）。
 # TASK-51.2（#401）で serde / serde_json（#138 で承認済み）を workspace 参照で追加（トークン応答の JSON パース）。
+# TASK-52.3（#409）で tar（#408 で承認済み。解析のみ）を workspace 参照で追加。
 # 依存の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 
 [package]
@@ -27,3 +28,5 @@ serde_json.workspace = true
 sha2.workspace = true
 # 承認: Issue #406・TASK-52.hdep2（workspace 承認済みの用途「レイヤー gzip 展開」）。TASK-52.2（#407）で利用。
 flate2.workspace = true
+# 承認: Issue #408（workspace 承認済みの用途「レイヤー tar の解析」）。TASK-52.3（#409）で利用。unpack 系 API は使わない。
+tar.workspace = true

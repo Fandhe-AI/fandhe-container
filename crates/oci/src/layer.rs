@@ -15,6 +15,10 @@
 //! 展開後 tar の diff_id（config の `rootfs.diff_ids`）との突合は未実装（後続 issue）。gzip トレーラ
 //! （CRC32・ISIZE）は EOF まで読み切ったときにだけ検証されるため、tar 側は EOF まで読むこと。
 //! zstd 圧縮・非圧縮レイヤーの分岐は本モジュールの対象外。
+//!
+//! tar 展開（TASK-52.3・OCI-1・#409）は子モジュール `extract` が担う（呼び出し契約と未実装項目はそちらを参照）。
+
+pub mod extract;
 
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};

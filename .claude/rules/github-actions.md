@@ -86,13 +86,13 @@ Actions のキャッシュはリポジトリあたり **10 GB** が上限で、�
 
 | キャッシュ | 場所 | key | 中身・サイズ（2026-10-11） |
 | ---------- | ---- | --- | -------------------------- |
-| `fandhe-container-<os>-clippy-v3-*`・`-test-v3-*` | `rust-ci`（reusable `rust-base-ci` の `cache: true`） | `Cargo.lock` のハッシュ。`restore-keys` は前方一致 | `~/.cargo/registry`・`target`（workspace メンバーの成果物は保存前に prune）。各 105〜145 MB |
+| `fandhe-container-<os>-clippy-v3-*`・`-test-v3-*` | `rust-ci`（reusable `rust-base-ci` の `cache: true`） | `Cargo.lock` のハッシュ（[#165](https://github.com/Fandhe-AI/actions/pull/165) 以降は `-v4-<rustc -vV のハッシュ>-<ルート Cargo.lock のハッシュ>`）。`restore-keys` は前方一致 | `~/.cargo/registry`・`target`（workspace メンバーの成果物は保存前に prune）。各 105〜145 MB |
 | `fandhe-container-<os>-deny-*` | 同上の deny ジョブ | 同上 | `~/.cargo/registry` のみ。30〜41 MB |
 | `cargo-tools-Linux-*` | `platform-ci`（ubuntu のみ） | `scripts/versions.sh` のハッシュ | cargo-deny・cargo-about のバイナリ。10 MB |
 
 - **保存は main の push だけにし、PR は restore のみにする**（大きい blob が対象）。PR の cache は `refs/pull/<N>/merge` スコープに保存され、他の PR・main からは読めない。`Cargo.lock` を変えた PR や、main の保存より先に走った PR が main と同内容の blob を PR ごとに重複保存し、容量を消費する。`rust-ci` は reusable の `cache-save` 入力（`Fandhe-AI/actions` [#165](https://github.com/Fandhe-AI/actions/pull/165) で追加。マージ後に `cache-save: ${{ github.ref == 'refs/heads/main' }}` を渡す）、自前の `actions/cache` は `actions/cache/restore` と、main だけで走る `actions/cache/save` に分ける
 - 例外: 版だけで決まる小さいツールのバイナリ（`cargo-tools-Linux-*`）は既定の保存のままでよい。PR に重複が出るのは `scripts/versions.sh` を変えた PR だけで、main の `platform-ci` は concurrency の取り消しで保存まで届かないことがあるため、PR 側で保存できるほうが再ビルド（約 220 秒）を避けられる
-- **key には中身を決める入力だけを入れる**。SHA・`run_id`・日付など毎回変わる値を入れない（再利用されない blob が溜まる）。ハッシュの入力は必要なファイルに絞る（`**/Cargo.lock` はサンプル・治具の `Cargo.lock` の変更でもキーを変える。reusable は [#165](https://github.com/Fandhe-AI/actions/pull/165) でルートの `Cargo.lock` だけにした）
+- **key には中身を決める入力だけを入れる**。SHA・`run_id`・日付など毎回変わる値を入れない（再利用されない blob が溜まる）。ハッシュの入力は必要なファイルに絞る（`**/Cargo.lock` は `.agents/skills/make/samples/**`（`.claude/skills` の symlink 経由も）や `poc/venus-decoder/jig` の `Cargo.lock` の変更でもキーを変える。#1758 でスキルのサンプルが入っただけで clippy・test・deny のキーが変わった。reusable は [#165](https://github.com/Fandhe-AI/actions/pull/165) でルートの `Cargo.lock` だけにした）。`target/` のようにコンパイラの版で中身が変わるものは key に rustc の版（`rustc -vV` のハッシュ）を入れる。`rust-toolchain.toml` は stable 追従のため runner イメージの更新で rustc が変わり、key に無いと旧 rustc の blob に exact hit し続けて依存を毎回全再ビルドし、exact hit のため保存もされない（#165 で対応）
 - `restore-keys` で前方一致の部分復元を必ず効かせる（key が変わっても cold にしない）。追い出しが起きても、最新の main の blob は毎回アクセスされるため LRU の最後まで残り、ヒットは続く
 - OS・ジョブをまたいで中身が同じなら key を共有する。中身が OS で変わるものは `runner.os` を入れる。使わなくなった key（2026-10-10 のジョブ再構成で `rust-ci` が ubuntu のみになった後の `fandhe-container-macOS-*`）は 7 日で消えるのを待つか、`gh cache delete` で消す
 - 新しいキャッシュを足すときは、blob サイズ × key が変わる頻度（1 日あたり）× 7 日 で容量を見積もり、他のキャッシュと合わせて 10 GB に収まることを確かめる。復元時間が節約時間より長いジョブにはキャッシュを付けない

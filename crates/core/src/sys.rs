@@ -430,6 +430,10 @@ mod consts {
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
     pub const PR_SET_PDEATHSIG: i32 = 1;
 
+    // include/uapi/linux/prctl.h の `PR_SET_KEEPCAPS`（8）。SUP-6・SEC-5・TASK-163 追補・#1462。
+    // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const PR_SET_KEEPCAPS: i32 = 8;
+
     // include/uapi/asm-generic/resource.h の `RLIMIT_*`（0〜15。SUP-12・TASK-169.1）。
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
     pub const RLIMIT_CPU: i32 = 0;
@@ -465,6 +469,14 @@ mod consts {
     // （setxid のシグナル配送）を持つため、capability と同じく呼び出しスレッドだけに効く生の syscall を使う。
     pub const SYS_GETGROUPS: ArchSysNo = ArchSysNo::new(115);
     pub const SYS_SETGROUPS: ArchSysNo = ArchSysNo::new(116);
+    // arch/x86/entry/syscalls/syscall_64.tbl の `setresuid`（117）・`getresuid`（118）・`setresgid`（119）・
+    // `getresgid`（120）。rootless の exec が参加後に `process.user` の uid・gid へ揃える（SUP-6・SEC-5・
+    // TASK-163 追補・#1462）。glibc のラッパーは全スレッドへ反映する仕組み（setxid）を持つため、補助グループと
+    // 同じく呼び出しスレッドだけに効く生の syscall を使う。
+    pub const SYS_SETRESUID: ArchSysNo = ArchSysNo::new(117);
+    pub const SYS_GETRESUID: ArchSysNo = ArchSysNo::new(118);
+    pub const SYS_SETRESGID: ArchSysNo = ArchSysNo::new(119);
+    pub const SYS_GETRESGID: ArchSysNo = ArchSysNo::new(120);
     // 禁止 syscall 遮断の結合試験用プローブ（CORE-5・TASK-38.4・#179）。番号は `crate::seccomp` の
     // テーブルとは独立に、x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h から取る。
     // `PTRACE_CONT`（include/uapi/linux/ptrace.h）は attach を伴わない要求で、`KEXEC_SEGMENT_MAX`
@@ -703,6 +715,10 @@ mod consts {
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
     pub const PR_SET_PDEATHSIG: i32 = 1;
 
+    // include/uapi/linux/prctl.h の `PR_SET_KEEPCAPS`（8）。SUP-6・SEC-5・TASK-163 追補・#1462。
+    // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const PR_SET_KEEPCAPS: i32 = 8;
+
     // include/uapi/asm-generic/resource.h の `RLIMIT_*`（0〜15。SUP-12・TASK-169.1）。
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
     pub const RLIMIT_CPU: i32 = 0;
@@ -736,6 +752,12 @@ mod consts {
     // include/uapi/asm-generic/unistd.h の `getgroups`（158）・`setgroups`（159）。TASK-163 追補・#1457。
     pub const SYS_GETGROUPS: ArchSysNo = ArchSysNo::new(158);
     pub const SYS_SETGROUPS: ArchSysNo = ArchSysNo::new(159);
+    // include/uapi/asm-generic/unistd.h の `setresuid`（147）・`getresuid`（148）・`setresgid`（149）・
+    // `getresgid`（150）。TASK-163 追補・#1462。
+    pub const SYS_SETRESUID: ArchSysNo = ArchSysNo::new(147);
+    pub const SYS_GETRESUID: ArchSysNo = ArchSysNo::new(148);
+    pub const SYS_SETRESGID: ArchSysNo = ArchSysNo::new(149);
+    pub const SYS_GETRESGID: ArchSysNo = ArchSysNo::new(150);
     // 禁止 syscall 遮断の結合試験用プローブ（CORE-5・TASK-38.4・#179）。番号は `crate::seccomp` の
     // テーブルとは独立に、x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h から取る。
     // `PTRACE_CONT`（include/uapi/linux/ptrace.h）は attach を伴わない要求で、`KEXEC_SEGMENT_MAX`
@@ -915,6 +937,7 @@ mod consts {
     pub const PR_GET_DUMPABLE: i32 = 0;
     pub const PR_SET_DUMPABLE: i32 = 0;
     pub const PR_SET_PDEATHSIG: i32 = 0;
+    pub const PR_SET_KEEPCAPS: i32 = 0;
 
     // rlimit の定数（対応外アーキテクチャでは各ラッパーが SUPPORTED で弾くため未使用）。
     pub const RLIMIT_CPU: i32 = 0;
@@ -946,6 +969,10 @@ mod consts {
     pub const SYS_CAPSET: ArchSysNo = ArchSysNo::UNSUPPORTED;
     pub const SYS_GETGROUPS: ArchSysNo = ArchSysNo::UNSUPPORTED;
     pub const SYS_SETGROUPS: ArchSysNo = ArchSysNo::UNSUPPORTED;
+    pub const SYS_SETRESUID: ArchSysNo = ArchSysNo::UNSUPPORTED;
+    pub const SYS_GETRESUID: ArchSysNo = ArchSysNo::UNSUPPORTED;
+    pub const SYS_SETRESGID: ArchSysNo = ArchSysNo::UNSUPPORTED;
+    pub const SYS_GETRESGID: ArchSysNo = ArchSysNo::UNSUPPORTED;
     // 禁止 syscall 遮断の結合試験用プローブ（CORE-5・TASK-38.4・#179）。番号は `crate::seccomp` の
     // テーブルとは独立に、x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h から取る。
     // `PTRACE_CONT`（include/uapi/linux/ptrace.h）は attach を伴わない要求で、`KEXEC_SEGMENT_MAX`
@@ -1360,12 +1387,16 @@ pub(crate) fn poll_readable(fd: BorrowedFd<'_>, timeout_ms: i32) -> Result<bool,
 ///
 /// 呼び出し元は `crate::exec::join_namespaces` のみで、単一スレッドであることを確認済みの前提で呼ぶ。
 /// 1 回の syscall なので全 namespace が all-or-nothing で切り替わり、途中まで参加した状態を作らない。
-/// 空の集合と `NsFlag::User`（user namespace 参加は未対応。fail-closed）は `EINVAL` で拒否する。
+/// 空の集合は `EINVAL` で拒否する。`NsFlag::User` を含めると、カーネルは user namespace を **先に** 取り付け、
+/// 残りの namespace の権限を参加先の user namespace の全 capability で検証したうえで、全体を all-or-nothing で
+/// 反映する（`kernel/nsproxy.c` の `validate_nsset` / `commit_nsset`。rootless の exec。SUP-6・SEC-5・#1462）。
+/// 同じ user namespace への再参加・マルチスレッド・参加先での `CAP_SYS_ADMIN` 不足はカーネルが `EINVAL` /
+/// `EPERM` で拒否するため、呼び出し側は「別の user namespace」と判定したときだけ `User` を付ける。
 pub(crate) fn setns_pidfd(pidfd: BorrowedFd<'_>, flags: &[NsFlag]) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
-    if flags.is_empty() || flags.contains(&NsFlag::User) {
+    if flags.is_empty() {
         return Err(SysError::Os(EINVAL));
     }
     let bits = flags.iter().fold(0i32, |acc, f| acc | f.bits());
@@ -3440,6 +3471,86 @@ pub(crate) fn clear_supplementary_groups() -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// 呼び出しスレッドの実効 gid・実 gid・保存 gid を `gid` に揃える（`setresgid(gid, gid, gid)`。SUP-6・SEC-5・
+/// TASK-163 追補・#1462）。
+///
+/// `crate::exec` の capability 削減段が、rootless の exec で user namespace へ参加した後に、`process.user` の
+/// gid（名前空間内の値）へ揃えるために使う。生の syscall のため効果は呼び出しスレッドだけに及ぶ（呼び出し側が
+/// 単一スレッドであることを確かめる）。参加先の user namespace に写像されていない gid は `EINVAL`、`CAP_SETGID`
+/// が無ければ `EPERM`。
+// テストビルドでは capability 削減段が偽のカーネルを使い、本関数を呼ばない（libtest のプロセスの資格情報を
+// 変えないため）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn set_res_gid(gid: u32) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let nr = consts::SYS_SETRESGID.get()?;
+    // SAFETY: `setresgid(gid_t rgid, gid_t egid, gid_t sgid)` に整数 3 つだけを渡し、ポインタを取らない。
+    // 効果は呼び出しスレッドの資格情報の変更のみでメモリには触れない。
+    let rc = unsafe { syscall(nr, i64::from(gid), i64::from(gid), i64::from(gid)) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 呼び出しスレッドの実効 uid・実 uid・保存 uid を `uid` に揃える（`setresuid(uid, uid, uid)`。[`set_res_gid`] の
+/// uid 版。#1462）。gid を先に揃えてから呼ぶ（uid を非 root にすると `CAP_SETGID` を失うため）。
+// テストビルドでは偽のカーネルを使い、本関数を呼ばない。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn set_res_uid(uid: u32) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let nr = consts::SYS_SETRESUID.get()?;
+    // SAFETY: `setresuid(uid_t ruid, uid_t euid, uid_t suid)` に整数 3 つだけを渡し、ポインタを取らない。
+    // 効果は呼び出しスレッドの資格情報の変更のみでメモリには触れない。
+    let rc = unsafe { syscall(nr, i64::from(uid), i64::from(uid), i64::from(uid)) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 呼び出しスレッドの (実, 実効, 保存) gid を返す（`getresgid`。#1462）。[`set_res_gid`] の読み戻しに使う。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn get_res_gid() -> Result<[u32; 3], SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let nr = consts::SYS_GETRESGID.get()?;
+    let mut ids = [0u32; 3];
+    let [r, e, s] = &mut ids;
+    // SAFETY: `getresgid(gid_t *rgid, gid_t *egid, gid_t *sgid)` に、呼び出しの間有効で互いに重ならない
+    // 3 つの `u32` への書き込みポインタを渡す。カーネルは各ポインタへ 4 バイトだけを書く。
+    let rc = unsafe {
+        syscall(
+            nr,
+            std::ptr::from_mut(r),
+            std::ptr::from_mut(e),
+            std::ptr::from_mut(s),
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(ids) }
+}
+
+/// 呼び出しスレッドの (実, 実効, 保存) uid を返す（`getresuid`。[`get_res_gid`] の uid 版。#1462）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn get_res_uid() -> Result<[u32; 3], SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let nr = consts::SYS_GETRESUID.get()?;
+    let mut ids = [0u32; 3];
+    let [r, e, s] = &mut ids;
+    // SAFETY: `getresuid(uid_t *ruid, uid_t *euid, uid_t *suid)` に、呼び出しの間有効で互いに重ならない
+    // 3 つの `u32` への書き込みポインタを渡す。カーネルは各ポインタへ 4 バイトだけを書く。
+    let rc = unsafe {
+        syscall(
+            nr,
+            std::ptr::from_mut(r),
+            std::ptr::from_mut(e),
+            std::ptr::from_mut(s),
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(ids) }
+}
+
 /// `signal(2)` の `SIG_DFL`（既定動作）と `SIG_ERR`（失敗）。`sighandler_t` はポインタ幅。
 const SIG_DFL: usize = 0;
 const SIG_ERR: usize = usize::MAX;
@@ -3753,6 +3864,23 @@ pub(crate) fn set_parent_death_sigkill() -> Result<(), SysError> {
     // （arg2 がシグナル番号。`SIGKILL` の定数だけを渡す。arg3〜5 はカーネルが参照しないが 0 に揃える）。
     // 呼び出したスレッドの `pdeath_signal` を設定するだけで、メモリ・fd には触れない。
     let rc = unsafe { prctl(consts::PR_SET_PDEATHSIG, signal, 0u64, 0u64, 0u64) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 呼び出したスレッドの `SECBIT_KEEP_CAPS` を設定・解除する（`PR_SET_KEEPCAPS`。SUP-6・SEC-5・TASK-163 追補・#1462）。
+///
+/// `exec/capabilities.rs` の uid 切り替えが `setresuid` の前後に呼ぶ。ホストの root から rootless のコンテナへ
+/// exec すると uid が 0 から非 0 へ変わり、このフラグが無ければ permitted が全消去されて後続の bounding set の
+/// 削減・`capset` が `EPERM` になるため、切り替えの間だけ有効にする。フラグは `execve` で自動的に解除され、
+/// 呼び出し側は切り替えの直後に必ず解除する（権限を残す方向のフラグなので、有効のまま先へ進めない）。
+pub(crate) fn set_keep_caps(keep: bool) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す
+    // （arg2 が 0 / 1。arg3〜5 はカーネルが参照しないが 0 に揃える）。呼び出したスレッドの securebits の
+    // KEEP_CAPS ビットを変えるだけで、メモリ・fd には触れない。
+    let rc = unsafe { prctl(consts::PR_SET_KEEPCAPS, u64::from(keep), 0u64, 0u64, 0u64) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
@@ -4314,11 +4442,15 @@ mod tests {
             consts::SYS_CAPSET,
             consts::SYS_GETGROUPS,
             consts::SYS_SETGROUPS,
+            consts::SYS_SETRESUID,
+            consts::SYS_GETRESUID,
+            consts::SYS_SETRESGID,
+            consts::SYS_GETRESGID,
             consts::SYS_PTRACE,
             consts::SYS_KEXEC_LOAD,
         ];
         let errors: Vec<_> = numbers.iter().map(|n| n.get().err()).collect();
-        assert_eq!(errors, vec![Some(SysError::Unsupported); 21]);
+        assert_eq!(errors, vec![Some(SysError::Unsupported); 25]);
     }
 
     /// CORE-5・TASK-39.1: Landlock 関連定数の固定値照合（arch ごとに個別定義した値の誤り検出）。
@@ -4615,6 +4747,40 @@ mod tests {
         assert_eq!(supplementary_group_count(), Ok(groups));
     }
 
+    /// SUP-6・SEC-5・TASK-163 追補（#1462）: `setresuid` / `getresuid` / `setresgid` / `getresgid` の syscall
+    /// 番号（x86_64 は syscall_64.tbl、aarch64 は asm-generic/unistd.h）と、読み出しが実スレッドの
+    /// `/proc/thread-self/status` の `Uid:` / `Gid:`（実・実効・保存）と一致すること。
+    #[test]
+    fn sup6_task163_res_id_syscall_numbers_and_readback_are_exact() {
+        let nums = [
+            consts::SYS_SETRESUID,
+            consts::SYS_GETRESUID,
+            consts::SYS_SETRESGID,
+            consts::SYS_GETRESGID,
+        ]
+        .map(|n| n.get().map(SyscallNumber::raw));
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+        assert_eq!(nums, [Ok(117), Ok(118), Ok(119), Ok(120)]);
+        #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+        assert_eq!(nums, [Ok(147), Ok(148), Ok(149), Ok(150)]);
+        let _ = nums;
+        let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+        let field = |name: &str| -> [u32; 3] {
+            let v: Vec<u32> = status
+                .lines()
+                .find_map(|l| l.strip_prefix(name))
+                .unwrap()
+                .split_whitespace()
+                .take(3)
+                .map(|t| t.parse().unwrap())
+                .collect();
+            // `Uid:` は (実, 実効, 保存, fs) の順。
+            [v[0], v[1], v[2]]
+        };
+        assert_eq!(get_res_uid(), Ok(field("Uid:")));
+        assert_eq!(get_res_gid(), Ok(field("Gid:")));
+    }
+
     /// SEC-1・TASK-37.1: capability 関連の定数の具体値。
     #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
     #[test]
@@ -4720,6 +4886,7 @@ mod tests {
         assert_eq!(consts::PR_GET_DUMPABLE, 3);
         assert_eq!(consts::PR_SET_DUMPABLE, 4);
         assert_eq!(consts::PR_SET_PDEATHSIG, 1);
+        assert_eq!(consts::PR_SET_KEEPCAPS, 8);
         // 親死亡シグナルの実 syscall は単体テストでは呼ばない（設定はスレッド単位で、テストプロセスを起動した
         // スレッドが先に終わるとテストプロセス全体へ SIGKILL が届く）。実プロセスでの照合は supervisor の
         // 結合試験 `exec_timeout` が行う。
@@ -4778,13 +4945,18 @@ mod tests {
         assert_eq!(NsFlag::Net.bits(), 0x4000_0000);
     }
 
-    /// SUP-6・TASK-163.1: 空集合・user namespace は拒否し、namespace でない fd は EINVAL（副作用なし）。
+    /// SUP-6・TASK-163.1・#1462: 空集合は拒否し、user namespace を含めても namespace でない fd は EINVAL
+    /// （副作用なし。ガードで弾くのではなく、カーネルが nsfd でない fd を拒否する）。
     #[test]
     fn sup6_setns_pidfd_rejects_invalid_input() {
         let null = std::fs::File::open("/dev/null").unwrap();
         let fd = std::os::fd::AsFd::as_fd(&null);
         assert_eq!(setns_pidfd(fd, &[]), Err(SysError::Os(EINVAL)));
         assert_eq!(setns_pidfd(fd, &[NsFlag::User]), Err(SysError::Os(EINVAL)));
+        assert_eq!(
+            setns_pidfd(fd, &[NsFlag::User, NsFlag::Pid, NsFlag::Mount]),
+            Err(SysError::Os(EINVAL))
+        );
         assert_eq!(
             setns_pidfd(fd, &[NsFlag::Mount, NsFlag::Net]),
             Err(SysError::Os(EINVAL))

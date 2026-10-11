@@ -802,7 +802,7 @@ jobs:
           # 最後の成功行だけでなく、各シナリオの成功行をすべて照合する（シナリオが黙って外れた場合を
           # 成功にしない。TASK-163 追補・#1460）。
           for line in \
-            'exec_setns_join: target in another user namespace rejected' \
+            'exec_setns_join: rootless join into the target user namespace verified' \
             'exec_setns_join: root after joining a pivoted target equals the pinned rootfs' \
             'exec_setns_join: supplementary groups kept and recorded where setgroups is denied' \
             'exec_setns_join: namespace join verified'; do

@@ -215,17 +215,20 @@ pub enum ViolationReason {
     ExecTargetSharesPidNamespace,
     /// exec の対象が呼び出し側と同じ mount namespace にいる（同上）。
     ExecTargetSharesMountNamespace,
-    /// exec の対象が呼び出し側と別の user namespace にいる（SUP-6・SEC-5・TASK-163.4）。user namespace への
-    /// 参加は未実装のため、参加すると exec したコマンドは呼び出し側の user namespace の資格情報のまま対象の
-    /// mount / PID namespace で動く。呼び出し側がホスト root なら、capability が自分の user namespace に閉じた
-    /// コンテナ内プロセスより強い権限を持つことになるため、`setns` が成功する場合でも参加の前に拒否する。
+    /// exec の対象と呼び出し側の user namespace が、`open` で関係を記録した時点から変わった（SUP-6・SEC-5・
+    /// TASK-163.4・TASK-163.h2・#1462）。別の user namespace にいる対象へは user namespace にも参加する設計
+    /// （rootless の exec）だが、参加する集合は `open` で判定した関係から決めるため、検証から参加までの間に対象
+    /// が別の user namespace へ移った、または呼び出し側の user namespace が変わった場合は、`setns` が成功する
+    /// 場合でも参加の前に拒否する（誤った集合で参加すると、user namespace に入らないまま mount / PID namespace
+    /// へ参加し、呼び出し側の資格情報のまま動いて launch より強い権限になり得る）。
     ExecTargetInOtherUserNamespace,
     /// `setns` 参加後の呼び出しプロセスの `/` が、記録（bundle の `config.json`）から固定したコンテナの
     /// rootfs と同じディレクトリでない（pivot していない対象・`/` へ別のマウントが重ねられた対象。この状態で
     /// 制限を適用するとルールが別の木に付き、コマンドも rootfs の外で動く。SEC-1・TASK-163.3）。
     ExecRootNotContainerRootfs,
-    /// `setns` 参加後の呼び出しプロセスの mount namespace が、制限を準備した時点の exec の対象（pid1）の
-    /// mount namespace と一致しない（A 用に準備した制限を、同じ rootfs を共有する別コンテナ B へ参加した
+    /// `setns` 参加後の呼び出しプロセスの user namespace または mount namespace が、制限を準備した時点の exec の
+    /// 対象（pid1）のものと一致しない（user namespace は #1462 で追加。参加した user namespace が対象のものである
+    /// ことの照合）（A 用に準備した制限を、同じ rootfs を共有する別コンテナ B へ参加した
     /// プロセスへ適用させない。rootfs のディレクトリ照合だけでは取り違えを検出できない。SEC-1・TASK-163.4）。
     ExecJoinedNamespaceMismatch,
     /// `setns` 参加後に子が入る PID namespace（`ns/pid_for_children`）が、制限を準備した時点の exec の対象
@@ -713,13 +716,13 @@ impl ViolationReason {
                 "the exec target shares the mount namespace with the caller; refusing to join"
             }
             Self::ExecTargetInOtherUserNamespace => {
-                "the exec target is in another user namespace than the caller; refusing to join"
+                "the user namespace of the exec target or the caller changed since it was verified; refusing to join"
             }
             Self::ExecRootNotContainerRootfs => {
                 "the root directory after joining is not the recorded container rootfs"
             }
             Self::ExecJoinedNamespaceMismatch => {
-                "the mount namespace after joining is not the one of the prepared exec target"
+                "the user or mount namespace after joining is not the one of the prepared exec target"
             }
             Self::ExecJoinedPidNamespaceMismatch => {
                 "the PID namespace after joining is not the one of the prepared exec target"
@@ -1085,7 +1088,7 @@ mod tests {
                 ViolationReason::ExecTargetInOtherUserNamespace,
                 "exec_target_in_other_user_namespace",
                 "SUP-6",
-                "the exec target is in another user namespace than the caller; refusing to join",
+                "the user namespace of the exec target or the caller changed since it was verified; refusing to join",
             ),
             (
                 ViolationReason::ExecRootNotContainerRootfs,
@@ -1097,7 +1100,7 @@ mod tests {
                 ViolationReason::ExecJoinedNamespaceMismatch,
                 "exec_joined_namespace_mismatch",
                 "SEC-1",
-                "the mount namespace after joining is not the one of the prepared exec target",
+                "the user or mount namespace after joining is not the one of the prepared exec target",
             ),
             (
                 ViolationReason::ExecJoinedPidNamespaceMismatch,

@@ -33,7 +33,9 @@ use std::num::{NonZeroU8, NonZeroU32};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use fandhe_container_core::oci_runtime::{LAUNCHER_REPLY_GRACE, OciRuntimeError, StartTimeouts};
+use fandhe_container_core::oci_runtime::{
+    LAUNCHER_REPLY_GRACE, OciRuntimeError, StartTimeouts, exit_code_for,
+};
 use fandhe_container_core::traits::{ContainerId, ErrorCode, TraitError};
 
 use crate::restart::RestartPolicy;
@@ -158,7 +160,7 @@ impl StartReport {
     /// 結果チャネルから読んだバイト列を復号する。壊れた入力は `InvalidArgument`（panic しない）。
     ///
     /// 検査順: 長さの上限 → `\n` の終端がちょうど 1 個 → ASCII → 接頭辞 → トークン数 → 数値（数字のみ・`checked`）→
-    /// `CODE` の完全一致（未知の値は拒否）。
+    /// `CODE` の完全一致（未知の値は拒否）→ `exit_code` が `exit_code_for(CODE)` と一致（分類と終了コードの矛盾を拒否）。
     pub fn decode(bytes: &[u8]) -> Result<Self, TraitError> {
         if bytes.len() > MAX_REPORT_LEN {
             return Err(invalid("report is too long"));
@@ -196,6 +198,9 @@ impl StartReport {
                     .and_then(|v| u8::try_from(v).ok())
                     .and_then(NonZeroU8::new)
                     .ok_or_else(|| invalid("report exit code is invalid"))?;
+                if exit_code != exit_code_for(code) {
+                    return Err(invalid("report exit code does not match the error code"));
+                }
                 if message.is_empty()
                     || message.len() > MAX_REPORT_MESSAGE_LEN
                     || !message.bytes().all(|b| matches!(b, 0x20..=0x7E))
@@ -346,7 +351,7 @@ mod tests {
             "production process launcher is not available yet",
         );
         let r = StartReport::failed(&err);
-        let exit = fandhe_container_core::oci_runtime::exit_code_for(ErrorCode::Unimplemented);
+        let exit = exit_code_for(ErrorCode::Unimplemented);
         assert_eq!(
             r.encode(),
             format!(
@@ -354,6 +359,32 @@ mod tests {
             )
         );
         assert_eq!(StartReport::decode(r.encode().as_bytes()).unwrap(), r);
+    }
+
+    /// REPAIR-2・ERR-2: `exit_code` が `exit_code_for(CODE)` と食い違う報告は拒否し、一致すれば受理する。
+    #[test]
+    fn repair2_report_decode_rejects_exit_code_mismatch() {
+        for code in ALL_CODES {
+            let expected = exit_code_for(code).get();
+            let ok = format!("FCSUP1 ERR {} {expected} m\n", code.as_str());
+            let decoded = StartReport::decode(ok.as_bytes()).expect("matching exit code");
+            assert_eq!(
+                decoded,
+                StartReport::Failed {
+                    code,
+                    exit_code: exit_code_for(code),
+                    message: ReportMessage("m".to_owned()),
+                }
+            );
+            let wrong = if expected == 255 { 254 } else { expected + 1 };
+            let bad = format!("FCSUP1 ERR {} {wrong} m\n", code.as_str());
+            let e = StartReport::decode(bad.as_bytes()).expect_err("mismatched exit code");
+            assert_eq!(e.code(), ErrorCode::InvalidArgument);
+            assert_eq!(
+                e.message(),
+                "report exit code does not match the error code"
+            );
+        }
     }
 
     /// REPAIR-2: 壊れた報告はすべて InvalidArgument で拒否される。

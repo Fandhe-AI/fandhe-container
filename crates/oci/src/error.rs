@@ -17,7 +17,7 @@ pub const OCI_ERROR_MESSAGE_MAX_BYTES: usize = 1024;
 /// `OciError` の機械可読な分類（ERR-1）。
 ///
 /// `#[non_exhaustive]` のため、呼び出し側の `match` は `_` 分岐を持つこと。
-/// HTTP ステータスとの対応表は #401〜#403 で決める（本 issue では決めない）。
+/// HTTP ステータスとの対応は `code_for_http_status`（#401・TASK-51.2）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum OciErrorCode {
@@ -105,6 +105,22 @@ impl OciError {
     }
 }
 
+/// HTTP ステータスを `OciErrorCode` へ写像する（TASK-51.2・OCI-1。#401〜#403 が共通で使う）。
+///
+/// 401 / 403 は `PermissionDenied`、404 は `NotFound`、408 は `Timeout`、429 と 5xx は `Unavailable`、
+/// その他の 4xx は `InvalidArgument`、上記以外（想定外の 1xx / 3xx 等）は `Internal`。
+/// 呼び出し側は併せて `with_http_status` でステータスを別持ちする。
+pub(crate) fn code_for_http_status(status: u16) -> OciErrorCode {
+    match status {
+        401 | 403 => OciErrorCode::PermissionDenied,
+        404 => OciErrorCode::NotFound,
+        408 => OciErrorCode::Timeout,
+        429 | 500..=599 => OciErrorCode::Unavailable,
+        400..=499 => OciErrorCode::InvalidArgument,
+        _ => OciErrorCode::Internal,
+    }
+}
+
 /// 制御文字を空白へ置換し、上限バイト数で文字境界に切り詰める。
 fn sanitize_message(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len().min(OCI_ERROR_MESSAGE_MAX_BYTES));
@@ -151,6 +167,26 @@ mod tests {
         let e = OciError::new(OciErrorCode::InvalidArgument, "bad reference");
         assert_eq!(e.to_string(), "INVALID_ARGUMENT: bad reference");
         assert_eq!(e.http_status(), None);
+    }
+
+    /// OCI-1: HTTP ステータス写像の具体値。
+    #[test]
+    fn http_status_mapping() {
+        let table = [
+            (401, OciErrorCode::PermissionDenied),
+            (403, OciErrorCode::PermissionDenied),
+            (404, OciErrorCode::NotFound),
+            (408, OciErrorCode::Timeout),
+            (429, OciErrorCode::Unavailable),
+            (500, OciErrorCode::Unavailable),
+            (503, OciErrorCode::Unavailable),
+            (400, OciErrorCode::InvalidArgument),
+            (416, OciErrorCode::InvalidArgument),
+            (302, OciErrorCode::Internal),
+        ];
+        for (status, code) in table {
+            assert_eq!(code_for_http_status(status), code, "status {status}");
+        }
     }
 
     /// ERR-1: HTTP ステータスは message と別に数値で保持する。

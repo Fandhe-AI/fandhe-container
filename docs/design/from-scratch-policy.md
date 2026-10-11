@@ -46,7 +46,7 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 | `nix` | =0.31.3 | syscall wrapper（Unix のみ cfg(unix)・feature 最小） | #86 |
 | `unicode-normalization` | =0.1.25 | NFC / NFD の別表記の衝突検出（IO-5。io crate のみ。名前は正規化せず、`nfd()` で比べて衝突を構造化エラーで拒否する。#103 の決定） | #798（#1720 でそのまま使うと決定） |
 | `serde` | =1.0.229 | データシリアライズ | #138 |
-| `serde_json` | =1.0.151 | JSON（ペイロード・設定） | #138 |
+| `serde_json` | =1.0.151 | JSON（ペイロード・設定。crates/oci のトークン応答パースにも使用。TASK-51.2・#401） | #138 |
 | `sha2` | =0.11.0 | SHA-256（digest 検証） | #278 |
 | `objc2-virtualization` | =0.3.2 | macOS Virtualization.framework（macOS のみ） | #356 |
 | `objc2` | =0.6.4 | Objective-C ランタイム連携（macOS のみ） | #356 |

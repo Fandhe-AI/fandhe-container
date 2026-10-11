@@ -623,3 +623,31 @@ fn sup3_launcher_relauncher_uses_same_launcher_and_spec() {
     assert_eq!(specs[0].args(), ["/bin/echo", "it"]);
     assert!(Path::new(specs[0].rootfs()).ends_with("bundle/rootfs"));
 }
+
+/// 書き込みが戻らない書き手。
+struct StuckWriter(std::sync::mpsc::Receiver<()>);
+
+impl Write for StuckWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = self.0.recv();
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// REPAIR-5・SUP-1: 結果チャネルの書き込みが止まっても、期限で `TimedOut` を返して先へ進める。
+#[test]
+fn repair5_bounded_writer_times_out_on_stuck_reader() {
+    let (release, stuck) = std::sync::mpsc::channel();
+    let mut w = fandhe_container_supervisor::start_entry::BoundedWriter::new(
+        StuckWriter(stuck),
+        Duration::from_millis(100),
+    );
+    let started = std::time::Instant::now();
+    let err = w.write_all(b"FCSUP1 OK 1\n").unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let _ = release.send(());
+}

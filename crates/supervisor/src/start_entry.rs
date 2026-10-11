@@ -35,8 +35,9 @@
 //! [`StartDeps`] を使う試験（`tests/start_entry.rs`）が照合する。
 
 use std::io::Write;
-use std::num::NonZeroU8;
-use std::sync::Arc;
+use std::num::{NonZeroU8, NonZeroU32};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::observability::OpRecorder;
@@ -46,7 +47,7 @@ use fandhe_container_core::oci_runtime::{
 };
 use fandhe_container_core::traits::{
     ContainerId, ContainerState, ContainerStatus, ErrorCode, GetStateRequest, StartRequest,
-    StateRecord, StateStore, SupervisionState, TraitError,
+    StateRecord, StateRevision, StateStore, SupervisionState, TraitError, UpdateStateRequest,
 };
 
 use crate::restart::{
@@ -94,6 +95,9 @@ pub struct Running {
     pub process: Box<dyn LaunchedProcess>,
     /// restart の再 launch（start で使った launcher と `LaunchSpec` をそのまま使う。SUP-3）。
     pub relauncher: Arc<dyn Relauncher>,
+    /// start が返したレコードの cgroup の instance（無ければ `None`）。回収後の `Stopped` 記録で、同じ ID の
+    /// 削除・再作成による別インスタンスのレコードを上書きしないための照合に使う（CORE-2・SEC-1）。
+    pub instance: Option<StateRevision>,
 }
 
 /// spec を捕捉できなかったときの再 launch（常に失敗させる。fail-closed）。
@@ -108,22 +112,112 @@ impl Relauncher for NoSpecRelauncher {
     }
 }
 
+/// 結果チャネルの書き込みの期限（読み手が読まず pipe が満杯でも監視へ進むため。REPAIR-5）。
+const REPORT_WRITE_DEADLINE: Duration = Duration::from_secs(5);
+/// stderr のログ 1 行の書き込みの期限。
+const LOG_WRITE_DEADLINE: Duration = Duration::from_secs(1);
+/// stderr への書き込みが期限を超えた後は、スレッドを増やさないよう以後のログを捨てる。
+static LOG_STUCK: AtomicBool = AtomicBool::new(false);
+
+/// 書き込みを別スレッドで行い、期限までに終わらなければ `TimedOut` を返す書き手（REPAIR-5）。
+///
+/// 読み手が止まって pipe が満杯でも、呼び出し側は期限で次へ進める（起動済みプロセスの監視・回収を止めない）。
+/// 期限後も書き込みスレッドは残り得るが、完了すれば終わる。1 回の `write_all` を 1 スレッドで行うため、
+/// 単一スレッド前提の区間（`oci_runtime::start` より前）の成功経路では使わない。
+pub struct BoundedWriter<W: Write + Send + 'static> {
+    inner: Arc<Mutex<W>>,
+    deadline: Duration,
+}
+
+impl<W: Write + Send + 'static> BoundedWriter<W> {
+    /// `deadline` を 1 回の書き込みの上限にして包む。
+    pub fn new(inner: W, deadline: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(inner)),
+            deadline,
+        }
+    }
+}
+
+impl<W: Write + Send + 'static> Write for BoundedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        let inner = Arc::clone(&self.inner);
+        let data = buf.to_vec();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("supervisor-write".into())
+            .spawn(move || {
+                let mut guard = inner.lock().unwrap_or_else(PoisonError::into_inner);
+                let result = guard.write_all(&data).and_then(|()| guard.flush());
+                let _ = tx.send(result);
+            })
+            .map_err(|_| std::io::Error::other("failed to spawn the write thread"))?;
+        match rx.recv_timeout(self.deadline) {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "write deadline exceeded",
+            )),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // 各 `write_all` が flush まで行う。
+        Ok(())
+    }
+}
+
 /// 構造化ログを stderr に 1 行出す（値は固定語彙だけ。入力値・OS のエラー文字列は載せない。REPAIR-4）。
+///
+/// stderr の読み手が止まっても回収・監視を止めないよう、書き込みは期限つき（REPAIR-5）。期限を超えたら以後は捨てる。
 fn log_event(event: &'static str, code: Option<ErrorCode>) {
+    if LOG_STUCK.load(Ordering::Relaxed) {
+        return;
+    }
     let code = code.map(|c| c.as_str()).unwrap_or("");
-    // eprintln! は stderr の書き込み失敗で panic する。ログ配送の失敗が回収・監視を止めないよう結果を捨てる。
-    let _ = writeln!(
-        std::io::stderr(),
-        "{{\"component\":\"supervisor\",\"event\":\"{event}\",\"code\":\"{code}\"}}"
-    );
+    let line =
+        format!("{{\"component\":\"supervisor\",\"event\":\"{event}\",\"code\":\"{code}\"}}\n");
+    let mut writer = BoundedWriter::new(std::io::stderr(), LOG_WRITE_DEADLINE);
+    if let Err(e) = writer.write_all(line.as_bytes())
+        && e.kind() == std::io::ErrorKind::TimedOut
+    {
+        LOG_STUCK.store(true, Ordering::Relaxed);
+    }
+}
+
+/// 回収を確かめられなかったハンドルの保管先（`Drop` は回収しないため、捨てずに保持する。REPAIR-5）。
+static STRANDED: Mutex<Vec<Box<dyn LaunchedProcess>>> = Mutex::new(Vec::new());
+
+fn keep_stranded(process: Box<dyn LaunchedProcess>) {
+    STRANDED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(process);
+}
+
+/// [`terminate_bounded`] の失敗。
+enum TerminateFailure {
+    /// 期限内に `Err` で戻った（または実行スレッドを作れなかった）。ハンドルは手元にあり再試行できる。
+    Returned(Box<dyn LaunchedProcess>),
+    /// 期限内に戻らなかった。ハンドルは実行スレッドが持つ（`Err` で戻れば [`STRANDED`] へ入る）。
+    Pending,
 }
 
 /// ハンドルの所有権を別スレッドへ渡して `terminate` を呼び、呼び出し境界でも期限を強制する（REPAIR-5）。
 ///
-/// 実装が `timeout` を守らず戻らない場合も、本関数は `timeout` に猶予を足した時点で `false` を返す。
-/// その場合ハンドルは実行スレッドが持ち続ける（回収は確かめられていない）。回収を確かめられたら `true`。
-fn terminate_bounded(process: Box<dyn LaunchedProcess>, timeout: Duration) -> bool {
-    let cell = Arc::new(std::sync::Mutex::new(Some(process)));
+/// 実装が `timeout` を守らず戻らない場合も、本関数は `timeout` に猶予を足した時点で `Pending` を返す。
+/// 回収を確かめられたら回収した pid を返す。`Err` で戻ったハンドルは捨てずに返す（再試行のため）。
+fn terminate_bounded(
+    process: Box<dyn LaunchedProcess>,
+    timeout: Duration,
+) -> Result<NonZeroU32, TerminateFailure> {
+    let pid = process.pid();
+    let cell = Arc::new(Mutex::new(Some(process)));
     let worker_cell = Arc::clone(&cell);
     let (tx, rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
@@ -131,28 +225,58 @@ fn terminate_bounded(process: Box<dyn LaunchedProcess>, timeout: Duration) -> bo
         .spawn(move || {
             let taken = worker_cell
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(PoisonError::into_inner)
                 .take();
-            let result = match taken {
-                Some(p) => p.terminate(timeout).map_err(|e| e.code()),
-                None => Err(ErrorCode::Internal),
+            let Some(p) = taken else {
+                return;
             };
-            let _ = tx.send(result);
+            match p.terminate(timeout) {
+                Ok(()) => {
+                    let _ = tx.send(Ok(()));
+                }
+                Err(e) => {
+                    // 受け手が待ちをやめていればハンドルを保管し、待っていれば返して再試行させる。
+                    if let Err(unsent) = tx.send(Err((e.code(), p)))
+                        && let Err((_, p)) = unsent.0
+                    {
+                        keep_stranded(p);
+                    }
+                }
+            }
         });
     if spawned.is_err() {
         log_event("terminate_thread_failed", None);
-        return false;
+        let left = cell.lock().unwrap_or_else(PoisonError::into_inner).take();
+        return Err(left.map_or(TerminateFailure::Pending, TerminateFailure::Returned));
     }
     match rx.recv_timeout(timeout.saturating_add(LAUNCHER_REPLY_GRACE)) {
-        Ok(Ok(())) => true,
-        Ok(Err(code)) => {
+        Ok(Ok(())) => Ok(pid),
+        Ok(Err((code, p))) => {
             log_event("handle_terminate_failed", Some(code));
-            false
+            Err(TerminateFailure::Returned(p))
         }
         Err(_) => {
             log_event("handle_terminate_timed_out", Some(ErrorCode::Timeout));
-            false
+            Err(TerminateFailure::Pending)
         }
+    }
+}
+
+/// [`terminate_bounded`] を、`Err` で戻ったハンドルについて 1 回だけ再試行する。回収できたらその pid。
+///
+/// 再試行も失敗したハンドルは [`STRANDED`] に保管する（`Drop` で捨てて子を孤児化させない）。
+fn terminate_retrying(process: Box<dyn LaunchedProcess>, timeout: Duration) -> Option<NonZeroU32> {
+    match terminate_bounded(process, timeout) {
+        Ok(pid) => Some(pid),
+        Err(TerminateFailure::Pending) => None,
+        Err(TerminateFailure::Returned(p)) => match terminate_bounded(p, timeout) {
+            Ok(pid) => Some(pid),
+            Err(TerminateFailure::Returned(p)) => {
+                keep_stranded(p);
+                None
+            }
+            Err(TerminateFailure::Pending) => None,
+        },
     }
 }
 
@@ -251,7 +375,8 @@ fn start_sequence(
     // 8
     match start(store, recorder, &launcher, req, timeouts) {
         Ok(started) => {
-            let (_record, process) = started.into_parts();
+            let (record, process) = started.into_parts();
+            let instance = record.cgroup().map(|c| c.instance());
             let relauncher: Arc<dyn Relauncher> = match capturing.captured_spec() {
                 Some(spec) => Arc::new(LauncherRelauncher::new(inner, spec)),
                 None => Arc::new(NoSpecRelauncher),
@@ -259,6 +384,7 @@ fn start_sequence(
             Ok(Running {
                 process,
                 relauncher,
+                instance,
             })
         }
         Err(e) if e.code() == ErrorCode::Timeout => {
@@ -276,11 +402,10 @@ fn start_sequence(
         }
         Err(e) => {
             // 記録の失敗後に terminate も失敗・超過した場合、core はハンドルを未回収レジストリに残して返す。
-            // 残っていれば回収と予約の確認を再試行し、確かめられなければ cgroup を残す（CORE-1・CORE-2）。
+            // レジストリが空でも、core の後始末スレッドがハンドルを保持中・予約が Running のまま残る場合があるため、
+            // 状態と core の予約の解放を確かめてから cgroup を消す。確かめられなければ cgroup を残す（CORE-1・CORE-2）。
             let pending = take_unreaped_processes();
-            if pending.is_empty()
-                || recover_after_timeout(store, &launcher, req.id(), timeouts, pending)
-            {
+            if settle_failed_start(store, &launcher, req.id(), timeouts, pending) {
                 release_logged(deps);
                 Err(e)
             } else {
@@ -327,25 +452,82 @@ fn recover_after_timeout(
     }
     let mut all_reaped = true;
     for p in extra.into_iter().chain(take_unreaped_processes()) {
-        if !terminate_bounded(p, timeouts.terminate()) {
+        if terminate_retrying(p, timeouts.terminate()).is_none() {
             all_reaped = false;
         }
     }
     recovered && all_reaped
 }
 
-/// 返ってきたハンドルを terminate して回収を確かめる。全件確かめられたら `true`（CORE-1・REPAIR-5）。
+/// 記録の失敗など Timeout 以外で `start` が失敗した後に、cgroup を消してよいかを確かめる。確かめられたら `true`。
+///
+/// - 状態が Created 以外（Running の予約が残る等）や読めない場合は [`recover_after_timeout`] で戻す。
+/// - Created でも、core の後始末スレッドがハンドルを保持したまま予約を解放していない場合がある。
+///   `recover_interrupted_start` が「回復対象なし」で戻る（＝予約が解放済み）まで待ってから、
+///   登録済みの未回収ハンドルを terminate する。待ちは上限つき（REPAIR-5）。
+fn settle_failed_start(
+    store: &dyn StateStore,
+    launcher: &Arc<dyn ProcessLauncher>,
+    id: &ContainerId,
+    timeouts: &StartTimeouts,
+    pending: Vec<Box<dyn LaunchedProcess>>,
+) -> bool {
+    let reverted = store
+        .get(&GetStateRequest::new(id.clone()))
+        .is_ok_and(|r| r.status().state() == ContainerState::Created && r.status().pid().is_none());
+    if !reverted {
+        return recover_after_timeout(store, launcher, id, timeouts, pending);
+    }
+    let limit = timeouts
+        .terminate()
+        .saturating_add(LAUNCHER_REPLY_GRACE.saturating_mul(2));
+    let started = Instant::now();
+    let idle = loop {
+        match recover_interrupted_start(store, launcher, id, timeouts) {
+            // Created のため回復対象は無い。予約が解放済みで、core のワーカーも残っていない。
+            Err(e)
+                if e.code() == ErrorCode::FailedPrecondition
+                    && e.message() == "no interrupted start reservation to recover" =>
+            {
+                break true;
+            }
+            Err(e) if e.code() == ErrorCode::FailedPrecondition && started.elapsed() < limit => {
+                std::thread::sleep(RECOVER_RETRY_INTERVAL);
+            }
+            Err(e) => {
+                log_event("start_settle_failed", Some(e.code()));
+                break false;
+            }
+            // Created から回復が成功することはない。想定外は確かめられなかった扱いにする。
+            Ok(_) => break false,
+        }
+    };
+    let mut all_reaped = true;
+    for p in pending.into_iter().chain(take_unreaped_processes()) {
+        if terminate_retrying(p, timeouts.terminate()).is_none() {
+            all_reaped = false;
+        }
+    }
+    idle && all_reaped
+}
+
+/// 返ってきたハンドルを terminate して回収を確かめる（CORE-1・REPAIR-5）。
+///
+/// 全件確かめられたかと、回収を確かめられた pid の一覧を返す。
 fn dispose(
     process: Option<Box<dyn LaunchedProcess>>,
     late: Option<&LateOrphans>,
     timeouts: &StartTimeouts,
-) -> bool {
+) -> (bool, Vec<NonZeroU32>) {
     let mut ok = true;
+    let mut reaped = Vec::new();
     if let Some(p) = process {
-        if terminate_bounded(p, timeouts.terminate()) {
-            log_event("handle_terminated", None);
-        } else {
-            ok = false;
+        match terminate_retrying(p, timeouts.terminate()) {
+            Some(pid) => {
+                log_event("handle_terminated", None);
+                reaped.push(pid);
+            }
+            None => ok = false,
         }
     }
     if let Some(late) = late {
@@ -354,36 +536,85 @@ fn dispose(
             ok = false;
         }
         for (p, _reason) in late.take() {
-            if terminate_bounded(p, timeouts.terminate()) {
-                log_event("handle_terminated", None);
-            } else {
-                ok = false;
+            match terminate_retrying(p, timeouts.terminate()) {
+                Some(pid) => {
+                    log_event("handle_terminated", None);
+                    reaped.push(pid);
+                }
+                None => ok = false,
             }
         }
     }
-    ok
+    (ok, reaped)
 }
 
-/// 報告済みの Running を、回収後に Stopped へ落とす（best effort。inspect が死んだ pid を生存中と表示しない。SUP-1）。
+/// 回収を確かめられたハンドルに対応する Running の記録を、`Stopped` に落として監視権を解除する
+/// （best effort。inspect が死んだ pid を生存中と表示せず、delete が拒否されないようにする。SUP-1・CORE-2）。
 ///
-/// 失敗はログに出すだけで終了コードは変えない（元のエラーを隠さない）。
-fn mark_stopped(store: &Arc<dyn StateStore>, id: &ContainerId) {
-    let result = SupervisedState::attach(Arc::clone(store), id.clone()).and_then(|mut st| {
-        let (health, count) = (st.record().health(), st.record().restart_count());
-        st.write(
-            ContainerStatus::stopped(id.clone(), None),
-            SupervisionState::new(None, health, count),
-        )
-        .map(|_| ())
-    });
-    if let Err(e) = result {
+/// 同じ ID が回収中に削除・再作成されていても別インスタンスを上書きしないよう、最新レコードを読み直したうえで
+/// 次を満たすときだけ書く（SEC-1）: cgroup の instance が start 時と一致／状態が Running で pid が回収済みの pid
+/// のいずれか／`supervisor_pid` が無いか自プロセス。書き込みは読んだ revision への楽観的排他。
+/// 失敗・不一致はログに出すだけで終了コードは変えない（元のエラーを隠さない）。
+fn mark_stopped(
+    store: &Arc<dyn StateStore>,
+    id: &ContainerId,
+    instance: Option<StateRevision>,
+    reaped: &[NonZeroU32],
+) {
+    if reaped.is_empty() {
+        return;
+    }
+    let record = match store.get(&GetStateRequest::new(id.clone())) {
+        Ok(r) => r,
+        Err(e) => {
+            log_event("mark_stopped_failed", Some(e.code()));
+            return;
+        }
+    };
+    let status = record.status();
+    let same_instance = record.cgroup().map(|c| c.instance()) == instance;
+    let same_process = status.state() == ContainerState::Running
+        && status.pid().is_some_and(|p| reaped.contains(&p));
+    let ours = record
+        .supervision()
+        .supervisor_pid()
+        .is_none_or(|p| p.get() == std::process::id());
+    if !(same_instance && same_process && ours) {
+        log_event("mark_stopped_skipped", None);
+        return;
+    }
+    let supervision = SupervisionState::new(None, record.health(), record.restart_count());
+    let req = UpdateStateRequest::new(
+        ContainerStatus::stopped(id.clone(), None),
+        record.revision(),
+    )
+    .with_supervision(supervision);
+    if let Err(e) = store.update(&req) {
         log_event("mark_stopped_failed", Some(e.code()));
+    }
+}
+
+/// 回収の結果を終了コードにまとめる。確かめられたものは `Stopped` を記録し、`code` を返す。確かめられなければ `Internal`。
+fn finish_disposed(
+    store: &Arc<dyn StateStore>,
+    id: &ContainerId,
+    instance: Option<StateRevision>,
+    disposed: (bool, Vec<NonZeroU32>),
+    code: u8,
+) -> u8 {
+    let (ok, reaped) = disposed;
+    if ok {
+        mark_stopped(store, id, instance, &reaped);
+        code
+    } else {
+        exit_code_for(ErrorCode::Internal).get()
     }
 }
 
 /// 手順 10: 監視と restart。返り値は supervisor プロセスの終了コード（0 = 記録して正常に終わった）。
 ///
 /// 監視の結果が返したハンドルの所有者は本入口なので、終了の前に terminate して回収を確かめる。
+/// 回収を確かめられれば、対応する Running の記録を `Stopped` に落とす（`mark_stopped`）。
 /// 回収を確かめられなければ `Internal` の非 0 で終わる。
 pub fn run_supervised(
     store: Arc<dyn StateStore>,
@@ -393,24 +624,23 @@ pub fn run_supervised(
     timeouts: &StartTimeouts,
     stop: &StopToken,
 ) -> u8 {
-    let internal = exit_code_for(ErrorCode::Internal).get();
     let Running {
         process,
         relauncher,
+        instance,
     } = running;
     let mut state = match SupervisedState::attach(Arc::clone(&store), id.clone()) {
         Ok(s) => s,
         Err(e) => {
             log_event("attach_failed", Some(e.code()));
-            let reaped = dispose(Some(process), None, timeouts);
-            if reaped {
-                mark_stopped(&store, &id);
-            }
-            return if reaped {
-                exit_code_for(e.code()).get()
-            } else {
-                internal
-            };
+            let disposed = dispose(Some(process), None, timeouts);
+            return finish_disposed(
+                &store,
+                &id,
+                instance,
+                disposed,
+                exit_code_for(e.code()).get(),
+            );
         }
     };
     let configs = MonitorConfig::new(POLL_INTERVAL).and_then(|m| {
@@ -422,15 +652,14 @@ pub fn run_supervised(
         Ok(c) => c,
         Err(e) => {
             log_event("config_invalid", Some(e.code()));
-            let reaped = dispose(Some(process), None, timeouts);
-            if reaped {
-                mark_stopped(&store, &id);
-            }
-            return if reaped {
-                exit_code_for(e.code()).get()
-            } else {
-                internal
-            };
+            let disposed = dispose(Some(process), None, timeouts);
+            return finish_disposed(
+                &store,
+                &id,
+                instance,
+                disposed,
+                exit_code_for(e.code()).get(),
+            );
         }
     };
     let outcome = supervise_with_restart(
@@ -450,37 +679,45 @@ pub fn run_supervised(
         }
         Ok(SuperviseOutcome::Finished { .. }) => 0,
         Ok(SuperviseOutcome::Stopped { process, late, .. }) => {
-            if dispose(process, Some(&late), timeouts) {
-                0
-            } else {
-                internal
-            }
+            let disposed = dispose(process, Some(&late), timeouts);
+            finish_disposed(&store, &id, instance, disposed, 0)
         }
         Ok(SuperviseOutcome::RelaunchFailed { error, late, .. })
         | Ok(SuperviseOutcome::RestartUnrecorded { error, late, .. }) => {
             log_event("restart_failed", Some(error.code()));
-            if dispose(None, Some(&late), timeouts) {
-                exit_code_for(error.code()).get()
-            } else {
-                internal
-            }
+            let disposed = dispose(None, Some(&late), timeouts);
+            finish_disposed(
+                &store,
+                &id,
+                instance,
+                disposed,
+                exit_code_for(error.code()).get(),
+            )
         }
         Ok(SuperviseOutcome::MonitorFailed { process, .. }) => {
             log_event("monitor_failed", None);
-            dispose(process, None, timeouts);
-            internal
+            let disposed = dispose(process, None, timeouts);
+            finish_disposed(
+                &store,
+                &id,
+                instance,
+                disposed,
+                exit_code_for(ErrorCode::Internal).get(),
+            )
         }
         Ok(SuperviseOutcome::MonitorError { error, process, .. }) => {
             log_event("monitor_error", Some(error.code()));
-            if dispose(Some(process), None, timeouts) {
-                exit_code_for(error.code()).get()
-            } else {
-                internal
-            }
+            let disposed = dispose(Some(process), None, timeouts);
+            finish_disposed(
+                &store,
+                &id,
+                instance,
+                disposed,
+                exit_code_for(error.code()).get(),
+            )
         }
     }
 }
-
 #[cfg(target_os = "linux")]
 pub use linux::{ProductionStartDeps, run_main};
 
@@ -618,14 +855,14 @@ mod linux {
     pub fn run_main<I: IntoIterator<Item = OsString>>(args: I) -> ExitCode {
         // 0: 結果チャネル。不正なら報告できないので stderr に固定スキーマの JSON を出して終わる。
         let mut out = match open_result_channel() {
-            Ok(f) => f,
+            Ok(f) => BoundedWriter::new(f, REPORT_WRITE_DEADLINE),
             Err(e) => {
                 let err = op_err(e);
                 let _ = err.write_json_line(&mut std::io::stderr());
                 return ExitCode::from(err.exit_code().get());
             }
         };
-        let fail = |out: &mut File, err: OciRuntimeError| -> ExitCode {
+        let fail = |out: &mut BoundedWriter<File>, err: OciRuntimeError| -> ExitCode {
             if write_report(out, &StartReport::failed(&err)).is_err() {
                 log_event("report_failed", None);
             }

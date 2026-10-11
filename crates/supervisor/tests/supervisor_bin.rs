@@ -71,6 +71,9 @@ fn bin() -> Command {
 /// 子の終了待ちの上限（超過したら kill して有限時間で回収する。REPAIR-5）。
 const CHILD_DEADLINE: Duration = Duration::from_secs(60);
 
+/// kill 後の回収確認の猶予。
+const REAP_GRACE: Duration = Duration::from_secs(5);
+
 /// 期限つきで子の終了を待つ。超過時は kill して回収し panic する（無期限のハングを作らない）。
 fn wait_bounded(child: &mut Child) -> ExitStatus {
     let start = Instant::now();
@@ -79,9 +82,19 @@ fn wait_bounded(child: &mut Child) -> ExitStatus {
             return status;
         }
         if start.elapsed() > CHILD_DEADLINE {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("child did not exit within the deadline");
+            let killed = child.kill();
+            // 回収も有限の猶予で確かめる（割り込み不能な待ちの子で無期限に塞がらない。REPAIR-5）。
+            let reap_start = Instant::now();
+            let reaped = loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break true,
+                    Ok(None) if reap_start.elapsed() < REAP_GRACE => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    _ => break false,
+                }
+            };
+            panic!("child did not exit within the deadline (kill: {killed:?}, reaped: {reaped})");
         }
         std::thread::sleep(Duration::from_millis(10));
     }

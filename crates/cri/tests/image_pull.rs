@@ -32,6 +32,9 @@ const SHA_LAYER2: &str = "486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65
 /// index から選ばれた manifest の digest（試験では内容を持たない任意値）。
 const SHA_INDEX_PICK: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+/// image index 本文の digest（試験では内容を持たない任意値。選択 manifest の `SHA_INDEX_PICK` とは別）。
+const SHA_INDEX_TOP: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
 fn blob_body(hex: &str) -> &'static [u8] {
     match hex {
         SHA_CONFIG => b"hello",
@@ -75,6 +78,8 @@ struct FakeClient {
     selected: Option<Digest>,
     /// 偽の「本文ハッシュ」。digest 参照では oci と同様に要求 digest と突合し、不一致は DataLoss にする。
     manifest_digest: Digest,
+    /// index 経由を模す場合の index 本文の偽ハッシュ。digest 参照はこの値と突合する。
+    index_digest: Option<Digest>,
     blob_delay: Duration,
     corrupt_digest: Option<&'static str>,
     blob_fetches: AtomicUsize,
@@ -89,6 +94,7 @@ impl FakeClient {
             require_credentials: false,
             selected: None,
             manifest_digest: Digest::parse(&format!("sha256:{SHA_INDEX_PICK}")).expect("digest"),
+            index_digest: None,
             blob_delay: Duration::ZERO,
             corrupt_digest: None,
             blob_fetches: AtomicUsize::new(0),
@@ -129,7 +135,7 @@ impl RegistryPullClient for FakeClient {
         _p: &Platform,
     ) -> Result<PulledManifest, OciError> {
         if let Reference::Digest(want) = reference
-            && *want != self.manifest_digest
+            && *want != *self.index_digest.as_ref().unwrap_or(&self.manifest_digest)
         {
             return Err(OciError::new(
                 OciErrorCode::DataLoss,
@@ -140,6 +146,7 @@ impl RegistryPullClient for FakeClient {
             manifest: parse_image(&self.manifest_json),
             selected_digest: self.selected.clone(),
             manifest_digest: self.manifest_digest.clone(),
+            index_digest: self.index_digest.clone(),
         })
     }
 
@@ -692,4 +699,99 @@ async fn repair4_pull_is_recorded() {
     assert_eq!(samples[0].kind().as_str(), "cri.pull_image");
     assert_eq!(samples[0].outcome(), CriOpOutcome::Success);
     assert_eq!(samples[1].outcome(), CriOpOutcome::Failure);
+}
+
+/// CRI-4・OCI-1: index の digest で pull した参照は、選択 manifest の digest と併せて index digest でも
+/// ImageStatus / ListImages から引ける。tag 経由でも index digest が repo_digests に載る。
+#[tokio::test]
+async fn cri4_index_digest_pull_is_resolvable_by_index_digest() {
+    let index = format!("alpine@sha256:{SHA_INDEX_TOP}");
+    let dir = TempDir::new("index");
+    let mut fake = FakeClient::new(two_layer_manifest());
+    fake.selected = Some(Digest::parse(&format!("sha256:{SHA_INDEX_PICK}")).expect("digest"));
+    fake.index_digest = Some(Digest::parse(&format!("sha256:{SHA_INDEX_TOP}")).expect("digest"));
+    let (svc, _store) = service_with(Arc::new(fake), config(&dir));
+    ImageService::pull_image(&svc, Request::new(pull_req(&index)))
+        .await
+        .expect("pull by index digest");
+
+    for reference in [&index, &format!("alpine@sha256:{SHA_INDEX_PICK}")] {
+        let status = ImageService::image_status(&svc, Request::new(status_req(reference)))
+            .await
+            .expect("status")
+            .into_inner();
+        let image = status.image.expect("resolvable by digest");
+        assert_eq!(image.id, format!("sha256:{SHA_CONFIG}"));
+        assert_eq!(
+            image.repo_digests,
+            vec![
+                format!("docker.io/library/alpine@sha256:{SHA_INDEX_PICK}"),
+                format!("docker.io/library/alpine@sha256:{SHA_INDEX_TOP}"),
+            ]
+        );
+        let list = ImageService::list_images(
+            &svc,
+            Request::new(v1::ListImagesRequest {
+                filter: Some(v1::ImageFilter {
+                    image: Some(v1::ImageSpec {
+                        image: reference.clone(),
+                        ..Default::default()
+                    }),
+                }),
+            }),
+        )
+        .await
+        .expect("list")
+        .into_inner();
+        assert_eq!(list.images.len(), 1, "filter by {reference}");
+    }
+
+    let dir2 = TempDir::new("index-tag");
+    let mut fake = FakeClient::new(two_layer_manifest());
+    fake.index_digest = Some(Digest::parse(&format!("sha256:{SHA_INDEX_TOP}")).expect("digest"));
+    let pulled = OciImagePuller::new(Arc::new(fake), config(&dir2))
+        .pull(&req("alpine:3.20"))
+        .expect("pull by tag");
+    assert_eq!(
+        pulled.repo_digests,
+        vec![
+            format!("docker.io/library/alpine@sha256:{SHA_INDEX_PICK}"),
+            format!("docker.io/library/alpine@sha256:{SHA_INDEX_TOP}"),
+        ]
+    );
+}
+
+/// OCI-1: descriptor の宣言サイズが実サイズと食い違う manifest は、キャッシュの有無によらず DATA_LOSS。
+#[test]
+fn oci1_descriptor_size_mismatch_is_rejected_regardless_of_cache() {
+    let dir = TempDir::new("size-mismatch");
+    // 実際の "abc" は 3 バイトだが 4 と宣言する。
+    let bad = manifest_json(SHA_CONFIG, &[(SHA_LAYER1, 4)]);
+    let good = manifest_json(SHA_CONFIG, &[(SHA_LAYER1, 3)]);
+    let cold = OciImagePuller::new(Arc::new(FakeClient::new(bad.clone())), config(&dir));
+    assert_eq!(
+        cold.pull(&req("alpine")).expect_err("cold").code(),
+        OciErrorCode::DataLoss
+    );
+    // 正しい manifest で blob をキャッシュへ載せた後でも、宣言サイズ違いは拒否される。
+    OciImagePuller::new(Arc::new(FakeClient::new(good)), config(&dir))
+        .pull(&req("alpine"))
+        .expect("seed cache");
+    let warm = OciImagePuller::new(Arc::new(FakeClient::new(bad)), config(&dir));
+    assert_eq!(
+        warm.pull(&req("alpine")).expect_err("warm").code(),
+        OciErrorCode::DataLoss
+    );
+}
+
+/// OCI-1: 同一 digest の descriptor が異なるサイズを宣言する manifest は拒否する。
+#[test]
+fn oci1_duplicate_descriptors_with_different_sizes_are_rejected() {
+    let dir = TempDir::new("dup-size");
+    let bad = manifest_json(SHA_CONFIG, &[(SHA_LAYER1, 3), (SHA_LAYER1, 4)]);
+    let puller = OciImagePuller::new(Arc::new(FakeClient::new(bad)), config(&dir));
+    assert_eq!(
+        puller.pull(&req("alpine")).expect_err("dup").code(),
+        OciErrorCode::DataLoss
+    );
 }

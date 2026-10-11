@@ -172,6 +172,9 @@ pub struct PulledManifest {
     pub selected_digest: Option<Digest>,
     /// `manifest` 本文のハッシュ。digest 参照・index 選択エントリでは oci が要求 digest と突合済み（OCI-1）。
     pub manifest_digest: Digest,
+    /// image index 経由で解決した場合の index 本文のハッシュ（digest 参照では要求 digest と突合済み。OCI-1）。
+    /// kubelet は `name@<index digest>` で再照会するため、repo_digests に併せて登録する（CRI-4）。
+    pub index_digest: Option<Digest>,
 }
 
 /// oci の `RegistryClient` を呼ぶ最小の境界。実体は [`OciRegistryClient`]、試験では偽実装を差し込む
@@ -284,6 +287,7 @@ impl RegistryPullClient for OciRegistryClient {
             manifest: resolved.manifest,
             selected_digest: resolved.selected_digest,
             manifest_digest: resolved.manifest_digest,
+            index_digest: resolved.index_digest,
         })
     }
 
@@ -376,9 +380,11 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         // キャッシュ命中: 通常ファイル（symlink は辿らない）かつ再検証に合格すれば再取得しない。
         // 再検証に失敗しても共有 blob は消さない（一過性の読み出しエラーで検証済み blob を失わないため）。
         // 取得・検証に成功した場合に限り、下の rename で置き換える。
+        // サイズは読み取り上限ではなく宣言値との完全一致で確認する（短い blob の誤受理を防ぐ。OCI-1）。
         if let Ok(meta) = fs::symlink_metadata(&final_path)
             && meta.is_file()
-            && verify_blob_digest(&final_path, &descriptor.digest, descriptor.size).is_ok()
+            && verify_blob_digest(&final_path, &descriptor.digest, descriptor.size)
+                .is_ok_and(|v| v.size == descriptor.size)
         {
             return Ok(());
         }
@@ -392,8 +398,14 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
                 &staged,
             )
             .map_err(|e| PullError::from_oci(&e))?;
-        verify_blob_digest(&staged, &descriptor.digest, descriptor.size)
+        let verified = verify_blob_digest(&staged, &descriptor.digest, descriptor.size)
             .map_err(|e| PullError::from_oci(&e))?;
+        if verified.size != descriptor.size {
+            return Err(PullError::new(
+                OciErrorCode::DataLoss,
+                "blob size does not match the descriptor",
+            ));
+        }
         fs::rename(&staged, &final_path).map_err(|_| {
             PullError::new(
                 OciErrorCode::FailedPrecondition,
@@ -477,14 +489,21 @@ impl<C: RegistryPullClient> ImagePuller for OciImagePuller<C> {
             auth: &auth,
         };
         // 同一 digest の重複（同じ layer を複数回使う manifest）は 1 回だけ取得する。
-        let mut seen: Vec<&Digest> = Vec::new();
+        // 同一 digest で宣言サイズが食い違う descriptor は不正な manifest として拒否する（OCI-1）。
+        let mut seen: Vec<(&Digest, u64)> = Vec::new();
         for descriptor in std::iter::once(&manifest.config).chain(manifest.layers.iter()) {
-            if seen.contains(&&descriptor.digest) {
+            if let Some((_, size)) = seen.iter().find(|(d, _)| **d == descriptor.digest) {
+                if *size != descriptor.size {
+                    return Err(PullError::new(
+                        OciErrorCode::DataLoss,
+                        "duplicate blob descriptors declare different sizes",
+                    ));
+                }
                 continue;
             }
             self.check_deadline(started)?;
             self.ensure_blob(&ctx, &staging, &blobs, descriptor)?;
-            seen.push(&descriptor.digest);
+            seen.push((&descriptor.digest, descriptor.size));
         }
         drop(staging);
         // 最後の blob の取得・検証で期限を超えた場合も成功を返さない（REPAIR-5）。
@@ -502,6 +521,14 @@ impl<C: RegistryPullClient> ImagePuller for OciImagePuller<C> {
             Reference::Digest(_) => {
                 // oci が本文ハッシュと要求 digest を突合済み（不一致は DataLoss）。
                 repo_digests.push(format!("{name}@{}", resolved.manifest_digest.as_str()));
+            }
+        }
+        // index 経由なら index 本文の digest も登録する（tag / digest 参照とも oci が検証済みの値のみ。
+        // kubelet が `name@<index digest>` で ImageStatus / ListImages を引けるようにする。CRI-4）。
+        if let Some(index_digest) = &resolved.index_digest {
+            let entry = format!("{name}@{}", index_digest.as_str());
+            if !repo_digests.contains(&entry) {
+                repo_digests.push(entry);
             }
         }
         if repo_tags

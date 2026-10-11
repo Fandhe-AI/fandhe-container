@@ -615,6 +615,9 @@ pub struct ResolvedManifest {
     pub manifest_digest: Digest,
     /// image index / manifest list を経由して解決したか。
     pub from_index: bool,
+    /// index 経由の場合の、index 本文（生バイト列）の sha256。digest 参照では要求 digest と突合済み
+    /// （不一致は `DataLoss`。OCI-1）。直接取得した単一 manifest では `None`。
+    pub index_digest: Option<Digest>,
 }
 
 /// `Accept` に並べる manifest の `mediaType`（定数のみ）。
@@ -680,8 +683,9 @@ fn fetch_manifest_flow(
             selected_digest: None,
             manifest_digest,
             from_index: false,
+            index_digest: None,
         }),
-        (ParsedManifest::Index(index), _) => {
+        (ParsedManifest::Index(index), index_digest) => {
             let selected = select_manifest(&index, platform)?.digest.clone();
             match fetch_one(&Reference::Digest(selected.clone()))? {
                 (ParsedManifest::Image(manifest), manifest_digest) => Ok(ResolvedManifest {
@@ -689,6 +693,7 @@ fn fetch_manifest_flow(
                     selected_digest: Some(selected),
                     manifest_digest,
                     from_index: true,
+                    index_digest: Some(index_digest),
                 }),
                 _ => Err(OciError::new(
                     OciErrorCode::DataLoss,
@@ -1725,6 +1730,7 @@ mod tests {
         let t = FakeTransport::new(vec![manifest_resp(200, &image_body())]);
         let r = fetch(&t, &bearer(300), "x86_64").expect("fetch");
         assert!(!r.from_index);
+        assert_eq!(r.index_digest, None);
         assert_eq!(r.selected_digest, None);
         assert_eq!(r.manifest.layers.len(), 1);
         let seen = t.seen.lock().expect("lock");
@@ -2106,6 +2112,7 @@ mod tests {
             ]);
             let r = fetch(&t, &RegistryAuth::None, arch).expect("fetch");
             assert!(r.from_index);
+            assert!(r.index_digest.is_some());
             assert_eq!(r.manifest_digest.as_str(), format!("sha256:{want}"));
             assert_eq!(
                 r.selected_digest.as_ref().map(|d| d.as_str().to_string()),

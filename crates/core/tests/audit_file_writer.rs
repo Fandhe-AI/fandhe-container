@@ -116,3 +116,50 @@ fn sec4_task41_5_1_one_line_per_record() {
     assert_eq!(fs::read_to_string(&p).unwrap().lines().count(), 1);
     fs::remove_dir_all(&d).unwrap();
 }
+
+/// REPAIR-5・#1703: 複数の `AuditFileWriter` が公開 API 経由で並行に書いても、プロセス内の順番待ちで
+/// 全スレッドが期限切れ（`Lock`）にならず、全レコードが 1 行ずつ欠落・混在なく追記される。
+#[test]
+fn repair5_1703_concurrent_writers_all_succeed_without_interleaving() {
+    const THREADS: i32 = 8;
+    const PER_THREAD: i32 = 25;
+    let d = tmp("concurrent");
+    let p = d.join("audit.log");
+    drop(AuditFileWriter::open(&p).unwrap());
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let p = p.clone();
+            std::thread::spawn(move || {
+                let mut w = AuditFileWriter::open(&p).unwrap();
+                for i in 0..PER_THREAD {
+                    // pid = スレッド番号 * 1000 + 連番（スレッドごとの書き込み順を後で照合する）。
+                    w.write_record(&rec((t + 1) * 1000 + i + 1)).unwrap();
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let s = fs::read_to_string(&p).unwrap();
+    let pids_all: Vec<i32> = s
+        .lines()
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).expect("each line is JSON");
+            i32::try_from(v["pid"].as_i64().expect("pid is integer")).unwrap()
+        })
+        .collect();
+    assert_eq!(pids_all.len(), (THREADS * PER_THREAD) as usize);
+    for t in 0..THREADS {
+        let expected: Vec<i32> = (0..PER_THREAD).map(|i| (t + 1) * 1000 + i + 1).collect();
+        let found: Vec<i32> = pids_all
+            .iter()
+            .copied()
+            .filter(|pid| pid / 1000 == t + 1)
+            .collect();
+        assert_eq!(found, expected, "thread {t} records keep their order");
+    }
+    fs::remove_dir_all(&d).unwrap();
+}

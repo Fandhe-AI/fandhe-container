@@ -705,6 +705,16 @@ jobs:
         timeout-minutes: 5
         run: make vz-virtio-gpu-guest-check-selftest
 
+      # commit-msg フックの本文行長検査（scripts/check-commit-msg-line-length.sh）の自己テスト
+      # （Issue #1295・REPAIR-12）。一時ファイルと一時 git リポジトリだけを使い、ネットワーク・secrets・
+      # `${{ }}` の埋め込みは使わない。フックは開発者の macOS（BSD tr / awk）・Windows（Git Bash）でも
+      # 動くため 3 OS で回す。フック側では実行しない（.claude/rules/git-hooks.md）。新ジョブは
+      # check-run 名が増えるため既存ジョブのステップとする（check-run 件数は不変）
+      - name: commit-msg 行長検査スクリプトの自己テスト（#1295・REPAIR-12。ubuntu・macos・windows）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make commit-msg-line-length-selftest
+
       - name: AppArmor の非特権 user namespace 制限を緩和（unshare_isolation 用・Linux のみ。CORE-1・SEC-5）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 2

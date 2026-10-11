@@ -27,7 +27,7 @@ fandhe-container/
 ├── .editorconfig / .gitattributes # インデント・改行（LF 固定）・文字コード規約
 ├── skills-lock.json               # 導入スキルのロックファイル
 ├── Makefile                       # 開発タスク集約（lint-docs・fmt・clippy・test・doc・deny・docker-*。`make help`）
-├── lefthook.yml                   # git hooks（整形・秘密情報検査・commit-msg・pre-push）
+├── lefthook.yml                   # git hooks（staged の整形・秘密情報検査・commit-msg。CI と重複する検査は置かない）
 ├── commitlint.config.mjs          # commitlint 設定（type を 9 種に限定）
 ├── Dockerfile / compose.yaml      # 開発コンテナ（環境非依存の `make docker-ci`）
 ├── .markdownlint.jsonc / .yamllint / .editorconfig-checker.json  # lint-docs 設定
@@ -156,6 +156,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 | [dependency-policy.md](.claude/rules/dependency-policy.md) | **リポ固有**: フルスクラッチ・禁止クレート・`=x.y.z` 固定・ユーザー承認制 |
 | [licensing.md](.claude/rules/licensing.md) | **リポ固有**: 中核 Apache-2.0 単独・補助 crate の選択肢・コピーレフト禁止 |
 | [ci.md](.claude/rules/ci.md) | **リポ固有**: ローカルゲート・5 段階 CI ゲート・3 OS CI・実機前提テストの扱い |
+| [git-hooks.md](.claude/rules/git-hooks.md) | **リポ固有**: lefthook の時間予算・CI との役割分担（CI と重複する検査をフックに置かない） |
 
 ## Current Skills
 

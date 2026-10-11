@@ -29,8 +29,9 @@
 //!
 //! # 排他とタイムアウト（REPAIR-5）
 //!
-//! - プロセス内 `Mutex` は持たない。排他は `AuditFileWriter::write_record` の `flock`（open file description
-//!   単位）が担い、同一プロセスの別スレッド・別プロセスのいずれも直列化される
+//! - このシンクはプロセス内 `Mutex` を持たない。排他は `AuditFileWriter::write_record` の `flock`（open file
+//!   description 単位）が担い、別プロセス・別スレッドのいずれも直列化される。同一プロセス内の書き手は
+//!   `file_writer` 側の FIFO（#1703）で順番に並ぶが、本シンクは 1 レコードごとに子プロセスで書くため事実上使われない
 //! - **主経路のファイル I/O は fork した使い捨ての子プロセスで行い、親は [`PRIMARY_WRITE_TIMEOUT`] だけ待つ**。
 //!   `write_all`・`sync_data` には期限を付けられず（ストレージ停止で戻らない）、スレッドでの隔離は時間切れ後に
 //!   スレッドが残って以後の fork（exec の worker は `Threads: 1` 必須）を妨げるため、プロセスで隔離する。

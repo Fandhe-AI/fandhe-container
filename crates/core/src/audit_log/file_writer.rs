@@ -21,6 +21,11 @@
 //! - 書き込みは `flock`（排他）を `AUDIT_LOCK_TIMEOUT` を上限に取得してから 1 レコードずつ行う。複数の
 //!   writer（同一プロセス内・別プロセス）が同じファイルを開いても、`write_all` の複数 write の間に他者の
 //!   追記が割り込まず、行が混ざらない。ロック下で末尾が LF でなければ行頭 LF で破損行を隔離する
+//! - 同一プロセス内の書き手は、`flock` を取る前にプロセス全体で 1 本の FIFO（`TurnQueue`）に並び、
+//!   先頭の 1 者だけが `flock` をポーリングする。解放側は `flock` を手放してから次の待ち手へ順番を渡すため、
+//!   解放直後に取り直す書き手が他のスレッドを飢えさせない（#1703）。プロセス間は従来どおり `flock` の
+//!   ポーリングのみで、プロセス間の FIFO は保証しない（本番の `FileAuditSink` は 1 レコードごとに子プロセスで
+//!   書くため、プロセス内の待ち行列は事実上空である）
 //! - 部分書き込みで壊れた行は、次回書き込みの行頭に LF を付けて独立した行に隔離する（読み手は破損行を
 //!   読み飛ばす）。失敗時の重複（主経路に部分書き込み＋フォールバックにも記録）は許容し、欠落は許容しない
 //! - 非 Linux では symlink・所有者の信頼境界を検査できないため `open` は `Unimplemented` 相当の
@@ -31,10 +36,13 @@
 //! 代替経路の実体は `kernel_audit` の `KernelAuditFallback`（主経路の失敗時にだけカーネル監査へ送る）。
 //! 常時の二重記録（tee）によるクラッシュ・改ざん時の記録保持は未実装（REPAIR-3）。
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -43,9 +51,100 @@ use super::{AuditEvent, AuditRecord};
 use crate::traits::ErrorCode;
 
 /// 書き込みロック取得の待ち時間上限（REPAIR-5: 無期限に待たない）。
+///
+/// プロセス内の順番待ち（`TurnQueue`）と `flock` のポーリングを合わせた 1 本の期限として掛かる
+/// （2 段それぞれに 5 秒ずつ許して最大 10 秒待つことはしない）。
 const AUDIT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 /// ロック取得のリトライ間隔。
 const AUDIT_LOCK_RETRY: Duration = Duration::from_millis(5);
+
+/// プロセス内の書き手を到着順に並べる待ち行列（#1703・REPAIR-5）。
+///
+/// `flock` のポーリング（5ms 間隔）だけでは、`unlock` 直後に次のレコードの `try_lock` を呼ぶ書き手が、
+/// 眠っている他の書き手より常に先に取り直して飢えさせる。その結果、最後尾のスレッドの待ちが
+/// 「残りレコード数 ×（`write_all` + `sync_data`）」まで伸び、`sync_data` が遅い環境で期限（5 秒）を超えて
+/// `Lock` になっていた。先頭の 1 者だけが `flock` を取りに行き、解放後に次へ渡すことで取得を FIFO にする。
+///
+/// - 期限は呼び出し側が決めた 1 本の `deadline` を共有する。期限を過ぎた待ち手は自分のチケットを取り除いて
+///   `Err` を返し、後続を塞がない（呼び出し側は `Lock` として代替経路へ回す）
+/// - `Mutex` が poison されても `into_inner` で続行する。臨界区間は `VecDeque` の push・retain・先頭参照だけで、
+///   途中で panic しても不変条件が崩れないため。`LockFailed` に倒すと以後の書き込みがすべて代替経路へ回る
+/// - fork 安全性: `FileAuditSink` は単一スレッドの親から子を fork し、親はその時点で `write_record` の中に
+///   いない。子は空の待ち行列を引き継ぎ、他スレッドに握られた `Mutex` を引き継がない
+/// - 既知の限界（REPAIR-3）: 待ち行列はプロセスに 1 本で、別ファイルへの書き手も直列化する。あるファイルの
+///   `sync_data` が止まると、同じプロセスの別ファイルの書き手も期限まで待つ。本番は 1 本の `@audit.log` にだけ
+///   書く。`(dev, ino)` ごとの分離は将来課題
+struct TurnQueue {
+    waiting: Mutex<VecDeque<u64>>,
+    changed: Condvar,
+    next_ticket: AtomicU64,
+}
+
+/// 本番の書き込み経路が共有するプロセス全体の待ち行列。
+static AUDIT_WRITE_QUEUE: TurnQueue = TurnQueue::new();
+
+/// `TurnQueue` のチケットを保持している間だけ生きるガード。drop で自分のチケットを取り除き次へ通知する。
+struct TurnGuard<'q> {
+    queue: &'q TurnQueue,
+    ticket: u64,
+}
+
+impl TurnQueue {
+    const fn new() -> Self {
+        Self {
+            waiting: Mutex::new(VecDeque::new()),
+            changed: Condvar::new(),
+            next_ticket: AtomicU64::new(0),
+        }
+    }
+
+    fn lock_waiting(&self) -> MutexGuard<'_, VecDeque<u64>> {
+        self.waiting.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 末尾に並び、先頭になるまで `deadline` を上限に待つ。期限切れは `Err(())`（チケットは取り除き済み）。
+    fn enter(&self, deadline: Instant) -> Result<TurnGuard<'_>, ()> {
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+        self.lock_waiting().push_back(ticket);
+        // push 後に生成する。以降の return / panic でも drop が必ずチケットを取り除く。
+        let guard = TurnGuard {
+            queue: self,
+            ticket,
+        };
+        let mut waiting = self.lock_waiting();
+        loop {
+            // 先頭であっても期限切れなら通さない（期限超過後に起床して保持者の解放を見た場合も拒否。REPAIR-5）。
+            let now = Instant::now();
+            if now >= deadline {
+                // guard の drop が同じ Mutex を取るため、先に手放す。
+                drop(waiting);
+                return Err(());
+            }
+            if waiting.front() == Some(&ticket) {
+                drop(waiting);
+                return Ok(guard);
+            }
+            waiting = self
+                .changed
+                .wait_timeout(waiting, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    /// テスト用: 待ち行列の長さ（保持者を含む）。
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.lock_waiting().len()
+    }
+}
+
+impl Drop for TurnGuard<'_> {
+    fn drop(&mut self) {
+        self.queue.lock_waiting().retain(|t| *t != self.ticket);
+        self.queue.changed.notify_all();
+    }
+}
 
 /// 1 行（LF 含む）のバイト長上限。パス 4096 バイトの JSON エスケープ最大 6 倍＋固定部に収まる値。
 pub const AUDIT_LINE_MAX_BYTES: usize = 32 * 1024;
@@ -309,18 +408,38 @@ impl AuditFileWriter {
     /// 失敗時は panic せず `Err` を返す。呼び出し側は [`write_with_fallback`] で代替経路へ回す。
     pub fn write_record(&mut self, record: &AuditRecord) -> Result<(), AuditWriteError> {
         let line = encode_json_line(record)?;
-        self.lock_exclusive()?;
+        // `_turn` は `flock` の解放より後に drop される（宣言順の逆）。先に flock を手放してから次の待ち手へ
+        // 順番を渡すことで、受け渡しの隙間に他者の書き込みが割り込んでも行は混ざらない。
+        let _turn = self.lock_exclusive(&AUDIT_WRITE_QUEUE, Instant::now() + AUDIT_LOCK_TIMEOUT)?;
         let result = self.write_locked(&line);
         // 解放失敗は致命的ではない（fd を閉じれば解放される）。結果は書き込みの成否で決める。
         let _ = self.file.unlock();
         result
     }
 
-    fn lock_exclusive(&self) -> Result<(), AuditWriteError> {
-        let deadline = Instant::now() + AUDIT_LOCK_TIMEOUT;
+    /// プロセス内の順番待ち → `flock` のポーリングの順に、共通の `deadline` までに排他を取る。
+    fn lock_exclusive<'q>(
+        &self,
+        queue: &'q TurnQueue,
+        deadline: Instant,
+    ) -> Result<TurnGuard<'q>, AuditWriteError> {
+        let turn = queue
+            .enter(deadline)
+            .map_err(|()| AuditWriteError::new(AuditWriteErrorKind::Lock))?;
         loop {
+            // flock を試す前に期限を確認する（期限切れでファイル書き込みへ進ませない。REPAIR-5）。
+            if Instant::now() >= deadline {
+                return Err(AuditWriteError::new(AuditWriteErrorKind::Lock));
+            }
             match self.file.try_lock() {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    // 取得直後にも確認し、期限切れなら解放して拒否する。
+                    if Instant::now() >= deadline {
+                        let _ = self.file.unlock();
+                        return Err(AuditWriteError::new(AuditWriteErrorKind::Lock));
+                    }
+                    return Ok(turn);
+                }
                 Err(std::fs::TryLockError::WouldBlock) => {
                     if Instant::now() >= deadline {
                         return Err(AuditWriteError::new(AuditWriteErrorKind::Lock));
@@ -1183,6 +1302,79 @@ mod tests {
                 "{l}"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REPAIR-5・#1703: 解放直後に取り直す書き手より、先に並んだ待ち手が先に順番を得る。
+    #[test]
+    fn repair5_1703_queue_hands_off_to_waiter_before_reacquire() {
+        use std::sync::Arc;
+        let queue = Arc::new(TurnQueue::new());
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let far = || Instant::now() + Duration::from_secs(30);
+
+        let first = queue.enter(far()).unwrap();
+        let waiter = {
+            let (queue, order) = (Arc::clone(&queue), Arc::clone(&order));
+            std::thread::spawn(move || {
+                let _turn = queue.enter(far()).unwrap();
+                order.lock().unwrap().push("waiter");
+            })
+        };
+        // 待ち手が並ぶまで待つ（上限付き）。
+        let limit = Instant::now() + Duration::from_secs(10);
+        while queue.len() < 2 {
+            assert!(Instant::now() < limit, "waiter did not enqueue");
+            std::thread::yield_now();
+        }
+        drop(first);
+        // 解放の直後に取り直しても、待ち手の後ろに並ぶ。
+        let second = queue.enter(far()).unwrap();
+        order.lock().unwrap().push("main");
+        drop(second);
+        waiter.join().unwrap();
+        assert_eq!(*order.lock().unwrap(), vec!["waiter", "main"]);
+        assert_eq!(queue.len(), 0);
+    }
+
+    /// REPAIR-5・#1703: 順番待ちの期限切れは `Lock` になり、自分のチケットを取り除く。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair5_1703_queue_deadline_returns_lock_and_removes_ticket() {
+        let dir = fresh_dir("queue-deadline");
+        let path = dir.join("audit.log");
+        let queue = TurnQueue::new();
+        let holder = queue
+            .enter(Instant::now() + Duration::from_secs(30))
+            .unwrap();
+        let w = AuditFileWriter::open(&path).unwrap();
+        let err = w
+            .lock_exclusive(&queue, Instant::now() + Duration::from_millis(50))
+            .err()
+            .unwrap();
+        assert_eq!(err.kind, AuditWriteErrorKind::Lock);
+        assert_eq!(queue.len(), 1);
+        drop(holder);
+        assert_eq!(queue.len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REPAIR-5・#1703: 保持者が解放済みで期限切れの待ち手が先頭になった場合は拒否し、チケットを残さない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair5_1703_expired_waiter_at_front_is_rejected() {
+        let dir = fresh_dir("queue-expired-front");
+        let path = dir.join("audit.log");
+        let queue = TurnQueue::new();
+        let w = AuditFileWriter::open(&path).unwrap();
+        // 先頭（保持者なし）でも、期限が過ぎていれば enter / lock_exclusive は Lock で拒否する。
+        let past = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(queue.enter(past).is_err());
+        assert_eq!(queue.len(), 0);
+        let err = w.lock_exclusive(&queue, past).err().unwrap();
+        assert_eq!(err.kind, AuditWriteErrorKind::Lock);
+        assert_eq!(queue.len(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

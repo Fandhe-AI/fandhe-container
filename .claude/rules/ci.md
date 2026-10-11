@@ -11,7 +11,7 @@ make ci          # 上記 + lint-docs + deny を一括実行
 ```
 
 - テストは変更のたびに全件実行し、失敗・警告を 1 件でも残したまま進めない（fail-closed）
-- Cargo.toml・メンバー crate が未作成の間、cargo 系ターゲットは Makefile 側で skip される（HAS_CARGO / HAS_MEMBERS）
+- Cargo.toml・メンバー crate が未作成の間、cargo 系ターゲットは scripts/targets/ 側で skip される（Cargo.toml・メンバー crate の有無の判定。`scripts/lib.sh` の `skip_unless_workspace`）
 - git hooks（lefthook）はこれらを実行しない（CI と重複するため。[git-hooks](git-hooks.md)）。ローカルゲートは手動で通す
 
 ## CI の構成（REPAIR-7 の 5 段階ゲート）
@@ -26,7 +26,7 @@ make ci          # 上記 + lint-docs + deny を一括実行
 
 ステージ 3（タイムアウト保護された結合試験）は `platform-ci` ジョブ（PR は ubuntu のみ・main への push と `workflow_dispatch` は 3 OS の matrix。実行ステップ 10 分・ジョブ全体 60 分の timeout-minutes）が担う（TASK-86.2・#36。旧 `integration-test` ジョブ）。
 
-`platform-ci` ジョブは結合試験に続けて、スクリプトの自己テストを実行する（main への push と `workflow_dispatch` では 3 OS。Windows は Git Bash）: `make plug4-core-invariance-selftest`（PLUG-4 判定スクリプト。TASK-109.4）・`make cli-parity-selftest`（CLI 3 OS 比較。TASK-125.1・CLI-1）・`make vz-virtio-gpu-guest-check-selftest`（virtio-gpu ゲスト側確認スクリプト。合成 fixture のみ。TASK-172.6・GPU-6）・`make commit-msg-line-length-selftest`（commit-msg フックの本文行長検査。Issue #1295・REPAIR-12）。あわせて `make cli-parity-native-reclaim-check`（タイムアウト回収のネイティブ exe 実測。#1548）と `make cli-parity-native-reclaim-selftest`（その全体期限の自己テスト。#1688・REPAIR-5・REPAIR-12）も実行する。いずれもステップごとに timeout-minutes 5 を付け、新しいジョブ・check-run 名は増やさない。
+`platform-ci` ジョブは結合試験に続けて、スクリプトの自己テストを実行する（main への push と `workflow_dispatch` では 3 OS。Windows は Git Bash）: `make plug4-core-invariance-selftest`（PLUG-4 判定スクリプト。TASK-109.4）・`make cli-parity-selftest`（CLI 3 OS 比較。TASK-125.1・CLI-1）・`make vz-virtio-gpu-guest-check-selftest`（virtio-gpu ゲスト側確認スクリプト。合成 fixture のみ。TASK-172.6・GPU-6）・`make commit-msg-line-length-selftest`（commit-msg フックの本文行長検査。Issue #1295・REPAIR-12）。あわせて `make cli-parity-native-reclaim-check`（タイムアウト回収のネイティブ exe 実測。#1548）と `make cli-parity-native-reclaim-selftest`（その全体期限の自己テスト。#1688・REPAIR-5・REPAIR-12）も実行する（後者の ubuntu 分は約 90 秒の待ちでクリティカルパスだったため `bench-regression` の並列グループへ移した。macOS・Windows は main の `platform-ci` で実行する）。いずれもステップごとに timeout-minutes 5 を付け、新しいジョブ・check-run 名は増やさない。
 
 `cli-parity-native-reclaim-check` はスクリプト自身が wall clock の全体期限（既定 150 秒。`CLI_PARITY_RECLAIM_DEADLINE_SECS`）を持ち、超えたら子孫を回収して `deadline_exceeded` の行つきで失敗する（Windows でステップの timeout-minutes が効かずジョブ上限まで止まらなかったため。#1688）。ハング注入は `CLI_PARITY_RECLAIM_TEST_HANG`、止まり方の実証は `workflow_dispatch` の `reclaim-hang-probe` 入力（none / step-timeout / script-deadline。PR ブランチへ `--ref` で dispatch すると 3 OS で回り、concurrency group が PR の CI と衝突しない）で行う。PR の CI は ubuntu のみのため、Windows での確認は `workflow_dispatch` で行う。
 
@@ -36,7 +36,7 @@ rustdoc の警告（壊れた intra-doc リンク・private 項目へのリン�
 
 macOS cold start 上乗せ確認（TASK-113.4・PLUG-6・MAC-2）は `benches/tests/macos_cold_start.rs` の結合試験（`cfg(target_os = "macos")`。他 OS は skip を明示）として `platform-ci` の macos（main への push と `workflow_dispatch`）で実行する。`bench-regression`（ubuntu 単独）のジョブ構成は変えず、基準値比較にも接続しない（模擬制御コアの計測で、実バックエンドは TASK-115）。
 
-`bench-regression` ジョブは次の 17 個の `make` を ci.yml の並びどおりに実行する（自己テストはスタブ・疑似 /proc・fixture のみで照合し、実機は使わない）。
+`bench-regression` ジョブは次の 17 個の `make` を実行する（自己テストはスタブ・疑似 /proc・fixture のみで照合し、実機は使わない）。1〜13 の自己テスト（と下記の `make cli-parity-native-reclaim-selftest`）は互いに独立なため、`scripts/run-parallel.sh 3` で最大 3 並列に実行する（所要時間の短縮。経過秒を照合する自己テストがあるため同時実行数は 3 に絞る。1 つでも失敗すればジョブは失敗する）。14 以降は ci.yml の並びどおりに直列で実行する。
 
 1. `make fio-bench-selftest`（fio 4K ランダム write ベンチスクリプトの自己テスト。TASK-25.1・IO-8）
 2. `make fio-baseline-ratio-selftest`（fio ベースライン比の算出の自己テスト。TASK-25.2・IO-8）

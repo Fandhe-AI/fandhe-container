@@ -26,7 +26,7 @@ fandhe-container/
 ├── rust-toolchain.toml            # stable + rustfmt/clippy（単一真実源）
 ├── .editorconfig / .gitattributes # インデント・改行（LF 固定）・文字コード規約
 ├── skills-lock.json               # 導入スキルのロックファイル
-├── Makefile                       # 開発タスク集約（lint-docs・fmt・clippy・test・doc・deny・docker-*。`make help`）
+├── Makefile                       # 開発タスク集約の薄い入口（実体は scripts/。lint-docs・fmt・clippy・test・doc・deny・docker-*。`make help`。編集規約は .claude/rules/makefile.md）
 ├── lefthook.yml                   # git hooks（staged の整形・秘密情報検査・commit-msg。CI と重複する検査は置かない）
 ├── commitlint.config.mjs          # commitlint 設定（type を 9 種に限定）
 ├── Dockerfile / compose.yaml      # 開発コンテナ（環境非依存の `make docker-ci`）
@@ -46,7 +46,7 @@ fandhe-container/
 │   ├── cli/ / stack/              #   統一 CLI / 複数コンテナ定義（TOML スキーマ・起動順）
 │   ├── compose-convert/           #   compose.yaml → TOML 片方向変換ツール（fandhe-container-compose-convert）
 │   └── plugin-*/                  #   fandhe-container-plugin-cri / -macos / -windows / -microvm / -mcp
-├── scripts/                       # ベンチ回帰比較スクリプト（TASK-86.3・REPAIR-8）・baseline.json 生成スクリプト（scripts/bench/。TASK-88.1）・アイドル時常駐メモリ計測（scripts/bench/idle_memory.sh。TASK-45.1・CORE-7）・50 コンテナ同時起動の集約メモリ計測（scripts/bench/concurrent_50_memory.sh。own 側 TASK-50.1・Docker 側と統合レポート TASK-50.2・CORE-9・SUP-1）・監視プロセス常駐メモリ（PSS）計測（scripts/bench/supervisor_pss.sh。TASK-158・SUP-2）・ネットワーク作成/接続/削除の所要時間計測（scripts/bench/net_setup_timing.sh。TASK-139.5・NET-1／NET-4）・DNS ヘルパーの正答率・レイテンシ・常駐 PSS 計測（scripts/bench/dns_helper_measure.sh。TASK-141.3・NET-5）・監視プロセス独立性の実証スクリプト（scripts/verify-supervisor-independence.sh。TASK-162・SUP-5。実機実証は #499）・restart レイテンシ実機実測スクリプト（scripts/measure-restart-latency.sh。TASK-160・SUP-3。実測は #491）・fio 4K ランダム write ベンチスクリプト（TASK-25.1・IO-8）・fio ベースライン比の算出（TASK-25.2・IO-8。scripts/testdata/ に fixture）・PLUG-4 の core 不変性判定スクリプト（scripts/check-plug4-core-invariance.sh と自己テスト。TASK-109.4・PLUG-4）・CLI 基本 6 コマンドの 3 OS 比較スクリプト（scripts/cli-parity-check.sh。TASK-125.1・CLI-1。実機確認は #661）・commit-msg フックの本文行長検査（scripts/check-commit-msg-line-length.sh。Issue #1295）。deny.toml のライセンス fail-closed 自己テスト（scripts/deny-license-fail-closed-selftest.sh。TASK-90.2・OSS-4・OSS-5）。サードパーティのライセンス表記生成（scripts/generate-third-party-licenses.sh と自己テスト。TASK-103.1・OSS-5）。依存禁止判定等は（予定）
+├── scripts/                       # Makefile ターゲットの実体（targets/<target>.sh）・共通ヘルパー（lib.sh・versions.sh・with-tools.sh・with-workspace.sh・run-parallel.sh・help.sh）・ベンチ回帰比較スクリプト（TASK-86.3・REPAIR-8）・baseline.json 生成スクリプト（scripts/bench/。TASK-88.1）・アイドル時常駐メモリ計測（scripts/bench/idle_memory.sh。TASK-45.1・CORE-7）・50 コンテナ同時起動の集約メモリ計測（scripts/bench/concurrent_50_memory.sh。own 側 TASK-50.1・Docker 側と統合レポート TASK-50.2・CORE-9・SUP-1）・監視プロセス常駐メモリ（PSS）計測（scripts/bench/supervisor_pss.sh。TASK-158・SUP-2）・ネットワーク作成/接続/削除の所要時間計測（scripts/bench/net_setup_timing.sh。TASK-139.5・NET-1／NET-4）・DNS ヘルパーの正答率・レイテンシ・常駐 PSS 計測（scripts/bench/dns_helper_measure.sh。TASK-141.3・NET-5）・監視プロセス独立性の実証スクリプト（scripts/verify-supervisor-independence.sh。TASK-162・SUP-5。実機実証は #499）・restart レイテンシ実機実測スクリプト（scripts/measure-restart-latency.sh。TASK-160・SUP-3。実測は #491）・fio 4K ランダム write ベンチスクリプト（TASK-25.1・IO-8）・fio ベースライン比の算出（TASK-25.2・IO-8。scripts/testdata/ に fixture）・PLUG-4 の core 不変性判定スクリプト（scripts/check-plug4-core-invariance.sh と自己テスト。TASK-109.4・PLUG-4）・CLI 基本 6 コマンドの 3 OS 比較スクリプト（scripts/cli-parity-check.sh。TASK-125.1・CLI-1。実機確認は #661）・commit-msg フックの本文行長検査（scripts/check-commit-msg-line-length.sh。Issue #1295）。deny.toml のライセンス fail-closed 自己テスト（scripts/deny-license-fail-closed-selftest.sh。TASK-90.2・OSS-4・OSS-5）。サードパーティのライセンス表記生成（scripts/generate-third-party-licenses.sh と自己テスト。TASK-103.1・OSS-5）。依存禁止判定等は（予定）
 ├── benches/                       # crate をまたぐベンチ回帰（REPAIR-8。root の workspace メンバー crate fandhe-container-benches、publish = false。benches/benches/regression_placeholder.rs は TASK-86.3 のプレースホルダベンチ、baseline.json は暫定基準値。benches/benches/plugin_boundary.rs は TASK-113.1 の代表操作 A ベンチでゲート未接続、benches/benches/plugin_boundary_list_images.rs は TASK-113.2 の代表操作 B〔イメージ一覧〕計測ハーネス（ゲート未接続）、benches/benches/plugin_boundary_macos_cold_start.rs と benches/tests/macos_cold_start.rs は TASK-113.4 の macOS cold start 上乗せ確認（macOS のみ・ゲート未接続）、plugin 境界ベンチ〔TASK-113〕は実装済みで baseline 未登録のため bench-check の比較対象外、files/s・起動 p95 のベンチは担当タスク未定〔bench-calibration.md「既知の欠落」〕、基準値の校正記録は TASK-88.2、基準値の確定は TASK-88.h1・TASK-113.h1）
 ├── poc/                           # 製品外の PoC パッケージ（ルート workspace の外。crate 境界の確定一覧に含めない）
 │   ├── venus-decoder/jig/         #   venus 試験治具の capset アダプタ（独立 Cargo パッケージ。TASK-172.4・GPU-6。`make poc-venus-jig-check`。CI は platform-ci が実行〔PR は ubuntu・main は 3 OS〕。macOS 向け型検査は cross-target-check）
@@ -156,6 +156,8 @@ main セッションはオーケストレーションに徹し、調査・実装
 | [dependency-policy.md](.claude/rules/dependency-policy.md) | **リポ固有**: フルスクラッチ・禁止クレート・`=x.y.z` 固定・ユーザー承認制 |
 | [licensing.md](.claude/rules/licensing.md) | **リポ固有**: 中核 Apache-2.0 単独・補助 crate の選択肢・コピーレフト禁止 |
 | [ci.md](.claude/rules/ci.md) | **リポ固有**: ローカルゲート・5 段階 CI ゲート・3 OS CI・実機前提テストの扱い |
+| [makefile.md](.claude/rules/makefile.md) | **リポ固有**: Makefile は薄い入口・実体は scripts/・ターゲット追加時の手順・スクリプト規約 |
+| [github-actions.md](.claude/rules/github-actions.md) | **リポ固有**: runner 方針（public は GitHub ホステッド）・必須チェック名・発火条件・ジョブ追加チェックリスト・所要時間 |
 | [git-hooks.md](.claude/rules/git-hooks.md) | **リポ固有**: lefthook の時間予算・CI との役割分担（CI と重複する検査をフックに置かない） |
 
 ## Current Skills
@@ -164,7 +166,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 
 - **ワークフロー系**: create-commit / create-pr / create-issue / create-issue-tree / create-plan / implement-issue / implement-issue-tree / implement-review / implement-review-pr / update-issue-tree / update-docs / comment-code
 - **メンテ系**: init-claude / update-claude / contribute-skill / setup-repo-guards
-- **リファレンス系**: rust / github-docs / commitlint / lefthook / editorconfig / anthropic-claude-code / anthropic-claude-code-extend / anthropic-api-tools-mcp / nvidia-cuda / dgx-spark / proxmox-ve / windows-interop-modernize
+- **リファレンス系**: make / rust / github-docs / commitlint / lefthook / editorconfig / anthropic-claude-code / anthropic-claude-code-extend / anthropic-api-tools-mcp / nvidia-cuda / dgx-spark / proxmox-ve / windows-interop-modernize
 
 ## Conventions
 

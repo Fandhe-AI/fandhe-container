@@ -532,7 +532,9 @@ pub trait LaunchedProcess: Send {
 
     /// 起動時（fork 直後・回収前）に開いた pidfd の借用。exec の対象（pid1）をこの pidfd で固定するために
     /// supervisor が参照する（記録 pid や cgroup の所属に同一性を依存させない。SUP-6・SEC-1・CORE-1・
-    /// TASK-163 追補・#1461）。指す先は [`Self::pid`] と同じ PID 1 であること（#1463）。既定は `None`（pidfd を保持しない実装。呼び出し側は fail-closed にする）。
+    /// TASK-163 追補・#1461）。
+    /// 指す先は [`Self::pid`] と同じ PID 1 であること（#1463）。
+    /// 既定は `None`（pidfd を保持しない実装。呼び出し側は fail-closed にする）。
     #[cfg(target_os = "linux")]
     fn launch_pidfd(&self) -> Option<BorrowedFd<'_>> {
         None

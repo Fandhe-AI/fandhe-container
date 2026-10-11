@@ -1,8 +1,9 @@
 //! レジストリクライアント基盤: 接続先 URL の組み立てと HTTP `Agent` の構築（TASK-51.1・OCI-1）。
 //!
 //! #402（manifest 取得）・#403（blob のストリーミング取得）が共通で使う土台。通信する公開メソッドは
-//! 匿名トークン取得の `RegistryClient::authenticate_anonymous`（TASK-51.2・#401）のみで、manifest / blob の
-//! 取得は未実装（#402・#403 が `pub(crate)` の accessor を通して `Agent` を使う。digest 検証は #405。REPAIR-3）。
+//! 匿名トークン取得の `RegistryClient::authenticate_anonymous`（TASK-51.2・#401）と manifest 取得の
+//! `RegistryClient::fetch_manifest`（TASK-51.3・#402）で、blob の取得は未実装（#403 が `pub(crate)` の
+//! accessor を通して `Agent` を使う。digest 検証は #405。REPAIR-3）。
 //! OCI-3（資格情報つき認証）も未実装で、匿名のみ。
 //!
 //! 安全側の既定値:
@@ -18,6 +19,11 @@
 use crate::auth::{RegistryAuth, parse_token_response, parse_www_authenticate};
 use crate::error::{OciError, OciErrorCode, code_for_http_status};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
+use crate::manifest::{
+    ImageManifest, MANIFEST_MAX_BYTES, MEDIA_TYPE_DOCKER_LIST, MEDIA_TYPE_DOCKER_MANIFEST,
+    MEDIA_TYPE_OCI_INDEX, MEDIA_TYPE_OCI_MANIFEST, ParsedManifest, Platform, parse_manifest,
+    select_manifest,
+};
 use crate::reference::{Digest, Reference, RegistryHost, Repository};
 use crate::tls;
 use std::fmt::Debug;
@@ -92,6 +98,10 @@ pub struct RegistryClientConfig {
     pub token_request_timeout: Duration,
     /// トークンエンドポイント応答本文の最大バイト数。
     pub max_token_response_bytes: u64,
+    /// manifest 取得 1 リクエストあたりの全体期限（REPAIR-5）。
+    pub manifest_request_timeout: Duration,
+    /// manifest 応答本文の最大バイト数。
+    pub max_manifest_bytes: u64,
 }
 
 impl Default for RegistryClientConfig {
@@ -105,13 +115,15 @@ impl Default for RegistryClientConfig {
             max_response_header_bytes: 64 * 1024,
             token_request_timeout: Duration::from_secs(30),
             max_token_response_bytes: 64 * 1024,
+            manifest_request_timeout: Duration::from_secs(30),
+            max_manifest_bytes: MANIFEST_MAX_BYTES,
         }
     }
 }
 
 /// レジストリ通信の土台となる HTTP クライアント（TLS 設定済みの ureq `Agent` を保持する）。
 ///
-/// 匿名トークン取得は実装済み（#401）。manifest（#402）・blob（#403）の取得は未実装（OCI-1）。
+/// 匿名トークン取得（#401）と manifest 取得（#402）は実装済み。blob（#403）の取得は未実装（OCI-1）。
 #[derive(Debug)]
 pub struct RegistryClient {
     agent: Agent,
@@ -201,6 +213,37 @@ impl RegistryClient {
         )
     }
 
+    /// manifest を取得し、image index なら対象 platform の manifest まで解決する（TASK-51.3・OCI-1）。
+    ///
+    /// `reference` が tag / digest の image manifest ならそのまま、index / manifest list なら `platform` に
+    /// 一致するエントリの digest で 2 回目の取得をする（入れ子は 1 段のみ。2 段目が index なら `DataLoss`）。
+    /// `Authorization` は `auth` が Bearer のときだけ接続先レジストリへ送り、リダイレクトは追従しない。
+    /// 期限切れの Bearer は通信せず `PermissionDenied`（再取得は呼び出し側）。各リクエストに
+    /// `manifest_request_timeout` の全体期限と `max_manifest_bytes` の本文上限がある（REPAIR-5）。
+    ///
+    /// 戻り値は digest 未検証（本文ハッシュと参照 digest の突合は #405）。成功・失敗とエラー code・所要時間は
+    /// `with_recorder` の記録先へ 1 件記録する（REPAIR-4）。
+    pub fn fetch_manifest(
+        &self,
+        endpoint: &RegistryEndpoint,
+        repository: &Repository,
+        reference: &Reference,
+        auth: &RegistryAuth,
+        platform: &Platform,
+    ) -> Result<ResolvedManifest, OciError> {
+        record_oci_op(self.recorder.as_ref(), OciOpKind::FetchManifest, || {
+            fetch_manifest_flow(
+                self.transport.as_ref(),
+                &self.config,
+                endpoint,
+                repository,
+                reference,
+                auth,
+                platform,
+            )
+        })
+    }
+
     fn authenticate_anonymous_inner(
         &self,
         endpoint: &RegistryEndpoint,
@@ -225,6 +268,7 @@ fn anonymous_flow(
         public_only: false,
         body_limit: None,
         timeout,
+        headers: &[],
     })?;
     match probe.status {
         200 => return Ok(RegistryAuth::None),
@@ -248,6 +292,7 @@ fn anonymous_flow(
         public_only: !challenge.realm.is_registry_host(),
         body_limit: Some(config.max_token_response_bytes),
         timeout,
+        headers: &[],
     })?;
     if resp.status != 200 {
         return Err(status_error(resp.status));
@@ -261,6 +306,92 @@ fn anonymous_flow(
     Ok(RegistryAuth::Bearer(token))
 }
 
+/// `fetch_manifest` の結果（将来の項目追加に備え `non_exhaustive`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ResolvedManifest {
+    /// 解決された image manifest（digest 未検証。#405）。
+    pub manifest: ImageManifest,
+    /// image index から選んだ場合の、選択エントリの digest（直接取得した場合は `None`）。
+    pub selected_digest: Option<Digest>,
+    /// image index / manifest list を経由して解決したか。
+    pub from_index: bool,
+}
+
+/// `Accept` に並べる manifest の `mediaType`（定数のみ）。
+fn manifest_accept() -> String {
+    [
+        MEDIA_TYPE_OCI_MANIFEST,
+        MEDIA_TYPE_OCI_INDEX,
+        MEDIA_TYPE_DOCKER_MANIFEST,
+        MEDIA_TYPE_DOCKER_LIST,
+    ]
+    .join(", ")
+}
+
+/// manifest 取得の手順（通信は `transport` に委ねる。テストでは差し替える）。
+fn fetch_manifest_flow(
+    transport: &dyn RegistryTransport,
+    config: &RegistryClientConfig,
+    endpoint: &RegistryEndpoint,
+    repository: &Repository,
+    reference: &Reference,
+    auth: &RegistryAuth,
+    platform: &Platform,
+) -> Result<ResolvedManifest, OciError> {
+    let authorization = match auth {
+        RegistryAuth::Bearer(t) if t.is_expired(Instant::now()) => {
+            return Err(OciError::new(
+                OciErrorCode::PermissionDenied,
+                "registry token has expired",
+            ));
+        }
+        RegistryAuth::Bearer(t) => Some(t.authorization_header_value()),
+        _ => None,
+    };
+    let accept = manifest_accept();
+    let mut headers: Vec<(&str, &str)> = vec![("Accept", accept.as_str())];
+    if let Some(a) = &authorization {
+        headers.push(("Authorization", a.as_str()));
+    }
+    let fetch_one = |reference: &Reference| -> Result<ParsedManifest, OciError> {
+        let url = endpoint.manifest_url(repository, reference);
+        let resp = transport.get(&TransportRequest {
+            url: &url,
+            query: &[],
+            public_only: false,
+            body_limit: Some(config.max_manifest_bytes),
+            timeout: config.manifest_request_timeout,
+            headers: &headers,
+        })?;
+        if resp.status != 200 {
+            return Err(status_error(resp.status));
+        }
+        parse_manifest(&resp.body, resp.content_type.as_deref())
+    };
+    match fetch_one(reference)? {
+        ParsedManifest::Image(manifest) => Ok(ResolvedManifest {
+            manifest,
+            selected_digest: None,
+            from_index: false,
+        }),
+        ParsedManifest::Index(index) => {
+            let selected = select_manifest(&index, platform)?.digest.clone();
+            match fetch_one(&Reference::Digest(selected.clone()))? {
+                ParsedManifest::Image(manifest) => Ok(ResolvedManifest {
+                    manifest,
+                    selected_digest: Some(selected),
+                    from_index: true,
+                }),
+                _ => Err(OciError::new(
+                    OciErrorCode::DataLoss,
+                    "nested image index is not supported",
+                )),
+            }
+        }
+    }
+}
+
 /// 1 回の GET の指定（redirect は常に追従しない）。
 struct TransportRequest<'a> {
     url: &'a str,
@@ -271,6 +402,8 @@ struct TransportRequest<'a> {
     body_limit: Option<u64>,
     /// リクエスト全体の期限（REPAIR-5）。
     timeout: Duration,
+    /// 追加のリクエストヘッダ（`Accept`・`Authorization`。値は呼び出し側が組み立てた固定形式のみ）。
+    headers: &'a [(&'a str, &'a str)],
 }
 
 // 本文にトークンが含まれうるため、Debug はテストでのみ導出する（security.md）。
@@ -278,6 +411,7 @@ struct TransportRequest<'a> {
 struct TransportResponse {
     status: u16,
     www_authenticate: Vec<String>,
+    content_type: Option<String>,
     body: Vec<u8>,
 }
 
@@ -308,6 +442,9 @@ impl RegistryTransport for UreqTransport {
         for (k, v) in req.query {
             builder = builder.query(*k, *v);
         }
+        for (k, v) in req.headers {
+            builder = builder.header(*k, *v);
+        }
         let mut resp = builder.call().map_err(map_ureq_error)?;
         let status = resp.status().as_u16();
         let www_authenticate = resp
@@ -316,6 +453,10 @@ impl RegistryTransport for UreqTransport {
             .iter()
             .filter_map(|v| v.to_str().ok().map(str::to_string))
             .collect();
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok().map(str::to_string));
         let body = match req.body_limit {
             Some(limit) if status == 200 => resp
                 .body_mut()
@@ -328,6 +469,7 @@ impl RegistryTransport for UreqTransport {
         Ok(TransportResponse {
             status,
             www_authenticate,
+            content_type,
             body,
         })
     }
@@ -517,6 +659,8 @@ mod tests {
         let c = RegistryClientConfig::default();
         assert_eq!(c.token_request_timeout, Duration::from_secs(30));
         assert_eq!(c.max_token_response_bytes, 65536);
+        assert_eq!(c.manifest_request_timeout, Duration::from_secs(30));
+        assert_eq!(c.max_manifest_bytes, 4 * 1024 * 1024);
     }
 
     /// OCI-1: ureq エラーの写像は固定文で、分類が具体値どおり。
@@ -585,6 +729,7 @@ mod tests {
     struct FakeTransport {
         script: Mutex<Vec<Result<TransportResponse, OciError>>>,
         seen: Mutex<Vec<SeenRequest>>,
+        seen_headers: Mutex<Vec<Vec<(String, String)>>>,
         delay_first: Duration,
     }
 
@@ -593,6 +738,7 @@ mod tests {
             Self {
                 script: Mutex::new(script),
                 seen: Mutex::new(Vec::new()),
+                seen_headers: Mutex::new(Vec::new()),
                 delay_first: Duration::ZERO,
             }
         }
@@ -610,6 +756,12 @@ mod tests {
                 req.public_only,
                 req.body_limit,
             ));
+            self.seen_headers.lock().expect("lock").push(
+                req.headers
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            );
             if first {
                 std::thread::sleep(self.delay_first);
             }
@@ -621,6 +773,7 @@ mod tests {
         Ok(TransportResponse {
             status,
             www_authenticate: www.iter().map(|s| s.to_string()).collect(),
+            content_type: None,
             body: body.as_bytes().to_vec(),
         })
     }
@@ -819,6 +972,262 @@ mod tests {
         assert!(!tok.is_expired(Instant::now()));
     }
 
+    // ---- manifest 取得フローの照合（OCI-1・TASK-51.3・REPAIR-12。外部通信なし）----
+
+    const HX: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const HA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HB: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn image_body() -> String {
+        format!(
+            r#"{{"schemaVersion":2,"mediaType":"{MEDIA_TYPE_OCI_MANIFEST}","config":{{"mediaType":"c","digest":"sha256:{HX}","size":1}},"layers":[{{"mediaType":"l","digest":"sha256:{HX}","size":2}}]}}"#
+        )
+    }
+
+    fn index_body() -> String {
+        format!(
+            r#"{{"schemaVersion":2,"mediaType":"{MEDIA_TYPE_OCI_INDEX}","manifests":[{{"mediaType":"{MEDIA_TYPE_OCI_MANIFEST}","digest":"sha256:{HA}","size":1,"platform":{{"architecture":"amd64","os":"linux"}}}},{{"mediaType":"{MEDIA_TYPE_OCI_MANIFEST}","digest":"sha256:{HB}","size":1,"platform":{{"architecture":"arm64","os":"linux"}}}}]}}"#
+        )
+    }
+
+    fn manifest_resp(status: u16, body: &str) -> Result<TransportResponse, OciError> {
+        Ok(TransportResponse {
+            status,
+            www_authenticate: Vec::new(),
+            content_type: None,
+            body: body.as_bytes().to_vec(),
+        })
+    }
+
+    fn fetch(
+        t: &FakeTransport,
+        auth: &RegistryAuth,
+        arch: &str,
+    ) -> Result<ResolvedManifest, OciError> {
+        let (ep, repo) = alpine();
+        fetch_manifest_flow(
+            t,
+            &RegistryClientConfig::default(),
+            &ep,
+            &repo,
+            &Reference::Tag(crate::reference::Tag::parse("latest").expect("tag")),
+            auth,
+            &Platform::for_arch(arch).expect("platform"),
+        )
+    }
+
+    fn bearer(expires_in: u64) -> RegistryAuth {
+        let t = FakeTransport::new(vec![
+            resp(401, &[HUB_CHALLENGE], ""),
+            resp(
+                200,
+                &[],
+                &format!(r#"{{"token":"tok","expires_in":{expires_in}}}"#),
+            ),
+        ]);
+        run(&t).expect("auth")
+    }
+
+    /// OCI-1: tag の image manifest は 1 回の GET で解決し、Accept と Authorization を送る。
+    #[test]
+    fn manifest_direct_image() {
+        let t = FakeTransport::new(vec![manifest_resp(200, &image_body())]);
+        let r = fetch(&t, &bearer(300), "x86_64").expect("fetch");
+        assert!(!r.from_index);
+        assert_eq!(r.selected_digest, None);
+        assert_eq!(r.manifest.layers.len(), 1);
+        let seen = t.seen.lock().expect("lock");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].0,
+            "https://registry-1.docker.io/v2/library/alpine/manifests/latest"
+        );
+        assert!(!seen[0].2, "must not use the public-only path");
+        assert_eq!(seen[0].3, Some(MANIFEST_MAX_BYTES));
+        let h = t.seen_headers.lock().expect("lock");
+        assert_eq!(
+            h[0],
+            vec![
+                (
+                    "Accept".to_string(),
+                    format!(
+                        "{MEDIA_TYPE_OCI_MANIFEST}, {MEDIA_TYPE_OCI_INDEX}, {MEDIA_TYPE_DOCKER_MANIFEST}, {MEDIA_TYPE_DOCKER_LIST}"
+                    )
+                ),
+                ("Authorization".to_string(), "Bearer tok".to_string()),
+            ]
+        );
+    }
+
+    /// OCI-1: 認証なしでは Authorization を送らない。
+    #[test]
+    fn manifest_without_auth_sends_no_authorization() {
+        let t = FakeTransport::new(vec![manifest_resp(200, &image_body())]);
+        fetch(&t, &RegistryAuth::None, "x86_64").expect("fetch");
+        let h = t.seen_headers.lock().expect("lock");
+        assert_eq!(h[0].len(), 1);
+        assert_eq!(h[0][0].0, "Accept");
+    }
+
+    /// OCI-1: index はホスト platform の digest で 2 回目の GET をする（amd64 / arm64 の双方）。
+    #[test]
+    fn manifest_index_resolves_platform() {
+        for (arch, want) in [("x86_64", HA), ("aarch64", HB)] {
+            let t = FakeTransport::new(vec![
+                manifest_resp(200, &index_body()),
+                manifest_resp(200, &image_body()),
+            ]);
+            let r = fetch(&t, &RegistryAuth::None, arch).expect("fetch");
+            assert!(r.from_index);
+            assert_eq!(
+                r.selected_digest.as_ref().map(|d| d.as_str().to_string()),
+                Some(format!("sha256:{want}"))
+            );
+            let seen = t.seen.lock().expect("lock");
+            assert_eq!(seen.len(), 2);
+            assert_eq!(
+                seen[1].0,
+                format!("https://registry-1.docker.io/v2/library/alpine/manifests/sha256:{want}")
+            );
+        }
+    }
+
+    /// OCI-1: platform 不一致は NotFound で、2 回目の取得は起きない。
+    #[test]
+    fn manifest_index_without_platform_is_not_found() {
+        let t = FakeTransport::new(vec![manifest_resp(200, &index_body())]);
+        let e = fetch(&t, &RegistryAuth::None, "s390x").expect_err("none");
+        assert_eq!(e.code(), OciErrorCode::NotFound);
+        assert_eq!(t.seen.lock().expect("lock").len(), 1);
+    }
+
+    /// OCI-1: 入れ子の index は DataLoss（再帰しない）。
+    #[test]
+    fn manifest_nested_index_is_rejected() {
+        let t = FakeTransport::new(vec![
+            manifest_resp(200, &index_body()),
+            manifest_resp(200, &index_body()),
+        ]);
+        let e = fetch(&t, &RegistryAuth::None, "x86_64").expect_err("nested");
+        assert_eq!(e.code(), OciErrorCode::DataLoss);
+        assert_eq!(t.seen.lock().expect("lock").len(), 2);
+    }
+
+    /// OCI-1: HTTP ステータスと不正本文の分類（panic しない）。
+    #[test]
+    fn manifest_error_classification() {
+        for (status, code) in [
+            (404, OciErrorCode::NotFound),
+            (401, OciErrorCode::PermissionDenied),
+            (429, OciErrorCode::Unavailable),
+            (500, OciErrorCode::Unavailable),
+        ] {
+            let t = FakeTransport::new(vec![manifest_resp(status, "")]);
+            let e = fetch(&t, &RegistryAuth::None, "x86_64").expect_err("status");
+            assert_eq!((e.code(), e.http_status()), (code, Some(status)));
+        }
+        let t = FakeTransport::new(vec![manifest_resp(200, "{broken")]);
+        assert_eq!(
+            fetch(&t, &RegistryAuth::None, "x86_64")
+                .expect_err("json")
+                .code(),
+            OciErrorCode::DataLoss
+        );
+        let t = FakeTransport::new(vec![manifest_resp(
+            200,
+            r#"{"schemaVersion":2,"mediaType":"text/plain"}"#,
+        )]);
+        assert_eq!(
+            fetch(&t, &RegistryAuth::None, "x86_64")
+                .expect_err("type")
+                .code(),
+            OciErrorCode::Unimplemented
+        );
+    }
+
+    /// OCI-1: 期限切れの Bearer では通信せず PermissionDenied。
+    #[test]
+    fn manifest_expired_token_makes_no_request() {
+        let auth = {
+            let t = FakeTransport::new(vec![
+                resp(401, &[HUB_CHALLENGE], ""),
+                resp(
+                    200,
+                    &[],
+                    r#"{"token":"a","expires_in":60,"issued_at":"2020-01-01T00:00:00Z"}"#,
+                ),
+            ]);
+            run(&t).expect("auth")
+        };
+        let t = FakeTransport::new(vec![]);
+        let e = fetch(&t, &auth, "x86_64").expect_err("expired");
+        assert_eq!(e.code(), OciErrorCode::PermissionDenied);
+        assert!(t.seen.lock().expect("lock").is_empty());
+    }
+
+    /// OCI-1・REPAIR-4: 公開メソッド `fetch_manifest` の成功と失敗が 1 件ずつ記録される。
+    #[test]
+    fn fetch_manifest_public_api_records_outcomes() {
+        use crate::instrument::{OciOpKind, OciOpOutcome};
+        let (ep, repo) = alpine();
+        let reference = Reference::Tag(crate::reference::Tag::parse("latest").expect("tag"));
+        let p = Platform::for_arch("x86_64").expect("platform");
+        let rec = Arc::new(crate::instrument::testing::Collect::default());
+        let ok = client_with(
+            FakeTransport::new(vec![manifest_resp(200, &image_body())]),
+            rec.clone(),
+        );
+        ok.fetch_manifest(&ep, &repo, &reference, &RegistryAuth::None, &p)
+            .expect("ok");
+        let bad = client_with(
+            FakeTransport::new(vec![manifest_resp(404, "")]),
+            rec.clone(),
+        );
+        bad.fetch_manifest(&ep, &repo, &reference, &RegistryAuth::None, &p)
+            .expect_err("404");
+        let items = rec.items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind(), OciOpKind::FetchManifest);
+        assert_eq!(items[0].outcome(), OciOpOutcome::Success);
+        assert_eq!(items[1].outcome(), OciOpOutcome::Failure);
+        assert_eq!(items[1].error_code(), Some(OciErrorCode::NotFound));
+    }
+
+    /// OCI-1: 実 HTTP で追加ヘッダが送られ、Content-Type が返る。
+    #[test]
+    fn ureq_transport_sends_headers_and_reads_content_type() {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let (url, _srv) = serve_once(move |head| {
+            let _ = tx.send(head.to_string());
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {MEDIA_TYPE_OCI_MANIFEST}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            )
+            .into_bytes()
+        });
+        let t = loopback_transport(&RegistryClientConfig::default());
+        let r = t
+            .get(&TransportRequest {
+                url: &url,
+                query: &[],
+                public_only: false,
+                body_limit: Some(1024),
+                timeout: Duration::from_secs(5),
+                headers: &[
+                    ("Accept", "application/x-test"),
+                    ("Authorization", "Bearer t"),
+                ],
+            })
+            .expect("get");
+        let head = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("request")
+            .to_ascii_lowercase();
+        assert!(head.contains("accept: application/x-test"), "{head}");
+        assert!(head.contains("authorization: bearer t"), "{head}");
+        assert_eq!(r.content_type.as_deref(), Some(MEDIA_TYPE_OCI_MANIFEST));
+        assert_eq!(r.body, b"{}");
+    }
+
     /// `serve_once` のサーバースレッドの回収用ガード。drop で停止を通知して join する
     /// （接続が来なかったテストでもスレッドを残さない。REPAIR-5）。
     struct ServerGuard {
@@ -893,6 +1302,7 @@ mod tests {
             public_only: false,
             body_limit: limit,
             timeout,
+            headers: &[],
         })
     }
 
@@ -987,6 +1397,7 @@ mod tests {
                 public_only: true,
                 body_limit: Some(1024),
                 timeout: Duration::from_secs(5),
+                headers: &[],
             })
             .expect_err("loopback");
         assert_eq!(e.code(), OciErrorCode::PermissionDenied);

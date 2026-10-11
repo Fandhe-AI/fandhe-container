@@ -6,8 +6,8 @@
 //! 使う。非公開のレジストリは覗かないため、「失敗時に状態を変えない」ことは、上限を 1 件に絞った
 //! サービスで失敗の後に 1 件だけ登録できることから確かめる。
 //!
-//! 状態が `ready` で登録されることの直接の照合は、状態を読む RPC（Status/List。#431）がまだ
-//! `Unimplemented` のため `src/runtime_service.rs` のユニットテストが担う（REPAIR-3）。
+//! 状態の読み取りは `PodSandboxStatus`・`ListPodSandbox`（TASK-57.3・#431）で公開 API 経由に照合し、
+//! レジストリ内部との突き合わせは `src/runtime_service.rs` のユニットテストが担う。
 //! ネットワーク I/O（bind・listen）は行わない。
 
 use std::future::Future;
@@ -326,19 +326,19 @@ fn task_57_1_recorder_receives_every_outcome() {
     assert!(!format!("{service:?}").contains("do-not-record"));
 }
 
-/// TASK-57.1: Run/Stop/Remove 以外の RPC は `Unimplemented` のままで、記録先へ何も渡さない
-/// （#431・TASK-58 で実装するときに計測の種別も追加する。REPAIR-3）。
+/// TASK-57.1: 未実装の RPC（Container 系）は `Unimplemented` のままで、記録先へ何も渡さない
+/// （TASK-58 で実装するときに計測の種別も追加する。REPAIR-3）。
 #[test]
 fn task_57_1_other_rpcs_remain_unimplemented() {
     let collect = Arc::new(Collect::default());
     let service = CriRuntimeService::with_recorder(collect.clone());
-    let err = block_on(RuntimeService::pod_sandbox_status(
+    let err = block_on(RuntimeService::container_status(
         &service,
-        Request::new(v1::PodSandboxStatusRequest::default()),
+        Request::new(v1::ContainerStatusRequest::default()),
     ))
     .expect_err("not implemented yet");
     assert_eq!(err.code(), Code::Unimplemented);
-    assert_eq!(err.message(), "pod_sandbox_status");
+    assert_eq!(err.message(), "container_status");
     assert_eq!(collect.lines(), vec![]);
 }
 /// 公開トレイト経由で `StopPodSandbox` を呼ぶ。
@@ -408,4 +408,72 @@ fn task_57_2_stop_remove_recorded_by_recorder() {
             ("cri.remove_pod_sandbox", "success", "OK"),
         ]
     );
+}
+
+/// 公開トレイト経由で `PodSandboxStatus` を呼ぶ。
+fn status(service: &CriRuntimeService, id: &str) -> Result<v1::PodSandboxStatusResponse, Code> {
+    let request = Request::new(v1::PodSandboxStatusRequest {
+        pod_sandbox_id: id.into(),
+        verbose: false,
+    });
+    block_on(RuntimeService::pod_sandbox_status(service, request))
+        .map(|r| r.into_inner())
+        .map_err(|s| s.code())
+}
+
+/// 公開トレイト経由で `ListPodSandbox` を呼び、(ID, state) の列を返す。
+fn list_ids(service: &CriRuntimeService) -> Vec<(String, i32)> {
+    let request = Request::new(v1::ListPodSandboxRequest { filter: None });
+    block_on(RuntimeService::list_pod_sandbox(service, request))
+        .map(|r| {
+            r.into_inner()
+                .items
+                .into_iter()
+                .map(|i| (i.id, i.state))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+/// CRI-1・TASK-57.3: Run -> List -> Stop -> Status -> Remove -> List/Status の一連が整合する。
+#[test]
+fn task_57_3_status_and_list_follow_lifecycle() {
+    let service = CriRuntimeService::new();
+    let id = run(&service, Some(config("p")), "").expect("run");
+    assert_eq!(list_ids(&service), vec![(id.clone(), 0)]);
+
+    let ready = status(&service, &id).expect("status");
+    let st = ready.status.expect("status body");
+    assert_eq!(st.id, id);
+    assert_eq!(st.state, 0);
+    assert_eq!(st.labels.get("k").map(String::as_str), Some("v"));
+    assert_eq!(st.annotations.get("a").map(String::as_str), Some("b"));
+    assert!(st.created_at > 0 && ready.timestamp > 0);
+
+    stop(&service, &id).expect("stop");
+    assert_eq!(
+        status(&service, &id)
+            .expect("status")
+            .status
+            .map(|s| s.state),
+        Some(1)
+    );
+    assert_eq!(list_ids(&service), vec![(id.clone(), 1)]);
+
+    remove(&service, &id).expect("remove");
+    assert_eq!(list_ids(&service), vec![]);
+    assert_eq!(status(&service, &id).unwrap_err(), Code::NotFound);
+    assert_eq!(status(&service, "").unwrap_err(), Code::InvalidArgument);
+}
+
+/// CRI-1・TASK-57.3: 枠を 1 件に絞った構成でも、Remove 後に List が空になり再登録できる。
+#[test]
+fn task_57_3_list_is_consistent_with_limited_registry() {
+    let service = CriRuntimeService::with_max_sandboxes(1);
+    let id = run(&service, Some(config("p")), "").expect("run");
+    assert!(run(&service, Some(config("q")), "").is_err());
+    assert_eq!(list_ids(&service).len(), 1);
+    remove(&service, &id).expect("remove");
+    assert_eq!(list_ids(&service), vec![]);
+    let again = run(&service, Some(config("q")), "").expect("run again");
+    assert_eq!(list_ids(&service), vec![(again, 0)]);
 }

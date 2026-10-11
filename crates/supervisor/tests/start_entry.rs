@@ -893,3 +893,90 @@ fn core3_release_failure_after_report_exits_internal() {
         other => panic!("unexpected report: {other:?}"),
     }
 }
+
+/// Stopped への書き込みだけを、指定回数まで FailedPrecondition（revision 競合の代わり）で失敗させる状態ストア。
+struct FlakyStoppedStore {
+    inner: Arc<dyn StateStore>,
+    fail_stopped: Mutex<u32>,
+}
+
+impl StateStore for FlakyStoppedStore {
+    fn create(
+        &self,
+        req: &fandhe_container_core::traits::CreateStateRequest,
+    ) -> Result<StateRecord, TraitError> {
+        self.inner.create(req)
+    }
+    fn update(&self, req: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
+        let fail = req.status().state() == ContainerState::Stopped && {
+            let mut left = self.fail_stopped.lock().unwrap();
+            let fail = *left > 0;
+            *left = left.saturating_sub(1);
+            fail
+        };
+        if fail {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "revision conflict",
+            ));
+        }
+        self.inner.update(req)
+    }
+    fn get(&self, req: &GetStateRequest) -> Result<StateRecord, TraitError> {
+        self.inner.get(req)
+    }
+    fn list(
+        &self,
+        req: &fandhe_container_core::traits::ListStateRequest,
+    ) -> Result<fandhe_container_core::traits::StateList, TraitError> {
+        self.inner.list(req)
+    }
+    fn delete(
+        &self,
+        req: &fandhe_container_core::traits::DeleteStateRequest,
+    ) -> Result<fandhe_container_core::traits::DeleteStateResponse, TraitError> {
+        self.inner.delete(req)
+    }
+}
+
+/// 監視の失敗で回収したあとに Stopped の記録を試みる（試験用の共通手順）。`fail_stopped` 回だけ Stopped の書き込みが
+/// 失敗する。終了コードと最終的な状態を返す。
+fn dispose_with_flaky_stopped(tag: &str, fail_stopped: u32) -> (u8, ContainerState) {
+    let env = Env::new(tag);
+    env.create(&env.id);
+    let calls = new_calls();
+    let mut fl = FakeLauncher::new(&calls);
+    fl.wait_mode = WaitMode::Error(ErrorCode::Timeout);
+    let (d, _l) = deps(&calls, fl);
+    let running =
+        start_with(&env, d, &env.id, &short_timeouts(), &mut Vec::new()).expect("started");
+    let flaky: Arc<dyn StateStore> = Arc::new(FlakyStoppedStore {
+        inner: env.store.clone(),
+        fail_stopped: Mutex::new(fail_stopped),
+    });
+    let code = run_supervised(
+        flaky,
+        cid(&env.id),
+        running,
+        RestartPolicy::No,
+        &short_timeouts(),
+        &StopToken::new(),
+    );
+    (code, env.record(&env.id).status().state())
+}
+
+/// SUP-1・CORE-2: Stopped の記録が一時的に失敗しても、照合を保った再試行で記録して元の終了コードで終わる。
+#[test]
+fn sup1_mark_stopped_retries_transient_failures() {
+    let (code, state) = dispose_with_flaky_stopped("mkretry", 2);
+    assert_eq!(code, exit_code_for(ErrorCode::Timeout).get());
+    assert_eq!(state, ContainerState::Stopped);
+}
+
+/// SUP-1・CORE-2: Stopped の記録が再試行の上限（3 回）まで失敗したら、終了コードは INTERNAL。
+#[test]
+fn sup1_mark_stopped_failure_exits_internal() {
+    let (code, state) = dispose_with_flaky_stopped("mkfail", 3);
+    assert_eq!(code, exit_code_for(ErrorCode::Internal).get());
+    assert_eq!(state, ContainerState::Running);
+}

@@ -220,6 +220,15 @@ enum TerminateSlot {
     Abandoned,
 }
 
+/// 実行スレッドの終了時に [`LateOrphans`] へ通知するガード。
+struct LateWorkerGuard(LateOrphans);
+
+impl Drop for LateWorkerGuard {
+    fn drop(&mut self) {
+        self.0.worker_finished();
+    }
+}
+
 /// [`terminate_bounded`] の失敗。
 enum TerminateFailure {
     /// 期限内に `Err` で戻った（または実行スレッドを作れなかった）。ハンドルは手元にあり再試行できる。
@@ -232,19 +241,26 @@ enum TerminateFailure {
 ///
 /// 実装が `timeout` を守らず戻らない場合も、本関数は `timeout` に猶予を足した時点で `Pending` を返す。
 /// 回収を確かめられたら回収した pid を返す。`Err` で戻ったハンドルは捨てずに返す（再試行のため）。
+/// 実行スレッドは `late` に登録し、待ちを打ち切った後に terminate が成功したら pid を `late` に積む
+/// （restart の後始末と同じ仕組み。呼び出し側は [`LateOrphans::wait_settled`] の後に `take_reaped` で受け取る）。
 fn terminate_bounded(
     process: Box<dyn LaunchedProcess>,
     timeout: Duration,
+    late: &LateOrphans,
 ) -> Result<NonZeroU32, TerminateFailure> {
     let pid = process.pid();
     let cell = Arc::new(Mutex::new(Some(process)));
     // 結果の引き渡しと待ちの放棄を同じ Mutex 配下で決める（期限後に戻ったハンドルを必ず保管先へ移す。CORE-1・REPAIR-5）。
     let shared: Arc<(Mutex<TerminateSlot>, Condvar)> =
         Arc::new((Mutex::new(TerminateSlot::Pending), Condvar::new()));
-    let (worker_cell, worker_shared) = (Arc::clone(&cell), Arc::clone(&shared));
+    let (worker_cell, worker_shared, worker_late) =
+        (Arc::clone(&cell), Arc::clone(&shared), late.clone());
+    late.worker_started();
     let spawned = std::thread::Builder::new()
         .name("supervisor-terminate".into())
         .spawn(move || {
+            // 全経路（panic を含む）で実行スレッドの終了を通知する。
+            let _finished = LateWorkerGuard(worker_late.clone());
             let taken = worker_cell
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -256,10 +272,11 @@ fn terminate_bounded(
             let (lock, cvar) = &*worker_shared;
             let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
             if matches!(*slot, TerminateSlot::Abandoned) {
-                // 受け手は待ちをやめた。`Err` のハンドルは捨てずに保管する（`Ok` は回収済み）。
+                // 受け手は待ちをやめた。`Err` のハンドルは捨てずに保管し、`Ok` は回収済みの pid を残す。
                 drop(slot);
-                if result.is_err() {
-                    keep_stranded(p);
+                match result {
+                    Ok(()) => worker_late.push_reaped(pid),
+                    Err(_) => keep_stranded(p),
                 }
                 return;
             }
@@ -267,6 +284,7 @@ fn terminate_bounded(
             cvar.notify_all();
         });
     if spawned.is_err() {
+        late.worker_finished();
         log_event("terminate_thread_failed", None);
         let left = cell.lock().unwrap_or_else(PoisonError::into_inner).take();
         return Err(left.map_or(TerminateFailure::Pending, TerminateFailure::Returned));
@@ -305,13 +323,25 @@ fn terminate_bounded(
 /// [`terminate_bounded`] を、`Err` で戻ったハンドルについて 1 回だけ再試行する。回収できたらその pid。
 ///
 /// 再試行も失敗したハンドルは [`STRANDED`] に保管する（`Drop` で捨てて子を孤児化させない）。
+/// 待ちを打ち切った後に成功した回収は、もう 1 回分の期限（`timeout`＋猶予）まで待って pid を返す。
 /// 1 回の待ちは `timeout`＋猶予で打ち切るため、全体も有限時間で終わる（REPAIR-5）。
 fn terminate_retrying(process: Box<dyn LaunchedProcess>, timeout: Duration) -> Option<NonZeroU32> {
+    let pid = process.pid();
+    let late = LateOrphans::default();
     let mut process = process;
     for _ in 0..2 {
-        match terminate_bounded(process, timeout) {
+        match terminate_bounded(process, timeout, &late) {
             Ok(pid) => return Some(pid),
-            Err(TerminateFailure::Pending) => return None,
+            Err(TerminateFailure::Pending) => {
+                // 待ちを打ち切った後に成功した回収も、もう 1 回分の期限まで待って受け取る（Stopped 記録の対象。
+                // SUP-1・CORE-2）。それでも戻らなければ確かめられなかった扱い。
+                let settled = late.wait_settled(timeout.saturating_add(LAUNCHER_REPLY_GRACE));
+                if settled && late.take_reaped().contains(&pid) {
+                    log_event("handle_terminated_late", None);
+                    return Some(pid);
+                }
+                return None;
+            }
             Err(TerminateFailure::Returned(p)) => process = p,
         }
     }
@@ -448,7 +478,8 @@ fn start_reporting(
             match terminate_retrying(process, timeouts.terminate()) {
                 Some(pid) => {
                     log_event("late_start_terminated", None);
-                    mark_stopped(store, req.id(), instance, &[pid]);
+                    // 終了コードは既に Internal。記録の失敗はログに残る。
+                    let _ = mark_stopped(store, req.id(), instance, &[pid]);
                 }
                 None => log_event("late_start_terminate_failed", None),
             }
@@ -651,7 +682,7 @@ fn abandoned_cleanup(
         Attempt::Started(running) => {
             // 入口の期限後の成功と同じく、terminate できたら照合つきで Stopped を記録する（SUP-1・CORE-2）。
             if let Some(pid) = terminate_retrying(running.process, timeouts.terminate()) {
-                mark_stopped(store, id, running.instance, &[pid]);
+                let _ = mark_stopped(store, id, running.instance, &[pid]);
             }
         }
         Attempt::Failed { cleanup, .. } => {
@@ -944,29 +975,52 @@ fn dispose(
     (ok, reaped)
 }
 
+/// [`mark_stopped`] の試行回数と間隔（全体は数百 ms で、後始末の期限に比べ十分短い）。
+const MARK_STOPPED_ATTEMPTS: u32 = 3;
+const MARK_STOPPED_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
 /// 回収を確かめられたハンドルに対応する Running の記録を、`Stopped` に落として監視権を解除する
-/// （best effort。inspect が死んだ pid を生存中と表示せず、delete が拒否されないようにする。SUP-1・CORE-2）。
+/// （inspect が死んだ pid を生存中と表示せず、delete が拒否されないようにする。SUP-1・CORE-2）。
 ///
-/// 同じ ID が回収中に削除・再作成されていても別インスタンスを上書きしないよう、最新レコードを読み直したうえで
+/// 同じ ID が回収中に削除・再作成されていても別インスタンスを上書きしないよう、試行ごとに最新レコードを読み直し、
 /// 次を満たすときだけ書く（SEC-1）: cgroup の instance が start 時と一致／状態が Running で pid が回収済みの pid
 /// のいずれか／`supervisor_pid` が無いか自プロセス。書き込みは読んだ revision への楽観的排他。
-/// 失敗・不一致はログに出すだけで終了コードは変えない（元のエラーを隠さない）。
+/// 読み取り・書き込みの失敗（health の更新との revision 競合等）は [`MARK_STOPPED_ATTEMPTS`] 回まで再試行する。
+/// 記録できたか、照合に合わず書くべき記録が無ければ `true`、最後まで失敗したら `false`（呼び出し側が INTERNAL に
+/// する）。
 fn mark_stopped(
     store: &Arc<dyn StateStore>,
     id: &ContainerId,
     instance: Option<StateRevision>,
     reaped: &[NonZeroU32],
-) {
+) -> bool {
     if reaped.is_empty() {
-        return;
+        return true;
     }
-    let record = match store.get(&GetStateRequest::new(id.clone())) {
-        Ok(r) => r,
-        Err(e) => {
-            log_event("mark_stopped_failed", Some(e.code()));
-            return;
+    for attempt in 1..=MARK_STOPPED_ATTEMPTS {
+        match try_mark_stopped(store.as_ref(), id, instance, reaped) {
+            Ok(()) => return true,
+            Err(code) => {
+                log_event("mark_stopped_failed", Some(code));
+                if attempt < MARK_STOPPED_ATTEMPTS {
+                    std::thread::sleep(MARK_STOPPED_RETRY_INTERVAL);
+                }
+            }
         }
-    };
+    }
+    false
+}
+
+/// [`mark_stopped`] の 1 回の試行。照合に合わなければ書かずに `Ok`（別インスタンス・別の監視者の記録）。
+fn try_mark_stopped(
+    store: &dyn StateStore,
+    id: &ContainerId,
+    instance: Option<StateRevision>,
+    reaped: &[NonZeroU32],
+) -> Result<(), ErrorCode> {
+    let record = store
+        .get(&GetStateRequest::new(id.clone()))
+        .map_err(|e| e.code())?;
     let status = record.status();
     let same_instance = record.cgroup().map(|c| c.instance()) == instance;
     let same_process = status.state() == ContainerState::Running
@@ -977,7 +1031,7 @@ fn mark_stopped(
         .is_none_or(|p| p.get() == std::process::id());
     if !(same_instance && same_process && ours) {
         log_event("mark_stopped_skipped", None);
-        return;
+        return Ok(());
     }
     let supervision = SupervisionState::new(None, record.health(), record.restart_count());
     let req = UpdateStateRequest::new(
@@ -985,12 +1039,11 @@ fn mark_stopped(
         record.revision(),
     )
     .with_supervision(supervision);
-    if let Err(e) = store.update(&req) {
-        log_event("mark_stopped_failed", Some(e.code()));
-    }
+    store.update(&req).map(drop).map_err(|e| e.code())
 }
 
-/// 回収の結果を終了コードにまとめる。確かめられたものは `Stopped` を記録し、`code` を返す。確かめられなければ `Internal`。
+/// 回収の結果を終了コードにまとめる。確かめられたものは `Stopped` を記録し、`code` を返す。回収または記録を
+/// 確かめられなければ `Internal`。
 fn finish_disposed(
     store: &Arc<dyn StateStore>,
     id: &ContainerId,
@@ -999,8 +1052,7 @@ fn finish_disposed(
     code: u8,
 ) -> u8 {
     let (ok, reaped) = disposed;
-    if ok {
-        mark_stopped(store, id, instance, &reaped);
+    if ok && mark_stopped(store, id, instance, &reaped) {
         code
     } else {
         exit_code_for(ErrorCode::Internal).get()
@@ -1204,13 +1256,31 @@ mod linux {
             let delegated = DelegatedCgroup::detect().map_err(to_trait)?;
             let plan = CgroupLimitPlan::for_privilege(privilege);
             let recorder = OpRecorder::new();
-            let chain = delegated
+            let prepared = delegated
                 .record_scope(store, observed)
                 .and_then(|r| r.create_cgroup())
-                .and_then(|p| p.apply_limits(&recorder, &plan))
+                .map_err(to_trait)?;
+            // mkdir の後の段（制限・参加フック）の失敗は core が巻き戻さないため、作った cgroup を消してから返す
+            // （削除は有限回の再試行。削除の失敗もエラーに含める。CORE-3）。
+            let name = prepared.cgroup().name().clone();
+            let start_cgroup = match prepared
+                .apply_limits(&recorder, &plan)
                 .and_then(|l| l.into_join())
-                .map_err(to_trait);
-            let start_cgroup = chain?;
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    return Err(match remove_named_bounded(&delegated, &name) {
+                        Ok(()) => TraitError::new(e.code, "failed to prepare the container cgroup"),
+                        Err(code) => TraitError::new(
+                            e.code,
+                            format!(
+                                "failed to prepare the container cgroup; removing it also failed: {}",
+                                code.as_str()
+                            ),
+                        ),
+                    });
+                }
+            };
             let instance = start_cgroup.record().cgroup().map(|c| c.instance());
             self.start_cgroup = Some(start_cgroup);
             self.delegated = Some(delegated);
@@ -1240,6 +1310,34 @@ mod linux {
                 .remove_child(start_cgroup.cgroup())
                 .map_err(|e| TraitError::new(e.code, "failed to remove the container cgroup"))
         }
+    }
+
+    /// 準備途中の cgroup の削除の試行回数と間隔（全体で数百 ms。有限）。
+    const CGROUP_REMOVE_ATTEMPTS: u32 = 5;
+    const CGROUP_REMOVE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
+    /// 名前で開き直したコンテナ用 cgroup を、有限回の再試行で消す（既に無ければ成功）。失敗はそのコード。
+    fn remove_named_bounded(
+        delegated: &DelegatedCgroup,
+        name: &fandhe_container_core::cgroups::CgroupName,
+    ) -> Result<(), ErrorCode> {
+        let mut last = ErrorCode::Internal;
+        for attempt in 1..=CGROUP_REMOVE_ATTEMPTS {
+            let result = match delegated.open_child(name) {
+                Ok(None) => return Ok(()),
+                Ok(Some(child)) => delegated.remove_child(&child),
+                Err(e) => Err(e),
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(e) => last = e.code,
+            }
+            if attempt < CGROUP_REMOVE_ATTEMPTS {
+                std::thread::sleep(CGROUP_REMOVE_RETRY_INTERVAL);
+            }
+        }
+        log_event("cgroup_remove_failed", Some(last));
+        Err(last)
     }
 
     /// 結果チャネル（stdout）を複製して取り、FIFO であることを確かめる（std の安全な API のみ）。
@@ -1356,6 +1454,42 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// terminate が呼び出し側の期限より遅れて成功する起動ハンドル。
+    struct SlowOk(u32, Duration);
+
+    impl LaunchedProcess for SlowOk {
+        fn pid(&self) -> NonZeroU32 {
+            NonZeroU32::new(self.0).unwrap()
+        }
+        fn wait(
+            &self,
+            _: Duration,
+        ) -> Result<Option<fandhe_container_core::oci_runtime::ProcessExit>, TraitError> {
+            Ok(None)
+        }
+        fn terminate(&self, _: Duration) -> Result<(), TraitError> {
+            std::thread::sleep(self.1);
+            Ok(())
+        }
+    }
+
+    /// SUP-1・CORE-2・REPAIR-5: 待ちの期限を過ぎてから terminate が成功しても、もう 1 回分の期限内なら回収済みの pid
+    /// を返す（Stopped 記録の対象にする）。それより遅ければ確かめられなかった扱い（`None`）。
+    #[test]
+    fn sup1_terminate_retrying_returns_late_reaped_pid() {
+        let timeout = Duration::from_millis(10);
+        let late = timeout + LAUNCHER_REPLY_GRACE + Duration::from_millis(300);
+        assert_eq!(
+            terminate_retrying(Box::new(SlowOk(91, late)), timeout).map(NonZeroU32::get),
+            Some(91)
+        );
+        let too_late = (timeout + LAUNCHER_REPLY_GRACE) * 2 + Duration::from_millis(500);
+        assert_eq!(
+            terminate_retrying(Box::new(SlowOk(92, too_late)), timeout),
+            None
+        );
+    }
 
     /// REPAIR-5: 報告の書き込み上限は `min(5s, 残り)`。期限を過ぎていれば 0、期限が無ければ 5s。
     #[test]

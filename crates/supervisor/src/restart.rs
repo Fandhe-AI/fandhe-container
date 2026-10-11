@@ -375,14 +375,14 @@ impl LateOrphans {
         self.inner.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// 実行スレッドの起動前に呼ぶ。
-    fn worker_started(&self) {
+    /// 実行スレッドの起動前に呼ぶ（`start_entry` の terminate の実行スレッドも使う）。
+    pub(crate) fn worker_started(&self) {
         let mut g = self.lock();
         g.active_workers = g.active_workers.saturating_add(1);
     }
 
     /// 実行スレッドの終了時（panic・起動失敗を含む）に呼ぶ。待機者を起こす。
-    fn worker_finished(&self) {
+    pub(crate) fn worker_finished(&self) {
         let mut g = self.lock();
         g.active_workers = g.active_workers.saturating_sub(1);
         drop(g);
@@ -393,7 +393,7 @@ impl LateOrphans {
         self.lock().orphans.push((process, error));
     }
 
-    fn push_reaped(&self, pid: NonZeroU32) {
+    pub(crate) fn push_reaped(&self, pid: NonZeroU32) {
         self.lock().reaped.push(pid);
     }
 

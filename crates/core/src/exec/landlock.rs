@@ -32,11 +32,13 @@ use std::path::PathBuf;
 
 use super::{ExecError, IsolationStage, ThreadCountSource};
 use crate::audit_log::{AuditRecord, AuditRecordError, landlock_denial_record_now};
+use crate::landlock::handled_for_abi;
 use crate::landlock::{
     LandlockApplyError, LandlockApplyReport, LandlockError, LandlockRuleError, LandlockRuleset,
     LandlockSupport, detect_landlock_abi, path_rules_from_config,
 };
-use crate::oci_runtime::OciConfig;
+use crate::launch_isolation::{LaunchIsolationRecord, RootIdentity};
+use crate::oci_runtime::{OciConfig, RootfsDir};
 use crate::sys;
 use crate::traits::types::ErrorCode;
 
@@ -86,6 +88,67 @@ pub(crate) fn landlock_ruleset_from_config(
     config: &OciConfig,
 ) -> Result<LandlockRuleset, ExecError> {
     ruleset_from_detection(detect_landlock_abi(), config)
+}
+
+/// 記録した launch 時の Landlock ルールから ruleset を組み直す（exec の再適用用。CORE-5・SUP-6・TASK-163 追補・
+/// #1468）。`config.json` は launch の後に変わりうるため読まない。
+///
+/// ABI 検出は launch と同じ fail-closed（ABI 6 未満・未対応は拒否）。ルールと handled は **記録のまま** 使い、
+/// 今のカーネルの ABI から計算し直さない。記録の handled が今のカーネルの扱える権利を超えるときは、launch
+/// より弱いルールに縮退せず `FailedPrecondition`（段 `Landlock`）で拒否する。
+pub(crate) fn landlock_ruleset_from_record(
+    record: &LaunchIsolationRecord,
+) -> Result<LandlockRuleset, ExecError> {
+    ruleset_from_recorded_detection(detect_landlock_abi(), record)
+}
+
+/// [`landlock_ruleset_from_record`] の ABI 検出結果を差し替えられる版（試験用の継ぎ目）。
+fn ruleset_from_recorded_detection(
+    detected: Result<LandlockSupport, LandlockError>,
+    record: &LaunchIsolationRecord,
+) -> Result<LandlockRuleset, ExecError> {
+    let support = detected.map_err(from_landlock_unavailable)?;
+    let ruleset = record
+        .landlock_ruleset()
+        .map_err(|e| ExecError::new(ErrorCode::Internal, IsolationStage::Landlock, e.message()))?;
+    if !ruleset
+        .handled_access_fs()
+        .is_subset_of(handled_for_abi(support.abi.get()))
+    {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::Landlock,
+            "recorded landlock access exceeds what the kernel supports",
+        ));
+    }
+    Ok(ruleset)
+}
+
+/// launch が bundle の rootfs を自分自身へ bind して pivot する構成で、`state.json` へ残す分離の記録を作る
+/// （SUP-6・CORE-5・TASK-163 追補・#1468。トレイト契約 12）。
+///
+/// ルールは `landlock_ruleset_from_config` と同じ関数で `config` から導く（launch が
+/// `StagePipeline::with_landlock` へ渡す ruleset と同一の入力・同一の関数で作ること）。`/` の識別子は固定した
+/// `rootfs`（`pin_bundle_rootfs`）の `st_dev`・`st_ino`。bind mount は元の inode と `st_dev` を保つため、launch の
+/// pivot 後の `/` と一致する。overlay など rootfs を mount namespace の中で組み立てる launcher は本関数ではなく、
+/// 子の pivot 後の `/` から [`RootIdentity`] を得て `LaunchIsolationRecord::new` を使う。
+///
+/// 将来仕様: 本番 launcher からの結線（作った記録を `CreateStateRequest::with_launch_isolation` で書く）は
+/// 後続作業（REPAIR-3）。
+pub fn launch_isolation_from_bundle(
+    config: &OciConfig,
+    rootfs: &RootfsDir,
+) -> Result<LaunchIsolationRecord, ExecError> {
+    let ruleset = landlock_ruleset_from_config(config)?;
+    let root = RootIdentity::of_dir_fd(rootfs.as_fd()).ok_or_else(|| {
+        ExecError::new(
+            ErrorCode::Internal,
+            IsolationStage::Validate,
+            "failed to inspect the rootfs",
+        )
+    })?;
+    LaunchIsolationRecord::new(root, &ruleset)
+        .map_err(|e| ExecError::new(ErrorCode::Internal, IsolationStage::Landlock, e.message()))
 }
 
 /// [`landlock_ruleset_from_config`] の ABI 検出結果を差し替えられる版（試験用の継ぎ目。本番は
@@ -375,6 +438,33 @@ mod tests {
             e.message
         );
         assert!(ruleset_from_detection(crate::landlock::evaluate_abi(6), &config).is_ok());
+    }
+
+    /// CORE-5・SUP-6・#1468: 記録から組み直す ruleset も ABI 6 未満は拒否し（縮退しない）、ABI 6 なら記録の
+    /// handled とルールをそのまま返す（`config.json` を読まない）。
+    #[test]
+    fn core5_sup6_1468_recorded_ruleset_refuses_old_abi_and_keeps_record() {
+        use crate::launch_isolation::{
+            RecordedLandlock, RecordedRule, RecordedTarget, RootIdentity,
+        };
+        let landlock =
+            RecordedLandlock::new(0x1FFF, vec![RecordedRule::new(RecordedTarget::Root, 0x5)])
+                .expect("recorded landlock");
+        let record = LaunchIsolationRecord::from_parts(RootIdentity::new(1, 2), landlock);
+        let e = ruleset_from_recorded_detection(crate::landlock::evaluate_abi(5), &record)
+            .expect_err("abi 5 must be refused");
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.stage, IsolationStage::Landlock);
+        assert!(
+            e.message.starts_with("landlock_abi_too_old"),
+            "{}",
+            e.message
+        );
+        let ok = ruleset_from_recorded_detection(crate::landlock::evaluate_abi(6), &record)
+            .expect("abi 6");
+        assert_eq!(ok.handled_access_fs().bits(), 0x1FFF);
+        assert_eq!(ok.rules().len(), 1);
+        assert_eq!(ok.rules()[0].allowed.bits(), 0x5);
     }
 
     /// CORE-5・TASK-39.5: プローブ件数の上限超過は適用前に InvalidArgument で拒否する。

@@ -92,6 +92,18 @@ mod linux {
         ContainerId::new("c1").expect("container id")
     }
 
+    /// launch 時の分離の記録（rootfs だけのルール。識別子は具体値。TASK-163 追補・#1468）。
+    fn launch_isolation() -> fandhe_container_core::launch_isolation::LaunchIsolationRecord {
+        use fandhe_container_core::launch_isolation::{
+            LaunchIsolationRecord, RecordedLandlock, RecordedRule, RecordedTarget, RootIdentity,
+        };
+        LaunchIsolationRecord::from_parts(
+            RootIdentity::new(44, 1234),
+            RecordedLandlock::new(0xFFFF, vec![RecordedRule::new(RecordedTarget::Root, 0x7)])
+                .expect("recorded landlock"),
+        )
+    }
+
     /// 全 16 種の launch 記録（`Nofile` は (700, 1500)、他は種別の添字から決める具体値。TASK-169 追補・#1467）。
     fn full_rlimits() -> fandhe_container_core::rlimits::Rlimits {
         use fandhe_container_core::rlimits::{Rlimit, RlimitKind, Rlimits};
@@ -126,6 +138,7 @@ mod linux {
             StateRevision::from_raw(7),
         ))
         .with_rlimits(full_rlimits())
+        .with_launch_isolation(launch_isolation())
     }
 
     fn request() -> ExecRequest {

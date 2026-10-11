@@ -95,32 +95,43 @@
 //!   部分的に載った不定状態のため、呼び出し側は続行せず終了する（巻き戻し不可。`join_cgroup` と同じ）
 //! - **fail-closed**: Landlock 未対応カーネル・ルール生成失敗は準備段階で `stage = Landlock` として拒否し、
 //!   Landlock 無しで続行する経路を作らない（CORE-5）。値を消費するため二重適用・fd の残留を型で防ぐ
-//! - **参加後の `/` をコンテナの rootfs と照合してから適用する（SEC-1）**: `setns(CLONE_NEWNS)` は呼び出し
+//! - **参加後の `/` を launch 時に記録したコンテナの `/` と照合してから適用する（SEC-1・#1468）**: `setns(CLONE_NEWNS)` は呼び出し
 //!   プロセスの root と cwd を **参加先 mount namespace のルート**（`mnt_ns->root` に積まれた最上位のマウント）へ
 //!   付け替える（カーネルの `fs/namespace.c` `mntns_install` が `set_fs_root` / `set_fs_pwd` を呼ぶ。pidfd で複数
 //!   namespace を一括指定した場合も `kernel/nsproxy.c` の `commit_nsset` が同じ root / cwd を反映する。`setns(2)` の
 //!   man page には記載が無いカーネルの挙動）。したがって参加後の `/` はホストの `/` ではないが、それが
 //!   「コンテナの rootfs」であることは launcher が `pivot_root` 済み（`exec/rootfs.rs`）で、以後 `/` へ別の
-//!   マウントが重ねられていないという前提に依存する。この前提を仮定で済ませず、[`prepare_exec_restrictions`] が
-//!   `setns` の前に固定した rootfs（start と同じ検査・固定を通した `RootfsDir`。ホスト側の記録が起点で、
-//!   コンテナからは変えられない）と、[`reapply_restrictions`] が参加後に開いた `/` が **同じディレクトリ
-//!   （`st_dev`・`st_ino` の一致）** であることを、何も適用する前に確かめる。不一致は違反記録
-//!   `exec_root_not_container_rootfs` つきの `FailedPrecondition` で拒否する（pivot していない対象・`/` へ
-//!   マウントを重ねた対象では、ルールが別の木に付くうえコマンドも rootfs の外で動くため）。固定した fd は
-//!   適用が終わるまで保持する（inode 番号の再利用で一致が偽にならないようにする）
+//!   マウントが重ねられていないという前提に依存する。この前提を仮定で済ませず、launch 時に `state.json` へ記録した
+//!   pivot 後の `/` の識別子（`LaunchIsolationRecord::root`。[`prepare_exec_restrictions`] が受け取る）と、
+//!   [`reapply_restrictions`] が参加後に開いた `/` が **同じディレクトリ（`st_dev`・`st_ino` の一致）** であることを、
+//!   何も適用する前に確かめる。不一致は違反記録 `exec_root_not_container_rootfs` つきの `FailedPrecondition` で
+//!   拒否する（pivot していない対象・`/` へマウントを重ねた対象・restart で記録し直していない対象では、ルールが
+//!   別の木に付くうえコマンドも rootfs の外で動くため）。基準はホスト側の bundle ディレクトリではなく記録した
+//!   pivot 後の `/` なので、rootfs を mount namespace の中で組み立てる構成（overlay 等）でも照合が成り立つ
+//!   （bundle の rootfs はホスト側の固定と監査と「自分の `/` でないこと」の検査にだけ使う）。記録は fd を持たず
+//!   inode 番号の再利用を型では防げないが、照合は mount namespace の束縛の後に行い、生きている pid1 の mount
+//!   namespace が `/` のマウントを固定していること・`CAP_SYS_ADMIN` を持たないコンテナは `/` を付け替えられない
+//!   （SEC-1）こと・seccomp が `setns`・`unshare` を拒否することで、束縛後の `/` が別物にすり替わらない。
+//!   記録した `/` が自プロセスの `/`（ホスト）と一致する場合も、準備が違反 `rootfs_is_host_root` で拒否する
 //! - **照合の基準に pid1 の root（`/proc/<pid>/root`）を使わない**: pid1 の root はコンテナ側が変えられる
-//!   （OCI 既定の capability には `CAP_SYS_CHROOT` が含まれ、pid1 は自分を `chroot` できる）。基準はホスト側で
-//!   固定した rootfs にする。pid1 が自分を `chroot` していても、exec は mount namespace のルート = rootfs へ入る
+//!   （OCI 既定の capability には `CAP_SYS_CHROOT` が含まれ、pid1 は自分を `chroot` できる）。基準は launch 時に
+//!   記録した `/` の識別子にする。pid1 が自分を `chroot` していても、exec は mount namespace のルート = rootfs へ入る
 //! - **ルールパスは照合済みの `/` の fd を起点に、`setns` の後に解決する**: 準備段階の ruleset が持つのは
-//!   config の mount destination（コンテナ内パス。`RulePath`。`..` を含まない正規化済み）の文字列だけで、
+//!   記録した mount destination（コンテナ内パス。`RulePath`。`..` を含まない正規化済み）の文字列だけで、
 //!   準備ではルールのパスを開かない（`setns` 前に開くとホスト側の木を指すため）。`landlock_add_rule` 用の
 //!   `O_PATH` fd は [`reapply_restrictions`] の中で、照合に使ったのと同じ `/` の fd から 1 要素ずつ
 //!   `O_NOFOLLOW` で開く。symlink はまたがず、解決できないパスは拒否し、ルールを黙って落とさない。launch 経路
 //!   （`StagePipeline::with_landlock`。pivot 後の `/` 起点）と同じ関数・同じ規則で辿る
-//! - ルールは launcher が実際にマウントした結果ではなく `config.json` から再導出する（launch 時の ruleset は
-//!   保存されていない）。Landlock の適用は存在しない・開けないルールパスを拒否するため、config の mount
-//!   destination が稼働中の rootfs に無ければ [`reapply_restrictions`] は失敗し exec は拒否される
-//!   （fail-closed として正しい挙動）。bundle は supervisor と同じ信頼境界（コンテナから書けない）にある前提
+//! - **ルールは launch 時に記録した ruleset をそのまま使う**（#1468）: handled access もパスごとの許可も
+//!   `LaunchIsolationRecord`（`state.json`。トレイト契約 12）から組み直し、`config.json` から導き直さない
+//!   （launch の後に bundle の config が変わっても、launch と同じ対象に同じ権限が付く）。ABI は launch と同じ
+//!   fail-closed（6 未満は拒否）で検出するだけで、handled は今のカーネルの ABI から計算し直さない（launch の
+//!   handled に無かった権利が無制限になるため）。記録の handled が今のカーネルの扱える範囲を超える場合は縮退せず
+//!   拒否する。Landlock の適用は存在しない・開けないルールパスを拒否するため、記録した mount destination が
+//!   稼働中の rootfs に無ければ [`reapply_restrictions`] は失敗し exec は拒否される（fail-closed として正しい挙動）。
+//!   記録が無い場合の拒否は supervisor の `identify_pid1` が行う。ルールの対象ごとの `(st_dev, st_ino)` は記録しない
+//!   （未実装）。「同じ対象」は、照合済みの `/` の fd を起点に `O_NOFOLLOW` で 1 要素ずつ辿ることと、対象が
+//!   すべてマウントポイントであること（`CAP_SYS_ADMIN` が無いと動かせない）で担保する
 //! - **完了は型で表す**: 成功結果 [`ExecRestrictionReport`] のフィールドは非公開で、未適用の制限は
 //!   [`ExecRestrictionReport::unapplied`] で読むだけ（crate の外から書き換え・構築できない）。TASK-163.4 で
 //!   rlimit と capability 削減を実装したため通常の一覧は空で、「launch 経路と同じ制限がすべて載った」ことの
@@ -141,7 +152,8 @@
 //!    読み取り・pivot していない対象の拒否・別コンテナへの参加の拒否を具体値で照合する。このうち
 //!    「launcher と同じ手順で `pivot_root` した対象へ参加した後の `/` が、固定した rootfs と同じディレクトリに
 //!    なる」ことだけは、非特権の user namespace で動く `tests/exec_setns_join.rs`（CI で実行）が本番の
-//!    `join_namespaces` を通して具体値で照合する。ルールパスの解決の起点が照合済みの fd であること（プロセスの `/` を引き直して
+//!    `join_namespaces` を通して具体値で照合する（rootfs を mount namespace の中で組み立てた場合の、記録した
+//!    `/` との一致とホスト側ディレクトリとの不一致も同じ試験が照合する。#1468）。ルールパスの解決の起点が照合済みの fd であること（プロセスの `/` を引き直して
 //!    いないこと）は、`open_verified_root` が返した fd を Landlock の適用と cwd の設定の両方へ渡す実装で担保し、
 //!    プロセスの `/` と起点が食い違う状況を作る専用の試験は未実装（下記）
 //! 5. **全体のタイムアウトと fd の後始末**: supervisor の `run_command` が準備から実行までを worker プロセスへ
@@ -158,12 +170,16 @@
 //!   参加するとき、launch と同じく root 以外を `Unimplemented` で拒否する）
 //! - ルールパスの解決の起点とプロセスの `/` が食い違う状況での照合専用の試験（上記 4）
 //! - 本番 launcher（`oci_runtime` の `ProcessLauncher` 実装）は未結線で、launch 経路の Landlock も本番では
-//!   まだ適用されない（`exec/landlock.rs`）。exec と launch の一致は「同じ `config.json` から同じ関数で導いた
-//!   ルールを、同じ rootfs のディレクトリを起点に同じ規則で辿る」ことで担保する
+//!   まだ適用されない（`exec/landlock.rs`）。launch 時の分離の記録（`launch_isolation_from_bundle` または
+//!   `LaunchIsolationRecord::new`）を `CreateStateRequest::with_launch_isolation` で書く結線も未実装で、結線までは
+//!   supervisor の `identify_pid1` が記録なしで exec を拒否する。restart の再 launch は mount namespace を作り直す
+//!   ため `UpdateStateRequest::with_launch_isolation` で記録し直す必要がある（しないと restart 後の exec は `/` の
+//!   照合で拒否される。fail-closed）。exec と launch の一致は「launch が適用した ruleset を記録し、同じ規則で辿る」
+//!   ことで担保する
 //! - 拒否の違反記録（種別 `exec_target`）の監査ログへの保存のうち、本番の sink の実体の生成と CLI からの
 //!   受け渡し（SEC-4）。層 `AuditLayer::ExecTarget` と supervisor `run_command`（親プロセス側）の 1 拒否 1 件の
 //!   記録は実装済み（#1465）。この段関数単体は記録せず、`ExecError::violation` に載せて返す
-//! - `--ulimit` の指定値の記録（`state.json`）。現状は pid1 の実効値を写して代替する（限界は上記。#1467）
+//! - ルールの対象ごとの `(st_dev, st_ino)` の記録と照合（launch の子から親への状態 pipe が要る。#1468）
 //! - 実機前提の通し試験 `tests/exec.rs` の実行結果の記録（CI ではビルドのみ）
 
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
@@ -172,7 +188,7 @@ use std::path::Path;
 
 use super::capabilities::{PreJoinGroups, ProcessIds};
 use super::entrypoint_mode::EntrypointExecMode;
-use super::landlock::landlock_ruleset_from_config;
+use super::landlock::landlock_ruleset_from_record;
 #[cfg(feature = "exec-test-support")]
 use super::landlock::{LandlockAccessProbe, run_probe};
 use super::rlimits::{apply_rlimits, widen_fsize_for_copy};
@@ -185,6 +201,7 @@ use super::{
     ThreadCountSource, ViolationReason, no_new_privs,
 };
 use crate::landlock::LandlockRuleset;
+use crate::launch_isolation::{LaunchIsolationRecord, RootIdentity};
 use crate::oci_runtime::{OciConfig, RootfsDir};
 use crate::rlimits::{Rlimit, RlimitKind, Rlimits};
 use crate::sys;
@@ -214,9 +231,10 @@ pub struct ExecRestrictions {
     landlock: LandlockRuleset,
     threads: ThreadCountSource,
     owner_pid: u32,
-    /// `setns` の前にホスト側で固定したコンテナの rootfs（`O_PATH`）。参加後の `/` と照合する基準。
-    /// 適用が終わるまで保持し、inode 番号が再利用されないようにする。
-    rootfs: OwnedFd,
+    /// launch 時に記録したコンテナの `/` の同一性（`state.json`。トレイト契約 12）。参加後の `/` と照合する基準。
+    /// ホスト側の bundle ディレクトリではなく launch の pivot 後の `/` の識別子なので、rootfs を mount namespace の
+    /// 中で組み立てる構成（overlay 等）でも成り立つ。
+    root: RootIdentity,
     /// launch 時の rlimit の記録（`state.json`。全 16 種）。exec プロセスへ同じ値を載せる。
     rlimits: Rlimits,
     /// 制限を準備した対象への束縛（参加後に別の対象へ適用させない）。
@@ -523,11 +541,13 @@ pub(super) struct ExecReadyParts {
     pub(super) seal_policy: SealPolicy,
 }
 
-/// `config`（コンテナの `config.json`）から Landlock ruleset を作り、参加後の `/` と照合する rootfs・
-/// 対象への束縛の材料・自プロセスの status fd を確保する。
+/// launch 時の分離の記録（`launch`）から Landlock ruleset を組み直し、参加後の `/` と照合する識別子・
+/// 対象への束縛の材料・自プロセスの status fd を確保する。`config.json` から Landlock を導き直さない（#1468）。
 ///
 /// `join_namespaces` の **前** に、再適用を行うプロセス自身が呼ぶ。`rootfs` は稼働中コンテナの bundle から
-/// `oci_runtime::pin_bundle_rootfs` で固定したもの（`config` と同じ bundle のもの）を渡す。`target` は
+/// `oci_runtime::pin_bundle_rootfs` で固定したもの（`config` と同じ bundle のもの）で、自プロセスの `/` と別の
+/// ディレクトリであることの検査と監査にだけ使う（`/` の照合の基準は `launch` の記録）。`config` は
+/// `process.user` の解釈に使う。`target` は
 /// `join_namespaces` へ渡すのと同じ対象で、その mount namespace の識別子をここで記録する（参加後に別の対象へ
 /// 適用させない）。`rlimits` は launch 時に `state.json` へ記録した全 16 種（`StateRecord::rlimits`）で、
 /// launch と同じ値を exec プロセスへ載せる。全 16 種そろっていなければ `FailedPrecondition`（段 `Rlimits`）で拒否する。
@@ -546,8 +566,15 @@ pub(super) struct ExecReadyParts {
 /// use fandhe_container_core::exec::{Pid1Target, prepare_exec_restrictions};
 /// use fandhe_container_core::oci_runtime::{OciConfig, RootfsDir};
 /// use fandhe_container_core::rlimits::Rlimits;
-/// fn without_proof(t: &Pid1Target, c: &OciConfig, r: &RootfsDir, l: &Rlimits) {
-///     let _ = prepare_exec_restrictions(t, c, r, l);
+/// use fandhe_container_core::launch_isolation::LaunchIsolationRecord;
+/// fn without_proof(
+///     t: &Pid1Target,
+///     c: &OciConfig,
+///     r: &RootfsDir,
+///     l: &Rlimits,
+///     i: &LaunchIsolationRecord,
+/// ) {
+///     let _ = prepare_exec_restrictions(t, c, r, l, i);
 /// }
 /// ```
 pub fn prepare_exec_restrictions(
@@ -556,15 +583,14 @@ pub fn prepare_exec_restrictions(
     config: &OciConfig,
     rootfs: &RootfsDir,
     rlimits: &Rlimits,
+    launch: &LaunchIsolationRecord,
 ) -> Result<ExecRestrictions, ExecError> {
     // 証跡は型で呼び出し元を絞るためだけに要求する（値は使わない）。
     let _ = worker;
-    let rootfs = rootfs.as_fd().try_clone_to_owned().map_err(|e| {
-        ExecError::from_io(&e, IsolationStage::Validate, "duplicate the rootfs handle")
-    })?;
     let own_root = sys::open_dir_path_nofollow(None, c"/")
         .map_err(|e| ExecError::from_sys(e, IsolationStage::Validate, "open own root"))?;
     reject_own_root(rootfs.as_fd(), own_root.as_fd())?;
+    reject_recorded_own_root(launch.root(), own_root.as_fd())?;
     let relation = target.user_ns_relation();
     let target_mnt_ns = target.mnt_ns_identity()?;
     let target_pid_ns = target.pid_ns_identity()?;
@@ -584,7 +610,7 @@ pub fn prepare_exec_restrictions(
         UserNsRelation::Shared { .. } => None,
         UserNsRelation::Distinct { .. } => Some(process_ids_from_config(config)?),
     };
-    let mut restrictions = prepare_with_rootfs(config, rootfs, rlimits, binding)?;
+    let mut restrictions = prepare_with_launch(launch, launch.root(), rlimits, binding)?;
     restrictions.ids = ids;
     // 準備の最後（ここまでの失敗では何も変えない）に、補助グループを参加の **前** に空にする。対象の user
     // namespace へ入った後では `setgroups` が `deny` で消せず、exec を起動したプロセスのホスト側の補助グループを
@@ -690,6 +716,31 @@ fn reject_own_root(rootfs: BorrowedFd<'_>, own_root: BorrowedFd<'_>) -> Result<(
     Ok(())
 }
 
+/// 記録した launch 時の `/` が呼び出しプロセス自身の `/` と別であることを確かめる（SEC-1・#1468）。
+///
+/// 記録が自分の `/`（ホストの `/`）と一致するなら、参加後の照合は「ホストの `/` を拒否する」意味を失う
+/// （壊れた記録・ホストの `/` を指す記録）ため、[`reject_own_root`] と同じ違反 `rootfs_is_host_root` で拒否する。
+fn reject_recorded_own_root(
+    recorded: RootIdentity,
+    own_root: BorrowedFd<'_>,
+) -> Result<(), ExecError> {
+    let own = RootIdentity::of_dir_fd(own_root).ok_or_else(|| {
+        ExecError::new(
+            ErrorCode::Internal,
+            IsolationStage::Validate,
+            "failed to inspect the root directory",
+        )
+    })?;
+    if own == recorded {
+        return Err(ExecError::from_violation_at(
+            ViolationReason::RootfsIsHostRoot,
+            None,
+            IsolationStage::Validate,
+        ));
+    }
+    Ok(())
+}
+
 /// 結合試験 `tests/exec_audit.rs`（supervisor）専用の入口: `rootfs` を symlink 非追従で開き、
 /// [`prepare_exec_restrictions`] と同じ `reject_own_root` の判定だけを行う（SEC-4・SEC-1・#1614 の事後監査）。
 ///
@@ -708,6 +759,16 @@ pub fn reject_own_root_for_test(rootfs: &Path) -> Result<(), ExecError> {
     let own_root = sys::open_dir_path_nofollow(None, c"/")
         .map_err(|e| ExecError::from_sys(e, stage, "open own root"))?;
     reject_own_root(dir.as_fd(), own_root.as_fd())
+}
+
+/// 結合試験 `tests/exec_setns_join.rs`（supervisor）専用の入口: 参加後の呼び出しプロセスの `/` が、記録した
+/// 識別子 `expected` と一致するかを本番と同じ `open_verified_root` で照合する（SEC-1・#1468）。一致すれば `Ok`、
+/// 不一致は違反 `exec_root_not_container_rootfs` つきの `Err`。overlay のように rootfs を mount namespace の中で
+/// 組み立てる構成の代わりの検証に使う。`exec-test-support` feature を付けたビルドにだけ存在する。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn verify_joined_root_for_test(expected: RootIdentity) -> Result<(), ExecError> {
+    open_verified_root(expected).map(|_| ())
 }
 
 /// 自プロセスの procfs ディレクトリ（pid 指定。`O_PATH`）を開き、本物の procfs であることを確かめる。
@@ -831,15 +892,16 @@ fn verify_target_binding(binding: &TargetBinding) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// [`prepare_exec_restrictions`] の本体（`rootfs` が自分の `/` でないことの検査を除く）。
+/// [`prepare_exec_restrictions`] の本体（`/` が自分の `/` でないことの検査を除く）。
 /// 結合試験用の観測関数は `setns` をしないため、自分の `/`・自分の namespace を基準にしてここから入る。
-fn prepare_with_rootfs(
-    config: &OciConfig,
-    rootfs: OwnedFd,
+/// Landlock は記録（`launch`）のルールからだけ作り、`config.json` は読まない（#1468）。
+fn prepare_with_launch(
+    launch: &LaunchIsolationRecord,
+    root: RootIdentity,
     rlimits: Rlimits,
     binding: TargetBinding,
 ) -> Result<ExecRestrictions, ExecError> {
-    let landlock = landlock_ruleset_from_config(config)?;
+    let landlock = landlock_ruleset_from_record(launch)?;
     let seal_policy = SealPolicy::probe();
     let status_error =
         |what: &'static str| ExecError::new(ErrorCode::Internal, IsolationStage::Landlock, what);
@@ -854,7 +916,7 @@ fn prepare_with_rootfs(
         landlock,
         threads: ThreadCountSource::PreOpened(file),
         owner_pid: std::process::id(),
-        rootfs,
+        root,
         rlimits,
         binding,
         groups_before_join: None,
@@ -900,15 +962,29 @@ fn same_directory(a: BorrowedFd<'_>, b: BorrowedFd<'_>) -> Result<bool, ExecErro
     }
 }
 
-/// 参加後の呼び出しプロセスの `/` を開き、`rootfs`（`setns` の前に固定したコンテナの rootfs）と同じ
-/// ディレクトリであることを確かめて返す（SEC-1）。不一致は違反記録 `exec_root_not_container_rootfs`。
+/// 参加後の呼び出しプロセスの `/` を開き、launch 時に記録したコンテナの `/`（`expected`）と同じ
+/// ディレクトリ（`st_dev`・`st_ino` の一致）であることを確かめて返す（SEC-1）。不一致は違反記録
+/// `exec_root_not_container_rootfs`。
 ///
 /// 返す fd は Landlock のルールパスを辿る起点と、コマンドの cwd の起点に使う（照合した実体と起点を
 /// 同じ fd にする）。
-fn open_verified_root(rootfs: BorrowedFd<'_>) -> Result<OwnedFd, ExecError> {
+///
+/// inode 番号の再利用への備え: 記録は識別子だけで fd を持ち続けないが、呼び出し側が先に mount namespace の
+/// 束縛（`verify_target_binding`）を済ませており、生きている pid1 の mount namespace が `/` のマウントを固定
+/// している。SEC-1 で `CAP_SYS_ADMIN` を持たないコンテナは `/` を付け替えられず、seccomp が `setns`・`unshare` を
+/// 拒否する。したがって束縛の後の `/` の識別子は launch のものと一致するか、記録が古い（restart で記録し直して
+/// いない）かのどちらかで、後者は不一致として拒否される。
+fn open_verified_root(expected: RootIdentity) -> Result<OwnedFd, ExecError> {
     let root = sys::open_dir_path_nofollow(None, c"/")
         .map_err(|e| ExecError::from_sys(e, IsolationStage::SetNs, "open / after joining"))?;
-    if !same_directory(rootfs, root.as_fd())? {
+    let actual = RootIdentity::of_dir_fd(root.as_fd()).ok_or_else(|| {
+        ExecError::new(
+            ErrorCode::Internal,
+            IsolationStage::SetNs,
+            "failed to inspect the root directory",
+        )
+    })?;
+    if actual != expected {
         return Err(ExecError::from_violation(
             ViolationReason::ExecRootNotContainerRootfs,
             None,
@@ -959,7 +1035,7 @@ fn reapply_inner(
         landlock,
         mut threads,
         owner_pid,
-        rootfs,
+        root: expected_root,
         rlimits,
         binding,
         groups_before_join,
@@ -978,7 +1054,7 @@ fn reapply_inner(
         require_rlimits(&rlimits)?;
     }
     verify_target_binding(&binding)?;
-    let root = open_verified_root(rootfs.as_fd())?;
+    let root = open_verified_root(expected_root)?;
     // 観測用の空集合では syscall を呼ばず、下で未適用の一覧へ `Rlimits` を載せる。通常は全 16 種が入る。
     let rlimits_skipped = rlimits.is_empty();
     // `RLIMIT_FSIZE` だけは子へ持ち越す（封印した複製の書き込みを妨げない。#1531）。実効値は子が複製の完成後・
@@ -1150,6 +1226,8 @@ pub fn observe_exec_restriction_reapply(
     let expected = OwnedFd::from(
         std::fs::File::open(expected_root).map_err(|_| internal("cannot open expected root"))?,
     );
+    let expected_identity = RootIdentity::of_dir_fd(expected.as_fd())
+        .ok_or_else(|| internal("expected root is not a directory"))?;
     // `setns` をしないため、対象の mount namespace は自分自身（束縛は常に一致する）。rlimit は変えない。
     let proc_dir = open_own_proc_dir().map_err(|_| internal("cannot open own procfs directory"))?;
     let target_user_ns = current_user_ns_identity(proc_dir.as_fd())
@@ -1167,7 +1245,14 @@ pub fn observe_exec_restriction_reapply(
         target_pid_ns,
         expected_cgroup,
     };
-    match prepare_with_rootfs(config, expected, Rlimits::default(), binding) {
+    // 観測では `config` から導いた ruleset と `expected_root` の識別子で記録を作る（launch の代わり）。
+    let prepared = super::landlock::landlock_ruleset_from_config(config).and_then(|ruleset| {
+        let launch = LaunchIsolationRecord::new(expected_identity, &ruleset).map_err(|e| {
+            ExecError::new(ErrorCode::Internal, IsolationStage::Landlock, e.message())
+        })?;
+        prepare_with_launch(&launch, expected_identity, Rlimits::default(), binding)
+    });
+    match prepared {
         Err(e) => obs.prepare_error = Some(e),
         Ok(prepared) => {
             match reapply_inner(prepared, ReapplyMode::ObservationWithoutCapabilityDrop) {
@@ -1222,12 +1307,16 @@ mod tests {
         restrictions_rooted_at(owner_pid, Path::new("/"))
     }
 
+    fn identity_of(path: &Path) -> RootIdentity {
+        RootIdentity::of_dir_fd(dir_fd(path).as_fd()).expect("directory identity")
+    }
+
     fn restrictions_rooted_at(owner_pid: u32, rootfs: &Path) -> ExecRestrictions {
         ExecRestrictions {
             landlock: LandlockRuleset::for_observation(6, Vec::new()),
             threads: ThreadCountSource::ProcSelf,
             owner_pid,
-            rootfs: dir_fd(rootfs),
+            root: identity_of(rootfs),
             rlimits: full_rlimits(),
             binding: own_binding(),
             groups_before_join: None,
@@ -1916,7 +2005,7 @@ mod tests {
         assert_eq!(ThreadCountSource::PreOpened(tmp_file(&over)).count(), None);
     }
 
-    /// SUP-6・SEC-1・SEC-4・TASK-163.3: 参加後の `/` が準備時に固定した rootfs と別のディレクトリなら、
+    /// SUP-6・SEC-1・SEC-4・TASK-163.3・#1468: 参加後の `/` が launch 時に記録した `/` と別のディレクトリなら、
     /// 何も適用せず違反記録つきの `FailedPrecondition`（理由 `exec_root_not_container_rootfs`・段 `SetNs`）。
     #[test]
     fn sup6_task163_3_root_mismatch_applies_nothing_and_records_violation() {
@@ -2055,6 +2144,86 @@ mod tests {
         assert_eq!(taken(), Vec::<&str>::new());
     }
 
+    /// 記録（`config.json` に無いルールを含む手組みの値）。rootfs と `/data`、`/only-in-record` を持つ。
+    fn hand_made_record(root: RootIdentity, handled: u64) -> LaunchIsolationRecord {
+        use crate::launch_isolation::{RecordedLandlock, RecordedRule, RecordedTarget};
+        use crate::oci_runtime::MountDestination;
+        let dest = |p: &str| MountDestination::parse(p).expect("destination");
+        let rules = vec![
+            RecordedRule::new(RecordedTarget::Root, 0x7),
+            RecordedRule::new(
+                RecordedTarget::Mount {
+                    destination: dest("/only-in-record"),
+                    index: 4,
+                },
+                0x1,
+            ),
+        ];
+        LaunchIsolationRecord::from_parts(
+            root,
+            RecordedLandlock::new(handled, rules).expect("recorded landlock"),
+        )
+    }
+
+    /// SUP-6・CORE-5・SEC-1・TASK-163 追補・#1468: exec の Landlock は記録のルールだけから作る。
+    /// `config.json` に無いルールでも記録にあればそのまま載り（launch の後に config が変わっても影響しない）、
+    /// 記録の handled も変えない。準備は `config` を引数に取らない。
+    #[test]
+    fn sup6_task163_1468_landlock_is_built_from_the_record_not_from_config() {
+        let launch = hand_made_record(identity_of(Path::new("/")), 0xFFFF);
+        match prepare_with_launch(&launch, launch.root(), Rlimits::default(), own_binding()) {
+            Ok(r) => {
+                let rules: Vec<(&str, u64)> = r
+                    .landlock
+                    .rules()
+                    .iter()
+                    .map(|rule| (rule.path.as_str(), rule.allowed.bits()))
+                    .collect();
+                assert_eq!(rules, vec![("/", 0x7), ("/only-in-record", 0x1)]);
+                assert_eq!(r.landlock.handled_access_fs().bits(), 0xFFFF);
+                assert_eq!(r.root, launch.root());
+            }
+            // Landlock 未対応のカーネルでは検出で拒否される（fail-closed）。
+            Err(e) => assert_eq!(e.stage, IsolationStage::Landlock),
+        }
+    }
+
+    /// SUP-6・SEC-1・SEC-4・#1468: 記録した `/` が自プロセスの `/` と同じ（壊れた記録・ホストの `/` を指す記録）なら、
+    /// 違反 `rootfs_is_host_root` で拒否する。
+    #[test]
+    fn sup6_task163_1468_recorded_root_equal_to_own_root_is_rejected() {
+        let own = dir_fd(Path::new("/"));
+        let e = reject_recorded_own_root(identity_of(Path::new("/")), own.as_fd())
+            .expect_err("own root");
+        assert_eq!(e.code, ErrorCode::InvalidArgument);
+        assert_eq!(e.stage, IsolationStage::Validate);
+        let v = e.violation.expect("violation recorded");
+        assert_eq!(v.reason.as_str(), "rootfs_is_host_root");
+        let dir = temp_dir("recorded-own");
+        reject_recorded_own_root(identity_of(&dir), own.as_fd()).expect("different directory");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SUP-6・SEC-1・#1468: 参加後の `/` の照合は記録した識別子との `st_dev`・`st_ino` の一致で決まる。
+    /// ホスト側の bundle ディレクトリ（`/` と別のディレクトリ）の識別子とは一致しない。
+    #[test]
+    fn sup6_task163_1468_open_verified_root_compares_recorded_identity() {
+        let root = identity_of(Path::new("/"));
+        assert!(open_verified_root(root).is_ok());
+        let other = RootIdentity::new(root.dev(), root.ino().wrapping_add(1));
+        let e = open_verified_root(other).expect_err("different inode");
+        assert_eq!(e.stage, IsolationStage::SetNs);
+        let v = e.violation.expect("violation recorded");
+        assert_eq!(v.reason, ViolationReason::ExecRootNotContainerRootfs);
+        let dir = temp_dir("verified-root");
+        let e = open_verified_root(identity_of(&dir)).expect_err("host directory");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            e.message,
+            "the root directory after joining is not the recorded container rootfs"
+        );
+    }
+
     /// SUP-6・TASK-163.3: `Debug` は fd・ルール内容を出さず、pid だけを示す。
     #[test]
     fn sup6_task163_3_debug_hides_internals() {
@@ -2075,12 +2244,13 @@ mod tests {
         (bundle, rootfs)
     }
 
-    /// 固定済みの rootfs の複製（`prepare_exec_restrictions` が行うのと同じ）。
-    fn pinned_fd(rootfs: &RootfsDir) -> OwnedFd {
-        rootfs
-            .as_fd()
-            .try_clone_to_owned()
-            .expect("duplicate rootfs")
+    /// launch の代わりに、`config` から導いた ruleset と固定済み rootfs の識別子で記録を作る
+    /// （`launch_isolation_from_bundle` と同じ。Landlock 未対応のカーネルでは `Err`）。
+    fn launch_record(
+        config: &OciConfig,
+        rootfs: &RootfsDir,
+    ) -> Result<LaunchIsolationRecord, ExecError> {
+        crate::exec::launch_isolation_from_bundle(config, rootfs)
     }
 
     fn config(readonly: bool, mounts: &str) -> OciConfig {
@@ -2090,15 +2260,13 @@ mod tests {
         crate::oci_runtime::parse_config_bytes(json.as_bytes()).expect("config")
     }
 
-    /// SUP-6・TASK-163.3・CORE-5: 書き込み制限が祖先ルールで無効になる構成は、準備が `stage = Landlock` で
-    /// 拒否する。ABI 検出が通らない環境では検出失敗で拒否される（どちらも fail-closed で成功しない）。
+    /// SUP-6・TASK-163.3・CORE-5・#1468: 書き込み制限が祖先ルールで無効になる構成は、launch の記録の作成が
+    /// `stage = Landlock` で拒否する（記録を作れないので exec の準備まで進まない）。ABI 検出が通らない環境では検出失敗で拒否される（どちらも fail-closed で成功しない）。
     #[test]
     fn sup6_task163_3_prepare_rejects_shadowed_write_restriction() {
         let c = config(false, r#"[{"destination":"/etc","options":["ro"]}]"#);
         let (bundle, rootfs) = pinned_rootfs("shadowed", &c);
-        let e = prepare_with_rootfs(&c, pinned_fd(&rootfs), Rlimits::default(), own_binding())
-            .map(|_| ())
-            .expect_err("must be rejected");
+        let e = launch_record(&c, &rootfs).expect_err("must be rejected");
         let _ = std::fs::remove_dir_all(&bundle);
         assert_eq!(e.stage, IsolationStage::Landlock);
         const DETECT: [&str; 6] = [
@@ -2125,8 +2293,9 @@ mod tests {
     fn sup6_task163_3_prepare_records_pid_and_reads_threads() {
         let c = config(true, "[]");
         let (bundle, rootfs) = pinned_rootfs("records", &c);
-        let prepared =
-            prepare_with_rootfs(&c, pinned_fd(&rootfs), Rlimits::default(), own_binding());
+        let prepared = launch_record(&c, &rootfs).and_then(|launch| {
+            prepare_with_launch(&launch, launch.root(), Rlimits::default(), own_binding())
+        });
         let _ = std::fs::remove_dir_all(&bundle);
         match prepared {
             Ok(mut r) => {
@@ -2150,8 +2319,9 @@ mod tests {
             &format!(r#"[{{"destination":"{dest}","options":["ro"]}}]"#),
         );
         let (bundle, rootfs) = pinned_rootfs("unresolved", &c);
-        let prepared =
-            prepare_with_rootfs(&c, pinned_fd(&rootfs), Rlimits::default(), own_binding());
+        let prepared = launch_record(&c, &rootfs).and_then(|launch| {
+            prepare_with_launch(&launch, launch.root(), Rlimits::default(), own_binding())
+        });
         let _ = std::fs::remove_dir_all(&bundle);
         match prepared {
             Ok(r) => {

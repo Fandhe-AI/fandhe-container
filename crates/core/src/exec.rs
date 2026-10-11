@@ -157,6 +157,7 @@ pub use diagnostic::{
 pub use entrypoint_mode::{EntrypointExecMode, IntegrityLsm, PathBoundLsm, SealedCopyUnavailable};
 pub use exec_command::{ExecChild, ExecWorkerProof, spawn_exec_command, spawn_exec_worker};
 pub use inject::{InjectReport, InjectedDirectoryOutcome, InjectedFileOutcome, inject_files};
+pub use landlock::launch_isolation_from_bundle;
 /// 結合試験 `tests/landlock.rs` 専用の再公開（CORE-5・TASK-39.5・#185。通常の利用者は呼ばない。詳細は定義側）。
 #[doc(hidden)]
 pub use landlock::{
@@ -206,6 +207,10 @@ pub use process::{StandardFd, close_standard_fds_for_test};
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
 pub use reapply::reject_own_root_for_test;
+/// 結合試験 `tests/exec_setns_join.rs` 専用の再公開（SEC-1・#1468。通常の利用者は呼ばない。詳細は定義側）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use reapply::verify_joined_root_for_test;
 pub use reapply::{
     ExecReady, ExecRestrictionReport, ExecRestrictions, UnappliedExecRestriction,
     prepare_exec_restrictions, reapply_restrictions,

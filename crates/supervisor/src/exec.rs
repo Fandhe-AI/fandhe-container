@@ -40,11 +40,12 @@
 //!   `spawn_exec_worker` の worker の中でしか得られない証跡 `ExecWorkerProof` を要求する（常駐側から呼べない。#1532）。順序の全体:
 //!   `identify_pid1` → `prepare_cgroup_join` → 子 cgroup の作成 → `prepare_restrictions` → `enter_namespaces` → `join_cgroup` →
 //!   `reapply_restrictions` → `require_exec_ready` → `spawn_exec_command`
-//! - 再適用は、参加後の自プロセスの `/` が **記録したコンテナの rootfs**（[`identify_pid1`] に渡した記録の
-//!   bundle から、start と同じ検査・固定で得たディレクトリ）であることを照合してから適用する。不一致
-//!   （pivot していない対象・`/` へ別のマウントが重ねられた対象）は違反 `exec_root_not_container_rootfs` で
-//!   拒否し、何も適用しない（SEC-1。根拠は core の `exec/reapply.rs` のモジュール doc）。bundle は
-//!   [`ExecTarget`] が特定時の記録から保持するため、別の記録の `config.json`・rootfs を取り違えない
+//! - 再適用は、参加後の自プロセスの `/` が **launch 時に記録したコンテナの `/`**（[`identify_pid1`] に渡した記録の
+//!   `launch_isolation` の `st_dev`・`st_ino`。ホスト側の bundle ディレクトリではなく launch の pivot 後の `/`）
+//!   であることを照合してから適用する。不一致（pivot していない対象・`/` へ別のマウントが重ねられた対象・restart で
+//!   記録し直していない対象）は違反 `exec_root_not_container_rootfs` で拒否し、何も適用しない（SEC-1。根拠は core の
+//!   `exec/reapply.rs` のモジュール doc）。bundle は [`ExecTarget`] が特定時の記録から保持するため、別の記録の
+//!   `config.json`・rootfs を取り違えない（bundle の rootfs はホスト側の固定と監査のために使い、`/` の照合の基準にしない）
 //! - **完了は型で表す**: 再適用は rlimit（launch 時の記録）・capability 削減（OCI 既定集合）・`NO_NEW_PRIVS`・
 //!   Landlock・seccomp を載せる（launch 経路と同じ順序。#503）。`ExecRestrictionReport` のフィールドは非公開で、
 //!   crate の外から未適用の一覧を書き換えたり値を構築したりできない。exec へ進んでよいことの証跡は core の
@@ -85,6 +86,13 @@
 //!   監査の違反としては記録しない。cgroup 配置が無いときと同じ扱い）。pid1 の現在の値（`/proc/<pid>/limits`）への
 //!   縮退はしない。記録を [`ExecTarget`] が保持し、core の `prepare_exec_restrictions` へ渡す（別の記録の値と取り違えない）。
 //!   pid1 が後から soft を上げ下げしても exec は記録の値で動く。core は適用を省かず、空・不完全な集合も拒否する（#1460）
+//! - **launch 時の分離の記録を要求し、無ければ拒否する**（SUP-6・CORE-5・SEC-1・TASK-163 追補・#1468）: launch は
+//!   コンテナの `/` の同一性と実際に適用した Landlock ルール（handled access・パスごとの許可）を 1 つの
+//!   `LaunchIsolationRecord` にして `state.json` へ残す（`StateRecord::launch_isolation`。トレイト契約 12）。
+//!   [`identify_pid1`] 系は記録が無い場合を、rlimit の記録の検査と同じ位置（pidfd を開く前）で `FailedPrecondition`
+//!   （`container has no recorded launch isolation; refusing to exec`）で拒否する。壊れた記録は `FileStateStore` が
+//!   読み込みの時点で `Internal` にする。記録を [`ExecTarget`] が保持し、core の `prepare_exec_restrictions` へ渡す。
+//!   exec の Landlock は記録のルールだけから作り、launch の後に変わりうる `config.json` から導き直さない
 //! - **コンテナから見える窓を閉じる**: exec の子は fork した時点でコンテナの PID namespace に入り、
 //!   `close_range` までの間コンテナの procfs から見える。worker は開始時に自分を non-dumpable にし（core の
 //!   `spawn_exec_worker`）、core の `spawn_exec_command` は non-dumpable でないプロセスからの fork を拒否する。
@@ -126,11 +134,8 @@
 //!   コンテナが停止済みなので、直下の `exec-*` すべてを `cgroup.kill` で止めて消す（残るとコンテナ cgroup の
 //!   `rmdir` が `EBUSY` になるため）。開始時の掃除の結果は `ExecOutcome::stale_exec_cgroups` に載せ、失敗は exec を
 //!   止めずに記録する（exec 自体が失敗したときはエラーのメッセージへ併記する）
-//! - 再適用の Landlock ルールは、launcher が実際にマウントした結果ではなく bundle の `config.json` から
-//!   再導出する（launch 時の ruleset は保存されていない）。launch 後に `config.json` が書き換えられると
-//!   追従してしまうが、bundle は supervisor と同じ信頼境界（コンテナから書けない場所）にある前提とする。
-//!   config の mount destination が稼働中の rootfs に無ければ Landlock の適用が失敗し、exec は拒否される
-//!   （fail-closed）
+//! - 再適用の Landlock ルールは launch 時の記録から組み直す（上記。`config.json` から導き直さない）。記録の
+//!   mount destination が稼働中の rootfs に無ければ Landlock の適用が失敗し、exec は拒否される（fail-closed）
 //! - [`join_cgroup`] は呼び出しプロセスをコンテナの cgroup へ移す（`cgroup.procs` はスレッドグループ全体を
 //!   移す）。supervisor 本体から呼ばず、委譲スコープの内側で動く exec 専用プロセスからのみ呼ぶ。
 //!   失敗時は所属が不定のため、呼び出し側は続行せず終了する（fail-closed）。保持 fd は子が `execve` の前に
@@ -173,8 +178,9 @@
 //! 2. capability 削減と rlimit 適用を実装し、未適用の一覧は空
 //! 3. 制限を exec の対象へ束縛する（mount namespace・子が入る PID namespace・所属 cgroup の照合）
 //! 4. `setns` を伴う通し試験: `tests/exec.rs`（実機前提。AGENTS.md。root を要し、CI ではビルドのみで実行して
-//!    いない）。pivot 済みの対象へ参加した後の `/` が固定した rootfs と一致することだけは、CI で実行する
-//!    `tests/exec_setns_join.rs` が非特権の user namespace で照合する
+//!    いない）。pivot 済みの対象へ参加した後の `/` が記録した `/` と一致することだけは、CI で実行する
+//!    `tests/exec_setns_join.rs` が非特権の user namespace で照合する（bundle の rootfs と一致しない
+//!    mount namespace 内で組み立てた rootfs の場合を含む）
 //!    （既定の入口 [`identify_pid1`] が実 cgroup の記録から成功すること・別 instance と特定後の cgroup 移動を拒否
 //!    することは、委譲 cgroup を要する実機前提の `tests/exec_identify_cgroup.rs` が照合する。#1464）
 //! 5. exec 専用プロセス全体のタイムアウトと、`execve` 前の `close_range`（[`run_command_with_pidfd`] と core の
@@ -235,6 +241,12 @@
 //! - launcher による記録の書き込み（`launch_rlimits_from_self` の結果を `StagePipeline::with_rlimits` と
 //!   `CreateStateRequest::with_rlimits` の両方へ渡す結線）。本番の `start` は `process.rlimits` を `Unimplemented` で
 //!   拒否しており、現状は Running の記録に rlimit が載らないため、exec は記録を要求して拒否する（REPAIR-3）
+//! - launcher による launch 時の分離の記録の書き込み（`launch_isolation_from_bundle` または overlay 等では子の
+//!   pivot 後の `/` から作る `LaunchIsolationRecord::new` の結果を、`StagePipeline::with_landlock` へ渡す ruleset と同じ
+//!   入力から作り、`CreateStateRequest::with_launch_isolation` で書く結線）。結線までは exec が記録なしで拒否する。
+//!   restart の再 launch は mount namespace を作り直すため、`UpdateStateRequest::with_launch_isolation` で記録し直す
+//!   必要がある（しないと restart 後の exec は `/` の照合で拒否される。fail-closed）。ルールの対象ごとの
+//!   `(st_dev, st_ino)` の記録と照合（launch の子から親への状態 pipe が要る）も未実装（REPAIR-3）
 //! - 実機前提の通し試験 `tests/exec.rs` の実行結果の記録（root を要し、CI ではビルドのみで実行していない）
 
 use std::io::{BufRead as _, Read as _, Write as _};
@@ -255,6 +267,7 @@ use fandhe_container_core::exec::{
     record_exec_worker_rejection, remove_exec_child_cgroup, spawn_exec_command, spawn_exec_worker,
     sweep_stale_exec_child_cgroups,
 };
+use fandhe_container_core::launch_isolation::LaunchIsolationRecord;
 use fandhe_container_core::oci_runtime::{
     OciConfig, RootfsDir, RootfsPinError, load_config, pin_bundle_rootfs_audited,
 };
@@ -277,6 +290,9 @@ pub struct ExecTarget {
     /// pid1 の特定に使った記録の launch 時の rlimit（全 16 種。[`require_recorded_rlimits`] が検証済み）。
     /// [`prepare_restrictions`] が core へ渡す。bundle と同じく、別の記録の値と取り違えないよう特定時に確定する。
     rlimits: Rlimits,
+    /// pid1 の特定に使った記録の launch 時の分離（`/` の同一性と Landlock ルール。
+    /// [`require_recorded_launch_isolation`] が存在を確かめた）。[`prepare_restrictions`] が core へ渡す。
+    launch_isolation: LaunchIsolationRecord,
 }
 
 impl ExecTarget {
@@ -317,6 +333,22 @@ fn require_recorded_rlimits(record: &StateRecord) -> Result<Rlimits, TraitError>
     }
 }
 
+/// 記録が launch 時の分離（`/` の同一性と Landlock ルール）を持つことを確かめ、その複製を返す
+/// （SUP-6・CORE-5・SEC-1・TASK-163 追補・#1468）。
+///
+/// 無い場合は `FailedPrecondition`（固定の英語文言。パスや値を含めない）。`config.json` から導き直して続ける縮退や、
+/// ホスト側の bundle ディレクトリとの照合への縮退はしない（fail-closed）。
+fn require_recorded_launch_isolation(
+    record: &StateRecord,
+) -> Result<LaunchIsolationRecord, TraitError> {
+    record.launch_isolation().cloned().ok_or_else(|| {
+        TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "container has no recorded launch isolation; refusing to exec",
+        )
+    })
+}
+
 /// `record` の稼働中コンテナから pid1 を特定する。
 ///
 /// `Running` かつ pid 記録ありでなければ `FailedPrecondition`。記録 pid は検証（pidfd 固定・直接入れ子の
@@ -335,6 +367,7 @@ pub fn identify_pid1(record: &StateRecord) -> Result<ExecTarget, TraitError> {
         ));
     };
     let rlimits = require_recorded_rlimits(record)?;
+    let launch_isolation = require_recorded_launch_isolation(record)?;
     let id = record.status().id();
     let pid1 = Pid1Target::open(pid, id, placement).map_err(from_exec_error)?;
     Ok(ExecTarget {
@@ -342,6 +375,7 @@ pub fn identify_pid1(record: &StateRecord) -> Result<ExecTarget, TraitError> {
         pid1,
         bundle: record.bundle().to_path_buf(),
         rlimits,
+        launch_isolation,
     })
 }
 
@@ -366,6 +400,7 @@ pub fn identify_pid1_with_pidfd(
         ));
     };
     let rlimits = require_recorded_rlimits(record)?;
+    let launch_isolation = require_recorded_launch_isolation(record)?;
     let owned = pidfd.try_clone_to_owned().map_err(|e| {
         TraitError::new(
             ErrorCode::Internal,
@@ -380,6 +415,7 @@ pub fn identify_pid1_with_pidfd(
         pid1,
         bundle: record.bundle().to_path_buf(),
         rlimits,
+        launch_isolation,
     })
 }
 
@@ -396,6 +432,7 @@ pub fn identify_pid1_in(
 ) -> Result<ExecTarget, TraitError> {
     let pid = running_pid(record)?;
     let rlimits = require_recorded_rlimits(record)?;
+    let launch_isolation = require_recorded_launch_isolation(record)?;
     let pid1 =
         Pid1Target::open_with_cgroup_path(pid, expected_cgroup_path).map_err(from_exec_error)?;
     Ok(ExecTarget {
@@ -403,6 +440,7 @@ pub fn identify_pid1_in(
         pid1,
         bundle: record.bundle().to_path_buf(),
         rlimits,
+        launch_isolation,
     })
 }
 
@@ -440,8 +478,15 @@ pub fn prepare_restrictions(
     target: &ExecTarget,
 ) -> Result<ExecRestrictions, TraitError> {
     let (config, rootfs) = load_exec_bundle(&target.bundle)?;
-    core_prepare_exec_restrictions(worker, &target.pid1, &config, &rootfs, &target.rlimits)
-        .map_err(from_exec_error)
+    core_prepare_exec_restrictions(
+        worker,
+        &target.pid1,
+        &config,
+        &rootfs,
+        &target.rlimits,
+        &target.launch_isolation,
+    )
+    .map_err(from_exec_error)
 }
 
 /// exec の拒否を永続化する本番の記録先を作る（SEC-4・SUP-6・TASK-163 追補・#1594）。
@@ -1458,9 +1503,15 @@ fn run_in_child_cgroup(
     let (config, rootfs) = load_exec_bundle(&target.bundle)?;
     // コマンドの環境はコンテナ定義（`process.env`）が基底で、呼び出しプロセスの環境は使わない（#1457）。
     let command = request.command(&ContainerEnv::from_config(&config).map_err(from_exec_error)?)?;
-    let restrictions =
-        core_prepare_exec_restrictions(proof, &target.pid1, &config, &rootfs, &target.rlimits)
-            .map_err(from_exec_error)?;
+    let restrictions = core_prepare_exec_restrictions(
+        proof,
+        &target.pid1,
+        &config,
+        &rootfs,
+        &target.rlimits,
+        &target.launch_isolation,
+    )
+    .map_err(from_exec_error)?;
     // 方式の切り替えを黙って行わない（オーナー判断 2026-10-09・#1531・REPAIR-4）。判定の直後に 1 回だけ出す。
     let entrypoint_mode = restrictions.entrypoint_mode();
     // 送信は待たない best-effort で結果は捨てる（#1698）。縮退の事実の確かな観測口は `ExecOutcome::entrypoint_mode`。
@@ -1666,6 +1717,18 @@ mod tests {
                 .collect(),
         )
         .unwrap()
+    }
+
+    /// launch 時の分離の記録（rootfs だけのルール。識別子は具体値。#1468）。
+    fn launch_isolation() -> fandhe_container_core::launch_isolation::LaunchIsolationRecord {
+        use fandhe_container_core::launch_isolation::{
+            LaunchIsolationRecord, RecordedLandlock, RecordedRule, RecordedTarget, RootIdentity,
+        };
+        LaunchIsolationRecord::from_parts(
+            RootIdentity::new(44, 1234),
+            RecordedLandlock::new(0xFFFF, vec![RecordedRule::new(RecordedTarget::Root, 0x7)])
+                .unwrap(),
+        )
     }
 
     /// SUP-6・REPAIR-4・#1531（オーナー判断 2026-10-09「条件付き切り替え」）: 実行方式の構造化ログの具体値。
@@ -1901,7 +1964,8 @@ mod tests {
                 CgroupScope::new("/user.slice/x.scope").unwrap(),
                 StateRevision::from_raw(7),
             ))
-            .with_rlimits(full_rlimits());
+            .with_rlimits(full_rlimits())
+            .with_launch_isolation(launch_isolation());
         let err = identify_pid1(&rec).unwrap_err();
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(
@@ -1953,6 +2017,39 @@ mod tests {
         );
     }
 
+    /// SUP-6・CORE-5・SEC-1・TASK-163 追補・#1468: launch 時の分離の記録が無い記録は、pid を開く前に
+    /// `FailedPrecondition` と固定文言で拒否する（`config.json` からの導き直しやホストの bundle との照合への縮退はしない）。
+    /// pidfd 版・試験用の `identify_pid1_in` も同じ。rlimit の記録の検査の後に行う。
+    #[test]
+    fn sup6_task163_1468_identify_rejects_missing_recorded_launch_isolation() {
+        // 存在しない pid でも NotFound にならない（分離の記録の検査が pid を開く前にある）。
+        let pid = NonZeroU32::new(4_194_305);
+        let placed = |rec: StateRecord| {
+            rec.with_cgroup(CgroupPlacement::new(
+                CgroupScope::new("/").unwrap(),
+                StateRevision::from_raw(7),
+            ))
+        };
+        let expected = "container has no recorded launch isolation; refusing to exec";
+        let rec = placed(record(ContainerStatus::running(cid(), pid))).with_rlimits(full_rlimits());
+        let pidfd = std::fs::File::open("/").unwrap();
+        let err = identify_pid1(&rec).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(err.message(), expected);
+        let err = identify_pid1_with_pidfd(&rec, std::os::fd::AsFd::as_fd(&pidfd)).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(err.message(), expected);
+        let err = identify_pid1_in(&rec, "/x").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(err.message(), expected);
+        // rlimit の記録が無い記録は rlimit の拒否が先になる。
+        let no_rlimits = placed(record(ContainerStatus::running(cid(), pid)));
+        assert_eq!(
+            identify_pid1(&no_rlimits).unwrap_err().message(),
+            "container has no recorded launch rlimits; refusing to exec"
+        );
+    }
+
     /// SUP-6: 違反記録のないエラー（システムエラー）は、段とメッセージだけを写す。
     #[test]
     fn sup6_identify_missing_pid_has_no_violation_suffix() {
@@ -1961,7 +2058,8 @@ mod tests {
                 CgroupScope::new("/").unwrap(),
                 StateRevision::from_raw(7),
             ))
-            .with_rlimits(full_rlimits());
+            .with_rlimits(full_rlimits())
+            .with_launch_isolation(launch_isolation());
         let err = identify_pid1(&rec).unwrap_err();
         assert_eq!(err.code(), ErrorCode::NotFound);
         assert!(

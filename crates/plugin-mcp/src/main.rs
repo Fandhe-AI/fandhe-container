@@ -5,14 +5,14 @@
 //! として予約し何も書かない。診断は stderr に 1 行 JSON（`code` / `message`、英語）で出す。
 //!
 //! 引数なしで起動すると stdin の JSON-RPC 2.0（改行区切り）を EOF まで処理し、応答を stdout へ書く
-//! （`initialize` / `tools/list`。TASK-118.2・#465。処理本体は lib の `server`）。診断は stderr のみ。
+//! （`initialize` / `tools/list` / `tools/call`。TASK-118.2・118.3。処理本体は lib の `server`）。診断は stderr のみ。
 //!
 //! 終了コード: stdin の EOF まで正常処理は 0、stdin 読み込み失敗・stdout 書き込み失敗・受信/送信の期限超過は 1
 //! （`UNAVAILABLE`）、引数ありは 2（`INVALID_ARGUMENT`）。引数の値は出力へ埋め込まない。
-//! 環境変数は読まない。
+//! 環境変数は本体では読まない（`list_containers` の状態ルート解決で core が `XDG_RUNTIME_DIR` を読む）。
 //!
-//! 未実装（REPAIR-3。TASK-118 の後続 sub で扱う）: `tools/call`（#466）、
-//! core との UDS 接続と peer 認証（PLUG-12。#467）、MCP-4 のエラー応答（ERR-5。#469・#470）。
+//! 未実装（REPAIR-3。TASK-118 の後続 sub で扱う）: `start_container` の本番起動（supervisor 起動の
+//! adapter。#1718 待ちで、現状は `UNIMPLEMENTED` を `isError` で返す）、core との UDS 接続と peer 認証（PLUG-12。#467）、MCP-4 のエラー応答（ERR-5。#469・#470）。
 
 use std::process::ExitCode;
 

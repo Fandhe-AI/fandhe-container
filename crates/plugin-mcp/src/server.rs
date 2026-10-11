@@ -13,11 +13,14 @@
 //! 可観測性（REPAIR-4）: 要求ごとに 1 行 JSON（`event` / `op` / `result` / `code` / `latency_us`）を
 //! ログ sink（既定は stderr）へ出す。`op` は既知メソッドの固定名か `other` で、入力値は反射させない。
 //!
-//! 実装済み: `initialize`・`tools/list`・`ping`、通知の黙殺（`notifications/initialized` 等）。
+//! 実装済み: `initialize`・`tools/list`・`ping`・`tools/call`（`list_containers`・`start_container`。
+//! TASK-118.3・#466）、通知の黙殺（`notifications/initialized` 等）。`tools/call` の実行は
+//! [`crate::backend::ToolBackend`] へ委ねる。引数の不正は `-32602`（`data.code = INVALID_ARGUMENT`）、
+//! バックエンドの業務エラーは result の `isError: true` に固定文言の `{code, message}` を載せる。
 //!
-//! 未実装（REPAIR-3）: `tools/call` は `UNIMPLEMENTED` を返すだけで、TASK-118.3（#466）で
-//! コンテナ実行層の操作へ接続する。エラー型は `provisional_error` の仮実装で、ERR-5 の対応表に
-//! 沿った `error.rs` と `isError: true` への変換は TASK-120（#469・#470）で置き換える。
+//! 未実装・簡易実装（REPAIR-3）: エラー応答の生成は `error_outcome` / `tool_error_result` の仮実装で、
+//! ERR-5 の対応表に沿った `error.rs` への置き換えは TASK-120（#469・#470）。`start_container` の
+//! 本番起動は未実装（`crate::backend` の doc を参照。#1718）。
 //! UDS 経由の疎通と peer 認証（PLUG-12）は TASK-118.4（#467）。
 
 use std::io::{self, BufRead, Write};
@@ -28,6 +31,9 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{Map, Value, json};
+
+use crate::backend::{CoreBackend, ToolBackend, UnavailableBackend};
+use fandhe_container_core::traits::{ContainerId, ErrorCode, TraitError};
 
 /// 本サーバーが応答する MCP のプロトコル版（MCP-1）。
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -117,6 +123,10 @@ pub struct Outcome {
     pub op: &'static str,
     /// 応答が JSON-RPC エラーのときのコード。
     pub error_code: Option<i64>,
+    /// `tools/call` で実行したツールの固定名（`list_containers` / `start_container`）。それ以外は `None`。
+    pub tool: Option<&'static str>,
+    /// ツールの業務エラー（`isError: true`）の ERR-1 コード。JSON-RPC としては成功応答のため `error_code` と区別する。
+    pub tool_error: Option<&'static str>,
 }
 
 impl Outcome {
@@ -125,6 +135,8 @@ impl Outcome {
             reply: None,
             op,
             error_code: None,
+            tool: None,
+            tool_error: None,
         }
     }
 
@@ -133,6 +145,8 @@ impl Outcome {
             reply: Some(reply),
             op,
             error_code: None,
+            tool: None,
+            tool_error: None,
         }
     }
 
@@ -141,6 +155,8 @@ impl Outcome {
             reply: Some(reply),
             op,
             error_code: Some(code),
+            tool: None,
+            tool_error: None,
         }
     }
 }
@@ -270,6 +286,11 @@ fn op_name(method: &str) -> &'static str {
 /// `reply: None`。入口で [`MAX_LINE_BYTES`] を超える入力を解析前に拒否する。JSON 符号化は呼び出し側
 /// （[`serve`]）が行う。外部入力は `get()` / `as_*()` で取り出し panic しない。
 pub fn handle_message(line: &[u8]) -> Outcome {
+    handle_message_with(line, &UnavailableBackend)
+}
+
+/// [`handle_message`] のバックエンド指定版。`tools/call` の実行を `backend` へ委ねる（MCP-2）。
+pub fn handle_message_with(line: &[u8], backend: &dyn ToolBackend) -> Outcome {
     if line.len() > MAX_LINE_BYTES {
         return error_outcome(
             "other",
@@ -368,15 +389,107 @@ pub fn handle_message(line: &[u8]) -> Outcome {
             },
         ),
         "ping" => success(op, id, json!({})),
-        // スタブ（REPAIR-3）: TASK-118.3（#466）で実装する。
-        "tools/call" => error_outcome(
-            op,
-            id,
-            INTERNAL_ERROR,
-            "Not implemented",
-            Some("UNIMPLEMENTED"),
-        ),
+        "tools/call" => tools_call(id, obj.get("params"), backend),
         _ => error_outcome(op, id, METHOD_NOT_FOUND, "Method not found", None),
+    }
+}
+
+/// 引数不正（`-32602`）の応答。`message` は固定文言で、ツール名・ID を反射させない。
+fn invalid_arguments(id: Value) -> Outcome {
+    error_outcome(
+        "tools/call",
+        id,
+        INVALID_PARAMS,
+        "Invalid params",
+        Some("INVALID_ARGUMENT"),
+    )
+}
+
+/// バックエンドの業務エラー分類ごとの固定文言（ERR-1）。core の `TraitError::message` はパス等を含み得るため
+/// 出力へ流さない。仮実装（REPAIR-3）: ERR-5 の対応表は TASK-120（#469・#470）で `error.rs` に置き換える。
+fn tool_error_message(code: ErrorCode) -> &'static str {
+    match code {
+        ErrorCode::InvalidArgument => "Invalid argument",
+        ErrorCode::NotFound => "Container not found",
+        ErrorCode::AlreadyExists => "Already exists",
+        ErrorCode::FailedPrecondition => "Operation not allowed in the current state",
+        ErrorCode::Unimplemented => "Not implemented",
+        ErrorCode::PermissionDenied => "Permission denied",
+        ErrorCode::Timeout => "Operation timed out",
+        ErrorCode::Unavailable => "Backend unavailable",
+        _ => "Internal error",
+    }
+}
+
+/// 業務エラーの `tools/call` result（`isError: true`）。仮実装（REPAIR-3。TASK-120 で置き換え）。
+fn tool_error_result(tool: &'static str, id: Value, err: &TraitError) -> Outcome {
+    let code = err.code();
+    let body = json!({"code": code.as_str(), "message": tool_error_message(code)});
+    let result = json!({
+        "content": [{"type": "text", "text": body.to_string()}],
+        "isError": true,
+    });
+    let mut out = Outcome::ok(
+        "tools/call",
+        json!({"jsonrpc": "2.0", "id": id, "result": result}),
+    );
+    out.tool = Some(tool);
+    out.tool_error = Some(code.as_str());
+    out
+}
+
+/// ツール成功の `tools/call` result。`structuredContent` と同内容の JSON 文字列を `content` にも載せる（2025-06-18）。
+fn tool_success_result(tool: &'static str, id: Value, structured: impl Serialize) -> Outcome {
+    let Ok(structured) = serde_json::to_value(structured) else {
+        return error_outcome("tools/call", id, INTERNAL_ERROR, "Internal error", None);
+    };
+    let result = json!({
+        "content": [{"type": "text", "text": structured.to_string()}],
+        "structuredContent": structured,
+        "isError": false,
+    });
+    let mut out = Outcome::ok(
+        "tools/call",
+        json!({"jsonrpc": "2.0", "id": id, "result": result}),
+    );
+    out.tool = Some(tool);
+    out
+}
+
+/// `tools/call` の params を検証してツールを実行する（MCP-2）。外部入力は `get()` / `as_*()` で扱う。
+fn tools_call(id: Value, params: Option<&Value>, backend: &dyn ToolBackend) -> Outcome {
+    let Some(params) = params.and_then(Value::as_object) else {
+        return invalid_arguments(id);
+    };
+    let Some(name) = params.get("name").and_then(Value::as_str) else {
+        return invalid_arguments(id);
+    };
+    let args = match params.get("arguments") {
+        None => None,
+        Some(v) => match v.as_object() {
+            Some(o) => Some(o),
+            None => return invalid_arguments(id),
+        },
+    };
+    match name {
+        "list_containers" => match backend.list_containers() {
+            Ok(list) => tool_success_result("list_containers", id, list),
+            Err(e) => tool_error_result("list_containers", id, &e),
+        },
+        "start_container" => {
+            let Some(cid) = args
+                .and_then(|a| a.get("container_id"))
+                .and_then(Value::as_str)
+                .and_then(|s| ContainerId::new(s).ok())
+            else {
+                return invalid_arguments(id);
+            };
+            match backend.start_container(&cid) {
+                Ok(started) => tool_success_result("start_container", id, started),
+                Err(e) => tool_error_result("start_container", id, &e),
+            }
+        }
+        _ => invalid_arguments(id),
     }
 }
 
@@ -386,6 +499,7 @@ where
     R: BufRead + Send + 'static,
     W: Write + Send + 'static,
 {
+    let backend = CoreBackend::production();
     // stderr が詰まっても要求処理を止めないよう、ログは専用スレッドへ非ブロッキングで渡す（REPAIR-5）。
     let (tx, rx) = mpsc::sync_channel::<String>(LOG_QUEUE_DEPTH);
     // 配送完了の合図。終了時に未配送ログを期限付きで待つために使う（REPAIR-4・REPAIR-5）。
@@ -400,7 +514,7 @@ where
             let _ = done_tx.send(());
         });
     let logger_alive = spawned.is_ok();
-    let result = serve_with(reader, writer, Limits::default(), &mut |line| {
+    let result = serve_with(reader, writer, Limits::default(), &backend, &mut |line| {
         if logger_alive {
             // 満杯・切断時は捨てる（try_send は待たない）。
             let _ = tx.try_send(line.to_owned());
@@ -503,11 +617,17 @@ fn log_request(log: &mut dyn FnMut(&str), outcome: &Outcome, started: Instant) {
         (Some(_), None) => "ok",
         (Some(_), Some(_)) => "error",
     };
+    let result = if outcome.tool_error.is_some() {
+        "tool_error"
+    } else {
+        result
+    };
     let line = json!({
         "event": "mcp.request",
         "op": outcome.op,
+        "tool": outcome.tool,
         "result": result,
-        "code": outcome.error_code,
+        "code": outcome.tool_error.map_or_else(|| json!(outcome.error_code), |c| json!(c)),
         "latency_us": u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
     });
     log(&line.to_string());
@@ -525,6 +645,7 @@ pub fn serve_with<R, W>(
     mut reader: R,
     mut writer: W,
     limits: Limits,
+    backend: &dyn ToolBackend,
     log: &mut dyn FnMut(&str),
 ) -> Result<(), ServeError>
 where
@@ -668,7 +789,7 @@ where
                 if data.iter().all(u8::is_ascii_whitespace) {
                     continue;
                 }
-                handle_message(&data)
+                handle_message_with(&data, backend)
             }
         };
         if let Some(reply) = &outcome.reply {
@@ -706,6 +827,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{ContainerList, ContainerSummary, StartedSummary};
     use std::io::Cursor;
     use std::sync::{Arc, Mutex};
 
@@ -744,9 +866,15 @@ mod tests {
     fn run(input: String, limits: Limits) -> (Result<(), ServeError>, String, Vec<String>) {
         let out = SharedBuf::default();
         let mut logs = Vec::new();
-        let r = serve_with(Cursor::new(input), out.clone(), limits, &mut |l| {
-            logs.push(l.to_owned());
-        });
+        let r = serve_with(
+            Cursor::new(input),
+            out.clone(),
+            limits,
+            &UnavailableBackend,
+            &mut |l| {
+                logs.push(l.to_owned());
+            },
+        );
         (r, out.text(), logs)
     }
 
@@ -842,7 +970,9 @@ mod tests {
             Outcome {
                 reply: None,
                 op: "notification",
-                error_code: None
+                error_code: None,
+                tool: None,
+                tool_error: None,
             }
         );
     }
@@ -861,11 +991,196 @@ mod tests {
         );
     }
 
+    /// 固定の結果を返すフェイクバックエンド。
+    struct Fake {
+        list: Result<ContainerList, TraitError>,
+        start: Result<StartedSummary, TraitError>,
+    }
+
+    impl ToolBackend for Fake {
+        fn list_containers(&self) -> Result<ContainerList, TraitError> {
+            self.list.clone()
+        }
+        fn start_container(&self, _id: &ContainerId) -> Result<StartedSummary, TraitError> {
+            self.start.clone()
+        }
+    }
+
+    fn summary(id: &str, status: &str, pid: Option<u32>) -> ContainerSummary {
+        ContainerSummary {
+            id: id.to_owned(),
+            status: status.to_owned(),
+            pid,
+        }
+    }
+
+    fn fake_ok() -> Fake {
+        Fake {
+            list: Ok(ContainerList {
+                containers: vec![
+                    summary("c1", "running", Some(42)),
+                    summary("c2", "created", None),
+                ],
+                truncated: false,
+            }),
+            start: Ok(summary("c1", "running", Some(42))),
+        }
+    }
+
+    fn fake_err(code: ErrorCode, msg: &str) -> Fake {
+        Fake {
+            list: Err(TraitError::new(code, msg)),
+            start: Err(TraitError::new(code, msg)),
+        }
+    }
+
+    fn call_with(line: &str, backend: &dyn ToolBackend) -> Value {
+        handle_message_with(line.as_bytes(), backend).reply.unwrap()
+    }
+
+    fn tools_call_req(params: &str) -> String {
+        format!(r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{params}}}"#)
+    }
+
     #[test]
-    fn tools_call_is_unimplemented_32603() {
-        let v = call(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{}}"#).unwrap();
-        assert_eq!(v["error"]["code"], -32603);
-        assert_eq!(v["error"]["data"]["code"], "UNIMPLEMENTED");
+    fn mcp2_tools_call_list_containers_returns_records() {
+        let v = call_with(&tools_call_req(r#"{"name":"list_containers"}"#), &fake_ok());
+        let expected = json!({"containers":[
+            {"id":"c1","status":"running","pid":42},
+            {"id":"c2","status":"created","pid":null}
+        ],"truncated":false});
+        assert_eq!(v["result"]["isError"], false);
+        assert_eq!(v["result"]["structuredContent"], expected);
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(serde_json::from_str::<Value>(text).unwrap(), expected);
+        assert_eq!(v["result"]["content"][0]["type"], "text");
+    }
+
+    #[test]
+    fn mcp2_tools_call_start_container_returns_started() {
+        let v = call_with(
+            &tools_call_req(r#"{"name":"start_container","arguments":{"container_id":"c1"}}"#),
+            &fake_ok(),
+        );
+        assert_eq!(v["result"]["isError"], false);
+        assert_eq!(
+            v["result"]["structuredContent"],
+            json!({"id":"c1","status":"running","pid":42})
+        );
+    }
+
+    #[test]
+    fn mcp2_tools_call_unknown_tool_is_32602_without_echo() {
+        let v = call_with(&tools_call_req(r#"{"name":"zzSECRETzz"}"#), &fake_ok());
+        assert_eq!(v["error"]["code"], -32602);
+        assert_eq!(v["error"]["data"]["code"], "INVALID_ARGUMENT");
+        assert!(!v.to_string().contains("zzSECRETzz"));
+    }
+
+    #[test]
+    fn mcp2_tools_call_rejects_bad_params_with_32602() {
+        let long_id = "a".repeat(256);
+        let cases = [
+            "[]".to_owned(),
+            "{}".to_owned(),
+            r#"{"name":1}"#.to_owned(),
+            r#"{"name":"list_containers","arguments":[]}"#.to_owned(),
+            r#"{"name":"start_container"}"#.to_owned(),
+            r#"{"name":"start_container","arguments":{}}"#.to_owned(),
+            r#"{"name":"start_container","arguments":{"container_id":1}}"#.to_owned(),
+            r#"{"name":"start_container","arguments":{"container_id":"a/b"}}"#.to_owned(),
+            r#"{"name":"start_container","arguments":{"container_id":".."}}"#.to_owned(),
+            r#"{"name":"start_container","arguments":{"container_id":""}}"#.to_owned(),
+            format!(r#"{{"name":"start_container","arguments":{{"container_id":"{long_id}"}}}}"#),
+        ];
+        for params in cases {
+            let v = call_with(&tools_call_req(&params), &fake_ok());
+            assert_eq!(v["error"]["code"], -32602, "params: {params}");
+            assert_eq!(v["error"]["data"]["code"], "INVALID_ARGUMENT");
+        }
+        // params 省略。
+        let v = call_with(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call"}"#,
+            &fake_ok(),
+        );
+        assert_eq!(v["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn mcp4_backend_business_error_sets_is_error_with_fixed_message() {
+        let cases = [
+            (ErrorCode::NotFound, "NOT_FOUND", "Container not found"),
+            (
+                ErrorCode::FailedPrecondition,
+                "FAILED_PRECONDITION",
+                "Operation not allowed in the current state",
+            ),
+            (ErrorCode::Unimplemented, "UNIMPLEMENTED", "Not implemented"),
+            (ErrorCode::Timeout, "TIMEOUT", "Operation timed out"),
+        ];
+        for (code, name, message) in cases {
+            let backend = fake_err(code, "/secret/path/zzSECRETzz");
+            for params in [
+                r#"{"name":"list_containers"}"#,
+                r#"{"name":"start_container","arguments":{"container_id":"c1"}}"#,
+            ] {
+                let v = call_with(&tools_call_req(params), &backend);
+                assert_eq!(v["result"]["isError"], true);
+                let text = v["result"]["content"][0]["text"].as_str().unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(text).unwrap(),
+                    json!({"code": name, "message": message})
+                );
+                assert!(!v.to_string().contains("zzSECRETzz"));
+                assert!(v.get("error").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn mcp2_unavailable_backend_reports_unimplemented_via_handle_message() {
+        let o = handle_message(tools_call_req(r#"{"name":"list_containers"}"#).as_bytes());
+        let v = o.reply.unwrap();
+        assert_eq!(v["result"]["isError"], true);
+        assert_eq!(o.tool_error, Some("UNIMPLEMENTED"));
+        assert_eq!(o.tool, Some("list_containers"));
+    }
+
+    #[test]
+    fn serve_logs_tool_name_without_input_values() {
+        let input = format!(
+            "{}\n{}\n",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"start_container","arguments":{"container_id":"zzSECRETzz"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_containers"}}"#,
+        );
+        let out = SharedBuf::default();
+        let mut logs = Vec::new();
+        serve_with(
+            Cursor::new(input),
+            out.clone(),
+            Limits::default(),
+            &fake_ok(),
+            &mut |l| logs.push(l.to_owned()),
+        )
+        .unwrap();
+        let recs: Vec<Value> = logs
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(recs[0]["tool"], "start_container");
+        assert_eq!(recs[0]["result"], "ok");
+        assert_eq!(recs[1]["tool"], "list_containers");
+        assert!(logs.iter().all(|l| !l.contains("zzSECRETzz")));
+        // 業務エラーはログ上で区別する。
+        let o = handle_message_with(
+            tools_call_req(r#"{"name":"list_containers"}"#).as_bytes(),
+            &fake_err(ErrorCode::NotFound, "x"),
+        );
+        let mut logs = Vec::new();
+        log_request(&mut |l| logs.push(l.to_owned()), &o, Instant::now());
+        let rec: Value = serde_json::from_str(&logs[0]).unwrap();
+        assert_eq!(rec["result"], "tool_error");
+        assert_eq!(rec["code"], "NOT_FOUND");
     }
 
     #[test]
@@ -1055,6 +1370,7 @@ mod tests {
             StallReader { sent: false },
             SharedBuf::default(),
             limits,
+            &UnavailableBackend,
             &mut |l| logs.push(l.to_owned()),
         );
         assert!(matches!(r, Err(ServeError::ReadTimeout)));
@@ -1079,7 +1395,13 @@ mod tests {
             ..Limits::default()
         };
         let input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
-        let r = serve_with(Cursor::new(input), StallWriter, limits, &mut |_| {});
+        let r = serve_with(
+            Cursor::new(input),
+            StallWriter,
+            limits,
+            &UnavailableBackend,
+            &mut |_| {},
+        );
         assert!(matches!(r, Err(ServeError::WriteTimeout)));
     }
 
@@ -1145,7 +1467,9 @@ mod tests {
             ],
         };
         let mut logs = Vec::new();
-        let r = serve_with(reader, SlowWriter, limits, &mut |l| logs.push(l.to_owned()));
+        let r = serve_with(reader, SlowWriter, limits, &UnavailableBackend, &mut |l| {
+            logs.push(l.to_owned())
+        });
         assert!(matches!(r, Err(ServeError::ReadTimeout)), "{r:?}");
         assert!(logs.iter().any(|l| l.contains("DEADLINE_EXCEEDED")));
     }
@@ -1169,6 +1493,7 @@ mod tests {
             Cursor::new(input.into_bytes()),
             SlowWriter,
             limits,
+            &UnavailableBackend,
             &mut |_| {},
         );
         assert!(r.is_ok(), "{r:?}");

@@ -159,6 +159,14 @@ name = "landlock_implicit_dev"
 path = "tests/landlock_implicit_dev.rs"
 harness = false
 
+# 既定のデバイス制限（デバイス cgroup の EPERM・rootfs の nodev の EACCES）の層ごとの実機照合（SEC-1・CORE-4・TASK-32 追補・#1681）。
+# 子を新しい PID namespace の PID 1 にするため、親は単一スレッドで分離する必要があり harness = false。`-- --ignored` 指定時のみ
+# 実行する実機前提テスト（root・cgroup v2 の委譲スコープ・bpf(2) の cgroup-device 対応。AGENTS.md）。
+[[test]]
+name = "device_cgroup_layers"
+path = "tests/device_cgroup_layers.rs"
+harness = false
+
 # tmpfs マウント（mount_tmpfs。--shm-size / --tmpfs）の結合試験（SUP-12・TASK-169.2）。上と同じ理由で
 # harness = false。`-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
 [[test]]

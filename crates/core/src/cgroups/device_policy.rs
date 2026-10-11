@@ -70,7 +70,9 @@
 //! `device_prog_attach`）が呼び出しを記録して差し込み値を返す。root で単体テストを走らせてもホストの
 //! cgroup には届かない。このため lib の試験バイナリでは入口の本番経路（実際の `bpf(2)`）は通らず、
 //! 入口の結合試験は `crates/core/tests/cgroup_device_policy_rootless.rs` / `cgroup_device_policy_rootful.rs`
-//! （委譲 cgroup・root を要するため `#[ignore]` の実機前提テスト）に置く。
+//! （委譲 cgroup・root を要するため `#[ignore]` の実機前提テスト）に置く。層ごとの errno の実機照合
+//! （デバイス cgroup の `EPERM`・rootfs の `nodev` の `EACCES`）は `tests/device_cgroup_layers.rs`（#1681。
+//! 問い合わせは本モジュールの `query_device_programs_for_test`）が担う。
 
 use std::os::fd::BorrowedFd;
 
@@ -345,6 +347,48 @@ fn bpf_load_error(e: &bpf::BpfProgLoadError) -> CgroupError {
         .with_verifier_log(log);
     }
     bpf_sys_error(step, "BPF_PROG_LOAD", e.cause, LOAD_EPERM_HINT)
+}
+
+/// 実機結合試験専用の問い合わせ結果（`BPF_PROG_QUERY`・`BPF_CGROUP_DEVICE`）。
+///
+/// `sys` の型を外へ出さないための写し。`tests/device_cgroup_layers.rs` が、コンテナ用 cgroup にプログラムが 1 件・
+/// attach flags 0 で付き、子孫の `exec-*` 自身には付かず、後始末の後にホストの cgroup へ残らないことを
+/// ID で照合するために使う（SEC-1・CORE-4・TASK-32 追補・#1681）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DeviceProgramQueryForTest {
+    /// その cgroup 自身に付いているプログラムの数。
+    pub prog_count: u32,
+    /// attach flags。
+    pub attach_flags: u32,
+    /// プログラム ID。
+    pub prog_ids: Vec<u32>,
+}
+
+/// `cgroup`（O_PATH でもよい cgroup ディレクトリの fd）に付いたデバイス用プログラムを問い合わせる。
+///
+/// 常に実際の `bpf(2)` を呼ぶ（`cfg(test)` の dry-run 差し込みを通さない）。結合試験専用で、
+/// `exec-test-support` feature を付けたビルドにだけ存在する。失敗は `QueryDeviceProgram` 段の `CgroupError`。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn query_device_programs_for_test(
+    cgroup: BorrowedFd<'_>,
+) -> Result<DeviceProgramQueryForTest, CgroupError> {
+    let q = bpf::bpf_prog_query_cgroup_device(cgroup).map_err(|e| {
+        bpf_sys_error(
+            CgroupStep::QueryDeviceProgram,
+            "BPF_PROG_QUERY (test)",
+            e,
+            QUERY_EPERM_HINT,
+        )
+    })?;
+    Ok(DeviceProgramQueryForTest {
+        prog_count: q.prog_count(),
+        attach_flags: q.attach_flags(),
+        prog_ids: q.prog_ids().to_vec(),
+    })
 }
 
 // ---------------------------------------------------------------------------------------------

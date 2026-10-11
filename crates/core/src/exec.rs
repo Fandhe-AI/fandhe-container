@@ -103,6 +103,7 @@ use crate::traits::types::ErrorCode;
 mod capabilities;
 mod cgroup_join;
 mod container_env;
+mod device_probe;
 mod devices;
 mod diagnostic;
 mod entrypoint_mode;
@@ -138,6 +139,11 @@ pub use cgroup_join::{
 #[cfg(feature = "exec-test-support")]
 pub use cgroup_join::{remove_exec_child_cgroup_in, sweep_stale_exec_child_cgroups_in};
 pub use container_env::{ContainerEnv, ExecCommand};
+/// 結合試験 `tests/device_cgroup_layers.rs` 専用の再公開（SEC-1・TASK-32 追補・#1681。通常の利用者は呼ばない。
+/// 詳細は定義側）。`exec-test-support` feature を付けたビルドにだけ存在する。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use device_probe::{PtySlaveProbe, make_char_device_for_test, open_pty_slave_for_test};
 pub use devices::{
     DeviceLinkOutcome, DeviceLinkStatus, DeviceNodeOutcome, DeviceNodeStatus, DeviceReport,
     DevptsDirStatus, DevptsGidSource, DevptsOutcome, create_default_devices,

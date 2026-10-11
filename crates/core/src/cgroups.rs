@@ -61,6 +61,8 @@
 //!   ロード → アタッチ（flags 0）→ 事後問い合わせの照合を行い、rootless では何も試さず
 //!   [`DevicePolicyOutcome::NotApplied`] を返す。start の連鎖の制限の段（[`CgroupPrepared::apply_limits`]）から呼ぶ
 //!   （#1716。`IsolationPrivilege` からの変換は `From` 実装。supervisor からの呼び出しは #1717）
+//!   層ごとの errno の実機照合（デバイス cgroup の `EPERM`・rootfs の `nodev` の `EACCES`。#1681）は `tests/device_cgroup_layers.rs`
+//!   （実機前提・root。実行は人間担当で記録先は #1621）
 //!
 //! - delete 時の cgroup 削除（TASK-30.3・OCI-6）: [`DelegatedCgroup::open_child`] で名前から既存の子 cgroup を
 //!   検証つきで開き、`oci_runtime::ContainerCgroupRemover` の実装として [`DelegatedCgroup::remove_child`] へ渡す
@@ -85,7 +87,7 @@
 //! 有無が分かれる非対称の再発を防ぐ、(c) 事前検証を含む全終了経路を漏れなく数えられる。
 //!
 //! # 未実装（REPAIR-3）
-//! - デバイス cgroup の supervisor・launcher からの呼び出しの結線（#1717・#1715）・入口の実機試験と verifier・EPERM の実機照合（#1681）・GPU の `deviceNodes` の追加（#562）
+//! - デバイス cgroup の supervisor・launcher からの呼び出しの結線（#1717・#1715）・GPU の `deviceNodes` の追加（#562）
 //! - OCI `linux.resources` から `set_memory_limits` / `set_cpu_max` への反映、本番 launcher での
 //!   `detect` → `prepare` → `join_hook` の結線（TASK-29 / TASK-157 系）
 //! - OCI `linux.cgroupsPath` の反映・start 時の委譲スコープの追記の連鎖（`start_chain`。#1716）の supervisor
@@ -129,6 +131,10 @@ mod device_policy;
 pub use device_policy::{
     AppliedDevicePolicy, DevicePolicyMode, DevicePolicyNotApplied, DevicePolicyOutcome,
 };
+/// 結合試験 `tests/device_cgroup_layers.rs` 専用の再公開（SEC-1・TASK-32 追補・#1681。通常の利用者は呼ばない）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use device_policy::{DeviceProgramQueryForTest, query_device_programs_for_test};
 mod start_chain;
 pub use start_chain::{
     CgroupLimitPlan, CgroupLimitReport, CgroupLimited, CgroupPrepared, CgroupScopeRecorded,

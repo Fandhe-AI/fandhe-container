@@ -13,14 +13,20 @@
 //!
 //! 公開入口を本番ビルド（`cfg(test)` の差し込みなし）で通す。rootless では `bpf(2)` を呼ばないため
 //! 特権なしで結果型を具体値照合できる。root・`Rootful` の経路は `cgroup_device_policy_rootful.rs`。
+//!
+//! 「`bpf(2)` を呼ばない」ことの証拠として、同じ非 root のプロセスで `Rootful` を申告した対照を足す（#1681）。
+//! 非 root ではどの `bpf(2)` も `EPERM` になり、`Rootful` の入口は最初の `BPF_PROG_QUERY` の `EPERM` を
+//! `PermissionDenied`（段は `QueryDeviceProgram`）の `Err` に写す。したがって `Rootless` が `Ok` を返したことは、
+//! `bpf(2)` を呼んでいない（呼んでいれば同じ `EPERM` が `Err` になる）ことを意味する。
 
 #[cfg(target_os = "linux")]
 mod linux {
     use fandhe_container_core::cgroups::{
-        CgroupName, DelegatedCgroup, DevicePolicyMode, DevicePolicyNotApplied, DevicePolicyOutcome,
+        CgroupName, CgroupStep, DelegatedCgroup, DevicePolicyMode, DevicePolicyNotApplied,
+        DevicePolicyOutcome,
     };
     use fandhe_container_core::observability::OpRecorder;
-    use fandhe_container_core::traits::ContainerId;
+    use fandhe_container_core::traits::{ContainerId, ErrorCode};
 
     /// `/proc/self/status` の実効 UID（`Uid:` 行の 3 番目の値）。
     fn euid() -> u32 {
@@ -53,6 +59,13 @@ mod linux {
             outcome,
             DevicePolicyOutcome::NotApplied(DevicePolicyNotApplied::Rootless)
         );
+
+        // 対照: 同じ非 root で Rootful を申告すると bpf(2) の EPERM が Err になる。
+        let err = child
+            .apply_default_device_policy(&OpRecorder::new(), DevicePolicyMode::Rootful)
+            .expect_err("rootful apply as non-root must fail with EPERM");
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert_eq!(err.step, CgroupStep::QueryDeviceProgram);
 
         delegated.remove_child(&child).expect("remove child cgroup");
     }

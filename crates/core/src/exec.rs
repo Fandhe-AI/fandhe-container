@@ -347,6 +347,7 @@ pub fn record_exec_target_rejection<E>(
 /// `reason` は `ViolationReason::EXEC_WORKER_REASONS` で引き直した値を渡す。種別 `exec_target` は層 `exec_target`
 /// （[`record_exec_target_rejection`] と同じレコード）、種別 `rootfs_pivot`（`rootfs_is_host_root`）は
 /// [`audit_mount_violation`] と同じ写像で層 `mount` のパスなし・理由コードつきのレコードにする（`ViolationReason::exec_worker_audit_event`）。
+/// 種別 `mount_target`（bundle の rootfs の固定が検証後の差し替えで拒否した `path_symlink_or_not_directory`・`path_missing`。#1702）も同じ。
 /// 一覧外の理由は記録せず `NotApplicable`。時刻と PID は呼び出したプロセスのもの。記録の成否で `error` は
 /// 変わらない（fail-closed）。
 ///
@@ -1697,6 +1698,7 @@ fn mount_proc_syscall(target: &std::ffi::CStr) -> Result<(), SysError> {
 /// symlink へ差し替えても、祖先を改名しても、辿る実体は固定した rootfs の中に留まる。O_PATH は
 /// 読み取り権限を要求しないため、実行権限のみの祖先（`CLONE_NEWUSER` 後のホスト所有
 /// ディレクトリ等）も辿れる。
+/// `RootfsDir::pin` は `PathSymlinkOrNotDirectory`・`PathMissing` の違反だけを `RootfsPinError` で運び、exec の経路が層 `mount` に記録する（#1702）。
 ///
 /// 拒否は違反記録付きの `InvalidArgument`:
 /// - rootfs 側（対象は `rootfs`）: symlink・非ディレクトリ → `RootfsSymlinkOrNotDirectory`、

@@ -11,6 +11,10 @@
 //! `reject_own_root`（`reject_own_root_for_test`）を本番と同じ worker の中で呼び、結果行を経た親側の記録が層 `mount`・理由コードつき・
 //! パスなし・1 件になること、本番の記録先の JSON Lines に同じ 1 行が届くことを照合する。
 //!
+//! bundle の rootfs の固定が検証後の差し替え（symlink・不在。種別 `mount_target` の `path_symlink_or_not_directory`・
+//! `path_missing`。#1702）で拒否した場合も、試験専用の差し込み（`pin_exec_bundle_with_swap_for_test`）を本番と同じ
+//! worker の中で走らせ、親側の記録が層 `mount`・理由コードつき・パスなし・1 件になることを照合する。
+//!
 //! fork は呼び出しプロセスが単一スレッドであることを要求するため、`harness = false` の単一スレッド `main` で動かす
 //! （`exec_timeout` と同じ。root・実コンテナ不要で既定のテスト集合で実行する）。
 
@@ -38,7 +42,8 @@ mod linux {
         StateRevision, TraitError,
     };
     use fandhe_container_supervisor::exec::{
-        ExecOutcome, ExecRequest, default_audit_sink, run_command, run_in_worker_audited_for_test,
+        ExecOutcome, ExecRequest, default_audit_sink, pin_exec_bundle_with_swap_for_test,
+        run_command, run_in_worker_audited_for_test, run_in_worker_trait_audited_for_test,
     };
 
     pub fn run() {
@@ -49,6 +54,8 @@ mod linux {
         non_running_record_is_not_audited();
         worker_rootfs_rejection_is_recorded_once_as_mount_without_path();
         worker_rootfs_rejection_reaches_the_audit_file_as_one_mount_line();
+        pin_swap_after_validation_is_recorded_once_as_mount_without_path();
+        pin_swap_after_validation_reaches_the_audit_file_as_one_mount_line();
         println!("exec_audit: all scenarios passed");
     }
 
@@ -344,6 +351,102 @@ mod linux {
             assert!(!line.contains("entrypoint"), "{line}");
         });
         let _ = std::fs::remove_dir_all(&dir);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// 使い捨ての bundle（`config.json` と `rootfs/`）。祖先に symlink を含まない実パスに作る。
+    fn make_bundle(name: &str) -> PathBuf {
+        let base = std::fs::canonicalize(std::env::temp_dir()).expect("temp dir");
+        let dir = base.join(format!("fandhe-exec-audit-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("rootfs")).expect("bundle");
+        std::fs::write(
+            dir.join("config.json"),
+            br#"{"ociVersion":"1.2.0","root":{"path":"rootfs"}}"#,
+        )
+        .expect("config");
+        dir
+    }
+
+    /// 本番と同じ worker の中で、検証後に rootfs を差し替えて固定させる。`to_symlink` なら symlink、でなければ不在。
+    fn pin_swap_in_worker(
+        bundle: &Path,
+        to_symlink: bool,
+        sink: &dyn AuditSink,
+    ) -> fandhe_container_core::audit_log::AuditedRejection<TraitError> {
+        run_in_worker_trait_audited_for_test(
+            Duration::from_secs(30),
+            || -> Result<ExecOutcome, TraitError> {
+                pin_exec_bundle_with_swap_for_test(bundle, || {
+                    std::fs::remove_dir(bundle.join("rootfs")).expect("remove rootfs");
+                    if to_symlink {
+                        std::os::unix::fs::symlink("/", bundle.join("rootfs")).expect("symlink");
+                    }
+                })?;
+                panic!("the swapped rootfs must be rejected");
+            },
+            Some(&cid()),
+            sink,
+        )
+        .expect_err("the swapped rootfs must be rejected")
+    }
+
+    /// SEC-4・SEC-1・SUP-6・#1702: 検証後の rootfs の差し替え（symlink / 不在）は、結果行を経て親側で層 `mount` の
+    /// 1 件（理由コードつき・パスなし・親〔自〕プロセスの PID）になる。`code` と文言（`rootfs changed after validation`）は不変。
+    fn pin_swap_after_validation_is_recorded_once_as_mount_without_path() {
+        for (name, to_symlink, reason) in [
+            ("symlink", true, "path_symlink_or_not_directory"),
+            ("missing", false, "path_missing"),
+        ] {
+            let bundle = make_bundle(name);
+            let sink = VecSink::new(false);
+            let rejected = pin_swap_in_worker(&bundle, to_symlink, &sink);
+            let _ = std::fs::remove_dir_all(&bundle);
+            assert_eq!(rejected.error.code(), ErrorCode::PermissionDenied);
+            assert_eq!(
+                rejected.error.message(),
+                format!(
+                    "exec stage Validate: rootfs changed after validation \
+                     (violation: mount_target/{reason}, CORE-1)"
+                )
+            );
+            assert_eq!(rejected.delivery, AuditDelivery::Recorded);
+            let recs = sink.snapshot();
+            assert_eq!(recs.len(), 1, "{reason}");
+            assert_eq!(recs[0].layer(), AuditLayer::Mount);
+            assert_eq!(recs[0].reason().map(|r| r.as_str()), Some(reason));
+            assert_eq!(recs[0].path(), None);
+            assert_eq!(recs[0].pid().get(), std::process::id());
+            assert_eq!(recs[0].container_id().map(|c| c.as_str()), Some("c1"));
+        }
+    }
+
+    /// SEC-4・#1702: 本番の記録先（`FileAuditSink`）の JSON Lines に層 `mount`・`path` null・理由コードつきの 1 行が届き、
+    /// bundle のパスは載らない。
+    fn pin_swap_after_validation_reaches_the_audit_file_as_one_mount_line() {
+        let dir = private_dir();
+        let bundle = make_bundle("file");
+        let result = std::panic::catch_unwind(|| {
+            let sink = default_audit_sink(Some(dir.clone())).expect("production audit sink");
+            let rejected = pin_swap_in_worker(&bundle, true, &sink);
+            assert_eq!(rejected.delivery, AuditDelivery::Recorded);
+            let text = std::fs::read_to_string(dir.join("@audit.log")).expect("read audit file");
+            assert_eq!(text.lines().count(), 1, "{text}");
+            let line = text.lines().next().expect("one line");
+            assert!(line.contains("\"layer\":\"mount\""), "{line}");
+            assert!(line.contains("\"path\":null"), "{line}");
+            assert!(
+                line.ends_with(
+                    "\"path_original_len\":null,\"reason\":\"path_symlink_or_not_directory\",\"container_id\":\"c1\"}"
+                ),
+                "{line}"
+            );
+            assert!(!line.contains(bundle.to_string_lossy().as_ref()), "{line}");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&bundle);
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }

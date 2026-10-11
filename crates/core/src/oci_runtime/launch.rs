@@ -138,6 +138,50 @@ pub struct RootfsDir {
     never: std::convert::Infallible,
 }
 
+/// `RootfsDir::pin` の失敗（拒否の `TraitError` と、記録すべき分離違反の理由。SEC-4・SEC-1・SUP-6・#1702）。
+///
+/// `TraitError` は違反記録を運べないため、`rootfs changed after validation`（検証後に bundle 配下の要素が
+/// symlink・非ディレクトリ・不在へ差し替えられた）のときだけ理由を並べて持つ。supervisor の exec の経路
+/// （`load_exec_bundle`）が [`pin_bundle_rootfs_audited`] で受け取り、拒否は `error` のまま、理由は
+/// 親プロセスが監査ログの層 `mount` へ記録する。理由だけを持ち（`IsolationViolation` の subject は持たない）、
+/// ホスト側の bundle パスを呼び出し側へ渡さない。違反を伴わない失敗（I/O エラー・検証前の失敗・bundle 自体や
+/// 祖先の差し替え）は `violation` が `None`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootfsPinError {
+    error: TraitError,
+    violation: Option<crate::exec::ViolationReason>,
+}
+
+impl RootfsPinError {
+    fn without_violation(error: TraitError) -> Self {
+        Self {
+            error,
+            violation: None,
+        }
+    }
+
+    /// 拒否の `TraitError`（`code` と固定文言。start と共通）。
+    pub fn error(&self) -> &TraitError {
+        &self.error
+    }
+
+    /// 記録すべき分離違反の理由（`path_symlink_or_not_directory` / `path_missing`）。違反を伴わない失敗は `None`。
+    pub fn violation(&self) -> Option<crate::exec::ViolationReason> {
+        self.violation
+    }
+
+    /// 違反の情報を捨てて `TraitError` だけを取り出す。
+    pub fn into_error(self) -> TraitError {
+        self.error
+    }
+}
+
+impl From<RootfsPinError> for TraitError {
+    fn from(e: RootfsPinError) -> Self {
+        e.error
+    }
+}
+
 impl RootfsDir {
     /// `bundle`（絶対パス）配下の `rootfs` を、祖先を含む全要素を symlink 非追従で辿って固定する。
     ///
@@ -146,10 +190,17 @@ impl RootfsDir {
     /// （`rootfs changed after validation`）、bundle 自体やその祖先が symlink を含む・ディレクトリで
     /// ないなら `InvalidArgument`。本番 launcher の `exec::prepare_rootfs` も `/` から同じ条件で rootfs を
     /// 辿るため、ここで先に拒否する。メッセージは固定文言のみ（パス・errno を含めない）。
+    ///
+    /// 前者（`rootfs changed after validation`）に限り、`open_dir_beneath` が返した違反の理由
+    /// （`path_symlink_or_not_directory`・`path_missing`）を [`RootfsPinError::violation`] で運ぶ
+    /// （SEC-4・SEC-1・SUP-6・#1702）。exec の経路（supervisor の `load_exec_bundle`）はこれを監査ログの層
+    /// `mount` へ記録する。start の経路は `AuditSink` の配線が無いため記録しない（本番 launcher の構成 #1314）。
     #[cfg(target_os = "linux")]
-    pub(super) fn pin(bundle: &Path, rootfs: &Path) -> Result<Self, TraitError> {
+    pub(super) fn pin(bundle: &Path, rootfs: &Path) -> Result<Self, RootfsPinError> {
         use crate::exec::ViolationReason;
-        let invalid = |msg: &'static str| TraitError::new(ErrorCode::InvalidArgument, msg);
+        let invalid = |msg: &'static str| {
+            RootfsPinError::without_violation(TraitError::new(ErrorCode::InvalidArgument, msg))
+        };
         if !bundle.is_absolute() {
             return Err(invalid("bundle path must be absolute"));
         }
@@ -166,14 +217,23 @@ impl RootfsDir {
         }
         let fd = crate::exec::open_dir_beneath(bundle, &names).map_err(|e| {
             match e.violation.as_ref().map(|v| v.reason) {
-                Some(ViolationReason::PathSymlinkOrNotDirectory | ViolationReason::PathMissing) => {
-                    TraitError::new(
+                // 明示の列挙にする（`exec/violation_scan.rs` がソースから理由名を抽出して一覧と照合する）。
+                Some(
+                    reason @ (ViolationReason::PathSymlinkOrNotDirectory
+                    | ViolationReason::PathMissing),
+                ) => RootfsPinError {
+                    error: TraitError::new(
                         ErrorCode::PermissionDenied,
                         "rootfs changed after validation",
-                    )
-                }
+                    ),
+                    violation: Some(reason),
+                },
+                // bundle 自体や祖先の差し替えは、理由コード `rootfs_*` が bundle を rootfs と誤読させるため運ばない。
                 Some(_) => invalid("bundle path must be a directory reachable without symlinks"),
-                None => TraitError::new(e.code, "failed to open the rootfs directory"),
+                None => RootfsPinError::without_violation(TraitError::new(
+                    e.code,
+                    "failed to open the rootfs directory",
+                )),
             }
         })?;
         Ok(Self { fd: Arc::new(fd) })
@@ -181,11 +241,11 @@ impl RootfsDir {
 
     /// Linux 以外では rootfs を fd で固定できないため、起動仕様を作らず拒否する（fail-closed）。
     #[cfg(not(target_os = "linux"))]
-    pub(super) fn pin(_bundle: &Path, _rootfs: &Path) -> Result<Self, TraitError> {
-        Err(TraitError::new(
+    pub(super) fn pin(_bundle: &Path, _rootfs: &Path) -> Result<Self, RootfsPinError> {
+        Err(RootfsPinError::without_violation(TraitError::new(
             ErrorCode::Unimplemented,
             "start requires Linux to pin the rootfs directory",
-        ))
+        )))
     }
 
     /// 固定した rootfs ディレクトリの fd（O_PATH。dirfd・`/proc/thread-self/fd/N`・`fchdir` 専用）。
@@ -206,7 +266,38 @@ impl RootfsDir {
 ///
 /// エラーは start と同じ固定文言で、パスを含めない。Linux 以外は `Unimplemented`（fail-closed。CLI-1）。
 pub fn pin_bundle_rootfs(bundle: &Path, config: &OciConfig) -> Result<RootfsDir, TraitError> {
-    let rootfs = super::create::check_rootfs(bundle, config.root().path())?;
+    pin_bundle_rootfs_audited(bundle, config).map_err(TraitError::from)
+}
+
+/// [`pin_bundle_rootfs`] と同じ固定を行い、失敗時に分離違反の理由も運ぶ（SEC-4・SEC-1・SUP-6・#1702）。
+///
+/// supervisor の exec の経路（`load_exec_bundle`）が使う。検証後の差し替えによる拒否のとき
+/// [`RootfsPinError::violation`] が `Some` になり、呼び出し側が監査ログへ記録する。検証前の失敗
+/// （`check_rootfs`）は違反を伴わない。
+pub fn pin_bundle_rootfs_audited(
+    bundle: &Path,
+    config: &OciConfig,
+) -> Result<RootfsDir, RootfsPinError> {
+    let rootfs = super::create::check_rootfs(bundle, config.root().path())
+        .map_err(RootfsPinError::without_violation)?;
+    RootfsDir::pin(bundle, &rootfs)
+}
+
+/// 試験専用: [`pin_bundle_rootfs_audited`] の検証（`check_rootfs`）と固定（`pin`）の間で `swap` を呼ぶ。
+///
+/// 「検証後に bundle 配下の要素が差し替えられた」競合を決定的に再現し、exec の経路の記録を結合試験で
+/// 通すための差し込み口（SEC-4・#1702）。本番経路には存在しない（`exec-test-support` feature の下のみ。
+/// この feature を付けたリリースビルドは supervisor が `compile_error!` で拒否する）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn pin_bundle_rootfs_with_swap_for_test(
+    bundle: &Path,
+    config: &OciConfig,
+    swap: impl FnOnce(),
+) -> Result<RootfsDir, RootfsPinError> {
+    let rootfs = super::create::check_rootfs(bundle, config.root().path())
+        .map_err(RootfsPinError::without_violation)?;
+    swap();
     RootfsDir::pin(bundle, &rootfs)
 }
 
@@ -798,8 +889,12 @@ mod tests {
         std::fs::create_dir_all(&bundle).expect("bundle");
         std::os::unix::fs::symlink(&outside, bundle.join("a")).expect("symlink");
         let err = RootfsDir::pin(&bundle, &bundle.join("a").join("rootfs")).expect_err("fail");
-        assert_eq!(err.code(), ErrorCode::PermissionDenied);
-        assert_eq!(err.message(), "rootfs changed after validation");
+        assert_eq!(err.error().code(), ErrorCode::PermissionDenied);
+        assert_eq!(err.error().message(), "rootfs changed after validation");
+        assert_eq!(
+            err.violation(),
+            Some(crate::exec::ViolationReason::PathSymlinkOrNotDirectory)
+        );
     }
 
     /// SEC-1・REPAIR-5: rootfs が FIFO に差し替えられていても open でブロックせず拒否する。
@@ -814,8 +909,12 @@ mod tests {
             .expect("mkfifo");
         assert!(status.success());
         let err = RootfsDir::pin(&t.0, &fifo).expect_err("fail");
-        assert_eq!(err.code(), ErrorCode::PermissionDenied);
-        assert_eq!(err.message(), "rootfs changed after validation");
+        assert_eq!(err.error().code(), ErrorCode::PermissionDenied);
+        assert_eq!(err.error().message(), "rootfs changed after validation");
+        assert_eq!(
+            err.violation(),
+            Some(crate::exec::ViolationReason::PathSymlinkOrNotDirectory)
+        );
     }
 
     /// SEC-1: 固定後に祖先を改名して同名の別ディレクトリを置いても、ハンドルは元の実体を指し続ける。
@@ -844,13 +943,66 @@ mod tests {
         let link = t.0.join("link");
         std::os::unix::fs::symlink(&real, &link).expect("symlink");
         let err = RootfsDir::pin(&link, &link.join("rootfs")).expect_err("fail");
-        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(err.error().code(), ErrorCode::InvalidArgument);
         assert_eq!(
-            err.message(),
+            err.error().message(),
             "bundle path must be a directory reachable without symlinks"
         );
+        // bundle 自体の差し替えは、理由コード `rootfs_*` が bundle を rootfs と誤読させるため運ばない（#1702）。
+        assert_eq!(err.violation(), None);
         let err = RootfsDir::pin(Path::new("rel"), Path::new("rel/rootfs")).expect_err("fail");
-        assert_eq!(err.message(), "bundle path must be absolute");
+        assert_eq!(err.error().message(), "bundle path must be absolute");
+        assert_eq!(err.violation(), None);
+    }
+
+    /// SEC-4・SEC-1・SUP-6・#1702: rootfs が不在へ差し替えられた拒否は `path_missing` を運ぶ（文言・code は不変）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_pin_carries_path_missing_when_rootfs_vanishes() {
+        let t = TempDir::new("gone");
+        let err = RootfsDir::pin(&t.0, &t.0.join("rootfs")).expect_err("fail");
+        assert_eq!(err.error().code(), ErrorCode::PermissionDenied);
+        assert_eq!(err.error().message(), "rootfs changed after validation");
+        assert_eq!(
+            err.violation(),
+            Some(crate::exec::ViolationReason::PathMissing)
+        );
+        assert_eq!(
+            TraitError::from(err).message(),
+            "rootfs changed after validation"
+        );
+    }
+
+    /// SEC-4・#1702: 検証（`check_rootfs`）の後・固定の前の差し替えを、差し込み関数で決定的に再現して拒否と理由を照合する。
+    /// 検証前の失敗は違反を運ばない。
+    #[cfg(all(target_os = "linux", feature = "exec-test-support"))]
+    #[test]
+    fn sec4_pin_bundle_rootfs_with_swap_carries_violation_only_after_validation() {
+        use crate::exec::ViolationReason;
+        let t = TempDir::new("swap");
+        std::fs::write(
+            t.0.join("config.json"),
+            br#"{"ociVersion":"1.2.0","root":{"path":"rootfs"}}"#,
+        )
+        .expect("config");
+        std::fs::create_dir(t.0.join("rootfs")).expect("rootfs");
+        let config = crate::oci_runtime::load_config(&t.0.join("config.json")).expect("config");
+        let err = pin_bundle_rootfs_with_swap_for_test(&t.0, &config, || {
+            std::fs::remove_dir(t.0.join("rootfs")).expect("remove");
+            std::os::unix::fs::symlink("/", t.0.join("rootfs")).expect("symlink");
+        })
+        .expect_err("swapped");
+        assert_eq!(err.error().code(), ErrorCode::PermissionDenied);
+        assert_eq!(
+            err.violation(),
+            Some(ViolationReason::PathSymlinkOrNotDirectory)
+        );
+
+        // 検証前に不在なら `check_rootfs` で拒否され、違反は運ばない。
+        std::fs::remove_file(t.0.join("rootfs")).expect("remove link");
+        let err = pin_bundle_rootfs_audited(&t.0, &config).expect_err("missing");
+        assert_eq!(err.error().code(), ErrorCode::NotFound);
+        assert_eq!(err.violation(), None);
     }
 
     /// CORE-1・REPAIR-5: `ContainerChildProcess::terminate` は実プロセスを kill して回収する。

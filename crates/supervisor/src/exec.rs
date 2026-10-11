@@ -142,7 +142,7 @@
 //!   記録する。worker の制限の準備で生じる rootfs の拒否（種別 `rootfs_pivot` の `rootfs_is_host_root`。worker 自身の
 //!   `/` が bundle の rootfs と同じディレクトリ。SEC-1）も、core の `IsolationViolation::mount_audit_event` と同じ写像で
 //!   層 `mount` のレコード（パスなし・理由コード `rootfs_is_host_root` つき。#1701）として
-//!   1 拒否につき 1 件記録する（#1614 の事後監査の P2）。worker の `err` 行が運ぶ理由はこの 11 種（core の
+//!   1 拒否につき 1 件記録する（#1614 の事後監査の P2）。worker の `err` 行が運ぶ理由はこの 13 種（core の
 //!   `ViolationReason::EXEC_WORKER_REASONS`）だけで、一覧と worker の経路のソースの一致は core の単体テストが固定する。
 //!   `execve` 前の子の拒否（`ExecExit::SetupFailed` の `violation`。種別 `entrypoint` の 8 理由）も
 //!   層 `entrypoint` のレコードとして 1 拒否につき 1 件記録し（#1595）、結果は [`AuditedOutcome::audit`] で返す
@@ -208,14 +208,17 @@
 //!   （`SetupFailed`。種別 `entrypoint`）の層 `entrypoint` での記録も実装済み（#1595）。未実装なのは
 //!   launch 経路（`spawn_container` の子・launcher）で同じ理由が生じたときの記録の配線（#1314。core の
 //!   `exec::audit_entrypoint_violation`）。worker の経路の違反（種別 `exec_target` の 10 理由と種別 `rootfs_pivot` の
-//!   `rootfs_is_host_root`）と exec の子の違反（種別 `entrypoint` の 8 理由）は、いずれもこの入口で記録する（「監査記録」）。
+//!   `rootfs_is_host_root`、bundle の rootfs の固定の種別 `mount_target` の `path_symlink_or_not_directory`・`path_missing`）と
+//!   exec の子の違反（種別 `entrypoint` の 8 理由）は、いずれもこの入口で記録する（「監査記録」）。
 //!   この入口の記録の対象外: 種別 `mount_target` の `target_moved` は launch の `pivot_root` 前だけで生じ、種別
 //!   `rootfs_pivot` のうち `rootfs_is_host_root` 以外（`rootfs_moved` 等）は launch の `prepare_rootfs` / `pivot_root`
 //!   だけで生じる（どちらも worker の結果行に載らず、載っても許可リスト外として拒否し記録しない）。worker の
-//!   bundle の rootfs の固定（`load_exec_bundle` → core の `pin_bundle_rootfs` / `RootfsDir::pin`。start と共有）は、
-//!   検証後の差し替え等によるパス検証の違反（`path_symlink_or_not_directory`・`path_missing` 等）を固定文言の
-//!   `TraitError` へ写して違反の情報を落とすため記録されない（start の経路でも同じ。bundle は supervisor と同じ
-//!   信頼境界にある前提。記録するには `pin` が違反を運べる形にする必要がある）。再起動を越えて残る置き場所・ローテーション・常時の二重記録も未実装（`FileAuditSink` の doc）
+//!   bundle の rootfs の固定（`load_exec_bundle` → core の `pin_bundle_rootfs_audited`）は、検証後の差し替えによる
+//!   `path_symlink_or_not_directory`・`path_missing` を `RootfsPinError` で運び、`from_pin_error` が末尾の目印つきの
+//!   `TraitError`（`code`・文言は従来どおり）にして、他の worker の違反と同じ経路で層 `mount` に記録する（#1702）。
+//!   bundle 自体や祖先の差し替え・I/O エラーは違反を運ばず記録しない。start の経路（core の `RootfsDir::pin`）は
+//!   `AuditSink` の配線が無く記録しない（#1314）。bundle は supervisor と同じ信頼境界にあるため、差し替えは境界の侵害の兆候。
+//!   再起動を越えて残る置き場所・ローテーション・常時の二重記録も未実装（`FileAuditSink` の doc）
 //! - `--ulimit` の指定値の `state.json` への記録。現状は pid1 の実効値を写して代替する（hard は launch を
 //!   超えないが、soft は pid1 が hard の範囲で上げていれば launch の指定より高くなり得る。core の
 //!   `exec/reapply.rs` のモジュール doc）
@@ -239,7 +242,9 @@ use fandhe_container_core::exec::{
     record_exec_worker_rejection, remove_exec_child_cgroup, spawn_exec_command, spawn_exec_worker,
     sweep_stale_exec_child_cgroups,
 };
-use fandhe_container_core::oci_runtime::{OciConfig, RootfsDir, load_config, pin_bundle_rootfs};
+use fandhe_container_core::oci_runtime::{
+    OciConfig, RootfsDir, RootfsPinError, load_config, pin_bundle_rootfs_audited,
+};
 use fandhe_container_core::state_store::{FileStateStore, StateRoot};
 use fandhe_container_core::traits::{
     CgroupPlacement, ContainerId, ContainerState, ErrorCode, StateRecord, TraitError,
@@ -885,7 +890,8 @@ fn attach_sweep(
 /// worker の失敗。拒否のエラーと、worker の経路の違反だった場合のその理由（監査記録の入力。SEC-4・#1465）。
 ///
 /// `violation` は worker の結果行の `<種別>/<理由>` を core の許可リスト（`ViolationReason::EXEC_WORKER_REASONS`。
-/// 種別 `exec_target` の 10 理由と種別 `rootfs_pivot` の `rootfs_is_host_root`）で引き直した値だけを持つ。
+/// 種別 `exec_target` の 10 理由、種別 `rootfs_pivot` の `rootfs_is_host_root`、bundle の rootfs の固定の
+/// 種別 `mount_target` の 2 理由〔#1702〕）で引き直した値だけを持つ。
 /// 未知・一覧外の文字列は結果行の不正として `Internal`（fail-closed）になりここへ来ない。
 #[derive(Debug)]
 struct WorkerFailure {
@@ -1129,7 +1135,8 @@ pub fn run_in_worker_for_test(
 /// 結合試験専用の入口: `work` を本番と同じ worker（fork・結果行の pipe・期限）で実行し、親側の記録点
 /// （`audit_worker_result`）まで通す（SEC-4・SUP-6・#1614 の事後監査。`tests/exec_audit.rs`）。
 ///
-/// `work` の `ExecError` は本番と同じ `from_exec_error` で写す。対象の特定を要する違反（`rootfs_is_host_root` 等）を
+/// `work` の `ExecError` は本番と同じ `from_exec_error` で写す（rootfs の固定の失敗を通すには
+/// [`run_in_worker_trait_audited_for_test`] と [`pin_exec_bundle_with_swap_for_test`]）。対象の特定を要する違反（`rootfs_is_host_root` 等）を
 /// 非特権で起こし、worker の結果行を経た記録を確かめるためだけに使う。`exec-test-support` feature を付けた
 /// ビルドにだけ存在し、本番経路は必ず [`run_command_with_pidfd`] を使う。
 #[cfg(feature = "exec-test-support")]
@@ -1147,6 +1154,42 @@ pub fn run_in_worker_audited_for_test(
         |_| work().map_err(from_exec_error),
     );
     audit_worker_result(result, container, audit)
+}
+
+/// 結合試験専用の入口: [`run_in_worker_audited_for_test`] の `work` が `TraitError` を返す版（`ExecError` の写像を
+/// 通さない。[`pin_exec_bundle_with_swap_for_test`] の結果を本番と同じ worker・親側の記録点まで通す。#1702）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn run_in_worker_trait_audited_for_test(
+    timeout: Duration,
+    work: impl FnOnce() -> Result<ExecOutcome, TraitError>,
+    container: Option<&ContainerId>,
+    audit: &dyn AuditSink,
+) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
+    let result = run_in_worker_with(
+        Deadline::after(timeout),
+        WORKER_GRACE,
+        || Ok(()),
+        |_| work(),
+    );
+    audit_worker_result(result, container, audit)
+}
+
+/// 結合試験専用の入口: `load_exec_bundle` と同じ経路（`config.json` の読み込み → 検証 → rootfs の固定 →
+/// [`from_pin_error`] の写像）で、検証と固定の間に `swap` を挟む（「検証後の差し替え」の再現。#1702）。
+///
+/// 成功時は `Ok(())`（固定した fd は捨てる）。`exec-test-support` feature を付けたビルドにだけ存在する。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn pin_exec_bundle_with_swap_for_test(
+    bundle: &std::path::Path,
+    swap: impl FnOnce(),
+) -> Result<(), TraitError> {
+    let config = load_config(&bundle.join("config.json"))
+        .map_err(|e| TraitError::new(e.code(), format!("exec stage Landlock: {e}")))?;
+    fandhe_container_core::oci_runtime::pin_bundle_rootfs_with_swap_for_test(bundle, &config, swap)
+        .map(|_| ())
+        .map_err(from_pin_error)
 }
 
 /// worker の結果を pipe 用の 1 行へ符号化する。成功は `ok <command|setup> <違反の理由コードまたは -> <exited|signaled>
@@ -1496,9 +1539,33 @@ fn wait_or_stop<T>(
 fn load_exec_bundle(bundle: &std::path::Path) -> Result<(OciConfig, RootfsDir), TraitError> {
     let config = load_config(&bundle.join("config.json"))
         .map_err(|e| TraitError::new(e.code(), format!("exec stage Landlock: {e}")))?;
-    let rootfs = pin_bundle_rootfs(bundle, &config)
-        .map_err(|e| TraitError::new(e.code(), format!("exec stage Validate: {}", e.message())))?;
+    let rootfs = pin_bundle_rootfs_audited(bundle, &config).map_err(from_pin_error)?;
     Ok((config, rootfs))
+}
+
+/// bundle の rootfs の固定の失敗を、`code` を保ったまま `TraitError` へ写す（SEC-4・SEC-1・SUP-6・#1702）。
+///
+/// 文言は従来どおり `exec stage Validate: <固定文言>`。検証後の差し替えによる拒否
+/// （[`RootfsPinError::violation`] が `Some`）だけ、[`from_exec_error`] と同じ末尾の目印
+/// （[`violation_marker`]）を付ける。worker の結果行はこの目印から `<種別>/<理由>` を運び
+/// （[`exec_worker_reason_of`]）、親プロセスが層 `mount` へ 1 件記録する。違反を伴わない失敗は目印なし
+/// （記録しない）。メッセージにパスを含めない。
+fn from_pin_error(err: RootfsPinError) -> TraitError {
+    let marker = err.violation().map_or_else(String::new, violation_marker);
+    TraitError::new(
+        err.error().code(),
+        format!("exec stage Validate: {}{marker}", err.error().message()),
+    )
+}
+
+/// 分離違反の末尾の目印 ` (violation: <種別>/<理由コード>, <ビヘイビア ID>)`（[`exec_worker_reason_of`] が引き直す形）。
+fn violation_marker(reason: ViolationReason) -> String {
+    format!(
+        "{VIOLATION_MARKER}{}/{}, {})",
+        reason.kind().as_str(),
+        reason.as_str(),
+        reason.behavior_id()
+    )
 }
 
 /// `ExecError` を `code` を保ったまま `TraitError` へ写す（段名はメッセージへ含める）。
@@ -1508,14 +1575,10 @@ fn load_exec_bundle(bundle: &std::path::Path) -> Result<(OciConfig, RootfsDir), 
 /// パス）はメッセージへ含めない。worker の経路の違反の監査記録は通しの入口 [`run_command_with_pidfd`] が親プロセスで行い、
 /// worker は末尾の目印から `<種別>/<理由>` を結果行へ載せる（[`exec_worker_reason_of`]。#1465）。
 fn from_exec_error(err: ExecError) -> TraitError {
-    let violation = err.violation.as_ref().map_or_else(String::new, |v| {
-        format!(
-            " (violation: {}/{}, {})",
-            v.kind.as_str(),
-            v.reason.as_str(),
-            v.behavior_id
-        )
-    });
+    let violation = err
+        .violation
+        .as_ref()
+        .map_or_else(String::new, |v| violation_marker(v.reason));
     TraitError::new(
         err.code,
         format!("exec stage {:?}: {}{violation}", err.stage, err.message),
@@ -2382,11 +2445,11 @@ mod tests {
     /// 違反の subject に持たせるホスト側パス（結果行・記録に現れてはならない）。
     const HOST_SUBJECT: &str = "/srv/fandhe/bundles/c1/rootfs";
 
-    /// SEC-4・SUP-6・SEC-1・TASK-163 追補（#1465）・#1614 の事後監査: worker の経路の 11 理由すべてが結果行へ
+    /// SEC-4・SUP-6・SEC-1・TASK-163 追補（#1465）・#1614 の事後監査: worker の経路の 13 理由すべてが結果行へ
     /// `<種別>/<理由>` として載り、往復で同じ理由に戻る。期待 cgroup パス・rootfs のパスはメッセージにも結果行にも載らない。
     #[test]
     fn sec4_sup6_task163_worker_line_carries_worker_violation_reason() {
-        assert_eq!(ViolationReason::EXEC_WORKER_REASONS.len(), 11);
+        assert_eq!(ViolationReason::EXEC_WORKER_REASONS.len(), 13);
         for reason in ViolationReason::EXEC_WORKER_REASONS {
             for err in [
                 exec_target_failure(reason),
@@ -2444,7 +2507,7 @@ mod tests {
         );
     }
 
-    /// SEC-4・SUP-6・SEC-1・TASK-163 追補（#1465）・#1614 の事後監査: 親側の記録は worker の経路の 11 理由それぞれ
+    /// SEC-4・SUP-6・SEC-1・TASK-163 追補（#1465）・#1614 の事後監査: 親側の記録は worker の経路の 13 理由それぞれ
     /// 1 件・パスなし・自 PID。種別 `exec_target` は層 `exec_target` と理由コード、`rootfs_is_host_root` は層 `mount`
     /// （理由コード `rootfs_is_host_root` つき）。違反なしの失敗は 0 件で `NotApplicable`、失敗する sink でも拒否は元のまま。
     #[test]
@@ -2460,10 +2523,10 @@ mod tests {
             assert_eq!(rejected.delivery, AuditDelivery::Recorded);
             let recs = sink.snapshot();
             assert_eq!(recs.len(), 1, "{reason:?}");
-            let layer = if reason == ViolationReason::RootfsIsHostRoot {
-                AuditLayer::Mount
-            } else {
+            let layer = if reason.kind().as_str() == "exec_target" {
                 AuditLayer::ExecTarget
+            } else {
+                AuditLayer::Mount
             };
             assert_eq!(recs[0].layer(), layer, "{reason:?}");
             assert_eq!(
@@ -2653,5 +2716,97 @@ mod tests {
             err.message(),
             "exec stage Validate: rootfs must not be the filesystem root"
         );
+    }
+
+    /// 検証後の差し替えを模した pin の失敗を、本番と同じ連鎖（`from_pin_error` → 結果行の符号化・復号 →
+    /// `audit_worker_result`）で親側の記録まで通す。
+    fn pin_rejection_recorded(
+        name: &str,
+        swap: impl FnOnce(&std::path::Path),
+    ) -> (
+        TraitError,
+        Vec<fandhe_container_core::audit_log::AuditRecord>,
+    ) {
+        let dir = bundle_dir(name);
+        std::fs::write(dir.join("config.json"), MINIMAL_CONFIG).unwrap();
+        std::fs::create_dir(dir.join("rootfs")).unwrap();
+        let config = load_config(&dir.join("config.json")).unwrap();
+        let err = fandhe_container_core::oci_runtime::pin_bundle_rootfs_with_swap_for_test(
+            &dir,
+            &config,
+            || swap(&dir),
+        )
+        .map(|_| ())
+        .map_err(from_pin_error)
+        .unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        let failure = decode_worker_result(&encode_worker_result(&Err(err.clone()))).unwrap_err();
+        let sink = RecordingSink::new(false);
+        let rejected = audit_worker_result(Err(failure), Some(&cid()), &sink).unwrap_err();
+        assert_eq!(rejected.error, err);
+        (err, sink.snapshot())
+    }
+
+    /// SEC-4・SEC-1・SUP-6・#1702: 検証後に rootfs が symlink / 不在へ差し替えられた拒否は、層 `mount` の
+    /// レコード 1 件（理由コードつき・パスなし）になる。`code` と利用者向けの文言は変わらない。
+    #[test]
+    fn sec4_task163_pin_swap_after_validation_is_recorded_once_as_mount() {
+        for (name, reason, id) in [
+            ("swaplink", "path_symlink_or_not_directory", "CORE-1"),
+            ("swapgone", "path_missing", "CORE-1"),
+        ] {
+            let (err, recs) = pin_rejection_recorded(name, |dir| {
+                std::fs::remove_dir(dir.join("rootfs")).unwrap();
+                if reason == "path_symlink_or_not_directory" {
+                    std::os::unix::fs::symlink("/tmp", dir.join("rootfs")).unwrap();
+                }
+            });
+            assert_eq!(err.code(), ErrorCode::PermissionDenied, "{name}");
+            let want = format!(
+                "exec stage Validate: rootfs changed after validation \
+                 (violation: mount_target/{reason}, {id})"
+            );
+            assert_eq!(err.message(), want, "{name}");
+            assert_eq!(recs.len(), 1, "{name}");
+            assert_eq!(recs[0].layer(), AuditLayer::Mount);
+            assert_eq!(recs[0].reason().map(|r| r.as_str()), Some(reason));
+            assert_eq!(recs[0].path(), None);
+            assert_eq!(recs[0].pid().get(), std::process::id());
+            assert_eq!(recs[0].container_id().map(|c| c.as_str()), Some("c1"));
+        }
+    }
+
+    /// SEC-4・#1702: 違反を伴わない pin の失敗（検証前の失敗・bundle 自体が symlink）は目印を付けず記録しない。
+    #[test]
+    fn sec4_task163_pin_failures_without_violation_are_not_recorded() {
+        // 検証前の失敗（rootfs 不在）。
+        let dir = bundle_dir("novio");
+        std::fs::write(dir.join("config.json"), MINIMAL_CONFIG).unwrap();
+        let err = load_exec_bundle(&dir).unwrap_err();
+        assert_eq!(
+            err.message(),
+            "exec stage Validate: rootfs directory not found"
+        );
+        assert_eq!(exec_worker_reason_of(&err), None);
+
+        // bundle 自体が symlink: 理由コード `rootfs_*` は bundle を rootfs と誤読させるため運ばない。
+        let link = bundle_dir("novio-link");
+        std::fs::remove_dir(&link).unwrap();
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        std::fs::create_dir(dir.join("rootfs")).unwrap();
+        let err = load_exec_bundle(&link).unwrap_err();
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "exec stage Validate: bundle path must be a directory reachable without symlinks"
+        );
+        assert_eq!(exec_worker_reason_of(&err), None);
+        let sink = RecordingSink::new(false);
+        let failure = decode_worker_result(&encode_worker_result(&Err(err))).unwrap_err();
+        let rejected = audit_worker_result(Err(failure), Some(&cid()), &sink).unwrap_err();
+        assert_eq!(rejected.delivery, AuditDelivery::NotApplicable);
+        assert_eq!(sink.snapshot().len(), 0);
     }
 }

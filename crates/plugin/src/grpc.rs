@@ -20,9 +20,10 @@
 //! - [`serve_router`]・[`connect_channel`] 自体は認証を持たない。gRPC の内容検証（リクエストの意味検証）は
 //!   上位の責務で、入力は untrusted として扱う。
 //!
-//! # 未実装（REPAIR-3）
+//! # CRI proto の疎通
 //!
-//! - CRI proto の RPC による疎通は TASK-108.3（#455）。
+//! 生成済み CRI サービス（`runtime.v1`）の UDS 経由 RPC 疎通は `tests/grpc_uds.rs` で試験する
+//! （TASK-108.3・#455・CRI-3）。
 //!
 //! # 同時接続数の上限（PLUG-12）
 //!

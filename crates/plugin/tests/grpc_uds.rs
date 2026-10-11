@@ -4,7 +4,8 @@
 //! TCP は一切 bind せず、`UdsListener` の配置検証・0600 化・peer UID 認証を通した UDS 経由で tonic の unary RPC が
 //! 成功することを機械照合する。別 UID の peer 認証拒否（期待 UID の差し替え）は `grpc.rs` の単体試験で行う。
 //! protoc も `build.rs` も使わず、手書きの prost メッセージと Echo 風 unary サービスを使う。root・特権は不要。
-//! CRI proto の RPC 疎通は TASK-108.3（#455）で別に試験する。
+//! TASK-108.3（#455・CRI-3・PLUG-2・MS-4）で、生成済み CRI サービス（`runtime.v1.RuntimeService` /
+//! `ImageService`）を同一 UDS に載せた RPC 疎通も試験する（cri crate は dev-dependency のみ。test 専用）。
 
 // WIN-1: UDS 固有の実装は unix のみ。非 unix では本試験は空になる（黙って通すのではなく、この明示を残す）。
 #![cfg(unix)]
@@ -130,10 +131,18 @@ struct Running {
 }
 
 fn start(sock: &Path, delay: Duration, cfg: GrpcServerConfig) -> Running {
+    start_router(sock, cfg, |mut b| b.add_service(EchoSvc { delay }))
+}
+
+/// 与えられた Router 構築関数で UDS gRPC サーバーを起動する（Echo / CRI 共通）。
+fn start_router(
+    sock: &Path,
+    cfg: GrpcServerConfig,
+    build: impl FnOnce(tonic::transport::Server) -> tonic::transport::server::Router,
+) -> Running {
     let listener = UdsListener::bind(sock).unwrap();
     let incoming = UdsIncoming::new(listener, Box::new(JsonLinesPeerAuthObserver::new())).unwrap();
-    let mut builder = server_builder(&cfg);
-    let router = builder.add_service(EchoSvc { delay });
+    let router = build(server_builder(&cfg));
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
     let task = tokio::spawn(async move {
@@ -354,6 +363,227 @@ async fn uds_channel_reconnects_after_server_restart() {
         };
         assert_eq!(text, "two");
         srv2.stop.store(true, Ordering::SeqCst);
+    })
+    .await
+    .expect("watchdog");
+}
+// ---- TASK-108.3（#455）: 生成済み CRI サービス（runtime.v1）の UDS 疎通 ----
+
+use fandhe_container_cri::runtime::v1 as cri;
+use fandhe_container_cri::runtime::v1::image_service_client::ImageServiceClient;
+use fandhe_container_cri::runtime::v1::image_service_server::{ImageService, ImageServiceServer};
+use fandhe_container_cri::runtime::v1::runtime_service_client::RuntimeServiceClient;
+use fandhe_container_cri::runtime::v1::runtime_service_server::RuntimeServiceServer;
+use fandhe_container_cri::runtime_service::CriRuntimeService;
+use tonic::codegen::tokio_stream::Empty;
+
+/// テスト内の最小 `ImageService`。`list_images` だけ固定の 1 件を返し、他は Unimplemented（CRI-3）。
+struct MinimalImage;
+
+#[tonic::async_trait]
+impl ImageService for MinimalImage {
+    type StreamImagesStream = Empty<Result<cri::StreamImagesResponse, tonic::Status>>;
+    async fn list_images(
+        &self,
+        _r: tonic::Request<cri::ListImagesRequest>,
+    ) -> Result<tonic::Response<cri::ListImagesResponse>, tonic::Status> {
+        Ok(tonic::Response::new(cri::ListImagesResponse {
+            images: vec![cri::Image {
+                id: "sha256:test-image".into(),
+                repo_tags: vec!["example.invalid/test:1".into()],
+                size: 42,
+                ..Default::default()
+            }],
+        }))
+    }
+    async fn stream_images(
+        &self,
+        _r: tonic::Request<cri::StreamImagesRequest>,
+    ) -> Result<tonic::Response<Self::StreamImagesStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("stream_images"))
+    }
+    async fn image_status(
+        &self,
+        _r: tonic::Request<cri::ImageStatusRequest>,
+    ) -> Result<tonic::Response<cri::ImageStatusResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("image_status"))
+    }
+    async fn pull_image(
+        &self,
+        _r: tonic::Request<cri::PullImageRequest>,
+    ) -> Result<tonic::Response<cri::PullImageResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("pull_image"))
+    }
+    async fn remove_image(
+        &self,
+        _r: tonic::Request<cri::RemoveImageRequest>,
+    ) -> Result<tonic::Response<cri::RemoveImageResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("remove_image"))
+    }
+    async fn image_fs_info(
+        &self,
+        _r: tonic::Request<cri::ImageFsInfoRequest>,
+    ) -> Result<tonic::Response<cri::ImageFsInfoResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("image_fs_info"))
+    }
+}
+
+fn start_cri(sock: &Path) -> Running {
+    start_router(sock, GrpcServerConfig::new(), |mut b| {
+        let rt = RuntimeServiceServer::new(CriRuntimeService::new())
+            .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
+        let img = ImageServiceServer::new(MinimalImage)
+            .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
+        b.add_service(rt).add_service(img)
+    })
+}
+
+fn run_req(name: &str) -> cri::RunPodSandboxRequest {
+    cri::RunPodSandboxRequest {
+        config: Some(cri::PodSandboxConfig {
+            metadata: Some(cri::PodSandboxMetadata {
+                name: name.into(),
+                uid: "uid-1".into(),
+                namespace: "default".into(),
+                attempt: 0,
+            }),
+            ..Default::default()
+        }),
+        runtime_handler: String::new(),
+    }
+}
+
+async fn stop_and_check(srv: Running, sock: &Path) {
+    srv.stop.store(true, Ordering::SeqCst);
+    let r = tokio::time::timeout(Duration::from_secs(10), srv.task)
+        .await
+        .expect("server must stop in bounded time")
+        .unwrap();
+    assert!(r.is_ok(), "{r:?}");
+    // PLUG-12: graceful shutdown 後に socket ファイルが残らない。
+    assert!(!sock.exists());
+}
+
+/// PLUG-2・CRI-3: UDS 越しに生成済み `RuntimeService::RunPodSandbox` が成功し、64 文字の ID が返る。
+#[tokio::test]
+async fn plug2_uds_cri_runtime_run_pod_sandbox_roundtrip() {
+    tokio::time::timeout(WATCHDOG, async {
+        let dir = TempDir::new();
+        let sock = dir.sock();
+        let srv = start_cri(&sock);
+        let before = grpc_stats();
+        let ch = connect(&sock, &GrpcClientConfig::new()).await;
+        let mut client = RuntimeServiceClient::new(ch.clone());
+        let resp = call_with_deadline(
+            async { client.run_pod_sandbox(run_req("pod-a")).await },
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(resp.pod_sandbox_id.len(), 64);
+        assert!(resp.pod_sandbox_id.chars().all(|c| c.is_ascii_hexdigit()));
+        // 観測性（REPAIR-4）: connect / call の件数が増える（並行試験のため下限で照合）。
+        let ok = |v: &[GrpcOpStats], op: &str| v.iter().find(|s| s.op == op).unwrap().success;
+        let after = grpc_stats();
+        assert!(ok(&after, "connect") > ok(&before, "connect"));
+        assert!(ok(&after, "call") > ok(&before, "call"));
+        drop(client);
+        drop(ch);
+        stop_and_check(srv, &sock).await;
+    })
+    .await
+    .expect("watchdog");
+}
+
+/// PLUG-2・CRI-3: 同一 UDS・同一 Channel で 2 つの CRI サービスがサービス名で振り分けられる。
+#[tokio::test]
+async fn plug2_uds_cri_image_list_images_roundtrip() {
+    tokio::time::timeout(WATCHDOG, async {
+        let dir = TempDir::new();
+        let sock = dir.sock();
+        let srv = start_cri(&sock);
+        let ch = connect(&sock, &GrpcClientConfig::new()).await;
+        let mut img = ImageServiceClient::new(ch.clone());
+        let resp = call_with_deadline(
+            async { img.list_images(cri::ListImagesRequest::default()).await },
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(resp.images.len(), 1);
+        assert_eq!(resp.images[0].id, "sha256:test-image");
+        assert_eq!(resp.images[0].size, 42);
+        // 同じ Channel で RuntimeService も呼べる。
+        let mut rt = RuntimeServiceClient::new(ch.clone());
+        let r = rt.run_pod_sandbox(run_req("pod-b")).await.unwrap();
+        assert_eq!(r.into_inner().pod_sandbox_id.len(), 64);
+        drop((img, rt, ch));
+        stop_and_check(srv, &sock).await;
+    })
+    .await
+    .expect("watchdog");
+}
+
+/// ERR 系: 未実装 RPC は Unimplemented、入力不正は InvalidArgument として PluginError に写る。
+#[tokio::test]
+async fn plug2_uds_cri_unimplemented_and_error_mapping() {
+    tokio::time::timeout(WATCHDOG, async {
+        let dir = TempDir::new();
+        let sock = dir.sock();
+        let srv = start_cri(&sock);
+        let ch = connect(&sock, &GrpcClientConfig::new()).await;
+        let mut rt = RuntimeServiceClient::new(ch.clone());
+        let st = rt
+            .version(cri::VersionRequest::default())
+            .await
+            .unwrap_err();
+        assert_eq!(st.code(), tonic::Code::Unimplemented);
+        assert_eq!(
+            status_to_plugin_error(&st).code(),
+            PluginErrorCode::Unimplemented
+        );
+        let st = rt
+            .run_pod_sandbox(cri::RunPodSandboxRequest::default())
+            .await
+            .unwrap_err();
+        assert_eq!(st.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            status_to_plugin_error(&st).code(),
+            PluginErrorCode::InvalidArgument
+        );
+        drop((rt, ch));
+        stop_and_check(srv, &sock).await;
+    })
+    .await
+    .expect("watchdog");
+}
+
+/// 同一 Channel からの並行 RPC が全て成功し ID が重複しない。続けて graceful shutdown する。
+#[tokio::test]
+async fn plug2_uds_cri_concurrent_calls_and_clean_shutdown() {
+    tokio::time::timeout(WATCHDOG, async {
+        let dir = TempDir::new();
+        let sock = dir.sock();
+        let srv = start_cri(&sock);
+        let ch = connect(&sock, &GrpcClientConfig::new()).await;
+        let call = |n: &'static str| {
+            let mut c = RuntimeServiceClient::new(ch.clone());
+            async move { c.run_pod_sandbox(run_req(n)).await }
+        };
+        let (a, b, c, d) = tokio::join!(call("p1"), call("p2"), call("p3"), call("p4"));
+        let mut ids: Vec<String> = [a, b, c, d]
+            .into_iter()
+            .map(|r| r.unwrap().into_inner().pod_sandbox_id)
+            .collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 4);
+        drop(ch);
+        stop_and_check(srv, &sock).await;
     })
     .await
     .expect("watchdog");

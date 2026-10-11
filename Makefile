@@ -499,6 +499,19 @@ deny-poc-venus-jig: ## venus 試験治具（poc/venus-decoder/jig）の Cargo.lo
 	cargo deny --manifest-path $(POC_VENUS_JIG_MANIFEST) --config deny.toml --locked \
 		check --show-stats advisories bans licenses sources
 
+# deny.toml の [licenses] が許可外ライセンス（GPL / LGPL / AGPL / MPL 等）を拒否する fail-closed で
+# あることの自己テスト（TASK-90.2・#127。OSS-4・OSS-5・REPAIR-9）。使い捨て workspace と本物の
+# deny.toml で照合し、本番の依存・lock は変えない。`make ci` には含めない（ci.md のローカルゲート
+# 定義を変えないため）。CI は platform-ci（ubuntu）が実行する。cargo-deny 未導入なら deny と同じ版を導入する。
+.PHONY: deny-license-fail-closed-selftest
+deny-license-fail-closed-selftest: ## deny.toml のライセンス fail-closed 自己テスト（TASK-90.2・OSS-4・OSS-5）
+	@export PATH="$$HOME/.cargo/bin:$$PATH"; \
+	command -v cargo-deny >/dev/null 2>&1 || { \
+		echo "cargo-deny を導入します"; \
+		cargo install cargo-deny@$(CARGO_DENY_VERSION) --locked; \
+	} && \
+	bash scripts/deny-license-fail-closed-selftest.sh
+
 .PHONY: ci
 ci: lint-docs check-workspace-manifest fmt-check lint test doc deny ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
 

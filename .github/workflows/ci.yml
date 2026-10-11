@@ -483,6 +483,14 @@ jobs:
         timeout-minutes: 20
         run: make deny-poc-venus-jig
 
+      # ライセンス判定は OS に依らず、cargo-deny の導入を 3 回払わないため ubuntu のみ。
+      # 既存ジョブへのステップ追加のため check-run 名は増えない。
+      - name: deny.toml のライセンス fail-closed 自己テスト（OSS-4・OSS-5・REPAIR-9・TASK-90.2。ubuntu のみ）
+        if: runner.os == 'Linux'
+        shell: bash
+        timeout-minutes: 5
+        run: make deny-license-fail-closed-selftest
+
       # 以下は旧 integration-test のステップ（REPAIR-7 ステージ 3: タイムアウト保護された結合試験）
       - name: integration test target 件数の判定
         id: count

@@ -640,6 +640,9 @@ where
     type Item = Result<KillableIo<IO>, IE>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // 1 回の poll で連続拒否できる件数（REPAIR-5）。内側が Ready を返し続けても実行権を返し、
+        // 接続の drop・shutdown・猶予期限のタスクが進めるようにする。
+        let mut rejected_in_poll = 0usize;
         loop {
             let this = &mut *self;
             match this.inner.as_mut().poll_next(cx) {
@@ -652,6 +655,12 @@ where
                         // 出力先（stderr 等）の失敗・ブロックが accept ループを止めないよう、
                         // 有界メモリのアトミック計数だけを更新する（panic・ブロックなし。REPAIR-5）。
                         STATS_REJECTED.fetch_add(1, Ordering::Relaxed);
+                        rejected_in_poll += 1;
+                        if rejected_in_poll >= MAX_REJECTS_PER_POLL {
+                            // 自分を再スケジュールして Pending を返し、内側の協調動作に依存しない。
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
                         continue;
                     }
                     return Poll::Ready(Some(Ok(KillableIo::new(io, Arc::clone(&this.switch)))));
@@ -663,6 +672,9 @@ where
         }
     }
 }
+
+/// `KillableIncoming::poll_next` が 1 回の poll で連続して拒否する接続数の上限。
+const MAX_REJECTS_PER_POLL: usize = 64;
 
 /// 強制停止後に接続タスクの終了（IO の drop）を待つ上限。
 const FORCE_RECLAIM_WAIT: Duration = Duration::from_secs(2);
@@ -1218,6 +1230,43 @@ mod tests {
         assert!(again.is_some());
         assert_eq!(switch.live(), 2);
         assert_eq!(inc.rejected, 1);
+    }
+
+    /// 拒否が無限に続く内側ストリームでも 1 poll の拒否数が上限で止まり、Pending と再 wake を返す（REPAIR-5）。
+    #[tokio::test]
+    async fn reject_burst_yields_pending_and_rewakes() {
+        use std::sync::atomic::AtomicUsize;
+        use std::task::{Wake, Waker};
+        use tokio::io::DuplexStream;
+
+        struct Endless;
+        impl Stream for Endless {
+            type Item = Result<DuplexStream, std::io::Error>;
+            fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+                Poll::Ready(Some(Ok(tokio::io::duplex(8).0)))
+            }
+        }
+        struct Counter(AtomicUsize);
+        impl Wake for Counter {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let switch = KillSwitch::new();
+        let mut inc: KillableIncoming<Endless, DuplexStream, std::io::Error> = KillableIncoming {
+            inner: Box::pin(Endless),
+            switch: Arc::clone(&switch),
+            max_connections: 0,
+            rejected: 0,
+            _marker: PhantomData,
+        };
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut cx = Context::from_waker(&waker);
+        let r = Pin::new(&mut inc).poll_next(&mut cx);
+        assert!(r.is_pending());
+        assert_eq!(inc.rejected, MAX_REJECTS_PER_POLL as u64);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
     }
 
     #[test]

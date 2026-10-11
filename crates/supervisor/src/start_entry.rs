@@ -36,7 +36,7 @@
 
 use std::io::Write;
 use std::num::{NonZeroU8, NonZeroU32};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::observability::OpRecorder;
@@ -185,6 +185,16 @@ fn keep_stranded(process: Box<dyn LaunchedProcess>) {
         .push(process);
 }
 
+/// [`terminate_bounded`] の実行スレッドと待ち手の間の受け渡し状態（同じ Mutex で守る）。
+enum TerminateSlot {
+    /// 実行スレッドの結果待ち。
+    Pending,
+    /// 実行スレッドの結果（`Err` ならハンドルを返す）。
+    Done(Result<(), (ErrorCode, Box<dyn LaunchedProcess>)>),
+    /// 待ち手が期限で待ちをやめた（または結果を取り出した）。
+    Abandoned,
+}
+
 /// [`terminate_bounded`] の失敗。
 enum TerminateFailure {
     /// 期限内に `Err` で戻った（または実行スレッドを作れなかった）。ハンドルは手元にあり再試行できる。
@@ -203,8 +213,10 @@ fn terminate_bounded(
 ) -> Result<NonZeroU32, TerminateFailure> {
     let pid = process.pid();
     let cell = Arc::new(Mutex::new(Some(process)));
-    let worker_cell = Arc::clone(&cell);
-    let (tx, rx) = std::sync::mpsc::channel();
+    // 結果の引き渡しと待ちの放棄を同じ Mutex 配下で決める（期限後に戻ったハンドルを必ず保管先へ移す。CORE-1・REPAIR-5）。
+    let shared: Arc<(Mutex<TerminateSlot>, Condvar)> =
+        Arc::new((Mutex::new(TerminateSlot::Pending), Condvar::new()));
+    let (worker_cell, worker_shared) = (Arc::clone(&cell), Arc::clone(&shared));
     let spawned = std::thread::Builder::new()
         .name("supervisor-terminate".into())
         .spawn(move || {
@@ -215,35 +227,53 @@ fn terminate_bounded(
             let Some(p) = taken else {
                 return;
             };
-            match p.terminate(timeout) {
-                Ok(()) => {
-                    let _ = tx.send(Ok(()));
+            let result = p.terminate(timeout).map_err(|e| e.code());
+            let (lock, cvar) = &*worker_shared;
+            let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            if matches!(*slot, TerminateSlot::Abandoned) {
+                // 受け手は待ちをやめた。`Err` のハンドルは捨てずに保管する（`Ok` は回収済み）。
+                drop(slot);
+                if result.is_err() {
+                    keep_stranded(p);
                 }
-                Err(e) => {
-                    // 受け手が待ちをやめていればハンドルを保管し、待っていれば返して再試行させる。
-                    if let Err(unsent) = tx.send(Err((e.code(), p)))
-                        && let Err((_, p)) = unsent.0
-                    {
-                        keep_stranded(p);
-                    }
-                }
+                return;
             }
+            *slot = TerminateSlot::Done(result.map_err(|code| (code, p)));
+            cvar.notify_all();
         });
     if spawned.is_err() {
         log_event("terminate_thread_failed", None);
         let left = cell.lock().unwrap_or_else(PoisonError::into_inner).take();
         return Err(left.map_or(TerminateFailure::Pending, TerminateFailure::Returned));
     }
-    match rx.recv_timeout(timeout.saturating_add(LAUNCHER_REPLY_GRACE)) {
-        Ok(Ok(())) => Ok(pid),
-        Ok(Err((code, p))) => {
-            log_event("handle_terminate_failed", Some(code));
-            Err(TerminateFailure::Returned(p))
+    let deadline = Instant::now().checked_add(timeout.saturating_add(LAUNCHER_REPLY_GRACE));
+    let (lock, cvar) = &*shared;
+    let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    loop {
+        match std::mem::replace(&mut *slot, TerminateSlot::Abandoned) {
+            TerminateSlot::Done(Ok(())) => return Ok(pid),
+            TerminateSlot::Done(Err((code, p))) => {
+                drop(slot);
+                log_event("handle_terminate_failed", Some(code));
+                return Err(TerminateFailure::Returned(p));
+            }
+            other => *slot = other,
         }
-        Err(_) => {
-            log_event("handle_terminate_timed_out", Some(ErrorCode::Timeout));
-            Err(TerminateFailure::Pending)
-        }
+        let now = Instant::now();
+        let remaining = match deadline {
+            Some(d) if d > now => d - now,
+            _ => {
+                // 同じロックの下で放棄を記す。以後に戻った結果は実行スレッドが保管する。
+                *slot = TerminateSlot::Abandoned;
+                drop(slot);
+                log_event("handle_terminate_timed_out", Some(ErrorCode::Timeout));
+                return Err(TerminateFailure::Pending);
+            }
+        };
+        slot = cvar
+            .wait_timeout(slot, remaining)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
     }
 }
 
@@ -667,8 +697,7 @@ pub fn run_supervised(
             let disposed = dispose(process, Some(&late), timeouts);
             finish_disposed(&store, &id, instance, disposed, 0)
         }
-        Ok(SuperviseOutcome::RelaunchFailed { error, late, .. })
-        | Ok(SuperviseOutcome::RestartUnrecorded { error, late, .. }) => {
+        Ok(SuperviseOutcome::RelaunchFailed { error, late, .. }) => {
             log_event("restart_failed", Some(error.code()));
             let disposed = dispose(None, Some(&late), timeouts);
             finish_disposed(
@@ -676,6 +705,25 @@ pub fn run_supervised(
                 &id,
                 instance,
                 disposed,
+                exit_code_for(error.code()).get(),
+            )
+        }
+        Ok(SuperviseOutcome::RestartUnrecorded {
+            error,
+            late,
+            reaped,
+            ..
+        }) => {
+            log_event("restart_failed", Some(error.code()));
+            // supervise_with_restart の中で終了を確認できた新プロセスも、記録が Running のまま残り得るので
+            // 照合つきの Stopped 記録の対象に含める（SUP-1・CORE-2）。
+            let (ok, mut pids) = dispose(None, Some(&late), timeouts);
+            pids.extend(reaped);
+            finish_disposed(
+                &store,
+                &id,
+                instance,
+                (ok, pids),
                 exit_code_for(error.code()).get(),
             )
         }

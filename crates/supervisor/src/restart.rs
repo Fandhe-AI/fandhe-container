@@ -534,6 +534,9 @@ pub enum SuperviseOutcome {
         late: LateOrphans,
         /// 実施した再起動の回数（この失敗した 1 回は含まない）。
         restarts: u32,
+        /// 本関数内の terminate で終了を確認できた新プロセスの pid（`terminate_error` が `None` のとき `Some`）。
+        /// 記録が `Running(この pid)` のまま残り得るため、呼び出し側が照合つきで `Stopped` に落とすのに使う（SUP-1・CORE-2）。
+        reaped: Option<NonZeroU32>,
     },
     /// `monitor` が状態の不確かな結果（`ExitedUnrecorded` 等）を返したため、再起動せずに戻った（fail-closed）。
     MonitorFailed {
@@ -599,12 +602,14 @@ impl fmt::Debug for SuperviseOutcome {
                 terminate_error,
                 late,
                 restarts,
+                reaped,
             } => f
                 .debug_struct("RestartUnrecorded")
                 .field("error", error)
                 .field("terminate_error", terminate_error)
                 .field("late", late)
                 .field("restarts", restarts)
+                .field("reaped", reaped)
                 .finish(),
             Self::MonitorFailed {
                 last,
@@ -1017,6 +1022,7 @@ pub fn supervise_with_restart(
                                     terminate_error: Some(terminate_error),
                                     late: cleanup_late,
                                     restarts,
+                                    reaped: None,
                                 }
                             }
                         });
@@ -1042,6 +1048,7 @@ pub fn supervise_with_restart(
                                 terminate_error: None,
                                 late: cleanup_late,
                                 restarts,
+                                reaped: Some(new_pid),
                             }
                         }
                     });
@@ -1061,11 +1068,13 @@ pub fn supervise_with_restart(
                     spawn_os_thread,
                 )
                 .err();
+                let reaped = terminate_error.is_none().then_some(new_pid);
                 return Ok(SuperviseOutcome::RestartUnrecorded {
                     error,
                     terminate_error,
                     late: cleanup_late,
                     restarts,
+                    reaped,
                 });
             }
         }
@@ -1779,12 +1788,15 @@ mod tests {
             terminate_error,
             late,
             restarts,
+            reaped,
         } = out
         else {
             panic!("unexpected outcome: {out:?}")
         };
         assert_eq!(error.code(), ErrorCode::FailedPrecondition);
         assert!(terminate_error.is_none());
+        // 終了を確認できた新プロセスの pid を呼び出し側へ返す（SUP-1・CORE-2）。
+        assert_eq!(reaped.map(NonZeroU32::get), Some(43));
         assert!(late.wait_settled(Duration::from_secs(5)));
         assert!(late.take().is_empty());
         assert_eq!(restarts, 0);
@@ -2620,12 +2632,15 @@ mod tests {
             terminate_error,
             late,
             restarts,
+            reaped,
         } = out
         else {
             panic!("unexpected outcome: {out:?}")
         };
         assert_eq!(error.code(), ErrorCode::FailedPrecondition);
         assert_eq!(terminate_error.map(|e| e.code()), None);
+        // 記録は Running(43) のまま残るため、終了を確認できた pid を返す（入口が照合つきで Stopped に落とす）。
+        assert_eq!(reaped.map(NonZeroU32::get), Some(43));
         assert_eq!(restarts, 0);
         assert!(late.wait_settled(Duration::from_secs(5)));
         assert!(late.take().is_empty());

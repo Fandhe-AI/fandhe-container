@@ -12,8 +12,8 @@
 //! 1 進む（再 launch 失敗・記録失敗は数えない）。
 //!
 //! # 未実装の将来仕様（REPAIR-3）
-//! - 本番の再 launch（core の `ProcessLauncher` 経由）は未提供のため、[`Relauncher`] を呼び出し側から注入する
-//!   （SUP-3。supervisor のバイナリ入口も未実装）。実機でのレイテンシ実測・合否判定は #490・#491（TASK-160）の担当。
+//! - 本番の再 launch は [`LauncherRelauncher`]（start で使った launcher と `LaunchSpec` をそのまま使うアダプタ。#1717）で
+//!   足りるが、core の本番 `ProcessLauncher` が未提供のため実機では成り立たない（SUP-3。bin 入口は [`crate::start_entry`]）。実機でのレイテンシ実測・合否判定は #490・#491（TASK-160）の担当。
 //! - 明示的な stop の検知は SUP-9 の担当で、本モジュールは [`StopToken`] を [`StopIntent`] へ写すだけ。
 //!   再 launch 時の `unless-stopped` と `always` の差（stop 済みを復帰させるか）も未実装（SUP-3・SUP-9）。
 //! - [`crate::run::MonitorOutcome::ExitedUnrecorded`]（終了は回収済みだが記録失敗）の回復は未実装で、
@@ -34,9 +34,11 @@ use std::str::FromStr;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use fandhe_container_core::oci_runtime::{LaunchedProcess, ProcessExit};
+use fandhe_container_core::oci_runtime::{
+    LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher,
+};
 use fandhe_container_core::traits::{
-    ContainerStatus, ErrorCode, Signal, StateRecord, SupervisionState, TraitError,
+    ContainerId, ContainerStatus, ErrorCode, Signal, StateRecord, SupervisionState, TraitError,
 };
 
 use crate::run::{
@@ -252,8 +254,8 @@ const BACKOFF_SLICE: Duration = Duration::from_millis(10);
 
 /// 同じコンテナのプロセスを再 launch する拡張点（SUP-3・TASK-159.3）。
 ///
-/// 本番の `ProcessLauncher` は core に未提供のため、[`supervise_with_restart`] へ呼び出し側から注入する
-/// （本番実装は未実装。REPAIR-3）。
+/// [`supervise_with_restart`] へ呼び出し側から注入する。本番のアダプタは [`LauncherRelauncher`]（#1717）で、
+/// 中身の core の本番 `ProcessLauncher` は未提供（REPAIR-3）。
 ///
 /// 期限は実装への依頼だけに頼らず、[`supervise_with_restart`] が別スレッド上の呼び出し境界で強制する
 /// （上限＋[`RELAUNCH_REPLY_GRACE`] で待ちをやめる。REPAIR-5）。そのため `Send + Sync` を要求する。
@@ -362,6 +364,8 @@ pub struct LateOrphans {
 #[derive(Default)]
 struct LateInner {
     orphans: Vec<LateOrphan>,
+    /// [`terminate_bounded`] の実行スレッドが終了を確認できたプロセスの pid（期限の内外を問わない）。
+    reaped: Vec<NonZeroU32>,
     /// 動作中の再 launch 実行スレッドの数（0 なら以後ハンドルが積まれない）。
     active_workers: u32,
 }
@@ -371,14 +375,14 @@ impl LateOrphans {
         self.inner.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// 実行スレッドの起動前に呼ぶ。
-    fn worker_started(&self) {
+    /// 実行スレッドの起動前に呼ぶ（`start_entry` の terminate の実行スレッドも使う）。
+    pub(crate) fn worker_started(&self) {
         let mut g = self.lock();
         g.active_workers = g.active_workers.saturating_add(1);
     }
 
     /// 実行スレッドの終了時（panic・起動失敗を含む）に呼ぶ。待機者を起こす。
-    fn worker_finished(&self) {
+    pub(crate) fn worker_finished(&self) {
         let mut g = self.lock();
         g.active_workers = g.active_workers.saturating_sub(1);
         drop(g);
@@ -387,6 +391,10 @@ impl LateOrphans {
 
     fn push(&self, process: Box<dyn LaunchedProcess>, error: TraitError) {
         self.lock().orphans.push((process, error));
+    }
+
+    pub(crate) fn push_reaped(&self, pid: NonZeroU32) {
+        self.lock().reaped.push(pid);
     }
 
     /// 再 launch の実行スレッドがすべて終了済みで、以後ハンドルが積まれないとき `true`。
@@ -420,6 +428,13 @@ impl LateOrphans {
     /// 積まれている（terminate に失敗した）プロセスとその失敗理由をすべて取り出す。
     pub fn take(&self) -> Vec<LateOrphan> {
         std::mem::take(&mut self.lock().orphans)
+    }
+
+    /// terminate で終了を確認できたプロセスの pid をすべて取り出す（呼び出し側の待ちが期限を過ぎた後に成功した
+    /// 分を含む）。記録が `Running(この pid)` のまま残り得るため、呼び出し側が照合つきで `Stopped` に落とすのに使う
+    /// （SUP-1・CORE-2）。[`LateOrphans::wait_settled`] の後に呼べば最終結果になる。
+    pub fn take_reaped(&self) -> Vec<NonZeroU32> {
+        std::mem::take(&mut self.lock().reaped)
     }
 }
 
@@ -532,6 +547,9 @@ pub enum SuperviseOutcome {
         late: LateOrphans,
         /// 実施した再起動の回数（この失敗した 1 回は含まない）。
         restarts: u32,
+        /// 本関数内の terminate で終了を確認できた新プロセスの pid（`terminate_error` が `None` のとき `Some`）。
+        /// 記録が `Running(この pid)` のまま残り得るため、呼び出し側が照合つきで `Stopped` に落とすのに使う（SUP-1・CORE-2）。
+        reaped: Option<NonZeroU32>,
     },
     /// `monitor` が状態の不確かな結果（`ExitedUnrecorded` 等）を返したため、再起動せずに戻った（fail-closed）。
     MonitorFailed {
@@ -597,12 +615,14 @@ impl fmt::Debug for SuperviseOutcome {
                 terminate_error,
                 late,
                 restarts,
+                reaped,
             } => f
                 .debug_struct("RestartUnrecorded")
                 .field("error", error)
                 .field("terminate_error", terminate_error)
                 .field("late", late)
                 .field("restarts", restarts)
+                .field("reaped", reaped)
                 .finish(),
             Self::MonitorFailed {
                 last,
@@ -670,9 +690,12 @@ fn terminate_bounded(
         let Some(proc) = taken else {
             return;
         };
+        let pid = proc.pid();
         let r = proc.terminate(timeout);
-        if let Err(e) = &r {
-            worker_late.push(proc, e.clone());
+        match &r {
+            Err(e) => worker_late.push(proc, e.clone()),
+            // 呼び出し側が期限で待ちをやめた後に成功しても、回収済みの pid を受け皿に残す。
+            Ok(()) => worker_late.push_reaped(pid),
         }
         let (lock, cvar) = &*worker_result;
         *lock.lock().unwrap_or_else(PoisonError::into_inner) = Some(r);
@@ -1015,6 +1038,7 @@ pub fn supervise_with_restart(
                                     terminate_error: Some(terminate_error),
                                     late: cleanup_late,
                                     restarts,
+                                    reaped: None,
                                 }
                             }
                         });
@@ -1040,6 +1064,7 @@ pub fn supervise_with_restart(
                                 terminate_error: None,
                                 late: cleanup_late,
                                 restarts,
+                                reaped: Some(new_pid),
                             }
                         }
                     });
@@ -1059,16 +1084,85 @@ pub fn supervise_with_restart(
                     spawn_os_thread,
                 )
                 .err();
+                let reaped = terminate_error.is_none().then_some(new_pid);
                 return Ok(SuperviseOutcome::RestartUnrecorded {
                     error,
                     terminate_error,
                     late: cleanup_late,
                     restarts,
+                    reaped,
                 });
             }
         }
     }
 }
+/// `ProcessLauncher` を包み、`launch` に渡された検証済みの [`LaunchSpec`] を複製して保持する（SUP-3・#1717）。
+///
+/// supervisor の入口（[`crate::start_entry`]）が `oci_runtime::start` に渡す launcher をこれで包む。`LaunchSpec` は
+/// core の外では作れず、`start` が `config.json` を一度だけ読んで検証・rootfs の fd 固定をした値だけが載る。
+/// restart の再 launch はこの値をそのまま使い（[`LauncherRelauncher`]）、`config.json` を読み直さない
+/// （TOCTOU を作らない。SEC-1）。`confirm_no_process` も内側へ委ねる（既定実装は `Unimplemented` のため、
+/// 委ねないと包んだ launcher 越しの `recover_interrupted_start` が成功しない。CORE-2）。
+pub struct SpecCapturingLauncher {
+    inner: Arc<dyn ProcessLauncher>,
+    spec: Mutex<Option<LaunchSpec>>,
+}
+
+impl SpecCapturingLauncher {
+    /// `inner` を包む。
+    pub fn new(inner: Arc<dyn ProcessLauncher>) -> Self {
+        Self {
+            inner,
+            spec: Mutex::new(None),
+        }
+    }
+
+    /// 直近の `launch` に渡された仕様の複製（未 launch なら `None`）。
+    pub fn captured_spec(&self) -> Option<LaunchSpec> {
+        self.spec
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl ProcessLauncher for SpecCapturingLauncher {
+    fn launch(
+        &self,
+        spec: &LaunchSpec,
+        timeout: Duration,
+    ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+        *self.spec.lock().unwrap_or_else(PoisonError::into_inner) = Some(spec.clone());
+        self.inner.launch(spec, timeout)
+    }
+
+    fn confirm_no_process(&self, id: &ContainerId, timeout: Duration) -> Result<(), TraitError> {
+        self.inner.confirm_no_process(id, timeout)
+    }
+}
+
+/// start で使った launcher と [`LaunchSpec`] をそのまま使う [`Relauncher`] の本番アダプタ（SUP-3・#1717）。
+///
+/// `relaunch(timeout)` は `launcher.launch(&spec, timeout)` を呼ぶだけで、launcher の中身（フェイクか core の本番
+/// 実装か）に依存しない。`LaunchSpec` が持つ rootfs の fd は `Arc` 共有のため、複製しても固定は保たれる。
+pub struct LauncherRelauncher {
+    launcher: Arc<dyn ProcessLauncher>,
+    spec: LaunchSpec,
+}
+
+impl LauncherRelauncher {
+    /// start で使った `launcher` と捕捉した `spec` から作る。
+    pub fn new(launcher: Arc<dyn ProcessLauncher>, spec: LaunchSpec) -> Self {
+        Self { launcher, spec }
+    }
+}
+
+impl Relauncher for LauncherRelauncher {
+    fn relaunch(&self, timeout: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+        self.launcher.launch(&self.spec, timeout)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1710,12 +1804,15 @@ mod tests {
             terminate_error,
             late,
             restarts,
+            reaped,
         } = out
         else {
             panic!("unexpected outcome: {out:?}")
         };
         assert_eq!(error.code(), ErrorCode::FailedPrecondition);
         assert!(terminate_error.is_none());
+        // 終了を確認できた新プロセスの pid を呼び出し側へ返す（SUP-1・CORE-2）。
+        assert_eq!(reaped.map(NonZeroU32::get), Some(43));
         assert!(late.wait_settled(Duration::from_secs(5)));
         assert!(late.take().is_empty());
         assert_eq!(restarts, 0);
@@ -2032,6 +2129,42 @@ mod tests {
         assert!(process.is_none());
         assert_eq!(restarts, 0);
         assert_eq!(q.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// terminate が呼び出し側の期限より遅れて成功する起動ハンドル。
+    struct SlowOkProc(u32, Duration);
+
+    impl LaunchedProcess for SlowOkProc {
+        fn pid(&self) -> NonZeroU32 {
+            pidn(self.0)
+        }
+        fn wait(&self, _: Duration) -> Result<Option<ProcessExit>, TraitError> {
+            Ok(None)
+        }
+        fn terminate(&self, _: Duration) -> Result<(), TraitError> {
+            std::thread::sleep(self.1);
+            Ok(())
+        }
+    }
+
+    /// SUP-1・CORE-2・REPAIR-5: 呼び出し側の待ちが期限を過ぎた後に terminate が成功しても、回収済みの pid を
+    /// 受け皿に残す（`take_reaped`）。失敗ハンドルは積まない。
+    #[test]
+    fn sup1_late_successful_terminate_records_reaped_pid() {
+        let late = LateOrphans::default();
+        let timeout = Duration::from_millis(10);
+        let slow = timeout + RELAUNCH_REPLY_GRACE + Duration::from_millis(300);
+        let r = terminate_bounded(
+            Box::new(SlowOkProc(77, slow)),
+            timeout,
+            &late,
+            spawn_os_thread,
+        );
+        assert_eq!(r.unwrap_err().code(), ErrorCode::Timeout);
+        assert!(late.wait_settled(Duration::from_secs(5)));
+        assert!(late.take().is_empty());
+        assert_eq!(late.take_reaped(), vec![pidn(77)]);
+        assert!(late.take_reaped().is_empty());
     }
 
     /// terminate が必ず失敗する起動ハンドル。
@@ -2551,12 +2684,15 @@ mod tests {
             terminate_error,
             late,
             restarts,
+            reaped,
         } = out
         else {
             panic!("unexpected outcome: {out:?}")
         };
         assert_eq!(error.code(), ErrorCode::FailedPrecondition);
         assert_eq!(terminate_error.map(|e| e.code()), None);
+        // 記録は Running(43) のまま残るため、終了を確認できた pid を返す（入口が照合つきで Stopped に落とす）。
+        assert_eq!(reaped.map(NonZeroU32::get), Some(43));
         assert_eq!(restarts, 0);
         assert!(late.wait_settled(Duration::from_secs(5)));
         assert!(late.take().is_empty());

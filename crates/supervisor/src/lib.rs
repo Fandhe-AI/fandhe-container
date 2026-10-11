@@ -35,6 +35,7 @@
 //! | #856 | TASK-169.5.2 | 全オプション同時指定の結合テスト（`tests/container_options.rs`）。`--ipc=host` と `--shm-size` の併用は `ContainerOptions::tmpfs_set` が拒否 |
 //! | #488 | TASK-159.2 | restart ポリシー評価（実装済み） |
 //! | #858 | TASK-171.1.2 | 権限昇格の必要最小集合と検証ロジック（[`privilege`]。実装済み） |
+//! | #1717 | TASK-157 追補 | bin の入口（`src/main.rs`・[`start_entry`]）と CLI との起動の契約（[`start_contract`]）。core の本番 launcher が無い間は `UNIMPLEMENTED` で止まる。REPAIR-3 |
 //! | #1475 | TASK-171.1.3 | 権限昇格の実体 `privilege::elevate`（承認済みの方式〔#1454〕。縮退の syscall 適用と読み戻し検証は実装済み。fd 検証付き exec・入口検証・ランチャー bin は #1719 で未実装。REPAIR-3） |
 //! | #489 | TASK-159.3 | restart_count 管理・state.json 反映・結合テスト（実装済み。本番 launcher は未実装） |
 //! | #523 | TASK-168.1 | state.json 読み取り・inspect 出力フォーマット（実装済み） |
@@ -62,7 +63,10 @@ pub mod logs;
 pub mod privilege;
 pub mod restart;
 pub mod run;
+pub mod start_contract;
+pub mod start_entry;
 pub mod state;
 pub mod stats;
+pub mod stderr_sink;
 #[cfg(any(windows, target_os = "linux"))]
 mod sys;

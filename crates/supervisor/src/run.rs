@@ -6,8 +6,9 @@
 //! （常駐デーモンを前提にしない。CORE-1・D-19）。
 //!
 //! # 実装範囲の線引き（REPAIR-3）
-//! - 本番の `ProcessLauncher` は core に未提供のため、起動ハンドル（`LaunchedProcess`）は呼び出し側から注入する。
-//!   supervisor のバイナリ入口（`main.rs`）は本 issue では追加しない（実プロセスを起動できないため実装済みを装わない）。
+//! - 本番の `ProcessLauncher` は core に未提供（#1715 の Phase B）のため、起動ハンドル（`LaunchedProcess`）は呼び出し側から注入する。
+//!   supervisor のバイナリ入口は `src/main.rs`（処理順は [`crate::start_entry`]、CLI との契約は [`crate::start_contract`]。#1717）で、
+//!   Phase B が入るまでは起動の手順 4 で `UNIMPLEMENTED` を返して止まる（実プロセスを起動できないため実装済みを装わない）。
 //!   「コンテナ 0 個で supervisor プロセスが残存しない」ことの検証は結合テスト（#242・TASK-157.8）の担当。
 //! - restart ポリシーの配線と `restart_count` の加算は [`crate::restart`]（TASK-159.3・#489）。次節に未実装の範囲を記す。
 //!   stdout / stderr 捕捉の土台は [`crate::logs`] と [`monitor_with_capture`]（#241・TASK-157.7）。永続化・ローテーションは未実装
@@ -40,7 +41,7 @@
 //! （TASK-157.5 の土台だった「異常終了の検知回数」の加算は廃止し、`restart_count` を実施済み再起動回数に統一した）。
 //!
 //! 未実装（将来仕様と対応ビヘイビア ID）:
-//! - 本番 `ProcessLauncher` による再 launch（core の launcher 提供が前提。現状は [`crate::restart::Relauncher`] を注入する。SUP-3）。
+//! - 本番 `ProcessLauncher` による再 launch（core の launcher 提供が前提。[`crate::restart::LauncherRelauncher`] を [`crate::restart::Relauncher`] として注入する。SUP-3）。
 //! - 明示的な停止（`stop`）の検知と異常終了の区別、停止シグナル・猶予時間、再 launch 時の `unless-stopped` と `always` の差（SUP-9）。
 //! - 指数バックオフ等の高度な間隔制御（現状は固定のバックオフ。SUP-3）。
 //! - [`MonitorOutcome::ExitedUnrecorded`] の回復（SUP-3）。
@@ -289,6 +290,9 @@ pub trait MonitorObserver {
 }
 
 /// 1 行 1 JSON の構造化ログを stderr へ出す既定の観測器（値は固定語彙・数値のみ）。
+///
+/// [`crate::stderr_sink`] の専用スレッドへ渡すだけで待たない。stderr の読み手が止まっても監視・回収・restart を
+/// 止めず、キューが満杯なら行を捨てる（REPAIR-5）。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StderrLogObserver;
 
@@ -303,13 +307,15 @@ impl MonitorObserver for StderrLogObserver {
             .error_code
             .map(|c| c.as_str().to_owned())
             .unwrap_or_default();
-        eprintln!(
-            "{{\"component\":\"supervisor.monitor\",\"operation\":\"{}\",\"result\":\"{}\",\"code\":\"{}\",\"elapsed_us\":{}}}",
+        let line = format!(
+            "{{\"component\":\"supervisor.monitor\",\"operation\":\"{}\",\"result\":\"{}\",\"code\":\"{}\",\"elapsed_us\":{}}}\n",
             event.operation.as_str(),
             result,
             code,
             event.elapsed.as_micros()
         );
+        // 満杯・書き込み失敗でも監視は止めない（ログの欠落は許す）。
+        let _ = crate::stderr_sink::stderr().emit(line.into_bytes());
     }
 }
 

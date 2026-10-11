@@ -98,6 +98,10 @@ impl<S: PollStream> Read for PollReader<S> {
                     return Err(self.expire());
                 };
                 self.stream.set_poll_timeout(slice)?;
+            } else {
+                // アイドル待機では周期を IDLE_POLL 系の `poll` へ戻す。直前の受信や応答書き込みで
+                // 残り時間に絞った短い待機が残ると、通知・空行の直後に高頻度で起床し続ける。
+                self.stream.set_poll_timeout(self.poll)?;
             }
             match self.stream.read(buf) {
                 Err(e) if is_retry(e.kind()) => {
@@ -274,6 +278,8 @@ mod tests {
         slow: Duration,
         /// 台本が尽きたあとも TimedOut を返し続けるか（EOF を返さない停止相手）。
         stall_forever: bool,
+        /// `set_poll_timeout` に渡された値の履歴。
+        timeouts: Arc<Mutex<Vec<Duration>>>,
     }
 
     impl Fake {
@@ -287,6 +293,7 @@ mod tests {
                     write_chunk: usize::MAX,
                     slow: Duration::ZERO,
                     stall_forever: false,
+                    timeouts: Arc::new(Mutex::new(Vec::new())),
                 },
                 written,
             )
@@ -336,7 +343,8 @@ mod tests {
     }
 
     impl PollStream for Fake {
-        fn set_poll_timeout(&self, _: Duration) -> io::Result<()> {
+        fn set_poll_timeout(&self, t: Duration) -> io::Result<()> {
+            self.timeouts.lock().unwrap().push(t);
             Ok(())
         }
     }
@@ -439,6 +447,23 @@ mod tests {
         let out = String::from_utf8(written.lock().unwrap().clone()).unwrap();
         assert_eq!(out.lines().count(), 2);
         assert!(out.lines().all(|l| l.contains("-32600")));
+    }
+
+    /// 受信期限で絞った待機は、アイドルへ戻る読み出しで周期 `poll` に復元される（REPAIR-5）。
+    #[test]
+    fn idle_read_restores_poll_timeout_after_shortened_slice() {
+        let (fake, _) = Fake::new(vec![Step::Data(b" "), Step::Data(b"\n"), Step::Eof]);
+        let timeouts = Arc::clone(&fake.timeouts);
+        let limits = quick();
+        let r = serve_uds_with(fake, limits, &UnavailableBackend, &mut |_| {});
+        assert!(r.is_ok());
+        let t = timeouts.lock().unwrap().clone();
+        let poll = Duration::from_millis(80);
+        assert!(
+            t.iter().any(|d| *d < poll),
+            "shortened slice expected: {t:?}"
+        );
+        assert_eq!(t.last(), Some(&poll));
     }
 
     /// 1 バイトずつ成功し続ける遅い相手でも message_timeout で ReadTimeout（REPAIR-5）。

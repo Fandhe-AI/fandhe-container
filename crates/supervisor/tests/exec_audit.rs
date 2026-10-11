@@ -8,7 +8,7 @@
 //!
 //! worker の制限の準備で生じる rootfs の拒否（種別 `rootfs_pivot` の `rootfs_is_host_root`。#1614 の事後監査 P2）は、
 //! 本番の経路では対象の特定を通った後でしか起きないため、試験専用の入口（`exec-test-support`）で core の判定
-//! `reject_own_root`（`reject_own_root_for_test`）を本番と同じ worker の中で呼び、結果行を経た親側の記録が層 `mount`・
+//! `reject_own_root`（`reject_own_root_for_test`）を本番と同じ worker の中で呼び、結果行を経た親側の記録が層 `mount`・理由コードつき・
 //! パスなし・1 件になること、本番の記録先の JSON Lines に同じ 1 行が届くことを照合する。
 //!
 //! fork は呼び出しプロセスが単一スレッドであることを要求するため、`harness = false` の単一スレッド `main` で動かす
@@ -285,7 +285,7 @@ mod linux {
     }
 
     /// SEC-4・SEC-1・SUP-6・#1614 の事後監査 P2: worker の `rootfs_is_host_root` の拒否は結果行を経て親側で 1 件だけ
-    /// 記録される（層 `mount`・理由コードの欄なし・パスなし・親〔自〕プロセスの PID）。拒否の内容は元のまま。
+    /// 記録される（層 `mount`・理由コード `rootfs_is_host_root` つき・パスなし・親〔自〕プロセスの PID）。拒否の内容は元のまま。
     fn worker_rootfs_rejection_is_recorded_once_as_mount_without_path() {
         let sink = VecSink::new(false);
         let rejected = rootfs_is_host_root_in_worker(&sink);
@@ -295,7 +295,10 @@ mod linux {
         let recs = sink.snapshot();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].layer(), AuditLayer::Mount);
-        assert_eq!(recs[0].reason(), None);
+        assert_eq!(
+            recs[0].reason().map(|r| r.as_str()),
+            Some("rootfs_is_host_root")
+        );
         assert_eq!(recs[0].path(), None);
         assert_eq!(recs[0].syscall(), None);
         assert_eq!(recs[0].pid().get(), std::process::id());
@@ -331,6 +334,12 @@ mod linux {
                 "{line}"
             );
             assert!(line.ends_with("\"container_id\":\"c1\"}"), "{line}");
+            assert!(
+                line.ends_with(
+                    "\"path_original_len\":null,\"reason\":\"rootfs_is_host_root\",\"container_id\":\"c1\"}"
+                ),
+                "{line}"
+            );
             assert!(!line.contains("exec_target"), "{line}");
             assert!(!line.contains("entrypoint"), "{line}");
         });

@@ -14,7 +14,7 @@
 //! - exec の対象の拒否（層 `exec_target`）は `exec::audit_exec_violation` / `exec::record_exec_target_rejection`
 //!   が [`AuditEvent::ExecTarget`] として記録する。supervisor の通しの入口 `run_command` が親プロセス側で
 //!   1 拒否 1 件を記録する（#1465。worker の経路の拒否は `exec::record_exec_worker_rejection` で、種別 `rootfs_pivot`
-//!   の `rootfs_is_host_root` は層 `mount` のパスなし〔理由コードの欄なし〕の 1 件になる）。パスは持たない（型で保証）
+//!   の `rootfs_is_host_root` は層 `mount` のパスなし・理由コードつきの 1 件になる）。パスは持たない（型で保証）
 //! - エントリポイント検証の拒否（層 `entrypoint`。#1595）は `exec::audit_entrypoint_violation` /
 //!   `exec::record_entrypoint_rejection` が [`AuditEvent::Entrypoint`] として記録する。launch と exec の
 //!   子が共有する検証（`exec_checked_entrypoint` 等）の拒否理由 8 種を載せる層で、exec の
@@ -398,9 +398,20 @@ pub enum AuditEvent {
         syscall: Option<AuditSyscallNr>,
     },
     /// マウント検証 / API の拒否。パス検証による拒否ならパスあり、計画段階の拒否ならなし。
+    ///
+    /// 違反の理由コード（`ViolationReason` の静的トークン。例: `rootfs_is_host_root`）を `reason` に載せる
+    /// （SEC-4・TASK-41.4 追補・#1701）。理由の語彙を持たない API 層（OCI config の拒否。
+    /// `record_mount_rejection`）は `None` で、その行の出力は従来と変わらない。OCI 側に理由トークンを
+    /// 持たせるかは #652（TASK-98.1）の共通ログ型と合わせて決める（REPAIR-3）。
+    ///
+    /// 破壊的変更: `Seccomp` の `arch`（TASK-41.2）と同じく、フィールド追加で構築とパターンが壊れる。
+    /// 移行手順: 構築は `Mount { path, reason: None }`（理由を持つ経路は `Some(..)`）、
+    /// パターンは `Mount { path, .. }` と書く（理由を読むなら `AuditRecord::reason()`）。
     Mount {
         /// 拒否されたマウント先パス。
         path: Option<AuditPath>,
+        /// 違反の理由コード（静的トークン。[`AuditReason`] 参照）。API 層の拒否では `None`。
+        reason: Option<AuditReason>,
     },
     /// plugin 信頼検証の拒否（PLUG-11・TASK-122.5）。パスと拒否理由は必須。
     PluginTrust {
@@ -546,14 +557,16 @@ impl AuditRecord {
             | AuditEvent::ExecTarget { .. }
             | AuditEvent::Entrypoint { .. } => None,
             AuditEvent::Landlock { path, .. } => Some(path.as_path()),
-            AuditEvent::Mount { path } => path.as_ref().map(AuditPath::as_path),
+            AuditEvent::Mount { path, .. } => path.as_ref().map(AuditPath::as_path),
             AuditEvent::PluginTrust { path, .. } => Some(path.as_path()),
         }
     }
 
-    /// 拒否理由トークン（plugin 信頼検証・exec 対象・エントリポイントのレコードのみ。他レイヤーは `None`）。
+    /// 拒否理由トークン（plugin 信頼検証・exec 対象・エントリポイント、および理由を持つ mount のレコード。
+    /// seccomp・landlock と理由なしの mount は `None`）。
     pub fn reason(&self) -> Option<AuditReason> {
         match &self.event {
+            AuditEvent::Mount { reason, .. } => *reason,
             AuditEvent::PluginTrust { reason, .. }
             | AuditEvent::ExecTarget { reason }
             | AuditEvent::Entrypoint { reason } => Some(*reason),
@@ -565,6 +578,33 @@ impl AuditRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SEC-4・#1701: 理由つきの `Mount` は `reason()` が静的トークンを返し、理由なしは `None`。
+    #[test]
+    fn sec4_1701_mount_reason_accessor() {
+        let with = AuditRecord::new(
+            AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 5)),
+            AuditPid::new(9).unwrap(),
+            AuditEvent::Mount {
+                path: None,
+                reason: Some(AuditReason::new("rootfs_is_host_root")),
+            },
+        );
+        assert_eq!(
+            with.reason().map(|r| r.as_str()),
+            Some("rootfs_is_host_root")
+        );
+        assert_eq!(with.path(), None);
+        let without = AuditRecord::new(
+            AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 5)),
+            AuditPid::new(9).unwrap(),
+            AuditEvent::Mount {
+                path: None,
+                reason: None,
+            },
+        );
+        assert_eq!(without.reason(), None);
+    }
 
     fn ts() -> AuditTimestamp {
         AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 5))
@@ -632,12 +672,20 @@ mod tests {
             pid(9),
             AuditEvent::Mount {
                 path: Some(AuditPath::new("/proc/sys")),
+                reason: None,
             },
         );
         assert_eq!(with.layer(), AuditLayer::Mount);
         assert_eq!(with.path(), Some(Path::new("/proc/sys")));
         assert_eq!(with.syscall(), None);
-        let without = AuditRecord::new(ts(), pid(9), AuditEvent::Mount { path: None });
+        let without = AuditRecord::new(
+            ts(),
+            pid(9),
+            AuditEvent::Mount {
+                path: None,
+                reason: None,
+            },
+        );
         assert_eq!(without.path(), None);
     }
 
@@ -694,7 +742,14 @@ mod tests {
 
     #[test]
     fn sec4_task41_1618_record_container_id_accessor() {
-        let rec = AuditRecord::new(ts(), pid(7), AuditEvent::Mount { path: None });
+        let rec = AuditRecord::new(
+            ts(),
+            pid(7),
+            AuditEvent::Mount {
+                path: None,
+                reason: None,
+            },
+        );
         assert_eq!(rec.container_id(), None);
         let with = rec.with_container_id(ContainerId::new("c1").unwrap());
         assert_eq!(with.container_id().map(ContainerId::as_str), Some("c1"));
@@ -765,6 +820,7 @@ mod tests {
             pid(3),
             AuditEvent::Mount {
                 path: Some(AuditPath::new(&"b".repeat(5000))),
+                reason: None,
             },
         );
         assert_eq!(mount.path().map(|p| p.as_os_str().len()), Some(4096));

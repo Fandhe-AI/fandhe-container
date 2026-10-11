@@ -43,13 +43,16 @@ SUP_REPLACED=0
 # 更新途中の状態を旧 supervisor へ戻す（旧 launcher と新 supervisor の組み合わせを残さない）。
 restore_supervisor() {
   [ "${SUP_REPLACED}" -eq 1 ] || return 0
-  SUP_REPLACED=0
+  # 復元中に再度シグナルを受けて中断しないよう、捕捉可能な信号を無視する（完遂を優先する）。
+  trap '' INT HUP TERM
   if [ -n "${BAK_SUPERVISOR}" ]; then
     mv -f -- "${BAK_SUPERVISOR}" "${SUPERVISOR_DST}" || true
     BAK_SUPERVISOR=""
   else
     rm -f -- "${SUPERVISOR_DST}"
   fi
+  # 復元の完了後にフラグを落とす（途中で再入しても復元をやり直せる順序）。
+  SUP_REPLACED=0
 }
 cleanup() {
   restore_supervisor

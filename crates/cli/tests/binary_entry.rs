@@ -94,6 +94,68 @@ fn assert_failure(out: &Output, code: i32, stderr: &str) {
     assert!(out.stdout.is_empty(), "stdout must be empty");
 }
 
+/// REPAIR-5・#1673: stderr が読み手の読まない満杯の socket でも、終了時の出力は期限（2 秒）で打ち切られ、
+/// 終了コード（使い方エラーの 2）は保たれる。出力スレッドは書き込みで止まるため、終了までに期限ぶんかかる。
+/// `UnixStream` を使うため unix のみ（Windows には満杯にできる同等の stderr を std で作る手段が無い）。
+#[cfg(unix)]
+#[test]
+fn repair5_exit_is_bounded_when_stderr_reader_stalls() {
+    use std::os::unix::net::UnixStream;
+    let (a, b) = UnixStream::pair().expect("socketpair");
+    // 送信バッファを満たす間だけ非ブロッキングにし、子へ渡す前にブロッキングへ戻す（子の書き込みは止まる）。
+    a.set_nonblocking(true).expect("set_nonblocking");
+    let chunk = [b'x'; 4096];
+    let mut filled = false;
+    for _ in 0..1_000_000 {
+        match std::io::Write::write(&mut &a, &chunk) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                filled = true;
+                break;
+            }
+            Err(e) => panic!("fill failed: {e}"),
+        }
+    }
+    assert!(filled, "socket buffer was not filled");
+    a.set_nonblocking(false).expect("set_nonblocking");
+
+    let start = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fandhe-container"))
+        .env_remove("FANDHE_CONTAINER_PLUGIN_PATH_SEARCH")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::os::fd::OwnedFd::from(a)))
+        .spawn()
+        .expect("failed to spawn fandhe-container");
+    let deadline = start + CHILD_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            other => {
+                let _ = child.kill();
+                let reap_deadline = Instant::now() + REAP_TIMEOUT;
+                while Instant::now() < reap_deadline {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                panic!("fandhe-container did not exit within {CHILD_TIMEOUT:?}: {other:?}");
+            }
+        }
+    };
+    let elapsed = start.elapsed();
+    drop(b);
+    assert_eq!(status.code(), Some(2));
+    // 書き込みが止まったまま期限で打ち切られたこと（即座に終わったなら出力が止まっていない）。
+    assert!(
+        elapsed >= Duration::from_millis(1500),
+        "exited before the report timeout: {elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(15), "exit took {elapsed:?}");
+}
+
 /// CLI-1: 引数なしは使い方エラー（終了コード 2）。
 #[test]
 fn cli1_no_args_is_usage_error() {

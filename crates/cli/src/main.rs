@@ -169,6 +169,53 @@ mod tests {
         assert_eq!(FALLBACK.load(Ordering::SeqCst), 6);
     }
 
+    static RELEASE_BLOCKED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static BLOCKED_ENTERED: AtomicUsize = AtomicUsize::new(0);
+    static BLOCKED_FALLBACK: AtomicUsize = AtomicUsize::new(0);
+
+    /// 読み手が読まない stderr への書き込みの模擬: 解放されるまで戻らない（試験の終わりに解放する）。
+    #[allow(clippy::ptr_arg)] // `count` と同じ理由（`fn(&Vec<u8>)` の関数ポインタ型に合わせる）
+    fn block_until_released(_s: &Vec<u8>) {
+        BLOCKED_ENTERED.fetch_add(1, Ordering::SeqCst);
+        while !RELEASE_BLOCKED.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[allow(clippy::ptr_arg)] // `count` と同じ理由
+    fn count_blocked_fallback(s: &Vec<u8>) {
+        BLOCKED_FALLBACK.fetch_add(s.len(), Ordering::SeqCst);
+    }
+
+    /// 起動に成功した出力スレッドが書き込みで止まっても、`recv_timeout` の期限で呼び出し元へ戻り、縮退出力も
+    /// 呼ばない（スレッドは置き去りにする。#1673・REPAIR-5）。
+    #[test]
+    fn blocked_writer_returns_after_timeout_without_fallback() {
+        let timeout = Duration::from_millis(300);
+        let start = std::time::Instant::now();
+        report_deferred(
+            b"record".to_vec(),
+            timeout,
+            spawn_thread,
+            block_until_released,
+            count_blocked_fallback,
+        );
+        let elapsed = start.elapsed();
+        let entered = BLOCKED_ENTERED.load(Ordering::SeqCst);
+        RELEASE_BLOCKED.store(true, Ordering::SeqCst);
+        assert_eq!(entered, 1);
+        assert!(
+            elapsed >= timeout,
+            "returned before the timeout: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "did not return in time: {elapsed:?}"
+        );
+        assert_eq!(BLOCKED_FALLBACK.load(Ordering::SeqCst), 0);
+    }
+
     /// 縮退出力は断片分離の改行・コマンド結果の順で 1 つのバッファにまとまる（1 回の非ブロッキング書き込みで出す。
     /// 成功かつ断片なしなら空で、何も書かない。#1673・REPAIR-5・ERR-1）。
     #[test]

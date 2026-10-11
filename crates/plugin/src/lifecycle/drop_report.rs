@@ -98,9 +98,17 @@ impl DropReportTable {
                 return;
             }
         }
-        let _ = self
-            .dropped
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| n.checked_add(1));
+        // `fetch_update` は新しい toolchain で非推奨（`try_update` へ改名）のため、版差を避けて CAS ループで書く。
+        let mut cur = self.dropped.load(Ordering::Relaxed);
+        while let Some(next) = cur.checked_add(1) {
+            match self
+                .dropped
+                .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(now) => cur = now,
+            }
+        }
     }
 
     /// 即時書き込みが途中までで終わった印を立てる（取り出し時に先頭へ改行を足す）。

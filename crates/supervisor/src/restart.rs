@@ -12,8 +12,8 @@
 //! 1 進む（再 launch 失敗・記録失敗は数えない）。
 //!
 //! # 未実装の将来仕様（REPAIR-3）
-//! - 本番の再 launch（core の `ProcessLauncher` 経由）は未提供のため、[`Relauncher`] を呼び出し側から注入する
-//!   （SUP-3。supervisor のバイナリ入口も未実装）。実機でのレイテンシ実測・合否判定は #490・#491（TASK-160）の担当。
+//! - 本番の再 launch は [`LauncherRelauncher`]（start で使った launcher と `LaunchSpec` をそのまま使うアダプタ。#1717）で
+//!   足りるが、core の本番 `ProcessLauncher` が未提供のため実機では成り立たない（SUP-3。bin 入口は [`crate::start_entry`]）。実機でのレイテンシ実測・合否判定は #490・#491（TASK-160）の担当。
 //! - 明示的な stop の検知は SUP-9 の担当で、本モジュールは [`StopToken`] を [`StopIntent`] へ写すだけ。
 //!   再 launch 時の `unless-stopped` と `always` の差（stop 済みを復帰させるか）も未実装（SUP-3・SUP-9）。
 //! - [`crate::run::MonitorOutcome::ExitedUnrecorded`]（終了は回収済みだが記録失敗）の回復は未実装で、
@@ -34,9 +34,11 @@ use std::str::FromStr;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use fandhe_container_core::oci_runtime::{LaunchedProcess, ProcessExit};
+use fandhe_container_core::oci_runtime::{
+    LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher,
+};
 use fandhe_container_core::traits::{
-    ContainerStatus, ErrorCode, Signal, StateRecord, SupervisionState, TraitError,
+    ContainerId, ContainerStatus, ErrorCode, Signal, StateRecord, SupervisionState, TraitError,
 };
 
 use crate::run::{
@@ -252,8 +254,8 @@ const BACKOFF_SLICE: Duration = Duration::from_millis(10);
 
 /// 同じコンテナのプロセスを再 launch する拡張点（SUP-3・TASK-159.3）。
 ///
-/// 本番の `ProcessLauncher` は core に未提供のため、[`supervise_with_restart`] へ呼び出し側から注入する
-/// （本番実装は未実装。REPAIR-3）。
+/// [`supervise_with_restart`] へ呼び出し側から注入する。本番のアダプタは [`LauncherRelauncher`]（#1717）で、
+/// 中身の core の本番 `ProcessLauncher` は未提供（REPAIR-3）。
 ///
 /// 期限は実装への依頼だけに頼らず、[`supervise_with_restart`] が別スレッド上の呼び出し境界で強制する
 /// （上限＋[`RELAUNCH_REPLY_GRACE`] で待ちをやめる。REPAIR-5）。そのため `Send + Sync` を要求する。
@@ -1069,6 +1071,73 @@ pub fn supervise_with_restart(
         }
     }
 }
+/// `ProcessLauncher` を包み、`launch` に渡された検証済みの [`LaunchSpec`] を複製して保持する（SUP-3・#1717）。
+///
+/// supervisor の入口（[`crate::start_entry`]）が `oci_runtime::start` に渡す launcher をこれで包む。`LaunchSpec` は
+/// core の外では作れず、`start` が `config.json` を一度だけ読んで検証・rootfs の fd 固定をした値だけが載る。
+/// restart の再 launch はこの値をそのまま使い（[`LauncherRelauncher`]）、`config.json` を読み直さない
+/// （TOCTOU を作らない。SEC-1）。`confirm_no_process` も内側へ委ねる（既定実装は `Unimplemented` のため、
+/// 委ねないと包んだ launcher 越しの `recover_interrupted_start` が成功しない。CORE-2）。
+pub struct SpecCapturingLauncher {
+    inner: Arc<dyn ProcessLauncher>,
+    spec: Mutex<Option<LaunchSpec>>,
+}
+
+impl SpecCapturingLauncher {
+    /// `inner` を包む。
+    pub fn new(inner: Arc<dyn ProcessLauncher>) -> Self {
+        Self {
+            inner,
+            spec: Mutex::new(None),
+        }
+    }
+
+    /// 直近の `launch` に渡された仕様の複製（未 launch なら `None`）。
+    pub fn captured_spec(&self) -> Option<LaunchSpec> {
+        self.spec
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl ProcessLauncher for SpecCapturingLauncher {
+    fn launch(
+        &self,
+        spec: &LaunchSpec,
+        timeout: Duration,
+    ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+        *self.spec.lock().unwrap_or_else(PoisonError::into_inner) = Some(spec.clone());
+        self.inner.launch(spec, timeout)
+    }
+
+    fn confirm_no_process(&self, id: &ContainerId, timeout: Duration) -> Result<(), TraitError> {
+        self.inner.confirm_no_process(id, timeout)
+    }
+}
+
+/// start で使った launcher と [`LaunchSpec`] をそのまま使う [`Relauncher`] の本番アダプタ（SUP-3・#1717）。
+///
+/// `relaunch(timeout)` は `launcher.launch(&spec, timeout)` を呼ぶだけで、launcher の中身（フェイクか core の本番
+/// 実装か）に依存しない。`LaunchSpec` が持つ rootfs の fd は `Arc` 共有のため、複製しても固定は保たれる。
+pub struct LauncherRelauncher {
+    launcher: Arc<dyn ProcessLauncher>,
+    spec: LaunchSpec,
+}
+
+impl LauncherRelauncher {
+    /// start で使った `launcher` と捕捉した `spec` から作る。
+    pub fn new(launcher: Arc<dyn ProcessLauncher>, spec: LaunchSpec) -> Self {
+        Self { launcher, spec }
+    }
+}
+
+impl Relauncher for LauncherRelauncher {
+    fn relaunch(&self, timeout: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+        self.launcher.launch(&self.spec, timeout)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

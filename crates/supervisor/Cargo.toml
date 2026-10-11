@@ -26,6 +26,7 @@
 # TASK-163.4（#503）で exec にコマンド実行（run_command）と実コンテナへの通し結合試験 tests/exec.rs を追加した（依存は不変）。
 # TASK-163 追補（#1465）で exec::run_command に監査の記録先を必須の引数として追加した（依存は不変）。
 # TASK-164 追補（#1470）で Windows の世代 rename 再試行・ロックファイル ID 照合（src/sys.rs。自前 FFI 宣言）を追加した（依存は不変）。
+# TASK-157 追補（#1717）で bin の入口（src/main.rs）と起動の契約（start_contract・start_entry）を追加した（依存は不変）。
 # 外部クレート（crates.io）の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 
 [package]
@@ -42,6 +43,12 @@ publish = false
 name = "container_options_ipc"
 path = "tests/container_options_ipc.rs"
 harness = false
+
+# supervisor の bin（起動 → 結果の返却 → 監視。#1717）。doc = false は lib の rustdoc の出力名との衝突を避けるため。
+[[bin]]
+name = "fandhe-container-supervisor"
+path = "src/main.rs"
+doc = false
 
 [dependencies]
 fandhe-container-core = { path = "../core" }

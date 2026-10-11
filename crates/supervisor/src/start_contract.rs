@@ -324,6 +324,16 @@ pub fn cli_receive_deadline(timeouts: &StartTimeouts) -> Duration {
 mod tests {
     use super::*;
 
+    /// 絶対パスの fixture（Windows の `Path::is_absolute` はドライブ接頭辞を要する。CLI-1）。
+    #[cfg(windows)]
+    const ROOT: &str = r"C:\r";
+    #[cfg(windows)]
+    const ROOT2: &str = r"C:\s";
+    #[cfg(not(windows))]
+    const ROOT: &str = "/r";
+    #[cfg(not(windows))]
+    const ROOT2: &str = "/s";
+
     const ALL_CODES: [ErrorCode; 9] = [
         ErrorCode::InvalidArgument,
         ErrorCode::NotFound,
@@ -452,19 +462,19 @@ mod tests {
     /// SUP-1: 正しい argv の解析。
     #[test]
     fn sup1_args_parse_accepts_valid() {
-        let a = StartArgs::parse(os(&["start", "--root", "/r", "c1"])).unwrap();
-        assert_eq!(a.root, PathBuf::from("/r"));
+        let a = StartArgs::parse(os(&["start", "--root", ROOT, "c1"])).unwrap();
+        assert_eq!(a.root, PathBuf::from(ROOT));
         assert_eq!(a.restart, RestartPolicy::No);
         assert_eq!(a.id.as_str(), "c1");
         let b =
-            StartArgs::parse(os(&["start", "--restart", "always", "--root", "/r", "c-2"])).unwrap();
+            StartArgs::parse(os(&["start", "--restart", "always", "--root", ROOT, "c-2"])).unwrap();
         assert_eq!(b.restart, RestartPolicy::Always);
         assert_eq!(b.id.as_str(), "c-2");
         let c = StartArgs::parse(os(&[
             "start",
             "c1",
             "--root",
-            "/r",
+            ROOT,
             "--restart",
             "on-failure:3",
         ]))
@@ -479,28 +489,28 @@ mod tests {
         let nine: Vec<&str> = vec!["start"; 9];
         let cases: Vec<Vec<&str>> = vec![
             vec![],
-            vec!["run", "--root", "/r", "c1"],
+            vec!["run", "--root", ROOT, "c1"],
             vec!["start", "--root", "r", "c1"],
-            vec!["start", "--root", "/r"],
-            vec!["start", "--root", "/r", "a", "b"],
-            vec!["start", "--root", "/r", "--root", "/s", "c1"],
+            vec!["start", "--root", ROOT],
+            vec!["start", "--root", ROOT, "a", "b"],
+            vec!["start", "--root", ROOT, "--root", ROOT2, "c1"],
             vec![
                 "start",
                 "--root",
-                "/r",
+                ROOT,
                 "--restart",
                 "no",
                 "--restart",
                 "no",
                 "c1",
             ],
-            vec!["start", "--root", "/r", "--bogus", "c1"],
+            vec!["start", "--root", ROOT, "--bogus", "c1"],
             vec!["start", "--root"],
-            vec!["start", "--root", "/r", "--restart", "sometimes", "c1"],
+            vec!["start", "--root", ROOT, "--restart", "sometimes", "c1"],
             vec!["start", "c1"],
-            vec!["start", "--root", "/r", "bad/id"],
+            vec!["start", "--root", ROOT, "bad/id"],
             nine,
-            vec!["start", "--root", "/r", long.as_str()],
+            vec!["start", "--root", ROOT, long.as_str()],
         ];
         for c in cases {
             let e = StartArgs::parse(os(&c)).expect_err("must be rejected");

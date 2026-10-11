@@ -47,7 +47,8 @@ undocumented_unsafe_blocks = "deny"
 
 # 共通依存の集約先。追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 # 採用済みは serde / serde_json（承認: Issue #138・TASK-29.hdep1。OCI config.json のパース用）・sha2（#278）・
-# objc2 系 5 件（#356・TASK-64.hdep1）・windows-sys（#371・TASK-67.hdep1）。
+# objc2 系 5 件（#356・TASK-64.hdep1）・windows-sys（#371・TASK-67.hdep1）・
+# ureq / rustls / rustls-graviola / rustls-native-certs（#399・TASK-51.hdep1。crates/oci のレジストリクライアント用）。
 # workspace 内 crate の path 依存は外部クレートの追加ではない（TASK-111.1・#262・PLUG-3。core の optional 依存用）。
 [workspace.dependencies]
 fandhe-container-plugin = { path = "crates/plugin" }
@@ -71,3 +72,10 @@ windows-sys = { version = "=0.61.2", default-features = false }
 # 配置は crates/io に限る。使うのは正準分解（nfd()）だけで、互換分解・合成は使わない。
 # 純 Rust・MIT OR Apache-2.0。推移依存は tinyvec（alloc）のみ。nfd() は alloc だけで動くため std を無効化する。
 unicode-normalization = { version = "=0.1.25", default-features = false }
+# OCI レジストリクライアントの HTTP/TLS（OCI-1・TASK-51.1）。承認: Issue #399・TASK-51.hdep1（2026-10-10）。
+# 配置は crates/oci に限る。暗号は rustls-graviola（純 Rust）に固定し、ring / aws-lc-rs / webpki-roots は引かない。
+# rustls は RUSTSEC-2026-0285 の修正版 0.23.45。ルート証明書は OS のストア（rustls-native-certs）から読む。
+ureq = { version = "=3.4.2", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["std", "tls12", "logging"] }
+rustls-graviola = { version = "=0.4.0" }
+rustls-native-certs = { version = "=0.8.4" }

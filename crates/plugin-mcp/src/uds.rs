@@ -62,26 +62,54 @@ struct RecvState {
     expired: Cell<bool>,
 }
 
+/// 期限までの残り時間を、周期 `poll` を上限・1ms を下限にして返す。期限超過なら `None`。
+fn slice_until(deadline: Instant, poll: Duration) -> Option<Duration> {
+    let rest = deadline.checked_duration_since(Instant::now())?;
+    if rest.is_zero() {
+        return None;
+    }
+    Some(rest.min(poll).max(Duration::from_millis(1)))
+}
+
 /// ポーリング周期の `WouldBlock` / `TimedOut` を吸収し、期限があれば超過で打ち切る reader。
+///
+/// 期限（絶対時刻）は read が成功し続ける場合にも適用する（REPAIR-5）。各 read の前に残り時間を確認し、
+/// socket の待機を残り時間以下に絞り、read の後にも確認する。少量ずつ送り続ける相手でも
+/// `message_timeout` を超えて受信を続けない（上限超過後の読み捨てを含む）。
 struct PollReader<S> {
     stream: S,
     state: Rc<RecvState>,
+    poll: Duration,
+}
+
+impl<S: PollStream> PollReader<S> {
+    fn expire(&self) -> io::Error {
+        self.state.expired.set(true);
+        io::Error::from(io::ErrorKind::TimedOut)
+    }
 }
 
 impl<S: PollStream> Read for PollReader<S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
+            let deadline = self.state.deadline.get();
+            if let Some(d) = deadline {
+                let Some(slice) = slice_until(d, self.poll) else {
+                    return Err(self.expire());
+                };
+                self.stream.set_poll_timeout(slice)?;
+            }
             match self.stream.read(buf) {
                 Err(e) if is_retry(e.kind()) => {
-                    if self
-                        .state
-                        .deadline
-                        .get()
-                        .is_some_and(|d| Instant::now() >= d)
-                    {
-                        self.state.expired.set(true);
-                        return Err(io::Error::from(io::ErrorKind::TimedOut));
+                    if deadline.is_some_and(|d| Instant::now() >= d) {
+                        return Err(self.expire());
                     }
+                }
+                Ok(n) => {
+                    if deadline.is_some_and(|d| Instant::now() >= d) {
+                        return Err(self.expire());
+                    }
+                    return Ok(n);
                 }
                 other => return other,
             }
@@ -90,10 +118,14 @@ impl<S: PollStream> Read for PollReader<S> {
 }
 
 /// 応答 1 件（末尾に改行を付ける）を `timeout` の合計期限で書いて flush する。
+///
+/// 各 write・flush の前に残り時間を確認して待機を残り時間以下に絞り、成功後にも確認する。
+/// 部分書き込みが進み続けても、flush が成功しても、合計期限を超えたら `WriteTimeout`（REPAIR-5）。
 fn write_line<S: PollStream>(
     stream: &mut S,
     text: &str,
     timeout: Duration,
+    poll: Duration,
 ) -> Result<(), ServeError> {
     let deadline = Instant::now() + timeout;
     let mut data = Vec::with_capacity(text.len().saturating_add(1));
@@ -101,27 +133,29 @@ fn write_line<S: PollStream>(
     data.push(b'\n');
     let mut rest: &[u8] = &data;
     while !rest.is_empty() {
+        let slice = slice_until(deadline, poll).ok_or(ServeError::WriteTimeout)?;
+        stream.set_poll_timeout(slice).map_err(ServeError::Write)?;
         match stream.write(rest) {
             Ok(0) => {
                 return Err(ServeError::Write(io::Error::from(io::ErrorKind::WriteZero)));
             }
             Ok(n) => rest = rest.get(n..).unwrap_or_default(),
-            Err(e) if is_retry(e.kind()) => {
-                if Instant::now() >= deadline {
-                    return Err(ServeError::WriteTimeout);
-                }
-            }
+            Err(e) if is_retry(e.kind()) => {}
             Err(e) => return Err(ServeError::Write(e)),
         }
     }
     loop {
+        let slice = slice_until(deadline, poll).ok_or(ServeError::WriteTimeout)?;
+        stream.set_poll_timeout(slice).map_err(ServeError::Write)?;
         match stream.flush() {
-            Ok(()) => return Ok(()),
-            Err(e) if is_retry(e.kind()) => {
-                if Instant::now() >= deadline {
-                    return Err(ServeError::WriteTimeout);
-                }
+            Ok(()) => {
+                return if Instant::now() >= deadline {
+                    Err(ServeError::WriteTimeout)
+                } else {
+                    Ok(())
+                };
             }
+            Err(e) if is_retry(e.kind()) => {}
             Err(e) => return Err(ServeError::Write(e)),
         }
     }
@@ -152,6 +186,7 @@ pub fn serve_uds_with<S: PollStream>(
     let mut reader = BufReader::new(PollReader {
         stream,
         state: Rc::clone(&state),
+        poll,
     });
     loop {
         state.deadline.set(None);
@@ -163,7 +198,14 @@ pub fn serve_uds_with<S: PollStream>(
                 .set(Some(Instant::now() + message_timeout));
         };
         let line = match read_line(&mut reader, limits.max_line_bytes, &mut on_start) {
-            Ok(Some(line)) => line,
+            Ok(Some(line)) => {
+                // バッファ済みの行で完結した場合も、受信の期限超過なら拒否する。
+                if state.deadline.get().is_some_and(|d| Instant::now() >= d) {
+                    log_transport(log, "DEADLINE_EXCEEDED");
+                    return Err(ServeError::ReadTimeout);
+                }
+                line
+            }
             Ok(None) => return Ok(()),
             Err(e) => {
                 if state.expired.get() {
@@ -185,7 +227,12 @@ pub fn serve_uds_with<S: PollStream>(
                 log_transport(log, "INTERNAL");
                 return Err(ServeError::Encode);
             };
-            if let Err(e) = write_line(&mut reader.get_mut().stream, &text, limits.write_timeout) {
+            if let Err(e) = write_line(
+                &mut reader.get_mut().stream,
+                &text,
+                limits.write_timeout,
+                poll,
+            ) {
                 log_transport(
                     log,
                     if matches!(e, ServeError::WriteTimeout) {
@@ -223,6 +270,8 @@ mod tests {
         write_blocks: bool,
         /// 1 回の write で受け取る最大バイト数（部分書き込みの再現）。
         write_chunk: usize,
+        /// read / write 1 回ごとに眠る時間（成功する遅い I/O の再現）。
+        slow: Duration,
         /// 台本が尽きたあとも TimedOut を返し続けるか（EOF を返さない停止相手）。
         stall_forever: bool,
     }
@@ -236,6 +285,7 @@ mod tests {
                     written: Arc::clone(&written),
                     write_blocks: false,
                     write_chunk: usize::MAX,
+                    slow: Duration::ZERO,
                     stall_forever: false,
                 },
                 written,
@@ -245,6 +295,7 @@ mod tests {
 
     impl Read for Fake {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            std::thread::sleep(self.slow);
             match self.script.pop_front() {
                 Some(Step::Data(d)) => {
                     let n = d.len().min(buf.len());
@@ -271,6 +322,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(2));
                 return Err(io::Error::from(io::ErrorKind::WouldBlock));
             }
+            std::thread::sleep(self.slow);
             let n = buf.len().min(self.write_chunk);
             self.written
                 .lock()
@@ -381,5 +433,33 @@ mod tests {
         let out = String::from_utf8(written.lock().unwrap().clone()).unwrap();
         assert_eq!(out.lines().count(), 2);
         assert!(out.lines().all(|l| l.contains("-32600")));
+    }
+
+    /// 1 バイトずつ成功し続ける遅い相手でも message_timeout で ReadTimeout（REPAIR-5）。
+    #[test]
+    fn slow_successful_reads_hit_message_deadline() {
+        let steps = (0..200).map(|_| Step::Data(b"x")).collect();
+        let (mut fake, written) = Fake::new(steps);
+        fake.slow = Duration::from_millis(5);
+        let began = Instant::now();
+        let r = serve_uds_with(fake, quick(), &UnavailableBackend, &mut |_| {});
+        assert!(matches!(r, Err(ServeError::ReadTimeout)));
+        assert!(began.elapsed() < Duration::from_millis(600));
+        assert!(written.lock().unwrap().is_empty());
+    }
+
+    /// 少量ずつ書けるが合計期限を超える相手は WriteTimeout（REPAIR-5）。
+    #[test]
+    fn slow_successful_writes_hit_write_deadline() {
+        let (mut fake, _) = Fake::new(vec![Step::Data(PING), Step::Eof]);
+        fake.write_chunk = 1;
+        fake.slow = Duration::from_millis(10);
+        // 応答は 50 バイト超 x 10ms で 80ms を超える。読み側の遅延も含むため write のみ眠らせる別台本は不要。
+        let limits = Limits {
+            message_timeout: Duration::from_secs(5),
+            ..quick()
+        };
+        let r = serve_uds_with(fake, limits, &UnavailableBackend, &mut |_| {});
+        assert!(matches!(r, Err(ServeError::WriteTimeout)));
     }
 }

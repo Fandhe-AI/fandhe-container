@@ -54,6 +54,10 @@ const UDS_READ_FAILED_JSON: &str =
     "{\"code\":\"UNAVAILABLE\",\"message\":\"failed to read request from socket\"}";
 const UDS_WRITE_FAILED_JSON: &str =
     "{\"code\":\"UNAVAILABLE\",\"message\":\"failed to write response to socket\"}";
+const UDS_READ_TIMEOUT_JSON: &str =
+    "{\"code\":\"DEADLINE_EXCEEDED\",\"message\":\"timed out reading request from socket\"}";
+const UDS_WRITE_TIMEOUT_JSON: &str =
+    "{\"code\":\"DEADLINE_EXCEEDED\",\"message\":\"timed out writing response to socket\"}";
 
 /// UDS 接続失敗の終了コード（plugin-macos / -windows と同じ値）。
 const EXIT_CONNECT_FAILED: u8 = 3;
@@ -94,7 +98,9 @@ fn exit_for(result: Result<(), ServeError>, uds: bool) -> ExitCode {
         Err(ServeError::Read(_)) => READ_FAILED_JSON,
         Err(ServeError::Write(_)) if uds => UDS_WRITE_FAILED_JSON,
         Err(ServeError::Write(_)) => WRITE_FAILED_JSON,
+        Err(ServeError::ReadTimeout) if uds => UDS_READ_TIMEOUT_JSON,
         Err(ServeError::ReadTimeout) => READ_TIMEOUT_JSON,
+        Err(ServeError::WriteTimeout) if uds => UDS_WRITE_TIMEOUT_JSON,
         Err(ServeError::WriteTimeout) => WRITE_TIMEOUT_JSON,
         Err(ServeError::Spawn(_)) => SPAWN_FAILED_JSON,
         Err(ServeError::Encode) => ENCODE_FAILED_JSON,
@@ -161,6 +167,14 @@ mod tests {
         assert_eq!(
             WRITE_TIMEOUT_JSON,
             "{\"code\":\"DEADLINE_EXCEEDED\",\"message\":\"timed out writing response to stdout\"}"
+        );
+        assert_eq!(
+            UDS_READ_TIMEOUT_JSON,
+            "{\"code\":\"DEADLINE_EXCEEDED\",\"message\":\"timed out reading request from socket\"}"
+        );
+        assert_eq!(
+            UDS_WRITE_TIMEOUT_JSON,
+            "{\"code\":\"DEADLINE_EXCEEDED\",\"message\":\"timed out writing response to socket\"}"
         );
         assert_eq!(
             ENCODE_FAILED_JSON,

@@ -93,6 +93,9 @@ pub const GRPC_SHUTDOWN_GRACE_DEFAULT: Duration = Duration::from_secs(10);
 /// 同時リクエスト数・同時ストリーム数の上限値。
 pub const GRPC_CONCURRENCY_MAX: u32 = 65_536;
 
+/// サーバー全体の同時接続数の既定値（小さい有限値。PLUG-12）。
+pub const GRPC_MAX_CONNECTIONS_DEFAULT: u32 = 64;
+
 /// HTTP/2 ヘッダリストサイズの上限値（バイト）。
 pub const GRPC_HEADER_LIST_MAX_BYTES: u32 = 1024 * 1024;
 
@@ -133,6 +136,7 @@ pub struct GrpcServerConfig {
     keepalive_timeout: Duration,
     header_list_max_bytes: u32,
     shutdown_grace: Duration,
+    max_connections: u32,
 }
 
 impl Default for GrpcServerConfig {
@@ -145,6 +149,7 @@ impl Default for GrpcServerConfig {
             keepalive_timeout: Duration::from_secs(10),
             header_list_max_bytes: 16 * 1024,
             shutdown_grace: GRPC_SHUTDOWN_GRACE_DEFAULT,
+            max_connections: GRPC_MAX_CONNECTIONS_DEFAULT,
         }
     }
 }
@@ -197,6 +202,20 @@ impl GrpcServerConfig {
     pub fn with_shutdown_grace(mut self, d: Duration) -> Result<Self, PluginError> {
         self.shutdown_grace = check_duration(d, "shutdown grace")?;
         Ok(self)
+    }
+
+    /// サーバー全体の同時接続数の上限（0 と [`GRPC_CONCURRENCY_MAX`] 超は `InvalidArgument`）。
+    ///
+    /// UID 認証を通った接続にも件数上限を掛け、同一 UID の非信頼 plugin による接続・タスク・fd の
+    /// 枯渇を防ぐ（PLUG-12・OWASP A04）。上限到達後の接続は accept 直後に close して拒否する。
+    pub fn with_max_connections(mut self, n: u32) -> Result<Self, PluginError> {
+        self.max_connections = check_count(n, GRPC_CONCURRENCY_MAX, "max connections")?;
+        Ok(self)
+    }
+
+    /// 同時接続数の上限を返す。
+    pub fn max_connections(&self) -> u32 {
+        self.max_connections
     }
 
     /// リクエストタイムアウトを返す。
@@ -595,6 +614,10 @@ impl<IO: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for KillableIo<IO>
 struct KillableIncoming<I, IO, IE> {
     inner: Pin<Box<I>>,
     switch: Arc<KillSwitch>,
+    /// 同時接続数の上限。存命の [`KillableIo`]（= `switch.live`）がこれに達したら新規接続を拒否する。
+    max_connections: usize,
+    /// 上限超過で拒否した累計件数（ログの間引きに使う）。
+    rejected: u64,
     _marker: PhantomData<fn() -> (IO, IE)>,
 }
 
@@ -605,11 +628,31 @@ where
     type Item = Result<KillableIo<IO>, IE>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let switch = Arc::clone(&self.switch);
-        self.inner
-            .as_mut()
-            .poll_next(cx)
-            .map(|o| o.map(|r| r.map(|io| KillableIo::new(io, switch))))
+        loop {
+            let this = &mut *self;
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(io))) => {
+                    // 件数は IO の生成（ここ）で加算し drop で減算するため、枠は接続の寿命と一致する。
+                    if this.switch.live() >= this.max_connections {
+                        // 即 close して拒否し、次の accept に進む（枠が空くのを待たない）。
+                        drop(io);
+                        this.rejected = this.rejected.saturating_add(1);
+                        // 攻撃時のログ洪水を避け、2 のべき乗回目だけ構造化ログを出す。
+                        if this.rejected.is_power_of_two() {
+                            eprintln!(
+                                "{{\"event\":\"grpc_connection_rejected\",\"code\":\"resource_exhausted\",\"message\":\"max connections reached\",\"max_connections\":{},\"rejected_total\":{}}}",
+                                this.max_connections, this.rejected
+                            );
+                        }
+                        continue;
+                    }
+                    return Poll::Ready(Some(Ok(KillableIo::new(io, Arc::clone(&this.switch)))));
+                }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 }
 
@@ -670,6 +713,8 @@ where
     let wrapped = KillableIncoming {
         inner: Box::pin(incoming),
         switch: Arc::clone(&switch),
+        max_connections: config.max_connections as usize,
+        rejected: 0,
         _marker: PhantomData,
     };
     let fired = Arc::new(AtomicBool::new(false));
@@ -1123,6 +1168,67 @@ pub fn status_to_plugin_error(status: &tonic::Status) -> PluginError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 接続上限: 上限到達で追加接続は拒否され、接続を drop すると枠が戻る（PLUG-12・REPAIR-12）。
+    #[tokio::test]
+    async fn max_connections_rejects_then_recovers() {
+        use std::collections::VecDeque;
+        use tokio::io::DuplexStream;
+
+        struct Feed(Arc<Mutex<VecDeque<DuplexStream>>>);
+        impl Stream for Feed {
+            type Item = Result<DuplexStream, std::io::Error>;
+            fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+                Poll::Ready(self.0.lock().unwrap().pop_front().map(Ok))
+            }
+        }
+        let q: Arc<Mutex<VecDeque<DuplexStream>>> = Arc::default();
+        let switch = KillSwitch::new();
+        let mut inc: KillableIncoming<Feed, DuplexStream, std::io::Error> = KillableIncoming {
+            inner: Box::pin(Feed(Arc::clone(&q))),
+            switch: Arc::clone(&switch),
+            max_connections: 2,
+            rejected: 0,
+            _marker: PhantomData,
+        };
+        for _ in 0..3 {
+            q.lock().unwrap().push_back(tokio::io::duplex(64).0);
+        }
+        let mut accepted = Vec::new();
+        while let Some(r) = poll_fn(|cx| Pin::new(&mut inc).poll_next(cx)).await {
+            accepted.push(r.unwrap());
+        }
+        assert_eq!(accepted.len(), 2);
+        assert_eq!(switch.live(), 2);
+        assert_eq!(inc.rejected, 1);
+        accepted.pop();
+        assert_eq!(switch.live(), 1);
+        q.lock().unwrap().push_back(tokio::io::duplex(64).0);
+        let again = poll_fn(|cx| Pin::new(&mut inc).poll_next(cx)).await;
+        assert!(again.is_some());
+        assert_eq!(switch.live(), 2);
+        assert_eq!(inc.rejected, 1);
+    }
+
+    #[test]
+    fn max_connections_validation() {
+        assert_eq!(GrpcServerConfig::new().max_connections(), 64);
+        assert_eq!(
+            GrpcServerConfig::new()
+                .with_max_connections(0)
+                .unwrap_err()
+                .code(),
+            PluginErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            GrpcServerConfig::new()
+                .with_max_connections(GRPC_CONCURRENCY_MAX + 1)
+                .unwrap_err()
+                .code(),
+            PluginErrorCode::InvalidArgument
+        );
+        assert!(GrpcServerConfig::new().with_max_connections(1).is_ok());
+    }
 
     /// 境界値: 上限ちょうどは成功し、0 と上限超過は InvalidArgument（REPAIR-2・REPAIR-5）。
     #[test]

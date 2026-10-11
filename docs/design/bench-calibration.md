@@ -26,7 +26,7 @@
 
 ## 実測の前提条件
 
-1. files/s ベンチと起動 p95 ベンチが `benches/benches/` に実装され、Makefile の `BENCH_NAMES` と `benches/metrics.json` に登録されている
+1. files/s ベンチと起動 p95 ベンチが `benches/benches/` に実装され、`scripts/lib.sh` の `BENCH_NAMES` と `benches/metrics.json` に登録されている
 2. 起動 p95 は TASK-29（コンテナ create/start）が完了している
 3. 計測環境の扱いが TASK-88.h1 で決まっている（下記）
 

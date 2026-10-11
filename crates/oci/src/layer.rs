@@ -9,13 +9,14 @@
 //! 未実装（後続 issue）: `fetch_blob` 内への組み込み、manifest 本文の digest 突合、展開・キャッシュ格納。
 
 use std::fmt::Write as _;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::path::Path;
 
 use sha2::{Digest as _, Sha256};
 
 use crate::error::{OciError, OciErrorCode};
+use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
 use crate::reference::Digest;
 use crate::registry::FetchedBlob;
 
@@ -32,16 +33,72 @@ pub struct VerifiedBlob {
     pub size: u64,
 }
 
-/// `path` の blob の sha256 を計算し `expected` と比較する（OCI-1）。
-///
-/// `max_bytes` は読み取り上限で、呼び出し側は `descriptor.size` または `RegistryClientConfig::max_blob_bytes`
-/// を渡す。超過は `ResourceExhausted`、不一致は `DataLoss`、通常ファイル以外は `InvalidArgument`。
+/// 書き手のいない FIFO 等で `open` が無期限に止まらないよう、Unix では非ブロッキングで開く（REPAIR-5）。
+/// 通常ファイルの読み取りには影響しない。値は OS ごとの `O_NONBLOCK`（libc 依存を増やさないため定数で持つ）。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const O_NONBLOCK: i32 = 0o4000;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+const O_NONBLOCK: i32 = 0x4;
+
+/// 種別確認前にブロックしない設定で blob ファイルを開く。
+fn open_blob(path: &Path) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(O_NONBLOCK);
+    }
+    opts.open(path)
+}
+
+/// 計装なしの `verify_blob_digest_with`（`NoopOciOpRecorder`）。
 pub fn verify_blob_digest(
     path: &Path,
     expected: &Digest,
     max_bytes: u64,
 ) -> Result<VerifiedBlob, OciError> {
-    let file = File::open(path).map_err(map_io_error)?;
+    verify_blob_digest_with(&NoopOciOpRecorder, path, expected, max_bytes)
+}
+
+/// 検証全体（open 失敗を含む）を `OciOpKind::VerifyBlobDigest` として `recorder` へ記録する（REPAIR-4）。
+pub fn verify_blob_digest_with(
+    recorder: &dyn OciOpRecorder,
+    path: &Path,
+    expected: &Digest,
+    max_bytes: u64,
+) -> Result<VerifiedBlob, OciError> {
+    record_oci_op(recorder, OciOpKind::VerifyBlobDigest, || {
+        verify_blob_digest_inner(path, expected, max_bytes)
+    })
+}
+
+/// `path` の blob の sha256 を計算し `expected` と比較する（OCI-1）。
+///
+/// `max_bytes` は読み取り上限で、呼び出し側は `descriptor.size` または `RegistryClientConfig::max_blob_bytes`
+/// を渡す。超過は `ResourceExhausted`、不一致は `DataLoss`、通常ファイル以外は `InvalidArgument`。
+fn verify_blob_digest_inner(
+    path: &Path,
+    expected: &Digest,
+    max_bytes: u64,
+) -> Result<VerifiedBlob, OciError> {
+    let file = open_blob(path).map_err(map_io_error)?;
     // 同一ハンドルで種別を確認する（FIFO 等で読みがブロックするのを避ける）。
     let meta = file.metadata().map_err(map_io_error)?;
     if !meta.is_file() {
@@ -67,6 +124,15 @@ pub fn verify_blob_digest(
 /// `fetch_blob` の戻り値を、要求した digest に対して検証する薄いラッパー。
 pub fn verify_fetched_blob(blob: &FetchedBlob, max_bytes: u64) -> Result<VerifiedBlob, OciError> {
     verify_blob_digest(&blob.path, &blob.digest, max_bytes)
+}
+
+/// 計装つきの `verify_fetched_blob`。
+pub fn verify_fetched_blob_with(
+    recorder: &dyn OciOpRecorder,
+    blob: &FetchedBlob,
+    max_bytes: u64,
+) -> Result<VerifiedBlob, OciError> {
+    verify_blob_digest_with(recorder, &blob.path, &blob.digest, max_bytes)
 }
 
 /// Reader を EOF まで読み、小文字 hex の sha256 と読み取りバイト数を返す。
@@ -257,6 +323,56 @@ mod tests {
         blob.digest = Digest::parse(EMPTY).unwrap();
         let e = verify_fetched_blob(&blob, 10).unwrap_err();
         assert_eq!(e.code(), OciErrorCode::DataLoss);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// REPAIR-5: 書き手のいない FIFO でも停止せず InvalidArgument で拒否する。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn oci1_fifo_does_not_hang() {
+        let d = tmp_dir("fifo");
+        let p = d.join("f");
+        let st = std::process::Command::new("mkfifo").arg(&p).status();
+        assert!(matches!(st, Ok(s) if s.success()), "mkfifo is required");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pc = p.clone();
+        std::thread::spawn(move || {
+            let r = verify_blob_digest(&pc, &Digest::parse(ABC).unwrap(), 10);
+            let _ = tx.send(r);
+        });
+        let r = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("verify must not block on a FIFO");
+        assert_eq!(r.unwrap_err().code(), OciErrorCode::InvalidArgument);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[derive(Debug, Default)]
+    struct Collect(std::sync::Mutex<Vec<crate::instrument::OciOpSample>>);
+    impl OciOpRecorder for Collect {
+        fn record_oci_op(&self, s: &crate::instrument::OciOpSample) {
+            self.0.lock().unwrap().push(*s);
+        }
+    }
+
+    /// REPAIR-4: 成功・DataLoss・open 失敗がそれぞれ 1 件記録される。
+    #[test]
+    fn oci1_verify_is_recorded() {
+        use crate::instrument::OciOpOutcome;
+        let d = tmp_dir("rec");
+        let p = d.join("b");
+        std::fs::write(&p, b"abc").unwrap();
+        let c = Collect::default();
+        verify_blob_digest_with(&c, &p, &Digest::parse(ABC).unwrap(), 10).unwrap();
+        verify_blob_digest_with(&c, &p, &Digest::parse(EMPTY).unwrap(), 10).unwrap_err();
+        verify_blob_digest_with(&c, &d.join("none"), &Digest::parse(ABC).unwrap(), 10).unwrap_err();
+        let v = c.0.lock().unwrap();
+        assert_eq!(v.len(), 3);
+        assert!(v.iter().all(|s| s.kind() == OciOpKind::VerifyBlobDigest));
+        assert_eq!(v[0].outcome(), OciOpOutcome::Success);
+        assert_eq!(v[0].error_code(), None);
+        assert_eq!(v[1].error_code(), Some(OciErrorCode::DataLoss));
+        assert_eq!(v[2].error_code(), Some(OciErrorCode::NotFound));
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

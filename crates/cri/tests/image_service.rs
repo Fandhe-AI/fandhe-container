@@ -160,11 +160,6 @@ fn task_61_1_oversized_filter_is_invalid_argument() {
 #[test]
 fn task_61_1_other_rpcs_are_unimplemented() {
     let svc = CriImageService::new();
-    let status = block_on(ImageService::image_status(
-        &svc,
-        Request::new(Default::default()),
-    ));
-    assert_eq!(status.err().map(|s| s.code()), Some(Code::Unimplemented));
     let pull = block_on(ImageService::pull_image(
         &svc,
         Request::new(Default::default()),
@@ -190,4 +185,74 @@ fn task_61_1_image_service_server_wraps_service() {
         <ImageServiceServer<CriImageService> as NamedService>::NAME,
         "runtime.v1.ImageService"
     );
+}
+
+fn status(
+    svc: &CriImageService,
+    reference: Option<&str>,
+    verbose: bool,
+) -> Result<v1::ImageStatusResponse, tonic::Status> {
+    let request = v1::ImageStatusRequest {
+        image: reference.map(|r| v1::ImageSpec {
+            image: r.into(),
+            ..Default::default()
+        }),
+        verbose,
+    };
+    block_on(ImageService::image_status(svc, Request::new(request))).map(|r| r.into_inner())
+}
+
+/// CRI-4・TASK-61.2: 取得済みイメージが id・タグ・digest のいずれの参照でも期待する digest とサイズで返る（受入基準）。
+#[test]
+fn task_61_2_image_status_returns_digest_and_size() {
+    let (recorder, svc) = seeded();
+    for r in ["sha256:bb", "reg/b:2", "reg/b@sha256:bb"] {
+        let resp = status(&svc, Some(r), false).expect("status");
+        let image = resp.image.expect("image");
+        assert_eq!(image.id, "sha256:bb", "{r}");
+        assert_eq!(image.repo_tags, vec!["reg/b:2".to_owned()]);
+        assert_eq!(image.repo_digests, vec!["reg/b@sha256:bb".to_owned()]);
+        assert_eq!(image.size, 200);
+        assert_eq!(
+            image.spec.as_ref().map(|s| s.image.as_str()),
+            Some("sha256:bb")
+        );
+        assert!(resp.info.is_empty());
+    }
+    assert_eq!(
+        recorder.lines(),
+        vec![("cri.image_status", "success", "OK"); 3]
+    );
+}
+
+/// CRI-4・TASK-61.2: verbose でも成功し info は未実装のため空（REPAIR-3）。
+#[test]
+fn task_61_2_image_status_verbose_info_is_empty() {
+    let (_, svc) = seeded();
+    let resp = status(&svc, Some("reg/a:1"), true).expect("status");
+    assert_eq!(resp.image.map(|i| i.size), Some(100));
+    assert!(resp.info.is_empty());
+}
+
+/// CRI-4・TASK-61.2: 未取得は NOT_FOUND にせず、`image: None` の成功応答を返す（api.proto の nil Image）。
+#[test]
+fn task_61_2_image_status_unknown_returns_none() {
+    let (recorder, svc) = seeded();
+    let resp = status(&svc, Some("reg/missing:9"), false).expect("ok");
+    assert_eq!(resp.image, None);
+    assert_eq!(
+        recorder.lines(),
+        vec![("cri.image_status", "success", "OK")]
+    );
+}
+
+/// ERR-3・TASK-61.2: 参照なし・空・長すぎる参照は INVALID_ARGUMENT。
+#[test]
+fn task_61_2_image_status_invalid_reference() {
+    let (_, svc) = seeded();
+    let long = "x".repeat(MAX_FILTER_BYTES + 1);
+    for r in [None, Some(""), Some(long.as_str())] {
+        let err = status(&svc, r, false).expect_err("must fail");
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
 }

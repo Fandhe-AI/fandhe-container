@@ -1,12 +1,15 @@
-//! `ImageService` の CRI 実装の雛形と `ListImages`（TASK-61.1・#444・CRI-4・ERR-3・REPAIR-4）。
+//! `ImageService` の CRI 実装の雛形と `ListImages`・`ImageStatus`（TASK-61.1・61.2・#444・#445・CRI-4・ERR-3・REPAIR-4）。
 //!
 //! `fandhe-container-plugin-cri`（TASK-108）が `ImageServiceServer` で包んで gRPC に載せる実装の本体。
 //! `crictl images` 相当の一覧を、ローカルキャッシュの抽象 [`ImageStore`] から返す。
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! - 実装済みなのは `ListImages` のみ。`ImageStatus`（TASK-61.2）・`PullImage`（TASK-61.3）・
+//! - 実装済みなのは `ListImages`・`ImageStatus` のみ。`PullImage`（TASK-61.3）・
 //!   `RemoveImage`・`StreamImages`・`ImageFsInfo` は `Unimplemented` を返す
+//! - `ImageStatus` の `verbose` 拡張情報（`info`）は未実装で常に空。OCI image config 由来の情報は
+//!   TASK-61.3・TASK-183（OCI-7）で追加する。取り込み時の digest 検証（OCI-1）は PullImage の責務で、
+//!   本 RPC は読み取りのみ
 //! - [`InMemoryImageStore`] はプロセス内メモリのスタブ。永続キャッシュと oci の pull 経路
 //!   （digest 検証つきの取り込み。OCI-1）への接続は TASK-61.3・TASK-183（OCI-7）で置き換える
 //! - エラーの正規化（TASK-97.2）は未適用。リスナー・メッセージ長上限・UDS の権限と peer credential
@@ -171,10 +174,16 @@ impl ImageRecord {
 
 /// ローカルイメージキャッシュの読み取り境界（CRI-4）。
 ///
-/// `ImageStatus`（TASK-61.2）が `get` を足す。契約: 有界時間で戻ること（REPAIR-5）。
+/// 契約: 有界時間で戻ること（REPAIR-5）。
 pub trait ImageStore: Send + Sync {
     /// 全イメージを ID 昇順で返す。
     fn list(&self) -> Result<Vec<ImageRecord>, ImageStoreError>;
+
+    /// 参照（id・タグ・digest の完全一致。`ListImages` の絞り込みと同じ規則）を 1 件に解決する。
+    ///
+    /// 複数一致する場合は id 完全一致を優先し、なければ ID 昇順で最初の 1 件（決定的）。
+    /// 未取得は `Ok(None)`（`ImageStatus` が `image: None` の成功応答に写す。TASK-61.2）。
+    fn get(&self, reference: &str) -> Result<Option<ImageRecord>, ImageStoreError>;
 }
 
 /// プロセス内メモリのスタブ実装（REPAIR-3。永続キャッシュは TASK-61.3・TASK-183 で置換）。
@@ -215,9 +224,17 @@ impl ImageStore for InMemoryImageStore {
         let images = self.images.lock().map_err(|_| ImageStoreError::Poisoned)?;
         Ok(images.values().cloned().collect())
     }
+
+    fn get(&self, reference: &str) -> Result<Option<ImageRecord>, ImageStoreError> {
+        let images = self.images.lock().map_err(|_| ImageStoreError::Poisoned)?;
+        if let Some(exact) = images.get(reference) {
+            return Ok(Some(exact.clone()));
+        }
+        Ok(images.values().find(|r| r.matches(reference)).cloned())
+    }
 }
 
-/// `ImageService` の実装（現状 `ListImages` のみ。TASK-61.1）。
+/// `ImageService` の実装（現状 `ListImages`・`ImageStatus`。TASK-61.1・61.2）。
 pub struct CriImageService {
     store: Arc<dyn ImageStore>,
     recorder: Arc<dyn CriOpRecorder>,
@@ -248,6 +265,29 @@ impl CriImageService {
         recorder: Arc<dyn CriOpRecorder>,
     ) -> Self {
         Self { store, recorder }
+    }
+
+    /// `ImageStatus` の本体。参照検証 → ストア解決 → 未取得は `image: None` の成功応答（CRI-4。api.proto の ImageStatus は未存在で nil Image）。
+    ///
+    /// 文言に参照（イメージ名・タグ・digest）を含めない。`verbose` の `info` は未実装で空（REPAIR-3）。
+    fn status(&self, request: v1::ImageStatusRequest) -> Result<v1::ImageStatusResponse, Status> {
+        let reference = request.image.map(|spec| spec.image).unwrap_or_default();
+        if reference.is_empty() {
+            return Err(Status::invalid_argument(
+                "image reference must not be empty",
+            ));
+        }
+        if reference.len() > MAX_FILTER_BYTES {
+            return Err(Status::invalid_argument("image reference is too long"));
+        }
+        let record = self
+            .store
+            .get(&reference)
+            .map_err(|_| Status::internal("image store failure"))?;
+        Ok(v1::ImageStatusResponse {
+            image: record.map(|r| r.to_proto()),
+            info: Default::default(),
+        })
     }
 
     /// `ListImages` の本体。フィルタ検証 → ストア読み取り → 絞り込み。
@@ -307,13 +347,18 @@ impl ImageService for CriImageService {
         Err(Status::unimplemented("stream_images"))
     }
 
-    // 以降は TASK-61.2（ImageStatus）・TASK-61.3（PullImage）などで順次実装する（REPAIR-3）。
+    /// 参照（id・タグ・digest）に一致する取得済みイメージの詳細を返す。未取得は `image: None` の成功応答（CRI-4・TASK-61.2）。
     async fn image_status(
         &self,
-        _request: Request<v1::ImageStatusRequest>,
+        request: Request<v1::ImageStatusRequest>,
     ) -> Result<Response<v1::ImageStatusResponse>, Status> {
-        Err(Status::unimplemented("image_status"))
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ImageStatus);
+        let result = self.status(request.into_inner());
+        timer.finish_with(&result);
+        result.map(Response::new)
     }
+
+    // 以降は TASK-61.3（PullImage）などで順次実装する（REPAIR-3）。
 
     async fn pull_image(
         &self,
@@ -404,6 +449,9 @@ mod tests {
         fn list(&self) -> Result<Vec<ImageRecord>, ImageStoreError> {
             Err(ImageStoreError::Poisoned)
         }
+        fn get(&self, _reference: &str) -> Result<Option<ImageRecord>, ImageStoreError> {
+            Err(ImageStoreError::Poisoned)
+        }
     }
 
     /// CRI-4・REPAIR-4: ストア失敗は INTERNAL（内部詳細を含まない）で、失敗として記録される。
@@ -438,6 +486,93 @@ mod tests {
         };
         let err = svc.list(req).expect_err("must fail");
         assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    fn status_req(reference: &str) -> v1::ImageStatusRequest {
+        v1::ImageStatusRequest {
+            image: Some(v1::ImageSpec {
+                image: reference.into(),
+                ..Default::default()
+            }),
+            verbose: false,
+        }
+    }
+
+    /// CRI-4・TASK-61.2: id・タグ・digest のいずれの参照でも同じイメージに解決し、id 完全一致を優先する。
+    #[test]
+    fn cri4_get_resolves_id_tag_digest_and_prefers_id() {
+        let store = InMemoryImageStore::new();
+        store
+            .insert(rec("sha256:aa", "reg/a:1", "reg/a@sha256:aa", 100))
+            .unwrap();
+        // 別イメージが "sha256:aa" をタグとして持つ衝突を作り、id 完全一致が優先されることを確かめる。
+        store
+            .insert(rec("sha256:00", "sha256:aa", "reg/z@sha256:00", 5))
+            .unwrap();
+        for r in ["sha256:aa", "aa", "reg/a:1", "reg/a@sha256:aa"] {
+            assert_eq!(
+                store.get(r).unwrap().map(|x| x.id),
+                Some("sha256:aa".to_owned()),
+                "{r}"
+            );
+        }
+        assert_eq!(store.get("reg/none:9").unwrap(), None);
+    }
+
+    /// CRI-4・TASK-61.2: 未取得は成功応答で `image` が None（NOT_FOUND にしない）。
+    #[test]
+    fn cri4_status_missing_returns_none() {
+        let svc = CriImageService::new();
+        let resp = svc.status(status_req("reg/secret:1")).expect("ok");
+        assert_eq!(resp.image, None);
+        assert!(resp.info.is_empty());
+    }
+
+    /// CRI-4・TASK-61.2: 取得済みなら digest・サイズ・タグを返し、info は空。
+    #[test]
+    fn cri4_status_returns_image() {
+        let store = Arc::new(InMemoryImageStore::new());
+        store
+            .insert(rec("sha256:aa", "reg/a:1", "reg/a@sha256:aa", 100))
+            .unwrap();
+        let svc = CriImageService::with_store(store);
+        let mut req = status_req("reg/a:1");
+        req.verbose = true;
+        let resp = svc.status(req).expect("ok");
+        let image = resp.image.expect("image");
+        assert_eq!(image.id, "sha256:aa");
+        assert_eq!(image.size, 100);
+        assert_eq!(image.repo_digests, vec!["reg/a@sha256:aa".to_owned()]);
+        assert!(resp.info.is_empty());
+    }
+
+    /// ERR-3: 空・None・長すぎる参照は INVALID_ARGUMENT。
+    #[test]
+    fn cri4_status_empty_or_oversized_is_invalid_argument() {
+        let svc = CriImageService::new();
+        let none = v1::ImageStatusRequest::default();
+        assert_eq!(
+            svc.status(none).expect_err("e").code(),
+            Code::InvalidArgument
+        );
+        assert_eq!(
+            svc.status(status_req("")).expect_err("e").code(),
+            Code::InvalidArgument
+        );
+        let long = "x".repeat(MAX_FILTER_BYTES + 1);
+        assert_eq!(
+            svc.status(status_req(&long)).expect_err("e").code(),
+            Code::InvalidArgument
+        );
+    }
+
+    /// CRI-4: ストア失敗は INTERNAL（内部詳細を含まない）。
+    #[test]
+    fn cri4_status_store_failure_is_internal() {
+        let svc = CriImageService::with_store(Arc::new(Failing));
+        let err = svc.status(status_req("a")).expect_err("must fail");
+        assert_eq!(err.code(), Code::Internal);
+        assert_eq!(err.message(), "image store failure");
     }
 
     /// CRI-4: `sha256:` 無しの 16 進指定も ID に一致する。

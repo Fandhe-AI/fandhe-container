@@ -1,8 +1,9 @@
 //! レジストリクライアント基盤: 接続先 URL の組み立てと HTTP `Agent` の構築（TASK-51.1・OCI-1）。
 //!
-//! 後続の #401（トークン取得・`WWW-Authenticate` 解析）・#402（manifest 取得）・#403（blob のストリーミング取得）
-//! が共通で使う土台。**本モジュールは通信する公開メソッドを持たない**（取得処理は未実装で、#401〜#403 で
-//! `pub(crate)` の accessor を通して `Agent` を使う。digest 検証は #405。REPAIR-3）。
+//! #402（manifest 取得）・#403（blob のストリーミング取得）が共通で使う土台。通信する公開メソッドは
+//! 匿名トークン取得の `RegistryClient::authenticate_anonymous`（TASK-51.2・#401）のみで、manifest / blob の
+//! 取得は未実装（#402・#403 が `pub(crate)` の accessor を通して `Agent` を使う。digest 検証は #405。REPAIR-3）。
+//! OCI-3（資格情報つき認証）も未実装で、匿名のみ。
 //!
 //! 安全側の既定値:
 //! - 平文 HTTP の経路を持たない（`https_only`。scheme は `https` 固定）
@@ -10,10 +11,12 @@
 //! - リダイレクト先へ `Authorization` を送らない（`RedirectAuthHeaders::Never`）。回数・ヘッダサイズに上限
 //! - DNS 解決・connect・リクエスト送信・応答ヘッダ待ちのタイムアウトは `Duration` 必須で、未設定にできない（REPAIR-5）
 //!
-//! 本文受信（`recv_body`）と全体（`global`）のタイムアウトは既定では無制限のまま。操作ごとの設定（blob の長時間転送を含む）は #401〜#403 で行う。
+//! 本文受信（`recv_body`）と全体（`global`）のタイムアウトは Agent 既定では無制限のまま。トークン取得は
+//! リクエスト単位で全体期限（`token_request_timeout`）と本文上限を設ける。blob の長時間転送の設定は #403。
 //! CA ファイルを指定する経路は範囲外（OS のストアと `SSL_CERT_FILE` / `SSL_CERT_DIR` のみ）。
 
-use crate::error::OciError;
+use crate::auth::{RegistryAuth, parse_token_response, parse_www_authenticate};
+use crate::error::{OciError, OciErrorCode, code_for_http_status};
 use crate::reference::{Digest, Reference, RegistryHost, Repository};
 use crate::tls;
 use std::time::Duration;
@@ -78,6 +81,10 @@ pub struct RegistryClientConfig {
     pub max_redirects: u32,
     /// 応答ヘッダの最大バイト数。
     pub max_response_header_bytes: usize,
+    /// トークン取得（`/v2/` のプローブと トークンエンドポイント）1 リクエストあたりの全体期限（REPAIR-5）。
+    pub token_request_timeout: Duration,
+    /// トークンエンドポイント応答本文の最大バイト数。
+    pub max_token_response_bytes: u64,
 }
 
 impl Default for RegistryClientConfig {
@@ -89,16 +96,19 @@ impl Default for RegistryClientConfig {
             recv_response_timeout: Duration::from_secs(60),
             max_redirects: 5,
             max_response_header_bytes: 64 * 1024,
+            token_request_timeout: Duration::from_secs(30),
+            max_token_response_bytes: 64 * 1024,
         }
     }
 }
 
 /// レジストリ通信の土台となる HTTP クライアント（TLS 設定済みの ureq `Agent` を保持する）。
 ///
-/// 取得処理は未実装で、#401（トークン）・#402（manifest）・#403（blob）が追加する（OCI-1）。
+/// 匿名トークン取得は実装済み（#401）。manifest（#402）・blob（#403）の取得は未実装（OCI-1）。
 #[derive(Debug)]
 pub struct RegistryClient {
     agent: Agent,
+    config: RegistryClientConfig,
 }
 
 impl RegistryClient {
@@ -140,13 +150,104 @@ impl RegistryClient {
             .user_agent(concat!("fandhe-container/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();
-        Ok(Self { agent })
+        Ok(Self {
+            agent,
+            config: config.clone(),
+        })
     }
 
-    /// 後続の取得処理（#401〜#403）が使う `Agent`。
+    /// 後続の取得処理（#402・#403）が使う `Agent`（呼び出し元が入るまで未使用）。
     #[allow(dead_code)]
     pub(crate) fn agent(&self) -> &Agent {
         &self.agent
+    }
+
+    /// 資格情報なしで Distribution API のトークンを取得する（TASK-51.2・OCI-1）。
+    ///
+    /// 認証ヘッダなしで `/v2/` を叩き、200 なら `RegistryAuth::None`、401 の `WWW-Authenticate`（Bearer）
+    /// に従って `realm` へ `service` と `scope=repository:<name>:pull` を付けて GET し、トークンを得る。
+    /// scope は検証済みの `repository` から作り、レジストリ提示の scope は使わない。資格情報・
+    /// `Authorization` は送らない。各リクエストに `token_request_timeout` の全体期限と応答本文の上限がある。
+    /// Basic のみの提示は `Unimplemented`（OCI-3）。トークンのキャッシュ・再取得は未実装。
+    pub fn authenticate_anonymous(
+        &self,
+        endpoint: &RegistryEndpoint,
+        repository: &Repository,
+    ) -> Result<RegistryAuth, OciError> {
+        let timeout = Some(self.config.token_request_timeout);
+        let probe = self
+            .agent
+            .get(endpoint.base_url())
+            .config()
+            .timeout_global(timeout)
+            .build()
+            .call()
+            .map_err(map_ureq_error)?;
+        match probe.status().as_u16() {
+            200 => return Ok(RegistryAuth::None),
+            401 => {}
+            s => return Err(status_error(s)),
+        }
+        let values: Vec<&str> = probe
+            .headers()
+            .get_all("www-authenticate")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        let challenge = parse_www_authenticate(&values, &endpoint.host)?;
+
+        let mut req = self
+            .agent
+            .get(challenge.realm.as_str())
+            .config()
+            .timeout_global(timeout)
+            .build()
+            .query("scope", format!("repository:{}:pull", repository.as_str()));
+        if let Some(service) = &challenge.service {
+            req = req.query("service", service);
+        }
+        let mut resp = req.call().map_err(map_ureq_error)?;
+        let status = resp.status().as_u16();
+        if status != 200 {
+            return Err(status_error(status));
+        }
+        let body = resp
+            .body_mut()
+            .with_config()
+            .limit(self.config.max_token_response_bytes)
+            .read_to_vec()
+            .map_err(map_ureq_error)?;
+        let token = parse_token_response(&body, std::time::Instant::now())?;
+        Ok(RegistryAuth::Bearer(token))
+    }
+}
+
+/// 想定外の HTTP ステータスをエラーにする（message は固定文。応答本文・URL は載せない）。
+fn status_error(status: u16) -> OciError {
+    OciError::new(
+        code_for_http_status(status),
+        "registry returned an error status",
+    )
+    .with_http_status(status)
+}
+
+/// ureq のエラーを `OciError` へ写像する。message は固定文のみ（URL・ヘッダ値を含め得る元メッセージは捨てる）。
+fn map_ureq_error(e: ureq::Error) -> OciError {
+    match e {
+        ureq::Error::Timeout(_) => {
+            OciError::new(OciErrorCode::Timeout, "registry request timed out")
+        }
+        ureq::Error::BodyExceedsLimit(_) => OciError::new(
+            OciErrorCode::ResourceExhausted,
+            "registry response body is too large",
+        ),
+        ureq::Error::Protocol(_)
+        | ureq::Error::LargeResponseHeader(_, _)
+        | ureq::Error::TooManyRedirects
+        | ureq::Error::RedirectFailed => {
+            OciError::new(OciErrorCode::DataLoss, "invalid response from registry")
+        }
+        _ => OciError::new(OciErrorCode::Unavailable, "registry is unreachable"),
     }
 }
 
@@ -175,6 +276,28 @@ mod tests {
             ep.blob_url(r.repository(), &d),
             format!("https://localhost:5000/v2/a/b/blobs/sha256:{hex}")
         );
+    }
+
+    /// OCI-1・REPAIR-5: 設定の既定値（具体値）。
+    #[test]
+    fn config_defaults() {
+        let c = RegistryClientConfig::default();
+        assert_eq!(c.token_request_timeout, Duration::from_secs(30));
+        assert_eq!(c.max_token_response_bytes, 65536);
+    }
+
+    /// OCI-1: ureq エラーの写像は固定文で、分類が具体値どおり。
+    #[test]
+    fn ureq_error_mapping() {
+        let e = map_ureq_error(ureq::Error::Timeout(ureq::Timeout::Global));
+        assert_eq!(e.code(), OciErrorCode::Timeout);
+        let e = map_ureq_error(ureq::Error::BodyExceedsLimit(10));
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+        let e = map_ureq_error(ureq::Error::HostNotFound);
+        assert_eq!(e.code(), OciErrorCode::Unavailable);
+        let e = status_error(429);
+        assert_eq!(e.code(), OciErrorCode::Unavailable);
+        assert_eq!(e.http_status(), Some(429));
     }
 
     fn one_cert() -> CertificateResult {

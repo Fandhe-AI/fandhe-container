@@ -4,11 +4,15 @@
 //! イメージ参照の検証と正規化（`reference`）、接続先 URL の組み立てと TLS 設定済み HTTP `Agent` の構築
 //! （`registry`・`tls`）。
 //!
-//! 未実装（スタブではなく後続 issue の担当）: トークン取得と `WWW-Authenticate` 解析（#401）、manifest の
+//! 実装済み: 匿名トークン取得（TASK-51.2・OCI-1・#401。`auth` と `RegistryClient::authenticate_anonymous`）。
+//! 資格情報つき認証（OCI-3）とトークンのキャッシュ・再取得は未実装。
+//!
+//! 未実装（スタブではなく後続 issue の担当）: manifest の
 //! 取得とパース（#402）、blob のストリーミング取得と上限検証（#403）、digest 検証（#405）、キャッシュ・
-//! `image ls`/`rm`/`tag`（TASK-52〜55・TASK-183〜184）。`RegistryClient` はまだ通信する公開メソッドを持たない。
+//! `image ls`/`rm`/`tag`（TASK-52〜55・TASK-183〜184）。`RegistryClient` の通信は匿名トークン取得のみ。
 //! PLUG-1 区分は core（crate-naming.md）。
 
+pub mod auth;
 pub mod error;
 pub mod reference;
 pub mod registry;

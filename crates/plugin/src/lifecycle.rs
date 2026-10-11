@@ -1868,14 +1868,31 @@ mod tests {
             .spawn()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            if let Some(st) = child.try_wait().unwrap() {
-                assert!(st.success(), "child failed: {st}");
-                break;
+        let failure = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => {
+                    assert!(st.success(), "child failed: {st}");
+                    return;
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => break "child did not exit in time".to_string(),
+                Err(e) => break format!("try_wait failed: {e}"),
             }
-            assert!(Instant::now() < deadline, "child did not exit in time");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        };
+        // `Child` の破棄は子を止めも回収もしないため、失敗を報告する前に SIGKILL を送り、有限の猶予で回収する
+        // （検出対象の子がブロックしたまま残らないように。REPAIR-5・PLUG-7）。
+        let _ = child.kill();
+        let grace = Instant::now() + Duration::from_secs(5);
+        let reaped = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break true,
+                Ok(None) if Instant::now() < grace => std::thread::sleep(Duration::from_millis(10)),
+                _ => break false,
+            }
+        };
+        panic!("{failure} (killed child, reaped: {reaped})");
     }
 
     #[cfg(unix)]

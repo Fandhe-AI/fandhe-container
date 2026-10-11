@@ -468,6 +468,27 @@ else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため test-integration をスキップ"
 endif
 
+# サードパーティのライセンス表記を cargo-about で生成する（TASK-103.1・OSS-5）。`make ci` には
+# 含めない（ローカルゲートの定義を変えない）。cargo-deny と違い自動導入しない（cargo-about の
+# 版を固定した導入と版の承認は #830〔TASK-103.2〕）。未導入なら exit 2 で止まる。
+# OUTPUT=<file> で出力先を指定できる（既定: target/third-party-licenses/）。値は単一引用符化して渡し、検証はスクリプトに任せる。
+.PHONY: third-party-licenses
+third-party-licenses: ## サードパーティのライセンス表記を cargo about で生成する（cargo-about 未導入なら失敗。OUTPUT=<file> 任意）
+ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
+	@export PATH="$$HOME/.cargo/bin:$$PATH"; \
+	if [ -n $(call fio_bench_sq,$(OUTPUT)) ]; then \
+		bash scripts/generate-third-party-licenses.sh --output $(call fio_bench_sq,$(OUTPUT)); \
+	else \
+		bash scripts/generate-third-party-licenses.sh; \
+	fi
+else
+	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため third-party-licenses をスキップ"
+endif
+
+.PHONY: third-party-licenses-selftest
+third-party-licenses-selftest: ## ライセンス表記生成スクリプトの自己テスト（スタブ cargo のみ。TASK-103.1）
+	bash scripts/generate-third-party-licenses-selftest.sh
+
 .PHONY: deny
 deny: ## cargo deny check advisories bans licenses sources（ルート workspace と venus 試験治具の依存監査。cargo-deny 未導入なら自動導入）
 ifneq ($(and $(HAS_CARGO),$(HAS_DENY),$(HAS_MEMBERS)),)

@@ -28,7 +28,7 @@
 //!
 //! UDS サーバーの同時接続数は既定 [`GRPC_MAX_CONNECTIONS_DEFAULT`]（64）で、
 //! [`GrpcServerConfig::with_max_connections`] で変更する。上限到達時の追加接続は拒否され
-//! （構造化ログ `grpc_connection_rejected`）、既存接続が閉じると枠が戻る。
+//! （累計は [`grpc_rejected_connections`] で観測する。ログ出力はしない）、既存接続が閉じると枠が戻る。
 //! 接続あたりの並列・ストリーム数も [`GrpcServerConfig`] で制限される。
 //!
 //! # 期限（REPAIR-5）
@@ -381,6 +381,13 @@ impl OpCounters {
 static STATS_SERVE: OpCounters = OpCounters::new();
 static STATS_CONNECT: OpCounters = OpCounters::new();
 static STATS_CALL: OpCounters = OpCounters::new();
+/// 接続上限（PLUG-12）で拒否した接続の累計（プロセス全体）。
+static STATS_REJECTED: AtomicU64 = AtomicU64::new(0);
+
+/// 接続上限超過で拒否した接続の累計件数を返す（観測用。出力を伴わず panic・ブロックしない。PLUG-12・REPAIR-4/5）。
+pub fn grpc_rejected_connections() -> u64 {
+    STATS_REJECTED.load(Ordering::Relaxed)
+}
 
 /// 1 操作（`serve`・`connect`・`call`）の集計スナップショット（REPAIR-4）。
 ///
@@ -621,7 +628,7 @@ struct KillableIncoming<I, IO, IE> {
     switch: Arc<KillSwitch>,
     /// 同時接続数の上限。存命の [`KillableIo`]（= `switch.live`）がこれに達したら新規接続を拒否する。
     max_connections: usize,
-    /// 上限超過で拒否した累計件数（ログの間引きに使う）。
+    /// 上限超過でこのストリームが拒否した累計件数。
     rejected: u64,
     _marker: PhantomData<fn() -> (IO, IE)>,
 }
@@ -642,13 +649,9 @@ where
                         // 即 close して拒否し、次の accept に進む（枠が空くのを待たない）。
                         drop(io);
                         this.rejected = this.rejected.saturating_add(1);
-                        // 攻撃時のログ洪水を避け、2 のべき乗回目だけ構造化ログを出す。
-                        if this.rejected.is_power_of_two() {
-                            eprintln!(
-                                "{{\"event\":\"grpc_connection_rejected\",\"code\":\"resource_exhausted\",\"message\":\"max connections reached\",\"max_connections\":{},\"rejected_total\":{}}}",
-                                this.max_connections, this.rejected
-                            );
-                        }
+                        // 出力先（stderr 等）の失敗・ブロックが accept ループを止めないよう、
+                        // 有界メモリのアトミック計数だけを更新する（panic・ブロックなし。REPAIR-5）。
+                        STATS_REJECTED.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
                     return Poll::Ready(Some(Ok(KillableIo::new(io, Arc::clone(&this.switch)))));
@@ -1206,6 +1209,7 @@ mod tests {
         assert_eq!(accepted.len(), 2);
         assert_eq!(switch.live(), 2);
         assert_eq!(inc.rejected, 1);
+        assert!(grpc_rejected_connections() >= 1);
         accepted.pop();
         assert_eq!(switch.live(), 1);
         q.lock().unwrap().push_back(tokio::io::duplex(64).0);

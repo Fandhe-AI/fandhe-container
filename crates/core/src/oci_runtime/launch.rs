@@ -149,6 +149,8 @@ pub struct RootfsDir {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootfsPinError {
     error: TraitError,
+    /// 違反の理由型 `exec::ViolationReason` は Linux 限定のため、フィールドも Linux のみ（CLI-1）。
+    #[cfg(target_os = "linux")]
     violation: Option<crate::exec::ViolationReason>,
 }
 
@@ -156,6 +158,7 @@ impl RootfsPinError {
     fn without_violation(error: TraitError) -> Self {
         Self {
             error,
+            #[cfg(target_os = "linux")]
             violation: None,
         }
     }
@@ -166,6 +169,8 @@ impl RootfsPinError {
     }
 
     /// 記録すべき分離違反の理由（`path_symlink_or_not_directory` / `path_missing`）。違反を伴わない失敗は `None`。
+    /// 理由型が Linux 限定のため Linux のみ（非 Linux は rootfs を固定できず違反も起きない。CLI-1）。
+    #[cfg(target_os = "linux")]
     pub fn violation(&self) -> Option<crate::exec::ViolationReason> {
         self.violation
     }
@@ -272,7 +277,7 @@ pub fn pin_bundle_rootfs(bundle: &Path, config: &OciConfig) -> Result<RootfsDir,
 /// [`pin_bundle_rootfs`] と同じ固定を行い、失敗時に分離違反の理由も運ぶ（SEC-4・SEC-1・SUP-6・#1702）。
 ///
 /// supervisor の exec の経路（`load_exec_bundle`）が使う。検証後の差し替えによる拒否のとき
-/// [`RootfsPinError::violation`] が `Some` になり、呼び出し側が監査ログへ記録する。検証前の失敗
+/// `RootfsPinError::violation`（Linux のみ） が `Some` になり、呼び出し側が監査ログへ記録する。検証前の失敗
 /// （`check_rootfs`）は違反を伴わない。
 pub fn pin_bundle_rootfs_audited(
     bundle: &Path,

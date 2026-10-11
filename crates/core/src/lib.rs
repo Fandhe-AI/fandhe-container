@@ -104,6 +104,7 @@ pub mod exec;
 pub mod injected_files;
 #[cfg(target_os = "linux")]
 pub mod landlock;
+pub mod launch_isolation;
 pub mod legacy_tiocsti;
 pub mod observability;
 pub mod oci_runtime;

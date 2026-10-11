@@ -16,8 +16,8 @@
 //!   何の namespace にも参加しない
 //!
 //! # joiner が状態ストアを直接開かない理由
-//! joiner は pid1 の user namespace へ `nsenter` で先に入る（user namespace への参加は未実装。`exec_setns_join`
-//! と同じ構成）。その中からは `FileStateStore::open` が通らない（祖先ディレクトリの所有者がホストの root として
+//! joiner は pid1 の user namespace へ `nsenter` で先に入る（rootful 相当の同じ user namespace では参加しない
+//! 構成。rootless の user namespace 参加は `exec_setns_join` が照合する。#1462）。その中からは `FileStateStore::open` が通らない（祖先ディレクトリの所有者がホストの root として
 //! 見えず、overflow uid になるため、祖先検証が fail-closed で拒否する）。そのため、ストアの読み書きは orchestrator
 //! （初期 user namespace）が行い、読み戻した配置（scope・instance）と pid を引数で joiner へ渡し、joiner が
 //! `StateRecord` を再構成して `identify_pid1` へ渡す（`tests/exec.rs` の `make_record` と同じ方式）。
@@ -482,6 +482,38 @@ mod linux {
             })
     }
 
+    /// launch 時の分離の記録（rootfs だけのルール。識別子は具体値。TASK-163 追補・#1468）。
+    fn launch_isolation() -> fandhe_container_core::launch_isolation::LaunchIsolationRecord {
+        use fandhe_container_core::launch_isolation::{
+            LaunchIsolationRecord, RecordedLandlock, RecordedRule, RecordedTarget, RootIdentity,
+        };
+        LaunchIsolationRecord::from_parts(
+            RootIdentity::new(44, 1234),
+            RecordedLandlock::new(0xFFFF, vec![RecordedRule::new(RecordedTarget::Root, 0x7)])
+                .expect("recorded landlock"),
+        )
+    }
+
+    /// 全 16 種の launch 記録（`Nofile` は (700, 1500)、他は種別の添字から決める具体値。TASK-169 追補・#1467）。
+    fn full_rlimits() -> fandhe_container_core::rlimits::Rlimits {
+        use fandhe_container_core::rlimits::{Rlimit, RlimitKind, Rlimits};
+        Rlimits::new(
+            RlimitKind::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(i, k)| {
+                    let (soft, hard) = if k == RlimitKind::Nofile {
+                        (700, 1500)
+                    } else {
+                        (i as u64, 100 + i as u64)
+                    };
+                    Rlimit::new(k, soft, hard).expect("rlimit")
+                })
+                .collect(),
+        )
+        .expect("rlimits")
+    }
+
     /// joiner の引数（`<flag> <pid1> <scope> <instance> ...`）から Running の記録を再構成する。
     fn record_from_args(args: &[String]) -> (u32, StateRecord) {
         let pid: u32 = args
@@ -506,7 +538,9 @@ mod linux {
         .with_cgroup(CgroupPlacement::new(
             scope,
             StateRevision::from_raw(instance),
-        ));
+        ))
+        .with_rlimits(full_rlimits())
+        .with_launch_isolation(launch_isolation());
         (pid, record)
     }
 

@@ -125,12 +125,12 @@ mod violation;
 #[cfg(test)]
 mod violation_scan;
 
+pub use capabilities::{CapabilityReport, SupplementaryGroups};
 /// 結合試験 `tests/exec_child_setup.rs`・supervisor の `tests/exec_setns_join.rs` 専用の再公開
 /// （SUP-6・TASK-163 追補・#1457。通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(all(feature = "exec-test-support", not(test)))]
 #[doc(hidden)]
-pub use capabilities::clear_supplementary_groups_for_test;
-pub use capabilities::{CapabilityReport, SupplementaryGroups};
+pub use capabilities::{apply_join_credentials_for_test, clear_supplementary_groups_for_test};
 pub use cgroup_join::{
     ExecCgroupJoin, ExecCgroupJoinReport, ExecCgroupName, ExecCgroupRemoval, ExecCgroupSweep,
     ExecChildCgroup, join_cgroup, prepare_cgroup_join, remove_exec_child_cgroup,
@@ -157,6 +157,7 @@ pub use diagnostic::{
 pub use entrypoint_mode::{EntrypointExecMode, IntegrityLsm, PathBoundLsm, SealedCopyUnavailable};
 pub use exec_command::{ExecChild, ExecWorkerProof, spawn_exec_command, spawn_exec_worker};
 pub use inject::{InjectReport, InjectedDirectoryOutcome, InjectedFileOutcome, inject_files};
+pub use landlock::launch_isolation_from_bundle;
 /// 結合試験 `tests/landlock.rs` 専用の再公開（CORE-5・TASK-39.5・#185。通常の利用者は呼ばない。詳細は定義側）。
 #[doc(hidden)]
 pub use landlock::{
@@ -206,6 +207,10 @@ pub use process::{StandardFd, close_standard_fds_for_test};
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
 pub use reapply::reject_own_root_for_test;
+/// 結合試験 `tests/exec_setns_join.rs` 専用の再公開（SEC-1・#1468。通常の利用者は呼ばない。詳細は定義側）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use reapply::verify_joined_root_for_test;
 pub use reapply::{
     ExecReady, ExecRestrictionReport, ExecRestrictions, UnappliedExecRestriction,
     prepare_exec_restrictions, reapply_restrictions,
@@ -215,6 +220,7 @@ pub use reapply::{
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
 pub use reapply::{ExecReapplyObservation, observe_exec_restriction_reapply};
+pub use rlimits::launch_rlimits_from_self;
 pub use rootfs::{PivotReport, PreparedRootfs, pivot_root, prepare_rootfs};
 pub use sealed_copy::MAX_SEALED_COPY_BYTES;
 pub use seccomp::SeccompReport;

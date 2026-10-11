@@ -180,6 +180,35 @@ impl Rlimits {
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
+
+    /// 全 16 種をちょうど 1 回ずつ持つか（launch 時の記録の完全性。TASK-169 追補・#1467）。
+    ///
+    /// 種別の重複は構築時に禁止されているため、件数が [`Rlimits::MAX_LEN`] に一致することと同値。
+    pub fn is_complete(&self) -> bool {
+        self.items.len() == Self::MAX_LEN
+    }
+
+    /// 指定のある種別は指定値、無い種別は `inherited` が返す値で埋めた全 16 種の集合を返す（#1467）。
+    ///
+    /// launch 時の記録（`state.json`）を作る純関数。`inherited` は呼び出しプロセスが launch の子へ
+    /// 継承させる実効値の読み取り（Linux では `prlimit(2)`）で、syscall はここでは持たない。並びは
+    /// 指定済みの要素を指定順に、続けて指定の無い種別を [`RlimitKind::ALL`] の順に並べる。
+    /// `soft <= hard` の検証は [`Rlimit::new`] を通す。読み取りの失敗はそのまま伝える。
+    pub fn complete_with<E>(
+        &self,
+        mut inherited: impl FnMut(RlimitKind) -> Result<(u64, u64), E>,
+        invalid_value: impl Fn(TraitError) -> E,
+    ) -> Result<Rlimits, E> {
+        let mut items = self.items.clone();
+        for kind in RlimitKind::ALL {
+            if items.iter().any(|r| r.kind == kind) {
+                continue;
+            }
+            let (soft, hard) = inherited(kind)?;
+            items.push(Rlimit::new(kind, soft, hard).map_err(&invalid_value)?);
+        }
+        Rlimits::new(items).map_err(invalid_value)
+    }
 }
 
 fn invalid(msg: &'static str) -> TraitError {
@@ -221,6 +250,37 @@ mod tests {
         assert_eq!((r.soft(), r.hard()), (u64::MAX, u64::MAX));
         assert_eq!(r.kind(), RlimitKind::Core);
         assert!(Rlimit::new(RlimitKind::Core, RLIMIT_INFINITY, 1).is_err());
+    }
+
+    /// TASK-169 追補・#1467: 補完は指定値を保ち、無い種別を継承値で埋めて 16 種にする。
+    #[test]
+    fn sup12_complete_with_fills_unspecified_kinds() {
+        let spec = Rlimits::new(vec![Rlimit::new(RlimitKind::Nofile, 700, 1500).unwrap()]).unwrap();
+        assert!(!spec.is_complete());
+        let full = spec
+            .complete_with::<TraitError>(|k| Ok((k as u64, 100 + k as u64)), |e| e)
+            .unwrap();
+        assert!(full.is_complete());
+        assert_eq!(full.len(), 16);
+        let get = |k: RlimitKind| {
+            let r = full.iter().find(|r| r.kind() == k).unwrap();
+            (r.soft(), r.hard())
+        };
+        assert_eq!(get(RlimitKind::Nofile), (700, 1500));
+        assert_eq!(get(RlimitKind::Cpu), (0, 100));
+        assert_eq!(get(RlimitKind::Core), (4, 104));
+        // 読み取りの失敗は伝わり、soft > hard の継承値は拒否される。
+        let e = spec
+            .complete_with::<TraitError>(
+                |_| Err(TraitError::new(ErrorCode::Internal, "read")),
+                |e| e,
+            )
+            .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Internal);
+        let e = spec
+            .complete_with::<TraitError>(|_| Ok((9, 1)), |e| e)
+            .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
     }
 
     /// SUP-12・TASK-169.1: 重複種別は拒否、空集合と全種別は受理。

@@ -82,3 +82,22 @@ protox = "=0.9.1"
 tonic = { version = "=0.14.6", default-features = false, features = ["codegen", "transport", "router"] }
 tonic-prost = "=0.14.6"
 prost = "=0.14.4"
+
+# 依存クレート（workspace メンバー以外）のデバッグ情報を行番号のみにする。
+# ローカルの `target/` は依存グラフ全体（tonic / prost・protox・objc2 系等）の full debuginfo が
+# 容量とリンク時間を押し上げる。開発時に依存の内部変数・型をデバッガで追う必要は薄いため、
+# それを諦めて両方を減らす。
+# - 残るもの: panic 位置・バックトレースの file:line・プロファイラの行番号
+# - 失うもの: デバッガ（lldb / gdb）で依存クレートの変数・型を見る機能のみ
+# - `"*"` はメンバー以外にだけ効くため、本リポの crate は full debuginfo のまま
+# - 依存のビルドスクリプト・proc-macro（`build-override` 側の既定は debuginfo なし）にも
+#   適用され行番号付きになる（`build-override` より `package."*"` が優先されるため
+#   打ち消せない）。増分は依存本体の削減に比べて小さい
+# - `test` プロファイルは `dev` を継承し package 指定も継承されるため `cargo test` にも効く。
+#   `release`・`bench`（`release` 継承）は既定どおり debuginfo なしで影響しない
+# - 別 workspace の `poc/venus-decoder/jig` には効かない（profile は各 workspace のルートでのみ有効）
+# CI の `rust-ci`（reusable `rust-base-ci`）の target キャッシュの key は Cargo.toml を含まないため、
+# 本設定を変えたときは main の `fandhe-container-Linux-{clippy,test}-v4-*` を削除して保存し直させる
+# （.claude/rules/github-actions.md「キャッシュ方針」）。
+[profile.dev.package."*"]
+debug = "line-tables-only"

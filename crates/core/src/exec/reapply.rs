@@ -16,7 +16,7 @@
 //!   [`prepare_exec_restrictions`] は **`join_namespaces` の前**、[`reapply_restrictions`] は
 //!   `join_namespaces` と `join_cgroup` の **後** に呼ぶ。seccomp の既定フィルタは `setns` を拒否するため、
 //!   再適用を `setns` の前に置くと namespace 参加が失敗する（cgroup join を seccomp の前に置く既存の順序と一致）。
-//!   [`reapply_restrictions`] の内部は「準備したプロセスの確認 → 参加後の mount namespace・子が入る PID namespace・所属 cgroup が準備時の対象のもの
+//!   [`reapply_restrictions`] の内部は「準備したプロセスの確認 → 参加後の user namespace・mount namespace・子が入る PID namespace・所属 cgroup が準備時の対象のもの
 //!   であることの照合 → 参加後の `/` の照合 → 適用」の順で、確認・照合で拒否したときは何も適用していない
 //! - 全体の順序（exec 専用プロセス内。supervisor の `run_command` が固定する）: `identify_pid1` →
 //!   `prepare_cgroup_join` → [`prepare_exec_restrictions`] → `join_namespaces` → `join_cgroup` →
@@ -30,29 +30,26 @@
 //!   後だと `prlimit64` を許す必要が生じるため前に置く）。最初の失敗で打ち切り、後続は呼ばない。エラーの
 //!   `stage` は `Rlimits` / `CapabilityDrop` / `NoNewPrivs` / `Landlock` / `Seccomp`
 //!   （適用前の拒否は、準備したプロセスの不一致が `Validate`、参加後の namespace・`/` の不一致が `SetNs`）
-//! - **rlimit は対象（pid1）の実効値を写す**: コンテナの rlimit（`--ulimit`）は `state.json` に記録されないため、
-//!   [`prepare_exec_restrictions`] が `setns` の前に対象の `limits`（procfs）を上限つきで読み、全 16 種の
-//!   (soft, hard) を exec プロセスへ適用して読み戻す（黙ってクランプしない。`apply_rlimits`）。解釈できない
-//!   内容は空集合へ落とさず拒否する（緩い制限のまま exec しない）。得られた集合が空の場合も、適用を省かず
-//!   `FailedPrecondition`（段 `Rlimits`）で拒否する（準備・再適用の両方で確かめる。TASK-163 追補・#1460。
-//!   適用を省いても未適用の一覧へ載らない経路を塞ぐ）。rootless で hard の引き上げが必要な
-//!   場合は `EPERM` で拒否する（launch と同じ fail-closed）。他プロセスへの `prlimit` 経路は作らない
-//! - **rlimit を写す方式の限界（launch の指定値そのものではない）**: 写すのは pid1 の **現在の** 値で、pid1 は
-//!   自分の rlimit を変えられる。OCI 既定の capability に `CAP_SYS_RESOURCE` は無く、hard の引き上げは初期 user
-//!   namespace の `CAP_SYS_RESOURCE` を要するため、コンテナ側にできるのは「hard を下げる（戻せない）」と
-//!   「soft を hard 以下の範囲で上げ下げする」だけである。したがって exec の **hard は launch の hard を
-//!   超えない** が、**soft は launch が指定した soft より高い値（launch の hard 以下）になり得る**。soft は
-//!   コンテナ内のどのプロセスも自分で hard まで上げられる値で、権限の境界は hard なので、exec がコンテナ内
-//!   プロセスより緩い上限を得ることはない。逆に pid1 が値を下げていれば exec はその厳しい値で動く（極端に
-//!   下げれば Landlock のパス解決や fork が失敗し、exec は拒否される。コンテナ側が自分の exec を失敗させ
-//!   られるだけで、緩くはならない）。launch の指定値どおりに戻すには `--ulimit` の記録が要る（下記「未実装」）
+//! - **rlimit は launch 時の記録を適用する**（SUP-12・SUP-6・TASK-169 追補・#1467）: コンテナの rlimit
+//!   （`--ulimit`）は launch 時に全 16 種（指定のある種別は指定値、無い種別は launch 時点の実効値）を
+//!   `state.json` へ記録する（`StateRecord::rlimits`。トレイト契約 11）。supervisor の特定が記録から取り出した
+//!   集合を [`prepare_exec_restrictions`] へ渡し、全 16 種の (soft, hard) を exec プロセスへ適用して読み戻す
+//!   （launch の `StagePipeline::with_rlimits` と同じ `apply_rlimits`。黙ってクランプしない）。記録が無い・全 16 種
+//!   そろっていない場合は、適用を省かず `FailedPrecondition`（段 `Rlimits`）で拒否する（準備・再適用の両方で
+//!   確かめる。#1460。適用を省いても未適用の一覧へ載らない経路を塞ぐ）。pid1 の現在値への縮退はしない。
+//!   他プロセスへの `prlimit` 経路は作らない
+//! - **記録の値は pid1 の後からの変更に影響されない**: pid1 が soft を上げ下げしても、exec は記録の値で動く
+//!   （再現性があり、コンテナ側から exec の値を操作できない）。記録の hard が exec を起動したプロセスの hard を
+//!   超える場合は `EPERM` で拒否する（rlimit は対象の user namespace へ参加した後に適用するため、hard の引き上げには
+//!   初期 user namespace の `CAP_SYS_RESOURCE` が要る。rootless では fail-closed になる）
 //! - **capability は OCI 既定集合へ削減する**（SEC-1）: launch と同じ関数・同じ集合
 //!   （`CapabilitySet::oci_default` 固定）で、bounding set を許可集合まで落とし、ambient を空にし、
 //!   effective = permitted = 許可集合 ∩ 現在の permitted、inheritable = 空にして読み戻す。launch 経路も
 //!   `config.json` の `process.capabilities` を解釈せず同じ固定集合を使うため、exec が launch より広い
 //!   集合を与えることはない（設定による絞り込みは launch・exec とも未実装）。pid1 が起動後に自分の
 //!   capability をさらに落としていても、exec は launch がコンテナへ与えた集合（OCI 既定）で動く。uid / gid・
-//!   securebits は launch・exec とも変更しない（呼び出しプロセスの値を引き継ぐ）。spec（SUP-6）が
+//!   securebits は launch・exec とも変更しない（呼び出しプロセスの値を引き継ぐ）。ただし user namespace へ参加した
+//!   場合（下記）は、補助グループの消去の後・bounding set の削減の前に、gid → uid の順で `process.user` の値へ揃える。spec（SUP-6）が
 //!   exec での capability 削減に言及しない点は確認事項で、「launch より弱くしない」側に倒している
 //! - **補助グループは launch・exec とも空にする**（SEC-1・SEC-5・TASK-163 追補・#1457）: capability 削減の関数が
 //!   先頭で `setgroups(0)` を呼び、読み戻して確かめる（`exec/capabilities.rs` の `SupplementaryGroups`）。launch の
@@ -65,13 +62,27 @@
 //!   namespace が `setgroups` を `deny` にしている場合（rootless。`setns` の前に開いた自分の procfs の `setgroups` で
 //!   確認する。`EPERM` という errno だけでは判断しない）は消去できないため現状のまま残し、結果
 //!   （[`ExecRestrictionReport::supplementary_groups`]）へ記録する。それ以外の理由で消去できなければ拒否する
-//! - **user namespace は対象と同じであること**: capability は user namespace に対する相対的な権限なので、
-//!   同じ集合でも exec プロセスが対象より外側の user namespace にいれば launch より強い。`Pid1Target::open` と
-//!   `join_namespaces` が、対象と呼び出し側の user namespace の一致を要求する（`exec/setns.rs`。不一致は違反
-//!   `exec_target_in_other_user_namespace`）
-//! - **制限を exec の対象へ束縛する**: [`prepare_exec_restrictions`] が対象の mount namespace の識別子（nsfs の
-//!   `st_dev`・`st_ino`）と自プロセスの procfs ディレクトリの fd（`setns` 後は `/proc/self` を解決できないため）を
-//!   保持し、[`reapply_restrictions`] が参加後の自プロセスの識別子と照合する。不一致は違反記録
+//! - **user namespace は対象のものへ参加する（SUP-6・SEC-5・TASK-163.h2・#1462）**: capability は user namespace に
+//!   対する相対的な権限なので、同じ集合でも exec プロセスが対象より外側の user namespace にいれば launch より
+//!   強い。対象が呼び出し側と別の user namespace にいる（既定の rootless）ときは、`join_namespaces` が他の
+//!   namespace より先に user namespace へ参加する（`exec/setns.rs`）。参加で参加先の全 capability を得るため、
+//!   参加後の処理は launch と同じ関数・同じ順序「補助グループ → gid・uid → capability 削減（bounding set・ambient・
+//!   permitted/effective/inheritable）→ `NO_NEW_PRIVS` → Landlock → seccomp」で省かない（SEC-5）。gid・uid は
+//!   `process.user`（`config.json`。launch と同じく root だけを許し、それ以外は `Unimplemented`）の値へ
+//!   `setresgid` → `setresuid` で揃えて読み戻す。非特権ユーザーが自分で作ったコンテナへの exec では名前空間内の
+//!   値が変わらないが、ホストの root から rootless のコンテナへ入ると名前空間内では写像されていない uid のまま
+//!   全 capability を持つため、コンテナの所有者の uid・gid へ揃えることが権限境界になる。同じ user namespace
+//!   （rootful 相当）では参加せず、uid / gid は呼び出しプロセスの値を引き継ぐ
+//! - **参加前の補助グループの消去の順序（#1457・#1462）**: 参加の前、初期 user namespace で `CAP_SETGID` を持つ間に消去
+//!   する（root・`sudo` 経由の起動者のグループをコンテナへ持ち込まない）。補助グループを持つ非特権ユーザーは
+//!   `CAP_SETGID` を持たず `EPERM` かつ `setgroups` が `allow` になるが、別の user namespace へ入り、呼び出し側の
+//!   実効 uid が対象の実効 uid と一致する（= コンテナの所有者自身の exec）場合に限り、消去を参加の **後** に回す
+//!   （参加先の全 capability で消去し、`deny` なら現状維持として記録する）。それ以外は従来どおり拒否する
+//!   （コンテナの所有者と別の uid の補助グループを持ち込まない。fail-closed）
+//! - **制限を exec の対象へ束縛する**: [`prepare_exec_restrictions`] が対象の user namespace・mount namespace の
+//!   識別子（nsfs の `st_dev`・`st_ino`）と自プロセスの procfs ディレクトリの fd（`setns` 後は `/proc/self` を
+//!   解決できないため）を保持し、[`reapply_restrictions`] が参加後の自プロセスの識別子と照合する（user namespace を
+//!   先に照合する。rootful で参加しない場合も「呼び出し側 = 対象」の一致を確かめる）。不一致は違反記録
 //!   `exec_joined_namespace_mismatch`（何も適用しない）。同じ rootfs を共有する別コンテナへ参加した場合は `/` の
 //!   照合だけでは検出できないため、`/` の照合より先に行う。[`ExecReady`] の作成後に対象が変わらないのは、
 //!   seccomp が `setns`・`unshare` を拒否するため
@@ -84,32 +95,43 @@
 //!   部分的に載った不定状態のため、呼び出し側は続行せず終了する（巻き戻し不可。`join_cgroup` と同じ）
 //! - **fail-closed**: Landlock 未対応カーネル・ルール生成失敗は準備段階で `stage = Landlock` として拒否し、
 //!   Landlock 無しで続行する経路を作らない（CORE-5）。値を消費するため二重適用・fd の残留を型で防ぐ
-//! - **参加後の `/` をコンテナの rootfs と照合してから適用する（SEC-1）**: `setns(CLONE_NEWNS)` は呼び出し
+//! - **参加後の `/` を launch 時に記録したコンテナの `/` と照合してから適用する（SEC-1・#1468）**: `setns(CLONE_NEWNS)` は呼び出し
 //!   プロセスの root と cwd を **参加先 mount namespace のルート**（`mnt_ns->root` に積まれた最上位のマウント）へ
 //!   付け替える（カーネルの `fs/namespace.c` `mntns_install` が `set_fs_root` / `set_fs_pwd` を呼ぶ。pidfd で複数
 //!   namespace を一括指定した場合も `kernel/nsproxy.c` の `commit_nsset` が同じ root / cwd を反映する。`setns(2)` の
 //!   man page には記載が無いカーネルの挙動）。したがって参加後の `/` はホストの `/` ではないが、それが
 //!   「コンテナの rootfs」であることは launcher が `pivot_root` 済み（`exec/rootfs.rs`）で、以後 `/` へ別の
-//!   マウントが重ねられていないという前提に依存する。この前提を仮定で済ませず、[`prepare_exec_restrictions`] が
-//!   `setns` の前に固定した rootfs（start と同じ検査・固定を通した `RootfsDir`。ホスト側の記録が起点で、
-//!   コンテナからは変えられない）と、[`reapply_restrictions`] が参加後に開いた `/` が **同じディレクトリ
-//!   （`st_dev`・`st_ino` の一致）** であることを、何も適用する前に確かめる。不一致は違反記録
-//!   `exec_root_not_container_rootfs` つきの `FailedPrecondition` で拒否する（pivot していない対象・`/` へ
-//!   マウントを重ねた対象では、ルールが別の木に付くうえコマンドも rootfs の外で動くため）。固定した fd は
-//!   適用が終わるまで保持する（inode 番号の再利用で一致が偽にならないようにする）
+//!   マウントが重ねられていないという前提に依存する。この前提を仮定で済ませず、launch 時に `state.json` へ記録した
+//!   pivot 後の `/` の識別子（`LaunchIsolationRecord::root`。[`prepare_exec_restrictions`] が受け取る）と、
+//!   [`reapply_restrictions`] が参加後に開いた `/` が **同じディレクトリ（`st_dev`・`st_ino` の一致）** であることを、
+//!   何も適用する前に確かめる。不一致は違反記録 `exec_root_not_container_rootfs` つきの `FailedPrecondition` で
+//!   拒否する（pivot していない対象・`/` へマウントを重ねた対象・restart で記録し直していない対象では、ルールが
+//!   別の木に付くうえコマンドも rootfs の外で動くため）。基準はホスト側の bundle ディレクトリではなく記録した
+//!   pivot 後の `/` なので、rootfs を mount namespace の中で組み立てる構成（overlay 等）でも照合が成り立つ
+//!   （bundle の rootfs はホスト側の固定と監査と「自分の `/` でないこと」の検査にだけ使う）。記録は fd を持たず
+//!   inode 番号の再利用を型では防げないが、照合は mount namespace の束縛の後に行い、生きている pid1 の mount
+//!   namespace が `/` のマウントを固定していること・`CAP_SYS_ADMIN` を持たないコンテナは `/` を付け替えられない
+//!   （SEC-1）こと・seccomp が `setns`・`unshare` を拒否することで、束縛後の `/` が別物にすり替わらない。
+//!   記録した `/` が自プロセスの `/`（ホスト）と一致する場合も、準備が違反 `rootfs_is_host_root` で拒否する
 //! - **照合の基準に pid1 の root（`/proc/<pid>/root`）を使わない**: pid1 の root はコンテナ側が変えられる
-//!   （OCI 既定の capability には `CAP_SYS_CHROOT` が含まれ、pid1 は自分を `chroot` できる）。基準はホスト側で
-//!   固定した rootfs にする。pid1 が自分を `chroot` していても、exec は mount namespace のルート = rootfs へ入る
+//!   （OCI 既定の capability には `CAP_SYS_CHROOT` が含まれ、pid1 は自分を `chroot` できる）。基準は launch 時に
+//!   記録した `/` の識別子にする。pid1 が自分を `chroot` していても、exec は mount namespace のルート = rootfs へ入る
 //! - **ルールパスは照合済みの `/` の fd を起点に、`setns` の後に解決する**: 準備段階の ruleset が持つのは
-//!   config の mount destination（コンテナ内パス。`RulePath`。`..` を含まない正規化済み）の文字列だけで、
+//!   記録した mount destination（コンテナ内パス。`RulePath`。`..` を含まない正規化済み）の文字列だけで、
 //!   準備ではルールのパスを開かない（`setns` 前に開くとホスト側の木を指すため）。`landlock_add_rule` 用の
 //!   `O_PATH` fd は [`reapply_restrictions`] の中で、照合に使ったのと同じ `/` の fd から 1 要素ずつ
 //!   `O_NOFOLLOW` で開く。symlink はまたがず、解決できないパスは拒否し、ルールを黙って落とさない。launch 経路
 //!   （`StagePipeline::with_landlock`。pivot 後の `/` 起点）と同じ関数・同じ規則で辿る
-//! - ルールは launcher が実際にマウントした結果ではなく `config.json` から再導出する（launch 時の ruleset は
-//!   保存されていない）。Landlock の適用は存在しない・開けないルールパスを拒否するため、config の mount
-//!   destination が稼働中の rootfs に無ければ [`reapply_restrictions`] は失敗し exec は拒否される
-//!   （fail-closed として正しい挙動）。bundle は supervisor と同じ信頼境界（コンテナから書けない）にある前提
+//! - **ルールは launch 時に記録した ruleset をそのまま使う**（#1468）: handled access もパスごとの許可も
+//!   `LaunchIsolationRecord`（`state.json`。トレイト契約 12）から組み直し、`config.json` から導き直さない
+//!   （launch の後に bundle の config が変わっても、launch と同じ対象に同じ権限が付く）。ABI は launch と同じ
+//!   fail-closed（6 未満は拒否）で検出するだけで、handled は今のカーネルの ABI から計算し直さない（launch の
+//!   handled に無かった権利が無制限になるため）。記録の handled が今のカーネルの扱える範囲を超える場合は縮退せず
+//!   拒否する。Landlock の適用は存在しない・開けないルールパスを拒否するため、記録した mount destination が
+//!   稼働中の rootfs に無ければ [`reapply_restrictions`] は失敗し exec は拒否される（fail-closed として正しい挙動）。
+//!   記録が無い場合の拒否は supervisor の `identify_pid1` が行う。ルールの対象ごとの `(st_dev, st_ino)` は記録しない
+//!   （未実装）。「同じ対象」は、照合済みの `/` の fd を起点に `O_NOFOLLOW` で 1 要素ずつ辿ることと、対象が
+//!   すべてマウントポイントであること（`CAP_SYS_ADMIN` が無いと動かせない）で担保する
 //! - **完了は型で表す**: 成功結果 [`ExecRestrictionReport`] のフィールドは非公開で、未適用の制限は
 //!   [`ExecRestrictionReport::unapplied`] で読むだけ（crate の外から書き換え・構築できない）。TASK-163.4 で
 //!   rlimit と capability 削減を実装したため通常の一覧は空で、「launch 経路と同じ制限がすべて載った」ことの
@@ -130,7 +152,8 @@
 //!    読み取り・pivot していない対象の拒否・別コンテナへの参加の拒否を具体値で照合する。このうち
 //!    「launcher と同じ手順で `pivot_root` した対象へ参加した後の `/` が、固定した rootfs と同じディレクトリに
 //!    なる」ことだけは、非特権の user namespace で動く `tests/exec_setns_join.rs`（CI で実行）が本番の
-//!    `join_namespaces` を通して具体値で照合する。ルールパスの解決の起点が照合済みの fd であること（プロセスの `/` を引き直して
+//!    `join_namespaces` を通して具体値で照合する（rootfs を mount namespace の中で組み立てた場合の、記録した
+//!    `/` との一致とホスト側ディレクトリとの不一致も同じ試験が照合する。#1468）。ルールパスの解決の起点が照合済みの fd であること（プロセスの `/` を引き直して
 //!    いないこと）は、`open_verified_root` が返した fd を Landlock の適用と cwd の設定の両方へ渡す実装で担保し、
 //!    プロセスの `/` と起点が食い違う状況を作る専用の試験は未実装（下記）
 //! 5. **全体のタイムアウトと fd の後始末**: supervisor の `run_command` が準備から実行までを worker プロセスへ
@@ -143,34 +166,42 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - user namespace への参加（rootless の exec に必須。現状は対象が別の user namespace にいれば参加の前に
-//!   拒否する。fail-closed）
+//! - `process.user` が root 以外の場合のユーザー切り替え（launch・exec とも未実装。exec は別の user namespace へ
+//!   参加するとき、launch と同じく root 以外を `Unimplemented` で拒否する）
 //! - ルールパスの解決の起点とプロセスの `/` が食い違う状況での照合専用の試験（上記 4）
 //! - 本番 launcher（`oci_runtime` の `ProcessLauncher` 実装）は未結線で、launch 経路の Landlock も本番では
-//!   まだ適用されない（`exec/landlock.rs`）。exec と launch の一致は「同じ `config.json` から同じ関数で導いた
-//!   ルールを、同じ rootfs のディレクトリを起点に同じ規則で辿る」ことで担保する
+//!   まだ適用されない（`exec/landlock.rs`）。launch 時の分離の記録（`launch_isolation_from_bundle` または
+//!   `LaunchIsolationRecord::new`）を `CreateStateRequest::with_launch_isolation` で書く結線も未実装で、結線までは
+//!   supervisor の `identify_pid1` が記録なしで exec を拒否する。restart の再 launch は mount namespace を作り直す
+//!   ため `UpdateStateRequest::with_launch_isolation` で記録し直す必要がある（しないと restart 後の exec は `/` の
+//!   照合で拒否される。fail-closed）。exec と launch の一致は「launch が適用した ruleset を記録し、同じ規則で辿る」
+//!   ことで担保する
 //! - 拒否の違反記録（種別 `exec_target`）の監査ログへの保存のうち、本番の sink の実体の生成と CLI からの
 //!   受け渡し（SEC-4）。層 `AuditLayer::ExecTarget` と supervisor `run_command`（親プロセス側）の 1 拒否 1 件の
 //!   記録は実装済み（#1465）。この段関数単体は記録せず、`ExecError::violation` に載せて返す
-//! - `--ulimit` の指定値の記録（`state.json`）。現状は pid1 の実効値を写して代替する（限界は上記）
+//! - ルールの対象ごとの `(st_dev, st_ino)` の記録と照合（launch の子から親への状態 pipe が要る。#1468）
 //! - 実機前提の通し試験 `tests/exec.rs` の実行結果の記録（CI ではビルドのみ）
 
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
+use super::capabilities::{PreJoinGroups, ProcessIds};
 use super::entrypoint_mode::EntrypointExecMode;
-use super::landlock::landlock_ruleset_from_config;
+use super::landlock::landlock_ruleset_from_record;
 #[cfg(feature = "exec-test-support")]
 use super::landlock::{LandlockAccessProbe, run_probe};
-use super::rlimits::{apply_rlimits, parse_proc_limits, widen_fsize_for_copy};
+use super::rlimits::{apply_rlimits, widen_fsize_for_copy};
 use super::sealed_copy::SealPolicy;
-use super::setns::{NsIdentity, cgroup_path_matches, read_bounded_from};
+use super::setns::{
+    NsIdentity, UserNsRelation, cgroup_path_matches, read_bounded_from, status_effective_uid,
+};
 use super::{
     ExecError, ExecWorkerProof, IsolationStage, Pid1Target, StageKind, SupplementaryGroups,
     ThreadCountSource, ViolationReason, no_new_privs,
 };
 use crate::landlock::LandlockRuleset;
+use crate::launch_isolation::{LaunchIsolationRecord, RootIdentity};
 use crate::oci_runtime::{OciConfig, RootfsDir};
 use crate::rlimits::{Rlimit, RlimitKind, Rlimits};
 use crate::sys;
@@ -200,16 +231,20 @@ pub struct ExecRestrictions {
     landlock: LandlockRuleset,
     threads: ThreadCountSource,
     owner_pid: u32,
-    /// `setns` の前にホスト側で固定したコンテナの rootfs（`O_PATH`）。参加後の `/` と照合する基準。
-    /// 適用が終わるまで保持し、inode 番号が再利用されないようにする。
-    rootfs: OwnedFd,
-    /// 対象（pid1）の実効 rlimit（対象の `limits`。`setns` の前に読む）。exec プロセスへ同じ値を載せる。
+    /// launch 時に記録したコンテナの `/` の同一性（`state.json`。トレイト契約 12）。参加後の `/` と照合する基準。
+    /// ホスト側の bundle ディレクトリではなく launch の pivot 後の `/` の識別子なので、rootfs を mount namespace の
+    /// 中で組み立てる構成（overlay 等）でも成り立つ。
+    root: RootIdentity,
+    /// launch 時の rlimit の記録（`state.json`。全 16 種）。exec プロセスへ同じ値を載せる。
     rlimits: Rlimits,
     /// 制限を準備した対象への束縛（参加後に別の対象へ適用させない）。
     binding: TargetBinding,
     /// namespace へ参加する前に補助グループを空にした結果（[`prepare_exec_restrictions`] が行う。#1457）。
     /// 観測用の経路・単体テストが直接組み立てた値では `None`（参加前の消去をしていない）。
     groups_before_join: Option<SupplementaryGroups>,
+    /// 参加後に呼び出しスレッドを揃える uid・gid（`process.user`）。対象が別の user namespace にいて参加する
+    /// ときだけ `Some`（SUP-6・SEC-5・TASK-163.h2・#1462）。同じ user namespace・観測用の経路は `None`。
+    ids: Option<ProcessIds>,
     /// 封印した複製が元のファイルの実行時ポリシー（複製では維持できない LSM・`AT_EXECVE_CHECK` の要否）を
     /// 迂回しないかの判定材料。`setns` の前（ホスト側の securityfs が見えるうち）に作る（#1531）。
     seal_policy: SealPolicy,
@@ -223,6 +258,10 @@ pub struct ExecRestrictions {
 /// 同じ rootfs を共有する別コンテナへ参加していても何も適用しない。
 struct TargetBinding {
     proc_dir: OwnedFd,
+    /// 対象の user namespace の識別子（`Pid1Target::open` が記録し、`join_namespaces` が参加の直前に再照合した
+    /// もの）。参加後の自プロセスの `ns/user` と照合する（別の user namespace へ参加する場合も、参加しない
+    /// 場合も。#1462）。
+    target_user_ns: NsIdentity,
     target_mnt_ns: NsIdentity,
     /// 対象の PID namespace の識別子。参加後に子が入る PID namespace（`ns/pid_for_children`）と照合する。
     target_pid_ns: NsIdentity,
@@ -377,7 +416,7 @@ impl ExecRestrictionReport {
         self.seccomp_instructions
     }
 
-    /// この exec プロセスへ適用した rlimit の種別数（対象の `limits` から読んだ全 16 種のうち、子へ持ち越した
+    /// この exec プロセスへ適用した rlimit の種別数（記録の全 16 種のうち、子へ持ち越した
     /// `RLIMIT_FSIZE` を除いたもの。通常は 15）。
     pub fn rlimits_applied(&self) -> usize {
         self.rlimits_applied
@@ -502,13 +541,16 @@ pub(super) struct ExecReadyParts {
     pub(super) seal_policy: SealPolicy,
 }
 
-/// `config`（コンテナの `config.json`）から Landlock ruleset を作り、参加後の `/` と照合する rootfs・
-/// 対象への束縛の材料・自プロセスの status fd を確保する。
+/// launch 時の分離の記録（`launch`）から Landlock ruleset を組み直し、参加後の `/` と照合する識別子・
+/// 対象への束縛の材料・自プロセスの status fd を確保する。`config.json` から Landlock を導き直さない（#1468）。
 ///
 /// `join_namespaces` の **前** に、再適用を行うプロセス自身が呼ぶ。`rootfs` は稼働中コンテナの bundle から
-/// `oci_runtime::pin_bundle_rootfs` で固定したもの（`config` と同じ bundle のもの）を渡す。`target` は
-/// `join_namespaces` へ渡すのと同じ対象で、その mount namespace の識別子と実効 rlimit（対象の `limits`）を
-/// ここで記録する（参加後に別の対象へ適用させない。rlimit は launch と同じ値を exec プロセスへ載せる）。
+/// `oci_runtime::pin_bundle_rootfs` で固定したもの（`config` と同じ bundle のもの）で、自プロセスの `/` と別の
+/// ディレクトリであることの検査と監査にだけ使う（`/` の照合の基準は `launch` の記録）。`config` は
+/// `process.user` の解釈に使う。`target` は
+/// `join_namespaces` へ渡すのと同じ対象で、その mount namespace の識別子をここで記録する（参加後に別の対象へ
+/// 適用させない）。`rlimits` は launch 時に `state.json` へ記録した全 16 種（`StateRecord::rlimits`）で、
+/// launch と同じ値を exec プロセスへ載せる。全 16 種そろっていなければ `FailedPrecondition`（段 `Rlimits`）で拒否する。
 /// **準備の最後に、呼び出しプロセスの補助グループを空にする**（不可逆。参加の前に消去するため。#1457）。消去
 /// できず、user namespace の `setgroups` = `deny` も確認できなければ `PermissionDenied`（段 `CapabilityDrop`）で、
 /// 参加へ進ませない。
@@ -523,8 +565,16 @@ pub(super) struct ExecReadyParts {
 /// ```compile_fail,E0061
 /// use fandhe_container_core::exec::{Pid1Target, prepare_exec_restrictions};
 /// use fandhe_container_core::oci_runtime::{OciConfig, RootfsDir};
-/// fn without_proof(t: &Pid1Target, c: &OciConfig, r: &RootfsDir) {
-///     let _ = prepare_exec_restrictions(t, c, r);
+/// use fandhe_container_core::rlimits::Rlimits;
+/// use fandhe_container_core::launch_isolation::LaunchIsolationRecord;
+/// fn without_proof(
+///     t: &Pid1Target,
+///     c: &OciConfig,
+///     r: &RootfsDir,
+///     l: &Rlimits,
+///     i: &LaunchIsolationRecord,
+/// ) {
+///     let _ = prepare_exec_restrictions(t, c, r, l, i);
 /// }
 /// ```
 pub fn prepare_exec_restrictions(
@@ -532,35 +582,104 @@ pub fn prepare_exec_restrictions(
     target: &Pid1Target,
     config: &OciConfig,
     rootfs: &RootfsDir,
+    rlimits: &Rlimits,
+    launch: &LaunchIsolationRecord,
 ) -> Result<ExecRestrictions, ExecError> {
     // 証跡は型で呼び出し元を絞るためだけに要求する（値は使わない）。
     let _ = worker;
-    let rootfs = rootfs.as_fd().try_clone_to_owned().map_err(|e| {
-        ExecError::from_io(&e, IsolationStage::Validate, "duplicate the rootfs handle")
-    })?;
     let own_root = sys::open_dir_path_nofollow(None, c"/")
         .map_err(|e| ExecError::from_sys(e, IsolationStage::Validate, "open own root"))?;
     reject_own_root(rootfs.as_fd(), own_root.as_fd())?;
+    reject_recorded_own_root(launch.root(), own_root.as_fd())?;
+    let relation = target.user_ns_relation();
     let target_mnt_ns = target.mnt_ns_identity()?;
     let target_pid_ns = target.pid_ns_identity()?;
-    let rlimits = parse_proc_limits(&target.read_limits()?)?;
-    // 対象の実効値を 1 つも読めなかった場合、rlimit を載せずに exec することになるため拒否する（#1460）。
-    require_rlimits(&rlimits)?;
+    // 記録が欠けている・不完全だと、緩い rlimit のまま exec することになるため拒否する（#1460・#1467）。
+    require_rlimits(rlimits)?;
+    let rlimits = rlimits.clone();
     let binding = TargetBinding {
         proc_dir: open_own_proc_dir()?,
+        target_user_ns: relation.target_identity(),
         target_mnt_ns,
         target_pid_ns,
         expected_cgroup: target.expected_cgroup_path().to_owned(),
     };
-    let mut restrictions = prepare_with_rootfs(config, rootfs, rlimits, binding)?;
+    // 別の user namespace へ参加するときだけ、参加後に揃える uid・gid（`process.user`）を決める。root 以外は
+    // launch と同じく未実装として、副作用（補助グループの消去）の前に拒否する。
+    let ids = match relation {
+        UserNsRelation::Shared { .. } => None,
+        UserNsRelation::Distinct { .. } => Some(process_ids_from_config(config)?),
+    };
+    let mut restrictions = prepare_with_launch(launch, launch.root(), rlimits, binding)?;
+    restrictions.ids = ids;
     // 準備の最後（ここまでの失敗では何も変えない）に、補助グループを参加の **前** に空にする。対象の user
     // namespace へ入った後では `setgroups` が `deny` で消せず、exec を起動したプロセスのホスト側の補助グループを
     // 持ち込んでしまうため（#1457）。不可逆で、以後このプロセスは exec 専用として使い捨てる。
-    restrictions.groups_before_join = Some(clear_supplementary_groups_before_join(
+    // 補助グループを持つ非特権の呼び出し側は初期 user namespace で消去できないが、コンテナの所有者自身の exec
+    // （別の user namespace で、呼び出し側の実効 uid が対象の実効 uid と一致）に限り参加後へ回す（#1462）。
+    let defer = defer_group_clearing(&relation, own_effective_uid());
+    restrictions.groups_before_join = match clear_supplementary_groups_before_join(
         &mut restrictions.threads,
         restrictions.binding.proc_dir.as_fd(),
-    )?);
+        defer,
+    )? {
+        PreJoinGroups::Done(groups) => Some(groups),
+        PreJoinGroups::DeferredUntilJoin => None,
+    };
     Ok(restrictions)
+}
+
+/// 参加前の補助グループの消去を参加後へ回してよいか（副作用の前に判定するテスト可能な純関数。SUP-6・SEC-1・
+/// SEC-5・TASK-163.h2・#1462）。
+///
+/// 別の user namespace へ参加し（`Distinct`）、かつ呼び出し側の実効 uid（`own_euid`。読めなければ `None`）が対象の
+/// 実効 uid と一致する場合だけ真。一致しない呼び出し側（コンテナの所有者と別の uid、たとえば別ユーザーの
+/// 補助グループを持つプロセス）は、参加後の消去が `deny` で現状維持になるとそのグループをコンテナへ持ち込むため、
+/// 従来どおり参加前の消去の失敗として拒否させる。
+fn defer_group_clearing(relation: &UserNsRelation, own_euid: Option<u32>) -> bool {
+    match *relation {
+        UserNsRelation::Shared { .. } => false,
+        UserNsRelation::Distinct { target_euid, .. } => own_euid == Some(target_euid),
+    }
+}
+
+/// 呼び出しプロセスの実効 uid（`/proc/self/status` の `Uid:`。呼び出し側の user namespace から見た値）。
+/// 読めない・解釈できない場合は `None`。
+fn own_effective_uid() -> Option<u32> {
+    let file = std::fs::File::open("/proc/self/status").ok()?;
+    let text = read_bounded_from(file, OWN_STATUS_READ_LIMIT).ok()?;
+    status_effective_uid(&text)
+}
+
+/// 自プロセスの `status` の読み取り上限（バイト）。
+const OWN_STATUS_READ_LIMIT: u64 = 64 * 1024;
+
+/// `config.json` の `process.user` から、参加後に揃える uid・gid を導く（SUP-6・SEC-5・TASK-163.h2・#1462）。
+///
+/// launch（`oci_runtime/start.rs`）と同じ制約を検査する: uid・gid が 0 でない、または `additionalGids` が空でない
+/// 指定は、ユーザー切り替えが未実装のため `Unimplemented`（段 `Validate`）で拒否する。値は定数にせず config から
+/// 導き、将来 launch が root 以外を扱うときに exec も同じ値へ揃える。`process` が無い config は `InvalidArgument`。
+fn process_ids_from_config(config: &OciConfig) -> Result<ProcessIds, ExecError> {
+    let stage = IsolationStage::Validate;
+    let process = config.process().ok_or_else(|| {
+        ExecError::new(
+            ErrorCode::InvalidArgument,
+            stage,
+            "config.json: process is required",
+        )
+    })?;
+    let user = process.user();
+    if user.uid() != 0 || user.gid() != 0 || !user.additional_gids().is_empty() {
+        return Err(ExecError::new(
+            ErrorCode::Unimplemented,
+            stage,
+            "process.user other than root is not supported",
+        ));
+    }
+    Ok(ProcessIds {
+        uid: user.uid(),
+        gid: user.gid(),
+    })
 }
 
 /// 参加前の消去の結果 `before` と、参加後の capability 削減の中での結果 `after` から、報告する値を決める。
@@ -597,6 +716,31 @@ fn reject_own_root(rootfs: BorrowedFd<'_>, own_root: BorrowedFd<'_>) -> Result<(
     Ok(())
 }
 
+/// 記録した launch 時の `/` が呼び出しプロセス自身の `/` と別であることを確かめる（SEC-1・#1468）。
+///
+/// 記録が自分の `/`（ホストの `/`）と一致するなら、参加後の照合は「ホストの `/` を拒否する」意味を失う
+/// （壊れた記録・ホストの `/` を指す記録）ため、[`reject_own_root`] と同じ違反 `rootfs_is_host_root` で拒否する。
+fn reject_recorded_own_root(
+    recorded: RootIdentity,
+    own_root: BorrowedFd<'_>,
+) -> Result<(), ExecError> {
+    let own = RootIdentity::of_dir_fd(own_root).ok_or_else(|| {
+        ExecError::new(
+            ErrorCode::Internal,
+            IsolationStage::Validate,
+            "failed to inspect the root directory",
+        )
+    })?;
+    if own == recorded {
+        return Err(ExecError::from_violation_at(
+            ViolationReason::RootfsIsHostRoot,
+            None,
+            IsolationStage::Validate,
+        ));
+    }
+    Ok(())
+}
+
 /// 結合試験 `tests/exec_audit.rs`（supervisor）専用の入口: `rootfs` を symlink 非追従で開き、
 /// [`prepare_exec_restrictions`] と同じ `reject_own_root` の判定だけを行う（SEC-4・SEC-1・#1614 の事後監査）。
 ///
@@ -615,6 +759,16 @@ pub fn reject_own_root_for_test(rootfs: &Path) -> Result<(), ExecError> {
     let own_root = sys::open_dir_path_nofollow(None, c"/")
         .map_err(|e| ExecError::from_sys(e, stage, "open own root"))?;
     reject_own_root(dir.as_fd(), own_root.as_fd())
+}
+
+/// 結合試験 `tests/exec_setns_join.rs`（supervisor）専用の入口: 参加後の呼び出しプロセスの `/` が、記録した
+/// 識別子 `expected` と一致するかを本番と同じ `open_verified_root` で照合する（SEC-1・#1468）。一致すれば `Ok`、
+/// 不一致は違反 `exec_root_not_container_rootfs` つきの `Err`。overlay のように rootfs を mount namespace の中で
+/// 組み立てる構成の代わりの検証に使う。`exec-test-support` feature を付けたビルドにだけ存在する。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn verify_joined_root_for_test(expected: RootIdentity) -> Result<(), ExecError> {
+    open_verified_root(expected).map(|_| ())
 }
 
 /// 自プロセスの procfs ディレクトリ（pid 指定。`O_PATH`）を開き、本物の procfs であることを確かめる。
@@ -642,6 +796,13 @@ fn open_own_proc_dir() -> Result<OwnedFd, ExecError> {
 /// `ns/mnt` は参照のたびにタスクの現在の namespace へ解決されるため、`setns` の後は参加先を返す。
 fn current_mnt_ns_identity(proc_dir: BorrowedFd<'_>) -> Result<NsIdentity, ExecError> {
     own_ns_identity(proc_dir, c"ns/mnt", "mount")
+}
+
+/// 保持した procfs ディレクトリ `proc_dir` から、呼び出しプロセスの現在の user namespace の識別子を読む。
+///
+/// `ns/user` は参照のたびにタスクの現在の資格情報の user namespace へ解決されるため、`setns` の後は参加先を返す。
+fn current_user_ns_identity(proc_dir: BorrowedFd<'_>) -> Result<NsIdentity, ExecError> {
+    own_ns_identity(proc_dir, c"ns/user", "user")
 }
 
 /// 保持した procfs ディレクトリ `proc_dir` から、呼び出しプロセスの子が入る PID namespace の識別子を読む。
@@ -696,11 +857,19 @@ fn own_cgroup_path(proc_dir: BorrowedFd<'_>) -> Result<String, ExecError> {
 /// 自プロセスの `cgroup` の読み取り上限（バイト）。
 const OWN_CGROUP_READ_LIMIT: u64 = 64 * 1024;
 
-/// 参加後の mount namespace・子が入る PID namespace・所属 cgroup が、準備時に記録した対象のものと一致する
-/// ことをこの順で確かめる（SEC-1）。不一致は違反記録（`exec_joined_namespace_mismatch` /
-/// `exec_joined_pid_namespace_mismatch` / `exec_joined_cgroup_mismatch`。何も適用しない）。
+/// 参加後の user namespace・mount namespace・子が入る PID namespace・所属 cgroup が、準備時に記録した対象の
+/// ものと一致することをこの順で確かめる（SEC-1・SEC-5）。不一致は違反記録（user / mount は
+/// `exec_joined_namespace_mismatch`、他は `exec_joined_pid_namespace_mismatch` / `exec_joined_cgroup_mismatch`。
+/// 何も適用しない）。user namespace は別の user namespace へ参加した場合も参加しない場合も照合する（#1462。
+/// 参加しない場合は「呼び出し側 = 対象」の一致の確認になる）。
 fn verify_target_binding(binding: &TargetBinding) -> Result<(), ExecError> {
     let proc_dir = binding.proc_dir.as_fd();
+    if current_user_ns_identity(proc_dir)? != binding.target_user_ns {
+        return Err(ExecError::from_violation(
+            ViolationReason::ExecJoinedNamespaceMismatch,
+            None,
+        ));
+    }
     if current_mnt_ns_identity(proc_dir)? != binding.target_mnt_ns {
         return Err(ExecError::from_violation(
             ViolationReason::ExecJoinedNamespaceMismatch,
@@ -723,15 +892,16 @@ fn verify_target_binding(binding: &TargetBinding) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// [`prepare_exec_restrictions`] の本体（`rootfs` が自分の `/` でないことの検査を除く）。
+/// [`prepare_exec_restrictions`] の本体（`/` が自分の `/` でないことの検査を除く）。
 /// 結合試験用の観測関数は `setns` をしないため、自分の `/`・自分の namespace を基準にしてここから入る。
-fn prepare_with_rootfs(
-    config: &OciConfig,
-    rootfs: OwnedFd,
+/// Landlock は記録（`launch`）のルールからだけ作り、`config.json` は読まない（#1468）。
+fn prepare_with_launch(
+    launch: &LaunchIsolationRecord,
+    root: RootIdentity,
     rlimits: Rlimits,
     binding: TargetBinding,
 ) -> Result<ExecRestrictions, ExecError> {
-    let landlock = landlock_ruleset_from_config(config)?;
+    let landlock = landlock_ruleset_from_record(launch)?;
     let seal_policy = SealPolicy::probe();
     let status_error =
         |what: &'static str| ExecError::new(ErrorCode::Internal, IsolationStage::Landlock, what);
@@ -746,26 +916,27 @@ fn prepare_with_rootfs(
         landlock,
         threads: ThreadCountSource::PreOpened(file),
         owner_pid: std::process::id(),
-        rootfs,
+        root,
         rlimits,
         binding,
         groups_before_join: None,
+        ids: None,
         seal_policy,
     })
 }
 
-/// 再適用する rlimit の集合が空でないことを確かめる（SUP-6・SEC-1・REPAIR-3・TASK-163 追補・#1460）。
+/// 再適用する rlimit の集合が全 16 種そろっていることを確かめる（SUP-6・SEC-1・REPAIR-3・TASK-163 追補・#1460・#1467）。
 ///
-/// 空集合は「適用する値が無い」ため rlimit の適用を省くことになるが、結果の件数が 0 になるだけで未適用の
-/// 一覧には載らず、launch より緩い rlimit のまま exec へ進めてしまう。本番の入口（[`prepare_exec_restrictions`]・
-/// [`reapply_restrictions`]）は空集合を `FailedPrecondition`（段 `Rlimits`）で拒否する。通常は対象の `limits` から
-/// 全 16 種が入る。
+/// 空集合や一部の種別だけの集合は「適用する値が無い種別」を残し、launch より緩い rlimit のまま exec へ進めてしまう
+/// （結果の件数が減るだけで未適用の一覧には載らない）。本番の入口（[`prepare_exec_restrictions`]・
+/// [`reapply_restrictions`]）は、全 16 種そろっていない集合を `FailedPrecondition`（段 `Rlimits`）で拒否する。
+/// 通常は launch 時の記録（`state.json`）から全 16 種が入る。
 fn require_rlimits(rlimits: &Rlimits) -> Result<(), ExecError> {
-    if rlimits.is_empty() {
+    if !rlimits.is_complete() {
         return Err(ExecError::new(
             ErrorCode::FailedPrecondition,
             IsolationStage::Rlimits,
-            "the rlimits of the exec target are empty; refusing to exec without rlimits",
+            "the rlimits of the exec target are incomplete; refusing to exec without all rlimits",
         ));
     }
     Ok(())
@@ -791,15 +962,29 @@ fn same_directory(a: BorrowedFd<'_>, b: BorrowedFd<'_>) -> Result<bool, ExecErro
     }
 }
 
-/// 参加後の呼び出しプロセスの `/` を開き、`rootfs`（`setns` の前に固定したコンテナの rootfs）と同じ
-/// ディレクトリであることを確かめて返す（SEC-1）。不一致は違反記録 `exec_root_not_container_rootfs`。
+/// 参加後の呼び出しプロセスの `/` を開き、launch 時に記録したコンテナの `/`（`expected`）と同じ
+/// ディレクトリ（`st_dev`・`st_ino` の一致）であることを確かめて返す（SEC-1）。不一致は違反記録
+/// `exec_root_not_container_rootfs`。
 ///
 /// 返す fd は Landlock のルールパスを辿る起点と、コマンドの cwd の起点に使う（照合した実体と起点を
 /// 同じ fd にする）。
-fn open_verified_root(rootfs: BorrowedFd<'_>) -> Result<OwnedFd, ExecError> {
+///
+/// inode 番号の再利用への備え: 記録は識別子だけで fd を持ち続けないが、呼び出し側が先に mount namespace の
+/// 束縛（`verify_target_binding`）を済ませており、生きている pid1 の mount namespace が `/` のマウントを固定
+/// している。SEC-1 で `CAP_SYS_ADMIN` を持たないコンテナは `/` を付け替えられず、seccomp が `setns`・`unshare` を
+/// 拒否する。したがって束縛の後の `/` の識別子は launch のものと一致するか、記録が古い（restart で記録し直して
+/// いない）かのどちらかで、後者は不一致として拒否される。
+fn open_verified_root(expected: RootIdentity) -> Result<OwnedFd, ExecError> {
     let root = sys::open_dir_path_nofollow(None, c"/")
         .map_err(|e| ExecError::from_sys(e, IsolationStage::SetNs, "open / after joining"))?;
-    if !same_directory(rootfs, root.as_fd())? {
+    let actual = RootIdentity::of_dir_fd(root.as_fd()).ok_or_else(|| {
+        ExecError::new(
+            ErrorCode::Internal,
+            IsolationStage::SetNs,
+            "failed to inspect the root directory",
+        )
+    })?;
+    if actual != expected {
         return Err(ExecError::from_violation(
             ViolationReason::ExecRootNotContainerRootfs,
             None,
@@ -850,10 +1035,11 @@ fn reapply_inner(
         landlock,
         mut threads,
         owner_pid,
-        rootfs,
+        root: expected_root,
         rlimits,
         binding,
         groups_before_join,
+        ids,
         seal_policy,
     } = restrictions;
     if owner_pid != std::process::id() {
@@ -868,7 +1054,7 @@ fn reapply_inner(
         require_rlimits(&rlimits)?;
     }
     verify_target_binding(&binding)?;
-    let root = open_verified_root(rootfs.as_fd())?;
+    let root = open_verified_root(expected_root)?;
     // 観測用の空集合では syscall を呼ばず、下で未適用の一覧へ `Rlimits` を載せる。通常は全 16 種が入る。
     let rlimits_skipped = rlimits.is_empty();
     // `RLIMIT_FSIZE` だけは子へ持ち越す（封印した複製の書き込みを妨げない。#1531）。実効値は子が複製の完成後・
@@ -886,7 +1072,7 @@ fn reapply_inner(
     // capability 削減は、先頭で補助グループも空にする（launch 経路と同じ関数。#1457）。
     let capabilities = if drop_capabilities {
         Some(
-            apply_default_capabilities_with(&mut threads, Some(binding.proc_dir.as_fd()))
+            apply_default_capabilities_with(&mut threads, Some(binding.proc_dir.as_fd()), ids)
                 .map_err(|e| e.at_stage(IsolationStage::CapabilityDrop))?,
         )
     } else {
@@ -1040,8 +1226,12 @@ pub fn observe_exec_restriction_reapply(
     let expected = OwnedFd::from(
         std::fs::File::open(expected_root).map_err(|_| internal("cannot open expected root"))?,
     );
+    let expected_identity = RootIdentity::of_dir_fd(expected.as_fd())
+        .ok_or_else(|| internal("expected root is not a directory"))?;
     // `setns` をしないため、対象の mount namespace は自分自身（束縛は常に一致する）。rlimit は変えない。
     let proc_dir = open_own_proc_dir().map_err(|_| internal("cannot open own procfs directory"))?;
+    let target_user_ns = current_user_ns_identity(proc_dir.as_fd())
+        .map_err(|_| internal("cannot read own user namespace"))?;
     let target_mnt_ns = current_mnt_ns_identity(proc_dir.as_fd())
         .map_err(|_| internal("cannot read own mount namespace"))?;
     let target_pid_ns = current_pid_ns_for_children_identity(proc_dir.as_fd())
@@ -1050,11 +1240,19 @@ pub fn observe_exec_restriction_reapply(
         own_cgroup_path(proc_dir.as_fd()).map_err(|_| internal("cannot read own cgroup"))?;
     let binding = TargetBinding {
         proc_dir,
+        target_user_ns,
         target_mnt_ns,
         target_pid_ns,
         expected_cgroup,
     };
-    match prepare_with_rootfs(config, expected, Rlimits::default(), binding) {
+    // 観測では `config` から導いた ruleset と `expected_root` の識別子で記録を作る（launch の代わり）。
+    let prepared = super::landlock::landlock_ruleset_from_config(config).and_then(|ruleset| {
+        let launch = LaunchIsolationRecord::new(expected_identity, &ruleset).map_err(|e| {
+            ExecError::new(ErrorCode::Internal, IsolationStage::Landlock, e.message())
+        })?;
+        prepare_with_launch(&launch, expected_identity, Rlimits::default(), binding)
+    });
+    match prepared {
         Err(e) => obs.prepare_error = Some(e),
         Ok(prepared) => {
             match reapply_inner(prepared, ReapplyMode::ObservationWithoutCapabilityDrop) {
@@ -1109,15 +1307,20 @@ mod tests {
         restrictions_rooted_at(owner_pid, Path::new("/"))
     }
 
+    fn identity_of(path: &Path) -> RootIdentity {
+        RootIdentity::of_dir_fd(dir_fd(path).as_fd()).expect("directory identity")
+    }
+
     fn restrictions_rooted_at(owner_pid: u32, rootfs: &Path) -> ExecRestrictions {
         ExecRestrictions {
             landlock: LandlockRuleset::for_observation(6, Vec::new()),
             threads: ThreadCountSource::ProcSelf,
             owner_pid,
-            rootfs: dir_fd(rootfs),
-            rlimits: one_rlimit(),
+            root: identity_of(rootfs),
+            rlimits: full_rlimits(),
             binding: own_binding(),
             groups_before_join: None,
+            ids: None,
             seal_policy: SealPolicy::unrestricted(),
         }
     }
@@ -1125,24 +1328,45 @@ mod tests {
     /// 対象の mount namespace を自分自身にした束縛（単体テストは `setns` をしないため照合が通る）。
     fn own_binding() -> TargetBinding {
         let proc_dir = open_own_proc_dir().expect("own procfs dir");
+        let target_user_ns = current_user_ns_identity(proc_dir.as_fd()).expect("own user ns");
         let target_mnt_ns = current_mnt_ns_identity(proc_dir.as_fd()).expect("own mnt ns");
         let target_pid_ns =
             current_pid_ns_for_children_identity(proc_dir.as_fd()).expect("own pid ns");
         let expected_cgroup = own_cgroup_path(proc_dir.as_fd()).expect("own cgroup");
         TargetBinding {
             proc_dir,
+            target_user_ns,
             target_mnt_ns,
             target_pid_ns,
             expected_cgroup,
         }
     }
 
-    /// 適用の呼び出し順を確かめるための 1 件だけの rlimit 集合（偽の `prlimit` が記録する）。
-    fn one_rlimit() -> Rlimits {
-        use crate::rlimits::{Rlimit, RlimitKind};
-        Rlimits::new(vec![
-            Rlimit::new(RlimitKind::Nofile, 256, 512).expect("rlimit"),
-        ])
+    /// 偽の呼び出し記録を取り出し、連続する `rlimits`（種別ごとに 1 回ずつ記録される）を 1 つにまとめる。
+    /// 段の順序の照合用（rlimit の個別の値は `take_sets` で照合する）。
+    fn taken() -> Vec<&'static str> {
+        let mut v = take();
+        v.dedup();
+        v
+    }
+
+    /// 適用の呼び出し順を確かめるための全 16 種の rlimit 集合（偽の `prlimit` が記録する）。
+    /// 値は種別の添字から決める具体値で、`Nofile` だけ (256, 512)、`Fsize` は (4096, 4096)。
+    fn full_rlimits() -> Rlimits {
+        Rlimits::new(
+            RlimitKind::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(i, k)| {
+                    let (soft, hard) = match k {
+                        RlimitKind::Nofile => (256, 512),
+                        RlimitKind::Fsize => (4096, 4096),
+                        _ => (i as u64, 100 + i as u64),
+                    };
+                    Rlimit::new(k, soft, hard).expect("rlimit")
+                })
+                .collect(),
+        )
         .expect("set")
     }
 
@@ -1189,16 +1413,11 @@ mod tests {
     #[test]
     fn sup12_deferred_fsize_is_reported_separately_from_applied_rlimits() {
         let _ = take();
-        let mut r = restrictions(std::process::id());
-        r.rlimits = Rlimits::new(vec![
-            Rlimit::new(RlimitKind::Nofile, 256, 512).expect("nofile"),
-            Rlimit::new(RlimitKind::Fsize, 4096, 4096).expect("fsize"),
-        ])
-        .expect("set");
+        let r = restrictions(std::process::id());
         let report = reapply_restrictions(r).expect("ok");
         assert_eq!(
             (report.rlimits_applied(), report.rlimits_deferred()),
-            (1, 1)
+            (15, 1)
         );
         assert!(report.is_complete());
         let carry = report.into_complete().expect("ready").into_parts();
@@ -1215,7 +1434,7 @@ mod tests {
         let _ = take();
         let report = reapply_restrictions(restrictions(std::process::id())).expect("ok");
         assert_eq!(
-            take(),
+            taken(),
             vec![
                 "rlimits",
                 "capability_drop",
@@ -1226,8 +1445,29 @@ mod tests {
         );
         assert_eq!(report.landlock_rules(), 0);
         assert_eq!(report.seccomp_instructions(), 0);
-        assert_eq!(report.rlimits_applied(), 1);
-        assert_eq!(report.rlimits_deferred(), 0);
+        assert_eq!(report.rlimits_applied(), 15);
+        assert_eq!(report.rlimits_deferred(), 1);
+        // #1467: 偽の `prlimit` へは記録の全 16 種が、値・件数とも記録どおりに渡る（Fsize は持ち越し）。
+        let sets = crate::exec::rlimits::testing::take_sets();
+        let (fsize, others): (Vec<_>, Vec<_>) = sets
+            .into_iter()
+            .partition(|(k, _, _)| *k == RlimitKind::Fsize);
+        let want: Vec<_> = full_rlimits()
+            .iter()
+            .filter(|r| r.kind() != RlimitKind::Fsize)
+            .map(|r| (r.kind(), r.soft(), r.hard()))
+            .collect();
+        assert_eq!(others.len(), 15);
+        assert_eq!(others, want);
+        // 持ち越した Fsize は exec プロセスでは広げるだけ（封印した複製の書き込みのため。#1531）で、記録の値は載せない。
+        assert_eq!(
+            fsize,
+            [(
+                RlimitKind::Fsize,
+                crate::rlimits::RLIMIT_INFINITY,
+                crate::rlimits::RLIMIT_INFINITY
+            )]
+        );
         // TASK-163 追補（#1457）: capability 削減が補助グループの扱いも済ませ、結果に載る（偽のカーネルは空）。
         assert_eq!(
             report.supplementary_groups(),
@@ -1269,7 +1509,7 @@ mod tests {
         assert_eq!(StageKind::ORDER.first(), Some(&StageKind::CgroupJoin));
         let _ = take();
         let report = reapply_restrictions(restrictions(std::process::id())).expect("ok");
-        assert_eq!(take(), expected);
+        assert_eq!(taken(), expected);
         assert!(report.into_complete().is_ok());
         let _ = crate::exec::rlimits::testing::take_sets();
     }
@@ -1303,15 +1543,21 @@ mod tests {
         let _ = take();
         let mut r = restrictions(std::process::id());
         crate::exec::capabilities::testing::fake_groups_before_join(4);
-        r.groups_before_join = Some(
-            clear_supplementary_groups_before_join(&mut r.threads, r.binding.proc_dir.as_fd())
-                .expect("clear before join"),
-        );
+        r.groups_before_join = match clear_supplementary_groups_before_join(
+            &mut r.threads,
+            r.binding.proc_dir.as_fd(),
+            false,
+        )
+        .expect("clear before join")
+        {
+            PreJoinGroups::Done(groups) => Some(groups),
+            PreJoinGroups::DeferredUntilJoin => None,
+        };
         assert_eq!(r.groups_before_join, Some(Cleared { cleared: 4 }));
         let report = reapply_restrictions(r).expect("ok");
         assert_eq!(report.supplementary_groups(), Some(Cleared { cleared: 4 }));
         assert_eq!(
-            take(),
+            taken(),
             vec![
                 "setgroups_before_join",
                 "rlimits",
@@ -1338,15 +1584,27 @@ mod tests {
         );
         assert_eq!(
             e.message,
-            "the rlimits of the exec target are empty; refusing to exec without rlimits"
+            "the rlimits of the exec target are incomplete; refusing to exec without all rlimits"
         );
         assert_eq!(e.violation, None);
-        assert_eq!(take(), Vec::<&str>::new());
+        assert_eq!(taken(), Vec::<&str>::new());
         assert_eq!(
             require_rlimits(&Rlimits::default()).unwrap_err().stage,
             IsolationStage::Rlimits
         );
-        require_rlimits(&one_rlimit()).unwrap();
+        // 15 種（1 種欠け）も、何も適用する前に拒否する（#1467）。
+        let fifteen = Rlimits::new(full_rlimits().iter().skip(1).copied().collect()).expect("set");
+        assert_eq!(fifteen.len(), 15);
+        let mut r = restrictions(std::process::id());
+        r.rlimits = fifteen.clone();
+        let e = reapply_restrictions(r).unwrap_err();
+        assert_eq!(
+            (e.code, e.stage),
+            (ErrorCode::FailedPrecondition, IsolationStage::Rlimits)
+        );
+        assert_eq!(taken(), Vec::<&str>::new());
+        assert!(require_rlimits(&fifteen).is_err());
+        require_rlimits(&full_rlimits()).unwrap();
     }
 
     /// SUP-6・SEC-1・REPAIR-3・TASK-163 追補（#1460）: 観測用の経路は rlimit の空集合と capability 削減の省略を
@@ -1358,7 +1616,7 @@ mod tests {
         r.rlimits = Rlimits::default();
         let report =
             reapply_inner(r, ReapplyMode::ObservationWithoutCapabilityDrop).expect("observation");
-        assert_eq!(take(), vec!["no_new_privs", "landlock", "seccomp"]);
+        assert_eq!(taken(), vec!["no_new_privs", "landlock", "seccomp"]);
         assert_eq!(report.rlimits_applied(), 0);
         assert_eq!(report.supplementary_groups(), None);
         assert_eq!(
@@ -1382,7 +1640,7 @@ mod tests {
         )
         .expect("observation");
         assert_eq!(
-            take(),
+            taken(),
             vec!["rlimits", "no_new_privs", "landlock", "seccomp"]
         );
         let _ = crate::exec::rlimits::testing::take_sets();
@@ -1401,7 +1659,7 @@ mod tests {
         let e = reapply_restrictions(restrictions(std::process::id())).expect_err("rlimit");
         assert_eq!(e.stage, IsolationStage::Rlimits);
         assert_eq!(e.code, ErrorCode::PermissionDenied);
-        assert_eq!(take(), vec!["rlimits"]);
+        assert_eq!(taken(), vec!["rlimits"]);
         let _ = crate::exec::rlimits::testing::take_sets();
     }
 
@@ -1415,7 +1673,7 @@ mod tests {
         let e = reapply_restrictions(restrictions(std::process::id())).expect_err("capability");
         assert_eq!(e.stage, IsolationStage::CapabilityDrop);
         assert_eq!(e.code, ErrorCode::PermissionDenied);
-        assert_eq!(take(), vec!["rlimits", "capability_drop"]);
+        assert_eq!(taken(), vec!["rlimits", "capability_drop"]);
         let _ = crate::exec::rlimits::testing::take_sets();
     }
 
@@ -1433,14 +1691,14 @@ mod tests {
         assert_eq!(e.stage, IsolationStage::SetNs);
         assert_eq!(
             e.message,
-            "the mount namespace after joining is not the one of the prepared exec target"
+            "the user or mount namespace after joining is not the one of the prepared exec target"
         );
         let v = e.violation.expect("violation recorded");
         assert_eq!(v.reason, ViolationReason::ExecJoinedNamespaceMismatch);
         assert_eq!(v.reason.as_str(), "exec_joined_namespace_mismatch");
         assert_eq!(v.kind.as_str(), "exec_target");
         assert_eq!(v.behavior_id, "SEC-1");
-        assert_eq!(take(), Vec::<&str>::new());
+        assert_eq!(taken(), Vec::<&str>::new());
         let _ = crate::exec::rlimits::testing::take_sets();
     }
 
@@ -1462,8 +1720,153 @@ mod tests {
         let v = e.violation.expect("violation recorded");
         assert_eq!(v.reason, ViolationReason::ExecJoinedPidNamespaceMismatch);
         assert_eq!(v.behavior_id, "SEC-1");
-        assert_eq!(take(), Vec::<&str>::new());
+        assert_eq!(taken(), Vec::<&str>::new());
         let _ = crate::exec::rlimits::testing::take_sets();
+    }
+
+    /// SUP-6・SEC-5・SEC-4・TASK-163.h2・#1462: 参加後の user namespace が準備時に記録した対象のものと違えば
+    /// （別の user namespace へ参加し損ねた・rootful が user namespace に入らずに参加した場合を想定）、何も適用せず
+    /// 違反記録つきの `FailedPrecondition`（理由 `exec_joined_namespace_mismatch`・段 `SetNs`）。mount namespace の
+    /// 照合より先に判定する（mount namespace も食い違わせて、user namespace の方で止まることを確かめる）。
+    #[test]
+    fn sup6_task163_h2_other_user_namespace_applies_nothing() {
+        let _ = take();
+        let mut r = restrictions(std::process::id());
+        let (dev, ino) = r.binding.target_user_ns;
+        r.binding.target_user_ns = (dev, ino.wrapping_add(1));
+        let (dev, ino) = r.binding.target_mnt_ns;
+        r.binding.target_mnt_ns = (dev, ino.wrapping_add(1));
+        let e = reapply_restrictions(r).expect_err("other user ns");
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.stage, IsolationStage::SetNs);
+        assert_eq!(
+            e.message,
+            "the user or mount namespace after joining is not the one of the prepared exec target"
+        );
+        let v = e.violation.expect("violation recorded");
+        assert_eq!(v.reason, ViolationReason::ExecJoinedNamespaceMismatch);
+        assert_eq!(v.behavior_id, "SEC-1");
+        assert_eq!(taken(), Vec::<&str>::new());
+        let _ = crate::exec::rlimits::testing::take_sets();
+    }
+
+    /// SUP-6・SEC-5・TASK-163.h2・#1462: 参加前の補助グループの消去を参加後へ回してよいのは、別の user namespace
+    /// （`Distinct`）で、呼び出し側の実効 uid が対象の実効 uid と一致するときだけ。同じ user namespace・uid 不一致・
+    /// uid を読めない場合は回さない（fail-closed）。
+    #[test]
+    fn sup6_task163_h2_defer_group_clearing_truth_table() {
+        let own: NsIdentity = (4, 10);
+        let shared = UserNsRelation::Shared { identity: own };
+        let distinct = UserNsRelation::Distinct {
+            target: (4, 11),
+            own,
+            target_euid: 1000,
+        };
+        assert!(!defer_group_clearing(&shared, Some(1000)));
+        assert!(!defer_group_clearing(&shared, None));
+        assert!(defer_group_clearing(&distinct, Some(1000)));
+        assert!(!defer_group_clearing(&distinct, Some(0)));
+        assert!(!defer_group_clearing(&distinct, Some(1001)));
+        assert!(!defer_group_clearing(&distinct, None));
+    }
+
+    /// `process.user` を指定した最小の config（`process_ids_from_config` の入力）。
+    fn config_with_user(user: &str) -> OciConfig {
+        let json = format!(
+            r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":false}},"mounts":[],
+            "process":{{"terminal":false,"user":{user},"args":["/bin/true"],"cwd":"/"}}}}"#
+        );
+        crate::oci_runtime::parse_config_bytes(json.as_bytes()).expect("config")
+    }
+
+    /// SUP-6・SEC-5・TASK-163.h2・#1462: 参加後に揃える uid・gid は `process.user` から導く。launch と同じく root
+    /// （uid 0・gid 0・追加グループなし）だけを許し、それ以外は `Unimplemented`（段 `Validate`）。`process` の無い
+    /// config は `InvalidArgument`。
+    #[test]
+    fn sup6_task163_h2_process_ids_come_from_process_user() {
+        let ok = process_ids_from_config(&config_with_user(r#"{"uid":0,"gid":0}"#)).expect("root");
+        assert_eq!(ok, ProcessIds { uid: 0, gid: 0 });
+        for user in [
+            r#"{"uid":1000,"gid":0}"#,
+            r#"{"uid":0,"gid":100}"#,
+            r#"{"uid":0,"gid":0,"additionalGids":[5]}"#,
+        ] {
+            let e = process_ids_from_config(&config_with_user(user)).unwrap_err();
+            assert_eq!(
+                (e.code, e.stage),
+                (ErrorCode::Unimplemented, IsolationStage::Validate),
+                "{user}"
+            );
+            assert_eq!(e.message, "process.user other than root is not supported");
+            assert_eq!(e.violation, None);
+        }
+        let e = process_ids_from_config(&config(false, "[]")).unwrap_err();
+        assert_eq!(
+            (e.code, e.stage),
+            (ErrorCode::InvalidArgument, IsolationStage::Validate)
+        );
+    }
+
+    /// SUP-6・SEC-5・TASK-163.h2・#1462: 再適用は準備で決めた `ids` を capability 段へ渡す。別の user namespace へ
+    /// 参加した場合（`Some`）は gid・uid の切り替えが載り、同じ user namespace（`None`）では渡さない。
+    #[test]
+    fn sup6_task163_h2_ids_reach_capability_stage_only_when_set() {
+        use crate::exec::capabilities::testing::take_ids_seen;
+        let _ = take();
+        let _ = take_ids_seen();
+        let mut r = restrictions(std::process::id());
+        r.ids = Some(ProcessIds { uid: 0, gid: 0 });
+        let _ = reapply_restrictions(r).expect("ok with ids");
+        assert_eq!(take_ids_seen(), Some(Some(ProcessIds { uid: 0, gid: 0 })));
+        let _ = take();
+        let _ = reapply_restrictions(restrictions(std::process::id())).expect("ok without ids");
+        assert_eq!(take_ids_seen(), Some(None));
+        let _ = take();
+        let _ = crate::exec::rlimits::testing::take_sets();
+    }
+
+    /// SUP-6・SEC-1・SEC-5・TASK-163.h2・#1462: 参加前の消去を延期してよい場合（`EPERM` かつ `allow`）は、延期の
+    /// 可否が下位の関数へ渡り、延期可なら `DeferredUntilJoin`（`groups_before_join` は `None` になり、参加後の結果が
+    /// 報告に使われる）。延期不可なら従来どおり `PermissionDenied` で準備が失敗する。
+    #[test]
+    fn sup6_task163_h2_pre_join_group_clearing_can_be_deferred() {
+        use crate::exec::capabilities::testing::{
+            fake_groups_before_join, fake_groups_before_join_eperm_allow, take_defer_requested,
+        };
+        let _ = take();
+        let mut r = restrictions(std::process::id());
+        fake_groups_before_join(3);
+        fake_groups_before_join_eperm_allow();
+        let out = clear_supplementary_groups_before_join(
+            &mut r.threads,
+            r.binding.proc_dir.as_fd(),
+            true,
+        )
+        .expect("deferred");
+        assert_eq!(out, PreJoinGroups::DeferredUntilJoin);
+        assert_eq!(take_defer_requested(), Some(true));
+        fake_groups_before_join(3);
+        fake_groups_before_join_eperm_allow();
+        let e = clear_supplementary_groups_before_join(
+            &mut r.threads,
+            r.binding.proc_dir.as_fd(),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            (e.code, e.stage),
+            (ErrorCode::PermissionDenied, IsolationStage::CapabilityDrop)
+        );
+        assert_eq!(take_defer_requested(), Some(false));
+        // 延期した場合、参加後の結果が報告に使われる。
+        assert_eq!(
+            combine_group_outcomes(
+                None,
+                Some(SupplementaryGroups::KeptSetgroupsDenied { kept: 3 })
+            ),
+            Some(SupplementaryGroups::KeptSetgroupsDenied { kept: 3 })
+        );
+        let _ = take();
     }
 
     /// SUP-6・SEC-1・SEC-4・TASK-163.4: mount・PID namespace が同じでも、参加後の所属 cgroup が準備時の対象の
@@ -1483,7 +1886,7 @@ mod tests {
         let v = e.violation.expect("violation recorded");
         assert_eq!(v.reason, ViolationReason::ExecJoinedCgroupMismatch);
         assert_eq!(v.behavior_id, "SEC-1");
-        assert_eq!(take(), Vec::<&str>::new());
+        assert_eq!(taken(), Vec::<&str>::new());
         let _ = crate::exec::rlimits::testing::take_sets();
     }
 
@@ -1501,7 +1904,7 @@ mod tests {
             e.violation.expect("violation").reason,
             ViolationReason::ExecJoinedNamespaceMismatch
         );
-        assert_eq!(take(), Vec::<&str>::new());
+        assert_eq!(taken(), Vec::<&str>::new());
     }
 
     /// SUP-6・TASK-163.4: 自プロセスの mount namespace の識別子は、`/proc/self/ns/mnt` の `stat` と一致する
@@ -1602,7 +2005,7 @@ mod tests {
         assert_eq!(ThreadCountSource::PreOpened(tmp_file(&over)).count(), None);
     }
 
-    /// SUP-6・SEC-1・SEC-4・TASK-163.3: 参加後の `/` が準備時に固定した rootfs と別のディレクトリなら、
+    /// SUP-6・SEC-1・SEC-4・TASK-163.3・#1468: 参加後の `/` が launch 時に記録した `/` と別のディレクトリなら、
     /// 何も適用せず違反記録つきの `FailedPrecondition`（理由 `exec_root_not_container_rootfs`・段 `SetNs`）。
     #[test]
     fn sup6_task163_3_root_mismatch_applies_nothing_and_records_violation() {
@@ -1622,7 +2025,7 @@ mod tests {
         assert_eq!(v.reason.as_str(), "exec_root_not_container_rootfs");
         assert_eq!(v.kind.as_str(), "exec_target");
         assert_eq!(v.behavior_id, "SEC-1");
-        assert_eq!(take(), Vec::<&str>::new());
+        assert_eq!(taken(), Vec::<&str>::new());
         let _ = crate::exec::rlimits::testing::take_sets();
     }
 
@@ -1637,7 +2040,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(e.stage, IsolationStage::Validate);
         assert!(e.violation.is_none());
-        assert_eq!(take(), Vec::<&str>::new());
+        assert_eq!(taken(), Vec::<&str>::new());
     }
 
     /// SUP-6・SEC-1・TASK-163.3: ディレクトリの同一性は `st_dev`・`st_ino` で決まる。同じディレクトリを別々に
@@ -1681,7 +2084,7 @@ mod tests {
         let e = reapply_restrictions(restrictions(std::process::id())).expect_err("nnp fails");
         assert_eq!(e.stage, IsolationStage::NoNewPrivs);
         assert_eq!(e.code, ErrorCode::PermissionDenied);
-        assert_eq!(take(), vec!["rlimits", "capability_drop", "no_new_privs"]);
+        assert_eq!(taken(), vec!["rlimits", "capability_drop", "no_new_privs"]);
         let _ = crate::exec::rlimits::testing::take_sets();
     }
 
@@ -1697,7 +2100,7 @@ mod tests {
         assert_eq!(e.stage, IsolationStage::Landlock);
         assert_eq!(e.code, ErrorCode::FailedPrecondition);
         assert_eq!(
-            take(),
+            taken(),
             vec!["rlimits", "capability_drop", "no_new_privs", "landlock"]
         );
         let _ = crate::exec::rlimits::testing::take_sets();
@@ -1715,7 +2118,7 @@ mod tests {
         assert_eq!(e.stage, IsolationStage::Seccomp);
         assert_eq!(e.code, ErrorCode::Internal);
         assert_eq!(
-            take(),
+            taken(),
             vec![
                 "rlimits",
                 "capability_drop",
@@ -1738,7 +2141,87 @@ mod tests {
             e.message,
             "restrictions must be reapplied by the process that prepared them"
         );
-        assert_eq!(take(), Vec::<&str>::new());
+        assert_eq!(taken(), Vec::<&str>::new());
+    }
+
+    /// 記録（`config.json` に無いルールを含む手組みの値）。rootfs と `/data`、`/only-in-record` を持つ。
+    fn hand_made_record(root: RootIdentity, handled: u64) -> LaunchIsolationRecord {
+        use crate::launch_isolation::{RecordedLandlock, RecordedRule, RecordedTarget};
+        use crate::oci_runtime::MountDestination;
+        let dest = |p: &str| MountDestination::parse(p).expect("destination");
+        let rules = vec![
+            RecordedRule::new(RecordedTarget::Root, 0x7),
+            RecordedRule::new(
+                RecordedTarget::Mount {
+                    destination: dest("/only-in-record"),
+                    index: 4,
+                },
+                0x1,
+            ),
+        ];
+        LaunchIsolationRecord::from_parts(
+            root,
+            RecordedLandlock::new(handled, rules).expect("recorded landlock"),
+        )
+    }
+
+    /// SUP-6・CORE-5・SEC-1・TASK-163 追補・#1468: exec の Landlock は記録のルールだけから作る。
+    /// `config.json` に無いルールでも記録にあればそのまま載り（launch の後に config が変わっても影響しない）、
+    /// 記録の handled も変えない。準備は `config` を引数に取らない。
+    #[test]
+    fn sup6_task163_1468_landlock_is_built_from_the_record_not_from_config() {
+        let launch = hand_made_record(identity_of(Path::new("/")), 0xFFFF);
+        match prepare_with_launch(&launch, launch.root(), Rlimits::default(), own_binding()) {
+            Ok(r) => {
+                let rules: Vec<(&str, u64)> = r
+                    .landlock
+                    .rules()
+                    .iter()
+                    .map(|rule| (rule.path.as_str(), rule.allowed.bits()))
+                    .collect();
+                assert_eq!(rules, vec![("/", 0x7), ("/only-in-record", 0x1)]);
+                assert_eq!(r.landlock.handled_access_fs().bits(), 0xFFFF);
+                assert_eq!(r.root, launch.root());
+            }
+            // Landlock 未対応のカーネルでは検出で拒否される（fail-closed）。
+            Err(e) => assert_eq!(e.stage, IsolationStage::Landlock),
+        }
+    }
+
+    /// SUP-6・SEC-1・SEC-4・#1468: 記録した `/` が自プロセスの `/` と同じ（壊れた記録・ホストの `/` を指す記録）なら、
+    /// 違反 `rootfs_is_host_root` で拒否する。
+    #[test]
+    fn sup6_task163_1468_recorded_root_equal_to_own_root_is_rejected() {
+        let own = dir_fd(Path::new("/"));
+        let e = reject_recorded_own_root(identity_of(Path::new("/")), own.as_fd())
+            .expect_err("own root");
+        assert_eq!(e.code, ErrorCode::InvalidArgument);
+        assert_eq!(e.stage, IsolationStage::Validate);
+        let v = e.violation.expect("violation recorded");
+        assert_eq!(v.reason.as_str(), "rootfs_is_host_root");
+        let dir = temp_dir("recorded-own");
+        reject_recorded_own_root(identity_of(&dir), own.as_fd()).expect("different directory");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SUP-6・SEC-1・#1468: 参加後の `/` の照合は記録した識別子との `st_dev`・`st_ino` の一致で決まる。
+    /// ホスト側の bundle ディレクトリ（`/` と別のディレクトリ）の識別子とは一致しない。
+    #[test]
+    fn sup6_task163_1468_open_verified_root_compares_recorded_identity() {
+        let root = identity_of(Path::new("/"));
+        assert!(open_verified_root(root).is_ok());
+        let other = RootIdentity::new(root.dev(), root.ino().wrapping_add(1));
+        let e = open_verified_root(other).expect_err("different inode");
+        assert_eq!(e.stage, IsolationStage::SetNs);
+        let v = e.violation.expect("violation recorded");
+        assert_eq!(v.reason, ViolationReason::ExecRootNotContainerRootfs);
+        let dir = temp_dir("verified-root");
+        let e = open_verified_root(identity_of(&dir)).expect_err("host directory");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            e.message,
+            "the root directory after joining is not the recorded container rootfs"
+        );
     }
 
     /// SUP-6・TASK-163.3: `Debug` は fd・ルール内容を出さず、pid だけを示す。
@@ -1761,12 +2244,13 @@ mod tests {
         (bundle, rootfs)
     }
 
-    /// 固定済みの rootfs の複製（`prepare_exec_restrictions` が行うのと同じ）。
-    fn pinned_fd(rootfs: &RootfsDir) -> OwnedFd {
-        rootfs
-            .as_fd()
-            .try_clone_to_owned()
-            .expect("duplicate rootfs")
+    /// launch の代わりに、`config` から導いた ruleset と固定済み rootfs の識別子で記録を作る
+    /// （`launch_isolation_from_bundle` と同じ。Landlock 未対応のカーネルでは `Err`）。
+    fn launch_record(
+        config: &OciConfig,
+        rootfs: &RootfsDir,
+    ) -> Result<LaunchIsolationRecord, ExecError> {
+        crate::exec::launch_isolation_from_bundle(config, rootfs)
     }
 
     fn config(readonly: bool, mounts: &str) -> OciConfig {
@@ -1776,15 +2260,13 @@ mod tests {
         crate::oci_runtime::parse_config_bytes(json.as_bytes()).expect("config")
     }
 
-    /// SUP-6・TASK-163.3・CORE-5: 書き込み制限が祖先ルールで無効になる構成は、準備が `stage = Landlock` で
-    /// 拒否する。ABI 検出が通らない環境では検出失敗で拒否される（どちらも fail-closed で成功しない）。
+    /// SUP-6・TASK-163.3・CORE-5・#1468: 書き込み制限が祖先ルールで無効になる構成は、launch の記録の作成が
+    /// `stage = Landlock` で拒否する（記録を作れないので exec の準備まで進まない）。ABI 検出が通らない環境では検出失敗で拒否される（どちらも fail-closed で成功しない）。
     #[test]
     fn sup6_task163_3_prepare_rejects_shadowed_write_restriction() {
         let c = config(false, r#"[{"destination":"/etc","options":["ro"]}]"#);
         let (bundle, rootfs) = pinned_rootfs("shadowed", &c);
-        let e = prepare_with_rootfs(&c, pinned_fd(&rootfs), Rlimits::default(), own_binding())
-            .map(|_| ())
-            .expect_err("must be rejected");
+        let e = launch_record(&c, &rootfs).expect_err("must be rejected");
         let _ = std::fs::remove_dir_all(&bundle);
         assert_eq!(e.stage, IsolationStage::Landlock);
         const DETECT: [&str; 6] = [
@@ -1811,8 +2293,9 @@ mod tests {
     fn sup6_task163_3_prepare_records_pid_and_reads_threads() {
         let c = config(true, "[]");
         let (bundle, rootfs) = pinned_rootfs("records", &c);
-        let prepared =
-            prepare_with_rootfs(&c, pinned_fd(&rootfs), Rlimits::default(), own_binding());
+        let prepared = launch_record(&c, &rootfs).and_then(|launch| {
+            prepare_with_launch(&launch, launch.root(), Rlimits::default(), own_binding())
+        });
         let _ = std::fs::remove_dir_all(&bundle);
         match prepared {
             Ok(mut r) => {
@@ -1836,8 +2319,9 @@ mod tests {
             &format!(r#"[{{"destination":"{dest}","options":["ro"]}}]"#),
         );
         let (bundle, rootfs) = pinned_rootfs("unresolved", &c);
-        let prepared =
-            prepare_with_rootfs(&c, pinned_fd(&rootfs), Rlimits::default(), own_binding());
+        let prepared = launch_record(&c, &rootfs).and_then(|launch| {
+            prepare_with_launch(&launch, launch.root(), Rlimits::default(), own_binding())
+        });
         let _ = std::fs::remove_dir_all(&bundle);
         match prepared {
             Ok(r) => {

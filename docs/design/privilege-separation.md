@@ -1,8 +1,8 @@
-# 権限分離方式の比較と必要最小権限（設計ドラフト）
+# 権限分離方式の比較と必要最小権限（方式承認済み）
 
 sudo＋pty に頼らない権限昇格方式（setuid バイナリ・capability ベース）の選択肢と、本リポが rootful で必要とする最小権限を整理する（SUP-14）。
 
-> **位置づけ**: 本書はドラフトであり、採否を確定しない。9 章の採用方式案は推奨にすぎず、ユーザーの承認は未取得である。方式の承認が記録されるまで、TASK-171.1.2（#858）のうち昇格を実際に行う syscall 経路には着手しない（方式非依存の純ロジック〔必要最小集合・`/proc/<pid>/status` の検証・縮退計画〕は実装済みで、境界は 10 章末尾の補足を参照）。`docs/design/rootless-network.md` と同じ扱いで、本書は判断材料である。
+> **位置づけ**: 方式は承認済み（オーナー判断 2026-10-10・[#1454](https://github.com/Fandhe-AI/fandhe-container/issues/1454)）。(c) 特権ランチャー＋ ambient capability を既定とし、xattr 非対応の環境に限り (a) setuid root を代わりに認める。どちらも失敗したら fail-closed にし、sudo へは戻らない。`unsafe` の syscall ラッパーは `crates/supervisor/src/sys`（Linux 版）に置く（事前承認の範囲）。ランチャーは `crates/supervisor` の bin（`fandhe-container-launcher`）とし、実装は #1719 で行う。9 章を採用方式として更新した。縮退の適用と読み戻し検証は TASK-171.1.3（#1475）で `privilege::elevate` として実装済みで、境界は 10 章末尾の補足を参照。
 
 - 対象ビヘイビア: SUP-14（Must・確定。関連: SUP-1・CORE-1・CORE-5・CORE-6・SEC-1・SEC-5・PLUG-11・ERR-1・REPAIR-5・D-19）
 - タスク: TASK-171（MS-9・G12・担当: 共同）。本書は TASK-171.1.1（#857。親 #536・#535）
@@ -116,11 +116,15 @@ TASK-171 の成果物は `crates/supervisor/src/privilege.rs`（仮称）だが�
 | `unsafe` ラッパーの置き場所 | supervisor の `sys`／ core の `sys` を再利用 | 事前承認は各 crate の `sys` モジュール内に限る（coding-rust.md）。`sys` 外の `unsafe` は 1 件ずつ承認が必要 |
 | 特権の分割 | supervisor が集合を保持／短命の特権ヘルパーへ分離 | restart 時に再昇格が要るか。分離すると 5 章の保持期間を短くできるが、境界が増える |
 
-## 9. 採用方式案（推奨。ユーザー承認待ち）
+## 9. 採用方式（承認済み。#1454・2026-10-10）
 
-推奨: **(c) 特権ランチャー＋ ambient capability**（フォールバックとして xattr 非対応環境向けに (a) を許容）。
+採用: **(c) 特権ランチャー＋ ambient capability**（xattr 非対応環境に限り (a) setuid root を代替として認める）。配置は 8 章の論点に対して次のとおり確定した。
 
-理由:
+- 特権を持つバイナリ: `crates/supervisor` の bin（`fandhe-container-launcher`。新 crate は作らない。実装は #1719）
+- `unsafe` ラッパー: supervisor の `sys`（Linux 版）に置く。core の `sys` の同等関数は `pub(crate)` のため重複を許容する
+- 特権の分割: 本方式では supervisor が集合を保持する（短命の特権ヘルパーへの分離は未採用）
+
+採用理由:
 
 - 特権付きファイル属性を持つバイナリを最小のランチャー 1 つに限定でき、supervisor 本体はコピー・更新の自由度を保てる（3 章比較）
 - uid 0 にならず、4 章の集合だけを保持できる（(a) は縮退を誤ると全権限が残る）
@@ -133,22 +137,21 @@ TASK-171 の成果物は `crates/supervisor/src/privilege.rs`（仮称）だが�
 - 現状の暫定（sudo＋`setsid`）: sudo と pty に依存し続ける
 - (c) の欠点（ambient の子への継承）は 5 章の手順で落とす。取りこぼしがないことは #538・#539 の実機検証が必要で、本書では確認していない
 
-これは推奨であり、方式の承認は未取得である。承認は #857 へのコメントで記録する運用を案とする。なお人間担当ツリー #812 配下には、方式選定の承認そのものを記録する issue が見当たらない（#539 は実装後のレビュー）。起票の要否はユーザー判断とする。
+方式の承認は #1454 のオーナー判断（2026-10-10）で記録済み。
 
 ## 10. #858 以降への引き継ぎ
 
 ユーザー承認が必要な項目:
 
-- 方式そのもの（9 章）
 - `sys` モジュール外の `unsafe` が必要になった場合の 1 件ごと
-- 特権バイナリの crate 配置・新 crate の追加（8 章）
+- 新 crate の追加（ランチャーは supervisor の bin で新 crate は作らない方針。変更する場合）
 - 新規依存（必要になった場合）・root 権限コマンドの実行
 
 補足:
 
-- 方式非依存の純ロジック（必要最小集合・`/proc/<pid>/status` のパースと昇格結果の fail-closed 検証・縮退計画の算出。縮退後は uid・gid 0 と補助グループの残存も拒否し、補助グループは空のみ許可する。縮退計画は 5 章 4 のとおり uid 遷移がある場合に `PR_SET_KEEPCAPS` の設定と解除を対で含み、解除を最終手順とする。検証は `PR_GET_KEEPCAPS` の読み戻し結果を入力に取り、残存・未確認を拒否する）は `crates/supervisor/src/privilege.rs` に実装済み（TASK-171.1.2・#858）。昇格を実際に行う syscall 経路（ambient 載せ・`capset`・bounding 削除・setuid フォールバック・`PR_SET_KEEPCAPS` の設定 / 解除 / 読み戻し・fd 検証付き exec）は方式の承認待ちで未実装であり、`elevate` は `UNIMPLEMENTED` を返すスタブである
+- 方式非依存の純ロジック（必要最小集合・`/proc/<pid>/status` のパースと昇格結果の fail-closed 検証・縮退計画の算出。縮退後は uid・gid 0 と補助グループの残存も拒否し、補助グループは空のみ許可する。縮退計画は 5 章 4 のとおり uid 遷移がある場合に `PR_SET_KEEPCAPS` の設定と解除を対で含み、解除を最終手順とする。検証は `PR_GET_KEEPCAPS` の読み戻し結果を入力に取り、残存・未確認を拒否する）は `crates/supervisor/src/privilege.rs` に実装済み（TASK-171.1.2・#858）。縮退を実際に適用する `privilege::elevate`（単一スレッドの確認 → 方式の前提確認 → `plan_reduction` → `ReductionPlan::steps` の順に適用〔補助グループ消去・`setresgid`・bounding 削除・`PR_SET_KEEPCAPS`・`setresuid`・`capset`・ambient 載せ〕→ `PR_GET_KEEPCAPS` と `/proc/self/status` の読み戻し → `verify_elevation`）は TASK-171.1.3（#1475）で実装済み。どの段で失敗しても `Err` を返し、`Err` のときプロセスは部分的に縮退した状態にあるため、呼び出し元は exec も特権操作もせず非ゼロで終了する。目標の uid / gid は呼び出し元の real から決める。方式 (c) の file capability には最小集合に加えて、補助グループを持つ利用者向けに `CAP_SETGID`（effective）が要る。未実装は、fd 検証付き exec・引数 / 環境変数 / cwd / 継承 fd の入口検証・ランチャー bin（#1719）、file capability / setuid の付与（#1721）、子での ambient 解除（#537 以降）である。実機の縮退試験は `crates/supervisor/tests/privilege_elevate.rs`（`-- --ignored`。実行は #539）
 - setuid ビット・`setcap` の付与はインストール時の操作でコード外である
-- 事前承認の範囲は各 crate の `sys` モジュール内の syscall ラッパーに限られる
+- 事前承認の範囲は各 crate の `sys` モジュール内の syscall ラッパーに限られる（`elevate` のラッパーは `crates/supervisor/src/sys/linux.rs`。#1719 の `execveat` 等も同じ `sys` に足す）
 - 実機検証（sudo の `SIGKILL` 再現・昇格の実動作）は #538・#539 で扱い、本書の範囲外とする
 
 ## 11. 参照

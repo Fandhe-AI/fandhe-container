@@ -58,10 +58,20 @@ fn sup14_task171_1_2_full_privileges_are_rejected() {
 }
 
 #[test]
-fn sup14_task171_1_2_elevate_stub_reports_unimplemented() {
+fn sup14_task171_1_3_elevate_refuses_without_changing_anything() {
     let e = elevate(PrivilegeMethod::LauncherAmbient).unwrap_err();
-    assert_eq!(e.code, ErrorCode::Unimplemented);
-    assert_eq!(e.reason, PrivilegeErrorReason::Unimplemented);
+    // Linux の libtest は複数スレッドのため、何も変更せず単一スレッド要件で拒否される。
+    // 非 Linux では SUP-14 の対象外のため Unimplemented（実機の縮退は privilege_elevate.rs）。
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.reason, PrivilegeErrorReason::MultiThreaded);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert_eq!(e.code, ErrorCode::Unimplemented);
+        assert_eq!(e.reason, PrivilegeErrorReason::Unimplemented);
+    }
 }
 
 /// SUP-14: 権限保持設定（`PR_SET_KEEPCAPS`）が残る・未確認の縮退結果は、capability が最小集合ちょうどでも拒否する。

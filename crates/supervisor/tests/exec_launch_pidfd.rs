@@ -60,6 +60,38 @@ mod linux {
         println!("exec_launch_pidfd: all scenarios passed");
     }
 
+    /// launch 時の分離の記録（rootfs だけのルール。識別子は具体値。TASK-163 追補・#1468）。
+    fn launch_isolation() -> fandhe_container_core::launch_isolation::LaunchIsolationRecord {
+        use fandhe_container_core::launch_isolation::{
+            LaunchIsolationRecord, RecordedLandlock, RecordedRule, RecordedTarget, RootIdentity,
+        };
+        LaunchIsolationRecord::from_parts(
+            RootIdentity::new(44, 1234),
+            RecordedLandlock::new(0xFFFF, vec![RecordedRule::new(RecordedTarget::Root, 0x7)])
+                .expect("recorded landlock"),
+        )
+    }
+
+    /// 全 16 種の launch 記録（`Nofile` は (700, 1500)、他は種別の添字から決める具体値。TASK-169 追補・#1467）。
+    fn full_rlimits() -> fandhe_container_core::rlimits::Rlimits {
+        use fandhe_container_core::rlimits::{Rlimit, RlimitKind, Rlimits};
+        Rlimits::new(
+            RlimitKind::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(i, k)| {
+                    let (soft, hard) = if k == RlimitKind::Nofile {
+                        (700, 1500)
+                    } else {
+                        (i as u64, 100 + i as u64)
+                    };
+                    Rlimit::new(k, soft, hard).expect("rlimit")
+                })
+                .collect(),
+        )
+        .expect("rlimits")
+    }
+
     fn record(pid: u32, with_cgroup: bool) -> StateRecord {
         let id = ContainerId::new("c1").unwrap();
         let rec = StateRecord::new(
@@ -68,6 +100,9 @@ mod linux {
             StateRevision::from_raw(1),
         )
         .unwrap();
+        let rec = rec
+            .with_rlimits(full_rlimits())
+            .with_launch_isolation(launch_isolation());
         if with_cgroup {
             rec.with_cgroup(CgroupPlacement::new(
                 CgroupScope::new("/user.slice/x.scope").unwrap(),
@@ -104,6 +139,8 @@ mod linux {
     }
 
     /// 記録 pid が一致すれば pidfd の照合を通り、次段の入れ子の PID 1 の検査で拒否する（順序の証明）。
+    /// 外側の PID namespace に残る子（中間プロセスの代わり）を記録 pid にした場合も同じ拒否になる
+    /// （記録 pid は PID 1 を指す契約。#1463・SUP-6）。
     fn matching_record_pid_reaches_nested_pid1_check(
         child: &ContainerChild,
         pidfd: std::os::fd::BorrowedFd<'_>,

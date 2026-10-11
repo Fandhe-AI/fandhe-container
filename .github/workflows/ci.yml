@@ -173,9 +173,12 @@ jobs:
       # トレードオフを埋める。値を上げる場合は scripts/versions.sh・Dockerfile 側も同時に
       # 更新し、3 箇所の整合をレビューで確認する）
       cargo-deny-version: "0.20.2"
-      # cargo レジストリ・target の cache（reusable 側のオプトイン入力。
-      # key は `**/Cargo.lock` のハッシュに加え `runner.os` を含む形で reusable
-      # workflow 側が OS ごとに分離する）。ホステッド runner は毎回まっさらなため、
+      # cargo レジストリ・target の cache（reusable 側のオプトイン入力）。clippy / test の key は
+      # reusable workflow 側が決める（ハッシュはルートの Cargo.lock だけ）:
+      # `<cache-key-prefix>-<runner.os>-{clippy,test}-v4-<rustc の release>-<commit-hash>-<hashFiles('Cargo.lock')>`
+      # key は Cargo.toml の `[profile]` 等を含まないため、それらを変えたら
+      # マージ後に main の `fandhe-container-Linux-{clippy,test}-v4-*` を削除する
+      # （github-actions.md「キャッシュ方針」）。ホステッド runner は毎回まっさらなため、
       # 無効のままだと各ジョブが依存クレートを毎回フルビルドすることになる。
       # cache-key-prefix は他リポジトリとの衝突回避のため本リポ名にする。
       # 以前は windows-latest のみ無効化していた（reusable の prune ステップが Windows で
@@ -183,6 +186,11 @@ jobs:
       # 条件式は不要になった
       cache: true
       cache-key-prefix: fandhe-container
+      # cache の保存は main への push だけにし、PR は restore のみにする
+      # （Fandhe-AI/actions#165 の入力）。PR スコープの blob が main と同内容で重複保存され、
+      # リポジトリの上限 10 GB を圧迫していたため（github-actions.md「キャッシュ方針」）。
+      # 本 workflow は push（main）でも走り、そこで保存した blob を PR が restore-keys で読む
+      cache-save: ${{ github.ref == 'refs/heads/main' }}
 
   # --------------------------------------------------
   # platform-ci（ネイティブのビルド・テスト・タイムアウト保護付き結合試験。REPAIR-7 ステージ 1〜3）
@@ -802,8 +810,9 @@ jobs:
           # 最後の成功行だけでなく、各シナリオの成功行をすべて照合する（シナリオが黙って外れた場合を
           # 成功にしない。TASK-163 追補・#1460）。
           for line in \
-            'exec_setns_join: target in another user namespace rejected' \
+            'exec_setns_join: rootless join into the target user namespace verified' \
             'exec_setns_join: root after joining a pivoted target equals the pinned rootfs' \
+            'exec_setns_join: root after joining a mount-namespace-built rootfs equals the recorded root' \
             'exec_setns_join: supplementary groups kept and recorded where setgroups is denied' \
             'exec_setns_join: namespace join verified'; do
             if ! grep -Fxq "${line}" "${log}"; then

@@ -112,6 +112,12 @@ impl AccessFs {
         self.0
     }
 
+    /// ビット値から作る。既知の 16 ビットの外を含む値は `None`（`state.json` の launch 記録を untrusted として
+    /// 読み戻すときの検証。TASK-163 追補・#1468）。
+    pub(crate) fn from_bits(bits: u64) -> Option<Self> {
+        (bits & !Self::ALL.0 == 0).then_some(Self(bits))
+    }
+
     /// `other` のすべてのビットを含むか。
     pub fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
@@ -144,7 +150,7 @@ impl AccessFs {
 }
 
 /// ABI ごとの handled access（ルールに無い権利は既定拒否になる）。
-fn handled_for_abi(abi: u32) -> AccessFs {
+pub(crate) fn handled_for_abi(abi: u32) -> AccessFs {
     let mut h = AccessFs(0x1FFF);
     if abi >= 2 {
         h = h.union(AccessFs::REFER);
@@ -241,6 +247,20 @@ impl LandlockRuleset {
     pub(crate) fn for_observation(abi: u32, rules: Vec<PathRule>) -> Self {
         Self {
             handled_access_fs: handled_for_abi(abi),
+            rules,
+            shadowed: Vec::new(),
+        }
+    }
+
+    /// launch 時に記録した handled access とルールから組み直す（exec の再適用用。TASK-163 追補・#1468）。
+    ///
+    /// ABI の再検出も `config.json` の再解釈もしない。今のカーネルの ABI から handled を計算し直すと、launch の
+    /// handled に無かった権利が無制限になり launch と意味が変わるため、**記録した `handled` をそのまま使う**。
+    /// `shadowed` は適用に使わない監査用の情報なので空にする。入力の検証は呼び出し側
+    /// （`launch_isolation::RecordedLandlock::validate`）が済ませている前提。
+    pub(crate) fn from_recorded(handled: AccessFs, rules: Vec<PathRule>) -> Self {
+        Self {
+            handled_access_fs: handled,
             rules,
             shadowed: Vec::new(),
         }

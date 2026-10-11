@@ -109,7 +109,7 @@
 //!   別マウントであること・自分のマウントそのものであること）で事後検証する
 //! - **`gid=` の決定**: [`DevptsGidSource`] で呼び出し元が申告する（基本デバイスの供給方式と同じ入力）。rootful は常に 5、rootless は検証済みの gid の
 //!   写像でコンテナ内 gid 5 が写像されているときだけ 5、いなければ `gid=` を渡さない（判断 3）。省いたときは
-//!   固定語彙の構造化ログを標準エラーへ 1 行出し、[`DevptsOutcome::gid`] も `None` になる。申告がずれても
+//!   固定語彙の構造化ログを待たない出力経路（`exec::diagnostic` の表。AF_UNIX の socket 以外では捨てる）で 1 行出し、[`DevptsOutcome::gid`] も `None` になる。申告がずれても
 //!   緩む方向には働かない（rootless で `Rootful` を渡せばカーネルが `EINVAL` で拒否し、rootful で `Rootless` を
 //!   渡せば `gid=` が付かないだけ）
 //! - **`ptmx` は完全一致のみ受け入れる**: devpts のマウント後に `ptmx` → `pts/ptmx` を default symlink と同じ
@@ -291,15 +291,16 @@ fn devpts_gid(source: DevptsGidSource<'_>) -> sys::DevptsGid {
 }
 
 /// `gid=` を省いたときに出す構造化ログの 1 行（固定の語彙と数値だけ。利用者の値・パスは含めない）。
-fn devpts_gid_omitted_log_line() -> &'static str {
+pub(super) fn devpts_gid_omitted_log_line() -> &'static str {
     r#"{"event":"devpts_gid_omitted","container_gid":5,"reason":"rootless_gid_unmapped"}"#
 }
 
 #[cfg(not(test))]
 fn emit_devpts_gid_omitted() {
-    use std::io::Write as _;
-    // 書き込みの失敗でコンテナの起動を止めない（診断用のログのため結果は捨てる）。
-    let _ = writeln!(std::io::stderr(), "{}", devpts_gid_omitted_log_line());
+    // 待たない出力経路（`exec::diagnostic`）で 1 回だけ出す。stderr が満杯の pipe でも止まらず、AF_UNIX の socket
+    // 以外へは書かずに捨てる（#1697・REPAIR-5）。結果を返す先が無い子（PID 1）の側であり、診断用のログのため
+    // 失敗・破棄でコンテナの起動を止めない。省略した事実は `DevptsOutcome::gid` でも観測できる。
+    let _ = super::emit_diagnostic_line(devpts_gid_omitted_log_line());
 }
 
 /// dry-run: 標準エラーへは出さず、出力した事実を記録する。

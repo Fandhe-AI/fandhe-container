@@ -179,7 +179,7 @@ path_is_symlink_free() {
 
 # ツール確認は入力検証より先に行い、未導入を別の失敗と誤分類しない。
 if ! run_limited 30 "$cargo" about --version >/dev/null 2>&1; then
-    err tool-missing "cargo-about is not installed (run `make install-cargo-about`)"
+    err tool-missing "cargo-about is not installed (run: make install-cargo-about)"
     exit 2
 fi
 

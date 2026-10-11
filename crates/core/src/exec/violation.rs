@@ -15,9 +15,10 @@
 //! 監査イベントへの写像は [`IsolationViolation::exec_audit_event`]（SUP-6・TASK-163 追補・#1465）で実装済み。
 //! エントリポイント検証の拒否（種別 `entrypoint` の 8 理由。launch と exec の子が共有する）から `Entrypoint`
 //! 監査イベントへの写像は [`IsolationViolation::entrypoint_audit_event`]（SEC-4・SUP-6・SEC-1・TASK-163 追補・#1595）。
-//! supervisor の exec の worker が返し得る違反（[`ViolationReason::EXEC_WORKER_REASONS`]。種別 `exec_target` の 10 理由と
-//! 種別 `rootfs_pivot` の `rootfs_is_host_root`）から監査イベントへの写像は [`ViolationReason::exec_worker_audit_event`]
-//! （`exec_target` は `ExecTarget`、`rootfs_is_host_root` は `mount_audit_event` と同じ `Mount` のパスなし・理由コードつき。#1614 の事後監査）。
+//! supervisor の exec の worker が返し得る違反（[`ViolationReason::EXEC_WORKER_REASONS`]。種別 `exec_target` の 10 理由、
+//! 種別 `rootfs_pivot` の `rootfs_is_host_root`、bundle の rootfs の固定が運ぶ種別 `mount_target` の
+//! `path_symlink_or_not_directory`・`path_missing`）から監査イベントへの写像は [`ViolationReason::exec_worker_audit_event`]
+//! （`exec_target` は `ExecTarget`、他の 3 理由は `mount_audit_event` と同じ `Mount` のパスなし・理由コードつき。#1614 の事後監査・#1702）。
 //! ファイルへの永続化（TASK-41.5.1・#839）とカーネル監査フォールバック（#840）も `audit_log` に実装済みで、
 //! 本モジュールの記録を実際の sink へ流す本番経路（launcher・CLI への配線）は未実装
 //! （REPAIR-3: 実装済みを装わない）。
@@ -307,10 +308,12 @@ impl ViolationReason {
     ///
     /// supervisor の親プロセスが worker の結果行（`err` 行）の `<種別>/<理由>` を引き直す許可リストの SSOT。
     /// [`Self::EXEC_TARGET_REASONS`] の 10 理由と、`prepare_exec_restrictions` の `reject_own_root` が返す
-    /// 種別 `rootfs_pivot` の `rootfs_is_host_root`（worker 自身の `/` が bundle の rootfs と同じディレクトリ）から成る。
+    /// 種別 `rootfs_pivot` の `rootfs_is_host_root`（worker 自身の `/` が bundle の rootfs と同じディレクトリ）、
+    /// bundle の rootfs の固定（`oci_runtime::RootfsDir::pin`）が検証後の差し替えで拒否する種別 `mount_target` の
+    /// `path_symlink_or_not_directory`・`path_missing`（`RootfsPinError` が運ぶ。#1702）から成る。
     /// 一覧と worker の経路のソースが作る理由の一致は `exec/violation_scan.rs` の単体テストが固定する。
     /// exec の子が `execve` 前に報告する違反（種別 `entrypoint`）は `ok` 行の `SetupFailed` で運ばれるためここに含めない。
-    pub const EXEC_WORKER_REASONS: [ViolationReason; 11] = [
+    pub const EXEC_WORKER_REASONS: [ViolationReason; 13] = [
         Self::ExecTargetNotNestedPid1,
         Self::ExecTargetCgroupMismatch,
         Self::ExecTargetSharesPidNamespace,
@@ -322,6 +325,8 @@ impl ViolationReason {
         Self::ExecJoinedCgroupMismatch,
         Self::ExecTargetPidfdMismatch,
         Self::RootfsIsHostRoot,
+        Self::PathSymlinkOrNotDirectory,
+        Self::PathMissing,
     ];
 
     /// worker の結果行の種別名 `kind` と理由コード `reason` から理由を引き直す（許可リスト照合。SEC-4・SUP-6）。
@@ -340,14 +345,16 @@ impl ViolationReason {
     /// [`Self::EXEC_WORKER_REASONS`] の理由だけが対象で、それ以外は `None`。種別 `exec_target` は
     /// [`Self::exec_target_audit_event`] と同じ `ExecTarget`、種別 `rootfs_pivot` は
     /// [`IsolationViolation::mount_audit_event`] と同じ層 `Mount` へ写す（理由コードだけを持つ呼び出し側のため
-    /// パスなし・理由コードつき。#1701）。1 理由が写る層は 1 つだけ（二重に記録しない）。
+    /// パスなし・理由コードつき。#1701）。種別 `mount_target`（bundle の rootfs の固定の差し替え検出。#1702）も同じ。1 理由が写る層は 1 つだけ（二重に記録しない）。
     pub fn exec_worker_audit_event(self) -> Option<AuditEvent> {
         if !Self::EXEC_WORKER_REASONS.contains(&self) {
             return None;
         }
         match self.kind() {
             ViolationKind::ExecTarget => self.exec_target_audit_event(),
-            ViolationKind::RootfsPivot => self.mount_layer_audit_event(None),
+            ViolationKind::RootfsPivot | ViolationKind::MountTarget => {
+                self.mount_layer_audit_event(None)
+            }
             _ => None,
         }
     }
@@ -1316,11 +1323,11 @@ mod tests {
         );
     }
 
-    /// SEC-4・SUP-6・SEC-1: worker の経路の 11 理由は `<種別>/<理由>` で往復でき、層は exec_target か mount の
+    /// SEC-4・SUP-6・SEC-1: worker の経路の 13 理由は `<種別>/<理由>` で往復でき、層は exec_target か mount の
     /// どちらか 1 つだけ（パスなし）。一覧外・種別の食い違い・未知は引けず、監査イベントも作らない。
     #[test]
     fn sec4_sup6_exec_worker_token_allowlist_maps_each_reason_to_one_layer() {
-        assert_eq!(ViolationReason::EXEC_WORKER_REASONS.len(), 11);
+        assert_eq!(ViolationReason::EXEC_WORKER_REASONS.len(), 13);
         for r in ViolationReason::EXEC_TARGET_REASONS {
             assert!(ViolationReason::EXEC_WORKER_REASONS.contains(&r), "{r:?}");
         }
@@ -1333,7 +1340,7 @@ mod tests {
                 ViolationKind::ExecTarget => AuditEvent::ExecTarget {
                     reason: AuditReason::new(r.as_str()),
                 },
-                ViolationKind::RootfsPivot => AuditEvent::Mount {
+                ViolationKind::RootfsPivot | ViolationKind::MountTarget => AuditEvent::Mount {
                     path: None,
                     reason: Some(AuditReason::new(r.as_str())),
                 },
@@ -1472,8 +1479,8 @@ mod tests {
         }
     }
 
-    /// SEC-4・SUP-6・SEC-1: worker の経路の 11 理由はそれぞれ 1 件だけ記録される（exec 対象は層 exec_target と理由
-    /// コード、`rootfs_is_host_root` は層 mount で理由コードつき。どちらもパスなし）。一覧外は 0 件、失敗でも error は不変。
+    /// SEC-4・SUP-6・SEC-1: worker の経路の 13 理由はそれぞれ 1 件だけ記録される（exec 対象は層 exec_target と理由
+    /// コード、`rootfs_is_host_root` と rootfs の固定の 2 理由〔#1702〕は層 mount で理由コードつき。どちらもパスなし）。一覧外は 0 件、失敗でも error は不変。
     #[test]
     fn sec4_sup6_record_exec_worker_rejection_records_once_per_reason() {
         use crate::audit_log::mount::tests::VecSink;
@@ -1487,10 +1494,9 @@ mod tests {
             assert_eq!(out.error, "rejected");
             let recs = sink.snapshot();
             assert_eq!(recs.len(), 1, "{r:?}");
-            let layer = if r == ViolationReason::RootfsIsHostRoot {
-                AuditLayer::Mount
-            } else {
-                AuditLayer::ExecTarget
+            let layer = match r.kind() {
+                ViolationKind::ExecTarget => AuditLayer::ExecTarget,
+                _ => AuditLayer::Mount,
             };
             assert_eq!(recs[0].layer(), layer, "{r:?}");
             assert_eq!(recs[0].reason().map(AuditReason::as_str), Some(r.as_str()));

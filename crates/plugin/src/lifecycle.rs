@@ -101,7 +101,7 @@ use crate::signal_forward::{PLUGIN_REGISTRY, Registry, SlotToken};
 use crate::transport::{RpcTimeout, UdsListener};
 pub use drop_report::{
     ChildCleanupFailure, DROP_REPORT_CAPACITY, PendingChildCleanup,
-    take_pending_child_cleanup_failures,
+    take_pending_child_cleanup_failures, write_stderr_nonblocking,
 };
 use drop_report::{GLOBAL_TABLE, record_drop_failure};
 use std::ffi::OsString;
@@ -1846,15 +1846,22 @@ mod tests {
     /// 子の役を `stderr` を向け先に付けて再実行し、期限内の正常終了を確かめる。
     #[cfg(unix)]
     fn run_roundtrip_child(stderr: Stdio) {
+        run_child_role(
+            "lifecycle::tests::repair4_drop_report_roundtrip_child_role",
+            DROP_REPORT_CHILD_ENV,
+            "1",
+            stderr,
+        );
+    }
+
+    /// テスト名 `test` の子の役を、環境変数 `env`=`value` と `stderr` の向け先を付けて再実行し、期限内の
+    /// 正常終了を確かめる（子の役の assert が失敗すれば非ゼロ終了で検出する）。
+    #[cfg(unix)]
+    fn run_child_role(test: &str, env: &str, value: &str, stderr: Stdio) {
         let exe = std::env::current_exe().unwrap();
         let mut child = Command::new(exe)
-            .args([
-                "--exact",
-                "lifecycle::tests::repair4_drop_report_roundtrip_child_role",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(DROP_REPORT_CHILD_ENV, "1")
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(env, value)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(stderr)
@@ -1942,6 +1949,114 @@ mod tests {
             only_cleanup_lines(&text),
             vec![GROUP_KILL_FAILED_LINE.to_string()]
         );
+    }
+
+    #[cfg(unix)]
+    const NONBLOCKING_CHILD_ENV: &str = "FANDHE_STDERR_NONBLOCKING_CHILD_1673";
+    #[cfg(unix)]
+    const NONBLOCKING_MARKER: &[u8] = b"{\"event\":\"nonblocking_marker_1673\"}\n";
+
+    /// `write_stderr_nonblocking` の子の役（環境変数が無ければ何もしない）。値で期待する結果を受け取り、
+    /// 1 回だけ書いて期限内に戻ることと結果の種別を確かめる（#1673・REPAIR-5）。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_write_stderr_nonblocking_child_role() {
+        let Some(expect) = std::env::var_os(NONBLOCKING_CHILD_ENV) else {
+            return;
+        };
+        let start = Instant::now();
+        let r = write_stderr_nonblocking(NONBLOCKING_MARKER);
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_secs(5), "write took {elapsed:?}");
+        match expect.to_str() {
+            Some("written") => assert_eq!(r.unwrap(), NONBLOCKING_MARKER.len()),
+            Some("would_block") => assert_eq!(r.unwrap_err().kind(), io::ErrorKind::WouldBlock),
+            Some("unsupported") => assert_eq!(r.unwrap_err().kind(), io::ErrorKind::Unsupported),
+            other => panic!("unknown expectation: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn run_nonblocking_child(expect: &str, stderr: Stdio) {
+        run_child_role(
+            "lifecycle::tests::repair5_write_stderr_nonblocking_child_role",
+            NONBLOCKING_CHILD_ENV,
+            expect,
+            stderr,
+        );
+    }
+
+    /// REPAIR-5・#1673: stderr が pipe なら、ブロックしない保証が無いため書かず `Unsupported`（どの unix も）。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_write_stderr_nonblocking_skips_pipe() {
+        use std::io::Read;
+        let (mut r, w) = io::pipe().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _reader = std::thread::spawn(move || {
+            let mut text = Vec::new();
+            let res = r.read_to_end(&mut text).map(|_| text);
+            let _ = tx.send(res);
+        });
+        run_nonblocking_child("unsupported", Stdio::from(w));
+        let text = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("pipe collection did not finish in time")
+            .unwrap();
+        let marker = &NONBLOCKING_MARKER[..NONBLOCKING_MARKER.len() - 1];
+        assert!(!text.windows(marker.len()).any(|w| w == marker));
+    }
+
+    /// REPAIR-5・#1673: stderr が AF_UNIX socket（Linux x86_64 / aarch64）なら 1 回で全文が届く。
+    #[cfg(all(
+        target_os = "linux",
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    #[test]
+    fn repair5_write_stderr_nonblocking_writes_unix_socket() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        let (a, mut b) = UnixStream::pair().unwrap();
+        b.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        run_nonblocking_child("written", Stdio::from(std::os::fd::OwnedFd::from(a)));
+        let mut text = Vec::new();
+        b.read_to_end(&mut text).unwrap();
+        let count = text
+            .windows(NONBLOCKING_MARKER.len())
+            .filter(|w| *w == NONBLOCKING_MARKER)
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    /// REPAIR-5・#1673: 読み手が読まず送信バッファが満杯の AF_UNIX socket（Linux x86_64 / aarch64）でも、
+    /// 待たずに `WouldBlock` で戻り、子は期限内に終了する（共有 fd の `O_NONBLOCK` は立てない）。
+    #[cfg(all(
+        target_os = "linux",
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    #[test]
+    fn repair5_write_stderr_nonblocking_does_not_block_on_full_socket() {
+        use std::os::unix::net::UnixStream;
+        let (a, b) = UnixStream::pair().unwrap();
+        // fd の状態を変えない `MSG_DONTWAIT` の送信で、`EAGAIN` になるまで満たす。上限は既定で数百 KiB の
+        // ため、100 万回で打ち切る（REPAIR-5）。
+        let chunk = [b'x'; 4096];
+        let mut last = Ok(0);
+        for _ in 0..1_000_000 {
+            last = crate::sys::write_nonblocking(&a, &chunk);
+            if last.is_err() {
+                break;
+            }
+        }
+        assert_eq!(last.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        run_nonblocking_child("would_block", Stdio::from(std::os::fd::OwnedFd::from(a)));
+        drop(b);
     }
 
     /// REPAIR-4・#1605: `Reap` から記録への写像と JSON 行の全文。

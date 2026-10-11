@@ -28,8 +28,8 @@ fn main() -> ExitCode {
     // 結果の前に改行で分離する（#1673）。
     let partial = pending.take_partial_write_mark();
     // 断片分離の改行・コマンド結果・延期した後始末の記録は、順序を保ったまま 1 つの別スレッドで書く。
-    // stderr が満杯の pipe / socket だと write が永久にブロックし得るため、main では一切 stderr へ書かず
-    // 有限の期限で待つ（REPAIR-5）。期限内に終わらなければスレッドを置き去りにして終了する
+    // stderr が満杯の pipe / socket だと write が永久にブロックし得るため、main ではブロックし得る書き込みを
+    // 一切せず有限の期限で待つ（REPAIR-5。スレッドを起動できないときの縮退出力もブロックしない 1 回の書き込みに限る）。期限内に終わらなければスレッドを置き去りにして終了する
     // （main の return でプロセスごと破棄される）。終了コードは書き込みの成否に依存させない。
     report_deferred(
         Report {
@@ -56,8 +56,9 @@ fn spawn_thread(job: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
 }
 
 /// 延期した記録を `write` で出す。別スレッドで書き有限の期限で待つ。スレッド起動に失敗したら
-/// 延期した記録は諦めるが、必須のコマンド結果（`code` / `message`）は `fallback` で呼び出し元のスレッドから書く
-/// （ERR 系の構造化エラー契約を保つ。#1673・REPAIR-4・REPAIR-5）。
+/// 延期した記録は諦め、`fallback` を呼び出し元のスレッドで実行する。`fallback` はブロックし得る書き込みを
+/// してはならない（本番の [`write_stderr_fallback`] は、ブロックしないと保証できる場合にだけ 1 回書く。
+/// #1673・REPAIR-4・REPAIR-5）。
 fn report_deferred<T: Send + 'static>(
     pending: T,
     timeout: Duration,
@@ -99,13 +100,31 @@ fn write_stderr(r: &Report) {
     let _ = r.pending.write_json_lines(&mut err);
 }
 
-/// スレッドを起動できなかったときの縮退出力。延期した記録は出さず、断片分離の改行とコマンド結果だけを書く。
+/// スレッドを起動できなかったときの縮退出力（main スレッドで呼ばれる）。延期した記録は出さず、断片分離の改行と
+/// コマンド結果（`code` / `message`）だけを、ブロックしないと保証できる場合にだけ 1 回で書く（#1673・REPAIR-5）。
+///
+/// 期限付きスレッドが無いため、通常の `write_all` は満杯の pipe / socket で無期限に止まり得る。そこで
+/// `fandhe_container_plugin::write_stderr_nonblocking` で 1 回だけ書く。OS ごとの保証:
+/// - Linux（x86_64 / aarch64）で stderr が AF_UNIX socket: `send(MSG_DONTWAIT | MSG_NOSIGNAL)` 1 回。満杯なら
+///   `WouldBlock` で即座に戻る。一部だけ書けても再試行しない（この後に stderr へ書くものは無いため、切れた行が
+///   後続の行と連結することはない）
+/// - それ以外（pipe・端末・通常ファイル、macOS、Windows）: 待たない手段が無いため書かない。この縮退経路では
+///   ERR 系の構造化エラーは失われ、終了コードだけが残る（無期限に止まらないこと〔REPAIR-5〕を優先する）
 fn write_stderr_fallback(r: &Report) {
-    let mut err = std::io::stderr();
-    if r.partial {
-        let _ = std::io::Write::write_all(&mut err, b"\n");
+    let bytes = fallback_bytes(r.partial, &r.exit);
+    if !bytes.is_empty() {
+        let _ = fandhe_container_plugin::write_stderr_nonblocking(&bytes);
     }
-    let _ = r.exit.write_stderr(&mut err);
+}
+
+/// 縮退出力の内容（断片分離の改行・コマンド結果の順）を 1 つのバッファへ組み立てる（1 回の書き込みで出すため）。
+fn fallback_bytes(partial: bool, exit: &fandhe_container_cli::commands::CliExit) -> Vec<u8> {
+    let mut buf = Vec::new();
+    if partial {
+        buf.push(b'\n');
+    }
+    let _ = exit.write_stderr(&mut buf);
+    buf
 }
 
 #[cfg(test)]
@@ -148,5 +167,25 @@ mod tests {
         );
         assert_eq!(WRITTEN.load(Ordering::SeqCst), 0);
         assert_eq!(FALLBACK.load(Ordering::SeqCst), 6);
+    }
+
+    /// 縮退出力は断片分離の改行・コマンド結果の順で 1 つのバッファにまとまる（1 回の非ブロッキング書き込みで出す。
+    /// 成功かつ断片なしなら空で、何も書かない。#1673・REPAIR-5・ERR-1）。
+    #[test]
+    fn fallback_bytes_orders_separator_before_result_in_one_buffer() {
+        use fandhe_container_cli::commands::CliExit;
+        assert_eq!(fallback_bytes(false, &CliExit::Success), b"");
+        assert_eq!(fallback_bytes(true, &CliExit::Success), b"\n");
+        let usage = fandhe_container_cli::commands::run(Vec::<std::ffi::OsString>::new());
+        let mut line = Vec::new();
+        usage.write_stderr(&mut line).unwrap();
+        assert_eq!(fallback_bytes(false, &usage), line);
+        let mut expected = b"\n".to_vec();
+        expected.extend_from_slice(&line);
+        assert_eq!(fallback_bytes(true, &usage), expected);
+        assert_eq!(
+            String::from_utf8(line).unwrap(),
+            "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|setup>\"}\n"
+        );
     }
 }

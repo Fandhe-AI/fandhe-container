@@ -4,8 +4,10 @@
 //! `Drop` は `Result` を返せず、stderr への書き込みがブロックしないと保証できるのは Linux（x86_64 / aarch64）の
 //! AF_UNIX socket だけである（`crate::sys::write_nonblocking`）。それ以外（macOS・端末・通常ファイル・pipe・
 //! 書き込みが途中までで終わった場合）の記録は、確保も I/O もロックもせず atomic の CAS だけでこの表へ積む。
-//! ホスト（CLI の `main`）は終了時に [`take_pending_child_cleanup_failures`] で取り出し、通常のブロッキング
-//! stderr 経路で 1 行ずつ出す。取り出した記録は表から消え、各記録はちょうど 1 回だけ返る。
+//! ホスト（CLI の `main`）は終了時に [`take_pending_child_cleanup_failures`] で取り出し、期限付きで待つ別スレッドから
+//! stderr へ 1 行ずつ出す（main は stderr へ書かない。REPAIR-5）。取り出した記録は表から消え、各記録はちょうど
+//! 1 回だけ返る。ホストがスレッドを起動できないときの縮退出力には、ブロックしないと保証できる場合にだけ 1 回書く
+//! [`write_stderr_nonblocking`] を使う。
 //!
 //! 記録に載せるのは固定文字列と pid の整数だけで、plugin 由来の文字列は載せない（ログ行の偽装を防ぐ）。
 //!
@@ -196,9 +198,32 @@ static GLOBAL_SLOTS: [AtomicU64; DROP_REPORT_CAPACITY] =
 pub(crate) static GLOBAL_TABLE: DropReportTable = DropReportTable::over(&GLOBAL_SLOTS);
 
 /// `Drop` 経路で即時に書けなかった後始末の失敗記録を取り出す。ホストは終了時（コマンド結果の出力後）に
-/// 呼び、[`PendingChildCleanup::write_json_lines`] でブロッキングの stderr へ出す（#1673・REPAIR-4）。
+/// 呼び、[`PendingChildCleanup::write_json_lines`] で stderr へ出す。stderr の書き込みはブロックし得るため、
+/// ホストは期限付きで待つ別スレッドから書く（CLI の `main`。#1673・REPAIR-4・REPAIR-5）。
 pub fn take_pending_child_cleanup_failures() -> PendingChildCleanup {
     GLOBAL_TABLE.take()
+}
+
+/// stderr へ、ブロックしないと保証できる場合にだけ `buf` を 1 回書く（#1673・REPAIR-5）。書いたバイト数を返す。
+///
+/// ホストが期限付きの出力スレッドを起動できなかったとき（EAGAIN 等）の縮退出力に使う。呼び出し元のスレッドで
+/// 呼んでも、どの OS でも無期限に待たない:
+/// - Linux（x86_64 / aarch64）で stderr が AF_UNIX socket: `send(MSG_DONTWAIT | MSG_NOSIGNAL)` を 1 回だけ行う
+///   （`crate::sys::write_nonblocking`。送信バッファが満杯なら `WouldBlock` で即座に戻る。一部だけ書けた場合も
+///   再試行しない）
+/// - それ以外（pipe・端末・通常ファイル・キャラクタデバイス・TCP 等の socket、macOS を含むその他の unix、Windows）:
+///   共有 fd の状態（`O_NONBLOCK`・`SO_SNDTIMEO` 等）を変えずに待たない手段が無いため、書かずに `Unsupported` を返す
+///   （fail-closed。出力は失われる）
+pub fn write_stderr_nonblocking(buf: &[u8]) -> io::Result<usize> {
+    #[cfg(unix)]
+    {
+        crate::sys::write_nonblocking(&io::stderr(), buf)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = buf;
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
 }
 
 /// `Drop` の記録 1 件を、書けるなら即時に（Linux の AF_UNIX socket）、書けなければ延期表へ積む。

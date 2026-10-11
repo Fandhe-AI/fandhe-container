@@ -28,7 +28,8 @@
 //!   `crate::launcher`（#1719。実装済み）
 //! - ambient は exec 後の子孫へ引き継がれる。コンテナの子は core の制限段で消すが、healthcheck の exec など
 //!   supervisor が起動する子での解除は TASK-161.2（#495）の実装時（設計書 5 章 5・10 章）
-//! - file capability / setuid ビットの付与（インストール）: #1721
+//! - file capability / setuid ビットの付与（インストール）: `scripts/install-privileged-launcher.sh`（#1721。実装済み。
+//!   実機での実行と検証は人間担当: #538・#539）
 
 use std::fmt;
 
@@ -997,7 +998,7 @@ impl PrivilegeKernel for RealKernel {
 ///   （bounding の削除は戻せない）、呼び出し元は exec も特権操作もせず非ゼロで終了する
 /// - 方式 (c)［`PrivilegeMethod::LauncherAmbient`］では、file capability に `RUNTIME_REQUIRED_CAPABILITIES` に加えて、
 ///   補助グループを持つ利用者向けに `CAP_SETGID` を effective 付きで持たせる必要がある（`plan_reduction` の前提。
-///   必要最小集合は広げない。付与の手順は #1721／#1719 へ引き継ぐ）
+///   必要最小集合は広げない。付与は `scripts/install-privileged-launcher.sh`〔#1721〕が行う）
 /// - ambient は exec 後の子孫へ引き継がれる。子での解除は #537 以降の範囲
 ///
 /// fd 検証付き exec・入口検証は本関数の範囲外（#1719）。非 Linux では常に `Unimplemented`（SUP-14 の対象は Linux の

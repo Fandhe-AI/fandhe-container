@@ -32,7 +32,7 @@ SHELL := /bin/bash
 	bench-check-selftest bench-baseline-selftest fio-bench-selftest fio-baseline-ratio-selftest \
 	startup-latency-selftest net-setup-timing-selftest dns-helper-measure-selftest idle-memory-selftest \
 	idle-memory-supervised-selftest supervisor-pss-selftest concurrent-memory-selftest \
-	supervisor-independence-selftest restart-latency-selftest deny deny-poc-venus-jig \
+	supervisor-independence-selftest restart-latency-selftest install-launcher-selftest deny deny-poc-venus-jig \
 	third-party-licenses install-cargo-about ci bench-check bench-plugin-boundary \
 	bench-macos-cold-start bench-baseline cli-parity fio-bench fio-baseline-ratio startup-latency \
 	startup-latency-docker startup-latency-report net-setup-timing dns-helper-measure idle-memory \
@@ -190,6 +190,9 @@ supervisor-independence-selftest: ## 監視プロセス独立性実証スクリ�
 
 restart-latency-selftest: ## restart レイテンシ計測スクリプトの自己テスト（SUP-3・REPAIR-12。スタブ launcher のみ）
 	@scripts/measure-restart-latency-selftest.sh
+
+install-launcher-selftest: ## 特権ランチャーのインストールスクリプトの自己テスト（SUP-14・SEC-1・REPAIR-12。スタブのみ・root 不要）
+	@scripts/install-privileged-launcher-selftest.sh
 
 # --------------------------------------------------
 # 依存監査・ライセンス表記

@@ -8,7 +8,7 @@
 //!
 //! # 呼び出し元・呼び出し先
 //! - 呼び出し元: CLI（#1718）が固定のインストール先から起動する（file capability を持つ非 root の bin〔方式 (c)〕、
-//!   または xattr 非対応環境に限る setuid root の bin〔方式 (a)〕。付与は #1721）
+//!   または xattr 非対応環境に限る setuid root の bin〔方式 (a)〕。付与は `scripts/install-privileged-launcher.sh`〔#1721〕）
 //! - 呼び出し先: [`crate::start_contract::StartArgs::parse`]（引数の検証）、[`crate::privilege::elevate`]（縮退）、
 //!   `crate::sys` の `execveat_fd`（検証済み fd の exec）、[`crate::stderr_sink`]（期限つきの報告）
 //!
@@ -39,7 +39,7 @@
 //!   （`fandhe_container_core::exec` の capability 段。ambient を全消去してから bounding / capset）。(2) supervisor の
 //!   healthcheck コマンド実行は未実装（TASK-161.2・#495）で、実装時に子で ambient を落としてから exec する要件を
 //!   #495 へ記録する（設計書 5 章 5・10 章）。取りこぼしがないことの確認は実機検証（#538・#539。人間担当）
-//! - setcap / setuid の付与（#1721）・CLI `setup` の表示（#1722）・`setsid` と pty 非経由の確認（#537）
+//! - setcap / setuid の付与（`scripts/install-privileged-launcher.sh`。#1721 で実装済み）・CLI `setup` の表示（#1722）・`setsid` と pty 非経由の確認（#537）
 
 use std::collections::VecDeque;
 use std::fmt;

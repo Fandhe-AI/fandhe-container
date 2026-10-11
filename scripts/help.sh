@@ -103,6 +103,8 @@ cat <<'EOF'
                                         監視プロセス独立性実証スクリプトの自己テスト（SUP-5・REPAIR-12。スタブ launcher のみ）
   restart-latency-selftest            scripts/measure-restart-latency-selftest.sh
                                         restart レイテンシ計測スクリプトの自己テスト（SUP-3・REPAIR-12。スタブ launcher のみ）
+  install-launcher-selftest           scripts/install-privileged-launcher-selftest.sh
+                                        特権ランチャーのインストールスクリプトの自己テスト（SUP-14・SEC-1・REPAIR-12。スタブのみ・root 不要）
   deny                                scripts/targets/deny.sh
                                         cargo deny check advisories bans licenses sources（ルート workspace と venus 試験治具の依存監査。cargo-deny 未導入なら自動導入）
   deny-poc-venus-jig                  scripts/targets/deny-poc-venus-jig.sh

@@ -226,6 +226,10 @@ dependencies = [
 [[package]]
 name = "fandhe-container-plugin-mcp"
 version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "fandhe-container-plugin-microvm"

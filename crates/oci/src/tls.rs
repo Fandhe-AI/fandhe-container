@@ -156,7 +156,7 @@ mod tests {
         assert_eq!(e.message(), "required CPU features are missing: avx2");
     }
 
-    /// 実 CPU の確認は panic せず Ok か Unimplemented のどちらかを返す。
+    /// OCI-1・ERR-1: 実 CPU の確認は panic せず Ok か Unimplemented のどちらかを返す。
     #[test]
     fn probe_cpu_does_not_panic() {
         match probe_cpu() {
@@ -165,7 +165,7 @@ mod tests {
         }
     }
 
-    /// CPU 確認が失敗すれば provider を作らず同じエラーを返す。
+    /// OCI-1・ERR-1: CPU 確認が失敗すれば provider を作らず同じエラーを返す。
     #[test]
     fn crypto_provider_fails_closed() {
         let e = crypto_provider(|| Err(OciError::new(OciErrorCode::Unimplemented, "no")))
@@ -173,7 +173,7 @@ mod tests {
         assert_eq!(e.code(), OciErrorCode::Unimplemented);
     }
 
-    /// ルート証明書: 0 件は FailedPrecondition、一部エラーつきでも 1 件以上なら Ok、上限超過は ResourceExhausted。
+    /// OCI-1・ERR-1: ルート証明書: 0 件は FailedPrecondition、一部エラーつきでも 1 件以上なら Ok、上限超過は ResourceExhausted。
     #[test]
     fn load_roots_cases() {
         let e = load_roots(|| result_with(0, 2)).expect_err("empty");

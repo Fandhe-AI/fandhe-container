@@ -440,7 +440,7 @@ mod tests {
         }
     }
 
-    /// repository 成分規則の許可側（区切りの組み合わせ）。
+    /// OCI-1: repository 成分規則の許可側（区切りの組み合わせ）。
     #[test]
     fn repository_separators() {
         for ok in ["a.b", "a_b", "a__b", "a-b", "a---b", "a/b-c.d/e__f", "a0"] {

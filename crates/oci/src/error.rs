@@ -161,14 +161,14 @@ mod tests {
         assert_eq!(e.message(), "manifest unknown");
     }
 
-    /// 制御文字は空白へ置換される。
+    /// ERR-1・ERR-2: 制御文字は空白へ置換される。
     #[test]
     fn control_chars_are_replaced() {
         let e = OciError::new(OciErrorCode::Internal, "a\nb\u{1b}[0mc");
         assert_eq!(e.message(), "a b [0mc");
     }
 
-    /// 上限で UTF-8 の境界に切り詰める（3 バイト文字で境界を跨ぐ）。
+    /// ERR-2: 上限で UTF-8 の境界に切り詰める（3 バイト文字で境界を跨ぐ）。
     #[test]
     fn message_is_truncated_on_char_boundary() {
         let e = OciError::new(OciErrorCode::Internal, "あ".repeat(400));

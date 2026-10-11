@@ -184,14 +184,14 @@ mod tests {
         r
     }
 
-    /// Agent の構築は接続せずに成功する（CPU 確認は偽装して通す。provider 生成は実物）。
+    /// OCI-1: Agent の構築は接続せずに成功する（CPU 確認は偽装して通す。provider 生成は実物）。
     #[test]
     fn builds_agent_without_connecting() {
         let c = RegistryClient::new_with(&RegistryClientConfig::default(), || Ok(()), one_cert);
         assert!(c.is_ok());
     }
 
-    /// CPU 機能が不足していれば Unimplemented で構築に失敗する。
+    /// OCI-1・ERR-1: CPU 機能が不足していれば Unimplemented で構築に失敗する。
     #[test]
     fn cpu_failure_propagates() {
         let e = RegistryClient::new_with(
@@ -203,7 +203,7 @@ mod tests {
         assert_eq!(e.code(), OciErrorCode::Unimplemented);
     }
 
-    /// ルート証明書が 0 件なら FailedPrecondition で構築に失敗する。
+    /// OCI-1・ERR-1: ルート証明書が 0 件なら FailedPrecondition で構築に失敗する。
     #[test]
     fn empty_roots_fail_closed() {
         let e = RegistryClient::new_with(
@@ -215,7 +215,7 @@ mod tests {
         assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
     }
 
-    /// 実 CPU・実 OS ストアでの構築は panic せず、Ok か想定内の分類のエラーを返す。
+    /// OCI-1・ERR-1: 実 CPU・実 OS ストアでの構築は panic せず、Ok か想定内の分類のエラーを返す。
     #[test]
     fn real_construction_does_not_panic() {
         match RegistryClient::new(&RegistryClientConfig::default()) {

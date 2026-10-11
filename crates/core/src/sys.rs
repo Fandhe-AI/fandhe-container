@@ -2204,8 +2204,8 @@ pub(crate) const DEVPTS_MAGIC: i64 = 0x1cd1;
 /// [`mount_devpts_on`] の作成パラメータ。`/dev/pts` の devpts は OCI runtime-spec の Default Filesystems で
 /// SHOULD とされ、常に載せる暗黙の固定集合である（TASK-29 追補・CORE-1・SEC-1）。
 ///
-/// 可変なのは `gid` だけで、`mode`（0o620）・`ptmxmode`（0o666）・マウント属性（nosuid・noexec）は型の外から
-/// 変えられない。カーネルへ渡す文字列は本モジュール内で整数から生成し、利用者文字列や `mount(2)` の data を
+/// 可変なのは `gid` だけで、`mode`（0o620）・`ptmxmode`（0o666）・`max`（61）・マウント属性（nosuid・noexec）は
+/// 型の外から変えられない。カーネルへ渡す文字列は本モジュール内で整数から生成し、利用者文字列や `mount(2)` の data を
 /// 渡す経路を持たない。呼び出し元（`crate::exec::create_default_devices`。#1656）が rootless で gid 5 が写像されていないときに
 /// `gid` を `None` にする（判定はここでは行わない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2244,6 +2244,13 @@ impl DevptsCreate {
     pub(crate) const MODE: u32 = 0o620;
     /// `/dev/pts/ptmx` のモード（`ptmxmode=`）。0o666 でないと非特権プロセスが pty を確保できない。
     pub(crate) const PTMXMODE: u32 = 0o666;
+    /// instance ごとの pty 数の上限（`max=`。10 進で渡す）。`kernel.pty.reserve` が守るのは初期 mount namespace
+    /// からマウントした instance だけで、コンテナ同士は `kernel.pty.max - kernel.pty.reserve` の共有枠を取り合い、
+    /// 1 つのコンテナが使い切れる。`max=` は instance 単位で効くため、これで枠の独占を防ぐ（SEC-1。#1658 の
+    /// オーナー判断 2026-10-11、案 (a)、実装 #1738）。61 は (4096 − 1024) / 50 ≈ 61 で、既定の sysctl のもとでは
+    /// 50 コンテナが上限まで使っても共有枠が尽きない。sysctl を既定から変えたホストや 50 超の同時起動では
+    /// この保証は成り立たない。1 instance で開ける pty は 0〜60 の 61 個（index が `max` 以上は `ENOSPC`）。
+    pub(crate) const MAX_PTYS: u32 = 61;
 
     /// `fsmount(2)` の `attr_flags`。`nosuid`・`noexec` を固定で付ける。pty は文字デバイスなので
     /// `nodev` は付けない（付けるとスレーブを open できなくなる）。
@@ -2264,6 +2271,7 @@ impl DevptsCreate {
             make(c"source", "devpts".to_owned())?,
             make(c"mode", format!("{:04o}", Self::MODE))?,
             make(c"ptmxmode", format!("{:04o}", Self::PTMXMODE))?,
+            make(c"max", Self::MAX_PTYS.to_string())?,
         ];
         if let Some(gid) = self.gid.value() {
             params.push(make(c"gid", gid.to_string())?);
@@ -2281,8 +2289,8 @@ impl DevptsCreate {
 /// （`crate::exec::create_default_devices`。#1656）が `DEVPTS_MAGIC` による事後検証と失敗時の後始末に使う。
 ///
 /// `nodev` は付けない（pty は文字デバイスのため）。`newinstance` は渡さない（Linux 4.7 以降は devpts の
-/// mount がすべて独立 instance で、本 API の前提は 5.2 以降）。instance ごとの `max=` も付けない
-/// （全体上限は `kernel.pty.max` が担う）。未対応（`ENOSYS`）は [`SysError::Unsupported`] で返し、
+/// mount がすべて独立 instance で、本 API の前提は 5.2 以降）。instance ごとの `max=`（[`DevptsCreate::MAX_PTYS`] の 61）を
+/// 常に付ける（`kernel.pty.reserve` は初期 mount namespace の instance しか守らず、コンテナが共有枠を使い切らないため。#1658）。未対応（`ENOSYS`）は [`SysError::Unsupported`] で返し、
 /// `mount(2)` へは縮退しない（fail-closed）。実マウントは `sys::tests::core1_sec1_task29_devpts_real_mount`（実機前提・`--ignored`）が
 /// user + mount namespace 内で確認し、`crate::exec` からの呼び出しは `tests/default_devices.rs` が確認する（#1656）。
 /// ビヘイビア: CORE-1・SEC-1・REPAIR-2（TASK-29 追補・#1655）。
@@ -4813,7 +4821,7 @@ mod tests {
     }
 
     /// CORE-1・SEC-1（TASK-29 追補・#1655）: devpts の fsconfig 列は具体値で固定され、`DevptsGid::Omitted` では
-    /// `gid` のキーを渡さない。`mode`・`ptmxmode` は 4 桁 8 進表記（runc と同じ）。
+    /// `gid` のキーを渡さない。`mode`・`ptmxmode` は 4 桁 8 進表記（runc と同じ）、`max` は 10 進の 61（#1738）。
     #[test]
     fn core1_sec1_task29_devpts_fsconfig_params_are_exact() {
         let to_strs = |c: DevptsCreate| -> Vec<(String, String)> {
@@ -4832,6 +4840,7 @@ mod tests {
         let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
         assert_eq!(DevptsCreate::MODE, 0o620);
         assert_eq!(DevptsCreate::PTMXMODE, 0o666);
+        assert_eq!(DevptsCreate::MAX_PTYS, 61);
         assert_eq!(DevptsGid::TTY_GID, 5);
         assert_eq!(DevptsGid::Tty.value(), Some(5));
         assert_eq!(DevptsGid::Omitted.value(), None);
@@ -4843,6 +4852,7 @@ mod tests {
                 pair("source", "devpts"),
                 pair("mode", "0620"),
                 pair("ptmxmode", "0666"),
+                pair("max", "61"),
                 pair("gid", "5"),
             ]
         );
@@ -4854,6 +4864,7 @@ mod tests {
                 pair("source", "devpts"),
                 pair("mode", "0620"),
                 pair("ptmxmode", "0666"),
+                pair("max", "61"),
             ]
         );
     }
@@ -4886,7 +4897,7 @@ mod tests {
     /// 外側のテストが `unshare --user --map-root-user --mount` で自身を再実行し、内側（環境変数で判別）が
     /// その namespace 内でマウントする。ホストのマウントは変えない。内側は (1) カーネルがパラメータを受理して
     /// 成功する、(2) 返された fd が devpts（magic 0x1cd1）を指す、(3) 指定先へ接続され mountinfo に
-    /// `nosuid,noexec` の devpts として現れる、(4) `ptmx` が 0666 の独立 instance で pty を確保できる、
+    /// `nosuid,noexec` の devpts として現れ superblock に `max=61` が付く（#1738）、(4) `ptmx` が 0666 の独立 instance で pty を確保できる、
     /// ことを具体値で照合する。
     #[cfg(all(
         target_os = "linux",
@@ -4997,6 +5008,9 @@ mod tests {
         );
         assert!(!opts.contains(&"nodev"), "{line}");
         assert_eq!(post.split(' ').next(), Some("devpts"), "{line}");
+        // superblock オプションに instance ごとの上限 `max=61` が現れる（カーネルは max が既定上限未満のときだけ出す。#1738）。
+        let super_opts: Vec<&str> = post.split(' ').nth(2).unwrap().split(',').collect();
+        assert!(super_opts.contains(&"max=61"), "{line}");
 
         // ptmx は ptmxmode=0666。開くと独立 instance 側にスレーブ（数字名）が現れ、モードは 0620。
         let ptmx = dir.join("ptmx");

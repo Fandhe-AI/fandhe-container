@@ -57,6 +57,7 @@ tmpfs にする（runc 方式）に確定（4 章の判断 1）。実装は #165
 ### 3.3 devpts と `/dev/ptmx`
 
 - devpts は `fsopen("devpts")` と `fsconfig` を `sys` に新設し、オプションは型付きフィールドからキー単位で渡す。利用者の文字列や `data` 文字列は渡さない。常に独立 instance にする
+- instance ごとの上限 `max=61` を常に付ける（#1658 のオーナー判断 2026-10-11、案 (a)。実装 #1738）。`kernel.pty.reserve` が守るのは初期 mount namespace からマウントした instance だけで、コンテナ同士は `pty_limit - pty_reserve` の共有枠を取り合うため、1 つのコンテナが使い切れる。`max=` は instance 単位で効く。61 は (4096 − 1024) / 50 ≈ 61 で、既定の `kernel.pty.max`・`kernel.pty.reserve` のもとで 50 コンテナが上限まで使っても共有枠が尽きない。sysctl を変えたホストや 50 超の同時起動では保証しない
 - rootless で `gid=5` が写像されていない場合、runc は `gid=` を除く。本リポも `gid=` を除いて載せる（runc `ToRootless` と同じ。判断 3）
 - `/dev/ptmx` は `pts/ptmx` への symlink にする（runc と同じ。#1656）。symlink はマウント後に置く必要があり、`devices.rs` の default symlink 集合に足すと順序が逆になる。既存の `ptmx` が完全一致でなければ拒否する
 

@@ -111,6 +111,8 @@ pub fn record_mount_rejection<E>(
 ) -> AuditedRejection<E> {
     let event = AuditEvent::Mount {
         path: path.map(AuditPath::new),
+        // API 層は理由の語彙を持たないため `None`（出力は従来どおり。#1701）。
+        reason: None,
     };
     let delivery = deliver(event, container, sink);
     AuditedRejection { error, delivery }

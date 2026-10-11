@@ -109,6 +109,7 @@ fn sec4_task41_5_1_one_line_per_record() {
         AuditPid::new(3).unwrap(),
         AuditEvent::Mount {
             path: Some(AuditPath::new("/x\n{\"forged\":1}")),
+            reason: None,
         },
     );
     w.write_record(&r).unwrap();

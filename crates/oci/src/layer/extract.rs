@@ -515,6 +515,9 @@ fn resolve_dir(root: &Path, rel: &[OsString], create: bool) -> Result<Vec<OsStri
                     return Err(err(OciErrorCode::NotFound, "extraction path not found"));
                 }
                 fs::create_dir(&cand).map_err(|e| map_fs_err(&e))?;
+                // 暗黙の親ディレクトリはホストの umask に依存させず既定 0755 にする。
+                // 明示的なディレクトリエントリがあれば `make_dir` がその mode で上書きする（OCI-1）。
+                apply_dir_mode(&cand, IMPLICIT_DIR_MODE)?;
                 resolved.push(c);
             }
             Err(e) => return Err(map_fs_err(&e)),
@@ -522,6 +525,9 @@ fn resolve_dir(root: &Path, rel: &[OsString], create: bool) -> Result<Vec<OsStri
     }
     Ok(resolved)
 }
+
+/// tar に親ディレクトリのエントリが無い場合に暗黙作成するディレクトリの既定 mode。
+const IMPLICIT_DIR_MODE: u32 = 0o755;
 
 /// ルートと解決済みコンポーネントから物理パスを作る。
 fn join_resolved(root: &Path, resolved: &[OsString], name: &OsString) -> PathBuf {
@@ -1085,6 +1091,28 @@ mod tests {
         assert_eq!(mode("usr/bin/tool"), 0o4755);
         assert_eq!(mode("etc"), 0o755);
         sb.assert_outside_untouched();
+    }
+
+    /// OCI-1: 親エントリの無い tar の暗黙ディレクトリは既定 0755、後続の明示エントリがあればその mode になる。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_implicit_dirs_get_default_mode_and_explicit_overrides() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let sb = Sandbox::new();
+        run(
+            &sb,
+            &[
+                file("usr/bin/tool", 0o755, b"x"),
+                file("opt/app/f", 0o644, b"y"),
+                dir("opt/", 0o750),
+            ],
+        )
+        .unwrap();
+        let mode = |p: &str| fs::metadata(sb.root.join(p)).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode("usr"), 0o755);
+        assert_eq!(mode("usr/bin"), 0o755);
+        assert_eq!(mode("opt/app"), 0o755);
+        assert_eq!(mode("opt"), 0o750);
     }
 
     /// OCI-1: 所有者の権限が欠けるディレクトリでも子を作れ、最終的に mode が適用される。

@@ -36,11 +36,32 @@ LAUNCHER_CAPS="cap_sys_admin,cap_mknod,cap_setpcap,cap_net_admin,cap_audit_write
 
 TMP_LAUNCHER=""
 TMP_SUPERVISOR=""
+BAK_SUPERVISOR=""
+SUPERVISOR_DST=""
+# 1 のとき supervisor は置換済みで launcher は未置換（更新途中）。EXIT trap が旧 supervisor へ戻す。
+SUP_REPLACED=0
+# 更新途中の状態を旧 supervisor へ戻す（旧 launcher と新 supervisor の組み合わせを残さない）。
+restore_supervisor() {
+  [ "${SUP_REPLACED}" -eq 1 ] || return 0
+  SUP_REPLACED=0
+  if [ -n "${BAK_SUPERVISOR}" ]; then
+    mv -f -- "${BAK_SUPERVISOR}" "${SUPERVISOR_DST}" || true
+    BAK_SUPERVISOR=""
+  else
+    rm -f -- "${SUPERVISOR_DST}"
+  fi
+}
 cleanup() {
+  restore_supervisor
   [ -z "${TMP_LAUNCHER}" ] || rm -f -- "${TMP_LAUNCHER}"
   [ -z "${TMP_SUPERVISOR}" ] || rm -f -- "${TMP_SUPERVISOR}"
+  [ -z "${BAK_SUPERVISOR}" ] || rm -f -- "${BAK_SUPERVISOR}"
 }
 trap cleanup EXIT
+# 捕捉可能な中断は終了コード付きで抜け、EXIT trap（cleanup）に復元させる。SIGKILL は捕捉できない。
+trap 'exit 130' INT
+trap 'exit 129' HUP
+trap 'exit 143' TERM
 
 # 構造化エラーを 1 行出して終了する。
 die() { # <exit-code> <code> <message>
@@ -66,7 +87,9 @@ while [ $# -gt 0 ]; do
 done
 [ -n "${LAUNCHER_SRC}" ] && [ -n "${SUPERVISOR_SRC}" ] || usage
 
-# --dest-dir は許可リスト方式で検証する（空白・改行・glob・.. を拒否）。
+# --dest-dir は許可リスト方式で検証する（空白・改行・glob・.. を拒否）。単一の末尾スラッシュは検査より先に除去する
+# （除去後に残る `//` は空要素として拒否する）。
+DEST_DIR="${DEST_DIR%/}"
 dest_ok=1
 [ "${#DEST_DIR}" -le 4096 ] || dest_ok=0
 [[ "${DEST_DIR}" =~ ^/[A-Za-z0-9._+/-]+$ ]] || dest_ok=0
@@ -80,7 +103,6 @@ if [ "${dest_ok}" -ne 1 ]; then
   echo "error: invalid-argument: --dest-dir must be a normalized absolute path" >&2
   exit 2
 fi
-DEST_DIR="${DEST_DIR%/}"
 
 [ "$(uname -s)" = "Linux" ] || die 3 unsupported-os "this installer supports Linux only"
 
@@ -119,7 +141,14 @@ SRC_FD_SUPERVISOR=""
 open_source() { # <path> <fd 番号を入れる変数名>
   local path="$1" fd lst fst
   [ ! -L "${path}" ] || die 3 invalid-source "source must be a readable regular file and not a symlink"
-  { exec {fd}<"${path}"; } 2>/dev/null || die 3 invalid-source "source must be a readable regular file and not a symlink"
+  # open 前に通常ファイルであることを確かめ、FIFO 等を open せずに拒否する（書き手のいない FIFO の open は無期限に止まる）。
+  [ -f "${path}" ] || die 3 invalid-source "source must be a readable regular file and not a symlink"
+  # 事前検査と open の間の差し替え競合に備え、open 自体にも期限を付ける（REPAIR-5）。この時点では一時ファイルも
+  # 更新途中の状態も無いため、期限切れは watchdog が KILL して終了してよい。
+  ( sleep "${CHILD_TIMEOUT}" && { printf 'error: source-open-timeout: opening source timed out\n' >&2; kill -KILL $$; } ) &
+  local wd=$!
+  { exec {fd}<"${path}"; } 2>/dev/null || { kill "${wd}" 2>/dev/null || true; die 3 invalid-source "source must be a readable regular file and not a symlink"; }
+  kill "${wd}" 2>/dev/null || true
   lst="$(stat -c '%F %d:%i' -- "${path}")" || die 3 invalid-source "cannot stat source"
   fst="$(stat -L -c '%F %d:%i' -- "/proc/self/fd/${fd}")" || die 3 invalid-source "cannot stat opened source"
   if [ "${lst}" != "${fst}" ] || [ "${fst%% [0-9]*}" != "regular file" ]; then
@@ -261,25 +290,39 @@ expect_stat "${TMP_SUPERVISOR}" 755
 
 # 失敗しうる処理がすべて成功してから最終名へ置換する（rename は xattr を保つ）。2 つの置換は一組として扱い、
 # 2 つ目が失敗したら旧ファイル（ハードリンクで保持した退避。xattr も保つ）へ戻す（旧 launcher と新 supervisor の不整合を残さない）。
-BAK_SUPERVISOR=""
 if [ -e "${SUPERVISOR_DST}" ]; then
   BAK_SUPERVISOR="${DEST_DIR}/.supervisor.bak.$$"
-  ln -- "${SUPERVISOR_DST}" "${BAK_SUPERVISOR}" || die 1 install-failed "backup failed"
+  ln -- "${SUPERVISOR_DST}" "${BAK_SUPERVISOR}" || { BAK_SUPERVISOR=""; die 1 install-failed "backup failed"; }
 fi
-mv -f -- "${TMP_SUPERVISOR}" "${SUPERVISOR_DST}" || {
-  [ -z "${BAK_SUPERVISOR}" ] || rm -f -- "${BAK_SUPERVISOR}"
+# supervisor の rename と更新途中フラグの設定の間に中断が入らないよう、捕捉可能な信号を一時的に無視する。
+trap '' INT HUP TERM
+if ! mv -f -- "${TMP_SUPERVISOR}" "${SUPERVISOR_DST}"; then
+  trap 'exit 130' INT
+  trap 'exit 129' HUP
+  trap 'exit 143' TERM
   die 1 install-failed "rename failed"
-}
+fi
 TMP_SUPERVISOR=""
+SUP_REPLACED=1
+trap 'exit 130' INT
+trap 'exit 129' HUP
+trap 'exit 143' TERM
+# ここから launcher の rename 完了までが更新途中。置換後の supervisor を読み戻して検証する間に中断・失敗しても、
+# EXIT trap が旧 supervisor へ戻す（旧 launcher と新 supervisor の組み合わせを残さない）。
+expect_no_caps "${SUPERVISOR_DST}"
+expect_stat "${SUPERVISOR_DST}" 755
+trap '' INT HUP TERM
 if ! mv -f -- "${TMP_LAUNCHER}" "${LAUNCHER_DST}"; then
-  if [ -n "${BAK_SUPERVISOR}" ]; then
-    mv -f -- "${BAK_SUPERVISOR}" "${SUPERVISOR_DST}" || true
-  else
-    rm -f -- "${SUPERVISOR_DST}"
-  fi
+  trap 'exit 130' INT
+  trap 'exit 129' HUP
+  trap 'exit 143' TERM
   die 1 install-failed "rename failed (previous supervisor restored)"
 fi
 TMP_LAUNCHER=""
+SUP_REPLACED=0
+trap 'exit 130' INT
+trap 'exit 129' HUP
+trap 'exit 143' TERM
 [ -z "${BAK_SUPERVISOR}" ] || rm -f -- "${BAK_SUPERVISOR}"
 
 expect_no_caps "${SUPERVISOR_DST}"

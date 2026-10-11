@@ -78,6 +78,10 @@ echo "getcap $*" >>"${FANDHE_INSTALL_TEST_SANDBOX}/calls.log"
 file="$1"
 [ "${STUB_GETCAP_MODE:-match}" = "fail" ] && exit 1
 [ "${STUB_GETCAP_MODE:-match}" = "fail-supervisor" ] && case "$file" in *supervisor*) exit 1 ;; esac
+if [ "${STUB_GETCAP_MODE:-match}" = "term-installer" ]; then
+  # 置換後の最終名の supervisor を読み戻すときだけ、インストーラ本体（timeout の親）へ SIGTERM を送る。
+  case "$file" in */.supervisor.*) ;; *supervisor) kill -TERM "$(ps -o ppid= -p "$PPID" | tr -d ' ')" ;; esac
+fi
 caps="cap_kill,cap_setgid,cap_mknod,cap_setpcap,cap_net_admin,cap_audit_write,cap_dac_override,cap_sys_admin"
 emit() { # <caps>
   if [ "${STUB_GETCAP_FORMAT:-old}" = "new" ]; then echo "$file = $1+ep"; else echo "$file $1=ep"; fi
@@ -240,6 +244,38 @@ stop_case "getcap mismatch" capability-mismatch STUB_GETCAP_MODE=mismatch
 stop_case "getcap fails (launcher readback)" capability-mismatch STUB_GETCAP_MODE=fail
 stop_case "getcap fails (no-caps readback)" capability-mismatch STUB_GETCAP_MODE=fail-supervisor
 stop_case "supervisor has capabilities" capability-mismatch STUB_GETCAP_MODE=supervisor-has-caps
+
+# --- 5b. 更新途中の中断・末尾スラッシュ・FIFO ---
+new_sandbox
+printf 'OLD-LAUNCHER\n' >"${SB}/dest/fandhe-container-launcher"
+printf 'OLD-SUPERVISOR\n' >"${SB}/dest/fandhe-container-supervisor"
+# shellcheck disable=SC2046
+run_install STUB_GETCAP_MODE=term-installer -- $(std_args)
+eq "SIGTERM mid-update: exit code" 143 "${rc}"
+eq "SIGTERM mid-update: old launcher kept" "OLD-LAUNCHER" "$(cat "${SB}/dest/fandhe-container-launcher")"
+eq "SIGTERM mid-update: old supervisor restored" "OLD-SUPERVISOR" "$(cat "${SB}/dest/fandhe-container-supervisor")"
+eq "SIGTERM mid-update: no leftover files" 2 "$(find "${SB}/dest" -mindepth 1 | wc -l | tr -d ' ')"
+new_sandbox
+# shellcheck disable=SC2046
+run_install STUB_GETCAP_MODE=term-installer -- $(std_args)
+eq "SIGTERM mid-update (fresh): exit code" 143 "${rc}"
+eq "SIGTERM mid-update (fresh): nothing installed" 0 "$(find "${SB}/dest" -mindepth 1 | wc -l | tr -d ' ')"
+
+new_sandbox
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --dest-dir "${SB}/dest/"
+eq "dest-dir trailing slash: exit code" 0 "${rc}"
+eq "dest-dir trailing slash: stdout" "installed: method=file-capability dest-dir=${SB}/dest" "$(cat "${SB}/out")"
+new_sandbox
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --dest-dir "${SB}/dest//"
+eq "dest-dir double trailing slash: exit code" 2 "${rc}"
+
+new_sandbox
+mkfifo "${SB}/src/fifo"
+rc=0
+env FANDHE_INSTALL_TEST_SANDBOX="${SB}" timeout 20 "${target}" --launcher "${SB}/src/fifo" \
+  --supervisor "${SB}/src/supervisor" --dest-dir "${SB}/dest" >"${SB}/out" 2>"${SB}/err" || rc=$?
+eq "fifo source: exit code" 3 "${rc}"
+eq "fifo source: stderr code" "error: invalid-source:" "$(stderr_head)"
 
 # --- 6. 引数エラー・入力元 ---
 new_sandbox

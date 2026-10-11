@@ -125,8 +125,28 @@ pub fn extract_layer_blob(
     max_uncompressed_bytes: u64,
     limits: ExtractLimits,
 ) -> Result<ExtractedLayer, OciError> {
-    let reader = open_gzip_layer(blob_path, max_uncompressed_bytes)?;
-    extract_tar(reader, root, limits)
+    extract_layer_blob_with(
+        &NoopOciOpRecorder,
+        blob_path,
+        root,
+        max_uncompressed_bytes,
+        limits,
+    )
+}
+
+/// `extract_layer_blob` の計装版。blob を開く処理から展開完了までを 1 回の
+/// `OciOpKind::ExtractLayer` として `recorder` へ記録する（open 失敗も記録対象。REPAIR-4）。
+pub fn extract_layer_blob_with(
+    recorder: &dyn OciOpRecorder,
+    blob_path: &Path,
+    root: &Path,
+    max_uncompressed_bytes: u64,
+    limits: ExtractLimits,
+) -> Result<ExtractedLayer, OciError> {
+    record_oci_op(recorder, OciOpKind::ExtractLayer, || {
+        let reader = open_gzip_layer(blob_path, max_uncompressed_bytes)?;
+        extract_inner(reader, root, limits)
+    })
 }
 
 /// 親ディレクトリの解決・種別ごとの処理を束ねる状態。
@@ -251,9 +271,11 @@ impl<R> TarGuard<R> {
     }
 }
 
-/// PAX 拡張ヘッダ本体を長さ付きレコード（`<len> <key>=<value>\n`）として解析し、
-/// キーが正確に `size` のレコードがあれば拒否する（OCI-1）。
-/// `path` 等の値に ` size=` が含まれるだけの正常な tar は通す。構文違反は拒否する。
+/// PAX 拡張ヘッダ本体を `tar` crate と同じ規則（先に改行で分割し、各行を `<len> <key>=<value>`
+/// として解釈。`len` は行 + 改行の長さと一致）で解析し、キーが正確に `size` の行があれば拒否する（OCI-1）。
+/// 長さ欄が後続行にまたがるレコードは `tar` crate も別行として解釈するため、同じ分割で検査して
+/// 埋め込み `size` の見逃しを防ぐ。`path` 等の値に ` size=` が含まれるだけの正常な tar は通す。
+/// 構文違反（長さ不一致・`=` 欠落・末尾改行欠落・途中の空行）は拒否する。
 fn pax_reject_size_override(body: &[u8]) -> std::io::Result<()> {
     let malformed = || {
         guard_error(
@@ -261,24 +283,22 @@ fn pax_reject_size_override(body: &[u8]) -> std::io::Result<()> {
             "malformed pax extended header record",
         )
     };
-    let mut rest = body;
-    while !rest.is_empty() {
-        let sp = rest.iter().position(|b| *b == b' ').ok_or_else(malformed)?;
-        let len: usize = std::str::from_utf8(rest.get(..sp).ok_or_else(malformed)?)
+    let mut lines = body.split(|b| *b == b'\n');
+    // 本体は改行で終わる必要がある。最後の要素は空でなければ末尾改行欠落。
+    let last = lines.next_back();
+    if !matches!(last, Some([])) && !body.is_empty() {
+        return Err(malformed());
+    }
+    for line in lines {
+        let sp = line.iter().position(|b| *b == b' ').ok_or_else(malformed)?;
+        let len: usize = std::str::from_utf8(line.get(..sp).ok_or_else(malformed)?)
             .ok()
             .and_then(|t| t.parse().ok())
             .ok_or_else(malformed)?;
-        // レコード全体の長さは長さ欄自身を含む。空白と改行の分だけ最低でも sp + 2 ある。
-        if len < sp.saturating_add(2) {
+        if line.len().checked_add(1) != Some(len) {
             return Err(malformed());
         }
-        let record = rest.get(..len).ok_or_else(malformed)?;
-        if record.last() != Some(&b'\n') {
-            return Err(malformed());
-        }
-        let kv = record
-            .get(sp.saturating_add(1)..len.saturating_sub(1))
-            .ok_or_else(malformed)?;
+        let kv = line.get(sp.saturating_add(1)..).ok_or_else(malformed)?;
         let eq = kv.iter().position(|b| *b == b'=').ok_or_else(malformed)?;
         if kv.get(..eq) == Some(&b"size"[..]) {
             return Err(guard_error(
@@ -286,7 +306,6 @@ fn pax_reject_size_override(body: &[u8]) -> std::io::Result<()> {
                 "pax size override is not supported",
             ));
         }
-        rest = rest.get(len..).ok_or_else(malformed)?;
     }
     Ok(())
 }
@@ -681,6 +700,10 @@ impl Extractor<'_> {
         }
         let resolved = resolve_dir(self.root, &parent, true)?;
         let path = join_resolved(self.root, &resolved, &name);
+        // 参照先と同一パス（f → f）なら削除すると参照元を失うため、既存ファイルをそのまま保持する。
+        if tpath == path {
+            return Ok(());
+        }
         self.clear_existing_non_dir(&path)?;
         fs::hard_link(&tpath, &path).map_err(|e| map_fs_err(&e))
     }
@@ -1105,6 +1128,8 @@ mod tests {
             b"x size=1\n",
             b"3 a\n",
             b"12 size=999",
+            // 長さ欄が後続行にまたがるレコード（埋め込み size を隠す）は tar crate と同様に不整合として拒否する。
+            b"22 path=a\n12 size=999\n",
         ] {
             assert_eq!(
                 pax_reject_size_override(bad).unwrap_err().kind(),
@@ -1121,6 +1146,30 @@ mod tests {
             n = base + n.to_string().len();
         }
         format!("{n} {key}={val}\n").into_bytes()
+    }
+
+    /// OCI-1: 前のレコードの長さ欄に隠された埋め込み `size` 行も拒否する（改行で先に分割する）。
+    #[test]
+    fn oci1_pax_embedded_size_record_is_rejected() {
+        let sb = Sandbox::new();
+        // 1 行目の長さ欄が 2 行分を指していても、tar crate は改行で分割して `size` 行を解釈する。
+        for rec in [
+            &b"22 path=a\n12 size=999\n"[..],
+            b"10 path=a\n12 size=999\n",
+        ] {
+            let e = raw_entry(
+                b"pax",
+                EntryType::XHeader,
+                b"",
+                0o644,
+                rec.len() as u64,
+                rec,
+            );
+            assert_eq!(
+                code(run(&sb, &[e, file("f", 0o644, b"x")])),
+                OciErrorCode::InvalidArgument
+            );
+        }
     }
 
     /// OCI-1: symlink のターゲットがルートより上へ出るものは拒否、収まるものは成功する。
@@ -1308,6 +1357,15 @@ mod tests {
         }
     }
 
+    /// OCI-1: 自分自身への hardlink（f → f）は参照元を削除せず成功する。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_hardlink_to_self_keeps_file() {
+        let sb = Sandbox::new();
+        run(&sb, &[file("f", 0o644, b"data"), hardlink("f", "f")]).unwrap();
+        assert_eq!(fs::read(sb.root.join("f")).unwrap(), b"data");
+    }
+
     /// OCI-1: デバイス・FIFO は拒否する。
     #[test]
     fn oci1_special_entries_are_rejected() {
@@ -1437,6 +1495,21 @@ mod tests {
         assert_eq!(items[0].outcome(), OciOpOutcome::Success);
         assert_eq!(items[1].outcome(), OciOpOutcome::Failure);
         assert_eq!(items[1].error_code(), Some(OciErrorCode::PermissionDenied));
+    }
+
+    /// REPAIR-4: blob を開く失敗（不存在）も `oci.layer.extract` の失敗として記録される。
+    #[test]
+    fn repair4_records_blob_open_failure() {
+        let c = Collect::default();
+        let sb = Sandbox::new();
+        let missing = sb.base.join("no-such-blob");
+        let e = extract_layer_blob_with(&c, &missing, &sb.root, 1 << 20, ExtractLimits::new(1, 1))
+            .unwrap_err();
+        let items = c.items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind().as_str(), "oci.layer.extract");
+        assert_eq!(items[0].outcome(), OciOpOutcome::Failure);
+        assert_eq!(items[0].error_code(), Some(e.code()));
     }
 
     /// root が通常ファイルなら InvalidArgument。

@@ -18,8 +18,8 @@
 //! 受信/送信の期限超過は 1（`UNAVAILABLE` / `DEADLINE_EXCEEDED`）、引数あり・socket パスの不正
 //! （空・相対・`..` 含み）は 2（`INVALID_ARGUMENT`）、UDS への接続失敗は 3（plugin-macos / -windows と同じ値で、
 //! core 側 proxy が同じ規則で扱えるようにする）。引数・環境変数の値・socket パスは出力へ埋め込まない。
-//! peer 認証の拒否イベント行は socket パスを含むため転記しない（永続的な監査ログ SEC-4 への配線は
-//! core 側 TASK-114 で未実装。REPAIR-3）。
+//! peer 認証の拒否イベントは、socket パスを除いた構造化 1 行（`PathlessPeerAuthObserver`）にして
+//! 接続失敗の診断の直前に stderr へ出す（SEC-4。永続的な監査ログへの配線は core 側 TASK-114 で未実装。REPAIR-3）。
 //! `list_containers` の状態ルート解決では core が `XDG_RUNTIME_DIR` を読む。
 //!
 //! 未実装（REPAIR-3。TASK-118 の後続 sub で扱う）: `start_container` の本番起動（supervisor 起動の
@@ -30,7 +30,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use fandhe_container_plugin::{
-    JsonLinesPeerAuthObserver, PLUGIN_SOCKET_ENV, PluginError, UdsStream,
+    PLUGIN_SOCKET_ENV, PeerAuthObserver, PeerAuthRejection, PluginError, UdsStream,
 };
 use fandhe_container_plugin_mcp::server::ServeError;
 
@@ -109,17 +109,71 @@ fn exit_for(result: Result<(), ServeError>, uds: bool) -> ExitCode {
     ExitCode::from(1)
 }
 
+/// 1 回の接続で保持する拒否イベントの最大件数（有界メモリ。超過分は捨てず件数で集約する。SEC-4）。
+const MAX_REJECTION_LINES: usize = 8;
+
+/// peer 認証の拒否イベントを socket パス抜きの 1 行 JSON としてメモリへ積む受け手（PLUG-12・SEC-4）。
+/// `PeerAuthRejection::to_json_line` は socket パスを含むため使わず、パス以外の項目だけを写す。
+/// I/O はせず、接続失敗後に `drain` で回収して stderr へ書く（REPAIR-5）。
+#[derive(Default)]
+struct PathlessPeerAuthObserver {
+    lines: Vec<String>,
+    coalesced: u64,
+}
+
+impl PeerAuthObserver for PathlessPeerAuthObserver {
+    fn on_rejection(&mut self, event: &PeerAuthRejection<'_>) {
+        if self.lines.len() >= MAX_REJECTION_LINES {
+            self.coalesced = self.coalesced.saturating_add(1);
+            return;
+        }
+        let line = serde_json::json!({
+            "event": "plugin_peer_auth",
+            "op": event.op.as_str(),
+            "outcome": "error",
+            "reason": event.reason.as_str(),
+            "code": event.code.as_str(),
+            "expected_uid": event.expected_uid,
+            "peer_uid": event.peer_uid,
+        });
+        self.lines.push(line.to_string());
+    }
+}
+
+impl PathlessPeerAuthObserver {
+    /// 積んだ行を届いた順に返す。集約があれば末尾に件数行を足す。
+    fn drain(&mut self) -> Vec<String> {
+        let mut out = std::mem::take(&mut self.lines);
+        if self.coalesced > 0 {
+            out.push(
+                serde_json::json!({
+                    "event": "plugin_peer_auth",
+                    "outcome": "error",
+                    "reason": "peer_auth_rejections_coalesced",
+                    "count": self.coalesced,
+                })
+                .to_string(),
+            );
+            self.coalesced = 0;
+        }
+        out
+    }
+}
+
 /// UDS モード。接続は peer 認証つき `UdsStream::connect` のみ（PLUG-12）。
 fn run_uds(raw: &std::ffi::OsStr) -> ExitCode {
     let Some(path) = validate_socket_path(raw) else {
         stderr_line(INVALID_SOCKET_JSON);
         return ExitCode::from(2);
     };
-    // 拒否イベント行は socket パスを含むため出力しない（上の doc）。
-    let mut observer = JsonLinesPeerAuthObserver::new();
+    // 拒否イベントはパスを除いた形で回収し、失敗時に stderr へ出す（上の doc。SEC-4）。
+    let mut observer = PathlessPeerAuthObserver::default();
     match UdsStream::connect(&path, CONNECT_TIMEOUT, &mut observer) {
         Ok(stream) => exit_for(fandhe_container_plugin_mcp::uds::serve_uds(stream), true),
         Err(e) => {
+            for line in observer.drain() {
+                stderr_line(&line);
+            }
             stderr_line(&connect_failed_json(&e));
             ExitCode::from(EXIT_CONNECT_FAILED)
         }
@@ -184,6 +238,22 @@ mod tests {
             WRITE_FAILED_JSON,
             "{\"code\":\"UNAVAILABLE\",\"message\":\"failed to write response to stdout\"}"
         );
+    }
+
+    /// SEC-4: 集約行は固定の具体値で、通常行の後ろに 1 行足される。
+    #[test]
+    fn pathless_observer_drain_appends_coalesced_line() {
+        let mut o = PathlessPeerAuthObserver {
+            lines: vec!["{\"event\":\"plugin_peer_auth\"}".to_string()],
+            coalesced: 2,
+        };
+        let lines = o.drain();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[1],
+            "{\"count\":2,\"event\":\"plugin_peer_auth\",\"outcome\":\"error\",\"reason\":\"peer_auth_rejections_coalesced\"}"
+        );
+        assert!(o.drain().is_empty());
     }
 
     /// PLUG-12: socket パスは空・相対・`..` 含みを拒否し、絶対パスのみ通す。

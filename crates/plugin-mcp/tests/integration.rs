@@ -132,26 +132,72 @@ mod uds {
         );
     }
 
-    /// 応答 1 行を期限内に読む。
+    /// 応答 1 行の最大バイト数（無制限確保を避ける。REPAIR-5）。
+    const MAX_REPLY_BYTES: usize = 64 * 1024;
+
+    /// テスト失敗（panic）時にも子を kill して有限の猶予で回収するガード。
+    struct ChildGuard(Option<Child>);
+
+    impl ChildGuard {
+        /// 正常系で子を取り出す（以降は `wait_exit` が回収する）。
+        fn into_inner(mut self) -> Child {
+            self.0.take().expect("child present")
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut c) = self.0.take() {
+                let _ = c.kill();
+                let start = Instant::now();
+                while start.elapsed() < REAP_GRACE {
+                    if matches!(c.try_wait(), Ok(Some(_))) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    /// 応答 1 行を絶対期限（`WAIT`）と受信サイズ上限つきで読む。
+    /// チャンクごとに期限とサイズを確認するため、改行なしのデータを送り続けられても戻る（REPAIR-5）。
     fn read_reply(reader: &mut BufReader<fandhe_container_plugin::UdsStream>) -> Value {
-        let mut line = String::new();
-        let start = Instant::now();
+        let mut line: Vec<u8> = Vec::new();
+        let deadline = Instant::now() + WAIT;
         loop {
-            match reader.read_line(&mut line) {
-                Ok(0) => panic!("connection closed before a reply: {line:?}"),
-                Ok(_) => break,
+            assert!(Instant::now() < deadline, "no reply within deadline");
+            let (used, done) = match reader.fill_buf() {
+                Ok([]) => panic!("connection closed before a reply: {} bytes", line.len()),
+                Ok(buf) => match buf.iter().position(|&b| b == b'\n') {
+                    Some(i) => {
+                        line.extend_from_slice(&buf[..i]);
+                        (i + 1, true)
+                    }
+                    None => {
+                        line.extend_from_slice(buf);
+                        (buf.len(), false)
+                    }
+                },
                 Err(e)
                     if matches!(
                         e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
                     ) =>
                 {
-                    assert!(start.elapsed() < WAIT, "no reply within deadline");
+                    continue;
                 }
                 Err(e) => panic!("read reply: {e}"),
+            };
+            reader.consume(used);
+            assert!(line.len() <= MAX_REPLY_BYTES, "reply exceeds size limit");
+            if done {
+                break;
             }
         }
-        serde_json::from_str(line.trim_end()).expect("reply is JSON")
+        serde_json::from_slice(&line).expect("reply is JSON")
     }
 
     /// MCP-1・MCP-2・PLUG-12 / TASK-118.4: 同一 UID の UDS 上で 3 要求が正常に応答する。拒否イベントは 0 件。
@@ -166,7 +212,10 @@ mod uds {
             .unwrap();
         let sock = dir.0.join("p.sock");
         let listener = UdsListener::bind(&sock).expect("bind");
-        let child = spawn_with(listener.path().as_os_str(), Some(&runtime));
+        let child = ChildGuard(Some(spawn_with(
+            listener.path().as_os_str(),
+            Some(&runtime),
+        )));
         let mut obs = JsonLinesPeerAuthObserver::new();
         let stream = listener
             .accept(Duration::from_secs(20), &mut obs)
@@ -244,7 +293,7 @@ mod uds {
         }
 
         drop(reader);
-        let (code, out, err) = wait_exit(child);
+        let (code, out, err) = wait_exit(child.into_inner());
         assert_eq!(code, 0, "{err}");
         assert_eq!(out, "", "stdout must stay empty in UDS mode");
         let ops: Vec<String> = err
@@ -320,9 +369,17 @@ mod uds {
         let (code, out, err) = wait_exit(spawn_with(path.as_os_str(), None));
         assert_eq!(code, 3, "{err}");
         assert_eq!(out, "");
+        // 先頭は socket パスを含まない拒否イベント（SEC-4）、末尾は固定の診断行。
+        let lines: Vec<&str> = err.lines().collect();
+        assert_eq!(lines.len(), 2, "{err}");
+        let ev: Value = serde_json::from_str(lines[0]).expect("event line is JSON");
+        assert_eq!(ev["event"], json!("plugin_peer_auth"), "{err}");
+        assert_eq!(ev["op"], json!("connect"), "{err}");
+        assert_eq!(ev["code"], json!("PERMISSION_DENIED"), "{err}");
+        assert!(ev.get("socket_path").is_none(), "{err}");
         assert_eq!(
-            err,
-            "{\"code\":\"PERMISSION_DENIED\",\"message\":\"peer credential does not match the current user\"}\n"
+            lines[1],
+            "{\"code\":\"PERMISSION_DENIED\",\"message\":\"peer credential does not match the current user\"}"
         );
         assert!(!err.contains(path.to_str().expect("utf8")), "{err}");
 

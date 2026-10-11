@@ -24,6 +24,8 @@ pub enum OciOpKind {
     FetchManifest,
     /// blob（レイヤー・config）のストリーミング取得（TASK-51.4）。
     FetchBlob,
+    /// 取得済み blob の sha256 digest 検証（open 失敗を含む操作全体。TASK-52.1）。
+    VerifyBlobDigest,
 }
 
 impl OciOpKind {
@@ -33,6 +35,7 @@ impl OciOpKind {
             OciOpKind::AuthenticateAnonymous => "oci.auth.anonymous",
             OciOpKind::FetchManifest => "oci.manifest.fetch",
             OciOpKind::FetchBlob => "oci.blob.fetch",
+            OciOpKind::VerifyBlobDigest => "oci.blob.verify",
         }
     }
 }

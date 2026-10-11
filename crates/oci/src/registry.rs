@@ -3,7 +3,7 @@
 //! #402（manifest 取得）・#403（blob のストリーミング取得）が共通で使う土台。通信する公開メソッドは
 //! 匿名トークン取得の `RegistryClient::authenticate_anonymous`（TASK-51.2・#401）と manifest 取得の
 //! `RegistryClient::fetch_manifest`（TASK-51.3・#402）と、blob のストリーミング取得
-//! `RegistryClient::fetch_blob`（TASK-51.4・#403）。blob は digest 未検証（検証は #405。REPAIR-3）。
+//! `RegistryClient::fetch_blob`（TASK-51.4・#403）。blob は `fetch_blob` では digest 未検証（`layer::verify_blob_digest` で別途検証する。#405。REPAIR-3）。
 //! OCI-3（資格情報つき認証）は未実装で、匿名のみ。
 //!
 //! 安全側の既定値:
@@ -231,7 +231,7 @@ impl RegistryClient {
     /// 期限切れの Bearer は通信せず `PermissionDenied`（再取得は呼び出し側）。各リクエストに
     /// `manifest_request_timeout` の全体期限と `max_manifest_bytes` の本文上限がある（REPAIR-5）。
     ///
-    /// 戻り値は digest 未検証（本文ハッシュと参照 digest の突合は #405）。成功・失敗とエラー code・所要時間は
+    /// 戻り値は本文 digest 未検証（本文ハッシュと参照 digest の突合は未実装）。成功・失敗とエラー code・所要時間は
     /// `with_recorder` の記録先へ 1 件記録する（REPAIR-4）。
     pub fn fetch_manifest(
         &self,
@@ -266,7 +266,7 @@ impl RegistryClient {
     /// URL のみ許可し、`Authorization` を送らず公開 IP のみへ接続する（SSRF・資格情報漏えい対策）。Location は
     /// 署名付きで秘密を含みうるためエラー・記録に載せない。相対 Location は未対応（拒否）。
     ///
-    /// 戻り値は digest 未検証（検証は #405・TASK-52）。Range による再開は未対応。トークンの期限検査は開始時のみ。
+    /// 戻り値は digest 未検証（`layer::verify_fetched_blob` で別途検証する。#405・TASK-52.1）。Range による再開は未対応。トークンの期限検査は開始時のみ。
     /// 成功・失敗とエラー code・所要時間は `with_recorder` の記録先へ 1 件記録する（REPAIR-4）。
     pub fn fetch_blob(
         &self,
@@ -445,7 +445,7 @@ pub struct FetchedBlob {
     pub path: PathBuf,
     /// 書き込んだバイト数（`Descriptor::size` と一致を確認済み）。
     pub size: u64,
-    /// 要求した digest。**本文のハッシュとは未突合**（検証は #405・TASK-52。検証前のファイルを信頼しない）。
+    /// 要求した digest。**本文のハッシュとは未突合**（`layer::verify_fetched_blob` で検証する。検証前のファイルを信頼しない。#405・TASK-52.1）。
     pub digest: Digest,
 }
 

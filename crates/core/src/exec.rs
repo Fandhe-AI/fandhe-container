@@ -104,6 +104,7 @@ mod capabilities;
 mod cgroup_join;
 mod container_env;
 mod devices;
+mod diagnostic;
 mod entrypoint_mode;
 mod exec_command;
 mod inject;
@@ -142,6 +143,10 @@ pub use devices::{
     DevptsDirStatus, DevptsGidSource, DevptsOutcome, create_default_devices,
 };
 /// 封印した複製の上限（結合試験が上限超過を再現するための再公開。TASK-163 追補・#1531）。
+pub use diagnostic::{
+    DiagnosticDelivery, DiagnosticDropReason, MAX_DIAGNOSTIC_LINE, emit_diagnostic_line,
+    emit_diagnostic_line_to,
+};
 pub use entrypoint_mode::{EntrypointExecMode, IntegrityLsm, PathBoundLsm, SealedCopyUnavailable};
 pub use exec_command::{ExecChild, ExecWorkerProof, spawn_exec_command, spawn_exec_worker};
 pub use inject::{InjectReport, InjectedDirectoryOutcome, InjectedFileOutcome, inject_files};
@@ -1437,7 +1442,7 @@ pub fn isolate_rootless_subordinate(
         EXIT_SETUP_FAILED,
     )
     .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
-    let mapper = ContainerChild::new(mapper_pid);
+    let mapper = ContainerChild::spawned(mapper_pid);
 
     let handshake = rootless_handshake(&mut parent_sock, plan);
     drop(parent_sock);

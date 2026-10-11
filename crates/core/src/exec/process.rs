@@ -2030,34 +2030,79 @@ pub fn spawn_container(rootfs: &Path, entry: &Entrypoint) -> Result<ContainerChi
 /// 挙動の変更（#1714）: `stages` に `with_landlock` を載せて全段が成功したときだけ制限適用の証跡
 /// （`LaunchReady`）がそろい exec へ進む。Landlock 無し・独自の Landlock フック・ダミーフックだけでは
 /// 証跡にならず exec は拒否される（fail-closed）。
+/// fork に成功した後、親の側で `dev.tty.legacy_tiocsti` が `1` のときだけ警告 1 行を標準エラーへ待たずに出す
+/// （CORE-5・SEC-1・REPAIR-4・REPAIR-5・#1739。出力は `report_legacy_tiocsti_to`。起動の可否は変えない）。
 pub fn spawn_container_with_stages(
     rootfs: &Path,
     entry: &Entrypoint,
     stages: StagePipeline,
 ) -> Result<ContainerChild, ExecError> {
+    spawn_container_reporting(
+        rootfs,
+        entry,
+        stages,
+        crate::legacy_tiocsti::read_host(),
+        std::io::stderr().as_fd(),
+    )
+    .map(|(child, _report)| child)
+}
+
+/// `dev.tty.legacy_tiocsti` の警告 1 行の出力結果（CORE-5・SEC-1・REPAIR-4・REPAIR-5・#1739）。
+/// 真偽値にせず、将来の状態を足せる形にする（`#[non_exhaustive]`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LegacyTiocstiReport {
+    /// 警告の対象ではない（`1` 以外。何も出していない）。
+    NotApplicable,
+    /// 警告の対象で、`emit_diagnostic_line_to` へ 1 回渡した。結果（送信済み・捨てた理由）を持つ。
+    Emitted(super::DiagnosticDelivery),
+}
+
+/// 観測結果が `Enabled` なら警告 1 行を `out` へ待たずに出し、結果を返す（CORE-5・SEC-1・REPAIR-4・REPAIR-5・#1739）。
+/// 出力は診断ログの共通経路（`emit_diagnostic_line_to`。AF_UNIX の socket 以外へは書かず、満杯でも待たない）の
+/// 1 回だけで、成否で起動の可否は変えない。
+pub fn report_legacy_tiocsti_to(
+    state: crate::legacy_tiocsti::LegacyTiocsti,
+    out: BorrowedFd<'_>,
+) -> LegacyTiocstiReport {
+    match crate::legacy_tiocsti::warning_line(state) {
+        Some(line) => LegacyTiocstiReport::Emitted(super::emit_diagnostic_line_to(out, line)),
+        None => LegacyTiocstiReport::NotApplicable,
+    }
+}
+
+/// `spawn_container_with_stages` の本体。観測値 `state` と警告の出力先 `out` を注入できる形にして、起動経路から
+/// 警告が出ることを結合試験で照合する（REPAIR-12・#1739）。fork に成功した後、親の側で 1 回だけ報告する
+/// （fork 失敗時は出さない）。子は exec 直前に fd 0〜2 を `/dev/null` へ差し替えるため、運用者へ確実に届く親の側で出す。
+fn spawn_container_reporting(
+    rootfs: &Path,
+    entry: &Entrypoint,
+    stages: StagePipeline,
+    state: crate::legacy_tiocsti::LegacyTiocsti,
+    out: BorrowedFd<'_>,
+) -> Result<(ContainerChild, LegacyTiocstiReport), ExecError> {
     let pid = sys::fork_single_threaded(
         || child_main(rootfs, entry, stages, None),
         EXIT_SETUP_FAILED,
     )
     .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
-    // 実際に起動したときだけ、親の側で 1 回観測する（fork 失敗時は出さない）。
-    report_legacy_tiocsti();
-    Ok(ContainerChild::spawned(pid))
+    let report = report_legacy_tiocsti_to(state, out);
+    Ok((ContainerChild::spawned(pid), report))
 }
 
-/// 起動時に `dev.tty.legacy_tiocsti` を読み、`1` のときだけ警告 1 行を標準エラーへ出す（CORE-5・SEC-1・
-/// REPAIR-4・#1739。契約は `legacy_tiocsti` モジュール）。観測だけで起動は止めず、書き込み失敗も捨てる。
-/// 子は exec 直前に fd 0〜2 を `/dev/null` へ差し替えるため、運用者へ確実に届く親の側で出す。短い固定 1 行で、
-/// 前例（`child_main` のエラー出力）と同じ標準エラーへの書き込み（REPAIR-5）。
-#[cfg(not(test))]
-fn report_legacy_tiocsti() {
-    let state = crate::legacy_tiocsti::read_host();
-    let _ = crate::legacy_tiocsti::write_warning(state, &mut std::io::stderr());
+/// 結合試験専用: 観測値と警告の出力先を注入して `spawn_container_with_stages` と同じ経路を通す
+/// （CORE-5・SEC-1・REPAIR-12・#1739）。通常の利用者は呼ばない。
+#[doc(hidden)]
+#[cfg(feature = "exec-test-support")]
+pub fn spawn_container_with_stages_reporting_for_test(
+    rootfs: &Path,
+    entry: &Entrypoint,
+    stages: StagePipeline,
+    state: crate::legacy_tiocsti::LegacyTiocsti,
+    out: BorrowedFd<'_>,
+) -> Result<(ContainerChild, LegacyTiocstiReport), ExecError> {
+    spawn_container_reporting(rootfs, entry, stages, state, out)
 }
-
-/// 単体試験: 試験プロセスの標準エラーを汚さず、ホストの値にも左右されないよう何もしない。
-#[cfg(test)]
-fn report_legacy_tiocsti() {}
 
 /// 結合試験専用: `spawn_container_with_stages` に、pivot 前の専用 `/dev`（`create_default_devices`）を足した版
 /// （CORE-5・SEC-1・REPAIR-12・#1714）。

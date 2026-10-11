@@ -30,11 +30,14 @@
 //! # 呼び出し元
 //!
 //! `exec::spawn_container_with_stages`（`spawn_container` を含む）が fork に成功した後、親の側で 1 回呼ぶ。
+//! 出力は core の診断ログの共通経路（`exec::emit_diagnostic_line_to`。AF_UNIX の socket 以外へは書かず、満杯でも
+//! 待たない。REPAIR-5）で、`exec::report_legacy_tiocsti_to` が行い、結果を `exec::LegacyTiocstiReport` で返す。
+//! 本モジュールは OS 非依存の観測と固定 1 行の生成だけを持ち、出力はしない。
 //! 本番の launcher はまだ無く（`REPAIR-3`）、launcher の追加後も実プロセスを起動する経路から同じ
-//! [`read_host`] と [`write_warning`] を呼ぶ。`/proc/sys/dev/tty/legacy_tiocsti` はグローバルな値で、
+//! [`read_host`] と [`warning_line`] を使う。`/proc/sys/dev/tty/legacy_tiocsti` はグローバルな値で、
 //! 親の user namespace から読んでも子と同じ値になる。非 Linux では常に `Absent` になり、呼び出し元は無い。
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::Path;
 
 /// 読む sysctl のパス。固定で、利用者の入力は入らない。
@@ -132,21 +135,6 @@ pub fn warning_line(state: LegacyTiocsti) -> Option<&'static str> {
     }
 }
 
-/// 警告が必要なら 1 行と LF を `write_all` 1 回で書き、書いたかを返す。呼び出し側は失敗しても起動を続ける。
-/// 1 行は短い固定長で、前例（`devpts_gid_omitted`）と同じ扱いの診断出力。
-pub fn write_warning(state: LegacyTiocsti, out: &mut dyn Write) -> io::Result<bool> {
-    match warning_line(state) {
-        Some(line) => {
-            let mut bytes = Vec::with_capacity(line.len() + 1);
-            bytes.extend_from_slice(line.as_bytes());
-            bytes.push(b'\n');
-            out.write_all(&bytes)?;
-            Ok(true)
-        }
-        None => Ok(false),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,20 +208,20 @@ mod tests {
 
     #[test]
     fn core5_sec1_1739_warning_line_exact_json() {
-        let mut out = Vec::new();
-        assert!(write_warning(LegacyTiocsti::Enabled, &mut out).unwrap());
-        assert_eq!(out, format!("{LINE}\n").into_bytes());
-        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let line = warning_line(LegacyTiocsti::Enabled).unwrap();
+        assert_eq!(line, LINE);
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
         let obj = v.as_object().unwrap();
         assert_eq!(obj.len(), 4);
         assert_eq!(obj["level"], "warn");
         assert_eq!(obj["event"], "legacy_tiocsti_enabled");
         assert_eq!(obj["sysctl"], SYSCTL_NAME);
         assert_eq!(obj["value"], 1);
+        assert!(!line.contains('\n') && !line.contains('\r'));
     }
 
     #[test]
-    fn core5_sec1_1739_other_states_write_nothing() {
+    fn core5_sec1_1739_other_states_have_no_line() {
         for s in [
             LegacyTiocsti::Absent,
             LegacyTiocsti::Disabled,
@@ -242,24 +230,8 @@ mod tests {
                 kind: io::ErrorKind::PermissionDenied,
             },
         ] {
-            let mut out = Vec::new();
-            assert!(!write_warning(s, &mut out).unwrap());
-            assert!(out.is_empty());
+            assert_eq!(warning_line(s), None, "{s:?}");
         }
-    }
-
-    #[test]
-    fn core5_sec1_1739_write_failure_is_returned_not_panicked() {
-        struct Failing;
-        impl Write for Failing {
-            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-                Err(io::Error::from(io::ErrorKind::BrokenPipe))
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        assert!(write_warning(LegacyTiocsti::Enabled, &mut Failing).is_err());
     }
 
     #[test]

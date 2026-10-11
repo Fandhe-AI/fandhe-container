@@ -194,6 +194,18 @@ else
     fail "mv failure structured (rc=$rc)"
 fi
 
+# 12 出力先パスに改行を含む場合は拒否し、何も書かない
+mkdir -p "$work/o12/real"
+ln -s "$work/o12/real" "$work/o12/a
+b"
+run ok --output "$work/o12/a
+b/L.md"
+if [ "$rc" -eq 2 ] && grep -q "code=bad-output" "$work/err" && [ -z "$(ls -A "$work/o12/real")" ]; then
+    pass "newline in output path rejected"
+else
+    fail "newline in output path rejected (rc=$rc)"
+fi
+
 if [ "$fails" -ne 0 ]; then
     echo "$fails check(s) failed"
     exit 1

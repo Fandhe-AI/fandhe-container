@@ -52,6 +52,10 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --output)
             [ $# -ge 2 ] || { err bad-argument "--output requires a value"; exit 2; }
+            # 改行等の制御文字は祖先 symlink 検査（read による分割）を迂回し得るため拒否する。
+            case "$2" in
+                *[[:cntrl:]]*) err bad-output "output path must not contain control characters"; exit 2 ;;
+            esac
             output="$2"
             shift 2
             ;;

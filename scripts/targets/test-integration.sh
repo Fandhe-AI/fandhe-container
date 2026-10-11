@@ -29,5 +29,5 @@ if [ "${count}" = "0" ]; then
   echo "notice: no integration test target, nothing to run"
   exit 0
 fi
-cargo test --workspace --test '*' --features fandhe-container-io/crash-test-server
+cargo test --workspace --test '*' --features fandhe-container-io/crash-test-server,fandhe-container-plugin/grpc
 cargo test -p fandhe-container-io --bins --features crash-test-server

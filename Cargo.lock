@@ -315,8 +315,12 @@ dependencies = [
 name = "fandhe-container-plugin"
 version = "0.0.0"
 dependencies = [
+ "prost",
  "serde",
  "serde_json",
+ "tokio",
+ "tonic",
+ "tonic-prost",
 ]
 
 [[package]]

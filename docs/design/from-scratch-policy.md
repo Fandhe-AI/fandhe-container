@@ -85,7 +85,7 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 | クレート | 理由 | issue |
 | -------- | ---- | ----- |
 | `bincode` | RUSTSEC-2025-0141 により不採用。ペイロードは serde_json で代替 | #246 |
-| `ring`・`aws-lc-rs` | C/C++ ネイティブビルドを引き込む（TLS の暗号実装は `rustls-graviola`）。`Cargo.lock` には rustls-webpki の optional 依存として `ring`・`cc` の項目が残るが、有効な feature に含まれずビルドされない（`cargo tree -e normal,build -i ring --target all` が空であることで確認する） | #399 |
+| `ring`・`aws-lc-rs` | C/C++ ネイティブビルドを引き込む（TLS の暗号実装は `rustls-graviola`）。`Cargo.lock` には rustls-webpki の optional 依存として `ring`・`cc` の項目が残るが、有効な feature に含まれずビルドされない（`cargo tree -e normal,build -i ring --target all` が空であることで確認する）。`ring`・`cc`・`aws-lc-rs` は `deny.toml` の `[bans]` で機械的に禁止しており、ビルド対象の依存グラフに入ると `make deny`（CI の rust-ci）が fail する | #399・#1779 |
 | `webpki-roots` | CDLA-Permissive-2.0 で `deny.toml` の許可外。ルート証明書は `rustls-native-certs` で OS から読む | #399 |
 | `native-tls` | Linux で OpenSSL のヘッダと `cc`・`pkg-config` のビルドが要る | #399 |
 | `ttrpc` | protobuf の実行時ライブラリの二重化・prost / nix の版の重複を招く。ワイヤー形式は crates/cri で自作 | #670 |

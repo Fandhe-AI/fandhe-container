@@ -1393,6 +1393,17 @@ mod linux {
             }
             ExitCode::from(err.exit_code().get())
         };
+        // 0b: execve は dumpable を 1 に戻す。特権ランチャー経由（ambient capability・AT_SECURE なし）で昇格した
+        // supervisor を同一 uid の親が ptrace して capability を奪えないよう、入口で改めて 0 にする（SUP-14・#1719）。
+        if let Err(e) = crate::sys::set_dumpable(false) {
+            return fail(
+                &mut out,
+                op_err(TraitError::new(
+                    ErrorCode::Internal,
+                    format!("PR_SET_DUMPABLE failed: {}", e.kind()),
+                )),
+            );
+        }
         // 1
         let args = match StartArgs::parse(args) {
             Ok(a) => a,

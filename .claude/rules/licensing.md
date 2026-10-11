@@ -12,6 +12,7 @@
 - 依存は MIT / Apache-2.0 / BSD / ISC / Unlicense / Zlib 等の permissive ライセンスに限る（`deny.toml` の許可リスト）
 - GPL / LGPL / AGPL 系・MPL-2.0 等のコピーレフト系の依存は導入しない
 - `cargo deny check licenses`（`make deny`・`make ci`・CI の rust-ci に含まれる）で許可外ライセンスを検出したら fail させる（OSS-4・OSS-5・REPAIR-9）
+- サードパーティのライセンス表記は `make third-party-licenses`（cargo-about。`about.toml` の `accepted` は `deny.toml` の allow と同期させる。TASK-103.1）で生成する。cargo-about の導入と CI 接続は #830（TASK-103.2）
 
 ## 非 Cargo 資産
 

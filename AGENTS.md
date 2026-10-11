@@ -51,6 +51,8 @@ make test                   # cargo test --workspace（既定 feature）
 make doc                    # RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps（既定 feature。rustdoc 警告のゲート）
 make test-integration       # cargo test --workspace --test '*' --features fandhe-container-io/crash-test-server ＋ --bins（結合試験。integration test target が 0 件なら notice を出して成功終了する）
 make deny                   # cargo deny --locked check advisories bans licenses sources
+make third-party-licenses   # cargo about でサードパーティのライセンス表記を生成（TASK-103.1・OSS-5。cargo-about 未導入なら失敗。OUTPUT=<file> 任意。make ci には含めない）
+make third-party-licenses-selftest  # 上記スクリプトの自己テスト（スタブ cargo のみ）
 make ci                     # lint-docs + check-workspace-manifest + fmt-check + lint + test + doc + deny を一括実行
 make bench-check-selftest   # ベンチ回帰比較スクリプトの自己テスト（REPAIR-8）
 make plugin-feature-size    # core の既定 / plugin 除外 release ビルドの rlib サイズ記録（PLUG-3・TASK-111.2。最終バイナリ未実装のため rlib 計測）

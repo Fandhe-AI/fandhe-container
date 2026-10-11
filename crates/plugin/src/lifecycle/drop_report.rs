@@ -207,17 +207,16 @@ impl PendingChildCleanup {
         std::mem::take(&mut self.partial_write_seen)
     }
 
-    /// 出すものが無いとき真。
+    /// 出すものが無いとき真。記録が無くても断片分離の印が残っていれば偽（分離用の改行を出す必要がある）。
     pub fn is_empty(&self) -> bool {
-        self.failures.is_empty() && self.dropped == 0
+        self.failures.is_empty() && self.dropped == 0 && !self.partial_write_seen
     }
 
     /// `Drop` 時と同じ固定書式で 1 行ずつ書く。即時書き込みが途中で切れた断片が後続の行と連結しないよう、
     /// 印が立っていれば先頭に改行を 1 つ出す。溢れた分は固定の 1 行で件数を出す。
     pub fn write_json_lines(&self, out: &mut dyn Write) -> io::Result<()> {
-        if self.is_empty() {
-            return Ok(());
-        }
+        // 部分書き込みの印と記録の push の間に並行して取り出された場合、記録が空で印だけが残る。印は表から
+        // 消えているため、ここで改行を出さないと次回の記録が断片へ連結する（REPAIR-4）。
         if self.partial_write_seen {
             out.write_all(b"\n")?;
         }
@@ -400,6 +399,24 @@ mod tests {
         assert!(out.starts_with("\n{\"event\""));
         t.push(ChildCleanupFailure::GroupKillFailed);
         assert!(render(&t.take()).starts_with("{\"event\""));
+    }
+
+    /// REPAIR-4・#1673: 記録が空で印だけを取り出した場合も分離用の改行を 1 つ出す（部分書き込みの印と push の間に
+    /// 並行して取り出された場合。次回の記録が断片へ連結しない）。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_partial_mark_without_records_still_emits_separator() {
+        let t = leaked_table(2);
+        t.mark_partial_write();
+        let p = t.take();
+        assert!(p.failures().is_empty());
+        assert!(!p.is_empty());
+        assert_eq!(render(&p), "\n");
+        t.push(ChildCleanupFailure::GroupKillFailed);
+        assert_eq!(
+            render(&t.take()),
+            format!("{}\n", ChildCleanupFailure::GroupKillFailed.to_json_line())
+        );
     }
 
     /// #1673: 印を呼び出し側が取り出すと 1 回だけ真で、以後の出力は先頭の改行を重ねない。

@@ -259,8 +259,8 @@ impl RegistryClient {
     /// `descriptor.size` を期待サイズの正とし、`max_blob_bytes` 超過は通信前に `ResourceExhausted`。応答の
     /// `Content-Length` が期待サイズと食い違えば本文に触れず `DataLoss`。本文は固定長バッファで流し、
     /// `Content-Length` の値でアロケーションしない。書き込みは `dest` + `.part` へ行い、サイズ一致を確認して
-    /// `rename` する（失敗時は `.part` を削除し、部分ファイルを `dest` に公開しない）。`dest` が既に存在すれば
-    /// `FailedPrecondition`。親ディレクトリは呼び出し側（ステージング領域）が用意する。
+    /// 宛先を置き換えない方式（hard_link）で公開する（失敗時は自分が作った `.part` だけを削除し、部分ファイルを
+    /// `dest` に公開しない）。`dest` が既に存在すれば（転送中に作られた場合も）`FailedPrecondition`。親ディレクトリは呼び出し側（ステージング領域）が用意する。
     ///
     /// CDN へのリダイレクト（301/302/303/307/308）は `max_redirects` 回まで手動で追従する。遷移先は絶対 https
     /// URL のみ許可し、`Authorization` を送らず公開 IP のみへ接続する（SSRF・資格情報漏えい対策）。Location は
@@ -480,6 +480,9 @@ fn validate_redirect_location(location: &str) -> Result<(), OciError> {
 struct LazyPartFile {
     path: PathBuf,
     file: Option<File>,
+    /// `create_new` が成功した（= このインスタンスが `.part` を所有する）ときだけ true。
+    /// 後始末の対象を自分が作ったファイルに限る（既存の `.part` や並行取得のファイルは消さない）。
+    created: bool,
 }
 
 impl LazyPartFile {
@@ -493,6 +496,7 @@ impl LazyPartFile {
                 o.mode(0o600);
             }
             self.file = Some(o.open(&self.path)?);
+            self.created = true;
         }
         self.file
             .as_mut()
@@ -520,18 +524,27 @@ impl Write for LazyPartFile {
     }
 }
 
-/// 失敗時（panic 含む）に `.part` を必ず消すガード。成功時だけ `armed` を落とす。
-struct PartGuard {
-    path: PathBuf,
-    armed: bool,
-}
-
-impl Drop for PartGuard {
+/// 自分が作った `.part` だけを drop（失敗・panic・公開後）で消す。`create_new` が失敗した経路
+/// （既存の `.part` が AlreadyExists・通信失敗でファイル未作成）では何も削除しない。
+impl Drop for LazyPartFile {
     fn drop(&mut self) {
-        if self.armed {
+        if self.created {
             let _ = std::fs::remove_file(&self.path);
         }
     }
+}
+
+/// `part` を `dest` へ「宛先が存在すれば失敗」する形で公開する（hard_link は 3 OS とも宛先があれば
+/// AlreadyExists で原子的に失敗する。`rename` は既存を置き換えるため使わない）。公開後の `.part` は
+/// 呼び出し側の drop が消す。宛先の競合は `FailedPrecondition`。
+fn publish_no_replace(part: &Path, dest: &Path) -> Result<(), OciError> {
+    std::fs::hard_link(part, dest).map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => OciError::new(
+            OciErrorCode::FailedPrecondition,
+            "blob destination already exists",
+        ),
+        _ => map_sink_error(e),
+    })
 }
 
 /// blob 取得の手順（通信は `transport` に委ねる。テストでは差し替える）。
@@ -576,13 +589,10 @@ fn fetch_blob_flow(
     part_name.push(".part");
     let part_path = dest.with_file_name(part_name);
 
-    let mut guard = PartGuard {
-        path: part_path.clone(),
-        armed: true,
-    };
     let mut sink = LazyPartFile {
         path: part_path,
         file: None,
+        created: false,
     };
 
     let mut url = endpoint.blob_url(repository, &descriptor.digest);
@@ -631,8 +641,7 @@ fn fetch_blob_flow(
         ));
     }
     sink.finish().map_err(map_sink_error)?;
-    std::fs::rename(&guard.path, dest).map_err(map_sink_error)?;
-    guard.armed = false;
+    publish_no_replace(&sink.path, dest)?;
     Ok(FetchedBlob {
         path: dest.to_path_buf(),
         size: written,
@@ -1939,8 +1948,7 @@ mod tests {
             let s = self.script.lock().expect("lock").remove(0);
             let mut n = 0u64;
             for c in &s.chunks {
-                sink.write_all(c)
-                    .map_err(|e| OciError::new(OciErrorCode::Internal, e.to_string()))?;
+                sink.write_all(c).map_err(map_sink_error)?;
                 n += c.len() as u64;
             }
             Ok(StreamResponse {
@@ -2132,6 +2140,64 @@ mod tests {
         assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
         assert_eq!(std::fs::read(tmp.dest()).expect("read"), b"x");
         assert!(t.seen.lock().expect("lock").is_empty());
+    }
+
+    /// 転送中に別処理が dest を作る競合を再現する通信（本文を流した後に dest を作る）。
+    #[derive(Debug)]
+    struct RaceStream {
+        inner: FakeStream,
+        dest: PathBuf,
+    }
+
+    impl RegistryTransport for RaceStream {
+        fn get(&self, req: &TransportRequest<'_>) -> Result<TransportResponse, OciError> {
+            self.inner.get(req)
+        }
+        fn get_stream(
+            &self,
+            req: &StreamRequest<'_>,
+            sink: &mut dyn Write,
+        ) -> Result<StreamResponse, OciError> {
+            let r = self.inner.get_stream(req, sink)?;
+            std::fs::write(&self.dest, b"other").expect("race write");
+            Ok(r)
+        }
+    }
+
+    /// OCI-1: 転送中に dest が作られたら上書きせず FailedPrecondition。他者の dest は無傷で `.part` は残らない。
+    #[test]
+    fn blob_dest_created_during_transfer_is_not_replaced() {
+        let tmp = TmpDir::new("race");
+        let t = RaceStream {
+            inner: FakeStream::new(vec![step(200, None, vec![b"abc".to_vec()])]),
+            dest: tmp.dest(),
+        };
+        let (ep, repo) = alpine();
+        let e = fetch_blob_flow(
+            &t,
+            &RegistryClientConfig::default(),
+            &ep,
+            &repo,
+            &desc(3),
+            &RegistryAuth::None,
+            &tmp.dest(),
+        )
+        .expect_err("race");
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(std::fs::read(tmp.dest()).expect("read"), b"other");
+        assert!(!tmp.part().exists());
+    }
+
+    /// OCI-1: 既存の `.part`（他者・並行取得）は失敗しても削除されず、FailedPrecondition になる。
+    #[test]
+    fn blob_existing_part_is_not_deleted() {
+        let tmp = TmpDir::new("foreign-part");
+        std::fs::write(tmp.part(), b"foreign").expect("write");
+        let t = FakeStream::new(vec![step(200, None, vec![b"abc".to_vec()])]);
+        let e = blob(&t, &RegistryAuth::None, &desc(3), &tmp.dest()).expect_err("part exists");
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(std::fs::read(tmp.part()).expect("read"), b"foreign");
+        assert!(!tmp.dest().exists());
     }
 
     /// OCI-1: 401 / 403 / 404 は分類つきのエラー。ファイルは作られない。

@@ -1,0 +1,342 @@
+//! バイナリ `fandhe-container-plugin-mcp` の UDS（PLUG-12 準拠）経由の起動・疎通の結合試験
+//! （TASK-118.4・#467。MCP-1・MCP-2・PLUG-12・REPAIR-5・REPAIR-12）。
+//!
+//! 接続方向は既存契約（core = ハーネスが `UdsListener` で bind、plugin が `FANDHE_CONTAINER_PLUGIN_SOCKET`
+//! の socket へ `UdsStream::connect` で接続）。UDS 上のフレーミングは改行区切りの JSON-RPC 2.0
+//! （暫定契約。確定は TASK-114）。既定集合のテストは同一 UID で `initialize` → `tools/list` →
+//! `tools/call` の 3 要求の応答を具体値で照合する。
+//!
+//! 別 UID の listener の拒否は root なしに用意できないため `#[ignore]` の実機前提テスト（準備手順は
+//! `AGENTS.md`「実機前提テスト」節）。ハーネス側 listener による別 UID connector の拒否は
+//! `crates/plugin/tests/peer_auth.rs` が検証済みで、本ファイルでは重複させない。
+//! 待ちはすべて期限つきで、超過時は kill して失敗にする（REPAIR-5）。
+
+use std::io::Read;
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+use fandhe_container_plugin::PLUGIN_SOCKET_ENV;
+
+const BIN: &str = env!("CARGO_BIN_EXE_fandhe-container-plugin-mcp");
+/// 子プロセスの終了・応答 1 行を待つ上限。
+const WAIT: Duration = Duration::from_secs(30);
+
+/// 子の終了を期限内に待ち、(終了コード, stdout, stderr) を返す。超過時は kill して失敗にする。
+fn wait_exit(mut child: Child) -> (i32, String, String) {
+    let out_rx = spawn_reader(child.stdout.take());
+    let err_rx = spawn_reader(child.stderr.take());
+    let start = Instant::now();
+    let status = loop {
+        if let Some(s) = child.try_wait().expect("try_wait") {
+            break s;
+        }
+        if start.elapsed() > WAIT {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("plugin binary did not exit within deadline");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let out = out_rx.recv_timeout(WAIT).expect("stdout not collected");
+    let err = err_rx.recv_timeout(WAIT).expect("stderr not collected");
+    (status.code().expect("exit code"), out, err)
+}
+
+fn spawn_reader<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut p) = pipe {
+            let _ = p.read_to_string(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
+/// 環境を空にして socket 環境変数だけを渡して起動する（stdin は null、stdout/stderr は収集）。
+fn spawn_with(sock: &std::ffi::OsStr, runtime_dir: Option<&std::path::Path>) -> Child {
+    let mut cmd = Command::new(BIN);
+    cmd.env_clear().env(PLUGIN_SOCKET_ENV, sock);
+    if let Some(dir) = runtime_dir {
+        cmd.env("XDG_RUNTIME_DIR", dir);
+    }
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        cmd.env("SystemRoot", root);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn fandhe-container-plugin-mcp")
+}
+
+#[cfg(unix)]
+mod uds {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
+    use std::path::{Path, PathBuf};
+
+    use fandhe_container_plugin::{JsonLinesPeerAuthObserver, UdsListener};
+    use serde_json::{Value, json};
+
+    /// 一時ディレクトリ（0700）。macOS の `temp_dir` は `sun_path` に収まらないことがあるため /tmp 直下に作る。
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            for n in 0..100u32 {
+                let p = PathBuf::from("/tmp")
+                    .join(format!("fc-mcp-{}-{nanos:x}-{n}", std::process::id()));
+                match std::fs::DirBuilder::new().mode(0o700).create(&p) {
+                    Ok(()) => return Self(p),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("create test dir: {e}"),
+                }
+            }
+            panic!("could not create a unique test dir");
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0); // 排他作成した自前のディレクトリのみ
+        }
+    }
+
+    /// root で実行すると状態ルートが `/run/fandhe-container` に解決され実環境へ触れるため、失敗させる（skip しない）。
+    fn assert_non_root(dir: &TempDir) {
+        let uid = std::fs::metadata(&dir.0).expect("meta").uid();
+        assert_ne!(
+            uid, 0,
+            "this test must run as a non-root user (state root would be /run)"
+        );
+    }
+
+    /// 応答 1 行を期限内に読む。
+    fn read_reply(reader: &mut BufReader<fandhe_container_plugin::UdsStream>) -> Value {
+        let mut line = String::new();
+        let start = Instant::now();
+        loop {
+            match reader.read_line(&mut line) {
+                Ok(0) => panic!("connection closed before a reply: {line:?}"),
+                Ok(_) => break,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    assert!(start.elapsed() < WAIT, "no reply within deadline");
+                }
+                Err(e) => panic!("read reply: {e}"),
+            }
+        }
+        serde_json::from_str(line.trim_end()).expect("reply is JSON")
+    }
+
+    /// MCP-1・MCP-2・PLUG-12 / TASK-118.4: 同一 UID の UDS 上で 3 要求が正常に応答する。拒否イベントは 0 件。
+    #[test]
+    fn mcp1_mcp2_plug12_three_requests_over_uds_same_uid() {
+        let dir = TempDir::new();
+        assert_non_root(&dir);
+        let runtime = dir.0.join("run");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&runtime)
+            .unwrap();
+        let sock = dir.0.join("p.sock");
+        let listener = UdsListener::bind(&sock).expect("bind");
+        let child = spawn_with(listener.path().as_os_str(), Some(&runtime));
+        let mut obs = JsonLinesPeerAuthObserver::new();
+        let stream = listener
+            .accept(Duration::from_secs(20), &mut obs)
+            .expect("accept");
+        assert_eq!(obs.len(), 0);
+        stream
+            .set_io_timeout(Duration::from_secs(1))
+            .expect("set timeout");
+        let mut reader = BufReader::new(stream);
+
+        let send = |reader: &mut BufReader<fandhe_container_plugin::UdsStream>, v: Value| {
+            let mut text = v.to_string();
+            text.push('\n');
+            reader
+                .get_mut()
+                .write_all(text.as_bytes())
+                .expect("write request");
+        };
+
+        send(
+            &mut reader,
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                "protocolVersion":"2025-06-18","capabilities":{},
+                "clientInfo":{"name":"harness","version":"0"}}}),
+        );
+        let init = read_reply(&mut reader);
+        assert_eq!(init["id"], json!(1));
+        assert_eq!(init["result"]["protocolVersion"], json!("2025-06-18"));
+        assert!(init.get("error").is_none(), "{init}");
+
+        send(
+            &mut reader,
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        );
+        send(
+            &mut reader,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+        );
+        let list = read_reply(&mut reader);
+        assert_eq!(list["id"], json!(2));
+        let names: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert_eq!(names, ["list_containers", "start_container"]);
+
+        send(
+            &mut reader,
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+                   "params":{"name":"list_containers","arguments":{}}}),
+        );
+        let call = read_reply(&mut reader);
+        assert_eq!(call["id"], json!(3));
+        assert!(call.get("error").is_none(), "{call}");
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(call["result"]["isError"], json!(false), "{call}");
+            assert_eq!(
+                call["result"]["structuredContent"]["containers"],
+                json!([]),
+                "{call}"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Linux 以外は状態ストアの実装が無く UNIMPLEMENTED を isError で返す。
+            assert_eq!(call["result"]["isError"], json!(true), "{call}");
+            assert_eq!(
+                call["result"]["structuredContent"]["code"],
+                json!("UNIMPLEMENTED"),
+                "{call}"
+            );
+        }
+
+        drop(reader);
+        let (code, out, err) = wait_exit(child);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(out, "", "stdout must stay empty in UDS mode");
+        let ops: Vec<String> = err
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["event"] == "mcp.request")
+            .map(|v| v["op"].as_str().unwrap_or("").to_owned())
+            .collect();
+        assert_eq!(
+            ops,
+            ["initialize", "notification", "tools/list", "tools/call"]
+        );
+        assert!(!err.contains("PERMISSION_DENIED"), "{err}");
+        assert!(!err.contains(sock.to_str().expect("utf8")), "{err}");
+    }
+
+    /// PLUG-12 / TASK-118.4: 相対パス・`..` 含みの socket 指定は終了コード 2 で拒否し、入力値を出力へ反射しない。
+    #[test]
+    fn plug12_uds_mode_rejects_invalid_socket_env_without_echo() {
+        for bad in ["relative/secret-name.sock", "/tmp/../secret-name.sock", ""] {
+            let (code, out, err) = wait_exit(spawn_with(std::ffi::OsStr::new(bad), None));
+            assert_eq!(code, 2, "{bad}: {err}");
+            assert_eq!(out, "");
+            assert_eq!(
+                err,
+                "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"invalid socket path\"}\n"
+            );
+        }
+    }
+
+    /// PLUG-12 / TASK-118.4: 存在しない socket は終了コード 3 で、パスを出力へ反射しない。
+    #[test]
+    fn plug12_uds_mode_reports_missing_socket_without_echo() {
+        let dir = TempDir::new();
+        let sock = dir.0.join("secret-missing.sock");
+        let (code, out, err) = wait_exit(spawn_with(sock.as_os_str(), None));
+        assert_eq!(code, 3, "{err}");
+        assert_eq!(out, "");
+        let v: Value = serde_json::from_str(err.trim_end()).expect("one JSON line");
+        assert_eq!(v["code"], json!("NOT_FOUND"), "{err}");
+        assert!(!err.contains("secret-missing"), "{err}");
+    }
+
+    /// PLUG-12 / TASK-118.4（実機前提）: 別 UID が listen 中の socket への接続を plugin-mcp が拒否し fail-closed する。
+    ///
+    /// 別 UID が listen 中で実行ユーザーから接続できる socket と、その listener が受信したバイトを
+    /// 書き出す空の記録ファイルを人間が用意する。fixture は読み取りと connect のみで、削除・chmod しない。
+    /// 確認は終了コード 3・固定の stderr に加え、listener 側の受信バイト数が 0 であること
+    /// （認証前にデータを送らない。PLUG-12・REPAIR-12）。テスト自身は sudo もシェルも呼ばない。
+    #[test]
+    #[ignore = "requires a listening socket owned by another UID prepared by a human; PLUG-12"]
+    fn plug12_rejects_other_uid_listener() {
+        let raw = std::env::var_os("FANDHE_CONTAINER_TEST_OTHER_UID_SOCKET").expect(
+            "FANDHE_CONTAINER_TEST_OTHER_UID_SOCKET must be set to an absolute path (see AGENTS.md)",
+        );
+        let recv_raw = std::env::var_os("FANDHE_CONTAINER_TEST_OTHER_UID_RECEIVED_FILE").expect(
+            "FANDHE_CONTAINER_TEST_OTHER_UID_RECEIVED_FILE must be set to an absolute path (see AGENTS.md)",
+        );
+        let recv_path = PathBuf::from(recv_raw);
+        assert!(
+            recv_path.is_absolute(),
+            "received file must be an absolute path"
+        );
+        let path = PathBuf::from(raw);
+        assert!(path.is_absolute(), "fixture must be an absolute path");
+        let meta = std::fs::symlink_metadata(&path).expect("fixture socket must exist");
+        assert!(meta.file_type().is_socket(), "fixture must be a socket");
+        let dir = TempDir::new();
+        let me = std::fs::metadata(&dir.0).expect("meta").uid();
+        assert_ne!(me, 0, "test must run as a non-root user");
+        assert_ne!(meta.uid(), me, "fixture must be owned by a different UID");
+
+        let (code, out, err) = wait_exit(spawn_with(path.as_os_str(), None));
+        assert_eq!(code, 3, "{err}");
+        assert_eq!(out, "");
+        assert_eq!(
+            err,
+            "{\"code\":\"PERMISSION_DENIED\",\"message\":\"peer credential does not match the current user\"}\n"
+        );
+        assert!(!err.contains(path.to_str().expect("utf8")), "{err}");
+
+        // listener が受信したバイト数は 0 でなければならない。終了後も決定的な猶予の間監視する。
+        assert!(
+            std::fs::metadata(&recv_path)
+                .expect("received-bytes file must exist")
+                .is_file(),
+            "received-bytes file must be a regular file"
+        );
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            let len = std::fs::metadata(&recv_path).expect("exists").len();
+            assert_eq!(len, 0, "listener of another UID must receive 0 bytes");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _: &Path = &path;
+    }
+}
+
+/// 非 unix では UDS が未実装のため、UDS モードは `UNIMPLEMENTED`・終了コード 3 で fail-closed する（PLUG-12）。
+#[cfg(not(unix))]
+#[test]
+fn plug12_uds_mode_is_unimplemented_on_non_unix() {
+    let sock = std::env::temp_dir().join("fc-mcp-none.sock");
+    let (code, out, err) = wait_exit(spawn_with(sock.as_os_str(), None));
+    assert_eq!(code, 3, "{err}");
+    assert_eq!(out, "");
+    assert!(err.contains("UNIMPLEMENTED"), "{err}");
+}

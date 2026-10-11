@@ -482,6 +482,26 @@ mod linux {
             })
     }
 
+    /// 全 16 種の launch 記録（`Nofile` は (700, 1500)、他は種別の添字から決める具体値。TASK-169 追補・#1467）。
+    fn full_rlimits() -> fandhe_container_core::rlimits::Rlimits {
+        use fandhe_container_core::rlimits::{Rlimit, RlimitKind, Rlimits};
+        Rlimits::new(
+            RlimitKind::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(i, k)| {
+                    let (soft, hard) = if k == RlimitKind::Nofile {
+                        (700, 1500)
+                    } else {
+                        (i as u64, 100 + i as u64)
+                    };
+                    Rlimit::new(k, soft, hard).expect("rlimit")
+                })
+                .collect(),
+        )
+        .expect("rlimits")
+    }
+
     /// joiner の引数（`<flag> <pid1> <scope> <instance> ...`）から Running の記録を再構成する。
     fn record_from_args(args: &[String]) -> (u32, StateRecord) {
         let pid: u32 = args
@@ -506,7 +526,8 @@ mod linux {
         .with_cgroup(CgroupPlacement::new(
             scope,
             StateRevision::from_raw(instance),
-        ));
+        ))
+        .with_rlimits(full_rlimits());
         (pid, record)
     }
 

@@ -6,7 +6,8 @@
 //!
 //! - `Seccomp: 2`・`NoNewPrivs: 1`（seccomp filter・`NO_NEW_PRIVS`）
 //! - capability: `CapBnd` / `CapPrm` / `CapEff` が OCI 既定集合（SEC-1。core の `DEFAULT_MASK` = `0xa80425fb`）
-//! - rlimit: `/proc/<pid>/limits` が pid1 と全 16 種で一致（launch と同じ値。SUP-12）
+//! - rlimit: `/proc/<pid>/limits` が launch 時の記録（`state.json` 相当の全 16 種）と一致し、pid1 が launch の後に soft を
+//!   上げていても記録の値になる（SUP-12・TASK-169 追補・#1467）
 //! - Landlock: 読み取り専用の root 配下への書き込みが拒否され（`deny/no` は作られない）、`rw` の mount 先
 //!   （`data/ok`）は作られる。seccomp: 禁止 syscall の `unshare(0)` が `EPERM`（`data/unshare_denied`）
 //! - cgroup: `/proc/<pid>/cgroup` がコンテナ用 cgroup（`<scope>/fc-<id>@<instance>`）直下の exec 用の子
@@ -115,9 +116,11 @@ mod linux {
     use fandhe_container_core::exec::{
         ChildExit, ContainerEnv, DevptsGidSource, ExecExit, IsolationConfig, MountIsolation,
         Namespace, NamespaceSet, ViolationReason, create_default_devices,
-        isolate_rootful_host_root, mount_tmpfs, pivot_root, plan_rootful_host_root, prepare_rootfs,
+        isolate_rootful_host_root, launch_rlimits_from_self, mount_tmpfs, pivot_root,
+        plan_rootful_host_root, prepare_rootfs,
     };
     use fandhe_container_core::oci_runtime::load_config;
+    use fandhe_container_core::rlimits::{Rlimit, RlimitKind, Rlimits};
     use fandhe_container_core::tmpfs::TmpfsMountSet;
     use fandhe_container_core::traits::{
         CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, StateRecord, StateRevision,
@@ -472,7 +475,18 @@ mod linux {
         (dir, path)
     }
 
-    /// 記録（Running・pid1 の host 側 pid・cgroup 配置つき）。joiner も同じ関数で作る。
+    /// launch 時の rlimit の記録（`--ulimit nofile=700:1500` 相当を指定し、残りの 15 種は launch 時点の実効値で埋めた
+    /// 全 16 種。#1467）。joiner はオーケストレータの子で、pid1 と同じ継承値を持つため、本番の launcher が使う
+    /// core の `launch_rlimits_from_self` で pid1 の launch 時の値と一致する集合が作れる。
+    fn launch_rlimits() -> Rlimits {
+        let specified = Rlimits::new(vec![
+            Rlimit::new(RlimitKind::Nofile, 700, 1500).expect("rlimit"),
+        ])
+        .expect("rlimits");
+        launch_rlimits_from_self(&specified).expect("launch rlimits")
+    }
+
+    /// 記録（Running・pid1 の host 側 pid・cgroup 配置・launch 時の rlimit つき）。joiner も同じ関数で作る。
     fn make_record(pid1: u32, bundle: &Path, scope: &str, instance: u64) -> StateRecord {
         let status = ContainerStatus::running(
             ContainerId::new(CONTAINER_ID).expect("id"),
@@ -484,6 +498,7 @@ mod linux {
                 CgroupScope::new(scope).expect("scope"),
                 StateRevision::from_raw(instance),
             ))
+            .with_rlimits(launch_rlimits())
     }
 
     /// コンテナ（pivot 済みの pid1）を起動して cgroup へ入れる。`tag` は合図・pid ファイルの識別子。
@@ -524,6 +539,20 @@ mod linux {
             finish_joiner(prlimit).0,
             Some(0),
             "prlimit must lower pid1's NOFILE"
+        );
+        // launch の後に pid1 が自分の soft を hard の範囲で上げる（コンテナ内のプロセスにできる操作）。exec は
+        // pid1 の今の値（1400）ではなく、launch 時の記録（700）を適用しなければならない（#1467）。
+        let raise = Command::new("prlimit")
+            .arg("--pid")
+            .arg(pid1.to_string())
+            .arg("--nofile=1400:1500")
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("run prlimit (util-linux)");
+        assert_eq!(
+            finish_joiner(raise).0,
+            Some(0),
+            "prlimit must raise pid1's NOFILE soft limit"
         );
         Container {
             stdin,
@@ -949,14 +978,26 @@ mod linux {
             "{child} {ctx}"
         );
         assert_ne!(cgroup, original_cgroup, "{ctx}");
-        // rlimit は launch と同じ（pid1 の実効値と全 16 種で一致）。
+        // rlimit は launch 時の記録と同じ（#1467）。pid1 は launch の後に NOFILE の soft を 1400 へ上げているが、
+        // exec は記録の 700 を適用する。他の 15 種は launch の継承値（記録）で、pid1 の値と一致する。
         let lines = limit_lines(pid);
         assert_eq!(lines.len(), 16, "{ctx}");
-        assert_eq!(lines, limit_lines(c.pid1), "{ctx}");
+        let pid1_lines = limit_lines(c.pid1);
+        assert!(
+            pid1_lines.contains(&"Max open files 1400 1500 files".to_owned()),
+            "pid1's NOFILE soft limit must have been raised after launch: {pid1_lines:?}; {ctx}"
+        );
         assert!(
             lines.contains(&"Max open files 700 1500 files".to_owned()),
-            "pid1's lowered NOFILE must be copied: {lines:?}; {ctx}"
+            "the recorded launch NOFILE must be applied, not pid1's current value: {lines:?}; {ctx}"
         );
+        let others = |v: &[String]| -> Vec<String> {
+            v.iter()
+                .filter(|l| !l.starts_with("Max open files"))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(others(&lines), others(&pid1_lines), "{ctx}");
         // Landlock と seccomp の遮断（プローブが残したファイル）。
         let rootfs = bundle.rootfs();
         assert!(

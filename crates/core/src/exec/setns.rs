@@ -333,16 +333,6 @@ impl Pid1Target {
         Ok(id)
     }
 
-    /// 対象の `/proc/<pid>/limits` の内容（上限つきで読む）。コンテナの rlimit の記録上の出所が無いため、
-    /// exec プロセスへ同じ値を適用する材料にする（SUP-6・SUP-12・TASK-163.4）。読み取りの後に pidfd の
-    /// 未終了を確認する。
-    pub(super) fn read_limits(&self) -> Result<String, ExecError> {
-        let text = read_bounded(&format!("/proc/{}/limits", self.pid))
-            .map_err(|e| target_proc_error(&e, "read target limits"))?;
-        ensure_not_exited(self, "refusing to copy its limits")?;
-        Ok(text)
-    }
-
     /// `pid` を候補として pid1 を特定し、検証を通ったものだけを対象にする。
     ///
     /// 期待 cgroup パスは、記録のコンテナ ID と cgroup 配置から `<scope>/fc-<id>@<instance>` として

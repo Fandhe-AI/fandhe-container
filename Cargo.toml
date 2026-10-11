@@ -49,7 +49,7 @@ undocumented_unsafe_blocks = "deny"
 # 採用済みは serde / serde_json（承認: Issue #138・TASK-29.hdep1。OCI config.json のパース用）・sha2（#278）・
 # objc2 系 5 件（#356・TASK-64.hdep1）・windows-sys（#371・TASK-67.hdep1）・
 # ureq / rustls / rustls-graviola / rustls-native-certs（#399・TASK-51.hdep1。crates/oci のレジストリクライアント用）。
-# tonic-prost-build / protox（#425・TASK-56.hdep1。build 時のみ）。
+# tonic-prost-build / protox（#425・TASK-56.hdep1。build 時のみ）・tonic / tonic-prost / prost（#425。crates/cri の実行時依存。TASK-56.4）。
 # workspace 内 crate の path 依存は外部クレートの追加ではない（TASK-111.1・#262・PLUG-3。core の optional 依存用）。
 [workspace.dependencies]
 fandhe-container-plugin = { path = "crates/plugin" }
@@ -88,6 +88,11 @@ rustls-native-certs = { version = "=0.8.4" }
 # cleanup-markdown（既定 feature）は外す。prost-build / tonic-build は推移依存として入り Cargo.lock で固定される。
 tonic-prost-build = { version = "=0.14.6", default-features = false, features = ["transport"] }
 protox = "=0.9.1"
+# 生成した gRPC コードの取り込み先（CRI-3・TASK-56.4）。承認: Issue #425・TASK-56.hdep1。
+# cri / plugin の gRPC 面のみで使い、core には入れない（PLUG-1・CORE-1）。承認条件のとおり `router` を有効にする。
+tonic = { version = "=0.14.6", default-features = false, features = ["codegen", "transport", "router"] }
+tonic-prost = "=0.14.6"
+prost = "=0.14.4"
 
 # 依存クレート（workspace メンバー以外）のデバッグ情報を行番号のみにする。
 # ローカルの `target/` は依存グラフ全体（tonic / prost・protox・objc2 系等）の full debuginfo が

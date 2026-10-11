@@ -1,7 +1,7 @@
 //! build.rs のコード生成の機械照合（TASK-56.3・#426・CRI-3・REPAIR-12）。
 //!
 //! 受け入れ条件「`cargo build` で `OUT_DIR` に生成コードが出る」を、生成物を文字列として読んで照合する。
-//! 生成物は `include!` しない（実行時の依存は TASK-56.4〔#427〕・TASK-108.1〔#453〕まで入れないため）。
+//! ここはファイル出力の確認用の文字列照合で、型の照合は `tests/generated_build_check.rs`（TASK-56.4・#427）が行う。
 
 const GENERATED: &str = include_str!(concat!(env!("OUT_DIR"), "/runtime.v1.rs"));
 

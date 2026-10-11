@@ -136,7 +136,7 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 | `deny-poc-venus-jig`（`deny` からも呼ぶ） | `platform-ci`（ubuntu のみ。結果が OS に依らない依存監査のため） |
 | `deny-license-fail-closed-selftest` | `platform-ci`（ubuntu のみ。cargo-deny の判定が OS に依らないため。TASK-90.2・OSS-4・OSS-5） |
 | `third-party-licenses-selftest`・`third-party-licenses` | `platform-ci`（ubuntu のみ。表記の生成結果が OS に依らないため。TASK-103.2・OSS-5） |
-| `plug4-core-invariance-selftest`・`cli-parity-selftest`・`cli-parity-native-reclaim-check`・`cli-parity-native-reclaim-selftest`・`vz-virtio-gpu-guest-check-selftest` | `platform-ci`（PR は ubuntu・main は 3 OS。Windows は Git Bash） |
+| `plug4-core-invariance-selftest`・`cli-parity-selftest`・`cli-parity-native-reclaim-check`・`cli-parity-native-reclaim-selftest`・`vz-virtio-gpu-guest-check-selftest`・`commit-msg-line-length-selftest` | `platform-ci`（PR は ubuntu・main は 3 OS。Windows は Git Bash） |
 | `bench-check-selftest`・`bench-baseline-selftest`・`bench-check`・`bench-plugin-boundary`・`plugin-feature-size` | `bench-regression` |
 | （対応 target なし。`rustup target add aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc` の後に、`<target>` をこの 3 つに置き換えて `cargo check --workspace --all-targets --all-features --target <target>` と `cargo clippy --workspace --all-targets --all-features --target <target> -- -D warnings`。`aarch64-apple-darwin`・`x86_64-pc-windows-msvc` は加えて既定 feature の `cargo clippy --workspace --all-targets --target <target> -- -D warnings` と `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --target <target>`。venus 試験治具は `cargo check` / `cargo clippy --manifest-path poc/venus-decoder/jig/Cargo.toml --locked --all-targets --target aarch64-apple-darwin`〔clippy は `-- -D warnings`〕） | `cross-target-check` |
 | `lint-docs` | `lint-docs` |

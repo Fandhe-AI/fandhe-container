@@ -1,10 +1,14 @@
 # Git hooks 定義（lefthook）。`make hooks`（lefthook install）で導入する。
 #
-# 方針（.claude/rules/conventional-commits.md・security.md。Fandhe-AI/rust-ai-library と同一）:
+# 方針（.claude/rules/git-hooks.md・conventional-commits.md・security.md）:
 # - --no-verify によるスキップは禁止
 # - Cargo.toml 未追加（workspace 作成予定）の間、cargo 系ジョブはスキップする
 #   （Makefile の HAS_CARGO 判定と同一方針）
-# - 重いチェック（clippy・test）は pre-push に置き、pre-commit は整形チェックのみで軽量に保つ
+# - フックの追加・変更時は .claude/rules/git-hooks.md の方針（時間予算・CI との役割分担）に従う
+# - GitHub Actions（ci.yml の rust-ci・platform-ci 等）で実行する検査はフックで重複実行しない。
+#   フックは CI に無い秘密情報検査と、staged 限定の軽量な整形・コミットメッセージ検査に限る
+#   （開発速度を落とさないため clippy・test は pre-push に置かない）
+# - ローカルゲート（make ci。.claude/rules/ci.md）の規約自体は変わらず、フックで強制しないだけ
 
 pre-commit:
   parallel: true
@@ -30,28 +34,43 @@ pre-commit:
     # 検出範囲を維持するため追加している）
     - name: secrets-guard
       run: |
-        # 末尾の `grep -q .` は「拒否パターンに一致し、かつ許可リストに一致しない行が
-        # 実在するか」の判定（BSD grep は空入力への `-qv` が 0 を返すため `-qv` は使わない）
+        # プロセス起動回数をファイル数に比例させないため、awk 1 本で全パスを判定する
+        # （旧実装の「1 ファイルごとに grep を 3 回」は --all-files で約 7 秒かかっていた）。
+        # 正規表現は awk -v ではなく ENVIRON で渡す（-v はバックスラッシュをエスケープとして
+        # 解釈し `\.` が崩れるため）。BSD awk は UTF-8 ロケールで不正なマルチバイト列に
+        # 当たると異常終了するため LC_ALL=C で照合する（パターンは ASCII のみ）。
+        # awk 自体が失敗した場合は判定できていないパスが残るため fail-closed で拒否する
         re='(^|/)\.env(\..+)?$|(^|/)(id_rsa|id_ed25519)(\..+)?$|\.(pem|p12|pfx|key|env)$'
         re_ok='\.(example|sample|template|pub)$'
-        for f in {staged_files}; do
-          if printf '%s\n' "$f" | grep -E "$re" | grep -vE "$re_ok" | grep -q .; then
-            echo "NG: 秘密情報ファイルがステージされています: $f" >&2
-            exit 1
-          fi
-        done
+        if ! hits=$(printf '%s\n' {staged_files} \
+          | LC_ALL=C RE="$re" RE_OK="$re_ok" awk '$0 ~ ENVIRON["RE"] && $0 !~ ENVIRON["RE_OK"]'); then
+          echo "NG: secrets check incomplete: failed to evaluate staged file names" >&2
+          exit 1
+        fi
+        if [ -n "$hits" ]; then
+          printf '%s\n' "$hits" | while IFS= read -r f; do
+            echo "NG: credential file is staged: $f" >&2
+          done
+          exit 1
+        fi
 
     # ファイル名パターンだけでは検出できない、内容そのものに秘密情報らしき
     # 文字列が含まれるケースの「うっかり」防止（網羅的な検出ではない。
     # サーバー側の最終防御線は GitHub の secret scanning + push protection
     # （リポジトリ設定で有効化済み）。誤検知した場合も --no-verify での回避は
     # 行わず、該当箇所の値を除去してから再ステージする）。
-    # staged diff の追加行（`+` 始まり。削除行・`+++` ヘッダ行は対象外）のみを
-    # 走査する。バイナリファイルは git diff が +/- 行を出力しないため自然に
+    # staged diff の hunk 内の追加行（`+` 始まり。削除行は対象外）のみを走査する。
+    # `+++ b/...` のファイルヘッダは `diff --git` から最初の `@@` までの間だけで
+    # 解釈する。バイナリファイルは git diff が +/- 行を出力しないため自然に
     # 除外される。検出時はファイル名とパターン種別のみを表示し、値そのものは
     # 出力しない。
     - name: secrets-content-guard
       run: |
+        # プロセス起動回数を diff 行数に比例させないため、awk 1 本で追加行の本文と
+        # ファイル名を行対応の一時ファイルへ書き出し、パターンごとに grep -E を 1 回だけ
+        # 実行する（追加行 × パターンごとに grep を起動する旧実装は 3000 行の diff で
+        # 約 47 秒かかった。awk の `{n}` 区間指定は古い mawk / BSD awk で使えないため
+        # grep -E 側で照合する。BSD / GNU の両方で動く。Fandhe-AI/fandhe-browser と同一実装）
         patterns='
         -----BEGIN [A-Z ]*PRIVATE KEY-----|private-key
         AKIA[0-9A-Z]{16}|aws-access-key-id
@@ -61,26 +80,75 @@ pre-commit:
         xox[abprs]-[A-Za-z0-9-]{10,}|slack-token
         AIza[0-9A-Za-z_-]{35}|google-api-key
         '
-        file=""
-        git diff --cached --diff-filter=ACMR -U0 -- . | while IFS= read -r line; do
-          case "$line" in
-            "+++ b/"*)
-              file="${line#+++ b/}"
-              ;;
-            "+++ "*)
-              ;;
-            "+"*)
-              content="${line#+}"
-              printf '%s\n' "$patterns" | while IFS='|' read -r pat kind; do
-                [ -z "$pat" ] && continue
-                if printf '%s' "$content" | grep -Eq -- "$pat"; then
-                  echo "NG: 秘密情報らしき文字列を検出しました: file=${file:-(unknown)} pattern=$kind" >&2
-                  exit 1
-                fi
-              done || exit 1
-              ;;
-          esac
-        done
+        tmp="$(mktemp -d)" || exit 1
+        trap 'rm -rf "$tmp"' EXIT
+        # diff の取得・追加行の抽出のどちらかが失敗した場合（一時領域の容量不足等）は、
+        # 検査できていない行が残るため fail-closed でコミットを拒否する。パイプの左辺の
+        # 終了状態は sh では取れないため、diff を一度ファイルへ書き出してから awk に渡す。
+        # 利用者の git 設定（color.diff=always・外部 diff ドライバ・リネーム検出）で出力形式が
+        # 変わると追加行を取りこぼすため、--no-color --no-ext-diff --no-renames で固定する
+        # （リネームは追加側として新パスの全行を走査する）
+        if ! git diff --cached --no-color --no-ext-diff --no-renames --diff-filter=ACMR -U0 -- . > "$tmp/diff"; then
+          echo "NG: secrets check incomplete: failed to read the staged diff" >&2
+          exit 1
+        fi
+        # hunk 内の追加行の本文が `++ b/` で始まると diff 上は `+++ b/...` になるため、
+        # ヘッダの解釈は hunk の外（`diff --git` から最初の `@@` まで）に限る。空白を含む
+        # パスに git が付ける末尾のタブと、特殊文字を含むパスの二重引用符（`+++ "b/..."`）も
+        # 外す。BSD awk は UTF-8 ロケールで不正なマルチバイト列を含む行に当たると異常終了
+        # するため LC_ALL=C で走査する。書き込み失敗（close の失敗）は非ゼロで返し、件数は
+        # stderr 経由で受け取って書き出した行数と照合する（抽出漏れのまま合格させない）
+        if ! LC_ALL=C awk -v cf="$tmp/content" -v nf="$tmp/names" '
+          /^diff --git / { inhunk = 0; file = ""; next }
+          /^@@ /         { inhunk = 1; next }
+          !inhunk && /^\+\+\+ "b\// { file = substr($0, 8); sub(/\t$/, "", file); sub(/"$/, "", file); next }
+          !inhunk && /^\+\+\+ b\//  { file = substr($0, 7); sub(/\t$/, "", file); next }
+          !inhunk        { next }
+          /^\+/          { print substr($0, 2) > cf; print (file == "" ? "(unknown)" : file) > nf; n++ }
+          END {
+            if (n > 0 && (close(cf) != 0 || close(nf) != 0)) exit 2
+            print n + 0 > "/dev/stderr"
+          }
+        ' "$tmp/diff" 2> "$tmp/count"; then
+          echo "NG: secrets check incomplete: failed to extract added lines" >&2
+          exit 1
+        fi
+        n="$(cat "$tmp/count")"
+        case "$n" in
+          ''|*[!0-9]*)
+            echo "NG: secrets check incomplete: failed to count added lines" >&2
+            exit 1
+            ;;
+        esac
+        if [ "$n" -eq 0 ]; then
+          exit 0
+        fi
+        if [ "$(wc -l < "$tmp/content" | tr -d ' ')" != "$n" ]; then
+          echo "NG: secrets check incomplete: extracted added lines are incomplete" >&2
+          exit 1
+        fi
+        # grep の終了状態は 0=一致あり・1=一致なし・2 以上=検査エラー。エラーを「一致なし」と
+        # 同一視すると検査できないまま合格するため、2 以上も NG にする（fail-closed）。
+        # パターンは ASCII のみのため LC_ALL=C で照合し、非 UTF-8 の行で grep が失敗・
+        # バイナリ扱いしないようにする（-a は NUL 等を含む行をバイナリ扱いさせないため）
+        rc=0
+        printf '%s\n' "$patterns" | {
+          while IFS='|' read -r pat kind; do
+            [ -z "$pat" ] && continue
+            LC_ALL=C grep -aEn -m1 -- "$pat" "$tmp/content" > "$tmp/hit"
+            grc=$?
+            if [ "$grc" -gt 1 ]; then
+              echo "NG: secrets check failed with an error: pattern=$kind" >&2
+              rc=1
+            elif [ "$grc" -eq 0 ]; then
+              ln="$(head -n1 "$tmp/hit" | cut -d: -f1)"
+              file="$(sed -n "${ln}p" "$tmp/names")"
+              echo "NG: possible secret detected: file=${file:-(unknown)} pattern=$kind" >&2
+              rc=1
+            fi
+          done
+          exit "$rc"
+        }
 
 commit-msg:
   jobs:
@@ -102,24 +170,3 @@ commit-msg:
           exit 1
         fi
         sh scripts/check-commit-msg-line-length.sh {1}
-
-pre-push:
-  jobs:
-    # clippy・test は Makefile の lint / test ターゲットへ委譲し、既定 feature のみで
-    # 実行する（`--all-features` 込みの検証は CI の rust-ci ジョブが担う）。
-    # Cargo.toml 未追加・メンバー crate 未作成なら make 側の HAS_CARGO / HAS_MEMBERS
-    # 判定で skip する
-    - name: clippy
-      run: |
-        if [ -f Cargo.toml ]; then
-          make lint
-        else
-          echo "skip: Cargo.toml 未追加"
-        fi
-    - name: test
-      run: |
-        if [ -f Cargo.toml ]; then
-          make test
-        else
-          echo "skip: Cargo.toml 未追加"
-        fi

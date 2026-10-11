@@ -22,11 +22,12 @@
 //! （手順 2 の確認の後に作るスレッドで、入口は Condvar で待つだけでロックを持たない）。報告は期限までに必ず 1 回書き、
 //! 後始末は報告の後に行う（契約は [`crate::start_contract`] の「報告の後の後始末」）。
 //! - 手順 5〜7 の失敗: 作った cgroup を [`StartDeps::release_cgroup`] で消す。
-//! - `start` が `Timeout` 以外: 予約を Created へ戻すことと子の terminate は core の `start` が行う。本入口は予約の解放と
-//!   core のワーカー完了を確かめてから cgroup を消す。
-//! - `start` が `Timeout`: 予約（Running・pid なし）が残る。本入口が終了すると core の後始末スレッドごと消えるため、
-//!   `recover_interrupted_start` を約 50ms 刻みで再試行して Created へ戻し、`take_unreaped_processes` で引き取った
-//!   ハンドルを terminate する。戻せたら cgroup を消し、戻せなければ cgroup を消さない。
+//! - `start` の失敗（Timeout を含む）は、状態を読み直して分ける。
+//!   - Created に戻っている（launch の失敗・launcher 自身が期限内に返した Timeout 等。core の `start` が予約を戻し、
+//!     子を terminate 済み）: 予約の解放と core のワーカー完了を確かめてから cgroup を消す。
+//!   - 予約（Running・pid なし）が残る（呼び出し境界の期限超過）: 本入口が終了すると core の後始末スレッドごと
+//!     消えるため、`recover_interrupted_start` を約 50ms 刻みで再試行して Created へ戻し、`take_unreaped_processes`
+//!     で引き取ったハンドルを terminate する。戻せたら cgroup を消し、戻せなければ cgroup を消さない。
 //! - 期限超過: `INTERNAL`（[`DEADLINE_EXCEEDED_MESSAGE`]）を報告し、作業スレッドの完了を有限の期限まで待って、
 //!   後から成功していれば起動したプロセスを terminate して `Stopped` を記録する。
 //! - 後始末を確かめられなければ終了コードは `INTERNAL`。後始末自体の失敗は元のエラーを隠さず、構造化ログ（stderr）に出す。
@@ -550,9 +551,8 @@ enum Cleanup {
     Nothing,
     /// cgroup の準備・監査 sink・launcher の構築の失敗（作った cgroup を消す）。
     ReleaseCgroup,
-    /// `start` が `Timeout`（予約を Created へ戻し、未回収のハンドルを terminate してから cgroup を消す）。
-    AfterTimeout(Arc<dyn ProcessLauncher>),
-    /// `start` が Timeout 以外で失敗（予約の解放と core のワーカー完了を確かめてから cgroup を消す）。
+    /// `start` が失敗（Timeout を含む。予約が残れば Created へ戻し、予約の解放と core のワーカー完了を確かめ、
+    /// 未回収のハンドルを terminate してから cgroup を消す）。
     AfterFailure(Arc<dyn ProcessLauncher>, Vec<Box<dyn LaunchedProcess>>),
 }
 
@@ -702,9 +702,6 @@ fn cleanup_after_report(
     let confirmed = match cleanup {
         Cleanup::Nothing => return true,
         Cleanup::ReleaseCgroup => return release_logged(deps.as_mut()),
-        Cleanup::AfterTimeout(launcher) => {
-            recover_after_timeout(store, &launcher, id, timeouts, Vec::new())
-        }
         Cleanup::AfterFailure(launcher, pending) => {
             settle_failed_start(store, &launcher, id, timeouts, pending)
         }
@@ -795,13 +792,11 @@ fn attempt_start(
                 instance,
             })
         }
-        Err(e) if e.code() == ErrorCode::Timeout => Attempt::Failed {
-            error: e,
-            cleanup: Cleanup::AfterTimeout(launcher),
-        },
+        // Timeout を含むすべての失敗を同じ確認に通す。呼び出し境界の期限超過なら予約（Running・pid なし）が残るので
+        // 回復し、launcher 自身が期限内に Timeout 等を返したなら core が予約を Created へ戻し済みなので解放を確かめる。
         // 記録の失敗後に terminate も失敗・超過した場合、core はハンドルを未回収レジストリに残して返す。
         // レジストリが空でも、core の後始末スレッドがハンドルを保持中・予約が Running のまま残る場合があるため、
-        // 報告の後に状態と core の予約の解放を確かめてから cgroup を消す（CORE-1・CORE-2）。
+        // 報告の後に状態と core の予約の解放を確かめてから cgroup を消す（CORE-1・CORE-2・CORE-3）。
         Err(e) => Attempt::Failed {
             error: e,
             cleanup: Cleanup::AfterFailure(launcher, take_unreaped_processes()),

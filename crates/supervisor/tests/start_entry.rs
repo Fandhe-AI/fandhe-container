@@ -980,3 +980,32 @@ fn sup1_mark_stopped_failure_exits_internal() {
     assert_eq!(code, exit_code_for(ErrorCode::Internal).get());
     assert_eq!(state, ContainerState::Running);
 }
+
+/// CORE-3・CORE-2: launcher 自身が期限内に Timeout を返した場合（core が予約を Created へ戻し済み）は、予約の解放を
+/// 確かめて cgroup を消し、TIMEOUT を報告して TIMEOUT の終了コードで終わる（後始末の失敗扱いにしない）。
+#[test]
+fn core3_launcher_timeout_within_deadline_releases_cgroup() {
+    let env = Env::new("lto");
+    env.create(&env.id);
+    let calls = new_calls();
+    let mut fl = FakeLauncher::new(&calls);
+    fl.launch_error = Some(ErrorCode::Timeout);
+    let (d, l) = deps(&calls, fl);
+    let mut out = Vec::new();
+    let code = start_with(&env, d, &env.id, &short_timeouts(), &mut out)
+        .err()
+        .expect("start must fail");
+    assert_eq!(code, exit_code_for(ErrorCode::Timeout));
+    assert_eq!(
+        calls_of(&calls),
+        ["check", "prepare", "audit", "build", "launch", "release"]
+    );
+    let rec = env.record(&env.id);
+    assert_eq!(rec.status().state(), ContainerState::Created);
+    assert!(rec.status().pid().is_none());
+    assert_eq!(l.terminated.load(Ordering::SeqCst), 0);
+    match report_of(&out) {
+        StartReport::Failed { code, .. } => assert_eq!(code, ErrorCode::Timeout),
+        other => panic!("unexpected report: {other:?}"),
+    }
+}

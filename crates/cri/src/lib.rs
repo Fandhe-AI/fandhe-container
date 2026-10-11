@@ -1,11 +1,14 @@
 //! fandhe-container-cri: CRI 実装ライブラリ（Runtime/ImageService・shim v2・streaming）。
 //!
-//! 現状は雛形のみで、実装はない（TASK-1.3・REPAIR-1。スタブの明示は REPAIR-3）。
+//! 雛形は TASK-1.3・REPAIR-1。現状の RPC 実装は `runtime_service` の `RunPodSandbox`（TASK-57.1・CRI-1）のみで、
+//! 他の RPC は `Unimplemented`、状態管理はメモリ上のスタブ（TASK-59 で置換。REPAIR-3）。
 //! 本体は G4（TASK-56〜63）で実装する。実行時は `fandhe-container-plugin-cri`（TASK-114）が
 //! 本 crate を別プロセスとして動かす。PLUG-1 区分は plugin 境界の外側（バックエンド実装ライブラリ。crate-naming.md）。
 //!
 //! TASK-56.1（#423・CRI-3）で雛形を確認済み。proto は TASK-56.2（#424）で `proto/api.proto` に配置済み。`build.rs`（TASK-56.3・#426）が `OUT_DIR/runtime.v1.rs` へ
-//! 生成し、[`runtime::v1`] で取り込む（TASK-56.4・#427。型の整合は `tests/generated_build_check.rs` で照合）。RPC 本体は TASK-57 以降で実装する。現状は実装のないスタブである（REPAIR-3）。
+//! 生成し、[`runtime::v1`] で取り込む（TASK-56.4・#427。型の整合は `tests/generated_build_check.rs` で照合）。RPC 本体は TASK-57 以降で順次実装する（未実装分はスタブ。REPAIR-3）。
+
+pub mod runtime_service;
 
 /// cri-api の proto package `runtime` に対応するモジュール階層（CRI-3・TASK-56.4）。
 pub mod runtime {

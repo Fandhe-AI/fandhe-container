@@ -28,7 +28,7 @@
 //! - 大文字小文字非区別 FS・Unicode 正規化による名前衝突の検出（IO-5）。
 //! - Windows ホストでの symlink エントリ（`Unimplemented` で拒否する）。
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
@@ -136,7 +136,7 @@ struct Extractor<'a> {
     entries: u64,
     bytes: u64,
     /// 所有者の rwx が欠けるディレクトリの mode。子の作成を妨げないよう全エントリ処理後に適用する。
-    deferred_dirs: Vec<(PathBuf, u32)>,
+    deferred_dirs: HashMap<PathBuf, u32>,
 }
 
 fn err(code: OciErrorCode, msg: &'static str) -> OciError {
@@ -244,16 +244,56 @@ impl<R> TarGuard<R> {
     }
 
     fn after_payload(&mut self) -> std::io::Result<()> {
-        if let Some(p) = self.pax.take()
-            && p.windows(6).any(|w| w == b" size=")
-        {
+        if let Some(p) = self.pax.take() {
+            pax_reject_size_override(&p)?;
+        }
+        Ok(())
+    }
+}
+
+/// PAX 拡張ヘッダ本体を長さ付きレコード（`<len> <key>=<value>\n`）として解析し、
+/// キーが正確に `size` のレコードがあれば拒否する（OCI-1）。
+/// `path` 等の値に ` size=` が含まれるだけの正常な tar は通す。構文違反は拒否する。
+fn pax_reject_size_override(body: &[u8]) -> std::io::Result<()> {
+    let malformed = || {
+        guard_error(
+            OciErrorCode::InvalidArgument,
+            "malformed pax extended header record",
+        )
+    };
+    let mut rest = body;
+    while !rest.is_empty() {
+        let sp = rest.iter().position(|b| *b == b' ').ok_or_else(malformed)?;
+        let len: usize = std::str::from_utf8(rest.get(..sp).ok_or_else(malformed)?)
+            .ok()
+            .and_then(|t| t.parse().ok())
+            .ok_or_else(malformed)?;
+        // レコード全体の長さは長さ欄自身を含む。空白と改行の分だけ最低でも sp + 2 ある。
+        if len < sp.saturating_add(2) {
+            return Err(malformed());
+        }
+        let record = rest.get(..len).ok_or_else(malformed)?;
+        if record.last() != Some(&b'\n') {
+            return Err(malformed());
+        }
+        let kv = record
+            .get(sp.saturating_add(1)..len.saturating_sub(1))
+            .ok_or_else(malformed)?;
+        let eq = kv.iter().position(|b| *b == b'=').ok_or_else(malformed)?;
+        if kv.get(..eq) == Some(&b"size"[..]) {
             return Err(guard_error(
                 OciErrorCode::InvalidArgument,
                 "pax size override is not supported",
             ));
         }
-        Ok(())
+        rest = rest.get(len..).ok_or_else(malformed)?;
     }
+    Ok(())
+}
+
+/// 添字の境界違反を構造化エラーで返す（外部入力経路では添字アクセスを使わない）。
+fn oob() -> std::io::Error {
+    guard_error(OciErrorCode::Internal, "tar guard buffer bounds violated")
 }
 
 impl<R: Read> Read for TarGuard<R> {
@@ -263,7 +303,7 @@ impl<R: Read> Read for TarGuard<R> {
         }
         if self.payload_left > 0 {
             let n = usize::try_from(self.payload_left).map_or(buf.len(), |l| l.min(buf.len()));
-            let r = self.inner.read(&mut buf[..n])?;
+            let r = self.inner.read(buf.get_mut(..n).ok_or_else(oob)?)?;
             if let (Some(p), Some(got)) = (self.pax.as_mut(), buf.get(..r)) {
                 p.extend_from_slice(got);
             }
@@ -275,14 +315,16 @@ impl<R: Read> Read for TarGuard<R> {
         }
         if self.pad_left > 0 {
             let n = usize::try_from(self.pad_left).map_or(buf.len(), |l| l.min(buf.len()));
-            let r = self.inner.read(&mut buf[..n])?;
+            let r = self.inner.read(buf.get_mut(..n).ok_or_else(oob)?)?;
             self.pad_left -= r as u64;
             return Ok(r);
         }
         let n = (512 - self.filled).min(buf.len());
-        let r = self.inner.read(&mut buf[..n])?;
-        self.header[self.filled..self.filled + r].copy_from_slice(&buf[..r]);
-        self.filled += r;
+        let r = self.inner.read(buf.get_mut(..n).ok_or_else(oob)?)?;
+        let end = self.filled.checked_add(r).ok_or_else(oob)?;
+        let dst = self.header.get_mut(self.filled..end).ok_or_else(oob)?;
+        dst.copy_from_slice(buf.get(..r).ok_or_else(oob)?);
+        self.filled = end;
         if self.filled == 512 {
             self.on_header()?;
             if self.payload_left == 0 {
@@ -518,9 +560,9 @@ impl Extractor<'_> {
             Err(e) => return Err(map_fs_err(&e)),
         }
         // 同じディレクトリの再定義は後勝ち。先の遅延 mode を残すと finish_dirs が後の mode を上書きする。
-        self.deferred_dirs.retain(|(p, _)| *p != path);
+        self.deferred_dirs.remove(&path);
         if needs_deferral(mode) {
-            self.deferred_dirs.push((path, mode));
+            self.deferred_dirs.insert(path, mode);
             Ok(())
         } else {
             apply_dir_mode(&path, mode)
@@ -645,8 +687,16 @@ impl Extractor<'_> {
 
     /// 遅延していたディレクトリの mode を深い順に適用する（実ディレクトリであることを再確認する）。
     fn finish_dirs(&mut self) -> Result<(), OciError> {
-        let mut dirs = std::mem::take(&mut self.deferred_dirs);
-        dirs.sort_by_key(|(p, _)| std::cmp::Reverse(p.components().count()));
+        let mut dirs: Vec<(PathBuf, u32)> = std::mem::take(&mut self.deferred_dirs)
+            .into_iter()
+            .collect();
+        // 深い順。同じ深さはパス順で決定的にする。
+        dirs.sort_by(|(a, _), (b, _)| {
+            b.components()
+                .count()
+                .cmp(&a.components().count())
+                .then_with(|| a.cmp(b))
+        });
         for (path, mode) in dirs {
             match fs::symlink_metadata(&path) {
                 Ok(m) if m.is_dir() => apply_dir_mode(&path, mode)?,
@@ -682,7 +732,7 @@ fn extract_inner<R: Read>(
         limits,
         entries: 0,
         bytes: 0,
-        deferred_dirs: Vec::new(),
+        deferred_dirs: HashMap::new(),
     };
     {
         let mut archive = Archive::new(TarGuard::new(&mut src));
@@ -1028,6 +1078,49 @@ mod tests {
             code(run(&sb, &[e, file("f", 0o644, b"x")])),
             OciErrorCode::InvalidArgument
         );
+    }
+
+    /// OCI-1: PAX の path 値に ` size=` を含むだけの正常な tar は拒否しない。
+    #[test]
+    fn oci1_pax_path_containing_size_text_is_accepted() {
+        let sb = Sandbox::new();
+        let body = pax_record("path", "a size=b.txt");
+        let e = raw_entry(
+            b"pax",
+            EntryType::XHeader,
+            b"",
+            0o644,
+            body.len() as u64,
+            &body,
+        );
+        let r = run(&sb, &[e, file("ignored", 0o644, b"x")]);
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    /// OCI-1: 構文違反の PAX レコードは構造化エラーで拒否する（パニックしない）。
+    #[test]
+    fn oci1_pax_malformed_record_is_rejected() {
+        for bad in [
+            &b"999 size=1\n"[..],
+            b"x size=1\n",
+            b"3 a\n",
+            b"12 size=999",
+        ] {
+            assert_eq!(
+                pax_reject_size_override(bad).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData,
+                "{bad:?}"
+            );
+        }
+    }
+
+    fn pax_record(key: &str, val: &str) -> Vec<u8> {
+        let base = key.len() + val.len() + 3;
+        let mut n = base;
+        while n.to_string().len() + base != n {
+            n = base + n.to_string().len();
+        }
+        format!("{n} {key}={val}\n").into_bytes()
     }
 
     /// OCI-1: symlink のターゲットがルートより上へ出るものは拒否、収まるものは成功する。

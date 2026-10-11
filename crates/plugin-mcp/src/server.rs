@@ -1,4 +1,4 @@
-//! stdio JSON-RPC 2.0 による MCP サーバーの処理（MCP-1・MCP-2。TASK-118.2・#465）。
+//! stdio JSON-RPC 2.0 による MCP サーバーの処理（MCP-1・MCP-2。TASK-118.2・MS-4・#465）。
 //!
 //! bin（`src/main.rs`）から stdin / stdout を渡されて呼ばれる。準拠する MCP のリビジョンは 2025-06-18
 //! （2026-07-28 版への追随は MCP-3・TASK-119）。フレーミングは改行区切りの 1 行 1 メッセージで、
@@ -387,6 +387,8 @@ where
 {
     // stderr が詰まっても要求処理を止めないよう、ログは専用スレッドへ非ブロッキングで渡す（REPAIR-5）。
     let (tx, rx) = mpsc::sync_channel::<String>(LOG_QUEUE_DEPTH);
+    // 配送完了の合図。終了時に未配送ログを期限付きで待つために使う（REPAIR-4・REPAIR-5）。
+    let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
     let spawned = thread::Builder::new()
         .name("mcp-log".into())
         .spawn(move || {
@@ -394,14 +396,22 @@ where
                 // 壊れた stderr で panic しない。詰まった場合はこのスレッドだけが止まる。
                 let _ = writeln!(io::stderr(), "{line}");
             }
+            let _ = done_tx.send(());
         });
     let logger_alive = spawned.is_ok();
-    serve_with(reader, writer, Limits::default(), &mut |line| {
+    let result = serve_with(reader, writer, Limits::default(), &mut |line| {
         if logger_alive {
             // 満杯・切断時は捨てる（try_send は待たない）。
             let _ = tx.try_send(line.to_owned());
         }
-    })
+    });
+    // Sender を drop してキューを閉じ、ログスレッドが drain し終えるのを DIAG_TIMEOUT まで待つ。
+    // stderr が停止していれば期限で打ち切り、終了は止めない。
+    drop(tx);
+    if logger_alive {
+        let _ = done_rx.recv_timeout(DIAG_TIMEOUT);
+    }
+    result
 }
 
 /// 診断 1 行を stderr へ書く。書き込みを専用スレッドで行い [`DIAG_TIMEOUT`] で打ち切る（REPAIR-5）。

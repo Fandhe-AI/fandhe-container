@@ -113,7 +113,22 @@
 //!   経路は実装済み（#1465）。この段関数単体は記録せず、`ExecError::violation` に載せて返すところまで
 //! - supervisor が起動時から保持する pidfd の、別プロセスの exec 専用プロセスへの受け渡し（execve 越しの継承・
 //!   `SCM_RIGHTS`。fork 継承は supervisor `exec::run_command_with_pidfd` で実装済み。#1461）
-//! - 記録 pid が入れ子の PID 1 でない起動経路（rootless の代役 init 等の中間プロセス）の pid1 特定
+//! - 本番 launcher（#1715 の Phase B）が PID 1 の pidfd を supervisor へ渡す手段（subreaper のもとで回収前に
+//!   `pidfd_open` する、または `SCM_RIGHTS`）。記録 pid の契約は下記のとおり固定した（#1463）
+//!
+//! # 記録 pid の契約と pid1 の特定（#1463・TASK-163 追補）
+//!
+//! - **記録 pid は PID 1 そのもの**: `LaunchedProcess::pid` / `launch_pidfd` はコンテナの PID 1（launcher の
+//!   PID namespace から見て `NSpid` が 2 要素で末尾 1）を指す契約とする。中間プロセス（fork 親・mapper・
+//!   rootless の代役 init）を記録する launcher は契約違反で、exec は `exec_target_not_nested_pid1` で拒否する
+//!   （fail-closed）。pid1 を後から探す走査は採らない
+//! - **`/proc/<pid>/task/*/children` の走査を採らない理由**: `CONFIG_PROC_CHILDREN` に依存しスレッドごとの
+//!   一覧なので取りこぼす。一覧の pid は読んでから `pidfd_open` するまでに再利用される窓を新たに作る（起動時の
+//!   pidfd〔#1461〕が閉じている窓）。使い捨ての中間プロセスが終了済みの設計では親子関係をたどれない
+//! - **procfs の PID namespace の前提**: `/proc` の属する PID namespace が呼び出し側と一致する（自分の
+//!   `NSpid` が 1 要素）ことを `/proc` を読む最初の段で確かめ、祖先の procfs を共有する構成は違反記録なしの
+//!   `FailedPrecondition` で拒否する（サポートには pid の換算が要り、未実装）
+//! - 特定した pid1 には cgroup 所属・`NSpid`・namespace 差異の検証が同じ強度で掛かる（新しい特定経路は無い）
 
 use std::fs;
 use std::io::Read;
@@ -376,6 +391,7 @@ impl Pid1Target {
                 "expected cgroup path must be an absolute, normalized, non-root cgroup path",
             ));
         }
+        verify_procfs_pid_ns()?;
         let pidfd = sys::pidfd_open(pid.get()).map_err(|e| setns_error(e, "pidfd_open"))?;
         Self::verify_pinned(pid, pidfd, expected_cgroup_path)
     }
@@ -413,6 +429,8 @@ impl Pid1Target {
                 "expected cgroup path must be an absolute, normalized, non-root cgroup path",
             ));
         }
+        // fdinfo の `Pid:` 照合より前に置く（祖先の procfs を共有する構成で誤った違反を記録しない。SEC-4）。
+        verify_procfs_pid_ns()?;
         use std::os::fd::AsRawFd as _;
         let info = read_bounded(&format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd()))
             .map_err(|e| target_proc_error(&e, "read pidfd info"))?;
@@ -687,6 +705,7 @@ pub fn join_namespaces(target: &Pid1Target) -> Result<NamespaceJoinReport, ExecE
             "the caller is multi-threaded or its thread count is unknown; refusing to setns",
         ));
     }
+    procfs_matches_caller_pid_ns(&own)?;
     // 所属 cgroup・user namespace の再照合は `setns` の直前に置く（残る窓を最小にする）。
     recheck_cgroup_membership(target)?;
     recheck_user_namespace(target)?;
@@ -793,17 +812,51 @@ fn ns_identity(path: &str) -> std::io::Result<NsIdentity> {
 /// （コンテナの中でさらに作られた PID namespace の PID 1）は対象にしない。行なし・非数値は fail-closed で
 /// `false`。
 fn nspid_is_nested_pid1(status: &str) -> bool {
-    let Some(rest) = status.lines().find_map(|l| l.strip_prefix("NSpid:")) else {
-        return false;
-    };
+    matches!(parse_nspid(status).as_deref(), Some([_, 1]))
+}
+
+/// `NSpid:` 行の各要素（外側の PID namespace から内側の順）を返す。行なし・空・非数値は `None`
+/// （fail-closed。`CONFIG_PID_NS` が無効なカーネルでは行自体が無い）。
+fn parse_nspid(status: &str) -> Option<Vec<u32>> {
+    let rest = status.lines().find_map(|l| l.strip_prefix("NSpid:"))?;
     let mut parsed = Vec::new();
     for tok in rest.split_whitespace() {
-        match tok.parse::<u32>() {
-            Ok(v) => parsed.push(v),
-            Err(_) => return false,
-        }
+        parsed.push(tok.parse::<u32>().ok()?);
     }
-    parsed.len() == 2 && parsed.last() == Some(&1)
+    if parsed.is_empty() {
+        None
+    } else {
+        Some(parsed)
+    }
+}
+
+/// 自プロセスの `/proc/self/status` の内容から、`/proc` の属する PID namespace が呼び出し側の PID namespace と
+/// 一致する（自分の `NSpid` がちょうど 1 要素）ことを確かめる純関数（SUP-6・SEC-1・SEC-4・#1463）。
+///
+/// 祖先の procfs を共有する入れ子の構成では `/proc/<pid>` の番号の空間と `pidfd_open(pid)` の空間が食い違い、
+/// 別のプロセスを読む・正当な対象を `exec_target_pidfd_mismatch` と誤記録する恐れがあるため、サポートせず
+/// 違反記録なしの前提エラーで拒否する（呼び出し文脈の誤り）。
+fn procfs_matches_caller_pid_ns(own_status: &str) -> Result<(), ExecError> {
+    match parse_nspid(own_status) {
+        Some(v) if v.len() == 1 => Ok(()),
+        Some(_) => Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::SetNs,
+            "procfs at /proc does not belong to the caller's PID namespace; cannot identify pid1",
+        )),
+        None => Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::SetNs,
+            "NSpid is missing or malformed in /proc/self/status; cannot identify pid1",
+        )),
+    }
+}
+
+/// [`procfs_matches_caller_pid_ns`] を実プロセスの `/proc/self/status` で行う。`/proc` を読む最初の段で呼ぶ。
+fn verify_procfs_pid_ns() -> Result<(), ExecError> {
+    let own = read_bounded("/proc/self/status")
+        .map_err(|e| ExecError::from_io(&e, IsolationStage::SetNs, "read own status"))?;
+    procfs_matches_caller_pid_ns(&own)
 }
 
 /// 期待 cgroup パスの形式検証: `/` 始まりの絶対パスで、ルート（`/`）でなく、各要素が空 / `.` / `..` で
@@ -843,6 +896,44 @@ mod tests {
     use super::*;
     use crate::exec::ViolationKind;
     use crate::traits::StateRevision;
+
+    /// #1463: `NSpid` の解析は行なし・空・非数値を `None` にする。
+    #[test]
+    fn sup6_1463_parse_nspid_concrete_values() {
+        assert_eq!(parse_nspid("NSpid:\t4242\t1\n"), Some(vec![4242, 1]));
+        assert_eq!(parse_nspid("NSpid:\t4242\n"), Some(vec![4242]));
+        assert_eq!(parse_nspid("Name:\tx\n"), None);
+        assert_eq!(parse_nspid("NSpid:\t\n"), None);
+        assert_eq!(parse_nspid("NSpid:\t4242\tabc\n"), None);
+    }
+
+    /// #1463: procfs の PID namespace 前提検査（違反記録なしの FailedPrecondition）。
+    #[test]
+    fn sup6_1463_procfs_pid_ns_check_concrete_values() {
+        assert!(procfs_matches_caller_pid_ns("NSpid:\t4242\n").is_ok());
+        let e = procfs_matches_caller_pid_ns("NSpid:\t9000\t42\n").unwrap_err();
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.stage, IsolationStage::SetNs);
+        assert!(e.violation.is_none());
+        assert_eq!(
+            e.message,
+            "procfs at /proc does not belong to the caller's PID namespace; cannot identify pid1"
+        );
+        let e = procfs_matches_caller_pid_ns("Name:\tx\n").unwrap_err();
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message,
+            "NSpid is missing or malformed in /proc/self/status; cannot identify pid1"
+        );
+        let e = procfs_matches_caller_pid_ns("NSpid:\tx\n").unwrap_err();
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+    }
+
+    /// #1463: 通常環境（自前の procfs）では前提検査が通る。
+    #[test]
+    fn sup6_1463_procfs_pid_ns_check_passes_on_host() {
+        assert!(verify_procfs_pid_ns().is_ok());
+    }
 
     fn me() -> NonZeroU32 {
         NonZeroU32::new(std::process::id()).unwrap()

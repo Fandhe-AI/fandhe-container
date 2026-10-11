@@ -183,6 +183,11 @@ jobs:
       # 条件式は不要になった
       cache: true
       cache-key-prefix: fandhe-container
+      # cache の保存は main への push だけにし、PR は restore のみにする
+      # （Fandhe-AI/actions#165 の入力）。PR スコープの blob が main と同内容で重複保存され、
+      # リポジトリの上限 10 GB を圧迫していたため（github-actions.md「キャッシュ方針」）。
+      # 本 workflow は push（main）でも走り、そこで保存した blob を PR が restore-keys で読む
+      cache-save: ${{ github.ref == 'refs/heads/main' }}
 
   # --------------------------------------------------
   # platform-ci（ネイティブのビルド・テスト・タイムアウト保護付き結合試験。REPAIR-7 ステージ 1〜3）

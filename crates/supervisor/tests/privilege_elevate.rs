@@ -25,9 +25,11 @@ fn main() {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::fs;
-    use std::io::Read;
-    use std::os::unix::fs::PermissionsExt;
-    use std::process::{Command, Stdio};
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, ExitStatus, Stdio};
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::traits::ErrorCode;
@@ -37,6 +39,8 @@ mod linux {
     const MIN_HEX: &str = "0000000028201122";
     /// 実機のシナリオで子の待機に設ける上限（REPAIR-5）。
     const CHILD_TIMEOUT: Duration = Duration::from_secs(60);
+    /// 強制終了後の回収（`wait`）と、子の終了後の標準出力回収に設ける上限（REPAIR-5）。
+    const REAP_TIMEOUT: Duration = Duration::from_secs(10);
 
     pub fn run() {
         if let Ok(role) = std::env::var(CHILD_ENV) {
@@ -112,7 +116,11 @@ mod linux {
         };
         match elevate(method) {
             Ok(r) => println!("elevate=ok held={}", r.held.len()),
-            Err(e) => println!("elevate=err {}:{:?}", e.code.as_str(), e.reason),
+            Err(e) => {
+                // SUP-14: Err のとき後続の exec・書き込み・chown をせず、診断だけ出して非ゼロで終了する。
+                println!("elevate=err {}:{:?}", e.code.as_str(), e.reason);
+                std::process::exit(1);
+            }
         }
         for k in [
             "CapPrm",
@@ -134,38 +142,120 @@ mod linux {
             .map(|s| s.success())
             .unwrap_or(false);
         println!("kill_pid1={kill_ok}");
+        // 共有 /tmp 上の予測可能な名前でも、O_EXCL（create_new）は既存の symlink / ファイルを採用せず失敗し、
+        // 以降の chown は作成した fd に対して行う。
         let path = std::env::temp_dir().join(format!("fc-elevate-chown-{}", std::process::id()));
-        let chown = fs::write(&path, b"x")
-            .and_then(|()| std::os::unix::fs::chown(&path, Some(0), None))
+        let chown = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .and_then(|mut f| {
+                f.write_all(b"x")?;
+                std::os::unix::fs::fchown(&f, Some(0), None)
+            })
             .map_err(|e| e.raw_os_error());
         let _ = fs::remove_file(&path);
         println!("chown_to_root={chown:?}");
     }
 
-    fn run_child(mut cmd: Command) -> Vec<(String, String)> {
+    /// 強制終了した子を期限付きで回収する。回収できなくても無期限には待たない（REPAIR-5）。
+    fn kill_and_reap(c: &mut Child) {
+        let _ = c.kill();
+        let deadline = Instant::now() + REAP_TIMEOUT;
+        while Instant::now() < deadline {
+            if matches!(c.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        eprintln!("privilege_elevate: killed child was not reaped within {REAP_TIMEOUT:?}");
+    }
+
+    /// 子を起動し、終了待ち・標準出力の回収・強制終了後の回収のすべてに期限を付けて実行する（REPAIR-5）。
+    /// 期限超過・起動失敗は panic（失敗）にする。
+    fn run_bounded(mut cmd: Command, what: &str) -> (ExitStatus, String) {
         cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
-        let mut c = cmd.spawn().expect("spawn child (setpriv required)");
+        let mut c = cmd
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawn {what} failed: {e}"));
+        // 子孫が標準出力を保持し続けても本体が固まらないよう、読み取りは別スレッド + 期限付き受信にする。
+        let (tx, rx) = mpsc::channel();
+        if let Some(mut so) = c.stdout.take() {
+            std::thread::spawn(move || {
+                let mut out = String::new();
+                let r = so.read_to_string(&mut out).map(|_| out);
+                let _ = tx.send(r);
+            });
+        }
         let start = Instant::now();
         let status = loop {
-            if let Some(s) = c.try_wait().expect("try_wait") {
-                break s;
+            match c.try_wait() {
+                Ok(Some(s)) => break s,
+                Ok(None) => {}
+                Err(e) => {
+                    kill_and_reap(&mut c);
+                    panic!("try_wait on {what} failed: {e}");
+                }
             }
             if start.elapsed() > CHILD_TIMEOUT {
-                let _ = c.kill();
-                let _ = c.wait();
-                panic!("child timed out");
+                kill_and_reap(&mut c);
+                panic!("{what} timed out");
             }
             std::thread::sleep(Duration::from_millis(50));
         };
-        let mut out = String::new();
-        if let Some(mut so) = c.stdout.take() {
-            so.read_to_string(&mut out).expect("read child output");
-        }
+        let out = match rx.recv_timeout(REAP_TIMEOUT) {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => panic!("read {what} output failed: {e}"),
+            Err(_) => panic!("{what} output not closed within {REAP_TIMEOUT:?}"),
+        };
+        (status, out)
+    }
+
+    fn run_child(cmd: Command) -> Vec<(String, String)> {
+        let (status, out) = run_bounded(cmd, "child");
         assert!(status.success(), "child failed: {status:?}\n{out}");
         out.lines()
             .filter_map(|l| l.split_once('='))
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect()
+    }
+
+    /// 共有一時ディレクトリの下に、排他的に（既存なら失敗）root 所有 0755 のディレクトリを新規作成する。
+    /// 事前の削除はしない。作成後に種別と所有者を確認し、攻撃者が用意したものを採用しない。
+    fn create_private_dir(prefix: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
+        fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&dir)
+            .unwrap_or_else(|e| panic!("exclusive mkdir {} failed: {e}", dir.display()));
+        let md = fs::symlink_metadata(&dir).expect("stat dir");
+        assert!(md.is_dir(), "{} is not a directory", dir.display());
+        // euid は /proc の Uid 行（real effective saved fs の 2 番目）から取得する（unsafe を使わない）。
+        let euid: u32 = status_field("Uid")
+            .split_whitespace()
+            .nth(1)
+            .and_then(|v| v.parse().ok())
+            .expect("parse euid");
+        assert_eq!(md.uid(), euid, "{} not owned by us", dir.display());
+        dir
+    }
+
+    /// `src` を `dst` へ排他的に（O_EXCL）複製して 0755 にする。
+    fn copy_exclusive(src: &Path, dst: &Path) {
+        let mut input = fs::File::open(src).expect("open exe");
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .open(dst)
+            .expect("exclusive create copy");
+        std::io::copy(&mut input, &mut output).expect("copy exe");
+        output.flush().expect("flush copy");
     }
 
     fn get<'a>(kv: &'a [(String, String)], key: &str) -> &'a str {
@@ -209,20 +299,15 @@ mod linux {
         println!("privilege_elevate: setuid-root scenario: ok");
 
         // (c) ランチャー相当: root 所有 0755 の複製に file capability を付け、非 root で起動する。
-        let dir = std::env::temp_dir().join(format!("fc-elevate-launcher-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("mkdir");
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("chmod dir");
+        let dir = create_private_dir("fc-elevate-launcher");
         let copy = dir.join("launcher");
         let result = std::panic::catch_unwind(|| {
-            fs::copy(&exe, &copy).expect("copy exe");
+            copy_exclusive(&exe, &copy);
             fs::set_permissions(&copy, fs::Permissions::from_mode(0o755)).expect("chmod");
             let caps = "cap_sys_admin,cap_mknod,cap_setpcap,cap_net_admin,cap_audit_write,cap_dac_override,cap_kill+ep";
-            let st = Command::new("setcap")
-                .arg(caps)
-                .arg(&copy)
-                .status()
-                .expect("setcap required");
+            let mut sc = Command::new("setcap");
+            sc.arg(caps).arg(&copy);
+            let (st, _) = run_bounded(sc, "setcap");
             assert!(
                 st.success(),
                 "setcap failed (xattr must be supported on the temp dir)"

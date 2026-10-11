@@ -57,8 +57,11 @@ TOML
     failures=$((failures + 1))
     return
   fi
-  out="$(cargo deny --manifest-path "${WORK}/root/Cargo.toml" --config "${DENY_TOML}" --locked \
+  # CI は CARGO_TERM_COLOR=always のため、色なし指定と ANSI 除去の両方で判定文字列の分断を防ぐ
+  out="$(NO_COLOR=1 CARGO_TERM_COLOR=never cargo deny --color never \
+    --manifest-path "${WORK}/root/Cargo.toml" --config "${DENY_TOML}" --locked \
     check licenses 2>&1)" || code=$?
+  out="$(printf '%s\n' "${out}" | sed $'s/\x1b\\[[0-9;]*m//g')"
   if [ "${expect}" = reject ]; then
     if [ "${code}" -ne 0 ] && grep -q 'rejected' <<<"${out}" && grep -q 'licenses FAILED' <<<"${out}"; then ok=1; fi
   else

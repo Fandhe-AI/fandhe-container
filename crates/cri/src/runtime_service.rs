@@ -1,8 +1,15 @@
-//! `RuntimeService` の CRI 実装（TASK-57.1・#429・CRI-1・ERR-3）。
+//! `RuntimeService` の CRI 実装（TASK-57.1・TASK-57.2・#429・#430・CRI-1・ERR-3）。
 //!
 //! `fandhe-container-plugin-cri`（TASK-108）が gRPC サーバーへ載せる `RuntimeService` 実装の本体。
-//! 本ファイルの時点で実装済みなのは `RunPodSandbox` のみで、他の RPC は `Unimplemented` を返す
-//! （Stop/Remove は #430、Status/List は #431、Container 系は TASK-58 で追加する）。
+//! 本ファイルの時点で実装済みなのは `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox` で、
+//! 他の RPC は `Unimplemented` を返す（Status/List は #431、Container 系は TASK-58 で追加する）。
+//!
+//! **Stop/Remove の未知 ID の扱い（ERR-3）**: `StopPodSandbox` は存在しない ID を `NOT_FOUND` にする
+//! （受け入れ基準）。cri-api の proto コメントは回収済みならエラーにしない冪等性を求めるため差異があり、
+//! 受け入れ基準を優先している。`RemovePodSandbox` は proto コメントどおり未知 ID を成功（冪等）とする。
+//! どちらも空の `pod_sandbox_id` は `INVALID_ARGUMENT`。既に停止済みの Stop は成功で状態は変わらない。
+//! Stop は枠（件数・保持量）を解放せず、Remove だけが解放する。ready のままの Remove は強制削除で、
+//! コンテナの強制終了は TASK-58 で追加する（現状はレコード除去のみ。REPAIR-3）。
 //!
 //! **スタブの明示（REPAIR-3）**: サンドボックスの状態はプロセス内メモリのレジストリにだけ持つ。
 //! 実行層（core）には未接続で、永続化もしない。TASK-59 で `StateStore` / `ContainerRuntime` へ置き換える
@@ -17,7 +24,7 @@
 //! 直接呼ぶ経路にも効かせるためと、受信上限では累積を縛れないため。検証の詳細は `config_limits`
 //! サブモジュール。
 //!
-//! **可観測性（REPAIR-4）**: `RunPodSandbox` は全終了経路（成功・入力不正・上限超過・内部エラー）で、
+//! **可観測性（REPAIR-4）**: `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox` は全終了経路（成功・入力不正・上限超過・内部エラー）で、
 //! 結果のステータスコードと所要時間を [`CriOpRecorder`] へ 1 件渡す。記録先は
 //! [`CriRuntimeService::with_recorder`] で注入する（既定は記録しない）。`config`・labels・annotations・
 //! エラー文言は記録先へ渡さない。
@@ -109,11 +116,10 @@ impl SandboxLimits {
 
 /// サンドボックスの内部状態（CRI の `PodSandboxState` に対応）。
 ///
-/// `NotReady` への遷移は StopPodSandbox（#430）が使う。
+/// `NotReady` への遷移は StopPodSandbox（#430）が行う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SandboxState {
     Ready,
-    #[allow(dead_code)]
     NotReady,
 }
 
@@ -277,6 +283,57 @@ impl CriRuntimeService {
         registry.retained_bytes = total_retained_bytes;
         Ok(v1::RunPodSandboxResponse { pod_sandbox_id })
     }
+
+    /// `StopPodSandbox` の本体。ready を notready へ遷移させる（冪等。CRI-1・TASK-57.2）。
+    ///
+    /// 未知 ID は `NOT_FOUND`、空 ID は `INVALID_ARGUMENT`。件数・保持量の枠は解放しない。
+    /// エラー文言には入力の ID を含めない。
+    fn stop_sandbox(
+        &self,
+        req: v1::StopPodSandboxRequest,
+    ) -> Result<v1::StopPodSandboxResponse, Status> {
+        if req.pod_sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("pod_sandbox_id is required"));
+        }
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+        let record = registry
+            .records
+            .get_mut(&req.pod_sandbox_id)
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        record.state = SandboxState::NotReady;
+        Ok(v1::StopPodSandboxResponse {})
+    }
+
+    /// `RemovePodSandbox` の本体。記録を除去し、件数と保持量の枠を解放する（CRI-1・TASK-57.2）。
+    ///
+    /// 未知 ID は成功（冪等）。保持量の合計が記録の和と食い違う場合は、レジストリを変更せず
+    /// `INTERNAL` で失敗する。ready のままでも強制削除する（コンテナの強制終了は TASK-58）。
+    fn remove_sandbox(
+        &self,
+        req: v1::RemovePodSandboxRequest,
+    ) -> Result<v1::RemovePodSandboxResponse, Status> {
+        if req.pod_sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("pod_sandbox_id is required"));
+        }
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+        let Some(record) = registry.records.get(&req.pod_sandbox_id) else {
+            return Ok(v1::RemovePodSandboxResponse {});
+        };
+        // 先に引けることを確かめてから除去し、失敗時にレジストリを変更しない。
+        let remaining = registry
+            .retained_bytes
+            .checked_sub(record.retained_bytes)
+            .ok_or_else(|| Status::internal("sandbox registry is inconsistent"))?;
+        registry.records.remove(&req.pod_sandbox_id);
+        registry.retained_bytes = remaining;
+        Ok(v1::RemovePodSandboxResponse {})
+    }
 }
 
 /// 64 文字の小文字 16 進 ID を採番する（containerd・crictl の慣習に合わせる）。
@@ -366,17 +423,26 @@ impl RuntimeService for CriRuntimeService {
     ) -> Result<Response<v1::VersionResponse>, Status> {
         Err(Status::unimplemented("version"))
     }
+    /// サンドボックスを notready にする（冪等。未知 ID は `NOT_FOUND`。CRI-1・ERR-3・TASK-57.2）。
     async fn stop_pod_sandbox(
         &self,
-        _request: Request<v1::StopPodSandboxRequest>,
+        request: Request<v1::StopPodSandboxRequest>,
     ) -> Result<Response<v1::StopPodSandboxResponse>, Status> {
-        Err(Status::unimplemented("stop_pod_sandbox"))
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::StopPodSandbox);
+        let result = self.stop_sandbox(request.into_inner());
+        timer.finish_with(&result);
+        result.map(Response::new)
     }
+
+    /// サンドボックスの記録を除去する（冪等。未知 ID は成功。CRI-1・ERR-3・TASK-57.2）。
     async fn remove_pod_sandbox(
         &self,
-        _request: Request<v1::RemovePodSandboxRequest>,
+        request: Request<v1::RemovePodSandboxRequest>,
     ) -> Result<Response<v1::RemovePodSandboxResponse>, Status> {
-        Err(Status::unimplemented("remove_pod_sandbox"))
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::RemovePodSandbox);
+        let result = self.remove_sandbox(request.into_inner());
+        timer.finish_with(&result);
+        result.map(Response::new)
     }
     async fn pod_sandbox_status(
         &self,
@@ -870,7 +936,7 @@ mod tests {
     fn task_57_1_unimplemented_rpcs_are_not_recorded() {
         let collect = Arc::new(Collect::default());
         let svc = CriRuntimeService::with_recorder(collect.clone());
-        block_on(svc.stop_pod_sandbox(Request::new(v1::StopPodSandboxRequest::default())))
+        block_on(svc.pod_sandbox_status(Request::new(v1::PodSandboxStatusRequest::default())))
             .unwrap_err();
         assert_eq!(collect.outcomes(), vec![]);
     }
@@ -888,13 +954,208 @@ mod tests {
         assert!(!debug.contains("do-not-print"));
     }
 
-    /// 未実装の RPC は Unimplemented のまま（#430 で stop_pod_sandbox を実装する際にこのテストを差し替える）。
+    /// 未実装の RPC は Unimplemented のまま（#431 で pod_sandbox_status を実装する際にこのテストを差し替える）。
     #[test]
     fn task_57_1_other_rpcs_remain_unimplemented() {
         let svc = CriRuntimeService::new();
         let err =
-            block_on(svc.stop_pod_sandbox(Request::new(v1::StopPodSandboxRequest::default())))
+            block_on(svc.pod_sandbox_status(Request::new(v1::PodSandboxStatusRequest::default())))
                 .unwrap_err();
         assert_eq!(err.code(), Code::Unimplemented);
+    }
+
+    fn stop(
+        svc: &CriRuntimeService,
+        id: &str,
+    ) -> Result<Response<v1::StopPodSandboxResponse>, Status> {
+        block_on(
+            svc.stop_pod_sandbox(Request::new(v1::StopPodSandboxRequest {
+                pod_sandbox_id: id.into(),
+            })),
+        )
+    }
+
+    fn remove(
+        svc: &CriRuntimeService,
+        id: &str,
+    ) -> Result<Response<v1::RemovePodSandboxResponse>, Status> {
+        block_on(
+            svc.remove_pod_sandbox(Request::new(v1::RemovePodSandboxRequest {
+                pod_sandbox_id: id.into(),
+            })),
+        )
+    }
+
+    fn run_id(svc: &CriRuntimeService) -> String {
+        run(svc, Some(config("p")), "")
+            .unwrap()
+            .into_inner()
+            .pod_sandbox_id
+    }
+
+    /// ERR-3・TASK-57.2: 存在しない ID の Stop は NOT_FOUND で、レジストリは変わらない。
+    #[test]
+    fn task_57_2_stop_unknown_id_returns_not_found() {
+        let svc = CriRuntimeService::new();
+        run_id(&svc);
+        let before = svc.retained_bytes();
+        let err = stop(&svc, &"0".repeat(64)).unwrap_err();
+        assert_eq!(err.code(), Code::NotFound);
+        assert_eq!(err.message(), "sandbox not found");
+        assert_eq!(svc.sandbox_count(), 1);
+        assert_eq!(svc.retained_bytes(), before);
+    }
+
+    /// CRI-1・TASK-57.2: Stop で notready になり、再度の Stop も成功で状態・config・保持量は変わらない。
+    #[test]
+    fn task_57_2_stop_marks_notready_and_is_idempotent() {
+        let svc = CriRuntimeService::new();
+        let id = run_id(&svc);
+        let retained = svc.retained_bytes();
+        for _ in 0..2 {
+            stop(&svc, &id).unwrap();
+            let reg = svc.registry.lock().unwrap();
+            let rec = reg.records.get(&id).unwrap();
+            assert_eq!(rec.state.to_proto(), PodSandboxState::SandboxNotready);
+            assert_eq!(rec.config, config("p"));
+            assert_eq!(rec.retained_bytes, retained);
+        }
+        assert_eq!(svc.retained_bytes(), retained);
+    }
+
+    /// CRI-1・TASK-57.2: Stop だけでは枠を解放しない。
+    #[test]
+    fn task_57_2_stop_does_not_free_slot() {
+        let svc = CriRuntimeService::with_max_sandboxes(1);
+        let id = run_id(&svc);
+        stop(&svc, &id).unwrap();
+        let err = run(&svc, Some(config("p")), "").unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    /// CRI-1・TASK-57.2: Remove で記録と保持量の計上の両方が消える。
+    #[test]
+    fn task_57_2_remove_deletes_record_and_retained_bytes() {
+        let svc = CriRuntimeService::new();
+        let a = run_id(&svc);
+        let b = run_id(&svc);
+        let per_sandbox = svc.retained_bytes() / 2;
+        remove(&svc, &a).unwrap();
+        {
+            let reg = svc.registry.lock().unwrap();
+            assert!(!reg.records.contains_key(&a));
+            let sum: usize = reg.records.values().map(|r| r.retained_bytes).sum();
+            assert_eq!(sum, reg.retained_bytes);
+        }
+        assert_eq!(svc.sandbox_count(), 1);
+        assert_eq!(svc.retained_bytes(), per_sandbox);
+        remove(&svc, &b).unwrap();
+        assert_eq!(svc.sandbox_count(), 0);
+        assert_eq!(svc.retained_bytes(), 0);
+    }
+
+    /// CRI-1・TASK-57.2: ready のままでも Remove でき、その後の Stop は NOT_FOUND。
+    #[test]
+    fn task_57_2_remove_ready_sandbox_forces_removal() {
+        let svc = CriRuntimeService::new();
+        let id = run_id(&svc);
+        remove(&svc, &id).unwrap();
+        assert_eq!(svc.sandbox_count(), 0);
+        assert_eq!(stop(&svc, &id).unwrap_err().code(), Code::NotFound);
+    }
+
+    /// ERR-3・TASK-57.2: 未知 ID の Remove は成功（冪等）で、状態は変わらない。
+    #[test]
+    fn task_57_2_remove_unknown_id_is_idempotent_ok() {
+        let svc = CriRuntimeService::new();
+        let id = run_id(&svc);
+        let retained = svc.retained_bytes();
+        remove(&svc, &"f".repeat(64)).unwrap();
+        remove(&svc, &"f".repeat(64)).unwrap();
+        assert_eq!(svc.sandbox_count(), 1);
+        assert_eq!(svc.retained_bytes(), retained);
+        remove(&svc, &id).unwrap();
+        remove(&svc, &id).unwrap();
+        assert_eq!(svc.sandbox_count(), 0);
+    }
+
+    /// CRI-1・TASK-57.2: Remove で件数の枠が空き、次の Run が成功する。
+    #[test]
+    fn task_57_2_remove_frees_slot_for_new_run() {
+        let svc = CriRuntimeService::with_max_sandboxes(1);
+        let id = run_id(&svc);
+        remove(&svc, &id).unwrap();
+        run(&svc, Some(config("p")), "").unwrap();
+        assert_eq!(svc.sandbox_count(), 1);
+    }
+
+    /// ERR-3・TASK-57.2: 空の pod_sandbox_id は Stop・Remove とも INVALID_ARGUMENT。
+    #[test]
+    fn task_57_2_empty_id_is_invalid_argument() {
+        let svc = CriRuntimeService::new();
+        for err in [stop(&svc, "").unwrap_err(), remove(&svc, "").unwrap_err()] {
+            assert_eq!(err.code(), Code::InvalidArgument);
+            assert_eq!(err.message(), "pod_sandbox_id is required");
+        }
+    }
+
+    /// TASK-57.2: 保持量が記録の和より小さい不整合は INTERNAL で失敗し、レジストリを変更しない。
+    #[test]
+    fn task_57_2_remove_inconsistent_retained_bytes_fails_without_change() {
+        let svc = CriRuntimeService::new();
+        let id = run_id(&svc);
+        svc.registry.lock().unwrap().retained_bytes = 0;
+        let err = remove(&svc, &id).unwrap_err();
+        assert_eq!(err.code(), Code::Internal);
+        assert_eq!(err.message(), "sandbox registry is inconsistent");
+        assert_eq!(svc.sandbox_count(), 1);
+        assert_eq!(svc.retained_bytes(), 0);
+    }
+
+    /// REPAIR-4・TASK-57.2: Stop・Remove の全終了経路で結果とコードが 1 件ずつ記録される。
+    #[test]
+    fn task_57_2_every_exit_path_is_recorded() {
+        let collect = Arc::new(Collect::default());
+        let svc = CriRuntimeService::with_recorder(collect.clone());
+        let id = run_id(&svc);
+        stop(&svc, &id).unwrap();
+        stop(&svc, &"0".repeat(64)).unwrap_err();
+        stop(&svc, "").unwrap_err();
+        remove(&svc, &id).unwrap();
+        remove(&svc, &id).unwrap();
+        remove(&svc, "").unwrap_err();
+
+        let svc = CriRuntimeService::with_recorder(collect.clone());
+        let poisoned = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = svc.registry.lock().unwrap();
+                    panic!("poison the registry lock");
+                })
+                .join()
+        });
+        assert!(poisoned.is_err());
+        stop(&svc, "x").unwrap_err();
+        remove(&svc, "x").unwrap_err();
+
+        let (run_k, s, r) = (
+            CriOpKind::RunPodSandbox,
+            CriOpKind::StopPodSandbox,
+            CriOpKind::RemovePodSandbox,
+        );
+        assert_eq!(
+            collect.outcomes(),
+            vec![
+                (run_k, CriOpOutcome::Success, Code::Ok),
+                (s, CriOpOutcome::Success, Code::Ok),
+                (s, CriOpOutcome::Failure, Code::NotFound),
+                (s, CriOpOutcome::Failure, Code::InvalidArgument),
+                (r, CriOpOutcome::Success, Code::Ok),
+                (r, CriOpOutcome::Success, Code::Ok),
+                (r, CriOpOutcome::Failure, Code::InvalidArgument),
+                (s, CriOpOutcome::Failure, Code::Internal),
+                (r, CriOpOutcome::Failure, Code::Internal),
+            ]
+        );
     }
 }

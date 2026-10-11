@@ -4,8 +4,9 @@
 //! 匿名トークン取得の `RegistryClient::authenticate_anonymous`（TASK-51.2・#401）と manifest 取得の
 //! `RegistryClient::fetch_manifest`（TASK-51.3・#402）と、blob のストリーミング取得
 //! `RegistryClient::fetch_blob`（TASK-51.4・#403）。blob は `fetch_blob` では digest 未検証（`layer::verify_blob_digest` で別途検証する。#405。REPAIR-3）。
-//! Basic 認証の検証 `RegistryClient::authenticate_basic`（TASK-54.1・OCI-3・#416）も持つ。Bearer の資格情報つき
-//! 交換は #417、チャレンジに応じた統一入口は #418 で未実装。
+//! Basic 認証の検証 `RegistryClient::authenticate_basic`（TASK-54.1・OCI-3・#416）と、資格情報つき Bearer
+//! トークン交換 `RegistryClient::authenticate_bearer`（TASK-54.2・OCI-3・#417）も持つ。OAuth2 の POST フロー
+//! （`refresh_token`）とチャレンジに応じた統一入口（#418）は未実装。
 //!
 //! 安全側の既定値:
 //! - 平文 HTTP の経路を持たない（`https_only`。scheme は `https` 固定）
@@ -20,7 +21,7 @@
 
 use crate::auth::{
     BasicCredentials, RegistryAuth, challenge_offers_basic, parse_token_response,
-    parse_www_authenticate,
+    parse_www_authenticate, realm_may_receive_credentials,
 };
 use crate::error::{OciError, OciErrorCode, code_for_http_status};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
@@ -234,7 +235,7 @@ impl RegistryClient {
     /// `RegistryAuth::Basic`。資格情報の送出先は `endpoint`（https 固定）の `/v2/` だけで、応答由来の
     /// `realm`・`Location` へは送らない。リダイレクトは追従しない。401 / 403 は `PermissionDenied`
     /// （message は固定文で、資格情報・応答本文を載せない）。Bearer のみの提示は `Unimplemented`
-    /// （Bearer の資格情報つき交換は #417、統一入口は #418）。再試行はしない。成功・失敗とエラー code・
+    /// （Bearer の資格情報つき交換は `authenticate_bearer`、統一入口は #418）。再試行はしない。成功・失敗とエラー code・
     /// 所要時間は `with_recorder` の記録先へ 1 件記録する（REPAIR-4。資格情報は記録しない）。
     pub fn authenticate_basic(
         &self,
@@ -244,6 +245,40 @@ impl RegistryClient {
         record_oci_op(self.recorder.as_ref(), OciOpKind::AuthenticateBasic, || {
             basic_flow(self.transport.as_ref(), &self.config, endpoint, credentials)
         })
+    }
+
+    /// 資格情報つき Bearer トークン交換で `RegistryAuth::Bearer` を得る（TASK-54.2・OCI-3・MS-4・#417）。
+    ///
+    /// 資格情報なしで `/v2/` を叩き、200 なら認証不要として `RegistryAuth::None`（資格情報は送らない）。
+    /// 401 の Bearer チャレンジの realm へ `Authorization: Basic` 付きで GET する（`service` と
+    /// `scope=repository:<repo>:pull` を付ける Docker token 認証）。realm は非信頼 URL のため、接続先と同一
+    /// ホスト・`trusted_realm_hosts` に明示されたホスト・組み込みの既知対（Docker Hub の `auth.docker.io`）
+    /// 以外へは資格情報を送らず、通信せずに `PermissionDenied` を返す（fail-closed）。リダイレクトは追従しない。
+    /// 401 / 403 は `PermissionDenied`（message は固定文で資格情報・応答本文を載せない）。Basic のみの提示は
+    /// `Unimplemented`。再試行はしない。成功・失敗とエラー code・所要時間は `with_recorder` の記録先へ 1 件
+    /// 記録する（REPAIR-4。資格情報・トークンは記録しない）。
+    ///
+    /// 未実装（将来仕様）: OAuth2 の POST フロー（`grant_type=password` / `refresh_token`。OCI-3）。
+    pub fn authenticate_bearer(
+        &self,
+        endpoint: &RegistryEndpoint,
+        repository: &Repository,
+        credentials: &BasicCredentials,
+        trusted_realm_hosts: &[RegistryHost],
+    ) -> Result<RegistryAuth, OciError> {
+        record_oci_op(
+            self.recorder.as_ref(),
+            OciOpKind::AuthenticateBearer,
+            || {
+                bearer_flow(
+                    self.transport.as_ref(),
+                    &self.config,
+                    endpoint,
+                    repository,
+                    Some((credentials, trusted_realm_hosts)),
+                )
+            },
+        )
     }
 
     /// manifest を取得し、image index なら対象 platform の manifest まで解決する（TASK-51.3・OCI-1）。
@@ -328,6 +363,18 @@ fn anonymous_flow(
     endpoint: &RegistryEndpoint,
     repository: &Repository,
 ) -> Result<RegistryAuth, OciError> {
+    bearer_flow(transport, config, endpoint, repository, None)
+}
+
+/// Bearer トークン取得の共通手順。`credentials` が `None` なら匿名、`Some` なら realm へ Basic 資格情報を
+/// 付ける（その場合は `realm_may_receive_credentials` が許可した realm にだけ送る。TASK-54.2・OCI-3）。
+fn bearer_flow(
+    transport: &dyn RegistryTransport,
+    config: &RegistryClientConfig,
+    endpoint: &RegistryEndpoint,
+    repository: &Repository,
+    credentials: Option<(&BasicCredentials, &[RegistryHost])>,
+) -> Result<RegistryAuth, OciError> {
     let timeout = config.token_request_timeout;
     let base_url = endpoint.base_url();
     let probe = transport.get(&TransportRequest {
@@ -345,6 +392,23 @@ fn anonymous_flow(
     }
     let values: Vec<&str> = probe.www_authenticate.iter().map(String::as_str).collect();
     let challenge = parse_www_authenticate(&values, &endpoint.host)?;
+    // 資格情報は検証済みの送出先にだけ付ける。不許可なら通信せずに止める。
+    let auth_header = match credentials {
+        Some((c, trusted)) => {
+            if !realm_may_receive_credentials(&challenge.realm, &endpoint.host, trusted) {
+                return Err(OciError::new(
+                    OciErrorCode::PermissionDenied,
+                    "token realm is not trusted for credentials",
+                ));
+            }
+            Some(c.authorization_header_value())
+        }
+        None => None,
+    };
+    let header_pairs: Vec<(&str, &str)> = match &auth_header {
+        Some(h) => vec![("Authorization", *h)],
+        None => Vec::new(),
+    };
 
     let scope = format!("repository:{}:pull", repository.as_str());
     let mut query: Vec<(&str, &str)> = vec![("scope", scope.as_str())];
@@ -360,10 +424,18 @@ fn anonymous_flow(
         public_only: !challenge.realm.is_registry_host(),
         body_limit: Some(config.max_token_response_bytes),
         timeout,
-        headers: &[],
+        headers: &header_pairs,
     })?;
-    if resp.status != 200 {
-        return Err(status_error(resp.status));
+    match resp.status {
+        200 => {}
+        s @ (401 | 403) if credentials.is_some() => {
+            return Err(OciError::new(
+                OciErrorCode::PermissionDenied,
+                "registry rejected the credentials",
+            )
+            .with_http_status(s));
+        }
+        s => return Err(status_error(s)),
     }
     let token = parse_token_response(
         &resp.body,
@@ -402,7 +474,7 @@ fn basic_flow(
         parse_www_authenticate(&values, &endpoint.host)?;
         return Err(OciError::new(
             OciErrorCode::Unimplemented,
-            "registry requires bearer token authentication (OCI-3, see TASK-54.2)",
+            "registry requires bearer token authentication (OCI-3, use authenticate_bearer)",
         ));
     }
     let header = credentials.authorization_header_value();
@@ -1672,6 +1744,211 @@ mod tests {
         assert_eq!(items[1].error_code(), Some(OciErrorCode::PermissionDenied));
     }
 
+    fn run_bearer_at(
+        reference: &str,
+        t: &FakeTransport,
+        trusted: &[RegistryHost],
+    ) -> Result<RegistryAuth, OciError> {
+        let r = ImageReference::parse(reference).expect("parse");
+        let ep = RegistryEndpoint::new(r.registry().clone());
+        bearer_flow(
+            t,
+            &RegistryClientConfig::default(),
+            &ep,
+            r.repository(),
+            Some((&aladdin(), trusted)),
+        )
+    }
+
+    fn run_bearer(t: &FakeTransport) -> Result<RegistryAuth, OciError> {
+        run_bearer_at("alpine", t, &[])
+    }
+
+    /// OCI-3・TASK-54.2: スコープ付きトークンを Basic 資格情報で取得し、続く manifest 取得に Bearer が載る。
+    #[test]
+    fn bearer_exchange_sends_scope_service_and_basic_then_manifest_uses_bearer() {
+        let t = FakeTransport::new(vec![
+            resp(401, &[HUB_CHALLENGE], ""),
+            resp(200, &[], r#"{"token":"tok-1","expires_in":300}"#),
+        ]);
+        let auth = run_bearer(&t).expect("bearer");
+        assert!(matches!(auth, RegistryAuth::Bearer(_)));
+        {
+            let seen = t.seen.lock().expect("lock");
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[0].0, "https://registry-1.docker.io/v2/");
+            assert_eq!(seen[1].0, "https://auth.docker.io/token");
+            assert_eq!(
+                seen[1].1,
+                vec![
+                    (
+                        "scope".to_string(),
+                        "repository:library/alpine:pull".to_string()
+                    ),
+                    ("service".to_string(), "registry.docker.io".to_string()),
+                ]
+            );
+            assert!(seen[1].2, "foreign realm must use the public-only path");
+            assert_eq!(
+                seen[1].3,
+                Some(RegistryClientConfig::default().max_token_response_bytes)
+            );
+            let h = t.seen_headers.lock().expect("lock");
+            assert!(h[0].is_empty(), "probe must not carry credentials");
+            assert_eq!(
+                h[1],
+                vec![("Authorization".to_string(), ALADDIN.to_string())]
+            );
+        }
+        let t2 = FakeTransport::new(vec![manifest_resp(200, &image_body())]);
+        fetch(&t2, &auth, "x86_64").expect("fetch");
+        let h = t2.seen_headers.lock().expect("lock");
+        assert!(
+            h[0].contains(&("Authorization".to_string(), "Bearer tok-1".to_string())),
+            "{:?}",
+            h[0]
+        );
+    }
+
+    /// OCI-3: /v2/ が 200 なら資格情報を送らず認証不要として扱う。
+    #[test]
+    fn bearer_probe_200_sends_no_credentials() {
+        let t = FakeTransport::new(vec![resp(200, &[], "")]);
+        assert!(matches!(run_bearer(&t), Ok(RegistryAuth::None)));
+        assert_eq!(t.seen.lock().expect("lock").len(), 1);
+    }
+
+    /// OCI-3: 接続先と同一ホストの realm は通常経路で資格情報を付ける。
+    #[test]
+    fn bearer_same_host_realm_is_allowed() {
+        let t = FakeTransport::new(vec![
+            resp(
+                401,
+                &[r#"Bearer realm="https://registry.example/token",service="r""#],
+                "",
+            ),
+            resp(200, &[], r#"{"token":"t","expires_in":300}"#),
+        ]);
+        run_bearer_at("registry.example/team/app", &t, &[]).expect("bearer");
+        let seen = t.seen.lock().expect("lock");
+        assert_eq!(seen[1].0, "https://registry.example/token");
+        assert!(!seen[1].2);
+        assert_eq!(
+            t.seen_headers.lock().expect("lock")[1],
+            vec![("Authorization".to_string(), ALADDIN.to_string())]
+        );
+    }
+
+    /// OCI-3・SEC: 未登録の別ホスト realm へは資格情報を送らず、通信 1 回（プローブのみ）で拒否する。
+    #[test]
+    fn bearer_untrusted_realm_never_receives_credentials() {
+        let ch = r#"Bearer realm="https://evil.example/token",service="r""#;
+        let t = FakeTransport::new(vec![resp(401, &[ch], "")]);
+        let e = run_bearer_at("registry.example/team/app", &t, &[]).expect_err("untrusted");
+        assert_eq!(e.code(), OciErrorCode::PermissionDenied);
+        assert_eq!(e.message(), "token realm is not trusted for credentials");
+        assert_eq!(t.seen.lock().expect("lock").len(), 1);
+        assert!(t.seen_headers.lock().expect("lock")[0].is_empty());
+        // 明示した信頼ホストなら送る。別ホストの信頼登録では送らない。
+        let trusted = [RegistryHost::parse("evil.example").expect("host")];
+        let t = FakeTransport::new(vec![
+            resp(401, &[ch], ""),
+            resp(200, &[], r#"{"token":"t","expires_in":300}"#),
+        ]);
+        run_bearer_at("registry.example/team/app", &t, &trusted).expect("trusted");
+        let other = [RegistryHost::parse("other.example").expect("host")];
+        let t = FakeTransport::new(vec![resp(401, &[ch], "")]);
+        assert_eq!(
+            run_bearer_at("registry.example/team/app", &t, &other)
+                .expect_err("not listed")
+                .code(),
+            OciErrorCode::PermissionDenied
+        );
+    }
+
+    /// OCI-3・SEC: トークン要求の失敗は分類つきの Result で返り、資格情報・本文を載せない。
+    #[test]
+    fn bearer_failures_are_classified_and_do_not_leak() {
+        for status in [401u16, 403] {
+            let t = FakeTransport::new(vec![
+                resp(401, &[HUB_CHALLENGE], ""),
+                resp(status, &[], "open sesame"),
+            ]);
+            let e = run_bearer(&t).expect_err("rejected");
+            assert_eq!(e.code(), OciErrorCode::PermissionDenied);
+            assert_eq!(e.http_status(), Some(status));
+            assert_eq!(e.message(), "registry rejected the credentials");
+        }
+        let t = FakeTransport::new(vec![resp(401, &[HUB_CHALLENGE], ""), resp(500, &[], "")]);
+        assert_eq!(
+            run_bearer(&t).expect_err("500").code(),
+            OciErrorCode::Unavailable
+        );
+        let t = FakeTransport::new(vec![resp(401, &[HUB_CHALLENGE], ""), resp(302, &[], "")]);
+        assert_eq!(run_bearer(&t).expect_err("302").http_status(), Some(302));
+        let t = FakeTransport::new(vec![
+            resp(401, &[HUB_CHALLENGE], ""),
+            Err(OciError::new(OciErrorCode::Timeout, "t")),
+        ]);
+        assert_eq!(
+            run_bearer(&t).expect_err("timeout").code(),
+            OciErrorCode::Timeout
+        );
+        for body in ["not json", r#"{"expires_in":300}"#] {
+            let t = FakeTransport::new(vec![resp(401, &[HUB_CHALLENGE], ""), resp(200, &[], body)]);
+            assert_eq!(
+                run_bearer(&t).expect_err("bad token").code(),
+                OciErrorCode::DataLoss
+            );
+        }
+    }
+
+    /// OCI-3: Basic のみの提示は資格情報を送らず Unimplemented。challenge なしの 401 は DataLoss。
+    #[test]
+    fn bearer_other_challenges_send_no_credentials() {
+        let t = FakeTransport::new(vec![resp(401, &[BASIC_CHALLENGE], "")]);
+        assert_eq!(
+            run_bearer(&t).expect_err("basic").code(),
+            OciErrorCode::Unimplemented
+        );
+        assert_eq!(t.seen.lock().expect("lock").len(), 1);
+        let t = FakeTransport::new(vec![resp(401, &[], "")]);
+        assert_eq!(
+            run_bearer(&t).expect_err("none").code(),
+            OciErrorCode::DataLoss
+        );
+    }
+
+    /// OCI-3・REPAIR-4: 公開メソッド `authenticate_bearer` の成功と失敗が 1 件ずつ記録される。
+    #[test]
+    fn authenticate_bearer_public_api_records_outcomes() {
+        use crate::instrument::OciOpOutcome;
+        let (ep, repo) = alpine();
+        let rec = Arc::new(crate::instrument::testing::Collect::default());
+        let ok = client_with(
+            FakeTransport::new(vec![
+                resp(401, &[HUB_CHALLENGE], ""),
+                resp(200, &[], r#"{"token":"t","expires_in":300}"#),
+            ]),
+            rec.clone(),
+        );
+        assert!(matches!(
+            ok.authenticate_bearer(&ep, &repo, &aladdin(), &[]),
+            Ok(RegistryAuth::Bearer(_))
+        ));
+        let bad = client_with(
+            FakeTransport::new(vec![resp(401, &[HUB_CHALLENGE], ""), resp(401, &[], "")]),
+            rec.clone(),
+        );
+        bad.authenticate_bearer(&ep, &repo, &aladdin(), &[])
+            .expect_err("401");
+        let items = rec.items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind(), OciOpKind::AuthenticateBearer);
+        assert_eq!(items[0].outcome(), OciOpOutcome::Success);
+        assert_eq!(items[1].outcome(), OciOpOutcome::Failure);
+        assert_eq!(items[1].error_code(), Some(OciErrorCode::PermissionDenied));
+    }
     /// OCI-1: 認証なしでは Authorization を送らない。
     #[test]
     fn manifest_without_auth_sends_no_authorization() {

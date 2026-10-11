@@ -13,7 +13,11 @@
 //! 実装済み: Basic 認証の資格情報型 `BasicCredentials` とチャレンジ判定（TASK-54.1・OCI-3・MS-4・#416）。
 //! 資格情報は生成時に検証し（REPAIR-2）、`Authorization` ヘッダ値は `Debug` / エラーに出さない。
 //!
-//! 未実装（将来仕様）: Bearer の資格情報つきトークン交換と OAuth2（OCI-3・#417）、`registry` への統一入口
+//! 実装済み: 資格情報つき Bearer トークン交換（Basic 認証付きで realm へ GET する Docker token 認証。
+//! TASK-54.2・OCI-3・MS-4・#417）。realm は非信頼 URL のため、`realm_may_receive_credentials` が許可した
+//! ホストにだけ資格情報を送る（fail-closed）。
+//!
+//! 未実装（将来仕様）: OAuth2 の POST フロー（`grant_type=password` / `refresh_token`・OCI-3・#417 の後続）、`registry` への統一入口
 //! （チャレンジに応じた Basic / Bearer の自動選択。OCI-3・#418）、トークンのキャッシュと失効時の再取得。
 //! 資格情報の保管（docker config・credential helper）も範囲外。
 
@@ -60,7 +64,36 @@ fn data_loss(message: &str) -> OciError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TokenRealm {
     url: String,
+    host: RegistryHost,
     same_as_registry: bool,
+}
+
+/// 資格情報の送出先として組み込みで許可する (レジストリ, realm) の対。Docker Hub は
+/// `registry-1.docker.io` が `auth.docker.io` をトークンエンドポイントとして提示する実在の構成（OCI-3）。
+const BUILTIN_REALM_PAIRS: &[(&str, &str)] = &[("registry-1.docker.io", "auth.docker.io")];
+
+/// 資格情報を `realm` へ送ってよいか判定する（TASK-54.2・OCI-3）。
+///
+/// realm はレジストリ応答由来の非信頼 URL のため、無条件に資格情報を送ると悪意あるレジストリや
+/// 中間者に資格情報を持ち出される。許可は次の 3 つだけ（fail-closed）: (1) 接続先レジストリと同一
+/// エンドポイント、(2) 呼び出し側が明示した `trusted`（ホストとポートが一致）、(3) 組み込みの既知対。
+pub(crate) fn realm_may_receive_credentials(
+    realm: &TokenRealm,
+    registry: &RegistryHost,
+    trusted: &[RegistryHost],
+) -> bool {
+    if realm.is_registry_host() {
+        return true;
+    }
+    let h = realm.host();
+    if trusted.iter().any(|t| same_endpoint(t, h)) {
+        return true;
+    }
+    h.port().unwrap_or(443) == 443
+        && registry.port().unwrap_or(443) == 443
+        && BUILTIN_REALM_PAIRS
+            .iter()
+            .any(|(r, a)| registry.host() == *r && h.host() == *a)
 }
 
 /// 既定ポート（https の 443）を補ってホストとポートが同じか判定する。
@@ -108,6 +141,7 @@ impl TokenRealm {
         }
         Ok(Self {
             url: format!("https://{}{}", host.authority(), path),
+            host,
             same_as_registry: same,
         })
     }
@@ -116,6 +150,11 @@ impl TokenRealm {
     /// 経路で通信する（SSRF 対策）。
     pub(crate) fn is_registry_host(&self) -> bool {
         self.same_as_registry
+    }
+
+    /// 検証済みの realm ホスト（資格情報の送出可否判定に使う）。
+    pub(crate) fn host(&self) -> &RegistryHost {
+        &self.host
     }
 
     /// 検証済みの URL 文字列。
@@ -961,5 +1000,28 @@ mod tests {
             basic.authorization_header(now).expect("basic").as_deref(),
             Some("Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==")
         );
+    }
+
+    /// OCI-3・TASK-54.2: 資格情報の送出可否は同一ホスト・明示した信頼ホスト・既知対だけ許可する。
+    #[test]
+    fn realm_credentials_policy() {
+        let parse = |r: &str, h: &str| {
+            let host = RegistryHost::parse(h).expect("host");
+            (TokenRealm::parse(r, &host).expect("realm"), host)
+        };
+        let trusted = [RegistryHost::parse("auth.corp.example:8443").expect("t")];
+        let (r, h) = parse("https://harbor.internal/token", "harbor.internal:443");
+        assert!(realm_may_receive_credentials(&r, &h, &[]));
+        let (r, h) = parse("https://auth.docker.io/token", "registry-1.docker.io");
+        assert!(realm_may_receive_credentials(&r, &h, &[]));
+        let (r, h) = parse("https://auth.docker.io/token", "other.example");
+        assert!(!realm_may_receive_credentials(&r, &h, &[]));
+        let (r, h) = parse("https://auth.corp.example:8443/t", "reg.example");
+        assert!(realm_may_receive_credentials(&r, &h, &trusted));
+        assert!(!realm_may_receive_credentials(&r, &h, &[]));
+        let (r, h) = parse("https://auth.corp.example/t", "reg.example");
+        assert!(!realm_may_receive_credentials(&r, &h, &trusted));
+        let (r, h) = parse("https://evil.example/t", "registry-1.docker.io");
+        assert!(!realm_may_receive_credentials(&r, &h, &[]));
     }
 }

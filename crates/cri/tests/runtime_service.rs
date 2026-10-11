@@ -1,5 +1,5 @@
-//! `CriRuntimeService` の `RunPodSandbox` を公開 API だけで検証する結合試験
-//! （TASK-57.1・#429・CRI-1・ERR-3・REPAIR-4・REPAIR-12）。
+//! `CriRuntimeService` の `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox` を公開 API だけで検証する結合試験
+//! （TASK-57.1・TASK-57.2・#429・#430・CRI-1・ERR-3・REPAIR-4・REPAIR-12）。
 //!
 //! plugin-cri（TASK-108）と同じ外部利用者の立場で、`fandhe_container_cri` の公開の型
 //! （`CriRuntimeService`・`SandboxLimits`・`CriOpRecorder`・生成された `RuntimeService` トレイト）だけを
@@ -326,8 +326,8 @@ fn task_57_1_recorder_receives_every_outcome() {
     assert!(!format!("{service:?}").contains("do-not-record"));
 }
 
-/// TASK-57.1: `RunPodSandbox` 以外の RPC は `Unimplemented` のままで、記録先へ何も渡さない
-/// （#430・#431・TASK-58 で実装するときに計測の種別も追加する。REPAIR-3）。
+/// TASK-57.1: Run/Stop/Remove 以外の RPC は `Unimplemented` のままで、記録先へ何も渡さない
+/// （#431・TASK-58 で実装するときに計測の種別も追加する。REPAIR-3）。
 #[test]
 fn task_57_1_other_rpcs_remain_unimplemented() {
     let collect = Arc::new(Collect::default());
@@ -340,4 +340,72 @@ fn task_57_1_other_rpcs_remain_unimplemented() {
     assert_eq!(err.code(), Code::Unimplemented);
     assert_eq!(err.message(), "pod_sandbox_status");
     assert_eq!(collect.lines(), vec![]);
+}
+/// 公開トレイト経由で `StopPodSandbox` を呼ぶ。
+fn stop(service: &CriRuntimeService, id: &str) -> Result<(), (Code, String)> {
+    let request = Request::new(v1::StopPodSandboxRequest {
+        pod_sandbox_id: id.into(),
+    });
+    block_on(RuntimeService::stop_pod_sandbox(service, request))
+        .map(|_| ())
+        .map_err(|status: Status| (status.code(), status.message().to_owned()))
+}
+
+/// 公開トレイト経由で `RemovePodSandbox` を呼ぶ。
+fn remove(service: &CriRuntimeService, id: &str) -> Result<(), (Code, String)> {
+    let request = Request::new(v1::RemovePodSandboxRequest {
+        pod_sandbox_id: id.into(),
+    });
+    block_on(RuntimeService::remove_pod_sandbox(service, request))
+        .map(|_| ())
+        .map_err(|status: Status| (status.code(), status.message().to_owned()))
+}
+
+/// ERR-3・TASK-57.2: 存在しないサンドボックスの Stop は NOT_FOUND。
+#[test]
+fn task_57_2_stop_unknown_sandbox_returns_not_found() {
+    let service = CriRuntimeService::new();
+    assert_eq!(
+        stop(&service, &"0".repeat(64)),
+        Err((Code::NotFound, "sandbox not found".to_owned()))
+    );
+}
+
+/// CRI-1・TASK-57.2: Remove で件数の枠が戻り、削除済みの ID は Stop が NOT_FOUND になる。
+#[test]
+fn task_57_2_remove_releases_capacity() {
+    let service = CriRuntimeService::with_max_sandboxes(1);
+    let id = run(&service, Some(config("pod-a")), "").expect("first sandbox");
+    assert_eq!(
+        run(&service, Some(config("pod-b")), ""),
+        Err((Code::FailedPrecondition, "too many sandboxes".to_owned()))
+    );
+    remove(&service, &id).expect("remove");
+    assert_eq!(
+        stop(&service, &id),
+        Err((Code::NotFound, "sandbox not found".to_owned()))
+    );
+    run(&service, Some(config("pod-b")), "").expect("slot is free after remove");
+}
+
+/// REPAIR-4・TASK-57.2: Stop・Remove の結果が操作名・結果・コードつきで記録先へ渡る。
+#[test]
+fn task_57_2_stop_remove_recorded_by_recorder() {
+    let collect = Arc::new(Collect::default());
+    let service = CriRuntimeService::with_recorder(collect.clone());
+    let id = run(&service, Some(config("pod-a")), "").expect("sandbox");
+    stop(&service, &id).expect("stop");
+    stop(&service, &"0".repeat(64)).expect_err("unknown id");
+    remove(&service, &id).expect("remove");
+    remove(&service, &id).expect("idempotent remove");
+    assert_eq!(
+        collect.lines(),
+        vec![
+            ("cri.run_pod_sandbox", "success", "OK"),
+            ("cri.stop_pod_sandbox", "success", "OK"),
+            ("cri.stop_pod_sandbox", "failure", "NOT_FOUND"),
+            ("cri.remove_pod_sandbox", "success", "OK"),
+            ("cri.remove_pod_sandbox", "success", "OK"),
+        ]
+    );
 }

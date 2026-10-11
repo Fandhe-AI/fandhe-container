@@ -85,6 +85,9 @@ struct FakeClient {
     blob_fetches: AtomicUsize,
     seen_credentials: Mutex<Vec<bool>>,
     delay: Duration,
+    /// 先頭から数えてこの回数だけ blob 取得を PermissionDenied にする（token 失効の模擬）。
+    deny_blob_fetches: AtomicUsize,
+    auth_calls: AtomicUsize,
 }
 
 impl FakeClient {
@@ -100,6 +103,8 @@ impl FakeClient {
             blob_fetches: AtomicUsize::new(0),
             seen_credentials: Mutex::new(Vec::new()),
             delay: Duration::ZERO,
+            deny_blob_fetches: AtomicUsize::new(0),
+            auth_calls: AtomicUsize::new(0),
         }
     }
 }
@@ -113,6 +118,7 @@ impl RegistryPullClient for FakeClient {
         _t: &[RegistryHost],
     ) -> Result<RegistryAuth, OciError> {
         std::thread::sleep(self.delay);
+        self.auth_calls.fetch_add(1, Ordering::SeqCst);
         self.seen_credentials
             .lock()
             .expect("lock")
@@ -159,6 +165,13 @@ impl RegistryPullClient for FakeClient {
         dest: &Path,
     ) -> Result<(), OciError> {
         self.blob_fetches.fetch_add(1, Ordering::SeqCst);
+        if self.deny_blob_fetches.load(Ordering::SeqCst) > 0 {
+            self.deny_blob_fetches.fetch_sub(1, Ordering::SeqCst);
+            return Err(OciError::new(
+                OciErrorCode::PermissionDenied,
+                "registry token has expired",
+            ));
+        }
         std::thread::sleep(self.blob_delay);
         let hex = descriptor.digest.as_str().trim_start_matches("sha256:");
         let mut body = blob_body(hex).to_vec();
@@ -794,4 +807,66 @@ fn oci1_duplicate_descriptors_with_different_sizes_are_rejected() {
         puller.pull(&req("alpine")).expect_err("dup").code(),
         OciErrorCode::DataLoss
     );
+}
+
+/// OCI-3: blob 取得が PermissionDenied（token 失効）なら再認証して再試行し、pull は成功する。
+#[test]
+fn oci3_pull_reauthenticates_when_blob_fetch_is_denied() {
+    let dir = TempDir::new("reauth");
+    let mut fake = FakeClient::new(two_layer_manifest());
+    fake.deny_blob_fetches = AtomicUsize::new(1);
+    let client = Arc::new(fake);
+    let puller = OciImagePuller::new(client.clone(), config(&dir));
+    puller.pull(&req("alpine:3.20")).expect("pull");
+    assert_eq!(client.auth_calls.load(Ordering::SeqCst), 2);
+    assert!(staging_is_empty(&dir));
+}
+
+/// OCI-3: 再認証の再試行は有限回（2 回）で、超えたら PermissionDenied を返す。
+#[test]
+fn oci3_reauthentication_is_bounded() {
+    let dir = TempDir::new("reauth-bound");
+    let mut fake = FakeClient::new(two_layer_manifest());
+    fake.deny_blob_fetches = AtomicUsize::new(100);
+    let client = Arc::new(fake);
+    let puller = OciImagePuller::new(client.clone(), config(&dir));
+    let err = puller.pull(&req("alpine:3.20")).expect_err("denied");
+    assert_eq!(err.code(), OciErrorCode::PermissionDenied);
+    assert_eq!(client.auth_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 3);
+    assert!(staging_is_empty(&dir));
+}
+
+/// SEC・OCI-1: キャッシュ内の既存ディレクトリが symlink なら外部へ公開せず拒否する。
+#[cfg(unix)]
+#[test]
+fn sec_pull_rejects_symlinked_cache_directory() {
+    let dir = TempDir::new("symlink");
+    let outside = dir.0.join("outside");
+    fs::create_dir_all(&outside).expect("mkdir");
+    let blobs = dir.0.join("cache").join("blobs");
+    fs::create_dir_all(&blobs).expect("mkdir");
+    std::os::unix::fs::symlink(&outside, blobs.join("sha256")).expect("symlink");
+    let client = Arc::new(FakeClient::new(two_layer_manifest()));
+    let puller = OciImagePuller::new(client.clone(), config(&dir));
+    let err = puller.pull(&req("alpine:3.20")).expect_err("rejected");
+    assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+    assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 0);
+    assert_eq!(fs::read_dir(&outside).expect("read").count(), 0);
+}
+
+/// SEC・OCI-1: 他ユーザー書き込み可能な既存ディレクトリは拒否する。
+#[cfg(unix)]
+#[test]
+fn sec_pull_rejects_world_writable_cache_directory() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = TempDir::new("worldw");
+    let sha = dir.0.join("cache").join("blobs").join("sha256");
+    fs::create_dir_all(&sha).expect("mkdir");
+    fs::set_permissions(&sha, fs::Permissions::from_mode(0o777)).expect("chmod");
+    let client = Arc::new(FakeClient::new(two_layer_manifest()));
+    let puller = OciImagePuller::new(client.clone(), config(&dir));
+    let err = puller.pull(&req("alpine:3.20")).expect_err("rejected");
+    assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+    assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 0);
 }

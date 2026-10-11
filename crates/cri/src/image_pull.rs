@@ -350,6 +350,18 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         Self { client, config }
     }
 
+    /// 認証状態を取り直す（token 失効・PermissionDenied 時。資格情報は pull 要求のものを再利用する）。
+    fn reauthenticate(&self, ctx: &PullContext<'_>) -> Result<RegistryAuth, PullError> {
+        self.client
+            .authenticate(
+                ctx.endpoint,
+                ctx.repository,
+                ctx.credentials,
+                &self.config.trusted_realm_hosts,
+            )
+            .map_err(|e| PullError::from_oci(&e))
+    }
+
     fn check_deadline(&self, started: Instant) -> Result<(), PullError> {
         if started.elapsed() >= self.config.pull_deadline {
             return Err(PullError::new(
@@ -362,15 +374,14 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
 
     /// `blobs/sha256` を作る（Unix では 0700）。
     fn blobs_dir(&self) -> Result<PathBuf, PullError> {
-        let dir = self.config.cache_dir.join("blobs").join("sha256");
-        create_private_dir_all(&dir)?;
-        Ok(dir)
+        prepare_private_dir(&self.config.cache_dir, &["blobs", "sha256"])
     }
 
     /// 検証済みなら取得を省き、そうでなければステージングへ取得 → 検証 → 公開する。
     fn ensure_blob(
         &self,
         request: &PullContext<'_>,
+        auth: &mut RegistryAuth,
         staging: &StagingDir,
         blobs: &Path,
         descriptor: &Descriptor,
@@ -389,15 +400,33 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
             return Ok(());
         }
         let staged = staging.path().join(hex);
-        self.client
-            .fetch_blob(
+        // 長時間の pull では Bearer token が途中で失効する。取得前に失効を確認して再認証し、
+        // 取得が PermissionDenied なら有限回（MAX_REAUTH_RETRIES）だけ再認証して再試行する（OCI-3）。
+        let mut retries = 0u32;
+        loop {
+            if matches!(&*auth, RegistryAuth::Bearer(t) if t.is_expired(Instant::now())) {
+                *auth = self.reauthenticate(request)?;
+            }
+            match self.client.fetch_blob(
                 request.endpoint,
                 request.repository,
                 descriptor,
-                request.auth,
+                auth,
                 &staged,
-            )
-            .map_err(|e| PullError::from_oci(&e))?;
+            ) {
+                Ok(()) => break,
+                Err(e)
+                    if e.code() == OciErrorCode::PermissionDenied
+                        && retries < MAX_REAUTH_RETRIES =>
+                {
+                    retries += 1;
+                    // fetch_blob は dest が未存在であることを要求する。部分ファイルを残さない。
+                    let _ = fs::remove_file(&staged);
+                    *auth = self.reauthenticate(request)?;
+                }
+                Err(e) => return Err(PullError::from_oci(&e)),
+            }
+        }
         let verified = verify_blob_digest(&staged, &descriptor.digest, descriptor.size)
             .map_err(|e| PullError::from_oci(&e))?;
         if verified.size != descriptor.size {
@@ -419,8 +448,11 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
 struct PullContext<'a> {
     endpoint: &'a RegistryEndpoint,
     repository: &'a Repository,
-    auth: &'a RegistryAuth,
+    credentials: Option<&'a BasicCredentials>,
 }
+
+/// blob 取得が PermissionDenied のときの再認証の最大回数。
+const MAX_REAUTH_RETRIES: u32 = 2;
 
 impl<C: RegistryPullClient> ImagePuller for OciImagePuller<C> {
     fn pull(&self, request: &PullRequest) -> Result<PulledImage, PullError> {
@@ -430,7 +462,7 @@ impl<C: RegistryPullClient> ImagePuller for OciImagePuller<C> {
         let endpoint = RegistryEndpoint::new(image_ref.registry().clone());
         let repository = image_ref.repository();
 
-        let auth = self
+        let mut auth = self
             .client
             .authenticate(
                 &endpoint,
@@ -486,7 +518,7 @@ impl<C: RegistryPullClient> ImagePuller for OciImagePuller<C> {
         let ctx = PullContext {
             endpoint: &endpoint,
             repository,
-            auth: &auth,
+            credentials: request.credentials.as_ref(),
         };
         // 同一 digest の重複（同じ layer を複数回使う manifest）は 1 回だけ取得する。
         // 同一 digest で宣言サイズが食い違う descriptor は不正な manifest として拒否する（OCI-1）。
@@ -502,7 +534,7 @@ impl<C: RegistryPullClient> ImagePuller for OciImagePuller<C> {
                 continue;
             }
             self.check_deadline(started)?;
-            self.ensure_blob(&ctx, &staging, &blobs, descriptor)?;
+            self.ensure_blob(&ctx, &mut auth, &staging, &blobs, descriptor)?;
             seen.push((&descriptor.digest, descriptor.size));
         }
         drop(staging);
@@ -577,21 +609,106 @@ pub fn canonical_reference(input: &str) -> Option<String> {
     })
 }
 
-/// ディレクトリを（親ごと）作る。Unix では 0700。
-fn create_private_dir_all(dir: &Path) -> Result<(), PullError> {
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        builder.mode(0o700);
-    }
-    builder.create(dir).map_err(|_| {
+/// キャッシュ配下のディレクトリを 1 要素ずつ作り、既存要素も検証する（SEC・OCI-1）。
+///
+/// `cache_dir` 自体は（親ごと）作成後に検証する。`components` は `cache_dir` 直下から順に非再帰で作成し
+/// （既存は許容）、各要素について「symlink でない通常ディレクトリ」「呼び出しプロセスと同一所有者」
+/// 「group / other 書き込み権限なし」（Unix）を確認する。検証済みの所有者専用ディレクトリは他ユーザーが
+/// 差し替えられないため、検証後の blob 公開（rename）で未検証の内容が混入する経路を塞ぐ。
+/// 0700 の指定は新規作成時にしか効かないので、既存ディレクトリは必ずここで検証する。
+fn prepare_private_dir(cache_dir: &Path, components: &[&str]) -> Result<PathBuf, PullError> {
+    let prep_err = || {
         PullError::new(
             OciErrorCode::FailedPrecondition,
             "failed to prepare the image cache directory",
         )
-    })
+    };
+    let mut root_builder = fs::DirBuilder::new();
+    root_builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        root_builder.mode(0o700);
+    }
+    root_builder.create(cache_dir).map_err(|_| prep_err())?;
+    let owner = owner_probe(cache_dir)?;
+    verify_private_dir(cache_dir, owner)?;
+    let mut current = cache_dir.to_path_buf();
+    for name in components {
+        current.push(name);
+        let mut single = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            single.mode(0o700);
+        }
+        match single.create(&current) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(prep_err()),
+        }
+        verify_private_dir(&current, owner)?;
+    }
+    Ok(current)
+}
+
+/// 呼び出しプロセスの実効 UID 相当の値（Unix）。自分が作ったファイルの所有者を読んで得る
+/// （`unsafe` / libc を使わずに実効 UID を得るため）。非 Unix では 0 を返し所有者検査は行わない。
+#[cfg(unix)]
+fn owner_probe(dir: &Path) -> Result<u32, PullError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let probe = dir.join(format!(
+        ".owner-probe-{}-{nanos}-{}",
+        std::process::id(),
+        STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let fail = || {
+        PullError::new(
+            OciErrorCode::FailedPrecondition,
+            "failed to prepare the image cache directory",
+        )
+    };
+    // create_new は既存（symlink を含む）を辿らず失敗する。
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|_| fail())?;
+    let uid = fs::symlink_metadata(&probe).map(|m| m.uid());
+    let _ = fs::remove_file(&probe);
+    uid.map_err(|_| fail())
+}
+
+#[cfg(not(unix))]
+fn owner_probe(_dir: &Path) -> Result<u32, PullError> {
+    Ok(0)
+}
+
+/// `dir` が symlink でない通常ディレクトリで、`owner` の所有かつ他ユーザー書き込み不可であることを確認する。
+fn verify_private_dir(dir: &Path, owner: u32) -> Result<(), PullError> {
+    let reject = |message: &'static str| PullError::new(OciErrorCode::FailedPrecondition, message);
+    let meta = fs::symlink_metadata(dir)
+        .map_err(|_| reject("failed to prepare the image cache directory"))?;
+    if !meta.file_type().is_dir() {
+        return Err(reject("image cache path is not a plain directory"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if meta.uid() != owner {
+            return Err(reject("image cache directory has an unexpected owner"));
+        }
+        if meta.permissions().mode() & 0o022 != 0 {
+            return Err(reject("image cache directory is writable by other users"));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = owner;
+    Ok(())
 }
 
 /// pull ごとに一意なステージング領域。`Drop` で成否に関わらず削除する（部分ファイルを残さない）。
@@ -604,8 +721,7 @@ static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl StagingDir {
     fn create(cache_dir: &Path) -> Result<Self, PullError> {
-        let root = cache_dir.join("staging");
-        create_private_dir_all(&root)?;
+        let root = prepare_private_dir(cache_dir, &["staging"])?;
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())

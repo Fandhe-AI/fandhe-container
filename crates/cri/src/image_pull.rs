@@ -675,12 +675,15 @@ fn owner_probe(dir: &Path) -> Result<u32, PullError> {
         )
     };
     // create_new は既存（symlink を含む）を辿らず失敗する。
-    fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&probe)
         .map_err(|_| fail())?;
-    let uid = fs::symlink_metadata(&probe).map(|m| m.uid());
+    // 所有者は保持した File のハンドルから読む。パスを再照会すると差し替えられた別ファイルの UID を
+    // 信頼基準にしてしまうため（パスは削除にしか使わない）。
+    let uid = file.metadata().map(|m| m.uid());
+    drop(file);
     let _ = fs::remove_file(&probe);
     uid.map_err(|_| fail())
 }
@@ -697,7 +700,11 @@ fn owner_probe(_dir: &Path) -> Result<u32, PullError> {
 
 /// `cache_dir` の祖先ディレクトリを根まで検証する（Unix）。
 ///
-/// 親を `canonicalize` して symlink を解決したうえで、親から根までの各ディレクトリが「呼び出しプロセスまたは
+/// まず元のパスの各要素を `symlink_metadata` で辿り、root 所有でない symlink と `..` 要素を拒否する
+/// （後続の staging・blob 公開・後始末は元の `cache_dir` を使うため、利用者所有の symlink が
+/// 信頼できない祖先を隠して差し替え可能になる経路を塞ぐ）。root 所有の symlink（macOS の `/var` 等）は
+/// 一般ユーザーが付け替えられないので許可し、解決後の連鎖も下記で検証する。
+/// 次に親を `canonicalize` して symlink を解決したうえで、親から根までの各ディレクトリが「呼び出しプロセスまたは
 /// root の所有」かつ「group / other 書き込み不可、または sticky ビット付き（他ユーザーが他人のエントリを
 /// rename / 削除できない `/tmp` 等）」であることを要求する。信頼できない祖先は fail-closed で拒否する。
 /// 限界: 標準ライブラリだけでは openat 相当のディレクトリハンドル基準の操作ができないため、検証後に
@@ -710,6 +717,39 @@ fn verify_ancestors(cache_dir: &Path, owner: u32) -> Result<(), PullError> {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
+    let absolute = std::path::absolute(parent)
+        .map_err(|_| reject("failed to resolve the image cache parent directory"))?;
+    let mut walked = PathBuf::new();
+    for component in absolute.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(reject(
+                "image cache path must not contain parent components",
+            ));
+        }
+        walked.push(component);
+        let meta = fs::symlink_metadata(&walked)
+            .map_err(|_| reject("failed to inspect an image cache ancestor directory"))?;
+        let kind = meta.file_type();
+        if kind.is_symlink() {
+            if meta.uid() != 0 {
+                return Err(reject("image cache path contains a user-owned symlink"));
+            }
+        } else if !kind.is_dir() {
+            return Err(reject("image cache ancestor is not a plain directory"));
+        } else {
+            if meta.uid() != owner && meta.uid() != 0 {
+                return Err(reject(
+                    "image cache ancestor directory has an untrusted owner",
+                ));
+            }
+            let mode = meta.permissions().mode();
+            if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+                return Err(reject(
+                    "image cache ancestor directory is writable by other users",
+                ));
+            }
+        }
+    }
     let canonical = fs::canonicalize(parent)
         .map_err(|_| reject("failed to resolve the image cache parent directory"))?;
     for ancestor in canonical.ancestors() {

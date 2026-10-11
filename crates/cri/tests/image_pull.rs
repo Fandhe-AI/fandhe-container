@@ -896,3 +896,21 @@ fn sec_pull_rejects_world_writable_cache_ancestor() {
     assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
     assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 0);
 }
+
+/// SEC・OCI-1: キャッシュパスの祖先が利用者所有の symlink なら（解決先が安全でも）拒否する。
+#[cfg(unix)]
+#[test]
+fn sec_pull_rejects_symlinked_cache_ancestor() {
+    let dir = TempDir::new("ancestorlink");
+    let real = dir.0.join("real");
+    fs::create_dir_all(&real).expect("mkdir");
+    let link = dir.0.join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+    let mut cfg = config(&dir);
+    cfg.cache_dir = link.join("cache");
+    let client = Arc::new(FakeClient::new(two_layer_manifest()));
+    let puller = OciImagePuller::new(client.clone(), cfg);
+    let err = puller.pull(&req("alpine:3.20")).expect_err("rejected");
+    assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+    assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 0);
+}

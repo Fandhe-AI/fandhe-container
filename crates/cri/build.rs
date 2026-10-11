@@ -4,7 +4,7 @@
 //! protox（純 Rust の `.proto` パーサ）で解析し、tonic-prost-build で `OUT_DIR/runtime.v1.rs` へ
 //! `RuntimeService` / `ImageService` のサーバー・クライアントとメッセージ型を出力する。
 //! `protoc` は不要（承認: Issue #425）。外部コマンドは起動せず、入力は vendor 済みの固定ファイルのみ。
-//! 生成物の `include!` とビルド確認は TASK-56.4（#427）で行う（現状は取り込み前のスタブ。REPAIR-3）。
+//! 生成物は `src/lib.rs` の `runtime::v1` で取り込む（TASK-56.4・#427）。
 
 use std::path::PathBuf;
 

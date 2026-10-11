@@ -549,7 +549,8 @@ fn sup1_monitor_exit_disposes_returned_handles() {
     assert_eq!(l.terminated.load(Ordering::SeqCst), 1);
     assert_eq!(code, exit_code_for(ErrorCode::Timeout).get());
 
-    // terminate 失敗: 回収を確かめられないので Internal。
+    // terminate 失敗: Err で戻ったハンドルは 1 回だけ再試行し（初回＋再試行の 2 回）、なお失敗なら
+    // 回収を確かめられないので Internal（CORE-1・REPAIR-5）。
     let env = Env::new("dispose2");
     env.create(&env.id);
     let calls = new_calls();
@@ -567,7 +568,7 @@ fn sup1_monitor_exit_disposes_returned_handles() {
         &short_timeouts(),
         &StopToken::new(),
     );
-    assert_eq!(l.terminated.load(Ordering::SeqCst), 1);
+    assert_eq!(l.terminated.load(Ordering::SeqCst), 2);
     assert_eq!(code, exit_code_for(ErrorCode::Internal).get());
 }
 

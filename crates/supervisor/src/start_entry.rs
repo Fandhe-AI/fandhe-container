@@ -36,7 +36,6 @@
 
 use std::io::Write;
 use std::num::{NonZeroU8, NonZeroU32};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -112,13 +111,6 @@ impl Relauncher for NoSpecRelauncher {
     }
 }
 
-/// 結果チャネルの書き込みの期限（読み手が読まず pipe が満杯でも監視へ進むため。REPAIR-5）。
-const REPORT_WRITE_DEADLINE: Duration = Duration::from_secs(5);
-/// stderr のログ 1 行の書き込みの期限。
-const LOG_WRITE_DEADLINE: Duration = Duration::from_secs(1);
-/// stderr への書き込みが期限を超えた後は、スレッドを増やさないよう以後のログを捨てる。
-static LOG_STUCK: AtomicBool = AtomicBool::new(false);
-
 /// 書き込みを別スレッドで行い、期限までに終わらなければ `TimedOut` を返す書き手（REPAIR-5）。
 ///
 /// 読み手が止まって pipe が満杯でも、呼び出し側は期限で次へ進める（起動済みプロセスの監視・回収を止めない）。
@@ -174,20 +166,13 @@ impl<W: Write + Send + 'static> Write for BoundedWriter<W> {
 
 /// 構造化ログを stderr に 1 行出す（値は固定語彙だけ。入力値・OS のエラー文字列は載せない。REPAIR-4）。
 ///
-/// stderr の読み手が止まっても回収・監視を止めないよう、書き込みは期限つき（REPAIR-5）。期限を超えたら以後は捨てる。
+/// stderr の読み手が止まっても回収・監視を止めないよう、[`crate::stderr_sink`] の専用スレッドへ渡すだけで待たない
+/// （キューが満杯なら捨てる。REPAIR-5）。
 fn log_event(event: &'static str, code: Option<ErrorCode>) {
-    if LOG_STUCK.load(Ordering::Relaxed) {
-        return;
-    }
     let code = code.map(|c| c.as_str()).unwrap_or("");
     let line =
         format!("{{\"component\":\"supervisor\",\"event\":\"{event}\",\"code\":\"{code}\"}}\n");
-    let mut writer = BoundedWriter::new(std::io::stderr(), LOG_WRITE_DEADLINE);
-    if let Err(e) = writer.write_all(line.as_bytes())
-        && e.kind() == std::io::ErrorKind::TimedOut
-    {
-        LOG_STUCK.store(true, Ordering::Relaxed);
-    }
+    crate::stderr_sink::stderr().emit(line.into_bytes());
 }
 
 /// 回収を確かめられなかったハンドルの保管先（`Drop` は回収しないため、捨てずに保持する。REPAIR-5）。
@@ -737,6 +722,11 @@ mod linux {
     use super::*;
     use crate::start_contract::StartArgs;
 
+    /// 結果チャネルの書き込みの期限（読み手が読まず pipe が満杯でも監視へ進むため。REPAIR-5）。
+    const REPORT_WRITE_DEADLINE: Duration = Duration::from_secs(5);
+    /// stderr への報告 1 行（結果チャネルが使えないとき）と、終了前のログの書き出しを待つ期限（REPAIR-5）。
+    const STDERR_DEADLINE: Duration = Duration::from_secs(1);
+
     /// 本番の [`StartDeps`]。core の本番 `ProcessLauncher`（#1715 の Phase B）が無い間、手順 4 で `UNIMPLEMENTED` を返す。
     pub struct ProductionStartDeps {
         root: PathBuf,
@@ -852,13 +842,25 @@ mod linux {
     }
 
     /// supervisor の bin の入口（`src/main.rs` から呼ぶ）。`args` はプログラム名を除いた argv。
+    ///
+    /// 終了の前に、それまでの stderr のログが書かれるのを期限つきで待つ（読み手が止まっていても期限で終わる）。
     pub fn run_main<I: IntoIterator<Item = OsString>>(args: I) -> ExitCode {
+        let code = run_main_inner(args);
+        let _ = crate::stderr_sink::flush_stderr(STDERR_DEADLINE);
+        code
+    }
+
+    fn run_main_inner<I: IntoIterator<Item = OsString>>(args: I) -> ExitCode {
         // 0: 結果チャネル。不正なら報告できないので stderr に固定スキーマの JSON を出して終わる。
         let mut out = match open_result_channel() {
             Ok(f) => BoundedWriter::new(f, REPORT_WRITE_DEADLINE),
             Err(e) => {
                 let err = op_err(e);
-                let _ = err.write_json_line(&mut std::io::stderr());
+                let mut line = Vec::new();
+                if err.write_json_line(&mut line).is_ok() {
+                    // 期限つき（stderr の読み手が止まっていても終了できる。REPAIR-5）。
+                    let _ = crate::stderr_sink::stderr().emit_and_wait(line, STDERR_DEADLINE);
+                }
                 return ExitCode::from(err.exit_code().get());
             }
         };

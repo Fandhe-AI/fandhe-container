@@ -19,6 +19,11 @@ fn main() -> std::process::ExitCode {
         ErrorCode::Unimplemented,
         "the supervisor requires Linux",
     );
-    let _ = err.write_json_line(&mut std::io::stderr());
+    // stderr の読み手が止まっていても期限で終わる（REPAIR-5）。
+    let mut line = Vec::new();
+    if err.write_json_line(&mut line).is_ok() {
+        let _ = fandhe_container_supervisor::stderr_sink::stderr()
+            .emit_and_wait(line, std::time::Duration::from_secs(1));
+    }
     std::process::ExitCode::from(err.exit_code().get())
 }

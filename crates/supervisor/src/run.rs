@@ -290,6 +290,9 @@ pub trait MonitorObserver {
 }
 
 /// 1 行 1 JSON の構造化ログを stderr へ出す既定の観測器（値は固定語彙・数値のみ）。
+///
+/// [`crate::stderr_sink`] の専用スレッドへ渡すだけで待たない。stderr の読み手が止まっても監視・回収・restart を
+/// 止めず、キューが満杯なら行を捨てる（REPAIR-5）。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StderrLogObserver;
 
@@ -304,13 +307,14 @@ impl MonitorObserver for StderrLogObserver {
             .error_code
             .map(|c| c.as_str().to_owned())
             .unwrap_or_default();
-        eprintln!(
-            "{{\"component\":\"supervisor.monitor\",\"operation\":\"{}\",\"result\":\"{}\",\"code\":\"{}\",\"elapsed_us\":{}}}",
+        let line = format!(
+            "{{\"component\":\"supervisor.monitor\",\"operation\":\"{}\",\"result\":\"{}\",\"code\":\"{}\",\"elapsed_us\":{}}}\n",
             event.operation.as_str(),
             result,
             code,
             event.elapsed.as_micros()
         );
+        crate::stderr_sink::stderr().emit(line.into_bytes());
     }
 }
 

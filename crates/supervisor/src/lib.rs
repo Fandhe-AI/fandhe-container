@@ -67,5 +67,6 @@ pub mod start_contract;
 pub mod start_entry;
 pub mod state;
 pub mod stats;
+pub mod stderr_sink;
 #[cfg(any(windows, target_os = "linux"))]
 mod sys;

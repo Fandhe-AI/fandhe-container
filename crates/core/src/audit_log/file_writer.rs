@@ -113,15 +113,16 @@ impl TurnQueue {
         };
         let mut waiting = self.lock_waiting();
         loop {
-            if waiting.front() == Some(&ticket) {
-                drop(waiting);
-                return Ok(guard);
-            }
+            // 先頭であっても期限切れなら通さない（期限超過後に起床して保持者の解放を見た場合も拒否。REPAIR-5）。
             let now = Instant::now();
             if now >= deadline {
                 // guard の drop が同じ Mutex を取るため、先に手放す。
                 drop(waiting);
                 return Err(());
+            }
+            if waiting.front() == Some(&ticket) {
+                drop(waiting);
+                return Ok(guard);
             }
             waiting = self
                 .changed
@@ -426,8 +427,19 @@ impl AuditFileWriter {
             .enter(deadline)
             .map_err(|()| AuditWriteError::new(AuditWriteErrorKind::Lock))?;
         loop {
+            // flock を試す前に期限を確認する（期限切れでファイル書き込みへ進ませない。REPAIR-5）。
+            if Instant::now() >= deadline {
+                return Err(AuditWriteError::new(AuditWriteErrorKind::Lock));
+            }
             match self.file.try_lock() {
-                Ok(()) => return Ok(turn),
+                Ok(()) => {
+                    // 取得直後にも確認し、期限切れなら解放して拒否する。
+                    if Instant::now() >= deadline {
+                        let _ = self.file.unlock();
+                        return Err(AuditWriteError::new(AuditWriteErrorKind::Lock));
+                    }
+                    return Ok(turn);
+                }
                 Err(std::fs::TryLockError::WouldBlock) => {
                     if Instant::now() >= deadline {
                         return Err(AuditWriteError::new(AuditWriteErrorKind::Lock));
@@ -1343,6 +1355,25 @@ mod tests {
         assert_eq!(err.kind, AuditWriteErrorKind::Lock);
         assert_eq!(queue.len(), 1);
         drop(holder);
+        assert_eq!(queue.len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REPAIR-5・#1703: 保持者が解放済みで期限切れの待ち手が先頭になった場合は拒否し、チケットを残さない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair5_1703_expired_waiter_at_front_is_rejected() {
+        let dir = fresh_dir("queue-expired-front");
+        let path = dir.join("audit.log");
+        let queue = TurnQueue::new();
+        let w = AuditFileWriter::open(&path).unwrap();
+        // 先頭（保持者なし）でも、期限が過ぎていれば enter / lock_exclusive は Lock で拒否する。
+        let past = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(queue.enter(past).is_err());
+        assert_eq!(queue.len(), 0);
+        let err = w.lock_exclusive(&queue, past).err().unwrap();
+        assert_eq!(err.kind, AuditWriteErrorKind::Lock);
         assert_eq!(queue.len(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }

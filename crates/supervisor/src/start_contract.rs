@@ -289,6 +289,10 @@ impl StartArgs {
 
 /// supervisor が結果を書くまでの内部上限: `launch + terminate + confirm + 3 × LAUNCHER_REPLY_GRACE + 5s`
 /// （既定値で 33s。あふれたら `Duration::MAX` に張り付く）。
+///
+/// supervisor（`start_entry::run_start`）は開始時刻にこの値を足した期限を処理全体で共有し、失敗後の回復の再試行・
+/// 未回収ハンドルの terminate は、1 回の待ちの上限が残り時間に収まるときだけ行う。収まらなければ回復・回収を
+/// 確かめられなかった扱い（`INTERNAL`）で報告するため、報告はこの上限内に届く（REPAIR-5）。
 pub fn result_deadline(timeouts: &StartTimeouts) -> Duration {
     timeouts
         .launch()

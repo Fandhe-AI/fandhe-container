@@ -21,11 +21,11 @@ use fandhe_container_core::oci_runtime::{
 };
 use fandhe_container_core::traits::{
     CgroupScope, ContainerId, ContainerState, CreateRequest, ErrorCode, GetStateRequest,
-    StartRequest, StateRecord, StateStore, TraitError, UpdateStateRequest,
+    StartRequest, StateRecord, StateRevision, StateStore, TraitError, UpdateStateRequest,
 };
 use fandhe_container_supervisor::restart::RestartPolicy;
 use fandhe_container_supervisor::run::StopToken;
-use fandhe_container_supervisor::start_contract::StartReport;
+use fandhe_container_supervisor::start_contract::{StartReport, result_deadline};
 use fandhe_container_supervisor::start_entry::{Running, StartDeps, run_start, run_supervised};
 use fandhe_container_supervisor::state::open_default_store;
 
@@ -223,6 +223,8 @@ struct FakeDeps {
     launcher: Arc<FakeLauncher>,
     fail_at: Option<&'static str>,
     unavailable: bool,
+    /// `prepare_cgroup` が返す準備した世代（既定 `None` = スコープを記録しない）。
+    prepared_instance: Option<StateRevision>,
 }
 
 impl FakeDeps {
@@ -254,8 +256,8 @@ impl StartDeps for FakeDeps {
         &mut self,
         _store: &dyn StateStore,
         _observed: &StateRecord,
-    ) -> Result<(), TraitError> {
-        self.step("prepare")
+    ) -> Result<Option<StateRevision>, TraitError> {
+        self.step("prepare").map(|()| self.prepared_instance)
     }
 
     fn build_audit_sink(&mut self) -> Result<(), TraitError> {
@@ -280,6 +282,7 @@ fn deps(calls: &Calls, launcher: FakeLauncher) -> (FakeDeps, Arc<FakeLauncher>) 
             launcher: Arc::clone(&launcher),
             fail_at: None,
             unavailable: false,
+            prepared_instance: None,
         },
         launcher,
     )
@@ -298,7 +301,7 @@ fn start_with(
 ) -> Result<Running, std::num::NonZeroU8> {
     run_start(
         deps,
-        env.store.as_ref(),
+        &env.store,
         &OpRecorder::new(),
         &StartRequest::new(cid(id)),
         timeouts,
@@ -449,7 +452,10 @@ fn repair5_launch_timeout_without_confirmation_reports_internal() {
     fl.confirm_ok = false;
     let (mut d, _l) = deps(&calls, fl);
     let mut out = Vec::new();
+    let started = std::time::Instant::now();
     assert!(start_with(&env, &mut d, &env.id, &short_timeouts(), &mut out).is_err());
+    // 回復の再試行を含めても、報告は契約の内部上限内に届く（REPAIR-5）。
+    assert!(started.elapsed() <= result_deadline(&short_timeouts()));
     let rec = env.record(&env.id);
     assert_eq!(rec.status().state(), ContainerState::Running);
     assert!(rec.status().pid().is_none());
@@ -651,4 +657,36 @@ fn repair5_bounded_writer_times_out_on_stuck_reader() {
     assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     assert!(started.elapsed() < Duration::from_secs(5));
     let _ = release.send(());
+}
+
+/// CORE-2・CORE-3・SEC-1: 準備した cgroup の世代と launch 時点（起動権の予約の後）のレコードが食い違えば
+/// （準備の後に同じ ID が削除・再作成された）launch せず、予約を Created へ戻して準備した cgroup を消す。
+#[test]
+fn core2_recreated_after_prepare_is_not_launched() {
+    let env = Env::new("regen");
+    env.create(&env.id);
+    let calls = new_calls();
+    let (mut d, l) = deps(&calls, FakeLauncher::new(&calls));
+    // 準備した世代はあるが、レコードにはスコープが無い（再作成された別世代のレコード）。
+    d.prepared_instance = Some(StateRevision::from_raw(1));
+    let mut out = Vec::new();
+    assert!(start_with(&env, &mut d, &env.id, &short_timeouts(), &mut out).is_err());
+    assert_eq!(
+        calls_of(&calls),
+        ["check", "prepare", "audit", "build", "release"]
+    );
+    assert!(l.specs.lock().unwrap().is_empty());
+    let rec = env.record(&env.id);
+    assert_eq!(rec.status().state(), ContainerState::Created);
+    assert!(rec.status().pid().is_none());
+    match report_of(&out) {
+        StartReport::Failed { code, message, .. } => {
+            assert_eq!(code, ErrorCode::FailedPrecondition);
+            assert_eq!(
+                message.as_str(),
+                "the container was recreated after its cgroup was prepared"
+            );
+        }
+        other => panic!("unexpected report: {other:?}"),
+    }
 }

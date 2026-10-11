@@ -41,8 +41,9 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_core::oci_runtime::{
-    LAUNCHER_REPLY_GRACE, LaunchedProcess, LifecycleOp, OciRuntimeError, ProcessLauncher,
-    StartTimeouts, exit_code_for, recover_interrupted_start, start, take_unreaped_processes,
+    LAUNCHER_REPLY_GRACE, LaunchSpec, LaunchedProcess, LifecycleOp, OciRuntimeError,
+    ProcessLauncher, StartTimeouts, exit_code_for, recover_interrupted_start, start,
+    take_unreaped_processes,
 };
 use fandhe_container_core::traits::{
     ContainerId, ContainerState, ContainerStatus, ErrorCode, GetStateRequest, StartRequest,
@@ -71,11 +72,15 @@ pub trait StartDeps {
 
     /// 手順 5: cgroup の連鎖（スコープの記録 → mkdir → 制限 → 参加フック）。`observed` は事前確認済みのレコード。
     /// 成功した cgroup は実装が保持し、[`Self::release_cgroup`] と [`Self::build_launcher`] が使う。
+    ///
+    /// 記録したスコープの instance（`CgroupScope::instance`）を返す（スコープを記録しない実装は `None`）。
+    /// 入口は launch の時点（core の起動権の予約の後）のレコードとこれを照合し、同じ ID の削除・再作成で世代が
+    /// 変わっていれば launch しない（CORE-2・CORE-3・SEC-1）。
     fn prepare_cgroup(
         &mut self,
         store: &dyn StateStore,
         observed: &StateRecord,
-    ) -> Result<(), TraitError>;
+    ) -> Result<Option<StateRevision>, TraitError>;
 
     /// 手順 6: 監査 sink を構築する（fork の前。SEC-4）。実装が保持し [`Self::build_launcher`] が使う。
     fn build_audit_sink(&mut self) -> Result<(), TraitError>;
@@ -280,19 +285,34 @@ fn terminate_bounded(
 /// [`terminate_bounded`] を、`Err` で戻ったハンドルについて 1 回だけ再試行する。回収できたらその pid。
 ///
 /// 再試行も失敗したハンドルは [`STRANDED`] に保管する（`Drop` で捨てて子を孤児化させない）。
-fn terminate_retrying(process: Box<dyn LaunchedProcess>, timeout: Duration) -> Option<NonZeroU32> {
-    match terminate_bounded(process, timeout) {
-        Ok(pid) => Some(pid),
-        Err(TerminateFailure::Pending) => None,
-        Err(TerminateFailure::Returned(p)) => match terminate_bounded(p, timeout) {
-            Ok(pid) => Some(pid),
-            Err(TerminateFailure::Returned(p)) => {
-                keep_stranded(p);
-                None
-            }
-            Err(TerminateFailure::Pending) => None,
-        },
+/// `deadline` が `Some` なら、1 回の待ちの上限（`timeout` ＋猶予）が残り時間に収まるときだけ呼ぶ。収まらなければ
+/// 呼ばずに保管して `None`（報告の期限を守る。REPAIR-5）。
+fn terminate_retrying(
+    process: Box<dyn LaunchedProcess>,
+    timeout: Duration,
+    deadline: Option<Instant>,
+) -> Option<NonZeroU32> {
+    let need = timeout.saturating_add(LAUNCHER_REPLY_GRACE);
+    let mut process = process;
+    for _ in 0..2 {
+        if !fits(deadline, need) {
+            log_event("terminate_budget_exhausted", Some(ErrorCode::Timeout));
+            keep_stranded(process);
+            return None;
+        }
+        match terminate_bounded(process, timeout) {
+            Ok(pid) => return Some(pid),
+            Err(TerminateFailure::Pending) => return None,
+            Err(TerminateFailure::Returned(p)) => process = p,
+        }
     }
+    keep_stranded(process);
+    None
+}
+
+/// `deadline` までの残りが `need` 以上あるか（`None` は期限なし）。
+fn fits(deadline: Option<Instant>, need: Duration) -> bool {
+    deadline.is_none_or(|d| Instant::now().checked_add(need).is_some_and(|t| t <= d))
 }
 
 fn op_err(e: TraitError) -> OciRuntimeError {
@@ -316,15 +336,19 @@ fn release_logged(deps: &mut dyn StartDeps) {
 ///
 /// 報告（`out` への 1 行）は成功・失敗とも本関数が書く。報告の書き込みに失敗しても（EPIPE 等）監視は続けるため
 /// 成功は `Ok(Running)` を返し、ログに `report_failed` を出す。
+///
+/// 失敗後の回復・回収は、本関数の開始から [`crate::start_contract::result_deadline`] までの残り時間の範囲でだけ
+/// 行う。足りなければ確かめられなかった扱い（`Internal`）で報告し、報告の期限を守る（REPAIR-5）。
 pub fn run_start(
     deps: &mut dyn StartDeps,
-    store: &dyn StateStore,
+    store: &Arc<dyn StateStore>,
     recorder: &OpRecorder,
     req: &StartRequest,
     timeouts: &StartTimeouts,
     out: &mut dyn Write,
 ) -> Result<Running, NonZeroU8> {
-    match start_sequence(deps, store, recorder, req, timeouts) {
+    let deadline = Instant::now().checked_add(crate::start_contract::result_deadline(timeouts));
+    match start_sequence(deps, store, recorder, req, timeouts, deadline) {
         Ok(running) => {
             let report = StartReport::Started {
                 pid: running.process.pid(),
@@ -345,11 +369,13 @@ pub fn run_start(
 
 fn start_sequence(
     deps: &mut dyn StartDeps,
-    store: &dyn StateStore,
+    store_arc: &Arc<dyn StateStore>,
     recorder: &OpRecorder,
     req: &StartRequest,
     timeouts: &StartTimeouts,
+    deadline: Option<Instant>,
 ) -> Result<Running, OciRuntimeError> {
+    let store: &dyn StateStore = store_arc.as_ref();
     // 3: 副作用なしの事前確認。
     let observed = store
         .get(&GetStateRequest::new(req.id().clone()))
@@ -370,10 +396,13 @@ fn start_sequence(
     // 4: 副作用なしで launcher の可用性を確かめる。
     deps.check_launcher_available().map_err(op_err)?;
     // 5〜7: ここから先の失敗は、作った cgroup を消してから返す。
-    if let Err(e) = deps.prepare_cgroup(store, &observed) {
-        release_logged(deps);
-        return Err(op_err(e));
-    }
+    let prepared = match deps.prepare_cgroup(store, &observed) {
+        Ok(instance) => instance,
+        Err(e) => {
+            release_logged(deps);
+            return Err(op_err(e));
+        }
+    };
     if let Err(e) = deps.build_audit_sink() {
         release_logged(deps);
         return Err(op_err(e));
@@ -385,7 +414,13 @@ fn start_sequence(
             return Err(op_err(e));
         }
     };
-    let capturing = Arc::new(SpecCapturingLauncher::new(Arc::clone(&inner)));
+    let checked: Arc<dyn ProcessLauncher> = Arc::new(InstanceCheckedLauncher {
+        inner: Arc::clone(&inner),
+        store: Arc::clone(store_arc),
+        id: req.id().clone(),
+        expected: prepared,
+    });
+    let capturing = Arc::new(SpecCapturingLauncher::new(checked));
     let launcher: Arc<dyn ProcessLauncher> = capturing.clone();
     // 8
     match start(store, recorder, &launcher, req, timeouts) {
@@ -403,7 +438,7 @@ fn start_sequence(
             })
         }
         Err(e) if e.code() == ErrorCode::Timeout => {
-            if recover_after_timeout(store, &launcher, req.id(), timeouts, Vec::new()) {
+            if recover_after_timeout(store, &launcher, req.id(), timeouts, Vec::new(), deadline) {
                 release_logged(deps);
                 Err(e)
             } else {
@@ -420,7 +455,7 @@ fn start_sequence(
             // レジストリが空でも、core の後始末スレッドがハンドルを保持中・予約が Running のまま残る場合があるため、
             // 状態と core の予約の解放を確かめてから cgroup を消す。確かめられなければ cgroup を残す（CORE-1・CORE-2）。
             let pending = take_unreaped_processes();
-            if settle_failed_start(store, &launcher, req.id(), timeouts, pending) {
+            if settle_failed_start(store, &launcher, req.id(), timeouts, pending, deadline) {
                 release_logged(deps);
                 Err(e)
             } else {
@@ -434,6 +469,46 @@ fn start_sequence(
     }
 }
 
+/// `recover_interrupted_start` 1 回の待ちの上限（`confirm_no_process` の上限＋猶予）。
+fn recover_need(timeouts: &StartTimeouts) -> Duration {
+    timeouts.confirm().saturating_add(LAUNCHER_REPLY_GRACE)
+}
+
+/// launch の時点で、レコードの cgroup の instance が [`StartDeps::prepare_cgroup`] の準備した世代と一致するかを
+/// 確かめてから内側の launcher へ委ねる（CORE-2・CORE-3・SEC-1）。
+///
+/// core の `start` は起動権の予約（revision 照合つきの Created → Running〔pid なし〕）を済ませてから launch を呼び、
+/// 予約中のレコードは delete が拒否する。そのためこの時点の照合で、準備の後・予約の前に同じ ID が削除・再作成された
+/// 場合（別世代の bundle を旧世代の cgroup で起動する経路）を漏れなく拒否できる。拒否すると core は予約を Created へ
+/// 戻し、入口は準備した cgroup を消す。
+struct InstanceCheckedLauncher {
+    inner: Arc<dyn ProcessLauncher>,
+    store: Arc<dyn StateStore>,
+    id: ContainerId,
+    expected: Option<StateRevision>,
+}
+
+impl ProcessLauncher for InstanceCheckedLauncher {
+    fn launch(
+        &self,
+        spec: &LaunchSpec,
+        timeout: Duration,
+    ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+        let record = self.store.get(&GetStateRequest::new(self.id.clone()))?;
+        if record.cgroup().map(|c| c.instance()) != self.expected {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "the container was recreated after its cgroup was prepared",
+            ));
+        }
+        self.inner.launch(spec, timeout)
+    }
+
+    fn confirm_no_process(&self, id: &ContainerId, timeout: Duration) -> Result<(), TraitError> {
+        self.inner.confirm_no_process(id, timeout)
+    }
+}
+
 /// `start` 失敗後に予約を Created へ戻し、未回収のハンドル（`extra` と登録済み分）を terminate する。
 /// 両方済んだら `true`。
 fn recover_after_timeout(
@@ -442,6 +517,7 @@ fn recover_after_timeout(
     id: &ContainerId,
     timeouts: &StartTimeouts,
     extra: Vec<Box<dyn LaunchedProcess>>,
+    deadline: Option<Instant>,
 ) -> bool {
     let limit = timeouts
         .terminate()
@@ -450,6 +526,10 @@ fn recover_after_timeout(
     let started = Instant::now();
     let mut recovered = false;
     loop {
+        if !fits(deadline, recover_need(timeouts)) {
+            log_event("recover_budget_exhausted", Some(ErrorCode::Timeout));
+            break;
+        }
         match recover_interrupted_start(store, launcher, id, timeouts) {
             Ok(_) => {
                 recovered = true;
@@ -467,7 +547,7 @@ fn recover_after_timeout(
     }
     let mut all_reaped = true;
     for p in extra.into_iter().chain(take_unreaped_processes()) {
-        if terminate_retrying(p, timeouts.terminate()).is_none() {
+        if terminate_retrying(p, timeouts.terminate(), deadline).is_none() {
             all_reaped = false;
         }
     }
@@ -486,18 +566,23 @@ fn settle_failed_start(
     id: &ContainerId,
     timeouts: &StartTimeouts,
     pending: Vec<Box<dyn LaunchedProcess>>,
+    deadline: Option<Instant>,
 ) -> bool {
     let reverted = store
         .get(&GetStateRequest::new(id.clone()))
         .is_ok_and(|r| r.status().state() == ContainerState::Created && r.status().pid().is_none());
     if !reverted {
-        return recover_after_timeout(store, launcher, id, timeouts, pending);
+        return recover_after_timeout(store, launcher, id, timeouts, pending, deadline);
     }
     let limit = timeouts
         .terminate()
         .saturating_add(LAUNCHER_REPLY_GRACE.saturating_mul(2));
     let started = Instant::now();
     let idle = loop {
+        if !fits(deadline, recover_need(timeouts)) {
+            log_event("start_settle_budget_exhausted", Some(ErrorCode::Timeout));
+            break false;
+        }
         match recover_interrupted_start(store, launcher, id, timeouts) {
             // Created のため回復対象は無い。予約が解放済みで、core のワーカーも残っていない。
             Err(e)
@@ -519,7 +604,7 @@ fn settle_failed_start(
     };
     let mut all_reaped = true;
     for p in pending.into_iter().chain(take_unreaped_processes()) {
-        if terminate_retrying(p, timeouts.terminate()).is_none() {
+        if terminate_retrying(p, timeouts.terminate(), deadline).is_none() {
             all_reaped = false;
         }
     }
@@ -537,7 +622,7 @@ fn dispose(
     let mut ok = true;
     let mut reaped = Vec::new();
     if let Some(p) = process {
-        match terminate_retrying(p, timeouts.terminate()) {
+        match terminate_retrying(p, timeouts.terminate(), None) {
             Some(pid) => {
                 log_event("handle_terminated", None);
                 reaped.push(pid);
@@ -551,7 +636,7 @@ fn dispose(
             ok = false;
         }
         for (p, _reason) in late.take() {
-            match terminate_retrying(p, timeouts.terminate()) {
+            match terminate_retrying(p, timeouts.terminate(), None) {
                 Some(pid) => {
                     log_event("handle_terminated", None);
                     reaped.push(pid);
@@ -810,7 +895,7 @@ mod linux {
             &mut self,
             store: &dyn StateStore,
             observed: &StateRecord,
-        ) -> Result<(), TraitError> {
+        ) -> Result<Option<StateRevision>, TraitError> {
             let Some(privilege) = self.privilege else {
                 return Err(TraitError::new(
                     ErrorCode::Unimplemented,
@@ -830,9 +915,10 @@ mod linux {
                 .and_then(|l| l.into_join())
                 .map_err(to_trait);
             let start_cgroup = chain?;
+            let instance = start_cgroup.record().cgroup().map(|c| c.instance());
             self.start_cgroup = Some(start_cgroup);
             self.delegated = Some(delegated);
-            Ok(())
+            Ok(instance)
         }
 
         fn build_audit_sink(&mut self) -> Result<(), TraitError> {
@@ -942,7 +1028,7 @@ mod linux {
         let mut deps = ProductionStartDeps::new(args.root);
         let running = match run_start(
             &mut deps,
-            store.as_ref(),
+            &store,
             &OpRecorder::new(),
             &req,
             &timeouts,

@@ -35,10 +35,18 @@ pub const PROTOCOL_VERSION: &str = "2025-06-18";
 pub const MAX_LINE_BYTES: usize = 1024 * 1024;
 
 /// メッセージ受信開始後に 1 行を読み切るまでの既定の期限（REPAIR-5）。
-pub const MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
+/// AGENTS.md の推奨（新規の応答待ちは 5〜10 秒）の上限に合わせる。1 行は最大 1 MiB で、
+/// 先頭バイト受信後の読み切りに 10 秒を超える正当な理由はない。
+pub const MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 応答 1 件の書き込み・flush の既定の期限（REPAIR-5）。
-pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// 応答 1 件の書き込み・flush の既定の期限（REPAIR-5）。推奨範囲（5〜10 秒）の上限に合わせる。
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 診断出力（stderr）を待つ上限。超過時は診断を捨てて処理を続ける（REPAIR-5）。
+pub const DIAG_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// ログ用キューの深さ。満杯なら新しい行を捨てる（要求処理を止めない）。
+const LOG_QUEUE_DEPTH: usize = 64;
 
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
@@ -80,6 +88,8 @@ pub enum ServeError {
     WriteTimeout,
     /// 応答の JSON 符号化に失敗した（通知の無応答とは区別する）。
     Encode,
+    /// 読み書きスレッドを生成できなかった（OS のスレッド上限等）。
+    Spawn(io::Error),
 }
 
 impl std::fmt::Display for ServeError {
@@ -90,6 +100,7 @@ impl std::fmt::Display for ServeError {
             ServeError::ReadTimeout => f.write_str("timed out reading request"),
             ServeError::WriteTimeout => f.write_str("timed out writing response"),
             ServeError::Encode => f.write_str("failed to encode response"),
+            ServeError::Spawn(_) => f.write_str("failed to spawn worker thread"),
         }
     }
 }
@@ -318,6 +329,14 @@ pub fn handle_message(line: &[u8]) -> Outcome {
         return invalid();
     };
 
+    // params は省略・オブジェクト・配列のいずれか（JSON-RPC 2.0）。既知メソッド共通の入口で検証する。
+    let params_type_ok = obj
+        .get("params")
+        .is_none_or(|p| p.is_object() || p.is_array());
+    if !params_type_ok && matches!(method, "initialize" | "tools/list" | "tools/call" | "ping") {
+        return error_outcome(op, id, INVALID_PARAMS, "Invalid params", None);
+    }
+
     match method {
         "initialize" => {
             if !initialize_params_valid(obj.get("params")) {
@@ -366,10 +385,40 @@ where
     R: BufRead + Send + 'static,
     W: Write + Send + 'static,
 {
+    // stderr が詰まっても要求処理を止めないよう、ログは専用スレッドへ非ブロッキングで渡す（REPAIR-5）。
+    let (tx, rx) = mpsc::sync_channel::<String>(LOG_QUEUE_DEPTH);
+    let spawned = thread::Builder::new()
+        .name("mcp-log".into())
+        .spawn(move || {
+            for line in rx {
+                // 壊れた stderr で panic しない。詰まった場合はこのスレッドだけが止まる。
+                let _ = writeln!(io::stderr(), "{line}");
+            }
+        });
+    let logger_alive = spawned.is_ok();
     serve_with(reader, writer, Limits::default(), &mut |line| {
-        // 壊れた stderr で panic しない。
-        let _ = writeln!(io::stderr(), "{line}");
+        if logger_alive {
+            // 満杯・切断時は捨てる（try_send は待たない）。
+            let _ = tx.try_send(line.to_owned());
+        }
     })
+}
+
+/// 診断 1 行を stderr へ書く。書き込みを専用スレッドで行い [`DIAG_TIMEOUT`] で打ち切る（REPAIR-5）。
+/// 期限超過・スレッド生成失敗時は診断を捨てる。bin が終了時の診断に使う。
+pub fn write_diagnostic(line: &str) {
+    let owned = format!("{line}\n");
+    let (tx, rx) = mpsc::sync_channel::<()>(1);
+    let spawned = thread::Builder::new()
+        .name("mcp-diag".into())
+        .spawn(move || {
+            let mut err = io::stderr();
+            let _ = err.write_all(owned.as_bytes()).and_then(|()| err.flush());
+            let _ = tx.send(());
+        });
+    if spawned.is_ok() {
+        let _ = rx.recv_timeout(DIAG_TIMEOUT);
+    }
 }
 
 /// 1 行の読み取り結果。
@@ -469,44 +518,58 @@ where
 {
     let (ev_tx, ev_rx) = mpsc::sync_channel::<Event>(4);
     let max_line = limits.max_line_bytes;
-    thread::spawn(move || {
-        loop {
-            let started_tx = ev_tx.clone();
-            let mut on_start = move || {
-                let _ = started_tx.send(Event::Started);
-            };
-            match read_line(&mut reader, max_line, &mut on_start) {
-                Ok(None) => {
-                    let _ = ev_tx.send(Event::Eof);
+    let (out_tx, out_rx) = mpsc::sync_channel::<String>(1);
+    let (done_tx, done_rx) = mpsc::sync_channel::<io::Result<()>>(1);
+    // 書き込みスレッドを先に作る。読み取りスレッドの生成に失敗したら out_tx を drop して回収させる。
+    if let Err(e) = thread::Builder::new()
+        .name("mcp-write".into())
+        .spawn(move || {
+            for text in out_rx {
+                let res = writer
+                    .write_all(text.as_bytes())
+                    .and_then(|()| writer.write_all(b"\n"))
+                    .and_then(|()| writer.flush());
+                let failed = res.is_err();
+                if done_tx.send(res).is_err() || failed {
                     break;
                 }
-                Ok(Some(line)) => {
-                    if ev_tx.send(Event::Line(line)).is_err() {
+            }
+        })
+    {
+        log_transport(log, "UNAVAILABLE");
+        return Err(ServeError::Spawn(e));
+    }
+    let reader_spawn = thread::Builder::new()
+        .name("mcp-read".into())
+        .spawn(move || {
+            loop {
+                let started_tx = ev_tx.clone();
+                let mut on_start = move || {
+                    let _ = started_tx.send(Event::Started);
+                };
+                match read_line(&mut reader, max_line, &mut on_start) {
+                    Ok(None) => {
+                        let _ = ev_tx.send(Event::Eof);
+                        break;
+                    }
+                    Ok(Some(line)) => {
+                        if ev_tx.send(Event::Line(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(Event::Failed(e));
                         break;
                     }
                 }
-                Err(e) => {
-                    let _ = ev_tx.send(Event::Failed(e));
-                    break;
-                }
             }
-        }
-    });
-
-    let (out_tx, out_rx) = mpsc::sync_channel::<String>(1);
-    let (done_tx, done_rx) = mpsc::sync_channel::<io::Result<()>>(1);
-    thread::spawn(move || {
-        for text in out_rx {
-            let res = writer
-                .write_all(text.as_bytes())
-                .and_then(|()| writer.write_all(b"\n"))
-                .and_then(|()| writer.flush());
-            let failed = res.is_err();
-            if done_tx.send(res).is_err() || failed {
-                break;
-            }
-        }
-    });
+        });
+    if let Err(e) = reader_spawn {
+        // out_tx は return で drop され、書き込みスレッドは終了する。
+        drop(out_tx);
+        log_transport(log, "UNAVAILABLE");
+        return Err(ServeError::Spawn(e));
+    }
 
     loop {
         // アイドル待ちは無期限。メッセージの先頭バイトが来てからは期限付き。
@@ -678,6 +741,28 @@ mod tests {
                 json!({"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Invalid params"}}),
                 "case: {case}"
             );
+        }
+    }
+
+    /// MCP-1: initialize 以外でも params がオブジェクト・配列以外なら -32602。
+    #[test]
+    fn mcp1_non_initialize_rejects_scalar_params_with_32602() {
+        for method in ["tools/list", "ping"] {
+            for params in ["1", "\"invalid\"", "true", "null"] {
+                let line =
+                    format!(r#"{{"jsonrpc":"2.0","id":3,"method":"{method}","params":{params}}}"#);
+                let v = call(&line).unwrap();
+                assert_eq!(
+                    v,
+                    json!({"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"Invalid params"}}),
+                    "case: {line}"
+                );
+            }
+            for params in ["{}", "[]"] {
+                let line =
+                    format!(r#"{{"jsonrpc":"2.0","id":3,"method":"{method}","params":{params}}}"#);
+                assert!(call(&line).unwrap().get("result").is_some(), "case: {line}");
+            }
         }
     }
 

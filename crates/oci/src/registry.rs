@@ -369,14 +369,6 @@ fn is_public_ip(ip: IpAddr) -> bool {
             if v6.is_unspecified() || v6.is_loopback() || v6.is_multicast() {
                 return false;
             }
-            // fc00::/7（ULA）・fe80::/10（リンクローカル）・fec0::/10（旧サイトローカル）。
-            if s[0] & 0xfe00 == 0xfc00 || s[0] & 0xffc0 == 0xfe80 || s[0] & 0xffc0 == 0xfec0 {
-                return false;
-            }
-            // 2001:db8::/32（文書化用）。
-            if s[0] == 0x2001 && s[1] == 0x0db8 {
-                return false;
-            }
             let embedded = |hi: u16, lo: u16| {
                 let [a, b] = hi.to_be_bytes();
                 let [c, d] = lo.to_be_bytes();
@@ -387,8 +379,21 @@ fn is_public_ip(ip: IpAddr) -> bool {
                 return embedded(s[6], s[7]);
             }
             if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
-                // 64:ff9b::/96（NAT64）。
+                // 64:ff9b::/96（well-known NAT64。RFC 6052）。埋め込まれた IPv4 を検査する。
+                // 64:ff9b:1::/48（local-use NAT64。RFC 8215）は下の 2000::/3 判定で拒否される。
                 return embedded(s[6], s[7]);
+            }
+            // fail-closed: グローバルユニキャスト 2000::/3 以外（ULA・リンクローカル・サイトローカル・
+            // local-use NAT64・SRv6 SID・予約等）はすべて非公開として扱う。
+            if s[0] & 0xe000 != 0x2000 {
+                return false;
+            }
+            // 2001::/23（IETF プロトコル割り当て。Teredo 2001::/32 を含む）・2001:db8::/32（文書化用）・
+            // 3fff::/20（文書化用。RFC 9637）。
+            if (s[0] == 0x2001 && (s[1] < 0x0200 || s[1] == 0x0db8))
+                || (s[0] == 0x3fff && s[1] < 0x1000)
+            {
+                return false;
             }
             if s[0] == 0x2002 {
                 // 2002::/16（6to4）。
@@ -738,6 +743,50 @@ mod tests {
         assert_eq!(run(&t).expect_err("timeout").code(), OciErrorCode::Timeout);
     }
 
+    /// 偽の通信を差し込んだ `RegistryClient`（公開メソッド経由の照合用）。
+    fn client_with(
+        t: FakeTransport,
+        rec: Arc<crate::instrument::testing::Collect>,
+    ) -> RegistryClient {
+        RegistryClient {
+            agent: Agent::new_with_config(Config::default()),
+            transport: Arc::new(t),
+            config: RegistryClientConfig::default(),
+            recorder: rec,
+        }
+    }
+
+    /// OCI-1・REPAIR-4: 公開メソッド `authenticate_anonymous` の成功と失敗が記録先へ 1 件ずつ記録される。
+    #[test]
+    fn authenticate_anonymous_public_api_records_outcomes() {
+        use crate::instrument::OciOpOutcome;
+        let (ep, repo) = alpine();
+        let rec = Arc::new(crate::instrument::testing::Collect::default());
+        let ok = client_with(
+            FakeTransport::new(vec![
+                resp(401, &[HUB_CHALLENGE], ""),
+                resp(200, &[], r#"{"token":"tok","expires_in":300}"#),
+            ]),
+            rec.clone(),
+        );
+        let RegistryAuth::Bearer(t) = ok.authenticate_anonymous(&ep, &repo).expect("auth") else {
+            panic!("expected bearer");
+        };
+        assert_eq!(t.authorization_header_value(), "Bearer tok");
+        let bad = client_with(
+            FakeTransport::new(vec![resp(401, &[HUB_CHALLENGE], ""), resp(403, &[], "")]),
+            rec.clone(),
+        );
+        let e = bad.authenticate_anonymous(&ep, &repo).expect_err("403");
+        assert_eq!(e.code(), OciErrorCode::PermissionDenied);
+        let items = rec.items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].outcome(), OciOpOutcome::Success);
+        assert_eq!(items[0].error_code(), None);
+        assert_eq!(items[1].outcome(), OciOpOutcome::Failure);
+        assert_eq!(items[1].error_code(), Some(OciErrorCode::PermissionDenied));
+    }
+
     /// OCI-1: 発行時刻が古い応答は取得直後でも失効扱い（期限切れの照合）。
     #[test]
     fn expired_token_is_reported_expired() {
@@ -933,6 +982,15 @@ mod tests {
             "64:ff9b::a00:1",
             "2002:7f00:1::1",
             "2001:db8::1",
+            "64:ff9b:1::a00:1",
+            "64:ff9b:1::808:808",
+            "64:ff9b::7f00:1",
+            "2001::1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "3fff::1",
+            "5f00::1",
+            "100::1",
+            "fec0::1",
         ];
         for a in private {
             assert!(!is_public_ip(a.parse().expect("ip")), "{a}");
@@ -944,6 +1002,8 @@ mod tests {
             "2606:4700::1111",
             "::ffff:8.8.8.8",
             "2002:0808:0808::1",
+            "64:ff9b::808:808",
+            "2001:4860:4860::8888",
         ];
         for a in public {
             assert!(is_public_ip(a.parse().expect("ip")), "{a}");

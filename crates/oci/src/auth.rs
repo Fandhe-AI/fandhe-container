@@ -59,6 +59,13 @@ pub(crate) struct TokenRealm {
     same_as_registry: bool,
 }
 
+/// 既定ポート（https の 443）を補ってホストとポートが同じか判定する。
+/// `harbor.internal` と `harbor.internal:443` は同じ接続先なので同一視する（`RegistryHost` の
+/// `PartialEq` はポートの有無を区別するため使わない）。
+fn same_endpoint(a: &RegistryHost, b: &RegistryHost) -> bool {
+    a.host() == b.host() && a.port().unwrap_or(443) == b.port().unwrap_or(443)
+}
+
 impl TokenRealm {
     /// `realm` を検証して作る。`registry` はこの realm を提示したレジストリのホスト。
     pub(crate) fn parse(realm: &str, registry: &RegistryHost) -> Result<Self, OciError> {
@@ -74,7 +81,8 @@ impl TokenRealm {
             None => (rest, ""),
         };
         let host = RegistryHost::parse(authority).map_err(|_| bad("invalid token realm host"))?;
-        if host != *registry {
+        let same = same_endpoint(&host, registry);
+        if !same {
             let last_label = host.host().rsplit('.').next().unwrap_or("");
             let numeric_tail =
                 !last_label.is_empty() && last_label.bytes().all(|b| b.is_ascii_digit());
@@ -96,7 +104,7 @@ impl TokenRealm {
         }
         Ok(Self {
             url: format!("https://{}{}", host.authority(), path),
-            same_as_registry: host == *registry,
+            same_as_registry: same,
         })
     }
 
@@ -548,6 +556,28 @@ mod tests {
         let c = parse_www_authenticate(&[r#"Bearer realm="https://localhost:5000/token""#], &host)
             .expect("same host");
         assert_eq!(c.realm.as_str(), "https://localhost:5000/token");
+    }
+
+    /// OCI-1: 既定ポート 443 の明示有無は同一ホストとして扱い、別ポートは別ホストのまま。
+    #[test]
+    fn realm_default_port_is_normalized() {
+        for (reg, realm) in [
+            ("harbor.internal", "https://harbor.internal:443/token"),
+            ("harbor.internal:443", "https://harbor.internal/token"),
+        ] {
+            let host = RegistryHost::parse(reg).expect("host");
+            let c = parse_www_authenticate(&[&format!(r#"Bearer realm="{realm}""#)], &host)
+                .expect("same host");
+            assert!(c.realm.is_registry_host(), "{reg} {realm}");
+        }
+        let host = RegistryHost::parse("harbor.internal").expect("host");
+        let c = parse_www_authenticate(
+            &[r#"Bearer realm="https://harbor.internal:8443/token""#],
+            &host,
+        )
+        .expect("other port is a separate host");
+        // 別ポートはレジストリ自身ではないため公開 IP のみの経路になる。
+        assert!(!c.realm.is_registry_host());
     }
 
     fn token(json: &str) -> Result<BearerToken, OciError> {

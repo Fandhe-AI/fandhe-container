@@ -491,6 +491,32 @@ jobs:
         timeout-minutes: 5
         run: make deny-license-fail-closed-selftest
 
+      # サードパーティのライセンス表記の生成（TASK-103.2・OSS-5）。about.toml が 5 ターゲットを固定する
+      # ため生成結果は実行 OS に依らず、cargo-about の導入ビルドを 3 回払わないよう ubuntu のみで実行する。
+      # 既存の platform-ci のステップとして足すため check-run 名は増えない（ruleset の変更は不要）。
+      # 自己テストはスタブのみで OS に依らない。
+      - name: ライセンス表記生成スクリプトの自己テスト（OSS-5・TASK-103.1。ubuntu のみ）
+        if: runner.os == 'Linux'
+        shell: bash
+        timeout-minutes: 5
+        run: make third-party-licenses-selftest
+
+      # cargo-about は Makefile の CARGO_ABOUT_VERSION（Dockerfile と同期）へ cargo install --locked で
+      # 固定導入し、版の完全一致を検査してから生成する（action は追加しない）。生成物はコミットせず
+      # target/ 配下に出す。run に ${{ }} は埋め込まない。
+      - name: サードパーティのライセンス表記を生成（cargo about。ubuntu のみ）
+        if: runner.os == 'Linux'
+        shell: bash
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          make install-cargo-about
+          make third-party-licenses
+          out="target/third-party-licenses/THIRD-PARTY-LICENSES.md"
+          test -s "${out}"
+          wc -l "${out}"
+          sed -n '/^## Overview/,/^## Licenses/p' "${out}"
+
       # 以下は旧 integration-test のステップ（REPAIR-7 ステージ 3: タイムアウト保護された結合試験）
       - name: integration test target 件数の判定
         id: count

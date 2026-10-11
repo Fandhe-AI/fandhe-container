@@ -39,9 +39,12 @@ COMMITLINT_CONFIG_VERSION := 21.2.0
 
 # 導入系ツールの固定バージョン（`=x.y.z` 完全固定方針に合わせ exact 固定。
 # CARGO_DENY_VERSION は Dockerfile の先行導入・.github/workflows/ci.yml の
-# rust-ci.with.cargo-deny-version（REPAIR-7 ステージ 5）と値を同期させる）。
+# rust-ci.with.cargo-deny-version（REPAIR-7 ステージ 5）と値を同期させる。
+# CARGO_ABOUT_VERSION は Dockerfile の先行導入（cargo install cargo-about@x.y.z）と同期させる。
+# CI の platform-ci は `make install-cargo-about` 経由で本値を使う。TASK-103.2・OSS-5）。
 LEFTHOOK_VERSION := 2.1.10
 CARGO_DENY_VERSION := 0.20.2
+CARGO_ABOUT_VERSION := 0.9.2
 
 .PHONY: help
 help: ## ターゲット一覧を表示する
@@ -469,8 +472,9 @@ else
 endif
 
 # サードパーティのライセンス表記を cargo-about で生成する（TASK-103.1・OSS-5）。`make ci` には
-# 含めない（ローカルゲートの定義を変えない）。cargo-deny と違い自動導入しない（cargo-about の
-# 版を固定した導入と版の承認は #830〔TASK-103.2〕）。未導入なら exit 2 で止まる。
+# 含めない（ローカルゲートの定義を変えない）。cargo-deny と違い自動導入しない（fail-closed）。
+# 導入は開発コンテナ（Dockerfile）か `make install-cargo-about`（版は CARGO_ABOUT_VERSION。TASK-103.2）。
+# 未導入なら exit 2 で止まる。
 # OUTPUT=<file> で出力先を指定できる（既定: target/third-party-licenses/）。値は単一引用符化して渡し、検証はスクリプトに任せる。
 .PHONY: third-party-licenses
 third-party-licenses: ## サードパーティのライセンス表記を cargo about で生成する（cargo-about 未導入なら失敗。OUTPUT=<file> 任意）
@@ -484,6 +488,24 @@ ifneq ($(and $(HAS_CARGO),$(HAS_MEMBERS)),)
 else
 	@echo "skip: Cargo.toml 未追加、または workspace にメンバー crate が無いため third-party-licenses をスキップ"
 endif
+
+# cargo-about を CARGO_ABOUT_VERSION へ完全固定で導入する（TASK-103.2・OSS-5）。platform-ci（ubuntu）
+# が third-party-licenses の前に実行する。バイナリは feature `cli` が要る（無いと導入されない）。
+# 既に同じ版なら再導入せず、導入後は `cargo about --version` が版と完全一致することを検査する。
+# 依存ではなくツールのため Cargo.toml・Cargo.lock には入らない。ビルドに C コンパイラが要る（ring 等）。
+.PHONY: install-cargo-about
+install-cargo-about: ## cargo-about を固定版で導入する（TASK-103.2。版は CARGO_ABOUT_VERSION）
+	@export PATH="$$HOME/.cargo/bin:$$PATH"; \
+	if [ "$$(cargo about --version 2>/dev/null)" != "cargo-about $(CARGO_ABOUT_VERSION)" ]; then \
+		echo "cargo-about $(CARGO_ABOUT_VERSION) を導入します"; \
+		cargo install cargo-about@$(CARGO_ABOUT_VERSION) --locked --features cli --force; \
+	fi; \
+	got="$$(cargo about --version 2>/dev/null)"; \
+	if [ "$$got" != "cargo-about $(CARGO_ABOUT_VERSION)" ]; then \
+		echo "error: expected cargo-about $(CARGO_ABOUT_VERSION) but got '$$got'" >&2; \
+		exit 1; \
+	fi; \
+	echo "$$got"
 
 .PHONY: third-party-licenses-selftest
 third-party-licenses-selftest: ## ライセンス表記生成スクリプトの自己テスト（スタブ cargo のみ。TASK-103.1）

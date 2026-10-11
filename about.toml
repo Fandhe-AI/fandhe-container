@@ -3,12 +3,12 @@
 # ライセンスの定義。呼び出し元は `scripts/generate-third-party-licenses.sh`（`-c` で本ファイルを
 # 渡す。`make third-party-licenses` 経由）。テンプレートは about.hbs。
 # 検査（許可外ライセンスの fail-closed 検出）は deny.toml の cargo-deny が担い、本ファイルは
-# 「表記の生成」だけを担う。cargo-about の導入と実出力の確認は #830（TASK-103.2）で行う。
+# 「表記の生成」だけを担う。cargo-about は Dockerfile と `make install-cargo-about` で版固定導入する（TASK-103.2）。
 
 # deny.toml の [licenses].allow と同じ集合・同じ順で同期させる。片方だけ足さない。
 # 識別子の追加は依存追加のユーザー承認（dependency-policy）とセットで行い、
 # コピーレフト（GPL/LGPL/MPL 等）は列挙しない。
-# 注意: `Apache-2.0 WITH LLVM-exception` を cargo-about が受理するかは未検証（#830 で確認する）。
+# `Apache-2.0 WITH LLVM-exception` を含め cargo-about 0.9.2 が受理することを実機で確認済み（TASK-103.2）。
 accepted = [
   "MIT",
   "Apache-2.0",

@@ -127,15 +127,18 @@ impl PeerAuthObserver for PathlessPeerAuthObserver {
             self.coalesced = self.coalesced.saturating_add(1);
             return;
         }
-        let line = serde_json::json!({
+        let mut line = serde_json::json!({
             "event": "plugin_peer_auth",
             "op": event.op.as_str(),
             "outcome": "error",
             "reason": event.reason.as_str(),
             "code": event.code.as_str(),
             "expected_uid": event.expected_uid,
-            "peer_uid": event.peer_uid,
         });
+        // 正式な plugin_peer_auth イベントと揃え、取得できない peer_uid はキーごと省略する。
+        if let (Some(uid), Some(obj)) = (event.peer_uid, line.as_object_mut()) {
+            obj.insert("peer_uid".to_owned(), serde_json::json!(uid));
+        }
         self.lines.push(line.to_string());
     }
 }

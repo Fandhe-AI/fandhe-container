@@ -394,16 +394,22 @@ mod tests {
     /// 何も送らないアイドル相手は期限で切らず、EOF で正常終了する（stdio と同じ契約）。
     #[test]
     fn idle_connection_waits_until_eof() {
-        let (fake, _) = Fake::new(vec![
-            Step::Idle,
-            Step::Idle,
-            Step::Idle,
-            Step::Idle,
-            Step::Eof,
-        ]);
-        // 期限（80ms）を超えて待っても ReadTimeout にならない。
-        let r = serve_uds_with(fake, quick(), &UnavailableBackend, &mut |_| {});
-        assert!(r.is_ok());
+        // Idle 1 回あたり最低 2ms 眠るため、60 回で期限（80ms）を確実に超える。
+        let mut script: Vec<Step> = (0..60).map(|_| Step::Idle).collect();
+        script.push(Step::Eof);
+        let (fake, written) = Fake::new(script);
+        let limits = quick();
+        let started = Instant::now();
+        let r = serve_uds_with(fake, limits, &UnavailableBackend, &mut |_| {});
+        let elapsed = started.elapsed();
+        // 期限を超えて待ったうえで ReadTimeout にならず EOF で正常終了する（REPAIR-12）。
+        assert!(
+            elapsed > limits.message_timeout,
+            "idle wait {elapsed:?} must exceed {:?}",
+            limits.message_timeout
+        );
+        assert!(r.is_ok(), "{r:?}");
+        assert!(written.lock().unwrap().is_empty());
     }
 
     /// 書き込みが進まない相手は write_timeout で WriteTimeout（REPAIR-5）。

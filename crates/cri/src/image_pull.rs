@@ -24,8 +24,6 @@
 //! - tar 展開（rootfs 化）・whiteout・diff_id 検証は TASK-52.3、永続イメージストアと展開後サイズの算出は
 //!   TASK-183（OCI-7）の担当。本モジュールが返す `size` は config と全 layer の**圧縮サイズの合計**で、
 //!   展開後サイズではない
-//! - tag 直指定で単一 manifest のとき、oci が manifest 本文の digest を露出しないため `repo_digests` は空になる
-//!   （manifest 本文と参照 digest の突合も oci 側で未実装。OCI-1）
 //! - `AuthConfig.identity_token`（OAuth2）・`registry_token` は未対応で `UNIMPLEMENTED`（oci の OAuth2 POST フロー待ち。OCI-3）
 //! - 実行中の blocking 処理は gRPC 側のキャンセルでは打ち切れず、[`PullConfig::pull_deadline`] のステップ間確認と
 //!   oci の各リクエスト期限で有界化される。全体 timeout は plugin-cri（TASK-108・TASK-114）の責務
@@ -172,6 +170,8 @@ pub struct PulledManifest {
     pub manifest: ImageManifest,
     /// image index から選んだ場合の選択エントリの digest。
     pub selected_digest: Option<Digest>,
+    /// `manifest` 本文のハッシュ。digest 参照・index 選択エントリでは oci が要求 digest と突合済み（OCI-1）。
+    pub manifest_digest: Digest,
 }
 
 /// oci の `RegistryClient` を呼ぶ最小の境界。実体は [`OciRegistryClient`]、試験では偽実装を差し込む
@@ -283,6 +283,7 @@ impl RegistryPullClient for OciRegistryClient {
         Ok(PulledManifest {
             manifest: resolved.manifest,
             selected_digest: resolved.selected_digest,
+            manifest_digest: resolved.manifest_digest,
         })
     }
 
@@ -373,14 +374,13 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         let hex = digest_hex(&descriptor.digest);
         let final_path = blobs.join(hex);
         // キャッシュ命中: 通常ファイル（symlink は辿らない）かつ再検証に合格すれば再取得しない。
-        if let Ok(meta) = fs::symlink_metadata(&final_path) {
-            let valid = meta.is_file()
-                && verify_blob_digest(&final_path, &descriptor.digest, descriptor.size).is_ok();
-            if valid {
-                return Ok(());
-            }
-            // 破損・種別違いは取り除いて再取得する（ディレクトリ等は remove_file が失敗し、公開時に失敗する）。
-            let _ = fs::remove_file(&final_path);
+        // 再検証に失敗しても共有 blob は消さない（一過性の読み出しエラーで検証済み blob を失わないため）。
+        // 取得・検証に成功した場合に限り、下の rename で置き換える。
+        if let Ok(meta) = fs::symlink_metadata(&final_path)
+            && meta.is_file()
+            && verify_blob_digest(&final_path, &descriptor.digest, descriptor.size).is_ok()
+        {
+            return Ok(());
         }
         let staged = staging.path().join(hex);
         self.client
@@ -487,6 +487,8 @@ impl<C: RegistryPullClient> ImagePuller for OciImagePuller<C> {
             seen.push(&descriptor.digest);
         }
         drop(staging);
+        // 最後の blob の取得・検証で期限を超えた場合も成功を返さない（REPAIR-5）。
+        self.check_deadline(started)?;
 
         let name = display_name(image_ref.registry(), repository);
         let mut repo_tags = Vec::new();
@@ -494,12 +496,12 @@ impl<C: RegistryPullClient> ImagePuller for OciImagePuller<C> {
         match image_ref.reference() {
             Reference::Tag(tag) => {
                 repo_tags.push(format!("{name}:{}", tag.as_str()));
-                if let Some(selected) = &resolved.selected_digest {
-                    repo_digests.push(format!("{name}@{}", selected.as_str()));
-                }
+                // 検証済みの manifest digest のみ登録する（index 選択時は選択エントリ照合済み。OCI-1）。
+                repo_digests.push(format!("{name}@{}", resolved.manifest_digest.as_str()));
             }
-            Reference::Digest(digest) => {
-                repo_digests.push(format!("{name}@{}", digest.as_str()));
+            Reference::Digest(_) => {
+                // oci が本文ハッシュと要求 digest を突合済み（不一致は DataLoss）。
+                repo_digests.push(format!("{name}@{}", resolved.manifest_digest.as_str()));
             }
         }
         if repo_tags
@@ -534,6 +536,18 @@ fn display_name(registry: &RegistryHost, repository: &Repository) -> String {
         registry.authority()
     };
     format!("{host}/{}", repository.as_str())
+}
+
+/// 参照文字列を `PullImage` が登録する形（`<registry>/<repo>:<tag>` または `<registry>/<repo>@<digest>`）へ
+/// 正規化する。`ImageStatus`・`ListImages` が短縮名を pull と同じ規則で照会するために使う（CRI-4）。
+/// 解釈できない文字列（イメージ ID の 16 進等）は `None`。
+pub fn canonical_reference(input: &str) -> Option<String> {
+    let image_ref = ImageReference::parse(input).ok()?;
+    let name = display_name(image_ref.registry(), image_ref.repository());
+    Some(match image_ref.reference() {
+        Reference::Tag(tag) => format!("{name}:{}", tag.as_str()),
+        Reference::Digest(digest) => format!("{name}@{}", digest.as_str()),
+    })
 }
 
 /// ディレクトリを（親ごと）作る。Unix では 0700。
@@ -576,12 +590,15 @@ impl StagingDir {
         );
         let path = root.join(name);
         // 非再帰の create は既存（symlink を含む）を辿らず失敗する。
-        let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt as _;
+            let mut builder = fs::DirBuilder::new();
             builder.mode(0o700);
-        }
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = fs::DirBuilder::new();
         builder.create(&path).map_err(|_| {
             PullError::new(
                 OciErrorCode::FailedPrecondition,

@@ -30,7 +30,9 @@ use std::sync::{Arc, Mutex};
 use tonic::codegen::tokio_stream::Empty;
 use tonic::{Request, Response, Status};
 
-use crate::image_pull::{ImagePuller, PullRequest, credentials_from_auth_config};
+use crate::image_pull::{
+    ImagePuller, PullRequest, canonical_reference, credentials_from_auth_config,
+};
 use crate::instrument::{CriOpKind, CriOpRecorder, CriOpTimer, NoopCriOpRecorder};
 use crate::runtime::v1::{self, image_service_server::ImageService};
 
@@ -421,10 +423,15 @@ impl CriImageService {
         if reference.len() > MAX_FILTER_BYTES {
             return Err(Status::invalid_argument("image reference is too long"));
         }
-        let record = self
-            .store
-            .get(&reference)
-            .map_err(|_| Status::internal("image store failure"))?;
+        let store_err = |_| Status::internal("image store failure");
+        let mut record = self.store.get(&reference).map_err(store_err)?;
+        if record.is_none()
+            && let Some(canonical) = canonical_reference(&reference)
+            && canonical != reference
+        {
+            // 短縮名（`alpine`・`alpine:3`）は PullImage と同じ規則で正規化して再照会する（CRI-4）。
+            record = self.store.get(&canonical).map_err(store_err)?;
+        }
         Ok(v1::ImageStatusResponse {
             image: record.map(|r| r.to_proto()),
             info: Default::default(),
@@ -445,9 +452,14 @@ impl CriImageService {
             .store
             .list()
             .map_err(|_| Status::internal("image store failure"))?;
+        let canonical = canonical_reference(&wanted);
         let images = records
             .iter()
-            .filter(|r| wanted.is_empty() || r.matches(&wanted))
+            .filter(|r| {
+                wanted.is_empty()
+                    || r.matches(&wanted)
+                    || canonical.as_deref().is_some_and(|c| r.matches(c))
+            })
             .map(ImageRecord::to_proto)
             .collect();
         Ok(v1::ListImagesResponse { images })

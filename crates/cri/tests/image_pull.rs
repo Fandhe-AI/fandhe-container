@@ -73,6 +73,9 @@ struct FakeClient {
     manifest_json: String,
     require_credentials: bool,
     selected: Option<Digest>,
+    /// 偽の「本文ハッシュ」。digest 参照では oci と同様に要求 digest と突合し、不一致は DataLoss にする。
+    manifest_digest: Digest,
+    blob_delay: Duration,
     corrupt_digest: Option<&'static str>,
     blob_fetches: AtomicUsize,
     seen_credentials: Mutex<Vec<bool>>,
@@ -85,6 +88,8 @@ impl FakeClient {
             manifest_json,
             require_credentials: false,
             selected: None,
+            manifest_digest: Digest::parse(&format!("sha256:{SHA_INDEX_PICK}")).expect("digest"),
+            blob_delay: Duration::ZERO,
             corrupt_digest: None,
             blob_fetches: AtomicUsize::new(0),
             seen_credentials: Mutex::new(Vec::new()),
@@ -119,13 +124,22 @@ impl RegistryPullClient for FakeClient {
         &self,
         _e: &RegistryEndpoint,
         _r: &Repository,
-        _reference: &Reference,
+        reference: &Reference,
         _a: &RegistryAuth,
         _p: &Platform,
     ) -> Result<PulledManifest, OciError> {
+        if let Reference::Digest(want) = reference
+            && *want != self.manifest_digest
+        {
+            return Err(OciError::new(
+                OciErrorCode::DataLoss,
+                "manifest digest mismatch",
+            ));
+        }
         Ok(PulledManifest {
             manifest: parse_image(&self.manifest_json),
             selected_digest: self.selected.clone(),
+            manifest_digest: self.manifest_digest.clone(),
         })
     }
 
@@ -138,6 +152,7 @@ impl RegistryPullClient for FakeClient {
         dest: &Path,
     ) -> Result<(), OciError> {
         self.blob_fetches.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(self.blob_delay);
         let hex = descriptor.digest.as_str().trim_start_matches("sha256:");
         let mut body = blob_body(hex).to_vec();
         if self.corrupt_digest == Some(hex) {
@@ -240,7 +255,7 @@ fn cri4_pull_tag_publishes_verified_blobs() {
         PulledImage {
             id: format!("sha256:{SHA_CONFIG}"),
             repo_tags: vec!["docker.io/library/alpine:3.20".to_owned()],
-            repo_digests: vec![],
+            repo_digests: vec![format!("docker.io/library/alpine@sha256:{SHA_INDEX_PICK}")],
             size: 13,
         }
     );
@@ -287,6 +302,49 @@ fn cri4_pull_repo_digests() {
         pulled.repo_digests,
         vec![format!("docker.io/library/alpine@sha256:{SHA_INDEX_PICK}")]
     );
+}
+
+/// OCI-1: digest 指定の manifest 本文が要求 digest と食い違えば DATA_LOSS で、何も登録・公開しない。
+#[test]
+fn oci1_digest_pull_with_mismatched_manifest_is_rejected() {
+    let dir = TempDir::new("mismatch");
+    let puller = OciImagePuller::new(
+        Arc::new(FakeClient::new(two_layer_manifest())),
+        config(&dir),
+    );
+    let err = puller
+        .pull(&req(&format!("alpine@sha256:{SHA_CONFIG}")))
+        .expect_err("mismatch");
+    assert_eq!(err.code(), OciErrorCode::DataLoss);
+    assert!(!blob_path(&dir, SHA_CONFIG).exists());
+}
+
+/// REPAIR-5: 最後の blob の処理で期限を超えたら成功を返さない。
+#[test]
+fn repair5_deadline_is_checked_after_last_blob() {
+    let dir = TempDir::new("lastblob");
+    let mut fake = FakeClient::new(manifest_json(SHA_CONFIG, &[(SHA_LAYER1, 3)]));
+    fake.blob_delay = Duration::from_millis(60);
+    let mut cfg = config(&dir);
+    cfg.pull_deadline = Duration::from_millis(90);
+    let puller = OciImagePuller::new(Arc::new(fake), cfg);
+    let err = puller.pull(&req("alpine")).expect_err("deadline");
+    assert_eq!(err.code(), OciErrorCode::Timeout);
+}
+
+/// CRI-4: 短縮名は PullImage が登録する正規名へ正規化される（ID 等の解釈不能な文字列は None）。
+#[test]
+fn cri4_canonical_reference_matches_pull_registration() {
+    use fandhe_container_cri::image_pull::canonical_reference;
+    assert_eq!(
+        canonical_reference("alpine:3.20").as_deref(),
+        Some("docker.io/library/alpine:3.20")
+    );
+    assert_eq!(
+        canonical_reference("registry.example.com:5000/team/app:v1").as_deref(),
+        Some("registry.example.com:5000/team/app:v1")
+    );
+    assert_eq!(canonical_reference("Bad Name!"), None);
 }
 
 /// OCI-1: 重複する layer は 1 回だけ取得する。キャッシュ命中は再取得せず、破損した既存 blob は再取得する。

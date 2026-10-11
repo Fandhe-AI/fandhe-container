@@ -494,7 +494,10 @@ pub enum ProcessExit {
 /// 実装は `Drop` で kill / 回収しなくてよい（コンテナの寿命をハンドルに暗黙で縛らない）ため、所有者は
 /// 終了まで待って回収する責任を負う。
 pub trait LaunchedProcess: Send {
-    /// 起動したコンテナプロセスの pid。
+    /// 起動したコンテナプロセスの pid。**コンテナの PID 1**（launcher の PID namespace から見て `NSpid` が
+    /// 2 要素で末尾 1）を指すこと。中間プロセス（fork 親・mapper・代役 init）を返してはならない。違反すると
+    /// exec が `exec_target_not_nested_pid1` で拒否する。PID 1 の pidfd の取得は本番 launcher の責務
+    /// （SUP-6・SEC-1・CORE-1・TASK-163 追補・#1463）。
     fn pid(&self) -> NonZeroU32;
 
     /// プロセスの終了を `timeout` まで待つ。期限を過ぎても kill しない（監視用。REPAIR-5）。
@@ -529,7 +532,9 @@ pub trait LaunchedProcess: Send {
 
     /// 起動時（fork 直後・回収前）に開いた pidfd の借用。exec の対象（pid1）をこの pidfd で固定するために
     /// supervisor が参照する（記録 pid や cgroup の所属に同一性を依存させない。SUP-6・SEC-1・CORE-1・
-    /// TASK-163 追補・#1461）。既定は `None`（pidfd を保持しない実装。呼び出し側は fail-closed にする）。
+    /// TASK-163 追補・#1461）。
+    /// 指す先は [`Self::pid`] と同じ PID 1 であること（#1463）。
+    /// 既定は `None`（pidfd を保持しない実装。呼び出し側は fail-closed にする）。
     #[cfg(target_os = "linux")]
     fn launch_pidfd(&self) -> Option<BorrowedFd<'_>> {
         None

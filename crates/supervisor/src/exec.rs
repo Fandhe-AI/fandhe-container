@@ -195,6 +195,10 @@
 //!   マウント・cgroup namespace・`/sys/fs/cgroup` の bind mount を導入する変更は、この縮退経路を拒否へ切り替える
 //!   こと
 //!
+//! - **記録 pid の意味（#1463）**: `LaunchedProcess::pid` / `launch_pidfd` はコンテナの PID 1 を指す契約で、
+//!   中間プロセス（fork 親・rootless の代役 init 等）が記録された場合は `exec_target_not_nested_pid1` で拒否する。
+//!   祖先の procfs を共有する構成は前提エラーで拒否する（根拠は core の `exec/setns.rs` のモジュール doc）
+//!
 //! # 未実装（REPAIR-3）
 //!
 //! - supervisor から別プロセスの exec 専用プロセスへ pidfd を渡す 1 段目（execve 越しの継承、または外部 CLI への

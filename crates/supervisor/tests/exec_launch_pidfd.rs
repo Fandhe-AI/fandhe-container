@@ -125,6 +125,8 @@ mod linux {
     }
 
     /// 記録 pid が一致すれば pidfd の照合を通り、次段の入れ子の PID 1 の検査で拒否する（順序の証明）。
+    /// 外側の PID namespace に残る子（中間プロセスの代わり）を記録 pid にした場合も同じ拒否になる
+    /// （記録 pid は PID 1 を指す契約。#1463・SUP-6）。
     fn matching_record_pid_reaches_nested_pid1_check(
         child: &ContainerChild,
         pidfd: std::os::fd::BorrowedFd<'_>,

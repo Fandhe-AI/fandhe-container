@@ -17,8 +17,11 @@
 //! TASK-54.2・OCI-3・MS-4・#417）。realm は非信頼 URL のため、`realm_may_receive_credentials` が許可した
 //! ホストにだけ資格情報を送る（fail-closed）。
 //!
-//! 未実装（将来仕様）: OAuth2 の POST フロー（`grant_type=password` / `refresh_token`・OCI-3・#417 の後続）、`registry` への統一入口
-//! （チャレンジに応じた Basic / Bearer の自動選択。OCI-3・#418）、トークンのキャッシュと失効時の再取得。
+//! 実装済み: `registry` への統一入口 `RegistryClient::authenticate`（チャレンジに応じた Basic / Bearer の
+//! 自動選択。TASK-54.3・OCI-3・#418）。
+//!
+//! 未実装（将来仕様）: OAuth2 の POST フロー（`grant_type=password` / `refresh_token`・OCI-3）、
+//! トークンのキャッシュと失効時の再取得。
 //! 資格情報の保管（docker config・credential helper）も範囲外。
 
 use crate::error::{OciError, OciErrorCode};

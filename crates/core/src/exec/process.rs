@@ -106,12 +106,16 @@ use crate::traits::types::ErrorCode;
 use super::entrypoint_mode::EntrypointExecMode;
 use super::interpreter::reject_runtime_interpreter;
 use super::rlimits::apply_rlimits;
+use super::rootfs::PreparedRootfs;
 use super::sealed_copy::{SealPolicy, check_not_on_noexec_mount, seal_entrypoint_copy};
 use super::stages::{LaunchNotReady, LaunchReady};
 use super::{
-    DevptsGidSource, ExecError, IsolationStage, MountIsolation, PivotReport, StagePipeline,
-    ViolationReason, create_default_devices, describe, fd_mount_id, pivot_root, prepare_rootfs,
+    DeviceReport, DevptsGidSource, ExecError, IsolationStage, MountIsolation, PivotReport,
+    StagePipeline, ViolationReason, create_default_devices, describe, fd_mount_id, inject_files,
+    mount_tmpfs, pivot_root, prepare_rootfs,
 };
+use crate::injected_files::InjectedFileSet;
+use crate::tmpfs::TmpfsMountSet;
 
 /// argv の要素数の上限（アロケーション前に検証する）。
 pub const ENTRYPOINT_MAX_ARGS: usize = 4096;
@@ -1647,11 +1651,15 @@ fn parse_setup_report(text: &str) -> Option<ExecChildSetupReport> {
 /// 子のメイン。`establish` → `prepare_rootfs` → `pivot_root` → `exec_entrypoint` を通し、失敗したら
 /// stderr に英語 1 行を出して終了コードを返す（戻り値は `_exit` に渡される）。
 ///
-/// ステージ列（#832。`run_child` が pivot 後・exec 前に呼ぶ）と基本デバイス
-/// ノード（#834）の差し込み位置は、pivot 後・exec 前（`exec_entrypoint` の直前）を想定する。
-/// デバイスノードを pivot の前後どちらで作るかは #834 で決める（本 PR では決めない）。
-fn child_main(rootfs: &Path, entry: &Entrypoint, stages: StagePipeline) -> i32 {
-    match run_child(rootfs, entry, stages, None) {
+/// pivot 前の段（専用 `/dev`・tmpfs・注入）は渡された [`PrePivotSetup`] の分だけ、[`run_pre_pivot`] が固定順
+/// で行う。`None` なら最小構成（何も載せない）。
+fn child_main(
+    rootfs: &Path,
+    entry: &Entrypoint,
+    stages: StagePipeline,
+    setup: Option<PrePivotSetup<'_>>,
+) -> i32 {
+    match run_child(rootfs, entry, stages, setup) {
         Ok(never) => match never {},
         Err(err) => {
             // env の値は message に含めない（パスと errno のみ）。stderr が閉じていても panic しない。
@@ -1665,9 +1673,9 @@ fn run_child(
     rootfs: &Path,
     entry: &Entrypoint,
     stages: StagePipeline,
-    devices: Option<DevptsGidSource<'_>>,
+    setup: Option<PrePivotSetup<'_>>,
 ) -> Result<Infallible, ExecError> {
-    run_child_then(rootfs, devices, stages, |isolation, report, evidence| {
+    run_child_then(rootfs, setup, stages, |isolation, report, evidence| {
         // `exec_entrypoint` と同じ検証を、ステージ列が作った証跡を添えて行う。
         isolation.verify_caller(IsolationStage::Exec)?;
         require_restriction_evidence(evidence)?;
@@ -1675,7 +1683,188 @@ fn run_child(
     })
 }
 
-/// 子の前段（`establish` → `prepare_rootfs` → `pivot_root` → ステージ列）を共通化した本体。
+/// pivot 前に rootfs へ載せるものの指定（TASK-29 追補・#1715。CORE-1・CORE-5・SEC-1）。
+///
+/// 本番の launcher（`oci_runtime`）だけが組み立てる。呼び出し側は「何を載せるか」だけを渡し、
+/// 「どの順で行うか」は [`run_pre_pivot`] が 1 か所で固定する（順序を変える入口を core の外へ出さない）。
+/// 専用 `/dev`（`create_default_devices`）は常に先頭で作る。
+#[derive(Clone, Copy)]
+pub(crate) struct PrePivotSetup<'a> {
+    /// 専用 `/dev` の devpts の `gid=` の決定元。
+    pub(crate) devices: DevptsGidSource<'a>,
+    /// `/dev` の後に載せる tmpfs（無ければ載せない）。
+    pub(crate) tmpfs: Option<&'a TmpfsMountSet>,
+    /// tmpfs の後に注入するファイル（無ければ注入しない）。
+    pub(crate) inject: Option<&'a InjectedFileSet>,
+    /// 検証済みの rootfs を固定した fd。あれば `prepare_rootfs` の後、パスから辿り直した実体が同じ
+    /// `(st_dev, st_ino)` であることを確かめる（検証後の差し替え対策）。
+    pub(crate) pinned_rootfs: Option<BorrowedFd<'a>>,
+}
+
+/// [`run_pre_pivot`] が呼ぶ各段（単体テストが呼び出し順を記録できるよう差し替え可能にした継ぎ目。
+/// 本番の実装は [`RealPrePivotOps`] で、既存の公開関数を呼ぶだけ）。
+trait PrePivotOps {
+    type Isolation;
+    type Prepared;
+    type Devices;
+    type Pivoted;
+    fn establish(&self) -> Result<Self::Isolation, ExecError>;
+    fn prepare_rootfs(
+        &self,
+        isolation: &Self::Isolation,
+        rootfs: &Path,
+    ) -> Result<Self::Prepared, ExecError>;
+    fn verify_pinned(
+        &self,
+        prepared: &Self::Prepared,
+        pinned: BorrowedFd<'_>,
+    ) -> Result<(), ExecError>;
+    fn create_default_devices(
+        &self,
+        isolation: &Self::Isolation,
+        prepared: &Self::Prepared,
+        source: DevptsGidSource<'_>,
+    ) -> Result<Self::Devices, ExecError>;
+    fn mount_tmpfs(
+        &self,
+        isolation: &Self::Isolation,
+        prepared: &Self::Prepared,
+        devices: &Self::Devices,
+        set: &TmpfsMountSet,
+    ) -> Result<(), ExecError>;
+    fn inject_files(
+        &self,
+        isolation: &Self::Isolation,
+        prepared: &Self::Prepared,
+        set: &InjectedFileSet,
+    ) -> Result<(), ExecError>;
+    fn pivot_root(
+        &self,
+        isolation: &Self::Isolation,
+        prepared: Self::Prepared,
+    ) -> Result<Self::Pivoted, ExecError>;
+}
+
+/// 本番の段の実装（既存の公開関数への薄い委譲）。
+struct RealPrePivotOps;
+
+impl PrePivotOps for RealPrePivotOps {
+    type Isolation = MountIsolation;
+    type Prepared = PreparedRootfs;
+    type Devices = DeviceReport;
+    type Pivoted = PivotReport;
+
+    fn establish(&self) -> Result<MountIsolation, ExecError> {
+        MountIsolation::establish()
+    }
+
+    fn prepare_rootfs(
+        &self,
+        isolation: &MountIsolation,
+        rootfs: &Path,
+    ) -> Result<PreparedRootfs, ExecError> {
+        prepare_rootfs(isolation, rootfs)
+    }
+
+    fn verify_pinned(
+        &self,
+        prepared: &PreparedRootfs,
+        pinned: BorrowedFd<'_>,
+    ) -> Result<(), ExecError> {
+        let identity = |fd: BorrowedFd<'_>| -> Result<(u64, u64), ExecError> {
+            let owned = fd.try_clone_to_owned().map_err(|e| {
+                ExecError::from_io(&e, IsolationStage::PrepareRootfs, "dup(rootfs)")
+            })?;
+            let meta = std::fs::File::from(owned).metadata().map_err(|e| {
+                ExecError::from_io(&e, IsolationStage::PrepareRootfs, "fstat(rootfs)")
+            })?;
+            Ok((meta.dev(), meta.ino()))
+        };
+        check_rootfs_identity(identity(pinned)?, identity(prepared.new_root())?)
+    }
+
+    fn create_default_devices(
+        &self,
+        isolation: &MountIsolation,
+        prepared: &PreparedRootfs,
+        source: DevptsGidSource<'_>,
+    ) -> Result<DeviceReport, ExecError> {
+        create_default_devices(isolation, prepared, source)
+    }
+
+    fn mount_tmpfs(
+        &self,
+        isolation: &MountIsolation,
+        prepared: &PreparedRootfs,
+        devices: &DeviceReport,
+        set: &TmpfsMountSet,
+    ) -> Result<(), ExecError> {
+        mount_tmpfs(isolation, prepared, Some(devices), set).map(|_| ())
+    }
+
+    fn inject_files(
+        &self,
+        isolation: &MountIsolation,
+        prepared: &PreparedRootfs,
+        set: &InjectedFileSet,
+    ) -> Result<(), ExecError> {
+        inject_files(isolation, prepared, set).map(|_| ())
+    }
+
+    fn pivot_root(
+        &self,
+        isolation: &MountIsolation,
+        prepared: PreparedRootfs,
+    ) -> Result<PivotReport, ExecError> {
+        pivot_root(isolation, prepared)
+    }
+}
+
+/// 固定した rootfs の実体と、`prepare_rootfs` の後に得た mount top の実体が同じか（純関数。fail-closed）。
+/// bind mount は同じ superblock・inode を指すため、同じ実体なら `(st_dev, st_ino)` が一致する。
+fn check_rootfs_identity(pinned: (u64, u64), prepared: (u64, u64)) -> Result<(), ExecError> {
+    if pinned != prepared {
+        return Err(ExecError::new(
+            ErrorCode::PermissionDenied,
+            IsolationStage::PrepareRootfs,
+            "rootfs changed after validation",
+        ));
+    }
+    Ok(())
+}
+
+/// pivot までの前段を固定順で実行する（TASK-29 追補・#1715。CORE-1）。順序はここだけが決める:
+///
+/// `establish` → `prepare_rootfs` → （固定した rootfs との照合）→ `create_default_devices` →
+/// `mount_tmpfs`（指定時）→ `inject_files`（指定時）→ `pivot_root`。
+///
+/// デバイスノードと tmpfs は pivot の前に、`PreparedRootfs` の fd を起点に作る（pivot 後は旧 root が
+/// 切り離され、ホスト側の `/dev` を再解決できないため）。`setup` が `None` なら
+/// `establish` → `prepare_rootfs` → `pivot_root` だけの最小構成。
+fn run_pre_pivot<O: PrePivotOps>(
+    ops: &O,
+    rootfs: &Path,
+    setup: Option<PrePivotSetup<'_>>,
+) -> Result<(O::Isolation, O::Pivoted), ExecError> {
+    let isolation = ops.establish()?;
+    let prepared = ops.prepare_rootfs(&isolation, rootfs)?;
+    if let Some(setup) = setup {
+        if let Some(pinned) = setup.pinned_rootfs {
+            ops.verify_pinned(&prepared, pinned)?;
+        }
+        let devices = ops.create_default_devices(&isolation, &prepared, setup.devices)?;
+        if let Some(set) = setup.tmpfs {
+            ops.mount_tmpfs(&isolation, &prepared, &devices, set)?;
+        }
+        if let Some(set) = setup.inject {
+            ops.inject_files(&isolation, &prepared, set)?;
+        }
+    }
+    let pivoted = ops.pivot_root(&isolation, prepared)?;
+    Ok((isolation, pivoted))
+}
+
+/// 子の前段（[`run_pre_pivot`] → ステージ列）を共通化した本体。
 ///
 /// 終端 `terminal` は組み込みステージ（capability 削減・`NO_NEW_PRIVS`・seccomp）の通過後にだけ呼ばれる。
 /// 本番の `run_child` は exec を、結合試験専用の [`spawn_container_seccomp_probe`] は exec の代わりに
@@ -1683,7 +1872,7 @@ fn run_child(
 /// は変わらない。
 fn run_child_then<T>(
     rootfs: &Path,
-    devices: Option<DevptsGidSource<'_>>,
+    setup: Option<PrePivotSetup<'_>>,
     stages: StagePipeline,
     terminal: impl FnOnce(
         &MountIsolation,
@@ -1691,14 +1880,7 @@ fn run_child_then<T>(
         Result<LaunchReady, LaunchNotReady>,
     ) -> Result<T, ExecError>,
 ) -> Result<T, ExecError> {
-    let isolation = MountIsolation::establish()?;
-    let prepared = prepare_rootfs(&isolation, rootfs)?;
-    // 専用 /dev（基本デバイス 1:3 の null を含む）を pivot 前に載せる経路は結合試験専用（`devices` が `Some`）。
-    // 本番の配線は #1314。None なら従来どおり何も載せない。
-    if let Some(source) = devices {
-        create_default_devices(&isolation, &prepared, source)?;
-    }
-    let report = pivot_root(&isolation, prepared)?;
+    let (isolation, report) = run_pre_pivot(&RealPrePivotOps, rootfs, setup)?;
     // pivot 後・終端前にステージ列を固定順で実行する。
     stages.run_then(|_stage_report, _capability_report, evidence| {
         terminal(&isolation, &report, evidence)
@@ -1853,8 +2035,11 @@ pub fn spawn_container_with_stages(
     entry: &Entrypoint,
     stages: StagePipeline,
 ) -> Result<ContainerChild, ExecError> {
-    let pid = sys::fork_single_threaded(|| child_main(rootfs, entry, stages), EXIT_SETUP_FAILED)
-        .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
+    let pid = sys::fork_single_threaded(
+        || child_main(rootfs, entry, stages, None),
+        EXIT_SETUP_FAILED,
+    )
+    .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
     Ok(ContainerChild::spawned(pid))
 }
 
@@ -1874,7 +2059,17 @@ pub fn spawn_container_with_stages_and_devices(
     devices: DevptsGidSource<'_>,
 ) -> Result<ContainerChild, ExecError> {
     let pid = sys::fork_single_threaded(
-        || match run_child(rootfs, entry, stages, Some(devices)) {
+        || match run_child(
+            rootfs,
+            entry,
+            stages,
+            Some(PrePivotSetup {
+                devices,
+                tmpfs: None,
+                inject: None,
+                pinned_rootfs: None,
+            }),
+        ) {
             Ok(never) => match never {},
             Err(err) => {
                 let _ = writeln!(std::io::stderr(), "fandhe-container: {err}");
@@ -4082,5 +4277,156 @@ mod tests {
         let found = child_path_violation_names(excluded);
         let names: Vec<&str> = found.iter().map(String::as_str).collect();
         assert_eq!(names, ["Real"]);
+    }
+
+    /// 段の呼び出しを記録するだけの [`PrePivotOps`]（`fail_at` の段で失敗する）。
+    struct RecordingOps {
+        fail_at: Option<&'static str>,
+    }
+
+    impl RecordingOps {
+        fn step(&self, name: &'static str) -> Result<(), ExecError> {
+            record(name.to_owned());
+            if self.fail_at == Some(name) {
+                return Err(ExecError::new(
+                    ErrorCode::Internal,
+                    IsolationStage::PrepareRootfs,
+                    "injected failure",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl PrePivotOps for RecordingOps {
+        type Isolation = ();
+        type Prepared = ();
+        type Devices = ();
+        type Pivoted = ();
+        fn establish(&self) -> Result<(), ExecError> {
+            self.step("establish")
+        }
+        fn prepare_rootfs(&self, _: &(), _: &Path) -> Result<(), ExecError> {
+            self.step("prepare_rootfs")
+        }
+        fn verify_pinned(&self, _: &(), _: BorrowedFd<'_>) -> Result<(), ExecError> {
+            self.step("verify_pinned")
+        }
+        fn create_default_devices(
+            &self,
+            _: &(),
+            _: &(),
+            _: DevptsGidSource<'_>,
+        ) -> Result<(), ExecError> {
+            self.step("create_default_devices")
+        }
+        fn mount_tmpfs(&self, _: &(), _: &(), _: &(), _: &TmpfsMountSet) -> Result<(), ExecError> {
+            self.step("mount_tmpfs")
+        }
+        fn inject_files(&self, _: &(), _: &(), _: &InjectedFileSet) -> Result<(), ExecError> {
+            self.step("inject_files")
+        }
+        fn pivot_root(&self, _: &(), _: ()) -> Result<(), ExecError> {
+            self.step("pivot_root")
+        }
+    }
+
+    /// CORE-1・CORE-5（TASK-29 追補・#1715）: pivot 前の段は
+    /// `establish` → `prepare_rootfs` → `verify_pinned` → `create_default_devices` → `mount_tmpfs` →
+    /// `inject_files` → `pivot_root` の固定順で呼ばれる。
+    #[test]
+    fn core1_run_pre_pivot_order_is_fixed() {
+        let tmpfs = TmpfsMountSet::new();
+        let inject = InjectedFileSet::new();
+        let pinned = std::fs::File::open("/").unwrap();
+        let _ = take_calls();
+        run_pre_pivot(
+            &RecordingOps { fail_at: None },
+            Path::new("/rootfs"),
+            Some(PrePivotSetup {
+                devices: DevptsGidSource::Rootful,
+                tmpfs: Some(&tmpfs),
+                inject: Some(&inject),
+                pinned_rootfs: Some(pinned.as_fd()),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            take_calls(),
+            [
+                "establish",
+                "prepare_rootfs",
+                "verify_pinned",
+                "create_default_devices",
+                "mount_tmpfs",
+                "inject_files",
+                "pivot_root",
+            ]
+        );
+    }
+
+    /// 指定が無い段は呼ばれず、devices は常に pivot の前に作られる。`None` は最小構成。
+    #[test]
+    fn core1_run_pre_pivot_skips_unspecified_steps() {
+        let _ = take_calls();
+        run_pre_pivot(
+            &RecordingOps { fail_at: None },
+            Path::new("/rootfs"),
+            Some(PrePivotSetup {
+                devices: DevptsGidSource::Rootful,
+                tmpfs: None,
+                inject: None,
+                pinned_rootfs: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            take_calls(),
+            [
+                "establish",
+                "prepare_rootfs",
+                "create_default_devices",
+                "pivot_root"
+            ]
+        );
+        run_pre_pivot(&RecordingOps { fail_at: None }, Path::new("/rootfs"), None).unwrap();
+        assert_eq!(take_calls(), ["establish", "prepare_rootfs", "pivot_root"]);
+    }
+
+    /// 途中の段が失敗したら後続の段（特に `pivot_root`）へ進まない（fail-closed）。
+    #[test]
+    fn core1_run_pre_pivot_stops_at_first_failure() {
+        let tmpfs = TmpfsMountSet::new();
+        let _ = take_calls();
+        let err = run_pre_pivot(
+            &RecordingOps {
+                fail_at: Some("create_default_devices"),
+            },
+            Path::new("/rootfs"),
+            Some(PrePivotSetup {
+                devices: DevptsGidSource::Rootful,
+                tmpfs: Some(&tmpfs),
+                inject: None,
+                pinned_rootfs: None,
+            }),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert_eq!(
+            take_calls(),
+            ["establish", "prepare_rootfs", "create_default_devices"]
+        );
+    }
+
+    /// 固定した rootfs と実体が違えば `PermissionDenied`（固定文言）で拒否する。
+    #[test]
+    fn core1_check_rootfs_identity_is_exact() {
+        assert!(check_rootfs_identity((7, 42), (7, 42)).is_ok());
+        for other in [(7, 43), (8, 42)] {
+            let err = check_rootfs_identity((7, 42), other).unwrap_err();
+            assert_eq!(err.code, ErrorCode::PermissionDenied);
+            assert!(err.to_string().contains("rootfs changed after validation"));
+        }
     }
 }

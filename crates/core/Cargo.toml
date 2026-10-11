@@ -138,6 +138,15 @@ name = "exec_child_setup"
 path = "tests/exec_child_setup.rs"
 harness = false
 
+# 起動経路から `dev.tty.legacy_tiocsti` の警告 1 行が出ること（有効時は固定 JSON 1 行・対象外は無出力・出力先が
+# 満杯でも起動が戻ること）を照合する結合試験（CORE-5・SEC-1・REPAIR-5・REPAIR-12・#1739）。fork は単一スレッドの
+# 呼び出し元を要求するため harness = false。root・実コンテナは不要で、既定のテスト集合で実行する
+# （`exec-test-support` は上の自己参照で有効）。
+[[test]]
+name = "legacy_tiocsti_launch"
+path = "tests/legacy_tiocsti_launch.rs"
+harness = false
+
 # FileAuditSink の主経路・失敗通知の子プロセス隔離の結合試験（REPAIR-5・SEC-4・TASK-163 追補・#1594）。fork は
 # 単一スレッドの呼び出し元を要求するため harness = false。root・実カーネル監査は不要で、既定のテスト集合で実行する
 # （`exec-test-support` は上の自己参照で有効）。

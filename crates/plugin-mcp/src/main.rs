@@ -24,11 +24,60 @@ fn stderr_line(line: &str) {
     let _ = writeln!(std::io::stderr(), "{line}");
 }
 
-fn main() -> ExitCode {
-    if std::env::args_os().nth(1).is_some() {
-        stderr_line(INVALID_ARGUMENT_JSON);
-        return ExitCode::from(2);
+/// 起動時の判定結果（終了コードと stderr へ出す診断 1 行）。副作用を持たない。
+#[derive(Debug, PartialEq, Eq)]
+struct Outcome {
+    exit_code: u8,
+    diagnostic: &'static str,
+}
+
+/// 追加引数の有無（プログラム名を除く）から終了コードと診断を決める純関数（MCP-1・REPAIR-12）。
+/// 引数の値は診断へ埋め込まない。
+fn decide(has_extra_args: bool) -> Outcome {
+    if has_extra_args {
+        Outcome {
+            exit_code: 2,
+            diagnostic: INVALID_ARGUMENT_JSON,
+        }
+    } else {
+        Outcome {
+            exit_code: 1,
+            diagnostic: UNIMPLEMENTED_JSON,
+        }
     }
-    stderr_line(UNIMPLEMENTED_JSON);
-    ExitCode::from(1)
+}
+
+fn main() -> ExitCode {
+    let outcome = decide(std::env::args_os().nth(1).is_some());
+    stderr_line(outcome.diagnostic);
+    ExitCode::from(outcome.exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MCP-1・REPAIR-12: 引数なしは終了コード 1 と UNIMPLEMENTED。
+    #[test]
+    fn decide_without_args_is_unimplemented() {
+        assert_eq!(
+            decide(false),
+            Outcome {
+                exit_code: 1,
+                diagnostic: "{\"code\":\"UNIMPLEMENTED\",\"message\":\"mcp server is not implemented yet\"}",
+            }
+        );
+    }
+
+    /// MCP-1・REPAIR-12: 引数ありは終了コード 2 と INVALID_ARGUMENT。
+    #[test]
+    fn decide_with_args_is_invalid_argument() {
+        assert_eq!(
+            decide(true),
+            Outcome {
+                exit_code: 2,
+                diagnostic: "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"unexpected argument\"}",
+            }
+        );
+    }
 }

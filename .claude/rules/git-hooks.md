@@ -13,8 +13,9 @@ paths:
 フックはローカルでの早期検知専用であり、CI の代替ではない。**開発速度を落とさないことを最優先**し、
 重い検査・網羅的な検査は CI（`.github/workflows/ci.yml`）に任せる。
 
-ローカルゲート（`make ci`。[ci](ci.md)）の規約自体は変わらない。フックで強制しないだけで、
-コミット・PR 前に `make fmt-check`・`make lint`・`make test`・`make doc`（まとめて `make ci`）を通す運用は維持する。
+コミット・PR 前のローカル確認は [ci](ci.md)「ローカルゲート」に従い、変更範囲に限った軽量な確認
+（`make fmt` と、変更した crate の `cargo clippy -p`・`cargo test -p` 等）に留める。フックはこれも強制しない。
+ワークスペース全体の検証は CI が担い、`make ci` はローカル必須ではない。
 
 ## 時間予算
 
@@ -92,7 +93,8 @@ time lefthook run pre-commit --all-files
 
 ## 手元で CI 相当を確認する
 
-フックで強制しない検査は、必要に応じて手元で実行する。
+フックで強制しない検査は、必要に応じて手元で実行する（いずれも任意。CI の失敗の再現・リリース前の確認等。
+通常のコミット前は [ci](ci.md)「ローカルゲート」の変更範囲の確認で足りる）。
 
 ```bash
 make ci        # lint-docs・check-workspace-manifest・fmt-check・lint・test・doc・deny を一括実行

@@ -234,16 +234,15 @@ fn task_61_2_image_status_verbose_info_is_empty() {
     assert!(resp.info.is_empty());
 }
 
-/// CRI-4・ERR-3・TASK-61.2: 未取得は NOT_FOUND で、文言に参照を含めない（受入基準）。
+/// CRI-4・TASK-61.2: 未取得は NOT_FOUND にせず、`image: None` の成功応答を返す（api.proto の nil Image）。
 #[test]
-fn task_61_2_image_status_unknown_is_not_found() {
+fn task_61_2_image_status_unknown_returns_none() {
     let (recorder, svc) = seeded();
-    let err = status(&svc, Some("reg/missing:9"), false).expect_err("must fail");
-    assert_eq!(err.code(), Code::NotFound);
-    assert!(!err.message().contains("missing"));
+    let resp = status(&svc, Some("reg/missing:9"), false).expect("ok");
+    assert_eq!(resp.image, None);
     assert_eq!(
         recorder.lines(),
-        vec![("cri.image_status", "failure", "NOT_FOUND")]
+        vec![("cri.image_status", "success", "OK")]
     );
 }
 

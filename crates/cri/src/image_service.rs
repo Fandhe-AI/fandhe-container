@@ -182,7 +182,7 @@ pub trait ImageStore: Send + Sync {
     /// 参照（id・タグ・digest の完全一致。`ListImages` の絞り込みと同じ規則）を 1 件に解決する。
     ///
     /// 複数一致する場合は id 完全一致を優先し、なければ ID 昇順で最初の 1 件（決定的）。
-    /// 未取得は `Ok(None)`（`ImageStatus` が NOT_FOUND に写す。TASK-61.2）。
+    /// 未取得は `Ok(None)`（`ImageStatus` が `image: None` の成功応答に写す。TASK-61.2）。
     fn get(&self, reference: &str) -> Result<Option<ImageRecord>, ImageStoreError>;
 }
 
@@ -267,7 +267,7 @@ impl CriImageService {
         Self { store, recorder }
     }
 
-    /// `ImageStatus` の本体。参照検証 → ストア解決 → 未取得は NOT_FOUND（CRI-4・ERR-3）。
+    /// `ImageStatus` の本体。参照検証 → ストア解決 → 未取得は `image: None` の成功応答（CRI-4。api.proto の ImageStatus は未存在で nil Image）。
     ///
     /// 文言に参照（イメージ名・タグ・digest）を含めない。`verbose` の `info` は未実装で空（REPAIR-3）。
     fn status(&self, request: v1::ImageStatusRequest) -> Result<v1::ImageStatusResponse, Status> {
@@ -283,10 +283,9 @@ impl CriImageService {
         let record = self
             .store
             .get(&reference)
-            .map_err(|_| Status::internal("image store failure"))?
-            .ok_or_else(|| Status::not_found("image not found"))?;
+            .map_err(|_| Status::internal("image store failure"))?;
         Ok(v1::ImageStatusResponse {
-            image: Some(record.to_proto()),
+            image: record.map(|r| r.to_proto()),
             info: Default::default(),
         })
     }
@@ -348,7 +347,7 @@ impl ImageService for CriImageService {
         Err(Status::unimplemented("stream_images"))
     }
 
-    /// 参照（id・タグ・digest）に一致する取得済みイメージの詳細を返す。未取得は NOT_FOUND（CRI-4・TASK-61.2）。
+    /// 参照（id・タグ・digest）に一致する取得済みイメージの詳細を返す。未取得は `image: None` の成功応答（CRI-4・TASK-61.2）。
     async fn image_status(
         &self,
         request: Request<v1::ImageStatusRequest>,
@@ -520,15 +519,13 @@ mod tests {
         assert_eq!(store.get("reg/none:9").unwrap(), None);
     }
 
-    /// CRI-4・TASK-61.2: 未取得は NOT_FOUND で、文言に参照を含めない。
+    /// CRI-4・TASK-61.2: 未取得は成功応答で `image` が None（NOT_FOUND にしない）。
     #[test]
-    fn cri4_status_not_found() {
+    fn cri4_status_missing_returns_none() {
         let svc = CriImageService::new();
-        let err = svc
-            .status(status_req("reg/secret:1"))
-            .expect_err("must fail");
-        assert_eq!(err.code(), Code::NotFound);
-        assert_eq!(err.message(), "image not found");
+        let resp = svc.status(status_req("reg/secret:1")).expect("ok");
+        assert_eq!(resp.image, None);
+        assert!(resp.info.is_empty());
     }
 
     /// CRI-4・TASK-61.2: 取得済みなら digest・サイズ・タグを返し、info は空。

@@ -76,7 +76,7 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 
 版は承認時点の値。`Cargo.toml` への追加時に新版がある場合は PR で再確認する。objc2 系は `default-features = false` で必要な feature だけを列挙し、AppKit（`objc2-app-kit`）を引き込まない。
 
-2026-10-10 承認分（#399・#406・#408・#425・#540・#582・#678）のうち、#425 の build 時の依存 `tonic-prost-build`・`protox` は #426（TASK-56.3）で `Cargo.toml` に入った。それ以外はまだ入っていない。追加は各実装 issue（#400・#407・#409・#426・#453・#454・#541・TASK-151・#583・#679）で行う。「cri / plugin の gRPC 面」は crates/cri・`fandhe-container-plugin-cri`・crates/plugin の gRPC 面（TASK-108）を指す。`prost-build`・`tonic-build` は `tonic-prost-build` から推移的に入るため直接の依存には書かない（版は `Cargo.lock` で固定される）。
+2026-10-10 承認分（#399・#406・#408・#425・#540・#582・#678）のうち、#425 の build 時の依存 `tonic-prost-build`・`protox` は #426（TASK-56.3）で `Cargo.toml` に入った。`tonic`・`tonic-prost`・`prost` は #427（TASK-56.4）で crates/cri の実行時依存として入った。残り（tokio・tokio-stream・tower-service・hyper-util・http 等）はまだ入っていない。追加は各実装 issue（#400・#407・#409・#426・#453・#454・#541・TASK-151・#583・#679）で行う。「cri / plugin の gRPC 面」は crates/cri・`fandhe-container-plugin-cri`・crates/plugin の gRPC 面（TASK-108）を指す。`prost-build`・`tonic-build` は `tonic-prost-build` から推移的に入るため直接の依存には書かない（版は `Cargo.lock` で固定される）。
 
 **非同期ランタイム**: tokio を承認（#425・2026-10-10）。使ってよいのは cri / plugin の gRPC 面だけで、core には入れない（PLUG-1・CORE-1）。例外は #678 で crates/cri の直接依存として承認した CRI ストリーミングサーバー（hyper・hyper-util の `tokio` feature。CRI-6）で、crates/cri の中で同じ tokio を使う。hyper・hyper-util の参照も cri / plugin に限る。
 

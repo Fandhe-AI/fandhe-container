@@ -63,7 +63,7 @@ secrets-content-guard は staged diff（`git diff --cached`）を走査するた
 
 - `pre-commit` の `parallel: true` を維持する（直列化しない）
 - `{staged_files}` と `glob` で対象を絞る
-- cargo 系ジョブは `Cargo.toml` 未追加・ツール未導入なら `skip:` を出して成功終了する（Makefile の HAS_CARGO 判定と同一方針）
+- cargo 系ジョブは `Cargo.toml` 未追加・ツール未導入なら `skip:` を出して成功終了する（`scripts/lib.sh` の `skip_unless_workspace` の判定と同一方針）
 - diff の行数・ファイル数に比例してプロセスを起動するループを書かない。awk / grep を 1 回だけ起動して一括で判定する
   （行 × パターンごとに grep を起動していた旧 secrets-content-guard は 3000 行の diff で約 47 秒、
   ファイルごとに grep を起動していた旧 secrets-guard は `--all-files` で約 7 秒かかった）

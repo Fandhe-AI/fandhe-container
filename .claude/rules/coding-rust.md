@@ -3,7 +3,7 @@
 ## ツールチェーン
 
 - `rust-toolchain.toml`（stable・rustfmt・clippy）を単一真実源とする
-- `make fmt`・`make lint`（clippy `-D warnings`）・`make test` を通してからコミットする（clippy 警告 0 件を維持。[ci](./ci.md)）
+- `make fmt` で整形し、変更した crate の `cargo clippy -p <パッケージ名> --all-targets -- -D warnings`・`cargo test -p <パッケージ名>` を通してからコミットする（clippy 警告 0 件を維持。ワークスペース全体の検証は CI が担う。[ci](./ci.md)「ローカルゲート」）
 - ビルド・テストは `docs/spec` 抜きで成立させる。コード・`build.rs`・テストから `docs/spec` 配下を参照しない
 
 ## crate 構成と境界

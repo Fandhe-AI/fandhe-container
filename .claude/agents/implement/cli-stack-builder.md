@@ -28,4 +28,4 @@ tools: [Read, Edit, Write, Glob, Grep, Bash]
 - 担当 crate の外を編集しない。他 crate・公開トレイトの変更が必要なら main へ報告する
 - spec の挙動に対応するコード・テストにはビヘイビア ID を併記する。`docs/spec` 配下は編集しない（`.claude/rules/spec-reference.md`）
 - 担当が「人間」の spec タスク（実機実測・判定）は計測スクリプト等の準備までに留める（`.claude/rules/delegation-impl.md`）
-- 実装後は `make fmt`・`make lint`・`make test` を通してから完了報告する。root・KVM・GPU 等の実機前提テストを実行できなかった場合はその旨を明記する（`.claude/rules/ci.md`）
+- 実装後は `make fmt` で整形し、変更した crate の `cargo clippy -p <パッケージ名> --all-targets -- -D warnings`・`cargo test -p <パッケージ名>` を通してから完了報告する（ワークスペース全体の検証は CI。他 crate へ波及しうる変更では `cargo check --workspace --all-targets` も通す。`.claude/rules/ci.md`「ローカルゲート」）。root・KVM・GPU 等の実機前提テストを実行できなかった場合はその旨を明記する（`.claude/rules/ci.md`）

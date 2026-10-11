@@ -2,6 +2,27 @@
 
 ## ローカルゲート（コミット・PR 前）
 
+開発速度を優先し、ローカルでは変更範囲に限った軽量な確認だけを行う（オーナー決定 2026-10-11）。ワークスペース全体の検証（clippy・test・doc・deny・lint-docs・3 OS・`--all-features`）は GitHub Actions の CI（`.github/workflows/ci.yml` の `rust-ci`・`platform-ci`・`cross-target-check`・`lint-docs`・`bench-regression`）を正のゲートとし、ローカルでは重複実行しない。
+
+コミット・PR 前に必須とするのは次だけである。
+
+1. 整形: `make fmt`（または `cargo fmt --all`）で整形する。`make fmt-check` は速いので通してよい
+2. 変更した crate だけの lint とテスト: `cargo clippy -p <パッケージ名> --all-targets -- -D warnings` と `cargo test -p <パッケージ名>`（複数 crate なら `-p` を並べる）。`<パッケージ名>` はディレクトリ名ではなく Cargo のパッケージ名（`fandhe-container-<短縮名>`。例: `crates/io` は `-p fandhe-container-io`）。ワークスペース全体の `make lint`・`make test` は必須にしない
+3. Rust 以外の変更: 変更したスクリプトに対応する自己テスト（`make <name>-selftest`）や、変更した Markdown / YAML だけの lint（必要なら）に限る。docs のみの変更ではビルド・テストを省略してよい
+4. 他 crate へ波及しうる変更（共有の型・公開トレイト・`Cargo.toml`・feature・`cfg` 分岐の変更）では、`cargo check --workspace --all-targets` を追加で通す（型検査のみで速い）
+5. PR のマージゲートは CI。CI が失敗したら、失敗したジョブ・テストの範囲だけを手元で再現して直す
+
+維持するもの（ローカルを軽くしても変えない）:
+
+- fail-closed: 変更した crate のテストを全件実行し、失敗・警告を 1 件でも残したまま進めない。ワークスペース全体は CI が検証し、CI の全ジョブが緑であることをマージの条件とする（失敗・警告を残したままマージしない）
+- テストの skip・ignore・アサーション弱体化で通さない。clippy 警告 0 件を維持する
+- `git commit --no-verify` を使わない
+- 実機前提テストの扱い（下記「実機前提テスト」）と、ビヘイビア ID に対応づけたテストを書く義務（[coding-rust](coding-rust.md)「テスト」）
+
+### 任意（CI の失敗の再現・リリース前の手元確認）
+
+ワークスペース全体を手元で確認したいときは次を使う。ローカル必須ではない。
+
 ```bash
 make fmt-check   # cargo fmt --all --check
 make lint        # cargo clippy --workspace --all-targets -- -D warnings
@@ -10,9 +31,8 @@ make doc         # RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 make ci          # 上記 + lint-docs + deny を一括実行
 ```
 
-- テストは変更のたびに全件実行し、失敗・警告を 1 件でも残したまま進めない（fail-closed）
 - Cargo.toml・メンバー crate が未作成の間、cargo 系ターゲットは scripts/targets/ 側で skip される（Cargo.toml・メンバー crate の有無の判定。`scripts/lib.sh` の `skip_unless_workspace`）
-- git hooks（lefthook）はこれらを実行しない（CI と重複するため。[git-hooks](git-hooks.md)）。ローカルゲートは手動で通す
+- git hooks（lefthook）はこれらを実行しない（CI と重複するため。[git-hooks](git-hooks.md)）。上記の変更範囲の確認は手動で行う
 
 ## CI の構成（REPAIR-7 の 5 段階ゲート）
 

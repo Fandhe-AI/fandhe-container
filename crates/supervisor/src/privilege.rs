@@ -1,28 +1,32 @@
-//! 権限昇格の必要最小集合と検証ロジック（SUP-14・TASK-171.1.2・#858・MS-9）。
+//! 権限昇格の必要最小集合・検証ロジックと、縮退を実際に適用する `elevate`（SUP-14・SEC-1・TASK-171.1.2・#858／
+//! TASK-171.1.3・#1475・MS-9）。
 //!
 //! # 役割
 //! `sudo` + pty に頼らない権限分離（SUP-14）で、昇格後のプロセスが保持してよい capability を
-//! 「必要最小の集合」に限定できていることを機械的に検証する純ロジックを置く。
-//! 方式（特権ランチャー + ambient〔[`PrivilegeMethod::LauncherAmbient`]〕／setuid〔[`PrivilegeMethod::SetuidRoot`]〕）は
-//! `docs/design/privilege-separation.md` で比較したドラフトで採否は未確定のため、型は方式非依存にしてある。
-//! 本モジュールは syscall を一切呼ばず `unsafe` を含まないため、3 OS の CI で具体値照合できる。
+//! 「必要最小の集合」に限定する。純ロジック（[`parse_proc_status`]・[`verify_elevation`]・[`plan_reduction`]）は
+//! syscall を呼ばず `unsafe` を含まないため 3 OS の CI で具体値照合できる。実際に縮退を適用する [`elevate`] は
+//! Linux 専用で、`unsafe` を `crate::sys`（Linux 版。事前承認の範囲）の薄いラッパーに閉じる。
+//!
+//! # 方式（承認済み。#1454 のオーナー判断 2026-10-10。`docs/design/privilege-separation.md` 9 章）
+//! - 既定: [`PrivilegeMethod::LauncherAmbient`]（特権ランチャー + file capability + ambient capability）
+//! - 代替: [`PrivilegeMethod::SetuidRoot`]（xattr 非対応の環境に限る）
+//! - どちらも失敗したら fail-closed にし、`sudo` へ黙ってフォールバックしない（設計書 6 章）
 //!
 //! # 呼び出し文脈・契約
-//! - 呼び出し元（予定）: 特権ランチャーが supervisor を exec する直前に `/proc/self/status` を読み、
-//!   [`parse_proc_status`] → [`verify_elevation`] で縮退結果を確認する（設計書 5 章 4）
+//! - 呼び出し元: 特権ランチャー（`fandhe-container-launcher`。#1719）が起動直後に単一スレッドで [`elevate`] を呼び、
+//!   `Ok` のときだけ supervisor の exec へ進む。`Err` のときプロセスは部分的に縮退した状態にあり、
+//!   呼び出し元は exec も特権操作もせず非ゼロで終了する（bounding の削除は戻せないため巻き戻さない）
 //! - [`runtime_required_capabilities`] はランタイム側が一時的に保持する権限であり、コンテナへ渡す
 //!   OCI 既定集合（SEC-1）とは別物
 //! - カーネル応答（`/proc/<pid>/status`）は外部入力として扱い、長さ・行数を先に検証し、`unwrap`・添字アクセスを使わない
-//! - 検証は fail-closed。過剰権限・不足・`no_new_privs`・uid 0・`PR_SET_KEEPCAPS` の残存 / 未確認・ambient 不一致の
-//!   いずれも `Ok` にしない。keepcaps は `/proc/<pid>/status` に現れないため、呼び出し元が `prctl(PR_GET_KEEPCAPS)` で
-//!   読み戻した値を [`KeepCapsState`] として渡す（読み戻し経路は syscall のため未実装。下記）
-//!   不足時に `sudo` へ黙ってフォールバックしない（設計書 6 章）
+//! - 検証は fail-closed。過剰権限・不足・`no_new_privs`・uid 0・`PR_SET_KEEPCAPS` の残存 / 未確認・ambient 不一致・
+//!   スレッド数の増加のいずれも `Ok` にしない。keepcaps は `/proc/<pid>/status` に現れないため、
+//!   `prctl(PR_GET_KEEPCAPS)` で読み戻した値を [`KeepCapsState`] として [`verify_elevation`] へ渡す
 //!
-//! # 未実装（REPAIR-3。承認待ち）
-//! 実際に bounding 削除・`capset`・ambient 載せ・`setresuid`・`PR_SET_KEEPCAPS` の設定 / 解除 / 読み戻し・
-//! fd 検証付き exec を行う経路は未実装で、
-//! [`elevate`] は [`ErrorCode::Unimplemented`] を返す。方式（設計書 9 章）・新規 `unsafe`・crate 配置（同 8 章）の
-//! ユーザー承認が未取得のため着手していない。承認後に [`plan_reduction`] の計画を実行する形で実装する。
+//! # 本モジュールの範囲外（REPAIR-3。実装済みを装わない）
+//! - fd 検証付き exec（`execveat`・所有者 / 権限の検証）・引数 / 環境変数 / cwd / 継承 fd の入口検証・ランチャー bin: #1719
+//! - ambient は exec 後の子孫へ引き継がれる。healthcheck の exec など子での解除: #537 以降（設計書 5 章 5）
+//! - file capability / setuid ビットの付与（インストール）: #1721
 
 use std::fmt;
 
@@ -34,13 +38,13 @@ pub const MAX_STATUS_BYTES: usize = 64 * 1024;
 /// `/proc/<pid>/status` として受け入れる最大行数。
 pub const MAX_STATUS_LINES: usize = 512;
 
-/// 権限取得の方式（設計書 3・9 章。採否未確定）。
+/// 権限取得の方式（設計書 3・9 章。#1454 のオーナー判断 2026-10-10 で承認済み）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PrivilegeMethod {
-    /// 特権ランチャー + ambient capability（設計書の推奨案 (c)）。
+    /// 特権ランチャー + ambient capability（設計書の (c)。既定の方式。file capability で昇格した非 root のランチャー）。
     LauncherAmbient,
-    /// setuid root バイナリ（設計書 (a)。xattr 非対応環境向けのフォールバック案）。
+    /// setuid root バイナリ（設計書 (a)。xattr 非対応環境に限る代替。非 root が起動した setuid root のランチャー）。
     SetuidRoot,
 }
 
@@ -93,8 +97,15 @@ pub enum PrivilegeErrorReason {
     AmbientMismatch,
     /// `/proc/<pid>/status` の形式不正・欠落・上限超過。
     MalformedStatus,
-    /// 実適用経路が未実装。
+    /// 実適用経路が未実装（非 Linux の [`elevate`]）。
     Unimplemented,
+    /// 単一スレッドであることを確認できなかった（`Threads:` が 1 でない・読めない）。capability はスレッド単位のため、
+    /// 他スレッドに強い権限が残ったまま `Ok` にしない。
+    MultiThreaded,
+    /// 方式と現在の資格情報の組み合わせが合わない（例: 方式 (c) なのに uid 0、方式 (a) なのに effective uid が 0 でない）。
+    MethodMismatch,
+    /// 縮退手順または読み戻しの syscall が失敗した（message に手順名と errno を入れる）。
+    SyscallFailed,
 }
 
 /// 権限昇格の検証・計画エラー（ERR-1 の `code` と英語 `message`）。
@@ -384,8 +395,8 @@ pub fn parse_proc_status(text: &str) -> Result<CredentialSnapshot, PrivilegeErro
 
 /// 縮退後の `PR_SET_KEEPCAPS`（securebits の `SECBIT_KEEP_CAPS`）の読み戻し結果。
 ///
-/// `/proc/<pid>/status` には現れないため [`CredentialSnapshot`] とは別に渡す。将来の syscall 経路が
-/// `prctl(PR_GET_KEEPCAPS)` の戻り値から作る（未実装。REPAIR-3）。読み戻しに失敗した・読み戻していない場合は
+/// `/proc/<pid>/status` には現れないため [`CredentialSnapshot`] とは別に渡す。[`elevate`] が
+/// `prctl(PR_GET_KEEPCAPS)` の戻り値から作る。読み戻しに失敗した・読み戻していない場合は
 /// [`KeepCapsState::Unknown`] とし、[`verify_elevation`] はこれを成功にしない（fail-closed。設計書 5 章 4・6 章）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -713,18 +724,296 @@ pub fn plan_reduction(
     })
 }
 
-/// 権限を実際に縮退・付与する入口（スタブ。実装済みを装わない）。
+/// `Threads:` 行から現在のスレッド数を取り出す（純関数。`/proc/self/status` の外部入力検証つき）。
 ///
-/// 未実装（REPAIR-3）。将来仕様（設計書 5 章）: [`ReductionPlan::steps`] の順に適用（bounding 縮小 → `capset` →
-/// ambient 載せ → `PR_SET_KEEPCAPS` 解除。途中の失敗は解除の失敗を含めすべて中断）→ 読み戻し検証
-/// （[`verify_elevation`]。keepcaps は `PR_GET_KEEPCAPS`）→ fd 検証付き exec。子の待機にはタイムアウトを設ける（REPAIR-5）。
-/// 方式・`unsafe`・crate 配置の承認後に実装する（SUP-14・TASK-171.1.2 の残作業）。
-pub fn elevate(_method: PrivilegeMethod) -> Result<ElevationReport, PrivilegeError> {
-    Err(PrivilegeError::new(
-        ErrorCode::Unimplemented,
-        PrivilegeErrorReason::Unimplemented,
-        "privilege elevation is not implemented",
-    ))
+/// バイト数・行数が上限（[`MAX_STATUS_BYTES`]・[`MAX_STATUS_LINES`]）を超える、`Threads:` が無い・重複する・
+/// 10 進整数でない場合は `None`（呼び出し側は fail-closed で単一スレッドと認めない）。
+#[cfg(any(target_os = "linux", test))]
+fn parse_thread_count(text: &str) -> Option<u64> {
+    if text.len() > MAX_STATUS_BYTES {
+        return None;
+    }
+    let mut found: Option<u64> = None;
+    for (n, line) in text.lines().enumerate() {
+        if n >= MAX_STATUS_LINES {
+            return None;
+        }
+        if let Some(rest) = line.strip_prefix("Threads:") {
+            if found.is_some() {
+                return None;
+            }
+            let v = rest.trim();
+            if v.is_empty() || !v.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            found = Some(v.parse::<u64>().ok()?);
+        }
+    }
+    found
+}
+
+/// [`elevate_with`] が使うカーネル操作の抽象（テストでは偽物に差し替え、本番は Linux 版の `RealKernel`）。
+///
+/// 各メソッドの失敗は `io::Error`（errno 付き）で返す。capability / keepcaps は呼び出したスレッドのみに効く。
+#[cfg(any(target_os = "linux", test))]
+trait PrivilegeKernel {
+    /// `/proc/self/status` を上限付きで読む。
+    fn read_self_status(&mut self) -> std::io::Result<String>;
+    fn clear_groups(&mut self) -> std::io::Result<()>;
+    fn set_resgid(&mut self, gid: u32) -> std::io::Result<()>;
+    fn drop_bounding(&mut self, cap: u8) -> std::io::Result<()>;
+    fn set_keep_caps(&mut self, on: bool) -> std::io::Result<()>;
+    fn set_resuid(&mut self, uid: u32) -> std::io::Result<()>;
+    /// effective・permitted・inheritable を設定する。
+    fn capset(&mut self, effective: u64, permitted: u64, inheritable: u64) -> std::io::Result<()>;
+    fn ambient_clear_all(&mut self) -> std::io::Result<()>;
+    fn ambient_raise(&mut self, cap: u8) -> std::io::Result<()>;
+    fn get_keep_caps(&mut self) -> std::io::Result<bool>;
+}
+
+/// 手順 syscall の失敗を `SyscallFailed` にする（EPERM は `PermissionDenied`、その他は `Internal`）。
+/// message は固定の英語文と errno 番号だけで、環境の情報を含めない。
+#[cfg(any(target_os = "linux", test))]
+fn syscall_failed(what: &str, e: &std::io::Error) -> PrivilegeError {
+    let code = if e.raw_os_error() == Some(1) {
+        ErrorCode::PermissionDenied
+    } else {
+        ErrorCode::Internal
+    };
+    let errno = e.raw_os_error().unwrap_or(0);
+    PrivilegeError::new(
+        code,
+        PrivilegeErrorReason::SyscallFailed,
+        format!("{what} failed (errno {errno})"),
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn multi_threaded(message: &str) -> PrivilegeError {
+    PrivilegeError::new(
+        ErrorCode::FailedPrecondition,
+        PrivilegeErrorReason::MultiThreaded,
+        message,
+    )
+}
+
+/// `/proc/self/status` を読み、単一スレッドであることを確かめてから資格情報を取り出す。
+#[cfg(any(target_os = "linux", test))]
+fn read_single_threaded_snapshot<K: PrivilegeKernel>(
+    k: &mut K,
+) -> Result<CredentialSnapshot, PrivilegeError> {
+    let text = k
+        .read_self_status()
+        .map_err(|_| multi_threaded("cannot confirm a single thread: process status unreadable"))?;
+    if parse_thread_count(&text) != Some(1) {
+        return Err(multi_threaded(
+            "privilege elevation requires a single-threaded process",
+        ));
+    }
+    parse_proc_status(&text)
+}
+
+/// 方式と現在の資格情報の組み合わせを確認する（何も変更しない）。
+#[cfg(any(target_os = "linux", test))]
+fn check_method_premise(
+    snap: &CredentialSnapshot,
+    method: PrivilegeMethod,
+) -> Result<(), PrivilegeError> {
+    let mismatch = |m: &str| {
+        PrivilegeError::new(
+            ErrorCode::FailedPrecondition,
+            PrivilegeErrorReason::MethodMismatch,
+            m,
+        )
+    };
+    match method {
+        PrivilegeMethod::LauncherAmbient if snap.uid.any_root() => Err(mismatch(
+            "launcher-ambient method requires a non-root uid; uid 0 was found",
+        )),
+        PrivilegeMethod::SetuidRoot if snap.uid.effective != 0 || snap.uid.real == 0 => Err(
+            mismatch("setuid-root method requires effective uid 0 and a non-root real uid"),
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// 縮退計画の 1 手順を適用する。
+#[cfg(any(target_os = "linux", test))]
+fn apply_step<K: PrivilegeKernel>(
+    k: &mut K,
+    step: ReductionStep,
+    plan: &ReductionPlan,
+) -> Result<(), PrivilegeError> {
+    let fail = |what: &'static str| move |e: std::io::Error| syscall_failed(what, &e);
+    match step {
+        ReductionStep::ClearSupplementaryGroups => k.clear_groups().map_err(fail("setgroups")),
+        ReductionStep::SetGid => k.set_resgid(plan.gid.real).map_err(fail("setresgid")),
+        ReductionStep::DropBounding => {
+            for cap in &plan.bounding_drop {
+                k.drop_bounding(*cap).map_err(fail("bounding drop"))?;
+            }
+            Ok(())
+        }
+        ReductionStep::KeepCapabilities => k.set_keep_caps(true).map_err(fail("set keepcaps")),
+        ReductionStep::SetUid => k.set_resuid(plan.uid.real).map_err(fail("setresuid")),
+        ReductionStep::Capset => k
+            .capset(
+                CapMask::from_set(plan.effective).0,
+                CapMask::from_set(plan.permitted).0,
+                CapMask::from_set(plan.inheritable).0,
+            )
+            .map_err(fail("capset")),
+        ReductionStep::RaiseAmbient => {
+            k.ambient_clear_all().map_err(fail("ambient clear"))?;
+            let mut caps: Vec<u8> = plan.ambient.iter().map(|c| c.index()).collect();
+            caps.sort_unstable();
+            for cap in caps {
+                k.ambient_raise(cap).map_err(fail("ambient raise"))?;
+            }
+            Ok(())
+        }
+        ReductionStep::ClearKeepCapabilities => {
+            k.set_keep_caps(false).map_err(fail("clear keepcaps"))
+        }
+    }
+}
+
+/// [`elevate`] の本体（カーネル操作を差し替え可能にした形。単体テストが偽物で全手順の失敗を注入する）。
+///
+/// 順序: 単一スレッド確認 → 資格情報の読み取り → 方式の前提確認 → [`plan_reduction`] → [`ReductionPlan::steps`] の
+/// 順に適用 → `PR_GET_KEEPCAPS`・`/proc/self/status` の読み戻し → [`verify_elevation`]。前提確認と計画までは
+/// 何も変更しない。最初の失敗で中断し、後続の手順は呼ばない。
+#[cfg(any(target_os = "linux", test))]
+fn elevate_with<K: PrivilegeKernel>(
+    k: &mut K,
+    method: PrivilegeMethod,
+) -> Result<ElevationReport, PrivilegeError> {
+    let snap = read_single_threaded_snapshot(k)?;
+    check_method_premise(&snap, method)?;
+    // 目標の uid / gid は呼び出し元の本来の資格情報（real）に固定し、引数では受け取らない。
+    // 任意の uid への遷移を許さず、real が 0 なら計画段で拒否される。
+    let expected = runtime_required_capabilities();
+    let plan = plan_reduction(&snap, expected, snap.uid.real, snap.gid.real)?;
+    let mut keep_set = false;
+    for step in plan.steps() {
+        if let Err(e) = apply_step(k, step, &plan) {
+            // KeepCapabilities 後の中断では、権限保持設定を縮退後に残さないよう解除を 1 回だけ試す
+            // （結果は返り値を変えない）。解除手順自体の失敗は試行済みのため繰り返さない。
+            if keep_set && step != ReductionStep::ClearKeepCapabilities {
+                let _ = k.set_keep_caps(false);
+            }
+            return Err(e);
+        }
+        match step {
+            ReductionStep::KeepCapabilities => keep_set = true,
+            ReductionStep::ClearKeepCapabilities => keep_set = false,
+            _ => {}
+        }
+    }
+    let keep = match k.get_keep_caps() {
+        Ok(false) => KeepCapsState::Cleared,
+        Ok(true) => KeepCapsState::Set,
+        Err(_) => KeepCapsState::Unknown,
+    };
+    let after = read_single_threaded_snapshot(k)?;
+    verify_elevation(&after, keep, expected, method)
+}
+
+/// Linux の本番実装。`crate::sys` の薄いラッパーを呼ぶ。
+#[cfg(target_os = "linux")]
+struct RealKernel;
+
+#[cfg(target_os = "linux")]
+impl PrivilegeKernel for RealKernel {
+    fn read_self_status(&mut self) -> std::io::Result<String> {
+        use std::io::Read;
+        let mut text = String::new();
+        let limit = u64::try_from(MAX_STATUS_BYTES + 1).unwrap_or(u64::MAX);
+        std::fs::File::open("/proc/self/status")?
+            .take(limit)
+            .read_to_string(&mut text)?;
+        if text.len() > MAX_STATUS_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "process status exceeds the size limit",
+            ));
+        }
+        Ok(text)
+    }
+
+    fn clear_groups(&mut self) -> std::io::Result<()> {
+        crate::sys::clear_supplementary_groups()
+    }
+
+    fn set_resgid(&mut self, gid: u32) -> std::io::Result<()> {
+        crate::sys::set_resgid(gid, gid, gid)
+    }
+
+    fn drop_bounding(&mut self, cap: u8) -> std::io::Result<()> {
+        crate::sys::cap_bounding_drop(cap)
+    }
+
+    fn set_keep_caps(&mut self, on: bool) -> std::io::Result<()> {
+        crate::sys::set_keep_caps(on)
+    }
+
+    fn set_resuid(&mut self, uid: u32) -> std::io::Result<()> {
+        crate::sys::set_resuid(uid, uid, uid)
+    }
+
+    fn capset(&mut self, effective: u64, permitted: u64, inheritable: u64) -> std::io::Result<()> {
+        crate::sys::cap_set_thread(crate::sys::ThreadCaps {
+            effective,
+            permitted,
+            inheritable,
+        })
+    }
+
+    fn ambient_clear_all(&mut self) -> std::io::Result<()> {
+        crate::sys::cap_ambient_clear_all()
+    }
+
+    fn ambient_raise(&mut self, cap: u8) -> std::io::Result<()> {
+        crate::sys::cap_ambient_raise(cap)
+    }
+
+    fn get_keep_caps(&mut self) -> std::io::Result<bool> {
+        crate::sys::get_keep_caps()
+    }
+}
+
+/// 権限を縮退して必要最小集合だけを保持する状態にし、読み戻して検証する入口（SUP-14・SEC-1・TASK-171.1.3・#1475）。
+///
+/// 特権ランチャー（#1719）が起動直後に呼ぶ。呼び出し元の本来の uid / gid（real）へ遷移し、補助グループを消し、
+/// bounding を必要最小集合へ縮め、`capset` と ambient で [`runtime_required_capabilities`] ちょうどを保持する。
+/// どの段で失敗しても `Err` を返し、`sudo` へ戻らない（fail-closed）。
+///
+/// # 契約
+/// - 単一スレッドのプロセスから呼ぶ（`capset`・keepcaps はスレッド単位のため、`Threads:` が 1 でなければ
+///   何も変更せず `MultiThreaded` で拒否し、適用後にも再確認する）
+/// - `Ok` のときだけ、呼び出し元は exec へ進んでよい。`Err` のときプロセスは部分的に縮退した状態にあり
+///   （bounding の削除は戻せない）、呼び出し元は exec も特権操作もせず非ゼロで終了する
+/// - 方式 (c)［`PrivilegeMethod::LauncherAmbient`］では、file capability に `RUNTIME_REQUIRED_CAPABILITIES` に加えて、
+///   補助グループを持つ利用者向けに `CAP_SETGID` を effective 付きで持たせる必要がある（`plan_reduction` の前提。
+///   必要最小集合は広げない。付与の手順は #1721／#1719 へ引き継ぐ）
+/// - ambient は exec 後の子孫へ引き継がれる。子での解除は #537 以降の範囲
+///
+/// fd 検証付き exec・入口検証は本関数の範囲外（#1719）。非 Linux では常に `Unimplemented`（SUP-14 の対象は Linux の
+/// rootful 経路で、macOS / Windows は VM 内で動く）。
+pub fn elevate(method: PrivilegeMethod) -> Result<ElevationReport, PrivilegeError> {
+    #[cfg(target_os = "linux")]
+    {
+        elevate_with(&mut RealKernel, method)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = method;
+        Err(PrivilegeError::new(
+            ErrorCode::Unimplemented,
+            PrivilegeErrorReason::Unimplemented,
+            "privilege elevation is only supported on Linux",
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1056,11 +1345,428 @@ mod tests {
         );
     }
 
+    /// 非 Linux の `elevate` は常に `Unimplemented`。Linux の libtest は複数スレッドのため `MultiThreaded` で
+    /// 何も変更せず拒否される（実機の縮退は `tests/privilege_elevate.rs`）。
     #[test]
-    fn sup14_task171_1_2_elevate_is_stub() {
+    fn sup14_task171_1_3_public_elevate_reports_platform_result() {
         let e = elevate(PrivilegeMethod::LauncherAmbient).unwrap_err();
-        assert_eq!(e.code, ErrorCode::Unimplemented);
-        assert_eq!(TraitError::from(e).code(), ErrorCode::Unimplemented);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(e.code, ErrorCode::FailedPrecondition);
+            assert_eq!(e.reason, PrivilegeErrorReason::MultiThreaded);
+            assert_eq!(TraitError::from(e).code(), ErrorCode::FailedPrecondition);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(e.code, ErrorCode::Unimplemented);
+            assert_eq!(e.reason, PrivilegeErrorReason::Unimplemented);
+            assert_eq!(TraitError::from(e).code(), ErrorCode::Unimplemented);
+        }
+    }
+
+    // ---- TASK-171.1.3・#1475: elevate の適用順・失敗注入（偽のカーネル操作で 3 OS 共通に照合） ----
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Op {
+        ReadStatus,
+        ClearGroups,
+        SetGid(u32),
+        DropBounding(u8),
+        KeepCaps(bool),
+        SetUid(u32),
+        Capset(u64, u64, u64),
+        AmbientClearAll,
+        AmbientRaise(u8),
+        GetKeepCaps,
+    }
+
+    /// 呼び出しを記録し、変更系 n 番目（0 起点。ReadStatus・GetKeepCaps は数えない）の操作に errno を注入できる偽物。
+    struct FakeKernel {
+        ops: Vec<Op>,
+        statuses: Vec<String>,
+        reads: usize,
+        keep_after: Option<bool>,
+        fail_nth: Option<(usize, i32)>,
+        mutations: usize,
+    }
+
+    impl FakeKernel {
+        fn new(statuses: Vec<String>) -> Self {
+            Self {
+                ops: Vec::new(),
+                statuses,
+                reads: 0,
+                keep_after: Some(false),
+                fail_nth: None,
+                mutations: 0,
+            }
+        }
+
+        fn mutate(&mut self, op: Op) -> std::io::Result<()> {
+            self.ops.push(op);
+            let n = self.mutations;
+            self.mutations += 1;
+            match self.fail_nth {
+                Some((i, errno)) if i == n => Err(std::io::Error::from_raw_os_error(errno)),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    impl PrivilegeKernel for FakeKernel {
+        fn read_self_status(&mut self) -> std::io::Result<String> {
+            self.ops.push(Op::ReadStatus);
+            let i = self.reads.min(self.statuses.len().saturating_sub(1));
+            self.reads += 1;
+            self.statuses
+                .get(i)
+                .cloned()
+                .ok_or_else(|| std::io::Error::from_raw_os_error(5))
+        }
+        fn clear_groups(&mut self) -> std::io::Result<()> {
+            self.mutate(Op::ClearGroups)
+        }
+        fn set_resgid(&mut self, gid: u32) -> std::io::Result<()> {
+            self.mutate(Op::SetGid(gid))
+        }
+        fn drop_bounding(&mut self, cap: u8) -> std::io::Result<()> {
+            self.mutate(Op::DropBounding(cap))
+        }
+        fn set_keep_caps(&mut self, on: bool) -> std::io::Result<()> {
+            self.mutate(Op::KeepCaps(on))
+        }
+        fn set_resuid(&mut self, uid: u32) -> std::io::Result<()> {
+            self.mutate(Op::SetUid(uid))
+        }
+        fn capset(&mut self, e: u64, p: u64, i: u64) -> std::io::Result<()> {
+            self.mutate(Op::Capset(e, p, i))
+        }
+        fn ambient_clear_all(&mut self) -> std::io::Result<()> {
+            self.mutate(Op::AmbientClearAll)
+        }
+        fn ambient_raise(&mut self, cap: u8) -> std::io::Result<()> {
+            self.mutate(Op::AmbientRaise(cap))
+        }
+        fn get_keep_caps(&mut self) -> std::io::Result<bool> {
+            self.ops.push(Op::GetKeepCaps);
+            self.keep_after
+                .ok_or_else(|| std::io::Error::from_raw_os_error(22))
+        }
+    }
+
+    struct St<'a> {
+        threads: &'a str,
+        uid: &'a str,
+        gid: &'a str,
+        groups: &'a str,
+        inh: &'a str,
+        prm: &'a str,
+        eff: &'a str,
+        bnd: &'a str,
+        amb: &'a str,
+        nnp: &'a str,
+    }
+
+    impl St<'_> {
+        fn render(&self) -> String {
+            format!(
+                "Name:\tx\nThreads:\t{}\nUid:\t{}\nGid:\t{}\nGroups:\t{}\nCapInh:\t{}\nCapPrm:\t{}\nCapEff:\t{}\nCapBnd:\t{}\nCapAmb:\t{}\nNoNewPrivs:\t{}\n",
+                self.threads,
+                self.uid,
+                self.gid,
+                self.groups,
+                self.inh,
+                self.prm,
+                self.eff,
+                self.bnd,
+                self.amb,
+                self.nnp
+            )
+        }
+    }
+
+    const MIN: &str = "0000000028201122";
+    /// 最小集合 + `CAP_SETGID`（bit 6）。方式 (c) で補助グループを持つ利用者の file capability。
+    const MIN_SETGID: &str = "0000000028201162";
+    const NONE: &str = "0000000000000000";
+    /// 方式 (a): real は非 root、effective / saved / fs が 0（setuid root を非 root が起動した状態）。
+    const SETUID_UID: &str = "1000\t0\t0\t0";
+
+    fn before_setuid() -> String {
+        St {
+            threads: "1",
+            uid: SETUID_UID,
+            gid: GID,
+            groups: "",
+            inh: NONE,
+            prm: FULL,
+            eff: FULL,
+            bnd: FULL,
+            amb: NONE,
+            nnp: "0",
+        }
+        .render()
+    }
+
+    fn before_launcher() -> String {
+        St {
+            threads: "1",
+            uid: UID,
+            gid: GID,
+            groups: "1000\t4",
+            inh: NONE,
+            prm: MIN_SETGID,
+            eff: MIN_SETGID,
+            bnd: FULL,
+            amb: NONE,
+            nnp: "0",
+        }
+        .render()
+    }
+
+    fn after_ok() -> String {
+        St {
+            threads: "1",
+            uid: UID,
+            gid: GID,
+            groups: "",
+            inh: MIN,
+            prm: MIN,
+            eff: MIN,
+            bnd: MIN,
+            amb: MIN,
+            nnp: "0",
+        }
+        .render()
+    }
+
+    const MIN_MASK: u64 = 0x2820_1122;
+
+    fn dropped_bounding() -> Vec<Op> {
+        // FULL は番号 0..=40。最小集合 {1,5,8,12,21,27,29} 以外を昇順に落とす（CAP_SETPCAP=8 は残るため末尾移動なし）。
+        (0u8..41)
+            .filter(|i| !matches!(*i, 1 | 5 | 8 | 12 | 21 | 27 | 29))
+            .map(Op::DropBounding)
+            .collect()
+    }
+
+    fn ambient_ops() -> Vec<Op> {
+        let mut v = vec![Op::AmbientClearAll];
+        v.extend([1u8, 5, 8, 12, 21, 27, 29].map(Op::AmbientRaise));
+        v
+    }
+
+    fn setuid_expected_ops() -> Vec<Op> {
+        let mut v = vec![Op::ReadStatus, Op::SetGid(1000)];
+        v.extend(dropped_bounding());
+        v.extend([
+            Op::KeepCaps(true),
+            Op::SetUid(1000),
+            Op::Capset(MIN_MASK, MIN_MASK, MIN_MASK),
+        ]);
+        v.extend(ambient_ops());
+        v.extend([Op::KeepCaps(false), Op::GetKeepCaps, Op::ReadStatus]);
+        v
+    }
+
+    /// SUP-14・TASK-171.1.3: 方式 (a) の適用順が `ReductionPlan::steps` どおりで、34 個の bounding 削除・7 個の ambient 載せが
+    /// 具体値で一致し、結果が必要最小集合ちょうどになる。
+    #[test]
+    fn sup14_task171_1_3_setuid_applies_steps_in_order() {
+        let mut k = FakeKernel::new(vec![before_setuid(), after_ok()]);
+        let r = elevate_with(&mut k, PrivilegeMethod::SetuidRoot).unwrap();
+        assert_eq!(k.ops, setuid_expected_ops());
+        assert_eq!(dropped_bounding().len(), 34);
+        assert_eq!(r.held, runtime_required_capabilities());
+        assert_eq!(r.method, PrivilegeMethod::SetuidRoot);
+        assert_eq!(r.uid.real, 1000);
+    }
+
+    /// SUP-14・TASK-171.1.3: 方式 (c) は uid 遷移が無いため keepcaps を使わず、補助グループの消去から始まる。
+    #[test]
+    fn sup14_task171_1_3_launcher_ambient_skips_keepcaps_and_clears_groups_first() {
+        let mut k = FakeKernel::new(vec![before_launcher(), after_ok()]);
+        let r = elevate_with(&mut k, PrivilegeMethod::LauncherAmbient).unwrap();
+        let mut want = vec![Op::ReadStatus, Op::ClearGroups, Op::SetGid(1000)];
+        want.extend(dropped_bounding());
+        want.extend([Op::SetUid(1000), Op::Capset(MIN_MASK, MIN_MASK, MIN_MASK)]);
+        want.extend(ambient_ops());
+        want.extend([Op::GetKeepCaps, Op::ReadStatus]);
+        assert_eq!(k.ops, want);
+        assert_eq!(r.held, runtime_required_capabilities());
+    }
+
+    fn op_name(op: &Op) -> &'static str {
+        match op {
+            Op::ClearGroups => "setgroups",
+            Op::SetGid(_) => "setresgid",
+            Op::DropBounding(_) => "bounding drop",
+            Op::KeepCaps(true) => "set keepcaps",
+            Op::KeepCaps(false) => "clear keepcaps",
+            Op::SetUid(_) => "setresuid",
+            Op::Capset(..) => "capset",
+            Op::AmbientClearAll => "ambient clear",
+            Op::AmbientRaise(_) => "ambient raise",
+            Op::ReadStatus | Op::GetKeepCaps => "read",
+        }
+    }
+
+    /// SUP-14・TASK-171.1.3: 変更系の全手順で 1 つずつ失敗を注入すると、`Err` を返して後続の操作を一切呼ばない。
+    /// keepcaps 設定後の失敗では解除を 1 回だけ試す。EPERM は `PermissionDenied`、それ以外は `Internal`。
+    #[test]
+    fn sup14_task171_1_3_every_step_failure_aborts_fail_closed() {
+        let full: Vec<Op> = setuid_expected_ops()
+            .into_iter()
+            .filter(|o| !matches!(o, Op::ReadStatus | Op::GetKeepCaps))
+            .collect();
+        let keep_on = full.iter().position(|o| *o == Op::KeepCaps(true)).unwrap();
+        let last = full.len() - 1;
+        assert_eq!(full.len(), 1 + 34 + 1 + 1 + 1 + 8 + 1);
+        for (i, failing) in full.iter().enumerate() {
+            for (errno, code) in [(1, ErrorCode::PermissionDenied), (12, ErrorCode::Internal)] {
+                let mut k = FakeKernel::new(vec![before_setuid(), after_ok()]);
+                k.fail_nth = Some((i, errno));
+                let e = elevate_with(&mut k, PrivilegeMethod::SetuidRoot).unwrap_err();
+                assert_eq!(e.reason, PrivilegeErrorReason::SyscallFailed, "step {i}");
+                assert_eq!(e.code, code, "step {i}");
+                assert_eq!(
+                    e.message,
+                    format!("{} failed (errno {errno})", op_name(failing)),
+                    "step {i}"
+                );
+                let mut want = vec![Op::ReadStatus];
+                want.extend(full.iter().take(i + 1).cloned());
+                if i > keep_on && i != last {
+                    want.push(Op::KeepCaps(false));
+                }
+                assert_eq!(k.ops, want, "step {i}");
+            }
+        }
+    }
+
+    /// SUP-14・TASK-171.1.3: 事前条件で拒否するときは何も変更しない（記録されるのは ReadStatus の 1 件だけ）。
+    #[test]
+    fn sup14_task171_1_3_precondition_rejections_change_nothing() {
+        let mk = |threads: &str, uid: &str, caps: &str, nnp: &str| {
+            St {
+                threads,
+                uid,
+                gid: GID,
+                groups: "",
+                inh: NONE,
+                prm: caps,
+                eff: caps,
+                bnd: FULL,
+                amb: NONE,
+                nnp,
+            }
+            .render()
+        };
+        let root = "0\t0\t0\t0";
+        let cases: Vec<(String, PrivilegeMethod, PrivilegeErrorReason, ErrorCode)> = vec![
+            (
+                mk("2", SETUID_UID, FULL, "0"),
+                PrivilegeMethod::SetuidRoot,
+                PrivilegeErrorReason::MultiThreaded,
+                ErrorCode::FailedPrecondition,
+            ),
+            (
+                before_setuid().replace("Threads:\t1\n", ""),
+                PrivilegeMethod::SetuidRoot,
+                PrivilegeErrorReason::MultiThreaded,
+                ErrorCode::FailedPrecondition,
+            ),
+            (
+                mk("1", root, FULL, "0"),
+                PrivilegeMethod::LauncherAmbient,
+                PrivilegeErrorReason::MethodMismatch,
+                ErrorCode::FailedPrecondition,
+            ),
+            (
+                mk("1", UID, FULL, "0"),
+                PrivilegeMethod::SetuidRoot,
+                PrivilegeErrorReason::MethodMismatch,
+                ErrorCode::FailedPrecondition,
+            ),
+            (
+                mk("1", root, FULL, "0"),
+                PrivilegeMethod::SetuidRoot,
+                PrivilegeErrorReason::MethodMismatch,
+                ErrorCode::FailedPrecondition,
+            ),
+            (
+                mk("1", UID, NONE, "0"),
+                PrivilegeMethod::LauncherAmbient,
+                PrivilegeErrorReason::MissingCapabilities,
+                ErrorCode::PermissionDenied,
+            ),
+            (
+                mk("1", UID, FULL, "1"),
+                PrivilegeMethod::LauncherAmbient,
+                PrivilegeErrorReason::NoNewPrivsSet,
+                ErrorCode::FailedPrecondition,
+            ),
+        ];
+        for (n, (text, method, reason, code)) in cases.into_iter().enumerate() {
+            let mut k = FakeKernel::new(vec![text]);
+            let e = elevate_with(&mut k, method).unwrap_err();
+            assert_eq!(e.reason, reason, "case {n}");
+            assert_eq!(e.code, code, "case {n}");
+            assert_eq!(k.ops, vec![Op::ReadStatus], "case {n}");
+        }
+    }
+
+    /// SUP-14・TASK-171.1.3: 状態を読めないときも単一スレッドと認めず、何も変更しない。
+    #[test]
+    fn sup14_task171_1_3_unreadable_status_is_rejected() {
+        let mut k = FakeKernel::new(Vec::new());
+        let e = elevate_with(&mut k, PrivilegeMethod::SetuidRoot).unwrap_err();
+        assert_eq!(e.reason, PrivilegeErrorReason::MultiThreaded);
+        assert_eq!(k.ops, vec![Op::ReadStatus]);
+    }
+
+    /// SUP-14・TASK-171.1.3: 読み戻しの不一致（過剰 capability・keepcaps 残存 / 未確認・スレッド増加）は `Ok` にしない。
+    #[test]
+    fn sup14_task171_1_3_readback_rejections() {
+        let excess = after_ok().replace("CapBnd:\t0000000028201122", "CapBnd:\t000001ffffffffff");
+        let mut k = FakeKernel::new(vec![before_setuid(), excess]);
+        let e = elevate_with(&mut k, PrivilegeMethod::SetuidRoot).unwrap_err();
+        assert_eq!(e.reason, PrivilegeErrorReason::ExcessCapabilities);
+        assert_eq!(e.code, ErrorCode::PermissionDenied);
+        assert_eq!(k.ops.last(), Some(&Op::ReadStatus));
+
+        let mut k = FakeKernel::new(vec![before_setuid(), after_ok()]);
+        k.keep_after = Some(true);
+        let e = elevate_with(&mut k, PrivilegeMethod::SetuidRoot).unwrap_err();
+        assert_eq!(e.reason, PrivilegeErrorReason::KeepCapsRetained);
+        assert_eq!(e.code, ErrorCode::PermissionDenied);
+
+        let mut k = FakeKernel::new(vec![before_setuid(), after_ok()]);
+        k.keep_after = None;
+        let e = elevate_with(&mut k, PrivilegeMethod::SetuidRoot).unwrap_err();
+        assert_eq!(e.reason, PrivilegeErrorReason::KeepCapsRetained);
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+
+        let threaded = after_ok().replace("Threads:\t1\n", "Threads:\t3\n");
+        let mut k = FakeKernel::new(vec![before_setuid(), threaded]);
+        let e = elevate_with(&mut k, PrivilegeMethod::SetuidRoot).unwrap_err();
+        assert_eq!(e.reason, PrivilegeErrorReason::MultiThreaded);
+    }
+
+    /// SUP-14・TASK-171.1.3: `Threads:` 行の境界（欠落・非数値・重複・上限超過）は `None`。
+    #[test]
+    fn sup14_task171_1_3_parse_thread_count_boundaries() {
+        assert_eq!(parse_thread_count("Name:\tx\nThreads:\t1\n"), Some(1));
+        assert_eq!(parse_thread_count("Threads:\t12\n"), Some(12));
+        assert_eq!(parse_thread_count("Name:\tx\n"), None);
+        assert_eq!(parse_thread_count("Threads:\tabc\n"), None);
+        assert_eq!(parse_thread_count("Threads:\t+1\n"), None);
+        assert_eq!(parse_thread_count("Threads:\t\n"), None);
+        assert_eq!(parse_thread_count("Threads:\t1\nThreads:\t1\n"), None);
+        let long = format!("Threads:\t1\n{}", "x".repeat(MAX_STATUS_BYTES));
+        assert_eq!(parse_thread_count(&long), None);
+        let many = format!("{}Threads:\t1\n", "a\n".repeat(MAX_STATUS_LINES));
+        assert_eq!(parse_thread_count(&many), None);
     }
 
     #[test]

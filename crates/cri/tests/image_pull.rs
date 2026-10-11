@@ -3,6 +3,10 @@
 //! 実レジストリには接続せず、`RegistryPullClient` の偽実装で manifest / blob を返す。digest 検証・キャッシュ公開・
 //! ステージング後始末・ストア登録は本物の経路を通す。実レジストリでの確認（`crictl pull`）は plugin-cri（TASK-114）以降。
 
+// 非 Unix ではキャッシュのアクセス制御を検証できず fail-closed で拒否するため、本ファイルは Unix 限定
+// （非 Unix の拒否は `image_pull_non_unix.rs`）。
+#![cfg(unix)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -195,6 +199,11 @@ impl TempDir {
             std::process::id()
         ));
         fs::create_dir_all(&p).expect("mkdir");
+        // umask 002 の環境でも祖先検証（group 書き込み不可）を通すため 0755 に固定する。
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
         Self(p)
     }
 }
@@ -866,6 +875,23 @@ fn sec_pull_rejects_world_writable_cache_directory() {
     fs::set_permissions(&sha, fs::Permissions::from_mode(0o777)).expect("chmod");
     let client = Arc::new(FakeClient::new(two_layer_manifest()));
     let puller = OciImagePuller::new(client.clone(), config(&dir));
+    let err = puller.pull(&req("alpine:3.20")).expect_err("rejected");
+    assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+    assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 0);
+}
+
+/// SEC・OCI-1: キャッシュの祖先が他ユーザー書き込み可能（sticky なし）なら拒否する。
+#[test]
+fn sec_pull_rejects_world_writable_cache_ancestor() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = TempDir::new("ancestorw");
+    let shared = dir.0.join("shared");
+    fs::create_dir_all(&shared).expect("mkdir");
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).expect("chmod");
+    let mut cfg = config(&dir);
+    cfg.cache_dir = shared.join("cache");
+    let client = Arc::new(FakeClient::new(two_layer_manifest()));
+    let puller = OciImagePuller::new(client.clone(), cfg);
     let err = puller.pull(&req("alpine:3.20")).expect_err("rejected");
     assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
     assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 0);

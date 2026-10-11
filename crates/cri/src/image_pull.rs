@@ -633,9 +633,11 @@ fn prepare_private_dir(cache_dir: &Path, components: &[&str]) -> Result<PathBuf,
     root_builder.create(cache_dir).map_err(|_| prep_err())?;
     let owner = owner_probe(cache_dir)?;
     verify_private_dir(cache_dir, owner)?;
+    verify_ancestors(cache_dir, owner)?;
     let mut current = cache_dir.to_path_buf();
     for name in components {
         current.push(name);
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut single = fs::DirBuilder::new();
         #[cfg(unix)]
         {
@@ -683,9 +685,57 @@ fn owner_probe(dir: &Path) -> Result<u32, PullError> {
     uid.map_err(|_| fail())
 }
 
+/// 非 Unix では所有者・ACL（DACL）を検証する手段が無い（`windows-sys` は未導入）ため、検証できないまま
+/// キャッシュを使わず fail-closed で拒否する（SEC・OCI-1。Windows の ACL 検証は将来仕様）。
 #[cfg(not(unix))]
 fn owner_probe(_dir: &Path) -> Result<u32, PullError> {
-    Ok(0)
+    Err(PullError::new(
+        OciErrorCode::Unimplemented,
+        "image cache access control is not supported on this platform",
+    ))
+}
+
+/// `cache_dir` の祖先ディレクトリを根まで検証する（Unix）。
+///
+/// 親を `canonicalize` して symlink を解決したうえで、親から根までの各ディレクトリが「呼び出しプロセスまたは
+/// root の所有」かつ「group / other 書き込み不可、または sticky ビット付き（他ユーザーが他人のエントリを
+/// rename / 削除できない `/tmp` 等）」であることを要求する。信頼できない祖先は fail-closed で拒否する。
+/// 限界: 標準ライブラリだけでは openat 相当のディレクトリハンドル基準の操作ができないため、検証後に
+/// 同一所有者・root 以外が祖先を差し替える経路は上記の所有者・権限条件で塞ぐ（TOCTOU 全体の排除ではない）。
+#[cfg(unix)]
+fn verify_ancestors(cache_dir: &Path, owner: u32) -> Result<(), PullError> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let reject = |message: &'static str| PullError::new(OciErrorCode::FailedPrecondition, message);
+    let parent = match cache_dir.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let canonical = fs::canonicalize(parent)
+        .map_err(|_| reject("failed to resolve the image cache parent directory"))?;
+    for ancestor in canonical.ancestors() {
+        let meta = fs::symlink_metadata(ancestor)
+            .map_err(|_| reject("failed to inspect an image cache ancestor directory"))?;
+        if !meta.file_type().is_dir() {
+            return Err(reject("image cache ancestor is not a plain directory"));
+        }
+        if meta.uid() != owner && meta.uid() != 0 {
+            return Err(reject(
+                "image cache ancestor directory has an untrusted owner",
+            ));
+        }
+        let mode = meta.permissions().mode();
+        if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+            return Err(reject(
+                "image cache ancestor directory is writable by other users",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_ancestors(_cache_dir: &Path, _owner: u32) -> Result<(), PullError> {
+    Ok(())
 }
 
 /// `dir` が symlink でない通常ディレクトリで、`owner` の所有かつ他ユーザー書き込み不可であることを確認する。
@@ -954,5 +1004,19 @@ mod tests {
             display_name(other.registry(), other.repository()),
             "registry.example.com:5000/team/app"
         );
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+mod non_unix_tests {
+    use super::*;
+
+    /// SEC・OCI-1: 非 Unix ではアクセス制御を検証できないため、キャッシュ準備は `Unimplemented` で拒否する。
+    #[test]
+    fn sec_cache_preparation_is_rejected_without_acl_verification() {
+        let dir = std::env::temp_dir().join(format!("fandhe-cri-acl-{}", std::process::id()));
+        let err = prepare_private_dir(&dir, &["staging"]).expect_err("rejected");
+        assert_eq!(err.code(), OciErrorCode::Unimplemented);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -7,9 +7,9 @@
 
 #![cfg(target_os = "linux")]
 
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_core::oci_runtime::{create, exit_code_for};
@@ -68,15 +68,48 @@ fn bin() -> Command {
     c
 }
 
+/// 子の終了待ちの上限（超過したら kill して有限時間で回収する。REPAIR-5）。
+const CHILD_DEADLINE: Duration = Duration::from_secs(60);
+
+/// 期限つきで子の終了を待つ。超過時は kill して回収し panic する（無期限のハングを作らない）。
+fn wait_bounded(child: &mut Child) -> ExitStatus {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if start.elapsed() > CHILD_DEADLINE {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child did not exit within the deadline");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 読み取りを別スレッドで行い、期限までに EOF にならなければ失敗させる。
+fn read_bounded<R: std::io::Read + Send + 'static>(mut r: R) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = r.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
 fn run_with_pipe(cmd: &mut Command) -> (Option<i32>, Vec<u8>, Vec<u8>) {
-    let out = cmd
+    let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap()
-        .wait_with_output()
         .unwrap();
-    (out.status.code(), out.stdout, out.stderr)
+    let out_rx = read_bounded(child.stdout.take().unwrap());
+    let err_rx = read_bounded(child.stderr.take().unwrap());
+    let status = wait_bounded(&mut child);
+    let stdout = out_rx.recv_timeout(CHILD_DEADLINE).unwrap();
+    let stderr = err_rx.recv_timeout(CHILD_DEADLINE).unwrap();
+    (status.code(), stdout, stderr)
 }
 
 fn args(root: &Path, id: &str) -> Vec<String> {
@@ -139,14 +172,9 @@ fn sup1_bin_rejects_non_pipe_result_channel() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut stderr = String::new();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .unwrap();
-    let status = child.wait().unwrap();
+    let err_rx = read_bounded(child.stderr.take().unwrap());
+    let status = wait_bounded(&mut child);
+    let stderr = String::from_utf8(err_rx.recv_timeout(CHILD_DEADLINE).unwrap()).unwrap();
     let n = exit_code_for(ErrorCode::InvalidArgument);
     assert_eq!(status.code(), Some(i32::from(n.get())));
     assert_eq!(

@@ -45,8 +45,8 @@ use fandhe_container_core::oci_runtime::{
     StartTimeouts, exit_code_for, recover_interrupted_start, start, take_unreaped_processes,
 };
 use fandhe_container_core::traits::{
-    ContainerId, ContainerState, ErrorCode, GetStateRequest, StartRequest, StateRecord, StateStore,
-    TraitError,
+    ContainerId, ContainerState, ContainerStatus, ErrorCode, GetStateRequest, StartRequest,
+    StateRecord, StateStore, SupervisionState, TraitError,
 };
 
 use crate::restart::{
@@ -111,7 +111,49 @@ impl Relauncher for NoSpecRelauncher {
 /// 構造化ログを stderr に 1 行出す（値は固定語彙だけ。入力値・OS のエラー文字列は載せない。REPAIR-4）。
 fn log_event(event: &'static str, code: Option<ErrorCode>) {
     let code = code.map(|c| c.as_str()).unwrap_or("");
-    eprintln!("{{\"component\":\"supervisor\",\"event\":\"{event}\",\"code\":\"{code}\"}}");
+    // eprintln! は stderr の書き込み失敗で panic する。ログ配送の失敗が回収・監視を止めないよう結果を捨てる。
+    let _ = writeln!(
+        std::io::stderr(),
+        "{{\"component\":\"supervisor\",\"event\":\"{event}\",\"code\":\"{code}\"}}"
+    );
+}
+
+/// ハンドルの所有権を別スレッドへ渡して `terminate` を呼び、呼び出し境界でも期限を強制する（REPAIR-5）。
+///
+/// 実装が `timeout` を守らず戻らない場合も、本関数は `timeout` に猶予を足した時点で `false` を返す。
+/// その場合ハンドルは実行スレッドが持ち続ける（回収は確かめられていない）。回収を確かめられたら `true`。
+fn terminate_bounded(process: Box<dyn LaunchedProcess>, timeout: Duration) -> bool {
+    let cell = Arc::new(std::sync::Mutex::new(Some(process)));
+    let worker_cell = Arc::clone(&cell);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("supervisor-terminate".into())
+        .spawn(move || {
+            let taken = worker_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            let result = match taken {
+                Some(p) => p.terminate(timeout).map_err(|e| e.code()),
+                None => Err(ErrorCode::Internal),
+            };
+            let _ = tx.send(result);
+        });
+    if spawned.is_err() {
+        log_event("terminate_thread_failed", None);
+        return false;
+    }
+    match rx.recv_timeout(timeout.saturating_add(LAUNCHER_REPLY_GRACE)) {
+        Ok(Ok(())) => true,
+        Ok(Err(code)) => {
+            log_event("handle_terminate_failed", Some(code));
+            false
+        }
+        Err(_) => {
+            log_event("handle_terminate_timed_out", Some(ErrorCode::Timeout));
+            false
+        }
+    }
 }
 
 fn op_err(e: TraitError) -> OciRuntimeError {
@@ -220,7 +262,7 @@ fn start_sequence(
             })
         }
         Err(e) if e.code() == ErrorCode::Timeout => {
-            if recover_after_timeout(store, &launcher, req.id(), timeouts) {
+            if recover_after_timeout(store, &launcher, req.id(), timeouts, Vec::new()) {
                 release_logged(deps);
                 Err(e)
             } else {
@@ -233,18 +275,33 @@ fn start_sequence(
             }
         }
         Err(e) => {
-            release_logged(deps);
-            Err(e)
+            // 記録の失敗後に terminate も失敗・超過した場合、core はハンドルを未回収レジストリに残して返す。
+            // 残っていれば回収と予約の確認を再試行し、確かめられなければ cgroup を残す（CORE-1・CORE-2）。
+            let pending = take_unreaped_processes();
+            if pending.is_empty()
+                || recover_after_timeout(store, &launcher, req.id(), timeouts, pending)
+            {
+                release_logged(deps);
+                Err(e)
+            } else {
+                Err(OciRuntimeError::new(
+                    LifecycleOp::Start,
+                    ErrorCode::Internal,
+                    "start failed and cleanup could not be confirmed; a reservation or child process may remain",
+                ))
+            }
         }
     }
 }
 
-/// `start` の `Timeout` 後に予約を Created へ戻し、未回収のハンドルを terminate する。両方済んだら `true`。
+/// `start` 失敗後に予約を Created へ戻し、未回収のハンドル（`extra` と登録済み分）を terminate する。
+/// 両方済んだら `true`。
 fn recover_after_timeout(
     store: &dyn StateStore,
     launcher: &Arc<dyn ProcessLauncher>,
     id: &ContainerId,
     timeouts: &StartTimeouts,
+    extra: Vec<Box<dyn LaunchedProcess>>,
 ) -> bool {
     let limit = timeouts
         .terminate()
@@ -269,9 +326,8 @@ fn recover_after_timeout(
         }
     }
     let mut all_reaped = true;
-    for p in take_unreaped_processes() {
-        if let Err(e) = p.terminate(timeouts.terminate()) {
-            log_event("unreaped_terminate_failed", Some(e.code()));
+    for p in extra.into_iter().chain(take_unreaped_processes()) {
+        if !terminate_bounded(p, timeouts.terminate()) {
             all_reaped = false;
         }
     }
@@ -286,12 +342,10 @@ fn dispose(
 ) -> bool {
     let mut ok = true;
     if let Some(p) = process {
-        match p.terminate(timeouts.terminate()) {
-            Ok(()) => log_event("handle_terminated", None),
-            Err(e) => {
-                log_event("handle_terminate_failed", Some(e.code()));
-                ok = false;
-            }
+        if terminate_bounded(p, timeouts.terminate()) {
+            log_event("handle_terminated", None);
+        } else {
+            ok = false;
         }
     }
     if let Some(late) = late {
@@ -300,16 +354,31 @@ fn dispose(
             ok = false;
         }
         for (p, _reason) in late.take() {
-            match p.terminate(timeouts.terminate()) {
-                Ok(()) => log_event("handle_terminated", None),
-                Err(e) => {
-                    log_event("handle_terminate_failed", Some(e.code()));
-                    ok = false;
-                }
+            if terminate_bounded(p, timeouts.terminate()) {
+                log_event("handle_terminated", None);
+            } else {
+                ok = false;
             }
         }
     }
     ok
+}
+
+/// 報告済みの Running を、回収後に Stopped へ落とす（best effort。inspect が死んだ pid を生存中と表示しない。SUP-1）。
+///
+/// 失敗はログに出すだけで終了コードは変えない（元のエラーを隠さない）。
+fn mark_stopped(store: &Arc<dyn StateStore>, id: &ContainerId) {
+    let result = SupervisedState::attach(Arc::clone(store), id.clone()).and_then(|mut st| {
+        let (health, count) = (st.record().health(), st.record().restart_count());
+        st.write(
+            ContainerStatus::stopped(id.clone(), None),
+            SupervisionState::new(None, health, count),
+        )
+        .map(|_| ())
+    });
+    if let Err(e) = result {
+        log_event("mark_stopped_failed", Some(e.code()));
+    }
 }
 
 /// 手順 10: 監視と restart。返り値は supervisor プロセスの終了コード（0 = 記録して正常に終わった）。
@@ -329,11 +398,14 @@ pub fn run_supervised(
         process,
         relauncher,
     } = running;
-    let mut state = match SupervisedState::attach(store, id) {
+    let mut state = match SupervisedState::attach(Arc::clone(&store), id.clone()) {
         Ok(s) => s,
         Err(e) => {
             log_event("attach_failed", Some(e.code()));
             let reaped = dispose(Some(process), None, timeouts);
+            if reaped {
+                mark_stopped(&store, &id);
+            }
             return if reaped {
                 exit_code_for(e.code()).get()
             } else {
@@ -351,6 +423,9 @@ pub fn run_supervised(
         Err(e) => {
             log_event("config_invalid", Some(e.code()));
             let reaped = dispose(Some(process), None, timeouts);
+            if reaped {
+                mark_stopped(&store, &id);
+            }
             return if reaped {
                 exit_code_for(e.code()).get()
             } else {

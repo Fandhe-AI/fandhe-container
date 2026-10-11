@@ -20,6 +20,11 @@
 //! 変換先の [`Rlimits`] は `fandhe_container_core::exec::StagePipeline::with_rlimits`（fork 後・capability
 //! 削減の前に `prlimit(2)` で適用。Linux 限定）が消費する。
 //!
+//! `state.json` に記録する launch 時の rlimit（exec が適用する値。TASK-169 追補・#1467）は、ここで保持する
+//! 「指定した種別だけ」の集合ではなく、core の `exec::launch_rlimits_from_self` で指定の無い種別を launch 時点の
+//! 実効値で埋めた全 16 種である。launcher はその同じ集合を `StagePipeline::with_rlimits` と
+//! `CreateStateRequest::with_rlimits` の両方へ渡す（結線は本番 launcher の後続作業。REPAIR-3）。
+//!
 //! `--ipc`（`host` / `shareable`）は [`ipc`] サブモジュールの [`IpcMode`] で保持する（#528・TASK-169.3）。
 //!
 //! # サブモジュール

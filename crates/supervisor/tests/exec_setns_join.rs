@@ -352,6 +352,26 @@ mod linux {
         );
     }
 
+    /// 全 16 種の launch 記録（`Nofile` は (700, 1500)、他は種別の添字から決める具体値。TASK-169 追補・#1467）。
+    fn full_rlimits() -> fandhe_container_core::rlimits::Rlimits {
+        use fandhe_container_core::rlimits::{Rlimit, RlimitKind, Rlimits};
+        Rlimits::new(
+            RlimitKind::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(i, k)| {
+                    let (soft, hard) = if k == RlimitKind::Nofile {
+                        (700, 1500)
+                    } else {
+                        (i as u64, 100 + i as u64)
+                    };
+                    Rlimit::new(k, soft, hard).expect("rlimit")
+                })
+                .collect(),
+        )
+        .expect("rlimits")
+    }
+
     /// 試験用のレコード（Running・記録 pid あり）と、pid1 が実際に属する cgroup の絶対パス。
     fn record_and_cgroup_path(pid: u32) -> (StateRecord, String) {
         let status =
@@ -361,7 +381,8 @@ mod linux {
             std::env::temp_dir().join("b"),
             StateRevision::from_raw(1),
         )
-        .expect("record");
+        .expect("record")
+        .with_rlimits(full_rlimits());
         let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("read cgroup");
         let path = cgroup
             .lines()

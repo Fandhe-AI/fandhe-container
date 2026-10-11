@@ -45,7 +45,7 @@
 //!   （pivot していない対象・`/` へ別のマウントが重ねられた対象）は違反 `exec_root_not_container_rootfs` で
 //!   拒否し、何も適用しない（SEC-1。根拠は core の `exec/reapply.rs` のモジュール doc）。bundle は
 //!   [`ExecTarget`] が特定時の記録から保持するため、別の記録の `config.json`・rootfs を取り違えない
-//! - **完了は型で表す**: 再適用は rlimit（対象 pid1 の実効値）・capability 削減（OCI 既定集合）・`NO_NEW_PRIVS`・
+//! - **完了は型で表す**: 再適用は rlimit（launch 時の記録）・capability 削減（OCI 既定集合）・`NO_NEW_PRIVS`・
 //!   Landlock・seccomp を載せる（launch 経路と同じ順序。#503）。`ExecRestrictionReport` のフィールドは非公開で、
 //!   crate の外から未適用の一覧を書き換えたり値を構築したりできない。exec へ進んでよいことの証跡は core の
 //!   `ExecReady` で、[`require_exec_ready`]（core の `ExecRestrictionReport::into_complete`）だけが作る。
@@ -77,8 +77,14 @@
 //!   判定する（core の `exec/exec_command.rs`）。分離違反による拒否（ランタイム自身のバイナリ・インタープリタ経由・
 //!   `/dev/null` の差し替え）は理由コードを持ち、呼び出し側が違反として記録できる（SEC-4。監査ログへの保存は
 //!   下記「未実装」）
-//! - **rlimit の空集合は拒否する**（TASK-163 追補・#1460）: 対象の実効 rlimit を 1 つも得られなかった場合、core は
-//!   適用を省かず `FailedPrecondition` で拒否する（rlimit を載せないまま exec へ進む経路を作らない）
+//! - **rlimit は launch 時の記録を適用し、記録が無ければ拒否する**（SUP-12・SUP-6・TASK-169 追補・#1467・#1455）:
+//!   launch は `--ulimit` の指定値に、指定の無い種別は launch 時点の実効値を足した全 16 種を `state.json` へ記録する
+//!   （`StateRecord::rlimits`。トレイト契約 11。作る関数は core の `launch_rlimits_from_self`）。[`identify_pid1`] 系は
+//!   記録が無い・全 16 種そろっていない場合を、pidfd を開く前に `FailedPrecondition`
+//!   （`container has no recorded launch rlimits; refusing to exec`）で拒否する（分離違反ではなく前提条件の不備のため
+//!   監査の違反としては記録しない。cgroup 配置が無いときと同じ扱い）。pid1 の現在の値（`/proc/<pid>/limits`）への
+//!   縮退はしない。記録を [`ExecTarget`] が保持し、core の `prepare_exec_restrictions` へ渡す（別の記録の値と取り違えない）。
+//!   pid1 が後から soft を上げ下げしても exec は記録の値で動く。core は適用を省かず、空・不完全な集合も拒否する（#1460）
 //! - **コンテナから見える窓を閉じる**: exec の子は fork した時点でコンテナの PID namespace に入り、
 //!   `close_range` までの間コンテナの procfs から見える。worker は開始時に自分を non-dumpable にし（core の
 //!   `spawn_exec_worker`）、core の `spawn_exec_command` は non-dumpable でないプロセスからの fork を拒否する。
@@ -222,9 +228,9 @@
 //!   bundle 自体や祖先の差し替え・I/O エラーは違反を運ばず記録しない。start の経路（core の `RootfsDir::pin`）は
 //!   `AuditSink` の配線が無く記録しない（#1314）。bundle は supervisor と同じ信頼境界にあるため、差し替えは境界の侵害の兆候。
 //!   再起動を越えて残る置き場所・ローテーション・常時の二重記録も未実装（`FileAuditSink` の doc）
-//! - `--ulimit` の指定値の `state.json` への記録。現状は pid1 の実効値を写して代替する（hard は launch を
-//!   超えないが、soft は pid1 が hard の範囲で上げていれば launch の指定より高くなり得る。core の
-//!   `exec/reapply.rs` のモジュール doc）
+//! - launcher による記録の書き込み（`launch_rlimits_from_self` の結果を `StagePipeline::with_rlimits` と
+//!   `CreateStateRequest::with_rlimits` の両方へ渡す結線）。本番の `start` は `process.rlimits` を `Unimplemented` で
+//!   拒否しており、現状は Running の記録に rlimit が載らないため、exec は記録を要求して拒否する（REPAIR-3）
 //! - 実機前提の通し試験 `tests/exec.rs` の実行結果の記録（root を要し、CI ではビルドのみで実行していない）
 
 use std::io::{BufRead as _, Read as _, Write as _};
@@ -248,6 +254,7 @@ use fandhe_container_core::exec::{
 use fandhe_container_core::oci_runtime::{
     OciConfig, RootfsDir, RootfsPinError, load_config, pin_bundle_rootfs_audited,
 };
+use fandhe_container_core::rlimits::Rlimits;
 use fandhe_container_core::state_store::{FileStateStore, StateRoot};
 use fandhe_container_core::traits::{
     CgroupPlacement, ContainerId, ContainerState, ErrorCode, StateRecord, TraitError,
@@ -263,6 +270,9 @@ pub struct ExecTarget {
     /// pid1 の特定に使った記録の bundle。[`prepare_restrictions`] が `config.json` と rootfs をここから
     /// 取るため、pid1 を照合した記録と別の記録の設定で制限を組み立てることがない。
     bundle: std::path::PathBuf,
+    /// pid1 の特定に使った記録の launch 時の rlimit（全 16 種。[`require_recorded_rlimits`] が検証済み）。
+    /// [`prepare_restrictions`] が core へ渡す。bundle と同じく、別の記録の値と取り違えないよう特定時に確定する。
+    rlimits: Rlimits,
 }
 
 impl ExecTarget {
@@ -289,6 +299,20 @@ fn running_pid(record: &StateRecord) -> Result<std::num::NonZeroU32, TraitError>
     }
 }
 
+/// 記録が launch 時の rlimit を全 16 種そろえて持つことを確かめ、その複製を返す（SUP-12・SUP-6・#1467）。
+///
+/// 無い・不完全な場合は `FailedPrecondition`（固定の英語文言。パスや値を含めない）。launch より緩い rlimit のまま
+/// exec させないための入口の検査で、pid1 の現在値への縮退はしない（fail-closed）。
+fn require_recorded_rlimits(record: &StateRecord) -> Result<Rlimits, TraitError> {
+    match record.rlimits() {
+        Some(r) if r.is_complete() => Ok(r.clone()),
+        _ => Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "container has no recorded launch rlimits; refusing to exec",
+        )),
+    }
+}
+
 /// `record` の稼働中コンテナから pid1 を特定する。
 ///
 /// `Running` かつ pid 記録ありでなければ `FailedPrecondition`。記録 pid は検証（pidfd 固定・直接入れ子の
@@ -306,12 +330,14 @@ pub fn identify_pid1(record: &StateRecord) -> Result<ExecTarget, TraitError> {
             "container has no recorded cgroup placement; cannot verify pid1 identity",
         ));
     };
+    let rlimits = require_recorded_rlimits(record)?;
     let id = record.status().id();
     let pid1 = Pid1Target::open(pid, id, placement).map_err(from_exec_error)?;
     Ok(ExecTarget {
         id: id.clone(),
         pid1,
         bundle: record.bundle().to_path_buf(),
+        rlimits,
     })
 }
 
@@ -335,6 +361,7 @@ pub fn identify_pid1_with_pidfd(
             "container has no recorded cgroup placement; cannot verify pid1 identity",
         ));
     };
+    let rlimits = require_recorded_rlimits(record)?;
     let owned = pidfd.try_clone_to_owned().map_err(|e| {
         TraitError::new(
             ErrorCode::Internal,
@@ -348,6 +375,7 @@ pub fn identify_pid1_with_pidfd(
         id: id.clone(),
         pid1,
         bundle: record.bundle().to_path_buf(),
+        rlimits,
     })
 }
 
@@ -363,12 +391,14 @@ pub fn identify_pid1_in(
     expected_cgroup_path: &str,
 ) -> Result<ExecTarget, TraitError> {
     let pid = running_pid(record)?;
+    let rlimits = require_recorded_rlimits(record)?;
     let pid1 =
         Pid1Target::open_with_cgroup_path(pid, expected_cgroup_path).map_err(from_exec_error)?;
     Ok(ExecTarget {
         id: record.status().id().clone(),
         pid1,
         bundle: record.bundle().to_path_buf(),
+        rlimits,
     })
 }
 
@@ -390,7 +420,7 @@ pub fn join_cgroup(join: ExecCgroupJoin) -> Result<ExecCgroupJoinReport, TraitEr
 }
 
 /// コンテナの `config.json` から Landlock ruleset を作り、コンテナの rootfs を固定し、自プロセスの status fd・
-/// 対象の mount namespace の識別子・対象の実効 rlimit を確保し、**最後に自プロセスの補助グループを空にする**
+/// 対象の mount namespace の識別子を確保し（rlimit は特定時の記録を使う）、**最後に自プロセスの補助グループを空にする**
 /// （不可逆。namespace へ参加する前に消去するため。TASK-163 追補・#1457。契約はモジュール doc）。[`enter_namespaces`] の **前** に、再適用を
 /// 行うプロセス自身が呼ぶ（SUP-6・#502・#503。契約はモジュール doc）。
 ///
@@ -406,7 +436,8 @@ pub fn prepare_restrictions(
     target: &ExecTarget,
 ) -> Result<ExecRestrictions, TraitError> {
     let (config, rootfs) = load_exec_bundle(&target.bundle)?;
-    core_prepare_exec_restrictions(worker, &target.pid1, &config, &rootfs).map_err(from_exec_error)
+    core_prepare_exec_restrictions(worker, &target.pid1, &config, &rootfs, &target.rlimits)
+        .map_err(from_exec_error)
 }
 
 /// exec の拒否を永続化する本番の記録先を作る（SEC-4・SUP-6・TASK-163 追補・#1594）。
@@ -565,7 +596,7 @@ pub struct ExecOutcome {
     /// 判定すること（healthcheck は `Command` の非 0 を不健全、`SetupFailed` を実行基盤側の失敗として扱える）。
     /// 分離違反による拒否（ランタイム自身のバイナリ・インタープリタ経由・`/dev/null` の差し替え）は理由を持つ。
     pub exit: ExecExit,
-    /// exec プロセスへ適用した rlimit の種別数（対象 pid1 の実効値。子へ持ち越した `RLIMIT_FSIZE` を除き通常は 15）。
+    /// exec プロセスへ適用した rlimit の種別数（launch 時の記録。子へ持ち越した `RLIMIT_FSIZE` を除き通常は 15）。
     pub rlimits_applied: usize,
     /// 子へ持ち越した rlimit の種別数（`RLIMIT_FSIZE`。0 か 1。#1531）。exec の子が `execveat` の前に適用して読み戻し、
     /// 失敗すればコマンドは起動しない（`exit` は `SetupFailed`）。`rlimits_applied` との和が対象の rlimit の種別数。
@@ -1423,8 +1454,9 @@ fn run_in_child_cgroup(
     let (config, rootfs) = load_exec_bundle(&target.bundle)?;
     // コマンドの環境はコンテナ定義（`process.env`）が基底で、呼び出しプロセスの環境は使わない（#1457）。
     let command = request.command(&ContainerEnv::from_config(&config).map_err(from_exec_error)?)?;
-    let restrictions = core_prepare_exec_restrictions(proof, &target.pid1, &config, &rootfs)
-        .map_err(from_exec_error)?;
+    let restrictions =
+        core_prepare_exec_restrictions(proof, &target.pid1, &config, &rootfs, &target.rlimits)
+            .map_err(from_exec_error)?;
     // 方式の切り替えを黙って行わない（オーナー判断 2026-10-09・#1531・REPAIR-4）。判定の直後に 1 回だけ出す。
     let entrypoint_mode = restrictions.entrypoint_mode();
     // 送信は待たない best-effort で結果は捨てる（#1698）。縮退の事実の確かな観測口は `ExecOutcome::entrypoint_mode`。
@@ -1610,6 +1642,26 @@ mod tests {
 
     fn cid() -> ContainerId {
         ContainerId::new("c1").unwrap()
+    }
+
+    /// 全 16 種の launch 記録（`Nofile` は (700, 1500)、他は種別の添字から決める具体値）。
+    fn full_rlimits() -> Rlimits {
+        use fandhe_container_core::rlimits::{Rlimit, RlimitKind};
+        Rlimits::new(
+            RlimitKind::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(i, k)| {
+                    let (soft, hard) = if k == RlimitKind::Nofile {
+                        (700, 1500)
+                    } else {
+                        (i as u64, 100 + i as u64)
+                    };
+                    Rlimit::new(k, soft, hard).unwrap()
+                })
+                .collect(),
+        )
+        .unwrap()
     }
 
     /// SUP-6・REPAIR-4・#1531（オーナー判断 2026-10-09「条件付き切り替え」）: 実行方式の構造化ログの具体値。
@@ -1840,10 +1892,12 @@ mod tests {
     #[test]
     fn sup6_identify_with_placement_reaches_core_verification() {
         let pid = NonZeroU32::new(std::process::id());
-        let rec = record(ContainerStatus::running(cid(), pid)).with_cgroup(CgroupPlacement::new(
-            CgroupScope::new("/user.slice/x.scope").unwrap(),
-            StateRevision::from_raw(7),
-        ));
+        let rec = record(ContainerStatus::running(cid(), pid))
+            .with_cgroup(CgroupPlacement::new(
+                CgroupScope::new("/user.slice/x.scope").unwrap(),
+                StateRevision::from_raw(7),
+            ))
+            .with_rlimits(full_rlimits());
         let err = identify_pid1(&rec).unwrap_err();
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(
@@ -1853,12 +1907,57 @@ mod tests {
         );
     }
 
+    /// SUP-12・SUP-6・TASK-169 追補・#1467: launch 時の rlimit の記録が無い・全 16 種そろっていない記録は、
+    /// pid を開く前に `FailedPrecondition` と固定文言で拒否する（pid1 の現在値への縮退はしない）。cgroup 配置の
+    /// 検査の後に行うため、配置が無ければ配置の拒否が先になる。pidfd 版・試験用の `identify_pid1_in` も同じ。
+    #[test]
+    fn sup12_task169_identify_rejects_missing_or_incomplete_recorded_rlimits() {
+        use fandhe_container_core::rlimits::Rlimits;
+        // 存在しない pid でも NotFound にならない（rlimit の検査が pid を開く前にある）。
+        let pid = NonZeroU32::new(4_194_305);
+        let placed = |rec: StateRecord| {
+            rec.with_cgroup(CgroupPlacement::new(
+                CgroupScope::new("/").unwrap(),
+                StateRevision::from_raw(7),
+            ))
+        };
+        let fifteen =
+            Rlimits::new(full_rlimits().iter().skip(1).copied().collect::<Vec<_>>()).unwrap();
+        assert_eq!(fifteen.len(), 15);
+        let expected = "container has no recorded launch rlimits; refusing to exec";
+        let none = placed(record(ContainerStatus::running(cid(), pid)));
+        let few = placed(record(ContainerStatus::running(cid(), pid))).with_rlimits(fifteen);
+        let empty =
+            placed(record(ContainerStatus::running(cid(), pid))).with_rlimits(Rlimits::default());
+        let pidfd = std::fs::File::open("/").unwrap();
+        for rec in [&none, &few, &empty] {
+            let err = identify_pid1(rec).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(err.message(), expected);
+            let err = identify_pid1_with_pidfd(rec, std::os::fd::AsFd::as_fd(&pidfd)).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(err.message(), expected);
+            let err = identify_pid1_in(rec, "/x").unwrap_err();
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(err.message(), expected);
+        }
+        // 配置が無い記録は、rlimit の検査より先に配置の拒否になる。
+        let err = identify_pid1(&record(ContainerStatus::running(cid(), pid))).unwrap_err();
+        assert_eq!(
+            err.message(),
+            "container has no recorded cgroup placement; cannot verify pid1 identity"
+        );
+    }
+
     /// SUP-6: 違反記録のないエラー（システムエラー）は、段とメッセージだけを写す。
     #[test]
     fn sup6_identify_missing_pid_has_no_violation_suffix() {
-        let rec = record(ContainerStatus::running(cid(), NonZeroU32::new(4_194_305))).with_cgroup(
-            CgroupPlacement::new(CgroupScope::new("/").unwrap(), StateRevision::from_raw(7)),
-        );
+        let rec = record(ContainerStatus::running(cid(), NonZeroU32::new(4_194_305)))
+            .with_cgroup(CgroupPlacement::new(
+                CgroupScope::new("/").unwrap(),
+                StateRevision::from_raw(7),
+            ))
+            .with_rlimits(full_rlimits());
         let err = identify_pid1(&rec).unwrap_err();
         assert_eq!(err.code(), ErrorCode::NotFound);
         assert!(

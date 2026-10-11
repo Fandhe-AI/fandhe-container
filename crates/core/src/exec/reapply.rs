@@ -30,22 +30,18 @@
 //!   後だと `prlimit64` を許す必要が生じるため前に置く）。最初の失敗で打ち切り、後続は呼ばない。エラーの
 //!   `stage` は `Rlimits` / `CapabilityDrop` / `NoNewPrivs` / `Landlock` / `Seccomp`
 //!   （適用前の拒否は、準備したプロセスの不一致が `Validate`、参加後の namespace・`/` の不一致が `SetNs`）
-//! - **rlimit は対象（pid1）の実効値を写す**: コンテナの rlimit（`--ulimit`）は `state.json` に記録されないため、
-//!   [`prepare_exec_restrictions`] が `setns` の前に対象の `limits`（procfs）を上限つきで読み、全 16 種の
-//!   (soft, hard) を exec プロセスへ適用して読み戻す（黙ってクランプしない。`apply_rlimits`）。解釈できない
-//!   内容は空集合へ落とさず拒否する（緩い制限のまま exec しない）。得られた集合が空の場合も、適用を省かず
-//!   `FailedPrecondition`（段 `Rlimits`）で拒否する（準備・再適用の両方で確かめる。TASK-163 追補・#1460。
-//!   適用を省いても未適用の一覧へ載らない経路を塞ぐ）。rootless で hard の引き上げが必要な
-//!   場合は `EPERM` で拒否する（launch と同じ fail-closed）。他プロセスへの `prlimit` 経路は作らない
-//! - **rlimit を写す方式の限界（launch の指定値そのものではない）**: 写すのは pid1 の **現在の** 値で、pid1 は
-//!   自分の rlimit を変えられる。OCI 既定の capability に `CAP_SYS_RESOURCE` は無く、hard の引き上げは初期 user
-//!   namespace の `CAP_SYS_RESOURCE` を要するため、コンテナ側にできるのは「hard を下げる（戻せない）」と
-//!   「soft を hard 以下の範囲で上げ下げする」だけである。したがって exec の **hard は launch の hard を
-//!   超えない** が、**soft は launch が指定した soft より高い値（launch の hard 以下）になり得る**。soft は
-//!   コンテナ内のどのプロセスも自分で hard まで上げられる値で、権限の境界は hard なので、exec がコンテナ内
-//!   プロセスより緩い上限を得ることはない。逆に pid1 が値を下げていれば exec はその厳しい値で動く（極端に
-//!   下げれば Landlock のパス解決や fork が失敗し、exec は拒否される。コンテナ側が自分の exec を失敗させ
-//!   られるだけで、緩くはならない）。launch の指定値どおりに戻すには `--ulimit` の記録が要る（下記「未実装」）
+//! - **rlimit は launch 時の記録を適用する**（SUP-12・SUP-6・TASK-169 追補・#1467）: コンテナの rlimit
+//!   （`--ulimit`）は launch 時に全 16 種（指定のある種別は指定値、無い種別は launch 時点の実効値）を
+//!   `state.json` へ記録する（`StateRecord::rlimits`。トレイト契約 11）。supervisor の特定が記録から取り出した
+//!   集合を [`prepare_exec_restrictions`] へ渡し、全 16 種の (soft, hard) を exec プロセスへ適用して読み戻す
+//!   （launch の `StagePipeline::with_rlimits` と同じ `apply_rlimits`。黙ってクランプしない）。記録が無い・全 16 種
+//!   そろっていない場合は、適用を省かず `FailedPrecondition`（段 `Rlimits`）で拒否する（準備・再適用の両方で
+//!   確かめる。#1460。適用を省いても未適用の一覧へ載らない経路を塞ぐ）。pid1 の現在値への縮退はしない。
+//!   他プロセスへの `prlimit` 経路は作らない
+//! - **記録の値は pid1 の後からの変更に影響されない**: pid1 が soft を上げ下げしても、exec は記録の値で動く
+//!   （再現性があり、コンテナ側から exec の値を操作できない）。記録の hard が exec を起動したプロセスの hard を
+//!   超える場合は `EPERM` で拒否する（rlimit は対象の user namespace へ参加した後に適用するため、hard の引き上げには
+//!   初期 user namespace の `CAP_SYS_RESOURCE` が要る。rootless では fail-closed になる）
 //! - **capability は OCI 既定集合へ削減する**（SEC-1）: launch と同じ関数・同じ集合
 //!   （`CapabilitySet::oci_default` 固定）で、bounding set を許可集合まで落とし、ambient を空にし、
 //!   effective = permitted = 許可集合 ∩ 現在の permitted、inheritable = 空にして読み戻す。launch 経路も
@@ -179,7 +175,7 @@ use super::entrypoint_mode::EntrypointExecMode;
 use super::landlock::landlock_ruleset_from_config;
 #[cfg(feature = "exec-test-support")]
 use super::landlock::{LandlockAccessProbe, run_probe};
-use super::rlimits::{apply_rlimits, parse_proc_limits, widen_fsize_for_copy};
+use super::rlimits::{apply_rlimits, widen_fsize_for_copy};
 use super::sealed_copy::SealPolicy;
 use super::setns::{
     NsIdentity, UserNsRelation, cgroup_path_matches, read_bounded_from, status_effective_uid,
@@ -221,7 +217,7 @@ pub struct ExecRestrictions {
     /// `setns` の前にホスト側で固定したコンテナの rootfs（`O_PATH`）。参加後の `/` と照合する基準。
     /// 適用が終わるまで保持し、inode 番号が再利用されないようにする。
     rootfs: OwnedFd,
-    /// 対象（pid1）の実効 rlimit（対象の `limits`。`setns` の前に読む）。exec プロセスへ同じ値を載せる。
+    /// launch 時の rlimit の記録（`state.json`。全 16 種）。exec プロセスへ同じ値を載せる。
     rlimits: Rlimits,
     /// 制限を準備した対象への束縛（参加後に別の対象へ適用させない）。
     binding: TargetBinding,
@@ -402,7 +398,7 @@ impl ExecRestrictionReport {
         self.seccomp_instructions
     }
 
-    /// この exec プロセスへ適用した rlimit の種別数（対象の `limits` から読んだ全 16 種のうち、子へ持ち越した
+    /// この exec プロセスへ適用した rlimit の種別数（記録の全 16 種のうち、子へ持ち越した
     /// `RLIMIT_FSIZE` を除いたもの。通常は 15）。
     pub fn rlimits_applied(&self) -> usize {
         self.rlimits_applied
@@ -532,8 +528,9 @@ pub(super) struct ExecReadyParts {
 ///
 /// `join_namespaces` の **前** に、再適用を行うプロセス自身が呼ぶ。`rootfs` は稼働中コンテナの bundle から
 /// `oci_runtime::pin_bundle_rootfs` で固定したもの（`config` と同じ bundle のもの）を渡す。`target` は
-/// `join_namespaces` へ渡すのと同じ対象で、その mount namespace の識別子と実効 rlimit（対象の `limits`）を
-/// ここで記録する（参加後に別の対象へ適用させない。rlimit は launch と同じ値を exec プロセスへ載せる）。
+/// `join_namespaces` へ渡すのと同じ対象で、その mount namespace の識別子をここで記録する（参加後に別の対象へ
+/// 適用させない）。`rlimits` は launch 時に `state.json` へ記録した全 16 種（`StateRecord::rlimits`）で、
+/// launch と同じ値を exec プロセスへ載せる。全 16 種そろっていなければ `FailedPrecondition`（段 `Rlimits`）で拒否する。
 /// **準備の最後に、呼び出しプロセスの補助グループを空にする**（不可逆。参加の前に消去するため。#1457）。消去
 /// できず、user namespace の `setgroups` = `deny` も確認できなければ `PermissionDenied`（段 `CapabilityDrop`）で、
 /// 参加へ進ませない。
@@ -548,8 +545,9 @@ pub(super) struct ExecReadyParts {
 /// ```compile_fail,E0061
 /// use fandhe_container_core::exec::{Pid1Target, prepare_exec_restrictions};
 /// use fandhe_container_core::oci_runtime::{OciConfig, RootfsDir};
-/// fn without_proof(t: &Pid1Target, c: &OciConfig, r: &RootfsDir) {
-///     let _ = prepare_exec_restrictions(t, c, r);
+/// use fandhe_container_core::rlimits::Rlimits;
+/// fn without_proof(t: &Pid1Target, c: &OciConfig, r: &RootfsDir, l: &Rlimits) {
+///     let _ = prepare_exec_restrictions(t, c, r, l);
 /// }
 /// ```
 pub fn prepare_exec_restrictions(
@@ -557,6 +555,7 @@ pub fn prepare_exec_restrictions(
     target: &Pid1Target,
     config: &OciConfig,
     rootfs: &RootfsDir,
+    rlimits: &Rlimits,
 ) -> Result<ExecRestrictions, ExecError> {
     // 証跡は型で呼び出し元を絞るためだけに要求する（値は使わない）。
     let _ = worker;
@@ -569,9 +568,9 @@ pub fn prepare_exec_restrictions(
     let relation = target.user_ns_relation();
     let target_mnt_ns = target.mnt_ns_identity()?;
     let target_pid_ns = target.pid_ns_identity()?;
-    let rlimits = parse_proc_limits(&target.read_limits()?)?;
-    // 対象の実効値を 1 つも読めなかった場合、rlimit を載せずに exec することになるため拒否する（#1460）。
-    require_rlimits(&rlimits)?;
+    // 記録が欠けている・不完全だと、緩い rlimit のまま exec することになるため拒否する（#1460・#1467）。
+    require_rlimits(rlimits)?;
+    let rlimits = rlimits.clone();
     let binding = TargetBinding {
         proc_dir: open_own_proc_dir()?,
         target_user_ns: relation.target_identity(),
@@ -864,18 +863,18 @@ fn prepare_with_rootfs(
     })
 }
 
-/// 再適用する rlimit の集合が空でないことを確かめる（SUP-6・SEC-1・REPAIR-3・TASK-163 追補・#1460）。
+/// 再適用する rlimit の集合が全 16 種そろっていることを確かめる（SUP-6・SEC-1・REPAIR-3・TASK-163 追補・#1460・#1467）。
 ///
-/// 空集合は「適用する値が無い」ため rlimit の適用を省くことになるが、結果の件数が 0 になるだけで未適用の
-/// 一覧には載らず、launch より緩い rlimit のまま exec へ進めてしまう。本番の入口（[`prepare_exec_restrictions`]・
-/// [`reapply_restrictions`]）は空集合を `FailedPrecondition`（段 `Rlimits`）で拒否する。通常は対象の `limits` から
-/// 全 16 種が入る。
+/// 空集合や一部の種別だけの集合は「適用する値が無い種別」を残し、launch より緩い rlimit のまま exec へ進めてしまう
+/// （結果の件数が減るだけで未適用の一覧には載らない）。本番の入口（[`prepare_exec_restrictions`]・
+/// [`reapply_restrictions`]）は、全 16 種そろっていない集合を `FailedPrecondition`（段 `Rlimits`）で拒否する。
+/// 通常は launch 時の記録（`state.json`）から全 16 種が入る。
 fn require_rlimits(rlimits: &Rlimits) -> Result<(), ExecError> {
-    if rlimits.is_empty() {
+    if !rlimits.is_complete() {
         return Err(ExecError::new(
             ErrorCode::FailedPrecondition,
             IsolationStage::Rlimits,
-            "the rlimits of the exec target are empty; refusing to exec without rlimits",
+            "the rlimits of the exec target are incomplete; refusing to exec without all rlimits",
         ));
     }
     Ok(())
@@ -1229,7 +1228,7 @@ mod tests {
             threads: ThreadCountSource::ProcSelf,
             owner_pid,
             rootfs: dir_fd(rootfs),
-            rlimits: one_rlimit(),
+            rlimits: full_rlimits(),
             binding: own_binding(),
             groups_before_join: None,
             ids: None,
@@ -1254,12 +1253,31 @@ mod tests {
         }
     }
 
-    /// 適用の呼び出し順を確かめるための 1 件だけの rlimit 集合（偽の `prlimit` が記録する）。
-    fn one_rlimit() -> Rlimits {
-        use crate::rlimits::{Rlimit, RlimitKind};
-        Rlimits::new(vec![
-            Rlimit::new(RlimitKind::Nofile, 256, 512).expect("rlimit"),
-        ])
+    /// 偽の呼び出し記録を取り出し、連続する `rlimits`（種別ごとに 1 回ずつ記録される）を 1 つにまとめる。
+    /// 段の順序の照合用（rlimit の個別の値は `take_sets` で照合する）。
+    fn taken() -> Vec<&'static str> {
+        let mut v = take();
+        v.dedup();
+        v
+    }
+
+    /// 適用の呼び出し順を確かめるための全 16 種の rlimit 集合（偽の `prlimit` が記録する）。
+    /// 値は種別の添字から決める具体値で、`Nofile` だけ (256, 512)、`Fsize` は (4096, 4096)。
+    fn full_rlimits() -> Rlimits {
+        Rlimits::new(
+            RlimitKind::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(i, k)| {
+                    let (soft, hard) = match k {
+                        RlimitKind::Nofile => (256, 512),
+                        RlimitKind::Fsize => (4096, 4096),
+                        _ => (i as u64, 100 + i as u64),
+                    };
+                    Rlimit::new(k, soft, hard).expect("rlimit")
+                })
+                .collect(),
+        )
         .expect("set")
     }
 
@@ -1306,16 +1324,11 @@ mod tests {
     #[test]
     fn sup12_deferred_fsize_is_reported_separately_from_applied_rlimits() {
         let _ = take();
-        let mut r = restrictions(std::process::id());
-        r.rlimits = Rlimits::new(vec![
-            Rlimit::new(RlimitKind::Nofile, 256, 512).expect("nofile"),
-            Rlimit::new(RlimitKind::Fsize, 4096, 4096).expect("fsize"),
-        ])
-        .expect("set");
+        let r = restrictions(std::process::id());
         let report = reapply_restrictions(r).expect("ok");
         assert_eq!(
             (report.rlimits_applied(), report.rlimits_deferred()),
-            (1, 1)
+            (15, 1)
         );
         assert!(report.is_complete());
         let carry = report.into_complete().expect("ready").into_parts();
@@ -1332,7 +1345,7 @@ mod tests {
         let _ = take();
         let report = reapply_restrictions(restrictions(std::process::id())).expect("ok");
         assert_eq!(
-            take(),
+            taken(),
             vec![
                 "rlimits",
                 "capability_drop",
@@ -1343,8 +1356,29 @@ mod tests {
         );
         assert_eq!(report.landlock_rules(), 0);
         assert_eq!(report.seccomp_instructions(), 0);
-        assert_eq!(report.rlimits_applied(), 1);
-        assert_eq!(report.rlimits_deferred(), 0);
+        assert_eq!(report.rlimits_applied(), 15);
+        assert_eq!(report.rlimits_deferred(), 1);
+        // #1467: 偽の `prlimit` へは記録の全 16 種が、値・件数とも記録どおりに渡る（Fsize は持ち越し）。
+        let sets = crate::exec::rlimits::testing::take_sets();
+        let (fsize, others): (Vec<_>, Vec<_>) = sets
+            .into_iter()
+            .partition(|(k, _, _)| *k == RlimitKind::Fsize);
+        let want: Vec<_> = full_rlimits()
+            .iter()
+            .filter(|r| r.kind() != RlimitKind::Fsize)
+            .map(|r| (r.kind(), r.soft(), r.hard()))
+            .collect();
+        assert_eq!(others.len(), 15);
+        assert_eq!(others, want);
+        // 持ち越した Fsize は exec プロセスでは広げるだけ（封印した複製の書き込みのため。#1531）で、記録の値は載せない。
+        assert_eq!(
+            fsize,
+            [(
+                RlimitKind::Fsize,
+                crate::rlimits::RLIMIT_INFINITY,
+                crate::rlimits::RLIMIT_INFINITY
+            )]
+        );
         // TASK-163 追補（#1457）: capability 削減が補助グループの扱いも済ませ、結果に載る（偽のカーネルは空）。
         assert_eq!(
             report.supplementary_groups(),
@@ -1386,7 +1420,7 @@ mod tests {
         assert_eq!(StageKind::ORDER.first(), Some(&StageKind::CgroupJoin));
         let _ = take();
         let report = reapply_restrictions(restrictions(std::process::id())).expect("ok");
-        assert_eq!(take(), expected);
+        assert_eq!(taken(), expected);
         assert!(report.into_complete().is_ok());
         let _ = crate::exec::rlimits::testing::take_sets();
     }
@@ -1434,7 +1468,7 @@ mod tests {
         let report = reapply_restrictions(r).expect("ok");
         assert_eq!(report.supplementary_groups(), Some(Cleared { cleared: 4 }));
         assert_eq!(
-            take(),
+            taken(),
             vec![
                 "setgroups_before_join",
                 "rlimits",
@@ -1461,15 +1495,27 @@ mod tests {
         );
         assert_eq!(
             e.message,
-            "the rlimits of the exec target are empty; refusing to exec without rlimits"
+            "the rlimits of the exec target are incomplete; refusing to exec without all rlimits"
         );
         assert_eq!(e.violation, None);
-        assert_eq!(take(), Vec::<&str>::new());
+        assert_eq!(taken(), Vec::<&str>::new());
         assert_eq!(
             require_rlimits(&Rlimits::default()).unwrap_err().stage,
             IsolationStage::Rlimits
         );
-        require_rlimits(&one_rlimit()).unwrap();
+        // 15 種（1 種欠け）も、何も適用する前に拒否する（#1467）。
+        let fifteen = Rlimits::new(full_rlimits().iter().skip(1).copied().collect()).expect("set");
+        assert_eq!(fifteen.len(), 15);
+        let mut r = restrictions(std::process::id());
+        r.rlimits = fifteen.clone();
+        let e = reapply_restrictions(r).unwrap_err();
+        assert_eq!(
+            (e.code, e.stage),
+            (ErrorCode::FailedPrecondition, IsolationStage::Rlimits)
+        );
+        assert_eq!(taken(), Vec::<&str>::new());
+        assert!(require_rlimits(&fifteen).is_err());
+        require_rlimits(&full_rlimits()).unwrap();
     }
 
     /// SUP-6・SEC-1・REPAIR-3・TASK-163 追補（#1460）: 観測用の経路は rlimit の空集合と capability 削減の省略を
@@ -1481,7 +1527,7 @@ mod tests {
         r.rlimits = Rlimits::default();
         let report =
             reapply_inner(r, ReapplyMode::ObservationWithoutCapabilityDrop).expect("observation");
-        assert_eq!(take(), vec!["no_new_privs", "landlock", "seccomp"]);
+        assert_eq!(taken(), vec!["no_new_privs", "landlock", "seccomp"]);
         assert_eq!(report.rlimits_applied(), 0);
         assert_eq!(report.supplementary_groups(), None);
         assert_eq!(
@@ -1505,7 +1551,7 @@ mod tests {
         )
         .expect("observation");
         assert_eq!(
-            take(),
+            taken(),
             vec!["rlimits", "no_new_privs", "landlock", "seccomp"]
         );
         let _ = crate::exec::rlimits::testing::take_sets();
@@ -1524,7 +1570,7 @@ mod tests {
         let e = reapply_restrictions(restrictions(std::process::id())).expect_err("rlimit");
         assert_eq!(e.stage, IsolationStage::Rlimits);
         assert_eq!(e.code, ErrorCode::PermissionDenied);
-        assert_eq!(take(), vec!["rlimits"]);
+        assert_eq!(taken(), vec!["rlimits"]);
         let _ = crate::exec::rlimits::testing::take_sets();
     }
 
@@ -1538,7 +1584,7 @@ mod tests {
         let e = reapply_restrictions(restrictions(std::process::id())).expect_err("capability");
         assert_eq!(e.stage, IsolationStage::CapabilityDrop);
         assert_eq!(e.code, ErrorCode::PermissionDenied);
-        assert_eq!(take(), vec!["rlimits", "capability_drop"]);
+        assert_eq!(taken(), vec!["rlimits", "capability_drop"]);
         let _ = crate::exec::rlimits::testing::take_sets();
     }
 
@@ -1563,7 +1609,7 @@ mod tests {
         assert_eq!(v.reason.as_str(), "exec_joined_namespace_mismatch");
         assert_eq!(v.kind.as_str(), "exec_target");
         assert_eq!(v.behavior_id, "SEC-1");
-        assert_eq!(take(), Vec::<&str>::new());
+        assert_eq!(taken(), Vec::<&str>::new());
         let _ = crate::exec::rlimits::testing::take_sets();
     }
 
@@ -1585,7 +1631,7 @@ mod tests {
         let v = e.violation.expect("violation recorded");
         assert_eq!(v.reason, ViolationReason::ExecJoinedPidNamespaceMismatch);
         assert_eq!(v.behavior_id, "SEC-1");
-        assert_eq!(take(), Vec::<&str>::new());
+        assert_eq!(taken(), Vec::<&str>::new());
         let _ = crate::exec::rlimits::testing::take_sets();
     }
 
@@ -1611,7 +1657,7 @@ mod tests {
         let v = e.violation.expect("violation recorded");
         assert_eq!(v.reason, ViolationReason::ExecJoinedNamespaceMismatch);
         assert_eq!(v.behavior_id, "SEC-1");
-        assert_eq!(take(), Vec::<&str>::new());
+        assert_eq!(taken(), Vec::<&str>::new());
         let _ = crate::exec::rlimits::testing::take_sets();
     }
 
@@ -1751,7 +1797,7 @@ mod tests {
         let v = e.violation.expect("violation recorded");
         assert_eq!(v.reason, ViolationReason::ExecJoinedCgroupMismatch);
         assert_eq!(v.behavior_id, "SEC-1");
-        assert_eq!(take(), Vec::<&str>::new());
+        assert_eq!(taken(), Vec::<&str>::new());
         let _ = crate::exec::rlimits::testing::take_sets();
     }
 
@@ -1769,7 +1815,7 @@ mod tests {
             e.violation.expect("violation").reason,
             ViolationReason::ExecJoinedNamespaceMismatch
         );
-        assert_eq!(take(), Vec::<&str>::new());
+        assert_eq!(taken(), Vec::<&str>::new());
     }
 
     /// SUP-6・TASK-163.4: 自プロセスの mount namespace の識別子は、`/proc/self/ns/mnt` の `stat` と一致する
@@ -1890,7 +1936,7 @@ mod tests {
         assert_eq!(v.reason.as_str(), "exec_root_not_container_rootfs");
         assert_eq!(v.kind.as_str(), "exec_target");
         assert_eq!(v.behavior_id, "SEC-1");
-        assert_eq!(take(), Vec::<&str>::new());
+        assert_eq!(taken(), Vec::<&str>::new());
         let _ = crate::exec::rlimits::testing::take_sets();
     }
 
@@ -1905,7 +1951,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(e.stage, IsolationStage::Validate);
         assert!(e.violation.is_none());
-        assert_eq!(take(), Vec::<&str>::new());
+        assert_eq!(taken(), Vec::<&str>::new());
     }
 
     /// SUP-6・SEC-1・TASK-163.3: ディレクトリの同一性は `st_dev`・`st_ino` で決まる。同じディレクトリを別々に
@@ -1949,7 +1995,7 @@ mod tests {
         let e = reapply_restrictions(restrictions(std::process::id())).expect_err("nnp fails");
         assert_eq!(e.stage, IsolationStage::NoNewPrivs);
         assert_eq!(e.code, ErrorCode::PermissionDenied);
-        assert_eq!(take(), vec!["rlimits", "capability_drop", "no_new_privs"]);
+        assert_eq!(taken(), vec!["rlimits", "capability_drop", "no_new_privs"]);
         let _ = crate::exec::rlimits::testing::take_sets();
     }
 
@@ -1965,7 +2011,7 @@ mod tests {
         assert_eq!(e.stage, IsolationStage::Landlock);
         assert_eq!(e.code, ErrorCode::FailedPrecondition);
         assert_eq!(
-            take(),
+            taken(),
             vec!["rlimits", "capability_drop", "no_new_privs", "landlock"]
         );
         let _ = crate::exec::rlimits::testing::take_sets();
@@ -1983,7 +2029,7 @@ mod tests {
         assert_eq!(e.stage, IsolationStage::Seccomp);
         assert_eq!(e.code, ErrorCode::Internal);
         assert_eq!(
-            take(),
+            taken(),
             vec![
                 "rlimits",
                 "capability_drop",
@@ -2006,7 +2052,7 @@ mod tests {
             e.message,
             "restrictions must be reapplied by the process that prepared them"
         );
-        assert_eq!(take(), Vec::<&str>::new());
+        assert_eq!(taken(), Vec::<&str>::new());
     }
 
     /// SUP-6・TASK-163.3: `Debug` は fd・ルール内容を出さず、pid だけを示す。

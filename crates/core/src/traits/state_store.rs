@@ -61,6 +61,14 @@
 //!     変えずに引き継ぐ（[`UpdateStateRequest`] には持たせない。supervisor の status 更新で label を消さない。
 //!     契約 8 と同じ形）。`get` / `list` で返す。plugin 実装も同じく往復させる。純粋なメタデータで、
 //!     分離・権限・cgroup 等の判断には使わない
+//! 11. [`StateRecord::rlimits`]（launch 時の rlimit の記録。`--ulimit` 相当の指定値に、指定の無い種別は
+//!     launch 時点の実効値を足した全 16 種。SUP-12・SUP-6・TASK-169 追補・#1467）は、`create` で
+//!     [`CreateStateRequest::with_rlimits`] の指定があればその値、なければ `None` で記録する。`update` は
+//!     [`UpdateStateRequest::with_rlimits`] の指定があれば置き換え（restart の再 launch で記録し直す余地）、
+//!     なければ既存の値を引き継ぐ（supervisor の status 更新で記録を消さないため。契約 9・10 と同じ形）。
+//!     `get` / `list` で返す。plugin 実装も同じく往復させる。ストアは集合の完全性を課さない
+//!     （任意の集合を往復させる）。完全性（16 種）の判定は exec 側の責務で、記録が無い・不完全なら
+//!     exec は `FailedPrecondition` で拒否する
 //!
 //! メソッドは同期（`&self`、`async fn` を使わない）にし、ジェネリクスも持たない。
 //! `ContainerRuntime`（TASK-4.1）と同じく dyn 互換（object safety）を保つ。
@@ -76,6 +84,7 @@ use std::path::{Path, PathBuf};
 
 use super::container_runtime::ContainerStatus;
 use super::types::{ContainerId, ErrorCode, TraitError};
+use crate::rlimits::Rlimits;
 
 /// コンテナ状態の作成・更新・取得・一覧・削除を抽象化する拡張点。
 ///
@@ -456,6 +465,8 @@ pub struct StateRecord {
     restart_count: u32,
     /// コンテナの label（契約 10。SUP-12・TASK-169.5.1）。
     annotations: Annotations,
+    /// launch 時の rlimit の記録（契約 11。SUP-12・SUP-6・TASK-169 追補・#1467）。
+    rlimits: Option<Rlimits>,
 }
 
 impl StateRecord {
@@ -484,7 +495,20 @@ impl StateRecord {
             health: None,
             restart_count: 0,
             annotations: Annotations::default(),
+            rlimits: None,
         })
+    }
+
+    /// launch 時の rlimit の記録を設定する（[`Self::rlimits`]）。ストア実装が create・update・読み込みで使う。
+    #[must_use]
+    pub fn with_rlimits(mut self, rlimits: Rlimits) -> Self {
+        self.rlimits = Some(rlimits);
+        self
+    }
+
+    /// launch 時の rlimit の記録を返す（契約 11）。`None` は記録が無いことを表し、exec は拒否する。
+    pub fn rlimits(&self) -> Option<&Rlimits> {
+        self.rlimits.as_ref()
     }
 
     /// label を設定する（[`Self::annotations`]）。ストア実装が create・読み込みで使う。
@@ -583,6 +607,7 @@ pub struct CreateStateRequest {
     cgroup_scope: Option<CgroupScope>,
     supervision: Option<SupervisionState>,
     annotations: Option<Annotations>,
+    rlimits: Option<Rlimits>,
 }
 
 impl CreateStateRequest {
@@ -602,7 +627,20 @@ impl CreateStateRequest {
             cgroup_scope: None,
             supervision: None,
             annotations: None,
+            rlimits: None,
         })
+    }
+
+    /// 記録する launch 時の rlimit を指定する（SUP-12・TASK-169 追補・#1467。契約 11）。未指定なら記録しない。
+    #[must_use]
+    pub fn with_rlimits(mut self, rlimits: Rlimits) -> Self {
+        self.rlimits = Some(rlimits);
+        self
+    }
+
+    /// 指定された rlimit の記録を返す（未指定なら `None`）。
+    pub fn rlimits(&self) -> Option<&Rlimits> {
+        self.rlimits.as_ref()
     }
 
     /// 記録する label を指定する（SUP-12・TASK-169.5.1。契約 10）。未指定なら空で作る。
@@ -670,6 +708,7 @@ pub struct UpdateStateRequest {
     expected_revision: StateRevision,
     supervision: Option<SupervisionState>,
     cgroup_scope: Option<CgroupScope>,
+    rlimits: Option<Rlimits>,
 }
 
 impl UpdateStateRequest {
@@ -680,7 +719,21 @@ impl UpdateStateRequest {
             expected_revision,
             supervision: None,
             cgroup_scope: None,
+            rlimits: None,
         }
+    }
+
+    /// 更新後の rlimit の記録を指定する（契約 11。SUP-12・TASK-169 追補・#1467）。
+    /// 未指定の update は既存の値を引き継ぐ。
+    #[must_use]
+    pub fn with_rlimits(mut self, rlimits: Rlimits) -> Self {
+        self.rlimits = Some(rlimits);
+        self
+    }
+
+    /// 指定された rlimit の記録を返す（未指定なら `None`。その場合は既存の値を引き継ぐ）。
+    pub fn rlimits(&self) -> Option<&Rlimits> {
+        self.rlimits.as_ref()
     }
 
     /// コンテナ用 cgroup を作る委譲スコープを **追記** する（TASK-32・OCI-6・CORE-3。契約 8）。
@@ -997,6 +1050,10 @@ mod tests {
             if let Some(a) = req.annotations() {
                 record = record.with_annotations(a.clone());
             }
+            // 契約 11: rlimit の記録は指定があればその値、なければ記録しない。
+            if let Some(r) = req.rlimits() {
+                record = record.with_rlimits(r.clone());
+            }
             records.insert(req.id().clone(), record.clone());
             Ok(record)
         }
@@ -1035,6 +1092,10 @@ mod tests {
             updated = updated.with_supervision(req.supervision().unwrap_or(current.supervision()));
             // 契約 10: label は update で変えずに引き継ぐ。
             updated = updated.with_annotations(current.annotations().clone());
+            // 契約 11: rlimit の記録は指定があれば置き換え、なければ引き継ぐ。
+            if let Some(r) = req.rlimits().or(current.rlimits()) {
+                updated = updated.with_rlimits(r.clone());
+            }
             records.insert(req.id().clone(), updated.clone());
             Ok(updated)
         }
@@ -1532,6 +1593,49 @@ mod tests {
             .update(&UpdateStateRequest::new(status, rec.revision()))
             .unwrap();
         assert_eq!(updated.annotations(), &labels);
+    }
+
+    /// SUP-12・TASK-169 追補・#1467: 契約 11（create で記録・指定なしの update は引き継ぎ・指定ありは置き換え）。
+    #[test]
+    fn sup12_task169_rlimits_round_trip_through_trait_store() {
+        use crate::rlimits::{Rlimit, RlimitKind};
+        let mk = |soft| {
+            Rlimits::new(vec![Rlimit::new(RlimitKind::Nofile, soft, 1500).unwrap()]).unwrap()
+        };
+        let store = StubStateStore::new();
+        let id = ContainerId::new("lim".to_string()).unwrap();
+        let none = store
+            .create(
+                &CreateStateRequest::new(
+                    ContainerStatus::created(ContainerId::new("nolim".to_string()).unwrap(), None),
+                    std::env::temp_dir(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(none.rlimits(), None);
+        let req = CreateStateRequest::new(
+            ContainerStatus::created(id.clone(), None),
+            std::env::temp_dir(),
+        )
+        .unwrap()
+        .with_rlimits(mk(700));
+        let rec = store.create(&req).unwrap();
+        assert_eq!(rec.rlimits(), Some(&mk(700)));
+        let kept = store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::stopped(id.clone(), Some(0)),
+                rec.revision(),
+            ))
+            .unwrap();
+        assert_eq!(kept.rlimits(), Some(&mk(700)));
+        let replaced = store
+            .update(
+                &UpdateStateRequest::new(ContainerStatus::stopped(id, Some(0)), kept.revision())
+                    .with_rlimits(mk(800)),
+            )
+            .unwrap();
+        assert_eq!(replaced.rlimits(), Some(&mk(800)));
     }
 
     /// TASK-30.3・OCI-6: `CgroupScope` はルート `/` と `/a/b` 形式だけを受理し、相対・空要素・`.`・`..`・

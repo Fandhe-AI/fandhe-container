@@ -155,7 +155,7 @@ jobs:
       matrix:
         # 1 要素の matrix（check-run 名の `(ubuntu-latest)` を保つため。上記コメント参照）
         os: [ubuntu-latest]
-    uses: Fandhe-AI/actions/.github/workflows/rust-base-ci.yml@latest
+    uses: Fandhe-AI/actions/.github/workflows/rust-base-ci.yml@ci/rust-base-ci-cache-save
     permissions:
       contents: read
     with:
@@ -183,6 +183,8 @@ jobs:
       # 条件式は不要になった
       cache: true
       cache-key-prefix: fandhe-container
+      # 検証用（マージしない）: 保存経路の確認のため一時的に PR でも保存する
+      cache-save: true
 
   # --------------------------------------------------
   # platform-ci（ネイティブのビルド・テスト・タイムアウト保護付き結合試験。REPAIR-7 ステージ 1〜3）

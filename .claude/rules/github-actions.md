@@ -82,7 +82,9 @@ reusable workflow の `rust-ci (ubuntu-latest) / cargo deny check`（約 120 秒
 
 ## キャッシュ方針
 
-Actions のキャッシュは本リポジトリの上限が **10 GB**（既定値のまま）で、超えると最終アクセスの古いものから追い出され（LRU）、7 日間アクセスの無いものは削除される。Org の Actions の予算は $10（超過で停止）で、リポジトリの上限を 10 GB より上げた場合は 10 GB を超えた分が 1 GB あたり月 $0.07 の課金になる。本リポジトリは上限を上げず、**10 GB の中でヒット率を保つ**ことを目的にする（上限の引き上げはリポジトリ設定の変更のためオーナー判断）。
+Actions のキャッシュはリポジトリあたり **10 GB** が上限（Org 設定も 10 GB）で、超えると最終アクセスの古いものから追い出され（LRU）、7 日間アクセスの無いものは削除される。Org の Actions の予算は **$0（超過不可）** のため、10 GB を超える上限は使えない（上げても 10 GB を超えた時点でキャッシュが読み取り専用になる）。**10 GB の中でヒット率を保つ**ことを目的にする。上限・予算の変更はユーザー判断。
+
+現状（2026-10-11、macOS の blob の削除後）: 約 4.8 GB・111 件。使っているのは下表の 3 種（すべて GitHub ホステッドの ubuntu runner）。
 
 | キャッシュ | 場所 | key | 中身・サイズ（2026-10-11） |
 | ---------- | ---- | --- | -------------------------- |
@@ -91,22 +93,29 @@ Actions のキャッシュは本リポジトリの上限が **10 GB**（既定�
 | `cargo-tools-Linux-*` | `platform-ci`（ubuntu のみ） | `scripts/versions.sh` のハッシュ | cargo-deny・cargo-about のバイナリ。10 MB |
 
 - **保存は main の push だけにし、PR は restore のみにする**（大きい blob が対象）。PR の cache は `refs/pull/<N>/merge` スコープに保存され、他の PR・main からは読めない。`Cargo.lock` を変えた PR や、main の保存より先に走った PR が main と同内容の blob を PR ごとに重複保存し、容量を消費する。`rust-ci` は reusable の `cache-save` 入力（`Fandhe-AI/actions` [#165](https://github.com/Fandhe-AI/actions/pull/165) で追加。`ci.yml` の `rust-ci` は `cache-save: ${{ github.ref == 'refs/heads/main' }}` を渡し済み）、自前の `actions/cache` は `actions/cache/restore` と、main だけで走る `actions/cache/save` に分ける。トレードオフ: PR は 2 回目以降の push でも自分の保存を使えず、main の blob からの部分復元になる。main への push が続くと古い実行は concurrency で取り消されて保存されないが、最後の実行が保存するため PR はその blob を読む
+- **入れる前・残す前に効果を測る**。キャッシュは復元にも時間がかかる。ジョブログで依存の再ビルド数（`Compiling` / `Checking` 行）・`downloaded` 件数・復元の秒数を見て、節約が復元時間を上回ることを確かめる。self-hosted runner ではツールチェーン・パッケージストア・`CARGO_TARGET_DIR` がジョブをまたいで残り、GitHub のキャッシュが無意味になることがある（他リポジトリの実例: mirror-ui は pnpm キャッシュの復元に 1 ジョブ平均 75 秒かけて `downloaded 0` だったため撤去、team-hub は `Swatinem/rust-cache` が保存する `./target` と runner の `CARGO_TARGET_DIR` が食い違い registry しか保存されていなかったため撤去）。本リポジトリで self-hosted を使う `codex / review` にはキャッシュを付けない
+- 自前の `actions/cache` で保存を main に限る書き方: restore は全イベントで `actions/cache/restore`（`id: <id>`）、保存は `actions/cache/save` に `if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.<id>.outputs.cache-hit != 'true'` と `key: ${{ steps.<id>.outputs.cache-primary-key }}` を付ける。`actions/setup-node` の `cache:` のような一体型は PR でも保存する点に注意する
 - 例外: 版だけで決まる小さいツールのバイナリ（`cargo-tools-Linux-*`）は既定の保存のままでよい。PR に重複が出るのは `scripts/versions.sh` を変えた PR だけで、main の `platform-ci` は concurrency の取り消しで保存まで届かないことがあるため、PR 側で保存できるほうが再ビルド（約 220 秒）を避けられる
 - **key には中身を決める入力だけを入れる**。SHA・`run_id`・日付など毎回変わる値を入れない（再利用されない blob が溜まる）。ハッシュの入力は必要なファイルに絞る（`**/Cargo.lock` は `.agents/skills/make/samples/**`（`.claude/skills` の symlink 経由も）や `poc/venus-decoder/jig` の `Cargo.lock` の変更でもキーを変える。#1758 でスキルのサンプルが入っただけで clippy・test・deny のキーが変わった。reusable は [#165](https://github.com/Fandhe-AI/actions/pull/165) でルートの `Cargo.lock` だけにした）。`target/` のようにコンパイラの版で中身が変わるものは key に rustc の版（`rustc -vV` の release・commit-hash）を入れる。`rust-toolchain.toml` は stable 追従のため runner イメージの更新で rustc が変わり、key に無いと旧 rustc の blob に exact hit し続けて依存を毎回全再ビルドし、exact hit のため保存もされない（#165 で対応）
 - `restore-keys` で前方一致の部分復元を必ず効かせる（key が変わっても cold にしない）。追い出しが起きても、最新の main の blob は毎回アクセスされるため LRU の最後まで残り、ヒットは続く
 - OS・ジョブをまたいで中身が同じなら key を共有する。中身が OS で変わるものは `runner.os` を入れる。使わなくなった key（2026-10-10 のジョブ再構成で `rust-ci` が ubuntu のみになった後の `fandhe-container-macOS-*`）は 7 日で消えるのを待つか、`gh cache delete` で消す（読むジョブが無いことを `ci.yml` で確かめてから消す）
-- 新しいキャッシュを足すときは、blob サイズ × key が変わる頻度（1 日あたり）× 7 日 で容量を見積もり、他のキャッシュと合わせて 10 GB に収まることを確かめる。復元時間が節約時間より長いジョブにはキャッシュを付けない
+- **サイズを抑える**: 1 世代の合計が 10 GB に余裕をもって収まるようにする。`rust-ci` は reusable 側が `CARGO_INCREMENTAL=0` と保存前の workspace メンバー成果物の prune を行う。自前で `target/` を cache するなら同じことを行い、CI 限定の `CARGO_PROFILE_DEV_DEBUG=line-tables-only` なども検討する
+- 新しいキャッシュを足すときは、blob サイズ × 種別 × OS × key が変わる頻度（1 日あたり）× 7 日 で容量を見積もり、他のキャッシュと合わせて 10 GB に収まることを確かめる。復元時間が節約時間より長いジョブにはキャッシュを付けない
+- ワークフローにキャッシュを追加・変更する PR では、効果の計測・保存を main に限ったこと・key の設計・サイズの見積もりを確認したことを PR 本文に書く
 
 計測方法:
 
 ```bash
 gh api repos/Fandhe-AI/fandhe-container/actions/cache/usage
+gh cache list -R Fandhe-AI/fandhe-container -L 100   # key・サイズ・ref
 gh api --paginate "repos/Fandhe-AI/fandhe-container/actions/caches?per_page=100" \
   --jq '.actions_caches[] | [.key, .ref, .size_in_bytes, .created_at, .last_accessed_at] | @tsv'
 # ジョブごとのヒット（exact は "Cache hit occurred on the primary key"、部分復元は
 # "Cache restored from key" が primary key と異なる、miss は "Cache not found"）と保存の有無
 gh api repos/Fandhe-AI/fandhe-container/actions/jobs/<job-id>/logs \
   | grep -E "Cache (restored from key|not found|saved with key|hit occurred)|Cache Size"
+# 不要になったキャッシュの削除（共有状態のため、読むジョブが無いことを確かめてから）
+gh cache delete <id> -R Fandhe-AI/fandhe-container
 ```
 
 2026-10-11 の実測（変更前。main の push 5 件・PR 14 件の `rust-ci` の clippy・test・deny 57 ステップ）:

@@ -7,7 +7,7 @@
 //! 引数なしで起動すると stdin の JSON-RPC 2.0（改行区切り）を EOF まで処理し、応答を stdout へ書く
 //! （`initialize` / `tools/list`。TASK-118.2・#465。処理本体は lib の `server`）。診断は stderr のみ。
 //!
-//! 終了コード: stdin の EOF まで正常処理は 0、stdin 読み込み失敗・stdout 書き込み失敗は 1
+//! 終了コード: stdin の EOF まで正常処理は 0、stdin 読み込み失敗・stdout 書き込み失敗・受信/送信の期限超過は 1
 //! （`UNAVAILABLE`）、引数ありは 2（`INVALID_ARGUMENT`）。引数の値は出力へ埋め込まない。
 //! 環境変数は読まない。
 //!
@@ -21,6 +21,12 @@ const READ_FAILED_JSON: &str =
     "{\"code\":\"UNAVAILABLE\",\"message\":\"failed to read request from stdin\"}";
 const WRITE_FAILED_JSON: &str =
     "{\"code\":\"UNAVAILABLE\",\"message\":\"failed to write response to stdout\"}";
+const READ_TIMEOUT_JSON: &str =
+    "{\"code\":\"DEADLINE_EXCEEDED\",\"message\":\"timed out reading request from stdin\"}";
+const WRITE_TIMEOUT_JSON: &str =
+    "{\"code\":\"DEADLINE_EXCEEDED\",\"message\":\"timed out writing response to stdout\"}";
+const ENCODE_FAILED_JSON: &str =
+    "{\"code\":\"INTERNAL\",\"message\":\"failed to encode response\"}";
 const INVALID_ARGUMENT_JSON: &str =
     "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"unexpected argument\"}";
 
@@ -40,9 +46,8 @@ fn main() -> ExitCode {
     if std::env::args_os().nth(1).is_some() {
         return reject_args();
     }
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    match serve(stdin.lock(), stdout.lock()) {
+    // 読み書きは serve 内の専用スレッドで行うため、'static な Stdin / Stdout を渡す（REPAIR-5）。
+    match serve(std::io::BufReader::new(std::io::stdin()), std::io::stdout()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(ServeError::Read(_)) => {
             stderr_line(READ_FAILED_JSON);
@@ -50,6 +55,18 @@ fn main() -> ExitCode {
         }
         Err(ServeError::Write(_)) => {
             stderr_line(WRITE_FAILED_JSON);
+            ExitCode::from(1)
+        }
+        Err(ServeError::ReadTimeout) => {
+            stderr_line(READ_TIMEOUT_JSON);
+            ExitCode::from(1)
+        }
+        Err(ServeError::WriteTimeout) => {
+            stderr_line(WRITE_TIMEOUT_JSON);
+            ExitCode::from(1)
+        }
+        Err(ServeError::Encode) => {
+            stderr_line(ENCODE_FAILED_JSON);
             ExitCode::from(1)
         }
     }
@@ -69,6 +86,18 @@ mod tests {
         assert_eq!(
             READ_FAILED_JSON,
             "{\"code\":\"UNAVAILABLE\",\"message\":\"failed to read request from stdin\"}"
+        );
+        assert_eq!(
+            READ_TIMEOUT_JSON,
+            "{\"code\":\"DEADLINE_EXCEEDED\",\"message\":\"timed out reading request from stdin\"}"
+        );
+        assert_eq!(
+            WRITE_TIMEOUT_JSON,
+            "{\"code\":\"DEADLINE_EXCEEDED\",\"message\":\"timed out writing response to stdout\"}"
+        );
+        assert_eq!(
+            ENCODE_FAILED_JSON,
+            "{\"code\":\"INTERNAL\",\"message\":\"failed to encode response\"}"
         );
         assert_eq!(
             WRITE_FAILED_JSON,

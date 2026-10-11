@@ -104,7 +104,16 @@ fn mcp1_initialize_then_tools_list_over_stdio() {
     );
     let out = run(&[], input.as_bytes());
     assert_eq!(out.status.code(), Some(0));
-    assert!(out.stderr.is_empty(), "stderr must be empty");
+    // REPAIR-4: stderr には要求ごとの構造化ログ 1 行 JSON（3 要求分）だけが出る。
+    let stderr = String::from_utf8(out.stderr).expect("stderr is UTF-8");
+    let logs: Vec<serde_json::Value> = stderr
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("log line is JSON"))
+        .collect();
+    let ops: Vec<&str> = logs.iter().filter_map(|l| l["op"].as_str()).collect();
+    assert_eq!(ops, ["initialize", "notification", "tools/list"]);
+    let results: Vec<&str> = logs.iter().filter_map(|l| l["result"].as_str()).collect();
+    assert_eq!(results, ["ok", "no_reply", "ok"]);
     let text = String::from_utf8(out.stdout).expect("stdout is UTF-8");
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 2, "stdout: {text}");

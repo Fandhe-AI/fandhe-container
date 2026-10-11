@@ -173,9 +173,12 @@ jobs:
       # トレードオフを埋める。値を上げる場合は scripts/versions.sh・Dockerfile 側も同時に
       # 更新し、3 箇所の整合をレビューで確認する）
       cargo-deny-version: "0.20.2"
-      # cargo レジストリ・target の cache（reusable 側のオプトイン入力。
-      # key は `**/Cargo.lock` のハッシュに加え `runner.os` を含む形で reusable
-      # workflow 側が OS ごとに分離する）。ホステッド runner は毎回まっさらなため、
+      # cargo レジストリ・target の cache（reusable 側のオプトイン入力）。clippy / test の key は
+      # reusable workflow 側が決める（ハッシュはルートの Cargo.lock だけ）:
+      # `<cache-key-prefix>-<runner.os>-{clippy,test}-v4-<rustc の release>-<commit-hash>-<hashFiles('Cargo.lock')>`
+      # key は Cargo.toml の `[profile]` 等を含まないため、それらを変えたら
+      # マージ後に main の `fandhe-container-Linux-{clippy,test}-v4-*` を削除する
+      # （github-actions.md「キャッシュ方針」）。ホステッド runner は毎回まっさらなため、
       # 無効のままだと各ジョブが依存クレートを毎回フルビルドすることになる。
       # cache-key-prefix は他リポジトリとの衝突回避のため本リポ名にする。
       # 以前は windows-latest のみ無効化していた（reusable の prune ステップが Windows で

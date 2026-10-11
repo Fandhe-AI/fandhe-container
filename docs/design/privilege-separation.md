@@ -104,7 +104,8 @@ rootful 時に、本リポのコードが行う特権操作と、それに要す
 - (c) では、ランチャーが ambient capability を付けて supervisor を exec するため、supervisor の実行ファイルの改変はそのままランタイム側の権限取得になる。supervisor の実行ファイル本体と、そこへ至る親ディレクトリのすべての要素を、root（または信頼するインストール所有者）所有かつ他ユーザー書き込み不可にする。symlink を辿る場合は、解決後の実体とその親ディレクトリにも同じ条件を課す
 - ランチャーは exec の直前に supervisor の実体を検証する。パスを `open` して得た fd に対し `fstat` で所有者・パーミッション（グループ・他者の書き込みビットが無いこと）・通常ファイルであることを確認し、`/proc/self/fd` 経由や `execveat`（fd 指定）で検証した同一の実体を exec する。検証と exec の間の差し替え（TOCTOU）を避けるため、パス文字列で検証して別途パスで exec する方式にしない。許可済みハッシュ・署名との照合の要否は PLUG-11 に合わせて実装時に決める（未確認）。検証に失敗した場合は 6 章に従い fail-closed とする
 - supervisor のパスは固定の絶対パスまたは同一インストール先からの相対解決に限り、`PATH` 探索や呼び出し元が与える任意パスを受け付けない（既定）
-- core dump・ptrace の可否（`PR_SET_DUMPABLE` 等）の扱いは実装時に決める（未確認）
+- core dump・ptrace の可否: `PR_SET_DUMPABLE=0` を `elevate` の前に設定する（#1719 で確定。昇格中の窓で同一 uid の別プロセスから ptrace・`/proc/<pid>/mem`・core dump を受けない）
+- 実装の対応（#1719。`crates/supervisor/src/launcher.rs`・`src/bin/fandhe-container-launcher.rs`）: 環境は `execveat` に渡す `envp` を許可リスト方式で新規に組む（固定の `PATH` のみ。`LD_*` を渡さない）。引数は supervisor と同じ `StartArgs::parse` で検証して転送する。supervisor のパスはランチャー自身の実体（`/proc/self/exe`）の親ディレクトリ + 固定名。パスは根から全要素を辿り、ディレクトリは root 所有・group / other 書き込み不可（sticky でも免除しない）、symlink は root 所有のみ許可して自前で解決する。最終ファイルは `open` した fd の `fstat` で通常ファイル・setuid / setgid 無し・group / other 書き込み不可・root 所有を確かめ（この順に最初の失敗を報告）、同じ fd を `execveat(AT_EMPTY_PATH)` で exec する。fd 0〜2 が閉じていれば結果チャネルを乗っ取られないため拒否し、fd 3 以降は閉じ、cwd は `/`。許可済みハッシュ・署名との照合は行わない（PLUG-11 との整合は 12 章に未確認として残す）
 
 ## 8. 配置の論点（本書では決めない）
 
@@ -149,7 +150,7 @@ TASK-171 の成果物は `crates/supervisor/src/privilege.rs`（仮称）だが�
 
 補足:
 
-- 方式非依存の純ロジック（必要最小集合・`/proc/<pid>/status` のパースと昇格結果の fail-closed 検証・縮退計画の算出。縮退後は uid・gid 0 と補助グループの残存も拒否し、補助グループは空のみ許可する。縮退計画は 5 章 4 のとおり uid 遷移がある場合に `PR_SET_KEEPCAPS` の設定と解除を対で含み、解除を最終手順とする。検証は `PR_GET_KEEPCAPS` の読み戻し結果を入力に取り、残存・未確認を拒否する）は `crates/supervisor/src/privilege.rs` に実装済み（TASK-171.1.2・#858）。縮退を実際に適用する `privilege::elevate`（単一スレッドの確認 → 方式の前提確認 → `plan_reduction` → `ReductionPlan::steps` の順に適用〔補助グループ消去・`setresgid`・bounding 削除・`PR_SET_KEEPCAPS`・`setresuid`・`capset`・ambient 載せ〕→ `PR_GET_KEEPCAPS` と `/proc/self/status` の読み戻し → `verify_elevation`）は TASK-171.1.3（#1475）で実装済み。どの段で失敗しても `Err` を返し、`Err` のときプロセスは部分的に縮退した状態にあるため、呼び出し元は exec も特権操作もせず非ゼロで終了する。目標の uid / gid は呼び出し元の real から決める。方式 (c) の file capability には最小集合に加えて、補助グループを持つ利用者向けに `CAP_SETGID`（effective）が要る。未実装は、fd 検証付き exec・引数 / 環境変数 / cwd / 継承 fd の入口検証・ランチャー bin（#1719）、file capability / setuid の付与（#1721）、子での ambient 解除（#537 以降）である。実機の縮退試験は `crates/supervisor/tests/privilege_elevate.rs`（`-- --ignored`。実行は #539）
+- 方式非依存の純ロジック（必要最小集合・`/proc/<pid>/status` のパースと昇格結果の fail-closed 検証・縮退計画の算出。縮退後は uid・gid 0 と補助グループの残存も拒否し、補助グループは空のみ許可する。縮退計画は 5 章 4 のとおり uid 遷移がある場合に `PR_SET_KEEPCAPS` の設定と解除を対で含み、解除を最終手順とする。検証は `PR_GET_KEEPCAPS` の読み戻し結果を入力に取り、残存・未確認を拒否する）は `crates/supervisor/src/privilege.rs` に実装済み（TASK-171.1.2・#858）。縮退を実際に適用する `privilege::elevate`（単一スレッドの確認 → 方式の前提確認 → `plan_reduction` → `ReductionPlan::steps` の順に適用〔補助グループ消去・`setresgid`・bounding 削除・`PR_SET_KEEPCAPS`・`setresuid`・`capset`・ambient 載せ〕→ `PR_GET_KEEPCAPS` と `/proc/self/status` の読み戻し → `verify_elevation`）は TASK-171.1.3（#1475）で実装済み。どの段で失敗しても `Err` を返し、`Err` のときプロセスは部分的に縮退した状態にあるため、呼び出し元は exec も特権操作もせず非ゼロで終了する。目標の uid / gid は呼び出し元の real から決める。方式 (c) の file capability には最小集合に加えて、補助グループを持つ利用者向けに `CAP_SETGID`（effective）が要る。ランチャー bin（入口検証・fd 検証付き `execveat`）は #1719 で実装済み（7 章の「実装の対応」）。未実装は、file capability / setuid の付与（#1721）、子での ambient 解除である。ambient を落とす箇所は、コンテナの子は core の制限段（capability 段で ambient を全消去）、supervisor の healthcheck コマンド実行は未実装（TASK-161.2・#495。実装時に子で ambient を落としてから exec する）。取りこぼしがないことの確認は実機検証（#538・#539）で行う。実機のランチャー試験は `crates/supervisor/tests/launcher_entry_real.rs`（`-- --ignored`）実機の縮退試験は `crates/supervisor/tests/privilege_elevate.rs`（`-- --ignored`。実行は #539）
 - setuid ビット・`setcap` の付与はインストール時の操作でコード外である
 - 事前承認の範囲は各 crate の `sys` モジュール内の syscall ラッパーに限られる（`elevate` のラッパーは `crates/supervisor/src/sys/linux.rs`。#1719 の `execveat` 等も同じ `sys` に足す）
 - 実機検証（sudo の `SIGKILL` 再現・昇格の実動作）は #538・#539 で扱い、本書の範囲外とする
@@ -168,4 +169,5 @@ TASK-171 の成果物は `crates/supervisor/src/privilege.rs`（仮称）だが�
 | file capabilities 付きバイナリの AppArmor 等の LSM 下の挙動 | 未確認 |
 | macOS・Windows（VM 内）で本方式が不要であること | 要確認（MAC・WIN 系ビヘイビア） |
 | rootless（CORE-6）経路との関係 | PoC 未検証 |
+| supervisor の hash / 署名照合の要否（PLUG-11 との整合） | 未確認（#1719 は所有権と書き込み権限のみで信頼を判断） |
 | 再検証条件 | 実機（root 権限・対象カーネル）で #538・#539 を実施するとき |

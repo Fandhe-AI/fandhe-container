@@ -13,7 +13,7 @@
 //! - どちらも失敗したら fail-closed にし、`sudo` へ黙ってフォールバックしない（設計書 6 章）
 //!
 //! # 呼び出し文脈・契約
-//! - 呼び出し元: 特権ランチャー（`fandhe-container-launcher`。#1719）が起動直後に単一スレッドで [`elevate`] を呼び、
+//! - 呼び出し元: 特権ランチャー（`fandhe-container-launcher`。`crate::launcher`。#1719）が起動直後に単一スレッドで [`elevate`] を呼び、
 //!   `Ok` のときだけ supervisor の exec へ進む。`Err` のときプロセスは部分的に縮退した状態にあり、
 //!   呼び出し元は exec も特権操作もせず非ゼロで終了する（bounding の削除は戻せないため巻き戻さない）
 //! - [`runtime_required_capabilities`] はランタイム側が一時的に保持する権限であり、コンテナへ渡す
@@ -24,8 +24,10 @@
 //!   `prctl(PR_GET_KEEPCAPS)` で読み戻した値を [`KeepCapsState`] として [`verify_elevation`] へ渡す
 //!
 //! # 本モジュールの範囲外（REPAIR-3。実装済みを装わない）
-//! - fd 検証付き exec（`execveat`・所有者 / 権限の検証）・引数 / 環境変数 / cwd / 継承 fd の入口検証・ランチャー bin: #1719
-//! - ambient は exec 後の子孫へ引き継がれる。healthcheck の exec など子での解除: #537 以降（設計書 5 章 5）
+//! - fd 検証付き exec（`execveat`・所有者 / 権限の検証）・引数 / 環境変数 / cwd / 継承 fd の入口検証・ランチャー bin:
+//!   `crate::launcher`（#1719。実装済み）
+//! - ambient は exec 後の子孫へ引き継がれる。コンテナの子は core の制限段で消すが、healthcheck の exec など
+//!   supervisor が起動する子での解除は TASK-161.2（#495）の実装時（設計書 5 章 5・10 章）
 //! - file capability / setuid ビットの付与（インストール）: #1721
 
 use std::fmt;

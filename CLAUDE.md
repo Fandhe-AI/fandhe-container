@@ -37,7 +37,7 @@ fandhe-container/
 ├── crates/                        # crate 名前空間は fandhe-container-*（Cargo.toml・src/lib.rs は TASK-1.3 雛形。本体は各 TASK）
 │   ├── io/                        #   I/O 共有層（バッチ write-back・フラッシュバリア・FS 正規化）
 │   ├── core/                      #   実行層（namespace・cgroups v2・seccomp/Landlock・rootless）
-│   ├── supervisor/                #   コンテナごとの軽量監視プロセス
+│   ├── supervisor/                #   コンテナごとの軽量監視プロセス（bin: fandhe-container-supervisor・特権ランチャー fandhe-container-launcher〔仮称。TASK-171 追補・#1719〕）
 │   ├── oci/ / cri/                #   OCI イメージ・ライフサイクル / CRI
 │   │   └── cri/proto/             #     cri-api の .proto（kubernetes/cri-api v0.37.1 無改変）と出典 README（TASK-56.2・CRI-3）
 │   ├── platform-macos/ / platform-windows/ / microvm/  # プラットフォーム層

@@ -1,4 +1,4 @@
-//! gRPC 基盤（`fandhe_container_plugin::grpc`）の結合試験（TASK-108.1・#453・PLUG-2・REPAIR-5・REPAIR-12）。
+//! gRPC 基盤（`fandhe_container_plugin::grpc`）の結合試験（TASK-108.1・#453・PLUG-2・MS-3・REPAIR-4・REPAIR-5・REPAIR-12）。
 //!
 //! protoc も `build.rs` も使わず、手書きの prost メッセージと Echo 風 unary サービスでサーバー起動・
 //! クライアント接続・graceful shutdown・各種タイムアウト・サイズ上限を機械照合する。TCP はテスト内の
@@ -14,8 +14,9 @@ use std::time::Duration;
 
 use fandhe_container_plugin::PluginErrorCode;
 use fandhe_container_plugin::grpc::{
-    GRPC_MAX_MESSAGE_BYTES, GrpcClientConfig, GrpcServerConfig, connect_channel, serve_router,
-    server_builder, status_to_plugin_error,
+    GRPC_MAX_MESSAGE_BYTES, GrpcClientConfig, GrpcServerConfig, call_with_deadline,
+    connect_channel, export_stats_json_lines, grpc_stats, serve_router, server_builder,
+    status_to_plugin_error,
 };
 use tonic::codegen::{BoxFuture, Service, http};
 use tonic::transport::server::TcpIncoming;
@@ -219,6 +220,78 @@ async fn oversized_message_rejected() {
             "{st:?}"
         );
         srv.stop.store(true, Ordering::SeqCst);
+    })
+    .await
+    .expect("watchdog");
+}
+
+/// 応答ヘッダ後の本文が来ない RPC も `call_with_deadline` の期限で Timeout になる（REPAIR-5）。
+#[tokio::test]
+async fn call_with_deadline_bounds_whole_rpc() {
+    tokio::time::timeout(WATCHDOG, async {
+        let srv = start(Duration::from_secs(5), GrpcServerConfig::new());
+        let ch = connect(srv.addr, &GrpcClientConfig::new()).await;
+        let started = std::time::Instant::now();
+        let e = call_with_deadline(say(ch, "slow".into()), Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Timeout, "{e:?}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        srv.stop.store(true, Ordering::SeqCst);
+    })
+    .await
+    .expect("watchdog");
+}
+
+/// shutdown 猶予を超えて居座る接続は強制的に閉じられ、Timeout で返る（REPAIR-5）。
+#[tokio::test]
+async fn shutdown_grace_expiry_force_closes_connections() {
+    tokio::time::timeout(WATCHDOG, async {
+        let cfg = GrpcServerConfig::new()
+            .with_shutdown_grace(Duration::from_millis(300))
+            .unwrap();
+        let srv = start(Duration::from_secs(8), cfg);
+        let ch = connect(srv.addr, &GrpcClientConfig::new()).await;
+        let inflight = tokio::spawn(say(ch.clone(), "stuck".into()));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        srv.stop.store(true, Ordering::SeqCst);
+        let r = tokio::time::timeout(Duration::from_secs(6), srv.task)
+            .await
+            .expect("server must stop in bounded time")
+            .unwrap();
+        let e = r.unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Timeout, "{e:?}");
+        assert!(e.message().contains("reclaimed=true"), "{e:?}");
+        // 強制停止で進行中の RPC も終わる。
+        let st = tokio::time::timeout(Duration::from_secs(5), inflight)
+            .await
+            .expect("client call must end")
+            .unwrap();
+        assert!(st.is_err());
+    })
+    .await
+    .expect("watchdog");
+}
+
+/// 記録した件数が JSON Lines に現れる（REPAIR-4）。他試験と並行のため下限で照合する。
+#[tokio::test]
+async fn stats_are_recorded_and_exported() {
+    tokio::time::timeout(WATCHDOG, async {
+        let srv = start(Duration::ZERO, GrpcServerConfig::new());
+        let ch = connect(srv.addr, &GrpcClientConfig::new()).await;
+        call_with_deadline(say(ch, "x".into()), Duration::from_secs(5))
+            .await
+            .unwrap();
+        srv.stop.store(true, Ordering::SeqCst);
+        let stats = grpc_stats();
+        let by = |op: &str| stats.iter().find(|s| s.op == op).unwrap().clone();
+        assert!(by("connect").success >= 1);
+        assert!(by("call").success >= 1);
+        let mut out = Vec::new();
+        export_stats_json_lines(&mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().count(), 3);
+        assert!(text.starts_with("{\"event\":\"grpc_op_stats\",\"op\":\"serve\""));
     })
     .await
     .expect("watchdog");

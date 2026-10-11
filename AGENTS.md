@@ -51,6 +51,7 @@ make test                   # cargo test --workspace（既定 feature）
 make doc                    # RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps（既定 feature。rustdoc 警告のゲート）
 make test-integration       # cargo test --workspace --test '*' --features fandhe-container-io/crash-test-server ＋ --bins（結合試験。integration test target が 0 件なら notice を出して成功終了する）
 make deny                   # cargo deny --locked check advisories bans licenses sources
+make install-cargo-about    # cargo-about 0.9.2 を固定導入（TASK-103.2。開発コンテナは導入済み）
 make third-party-licenses   # cargo about でサードパーティのライセンス表記を生成（TASK-103.1・OSS-5。cargo-about 未導入なら失敗。OUTPUT=<file> 任意。make ci には含めない）
 make third-party-licenses-selftest  # 上記スクリプトの自己テスト（スタブ cargo のみ）
 make ci                     # lint-docs + check-workspace-manifest + fmt-check + lint + test + doc + deny を一括実行
@@ -134,6 +135,7 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 | `poc-venus-jig-check` | `platform-ci`（PR は ubuntu・main は 3 OS）。PR の macOS 向けは `cross-target-check` が `aarch64-apple-darwin` で check / clippy） |
 | `deny-poc-venus-jig`（`deny` からも呼ぶ） | `platform-ci`（ubuntu のみ。結果が OS に依らない依存監査のため） |
 | `deny-license-fail-closed-selftest` | `platform-ci`（ubuntu のみ。cargo-deny の判定が OS に依らないため。TASK-90.2・OSS-4・OSS-5） |
+| `third-party-licenses-selftest`・`third-party-licenses` | `platform-ci`（ubuntu のみ。表記の生成結果が OS に依らないため。TASK-103.2・OSS-5） |
 | `plug4-core-invariance-selftest`・`cli-parity-selftest`・`cli-parity-native-reclaim-check`・`cli-parity-native-reclaim-selftest`・`vz-virtio-gpu-guest-check-selftest` | `platform-ci`（PR は ubuntu・main は 3 OS。Windows は Git Bash） |
 | `bench-check-selftest`・`bench-baseline-selftest`・`bench-check`・`bench-plugin-boundary`・`plugin-feature-size` | `bench-regression` |
 | （対応 target なし。`rustup target add aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc` の後に、`<target>` をこの 3 つに置き換えて `cargo check --workspace --all-targets --all-features --target <target>` と `cargo clippy --workspace --all-targets --all-features --target <target> -- -D warnings`。`aarch64-apple-darwin`・`x86_64-pc-windows-msvc` は加えて既定 feature の `cargo clippy --workspace --all-targets --target <target> -- -D warnings` と `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --target <target>`。venus 試験治具は `cargo check` / `cargo clippy --manifest-path poc/venus-decoder/jig/Cargo.toml --locked --all-targets --target aarch64-apple-darwin`〔clippy は `-- -D warnings`〕） | `cross-target-check` |

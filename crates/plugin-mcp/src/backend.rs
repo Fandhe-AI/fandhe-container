@@ -220,12 +220,15 @@ mod tests {
         }
     }
 
+    /// 一覧の試験用レコード。bundle は `StateRecord::new` の絶対パス検証を通すためだけの値で、読まない。
+    /// `/b` のような Unix 形式は Windows ではドライブ等の接頭辞が無く絶対パスにならないため、
+    /// 各 OS の一時ディレクトリの絶対パスを返す `temp_dir()` を使う（cli・supervisor の試験と同じ書き方）。
     fn record(n: usize) -> StateRecord {
         use fandhe_container_core::traits::ContainerStatus;
         let id = ContainerId::new(format!("c{n}")).unwrap();
         StateRecord::new(
             ContainerStatus::created(id, None),
-            std::path::PathBuf::from("/b"),
+            std::env::temp_dir().join("b"),
             fandhe_container_core::traits::StateRevision::from_raw(1),
         )
         .unwrap()

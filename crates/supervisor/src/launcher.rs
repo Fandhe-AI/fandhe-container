@@ -1,4 +1,4 @@
-//! 特権ランチャー（`fandhe-container-launcher`。仮称）の入口検証と起動処理（SUP-14・SEC-1・CORE-1・REPAIR-5・
+//! 特権ランチャー（`fandhe-container-launcher`）の入口検証と起動処理（SUP-14・SEC-1・CORE-1・REPAIR-5・
 //! TASK-171 追補・#1719・MS-9）。
 //!
 //! # 役割

@@ -48,7 +48,8 @@ const CDI_SPEC_ERROR_MESSAGE_MAX_BYTES: usize = 512;
 pub enum CdiSpecErrorCode {
     /// 構文・型・必須欠落・未知フィールド・重複キー。
     InvalidArgument,
-    /// 入力サイズ・深さ・ノード数・エイリアス展開などの上限超過。
+    /// 入力サイズ・深さ・ノード数・エイリアス展開などの上限超過、または集計で要求したデバイス名の
+    /// 件数・長さの上限超過。
     ResourceExhausted,
     /// spec ファイルが存在しない、または集計で指定したデバイスが spec に無い。
     NotFound,

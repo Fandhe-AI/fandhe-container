@@ -483,6 +483,38 @@ fn stat_error() -> CdiSpecError {
     CdiSpecError::new(CdiSpecErrorCode::Internal, "failed to stat CDI spec file")
 }
 
+/// 固定済みハンドルの `/proc/self/fd/N` を読み取り用に開き直す。
+///
+/// 対象ファイルの存在判定とは無関係なため、失敗は `NotFound` にせず常に `Internal` とする
+/// （`/proc` 欠落で実在する spec が不在扱いになり、呼び出し側が GPU 編集を飛ばすのを防ぐ。GPU-1）。
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "powerpc64",
+        target_arch = "s390x"
+    )
+))]
+fn reopen_via_proc(proc_path: &Path) -> Result<std::fs::File, CdiSpecError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut reopen = std::fs::OpenOptions::new();
+    reopen.read(true);
+    if let Some(flag) = OPEN_FLAGS {
+        reopen.custom_flags(flag);
+    }
+    reopen.open(proc_path).map_err(|_| {
+        CdiSpecError::new(
+            CdiSpecErrorCode::Internal,
+            "failed to reopen pinned CDI spec file via /proc",
+        )
+    })
+}
+
 /// 通常ファイルだけを開く。FIFO・デバイス等は拒否する（open / read の無期限停止とドライバ副作用を防ぐ）。
 ///
 /// Linux では `O_PATH` で対象を固定し（デバイスの open 処理は走らない）、`fstat` で通常ファイルと
@@ -512,12 +544,7 @@ fn open_regular_file(path: &Path) -> Result<std::fs::File, CdiSpecError> {
         return Err(not_regular_error());
     }
     let proc_path = std::path::PathBuf::from(format!("/proc/self/fd/{}", pinned.as_raw_fd()));
-    let mut reopen = std::fs::OpenOptions::new();
-    reopen.read(true);
-    if let Some(flag) = OPEN_FLAGS {
-        reopen.custom_flags(flag);
-    }
-    let file = reopen.open(&proc_path).map_err(|e| map_open_error(&e))?;
+    let file = reopen_via_proc(&proc_path)?;
     let meta = file.metadata().map_err(|_| stat_error())?;
     if !meta.is_file() || meta.dev() != pinned_meta.dev() || meta.ino() != pinned_meta.ino() {
         return Err(not_regular_error());
@@ -781,6 +808,29 @@ containerEdits:
     fn read_missing_file_is_not_found() {
         let e = read_cdi_spec_file(Path::new("/nonexistent/fandhe/cdi.yaml")).unwrap_err();
         assert_eq!(e.code(), CdiSpecErrorCode::NotFound);
+    }
+
+    /// GPU-1: `/proc` 再オープンの失敗は NotFound ではなく Internal（具体値）。
+    #[cfg(all(
+        target_os = "linux",
+        any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "arm",
+            target_arch = "aarch64",
+            target_arch = "riscv64",
+            target_arch = "powerpc64",
+            target_arch = "s390x"
+        )
+    ))]
+    #[test]
+    fn gpu1_proc_reopen_failure_is_internal_not_not_found() {
+        let e = reopen_via_proc(Path::new("/nonexistent-proc/self/fd/3")).unwrap_err();
+        assert_eq!(e.code(), CdiSpecErrorCode::Internal);
+        assert_eq!(
+            e.message(),
+            "failed to reopen pinned CDI spec file via /proc"
+        );
     }
 
     /// GPU-1: 通常ファイルは読め、デバイス（直接・symlink 経由）は InvalidArgument で拒否する。

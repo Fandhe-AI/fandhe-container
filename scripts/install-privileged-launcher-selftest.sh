@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# scripts/install-privileged-launcher.sh の自己テスト（TASK-171 追補・#1721・SUP-14・SEC-1・REPAIR-5・REPAIR-12）。
+# scripts/install-privileged-launcher.sh の自己テスト（TASK-171 追補・#1721・MS-9・SUP-14・SEC-1・REPAIR-5・REPAIR-12）。
 #
-# 役割: 実行のたびに mktemp -d 配下へスタブ（stat / mkdir / mktemp / dd / chown / chmod / setcap / getcap / ln / mv / rm / id）と
+# 役割: 実行のたびに mktemp -d 配下へスタブ（stat / mkdir / flock / mktemp / dd / chown / chmod / setcap / getcap / ln / mv / rm / id）と
 #   入力元・配置先を作り、終了コード・stdout / stderr・スタブ呼び出し記録・最終ファイルの中身とモードを具体値で照合する。
 #   root もホスト設定の変更も使わない（実機の root 実行と検証は人間担当: #538・#539）。インストーラ本体はテスト入口
 #   FANDHE_INSTALL_TEST_SANDBOX 経由で本番と同じ検査コードを通る。
@@ -12,6 +12,8 @@
 #   (3) インストーラの本文に、期限なしの外部コマンド・親シェルのファイル検査・配置先へのリダイレクトが無いことを静的に確かめる。
 #   経過秒はきつく照合しない（CI では他の自己テストと並列に走るため）。各実行を外側の timeout で包み、ハングしたまま
 #   残らないことだけを確かめる。
+# 排他の照合: 配置先のロックを別プロセスが持っている間は何も変えずに止まること、配置先・属性を変えるスタブの呼び出しが
+#   すべてロックを持ったまま行われること（スタブが呼び出しごとにロックの取得を試み、取れてしまったら記録する）を確かめる。
 # 呼び出し元: Makefile の `install-launcher-selftest` と CI の bench-regression ジョブ。
 # 1 件でも期待と異なれば非ゼロで終了する（fail-closed）。Linux・非 root 限定で、前提を満たさない環境では失敗する。
 
@@ -61,7 +63,11 @@ new_sandbox() {
   # 全スタブ共通の前処理: 呼び出し記録・期限つき実行の確認・n 回目の呼び出しへのハング / 失敗の注入。
   #   STUB_HANG / STUB_FAIL / STUB_HANG_AFTER は `<command>:<n>` の空白区切り（そのコマンドの n 回目の呼び出し）。
   #   STUB_HANG_AFTER は本来の処理を済ませてからハングする（「操作は効いたが応答が返らない」の再現）。
-  cat >"${SB}/stub-common.sh" <<'EOS'
+  #   STUB_HOOK_AT の呼び出しでは、本来の処理の前に ${sb}/hook.sh を実行する（実行の途中で配置先を外から変える再現）。
+  #   STUB_HOOK_AFTER_AT は本来の処理の後に実行する（検査と次の操作の間の差し替えの再現）。
+  # ロックの確認にはスタブではない実物の flock を使う（スタブを通すと呼び出し記録に混ざる）。
+  printf 'real_flock=%q\n' "$(PATH=/usr/bin:/bin command -v flock)" >"${SB}/stub-common.sh"
+  cat >>"${SB}/stub-common.sh" <<'EOS'
 sb="${FANDHE_INSTALL_TEST_SANDBOX}"
 name="${0##*/}"
 echo "${name} $*" >>"${sb}/calls.log"
@@ -69,6 +75,14 @@ echo "${name} $*" >>"${sb}/calls.log"
 parent=""
 read -r parent <"/proc/${PPID}/comm" || true
 [ "${parent}" = "timeout" ] || echo "${name} $*" >>"${sb}/unbounded.log"
+# 配置先・属性を変えるコマンドは、配置先のロック（<dest-dir>/.install.lock）をインストーラが持ったまま呼ばれる。
+# ロックファイルが無い・別の記述子から取れてしまう（＝誰も持っていない）なら、排他の外での変更として記録する。
+case "${name}" in
+  mktemp | dd | chown | chmod | setcap | ln | mv | rm)
+    lock="$(find "${sb}" -name .install.lock | head -n1)"
+    if [ -z "${lock}" ] || "${real_flock}" -n "${lock}" true; then echo "${name} $*" >>"${sb}/unlocked.log"; fi
+    ;;
+esac
 n="$(grep -c "^${name} " "${sb}/calls.log")"
 injected() { # <`command:n` の並び>
   local spec
@@ -81,6 +95,10 @@ hang() { # <記録に残す種別>
   echo "$1 ${name}:${n}" >>"${sb}/inject.log"
   exec sleep 120
 }
+if injected "${STUB_HOOK_AT:-}"; then
+  echo "hook ${name}:${n}" >>"${sb}/inject.log"
+  "${sb}/hook.sh"
+fi
 if injected "${STUB_HANG:-}"; then hang hang; fi
 if injected "${STUB_FAIL:-}"; then
   echo "fail ${name}:${n}" >>"${sb}/inject.log"
@@ -89,6 +107,13 @@ if injected "${STUB_FAIL:-}"; then
 fi
 # 本来の処理（実コマンド）を実行して終わる。STUB_HANG_AFTER の対象なら、処理を済ませてからハングする。
 finish() { # <実コマンド> [args...]
+  local finish_rc=0
+  if injected "${STUB_HOOK_AFTER_AT:-}"; then
+    "$@" || finish_rc=$?
+    echo "hook-after ${name}:${n}" >>"${sb}/inject.log"
+    "${sb}/hook.sh"
+    exit "${finish_rc}"
+  fi
   if injected "${STUB_HANG_AFTER:-}"; then
     "$@" || exit $?
     hang hang-after
@@ -102,7 +127,7 @@ if [ "${1:-}" = "-u" ]; then echo "${STUB_UID:-0}"; exit 0; fi
 exec /usr/bin/id "$@"
 EOS
   # 実コマンドへそのまま渡すスタブ（記録と注入だけを足す）。
-  for name in stat mkdir mktemp dd chmod ln mv rm; do
+  for name in stat mkdir flock mktemp dd chmod ln mv rm; do
     real="$(PATH=/usr/bin:/bin command -v "${name}")"
     cat >"${SB}/stubs/${name}" <<EOS
 #!/bin/bash
@@ -191,7 +216,14 @@ norm_log() {
 count_log() { grep -c -E "$1" "${SB}/calls.log" || true; }
 count_err() { grep -c -E "$1" "${SB}/err" || true; }
 stderr_head() { head -n1 "${SB}/err" | sed -E 's#^((error|warning): [a-z-]+:).*#\1#'; }
-dest_count() { find "${SB}/dest" -mindepth 1 | wc -l | tr -d ' '; }
+# 配置先の中のファイル数。ロックファイル（消さずに残す）は数えず、lock_state で別に照合する。
+dest_count() { find "${SB}/dest" -mindepth 1 ! -name .install.lock | wc -l | tr -d ' '; }
+# sandbox 内のロックファイルの状態（`<配置先からの相対パス>:<mode>`。無ければ none）。
+lock_state() {
+  local lock
+  lock="$(find "${SB}" -name .install.lock | head -n1)"
+  if [ -n "${lock}" ]; then echo "${lock#"${SB}"/}:$(stat -c %a "${lock}")"; else echo none; fi
+}
 launcher_content() { cat "${SB}/dest/fandhe-container-launcher" 2>/dev/null || echo "<missing>"; }
 supervisor_content() { cat "${SB}/dest/fandhe-container-supervisor" 2>/dev/null || echo "<missing>"; }
 backup_content() { cat "${SB}"/dest/.supervisor.bak.* 2>/dev/null || echo "<missing>"; }
@@ -213,6 +245,7 @@ eq "not-root: exit code" 3 "${rc}"
 eq "not-root: stderr code" "error: not-root:" "$(stderr_head)"
 eq "not-root: no mutating calls" 0 "$(count_log "${MUTATING}")"
 eq "not-root: dest untouched" 0 "$(dest_count)"
+eq "not-root: no lock file" none "$(lock_state)"
 rc=0
 env -u FANDHE_INSTALL_TEST_SANDBOX "${target}" --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" \
   --dest-dir "${SB}/dest" >"${SB}/out" 2>"${SB}/err" || rc=$?
@@ -229,6 +262,7 @@ untrusted_case() { # <name> <prep 関数>
   eq "$1: exit code" 3 "${rc}"
   eq "$1: stderr code" "error: untrusted-dest-dir:" "$(stderr_head)"
   eq "$1: no mutating calls" 0 "$(count_log "${MUTATING}")"
+  eq "$1: no lock file" none "$(lock_state)"
   eq "$1: stdout empty" "" "$(cat "${SB}/out")"
   if [ -d "${SB}/dest" ]; then
     eq "$1: old launcher unchanged" "OLD-LAUNCHER" "$(cat "${SB}/dest/fandhe-container-launcher")"
@@ -284,6 +318,8 @@ success_case() { # <name> <getcap format>
   eq "$1: setcap calls" "setcap ${CAPS} SB/dest/.launcher.TMP" "$(norm_log | grep '^setcap' || true)"
   eq "$1: no setuid chmod" 0 "$(count_log '^chmod 4755')"
   eq "$1: no leftover temp files" 2 "$(dest_count)"
+  eq "$1: lock file is private" "dest/.install.lock:600" "$(lock_state)"
+  eq "$1: every change ran under the lock" "" "$(cat "${SB}/unlocked.log" 2>/dev/null || true)"
 }
 success_case "setcap ok (old getcap format)" old
 success_case "setcap ok (new getcap format)" new
@@ -313,6 +349,47 @@ eq "dest created: mkdir calls" "mkdir -m 0755 -- SB/dest|mkdir -m 0755 -- SB/des
 eq "dest created: directory modes" "755 755 755" \
   "$(stat -c %a "${SB}/dest" "${SB}/dest/a" "${SB}/dest/a/b" | paste -sd' ' -)"
 eq "dest created: launcher content" "NEW-LAUNCHER" "$(cat "${SB}/dest/a/b/fandhe-container-launcher")"
+eq "dest created: lock file is private" "dest/a/b/.install.lock:600" "$(lock_state)"
+
+# --- 3b. 同じ配置先への並行インストールの排他 ---
+# 別のプロセスがロックを持っている間は、何も変えずに終了コード 3 で止まる。解放されれば更新できる。
+new_sandbox
+put_old_files
+: >"${SB}/dest/.install.lock"
+chmod 600 "${SB}/dest/.install.lock"
+exec 9>>"${SB}/dest/.install.lock"
+flock -n 9
+# shellcheck disable=SC2046
+run_install -- $(std_args)
+eq "lock held by another process: exit code" 3 "${rc}"
+eq "lock held by another process: stderr code" "error: install-locked:" "$(stderr_head)"
+eq "lock held by another process: stderr is one line" 1 "$(wc -l <"${SB}/err" | tr -d ' ')"
+eq "lock held by another process: no mutating calls" 0 "$(count_log "${MUTATING}")"
+eq "lock held by another process: files" "OLD-LAUNCHER OLD-SUPERVISOR" "$(launcher_content) $(supervisor_content)"
+eq "lock held by another process: file count" 2 "$(dest_count)"
+exec 9>&-
+# shellcheck disable=SC2046
+run_install -- $(std_args)
+eq "lock released: exit code" 0 "${rc}"
+eq "lock released: files" "NEW-LAUNCHER NEW-SUPERVISOR" "$(launcher_content) $(supervisor_content)"
+# ロックファイルが他の利用者から読める（読めるだけで flock を取れる）・通常ファイルでないときは、信頼できない配置先として止まる
+lock_untrusted_case() { # <name> <prep 関数>
+  new_sandbox
+  put_old_files
+  "$2"
+  # shellcheck disable=SC2046
+  run_install -- $(std_args)
+  eq "$1: exit code" 3 "${rc}"
+  eq "$1: stderr code" "error: untrusted-dest-dir:" "$(stderr_head)"
+  eq "$1: no mutating calls" 0 "$(count_log "${MUTATING}")"
+  eq "$1: files" "OLD-LAUNCHER OLD-SUPERVISOR" "$(launcher_content) $(supervisor_content)"
+}
+prep_lock_644() { : >"${SB}/dest/.install.lock"; chmod 644 "${SB}/dest/.install.lock"; }
+prep_lock_symlink() { : >"${SB}/lock-target"; chmod 600 "${SB}/lock-target"; ln -s "${SB}/lock-target" "${SB}/dest/.install.lock"; }
+prep_lock_dir() { mkdir "${SB}/dest/.install.lock"; }
+lock_untrusted_case "lock file readable by others" prep_lock_644
+lock_untrusted_case "lock file is a symlink" prep_lock_symlink
+lock_untrusted_case "lock file is a directory" prep_lock_dir
 
 # --- 4. xattr 非対応で setuid ---
 setuid_case() { # <name> <setcap mode> [env 代入]...
@@ -420,6 +497,59 @@ eq "SIGTERM mid-update (fresh): exit code" 143 "${rc}"
 eq "SIGTERM mid-update (fresh): outcome line" 1 "$(count_err '^warning: rolled-back: new supervisor removed ')"
 eq "SIGTERM mid-update (fresh): nothing installed" 0 "$(dest_count)"
 
+# 実行の途中で配置先が外から変えられた場合（ロックの外にいる root の操作）。スタブの呼び出しに合わせて hook.sh が変える。
+write_hook() { # <hook.sh の本文>
+  # hook.sh はスタブではなく実コマンドを使う（スタブを通すと呼び出し記録に混ざる）。
+  printf '#!/bin/bash\nPATH=/usr/bin:/bin\n%s\n' "$1" >"${SB}/hook.sh"
+  chmod +x "${SB}/hook.sh"
+}
+# 最初の確認の後に現れた supervisor も退避し、launcher の置換に失敗したら戻す（退避なしで上書きしない）
+new_sandbox
+# shellcheck disable=SC2016 # hook.sh の中で展開する
+write_hook 'printf "APPEARED\n" >"${FANDHE_INSTALL_TEST_SANDBOX}/dest/fandhe-container-supervisor"'
+# shellcheck disable=SC2046
+run_install STUB_HOOK_AT=dd:1 STUB_FAIL=mv:2 -- $(std_args)
+eq "supervisor appears mid-run: exit code" 1 "${rc}"
+eq "supervisor appears mid-run: stderr code" "error: install-failed:" "$(stderr_head)"
+eq "supervisor appears mid-run: outcome line" 1 "$(count_err '^warning: rolled-back: previous supervisor restored ')"
+eq "supervisor appears mid-run: files" "<missing> APPEARED" "$(launcher_content) $(supervisor_content)"
+eq "supervisor appears mid-run: file count" 1 "$(dest_count)"
+# 最初の確認の後に最終名が symlink になったら、置換せずに止まる
+new_sandbox
+put_old_files
+# shellcheck disable=SC2016 # hook.sh の中で展開する
+write_hook 'ln -sf "${FANDHE_INSTALL_TEST_SANDBOX}/src/launcher" "${FANDHE_INSTALL_TEST_SANDBOX}/dest/fandhe-container-launcher"'
+# shellcheck disable=SC2046
+run_install STUB_HOOK_AT=dd:1 -- $(std_args)
+eq "launcher becomes a symlink mid-run: exit code" 3 "${rc}"
+eq "launcher becomes a symlink mid-run: stderr code" "error: untrusted-dest-dir:" "$(stderr_head)"
+eq "launcher becomes a symlink mid-run: no rename" 0 "$(count_log '^mv ')"
+eq "launcher becomes a symlink mid-run: supervisor unchanged" "OLD-SUPERVISOR" "$(supervisor_content)"
+eq "launcher becomes a symlink mid-run: file count" 2 "$(dest_count)"
+# rename の直前に最終名がディレクトリになっても、その中へ移動せずに失敗する（mv -T）
+new_sandbox
+# shellcheck disable=SC2016 # hook.sh の中で展開する
+write_hook 'mkdir "${FANDHE_INSTALL_TEST_SANDBOX}/dest/fandhe-container-supervisor"'
+# shellcheck disable=SC2046
+run_install STUB_HOOK_AT=mv:1 -- $(std_args)
+eq "supervisor becomes a directory before rename: exit code" 1 "${rc}"
+eq "supervisor becomes a directory before rename: stderr code" "error: install-failed:" "$(stderr_head)"
+eq "supervisor becomes a directory before rename: nothing moved into it" 0 \
+  "$(find "${SB}/dest/fandhe-container-supervisor" -mindepth 1 | wc -l | tr -d ' ')"
+eq "supervisor becomes a directory before rename: file count" 1 "$(dest_count)"
+# 更新の途中で最終名の supervisor が消えていたら、退避ファイルを消さずにそこから戻す（唯一の写しを失わない）
+new_sandbox
+put_old_files
+# shellcheck disable=SC2016 # hook.sh の中で展開する
+write_hook 'rm -f "${FANDHE_INSTALL_TEST_SANDBOX}/dest/fandhe-container-supervisor"'
+# shellcheck disable=SC2046
+run_install STUB_HOOK_AT=mv:1 STUB_FAIL=mv:1 -- $(std_args)
+eq "supervisor vanishes during the update: exit code" 1 "${rc}"
+eq "supervisor vanishes during the update: stderr code" "error: install-failed:" "$(stderr_head)"
+eq "supervisor vanishes during the update: outcome line" 1 "$(count_err '^warning: rolled-back: previous supervisor restored ')"
+eq "supervisor vanishes during the update: files" "OLD-LAUNCHER OLD-SUPERVISOR" "$(launcher_content) $(supervisor_content)"
+eq "supervisor vanishes during the update: file count" 2 "$(dest_count)"
+
 new_sandbox
 run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --dest-dir "${SB}/dest/"
 eq "dest-dir trailing slash: exit code" 0 "${rc}"
@@ -433,6 +563,19 @@ mkfifo "${SB}/src/fifo"
 run_install -- --launcher "${SB}/src/fifo" --supervisor "${SB}/src/supervisor" --dest-dir "${SB}/dest"
 eq "fifo source: exit code" 3 "${rc}"
 eq "fifo source: stderr code" "error: invalid-source:" "$(stderr_head)"
+# 検査（stat）の直後に入力元が書き手のいない FIFO へ差し替えられると、親シェルの open が止まる。watchdog が期限で
+# 構造化エラーを出して本体を KILL する（終了コード 137）。本体が KILL されたことを知らせる bash の通知は捨てる。
+new_sandbox
+put_old_files
+# shellcheck disable=SC2016 # hook.sh の中で展開する
+write_hook 'rm -f "${FANDHE_INSTALL_TEST_SANDBOX}/src/launcher"; mkfifo "${FANDHE_INSTALL_TEST_SANDBOX}/src/launcher"'
+rc=0
+# shellcheck disable=SC2046
+(run_install STUB_HOOK_AFTER_AT=stat:1 "FANDHE_INSTALL_TEST_TIMEOUT_SECS=${SHORT_TIMEOUT}" -- $(std_args) && exit "${rc}") 2>/dev/null || rc=$?
+eq "source swapped to a fifo before open: exit code" 137 "${rc}"
+eq "source swapped to a fifo before open: stderr" "error: source-open-timeout: opening source timed out" "$(cat "${SB}/err")"
+eq "source swapped to a fifo before open: no mutating calls" 0 "$(count_log "${MUTATING}")"
+eq "source swapped to a fifo before open: files" "OLD-LAUNCHER OLD-SUPERVISOR" "$(launcher_content) $(supervisor_content)"
 
 # --- 6. 引数エラー・入力元・テスト入口 ---
 new_sandbox
@@ -523,7 +666,8 @@ eq "reference upgrade: rename count" 2 "$(grep -c '^mv ' "${ref_log}")"
 eq "reference upgrade: backup link count" 1 "$(grep -c '^ln ' "${ref_log}")"
 eq "reference upgrade: remove count" 1 "$(grep -c '^rm ' "${ref_log}")"
 eq "reference upgrade: temporary name count" 3 "$(grep -c '^mktemp ' "${ref_log}")"
-eq "reference upgrade: stubbed commands seen" "chmod chown dd getcap ln mktemp mv rm setcap stat" \
+eq "reference upgrade: every change ran under the lock" "" "$(cat "${SB}/unlocked.log" 2>/dev/null || true)"
+eq "reference upgrade: stubbed commands seen" "chmod chown dd flock getcap ln mktemp mv rm setcap stat" \
   "$(cut -d' ' -f1 "${ref_log}" | sort -u | paste -sd' ' -)"
 ref_specs=()
 while IFS= read -r spec; do ref_specs+=("${spec}"); done < <(awk '{c[$1]++; print $1 ":" c[$1]}' "${ref_log}")
@@ -562,7 +706,8 @@ extra_case launcher-renamed-then-hang old "STUB_HANG_AFTER=mv:2"
 extra_case cleanup-timeout-after-failure old STUB_SETCAP_MODE=eperm "STUB_HANG=rm:1"
 extra_case fresh-launcher-rename-timeout fresh "STUB_HANG=mv:2"
 extra_case fresh-restore-timeout fresh "STUB_FAIL=mv:2" "STUB_HANG=rm:1"
-extra_case fresh-indeterminate fresh "STUB_HANG=mv:2 stat:${ref_stat_after_mv2}"
+# 新規インストールでは退避ファイルの読み戻し（stat 1 回）が無いので、同じ stat は 1 つ前の番号になる。
+extra_case fresh-indeterminate fresh "STUB_HANG=mv:2 stat:$((ref_stat_after_mv2 - 1))"
 wait
 
 i=0
@@ -621,7 +766,7 @@ for name in "${extra_names[@]}"; do
       eq "${name}: exit code" 1 "${rc}"
       eq "${name}: stderr code" "error: install-failed:" "$(stderr_head)"
       eq "${name}: restore-failed line" \
-        "error: restore-failed: could not restore the previous supervisor (exit code $([ "${name}" = restore-timeout ] && echo TIMEOUT || echo 1)); it is kept at ${bak} and ${SB}/dest/fandhe-container-supervisor is the new one; restore with: mv -f -- ${bak} ${SB}/dest/fandhe-container-supervisor" \
+        "error: restore-failed: could not restore the previous supervisor (exit code $([ "${name}" = restore-timeout ] && echo TIMEOUT || echo 1)); it is kept at ${bak} and ${SB}/dest/fandhe-container-supervisor is the new one; restore with: mv -f -T -- ${bak} ${SB}/dest/fandhe-container-supervisor" \
         "$(err_line 2)"
       eq "${name}: stderr is two lines" 2 "$(wc -l <"${SB}/err" | tr -d ' ')"
       eq "${name}: files" "OLD-LAUNCHER NEW-SUPERVISOR" "$(launcher_content) $(supervisor_content)"
@@ -634,7 +779,7 @@ for name in "${extra_names[@]}"; do
       eq "${name}: exit code" 1 "${rc}"
       eq "${name}: stderr code" "error: operation-timeout:" "$(stderr_head)"
       eq "${name}: state-indeterminate line" 1 \
-        "$(sed -n 2p "${SB}/err" | grep -c "^error: state-indeterminate: .* kept at ${bak}; .* restore with: mv -f -- ${bak} ${SB}/dest/fandhe-container-supervisor; ")"
+        "$(sed -n 2p "${SB}/err" | grep -c "^error: state-indeterminate: .* kept at ${bak}; .* restore with: mv -f -T -- ${bak} ${SB}/dest/fandhe-container-supervisor; ")"
       eq "${name}: stderr is two lines" 2 "$(wc -l <"${SB}/err" | tr -d ' ')"
       eq "${name}: backup kept" "OLD-SUPERVISOR" "$(backup_content)"
       eq "${name}: supervisor not moved" "NEW-SUPERVISOR" "$(supervisor_content)"
@@ -688,7 +833,7 @@ for name in "${extra_names[@]}"; do
       eq "${name}: file count" 1 "$(dest_count)"
       ;;
     fresh-indeterminate)
-      check_bounded_case "${name}" "hang mv:2 hang stat:${ref_stat_after_mv2}"
+      check_bounded_case "${name}" "hang mv:2 hang stat:$((ref_stat_after_mv2 - 1))"
       eq "${name}: exit code" 1 "${rc}"
       eq "${name}: stderr code" "error: operation-timeout:" "$(stderr_head)"
       eq "${name}: state-indeterminate line" 1 \
@@ -700,15 +845,16 @@ for name in "${extra_names[@]}"; do
   esac
 done
 
-# 全ケースを通して、期限なしで呼ばれたスタブが 1 件も無いこと。
+# 全ケースを通して、期限なしで呼ばれたスタブ・ロックを持たずに行われた変更が 1 件も無いこと。
 eq "no stub ran outside timeout in any case" 0 "$(find "${root_tmp}" -name unbounded.log | wc -l | tr -d ' ')"
+eq "no change ran outside the lock in any case" 0 "$(find "${root_tmp}" -name unlocked.log | wc -l | tr -d ' ')"
 
 # --- 9. 期限: 本文の静的検査（REPAIR-5） ---
 # コメント行と行末コメントを除いた本文を対象にする。
 code="$(grep -v '^[[:space:]]*#' "${target}" | sed -E 's/[[:space:]]+#[[:space:]].*$//')"
 # 配置先・入力元に触る外部コマンドがコマンド位置（行頭・`;` `&` `|` `(` `{` `!` の直後・then / do / else・command / exec /
 # env / eval / xargs の後）に現れないこと。期限つきの経路（run_child・bounded・step）の引数としてだけ現れる。
-fs_cmds='(stat|mkdir|mktemp|dd|cp|cat|tee|install|chown|chmod|setcap|getcap|ln|mv|rm|rmdir|touch|readlink|realpath|ls|find|test)'
+fs_cmds='(stat|mkdir|flock|mktemp|dd|cp|cat|tee|install|chown|chmod|setcap|getcap|ln|mv|rm|rmdir|touch|readlink|realpath|ls|find|test)'
 eq "static: no file command outside the bounded runner" "" \
   "$(printf '%s\n' "${code}" | grep -n -E "(^|[;&|({!]|then|do|else|command|exec|env|eval|xargs)[[:space:]]*${fs_cmds}([[:space:]]|\$)" || true)"
 # timeout(1) の呼び出しは run_child の 2 行だけ（期限と猶予を必ず渡している）。
@@ -719,11 +865,17 @@ eq "static: no other timeout invocation" 2 "$(printf '%s\n' "${code}" | grep -c 
 # 親シェルのファイル検査（[ -e ] [ -f ] [ -d ] [ -L ] 等。-n と -z は文字列の検査なので除く）が無いこと。
 eq "static: no file test in the parent shell" "" \
   "$(printf '%s\n' "${code}" | grep -n -E '(\[|&&|\|\|)[[:space:]]+(![[:space:]]+)?-[a-mo-yA-Z][[:space:]]' || true)"
-# 親シェルが開くファイルは入力元の 1 か所（watchdog つきの open）だけ。/dev/null と fd の複製（<& >&）は対象外。
+# 親シェルが開くファイルは入力元とロックファイルの 2 か所（どちらも watchdog つきの open）だけ。/dev/null と fd の複製
+# （<& >&）は対象外。
 opens="$(printf '%s\n' "${code}" | sed 's#/dev/null##g' | grep -E '[<>][[:space:]]*"?(\$|/)' || true)"
-eq "static: the parent shell opens one file" 1 "$(printf '%s\n' "${opens}" | grep -c .)"
+eq "static: the parent shell opens two files" 2 "$(printf '%s\n' "${opens}" | grep -c .)"
 # shellcheck disable=SC2016 # インストーラ本文の文字列をそのまま探す
-eq "static: the only open is the watchdog-guarded source" 1 "$(printf '%s\n' "${opens}" | grep -c -F 'exec {fd}<"${path}"')"
+eq "static: one open is the source" 1 "$(printf '%s\n' "${opens}" | grep -c -F 'exec {fd}<"${path}"')"
+# shellcheck disable=SC2016 # インストーラ本文の文字列をそのまま探す
+eq "static: one open is the installation lock" 1 "$(printf '%s\n' "${opens}" | grep -c -F 'exec {LOCK_FD}>>"${LOCK_PATH}"')"
+# 親シェルの open は、どちらも watchdog の開始と停止の間にある。
+eq "static: both opens are guarded by the watchdog" 2 \
+  "$(printf '%s\n' "${code}" | grep -B1 -E '^[[:space:]]*\{ exec \{(fd|LOCK_FD)\}' | grep -c -E '^[[:space:]]*start_watchdog ')"
 
 if [ "${failures}" -ne 0 ]; then
   echo "FAIL: ${failures} check(s) failed" >&2

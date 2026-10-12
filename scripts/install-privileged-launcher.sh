@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 特権ランチャー（fandhe-container-launcher）と supervisor を固定の配置先へ置き、ランチャーにだけ file capability
-# を付与するインストールスクリプト（TASK-171 追補・#1721・SUP-14・SEC-1・PLUG-11・CORE-6）。
+# を付与するインストールスクリプト（TASK-171 追補・#1721・MS-9・SUP-14・SEC-1・PLUG-11・CORE-6）。
 #
 # 役割: #1454 の決定（2026-10-10）に従い、権限の付与は CLI ではなくこのスクリプト（またはパッケージの postinst）が
 #   root で行う。CLI は特権を持たず、`setup` は本スクリプトの手順を表示するだけ（#1722）。ランチャー側の実行時検証
@@ -11,12 +11,12 @@
 # 使い方: install-privileged-launcher.sh --launcher <file> --supervisor <file> [--dest-dir <絶対パス>]
 #   既定の配置先は /usr/local/libexec/fandhe-container。入力元は必須（root が作業ツリーの暗黙の既定パスを拾わないため）。
 # 終了コード: 0 成功 / 1 インストール操作の失敗（期限超過を含む） / 2 引数エラー / 3 前提不成立（root でない・Linux でない・
-#   配置先が信頼条件を満たさない・入力元が不正） / 129・130・143 HUP・INT・TERM による中断。
+#   配置先が信頼条件を満たさない・入力元が不正・同じ配置先へ別のインストールが進行中） / 129・130・143 HUP・INT・TERM による中断。
 # 出力: 成功は stdout に 1 行 `installed: method=file-capability|setuid dest-dir=<path>`。失敗は stderr の 1 行目に原因
 #   `error: <code>: <message>`（英語）。更新の途中で止まったときと後始末が残ったときだけ、結果を示す行が続く
 #   （どれも `error|warning: <code>: <message>` の 1 行）:
-#     warning: rolled-back        旧 supervisor へ戻した（新規インストールなら新 supervisor を消した。rename の前なら何もしていない）。
-#                                 置換済みのファイルは無い
+#     warning: rolled-back        旧 supervisor へ戻した（新規インストールなら新 supervisor を消した。最終名が旧 supervisor の
+#                                 ままと確かめられたら何もしない）。置換済みのファイルは無い
 #     error: restore-failed       旧 supervisor へ戻せなかった。退避ファイルを残し、場所と復元コマンドを示す
 #     error: state-indeterminate  launcher の置換が起きたか確かめられなかった。退避ファイルを残し、確かめ方を示す
 #     warning: replaced-unverified 2 つとも置換済みだが最後の読み戻しを終えていない（再実行で検証できる）
@@ -34,11 +34,17 @@
 #   capability なしとして扱う。この例外は setuid への切り替え条件（setcap の結果）を広げない。
 #   配置先は祖先を含む全要素が root 所有・g/o 書き込み不可でなければ、補修も上書きもせず止まる。置換は同一ディレクトリの
 #   一時ファイルで検証を済ませてから rename する。入力元は 1 回だけ開いた fd を検査して同じ fd から複製し、以降は複製に対して操作する。
-# 期限（REPAIR-5）: 配置先・入力元に触る外部コマンド（stat・mkdir・mktemp・dd・chown・chmod・setcap・getcap・ln・mv・rm）は
+# 排他: 配置先ごとのロックファイル `<dest-dir>/.install.lock`（root 所有・0600。消さずに残す）に flock(1) を取り、既存
+#   ファイルの確認から置換・復元・最後の読み戻しまでを 1 つのインストールだけが行う（2 つの置換は一組。並行する実行が
+#   launcher と supervisor を別々の版にしたり、他方の更新を旧版へ戻したりしない）。ロックは待たずに取り（flock -n）、取れなければ
+#   `error: install-locked`（終了コード 3）で何も変えずに止まる。ロックはプロセスの終了で必ず解放される（残骸で次回が
+#   止まらない）。0600 にするのは、読めるだけの利用者でも flock を取れてしまい、インストールを止められるため。
+# 期限（REPAIR-5）: 配置先・入力元に触る外部コマンド（stat・mkdir・flock・mktemp・dd・chown・chmod・setcap・getcap・ln・mv・rm）は
 #   例外なく run_child（timeout(1)。期限 30 秒・超過後 5 秒で KILL）を通す。timeout が無ければ実行前に拒否する。親シェルは
-#   ファイル検査（[ -e ] 等）も配置先へのリダイレクトも行わない（NFS / FUSE の停止で無期限に待つため）。唯一の例外は入力元の
-#   open で、watchdog が同じ期限で打ち切る（`error: source-open-timeout` を出して本体を KILL する。終了コード 137。この時点では
-#   何も作っていない）。それ以外の期限超過は `error: operation-timeout` で終了コード 1。超過した操作は「実行されたか不明」
+#   ファイル検査（[ -e ] 等）も配置先へのリダイレクトも行わない（NFS / FUSE の停止で無期限に待つため）。例外は入力元と
+#   ロックファイルの open の 2 か所で、watchdog が同じ期限で打ち切る（`error: source-open-timeout` / `lock-open-timeout` を
+#   出して本体を KILL する。終了コード 137。この時点では一時ファイルも置換も無い）。それ以外の期限超過は
+#   `error: operation-timeout` で終了コード 1。超過した操作は「実行されたか不明」
 #   として扱い、置換の成否は inode の読み戻しで確かめてから復元する（確かめられなければ state-indeterminate）。
 #   後始末と復元の間は INT・HUP・TERM を無視して完遂を優先する（各操作に期限があるので有限時間で終わる。子は TERM を無視した
 #   まま起動されるので、後始末中の期限超過は KILL までの猶予を含めて最大 35 秒）。期限超過 1 回のあとの後始末は最大 5 操作。
@@ -69,6 +75,8 @@ BAK_SUPERVISOR=""
 # 置換前に読んだ一時ファイルの inode（dev:inode）。期限超過・中断のあと、最終名が新しい実体かどうかの判定に使う。
 NEW_LAUNCHER_ID=""
 NEW_SUPERVISOR_ID=""
+# 退避を取った時点の旧 supervisor の inode（退避ファイルと同じ実体）。最終名が旧 supervisor のままかどうかの判定に使う。
+OLD_SUPERVISOR_ID=""
 # 進行段階。rename の前に「置換中」へ進めておき、rename が起きたか不明な間は起きた可能性があるものとして後始末する。
 #   precheck → staged（一時ファイル作成以降。置換済みのファイルは無い） → supervisor-replacing → mid-update（supervisor
 #   だけ置換済み） → launcher-replacing → committed（2 つとも置換済み）
@@ -209,9 +217,12 @@ remove_backup() {
 
 # 置換の途中（supervisor-replacing・mid-update・launcher-replacing）で止まったときに、旧 launcher と新 supervisor の
 # 組み合わせを残さないよう状態を確定する。EXIT trap から呼ばれる。rename が起きたか不明な段階では inode を読み戻して
-# 判定し、判定できないときは何も動かさず退避ファイルを残して確かめ方を示す。
+# 判定し、launcher の置換を判定できないときは何も動かさず退避ファイルを残して確かめ方を示す。
+# supervisor は「最終名が旧 supervisor の実体（退避ファイルと同じ inode）である」ことを確かめられたときだけ戻さずに
+# 退避ファイルを消す。それ以外（新しい実体・無い・別の実体・確かめられない）はすべて退避ファイルから戻す（退避ファイルが
+# 旧 supervisor の唯一の写しになっている可能性があるため、確かめずに消さない）。
 settle_update() {
-  local sup_state="yes"
+  local sup_is="may be"
   if [ "${PHASE}" = "launcher-replacing" ]; then
     replaced_state "${LAUNCHER_DST}" "${NEW_LAUNCHER_ID}"
     case "${REPLACED}" in
@@ -223,7 +234,7 @@ settle_update() {
       unknown)
         KEEP_BACKUP=1
         if [ -n "${BAK_SUPERVISOR}" ]; then
-          printf 'error: state-indeterminate: could not confirm whether %s was replaced; %s is the new supervisor and the previous one is kept at %s; if the launcher is still the previous one, restore with: mv -f -- %s %s; otherwise remove %s; or rerun the installer\n' \
+          printf 'error: state-indeterminate: could not confirm whether %s was replaced; %s is the new supervisor and the previous one is kept at %s; if the launcher is still the previous one, restore with: mv -f -T -- %s %s; otherwise remove %s; or rerun the installer\n' \
             "${LAUNCHER_DST}" "${SUPERVISOR_DST}" "${BAK_SUPERVISOR}" "${BAK_SUPERVISOR}" "${SUPERVISOR_DST}" "${BAK_SUPERVISOR}" >&2
         else
           printf 'error: state-indeterminate: could not confirm whether %s was installed; %s is the new supervisor and there was no previous one; if the launcher is missing, remove %s; or rerun the installer\n' \
@@ -232,28 +243,34 @@ settle_update() {
         return 0
         ;;
     esac
-  elif [ "${PHASE}" = "supervisor-replacing" ]; then
-    replaced_state "${SUPERVISOR_DST}" "${NEW_SUPERVISOR_ID}"
-    sup_state="${REPLACED}"
   fi
-  if [ "${sup_state}" = "no" ]; then
-    # supervisor の rename は起きていない。戻すものは無い。
-    PHASE="staged"
-    warn rolled-back "the supervisor had not been replaced yet; no installed file is replaced"
-    return 0
+  replaced_state "${SUPERVISOR_DST}" "${NEW_SUPERVISOR_ID}"
+  if [ "${REPLACED}" = "yes" ]; then
+    sup_is="is"
   fi
   if [ -n "${BAK_SUPERVISOR}" ]; then
-    if bounded mv -f -- "${BAK_SUPERVISOR}" "${SUPERVISOR_DST}"; then
+    if [ "${REPLACED}" = "no" ] && [ -n "${OLD_SUPERVISOR_ID}" ] && [ "${P_ID}" = "${OLD_SUPERVISOR_ID}" ]; then
+      # 最終名は旧 supervisor のまま（rename は起きていない）。退避ファイルは余分なリンクなので後始末で消してよい。
+      PHASE="staged"
+      warn rolled-back "the previous supervisor is still in place at ${SUPERVISOR_DST}; no installed file is replaced"
+      return 0
+    fi
+    if bounded mv -f -T -- "${BAK_SUPERVISOR}" "${SUPERVISOR_DST}"; then
       BAK_SUPERVISOR=""
       PHASE="staged"
       warn rolled-back "previous supervisor restored at ${SUPERVISOR_DST}; no installed file is replaced"
     else
       # 復元に失敗したら状態を消さない。退避ファイル（旧 supervisor）は削除せず、場所と復元コマンドを示す。
       KEEP_BACKUP=1
-      printf 'error: restore-failed: could not restore the previous supervisor (exit code %s); it is kept at %s and %s %s the new one; restore with: mv -f -- %s %s\n' \
-        "${BOUNDED_RC}" "${BAK_SUPERVISOR}" "${SUPERVISOR_DST}" "$([ "${sup_state}" = "yes" ] && printf 'is' || printf 'may be')" \
-        "${BAK_SUPERVISOR}" "${SUPERVISOR_DST}" >&2
+      printf 'error: restore-failed: could not restore the previous supervisor (exit code %s); it is kept at %s and %s %s the new one; restore with: mv -f -T -- %s %s\n' \
+        "${BOUNDED_RC}" "${BAK_SUPERVISOR}" "${SUPERVISOR_DST}" "${sup_is}" "${BAK_SUPERVISOR}" "${SUPERVISOR_DST}" >&2
     fi
+    return 0
+  fi
+  # 旧 supervisor が無かった（新規）。最終名が新しい実体でないと確かめられたら触らない（自分が置いたものではない）。
+  if [ "${REPLACED}" = "no" ]; then
+    PHASE="staged"
+    warn rolled-back "the new supervisor had not been installed yet; nothing is installed"
   elif bounded rm -f -- "${SUPERVISOR_DST}"; then
     PHASE="staged"
     warn rolled-back "new supervisor removed from ${SUPERVISOR_DST}; nothing is installed"
@@ -355,31 +372,40 @@ export LC_ALL=C
 
 # 子プロセスの待機には必ず期限を設ける（REPAIR-5）。期限を保護できない環境では実行前に拒否する。
 command -v timeout >/dev/null 2>&1 || die 3 timeout-unavailable "timeout(1) is required to bound child processes"
+# 同じ配置先への並行インストールを排他できない環境でも実行前に拒否する。
+command -v flock >/dev/null 2>&1 || die 3 flock-unavailable "flock(1) is required to serialize installations"
 
 # 入力元は 1 回だけ開き、開いた fd 自体を検査して同じ fd から複製する（検査後の再オープンによる TOCTOU を作らない）。
 # パスが symlink でないこと（lstat）と、fd の指す実体（fstat）が通常ファイルで lstat と同一 inode であることを確かめる。
 SRC_FD_LAUNCHER=""
 SRC_FD_SUPERVISOR=""
+# 親シェル自身が行う open（入力元・ロックファイル）の期限。期限つきの子へ移せない（fd を親が持つ必要がある）ため、
+# 期限を過ぎたら構造化エラーを出して本体を KILL する watchdog を open の間だけ動かす。呼び出すのは一時ファイルも置換も
+# 無い段階に限る（KILL では EXIT trap が走らない）。待ちには外部コマンド（sleep）を使わず read の期限を使う: watchdog を
+# KILL で止めたあとに子プロセスが残らない（残った sleep が、呼び出し元から継承した fd を期限まで握り続けることがない）。
+# `<> <(:)` は読み書き両用で開いたパイプで、書き手が自分自身なので EOF にならず、read は期限まで待つ。
+WATCHDOG_PID=""
+start_watchdog() { # <code> <message>
+  ( read -r -t "${CHILD_TIMEOUT}" _ <> <(:) || true; printf 'error: %s: %s\n' "$1" "$2" >&2; kill -KILL $$ ) &
+  WATCHDOG_PID=$!
+}
 # watchdog を止めて回収する。TERM ではなく KILL を使う: fork 直後の子はまだ親の trap（TERM で exit → EXIT trap の
 # cleanup）を持っており、その間に届いた TERM は親の後始末を子で走らせたり、取りこぼされて watchdog が生き残ったりする
 # （生き残ると期限後に親の pid へ KILL を送る）。KILL は取りこぼされない。
-stop_watchdog() { # <pid>
-  kill -KILL "$1" 2>/dev/null || true
-  wait "$1" 2>/dev/null || true
+stop_watchdog() {
+  kill -KILL "${WATCHDOG_PID}" 2>/dev/null || true
+  wait "${WATCHDOG_PID}" 2>/dev/null || true
 }
 open_source() { # <path> <fd 番号を入れる変数名>
-  local path="$1" fd lst wd
+  local path="$1" fd lst
   # open 前に symlink でない通常ファイルであることを期限つき stat（lstat）で確かめ、FIFO 等を open せずに拒否する
   # （書き手のいない FIFO の open は無期限に止まる）。
   probe_path "${path}" || fail_bounded 3 invalid-source "stat of the source"
   [ "${P_KIND}" = "regular file" ] || die 3 invalid-source "source must be a readable regular file and not a symlink"
-  # 事前検査と open の間の差し替え競合に備え、open 自体にも期限を付ける（REPAIR-5）。この時点では一時ファイルも
-  # 更新途中の状態も無いため、期限切れは watchdog が KILL して終了してよい。watchdog の sleep は打ち切り後も残るので、
-  # 呼び出し元の stdout / stderr（パイプ）を握らせない。
-  ( sleep "${CHILD_TIMEOUT}" >/dev/null 2>&1 && { printf 'error: source-open-timeout: opening source timed out\n' >&2; kill -KILL $$; } ) &
-  wd=$!
-  { exec {fd}<"${path}"; } 2>/dev/null || { stop_watchdog "${wd}"; die 3 invalid-source "source must be a readable regular file and not a symlink"; }
-  stop_watchdog "${wd}"
+  # 事前検査と open の間の差し替え競合に備え、open 自体にも期限を付ける（REPAIR-5）。
+  start_watchdog source-open-timeout "opening source timed out"
+  { exec {fd}<"${path}"; } 2>/dev/null || { stop_watchdog; die 3 invalid-source "source must be a readable regular file and not a symlink"; }
+  stop_watchdog
   probe_path "${path}" || fail_bounded 3 invalid-source "stat of the source"
   lst="${P_KIND} ${P_ID}"
   probe_path "/proc/self/fd/${fd}" -L || fail_bounded 3 invalid-source "stat of the opened source"
@@ -428,19 +454,63 @@ for comp in ${comps[@]+"${comps[@]}"}; do
   check_dir "${cur}"
 done
 
+# 配置先のロックを取る（冒頭の「排他」）。ここから終了まで、同じ配置先を触るインストールはこのプロセスだけになる。
+# ロックファイルは信頼条件を確かめた配置先の中に置く。symlink を追わないよう open の前に lstat で種別を確かめ、
+# open した fd の実体が同じ inode の通常ファイルで、信頼する所有者・g/o から読み書き不可であることを確かめてから
+# flock を取る。flock は待たない（-n）。取れないときの終了コードは実装によって他の失敗と区別できないため、
+# 期限超過以外の失敗はすべて「ロックを取れなかった」として止まる（fail-closed）。
+LOCK_PATH="${DEST_DIR}/.install.lock"
+LOCK_FD=""
+take_install_lock() {
+  local old_umask lst
+  probe_path "${LOCK_PATH}" || fail_bounded 3 untrusted-dest-dir "stat of ${LOCK_PATH}"
+  if [ "${P_KIND}" != "missing" ]; then
+    is_regular || die 3 untrusted-dest-dir "installation lock is not a regular file: ${LOCK_PATH}"
+  fi
+  old_umask="$(umask)"
+  umask 077
+  start_watchdog lock-open-timeout "opening the installation lock timed out"
+  { exec {LOCK_FD}>>"${LOCK_PATH}"; } 2>/dev/null || { stop_watchdog; die 1 install-failed "cannot open the installation lock ${LOCK_PATH}"; }
+  stop_watchdog
+  umask "${old_umask}"
+  probe_path "${LOCK_PATH}" || fail_bounded 3 untrusted-dest-dir "stat of ${LOCK_PATH}"
+  lst="${P_KIND} ${P_ID}"
+  probe_path "/proc/self/fd/${LOCK_FD}" -L || fail_bounded 3 untrusted-dest-dir "stat of the opened installation lock"
+  if [ "${lst}" != "${P_KIND} ${P_ID}" ] || ! is_regular; then
+    die 3 untrusted-dest-dir "installation lock is not a regular file: ${LOCK_PATH}"
+  fi
+  [ "${P_UID}" = "${TRUSTED_UID}" ] || die 3 untrusted-dest-dir "installation lock is not owned by the trusted owner: ${LOCK_PATH}"
+  [ $(( 8#${P_MODE} & 8#077 )) -eq 0 ] || die 3 untrusted-dest-dir "installation lock is accessible by group/other: ${LOCK_PATH}"
+  if ! bounded flock -n "${LOCK_FD}"; then
+    if timed_out; then
+      fail_bounded 1 install-failed "flock of ${LOCK_PATH}"
+    fi
+    die 3 install-locked "could not take the installation lock ${LOCK_PATH} (exit code ${BOUNDED_RC}); another installation may be in progress for ${DEST_DIR}"
+  fi
+}
+take_install_lock
+
 LAUNCHER_DST="${DEST_DIR}/${LAUNCHER_NAME}"
 SUPERVISOR_DST="${DEST_DIR}/${SUPERVISOR_NAME}"
+# 最終名にあるものが「無い」か「symlink でない通常ファイル」であることを確かめ、旧 supervisor の有無を SUPERVISOR_EXISTS へ
+# 入れる。一時ファイルを作る前（早く止まるため）と、退避を取る直前（その間に現れた・変わったものを見落とさないため）の
+# 2 回呼ぶ。ロックを持っているので、その間に変えうるのはこのスクリプト以外の root の操作だけ。
 SUPERVISOR_EXISTS=0
-for dst in "${LAUNCHER_DST}" "${SUPERVISOR_DST}"; do
-  probe_path "${dst}" || fail_bounded 3 untrusted-dest-dir "stat of ${dst}"
-  if [ "${P_KIND}" = "missing" ]; then
-    continue
-  fi
-  is_regular || die 3 untrusted-dest-dir "existing destination is not a regular file: ${dst}"
-  if [ "${dst}" = "${SUPERVISOR_DST}" ]; then
-    SUPERVISOR_EXISTS=1
-  fi
-done
+check_destinations() {
+  local dst
+  SUPERVISOR_EXISTS=0
+  for dst in "${LAUNCHER_DST}" "${SUPERVISOR_DST}"; do
+    probe_path "${dst}" || fail_bounded 3 untrusted-dest-dir "stat of ${dst}"
+    if [ "${P_KIND}" = "missing" ]; then
+      continue
+    fi
+    is_regular || die 3 untrusted-dest-dir "existing destination is not a regular file: ${dst}"
+    if [ "${dst}" = "${SUPERVISOR_DST}" ]; then
+      SUPERVISOR_EXISTS=1
+    fi
+  done
+}
+check_destinations
 
 # libcap の getcap 出力（新旧書式）から、パスより後ろの能力名リスト（ソート済み）とフラグを取り出す。
 sorted_caps() { # <カンマ区切り>
@@ -564,14 +634,21 @@ NEW_SUPERVISOR_ID="${P_ID}"
 # 失敗しうる処理がすべて成功してから最終名へ置換する（rename は xattr を保つ）。2 つの置換は一組として扱い、
 # 途中で止まったら旧ファイル（ハードリンクで保持した退避。xattr も保つ）へ戻す（旧 launcher と新 supervisor の不整合を残さない）。
 # 退避の名前は mktemp で一意に取り、その名前をハードリンクで置き換える（以前の実行が残した退避ファイルと衝突しない）。
+# 退避を取る直前に最終名を確かめ直し、取った退避が通常ファイルであることと inode を読み戻す。
+check_destinations
 if [ "${SUPERVISOR_EXISTS}" -eq 1 ]; then
   make_temp ".supervisor.bak" BAK_SUPERVISOR
   bounded ln -f -- "${SUPERVISOR_DST}" "${BAK_SUPERVISOR}" || fail_bounded 1 install-failed "backup of the previous supervisor"
+  probe_path "${BAK_SUPERVISOR}" || fail_bounded 1 install-failed "stat of ${BAK_SUPERVISOR}"
+  is_regular || die 1 install-failed "backup of the previous supervisor is not a regular file: ${BAK_SUPERVISOR}"
+  OLD_SUPERVISOR_ID="${P_ID}"
 fi
+# mv は -T（最終名をディレクトリとして扱わない）で呼ぶ。最終名がディレクトリやディレクトリへの symlink に変わっていても、
+# その中へ移動せずに失敗する。
 # rename の前に段階を進める。rename の完了と段階の更新の間で中断・期限超過が起きても、EXIT trap が inode を読み戻して
 # 置換の有無を確かめるので、信号を無視する区間は要らない（期限つきの子を信号無視のまま待たない）。
 PHASE="supervisor-replacing"
-bounded mv -f -- "${TMP_SUPERVISOR}" "${SUPERVISOR_DST}" || fail_bounded 1 install-failed "rename of the supervisor"
+bounded mv -f -T -- "${TMP_SUPERVISOR}" "${SUPERVISOR_DST}" || fail_bounded 1 install-failed "rename of the supervisor"
 TMP_SUPERVISOR=""
 PHASE="mid-update"
 # ここから launcher の rename 完了までが更新途中。置換後の supervisor を読み戻して検証する間に中断・失敗しても、
@@ -579,7 +656,7 @@ PHASE="mid-update"
 expect_no_caps "${SUPERVISOR_DST}"
 expect_stat "${SUPERVISOR_DST}" 755
 PHASE="launcher-replacing"
-bounded mv -f -- "${TMP_LAUNCHER}" "${LAUNCHER_DST}" || fail_bounded 1 install-failed "rename of the launcher"
+bounded mv -f -T -- "${TMP_LAUNCHER}" "${LAUNCHER_DST}" || fail_bounded 1 install-failed "rename of the launcher"
 TMP_LAUNCHER=""
 PHASE="committed"
 remove_backup

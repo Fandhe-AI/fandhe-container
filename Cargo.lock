@@ -312,8 +312,10 @@ dependencies = [
 name = "fandhe-container-cri"
 version = "0.0.0"
 dependencies = [
+ "fandhe-container-oci",
  "prost",
  "protox",
+ "tokio",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

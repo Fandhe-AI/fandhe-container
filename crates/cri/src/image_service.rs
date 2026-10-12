@@ -5,13 +5,16 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! - 実装済みなのは `ListImages`・`ImageStatus` のみ。`PullImage`（TASK-61.3）・
-//!   `RemoveImage`・`StreamImages`・`ImageFsInfo` は `Unimplemented` を返す
+//! - 実装済みなのは `ListImages`・`ImageStatus`・`PullImage`（TASK-61.3）。`RemoveImage`・`StreamImages`・
+//!   `ImageFsInfo` は `Unimplemented` を返す。`PullImage` は [`ImagePuller`] を注入されたときだけ動き、
+//!   未設定なら従来どおり `Unimplemented`。取り込み手順と限界は [`crate::image_pull`] を参照
+//! - `PullImage` の `sandbox_config` は無視する（Pod 単位の pull 文脈は未対応）。同時 pull 数は
+//!   [`DEFAULT_MAX_CONCURRENT_PULLS`] で制限する（blocking プールの枯渇防止。REPAIR-5）
 //! - `ImageStatus` の `verbose` 拡張情報（`info`）は未実装で常に空。OCI image config 由来の情報は
-//!   TASK-61.3・TASK-183（OCI-7）で追加する。取り込み時の digest 検証（OCI-1）は PullImage の責務で、
+//!   TASK-183（OCI-7）で追加する。取り込み時の digest 検証（OCI-1）は PullImage の責務で、
 //!   本 RPC は読み取りのみ
-//! - [`InMemoryImageStore`] はプロセス内メモリのスタブ。永続キャッシュと oci の pull 経路
-//!   （digest 検証つきの取り込み。OCI-1）への接続は TASK-61.3・TASK-183（OCI-7）で置き換える
+//! - [`InMemoryImageStore`] はプロセス内メモリのスタブ。永続キャッシュと展開後サイズの算出は
+//!   TASK-183（OCI-7）で置き換える
 //! - エラーの正規化（TASK-97.2）は未適用。リスナー・メッセージ長上限・UDS の権限と peer credential
 //!   検証（PLUG-12）は plugin-cri（TASK-108）の責務
 //!
@@ -21,11 +24,15 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tonic::codegen::tokio_stream::Empty;
 use tonic::{Request, Response, Status};
 
+use crate::image_pull::{
+    ImagePuller, PullRequest, canonical_reference, credentials_from_auth_config,
+};
 use crate::instrument::{CriOpKind, CriOpRecorder, CriOpTimer, NoopCriOpRecorder};
 use crate::runtime::v1::{self, image_service_server::ImageService};
 
@@ -37,6 +44,8 @@ pub const MAX_IMAGE_FIELD_BYTES: usize = 1024;
 pub const MAX_REFS_PER_IMAGE: usize = 64;
 /// `ListImages` のフィルタ文字列の最大バイト数。
 pub const MAX_FILTER_BYTES: usize = MAX_IMAGE_FIELD_BYTES;
+/// 同時に実行できる `PullImage` 数の既定上限（超過は `RESOURCE_EXHAUSTED`。blocking プールの枯渇防止）。
+pub const DEFAULT_MAX_CONCURRENT_PULLS: usize = 4;
 /// `username` の最大バイト数。
 const MAX_USERNAME_BYTES: usize = 256;
 
@@ -58,6 +67,8 @@ pub enum ImageStoreError {
     ConflictingUser,
     /// 内部状態の破損（ロックの毒化）。
     Poisoned,
+    /// このストアは書き込みに対応していない（`upsert` 未実装の実装）。
+    ReadOnly,
 }
 
 impl fmt::Display for ImageStoreError {
@@ -70,6 +81,7 @@ impl fmt::Display for ImageStoreError {
             ImageStoreError::StoreFull => "image store is full",
             ImageStoreError::ConflictingUser => "image uid and username are mutually exclusive",
             ImageStoreError::Poisoned => "image store is unavailable",
+            ImageStoreError::ReadOnly => "image store is read-only",
         })
     }
 }
@@ -141,6 +153,26 @@ impl ImageRecord {
         self
     }
 
+    /// 同一 ID の既存レコード（`self`）へ新しい取り込み結果を統合する（タグ・digest は和集合、size は新しい値、
+    /// uid・username・pinned は既存を保つ）。件数が [`MAX_REFS_PER_IMAGE`] を超えるなら `TooManyRefs`。
+    fn merged_with(mut self, newer: ImageRecord) -> Result<Self, ImageStoreError> {
+        fn union(base: &mut Vec<String>, extra: Vec<String>) {
+            for item in extra {
+                if !base.contains(&item) {
+                    base.push(item);
+                }
+            }
+        }
+        union(&mut self.repo_tags, newer.repo_tags);
+        union(&mut self.repo_digests, newer.repo_digests);
+        if self.repo_tags.len() > MAX_REFS_PER_IMAGE || self.repo_digests.len() > MAX_REFS_PER_IMAGE
+        {
+            return Err(ImageStoreError::TooManyRefs);
+        }
+        self.size = newer.size;
+        Ok(self)
+    }
+
     /// イメージ ID。
     pub fn id(&self) -> &str {
         &self.id
@@ -184,6 +216,14 @@ pub trait ImageStore: Send + Sync {
     /// 複数一致する場合は id 完全一致を優先し、なければ ID 昇順で最初の 1 件（決定的）。
     /// 未取得は `Ok(None)`（`ImageStatus` が `image: None` の成功応答に写す。TASK-61.2）。
     fn get(&self, reference: &str) -> Result<Option<ImageRecord>, ImageStoreError>;
+
+    /// 取り込み結果を登録する（`PullImage`。TASK-61.3）。
+    ///
+    /// 同一 ID があればタグ・digest を統合し、他イメージが持つ同一タグは外す（タグは 1 イメージにだけ付く）。
+    /// 既定実装は書き込み非対応で [`ImageStoreError::ReadOnly`] を返す。
+    fn upsert(&self, _record: ImageRecord) -> Result<(), ImageStoreError> {
+        Err(ImageStoreError::ReadOnly)
+    }
 }
 
 /// プロセス内メモリのスタブ実装（REPAIR-3。永続キャッシュは TASK-61.3・TASK-183 で置換）。
@@ -232,12 +272,55 @@ impl ImageStore for InMemoryImageStore {
         }
         Ok(images.values().find(|r| r.matches(reference)).cloned())
     }
+
+    fn upsert(&self, record: ImageRecord) -> Result<(), ImageStoreError> {
+        let mut images = self.images.lock().map_err(|_| ImageStoreError::Poisoned)?;
+        let merged = match images.get(record.id()) {
+            Some(existing) => existing.clone().merged_with(record)?,
+            None if images.len() >= MAX_IMAGES => return Err(ImageStoreError::StoreFull),
+            None => record,
+        };
+        for (id, other) in images.iter_mut() {
+            if id != merged.id() {
+                other.repo_tags.retain(|t| !merged.repo_tags.contains(t));
+            }
+        }
+        images.insert(merged.id.clone(), merged);
+        Ok(())
+    }
 }
 
-/// `ImageService` の実装（現状 `ListImages`・`ImageStatus`。TASK-61.1・61.2）。
+/// 実行中の pull 数を数え、`Drop` で確実に解放するガード（上限超過は取得できない）。
+struct PullSlot {
+    counter: Arc<AtomicUsize>,
+}
+
+impl PullSlot {
+    fn acquire(counter: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
+        let previous = counter.fetch_add(1, Ordering::AcqRel);
+        if previous >= max {
+            counter.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Self {
+            counter: Arc::clone(counter),
+        })
+    }
+}
+
+impl Drop for PullSlot {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// `ImageService` の実装（`ListImages`・`ImageStatus`・`PullImage`。TASK-61.1・61.2・61.3）。
 pub struct CriImageService {
     store: Arc<dyn ImageStore>,
     recorder: Arc<dyn CriOpRecorder>,
+    puller: Option<Arc<dyn ImagePuller>>,
+    pulls_in_flight: Arc<AtomicUsize>,
+    max_concurrent_pulls: usize,
 }
 
 impl CriImageService {
@@ -264,7 +347,67 @@ impl CriImageService {
         store: Arc<dyn ImageStore>,
         recorder: Arc<dyn CriOpRecorder>,
     ) -> Self {
-        Self { store, recorder }
+        Self {
+            store,
+            recorder,
+            puller: None,
+            pulls_in_flight: Arc::new(AtomicUsize::new(0)),
+            max_concurrent_pulls: DEFAULT_MAX_CONCURRENT_PULLS,
+        }
+    }
+
+    /// `PullImage` の取り込み実装を注入する（未設定の間は `PullImage` が `Unimplemented`。TASK-61.3）。
+    pub fn with_puller(mut self, puller: Arc<dyn ImagePuller>) -> Self {
+        self.puller = Some(puller);
+        self
+    }
+
+    /// 同時 `PullImage` 数の上限を変える（0 は全拒否になるため 1 に切り上げる）。
+    pub fn with_max_concurrent_pulls(mut self, max: usize) -> Self {
+        self.max_concurrent_pulls = max.max(1);
+        self
+    }
+
+    /// `PullImage` の本体（検証 → 資格情報変換 → 同時数制限 → blocking 実行 → ストア登録）。
+    ///
+    /// 文言にイメージ名・資格情報を含めない。`sandbox_config` は無視する。
+    async fn pull(&self, request: v1::PullImageRequest) -> Result<v1::PullImageResponse, Status> {
+        let Some(puller) = self.puller.clone() else {
+            return Err(Status::unimplemented("pull_image"));
+        };
+        let reference = request.image.map(|spec| spec.image).unwrap_or_default();
+        if reference.is_empty() {
+            return Err(Status::invalid_argument(
+                "image reference must not be empty",
+            ));
+        }
+        if reference.len() > MAX_FILTER_BYTES {
+            return Err(Status::invalid_argument("image reference is too long"));
+        }
+        let credentials = match request.auth {
+            Some(auth) => credentials_from_auth_config(&auth).map_err(Status::from)?,
+            None => None,
+        };
+        let slot = PullSlot::acquire(&self.pulls_in_flight, self.max_concurrent_pulls)
+            .ok_or_else(|| Status::resource_exhausted("too many concurrent image pulls"))?;
+        let pull_request = PullRequest {
+            reference,
+            credentials,
+        };
+        let pulled = tokio::task::spawn_blocking(move || {
+            // スロットはタスクの完了（成否・panic）まで保持する。
+            let _slot = slot;
+            puller.pull(&pull_request)
+        })
+        .await
+        .map_err(|_| Status::internal("image pull task failed"))?
+        .map_err(Status::from)?;
+        let record = pulled.into_record().map_err(Status::from)?;
+        let image_ref = record.id().to_owned();
+        self.store
+            .upsert(record)
+            .map_err(|_| Status::internal("image store failure"))?;
+        Ok(v1::PullImageResponse { image_ref })
     }
 
     /// `ImageStatus` の本体。参照検証 → ストア解決 → 未取得は `image: None` の成功応答（CRI-4。api.proto の ImageStatus は未存在で nil Image）。
@@ -280,10 +423,15 @@ impl CriImageService {
         if reference.len() > MAX_FILTER_BYTES {
             return Err(Status::invalid_argument("image reference is too long"));
         }
-        let record = self
-            .store
-            .get(&reference)
-            .map_err(|_| Status::internal("image store failure"))?;
+        let store_err = |_| Status::internal("image store failure");
+        let mut record = self.store.get(&reference).map_err(store_err)?;
+        if record.is_none()
+            && let Some(canonical) = canonical_reference(&reference)
+            && canonical != reference
+        {
+            // 短縮名（`alpine`・`alpine:3`）は PullImage と同じ規則で正規化して再照会する（CRI-4）。
+            record = self.store.get(&canonical).map_err(store_err)?;
+        }
         Ok(v1::ImageStatusResponse {
             image: record.map(|r| r.to_proto()),
             info: Default::default(),
@@ -304,9 +452,14 @@ impl CriImageService {
             .store
             .list()
             .map_err(|_| Status::internal("image store failure"))?;
+        let canonical = canonical_reference(&wanted);
         let images = records
             .iter()
-            .filter(|r| wanted.is_empty() || r.matches(&wanted))
+            .filter(|r| {
+                wanted.is_empty()
+                    || r.matches(&wanted)
+                    || canonical.as_deref().is_some_and(|c| r.matches(c))
+            })
             .map(ImageRecord::to_proto)
             .collect();
         Ok(v1::ListImagesResponse { images })
@@ -358,14 +511,20 @@ impl ImageService for CriImageService {
         result.map(Response::new)
     }
 
-    // 以降は TASK-61.3（PullImage）などで順次実装する（REPAIR-3）。
-
+    /// レジストリからイメージをローカルキャッシュへ取り込む（CRI-4・OCI-1・TASK-61.3）。
+    ///
+    /// 応答の `image_ref` はイメージ ID（`ListImages`・`ImageStatus` の `Image.id` と一致）。
     async fn pull_image(
         &self,
-        _request: Request<v1::PullImageRequest>,
+        request: Request<v1::PullImageRequest>,
     ) -> Result<Response<v1::PullImageResponse>, Status> {
-        Err(Status::unimplemented("pull_image"))
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::PullImage);
+        let result = self.pull(request.into_inner()).await;
+        timer.finish_with(&result);
+        result.map(Response::new)
     }
+
+    // 以降は順次実装する（REPAIR-3）。
 
     async fn remove_image(
         &self,
@@ -442,6 +601,34 @@ mod tests {
         );
         assert_eq!(store.insert(rec("id0", "t2", "d", 2)), Ok(()));
         assert_eq!(store.len(), MAX_IMAGES);
+    }
+
+    /// CRI-4: upsert は同一 ID のタグを統合し、他イメージの同一タグを外し、件数上限を守る。
+    #[test]
+    fn cri4_upsert_merges_moves_tags_and_bounds() {
+        let store = InMemoryImageStore::new();
+        let a = |tags: &[&str]| {
+            ImageRecord::new(
+                "sha256:a",
+                tags.iter().map(|t| (*t).to_owned()).collect(),
+                vec![],
+                3,
+            )
+            .expect("record")
+        };
+        store.upsert(a(&["t1"])).expect("first");
+        store.upsert(a(&["t2", "t1"])).expect("merge");
+        let got = store.get("sha256:a").expect("get").expect("some");
+        assert_eq!(got.repo_tags, vec!["t1".to_owned(), "t2".to_owned()]);
+
+        let b = ImageRecord::new("sha256:b", vec!["t1".into()], vec![], 4).expect("record");
+        store.upsert(b).expect("steal tag");
+        let a_after = store.get("sha256:a").expect("get").expect("some");
+        assert_eq!(a_after.repo_tags, vec!["t2".to_owned()]);
+
+        let many: Vec<String> = (0..MAX_REFS_PER_IMAGE).map(|i| format!("m{i}")).collect();
+        let full = ImageRecord::new("sha256:a", many, vec![], 3).expect("record");
+        assert_eq!(store.upsert(full), Err(ImageStoreError::TooManyRefs));
     }
 
     struct Failing;

@@ -33,6 +33,7 @@ use crate::manifest::{
 };
 use crate::reference::{Digest, Reference, RegistryHost, Repository};
 use crate::tls;
+use sha2::{Digest as _, Sha256};
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -608,8 +609,15 @@ pub struct ResolvedManifest {
     pub manifest: ImageManifest,
     /// image index から選んだ場合の、選択エントリの digest（直接取得した場合は `None`）。
     pub selected_digest: Option<Digest>,
+    /// `manifest` の本文（生バイト列）の sha256。digest 参照・index 経由の選択エントリでは要求 digest と
+    /// 突合済み（不一致は `DataLoss`。OCI-1）。tag 直指定の単一 manifest では本文から計算した値で、
+    /// レジストリ応答が tag に対して正しいことまでは保証しない。
+    pub manifest_digest: Digest,
     /// image index / manifest list を経由して解決したか。
     pub from_index: bool,
+    /// index 経由の場合の、index 本文（生バイト列）の sha256。digest 参照では要求 digest と突合済み
+    /// （不一致は `DataLoss`。OCI-1）。直接取得した単一 manifest では `None`。
+    pub index_digest: Option<Digest>,
 }
 
 /// `Accept` に並べる manifest の `mediaType`（定数のみ）。
@@ -639,7 +647,7 @@ fn fetch_manifest_flow(
     if let Some(a) = &authorization {
         headers.push(("Authorization", a.as_str()));
     }
-    let fetch_one = |reference: &Reference| -> Result<ParsedManifest, OciError> {
+    let fetch_one = |reference: &Reference| -> Result<(ParsedManifest, Digest), OciError> {
         let url = endpoint.manifest_url(repository, reference);
         let resp = transport.get(&TransportRequest {
             url: &url,
@@ -652,21 +660,40 @@ fn fetch_manifest_flow(
         if resp.status != 200 {
             return Err(status_error(resp.status));
         }
-        parse_manifest(&resp.body, resp.content_type.as_deref())
+        // digest 参照は本文のハッシュと突合する（レジストリ応答は非信頼。OCI-1）。
+        let hex: String = Sha256::digest(&resp.body)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let actual = Digest::parse(&format!("sha256:{hex}"))?;
+        if let Reference::Digest(expected) = reference
+            && *expected != actual
+        {
+            return Err(OciError::new(
+                OciErrorCode::DataLoss,
+                "manifest digest mismatch",
+            ));
+        }
+        let parsed = parse_manifest(&resp.body, resp.content_type.as_deref())?;
+        Ok((parsed, actual))
     };
     match fetch_one(reference)? {
-        ParsedManifest::Image(manifest) => Ok(ResolvedManifest {
+        (ParsedManifest::Image(manifest), manifest_digest) => Ok(ResolvedManifest {
             manifest,
             selected_digest: None,
+            manifest_digest,
             from_index: false,
+            index_digest: None,
         }),
-        ParsedManifest::Index(index) => {
+        (ParsedManifest::Index(index), index_digest) => {
             let selected = select_manifest(&index, platform)?.digest.clone();
             match fetch_one(&Reference::Digest(selected.clone()))? {
-                ParsedManifest::Image(manifest) => Ok(ResolvedManifest {
+                (ParsedManifest::Image(manifest), manifest_digest) => Ok(ResolvedManifest {
                     manifest,
                     selected_digest: Some(selected),
+                    manifest_digest,
                     from_index: true,
+                    index_digest: Some(index_digest),
                 }),
                 _ => Err(OciError::new(
                     OciErrorCode::DataLoss,
@@ -1633,8 +1660,6 @@ mod tests {
     // ---- manifest 取得フローの照合（OCI-1・TASK-51.3・REPAIR-12。外部通信なし）----
 
     const HX: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-    const HA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const HB: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     fn image_body() -> String {
         format!(
@@ -1642,9 +1667,22 @@ mod tests {
         )
     }
 
+    /// arm64 用の image manifest（`image_body` と本文を変えて digest を分ける）。
+    fn image_body_arm() -> String {
+        image_body().replace(r#""size":2"#, r#""size":3"#)
+    }
+
+    fn sha_hex(body: &str) -> String {
+        Sha256::digest(body.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
     fn index_body() -> String {
+        let (ha, hb) = (sha_hex(&image_body()), sha_hex(&image_body_arm()));
         format!(
-            r#"{{"schemaVersion":2,"mediaType":"{MEDIA_TYPE_OCI_INDEX}","manifests":[{{"mediaType":"{MEDIA_TYPE_OCI_MANIFEST}","digest":"sha256:{HA}","size":1,"platform":{{"architecture":"amd64","os":"linux"}}}},{{"mediaType":"{MEDIA_TYPE_OCI_MANIFEST}","digest":"sha256:{HB}","size":1,"platform":{{"architecture":"arm64","os":"linux"}}}}]}}"#
+            r#"{{"schemaVersion":2,"mediaType":"{MEDIA_TYPE_OCI_INDEX}","manifests":[{{"mediaType":"{MEDIA_TYPE_OCI_MANIFEST}","digest":"sha256:{ha}","size":1,"platform":{{"architecture":"amd64","os":"linux"}}}},{{"mediaType":"{MEDIA_TYPE_OCI_MANIFEST}","digest":"sha256:{hb}","size":1,"platform":{{"architecture":"arm64","os":"linux"}}}}]}}"#
         )
     }
 
@@ -1692,6 +1730,7 @@ mod tests {
         let t = FakeTransport::new(vec![manifest_resp(200, &image_body())]);
         let r = fetch(&t, &bearer(300), "x86_64").expect("fetch");
         assert!(!r.from_index);
+        assert_eq!(r.index_digest, None);
         assert_eq!(r.selected_digest, None);
         assert_eq!(r.manifest.layers.len(), 1);
         let seen = t.seen.lock().expect("lock");
@@ -2065,13 +2104,16 @@ mod tests {
     /// OCI-1: index はホスト platform の digest で 2 回目の GET をする（amd64 / arm64 の双方）。
     #[test]
     fn manifest_index_resolves_platform() {
-        for (arch, want) in [("x86_64", HA), ("aarch64", HB)] {
+        for (arch, body) in [("x86_64", image_body()), ("aarch64", image_body_arm())] {
+            let want = sha_hex(&body);
             let t = FakeTransport::new(vec![
                 manifest_resp(200, &index_body()),
-                manifest_resp(200, &image_body()),
+                manifest_resp(200, &body),
             ]);
             let r = fetch(&t, &RegistryAuth::None, arch).expect("fetch");
             assert!(r.from_index);
+            assert!(r.index_digest.is_some());
+            assert_eq!(r.manifest_digest.as_str(), format!("sha256:{want}"));
             assert_eq!(
                 r.selected_digest.as_ref().map(|d| d.as_str().to_string()),
                 Some(format!("sha256:{want}"))
@@ -2083,6 +2125,43 @@ mod tests {
                 format!("https://registry-1.docker.io/v2/library/alpine/manifests/sha256:{want}")
             );
         }
+    }
+
+    /// OCI-1: index が指す digest と本文のハッシュが食い違えば DataLoss（改ざん・取り違えを登録しない）。
+    #[test]
+    fn manifest_index_selected_body_digest_mismatch_is_data_loss() {
+        let t = FakeTransport::new(vec![
+            manifest_resp(200, &index_body()),
+            manifest_resp(200, &image_body_arm()),
+        ]);
+        let e = fetch(&t, &RegistryAuth::None, "x86_64").expect_err("mismatch");
+        assert_eq!(e.code(), OciErrorCode::DataLoss);
+    }
+
+    /// OCI-1: digest 参照は本文のハッシュと突合する（一致で成功・不一致は DataLoss）。
+    #[test]
+    fn manifest_by_digest_is_verified_against_body() {
+        let (ep, repo) = alpine();
+        let run = |want: &str, body: &str| {
+            let t = FakeTransport::new(vec![manifest_resp(200, body)]);
+            fetch_manifest_flow(
+                &t,
+                &RegistryClientConfig::default(),
+                &ep,
+                &repo,
+                &Reference::Digest(Digest::parse(&format!("sha256:{want}")).expect("digest")),
+                &RegistryAuth::None,
+                &Platform::for_arch("x86_64").expect("platform"),
+            )
+        };
+        let body = image_body();
+        let ok = run(&sha_hex(&body), &body).expect("match");
+        assert_eq!(
+            ok.manifest_digest.as_str(),
+            format!("sha256:{}", sha_hex(&body))
+        );
+        let e = run(&sha_hex(&image_body_arm()), &body).expect_err("mismatch");
+        assert_eq!(e.code(), OciErrorCode::DataLoss);
     }
 
     /// OCI-1: platform 不一致は NotFound で、2 回目の取得は起きない。

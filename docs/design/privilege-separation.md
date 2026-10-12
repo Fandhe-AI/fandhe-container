@@ -162,7 +162,9 @@ TASK-171 の成果物は `crates/supervisor/src/privilege.rs`（仮称）だが�
 - 配置先は既定 `/usr/local/libexec/fandhe-container`。根から配置先までの全要素が root 所有・g/o 書き込み不可の通常ディレクトリ（symlink 不可）でなければ、補修も上書きもせず終了コード 3 で止まる（7 章）。supervisor もランチャーと同じ条件で置く。
 - ランチャーにだけ `RUNTIME_REQUIRED_CAPABILITIES`（7 件）に `cap_setgid` を足した 8 件を `+ep` で付け、`getcap` で読み戻して照合する。`cap_setgid` は `elevate` の契約（方式 (c) は補助グループを持つ利用者向けに effective で要る）による。縮退後の保持集合は最小の 7 件に戻る。supervisor には付けず、付いていないことも読み戻す。
 - setuid root（`root:root`・`4755`）へ切り替えるのは、`setcap` が非 0 で終わり stderr に `not supported`（ENOTSUP / EOPNOTSUPP。xattr 非対応）を含むときだけ。EPERM・EINVAL・`setcap` 未導入・読み戻し不一致では切り替えず、`error: <code>: <message>` の 1 行を出して終了コード 1 で止まる（fail-closed）。
-- 一時ファイルで検証を済ませてから rename で置換するため、途中失敗で半端な属性を残さない。
+- `getcap` は読めなかったときも終了コード 0 のまま stderr に診断を出すことがあるため、終了コードだけで成否を決めない。出力が空なら capability なし、`<file> <caps>` の 1 行なら付与あり、それ以外は失敗として止まる。例外は setuid へ切り替えた後だけで、診断が `not supported` を含むとき（2021-09 より前の libcap は xattr 非対応の FS で ENOTSUP を stderr へ出す）に限り capability なしとして扱う。setuid への切り替え条件（`setcap` の結果）は広げない。
+- 一時ファイルで検証を済ませてから rename で置換するため、途中失敗で半端な属性を残さない。supervisor・launcher の順に置換し、途中で止まったら旧 supervisor（ハードリンクの退避）へ戻す。
+- 配置先・入力元に触る外部コマンド（`stat`・`mkdir`・`mktemp`・`dd`・`chown`・`chmod`・`setcap`・`getcap`・`ln`・`mv`・`rm`）はすべて `timeout(1)` の期限つき（30 秒・超過後 5 秒で KILL）で実行し、親シェルはファイル検査も配置先へのリダイレクトも行わない（REPAIR-5。NFS / FUSE の停止で無期限に待たない）。期限超過は `error: operation-timeout`（終了コード 1）。期限を超えた操作は実行されたか不明として扱い、置換の有無を inode の読み戻しで確かめてから戻す。結果は stderr の 2 行目以降に `warning: rolled-back`（戻した・置換済みのファイルは無い）・`error: restore-failed`（戻せなかった。退避ファイルを残し復元コマンドを示す）・`error: state-indeterminate`（launcher の置換を確かめられなかった。退避ファイルを残す）・`warning: replaced-unverified`（2 つとも置換済みで最後の読み戻しが未完）・`warning: cleanup-incomplete`（一時ファイル・退避ファイルを消せなかっただけ。置換の成否には影響せず、成功時は終了コード 0 のまま）で示す。SIGKILL でも終わらない子（割り込めない I/O 待ち）は `timeout(1)` が回収を待つため、期限では打ち切れない。
 - 既知の範囲外: 入力元のハッシュ・署名の照合は未実装（12 章）。nosuid マウント上の配置先では file capability / setuid が効かず、ランチャーが実行時に fail-closed で拒否する。
 
 ## 11. 参照

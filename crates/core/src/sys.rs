@@ -3437,6 +3437,26 @@ pub(crate) fn reset_sigpipe_default() -> Result<(), SysError> {
     }
 }
 
+/// `SIGPIPE` の disposition を `SIG_IGN` にする。無視は `execve` を越えて継承される。
+///
+/// ログ用パイプを stdout / stderr に接続するコンテナで、supervisor 死亡後に読み取り側が閉じても
+/// 出力 `write` が `SIGPIPE` で致死とならず `EPIPE` になるようにする（SUP-5・#1471）。
+// テストビルドでは dry-run 差し込み点が本関数を呼ばない（libtest のプロセスの disposition を変えないため）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn ignore_sigpipe() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数（`SIG_IGN` = 1）のみでポインタを取らない。ハンドラ関数を登録しないため、
+    // シグナルハンドラの再入・非同期安全性の問題は生じない。
+    let prev = unsafe { signal(consts::SIGPIPE, SIG_IGN) };
+    if prev == SIG_ERR {
+        Err(last_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// 呼び出しプロセスを新しいセッションのリーダーにし、制御端末から切り離す（`setsid(2)`。
 /// SUP-6・SEC-1・TASK-163 追補・#1456）。戻り値は新しいセッション ID（= 呼び出しプロセスの pid）。
 ///
@@ -3584,7 +3604,6 @@ pub(crate) fn get_res_uid() -> Result<[u32; 3], SysError> {
 const SIG_DFL: usize = 0;
 const SIG_ERR: usize = usize::MAX;
 /// `signal(2)` の `SIG_IGN`（無視。include/uapi/asm-generic/signal-defs.h の `((__sighandler_t)1)`）。
-#[cfg(feature = "exec-test-support")]
 const SIG_IGN: usize = 1;
 
 /// 結合試験専用: 自プロセスの `SIGCHLD` を `ignored` なら `SIG_IGN`、そうでなければ `SIG_DFL` にする

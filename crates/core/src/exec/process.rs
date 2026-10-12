@@ -363,7 +363,8 @@ pub fn exec_entrypoint(
 ///    シェバン付きスクリプトは新 root の `/dev/fd/N` が同じ実体に解決することを確認する（できなければ拒否）。
 ///    fd 3 以上を `CLOEXEC` にする（CVE-2024-21626 型の fd 漏えい対策。カーネル 5.11 未満は
 ///    `ENOSYS`/`EINVAL` で fail-closed）
-/// 4. `SIGPIPE` を `SIG_DFL` へ戻す（Rust ランタイムが設定した ignore は `execve` を越えて継承される）
+/// 4. `SIGPIPE` を `SIG_DFL` へ戻す（Rust ランタイムが設定した ignore は `execve` を越えて継承される）。
+///    stdout / stderr をログ用パイプへ付け替えた場合は逆に `SIG_IGN` にする（#1471・SUP-5）
 /// 5. fd 0〜2 を新 root の `/dev/null`（開く前に `O_PATH` で固定して 1:3 を検証し、`O_NOCTTY` つきで開き直す。
 ///    #1459）へ置換する（継承されたホスト側の標準入出力を渡さない）
 /// 6. `execveat`（開いた fd を実行。実行権限がなければ `EACCES`）。戻ってきたら失敗
@@ -512,7 +513,7 @@ fn prepare_exec_child(
     }
 
     mark_fds_cloexec()?;
-    reset_sigpipe()?;
+    reset_sigpipe(!nulling.stdout || !nulling.stderr)?;
     if is_script {
         sys::set_cloexec(file.as_fd(), false)
             .map_err(|e| ExecError::from_sys(e, STAGE, "fcntl(F_SETFD)"))?;
@@ -867,17 +868,29 @@ fn redirect_stdio_to_null(
     Ok(())
 }
 
-/// `SIGPIPE` を `SIG_DFL` へ戻す。本番ビルドの実装。
+/// `SIGPIPE` を `SIG_DFL` へ戻す。ログ用パイプ接続時（`piped`）は `SIG_IGN` にする。本番ビルドの実装。
+///
+/// パイプ接続時に無視へ固定するのは、supervisor が死んで読み取り側が閉じた後の出力 `write` が
+/// `SIGPIPE` でコンテナを落とさず `EPIPE` になるようにするため（SUP-5・#1471）。
 #[cfg(not(test))]
-fn reset_sigpipe() -> Result<(), ExecError> {
-    sys::reset_sigpipe_default()
-        .map_err(|e| ExecError::from_sys(e, IsolationStage::Exec, "signal(SIGPIPE, SIG_DFL)"))
+fn reset_sigpipe(piped: bool) -> Result<(), ExecError> {
+    if piped {
+        sys::ignore_sigpipe()
+            .map_err(|e| ExecError::from_sys(e, IsolationStage::Exec, "signal(SIGPIPE, SIG_IGN)"))
+    } else {
+        sys::reset_sigpipe_default()
+            .map_err(|e| ExecError::from_sys(e, IsolationStage::Exec, "signal(SIGPIPE, SIG_DFL)"))
+    }
 }
 
 /// テストビルドの dry-run 差し込み点。呼ばれたことだけを記録する。
 #[cfg(test)]
-fn reset_sigpipe() -> Result<(), ExecError> {
-    tests::record("signal(SIGPIPE,SIG_DFL)".to_string());
+fn reset_sigpipe(piped: bool) -> Result<(), ExecError> {
+    tests::record(if piped {
+        "signal(SIGPIPE,SIG_IGN)".to_string()
+    } else {
+        "signal(SIGPIPE,SIG_DFL)".to_string()
+    });
     Ok(())
 }
 
@@ -1717,10 +1730,10 @@ impl StdioNulling {
 /// exec を越える（それ以外の書き込み側・読み取り側の fd は `close_inherited_fds` が閉じる）。
 ///
 /// # 制限（SUP-5・SUP-8 との関係）
-/// 読み取り側（supervisor）が異常終了して閉じると、コンテナは次の出力 `write` で `SIGPIPE`（子は
-/// `reset_sigpipe` で既定動作に戻す）を受けて終了し得る。ワークロードのシグナル配置は変えない（POSIX の既定を維持）。
-/// supervisor 死亡後も稼働を続ける保証（SUP-5）は出力を書かないコンテナに限られ、出力を書くコンテナの扱いは
-/// 孤児の re-adopt・明示終了ポリシー（SUP-8・TASK-165）で解決する。supervisor が生きている間は、sink が失敗しても
+/// パイプ接続時、子は `SIGPIPE` を `SIG_IGN` にして exec する（無視は exec を越えて継承される）。読み取り側
+/// （supervisor）が異常終了して閉じても、コンテナの出力 `write` は `SIGPIPE` で致死とならず `EPIPE` を返す
+/// ため、SUP-5（supervisor 死亡後も稼働継続）を損なわない。出力は失われる（再接続・re-adopt は SUP-8・TASK-165）。
+/// ワークロードが `SIGPIPE` を自前で扱う場合はその設定が優先される。supervisor が生きている間は、sink が失敗しても
 /// 読み取りは EOF まで続くため、コンテナの `write` は詰まらない。
 #[derive(Debug)]
 pub struct ChildStdio {
@@ -3451,7 +3464,7 @@ mod tests {
                 "setsid".to_string(),
                 "reopen(entrypoint)".to_string(),
                 "close_range(3)".to_string(),
-                "signal(SIGPIPE,SIG_DFL)".to_string(),
+                "signal(SIGPIPE,SIG_IGN)".to_string(),
                 "stdio[0]->/dev/null".to_string(),
                 format!("execve({})", bin.display()),
                 "argv=probe".to_string(),

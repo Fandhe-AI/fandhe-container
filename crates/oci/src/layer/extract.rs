@@ -1433,8 +1433,6 @@ mod tests {
     fn io5_case_variants_follow_destination_fs() {
         let sb = Sandbox::new();
         let folds = fs_resolves_as_same(&sb.base, "probe", "PROBE");
-        // どの OS のどの FS で走ったかを CI のログで確かめられるようにする。
-        println!("destination filesystem resolves case variants as the same name: {folds}");
         let layers = [
             vec![file("f", 0o644, b"data"), hardlink("F", "f")],
             vec![file("f", 0o644, b"data"), file("F", 0o644, b"two")],
@@ -1491,7 +1489,6 @@ mod tests {
         let (nfc, nfd) = ("caf\u{e9}", "cafe\u{301}");
         let sb = Sandbox::new();
         let folds = fs_resolves_as_same(&sb.base, nfc, nfd);
-        println!("destination filesystem resolves NFC and NFD as the same name: {folds}");
         let r = run(&sb, &[file(nfc, 0o644, b"nfc"), file(nfd, 0o644, b"nfd")]);
         if folds {
             assert_spelling_collision(r);
@@ -1503,6 +1500,21 @@ mod tests {
             assert_eq!(fs::read(sb.root.join(nfd)).unwrap(), b"nfd");
         }
         assert_eq!(fs::read(sb.root.join(nfc)).unwrap(), b"nfc");
+        sb.assert_outside_untouched();
+    }
+
+    /// IO-5: Windows・macOS の既定の一時領域は大文字小文字を区別しない（macOS の APFS は NFC / NFD も区別しない）。
+    ///
+    /// `io5_case_variants_follow_destination_fs` と `io5_normalization_variants_follow_destination_fs` は
+    /// 展開先 FS の挙動で分岐するため、これらの OS の CI で「実 FS が別表記を既存の実体へ解決し、展開が
+    /// 拒否する」側が実際に走ったことをここで固定する（区別する側へ黙って流れたら失敗させる）。
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn io5_default_host_fs_resolves_spelling_variants_as_same() {
+        let sb = Sandbox::new();
+        assert!(fs_resolves_as_same(&sb.base, "probe", "PROBE"));
+        #[cfg(target_os = "macos")]
+        assert!(fs_resolves_as_same(&sb.base, "caf\u{e9}", "cafe\u{301}"));
         sb.assert_outside_untouched();
     }
 

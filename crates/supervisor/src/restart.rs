@@ -41,6 +41,7 @@ use fandhe_container_core::traits::{
     ContainerId, ContainerStatus, ErrorCode, Signal, StateRecord, SupervisionState, TraitError,
 };
 
+use crate::log_pipeline::CaptureHub;
 use crate::run::{
     MonitorConfig, MonitorEvent, MonitorObserver, MonitorOperation, MonitorOutcome, StopToken,
     ensure_owner, is_running_with_pid, monitor_with_observer, precondition, write_with_retry_when,
@@ -264,6 +265,14 @@ const BACKOFF_SLICE: Duration = Duration::from_millis(10);
 pub trait Relauncher: Send + Sync {
     /// 同じコンテナのプロセスを再起動し、新しい起動ハンドルを返す。待ちは `timeout` まで（REPAIR-5）。
     fn relaunch(&self, timeout: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError>;
+
+    /// `relaunch` が `Err` を返す際に、terminate できず生存の可能性が残るプロセスのハンドルを引き渡す。
+    ///
+    /// 既定は空。`relaunch_bounded` が `relaunch` の直後に呼び、[`LateOrphans`] へ積んで呼び出し側が
+    /// 再回収できるようにする（CORE-1・REPAIR-5。`LaunchedProcess` は `Drop` で回収しない）。
+    fn take_stranded(&self) -> Vec<LateOrphan> {
+        Vec::new()
+    }
 }
 
 /// 再起動ループの設定。検証付きコンストラクタ経由でのみ作れる。
@@ -754,6 +763,9 @@ fn relaunch_bounded(
     let worker_late = late.clone();
     spawn_tracked(spawn, "fandhe-relaunch", late, move || {
         let value = r.relaunch(timeout);
+        for (proc, error) in r.take_stranded() {
+            worker_late.push(proc, error);
+        }
         let (lock, cvar) = &*worker;
         let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
         if matches!(*slot, Slot::Abandoned) {
@@ -1145,21 +1157,70 @@ impl ProcessLauncher for SpecCapturingLauncher {
 ///
 /// `relaunch(timeout)` は `launcher.launch(&spec, timeout)` を呼ぶだけで、launcher の中身（フェイクか core の本番
 /// 実装か）に依存しない。`LaunchSpec` が持つ rootfs の fd は `Arc` 共有のため、複製しても固定は保たれる。
+///
+/// 出力の捕捉（TASK-164 追補・#1471・SUP-7・SUP-1）: [`Self::with_capture`] でハブを持たせると、再 launch の直後に
+/// 新プロセスの `take_output` を取って [`CaptureHub::attach`] へ渡す（再起動をまたいで同じ sink へ流れる）。
+/// 捕捉を開始できなければ、新プロセスを terminate して回収してから `Err` を返す（読み取り側を捨てると
+/// コンテナは SIGPIPE を受けるため、ログを失ったまま動かさない。fail-closed）。
+/// 再 launch の直前に [`CaptureHub::quiesce`] で直前の捕捉を畳み、捕捉スレッドを 0 にしてから launch する
+/// （core の fork 経路が `Threads: 1` を要求するため。`relaunch_bounded` の実行スレッドは別に存在する）。
 pub struct LauncherRelauncher {
     launcher: Arc<dyn ProcessLauncher>,
     spec: LaunchSpec,
+    capture: Option<Arc<CaptureHub>>,
+    /// 捕捉開始に失敗し terminate も失敗したプロセスのハンドル（[`Relauncher::take_stranded`] が引き渡す）。
+    stranded: Mutex<Vec<LateOrphan>>,
 }
 
 impl LauncherRelauncher {
-    /// start で使った `launcher` と捕捉した `spec` から作る。
+    /// start で使った `launcher` と捕捉した `spec` から作る（出力は捕捉しない）。
     pub fn new(launcher: Arc<dyn ProcessLauncher>, spec: LaunchSpec) -> Self {
-        Self { launcher, spec }
+        Self {
+            launcher,
+            spec,
+            capture: None,
+            stranded: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// 再 launch したプロセスの出力を `hub` へ渡す。
+    #[must_use]
+    pub fn with_capture(mut self, hub: Arc<CaptureHub>) -> Self {
+        self.capture = Some(hub);
+        self
     }
 }
 
 impl Relauncher for LauncherRelauncher {
     fn relaunch(&self, timeout: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
-        self.launcher.launch(&self.spec, timeout)
+        if let Some(hub) = &self.capture {
+            // 旧プロセスは回収済み。読み取りスレッドを残したまま fork しない（SUP-7）。
+            hub.quiesce();
+        }
+        let process = self.launcher.launch(&self.spec, timeout)?;
+        // 捕捉ハブが無いときは読み取り側を取り出さない（取り出して捨てるとコンテナが SIGPIPE を受ける）。
+        if let Some(hub) = &self.capture
+            && let Some(output) = process.take_output()
+            && let Err(e) = hub.attach(output)
+        {
+            // 新プロセスを動かしたままにしない。回収できなければハンドルを保持し、
+            // `take_stranded` 経由で呼び出し側が再回収できるようにする（CORE-1・REPAIR-5）。
+            return match process.terminate(timeout) {
+                Ok(()) => Err(e),
+                Err(t) => {
+                    self.stranded
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push((process, t.clone()));
+                    Err(t)
+                }
+            };
+        }
+        Ok(process)
+    }
+
+    fn take_stranded(&self) -> Vec<LateOrphan> {
+        std::mem::take(&mut *self.stranded.lock().unwrap_or_else(PoisonError::into_inner))
     }
 }
 

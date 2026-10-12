@@ -61,6 +61,7 @@ pub mod health;
 pub mod healthcheck;
 pub mod inspect;
 pub mod launcher;
+pub mod log_pipeline;
 pub mod logs;
 pub mod privilege;
 pub mod restart;

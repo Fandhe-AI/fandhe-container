@@ -72,7 +72,7 @@ fandhe-container/
 │   │   ├── macos-vm-strategy.md   # macOS の VM 利用方式（既定: 常駐 VM 共用＋軽量プロセス分離／オプション: 1 コンテナ = 1 VM。TASK-66・MAC-4）
 │   │   ├── fs-normalization.md   # FS 正規化（NFC/NFD の別表記の衝突を検出して拒否・名前は書き換えない。TASK-21・IO-5）
 │   │   ├── crate-naming.md        # crate 短縮名・plugin crate 配置の確定内容（TASK-1・REPAIR-1）
-│   │   ├── rootless-network.md    # rootless ネットワーク外部ヘルパー選択肢の設計ドラフト（TASK-147・NET-9。採否未決）
+│   │   ├── rootless-network.md    # rootless ネットワーク外部ヘルパーの判断記録（TASK-147・NET-9。pasta を採用〔#340〕。実装・実証は #341）
 │   │   ├── privilege-separation.md  # 権限分離方式の比較と必要最小権限の設計書（TASK-171.1.1・SUP-14。方式承認済み〔#1454〕）
 │   │   └── dev-default-mounts.md  # OCI 既定の /dev の残り（/dev/pts・/dev/ptmx・/dev/shm・/dev/console）と rootless の /dev 供給方式の設計ドラフト（TASK-29 追補・#1609。方式を確定し実装 issue を #54 配下に起票）
 │   ├── setup/                     # 利用者向けセットアップ手順

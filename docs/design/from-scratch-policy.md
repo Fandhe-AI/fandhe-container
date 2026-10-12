@@ -4,7 +4,7 @@
 
 - 決定日: 2026-09-26（ユーザー決定）
 - 関連 issue: #25（MS-0・TASK-73〜75 の前提）
-- 更新: 2026-10-10（オーナー判断。#399・#406・#408・#425・#540・#582・#597・#670・#678 の承認・不採用を反映）
+- 更新: 2026-10-10（オーナー判断。#399・#406・#408・#425・#540・#582・#597・#670・#678 の承認・不採用を反映。2026-10-12 の判断（#340）で rootless の外部ヘルパー pasta の例外を記録）
 
 ## 方針
 
@@ -100,6 +100,15 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 | `astral-tokio-tar` | tokio が前提で、2025〜2026 年に advisory が 5 件 | #408 |
 | 署名検証クレート（`ed25519-dalek` 等） | PLUG-11 の既定実装はハッシュ一覧比較のため当面不要 | #281 |
 
+## 例外の記録
+
+- **rootless の外部ヘルパー（pasta）**（2026-10-12 のオーナー判断。TASK-147.h1・NET-9。#340）
+  - フルスクラッチ方針の例外として認める。例外は rootless のユーザー空間転送に限る（D-14 の例外も同じ経路に限る）
+  - Cargo の依存ではなく、利用者が導入した外部バイナリを別プロセスとして exec するだけ。同梱・リンクはしない
+  - ライセンスは GPL-2.0-or-later。この使い方に限って認める。依存を permissive に限る規約は変えない
+  - netlink・nftables の自前実装（NET-11）は変えない
+  - 詳細は [rootless-network.md](rootless-network.md) の「決定」
+
 ## 承認待ち（後続 Phase）
 
 以下は対応 Phase の着手時にユーザー承認を取る：
@@ -108,13 +117,10 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 
 ## 未決事項
 
-**rootless の外部ヘルパー採否**（pasta 等）
-
-- spec 01-brainstorm.md D-18・未解決疑問点 14
-- netlink / nftables は自前実装で決定済み（NET-11）
-- 選択肢・判断材料のドラフト: [rootless-network.md](rootless-network.md)（TASK-147.1・NET-9。採否は #340 で判断）
+現時点で無い。
 
 ## 非 Cargo 資産（ライセンス手動確認）
 
 - **macOS ゲストカーネル**: kernel.org LTS を自前ビルド。GPL-2.0 ソース提供は tarball URL・版数・defconfig・ビルドスクリプト公開で充足。release に別資産配布
 - **initrd**: 自前 Rust 製 init のみ（#362。外部 init システム不採用）
+- **rootless の外部ヘルパー（pasta）**: 同梱しない。利用者が導入する。GPL-2.0-or-later。exec のみ（リンク・同梱なし。2026-10-12 の判断。#340）

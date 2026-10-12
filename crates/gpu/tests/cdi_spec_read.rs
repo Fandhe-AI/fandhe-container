@@ -150,6 +150,24 @@ fn gpu1_rejects_fifo_without_hanging() {
     assert_eq!(e.message(), "CDI spec path is not a regular file");
 }
 
+/// GPU-1: 文字デバイス（/dev/null）とその symlink は通常ファイルでないため拒否される（Unix のみ）。
+/// open は O_NOCTTY 付きで行うため、端末デバイスでも制御端末を取得しない。
+#[cfg(unix)]
+#[test]
+fn gpu1_rejects_char_device_and_symlink_to_it() {
+    let dev = Path::new("/dev/null");
+    let e = read_cdi_spec_file(dev).unwrap_err();
+    assert_eq!(e.code(), CdiSpecErrorCode::InvalidArgument);
+    assert_eq!(e.message(), "CDI spec path is not a regular file");
+
+    let d = TempDir::new("devlink");
+    let link = d.path().join("spec.yaml");
+    std::os::unix::fs::symlink(dev, &link).expect("symlink");
+    let e = read_cdi_spec_file(&link).unwrap_err();
+    assert_eq!(e.code(), CdiSpecErrorCode::InvalidArgument);
+    assert_eq!(e.message(), "CDI spec path is not a regular file");
+}
+
 /// GPU-1: 上限 +1 バイトが多バイト文字の途中で切れても ResourceExhausted になる。
 #[test]
 fn gpu1_oversize_multibyte_boundary_is_resource_exhausted() {

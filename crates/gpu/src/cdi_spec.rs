@@ -419,10 +419,12 @@ impl CdiSpecReadRecorder for NoopRecorder {
     fn record(&self, _sample: CdiSpecReadSample) {}
 }
 
-/// 非ブロッキング open のフラグ値（FIFO の open 待ちによる無期限停止を避ける）。
+/// open フラグ（`O_NONBLOCK | O_NOCTTY`）。`O_NONBLOCK` は FIFO の open 待ちによる無期限停止を避け、
+/// `O_NOCTTY` は端末デバイス（またはその symlink）を指定されても制御端末を取得しないために付ける
+/// （種別拒否の前に open するため、拒否しても取り消せない副作用を作らない）。
 /// 値を確定できない Unix では `None` とし、open 前の `metadata` 検査で代える。
 #[cfg(unix)]
-const O_NONBLOCK: Option<i32> = if cfg!(all(
+const OPEN_FLAGS: Option<i32> = if cfg!(all(
     target_os = "linux",
     not(any(
         target_arch = "mips",
@@ -431,15 +433,18 @@ const O_NONBLOCK: Option<i32> = if cfg!(all(
         target_arch = "sparc64"
     ))
 )) {
-    Some(0o4000)
+    // O_NONBLOCK 0o4000 | O_NOCTTY 0o400
+    Some(0o4000 | 0o400)
+} else if cfg!(any(target_os = "macos", target_os = "ios")) {
+    // O_NONBLOCK 0x4 | O_NOCTTY 0x20000
+    Some(0x4 | 0x20000)
 } else if cfg!(any(
-    target_os = "macos",
-    target_os = "ios",
     target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd"
 )) {
-    Some(0x4)
+    // O_NONBLOCK 0x4 | O_NOCTTY 0x8000
+    Some(0x4 | 0x8000)
 } else {
     None
 };
@@ -457,7 +462,7 @@ fn open_regular_file(path: &Path) -> Result<std::fs::File, CdiSpecError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        match O_NONBLOCK {
+        match OPEN_FLAGS {
             Some(flag) => {
                 opts.custom_flags(flag);
             }

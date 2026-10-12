@@ -126,6 +126,19 @@ start_child() {
   fi
   echo "$child" >>"${STUB_DIR}/pids"
 }
+# 子が sleep を exec し終えるまで待つ（Issue #1728。#1695 と同種の fork から exec までの窓）。exec 前の子は
+# launcher の所有トークン・session を継承しており、その窓で計測スクリプトが判定すると「本実行のもの」と
+# 扱われて回収で kill される。待ちは上限付き（約 5 秒。REPAIR-5）で、超過時もハングせず進み、
+# フィクスチャ不成立は後続の期待値照合が fail-closed で検出する。
+wait_exec() { # <pid>
+  local i=0
+  while [ "$i" -lt 500 ]; do
+    [ "$(cat "/proc/$1/comm" 2>/dev/null || true)" = sleep ] && return 0
+    sleep 0.01
+    i=$((i + 1))
+  done
+  return 0
+}
 late_term() {
   if [ "$STUB_MODE" = late_orphan ]; then
     kill -KILL "$child" 2>/dev/null
@@ -137,6 +150,7 @@ late_term() {
     env -u FANDHE_BENCH_OWNER sleep 300 &
   fi
   child=$!
+  wait_exec "$child"
   case "$STUB_MODE" in
     late_session | late_orphan) echo "$child" >>"${STUB_DIR}/leftover" ;;
     *) echo "$child" >>"${STUB_DIR}/pids" ;;

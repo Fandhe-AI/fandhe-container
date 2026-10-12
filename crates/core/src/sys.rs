@@ -2661,20 +2661,25 @@ pub(crate) fn dup_fd_at_least(fd: BorrowedFd<'_>, min: i32) -> Result<OwnedFd, S
     Ok(unsafe { OwnedFd::from_raw_fd(new) })
 }
 
-/// fd 0・1・2 を `fd` の実体で置き換える（`dup2`。置換先は close-on-exec が外れる）。呼び出し元が
-/// 引き継いだ標準入出力の実体（ホストのファイル・ソケット）をコンテナへ渡さないために使う。
-/// `fd` 自体が 0〜2 のいずれかのときは、その番号は置換せず close-on-exec を外して保持する。
+/// `targets`（0〜2 のうち置換する番号）だけを `fd` の実体で置き換える。
+///
+/// 子の stdout / stderr をログ用のパイプへ渡す場合（TASK-164 追補・#1471・SUP-7）に、パイプへ付け替え済みの
+/// 番号を `/dev/null` で上書きしないため、置換する番号を呼び出し側が選ぶ。`targets` に 0〜2 以外を含めると
+/// `EINVAL`。`fd` 自体が 0〜2 のいずれかのときは、その番号を（`targets` に含まれていなくても）閉じずに保持する。
 #[cfg_attr(test, allow(dead_code))]
-pub(crate) fn redirect_stdio_to(fd: OwnedFd) -> Result<(), SysError> {
+pub(crate) fn redirect_fds_to(fd: OwnedFd, targets: &[i32]) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
+    if targets.iter().any(|t| !(0..=2).contains(t)) {
+        return Err(SysError::Os(EINVAL));
+    }
     let raw = fd.as_raw_fd();
-    for target in 0..=2 {
+    for &target in targets {
         if target == raw {
             continue;
         }
-        // SAFETY: `raw` は `fd` が所有する生存中の fd。`target` は 0〜2 の整数で、引数はいずれも
+        // SAFETY: `raw` は `fd` が所有する生存中の fd。`target` は上で 0〜2 に検証した整数で、引数はいずれも
         // 整数のみ（ポインタなし）。既存の標準 fd は暗黙に close され置換される（意図した動作）。
         if unsafe { dup2(raw, target) } == -1 {
             return Err(last_error());
@@ -2687,6 +2692,30 @@ pub(crate) fn redirect_stdio_to(fd: OwnedFd) -> Result<(), SysError> {
         // 借用の間に close されない。
         let borrowed = unsafe { BorrowedFd::borrow_raw(kept) };
         return set_cloexec(borrowed, false);
+    }
+    Ok(())
+}
+
+/// `fd` の実体を番号 `target` へ複製する（`dup2`。`target` の既存の fd は暗黙に close される。複製先は
+/// close-on-exec が外れる）。`fd == target` のときは複製せず close-on-exec だけを外す。
+///
+/// 子の stdout / stderr をパイプの書き込み側へ付け替えるのに使う（TASK-164 追補・#1471・SUP-7）。
+/// `target` は 0 以上でなければ `EINVAL`。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn dup_onto(fd: BorrowedFd<'_>, target: i32) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    if target < 0 {
+        return Err(SysError::Os(EINVAL));
+    }
+    if fd.as_raw_fd() == target {
+        return set_cloexec(fd, false);
+    }
+    // SAFETY: `fd` は生存中の `BorrowedFd`。`target` は上で非負を確認した整数で、引数はいずれも整数のみ
+    // （ポインタなし）。`target` の既存の fd は暗黙に close され置換される（意図した動作）。
+    if unsafe { dup2(fd.as_raw_fd(), target) } == -1 {
+        return Err(last_error());
     }
     Ok(())
 }
@@ -3408,6 +3437,26 @@ pub(crate) fn reset_sigpipe_default() -> Result<(), SysError> {
     }
 }
 
+/// `SIGPIPE` の disposition を `SIG_IGN` にする。無視は `execve` を越えて継承される。
+///
+/// ログ用パイプを stdout / stderr に接続するコンテナで、supervisor 死亡後に読み取り側が閉じても
+/// 出力 `write` が `SIGPIPE` で致死とならず `EPIPE` になるようにする（SUP-5・#1471）。
+// テストビルドでは dry-run 差し込み点が本関数を呼ばない（libtest のプロセスの disposition を変えないため）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn ignore_sigpipe() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数（`SIG_IGN` = 1）のみでポインタを取らない。ハンドラ関数を登録しないため、
+    // シグナルハンドラの再入・非同期安全性の問題は生じない。
+    let prev = unsafe { signal(consts::SIGPIPE, SIG_IGN) };
+    if prev == SIG_ERR {
+        Err(last_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// 呼び出しプロセスを新しいセッションのリーダーにし、制御端末から切り離す（`setsid(2)`。
 /// SUP-6・SEC-1・TASK-163 追補・#1456）。戻り値は新しいセッション ID（= 呼び出しプロセスの pid）。
 ///
@@ -3555,7 +3604,6 @@ pub(crate) fn get_res_uid() -> Result<[u32; 3], SysError> {
 const SIG_DFL: usize = 0;
 const SIG_ERR: usize = usize::MAX;
 /// `signal(2)` の `SIG_IGN`（無視。include/uapi/asm-generic/signal-defs.h の `((__sighandler_t)1)`）。
-#[cfg(feature = "exec-test-support")]
 const SIG_IGN: usize = 1;
 
 /// 結合試験専用: 自プロセスの `SIGCHLD` を `ignored` なら `SIG_IGN`、そうでなければ `SIG_DFL` にする

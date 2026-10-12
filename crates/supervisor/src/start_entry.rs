@@ -57,6 +57,8 @@ use fandhe_container_core::traits::{
     StateRecord, StateRevision, StateStore, SupervisionState, TraitError, UpdateStateRequest,
 };
 
+use crate::log_pipeline::CaptureHub;
+use crate::logs::LogSink;
 use crate::restart::{
     LateOrphans, LauncherRelauncher, Relauncher, RestartConfig, RestartPolicy,
     SpecCapturingLauncher, SuperviseOutcome, supervise_with_restart,
@@ -92,6 +94,16 @@ pub trait StartDeps {
     /// 手順 6: 監査 sink を構築する（fork の前。SEC-4）。実装が保持し [`Self::build_launcher`] が使う。
     fn build_audit_sink(&mut self) -> Result<(), TraitError>;
 
+    /// 手順 6: コンテナの stdout / stderr の記録先（ログ sink）を開く（fork の前。TASK-164 追補・#1471・SUP-7）。
+    ///
+    /// `Some` を返すと、入口は捕捉ハブ（[`CaptureHub`]）を作り、起動・再起動のたびに新プロセスの出力を行単位で
+    /// この sink へ流す。開けなければ失敗させる（ログ喪失を黙って許さない。ERR-1・REPAIR-4）。既定は `None`
+    /// （出力は記録せず読み捨てる。フェイクの [`StartDeps`] は上書きしなくてよい）。
+    fn open_log_sink(&mut self, id: &ContainerId) -> Result<Option<Arc<dyn LogSink>>, TraitError> {
+        let _ = id;
+        Ok(None)
+    }
+
     /// 手順 7: launcher を構築する（保持している cgroup の参加フックと監査 sink を使う）。
     fn build_launcher(&mut self) -> Result<Arc<dyn ProcessLauncher>, TraitError>;
 
@@ -109,6 +121,9 @@ pub struct Running {
     /// start が返したレコードの cgroup の instance（無ければ `None`）。回収後の `Stopped` 記録で、同じ ID の
     /// 削除・再作成による別インスタンスのレコードを上書きしないための照合に使う（CORE-2・SEC-1）。
     pub instance: Option<StateRevision>,
+    /// コンテナ出力の捕捉ハブ（ログ sink を開いたときだけ。`run_supervised` が初回の出力を渡し、全終了経路で畳む。
+    /// 再起動後の出力は `relauncher` が同じハブへ渡す。TASK-164 追補・#1471・SUP-7）。
+    pub logs: Option<Arc<CaptureHub>>,
 }
 
 /// spec を捕捉できなかったときの再 launch（常に失敗させる。fail-closed）。
@@ -765,6 +780,13 @@ fn attempt_start(
     if let Err(e) = deps.build_audit_sink() {
         return fail(e, Cleanup::ReleaseCgroup);
     }
+    let logs = match deps.open_log_sink(req.id()) {
+        // 記録先が無くても出力パイプは読み捨てる（読まないとコンテナの write が詰まる。SUP-1・SUP-7・REPAIR-5）。
+        Ok(sink) => Some(Arc::new(CaptureHub::new(sink.unwrap_or_else(|| {
+            Arc::new(crate::logs::DiscardLogSink) as Arc<dyn LogSink>
+        })))),
+        Err(e) => return fail(e, Cleanup::ReleaseCgroup),
+    };
     let inner = match deps.build_launcher() {
         Ok(l) => l,
         Err(e) => return fail(e, Cleanup::ReleaseCgroup),
@@ -783,13 +805,20 @@ fn attempt_start(
             let (record, process) = started.into_parts();
             let instance = record.cgroup().map(|c| c.instance());
             let relauncher: Arc<dyn Relauncher> = match capturing.captured_spec() {
-                Some(spec) => Arc::new(LauncherRelauncher::new(inner, spec)),
+                Some(spec) => {
+                    let relauncher = LauncherRelauncher::new(inner, spec);
+                    match &logs {
+                        Some(hub) => Arc::new(relauncher.with_capture(Arc::clone(hub))),
+                        None => Arc::new(relauncher),
+                    }
+                }
                 None => Arc::new(NoSpecRelauncher),
             };
             Attempt::Started(Running {
                 process,
                 relauncher,
                 instance,
+                logs,
             })
         }
         // Timeout を含むすべての失敗を同じ確認に通す。呼び出し境界の期限超過なら予約（Running・pid なし）が残るので
@@ -1059,6 +1088,11 @@ fn finish_disposed(
 /// 監視の結果が返したハンドルの所有者は本入口なので、終了の前に terminate して回収を確かめる。
 /// 回収を確かめられれば、対応する Running の記録を `Stopped` に落とす（`mark_stopped`）。
 /// 回収を確かめられなければ `Internal` の非 0 で終わる。
+///
+/// コンテナ出力の捕捉（TASK-164 追補・#1471・SUP-7・SUP-1）: `running.logs` があれば、監視の前に初回プロセスの
+/// `take_output` を捕捉ハブへ渡し（読み取りスレッドは `start` の完了後にここで初めて作る）、全終了経路で
+/// ハブを畳んで末尾の行を sink へ flush する。捕捉を開始できなければ、読み取り側を捨てるとコンテナが
+/// SIGPIPE を受けるため、起動したプロセスを回収して非 0 で終わる（fail-closed）。
 pub fn run_supervised(
     store: Arc<dyn StateStore>,
     id: ContainerId,
@@ -1071,7 +1105,47 @@ pub fn run_supervised(
         process,
         relauncher,
         instance,
+        logs,
     } = running;
+    // 捕捉ハブが無いときは読み取り側を取り出さない（取り出して捨てるとコンテナが SIGPIPE を受ける）。
+    if let Some(hub) = &logs
+        && let Some(output) = process.take_output()
+        && let Err(e) = hub.attach(output)
+    {
+        log_event("log_capture_failed", Some(e.code()));
+        let disposed = dispose(Some(process), None, timeouts);
+        return finish_disposed(
+            &store,
+            &id,
+            instance,
+            disposed,
+            exit_code_for(e.code()).get(),
+        );
+    }
+    let code = supervise_running(
+        store, id, process, relauncher, instance, restart, timeouts, stop,
+    );
+    if let Some(hub) = logs {
+        // 失敗（集計内の error_code を含む）は finish が構造化ログへ報告する。
+        let _ = hub.finish(timeouts.terminate());
+    }
+    code
+}
+
+/// [`run_supervised`] の監視と回収の本体（出力の捕捉は呼び出し側が担う）。
+// 理由: 入口 `run_supervised` が受けた store・id・process・relauncher・instance・restart・timeouts・stop は
+// いずれも独立に所有・借用の区別が要る値で、束ねる型を作ると呼び出し側の分解コードが増えるだけのため引数のまま渡す。
+#[allow(clippy::too_many_arguments)]
+fn supervise_running(
+    store: Arc<dyn StateStore>,
+    id: ContainerId,
+    process: Box<dyn LaunchedProcess>,
+    relauncher: Arc<dyn Relauncher>,
+    instance: Option<StateRevision>,
+    restart: RestartPolicy,
+    timeouts: &StartTimeouts,
+    stop: &StopToken,
+) -> u8 {
     let mut state = match SupervisedState::attach(Arc::clone(&store), id.clone()) {
         Ok(s) => s,
         Err(e) => {
@@ -1285,6 +1359,32 @@ mod linux {
         fn build_audit_sink(&mut self) -> Result<(), TraitError> {
             self.audit = Some(crate::exec::default_audit_sink(Some(self.root.clone()))?);
             Ok(())
+        }
+
+        /// 暫定の配置: `--root` 配下の `logs/`（0700）に `<id>.log`（既定 1MiB × 3 世代）を置く。ログのディレクトリ契約は
+        /// `logs` コマンド側（#1543）で確定する事項で、確定したらここを合わせる。
+        fn open_log_sink(
+            &mut self,
+            id: &ContainerId,
+        ) -> Result<Option<Arc<dyn LogSink>>, TraitError> {
+            use std::os::unix::fs::DirBuilderExt as _;
+            let dir = self.root.join("logs");
+            match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => {
+                    return Err(TraitError::new(
+                        ErrorCode::Internal,
+                        "failed to create the log directory",
+                    ));
+                }
+            }
+            let config = crate::logs::RotationConfig::new(
+                crate::logs::rotating::DEFAULT_LOG_FILE_BYTES,
+                crate::logs::rotating::DEFAULT_LOG_GENERATIONS,
+            )?;
+            let sink = crate::logs::RotatingFileSink::open(&dir, id, config)?;
+            Ok(Some(Arc::new(sink)))
         }
 
         fn build_launcher(&mut self) -> Result<Arc<dyn ProcessLauncher>, TraitError> {

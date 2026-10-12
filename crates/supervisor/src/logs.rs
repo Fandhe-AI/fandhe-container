@@ -57,8 +57,10 @@
 //! - stdout / stderr 混在での大規模な欠落 0・重複 0 の検証（stdout 単独の 100 万行検証は `tests/log_rotation.rs` に実装済み）: SUP-7・TASK-164.4（#508）。
 //! - `logs` コマンドからの読み出し経路: TASK-164 以降 / CLI 側（ログ名の列挙は [`log_file_paths`] が実装済みで、ロックファイルを含めない。内容の読み出し・CLI 配線は未実装。TASK-164 追補・#1469）。
 //! - コンテナ削除経路からの [`RotatingFileSink::remove_all`]（ログ・ロックファイルの一括削除）の呼び出し配線: SUP-7・TASK-164 追補（#1469）。
-//! - 実パイプの取得: core の本番 launcher が子の stdio をパイプへ接続して渡す経路は未提供
-//!   （現状 core は子の標準入出力を null へ向けている）。そのため入力は注入式である。
+//! - 本番 launcher からの呼び出し配線: 子の stdout / stderr をパイプへ接続する機構（core の `exec::ChildStdio`）と、
+//!   読み取り側を受け取って起動・再起動をまたいで捕捉する配線（[`crate::log_pipeline::CaptureHub`]）は実装済みだが
+//!   （TASK-164 追補・#1471）、core の本番 `ProcessLauncher`（TASK-29 追補の Phase B）が `ChildStdio` を使って
+//!   `LaunchedProcess::take_output` を返す部分は未実装。入力は注入式のままである。
 //!
 //! 既定の [`MemoryLogSink`] はメモリ保持のみ（上限付き）で、supervisor 終了時に失われる。永続化には [`rotating::RotatingFileSink`] を注入する。
 
@@ -272,6 +274,20 @@ pub trait LogSink: Send + Sync {
     /// リーダーが read のたびと終了前に呼ぶ（[`LogCapture::cancel`] も取消し後に 1 回呼ぶ）。有限時間で戻ること。`Err` を返すと `append` と同様、
     /// そのストリームでは以後 sink を呼ばない。
     fn flush(&self) -> Result<(), TraitError> {
+        Ok(())
+    }
+}
+
+/// 行を記録せず捨てる [`LogSink`]（SUP-7・SUP-1・REPAIR-5）。
+///
+/// 記録先が無い（`StartDeps::open_log_sink` が `None`）場合でも、launcher が返した出力パイプを有界に読み捨てて
+/// コンテナの `write` が詰まらないようにするため、捕捉ハブ（`CaptureHub`）の sink として使う。
+/// 読み取り側を保持するだけで読まないと、パイプ容量を超えた出力でコンテナが停止し、監視が終了を待ち続ける。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DiscardLogSink;
+
+impl LogSink for DiscardLogSink {
+    fn append(&self, _stream: StreamKind, _line: &[u8]) -> Result<(), TraitError> {
         Ok(())
     }
 }
@@ -1030,6 +1046,23 @@ mod tests {
             stream,
             bytes: s.to_vec(),
         }
+    }
+
+    /// SUP-1・SUP-7・REPAIR-5: 捨て sink でも出力を EOF まで読み切り、パイプを詰まらせない（行は記録しない）。
+    #[test]
+    fn sup7_discard_sink_reads_all_output_and_drops_lines() {
+        let big = vec![b'x'; 200_000];
+        let mut data = big.clone();
+        data.push(b'\n');
+        let budget = ReaderBudget::with_max_limit();
+        let cap = LogCapture::start(
+            OutputStreams::new(&budget, boxed(&data), None),
+            Arc::new(DiscardLogSink),
+        )
+        .unwrap();
+        let sum = cap.drain(Duration::from_secs(10)).unwrap();
+        assert!(sum.stdout().unwrap().error_code().is_none());
+        assert_eq!(wait_live(&budget, 0), 0);
     }
 
     /// REPAIR-5・TASK-157.7: 溢れる timeout は panic せず InvalidArgument を返す。

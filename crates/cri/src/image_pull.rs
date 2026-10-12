@@ -8,8 +8,12 @@
 //! 2. 認証（`RegistryClient::authenticate`。匿名・Basic・Bearer を oci が自動選択）
 //! 3. manifest 取得と platform 解決（`fetch_manifest`）
 //! 4. 通信前のサイズ検証（descriptor の合計が [`PullConfig::max_image_bytes`] 以下）
-//! 5. config と各 layer の blob を一意なステージング領域へ取得し、sha256 digest を検証（`verify_blob_digest`）
+//! 5. config と各 layer の blob を一意なステージング領域へ取得し、開いたハンドルで所有者・権限・ハードリンク数を
+//!    確認してから、同じハンドルの内容の sha256 digest を検証（`verify_blob_file_digest`）
 //! 6. 検証済み blob をコンテンツアドレスのパス `<cache_dir>/blobs/sha256/<hex>` へ公開
+//!
+//! キャッシュに同じ digest の blob が既にあれば 5 の取得を省くが、再利用するのは「信頼できる」既存 blob だけ
+//! （下記「既存 blob の再利用条件」）。条件を満たさない既存 blob は、ステージングへ取得し直したファイルで置き換える。
 //!
 //! # 契約
 //!
@@ -18,6 +22,37 @@
 //! - ステージング領域は成否に関わらず後始末する（ステージング領域の `Drop` で削除）
 //! - エラー文言は固定の英語で、イメージ名・資格情報・レジストリ応答の文言を含めない（`.claude/rules/security.md`）
 //! - 資格情報は oci の `BasicCredentials` で検証され、`Debug` は伏せられる。zeroize は未対応（oci と同様。依存を足さない）
+//!
+//! # 既存 blob の再利用条件（OCI-1・SEC）
+//!
+//! キャッシュのディレクトリを他ユーザー書き込み不可にしても、その中の既存 inode の書き換えは防げない
+//! （他ユーザー所有・group / other 書き込み可のファイルや、別の場所からハードリンクされたファイルは、
+//! 検証後にも内容を変えられる）。そのため既存 blob は、次をすべて満たすときだけ再取得を省く。
+//!
+//! - パスの最終要素が symlink でない通常ファイルである（`open_blob_nofollow`。symlink は辿らない）
+//! - 所有者が呼び出しプロセスと同じ（キャッシュのディレクトリ検証と同じ基準）
+//! - group / other の書き込み権限が無い
+//! - ハードリンク数が 1（キャッシュ外の名前から同じ inode を書き換えられない）
+//! - 内容の digest とサイズが descriptor と一致する
+//!
+//! 検査と利用の間の差し替え（TOCTOU）への対処: メタデータは開いたハンドルの fstat から読み、digest も同じ
+//! ハンドルから計算する（パスを再解決しない）。条件を満たさない・開けない・読めない場合は再利用せず、
+//! ステージングの所有者専用（0700）ディレクトリへ取得して同じ手順で検証したファイルを rename で公開する
+//! （rename は既存のエントリを置き換えるだけで、symlink の先・ハードリンクされた元の inode には書き込まない）。
+//! 公開するファイルは 0600 に揃えるため、次回の pull で上記の条件を満たす。
+//!
+//! 限界:
+//!
+//! - 本モジュールが保証するのは「この pull が確認した時点で、キャッシュのエントリが上記条件を満たす検証済みの
+//!   ファイルである」ことまで。キャッシュの blob を後から読む処理（tar 展開は TASK-52.3）は、パスを信頼せず
+//!   同じ手順（symlink を辿らずに開く → ハンドルで条件を確認 → 同じハンドルから読む）で開き直すこと
+//! - 同一 UID の別プロセスと root による書き換えは対象外（キャッシュの所有者自身のため防げない）。所有者または
+//!   root が過去に権限を緩めていた間に他ユーザーが開いた書き込み用の記述子も、現在のメタデータからは検出できない
+//! - 既存のキャッシュディレクトリが他ユーザーから辿れる権限（0755 等）で、OS が他人のファイルへのハードリンク作成を
+//!   禁じていない場合、他ユーザーが blob へリンクを張るとリンク数が 2 になり、次の pull で取得し直しになる
+//!   （内容は書き換えられず完全性は保たれるが、再取得を強制できる。本モジュールが新規に作るディレクトリは 0700）
+//! - 非 Unix では所有者・権限を確認できないため再利用も公開もしない（キャッシュ準備の時点で `Unimplemented` で
+//!   拒否する。fail-closed）
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
@@ -37,7 +72,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fandhe_container_oci::auth::{BasicCredentials, RegistryAuth};
 use fandhe_container_oci::error::{OciError, OciErrorCode};
-use fandhe_container_oci::layer::verify_blob_digest;
+use fandhe_container_oci::layer::{open_blob_nofollow, verify_blob_file_digest};
 use fandhe_container_oci::manifest::{Descriptor, ImageManifest, Platform};
 use fandhe_container_oci::reference::{
     DOCKER_HUB_REGISTRY_HOST, Digest, ImageReference, Reference, RegistryHost, Repository,
@@ -200,6 +235,8 @@ pub trait RegistryPullClient: Send + Sync {
     ) -> Result<PulledManifest, OciError>;
 
     /// blob を `dest` へ保存する。`dest` は未存在であること。digest 検証は呼び出し側が行う。
+    /// `dest` は通常ファイルとして新規作成すること（呼び出し側は symlink・ハードリンクされたファイルを公開せず、
+    /// 公開前に権限を 0600 へ狭める）。
     fn fetch_blob(
         &self,
         endpoint: &RegistryEndpoint,
@@ -373,29 +410,32 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
     }
 
     /// `blobs/sha256` を作る（Unix では 0700）。
-    fn blobs_dir(&self) -> Result<PathBuf, PullError> {
+    fn blobs_dir(&self) -> Result<TrustedDir, PullError> {
         prepare_private_dir(&self.config.cache_dir, &["blobs", "sha256"])
     }
 
-    /// 検証済みなら取得を省き、そうでなければステージングへ取得 → 検証 → 公開する。
+    /// 信頼できる検証済みの既存 blob があれば取得を省き、そうでなければステージングへ取得 → 検証 → 公開する。
     fn ensure_blob(
         &self,
         request: &PullContext<'_>,
         auth: &mut RegistryAuth,
         staging: &StagingDir,
-        blobs: &Path,
+        blobs: &TrustedDir,
         descriptor: &Descriptor,
     ) -> Result<(), PullError> {
         let hex = digest_hex(&descriptor.digest);
-        let final_path = blobs.join(hex);
-        // キャッシュ命中: 通常ファイル（symlink は辿らない）かつ再検証に合格すれば再取得しない。
-        // 再検証に失敗しても共有 blob は消さない（一過性の読み出しエラーで検証済み blob を失わないため）。
+        let final_path = blobs.path.join(hex);
+        // キャッシュ命中: 所有者・権限・ハードリンク数と内容の検証（モジュール冒頭「既存 blob の再利用条件」）に
+        // 合格した既存 blob だけ再取得を省く。
+        // 不合格でも共有 blob はここでは消さない（一過性の読み出しエラーで検証済み blob を失わないため）。
         // 取得・検証に成功した場合に限り、下の rename で置き換える。
-        // サイズは読み取り上限ではなく宣言値との完全一致で確認する（短い blob の誤受理を防ぐ。OCI-1）。
-        if let Ok(meta) = fs::symlink_metadata(&final_path)
-            && meta.is_file()
-            && verify_blob_digest(&final_path, &descriptor.digest, descriptor.size)
-                .is_ok_and(|v| v.size == descriptor.size)
+        if inspect_cached_blob(
+            &final_path,
+            &descriptor.digest,
+            descriptor.size,
+            blobs.owner,
+        )
+        .is_ok()
         {
             return Ok(());
         }
@@ -427,14 +467,22 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
                 Err(e) => return Err(PullError::from_oci(&e)),
             }
         }
-        let verified = verify_blob_digest(&staged, &descriptor.digest, descriptor.size)
+        // 公開するファイルも既存 blob と同じ条件で確認する。ハンドルを保持したまま権限を狭めて内容を検証し、
+        // 確認したファイルと公開するファイルが食い違わないようにする（ステージングは pull ごとの 0700 で、
+        // 他ユーザーはエントリを差し替えられない）。
+        let staged_file = open_staged_blob(&staged, blobs.owner)?;
+        let verified = verify_blob_file_digest(&staged_file, &descriptor.digest, descriptor.size)
             .map_err(|e| PullError::from_oci(&e))?;
+        // サイズは読み取り上限ではなく宣言値との完全一致で確認する（短い blob の誤受理を防ぐ。OCI-1）。
         if verified.size != descriptor.size {
             return Err(PullError::new(
                 OciErrorCode::DataLoss,
                 "blob size does not match the descriptor",
             ));
         }
+        drop(staged_file);
+        // rename は既存のエントリ（信頼できない blob・symlink を含む）を置き換える。symlink の先や、
+        // ハードリンクされた元の inode へは書き込まない。
         fs::rename(&staged, &final_path).map_err(|_| {
             PullError::new(
                 OciErrorCode::FailedPrecondition,
@@ -619,9 +667,10 @@ pub fn canonical_reference(input: &str) -> Option<String> {
 /// `components` は `cache_dir` 直下から順に非再帰で作成し（既存は許容）、各要素について
 /// 「symlink でない通常ディレクトリ」「呼び出しプロセスと同一所有者」「group / other 書き込み権限なし」
 /// （Unix）を確認する。検証済みの所有者専用ディレクトリは他ユーザーが差し替えられないため、検証後の
-/// blob 公開（rename）で未検証の内容が混入する経路を塞ぐ。
+/// blob 公開（rename）で未検証の内容が混入する経路を塞ぐ。ディレクトリの検証は配下の既存 inode の書き換えを
+/// 防がないため、blob ファイル自体の所有者・権限・ハードリンク数は [`check_blob_trust`] で別に確認する。
 /// 0700 の指定は新規作成時にしか効かないので、既存ディレクトリは必ずここで検証する。
-fn prepare_private_dir(cache_dir: &Path, components: &[&str]) -> Result<PathBuf, PullError> {
+fn prepare_private_dir(cache_dir: &Path, components: &[&str]) -> Result<TrustedDir, PullError> {
     let prep_err = || {
         PullError::new(
             OciErrorCode::FailedPrecondition,
@@ -656,7 +705,170 @@ fn prepare_private_dir(cache_dir: &Path, components: &[&str]) -> Result<PathBuf,
         }
         verify_private_dir(&current, owner)?;
     }
-    Ok(current)
+    Ok(TrustedDir {
+        path: current,
+        owner,
+    })
+}
+
+/// 検証済みのキャッシュ配下ディレクトリと、検証に使った所有者基準（[`prepare_private_dir`] の戻り値）。
+///
+/// `owner` は呼び出しプロセスの実効 UID 相当（`owner_probe`）で、配下の blob ファイルの所有者確認
+/// （[`check_blob_trust`]）にも同じ値を使う（基準を取り直さない）。
+#[derive(Debug)]
+struct TrustedDir {
+    path: PathBuf,
+    owner: u32,
+}
+
+/// blob ファイルの信頼条件の判定材料。開いたハンドルの fstat から得た値で、パスからは読まない
+/// （[`blob_file_facts`]）。判定（[`check_blob_trust`]）を OS 呼び出しから分け、他ユーザー所有のように
+/// root なしでは作れない状態も具体値で試験できるようにする（REPAIR-12）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlobFileFacts {
+    /// 通常ファイルか（ディレクトリ・FIFO・デバイス等でない）。
+    is_regular_file: bool,
+    /// 所有者の UID。
+    owner_uid: u32,
+    /// `st_mode`（判定には権限ビットだけを使う）。
+    mode: u32,
+    /// ハードリンク数（`st_nlink`）。
+    hard_links: u64,
+}
+
+/// blob ファイルが信頼条件を満たさない理由（[`check_blob_trust`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlobTrustViolation {
+    /// 通常ファイルでない。
+    NotRegularFile,
+    /// 所有者が呼び出しプロセスと異なる（所有者は後から権限を変えて書き換えられる）。
+    UnexpectedOwner,
+    /// ハードリンク数が 1 でない（キャッシュ外の名前から同じ inode を書き換えられる）。
+    UnexpectedLinkCount,
+    /// group / other に書き込み権限がある。
+    WritableByOthers,
+}
+
+/// blob ファイルを再利用・公開してよいか判定する（OCI-1・SEC。OS 呼び出しを含まない純粋関数）。
+///
+/// 条件は「通常ファイル」「所有者が `owner`」「ハードリンク数が 1」「group / other 書き込み不可」。
+/// 違反が複数あれば、この順で最初の 1 つを返す（順序は契約。[`open_staged_blob`] は
+/// `WritableByOthers` を「それ以外の条件は満たしている」と読む）。同種の確認は net の hosts ファイル追記・
+/// plugin の UDS 検証にもある（crate をまたぐ共有はしていない）。
+fn check_blob_trust(facts: &BlobFileFacts, owner: u32) -> Result<(), BlobTrustViolation> {
+    if !facts.is_regular_file {
+        return Err(BlobTrustViolation::NotRegularFile);
+    }
+    if facts.owner_uid != owner {
+        return Err(BlobTrustViolation::UnexpectedOwner);
+    }
+    if facts.hard_links != 1 {
+        return Err(BlobTrustViolation::UnexpectedLinkCount);
+    }
+    if facts.mode & 0o022 != 0 {
+        return Err(BlobTrustViolation::WritableByOthers);
+    }
+    Ok(())
+}
+
+/// 開いたハンドルから判定材料を読む（fstat。パスは引かない）。読めなければ `None`。
+#[cfg(unix)]
+fn blob_file_facts(file: &fs::File) -> Option<BlobFileFacts> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = file.metadata().ok()?;
+    Some(BlobFileFacts {
+        is_regular_file: meta.file_type().is_file(),
+        owner_uid: meta.uid(),
+        mode: meta.mode(),
+        hard_links: meta.nlink(),
+    })
+}
+
+/// 非 Unix では所有者・権限・ハードリンク数を標準ライブラリで取得できないため、常に `None`
+/// （呼び出し側は再利用も公開もしない。fail-closed）。キャッシュ準備（`owner_probe`）が先に
+/// `Unimplemented` で拒否するため、現状は到達しない。
+#[cfg(not(unix))]
+fn blob_file_facts(_file: &fs::File) -> Option<BlobFileFacts> {
+    None
+}
+
+/// 既存 blob を再利用しない理由（[`inspect_cached_blob`]）。いずれの場合も呼び出し側は取得し直す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CachedBlobRejection {
+    /// 存在しない・symlink や通常ファイル以外・開けない・開く間に差し替えられた。
+    Unopenable,
+    /// メタデータを取得できず、信頼条件を確認できない（非 Unix を含む）。
+    Unverifiable,
+    /// 信頼条件を満たさない。
+    Untrusted(BlobTrustViolation),
+    /// 内容の digest またはサイズが descriptor と一致しない・読み出しに失敗した。
+    ContentMismatch,
+}
+
+/// キャッシュの既存 blob を再利用してよいか確認する（OCI-1・SEC。`ensure_blob` のキャッシュ命中判定）。
+///
+/// symlink を辿らずに開いたハンドルで信頼条件（[`check_blob_trust`]）を確認し、同じハンドルから digest を
+/// 計算して descriptor の `digest`・`size` と突合する。確認と読み取りの間でパスを再解決しないため、
+/// 確認したファイルと検証したファイルは同一である。ファイルは変更も削除もしない。
+fn inspect_cached_blob(
+    path: &Path,
+    digest: &Digest,
+    size: u64,
+    owner: u32,
+) -> Result<(), CachedBlobRejection> {
+    let file = open_blob_nofollow(path).map_err(|_| CachedBlobRejection::Unopenable)?;
+    let facts = blob_file_facts(&file).ok_or(CachedBlobRejection::Unverifiable)?;
+    check_blob_trust(&facts, owner).map_err(CachedBlobRejection::Untrusted)?;
+    // サイズは読み取り上限ではなく宣言値との完全一致で確認する（短い blob の誤受理を防ぐ。OCI-1）。
+    match verify_blob_file_digest(&file, digest, size) {
+        Ok(verified) if verified.size == size => Ok(()),
+        _ => Err(CachedBlobRejection::ContentMismatch),
+    }
+}
+
+/// 公開する blob の権限（所有者のみ読み書き）。oci の `fetch_blob` が作る `.part` と同じ値。
+#[cfg(unix)]
+const PUBLISHED_BLOB_MODE: u32 = 0o600;
+
+/// ステージングへ取得した blob を公開してよい状態にし、検証用のハンドルを返す（OCI-1・SEC）。
+///
+/// symlink を辿らずに開き、ハンドルの fstat で「通常ファイル」「所有者が `owner`」「ハードリンク数が 1」を
+/// 確認してから、同じハンドルで権限を 0600 へ狭め（fchmod）、狭めた後の状態を [`check_blob_trust`] で
+/// 確認し直す。所有者・種別・リンク数は変えられないので拒否し、権限だけをここで揃える（取得側の umask に
+/// 依らず、公開した blob が次回の pull で再利用条件を満たすようにする）。呼び出し側は返ったハンドルから
+/// digest を検証する。失敗は固定文言の `FailedPrecondition`。
+#[cfg(unix)]
+fn open_staged_blob(path: &Path, owner: u32) -> Result<fs::File, PullError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let unsafe_blob = || {
+        PullError::new(
+            OciErrorCode::FailedPrecondition,
+            "staged blob is not safe to publish",
+        )
+    };
+    let file = open_blob_nofollow(path).map_err(|_| unsafe_blob())?;
+    let facts = blob_file_facts(&file).ok_or_else(unsafe_blob)?;
+    match check_blob_trust(&facts, owner) {
+        Ok(()) | Err(BlobTrustViolation::WritableByOthers) => {}
+        Err(_) => return Err(unsafe_blob()),
+    }
+    file.set_permissions(fs::Permissions::from_mode(PUBLISHED_BLOB_MODE))
+        .map_err(|_| unsafe_blob())?;
+    let facts = blob_file_facts(&file).ok_or_else(unsafe_blob)?;
+    if check_blob_trust(&facts, owner).is_err() || facts.mode & 0o777 != PUBLISHED_BLOB_MODE {
+        return Err(unsafe_blob());
+    }
+    Ok(file)
+}
+
+/// 非 Unix では所有者・権限を確認できないため公開しない（fail-closed）。キャッシュ準備（`owner_probe`）が
+/// 先に `Unimplemented` で拒否するため、現状は到達しない。
+#[cfg(not(unix))]
+fn open_staged_blob(_path: &Path, _owner: u32) -> Result<fs::File, PullError> {
+    Err(PullError::new(
+        OciErrorCode::Unimplemented,
+        "image cache access control is not supported on this platform",
+    ))
 }
 
 /// `cache_dir` を絶対化し、実在する最も深い祖先（またはパス自身）と、その下の未作成要素に分ける。
@@ -876,7 +1088,7 @@ static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl StagingDir {
     fn create(cache_dir: &Path) -> Result<Self, PullError> {
-        let root = prepare_private_dir(cache_dir, &["staging"])?;
+        let root = prepare_private_dir(cache_dir, &["staging"])?.path;
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -1096,6 +1308,139 @@ mod tests {
         }
     }
 
+    /// 信頼条件をすべて満たす判定材料（所有者 1000・0600・リンク数 1 の通常ファイル）。
+    fn trusted_facts() -> BlobFileFacts {
+        BlobFileFacts {
+            is_regular_file: true,
+            owner_uid: 1000,
+            mode: 0o100_600,
+            hard_links: 1,
+        }
+    }
+
+    /// OCI-1・SEC: 所有者一致・group / other 書き込み不可・リンク数 1 の通常ファイルだけを信頼する。
+    #[test]
+    fn sec_blob_trust_accepts_only_private_single_link_regular_files() {
+        assert_eq!(check_blob_trust(&trusted_facts(), 1000), Ok(()));
+        // 読み取りだけの共有（0644・0444）は書き換え経路にならないため許す。
+        for mode in [0o100_644, 0o100_444, 0o100_640, 0o100_400] {
+            let facts = BlobFileFacts {
+                mode,
+                ..trusted_facts()
+            };
+            assert_eq!(check_blob_trust(&facts, 1000), Ok(()), "mode {mode:o}");
+        }
+        // root で動く場合の基準は 0。
+        let root_owned = BlobFileFacts {
+            owner_uid: 0,
+            ..trusted_facts()
+        };
+        assert_eq!(check_blob_trust(&root_owned, 0), Ok(()));
+    }
+
+    /// OCI-1・SEC: 他ユーザー所有・group / other 書き込み可・ハードリンクあり・通常ファイル以外を拒否する
+    /// （他ユーザー所有は root なしでは実ファイルで作れないため、判定材料を直接与えて照合する）。
+    #[test]
+    fn sec_blob_trust_rejects_untrusted_metadata() {
+        let other_owner = BlobFileFacts {
+            owner_uid: 1001,
+            ..trusted_facts()
+        };
+        assert_eq!(
+            check_blob_trust(&other_owner, 1000),
+            Err(BlobTrustViolation::UnexpectedOwner)
+        );
+        // root 所有でも、呼び出しプロセスが root でなければ基準と異なる所有者として拒否する。
+        let root_owned = BlobFileFacts {
+            owner_uid: 0,
+            ..trusted_facts()
+        };
+        assert_eq!(
+            check_blob_trust(&root_owned, 1000),
+            Err(BlobTrustViolation::UnexpectedOwner)
+        );
+        assert_eq!(
+            check_blob_trust(&trusted_facts(), 0),
+            Err(BlobTrustViolation::UnexpectedOwner)
+        );
+
+        for mode in [
+            0o100_620, 0o100_602, 0o100_622, 0o100_664, 0o100_666, 0o100_646,
+        ] {
+            let facts = BlobFileFacts {
+                mode,
+                ..trusted_facts()
+            };
+            assert_eq!(
+                check_blob_trust(&facts, 1000),
+                Err(BlobTrustViolation::WritableByOthers),
+                "mode {mode:o}"
+            );
+        }
+
+        for hard_links in [0, 2, 3, u64::MAX] {
+            let facts = BlobFileFacts {
+                hard_links,
+                ..trusted_facts()
+            };
+            assert_eq!(
+                check_blob_trust(&facts, 1000),
+                Err(BlobTrustViolation::UnexpectedLinkCount),
+                "links {hard_links}"
+            );
+        }
+
+        let directory = BlobFileFacts {
+            is_regular_file: false,
+            mode: 0o040_700,
+            ..trusted_facts()
+        };
+        assert_eq!(
+            check_blob_trust(&directory, 1000),
+            Err(BlobTrustViolation::NotRegularFile)
+        );
+    }
+
+    /// OCI-1・SEC: 違反が複数あるときは「種別 → 所有者 → リンク数 → 権限」の順で最初の 1 つを返す
+    /// （`open_staged_blob` は `WritableByOthers` を「権限以外は満たす」と読むため、順序は契約）。
+    #[test]
+    fn sec_blob_trust_reports_the_first_violation_in_contract_order() {
+        let all_bad = BlobFileFacts {
+            is_regular_file: false,
+            owner_uid: 1001,
+            mode: 0o100_666,
+            hard_links: 2,
+        };
+        assert_eq!(
+            check_blob_trust(&all_bad, 1000),
+            Err(BlobTrustViolation::NotRegularFile)
+        );
+        let regular = BlobFileFacts {
+            is_regular_file: true,
+            ..all_bad
+        };
+        assert_eq!(
+            check_blob_trust(&regular, 1000),
+            Err(BlobTrustViolation::UnexpectedOwner)
+        );
+        let owned = BlobFileFacts {
+            owner_uid: 1000,
+            ..regular
+        };
+        assert_eq!(
+            check_blob_trust(&owned, 1000),
+            Err(BlobTrustViolation::UnexpectedLinkCount)
+        );
+        let single = BlobFileFacts {
+            hard_links: 1,
+            ..owned
+        };
+        assert_eq!(
+            check_blob_trust(&single, 1000),
+            Err(BlobTrustViolation::WritableByOthers)
+        );
+    }
+
     /// CRI-4: 正規化名は Docker Hub を `docker.io` へ戻し、他レジストリはホストを保つ。
     #[test]
     fn cri4_display_name_normalization() {
@@ -1112,6 +1457,199 @@ mod tests {
     }
 }
 
+/// 実ファイルでの blob の信頼条件の試験（Unix。所有者の不一致は、基準側の `owner` をずらして再現する）。
+#[cfg(all(test, unix))]
+mod blob_trust_fs_tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    /// `abc` の sha256。
+    const ABC: &str = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "fandhe-cri-blob-trust-{tag}-{}-{}",
+                std::process::id(),
+                STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).expect("mkdir");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn abc() -> Digest {
+        Digest::parse(ABC).expect("digest")
+    }
+
+    /// 内容 `abc`・権限 `mode` のファイルを作り、パスと実際の所有者 UID を返す。
+    fn blob_with_mode(dir: &TempDir, name: &str, mode: u32) -> (PathBuf, u32) {
+        let path = dir.0.join(name);
+        fs::write(&path, b"abc").expect("write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("chmod");
+        let uid = fs::metadata(&path).expect("stat").uid();
+        (path, uid)
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        fs::symlink_metadata(path).expect("stat").mode() & 0o777
+    }
+
+    /// OCI-1・SEC: 所有者専用・リンク数 1・内容一致の既存 blob は再利用でき、検査はファイルを変えない。
+    #[test]
+    fn sec_cached_blob_is_reusable_when_trusted_and_verified() {
+        let dir = TempDir::new("ok");
+        let (path, uid) = blob_with_mode(&dir, "blob", 0o600);
+        assert_eq!(inspect_cached_blob(&path, &abc(), 3, uid), Ok(()));
+        let (readable, _) = blob_with_mode(&dir, "readable", 0o644);
+        assert_eq!(inspect_cached_blob(&readable, &abc(), 3, uid), Ok(()));
+        assert_eq!(mode_of(&readable), 0o644);
+        assert_eq!(fs::read(&path).expect("read"), b"abc");
+    }
+
+    /// OCI-1・SEC: 内容が正しくても、所有者が基準と異なる blob は再利用しない。
+    #[test]
+    fn sec_cached_blob_with_unexpected_owner_is_not_reused() {
+        let dir = TempDir::new("owner");
+        let (path, uid) = blob_with_mode(&dir, "blob", 0o600);
+        let other = uid.wrapping_add(1);
+        assert_eq!(
+            inspect_cached_blob(&path, &abc(), 3, other),
+            Err(CachedBlobRejection::Untrusted(
+                BlobTrustViolation::UnexpectedOwner
+            ))
+        );
+    }
+
+    /// OCI-1・SEC: 内容が正しくても、group / other 書き込み可の blob は再利用しない。
+    #[test]
+    fn sec_cached_blob_writable_by_others_is_not_reused() {
+        let dir = TempDir::new("mode");
+        for mode in [0o620, 0o602, 0o664, 0o666] {
+            let (path, uid) = blob_with_mode(&dir, &format!("blob-{mode:o}"), mode);
+            assert_eq!(
+                inspect_cached_blob(&path, &abc(), 3, uid),
+                Err(CachedBlobRejection::Untrusted(
+                    BlobTrustViolation::WritableByOthers
+                )),
+                "mode {mode:o}"
+            );
+            assert_eq!(mode_of(&path), mode, "inspection must not change the file");
+        }
+    }
+
+    /// OCI-1・SEC: 内容が正しくても、別の名前からハードリンクされた blob（リンク数 2）は再利用しない。
+    #[test]
+    fn sec_cached_blob_with_extra_hard_link_is_not_reused() {
+        let dir = TempDir::new("link");
+        let (path, uid) = blob_with_mode(&dir, "blob", 0o600);
+        fs::hard_link(&path, dir.0.join("alias")).expect("link");
+        assert_eq!(fs::metadata(&path).expect("stat").nlink(), 2);
+        assert_eq!(
+            inspect_cached_blob(&path, &abc(), 3, uid),
+            Err(CachedBlobRejection::Untrusted(
+                BlobTrustViolation::UnexpectedLinkCount
+            ))
+        );
+        // リンクを外せば（リンク数 1）再利用できる。
+        fs::remove_file(dir.0.join("alias")).expect("unlink");
+        assert_eq!(inspect_cached_blob(&path, &abc(), 3, uid), Ok(()));
+    }
+
+    /// OCI-1・SEC: symlink（先が信頼条件を満たす正しい blob でも）・ディレクトリ・未存在は開かずに再利用しない。
+    #[test]
+    fn sec_cached_blob_symlink_and_non_regular_are_not_reused() {
+        let dir = TempDir::new("symlink");
+        let (target, uid) = blob_with_mode(&dir, "target", 0o600);
+        let link = dir.0.join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert_eq!(
+            inspect_cached_blob(&link, &abc(), 3, uid),
+            Err(CachedBlobRejection::Unopenable)
+        );
+        assert_eq!(
+            inspect_cached_blob(&dir.0, &abc(), 3, uid),
+            Err(CachedBlobRejection::Unopenable)
+        );
+        assert_eq!(
+            inspect_cached_blob(&dir.0.join("missing"), &abc(), 3, uid),
+            Err(CachedBlobRejection::Unopenable)
+        );
+    }
+
+    /// OCI-1: 信頼条件を満たしても、内容の digest・サイズが descriptor と一致しなければ再利用しない。
+    #[test]
+    fn oci1_cached_blob_with_wrong_content_or_size_is_not_reused() {
+        let dir = TempDir::new("content");
+        let (path, uid) = blob_with_mode(&dir, "blob", 0o600);
+        // 宣言サイズが実サイズより大きい（読み取り上限としては通るが完全一致しない）。
+        assert_eq!(
+            inspect_cached_blob(&path, &abc(), 5, uid),
+            Err(CachedBlobRejection::ContentMismatch)
+        );
+        // 宣言サイズが実サイズより小さい。
+        assert_eq!(
+            inspect_cached_blob(&path, &abc(), 2, uid),
+            Err(CachedBlobRejection::ContentMismatch)
+        );
+        fs::write(&path, b"xyz").expect("corrupt");
+        assert_eq!(
+            inspect_cached_blob(&path, &abc(), 3, uid),
+            Err(CachedBlobRejection::ContentMismatch)
+        );
+    }
+
+    /// OCI-1・SEC: 公開前のステージング blob は、取得側の権限（0666）に依らず 0600 へ狭める。
+    /// 返ったハンドルは狭めたファイル自身で、内容を検証できる。
+    #[test]
+    fn sec_staged_blob_is_restricted_to_owner_before_publish() {
+        let dir = TempDir::new("staged");
+        for mode in [0o666, 0o664, 0o644, 0o600] {
+            let (path, uid) = blob_with_mode(&dir, &format!("blob-{mode:o}"), mode);
+            let file = open_staged_blob(&path, uid).expect("open");
+            assert_eq!(mode_of(&path), 0o600, "mode {mode:o}");
+            let verified = verify_blob_file_digest(&file, &abc(), 3).expect("verify");
+            assert_eq!(verified.size, 3);
+            assert_eq!(inspect_cached_blob(&path, &abc(), 3, uid), Ok(()));
+        }
+    }
+
+    /// OCI-1・SEC: 所有者が異なる・ハードリンクされた・symlink のステージング blob は公開せず、
+    /// 権限も変更しない（所有者を確認する前に chmod しない）。
+    #[test]
+    fn sec_staged_blob_with_untrusted_identity_is_rejected_unchanged() {
+        let dir = TempDir::new("staged-bad");
+        let (path, uid) = blob_with_mode(&dir, "blob", 0o666);
+        let err = open_staged_blob(&path, uid.wrapping_add(1)).expect_err("owner");
+        assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(err.message(), "staged blob is not safe to publish");
+        assert_eq!(mode_of(&path), 0o666);
+
+        fs::hard_link(&path, dir.0.join("alias")).expect("link");
+        let err = open_staged_blob(&path, uid).expect_err("hard link");
+        assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(mode_of(&path), 0o666);
+
+        let (target, _) = blob_with_mode(&dir, "target", 0o644);
+        let link = dir.0.join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let err = open_staged_blob(&link, uid).expect_err("symlink");
+        assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(mode_of(&target), 0o644);
+
+        let err = open_staged_blob(&dir.0.join("missing"), uid).expect_err("missing");
+        assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+    }
+}
+
 #[cfg(all(test, not(unix)))]
 mod non_unix_tests {
     use super::*;
@@ -1121,6 +1659,28 @@ mod non_unix_tests {
     fn sec_cache_preparation_is_rejected_without_acl_verification() {
         let dir = std::env::temp_dir().join(format!("fandhe-cri-acl-{}", std::process::id()));
         let err = prepare_private_dir(&dir, &["staging"]).expect_err("rejected");
+        assert_eq!(err.code(), OciErrorCode::Unimplemented);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// SEC・OCI-1: 非 Unix では blob の所有者・権限を確認できないため、既存 blob を再利用せず、公開もしない。
+    #[test]
+    fn sec_blobs_are_neither_reused_nor_published_without_metadata() {
+        let dir = std::env::temp_dir().join(format!("fandhe-cri-blob-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("blob");
+        fs::write(&path, b"abc").expect("write");
+        let digest = Digest::parse(
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        )
+        .expect("digest");
+        assert_eq!(
+            inspect_cached_blob(&path, &digest, 3, 0),
+            Err(CachedBlobRejection::Unopenable)
+        );
+        let file = fs::File::open(&path).expect("open");
+        assert_eq!(blob_file_facts(&file), None);
+        let err = open_staged_blob(&path, 0).expect_err("rejected");
         assert_eq!(err.code(), OciErrorCode::Unimplemented);
         let _ = fs::remove_dir_all(&dir);
     }

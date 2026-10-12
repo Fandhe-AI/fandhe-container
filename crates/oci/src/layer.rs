@@ -8,6 +8,12 @@
 //! 検証対象は呼び出し側が管理するステージング領域のファイルとし、パスはエラー文言に載せない。
 //! 未実装（後続 issue）: `fetch_blob` 内への組み込み、manifest 本文の digest 突合、tar 展開・キャッシュ格納。
 //!
+//! 開いたハンドルでの検証（OCI-1・#446）: 呼び出し側が blob の所有者・権限・ハードリンク数を確認してから
+//! 内容を検証する場合（`fandhe-container-cri` の `PullImage` のキャッシュ再利用・公開）は、
+//! `open_blob_nofollow` で最終要素の symlink を辿らずに開き、そのハンドルのメタデータを確認したうえで
+//! `verify_blob_file_digest` に同じハンドルを渡す。パスを再解決しないため、確認と読み取りの間に
+//! 別のファイルへ差し替えられない。所有者・権限の判定（信頼条件）は本モジュールでは行わない（呼び出し側の責務）。
+//!
 //! gzip 展開（TASK-52.2・OCI-1・#407）: digest 検証済みの圧縮 blob を `GzipLayerReader` で逐次展開し、
 //! 後続の tar 展開（TASK-52.3）へ tar バイトストリームとして渡す。展開後サイズの上限は必須引数で、
 //! 超過した最初の読み取りで中断する（decompression bomb 対策。メモリ使用量は展開サイズに依存しない）。
@@ -18,7 +24,7 @@
 
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read, Seek as _, SeekFrom, Write};
 use std::path::Path;
 
 use flate2::read::MultiGzDecoder;
@@ -90,6 +96,76 @@ fn open_regular_blob(path: &Path) -> Result<File, OciError> {
     Ok(file)
 }
 
+/// 最終要素の symlink を辿らずに、通常ファイルの blob を読み取り専用で開く（OCI-1・#446）。
+///
+/// 呼び出し側（`fandhe-container-cri` の `PullImage`）は、返ったハンドルの `metadata`（fstat）で所有者・権限・
+/// ハードリンク数を確認し、同じハンドルを [`verify_blob_file_digest`] へ渡す。手順は次のとおり。
+///
+/// 1. `symlink_metadata`（lstat）で通常ファイルであることを確認する（symlink・FIFO・デバイス等は開かずに拒否する）
+/// 2. 非ブロッキングで開く（1 の後に FIFO へ差し替えられても `open` が止まらない。REPAIR-5）
+/// 3. 開いたハンドルの fstat と、開いた後に取り直した lstat の `dev` / `ino` が一致し、どちらも通常ファイルで
+///    あることを確認する。ハンドルを保持している間は inode が再利用されないため、一致すれば `path` の
+///    エントリ自身が開いたファイルであり、symlink を辿った先ではないと言える
+///
+/// `O_NOFOLLOW` を使わないのは、値が OS・アーキテクチャごとに異なり（Linux でも x86_64 と aarch64 で違う）、
+/// libc 依存なしに全ターゲットの値を持つと取り違えの余地が増えるため。`dev` / `ino` の照合は Unix 共通で書ける。
+///
+/// エラー: 存在しなければ `NotFound`、通常ファイルでなければ（symlink を含む）`InvalidArgument`、
+/// 開く間に差し替えられたら `FailedPrecondition`。
+/// 非 Unix: 標準ライブラリの安定版 API ではファイルの同一性（`dev` / `ino` 相当）を取得できず、symlink を
+/// 辿っていないことを確認できないため、開かずに `Unimplemented` で拒否する（fail-closed）。
+pub fn open_blob_nofollow(path: &Path) -> Result<File, OciError> {
+    open_blob_nofollow_inner(path, &|| {}, &|| {})
+}
+
+/// [`open_blob_nofollow`] の本体。`after_precheck` は手順 1 と 2 の間、`after_open` は手順 2 と 3 の間で呼ばれ、
+/// 試験が各時点での差し替えを再現するために使う（本番の呼び出しは何もしない）。
+#[cfg(unix)]
+fn open_blob_nofollow_inner(
+    path: &Path,
+    after_precheck: &dyn Fn(),
+    after_open: &dyn Fn(),
+) -> Result<File, OciError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let not_regular = || {
+        OciError::new(
+            OciErrorCode::InvalidArgument,
+            "blob path is not a regular file",
+        )
+    };
+    let before = std::fs::symlink_metadata(path).map_err(map_io_error)?;
+    if !before.file_type().is_file() {
+        return Err(not_regular());
+    }
+    after_precheck();
+    let file = open_blob(path).map_err(map_io_error)?;
+    let opened = file.metadata().map_err(map_io_error)?;
+    after_open();
+    let after = std::fs::symlink_metadata(path).map_err(map_io_error)?;
+    if !opened.file_type().is_file() || !after.file_type().is_file() {
+        return Err(not_regular());
+    }
+    if (opened.dev(), opened.ino()) != (after.dev(), after.ino()) {
+        return Err(OciError::new(
+            OciErrorCode::FailedPrecondition,
+            "blob path changed while opening",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_blob_nofollow_inner(
+    _path: &Path,
+    _after_precheck: &dyn Fn(),
+    _after_open: &dyn Fn(),
+) -> Result<File, OciError> {
+    Err(OciError::new(
+        OciErrorCode::Unimplemented,
+        "symlink-safe blob open is not supported on this platform",
+    ))
+}
+
 /// 計装なしの `verify_blob_digest_with`（`NoopOciOpRecorder`）。
 pub fn verify_blob_digest(
     path: &Path,
@@ -121,6 +197,52 @@ fn verify_blob_digest_inner(
     max_bytes: u64,
 ) -> Result<VerifiedBlob, OciError> {
     let file = open_regular_blob(path)?;
+    digest_of_open_blob(&file, expected, max_bytes)
+}
+
+/// 計装なしの `verify_blob_file_digest_with`（`NoopOciOpRecorder`）。
+pub fn verify_blob_file_digest(
+    file: &File,
+    expected: &Digest,
+    max_bytes: u64,
+) -> Result<VerifiedBlob, OciError> {
+    verify_blob_file_digest_with(&NoopOciOpRecorder, file, expected, max_bytes)
+}
+
+/// 開いた blob ファイルのハンドルの内容を `expected` と比較する（OCI-1・#446）。検証全体を
+/// `OciOpKind::VerifyBlobDigest` として `recorder` へ記録する（REPAIR-4）。
+///
+/// [`verify_blob_digest_with`] と違いパスを開き直さない。呼び出し側がハンドルのメタデータ（所有者・権限・
+/// ハードリンク数）を確認した、そのファイル自身の内容を検証するための入口（[`open_blob_nofollow`] と組で使う）。
+/// ハンドルが通常ファイルでなければ `InvalidArgument`。読み取り位置は先頭へ戻してから読むため、
+/// 呼び出し前の位置に依らず全体を検証する（検証後の位置は末尾）。`max_bytes`・不一致の扱いは
+/// `verify_blob_digest` と同じ。
+pub fn verify_blob_file_digest_with(
+    recorder: &dyn OciOpRecorder,
+    file: &File,
+    expected: &Digest,
+    max_bytes: u64,
+) -> Result<VerifiedBlob, OciError> {
+    record_oci_op(recorder, OciOpKind::VerifyBlobDigest, || {
+        let meta = file.metadata().map_err(map_io_error)?;
+        if !meta.is_file() {
+            return Err(OciError::new(
+                OciErrorCode::InvalidArgument,
+                "blob path is not a regular file",
+            ));
+        }
+        let mut handle = file;
+        handle.seek(SeekFrom::Start(0)).map_err(map_io_error)?;
+        digest_of_open_blob(file, expected, max_bytes)
+    })
+}
+
+/// 開いたハンドルを現在位置から EOF まで読み、sha256 を `expected` と比較する（パス・ハンドル両入口の共通部）。
+fn digest_of_open_blob(
+    file: &File,
+    expected: &Digest,
+    max_bytes: u64,
+) -> Result<VerifiedBlob, OciError> {
     let (hex, size) = sha256_hex_of_reader(file, max_bytes)?;
     let actual = format!("sha256:{hex}");
     if actual != expected.as_str() {
@@ -526,6 +648,176 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("verify must not block on a FIFO");
         assert_eq!(r.unwrap_err().code(), OciErrorCode::InvalidArgument);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// OCI-1・#446: 開いたハンドルの内容を検証する。読み取り位置に依らず全体を読み、検証対象は
+    /// パスではなくハンドルのファイルである（検証後にパスを差し替えても結果が変わらない）。
+    #[test]
+    fn oci1_verify_blob_file_digest_reads_the_given_handle() {
+        let d = tmp_dir("handle");
+        let p = d.join("b");
+        std::fs::write(&p, b"abc").unwrap();
+        let mut f = File::open(&p).unwrap();
+        let mut head = [0u8; 2];
+        f.read_exact(&mut head).unwrap();
+        assert_eq!(&head, b"ab");
+        let v = verify_blob_file_digest(&f, &Digest::parse(ABC).unwrap(), 3).unwrap();
+        assert_eq!(v.digest.as_str(), ABC);
+        assert_eq!(v.size, 3);
+
+        // パスを別内容のファイルへ差し替える（rename）。ハンドルは元のファイルを指したまま。
+        std::fs::write(d.join("other"), b"tampered").unwrap();
+        std::fs::rename(d.join("other"), &p).unwrap();
+        let v = verify_blob_file_digest(&f, &Digest::parse(ABC).unwrap(), 3).unwrap();
+        assert_eq!(v.size, 3);
+        let e = verify_blob_digest(&p, &Digest::parse(ABC).unwrap(), 10).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::DataLoss);
+
+        let e = verify_blob_file_digest(&f, &Digest::parse(EMPTY).unwrap(), 3).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::DataLoss);
+        assert_eq!(e.message(), MSG);
+        let e = verify_blob_file_digest(&f, &Digest::parse(ABC).unwrap(), 2).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// OCI-1・#446: ハンドルが通常ファイルでなければ（ディレクトリ）読まずに InvalidArgument。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_verify_blob_file_digest_rejects_non_regular_handle() {
+        let d = tmp_dir("handle-dir");
+        let dir_handle = File::open(&d).unwrap();
+        let e = verify_blob_file_digest(&dir_handle, &Digest::parse(ABC).unwrap(), 10).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "blob path is not a regular file");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// REPAIR-4・#446: ハンドル入口の検証も成功・DataLoss が 1 件ずつ記録される。
+    #[test]
+    fn oci1_verify_blob_file_digest_is_recorded() {
+        use crate::instrument::OciOpOutcome;
+        let d = tmp_dir("handle-rec");
+        let p = d.join("b");
+        std::fs::write(&p, b"abc").unwrap();
+        let f = File::open(&p).unwrap();
+        let c = Collect::default();
+        verify_blob_file_digest_with(&c, &f, &Digest::parse(ABC).unwrap(), 10).unwrap();
+        verify_blob_file_digest_with(&c, &f, &Digest::parse(EMPTY).unwrap(), 10).unwrap_err();
+        let v = c.0.lock().unwrap();
+        assert_eq!(v.len(), 2);
+        assert!(v.iter().all(|s| s.kind() == OciOpKind::VerifyBlobDigest));
+        assert_eq!(v[0].outcome(), OciOpOutcome::Success);
+        assert_eq!(v[1].error_code(), Some(OciErrorCode::DataLoss));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// OCI-1・#446: 通常ファイルは開け、symlink（先が通常ファイルでも）・ディレクトリ・未存在は拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_open_blob_nofollow_rejects_symlink_and_non_regular() {
+        let d = tmp_dir("nofollow");
+        let real = d.join("real");
+        std::fs::write(&real, b"abc").unwrap();
+        let f = open_blob_nofollow(&real).unwrap();
+        let v = verify_blob_file_digest(&f, &Digest::parse(ABC).unwrap(), 3).unwrap();
+        assert_eq!(v.size, 3);
+
+        let link = d.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let e = open_blob_nofollow(&link).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "blob path is not a regular file");
+
+        let e = open_blob_nofollow(&d).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::InvalidArgument);
+        let e = open_blob_nofollow(&d.join("none")).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::NotFound);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// OCI-1・#446: lstat の後に symlink へ差し替えられても、辿った先のファイルを返さない（TOCTOU）。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_open_blob_nofollow_rejects_symlink_swapped_in_after_precheck() {
+        let d = tmp_dir("nofollow-swap");
+        let outside = d.join("outside");
+        std::fs::write(&outside, b"abc").unwrap();
+        let p = d.join("b");
+        std::fs::write(&p, b"abc").unwrap();
+        let swap = || {
+            std::fs::remove_file(&p).unwrap();
+            std::os::unix::fs::symlink(&outside, &p).unwrap();
+        };
+        let e = open_blob_nofollow_inner(&p, &swap, &|| {}).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "blob path is not a regular file");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// OCI-1・#446: open の後にパスが別の通常ファイルへ差し替えられたら（dev / ino 不一致）FailedPrecondition。
+    /// lstat と open の間の差し替えは、差し替え後のファイル自身を開くため受理する（ハンドルとパスが一致する）。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_open_blob_nofollow_detects_replacement_by_identity() {
+        let d = tmp_dir("nofollow-ident");
+        let p = d.join("b");
+        std::fs::write(&p, b"abc").unwrap();
+        let replace = || {
+            std::fs::write(d.join("other"), b"").unwrap();
+            std::fs::rename(d.join("other"), &p).unwrap();
+        };
+        let e = open_blob_nofollow_inner(&p, &|| {}, &replace).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), "blob path changed while opening");
+
+        std::fs::write(&p, b"abc").unwrap();
+        let f = open_blob_nofollow_inner(&p, &replace, &|| {}).unwrap();
+        let v = verify_blob_file_digest(&f, &Digest::parse(EMPTY).unwrap(), 10).unwrap();
+        assert_eq!(v.size, 0);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// REPAIR-5・#446: FIFO は開かずに拒否し、lstat の後に FIFO へ差し替えられても open で止まらない。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn oci1_open_blob_nofollow_does_not_hang_on_fifo() {
+        let d = tmp_dir("nofollow-fifo");
+        let fifo = d.join("f");
+        let st = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(matches!(st, Ok(s) if s.success()), "mkfifo is required");
+        let p = d.join("b");
+        std::fs::write(&p, b"abc").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (fifo_c, p_c) = (fifo.clone(), p.clone());
+        std::thread::spawn(move || {
+            let direct = open_blob_nofollow(&fifo_c).map(|_| ());
+            let swap = || {
+                std::fs::remove_file(&p_c).unwrap();
+                let st = std::process::Command::new("mkfifo").arg(&p_c).status();
+                assert!(matches!(st, Ok(s) if s.success()), "mkfifo is required");
+            };
+            let swapped = open_blob_nofollow_inner(&p_c, &swap, &|| {}).map(|_| ());
+            let _ = tx.send((direct, swapped));
+        });
+        let (direct, swapped) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("open must not block on a FIFO");
+        assert_eq!(direct.unwrap_err().code(), OciErrorCode::InvalidArgument);
+        assert_eq!(swapped.unwrap_err().code(), OciErrorCode::InvalidArgument);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// OCI-1・#446: 非 Unix では symlink を辿っていないことを確認できないため、開かずに Unimplemented で拒否する。
+    #[cfg(not(unix))]
+    #[test]
+    fn oci1_open_blob_nofollow_is_rejected_without_file_identity() {
+        let d = tmp_dir("nofollow-nonunix");
+        let p = d.join("b");
+        std::fs::write(&p, b"abc").unwrap();
+        let e = open_blob_nofollow(&p).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::Unimplemented);
         std::fs::remove_dir_all(&d).unwrap();
     }
 

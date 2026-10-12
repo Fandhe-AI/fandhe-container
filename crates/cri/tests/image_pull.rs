@@ -4,7 +4,7 @@
 //! ステージング後始末・ストア登録は本物の経路を通す。実レジストリでの確認（`crictl pull`）は plugin-cri（TASK-114）以降。
 
 // 非 Unix ではキャッシュのアクセス制御を検証できず fail-closed で拒否するため、本ファイルは Unix 限定
-// （非 Unix の拒否は `image_pull_non_unix.rs`）。
+// （非 Unix の拒否は `src/image_pull.rs` の `non_unix_tests`）。
 #![cfg(unix)]
 
 use std::fs;
@@ -92,6 +92,8 @@ struct FakeClient {
     /// 先頭から数えてこの回数だけ blob 取得を PermissionDenied にする（token 失効の模擬）。
     deny_blob_fetches: AtomicUsize,
     auth_calls: AtomicUsize,
+    /// 指定すると、blob を書かずに `dest` をこのパスへの symlink として作る（不正な取得結果の模擬）。
+    staged_symlink_target: Option<PathBuf>,
 }
 
 impl FakeClient {
@@ -109,6 +111,7 @@ impl FakeClient {
             delay: Duration::ZERO,
             deny_blob_fetches: AtomicUsize::new(0),
             auth_calls: AtomicUsize::new(0),
+            staged_symlink_target: None,
         }
     }
 }
@@ -177,6 +180,10 @@ impl RegistryPullClient for FakeClient {
             ));
         }
         std::thread::sleep(self.blob_delay);
+        if let Some(target) = &self.staged_symlink_target {
+            return std::os::unix::fs::symlink(target, dest)
+                .map_err(|_| OciError::new(OciErrorCode::Internal, "symlink"));
+        }
         let hex = descriptor.digest.as_str().trim_start_matches("sha256:");
         let mut body = blob_body(hex).to_vec();
         if self.corrupt_digest == Some(hex) {
@@ -222,6 +229,21 @@ fn config(dir: &TempDir) -> PullConfig {
 
 fn blob_path(dir: &TempDir, hex: &str) -> PathBuf {
     dir.0.join("cache").join("blobs").join("sha256").join(hex)
+}
+
+/// 公開済み blob の（権限ビット, ハードリンク数）。symlink は辿らず、通常ファイルでなければ失敗する。
+fn blob_stat(dir: &TempDir, hex: &str) -> (u32, u64) {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = fs::symlink_metadata(blob_path(dir, hex)).expect("stat");
+    assert!(meta.file_type().is_file(), "blob must be a regular file");
+    (meta.mode() & 0o777, meta.nlink())
+}
+
+fn blob_inode(dir: &TempDir, hex: &str) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    fs::symlink_metadata(blob_path(dir, hex))
+        .expect("stat")
+        .ino()
 }
 
 fn staging_is_empty(dir: &TempDir) -> bool {
@@ -295,6 +317,10 @@ fn cri4_pull_tag_publishes_verified_blobs() {
     assert_eq!(fs::read(blob_path(&dir, SHA_LAYER1)).expect("l1"), b"abc");
     assert_eq!(fs::read(blob_path(&dir, SHA_LAYER2)).expect("l2"), b"world");
     assert!(staging_is_empty(&dir));
+    // 公開した blob は取得側の umask に依らず所有者専用（0600）・リンク数 1 の通常ファイル（OCI-1・SEC）。
+    for hex in [SHA_CONFIG, SHA_LAYER1, SHA_LAYER2] {
+        assert_eq!(blob_stat(&dir, hex), (0o600, 1), "{hex}");
+    }
 }
 
 /// OCI-1: index 経由なら選択 digest、digest 指定ならその digest が repo_digests に入る。
@@ -916,4 +942,118 @@ fn sec_pull_rejects_symlinked_cache_ancestor() {
     assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 0);
     // 拒否前にリンク先（キャッシュ外）へディレクトリ・probe ファイルを作らない。
     assert_eq!(fs::read_dir(&real).expect("read").count(), 0);
+}
+
+/// SEC・OCI-1: 内容が正しくても group / other 書き込み可の既存 blob は再利用せず、取得し直した
+/// 所有者専用のファイルで置き換える（他の blob は再利用する）。
+#[test]
+fn sec_pull_replaces_cached_blob_writable_by_others() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = TempDir::new("blobmode");
+    let client = Arc::new(FakeClient::new(two_layer_manifest()));
+    let puller = OciImagePuller::new(client.clone(), config(&dir));
+    puller.pull(&req("alpine:3.20")).expect("first");
+    assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 3);
+
+    let path = blob_path(&dir, SHA_LAYER1);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).expect("chmod");
+    let old_inode = blob_inode(&dir, SHA_LAYER1);
+    puller.pull(&req("alpine:3.20")).expect("second");
+    assert_eq!(
+        client.blob_fetches.load(Ordering::SeqCst),
+        4,
+        "only the untrusted blob is refetched"
+    );
+    assert_eq!(blob_stat(&dir, SHA_LAYER1), (0o600, 1));
+    assert_ne!(
+        blob_inode(&dir, SHA_LAYER1),
+        old_inode,
+        "replaced, not reused"
+    );
+    assert_eq!(fs::read(&path).expect("l1"), b"abc");
+    assert!(staging_is_empty(&dir));
+
+    puller.pull(&req("alpine:3.20")).expect("third");
+    assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 4, "cache hit");
+}
+
+/// SEC・OCI-1: キャッシュ外の名前からハードリンクされた既存 blob は再利用せず、別の inode のファイルで
+/// 置き換える。置き換え後は、元の名前から書き換えてもキャッシュの内容は変わらない。
+#[test]
+fn sec_pull_replaces_hard_linked_cached_blob() {
+    let dir = TempDir::new("bloblink");
+    let client = Arc::new(FakeClient::new(two_layer_manifest()));
+    let puller = OciImagePuller::new(client.clone(), config(&dir));
+    puller.pull(&req("alpine:3.20")).expect("first");
+    assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 3);
+
+    let path = blob_path(&dir, SHA_LAYER2);
+    let alias = dir.0.join("alias");
+    fs::hard_link(&path, &alias).expect("link");
+    assert_eq!(blob_stat(&dir, SHA_LAYER2), (0o600, 2));
+    let old_inode = blob_inode(&dir, SHA_LAYER2);
+
+    puller.pull(&req("alpine:3.20")).expect("second");
+    assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 4);
+    assert_eq!(blob_stat(&dir, SHA_LAYER2), (0o600, 1));
+    assert_ne!(blob_inode(&dir, SHA_LAYER2), old_inode);
+
+    // 元の inode は alias に残る。そこへ書き込んでもキャッシュの blob は変わらない。
+    fs::write(&alias, b"tampered").expect("tamper through the old link");
+    assert_eq!(fs::read(&path).expect("l2"), b"world");
+    puller.pull(&req("alpine:3.20")).expect("third");
+    assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 4, "cache hit");
+}
+
+/// SEC・OCI-1: 既存 blob のパスが symlink なら（先が正しい内容でも）辿らず、エントリを通常ファイルで
+/// 置き換える。symlink の先のファイルには書き込まない。
+#[test]
+fn sec_pull_replaces_symlinked_cached_blob_without_touching_the_target() {
+    use std::os::unix::fs::MetadataExt as _;
+    let dir = TempDir::new("blobsymlink");
+    let client = Arc::new(FakeClient::new(two_layer_manifest()));
+    let puller = OciImagePuller::new(client.clone(), config(&dir));
+    puller.pull(&req("alpine:3.20")).expect("first");
+    assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 3);
+
+    let path = blob_path(&dir, SHA_LAYER1);
+    let outside = dir.0.join("outside-blob");
+    fs::write(&outside, b"abc").expect("write");
+    let outside_before = fs::metadata(&outside).expect("stat");
+    fs::remove_file(&path).expect("remove");
+    std::os::unix::fs::symlink(&outside, &path).expect("symlink");
+
+    puller.pull(&req("alpine:3.20")).expect("second");
+    assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 4);
+    assert_eq!(blob_stat(&dir, SHA_LAYER1), (0o600, 1));
+    assert_eq!(fs::read(&path).expect("l1"), b"abc");
+
+    let outside_after = fs::metadata(&outside).expect("stat");
+    assert_eq!(outside_after.ino(), outside_before.ino());
+    assert_eq!(outside_after.mode(), outside_before.mode());
+    assert_eq!(outside_after.nlink(), 1);
+    assert_ne!(blob_inode(&dir, SHA_LAYER1), outside_after.ino());
+    assert_eq!(fs::read(&outside).expect("outside"), b"abc");
+}
+
+/// SEC・OCI-1: 取得結果が symlink のステージング blob は公開しない（先が正しい内容でも辿らない）。
+#[test]
+fn sec_pull_does_not_publish_symlinked_staged_blob() {
+    let dir = TempDir::new("stagedsymlink");
+    let outside = dir.0.join("outside-blob");
+    fs::write(&outside, b"hello").expect("write");
+    let mut client = FakeClient::new(two_layer_manifest());
+    client.staged_symlink_target = Some(outside.clone());
+    let client = Arc::new(client);
+    let puller = OciImagePuller::new(client.clone(), config(&dir));
+    let err = puller.pull(&req("alpine:3.20")).expect_err("rejected");
+    assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+    assert_eq!(err.message(), "staged blob is not safe to publish");
+    assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 1);
+    assert!(
+        fs::symlink_metadata(blob_path(&dir, SHA_CONFIG)).is_err(),
+        "nothing is published"
+    );
+    assert!(staging_is_empty(&dir));
+    assert_eq!(fs::read(&outside).expect("outside"), b"hello");
 }

@@ -2661,20 +2661,25 @@ pub(crate) fn dup_fd_at_least(fd: BorrowedFd<'_>, min: i32) -> Result<OwnedFd, S
     Ok(unsafe { OwnedFd::from_raw_fd(new) })
 }
 
-/// fd 0・1・2 を `fd` の実体で置き換える（`dup2`。置換先は close-on-exec が外れる）。呼び出し元が
-/// 引き継いだ標準入出力の実体（ホストのファイル・ソケット）をコンテナへ渡さないために使う。
-/// `fd` 自体が 0〜2 のいずれかのときは、その番号は置換せず close-on-exec を外して保持する。
+/// `targets`（0〜2 のうち置換する番号）だけを `fd` の実体で置き換える。
+///
+/// 子の stdout / stderr をログ用のパイプへ渡す場合（TASK-164 追補・#1471・SUP-7）に、パイプへ付け替え済みの
+/// 番号を `/dev/null` で上書きしないため、置換する番号を呼び出し側が選ぶ。`targets` に 0〜2 以外を含めると
+/// `EINVAL`。`fd` 自体が 0〜2 のいずれかのときは、その番号を（`targets` に含まれていなくても）閉じずに保持する。
 #[cfg_attr(test, allow(dead_code))]
-pub(crate) fn redirect_stdio_to(fd: OwnedFd) -> Result<(), SysError> {
+pub(crate) fn redirect_fds_to(fd: OwnedFd, targets: &[i32]) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
+    if targets.iter().any(|t| !(0..=2).contains(t)) {
+        return Err(SysError::Os(EINVAL));
+    }
     let raw = fd.as_raw_fd();
-    for target in 0..=2 {
+    for &target in targets {
         if target == raw {
             continue;
         }
-        // SAFETY: `raw` は `fd` が所有する生存中の fd。`target` は 0〜2 の整数で、引数はいずれも
+        // SAFETY: `raw` は `fd` が所有する生存中の fd。`target` は上で 0〜2 に検証した整数で、引数はいずれも
         // 整数のみ（ポインタなし）。既存の標準 fd は暗黙に close され置換される（意図した動作）。
         if unsafe { dup2(raw, target) } == -1 {
             return Err(last_error());
@@ -2687,6 +2692,30 @@ pub(crate) fn redirect_stdio_to(fd: OwnedFd) -> Result<(), SysError> {
         // 借用の間に close されない。
         let borrowed = unsafe { BorrowedFd::borrow_raw(kept) };
         return set_cloexec(borrowed, false);
+    }
+    Ok(())
+}
+
+/// `fd` の実体を番号 `target` へ複製する（`dup2`。`target` の既存の fd は暗黙に close される。複製先は
+/// close-on-exec が外れる）。`fd == target` のときは複製せず close-on-exec だけを外す。
+///
+/// 子の stdout / stderr をパイプの書き込み側へ付け替えるのに使う（TASK-164 追補・#1471・SUP-7）。
+/// `target` は 0 以上でなければ `EINVAL`。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn dup_onto(fd: BorrowedFd<'_>, target: i32) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    if target < 0 {
+        return Err(SysError::Os(EINVAL));
+    }
+    if fd.as_raw_fd() == target {
+        return set_cloexec(fd, false);
+    }
+    // SAFETY: `fd` は生存中の `BorrowedFd`。`target` は上で非負を確認した整数で、引数はいずれも整数のみ
+    // （ポインタなし）。`target` の既存の fd は暗黙に close され置換される（意図した動作）。
+    if unsafe { dup2(fd.as_raw_fd(), target) } == -1 {
+        return Err(last_error());
     }
     Ok(())
 }

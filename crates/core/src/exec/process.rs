@@ -371,6 +371,17 @@ fn exec_entrypoint_verified(
     pivot_mnt_id: u64,
     entry: &Entrypoint,
 ) -> Result<Infallible, ExecError> {
+    exec_entrypoint_verified_with(pivot_mnt_id, entry, StdioNulling::ALL)
+}
+
+/// [`exec_entrypoint_verified`] の、標準入出力のうち `/dev/null` へ置換する範囲を指定できる版
+/// （TASK-164 追補・#1471・SUP-7）。`nulling` で外した番号は、子の先頭で [`ChildStdio::install`] が付け替えた
+/// ログ用パイプのまま exec へ引き継ぐ。
+fn exec_entrypoint_verified_with(
+    pivot_mnt_id: u64,
+    entry: &Entrypoint,
+    nulling: StdioNulling,
+) -> Result<Infallible, ExecError> {
     const STAGE: IsolationStage = IsolationStage::Exec;
     let root = sys::open_dir_path_nofollow(None, c"/")
         .map_err(|e| ExecError::from_sys(e, STAGE, "openat(/)"))?;
@@ -382,15 +393,18 @@ fn exec_entrypoint_verified(
         ));
     }
     drop::<OwnedFd>(root);
-    exec_checked_entrypoint(entry)
+    exec_checked_entrypoint(entry, nulling)
 }
 
 /// `exec_entrypoint_verified` の手順 2 以降（fd 3 以上の close → エントリポイントの検査 → 標準入出力の置換 →
 /// `execveat`）。launch 経路（pivot 直後の mount ID 照合の後）と、稼働中コンテナへの exec
 /// （`exec_command::spawn_exec_command` の子。参加後の `/` の照合は `reapply_restrictions` が済ませている。
 /// SUP-6・TASK-163.4）が共有する。呼び出し元は「`/` が正しい root であること」を事前に保証すること。
-pub(super) fn exec_checked_entrypoint(entry: &Entrypoint) -> Result<Infallible, ExecError> {
-    let exe = prepare_exec_child(entry, None, EntrypointSource::Pinned, None)?;
+fn exec_checked_entrypoint(
+    entry: &Entrypoint,
+    nulling: StdioNulling,
+) -> Result<Infallible, ExecError> {
+    let exe = prepare_exec_child(entry, None, EntrypointSource::Pinned, None, nulling)?;
     Err(execve_checked(entry, &exe))
 }
 
@@ -419,6 +433,7 @@ fn prepare_exec_child(
     keep: Option<BorrowedFd<'_>>,
     source: EntrypointSource,
     deferred_fsize: Option<Rlimit>,
+    nulling: StdioNulling,
 ) -> Result<ExecutableFd, ExecError> {
     const STAGE: IsolationStage = IsolationStage::Exec;
     // 継承したホスト側の fd 3 以上を開く前に閉じる（rootfs 内の /proc/self/fd/N 経由で実体を開かれない）。
@@ -503,7 +518,8 @@ fn prepare_exec_child(
             .map_err(|e| ExecError::from_sys(e, STAGE, "fcntl(F_SETFD)"))?;
     }
     // 最後に標準入出力を置換する（以降の execve 失敗の診断は stderr へ出せず、終了コードのみで通知）。
-    redirect_stdio_to_null(root.as_fd(), procfs.as_fd())?;
+    // stdout / stderr をログ用パイプへ付け替え済みの番号は置換しない（`nulling` が外す。#1471）。
+    redirect_stdio_to_null(root.as_fd(), procfs.as_fd(), nulling)?;
     Ok(exe)
 }
 
@@ -697,11 +713,16 @@ fn mark_fds_cloexec() -> Result<(), ExecError> {
 /// 呼び出し元が引き継いだ 0〜2 番の実体（ホストのファイル・ソケット）をコンテナのエントリポイントへ
 /// 渡さない（CVE-2024-21626 型・fd 3 以上は `mark_fds_cloexec` が担当）。置換先は [`open_verified_null`] が
 /// 検証してから開いた `/dev/null` で、存在しない・`null` デバイス（1:3）でない場合は、別の実体を標準入出力に
-/// しないため fail-closed で拒否する。標準入出力の受け渡し（端末・パイプ）は TASK-29/30 の範囲（未実装）。
+/// しないため fail-closed で拒否する。stdout / stderr のパイプ受け渡しは [`ChildStdio`]（#1471）が先に付け替え、`nulling` が外した番号は
+/// 置換しない。端末（pty）の受け渡しは TASK-171.2（#537）の範囲（未実装）。
 #[cfg(not(test))]
-fn redirect_stdio_to_null(root: BorrowedFd<'_>, procfs: BorrowedFd<'_>) -> Result<(), ExecError> {
+fn redirect_stdio_to_null(
+    root: BorrowedFd<'_>,
+    procfs: BorrowedFd<'_>,
+    nulling: StdioNulling,
+) -> Result<(), ExecError> {
     let null = open_verified_null(root, procfs)?;
-    sys::redirect_stdio_to(null)
+    sys::redirect_fds_to(null, &nulling.targets())
         .map_err(|e| ExecError::from_sys(e, IsolationStage::Exec, "dup2(/dev/null)"))
 }
 
@@ -833,8 +854,16 @@ fn is_null_device(fd: BorrowedFd<'_>) -> Result<bool, ExecError> {
 
 /// テストビルドの dry-run 差し込み点。呼ばれたことだけを記録する。
 #[cfg(test)]
-fn redirect_stdio_to_null(_root: BorrowedFd<'_>, _procfs: BorrowedFd<'_>) -> Result<(), ExecError> {
-    tests::record("stdio->/dev/null".to_string());
+fn redirect_stdio_to_null(
+    _root: BorrowedFd<'_>,
+    _procfs: BorrowedFd<'_>,
+    nulling: StdioNulling,
+) -> Result<(), ExecError> {
+    tests::record(if nulling == StdioNulling::ALL {
+        "stdio->/dev/null".to_string()
+    } else {
+        format!("stdio{:?}->/dev/null", nulling.targets())
+    });
     Ok(())
 }
 
@@ -1101,6 +1130,7 @@ fn run_exec_child(
         Some(status.as_fd()),
         EntrypointSource::Switchable(seal_policy),
         deferred_fsize,
+        StdioNulling::ALL,
     )
     .and_then(|exe| {
         write_exec_status(status, EXEC_STATUS_READY)?;
@@ -1648,18 +1678,138 @@ fn parse_setup_report(text: &str) -> Option<ExecChildSetupReport> {
     })
 }
 
+/// 子の標準入出力のうち、exec 直前に `/dev/null` へ置換する番号（TASK-164 追補・#1471・SUP-7）。
+///
+/// fd 0（stdin）は常に置換する（受け渡しは未実装）。stdout / stderr は、ログ用パイプへ付け替え済みなら
+/// 置換せずパイプのまま exec へ引き継ぐ（`false`）。[`ChildStdio::install`] が付け替えた結果から作る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StdioNulling {
+    stdout: bool,
+    stderr: bool,
+}
+
+impl StdioNulling {
+    /// 3 本とも置換する（パイプ指定なし。従来どおり）。
+    const ALL: Self = Self {
+        stdout: true,
+        stderr: true,
+    };
+
+    /// `/dev/null` へ置換する fd 番号（昇順）。
+    fn targets(self) -> Vec<i32> {
+        let mut t = vec![0];
+        if self.stdout {
+            t.push(1);
+        }
+        if self.stderr {
+            t.push(2);
+        }
+        t
+    }
+}
+
+/// 子の stdout / stderr へ付け替えるパイプの書き込み側（TASK-164 追補・#1471・SUP-7・SUP-1）。
+///
+/// 親（launcher）が fork の前に [`ChildStdio::pipes`] で作り、`spawn_container_with_stages_and_stdio` へ渡す。
+/// 読み取り側は親に残り、supervisor の行単位捕捉（`LogCapture`）へ `ContainerOutput` として渡る。
+/// fork 後の親側のコピーは spawn が drop して書き込み側を閉じるため、子と孫がすべて終了すれば読み取り側は EOF に
+/// なる。fd は `pipe()` の close-on-exec のまま保持し、子が `install` で 1・2 へ複製した分だけが
+/// exec を越える（それ以外の書き込み側・読み取り側の fd は `close_inherited_fds` が閉じる）。
+///
+/// # 制限（SUP-5・SUP-8 との関係）
+/// 読み取り側（supervisor）が異常終了して閉じると、コンテナは次の出力 `write` で `SIGPIPE`（子は
+/// `reset_sigpipe` で既定動作に戻す）を受けて終了し得る。ワークロードのシグナル配置は変えない（POSIX の既定を維持）。
+/// supervisor 死亡後も稼働を続ける保証（SUP-5）は出力を書かないコンテナに限られ、出力を書くコンテナの扱いは
+/// 孤児の re-adopt・明示終了ポリシー（SUP-8・TASK-165）で解決する。supervisor が生きている間は、sink が失敗しても
+/// 読み取りは EOF まで続くため、コンテナの `write` は詰まらない。
+#[derive(Debug)]
+pub struct ChildStdio {
+    stdout: Option<OwnedFd>,
+    stderr: Option<OwnedFd>,
+}
+
+impl ChildStdio {
+    /// stdout・stderr それぞれ別のパイプを作り、書き込み側と読み取り側 2 本を返す。
+    ///
+    /// stdout と stderr を別のパイプにするのは、ログ行へストリーム名を付けるため（SUP-7）。
+    /// 失敗（fd 枯渇等）は `ExecError`（段は `Spawn`）。
+    pub fn pipes() -> Result<(Self, std::io::PipeReader, std::io::PipeReader), ExecError> {
+        let make = |what: &str| {
+            std::io::pipe().map_err(|e| ExecError::from_io(&e, IsolationStage::Spawn, what))
+        };
+        let (out_r, out_w) = make("pipe(stdout)")?;
+        let (err_r, err_w) = make("pipe(stderr)")?;
+        Ok((
+            Self {
+                stdout: Some(OwnedFd::from(out_w)),
+                stderr: Some(OwnedFd::from(err_w)),
+            },
+            out_r,
+            err_r,
+        ))
+    }
+
+    /// パイプ指定なし（stdout / stderr とも従来どおり `/dev/null`）。
+    pub fn none() -> Self {
+        Self {
+            stdout: None,
+            stderr: None,
+        }
+    }
+
+    /// 子の側で fd 1・2 へ付け替える。`prepare_exec_child` の `close_inherited_fds`（fd 3 以上を閉じる）より
+    /// 前に呼ぶこと（付け替えた 1・2 は閉じられない）。
+    ///
+    /// 先に各 fd を 3 以上へ退避してから複製する: パイプの fd 番号が 1・2 と重なると（親が標準 fd を閉じていた
+    /// 場合）、片方の複製がもう片方を上書きするため。戻り値は、以後 `/dev/null` へ置換しない番号を除いた範囲。
+    fn install(self) -> Result<StdioNulling, ExecError> {
+        const STAGE: IsolationStage = IsolationStage::Spawn;
+        let lift = |fd: Option<OwnedFd>, what: &str| -> Result<Option<OwnedFd>, ExecError> {
+            fd.map(|fd| {
+                sys::dup_fd_at_least(fd.as_fd(), 3).map_err(|e| ExecError::from_sys(e, STAGE, what))
+            })
+            .transpose()
+        };
+        let stdout = lift(self.stdout, "fcntl(F_DUPFD_CLOEXEC, stdout)")?;
+        let stderr = lift(self.stderr, "fcntl(F_DUPFD_CLOEXEC, stderr)")?;
+        if let Some(fd) = &stdout {
+            sys::dup_onto(fd.as_fd(), 1)
+                .map_err(|e| ExecError::from_sys(e, STAGE, "dup2(stdout pipe)"))?;
+        }
+        if let Some(fd) = &stderr {
+            sys::dup_onto(fd.as_fd(), 2)
+                .map_err(|e| ExecError::from_sys(e, STAGE, "dup2(stderr pipe)"))?;
+        }
+        Ok(StdioNulling {
+            stdout: stdout.is_none(),
+            stderr: stderr.is_none(),
+        })
+    }
+}
+
 /// 子のメイン。`establish` → `prepare_rootfs` → `pivot_root` → `exec_entrypoint` を通し、失敗したら
 /// stderr に英語 1 行を出して終了コードを返す（戻り値は `_exit` に渡される）。
 ///
 /// pivot 前の段（専用 `/dev`・tmpfs・注入）は渡された [`PrePivotSetup`] の分だけ、[`run_pre_pivot`] が固定順
 /// で行う。`None` なら最小構成（何も載せない）。
+///
+/// `stdio` は最初に fd 1・2 へ付け替える（#1471）。付け替えの失敗は stderr（付け替え前の継承 fd）へ出す。
+/// 副作用: パイプ指定時、これ以降の失敗診断（下の 1 行を含む）は supervisor の stderr ではなくコンテナのログに入る。
 fn child_main(
     rootfs: &Path,
     entry: &Entrypoint,
     stages: StagePipeline,
     setup: Option<PrePivotSetup<'_>>,
+    stdio: ChildStdio,
 ) -> i32 {
-    match run_child(rootfs, entry, stages, setup) {
+    let nulling = match stdio.install() {
+        Ok(n) => n,
+        Err(err) => {
+            let _ = writeln!(std::io::stderr(), "fandhe-container: {err}");
+            return exit_code_for(&err);
+        }
+    };
+    match run_child(rootfs, entry, stages, setup, nulling) {
         Ok(never) => match never {},
         Err(err) => {
             // env の値は message に含めない（パスと errno のみ）。stderr が閉じていても panic しない。
@@ -1674,12 +1824,13 @@ fn run_child(
     entry: &Entrypoint,
     stages: StagePipeline,
     setup: Option<PrePivotSetup<'_>>,
+    nulling: StdioNulling,
 ) -> Result<Infallible, ExecError> {
     run_child_then(rootfs, setup, stages, |isolation, report, evidence| {
         // `exec_entrypoint` と同じ検証を、ステージ列が作った証跡を添えて行う。
         isolation.verify_caller(IsolationStage::Exec)?;
         require_restriction_evidence(evidence)?;
-        exec_entrypoint_verified(report.new_root_mnt_id, entry)
+        exec_entrypoint_verified_with(report.new_root_mnt_id, entry, nulling)
     })
 }
 
@@ -2047,6 +2198,30 @@ pub fn spawn_container_with_stages(
     .map(|(child, _report)| child)
 }
 
+/// [`spawn_container_with_stages`] に、コンテナの stdout / stderr の付け替え先（[`ChildStdio`]）を足した版
+/// （TASK-164 追補・#1471・SUP-7・SUP-1）。
+///
+/// `stdio` の書き込み側は子が fd 1・2 へ付け替えて exec へ引き継ぎ、親の側のコピーは fork 後に閉じる。読み取り側
+/// （[`ChildStdio::pipes`] が返したもの）は呼び出し側が保持し、supervisor の行単位捕捉へ渡す。
+/// `ChildStdio::none()` なら [`spawn_container_with_stages`] と同じ（3 本とも `/dev/null`）。
+/// 副作用: パイプ指定時、子の setup 失敗診断（`fandhe-container: ...` の 1 行）もコンテナのログに入る。
+pub fn spawn_container_with_stages_and_stdio(
+    rootfs: &Path,
+    entry: &Entrypoint,
+    stages: StagePipeline,
+    stdio: ChildStdio,
+) -> Result<ContainerChild, ExecError> {
+    spawn_container_reporting_with_stdio(
+        rootfs,
+        entry,
+        stages,
+        crate::legacy_tiocsti::read_host(),
+        std::io::stderr().as_fd(),
+        stdio,
+    )
+    .map(|(child, _report)| child)
+}
+
 /// `dev.tty.legacy_tiocsti` の警告 1 行の出力結果（CORE-5・SEC-1・REPAIR-4・REPAIR-5・#1739）。
 /// 真偽値にせず、将来の状態を足せる形にする（`#[non_exhaustive]`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2081,8 +2256,21 @@ fn spawn_container_reporting(
     state: crate::legacy_tiocsti::LegacyTiocsti,
     out: BorrowedFd<'_>,
 ) -> Result<(ContainerChild, LegacyTiocstiReport), ExecError> {
+    spawn_container_reporting_with_stdio(rootfs, entry, stages, state, out, ChildStdio::none())
+}
+
+/// [`spawn_container_reporting`] に stdout / stderr の付け替え先を足した本体（#1471）。`stdio` は fork 後に
+/// 親の側でも drop され、親が持つ書き込み側は閉じる（読み取り側が EOF に達するための条件）。
+fn spawn_container_reporting_with_stdio(
+    rootfs: &Path,
+    entry: &Entrypoint,
+    stages: StagePipeline,
+    state: crate::legacy_tiocsti::LegacyTiocsti,
+    out: BorrowedFd<'_>,
+    stdio: ChildStdio,
+) -> Result<(ContainerChild, LegacyTiocstiReport), ExecError> {
     let pid = sys::fork_single_threaded(
-        || child_main(rootfs, entry, stages, None),
+        move || child_main(rootfs, entry, stages, None, stdio),
         EXIT_SETUP_FAILED,
     )
     .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
@@ -2130,6 +2318,7 @@ pub fn spawn_container_with_stages_and_devices(
                 inject: None,
                 pinned_rootfs: None,
             }),
+            StdioNulling::ALL,
         ) {
             Ok(never) => match never {},
             Err(err) => {
@@ -3231,6 +3420,119 @@ mod tests {
                 "env=K=V".to_string(),
             ]
         );
+    }
+
+    /// SUP-7・SUP-1（TASK-164 追補・#1471）: stdout / stderr をパイプへ付け替えた場合、exec 直前の置換は fd 0 だけで、
+    /// 付け替え済みの 1・2 は `/dev/null` で上書きしない。置換の位置は `execve` の直前のまま変わらない。
+    #[test]
+    fn sup7_1471_piped_stdout_stderr_are_not_nulled() {
+        let dir = TempDir::create("exec-piped");
+        let bin = dir.0.join("probe");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&bin)
+            .unwrap();
+        let entry = Entrypoint::new(&bin, ["probe"], [] as [&str; 0]).unwrap();
+        let _ = take_calls();
+        let nulling = StdioNulling {
+            stdout: false,
+            stderr: false,
+        };
+        let err =
+            exec_entrypoint_verified_with(current_root_mnt_id(), &entry, nulling).unwrap_err();
+        let calls = take_calls();
+        drop(dir);
+        assert_eq!(err.stage, IsolationStage::Exec);
+        assert_eq!(
+            calls,
+            vec![
+                "close_range(3,close)".to_string(),
+                "setsid".to_string(),
+                "reopen(entrypoint)".to_string(),
+                "close_range(3)".to_string(),
+                "signal(SIGPIPE,SIG_DFL)".to_string(),
+                "stdio[0]->/dev/null".to_string(),
+                format!("execve({})", bin.display()),
+                "argv=probe".to_string(),
+                "env=".to_string(),
+            ]
+        );
+    }
+
+    /// SUP-7（#1471）: 置換する fd 番号は、パイプ指定なしなら 0・1・2、片方だけなら指定のない側と 0。
+    #[test]
+    fn sup7_1471_stdio_nulling_targets() {
+        assert_eq!(StdioNulling::ALL.targets(), vec![0, 1, 2]);
+        let only_err_piped = StdioNulling {
+            stdout: true,
+            stderr: false,
+        };
+        assert_eq!(only_err_piped.targets(), vec![0, 1]);
+        let only_out_piped = StdioNulling {
+            stdout: false,
+            stderr: true,
+        };
+        assert_eq!(only_out_piped.targets(), vec![0, 2]);
+    }
+
+    /// SUP-7・SUP-1（#1471）: 親が書き込み側（`ChildStdio`）を閉じると、読み取り側は EOF になる
+    /// （`drain` が終わるための条件。閉じ忘れると読み取りが終わらない）。
+    #[test]
+    fn sup7_1471_reader_reaches_eof_after_child_stdio_dropped() {
+        use std::io::Read as _;
+        let (stdio, mut out, mut err) = ChildStdio::pipes().unwrap();
+        drop(stdio);
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        assert_eq!(out.read_to_end(&mut a).unwrap(), 0);
+        assert_eq!(err.read_to_end(&mut b).unwrap(), 0);
+    }
+
+    /// 付け替えの子役が使う環境変数。
+    const STDIO_INSTALL_CHILD_ENV: &str = "FANDHE_TEST_1471_STDIO_INSTALL_CHILD";
+
+    /// 付け替えの子役。`ChildStdio::install` 後に fd 1・2 へ書いた行が、それぞれ別のパイプの読み取り側に届き、
+    /// 戻り値の `StdioNulling` が両方「置換しない」であることを確かめる。結果は終了コード（0 = 成功）で返す。
+    fn stdio_install_child_main() -> ! {
+        use std::io::Read as _;
+        let (stdio, mut out, mut err) = ChildStdio::pipes().unwrap();
+        let code = match stdio.install() {
+            Ok(n) if n.targets() == vec![0] => {
+                let _ = std::io::stdout().write_all(b"OUT-LINE\n");
+                let _ = std::io::stdout().flush();
+                let _ = std::io::stderr().write_all(b"ERR-LINE\n");
+                let (mut a, mut b) = ([0u8; 9], [0u8; 9]);
+                match (out.read_exact(&mut a), err.read_exact(&mut b)) {
+                    (Ok(()), Ok(())) if &a == b"OUT-LINE\n" && &b == b"ERR-LINE\n" => 0,
+                    _ => 2,
+                }
+            }
+            _ => 1,
+        };
+        std::process::exit(code);
+    }
+
+    /// SUP-7・SUP-1（#1471）: `install` は stdout を 1 番、stderr を 2 番へ別々に付け替える。テストバイナリ自身を
+    /// 再実行した子役で確かめる（自プロセスの fd 1・2 を差し替えない）。
+    #[test]
+    fn sup7_1471_install_routes_fd1_and_fd2_to_separate_pipes() {
+        if std::env::var_os(STDIO_INSTALL_CHILD_ENV).is_some() {
+            stdio_install_child_main();
+        }
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "exec::process::tests::sup7_1471_install_routes_fd1_and_fd2_to_separate_pipes",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(STDIO_INSTALL_CHILD_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(0));
     }
 
     /// CORE-1（TASK-27.4.1）: `/` が pivot 直後の新 root でなければ何も呼ばず拒否する。

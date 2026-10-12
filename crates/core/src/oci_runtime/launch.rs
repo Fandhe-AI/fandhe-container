@@ -486,6 +486,29 @@ pub enum ProcessExit {
     Signaled(i32),
 }
 
+/// 起動済みコンテナの標準出力・標準エラーの読み取り側（TASK-164 追補・#1471・SUP-7・SUP-1）。
+///
+/// launcher が子の stdout / stderr をパイプへ接続して作り、[`LaunchedProcess::take_output`] で supervisor へ
+/// 渡す。supervisor はこれを行単位捕捉（`LogCapture`）へ移し、ローテーション付きの sink へ流す。OS 固有の型
+/// （fd）は公開せず `Read + Send` に包む（CLI-1）。どちらかが `None` なら、そのストリームは捕捉しない。
+/// 読み取り側は書き込み側（子とその孫）がすべて閉じると EOF になる。
+#[derive(Default)]
+pub struct ContainerOutput {
+    /// コンテナの標準出力。
+    pub stdout: Option<Box<dyn std::io::Read + Send>>,
+    /// コンテナの標準エラー。
+    pub stderr: Option<Box<dyn std::io::Read + Send>>,
+}
+
+impl std::fmt::Debug for ContainerOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContainerOutput")
+            .field("stdout", &self.stdout.is_some())
+            .field("stderr", &self.stderr.is_some())
+            .finish()
+    }
+}
+
 /// 起動済みプロセスへのハンドル。
 ///
 /// start は上限を強制するため別スレッド（上限超過後の後始末を含む）へハンドルを移すので `Send` を要求する。
@@ -539,6 +562,15 @@ pub trait LaunchedProcess: Send {
     fn launch_pidfd(&self) -> Option<BorrowedFd<'_>> {
         None
     }
+
+    /// コンテナの stdout / stderr の読み取り側を 1 回だけ取り出す（TASK-164 追補・#1471・SUP-7・SUP-1）。
+    ///
+    /// supervisor が起動・再起動のたびに呼び、行単位捕捉へ渡す。2 回目以降と、出力を捕捉しない実装は `None`
+    /// （既定）。取り出した後の所有権は呼び出し側に移る。`LaunchedProcess` を包み直す実装は、内側の
+    /// `take_output` へ転送すること（転送しないと出力が捕捉されず、コンテナの出力が失われる）。
+    fn take_output(&self) -> Option<ContainerOutput> {
+        None
+    }
 }
 
 /// `exec::ContainerChild`（fork した子）を [`LaunchedProcess`] として扱うアダプタ（Linux。CORE-1・REPAIR-5）。
@@ -552,6 +584,9 @@ pub trait LaunchedProcess: Send {
 pub struct ContainerChildProcess {
     child: crate::exec::ContainerChild,
     pid: NonZeroU32,
+    /// `take_output` で 1 回だけ取り出す stdout / stderr の読み取り側（無ければ `None`）。`take_output` が
+    /// `&self` のため `Mutex` で保持する。
+    output: std::sync::Mutex<Option<ContainerOutput>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -564,7 +599,26 @@ impl ContainerChildProcess {
                 "the child process id must be non-zero",
             )
         })?;
-        Ok(Self { child, pid })
+        Ok(Self {
+            child,
+            pid,
+            output: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// 子の stdout / stderr の読み取り側を持たせる（`exec::ChildStdio::pipes` が返したもの。#1471）。
+    /// [`LaunchedProcess::take_output`] で 1 回だけ取り出される。
+    #[must_use]
+    pub fn with_output(self, stdout: std::io::PipeReader, stderr: std::io::PipeReader) -> Self {
+        let output = ContainerOutput {
+            stdout: Some(Box::new(stdout)),
+            stderr: Some(Box::new(stderr)),
+        };
+        *self
+            .output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(output);
+        self
     }
 
     /// 包んでいる子のハンドル（終了待ち `wait_timeout` 等に使う）。
@@ -581,6 +635,13 @@ impl LaunchedProcess for ContainerChildProcess {
 
     fn launch_pidfd(&self) -> Option<BorrowedFd<'_>> {
         self.child.pidfd()
+    }
+
+    fn take_output(&self) -> Option<ContainerOutput> {
+        self.output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     fn wait(&self, timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
@@ -793,6 +854,45 @@ mod tests {
         assert_eq!(line.trim_start_matches("Pid:").trim(), pid.to_string());
         child.kill().expect("kill");
         child.wait().expect("wait");
+    }
+
+    /// SUP-7・SUP-1（TASK-164 追補・#1471）: `take_output` は既定で `None`、`with_output` で持たせた読み取り側は
+    /// 1 回だけ取り出せて、子の stdout / stderr の行が別々のパイプから具体値どおりに読める。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup7_1471_take_output_returns_stdout_and_stderr_once() {
+        use std::io::Read as _;
+        let (out_r, out_w) = std::io::pipe().expect("pipe");
+        let (err_r, err_w) = std::io::pipe().expect("pipe");
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "echo out-line; echo err-line >&2"])
+            .stdin(std::process::Stdio::null())
+            .stdout(out_w)
+            .stderr(err_w);
+        let mut child = cmd.spawn().expect("spawn");
+        // `cmd` が持つ書き込み側を閉じる（閉じないと読み取り側が EOF にならない）。
+        drop(cmd);
+        let pid = child.id();
+        let process =
+            ContainerChildProcess::new(crate::exec::ContainerChild::from_pid_for_test(pid))
+                .expect("wrap");
+        assert!(process.take_output().is_none(), "既定は出力なし");
+        let process = process.with_output(out_r, err_r);
+        let output = process.take_output().expect("output");
+        assert!(process.take_output().is_none(), "2 回目は None");
+        let (mut a, mut b) = (String::new(), String::new());
+        output
+            .stdout
+            .expect("stdout")
+            .read_to_string(&mut a)
+            .expect("read stdout");
+        output
+            .stderr
+            .expect("stderr")
+            .read_to_string(&mut b)
+            .expect("read stderr");
+        child.wait().expect("wait");
+        assert_eq!((a.as_str(), b.as_str()), ("out-line\n", "err-line\n"));
     }
 
     /// CORE-2・OCI-6（TASK-30.1）: `ContainerChildProcess::signal` は実プロセスへ SIGKILL を送り、

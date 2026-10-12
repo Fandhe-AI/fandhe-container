@@ -131,6 +131,10 @@ impl CaptureHub {
     /// 生きている捕捉を `timeout` まで待って畳み、末尾の行を sink へ flush する。捕捉が無ければ `None`。
     ///
     /// supervisor の全終了経路で呼ぶ（末尾の行が sink 内のバッファに残らないように）。
+    ///
+    /// `timeout` は `LogCapture::drain` の上限（`MAX_DRAIN_TIMEOUT`）に切り詰めて渡す。`StartTimeouts` の terminate は
+    /// 最大 600 秒まで許すため、そのまま渡すと drain が `InvalidArgument` で EOF を待たず捕捉を取り消し、
+    /// 正常終了でも末尾行が失われる（SUP-7・REPAIR-5）。
     pub fn finish(&self, timeout: Duration) -> Option<Result<CaptureSummary, TraitError>> {
         let live = self
             .live
@@ -138,7 +142,7 @@ impl CaptureHub {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         live.map(|capture| {
-            let drained = capture.drain(timeout);
+            let drained = capture.drain(timeout.min(crate::logs::MAX_DRAIN_TIMEOUT));
             report_drain("log_capture_finish_failed", &drained);
             drained
         })
@@ -165,6 +169,29 @@ mod tests {
             .filter(|l| l.stream == kind)
             .map(|l| l.bytes)
             .collect()
+    }
+
+    /// SUP-7・REPAIR-5（#1471）: terminate が drain の上限（60 秒）を超える 120 秒でも、finish は拒否されず
+    /// LF なしの末尾行まで sink に flush する。
+    #[test]
+    fn sup7_1471_finish_clamps_timeout_above_drain_limit() {
+        let sink = Arc::new(MemoryLogSink::default());
+        let hub = CaptureHub::new(sink.clone());
+        hub.attach(output(
+            "a1
+last-no-lf",
+            "",
+        ))
+        .expect("attach");
+        let summary = hub
+            .finish(Duration::from_secs(120))
+            .expect("live capture")
+            .expect("drain must not reject a 120s timeout");
+        assert!(summary.stdout().is_some());
+        assert_eq!(
+            lines_of(&sink, StreamKind::Stdout),
+            vec![b"a1".to_vec(), b"last-no-lf".to_vec()]
+        );
     }
 
     /// SUP-7・SUP-1（#1471）: 2 回 attach しても、両方のプロセスの行がストリーム別に欠落・重複なく sink に入る。

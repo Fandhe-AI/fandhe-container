@@ -373,6 +373,9 @@ impl<R: Read> Read for LimitedReader<R> {
 /// - GNU long name / long link / PAX の宣言サイズが `MAX_META_BYTES` を超えるもの（確保前に中断する）。
 /// - GNU sparse（`S`）: 拡張ヘッダブロックで追跡がずれるうえ、展開でも拒否する種別のため。
 /// - PAX の `size` 上書き: ヘッダのサイズと食い違い、追跡をすり抜けて拡張ヘッダを隠せるため。
+/// - PAX 形式の GNU sparse（`GNU.sparse.*` キー。typeflag は通常ファイルのまま）: `tar` crate（0.4.46）は
+///   これらのキーを解釈せず、穴を詰めた保存データをそのまま通常ファイルとして返す。論理サイズへ膨らむことは
+///   ないが、内容が元のファイルと食い違ったまま成功してしまうため、他の sparse と同じく拒否する。
 struct TarGuard<R> {
     inner: R,
     header: [u8; 512],
@@ -433,18 +436,19 @@ impl<R> TarGuard<R> {
 
     fn after_payload(&mut self) -> std::io::Result<()> {
         if let Some(p) = self.pax.take() {
-            pax_reject_size_override(&p)?;
+            pax_reject_unsupported_records(&p)?;
         }
         Ok(())
     }
 }
 
 /// PAX 拡張ヘッダ本体を `tar` crate と同じ規則（先に改行で分割し、各行を `<len> <key>=<value>`
-/// として解釈。`len` は行 + 改行の長さと一致）で解析し、キーが正確に `size` の行があれば拒否する（OCI-1）。
+/// として解釈。`len` は行 + 改行の長さと一致）で解析し、キーが正確に `size` の行、またはキーが
+/// `GNU.sparse.` で始まる行（PAX 形式の GNU sparse 0.0 / 0.1 / 1.0）があれば拒否する（OCI-1）。
 /// 長さ欄が後続行にまたがるレコードは `tar` crate も別行として解釈するため、同じ分割で検査して
 /// 埋め込み `size` の見逃しを防ぐ。`path` 等の値に ` size=` が含まれるだけの正常な tar は通す。
 /// 構文違反（長さ不一致・`=` 欠落・末尾改行欠落・途中の空行）は拒否する。
-fn pax_reject_size_override(body: &[u8]) -> std::io::Result<()> {
+fn pax_reject_unsupported_records(body: &[u8]) -> std::io::Result<()> {
     let malformed = || {
         guard_error(
             OciErrorCode::InvalidArgument,
@@ -468,10 +472,17 @@ fn pax_reject_size_override(body: &[u8]) -> std::io::Result<()> {
         }
         let kv = line.get(sp.saturating_add(1)..).ok_or_else(malformed)?;
         let eq = kv.iter().position(|b| *b == b'=').ok_or_else(malformed)?;
-        if kv.get(..eq) == Some(&b"size"[..]) {
+        let key = kv.get(..eq).ok_or_else(malformed)?;
+        if key == b"size" {
             return Err(guard_error(
                 OciErrorCode::InvalidArgument,
                 "pax size override is not supported",
+            ));
+        }
+        if key.starts_with(b"GNU.sparse.") {
+            return Err(guard_error(
+                OciErrorCode::DataLoss,
+                "sparse entries are not supported",
             ));
         }
     }
@@ -1748,7 +1759,7 @@ mod tests {
             b"22 path=a\n12 size=999\n",
         ] {
             assert_eq!(
-                pax_reject_size_override(bad).unwrap_err().kind(),
+                pax_reject_unsupported_records(bad).unwrap_err().kind(),
                 std::io::ErrorKind::InvalidData,
                 "{bad:?}"
             );
@@ -2016,6 +2027,58 @@ mod tests {
         let e = raw_entry(b"sp", EntryType::GNUSparse, b"", 0o644, 0, b"");
         assert_eq!(code(run(&sb, &[e])), OciErrorCode::DataLoss);
         assert!(!sb.root.join("sp").exists());
+    }
+
+    /// OCI-1: PAX 形式の GNU sparse（`GNU.sparse.*` キー + 通常ファイルの typeflag）は、穴を詰めた内容のまま
+    /// 通常ファイルとして展開せずに拒否する。値やパスに同じ文字列を含むだけの PAX レコードは通す。
+    #[test]
+    fn oci1_pax_gnu_sparse_entry_is_rejected() {
+        let pax = |rec: &[u8]| {
+            raw_entry(
+                b"pax",
+                EntryType::XHeader,
+                b"",
+                0o644,
+                rec.len() as u64,
+                rec,
+            )
+        };
+        for (key, val) in [
+            // 0.0
+            ("GNU.sparse.size", "1073741824"),
+            ("GNU.sparse.numblocks", "1"),
+            // 0.1
+            ("GNU.sparse.map", "0,4"),
+            // 1.0
+            ("GNU.sparse.major", "1"),
+            ("GNU.sparse.realsize", "1073741824"),
+            ("GNU.sparse.name", "sp"),
+        ] {
+            let sb = Sandbox::new();
+            let e = run(
+                &sb,
+                &[pax(&pax_record(key, val)), file("sp", 0o644, b"data")],
+            )
+            .expect_err(key);
+            assert_eq!(e.code(), OciErrorCode::DataLoss, "{key}");
+            assert_eq!(e.message(), "sparse entries are not supported", "{key}");
+            assert_eq!(names_in(&sb.root), Vec::<String>::new(), "{key}");
+        }
+
+        let sb = Sandbox::new();
+        let r = run(
+            &sb,
+            &[
+                pax(&pax_record("path", "GNU.sparse.size")),
+                file("ignored", 0o644, b"data"),
+                pax(&pax_record("comment", "GNU.sparse.map=0,4")),
+                file("f", 0o644, b"x"),
+            ],
+        )
+        .unwrap();
+        assert_eq!((r.entries, r.bytes), (2, 5));
+        assert_eq!(names_in(&sb.root), ["GNU.sparse.size", "f"]);
+        assert_eq!(fs::read(sb.root.join("GNU.sparse.size")).unwrap(), b"data");
     }
 
     /// OCI-1: 旧 GNU sparse（通常 typeflag + isextended）は拒否する（ヘッダ境界の追跡ずれを防ぐ）。

@@ -60,10 +60,10 @@ TASK-125（共同タスク）の確認記録の雛形。実機での実行・結
 
 | 項目 | Linux | macOS | Windows |
 | ---- | ----- | ----- | ------- |
-| OS 版数 | | | |
-| アーキ | | | |
-| コミット SHA | | | |
-| 実施日 | | | |
+| OS 版数 | Ubuntu 26.04.1 LTS（カーネル 7.0.0-34-generic） | macOS 27.0.1（26A434） | |
+| アーキ | x86_64 | arm64（Apple M4） | |
+| コミット SHA | `d2566bc166500dccf137b1d918adecfdfd9a0e72` | `d2566bc166500dccf137b1d918adecfdfd9a0e72` | |
+| 実施日 | 2026-10-12 | 2026-10-12 | |
 
 ## A 層: 構文・使い方エラー（3 OS で比較可能）
 
@@ -71,24 +71,24 @@ TASK-125（共同タスク）の確認記録の雛形。実機での実行・結
 
 | ID | 構文 | 期待 | Linux | macOS | Windows | 一致 | 備考 |
 | -- | ---- | ---- | ----- | ----- | ------- | ---- | ---- |
-| A01 | コマンドなし | 2 / `INVALID_ARGUMENT` | | | | | |
-| A02 | 未知コマンド | 2 / `INVALID_ARGUMENT` | | | | | |
-| A03 | `create`（引数なし） | 2 / `INVALID_ARGUMENT` | | | | | |
-| A04 | `create <id>`（`--bundle` 欠落） | 2 / `INVALID_ARGUMENT` | | | | | |
-| A05 | `create --bundle <bundle>`（ID 欠落） | 2 / `INVALID_ARGUMENT` | | | | | |
-| A06 | `create` の ID 余剰 | 2 / `INVALID_ARGUMENT` | | | | | |
-| A07 | `start`（ID 欠落） | 2 / `INVALID_ARGUMENT` | | | | | |
-| A08 | `start` の ID 余剰 | 2 / `INVALID_ARGUMENT` | | | | | |
-| A09 | `stop`（ID 欠落） | 2 / `INVALID_ARGUMENT` | | | | | |
-| A10 | `delete`（ID 欠落） | 2 / `INVALID_ARGUMENT` | | | | | |
-| A11 | `delete --force --force <id>`（重複） | 2 / `INVALID_ARGUMENT` | | | | | |
-| A12 | `list extra`（余剰引数） | 2 / `INVALID_ARGUMENT` | | | | | |
-| A13 | `logs`（ID 欠落） | 2 / `INVALID_ARGUMENT` | | | | | |
-| A14 | `start a/b`（不正な ID） | 2 / `INVALID_ARGUMENT` | | | | | |
-| A15 | `--root` の重複 | 2 / `INVALID_ARGUMENT` | | | | | |
-| A16 | `--plugin-path-search` の重複 | 2 / `INVALID_ARGUMENT` | | | | | |
-| A17 | `--root` の値欠落 | 2 / `INVALID_ARGUMENT` | | | | | |
-| A18 | `start --bogus <id>`（未知オプション） | 2 / `INVALID_ARGUMENT` | | | | | |
+| A01 | コマンドなし | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | Linux・macOS 一致 | |
+| A02 | 未知コマンド | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | Linux・macOS 一致 | |
+| A03 | `create`（引数なし） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | Linux・macOS 一致 | |
+| A04 | `create <id>`（`--bundle` 欠落） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | Linux・macOS 一致 | |
+| A05 | `create --bundle <bundle>`（ID 欠落） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | Linux・macOS 一致 | |
+| A06 | `create` の ID 余剰 | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | Linux・macOS 一致 | |
+| A07 | `start`（ID 欠落） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | Linux・macOS 一致 | |
+| A08 | `start` の ID 余剰 | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | Linux・macOS 一致 | |
+| A09 | `stop`（ID 欠落） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | Linux・macOS 一致 | |
+| A10 | `delete`（ID 欠落） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | Linux・macOS 一致 | |
+| A11 | `delete --force --force <id>`（重複） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | Linux・macOS 一致 | |
+| A12 | `list extra`（余剰引数） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | Linux・macOS 一致 | |
+| A13 | `logs`（ID 欠落） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | Linux・macOS 一致 | |
+| A14 | `start a/b`（不正な ID） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | Linux・macOS 一致 | |
+| A15 | `--root` の重複 | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | Linux・macOS 一致 | |
+| A16 | `--plugin-path-search` の重複 | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | Linux・macOS 一致 | |
+| A17 | `--root` の値欠落 | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | Linux・macOS 一致 | |
+| A18 | `start --bogus <id>`（未知オプション） | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | 2 / `INVALID_ARGUMENT` | | Linux・macOS 一致 | |
 
 ## B 層: 挙動（macOS / Windows は plugin 発見機構経由）
 
@@ -111,21 +111,21 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 
 | ID | コマンドと前提 | Linux の参考期待値 | Linux | macOS | Windows | 一致 | 備考 |
 | -- | -------------- | ------------------ | ----- | ----- | ------- | ---- | ---- |
-| B01 | `list`（空の状態ルート） | 0 / `-` / `list:H` | | 前提未達 | 前提未達 | | |
-| B02 | `create --bundle <bundle> c1` | 0 / `-` / `-` | | 前提未達 | 前提未達 | | |
-| B03 | `list`（create 後） | 0 / `-` / `list:H;c1,created,-` | | 前提未達 | 前提未達 | | |
-| B04 | `create`（c1 重複） | 4 / `ALREADY_EXISTS` / `-` | | 前提未達 | 前提未達 | | |
-| B05 | `start c1` | 8 / `UNIMPLEMENTED` / `-`（本番 launcher 未提供） | | 前提未達 | 前提未達 | | |
-| B06 | `list`（start 後） | 0 / `-` / `list:H;c1,created,-` | | 前提未達 | 前提未達 | | |
-| B07 | `logs c1` | 8 / `UNIMPLEMENTED` / `-` | | 前提未達 | 前提未達 | | |
-| B08 | `stop c1` | 5 / `FAILED_PRECONDITION` / `-`（未起動） | | 前提未達 | 前提未達 | | |
-| B09 | `delete c1` | 0 / `-` / `-` | | 前提未達 | 前提未達 | | |
-| B10 | `list`（delete 後） | 0 / `-` / `list:H` | | 前提未達 | 前提未達 | | |
-| B11 | `start nonexist` | 3 / `NOT_FOUND` / `-` | | 前提未達 | 前提未達 | | |
-| B12 | `stop nonexist` | 3 / `NOT_FOUND` / `-` | | 前提未達 | 前提未達 | | |
-| B13 | `delete nonexist` | 3 / `NOT_FOUND` / `-` | | 前提未達 | 前提未達 | | |
-| B14 | `logs nonexist` | 3 / `NOT_FOUND` / `-` | | 前提未達 | 前提未達 | | |
-| B15 | `list`（状態ルートの親ディレクトリも不在） | 3 / `NOT_FOUND` / `-` | | 前提未達 | 前提未達 | | |
+| B01 | `list`（空の状態ルート） | 0 / `-` / `list:H` | 0 / `-` / `list:H` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
+| B02 | `create --bundle <bundle> c1` | 0 / `-` / `-` | 0 / `-` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
+| B03 | `list`（create 後） | 0 / `-` / `list:H;c1,created,-` | 0 / `-` / `list:H;c1,created,-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
+| B04 | `create`（c1 重複） | 4 / `ALREADY_EXISTS` / `-` | 4 / `ALREADY_EXISTS` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
+| B05 | `start c1` | 8 / `UNIMPLEMENTED` / `-`（本番 launcher 未提供） | 8 / `UNIMPLEMENTED` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
+| B06 | `list`（start 後） | 0 / `-` / `list:H;c1,created,-` | 0 / `-` / `list:H;c1,created,-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
+| B07 | `logs c1` | 8 / `UNIMPLEMENTED` / `-` | 8 / `UNIMPLEMENTED` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
+| B08 | `stop c1` | 5 / `FAILED_PRECONDITION` / `-`（未起動） | 5 / `FAILED_PRECONDITION` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない）。値は Linux と同じだが、未起動の判定ではなくバックエンド解決の失敗 |
+| B09 | `delete c1` | 0 / `-` / `-` | 0 / `-` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
+| B10 | `list`（delete 後） | 0 / `-` / `list:H` | 0 / `-` / `list:H` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
+| B11 | `start nonexist` | 3 / `NOT_FOUND` / `-` | 3 / `NOT_FOUND` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
+| B12 | `stop nonexist` | 3 / `NOT_FOUND` / `-` | 3 / `NOT_FOUND` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
+| B13 | `delete nonexist` | 3 / `NOT_FOUND` / `-` | 3 / `NOT_FOUND` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
+| B14 | `logs nonexist` | 3 / `NOT_FOUND` / `-` | 3 / `NOT_FOUND` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
+| B15 | `list`（状態ルートの親ディレクトリも不在） | 3 / `NOT_FOUND` / `-` | 3 / `NOT_FOUND` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 
 ## 差異のフィードバック先
 

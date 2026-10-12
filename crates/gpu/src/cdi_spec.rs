@@ -21,6 +21,7 @@ use std::error::Error;
 use std::fmt;
 use std::io::Read;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_saphyr::options::{DuplicateKeyPolicy, MergeKeyPolicy};
@@ -301,10 +302,10 @@ pub struct IntelRdt {
     #[serde(default)]
     pub mem_bw_schema: Option<String>,
     /// CMT の有効化。
-    #[serde(default)]
+    #[serde(default, rename = "enableCMT")]
     pub enable_cmt: Option<bool>,
     /// MBM の有効化。
-    #[serde(default)]
+    #[serde(default, rename = "enableMBM")]
     pub enable_mbm: Option<bool>,
 }
 
@@ -375,17 +376,142 @@ pub fn parse_cdi_spec(input: &str) -> Result<CdiSpec, CdiSpecError> {
     serde_saphyr::from_str_with_options::<CdiSpec>(input, options).map_err(|e| classify(&e))
 }
 
-/// ファイルから [`CdiSpec`] を読む（上限付き）。
+/// 読み込み 1 回の計測結果（REPAIR-4）。入力内容・パス・`env` の値は持たない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CdiSpecReadSample {
+    /// 成功なら `None`、失敗なら分類。
+    error_code: Option<CdiSpecErrorCode>,
+    /// open から解析完了（または失敗）までの所要時間。
+    latency: Duration,
+}
+
+impl CdiSpecReadSample {
+    /// 成功したか。
+    pub fn is_success(&self) -> bool {
+        self.error_code.is_none()
+    }
+
+    /// 失敗時の分類（成功なら `None`）。
+    pub fn error_code(&self) -> Option<CdiSpecErrorCode> {
+        self.error_code
+    }
+
+    /// 所要時間。
+    pub fn latency(&self) -> Duration {
+        self.latency
+    }
+}
+
+/// [`read_cdi_spec_file_with_recorder`] の計測先（REPAIR-4）。
 ///
-/// ディレクトリ走査・所有者検証は行わない（後続タスク）。
-pub fn read_cdi_spec_file(path: &Path) -> Result<CdiSpec, CdiSpecError> {
-    let file = std::fs::File::open(path).map_err(|e| {
+/// 上位 crate が core の `OpRecorder` 等へ写すアダプタを実装する（gpu は core に依存しない）。
+/// 成功・open 失敗・種別拒否・read 失敗・UTF-8 失敗・解析失敗のすべてで 1 回だけ呼ばれる。
+pub trait CdiSpecReadRecorder {
+    /// 1 回の読み込み結果を記録する。
+    fn record(&self, sample: CdiSpecReadSample);
+}
+
+/// 何も記録しない記録先。
+struct NoopRecorder;
+
+impl CdiSpecReadRecorder for NoopRecorder {
+    fn record(&self, _sample: CdiSpecReadSample) {}
+}
+
+/// 非ブロッキング open のフラグ値（FIFO の open 待ちによる無期限停止を避ける）。
+/// 値を確定できない Unix では `None` とし、open 前の `metadata` 検査で代える。
+#[cfg(unix)]
+const O_NONBLOCK: Option<i32> = if cfg!(all(
+    target_os = "linux",
+    not(any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "sparc",
+        target_arch = "sparc64"
+    ))
+)) {
+    Some(0o4000)
+} else if cfg!(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+)) {
+    Some(0x4)
+} else {
+    None
+};
+
+/// 通常ファイルだけを開く。FIFO・デバイス等は拒否する（open / read の無期限停止を防ぐ）。
+fn open_regular_file(path: &Path) -> Result<std::fs::File, CdiSpecError> {
+    let not_regular = || {
+        CdiSpecError::new(
+            CdiSpecErrorCode::InvalidArgument,
+            "CDI spec path is not a regular file",
+        )
+    };
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        match O_NONBLOCK {
+            Some(flag) => {
+                opts.custom_flags(flag);
+            }
+            None => {
+                // フラグが使えない OS では open 前に種別を確認する（TOCTOU は残るため best effort）。
+                if let Ok(meta) = std::fs::metadata(path)
+                    && !meta.is_file()
+                {
+                    return Err(not_regular());
+                }
+            }
+        }
+    }
+    let file = opts.open(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             CdiSpecError::new(CdiSpecErrorCode::NotFound, "CDI spec file not found")
         } else {
             CdiSpecError::new(CdiSpecErrorCode::Internal, "failed to open CDI spec file")
         }
     })?;
+    // 取得したハンドル自体の種別を検証する（パス検査との競合を避ける）。
+    let meta = file.metadata().map_err(|_| {
+        CdiSpecError::new(CdiSpecErrorCode::Internal, "failed to stat CDI spec file")
+    })?;
+    if !meta.is_file() {
+        return Err(not_regular());
+    }
+    Ok(file)
+}
+
+/// ファイルから [`CdiSpec`] を読む（上限付き）。計測は行わない。
+///
+/// 通常ファイル以外（FIFO・デバイス等）は `InvalidArgument`。ディレクトリ走査・所有者検証は
+/// 行わない（後続タスク）。計測が要る呼び出し側は [`read_cdi_spec_file_with_recorder`] を使う。
+pub fn read_cdi_spec_file(path: &Path) -> Result<CdiSpec, CdiSpecError> {
+    read_cdi_spec_file_with_recorder(path, &NoopRecorder)
+}
+
+/// [`read_cdi_spec_file`] に計測（REPAIR-4）を付けたもの。全経路で結果とレイテンシを 1 回記録する。
+pub fn read_cdi_spec_file_with_recorder(
+    path: &Path,
+    recorder: &dyn CdiSpecReadRecorder,
+) -> Result<CdiSpec, CdiSpecError> {
+    let start = Instant::now();
+    let result = read_cdi_spec_file_inner(path);
+    recorder.record(CdiSpecReadSample {
+        error_code: result.as_ref().err().map(CdiSpecError::code),
+        latency: start.elapsed(),
+    });
+    result
+}
+
+fn read_cdi_spec_file_inner(path: &Path) -> Result<CdiSpec, CdiSpecError> {
+    let file = open_regular_file(path)?;
     let mut buf = Vec::new();
     let limit = CDI_SPEC_MAX_INPUT_BYTES as u64 + 1;
     file.take(limit).read_to_end(&mut buf).map_err(|_| {
@@ -517,21 +643,37 @@ containerEdits:
         );
         assert_eq!(code_of(&big), CdiSpecErrorCode::ResourceExhausted);
 
-        let deep = format!(
-            "cdiVersion: '1'\nkind: a/b\nannotations: {}\n",
-            "[".repeat(5000)
-        );
-        assert!(parse_cdi_spec(&deep).is_err());
-
-        let mut bomb =
-            String::from("cdiVersion: '1'\nkind: a/b\nx: &a0 [a, a, a, a, a, a, a, a, a]\n");
-        for i in 1..12 {
-            let p = i - 1;
-            bomb.push_str(&format!(
-                "x{i}: &a{i} [*a{p}, *a{p}, *a{p}, *a{p}, *a{p}, *a{p}, *a{p}, *a{p}, *a{p}]\n"
-            ));
+        // 構文的に完結し、スキーマにも適合する入力でノード数上限（CDI_SPEC_MAX_NODES）を超える。
+        // 深さは未知フィールド・型不一致が先に検出されるため、別経路（ノード数・エイリアス）で上限を確認する。
+        let mut many = String::from("cdiVersion: '1'\nkind: a/b\ndevices:\n");
+        for _ in 0..30_000 {
+            many.push_str("- {name: a, containerEdits: {}}\n");
         }
-        assert!(parse_cdi_spec(&bomb).is_err());
+        assert!(many.len() <= CDI_SPEC_MAX_INPUT_BYTES);
+        assert_eq!(code_of(&many), CdiSpecErrorCode::ResourceExhausted);
+
+        // 構文的に完結し、スキーマにも適合する入力でエイリアス数上限（CDI_SPEC_MAX_ALIASES）を超える。
+        let mut aliases = String::from("cdiVersion: '1'\nkind: a/b\nannotations:\n  k0: &a v\n");
+        for i in 1..=(CDI_SPEC_MAX_ALIASES + 8) {
+            aliases.push_str(&format!("  k{i}: *a\n"));
+        }
+        assert_eq!(code_of(&aliases), CdiSpecErrorCode::ResourceExhausted);
+    }
+
+    /// GPU-1: IntelRdt は CDI の綴り enableCMT / enableMBM を読む。
+    #[test]
+    fn gpu1_intel_rdt_field_names() {
+        let y = "cdiVersion: '1'\nkind: a/b\ncontainerEdits:\n  intelRdt:\n    closID: c1\n    enableCMT: true\n    enableMBM: false\n";
+        let r = parse_cdi_spec(y)
+            .unwrap()
+            .container_edits
+            .intel_rdt
+            .unwrap();
+        assert_eq!(r.clos_id.as_deref(), Some("c1"));
+        assert_eq!(r.enable_cmt, Some(true));
+        assert_eq!(r.enable_mbm, Some(false));
+        let bad = "cdiVersion: '1'\nkind: a/b\ncontainerEdits:\n  intelRdt:\n    enableCmt: true\n";
+        assert_eq!(code_of(bad), CdiSpecErrorCode::InvalidArgument);
     }
 
     /// GPU-1: env の値はエラー message と Debug に出ない。

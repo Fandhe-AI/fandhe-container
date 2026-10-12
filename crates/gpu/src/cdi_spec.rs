@@ -517,6 +517,14 @@ fn read_cdi_spec_file_inner(path: &Path) -> Result<CdiSpec, CdiSpecError> {
     file.take(limit).read_to_end(&mut buf).map_err(|_| {
         CdiSpecError::new(CdiSpecErrorCode::Internal, "failed to read CDI spec file")
     })?;
+    // UTF-8 変換より先に上限超過を判定する（上限 +1 バイトで切れた多バイト文字が
+    // InvalidArgument に化けて分類契約と食い違うのを防ぐ）。
+    if buf.len() > CDI_SPEC_MAX_INPUT_BYTES {
+        return Err(CdiSpecError::new(
+            CdiSpecErrorCode::ResourceExhausted,
+            "CDI spec input exceeds the size limit",
+        ));
+    }
     let text = String::from_utf8(buf).map_err(|_| {
         CdiSpecError::new(
             CdiSpecErrorCode::InvalidArgument,

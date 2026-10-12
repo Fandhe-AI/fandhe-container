@@ -110,17 +110,54 @@ fn gpu1_rejects_non_regular_file() {
     assert_eq!(e.message(), "CDI spec path is not a regular file");
 }
 
+/// mkfifo の終了待ちの期限（REPAIR-5）。
+#[cfg(unix)]
+const MKFIFO_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// mkfifo を期限付きで実行する。起動失敗・失敗終了・期限超過はすべて panic（無言で省略しない）。
+#[cfg(unix)]
+fn make_fifo(path: &Path) {
+    let mut child = std::process::Command::new("mkfifo")
+        .arg(path)
+        .spawn()
+        .expect("mkfifo must be available to verify FIFO handling (GPU-1)");
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait().expect("failed to poll mkfifo") {
+            Some(status) => {
+                assert!(status.success(), "mkfifo failed: {status}");
+                return;
+            }
+            None if start.elapsed() > MKFIFO_DEADLINE => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("mkfifo did not finish within {MKFIFO_DEADLINE:?}");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
+}
+
 /// GPU-1: FIFO は writer がいなくても open で停止せず拒否される（Unix のみ）。
 #[cfg(unix)]
 #[test]
 fn gpu1_rejects_fifo_without_hanging() {
     let d = TempDir::new("fifo");
     let p = d.path().join("spec.fifo");
-    let Ok(status) = std::process::Command::new("mkfifo").arg(&p).status() else {
-        return; // mkfifo が無い環境では FIFO を作れないため検証対象外
-    };
-    assert!(status.success());
+    make_fifo(&p);
     let e = read_cdi_spec_file(&p).unwrap_err();
     assert_eq!(e.code(), CdiSpecErrorCode::InvalidArgument);
     assert_eq!(e.message(), "CDI spec path is not a regular file");
+}
+
+/// GPU-1: 上限 +1 バイトが多バイト文字の途中で切れても ResourceExhausted になる。
+#[test]
+fn gpu1_oversize_multibyte_boundary_is_resource_exhausted() {
+    let d = TempDir::new("mb");
+    let p = d.path().join("mb.yaml");
+    let mut data = vec![b'#'; CDI_SPEC_MAX_INPUT_BYTES - 1];
+    data.extend("あ".as_bytes()); // 3 バイト文字が上限境界をまたぐ
+    std::fs::write(&p, data).unwrap();
+    let e = read_cdi_spec_file(&p).unwrap_err();
+    assert_eq!(e.code(), CdiSpecErrorCode::ResourceExhausted);
 }

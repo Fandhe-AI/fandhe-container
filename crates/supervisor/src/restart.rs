@@ -41,6 +41,7 @@ use fandhe_container_core::traits::{
     ContainerId, ContainerStatus, ErrorCode, Signal, StateRecord, SupervisionState, TraitError,
 };
 
+use crate::log_pipeline::CaptureHub;
 use crate::run::{
     MonitorConfig, MonitorEvent, MonitorObserver, MonitorOperation, MonitorOutcome, StopToken,
     ensure_owner, is_running_with_pid, monitor_with_observer, precondition, write_with_retry_when,
@@ -1145,21 +1146,49 @@ impl ProcessLauncher for SpecCapturingLauncher {
 ///
 /// `relaunch(timeout)` は `launcher.launch(&spec, timeout)` を呼ぶだけで、launcher の中身（フェイクか core の本番
 /// 実装か）に依存しない。`LaunchSpec` が持つ rootfs の fd は `Arc` 共有のため、複製しても固定は保たれる。
+///
+/// 出力の捕捉（TASK-164 追補・#1471・SUP-7・SUP-1）: [`Self::with_capture`] でハブを持たせると、再 launch の直後に
+/// 新プロセスの `take_output` を取って [`CaptureHub::attach`] へ渡す（再起動をまたいで同じ sink へ流れる）。
+/// 捕捉を開始できなければ、新プロセスを terminate して回収してから `Err` を返す（読み取り側を捨てると
+/// コンテナは SIGPIPE を受けるため、ログを失ったまま動かさない。fail-closed）。
+/// 注意: この時点で既に捕捉スレッドが存在するため、再 launch の経路は「呼び出し元がシングルスレッド」を前提にできない。
 pub struct LauncherRelauncher {
     launcher: Arc<dyn ProcessLauncher>,
     spec: LaunchSpec,
+    capture: Option<Arc<CaptureHub>>,
 }
 
 impl LauncherRelauncher {
-    /// start で使った `launcher` と捕捉した `spec` から作る。
+    /// start で使った `launcher` と捕捉した `spec` から作る（出力は捕捉しない）。
     pub fn new(launcher: Arc<dyn ProcessLauncher>, spec: LaunchSpec) -> Self {
-        Self { launcher, spec }
+        Self {
+            launcher,
+            spec,
+            capture: None,
+        }
+    }
+
+    /// 再 launch したプロセスの出力を `hub` へ渡す。
+    #[must_use]
+    pub fn with_capture(mut self, hub: Arc<CaptureHub>) -> Self {
+        self.capture = Some(hub);
+        self
     }
 }
 
 impl Relauncher for LauncherRelauncher {
     fn relaunch(&self, timeout: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
-        self.launcher.launch(&self.spec, timeout)
+        let process = self.launcher.launch(&self.spec, timeout)?;
+        if let (Some(hub), Some(output)) = (&self.capture, process.take_output())
+            && let Err(e) = hub.attach(output)
+        {
+            // 新プロセスを動かしたままにしない（回収できなければその失敗を返す。REPAIR-5）。
+            return match process.terminate(timeout) {
+                Ok(()) => Err(e),
+                Err(t) => Err(t),
+            };
+        }
+        Ok(process)
     }
 }
 

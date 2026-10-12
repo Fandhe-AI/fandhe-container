@@ -57,8 +57,10 @@
 //! - stdout / stderr 混在での大規模な欠落 0・重複 0 の検証（stdout 単独の 100 万行検証は `tests/log_rotation.rs` に実装済み）: SUP-7・TASK-164.4（#508）。
 //! - `logs` コマンドからの読み出し経路: TASK-164 以降 / CLI 側（ログ名の列挙は [`log_file_paths`] が実装済みで、ロックファイルを含めない。内容の読み出し・CLI 配線は未実装。TASK-164 追補・#1469）。
 //! - コンテナ削除経路からの [`RotatingFileSink::remove_all`]（ログ・ロックファイルの一括削除）の呼び出し配線: SUP-7・TASK-164 追補（#1469）。
-//! - 実パイプの取得: core の本番 launcher が子の stdio をパイプへ接続して渡す経路は未提供
-//!   （現状 core は子の標準入出力を null へ向けている）。そのため入力は注入式である。
+//! - 本番 launcher からの呼び出し配線: 子の stdout / stderr をパイプへ接続する機構（core の `exec::ChildStdio`）と、
+//!   読み取り側を受け取って起動・再起動をまたいで捕捉する配線（[`crate::log_pipeline::CaptureHub`]）は実装済みだが
+//!   （TASK-164 追補・#1471）、core の本番 `ProcessLauncher`（TASK-29 追補の Phase B）が `ChildStdio` を使って
+//!   `LaunchedProcess::take_output` を返す部分は未実装。入力は注入式のままである。
 //!
 //! 既定の [`MemoryLogSink`] はメモリ保持のみ（上限付き）で、supervisor 終了時に失われる。永続化には [`rotating::RotatingFileSink`] を注入する。
 

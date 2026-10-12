@@ -1151,7 +1151,8 @@ impl ProcessLauncher for SpecCapturingLauncher {
 /// 新プロセスの `take_output` を取って [`CaptureHub::attach`] へ渡す（再起動をまたいで同じ sink へ流れる）。
 /// 捕捉を開始できなければ、新プロセスを terminate して回収してから `Err` を返す（読み取り側を捨てると
 /// コンテナは SIGPIPE を受けるため、ログを失ったまま動かさない。fail-closed）。
-/// 注意: この時点で既に捕捉スレッドが存在するため、再 launch の経路は「呼び出し元がシングルスレッド」を前提にできない。
+/// 再 launch の直前に [`CaptureHub::quiesce`] で直前の捕捉を畳み、捕捉スレッドを 0 にしてから launch する
+/// （core の fork 経路が `Threads: 1` を要求するため。`relaunch_bounded` の実行スレッドは別に存在する）。
 pub struct LauncherRelauncher {
     launcher: Arc<dyn ProcessLauncher>,
     spec: LaunchSpec,
@@ -1178,6 +1179,10 @@ impl LauncherRelauncher {
 
 impl Relauncher for LauncherRelauncher {
     fn relaunch(&self, timeout: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+        if let Some(hub) = &self.capture {
+            // 旧プロセスは回収済み。読み取りスレッドを残したまま fork しない（SUP-7）。
+            hub.quiesce();
+        }
         let process = self.launcher.launch(&self.spec, timeout)?;
         if let (Some(hub), Some(output)) = (&self.capture, process.take_output())
             && let Err(e) = hub.attach(output)

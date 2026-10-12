@@ -12,7 +12,9 @@
 //!   `drain` する（旧プロセスは終了検知済みで EOF が届くはず。孫がパイプを保持して期限切れなら `drain` が自動で取り消し、
 //!   リーダー数は予算が上限管理する）。新しい捕捉を先にするのは、restart のレイテンシに drain の待ちを載せないため。
 //! - 読み取りスレッドを作るのは `oci_runtime::start` の完了後に限る（start は単一スレッド前提。start_entry 参照）。
-//!   再起動時には既に捕捉スレッドが存在するため、再起動の launch 経路は「呼び出し元がシングルスレッド」を前提にできない。
+//!   再起動の launch の直前には [`CaptureHub::quiesce`] で直前の捕捉を畳み、捕捉スレッドを 0 にしてから launch する
+//!   （core の fork 経路が `Threads: 1` を要求するため。なお `relaunch_bounded` の実行スレッドは別途存在する。
+//!   Phase B の本番 launcher はそのスレッド構成で fork できる方式にする必要がある）。
 //! - 捕捉を開始できなかったときは `Err` を返す。読み取り側を破棄するとコンテナは次の `write` で SIGPIPE を受けるため、
 //!   呼び出し側は fail-closed（起動・再起動を失敗として扱いプロセスを回収する）にする。ログ喪失を黙って許さない（REPAIR-4）。
 //! - 出力は非信頼バイト列として不透明に扱い、supervisor 自身のログへ行内容を出さない。
@@ -76,6 +78,22 @@ impl CaptureHub {
         Ok(())
     }
 
+    /// 直前の捕捉を `PREVIOUS_DRAIN_TIMEOUT` まで待って畳み、読み取りスレッドを残さない（SUP-7）。
+    ///
+    /// 再起動の launch の直前に呼ぶ。core の fork 経路は `Threads: 1`（シングルスレッド）を要求するため、
+    /// 捕捉スレッドが生きたまま launch すると `MultiThreaded` で拒否される。旧プロセスは回収済みで EOF が即座に届くはず。
+    /// 期限切れの場合は `drain` が自動で取り消す（孫がパイプを保持している場合のスレッド残存は予算が上限管理する）。
+    pub fn quiesce(&self) {
+        let previous = self
+            .live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(previous) = previous {
+            let _ = previous.drain(PREVIOUS_DRAIN_TIMEOUT);
+        }
+    }
+
     /// 生きている捕捉を `timeout` まで待って畳み、末尾の行を sink へ flush する。捕捉が無ければ `None`。
     ///
     /// supervisor の全終了経路で呼ぶ（末尾の行が sink 内のバッファに残らないように）。
@@ -130,6 +148,19 @@ mod tests {
         let mut stderr = lines_of(&sink, StreamKind::Stderr);
         stderr.sort();
         assert_eq!(stderr, vec![b"e1".to_vec(), b"e2".to_vec(), b"e3".to_vec()]);
+    }
+
+    /// SUP-7（#1471）: `quiesce` の後は読み取りスレッドが 0 になり、末尾の行も sink へ入っている。
+    #[test]
+    fn sup7_1471_quiesce_leaves_no_reader_threads() {
+        let sink = Arc::new(MemoryLogSink::default());
+        let hub = CaptureHub::new(sink.clone());
+        hub.attach(output("a1\n", "e1")).expect("attach");
+        hub.quiesce();
+        assert_eq!(hub.budget.live(), 0);
+        assert!(hub.finish(Duration::from_secs(1)).is_none());
+        assert_eq!(lines_of(&sink, StreamKind::Stdout), vec![b"a1".to_vec()]);
+        assert_eq!(lines_of(&sink, StreamKind::Stderr), vec![b"e1".to_vec()]);
     }
 
     /// 出力の無いプロセスは捕捉を始めず、`finish` も `None`。

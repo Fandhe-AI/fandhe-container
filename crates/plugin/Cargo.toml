@@ -18,6 +18,8 @@
 # gRPC 面（`grpc` モジュール。TASK-108.1・#453・PLUG-2）は非既定 feature `grpc` の背後に置く。tonic / tokio（承認: #425 の
 # オーナー判断 2026-10-10）は optional で、core が既定 feature で本 crate を引いても tokio / tonic は core に入らない（PLUG-3・PLUG-4）。
 # UDS 上の tonic 統合（TASK-108.2・#454）は hyper-util（承認: #425 のオーナー判断。同 feature `grpc` のみ・Cargo.lock に既存）を追加。
+# CRI proto 由来 RPC の UDS 疎通試験（TASK-108.3・#455）のため、dev-dependency に workspace 内 path の `fandhe-container-cri` を追加
+# （外部依存の追加なし。test 専用で core の normal 依存木に影響しない。PLUG-3・PLUG-4）。cri→plugin の通常依存は足さない。
 # license は workspace 継承（Apache-2.0）をやめ、本 crate だけ `MIT OR Apache-2.0` にする
 # （#13 のオーナー判断 2026-10-10・TASK-3・OSS-3。外部の plugin の作者もリンクする境界ライブラリのため）。
 # 全文はルートの LICENSE-MIT・LICENSE-APACHE。依存の serde / serde_json も MIT OR Apache-2.0。
@@ -45,6 +47,7 @@ hyper-util = { workspace = true, optional = true, features = ["tokio"] }
 prost = { workspace = true }
 tonic-prost = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "time", "net"] }
+fandhe-container-cri = { path = "../cri" }
 
 [[test]]
 name = "grpc_basic"

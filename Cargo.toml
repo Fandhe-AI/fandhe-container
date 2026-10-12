@@ -111,6 +111,9 @@ flate2 = { version = "=1.1.10", default-features = false, features = ["zlib-rs"]
 # 解析（エントリ列挙）だけに使い、`Entry::unpack` / `unpack_in` は使わない（展開は crates/oci で自作する）。
 # MIT OR Apache-2.0。xattr 等の既定 feature を無効化する。
 tar = { version = "=0.4.46", default-features = false }
+# YAML（CDI spec。GPU-1・TASK-126.1）。承認: Issue #540（2026-10-10）。配置は crates/gpu と crates/compose-convert に限り core には入れない。
+# default-features を無効化し deserialize のみ有効にする。パースは from_str_with_options で Budget を明示し duplicate_keys: Error を維持する。
+serde-saphyr = { version = "=1.3.0", default-features = false, features = ["deserialize"] }
 
 # 依存クレート（workspace メンバー以外）のデバッグ情報を行番号のみにする。
 # ローカルの `target/` は依存グラフ全体（tonic / prost・protox・objc2 系等）の full debuginfo が

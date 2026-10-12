@@ -54,8 +54,8 @@ pub use launch::ContainerChildProcess;
 #[doc(hidden)]
 pub use launch::pin_bundle_rootfs_with_swap_for_test;
 pub use launch::{
-    LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher, RootfsDir, RootfsPinError,
-    START_TIMEOUT_MAX, StartTimeouts, pin_bundle_rootfs, pin_bundle_rootfs_audited,
+    ContainerOutput, LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher, RootfsDir,
+    RootfsPinError, START_TIMEOUT_MAX, StartTimeouts, pin_bundle_rootfs, pin_bundle_rootfs_audited,
 };
 pub use mount_destination::{MountDestination, audit_mount_config_error};
 pub use start::{

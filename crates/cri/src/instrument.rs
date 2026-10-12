@@ -13,7 +13,7 @@
 //!
 //! - core の `OpRecorder` との接続アダプタ（`fandhe-container-plugin-cri` の担当。TASK-108）。それまでは
 //!   既定の [`NoopCriOpRecorder`] が使われ、記録先を注入しない限り何も出力されない
-//! - `RunPodSandbox` 以外の RPC の種別は、RPC の実装（#430・#431・TASK-58）と一緒に [`CriOpKind`] へ追加する
+//! - `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`ListImages`・`ImageStatus` 以外の RPC の種別は、RPC の実装（TASK-58 以降・TASK-61.3 以降）と一緒に [`CriOpKind`] へ追加する
 //!
 //! # 機微情報
 //!
@@ -34,6 +34,18 @@ use tonic::{Code, Status};
 pub enum CriOpKind {
     /// `RuntimeService.RunPodSandbox` 1 回（入力検証から登録まで。CRI-1・TASK-57.1）。
     RunPodSandbox,
+    /// `RuntimeService.StopPodSandbox` 1 回（ready から notready への遷移。CRI-1・TASK-57.2）。
+    StopPodSandbox,
+    /// `RuntimeService.RemovePodSandbox` 1 回（レジストリからの除去。CRI-1・TASK-57.2）。
+    RemovePodSandbox,
+    /// `RuntimeService.PodSandboxStatus` 1 回（レジストリの読み取り。CRI-1・TASK-57.3）。
+    PodSandboxStatus,
+    /// `RuntimeService.ListPodSandbox` 1 回（レジストリの絞り込み一覧。CRI-1・TASK-57.3）。
+    ListPodSandbox,
+    /// `ImageService.ListImages` 1 回（ローカルキャッシュの絞り込み一覧。CRI-4・TASK-61.1）。
+    ListImages,
+    /// `ImageService.ImageStatus` 1 回（ローカルキャッシュの単一参照解決。CRI-4・TASK-61.2）。
+    ImageStatus,
 }
 
 impl CriOpKind {
@@ -41,6 +53,12 @@ impl CriOpKind {
     pub fn as_str(self) -> &'static str {
         match self {
             CriOpKind::RunPodSandbox => "cri.run_pod_sandbox",
+            CriOpKind::StopPodSandbox => "cri.stop_pod_sandbox",
+            CriOpKind::RemovePodSandbox => "cri.remove_pod_sandbox",
+            CriOpKind::PodSandboxStatus => "cri.pod_sandbox_status",
+            CriOpKind::ListPodSandbox => "cri.list_pod_sandbox",
+            CriOpKind::ListImages => "cri.list_images",
+            CriOpKind::ImageStatus => "cri.image_status",
         }
     }
 }
@@ -245,12 +263,32 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [CriOpKind; 1] = [CriOpKind::RunPodSandbox];
+    const ALL_KINDS: [CriOpKind; 7] = [
+        CriOpKind::RunPodSandbox,
+        CriOpKind::StopPodSandbox,
+        CriOpKind::RemovePodSandbox,
+        CriOpKind::PodSandboxStatus,
+        CriOpKind::ListPodSandbox,
+        CriOpKind::ListImages,
+        CriOpKind::ImageStatus,
+    ];
 
     /// REPAIR-4: 操作名は安定した固定文字列。
     #[test]
     fn repair4_cri_op_kind_as_str_is_stable() {
         assert_eq!(CriOpKind::RunPodSandbox.as_str(), "cri.run_pod_sandbox");
+        assert_eq!(CriOpKind::StopPodSandbox.as_str(), "cri.stop_pod_sandbox");
+        assert_eq!(
+            CriOpKind::RemovePodSandbox.as_str(),
+            "cri.remove_pod_sandbox"
+        );
+        assert_eq!(
+            CriOpKind::PodSandboxStatus.as_str(),
+            "cri.pod_sandbox_status"
+        );
+        assert_eq!(CriOpKind::ListPodSandbox.as_str(), "cri.list_pod_sandbox");
+        assert_eq!(CriOpKind::ListImages.as_str(), "cri.list_images");
+        assert_eq!(CriOpKind::ImageStatus.as_str(), "cri.image_status");
     }
 
     /// REPAIR-4: 操作名は core の `OpName::new` と同じ規則に収まる（cri は core に依存できないため

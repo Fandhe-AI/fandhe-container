@@ -22,6 +22,10 @@ pub enum OciOpKind {
     AuthenticateAnonymous,
     /// Basic 認証の検証（`/v2/` プローブと資格情報つき再要求の全体。TASK-54.1・OCI-3）。
     AuthenticateBasic,
+    /// 資格情報つき Bearer トークン交換（`/v2/` プローブからトークンエンドポイントまでの全体。TASK-54.2・OCI-3）。
+    AuthenticateBearer,
+    /// チャレンジに応じた Basic / Bearer 自動選択の統一入口（プローブから認証確立までの全体。TASK-54.3・OCI-3）。
+    Authenticate,
     /// マニフェスト取得（image index の場合は platform 解決後の取得まで。TASK-51.3）。
     FetchManifest,
     /// blob（レイヤー・config）のストリーミング取得（TASK-51.4）。
@@ -40,6 +44,8 @@ impl OciOpKind {
         match self {
             OciOpKind::AuthenticateAnonymous => "oci.auth.anonymous",
             OciOpKind::AuthenticateBasic => "oci.auth.basic",
+            OciOpKind::AuthenticateBearer => "oci.auth.bearer",
+            OciOpKind::Authenticate => "oci.auth",
             OciOpKind::FetchManifest => "oci.manifest.fetch",
             OciOpKind::FetchBlob => "oci.blob.fetch",
             OciOpKind::VerifyBlobDigest => "oci.blob.verify",

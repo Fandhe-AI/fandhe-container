@@ -51,7 +51,7 @@ name = "fandhe-container-supervisor"
 path = "src/main.rs"
 doc = false
 
-# 特権ランチャーの bin（入口検証 → 権限昇格 → 検証済み fd で supervisor を exec。#1719・SUP-14）。名前は仮称。
+# 特権ランチャーの bin（入口検証 → 権限昇格 → 検証済み fd で supervisor を exec。#1719・SUP-14）。名前は spec（TASK-171 の成果物欄）で確定。
 # doc = false は supervisor の bin と同じ理由（lib の rustdoc の出力名との衝突を避ける）。
 [[bin]]
 name = "fandhe-container-launcher"

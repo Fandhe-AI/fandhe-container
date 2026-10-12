@@ -1,4 +1,4 @@
-//! 特権ランチャー bin（`fandhe-container-launcher`。仮称）の外形の結合試験（SUP-14・SEC-1・REPAIR-5・
+//! 特権ランチャー bin（`fandhe-container-launcher`）の外形の結合試験（SUP-14・SEC-1・REPAIR-5・
 //! TASK-171 追補・#1719・MS-9）。
 //!
 //! 実バイナリを CLI と同じ契約（argv・stdout の pipe の結果チャネル）で起動し、失敗の報告 1 行・stderr の構造化 JSON・

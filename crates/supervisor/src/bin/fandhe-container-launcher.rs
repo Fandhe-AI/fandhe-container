@@ -1,4 +1,4 @@
-//! 特権ランチャーの bin の入口（TASK-171 追補・#1719・SUP-14・SEC-1。bin 名は仮称）。
+//! 特権ランチャーの bin の入口（TASK-171 追補・#1719・SUP-14・SEC-1）。
 //!
 //! CLI（#1718）が固定のインストール先から起動する。file capability（方式 (c)）または setuid root（方式 (a)。
 //! xattr 非対応環境に限る）が付与されている前提で、入口検証 → 権限昇格 → 検証済み fd での supervisor の exec を行う。

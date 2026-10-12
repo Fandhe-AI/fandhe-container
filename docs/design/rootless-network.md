@@ -7,7 +7,7 @@
 - 対象ビヘイビア: NET-9（Should・検討中。関連: CORE-6・SEC-5・NET-11・NET-6・PLUG-1・ERR-1・REPAIR-5）
 - タスク: TASK-147（MS-8・G10。本書は TASK-147.1・#339。前提は TASK-8〔#26。完了済み〕）
 - 関連 issue: #338（親）・#340（採否判断。人間担当）・#341（採用時の実装・実証。条件付き）
-- 出典: `docs/spec/04-behavior/api-network.md` の `NET-9`・`NET-11`、`01-brainstorm.md` の D-18 論点 3・4・未解決疑問点 11・14、`05-tasks.md` の TASK-147（submodule リビジョン `984f8a2`）。外部事実の出典は 3 章に URL と確認日（2026-10-02）を付す
+- 出典: `docs/spec/04-behavior/api-network.md` の `NET-9`・`NET-11`、`01-brainstorm.md` の D-18 論点 3・4・未解決疑問点 11・14、`05-tasks.md` の TASK-147（submodule リビジョン `fd9adc3`。起草時の `984f8a2` から NET-9・NET-11・TASK-147 の記述は変わっていない）。関連: `NET-6`（コンテナ単位のネットワークの既定は `none`。NET-9 の確定後に見直す。2026-10-12 のオーナー決定）。外部事実の出典は 3 章に URL と確認日（2026-10-02）を付す
 
 ## 1. 前提と制約
 

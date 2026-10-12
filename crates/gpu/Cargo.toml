@@ -13,3 +13,8 @@ publish = false
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]
 workspace = true
+
+# CDI spec（YAML / JSON）の読み込み（GPU-1・TASK-126.1）。serde-saphyr は #540 で承認済み。
+[dependencies]
+serde.workspace = true
+serde-saphyr.workspace = true

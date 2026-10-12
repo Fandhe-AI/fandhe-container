@@ -46,8 +46,13 @@
 //! # 未実装（実装済みを装わない。REPAIR-3）
 //!
 //! - whiteout（`.wh.*`・`.wh..wh..opq`）の解釈は TASK-53 の担当。本モジュールは通常ファイルとして展開する。
-//! - uid / gid の写像と `chown`（SEC-5）。展開物は実行ユーザー所有になる。setuid / setgid / sticky は
-//!   mode にそのまま保持する（ホストでは実行されない前提。rootless の UID 写像は SEC-5 で扱う）。
+//! - uid / gid の写像と `chown`（SEC-5）。展開物は実行ユーザー所有になる。
+//! - 通常ファイルの setuid / setgid / sticky の保持。展開物が実行ユーザー所有のまま setuid / setgid を残すと、
+//!   ホスト root がほかのユーザーも辿れるステージングへ展開したときに、レイヤー由来の実行ファイルが root 所有の
+//!   setuid になり、ホスト上の権限昇格に使える。所有者の写像（SEC-5）が入るまで、通常ファイルの mode は
+//!   下位 9 ビット（`FILE_MODE_MASK`）だけを適用し、落とした件数を
+//!   `ExtractedLayer::files_with_stripped_special_bits` に返す（黙って落とさない）。ディレクトリの mode は
+//!   sticky（`/tmp` の 1777）・setgid を含めてそのまま適用する。
 //! - ディレクトリ fd 起点（`openat2` の `RESOLVE_IN_ROOT` 等）の解決。libc 系の依存承認後の後続課題。
 //! - 綴りの畳み込みによる名前衝突の検出（展開先 FS が区別する別表記は衝突として扱わない。IO-5）。HFS+ のように
 //!   保存時に名前を書き換える FS は前提外。
@@ -142,6 +147,11 @@ pub struct ExtractedLayer {
     pub entries: u64,
     /// 書き出したファイル本体の累積バイト数。
     pub bytes: u64,
+    /// tar の mode に setuid / setgid / sticky が付いていて、それを落として展開した通常ファイルのエントリ数。
+    ///
+    /// 0 でなければ、展開結果の mode はレイヤーの記述と一致しない（所有者の写像〔SEC-5〕が入るまでの措置。
+    /// モジュール冒頭の「未実装」を参照）。
+    pub files_with_stripped_special_bits: u64,
 }
 
 /// 計装なしの `extract_tar_with`（`NoopOciOpRecorder`）。
@@ -272,6 +282,8 @@ struct Extractor<'a> {
     limits: ExtractLimits,
     entries: u64,
     bytes: u64,
+    /// setuid / setgid / sticky を落として展開した通常ファイルのエントリ数。
+    stripped_special: u64,
     /// 所有者の rwx が欠けるディレクトリの mode。子の作成を妨げないよう全エントリ処理後に適用する。
     /// キーは物理パス。別表記は `probe` が先に拒否するため、同じディレクトリのキーは 1 つに定まる。
     deferred_dirs: HashMap<PathBuf, u32>,
@@ -678,6 +690,13 @@ fn apply_dir_mode(_path: &Path, _mode: u32) -> Result<(), OciError> {
     Ok(())
 }
 
+/// 通常ファイルへ適用する mode のマスク（下位 9 ビット）。
+///
+/// setuid / setgid / sticky は適用しない。展開物は実行ユーザー所有になるため、非信頼のレイヤーが指定した
+/// setuid / setgid を残すと、ホスト上で実行ユーザー（root なら root）の権限で動く実行ファイルを作れてしまう
+/// （SEC-5 の所有者写像が入るまでの措置）。
+const FILE_MODE_MASK: u32 = 0o777;
+
 /// 所有者の rwx がそろわない mode か（子の作成を妨げうるため適用を遅延する）。
 fn needs_deferral(mode: u32) -> bool {
     mode & 0o700 != 0o700
@@ -898,7 +917,10 @@ impl Extractor<'_> {
         if written != size {
             return Err(err(OciErrorCode::DataLoss, "layer tar stream is malformed"));
         }
-        apply_file_mode(&f, mode)?;
+        apply_file_mode(&f, mode & FILE_MODE_MASK)?;
+        if mode & 0o7000 != 0 {
+            self.stripped_special = self.stripped_special.saturating_add(1);
+        }
         self.bytes = next;
         Ok(())
     }
@@ -1045,6 +1067,7 @@ fn extract_with_lstat<R: Read>(
         limits,
         entries: 0,
         bytes: 0,
+        stripped_special: 0,
         deferred_dirs: HashMap::new(),
         names: NameIndex::new(limits.max_tracked_paths),
         lstat,
@@ -1123,6 +1146,7 @@ fn extract_with_lstat<R: Read>(
     Ok(ExtractedLayer {
         entries: x.entries,
         bytes: x.bytes,
+        files_with_stripped_special_bits: x.stripped_special,
     })
 }
 
@@ -1613,7 +1637,8 @@ mod tests {
         sb.assert_outside_untouched();
     }
 
-    /// OCI-1: 通常の展開（暗黙の親ディレクトリ・`./` 正規化・mode・ルート自身の無視）。
+    /// OCI-1 / SEC-5: 通常の展開（暗黙の親ディレクトリ・`./` 正規化・mode・ルート自身の無視）。
+    /// 通常ファイルの setuid（04755）は落として 0755 で展開する。
     #[cfg(unix)]
     #[test]
     fn oci1_extracts_regular_tree_with_modes() {
@@ -1633,9 +1658,44 @@ mod tests {
         assert_eq!(fs::read(sb.root.join("etc/hosts")).unwrap(), b"127.0.0.1");
         let mode = |p: &str| fs::metadata(sb.root.join(p)).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode("etc/hosts"), 0o644);
-        assert_eq!(mode("usr/bin/tool"), 0o4755);
+        assert_eq!(mode("usr/bin/tool"), 0o755);
+        assert_eq!(r.files_with_stripped_special_bits, 1);
         assert_eq!(mode("etc"), 0o755);
         sb.assert_outside_untouched();
+    }
+
+    /// SEC-5 / OCI-1: 通常ファイルの setuid / setgid / sticky は落とし、落とした件数を結果に返す。
+    /// 実行ユーザー所有のまま setuid / setgid を残さない。ディレクトリの mode（sticky の 1777）は変えない。
+    #[cfg(unix)]
+    #[test]
+    fn sec5_special_mode_bits_are_stripped_from_regular_files() {
+        let sb = Sandbox::new();
+        let r = run(
+            &sb,
+            &[
+                file("suid", 0o4755, b"a"),
+                file("sgid", 0o2755, b"b"),
+                file("both", 0o6711, b"c"),
+                file("sticky", 0o1644, b"d"),
+                file("plain", 0o755, b"e"),
+                hardlink("link", "suid"),
+                dir("tmp/", 0o1777),
+            ],
+        )
+        .unwrap();
+        assert_eq!((r.entries, r.bytes), (7, 5));
+        assert_eq!(r.files_with_stripped_special_bits, 4);
+        for (name, want) in [
+            ("suid", 0o755),
+            ("sgid", 0o755),
+            ("both", 0o711),
+            ("sticky", 0o644),
+            ("plain", 0o755),
+            ("link", 0o755),
+            ("tmp", 0o1777),
+        ] {
+            assert_eq!(mode_of(&sb.root.join(name)), want, "{name}");
+        }
     }
 
     /// OCI-1: 親エントリの無い tar の暗黙ディレクトリは既定 0755、後続の明示エントリがあればその mode になる。

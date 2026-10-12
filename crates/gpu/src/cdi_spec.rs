@@ -48,9 +48,10 @@ const CDI_SPEC_ERROR_MESSAGE_MAX_BYTES: usize = 512;
 pub enum CdiSpecErrorCode {
     /// 構文・型・必須欠落・未知フィールド・重複キー。
     InvalidArgument,
-    /// 入力サイズ・深さ・ノード数・エイリアス展開などの上限超過。
+    /// 入力サイズ・深さ・ノード数・エイリアス展開などの上限超過、または集計で要求したデバイス名の
+    /// 件数・長さの上限超過。
     ResourceExhausted,
-    /// spec ファイルが存在しない。
+    /// spec ファイルが存在しない、または集計で指定したデバイスが spec に無い。
     NotFound,
     /// 上記以外（読み取り失敗など）。
     Internal,
@@ -80,7 +81,7 @@ pub struct CdiSpecError {
 }
 
 impl CdiSpecError {
-    fn new(code: CdiSpecErrorCode, message: &str) -> Self {
+    pub(crate) fn new(code: CdiSpecErrorCode, message: &str) -> Self {
         let mut sanitized: String = message
             .chars()
             .map(|c| if c.is_control() { ' ' } else { c })
@@ -143,6 +144,11 @@ impl Error for CdiSpecError {}
 pub struct EnvList(Vec<String>);
 
 impl EnvList {
+    /// 集計結果（`cdi_edits`。TASK-126.2）から `EnvList` を組み立てる。
+    pub(crate) fn from_entries(entries: Vec<String>) -> Self {
+        Self(entries)
+    }
+
     /// `KEY=VALUE` 形式の文字列を順に返す。
     pub fn iter(&self) -> std::slice::Iter<'_, String> {
         self.0.iter()

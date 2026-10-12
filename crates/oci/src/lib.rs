@@ -27,7 +27,15 @@
 //! `layer::GzipLayerReader`）。展開後サイズの上限を必須引数とし、超過で中断する（decompression bomb 対策）。
 //! 展開後 tar の diff_id 検証は未実装。
 //!
-//! 未実装（スタブではなく後続 issue の担当）: tar 展開（TASK-52.3）、whiteout、
+//! 実装済み: レイヤー tar のルート配下への安全な展開（TASK-52.3・OCI-1・MS-4・#409。`layer::extract`）。
+//! パス検証、ルートに閉じ込めた symlink 解決、hardlink の制限、エントリ数・累積サイズの上限を持つ。
+//! 展開先 FS が別表記（大文字小文字・Unicode 正規化）を既存の実体へ解決する名前は、変更操作の前に
+//! `AlreadyExists` で拒否する（IO-5）。
+//! 未実装: ディレクトリ fd 起点の解決（TOCTOU 対策）、uid / gid 写像（SEC-5）、通常ファイルの
+//! setuid / setgid / sticky の保持（所有者の写像が入るまで落とし、件数を結果に返す。SEC-5）、綴りの畳み込みによる
+//! 名前衝突の検出（展開先 FS が区別する別表記は衝突として扱わない。IO-5）。
+//!
+//! 未実装（スタブではなく後続 issue の担当）: whiteout（TASK-53）、
 //! キャッシュ・`image ls`/`rm`/`tag`（TASK-52〜55・TASK-183〜184）。`RegistryClient` の通信は匿名トークン取得・
 //! manifest 取得・blob 取得のみ。
 //! PLUG-1 区分は core（crate-naming.md）。

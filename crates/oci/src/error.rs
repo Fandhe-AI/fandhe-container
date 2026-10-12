@@ -39,6 +39,8 @@ pub enum OciErrorCode {
     ResourceExhausted,
     /// ルート証明書が 0 件など、前提が満たされていない。
     FailedPrecondition,
+    /// 同じ実体を指す名前がすでに在る（レイヤー展開での別表記の衝突。IO-5・TASK-52.3）。
+    AlreadyExists,
     /// 上記以外の内部エラー。
     Internal,
 }
@@ -56,6 +58,7 @@ impl OciErrorCode {
             Self::DataLoss => "DATA_LOSS",
             Self::ResourceExhausted => "RESOURCE_EXHAUSTED",
             Self::FailedPrecondition => "FAILED_PRECONDITION",
+            Self::AlreadyExists => "ALREADY_EXISTS",
             Self::Internal => "INTERNAL",
         }
     }
@@ -159,6 +162,7 @@ mod tests {
             (OciErrorCode::DataLoss, "DATA_LOSS"),
             (OciErrorCode::ResourceExhausted, "RESOURCE_EXHAUSTED"),
             (OciErrorCode::FailedPrecondition, "FAILED_PRECONDITION"),
+            (OciErrorCode::AlreadyExists, "ALREADY_EXISTS"),
             (OciErrorCode::Internal, "INTERNAL"),
         ];
         for (code, s) in table {

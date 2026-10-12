@@ -107,6 +107,10 @@ hyper-util = { version = "=0.1.21", default-features = false }
 # 配置は crates/oci に限る。backend は純 Rust の zlib-rs（libz-sys / cc を引かない）。展開後サイズの上限は呼び出し側で検証する。
 # 純 Rust・MIT OR Apache-2.0（zlib-rs は Zlib）。default-features を無効化する。
 flate2 = { version = "=1.1.10", default-features = false, features = ["zlib-rs"] }
+# OCI レイヤー tar の解析（OCI-1・TASK-52.3）。承認: Issue #408（オーナー判断 2026-10-10）。配置は crates/oci に限る。
+# 解析（エントリ列挙）だけに使い、`Entry::unpack` / `unpack_in` は使わない（展開は crates/oci で自作する）。
+# MIT OR Apache-2.0。xattr 等の既定 feature を無効化する。
+tar = { version = "=0.4.46", default-features = false }
 # YAML（CDI spec。GPU-1・TASK-126.1）。承認: Issue #540（2026-10-10）。配置は crates/gpu と crates/compose-convert に限り core には入れない。
 # default-features を無効化し deserialize のみ有効にする。パースは from_str_with_options で Budget を明示し duplicate_keys: Error を維持する。
 serde-saphyr = { version = "=1.3.0", default-features = false, features = ["deserialize"] }

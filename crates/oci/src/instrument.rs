@@ -34,6 +34,8 @@ pub enum OciOpKind {
     VerifyBlobDigest,
     /// レイヤー blob の gzip 展開（open 失敗を含む操作全体。TASK-52.2）。
     DecompressLayer,
+    /// レイヤー tar のルート配下への展開（TASK-52.3）。
+    ExtractLayer,
 }
 
 impl OciOpKind {
@@ -48,6 +50,7 @@ impl OciOpKind {
             OciOpKind::FetchBlob => "oci.blob.fetch",
             OciOpKind::VerifyBlobDigest => "oci.blob.verify",
             OciOpKind::DecompressLayer => "oci.layer.decompress",
+            OciOpKind::ExtractLayer => "oci.layer.extract",
         }
     }
 }

@@ -1,0 +1,2414 @@
+//! レイヤー tar のルート配下への安全な展開（TASK-52.3・OCI-1・MS-4・#409）。
+//!
+//! `layer` の gzip 展開（TASK-52.2。`GzipLayerReader`）が返す tar バイトストリームを、rootfs 相当の
+//! ステージング用ディレクトリへ書き出す。レイヤー tar は非信頼入力のため、このモジュールは次を担う。
+//!
+//! - パス検証と正規化（`..`・絶対パス・NUL・過大な長さ / 深さの拒否）。
+//! - 親ディレクトリの解決はルートに閉じ込める（symlink を辿ってもホストの絶対パスへ抜けない。chroot 意味論）。
+//! - symlink エントリはリンク先がルートより上へ出る場合に拒否し、hardlink はルート内の通常ファイルに限る。
+//! - デバイス・FIFO・sparse は拒否する（既定拒否の最小権限）。
+//! - エントリ数と累積展開バイト数に必須の上限を課し、超過したら書き込み前に中断する（DoS 対策）。
+//! - 展開先 FS が別表記（大文字小文字・Unicode 正規化）を既存の実体へ解決する名前は、
+//!   削除・権限変更・リンク作成の前に `AlreadyExists` で拒否する（IO-5。下記「別表記の衝突」）。
+//!
+//! tar クレートは解析（エントリ列挙）だけに使い、`unpack` / `unpack_in` は使わない（#408 の承認条件）。
+//!
+//! # 呼び出し契約
+//!
+//! - 呼び出し側は先に `verify_blob_digest` を通すこと。
+//! - `root` は呼び出し側が排他的に所有する既存の空ディレクトリ（ステージング）で、`root` 自体が
+//!   symlink であってはならない。空でなければ `FailedPrecondition` で拒否する（別表記の衝突の判定が
+//!   「`root` 配下の実在項目はすべてこの展開が作った」ことに依るため）。別プロセスが同時に `root` を
+//!   書き換える競合（TOCTOU）は防げない。
+//! - 失敗時は部分的な展開物が残るため、呼び出し側が `root` ごと破棄すること。
+//! - tar の終端後に入力を EOF まで読み捨てる（gzip トレーラの CRC32・ISIZE 検証のため）。読み捨てを含む
+//!   入力全体は `ExtractLimits::max_input_bytes` で上限を課す（超過は `ResourceExhausted`）。
+//!
+//! # 別表記の衝突（IO-5）
+//!
+//! 大文字小文字非区別の FS（Windows・macOS の既定）では `f` と `F`、正規化非区別の FS（APFS）では NFC と NFD の
+//! 綴りが同じ実体を指す。綴りの比較（`PathBuf` の一致）だけで同一性を判断すると、`f` の後の hardlink
+//! `F → f` が参照元を削除し、`d/` の後の `D/` が先の遅延 mode を残す。
+//!
+//! 判定は展開先 FS の実際の挙動で行う。`NameIndex` にこの展開が作った名前（親ディレクトリと正確な綴りの組）を
+//! 記録し、`lstat` が成功するのに索引に無い綴りは「FS が別表記を既存の実体へ解決した」とみなして拒否する。
+//! `root` が空で始まるため、実在するのに索引に無い名前はそれ以外に生じない。
+//!
+//! - 綴りの畳み込み（`fandhe-container-io` の `fold_component`）で判定しないのは、大文字小文字を区別する FS では
+//!   `f` と `F` が別ファイルで正当なレイヤーだからである（区別する FS では `lstat` が `NotFound` になり通す）。
+//! - 実体の同一性（inode / file index）で判定しないのは、Windows の file index が安定版の std から取れず、
+//!   hardlink が正当に同じ inode を共有するためである。
+//! - 検査はパスの全コンポーネント（symlink を辿った先・hardlink の参照先を含む）に、変更操作の前に適用する。
+//! - 索引の件数は `ExtractLimits::max_tracked_paths` で上限を課す（超過は `ResourceExhausted`）。
+//! - 判定は FS の解決結果だけに依るため、Windows の 8.3 短縮名のような他の別名も同じ経路で拒否されるはずだが、
+//!   試験で確かめているのは大文字小文字と NFC / NFD だけである。
+//!
+//! # 未実装（実装済みを装わない。REPAIR-3）
+//!
+//! - whiteout（`.wh.*`・`.wh..wh..opq`）の解釈は TASK-53 の担当。本モジュールは通常ファイルとして展開する。
+//! - uid / gid の写像と `chown`（SEC-5）。展開物は実行ユーザー所有になる。
+//! - 通常ファイルの setuid / setgid / sticky の保持。展開物が実行ユーザー所有のまま setuid / setgid を残すと、
+//!   ホスト root がほかのユーザーも辿れるステージングへ展開したときに、レイヤー由来の実行ファイルが root 所有の
+//!   setuid になり、ホスト上の権限昇格に使える。所有者の写像（SEC-5）が入るまで、通常ファイルの mode は
+//!   下位 9 ビット（`FILE_MODE_MASK`）だけを適用し、落とした件数を
+//!   `ExtractedLayer::files_with_stripped_special_bits` に返す（黙って落とさない）。ディレクトリの mode は
+//!   sticky（`/tmp` の 1777）・setgid を含めてそのまま適用する。
+//! - ディレクトリ fd 起点（`openat2` の `RESOLVE_IN_ROOT` 等）の解決。libc 系の依存承認後の後続課題。
+//! - 綴りの畳み込みによる名前衝突の検出（展開先 FS が区別する別表記は衝突として扱わない。IO-5）。HFS+ のように
+//!   保存時に名前を書き換える FS は前提外。
+//! - Windows ホストでの symlink エントリ（`Unimplemented` で拒否する）。
+
+use std::collections::{HashMap, VecDeque};
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
+use std::path::{Component, Path, PathBuf};
+
+use tar::{Archive, EntryType};
+
+use super::{DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, oci_error_from_layer_io, open_gzip_layer};
+use crate::error::{OciError, OciErrorCode};
+use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
+
+/// エントリ数上限の参考既定値。API は上限を必須引数にしており、上限なしの経路は提供しない。
+pub const DEFAULT_MAX_LAYER_ENTRIES: u64 = 1_000_000;
+
+/// 累積展開バイト数上限の参考既定値（gzip 展開後サイズの参考既定値と同値）。
+pub const DEFAULT_MAX_EXTRACTED_BYTES: u64 = DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES;
+
+/// 索引に載せる名前の数の上限の参考既定値（`ExtractLimits::max_tracked_paths`）。
+///
+/// 親ディレクトリのエントリを省いた tar が暗黙に作るディレクトリの分を見込み、エントリ数の既定の 2 倍とする。
+pub const DEFAULT_MAX_TRACKED_PATHS: u64 = 2 * DEFAULT_MAX_LAYER_ENTRIES;
+
+/// パス全体の最大バイト数（Linux の `PATH_MAX`）。
+const MAX_PATH_BYTES: usize = 4096;
+/// 1 コンポーネントの最大バイト数（`NAME_MAX`）。
+const MAX_COMPONENT_BYTES: usize = 255;
+/// 1 パスのコンポーネント数の上限。
+const MAX_COMPONENTS: usize = 256;
+/// symlink の追従回数の上限（`ELOOP` 相当）。
+const MAX_SYMLINK_FOLLOWS: u32 = 40;
+/// 複写バッファ長（メモリ使用量を入力サイズに依存させない）。
+const COPY_BUF_LEN: usize = 64 * 1024;
+
+/// 展開の上限（必須。将来の項目追加に備え `non_exhaustive`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExtractLimits {
+    /// 受け付けるエントリ数の上限（超過は `ResourceExhausted`）。
+    pub max_entries: u64,
+    /// 累積展開バイト数の上限（ヘッダ宣言サイズで書き込み前に検査。超過は `ResourceExhausted`）。
+    pub max_total_bytes: u64,
+    /// 入力 tar ストリーム全体（ヘッダ・パディング・終端後の読み捨てを含む）の読み取り上限バイト数
+    /// （超過は `ResourceExhausted`）。`max_total_bytes` は通常ファイル本体しか数えないため別に必須とする。
+    pub max_input_bytes: u64,
+    /// 展開が作る名前（エントリと、暗黙に作る親ディレクトリ）の数の上限（超過は作成前に `ResourceExhausted`）。
+    ///
+    /// 別表記の衝突検出（IO-5）の索引 `NameIndex` の件数上限で、索引のメモリ使用量を
+    /// `max_tracked_paths ×（1 コンポーネントの最大 255 バイト + 固定長）` に抑える。`max_entries` は tar の
+    /// エントリしか数えず、1 エントリが多数の親ディレクトリを暗黙に作れるため別に必須とする。
+    pub max_tracked_paths: u64,
+}
+
+impl ExtractLimits {
+    /// 上限を指定して作る。
+    pub fn new(
+        max_entries: u64,
+        max_total_bytes: u64,
+        max_input_bytes: u64,
+        max_tracked_paths: u64,
+    ) -> Self {
+        Self {
+            max_entries,
+            max_total_bytes,
+            max_input_bytes,
+            max_tracked_paths,
+        }
+    }
+}
+
+impl Default for ExtractLimits {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_MAX_LAYER_ENTRIES,
+            DEFAULT_MAX_EXTRACTED_BYTES,
+            DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES,
+            DEFAULT_MAX_TRACKED_PATHS,
+        )
+    }
+}
+
+/// 展開に成功したレイヤーの結果（将来の項目追加に備え `non_exhaustive`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExtractedLayer {
+    /// 処理したエントリ数（PAX グローバルヘッダを除く）。
+    pub entries: u64,
+    /// 書き出したファイル本体の累積バイト数。
+    pub bytes: u64,
+    /// tar の mode に setuid / setgid / sticky が付いていて、それを落として展開した通常ファイルのエントリ数。
+    ///
+    /// 0 でなければ、展開結果の mode はレイヤーの記述と一致しない（所有者の写像〔SEC-5〕が入るまでの措置。
+    /// モジュール冒頭の「未実装」を参照）。
+    pub files_with_stripped_special_bits: u64,
+}
+
+/// 計装なしの `extract_tar_with`（`NoopOciOpRecorder`）。
+pub fn extract_tar<R: Read>(
+    src: R,
+    root: &Path,
+    limits: ExtractLimits,
+) -> Result<ExtractedLayer, OciError> {
+    extract_tar_with(&NoopOciOpRecorder, src, root, limits)
+}
+
+/// 展開全体を `OciOpKind::ExtractLayer` として `recorder` へ記録する（REPAIR-4）。
+///
+/// `src` は gzip 展開済みの tar バイトストリーム（通常は `GzipLayerReader`）。契約はモジュール冒頭を参照。
+pub fn extract_tar_with<R: Read>(
+    recorder: &dyn OciOpRecorder,
+    src: R,
+    root: &Path,
+    limits: ExtractLimits,
+) -> Result<ExtractedLayer, OciError> {
+    record_oci_op(recorder, OciOpKind::ExtractLayer, || {
+        extract_inner(src, root, limits)
+    })
+}
+
+/// 圧縮レイヤー blob（digest 検証済み）を開き、gzip 展開しながら `root` へ展開する便宜関数。
+///
+/// `max_uncompressed_bytes` は gzip 展開後（tar 全体）の上限で、`limits.max_total_bytes` とは別に効く。
+pub fn extract_layer_blob(
+    blob_path: &Path,
+    root: &Path,
+    max_uncompressed_bytes: u64,
+    limits: ExtractLimits,
+) -> Result<ExtractedLayer, OciError> {
+    extract_layer_blob_with(
+        &NoopOciOpRecorder,
+        blob_path,
+        root,
+        max_uncompressed_bytes,
+        limits,
+    )
+}
+
+/// `extract_layer_blob` の計装版。blob を開く処理から展開完了までを 1 回の
+/// `OciOpKind::ExtractLayer` として `recorder` へ記録する（open 失敗も記録対象。REPAIR-4）。
+pub fn extract_layer_blob_with(
+    recorder: &dyn OciOpRecorder,
+    blob_path: &Path,
+    root: &Path,
+    max_uncompressed_bytes: u64,
+    limits: ExtractLimits,
+) -> Result<ExtractedLayer, OciError> {
+    record_oci_op(recorder, OciOpKind::ExtractLayer, || {
+        let reader = open_gzip_layer(blob_path, max_uncompressed_bytes)?;
+        extract_inner(reader, root, limits)
+    })
+}
+
+/// 展開先 FS の名前解決（`lstat`）。既定は `fs::symlink_metadata`。
+///
+/// 大文字小文字を区別する FS しかない CI（Linux）でも「別表記が同じ実体へ解決される」経路を照合できるよう、
+/// テストから差し替える注入点にしている。拒否は変更操作より前に行うため、差し替えるのは解決だけでよい。
+type Lstat = fn(&Path) -> std::io::Result<fs::Metadata>;
+
+/// 既定の `Lstat`（ホストの FS をそのまま引く）。
+fn host_lstat(path: &Path) -> std::io::Result<fs::Metadata> {
+    fs::symlink_metadata(path)
+}
+
+/// `NameIndex` での `root` 自身の ID。
+const ROOT_ID: u64 = 0;
+
+/// この展開が作った名前の索引（IO-5 の別表記の衝突検出用）。
+///
+/// キーは「親ディレクトリの ID と、作成時の正確な綴り」。物理パス全体ではなく親の ID で持つため、1 件あたりの
+/// メモリは 1 コンポーネントの長さ（`MAX_COMPONENT_BYTES` 以下）と固定長に収まる。件数は `limit` で頭打ちにする。
+/// ディレクトリは展開中に削除しない（`clear_existing_non_dir` が拒否する）ため、ID は展開の間ずっと同じ
+/// ディレクトリを指す。
+struct NameIndex {
+    ids: HashMap<(u64, OsString), u64>,
+    limit: u64,
+}
+
+impl NameIndex {
+    fn new(limit: u64) -> Self {
+        Self {
+            ids: HashMap::new(),
+            limit,
+        }
+    }
+
+    /// `parent` 直下に `name` をこの綴りで作っていれば、その ID を返す。
+    fn get(&self, parent: u64, name: &OsStr) -> Option<u64> {
+        self.ids.get(&(parent, name.to_os_string())).copied()
+    }
+
+    /// `parent` 直下の `name` を索引へ載せて ID を返す（登録済みなら同じ ID）。作成操作の前に呼び、
+    /// 上限超過なら何も作らせずに `ResourceExhausted` を返す。
+    fn insert(&mut self, parent: u64, name: &OsStr) -> Result<u64, OciError> {
+        if let Some(id) = self.get(parent, name) {
+            return Ok(id);
+        }
+        // ROOT_ID（0）と重ならないよう 1 始まりで採番する。
+        let id = u64::try_from(self.ids.len())
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .filter(|n| *n <= self.limit)
+            .ok_or_else(|| {
+                err(
+                    OciErrorCode::ResourceExhausted,
+                    "layer exceeds the tracked path limit",
+                )
+            })?;
+        self.ids.insert((parent, name.to_os_string()), id);
+        Ok(id)
+    }
+}
+
+/// `resolve_dir` が解決したディレクトリ（`root` からの物理コンポーネント列と `NameIndex` の ID）。
+struct ResolvedDir {
+    comps: Vec<OsString>,
+    id: u64,
+}
+
+/// 親ディレクトリの解決・種別ごとの処理を束ねる状態。
+struct Extractor<'a> {
+    root: &'a Path,
+    limits: ExtractLimits,
+    entries: u64,
+    bytes: u64,
+    /// setuid / setgid / sticky を落として展開した通常ファイルのエントリ数。
+    stripped_special: u64,
+    /// 所有者の rwx が欠けるディレクトリの mode。子の作成を妨げないよう全エントリ処理後に適用する。
+    /// キーは物理パス。別表記は `probe` が先に拒否するため、同じディレクトリのキーは 1 つに定まる。
+    deferred_dirs: HashMap<PathBuf, u32>,
+    /// この展開が作った名前（IO-5）。
+    names: NameIndex,
+    lstat: Lstat,
+}
+
+fn err(code: OciErrorCode, msg: &'static str) -> OciError {
+    OciError::new(code, msg)
+}
+
+fn escapes() -> OciError {
+    err(
+        OciErrorCode::PermissionDenied,
+        "entry path escapes the extraction root",
+    )
+}
+
+/// 展開先 FS が別表記を既存の実体へ解決したときのエラー（IO-5。パスは載せない）。
+fn spelling_collision() -> OciError {
+    err(
+        OciErrorCode::AlreadyExists,
+        "entry name resolves to an existing entry with a different spelling \
+         (case or Unicode normalization) on the destination filesystem",
+    )
+}
+
+/// tar 解析 / 読み取りの `io::Error` を構造化エラーへ写す。分類不能なものは tar 構文違反として `DataLoss`。
+fn map_stream_err(e: std::io::Error) -> OciError {
+    if let Some(v) = e.get_ref().and_then(|i| i.downcast_ref::<GuardViolation>()) {
+        return err(v.code, v.msg);
+    }
+    let m = oci_error_from_layer_io(e);
+    if m.code() == OciErrorCode::Internal {
+        return err(OciErrorCode::DataLoss, "layer tar stream is malformed");
+    }
+    m
+}
+
+/// 拡張ヘッダ（GNU long name / long link・PAX）本体 1 件あたりの上限バイト数。
+///
+/// `max_total_bytes` は通常ファイル本体のみを制限するため、メタデータには独立した有限の上限を課す（OCI-1）。
+/// パスは `MAX_PATH_BYTES` が上限であり、これを超える拡張ヘッダは正当なレイヤーに現れない。
+const MAX_META_BYTES: u64 = 1024 * 1024;
+
+/// `TarGuard` が返す検査違反（`io::Error` の内包値。`map_stream_err` が構造化エラーへ戻す）。
+#[derive(Debug)]
+struct GuardViolation {
+    code: OciErrorCode,
+    msg: &'static str,
+}
+
+impl std::fmt::Display for GuardViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.msg)
+    }
+}
+
+impl std::error::Error for GuardViolation {}
+
+fn guard_error(code: OciErrorCode, msg: &'static str) -> std::io::Error {
+    std::io::Error::new(ErrorKind::InvalidData, GuardViolation { code, msg })
+}
+
+/// 読み取った総バイト数を数え、`limit` を超えたら `ResourceExhausted` で中断する読み取りアダプタ。
+///
+/// tar 解析中と終端後の読み捨ての両方を同じ計数で覆い、終端後に巨大データを付加された入力でも
+/// 無制限に読み続けないようにする（OCI-1）。ちょうど `limit` バイトまでは許容する。
+struct LimitedReader<R> {
+    inner: R,
+    read: u64,
+    limit: u64,
+}
+
+impl<R: Read> Read for LimitedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // 超過検出のため、残りより 1 バイト多く読めるようにする。
+        let room = self.limit.saturating_sub(self.read).saturating_add(1);
+        let cap = usize::try_from(room).unwrap_or(usize::MAX).min(buf.len());
+        let Some(dst) = buf.get_mut(..cap) else {
+            return Ok(0);
+        };
+        let n = self.inner.read(dst)?;
+        self.read = self.read.saturating_add(n as u64);
+        if self.read > self.limit {
+            return Err(guard_error(
+                OciErrorCode::ResourceExhausted,
+                "layer tar stream exceeds the input size limit",
+            ));
+        }
+        Ok(n)
+    }
+}
+
+/// `tar` クレートが拡張ヘッダ本体をメモリへ確保する前に、宣言サイズを検査する読み取りアダプタ。
+///
+/// 512 バイトのヘッダブロック境界で自前に追跡し（データはそのまま通す）、次を拒否する。
+/// - GNU long name / long link / PAX の宣言サイズが `MAX_META_BYTES` を超えるもの（確保前に中断する）。
+/// - GNU sparse（`S`）: 拡張ヘッダブロックで追跡がずれるうえ、展開でも拒否する種別のため。
+/// - PAX の `size` 上書き: ヘッダのサイズと食い違い、追跡をすり抜けて拡張ヘッダを隠せるため。
+/// - PAX 形式の GNU sparse（`GNU.sparse.*` キー。typeflag は通常ファイルのまま）: `tar` crate（0.4.46）は
+///   これらのキーを解釈せず、穴を詰めた保存データをそのまま通常ファイルとして返す。論理サイズへ膨らむことは
+///   ないが、内容が元のファイルと食い違ったまま成功してしまうため、他の sparse と同じく拒否する。
+struct TarGuard<R> {
+    inner: R,
+    header: [u8; 512],
+    filled: usize,
+    /// 現在のエントリの本体（拡張ヘッダなら内容）の残りバイト数。
+    payload_left: u64,
+    /// 本体の後ろの 512 バイト境界パディングの残りバイト数。
+    pad_left: u64,
+    /// PAX ヘッダ本体の収集先（`size` 上書きの検出用。`MAX_META_BYTES` 以下）。
+    pax: Option<Vec<u8>>,
+}
+
+impl<R> TarGuard<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            header: [0; 512],
+            filled: 0,
+            payload_left: 0,
+            pad_left: 0,
+            pax: None,
+        }
+    }
+
+    fn on_header(&mut self) -> std::io::Result<()> {
+        let h = tar::Header::from_byte_slice(&self.header);
+        let ty = h.entry_type();
+        // サイズが読めないヘッダは tar 側が構文違反として拒否する。
+        let size = h.size().unwrap_or(0);
+        if ty == EntryType::GNUSparse {
+            return Err(guard_error(
+                OciErrorCode::DataLoss,
+                "sparse entries are not supported",
+            ));
+        }
+        // 旧 GNU sparse は typeflag が通常のまま、isextended（offset 482）で sparse map ブロックが後続し、
+        // 512 バイト境界の追跡がずれる。GNU magic のヘッダで isextended が立つものは拒否する。
+        if h.as_gnu().is_some_and(tar::GnuHeader::is_extended) {
+            return Err(guard_error(
+                OciErrorCode::DataLoss,
+                "old GNU sparse entries are not supported",
+            ));
+        }
+        let is_pax = matches!(ty, EntryType::XHeader | EntryType::XGlobalHeader);
+        let is_meta = is_pax || matches!(ty, EntryType::GNULongName | EntryType::GNULongLink);
+        if is_meta && size > MAX_META_BYTES {
+            return Err(guard_error(
+                OciErrorCode::ResourceExhausted,
+                "extended header exceeds the metadata size limit",
+            ));
+        }
+        self.payload_left = size;
+        self.pad_left = size.div_ceil(512).saturating_mul(512) - size;
+        self.pax = is_pax.then(Vec::new);
+        self.filled = 0;
+        Ok(())
+    }
+
+    fn after_payload(&mut self) -> std::io::Result<()> {
+        if let Some(p) = self.pax.take() {
+            pax_reject_unsupported_records(&p)?;
+        }
+        Ok(())
+    }
+}
+
+/// PAX 拡張ヘッダ本体を `tar` crate と同じ規則（先に改行で分割し、各行を `<len> <key>=<value>`
+/// として解釈。`len` は行 + 改行の長さと一致）で解析し、キーが正確に `size` の行、またはキーが
+/// `GNU.sparse.` で始まる行（PAX 形式の GNU sparse 0.0 / 0.1 / 1.0）があれば拒否する（OCI-1）。
+/// 長さ欄が後続行にまたがるレコードは `tar` crate も別行として解釈するため、同じ分割で検査して
+/// 埋め込み `size` の見逃しを防ぐ。`path` 等の値に ` size=` が含まれるだけの正常な tar は通す。
+/// 構文違反（長さ不一致・`=` 欠落・末尾改行欠落・途中の空行）は拒否する。
+fn pax_reject_unsupported_records(body: &[u8]) -> std::io::Result<()> {
+    let malformed = || {
+        guard_error(
+            OciErrorCode::InvalidArgument,
+            "malformed pax extended header record",
+        )
+    };
+    let mut lines = body.split(|b| *b == b'\n');
+    // 本体は改行で終わる必要がある。最後の要素は空でなければ末尾改行欠落。
+    let last = lines.next_back();
+    if !matches!(last, Some([])) && !body.is_empty() {
+        return Err(malformed());
+    }
+    for line in lines {
+        let sp = line.iter().position(|b| *b == b' ').ok_or_else(malformed)?;
+        let len: usize = std::str::from_utf8(line.get(..sp).ok_or_else(malformed)?)
+            .ok()
+            .and_then(|t| t.parse().ok())
+            .ok_or_else(malformed)?;
+        if line.len().checked_add(1) != Some(len) {
+            return Err(malformed());
+        }
+        let kv = line.get(sp.saturating_add(1)..).ok_or_else(malformed)?;
+        let eq = kv.iter().position(|b| *b == b'=').ok_or_else(malformed)?;
+        let key = kv.get(..eq).ok_or_else(malformed)?;
+        if key == b"size" {
+            return Err(guard_error(
+                OciErrorCode::InvalidArgument,
+                "pax size override is not supported",
+            ));
+        }
+        if key.starts_with(b"GNU.sparse.") {
+            return Err(guard_error(
+                OciErrorCode::DataLoss,
+                "sparse entries are not supported",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 添字の境界違反を構造化エラーで返す（外部入力経路では添字アクセスを使わない）。
+fn oob() -> std::io::Error {
+    guard_error(OciErrorCode::Internal, "tar guard buffer bounds violated")
+}
+
+impl<R: Read> Read for TarGuard<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.payload_left > 0 {
+            let n = usize::try_from(self.payload_left).map_or(buf.len(), |l| l.min(buf.len()));
+            let r = self.inner.read(buf.get_mut(..n).ok_or_else(oob)?)?;
+            if let (Some(p), Some(got)) = (self.pax.as_mut(), buf.get(..r)) {
+                p.extend_from_slice(got);
+            }
+            self.payload_left -= r as u64;
+            if self.payload_left == 0 {
+                self.after_payload()?;
+            }
+            return Ok(r);
+        }
+        if self.pad_left > 0 {
+            let n = usize::try_from(self.pad_left).map_or(buf.len(), |l| l.min(buf.len()));
+            let r = self.inner.read(buf.get_mut(..n).ok_or_else(oob)?)?;
+            self.pad_left -= r as u64;
+            return Ok(r);
+        }
+        let n = (512 - self.filled).min(buf.len());
+        let r = self.inner.read(buf.get_mut(..n).ok_or_else(oob)?)?;
+        let end = self.filled.checked_add(r).ok_or_else(oob)?;
+        let dst = self.header.get_mut(self.filled..end).ok_or_else(oob)?;
+        dst.copy_from_slice(buf.get(..r).ok_or_else(oob)?);
+        self.filled = end;
+        if self.filled == 512 {
+            self.on_header()?;
+            if self.payload_left == 0 {
+                self.after_payload()?;
+            }
+        }
+        Ok(r)
+    }
+}
+/// ファイルシステム操作の `io::Error` を写す（パス・OS メッセージは載せない）。
+fn map_fs_err(e: &std::io::Error) -> OciError {
+    match e.kind() {
+        ErrorKind::PermissionDenied => err(
+            OciErrorCode::PermissionDenied,
+            "failed to write the extraction target",
+        ),
+        ErrorKind::NotFound => err(OciErrorCode::NotFound, "extraction path not found"),
+        _ => err(
+            OciErrorCode::Internal,
+            "failed to write the extraction target",
+        ),
+    }
+}
+
+#[cfg(unix)]
+// 非 unix ホストと unix ホストで関数シグネチャ（Result）をそろえ、呼び出し側を cfg 分岐させないため。
+#[allow(clippy::unnecessary_wraps)]
+fn bytes_to_os(b: &[u8]) -> Result<OsString, OciError> {
+    use std::os::unix::ffi::OsStringExt as _;
+    Ok(OsString::from_vec(b.to_vec()))
+}
+
+#[cfg(not(unix))]
+fn bytes_to_os(b: &[u8]) -> Result<OsString, OciError> {
+    let s = std::str::from_utf8(b).map_err(|_| {
+        err(
+            OciErrorCode::InvalidArgument,
+            "entry path is not valid UTF-8",
+        )
+    })?;
+    if s.contains(['\\', ':']) {
+        return Err(escapes());
+    }
+    Ok(OsString::from(s))
+}
+
+/// Windows の予約デバイス名（拡張子付きの形を含む。大文字小文字を区別しない）か。
+fn is_windows_reserved_name(c: &[u8]) -> bool {
+    let stem = c.split(|b| *b == b'.').next().unwrap_or(c);
+    let stem = stem.trim_ascii_end();
+    let upper = stem.to_ascii_uppercase();
+    matches!(upper.as_slice(), b"CON" | b"PRN" | b"AUX" | b"NUL")
+        || matches!(upper.as_slice(), [b'C', b'O', b'M', b'1'..=b'9'])
+        || matches!(upper.as_slice(), [b'L', b'P', b'T', b'1'..=b'9'])
+}
+
+/// コンポーネントが Win32 の名前正規化で展開 root を脱出または別物になりうるかを判定する。
+///
+/// 末尾の `.` と空白を除いた結果が `.` / `..` になるもの（`".. "`・`"..."` 等）は全 OS で拒否する。
+/// `windows_names` が真（Windows ホスト）では、末尾が `.` / 空白のもの（Win32 が除去して別名になる）と
+/// 予約デバイス名（`CON`・`NUL`・`COM1`〜`COM9`・`LPT1`〜`LPT9` 等）も拒否する（OCI-1）。
+fn component_is_unsafe(c: &[u8], windows_names: bool) -> bool {
+    let trimmed = c.trim_ascii_end();
+    let trimmed = trimmed
+        .iter()
+        .rposition(|b| *b != b'.')
+        .map_or(&[][..], |i| trimmed.get(..=i).unwrap_or(&[]));
+    let stripped_is_dots = trimmed.is_empty() && c.first() == Some(&b'.');
+    let trailing = matches!(c.last(), Some(b'.' | b' '));
+    stripped_is_dots && c != b"." || windows_names && (trailing || is_windows_reserved_name(c))
+}
+
+/// アーカイブ内のパスを、`.` を除いたコンポーネント列へ正規化する（`..`・絶対パス・NUL・過大な長さを拒否）。
+fn normalize_entry_path(raw: &[u8]) -> Result<Vec<OsString>, OciError> {
+    normalize_entry_path_for(raw, cfg!(windows))
+}
+
+/// `normalize_entry_path` の本体。`windows_names` でホスト依存の名前規則を切り替える（テストで両方を検証する）。
+fn normalize_entry_path_for(raw: &[u8], windows_names: bool) -> Result<Vec<OsString>, OciError> {
+    if raw.is_empty() {
+        return Err(err(OciErrorCode::InvalidArgument, "entry path is empty"));
+    }
+    if raw.len() > MAX_PATH_BYTES || raw.contains(&0) {
+        return Err(err(OciErrorCode::InvalidArgument, "entry path is invalid"));
+    }
+    if raw.first() == Some(&b'/') {
+        return Err(escapes());
+    }
+    let mut out = Vec::new();
+    for c in raw.split(|b| *b == b'/') {
+        if c.is_empty() || c == b"." {
+            continue;
+        }
+        if c == b".." || component_is_unsafe(c, windows_names) {
+            return Err(escapes());
+        }
+        if c.len() > MAX_COMPONENT_BYTES || out.len() >= MAX_COMPONENTS {
+            return Err(err(
+                OciErrorCode::InvalidArgument,
+                "entry path is too long or too deep",
+            ));
+        }
+        out.push(bytes_to_os(c)?);
+    }
+    Ok(out)
+}
+
+/// tar に親ディレクトリのエントリが無い場合に暗黙作成するディレクトリの既定 mode。
+const IMPLICIT_DIR_MODE: u32 = 0o755;
+
+/// ルートと解決済みコンポーネントから物理パスを作る。
+fn join_resolved(root: &Path, resolved: &[OsString], name: &OsString) -> PathBuf {
+    let mut p = root.to_path_buf();
+    p.extend(resolved);
+    p.push(name);
+    p
+}
+
+/// 最終コンポーネントを取り出す。コンポーネントが空（ルート自身）なら `None`。
+fn split_last(mut comps: Vec<OsString>) -> Option<(Vec<OsString>, OsString)> {
+    let last = comps.pop()?;
+    Some((comps, last))
+}
+
+#[cfg(unix)]
+fn mode_perms(mode: u32) -> fs::Permissions {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::Permissions::from_mode(mode & 0o7777)
+}
+
+#[cfg(unix)]
+fn apply_file_mode(f: &fs::File, mode: u32) -> Result<(), OciError> {
+    f.set_permissions(mode_perms(mode))
+        .map_err(|e| map_fs_err(&e))
+}
+
+#[cfg(not(unix))]
+// 非 unix ホストと unix ホストで関数シグネチャ（Result）をそろえ、呼び出し側を cfg 分岐させないため。
+#[allow(clippy::unnecessary_wraps)]
+fn apply_file_mode(_f: &fs::File, _mode: u32) -> Result<(), OciError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn apply_dir_mode(path: &Path, mode: u32) -> Result<(), OciError> {
+    fs::set_permissions(path, mode_perms(mode)).map_err(|e| map_fs_err(&e))
+}
+
+#[cfg(not(unix))]
+// 非 unix ホストと unix ホストで関数シグネチャ（Result）をそろえ、呼び出し側を cfg 分岐させないため。
+#[allow(clippy::unnecessary_wraps)]
+fn apply_dir_mode(_path: &Path, _mode: u32) -> Result<(), OciError> {
+    Ok(())
+}
+
+/// 通常ファイルへ適用する mode のマスク（下位 9 ビット）。
+///
+/// setuid / setgid / sticky は適用しない。展開物は実行ユーザー所有になるため、非信頼のレイヤーが指定した
+/// setuid / setgid を残すと、ホスト上で実行ユーザー（root なら root）の権限で動く実行ファイルを作れてしまう
+/// （SEC-5 の所有者写像が入るまでの措置）。
+const FILE_MODE_MASK: u32 = 0o777;
+
+/// 所有者の rwx がそろわない mode か（子の作成を妨げうるため適用を遅延する）。
+fn needs_deferral(mode: u32) -> bool {
+    mode & 0o700 != 0o700
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &Path, link: &Path) -> Result<(), OciError> {
+    std::os::unix::fs::symlink(target, link).map_err(|e| map_fs_err(&e))
+}
+
+#[cfg(not(unix))]
+fn create_symlink(_target: &Path, _link: &Path) -> Result<(), OciError> {
+    Err(err(
+        OciErrorCode::Unimplemented,
+        "symlink entries are not supported on this host",
+    ))
+}
+
+impl Extractor<'_> {
+    /// `dir`（ID は `dir_id`）直下の `name`（物理パスは `path`）を `lstat` する。無ければ `None`、
+    /// あればメタデータと `NameIndex` の ID を返す。
+    ///
+    /// 実在するのにこの展開がその綴りで作っていない名前は、展開先 FS が別表記（大文字小文字・Unicode
+    /// 正規化など）を既存の実体へ解決したものである（`root` は空で始まる）。削除・権限変更・リンク作成より
+    /// 前にここで `AlreadyExists` として拒否する（IO-5）。実在する名前を見る箇所はすべてここを通す。
+    fn probe(
+        &self,
+        dir_id: u64,
+        name: &OsStr,
+        path: &Path,
+    ) -> Result<Option<(fs::Metadata, u64)>, OciError> {
+        match (self.lstat)(path) {
+            Ok(m) => match self.names.get(dir_id, name) {
+                Some(id) => Ok(Some((m, id))),
+                None => Err(spelling_collision()),
+            },
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(map_fs_err(&e)),
+        }
+    }
+
+    /// `rel` の各コンポーネントを 1 つずつ `probe`（`lstat`）で確認しながら、ルート内の物理位置を解決する。
+    ///
+    /// symlink は読み取ってルート基準で辿る（絶対ターゲットはルートへ戻し、`..` はルートで止める）ため、
+    /// ホストの任意パスへは出られない。`create` が真なら存在しないディレクトリを作る。
+    /// 戻り値はルートからの物理コンポーネント列と、そのディレクトリの `NameIndex` の ID。
+    fn resolve_dir(&mut self, rel: &[OsString], create: bool) -> Result<ResolvedDir, OciError> {
+        let mut resolved: Vec<OsString> = Vec::new();
+        // `resolved` の各コンポーネントの ID（同じ長さを保つ）。
+        let mut ids: Vec<u64> = Vec::new();
+        let mut queue: VecDeque<OsString> = rel.iter().cloned().collect();
+        let mut follows = 0u32;
+        while let Some(c) = queue.pop_front() {
+            if c == "." {
+                continue;
+            }
+            if c == ".." {
+                resolved.pop();
+                ids.pop();
+                continue;
+            }
+            let parent_id = ids.last().copied().unwrap_or(ROOT_ID);
+            let cand = join_resolved(self.root, &resolved, &c);
+            match self.probe(parent_id, &c, &cand)? {
+                Some((m, id)) if m.is_dir() => {
+                    resolved.push(c);
+                    ids.push(id);
+                }
+                Some((m, _)) if m.file_type().is_symlink() => {
+                    follows += 1;
+                    if follows > MAX_SYMLINK_FOLLOWS {
+                        return Err(err(
+                            OciErrorCode::InvalidArgument,
+                            "too many symbolic links while resolving an entry path",
+                        ));
+                    }
+                    let target = fs::read_link(&cand).map_err(|e| map_fs_err(&e))?;
+                    let mut pending = Vec::new();
+                    for comp in target.components() {
+                        match comp {
+                            Component::RootDir | Component::Prefix(_) => {
+                                resolved.clear();
+                                ids.clear();
+                                pending.clear();
+                            }
+                            Component::CurDir => {}
+                            Component::ParentDir => pending.push(OsString::from("..")),
+                            Component::Normal(n) => pending.push(n.to_os_string()),
+                        }
+                    }
+                    for p in pending.into_iter().rev() {
+                        queue.push_front(p);
+                    }
+                }
+                Some(_) => {
+                    return Err(err(
+                        OciErrorCode::FailedPrecondition,
+                        "a parent path component is not a directory",
+                    ));
+                }
+                None => {
+                    if !create {
+                        return Err(err(OciErrorCode::NotFound, "extraction path not found"));
+                    }
+                    let id = self.names.insert(parent_id, &c)?;
+                    fs::create_dir(&cand).map_err(|e| map_fs_err(&e))?;
+                    // 暗黙の親ディレクトリはホストの umask に依存させず既定 0755 にする。
+                    // 明示的なディレクトリエントリがあれば `make_dir` がその mode で上書きする（OCI-1）。
+                    apply_dir_mode(&cand, IMPLICIT_DIR_MODE)?;
+                    resolved.push(c);
+                    ids.push(id);
+                }
+            }
+        }
+        Ok(ResolvedDir {
+            id: ids.last().copied().unwrap_or(ROOT_ID),
+            comps: resolved,
+        })
+    }
+
+    /// 既存の非ディレクトリを除去する。ディレクトリなら `FailedPrecondition`。存在しなければ何もしない。
+    /// 別表記で既存の実体へ解決される名前は、除去の前に `probe` が拒否する（IO-5）。
+    fn clear_existing_non_dir(
+        &self,
+        dir_id: u64,
+        name: &OsStr,
+        path: &Path,
+    ) -> Result<(), OciError> {
+        match self.probe(dir_id, name, path)? {
+            Some((m, _)) if m.is_dir() => Err(err(
+                OciErrorCode::FailedPrecondition,
+                "a directory already exists at the entry path",
+            )),
+            Some(_) => fs::remove_file(path).map_err(|e| map_fs_err(&e)),
+            None => Ok(()),
+        }
+    }
+
+    fn make_dir(&mut self, comps: Vec<OsString>, mode: u32) -> Result<(), OciError> {
+        let Some((parent, name)) = split_last(comps) else {
+            return Ok(());
+        };
+        let dir = self.resolve_dir(&parent, true)?;
+        let path = join_resolved(self.root, &dir.comps, &name);
+        // 別表記（`d/` の後の `D/`）は、下の遅延 mode の取り消し・mode の適用より前に `probe` が拒否する（IO-5）。
+        match self.probe(dir.id, &name, &path)? {
+            Some((m, _)) if m.is_dir() => {}
+            Some(_) => {
+                fs::remove_file(&path).map_err(|e| map_fs_err(&e))?;
+                fs::create_dir(&path).map_err(|e| map_fs_err(&e))?;
+            }
+            None => {
+                self.names.insert(dir.id, &name)?;
+                fs::create_dir(&path).map_err(|e| map_fs_err(&e))?;
+            }
+        }
+        // 同じディレクトリの再定義は後勝ち。先の遅延 mode を残すと finish_dirs が後の mode を上書きする。
+        self.deferred_dirs.remove(&path);
+        if needs_deferral(mode) {
+            // umask 等で所有者の rwx が欠けても子を作れるよう、finish_dirs まで一時的に 0700 にする。
+            apply_dir_mode(&path, 0o700)?;
+            self.deferred_dirs.insert(path, mode);
+            Ok(())
+        } else {
+            apply_dir_mode(&path, mode)
+        }
+    }
+
+    fn write_file<R: Read>(
+        &mut self,
+        comps: Vec<OsString>,
+        mode: u32,
+        size: u64,
+        data: &mut R,
+    ) -> Result<(), OciError> {
+        let Some((parent, name)) = split_last(comps) else {
+            return Err(err(OciErrorCode::InvalidArgument, "entry path is empty"));
+        };
+        // 宣言サイズで累積上限を書き込み前に検査する（巨大宣言サイズによる DoS を防ぐ）。
+        let next = self
+            .bytes
+            .checked_add(size)
+            .filter(|n| *n <= self.limits.max_total_bytes)
+            .ok_or_else(|| {
+                err(
+                    OciErrorCode::ResourceExhausted,
+                    "layer exceeds the extracted size limit",
+                )
+            })?;
+        let dir = self.resolve_dir(&parent, true)?;
+        let path = join_resolved(self.root, &dir.comps, &name);
+        self.clear_existing_non_dir(dir.id, &name, &path)?;
+        self.names.insert(dir.id, &name)?;
+        // create_new は O_CREAT|O_EXCL で、最終コンポーネントの symlink を追従しない。
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| map_fs_err(&e))?;
+        let mut buf = vec![0u8; COPY_BUF_LEN];
+        let mut written = 0u64;
+        while written < size {
+            let want = usize::try_from(size - written).map_or(buf.len(), |r| r.min(buf.len()));
+            let Some(dst) = buf.get_mut(..want) else {
+                break;
+            };
+            let n = match data.read(dst) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(map_stream_err(e)),
+            };
+            if let Some(chunk) = buf.get(..n) {
+                f.write_all(chunk).map_err(|e| map_fs_err(&e))?;
+            }
+            written += n as u64;
+        }
+        if written != size {
+            return Err(err(OciErrorCode::DataLoss, "layer tar stream is malformed"));
+        }
+        apply_file_mode(&f, mode & FILE_MODE_MASK)?;
+        if mode & 0o7000 != 0 {
+            self.stripped_special = self.stripped_special.saturating_add(1);
+        }
+        self.bytes = next;
+        Ok(())
+    }
+
+    fn make_symlink(&mut self, comps: Vec<OsString>, target: &[u8]) -> Result<(), OciError> {
+        let Some((parent, name)) = split_last(comps) else {
+            return Err(err(OciErrorCode::InvalidArgument, "entry path is empty"));
+        };
+        if target.is_empty() || target.len() > MAX_PATH_BYTES || target.contains(&0) {
+            return Err(err(
+                OciErrorCode::InvalidArgument,
+                "symlink target is invalid",
+            ));
+        }
+        let dir = self.resolve_dir(&parent, true)?;
+        // リンク先を配置ディレクトリ基準で字句的に検査し、ルートより上へ出るものを拒否する。
+        let mut depth = if target.first() == Some(&b'/') {
+            0
+        } else {
+            dir.comps.len()
+        };
+        for c in target.split(|b| *b == b'/') {
+            if c.is_empty() || c == b"." {
+                continue;
+            }
+            if c == b".." {
+                depth = depth.checked_sub(1).ok_or_else(escapes)?;
+            } else {
+                depth += 1;
+            }
+        }
+        let path = join_resolved(self.root, &dir.comps, &name);
+        self.clear_existing_non_dir(dir.id, &name, &path)?;
+        self.names.insert(dir.id, &name)?;
+        create_symlink(Path::new(&bytes_to_os(target)?), &path)
+    }
+
+    fn make_hardlink(&mut self, comps: Vec<OsString>, target: &[u8]) -> Result<(), OciError> {
+        let Some((parent, name)) = split_last(comps) else {
+            return Err(err(OciErrorCode::InvalidArgument, "entry path is empty"));
+        };
+        let Some((tparent, tname)) = split_last(normalize_entry_path(target)?) else {
+            return Err(err(
+                OciErrorCode::InvalidArgument,
+                "hardlink target is empty",
+            ));
+        };
+        let tdir = self.resolve_dir(&tparent, false)?;
+        let tpath = join_resolved(self.root, &tdir.comps, &tname);
+        // 参照先も `probe` を通す。別表記で既存の実体へ解決される参照先（`g → F` で実在するのは `f`）は拒否する。
+        match self.probe(tdir.id, &tname, &tpath)? {
+            Some((m, _)) if m.is_file() => {}
+            Some(_) => {
+                return Err(err(
+                    OciErrorCode::PermissionDenied,
+                    "hardlink target is not a regular file",
+                ));
+            }
+            None => return Err(err(OciErrorCode::NotFound, "extraction path not found")),
+        }
+        let dir = self.resolve_dir(&parent, true)?;
+        let path = join_resolved(self.root, &dir.comps, &name);
+        // 参照先と同一パス（f → f）なら削除すると参照元を失うため、既存ファイルをそのまま保持する。
+        // 綴りだけが違う同じ実体（`F → f`）は、下の `clear_existing_non_dir` が削除の前に拒否する（IO-5）。
+        if tpath == path {
+            return Ok(());
+        }
+        self.clear_existing_non_dir(dir.id, &name, &path)?;
+        self.names.insert(dir.id, &name)?;
+        fs::hard_link(&tpath, &path).map_err(|e| map_fs_err(&e))
+    }
+
+    /// 遅延していたディレクトリの mode を深い順に適用する（実ディレクトリであることを再確認する）。
+    fn finish_dirs(&mut self) -> Result<(), OciError> {
+        let mut dirs: Vec<(PathBuf, u32)> = std::mem::take(&mut self.deferred_dirs)
+            .into_iter()
+            .collect();
+        // 深い順。同じ深さはパス順で決定的にする。
+        dirs.sort_by(|(a, _), (b, _)| {
+            b.components()
+                .count()
+                .cmp(&a.components().count())
+                .then_with(|| a.cmp(b))
+        });
+        for (path, mode) in dirs {
+            match fs::symlink_metadata(&path) {
+                Ok(m) if m.is_dir() => apply_dir_mode(&path, mode)?,
+                _ => {
+                    return Err(err(
+                        OciErrorCode::FailedPrecondition,
+                        "an extracted directory was replaced during extraction",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn extract_inner<R: Read>(
+    src: R,
+    root: &Path,
+    limits: ExtractLimits,
+) -> Result<ExtractedLayer, OciError> {
+    extract_with_lstat(src, root, limits, host_lstat)
+}
+
+/// `extract_inner` の本体。`lstat` は展開先 FS の名前解決で、テストだけが差し替える（`Lstat` を参照）。
+fn extract_with_lstat<R: Read>(
+    src: R,
+    root: &Path,
+    limits: ExtractLimits,
+    lstat: Lstat,
+) -> Result<ExtractedLayer, OciError> {
+    match fs::symlink_metadata(root) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => {
+            return Err(err(
+                OciErrorCode::InvalidArgument,
+                "extraction root is not a directory",
+            ));
+        }
+        Err(e) => return Err(map_fs_err(&e)),
+    }
+    // 別表記の衝突の判定（`Extractor::probe`）は「`root` 配下の実在項目はすべてこの展開が作った」ことに依る。
+    // 呼び出し契約（空のステージング）を前提にせず、ここで確かめる（IO-5）。
+    match fs::read_dir(root).map_err(|e| map_fs_err(&e))?.next() {
+        None => {}
+        Some(Ok(_)) => {
+            return Err(err(
+                OciErrorCode::FailedPrecondition,
+                "extraction root is not empty",
+            ));
+        }
+        Some(Err(e)) => return Err(map_fs_err(&e)),
+    }
+    let mut src = LimitedReader {
+        inner: src,
+        read: 0,
+        limit: limits.max_input_bytes,
+    };
+    let mut x = Extractor {
+        root,
+        limits,
+        entries: 0,
+        bytes: 0,
+        stripped_special: 0,
+        deferred_dirs: HashMap::new(),
+        names: NameIndex::new(limits.max_tracked_paths),
+        lstat,
+    };
+    {
+        let mut archive = Archive::new(TarGuard::new(&mut src));
+        for entry in archive.entries().map_err(map_stream_err)? {
+            let mut entry = entry.map_err(map_stream_err)?;
+            let ty = entry.header().entry_type();
+            if ty == EntryType::XGlobalHeader {
+                continue;
+            }
+            x.entries += 1;
+            if x.entries > limits.max_entries {
+                return Err(err(
+                    OciErrorCode::ResourceExhausted,
+                    "layer exceeds the entry count limit",
+                ));
+            }
+            let raw_path = entry.path_bytes().into_owned();
+            let is_dir_name = raw_path.last() == Some(&b'/');
+            let comps = normalize_entry_path(&raw_path)?;
+            let mode = entry.header().mode().map_err(map_stream_err)?;
+            match ty {
+                EntryType::Directory => x.make_dir(comps, mode)?,
+                EntryType::Regular | EntryType::Continuous if is_dir_name => {
+                    x.make_dir(comps, mode)?;
+                }
+                EntryType::Regular | EntryType::Continuous => {
+                    let size = entry.size();
+                    x.write_file(comps, mode, size, &mut entry)?;
+                }
+                EntryType::Symlink => {
+                    let target = entry
+                        .link_name_bytes()
+                        .map(std::borrow::Cow::into_owned)
+                        .ok_or_else(|| {
+                            err(OciErrorCode::InvalidArgument, "symlink target is invalid")
+                        })?;
+                    x.make_symlink(comps, &target)?;
+                }
+                EntryType::Link => {
+                    let target = entry
+                        .link_name_bytes()
+                        .map(std::borrow::Cow::into_owned)
+                        .ok_or_else(|| {
+                            err(OciErrorCode::InvalidArgument, "hardlink target is invalid")
+                        })?;
+                    x.make_hardlink(comps, &target)?;
+                }
+                _ => {
+                    return Err(err(
+                        OciErrorCode::PermissionDenied,
+                        "unsupported entry type",
+                    ));
+                }
+            }
+        }
+    }
+    x.finish_dirs()?;
+    // tar 終端後の残りを読み捨て、gzip トレーラ（CRC32・ISIZE）を検証させる。
+    let mut buf = vec![0u8; COPY_BUF_LEN];
+    loop {
+        match src.read(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => {
+                if let Some(v) = e.get_ref().and_then(|i| i.downcast_ref::<GuardViolation>()) {
+                    return Err(err(v.code, v.msg));
+                }
+                return Err(oci_error_from_layer_io(e));
+            }
+        }
+    }
+    Ok(ExtractedLayer {
+        entries: x.entries,
+        bytes: x.bytes,
+        files_with_stripped_special_bits: x.stripped_special,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::instrument::OciOpOutcome;
+    use crate::instrument::testing::Collect;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+
+    /// `base/root` を作る一時ディレクトリ。Drop で `base` ごと消す（番兵でルート外書き込みを検出する）。
+    struct Sandbox {
+        base: PathBuf,
+        root: PathBuf,
+    }
+
+    impl Sandbox {
+        fn new() -> Self {
+            let n = SEQ.fetch_add(1, Ordering::SeqCst);
+            let base =
+                std::env::temp_dir().join(format!("fc-oci-extract-{}-{n}", std::process::id()));
+            let _ = fs::remove_dir_all(&base);
+            let root = base.join("root");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(base.join("sentinel"), b"s").unwrap();
+            Self { base, root }
+        }
+
+        /// ルート外に番兵以外が増えていないこと。
+        fn assert_outside_untouched(&self) {
+            let mut names: Vec<_> = fs::read_dir(&self.base)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            assert_eq!(names, vec!["root".to_string(), "sentinel".to_string()]);
+            assert_eq!(fs::read(self.base.join("sentinel")).unwrap(), b"s");
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            // 0o555 等のディレクトリを消せるよう権限を戻す。
+            #[cfg(unix)]
+            restore_perms(&self.base);
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    #[cfg(unix)]
+    fn restore_perms(p: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Ok(m) = fs::symlink_metadata(p)
+            && m.is_dir()
+        {
+            let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o755));
+            if let Ok(rd) = fs::read_dir(p) {
+                for e in rd.flatten() {
+                    restore_perms(&e.path());
+                }
+            }
+        }
+    }
+
+    /// 生バイトで 1 エントリ分（ヘッダ + パディング済みデータ）を組み立てる。
+    /// `tar::Builder` は `..` や絶対パスを拒否するため、悪意あるアーカイブはここで手組みする。
+    fn raw_entry(
+        name: &[u8],
+        ty: EntryType,
+        link: &[u8],
+        mode: u32,
+        declared: u64,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut h = tar::Header::new_gnu();
+        {
+            let old = h.as_old_mut();
+            old.name[..name.len()].copy_from_slice(name);
+            old.linkname[..link.len()].copy_from_slice(link);
+        }
+        h.set_entry_type(ty);
+        h.set_mode(mode);
+        h.set_size(declared);
+        h.set_cksum();
+        let mut out = h.as_bytes().to_vec();
+        out.extend_from_slice(data);
+        let pad = (512 - data.len() % 512) % 512;
+        out.extend(std::iter::repeat_n(0u8, pad));
+        out
+    }
+
+    fn file(name: &str, mode: u32, data: &[u8]) -> Vec<u8> {
+        raw_entry(
+            name.as_bytes(),
+            EntryType::Regular,
+            b"",
+            mode,
+            data.len() as u64,
+            data,
+        )
+    }
+
+    fn dir(name: &str, mode: u32) -> Vec<u8> {
+        raw_entry(name.as_bytes(), EntryType::Directory, b"", mode, 0, b"")
+    }
+
+    fn symlink(name: &str, target: &str) -> Vec<u8> {
+        raw_entry(
+            name.as_bytes(),
+            EntryType::Symlink,
+            target.as_bytes(),
+            0o777,
+            0,
+            b"",
+        )
+    }
+
+    fn hardlink(name: &str, target: &str) -> Vec<u8> {
+        raw_entry(
+            name.as_bytes(),
+            EntryType::Link,
+            target.as_bytes(),
+            0o644,
+            0,
+            b"",
+        )
+    }
+
+    fn archive(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut out: Vec<u8> = entries.concat();
+        out.extend(std::iter::repeat_n(0u8, 1024));
+        out
+    }
+
+    fn run(sb: &Sandbox, entries: &[Vec<u8>]) -> Result<ExtractedLayer, OciError> {
+        extract_tar(
+            archive(entries).as_slice(),
+            &sb.root,
+            ExtractLimits::new(1000, 1 << 20, 1 << 30, 1 << 20),
+        )
+    }
+
+    /// 大文字小文字と NFC / NFD を区別しない FS の名前解決を模擬する `Lstat`（IO-5）。
+    ///
+    /// 綴りどおりに無ければ、最終コンポーネントを ASCII 小文字にし `e` + U+0301 を U+00E9 へ畳んで引き直す。
+    /// 大文字小文字を区別する FS（Linux の CI）の上で「別表記が既存の実体へ解決される」状況を作る。
+    /// 先に小文字・NFC の名前を作り、後から大文字・NFD の綴りで参照する入力に対して使う。
+    fn folding_lstat(p: &Path) -> std::io::Result<fs::Metadata> {
+        fs::symlink_metadata(p).or_else(|e| {
+            let (Some(dir), Some(name)) = (p.parent(), p.file_name().and_then(|n| n.to_str()))
+            else {
+                return Err(e);
+            };
+            let folded = name.to_ascii_lowercase().replace("e\u{301}", "\u{e9}");
+            fs::symlink_metadata(dir.join(folded))
+        })
+    }
+
+    /// `folding_lstat` を注入して展開する（区別しない FS の模擬）。
+    fn run_folding(sb: &Sandbox, entries: &[Vec<u8>]) -> Result<ExtractedLayer, OciError> {
+        extract_with_lstat(
+            archive(entries).as_slice(),
+            &sb.root,
+            ExtractLimits::new(1000, 1 << 20, 1 << 30, 1 << 20),
+            folding_lstat,
+        )
+    }
+
+    /// `dir` 直下の名前を綴りのまま昇順で返す。
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// 別表記の衝突として拒否されたこと（`code` と `message` の具体値）を確かめる。
+    fn assert_spelling_collision(r: Result<ExtractedLayer, OciError>) {
+        let e = r.expect_err("must be rejected as a spelling collision");
+        assert_eq!(e.code(), OciErrorCode::AlreadyExists);
+        assert_eq!(e.code().as_str(), "ALREADY_EXISTS");
+        assert_eq!(
+            e.message(),
+            "entry name resolves to an existing entry with a different spelling \
+             (case or Unicode normalization) on the destination filesystem"
+        );
+    }
+
+    /// `base` の FS が `a` と `b` を同じ名前として解決するか（`a` を作って `b` で引く。後始末する）。
+    fn fs_resolves_as_same(base: &Path, a: &str, b: &str) -> bool {
+        fs::write(base.join(a), b"p").unwrap();
+        let same = fs::symlink_metadata(base.join(b)).is_ok();
+        fs::remove_file(base.join(a)).unwrap();
+        same
+    }
+
+    #[cfg(unix)]
+    fn mode_of(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// IO-5 / OCI-1: 通常ファイル `f` の後の hardlink `F → f` は、区別しない FS では参照元を削除する前に拒否する。
+    #[test]
+    fn io5_hardlink_under_alias_spelling_is_rejected_before_removing_source() {
+        let sb = Sandbox::new();
+        assert_spelling_collision(run_folding(
+            &sb,
+            &[file("f", 0o644, b"data"), hardlink("F", "f")],
+        ));
+        assert_eq!(names_in(&sb.root), ["f"]);
+        assert_eq!(fs::read(sb.root.join("f")).unwrap(), b"data");
+        sb.assert_outside_untouched();
+    }
+
+    /// IO-5 / OCI-1: `d/`（0555）の後の `D/`（0755）は、区別しない FS では mode を変える前に拒否する
+    /// （先の遅延 mode が残って後勝ちが崩れる経路を作らない）。
+    #[test]
+    fn io5_directory_alias_redefinition_is_rejected_before_mode_change() {
+        let sb = Sandbox::new();
+        assert_spelling_collision(run_folding(&sb, &[dir("d/", 0o555), dir("D/", 0o755)]));
+        assert_eq!(names_in(&sb.root), ["d"]);
+        // `d/` は遅延中の一時 mode（0700）のままで、`D/` の 0755 は適用されていない。
+        #[cfg(unix)]
+        assert_eq!(mode_of(&sb.root.join("d")), 0o700);
+        sb.assert_outside_untouched();
+    }
+
+    /// IO-5 / OCI-1: 区別しない FS で別表記の通常ファイルが先の内容を上書きしない（`f` の後の `F`、NFC の後の NFD）。
+    #[test]
+    fn io5_file_alias_does_not_overwrite() {
+        let sb = Sandbox::new();
+        assert_spelling_collision(run_folding(
+            &sb,
+            &[file("f", 0o644, b"one"), file("F", 0o644, b"two")],
+        ));
+        assert_eq!(names_in(&sb.root), ["f"]);
+        assert_eq!(fs::read(sb.root.join("f")).unwrap(), b"one");
+
+        let sb = Sandbox::new();
+        assert_spelling_collision(run_folding(
+            &sb,
+            &[
+                file("caf\u{e9}", 0o644, b"nfc"),
+                file("cafe\u{301}", 0o644, b"nfd"),
+            ],
+        ));
+        assert_eq!(names_in(&sb.root), ["caf\u{e9}"]);
+        assert_eq!(fs::read(sb.root.join("caf\u{e9}")).unwrap(), b"nfc");
+    }
+
+    /// IO-5 / OCI-1: 別表記は親コンポーネント・hardlink の参照先・symlink を辿った先でも拒否し、何も作らない。
+    #[test]
+    fn io5_alias_in_parent_and_link_targets_is_rejected() {
+        let sb = Sandbox::new();
+        assert_spelling_collision(run_folding(
+            &sb,
+            &[file("d/x", 0o644, b"x"), file("D/y", 0o644, b"y")],
+        ));
+        assert_eq!(names_in(&sb.root), ["d"]);
+        assert_eq!(names_in(&sb.root.join("d")), ["x"]);
+
+        let sb = Sandbox::new();
+        assert_spelling_collision(run_folding(
+            &sb,
+            &[file("f", 0o644, b"data"), hardlink("g", "F")],
+        ));
+        assert_eq!(names_in(&sb.root), ["f"]);
+
+        #[cfg(unix)]
+        {
+            let sb = Sandbox::new();
+            assert_spelling_collision(run_folding(
+                &sb,
+                &[
+                    dir("d/", 0o755),
+                    symlink("l", "D"),
+                    file("l/x", 0o644, b"x"),
+                ],
+            ));
+            assert_eq!(names_in(&sb.root), ["d", "l"]);
+            assert_eq!(names_in(&sb.root.join("d")), Vec::<String>::new());
+        }
+    }
+
+    /// IO-5 / OCI-1: 区別しない FS の模擬でも、同じ綴りの再定義（後勝ち）と別名は従来どおり通す（過剰に拒否しない）。
+    #[test]
+    fn io5_same_spelling_redefinition_is_still_accepted_on_folding_fs() {
+        let sb = Sandbox::new();
+        let r = run_folding(
+            &sb,
+            &[
+                file("f", 0o644, b"one"),
+                file("f", 0o644, b"two"),
+                hardlink("f", "f"),
+                hardlink("g", "f"),
+                dir("d/", 0o555),
+                dir("d/", 0o755),
+                file("d/x", 0o644, b"x"),
+            ],
+        )
+        .unwrap();
+        assert_eq!((r.entries, r.bytes), (7, 7));
+        assert_eq!(names_in(&sb.root), ["d", "f", "g"]);
+        assert_eq!(fs::read(sb.root.join("f")).unwrap(), b"two");
+        assert_eq!(fs::read(sb.root.join("g")).unwrap(), b"two");
+        assert_eq!(fs::read(sb.root.join("d/x")).unwrap(), b"x");
+        #[cfg(unix)]
+        assert_eq!(mode_of(&sb.root.join("d")), 0o755);
+    }
+
+    /// IO-5 / OCI-1: 実 FS での大文字小文字の別表記。区別する FS（Linux の既定）では別の実体として両方を
+    /// 展開し、区別しない FS（Windows・macOS の既定）では先の実体を変える前に拒否する。
+    #[test]
+    fn io5_case_variants_follow_destination_fs() {
+        let sb = Sandbox::new();
+        let folds = fs_resolves_as_same(&sb.base, "probe", "PROBE");
+        let layers = [
+            vec![file("f", 0o644, b"data"), hardlink("F", "f")],
+            vec![file("f", 0o644, b"data"), file("F", 0o644, b"two")],
+            vec![dir("d/", 0o555), dir("D/", 0o755)],
+        ];
+        if folds {
+            // hardlink `F → f` は参照元 `f` を削除する前に拒否する。
+            let sb = Sandbox::new();
+            assert_spelling_collision(run(&sb, &layers[0]));
+            assert_eq!(names_in(&sb.root), ["f"]);
+            assert_eq!(fs::read(sb.root.join("f")).unwrap(), b"data");
+            sb.assert_outside_untouched();
+
+            // 通常ファイル `F` は `f` の内容を上書きする前に拒否する。
+            let sb = Sandbox::new();
+            assert_spelling_collision(run(&sb, &layers[1]));
+            assert_eq!(names_in(&sb.root), ["f"]);
+            assert_eq!(fs::read(sb.root.join("f")).unwrap(), b"data");
+
+            // ディレクトリ `D/` は `d/` の mode（遅延中の一時 0700）を変える前に拒否する。
+            let sb = Sandbox::new();
+            assert_spelling_collision(run(&sb, &layers[2]));
+            assert_eq!(names_in(&sb.root), ["d"]);
+            #[cfg(unix)]
+            assert_eq!(mode_of(&sb.root.join("d")), 0o700);
+        } else {
+            let sb = Sandbox::new();
+            run(&sb, &layers[0]).unwrap();
+            assert_eq!(names_in(&sb.root), ["F", "f"]);
+            assert_eq!(fs::read(sb.root.join("F")).unwrap(), b"data");
+            assert_eq!(fs::read(sb.root.join("f")).unwrap(), b"data");
+
+            let sb = Sandbox::new();
+            run(&sb, &layers[1]).unwrap();
+            assert_eq!(names_in(&sb.root), ["F", "f"]);
+            assert_eq!(fs::read(sb.root.join("F")).unwrap(), b"two");
+            assert_eq!(fs::read(sb.root.join("f")).unwrap(), b"data");
+
+            let sb = Sandbox::new();
+            run(&sb, &layers[2]).unwrap();
+            assert_eq!(names_in(&sb.root), ["D", "d"]);
+            #[cfg(unix)]
+            {
+                assert_eq!(mode_of(&sb.root.join("d")), 0o555);
+                assert_eq!(mode_of(&sb.root.join("D")), 0o755);
+            }
+        }
+    }
+
+    /// IO-5 / OCI-1: 実 FS での NFC / NFD の別表記。正規化を区別する FS（ext4・NTFS）では両方を展開し、
+    /// 区別しない FS（APFS）では先の内容を上書きする前に拒否する。
+    #[test]
+    fn io5_normalization_variants_follow_destination_fs() {
+        let (nfc, nfd) = ("caf\u{e9}", "cafe\u{301}");
+        let sb = Sandbox::new();
+        let folds = fs_resolves_as_same(&sb.base, nfc, nfd);
+        let r = run(&sb, &[file(nfc, 0o644, b"nfc"), file(nfd, 0o644, b"nfd")]);
+        if folds {
+            assert_spelling_collision(r);
+            assert_eq!(names_in(&sb.root), [nfc]);
+        } else {
+            let r = r.unwrap();
+            assert_eq!((r.entries, r.bytes), (2, 6));
+            assert_eq!(names_in(&sb.root), [nfd, nfc]);
+            assert_eq!(fs::read(sb.root.join(nfd)).unwrap(), b"nfd");
+        }
+        assert_eq!(fs::read(sb.root.join(nfc)).unwrap(), b"nfc");
+        sb.assert_outside_untouched();
+    }
+
+    /// IO-5: Windows・macOS の既定の一時領域は大文字小文字を区別しない（macOS の APFS は NFC / NFD も区別しない）。
+    ///
+    /// `io5_case_variants_follow_destination_fs` と `io5_normalization_variants_follow_destination_fs` は
+    /// 展開先 FS の挙動で分岐するため、これらの OS の CI で「実 FS が別表記を既存の実体へ解決し、展開が
+    /// 拒否する」側が実際に走ったことをここで固定する（区別する側へ黙って流れたら失敗させる）。
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn io5_default_host_fs_resolves_spelling_variants_as_same() {
+        let sb = Sandbox::new();
+        assert!(fs_resolves_as_same(&sb.base, "probe", "PROBE"));
+        #[cfg(target_os = "macos")]
+        assert!(fs_resolves_as_same(&sb.base, "caf\u{e9}", "cafe\u{301}"));
+        sb.assert_outside_untouched();
+    }
+
+    /// IO-5 / OCI-1: 空でない展開先は `FailedPrecondition` で拒否し、既存の項目に触れない
+    /// （別表記の衝突の判定が「実在項目はすべてこの展開が作った」ことに依るため）。
+    #[test]
+    fn io5_non_empty_root_is_rejected() {
+        let sb = Sandbox::new();
+        fs::write(sb.root.join("existing"), b"keep").unwrap();
+        let e = run(&sb, &[file("existing", 0o644, b"new")]).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), "extraction root is not empty");
+        assert_eq!(names_in(&sb.root), ["existing"]);
+        assert_eq!(fs::read(sb.root.join("existing")).unwrap(), b"keep");
+    }
+
+    /// OCI-1 / IO-5: 展開が作る名前（暗黙の親ディレクトリを含む）は上限ちょうどが成功し、超過は作成前に中断する。
+    /// 同じ名前の再定義は件数を増やさない。
+    #[test]
+    fn oci1_tracked_path_limit() {
+        let limits = |n| ExtractLimits::new(10, 100, 1 << 30, n);
+        let es = [file("a/b/c", 0o644, b"x"), file("a/b/c", 0o644, b"y")];
+        let sb = Sandbox::new();
+        let r = extract_tar(archive(&es).as_slice(), &sb.root, limits(3)).unwrap();
+        assert_eq!((r.entries, r.bytes), (2, 2));
+        assert_eq!(fs::read(sb.root.join("a/b/c")).unwrap(), b"y");
+
+        let sb = Sandbox::new();
+        let e = extract_tar(archive(&es).as_slice(), &sb.root, limits(2)).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+        assert_eq!(e.message(), "layer exceeds the tracked path limit");
+        assert_eq!(names_in(&sb.root.join("a")), ["b"]);
+        assert_eq!(names_in(&sb.root.join("a/b")), Vec::<String>::new());
+
+        let sb = Sandbox::new();
+        let e = extract_tar(
+            archive(&[dir("x/", 0o755), dir("y/", 0o755)]).as_slice(),
+            &sb.root,
+            limits(1),
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+        assert_eq!(names_in(&sb.root), ["x"]);
+    }
+
+    fn code(r: Result<ExtractedLayer, OciError>) -> OciErrorCode {
+        r.expect_err("must fail").code()
+    }
+
+    /// OCI-1: `..`・絶対パス・NUL・過大な長さは拒否され、ルート外には何も作られない。
+    #[test]
+    fn oci1_path_traversal_is_rejected() {
+        for name in [
+            "../evil",
+            "a/../../evil",
+            "/etc/passwd",
+            "a/b/../../..",
+            "./../evil",
+        ] {
+            let sb = Sandbox::new();
+            assert_eq!(
+                code(run(&sb, &[file(name, 0o644, b"x")])),
+                OciErrorCode::PermissionDenied,
+                "{name}"
+            );
+            sb.assert_outside_untouched();
+        }
+        // 1 コンポーネント 256 バイトは GNU long name 経由でしか表せない。
+        let sb = Sandbox::new();
+        let long = "x".repeat(256);
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(1);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append_data(&mut h, &long, &b"x"[..]).unwrap();
+        let bytes = b.into_inner().unwrap();
+        let e = extract_tar(
+            bytes.as_slice(),
+            &sb.root,
+            ExtractLimits::new(10, 100, 1 << 30, 1 << 20),
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::InvalidArgument);
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-1 / SEC-5: 通常の展開（暗黙の親ディレクトリ・`./` 正規化・mode・ルート自身の無視）。
+    /// 通常ファイルの setuid（04755）は落として 0755 で展開する。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_extracts_regular_tree_with_modes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let sb = Sandbox::new();
+        let r = run(
+            &sb,
+            &[
+                dir("./", 0o755),
+                dir("etc/", 0o755),
+                file("./etc/hosts", 0o644, b"127.0.0.1"),
+                file("usr/bin/tool", 0o4755, b"bin"),
+            ],
+        )
+        .unwrap();
+        assert_eq!((r.entries, r.bytes), (4, 12));
+        assert_eq!(fs::read(sb.root.join("etc/hosts")).unwrap(), b"127.0.0.1");
+        let mode = |p: &str| fs::metadata(sb.root.join(p)).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode("etc/hosts"), 0o644);
+        assert_eq!(mode("usr/bin/tool"), 0o755);
+        assert_eq!(r.files_with_stripped_special_bits, 1);
+        assert_eq!(mode("etc"), 0o755);
+        sb.assert_outside_untouched();
+    }
+
+    /// SEC-5 / OCI-1: 通常ファイルの setuid / setgid / sticky は落とし、落とした件数を結果に返す。
+    /// 実行ユーザー所有のまま setuid / setgid を残さない。ディレクトリの mode（sticky の 1777）は変えない。
+    #[cfg(unix)]
+    #[test]
+    fn sec5_special_mode_bits_are_stripped_from_regular_files() {
+        let sb = Sandbox::new();
+        let r = run(
+            &sb,
+            &[
+                file("suid", 0o4755, b"a"),
+                file("sgid", 0o2755, b"b"),
+                file("both", 0o6711, b"c"),
+                file("sticky", 0o1644, b"d"),
+                file("plain", 0o755, b"e"),
+                hardlink("link", "suid"),
+                dir("tmp/", 0o1777),
+            ],
+        )
+        .unwrap();
+        assert_eq!((r.entries, r.bytes), (7, 5));
+        assert_eq!(r.files_with_stripped_special_bits, 4);
+        for (name, want) in [
+            ("suid", 0o755),
+            ("sgid", 0o755),
+            ("both", 0o711),
+            ("sticky", 0o644),
+            ("plain", 0o755),
+            ("link", 0o755),
+            ("tmp", 0o1777),
+        ] {
+            assert_eq!(mode_of(&sb.root.join(name)), want, "{name}");
+        }
+    }
+
+    /// OCI-1: 親エントリの無い tar の暗黙ディレクトリは既定 0755、後続の明示エントリがあればその mode になる。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_implicit_dirs_get_default_mode_and_explicit_overrides() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let sb = Sandbox::new();
+        run(
+            &sb,
+            &[
+                file("usr/bin/tool", 0o755, b"x"),
+                file("opt/app/f", 0o644, b"y"),
+                dir("opt/", 0o750),
+            ],
+        )
+        .unwrap();
+        let mode = |p: &str| fs::metadata(sb.root.join(p)).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode("usr"), 0o755);
+        assert_eq!(mode("usr/bin"), 0o755);
+        assert_eq!(mode("opt/app"), 0o755);
+        assert_eq!(mode("opt"), 0o750);
+    }
+
+    /// OCI-1: 所有者の権限が欠けるディレクトリでも子を作れ、最終的に mode が適用される。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_readonly_directory_mode_is_deferred() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let sb = Sandbox::new();
+        run(&sb, &[dir("ro/", 0o555), file("ro/child", 0o644, b"c")]).unwrap();
+        assert_eq!(fs::read(sb.root.join("ro/child")).unwrap(), b"c");
+        let m = fs::metadata(sb.root.join("ro"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(m, 0o555);
+    }
+
+    /// OCI-1: 同じディレクトリの再定義は後勝ち（0555 の後に 0755 を定義すると最終 mode は 0755）。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_directory_redefinition_is_last_wins() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode_of = |sb: &Sandbox| {
+            fs::metadata(sb.root.join("d"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        let sb = Sandbox::new();
+        run(&sb, &[dir("d/", 0o555), dir("d/", 0o755)]).unwrap();
+        assert_eq!(mode_of(&sb), 0o755);
+        let sb = Sandbox::new();
+        run(&sb, &[dir("d/", 0o755), dir("d/", 0o555)]).unwrap();
+        assert_eq!(mode_of(&sb), 0o555);
+    }
+
+    /// OCI-1: 巨大な拡張ヘッダ（GNU long name / PAX）は本体を確保する前にメタデータ上限で拒否する。
+    #[test]
+    fn oci1_oversized_extended_header_is_rejected_before_read() {
+        for ty in [
+            EntryType::GNULongName,
+            EntryType::GNULongLink,
+            EntryType::XHeader,
+        ] {
+            let sb = Sandbox::new();
+            // 宣言サイズだけ巨大で本体は無い。確保前に拒否されなければ DataLoss（切り詰め）になる。
+            let e = raw_entry(b"././@LongLink", ty, b"", 0o644, 1 << 40, b"");
+            assert_eq!(code(run(&sb, &[e])), OciErrorCode::ResourceExhausted);
+        }
+    }
+
+    /// OCI-1: PAX の size 上書きは追跡をずらせるため拒否する。
+    #[test]
+    fn oci1_pax_size_override_is_rejected() {
+        let sb = Sandbox::new();
+        let rec = b"12 size=999\n";
+        let e = raw_entry(
+            b"pax",
+            EntryType::XHeader,
+            b"",
+            0o644,
+            rec.len() as u64,
+            rec,
+        );
+        assert_eq!(
+            code(run(&sb, &[e, file("f", 0o644, b"x")])),
+            OciErrorCode::InvalidArgument
+        );
+    }
+
+    /// OCI-1: PAX の path 値に ` size=` を含むだけの正常な tar は拒否しない。
+    #[test]
+    fn oci1_pax_path_containing_size_text_is_accepted() {
+        let sb = Sandbox::new();
+        let body = pax_record("path", "a size=b.txt");
+        let e = raw_entry(
+            b"pax",
+            EntryType::XHeader,
+            b"",
+            0o644,
+            body.len() as u64,
+            &body,
+        );
+        let r = run(&sb, &[e, file("ignored", 0o644, b"x")]);
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    /// OCI-1: 構文違反の PAX レコードは構造化エラーで拒否する（パニックしない）。
+    #[test]
+    fn oci1_pax_malformed_record_is_rejected() {
+        for bad in [
+            &b"999 size=1\n"[..],
+            b"x size=1\n",
+            b"3 a\n",
+            b"12 size=999",
+            // 長さ欄が後続行にまたがるレコード（埋め込み size を隠す）は tar crate と同様に不整合として拒否する。
+            b"22 path=a\n12 size=999\n",
+        ] {
+            assert_eq!(
+                pax_reject_unsupported_records(bad).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData,
+                "{bad:?}"
+            );
+        }
+    }
+
+    fn pax_record(key: &str, val: &str) -> Vec<u8> {
+        let base = key.len() + val.len() + 3;
+        let mut n = base;
+        while n.to_string().len() + base != n {
+            n = base + n.to_string().len();
+        }
+        format!("{n} {key}={val}\n").into_bytes()
+    }
+
+    /// OCI-1: 前のレコードの長さ欄に隠された埋め込み `size` 行も拒否する（改行で先に分割する）。
+    #[test]
+    fn oci1_pax_embedded_size_record_is_rejected() {
+        let sb = Sandbox::new();
+        // 1 行目の長さ欄が 2 行分を指していても、tar crate は改行で分割して `size` 行を解釈する。
+        for rec in [
+            &b"22 path=a\n12 size=999\n"[..],
+            b"10 path=a\n12 size=999\n",
+        ] {
+            let e = raw_entry(
+                b"pax",
+                EntryType::XHeader,
+                b"",
+                0o644,
+                rec.len() as u64,
+                rec,
+            );
+            assert_eq!(
+                code(run(&sb, &[e, file("f", 0o644, b"x")])),
+                OciErrorCode::InvalidArgument
+            );
+        }
+    }
+
+    /// OCI-1: symlink のターゲットがルートより上へ出るものは拒否、収まるものは成功する。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_symlink_targets_are_confined() {
+        let sb = Sandbox::new();
+        assert_eq!(
+            code(run(&sb, &[symlink("x", "../../etc")])),
+            OciErrorCode::PermissionDenied
+        );
+        assert_eq!(
+            code(run(&sb, &[symlink("y", "..")])),
+            OciErrorCode::PermissionDenied
+        );
+        assert_eq!(
+            code(run(&sb, &[symlink("z", "/..")])),
+            OciErrorCode::PermissionDenied
+        );
+        assert!(fs::symlink_metadata(sb.root.join("x")).is_err());
+        sb.assert_outside_untouched();
+
+        let sb = Sandbox::new();
+        run(
+            &sb,
+            &[
+                symlink("a/b/rel", "../sibling"),
+                symlink("abs", "/usr/bin/x"),
+                symlink("dotdot", "a/b/../.."),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_link(sb.root.join("a/b/rel")).unwrap(),
+            PathBuf::from("../sibling")
+        );
+        assert_eq!(
+            fs::read_link(sb.root.join("abs")).unwrap(),
+            PathBuf::from("/usr/bin/x")
+        );
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-1: ルートを指す絶対 symlink 越しの書き込みは、ホストではなく `root` 配下に作られる。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_symlink_traversal_stays_inside_root() {
+        let sb = Sandbox::new();
+        run(
+            &sb,
+            &[symlink("link", "/"), file("link/etc/x", 0o644, b"in")],
+        )
+        .unwrap();
+        assert_eq!(fs::read(sb.root.join("etc/x")).unwrap(), b"in");
+        sb.assert_outside_untouched();
+
+        // 相対で上へ登るリンク経由でもルートで止まる。
+        let sb = Sandbox::new();
+        run(
+            &sb,
+            &[
+                dir("d/", 0o755),
+                symlink("d/up", "../"),
+                file("d/up/d/up/f", 0o644, b"f"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(fs::read(sb.root.join("f")).unwrap(), b"f");
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-1: symlink を指す名前への書き込みはリンク先に追従せず、リンクを置換する。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_write_over_symlink_replaces_link() {
+        let sb = Sandbox::new();
+        // ルート外の実在ファイル（番兵）のホスト絶対パスを指す symlink をレイヤーで置く。絶対ターゲットは
+        // 展開時にはルート基準で解決するが、OS が素朴に追従すればホストの番兵へ届く。
+        let victim = sb.base.join("sentinel");
+        let target = victim.to_str().unwrap();
+        run(&sb, &[symlink("t", target), file("t", 0o644, b"new")]).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"s");
+        assert!(fs::symlink_metadata(sb.root.join("t")).unwrap().is_file());
+        assert_eq!(fs::read(sb.root.join("t")).unwrap(), b"new");
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-1: ループする symlink は追従回数の上限で拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_symlink_loop_is_rejected() {
+        let sb = Sandbox::new();
+        let r = run(
+            &sb,
+            &[
+                symlink("a", "b"),
+                symlink("b", "a"),
+                file("a/x", 0o644, b"x"),
+            ],
+        );
+        assert_eq!(code(r), OciErrorCode::InvalidArgument);
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-1: エントリ数は上限ちょうどが成功し、上限 + 1 は中断して以降を作らない。
+    #[test]
+    fn oci1_entry_count_limit() {
+        let es = [
+            file("a", 0o644, b"1"),
+            file("b", 0o644, b"2"),
+            file("c", 0o644, b"3"),
+        ];
+        let sb = Sandbox::new();
+        let r = extract_tar(
+            archive(&es).as_slice(),
+            &sb.root,
+            ExtractLimits::new(3, 100, 1 << 30, 1 << 20),
+        )
+        .unwrap();
+        assert_eq!(r.entries, 3);
+
+        let sb = Sandbox::new();
+        let e = extract_tar(
+            archive(&es).as_slice(),
+            &sb.root,
+            ExtractLimits::new(2, 100, 1 << 30, 1 << 20),
+        )
+        .expect_err("limit");
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+        assert!(sb.root.join("b").exists());
+        assert!(!sb.root.join("c").exists());
+    }
+
+    /// OCI-1: 累積サイズは上限ちょうどが成功し、超過は中断する。巨大な宣言サイズは書き込み前に拒否する。
+    #[test]
+    fn oci1_total_bytes_limit() {
+        let es = [file("a", 0o644, b"1234"), file("b", 0o644, b"5678")];
+        let sb = Sandbox::new();
+        let r = extract_tar(
+            archive(&es).as_slice(),
+            &sb.root,
+            ExtractLimits::new(10, 8, 1 << 30, 1 << 20),
+        )
+        .unwrap();
+        assert_eq!(r.bytes, 8);
+
+        let sb = Sandbox::new();
+        let e = extract_tar(
+            archive(&es).as_slice(),
+            &sb.root,
+            ExtractLimits::new(10, 7, 1 << 30, 1 << 20),
+        )
+        .expect_err("limit");
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+        assert!(!sb.root.join("b").exists());
+
+        let sb = Sandbox::new();
+        let huge = raw_entry(b"big", EntryType::Regular, b"", 0o644, 10 << 30, b"tiny");
+        assert_eq!(code(run(&sb, &[huge])), OciErrorCode::ResourceExhausted);
+        assert!(!sb.root.join("big").exists());
+    }
+
+    /// OCI-1: hardlink はルート内の通常ファイルへのみ成功する。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_hardlink_rules() {
+        let sb = Sandbox::new();
+        run(
+            &sb,
+            &[file("orig", 0o644, b"data"), hardlink("sub/copy", "orig")],
+        )
+        .unwrap();
+        assert_eq!(fs::read(sb.root.join("sub/copy")).unwrap(), b"data");
+
+        for (es, want) in [
+            (
+                vec![hardlink("h", "../sentinel")],
+                OciErrorCode::PermissionDenied,
+            ),
+            (
+                vec![hardlink("h", "/etc/passwd")],
+                OciErrorCode::PermissionDenied,
+            ),
+            (vec![hardlink("h", "missing")], OciErrorCode::NotFound),
+            (
+                vec![symlink("s", "orig"), hardlink("h", "s")],
+                OciErrorCode::PermissionDenied,
+            ),
+            (
+                vec![dir("d/", 0o755), hardlink("h", "d")],
+                OciErrorCode::PermissionDenied,
+            ),
+        ] {
+            let sb = Sandbox::new();
+            assert_eq!(code(run(&sb, &es)), want);
+            sb.assert_outside_untouched();
+        }
+    }
+
+    /// OCI-1: 自分自身への hardlink（f → f）は参照元を削除せず成功する。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_hardlink_to_self_keeps_file() {
+        let sb = Sandbox::new();
+        run(&sb, &[file("f", 0o644, b"data"), hardlink("f", "f")]).unwrap();
+        assert_eq!(fs::read(sb.root.join("f")).unwrap(), b"data");
+    }
+
+    /// OCI-1: デバイス・FIFO は拒否する。
+    #[test]
+    fn oci1_special_entries_are_rejected() {
+        for ty in [EntryType::Char, EntryType::Block, EntryType::Fifo] {
+            let sb = Sandbox::new();
+            let e = raw_entry(b"dev", ty, b"", 0o644, 0, b"");
+            assert_eq!(
+                code(run(&sb, &[e])),
+                OciErrorCode::PermissionDenied,
+                "{ty:?}"
+            );
+            assert!(!sb.root.join("dev").exists());
+        }
+    }
+
+    /// OCI-1: sparse エントリは拒否する（tar 側の解析で不正な sparse ヘッダとして DataLoss になる）。
+    #[test]
+    fn oci1_sparse_entry_is_rejected() {
+        let sb = Sandbox::new();
+        let e = raw_entry(b"sp", EntryType::GNUSparse, b"", 0o644, 0, b"");
+        assert_eq!(code(run(&sb, &[e])), OciErrorCode::DataLoss);
+        assert!(!sb.root.join("sp").exists());
+    }
+
+    /// OCI-1: PAX 形式の GNU sparse（`GNU.sparse.*` キー + 通常ファイルの typeflag）は、穴を詰めた内容のまま
+    /// 通常ファイルとして展開せずに拒否する。値やパスに同じ文字列を含むだけの PAX レコードは通す。
+    #[test]
+    fn oci1_pax_gnu_sparse_entry_is_rejected() {
+        let pax = |rec: &[u8]| {
+            raw_entry(
+                b"pax",
+                EntryType::XHeader,
+                b"",
+                0o644,
+                rec.len() as u64,
+                rec,
+            )
+        };
+        for (key, val) in [
+            // 0.0
+            ("GNU.sparse.size", "1073741824"),
+            ("GNU.sparse.numblocks", "1"),
+            // 0.1
+            ("GNU.sparse.map", "0,4"),
+            // 1.0
+            ("GNU.sparse.major", "1"),
+            ("GNU.sparse.realsize", "1073741824"),
+            ("GNU.sparse.name", "sp"),
+        ] {
+            let sb = Sandbox::new();
+            let e = run(
+                &sb,
+                &[pax(&pax_record(key, val)), file("sp", 0o644, b"data")],
+            )
+            .expect_err(key);
+            assert_eq!(e.code(), OciErrorCode::DataLoss, "{key}");
+            assert_eq!(e.message(), "sparse entries are not supported", "{key}");
+            assert_eq!(names_in(&sb.root), Vec::<String>::new(), "{key}");
+        }
+
+        let sb = Sandbox::new();
+        let r = run(
+            &sb,
+            &[
+                pax(&pax_record("path", "GNU.sparse.size")),
+                file("ignored", 0o644, b"data"),
+                pax(&pax_record("comment", "GNU.sparse.map=0,4")),
+                file("f", 0o644, b"x"),
+            ],
+        )
+        .unwrap();
+        assert_eq!((r.entries, r.bytes), (2, 5));
+        assert_eq!(names_in(&sb.root), ["GNU.sparse.size", "f"]);
+        assert_eq!(fs::read(sb.root.join("GNU.sparse.size")).unwrap(), b"data");
+    }
+
+    /// OCI-1: 旧 GNU sparse（通常 typeflag + isextended）は拒否する（ヘッダ境界の追跡ずれを防ぐ）。
+    #[test]
+    fn oci1_old_gnu_sparse_isextended_is_rejected() {
+        let sb = Sandbox::new();
+        let mut e = file("old", 0o644, b"");
+        // GNU ヘッダの isextended は offset 482。チェックサムを再計算する。
+        e[482] = 1;
+        let mut h = tar::Header::from_byte_slice(&e[..512]).clone();
+        h.set_cksum();
+        e[..512].copy_from_slice(h.as_bytes());
+        assert_eq!(code(run(&sb, &[e])), OciErrorCode::DataLoss);
+    }
+
+    /// OCI-1: 末尾ドット・空白付きの `..` は全 OS で脱出として拒否する。
+    #[test]
+    fn oci1_dotdot_variants_are_rejected() {
+        for p in ["a/.. /b", "a/.../b", "a/... /b", ".. "] {
+            for win in [false, true] {
+                assert!(
+                    normalize_entry_path_for(p.as_bytes(), win).is_err(),
+                    "{p} win={win}"
+                );
+            }
+        }
+        assert!(normalize_entry_path_for(b"a/./b", false).is_ok());
+        assert!(normalize_entry_path_for(b"a/.hidden", false).is_ok());
+        assert!(normalize_entry_path_for(b"a/foo.", false).is_ok());
+    }
+
+    /// OCI-1: Windows ホストでは末尾ドット・空白と予約デバイス名を拒否する。他 OS では通す。
+    #[test]
+    fn oci1_windows_names_are_rejected_on_windows_only() {
+        for p in [
+            "CON",
+            "con.txt",
+            "a/Nul",
+            "AUX.tar.gz",
+            "COM1",
+            "lpt9.x",
+            "prn ",
+            "foo.",
+            "bar ",
+        ] {
+            assert!(normalize_entry_path_for(p.as_bytes(), true).is_err(), "{p}");
+        }
+        for p in ["CON", "aux.c", "foo.", "COM0", "COM10", "console", "nul2"] {
+            assert!(normalize_entry_path_for(p.as_bytes(), false).is_ok(), "{p}");
+        }
+        for p in ["COM0", "COM10", "console", "nul2"] {
+            assert!(normalize_entry_path_for(p.as_bytes(), true).is_ok(), "{p}");
+        }
+    }
+
+    /// OCI-1: 所有者権限のないディレクトリの下にも子を作れ、最終 mode は元の値になる。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_zero_mode_directory_accepts_children_then_restores() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let sb = Sandbox::new();
+        run(&sb, &[dir("z/", 0o000), file("z/child", 0o644, b"c")]).unwrap();
+        let m = fs::metadata(sb.root.join("z"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(m, 0);
+        restore_perms(&sb.root);
+        assert_eq!(fs::read(sb.root.join("z/child")).unwrap(), b"c");
+    }
+
+    /// OCI-1: 後勝ち・ディレクトリ上へのファイルは拒否・長いパス（GNU long name）。
+    #[test]
+    fn oci1_duplicates_and_long_names() {
+        let sb = Sandbox::new();
+        run(&sb, &[file("f", 0o644, b"one"), file("f", 0o644, b"two")]).unwrap();
+        assert_eq!(fs::read(sb.root.join("f")).unwrap(), b"two");
+
+        let sb = Sandbox::new();
+        assert_eq!(
+            code(run(&sb, &[dir("d/", 0o755), file("d", 0o644, b"x")])),
+            OciErrorCode::FailedPrecondition
+        );
+
+        let sb = Sandbox::new();
+        let long: String = (0..8)
+            .map(|i| format!("{}{i}/", "d".repeat(60)))
+            .collect::<String>()
+            + "leaf";
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(2);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append_data(&mut h, &long, &b"ok"[..]).unwrap();
+        let bytes = b.into_inner().unwrap();
+        extract_tar(
+            bytes.as_slice(),
+            &sb.root,
+            ExtractLimits::new(10, 100, 1 << 30, 1 << 20),
+        )
+        .unwrap();
+        assert_eq!(fs::read(sb.root.join(&long)).unwrap(), b"ok");
+    }
+
+    /// OCI-1: 途中で切れた tar は DataLoss。
+    #[test]
+    fn oci1_truncated_tar_is_data_loss() {
+        let sb = Sandbox::new();
+        let mut bytes = archive(&[file("f", 0o644, &[7u8; 2000])]);
+        bytes.truncate(512 + 700);
+        let e = extract_tar(
+            bytes.as_slice(),
+            &sb.root,
+            ExtractLimits::new(10, 1 << 20, 1 << 30, 1 << 20),
+        )
+        .expect_err("truncated");
+        assert_eq!(e.code(), OciErrorCode::DataLoss);
+    }
+
+    /// OCI-1: gzip トレーラ破損は終端後の読み捨てで DataLoss になる。上限は gzip 側でも効く。
+    #[test]
+    fn oci1_gzip_trailer_is_verified_after_tar_end() {
+        use crate::layer::GzipLayerReader;
+        let tar_bytes = archive(&[file("f", 0o644, b"hello")]);
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(&tar_bytes).unwrap();
+        let gz = e.finish().unwrap();
+
+        let sb = Sandbox::new();
+        let r = extract_tar(
+            GzipLayerReader::new(gz.as_slice(), 1 << 20),
+            &sb.root,
+            ExtractLimits::new(10, 100, 1 << 30, 1 << 20),
+        )
+        .unwrap();
+        assert_eq!(r.bytes, 5);
+
+        let mut bad = gz.clone();
+        let n = bad.len();
+        bad[n - 8] ^= 0xff; // CRC32 を壊す。
+        let sb = Sandbox::new();
+        let e = extract_tar(
+            GzipLayerReader::new(bad.as_slice(), 1 << 20),
+            &sb.root,
+            ExtractLimits::new(10, 100, 1 << 30, 1 << 20),
+        )
+        .expect_err("crc");
+        assert_eq!(e.code(), OciErrorCode::DataLoss);
+
+        let sb = Sandbox::new();
+        let e = extract_tar(
+            GzipLayerReader::new(gz.as_slice(), 600),
+            &sb.root,
+            ExtractLimits::new(10, 100, 1 << 30, 1 << 20),
+        )
+        .expect_err("gzip limit");
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+    }
+
+    /// REPAIR-4: 成功と失敗でそれぞれ 1 件、種別 `oci.layer.extract` が記録される。
+    #[test]
+    fn repair4_records_extract_operation() {
+        let c = Collect::default();
+        let sb = Sandbox::new();
+        extract_tar_with(
+            &c,
+            archive(&[file("f", 0o644, b"x")]).as_slice(),
+            &sb.root,
+            ExtractLimits::new(10, 10, 1 << 30, 1 << 20),
+        )
+        .unwrap();
+        // 展開先は空である必要があるため、失敗側は別のステージングで行う。
+        let sb = Sandbox::new();
+        extract_tar_with(
+            &c,
+            archive(&[file("../f", 0o644, b"x")]).as_slice(),
+            &sb.root,
+            ExtractLimits::new(10, 10, 1 << 30, 1 << 20),
+        )
+        .unwrap_err();
+        let items = c.items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind().as_str(), "oci.layer.extract");
+        assert_eq!(items[0].outcome(), OciOpOutcome::Success);
+        assert_eq!(items[1].outcome(), OciOpOutcome::Failure);
+        assert_eq!(items[1].error_code(), Some(OciErrorCode::PermissionDenied));
+    }
+
+    /// REPAIR-4: blob を開く失敗（不存在）も `oci.layer.extract` の失敗として記録される。
+    #[test]
+    fn repair4_records_blob_open_failure() {
+        let c = Collect::default();
+        let sb = Sandbox::new();
+        let missing = sb.base.join("no-such-blob");
+        let e = extract_layer_blob_with(
+            &c,
+            &missing,
+            &sb.root,
+            1 << 20,
+            ExtractLimits::new(1, 1, 1 << 30, 1 << 20),
+        )
+        .unwrap_err();
+        let items = c.items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind().as_str(), "oci.layer.extract");
+        assert_eq!(items[0].outcome(), OciOpOutcome::Failure);
+        assert_eq!(items[0].error_code(), Some(e.code()));
+    }
+
+    /// 終端後に巨大データを付加した入力は、ファイル本体が 0 件でも入力上限で打ち切る（OCI-1）。
+    #[test]
+    fn trailing_garbage_exceeding_input_limit_is_rejected() {
+        let sb = Sandbox::new();
+        let mut bytes = archive(&[]);
+        bytes.extend(std::iter::repeat_n(0u8, 1 << 20));
+        let e = extract_tar(
+            bytes.as_slice(),
+            &sb.root,
+            ExtractLimits::new(0, 0, 64 * 1024, 1 << 20),
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+    }
+
+    /// 入力がちょうど上限バイトなら受理する（境界）。
+    #[test]
+    fn input_exactly_at_limit_is_accepted() {
+        let sb = Sandbox::new();
+        let bytes = archive(&[]);
+        let len = bytes.len() as u64;
+        extract_tar(
+            bytes.as_slice(),
+            &sb.root,
+            ExtractLimits::new(0, 0, len, 1 << 20),
+        )
+        .unwrap();
+        let sb2 = Sandbox::new();
+        let e = extract_tar(
+            bytes.as_slice(),
+            &sb2.root,
+            ExtractLimits::new(0, 0, len - 1, 1 << 20),
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+    }
+
+    /// root が通常ファイルなら InvalidArgument。
+    #[test]
+    fn root_must_be_directory() {
+        let sb = Sandbox::new();
+        let f = sb.base.join("sentinel");
+        let e = extract_tar(
+            archive(&[]).as_slice(),
+            &f,
+            ExtractLimits::new(1, 1, 1 << 30, 1 << 20),
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::InvalidArgument);
+    }
+
+    /// 非 unix ホストでは symlink エントリを Unimplemented で拒否する。
+    #[cfg(not(unix))]
+    #[test]
+    fn symlink_is_unimplemented_on_non_unix() {
+        let sb = Sandbox::new();
+        assert_eq!(
+            code(run(&sb, &[symlink("a", "b")])),
+            OciErrorCode::Unimplemented
+        );
+    }
+}

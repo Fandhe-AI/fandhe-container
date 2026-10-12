@@ -869,10 +869,25 @@ mod tests {
             .stdin(std::process::Stdio::null())
             .stdout(out_w)
             .stderr(err_w);
-        let mut child = cmd.spawn().expect("spawn");
+        let child = cmd.spawn().expect("spawn");
         // `cmd` が持つ書き込み側を閉じる（閉じないと読み取り側が EOF にならない）。
         drop(cmd);
         let pid = child.id();
+        // 読み取りが戻らない場合に備え、期限（REPAIR-5）で子を kill する見張りを付ける。
+        // kill された子のパイプは EOF になり、下の assert が失敗として戻る。
+        let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
+        let watchdog = {
+            let child = std::sync::Arc::clone(&child);
+            std::thread::spawn(move || {
+                if cancel_rx
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .is_err()
+                {
+                    let _ = child.lock().unwrap_or_else(|e| e.into_inner()).kill();
+                }
+            })
+        };
         let process =
             ContainerChildProcess::new(crate::exec::ContainerChild::from_pid_for_test(pid))
                 .expect("wrap");
@@ -891,7 +906,21 @@ mod tests {
             .expect("stderr")
             .read_to_string(&mut b)
             .expect("read stderr");
-        child.wait().expect("wait");
+        // 子の終了も期限内に確認する（見張りが kill した場合は wait が戻る）。
+        let status = loop {
+            let polled = child
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .try_wait()
+                .expect("try_wait");
+            if let Some(s) = polled {
+                break s;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let _ = cancel_tx.send(());
+        watchdog.join().expect("watchdog");
+        assert!(status.success(), "子が期限内に正常終了する: {status:?}");
         assert_eq!((a.as_str(), b.as_str()), ("out-line\n", "err-line\n"));
     }
 

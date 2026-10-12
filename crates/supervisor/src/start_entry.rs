@@ -1104,7 +1104,9 @@ pub fn run_supervised(
         instance,
         logs,
     } = running;
-    if let (Some(hub), Some(output)) = (&logs, process.take_output())
+    // 捕捉ハブが無いときは読み取り側を取り出さない（取り出して捨てるとコンテナが SIGPIPE を受ける）。
+    if let Some(hub) = &logs
+        && let Some(output) = process.take_output()
         && let Err(e) = hub.attach(output)
     {
         log_event("log_capture_failed", Some(e.code()));
@@ -1120,10 +1122,9 @@ pub fn run_supervised(
     let code = supervise_running(
         store, id, process, relauncher, instance, restart, timeouts, stop,
     );
-    if let Some(hub) = logs
-        && let Some(Err(e)) = hub.finish(timeouts.terminate())
-    {
-        log_event("log_capture_finish_failed", Some(e.code()));
+    if let Some(hub) = logs {
+        // 失敗（集計内の error_code を含む）は finish が構造化ログへ報告する。
+        let _ = hub.finish(timeouts.terminate());
     }
     code
 }

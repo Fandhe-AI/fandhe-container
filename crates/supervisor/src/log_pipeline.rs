@@ -27,6 +27,34 @@ use fandhe_container_core::traits::TraitError;
 
 use crate::logs::{CaptureSummary, LogCapture, LogSink, OutputStreams, ReaderBudget};
 
+/// `drain` の結果を構造化ログへ報告する（REPAIR-4）。
+///
+/// `drain` は読み取り・append・flush の失敗でも `Ok(CaptureSummary)` を返し、障害は
+/// `StreamSummary::error_code` と破棄行数にだけ残る。そのため `Err` だけでなく集計内の失敗も出す
+/// （ディスク容量不足などでログが失われても通知されるように）。行の内容は出さない。
+fn report_drain(event: &'static str, drained: &Result<CaptureSummary, TraitError>) {
+    let mut failures: Vec<(&'static str, &'static str, u64)> = Vec::new();
+    match drained {
+        Err(e) => failures.push(("both", e.code().as_str(), 0)),
+        Ok(summary) => {
+            for (name, stream) in [("stdout", summary.stdout()), ("stderr", summary.stderr())] {
+                if let Some(st) = stream
+                    && let Some(code) = st.error_code()
+                {
+                    failures.push((name, code.as_str(), st.discarded_lines()));
+                }
+            }
+        }
+    }
+    for (stream, code, discarded) in failures {
+        let line = format!(
+            "{{\"component\":\"supervisor\",\"event\":\"{event}\",\"stream\":\"{stream}\",\"code\":\"{code}\",\"discarded_lines\":{discarded}}}\n"
+        );
+        // 満杯・書き込み失敗でも処理は止めない（ログの欠落は許す）。
+        let _ = crate::stderr_sink::stderr().emit(line.into_bytes());
+    }
+}
+
 /// 直前の捕捉を畳むときの `drain` の期限（旧プロセスは回収済みで、通常は EOF が即座に届く。REPAIR-5）。
 pub const PREVIOUS_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -73,7 +101,10 @@ impl CaptureHub {
             .replace(capture);
         if let Some(previous) = previous {
             // 期限切れでも `drain` が自動で取り消す。ここで待つのは旧プロセスの EOF だけ。
-            let _ = previous.drain(PREVIOUS_DRAIN_TIMEOUT);
+            report_drain(
+                "log_capture_previous_drain_failed",
+                &previous.drain(PREVIOUS_DRAIN_TIMEOUT),
+            );
         }
         Ok(())
     }
@@ -90,7 +121,10 @@ impl CaptureHub {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         if let Some(previous) = previous {
-            let _ = previous.drain(PREVIOUS_DRAIN_TIMEOUT);
+            report_drain(
+                "log_capture_previous_drain_failed",
+                &previous.drain(PREVIOUS_DRAIN_TIMEOUT),
+            );
         }
     }
 
@@ -103,7 +137,11 @@ impl CaptureHub {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        live.map(|capture| capture.drain(timeout))
+        live.map(|capture| {
+            let drained = capture.drain(timeout);
+            report_drain("log_capture_finish_failed", &drained);
+            drained
+        })
     }
 }
 

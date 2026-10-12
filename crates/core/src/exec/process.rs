@@ -3519,7 +3519,7 @@ mod tests {
         if std::env::var_os(STDIO_INSTALL_CHILD_ENV).is_some() {
             stdio_install_child_main();
         }
-        let status = Command::new(std::env::current_exe().unwrap())
+        let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "exec::process::tests::sup7_1471_install_routes_fd1_and_fd2_to_separate_pipes",
@@ -3530,8 +3530,21 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
+            .spawn()
             .unwrap();
+        // 子役が read_exact で戻らない場合に備え、期限（REPAIR-5）を超えたら kill して回収し失敗させる。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break s;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("install child did not finish within 30s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         assert_eq!(status.code(), Some(0));
     }
 

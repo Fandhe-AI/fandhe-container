@@ -265,6 +265,14 @@ const BACKOFF_SLICE: Duration = Duration::from_millis(10);
 pub trait Relauncher: Send + Sync {
     /// 同じコンテナのプロセスを再起動し、新しい起動ハンドルを返す。待ちは `timeout` まで（REPAIR-5）。
     fn relaunch(&self, timeout: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError>;
+
+    /// `relaunch` が `Err` を返す際に、terminate できず生存の可能性が残るプロセスのハンドルを引き渡す。
+    ///
+    /// 既定は空。`relaunch_bounded` が `relaunch` の直後に呼び、[`LateOrphans`] へ積んで呼び出し側が
+    /// 再回収できるようにする（CORE-1・REPAIR-5。`LaunchedProcess` は `Drop` で回収しない）。
+    fn take_stranded(&self) -> Vec<LateOrphan> {
+        Vec::new()
+    }
 }
 
 /// 再起動ループの設定。検証付きコンストラクタ経由でのみ作れる。
@@ -755,6 +763,9 @@ fn relaunch_bounded(
     let worker_late = late.clone();
     spawn_tracked(spawn, "fandhe-relaunch", late, move || {
         let value = r.relaunch(timeout);
+        for (proc, error) in r.take_stranded() {
+            worker_late.push(proc, error);
+        }
         let (lock, cvar) = &*worker;
         let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
         if matches!(*slot, Slot::Abandoned) {
@@ -1157,6 +1168,8 @@ pub struct LauncherRelauncher {
     launcher: Arc<dyn ProcessLauncher>,
     spec: LaunchSpec,
     capture: Option<Arc<CaptureHub>>,
+    /// 捕捉開始に失敗し terminate も失敗したプロセスのハンドル（[`Relauncher::take_stranded`] が引き渡す）。
+    stranded: Mutex<Vec<LateOrphan>>,
 }
 
 impl LauncherRelauncher {
@@ -1166,6 +1179,7 @@ impl LauncherRelauncher {
             launcher,
             spec,
             capture: None,
+            stranded: Mutex::new(Vec::new()),
         }
     }
 
@@ -1184,16 +1198,29 @@ impl Relauncher for LauncherRelauncher {
             hub.quiesce();
         }
         let process = self.launcher.launch(&self.spec, timeout)?;
-        if let (Some(hub), Some(output)) = (&self.capture, process.take_output())
+        // 捕捉ハブが無いときは読み取り側を取り出さない（取り出して捨てるとコンテナが SIGPIPE を受ける）。
+        if let Some(hub) = &self.capture
+            && let Some(output) = process.take_output()
             && let Err(e) = hub.attach(output)
         {
-            // 新プロセスを動かしたままにしない（回収できなければその失敗を返す。REPAIR-5）。
+            // 新プロセスを動かしたままにしない。回収できなければハンドルを保持し、
+            // `take_stranded` 経由で呼び出し側が再回収できるようにする（CORE-1・REPAIR-5）。
             return match process.terminate(timeout) {
                 Ok(()) => Err(e),
-                Err(t) => Err(t),
+                Err(t) => {
+                    self.stranded
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push((process, t.clone()));
+                    Err(t)
+                }
             };
         }
         Ok(process)
+    }
+
+    fn take_stranded(&self) -> Vec<LateOrphan> {
+        std::mem::take(&mut *self.stranded.lock().unwrap_or_else(PoisonError::into_inner))
     }
 }
 

@@ -98,7 +98,7 @@ pub trait StartDeps {
     ///
     /// `Some` を返すと、入口は捕捉ハブ（[`CaptureHub`]）を作り、起動・再起動のたびに新プロセスの出力を行単位で
     /// この sink へ流す。開けなければ失敗させる（ログ喪失を黙って許さない。ERR-1・REPAIR-4）。既定は `None`
-    /// （出力を捕捉しない。フェイクの [`StartDeps`] は上書きしなくてよい）。
+    /// （出力は記録せず読み捨てる。フェイクの [`StartDeps`] は上書きしなくてよい）。
     fn open_log_sink(&mut self, id: &ContainerId) -> Result<Option<Arc<dyn LogSink>>, TraitError> {
         let _ = id;
         Ok(None)
@@ -781,7 +781,10 @@ fn attempt_start(
         return fail(e, Cleanup::ReleaseCgroup);
     }
     let logs = match deps.open_log_sink(req.id()) {
-        Ok(sink) => sink.map(|s| Arc::new(CaptureHub::new(s))),
+        // 記録先が無くても出力パイプは読み捨てる（読まないとコンテナの write が詰まる。SUP-1・SUP-7・REPAIR-5）。
+        Ok(sink) => Some(Arc::new(CaptureHub::new(sink.unwrap_or_else(|| {
+            Arc::new(crate::logs::DiscardLogSink) as Arc<dyn LogSink>
+        })))),
         Err(e) => return fail(e, Cleanup::ReleaseCgroup),
     };
     let inner = match deps.build_launcher() {
@@ -1130,6 +1133,8 @@ pub fn run_supervised(
 }
 
 /// [`run_supervised`] の監視と回収の本体（出力の捕捉は呼び出し側が担う）。
+// 理由: 入口 `run_supervised` が受けた store・id・process・relauncher・instance・restart・timeouts・stop は
+// いずれも独立に所有・借用の区別が要る値で、束ねる型を作ると呼び出し側の分解コードが増えるだけのため引数のまま渡す。
 #[allow(clippy::too_many_arguments)]
 fn supervise_running(
     store: Arc<dyn StateStore>,

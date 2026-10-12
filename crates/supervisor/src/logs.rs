@@ -278,6 +278,20 @@ pub trait LogSink: Send + Sync {
     }
 }
 
+/// 行を記録せず捨てる [`LogSink`]（SUP-7・SUP-1・REPAIR-5）。
+///
+/// 記録先が無い（`StartDeps::open_log_sink` が `None`）場合でも、launcher が返した出力パイプを有界に読み捨てて
+/// コンテナの `write` が詰まらないようにするため、捕捉ハブ（`CaptureHub`）の sink として使う。
+/// 読み取り側を保持するだけで読まないと、パイプ容量を超えた出力でコンテナが停止し、監視が終了を待ち続ける。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DiscardLogSink;
+
+impl LogSink for DiscardLogSink {
+    fn append(&self, _stream: StreamKind, _line: &[u8]) -> Result<(), TraitError> {
+        Ok(())
+    }
+}
+
 /// [`MemoryLogSink`] が保持する 1 行。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedLine {
@@ -1032,6 +1046,23 @@ mod tests {
             stream,
             bytes: s.to_vec(),
         }
+    }
+
+    /// SUP-1・SUP-7・REPAIR-5: 捨て sink でも出力を EOF まで読み切り、パイプを詰まらせない（行は記録しない）。
+    #[test]
+    fn sup7_discard_sink_reads_all_output_and_drops_lines() {
+        let big = vec![b'x'; 200_000];
+        let mut data = big.clone();
+        data.push(b'\n');
+        let budget = ReaderBudget::with_max_limit();
+        let cap = LogCapture::start(
+            OutputStreams::new(&budget, boxed(&data), None),
+            Arc::new(DiscardLogSink),
+        )
+        .unwrap();
+        let sum = cap.drain(Duration::from_secs(10)).unwrap();
+        assert!(sum.stdout().unwrap().error_code().is_none());
+        assert_eq!(wait_live(&budget, 0), 0);
     }
 
     /// REPAIR-5・TASK-157.7: 溢れる timeout は panic せず InvalidArgument を返す。

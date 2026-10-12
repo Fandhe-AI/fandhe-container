@@ -419,10 +419,9 @@ impl CdiSpecReadRecorder for NoopRecorder {
     fn record(&self, _sample: CdiSpecReadSample) {}
 }
 
-/// open フラグ（`O_NONBLOCK | O_NOCTTY`）。`O_NONBLOCK` は FIFO の open 待ちによる無期限停止を避け、
-/// `O_NOCTTY` は端末デバイス（またはその symlink）を指定されても制御端末を取得しないために付ける
-/// （種別拒否の前に open するため、拒否しても取り消せない副作用を作らない）。
-/// 値を確定できない Unix では `None` とし、open 前の `metadata` 検査で代える。
+/// 読み取り用 open のフラグ（`O_NONBLOCK | O_NOCTTY`）。`O_NONBLOCK` は FIFO の open 待ちによる無期限停止を避け、
+/// `O_NOCTTY` は端末デバイスを指定されても制御端末を取得しないために付ける。
+/// 値を確定できない Unix では `None` とし、open 前の `metadata` 検査だけで代える。
 #[cfg(unix)]
 const OPEN_FLAGS: Option<i32> = if cfg!(all(
     target_os = "linux",
@@ -449,46 +448,119 @@ const OPEN_FLAGS: Option<i32> = if cfg!(all(
     None
 };
 
-/// 通常ファイルだけを開く。FIFO・デバイス等は拒否する（open / read の無期限停止を防ぐ）。
+/// Linux の `O_PATH`（パスの固定だけを行い、デバイスドライバの open 処理を起こさない）。
+/// 値が汎用定義（0o10000000）と一致するアーキテクチャに限る。
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "powerpc64",
+        target_arch = "s390x"
+    )
+))]
+const O_PATH: i32 = 0o10000000;
+
+fn not_regular_error() -> CdiSpecError {
+    CdiSpecError::new(
+        CdiSpecErrorCode::InvalidArgument,
+        "CDI spec path is not a regular file",
+    )
+}
+
+fn map_open_error(e: &std::io::Error) -> CdiSpecError {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        CdiSpecError::new(CdiSpecErrorCode::NotFound, "CDI spec file not found")
+    } else {
+        CdiSpecError::new(CdiSpecErrorCode::Internal, "failed to open CDI spec file")
+    }
+}
+
+fn stat_error() -> CdiSpecError {
+    CdiSpecError::new(CdiSpecErrorCode::Internal, "failed to stat CDI spec file")
+}
+
+/// 通常ファイルだけを開く。FIFO・デバイス等は拒否する（open / read の無期限停止とドライバ副作用を防ぐ）。
+///
+/// Linux では `O_PATH` で対象を固定し（デバイスの open 処理は走らない）、`fstat` で通常ファイルと
+/// 確認できた同じ対象だけを `/proc/self/fd/N` 経由で読み取り用に開き直す（パス差し替え競合を避ける。
+/// GPU-1）。`/proc` が使えない環境では fail-closed で `Internal` を返す。
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "powerpc64",
+        target_arch = "s390x"
+    )
+))]
 fn open_regular_file(path: &Path) -> Result<std::fs::File, CdiSpecError> {
-    let not_regular = || {
-        CdiSpecError::new(
-            CdiSpecErrorCode::InvalidArgument,
-            "CDI spec path is not a regular file",
-        )
-    };
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let mut pin = std::fs::OpenOptions::new();
+    pin.read(true).custom_flags(O_PATH);
+    let pinned = pin.open(path).map_err(|e| map_open_error(&e))?;
+    let pinned_meta = pinned.metadata().map_err(|_| stat_error())?;
+    if !pinned_meta.is_file() {
+        return Err(not_regular_error());
+    }
+    let proc_path = std::path::PathBuf::from(format!("/proc/self/fd/{}", pinned.as_raw_fd()));
+    let mut reopen = std::fs::OpenOptions::new();
+    reopen.read(true);
+    if let Some(flag) = OPEN_FLAGS {
+        reopen.custom_flags(flag);
+    }
+    let file = reopen.open(&proc_path).map_err(|e| map_open_error(&e))?;
+    let meta = file.metadata().map_err(|_| stat_error())?;
+    if !meta.is_file() || meta.dev() != pinned_meta.dev() || meta.ino() != pinned_meta.ino() {
+        return Err(not_regular_error());
+    }
+    Ok(file)
+}
+
+/// 通常ファイルだけを開く（Linux 以外・対象外アーキテクチャ）。
+///
+/// std だけでは非通常ファイルを開かずに固定する手段が無いため、open 前に `metadata`（symlink を
+/// 辿る）で種別を確認し、開いた後にもハンドルの種別を検証する。検査と open の間のパス差し替えは
+/// 残る（best effort。固定する薄いラッパーは後続課題）。
+#[cfg(not(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "powerpc64",
+        target_arch = "s390x"
+    )
+)))]
+fn open_regular_file(path: &Path) -> Result<std::fs::File, CdiSpecError> {
+    if let Ok(meta) = std::fs::metadata(path)
+        && !meta.is_file()
+    {
+        return Err(not_regular_error());
+    }
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        match OPEN_FLAGS {
-            Some(flag) => {
-                opts.custom_flags(flag);
-            }
-            None => {
-                // フラグが使えない OS では open 前に種別を確認する（TOCTOU は残るため best effort）。
-                if let Ok(meta) = std::fs::metadata(path)
-                    && !meta.is_file()
-                {
-                    return Err(not_regular());
-                }
-            }
+        if let Some(flag) = OPEN_FLAGS {
+            opts.custom_flags(flag);
         }
     }
-    let file = opts.open(path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            CdiSpecError::new(CdiSpecErrorCode::NotFound, "CDI spec file not found")
-        } else {
-            CdiSpecError::new(CdiSpecErrorCode::Internal, "failed to open CDI spec file")
-        }
-    })?;
-    // 取得したハンドル自体の種別を検証する（パス検査との競合を避ける）。
-    let meta = file.metadata().map_err(|_| {
-        CdiSpecError::new(CdiSpecErrorCode::Internal, "failed to stat CDI spec file")
-    })?;
+    let file = opts.open(path).map_err(|e| map_open_error(&e))?;
+    let meta = file.metadata().map_err(|_| stat_error())?;
     if !meta.is_file() {
-        return Err(not_regular());
+        return Err(not_regular_error());
     }
     Ok(file)
 }
@@ -709,5 +781,28 @@ containerEdits:
     fn read_missing_file_is_not_found() {
         let e = read_cdi_spec_file(Path::new("/nonexistent/fandhe/cdi.yaml")).unwrap_err();
         assert_eq!(e.code(), CdiSpecErrorCode::NotFound);
+    }
+
+    /// GPU-1: 通常ファイルは読め、デバイス（直接・symlink 経由）は InvalidArgument で拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn gpu1_reads_regular_and_rejects_device_via_symlink() {
+        let dir = std::env::temp_dir().join(format!("fandhe-cdi-spec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("spec.yaml");
+        std::fs::write(&file, "cdiVersion: '0.5.0'\nkind: a.b/c\n").unwrap();
+        let link_ok = dir.join("ok.yaml");
+        let link_dev = dir.join("dev.yaml");
+        std::os::unix::fs::symlink(&file, &link_ok).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &link_dev).unwrap();
+
+        let ok = read_cdi_spec_file(&link_ok).unwrap();
+        assert_eq!(ok.kind, "a.b/c");
+        let e = read_cdi_spec_file(&link_dev).unwrap_err();
+        assert_eq!(e.code(), CdiSpecErrorCode::InvalidArgument);
+        let e = read_cdi_spec_file(Path::new("/dev/null")).unwrap_err();
+        assert_eq!(e.code(), CdiSpecErrorCode::InvalidArgument);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

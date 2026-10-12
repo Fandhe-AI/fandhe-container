@@ -178,7 +178,7 @@ flowchart LR
 | `plugin-*`（バイナリ群） → `core` | トレイト型（`ContainerRuntime` 等の共通型）を参照する想定（TASK-114〜118） | 想定 |
 | `core` → `plugin`（境界基盤） | core の `plugin` feature（既定で有効）で optional 依存。`--no-default-features` で除外できる（PLUG-3・TASK-111.1・#262）。plugin 候補の探索は core 側の `crates/core/src/plugin_discovery.rs` に実装済み。登録の成果物も core 側に置く想定（TASK-109） | 確定（optional 辺。探索は実装済み・登録は未実装） |
 | `stack` → `core` | `up` コマンドが core の CLI／ライブラリ API を呼ぶ想定（PLUG-1 境界表の stack 行・TASK-155） | 想定 |
-| `net` を含む辺 | PLUG-1 区分が「検討中」（NET-5・NET-9 のデータパス判定未確定。`plugin-system.md`） | 未確定 |
+| `net` を含む辺 | PLUG-1 区分が「検討中」（NET-5〔DNS ヘルパー〕のデータパス判定未確定。NET-9〔rootless 転送〕は 2026-10-12 に例外として確定。`plugin-system.md`） | 未確定 |
 | `gpu` の GPU-1〜4 以外を含む辺 | GPU-5・7・8 は境界表に明示判定なし、GPU-9 は「検討中」（`api-gpu.md`） | 未確定 |
 | macOS Venus（GPU-6）関連の辺 | 成果物は `plugin-macos` 側に置く定義のみが確定しており、依存の詳細な方向は未確定 | 未確定 |
 
@@ -206,16 +206,17 @@ D-14（方針追記 2）に基づく core / plugin の割り付け表を以下�
 | CRI サーバー（`api-cri.md`） | plugin | 制御面（`RunPodSandbox` 等）であり PoC-13 の代表操作 (A) そのもの |
 | MCP サーバー（`api-mcp.md`） | plugin（`fandhe-container-plugin-mcp` として参照実装済み） | core 無変更で追加可能なことを実証（PoC-13 成功基準 3） |
 | CDI の適用・OCI hook の実行（`api-gpu.md` GPU-1〜GPU-4） | core（推奨） | GPU の device node・mount・env 付与は汎用の mount／device 操作であり D-14 の core 範囲定義（Linux ネイティブ実行層）と整合する。hook はホスト権限でコンテナの rootfs を書き換える（ld キャッシュ更新等）ため、core 内で OCI hook（`createContainer` 相当）を実行する機能として実装する案を推奨する（D-15、gpu-passthrough-cdi〔PoC-14〕）。未解決疑問点 11 は未決であり、core 範囲の最終確定はスコープ確認（Phase 4→5）以降に持ち越す |
-| DNS ヘルパー・rootless ネットワーク転送（`api-network.md` NET-5・NET-9） | 検討中（未確定） | ネットワークごとの DNS ヘルパーとユーザー空間転送（pasta 相当）はデータパス上で動作するプロセスである。core⇔plugin の IPC 往復がデータパスに入るわけではなく、転送プロセス自体がネットワークを構成するという点で `VolumeProvider`（データパスのため core 固定）とは性質が異なる（D-18）。この整理を D-14 の原則（plugin 境界をデータパスに置かない）の例外として認めるかは未確定であり、判断材料（性質の違い・実測されたセットアップ時間への影響なし）のみを記録する |
+| rootless ネットワーク転送（`api-network.md` NET-9） | 例外として認める（2026-10-12 オーナー決定、#340） | ユーザー空間転送（pasta）はデータパス上で動作するプロセスだが、転送は外部ヘルパーのプロセスが担い、core⇔plugin の IPC 往復がデータパスに入るわけではない。この整理を D-14 の原則（plugin 境界をデータパスに置かない）の例外として認める。例外は rootless の経路に限り、rootful の経路（veth・bridge・nftables）は変えない。fandhe-container 側が持つのは pasta の起動・監視（制御面）で、その置き場所は `NetworkPlugin`（制御面）の区分に従う（core と plugin のどちらに置くかは決めていない） |
+| DNS ヘルパー（`api-network.md` NET-5） | 検討中（未確定） | ネットワークごとの DNS ヘルパーはデータパス上で動作するプロセスである。この整理を D-14 の原則（plugin 境界をデータパスに置かない）の例外として認めるかは未確定であり、判断材料（D-18）のみを記録する |
 | supervisor（コンテナごとの監視プロセス、`api-supervisor.md`、D-19） | core | コンテナのライフサイクルに従属する軽量監視プロセスであり、CORE-1 の「中央の常駐デーモンを持たない」への読み替え（D-19）の実装主体そのものである。PLUG-2 の plugin 境界を経由せず実行層コアの一部として動作する（supervisor-model、PoC-17。own n=0 で常駐プロセス 0 個を実機確認） |
 | 複数コンテナ定義の `up`／`down` 等（`api-stack.md`） | 独立した plugin 境界を持たない | `up` は TOML（STACK-1）を解析し、`depends_on` のトポロジカルソート順に core の CLI／ライブラリ API を順に呼ぶオーケストレーションで、別プロセス plugin 境界を持たない（`api-supervisor.md` SUP-1 の監視プロセス起動 API 等。supervisor-model、PoC-17 の `supervisor up` 実装で確認） |
 
-転記元: `docs/spec/04-behavior/plugin-system.md`（submodule リビジョン `2241961`）の境界表。追加分 3（2026-09-23）の 4 行（CDI の適用・OCI hook の実行／DNS ヘルパー・rootless ネットワーク転送／supervisor／複数コンテナ定義の `up`／`down`）を含む。
+転記元: `docs/spec/04-behavior/plugin-system.md`（submodule リビジョン `2241961`）の境界表。追加分 3（2026-09-23）の 4 行（CDI の適用・OCI hook の実行／DNS ヘルパー・rootless ネットワーク転送／supervisor／複数コンテナ定義の `up`／`down`）を含む。「DNS ヘルパー・rootless ネットワーク転送」の行は、2026-10-12 の決定（#340）で rootless ネットワーク転送と DNS ヘルパーの 2 行に分かれた（この 2 行はリビジョン `6d11a69` に合わせた）。
 
 補足:
 
 - CDI の適用・OCI hook の実行（行）は `core（推奨）` の段階であり、未解決疑問点 11 が未決のため確定扱いしない
-- DNS ヘルパー・rootless ネットワーク転送（行）は `検討中（未確定）` であり、D-14 原則の例外とするかは未確定である
+- rootless ネットワーク転送（NET-9）は D-14 の原則の例外として認められた（2026-10-12・#340。rootless の経路に限る）。DNS ヘルパー（NET-5）の行は `検討中（未確定）` のままである
 - GPU-5・7・8・9 は境界表に明示判定がない（[crate-naming.md](design/crate-naming.md) 注 1 を参照）
 
 ## Windows ネイティブコンテナ・Hyper-V 直接方式の MVP スコープ（WIN-6）
@@ -237,6 +238,7 @@ MVP における Windows 対応の主経路は WSL2 経由（WIN-1）である�
 | WIN-6 | Windows ネイティブコンテナは MVP の射程外。Hyper-V 直接方式は将来の強分離オプションとして設計上残す | `api-platform-windows.md` | 本書「Windows ネイティブコンテナ・Hyper-V 直接方式の MVP スコープ（WIN-6）」節を参照 |
 | MAC-4 | 既定は常駐 VM＋軽量プロセス分離とし、1 コンテナ = 1 VM はオプション扱いとする | `api-platform-macos.md` | [macos-vm-strategy.md](design/macos-vm-strategy.md)（TASK-66・#369。内容の確認は #370〔TASK-66.h1〕） |
 | MVM-5 | microVM の 3 OS 展開は Linux（KVM）→ macOS（Hypervisor.framework）の順で進め、Windows（WHP）は将来オプションとする | `api-microvm.md` | 本書へ TASK-78 で追記予定 |
+| NET-9 | rootless ネットワークの外部ヘルパー: pasta を採用（同梱もリンクもせず利用者が導入したものを exec。ポート公開の bind の既定は loopback） | `api-network.md` | [rootless-network.md](design/rootless-network.md)（TASK-147・#340） |
 | REPAIR-11 | モデル規模で自己補修の可否を一律禁止せず、ハーネス（REPAIR-7・REPAIR-12）を通過した変更のみ採用する | `ai-self-repair.md` | [small-model-repair-policy.md](design/small-model-repair-policy.md)（TASK-92。当該メモ自体は #44〔TASK-92.h1〕で再承認待ち） |
 | REPAIR-1 | 19 crate＋`benches` の workspace 構成（crate 分割の前提として本書冒頭の「crate 境界」節が参照する） | `ai-self-repair.md` | [crate-naming.md](design/crate-naming.md)（TASK-1.h1・#9） |
 | CORE-4 | MVP のリソース制限は cgroups v2 単独対応とし、cgroups v1（hybrid 含む）・systemd cgroup driver には対応しない | `api-runtime-core.md` | [cgroups.md](design/cgroups.md)（TASK-34・#166） |

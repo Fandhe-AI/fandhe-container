@@ -170,7 +170,7 @@ TASK-171 の成果物は `crates/supervisor/src/privilege.rs`（仮称）だが�
 
 ## 11. 参照
 
-- [rootless-network.md](./rootless-network.md)（本書と同じ形式のドラフト）
+- [rootless-network.md](./rootless-network.md)（rootless ネットワークの外部ヘルパーの判断記録。起草時は本書と同じ形式のドラフト）
 - [cgroups.md](./cgroups.md)（cgroups v2 単独対応）
 
 ## 12. 未確認事項・再検証条件

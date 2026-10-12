@@ -895,6 +895,7 @@ fn sec_pull_rejects_world_writable_cache_ancestor() {
     let err = puller.pull(&req("alpine:3.20")).expect_err("rejected");
     assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
     assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 0);
+    assert_eq!(fs::read_dir(&shared).expect("read").count(), 0);
 }
 
 /// SEC・OCI-1: キャッシュパスの祖先が利用者所有の symlink なら（解決先が安全でも）拒否する。
@@ -913,4 +914,6 @@ fn sec_pull_rejects_symlinked_cache_ancestor() {
     let err = puller.pull(&req("alpine:3.20")).expect_err("rejected");
     assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
     assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 0);
+    // 拒否前にリンク先（キャッシュ外）へディレクトリ・probe ファイルを作らない。
+    assert_eq!(fs::read_dir(&real).expect("read").count(), 0);
 }

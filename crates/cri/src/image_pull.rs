@@ -611,10 +611,15 @@ pub fn canonical_reference(input: &str) -> Option<String> {
 
 /// キャッシュ配下のディレクトリを 1 要素ずつ作り、既存要素も検証する（SEC・OCI-1）。
 ///
-/// `cache_dir` 自体は（親ごと）作成後に検証する。`components` は `cache_dir` 直下から順に非再帰で作成し
-/// （既存は許容）、各要素について「symlink でない通常ディレクトリ」「呼び出しプロセスと同一所有者」
-/// 「group / other 書き込み権限なし」（Unix）を確認する。検証済みの所有者専用ディレクトリは他ユーザーが
-/// 差し替えられないため、検証後の blob 公開（rename）で未検証の内容が混入する経路を塞ぐ。
+/// 副作用のない検証を作成より先に行う。まず `cache_dir` の既存部分（実在する最も深い祖先まで）を
+/// `symlink_metadata` で辿り、利用者所有の symlink と `..` を拒否する。次にその既存祖先で所有者基準を取得し、
+/// 祖先連鎖を検証してから、足りない要素を検証済みディレクトリの配下へ非再帰で 1 要素ずつ作る。
+/// 検証前に再帰作成や probe ファイルの作成をしないため、他ユーザーが張った symlink 経由で
+/// キャッシュ外にディレクトリ・ファイルが作られない。
+/// `components` は `cache_dir` 直下から順に非再帰で作成し（既存は許容）、各要素について
+/// 「symlink でない通常ディレクトリ」「呼び出しプロセスと同一所有者」「group / other 書き込み権限なし」
+/// （Unix）を確認する。検証済みの所有者専用ディレクトリは他ユーザーが差し替えられないため、検証後の
+/// blob 公開（rename）で未検証の内容が混入する経路を塞ぐ。
 /// 0700 の指定は新規作成時にしか効かないので、既存ディレクトリは必ずここで検証する。
 fn prepare_private_dir(cache_dir: &Path, components: &[&str]) -> Result<PathBuf, PullError> {
     let prep_err = || {
@@ -623,19 +628,19 @@ fn prepare_private_dir(cache_dir: &Path, components: &[&str]) -> Result<PathBuf,
             "failed to prepare the image cache directory",
         )
     };
-    let mut root_builder = fs::DirBuilder::new();
-    root_builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        root_builder.mode(0o700);
+    let (existing, missing) = split_existing_prefix(cache_dir)?;
+    let owner = owner_probe(&existing)?;
+    // `verify_ancestors` は引数の親を起点に検証するため、既存部分の直下の仮想子を渡す。
+    verify_ancestors(&existing.join("child"), owner)?;
+    let mut current = existing;
+    if missing.is_empty() {
+        verify_private_dir(&current, owner)?;
     }
-    root_builder.create(cache_dir).map_err(|_| prep_err())?;
-    let owner = owner_probe(cache_dir)?;
-    verify_private_dir(cache_dir, owner)?;
-    verify_ancestors(cache_dir, owner)?;
-    let mut current = cache_dir.to_path_buf();
-    for name in components {
+    let names = missing
+        .iter()
+        .map(|c| c.as_os_str())
+        .chain(components.iter().map(std::ffi::OsStr::new));
+    for name in names {
         current.push(name);
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut single = fs::DirBuilder::new();
@@ -654,6 +659,66 @@ fn prepare_private_dir(cache_dir: &Path, components: &[&str]) -> Result<PathBuf,
     Ok(current)
 }
 
+/// `cache_dir` を絶対化し、実在する最も深い祖先（またはパス自身）と、その下の未作成要素に分ける。
+///
+/// 辿る途中で `..` と利用者所有（root 以外）の symlink を拒否する（Unix）。何も作成しない。未作成要素が
+/// ある場合、既存祖先が（root 所有の）symlink なら解決先の実体パスにする。
+fn split_existing_prefix(
+    cache_dir: &Path,
+) -> Result<(PathBuf, Vec<std::ffi::OsString>), PullError> {
+    let reject = |message: &'static str| PullError::new(OciErrorCode::FailedPrecondition, message);
+    let absolute = std::path::absolute(cache_dir)
+        .map_err(|_| reject("failed to resolve the image cache directory"))?;
+    let comps: Vec<std::path::Component<'_>> = absolute.components().collect();
+    let mut walked = PathBuf::new();
+    let mut existing = PathBuf::new();
+    let mut existing_len = 0;
+    for (i, component) in comps.iter().enumerate() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(reject(
+                "image cache path must not contain parent components",
+            ));
+        }
+        walked.push(component);
+        match fs::symlink_metadata(&walked) {
+            Ok(meta) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt as _;
+                    if meta.file_type().is_symlink() && meta.uid() != 0 {
+                        return Err(reject("image cache path contains a user-owned symlink"));
+                    }
+                }
+                #[cfg(not(unix))]
+                let _ = &meta;
+                existing = walked.clone();
+                existing_len = i + 1;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => {
+                return Err(reject(
+                    "failed to inspect an image cache ancestor directory",
+                ));
+            }
+        }
+    }
+    let mut missing = Vec::new();
+    for component in &comps[existing_len..] {
+        match component {
+            std::path::Component::Normal(name) => missing.push((*name).to_os_string()),
+            _ => return Err(reject("image cache path has an unexpected component")),
+        }
+    }
+    if !missing.is_empty() {
+        // 未作成要素の親になる既存祖先は symlink を解決して実体の通常ディレクトリであることを要求する。
+        existing = fs::canonicalize(&existing)
+            .map_err(|_| reject("failed to resolve the image cache ancestor directory"))?;
+        if !fs::symlink_metadata(&existing).is_ok_and(|m| m.file_type().is_dir()) {
+            return Err(reject("image cache ancestor is not a plain directory"));
+        }
+    }
+    Ok((existing, missing))
+}
 /// 呼び出しプロセスの実効 UID 相当の値（Unix）。自分が作ったファイルの所有者を読んで得る
 /// （`unsafe` / libc を使わずに実効 UID を得るため）。非 Unix では 0 を返し所有者検査は行わない。
 #[cfg(unix)]

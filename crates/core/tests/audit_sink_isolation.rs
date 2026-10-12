@@ -164,14 +164,31 @@ mod linux {
         )
     }
 
+    /// 成功を期待するケース用の主経路の期限。負荷で子の起動が数百 ms 遅れても期限超過にならない長さ（#1729）。
+    const GENEROUS_LIMIT: Duration = Duration::from_secs(5);
+    /// 停止の検出を検証するケース用の短い主経路の期限。
+    const SHORT_LIMIT: Duration = Duration::from_millis(400);
+
+    /// 成功を期待するケース向け。主経路の期限は `GENEROUS_LIMIT`（停止検出が目的でない試験を負荷から守る。#1729）。
     fn sink(primary: Primary, ok: bool, notify: Notify, marker: PathBuf) -> (FileAuditSink, Seen) {
+        sink_with_limit(primary, ok, notify, marker, GENEROUS_LIMIT)
+    }
+
+    /// 主経路の期限を指定する。停止の検出（期限超過 → `IsolationTimeout`）を検証するケースだけ `SHORT_LIMIT` を渡す。
+    fn sink_with_limit(
+        primary: Primary,
+        ok: bool,
+        notify: Notify,
+        marker: PathBuf,
+        limit: Duration,
+    ) -> (FileAuditSink, Seen) {
         let seen: Seen = Arc::new(Mutex::new(Vec::new()));
         let s = seen.clone();
         let parent = std::process::id();
         let sink = FileAuditSink::isolated_for_test(
             marker.clone(),
             primary,
-            Duration::from_millis(400),
+            limit,
             Arc::new(move || {
                 Box::new(Rec {
                     seen: s.clone(),
@@ -214,6 +231,18 @@ mod linux {
             Duration::from_millis(200),
         );
         (sink, seen)
+    }
+
+    /// 成功を期待する `record`。失敗時は主経路の失敗種別と経過時間を出し、偶発失敗の原因を CI ログから判別できるようにする（#1729）。
+    fn record_expect_ok(sink: &FileAuditSink, seen: &Seen) {
+        let start = Instant::now();
+        if let Err(e) = sink.record(&record()) {
+            panic!(
+                "record failed: {e:?}, primary kinds seen={:?}, took={:?}",
+                seen.lock().unwrap(),
+                start.elapsed()
+            );
+        }
     }
 
     /// 両経路失敗（主経路は `isolation_unavailable`）の通知 1 行（`AuditWriteFailure::write_json_line`）。
@@ -284,7 +313,7 @@ mod linux {
             std::fs::write(path, b"persisted-by-child").map_err(|_| unreachable_err())
         });
         let (sink, seen) = sink(primary, false, Notify::Discard, marker.clone());
-        sink.record(&record()).unwrap();
+        record_expect_ok(&sink, &seen);
         assert_eq!(std::fs::read(&marker).unwrap(), b"persisted-by-child");
         assert_eq!(*seen.lock().unwrap(), vec![]);
         assert_eq!(threads(), 1);
@@ -294,7 +323,13 @@ mod linux {
     /// REPAIR-5・SEC-4・TASK-163: 主経路が無期限に止まっても期限内に代替経路へ進み、スレッドを残さない。
     fn stuck_primary_falls_back_within_the_limit() {
         let primary: Primary = Arc::new(|_, _| hang());
-        let (sink, seen) = sink(primary, true, Notify::Discard, tmp_marker("stuck"));
+        let (sink, seen) = sink_with_limit(
+            primary,
+            true,
+            Notify::Discard,
+            tmp_marker("stuck"),
+            SHORT_LIMIT,
+        );
         let start = Instant::now();
         sink.record(&record()).unwrap();
         let took = start.elapsed();
@@ -314,7 +349,7 @@ mod linux {
             AuditFileWriter::open(Path::new("relative/audit.log")).map(|_| ())
         });
         let (sink, seen) = sink(primary, true, Notify::Discard, tmp_marker("kind"));
-        sink.record(&record()).unwrap();
+        record_expect_ok(&sink, &seen);
         assert_eq!(
             *seen.lock().unwrap(),
             vec![AuditWriteErrorKind::RelativePath]
@@ -521,6 +556,9 @@ mod linux {
     /// 子の結果を結果 pipe で受けるため取り違えない。主経路の成功は代替経路へ回らず（二重記録なし）、失敗種別・
     /// 時間切れ・通知 1 行も届く。時間切れの子は回収済みとして追跡に残らない。
     fn sigchld_ignored_keeps_results_and_records_once() {
+        // 前の試験の影響（子の未回収・スレッド）が残っていないことを明示してから始める（#1729）。
+        wait_single_threaded();
+        wait_unreaped_cleared();
         // 成功: 子が書き、代替経路は呼ばれない。
         let marker = tmp_marker("ign-ok");
         let _ = std::fs::remove_file(&marker);
@@ -529,7 +567,7 @@ mod linux {
         });
         let (sink_ok, seen) = sink(primary, false, Notify::Discard, marker.clone());
         for _ in 0..3 {
-            sink_ok.record(&record()).unwrap();
+            record_expect_ok(&sink_ok, &seen);
         }
         assert_eq!(
             std::fs::read(&marker).unwrap(),
@@ -546,18 +584,19 @@ mod linux {
             Notify::Discard,
             tmp_marker("ign-k"),
         );
-        sink_kind.record(&record()).unwrap();
+        record_expect_ok(&sink_kind, &seen);
         assert_eq!(
             *seen.lock().unwrap(),
             vec![AuditWriteErrorKind::RelativePath]
         );
 
         // 時間切れ: 期限内に戻り、子は追跡に残らない。
-        let (sink_stuck, seen) = sink(
+        let (sink_stuck, seen) = sink_with_limit(
             Arc::new(|_, _| hang()),
             true,
             Notify::Discard,
             tmp_marker("ign-s"),
+            SHORT_LIMIT,
         );
         let start = Instant::now();
         sink_stuck.record(&record()).unwrap();

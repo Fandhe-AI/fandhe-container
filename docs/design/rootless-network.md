@@ -1,19 +1,34 @@
-# rootless ネットワークの外部ヘルパー選択肢（設計ドラフト）
+# rootless ネットワークの外部ヘルパー選択肢（判断記録）
 
-非特権 user namespace（rootless）で host / none 以外のネットワークとポート公開を成立させる方式の選択肢を整理する（NET-9）。
+非特権 user namespace（rootless）で host / none 以外のネットワークとポート公開を成立させる方式の選択肢を整理し、その判断を記録する（NET-9）。
 
-> **位置づけ**: 本書はドラフトであり、採否を確定しない。判断は TASK-147.h1（#340）で行い、本書はその判断材料である。NET-9 は spec 上「検討中」であり、確定扱いしない。
+> **位置づけ**: 本書は 2026-10-12 に #340 で採用を決定した判断記録である。決定の要点は下の「決定」のとおり。NET-9 は spec 上「検討中」のままで、spec 側の更新は spec リポジトリ側の課題として報告済み。
 
 - 対象ビヘイビア: NET-9（Should・検討中。関連: CORE-6・SEC-5・NET-11・NET-6・PLUG-1・ERR-1・REPAIR-5）
 - タスク: TASK-147（MS-8・G10。本書は TASK-147.1・#339。前提は TASK-8〔#26。完了済み〕）
-- 関連 issue: #338（親）・#340（採否判断。人間担当）・#341（採用時の実装・実証。条件付き）
+- 関連 issue: #338（親）・#340（採否判断。2026-10-12 に採用を決定）・#341（実装・実証）
 - 出典: `docs/spec/04-behavior/api-network.md` の `NET-9`・`NET-11`、`01-brainstorm.md` の D-18 論点 3・4・未解決疑問点 11・14、`05-tasks.md` の TASK-147（submodule リビジョン `fd9adc3`。起草時の `984f8a2` から NET-9・NET-11・TASK-147 の記述は変わっていない）。関連: `NET-6`（コンテナ単位のネットワークの既定は `none`。NET-9 の確定後に見直す。2026-10-12 のオーナー決定）。外部事実の出典は 3 章に URL と確認日（2026-10-02）を付す
+
+## 決定（2026-10-12・#340）
+
+オーナーの決定の記録は [#340 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/340#issuecomment-6127294645)。
+
+| 判断事項 | 決定 |
+| -- | ---- |
+| 採否 | 採用する（2 章の選択肢 (a)）。rootless のネットワークは外部ヘルパーによるユーザー空間転送で構成する |
+| 外部ヘルパー | pasta（passt）。同梱もリンクもしない。利用者が導入し、fandhe-container は別プロセスとして exec するだけ |
+| ライセンス | GPL-2.0-or-later のバイナリを、同梱しない・リンクしない・exec のみ、という使い方で使うことを認める。中核のライセンス（Apache-2.0 単独）と、依存を permissive ライセンスに限る規約は変えない。pasta は Cargo の依存ではなく、ビルドにも成果物にも入らない。同梱・再配布はしない（将来する場合は改めて判断する） |
+| D-14 | rootless のユーザー空間転送を例外として認める。転送プロセスがデータパス上に載るのを許すのは rootless の経路に限る。rootful の経路（veth・bridge・nftables）は変えない |
+| フルスクラッチ方針 | 例外として認める。netlink・nftables を自前実装する決定（NET-11）は変えない |
+| ポート公開の bind の既定 | loopback |
+
+spec 側は未更新である。NET-9 は「検討中」のまま、NET-6 の見直しはこれから、D-18 の未解決疑問点 11・14 もそのままで、spec リポジトリ側の課題としてオーナーに報告済み。本書は spec を変更しない。
 
 ## 1. 前提と制約
 
 - 非特権 user namespace ではホストの network namespace での `CAP_NET_ADMIN` がなく、bridge・veth・nftables（NET-1・NET-11 の自前実装）をホスト側に構成できない（CORE-6 と同一の制約）。host / none 以外のネットワークとポート公開にはユーザー空間転送が必要になる
 - 対象は Linux ネイティブの rootless のみ。macOS / Windows は VM 内で rootful 相当のため本書の対象外
-- 根拠 PoC がない。network-bridge-nft（PoC-15）・supervisor-model（PoC-17）は AppArmor 制約（非特権 user namespace の制限）により rootless 経路が未検証で、pasta は未導入・未計測
+- 根拠 PoC がない。network-bridge-nft（PoC-15）・supervisor-model（PoC-17）は AppArmor 制約（非特権 user namespace の制限）により rootless 経路が未検証で、pasta は未導入・未計測だった（PoC の時点。2026-10-12 に pasta 単体の実機確認を行った。3 章）
 - 再検証条件: AppArmor 変更が可能な環境（TASK-8 で調達する環境）での別 PoC（TASK-147 の採用時分岐、#341）
 
 ## 2. 選択肢
@@ -26,28 +41,30 @@ spec D-18 論点 3 の 3 案。spec には「(a) を MVP、(b) を将来」と�
 | (b) | ユーザー空間の TCP/IP 転送を自前実装する | 工数が大きい（8 章）。フルスクラッチ方針とは整合する |
 | (c) | rootless は host / none モード（NET-6）のみ対応する | NET-9（Should）の期待を満たさない。spec 側の判断が必要 |
 
+決定: (a)。外部ヘルパーは pasta。
+
 ## 3. 外部ヘルパー候補の比較
 
 確認日は 2026-10-02。出典に明記されていない項目は「未確認」とし、推測で埋めない。
 
 | 項目 | pasta（passt） | slirp4netns |
 | ---- | -------------- | ----------- |
-| ライセンス | GPL-2.0-or-later（[README](https://passt.top/passt/tree/README.md)・[man](https://passt.top/builds/latest/web/passt.1.html)）。ファイル別の例外は未確認 | GPL-2.0-or-later（[リポジトリ](https://github.com/rootless-containers/slirp4netns)）。依存する libslirp のライセンスは未確認 |
+| ライセンス | GPL-2.0-or-later（[README](https://passt.top/passt/tree/README.md)・[man](https://passt.top/builds/latest/web/passt.1.html)）。ファイル別の例外は、Ubuntu のパッケージの copyright で `checksum.c` が `GPL-2+ and BSD-3-Clause` と確認（実機確認 2026-10-12） | GPL-2.0-or-later（[リポジトリ](https://github.com/rootless-containers/slirp4netns)）。依存する libslirp のライセンスは未確認 |
 | 対象 netns の指定 | `pasta [OPTION]... PID` または `--netns [PATH\|NAME]`。`--netns-only` で user namespace に参加しない | PID 指定で attach（例: `slirp4netns ... <pid> tap0`） |
 | ポート公開 | `-t` / `-u` で `[address[%interface]/]ports`（範囲・変換可）。bind アドレスを指定できる | マニュアル上の API ソケットで管理（詳細な指定構文は未確認） |
 | readiness | `--pid file` が初期化完了後に PID を書く。既定はバックグラウンド化、`--foreground` で前面実行。DHCP・NDP・DHCPv6 を内蔵 | `--ready-fd` 等の有無は未確認 |
 | 終了・後始末 | 対象 netns の消滅（バインドされたパスの削除・プロセス終了）で終了する（`--no-netns-quit` で抑止） | 未確認 |
 | 特権 | 権限・capability なしで動作し、root 動作は user namespace 外では不許可（[about](https://passt.top/passt/about/)） | 非特権を前提とする設計（詳細は未確認） |
 | メンテナンス・配布 | Alpine・Arch・CentOS Stream・Debian・Fedora・Ubuntu 等にパッケージあり。最新リリース日は未確認 | v1.2.x が Active、v1.1.x は EOL（2022-05-02）と README に記載。最新リリース日は未確認 |
-| MAC との関係 | AppArmor・SELinux のプロファイル例が contrib に存在する。Ubuntu の `apparmor_restrict_unprivileged_userns` との関係は未確認 | 未確認 |
+| MAC との関係 | AppArmor・SELinux のプロファイル例が contrib に存在する。Ubuntu の `apparmor_restrict_unprivileged_userns` との関係は、制限が既定の `1` のままでも pasta が自分で namespace を作る形は動いたことを確認（実機確認 2026-10-12）。既存の namespace へ後から付ける形は制限を `0` に緩和した状態でのみ確認し、`1` のままは未確認（#341） | 未確認 |
 | 公開性能 | IPv4 TCP スループットが比較対象の 4〜50 倍（MTU 依存。pasta 側の主張）。独立した検証は未確認 | MTU 65520 で 9.21 Gbps（netns からホスト、README 記載） |
 
-- 自前実測はしていない。性能・常駐メモリ・セットアップ時間は 10 章の計測項目として #340 以降に残す
-- 本表の「未確認」は、#340 の判断前に一次情報（man・リリースページ・ディストリのパッケージ情報）で埋める必要がある
+- 2026-10-12 に実機確認を行った（x86_64 の Linux・Ubuntu 26.04.1 LTS・カーネル 7.0.0-34-generic・KVM の VM・passt `0.0~git20260120.386b5f5-1`）。以下は pasta 単体の参考値で、fandhe-container の製品コードとはつないでいない。セットアップ時間の中央値 39.5 ms（`pasta --config-net -- true` を 10 回）、常駐時の RSS 約 18.6 MB、loopback 越しのスループット 3,430 MiB/s（対照 8,535 MiB/s。python の socket で 1 回だけ計測。iperf3 は未使用）。rootful 比の劣化は未計測。上の公開性能の主張の検証ではない
+- 本表の「未確認」のうち、上記の実機確認で分かった項目は埋めた。残りは一次情報（man・リリースページ・ディストリのパッケージ情報）による確認を #341 で行う
 
 ## 4. フルスクラッチ方針との整合
 
-両論を併記し、結論は出さない（未解決疑問点 14 の外部ヘルパー部分は未決）。
+両論は次のとおり。オーナーは 2026-10-12 に、フルスクラッチ方針の例外として外部ヘルパーを認めた（#340）。NET-11 の決定（netlink・nftables の自前実装。`ip`・`nft` への委譲はしない）は変えない。例外は rootless のユーザー空間転送に限る。
 
 - 整合するとみる論拠: Cargo の依存ではなく外部バイナリの exec である（`from-scratch-policy.md` の依存基準は Cargo 依存が対象）。`newuidmap` / `newgidmap`（SEC-5）と同型の外部コマンド利用という整理が D-18 に記録されている
 - 整合しないとみる論拠: NET-11 は `ip`・`nft` コマンドへの委譲を、フルスクラッチ方針（決定 2）を理由に不採用とした。外部コマンドへの委譲を netlink では退け rootless では認める場合、線引きの説明が要る。`newuidmap` は特権ヘルパーとしてカーネル機能の補完に限られるのに対し、pasta はデータパス上の転送を担う点で性質が異なる
@@ -55,20 +72,28 @@ spec D-18 論点 3 の 3 案。spec には「(a) を MVP、(b) を将来」と�
 
 ## 5. ライセンス・配布
 
-- 外部バイナリは `cargo deny` の対象外（[licensing](../../.claude/rules/licensing.md)「非 Cargo 資産」）。導入時に手動確認が要る
-- 候補はいずれも GPL-2.0-or-later（3 章）。本書はライセンス判断をしない。次はユーザー判断事項として #340 に挙げる
-  - 別プロセスとして exec するだけ（リンク・同梱なし。利用者が別途導入）の場合の扱い
-  - バイナリを同梱・再配布する場合の扱い（ソース提供義務・帰属表示の要否。Apache-2.0 単独の中核との関係）
-  - コピーレフトのコードをリンク・流用しない前提の確認
+- 外部バイナリは `cargo deny` の対象外（[licensing](../../.claude/rules/licensing.md)「非 Cargo 資産」）
+- 候補はいずれも GPL-2.0-or-later（3 章）。2026-10-12 のオーナー決定（#340）で、次のとおりとした
+  - 別プロセスとして exec するだけ（リンク・同梱なし。利用者が別途導入）での利用を認める
+  - 同梱・再配布はしない。する場合は改めて判断する（ソース提供義務・帰属表示の要否を含む）
+  - コピーレフトのコードをリンク・流用しない前提は変えない
+  - 帰属表示: 同梱・再配布をしない前提では、fandhe-container の配布物側に帰属表示・ソース提供は生じない、と整理する（法的な断定ではない）
 
 ## 6. D-14 との関係
 
 - D-14 は「データパスに plugin 境界を置かない」原則。rootful 構成ではパケットがカーネル（veth・bridge・nftables）を通り、plugin が担うのは制御面のみで整合する
-- rootless のユーザー空間転送は転送プロセス自体がデータパス上にある。IPC 往復がデータパスに入るのとは性質が異なる、という整理案が D-18 に記録されているが、例外として認めるかは未解決疑問点 11 のとおり未決である
-- 関連: `docs/architecture.md`（境界表の NET-5・NET-9 行は「検討中」）、[crate-naming.md](crate-naming.md)（net crate の PLUG-1 区分が検討中）。本書は未確定のまま記録する
+- rootless のユーザー空間転送は転送プロセス自体がデータパス上にある。IPC 往復がデータパスに入るのとは性質が異なる、という整理案が D-18 に記録されている。オーナーは 2026-10-12 に例外として認めた（#340）。例外は rootless の経路に限る。spec 側の未解決疑問点 11 の更新は spec リポジトリ側の課題
+- 関連: `docs/architecture.md`（境界表の NET-5・NET-9 行は「検討中」）、[crate-naming.md](crate-naming.md)（net crate の PLUG-1 区分が検討中）。`docs/architecture.md` の境界表と `crate-naming.md` の記述は spec のステータスに従っており、spec の更新後に追従する
 
-## 7. 採用する場合の実装方針・工数概略
+## 7. 採用時の実装方針・工数概略（#341 の範囲）
 
+- 決定した構成: pasta を利用者が導入し、fandhe-container は `crates/net` から別プロセスとして exec する。同梱・リンクはしない。ポート公開の bind の既定は loopback
+- 実装で守る点:
+  - pasta の既定（`auto`）と、アドレスを省いた明示の指定は、ホストの全アドレスでポートを開く。loopback を既定にするには待ち受けアドレスを必ず明示する
+  - `-t none` と明示のポートは併用できない。明示の `-t` に `-u none -T none -U none` を足す
+- まだ確かめていない点（#341）: 制限 `1` のまま既存の namespace へ後から付ける形、IPv6、`--netns <パス>` の指定、`-T none -U none` を付けたときの名前解決、常駐時の PSS、rootful 比のスループット劣化
+- AppArmor の補足: Ubuntu 26.04 では `sleep` の実体が pasta の AppArmor プロファイルの exec 規則の外にあり、pasta から直接は起動できなかった。`sh -c` を挟めば動いた（実機確認 2026-10-12）
+- #341 の実証範囲: rootless の経路で host / none 以外のネットワーク構成（ポート公開を含む）が実機で成り立つこと（NET-9）。実装の issue（`crates/net` から pasta を起動する部分）は未起票
 - 配置案: `crates/net` 内にヘルパー起動・監視モジュールを置く（`NetworkPlugin` は plugin 側であり、実際の配置は PLUG-1 の判断に従う）。ヘルパーの寿命は supervisor のコンテナ寿命に連動させ、コンテナ終了時に確実に回収する
 - ヘルパー探索: 絶対パス指定または opt-in の探索のみとし、所有者・権限・版数を検証する（9 章）
 - ポート公開指定の変換: 利用者入力を検証してから `-t` / `-u` 相当の引数配列へ変換する。シェルを介さない
@@ -84,6 +109,8 @@ spec D-18 論点 3 の 3 案。spec には「(a) を MVP、(b) を将来」と�
 
 ## 8. 不採用の場合の実装方針・工数概略
 
+不採用としなかったため、本章は判断時の比較の記録として残す。
+
 - (c) host / none のみ対応: rootless で bridge 等が指定された場合は、作成前に ERR-1 形式のエラーで拒否し、制約をドキュメントに明記する。工数は小（概算で 0.5 人日未満）。NET-9（Should）の期待を満たさないため、spec 側の扱い変更の判断が必要で、ユーザー報告対象とする
 - (b) 自前実装を将来課題とする: TCP/IP スタック相当のユーザー空間転送が必要で、2 人日を大きく超える見込み。別タスク化と spec 側への反映が必要
 - いずれの場合も、spec の修正は本リポから行わず、ユーザーへ報告する
@@ -93,24 +120,24 @@ spec D-18 論点 3 の 3 案。spec には「(a) を MVP、(b) を将来」と�
 | 観点 | 要件 |
 | ---- | ---- |
 | インジェクション | ポート公開・アドレス等の利用者入力を検証し、引数配列で exec する（NET-12 と同じ ERR-1 方針） |
-| アクセス制御 | ヘルパーは user namespace 内の非特権で動かし、setuid を要求しない。ポート公開の bind アドレスを既定で全インターフェースへ開かない方針を 10 章で判断する |
+| アクセス制御 | ヘルパーは user namespace 内の非特権で動かし、setuid を要求しない。ポート公開の bind アドレスを既定で全インターフェースへ開かない。既定は loopback（2026-10-12 の決定）。pasta はアドレスを省くと全アドレスで開くため、待ち受けアドレスを必ず明示する |
 | 不安全な設計 | 起動・readiness 待ちにタイムアウト（REPAIR-5）。不在・版不一致・異常終了は fail-closed。コンテナ終了時に回収する |
 | 完全性 | ヘルパーは絶対パス・所有者・権限を検証し、信頼できない `PATH` の暗黙探索をしない（PLUG-11 の opt-in 方針に倣う）。対応版数を固定する |
 | サプライチェーン | `cargo deny` で検出できないため、ライセンス・脆弱性への追随を手動で確認する運用が必要 |
 | 監査 | 起動失敗・分離違反の試行を構造化ログ・監査ログへ記録する（SEC-4・REPAIR-4） |
 
-## 10. 判断に必要な項目（#340 への入力）
+## 10. 判断した項目（#340）
 
-1. 採否（2 章の (a)・(b)・(c)）と、NET-9 の spec 上の扱い
-2. ライセンス・帰属表示の判断（5 章）
-3. D-14 の例外として認めるか（6 章。未解決疑問点 11）
-4. ヘルパーを同梱するか、利用者導入とするか。候補は pasta・slirp4netns のどちらにするか
-5. ポート公開の bind アドレスの既定方針
-6. 実機で確認する計測項目: rootful 比のスループット劣化・セットアップ時間・常駐 RSS（CORE-7〜9）、および 3 章の未確認項目の一次情報による確認
+1. 採否（2 章の (a)・(b)・(c)）と、NET-9 の spec 上の扱い: (a) を採用した。NET-9 の spec 上の扱い（「検討中」のまま）は spec リポジトリ側の課題
+2. ライセンス・帰属表示の判断（5 章）: exec のみでの利用を認めた。同梱・再配布をしない前提では帰属表示は生じない、と整理した。法的な断定ではない
+3. D-14 の例外として認めるか（6 章。未解決疑問点 11）: rootless のユーザー空間転送に限り認めた。spec 側の疑問点 11 の更新は spec リポジトリ側の課題
+4. ヘルパーを同梱するか、利用者導入とするか。候補は pasta・slirp4netns のどちらにするか: 利用者導入とし、pasta を採用した。同梱はしない
+5. ポート公開の bind アドレスの既定方針: loopback とした
+6. 実機で確認する計測項目: 2026-10-12 の実機確認で、pasta 単体の参考値（セットアップ時間の中央値 39.5 ms・常駐 RSS 約 18.6 MB・loopback 越しのスループット 3,430 MiB/s〔対照 8,535 MiB/s〕）を得た。製品コードとはつないでいない。rootful 比のスループット劣化・常駐 PSS は未計測で、3 章の未確認項目の一次情報による確認とともに #341 に残す
 
 ## 11. 見直し条件
 
-- #340 の決定後、本書を判断記録へ更新する（ドラフトの注記を外す）
+- 2026-10-12 に判断記録へ更新した
 - NET-9・未解決疑問点 11・14 が spec 側で更新された場合は追従する
-
-> 再掲: 本書はドラフトであり採否を確定しない。判断は TASK-147.h1（#340）で行う。
+- NET-6 の既定の見直しが spec 側で決まった場合は追従する
+- pasta を同梱・再配布することにした場合は、ライセンスの判断をやり直す

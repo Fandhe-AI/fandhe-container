@@ -114,9 +114,7 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 
 ## 承認待ち（後続 Phase）
 
-現在なし。
-
-- #1521（macOS 27 対応の `objc2-virtualization` への更新）はリリース待ちで保留中。採用・更新範囲は未決定
+- #1521（macOS 27 対応の `objc2-virtualization` への更新）: 保留中（リリース待ち）。採用・更新範囲は未決定で、承認の依頼は出していない
 
 ## MoltenVK の動的ロード（自前 dlopen ラッパー）
 

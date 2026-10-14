@@ -19,7 +19,15 @@ I/O 共有層の SIGKILL 耐性試験（`crates/io/tests/crash_safety.rs`）を�
 
 - 有効試行: 所定の ACK を観測したうえで SIGKILL によりサーバーが終了した試行。それ以外は無効試行として数え直す
 - 目標は有効 10 回、試行上限は 30 回（`trial.rs` の `TARGET_VALID_TRIALS` / `MAX_ATTEMPTS`）
-- 集計は `crash_summary`、試行ごとの記録は `crash_trial` として、いずれも stderr に JSON 1 行で出る（`crash_trial` には `sink` を含む）。`cargo test` は既定で出力を捕捉するため、CI ログには件数が出ず、ローカルで `--nocapture` を付けて取得する
+- 集計は `crash_summary`、試行ごとの記録は `crash_trial` として、いずれも stderr に JSON 1 行で出る（`crash_trial` には `sink` を含む）。`cargo test` は既定で出力を捕捉するため、件数の取得は環境変数 `FANDHE_CONTAINER_CRASH_SUMMARY_DIR`（#1833）で行う。指定したディレクトリへ `crash_summary` 行を `<case>.json`（case は `flushed`・`deferred_unflushed`・`deferred_flushed`）として排他作成（0600）で書く。FLUSH ACK 非対応環境でも同じ形式で `persist_supported:false` が出る。CI の `platform-ci` は「結合試験の実行」の後の「crash_safety 件数の集計」ステップで `make crash-summary-check` を実行し、検証した結果を `GITHUB_STEP_SUMMARY` に表で出す。
+
+  ローカル手順（ディレクトリは毎回新規にする。排他作成のため既存ファイルがあるとテストが失敗する）:
+
+  ```bash
+  d="$(mktemp -d)"
+  FANDHE_CONTAINER_CRASH_SUMMARY_DIR="$d" cargo test -p fandhe-container-io --features crash-test-server --test crash_safety
+  make crash-summary-check CRASH_SUMMARY_DIR="$d" CRASH_SUMMARY_OS=Linux
+  ```
 
 ### 相手役 sink（`DeferredPersistSink`）
 
@@ -111,7 +119,7 @@ test unix::io3_unflushed_control_records_loss_without_asserting ... ok
 test other::io3_crash_test_server_reports_unsupported_platform ... ok
 ```
 
-- 推論: ubuntu と macOS の合格は、アサーションにより「有効 10 回・損失 0」が成立したことを意味する。ただし件数そのものは CI ログに出ないため、直接は観測していない。macOS の永続化対応判定（`PersistSupport`）が `SupportedFileSync` で true になることはコード上の事実だが、macOS の実 FS での挙動は本書の実測範囲外である
+- 推論: ubuntu と macOS の合格は、アサーションにより「有効 10 回・損失 0」が成立したことを意味する。ただし本書の実測時点では件数が CI に出ず、直接は観測していなかった（#1833 で CI の実行結果の要約に出るようにした。以降の値は各 run の要約を参照）。macOS の永続化対応判定（`PersistSupport`）が `SupportedFileSync` で true になることはコード上の事実だが、macOS の実 FS での挙動は本書の実測範囲外である
 - 事実: Windows は UDS 未対応のため、非対応プラットフォームとして終了コード 5 を返す契約の確認だけを行っており、SIGKILL 耐性は検証していない
 
 ## spec の PoC（node4）との比較
@@ -131,5 +139,5 @@ test other::io3_crash_test_server_reports_unsupported_platform ... ok
 
 - 解消（#1832）: 未フラッシュ対照が損失 0 で対照として働かない点は、試験専用 sink を相手役にした 2 ケースの対へ作り直して解消した。この対照で示せる範囲は上記「この対照で示せる範囲」のとおり
 - 未解決: 結果として tmpfs と実 FS のどちらを採用するか（本実測では差が出ていない）
-- 未解決: macOS の件数を CI 上で直接観測する仕組み（`--nocapture` 化・アーティファクト保存）を設けるか（有効試行数・損失件数を CI の実行結果へ出す件は別 issue で追跡）
+- 解消（#1833）: 有効試行数・損失件数を CI の実行結果（`GITHUB_STEP_SUMMARY`）へ出す仕組みを設けた。macOS の件数は main への push 後の `platform-ci (macos-latest)` の要約で確認できる。FLUSH ACK 非対応時は `persist_supported:false` が表と警告に出る
 - 未解決: 電源断・カーネルクラッシュ後の媒体永続化（IO-2）の検証をどのタスクで扱うか（追跡は [#1965](https://github.com/Fandhe-AI/fandhe-container/issues/1965)）

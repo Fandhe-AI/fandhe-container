@@ -71,6 +71,10 @@ cat <<'EOF'
                                         scripts/lib.sh の workspace 判定の回帰テスト（bash 3.2 を含む。一時ディレクトリのみ）
   commit-msg-line-length-selftest     scripts/check-commit-msg-line-length-selftest.sh
                                         commit-msg 行長検査スクリプトの自己テスト（Issue #1295・REPAIR-12）
+  crash-summary-check                 scripts/check-crash-summary.sh
+                                        crash_safety の件数サマリーを検証し表で出す（#1833・IO-3。CRASH_SUMMARY_DIR 必須・CRASH_SUMMARY_OS 任意）
+  crash-summary-check-selftest        scripts/with-tools.sh jq scripts/check-crash-summary-selftest.sh
+                                        crash-summary-check の自己テスト（#1833・IO-3・REPAIR-12。fixture のみ）
   vz-virtio-gpu-guest-check-selftest  poc/vz-custom-virtio-gpu/guest/check-virtio-gpu-selftest.sh
                                         virtio-gpu ゲスト側確認スクリプトの自己テスト（TASK-172.6・GPU-6・REPAIR-12。fixture のみ）
   third-party-licenses-selftest       scripts/generate-third-party-licenses-selftest.sh

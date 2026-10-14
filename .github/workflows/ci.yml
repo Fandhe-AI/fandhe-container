@@ -289,6 +289,8 @@ jobs:
   # `--test '*'` の glob は feature が欠けると黙って除外する（fail-open）。
   # そこで「crash_safety の存在確認」ステップを置き、ビルド・確認・実行の 3 箇所が
   # 同一の INTEGRATION_TEST_FEATURES を参照する形で feature 欠落を検出する。
+  # 件数（有効 / 無効の試行数・損失）は「結合試験の実行」直後の「crash_safety 件数の集計」ステップが
+  # 実行結果の要約に出す（#1833）。
   # rust-ci（ubuntu）と本ジョブの macOS・Windows の `--all-features` ステップでも
   # 同テストは重複して実行される。
   #
@@ -663,6 +665,9 @@ jobs:
           # 前段ステップの outputs も `${{ }}` を run: へ直接埋め込まず env 経由で
           # 受け渡す（HANG_PROBE と同じスクリプトインジェクション対策）
           COUNT: ${{ steps.count.outputs.count }}
+          # crash_safety（IO-3）が件数サマリーを書く出力先（#1833）。このステップだけに渡す（ジョブ全体の
+          # env に置くと macOS・Windows の `--all-features` ステップが同じディレクトリへ書き、排他作成が衝突する）
+          FANDHE_CONTAINER_CRASH_SUMMARY_DIR: ${{ runner.temp }}/crash-summary
         run: |
           set -euo pipefail
           if [ "${HANG_PROBE}" = "true" ]; then
@@ -674,9 +679,27 @@ jobs:
             echo "::notice::integration test targets: 0 (nothing to run)"
             exit 0
           fi
+          # -p なしの mkdir: 既存ディレクトリなら失敗させ、前回の残りを混ぜない
+          mkdir "${FANDHE_CONTAINER_CRASH_SUMMARY_DIR}"
           cargo test --workspace --test '*' --features "${INTEGRATION_TEST_FEATURES}"
           # crash_test_server bin 内のユニットテスト（--test '*' の対象外）も実行する
           cargo test -p fandhe-container-io --bins --features crash-test-server
+
+      # crash_safety の件数サマリー（有効 / 無効の試行数・損失件数）を実行結果に出す（#1833・IO-3・REPAIR-4）。
+      # 直前のステップが書いた JSON を scripts/check-crash-summary.sh が fail-closed で検証する
+      # （期待ケースの欠落・型不正は失敗。Windows は UDS 未対応でケース 0 件を確認する）。新ジョブにせず
+      # 既存ジョブのステップとする（check-run 件数は不変）。値は env 経由で受け渡す
+      # !cancelled() を明示するのは、前段の cargo test が失敗しても保存済みの件数を集計するため
+      # （暗黙の success() だと失敗時に集計が飛ぶ）。元の試験失敗の結論は前段ステップが維持する
+      - name: crash_safety 件数の集計（IO-3・#1833）
+        if: ${{ !cancelled() && steps.count.outputs.count != '0' && env.HANG_PROBE != 'true' }}
+        timeout-minutes: 5
+        env:
+          FANDHE_CONTAINER_CRASH_SUMMARY_DIR: ${{ runner.temp }}/crash-summary
+          OS_NAME: ${{ runner.os }}
+        run: |
+          make crash-summary-check \
+            CRASH_SUMMARY_DIR="${FANDHE_CONTAINER_CRASH_SUMMARY_DIR}" CRASH_SUMMARY_OS="${OS_NAME}"
 
       # PLUG-4 判定スクリプト（scripts/check-plug4-core-invariance.sh）の自己テスト（TASK-109.4・REPAIR-12）。
       # 判定本体は bench-regression（ubuntu 単独）で走るが、`make plug4-core-invariance` は開発者が各 OS で
@@ -744,6 +767,14 @@ jobs:
         if: env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: make commit-msg-line-length-selftest
+
+      # crash_safety 件数サマリー検証スクリプト（scripts/check-crash-summary.sh）の自己テスト（#1833・IO-3・REPAIR-12）。
+      # 合成 fixture と jq だけを使う。BSD と Windows のシェルでのツール差を確かめるため 3 OS で回す。
+      # 既存ジョブのステップ（check-run 件数は不変）
+      - name: crash-summary 検査スクリプトの自己テスト（#1833・REPAIR-12。ubuntu・macos・windows）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make crash-summary-check-selftest
 
       # scripts/lib.sh の workspace 判定（has_members 等）の回帰テスト（PR #1756 の指摘）。一時ディレクトリだけを
       # 使う。Makefile の cargo 系ターゲットの skip 判定を担うため、macOS（/bin/bash 3.2 も回す）・Windows の

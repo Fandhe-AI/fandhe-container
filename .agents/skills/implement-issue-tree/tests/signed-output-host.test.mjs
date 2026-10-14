@@ -14,6 +14,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { trackTmp } from './lib/tmp-track.mjs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -43,7 +44,7 @@ const SLICE_EXPORTS = [
   'SCRIPT_SHA256',
   'RESIDUAL_BYTE_MEASURE_MAX_RETRIES',
 ]
-const sliceDir = mkdtempSync(join(tmpdir(), 'iit-signed-host-'))
+const sliceDir = trackTmp(mkdtempSync(join(tmpdir(), 'iit-signed-host-')))
 let sliceSeq = 0
 // args を差し替えて別の定義部スライスを import する（skillDir は import 時に確定する定数のため）
 async function importSlice(argsValue) {
@@ -229,7 +230,7 @@ function runningAgent(onResult, mutateCommand = (c) => c) {
 }
 
 test('結合: 実スクリプトの出力を転記すると受理され、du / df の実測値になる', async () => {
-  const work = mkdtempSync(join(tmpdir(), 'iit-e2e-'))
+  const work = trackTmp(mkdtempSync(join(tmpdir(), 'iit-e2e-')))
   try {
     const dirs = ['wt one', 'wt-two'].map((n) => {
       const d = join(work, n)
@@ -249,7 +250,7 @@ test('結合: 実スクリプトの出力を転記すると受理され、du / d
 })
 
 test('結合: 実スクリプトの出力を転記後に kib を書き換えると拒否される（再測定でも改竄が続けば null）', async () => {
-  const work = mkdtempSync(join(tmpdir(), 'iit-e2e-'))
+  const work = trackTmp(mkdtempSync(join(tmpdir(), 'iit-e2e-')))
   try {
     const d = join(work, 'wt')
     mkdirSync(d)
@@ -262,7 +263,7 @@ test('結合: 実スクリプトの出力を転記後に kib を書き換える�
 })
 
 test('結合: 期待ハッシュと合わないスクリプト（版ずれ）は launcher が起動せず、出力が無いので null（fail-closed）', async () => {
-  const work = mkdtempSync(join(tmpdir(), 'iit-e2e-'))
+  const work = trackTmp(mkdtempSync(join(tmpdir(), 'iit-e2e-')))
   try {
     const d = join(work, 'wt')
     mkdirSync(d)
@@ -339,7 +340,7 @@ test('S2: 件数は同じで別のパスを測った封筒（正しい nonce・�
 })
 
 test('S2 結合: エージェントがコマンド中のパスを 1 文字変えて実行した出力は、実スクリプトの正しい封筒でも拒否される', async () => {
-  const work = mkdtempSync(join(tmpdir(), 'iit-e2e-'))
+  const work = trackTmp(mkdtempSync(join(tmpdir(), 'iit-e2e-')))
   try {
     const dirs = ['wt-one', 'wt-two'].map((n) => {
       const d = join(work, n)
@@ -361,7 +362,7 @@ test('S2 結合: エージェントがコマンド中のパスを 1 文字変え
 })
 
 test('S2 結合: free-disk のパスを変えて実行した出力も拒否され、変えなければ受理される', async () => {
-  const work = mkdtempSync(join(tmpdir(), 'iit-e2e-'))
+  const work = trackTmp(mkdtempSync(join(tmpdir(), 'iit-e2e-')))
   try {
     const d = join(work, 'main-wt')
     mkdirSync(d)
@@ -477,12 +478,16 @@ async function runDriver(args) {
   return { error, calls }
 }
 
-test('起動時: 残置バイト軸が有効（既定）で dryRun でないランは、skillDir 未指定ならエージェントを 1 回も呼ばずエラーで停止する', async () => {
-  const { error, calls } = await runDriver({ parent: 1 })
-  assert.ok(error, 'エラーで停止する')
-  assert.match(error.message, /args\.skillDir にはスキルディレクトリ.*絶対パスを渡す/)
-  assert.match(error.message, /dryRun: true か maxResidualWorktreeBytes: 0/)
-  assert.deepEqual(calls, [])
+// #603 第 2 弾: monitor の観測スクリプト（observe-pr.sh）が残置バイト軸の有無に関わらず使われるため、dryRun でないラン
+// （= 実エージェントを起動するラン）は、バイト軸を 0 でオプトアウトしていても skillDir が要る。
+test('起動時: dryRun でないランは、既定でもバイト軸オプトアウトでも、skillDir 未指定ならエージェントを 1 回も呼ばずエラーで停止する', async () => {
+  for (const args of [{ parent: 1 }, { parent: 1, maxResidualWorktreeBytes: 0, maxResidualWorktrees: 0 }]) {
+    const { error, calls } = await runDriver(args)
+    assert.ok(error, `エラーで停止する: ${JSON.stringify(args)}`)
+    assert.match(error.message, /args\.skillDir にはスキルディレクトリ.*絶対パスを渡す/)
+    assert.match(error.message, /省略できるのは dryRun: true のときだけ/)
+    assert.deepEqual(calls, [])
+  }
 })
 
 test('起動時: skillDir の形式不正は、他の引数より先に起動時エラーになる（dryRun・バイト軸オプトアウトでも）', async () => {
@@ -493,8 +498,8 @@ test('起動時: skillDir の形式不正は、他の引数より先に起動時
   }
 })
 
-test('起動時: dryRun: true または maxResidualWorktreeBytes: 0 のランは skillDir を省略できる（測定スクリプトを使わない）', async () => {
-  for (const args of [{ parent: 1, dryRun: true }, { parent: 1, maxResidualWorktreeBytes: 0, maxResidualWorktrees: 0 }]) {
+test('起動時: dryRun: true のランは skillDir を省略できる（スクリプトを使うエージェントを起動しない）', async () => {
+  for (const args of [{ parent: 1, dryRun: true }]) {
     const { error } = await runDriver(args)
     assert.ok(!error || !/skillDir/.test(error.message), `${JSON.stringify(args)}: ${error?.message}`)
   }

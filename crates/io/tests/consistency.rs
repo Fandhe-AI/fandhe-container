@@ -43,7 +43,8 @@
 //! が書き込む先のファイルに対して、呼び出し側（ホスト側）が
 //! `std::fs::rename` / `File::set_len` を実行する操作**と定義する。
 //!
-//! 操作は決定的な静止点でのみ行う。セッション境界の操作
+//! 操作は決定的な静止点でのみ行う（静止点を作らない交錯は後述の
+//! [`interleave`]〔TASK-14 追補・#1830〕が担う）。セッション境界の操作
 //! （[`rename_truncate::run_session`](rename_truncate)）は `serve_connection`
 //! の join 後（内部の [`fandhe_container_io::AppendFileSink`] が確実に閉じた
 //! 後）、ライブセッション中の操作（[`rename_truncate::LiveSession`]）は
@@ -102,7 +103,13 @@
 //! OS 差の前提は置かない。[`write_failure`]（TASK-14 追補・#1829）の 5 件
 //! （W1〜W5）は実ファイルへの書き込み失敗で部分レコードが ACK されないことを
 //! 確認し、3 OS で動く（W3 の `/dev/full` ケースだけ Linux 限定で `cfg` により
-//! コンパイル対象を分ける。skip ではない。合計 42 件〔Linux。他 OS は 41 件〕）。
+//! コンパイル対象を分ける。skip ではない）。[`interleave`]（TASK-14 追補・#1830）の
+//! 6 件（I1〜I6）は `BatchSink` ラッパーで `write_batch` の前・サブバッチの間・
+//! 後（ACK 送出前）に rename・`set_len` を差し込み、barrier で書き込みと rename を
+//! 同時に解放する反復も行う（静止点を作らない交錯）。差し込めない位置（1 回の
+//! `AppendFileSink::write_batch` 内のフレーム間）と成り立つ条件の表は
+//! [`interleave`] のモジュール doc に記す。3 OS で動く。合計 48 件〔Linux。他 OS は
+//! 47 件〕。
 
 #[path = "consistency/harness.rs"]
 mod harness;
@@ -121,3 +128,6 @@ mod concurrent_read;
 
 #[path = "consistency/write_failure.rs"]
 mod write_failure;
+
+#[path = "consistency/interleave.rs"]
+mod interleave;

@@ -46,7 +46,8 @@
 #
 # --from-json と run モードの契約（IO-8 の計測条件をベンチ名と一致させる）:
 #   変換対象の fio JSON は run モードと同じ条件で実行されたものだけを受け付ける。
-#   `jobs` はちょうど 1 件（--group_reporting）・`jobname` は `fandhe-fio-randwrite-4k`・
+#   `jobs` はちょうど 1 件（--group_reporting=1。値なしの --group_reporting は実 fio 3.36 が
+#   job options に出さないため拒否する。#1825・#1924）・`jobname` は `fandhe-fio-randwrite-4k`・
 #   `error` は 0 で、`global options` と `job options` を合わせた fio オプションは
 #   run モードが渡すものと同じ集合（name・directory・filename・rw・bs・ioengine・direct・
 #   size・runtime・iodepth・numjobs・end_fsync・group_reporting）に限る（time_based は
@@ -629,10 +630,11 @@ def fio_runtime_secs:
   | if $c == null then null else ($c.n | tonumber) end
   end;
 
-# 値なしフラグ（group_reporting）: fio は値なしを空文字列で記録する。
-# `=1` は有効、`=0` は無効化なので拒否する。
+# 値つきフラグ（group_reporting）: 実 fio 3.36 は値なしの `--group_reporting` を
+# `job options` に出さない（#1825 の実測）。値つきの `--group_reporting=1` だけが
+# "1" で記録される。`=0` は無効化、空文字列を出す版の一次情報は無いので、"1" のみ許可する。
 def fio_flag_enabled:
-  (type == "string") and (. == "" or . == "1");
+  (type == "string") and (. == "1");
 
 ($ff[0]) as $doc
 | if ($ff | length) != 1 then error("fio output must contain exactly one JSON document") else . end
@@ -647,7 +649,7 @@ def fio_flag_enabled:
     error("unsupported fio version \($fv): fio 3.x or later is required (lat_ns/clat_ns output keys)")
   else . end
 | if (($doc.jobs | type) != "array") or (($doc.jobs | length) != 1) then
-    error("fio output must contain exactly one entry in \"jobs\" (run with --group_reporting and a single job section)")
+    error("fio output must contain exactly one entry in \"jobs\" (run with --group_reporting=1 and a single job section)")
   else . end
 | ($doc.jobs[0]) as $job
 | if (($job | type) != "object") then error("jobs[0] must be an object") else . end
@@ -715,7 +717,7 @@ def fio_flag_enabled:
     error("fio option end_fsync must be \"1\" (got \($o.end_fsync | tojson))")
   else . end
 | if (($o.group_reporting | fio_flag_enabled) | not) then
-    error("fio option group_reporting must be enabled (got \($o.group_reporting | tojson))")
+    error("fio option group_reporting must be \"1\" (got \($o.group_reporting | tojson)); the key is absent when fio is run with a bare --group_reporting, so re-run fio with --group_reporting=1")
   else . end
 | if ($o.direct != $expect.direct) then
     error("fio option direct must match --direct \($expect.direct) (got \($o.direct | tojson))")
@@ -1041,7 +1043,9 @@ fio_args=(
   --iodepth="$iodepth"
   --numjobs="$numjobs"
   --end_fsync=1
-  --group_reporting
+  # 値なしの --group_reporting は実 fio が job options に記録せず、実行条件の照合が
+  # 通らないため、値つきで渡す（#1924）
+  --group_reporting=1
   --output-format=json
   --output="$fio_out_json"
 )

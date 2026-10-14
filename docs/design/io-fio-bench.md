@@ -51,20 +51,20 @@ fandhe 経路（共有マウント）の計測は、共有マウントが公開�
 fio --name=fandhe-fio-randwrite-4k --directory=/path/to/target \
     --filename=fandhe-fio-randwrite-4k.dat --rw=randwrite --bs=4k --ioengine=psync \
     --direct=1 --size=256m --runtime=30 --iodepth=1 --numjobs=1 \
-    --end_fsync=1 --group_reporting --output-format=json --output=/tmp/fio-out.json
+    --end_fsync=1 --group_reporting=1 --output-format=json --output=/tmp/fio-out.json
 bash scripts/fio-randwrite-4k.sh --from-json /tmp/fio-out.json --label docker_bind_mount
 ```
 
 `--from-json` は run モードと同じ条件で実行された fio JSON だけを受け付ける（IO-8: `fio_randwrite_4k_*` の名前で出す結果は 4K ランダム write の条件で計測されたものに限る）。照合内容は次のとおりで、1 つでも満たさなければ終了コード 2 で拒否する。
 
-- `jobs` はちょうど 1 件（`--group_reporting` を付け、ジョブセクションは 1 つ）、`jobname` は `fandhe-fio-randwrite-4k`、`error` は 0
+- `jobs` はちょうど 1 件（`--group_reporting=1` を付け、ジョブセクションは 1 つ）、`jobname` は `fandhe-fio-randwrite-4k`、`error` は 0
 - `global options` と `jobs[0]["job options"]` を合わせた（job 側を優先した）fio オプションは、run モードが渡すもの（`name`・`directory`・`filename`・`rw`・`bs`・`ioengine`・`direct`・`size`・`runtime`・`iodepth`・`numjobs`・`end_fsync`・`group_reporting`）に限る。これ以外のオプション（`time_based`・`rate_iops`・`fsync`・`percentile_list` 等）が 1 つでもあれば拒否する（`time_based` は下記「総書き込み量と runtime」のとおり総書き込み量の上限を無効にするため）。`job options` が無い JSON も拒否する
 - 上記 13 項目はすべて必須で、1 つでも欠ければ拒否する（値があるときだけ照合する項目は置かない）。`global options` は fio が空のとき出力しないため省略可だが、存在する場合はオブジェクトでなければ拒否する
-- 固定値: `name=fandhe-fio-randwrite-4k`・`rw=randwrite`・`bs=4k`（`4k`/`4K`/`4096`）・`ioengine=psync`・`filename=fandhe-fio-randwrite-4k.dat`・`end_fsync=1`・`group_reporting` が有効（値なし、または `1`）
+- 固定値: `name=fandhe-fio-randwrite-4k`・`rw=randwrite`・`bs=4k`（`4k`/`4K`/`4096`）・`ioengine=psync`・`filename=fandhe-fio-randwrite-4k.dat`・`end_fsync=1`・`group_reporting` は値つき `--group_reporting=1`（`job options` に `"1"` が出る。値なしの `--group_reporting` は実 fio 3.36 が `job options` に出さないため拒否する）
 - `directory`: 空でない絶対パス（`/` で始まる）で、コロン（`:`。fio がディレクトリ・ファイル名リストの区切り文字として解釈する）を含まないこと（run モードの `--target-dir` と同じ制約。Windows 版 fio のドライブレター形式は受け付けない）。run モードではさらに、本スクリプトが作った専用サブディレクトリ（下記「書き込み先の安全性」）と完全一致することを要求する。`--from-json` では元の実行先を知り得ないため形式のみを照合し、値は出力の `params` に含めない
 - 本スクリプトの同名オプション（既定値を含む）との一致: `direct`・`iodepth`・`numjobs`（文字列として一致）、`size`（`k`/`m`/`g` の大文字小文字・単位なしのバイト数を正規化して一致）、`runtime`（秒。末尾 `s` は可）。元の fio 実行が既定値と異なる条件なら、変換時に同じ値を `--size`・`--runtime`・`--iodepth`・`--numjobs`・`--direct` へ渡す
 
-fio の JSON 上のオプション表現（`job options`/`global options` は正規オプション名→入力文字列の組で、値なしフラグは空文字列）は fio 本体（axboe/fio）の `parse.c`（`add_to_dump_list`）・`stat.c`（`json_add_job_opts`）・`json.h` を直接参照して確認した。実 fio の出力での照合は未実施（実機での確認は下記「実機での確認」節）。
+fio の JSON 上のオプション表現（`job options`/`global options` は正規オプション名→入力文字列の組）は、実 fio 3.36 の出力で確認した（#1825 のコメントの実測）。値なしフラグは `job options` に出ない。`global options` は空のとき `null` になる。空文字列で記録する版の fio は一次情報が無いため受け付けない。run モードの `make fio-bench` の実 fio での確認は #1825 の受け入れ条件 3 で行う（未実施）。
 
 ### オプション
 
@@ -84,7 +84,7 @@ fio の JSON 上のオプション表現（`job options`/`global options` は正
 
 先頭ゼロを拒否する理由: 先頭ゼロを許すとシェル側の算術評価が 8 進数として解釈してしまい（例: `08` は無効な 8 進数リテラルとしてエラーになる）、入力エラーであるべきケースが「fio 実行失敗」等の別の終了コードに化ける、または無効な JSON 数値として渡ってしまうため。
 
-`--rw`（`randwrite` 固定）・`--bs`（`4k` 固定）・`--ioengine`（`psync` 固定。libaio は Linux 専用のため移植性を優先）・`--end_fsync`（`1` 固定。write-back とフラッシュの意味論〔IO-2〕を含めて測るため）・`--group_reporting`（有効固定）は変更できない。有効値はすべて出力 JSON の `params` に記録する。run モードの fio 出力にも `--from-json` と同じ実行条件の照合をかけるため、`params` はどちらのモードでも fio JSON に記録された実行条件と一致する。
+`--rw`（`randwrite` 固定）・`--bs`（`4k` 固定）・`--ioengine`（`psync` 固定。libaio は Linux 専用のため移植性を優先）・`--end_fsync`（`1` 固定。write-back とフラッシュの意味論〔IO-2〕を含めて測るため）・`--group_reporting=1`（有効固定）は変更できない。有効値はすべて出力 JSON の `params` に記録する。run モードの fio 出力にも `--from-json` と同じ実行条件の照合をかけるため、`params` はどちらのモードでも fio JSON に記録された実行条件と一致する。
 
 ### 書き込み先の安全性（symlink 経由のボリューム外書き込み対策）
 
@@ -215,7 +215,7 @@ timeout -k 10 90 docker run --rm --name fandhe-fio-bench --user "$(id -u):$(id -
   fio --name=fandhe-fio-randwrite-4k --directory=/data \
       --filename=fandhe-fio-randwrite-4k.dat --rw=randwrite --bs=4k --ioengine=psync \
       --direct=1 --size=256m --runtime=30 --iodepth=1 --numjobs=1 \
-      --end_fsync=1 --group_reporting --output-format=json --output=/out/fio-bind.json
+      --end_fsync=1 --group_reporting=1 --output-format=json --output=/out/fio-bind.json
 
 # 2) named volume（<volume> は事前に作成した docker volume 名。実体パスは root しか
 #    読み書きできないため、コンテナ内 fio 経由でしか --user 実行できない。下記「注意点」参照）
@@ -225,7 +225,7 @@ timeout -k 10 90 docker run --rm --name fandhe-fio-bench --user "$(id -u):$(id -
   fio --name=fandhe-fio-randwrite-4k --directory=/data \
       --filename=fandhe-fio-randwrite-4k.dat --rw=randwrite --bs=4k --ioengine=psync \
       --direct=1 --size=256m --runtime=30 --iodepth=1 --numjobs=1 \
-      --end_fsync=1 --group_reporting --output-format=json --output=/out/fio-volume.json
+      --end_fsync=1 --group_reporting=1 --output-format=json --output=/out/fio-volume.json
 
 # 3) fio JSON を results.json 形式へ変換する。計測ごとに出力ファイルを分けてあるため、
 #    それぞれを対応する label で変換する（同じ fio.json に上書きすると bind mount の結果が
@@ -296,4 +296,4 @@ PoC（Linux 実機。PoC linux-real-machine）で得られた fio 値を参考�
 
 ## 実機での確認（人間担当・TASK-25.2 との切り分け）
 
-fio が導入された Linux 環境で `make fio-bench TARGET_DIR=<一時ディレクトリ> LABEL=local_tmp RUNTIME=5` を実行し、JSON が出力されること・実行後に target ディレクトリへ専用サブディレクトリ（`fandhe-fio-randwrite-4k.*`）とデータファイルが残らないことを確認する。実行条件の照合（`job options` の形）は fio 本体のソースから導いたもので実 fio では未確認のため、この実行が最初の実機照合になる。`unexpected fio options` や `jobs[0]["job options"] is missing` で終了コード 2 になった場合は、使用した fio の版が想定と異なる形でオプションを記録していることを意味するので、回避せず fio の版と出力 JSON を添えて報告する。Docker ベースライン比の実測・レポート・目標値案は TASK-25.2（#113）、目標値の妥当性判断は TASK-25.h1（#114。人間担当）で行う。
+fio が導入された Linux 環境で `make fio-bench TARGET_DIR=<一時ディレクトリ> LABEL=local_tmp RUNTIME=5` を実行し、JSON が出力されること・実行後に target ディレクトリへ専用サブディレクトリ（`fandhe-fio-randwrite-4k.*`）とデータファイルが残らないことを確認する。`--from-json` の実行条件の照合（`job options` の形）は実 fio 3.36 の出力で確認済み（#1825）。run モードの実 fio での実行は未確認のため、この実行が最初の実機照合になる。`unexpected fio options` や `jobs[0]["job options"] is missing` で終了コード 2 になった場合は、使用した fio の版が想定と異なる形でオプションを記録していることを意味するので、回避せず fio の版と出力 JSON を添えて報告する。Docker ベースライン比の実測・レポート・目標値案は TASK-25.2（#113）、目標値の妥当性判断は TASK-25.h1（#114。人間担当）で行う。

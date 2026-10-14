@@ -21,6 +21,12 @@
 //!   は FLUSH ACK の直後に kill して損失 0 を検証する。示せる範囲は「FLUSH ACK が `persist` 成功の
 //!   後にだけ返ること」と「計測が損失を検出できること」までで、媒体への永続化（IO-2）は対象外。
 //!
+//! 件数の可視化（#1833）: 環境変数 `FANDHE_CONTAINER_CRASH_SUMMARY_DIR` に既存の実ディレクトリを
+//! 渡すと、各ケースの `crash_summary` 行を `<dir>/<case>.json` へ排他作成（0600）で書く
+//! （未設定なら書かない。空・symlink・不在は失敗）。CI の `platform-ci` はこれを
+//! `scripts/check-crash-summary.sh`（`make crash-summary-check`）で検証し `GITHUB_STEP_SUMMARY` に表を出す。
+//! 同じディレクトリでの再実行は排他作成のため失敗するので、毎回新規ディレクトリを使う。
+//!
 //! CI 回帰への組み込みは実装済み（#827）: `platform-ci`（PR は ubuntu・main は 3 OS）と `rust-ci`（`--all-features`）で
 //! 実行し、実機前提テストとしては分離しない。`platform-ci` は存在確認ステップで無言除外を検出する。
 //!
@@ -551,11 +557,23 @@ mod unix {
         }
     }
 
-    /// ケースごとのサマリー行（実測結果レポートの材料。REPAIR-4）。
-    fn log_case_summary(case: &str, ledger: &TrialLedger, summary: &TrialSummary) {
+    /// 件数サマリーの出力先ディレクトリを指す環境変数（IO-3・REPAIR-4・#1833）。
+    /// 設定時は各ケースの `crash_summary` 行を `<dir>/<case>.json` へ排他作成で書く。
+    /// CI の `platform-ci`「結合試験の実行」ステップだけが設定し、`scripts/check-crash-summary.sh`
+    /// （`make crash-summary-check`）が検証して `GITHUB_STEP_SUMMARY` へ表を出す。
+    const SUMMARY_DIR_ENV: &str = "FANDHE_CONTAINER_CRASH_SUMMARY_DIR";
+
+    /// `crash_summary` の JSON 1 行を組み立てる（改行なし）。`persist_supported` が false の
+    /// 環境（FLUSH ACK 非対応）でも同じ項目を出し、表で区別できるようにする。
+    fn case_summary_line(
+        case: &str,
+        persist_supported: bool,
+        ledger: &TrialLedger,
+        summary: &TrialSummary,
+    ) -> String {
         let loss = loss_summary(ledger);
-        eprintln!(
-            "{{\"event\":\"crash_summary\",\"case\":\"{case}\",\"attempts\":{},\"valid\":{},\"invalid\":{},\"aborted\":{},\"checked\":{},\"total_lost\":{},\"max_lost\":{},\"trials_with_loss\":{},\"unexact\":{}}}",
+        format!(
+            "{{\"event\":\"crash_summary\",\"case\":\"{case}\",\"persist_supported\":{persist_supported},\"attempts\":{},\"valid\":{},\"invalid\":{},\"aborted\":{},\"checked\":{},\"total_lost\":{},\"max_lost\":{},\"trials_with_loss\":{},\"unexact\":{}}}",
             summary.attempts,
             summary.valid,
             summary.invalid,
@@ -565,7 +583,56 @@ mod unix {
             loss.max_lost,
             loss.trials_with_loss,
             loss.unexact_trials
-        );
+        )
+    }
+
+    /// 出力先ディレクトリを検査して `<dir>/<case>.json` を排他作成（0600）で書く。
+    /// symlink・通常ファイル・不在のディレクトリ、既存ファイルへの書き込みは拒否する（fail-closed）。
+    fn write_case_summary_file(
+        dir: &std::path::Path,
+        case: &str,
+        line: &str,
+    ) -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let meta = std::fs::symlink_metadata(dir)?;
+        if !meta.file_type().is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "summary dir must be a real directory (not a symlink or file)",
+            ));
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dir.join(format!("{case}.json")))?;
+        file.write_all(line.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()
+    }
+
+    /// 環境変数から出力先を得る。未設定は `None`、空文字は試験の失敗（無言で出さない）。
+    fn summary_dir() -> Option<PathBuf> {
+        let value = std::env::var_os(SUMMARY_DIR_ENV)?;
+        assert!(!value.is_empty(), "{SUMMARY_DIR_ENV} must not be empty");
+        Some(PathBuf::from(value))
+    }
+
+    /// ケースごとのサマリー行（実測結果レポートの材料。REPAIR-4）。stderr に出し、
+    /// 環境変数があればファイルにも書く。各アサートの前に呼ぶため、失敗時も残る。
+    fn log_case_summary(
+        case: &str,
+        persist_supported: bool,
+        ledger: &TrialLedger,
+        summary: &TrialSummary,
+    ) {
+        let line = case_summary_line(case, persist_supported, ledger, summary);
+        eprintln!("{line}");
+        if let Some(dir) = summary_dir()
+            && let Err(e) = write_case_summary_file(&dir, case, &line)
+        {
+            panic!("failed to write crash summary file for case {case}: {e}");
+        }
     }
 
     /// 試行ループ。結果を JSON 1 行の構造化ログとして stderr へ出す（REPAIR-4）。
@@ -737,7 +804,12 @@ mod unix {
             MAX_ATTEMPTS,
         );
         let loss = loss_summary(&ledger);
-        log_case_summary("flushed", &ledger, &summary);
+        log_case_summary(
+            "flushed",
+            persist_support().is_supported(),
+            &ledger,
+            &summary,
+        );
         if persist_support().is_supported() {
             assert!(!summary.aborted, "summary: {summary:?}");
             assert_eq!(summary.valid, 10);
@@ -773,9 +845,6 @@ mod unix {
                     rec.verdict
                 );
             }
-            eprintln!(
-                "{{\"event\":\"crash_summary\",\"case\":\"flushed\",\"persist_supported\":false}}"
-            );
         }
     }
 
@@ -797,7 +866,7 @@ mod unix {
             MAX_ATTEMPTS,
         );
         let loss = loss_summary(&ledger);
-        log_case_summary("deferred_unflushed", &ledger, &summary);
+        log_case_summary("deferred_unflushed", true, &ledger, &summary);
         assert!(!summary.aborted, "summary: {summary:?}");
         assert_eq!(summary.valid, 10);
         let all: Vec<u64> = (0..30).collect();
@@ -836,7 +905,12 @@ mod unix {
             MAX_ATTEMPTS,
         );
         let loss = loss_summary(&ledger);
-        log_case_summary("deferred_flushed", &ledger, &summary);
+        log_case_summary(
+            "deferred_flushed",
+            persist_support().is_supported(),
+            &ledger,
+            &summary,
+        );
         if persist_support().is_supported() {
             assert!(!summary.aborted, "summary: {summary:?}");
             assert_eq!(summary.valid, 10);
@@ -870,10 +944,49 @@ mod unix {
                     rec.verdict
                 );
             }
-            eprintln!(
-                "{{\"event\":\"crash_summary\",\"case\":\"deferred_flushed\",\"persist_supported\":false}}"
-            );
         }
+    }
+
+    /// IO-3・REPAIR-4・REPAIR-12・#1833: サマリー行は全項目を含み、具体値で照合できる 1 行になる。
+    #[test]
+    fn case_summary_line_contains_all_fields_in_one_line() {
+        let ledger = TrialLedger::new(10, 30);
+        let line = case_summary_line("flushed", false, &ledger, &ledger.summary());
+        assert_eq!(
+            line,
+            "{\"event\":\"crash_summary\",\"case\":\"flushed\",\"persist_supported\":false,\"attempts\":0,\"valid\":0,\"invalid\":0,\"aborted\":false,\"checked\":0,\"total_lost\":0,\"max_lost\":0,\"trials_with_loss\":0,\"unexact\":0}"
+        );
+        assert!(!line.contains('\n'));
+    }
+
+    /// IO-3・REPAIR-12・#1833: 排他作成で書け、内容は行 + 改行。同名の 2 回目は AlreadyExists で失敗する。
+    #[test]
+    fn write_case_summary_file_is_exclusive_and_newline_terminated() {
+        let dir = TempDir::new("sumx");
+        write_case_summary_file(&dir.0, "flushed", "{\"a\":1}").expect("first write must succeed");
+        let body = std::fs::read_to_string(dir.0.join("flushed.json")).expect("must read back");
+        assert_eq!(body, "{\"a\":1}\n");
+        let err = write_case_summary_file(&dir.0, "flushed", "{\"a\":2}")
+            .expect_err("second write must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        let body = std::fs::read_to_string(dir.0.join("flushed.json")).expect("must read back");
+        assert_eq!(body, "{\"a\":1}\n");
+    }
+
+    /// IO-3・REPAIR-12・#1833: 出力先が symlink・通常ファイル・不在なら書かずに失敗する（fail-closed）。
+    #[test]
+    fn write_case_summary_file_rejects_bad_dirs() {
+        let dir = TempDir::new("sumb");
+        let real = dir.0.join("real");
+        std::fs::create_dir(&real).expect("mkdir");
+        let link = dir.0.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        assert!(write_case_summary_file(&link, "flushed", "{}").is_err());
+        assert!(!real.join("flushed.json").exists());
+        let file = dir.0.join("file");
+        std::fs::write(&file, b"x").expect("write file");
+        assert!(write_case_summary_file(&file, "flushed", "{}").is_err());
+        assert!(write_case_summary_file(&dir.0.join("missing"), "flushed", "{}").is_err());
     }
 
     /// IO-3・TASK-18.1.2: 無効試行しか得られない場合は上限で打ち切られ、有効数は 0 のまま。

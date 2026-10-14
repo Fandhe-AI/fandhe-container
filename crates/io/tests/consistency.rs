@@ -99,7 +99,10 @@
 //! rename が担う性質で本スイートの検証対象外とし、R3 は置換後の最終内容の
 //! 完全一致だけを確認する。[`graceful_shutdown`] の 5 件（G1〜G5）も同じ
 //! [`harness::DuplexEnd`] 基盤（実ソケットを使わない）で 3 OS すべてで動き、
-//! OS 差の前提は置かない（合計 33 件）。
+//! OS 差の前提は置かない。[`write_failure`]（TASK-14 追補・#1829）の 5 件
+//! （W1〜W5）は実ファイルへの書き込み失敗で部分レコードが ACK されないことを
+//! 確認し、3 OS で動く（W3 の `/dev/full` ケースだけ Linux 限定で `cfg` により
+//! コンパイル対象を分ける。skip ではない。合計 42 件〔Linux。他 OS は 41 件〕）。
 
 #[path = "consistency/harness.rs"]
 mod harness;
@@ -115,3 +118,6 @@ mod graceful_shutdown;
 
 #[path = "consistency/concurrent_read.rs"]
 mod concurrent_read;
+
+#[path = "consistency/write_failure.rs"]
+mod write_failure;

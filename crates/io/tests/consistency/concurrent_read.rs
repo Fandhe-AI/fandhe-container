@@ -77,6 +77,34 @@ impl Drop for DoneOnDrop {
     }
 }
 
+/// 読み手が「ACK 件数 N を先に読んでから開いたスナップショット」を照合し終えた
+/// ことを書き込み側へ知らせる共有値（REPAIR-5・REPAIR-12）。書き込み側は ACK の
+/// 静止点ごとに [`ObservedFloor::wait_for`] で読み手の観測完了を期限付きで待ち、
+/// 書き込み完了前に読み手が少なくとも 1 回は途中状態を観測したことを保証する
+/// （開始 Barrier だけでは、writer が先に全件書き終えて読み手が完成ファイルを 1 回
+/// 読むだけの実行でも通ってしまう）。
+#[derive(Clone, Default)]
+struct ObservedFloor(Arc<AtomicU64>);
+
+impl ObservedFloor {
+    /// 照合済みスナップショットの ACK 床（件数）を公開する。単調に増える。
+    fn publish(&self, acked: u64) {
+        self.0.fetch_max(acked, Ordering::Release);
+    }
+
+    /// 読み手が ACK 件数 `acked` 以上の床で照合し終えるまで期限付きで待つ。
+    fn wait_for(&self, acked: u64) {
+        let start = Instant::now();
+        while self.0.load(Ordering::Acquire) < acked {
+            assert!(
+                start.elapsed() < join_deadline(),
+                "reader did not observe the quiescent point at {acked} acked record(s) (REPAIR-5)"
+            );
+            std::thread::yield_now();
+        }
+    }
+}
+
 /// 位置 `i` の期待値との一致（`tolerant` のときは 0x00 も許す。(c)）。
 fn first_mismatch(actual: &[u8], expected: &[u8], tolerant_from: usize) -> Option<usize> {
     actual.iter().enumerate().find_map(|(i, byte)| {
@@ -147,9 +175,11 @@ fn run_single_connection(
     let progress = AckProgress::new();
     let done = Arc::new(AtomicBool::new(false));
     let barrier = Arc::new(Barrier::new(readers + 1));
+    let observed: Vec<ObservedFloor> = (0..readers).map(|_| ObservedFloor::default()).collect();
 
     let writer = {
         let progress = progress.clone();
+        let observed = observed.clone();
         let done = Arc::clone(&done);
         let barrier = Arc::clone(&barrier);
         let bodies: Vec<Vec<u8>> = (0..records_total)
@@ -166,6 +196,11 @@ fn run_single_connection(
                         .expect("recv_ack must succeed while writing");
                     progress.advance();
                 }
+                // 静止点: 全読み手がこの ACK 床で開いて照合し終えるまで次へ進まない。
+                let acked = progress.acked();
+                for o in &observed {
+                    o.wait_for(acked);
+                }
             }
         })
     };
@@ -177,6 +212,7 @@ fn run_single_connection(
             let barrier = Arc::clone(&barrier);
             let expected = expected.clone();
             let path = path.clone();
+            let observed = observed.get(r).expect("observed per reader").clone();
             std::thread::spawn(move || {
                 let who = format!("reader {r}");
                 barrier_wait_within(&barrier, join_deadline());
@@ -186,9 +222,11 @@ fn run_single_connection(
                 loop {
                     // 完了フラグ → ACK 件数 → 開く、の順（先に読んだ分だけが床になる）。
                     let finished = done.load(Ordering::Acquire);
-                    let floor = progress.acked() as usize * body_len;
+                    let acked = progress.acked();
+                    let floor = acked as usize * body_len;
                     let snapshot = sample_snapshot(&path);
                     check_snapshot(&snapshot, &expected, floor, &who, iter);
+                    observed.publish(acked);
                     // (d) 単調性（書き込みのみの局面）。
                     assert!(
                         snapshot.len() >= prev_len && floor >= prev_floor,
@@ -252,11 +290,17 @@ const SHARED_FRAMES: u32 = 64;
 const SHARED_BODY_LEN: usize = 20;
 
 /// 共有ファイルのスナップショットを分解して照合する（定義 (a)(b)(c)）。
-fn check_shared_snapshot(snapshot: &[u8], acked: &[u64], iter: u64) {
-    let (recs, _tail) = decompose_records_prefix(snapshot);
+///
+/// - ACK 済み（seq が当該 client の `acked` 件数未満）のレコードは全バイトを厳密に
+///   照合する。ゼロ埋めを許すのは未 ACK のレコード本体（ヘッダは厳密）だけ。
+/// - 完全レコードの後ろの端数（tail）は捨てず、全ゼロか、いずれかの client の次の
+///   レコードの接頭辞（本体のゼロ相当を除き一致）であることを確認する。
+/// - `finished`（全書き込み完了・全 ACK 済み）なら全レコードを厳密に照合し、tail を
+///   空・件数を全数とする。
+fn check_shared_snapshot(snapshot: &[u8], acked: &[u64], finished: bool, iter: u64) {
+    let (recs, tail) = decompose_records_prefix(snapshot);
     let mut next = vec![0u32; usize::from(SHARED_CLIENTS)];
-    let last = recs.len().saturating_sub(1);
-    for (idx, rec) in recs.iter().enumerate() {
+    for rec in &recs {
         let client = record_client(rec);
         assert!(
             client < SHARED_CLIENTS,
@@ -270,11 +314,11 @@ fn check_shared_snapshot(snapshot: &[u8], acked: &[u64], iter: u64) {
         *slot += 1;
         assert_eq!(rec.len(), SHARED_BODY_LEN, "iter {iter}: record length");
         let want = body_for(client, seq, SHARED_BODY_LEN);
-        // 末尾の完全長レコードだけは書き込み進行中でゼロ相当を許す (c)。
-        let tolerant_from = if idx == last {
-            BODY_HEADER_LEN
-        } else {
+        let floor = acked.get(usize::from(client)).copied().unwrap_or(0);
+        let tolerant_from = if finished || u64::from(seq) < floor {
             want.len()
+        } else {
+            BODY_HEADER_LEN
         };
         if let Some(pos) = first_mismatch(rec, &want, tolerant_from) {
             panic!("iter {iter}: client {client} seq {seq} differs at byte {pos}");
@@ -286,6 +330,34 @@ fn check_shared_snapshot(snapshot: &[u8], acked: &[u64], iter: u64) {
             "iter {iter}: client {client} has {got} record(s) visible, but {floor} were acked"
         );
     }
+    if finished {
+        assert!(
+            tail.is_empty(),
+            "iter {iter}: final snapshot has a {}-byte tail",
+            tail.len()
+        );
+        assert_eq!(
+            recs.len(),
+            usize::from(SHARED_CLIENTS) * SHARED_FRAMES as usize,
+            "iter {iter}: final snapshot must hold every record"
+        );
+        return;
+    }
+    if tail.iter().all(|b| *b == 0) {
+        return;
+    }
+    let tail_ok = next.iter().enumerate().any(|(client, seq)| {
+        if *seq >= SHARED_FRAMES {
+            return false;
+        }
+        let want = body_for(client as u16, *seq, SHARED_BODY_LEN);
+        tail.len() < want.len() && first_mismatch(tail, &want, BODY_HEADER_LEN).is_none()
+    });
+    assert!(
+        tail_ok,
+        "iter {iter}: {}-byte tail is not a prefix of any client's next record: {tail:?}",
+        tail.len()
+    );
 }
 
 /// IO-4・REPAIR-6・#1828（定義 (a)(b)(c)）: `SharedSink` を 4 接続が共有して
@@ -302,6 +374,7 @@ fn io4_concurrent_read_shared_file_multi_connection_records_never_interleave() {
     let progress: Vec<AckProgress> = (0..clients).map(|_| AckProgress::new()).collect();
     let done = Arc::new(AtomicBool::new(false));
     let barrier = Arc::new(Barrier::new(clients + 1));
+    let observed: Vec<ObservedFloor> = (0..clients).map(|_| ObservedFloor::default()).collect();
 
     let mut servers = Vec::new();
     let mut writers = Vec::new();
@@ -315,6 +388,7 @@ fn io4_concurrent_read_shared_file_multi_connection_records_never_interleave() {
         ));
         let progress = progress.clone();
         let barrier = Arc::clone(&barrier);
+        let observed = observed.get(i).expect("observed per client").clone();
         writers.push(std::thread::spawn(move || {
             let bodies: Vec<Vec<u8>> = (0..SHARED_FRAMES)
                 .map(|seq| body_for(i as u16, seq, SHARED_BODY_LEN))
@@ -331,6 +405,8 @@ fn io4_concurrent_read_shared_file_multi_connection_records_never_interleave() {
                     client.recv_ack(timeout()).expect("recv_ack must succeed");
                     progress.advance();
                 }
+                // 静止点: 読み手がこの client の ACK 床で照合し終えるまで次へ進まない。
+                observed.wait_for(progress.acked());
             }
         }));
     }
@@ -341,6 +417,7 @@ fn io4_concurrent_read_shared_file_multi_connection_records_never_interleave() {
         let done = Arc::clone(&done);
         let barrier = Arc::clone(&barrier);
         let path = path.clone();
+        let observed = observed.clone();
         std::thread::spawn(move || {
             barrier_wait_within(&barrier, join_deadline());
             let start = Instant::now();
@@ -349,7 +426,10 @@ fn io4_concurrent_read_shared_file_multi_connection_records_never_interleave() {
                 let finished = done.load(Ordering::Acquire);
                 let acked: Vec<u64> = progress.iter().map(AckProgress::acked).collect();
                 let snapshot = sample_snapshot(&path);
-                check_shared_snapshot(&snapshot, &acked, iter);
+                check_shared_snapshot(&snapshot, &acked, finished, iter);
+                for (o, a) in observed.iter().zip(&acked) {
+                    o.publish(*a);
+                }
                 lens.insert(snapshot.len());
                 iter += 1;
                 if finished {
@@ -635,4 +715,45 @@ fn io4_helper_decompose_records_prefix_panics_on_corrupt_len() {
     let mut data = body_for(0, 0, 16);
     data[6..10].copy_from_slice(&3u32.to_le_bytes());
     let _ = decompose_records_prefix(&data);
+}
+
+/// 照合関数の検証用: client 0 の ACK 済み 2 レコードの列。
+fn two_acked_records() -> Vec<u8> {
+    records(0, 0..2, SHARED_BODY_LEN)
+}
+
+/// ヘルパー検証（#1828）: 正しい次レコードの接頭辞の端数は受理する。
+#[test]
+fn io4_helper_shared_check_accepts_valid_tail_prefix() {
+    let mut data = two_acked_records();
+    data.extend(&body_for(0, 2, SHARED_BODY_LEN)[..5]);
+    check_shared_snapshot(&data, &[2, 0, 0, 0], false, 0);
+}
+
+/// ヘルパー検証（#1828）: ACK 済みレコード列に不正な 5 バイトを足したスナップショットを拒否する。
+#[test]
+#[should_panic(expected = "is not a prefix of any client's next record")]
+fn io4_helper_shared_check_rejects_corrupt_tail_bytes() {
+    let mut data = two_acked_records();
+    data.extend([0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
+    check_shared_snapshot(&data, &[2, 0, 0, 0], false, 0);
+}
+
+/// ヘルパー検証（#1828）: ACK 済みレコードのゼロ埋め本体を拒否する。
+#[test]
+#[should_panic(expected = "differs at byte")]
+fn io4_helper_shared_check_rejects_zeroed_acked_record() {
+    let mut data = two_acked_records();
+    let len = data.len();
+    data[len - 4..].fill(0);
+    check_shared_snapshot(&data, &[2, 0, 0, 0], false, 0);
+}
+
+/// ヘルパー検証（#1828）: 未 ACK の末尾レコード本体のゼロ相当は許容する。
+#[test]
+fn io4_helper_shared_check_tolerates_zeroed_unacked_record_body() {
+    let mut data = two_acked_records();
+    let len = data.len();
+    data[len - 4..].fill(0);
+    check_shared_snapshot(&data, &[1, 0, 0, 0], false, 0);
 }

@@ -448,7 +448,10 @@ mod app {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use fandhe_container_io::{BatchBuffer, BatchConfig, Frame, FrameKind, PushOutcome};
+        use fandhe_container_io::{
+            BatchBuffer, BatchConfig, FrameKind, InFlightLimit, PushOutcome, SendQueue,
+            WireRequestId, encode_request,
+        };
 
         fn args(list: &[&str]) -> Result<ServerArgs, IoError> {
             parse_args(list.iter().map(OsString::from))
@@ -478,10 +481,12 @@ mod app {
         }
 
         /// request id 8 バイト + body 8 バイトの Write フレーム 1 件のバッチを作る。
+        /// フレームは `SendQueue` が払い出した id から `encode_request` で組み立てる（REPAIR-2）。
         fn one_write_batch(seq: u64) -> Batch {
-            let mut payload = seq.to_le_bytes().to_vec();
-            payload.extend_from_slice(&seq.to_le_bytes());
-            let frame = Frame::new(FrameKind::Write, payload).unwrap();
+            let mut queue = SendQueue::new(InFlightLimit::new(1).unwrap());
+            let registered = queue.register(FrameKind::Write).unwrap();
+            let id = WireRequestId::from(registered.id());
+            let frame = encode_request(FrameKind::Write, id, &seq.to_le_bytes()).unwrap();
             let mut buf = BatchBuffer::new(BatchConfig::new(1).unwrap());
             match buf.push(frame).unwrap() {
                 PushOutcome::Ready(b) => b,

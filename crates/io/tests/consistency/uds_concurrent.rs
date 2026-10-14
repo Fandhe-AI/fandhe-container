@@ -31,8 +31,9 @@ mod unix {
     use std::time::Duration;
 
     use fandhe_container_io::{
-        BatchConfig, Frame, FrameHeader, FrameKind, IoErrorCode, NoopServerObserver, SinkOpenMode,
-        WritebackReport, WritebackSettings, WritebackTimeouts,
+        BatchConfig, Frame, FrameHeader, FrameKind, InFlightLimit, IoErrorCode, NoopServerObserver,
+        SendQueue, SinkOpenMode, WireRequestId, WritebackReport, WritebackSettings,
+        WritebackTimeouts, encode_request,
     };
 
     use super::super::harness::{
@@ -101,11 +102,19 @@ mod unix {
         stream
     }
 
-    fn send_write(stream: &mut UnixStream, id: u64, body: &[u8]) {
-        let mut payload = Vec::with_capacity(8 + body.len());
-        payload.extend_from_slice(&id.to_le_bytes());
-        payload.extend_from_slice(body);
-        let frame = Frame::new(FrameKind::Write, payload).expect("write frame must construct");
+    /// 共有の型付きエンコーダ（`encode_request`・`WireRequestId`。REPAIR-2）で Write フレームを
+    /// 組み立てて送る。request id は `SendQueue` の採番（client ごとに 0 から連番）を使い、
+    /// ACK 待ちを溜めないよう登録直後に外す。
+    fn send_write(stream: &mut UnixStream, queue: &mut SendQueue, body: &[u8]) {
+        let request = queue
+            .register(FrameKind::Write)
+            .expect("send queue must issue a request id");
+        let id = request.id();
+        queue
+            .remove(id)
+            .expect("issued request id must be removable");
+        let frame = encode_request(FrameKind::Write, WireRequestId::from(id), body)
+            .expect("write frame must construct");
         stream
             .write_all(&frame.encode())
             .expect("client write must succeed");
@@ -183,8 +192,11 @@ mod unix {
             client_handles.push(std::thread::spawn(move || {
                 let mut stream = pre.unwrap_or_else(|| connect(&socket_path));
                 barrier_wait_within(&barrier, deadline());
+                let mut queue = SendQueue::new(
+                    InFlightLimit::new(1).expect("in-flight limit of 1 must be valid"),
+                );
                 for seq in 0..frames {
-                    send_write(&mut stream, u64::from(seq), &body_for(i, seq, body_len));
+                    send_write(&mut stream, &mut queue, &body_for(i, seq, body_len));
                 }
                 let acked: Vec<u64> = (0..frames).map(|_| recv_ack_id(&mut stream)).collect();
                 // 全 ACK を受け取ってから切断する（discarded_pending_frames == 0）。

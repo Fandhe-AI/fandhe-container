@@ -19,7 +19,7 @@
         "iodepth": "1",
         "numjobs": "1",
         "end_fsync": "1",
-        "group_reporting": ""
+        "group_reporting": "1"
       },
       "write": {
         "io_bytes": 268435456,

@@ -197,6 +197,15 @@ for key in name directory filename rw bs ioengine direct size runtime iodepth nu
   run_case_msg "from-json-missing-option-${key}" 2 "fio option ${key} " --from-json "$missing_fixture" --label x
 done
 
+# group_reporting は値つき "1" のみ許可（実 fio 3.36 は値なしを job options に出さない。#1924）
+jq 'del(.jobs[0]["job options"].group_reporting)' "${fixtures_dir}/fio-3-ok.json" >"${missing_dir}/no-group-reporting.json"
+run_case_msg "from-json-no-group-reporting" 2 'fio option group_reporting must be "1" (got null)' --from-json "${missing_dir}/no-group-reporting.json" --label x
+run_case_msg "from-json-no-group-reporting-hint" 2 "re-run fio with --group_reporting=1" --from-json "${missing_dir}/no-group-reporting.json" --label x
+jq '.jobs[0]["job options"].group_reporting = ""' "${fixtures_dir}/fio-3-ok.json" >"${missing_dir}/empty-group-reporting.json"
+run_case_msg "from-json-group-reporting-empty" 2 'fio option group_reporting must be "1" (got "")' --from-json "${missing_dir}/empty-group-reporting.json" --label x
+jq '.jobs[0]["job options"].group_reporting = "0"' "${fixtures_dir}/fio-3-ok.json" >"${missing_dir}/zero-group-reporting.json"
+run_case_msg "from-json-group-reporting-zero" 2 'fio option group_reporting must be "1" (got "0")' --from-json "${missing_dir}/zero-group-reporting.json" --label x
+
 # directory の形式（空でない・絶対パス・':' を含まない）と global options の型
 make_variant() {
   # 引数: <出力ファイル名> <jq フィルタ>。fio-3-ok.json を jq で 1 点だけ変えた JSON を作る
@@ -375,8 +384,8 @@ PATH="$common_bin" run_case_msg "missing-fio-tool" 3 "fio is required" --target-
 # 使う既存 PATH は残すため、以降のケースは stub_bin を PATH の先頭に prefix する）。
 stub_bin="${tmp_root}/stub-bin"
 mkdir -p "$stub_bin"
-# fio スタブは実 fio と同じく、受け取った `--key=value`・値なしフラグ（`--group_reporting` 等）
-# を `jobs[0]["job options"]` に正規名→入力文字列（フラグは空文字列）で記録した JSON を
+# fio スタブは実 fio 3.36 と同じく、受け取った `--key=value` だけを
+# `jobs[0]["job options"]` に正規名→入力文字列で記録した JSON を（値なしフラグは記録しない。#1825）
 # --output へ書く（fio 本体の parse.c `add_to_dump_list`・stat.c `json_add_job_opts` と
 # 同じ形。run モードの出力も --from-json と同じ実行条件の照合を通ることを確かめるため）。
 # 加えて --directory/--filename が指す固定データファイルも実際に作る
@@ -401,7 +410,6 @@ for a in "$@"; do
       [ "$k" = filename ] && fname="$v"
       opts=$(jq -c --arg k "$k" --arg v "$v" '. + {($k): $v}' <<<"$opts")
       ;;
-    --*) opts=$(jq -c --arg k "${a#--}" '. + {($k): ""}' <<<"$opts") ;;
   esac
 done
 # 受け取った --output（fio の JSON 出力先。一時ディレクトリの中）を記録する

@@ -68,6 +68,14 @@ mkgood "${work}/multi"
 line flushed true 10 0 false 0 0 >>"${work}/multi/flushed.json"
 run "two lines" 1 Linux "${work}/multi" "exactly 1 line"
 
+mkgood "${work}/concat"
+printf '%s {}\n' "$(line flushed true 10 0 false 0 0 | tr -d '\n')" >"${work}/concat/flushed.json"
+run "valid summary concatenated with {} on one line" 1 Linux "${work}/concat" "exactly 1 JSON value"
+
+mkgood "${work}/concat2"
+printf '%s %s\n' "$(line flushed true 10 0 false 0 0 | tr -d '\n')" "$(line flushed true 10 0 false 0 0 | tr -d '\n')" >"${work}/concat2/flushed.json"
+run "two valid summaries on one line" 1 Linux "${work}/concat2" "exactly 1 JSON value"
+
 mkgood "${work}/badtype"
 sed 's/"valid":10/"valid":"10"/' "${work}/badtype/flushed.json" >"${work}/badtype/x" && mv "${work}/badtype/x" "${work}/badtype/flushed.json"
 run "string count" 1 Linux "${work}/badtype" "missing or invalid fields"

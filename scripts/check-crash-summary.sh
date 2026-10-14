@@ -114,6 +114,9 @@ for c in ${expected}; do
   fi
   lines="$(wc -l <"${f}" | tr -d ' ')"
   [ "${lines}" = "1" ] || fail "${c}.json must have exactly 1 line (got ${lines})"
+  # 複数のトップレベル JSON 値（連結入力）を受け付けないよう、値がちょうど 1 件であることを確認する
+  count="$(jq -s 'length' "${f}")" || fail "${c}.json is not valid JSON"
+  [ "${count}" = "1" ] || fail "${c}.json must contain exactly 1 JSON value (got ${count})"
   tsv="$(jq -r --arg case "${c}" "${filter}" "${f}")" || fail "${c}.json is not valid JSON"
   [ -n "${tsv}" ] || fail "${c}.json has missing or invalid fields"
   row="| $(printf '%s' "${tsv}" | sed 's/	/ | /g') |"

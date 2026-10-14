@@ -85,8 +85,8 @@
 //! 後（ACK 送出前）に rename・`set_len` を差し込み、barrier で書き込みと rename を
 //! 同時に解放する反復も行う（静止点を作らない交錯）。差し込めない位置（1 回の
 //! `AppendFileSink::write_batch` 内のフレーム間）と成り立つ条件の表は
-//! [`interleave`] のモジュール doc に記す。3 OS で動く。合計 40 件〔Linux・macOS。Windows は
-//! 35 件〕。
+//! [`interleave`] のモジュール doc に記す。3 OS で動く。
+//! 合計は Linux 40 件・macOS 39 件・Windows 35 件。
 
 #[path = "consistency/harness.rs"]
 mod harness;

@@ -34,7 +34,8 @@
 //! 検証する「並行 write」は、**複数の接続（クライアント）が同時に write
 //! ストリームを流し、接続ごとに `serve_connection` がスレッド並行で書き込む
 //! こと**と定義する。同じオフセット領域への上書き競合はワイヤーで表現
-//! できないため対象外（out-of-scope-tracking で追跡）。
+//! できないため対象外とする（ワイヤー形式の拡張〔IO-1 の I/O 契約の変更〕が
+//! 前提。設計の入口は #1886）。
 //!
 //! # 「rename / truncate」の定義（TASK-14.2・#81 の範囲）
 //!
@@ -60,10 +61,12 @@
 //! トランスポート）を使う 8 件の主ケース（[`concurrent_write`]）は 3 OS
 //! すべてで動く（ci.md「OS 依存のファイルシステム挙動のテストは 3 OS すべてで
 //! 実行する」）。[`fandhe_container_io::UdsServer`] は Linux / macOS 限定の
-//! ため、実ソケット越しの並行性を追加で補強するケースは範囲外とし、
-//! out-of-scope-tracking で追跡する（`fandhe_container_io::server` モジュール
-//! doc の「範囲外」節が同じ理由で UDS 受付ループ自体を後続 sub-issue としている
-//! ことと整合させる）。[`rename_truncate`] の 11 件（R1〜R5・T1〜T6）も
+//! ため、実ソケット越しの並行性は [`uds_concurrent`]（TASK-14 追補・#1831）の
+//! 5 件（U1〜U5。`WritebackSettings::bind` → `accept` → `serve` の実経路で複数の
+//! UDS 接続を同時に流し、内容をバイト単位で照合する）が Linux・macOS で補強する。
+//! Windows は UDS 未対応のため
+//! `io4_uds_concurrent_bind_is_unimplemented_on_unsupported_os` の 1 件で未対応を
+//! 明示する。[`rename_truncate`] の 11 件（R1〜R5・T1〜T6）も
 //! 同じ [`harness::DuplexEnd`] 基盤で 3 OS すべてで動くが、1 点だけ OS 差の
 //! 前提を置く: Rust std の既定 `share_mode` には `FILE_SHARE_DELETE` が
 //! 含まれるため、開いているファイルを**移動元**として rename するのは
@@ -82,8 +85,8 @@
 //! 後（ACK 送出前）に rename・`set_len` を差し込み、barrier で書き込みと rename を
 //! 同時に解放する反復も行う（静止点を作らない交錯）。差し込めない位置（1 回の
 //! `AppendFileSink::write_batch` 内のフレーム間）と成り立つ条件の表は
-//! [`interleave`] のモジュール doc に記す。3 OS で動く。合計 35 件〔Linux。他 OS は
-//! 34 件〕。
+//! [`interleave`] のモジュール doc に記す。3 OS で動く。合計 40 件〔Linux・macOS。Windows は
+//! 35 件〕。
 
 #[path = "consistency/harness.rs"]
 mod harness;
@@ -102,3 +105,6 @@ mod write_failure;
 
 #[path = "consistency/interleave.rs"]
 mod interleave;
+
+#[path = "consistency/uds_concurrent.rs"]
+mod uds_concurrent;

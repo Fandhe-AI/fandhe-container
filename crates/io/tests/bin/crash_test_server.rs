@@ -18,6 +18,13 @@
 //!   （SIGKILL 後はソケットが残るため、試行ごとに新しいパスを使う）
 //! - `--data-dir <dir>` / `--file <name>`（必須）: 出力ファイル（`SinkOpenMode::CreateNew`）
 //! - `--batch-size` / `--unflushed-max-frames` / `--unflushed-max-bytes`（任意）
+//! - `--sink <append-file|deferred>`（任意。既定 `append-file`）: 書き込み先の sink。
+//!   `append-file` は製品の `AppendFileSink`（通常 ACK は `write()` 完了後に返る）。
+//!   `deferred` は試験専用の `DeferredPersistSink` で、`BatchSink::persist` が呼ばれるまで
+//!   書き込みをメモリに保持しファイルへは書かない（TASK-18 追補・#1832）。これにより
+//!   「ACK 済みだが未書き込み」の状態を作り、`persist` の有無で SIGKILL 後の結果が変わる
+//!   対照を成立させる。製品の ACK 順序・`serve_connection`・`AppendFileSink` は変えない
+//!   （試験専用 sink はこの bin の中だけにあり、リリース成果物には入らない）
 //!
 //! # 準備完了の合図
 //!
@@ -73,14 +80,16 @@ fn json_escape(s: &str) -> String {
 mod app {
     use std::ffi::OsString;
     use std::io::Write;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::ExitCode;
+    use std::time::Instant;
 
     use fandhe_container_io::{
-        AppendFileSink, BATCH_SIZE_OPTION, IoError, IoErrorCode, IoTimeout, MAX_IO_TIMEOUT,
-        NoopServerObserver, SinkOpenMode, UNFLUSHED_MAX_BYTES_OPTION, UNFLUSHED_MAX_FRAMES_OPTION,
-        WritebackSettings, WritebackStats, WritebackTimeouts, parse_batch_size,
-        parse_unflushed_limit,
+        AppendFileSink, BATCH_SIZE_OPTION, Batch, BatchSink, IoError, IoErrorCode, IoTimeout,
+        MAX_IO_TIMEOUT, NoopServerObserver, SinkOpenMode, SinkPersistReport, SinkWriteReport,
+        UNFLUSHED_MAX_BYTES_OPTION, UNFLUSHED_MAX_FRAMES_OPTION, WritebackSettings, WritebackStats,
+        WritebackTimeouts, decode_request, parse_batch_size, parse_unflushed_limit,
+        persist_support,
     };
 
     use super::{EXIT_OK, EXIT_SERVE, EXIT_STARTUP, EXIT_USAGE, json_escape};
@@ -90,6 +99,19 @@ mod app {
     const SOCKET_OPTION: &str = "--socket";
     const DATA_DIR_OPTION: &str = "--data-dir";
     const FILE_OPTION: &str = "--file";
+    const SINK_OPTION: &str = "--sink";
+    /// `DeferredPersistSink` が `persist` まで保持するバイト数の上限（無制限確保の防止）。
+    /// 試験の書き込み量（30 件 × 8 バイト程度）より十分大きい値にする。
+    const DEFERRED_BUFFER_CAP: usize = 1024 * 1024;
+
+    /// 書き込み先 sink の種別。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SinkKind {
+        /// 製品の `AppendFileSink`。
+        AppendFile,
+        /// 試験専用の `DeferredPersistSink`（`persist` までファイルへ書かない）。
+        Deferred,
+    }
 
     /// 解析済みの起動引数。
     #[derive(Debug)]
@@ -100,6 +122,7 @@ mod app {
         batch_size: Option<String>,
         unflushed_frames: Option<String>,
         unflushed_bytes: Option<String>,
+        sink: SinkKind,
     }
 
     /// 値やパスを含めない `InvalidArgument`（ログ汚染の防止）。
@@ -116,6 +139,7 @@ mod app {
         let mut batch_size = None;
         let mut frames = None;
         let mut bytes = None;
+        let mut sink = None;
 
         let mut it = args.take(MAX_ARGS + 1);
         let mut count = 0usize;
@@ -138,6 +162,16 @@ mod app {
                 }
                 DATA_DIR_OPTION => {
                     if data_dir.replace(PathBuf::from(value)).is_some() {
+                        return Err(invalid("duplicate option"));
+                    }
+                }
+                SINK_OPTION => {
+                    let kind = match value.to_str() {
+                        Some("append-file") => SinkKind::AppendFile,
+                        Some("deferred") => SinkKind::Deferred,
+                        _ => return Err(invalid("unknown sink kind")),
+                    };
+                    if sink.replace(kind).is_some() {
                         return Err(invalid("duplicate option"));
                     }
                 }
@@ -169,7 +203,101 @@ mod app {
             batch_size,
             unflushed_frames: frames,
             unflushed_bytes: bytes,
+            sink: sink.unwrap_or(SinkKind::AppendFile),
         })
+    }
+
+    /// 試験専用 sink（`--sink deferred`）。`write_batch` は body をメモリへ積むだけで、
+    /// `persist` が呼ばれて初めてファイルへ書き `sync_all` する。
+    ///
+    /// 役割: 通常 ACK がバッチ書き込み後に返っても、FLUSH ACK の前に `persist` が走らなければ
+    /// SIGKILL でデータが失われる状態（spec の PoC の「ACK 済みで未書き込み」）を再現する。
+    /// `tests/crash_safety.rs` が、`persist` を経る場合（FLUSH ACK 後に kill）と経ない場合
+    /// （通常 ACK のみで kill）の結果差を検証する（IO-3・IO-2）。製品コードではない（REPAIR-3）。
+    pub struct DeferredPersistSink {
+        file: std::fs::File,
+        pending: Vec<u8>,
+    }
+
+    impl DeferredPersistSink {
+        /// `dir/name` を `create_new` で空のまま作る（READY 前に作るため、未フラッシュ時の
+        /// ディスク照合は「0 バイト = 全件欠落」になる）。`name` はディレクトリ区切り・`..`・
+        /// NUL・空を拒否する（既存ファイル・symlink の上書きも `create_new` が拒否する）。
+        pub fn create_in(dir: &Path, name: &str) -> Result<Self, IoError> {
+            let bad =
+                name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']);
+            if bad {
+                return Err(invalid("invalid file name"));
+            }
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(dir.join(name))
+                .map_err(|e| {
+                    IoError::new(
+                        IoErrorCode::Internal,
+                        format!("deferred sink open failed ({:?})", e.kind()),
+                    )
+                })?;
+            Ok(Self {
+                file,
+                pending: Vec::new(),
+            })
+        }
+
+        /// 未 persist のバイト数（ユニットテスト用）。
+        #[cfg(test)]
+        fn pending_len(&self) -> usize {
+            self.pending.len()
+        }
+    }
+
+    impl BatchSink for DeferredPersistSink {
+        fn write_batch(&mut self, batch: &Batch) -> Result<SinkWriteReport, IoError> {
+            let mut frames = 0usize;
+            let mut bytes = 0u64;
+            for frame in batch.frames() {
+                let body = decode_request(frame)?.body();
+                let next = self.pending.len().saturating_add(body.len());
+                if next > DEFERRED_BUFFER_CAP {
+                    return Err(IoError::new(
+                        IoErrorCode::Internal,
+                        "deferred sink buffer cap exceeded",
+                    ));
+                }
+                self.pending.extend_from_slice(body);
+                frames += 1;
+                bytes += u64::try_from(body.len()).unwrap_or(0);
+            }
+            Ok(SinkWriteReport::new(frames, bytes))
+        }
+
+        fn persist(&mut self) -> Result<SinkPersistReport, IoError> {
+            // 非対応環境では本体の試験と同じく FLUSH ACK 経路で失敗させる（Unimplemented）
+            if !persist_support().is_supported() {
+                return Err(IoError::new(
+                    IoErrorCode::Unimplemented,
+                    "persist is not supported on this platform (IO-2)",
+                ));
+            }
+            let start = Instant::now();
+            let io_err = |e: std::io::Error| {
+                IoError::new(
+                    IoErrorCode::Internal,
+                    format!("deferred sink persist failed ({:?})", e.kind()),
+                )
+            };
+            self.file.write_all(&self.pending).map_err(io_err)?;
+            self.file.sync_all().map_err(io_err)?;
+            self.pending.clear();
+            Ok(SinkPersistReport::new(start.elapsed()))
+        }
+    }
+
+    /// `run_server` が保持する sink（`serve` を型ごとに呼び分けるための列挙）。
+    enum ServerSink {
+        Append(AppendFileSink),
+        Deferred(DeferredPersistSink),
     }
 
     fn stats_json(s: &WritebackStats) -> String {
@@ -252,11 +380,20 @@ mod app {
         let settings = WritebackSettings::new(batch).with_unflushed_limit(limit);
 
         // READY を出す前に起動エラーをすべて確定させるため、sink を bind より先に開く。
-        let mut sink =
-            match AppendFileSink::open_in(&args.data_dir, &args.file, SinkOpenMode::CreateNew) {
-                Ok(s) => s,
-                Err(e) => return startup_failure(e),
-            };
+        let mut sink = match args.sink {
+            SinkKind::AppendFile => {
+                match AppendFileSink::open_in(&args.data_dir, &args.file, SinkOpenMode::CreateNew) {
+                    Ok(s) => ServerSink::Append(s),
+                    Err(e) => return startup_failure(e),
+                }
+            }
+            SinkKind::Deferred => {
+                match DeferredPersistSink::create_in(&args.data_dir, &args.file) {
+                    Ok(s) => ServerSink::Deferred(s),
+                    Err(e) => return startup_failure(e),
+                }
+            }
+        };
         let mut bound = match settings.bind(&args.socket, NoopServerObserver) {
             Ok(b) => b,
             Err(e) => return startup_failure(e),
@@ -275,13 +412,14 @@ mod app {
             Ok(c) => c,
             Err(e) => return startup_failure(e),
         };
-        let report = conn.serve(
-            &mut sink,
-            WritebackTimeouts {
-                recv: timeout,
-                send: timeout,
-            },
-        );
+        let timeouts = WritebackTimeouts {
+            recv: timeout,
+            send: timeout,
+        };
+        let report = match &mut sink {
+            ServerSink::Append(s) => conn.serve(s, timeouts),
+            ServerSink::Deferred(s) => conn.serve(s, timeouts),
+        };
         let code = if is_clean_peer_disconnect(&report.end) {
             EXIT_OK
         } else {
@@ -310,6 +448,90 @@ mod app {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use fandhe_container_io::{
+            BatchBuffer, BatchConfig, FrameKind, InFlightLimit, PushOutcome, SendQueue,
+            WireRequestId, encode_request,
+        };
+
+        fn args(list: &[&str]) -> Result<ServerArgs, IoError> {
+            parse_args(list.iter().map(OsString::from))
+        }
+
+        const BASE: [&str; 6] = ["--socket", "/x/s", "--data-dir", "/x", "--file", "d.bin"];
+
+        /// IO-3・#1832: `--sink` の既定は append-file、指定・重複・不明値を検証する。
+        #[test]
+        fn sink_option_parsing() {
+            assert_eq!(args(&BASE).unwrap().sink, SinkKind::AppendFile);
+            let mut with = BASE.to_vec();
+            with.extend(["--sink", "deferred"]);
+            assert_eq!(args(&with).unwrap().sink, SinkKind::Deferred);
+            let mut dup = with.clone();
+            dup.extend(["--sink", "deferred"]);
+            assert_eq!(args(&dup).unwrap_err().code(), IoErrorCode::InvalidArgument);
+            let mut bad = BASE.to_vec();
+            bad.extend(["--sink", "nope"]);
+            assert_eq!(args(&bad).unwrap_err().code(), IoErrorCode::InvalidArgument);
+        }
+
+        fn temp_dir(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!("fcio-dps-{}-{tag}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        /// request id 8 バイト + body 8 バイトの Write フレーム 1 件のバッチを作る。
+        /// フレームは `SendQueue` が払い出した id から `encode_request` で組み立てる（REPAIR-2）。
+        fn one_write_batch(seq: u64) -> Batch {
+            let mut queue = SendQueue::new(InFlightLimit::new(1).unwrap());
+            let registered = queue.register(FrameKind::Write).unwrap();
+            let id = WireRequestId::from(registered.id());
+            let frame = encode_request(FrameKind::Write, id, &seq.to_le_bytes()).unwrap();
+            let mut buf = BatchBuffer::new(BatchConfig::new(1).unwrap());
+            match buf.push(frame).unwrap() {
+                PushOutcome::Ready(b) => b,
+                other => panic!("batch_size=1 must fire immediately, got {other:?}"),
+            }
+        }
+
+        /// IO-3・#1832: `write_batch` 後は `persist` まで 0 バイト、`persist` 後に全件が見える。
+        #[test]
+        fn deferred_sink_writes_only_on_persist() {
+            let dir = temp_dir("persist");
+            let mut sink = DeferredPersistSink::create_in(&dir, "d.bin").unwrap();
+            for seq in 0..3u64 {
+                sink.write_batch(&one_write_batch(seq)).unwrap();
+            }
+            let path = dir.join("d.bin");
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+            assert_eq!(sink.pending_len(), 24);
+            if persist_support().is_supported() {
+                sink.persist().unwrap();
+                assert_eq!(std::fs::metadata(&path).unwrap().len(), 24);
+                assert_eq!(sink.pending_len(), 0);
+            } else {
+                assert_eq!(
+                    sink.persist().unwrap_err().code(),
+                    IoErrorCode::Unimplemented
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// セキュリティ: ファイル名の区切り・`..` を拒否し、既存ファイルは上書きしない。
+        #[test]
+        fn deferred_sink_rejects_bad_names_and_existing_files() {
+            let dir = temp_dir("names");
+            for name in ["", ".", "..", "a/b", "..\\x", "../x"] {
+                assert!(
+                    DeferredPersistSink::create_in(&dir, name).is_err(),
+                    "{name}"
+                );
+            }
+            DeferredPersistSink::create_in(&dir, "ok.bin").unwrap();
+            assert!(DeferredPersistSink::create_in(&dir, "ok.bin").is_err());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
 
         /// IO-3・TASK-18.1.1: 正常切断だけが終了コード 0 の対象になる。
         #[test]

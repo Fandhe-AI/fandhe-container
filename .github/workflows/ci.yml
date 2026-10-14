@@ -567,7 +567,8 @@ jobs:
             Linux|macOS)
               expected=(
                 "unix::io3_flushed_data_survives_10_valid_sigkills"
-                "unix::io3_unflushed_control_records_loss_without_asserting"
+                "unix::io3_deferred_sink_unflushed_loses_all_acked_data_in_10_valid_sigkills"
+                "unix::io3_deferred_sink_flushed_keeps_all_data_in_10_valid_sigkills"
               )
               ;;
             Windows)

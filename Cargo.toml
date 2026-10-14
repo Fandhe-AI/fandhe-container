@@ -79,9 +79,9 @@ unicode-normalization = { version = "=0.1.25", default-features = false }
 # Cargo.lock には rustls-webpki の optional 依存として ring / cc の項目が残るが、これは rustls-webpki 側の
 # `ring?/alloc`（weak feature）をロック解決が拾うためで、有効な feature には ring が無く、
 # `cargo tree -e normal,build -i ring --target all` は何も出力しない（ビルド・リンクされない）。
-# rustls は RUSTSEC-2026-0285 の修正版 0.23.45。ルート証明書は OS のストア（rustls-native-certs）から読む。
+# rustls は RUSTSEC-2026-0346〜0349 の修正版 0.23.46。ルート証明書は OS のストア（rustls-native-certs）から読む。
 ureq = { version = "=3.4.2", default-features = false, features = ["rustls-no-provider"] }
-rustls = { version = "=0.23.45", default-features = false, features = ["std", "tls12", "logging"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "tls12", "logging"] }
 rustls-graviola = { version = "=0.4.0" }
 rustls-native-certs = { version = "=0.8.4" }
 # cri-api の .proto から gRPC コードを生成する build.rs 用（CRI-3・TASK-56.3）。承認: Issue #425・TASK-56.hdep1。

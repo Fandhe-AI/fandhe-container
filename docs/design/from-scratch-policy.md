@@ -55,7 +55,7 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 | `dispatch2` | =0.3.1 | libdispatch（macOS のみ） | #356 |
 | `windows-sys` | =0.61.2 | Windows API（Windows のみ） | #371 |
 | `ureq` | =3.4.2 | OCI Distribution API の HTTPS クライアント（OCI-1。crates/oci のみ。default-features 無効・`rustls-no-provider`） | #399 |
-| `rustls` | =0.23.45 | TLS（crates/oci のみ。default-features 無効・`std`/`tls12`/`logging`。RUSTSEC-2026-0285 の修正版のため 0.23.45 未満へ固定しない） | #399 |
+| `rustls` | =0.23.46 | TLS（crates/oci のみ。default-features 無効・`std`/`tls12`/`logging`。RUSTSEC-2026-0346〜0349 の修正版のため 0.23.46 未満へ固定しない） | #399 |
 | `rustls-graviola` | =0.4.0 | rustls の暗号実装（純 Rust・C ビルドなし。crates/oci のみ。CPU 機能不足は panic させず構造化エラーで返す） | #399 |
 | `rustls-native-certs` | =0.8.4 | OS のルート証明書の読み込み（crates/oci のみ。webpki-roots の代わり） | #399 |
 | `flate2` | =1.1.10 | gzip 展開（OCI-1。crates/oci。展開後サイズの上限は呼び出し側で検証）と、CRI ストリーミングの SPDY/3.1 ヘッダの zlib 辞書（CRI-6。crates/cri。`set_dictionary`）。default-features 無効・`zlib-rs` backend で純 Rust。参照は crates/oci と crates/cri のみ | #406・#678 |

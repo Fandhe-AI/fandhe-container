@@ -298,6 +298,12 @@ const SHARED_BODY_LEN: usize = 20;
 /// - `finished`（全書き込み完了・全 ACK 済み）なら全レコードを厳密に照合し、tail を
 ///   空・件数を全数とする。
 fn check_shared_snapshot(snapshot: &[u8], acked: &[u64], finished: bool, iter: u64) {
+    let sent_total = usize::from(SHARED_CLIENTS) * SHARED_FRAMES as usize * SHARED_BODY_LEN;
+    assert!(
+        snapshot.len() <= sent_total,
+        "iter {iter}: snapshot ({} bytes) is longer than everything sent ({sent_total} bytes)",
+        snapshot.len()
+    );
     let (recs, tail) = decompose_records_prefix(snapshot);
     let mut next = vec![0u32; usize::from(SHARED_CLIENTS)];
     for rec in &recs {
@@ -307,6 +313,10 @@ fn check_shared_snapshot(snapshot: &[u8], acked: &[u64], finished: bool, iter: u
             "iter {iter}: client {client} out of range"
         );
         let seq = record_seq(rec);
+        assert!(
+            seq < SHARED_FRAMES,
+            "iter {iter}: client {client} seq {seq} out of range"
+        );
         let slot = next
             .get_mut(usize::from(client))
             .expect("client index checked above");
@@ -736,6 +746,18 @@ fn io4_helper_shared_check_accepts_valid_tail_prefix() {
 fn io4_helper_shared_check_rejects_corrupt_tail_bytes() {
     let mut data = two_acked_records();
     data.extend([0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
+    check_shared_snapshot(&data, &[2, 0, 0, 0], false, 0);
+}
+
+/// ヘルパー検証（#1828）: 送信総量を超えるゼロ領域を足したスナップショットを拒否する。
+#[test]
+#[should_panic(expected = "is longer than everything sent")]
+fn io4_helper_shared_check_rejects_oversized_zero_tail() {
+    let mut data = two_acked_records();
+    data.resize(
+        usize::from(SHARED_CLIENTS) * SHARED_FRAMES as usize * SHARED_BODY_LEN + 1,
+        0,
+    );
     check_shared_snapshot(&data, &[2, 0, 0, 0], false, 0);
 }
 

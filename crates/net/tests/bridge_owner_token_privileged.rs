@@ -78,6 +78,29 @@ mod linux {
         Duration::from_secs(secs)
     }
 
+    /// SIGKILL の後に `try_wait` を有限の猶予でポーリングして回収する（期限なしの `wait` は使わない。REPAIR-5）。
+    /// 猶予内に回収できなければ `false` を返し、呼び出し側が結果に含めて明示的に失敗させる。
+    fn kill_and_reap(c: &mut std::process::Child) -> bool {
+        let _ = c.kill();
+        let grace = Instant::now() + Duration::from_secs(5);
+        loop {
+            if matches!(c.try_wait(), Ok(Some(_))) {
+                return true;
+            }
+            if Instant::now() >= grace {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// 現在のプロセスの netns 識別子（`/proc/self/ns/net` のリンク先。`net:[inode]`）。
+    fn netns_id() -> Result<String, String> {
+        fs::read_link("/proc/self/ns/net")
+            .map(|p| p.to_string_lossy().into_owned())
+            .map_err(|e| format!("read_link /proc/self/ns/net: {e}"))
+    }
+
     pub fn launcher() {
         let uid_root = fs::read_to_string("/proc/self/status")
             .expect("read /proc/self/status")
@@ -88,10 +111,13 @@ mod linux {
             == Some("0");
         assert!(uid_root, "this test requires root (euid 0); see AGENTS.md");
         let exe = std::env::current_exe().expect("current_exe");
+        // 子が新規 netns であることを識別子の比較で確認するため、ランチャ（元の netns）の識別子を渡す。
+        let parent_ns = netns_id().expect("launcher netns id");
         let mut c = Command::new("unshare")
             .args(["--net", "--"])
             .arg(exe)
             .arg("--child")
+            .arg(format!("--parent-netns={parent_ns}"))
             .stdin(Stdio::null())
             .spawn()
             .expect("spawn unshare child");
@@ -101,9 +127,8 @@ mod linux {
                 break st;
             }
             if Instant::now() >= deadline {
-                let _ = c.kill();
-                let _ = c.wait();
-                panic!("child did not exit within the timeout");
+                let reaped = kill_and_reap(&mut c);
+                panic!("child did not exit within the timeout (reaped after SIGKILL: {reaped})");
             }
             std::thread::sleep(Duration::from_millis(20));
         };
@@ -125,9 +150,8 @@ mod linux {
                 break;
             }
             if Instant::now() >= deadline {
-                let _ = c.kill();
-                let _ = c.wait();
-                return Err("ip timed out".to_owned());
+                let reaped = kill_and_reap(&mut c);
+                return Err(format!("ip timed out (reaped after SIGKILL: {reaped})"));
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -164,6 +188,15 @@ mod linux {
 
     pub fn child() {
         // (0) 新しい netns であること。ホストの bridge を触らないための防御。
+        // ランチャの netns 識別子と同一、または確認不能なら、何も変更せず拒否する。
+        let parent_ns = std::env::args()
+            .find_map(|a| a.strip_prefix("--parent-netns=").map(str::to_owned))
+            .unwrap_or_else(|| fail("missing --parent-netns (run via the launcher)"));
+        let own_ns = netns_id().unwrap_or_else(|e| fail(&e));
+        if own_ns == parent_ns {
+            fail(&format!("child shares the launcher netns ({own_ns})"));
+        }
+        // 補助: 新規 netns に出るデバイスだけであること。
         let devs = fs::read_to_string("/proc/net/dev").unwrap_or_else(|e| fail(&e.to_string()));
         for l in devs.lines().skip(2) {
             let n = l.split(':').next().map(str::trim).unwrap_or_default();

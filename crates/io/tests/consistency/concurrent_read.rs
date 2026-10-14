@@ -545,6 +545,7 @@ fn spawn_truncate_reader(
     iters: Arc<AtomicU64>,
     barrier: Arc<Barrier>,
     stage_len_range: Vec<Option<(usize, usize)>>,
+    checked: Arc<AtomicU64>,
 ) -> std::thread::JoinHandle<BTreeSet<usize>> {
     std::thread::spawn(move || {
         barrier_wait_within(&barrier, join_deadline());
@@ -568,6 +569,11 @@ fn spawn_truncate_reader(
                     "stage {seen}: length {} outside {min}..={max} after truncate",
                     snapshot.len()
                 );
+                // 段階の期待長（範囲の上限）ちょうどを観測した回数。次の truncate が
+                // 先に進んでいる場合は範囲内でも上限と異なるので数えない。
+                if snapshot.len() == *max {
+                    checked.fetch_add(1, Ordering::Release);
+                }
             }
             lens.insert(snapshot.len());
             iters.fetch_add(1, Ordering::Release);
@@ -609,6 +615,7 @@ fn io4_concurrent_read_truncate_to_zero_while_reading() {
         Arc::clone(&iters),
         Arc::clone(&barrier),
         vec![None, Some((0, 0))],
+        Arc::new(AtomicU64::new(0)),
     );
     barrier_wait_within(&barrier, join_deadline());
     wait_for_iters(&iters, 20);
@@ -656,6 +663,7 @@ fn io4_concurrent_read_truncate_to_record_boundary_and_mid_record_while_reading(
     let stage = Arc::new(AtomicU8::new(0));
     let iters = Arc::new(AtomicU64::new(0));
     let barrier = Arc::new(Barrier::new(2));
+    let checked = Arc::new(AtomicU64::new(0));
     let reader = spawn_truncate_reader(
         path.clone(),
         old,
@@ -667,12 +675,15 @@ fn io4_concurrent_read_truncate_to_record_boundary_and_mid_record_while_reading(
             Some((boundary, boundary + FRAGMENT)),
             Some((boundary, boundary)),
         ],
+        Arc::clone(&checked),
     );
     barrier_wait_within(&barrier, join_deadline());
     wait_for_iters(&iters, 20);
     truncate_to(&path, (boundary + FRAGMENT) as u64);
     stage.store(1, Ordering::Release);
-    wait_for_iters(&iters, iters.load(Ordering::Acquire) + 10);
+    // 段階 2 へ進む前に、段階 1 のスナップショットが期待長（境界+端数）ちょうどである
+    // ことを読み手が 10 回観測するのを期限付きで待つ（REPAIR-12・REPAIR-5）。
+    wait_for_iters(&checked, 10);
     truncate_to(&path, boundary as u64);
     stage.store(2, Ordering::Release);
     let lens = join_within(reader, join_deadline());

@@ -733,10 +733,10 @@ mod socket {
         /// 名前から ifindex を引く（`RTM_GETLINK`。TASK-139.1・#314）。無ければ `NotFound`。
         /// 応答はカーネル由来の外部入力として検証する（`decode_ifinfomsg_index`）。
         pub fn link_index(&self, name: &IfName, timeout: Duration) -> Result<IfIndex, NetError> {
-            self.link_index_and_alias(name, timeout).map(|(i, _)| i)
+            self.link_index_alias(name, timeout).map(|(i, _)| i)
         }
 
-        /// 名前から ifindex を引き、`IFLA_IFALIAS` が `token`（作成時に付けた所有トークン）と
+        /// 名前から ifindex を引き、`IFLA_IFALIAS` が `token`（`RTM_SETLINK` で付けた所有トークン）と
         /// 一致する場合のみ返す（TASK-139.1・#314）。不一致（別者が同名 link に差し替えた等）は
         /// `FailedPrecondition` で、呼び出し側はその link を操作・削除してはならない。
         pub fn link_index_owned(
@@ -745,7 +745,7 @@ mod socket {
             token: &str,
             timeout: Duration,
         ) -> Result<IfIndex, NetError> {
-            let (index, alias) = self.link_index_and_alias(name, timeout)?;
+            let (index, alias) = self.link_index_alias(name, timeout)?;
             if alias.as_deref() == Some(token) {
                 Ok(index)
             } else {
@@ -789,7 +789,10 @@ mod socket {
                 })
         }
 
-        fn link_index_and_alias(
+        /// 名前から ifindex と別名（`IFLA_IFALIAS`。無ければ `None`）を 1 回の `RTM_GETLINK` で引く
+        /// （Issue #1925）。作成直後の bridge が印の無い（別名が空の）link であることの確認に使う。
+        /// 応答はカーネル由来の外部入力として検証する。無ければ `NotFound`。
+        pub fn link_index_alias(
             &self,
             name: &IfName,
             timeout: Duration,

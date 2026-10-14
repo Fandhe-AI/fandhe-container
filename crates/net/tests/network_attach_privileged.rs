@@ -24,8 +24,9 @@
 //! 待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で期限を切る（REPAIR-5）。前提（root・
 //! 外部コマンド）を満たさない場合は skip せず失敗する。
 //!
-//! `create_network` が `ResolveIndex` で失敗する場合は TASK-139.1 の所有トークン（作成時 `IFLA_IFALIAS`）が
-//! 実カーネルで機能していない疑いであり、本タスクでは修正せず（スコープ外）その旨を出力して失敗する。
+//! `create_network` が `ResolveIndex` で失敗する場合は所有トークンの付与・読み戻しが実カーネルで通っていない
+//! 疑いとして名指しで失敗する。作成時の `IFLA_IFALIAS` はカーネルが反映しなかったため、作成後の
+//! `RTM_SETLINK` で付ける方式に直した（Issue #1925。実機での再確認は `bridge_owner_token_privileged`）。
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -335,7 +336,7 @@ mod linux {
         .map_err(|e| {
             if e.step == CreateStep::ResolveIndex {
                 fail(format!(
-                    "create_network failed at ResolveIndex ({e}); the TASK-139.1 bridge ownership token (IFLA_IFALIAS at creation) may not work on a real kernel (out of scope for TASK-139.2.1)"
+                    "create_network failed at ResolveIndex ({e}); the bridge ownership token (IFLA_IFALIAS set by RTM_SETLINK after creation, Issue #1925) may not be readable on this kernel; see bridge_owner_token_privileged"
                 ))
             } else {
                 fail(format!("create_network failed at {:?}: {e}", e.step))

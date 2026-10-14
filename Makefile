@@ -27,7 +27,8 @@ SHELL := /bin/bash
 	check-workspace-manifest fmt fmt-check lint test doc poc-venus-jig-check check-cli-backend-deps \
 	test-core-no-plugin plugin-feature-size plug4-core-invariance plug4-core-invariance-selftest \
 	test-integration cli-parity-selftest cli-parity-native-reclaim-check \
-	cli-parity-native-reclaim-selftest commit-msg-line-length-selftest lib-selftest \
+	cli-parity-native-reclaim-selftest commit-msg-line-length-selftest crash-summary-check \
+	crash-summary-check-selftest lib-selftest \
 	vz-virtio-gpu-guest-check-selftest third-party-licenses-selftest deny-license-fail-closed-selftest \
 	bench-check-selftest bench-baseline-selftest fio-bench-selftest fio-baseline-ratio-selftest \
 	startup-latency-selftest net-setup-timing-selftest dns-helper-measure-selftest idle-memory-selftest \
@@ -142,6 +143,12 @@ lib-selftest: ## scripts/lib.sh の workspace 判定の回帰テスト（bash 3.
 
 commit-msg-line-length-selftest: ## commit-msg 行長検査スクリプトの自己テスト（Issue #1295・REPAIR-12）
 	@scripts/check-commit-msg-line-length-selftest.sh
+
+crash-summary-check: ## crash_safety の件数サマリーを検証し表で出す。CRASH_SUMMARY_DIR 必須・CRASH_SUMMARY_OS 任意（#1833・IO-3）
+	@scripts/check-crash-summary.sh --dir "$(CRASH_SUMMARY_DIR)" $(if $(CRASH_SUMMARY_OS),--os "$(CRASH_SUMMARY_OS)",)
+
+crash-summary-check-selftest: ## crash-summary-check スクリプトの自己テスト（#1833・IO-3・REPAIR-12。fixture のみ）
+	@scripts/with-tools.sh jq scripts/check-crash-summary-selftest.sh
 
 vz-virtio-gpu-guest-check-selftest: ## virtio-gpu ゲスト側確認スクリプトの自己テスト（TASK-172.6・GPU-6・REPAIR-12。fixture のみ）
 	@poc/vz-custom-virtio-gpu/guest/check-virtio-gpu-selftest.sh

@@ -2402,6 +2402,31 @@ mod tests {
         assert_eq!(e.rollback.leftover, unknown_bridge("web"));
     }
 
+    /// NET-1・Issue #1925: 非 UTF-8 の別名（復号結果は置換文字入りの非空文字列）は所有者不明として扱い、
+    /// 作成直後は上書きせず、印の付与後に差し替わっても削除しない（ロールバックは `_` 腕で Unknown）。
+    #[test]
+    fn net1_non_utf8_alias_is_unknown_owner() {
+        let lossy = "\u{fffd}".to_owned();
+        let f = Fake {
+            initial_alias: Some(lossy.clone()),
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        assert_eq!(f.calls(), ["create_bridge", "link_state"]);
+        assert!(e.rollback.removed.is_empty());
+        assert_eq!(e.rollback.leftover, unknown_bridge("web"));
+
+        let f = Fake {
+            swap_after_setlink: Some((7, Some(lossy))),
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        assert_eq!(e.step, CreateStep::ResolveIndex);
+        assert!(e.rollback.removed.is_empty());
+        assert_eq!(e.rollback.leftover, unknown_bridge("web"));
+        assert!(!f.calls().contains(&"delete_bridge"));
+    }
+
     /// NET-1・Issue #1925: 作成直後の NotFound は残るものが無く空報告。
     #[test]
     fn net1_new_link_not_found_reports_nothing() {

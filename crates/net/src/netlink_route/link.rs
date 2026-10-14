@@ -464,7 +464,9 @@ impl LinkDelete {
 /// `RTM_NEWLINK` 応答のペイロードから `IFLA_IFALIAS` を取り出す（無ければ `None`）。
 ///
 /// 応答はカーネル由来の外部入力として属性走査で検証する。NUL 終端を除いた UTF-8 文字列のみ返し、
-/// 不正な属性列は `DataLoss`、UTF-8 でない別名は `None` 扱い（所有トークンと一致し得ないため）。
+/// 不正な属性列は `DataLoss`。UTF-8 でない別名は「別名なし」と区別するため、置換文字入りの非空文字列
+/// （`from_utf8_lossy`）で返す。所有トークン（ASCII）とは一致せず、空でもないので、呼び出し側は
+/// 所有者不明として扱い、上書きも削除もしない（Issue #1925・NET-1）。
 pub fn decode_ifinfomsg_alias(payload: &[u8]) -> Result<Option<String>, NetError> {
     let attrs = payload.get(IFINFOMSG_LEN..).ok_or_else(|| {
         NetError::new(
@@ -477,8 +479,8 @@ pub fn decode_ifinfomsg_alias(payload: &[u8]) -> Result<Option<String>, NetError
         if attr.attr_type() == IFLA_IFALIAS {
             let raw = attr.payload();
             let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
-            let text = raw.get(..end).and_then(|b| std::str::from_utf8(b).ok());
-            return Ok(text.map(str::to_owned));
+            let bytes = raw.get(..end).unwrap_or_default();
+            return Ok(Some(String::from_utf8_lossy(bytes).into_owned()));
         }
     }
     Ok(None)
@@ -641,6 +643,19 @@ mod tests {
         assert_eq!(kids.len(), 1);
         assert_eq!(kids[0].attr_type(), IFLA_INFO_KIND);
         assert_eq!(kids[0].payload(), b"bridge\0");
+    }
+
+    /// Issue #1925: 非 UTF-8 の別名は「別名なし」ではなく非空の別名として復号する（NET-1）。
+    #[test]
+    fn net1_non_utf8_alias_is_not_decoded_as_absent() {
+        let mut payload = vec![0u8; IFINFOMSG_LEN];
+        let attr_len: u16 = 4 + 3;
+        payload.extend_from_slice(&attr_len.to_ne_bytes());
+        payload.extend_from_slice(&IFLA_IFALIAS.to_ne_bytes());
+        payload.extend_from_slice(&[0xff, 0xfe, 0x00]);
+        payload.push(0); // 4 バイト境界への padding
+        let alias = decode_ifinfomsg_alias(&payload).unwrap().unwrap();
+        assert_eq!(alias, "\u{fffd}\u{fffd}");
     }
 
     /// Issue #1925: bridge の作成要求は `IFLA_IFALIAS` を載せない（カーネルは作成時の別名を捨てるため）。

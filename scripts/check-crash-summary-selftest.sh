@@ -76,6 +76,28 @@ mkgood "${work}/concat2"
 printf '%s %s\n' "$(line flushed true 10 0 false 0 0 | tr -d '\n')" "$(line flushed true 10 0 false 0 0 | tr -d '\n')" >"${work}/concat2/flushed.json"
 run "two valid summaries on one line" 1 Linux "${work}/concat2" "exactly 1 JSON value"
 
+# Windows のネイティブ jq.exe は CRLF で出力する。実 jq を包んで各行を CRLF にした偽 jq で再現する
+mkgood "${work}/crlf"
+mkdir -p "${work}/fakebin"
+real_jq="$(command -v jq)"
+cat >"${work}/fakebin/jq" <<FAKE
+#!/usr/bin/env bash
+"${real_jq}" "\$@" | awk '{ printf "%s\r\n", \$0 }'
+exit "\${PIPESTATUS[0]}"
+FAKE
+chmod +x "${work}/fakebin/jq"
+saved_path="${PATH}"
+PATH="${work}/fakebin:${PATH}"
+run "crlf jq output accepted" 0 Linux "${work}/crlf" "| deferred_unflushed | true | 10 | 10 | 0 | false | 10 | 300 | 300 | 10 | 10 |"
+if grep -q "$(printf '\r')" "${work}/summary.md"; then
+  echo "FAIL: crlf jq output leaked CR into summary"
+  fails=$((fails + 1))
+else
+  echo "ok: no CR in summary"
+fi
+run "crlf jq output still rejects concatenated values" 1 Linux "${work}/concat" "exactly 1 JSON value"
+PATH="${saved_path}"
+
 mkgood "${work}/badtype"
 sed 's/"valid":10/"valid":"10"/' "${work}/badtype/flushed.json" >"${work}/badtype/x" && mv "${work}/badtype/x" "${work}/badtype/flushed.json"
 run "string count" 1 Linux "${work}/badtype" "missing or invalid fields"

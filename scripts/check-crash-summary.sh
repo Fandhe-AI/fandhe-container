@@ -56,6 +56,11 @@ fi
 
 out="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
 
+# Windows の Git Bash のネイティブ jq.exe は出力が CRLF になり、コマンド置換が末尾の CR を残して
+# 件数比較（"1\r" != "1"）や TSV の表が壊れる。jq の出力から CR を除去して LF に正規化する。
+# パイプの失敗は pipefail で呼び出し側の `|| fail` に伝わる。
+jq_lf() { jq "$@" | tr -d '\r'; }
+
 # ディレクトリ内の実在エントリ名（ドットファイル・壊れた symlink を含む）を改行区切りで集める
 entries=""
 for f in "${dir}"/* "${dir}"/.[!.]* "${dir}"/..?*; do
@@ -115,9 +120,9 @@ for c in ${expected}; do
   lines="$(wc -l <"${f}" | tr -d ' ')"
   [ "${lines}" = "1" ] || fail "${c}.json must have exactly 1 line (got ${lines})"
   # 複数のトップレベル JSON 値（連結入力）を受け付けないよう、値がちょうど 1 件であることを確認する
-  count="$(jq -s 'length' "${f}")" || fail "${c}.json is not valid JSON"
+  count="$(jq_lf -s 'length' "${f}")" || fail "${c}.json is not valid JSON"
   [ "${count}" = "1" ] || fail "${c}.json must contain exactly 1 JSON value (got ${count})"
-  tsv="$(jq -r --arg case "${c}" "${filter}" "${f}")" || fail "${c}.json is not valid JSON"
+  tsv="$(jq_lf -r --arg case "${c}" "${filter}" "${f}")" || fail "${c}.json is not valid JSON"
   [ -n "${tsv}" ] || fail "${c}.json has missing or invalid fields"
   row="| $(printf '%s' "${tsv}" | sed 's/	/ | /g') |"
   rows="${rows}${row}

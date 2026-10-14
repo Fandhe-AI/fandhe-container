@@ -81,7 +81,7 @@ pub const AF_UNSPEC: u8 = 0;
 pub const IFINFOMSG_LEN: usize = 16;
 /// インターフェース名属性（`linux/if_link.h`）。
 pub const IFLA_IFNAME: u16 = 3;
-/// インターフェースの別名属性（`linux/if_link.h` の `IFLA_IFALIAS`）。作成時に付けた所有トークンを
+/// インターフェースの別名属性（`linux/if_link.h` の `IFLA_IFALIAS`）。`RTM_SETLINK` で付けた所有トークンを
 /// 後から読み戻して、同名の別 link に差し替わっていないかを確認するために使う（TASK-139.1）。
 pub const IFLA_IFALIAS: u16 = 20;
 /// 別名の最大長（NUL を含まない。`linux/if.h` の `IFALIASZ` = 256 から NUL 分を引いた値）。
@@ -159,7 +159,7 @@ fn ifinfomsg_for_create() -> [u8; IFINFOMSG_LEN] {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Kind {
-    Bridge { name: IfName, alias: Option<String> },
+    Bridge { name: IfName },
     Veth { name: IfName, peer: IfName },
 }
 
@@ -169,26 +169,13 @@ pub struct LinkCreate(Kind);
 
 impl LinkCreate {
     /// bridge を 1 本作る要求。
+    ///
+    /// 作成要求には `IFLA_IFALIAS`（所有トークン）を載せない。カーネルは作成時の
+    /// `IFLA_IFALIAS` を黙って捨てる（torvalds/linux v7.0 の `net/core/rtnetlink.c` で `IFLA_IFALIAS` を
+    /// 処理するのは `do_setlink` の `netif_set_alias` だけで、作成経路の `rtnl_newlink_create`・
+    /// `rtnl_create_link` は読まない。Issue #1925）。所有は作成の ACK 後に [`LinkSet::set_alias`] で付ける。
     pub fn bridge(name: IfName) -> Self {
-        Self(Kind::Bridge { name, alias: None })
-    }
-
-    /// bridge の作成時に `IFLA_IFALIAS`（所有トークン）を付ける。veth には付けられず
-    /// `InvalidArgument`。トークンは 1〜255 バイトの可視 ASCII のみ（NUL・空白・制御文字は不可）。
-    pub fn with_alias(self, alias: &str) -> Result<Self, NetError> {
-        if alias.is_empty() || alias.len() > IFALIAS_MAX_LEN {
-            return Err(invalid("link alias length must be 1 to 255 bytes"));
-        }
-        if !alias.bytes().all(|c| c.is_ascii_graphic()) {
-            return Err(invalid("link alias must be visible ASCII"));
-        }
-        match self.0 {
-            Kind::Bridge { name, .. } => Ok(Self(Kind::Bridge {
-                name,
-                alias: Some(alias.to_owned()),
-            })),
-            Kind::Veth { .. } => Err(invalid("link alias is supported for bridge only")),
-        }
+        Self(Kind::Bridge { name })
     }
 
     /// veth ペア（`name` と `peer`）を作る要求。同名は `InvalidArgument`（fail-closed）。
@@ -211,15 +198,12 @@ impl LinkCreate {
 
     /// nlmsghdr の後ろに続く `ifinfomsg` と属性を `b` へ書き込む。
     pub fn encode(&self, b: &mut NlMsgBuilder) -> Result<(), NetError> {
-        let (name, kind, peer, alias) = match &self.0 {
-            Kind::Bridge { name, alias } => (name, "bridge", None, alias.as_deref()),
-            Kind::Veth { name, peer } => (name, "veth", Some(peer), None),
+        let (name, kind, peer) = match &self.0 {
+            Kind::Bridge { name } => (name, "bridge", None),
+            Kind::Veth { name, peer } => (name, "veth", Some(peer)),
         };
         b.put_fixed(&ifinfomsg_for_create())?;
         b.put_attr(IFLA_IFNAME, &name.to_nul_terminated())?;
-        if let Some(alias) = alias {
-            b.put_attr(IFLA_IFALIAS, &nul_terminated(alias.as_bytes()))?;
-        }
         b.put_nested(IFLA_LINKINFO, |b| {
             b.put_attr(IFLA_INFO_KIND, &nul_terminated(kind.as_bytes()))?;
             if let Some(peer) = peer {
@@ -383,9 +367,10 @@ impl<'a> LinkSet<'a> {
         Self(SetKind::SetMaster { link, master })
     }
 
-    /// リンクに `IFLA_IFALIAS`（所有トークン）を設定する要求（TASK-139.4・#317・NET-1）。veth は作成時に
-    /// 別名を付けられないため、作成直後に ifindex 指定でこの要求を送って所有を刻む。トークンは
-    /// [`LinkCreate::with_alias`] と同じ制約（1〜255 バイトの可視 ASCII）で、違反は `InvalidArgument`。
+    /// リンクに `IFLA_IFALIAS`（所有トークン）を設定する要求（TASK-139.4・#317・NET-1）。カーネルは
+    /// 作成時の `IFLA_IFALIAS` を反映しないため（[`LinkCreate::bridge`]）、bridge・veth とも作成の ACK 後に
+    /// ifindex 指定でこの要求を送って所有を刻む。トークンは 1〜255 バイトの可視 ASCII のみ（NUL・空白・
+    /// 制御文字は不可）で、違反は `InvalidArgument`。
     pub fn set_alias(link: LinkRef, alias: &'a str) -> Result<Self, NetError> {
         if alias.is_empty() || alias.len() > IFALIAS_MAX_LEN {
             return Err(invalid("link alias length must be 1 to 255 bytes"));
@@ -658,35 +643,30 @@ mod tests {
         assert_eq!(kids[0].payload(), b"bridge\0");
     }
 
-    /// TASK-139.1: 所有トークンは IFLA_IFALIAS に NUL 終端で載り、応答側の復号で読み戻せる。
+    /// Issue #1925: bridge の作成要求は `IFLA_IFALIAS` を載せない（カーネルは作成時の別名を捨てるため）。
+    /// 別名の応答側の復号は読み戻しで使うので維持する。
     #[test]
-    fn net11_bridge_alias_is_encoded_and_decoded() {
-        let data = build(&LinkCreate::bridge(name("br0")).with_alias("tok-1").unwrap());
+    fn net11_bridge_create_has_no_alias_attr() {
+        let data = build(&LinkCreate::bridge(name("br0")));
         let mut it = NlMsgIter::new(&data);
         let msg = it.next().unwrap().unwrap();
-        let alias = msg
+        let types: Vec<u16> = msg
             .attrs(IFINFOMSG_LEN)
             .unwrap()
-            .map(|a| a.unwrap())
-            .find(|a| a.attr_type() == IFLA_IFALIAS)
-            .unwrap();
-        assert_eq!(alias.payload(), b"tok-1\0");
-        assert_eq!(
-            decode_ifinfomsg_alias(msg.payload()).unwrap().as_deref(),
-            Some("tok-1")
-        );
-        let plain = build(&LinkCreate::bridge(name("br0")));
-        let m = NlMsgIter::new(&plain).next().unwrap().unwrap();
-        assert_eq!(decode_ifinfomsg_alias(m.payload()).unwrap(), None);
+            .map(|a| a.unwrap().attr_type())
+            .collect();
+        assert_eq!(types, [IFLA_IFNAME, IFLA_LINKINFO]);
+        assert_eq!(decode_ifinfomsg_alias(msg.payload()).unwrap(), None);
         assert_eq!(
             decode_ifinfomsg_alias(&[0u8; 4]).unwrap_err().code(),
             NetErrorCode::DataLoss
         );
     }
 
-    /// TASK-139.1: 不正な別名と veth への付与は InvalidArgument。
+    /// TASK-139.4: 不正な別名は InvalidArgument（RTM_SETLINK 側の検証）。
     #[test]
     fn net11_alias_validation() {
+        let link = || LinkRef::Index(LinkIndex::new(3).unwrap());
         for bad in [
             "".to_owned(),
             "a b".to_owned(),
@@ -694,23 +674,11 @@ mod tests {
             "x".repeat(256),
         ] {
             assert_eq!(
-                LinkCreate::bridge(name("br0"))
-                    .with_alias(&bad)
-                    .unwrap_err()
-                    .code(),
+                LinkSet::set_alias(link(), &bad).unwrap_err().code(),
                 NetErrorCode::InvalidArgument
             );
         }
-        assert!(
-            LinkCreate::bridge(name("br0"))
-                .with_alias(&"x".repeat(255))
-                .is_ok()
-        );
-        let veth = LinkCreate::veth(name("v0"), name("v1")).unwrap();
-        assert_eq!(
-            veth.with_alias("t").unwrap_err().code(),
-            NetErrorCode::InvalidArgument
-        );
+        assert!(LinkSet::set_alias(link(), &"x".repeat(255)).is_ok());
     }
 
     /// NET-11: メッセージ全体のバイト列を期待値と完全一致で比べる。

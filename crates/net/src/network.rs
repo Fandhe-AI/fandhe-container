@@ -24,8 +24,23 @@
 //!
 //! # ロールバック
 //!
-//! bridge は作成時に `IFLA_IFALIAS` へ作成ごとに一意な所有トークンを付け、名前から ifindex を引く際に
-//! トークン一致を確認する。不一致（同名 link への差し替え）なら操作も削除もしない。bridge 作成要求が
+//! カーネルは作成要求（`RTM_NEWLINK`）の `IFLA_IFALIAS` を反映しない（torvalds/linux v7.0 の
+//! `net/core/rtnetlink.c` で `IFLA_IFALIAS` を処理するのは `do_setlink` の `netif_set_alias` だけ。
+//! Issue #1925）。そのため bridge は `NLM_F_EXCL` で作成した後、次の順で所有トークンを刻む。
+//!
+//! 1. 名前から ifindex と別名を 1 回の `RTM_GETLINK` で引く。別名が既にあれば別者が差し替えた link なので
+//!    止まる（削除しない）
+//! 2. その ifindex 指定の `RTM_SETLINK` で作成ごとに一意な所有トークンを `IFLA_IFALIAS` に付ける
+//!    （名前では指定しない。名前の差し替えを巻き込まない）
+//! 3. 名前から引き直して、ifindex が 1 と同じで別名がトークンと一致することを確認する
+//!
+//! 3 までに同名 link へ差し替えられれば ifindex か別名が食い違って検出する。確認後の操作はすべてトークン一致
+//! を確認してから行い、不一致（同名 link への差し替え）なら操作も削除もしない。2 の `RTM_SETLINK` が
+//! 失敗・時間切れの場合だけ、再照会して「ifindex が 1 と同じ」かつ（別名がトークン、または別名が空のまま）
+//! のときに限り、ifindex 指定で削除する（`rollback_unstamped`）。残余リスク: 1 の直前に `CAP_NET_ADMIN`
+//! 保持者が自分の bridge を別名なしで差し替えた場合に限り、その link に印を付ける窓が残る。同じ権限を持つ者が
+//! 相手のため権限境界は越えず、`NLM_F_EXCL` と ifindex 指定（名前の再解決なし）で窓を最小化している。
+//! bridge 作成要求が
 //! 送信後の応答エラー（`ResourceExhausted` 等）で失敗した場合は作成済みの可能性があるため
 //! `ResourceState::Unknown` で報告する（確定的な拒否のみ空報告）。
 //! 自分が作ったと確定した bridge のみ削除する（address は bridge と一緒に消える）。作成結果が
@@ -325,7 +340,8 @@ pub struct CreatedNetwork {
     pub bridge: IfName,
     /// bridge の ifindex。
     pub bridge_index: IfIndex,
-    /// bridge の `IFLA_IFALIAS` に付けた所有トークン（接続時に同名の別 link でないことを確認する）。
+    /// bridge の `IFLA_IFALIAS` に作成後の `RTM_SETLINK` で付けた所有トークン（接続時に同名の別 link で
+    /// ないことを確認する）。
     pub bridge_token: String,
     /// 専用 nft テーブル名。
     pub table: NftName,
@@ -344,8 +360,10 @@ pub enum CreateStep {
     DeriveNames,
     /// bridge 作成。
     CreateBridge,
-    /// ifindex の取得。
+    /// ifindex の取得と、所有トークンの読み戻し確認。
     ResolveIndex,
+    /// 所有トークンの付与（`RTM_SETLINK`。Issue #1925）。
+    SetOwnerToken,
     /// gateway アドレスの付与。
     AddAddress,
     /// bridge の up。
@@ -426,11 +444,14 @@ pub(crate) struct NftApplyFailure {
 /// 作成手順が使うカーネル操作の境界。Linux 実装とテストの fake を差し替えるための crate 内部トレイトで、
 /// 公開の拡張点（PLUG-1）ではない。
 pub(crate) trait NetworkOps {
-    /// bridge を作り、`IFLA_IFALIAS` に所有トークン `token` を付ける。
-    fn create_bridge(&self, name: &IfName, token: &str) -> Result<(), NetError>;
-    /// 名前から ifindex を引く。`IFLA_IFALIAS` が `token` と一致しない（同名の別 link に差し替わった）
-    /// 場合は `FailedPrecondition` で失敗し、その link を操作させない。
-    fn link_index(&self, name: &IfName, token: &str) -> Result<IfIndex, NetError>;
+    /// bridge を `NLM_F_EXCL` で作る。カーネルは作成時の `IFLA_IFALIAS` を反映しないため、所有トークンは
+    /// 作成後に [`set_owner_token`](Self::set_owner_token) で付ける（Issue #1925）。
+    fn create_bridge(&self, name: &IfName) -> Result<(), NetError>;
+    /// 名前から ifindex と現在の別名（`IFLA_IFALIAS`。無ければ `None`）を引く。所有の確認はしない。
+    /// 作成直後の link に別名が既にあれば、差し替えられた別者の link と判断するために使う。
+    fn link_state(&self, name: &IfName) -> Result<(IfIndex, Option<String>), NetError>;
+    /// ifindex 指定の `RTM_SETLINK` で `IFLA_IFALIAS` に所有トークンを付ける（名前は再解決しない）。
+    fn set_owner_token(&self, index: IfIndex, token: &str) -> Result<(), NetError>;
     /// 操作直前の所有再確認。`name` が今も `index` を指し、かつ所有トークンが `token` と一致する
     /// 場合のみ `Ok`。確認後に bridge が削除され ifindex が別 link に再利用された場合を、各操作の
     /// 直前で検出するために使う。不一致は `FailedPrecondition`。
@@ -476,7 +497,7 @@ fn is_definitely_rejected(code: NetErrorCode) -> bool {
     )
 }
 
-/// 作成ごとに一意な所有トークン（bridge の `IFLA_IFALIAS` に付ける）。プロセス ID・時刻・連番を含み、
+/// 作成ごとに一意な所有トークン（bridge の `IFLA_IFALIAS` に作成後の `RTM_SETLINK` で付ける）。プロセス ID・時刻・連番を含み、
 /// 他者が推測して同名 link に付け替えることは想定しない（そもそも `CAP_NET_ADMIN` が必要）。
 fn ownership_token(network: &NetworkName) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -546,6 +567,50 @@ fn rollback_bridge(
     }
 }
 
+/// 所有トークンの `RTM_SETLINK` が失敗・時間切れだった bridge を、自分のものと確定できる場合だけ戻す
+/// （Issue #1925）。名前から ifindex と別名を再照会し、
+///
+/// - `NotFound`: 残るものは無い（空報告）
+/// - ifindex が `index`（作成直後に別名なしで確認した link）と同じで、別名がトークン（反映済み）:
+///   [`rollback_bridge`]（所有再確認つき）で削除する
+/// - ifindex が `index` と同じで別名が空: 確認した link と同一で印が無いだけなので、ifindex 指定で削除する
+/// - それ以外（ifindex 違い・別の別名・再照会の失敗）: 差し替えと判断し、削除せず `Unknown` で報告する
+///
+/// 削除は常に ifindex 指定で、名前では削除しない。
+fn rollback_unstamped(
+    ops: &impl NetworkOps,
+    bridge: &IfName,
+    token: &str,
+    index: IfIndex,
+    report: &mut RollbackReport,
+) {
+    match ops.link_state(bridge) {
+        Err(e) if e.code() == NetErrorCode::NotFound => {}
+        Ok((i, Some(alias))) if i == index && alias == token => {
+            rollback_bridge(ops, bridge, token, index, report);
+        }
+        Ok((i, alias)) if i == index && alias.as_deref().is_none_or(str::is_empty) => {
+            match ops.delete_bridge(index) {
+                Ok(()) => report.removed.push(NetworkResource::Bridge(bridge.clone())),
+                Err(e) => {
+                    let state = if is_indeterminate(e.code()) {
+                        ResourceState::Unknown
+                    } else {
+                        ResourceState::Present
+                    };
+                    report
+                        .leftover
+                        .push((NetworkResource::Bridge(bridge.clone()), state));
+                }
+            }
+        }
+        _ => report.leftover.push((
+            NetworkResource::Bridge(bridge.clone()),
+            ResourceState::Unknown,
+        )),
+    }
+}
+
 /// 作成手順本体（OS 非依存。`ops` を差し替えて 3 OS で単体テストできる）。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn create_network_with(
@@ -562,10 +627,11 @@ pub(crate) fn create_network_with(
     let bridge = names.bridge().clone();
     let table = names.table().clone();
 
-    // 1. bridge 作成（所有トークン付き）。AlreadyExists は他者のリソースなので削除しない。
-    // 確定的な拒否以外（送信後の応答エラー等）は作成済みの可能性があるため Unknown で報告する。
+    // 1. bridge 作成。カーネルは作成時の IFLA_IFALIAS を反映しないため、この要求では所有を刻まない。
+    // AlreadyExists は他者のリソースなので削除しない。確定的な拒否以外（送信後の応答エラー等）は
+    // 作成済みの可能性があるため Unknown で報告する。
     let token = ownership_token(spec.name());
-    if let Err(e) = ops.create_bridge(&bridge, &token) {
+    if let Err(e) = ops.create_bridge(&bridge) {
         let mut report = RollbackReport::default();
         if !is_definitely_rejected(e.code()) {
             report
@@ -575,21 +641,54 @@ pub(crate) fn create_network_with(
         return Err(fail(collision_or(e), CreateStep::CreateBridge, report));
     }
 
-    // 2〜4. ifindex 取得後の失敗は、その ifindex で bridge を削除する（address も一緒に消える）。
-    // ifindex は所有トークンの一致を確認して得るため、作成後に同名の別 link へ差し替えられても
-    // それを操作・削除しない。取得前（不一致を含む）は自分の bridge と確定できないため、名前では
-    // 削除せず Unknown で報告する（fail-closed）。
-    let index = match ops.link_index(&bridge, &token) {
-        Ok(i) => i,
+    // 2. 作成直後の ifindex と別名を引く。別名が空でなければ別者が差し替えた link なので、自分のものと
+    // 確定できず削除しない（Unknown）。NotFound は残るものが無い。
+    let unknown_bridge = |report: &mut RollbackReport| {
+        report.leftover.push((
+            NetworkResource::Bridge(bridge.clone()),
+            ResourceState::Unknown,
+        ));
+    };
+    let index = match ops.link_state(&bridge) {
+        Ok((i, alias)) if alias.as_deref().is_none_or(str::is_empty) => i,
+        Ok(_) => {
+            let mut report = RollbackReport::default();
+            unknown_bridge(&mut report);
+            return Err(fail(
+                NetError::new(
+                    NetErrorCode::FailedPrecondition,
+                    "new bridge already has an alias (link was replaced)",
+                ),
+                CreateStep::ResolveIndex,
+                report,
+            ));
+        }
         Err(e) => {
             let mut report = RollbackReport::default();
-            report.leftover.push((
-                NetworkResource::Bridge(bridge.clone()),
-                ResourceState::Unknown,
-            ));
+            if e.code() != NetErrorCode::NotFound {
+                unknown_bridge(&mut report);
+            }
             return Err(fail(e, CreateStep::ResolveIndex, report));
         }
     };
+
+    // 3. ifindex 指定の RTM_SETLINK で所有トークンを付ける。失敗・時間切れでも反映済みの可能性があるため、
+    // 再照会して自分のものと確定できる場合だけ ifindex 指定で戻す。
+    if let Err(e) = ops.set_owner_token(index, &token) {
+        let mut report = RollbackReport::default();
+        rollback_unstamped(ops, &bridge, &token, index, &mut report);
+        return Err(fail(e, CreateStep::SetOwnerToken, report));
+    }
+
+    // 4. 読み戻し。名前から引き直した ifindex と別名が一致しなければ差し替えられたので、削除しない。
+    if let Err(e) = ops.verify_owned(&bridge, &token, index) {
+        let mut report = RollbackReport::default();
+        unknown_bridge(&mut report);
+        return Err(fail(e, CreateStep::ResolveIndex, report));
+    }
+
+    // 5〜7. 所有確認後の失敗は、その ifindex で bridge を削除する（address も一緒に消える）。
+    // 各操作の直前にトークン一致を再確認するため、同名の別 link へ差し替えられてもそれを操作・削除しない。
     let step_fail = |e: NetError, step: CreateStep| {
         let mut report = RollbackReport::default();
         rollback_bridge(ops, &bridge, &token, index, &mut report);
@@ -602,7 +701,7 @@ pub(crate) fn create_network_with(
     ops.set_up(index)
         .map_err(|e| step_fail(e, CreateStep::SetUp))?;
 
-    // 5. nft テーブル。バッチは all-or-nothing のため、Unknown 以外は nft 側に何も残らない。
+    // 8. nft テーブル。バッチは all-or-nothing のため、Unknown 以外は nft 側に何も残らない。
     if let Err(f) = ops.apply_nft(&table, &token) {
         let mut report = RollbackReport::default();
         rollback_bridge(ops, &bridge, &token, index, &mut report);
@@ -642,17 +741,26 @@ struct LinuxNetworkOps<'a> {
 
 #[cfg(target_os = "linux")]
 impl NetworkOps for LinuxNetworkOps<'_> {
-    fn create_bridge(&self, name: &IfName, token: &str) -> Result<(), NetError> {
+    fn create_bridge(&self, name: &IfName) -> Result<(), NetError> {
         self.route
-            .create_link(
-                &LinkCreate::bridge(name.clone()).with_alias(token)?,
-                self.timeout,
-            )
+            .create_link(&LinkCreate::bridge(name.clone()), self.timeout)
             .map(|_| ())
     }
 
-    fn link_index(&self, name: &IfName, token: &str) -> Result<IfIndex, NetError> {
-        self.route.link_index_owned(name, token, self.timeout)
+    fn link_state(&self, name: &IfName) -> Result<(IfIndex, Option<String>), NetError> {
+        self.route.link_index_alias(name, self.timeout)
+    }
+
+    fn set_owner_token(&self, index: IfIndex, token: &str) -> Result<(), NetError> {
+        let idx = LinkIndex::new(i32::try_from(index.get()).map_err(|_| {
+            NetError::new(NetErrorCode::InvalidArgument, "ifindex exceeds i32::MAX")
+        })?)?;
+        self.route
+            .set_link(
+                &LinkSet::set_alias(LinkRef::Index(idx), token)?,
+                self.timeout,
+            )
+            .map(|_| ())
     }
 
     fn verify_owned(&self, name: &IfName, token: &str, index: IfIndex) -> Result<(), NetError> {
@@ -1164,7 +1272,7 @@ fn rollback_veth<O: AttachOps>(
 /// default route。TASK-139.3）→ ポート公開（指定があれば DNAT を一括投入）。失敗時は自分が作った
 /// 部分資源（veth・netns・IPAM の払い出し）だけを戻し、元のエラーはロールバックの失敗で上書きしない。
 ///
-/// veth は作成時に `IFLA_IFALIAS` を付けられない（`LinkCreate::with_alias` は veth を拒否する）ため、
+/// veth も bridge と同じく作成時に `IFLA_IFALIAS` を付けられない（カーネルが反映しない。`LinkCreate::bridge` の doc）ため、
 /// 「`NLM_F_EXCL` 作成 + 直後の ifindex 確保 + `RTM_SETLINK` で所有トークンを刻む + 以降は ifindex 指定」で
 /// 運用する。作成から解決・刻印までの極小の窓に同名 link へ差し替えられる残余リスクは残る
 /// （`CAP_NET_ADMIN` を持つ者に限られる）。削除側はトークンの一致を確認してから消す（ifindex は再利用されうる）。
@@ -1767,7 +1875,20 @@ mod tests {
     struct Fake {
         calls: RefCell<Vec<&'static str>>,
         fail_bridge: Option<NetErrorCode>,
-        fail_index: bool,
+        /// 最初の link_state の失敗（作成直後の ifindex 取得）。
+        fail_index: Option<NetErrorCode>,
+        /// 作成直後に既に付いている別名（差し替えられた link の模型）。
+        initial_alias: Option<String>,
+        /// set_owner_token が返す失敗。`stamp_on_fail` なら失敗でも別名は反映済みにする。
+        fail_setlink: Option<NetErrorCode>,
+        stamp_on_fail: bool,
+        /// set_owner_token の後に link が差し替わる模型（ifindex と別名を置き換える）。
+        swap_after_setlink: Option<(u32, Option<String>)>,
+        /// set_owner_token の失敗後の再照会（2 回目以降の link_state）の失敗。
+        fail_requery: Option<NetErrorCode>,
+        /// カーネル模型: 現在の (ifindex, 別名)。
+        kernel: RefCell<Option<(u32, Option<String>)>>,
+        link_state_count: std::cell::Cell<u32>,
         fail_addr: bool,
         fail_up: bool,
         fail_nft: Option<(NetErrorCode, NftBatchOutcome)>,
@@ -1792,19 +1913,61 @@ mod tests {
     }
 
     impl NetworkOps for Fake {
-        fn create_bridge(&self, _: &IfName, _: &str) -> Result<(), NetError> {
+        fn create_bridge(&self, _: &IfName) -> Result<(), NetError> {
             self.rec("create_bridge");
-            self.fail_bridge.map_or(Ok(()), |c| Err(err(c)))
-        }
-        fn link_index(&self, _: &IfName, _: &str) -> Result<IfIndex, NetError> {
-            self.rec("link_index");
-            if self.fail_index {
-                return Err(err(NetErrorCode::NotFound));
+            if let Some(c) = self.fail_bridge {
+                return Err(err(c));
             }
-            IfIndex::new(7)
+            // 実カーネルと同じく、作成直後は別名なし（initial_alias は差し替えの注入）。
+            *self.kernel.borrow_mut() = Some((7, self.initial_alias.clone()));
+            Ok(())
         }
-        fn verify_owned(&self, _: &IfName, _: &str, _: IfIndex) -> Result<(), NetError> {
+        fn link_state(&self, _: &IfName) -> Result<(IfIndex, Option<String>), NetError> {
+            self.rec("link_state");
+            let n = self.link_state_count.get() + 1;
+            self.link_state_count.set(n);
+            if n == 1 {
+                if let Some(c) = self.fail_index {
+                    return Err(err(c));
+                }
+            } else if let Some(c) = self.fail_requery {
+                return Err(err(c));
+            }
+            let (i, a) = self
+                .kernel
+                .borrow()
+                .clone()
+                .ok_or_else(|| err(NetErrorCode::NotFound))?;
+            Ok((IfIndex::new(i)?, a))
+        }
+        fn set_owner_token(&self, _: IfIndex, token: &str) -> Result<(), NetError> {
+            self.rec("set_owner_token");
+            if let Some(c) = self.fail_setlink {
+                if self.stamp_on_fail
+                    && let Some(k) = self.kernel.borrow_mut().as_mut()
+                {
+                    k.1 = Some(token.to_owned());
+                }
+                return Err(err(c));
+            }
+            if let Some(k) = self.kernel.borrow_mut().as_mut() {
+                k.1 = Some(token.to_owned());
+            }
+            if let Some(sw) = self.swap_after_setlink.clone() {
+                *self.kernel.borrow_mut() = Some(sw);
+            }
+            Ok(())
+        }
+        fn verify_owned(&self, _: &IfName, token: &str, index: IfIndex) -> Result<(), NetError> {
             self.rec("verify_owned");
+            let ok = self
+                .kernel
+                .borrow()
+                .as_ref()
+                .is_some_and(|(i, a)| *i == index.get() && a.as_deref() == Some(token));
+            if !ok {
+                return Err(err(NetErrorCode::FailedPrecondition));
+            }
             if self.fail_verify_after.is_some_and(|n| {
                 let c = self.verify_count.get() + 1;
                 self.verify_count.set(c);
@@ -1876,7 +2039,9 @@ mod tests {
             f.calls(),
             [
                 "create_bridge",
-                "link_index",
+                "link_state",
+                "set_owner_token",
+                "verify_owned",
                 "verify_owned",
                 "add_address",
                 "verify_owned",
@@ -1884,6 +2049,7 @@ mod tests {
                 "apply_nft"
             ]
         );
+        assert!(token_names_network(&c.bridge_token, &nname("web")));
         assert_eq!(c.bridge, bridge_of("web"));
         assert_eq!(c.table.as_str(), "fandhe_net_web");
         assert_eq!(c.bridge_index.get(), 7);
@@ -1991,7 +2157,9 @@ mod tests {
                 CreateStep::AddAddress,
                 vec![
                     "create_bridge",
-                    "link_index",
+                    "link_state",
+                    "set_owner_token",
+                    "verify_owned",
                     "verify_owned",
                     "add_address",
                     "verify_owned",
@@ -2006,7 +2174,9 @@ mod tests {
                 CreateStep::SetUp,
                 vec![
                     "create_bridge",
-                    "link_index",
+                    "link_state",
+                    "set_owner_token",
+                    "verify_owned",
                     "verify_owned",
                     "add_address",
                     "verify_owned",
@@ -2032,11 +2202,11 @@ mod tests {
     #[test]
     fn net1_resolve_index_failure_does_not_delete_by_name() {
         let f = Fake {
-            fail_index: true,
+            fail_index: Some(NetErrorCode::Internal),
             ..Default::default()
         };
         let e = create_network_with(&f, &spec("web")).unwrap_err();
-        assert_eq!(f.calls(), ["create_bridge", "link_index"]);
+        assert_eq!(f.calls(), ["create_bridge", "link_state"]);
         assert_eq!(e.step, CreateStep::ResolveIndex);
         assert!(e.rollback.removed.is_empty());
         assert_eq!(
@@ -2143,7 +2313,7 @@ mod tests {
     #[test]
     fn net1_replaced_before_add_address_touches_nothing() {
         let f = Fake {
-            fail_verify_after: Some(0),
+            fail_verify_after: Some(1),
             ..Default::default()
         };
         let e = create_network_with(&f, &spec("web")).unwrap_err();
@@ -2151,7 +2321,9 @@ mod tests {
             f.calls(),
             [
                 "create_bridge",
-                "link_index",
+                "link_state",
+                "set_owner_token",
+                "verify_owned",
                 "verify_owned",
                 "verify_owned"
             ]
@@ -2172,7 +2344,7 @@ mod tests {
     #[test]
     fn net1_replaced_before_set_up_touches_nothing() {
         let f = Fake {
-            fail_verify_after: Some(1),
+            fail_verify_after: Some(2),
             ..Default::default()
         };
         let e = create_network_with(&f, &spec("web")).unwrap_err();
@@ -2193,7 +2365,7 @@ mod tests {
     fn net1_replaced_before_rollback_delete_is_not_deleted() {
         let f = Fake {
             fail_up: true,
-            fail_verify_after: Some(2),
+            fail_verify_after: Some(3),
             ..Default::default()
         };
         let e = create_network_with(&f, &spec("web")).unwrap_err();
@@ -2207,6 +2379,205 @@ mod tests {
                 ResourceState::Unknown
             )]
         );
+    }
+    fn unknown_bridge(n: &str) -> Vec<(NetworkResource, ResourceState)> {
+        vec![(
+            NetworkResource::Bridge(bridge_of(n)),
+            ResourceState::Unknown,
+        )]
+    }
+
+    /// NET-1・Issue #1925: 作成直後の link に別名が既にある（差し替え）なら、印を付けず削除もしない。
+    #[test]
+    fn net1_pre_aliased_new_link_is_not_stamped_or_deleted() {
+        let f = Fake {
+            initial_alias: Some("someone-else".to_owned()),
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        assert_eq!(f.calls(), ["create_bridge", "link_state"]);
+        assert_eq!(e.step, CreateStep::ResolveIndex);
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert!(e.rollback.removed.is_empty());
+        assert_eq!(e.rollback.leftover, unknown_bridge("web"));
+    }
+
+    /// NET-1・Issue #1925: 作成直後の NotFound は残るものが無く空報告。
+    #[test]
+    fn net1_new_link_not_found_reports_nothing() {
+        let f = Fake {
+            fail_index: Some(NetErrorCode::NotFound),
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        assert_eq!(e.step, CreateStep::ResolveIndex);
+        assert_eq!(e.rollback, RollbackReport::default());
+    }
+
+    /// NET-1・Issue #1925: 印を付けた後に ifindex が差し替わったら、読み戻しで検出して削除しない。
+    #[test]
+    fn net1_swap_after_stamp_detected_by_readback() {
+        for swapped in [
+            (9, None),
+            (9, Some("x".to_owned())),
+            (7, Some("x".to_owned())),
+        ] {
+            let f = Fake {
+                swap_after_setlink: Some(swapped),
+                ..Default::default()
+            };
+            let e = create_network_with(&f, &spec("web")).unwrap_err();
+            assert_eq!(
+                f.calls(),
+                [
+                    "create_bridge",
+                    "link_state",
+                    "set_owner_token",
+                    "verify_owned"
+                ]
+            );
+            assert_eq!(e.step, CreateStep::ResolveIndex);
+            assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+            assert!(e.rollback.removed.is_empty());
+            assert_eq!(e.rollback.leftover, unknown_bridge("web"));
+        }
+    }
+
+    /// NET-1・Issue #1925: RTM_SETLINK の失敗でも印が反映済みなら、所有再確認つきで ifindex 指定で削除する。
+    #[test]
+    fn net1_setlink_failure_with_stamp_applied_deletes_by_index() {
+        let f = Fake {
+            fail_setlink: Some(NetErrorCode::Timeout),
+            stamp_on_fail: true,
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        assert_eq!(
+            f.calls(),
+            [
+                "create_bridge",
+                "link_state",
+                "set_owner_token",
+                "link_state",
+                "verify_owned",
+                "delete_bridge"
+            ]
+        );
+        assert_eq!(e.step, CreateStep::SetOwnerToken);
+        assert_eq!(e.code(), NetErrorCode::Timeout);
+        assert_eq!(
+            e.rollback.removed,
+            [NetworkResource::Bridge(bridge_of("web"))]
+        );
+        assert!(e.rollback.leftover.is_empty());
+    }
+
+    /// NET-1・Issue #1925: RTM_SETLINK が失敗し別名が空のまま（同じ ifindex）なら、確認済みの自分の
+    /// link なので ifindex 指定で削除する。
+    #[test]
+    fn net1_setlink_failure_unstamped_same_index_deletes_by_index() {
+        let f = Fake {
+            fail_setlink: Some(NetErrorCode::Internal),
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        assert_eq!(
+            f.calls(),
+            [
+                "create_bridge",
+                "link_state",
+                "set_owner_token",
+                "link_state",
+                "delete_bridge"
+            ]
+        );
+        assert_eq!(e.step, CreateStep::SetOwnerToken);
+        assert_eq!(
+            e.rollback.removed,
+            [NetworkResource::Bridge(bridge_of("web"))]
+        );
+    }
+
+    /// NET-1・Issue #1925: RTM_SETLINK の失敗後に消えていれば空報告、再照会の失敗は削除せず Unknown。
+    #[test]
+    fn net1_setlink_failure_requery_outcomes() {
+        let f = Fake {
+            fail_setlink: Some(NetErrorCode::Internal),
+            fail_requery: Some(NetErrorCode::NotFound),
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        assert_eq!(e.rollback, RollbackReport::default());
+        assert!(!f.calls().contains(&"delete_bridge"));
+
+        let f = Fake {
+            fail_setlink: Some(NetErrorCode::Internal),
+            fail_requery: Some(NetErrorCode::Timeout),
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        assert!(e.rollback.removed.is_empty());
+        assert_eq!(e.rollback.leftover, unknown_bridge("web"));
+        assert!(!f.calls().contains(&"delete_bridge"));
+    }
+
+    /// NET-1・Issue #1925: 再照会で ifindex が違う・別の別名なら差し替えと判断し、削除しない。
+    #[test]
+    fn net1_setlink_failure_replaced_link_is_not_deleted() {
+        for swapped in [
+            (9, None),
+            (7, Some("x".to_owned())),
+            (9, Some("x".to_owned())),
+        ] {
+            let f = Fake {
+                fail_setlink: Some(NetErrorCode::Internal),
+                ..Default::default()
+            };
+            // 1 回目の link_state の後、set_owner_token の失敗前に差し替わった状態を再現する。
+            let ops = SwapOnSetlink {
+                inner: &f,
+                swapped: swapped.clone(),
+            };
+            let e = create_network_with(&ops, &spec("web")).unwrap_err();
+            assert_eq!(e.step, CreateStep::SetOwnerToken, "{swapped:?}");
+            assert!(e.rollback.removed.is_empty(), "{swapped:?}");
+            assert_eq!(e.rollback.leftover, unknown_bridge("web"), "{swapped:?}");
+            assert!(!f.calls().contains(&"delete_bridge"), "{swapped:?}");
+        }
+    }
+
+    /// `set_owner_token` の直前に link を差し替える包み（差し替え競合の注入）。
+    struct SwapOnSetlink<'a> {
+        inner: &'a Fake,
+        swapped: (u32, Option<String>),
+    }
+
+    impl NetworkOps for SwapOnSetlink<'_> {
+        fn create_bridge(&self, n: &IfName) -> Result<(), NetError> {
+            self.inner.create_bridge(n)
+        }
+        fn link_state(&self, n: &IfName) -> Result<(IfIndex, Option<String>), NetError> {
+            self.inner.link_state(n)
+        }
+        fn set_owner_token(&self, i: IfIndex, t: &str) -> Result<(), NetError> {
+            *self.inner.kernel.borrow_mut() = Some(self.swapped.clone());
+            self.inner.set_owner_token(i, t)
+        }
+        fn verify_owned(&self, n: &IfName, t: &str, i: IfIndex) -> Result<(), NetError> {
+            self.inner.verify_owned(n, t, i)
+        }
+        fn add_address(&self, i: IfIndex, g: &IpPrefix) -> Result<(), NetError> {
+            self.inner.add_address(i, g)
+        }
+        fn set_up(&self, i: IfIndex) -> Result<(), NetError> {
+            self.inner.set_up(i)
+        }
+        fn delete_bridge(&self, i: IfIndex) -> Result<(), NetError> {
+            self.inner.delete_bridge(i)
+        }
+        fn apply_nft(&self, t: &NftName, k: &str) -> Result<(), NftApplyFailure> {
+            self.inner.apply_nft(t, k)
+        }
     }
 }
 #[cfg(test)]

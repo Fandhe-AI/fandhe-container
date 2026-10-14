@@ -138,10 +138,12 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 | `deny-license-fail-closed-selftest` | `platform-ci`（ubuntu のみ。cargo-deny の判定が OS に依らないため。TASK-90.2・OSS-4・OSS-5） |
 | `third-party-licenses-selftest`・`third-party-licenses` | `platform-ci`（ubuntu のみ。表記の生成結果が OS に依らないため。TASK-103.2・OSS-5） |
 | `plug4-core-invariance-selftest`・`cli-parity-selftest`・`cli-parity-native-reclaim-check`・`cli-parity-native-reclaim-selftest`・`vz-virtio-gpu-guest-check-selftest`・`commit-msg-line-length-selftest` | `platform-ci`（PR は ubuntu・main は 3 OS。Windows は Git Bash） |
-| `bench-check-selftest`・`bench-baseline-selftest`・`bench-check`・`bench-plugin-boundary`・`plugin-feature-size` | `bench-regression` |
+| `test-core-no-plugin`・`check-cli-backend-deps` | `platform-ci`（PR は ubuntu・main は 3 OS。core の plugin 無効構成の検証〔PLUG-3・TASK-111.1〕・cli のバックエンド直接依存なしの検証〔CLI-1・PLUG-4・TASK-79.4〕） |
+| `lib-selftest` | `platform-ci`（PR は ubuntu・main は 3 OS。Windows は Git Bash。macOS では `/bin/bash` 3.2 でも回す。`scripts/lib.sh` の判定の回帰テスト。PR #1756） |
+| `bench-check-selftest`・`bench-baseline-selftest`・`bench-check`・`bench-plugin-boundary`・`plugin-feature-size`・`plug4-core-invariance` | `bench-regression` |
 | （対応 target なし。`rustup target add aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc` の後に、`<target>` をこの 3 つに置き換えて `cargo check --workspace --all-targets --all-features --target <target>` と `cargo clippy --workspace --all-targets --all-features --target <target> -- -D warnings`。`aarch64-apple-darwin`・`x86_64-pc-windows-msvc` は加えて既定 feature の `cargo clippy --workspace --all-targets --target <target> -- -D warnings` と `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --target <target>`。venus 試験治具は `cargo check` / `cargo clippy --manifest-path poc/venus-decoder/jig/Cargo.toml --locked --all-targets --target aarch64-apple-darwin`〔clippy は `-- -D warnings`〕） | `cross-target-check` |
 | `lint-docs` | `lint-docs` |
-| `check-workspace-manifest`（`make ci` の一部） | 専用の CI ジョブはない（手元で `make ci` を実行したときだけ走る。`make ci` はローカル任意）。workspace manifest が不正なら各 cargo ジョブのビルドが失敗するため、CI では間接的に検出される |
+| `check-workspace-manifest`（`make ci` の一部でもある） | `platform-ci`（PR は ubuntu・main は 3 OS。ステップ「workspace manifest・supervisor 登録の検証」。PR #1231。members から外れた crate のテストが `cargo test --workspace` から黙って抜けるのを直接検出する） |
 
 ### 推奨タイムアウト値（REPAIR-5・REPAIR-10 (c)）
 
@@ -152,7 +154,7 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 | plugin 都度起動の合計期限（spawn から応答受信まで）・応答後の終了猶予・強制終了後の回収待ち・stderr の収集待ち | 合計期限 既定 10 秒・上限 10 秒（0 と上限超過は構築不可）／終了猶予 5 秒（超過で強制終了）／回収待ち 2 秒（超過は回収失敗としてエラー）／stderr の収集待ち 500 ミリ秒（超過は途中結果で打ち切り、読み取りスレッドを停止させる。停止の確認は 1 秒まで。保持は 64 KiB まで） | `crates/plugin/src/lifecycle.rs` の `OneShotTimeout`・`ONE_SHOT_EXIT_TIMEOUT`・`ONE_SHOT_REAP_TIMEOUT`・`ONE_SHOT_STDERR_DRAIN_TIMEOUT`・`ONE_SHOT_STDERR_STOP_TIMEOUT`・`ONE_SHOT_STDERR_MAX_BYTES`（TASK-110.1・#258） | REPAIR-5・PLUG-7 |
 | plugin 常駐モードの起動期限（spawn から接続確立まで）・往復ごとの期限・失敗後の終了確認の猶予 | 起動期限 既定 10 秒・上限 10 秒（0 と上限超過は構築不可）／往復は呼び出しごとの `RpcTimeout`（送信と受信の合計）／往復失敗後の終了確認 200 ミリ秒／終了待ち・回収待ち・stderr 収集待ちは都度起動と共用 | `crates/plugin/src/lifecycle/resident.rs` の `ResidentStartTimeout`・`RESIDENT_EXIT_DETECT_TIMEOUT`（TASK-110.2・#259） | REPAIR-5・PLUG-7 |
 | 結合試験の実行ステップ | 10 分 | `platform-ci` ジョブの実行ステップ `timeout-minutes: 10` | TASK-86.2（#36）・TASK-87 |
-| ジョブ全体 | `platform-ci` 60 分・`bench-regression` 15 分・`ci-complete` 5 分 | 各ジョブの `timeout-minutes` | 多層防御 |
+| ジョブ全体 | `platform-ci` 60 分・`cross-target-check` 30 分・`bench-regression` 15 分・`ci-complete` 5 分 | 各ジョブの `timeout-minutes` | 多層防御 |
 
 - この env を読んで `IoTimeout` を組み立てる消費側コードは `crates/io/tests/responsiveness.rs`（TASK-85.1・#119、TASK-85.2・#120。REPAIR-5）。範囲外・非数値の値は fail-closed で panic し、未設定時の既定は 10 秒。`crates/core/tests/unshare_isolation.rs`（TASK-27.2・#134。Linux のみ、`-- --ignored` 時の子プロセス待ち）と `crates/core/tests/escape_suite.rs`（TASK-42.6・#204。同条件）も同 env を読むが、`IoTimeout` ではなく `Duration` を組み立て、範囲外（1〜600 秒以外）・非数値の値は panic せず既定の 10 秒へフォールバックする。UDS 対応 OS（Linux / macOS）でのみコンパイルされ、Windows では当該経路は対象外。他の結合試験（スタブのトランスポートを使うもの）は env を読まず、固定の短いタイムアウトを使う
 - 新しく書く応答待ち処理は 5〜10 秒の範囲を既定とする。ACK・plugin RPC・子プロセスなど相手の応答を待つ処理に、タイムアウトなしで無期限に待ち得る経路を追加する差分は P0（REPAIR-5。詳細は下記「タイムアウト保護された結合試験・ベンチ回帰」節および「レビュー観点」のタイムアウト項目）

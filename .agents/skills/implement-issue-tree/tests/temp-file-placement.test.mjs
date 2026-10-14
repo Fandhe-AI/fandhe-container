@@ -22,6 +22,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync, writeFileSync, mkdtempSync } from 'node:fs'
+import { trackTmp } from './lib/tmp-track.mjs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -38,7 +39,7 @@ if (markerIndex < 0) {
   throw new Error(`テスト境界マーカー ${DRIVER_MARKER} が実装スクリプトに存在しない（削除・改名は回帰テストを無効化する）`)
 }
 const definitionPart = source.slice(0, source.lastIndexOf('\n', markerIndex))
-const sliceDir = mkdtempSync(join(tmpdir(), 'implement-issue-tree-temp-file-placement-defs-'))
+const sliceDir = trackTmp(mkdtempSync(join(tmpdir(), 'implement-issue-tree-temp-file-placement-defs-')))
 const slicePath = join(sliceDir, 'implement-issue-tree-temp-file-placement-defs.mjs')
 // 実装スクリプトは `export const meta` 以外の top-level export を持てない（Workflow 起動制約）
 // ため、定義部は非 export のまま置き、切り出したスライス側で export 文を付与する。
@@ -276,10 +277,8 @@ test('formatMainWorktreeUntrackedWarning: バッククォート・$ を含むパ
 test('State/worktree 系の主要プロンプト（loadState・updateState merge/cleanup・state:init-all・state:high-water・sweep・orphan-scan・record-count）は TEMP_FILE_POLICY を個別に含む', () => {
   const labelsAndWindows = [
 ['状態ファイル読み込みタスク。', 600],
-    ['const mergePromptText = [', 400],
+    ['function stateWritePrompt(', 600],
     ["`worktree / branch 掃除タスク（状態ファイルの JSON マージは別エージェントが実施済み）。`", 400],
-    ["状態ファイル更新タスク（トップレベルフィールド perWorktreeByteReserveHighWater・", 400],
-    ["状態ファイル一括初期化タスク。", 400],
     ["'worktree スイープタスク（ラン終了時の残骸回収）。'", 500],
     ["'git worktree 一覧の取得タスク（読み取り専用。削除・変更は一切行わない）。'", 400],
     ["'git worktree レコード総数の取得タスク（読み取り専用。削除・変更は一切行わない）。'", 400],
@@ -292,10 +291,13 @@ test('State/worktree 系の主要プロンプト（loadState・updateState merge
   }
 })
 
-test('worktree:sweep はプロンプトに「1 回の Bash 呼び出しで実行する」旨を含む（retain_file/registered_file/candidates_file を mktemp で手順をまたいで参照するため）', () => {
+test('worktree:sweep はプロンプトに「1 回の Bash 呼び出しで実行する」旨と、worktree-remove.sh sweep の 1 コマンド（候補は nonce 区切りのヒアドキュメント）を含み、手順の本文（retain_file 等の mktemp 連鎖・rm）を持たない', () => {
   const idx = source.indexOf("'worktree スイープタスク（ラン終了時の残骸回収）。'")
-  const section = source.slice(idx, idx + 700)
-  assert.match(section, /1 回の Bash 呼び出しで一連の手順すべてを実行する/)
+  const end = source.indexOf("{ label: 'worktree:sweep'", idx)
+  const section = source.slice(idx, end)
+  assert.match(section, /1 回の Bash 呼び出しで実行する/)
+  assert.match(source.slice(idx - 1800, idx), /worktree-remove\.sh', undefined, ` sweep --file \$\{STATE_FILE\}`/)
+  assert.doesNotMatch(section, /retain_file|registered_file|candidates_file|mktemp|rm -rf/)
 })
 
 // --- (g) scanMainWorktreeUntracked のプロンプトが破壊的操作を含まず例外時に throw しない ---

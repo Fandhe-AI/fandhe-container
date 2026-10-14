@@ -689,8 +689,10 @@ jobs:
       # 直前のステップが書いた JSON を scripts/check-crash-summary.sh が fail-closed で検証する
       # （期待ケースの欠落・型不正は失敗。Windows は UDS 未対応でケース 0 件を確認する）。新ジョブにせず
       # 既存ジョブのステップとする（check-run 件数は不変）。値は env 経由で受け渡す
+      # !cancelled() を明示するのは、前段の cargo test が失敗しても保存済みの件数を集計するため
+      # （暗黙の success() だと失敗時に集計が飛ぶ）。元の試験失敗の結論は前段ステップが維持する
       - name: crash_safety 件数の集計（IO-3・#1833）
-        if: steps.count.outputs.count != '0' && env.HANG_PROBE != 'true'
+        if: ${{ !cancelled() && steps.count.outputs.count != '0' && env.HANG_PROBE != 'true' }}
         timeout-minutes: 5
         env:
           FANDHE_CONTAINER_CRASH_SUMMARY_DIR: ${{ runner.temp }}/crash-summary

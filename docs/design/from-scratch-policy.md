@@ -4,7 +4,7 @@
 
 - 決定日: 2026-09-26（ユーザー決定）
 - 関連 issue: #25（MS-0・TASK-73〜75 の前提）
-- 更新: 2026-10-10（オーナー判断。#399・#406・#408・#425・#540・#582・#597・#670・#678 の承認・不採用を反映。2026-10-12 の判断（#340）で rootless の外部ヘルパー pasta の例外を記録）
+- 更新: 2026-10-10（オーナー判断。#399・#406・#408・#425・#540・#582・#597・#670・#678 の承認・不採用を反映。2026-10-12 の判断（#340）で rootless の外部ヘルパー pasta の例外を記録。2026-10-12 の判断（#1048・#1525・#1318）で MoltenVK 動的ロードの自前ラッパー・`libloading`／`ash`／`vulkanalia` の不採用・`libc` の用途限定を反映）
 
 ## 方針
 
@@ -42,8 +42,8 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 
 | クレート | バージョン | 用途 | issue |
 | -------- | ---------- | ---- | ----- |
-| `libc` | =0.2.189 | syscall 宣言（全 OS） | #86 |
-| `nix` | =0.31.3 | syscall wrapper（Unix のみ cfg(unix)・feature 最小） | #86 |
+| `libc` | =0.2.189 | 自前 FFI 宣言の機械照合（2026-10-12 の判断で用途を限定。dev-dependencies のみで、製品コードの依存には入れない。syscall の宣言自体は各 crate の `sys` の自前宣言を続ける。`Cargo.toml` への追加は #1838 で行い、現時点では未導入） | #86・#1318 |
+| `nix` | =0.31.3 | syscall wrapper（Unix のみ cfg(unix)・feature 最小。どの crate も使っていない〔#1318 の判断〕） | #86 |
 | `unicode-normalization` | =0.1.25 | NFC / NFD の別表記の衝突検出（IO-5。io crate のみ。名前は正規化せず、`nfd()` で比べて衝突を構造化エラーで拒否する。#103 の決定） | #798（#1720 でそのまま使うと決定） |
 | `serde` | =1.0.229 | データシリアライズ | #138 |
 | `serde_json` | =1.0.151 | JSON（ペイロード・設定。crates/oci のトークン応答パースにも使用。TASK-51.2・#401） | #138 |
@@ -98,6 +98,9 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 | `serde_yml` | RUSTSEC-2025-0068（unsound・unmaintained）。repo は archived | #540 |
 | `basic-toml` | 保守終了（README に "no longer maintained"） | #582 |
 | `astral-tokio-tar` | tokio が前提で、2025〜2026 年に advisory が 5 件 | #408 |
+| `libloading` | MoltenVK の動的ロードの対象は POSIX の `dlopen` だけで、宣言は 4 個。入れても `Library::new`・`get` は `unsafe fn` のままで、各 crate の `sys` に FFI 宣言を置く現行の流儀と変わらないため、自前ラッパーにする。#1525 で `ash` の `loaded` feature を使う場合だけ `=0.8.9` で再検討する | #1048 |
+| `ash` | `ash =0.38.0` は最終リリースが 2024-04-01 で、呼び出しは `unsafe fn` のままのため `unsafe` も減らない。Vulkan 呼び出しは自前 FFI | #1525 |
+| `vulkanalia` | Vulkan 呼び出しは自前 FFI で行う | #1525 |
 | 署名検証クレート（`ed25519-dalek` 等） | PLUG-11 の既定実装はハッシュ一覧比較のため当面不要 | #281 |
 
 ## 例外の記録
@@ -111,9 +114,21 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 
 ## 承認待ち（後続 Phase）
 
-以下は対応 Phase の着手時にユーザー承認を取る：
+現在なし。
 
-- `libloading` 等（#1048。TASK-180・GPU-6・MAC-5）: macOS の GPU 経路で、外部ライブラリの MoltenVK をホスト側の GPU バックエンドが実行時に読み込む用途に限る。plugin の読み込みには使わない（plugin は別プロセス＋UDS に限る。PLUG-2）。libc 経由の自前 dlopen ラッパーで足りるかも併せて比較する
+- #1521（macOS 27 対応の `objc2-virtualization` への更新）はリリース待ちで保留中。採用・更新範囲は未決定
+
+## MoltenVK の動的ロード（自前 dlopen ラッパー）
+
+2026-10-12 の判断（#1048・#1525。TASK-180・GPU-6・MAC-5）。macOS の GPU 経路で、外部ライブラリの MoltenVK をホスト側の GPU バックエンドが実行時に読み込む用途に限る。実装は #1049・#1526 で行い、現時点では未実装。
+
+- 配置: `crates/plugin-macos` の `sys` モジュール（`cfg(unix)`）に `dlopen`・`dlsym`・`dlclose`・`dlerror` の自前ラッパーを置く。Cargo の依存は増えない（`Cargo.toml` は変えない）
+- Vulkan の呼び出しは自前 FFI で行い、ロードと関数解決は同じラッパーを使う（#1525）
+- 絶対パスだけを受け取る
+- 所有者とモードを検証してから開く（PLUG-11 と同じ水準）
+- ライブラリ名だけを渡す探索をしない
+- plugin の読み込みには使わない（plugin は別プロセス＋UDS に限る。PLUG-2）
+- `dlerror` のスレッド安全性は #1049 で照合する
 
 ## 未決事項
 

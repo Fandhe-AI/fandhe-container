@@ -520,3 +520,76 @@ pub fn flush_session_end_code() -> IoErrorCode {
 pub fn flush_acks_per_flush() -> u64 {
     u64::from(fandhe_container_io::persist_support().is_supported())
 }
+
+/// [`decompose_records`] の「書きかけの末尾を許す」版（#1828・IO-4・REPAIR-6）。
+///
+/// 書き込みと同時に読む読み手のスナップショットは、末尾に書きかけのレコード
+/// （ヘッダ未満・本体未満）や、拡張済みだが未書き込みでゼロ相当の領域を含みうる。
+/// 完全なレコードだけを分解し、残りを第 2 要素で返す。ヘッダが読めるのに `len` が
+/// [`BODY_HEADER_LEN`] 未満（全ゼロの未書き込み領域は除く）なら破損として panic する
+/// （無限ループさせない。REPAIR-5）。
+pub fn decompose_records_prefix(data: &[u8]) -> (Vec<Vec<u8>>, &[u8]) {
+    let mut records = Vec::new();
+    let mut rest = data;
+    loop {
+        let Some(header) = rest.get(..BODY_HEADER_LEN) else {
+            return (records, rest);
+        };
+        if rest.iter().all(|b| *b == 0) {
+            return (records, rest);
+        }
+        let len_bytes: [u8; 4] = header
+            .get(6..10)
+            .and_then(|s| s.try_into().ok())
+            .expect("header slice has a 4-byte len field");
+        let len = u32::from_le_bytes(len_bytes) as usize;
+        assert!(
+            len >= BODY_HEADER_LEN,
+            "decompose_records_prefix: declared record length {len} is shorter than a record \
+             header ({BODY_HEADER_LEN} bytes) — snapshot is corrupted"
+        );
+        let Some(record) = rest.get(..len) else {
+            return (records, rest);
+        };
+        records.push(record.to_vec());
+        rest = rest.get(len..).unwrap_or(&[]);
+    }
+}
+
+/// ACK 済みレコード数の共有カウンタ（#1828）。書き込み側が `recv_ack` ごとに
+/// [`AckProgress::advance`] し、読み手がファイルを開く「前」に
+/// [`AckProgress::acked`] を読む。ACK はバッチ書き込み完了後に返る
+/// （`writeback.rs` D3）ため、先に読んだ値のぶんは、その後に開いた読み手に
+/// 必ず見える。
+#[derive(Clone, Default)]
+pub struct AckProgress {
+    count: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl AckProgress {
+    /// 0 件から始める。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// ACK を 1 件受け取った後に呼ぶ。
+    pub fn advance(&self) {
+        self.count.fetch_add(1, Ordering::Release);
+    }
+
+    /// これまでの ACK 済み件数。
+    pub fn acked(&self) -> u64 {
+        self.count.load(Ordering::Acquire)
+    }
+}
+
+/// `path` を新しく開いて全体を読む（読み手のスナップショット。#1828）。
+/// 開く・読む失敗は panic で即座に落とす。
+pub fn sample_snapshot(path: &std::path::Path) -> Vec<u8> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).expect("reader must be able to open the output file");
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .expect("reader must be able to read the output file");
+    buf
+}

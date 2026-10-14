@@ -53,6 +53,32 @@
 //! `serve_connection` が `Unimplemented` で終了する。D4）とクライアントの
 //! drop はセッション終了にのみ使い、`sleep` によるタイミング同期は行わない。
 //!
+//! # 「書き込み・truncate と同時に読む読み手」の定義（#1828・[`concurrent_read`] の範囲）
+//!
+//! 上記の読み手は書き込み停止後に開き直す（close-to-open）のみだったため、
+//! 書き込み・truncate と同時に読む試験を足す。R を送信したレコード列の連結、
+//! スナップショットを「読み手がファイルを新しく開いて全体を読んだ結果」とする。
+//!
+//! - (a) 接頭辞: スナップショットは R の接頭辞である（順序入れ替え・他接続の
+//!   body の混入・穴が無い）。共有ファイルでは完全なレコードに分解でき、
+//!   クライアントごとの seq が 0 から連続する
+//! - (b) ACK 床: 読み手が ACK 済み件数 A を先に読んでから開いた場合、先頭の
+//!   A 件分は R と完全一致する（ACK はバッチ書き込み完了後に返る。永続化は
+//!   主張しない。IO-2 の領分）
+//! - (c) 書きかけ許容: 末尾にヘッダ未満・本体未満の書きかけが見えてよい。
+//!   ACK 床より後ろは「期待値または 0x00」まで許容する（3 OS の一次資料で
+//!   確認できる範囲に留める。根拠は [`concurrent_read`] モジュール doc）
+//! - (d) 単調性: 書き込みのみの局面では、同じ読み手の長さと ACK 床は減らない
+//! - (e) truncate: 書き込み側の静止点（`drain_acks` 後）で `set_len` する間、
+//!   各スナップショットは旧内容の接頭辞で、truncate 完了後に開けば期待長になる。
+//!   truncate 後に再開した書き込みは新 EOF に穴なしで着地する。静止点なしの
+//!   rename / truncate・同じオフセットへの上書き競合は対象外
+//!
+//! [`concurrent_read`] の 6 件（`io4_concurrent_read_*`）とヘルパー検証 3 件
+//! （`io4_helper_*`）は [`harness::DuplexEnd`] 基盤で 3 OS すべてで動く。
+//! 開始同期は Barrier・ACK 進行・チャネルのみで行い（`sleep` 不使用）、待ちには
+//! すべて期限を付ける（REPAIR-5）。
+
 //! # 実行する OS の方針
 //!
 //! [`harness::DuplexEnd`]（`std::sync::mpsc` によるメモリ内の二方向
@@ -73,7 +99,7 @@
 //! rename が担う性質で本スイートの検証対象外とし、R3 は置換後の最終内容の
 //! 完全一致だけを確認する。[`graceful_shutdown`] の 5 件（G1〜G5）も同じ
 //! [`harness::DuplexEnd`] 基盤（実ソケットを使わない）で 3 OS すべてで動き、
-//! OS 差の前提は置かない（合計 24 件）。
+//! OS 差の前提は置かない（合計 33 件）。
 
 #[path = "consistency/harness.rs"]
 mod harness;
@@ -86,3 +112,6 @@ mod rename_truncate;
 
 #[path = "consistency/graceful_shutdown.rs"]
 mod graceful_shutdown;
+
+#[path = "consistency/concurrent_read.rs"]
+mod concurrent_read;

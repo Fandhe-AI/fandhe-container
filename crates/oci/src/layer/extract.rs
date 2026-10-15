@@ -953,7 +953,9 @@ impl Extractor<'_> {
                     ids.push(id);
                 }
                 Some((m, id)) if m.file_type().is_symlink() => {
-                    if create && !self.names.is_touched(id) {
+                    // 削除マーカー（whiteout・不透明）の親解決（`create = false`）も通過履歴に記録し、
+                    // 後から同じ symlink を whiteout する並びを拒否する（OCI-2）。
+                    if !self.names.is_touched(id) {
                         self.names.traversed_links.insert(id);
                     }
                     follows += 1;
@@ -988,14 +990,16 @@ impl Extractor<'_> {
                     ));
                 }
                 None => {
-                    if !create {
-                        return Err(err(OciErrorCode::NotFound, "extraction path not found"));
-                    }
+                    // 同じレイヤーが whiteout 済みの symlink 名を親として辿る並びは、逆順と結果が
+                    // 変わるため、書き込み系・削除マーカー系のどちらでも拒否する（OCI-2）。
                     if self.names.link_tombstones.contains(&(parent_id, c.clone())) {
                         return Err(err(
                             OciErrorCode::InvalidArgument,
                             "entry path depends on the order of a symlink whiteout in the same layer",
                         ));
+                    }
+                    if !create {
+                        return Err(err(OciErrorCode::NotFound, "extraction path not found"));
                     }
                     let id = self.names.insert(parent_id, &c)?;
                     fs::create_dir(&cand).map_err(|e| map_fs_err(&e))?;
@@ -3397,10 +3401,13 @@ mod tests {
         ex.clear_opaque_dir(&os(&["d"])).unwrap();
         assert!(fs::symlink_metadata(sb.root.join("d/lnk")).is_err());
         assert_eq!(fs::read(sb.root.join("real/f")).unwrap(), b"r");
-        // 絶対ターゲット `/` は root へ戻されるため、消えるのは root 配下の中身だけ（root 自体は残る）。
-        ex.clear_opaque_dir(&os(&["esc"])).unwrap();
+        // 絶対ターゲット `/` は root へ戻されるため root の外へは出ない。親として通過した symlink `esc`
+        // 自身が root 直下の消去対象でもあり、並び順で結果が変わるため拒否される（OCI-2）。
+        assert_eq!(
+            ex.clear_opaque_dir(&os(&["esc"])).unwrap_err().code(),
+            OciErrorCode::InvalidArgument
+        );
         assert!(sb.root.is_dir());
-        assert!(names_in(&sb.root).is_empty());
         sb.assert_outside_untouched();
     }
 
@@ -3713,6 +3720,44 @@ mod tests {
         assert!(!sb.root.join("real").exists());
         assert!(fs::symlink_metadata(sb.root.join("abs")).is_ok());
         sb.assert_outside_untouched();
+    }
+
+    /// OCI-2: symlink を経由する親の whiteout と、その symlink 自身の whiteout は、並び順に依らず
+    /// 一貫して拒否される（どちらの順でも下位の `real/x` は残る）。
+    #[test]
+    #[cfg(unix)]
+    fn oci2_pipeline_whiteout_parent_via_symlink_is_order_independent() {
+        for order in [[("lnk/.wh.x"), (".wh.lnk")], [(".wh.lnk"), ("lnk/.wh.x")]] {
+            let sb = Sandbox::new();
+            let mut ex = ex_for(&sb, host_lstat);
+            lay(
+                &mut ex,
+                &[file("real/x", 0o644, b"x"), symlink("lnk", "real")],
+            );
+            let entries: Vec<Vec<u8>> = order.iter().map(|n| wh(n)).collect();
+            // どちらの順でも同じ理由で失敗する（失敗したレイヤーの展開結果は採用されない）。
+            assert_eq!(lay_err(&mut ex, &entries), OciErrorCode::InvalidArgument);
+        }
+    }
+
+    /// OCI-2: 不透明マーカーの親が symlink 経由のときも、その symlink の whiteout と順序非依存に拒否される。
+    #[test]
+    #[cfg(unix)]
+    fn oci2_pipeline_opaque_parent_via_symlink_is_order_independent() {
+        for order in [
+            ["lnk/.wh..wh..opq", ".wh.lnk"],
+            [".wh.lnk", "lnk/.wh..wh..opq"],
+        ] {
+            let sb = Sandbox::new();
+            let mut ex = ex_for(&sb, host_lstat);
+            lay(
+                &mut ex,
+                &[file("real/x", 0o644, b"x"), symlink("lnk", "real")],
+            );
+            let entries: Vec<Vec<u8>> = order.iter().map(|n| wh(n)).collect();
+            // どちらの順でも同じ理由で失敗する（失敗したレイヤーの展開結果は採用されない）。
+            assert_eq!(lay_err(&mut ex, &entries), OciErrorCode::InvalidArgument);
+        }
     }
 
     /// OCI-2: 0 / 0555 の遅延 mode ディレクトリを whiteout・不透明にしても finish_dirs が成功する。

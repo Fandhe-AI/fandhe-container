@@ -478,6 +478,13 @@ pub(crate) fn err(code: OciErrorCode, msg: &'static str) -> OciError {
     OciError::new(code, msg)
 }
 
+fn order_dependent() -> OciError {
+    err(
+        OciErrorCode::InvalidArgument,
+        "entry path depends on the order of a symlink whiteout in the same layer",
+    )
+}
+
 fn escapes() -> OciError {
     err(
         OciErrorCode::PermissionDenied,
@@ -1231,21 +1238,79 @@ impl Extractor<'_> {
             }
             return Ok(());
         }
-        if meta.file_type().is_symlink() {
-            if self.names.traversed_links.contains(&id) {
-                return Err(err(
-                    OciErrorCode::InvalidArgument,
-                    "entry path depends on the order of a symlink whiteout in the same layer",
-                ));
-            }
-            self.names
-                .link_tombstones
-                .insert((dir.id, target.to_os_string()));
-        }
+        self.guard_untouched_removal(dir.id, target, &path, &meta, Some(id))?;
         crate::whiteout::remove_tree_nofollow(&path)?;
         self.drop_deferred_subtree(&path);
         self.names.forget_tree(dir.id, target);
         Ok(())
+    }
+
+    /// 現在のレイヤーが触っていない（下位由来の）実体 `name`（`parent_id` 直下・物理パス `path`）を木ごと
+    /// 削除する前の履歴検査と登録（OCI-2）。
+    ///
+    /// 対象が symlink、または配下に symlink を含むディレクトリのとき、(1) 現在のレイヤーが既に経路として通過した
+    /// symlink を消すなら並び順で結果が変わるため `InvalidArgument` で拒否し、(2) そうでなければ
+    /// `(parent_id, name)` を `link_tombstones` へ登録して、削除後にその名前を親として辿るエントリを拒否する。
+    /// 祖先の一括削除でも子孫の symlink の履歴を見落とさず、`a/lnk/.wh.x` と `.wh.a` の順序に依らず
+    /// 同じ結果（どちらも拒否）にそろえる。
+    fn guard_untouched_removal(
+        &mut self,
+        parent_id: u64,
+        name: &OsStr,
+        path: &Path,
+        meta: &fs::Metadata,
+        id: Option<u64>,
+    ) -> Result<(), OciError> {
+        let has_link = if meta.file_type().is_symlink() {
+            if id.is_some_and(|i| self.names.traversed_links.contains(&i)) {
+                return Err(order_dependent());
+            }
+            true
+        } else if meta.is_dir() {
+            self.scan_subtree_links(path, id, 0)?
+        } else {
+            false
+        };
+        if has_link {
+            self.names
+                .link_tombstones
+                .insert((parent_id, name.to_os_string()));
+        }
+        Ok(())
+    }
+
+    /// `dir`（ID は分かれば `dir_id`）配下に symlink があるかを調べる読み取り専用の走査。通過履歴のある
+    /// symlink を見つけたら `InvalidArgument`。深さは `MAX_REMOVE_DEPTH`。
+    fn scan_subtree_links(
+        &self,
+        dir: &Path,
+        dir_id: Option<u64>,
+        depth: usize,
+    ) -> Result<bool, OciError> {
+        if depth >= crate::whiteout::MAX_REMOVE_DEPTH {
+            return Err(err(
+                OciErrorCode::ResourceExhausted,
+                "directory tree to remove is too deep",
+            ));
+        }
+        let meta = fs::symlink_metadata(dir).map_err(|e| map_fs_err(&e))?;
+        crate::whiteout::make_dir_removable(dir, &meta)?;
+        let mut found = false;
+        for entry in fs::read_dir(dir).map_err(|e| map_fs_err(&e))? {
+            let entry = entry.map_err(|e| map_fs_err(&e))?;
+            let name = entry.file_name();
+            let child_id = dir_id.and_then(|d| self.names.get(d, &name));
+            let m = fs::symlink_metadata(entry.path()).map_err(|e| map_fs_err(&e))?;
+            if m.file_type().is_symlink() {
+                if child_id.is_some_and(|i| self.names.traversed_links.contains(&i)) {
+                    return Err(order_dependent());
+                }
+                found = true;
+            } else if m.is_dir() && self.scan_subtree_links(&entry.path(), child_id, depth + 1)? {
+                found = true;
+            }
+        }
+        Ok(found)
     }
 
     /// `path` 配下（`path` 自身を含む）の遅延ディレクトリ mode を取り除く。`BTreeMap` の範囲走査で、
@@ -1331,15 +1396,7 @@ impl Extractor<'_> {
                     // 下位由来の symlink は `remove_whiteout_target` と同じ履歴検査・登録を行い、
                     // opaque / 祖先 whiteout の前後で結果が変わらないようにする（OCI-2）。
                     let m = fs::symlink_metadata(&child).map_err(|e| map_fs_err(&e))?;
-                    if m.file_type().is_symlink() {
-                        if found.is_some_and(|id| self.names.traversed_links.contains(&id)) {
-                            return Err(err(
-                                OciErrorCode::InvalidArgument,
-                                "entry path depends on the order of a symlink whiteout in the same layer",
-                            ));
-                        }
-                        self.names.link_tombstones.insert((dir_id, name.clone()));
-                    }
+                    self.guard_untouched_removal(dir_id, &name, &child, &m, found)?;
                     crate::whiteout::remove_tree_nofollow(&child)?;
                     self.drop_deferred_subtree(&child);
                     self.names.forget_tree(dir_id, &name);
@@ -3842,6 +3899,29 @@ mod tests {
             lay(&mut ex, &[dir("real", 0o755), symlink("lnk", "real")]);
             let c = lay_err(&mut ex, &entries);
             assert_eq!(c, OciErrorCode::InvalidArgument);
+        }
+    }
+
+    /// OCI-2: 祖先ディレクトリの一括削除でも配下 symlink の通過履歴を検査し、`a/lnk/.wh.x` と `.wh.a` の
+    /// 並び順に依らず同じ結果（どちらも拒否）になる。`prune_lower`（不透明マーカー）経由も同様。
+    #[test]
+    #[cfg(unix)]
+    fn oci2_pipeline_ancestor_removal_with_inner_symlink_is_order_independent() {
+        let lower = [
+            file("real/x", 0o644, b"x"),
+            dir("a", 0o755),
+            symlink("a/lnk", "../real"),
+        ];
+        for entries in [
+            vec![wh("a/lnk/.wh.x"), wh(".wh.a")],
+            vec![wh(".wh.a"), wh("a/lnk/.wh.x")],
+            vec![wh("a/lnk/.wh.x"), wh(".wh..wh..opq")],
+            vec![wh(".wh..wh..opq"), wh("a/lnk/.wh.x")],
+        ] {
+            let sb = Sandbox::new();
+            let mut ex = ex_for(&sb, host_lstat);
+            lay(&mut ex, &lower);
+            assert_eq!(lay_err(&mut ex, &entries), OciErrorCode::InvalidArgument);
         }
     }
 

@@ -127,6 +127,12 @@ pub(super) struct ContainerRecord {
     /// 停止（`Exited` 遷移）の時刻。未停止は 0（TASK-58.2。ContainerStatus〔TASK-58.3〕が応答に使う）。
     pub(super) finished_at_nanos: i64,
     pub(super) retained_bytes: usize,
+    /// 実行層（`ContainerRuntime`）の create・start を呼び出し中（TASK-59.2・#438）。
+    ///
+    /// 状態は `Created` のまま、並行する Start・Remove・親サンドボックスの除去を `FAILED_PRECONDITION` で
+    /// 拒否するためのフラグ。実行層を呼ぶ間はレジストリのロックを持たないので、このフラグで二重実行と
+    /// 取りこぼし（記録だけ消えて実行層に残る）を防ぐ。
+    pub(super) in_flight: bool,
 }
 
 impl ContainerRecord {

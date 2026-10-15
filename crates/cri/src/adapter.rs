@@ -13,8 +13,10 @@
 //! RPC になり得る。async ハンドラからは `tokio::task::spawn_blocking` 上で呼ぶこと（`image_pull` の前例）。
 //!
 //! **未実装・簡易実装（REPAIR-3）**: 本モジュールは呼び出し境界だけを提供する。RPC ハンドラへの接続は
-//! TASK-59.2（#438。create・start）・TASK-59.3（#439。stop・delete）、結合試験は TASK-59.4（#440）で行い、
-//! `ContainerRuntime` の実装（plugin 側。TASK-114）と OCI bundle の生成も本モジュールの範囲外である。
+//! create・start が TASK-59.2（#438。`CriRuntimeService::with_runtime` で注入したときだけ有効）、
+//! stop・delete が TASK-59.3（#439）、結合試験は TASK-59.4（#440）で行い、
+//! `ContainerRuntime` の実装（plugin 側。TASK-114）と OCI bundle の生成の本体も本モジュールの範囲外である
+//! （bundle の供給は [`BundleProvider`] の注入点だけを定義する）。
 
 use std::fmt;
 use std::path::PathBuf;
@@ -28,6 +30,7 @@ use fandhe_container_core::traits::{
 };
 use tonic::{Code, Status};
 
+use crate::runtime::v1::ContainerConfig;
 use crate::runtime::v1::ContainerState as CriContainerState;
 
 /// エラーメッセージとして返す最大バイト数。plugin 由来の untrusted な文字列のため cri 側でも上限を掛ける。
@@ -107,6 +110,27 @@ pub fn trait_error_to_status(err: &TraitError) -> Status {
         msg.truncate(end);
     }
     Status::new(code, msg)
+}
+
+/// CRI の `ContainerConfig` から OCI bundle（rootfs と `config.json`）を用意する注入点（TASK-59.2・#438・CRI-2）。
+///
+/// `CreateContainer` ハンドラが `ContainerRuntime::create` を呼ぶ直前に呼ぶ。CRI の要求は bundle の
+/// パスを持たないため、image の展開と `ContainerConfig` から `config.json` への変換は本トレイトの実装側の
+/// 責務とする。同期 API で、ハンドラは `spawn_blocking` 上から呼ぶ。
+///
+/// **未実装（REPAIR-3）**: 本番の実装（image 展開・config 変換・パスの検証）は未提供で、本リポでは
+/// テスト用の実装だけがある。`config` の内容（envs 等の秘密値を含みうる）をエラー文言へ含めないこと。
+pub trait BundleProvider: Send + Sync {
+    /// コンテナ用の bundle を用意し、その絶対パスを返す。失敗は ERR-3 の gRPC ステータスで返す。
+    fn prepare(
+        &self,
+        container_id: &str,
+        sandbox_id: &str,
+        config: &ContainerConfig,
+    ) -> Result<PathBuf, Status>;
+
+    /// `prepare` で用意した資源を解放する（`create` 失敗時の後始末。stop・delete の接続は TASK-59.3）。
+    fn release(&self, container_id: &str);
 }
 
 /// RPC ハンドラから `ContainerRuntime` を呼ぶアダプタ（CRI-2・CRI-7）。

@@ -2472,7 +2472,9 @@ fn launch_with_status_pipe(
     };
     let (read, write) = exec_status_pipe().map_err(not_started)?;
     let status = &write;
-    let pid = sys::fork_single_threaded_with(
+    // fork 前の stdout / stderr の同期 flush は無期限に止まり得て、下の状態 pipe の期限が効かなくなる
+    // （REPAIR-5・#1815）ため、flush しない経路を使う。子は `_exit` するので二重出力は起きない。
+    let pid = sys::fork_single_threaded_with_no_flush(
         is_single_threaded,
         move || child_body(status),
         EXIT_SETUP_FAILED,
@@ -5142,6 +5144,84 @@ mod prepared_launch_tests {
         let mut buf = [0u8; 4];
         pid_read.read_exact(&mut buf).unwrap();
         (result, sink, u32::from_le_bytes(buf))
+    }
+
+    /// 子プロセス側の本体（`REPAIR5_1815_MARKER` が無ければ何もしない）。親が stdout の pipe を満杯にした
+    /// 合図（`<marker>.go`）を待ってから、stdout に未送信のバッファを持った状態で起動処理を行い、期限内に
+    /// 失敗が返ったら `<marker>` を書く。
+    #[test]
+    fn repair5_1815_child_stdout_full_helper() {
+        let Some(marker) = std::env::var_os("REPAIR5_1815_MARKER") else {
+            return;
+        };
+        let marker = std::path::PathBuf::from(marker);
+        let go = marker.with_extension("go");
+        // libtest の見出しの出力が済んだ後で動いていることを親へ知らせる。
+        let _ = std::fs::write(marker.with_extension("ready"), b"1");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !go.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // 改行なしの 1 バイトは LineWriter に残り、flush すると満杯の pipe で止まる。
+        let _ = std::io::stdout().write_all(b"x");
+        let (result, _sink, _pid) = run(Behavior::Silent, Duration::from_millis(500));
+        // 満杯の stdout へ libtest が書いて止まる前に、完了を目印ファイルで親へ知らせる。
+        if result.is_err() {
+            let _ = std::fs::write(&marker, b"done");
+        }
+    }
+
+    /// REPAIR-5（#1815）: 親の stdout が満杯の pipe でバッファが未送信でも、期限つき起動は fork 前の
+    /// flush で止まらず、指定した timeout の範囲で失敗を返す。
+    #[test]
+    fn repair5_1815_launch_does_not_block_on_full_stdout_pipe() {
+        if std::env::var_os("REPAIR5_1815_MARKER").is_some() {
+            return;
+        }
+        let (reader, writer) = std::io::pipe().unwrap();
+        let filler_writer = writer.try_clone().unwrap();
+        let marker = std::env::temp_dir().join(format!("repair5-1815-{}", std::process::id()));
+        let (ready, go) = (marker.with_extension("ready"), marker.with_extension("go"));
+        for f in [&marker, &ready, &go] {
+            let _ = std::fs::remove_file(f);
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+                "exec::process::prepared_launch_tests::repair5_1815_child_stdout_full_helper",
+            ])
+            .env("REPAIR5_1815_MARKER", &marker)
+            .stdout(writer)
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let wait_for = |path: &Path, secs: u64| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+            while !path.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            path.exists()
+        };
+        let child_ready = wait_for(&ready, 20);
+        // 読まれない pipe を満杯にする（満杯になると書き込みスレッドが止まる）。
+        let filler = std::thread::spawn(move || {
+            let mut w = filler_writer;
+            let chunk = [0u8; 4096];
+            while w.write_all(&chunk).is_ok() {}
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        let _ = std::fs::write(&go, b"1");
+        let finished = child_ready && wait_for(&marker, 20);
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(reader);
+        let _ = filler.join();
+        for f in [&marker, &ready, &go] {
+            let _ = std::fs::remove_file(f);
+        }
+        assert!(finished, "launch blocked on a full stdout pipe");
     }
 
     /// 回収済みなら `/proc/<pid>` は残らない（ゾンビも残さない）。

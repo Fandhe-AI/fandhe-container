@@ -2602,6 +2602,21 @@ pub(crate) fn fork_single_threaded_no_flush<F: FnOnce() -> i32>(
     )
 }
 
+/// [`fork_single_threaded_with`] と同じ強制（注入された `Threads: 1` 判定・子は `_exit`）だが、**fork 前に親で
+/// stdout / stderr を flush しない**（REPAIR-5・TASK-29 追補・#1815）。
+///
+/// 期限つきの起動経路（`exec::process` の pivot 前段の状態 pipe 待ち）が使う。親の flush は出力先
+/// （パイプ満杯など）で無期限に止まり得て、状態 pipe の期限は fork の後に始まるため効かない。
+/// 子は `child` の後に `_exit` するだけで親の stdio バッファを flush しないので、flush を省いても二重出力は
+/// 起きない。ただし子の `child` が親から継承した stdout のバッファを書き出す処理を呼んではならない。
+pub(crate) fn fork_single_threaded_with_no_flush<F: FnOnce() -> i32>(
+    is_single_threaded: impl FnOnce() -> bool,
+    child: F,
+    panic_exit: i32,
+) -> Result<u32, SysError> {
+    fork_checked(is_single_threaded, child, panic_exit, false)
+}
+
 /// fork の共通本体。`flush_stdio` が真のときだけ fork 前に stdout / stderr を flush する。
 fn fork_checked<F: FnOnce() -> i32>(
     is_single_threaded: impl FnOnce() -> bool,

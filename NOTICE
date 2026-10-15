@@ -1,0 +1,35 @@
+fandhe-container
+Copyright 2026 The fandhe-container Authors
+
+This product is licensed under the Apache License, Version 2.0
+(see LICENSE-APACHE). The notices below are provided for attribution
+only and do not modify the license terms.
+
+--------------------------------------------------------------------
+Third-party attribution: moby/moby (Apache License 2.0)
+--------------------------------------------------------------------
+
+Source:  https://github.com/moby/moby
+File:    daemon/pkg/oci/defaults.go
+Commit:  9fabd6dfbb926381278c436a866bc8d6ac222274
+
+What was derived: only the path strings of the default OCI
+linux.readonlyPaths (5 entries: /proc/bus, /proc/fs, /proc/irq,
+/proc/sys, /proc/sysrq-trigger) and the /proc entries (10 entries) of
+the default linux.maskedPaths. No logic was copied. The corresponding
+definition file in this repository will be listed here when it is added
+(see issue #1850).
+
+The attribution lines of the moby NOTICE file at that commit:
+
+    Docker
+    Copyright 2012-2017 Docker, Inc.
+
+    This product includes software developed at Docker, Inc.
+    (https://www.docker.com).
+
+Other notices in the moby NOTICE file (third-party libraries unrelated
+to the derived path strings, and an export-control note) do not relate
+to any part of this product and are omitted under Section 4(d) of the
+Apache License 2.0. The full text is in the NOTICE file at the commit
+above.

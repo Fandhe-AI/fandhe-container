@@ -19,8 +19,8 @@
 //! (`exec::spawn_container_via_intermediate`)。fork は単一スレッドの呼び出しを要求するため、
 //! `ProductionLauncher` は [`LaunchMode::SelfBounded`] を宣言し、start は別スレッドを作らず呼び出しスレッドで
 //! 直接 `launch` を呼ぶ。起動済みの子の終了・回収は `ContainerChildProcess`(Linux。`exec::ContainerChild` の
-//! 回収状態の排他を再利用する)が担う。supervisor の結線(#1819)・実機前提の
-//! 結合試験(#1818)は後続(REPAIR-3)。
+//! 回収状態の排他を再利用する)が担う。実機前提の結合試験は `tests/production_launcher.rs`(#1818。実行は
+//! `-- --ignored`)。supervisor の呼び出しスレッドの再構成(#1819)は後続(REPAIR-3)。
 
 #[cfg(target_os = "linux")]
 use std::ffi::OsStr;

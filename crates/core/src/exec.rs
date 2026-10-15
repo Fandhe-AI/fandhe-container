@@ -9,7 +9,7 @@
 //! `exec/no_new_privs.rs`）、capability 削減（#173）と seccomp（#178・TASK-38.3）も同様に組み込み済み。
 //! cgroup 参加は `cgroups::CgroupJoin`（TASK-32.4・#161）が `StageHook` として実装済み（登録は呼び出し側）。
 //! exec 経路（SUP-6）の制限の再適用は [`prepare_exec_restrictions`] / [`reapply_restrictions`]
-//! （TASK-163.3・TASK-163.4・#502・#503。`exec/reapply.rs`。`setns` の後に使えるよう status fd と rootfs の固定を事前に保持する二段階 API。参加後の対象束縛と `/` を照合してから、rlimit・capability 削減・`NO_NEW_PRIVS`・Landlock・seccomp を launch と同じ順で適用する）。稼働中コンテナでのコマンド実行は、再適用の完了の証跡 [`ExecReady`] だけを受け取る [`spawn_exec_command`]（`exec/exec_command.rs`。fork → `close_range` → `execveat`。TASK-163.4・#503）が担う。launch 経路の制限適用の証跡は型付きトークン `LaunchReady`（#1714。`StagePipeline::run_then` が作り、`with_landlock` を含む全段の成功時にだけ exec を許す）。本番 launcher からの結線は #1715（REPAIR-3）。
+//! （TASK-163.3・TASK-163.4・#502・#503。`exec/reapply.rs`。`setns` の後に使えるよう status fd と rootfs の固定を事前に保持する二段階 API。参加後の対象束縛と `/` を照合してから、rlimit・capability 削減・`NO_NEW_PRIVS`・Landlock・seccomp を launch と同じ順で適用する）。稼働中コンテナでのコマンド実行は、再適用の完了の証跡 [`ExecReady`] だけを受け取る [`spawn_exec_command`]（`exec/exec_command.rs`。fork → `close_range` → `execveat`。TASK-163.4・#503）が担う。launch 経路の制限適用の証跡は型付きトークン `LaunchReady`（#1714。`StagePipeline::run_then` が作り、`with_landlock` を含む全段の成功時にだけ exec を許す）。本番 launcher からの結線は実装済み（`oci_runtime::ProductionLauncher`。#1816）。
 //!
 //! # 目指すフロー（Linux 専用）
 //!

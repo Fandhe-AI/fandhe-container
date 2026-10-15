@@ -87,6 +87,14 @@ path = "tests/exec_cgroup_kill.rs"
 name = "exec_cgroup_sweep"
 path = "tests/exec_cgroup_sweep.rs"
 
+# 本番 launcher（ProductionLauncher）を create -> start 経由で実プロセスに通す結合試験（CORE-1・CORE-2・CORE-5・
+# SEC-1・SEC-5・TASK-29 追補・#1818）。launcher の fork が単一スレッドを要求するため harness = false。
+# `-- --ignored` 指定時のみ実行する実機前提テスト（非特権 user namespace・Landlock ABI 6 以上・cgroup v2 委譲。AGENTS.md）。
+[[test]]
+name = "production_launcher"
+path = "tests/production_launcher.rs"
+harness = false
+
 [[test]]
 name = "cgroup_join"
 path = "tests/cgroup_join.rs"

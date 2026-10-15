@@ -38,7 +38,7 @@
 //!   `require_restriction_evidence` が `LaunchReady` を受け取ったときだけ exec を許す。
 //!   - **Landlock は必須**: `with_landlock` を通らない（独自フックだけ・未登録）パイプラインでは作られない
 //!   - **`CgroupJoin` は条件に入れない**: cgroup を使う設定なのに join していない場合の拒否は
-//!     本番 launcher 側の責務（#1715）
+//!     本番 launcher 側の責務（実装済み: 参加の源があれば起動のたびに `CgroupJoin` を登録し、cgroup 要件ありで源が無い起動は fork 前に拒否する。#1816）
 //!   - **`/proc/self/status` の読み戻しは証跡にしない**: 親から継承した制限と区別できないため
 //!   - 段が 1 つでも失敗したら打ち切るので `LaunchReady` は作られず、終端も呼ばれない（fail-closed）
 //!   - capability 削減の [`CapabilityReport`] は終端クロージャへ別途渡すが、exec の許可には使わない
@@ -50,7 +50,7 @@
 //! # cgroup 参加（TASK-32.4）
 //!
 //! pivot 後はホストの `/sys/fs/cgroup` が見えないため、参加フックは fork 前に確保した cgroup
-//! ディレクトリの `OwnedFd` 経由で `cgroup.procs` へ書く。本番 launcher からの結線は未実装（#1715。REPAIR-3）。
+//! ディレクトリの `OwnedFd` 経由で `cgroup.procs` へ書く。本番 launcher からの結線は実装済み（`ProductionLauncher` の `cgroup_join_source`。#1816）。
 
 use std::fmt;
 

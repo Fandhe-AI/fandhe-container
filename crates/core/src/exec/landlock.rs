@@ -26,7 +26,7 @@
 //! - 適用結果 [`LandlockApplyReport`] 自体は証跡ではなく捨てる。制限適用の証跡は、`with_landlock` 経由の
 //!   適用が `Ok` を返したときに `stages.rs` の `run_then` だけが作る（`LaunchReady`。#1714）
 //! - Landlock の組み込み固定段への昇格（`with_hook(Landlock)` の拒否）は後続作業
-//! - 本番 launcher（`oci_runtime`）からの本関数の呼び出しは後続
+//! - 本番 launcher（`oci_runtime::ProductionLauncher`）からの `landlock_ruleset_from_config` の呼び出しは実装済み（#1816）
 
 use std::path::PathBuf;
 
@@ -78,7 +78,7 @@ pub(super) fn apply_landlock_stage_with(
 /// 縮退して続ける規定は無いので、起動を拒否する（fail-closed）と読む。拒否は段（`run_then`）の手前、fork の前に
 /// 行い、コードは `FailedPrecondition`（段 `Landlock`、理由コード `landlock_abi_too_old` 等）。`PermissionDenied` は
 /// exec 段での証跡欠落だけを表す。ruleset は検出済みの ABI からしか作れないため、ABI 不足では `with_landlock` も
-/// `LaunchReady` も得られない。本番 launcher（#1715）はこのエラーをそのまま返して起動を拒否し、Landlock 無しで
+/// `LaunchReady` も得られない。本番 launcher（`ProductionLauncher`。#1816）はこのエラーをそのまま返して起動を拒否し、Landlock 無しで
 /// 続けてはならない。
 ///
 /// # 将来仕様（記録のみ）

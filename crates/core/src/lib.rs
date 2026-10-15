@@ -38,7 +38,7 @@
 //!   errno 分類を再利用するため（`exec/devices.rs` と同じ判断）。ステージ列へは #173（TASK-37.2）で組み込み済み
 //! - `observability`: メトリクス集計型 `OpStats` 等（TASK-84.1）と記録 API `OpRecorder`
 //!   （TASK-84.2）は実装済み（REPAIR-4）。JSON Lines 出力（TASK-84.3）も実装済み。create / start / kill の計装は実装済み（TASK-84.4）、delete も TASK-30.2 で同じパターンにより計装済み。io 向け連携点は io 側に定義済み（TASK-84.5）
-//! - `landlock`: Landlock ABI 検出（TASK-39.1・#181）とパスルール生成（TASK-39.2・#182）と ruleset 適用（TASK-39.3・#183）を実装済み（Linux 限定。CORE-5）。ステージ列への組み込み口（`StagePipeline::with_landlock`・TASK-39.4・#184）は実装済みで、制限適用の証跡は `LaunchReady`（#1714）で配線済み。本番 launcher からの呼び出しは後続作業（#1715）。
+//! - `landlock`: Landlock ABI 検出（TASK-39.1・#181）とパスルール生成（TASK-39.2・#182）と ruleset 適用（TASK-39.3・#183）を実装済み（Linux 限定。CORE-5）。ステージ列への組み込み口（`StagePipeline::with_landlock`・TASK-39.4・#184）は実装済みで、制限適用の証跡は `LaunchReady`（#1714）で配線済み。本番 launcher（`oci_runtime::ProductionLauncher`）からの呼び出しは実装済み（#1816。実プロセスでの確認は `tests/production_launcher.rs`・#1818）。
 //! - `legacy_tiocsti`: 起動時に `dev.tty.legacy_tiocsti` を読み、`1` のときだけ警告の構造化ログを 1 行出す（観測のみで起動は止めない。CORE-5・SEC-1・REPAIR-4・#1658 の案 A・#1739。OS 非依存。呼び出し元は `exec::spawn_container_with_stages`。本番 launcher からの呼び出しは未配線で REPAIR-3）
 //! - `rlimits`: rlimit（`process.rlimits`・`--ulimit`）の検証済み型 `Rlimit`・`Rlimits`（SUP-12・TASK-169.1・#526。OS 非依存）。適用は `exec::StagePipeline::with_rlimits`（Linux 限定）で、OCI config からの結線は未実装（REPAIR-3）
 //! - `rootless`: user namespace の UID/GID 写像の設定・読み戻し検証（Linux 限定。CORE-6・SEC-5・
@@ -51,7 +51,7 @@
 //! - `sys`: syscall・FFI の薄いラッパー（Linux 限定・非公開。`unsafe` の事前承認範囲）
 //! - `oci_runtime`: OCI Runtime のライフサイクル。`config.json` の型・パーサ
 //!   （TASK-29.1.1）と create（プロセス未起動の状態初期化。TASK-29.2）は実装済み・OS 非依存。
-//!   start（TASK-29.3）は実装済みだが起動は `ProcessLauncher` の依存注入で、本番 launcher と実 exec は未提供。
+//!   start（TASK-29.3）の起動は `ProcessLauncher` の依存注入で、本番 launcher（`ProductionLauncher`・Linux。#1816）は実装済み。supervisor の呼び出しスレッドの再構成（#1819）は未実装。
 //!   kill（TASK-30.1）も実装済みで、送信は `ProcessSignaler` の依存注入（本番実装は supervisor 待ち）。delete（TASK-30.2・TASK-30.3）は cgroup（`ContainerCgroupRemover` の依存注入）と `StateStore` のレコードの削除を実装済みで、OCI-7 の参照解除は TASK-183 で未実装。
 //!   失敗のエラー型 `OciRuntimeError`（ERR-2・TASK-96.1）は定義済みで、4 操作（create / start / kill / delete）は結線済み・`write_json_line` で stderr 向け 1 行を出せる（TASK-96.2・TASK-96.3）。実 stderr 出力・終了は CLI 側で未実装
 //! - `tmpfs`: tmpfs マウントの検証済み仕様型（`--shm-size` / `--tmpfs`。SUP-12・TASK-169.2）。OS 非依存で、
@@ -64,7 +64,7 @@
 //!   fsync・残骸掃除の強化は TASK-31.2（#156）、結合テスト（ライフサイクル経由の `state.json` 照合）は TASK-31.3（#157）で実装済み。CLI と supervisor の書き込み排他（`@lock`＋期限つき `try_lock`＋revision による楽観的排他）の検証・明文化は TASK-157.9（#1069）
 //! - `cgroups`: 委譲 cgroup v2 の検出・コンテナ用子 cgroup 作成・自プロセス退避の検証・controller
 //!   有効化・`memory.max` / `memory.swap.max` 設定・`cpu.max` 設定（Linux 限定。TASK-32.1・TASK-32.2・
-//!   TASK-32.3・CORE-3 は実装済み。TASK-32.4 は fork 後の子の `cgroup.procs` 参加フック `CgroupJoin` まで実装済み。本番 launcher からの結線は未実装。デバイス cgroup の eBPF 命令列の組み立て〔#1678〕まで実装済みで、ロード・アタッチは未実装）
+//!   TASK-32.3・CORE-3 は実装済み。TASK-32.4 は fork 後の子の `cgroup.procs` 参加フック `CgroupJoin` まで実装済みで、本番 launcher 側の受け口（`ProductionLauncher` の `cgroup_join_source`。#1816）も実装済み。start 経路の supervisor からの供給の結線は #1717。デバイス cgroup の eBPF 命令列の組み立て〔#1678〕まで実装済みで、ロード・アタッチは未実装）
 //! - `plugin`: `plugin` feature 配下の境界基盤型の再エクスポート（PLUG-3・TASK-111.1・#262）。
 //!   発見・登録は未実装
 //! - `plugin_discovery`: 管理ディレクトリ（system / user）からの plugin 候補探索（TASK-109.1・PLUG-4・PLUG-11）と `PATH` 探索の opt-in・警告ログ（TASK-109.2）、同名重複を解決する候補レジストリ（TASK-109.3。登録は未検証）は実装済み・OS 非依存。

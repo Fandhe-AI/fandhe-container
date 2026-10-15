@@ -7,12 +7,12 @@
 //! `rootless` / `exec` モジュール自体がビルド対象外（OS 非該当であり skip ではない）。
 //!
 //! # 受入基準の解釈（REPAIR-3）
-//! 制限ステージ（Landlock。TASK-39。seccomp は組み込み済み）が未実装の間、`exec_entrypoint` は rootless でも
-//! exec を拒否するため、エントリポイントにファイルを作らせることはできない（exec 到達は
+//! 本試験の経路は `with_landlock` を載せず `LaunchReady` が作られない（fail-closed。#1714）ため、
+//! `exec_entrypoint` は rootless でも exec を拒否し、、エントリポイントにファイルを作らせることはできない（exec 到達は
 //! `rootless_launch` が照合済み）。ファイル所有者はプロセスの user namespace 写像だけで決まるので、
 //! `isolate_rootless_subordinate` 成功後のシナリオプロセス（コンテナの user namespace 内 uid 0）が
 //! ファイルを作成し、分離されていない外側のディスパッチャ（ホスト視点）が `stat` で所有者を照合する。
-//! exec が許可された後（TASK-38・TASK-39 以降）は、エントリポイント内での作成へ移せる。
+//! 本番 launcher 経由の確認は `production_launcher`（#1818）が担う。エントリポイント内での作成への移行は未着手。
 //!
 //! # 流れ
 //! - ディスパッチャ: 作業ディレクトリを作り、自身を `--scenario <name> <dir>` で再起動して

@@ -15,7 +15,7 @@
 //!   観測記録（REPAIR-4）と、起動したプロセスのホスト視点の写像（`/proc/<pid>/uid_map`・`gid_map`・
 //!   `status`）で照合する。検証できるのは **create / start / kill と、kill 直後の delete の拒否まで**で、
 //!   Running → Stopped の遷移と停止後の delete の成功は未検証（下記「既知課題」）
-//! - 制限ステージ（seccomp: TASK-38.2/38.3、Landlock: TASK-39.3/39.4）が未適用の間、`exec_entrypoint` は
+//! - 本試験の経路は `with_landlock` を載せず `LaunchReady` が作られない（#1714）ため、`exec_entrypoint` は
 //!   fail-closed で `Exited(126)` を返す。そのため長く動き続ける「実行中コンテナ」になれるのは
 //!   `isolate_rootless_subordinate` を通った中間プロセスだけで、これを init の代役として使う。中間プロセスは
 //!   `spawn_container` が exec 段まで到達して 126 で終わることを自身で確かめた後、stdin の EOF まで
@@ -51,9 +51,10 @@
 //!   マスクされた `/proc` で proc マウントも拒否されるため検証できない
 //! - rootless の cgroup v2 委譲（systemd ユーザー slice の Delegate）: rootless 経路での cgroup 参加は
 //!   未実装・未検証（TASK-32・CORE-3・CORE-4）
-//! - 実エントリポイントの exec: 制限ステージ適用（TASK-38.2/38.3・TASK-39.3/39.4。Landlock は ABI 6+ =
-//!   Linux 6.12+ が必要）まで拒否されるため代役 init を使う。適用後は、動き続ける実エントリポイントの pid を
-//!   対象にするよう置き換える
+//! - 実エントリポイントの exec: 本試験の経路は `LaunchReady` が作られず拒否されるため代役 init を使う
+//!   （Landlock を載せる経路は ABI 6+ = Linux 6.12+ が必要）。本番 `ProductionLauncher` の確認は
+//!   `production_launcher`（#1818）が担い、supervisor への配線は #1819。動き続ける実エントリポイントの pid を
+//!   対象にする置き換えは未着手
 //! - SIGKILL 以外のシグナル（SIGTERM 等）の配送: 本テストの起動ハンドルが std のみで作られており送れない。
 //!   本番の `ProcessSignaler` は supervisor（TASK-157）が提供する
 //! - Running → Stopped の遷移と停止後の delete の成功: Stopped への遷移は起動ハンドルの所有者である
@@ -262,7 +263,7 @@ mod linux {
         let exit = child
             .wait_timeout(timeout())
             .unwrap_or_else(|e| panic!("wait: {e}"));
-        // 制限ステージ未実装の間は exec だけが拒否される（126）。setup 失敗（125）ではない。
+        // `LaunchReady` が作られない経路のため exec だけが拒否される（126）。setup 失敗（125）ではない。
         assert_eq!(exit, ChildExit::Exited(126));
 
         let mut out = std::io::stdout();
@@ -671,7 +672,7 @@ mod linux {
             .mode(0o755)
             .open(rootfs.join("entry"))
             .expect("create entrypoint");
-        // exec は制限の証跡が無く拒否されるため、中身は実行されない。
+        // exec は `LaunchReady` が作られず拒否されるため、中身は実行されない。
         f.write_all(b"#!/bin/true\n").expect("write entrypoint");
         drop(f);
         // linux.uidMappings は書かない（start が拒否する。写像は launcher 側の責務）。

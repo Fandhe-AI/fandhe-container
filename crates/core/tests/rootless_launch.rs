@@ -6,8 +6,8 @@
 //! `exec` モジュール自体がビルド対象外（OS 非該当であり skip ではない）。
 //!
 //! # 受入基準の解釈（REPAIR-3）
-//! 制限ステージ（Landlock。TASK-39。capability 削減・seccomp は組み込み済み）が未実装の間、`exec_entrypoint` は
-//! rootless でも `PermissionDenied` で exec を拒否する。そのため「非 root で分離から exec 段まで
+//! 本試験の経路は `with_landlock` を載せず、制限適用の証跡 `LaunchReady` が作られない（fail-closed。#1714）ため、
+//! `exec_entrypoint` は rootless でも `PermissionDenied` で exec を拒否する。そのため「非 root で分離から exec 段まで
 //! 到達できること」を、子が `Exited(126)` で終わり stderr に `PERMISSION_DENIED` が出る（setup 失敗の
 //! 125 ではない）ことで照合する。user namespace の作成・写像の書き込み・`MS_PRIVATE`・自己 bind・
 //! `/proc` マウント・`pivot_root` がホスト root なしで成功したことの証になる。
@@ -160,7 +160,7 @@ mod linux {
             .mode(0o755)
             .open(rootfs.0.join(ENTRY))
             .expect("create entrypoint");
-        // exec は制限の証跡が無く拒否されるため、中身は実行されない。
+        // exec は `LaunchReady` が作られず拒否されるため、中身は実行されない。
         f.write_all(b"#!/bin/true\n").expect("write entrypoint");
         f.set_permissions(std::fs::Permissions::from_mode(0o755))
             .expect("chmod entrypoint");
@@ -236,7 +236,7 @@ mod linux {
                 Some(0),
                 "scenario {name} must exit with 0; stderr:\n{stderr}"
             );
-            // Exec 段への到達（SEC-1・CORE-5: 制限証跡が無く exec だけが拒否される）。
+            // Exec 段への到達（SEC-1・CORE-5: `LaunchReady` が作られず exec だけが拒否される）。
             assert!(
                 stderr.contains("PERMISSION_DENIED"),
                 "stderr of scenario {name} must contain PERMISSION_DENIED; got:\n{stderr}"
@@ -329,7 +329,7 @@ mod linux {
         let exit = child
             .wait_timeout(timeout())
             .unwrap_or_else(|e| panic!("wait: {e}"));
-        // 制限ステージ未実装の間は exec だけが拒否される（126）。setup 失敗（125）ではない。
+        // `LaunchReady` が作られない経路のため exec だけが拒否される（126）。setup 失敗（125）ではない。
         assert_eq!(exit, ChildExit::Exited(126), "scenario {name}");
     }
 }

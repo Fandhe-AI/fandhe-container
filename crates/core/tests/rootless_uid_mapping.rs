@@ -10,9 +10,9 @@
 //! - `pivot_root_isolation`（TASK-27.3）: 所有者を照合しない。本テストは subuid 範囲経路も含む
 //!
 //! # 受入基準の解釈（REPAIR-3）
-//! 制限ステージ（seccomp・Landlock。TASK-38.3・TASK-39.3 / 39.4）が未適用の間 `exec_entrypoint` は
-//! exec を拒否するため、実エントリポイントではなくテストバイナリ自身がコンテナ PID 1 の代役として
-//! ファイルを作る。exec が許可された後は、`spawn_container` 経由の実エントリポイント内作成へ移す。
+//! 本試験の経路は `with_landlock` を載せず `LaunchReady` が作られない（fail-closed。#1714）ため
+//! `exec_entrypoint` は exec を拒否し、実エントリポイントではなくテストバイナリ自身がコンテナ PID 1 の代役として
+//! ファイルを作る。本番 launcher 経由の確認は `production_launcher`（#1818）が担う。実エントリポイント内作成への置き換えは未着手。
 //!
 //! # 流れ（3 段）
 //! 1. ディスパッチャ（分離なし）: rootfs を作り、`--scenario <name> <rootfs>` で自身を起動し、

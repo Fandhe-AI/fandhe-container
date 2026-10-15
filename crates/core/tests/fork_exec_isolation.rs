@@ -14,18 +14,21 @@
 //! - ディスパッチャ: 分離前に、手組みの静的 ELF プローブ（終了コード 42）をホスト上で直接実行して
 //!   バイト列の正しさを自己検証する（バイト列の誤りをランタイムの不具合と取り違えないため）→
 //!   シナリオごとに一時 rootfs を作り、タイムアウト付きで終了コード 0 を待つ（REPAIR-5）
-//! - 制限（Landlock。capability 削減・no_new_privs・seccomp は組み込み済み）が未適用の間は root（rootful）・非 root（rootless）とも
-//!   exec は拒否されるため、全シナリオが `Exited(126)`・stderr に `PERMISSION_DENIED`（SEC-1・CORE-5）。
-//!   ステージ列（#832・#833）が適用されたら、下の想定を各シナリオ本来の値へ戻す
-//! - シナリオ `ok`: プローブへ exec し `Exited(42)`
-//! - シナリオ `missing`: 不在のエントリポイントで `Exited(127)`、stderr に `NOT_FOUND`
+//! - 期待値はシナリオごとに異なる。`with_landlock` を載せない経路（`ok`・`missing`・`not-executable`・`stages-order`・
+//!   `rlimits-apply`・`stdio-closed-*`）は、制限適用の証跡 `LaunchReady`（#1714）が作られず `execveat` の手前で
+//!   fail-closed に拒否されるため、root（rootful）・非 root（rootless）とも `Exited(126)`・stderr に `PERMISSION_DENIED`
+//!   （SEC-1・CORE-5）。Landlock を載せる `landlock-*` 系は下記の個別の期待値を持つ。
+//!   本物の `ProductionLauncher` 経由の確認は `production_launcher`（#1818）が担う
+//! - シナリオ `ok`: プローブへ exec する構成だが、`with_landlock` を載せず `Exited(126)`・`PERMISSION_DENIED`
+//! - シナリオ `missing`: 不在のエントリポイントも同じ理由で `Exited(126)`・`PERMISSION_DENIED`
+//!   （不在時 127・`NOT_FOUND` を照合するシナリオは未整備）
 //! - シナリオ `not-executable`: 実行権限の無いファイルで `Exited(126)`、stderr に `PERMISSION_DENIED`
 //! - シナリオ `stages-order`（#832・TASK-27.4.2、#833・TASK-27.4.3。`spawn_container_with_stages`）:
 //!   逆順に登録した 2 段（cgroup 参加・Landlock）のフックと、組み込みの capability 削減・NO_NEW_PRIVS が、子の pivot 後（`/` が
 //!   新 rootfs）に固定順で実行されることをログファイルで照合する。各フックは自分の時点の
 //!   `/proc/self/status` の `NoNewPrivs` を記録し、組み込みの固定ステージが capability 削減の後・
 //!   Landlock の前に実際に適用されたこと（Landlock の時点で 1）を照合する。フックが全て成功しても
-//!   証跡不在の exec は拒否される（`Exited(126)`・`PERMISSION_DENIED`）
+//!   `LaunchReady` が作られない exec は拒否される（`Exited(126)`・`PERMISSION_DENIED`）
 //!   検証範囲の注意: 環境（docker 等）が既に `NoNewPrivs=1` を継承していると、`PR_SET_NO_NEW_PRIVS` の
 //!   呼び出しを省いても `nnp=1` のログが一致する。その場合の本シナリオは「固定ステージが capability 削減の後・
 //!   Landlock の前に走る順序」までを検証し、設定操作そのものは次の独立経路で検証する: 偽 syscall による
@@ -34,7 +37,7 @@
 //!   `sys.rs` の `core1_set_no_new_privs_sets_calling_thread_flag`。継承値 0 の環境では本シナリオが設定操作も検証する
 //! - シナリオ `rlimits-apply`（SUP-12・TASK-169.1・#526。`with_rlimits`）: 組み込みの `Rlimits` 段が NOFILE
 //!   （soft 256 / hard 512。継承 hard が低ければそれ以下）と CORE（0 / 0）を子へ適用することを、Landlock スロットのフックが
-//!   記録した `/proc/self/limits` との完全一致で照合する。exec は証跡不在で `Exited(126)`・`PERMISSION_DENIED`
+//!   記録した `/proc/self/limits` との完全一致で照合する。exec は `LaunchReady` 不在で `Exited(126)`・`PERMISSION_DENIED`
 //! - シナリオ `rlimit-fail`（同上）: `fs.nr_open` を超える NOFILE の hard 指定は root でも rootless でも `EPERM` となり、
 //!   `Exited(125)`・stderr に `at Rlimits` と `PERMISSION_DENIED`、後段のフックが実行されないことを照合する
 //! - シナリオ `stage-fail`（同上）: 途中の段のフック失敗で後続段と exec に進まず `Exited(125)`
@@ -54,7 +57,8 @@
 //!   具体値は launch 経路では観測できず（`with_landlock` を載せないため `LaunchReady` が作られず `execveat` の手前で拒否）、`tests/exec_child_setup.rs` で照合する
 //!
 //! - シナリオ `landlock-exec`（#1714・CORE-5・SEC-1・REPAIR-12。`with_landlock` + `spawn_container_with_stages`）: 制限適用の証跡
-//!   `LaunchReady` がそろった launch 経路が実際に `execveat` まで到達する。プローブの終了コード 42 を照合する（拒否なら 126）
+//!   `LaunchReady` がそろった launch 経路が実際に `execveat` まで到達する。プローブの終了コード 42 を照合する（拒否なら 126）。
+//!   `landlock-*` 系は実カーネルの Landlock を使うため ABI 6 以上（Linux 6.12 以上）が必要
 //!
 //! # 実機前提テストとしての分離
 //! 実行には root もしくは非特権 user namespace を許可するホストが必要（AppArmor の
@@ -343,7 +347,7 @@ mod linux {
                 Some(0),
                 "scenario {name} must exit with 0; stderr:\n{stderr}"
             );
-            // SEC-1・CORE-5: 制限が未適用の間は exec が拒否される（`stage-fail` はフック失敗で
+            // SEC-1・CORE-5: `LaunchReady` が作られない構成は exec が拒否される（`stage-fail` はフック失敗で
             // exec に到達しないため、失敗した段を照合する）。
             assert!(
                 stderr.contains(marker),
@@ -406,9 +410,9 @@ mod linux {
             | "stdio-closed-one" | "stdio-closed-many" | "stdio-closed-all" => format!("/{PROBE}"),
             other => panic!("unknown scenario {other}"),
         };
-        // SEC-1・CORE-5: Landlock が未適用の間は、root / 非 root を問わず
-        // exec が拒否される（終了コード 126・PERMISSION_DENIED）。適用後は "ok" が Exited(PROBE_EXIT)、
-        // "missing" が Exited(127) に戻る。
+        // SEC-1・CORE-5: `with_landlock` を載せない構成は `LaunchReady` が作られず、root / 非 root を問わず
+        // exec が拒否される（終了コード 126・PERMISSION_DENIED）。`landlock-exec` は載せるため
+        // Exited(PROBE_EXIT)、`landlock-apply-*` / `landlock-fail` は個別の期待値を持つ。
         let mut want = ChildExit::Exited(126);
         close_standard_fds_for_scenario(name);
         let entry = Entrypoint::new(&path, [path.as_str()], [] as [&str; 0]).expect("entrypoint");
@@ -428,7 +432,7 @@ mod linux {
             "rlimits-apply" => {
                 // SUP-12・TASK-169.1・#526: 組み込みの Rlimits 段が pivot 後・exec 前に子へ適用する。
                 // Landlock スロットのフックが子自身の `/proc/self/limits` を記録し、指定値との完全一致を親が照合する。
-                // exec は証跡不在のため従来どおり拒否される（`Exited(126)`・`PERMISSION_DENIED`）。
+                // exec は `LaunchReady` 不在のため拒否される（`Exited(126)`・`PERMISSION_DENIED`）。
                 let (soft, hard) = rlimits_apply_nofile(inherited_nofile_hard());
                 let set = Rlimits::new(vec![
                     Rlimit::new(RlimitKind::Nofile, soft, hard).expect("nofile"),
@@ -470,7 +474,7 @@ mod linux {
             "landlock-apply-ro" | "landlock-apply-rw" | "landlock-fail" => {
                 // CORE-5・TASK-39.4・#184: 実カーネルの Landlock を、fork した子の本番経路
                 // （`spawn_container_*` → pivot → 組み込みの capability 削減・NO_NEW_PRIVS → Landlock → seccomp）で適用する。
-                // exec は証跡配線前で拒否されるため、終端は exec の代わりに pivot 後の `/` へ
+                // exec は `LaunchReady` 不在で拒否されるため、終端は exec の代わりに pivot 後の `/` へ
                 // 記録ファイルを書くプローブ（`spawn_container_seccomp_probe`）を使い、書き込みの成否で
                 // Landlock の適用有無を観測する。
                 let (readonly, mounts) = match name {
@@ -576,8 +580,8 @@ mod linux {
     /// 閉じた親から `spawn_container` しても、実行用の fd が 0〜2 に入り込まず fail-closed のまま
     /// （`Exited(126)`）であることを固定する。fd 移動そのものの具体値（実行用 fd が 3 以上・標準入出力が 1:3）は、
     /// launch 経路が `with_landlock` を載せず `LaunchReady` が作られないため `prepare_exec_child` の手前で拒否されるため観測できず、
-    /// `tests/exec_child_setup.rs` の観測用の入口で照合している。証跡が配線されたら、本シナリオの期待を
-    /// プローブの `Exited(42)` へ戻す（他シナリオと同じ扱い）。他のシナリオでは何もしない。
+    /// `tests/exec_child_setup.rs` の観測用の入口で照合している。`with_landlock` を載せる構成へ
+    /// 変えるなら、本シナリオの期待はプローブの `Exited(42)` になる。他のシナリオでは何もしない。
     #[cfg(feature = "exec-test-support")]
     fn close_standard_fds_for_scenario(name: &str) {
         use std::os::fd::AsFd as _;

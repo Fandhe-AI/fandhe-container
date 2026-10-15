@@ -12,16 +12,15 @@
 //! 各メソッドの引数として実装へも渡すが、実装が守ることには依存せず、start が呼び出し境界で強制する
 //! （別スレッドで呼び、上限を過ぎたら待つのをやめる。`start.rs` の `call_bounded`）。
 //!
-//! # 本番実装が未提供である理由（REPAIR-3: 実装済みを装わない）
+//! # 本番実装(#1816)
 //!
-//! TASK-27 の exec フロー（`exec::spawn_container`）は「分離済み・シングルスレッド・使い捨て」の
-//! 親プロセスを要求し、さらに制限ステージ（capability 削減・seccomp は組み込み済み、Landlock は未実装。TASK-37〜39）の
-//! 証跡が無い限り exec を拒否する（SEC-1・CORE-5）。任意の文脈から呼ばれる `start` はこれを
-//! 保証できないため、fork した中間プロセスでの `isolate` → `spawn_container` と pid 返却・子の回収
-//! を行う本番 launcher は後続 sub-issue（TASK-29 / TASK-157 系）で提供する。現時点で本 crate に
-//! launcher 実装は無く、実プロセスの起動は行われない。起動済みの子の終了・回収だけは、本番 launcher が
-//! そのまま使えるよう `ContainerChildProcess`（Linux。`exec::ContainerChild` の回収状態の排他を
-//! 再利用する）として提供する。
+//! 本番の [`ProcessLauncher`] は `launcher.rs` の `ProductionLauncher`(Linux)。fork した中間プロセスで
+//! `isolate` → PID 1 の起動を行い、Landlock を必須とする制限ステージ列の証跡が無い限り exec しない
+//! (`exec::spawn_container_via_intermediate`)。fork は単一スレッドの呼び出しを要求するため、
+//! `ProductionLauncher` は [`LaunchMode::SelfBounded`] を宣言し、start は別スレッドを作らず呼び出しスレッドで
+//! 直接 `launch` を呼ぶ。起動済みの子の終了・回収は `ContainerChildProcess`(Linux。`exec::ContainerChild` の
+//! 回収状態の排他を再利用する)が担う。`confirm_no_process`(#1817)・supervisor の結線(#1819)・実機前提の
+//! 結合試験(#1818)は後続(REPAIR-3)。
 
 #[cfg(target_os = "linux")]
 use std::ffi::OsStr;
@@ -426,9 +425,16 @@ pub struct LaunchSpec {
     hostname: Option<String>,
     namespaces: Vec<NamespaceKind>,
     cgroup: CgroupRequirement,
+    /// start が一度だけ読んだ config（本番 launcher が Landlock の ruleset 等を作る入力。bundle は読み直さない）。
+    config: std::sync::Arc<OciConfig>,
+    /// 起動対象のコンテナ ID（監査記録の `container` に使う。SEC-4）。
+    container_id: ContainerId,
 }
 
 impl LaunchSpec {
+    // 理由: start が一度だけ検証した各値を欠落なく束ねる唯一の構築点で、同じ型の引数を取り違えない
+    // よう公開しない(`pub(super)`)。呼び出しは start の 1 か所だけのため、引数用の中間構造体は設けない。
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         rootfs: PathBuf,
         rootfs_dir: RootfsDir,
@@ -437,6 +443,8 @@ impl LaunchSpec {
         hostname: Option<String>,
         namespaces: Vec<NamespaceKind>,
         cgroup: CgroupRequirement,
+        config: std::sync::Arc<OciConfig>,
+        container_id: ContainerId,
     ) -> Self {
         Self {
             rootfs,
@@ -446,7 +454,20 @@ impl LaunchSpec {
             hostname,
             namespaces,
             cgroup,
+            config,
+            container_id,
         }
+    }
+
+    /// 起動対象のコンテナ ID（launcher が pivot 前段の違反を監査記録する際の `container`。SEC-4）。
+    pub fn container_id(&self) -> &ContainerId {
+        &self.container_id
+    }
+
+    /// start が一度だけ読んだ config（同一 crate の本番 launcher が Landlock の ruleset 生成に使う。CORE-5）。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // 読み手は Linux 限定の本番 launcher
+    pub(crate) fn config(&self) -> &OciConfig {
+        &self.config
     }
 
     /// config が cgroup を使う設定かどうか（CORE-3・#1814）。必要なのに join の手段が無ければ、
@@ -485,6 +506,23 @@ impl LaunchSpec {
     pub fn namespaces(&self) -> &[NamespaceKind] {
         &self.namespaces
     }
+}
+
+/// [`ProcessLauncher::launch`] の時間上限の守り方（REPAIR-5）。
+///
+/// start が launch をどのスレッドで・どう上限づけて呼ぶかを launcher 自身が宣言する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LaunchMode {
+    /// 既定。start が別スレッドで launch を呼び、上限（＋猶予）を過ぎたら待つのをやめる（`call_bounded`）。
+    CallerBounded,
+    /// launcher が自身の上限を守る。start は launch を**呼び出しスレッドで直接**呼ぶ（別スレッドを作らない）。
+    ///
+    /// fork する本番 launcher は呼び出しプロセスが単一スレッドであること（`Threads: 1`）を要求するため、
+    /// start が別スレッドを作る経路からは起動できない（CORE-1・CORE-5）。この宣言をした実装は次を守る:
+    /// 入口で 1 つの `Instant` 期限（`timeout`）を取りすべての待ちをそこから導く。失敗後の後始末が足す上限は
+    /// 固定値で示す。戻りは `timeout` ＋後始末の上限以内とする。start はこの上限を強制しない（直接呼びのため）。
+    SelfBounded,
 }
 
 /// 起動済みプロセスの終了状態（OS 非依存。`exec::ChildExit` 等を写す）。
@@ -586,7 +624,7 @@ pub trait LaunchedProcess: Send {
 
 /// `exec::ContainerChild`（fork した子）を [`LaunchedProcess`] として扱うアダプタ（Linux。CORE-1・REPAIR-5）。
 ///
-/// 本番 launcher（後続 sub-issue）が `exec::spawn_container` の戻り値を包んで返すために置く。
+/// 本番 launcher（`ProductionLauncher`）が `exec::spawn_container_via_intermediate` の戻り値を包んで返すために置く。
 /// [`LaunchedProcess::terminate`] は `ContainerChild::kill_and_reap`、[`LaunchedProcess::wait`] は
 /// `ContainerChild::wait_for_exit` を呼び、`wait_timeout` と同じ回収状態の排他の下で回収する（回収済みの
 /// pid へは `SIGKILL` を送らない）。
@@ -706,7 +744,7 @@ impl LaunchedProcess for ContainerChildProcess {
 ///
 /// - 各メソッドの待ちは引数 `timeout` までに打ち切り、超過時は起動した子を kill・回収してから
 ///   `ErrorCode::Timeout` を返す（REPAIR-5）。start は実装が守ることに依存せず、呼び出し境界でも上限を
-///   強制する（超過後に返ってきた起動済みプロセスは start が [`LaunchedProcess::terminate`] で後始末する）。
+///   強制する（[`LaunchMode::CallerBounded`] のとき。`SelfBounded` は launcher が自身の上限を守り、start は呼び出しスレッドで直接呼ぶ）（超過後に返ってきた起動済みプロセスは start が [`LaunchedProcess::terminate`] で後始末する）。
 ///   別スレッドから呼ばれ得るため `Send + Sync` とする
 /// - exec フローの fail-closed（制限証跡なしの exec 拒否。SEC-1・CORE-5）を回避しない
 /// - 失敗時にプロセスを残さない
@@ -722,14 +760,32 @@ impl LaunchedProcess for ContainerChildProcess {
 ///   launcher の構築時に保持する
 /// - `LaunchSpec::namespaces` には Pid・Mount・User・Ipc・Uts が必ず含まれる（`start` が検証済み）
 ///
-/// 本番実装は本 crate に未提供（モジュール doc 参照）。
+/// 本番実装は `ProductionLauncher`（`launcher.rs`。Linux。モジュール doc 参照）。
 pub trait ProcessLauncher: Send + Sync {
+    /// 時間上限の守り方（[`LaunchMode`]）。既定は `CallerBounded`（start が別スレッドで上限を強制する）。
+    ///
+    /// ラッパー実装は内側へ転送すること（転送しないと `CallerBounded` へ黙って降格し、`SelfBounded` の
+    /// 本番 launcher が複数スレッドの呼び出しとして拒否される）。
+    fn launch_mode(&self) -> LaunchMode {
+        LaunchMode::CallerBounded
+    }
+
     /// プロセスを起動し、ハンドルを返す。`timeout` は起動確認（子からの通知待ち等）の上限。
     fn launch(
         &self,
         spec: &LaunchSpec,
         timeout: Duration,
     ) -> Result<Box<dyn LaunchedProcess>, TraitError>;
+
+    /// 直近の `launch` が `Err` で戻ったとき、回収を確認できていない子が残っている可能性があるか(CORE-2)。
+    ///
+    /// `true` なら start は起動予約(Running・pid なし)を `Created` へ戻さず保持する。戻すと、残った子が
+    /// いる状態で同じ ID の start や(cgroup 記録のない構成での)delete が通ってしまうため。回復は
+    /// `recover_interrupted_start`(`confirm_no_process` による確認つき)に限る。`launch` が `Ok` のときは
+    /// 呼ばれない。既定は `false`(失敗時にプロセスを残さない契約を信頼する)。
+    fn last_launch_may_have_left_process(&self) -> bool {
+        false
+    }
 
     /// `id` の起動が生存プロセスを残していないことを確認する（中断された start の回復用。CORE-2・SEC-1）。
     ///

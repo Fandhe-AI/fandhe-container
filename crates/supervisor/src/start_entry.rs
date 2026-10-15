@@ -847,6 +847,18 @@ struct InstanceCheckedLauncher {
 }
 
 impl ProcessLauncher for InstanceCheckedLauncher {
+    /// 内側の launcher の時間上限の守り方を転送する（転送しないと `SelfBounded` が `CallerBounded` へ
+    /// 降格し、単一スレッドを要求する本番 launcher が拒否される。REPAIR-5・#1816）。
+    fn launch_mode(&self) -> fandhe_container_core::oci_runtime::LaunchMode {
+        self.inner.launch_mode()
+    }
+
+    /// 内側の launcher の「子が残り得る」判定を転送する(転送しないと既定の `false` になり、回収できなかった
+    /// 子が残るのに起動予約が戻る。CORE-2)。
+    fn last_launch_may_have_left_process(&self) -> bool {
+        self.inner.last_launch_may_have_left_process()
+    }
+
     fn launch(
         &self,
         spec: &LaunchSpec,
@@ -1560,6 +1572,60 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fandhe_container_core::traits::{
+        CreateStateRequest, DeleteStateRequest, DeleteStateResponse, ListStateRequest, StateList,
+    };
+
+    /// `launch_mode` だけを答えるフェイク（転送の照合用。#1816・REPAIR-5）。
+    struct SelfBoundedFake;
+
+    impl ProcessLauncher for SelfBoundedFake {
+        fn launch_mode(&self) -> fandhe_container_core::oci_runtime::LaunchMode {
+            fandhe_container_core::oci_runtime::LaunchMode::SelfBounded
+        }
+
+        fn launch(
+            &self,
+            _spec: &LaunchSpec,
+            _timeout: Duration,
+        ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+    }
+
+    /// 使われない `StateStore`（`launch_mode` の転送の照合では store に触れない）。
+    struct UnusedStore;
+
+    impl StateStore for UnusedStore {
+        fn create(&self, _: &CreateStateRequest) -> Result<StateRecord, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+        fn update(&self, _: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+        fn get(&self, _: &GetStateRequest) -> Result<StateRecord, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+        fn list(&self, _: &ListStateRequest) -> Result<StateList, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+        fn delete(&self, _: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+    }
+
+    /// REPAIR-5・#1816: `InstanceCheckedLauncher` は内側の `launch_mode` を転送する（既定の降格をしない）。
+    #[test]
+    fn repair5_instance_checked_launcher_forwards_launch_mode() {
+        use fandhe_container_core::oci_runtime::LaunchMode;
+        let wrapped = InstanceCheckedLauncher {
+            inner: Arc::new(SelfBoundedFake),
+            store: Arc::new(UnusedStore),
+            id: ContainerId::new("c1").expect("id"),
+            expected: None,
+        };
+        assert_eq!(wrapped.launch_mode(), LaunchMode::SelfBounded);
+    }
 
     /// terminate が呼び出し側の期限より遅れて成功する起動ハンドル。
     struct SlowOk(u32, Duration);

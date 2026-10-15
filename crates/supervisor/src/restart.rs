@@ -1139,6 +1139,18 @@ impl SpecCapturingLauncher {
 }
 
 impl ProcessLauncher for SpecCapturingLauncher {
+    /// 内側の launcher の時間上限の守り方を転送する（転送しないと `SelfBounded` が `CallerBounded` へ
+    /// 降格し、単一スレッドを要求する本番 launcher が拒否される。REPAIR-5・#1816）。
+    fn launch_mode(&self) -> fandhe_container_core::oci_runtime::LaunchMode {
+        self.inner.launch_mode()
+    }
+
+    /// 内側の launcher の「子が残り得る」判定を転送する(転送しないと既定の `false` になり、回収できなかった
+    /// 子が残るのに起動予約が戻る。CORE-2)。
+    fn last_launch_may_have_left_process(&self) -> bool {
+        self.inner.last_launch_may_have_left_process()
+    }
+
     fn launch(
         &self,
         spec: &LaunchSpec,
@@ -1227,6 +1239,31 @@ impl Relauncher for LauncherRelauncher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `launch_mode` だけを答えるフェイク（転送の照合用。#1816・REPAIR-5）。
+    struct SelfBoundedFake;
+
+    impl ProcessLauncher for SelfBoundedFake {
+        fn launch_mode(&self) -> fandhe_container_core::oci_runtime::LaunchMode {
+            fandhe_container_core::oci_runtime::LaunchMode::SelfBounded
+        }
+
+        fn launch(
+            &self,
+            _spec: &LaunchSpec,
+            _timeout: Duration,
+        ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+    }
+
+    /// REPAIR-5・#1816: `SpecCapturingLauncher` は内側の `launch_mode` を転送する（既定の降格をしない）。
+    #[test]
+    fn repair5_spec_capturing_launcher_forwards_launch_mode() {
+        use fandhe_container_core::oci_runtime::LaunchMode;
+        let wrapped = SpecCapturingLauncher::new(Arc::new(SelfBoundedFake));
+        assert_eq!(wrapped.launch_mode(), LaunchMode::SelfBounded);
+    }
     use fandhe_container_core::traits::ContainerState;
 
     fn sig(n: u8) -> ExitClass {

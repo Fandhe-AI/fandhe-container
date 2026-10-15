@@ -439,6 +439,8 @@ mod consts {
     // include/uapi/linux/prctl.h の `PR_SET_CHILD_SUBREAPER`（36）・`PR_GET_CHILD_SUBREAPER`（37）。
     // CORE-1・CORE-2・TASK-29 追補・#1813。全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
     pub const PR_SET_CHILD_SUBREAPER: i32 = 36;
+    // include/uapi/linux/prctl.h の `PR_SET_NAME`（15）。TASK-29 追補・#1816。
+    pub const PR_SET_NAME: i32 = 15;
     pub const PR_GET_CHILD_SUBREAPER: i32 = 37;
 
     // include/uapi/asm-generic/resource.h の `RLIMIT_*`（0〜15。SUP-12・TASK-169.1）。
@@ -729,6 +731,8 @@ mod consts {
     // include/uapi/linux/prctl.h の `PR_SET_CHILD_SUBREAPER`（36）・`PR_GET_CHILD_SUBREAPER`（37）。
     // CORE-1・CORE-2・TASK-29 追補・#1813。全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
     pub const PR_SET_CHILD_SUBREAPER: i32 = 36;
+    // include/uapi/linux/prctl.h の `PR_SET_NAME`（15）。TASK-29 追補・#1816。
+    pub const PR_SET_NAME: i32 = 15;
     pub const PR_GET_CHILD_SUBREAPER: i32 = 37;
 
     // include/uapi/asm-generic/resource.h の `RLIMIT_*`（0〜15。SUP-12・TASK-169.1）。
@@ -951,6 +955,8 @@ mod consts {
     pub const PR_SET_PDEATHSIG: i32 = 0;
     pub const PR_SET_KEEPCAPS: i32 = 0;
     pub const PR_SET_CHILD_SUBREAPER: i32 = 0;
+    // include/uapi/linux/prctl.h の `PR_SET_NAME`（15）。TASK-29 追補・#1816。
+    pub const PR_SET_NAME: i32 = 0;
     pub const PR_GET_CHILD_SUBREAPER: i32 = 0;
 
     // rlimit の定数（対応外アーキテクチャでは各ラッパーが SUPPORTED で弾くため未使用）。
@@ -3060,12 +3066,15 @@ pub(crate) fn close_fds_from(first: u32) -> Result<(), SysError> {
     close_range_raw(first, u32::MAX, 0)
 }
 
-/// fd 1 本（`fd`）だけを閉じる（`close_range(fd, fd, 0)`。結合試験専用。#1299・SEC-1・CORE-1）。
+/// fd 1 本（`fd`）だけを閉じる（`close_range(fd, fd, 0)`。#1299・SEC-1・CORE-1）。
+///
+/// 結合試験に加え、本番 launcher の fork 後の子が不要な pipe 端点を明示的に閉じるのにも使う（close-on-exec は
+/// exec 前の待機には効かないため。#1816・CORE-2）。`File` が所有する fd を閉じるため、呼び出し側は fork 後の
+/// 子(`_exit` で終わり `File` を drop しない)でだけ使うこと。
 ///
 /// `exec::close_standard_fds_for_test` が、標準 fd（0〜2）を閉じた呼び出し側を作るために使う。既に閉じている
 /// 番号は `EBADF` ではなく成功になる（`close_range` の仕様）ため、閉じる前後の状態は呼び出し側が照合する。
 /// 呼び出し側は閉じた番号をこの後使わないこと。未対応カーネルは `ENOSYS`/`EINVAL`（呼び出し側が失敗にする）。
-#[cfg(all(feature = "exec-test-support", not(test)))]
 pub(crate) fn close_fd_number(fd: u32) -> Result<(), SysError> {
     close_range_raw(fd, fd, 0)
 }
@@ -3921,6 +3930,35 @@ pub(crate) fn set_non_dumpable() -> Result<(), SysError> {
     // （arg2 = 0 が `SUID_DUMP_DISABLE`。arg3〜5 はカーネルが参照しないが 0 に揃える）。呼び出した
     // プロセスの `mm` のフラグを下げるだけで、メモリの内容・fd には触れない。
     let rc = unsafe { prctl(consts::PR_SET_DUMPABLE, 0u64, 0u64, 0u64, 0u64) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 呼び出したプロセスの名前(`comm`。`PR_SET_NAME`)を設定する(TASK-29 追補・#1816。CORE-2)。
+///
+/// 本番 launcher の中間プロセスが PID 1 を fork する直前に、起動ごとの識別子を設定する。名前は fork で子へ
+/// 継承されるため、中間プロセスが PID 1 の pid を報告する前に死んでも、呼び出しプロセス(subreaper)は
+/// `/proc/<pid>/comm` で再親付けされた PID 1 を特定して回収できる。`execve` で実行ファイル名へ置き換わる。
+///
+/// `name` は 16 バイト固定で、NUL 終端を含むこと(長さ 15 バイト以下の名前)。NUL が無ければ `EINVAL`。
+pub(crate) fn set_process_comm(name: &[u8; 16]) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    if !name.contains(&0) {
+        return Err(SysError::Os(EINVAL));
+    }
+    // SAFETY: `name` は 16 バイトの配列で NUL を含む(上で確認)。カーネルは `PR_SET_NAME` で NUL 終端の
+    // 文字列を最大 15 バイトまで `task->comm` へコピーし、呼び出し後にポインタを保持しない。ポインタは
+    // レジスタ幅の値として可変長引数に渡す。副作用は呼び出したプロセスの名前の変更のみ。
+    let rc = unsafe {
+        prctl(
+            consts::PR_SET_NAME,
+            name.as_ptr() as usize as u64,
+            0u64,
+            0u64,
+            0u64,
+        )
+    };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
@@ -5023,6 +5061,7 @@ mod tests {
         assert_eq!(consts::PR_SET_KEEPCAPS, 8);
         assert_eq!(consts::PR_SET_CHILD_SUBREAPER, 36);
         assert_eq!(consts::PR_GET_CHILD_SUBREAPER, 37);
+        assert_eq!(consts::PR_SET_NAME, 15);
         // 親死亡シグナルの実 syscall は単体テストでは呼ばない（設定はスレッド単位で、テストプロセスを起動した
         // スレッドが先に終わるとテストプロセス全体へ SIGKILL が届く）。実プロセスでの照合は supervisor の
         // 結合試験 `exec_timeout` が行う。

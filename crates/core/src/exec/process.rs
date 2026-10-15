@@ -106,10 +106,7 @@ use crate::traits::types::ErrorCode;
 
 use super::entrypoint_mode::EntrypointExecMode;
 use super::interpreter::reject_runtime_interpreter;
-use super::launch_status::{
-    LaunchAudit, PrePivotFailure, PrePivotStep, read_pre_pivot_status, report_failure,
-    report_ready, resolve_pre_pivot_status,
-};
+use super::launch_status::{PrePivotFailure, PrePivotStep, report_failure, report_ready};
 use super::rlimits::apply_rlimits;
 use super::rootfs::PreparedRootfs;
 use super::sealed_copy::{SealPolicy, check_not_on_noexec_mount, seal_entrypoint_copy};
@@ -1813,7 +1810,7 @@ impl ChildStdio {
 ///
 /// `stdio` は最初に fd 1・2 へ付け替える（#1471）。付け替えの失敗は stderr（付け替え前の継承 fd）へ出す。
 /// 副作用: パイプ指定時、これ以降の失敗診断（下の 1 行を含む）は supervisor の stderr ではなくコンテナのログに入る。
-fn child_main(
+pub(super) fn child_main(
     rootfs: &Path,
     entry: &Entrypoint,
     stages: StagePipeline,
@@ -2397,116 +2394,30 @@ pub fn spawn_container_with_stages_and_devices(
     Ok(ContainerChild::spawned(pid))
 }
 
-/// pivot 前段の結果を親へ返す入口（TASK-29 追補・#1815。SEC-4・CORE-2・REPAIR-5）。
-///
-/// 状態 pipe を作って子を fork し、親は fork 直後に書き込み側を閉じてから `timeout` を上限に pivot 前段の結果
-/// （`launch_status` の 1 行）を読む。失敗・期限切れ・形式違反・EOF のみのいずれでも起動失敗として扱い、子を
-/// `kill_and_reap` で回収する（pivot 済みの PID 1 を残さない。CORE-2）。違反は `audit` の sink へ親が 1 件記録する
-/// （層 `mount`・パスなし。子は sink に触らない）。`setup.status` は上書きされる。
-///
-/// 将来仕様（REPAIR-3）: 本番 launcher（`oci_runtime` の `ProcessLauncher`）が起動ごとに `LaunchAudit` を作って
-/// 呼ぶ。launcher への配線（supervisor が `default_audit_sink` を渡す結線、`ContainerId` の受け渡し）は Phase B
-/// （#1715 の対象外項目）で、それまで crate 内の呼び出し元は無い。`dev.tty.legacy_tiocsti` の警告出力
-/// （#1739）も本入口には足していない。成功（`P`）の後（ステージ列・exec）の失敗は本入口では返らない。
-#[allow(dead_code)]
-pub(crate) fn spawn_container_prepared(
-    rootfs: &Path,
-    entry: &Entrypoint,
-    stages: StagePipeline,
-    stdio: ChildStdio,
-    setup: PrePivotSetup<'_>,
-    audit: LaunchAudit<'_>,
-    timeout: Duration,
-) -> Result<ContainerChild, Box<PreparedLaunchFailure>> {
-    launch_with_status_pipe(
-        sys::self_is_single_threaded,
-        |status| {
-            child_main(
-                rootfs,
-                entry,
-                stages,
-                Some(PrePivotSetup {
-                    status: Some(status),
-                    ..setup
-                }),
-                stdio,
-            )
-        },
-        audit,
-        timeout,
-    )
-}
-
-/// [`spawn_container_prepared`] が起動に失敗したときの値（CORE-2・REPAIR-5・#1815）。
+/// `spawn_container_via_intermediate`（`exec/launch_intermediate.rs`）が起動に失敗したときの値
+/// （CORE-2・REPAIR-5・#1815・#1816）。
 ///
 /// `rejection` が起動失敗の理由（監査の記録結果を含む）。子の回収（`SIGKILL` 後の `waitpid`）が期限内に
-/// 終わらなかった場合だけ、`unreaped` に未回収の子のハンドルを、`reap_error` に回収失敗の理由を載せて返す。
-/// `ContainerChild` は drop で kill / wait をしないため、呼び出し側（Phase B の launcher）は
+/// 終わらなかった場合だけ、`unreaped` に未回収の子（PID 1 または中間プロセス）のハンドルを、`reap_error` に
+/// 回収失敗の理由を載せて返す。`ContainerChild` は drop で kill / wait をしないため、呼び出し側（本番 launcher）は
 /// `unreaped` を期限付きの `kill_and_reap` で再回収できる所有者へ引き継ぐ責務を負う（孤児化させない）。
-// 本番 launcher（Phase B）が読むまで crate 内の読み手は試験だけ（REPAIR-3）。
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct PreparedLaunchFailure {
     /// 起動失敗の理由と監査の記録結果。
     pub(crate) rejection: AuditedRejection<ExecError>,
-    /// 回収できなかった子（回収済みなら `None`）。
-    pub(crate) unreaped: Option<ContainerChild>,
-    /// `unreaped` が `Some` のときの回収失敗の理由。
+    /// 回収できなかった子(回収済みなら空。中間プロセスの回収失敗時は PID 1 も未回収なら 2 個になり得る)。
+    pub(crate) unreaped: Vec<ContainerChild>,
+    /// 回収失敗の理由(最初の失敗)。`unreaped` が空でないとき、または報告前の PID 1 の探索自体ができなかったとき
+    /// (`unreaped` は空のまま)に `Some`。どちらも「子が残っている可能性」を表す(CORE-2)。
     pub(crate) reap_error: Option<ExecError>,
 }
 
-/// [`spawn_container_prepared`] の本体。子の動作（`child_body`）と fork 前のスレッド数判定を注入できる
-/// ようにして、成功・失敗・無報告の期限切れを結合試験で照合する（REPAIR-10・REPAIR-12）。
-fn launch_with_status_pipe(
-    is_single_threaded: impl FnOnce() -> bool,
-    child_body: impl FnOnce(&std::fs::File) -> i32,
-    audit: LaunchAudit<'_>,
-    timeout: Duration,
-) -> Result<ContainerChild, Box<PreparedLaunchFailure>> {
-    let not_started = |e: ExecError| {
-        Box::new(PreparedLaunchFailure {
-            rejection: AuditedRejection::not_applicable(e),
-            unreaped: None,
-            reap_error: None,
-        })
-    };
-    let (read, write) = exec_status_pipe().map_err(not_started)?;
-    let status = &write;
-    // fork 前の stdout / stderr の同期 flush は無期限に止まり得て、下の状態 pipe の期限が効かなくなる
-    // （REPAIR-5・#1815）ため、flush しない経路を使う。子は `_exit` するので二重出力は起きない。
-    let pid = sys::fork_single_threaded_with_no_flush(
-        is_single_threaded,
-        move || child_body(status),
-        EXIT_SETUP_FAILED,
-    )
-    .map_err(|e| not_started(ExecError::from_sys(e, IsolationStage::Spawn, "fork")))?;
-    // 親が書き込み側を持ち続けると、子が報告せずに終了しても EOF を観測できない。
-    drop(write);
-    let child = ContainerChild::spawned(pid);
-    let result = read_pre_pivot_status(&read, timeout);
-    match resolve_pre_pivot_status(result, audit) {
-        Ok(()) => Ok(child),
-        Err(rejection) => match child.kill_and_reap(KILL_REAP_TIMEOUT) {
-            Ok(_) => Err(Box::new(PreparedLaunchFailure {
-                rejection: *rejection,
-                unreaped: None,
-                reap_error: None,
-            })),
-            // 回収失敗は握りつぶさず、子のハンドルごと呼び出し側へ返す（孤児化の防止。CORE-2）。
-            Err(reap_error) => Err(Box::new(PreparedLaunchFailure {
-                rejection: *rejection,
-                unreaped: Some(child),
-                reap_error: Some(reap_error),
-            })),
-        },
-    }
-}
 /// 待ちのポーリング間隔。
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// `wait_timeout` に渡せる最大値（`Instant` の加算オーバーフローを避けるための丸め）。
 const WAIT_TIMEOUT_MAX: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// `SIGKILL` 後に回収を待つ上限。
-const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 子の回収状態（[`ContainerChild`] の `Mutex` が保護する）。
 ///
@@ -5061,220 +4972,5 @@ mod tests {
             assert_eq!(err.code, ErrorCode::PermissionDenied);
             assert!(err.to_string().contains("rootfs changed after validation"));
         }
-    }
-}
-/// `launch_with_status_pipe`（`spawn_container_prepared` の本体）の結合試験（#1815。SEC-4・CORE-2・REPAIR-5・
-/// REPAIR-10・REPAIR-12）。子の動作を注入し、成功・失敗・無報告の期限切れについて親への結果と子の回収を照合する。
-#[cfg(test)]
-mod prepared_launch_tests {
-    use std::io::Read as _;
-    use std::sync::Mutex;
-
-    use super::*;
-    use crate::audit_log::{AuditLayer, AuditRecord, AuditSink};
-    use crate::traits::{ContainerId, TraitError};
-
-    struct VecSink(Mutex<Vec<AuditRecord>>);
-
-    impl AuditSink for VecSink {
-        fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
-            self.0.lock().unwrap().push(record.clone());
-            Ok(())
-        }
-    }
-
-    /// 子の動作。pid を pipe へ書いた後に実行する。
-    #[derive(Clone, Copy)]
-    enum Behavior {
-        /// `P` を報告して終了する。
-        Ready,
-        /// 失敗（違反あり）を報告した後、回収されるまで眠る。
-        FailWithViolation,
-        /// 何も報告せず眠る（期限切れ）。
-        Silent,
-    }
-
-    fn run(
-        behavior: Behavior,
-        timeout: Duration,
-    ) -> (
-        Result<ContainerChild, Box<PreparedLaunchFailure>>,
-        VecSink,
-        u32,
-    ) {
-        let (mut pid_read, pid_write) = std::io::pipe().unwrap();
-        let sink = VecSink(Mutex::new(Vec::new()));
-        let id = ContainerId::new("c1815").unwrap();
-        let audit = LaunchAudit {
-            sink: &sink,
-            container: Some(&id),
-        };
-        let result = launch_with_status_pipe(
-            || true,
-            |status| {
-                let mut w = &pid_write;
-                let _ = w.write_all(&std::process::id().to_le_bytes());
-                match behavior {
-                    Behavior::Ready => {
-                        let _ = report_ready(status);
-                        0
-                    }
-                    Behavior::FailWithViolation => {
-                        let _ = report_failure(
-                            status,
-                            &PrePivotFailure {
-                                step: PrePivotStep::PivotRoot,
-                                code: ErrorCode::PermissionDenied,
-                                violation: Some(ViolationReason::TargetOnSharedMount),
-                            },
-                        );
-                        std::thread::sleep(Duration::from_secs(120));
-                        0
-                    }
-                    Behavior::Silent => {
-                        std::thread::sleep(Duration::from_secs(120));
-                        0
-                    }
-                }
-            },
-            audit,
-            timeout,
-        );
-        drop(pid_write);
-        let mut buf = [0u8; 4];
-        pid_read.read_exact(&mut buf).unwrap();
-        (result, sink, u32::from_le_bytes(buf))
-    }
-
-    /// 子プロセス側の本体（`REPAIR5_1815_MARKER` が無ければ何もしない）。親が stdout の pipe を満杯にした
-    /// 合図（`<marker>.go`）を待ってから、stdout に未送信のバッファを持った状態で起動処理を行い、期限内に
-    /// 失敗が返ったら `<marker>` を書く。
-    #[test]
-    fn repair5_1815_child_stdout_full_helper() {
-        let Some(marker) = std::env::var_os("REPAIR5_1815_MARKER") else {
-            return;
-        };
-        let marker = std::path::PathBuf::from(marker);
-        let go = marker.with_extension("go");
-        // libtest の見出しの出力が済んだ後で動いていることを親へ知らせる。
-        let _ = std::fs::write(marker.with_extension("ready"), b"1");
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while !go.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        // 改行なしの 1 バイトは LineWriter に残り、flush すると満杯の pipe で止まる。
-        let _ = std::io::stdout().write_all(b"x");
-        let (result, _sink, _pid) = run(Behavior::Silent, Duration::from_millis(500));
-        // 満杯の stdout へ libtest が書いて止まる前に、完了を目印ファイルで親へ知らせる。
-        if result.is_err() {
-            let _ = std::fs::write(&marker, b"done");
-        }
-    }
-
-    /// REPAIR-5（#1815）: 親の stdout が満杯の pipe でバッファが未送信でも、期限つき起動は fork 前の
-    /// flush で止まらず、指定した timeout の範囲で失敗を返す。
-    #[test]
-    fn repair5_1815_launch_does_not_block_on_full_stdout_pipe() {
-        if std::env::var_os("REPAIR5_1815_MARKER").is_some() {
-            return;
-        }
-        let (reader, writer) = std::io::pipe().unwrap();
-        let filler_writer = writer.try_clone().unwrap();
-        let marker = std::env::temp_dir().join(format!("repair5-1815-{}", std::process::id()));
-        let (ready, go) = (marker.with_extension("ready"), marker.with_extension("go"));
-        for f in [&marker, &ready, &go] {
-            let _ = std::fs::remove_file(f);
-        }
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "--nocapture",
-                "--test-threads=1",
-                "exec::process::prepared_launch_tests::repair5_1815_child_stdout_full_helper",
-            ])
-            .env("REPAIR5_1815_MARKER", &marker)
-            .stdout(writer)
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let wait_for = |path: &Path, secs: u64| {
-            let deadline = std::time::Instant::now() + Duration::from_secs(secs);
-            while !path.exists() && std::time::Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            path.exists()
-        };
-        let child_ready = wait_for(&ready, 20);
-        // 読まれない pipe を満杯にする（満杯になると書き込みスレッドが止まる）。
-        let filler = std::thread::spawn(move || {
-            let mut w = filler_writer;
-            let chunk = [0u8; 4096];
-            while w.write_all(&chunk).is_ok() {}
-        });
-        std::thread::sleep(Duration::from_millis(500));
-        let _ = std::fs::write(&go, b"1");
-        let finished = child_ready && wait_for(&marker, 20);
-        let _ = child.kill();
-        let _ = child.wait();
-        drop(reader);
-        let _ = filler.join();
-        for f in [&marker, &ready, &go] {
-            let _ = std::fs::remove_file(f);
-        }
-        assert!(finished, "launch blocked on a full stdout pipe");
-    }
-
-    /// 回収済みなら `/proc/<pid>` は残らない（ゾンビも残さない）。
-    fn gone(pid: u32) -> bool {
-        !Path::new(&format!("/proc/{pid}")).exists()
-    }
-
-    /// 成功: `Ok(child)` を返し、子は回収されず終了を待てる。監査は 0 件。
-    #[test]
-    fn core2_1815_prepared_launch_success_returns_live_child() {
-        let (result, sink, pid) = run(Behavior::Ready, Duration::from_secs(10));
-        let child = result.unwrap();
-        assert_eq!(child.pid(), pid);
-        assert_eq!(
-            child.wait_timeout(Duration::from_secs(10)).unwrap(),
-            ChildExit::Exited(0)
-        );
-        assert!(sink.0.lock().unwrap().is_empty());
-    }
-
-    /// 失敗報告: 起動失敗を返し、違反は親が 1 件記録し、眠っている子を回収する。
-    #[test]
-    fn sec4_1815_prepared_launch_failure_audits_and_reaps_child() {
-        let (result, sink, pid) = run(Behavior::FailWithViolation, Duration::from_secs(10));
-        let failure = result.expect_err("launch must fail");
-        assert_eq!(failure.rejection.error.code, ErrorCode::FailedPrecondition);
-        assert_eq!(
-            failure.rejection.error.violation.as_ref().map(|v| v.reason),
-            Some(ViolationReason::TargetOnSharedMount)
-        );
-        assert!(failure.unreaped.is_none());
-        assert!(failure.reap_error.is_none());
-        let recs = sink.0.lock().unwrap();
-        assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].layer(), AuditLayer::Mount);
-        assert_eq!(
-            recs[0].container_id().map(ContainerId::as_str),
-            Some("c1815")
-        );
-        assert!(gone(pid), "the child {pid} must be reaped");
-    }
-
-    /// 無報告の期限切れ: `Timeout` で失敗し、記録は 0 件、眠っている子を回収する（REPAIR-5）。
-    #[test]
-    fn repair5_1815_prepared_launch_silent_child_times_out_and_is_reaped() {
-        let started = Instant::now();
-        let (result, sink, pid) = run(Behavior::Silent, Duration::from_millis(300));
-        let failure = result.expect_err("launch must fail");
-        assert_eq!(failure.rejection.error.code, ErrorCode::Timeout);
-        assert_eq!(failure.rejection.error.violation, None);
-        assert!(failure.unreaped.is_none());
-        assert!(sink.0.lock().unwrap().is_empty());
-        assert!(gone(pid), "the child {pid} must be reaped");
-        assert!(started.elapsed() < Duration::from_secs(30));
     }
 }

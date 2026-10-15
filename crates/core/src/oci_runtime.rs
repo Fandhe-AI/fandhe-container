@@ -3,8 +3,9 @@
 //! bundle の `config.json` を型として読み込む `config`（TASK-29.1.1）と、
 //! `mounts[].destination` の正規化・トラバーサル拒否 `mount_destination`（TASK-29.1.2）、
 //! プロセス未起動の状態初期化 `create`（TASK-29.2）が実装済み。
-//! `start`（TASK-29.3）も実装済みだが、起動は依存注入する `ProcessLauncher` に委ねており、本番
-//! launcher と実プロセスの exec は未提供（制限ステージ TASK-37〜39 待ちで fail-closed）。
+//! `start`（TASK-29.3）も実装済みで、起動は依存注入する `ProcessLauncher` に委ねる。本番 launcher
+//! `ProductionLauncher`（`launcher.rs`。Linux。#1816）は実装済みで、supervisor への結線（#1819）・実機前提の結合試験
+//! （#1818）・`confirm_no_process`（#1817）は未実装である（REPAIR-3）。
 //! `kill`（TASK-30.1。送信は依存注入する `ProcessSignaler` に委ね、本番実装は supervisor〔TASK-157〕待ち）
 //! も実装済み。`delete`（TASK-30.2・TASK-30.3）は cgroup（依存注入する `ContainerCgroupRemover`。Linux の
 //! 本番実装は `cgroups::DelegatedCgroup`）と `StateStore` のレコード（状態ファイル）を削除する。OCI-7 の
@@ -30,6 +31,7 @@ mod delete;
 mod error;
 mod kill;
 mod launch;
+mod launcher;
 mod mount_destination;
 mod start;
 
@@ -59,9 +61,13 @@ pub use launch::ContainerChildProcess;
 #[doc(hidden)]
 pub use launch::pin_bundle_rootfs_with_swap_for_test;
 pub use launch::{
-    ContainerOutput, LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher, RootfsDir,
-    RootfsPinError, START_TIMEOUT_MAX, StartTimeouts, pin_bundle_rootfs, pin_bundle_rootfs_audited,
+    ContainerOutput, LaunchMode, LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher,
+    RootfsDir, RootfsPinError, START_TIMEOUT_MAX, StartTimeouts, pin_bundle_rootfs,
+    pin_bundle_rootfs_audited,
 };
+#[cfg(target_os = "linux")]
+pub use launcher::UnreapedChild;
+pub use launcher::{ProductionLauncher, ProductionLauncherBuilder};
 pub use mount_destination::{MountDestination, audit_mount_config_error};
 pub use start::{
     LAUNCHER_REPLY_GRACE, StartedContainer, recover_interrupted_start, start,

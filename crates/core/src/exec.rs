@@ -111,6 +111,7 @@ mod exec_command;
 mod inject;
 mod interpreter;
 mod landlock;
+mod launch_intermediate;
 mod launch_status;
 mod no_new_privs;
 mod process;
@@ -159,13 +160,19 @@ pub use diagnostic::{
 pub use entrypoint_mode::{EntrypointExecMode, IntegrityLsm, PathBoundLsm, SealedCopyUnavailable};
 pub use exec_command::{ExecChild, ExecWorkerProof, spawn_exec_command, spawn_exec_worker};
 pub use inject::{InjectReport, InjectedDirectoryOutcome, InjectedFileOutcome, inject_files};
+/// 本番 launcher（`oci_runtime::ProductionLauncher`。#1816）だけが使う crate 内の再公開。
+pub(crate) use landlock::landlock_ruleset_from_config;
 pub use landlock::launch_isolation_from_bundle;
+#[cfg(test)]
+pub(crate) use landlock::ruleset_from_detection;
 /// 結合試験 `tests/landlock.rs` 専用の再公開（CORE-5・TASK-39.5・#185。通常の利用者は呼ばない。詳細は定義側）。
 #[doc(hidden)]
 pub use landlock::{
     LANDLOCK_PROBE_CONTENT_MISMATCH, LandlockAccessKind, LandlockAccessObservation,
     LandlockAccessProbe, observe_landlock_path_access,
 };
+pub(crate) use launch_intermediate::{IntermediateSpec, spawn_container_via_intermediate};
+pub(crate) use launch_status::LaunchAudit;
 /// supervisor の `SETUP_VIOLATIONS` との突き合わせ試験専用の再公開（SEC-4・SUP-6・#1579。通常の利用者は呼ばない）。
 #[doc(hidden)]
 pub use process::exec_child_violation_reasons;
@@ -200,6 +207,7 @@ pub use process::{
     observe_exec_child_setup_with_fsize,
 };
 pub use process::{LegacyTiocstiReport, report_legacy_tiocsti_to};
+pub(crate) use process::{PrePivotSetup, PreparedLaunchFailure};
 /// 結合試験 `tests/exec_child_setup.rs`・`tests/fork_exec_isolation.rs` 専用の再公開（SEC-1・CORE-1・TASK-27.4.1・#1299。
 /// 通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(all(feature = "exec-test-support", not(test)))]
@@ -275,8 +283,8 @@ pub use violation::{
 /// 記録せず `NotApplicable`。`err` は常にそのまま返り、記録の失敗で拒否は覆らない（fail-closed）。
 ///
 /// launch 経路（fork 後の子）は sink に触らない。子が失敗した段と理由を状態 pipe で親へ返し、親が
-/// [`record_launch_mount_rejection`] で記録する（#1815）。その親側の入口は実装済みだが、本番 launcher
-/// （`oci_runtime`）・supervisor への配線は未実装（Phase B。TASK-29 / TASK-157 系。REPAIR-3）。
+/// [`record_launch_mount_rejection`] で記録する（#1815）。その親側の入口は実装済みで、本番 launcher
+/// （`oci_runtime::ProductionLauncher`。#1816）が呼ぶ。supervisor への結線は未実装（#1819。REPAIR-3）。
 /// ファイル永続化は `audit_log::AuditFileWriter`（#839）で実装済み。
 ///
 /// 移行（#1618）: 引数 `container` を `sink` の直前に追加した。記録の `container_id` に載せる検証済みの
@@ -721,8 +729,9 @@ pub struct ExecError {
 }
 
 impl ExecError {
-    /// 違反ではない失敗（システムエラー・入力書式エラー）を作る。
-    fn new(code: ErrorCode, stage: IsolationStage, message: impl Into<String>) -> Self {
+    /// 違反ではない失敗（システムエラー・入力書式エラー）を作る。crate 内の本番 launcher（`oci_runtime`）と
+    /// その試験からも使う。
+    pub(crate) fn new(code: ErrorCode, stage: IsolationStage, message: impl Into<String>) -> Self {
         Self {
             code,
             stage,

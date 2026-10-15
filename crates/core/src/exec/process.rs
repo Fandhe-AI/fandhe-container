@@ -313,7 +313,7 @@ fn exit_code_for(err: &ExecError) -> i32 {
 /// `with_landlock` で登録した core の Landlock 適用の成功を束ねたもので、このモジュールからは作れない。
 /// 真偽値・`StageReport`・`CapabilityReport` を受け取る入口は作らない（独自フックやダミーフックの
 /// `Applied` では exec を許さない）。`CgroupJoin` は条件に入れない（cgroup を使う設定なのに join して
-/// いない場合の拒否は本番 launcher の責務。#1715）。
+/// いない場合の拒否は本番 launcher が fork 前に `oci_runtime::require_cgroup_join` で行う。#1715・#1814）。
 /// `/proc/self/status` の `NoNewPrivs`・`Seccomp`・`CapEff` は、親から継承した制限と子のステージが
 /// 適用した制限を区別できず、seccomp フィルタの中身も確認できないため、証跡として扱わない。
 fn require_restriction_evidence(

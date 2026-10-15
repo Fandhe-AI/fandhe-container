@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::cgroup_requirement::CgroupRequirement;
 use super::config::{NamespaceKind, OciConfig};
 use crate::traits::{ContainerId, ErrorCode, Signal, TraitError};
 
@@ -424,6 +425,7 @@ pub struct LaunchSpec {
     env: Vec<String>,
     hostname: Option<String>,
     namespaces: Vec<NamespaceKind>,
+    cgroup: CgroupRequirement,
 }
 
 impl LaunchSpec {
@@ -434,6 +436,7 @@ impl LaunchSpec {
         env: Vec<String>,
         hostname: Option<String>,
         namespaces: Vec<NamespaceKind>,
+        cgroup: CgroupRequirement,
     ) -> Self {
         Self {
             rootfs,
@@ -442,7 +445,15 @@ impl LaunchSpec {
             env,
             hostname,
             namespaces,
+            cgroup,
         }
+    }
+
+    /// config が cgroup を使う設定かどうか（CORE-3・#1814）。必要なのに join の手段が無ければ、
+    /// launcher は fork の前に `require_cgroup_join` で拒否する。今は `start` が `linux.resources` /
+    /// `linux.cgroupsPath` を先に拒否するため常に不要（resources の写像 TASK-170.3 待ち。REPAIR-3）。
+    pub fn cgroup_requirement(&self) -> CgroupRequirement {
+        self.cgroup
     }
 
     /// 検査済みの rootfs の絶対パス（表示・記録用。使用には [`Self::rootfs_dir`] を使うこと）。
@@ -706,6 +717,9 @@ impl LaunchedProcess for ContainerChildProcess {
 ///   subuid / subgid の範囲写像（コンテナ内に複数 UID を持たせる通常の rootless 構成）が要る場合は
 ///   `exec::plan_rootless_subordinate` / `exec::isolate_rootless_subordinate` を使う（TASK-40.2・CORE-6。
 ///   `linux.uidMappings` を `LaunchSpec` へ載せる経路は未実装）
+/// - [`LaunchSpec::cgroup_requirement`] が必要なのに cgroup への join の手段が無ければ、fork の前に
+///   `require_cgroup_join` で拒否する（SEC-1・CORE-3・#1814）。join の手段は `LaunchSpec` に載せず、
+///   launcher の構築時に保持する
 /// - `LaunchSpec::namespaces` には Pid・Mount・User・Ipc・Uts が必ず含まれる（`start` が検証済み）
 ///
 /// 本番実装は本 crate に未提供（モジュール doc 参照）。

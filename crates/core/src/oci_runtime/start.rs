@@ -111,6 +111,7 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
+use super::cgroup_requirement::CgroupRequirement;
 use super::config::{NamespaceKind, OciConfig};
 use super::create::validate_bundle;
 use super::error::{LifecycleOp, OciRuntimeError};
@@ -676,6 +677,7 @@ fn build_spec(bundle: &Path) -> Result<LaunchSpec, TraitError> {
         process.env().to_vec(),
         config.hostname().map(str::to_owned),
         namespaces,
+        CgroupRequirement::of_config(&config),
     ))
 }
 
@@ -1724,6 +1726,8 @@ mod tests {
         let held = std::fs::metadata(format!("/proc/thread-self/fd/{fd}")).expect("meta");
         let named = std::fs::metadata(b.dir.join("rootfs")).expect("meta");
         assert_eq!((held.dev(), held.ino()), (named.dev(), named.ino()));
+        // CORE-3: cgroup 指定の無い config では要件なし。
+        assert!(!spec.cgroup_requirement().is_required());
     }
 
     /// SEC-1: bundle の祖先が symlink なら（create は受理しても）start は起動前に拒否し、予約もしない。

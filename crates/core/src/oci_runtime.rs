@@ -17,11 +17,13 @@
 //! create / start / kill / delete の失敗は `OciRuntimeError` で返し、標準エラー向け 1 行 JSON は `write_json_line` で
 //! 出せる（TASK-96.2・TASK-96.3）。実 stderr への書き出しとプロセス終了は CLI 側（TASK-79・TASK-95）の
 //! 責務で未結線である（REPAIR-3）。
+//! launcher が fork 前に cgroup 要件を検査する関数 `require_cgroup_join`（#1814・CORE-3）も置く。
 //! 例外は start の rootfs 固定（`RootfsDir::pin`。`exec::open_dir_beneath` を使う。検証後の差し替えの違反は
 //! `RootfsPinError` で運び、exec の経路が監査ログの層 `mount` へ記録する。start の経路は記録しない〔#1314〕。#1702）と
 //! `ContainerChildProcess` で、`launch.rs` 内に `cfg(target_os = "linux")` で局所化している。Linux 以外の
 //! start は rootfs を固定できないため、起動前に `Unimplemented` で拒否する（fail-closed）。
 
+mod cgroup_requirement;
 mod config;
 mod create;
 mod delete;
@@ -31,6 +33,9 @@ mod launch;
 mod mount_destination;
 mod start;
 
+pub use cgroup_requirement::{
+    CgroupJoinMeans, CgroupRequirement, launch_after_cgroup_check, require_cgroup_join,
+};
 pub use config::{
     CONFIG_MAX_ADDITIONAL_GIDS, CONFIG_MAX_ARGS, CONFIG_MAX_BYTES, CONFIG_MAX_ENV,
     CONFIG_MAX_HOSTNAME_BYTES, CONFIG_MAX_ID_MAPPINGS, CONFIG_MAX_MOUNT_OPTIONS, CONFIG_MAX_MOUNTS,

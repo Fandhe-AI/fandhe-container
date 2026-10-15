@@ -465,6 +465,27 @@ fn sink_error_from_io(err: &io::Error, batch_len: usize) -> IoError {
 
 impl BatchSink for AppendFileSink {
     fn write_batch(&mut self, batch: &Batch) -> Result<SinkWriteReport, IoError> {
+        self.write_batch_with_frame_hook(batch, &mut |_| {})
+    }
+
+    fn persist(&mut self) -> Result<SinkPersistReport, IoError> {
+        self.persist_with_support(crate::barrier::persist_support())
+    }
+}
+
+impl AppendFileSink {
+    /// [`BatchSink::write_batch`] の本体。各フレームの `write_all` が成功した直後に
+    /// `on_frame_written(書き込み済みフレーム数)` を呼ぶ。
+    ///
+    /// 試験専用の継ぎ目（`#[doc(hidden)]`）。1 回の `write_batch` の最中（フレーム間）へ
+    /// 外部 truncate 等を決定的に差し込むため、結合試験（`tests/consistency/interleave.rs`
+    /// の I7・IO-4・REPAIR-12）が使う。通常の `write_batch` は何もしないフックで呼ぶ。
+    #[doc(hidden)]
+    pub fn write_batch_with_frame_hook(
+        &mut self,
+        batch: &Batch,
+        on_frame_written: &mut dyn FnMut(usize),
+    ) -> Result<SinkWriteReport, IoError> {
         // 書き込み前に立てる（途中失敗でも一部が書かれうるため。persist の合流判定）。
         self.dirty_since_persist = true;
         // バッチごとに現在の EOF へ位置合わせする（`AppendFileSink::new` の
@@ -507,13 +528,10 @@ impl BatchSink for AppendFileSink {
             bytes_written = bytes_written.checked_add(body_len).ok_or_else(|| {
                 IoError::new(IoErrorCode::Internal, "bytes_written counter overflowed")
             })?;
+            on_frame_written(frames_written);
         }
 
         Ok(SinkWriteReport::new(frames_written, bytes_written))
-    }
-
-    fn persist(&mut self) -> Result<SinkPersistReport, IoError> {
-        self.persist_with_support(crate::barrier::persist_support())
     }
 }
 

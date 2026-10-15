@@ -20,30 +20,23 @@
 //! 2. 同時実行の反復（I6）: sink が書き込みの途中で `mpsc` に信号を出し、rename
 //!    スレッドが受けて残りの書き込みと並行に rename する（rename のみ。barrier で
 //!    同時に解放するだけでは、通常モードで途中に着地した反復が 0/100 だった）。
-//! 3. 1 回の `write_batch` の最中の truncate（I7）: 並行 truncater がパス経由で
-//!    ファイルサイズを `yield_now` で監視し、閾値に達した瞬間に `set_len` する。
+//! 3. 1 回の `write_batch` の最中の truncate（I7）: `AppendFileSink` の試験用の継ぎ目
+//!    `write_batch_with_frame_hook` で、実際の `write_batch` の k フレーム目を書いた直後に
+//!    同じスレッドからパス経由の `set_len` を行う（スレッド・時間・スケジューラに依らない
+//!    決定的な差し込み。REPAIR-12）。
 //!
-//! # 限界（本番コードを変えずに差し込める範囲）
+//! # 限界
 //!
-//! 内側の `AppendFileSink::write_batch` の中（フレーム間）へ決定的には差し込めない。
-//! 「フレーム間」はサブバッチ分割による「サブバッチ間」であり、サブバッチごとに
-//! `seek(End)` が走る。1 回の `write_batch` の最中の外部 truncate は
-//! `AppendFileSink::new` の doc が「追随の対象外」とするが、I7 が並行 truncater で
-//! 観測同期し、次の固定の期待値を置く（truncate 時点で k レコードが書かれ、m レコード
-//! 長へ縮小した場合。レコードは分断されない）。
+//! 1 回の `write_batch` の最中の外部 truncate は `AppendFileSink::new` の doc が
+//! 「追随の対象外」とするが、I7 が上記の継ぎ目で固定の期待値を置く（truncate 時点で k
+//! レコードが書かれ、m レコード長へ縮小した場合。縮小先がレコード境界のためレコードは
+//! 分断されない）。
 //!
-//! - 通常モード: 先頭 m レコード + `[m, k)` のゼロ埋めの穴 + 元の位置の後続レコード
-//!   （縮小後にレコードが続かなければ穴なしで先頭 m レコードのみ）。
+//! - 通常モード: 先頭 m レコード + `[m, k)` のゼロ埋めの穴 + 元の位置の後続レコード。
 //! - 追記モード: 先頭 m レコード + 後続レコード（穴なし）。
 //!
-//! 破損は「どの k のモデルにも完全一致しない」（ずれ・重複・欠落・混入・断片）こと。
-//! 縮小前の内容の消失と通常モードの穴は呼び出し側の truncate の帰結で、破損と
-//! 判定しない。truncate が書き込みの途中に着地する試行（0 < k < 全数）は、
-//! 最終内容から復元した k で数え、10 回に達するまで期限（60 秒）内で試行を重ねる
-//! （試行数の固定上限にしない。writer が先に書き終える試行は正しい実装でも起こりうるため、
-//! 1 試行ごとの着地は要求せず、期限内に十分な回数の交錯が得られることだけを assert する。
-//! 内側の `write_batch` の中は本番コードを変えずにゲートできないため、決定的な進行制御は
-//! 置けない）。
+//! 破損は「モデルに完全一致しない」（ずれ・重複・欠落・混入・断片）こと。縮小前の内容の
+//! 消失と通常モードの穴は呼び出し側の truncate の帰結で、破損と判定しない。
 //!
 //! # 成り立つ条件（期待値は `Vec<u8>` への追記・`set_len` 相当の単純な模型で作る）
 //!
@@ -555,11 +548,8 @@ fn io4_interleave_concurrent_rename_signal_mid_write_iterations() {
 /// I7 用: 1 バッチに入れるレコード数・レコード長（`MAX_BATCH_SIZE` 以下）。
 const I7_TOTAL: usize = 512;
 const I7_BODY_LEN: usize = 512;
-/// truncater が動き出す書き込み済みレコード数と、縮小先のレコード数。
+/// truncate を差し込む書き込み済みレコード数 `k`。
 const I7_TRIGGER: usize = 128;
-/// 途中着地が `I7_MIN_MID_BATCH` 回に達するまで試行を重ねる壁時計の期限（REPAIR-5）。
-const I7_TRIAL_DEADLINE: Duration = Duration::from_secs(60);
-const I7_MIN_MID_BATCH: usize = 10;
 
 fn i7_records(seqs: std::ops::Range<usize>) -> Vec<u8> {
     seqs.flat_map(|seq| body_for(0, seq as u32, I7_BODY_LEN))
@@ -570,78 +560,73 @@ fn i7_records(seqs: std::ops::Range<usize>) -> Vec<u8> {
 /// 通常モードは `[m, k)` がゼロ埋めの穴（カーソルが古い EOF に残るため）、追記モードは穴なし。
 fn i7_model(mode: Mode, m: usize, k: usize) -> Vec<u8> {
     let mut data = i7_records(0..m);
-    // 通常モードの穴は、縮小後にレコードが続くとき（k < 全数）だけできる。
-    if matches!(mode, Mode::Normal) && k < I7_TOTAL {
+    if matches!(mode, Mode::Normal) {
         data.resize(k * I7_BODY_LEN, 0);
     }
     data.extend(i7_records(k..I7_TOTAL));
     data
 }
 
-/// 最終ファイルから truncate 時点のレコード数 `k` を復元する。モデルに合わなければ `None`。
-fn i7_recover_k(mode: Mode, m: usize, data: &[u8]) -> Option<usize> {
-    let k = match mode {
-        // 穴の終わり: `m` 以降で最初にゼロでないスロット（レコードのヘッダは非ゼロ）。
-        Mode::Normal if data == i7_records(0..m).as_slice() => I7_TOTAL,
-        Mode::Normal => (m..I7_TOTAL)
-            .find(|i| {
-                data.get(i * I7_BODY_LEN..i * I7_BODY_LEN + harness::BODY_HEADER_LEN)
-                    .is_some_and(|h| h.iter().any(|b| *b != 0))
-            })
-            .unwrap_or(I7_TOTAL),
-        Mode::Append => {
-            let n = data.len() / I7_BODY_LEN;
-            I7_TOTAL.checked_sub(n.checked_sub(m)?)?
-        }
-    };
-    (k >= m && data == i7_model(mode, m, k).as_slice()).then_some(k)
+/// 実際の `AppendFileSink::write_batch` のフレーム間（`k` フレーム書いた直後）で、
+/// パス経由の `set_len` を同じスレッドで行う sink。スケジューラに依らず、truncate が
+/// 1 回の `write_batch` の最中に必ず着地する（REPAIR-12）。失敗は記録して試験末尾で照合する。
+struct TruncatingSink {
+    inner: fandhe_container_io::AppendFileSink,
+    path: PathBuf,
+    trigger: usize,
+    len: u64,
+    failures: FailureLog,
 }
 
-/// 1 回の `write_batch` の最中に並行 truncate を行い、最終ファイルを `k` として返す。
-fn i7_run_once(mode: Mode, m: usize, dir: &TempDir, n: usize) -> (Vec<u8>, Vec<String>) {
-    let path = dir.file_path(&format!("data-{n}.bin"));
+impl BatchSink for TruncatingSink {
+    fn write_batch(&mut self, batch: &Batch) -> Result<SinkWriteReport, IoError> {
+        let (path, trigger, len, failures) = (&self.path, self.trigger, self.len, &self.failures);
+        self.inner
+            .write_batch_with_frame_hook(batch, &mut |written| {
+                if written == trigger {
+                    let op = FileOp::SetLen {
+                        path: path.clone(),
+                        len,
+                    };
+                    if let Err(err) = op.run() {
+                        failures
+                            .lock()
+                            .expect("lock")
+                            .push(format!("set_len: {:?}", err.kind()));
+                    }
+                }
+            })
+    }
+
+    fn persist(&mut self) -> Result<fandhe_container_io::SinkPersistReport, IoError> {
+        self.inner.persist()
+    }
+}
+
+/// 1 回の `write_batch` の最中（`I7_TRIGGER` レコード書いた直後）に truncate を行い、
+/// 最終ファイルを返す。
+fn i7_run_once(mode: Mode, m: usize, dir: &TempDir) -> (Vec<u8>, Vec<String>) {
+    let path = dir.file_path("data.bin");
     let (client_end, server_end) = harness::duplex();
     let config = BatchConfig::new(I7_TOTAL).expect("valid batch size");
     let timeouts = WritebackTimeouts {
         recv: timeout(),
         send: timeout(),
     };
-    let sink = open_sink(&path, mode.open_mode()).expect("open sink");
+    let failures: FailureLog = Arc::default();
+    let sink = TruncatingSink {
+        inner: open_sink(&path, mode.open_mode()).expect("open sink"),
+        path: path.clone(),
+        trigger: I7_TRIGGER,
+        len: (m * I7_BODY_LEN) as u64,
+        failures: Arc::clone(&failures),
+    };
     let server = spawn_server(server_end, config, sink, timeouts);
     let mut client = PipelineClient::new(
         client_end,
         InFlightLimit::new(I7_TOTAL + 1).expect("valid in-flight limit"),
         NoopSendObserver,
     );
-    let failures: FailureLog = Arc::default();
-    let truncater = {
-        let (path, failures) = (path.clone(), Arc::clone(&failures));
-        std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + join_deadline();
-            let trigger = (I7_TRIGGER * I7_BODY_LEN) as u64;
-            // sleep は使わず yield で書き込みサイズを監視する（期限つき。REPAIR-5）。
-            while std::fs::metadata(&path).map(|md| md.len()).unwrap_or(0) < trigger {
-                if std::time::Instant::now() > deadline {
-                    failures
-                        .lock()
-                        .expect("lock")
-                        .push("trigger timeout".into());
-                    return;
-                }
-                std::thread::yield_now();
-            }
-            let op = FileOp::SetLen {
-                path,
-                len: (m * I7_BODY_LEN) as u64,
-            };
-            if let Err(err) = op.run() {
-                failures
-                    .lock()
-                    .expect("lock")
-                    .push(format!("set_len: {:?}", err.kind()));
-            }
-        })
-    };
     let bodies: Vec<Vec<u8>> = (0..I7_TOTAL)
         .map(|s| body_for(0, s as u32, I7_BODY_LEN))
         .collect();
@@ -649,7 +634,6 @@ fn i7_run_once(mode: Mode, m: usize, dir: &TempDir, n: usize) -> (Vec<u8>, Vec<S
     drain_acks(&mut client, I7_TOTAL, timeout());
     drop(client);
     let report = join_within(server, join_deadline());
-    join_within(truncater, join_deadline());
     assert_eq!(report.end.code(), IoErrorCode::Unavailable, "session end");
     assert_eq!(report.stats.acks_sent, I7_TOTAL as u64, "acks");
     assert_eq!(report.stats.batches_written, 1, "single batch");
@@ -660,29 +644,13 @@ fn i7_run_once(mode: Mode, m: usize, dir: &TempDir, n: usize) -> (Vec<u8>, Vec<S
 fn i7_matrix(mode: Mode) {
     for m in [0usize, I7_TRIGGER / 2] {
         let dir = TempDir::new("interleave-write-batch-truncate");
-        let mut mid_batch = 0usize;
-        let deadline = std::time::Instant::now() + I7_TRIAL_DEADLINE;
-        let mut trials = 0usize;
-        for n in 0.. {
-            trials = n + 1;
-            let (data, log) = i7_run_once(mode, m, &dir, n);
-            assert_no_failures(&log, &format!("{mode:?}/m={m}/trial {n}"));
-            let k = i7_recover_k(mode, m, &data).unwrap_or_else(|| {
-                panic!(
-                    "{mode:?}/m={m}/trial {n}: final file ({} bytes) matches no model",
-                    data.len()
-                )
-            });
-            if k < I7_TOTAL {
-                mid_batch += 1;
-            }
-            if mid_batch >= I7_MIN_MID_BATCH || std::time::Instant::now() > deadline {
-                break;
-            }
-        }
+        let (data, log) = i7_run_once(mode, m, &dir);
+        assert_no_failures(&log, &format!("{mode:?}/m={m}"));
+        // k は固定（I7_TRIGGER）。モデルとの完全一致で、ずれ・重複・欠落・混入・断片を検出する。
         assert!(
-            mid_batch >= I7_MIN_MID_BATCH,
-            "{mode:?}/m={m}: truncate landed mid-batch in only {mid_batch}/{trials} trials within {I7_TRIAL_DEADLINE:?}"
+            data == i7_model(mode, m, I7_TRIGGER),
+            "{mode:?}/m={m}: final file ({} bytes) differs from the model",
+            data.len()
         );
     }
 }

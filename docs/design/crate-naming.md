@@ -42,8 +42,8 @@ spec の仮称（`05-tasks.md` 冒頭）は core 系 8 個（`io`・`core`・`oc
 | 8 | microvm | microvm | KVM 直接制御・最小 virtio デバイスモデル（Linux オプション） | G5（TASK-74〜78） | plugin 境界の外側（`microvm` はバックエンド実装ライブラリ。実行時は `plugin-microvm` バイナリが別プロセスとして動かす。TASK-117） |
 | 9 | cli | cli | 統一 CLI・基本コマンド（create/start/stop/delete/list/logs/ps）、観測性 | G6（TASK-79〜98 の一部。crate の中核成果物は TASK-79〔基本コマンド〕・TASK-95〔エラー形式〕。REPAIR・ERR 系タスクを含む） | core |
 | 10 | plugin | plugin（旧称 `plugin-api`） | plugin 境界機構（UDS・長さ接頭辞フレーム・gRPC・常駐/都度起動・信頼性検証） | G8（TASK-107 が crate 本体〔`crates/plugin/` に改名〕、TASK-108 が gRPC〔tonic〕境界、TASK-110・TASK-113・TASK-122〜124。plugin 発見・登録〔TASK-109〕の成果物は `crates/core/src/plugin_discovery.rs` であり `plugin` ではない） | core・plugin 双方が依存する境界基盤ライブラリ |
-| 11 | gpu | gpu | GPU CDI spec 解析・edits 適用・Landlock/seccomp・cgroup device・読み取り専用 rootfs | G9（TASK-126〜135） | core（推奨）〔注 1〕。macOS Venus〔GPU-6〕は対象・実装機構が異なる別枠で、成果物は `plugin-macos` 側に置かれる |
-| 12 | net | net | netlink・nftables・bridge/veth/netns・DNS ヘルパー・host/none モード・ポート公開 | G10（TASK-136〜148・TASK-185〜186） | core 側のライブラリ（supervisor と `NetworkPlugin` の実装の両方がリンクする。ネットワーク設定操作は制御面として PLUG-1 で `NetworkPlugin` が plugin 側に区分され、その実装は plugin 側のまま。NET-5 の DNS ヘルパーの起動・停止は `NetworkPlugin` の実装〔plugin 側〕、NET-9 の pasta の起動・監視・回収は supervisor〔core 側〕が行う。いずれも D-14 の例外として認められている。PLUG-4 が数える「core」〔`crates/core`〕には入らない。2026-10-12 オーナー決定、[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6129145225)。rootful のネットワーク設定の配置は未解決疑問点 11 の残りで未決、`plugin-system.md`） |
+| 11 | gpu | gpu | GPU CDI spec 解析・edits 適用・Landlock/seccomp・cgroup device・読み取り専用 rootfs | G9（TASK-126〜135） | core（2026-10-15 確定）〔注 1〕。macOS Venus〔GPU-6〕は対象・実装機構が異なる別枠で、成果物は `plugin-macos` 側に置かれる |
+| 12 | net | net | netlink・nftables・bridge/veth/netns・DNS ヘルパー・host/none モード・ポート公開 | G10（TASK-136〜148・TASK-185〜186） | core 側のライブラリ（supervisor と `NetworkPlugin` の実装の両方がリンクする。ネットワーク設定操作は制御面として PLUG-1 で `NetworkPlugin` が plugin 側に区分され、その実装は plugin 側のまま。NET-5 の DNS ヘルパーの起動・停止は `NetworkPlugin` の実装〔plugin 側〕、NET-9 の pasta の起動・監視・回収は supervisor〔core 側〕が行う。いずれも D-14 の例外として認められている。PLUG-4 が数える「core」〔`crates/core`〕には入らない。2026-10-12 オーナー決定、[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6129145225)。rootful のネットワーク設定〔veth・bridge・nftables〕は `NetworkPlugin` の実装が `crates/net` を使って行い、core は network namespace を渡すだけにする。2026-10-15 オーナー決定、[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6200154873)、`plugin-system.md`） |
 | 13 | stack | stack | TOML スキーマ・`depends_on` 起動順・`profiles` 絞り込み | G11（TASK-149・150・187〜188。TASK-149 が crate 雛形） | core（CLI＋ライブラリ API） |
 | 14 | compose-convert | compose-convert | `compose.yaml` → TOML の片方向変換ツール（変換レポート・キー分類・`--downgrade` 格下げ・GPU 予約変換・`build:` エラー処理・往復検証テスト〔TASK-152〕） | G11（TASK-151 が crate 雛形・変換器本体、TASK-152・153・154・156・182） | 該当外（plugin ではない独立ツール。決定 5） |
 | 15 | plugin-cri | plugin-cri | CRI サーバー plugin バイナリ（`cri` の実装を別プロセス化） | G8（TASK-114） | plugin |
@@ -52,7 +52,7 @@ spec の仮称（`05-tasks.md` 冒頭）は core 系 8 個（`io`・`core`・`oc
 | 18 | plugin-microvm | plugin-microvm | microVM 制御 plugin バイナリ（`microvm` の実装を別プロセス化） | G8（TASK-117） | plugin |
 | 19 | plugin-mcp | plugin-mcp | MCP サーバー plugin バイナリ（参照実装） | G8（TASK-118、PoC-13） | plugin |
 
-〔注 1〕`gpu` 行の PLUG-1 区分の内訳: `plugin-system.md` の境界表で「core（推奨）」と明記されているのは GPU-1〜4（CDI 適用・OCI hook 実行）のみ。GPU-5・GPU-7・GPU-8（Landlock/seccomp・cgroup device・読み取り専用 rootfs との両立）は境界表での明示判定がなく、`gpu` crate に実装される付随機能として扱っている。GPU-9 は `api-gpu.md` でステータス「検討中」のため確定扱いしない。
+〔注 1〕`gpu` 行の PLUG-1 区分の内訳: `plugin-system.md` の境界表で core と明記されているのは GPU-1〜4（CDI 適用・OCI hook 実行）のみ（2026-10-15 に「推奨」から確定。#4 のコメント）。GPU-5・GPU-7・GPU-8（Landlock/seccomp・cgroup device・読み取り専用 rootfs との両立）は境界表での明示判定がなく、`gpu` crate に実装される付随機能として扱っている。GPU-9 は `api-gpu.md` でステータス「検討中」のため確定扱いしない。
 
 ## plugin crate の配置（決定）
 

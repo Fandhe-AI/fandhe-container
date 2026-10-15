@@ -4,7 +4,7 @@
 
 - 決定日: 2026-09-26（ユーザー決定）
 - 関連 issue: #25（MS-0・TASK-73〜75 の前提）
-- 更新: 2026-10-10（オーナー判断。#399・#406・#408・#425・#540・#582・#597・#670・#678 の承認・不採用を反映。2026-10-12 の判断（#340）で rootless の外部ヘルパー pasta の例外を記録。2026-10-12 の判断（#1048・#1525・#1318）で MoltenVK 動的ロードの自前ラッパー・`libloading`／`ash`／`vulkanalia` の不採用・`libc` の用途限定を反映）
+- 更新: 2026-10-10（オーナー判断。#399・#406・#408・#425・#540・#582・#597・#670・#678 の承認・不採用を反映。2026-10-12 の判断（#340）で rootless の外部ヘルパー pasta の例外を記録。2026-10-12 の判断（#1048・#1525・#1318）で MoltenVK 動的ロードの自前ラッパー・`libloading`／`ash`／`vulkanalia` の不採用・`libc` の用途限定を反映。2026-10-15 の判断で `nix` を許容依存リストから外して不採用へ移した）
 
 ## 方針
 
@@ -43,7 +43,6 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 | クレート | バージョン | 用途 | issue |
 | -------- | ---------- | ---- | ----- |
 | `libc` | =0.2.189 | 自前 FFI 宣言の機械照合（2026-10-12 の判断で用途を限定。dev-dependencies のみで、製品コードの依存には入れない。syscall の宣言自体は各 crate の `sys` の自前宣言を続ける。`Cargo.toml` への追加は #1838 で行い、現時点では未導入） | #86・#1318 |
-| `nix` | =0.31.3 | syscall wrapper（Unix のみ cfg(unix)・feature 最小。どの crate も使っていない〔#1318 の判断〕） | #86 |
 | `unicode-normalization` | =0.1.25 | NFC / NFD の別表記の衝突検出（IO-5。io crate のみ。名前は正規化せず、`nfd()` で比べて衝突を構造化エラーで拒否する。#103 の決定） | #798（#1720 でそのまま使うと決定） |
 | `serde` | =1.0.229 | データシリアライズ | #138 |
 | `serde_json` | =1.0.151 | JSON（ペイロード・設定。crates/oci のトークン応答パースにも使用。TASK-51.2・#401） | #138 |
@@ -93,6 +92,7 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 | `spdy-mux` | GPL-3.0-only（コピーレフト） | #678 |
 | `spdystream-rs` | 2026-05 公開で実績・保守体制が乏しい。SPDY/3.1 は自作 | #678 |
 | `shlex` | compose-go が使う go-shellwords v1.0.12 と分割規則が違う。分割は crates/compose-convert で自作 | #597 |
+| `nix` | どの crate も使っておらず、syscall・ioctl は各 crate の `sys` の自前宣言で行う（#1318）。2026-10-15 のオーナー判断で許容依存リストから外した（PR #1966 の保留の解消）。必要になったら改めて承認を得る | #86・#1318 |
 | `serde_norway` | libyaml を機械翻訳した unsafe コードを未信頼入力に晒し、上限を設定できない | #540 |
 | `serde_yaml` | 作者が非推奨とし archived。依存の unsafe-libyaml に RUSTSEC-2023-0075（unsound） | #540 |
 | `serde_yml` | RUSTSEC-2025-0068（unsound・unmaintained）。repo は archived | #540 |

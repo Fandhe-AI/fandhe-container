@@ -313,6 +313,9 @@ const ROOT_ID: u64 = 0;
 struct NameIndex {
     ids: HashMap<(u64, OsString), u64>,
     limit: u64,
+    /// 次に採番する ID。`forget_tree` で件数が減っても過去の ID を再利用しない（旧ディレクトリの登録と
+    /// 混ざって別表記の判定を誤らないため）。
+    next_id: u64,
 }
 
 impl NameIndex {
@@ -320,6 +323,27 @@ impl NameIndex {
         Self {
             ids: HashMap::new(),
             limit,
+            next_id: ROOT_ID + 1,
+        }
+    }
+
+    /// whiteout で削除した `parent` 直下の `name` と、その配下の登録をすべて索引から外す（IO-5）。
+    /// 外さないと、削除済みの綴りを現在の実体の綴りとして受理してしまう。ID は再利用しない。
+    fn forget_tree(&mut self, parent: u64, name: &OsStr) {
+        let Some(root_id) = self.ids.remove(&(parent, name.to_os_string())) else {
+            return;
+        };
+        let mut children: HashMap<u64, Vec<(u64, OsString)>> = HashMap::new();
+        for (p, n) in self.ids.keys() {
+            children.entry(*p).or_default().push((*p, n.clone()));
+        }
+        let mut work = vec![root_id];
+        while let Some(id) = work.pop() {
+            for key in children.remove(&id).unwrap_or_default() {
+                if let Some(child) = self.ids.remove(&key) {
+                    work.push(child);
+                }
+            }
         }
     }
 
@@ -335,16 +359,19 @@ impl NameIndex {
             return Ok(id);
         }
         // ROOT_ID（0）と重ならないよう 1 始まりで採番する。
-        let id = u64::try_from(self.ids.len())
-            .ok()
-            .and_then(|n| n.checked_add(1))
-            .filter(|n| *n <= self.limit)
-            .ok_or_else(|| {
-                err(
-                    OciErrorCode::ResourceExhausted,
-                    "layer exceeds the tracked path limit",
-                )
-            })?;
+        let id = self.next_id;
+        if u64::try_from(self.ids.len()).map_or(true, |n| n >= self.limit) {
+            return Err(err(
+                OciErrorCode::ResourceExhausted,
+                "layer exceeds the tracked path limit",
+            ));
+        }
+        self.next_id = id.checked_add(1).ok_or_else(|| {
+            err(
+                OciErrorCode::ResourceExhausted,
+                "layer exceeds the tracked path limit",
+            )
+        })?;
         self.ids.insert((parent, name.to_os_string()), id);
         Ok(id)
     }
@@ -1079,7 +1106,8 @@ impl Extractor<'_> {
     /// 下位に消す実体が無いのと同義で何もしない。別表記（大文字小文字・Unicode 正規化）で既存の実体へ
     /// 解決される名前は削除せず `AlreadyExists` で拒否する（IO-5。保守的な fail-closed）。
     /// 削除した木の配下の遅延ディレクトリ mode は取り除く（`finish_dirs` が置換と誤認しないため）。
-    /// `NameIndex` は据え置く（実在する名前は索引に残る不変条件が、削除後も保たれる）。
+    /// 削除した名前と配下の登録は `NameIndex` から外す（残すと削除済みの綴りが現在の実体の別表記判定を
+    /// すり抜ける。IO-5）。
     ///
     /// 未接続: `extract_one_layer` からの呼び出しと、同一レイヤー内で先に作った実体を消さない世代管理は
     /// TASK-53.3（#414）。
@@ -1100,6 +1128,7 @@ impl Extractor<'_> {
         }
         crate::whiteout::remove_tree_nofollow(&path)?;
         self.deferred_dirs.retain(|p, _| !p.starts_with(&path));
+        self.names.forget_tree(dir.id, target);
         Ok(())
     }
 
@@ -2999,5 +3028,22 @@ mod tests {
         lay(&mut ex, &[file("foo", 0o644, b"new")]);
         ex.finish_dirs().unwrap();
         assert_eq!(fs::read(sb.root.join("foo")).unwrap(), b"new");
+    }
+
+    /// OCI-2・IO-5: 削除した名前の旧綴りで、再作成された別表記の実体を whiteout できない（AlreadyExists）。
+    #[test]
+    fn oci2_whiteout_forgets_removed_spellings_of_recreated_tree() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, folding_lstat);
+        lay(&mut ex, &[dir("D", 0o755), file("D/F", 0o644, b"old")]);
+        ex.remove_whiteout_target(&[], OsStr::new("D")).unwrap();
+        lay(&mut ex, &[dir("d", 0o755), file("d/f", 0o644, b"new")]);
+        let e = ex
+            .remove_whiteout_target(&os(&["d"]), OsStr::new("F"))
+            .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::AlreadyExists);
+        let e = ex.remove_whiteout_target(&[], OsStr::new("D")).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::AlreadyExists);
+        assert_eq!(fs::read(sb.root.join("d/f")).unwrap(), b"new");
     }
 }

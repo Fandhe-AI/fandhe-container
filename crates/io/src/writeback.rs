@@ -316,7 +316,10 @@ impl AppendFileSink {
     /// バッチ単位の位置合わせで保証するのは「バッチの合間（ACK 送出後の
     /// 静止点）に行われた外部 truncate・拡張への追随」までであり、バッチの
     /// 書き込み途中の外部 truncate や他プロセスとの競合書き込みは対象外
-    /// （本 sink は単一の `serve_connection` ループからのみ使われる前提。
+    /// （通常モードでは truncate 後のカーソルが古い EOF に残り `[新 EOF, カーソル)` が
+    /// ゼロ埋めの穴になるが、レコードは分断されない。この期待値は回帰試験
+    /// `tests/consistency/interleave.rs` の I7〔`io4_interleave_truncate_during_single_write_batch_*`〕
+    /// が固定する。本 sink は単一の `serve_connection` ループからのみ使われる前提。
     /// 書き込みごとのアトミックな末尾追記が必要なら呼び出し側が
     /// `OpenOptions::append(true)` で開く）。
     pub fn new(mut file: File) -> Result<Self, IoError> {

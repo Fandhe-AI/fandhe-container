@@ -17,15 +17,29 @@
 //!      分けて書き、i 番目のフレームの後。
 //!    - `Position::AfterBatch`: `write_batch` の完了後で ACK の送出前
 //!      （既存の試験は ACK 受信後にしか操作しないので、これが新しい位置）。
-//! 2. 同時実行の反復: `Barrier` で書き込みと rename を同時に解放する（rename のみ）。
+//! 2. 同時実行の反復（I6）: sink が書き込みの途中で `mpsc` に信号を出し、rename
+//!    スレッドが受けて残りの書き込みと並行に rename する（rename のみ。barrier で
+//!    同時に解放するだけでは、通常モードで途中に着地した反復が 0/100 だった）。
+//! 3. 1 回の `write_batch` の最中の truncate（I7）: 並行 truncater がパス経由で
+//!    ファイルサイズを `yield_now` で監視し、閾値に達した瞬間に `set_len` する。
 //!
 //! # 限界（本番コードを変えずに差し込める範囲）
 //!
-//! 内側の `AppendFileSink::write_batch` の中（フレーム間）へは差し込めない。
+//! 内側の `AppendFileSink::write_batch` の中（フレーム間）へ決定的には差し込めない。
 //! 「フレーム間」はサブバッチ分割による「サブバッチ間」であり、サブバッチごとに
 //! `seek(End)` が走る。1 回の `write_batch` の最中の外部 truncate は
-//! `AppendFileSink::new` の doc が対象外と明記しており、本ファイルは同時 truncate
-//! の固定の期待値を置かない。
+//! `AppendFileSink::new` の doc が「追随の対象外」とするが、I7 が並行 truncater で
+//! 観測同期し、次の固定の期待値を置く（truncate 時点で k レコードが書かれ、m レコード
+//! 長へ縮小した場合。レコードは分断されない）。
+//!
+//! - 通常モード: 先頭 m レコード + `[m, k)` のゼロ埋めの穴 + 元の位置の後続レコード
+//!   （縮小後にレコードが続かなければ穴なしで先頭 m レコードのみ）。
+//! - 追記モード: 先頭 m レコード + 後続レコード（穴なし）。
+//!
+//! 破損は「どの k のモデルにも完全一致しない」（ずれ・重複・欠落・混入・断片）こと。
+//! 縮小前の内容の消失と通常モードの穴は呼び出し側の truncate の帰結で、破損と
+//! 判定しない。truncate が書き込みの途中に着地する試行（0 < k < 全数）は試行上限内で
+//! 10 回以上あることを assert する。
 //!
 //! # 成り立つ条件（期待値は `Vec<u8>` への追記・`set_len` 相当の単純な模型で作る）
 //!
@@ -45,7 +59,7 @@
 //! REPAIR-5）で、`sleep` は使わない。
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fandhe_container_io::{
@@ -55,8 +69,8 @@ use fandhe_container_io::{
 };
 
 use super::harness::{
-    self, DuplexEnd, TempDir, barrier_wait_within, body_for, drain_acks, join_within, open_sink,
-    send_all_writes, spawn_server, timeout,
+    self, DuplexEnd, TempDir, body_for, drain_acks, join_within, open_sink, send_all_writes,
+    spawn_server, timeout,
 };
 
 const BODY_LEN: usize = 16;
@@ -423,39 +437,90 @@ fn io4_interleave_truncate_extend_zero_fills_matrix() {
     truncate_matrix("extend", Trunc::ExtendBy(5));
 }
 
-/// I6: barrier で書き込みと rename を同時に解放しても、移動先に全バイトが入り元パスは
-/// 残らない（100 反復 × 2 モード）。IO-4・REPAIR-6・REPAIR-5。
+/// 書き込みの途中で信号を出す sink（I6 用）。n 番目のバッチをフレームごとのサブバッチへ
+/// 分けて書き、`signal_after` 個目のフレームを書いた直後に「それまでに書いたバイト数」を
+/// `tx` へ送る。送った後は待たずに残りのフレームを書き続けるため、受け手（rename スレッド）
+/// の操作は残りの書き込みと本当に重なる。
+struct SignalingSink {
+    inner: fandhe_container_io::AppendFileSink,
+    tx: Option<std::sync::mpsc::Sender<u64>>,
+    signal_batch: usize,
+    signal_after: usize,
+    calls: usize,
+    bytes: u64,
+}
+
+impl BatchSink for SignalingSink {
+    fn write_batch(&mut self, batch: &Batch) -> Result<SinkWriteReport, IoError> {
+        self.calls += 1;
+        let (mut frames, mut bytes) = (0usize, 0u64);
+        for (i, frame) in batch.frames().iter().enumerate() {
+            let sub = single_frame_batch(frame)?;
+            let r = self.inner.write_batch(&sub)?;
+            frames += r.frames_written;
+            bytes += r.bytes_written;
+            self.bytes += r.bytes_written;
+            if self.calls == self.signal_batch
+                && i + 1 == self.signal_after
+                && let Some(tx) = self.tx.take()
+            {
+                // 受け手が先に終了していても書き込みは続ける（送信失敗は無視）。
+                let _ = tx.send(self.bytes);
+            }
+        }
+        Ok(SinkWriteReport::new(frames, bytes))
+    }
+
+    fn persist(&mut self) -> Result<fandhe_container_io::SinkPersistReport, IoError> {
+        self.inner.persist()
+    }
+}
+
+/// I6: 書き込みの途中（2 バッチ目の 2 フレーム目の直後。6 レコード書いた時点）で sink が
+/// 信号を出し、rename スレッドがそれを受けて残りの書き込みと並行に rename する
+/// （100 反復 × 2 モード）。移動先に全バイトが入り元パスは残らない。
+/// 信号は必ず書き込みの途中（0 < 書き込み済み < 全量）で出るので、全反復で
+/// rename が書き込みの途中に始まることを assert する（以前の barrier 方式は通常モードで
+/// 途中に着地した反復が 0/100 だった）。IO-4・REPAIR-6・REPAIR-5。
 #[test]
-fn io4_interleave_concurrent_rename_barrier_iterations() {
+fn io4_interleave_concurrent_rename_signal_mid_write_iterations() {
     const ITERATIONS: usize = 100;
     for mode in MODES {
         let dir = TempDir::new("interleave-concurrent");
-        let mut mid_flight = 0usize;
         for i in 0..ITERATIONS {
             let label = format!("{mode:?}/iter {i}");
             let src = dir.file_path(&format!("iter-{i}.bin"));
             let dst = dir.file_path(&format!("iter-{i}.moved"));
-            let sink = open_sink(&src, mode.open_mode()).expect("open sink");
+            let (tx, rx) = std::sync::mpsc::channel::<u64>();
+            let sink = SignalingSink {
+                inner: open_sink(&src, mode.open_mode()).expect("open sink"),
+                tx: Some(tx),
+                signal_batch: 2,
+                signal_after: 2,
+                calls: 0,
+                bytes: 0,
+            };
             let mut session = Session::start(sink, TOTAL + 1);
-            let barrier = Arc::new(Barrier::new(2));
             let renamer = {
-                let barrier = Arc::clone(&barrier);
                 let (src, dst) = (src.clone(), dst.clone());
                 std::thread::spawn(move || {
-                    barrier_wait_within(&barrier, join_deadline());
-                    let before = std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
-                    std::fs::rename(&src, &dst).map(|()| before)
+                    let written = rx
+                        .recv_timeout(join_deadline())
+                        .expect("sink must signal mid-write");
+                    std::fs::rename(&src, &dst).map(|()| written)
                 })
             };
-            barrier_wait_within(&barrier, join_deadline());
             send_all_writes(&mut session.client, &bodies(TOTAL), timeout());
             drain_acks(&mut session.client, TOTAL, timeout());
             let report = session.finish();
-            let before = join_within(renamer, join_deadline()).expect("rename must succeed");
+            let written = join_within(renamer, join_deadline()).expect("rename must succeed");
             assert_eq!(report.stats.acks_sent, TOTAL as u64, "{label}");
-            if before > 0 && before < (TOTAL * BODY_LEN) as u64 {
-                mid_flight += 1;
-            }
+            assert_eq!(
+                written,
+                ((BATCH_SIZE + 2) * BODY_LEN) as u64,
+                "{label}: signal must fire mid-write"
+            );
+            assert!(written < (TOTAL * BODY_LEN) as u64, "{label}");
             assert_eq!(
                 std::fs::read(&dst).expect("read moved"),
                 records(0..TOTAL),
@@ -463,7 +528,153 @@ fn io4_interleave_concurrent_rename_barrier_iterations() {
             );
             assert!(!src.exists(), "{label}: source path must be gone");
         }
-        // 観測のみ（assert しない）。rename が書き込みの途中に着地した反復の数。
-        eprintln!("{mode:?}: rename landed mid-write in {mid_flight}/{ITERATIONS} iterations");
     }
+}
+
+/// I7 用: 1 バッチに入れるレコード数・レコード長（`MAX_BATCH_SIZE` 以下）。
+const I7_TOTAL: usize = 512;
+const I7_BODY_LEN: usize = 512;
+/// truncater が動き出す書き込み済みレコード数と、縮小先のレコード数。
+const I7_TRIGGER: usize = 128;
+const I7_TRIALS: usize = 200;
+const I7_MIN_MID_BATCH: usize = 10;
+
+fn i7_records(seqs: std::ops::Range<usize>) -> Vec<u8> {
+    seqs.flat_map(|seq| body_for(0, seq as u32, I7_BODY_LEN))
+        .collect()
+}
+
+/// I7 の期待モデル。truncate 時点で `k` レコード書かれており `m` レコード長へ縮小した場合。
+/// 通常モードは `[m, k)` がゼロ埋めの穴（カーソルが古い EOF に残るため）、追記モードは穴なし。
+fn i7_model(mode: Mode, m: usize, k: usize) -> Vec<u8> {
+    let mut data = i7_records(0..m);
+    // 通常モードの穴は、縮小後にレコードが続くとき（k < 全数）だけできる。
+    if matches!(mode, Mode::Normal) && k < I7_TOTAL {
+        data.resize(k * I7_BODY_LEN, 0);
+    }
+    data.extend(i7_records(k..I7_TOTAL));
+    data
+}
+
+/// 最終ファイルから truncate 時点のレコード数 `k` を復元する。モデルに合わなければ `None`。
+fn i7_recover_k(mode: Mode, m: usize, data: &[u8]) -> Option<usize> {
+    let k = match mode {
+        // 穴の終わり: `m` 以降で最初にゼロでないスロット（レコードのヘッダは非ゼロ）。
+        Mode::Normal if data == i7_records(0..m).as_slice() => I7_TOTAL,
+        Mode::Normal => (m..I7_TOTAL)
+            .find(|i| {
+                data.get(i * I7_BODY_LEN..i * I7_BODY_LEN + harness::BODY_HEADER_LEN)
+                    .is_some_and(|h| h.iter().any(|b| *b != 0))
+            })
+            .unwrap_or(I7_TOTAL),
+        Mode::Append => {
+            let n = data.len() / I7_BODY_LEN;
+            I7_TOTAL.checked_sub(n.checked_sub(m)?)?
+        }
+    };
+    (k >= m && data == i7_model(mode, m, k).as_slice()).then_some(k)
+}
+
+/// 1 回の `write_batch` の最中に並行 truncate を行い、最終ファイルを `k` として返す。
+fn i7_run_once(mode: Mode, m: usize, dir: &TempDir, n: usize) -> (Vec<u8>, Vec<String>) {
+    let path = dir.file_path(&format!("data-{n}.bin"));
+    let (client_end, server_end) = harness::duplex();
+    let config = BatchConfig::new(I7_TOTAL).expect("valid batch size");
+    let timeouts = WritebackTimeouts {
+        recv: timeout(),
+        send: timeout(),
+    };
+    let sink = open_sink(&path, mode.open_mode()).expect("open sink");
+    let server = spawn_server(server_end, config, sink, timeouts);
+    let mut client = PipelineClient::new(
+        client_end,
+        InFlightLimit::new(I7_TOTAL + 1).expect("valid in-flight limit"),
+        NoopSendObserver,
+    );
+    let failures: FailureLog = Arc::default();
+    let truncater = {
+        let (path, failures) = (path.clone(), Arc::clone(&failures));
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + join_deadline();
+            let trigger = (I7_TRIGGER * I7_BODY_LEN) as u64;
+            // sleep は使わず yield で書き込みサイズを監視する（期限つき。REPAIR-5）。
+            while std::fs::metadata(&path).map(|md| md.len()).unwrap_or(0) < trigger {
+                if std::time::Instant::now() > deadline {
+                    failures
+                        .lock()
+                        .expect("lock")
+                        .push("trigger timeout".into());
+                    return;
+                }
+                std::thread::yield_now();
+            }
+            let op = FileOp::SetLen {
+                path,
+                len: (m * I7_BODY_LEN) as u64,
+            };
+            if let Err(err) = op.run() {
+                failures
+                    .lock()
+                    .expect("lock")
+                    .push(format!("set_len: {:?}", err.kind()));
+            }
+        })
+    };
+    let bodies: Vec<Vec<u8>> = (0..I7_TOTAL)
+        .map(|s| body_for(0, s as u32, I7_BODY_LEN))
+        .collect();
+    send_all_writes(&mut client, &bodies, timeout());
+    drain_acks(&mut client, I7_TOTAL, timeout());
+    drop(client);
+    let report = join_within(server, join_deadline());
+    join_within(truncater, join_deadline());
+    assert_eq!(report.end.code(), IoErrorCode::Unavailable, "session end");
+    assert_eq!(report.stats.acks_sent, I7_TOTAL as u64, "acks");
+    assert_eq!(report.stats.batches_written, 1, "single batch");
+    let log = failures.lock().expect("lock").clone();
+    (std::fs::read(&path).expect("read output"), log)
+}
+
+fn i7_matrix(mode: Mode) {
+    for m in [0usize, I7_TRIGGER / 2] {
+        let dir = TempDir::new("interleave-write-batch-truncate");
+        let mut mid_batch = 0usize;
+        for n in 0..I7_TRIALS {
+            let (data, log) = i7_run_once(mode, m, &dir, n);
+            assert_no_failures(&log, &format!("{mode:?}/m={m}/trial {n}"));
+            let k = i7_recover_k(mode, m, &data).unwrap_or_else(|| {
+                panic!(
+                    "{mode:?}/m={m}/trial {n}: final file ({} bytes) matches no model",
+                    data.len()
+                )
+            });
+            if k < I7_TOTAL {
+                mid_batch += 1;
+            }
+            if mid_batch >= I7_MIN_MID_BATCH {
+                break;
+            }
+        }
+        assert!(
+            mid_batch >= I7_MIN_MID_BATCH,
+            "{mode:?}/m={m}: truncate landed mid-batch in only {mid_batch}/{I7_TRIALS} trials"
+        );
+    }
+}
+
+/// I7: 通常モードで 1 回の `write_batch` の最中に並行 truncate が入った場合の期待値。
+/// `[m, k)` のゼロ埋めの穴（カーソルが古い EOF に残る。縮小後に書かれたレコードがある場合）以外は、先頭 m レコード・
+/// 元の位置の後続レコードがそのまま残る。破損は「どの k のモデルにも一致しない」こと。
+/// 縮小前の内容の消失と穴は呼び出し側の truncate の帰結で、破損と判定しない。
+/// IO-4・REPAIR-6・REPAIR-5。
+#[test]
+fn io4_interleave_truncate_during_single_write_batch_normal_mode() {
+    i7_matrix(Mode::Normal);
+}
+
+/// I7（追記モード）: `O_APPEND` は毎回 EOF へ書くため穴ができず、先頭 m レコードの後ろに
+/// 縮小後のレコードが続く。IO-4・REPAIR-6・REPAIR-5。
+#[test]
+fn io4_interleave_truncate_during_single_write_batch_append_mode() {
+    i7_matrix(Mode::Append);
 }

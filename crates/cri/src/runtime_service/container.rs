@@ -164,6 +164,19 @@ pub(super) fn validate_create_request(
     {
         return Err(Status::invalid_argument("sandbox_config is too large"));
     }
+    // 複製の前に、参照のまま名前長と config 全体の符号化長を検証する（確保前に上限検証）。
+    if metadata.name.len() > MAX_METADATA_FIELD_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "config.metadata.name is too long: {} bytes exceeds the limit of {MAX_METADATA_FIELD_BYTES} bytes",
+            metadata.name.len()
+        )));
+    }
+    let encoded_len = config.encoded_len();
+    if encoded_len > MAX_CONFIG_ENCODED_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "config is too large: {encoded_len} bytes exceeds the limit of {MAX_CONFIG_ENCODED_BYTES} bytes"
+        )));
+    }
     let name = metadata.name.clone();
     let attempt = metadata.attempt;
     let config = BoundedContainerConfig::new(config)?;
@@ -297,10 +310,20 @@ fn for_each_collection(config: &ContainerConfig, visit: Visit<'_>) -> Result<(),
             uid_mappings,
             gid_mappings,
             recursive_read_only: _,
-            image: _,
+            image,
             image_sub_path: _,
             mount_options,
         } = mount;
+        if let Some(v1::ImageSpec {
+            image: _,
+            annotations,
+            user_specified_image: _,
+            runtime_handler: _,
+            image_ref: _,
+        }) = image
+        {
+            visit("mounts.image.annotations", annotations.len())?;
+        }
         visit("mounts.mount_options", mount_options.len())?;
         visit("mounts.uid_mappings", uid_mappings.len())?;
         visit("mounts.gid_mappings", gid_mappings.len())?;
@@ -562,6 +585,31 @@ mod tests {
     }
 
     /// ERR-3・TASK-58.1: 過大な `sandbox_config` は拒否する。
+    #[test]
+    fn task_58_1_mount_image_annotations_are_limited_and_counted() {
+        let mount_with = |n: usize| v1::Mount {
+            image: Some(v1::ImageSpec {
+                annotations: (0..n).map(|i| (i.to_string(), String::new())).collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut c = base_config();
+        let base = BoundedContainerConfig::new(c.clone())
+            .unwrap()
+            .retained_bytes();
+        c.mounts = vec![mount_with(MAX_CONFIG_COLLECTION_ENTRIES)];
+        let ok = BoundedContainerConfig::new(c.clone()).unwrap();
+        assert!(
+            ok.retained_bytes() >= base + MAX_CONFIG_COLLECTION_ENTRIES * RETAINED_BYTES_PER_ENTRY
+        );
+        c.mounts = vec![mount_with(MAX_CONFIG_COLLECTION_ENTRIES + 1)];
+        assert_eq!(
+            BoundedContainerConfig::new(c).unwrap_err().code(),
+            Code::InvalidArgument
+        );
+    }
+
     #[test]
     fn task_58_1_oversized_sandbox_config_is_rejected() {
         let mut req = request(Some(base_config()));

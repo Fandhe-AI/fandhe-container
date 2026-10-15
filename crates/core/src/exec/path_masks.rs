@@ -52,7 +52,6 @@
 //!   等で procfs を `/proc` に載せる場合は、`/sys` と同様に本段より前に載せること（後から載せると読み取り専用の bind が隠れる）
 //! - 違反の監査（SEC-4）への記録: 失敗は `ExecError`（段 `MountReadonlyPaths`）で返すだけで、専用の
 //!   `ViolationReason` は足していない
-//! - `maskedPaths`（#1851）、config の `readonlyPaths` の解釈（#1852）
 //!
 //! # 単体テストの安全策
 //!
@@ -65,7 +64,7 @@ use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
-use crate::path_masks::{self, READONLY_PROC_PATHS, READONLY_SYS_PATH};
+use crate::path_masks::{self, ProtectedPath};
 use crate::sys::{self, SysError};
 use crate::traits::types::ErrorCode;
 
@@ -100,23 +99,30 @@ enum Outcome {
 pub(super) fn apply_readonly_paths(
     isolation: &MountIsolation,
     prepared: &PreparedRootfs,
+    extra: &[ProtectedPath],
 ) -> Result<ReadonlyPathsReport, ExecError> {
     isolation.verify_caller(STAGE)?;
-    apply_at(prepared.new_root())
+    apply_at_with(prepared.new_root(), extra)
+}
+
+/// 固定集合だけを適用する（単体テスト用の短縮形）。
+#[cfg(test)]
+fn apply_at(root: BorrowedFd<'_>) -> Result<ReadonlyPathsReport, ExecError> {
+    apply_at_with(root, &[])
 }
 
 /// [`apply_readonly_paths`] の証跡検証後の本体（単体テストは偽 rootfs の fd を渡す）。
-fn apply_at(root: BorrowedFd<'_>) -> Result<ReadonlyPathsReport, ExecError> {
+fn apply_at_with(
+    root: BorrowedFd<'_>,
+    extra: &[ProtectedPath],
+) -> Result<ReadonlyPathsReport, ExecError> {
     let rootfs = root_display(root);
     let mut report = ReadonlyPathsReport {
         applied: 0,
         skipped: 0,
     };
-    let targets = READONLY_PROC_PATHS
-        .iter()
-        .map(|p| (*p, false))
-        .chain(std::iter::once((READONLY_SYS_PATH, true)));
-    for (path, dir_only) in targets {
+    for target in path_masks::readonly_targets(extra) {
+        let (path, dir_only) = (target.path, target.dir_only);
         let names = path_masks::components(path).ok_or_else(|| {
             ExecError::new(
                 ErrorCode::Internal,
@@ -403,6 +409,29 @@ mod tests {
             want.push(pair(&tmp, "ro", rel));
         }
         assert_eq!(take_events(), want);
+    }
+
+    /// SEC-2（#1852）: config 由来の対象は固定集合の後ろに処理され、不在は飛ばされ、固定集合との重複は 1 度だけ。
+    #[test]
+    fn sec2_config_targets_follow_fixed_set_and_missing_are_skipped() {
+        reset();
+        let _shared = override_shared(false);
+        let tmp = full_rootfs("ro-extra");
+        std::fs::create_dir_all(tmp.0.join("data/x")).expect("mkdir");
+        let fd = tmp.fd();
+        let extra: Vec<ProtectedPath> = ["/data/x", "/absent", "/proc/sys", "/data/x/"]
+            .iter()
+            .map(|p| ProtectedPath::parse(p, 4096).expect("valid"))
+            .collect();
+        let report = apply_at_with(fd.as_fd(), &extra).expect("apply");
+        assert_eq!((report.applied, report.skipped), (7, 1));
+        let events = take_events();
+        assert_eq!(events.len(), 14);
+        assert_eq!(events[10], pair(&tmp, "bind", "sys"));
+        assert_eq!(
+            &events[12..],
+            &[pair(&tmp, "bind", "data/x"), pair(&tmp, "ro", "data/x")]
+        );
     }
 
     /// SEC-2（#1850）: 存在しない対象は飛ばされ、件数が報告される。

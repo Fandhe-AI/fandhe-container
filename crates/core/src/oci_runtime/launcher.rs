@@ -75,10 +75,10 @@ use crate::audit_log::{AuditSink, AuditedRejection};
 use crate::cgroups::{CgroupError, CgroupJoin};
 #[cfg(target_os = "linux")]
 use crate::exec::{
-    ChildStdio, ChildSubreaper, ContainerChild, Entrypoint, ExecError, Hostname, IntermediateSpec,
-    IsolationConfig, IsolationPrivilege, IsolationStage, LaunchAudit, LaunchTag, Namespace,
-    NamespaceSet, PrePivotSetup, PreparedLaunchFailure, Rescan, StageKind, StagePipeline, plan,
-    rescan_unreported_init, spawn_container_via_intermediate,
+    ChildStdio, ChildSubreaper, ConfigPaths, ContainerChild, Entrypoint, ExecError, Hostname,
+    IntermediateSpec, IsolationConfig, IsolationPrivilege, IsolationStage, LaunchAudit, LaunchTag,
+    Namespace, NamespaceSet, PrePivotSetup, PreparedLaunchFailure, Rescan, StageKind,
+    StagePipeline, plan, rescan_unreported_init, spawn_container_via_intermediate,
 };
 #[cfg(target_os = "linux")]
 use crate::landlock::LandlockRuleset;
@@ -882,6 +882,10 @@ impl LaunchOps for RealOps {
             tmpfs: Some(&default_tmpfs),
             inject: None,
             pinned_rootfs: Some(input.spec.rootfs_dir().as_fd()),
+            config_paths: ConfigPaths {
+                readonly: input.spec.config().readonly_paths(),
+                masked: input.spec.config().masked_paths(),
+            },
             status: None,
         };
         let child = spawn_container_via_intermediate(

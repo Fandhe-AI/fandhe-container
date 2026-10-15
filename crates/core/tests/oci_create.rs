@@ -185,6 +185,35 @@ fn sec1_create_rejects_unapplied_fields() {
     assert_eq!(store.len(), 0);
 }
 
+/// SEC-2・OCI-4（#1852）: `maskedPaths` / `readonlyPaths` は解釈済みで、これだけの config は create できる。
+/// 他の未解釈プロパティと併記したときのエラーは、そちらだけを挙げる。
+#[test]
+fn sec2_create_accepts_masked_and_readonly_paths() {
+    let b = ready_bundle("masked-readonly");
+    let mut cfg = valid_config();
+    cfg["linux"] = json!({
+        "maskedPaths": ["/proc/kcore"],
+        "readonlyPaths": ["/proc/sys"],
+    });
+    b.write_config(&cfg);
+    let store = MemStateStore::new();
+    create(&store, &OpRecorder::new(), &b.request("c1")).expect("must succeed");
+    assert_eq!(store.len(), 1);
+
+    cfg["linux"]["seccomp"] = json!({"defaultAction": "SCMP_ACT_ERRNO"});
+    b.write_config(&cfg);
+    let store = MemStateStore::new();
+    let err = create(&store, &OpRecorder::new(), &b.request("c2")).expect_err("must fail");
+    assert_eq!(err.code(), ErrorCode::Unimplemented);
+    assert!(err.message().contains("linux.seccomp"), "{}", err.message());
+    assert!(
+        !err.message().contains("linux.maskedPaths"),
+        "{}",
+        err.message()
+    );
+    assert_eq!(store.len(), 0);
+}
+
 /// SEC-1: `root.path` の `..` は InvalidArgument で拒否する。
 #[test]
 fn sec1_create_rejects_parent_dir_in_root_path() {

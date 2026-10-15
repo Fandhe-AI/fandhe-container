@@ -27,13 +27,24 @@
 //! ことは意味しない。OCI Runtime Spec が定義するプロパティのうち本パーサが解釈しないもの
 //! （`process.capabilities`・`process.noNewPrivileges`・`process.rlimits`〔SEC-1・TASK-27.4.3 系〕、
 //! `linux.seccomp`〔CORE-5・TASK-38〕、`linux.resources`〔CORE-3/4・TASK-32〜〕、
-//! `linux.maskedPaths` / `readonlyPaths`、`mounts[].uidMappings` / `gidMappings`、`hooks` 等）は、
+//! `mounts[].uidMappings` / `gidMappings`、`hooks` 等）は、
 //! 値を読み飛ばすが指定の有無を [`UnappliedField`] として保持し、[`OciConfig::unapplied_fields`] で
 //! 返す（黙って破棄しない）。TASK-29.2 の `create` はこの一覧が空でない config を
 //! `Unimplemented` で拒否する（fail-closed。個別フィールドの許可は、適用する後続タスクが
 //! 解釈済みへ移すことで行う）。
 //! 一覧は `schema/config-schema.json`・`defs.json`・`config-linux.json` が定義するプロパティから、
 //! 解釈済みのものと `annotations`（任意のメタデータで、ランタイムの挙動を変えない）を除いたもの。
+//!
+//! # `linux.maskedPaths` / `readonlyPaths`（解釈済み。SEC-2・TASK-29 追補・#1852）
+//!
+//! 要素は絶対パス必須で、`..`・NUL・`\`・`/` のみ・空文字を拒否し、連続 `/`・`.` 要素・末尾 `/` を正規化する
+//! （[`ProtectedPath`]。`mounts[].destination` と規則を共有するが相対パスは拒否）。件数は
+//! [`CONFIG_MAX_MASKED_PATHS`] / [`CONFIG_MAX_READONLY_PATHS`]、1 要素は [`CONFIG_MAX_PATH_BYTES`] 以下。
+//! 指定は固定集合（`crate::path_masks`）に**追加**されるだけで、空配列・省略でも固定集合は適用される
+//! （外す・緩める手段は無い。#1315 のオーナー判断）。存在しないパス（ENOENT）は runc と同様に飛ばし、
+//! 存在するのに適用できなければ起動を止める（runc の `libcontainer/rootfs_linux.go` の `maskPaths` /
+//! `readonlyPath` が ENOENT を飛ばす挙動に合わせた。OCI Runtime Spec は存在しない場合を規定しない）。
+//! 経路の途中に symlink・非ディレクトリがあれば runc と違い拒否する（rootfs 内の symlink を辿らない）。
 //!
 //! # 実行ファイルの検証
 //!
@@ -63,6 +74,7 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 
 use super::mount_destination::MountDestination;
+use crate::path_masks::ProtectedPath;
 use crate::traits::ErrorCode;
 
 /// `config.json` 全体の最大バイト長（4 MiB）。`args` / `env` の合計上限（1 MiB。
@@ -83,6 +95,11 @@ pub const CONFIG_MAX_STRING_BYTES: usize = 131_071;
 pub const CONFIG_MAX_PATH_BYTES: usize = 4096;
 /// `mounts` の最大件数。
 pub const CONFIG_MAX_MOUNTS: usize = 1024;
+/// `linux.maskedPaths` の最大件数（moby / containerd の既定は 14 件。1 件ごとに pivot 前に fd の open とマウントが
+/// 走るため、`mounts` より小さく抑えて起動時間の暴走を防ぐ。#1852）。
+pub const CONFIG_MAX_MASKED_PATHS: usize = 256;
+/// `linux.readonlyPaths` の最大件数（moby / containerd の既定は 5 件。理由は [`CONFIG_MAX_MASKED_PATHS`] と同じ。#1852）。
+pub const CONFIG_MAX_READONLY_PATHS: usize = 256;
 /// `mounts[].options` の最大件数。
 pub const CONFIG_MAX_MOUNT_OPTIONS: usize = 64;
 /// `process.user.additionalGids` の最大件数（`NGROUPS_MAX` 相当）。
@@ -334,6 +351,10 @@ limits! {
     NamespacePathLimit => ("linux.namespaces[].path", CONFIG_MAX_PATH_BYTES),
     UidMappingsLimit => ("linux.uidMappings", CONFIG_MAX_ID_MAPPINGS),
     GidMappingsLimit => ("linux.gidMappings", CONFIG_MAX_ID_MAPPINGS),
+    MaskedPathsLimit => ("linux.maskedPaths", CONFIG_MAX_MASKED_PATHS),
+    MaskedPathLimit => ("linux.maskedPaths[]", CONFIG_MAX_PATH_BYTES),
+    ReadonlyPathsLimit => ("linux.readonlyPaths", CONFIG_MAX_READONLY_PATHS),
+    ReadonlyPathLimit => ("linux.readonlyPaths[]", CONFIG_MAX_PATH_BYTES),
 }
 
 /// 件数上限付きの配列。`L::MAX` 件を読んだ後に次の要素があれば、その要素を型 `T` として
@@ -526,8 +547,6 @@ unapplied_fields! {
     LinuxRootfsPropagation => "linux.rootfsPropagation",
     LinuxSeccomp => "linux.seccomp",
     LinuxSysctl => "linux.sysctl",
-    LinuxMaskedPaths => "linux.maskedPaths",
-    LinuxReadonlyPaths => "linux.readonlyPaths",
     LinuxMountLabel => "linux.mountLabel",
     LinuxIntelRdt => "linux.intelRdt",
     LinuxMemoryPolicy => "linux.memoryPolicy",
@@ -680,10 +699,10 @@ struct RawLinux {
     seccomp: Seen,
     #[serde(default)]
     sysctl: Seen,
-    #[serde(default)]
-    masked_paths: Seen,
-    #[serde(default)]
-    readonly_paths: Seen,
+    #[serde(default, deserialize_with = "present")]
+    masked_paths: Option<Bounded<BoundedStr<MaskedPathLimit>, MaskedPathsLimit>>,
+    #[serde(default, deserialize_with = "present")]
+    readonly_paths: Option<Bounded<BoundedStr<ReadonlyPathLimit>, ReadonlyPathsLimit>>,
     #[serde(default)]
     mount_label: Seen,
     #[serde(default)]
@@ -1039,6 +1058,8 @@ pub struct OciConfig {
     namespaces: Vec<OciNamespace>,
     uid_mappings: Vec<OciIdMapping>,
     gid_mappings: Vec<OciIdMapping>,
+    masked_paths: Vec<ProtectedPath>,
+    readonly_paths: Vec<ProtectedPath>,
     unapplied: Vec<UnappliedField>,
 }
 
@@ -1049,6 +1070,18 @@ impl OciConfig {
     /// これを確認せずに起動してはならず、実際に `Unimplemented` で拒否する（fail-closed。SEC-1・CORE-5）。
     pub fn unapplied_fields(&self) -> &[UnappliedField] {
         &self.unapplied
+    }
+
+    /// `linux.maskedPaths`（検証済み。固定集合に**追加**する指定で、固定集合を外す・緩める手段ではない。
+    /// 適用は pivot 前の `masked_paths` 段。SEC-2・TASK-29 追補・#1852）。
+    pub fn masked_paths(&self) -> &[ProtectedPath] {
+        &self.masked_paths
+    }
+
+    /// `linux.readonlyPaths`（検証済み。固定集合に**追加**する指定。適用は pivot 前の `readonly_paths` 段。
+    /// SEC-2・TASK-29 追補・#1852）。
+    pub fn readonly_paths(&self) -> &[ProtectedPath] {
+        &self.readonly_paths
     }
 
     /// `ociVersion`。
@@ -1162,6 +1195,21 @@ fn convert_mount(raw: RawMount) -> Result<OciMount, OciConfigError> {
     })
 }
 
+/// `linux.maskedPaths` / `linux.readonlyPaths` を検証済みの型へ変換する（絶対パス必須。#1852）。
+fn convert_protected_paths<L: Limit>(
+    list: Option<Bounded<BoundedStr<L>, impl Limit>>,
+    field: &'static str,
+) -> Result<Vec<ProtectedPath>, OciConfigError> {
+    list.map(|b| b.0)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            ProtectedPath::parse(&s.0, CONFIG_MAX_PATH_BYTES)
+                .ok_or_else(|| OciConfigError::invalid(field))
+        })
+        .collect()
+}
+
 impl RawConfig {
     fn validate(self) -> Result<OciConfig, OciConfigError> {
         let oci_version = OciVersion::parse(self.oci_version.0)?;
@@ -1209,8 +1257,6 @@ impl RawConfig {
             mark(l.rootfs_propagation, UnappliedField::LinuxRootfsPropagation);
             mark(l.seccomp, UnappliedField::LinuxSeccomp);
             mark(l.sysctl, UnappliedField::LinuxSysctl);
-            mark(l.masked_paths, UnappliedField::LinuxMaskedPaths);
-            mark(l.readonly_paths, UnappliedField::LinuxReadonlyPaths);
             mark(l.mount_label, UnappliedField::LinuxMountLabel);
             mark(l.intel_rdt, UnappliedField::LinuxIntelRdt);
             mark(l.memory_policy, UnappliedField::LinuxMemoryPolicy);
@@ -1232,6 +1278,7 @@ impl RawConfig {
 
         let (mut namespaces, mut uid_mappings, mut gid_mappings) =
             (Vec::new(), Vec::new(), Vec::new());
+        let (mut masked_paths, mut readonly_paths) = (Vec::new(), Vec::new());
         if let Some(Obj(linux)) = self.linux {
             for Obj(ns) in linux.namespaces.map(|b| b.0).unwrap_or_default() {
                 namespaces.push(OciNamespace {
@@ -1244,6 +1291,9 @@ impl RawConfig {
             }
             uid_mappings = convert_mappings(linux.uid_mappings, "linux.uidMappings")?;
             gid_mappings = convert_mappings(linux.gid_mappings, "linux.gidMappings")?;
+            masked_paths = convert_protected_paths(linux.masked_paths, "linux.maskedPaths[]")?;
+            readonly_paths =
+                convert_protected_paths(linux.readonly_paths, "linux.readonlyPaths[]")?;
         }
 
         Ok(OciConfig {
@@ -1255,6 +1305,8 @@ impl RawConfig {
             namespaces,
             uid_mappings,
             gid_mappings,
+            masked_paths,
+            readonly_paths,
             unapplied,
         })
     }
@@ -1827,7 +1879,7 @@ mod tests {
     /// 値が `null` でも「指定あり」とみなす（fail-closed 側）。未指定なら空。
     #[test]
     fn sec1_each_unapplied_field_is_reported() {
-        assert_eq!(UNAPPLIED_FIELDS.len(), 36);
+        assert_eq!(UNAPPLIED_FIELDS.len(), 34);
         let none: [UnappliedField; 0] = [];
         assert_eq!(parse(&base()).expect("valid").unapplied_fields(), none);
         for &field in UNAPPLIED_FIELDS {
@@ -1843,6 +1895,107 @@ mod tests {
                 let cfg = parse(&v).unwrap_or_else(|e| panic!("{path}: {e:?}"));
                 assert_eq!(cfg.unapplied_fields(), [field], "{path}");
             }
+        }
+    }
+
+    /// SEC-2・OCI-4（#1852）: `maskedPaths` / `readonlyPaths` は解釈済みで、未適用に残らない。
+    #[test]
+    fn sec2_masked_and_readonly_paths_are_interpreted() {
+        let mut v = base();
+        v["linux"] = json!({
+            "maskedPaths": ["/proc//kcore/", "/a/./b"],
+            "readonlyPaths": ["/proc/sys"],
+        });
+        let cfg = parse(&v).expect("valid");
+        let masked: Vec<&str> = cfg.masked_paths().iter().map(|p| p.as_str()).collect();
+        let ro: Vec<&str> = cfg.readonly_paths().iter().map(|p| p.as_str()).collect();
+        assert_eq!(masked, ["/proc/kcore", "/a/b"]);
+        assert_eq!(ro, ["/proc/sys"]);
+        let none: [UnappliedField; 0] = [];
+        assert_eq!(cfg.unapplied_fields(), none);
+        // 他の未適用プロパティと併記しても、残るのはそちらだけ。
+        v["linux"]["seccomp"] = json!({"defaultAction": "SCMP_ACT_ERRNO"});
+        assert_eq!(
+            parse(&v).expect("valid").unapplied_fields(),
+            [UnappliedField::LinuxSeccomp]
+        );
+        // 空配列・省略は空（固定集合は実行層が常に適用する）。
+        v["linux"] = json!({"maskedPaths": []});
+        assert!(parse(&v).expect("valid").masked_paths().is_empty());
+        assert!(parse(&base()).expect("valid").readonly_paths().is_empty());
+    }
+
+    /// OCI-4（#1852）: 不正な要素は `Invalid`（フィールド名つき）で拒否する。
+    #[test]
+    fn oci4_masked_and_readonly_paths_reject_invalid_elements() {
+        for (key, field) in [
+            ("maskedPaths", "linux.maskedPaths[]"),
+            ("readonlyPaths", "linux.readonlyPaths[]"),
+        ] {
+            for bad in [
+                "proc/kcore",
+                "/proc/../etc",
+                "/..",
+                "/a\0b",
+                "/",
+                "",
+                "/a\\b",
+            ] {
+                let mut v = base();
+                v["linux"] = json!({ key: ["/ok", bad] });
+                let err = parse(&v).expect_err(bad);
+                assert_eq!(err.code(), ErrorCode::InvalidArgument, "{bad:?}");
+                assert!(
+                    matches!(err.kind(), OciConfigErrorKind::Invalid { field: f } if *f == field),
+                    "{bad:?}: {err:?}"
+                );
+            }
+            // 非配列・null・非文字列要素は型不一致（Data）。
+            for bad in [json!("/a"), Value::Null, json!([1])] {
+                let mut v = base();
+                v["linux"] = json!({ key: bad });
+                let err = parse(&v).expect_err("type");
+                assert!(matches!(err.kind(), OciConfigErrorKind::Data), "{err:?}");
+            }
+        }
+    }
+
+    /// OCI-4（#1852）: 件数・長さの上限の境界（ちょうどは受理、超過は `LimitExceeded`）。
+    #[test]
+    fn oci4_masked_and_readonly_paths_limits() {
+        for (key, count_field, item_field, max) in [
+            (
+                "maskedPaths",
+                "linux.maskedPaths",
+                "linux.maskedPaths[]",
+                CONFIG_MAX_MASKED_PATHS,
+            ),
+            (
+                "readonlyPaths",
+                "linux.readonlyPaths",
+                "linux.readonlyPaths[]",
+                CONFIG_MAX_READONLY_PATHS,
+            ),
+        ] {
+            let mut v = base();
+            v["linux"] = json!({ key: vec!["/a"; max] });
+            assert!(parse(&v).is_ok(), "{key} at limit");
+            v["linux"] = json!({ key: vec!["/a"; max + 1] });
+            let err = parse(&v).expect_err("count");
+            assert!(
+                matches!(err.kind(), OciConfigErrorKind::LimitExceeded { field, limit }
+                    if *field == count_field && *limit == max),
+                "{err:?}"
+            );
+            v["linux"] = json!({ key: [format!("/{}", "a".repeat(CONFIG_MAX_PATH_BYTES - 1))] });
+            assert!(parse(&v).is_ok(), "{key} item at limit");
+            v["linux"] = json!({ key: [format!("/{}", "a".repeat(CONFIG_MAX_PATH_BYTES))] });
+            let err = parse(&v).expect_err("len");
+            assert!(
+                matches!(err.kind(), OciConfigErrorKind::LimitExceeded { field, limit }
+                    if *field == item_field && *limit == CONFIG_MAX_PATH_BYTES),
+                "{err:?}"
+            );
         }
     }
 

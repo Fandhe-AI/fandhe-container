@@ -403,15 +403,15 @@ impl Inner {
             reap_error,
         } = failure;
         let AuditedRejection { error, .. } = rejection;
-        if let Some(child) = unreaped {
-            self.unreaped
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(UnreapedChild {
-                    child,
-                    reason: reap_error.map_or(ErrorCode::Internal, |e| e.code),
-                });
-        }
+        let reason = reap_error.map_or(ErrorCode::Internal, |e| e.code);
+        self.unreaped
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(
+                unreaped
+                    .into_iter()
+                    .map(|child| UnreapedChild { child, reason }),
+            );
         to_trait_error(&error)
     }
 }
@@ -490,7 +490,7 @@ impl LaunchOps for RealOps {
         let not_started = |e: ExecError| {
             Box::new(PreparedLaunchFailure {
                 rejection: AuditedRejection::not_applicable(e),
-                unreaped: None,
+                unreaped: Vec::new(),
                 reap_error: None,
             })
         };
@@ -613,7 +613,10 @@ mod tests {
                         IsolationStage::Spawn,
                         "/secret/path errno 13",
                     )),
-                    unreaped: with_child.then(|| ContainerChild::from_pid_for_test(2_000_001)),
+                    unreaped: with_child
+                        .then(|| ContainerChild::from_pid_for_test(2_000_001))
+                        .into_iter()
+                        .collect(),
                     reap_error: with_child.then(|| {
                         ExecError::new(ErrorCode::Timeout, IsolationStage::Wait, "reap failed")
                     }),

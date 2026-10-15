@@ -442,7 +442,7 @@ fn launch_via_intermediate(
     let not_started = |e: ExecError| {
         Box::new(PreparedLaunchFailure {
             rejection: AuditedRejection::not_applicable(e),
-            unreaped: None,
+            unreaped: Vec::new(),
             reap_error: None,
         })
     };
@@ -488,14 +488,18 @@ fn launch_via_intermediate(
     let child = ContainerChild::adopt_reparented(pid1, subreaper);
     if let Err(reap_error) = reap_intermediate(&intermediate_child) {
         // 中間プロセスを回収できない: PID 1 を殺し、回収できなかった中間プロセスを返す(孤児化の防止)。
-        let _ = child.kill_and_reap(KILL_REAP_TIMEOUT);
+        // PID 1 の回収に失敗した場合も握りつぶさず、中間プロセスとあわせて両方のハンドルを返す(CORE-2)。
+        let mut unreaped = vec![intermediate_child];
+        if child.kill_and_reap(KILL_REAP_TIMEOUT).is_err() {
+            unreaped.push(child);
+        }
         return Err(Box::new(PreparedLaunchFailure {
             rejection: AuditedRejection::not_applicable(ExecError::new(
                 ErrorCode::Internal,
                 IsolationStage::Wait,
                 "the intermediate process could not be reaped",
             )),
-            unreaped: Some(intermediate_child),
+            unreaped,
             reap_error: Some(reap_error),
         }));
     }
@@ -506,13 +510,13 @@ fn launch_via_intermediate(
         Err(rejection) => match child.kill_and_reap(KILL_REAP_TIMEOUT) {
             Ok(_) => Err(Box::new(PreparedLaunchFailure {
                 rejection: *rejection,
-                unreaped: None,
+                unreaped: Vec::new(),
                 reap_error: None,
             })),
             // 回収失敗は握りつぶさず、子のハンドルごと呼び出し側へ返す(孤児化の防止。CORE-2)。
             Err(reap_error) => Err(Box::new(PreparedLaunchFailure {
                 rejection: *rejection,
-                unreaped: Some(child),
+                unreaped: vec![child],
                 reap_error: Some(reap_error),
             })),
         },
@@ -535,12 +539,12 @@ fn reap_intermediate_failure(
     match reap_intermediate(&child) {
         Ok(()) => Box::new(PreparedLaunchFailure {
             rejection: AuditedRejection::not_applicable(error),
-            unreaped: None,
+            unreaped: Vec::new(),
             reap_error: None,
         }),
         Err(reap_error) => Box::new(PreparedLaunchFailure {
             rejection: AuditedRejection::not_applicable(error),
-            unreaped: Some(child),
+            unreaped: vec![child],
             reap_error: Some(reap_error),
         }),
     }
@@ -554,13 +558,13 @@ fn kill_intermediate_failure(
     match child.kill_and_reap(KILL_REAP_TIMEOUT) {
         Ok(_) => Box::new(PreparedLaunchFailure {
             rejection: AuditedRejection::not_applicable(error),
-            unreaped: None,
+            unreaped: Vec::new(),
             reap_error: None,
         }),
         // 回収失敗は握りつぶさず、ハンドルごと返す(孤児化の防止。CORE-2)。
         Err(reap_error) => Box::new(PreparedLaunchFailure {
             rejection: AuditedRejection::not_applicable(error),
-            unreaped: Some(child),
+            unreaped: vec![child],
             reap_error: Some(reap_error),
         }),
     }
@@ -934,7 +938,7 @@ mod tests {
             failure.rejection.error.violation.as_ref().map(|v| v.reason),
             Some(ViolationReason::TargetOnSharedMount)
         );
-        assert!(failure.unreaped.is_none());
+        assert!(failure.unreaped.is_empty());
         assert!(failure.reap_error.is_none());
         let recs = sink.0.lock().unwrap();
         assert_eq!(recs.len(), 1);
@@ -954,7 +958,7 @@ mod tests {
         let failure = result.expect_err("launch must fail");
         assert_eq!(failure.rejection.error.code, ErrorCode::Timeout);
         assert_eq!(failure.rejection.error.violation, None);
-        assert!(failure.unreaped.is_none());
+        assert!(failure.unreaped.is_empty());
         assert!(sink.0.lock().unwrap().is_empty());
         assert!(gone(pid1.unwrap()), "the init {pid1:?} must be reaped");
         assert!(started.elapsed() < Duration::from_secs(30));
@@ -972,7 +976,7 @@ mod tests {
             failure.rejection.error.message,
             "timed out waiting for the intermediate process report"
         );
-        assert!(failure.unreaped.is_none());
+        assert!(failure.unreaped.is_empty());
         assert!(sink.0.lock().unwrap().is_empty());
         assert!(
             gone(intermediate.unwrap()),
@@ -992,7 +996,7 @@ mod tests {
             failure.rejection.error.message,
             "namespace isolation failed in the intermediate process"
         );
-        assert!(failure.unreaped.is_none());
+        assert!(failure.unreaped.is_empty());
         assert!(sink.0.lock().unwrap().is_empty());
     }
 
@@ -1026,7 +1030,7 @@ mod tests {
         );
         let failure = result.expect_err("must refuse");
         assert_eq!(failure.rejection.error.code, ErrorCode::FailedPrecondition);
-        assert!(failure.unreaped.is_none());
+        assert!(failure.unreaped.is_empty());
     }
 
     /// 子プロセス側の本体(`REPAIR5_1816_MARKER` が無ければ何もしない)。親が stdout の pipe を満杯にした

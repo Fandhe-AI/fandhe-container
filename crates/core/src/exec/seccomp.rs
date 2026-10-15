@@ -130,14 +130,17 @@ fn build_default_program() -> Result<SeccompProgram, ExecError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SeccompEnforcementObservation {
-    /// 適用前の `unshare(0)`（対照。フラグなしのため通常は成功し `None`）。
-    pub unshare_before: Option<i32>,
+    /// 適用前の `kcmp(自 pid, 自 pid, KCMP_VM)`（対照。通常は成功し `None`）。
+    pub kcmp_before: Option<i32>,
     /// 適用した BPF 命令数。
     pub instructions: usize,
     /// 適用後の `/proc/thread-self/status` の `Seccomp:` 値（filter モードは `2`）。
     pub seccomp_mode: String,
-    /// 適用後の `unshare(0)` の errno（禁止 syscall のため `EPERM`）。
-    pub unshare_after: Option<i32>,
+    /// 適用後の `kcmp` の errno（`ERRNO(EPERM)` の禁止 syscall のため `EPERM`）。
+    ///
+    /// `unshare`・`ptrace`・`kexec_load` は `KILL_PROCESS` で戻らないため errno では観測できない
+    /// （[`observe_default_seccomp_kill`]）。
+    pub kcmp_after: Option<i32>,
     /// 適用後の `mount` 系（`mount(MS_REC|MS_PRIVATE)`）の errno。
     pub mount_after: Option<i32>,
     /// 適用後の `pivot_root` の errno。
@@ -166,7 +169,7 @@ pub fn observe_default_seccomp_enforcement() -> Result<SeccompEnforcementObserva
     let fail =
         |m: &str| ExecError::new(ErrorCode::Internal, IsolationStage::Seccomp, m.to_string());
     sys::set_no_new_privs().map_err(|_| fail("failed to set no_new_privs"))?;
-    let unshare_before = errno(sys::unshare_namespaces(&[]));
+    let kcmp_before = errno(sys::kcmp_self_probe());
     let report = apply_default_seccomp()?;
     let status = std::fs::read_to_string("/proc/thread-self/status")
         .map_err(|_| fail("failed to read thread status"))?;
@@ -176,14 +179,52 @@ pub fn observe_default_seccomp_enforcement() -> Result<SeccompEnforcementObserva
         .map(|v| v.trim().to_string())
         .ok_or_else(|| fail("Seccomp field missing"))?;
     Ok(SeccompEnforcementObservation {
-        unshare_before,
+        kcmp_before,
         instructions: report.instructions,
         seccomp_mode,
-        unshare_after: errno(sys::unshare_namespaces(&[])),
+        kcmp_after: errno(sys::kcmp_self_probe()),
         mount_after: errno(sys::mount_root_private_recursive()),
         pivot_root_after: errno(sys::pivot_root_dot()),
         umount_after: errno(sys::umount_cwd_detach()),
     })
+}
+
+/// 強制終了（`SECCOMP_RET_KILL_PROCESS`）対象の禁止 syscall（ESC-06・CORE-5・SEC-2。`DeniedSyscall::deny_action`）。
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KilledSyscall {
+    /// `unshare(0)`。
+    Unshare,
+    /// `ptrace(PTRACE_CONT, 自 pid)`（attach を伴わない）。
+    Ptrace,
+    /// segment 数が上限超過の `kexec_load`（ロードに至らない）。
+    KexecLoad,
+}
+
+/// 本番の適用経路を適用したあと、強制終了対象の syscall を 1 件発行する（CORE-5・SEC-2・ESC-06・#1834。結合試験専用）。
+///
+/// 正常な挙動では syscall が SIGSYS で子プロセスを終了させるため、本関数は戻らない。戻った場合は
+/// 強制終了になっていない（フィルタの欠落）ので `Err` を返す。`tests/seccomp_enforcement.rs` の
+/// 使い捨ての子（`--child-kill`）から呼び、親が終了シグナル（SIGSYS = 31）を照合する。
+/// SIGSYS の既定動作はコアダンプのため、発行前に `RLIMIT_CORE` を 0 にする（CI のダンプ処理による遅延の回避）。
+#[doc(hidden)]
+pub fn observe_default_seccomp_kill(which: KilledSyscall) -> Result<(), ExecError> {
+    let fail =
+        |m: &str| ExecError::new(ErrorCode::Internal, IsolationStage::Seccomp, m.to_string());
+    sys::set_no_new_privs().map_err(|_| fail("failed to set no_new_privs"))?;
+    sys::set_rlimit_self(crate::rlimits::RlimitKind::Core, 0, 0)
+        .map_err(|_| fail("failed to set RLIMIT_CORE"))?;
+    apply_default_seccomp()?;
+    let r = match which {
+        KilledSyscall::Unshare => sys::unshare_namespaces(&[]),
+        KilledSyscall::Ptrace => sys::ptrace_cont_probe(std::process::id()),
+        KilledSyscall::KexecLoad => sys::kexec_load_invalid_probe(),
+    };
+    Err(ExecError::new(
+        ErrorCode::FailedPrecondition,
+        IsolationStage::Seccomp,
+        format!("{which:?} returned {r:?} instead of being killed by SIGSYS"),
+    ))
 }
 
 /// コンテナ内プローブの 1 syscall 分の結果。成功は [`ProbeOutcome::Ok`]、失敗は errno。
@@ -237,16 +278,18 @@ impl ProbeOutcome {
 ///
 /// [`spawn_container_seccomp_probe`](super::spawn_container_seccomp_probe) の子が `probe_denied_syscalls`
 /// で作り、pivot 後の `/seccomp-probe` へ `key=value` 行で書く。親（結合試験 `tests/seccomp.rs`）が
-/// [`SeccompProbeRecord::parse`] で読む。識別的な検査は `unshare`・`ptrace`・`seccomp_mode`、網羅確認は
-/// `mount`・`pivot_root`・`umount2`・`kexec_load`（capability 不足でも `EPERM` になり得る）。
+/// [`SeccompProbeRecord::parse`] で読む。識別的な検査は `kcmp`・`seccomp_mode`、網羅確認は
+/// `mount`・`pivot_root`・`umount2`（capability 不足でも `EPERM` になり得る）。強制終了対象の
+/// `unshare`・`ptrace`・`kexec_load` は戻らないため記録せず、別の子で終了シグナルを確認する。
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SeccompProbeRecord {
-    /// `unshare(0)`。フィルタが無ければ成功、有れば `EPERM`（識別的）。
-    pub unshare: ProbeOutcome,
-    /// `ptrace(PTRACE_CONT, 自 pid)`。フィルタが無ければ `ESRCH`、有れば `EPERM`（識別的）。
-    pub ptrace: ProbeOutcome,
+    /// `kcmp(自 pid, 自 pid, KCMP_VM)`。フィルタが無ければ成功、有れば `EPERM`（識別的）。
+    ///
+    /// `unshare`・`ptrace`・`kexec_load` は `KILL_PROCESS` で戻らず記録できないため、`ERRNO(EPERM)` の
+    /// 禁止 syscall である `kcmp` で遮断を識別する（強制終了は別の子で確認する。#1834）。
+    pub kcmp: ProbeOutcome,
     /// `/proc/thread-self/status` の `Seccomp:` 値（filter モードは `2`）。
     pub seccomp_mode: String,
     /// 禁止対象外の対照。`/proc/thread-self/status` を読めること（`openat`・`read` が動く）。
@@ -257,35 +300,29 @@ pub struct SeccompProbeRecord {
     pub pivot_root: ProbeOutcome,
     /// `umount2(".", MNT_DETACH)`（網羅確認）。
     pub umount2: ProbeOutcome,
-    /// 無効引数の `kexec_load`（網羅確認）。
-    pub kexec_load: ProbeOutcome,
 }
 
 /// 記録のキー（直列化・解析で共通。増減時は [`SeccompProbeRecord`] と同時に直す）。
-const PROBE_KEYS: [&str; 8] = [
-    "unshare",
-    "ptrace",
+const PROBE_KEYS: [&str; 6] = [
+    "kcmp",
     "seccomp_mode",
     "control",
     "mount",
     "pivot_root",
     "umount2",
-    "kexec_load",
 ];
 
 impl SeccompProbeRecord {
     /// 英語の `key=value` 行（改行区切り）へ直列化する。
     pub fn render(&self) -> String {
         format!(
-            "unshare={}\nptrace={}\nseccomp_mode={}\ncontrol={}\nmount={}\npivot_root={}\numount2={}\nkexec_load={}\n",
-            self.unshare.render(),
-            self.ptrace.render(),
+            "kcmp={}\nseccomp_mode={}\ncontrol={}\nmount={}\npivot_root={}\numount2={}\n",
+            self.kcmp.render(),
             self.seccomp_mode,
             self.control.render(),
             self.mount.render(),
             self.pivot_root.render(),
             self.umount2.render(),
-            self.kexec_load.render(),
         )
     }
 
@@ -314,14 +351,12 @@ impl SeccompProbeRecord {
             return Err(format!("invalid seccomp_mode {seccomp_mode:?}"));
         }
         Ok(SeccompProbeRecord {
-            unshare: ProbeOutcome::parse(get("unshare")?)?,
-            ptrace: ProbeOutcome::parse(get("ptrace")?)?,
+            kcmp: ProbeOutcome::parse(get("kcmp")?)?,
             seccomp_mode: seccomp_mode.to_string(),
             control: ProbeOutcome::parse(get("control")?)?,
             mount: ProbeOutcome::parse(get("mount")?)?,
             pivot_root: ProbeOutcome::parse(get("pivot_root")?)?,
             umount2: ProbeOutcome::parse(get("umount2")?)?,
-            kexec_load: ProbeOutcome::parse(get("kexec_load")?)?,
         })
     }
 }
@@ -351,14 +386,12 @@ pub(crate) fn probe_denied_syscalls() -> Result<SeccompProbeRecord, ExecError> {
         Err(_) => ProbeOutcome::Failed,
     };
     Ok(SeccompProbeRecord {
-        unshare: ProbeOutcome::from_result(sys::unshare_namespaces(&[])),
-        ptrace: ProbeOutcome::from_result(sys::ptrace_cont_probe(std::process::id())),
+        kcmp: ProbeOutcome::from_result(sys::kcmp_self_probe()),
         seccomp_mode,
         control,
         mount: ProbeOutcome::from_result(sys::mount_root_private_recursive()),
         pivot_root: ProbeOutcome::from_result(sys::pivot_root_dot()),
         umount2: ProbeOutcome::from_result(sys::umount_cwd_detach()),
-        kexec_load: ProbeOutcome::from_result(sys::kexec_load_invalid_probe()),
     })
 }
 
@@ -384,11 +417,14 @@ pub enum EscapeSyscallProbe {
 ///
 /// # 将来仕様（REPAIR-3）
 ///
-/// 現行フィルタは `EPERM` を返して戻る。禁止 syscall が SIGSYS（KILL / TRAP）化された後は戻らず、
-/// 子がシグナル終了する（ESC-06 の期待。CORE-5・SEC-4）。
+/// 現行フィルタは本 3 件を `SECCOMP_RET_KILL_PROCESS` で拒否するため、本関数は戻らず子が SIGSYS で
+/// 終了する（ESC-06 の期待。CORE-5・SEC-2。#1834）。戻るのはフィルタが欠落した場合だけ。
+/// 終了するプロセス自身は監査記録を書けない（SEC-4 の配送経路は別途設計）。
 #[cfg(feature = "escape-probe")]
 #[doc(hidden)]
 pub fn probe_escape_syscall(which: EscapeSyscallProbe) -> ProbeOutcome {
+    // SIGSYS の既定動作はコアダンプのため、発行前に抑止する（失敗しても観測は続ける。ベストエフォート）。
+    let _ = sys::set_rlimit_self(crate::rlimits::RlimitKind::Core, 0, 0);
     let result = match which {
         EscapeSyscallProbe::Unshare => sys::unshare_namespaces(&[]),
         EscapeSyscallProbe::Ptrace => sys::ptrace_cont_probe(std::process::id()),
@@ -669,8 +705,9 @@ mod tests {
             .unwrap();
             assert_eq!(report.instructions, p.len());
             assert_eq!(thread_status_field("Seccomp:"), "2");
-            // 通常は成功する unshare(0) が、禁止 syscall として EPERM になる。
-            assert_eq!(sys::unshare_namespaces(&[]), Err(SysError::Os(sys::EPERM)));
+            // 自プロセス同士の kcmp は通常成功するが、ERRNO の禁止 syscall として EPERM になる。
+            // （unshare・ptrace・kexec_load は KILL_PROCESS で戻らないため、libtest のプロセスでは呼ばない）
+            assert_eq!(sys::kcmp_self_probe(), Err(SysError::Os(sys::EPERM)));
             // 禁止対象外の syscall は動作し続ける。
             let _ = sys::effective_uid();
         })

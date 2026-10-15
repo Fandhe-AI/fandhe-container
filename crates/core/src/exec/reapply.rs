@@ -1160,10 +1160,12 @@ pub struct ExecReapplyObservation {
     pub seccomp_after: String,
     /// 試行後の `NoNewPrivs:` 値（適用に成功すれば `1`）。
     pub no_new_privs_after: String,
-    /// 適用前の `unshare(0)`（対照。フラグなしのため通常は成功し `None`）。
-    pub unshare_before: Option<i32>,
-    /// 適用後の `unshare(0)`（禁止 syscall のため `EPERM`）。適用に失敗した場合は `None`。
-    pub unshare_after: Option<i32>,
+    /// 適用前の `kcmp(自 pid, 自 pid, KCMP_VM)`（対照。通常は成功し `None`）。
+    pub kcmp_before: Option<i32>,
+    /// 適用後の `kcmp`（`ERRNO(EPERM)` の禁止 syscall のため `EPERM`）。適用に失敗した場合は `None`。
+    ///
+    /// `unshare` は `KILL_PROCESS` で戻らず errno を観測できないため、識別には `kcmp` を使う（#1834）。
+    pub kcmp_after: Option<i32>,
     /// Landlock プローブ結果（入力順）。再適用に成功した場合のみ入る。
     pub results: Vec<(LandlockAccessProbe, Option<i32>)>,
 }
@@ -1210,7 +1212,7 @@ pub fn observe_exec_restriction_reapply(
     let seccomp_before = status_field("Seccomp:").ok_or_else(|| internal("Seccomp missing"))?;
     let no_new_privs_before =
         status_field("NoNewPrivs:").ok_or_else(|| internal("NoNewPrivs missing"))?;
-    let unshare_before = errno_of(sys::unshare_namespaces(&[]));
+    let kcmp_before = errno_of(sys::kcmp_self_probe());
     let mut obs = ExecReapplyObservation {
         prepare_error: None,
         reapply_error: None,
@@ -1219,8 +1221,8 @@ pub fn observe_exec_restriction_reapply(
         no_new_privs_before,
         seccomp_after: String::new(),
         no_new_privs_after: String::new(),
-        unshare_before,
-        unshare_after: None,
+        kcmp_before,
+        kcmp_after: None,
         results: Vec::new(),
     };
     let expected = OwnedFd::from(
@@ -1265,7 +1267,7 @@ pub fn observe_exec_restriction_reapply(
     obs.no_new_privs_after =
         status_field("NoNewPrivs:").ok_or_else(|| internal("NoNewPrivs missing"))?;
     if obs.report.is_some() {
-        obs.unshare_after = errno_of(sys::unshare_namespaces(&[]));
+        obs.kcmp_after = errno_of(sys::kcmp_self_probe());
         for p in probes {
             obs.results.push((p.clone(), run_probe(p)));
         }

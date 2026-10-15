@@ -47,16 +47,67 @@
 //! 引数ベースのフィルタ（`clone`・`clone3` の `CLONE_NEW*`、`personality` 等）、moby 既定プロファイルの
 //! 許可リスト方式への発展（TASK-128・GPU-3）は扱わない。
 //! 監査ログ連携のうち拒否報告からレコードを作るフックは `audit_log`（TASK-41.2・SEC-4）にある。
-//! ただし現行の `ERRNO(EPERM)` はユーザー空間へ報告しないため、配送経路は未実装。
+//! ただし `ERRNO(EPERM)` も `KILL_PROCESS` もユーザー空間へ報告しないため、配送経路は未実装。
 //! 本一覧は拒否リストの土台である。将来 `config.json` の `linux.seccomp` を解釈する場合は
 //! 外部入力として別途検証が必要。
 
 use std::fmt;
 
+// # 拒否時の動作の方針（CORE-5・SEC-2・ESC-06・ESC-03・#1834）
+//
+// 拒否時の動作は [`DeniedSyscall::deny_action`] で syscall ごとに型として決める。
+//
+// - 強制終了（`SECCOMP_RET_KILL_PROCESS`）: `unshare`・`ptrace`・`kexec_load` の 3 件。PoC-9 の
+//   ESC-06 が「SIGSYS で強制終了」と定め、#205 のオーナー判断（2026-10-12）も同じ。
+//   `KILL_PROCESS` はハンドラの有無にかかわらず SIGSYS で終了させ、呼び出し元は捕捉できない
+//   （プロセス単位。Linux 4.14 以降。arch 不一致・x32 拒否で既に使用中）。`SECCOMP_RET_TRAP` は
+//   SIGSYS を送るだけで捕捉・無視できるため強制終了の手段にならず、`KILL_THREAD` はスレッド単位で
+//   他スレッドが残るため使わない
+// - `ERRNO(EPERM)`: 残りの 40 件（`mount`・`pivot_root`・`umount2` を含む）。ESC-03 は `mount` を
+//   EPERM で拒否と定める。他の 39 件は spec が動作を定めておらず、moby 既定プロファイル
+//   （`defaultAction` は ERRNO、KILL 系は使わない）に揃えて現状維持とする
+//
+// 互換性: コンテナ内で `unshare` を試し EPERM なら別手段へ切り替えるソフトウェア（ブラウザの
+// サンドボックスのフォールバック、bubblewrap 等）や `ptrace` を使うデバッガ（gdb・strace）は、
+// EPERM で失敗して戻る代わりにプロセスごと終了する。`kexec_load` を呼ぶ正当なコンテナ内
+// ソフトウェアは実質存在しない。
+//
+// 監査（SEC-4）: `KILL_PROCESS` では終了するプロセス自身は記録を書けないため、プロセス内の SIGSYS
+// ハンドラ経由の `SeccompDenialReport::from_sigsys` は使えない。配送経路（親の `waitpid` が得る
+// 終了シグナル・`USER_NOTIF`・カーネル監査サブシステム等）は別途設計する。ESC-06 の
+// `AuditExpectation::Deferred("seccomp")` はそのまま。
+//
+// 強制終了の範囲を広げる候補（既定は変えない。判断はオーナーが行う）: `kexec_file_load`
+// （`kexec_load` と同じ脅威）・`setns`（namespace 脱出。ランタイムの exec 経路は seccomp 適用前に
+// 完了）・`process_vm_readv` / `process_vm_writev`（`ptrace` と同じ脅威）・
+// `init_module` / `finit_module` / `delete_module`・`reboot`。
+
+/// 禁止 syscall の拒否時の動作（CORE-5・SEC-2・ESC-06。方針はモジュール内の「拒否時の動作の方針」）。
+///
+/// [`build_deny_filter`] が各エントリの BPF 戻り値に変換する。errno は `EPERM` 固定とし値を持たせない
+/// （ESC-03 の「EPERM で拒否」と moby 既定プロファイルの `defaultErrnoRet` に揃える）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenyAction {
+    /// `SECCOMP_RET_ERRNO | EPERM`: 呼び出しは失敗として戻る。
+    Errno,
+    /// `SECCOMP_RET_KILL_PROCESS`: SIGSYS でプロセスごと強制終了する（捕捉不可・戻らない）。
+    KillProcess,
+}
+
+impl DenyAction {
+    /// seccomp フィルタの BPF `RET` が返す 32 bit 値。
+    pub const fn ret_value(self) -> u32 {
+        match self {
+            DenyAction::Errno => SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA),
+            DenyAction::KillProcess => SECCOMP_RET_KILL_PROCESS,
+        }
+    }
+}
+
 /// 禁止 syscall の論理名。各 variant の doc に syscall 名と遮断理由を記す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeniedSyscall {
-    /// `unshare`: 新しい namespace の作成（コンテナ外への分離回避）。
+    /// `unshare`: 新しい namespace の作成（コンテナ外への分離回避）。拒否時は強制終了（ESC-06）。
     Unshare,
     /// `setns`: 既存 namespace への参加（ホスト namespace への侵入）。
     Setns,
@@ -80,7 +131,7 @@ pub enum DeniedSyscall {
     Fspick,
     /// `mount_setattr`: マウント属性の変更。
     MountSetattr,
-    /// `ptrace`: 他プロセスの観察・改変。
+    /// `ptrace`（拒否時は強制終了。ESC-06）: 他プロセスの観察・改変。
     Ptrace,
     /// `process_vm_readv`: 他プロセスのメモリ読み取り。
     ProcessVmReadv,
@@ -191,6 +242,58 @@ impl DeniedSyscall {
         DeniedSyscall::Iopl,
         DeniedSyscall::Ioperm,
     ];
+
+    /// 拒否時の動作。ワイルドカードを置かない網羅 match で、variant を足すと動作の決定を強制する。
+    ///
+    /// 強制終了は ESC-06 の `unshare`・`ptrace`・`kexec_load` の 3 件だけで、`mount` 系を含む残りは
+    /// `ERRNO(EPERM)`（ESC-03）。
+    pub const fn deny_action(self) -> DenyAction {
+        match self {
+            DeniedSyscall::Unshare | DeniedSyscall::Ptrace | DeniedSyscall::KexecLoad => {
+                DenyAction::KillProcess
+            }
+            DeniedSyscall::Setns
+            | DeniedSyscall::Mount
+            | DeniedSyscall::Umount2
+            | DeniedSyscall::PivotRoot
+            | DeniedSyscall::OpenTree
+            | DeniedSyscall::MoveMount
+            | DeniedSyscall::Fsopen
+            | DeniedSyscall::Fsconfig
+            | DeniedSyscall::Fsmount
+            | DeniedSyscall::Fspick
+            | DeniedSyscall::MountSetattr
+            | DeniedSyscall::ProcessVmReadv
+            | DeniedSyscall::ProcessVmWritev
+            | DeniedSyscall::Kcmp
+            | DeniedSyscall::KexecFileLoad
+            | DeniedSyscall::InitModule
+            | DeniedSyscall::FinitModule
+            | DeniedSyscall::DeleteModule
+            | DeniedSyscall::Reboot
+            | DeniedSyscall::Swapon
+            | DeniedSyscall::Swapoff
+            | DeniedSyscall::Acct
+            | DeniedSyscall::Quotactl
+            | DeniedSyscall::QuotactlFd
+            | DeniedSyscall::Vhangup
+            | DeniedSyscall::Settimeofday
+            | DeniedSyscall::ClockSettime
+            | DeniedSyscall::ClockAdjtime
+            | DeniedSyscall::Adjtimex
+            | DeniedSyscall::Syslog
+            | DeniedSyscall::LookupDcookie
+            | DeniedSyscall::Bpf
+            | DeniedSyscall::PerfEventOpen
+            | DeniedSyscall::Userfaultfd
+            | DeniedSyscall::AddKey
+            | DeniedSyscall::RequestKey
+            | DeniedSyscall::Keyctl
+            | DeniedSyscall::OpenByHandleAt
+            | DeniedSyscall::Iopl
+            | DeniedSyscall::Ioperm => DenyAction::Errno,
+        }
+    }
 
     /// syscall 名（監査ログ SEC-4・TASK-41 とエラー表示用）。
     pub const fn name(self) -> &'static str {
@@ -531,7 +634,8 @@ impl std::error::Error for SeccompBuildError {}
 /// 2. x86_64 のみ、`nr & 0x4000_0000 != 0`（x32 ABI）を表照合より前に `KILL_PROCESS`。
 ///    ptrace のトレーサが syscall を skip させるために書く `nr = 0xFFFF_FFFF` もこれに該当する
 ///    （deny-list 型のため、トレース下の挙動は範囲外）
-/// 3. `entries()` の各番号は `ERRNO(EPERM)`（`absent()` は命令を出さない）
+/// 3. `entries()` の各番号は `DeniedSyscall::deny_action` の動作（`unshare`・`ptrace`・`kexec_load` は
+///    `KILL_PROCESS`、他は `ERRNO(EPERM)`。`absent()` は命令を出さない）
 /// 4. それ以外は `ALLOW`（許可リスト方式への発展は TASK-128・GPU-3 で範囲外）
 ///
 /// 命令数は checked 演算で事前計算し、上限検証してから確保する。
@@ -581,7 +685,7 @@ pub fn build_deny_filter(table: &ArchSyscallTable) -> Result<SeccompProgram, Sec
             SECCOMP_RET_KILL_PROCESS,
         ));
     }
-    for (_, nr) in entries {
+    for (d, nr) in entries {
         p.push(BpfInstruction::jump(
             BPF_JMP | BPF_JEQ | BPF_K,
             nr.get(),
@@ -590,7 +694,7 @@ pub fn build_deny_filter(table: &ArchSyscallTable) -> Result<SeccompProgram, Sec
         ));
         p.push(BpfInstruction::stmt(
             BPF_RET | BPF_K,
-            SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA),
+            d.deny_action().ret_value(),
         ));
     }
     p.push(BpfInstruction::stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
@@ -1000,6 +1104,11 @@ mod bpf_tests {
     /// 同（aarch64）。
     const AARCH_RUNTIME: [u32; 11] = [221, 281, 167, 90, 91, 436, 93, 94, 434, 424, 139];
 
+    /// ESC-06 の強制終了対象（`unshare`・`ptrace`・`kexec_load`）の番号（x86_64）。
+    const X86_KILL_NRS: [u32; 3] = [272, 101, 246];
+    /// 同（aarch64）。
+    const AARCH_KILL_NRS: [u32; 3] = [97, 117, 104];
+
     const KILL: u32 = 0x8000_0000;
     const ERRNO_EPERM: u32 = 0x0005_0001;
     const ALLOW: u32 = 0x7fff_0000;
@@ -1072,7 +1181,10 @@ mod bpf_tests {
         assert_eq!(t(&i[4]), (0x45, 0, 1, 0x4000_0000));
         assert_eq!(t(&i[5]), (0x06, 0, 0, 0x8000_0000));
         assert_eq!(t(&i[6]), (0x15, 0, 1, 272));
-        assert_eq!(t(&i[7]), (0x06, 0, 0, ERRNO_EPERM));
+        // 先頭エントリ `unshare` は ESC-06 の強制終了、次の `setns`（308）は ERRNO。
+        assert_eq!(t(&i[7]), (0x06, 0, 0, KILL));
+        assert_eq!(t(&i[8]), (0x15, 0, 1, 308));
+        assert_eq!(t(&i[9]), (0x06, 0, 0, ERRNO_EPERM));
         assert_eq!(t(&i[92]), (0x06, 0, 0, 0x7fff_0000));
     }
 
@@ -1107,7 +1219,12 @@ mod bpf_tests {
     fn core5_task38_1_2_evaluation() {
         let px = build_deny_filter(x86()).unwrap();
         for n in X86_NRS {
-            assert_eq!(eval(&px, n, 0xC000_003E), ERRNO_EPERM, "nr {n}");
+            let want = if X86_KILL_NRS.contains(&n) {
+                KILL
+            } else {
+                ERRNO_EPERM
+            };
+            assert_eq!(eval(&px, n, 0xC000_003E), want, "nr {n}");
         }
         for n in X86_RUNTIME {
             assert_eq!(eval(&px, n, 0xC000_003E), ALLOW, "nr {n}");
@@ -1120,13 +1237,67 @@ mod bpf_tests {
 
         let pa = build_deny_filter(aarch()).unwrap();
         for n in AARCH_NRS {
-            assert_eq!(eval(&pa, n, 0xC000_00B7), ERRNO_EPERM, "nr {n}");
+            let want = if AARCH_KILL_NRS.contains(&n) {
+                KILL
+            } else {
+                ERRNO_EPERM
+            };
+            assert_eq!(eval(&pa, n, 0xC000_00B7), want, "nr {n}");
         }
         for n in AARCH_RUNTIME {
             assert_eq!(eval(&pa, n, 0xC000_00B7), ALLOW, "nr {n}");
         }
         assert_eq!(eval(&pa, 97, 0xC000_003E), KILL);
         assert_eq!(eval(&pa, 0x4000_0000 | 97, 0xC000_00B7), ALLOW);
+    }
+
+    /// CORE-5・SEC-2・ESC-06・ESC-03: 拒否時の動作の表。強制終了は 3 件だけで `mount` 系は ERRNO。
+    #[test]
+    fn core5_sec2_deny_action_table() {
+        assert_eq!(DeniedSyscall::ALL.len(), 43);
+        let kills: Vec<&str> = DeniedSyscall::ALL
+            .iter()
+            .filter(|d| d.deny_action() == DenyAction::KillProcess)
+            .map(|d| d.name())
+            .collect();
+        assert_eq!(kills, ["unshare", "ptrace", "kexec_load"]);
+        let errnos = DeniedSyscall::ALL
+            .iter()
+            .filter(|d| d.deny_action() == DenyAction::Errno)
+            .count();
+        assert_eq!(errnos, 40);
+        for d in [
+            DeniedSyscall::Mount,
+            DeniedSyscall::PivotRoot,
+            DeniedSyscall::Umount2,
+            DeniedSyscall::KexecFileLoad,
+        ] {
+            assert_eq!(d.deny_action(), DenyAction::Errno, "{}", d.name());
+        }
+        assert_eq!(DenyAction::Errno.ret_value(), ERRNO_EPERM);
+        assert_eq!(DenyAction::KillProcess.ret_value(), KILL);
+    }
+
+    /// CORE-5・SEC-2・ESC-06: 実テーブルで KILL になる番号がちょうど 3 件で、期待の番号に一致する。
+    #[test]
+    fn core5_sec2_kill_numbers_match_real_table() {
+        let kill_nrs = |t: &ArchSyscallTable| -> Vec<u32> {
+            let p = build_deny_filter(t).unwrap();
+            t.entries()
+                .iter()
+                .filter(|(_, n)| eval(&p, n.get(), t.audit_arch().get()) == KILL)
+                .map(|(_, n)| n.get())
+                .collect()
+        };
+        let mut x = kill_nrs(x86());
+        x.sort_unstable();
+        assert_eq!(x, [101, 246, 272]);
+        let mut a = kill_nrs(aarch());
+        a.sort_unstable();
+        assert_eq!(a, [97, 104, 117]);
+        // ランタイムが適用後に使う syscall は強制終了対象に含まれない。
+        assert!(X86_RUNTIME.iter().all(|n| !X86_KILL_NRS.contains(n)));
+        assert!(AARCH_RUNTIME.iter().all(|n| !AARCH_KILL_NRS.contains(n)));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! 本番の `prepare_exec_restrictions` → `reapply_restrictions`（`observe_exec_restriction_reapply` 経由）を
 //! 使い捨ての子（テストバイナリ自身の再実行）の中で通し、再適用の後に
-//! 許可外 syscall（`unshare(0)` = `EPERM`）と許可外パス（`denied/` への書き込み系 = `EACCES`）が
+//! 許可外 syscall（`kcmp(自 pid, 自 pid, KCMP_VM)` = `EPERM`。`unshare` は `KILL_PROCESS` で戻らない）と許可外パス（`denied/` への書き込み系 = `EACCES`）が
 //! 拒否され、許可パス（`allowed/`）と読み取りは通ることを具体値で照合する。
 //! 適用は不可逆・単一スレッド前提のため libtest ではなく `harness = false` の `main` で動かし、
 //! 親は子をタイムアウト付きで待つ（REPAIR-5）。
@@ -135,7 +135,10 @@ fn main() {
         ];
         let o =
             observe_exec_restriction_reapply(&config, Path::new("/"), &probes).expect("observe");
-        assert_eq!(o.unshare_before, None, "control: unshare(0) must succeed");
+        assert_eq!(
+            o.kcmp_before, None,
+            "control: kcmp(self, self) must succeed"
+        );
 
         if let Some(e) = &o.prepare_error {
             // Landlock 未対応カーネルでの fail-closed: 準備が Landlock 段で拒否し、何も適用しない。
@@ -195,7 +198,7 @@ fn main() {
         assert_eq!(o.seccomp_before, "0");
         assert_eq!(o.seccomp_after, "2");
         assert_eq!(o.no_new_privs_after, "1");
-        assert_eq!(o.unshare_after, Some(EPERM), "denied syscall must be EPERM");
+        assert_eq!(o.kcmp_after, Some(EPERM), "denied syscall must be EPERM");
         let got: Vec<Option<i32>> = o.results.iter().map(|(_, r)| *r).collect();
         let expected = vec![
             Some(EACCES),

@@ -66,7 +66,8 @@
 //!   読み取り専用であるという証拠（`has_mask_evidence`）がある場合だけ受理する。拒否理由別のより厳密な判定と
 //!   実 cgroup v1 の安全な観測は REPAIR-12 の後続課題
 //! - ESC-06（禁止 syscall の SIGSYS 強制終了＋監査記録）: SIGSYS での強制終了は spec の期待どおり必須とする。
-//!   現行の CORE-5 フィルタは `ERRNO(EPERM)` を返して戻るため、実機実行では失敗する（fail-closed。期待は弱めない）。
+//!   現行の CORE-5 フィルタは `unshare`・`ptrace`・`kexec_load` を `SECCOMP_RET_KILL_PROCESS` で拒否する
+//!   （`DeniedSyscall::deny_action`。#1834）ため、子は SIGSYS で終了する。戻って終了コード 0 になれば失敗（fail-closed）。
 //! - ESC-06 の監査（SEC-4）は `AuditExpectation::Deferred("seccomp")` とし、合否に使わない（ESC-03 と同じ扱い）。
 //!   理由: 子が SIGSYS で終了すると子からは記録を書けず、親側で取得できる本番の監査経路がまだない。
 //!   既存の記録経路はどれも使えない。`ExecError::violation`（`IsolationViolation`）は親側の分離確立時の拒否だけを
@@ -631,7 +632,7 @@ fn sec2_task42_3_case_expectation_selftest() {
             got: ObservedExit::Signaled(9)
         }])
     );
-    // 現行実装（EPERM で戻り、SIGSYS で終了しない）は失敗として検出される。
+    // 強制終了にならず EPERM で戻る実装（フィルタの退行）は失敗として検出される。
     assert_eq!(
         judge(
             &ESC06_EXPECT,
@@ -1869,7 +1870,7 @@ mod linux {
     }
 
     /// ESC-06（SEC-2・TASK-42.3・#201・MS-2）: `unshare(0)`（副作用なし）。期待は spec どおり SIGSYS 終了。
-    /// 戻ってきた場合（現行は EPERM）は結果を記録し、判定側が失敗にする。seccomp 監査は親側の本番経路が
+    /// 戻ってきた場合（フィルタの退行）は結果を記録し、判定側が失敗にする。seccomp 監査は親側の本番経路が
     /// 未配線のため `Deferred`（SEC-4・REPAIR-3）で、攻撃側で監査レコードを作らない（偽造しない）。
     fn attack_esc06_unshare(rec: &Recorder, _host_canary: &Path) {
         rec.outcome(probe_to_attack(probe_escape_syscall(

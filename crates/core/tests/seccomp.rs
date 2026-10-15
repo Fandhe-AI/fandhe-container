@@ -4,20 +4,22 @@
 //! `seccomp_enforcement`（#178）は使い捨ての子で適用経路を呼ぶ検証にとどまる。本試験は
 //! `spawn_container_seccomp_probe` が fork した実際のコンテナプロセス（新しい PID namespace の PID 1・
 //! pivot_root 後・capability 削減・`NO_NEW_PRIVS` 設定済み）の中で、ステージ列の**組み込み `Seccomp` 段**が
-//! 載せたフィルタが禁止 syscall を `EPERM` で拒否することを、子が pivot 後の `/seccomp-probe` へ書いた
-//! 記録（`SeccompProbeRecord`）の具体値で照合する。Landlock を載せない構成では `LaunchReady` が作られず exec は拒否される（fail-closed。
+//! 載せたフィルタが禁止 syscall を拒否することを照合する。`ERRNO(EPERM)` の syscall は、子が pivot 後の
+//! `/seccomp-probe` へ書いた記録（`SeccompProbeRecord`）の具体値で照合する。`KILL_PROCESS` の
+//! `unshare`・`ptrace`・`kexec_load`（ESC-06。`DeniedSyscall::deny_action`）は戻らず記録を書けないため、
+//! 1 件ずつ別の子で発行し、親が終了シグナル SIGSYS（31）を照合する。Landlock を載せない構成では `LaunchReady` が作られず exec は拒否される（fail-closed。
 //! #1714）ため、プローブ用 API は exec の代わりに終端でプローブを実行する。
 //!
 //! # 識別的な検査と網羅確認
-//! - 識別的（capability 不足ではなく seccomp が拒否したことを示せる）: `unshare(0)`（フィルタが無ければ
-//!   成功）・`ptrace`（フィルタが無ければ `ESRCH`）・`/proc/thread-self/status` の `Seccomp: 2`。
+//! - 識別的（capability 不足ではなく seccomp が拒否したことを示せる）: `kcmp(自 pid, 自 pid, KCMP_VM)`
+//!   （フィルタが無ければ成功）・`/proc/thread-self/status` の `Seccomp: 2`。
 //!   禁止対象外の対照（`/proc` の読み出し）が動くことも確認する
-//! - 網羅確認: `mount`・`pivot_root`・`umount2`・`kexec_load` が `EPERM`。capability 不足でも
+//! - 網羅確認: `mount`・`pivot_root`・`umount2` が `EPERM`。capability 不足でも
 //!   `EPERM` になり得るため、識別的な根拠とは扱わない
+//! - 強制終了: `unshare`・`ptrace`・`kexec_load` は別の子で SIGSYS 終了（`ChildExit::Signaled(31)`）。
+//!   プローブが戻って終了コード 0 で終われば（フィルタ欠落）失敗
 //!
-//! 受け入れ基準の「シグナル」側（x32 番号の `SECCOMP_RET_KILL_PROCESS` → `SIGSYS`）は、本試験では
-//! 扱わない（errno による遮断の照合のみ）。シグナル側は別途の追跡対象（TASK-38.4・CORE-5。追跡 Issue は
-//! out-of-scope-tracking に従いユーザー承認後に起票する）。
+//! x32 番号の `SECCOMP_RET_KILL_PROCESS` は本試験では扱わない（BPF の単体テストが照合する）。
 //!
 //! # 構成
 //! - 常に走る部分（3 OS 共通・既定のテスト集合）: プローブ対象が `DeniedSyscall::ALL` に含まれること、
@@ -38,12 +40,13 @@ use fandhe_container_core::exec::{ProbeOutcome, SeccompProbeRecord};
 use fandhe_container_core::seccomp::DeniedSyscall;
 
 /// 結合試験が errno を照合する禁止 syscall の論理名（`DeniedSyscall::ALL` に含まれる必要がある）。
-const PROBED: [&str; 6] = [
-    "unshare",
-    "ptrace",
+const PROBED: [&str; 7] = [
+    "kcmp",
     "mount",
     "pivot_root",
     "umount2",
+    "unshare",
+    "ptrace",
     "kexec_load",
 ];
 
@@ -61,17 +64,17 @@ fn core5_probed_names_are_in_deny_table() {
 /// 記録の解析を固定文字列で自己検証する（`exec` は Linux 限定のため Linux のみ）（具体値・欠落・重複・未知キー・不正値の検出）。
 #[cfg(target_os = "linux")]
 fn core5_record_parser_selftest() {
-    let ok = "unshare=errno=1\nptrace=errno=1\nseccomp_mode=2\ncontrol=ok\nmount=errno=1\n\
-              pivot_root=errno=1\numount2=errno=1\nkexec_load=errno=1\n";
+    let ok = "kcmp=errno=1\nseccomp_mode=2\ncontrol=ok\nmount=errno=1\n\
+              pivot_root=errno=1\numount2=errno=1\n";
     let rec = SeccompProbeRecord::parse(ok).expect("well-formed record");
-    assert_eq!(rec.unshare, ProbeOutcome::Errno(1));
+    assert_eq!(rec.kcmp, ProbeOutcome::Errno(1));
     assert_eq!(rec.seccomp_mode, "2");
     assert_eq!(rec.control, ProbeOutcome::Ok);
     assert_eq!(rec.render(), ok, "render must round-trip");
-    let missing = ok.replace("kexec_load=errno=1\n", "");
+    let missing = ok.replace("umount2=errno=1\n", "");
     assert_eq!(
         SeccompProbeRecord::parse(&missing),
-        Err("missing key \"kexec_load\"".to_string())
+        Err("missing key \"umount2\"".to_string())
     );
     let dup = format!("{ok}mount=ok\n");
     assert_eq!(
@@ -83,7 +86,7 @@ fn core5_record_parser_selftest() {
         SeccompProbeRecord::parse(&unknown),
         Err("unknown key \"extra\"".to_string())
     );
-    let bad = ok.replace("ptrace=errno=1", "ptrace=errno=x");
+    let bad = ok.replace("kcmp=errno=1", "kcmp=errno=x");
     assert_eq!(
         SeccompProbeRecord::parse(&bad),
         Err("invalid outcome \"errno=x\"".to_string())
@@ -155,11 +158,20 @@ mod linux {
     use fandhe_container_core::exec::{
         ChildExit, IsolationConfig, Namespace, NamespaceSet, ProbeOutcome, SeccompProbeRecord,
         StagePipeline, isolate, isolate_rootful_host_root, plan, plan_rootful_host_root,
-        spawn_container_seccomp_probe,
+        spawn_container_probe, spawn_container_seccomp_probe,
     };
+    use fandhe_container_core::exec::{EscapeSyscallProbe, probe_escape_syscall};
 
     /// Linux の `EPERM`（x86_64・aarch64 共通で 1）。
     const EPERM: i32 = 1;
+    /// Linux の `SIGSYS`（x86_64・aarch64 共通で 31）。
+    const SIGSYS: i32 = 31;
+    /// 強制終了（`KILL_PROCESS`）の対象と、そのシナリオ名（ESC-06）。
+    const KILLED: [(&str, EscapeSyscallProbe); 3] = [
+        ("unshare", EscapeSyscallProbe::Unshare),
+        ("ptrace", EscapeSyscallProbe::Ptrace),
+        ("kexec_load", EscapeSyscallProbe::KexecLoad),
+    ];
     /// 子が pivot 後の `/` に書く記録（親からは `<rootfs>/seccomp-probe`）。
     const RECORD: &str = "seccomp-probe";
 
@@ -176,10 +188,20 @@ mod linux {
         let args: Vec<String> = std::env::args().collect();
         match args.iter().position(|a| a == "--scenario") {
             Some(i) => {
+                let name = args.get(i + 1).expect("scenario name");
                 let rootfs = args
                     .get(i + 2)
                     .expect("rootfs path after the scenario name");
-                scenario(Path::new(rootfs));
+                match name.as_str() {
+                    "seccomp" => scenario(Path::new(rootfs)),
+                    other => {
+                        let (_, which) = KILLED
+                            .iter()
+                            .find(|(n, _)| other.strip_prefix("kill-") == Some(n))
+                            .unwrap_or_else(|| panic!("unknown scenario {other}"));
+                        scenario_kill(Path::new(rootfs), *which);
+                    }
+                }
             }
             None => dispatcher(),
         }
@@ -253,18 +275,19 @@ mod linux {
             .expect("Seccomp line in /proc/self/status")
     }
 
-    fn dispatcher() {
+    /// シナリオを自身の再実行で起動し、期限付きで待つ。終了状態と stderr を返す。
+    fn run_scenario(name: &str) -> (ExitStatus, String) {
         let exe = std::env::current_exe().expect("current_exe");
         let rootfs = make_rootfs();
         let mut child = Command::new(&exe)
-            .args(["--scenario", "seccomp"])
+            .args(["--scenario", name])
             .arg(&rootfs.0)
             .stdin(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn scenario");
         let status = wait_deadline(&mut child, timeout())
-            .unwrap_or_else(|| panic!("scenario did not exit within {:?}", timeout()));
+            .unwrap_or_else(|| panic!("scenario {name} did not exit within {:?}", timeout()));
         let mut stderr = String::new();
         child
             .stderr
@@ -272,19 +295,33 @@ mod linux {
             .expect("piped stderr")
             .read_to_string(&mut stderr)
             .expect("read scenario stderr");
+        (status, stderr)
+    }
+
+    fn dispatcher() {
+        let (status, stderr) = run_scenario("seccomp");
         assert_eq!(
             status.code(),
             Some(0),
             "seccomp scenario must exit with 0; stderr:\n{stderr}"
         );
+        // 強制終了対象は戻らないため、シナリオ（親）は子の SIGSYS 終了を確認して 0 で終わる。
+        for (name, _) in KILLED {
+            let (status, stderr) = run_scenario(&format!("kill-{name}"));
+            assert_eq!(
+                status.code(),
+                Some(0),
+                "kill-{name} scenario must exit with 0; stderr:\n{stderr}"
+            );
+        }
         println!(
             "seccomp: CORE-5 denied syscalls blocked inside the container (root={})",
             is_root()
         );
     }
 
-    /// 分離 → fork したコンテナ内でプローブ → 記録を具体値で照合する。
-    fn scenario(rootfs: &Path) {
+    /// シナリオ共通の分離（このプロセスを PID 1 の namespace 内へ入れる）。
+    fn isolate_scenario() {
         let is_root = is_root();
         // 適用前の対照観測: このシナリオ自身（= 組み込み段を載せる前）に seccomp フィルタが無いこと。
         // 継承したフィルタ（コンテナ・サンドボックス上のテストランナー等）が既にあると、後段の
@@ -312,6 +349,31 @@ mod linux {
             plan(&config).and_then(|p| isolate(&p))
         };
         result.unwrap_or_else(|err| panic!("isolate failed: {err}"));
+    }
+
+    /// 強制終了対象の syscall を子で 1 件発行し、SIGSYS で終了したことを照合する（ESC-06・CORE-5・SEC-2）。
+    fn scenario_kill(rootfs: &Path, which: EscapeSyscallProbe) {
+        isolate_scenario();
+        let child = spawn_container_probe(rootfs, StagePipeline::new(), move || {
+            // コアダンプ（SIGSYS の既定動作）による遅延を避けるため、`probe_escape_syscall` 側で
+            // RLIMIT_CORE を 0 にしてから発行する。戻ってきたら何もせず終了コード 0 になり、親が失敗にする。
+            let _ = probe_escape_syscall(which);
+        })
+        .unwrap_or_else(|e| panic!("spawn: {e}"));
+        let exit = child.wait_timeout(timeout()).unwrap_or_else(|e| {
+            let _ = child.kill_and_reap(Duration::from_secs(5));
+            panic!("wait: {e}")
+        });
+        assert_eq!(
+            exit,
+            ChildExit::Signaled(SIGSYS),
+            "{which:?} must kill the process with SIGSYS (KILL_PROCESS)"
+        );
+    }
+
+    /// 分離 → fork したコンテナ内でプローブ → 記録を具体値で照合する。
+    fn scenario(rootfs: &Path) {
+        isolate_scenario();
 
         let child = spawn_container_seccomp_probe(rootfs, StagePipeline::new())
             .unwrap_or_else(|e| panic!("spawn: {e}"));
@@ -325,10 +387,9 @@ mod linux {
             .unwrap_or_else(|e| panic!("read probe record: {e}"));
         let rec = SeccompProbeRecord::parse(&text).unwrap_or_else(|e| panic!("parse record: {e}"));
 
-        // 識別的な検査（フィルタが無ければ unshare は成功・ptrace は ESRCH になる）。
+        // 識別的な検査（フィルタが無ければ kcmp は成功する）。
         assert_eq!(rec.seccomp_mode, "2", "SECCOMP_MODE_FILTER");
-        assert_eq!(rec.unshare, ProbeOutcome::Errno(EPERM), "unshare blocked");
-        assert_eq!(rec.ptrace, ProbeOutcome::Errno(EPERM), "ptrace blocked");
+        assert_eq!(rec.kcmp, ProbeOutcome::Errno(EPERM), "kcmp blocked");
         // 対照: 禁止対象外の操作は引き続き動く。
         assert_eq!(rec.control, ProbeOutcome::Ok, "control read of /proc");
         // 網羅確認（capability 不足でも EPERM になり得るため識別的な根拠ではない）。
@@ -339,10 +400,5 @@ mod linux {
             "pivot_root blocked"
         );
         assert_eq!(rec.umount2, ProbeOutcome::Errno(EPERM), "umount2 blocked");
-        assert_eq!(
-            rec.kexec_load,
-            ProbeOutcome::Errno(EPERM),
-            "kexec_load blocked"
-        );
     }
 }

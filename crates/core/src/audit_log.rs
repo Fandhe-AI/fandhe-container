@@ -27,7 +27,8 @@
 //!   捕捉は未実装）
 //! - TASK-41.2（#193。seccomp フックは `seccomp_hook` に実装済み。拒否報告 [`SeccompDenialReport`] から
 //!   レコードを 1 件組み立てて [`AuditSink`] へ渡す。ただし現行フィルタは禁止 syscall に `ERRNO(EPERM)` を返し
-//!   SIGSYS も通知も発生しないため、本番の配送経路〔TRAP + SIGSYS ハンドラ / USER_NOTIF + supervisor listener〕は
+//!   〔`unshare`・`ptrace`・`kexec_load` は `KILL_PROCESS` で終了するが、終了するプロセス自身は記録を書けない〕
+//!   通知は発生しないため、本番の配送経路〔TRAP + SIGSYS ハンドラ / USER_NOTIF + supervisor listener〕は
 //!   **未実装**で、フックはまだ本番経路から呼ばれない。REPAIR-3）・41.4（#195 マウント検証/API。
 //!   `exec::IsolationViolation` からの写像もここで扱う）が、違反検知時に [`AuditRecord`] を組み立てる
 //! - ローカルファイルへの JSON Lines 書き込み（主経路）は `file_writer` で実装済み（TASK-41.5.1・#839）。

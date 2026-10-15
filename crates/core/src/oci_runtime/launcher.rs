@@ -38,7 +38,8 @@
 //! 呼び出し側に移った状態である。`confirm_no_process` は `Clean` のときだけ `Ok` を返し、`Pending` は期限内に
 //! 再回収(I → PID 1 の順。PID 1 は I の回収後でないと C の子にならない)と再探索を試みる。台帳に無い ID・`Handed`・
 //! 確かめられない `Pending` は `Ok` にしない。`Pending` の ID への再 launch は(再回収を試みても確かめられなければ)
-//! fork 前に拒否する。期限内に確かめられなかった事実は、launch の `TraitError` の固定の接尾辞
+//! fork 前に拒否する。再回収の待ちの間は `Pending` を台帳から取り出し(記録は `Settling`)、台帳の Mutex を解放する
+//! ため、他コンテナの launch は待たされない(REPAIR-5・CORE-1)。同じ ID への並行な確認・launch は拒否する。期限内に確かめられなかった事実は、launch の `TraitError` の固定の接尾辞
 //! (`UNCONFIRMED_SUFFIX`)と [`ProcessLauncher::last_launch_may_have_left_process`] で伝える。
 //!
 //! # 未実装・残余(REPAIR-3)
@@ -320,6 +321,9 @@ enum LaunchRecord {
     Clean,
     /// 消滅を確かめられていない。
     Pending(Pending),
+    /// 別スレッドが `Pending` を台帳から取り出して再回収中(台帳の Mutex は待ちの間保持しない。REPAIR-5・CORE-1)。
+    /// 結果は呼び出し元が書き戻す。確かめ済みとは扱わず、捨てない。
+    Settling,
     /// launch 成功。ハンドルの所有者は呼び出し側(start / supervisor)で、launcher は確証できない。
     Handed,
 }
@@ -340,6 +344,8 @@ struct Pending {
 enum AdmitError {
     /// 同じ ID に確かめられていない起動が残っている(位置)。
     Pending(usize),
+    /// 同じ ID の `Pending` を別スレッドが再回収中。
+    Settling,
     /// `Pending` だけで台帳が満杯。
     Full,
 }
@@ -361,7 +367,7 @@ impl Ledger {
     fn has_pending(&self) -> bool {
         self.entries
             .iter()
-            .any(|(_, r)| matches!(r, LaunchRecord::Pending(_)))
+            .any(|(_, r)| matches!(r, LaunchRecord::Pending(_) | LaunchRecord::Settling))
     }
 
     /// 古い順に、`Pending` でない最初の項目を捨てる(捨てられたか)。
@@ -369,7 +375,7 @@ impl Ledger {
         match self
             .entries
             .iter()
-            .position(|(_, r)| !matches!(r, LaunchRecord::Pending(_)))
+            .position(|(_, r)| !matches!(r, LaunchRecord::Pending(_) | LaunchRecord::Settling))
         {
             Some(i) => {
                 self.entries.remove(i);
@@ -384,6 +390,7 @@ impl Ledger {
         match self.position(id) {
             Some(i) => match self.entries.get(i) {
                 Some((_, LaunchRecord::Pending(_))) => Err(AdmitError::Pending(i)),
+                Some((_, LaunchRecord::Settling)) => Err(AdmitError::Settling),
                 _ => Ok(()),
             },
             None if self.entries.len() < LEDGER_MAX_ENTRIES => Ok(()),
@@ -556,16 +563,30 @@ impl Inner {
                 ErrorCode::FailedPrecondition,
                 "too many launches are awaiting confirmation that no process remains",
             )),
+            Err(AdmitError::Settling) => Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                format!(
+                    "a previous launch of this container is being confirmed{UNCONFIRMED_SUFFIX}"
+                ),
+            )),
             Err(AdmitError::Pending(i)) => {
-                let deadline = Instant::now() + RELAUNCH_SETTLE_TIMEOUT;
-                let settled = match ledger.entries.get_mut(i) {
-                    Some((_, LaunchRecord::Pending(p))) => self.settle(p, deadline).is_ok(),
-                    _ => false,
+                // 台帳から取り出し、Mutex を解放してから再回収する(他コンテナの launch を待たせない)。
+                let Some(mut pending) = Self::take_pending_at(&mut ledger, i) else {
+                    return Err(TraitError::new(
+                        ErrorCode::FailedPrecondition,
+                        format!(
+                            "a previous launch of this container is unconfirmed{UNCONFIRMED_SUFFIX}"
+                        ),
+                    ));
                 };
+                drop(ledger);
+                let deadline = Instant::now() + RELAUNCH_SETTLE_TIMEOUT;
+                let settled = self.settle(&mut pending, deadline).is_ok();
                 if settled {
-                    ledger.set(id, LaunchRecord::Clean);
+                    self.ledger().set(id, LaunchRecord::Clean);
                     Ok(())
                 } else {
+                    self.ledger().set(id, LaunchRecord::Pending(pending));
                     self.left_process.store(true, Ordering::SeqCst);
                     Err(TraitError::new(
                         ErrorCode::FailedPrecondition,
@@ -574,6 +595,21 @@ impl Inner {
                         ),
                     ))
                 }
+            }
+        }
+    }
+
+    /// 位置 `i` の `Pending` を取り出し、記録を `Settling` に置き換える(`Pending` でなければ `None`)。
+    fn take_pending_at(ledger: &mut Ledger, i: usize) -> Option<Pending> {
+        let slot = ledger.entries.get_mut(i)?;
+        if !matches!(slot.1, LaunchRecord::Pending(_)) {
+            return None;
+        }
+        match std::mem::replace(&mut slot.1, LaunchRecord::Settling) {
+            LaunchRecord::Pending(p) => Some(p),
+            other => {
+                slot.1 = other;
+                None
             }
         }
     }
@@ -672,39 +708,63 @@ impl Inner {
     /// `id` の起動が、この launcher が起動した範囲で生存プロセスを残していないことを確認する(CORE-2・REPAIR-5)。
     fn confirm_no_process(&self, id: &ContainerId, timeout: Duration) -> Result<(), TraitError> {
         let deadline = Instant::now() + timeout.min(CONFIRM_TIMEOUT_MAX);
-        let mut ledger = self.ledger();
-        let Some(i) = ledger.position(id) else {
-            return Err(TraitError::new(
-                ErrorCode::FailedPrecondition,
-                "the launcher has no launch record for this container; cannot confirm",
-            ));
-        };
-        let settled = match ledger.entries.get_mut(i) {
-            Some((_, LaunchRecord::Clean)) => return Ok(()),
-            Some((_, LaunchRecord::Handed)) | None => {
+        // Pending を台帳から取り出して Mutex を解放してから待つ(待ちの間、他コンテナの launch を止めない)。
+        let mut pending = {
+            let mut ledger = self.ledger();
+            let Some(i) = ledger.position(id) else {
                 return Err(TraitError::new(
                     ErrorCode::FailedPrecondition,
-                    "the launched process is owned by its handle holder; cannot confirm",
+                    "the launcher has no launch record for this container; cannot confirm",
                 ));
+            };
+            match ledger.entries.get(i) {
+                Some((_, LaunchRecord::Clean)) => return Ok(()),
+                Some((_, LaunchRecord::Settling)) => {
+                    return Err(TraitError::new(
+                        ErrorCode::FailedPrecondition,
+                        "another confirmation for this container is in progress",
+                    ));
+                }
+                Some((_, LaunchRecord::Pending(_))) => {}
+                Some((_, LaunchRecord::Handed)) | None => {
+                    return Err(TraitError::new(
+                        ErrorCode::FailedPrecondition,
+                        "the launched process is owned by its handle holder; cannot confirm",
+                    ));
+                }
             }
-            Some((_, LaunchRecord::Pending(p))) => self.settle(p, deadline),
+            match Self::take_pending_at(&mut ledger, i) {
+                Some(p) => p,
+                None => {
+                    return Err(TraitError::new(
+                        ErrorCode::Internal,
+                        "could not confirm that no launched process remains",
+                    ));
+                }
+            }
         };
+        let settled = self.settle(&mut pending, deadline);
         match settled {
             Ok(()) => {
+                let mut ledger = self.ledger();
                 ledger.set(id, LaunchRecord::Clean);
                 if !ledger.has_pending() {
                     self.left_process.store(false, Ordering::SeqCst);
                 }
                 Ok(())
             }
-            Err(ErrorCode::Timeout) => Err(TraitError::new(
-                ErrorCode::Timeout,
-                "timed out confirming that no launched process remains",
-            )),
-            Err(code) => Err(TraitError::new(
-                code,
-                "could not confirm that no launched process remains",
-            )),
+            Err(code) => {
+                self.ledger().set(id, LaunchRecord::Pending(pending));
+                Err(match code {
+                    ErrorCode::Timeout => TraitError::new(
+                        ErrorCode::Timeout,
+                        "timed out confirming that no launched process remains",
+                    ),
+                    code => {
+                        TraitError::new(code, "could not confirm that no launched process remains")
+                    }
+                })
+            }
         }
     }
 }

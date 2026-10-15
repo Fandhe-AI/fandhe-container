@@ -111,6 +111,9 @@ mod exec_command;
 mod inject;
 mod interpreter;
 mod landlock;
+// 本番 launcher（Phase B）が `spawn_container_prepared` を呼ぶまで crate 内の呼び出し元が無い（REPAIR-3。#1815）。
+#[allow(dead_code)]
+mod launch_status;
 mod no_new_privs;
 mod process;
 mod reapply;
@@ -273,8 +276,10 @@ pub use violation::{
 /// レコードを 1 件 `sink` へ渡す（時刻・PID は呼び出し時点。理由コード＝違反の `as_str()` つき。#1701）。システムエラー・それ以外の種別は
 /// 記録せず `NotApplicable`。`err` は常にそのまま返り、記録の失敗で拒否は覆らない（fail-closed）。
 ///
-/// 本番の `spawn_container` 子プロセス・launcher への配線は未実装（`AuditSink` を fork 後へ渡す設計が
-/// 未決定。TASK-29 / TASK-157 系。REPAIR-3）。ファイル永続化は `audit_log::AuditFileWriter`（#839）で実装済み。
+/// launch 経路（fork 後の子）は sink に触らない。子が失敗した段と理由を状態 pipe で親へ返し、親が
+/// [`record_launch_mount_rejection`] で記録する（#1815）。その親側の入口は実装済みだが、本番 launcher
+/// （`oci_runtime`）・supervisor への配線は未実装（Phase B。TASK-29 / TASK-157 系。REPAIR-3）。
+/// ファイル永続化は `audit_log::AuditFileWriter`（#839）で実装済み。
 ///
 /// 移行（#1618）: 引数 `container` を `sink` の直前に追加した。記録の `container_id` に載せる検証済みの
 /// コンテナ ID で、ID が無い呼び出し側は `None` を渡す（ワイヤーでは null）。記録の `pid` は記録を行った
@@ -375,6 +380,30 @@ pub fn record_exec_worker_rejection<E>(
     sink: &dyn crate::audit_log::AuditSink,
 ) -> crate::audit_log::AuditedRejection<E> {
     match reason.exec_worker_audit_event() {
+        Some(event) => {
+            let delivery = crate::audit_log::mount::deliver(event, container, sink);
+            crate::audit_log::AuditedRejection { error, delivery }
+        }
+        None => crate::audit_log::AuditedRejection::not_applicable(error),
+    }
+}
+
+/// launch 経路の pivot 前段で子が失敗した理由を、親が `Mount` 監査レコードとして 1 件記録して返す
+/// （SEC-4・CORE-1・TASK-29 追補・#1815）。
+///
+/// 呼び出し元は、子が状態 pipe で運んだ失敗を復号した親プロセス（`launch_status` の判定。将来は本番 launcher）。
+/// `reason` は `ViolationReason::from_launch_token` で引き直した値を渡す。種別 `mount_target`・
+/// `shared_propagation`・`rootfs_pivot` だけが層 `mount` のパスなし・理由コードつきのレコードになり
+/// （[`audit_mount_violation`] と同じ写像）、`establish_precondition`・`evidence_mismatch` は記録せず
+/// `NotApplicable`。時刻と PID は記録を行った親プロセスのもの（違反した子ではない）。パスは載らない。
+/// 記録の成否で `error` は変わらない（fail-closed）。
+pub fn record_launch_mount_rejection<E>(
+    error: E,
+    reason: ViolationReason,
+    container: Option<&crate::traits::ContainerId>,
+    sink: &dyn crate::audit_log::AuditSink,
+) -> crate::audit_log::AuditedRejection<E> {
+    match reason.launch_mount_audit_event() {
         Some(event) => {
             let delivery = crate::audit_log::mount::deliver(event, container, sink);
             crate::audit_log::AuditedRejection { error, delivery }

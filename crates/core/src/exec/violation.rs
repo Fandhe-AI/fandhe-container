@@ -21,7 +21,9 @@
 //! （`exec_target` は `ExecTarget`、他の 3 理由は `mount_audit_event` と同じ `Mount` のパスなし・理由コードつき。#1614 の事後監査・#1702）。
 //! ファイルへの永続化（TASK-41.5.1・#839）とカーネル監査フォールバック（#840）も `audit_log` に実装済みで、
 //! 本モジュールの記録を実際の sink へ流す本番経路（launcher・CLI への配線）は未実装
-//! （REPAIR-3: 実装済みを装わない）。
+//! （REPAIR-3: 実装済みを装わない）。launch 経路の pivot 前段の失敗は、子が状態 pipe で理由を親へ返し親が
+//! `exec::record_launch_mount_rejection` で記録する入口まで実装済み（`exec/launch_status.rs`。#1815）で、
+//! 本番 launcher からの呼び出しは未実装（Phase B）。
 //!
 //! # 違反とシステムエラーの区別
 //!
@@ -360,6 +362,93 @@ impl ViolationReason {
             }
             _ => None,
         }
+    }
+
+    /// `ViolationReason` の全 variant（pivot 前段の失敗を親が引き直す元。SEC-4・CORE-1・TASK-29 追補・#1815）。
+    ///
+    /// 手書きの理由リストを別に持たず、種別（[`Self::kind`]）で絞って使う（[`Self::from_launch_token`]）。
+    /// 足し忘れは単体テスト（`ALL` の件数が `as_str` の分岐数と一致すること）が検出する。
+    pub(super) const ALL: [ViolationReason; 52] = [
+        Self::NoNamespaces,
+        Self::HostnameWithoutUts,
+        Self::PidWithoutMount,
+        Self::UserNamespaceRequired,
+        Self::HostRootIdentityMapping,
+        Self::RootfulWithUserNamespace,
+        Self::RootfulRequiresRoot,
+        Self::IdentityChanged,
+        Self::EstablishNotPid1,
+        Self::EstablishNspidNotPid1,
+        Self::EstablishNotNestedPidNamespace,
+        Self::EstablishMultiThreaded,
+        Self::EstablishMountNamespaceNotFresh,
+        Self::EvidenceCallerNotPid1,
+        Self::EvidenceNspidNotPid1,
+        Self::EvidenceMountNamespaceMismatch,
+        Self::EvidencePidNamespaceMismatch,
+        Self::PathNotAbsolute,
+        Self::PathContainsNul,
+        Self::PathParentComponent,
+        Self::TargetOutsideRootfs,
+        Self::RootfsMissing,
+        Self::RootfsSymlinkOrNotDirectory,
+        Self::TargetIsRootfs,
+        Self::PathSymlinkOrNotDirectory,
+        Self::PathMissing,
+        Self::TargetOnSharedMount,
+        Self::TargetMoved,
+        Self::HostDeviceNodeUnexpected,
+        Self::RootfsIsHostRoot,
+        Self::RootfsOnSharedMount,
+        Self::RootfsMoved,
+        Self::RootfsHasSubmounts,
+        Self::RootfsHasExternalHardlink,
+        Self::EntrypointIsRuntimeBinary,
+        Self::StdioNullNotNullDevice,
+        Self::EntrypointInterpreterIsRuntimeBinary,
+        Self::ExecDevNotDirectory,
+        Self::ExecProcNotProcfs,
+        Self::EntrypointCopyTooLarge,
+        Self::EntrypointCopySealUnverified,
+        Self::EntrypointOnNoexecMount,
+        Self::ExecTargetNotNestedPid1,
+        Self::ExecTargetCgroupMismatch,
+        Self::ExecTargetSharesPidNamespace,
+        Self::ExecTargetSharesMountNamespace,
+        Self::ExecTargetInOtherUserNamespace,
+        Self::ExecRootNotContainerRootfs,
+        Self::ExecJoinedNamespaceMismatch,
+        Self::ExecJoinedPidNamespaceMismatch,
+        Self::ExecJoinedCgroupMismatch,
+        Self::ExecTargetPidfdMismatch,
+    ];
+
+    /// pivot 前段の子が状態 pipe で運んだ理由コード `token` から理由を引き直す（許可リスト照合。SEC-4・#1815）。
+    ///
+    /// 種別が `mount_target`・`shared_propagation`・`rootfs_pivot`・`establish_precondition`・`evidence_mismatch`
+    /// のどれかである理由だけが `Some`（pivot 前段の各段が返し得る違反の種別）。それ以外・未知の文字列は `None`
+    /// （呼び出し側は違反なしの失敗として扱う）。子は untrusted なので、文字列を監査レコードへ入る静的トークンへ
+    /// 変換する唯一の入口になる。
+    pub(super) fn from_launch_token(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| {
+            r.as_str() == token
+                && matches!(
+                    r.kind(),
+                    ViolationKind::MountTarget
+                        | ViolationKind::SharedPropagation
+                        | ViolationKind::RootfsPivot
+                        | ViolationKind::EstablishPrecondition
+                        | ViolationKind::EvidenceMismatch
+                )
+        })
+    }
+
+    /// launch 経路で子が運んだ理由に対応する `Mount` 監査イベント（パスなし・理由コードつき。SEC-4・#1815）。
+    ///
+    /// 対象は `MountTarget`・`SharedPropagation`・`RootfsPivot`（[`IsolationViolation::mount_audit_event`] と同じ範囲）。
+    /// 子から無制限長のパスを運ばないため、パスは載せない。
+    pub(super) fn launch_mount_audit_event(self) -> Option<AuditEvent> {
+        self.mount_layer_audit_event(None)
     }
 
     /// マウント層（`MountTarget`・`SharedPropagation`・`RootfsPivot`）の理由なら、理由コードつきの
@@ -854,6 +943,77 @@ impl IsolationViolation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ALL` は `as_str` の全分岐を網羅する（足し忘れの検出。SEC-4・#1815）。
+    #[test]
+    fn sec4_1815_all_reasons_covers_every_variant() {
+        let src = include_str!("violation.rs");
+        let start = src
+            .find("/// 機械可読な理由コード（snake_case）。")
+            .unwrap();
+        let end = src.find("/// 違反の種別。\n    pub fn kind").unwrap();
+        let arms = src[start..end]
+            .lines()
+            .filter(|l| l.contains("Self::") && l.contains("=>"))
+            .count();
+        assert_eq!(ViolationReason::ALL.len(), arms);
+        let mut names: Vec<&str> = ViolationReason::ALL.iter().map(|r| r.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), arms);
+    }
+
+    /// 引き直しは pivot 前段の 5 種別だけを受け付ける（SEC-4・#1815）。
+    #[test]
+    fn sec4_1815_launch_token_accepts_only_prepivot_kinds() {
+        for r in ViolationReason::ALL {
+            let accepted = match r.kind() {
+                ViolationKind::MountTarget
+                | ViolationKind::SharedPropagation
+                | ViolationKind::RootfsPivot
+                | ViolationKind::EstablishPrecondition
+                | ViolationKind::EvidenceMismatch => true,
+                ViolationKind::PlanRejected
+                | ViolationKind::Entrypoint
+                | ViolationKind::ExecTarget => false,
+            };
+            let expected = accepted.then_some(r);
+            assert_eq!(ViolationReason::from_launch_token(r.as_str()), expected);
+        }
+        assert_eq!(
+            ViolationReason::from_launch_token("target_on_shared_mount"),
+            Some(ViolationReason::TargetOnSharedMount)
+        );
+        assert_eq!(ViolationReason::from_launch_token("plan_rejected"), None);
+        assert_eq!(ViolationReason::from_launch_token(""), None);
+    }
+
+    /// 監査イベントはマウント層の 3 種別だけに写り、パスは載らない（SEC-4・#1815）。
+    #[test]
+    fn sec4_1815_launch_mount_audit_event_maps_mount_layer_only() {
+        assert_eq!(
+            ViolationReason::PathMissing.launch_mount_audit_event(),
+            Some(AuditEvent::Mount {
+                path: None,
+                reason: Some(AuditReason::new("path_missing")),
+            })
+        );
+        assert_eq!(
+            ViolationReason::RootfsIsHostRoot.launch_mount_audit_event(),
+            Some(AuditEvent::Mount {
+                path: None,
+                reason: Some(AuditReason::new("rootfs_is_host_root")),
+            })
+        );
+        assert_eq!(
+            ViolationReason::EstablishNotPid1.launch_mount_audit_event(),
+            None
+        );
+        assert_eq!(
+            ViolationReason::EvidenceCallerNotPid1.launch_mount_audit_event(),
+            None
+        );
+    }
 
     /// 制御文字・バックスラッシュはエスケープし、通常の文字はそのまま保持する。
     #[test]

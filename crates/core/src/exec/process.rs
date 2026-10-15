@@ -99,12 +99,17 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::audit_log::AuditedRejection;
 use crate::rlimits::{Rlimit, Rlimits};
 use crate::sys::{self, SealedReadOnlyCopy, Signal, SysError};
 use crate::traits::types::ErrorCode;
 
 use super::entrypoint_mode::EntrypointExecMode;
 use super::interpreter::reject_runtime_interpreter;
+use super::launch_status::{
+    LaunchAudit, PrePivotFailure, PrePivotStep, read_pre_pivot_status, report_failure,
+    report_ready, resolve_pre_pivot_status,
+};
 use super::rlimits::apply_rlimits;
 use super::rootfs::PreparedRootfs;
 use super::sealed_copy::{SealPolicy, check_not_on_noexec_mount, seal_entrypoint_copy};
@@ -1863,6 +1868,10 @@ pub(crate) struct PrePivotSetup<'a> {
     /// 検証済みの rootfs を固定した fd。あれば `prepare_rootfs` の後、パスから辿り直した実体が同じ
     /// `(st_dev, st_ino)` であることを確かめる（検証後の差し替え対策）。
     pub(crate) pinned_rootfs: Option<BorrowedFd<'a>>,
+    /// pivot 前段の結果を親へ返す状態 pipe の書き込み側（#1815。`launch_status` の形式）。あれば `run_child_then` が
+    /// 成功（`P`）または失敗（`F ...`）を 1 行書く。`None` なら何も返さない（従来どおり）。子はここ以外で sink に
+    /// 触らない。pivot 前段が終われば `close_inherited_fds` が閉じる（workload へ渡らない）。
+    pub(crate) status: Option<&'a std::fs::File>,
 }
 
 /// [`run_pre_pivot`] が呼ぶ各段（単体テストが呼び出し順を記録できるよう差し替え可能にした継ぎ目。
@@ -2009,23 +2018,46 @@ fn run_pre_pivot<O: PrePivotOps>(
     ops: &O,
     rootfs: &Path,
     setup: Option<PrePivotSetup<'_>>,
-) -> Result<(O::Isolation, O::Pivoted), ExecError> {
-    let isolation = ops.establish()?;
-    let prepared = ops.prepare_rootfs(&isolation, rootfs)?;
+) -> Result<(O::Isolation, O::Pivoted), Box<StepError>> {
+    use PrePivotStep as S;
+    let isolation = ops.establish().map_err(StepError::at(S::Establish))?;
+    let prepared = ops
+        .prepare_rootfs(&isolation, rootfs)
+        .map_err(StepError::at(S::PrepareRootfs))?;
     if let Some(setup) = setup {
         if let Some(pinned) = setup.pinned_rootfs {
-            ops.verify_pinned(&prepared, pinned)?;
+            ops.verify_pinned(&prepared, pinned)
+                .map_err(StepError::at(S::VerifyPinned))?;
         }
-        let devices = ops.create_default_devices(&isolation, &prepared, setup.devices)?;
+        let devices = ops
+            .create_default_devices(&isolation, &prepared, setup.devices)
+            .map_err(StepError::at(S::CreateDefaultDevices))?;
         if let Some(set) = setup.tmpfs {
-            ops.mount_tmpfs(&isolation, &prepared, &devices, set)?;
+            ops.mount_tmpfs(&isolation, &prepared, &devices, set)
+                .map_err(StepError::at(S::MountTmpfs))?;
         }
         if let Some(set) = setup.inject {
-            ops.inject_files(&isolation, &prepared, set)?;
+            ops.inject_files(&isolation, &prepared, set)
+                .map_err(StepError::at(S::InjectFiles))?;
         }
     }
-    let pivoted = ops.pivot_root(&isolation, prepared)?;
+    let pivoted = ops
+        .pivot_root(&isolation, prepared)
+        .map_err(StepError::at(S::PivotRoot))?;
     Ok((isolation, pivoted))
+}
+
+/// [`run_pre_pivot`] の失敗（どの段で失敗したか＋元のエラー。段は状態 pipe で親へ返す。#1815）。
+#[derive(Debug)]
+struct StepError {
+    step: PrePivotStep,
+    error: ExecError,
+}
+
+impl StepError {
+    fn at(step: PrePivotStep) -> impl FnOnce(ExecError) -> Box<Self> {
+        move |error| Box::new(Self { step, error })
+    }
 }
 
 /// 子の前段（[`run_pre_pivot`] → ステージ列）を共通化した本体。
@@ -2044,7 +2076,26 @@ fn run_child_then<T>(
         Result<LaunchReady, LaunchNotReady>,
     ) -> Result<T, ExecError>,
 ) -> Result<T, ExecError> {
-    let (isolation, report) = run_pre_pivot(&RealPrePivotOps, rootfs, setup)?;
+    let status = setup.and_then(|s| s.status);
+    let (isolation, report) = match (run_pre_pivot(&RealPrePivotOps, rootfs, setup), status) {
+        (Ok(done), None) => done,
+        (Err(failed), None) => return Err(failed.error),
+        // 成功の報告に失敗したら先へ進まない（親が結果を判定できないまま exec しない。fail-closed）。
+        (Ok(done), Some(status)) => {
+            report_ready(status)?;
+            done
+        }
+        (Err(failed), Some(status)) => {
+            let failure = PrePivotFailure::from_exec_error(failed.step, &failed.error);
+            if report_failure(status, &failure).is_err() {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "fandhe-container: the pre-pivot status could not be reported"
+                );
+            }
+            return Err(failed.error);
+        }
+    };
     // pivot 後・終端前にステージ列を固定順で実行する。
     stages.run_then(|_stage_report, _capability_report, evidence| {
         terminal(&isolation, &report, evidence)
@@ -2330,6 +2381,7 @@ pub fn spawn_container_with_stages_and_devices(
                 tmpfs: None,
                 inject: None,
                 pinned_rootfs: None,
+                status: None,
             }),
             StdioNulling::ALL,
         ) {
@@ -2345,6 +2397,65 @@ pub fn spawn_container_with_stages_and_devices(
     Ok(ContainerChild::spawned(pid))
 }
 
+/// pivot 前段の結果を親へ返す入口（TASK-29 追補・#1815。SEC-4・CORE-2・REPAIR-5）。
+///
+/// 状態 pipe を作って子を fork し、親は fork 直後に書き込み側を閉じてから `timeout` を上限に pivot 前段の結果
+/// （`launch_status` の 1 行）を読む。失敗・期限切れ・形式違反・EOF のみのいずれでも起動失敗として扱い、子を
+/// `kill_and_reap` で回収する（pivot 済みの PID 1 を残さない。CORE-2）。違反は `audit` の sink へ親が 1 件記録する
+/// （層 `mount`・パスなし。子は sink に触らない）。`setup.status` は上書きされる。
+///
+/// 将来仕様（REPAIR-3）: 本番 launcher（`oci_runtime` の `ProcessLauncher`）が起動ごとに `LaunchAudit` を作って
+/// 呼ぶ。launcher への配線（supervisor が `default_audit_sink` を渡す結線、`ContainerId` の受け渡し）は Phase B
+/// （#1715 の対象外項目）で、それまで crate 内の呼び出し元は無い。`dev.tty.legacy_tiocsti` の警告出力
+/// （#1739）も本入口には足していない。成功（`P`）の後（ステージ列・exec）の失敗は本入口では返らない。
+#[allow(dead_code)]
+pub(crate) fn spawn_container_prepared(
+    rootfs: &Path,
+    entry: &Entrypoint,
+    stages: StagePipeline,
+    stdio: ChildStdio,
+    setup: PrePivotSetup<'_>,
+    audit: LaunchAudit<'_>,
+    timeout: Duration,
+) -> Result<ContainerChild, Box<AuditedRejection<ExecError>>> {
+    let (read, write) =
+        exec_status_pipe().map_err(|e| Box::new(AuditedRejection::not_applicable(e)))?;
+    let status = &write;
+    let pid = sys::fork_single_threaded(
+        move || {
+            child_main(
+                rootfs,
+                entry,
+                stages,
+                Some(PrePivotSetup {
+                    status: Some(status),
+                    ..setup
+                }),
+                stdio,
+            )
+        },
+        EXIT_SETUP_FAILED,
+    )
+    .map_err(|e| {
+        Box::new(AuditedRejection::not_applicable(ExecError::from_sys(
+            e,
+            IsolationStage::Spawn,
+            "fork",
+        )))
+    })?;
+    // 親が書き込み側を持ち続けると、子が報告せずに終了しても EOF を観測できない。
+    drop(write);
+    let child = ContainerChild::spawned(pid);
+    let result = read_pre_pivot_status(&read, timeout);
+    match resolve_pre_pivot_status(result, audit) {
+        Ok(()) => Ok(child),
+        Err(rejection) => {
+            // 起動失敗は変えない（回収の失敗は握りつぶす。残った子は呼び出し側の drop 経路で扱う）。
+            let _ = child.kill_and_reap(KILL_REAP_TIMEOUT);
+            Err(rejection)
+        }
+    }
+}
 /// 待ちのポーリング間隔。
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// `wait_timeout` に渡せる最大値（`Instant` の加算オーバーフローを避けるための丸め）。
@@ -4673,15 +4784,37 @@ mod tests {
         fail_at: Option<&'static str>,
     }
 
+    /// 段ごとに異なる `ErrorCode`・違反理由を注入する（#1815。親での復元を具体値で照合するため）。
+    fn injected_failure(name: &str) -> ExecError {
+        let violation = |reason| ExecError::from_violation(reason, None);
+        match name {
+            "establish" => violation(ViolationReason::EstablishNotPid1),
+            "prepare_rootfs" => violation(ViolationReason::PathMissing),
+            "create_default_devices" => violation(ViolationReason::TargetOnSharedMount),
+            "pivot_root" => violation(ViolationReason::RootfsIsHostRoot),
+            "verify_pinned" => ExecError::new(
+                ErrorCode::PermissionDenied,
+                IsolationStage::PrepareRootfs,
+                "injected failure",
+            ),
+            "mount_tmpfs" => ExecError::new(
+                ErrorCode::NotFound,
+                IsolationStage::MountTmpfs,
+                "injected failure",
+            ),
+            _ => ExecError::new(
+                ErrorCode::InvalidArgument,
+                IsolationStage::InjectFiles,
+                "injected failure",
+            ),
+        }
+    }
+
     impl RecordingOps {
         fn step(&self, name: &'static str) -> Result<(), ExecError> {
             record(name.to_owned());
             if self.fail_at == Some(name) {
-                return Err(ExecError::new(
-                    ErrorCode::Internal,
-                    IsolationStage::PrepareRootfs,
-                    "injected failure",
-                ));
+                return Err(injected_failure(name));
             }
             Ok(())
         }
@@ -4737,6 +4870,7 @@ mod tests {
                 tmpfs: Some(&tmpfs),
                 inject: Some(&inject),
                 pinned_rootfs: Some(pinned.as_fd()),
+                status: None,
             }),
         )
         .unwrap();
@@ -4766,6 +4900,7 @@ mod tests {
                 tmpfs: None,
                 inject: None,
                 pinned_rootfs: None,
+                status: None,
             }),
         )
         .unwrap();
@@ -4797,15 +4932,79 @@ mod tests {
                 tmpfs: Some(&tmpfs),
                 inject: None,
                 pinned_rootfs: None,
+                status: None,
             }),
         )
         .err()
         .unwrap();
-        assert_eq!(err.code, ErrorCode::Internal);
+        assert_eq!(err.step, PrePivotStep::CreateDefaultDevices);
+        assert_eq!(err.error.code, ErrorCode::FailedPrecondition);
         assert_eq!(
             take_calls(),
             ["establish", "prepare_rootfs", "create_default_devices"]
         );
+    }
+
+    /// SEC-4・CORE-2（#1815）: 7 つの段のそれぞれの失敗が、状態行の符号化・復号を経て親で段の名前と
+    /// `ErrorCode`・違反理由の具体値として復元される。
+    #[test]
+    fn sec4_1815_every_step_failure_is_restored_by_the_parent() {
+        use super::super::launch_status::PrePivotStatus;
+        let tmpfs = TmpfsMountSet::new();
+        let inject = InjectedFileSet::new();
+        let pinned = std::fs::File::open("/").unwrap();
+        let expected = [
+            (
+                "establish",
+                ErrorCode::FailedPrecondition,
+                Some("establish_not_pid1"),
+            ),
+            (
+                "prepare_rootfs",
+                ErrorCode::InvalidArgument,
+                Some("path_missing"),
+            ),
+            ("verify_pinned", ErrorCode::PermissionDenied, None),
+            (
+                "create_default_devices",
+                ErrorCode::FailedPrecondition,
+                Some("target_on_shared_mount"),
+            ),
+            ("mount_tmpfs", ErrorCode::NotFound, None),
+            ("inject_files", ErrorCode::InvalidArgument, None),
+            (
+                "pivot_root",
+                ErrorCode::InvalidArgument,
+                Some("rootfs_is_host_root"),
+            ),
+        ];
+        for (name, code, reason) in expected {
+            let err = run_pre_pivot(
+                &RecordingOps {
+                    fail_at: Some(name),
+                },
+                Path::new("/rootfs"),
+                Some(PrePivotSetup {
+                    devices: DevptsGidSource::Rootful,
+                    tmpfs: Some(&tmpfs),
+                    inject: Some(&inject),
+                    pinned_rootfs: Some(pinned.as_fd()),
+                    status: None,
+                }),
+            )
+            .err()
+            .unwrap();
+            assert_eq!(err.step.as_str(), name);
+            let failure = PrePivotFailure::from_exec_error(err.step, &err.error);
+            let line = PrePivotStatus::Failed(failure).encode();
+            let decoded = PrePivotStatus::decode(line.as_bytes()).unwrap();
+            let PrePivotStatus::Failed(f) = decoded else {
+                panic!("expected a failure, got {decoded:?}");
+            };
+            assert_eq!(f.step.as_str(), name);
+            assert_eq!(f.code, code);
+            assert_eq!(f.violation.map(ViolationReason::as_str), reason);
+        }
     }
 
     /// 固定した rootfs と実体が違えば `PermissionDenied`（固定文言）で拒否する。

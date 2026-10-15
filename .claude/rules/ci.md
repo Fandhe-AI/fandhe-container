@@ -56,7 +56,7 @@ rustdoc の警告（壊れた intra-doc リンク・private 項目へのリン�
 
 macOS cold start 上乗せ確認（TASK-113.4・PLUG-6・MAC-2）は `benches/tests/macos_cold_start.rs` の結合試験（`cfg(target_os = "macos")`。他 OS は skip を明示）として `platform-ci` の macos（main への push と `workflow_dispatch`）で実行する。`bench-regression`（ubuntu 単独）のジョブ構成は変えず、基準値比較にも接続しない（模擬制御コアの計測で、実バックエンドは TASK-115）。
 
-`bench-regression` ジョブは次の 18 個の `make` を実行する（自己テストはスタブ・疑似 /proc・fixture のみで照合し、実機は使わない）。1〜14 の自己テスト（と下記の `make cli-parity-native-reclaim-selftest`）は互いに独立なため、`scripts/run-parallel.sh 3` で最大 3 並列に実行する（所要時間の短縮。経過秒を照合する自己テストがあるため同時実行数は 3 に絞る。1 つでも失敗すればジョブは失敗する）。15 以降は ci.yml の並びどおりに直列で実行する。
+`bench-regression` ジョブは次の 19 個の `make`（下記 1〜18 と `make cli-parity-native-reclaim-selftest`）を実行する（自己テストはスタブ・疑似 /proc・fixture のみで照合し、実機は使わない）。1〜14 の自己テスト（と下記の `make cli-parity-native-reclaim-selftest`）は互いに独立なため、`scripts/run-parallel.sh 3` で最大 3 並列に実行する（所要時間の短縮。経過秒を照合する自己テストがあるため同時実行数は 3 に絞る。1 つでも失敗すればジョブは失敗する）。15 以降は ci.yml の並びどおりに直列で実行する。
 
 1. `make fio-bench-selftest`（fio 4K ランダム write ベンチスクリプトの自己テスト。TASK-25.1・IO-8）
 2. `make fio-baseline-ratio-selftest`（fio ベースライン比の算出の自己テスト。TASK-25.2・IO-8）

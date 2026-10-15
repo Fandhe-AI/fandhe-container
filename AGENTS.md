@@ -137,7 +137,7 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 | `deny-poc-venus-jig`（`deny` からも呼ぶ） | `platform-ci`（ubuntu のみ。結果が OS に依らない依存監査のため） |
 | `deny-license-fail-closed-selftest` | `platform-ci`（ubuntu のみ。cargo-deny の判定が OS に依らないため。TASK-90.2・OSS-4・OSS-5） |
 | `third-party-licenses-selftest`・`third-party-licenses` | `platform-ci`（ubuntu のみ。表記の生成結果が OS に依らないため。TASK-103.2・OSS-5） |
-| `plug4-core-invariance-selftest`・`cli-parity-selftest`・`cli-parity-native-reclaim-check`・`cli-parity-native-reclaim-selftest`・`vz-virtio-gpu-guest-check-selftest`・`commit-msg-line-length-selftest` | `platform-ci`（PR は ubuntu・main は 3 OS。Windows は Git Bash） |
+| `plug4-core-invariance-selftest`・`cli-parity-selftest`・`cli-parity-native-reclaim-check`・`cli-parity-native-reclaim-selftest`・`vz-virtio-gpu-guest-check-selftest`・`commit-msg-line-length-selftest` | `platform-ci`（PR は ubuntu・main は 3 OS。Windows は Git Bash。`cli-parity-native-reclaim-selftest` の ubuntu 分は `bench-regression` の並列グループで実行し、`platform-ci` では macOS・Windows のみ） |
 | `test-core-no-plugin`・`check-cli-backend-deps` | `platform-ci`（PR は ubuntu・main は 3 OS。core の plugin 無効構成の検証〔PLUG-3・TASK-111.1〕・cli のバックエンド直接依存なしの検証〔CLI-1・PLUG-4・TASK-79.4〕） |
 | `lib-selftest` | `platform-ci`（PR は ubuntu・main は 3 OS。Windows は Git Bash。macOS では `/bin/bash` 3.2 でも回す。`scripts/lib.sh` の判定の回帰テスト。PR #1756） |
 | `bench-check-selftest`・`bench-baseline-selftest`・`bench-check`・`bench-plugin-boundary`・`plugin-feature-size`・`plug4-core-invariance` | `bench-regression` |

@@ -26,10 +26,30 @@ fn main() {
 mod linux {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::num::NonZeroU32;
-    use std::process::{Command, Stdio};
-    use std::time::Duration;
+    use std::process::{Child, Command, ExitStatus, Stdio};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     use fandhe_container_core::exec::{ChildExit, ChildSubreaper, ContainerChild, IsolationStage};
+
+    /// 各待ちの期限（REPAIR-5）。超過したら対象を kill して試験を失敗させる。
+    const IO_DEADLINE: Duration = Duration::from_secs(30);
+
+    /// 期限付きの終了待ち。超過時は kill して回収し panic する。
+    fn wait_deadline(child: &mut Child, what: &str) -> ExitStatus {
+        let start = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                return status;
+            }
+            if start.elapsed() >= IO_DEADLINE {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{what} did not exit within {IO_DEADLINE:?}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     pub fn run() {
         if std::env::args().any(|a| a == "--intermediate") {
@@ -52,8 +72,14 @@ mod linux {
         let mut out = std::io::stdout();
         writeln!(out, "{}", grandchild.id()).expect("write pid");
         out.flush().expect("flush");
-        let mut sink = Vec::new();
-        let _ = std::io::stdin().read_to_end(&mut sink);
+        // 親が止まっても無期限に残らないよう、stdin の EOF 待ちに期限を付ける（REPAIR-5）。
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = std::io::stdin().read_to_end(&mut sink);
+            let _ = tx.send(());
+        });
+        let _ = rx.recv_timeout(IO_DEADLINE);
         // 孫は意図的に待たない（回収は呼び出し側の subreaper が行う）。
         std::mem::forget(grandchild);
     }
@@ -86,10 +112,24 @@ mod linux {
             .spawn()
             .expect("spawn unrelated");
 
-        let mut line = String::new();
-        BufReader::new(mid.stdout.take().expect("stdout"))
-            .read_line(&mut line)
-            .expect("read grandchild pid");
+        // pid 通知の読み取りは別スレッド＋期限付き受信にする（通知前に停止しても無期限に待たない）。
+        let stdout = mid.stdout.take().expect("stdout");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let res = BufReader::new(stdout).read_line(&mut line).map(|_| line);
+            let _ = tx.send(res);
+        });
+        let line = match rx.recv_timeout(IO_DEADLINE) {
+            Ok(res) => res.expect("read grandchild pid"),
+            Err(_) => {
+                let _ = mid.kill();
+                let _ = mid.wait();
+                let _ = unrelated.kill();
+                let _ = unrelated.wait();
+                panic!("intermediate did not report grandchild pid within {IO_DEADLINE:?}");
+            }
+        };
         let gpid: u32 = line.trim().parse().expect("grandchild pid");
         let gpid_nz = NonZeroU32::new(gpid).expect("non-zero pid");
 
@@ -102,7 +142,7 @@ mod linux {
 
         // B: 中間プロセスを終わらせて回収し、孫が自分へ再親付けされたことを確認する。
         drop(mid.stdin.take());
-        let mid_status = mid.wait().expect("wait intermediate");
+        let mid_status = wait_deadline(&mut mid, "intermediate");
         assert_eq!(mid_status.code(), Some(0));
         let me = std::process::id();
         let mut reparented = false;
@@ -123,6 +163,6 @@ mod linux {
         );
 
         // C: 無関係な子は奪われていない。
-        assert_eq!(unrelated.wait().expect("wait unrelated").code(), Some(9));
+        assert_eq!(wait_deadline(&mut unrelated, "unrelated").code(), Some(9));
     }
 }

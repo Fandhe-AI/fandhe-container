@@ -254,9 +254,20 @@ fn retained_bytes(config: &ContainerConfig) -> Result<usize, Status> {
     })?;
     entries
         .checked_mul(RETAINED_BYTES_PER_ENTRY)
+        .and_then(|overhead| overhead.checked_add(mounts_struct_bytes(config.mounts.len())?))
         .and_then(|overhead| overhead.checked_add(encoded_len))
         .and_then(|bytes| bytes.checked_add(RETAINED_BYTES_PER_RECORD))
         .ok_or_else(|| Status::invalid_argument("config is too large"))
+}
+
+/// `mounts` の要素（`Mount` 本体）の保持量の上乗せ（符号化長・[`RETAINED_BYTES_PER_ENTRY`] に含まれない分）。
+///
+/// `Mount` は複数の `String`・`Vec` とインラインの `Option<ImageSpec>` を持ち、構造体自体が
+/// `RETAINED_BYTES_PER_ENTRY` を超える。空の `Mount` は符号化長がほぼ 0 のため、要素ごとの
+/// 見積もりが無いと実保持量を過小に数える。復号後の `Vec` は倍々に伸びて最大 2 倍の容量を持ち得るため
+/// `size_of::<Mount>()` の 2 倍で計上する（保守側。TASK-58.1・ERR-3）。オーバーフローは `None`。
+fn mounts_struct_bytes(count: usize) -> Option<usize> {
+    count.checked_mul(std::mem::size_of::<v1::Mount>().checked_mul(2)?)
 }
 
 type Visit<'a> = &'a mut dyn FnMut(&'static str, usize) -> Result<(), Status>;
@@ -608,6 +619,20 @@ mod tests {
             BoundedContainerConfig::new(c).unwrap_err().code(),
             Code::InvalidArgument
         );
+    }
+
+    /// ERR-3・TASK-58.1: 空の `Mount` を大量に含む設定は、構造体のサイズ分を保持量に計上する。
+    #[test]
+    fn task_58_1_empty_mounts_count_struct_size() {
+        let mut c = base_config();
+        let base = BoundedContainerConfig::new(c.clone())
+            .unwrap()
+            .retained_bytes();
+        c.mounts = vec![v1::Mount::default(); MAX_CONFIG_COLLECTION_ENTRIES];
+        let retained = BoundedContainerConfig::new(c).unwrap().retained_bytes();
+        let per_mount = 2 * std::mem::size_of::<v1::Mount>() + RETAINED_BYTES_PER_ENTRY;
+        assert!(retained >= base + MAX_CONFIG_COLLECTION_ENTRIES * per_mount);
+        assert!(2 * std::mem::size_of::<v1::Mount>() > RETAINED_BYTES_PER_ENTRY);
     }
 
     #[test]

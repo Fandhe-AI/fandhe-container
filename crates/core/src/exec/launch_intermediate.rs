@@ -58,6 +58,7 @@
 
 use std::io::Write as _;
 use std::num::NonZeroU32;
+use std::os::fd::{AsRawFd as _, RawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -375,6 +376,14 @@ pub(super) fn intermediate_body<O: IntermediateOps>(ops: &mut O) -> i32 {
     0
 }
 
+/// fork 後の子で、継承した不要な fd を閉じる。子は `_exit` で終わり `File` を drop しないため二重 close にならない。
+fn close_inherited(fd: RawFd) -> Result<(), sys::SysError> {
+    match u32::try_from(fd) {
+        Ok(n) => sys::close_fd_number(n),
+        Err(_) => Ok(()),
+    }
+}
+
 /// PID 1 側の開始ゲート: C の許可(1 行)を期限つきで待つ。C が許可せずに閉じた(EOF)・期限切れ・読み取り失敗は
 /// 失敗で、PID 1 は exec せずに終了する。C は許可の直前まで失敗経路で PID 1 を kill・回収するため、期限は
 /// 最後の砦(孤児が無期限に残らない)。CORE-2。
@@ -410,15 +419,23 @@ impl IntermediateOps for RealIntermediateOps<'_> {
         };
         let (rootfs, entry, setup) = (self.rootfs, self.entry, self.setup);
         let gate_r = self.gate_r;
+        let report_fd = self.report.as_raw_fd();
         // 識別子は fork で PID 1 へ継承される。設定できなければ、報告前に失われた PID 1 を C が特定できなく
         // なるため、PID 1 を作らずに失敗させる(fail-closed。CORE-2)。
         sys::set_process_comm(self.tag.comm_bytes())
             .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "set the launch tag"))?;
         // 親(I)の stdio バッファを子が二重に出力しないよう flush しない経路を使う。子は `_exit` するだけ。
         sys::fork_single_threaded_no_flush(
-            move || match await_start_gate(gate_r, START_GATE_TIMEOUT) {
-                Ok(()) => child_main(rootfs, entry, stages, Some(setup), stdio),
-                Err(_) => EXIT_SETUP_FAILED,
+            move || {
+                // PID 1 は報告 pipe の書き込み側を継承している。持ち続けると、K の報告前に I が終了しても
+                // C が EOF を観測できず期限まで待つ。開始ゲート待ちの前に閉じる(CORE-2・REPAIR-5)。
+                if close_inherited(report_fd).is_err() {
+                    return EXIT_SETUP_FAILED;
+                }
+                match await_start_gate(gate_r, START_GATE_TIMEOUT) {
+                    Ok(()) => child_main(rootfs, entry, stages, Some(setup), stdio),
+                    Err(_) => EXIT_SETUP_FAILED,
+                }
             },
             EXIT_SETUP_FAILED,
         )
@@ -528,11 +545,26 @@ fn launch_via_intermediate(
     let (gate_r, gate_w) = exec_status_pipe().map_err(not_started)?;
     let (status_ref, report_ref) = (&status_w, &report_w);
     let gate_r_ref = &gate_r;
+    let (gate_w_fd, report_r_fd, status_r_fd) = (
+        gate_w.as_raw_fd(),
+        report_r.as_raw_fd(),
+        status_r.as_raw_fd(),
+    );
     // fork 前の stdout / stderr の同期 flush は無期限に止まり得て、下の期限が効かなくなる(REPAIR-5)ため、
     // flush しない経路を使う。中間プロセスは `_exit` するので二重出力は起きない。
     let intermediate_pid = sys::fork_single_threaded_with_no_flush(
         is_single_threaded,
-        move || intermediate(status_ref, report_ref, gate_r_ref),
+        move || {
+            // I が持つべきでない C 専用の端点を閉じる。I から fork される PID 1 へ継承されると、C が許可前に
+            // 終了しても gate_r が EOF を観測できず、PID 1 が期限まで残る(CORE-2・REPAIR-5)。
+            if close_inherited(gate_w_fd).is_err()
+                || close_inherited(report_r_fd).is_err()
+                || close_inherited(status_r_fd).is_err()
+            {
+                return EXIT_SETUP_FAILED;
+            }
+            intermediate(status_ref, report_ref, gate_r_ref)
+        },
         EXIT_SETUP_FAILED,
     )
     .map_err(|e| not_started(ExecError::from_sys(e, IsolationStage::Spawn, "fork")))?;
@@ -1229,6 +1261,52 @@ mod tests {
             gone(pid1),
             "the unreported init {pid1} must be killed and reaped"
         );
+    }
+
+    /// CORE-2・REPAIR-5(#1816): I が許可前に報告なしで終了しても、PID 1 は gate_w を継承していないため、C の
+    /// 失敗(gate_w の drop)で開始ゲートが EOF となり、期限(10 秒)を待たずに終了する。
+    #[test]
+    fn core2_start_gate_sees_eof_when_launcher_aborts_before_release() {
+        let _subreaper = ChildSubreaper::enable().expect("subreaper");
+        let (mut mark_read, mark_write) = std::io::pipe().unwrap();
+        let mark_write = std::fs::File::from(std::os::fd::OwnedFd::from(mark_write));
+        let sink = VecSink(Mutex::new(Vec::new()));
+        let audit = LaunchAudit {
+            sink: &sink,
+            container: None,
+        };
+        let tag = LaunchTag::fresh();
+        let started = Instant::now();
+        let result = launch_via_intermediate(
+            || true,
+            |status, _report, gate_r| {
+                let _ = sys::fork_single_threaded_with(
+                    || true,
+                    || {
+                        let waited = Instant::now();
+                        let eof = await_start_gate(gate_r, Duration::from_secs(10)).is_err()
+                            && waited.elapsed() < Duration::from_secs(8);
+                        let _ = status;
+                        let mut w = &mark_write;
+                        let _ = w.write_all(if eof { b"E" } else { b"T" });
+                        0
+                    },
+                    EXIT_SETUP_FAILED,
+                );
+                // 報告せずに終了する。
+                EXIT_SETUP_FAILED
+            },
+            &_subreaper,
+            audit,
+            Duration::from_secs(5),
+            &tag,
+        );
+        assert!(result.is_err());
+        drop(result);
+        let mut mark = [0u8; 1];
+        mark_read.read_exact(&mut mark).unwrap();
+        assert_eq!(&mark, b"E", "the init must see EOF on the start gate");
+        assert!(started.elapsed() < Duration::from_secs(9));
     }
 
     /// CORE-2: 開始ゲートは許可の 1 行で通り、許可なしの close(EOF)では失敗する。

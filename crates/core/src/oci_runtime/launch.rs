@@ -19,7 +19,7 @@
 //! (`exec::spawn_container_via_intermediate`)。fork は単一スレッドの呼び出しを要求するため、
 //! `ProductionLauncher` は [`LaunchMode::SelfBounded`] を宣言し、start は別スレッドを作らず呼び出しスレッドで
 //! 直接 `launch` を呼ぶ。起動済みの子の終了・回収は `ContainerChildProcess`(Linux。`exec::ContainerChild` の
-//! 回収状態の排他を再利用する)が担う。`confirm_no_process`(#1817)・supervisor の結線(#1819)・実機前提の
+//! 回収状態の排他を再利用する)が担う。supervisor の結線(#1819)・実機前提の
 //! 結合試験(#1818)は後続(REPAIR-3)。
 
 #[cfg(target_os = "linux")]
@@ -796,6 +796,10 @@ pub trait ProcessLauncher: Send + Sync {
     /// 進行中の launch との排他は start 側が担う（同一プロセス内は予約、プロセス間は bundle ディレクトリの
     /// 所有ロック。本メソッドは所有ロックを取れた後にだけ呼ばれる）ため、実装は生存プロセスの確認に専念する。
     /// 既定実装は確認手段を持たないため fail-closed で `Unimplemented` を返す。待ちは `timeout` まで。
+    ///
+    /// 本番の `ProductionLauncher` は、自身が起動した範囲だけを確証できる（起動台帳。#1817）。失敗した launch の
+    /// 回収できなかった子と報告前の PID 1 を期限内に再回収・再探索し、消滅を確かめられたときだけ `Ok(())` を返す。
+    /// 台帳に無い ID（別プロセスで起動した残存）とハンドルを渡し済みの ID は確証できないため `FailedPrecondition`。
     fn confirm_no_process(&self, id: &ContainerId, timeout: Duration) -> Result<(), TraitError> {
         let _ = (id, timeout);
         Err(TraitError::new(

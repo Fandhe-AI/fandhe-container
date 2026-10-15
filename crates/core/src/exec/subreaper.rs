@@ -29,7 +29,8 @@
 //!
 //! 本番 launcher（`oci_runtime::ProductionLauncher`）が構築時に [`ChildSubreaper::enable`] を呼んで証跡を保持し、
 //! `exec/launch_intermediate.rs` が報告 pipe で受け取った PID 1 の pid を [`ContainerChild::adopt_reparented`] へ渡す。
-//! 中間プロセスが報告後に PID 1 を作ったまま殺された場合に pid を知る手段は未実装（#1817）。
+//! 中間プロセスが報告前に殺された場合の PID 1 は、起動識別子による `/proc` 探索で特定して回収する（`launch_intermediate.rs` の
+//! `rescan_unreported_init`。launch 失敗時と `confirm_no_process` で使う。#1817）。
 
 use std::num::NonZeroU32;
 

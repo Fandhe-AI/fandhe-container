@@ -171,7 +171,9 @@ pub use landlock::{
     LANDLOCK_PROBE_CONTENT_MISMATCH, LandlockAccessKind, LandlockAccessObservation,
     LandlockAccessProbe, observe_landlock_path_access,
 };
-pub(crate) use launch_intermediate::{IntermediateSpec, spawn_container_via_intermediate};
+pub(crate) use launch_intermediate::{
+    IntermediateSpec, LaunchTag, Rescan, rescan_unreported_init, spawn_container_via_intermediate,
+};
 pub(crate) use launch_status::LaunchAudit;
 /// supervisor の `SETUP_VIOLATIONS` との突き合わせ試験専用の再公開（SEC-4・SUP-6・#1579。通常の利用者は呼ばない）。
 #[doc(hidden)]

@@ -30,16 +30,28 @@
 //! 期限(中間プロセスの報告・pivot 前段の状態)と、失敗後の後始末の固定上限で、戻りは `timeout` ＋後始末の
 //! 上限以内。複数スレッドの呼び出しは副作用なしで `FailedPrecondition` にする。
 //!
+//! # 起動台帳と `confirm_no_process`(CORE-2・REPAIR-5。#1817)
+//!
+//! launch の失敗は、起動した全プロセス(中間プロセス I と PID 1)の消滅を確かめられたかを、コンテナ ID ごとの
+//! 台帳(上限 `LEDGER_MAX_ENTRIES` 件)に残す。`Clean` は消滅を確かめ済み、`Pending` は回収できなかった子の
+//! ハンドルと、報告前の PID 1 の再探索が要る起動識別子を保持する状態、`Handed` は launch 成功でハンドルの所有者が
+//! 呼び出し側に移った状態である。`confirm_no_process` は `Clean` のときだけ `Ok` を返し、`Pending` は期限内に
+//! 再回収(I → PID 1 の順。PID 1 は I の回収後でないと C の子にならない)と再探索を試みる。台帳に無い ID・`Handed`・
+//! 確かめられない `Pending` は `Ok` にしない。`Pending` の ID への再 launch は(再回収を試みても確かめられなければ)
+//! fork 前に拒否する。再回収の待ちの間は `Pending` を台帳から取り出し(記録は `Settling`)、台帳の Mutex を解放する
+//! ため、他コンテナの launch は待たされない(REPAIR-5・CORE-1)。同じ ID への並行な確認・launch は拒否する。期限内に確かめられなかった事実は、launch の `TraitError` の固定の接尾辞
+//! (`UNCONFIRMED_SUFFIX`)と [`ProcessLauncher::last_launch_may_have_left_process`] で伝える。
+//!
 //! # 未実装・残余(REPAIR-3)
 //!
 //! - **権限モデル**: `RootlessSingleId` のみ。`RootfulHostRoot`(SEC-5・CORE-7・CORE-9。start が user namespace
 //!   を必須とするため、start を通る構成では到達しない。整合は spec 側の判断事項)と `RootlessSubordinateIds`
 //!   (CORE-6・TASK-40.2。`LaunchSpec` が uid/gid 写像を持たない)は `Unimplemented` で拒否する
-//! - **`confirm_no_process`**: 既定(`Unimplemented`)のまま。中間プロセスが PID 1 を作った後に殺された場合の
-//!   pid の把握とあわせて #1817 で実装する。回収できなかった子は [`ProductionLauncher::take_unreaped`] で
-//!   取り出せる(握りつぶさない)。報告前の PID 1 は起動ごとの識別子で特定して回収する(`exec` 側。CORE-2)。
-//!   回収できなかった子が残り得る失敗では、start が起動予約(Running・pid なし)を `Created` へ戻さない
-//!   ([`ProcessLauncher::last_launch_may_have_left_process`])
+//! - **`confirm_no_process`**: この launcher 自身が起動した範囲だけを確証する(下の「起動台帳」)。別プロセス
+//!   (クラッシュ前の supervisor 等)で起動した残存は、launcher が ID から cgroup を引けないため確証できず
+//!   `FailedPrecondition` で返す(fail-closed)。cgroup の `cgroup.procs` が空であることの確認は別 issue の範囲
+//!   (StateStore の cgroup 記録との結線が要る)
+//! - 起動台帳はプロセス内のメモリのみ(再起動をまたがない。別プロセスの残存の確認は上記のとおり未対応)
 //! - **supervisor の結線**: `launch` は呼び出しスレッドで直接呼ぶ必要があり、supervisor の `run_start`
 //!   手順 8 と restart の再 launch は別スレッドで呼んでいる。再構成は #1819 の範囲
 //! - mounts・bind mount・`/dev` 以外の tmpfs の注入は `start` が拒否済みで、ここでは載せない
@@ -49,6 +61,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 #[cfg(target_os = "linux")]
 use super::cgroup_requirement::{CgroupJoinMeans, launch_after_cgroup_check};
@@ -62,15 +76,38 @@ use crate::cgroups::{CgroupError, CgroupJoin};
 #[cfg(target_os = "linux")]
 use crate::exec::{
     ChildStdio, ChildSubreaper, ContainerChild, Entrypoint, ExecError, Hostname, IntermediateSpec,
-    IsolationConfig, IsolationPrivilege, IsolationStage, LaunchAudit, Namespace, NamespaceSet,
-    PrePivotSetup, PreparedLaunchFailure, StageKind, StagePipeline, plan,
-    spawn_container_via_intermediate,
+    IsolationConfig, IsolationPrivilege, IsolationStage, LaunchAudit, LaunchTag, Namespace,
+    NamespaceSet, PrePivotSetup, PreparedLaunchFailure, Rescan, StageKind, StagePipeline, plan,
+    rescan_unreported_init, spawn_container_via_intermediate,
 };
 #[cfg(target_os = "linux")]
 use crate::landlock::LandlockRuleset;
 #[cfg(target_os = "linux")]
 use crate::tmpfs::TmpfsMountSet;
-use crate::traits::{ErrorCode, TraitError};
+use crate::traits::{ContainerId, ErrorCode, TraitError};
+
+/// 起動台帳の上限(異なるコンテナ ID の件数。無制限の確保を避ける。`Pending` は捨てないため、`Pending` だけで
+/// 満杯なら新しい ID の launch を拒否する)。
+#[cfg(target_os = "linux")]
+pub(super) const LEDGER_MAX_ENTRIES: usize = 64;
+
+/// launch が失敗し、起動したプロセスの消滅を期限内に確かめられなかったときに、失敗の文言へ足す固定の接尾辞
+/// (機械可読な判定は [`ProcessLauncher::last_launch_may_have_left_process`])。
+#[cfg(target_os = "linux")]
+pub(super) const UNCONFIRMED_SUFFIX: &str =
+    "; removal of the launched processes could not be confirmed";
+
+/// 成功した launch の直後の検査で拒否した子(pidfd 無し)を回収する待ちの固定上限(REPAIR-5)。
+#[cfg(target_os = "linux")]
+const POST_SPAWN_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `Pending` の ID への再 launch の前に、再回収を試みる待ちの固定上限(REPAIR-5)。
+#[cfg(target_os = "linux")]
+const RELAUNCH_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `confirm_no_process` の待ちに許す最大値(`Instant` の加算オーバーフローを避ける丸め)。
+#[cfg(target_os = "linux")]
+const CONFIRM_TIMEOUT_MAX: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// 本番の [`ProcessLauncher`]。構築は [`ProductionLauncher::builder`]。
 ///
@@ -87,35 +124,6 @@ pub struct ProductionLauncher {
 impl std::fmt::Debug for ProductionLauncher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProductionLauncher").finish_non_exhaustive()
-    }
-}
-
-/// 起動失敗の後始末で回収できなかった子(CORE-2・REPAIR-5)。
-///
-/// `ContainerChild` は drop で kill / wait をしないため、取り出した側が期限つきの `kill_and_reap` で再回収する
-/// 責務を負う(孤児化させない)。回収に失敗した理由の `ErrorCode` を添える(メッセージは運ばない)。
-#[cfg(target_os = "linux")]
-#[derive(Debug)]
-pub struct UnreapedChild {
-    child: ContainerChild,
-    reason: ErrorCode,
-}
-
-#[cfg(target_os = "linux")]
-impl UnreapedChild {
-    /// 回収できなかった子のハンドル。
-    pub fn child(&self) -> &ContainerChild {
-        &self.child
-    }
-
-    /// ハンドルを取り出す。
-    pub fn into_child(self) -> ContainerChild {
-        self.child
-    }
-
-    /// 回収に失敗した理由。
-    pub fn reason(&self) -> ErrorCode {
-        self.reason
     }
 }
 
@@ -149,21 +157,6 @@ impl ProductionLauncher {
     /// 構築器を作る。
     pub fn builder() -> ProductionLauncherBuilder {
         ProductionLauncherBuilder::default()
-    }
-
-    /// 回収できなかった子(PID 1 または中間プロセス)を取り出す(取り出すと空になる)。
-    ///
-    /// 起動失敗の後始末で `kill_and_reap` が期限内に終わらなかった子が積まれる。呼び出し側(supervisor・
-    /// `confirm_no_process`〔#1817〕)が期限つきで再回収する責務を負う(孤児化させない。CORE-2)。
-    #[cfg(target_os = "linux")]
-    pub fn take_unreaped(&self) -> Vec<UnreapedChild> {
-        std::mem::take(
-            &mut *self
-                .inner
-                .unreaped
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-        )
     }
 }
 
@@ -267,6 +260,20 @@ impl ProcessLauncher for ProductionLauncher {
             match self.never {}
         }
     }
+
+    /// この launcher が起動した範囲で、`id` の起動が生存プロセスを残していないことを確認する(CORE-2・REPAIR-5。
+    /// #1817)。台帳に無い ID・ハンドルを渡し済みの ID は確証できないため `FailedPrecondition`(fail-closed)。
+    fn confirm_no_process(&self, id: &ContainerId, timeout: Duration) -> Result<(), TraitError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.confirm_no_process(id, timeout)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (id, timeout);
+            match self.never {}
+        }
+    }
 }
 
 /// 起動の実体(fork・Landlock の検出・スレッド数の観測)を差し替えられる継ぎ目(単体テストが順序と拒否を
@@ -282,6 +289,9 @@ trait LaunchOps: Send + Sync {
     ) -> Result<LandlockRuleset, ExecError>;
     /// 中間プロセス経由で PID 1 を起動する。
     fn spawn(&self, input: SpawnInput<'_>) -> Result<Spawned, Box<PreparedLaunchFailure>>;
+    /// 報告前に失われた PID 1 を、起動識別子で `/proc` から探して回収する(`confirm_no_process` が、中間プロセスの
+    /// 回収後に呼ぶ。fork はしない。待ちは見つけた子ごとに `reap_timeout` まで)。
+    fn rescan(&self, tag: &LaunchTag, reap_timeout: Duration) -> Rescan;
 }
 
 /// [`LaunchOps::spawn`] へ渡す、fork 前に launcher が確定した値。
@@ -303,14 +313,116 @@ struct Spawned {
     stderr: std::io::PipeReader,
 }
 
-/// Linux の launcher 本体(拒否の判定・順序・写像)。
+/// コンテナ ID ごとの起動結果(起動台帳の 1 件。モジュール doc「起動台帳と `confirm_no_process`」)。
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum LaunchRecord {
+    /// 失敗した launch で、起動した全プロセスの消滅を確かめ済み。
+    Clean,
+    /// 消滅を確かめられていない。
+    Pending(Pending),
+    /// 別スレッドが `Pending` を台帳から取り出して再回収中(台帳の Mutex は待ちの間保持しない。REPAIR-5・CORE-1)。
+    /// 結果は呼び出し元が書き戻す。確かめ済みとは扱わず、捨てない。
+    Settling,
+    /// launch 成功。ハンドルの所有者は呼び出し側(start / supervisor)で、launcher は確証できない。
+    Handed,
+}
+
+/// 消滅を確かめられていない起動の残り(握りつぶさない。CORE-2)。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+struct Pending {
+    /// 回収できなかった子。順序は中間プロセス → PID 1(PID 1 は中間プロセスの回収後でないと C の子にならず、
+    /// `waitpid` が `ECHILD` になるため、この順で再回収する)。
+    children: Vec<ContainerChild>,
+    /// 報告前の PID 1 の再探索が要る起動識別子。
+    rescans: Vec<LaunchTag>,
+}
+
+/// 台帳への登録(`admit`)が拒否された理由。
+#[cfg(target_os = "linux")]
+enum AdmitError {
+    /// 同じ ID に確かめられていない起動が残っている(位置)。
+    Pending(usize),
+    /// 同じ ID の `Pending` を別スレッドが再回収中。
+    Settling,
+    /// `Pending` だけで台帳が満杯。
+    Full,
+}
+
+/// 起動台帳。件数に上限があり、`Pending` は捨てない(捨てると残存を見失う)。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+struct Ledger {
+    /// 古い順。
+    entries: Vec<(ContainerId, LaunchRecord)>,
+}
+
+#[cfg(target_os = "linux")]
+impl Ledger {
+    fn position(&self, id: &ContainerId) -> Option<usize> {
+        self.entries.iter().position(|(k, _)| k == id)
+    }
+
+    fn has_pending(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|(_, r)| matches!(r, LaunchRecord::Pending(_) | LaunchRecord::Settling))
+    }
+
+    /// 古い順に、`Pending` でない最初の項目を捨てる(捨てられたか)。
+    fn evict_oldest_settled(&mut self) -> bool {
+        match self
+            .entries
+            .iter()
+            .position(|(_, r)| !matches!(r, LaunchRecord::Pending(_) | LaunchRecord::Settling))
+        {
+            Some(i) => {
+                self.entries.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// launch の前に、台帳へ記録できる状態かを確かめる(`Pending` が残る ID・満杯は拒否)。
+    fn admit(&mut self, id: &ContainerId) -> Result<(), AdmitError> {
+        match self.position(id) {
+            Some(i) => match self.entries.get(i) {
+                Some((_, LaunchRecord::Pending(_))) => Err(AdmitError::Pending(i)),
+                Some((_, LaunchRecord::Settling)) => Err(AdmitError::Settling),
+                _ => Ok(()),
+            },
+            None if self.entries.len() < LEDGER_MAX_ENTRIES => Ok(()),
+            None if self.evict_oldest_settled() => Ok(()),
+            None => Err(AdmitError::Full),
+        }
+    }
+
+    /// 結果を記録する。`Pending` は必ず残し、それ以外は満杯なら古い確定済みを捨てる(捨てられなければ記録しない)。
+    fn set(&mut self, id: &ContainerId, record: LaunchRecord) {
+        if let Some(i) = self.position(id) {
+            if let Some(slot) = self.entries.get_mut(i) {
+                slot.1 = record;
+            }
+            return;
+        }
+        let is_pending = matches!(record, LaunchRecord::Pending(_));
+        if self.entries.len() >= LEDGER_MAX_ENTRIES && !self.evict_oldest_settled() && !is_pending {
+            return;
+        }
+        self.entries.push((id.clone(), record));
+    }
+}
+
+/// Linux の launcher 本体(拒否の判定・順序・写像・起動台帳)。
 #[cfg(target_os = "linux")]
 struct Inner {
     ops: Box<dyn LaunchOps>,
     privilege: IsolationPrivilege,
     audit_sink: Arc<dyn AuditSink>,
     cgroup_join_source: Option<JoinSource>,
-    unreaped: Mutex<Vec<UnreapedChild>>,
+    ledger: Mutex<Ledger>,
     /// 直近の `launch` が失敗し、子が残っている可能性があるか(回収に失敗した子がある、または報告前の PID 1 の
     /// 探索ができなかった。CORE-2)。`launch` の入口で偽に戻す。
     left_process: AtomicBool,
@@ -329,9 +441,13 @@ impl Inner {
             privilege,
             audit_sink,
             cgroup_join_source,
-            unreaped: Mutex::new(Vec::new()),
+            ledger: Mutex::new(Ledger::default()),
             left_process: AtomicBool::new(false),
         }
+    }
+
+    fn ledger(&self) -> std::sync::MutexGuard<'_, Ledger> {
+        self.ledger.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn launch(
@@ -371,6 +487,8 @@ impl Inner {
         spec: &LaunchSpec,
         timeout: Duration,
     ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+        let id = spec.container_id();
+        self.admit(id)?;
         if !self.ops.is_single_threaded() {
             return Err(TraitError::new(
                 ErrorCode::FailedPrecondition,
@@ -400,7 +518,7 @@ impl Inner {
         let isolation = isolation_config_of(spec)?;
         let audit = LaunchAudit {
             sink: self.audit_sink.as_ref(),
-            container: Some(spec.container_id()),
+            container: Some(id),
         };
         let spawned = self
             .ops
@@ -412,37 +530,255 @@ impl Inner {
                 audit,
                 timeout,
             })
-            .map_err(|failure| self.absorb_failure(*failure))?;
-        let process = super::launch::ContainerChildProcess::new(spawned.child)?
-            .with_output(spawned.stdout, spawned.stderr);
+            .map_err(|failure| self.absorb_failure(id, *failure))?;
+        let Spawned {
+            child,
+            stdout,
+            stderr,
+        } = spawned;
+        // pid 0 は実在する子ではない(`kill(0)` は自プロセスグループへ届くため、触らずに拒否する)。
+        if child.pid() == 0 {
+            return Err(TraitError::new(
+                ErrorCode::Internal,
+                "the launched process id is invalid",
+            ));
+        }
+        // pidfd 無しの子は使わない(pid 再利用で別のプロセスを止めない・exec の入口が pidfd を必須にしている。
+        // fail-closed)。drop では kill されないため、ここで回収する。
+        if child.pidfd().is_none() {
+            return Err(self.reject_unusable_child(id, child));
+        }
+        let process = super::launch::ContainerChildProcess::new(child)?.with_output(stdout, stderr);
+        self.ledger().set(id, LaunchRecord::Handed);
         Ok(Box::new(process))
     }
 
-    /// 起動失敗を `TraitError` へ写し、回収できなかった子は保持する(握りつぶさない。#1817 が読む)。
-    fn absorb_failure(&self, failure: PreparedLaunchFailure) -> TraitError {
+    /// launch の前に、同じ ID の確かめられていない起動を再回収する。確かめられなければ fork 前に拒否する
+    /// (二重起動の防止。CORE-2)。台帳が `Pending` だけで満杯のときも拒否する(子は作らない)。
+    fn admit(&self, id: &ContainerId) -> Result<(), TraitError> {
+        let mut ledger = self.ledger();
+        match ledger.admit(id) {
+            Ok(()) => Ok(()),
+            Err(AdmitError::Full) => Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "too many launches are awaiting confirmation that no process remains",
+            )),
+            Err(AdmitError::Settling) => Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                format!(
+                    "a previous launch of this container is being confirmed{UNCONFIRMED_SUFFIX}"
+                ),
+            )),
+            Err(AdmitError::Pending(i)) => {
+                // 台帳から取り出し、Mutex を解放してから再回収する(他コンテナの launch を待たせない)。
+                let Some(mut pending) = Self::take_pending_at(&mut ledger, i) else {
+                    return Err(TraitError::new(
+                        ErrorCode::FailedPrecondition,
+                        format!(
+                            "a previous launch of this container is unconfirmed{UNCONFIRMED_SUFFIX}"
+                        ),
+                    ));
+                };
+                drop(ledger);
+                let deadline = Instant::now() + RELAUNCH_SETTLE_TIMEOUT;
+                let settled = self.settle(&mut pending, deadline).is_ok();
+                if settled {
+                    self.ledger().set(id, LaunchRecord::Clean);
+                    Ok(())
+                } else {
+                    self.ledger().set(id, LaunchRecord::Pending(pending));
+                    self.left_process.store(true, Ordering::SeqCst);
+                    Err(TraitError::new(
+                        ErrorCode::FailedPrecondition,
+                        format!(
+                            "a previous launch of this container is unconfirmed{UNCONFIRMED_SUFFIX}"
+                        ),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// 位置 `i` の `Pending` を取り出し、記録を `Settling` に置き換える(`Pending` でなければ `None`)。
+    fn take_pending_at(ledger: &mut Ledger, i: usize) -> Option<Pending> {
+        let slot = ledger.entries.get_mut(i)?;
+        if !matches!(slot.1, LaunchRecord::Pending(_)) {
+            return None;
+        }
+        match std::mem::replace(&mut slot.1, LaunchRecord::Settling) {
+            LaunchRecord::Pending(p) => Some(p),
+            other => {
+                slot.1 = other;
+                None
+            }
+        }
+    }
+
+    /// pidfd の無い子を回収して拒否する(回収できなければ台帳に `Pending` で残す)。
+    fn reject_unusable_child(&self, id: &ContainerId, child: ContainerChild) -> TraitError {
+        match child.kill_and_reap(POST_SPAWN_REAP_TIMEOUT) {
+            Ok(_) => {
+                self.ledger().set(id, LaunchRecord::Clean);
+                TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "the launched process has no pidfd and was terminated",
+                )
+            }
+            Err(_) => {
+                self.left_process.store(true, Ordering::SeqCst);
+                self.ledger().set(
+                    id,
+                    LaunchRecord::Pending(Pending {
+                        children: vec![child],
+                        rescans: Vec::new(),
+                    }),
+                );
+                TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    format!("the launched process has no pidfd{UNCONFIRMED_SUFFIX}"),
+                )
+            }
+        }
+    }
+
+    /// 起動失敗を `TraitError` へ写し、回収を確かめられなかった子と再探索は台帳へ残す(握りつぶさない。CORE-2)。
+    fn absorb_failure(&self, id: &ContainerId, failure: PreparedLaunchFailure) -> TraitError {
         let PreparedLaunchFailure {
             rejection,
             unreaped,
             reap_error,
+            rescans,
         } = failure;
         let AuditedRejection { error, .. } = rejection;
-        // 回収できなかった子、または探索自体の失敗(`reap_error` のみ)は、プロセスが残る可能性を表す(CORE-2)。
-        if !unreaped.is_empty() || reap_error.is_some() {
+        // 回収できなかった子、報告前の PID 1 の探索の未完了、または探索自体の失敗は、プロセスが残る可能性を
+        // 表す(CORE-2)。
+        let unconfirmed = !unreaped.is_empty() || reap_error.is_some() || !rescans.is_empty();
+        if unconfirmed {
             self.left_process.store(true, Ordering::SeqCst);
-        }
-        let reason = reap_error.map_or(ErrorCode::Internal, |e| e.code);
-        self.unreaped
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend(
-                unreaped
-                    .into_iter()
-                    .map(|child| UnreapedChild { child, reason }),
+            self.ledger().set(
+                id,
+                LaunchRecord::Pending(Pending {
+                    children: unreaped,
+                    rescans,
+                }),
             );
-        to_trait_error(&error)
+        } else {
+            self.ledger().set(id, LaunchRecord::Clean);
+        }
+        launch_error(&error, unconfirmed)
+    }
+
+    /// `pending` の残りを期限内に再回収・再探索する。すべて消えたら `Ok`。確かめられなければ `Err`(`Timeout`
+    /// または `Internal`)で、残りは `pending` に残る(再試行できる)。fork はしない(別スレッドから呼ばれ得る)。
+    fn settle(&self, pending: &mut Pending, deadline: Instant) -> Result<(), ErrorCode> {
+        let remaining = || deadline.saturating_duration_since(Instant::now());
+        let mut failed = false;
+        let mut kept = Vec::new();
+        // 中間プロセス → PID 1 の順(積まれた順)で回収する。
+        for child in std::mem::take(&mut pending.children) {
+            if child.kill_and_reap(remaining()).is_err() {
+                failed = true;
+                kept.push(child);
+            }
+        }
+        pending.children = kept;
+        // 中間プロセスを含む全員を回収できた後でなければ、報告前の PID 1 は C へ再親付けされず見つからない。
+        if !failed {
+            for tag in std::mem::take(&mut pending.rescans) {
+                let found = self.ops.rescan(&tag, remaining());
+                if found.scan_incomplete {
+                    pending.rescans.push(tag);
+                }
+                if found.error.is_some() {
+                    failed = true;
+                }
+                pending.children.extend(found.unreaped);
+            }
+        }
+        if !failed {
+            return Ok(());
+        }
+        Err(if Instant::now() >= deadline {
+            ErrorCode::Timeout
+        } else {
+            ErrorCode::Internal
+        })
+    }
+
+    /// `id` の起動が、この launcher が起動した範囲で生存プロセスを残していないことを確認する(CORE-2・REPAIR-5)。
+    fn confirm_no_process(&self, id: &ContainerId, timeout: Duration) -> Result<(), TraitError> {
+        let deadline = Instant::now() + timeout.min(CONFIRM_TIMEOUT_MAX);
+        // Pending を台帳から取り出して Mutex を解放してから待つ(待ちの間、他コンテナの launch を止めない)。
+        let mut pending = {
+            let mut ledger = self.ledger();
+            let Some(i) = ledger.position(id) else {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "the launcher has no launch record for this container; cannot confirm",
+                ));
+            };
+            match ledger.entries.get(i) {
+                Some((_, LaunchRecord::Clean)) => return Ok(()),
+                Some((_, LaunchRecord::Settling)) => {
+                    return Err(TraitError::new(
+                        ErrorCode::FailedPrecondition,
+                        "another confirmation for this container is in progress",
+                    ));
+                }
+                Some((_, LaunchRecord::Pending(_))) => {}
+                Some((_, LaunchRecord::Handed)) | None => {
+                    return Err(TraitError::new(
+                        ErrorCode::FailedPrecondition,
+                        "the launched process is owned by its handle holder; cannot confirm",
+                    ));
+                }
+            }
+            match Self::take_pending_at(&mut ledger, i) {
+                Some(p) => p,
+                None => {
+                    return Err(TraitError::new(
+                        ErrorCode::Internal,
+                        "could not confirm that no launched process remains",
+                    ));
+                }
+            }
+        };
+        let settled = self.settle(&mut pending, deadline);
+        match settled {
+            Ok(()) => {
+                let mut ledger = self.ledger();
+                ledger.set(id, LaunchRecord::Clean);
+                if !ledger.has_pending() {
+                    self.left_process.store(false, Ordering::SeqCst);
+                }
+                Ok(())
+            }
+            Err(code) => {
+                self.ledger().set(id, LaunchRecord::Pending(pending));
+                Err(match code {
+                    ErrorCode::Timeout => TraitError::new(
+                        ErrorCode::Timeout,
+                        "timed out confirming that no launched process remains",
+                    ),
+                    code => {
+                        TraitError::new(code, "could not confirm that no launched process remains")
+                    }
+                })
+            }
+        }
     }
 }
 
+/// 起動失敗の `ExecError` を固定文言の `TraitError` へ写す。`unconfirmed` なら、起動したプロセスの消滅を確かめられ
+/// なかった事実を固定の接尾辞で足す(パス・errno・pid は載せない)。
+#[cfg(target_os = "linux")]
+fn launch_error(e: &ExecError, unconfirmed: bool) -> TraitError {
+    let mut error = to_trait_error(e);
+    if unconfirmed {
+        error = TraitError::new(e.code, format!("{}{UNCONFIRMED_SUFFIX}", error.message()));
+    }
+    error
+}
 /// `ExecError` を固定文言の `TraitError` へ写す(パス・errno・env の値を含めない。セキュリティ規約)。
 #[cfg(target_os = "linux")]
 fn to_trait_error(e: &ExecError) -> TraitError {
@@ -515,11 +851,9 @@ impl LaunchOps for RealOps {
 
     fn spawn(&self, input: SpawnInput<'_>) -> Result<Spawned, Box<PreparedLaunchFailure>> {
         let not_started = |e: ExecError| {
-            Box::new(PreparedLaunchFailure {
-                rejection: AuditedRejection::not_applicable(e),
-                unreaped: Vec::new(),
-                reap_error: None,
-            })
+            Box::new(PreparedLaunchFailure::clean(
+                AuditedRejection::not_applicable(e),
+            ))
         };
         // euid 0 の写像は計画の段階で拒否される(`HostRootIdentityMapping`。SEC-5)。
         let isolation_plan = plan(&input.isolation).map_err(not_started)?;
@@ -569,6 +903,10 @@ impl LaunchOps for RealOps {
             stderr,
         })
     }
+
+    fn rescan(&self, tag: &LaunchTag, reap_timeout: Duration) -> Rescan {
+        rescan_unreported_init(tag, &self.subreaper, reap_timeout)
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -577,7 +915,8 @@ mod tests {
     use crate::audit_log::AuditRecord;
     use crate::cgroups::CgroupJoin;
     use crate::oci_runtime::parse_config_bytes;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
     struct NullSink;
 
@@ -587,6 +926,38 @@ mod tests {
         }
     }
 
+    /// 失敗した spawn が返す、回収できなかった子の種類。
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Unreaped {
+        /// 無し(回収済み)。
+        None,
+        /// 存在しない pid(`kill_and_reap` が常に失敗する)。
+        Dead,
+        /// 実在する子(再回収で回収できる)。
+        Live,
+    }
+
+    /// 失敗する spawn の注入(`rescans` は返す再探索の識別子の個数)。
+    #[derive(Clone, Copy)]
+    struct FailSpawn {
+        code: ErrorCode,
+        unreaped: Unreaped,
+        rescans: usize,
+    }
+
+    /// 実在する子(`sleep`)のハンドル。pidfd を持ち、`kill_and_reap` で回収できる。
+    // 回収は返したハンドルの `kill_and_reap` / `terminate` が行う(std の `Child` は使わない)。
+    #[allow(clippy::zombie_processes)]
+    fn live_child() -> ContainerChild {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        std::mem::forget(child);
+        ContainerChild::from_pid_for_test(pid)
+    }
+
     /// 呼び出しの記録と注入ができる偽の実体。
     struct FakeOps {
         events: Arc<Mutex<Vec<String>>>,
@@ -594,7 +965,13 @@ mod tests {
         /// Landlock の検出を差し替える(`None` なら ABI 6 相当で成功)。
         abi: Option<u32>,
         spawn_calls: AtomicUsize,
-        fail_spawn: Option<(ErrorCode, bool)>,
+        fail_spawn: Option<FailSpawn>,
+        /// 成功する spawn が返す子を、pidfd の無い偽 pid にするか。
+        child_without_pidfd: bool,
+        /// 成功する spawn が返した子の pid(0 なら未起動)。
+        last_pid: Arc<AtomicU32>,
+        /// `rescan` が順に返す結果(尽きたら「残っていない」)。
+        rescan_results: Mutex<VecDeque<Rescan>>,
         /// ステージ列を偽のカーネル上で実行して証跡を記録するか(cgroup 参加の段を含む列は実行しない)。
         run_stages: bool,
     }
@@ -607,6 +984,9 @@ mod tests {
                 abi: None,
                 spawn_calls: AtomicUsize::new(0),
                 fail_spawn: None,
+                child_without_pidfd: false,
+                last_pid: Arc::new(AtomicU32::new(0)),
+                rescan_results: Mutex::new(VecDeque::new()),
                 run_stages: true,
             }
         }
@@ -643,29 +1023,47 @@ mod tests {
                 });
                 push(&self.events, format!("evidence {}", evidence.unwrap()));
             }
-            if let Some((code, with_child)) = self.fail_spawn {
+            if let Some(fail) = self.fail_spawn {
+                let unreaped = match fail.unreaped {
+                    Unreaped::None => Vec::new(),
+                    Unreaped::Dead => vec![ContainerChild::from_pid_for_test(2_000_001)],
+                    Unreaped::Live => vec![live_child()],
+                };
                 return Err(Box::new(PreparedLaunchFailure {
                     rejection: AuditedRejection::not_applicable(ExecError::new(
-                        code,
+                        fail.code,
                         IsolationStage::Spawn,
                         "/secret/path errno 13",
                     )),
-                    unreaped: with_child
-                        .then(|| ContainerChild::from_pid_for_test(2_000_001))
-                        .into_iter()
-                        .collect(),
-                    reap_error: with_child.then(|| {
+                    reap_error: (fail.unreaped != Unreaped::None).then(|| {
                         ExecError::new(ErrorCode::Timeout, IsolationStage::Wait, "reap failed")
                     }),
+                    unreaped,
+                    rescans: (0..fail.rescans).map(|_| LaunchTag::fresh()).collect(),
                 }));
             }
             let (stdout, _w1) = std::io::pipe().unwrap();
             let (stderr, _w2) = std::io::pipe().unwrap();
+            let child = if self.child_without_pidfd {
+                ContainerChild::from_pid_for_test(2_000_002)
+            } else {
+                live_child()
+            };
+            self.last_pid.store(child.pid(), Ordering::SeqCst);
             Ok(Spawned {
-                child: ContainerChild::from_pid_for_test(2_000_002),
+                child,
                 stdout,
                 stderr,
             })
+        }
+
+        fn rescan(&self, _tag: &LaunchTag, _reap_timeout: Duration) -> Rescan {
+            push(&self.events, "rescan");
+            self.rescan_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default()
         }
     }
 
@@ -737,9 +1135,12 @@ mod tests {
     fn core5_landlock_ruleset_is_always_in_the_pipeline_and_ordered() {
         let spec = spec_for("order", serde_json::json!({}));
         let ev = events();
-        let l = launcher(FakeOps::new(&ev), rootless(), None);
+        let ops = FakeOps::new(&ev);
+        let pid_of = Arc::clone(&ops.last_pid);
+        let l = launcher(ops, rootless(), None);
         let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
-        assert_eq!(p.pid().get(), 2_000_002);
+        assert_eq!(p.pid().get(), pid_of.load(Ordering::SeqCst));
+        p.terminate(Duration::from_secs(5)).expect("terminate");
         let log = ev.lock().unwrap().clone();
         assert_eq!(log.len(), 4, "{log:?}");
         assert_eq!(&log[..2], ["threads", "landlock"]);
@@ -825,8 +1226,14 @@ mod tests {
         let mut ops = FakeOps::new(&ev);
         ops.run_stages = false;
         let l = launcher(ops, rootless(), Some(source));
-        l.launch(&spec, Duration::from_secs(1)).expect("first");
-        l.launch(&spec, Duration::from_secs(1)).expect("second");
+        l.launch(&spec, Duration::from_secs(1))
+            .expect("first")
+            .terminate(Duration::from_secs(5))
+            .expect("terminate first");
+        l.launch(&spec, Duration::from_secs(1))
+            .expect("second")
+            .terminate(Duration::from_secs(5))
+            .expect("terminate second");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         let log = ev.lock().unwrap().clone();
         let spawns: Vec<_> = log.iter().filter(|e| e.starts_with("spawn")).collect();
@@ -887,64 +1294,266 @@ mod tests {
         assert_eq!(l.launch_mode(), LaunchMode::SelfBounded);
     }
 
-    /// セキュリティ規約: 失敗の文言は固定で、パス・errno を含めない。回収できなかった子は保持する。
-    #[test]
-    fn spawn_failure_message_is_fixed_and_unreaped_child_is_kept() {
-        let spec = spec_for("fail", serde_json::json!({}));
-        let ev = events();
-        let mut ops = FakeOps::new(&ev);
-        ops.fail_spawn = Some((ErrorCode::Timeout, true));
-        let l = launcher(ops, rootless(), None);
-        let err = l
-            .launch(&spec, Duration::from_secs(1))
-            .err()
-            .expect("failed");
-        assert_eq!(err.code(), ErrorCode::Timeout);
-        assert_eq!(
-            err.message(),
-            "container launch did not complete within the timeout"
-        );
-        let kept = l.take_unreaped();
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].child().pid(), 2_000_001);
-        assert_eq!(kept[0].reason(), ErrorCode::Timeout);
-        assert!(l.take_unreaped().is_empty());
-
-        let mut ops = FakeOps::new(&ev);
-        ops.fail_spawn = Some((ErrorCode::PermissionDenied, false));
-        let l = launcher(ops, rootless(), None);
-        let err = l
-            .launch(&spec, Duration::from_secs(1))
-            .err()
-            .expect("failed");
-        assert_eq!(err.code(), ErrorCode::PermissionDenied);
-        assert_eq!(err.message(), "container launch failed in the Spawn stage");
-        // 子を残していない失敗では、起動予約を保持させない。
-        assert!(!l.last_launch_may_have_left_process());
+    fn fail(code: ErrorCode, unreaped: Unreaped, rescans: usize) -> Option<FailSpawn> {
+        Some(FailSpawn {
+            code,
+            unreaped,
+            rescans,
+        })
     }
 
-    /// CORE-2: 回収できなかった子がある失敗は「子が残り得る」と start へ伝え、次の launch の入口で戻る。
+    fn launch_err(l: &ProductionLauncher, spec: &LaunchSpec) -> TraitError {
+        l.launch(spec, Duration::from_secs(1))
+            .err()
+            .expect("launch must fail")
+    }
+
+    const CLEAN_MESSAGE: &str = "container launch failed in the Spawn stage";
+
+    /// セキュリティ規約・CORE-2: 失敗の文言は固定で、パス・errno を含めない。子が残らない失敗には接尾辞を付けず、
+    /// 起動予約を保持させず、`confirm_no_process` が `Ok` になる(消滅を確かめ済み)。
     #[test]
-    fn core2_unreaped_child_marks_the_launch_as_possibly_leaving_a_process() {
+    fn core2_clean_failure_has_no_suffix_and_is_confirmed() {
+        let spec = spec_for("clean", serde_json::json!({}));
+        let ev = events();
+        let mut ops = FakeOps::new(&ev);
+        ops.fail_spawn = fail(ErrorCode::PermissionDenied, Unreaped::None, 0);
+        let l = launcher(ops, rootless(), None);
+        let err = launch_err(&l, &spec);
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
+        assert_eq!(err.message(), CLEAN_MESSAGE);
+        assert!(!l.last_launch_may_have_left_process());
+        l.confirm_no_process(spec.container_id(), Duration::from_secs(1))
+            .expect("clean");
+    }
+
+    /// CORE-2・REPAIR-5: 回収できなかった子がある失敗は、固定の接尾辞つきの文言で返り(`Timeout` はコードを保つ)、
+    /// start へ「子が残り得る」と伝える。`confirm_no_process` は確かめられない間 `Ok` にせず、再試行できる。
+    #[test]
+    fn core2_unreaped_child_is_reported_and_not_confirmed() {
         let spec = spec_for("leave", serde_json::json!({}));
         let ev = events();
         let mut ops = FakeOps::new(&ev);
-        ops.fail_spawn = Some((ErrorCode::Timeout, true));
+        ops.fail_spawn = fail(ErrorCode::Timeout, Unreaped::Dead, 0);
         let l = launcher(ops, rootless(), None);
         assert!(!l.last_launch_may_have_left_process());
-        l.launch(&spec, Duration::from_secs(1))
-            .err()
-            .expect("failed");
+        let err = launch_err(&l, &spec);
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert_eq!(
+            err.message(),
+            "container launch did not complete within the timeout; removal of the launched processes could not be confirmed"
+        );
         assert!(l.last_launch_may_have_left_process());
-        // 取り出しても印は残る(start は launch の直後に読む)。次の launch の入口で偽に戻る。
-        let _ = l.take_unreaped();
-        assert!(l.last_launch_may_have_left_process());
-        l.launch(&spec, Duration::from_secs(1))
-            .err()
-            .expect("failed");
+        // 確かめられない間は何度呼んでも `Ok` にならない(状態は `Pending` のまま)。
+        let started = Instant::now();
+        for _ in 0..2 {
+            let err = l
+                .confirm_no_process(spec.container_id(), Duration::from_millis(200))
+                .expect_err("cannot confirm");
+            assert_eq!(err.code(), ErrorCode::Internal);
+            assert_eq!(
+                err.message(),
+                "could not confirm that no launched process remains"
+            );
+        }
+        assert!(started.elapsed() < Duration::from_secs(5));
         assert!(l.last_launch_may_have_left_process());
     }
 
+    /// CORE-2・REPAIR-5: 実在する子を回収できなかった失敗は、`confirm_no_process` が期限内に kill・回収して `Ok` に
+    /// する。`Ok` の後は子が `/proc` に残らず、起動予約を保持させる印も戻る。
+    #[test]
+    fn core2_confirm_reaps_a_live_unreaped_child() {
+        let spec = spec_for("reap", serde_json::json!({}));
+        let ev = events();
+        let mut ops = FakeOps::new(&ev);
+        ops.fail_spawn = fail(ErrorCode::Internal, Unreaped::Live, 0);
+        let l = launcher(ops, rootless(), None);
+        let err = launch_err(&l, &spec);
+        assert!(err.message().ends_with(UNCONFIRMED_SUFFIX), "{err:?}");
+        let pid = match &l.inner.ledger().entries[0].1 {
+            LaunchRecord::Pending(p) => p.children[0].pid(),
+            other => panic!("unexpected record {other:?}"),
+        };
+        assert!(l.last_launch_may_have_left_process());
+        l.confirm_no_process(spec.container_id(), Duration::from_secs(5))
+            .expect("reaped");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the child {pid} must be reaped"
+        );
+        assert!(!l.last_launch_may_have_left_process());
+        // 確定済み(`Clean`)なので、もう一度呼んでも `Ok`。
+        l.confirm_no_process(spec.container_id(), Duration::from_secs(1))
+            .expect("still clean");
+    }
+
+    /// CORE-2: 報告前の PID 1 の再探索が要る失敗は、子を回収できても探索が済むまで `Ok` にならない。探索は子の回収が
+    /// 済んでから行い(回収できない間は呼ばない)、探索が未完了を返す間は `Pending` のまま、完了すれば `Ok`。
+    #[test]
+    fn core2_confirm_rescans_after_children_are_reaped() {
+        let spec = spec_for("rescan", serde_json::json!({}));
+        let ev = events();
+        let mut ops = FakeOps::new(&ev);
+        ops.fail_spawn = fail(ErrorCode::Timeout, Unreaped::Live, 1);
+        ops.rescan_results.lock().unwrap().push_back(Rescan {
+            unreaped: Vec::new(),
+            error: Some(ExecError::new(
+                ErrorCode::Internal,
+                IsolationStage::Wait,
+                "cannot scan",
+            )),
+            scan_incomplete: true,
+        });
+        let l = launcher(ops, rootless(), None);
+        launch_err(&l, &spec);
+        // 1 回目: 子は回収できるが、探索が未完了を返す。
+        let err = l
+            .confirm_no_process(spec.container_id(), Duration::from_secs(5))
+            .expect_err("scan incomplete");
+        assert_eq!(err.code(), ErrorCode::Internal);
+        // 2 回目: 子は回収済みで、探索が完了する。
+        l.confirm_no_process(spec.container_id(), Duration::from_secs(5))
+            .expect("rescanned");
+        assert_eq!(
+            ev.lock().unwrap().iter().filter(|e| *e == "rescan").count(),
+            2
+        );
+    }
+
+    /// CORE-2: 回収できない子が残る間は、再探索を呼ばない(中間プロセスを回収できないと PID 1 は C の子にならない)。
+    #[test]
+    fn core2_confirm_does_not_rescan_while_a_child_cannot_be_reaped() {
+        let spec = spec_for("norescan", serde_json::json!({}));
+        let ev = events();
+        let mut ops = FakeOps::new(&ev);
+        ops.fail_spawn = fail(ErrorCode::Timeout, Unreaped::Dead, 1);
+        let l = launcher(ops, rootless(), None);
+        launch_err(&l, &spec);
+        l.confirm_no_process(spec.container_id(), Duration::from_millis(200))
+            .expect_err("cannot reap");
+        assert!(!ev.lock().unwrap().iter().any(|e| e == "rescan"));
+    }
+
+    /// CORE-2・SEC-1: 台帳に無い ID(別プロセスで起動した残存を含む)と、ハンドルを渡し済みの ID は確証できないため、
+    /// `Ok` にせず `FailedPrecondition`(fail-closed)。
+    #[test]
+    fn core2_confirm_refuses_unknown_and_handed_ids() {
+        let spec = spec_for("handed", serde_json::json!({}));
+        let ev = events();
+        let l = launcher(FakeOps::new(&ev), rootless(), None);
+        let err = l
+            .confirm_no_process(spec.container_id(), Duration::from_secs(1))
+            .expect_err("unknown");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "the launcher has no launch record for this container; cannot confirm"
+        );
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let err = l
+            .confirm_no_process(spec.container_id(), Duration::from_secs(1))
+            .expect_err("handed");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "the launched process is owned by its handle holder; cannot confirm"
+        );
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// CORE-2: 確かめられていない起動が残る ID への再 launch は、spawn を呼ばずに拒否する(二重起動の防止)。
+    /// 子を回収できるようになれば(`Live`)再回収して通る。
+    #[test]
+    fn core2_relaunch_is_refused_while_the_previous_launch_is_unconfirmed() {
+        let spec = spec_for("relaunch", serde_json::json!({}));
+        let ev = events();
+        let mut ops = FakeOps::new(&ev);
+        ops.fail_spawn = fail(ErrorCode::Timeout, Unreaped::Dead, 0);
+        let l = launcher(ops, rootless(), None);
+        launch_err(&l, &spec);
+        let err = launch_err(&l, &spec);
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "a previous launch of this container is unconfirmed; removal of the launched processes could not be confirmed"
+        );
+        assert!(l.last_launch_may_have_left_process());
+        let spawns = ev
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.starts_with("spawn"))
+            .count();
+        assert_eq!(spawns, 1, "the second launch must not reach spawn");
+
+        let ev = events();
+        let mut ops = FakeOps::new(&ev);
+        ops.fail_spawn = fail(ErrorCode::Timeout, Unreaped::Live, 0);
+        let l = launcher(ops, rootless(), None);
+        launch_err(&l, &spec);
+        // 再回収できるので、2 回目は(同じ失敗の注入で)spawn まで進む。
+        launch_err(&l, &spec);
+        let spawns = ev
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.starts_with("spawn"))
+            .count();
+        assert_eq!(spawns, 2);
+        // 2 回目の失敗が積んだ子も回収する(試験が子を残さない)。
+        l.confirm_no_process(spec.container_id(), Duration::from_secs(5))
+            .expect("reaped");
+    }
+
+    /// SEC-1・CORE-1: pidfd の無い子は使わない。回収できなければ台帳に残して接尾辞つきで拒否し、pid 0 は
+    /// 触らずに拒否する(`kill(0)` は自プロセスグループへ届くため)。
+    #[test]
+    fn sec1_child_without_pidfd_is_refused_and_kept() {
+        let spec = spec_for("nopidfd", serde_json::json!({}));
+        let ev = events();
+        let mut ops = FakeOps::new(&ev);
+        ops.child_without_pidfd = true;
+        let l = launcher(ops, rootless(), None);
+        let err = launch_err(&l, &spec);
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "the launched process has no pidfd; removal of the launched processes could not be confirmed"
+        );
+        assert!(l.last_launch_may_have_left_process());
+        l.confirm_no_process(spec.container_id(), Duration::from_millis(200))
+            .expect_err("cannot confirm");
+    }
+
+    /// 台帳: 件数に上限があり、確定済みは古い順に捨て、`Pending` は捨てない。`Pending` だけで満杯なら新しい ID を
+    /// 拒否する。
+    #[test]
+    fn ledger_is_bounded_and_never_drops_pending() {
+        use crate::traits::ContainerId;
+        let id = |n: usize| ContainerId::new(format!("c{n}")).unwrap();
+        let mut ledger = Ledger::default();
+        for n in 0..LEDGER_MAX_ENTRIES {
+            ledger.set(&id(n), LaunchRecord::Clean);
+        }
+        assert_eq!(ledger.entries.len(), LEDGER_MAX_ENTRIES);
+        assert!(ledger.admit(&id(1000)).is_ok());
+        assert_eq!(ledger.entries.len(), LEDGER_MAX_ENTRIES - 1);
+        assert!(ledger.position(&id(0)).is_none(), "oldest is evicted first");
+
+        let mut ledger = Ledger::default();
+        for n in 0..LEDGER_MAX_ENTRIES {
+            ledger.set(&id(n), LaunchRecord::Pending(Pending::default()));
+        }
+        assert!(matches!(ledger.admit(&id(1000)), Err(AdmitError::Full)));
+        assert!(matches!(ledger.admit(&id(3)), Err(AdmitError::Pending(3))));
+        // `Pending` は満杯でも記録される(残存を見失わない)。
+        ledger.set(&id(1000), LaunchRecord::Pending(Pending::default()));
+        assert_eq!(ledger.entries.len(), LEDGER_MAX_ENTRIES + 1);
+        // 確定済みは満杯なら記録しない。
+        ledger.set(&id(2000), LaunchRecord::Clean);
+        assert!(ledger.position(&id(2000)).is_none());
+    }
     /// 構築: 必須値の欠落は `InvalidArgument`(固定文言)。
     #[test]
     fn builder_requires_privilege_and_audit_sink() {

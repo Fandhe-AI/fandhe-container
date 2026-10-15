@@ -46,8 +46,8 @@
 //!   I は fork の直前に起動ごとの識別子(`LaunchTag`)を `comm` へ設定し、PID 1 はそれを継承する。C は報告の
 //!   無い失敗で I を SIGKILL して回収した後(PID 1 は C へ再親付け済み)、`/proc` から「親が C で `comm` が
 //!   識別子と一致する」子を探して `kill_and_reap` する(`recover_unreported_init`)。I を回収できない場合は
-//!   再親付けが起きないため探索せず、I を `unreaped` で返す(呼び出し側が起動予約を保持する。`confirm_no_process`
-//!   は #1817 の範囲)。報告が `R`(失敗)の経路は PID 1 を作っていないため探索しない
+//!   再親付けが起きないため探索せず、I を `unreaped` で返し、探索できなかった識別子を `rescans` で返す(呼び出し側が
+//!   起動予約を保持し、`confirm_no_process` が I の回収後に `rescan_unreported_init` で再探索する。#1817)。報告が `R`(失敗)の経路は PID 1 を作っていないため探索しない
 //! - **開始ゲート(CORE-2)**: PID 1 は C が `K` の pid を受領して pidfd を開き、1 行の許可を書くまで exec に進まない
 //!   (exec で `comm` の識別子が失われると、報告前の PID 1 を特定できなくなるため)。C が許可せず閉じる・期限
 //!   ([`START_GATE_TIMEOUT`])切れの PID 1 は exec せずに終了する
@@ -293,7 +293,7 @@ fn report_read_error(e: PrePivotStatusError) -> ExecError {
 /// 報告前に失われた PID 1 を C が特定するための印で、同じプロセス内の起動ごとに異なる(カウンタ)。
 /// `execve` で `comm` は実行ファイル名に置き換わるため、起動に成功したコンテナとは衝突しない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct LaunchTag {
+pub(crate) struct LaunchTag {
     comm: [u8; 16],
     len: usize,
 }
@@ -302,7 +302,7 @@ static LAUNCH_TAG_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 impl LaunchTag {
     /// 新しい識別子(`fdh-l` + 8 桁の 16 進カウンタ = 13 バイト)。
-    pub(super) fn fresh() -> Self {
+    pub(crate) fn fresh() -> Self {
         let n = LAUNCH_TAG_COUNTER.fetch_add(1, Ordering::Relaxed);
         let text = format!("fdh-l{n:08x}");
         let mut comm = [0u8; 16];
@@ -530,11 +530,9 @@ fn launch_via_intermediate(
     tag: &LaunchTag,
 ) -> Result<ContainerChild, Box<PreparedLaunchFailure>> {
     let not_started = |e: ExecError| {
-        Box::new(PreparedLaunchFailure {
-            rejection: AuditedRejection::not_applicable(e),
-            unreaped: Vec::new(),
-            reap_error: None,
-        })
+        Box::new(PreparedLaunchFailure::clean(
+            AuditedRejection::not_applicable(e),
+        ))
     };
     let deadline = Instant::now() + timeout.min(TIMEOUT_MAX);
     let remaining = || deadline.saturating_duration_since(Instant::now());
@@ -593,6 +591,10 @@ fn launch_via_intermediate(
             // 中間プロセスが残るため、呼び出し側は起動予約を保持する)。
             if failure.unreaped.is_empty() {
                 recover_unreported_init(&mut failure, tag, subreaper);
+            } else {
+                // 探索しなかった(できなかった)ので、呼び出し側が中間プロセスの回収後に再探索できるよう識別子を返す
+                // (`confirm_no_process`。#1817)。
+                failure.rescans.push(*tag);
             }
             return Err(failure);
         }
@@ -631,6 +633,7 @@ fn launch_via_intermediate(
             )),
             unreaped,
             reap_error: Some(reap_error),
+            rescans: Vec::new(),
         }));
     }
 
@@ -638,17 +641,11 @@ fn launch_via_intermediate(
     match resolve_pre_pivot_status(status, audit) {
         Ok(()) => Ok(child),
         Err(rejection) => match child.kill_and_reap(KILL_REAP_TIMEOUT) {
-            Ok(_) => Err(Box::new(PreparedLaunchFailure {
-                rejection: *rejection,
-                unreaped: Vec::new(),
-                reap_error: None,
-            })),
+            Ok(_) => Err(Box::new(PreparedLaunchFailure::clean(*rejection))),
             // 回収失敗は握りつぶさず、子のハンドルごと呼び出し側へ返す(孤児化の防止。CORE-2)。
-            Err(reap_error) => Err(Box::new(PreparedLaunchFailure {
-                rejection: *rejection,
-                unreaped: vec![child],
-                reap_error: Some(reap_error),
-            })),
+            Err(reap_error) => Err(Box::new(PreparedLaunchFailure::with_unreaped(
+                *rejection, child, reap_error,
+            ))),
         },
     }
 }
@@ -660,34 +657,70 @@ fn parent_pid_of(stat: &str) -> Option<u32> {
     after.split_whitespace().nth(1)?.parse().ok()
 }
 
+/// 報告前の PID 1 の探索結果(`rescan_unreported_init`)。
+///
+/// `unreaped` は見つけたが回収できなかった子(`kill_and_reap` の失敗)、`error` は探索自体の失敗または最初の回収失敗。
+/// 両方とも空(`None`)のときだけ「報告前の PID 1 は残っていない」と言える(fail-closed。CORE-2)。
+#[derive(Debug, Default)]
+pub(crate) struct Rescan {
+    /// 回収できなかった子(ハンドルごと返す。孤児化させない)。
+    pub(crate) unreaped: Vec<ContainerChild>,
+    /// 最初の失敗の理由(探索の失敗を含む)。
+    pub(crate) error: Option<ExecError>,
+    /// 探索が途中で失敗し、見逃した候補があり得るか(`error` のうち、回収失敗でなく探索の失敗)。
+    pub(crate) scan_incomplete: bool,
+}
+
+impl Rescan {
+    /// 報告前の PID 1 が残っていないと確かめられたか(試験用)。
+    #[cfg(test)]
+    pub(crate) fn is_clean(&self) -> bool {
+        self.unreaped.is_empty() && self.error.is_none()
+    }
+}
+
 /// 報告前に失われた PID 1 を特定して kill・回収し、回収できなかったものを `failure.unreaped` へ足す(CORE-2)。
 ///
-/// 対象は「親が C 自身で、`comm` が `tag` と一致する」子だけ。`/proc` の読み取りに失敗しても起動失敗の理由は
-/// 変えない(列挙・読み取り・解析のどれかが失敗して候補を検査できなかった事実は、消滅を確認できた場合と区別するため
-/// `reap_error` に `Internal` を残す。fail-closed)。探索は失敗経路でのみ
-/// 走り、成功経路の負荷にならない。
+/// 探索の実体は [`rescan_unreported_init`]。探索自体が失敗した場合は、呼び出し側(launcher)が後で再探索できるよう
+/// `failure.rescans` に識別子を残す(`confirm_no_process`。#1817)。起動失敗の理由は変えない。
 fn recover_unreported_init(
     failure: &mut PreparedLaunchFailure,
     tag: &LaunchTag,
     subreaper: &ChildSubreaper,
 ) {
+    let found = rescan_unreported_init(tag, subreaper, KILL_REAP_TIMEOUT);
+    if found.scan_incomplete {
+        failure.rescans.push(*tag);
+    }
+    if failure.reap_error.is_none() {
+        failure.reap_error = found.error;
+    }
+    failure.unreaped.extend(found.unreaped);
+}
+
+/// 起動識別子 `tag` を `comm` に持つ、C の子(報告前に失われた PID 1)を `/proc` から探して kill・回収する(CORE-2)。
+///
+/// 対象は「親が C 自身で、`comm` が `tag` と完全一致する」子だけ。`/proc` の読み取りに失敗しても panic せず、
+/// 列挙・読み取り・解析のどれかが失敗して候補を検査できなかった事実は `error` に `Internal` で残す(消滅を確認できた
+/// 場合と区別する。fail-closed)。回収の待ちは見つけた子ごとに `reap_timeout` を上限とする(REPAIR-5)。探索は失敗
+/// 経路と `confirm_no_process` でのみ走り、成功経路の負荷にならない。
+///
+/// 前提: 中間プロセスを回収済みであること(未回収だと PID 1 は C へ再親付けされず見つからない)。
+pub(crate) fn rescan_unreported_init(
+    tag: &LaunchTag,
+    subreaper: &ChildSubreaper,
+    reap_timeout: Duration,
+) -> Rescan {
+    let mut out = Rescan::default();
     let me = std::process::id();
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        note_reap_failure(
-            failure,
-            ErrorCode::Internal,
-            "cannot scan /proc for the init",
-        );
-        return;
+        note_scan_failure(&mut out, "cannot scan /proc for the init");
+        return out;
     };
     for entry in entries {
         // 列挙の途中の失敗は、見逃した候補があり得るため残存なしとは言えない(fail-closed)。
         let Ok(entry) = entry else {
-            note_reap_failure(
-                failure,
-                ErrorCode::Internal,
-                "cannot enumerate /proc for the init",
-            );
+            note_scan_failure(&mut out, "cannot enumerate /proc for the init");
             continue;
         };
         let Some(pid) = entry
@@ -704,18 +737,16 @@ fn recover_unreported_init(
             // 探索中に消えた(= 回収済み)ので対象外。
             Ok(None) => continue,
             Err(_) => {
-                note_reap_failure(
-                    failure,
-                    ErrorCode::Internal,
+                note_scan_failure(
+                    &mut out,
                     "cannot read a /proc stat while scanning for the init",
                 );
                 continue;
             }
         };
         let Some(parent) = parent_pid_of(&stat) else {
-            note_reap_failure(
-                failure,
-                ErrorCode::Internal,
+            note_scan_failure(
+                &mut out,
                 "cannot parse a /proc stat while scanning for the init",
             );
             continue;
@@ -727,9 +758,8 @@ fn recover_unreported_init(
             Ok(Some(comm)) => comm,
             Ok(None) => continue,
             Err(_) => {
-                note_reap_failure(
-                    failure,
-                    ErrorCode::Internal,
+                note_scan_failure(
+                    &mut out,
                     "cannot read a /proc comm while scanning for the init",
                 );
                 continue;
@@ -738,14 +768,17 @@ fn recover_unreported_init(
         if comm.trim_end_matches('\n') != tag.name() {
             continue;
         }
+        // 親が C の未回収の子(subreaper が再親付けした)なので、回収まで pid は解放されず、pidfd が開けなくても
+        // `kill(2)` が別プロセスへ届くことはない。
         let child = ContainerChild::adopt_reparented(pid, subreaper);
-        if let Err(e) = child.kill_and_reap(KILL_REAP_TIMEOUT) {
-            if failure.reap_error.is_none() {
-                failure.reap_error = Some(e);
+        if let Err(e) = child.kill_and_reap(reap_timeout) {
+            if out.error.is_none() {
+                out.error = Some(e);
             }
-            failure.unreaped.push(child);
+            out.unreaped.push(child);
         }
     }
+    out
 }
 
 /// `/proc` のテキストを読む。対象が消えていれば `Ok(None)`(列挙から読むまでの間に終了した)、それ以外の失敗は
@@ -760,10 +793,15 @@ fn read_proc_text(path: &Path) -> std::io::Result<Option<String>> {
     }
 }
 
-/// 探索自体ができなかったことを `reap_error` に残す(未回収の子が無くても、呼び出し側が残存を疑えるようにする)。
-fn note_reap_failure(failure: &mut PreparedLaunchFailure, code: ErrorCode, what: &'static str) {
-    if failure.reap_error.is_none() {
-        failure.reap_error = Some(ExecError::new(code, IsolationStage::Wait, what));
+/// 探索自体ができなかったことを残す(未回収の子が無くても、呼び出し側が残存を疑えるようにする)。
+fn note_scan_failure(out: &mut Rescan, what: &'static str) {
+    out.scan_incomplete = true;
+    if out.error.is_none() {
+        out.error = Some(ExecError::new(
+            ErrorCode::Internal,
+            IsolationStage::Wait,
+            what,
+        ));
     }
 }
 
@@ -781,16 +819,14 @@ fn reap_intermediate_failure(
     error: ExecError,
 ) -> Box<PreparedLaunchFailure> {
     match reap_intermediate(&child) {
-        Ok(()) => Box::new(PreparedLaunchFailure {
-            rejection: AuditedRejection::not_applicable(error),
-            unreaped: Vec::new(),
-            reap_error: None,
-        }),
-        Err(reap_error) => Box::new(PreparedLaunchFailure {
-            rejection: AuditedRejection::not_applicable(error),
-            unreaped: vec![child],
-            reap_error: Some(reap_error),
-        }),
+        Ok(()) => Box::new(PreparedLaunchFailure::clean(
+            AuditedRejection::not_applicable(error),
+        )),
+        Err(reap_error) => Box::new(PreparedLaunchFailure::with_unreaped(
+            AuditedRejection::not_applicable(error),
+            child,
+            reap_error,
+        )),
     }
 }
 
@@ -800,17 +836,15 @@ fn kill_intermediate_failure(
     error: ExecError,
 ) -> Box<PreparedLaunchFailure> {
     match child.kill_and_reap(KILL_REAP_TIMEOUT) {
-        Ok(_) => Box::new(PreparedLaunchFailure {
-            rejection: AuditedRejection::not_applicable(error),
-            unreaped: Vec::new(),
-            reap_error: None,
-        }),
+        Ok(_) => Box::new(PreparedLaunchFailure::clean(
+            AuditedRejection::not_applicable(error),
+        )),
         // 回収失敗は握りつぶさず、ハンドルごと返す(孤児化の防止。CORE-2)。
-        Err(reap_error) => Box::new(PreparedLaunchFailure {
-            rejection: AuditedRejection::not_applicable(error),
-            unreaped: vec![child],
-            reap_error: Some(reap_error),
-        }),
+        Err(reap_error) => Box::new(PreparedLaunchFailure::with_unreaped(
+            AuditedRejection::not_applicable(error),
+            child,
+            reap_error,
+        )),
     }
 }
 
@@ -1048,6 +1082,8 @@ mod tests {
         IsolateFails,
         /// 中間プロセスが不正な行を書いて終了する。
         MalformedReport,
+        /// 中間プロセスが PID 1 の fork の失敗(`R <CODE> spawn`)を報告して終了する。
+        SpawnFails,
     }
 
     /// 代役の PID 1 を fork し、その pid をテストへ渡す(`pid_write`)。
@@ -1150,6 +1186,16 @@ mod tests {
                     Behavior::MalformedReport => {
                         let mut w = report;
                         let _ = w.write_all(b"K 0\n");
+                        return EXIT_SETUP_FAILED;
+                    }
+                    Behavior::SpawnFails => {
+                        send_report(
+                            report,
+                            &IntermediateReport::Failed {
+                                code: ErrorCode::Unavailable,
+                                phase: IntermediatePhase::Spawn,
+                            },
+                        );
                         return EXIT_SETUP_FAILED;
                     }
                 }
@@ -1261,6 +1307,53 @@ mod tests {
             gone(pid1),
             "the unreported init {pid1} must be killed and reaped"
         );
+    }
+
+    /// CORE-2(#1817): I が PID 1 の fork 失敗(`R ... spawn`)を報告して終了する経路では、子は残らず、探索の
+    /// 再実行も要らない(`rescans` は空)。I は回収済みで `/proc` に残らない。
+    #[test]
+    fn core2_via_intermediate_spawn_failure_report_leaves_nothing() {
+        let (result, sink, _) = run(Behavior::SpawnFails, Duration::from_secs(10));
+        let failure = result.expect_err("launch must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::Unavailable);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::Spawn);
+        assert!(failure.unreaped.is_empty());
+        assert!(failure.reap_error.is_none());
+        assert!(failure.rescans.is_empty());
+        assert!(sink.0.lock().unwrap().is_empty());
+    }
+
+    /// CORE-2・REPAIR-5(#1817): 識別子を `comm` に持つ C の子を、再探索が kill・回収する(`confirm_no_process` の
+    /// 再探索の実体)。見つけた子は回収済みで `/proc` に残らず、結果は「残っていない」(`is_clean`)。
+    #[test]
+    fn core2_rescan_finds_tagged_child_and_reaps_it() {
+        let subreaper = ChildSubreaper::enable().expect("subreaper");
+        let tag = LaunchTag::fresh();
+        let (mut ready_read, ready_write) = std::io::pipe().unwrap();
+        let ready_write = std::fs::File::from(std::os::fd::OwnedFd::from(ready_write));
+        let pid1 = sys::fork_single_threaded_with(
+            || true,
+            || {
+                if sys::set_process_comm(tag.comm_bytes()).is_err() {
+                    return EXIT_SETUP_FAILED;
+                }
+                let mut w = &ready_write;
+                let _ = w.write_all(b"R");
+                std::thread::sleep(Duration::from_secs(120));
+                0
+            },
+            EXIT_SETUP_FAILED,
+        )
+        .expect("fork the tagged child");
+        drop(ready_write);
+        let mut mark = [0u8; 1];
+        ready_read.read_exact(&mut mark).unwrap();
+        let found = rescan_unreported_init(&tag, &subreaper, Duration::from_secs(5));
+        assert!(found.is_clean(), "{found:?}");
+        assert!(!found.scan_incomplete);
+        assert!(gone(pid1), "the tagged child {pid1} must be reaped");
+        // 2 回目は何も見つからない(別の識別子の子や回収済みの子は対象外)。
+        assert!(rescan_unreported_init(&tag, &subreaper, Duration::from_secs(1)).is_clean());
     }
 
     /// CORE-2・REPAIR-5(#1816): I が許可前に報告なしで終了しても、PID 1 は gate_w を継承していないため、C の

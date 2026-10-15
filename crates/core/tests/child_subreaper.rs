@@ -35,7 +35,26 @@ mod linux {
     /// 各待ちの期限（REPAIR-5）。超過したら対象を kill して試験を失敗させる。
     const IO_DEADLINE: Duration = Duration::from_secs(30);
 
-    /// 期限付きの終了待ち。超過時は kill して回収し panic する。
+    /// kill 後の回収猶予（REPAIR-5）。SIGKILL は終了完了を保証しないため、回収待ちも有界にする。
+    const REAP_GRACE: Duration = Duration::from_secs(5);
+
+    /// kill して有限の猶予内に回収する。回収できなければ諦めて戻る（無期限の `wait` を使わない）。
+    fn kill_and_reap_bounded(child: &mut Child) {
+        let _ = child.kill();
+        let start = Instant::now();
+        while start.elapsed() < REAP_GRACE {
+            if let Ok(Some(_)) = child.try_wait() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        eprintln!(
+            "child {} could not be reaped within {REAP_GRACE:?}",
+            child.id()
+        );
+    }
+
+    /// 期限付きの終了待ち。超過時は kill して有界に回収し panic する。
     fn wait_deadline(child: &mut Child, what: &str) -> ExitStatus {
         let start = Instant::now();
         loop {
@@ -43,8 +62,7 @@ mod linux {
                 return status;
             }
             if start.elapsed() >= IO_DEADLINE {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_and_reap_bounded(child);
                 panic!("{what} did not exit within {IO_DEADLINE:?}");
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -123,10 +141,8 @@ mod linux {
         let line = match rx.recv_timeout(IO_DEADLINE) {
             Ok(res) => res.expect("read grandchild pid"),
             Err(_) => {
-                let _ = mid.kill();
-                let _ = mid.wait();
-                let _ = unrelated.kill();
-                let _ = unrelated.wait();
+                kill_and_reap_bounded(&mut mid);
+                kill_and_reap_bounded(&mut unrelated);
                 panic!("intermediate did not report grandchild pid within {IO_DEADLINE:?}");
             }
         };

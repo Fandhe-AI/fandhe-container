@@ -2,8 +2,9 @@
 //!
 //! `fandhe-container-plugin-cri`（TASK-108）が gRPC サーバーへ載せる `RuntimeService` 実装の本体。
 //! 本ファイルの時点で実装済みなのは `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・
-//! `PodSandboxStatus`・`ListPodSandbox` と、`CreateContainer`・`StartContainer`（TASK-58.1）で、
-//! 他の RPC は `Unimplemented` を返す（Stop/Remove/List/Status の Container 系は TASK-58.2・58.3）。
+//! `PodSandboxStatus`・`ListPodSandbox` と、`CreateContainer`・`StartContainer`（TASK-58.1）・
+//! `StopContainer`・`RemoveContainer`（TASK-58.2・#434）で、他の RPC は `Unimplemented` を返す
+//! （List/Status の Container 系は TASK-58.3）。
 //!
 //! **Create/Start の扱い（CRI-1・ERR-3・TASK-58.1）**: cri-api の `CreateContainerRequest` にクライアント指定の
 //! ID はなく、ID はサービスが採番する。proto は `(metadata.name, metadata.attempt)` を sandbox 内で一意と
@@ -25,7 +26,17 @@
 //! どちらも空の `pod_sandbox_id` は `INVALID_ARGUMENT`。既に停止済みの Stop は成功で状態は変わらない。
 //! Stop は枠（件数・保持量）を解放せず、Remove だけが解放する。ready のままの Remove は強制削除で、
 //! 配下のコンテナ記録も連鎖して除去する（プロセスの強制終了は TASK-59 で追加する。REPAIR-3）。
-//! Stop 時の配下コンテナの停止（Exited 遷移）は TASK-58.2（#434）で追加する。
+//! Stop 時は配下の running コンテナを exited へ遷移させる（TASK-58.2・#434。created は変えない）。
+//!
+//! **StopContainer/RemoveContainer の扱い（CRI-1・ERR-3・TASK-58.2・#434）**: `StopContainer` は空 ID と負の
+//! `timeout` を `INVALID_ARGUMENT`、未知 ID を `NOT_FOUND` にし、running を exited へ遷移させて
+//! `finished_at` を記録する。停止済み（exited）は冪等に成功し状態を変えない（proto コメント）。未起動
+//! （created）の Stop は前提違反として `FAILED_PRECONDITION`（ERR-3 の「`running` でないコンテナへの
+//! `StopContainer`」の読み分け。kubelet 運用で問題になれば実機確認の TASK-60 で見直す）。`timeout` は
+//! 猶予秒数で、スタブはプロセスを持たず待たないため検証だけして破棄する。`RemoveContainer` は空 ID を
+//! `INVALID_ARGUMENT`、未知 ID を成功（冪等。proto コメント）とし、どの状態でも記録・重複判定キー・保持量を
+//! 解放する（running の強制削除。プロセスの強制終了と、実待機の上限・REPAIR-5 のタイムアウトは TASK-59 で
+//! 追加する。REPAIR-3）。
 //!
 //! **スタブの明示（REPAIR-3）**: サンドボックスの状態はプロセス内メモリのレジストリにだけ持つ。
 //! 実行層（core）には未接続で、永続化もしない。TASK-59 で `StateStore` / `ContainerRuntime` へ置き換える
@@ -351,6 +362,7 @@ impl CriRuntimeService {
         if req.pod_sandbox_id.is_empty() {
             return Err(Status::invalid_argument("pod_sandbox_id is required"));
         }
+        let finished_at_nanos = now_nanos()?;
         let mut registry = self
             .registry
             .lock()
@@ -360,6 +372,13 @@ impl CriRuntimeService {
             .get_mut(&req.pod_sandbox_id)
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
         record.state = SandboxState::NotReady;
+        // 配下の running コンテナを exited にする（TASK-58.2。created・停止済みは変えない）。
+        for c in registry.containers.values_mut().filter(|c| {
+            c.pod_sandbox_id == req.pod_sandbox_id && c.state == ContainerState::Running
+        }) {
+            c.state = ContainerState::Exited;
+            c.finished_at_nanos = finished_at_nanos;
+        }
         Ok(v1::StopPodSandboxResponse {})
     }
 
@@ -480,6 +499,7 @@ impl CriRuntimeService {
                 state: ContainerState::Created,
                 created_at_nanos,
                 started_at_nanos: 0,
+                finished_at_nanos: 0,
                 retained_bytes,
             },
         );
@@ -526,6 +546,83 @@ impl CriRuntimeService {
             record.started_at_nanos = started_at_nanos;
         }
         Ok(v1::StartContainerResponse {})
+    }
+
+    /// `StopContainer` の本体。running を exited へ遷移させる（CRI-1・ERR-3・TASK-58.2）。
+    ///
+    /// 空 ID・負の `timeout` は `INVALID_ARGUMENT`、未知 ID は `NOT_FOUND`、created は
+    /// `FAILED_PRECONDITION`。exited は冪等に成功し状態を変えない。`timeout`（猶予秒数）はスタブが
+    /// 待たないため検証のみで破棄する（実待機は TASK-59 で上限と REPAIR-5 のタイムアウトつきで追加）。
+    /// プロセスは終了させない記録上の遷移（REPAIR-3）。件数・保持量の枠は解放しない。
+    fn stop_container_impl(
+        &self,
+        req: v1::StopContainerRequest,
+    ) -> Result<v1::StopContainerResponse, Status> {
+        if req.container_id.is_empty() {
+            return Err(Status::invalid_argument("container_id is required"));
+        }
+        if req.timeout < 0 {
+            return Err(Status::invalid_argument("timeout must not be negative"));
+        }
+        let finished_at_nanos = now_nanos()?;
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+        let record = registry
+            .containers
+            .get_mut(&req.container_id)
+            .ok_or_else(|| Status::not_found("container not found"))?;
+        match record.state {
+            ContainerState::Running => {
+                record.state = ContainerState::Exited;
+                record.finished_at_nanos = finished_at_nanos;
+                Ok(v1::StopContainerResponse {})
+            }
+            ContainerState::Exited => Ok(v1::StopContainerResponse {}),
+            ContainerState::Created => Err(Status::failed_precondition(
+                "container is not in running state",
+            )),
+        }
+    }
+
+    /// `RemoveContainer` の本体。記録・重複判定キー・保持量を解放する（CRI-1・TASK-58.2）。
+    ///
+    /// 未知 ID は成功（冪等）。どの状態でも除去する（running の強制削除。プロセスの強制終了は
+    /// TASK-59。REPAIR-3）。キーの復元や保持量の引き算が不整合なら、レジストリを変更せず `INTERNAL`。
+    fn remove_container_impl(
+        &self,
+        req: v1::RemoveContainerRequest,
+    ) -> Result<v1::RemoveContainerResponse, Status> {
+        if req.container_id.is_empty() {
+            return Err(Status::invalid_argument("container_id is required"));
+        }
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+        let Some(record) = registry.containers.get(&req.container_id) else {
+            return Ok(v1::RemoveContainerResponse {});
+        };
+        // 先に検証してから変更し、失敗時にレジストリを変更しない。
+        let inconsistent = || Status::internal("container registry is inconsistent");
+        let metadata = record.config.metadata.as_ref().ok_or_else(inconsistent)?;
+        let key = (
+            record.pod_sandbox_id.clone(),
+            metadata.name.clone(),
+            metadata.attempt,
+        );
+        let remaining = registry
+            .container_retained_bytes
+            .checked_sub(record.retained_bytes)
+            .ok_or_else(inconsistent)?;
+        if !registry.container_keys.contains(&key) {
+            return Err(inconsistent());
+        }
+        registry.containers.remove(&req.container_id);
+        registry.container_keys.remove(&key);
+        registry.container_retained_bytes = remaining;
+        Ok(v1::RemoveContainerResponse {})
     }
 
     /// `PodSandboxStatus` の本体。読み取り専用（CRI-1・ERR-3・TASK-57.3）。
@@ -843,17 +940,27 @@ impl RuntimeService for CriRuntimeService {
         timer.finish_with(&result);
         result.map(Response::new)
     }
+    /// コンテナを exited にする（停止済みは冪等・created は `FAILED_PRECONDITION`。
+    /// CRI-1・ERR-3・TASK-58.2）。
     async fn stop_container(
         &self,
-        _request: Request<v1::StopContainerRequest>,
+        request: Request<v1::StopContainerRequest>,
     ) -> Result<Response<v1::StopContainerResponse>, Status> {
-        Err(Status::unimplemented("stop_container"))
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::StopContainer);
+        let result = self.stop_container_impl(request.into_inner());
+        timer.finish_with(&result);
+        result.map(Response::new)
     }
+
+    /// コンテナの記録を除去する（未知 ID は冪等に成功。CRI-1・TASK-58.2）。
     async fn remove_container(
         &self,
-        _request: Request<v1::RemoveContainerRequest>,
+        request: Request<v1::RemoveContainerRequest>,
     ) -> Result<Response<v1::RemoveContainerResponse>, Status> {
-        Err(Status::unimplemented("remove_container"))
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::RemoveContainer);
+        let result = self.remove_container_impl(request.into_inner());
+        timer.finish_with(&result);
+        result.map(Response::new)
     }
     async fn list_containers(
         &self,
@@ -2053,5 +2160,244 @@ mod tests {
         let unique: HashSet<&&String> = ok.iter().collect();
         assert_eq!(unique.len(), 8);
         assert_eq!(svc.container_count(), 8);
+    }
+
+    fn stop_c(svc: &CriRuntimeService, id: &str, timeout: i64) -> Result<(), Status> {
+        block_on(svc.stop_container(Request::new(v1::StopContainerRequest {
+            container_id: id.into(),
+            timeout,
+        })))
+        .map(|_| ())
+    }
+
+    fn remove_c(svc: &CriRuntimeService, id: &str) -> Result<(), Status> {
+        block_on(
+            svc.remove_container(Request::new(v1::RemoveContainerRequest {
+                container_id: id.into(),
+            })),
+        )
+        .map(|_| ())
+    }
+
+    fn running(svc: &CriRuntimeService, sb: &str, name: &str) -> String {
+        let id = create(svc, sb, Some(container_config(name, 0))).unwrap();
+        start(svc, &id).unwrap();
+        id
+    }
+
+    /// CRI-1・TASK-58.2: running の Stop で exited になり finished_at が記録され、枠は解放されない。
+    #[test]
+    fn task_58_2_stop_running_becomes_exited() {
+        let svc = CriRuntimeService::new();
+        let sb = run_id(&svc);
+        let id = running(&svc, &sb, "c");
+        let (count, bytes) = (svc.container_count(), svc.container_retained_bytes());
+        stop_c(&svc, &id, 30).unwrap();
+        let reg = svc.registry.lock().unwrap();
+        let rec = reg.containers.get(&id).unwrap();
+        assert_eq!(rec.state, ContainerState::Exited);
+        assert_eq!(rec.state.to_proto() as i32, 2);
+        assert!(rec.finished_at_nanos >= rec.started_at_nanos);
+        drop(reg);
+        assert_eq!(
+            (svc.container_count(), svc.container_retained_bytes()),
+            (count, bytes)
+        );
+    }
+
+    /// CRI-1・TASK-58.2: 停止済みの Stop は成功し、状態も finished_at も変えない。timeout 0・最大値も通る。
+    #[test]
+    fn task_58_2_stop_is_idempotent_on_exited() {
+        let svc = CriRuntimeService::new();
+        let sb = run_id(&svc);
+        let id = running(&svc, &sb, "c");
+        stop_c(&svc, &id, 0).unwrap();
+        let first = svc.registry.lock().unwrap().containers[&id].finished_at_nanos;
+        stop_c(&svc, &id, i64::MAX).unwrap();
+        let reg = svc.registry.lock().unwrap();
+        assert_eq!(reg.containers[&id].state, ContainerState::Exited);
+        assert_eq!(reg.containers[&id].finished_at_nanos, first);
+    }
+
+    /// ERR-3・TASK-58.2（受け入れ条件）: created（running でない）の Stop は FAILED_PRECONDITION で状態不変。
+    #[test]
+    fn task_58_2_stop_created_is_failed_precondition() {
+        let svc = CriRuntimeService::new();
+        let sb = run_id(&svc);
+        let id = create(&svc, &sb, Some(container_config("c", 0))).unwrap();
+        let err = stop_c(&svc, &id, 0).unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(err.message(), "container is not in running state");
+        let reg = svc.registry.lock().unwrap();
+        assert_eq!(reg.containers[&id].state, ContainerState::Created);
+        assert_eq!(reg.containers[&id].finished_at_nanos, 0);
+    }
+
+    /// ERR-3・TASK-58.2: 空 ID・負の timeout は INVALID_ARGUMENT（状態不変）、未知 ID は NOT_FOUND。
+    #[test]
+    fn task_58_2_stop_error_codes() {
+        let svc = CriRuntimeService::new();
+        let sb = run_id(&svc);
+        let id = running(&svc, &sb, "c");
+        assert_eq!(
+            stop_c(&svc, "", 0).unwrap_err().code(),
+            Code::InvalidArgument
+        );
+        assert_eq!(
+            stop_c(&svc, &id, -1).unwrap_err().code(),
+            Code::InvalidArgument
+        );
+        assert_eq!(
+            svc.registry.lock().unwrap().containers[&id].state,
+            ContainerState::Running
+        );
+        let err = stop_c(&svc, &"0".repeat(64), 0).unwrap_err();
+        assert_eq!(err.code(), Code::NotFound);
+        assert!(!err.message().contains(&"0".repeat(64)));
+    }
+
+    /// CRI-1・TASK-58.2（受け入れ条件）: Remove は created / running / exited のいずれでも記録・キー・
+    /// 保持量を解放し、同じ (name, attempt) を再作成でき、他コンテナは変わらない。
+    #[test]
+    fn task_58_2_remove_releases_all_state() {
+        for kind in 0..3 {
+            let svc = CriRuntimeService::new();
+            let sb = run_id(&svc);
+            let other = create(&svc, &sb, Some(container_config("other", 0))).unwrap();
+            let other_bytes = svc.container_retained_bytes();
+            let id = match kind {
+                0 => create(&svc, &sb, Some(container_config("c", 0))).unwrap(),
+                1 => running(&svc, &sb, "c"),
+                _ => {
+                    let id = running(&svc, &sb, "c");
+                    stop_c(&svc, &id, 0).unwrap();
+                    id
+                }
+            };
+            remove_c(&svc, &id).unwrap();
+            let reg = svc.registry.lock().unwrap();
+            assert!(!reg.containers.contains_key(&id));
+            assert!(reg.containers.contains_key(&other));
+            assert_eq!(reg.container_keys.len(), 1);
+            assert_eq!(reg.container_retained_bytes, other_bytes);
+            drop(reg);
+            create(&svc, &sb, Some(container_config("c", 0))).unwrap();
+            assert_eq!(svc.container_count(), 2);
+        }
+    }
+
+    /// CRI-1・TASK-58.2: 空 ID は INVALID_ARGUMENT、未知 ID と 2 回目の Remove は成功。
+    #[test]
+    fn task_58_2_remove_is_idempotent_and_validates() {
+        let svc = CriRuntimeService::new();
+        let sb = run_id(&svc);
+        let id = create(&svc, &sb, Some(container_config("c", 0))).unwrap();
+        assert_eq!(
+            remove_c(&svc, "").unwrap_err().code(),
+            Code::InvalidArgument
+        );
+        remove_c(&svc, &"0".repeat(64)).unwrap();
+        remove_c(&svc, &id).unwrap();
+        remove_c(&svc, &id).unwrap();
+        assert_eq!(
+            (svc.container_count(), svc.container_retained_bytes()),
+            (0, 0)
+        );
+    }
+
+    /// TASK-58.2: 保持量が記録より小さい不整合では INTERNAL で失敗し、レジストリを変更しない。
+    #[test]
+    fn task_58_2_remove_inconsistent_registry_fails_without_change() {
+        let svc = CriRuntimeService::new();
+        let sb = run_id(&svc);
+        let id = create(&svc, &sb, Some(container_config("c", 0))).unwrap();
+        svc.registry.lock().unwrap().container_retained_bytes = 1;
+        let err = remove_c(&svc, &id).unwrap_err();
+        assert_eq!(err.code(), Code::Internal);
+        let reg = svc.registry.lock().unwrap();
+        assert_eq!(reg.containers.len(), 1);
+        assert_eq!(reg.container_keys.len(), 1);
+        assert_eq!(reg.container_retained_bytes, 1);
+    }
+
+    /// CRI-1・TASK-58.2: StopPodSandbox は配下の running を exited にし、created は変えない。再実行で
+    /// finished_at は変わらない。
+    #[test]
+    fn task_58_2_stop_sandbox_stops_running_containers() {
+        let svc = CriRuntimeService::new();
+        let sb = run_id(&svc);
+        let r = running(&svc, &sb, "r");
+        let c = create(&svc, &sb, Some(container_config("c", 0))).unwrap();
+        stop(&svc, &sb).unwrap();
+        let first = {
+            let reg = svc.registry.lock().unwrap();
+            assert_eq!(reg.containers[&r].state, ContainerState::Exited);
+            assert!(reg.containers[&r].finished_at_nanos > 0);
+            assert_eq!(reg.containers[&c].state, ContainerState::Created);
+            reg.containers[&r].finished_at_nanos
+        };
+        stop(&svc, &sb).unwrap();
+        assert_eq!(
+            svc.registry.lock().unwrap().containers[&r].finished_at_nanos,
+            first
+        );
+    }
+
+    /// REPAIR-4・TASK-58.2: Stop・Remove の全終了経路が 1 件ずつ記録され、ID を含まない。
+    #[test]
+    fn task_58_2_outcomes_are_recorded_without_content() {
+        let collect = Arc::new(Collect::default());
+        let svc = CriRuntimeService::with_recorder(collect.clone());
+        let sb = run_id(&svc);
+        let id = running(&svc, &sb, "c");
+        stop_c(&svc, &id, 0).unwrap();
+        stop_c(&svc, "", 0).unwrap_err();
+        remove_c(&svc, &id).unwrap();
+        remove_c(&svc, "").unwrap_err();
+        let samples = collect.items();
+        let tail: Vec<(&str, CriOpOutcome, Code)> = samples[samples.len() - 4..]
+            .iter()
+            .map(|s| (s.kind().as_str(), s.outcome(), s.code()))
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                ("cri.stop_container", CriOpOutcome::Success, Code::Ok),
+                (
+                    "cri.stop_container",
+                    CriOpOutcome::Failure,
+                    Code::InvalidArgument
+                ),
+                ("cri.remove_container", CriOpOutcome::Success, Code::Ok),
+                (
+                    "cri.remove_container",
+                    CriOpOutcome::Failure,
+                    Code::InvalidArgument
+                ),
+            ]
+        );
+        assert!(!format!("{samples:?}{svc:?}").contains(&id));
+    }
+
+    /// TASK-58.2: 同じコンテナへの並行 Stop は全て成功し、遷移は 1 回だけ。
+    #[test]
+    fn task_58_2_concurrent_stop_transitions_once() {
+        let svc = CriRuntimeService::new();
+        let sb = run_id(&svc);
+        let id = running(&svc, &sb, "c");
+        let results: Vec<Result<(), Status>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let (svc, id) = (&svc, &id);
+                    scope.spawn(move || stop_c(svc, id, 0))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(
+            svc.registry.lock().unwrap().containers[&id].state,
+            ContainerState::Exited
+        );
     }
 }

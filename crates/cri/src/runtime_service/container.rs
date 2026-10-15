@@ -6,8 +6,9 @@
 //! 有限の上限を課す。`envs` に秘密値が入り得るため、エラー文言・計装へ `config` の内容を出さない。
 //!
 //! **スタブの明示（REPAIR-3）**: 状態はプロセス内メモリにあるだけで、実行層（core）には未接続。
-//! `Running` は記録上の状態で、プロセスは起動しない。TASK-59（CRI-2）で `ContainerRuntime`
-//! 経由の namespace 分離起動と `StateStore` へ置き換える。`Exited` への遷移は TASK-58.2（#434）が追加する。
+//! `Running` は記録上の状態で、プロセスは起動しない。StopContainer / RemoveContainer（TASK-58.2・#434）も
+//! 記録上の遷移と除去だけで、プロセスの終了・猶予待ちは行わない。TASK-59（CRI-2）で `ContainerRuntime`
+//! 経由の namespace 分離起動・終了と `StateStore` へ置き換える。
 //! `command`・`mounts`・`log_path` 等のパス類は保持するだけで検証していない（ホストへ触れる TASK-59 で検証する）。
 
 use prost::Message;
@@ -87,11 +88,12 @@ impl ContainerLimits {
 
 /// コンテナの内部状態（CRI の `ContainerState` に対応）。
 ///
-/// `Exited`（停止済み）は StopContainer（TASK-58.2・#434）が追加する。
+/// `Exited`（停止済み）は StopContainer（TASK-58.2・#434）で `Running` から遷移する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ContainerState {
     Created,
     Running,
+    Exited,
 }
 
 impl ContainerState {
@@ -101,6 +103,7 @@ impl ContainerState {
         match self {
             Self::Created => ProtoContainerState::ContainerCreated,
             Self::Running => ProtoContainerState::ContainerRunning,
+            Self::Exited => ProtoContainerState::ContainerExited,
         }
     }
 }
@@ -119,6 +122,9 @@ pub(super) struct ContainerRecord {
     pub(super) created_at_nanos: i64,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) started_at_nanos: i64,
+    /// 停止（`Exited` 遷移）の時刻。未停止は 0（TASK-58.2。ContainerStatus〔TASK-58.3〕が応答に使う）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) finished_at_nanos: i64,
     pub(super) retained_bytes: usize,
 }
 
@@ -662,6 +668,7 @@ mod tests {
     fn task_58_1_state_proto_values() {
         assert_eq!(ContainerState::Created.to_proto() as i32, 0);
         assert_eq!(ContainerState::Running.to_proto() as i32, 1);
+        assert_eq!(ContainerState::Exited.to_proto() as i32, 2);
     }
 
     /// 作り直しは内容を変えない（labels・annotations 無改変）。

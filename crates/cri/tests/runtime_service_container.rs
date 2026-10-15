@@ -1,5 +1,5 @@
-//! `CriRuntimeService` の `CreateContainer`・`StartContainer` を公開 API だけで検証する結合試験
-//! （TASK-58.1・#433・CRI-1・ERR-3・REPAIR-4）。
+//! `CriRuntimeService` の `CreateContainer`・`StartContainer`・`StopContainer`・`RemoveContainer` を
+//! 公開 API だけで検証する結合試験（TASK-58.1・58.2・#433・#434・CRI-1・ERR-3・REPAIR-4）。
 //!
 //! plugin-cri（TASK-108）と同じ外部利用者の立場で、生成された `RuntimeService` トレイト経由で呼ぶ。
 //! 状態（running）の直接照合は、公開 API に `ContainerStatus`（TASK-58.3・#435）が無いため
@@ -183,6 +183,110 @@ fn task_58_1_operations_are_recorded() {
             ("cri.create_container", "failure", "ALREADY_EXISTS"),
             ("cri.start_container", "success", "OK"),
             ("cri.start_container", "failure", "FAILED_PRECONDITION"),
+        ]
+    );
+}
+fn stop(service: &CriRuntimeService, id: &str, timeout: i64) -> Result<(), Status> {
+    block_on(RuntimeService::stop_container(
+        service,
+        Request::new(v1::StopContainerRequest {
+            container_id: id.into(),
+            timeout,
+        }),
+    ))
+    .map(|_| ())
+}
+
+fn remove(service: &CriRuntimeService, id: &str) -> Result<(), Status> {
+    block_on(RuntimeService::remove_container(
+        service,
+        Request::new(v1::RemoveContainerRequest {
+            container_id: id.into(),
+        }),
+    ))
+    .map(|_| ())
+}
+
+/// CRI-1・TASK-58.2: `run → create → start → stop → remove` の中核フロー。Stop 後の Start は前提違反、
+/// Remove 後の Stop・Start は NOT_FOUND、Remove の再実行は冪等に成功する。
+#[test]
+fn task_58_2_stop_remove_core_flow() {
+    let service = CriRuntimeService::new();
+    let sandbox = run_sandbox(&service);
+    let id = create(&service, &sandbox, Some(container("c"))).expect("create");
+    start(&service, &id).expect("start");
+    stop(&service, &id, 10).expect("stop");
+    stop(&service, &id, 0).expect("stop is idempotent");
+    assert_eq!(
+        start(&service, &id).expect_err("start after stop").code(),
+        Code::FailedPrecondition
+    );
+    remove(&service, &id).expect("remove");
+    remove(&service, &id).expect("remove is idempotent");
+    assert_eq!(
+        stop(&service, &id, 0).expect_err("stop removed").code(),
+        Code::NotFound
+    );
+    assert_eq!(
+        start(&service, &id).expect_err("start removed").code(),
+        Code::NotFound
+    );
+    // 除去後は同じ (name, attempt) を再作成できる。
+    create(&service, &sandbox, Some(container("c"))).expect("recreate");
+}
+
+/// ERR-3・TASK-58.2: エラーコードの対応（空 ID・負の timeout は INVALID_ARGUMENT、未知 ID の Stop は
+/// NOT_FOUND・Remove は成功、created の Stop は FAILED_PRECONDITION）。
+#[test]
+fn task_58_2_error_code_mapping() {
+    let service = CriRuntimeService::new();
+    let sandbox = run_sandbox(&service);
+    let id = create(&service, &sandbox, Some(container("c"))).expect("create");
+    assert_eq!(
+        stop(&service, "", 0).expect_err("empty id").code(),
+        Code::InvalidArgument
+    );
+    assert_eq!(
+        stop(&service, &id, -1).expect_err("negative").code(),
+        Code::InvalidArgument
+    );
+    assert_eq!(
+        stop(&service, &"0".repeat(64), 0)
+            .expect_err("unknown")
+            .code(),
+        Code::NotFound
+    );
+    assert_eq!(
+        stop(&service, &id, 0).expect_err("created").code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(
+        remove(&service, "").expect_err("empty id").code(),
+        Code::InvalidArgument
+    );
+    remove(&service, &"0".repeat(64)).expect("unknown remove is ok");
+}
+
+/// REPAIR-4・TASK-58.2: Stop・Remove の操作名・結果・コード名が記録先へ渡る。
+#[test]
+fn task_58_2_operations_are_recorded() {
+    let collect = Arc::new(Collect::default());
+    let service = CriRuntimeService::with_recorder(collect.clone());
+    let sandbox = run_sandbox(&service);
+    let id = create(&service, &sandbox, Some(container("c"))).expect("create");
+    stop(&service, &id, 0).expect_err("created");
+    start(&service, &id).expect("start");
+    stop(&service, &id, 0).expect("stop");
+    remove(&service, &id).expect("remove");
+    remove(&service, "").expect_err("empty");
+    assert_eq!(
+        collect.lines()[2..],
+        [
+            ("cri.stop_container", "failure", "FAILED_PRECONDITION"),
+            ("cri.start_container", "success", "OK"),
+            ("cri.stop_container", "success", "OK"),
+            ("cri.remove_container", "success", "OK"),
+            ("cri.remove_container", "failure", "INVALID_ARGUMENT"),
         ]
     );
 }

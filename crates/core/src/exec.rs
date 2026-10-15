@@ -111,8 +111,6 @@ mod exec_command;
 mod inject;
 mod interpreter;
 mod landlock;
-// 本番 launcher（Phase B）が `spawn_container_prepared` を呼ぶまで crate 内の呼び出し元が無い（REPAIR-3。#1815）。
-#[allow(dead_code)]
 mod launch_status;
 mod no_new_privs;
 mod process;

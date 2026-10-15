@@ -2535,6 +2535,12 @@ pub(crate) fn current_thread_count() -> Option<u64> {
         .and_then(|status| status_thread_count(&status))
 }
 
+/// 自プロセスのスレッド数が 1 かを `/proc/self/status` で判定する（読めなければ `false`。fail-closed）。
+/// [`fork_single_threaded`] と同じ判定を、注入つきの [`fork_single_threaded_with`] の呼び出し側へ公開する。
+pub(crate) fn self_is_single_threaded() -> bool {
+    std::fs::read_to_string("/proc/self/status").is_ok_and(|status| threads_is_one(&status))
+}
+
 /// `child` をシングルスレッドの呼び出し元から `fork(2)` した子で実行し、親には子の PID を返す。
 ///
 /// `crate::exec::spawn_container`（CORE-1・TASK-27.4.1）が使う。fork の健全性条件を呼び出し側の

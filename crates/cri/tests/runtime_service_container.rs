@@ -1,9 +1,8 @@
 //! `CriRuntimeService` の `CreateContainer`・`StartContainer`・`StopContainer`・`RemoveContainer` を
-//! 公開 API だけで検証する結合試験（TASK-58.1・58.2・#433・#434・CRI-1・ERR-3・REPAIR-4）。
+//! 公開 API だけで検証する結合試験（TASK-58.1・58.2・58.3・#433・#434・#435・CRI-1・ERR-3・REPAIR-4）。
 //!
 //! plugin-cri（TASK-108）と同じ外部利用者の立場で、生成された `RuntimeService` トレイト経由で呼ぶ。
-//! 状態（running）の直接照合は、公開 API に `ContainerStatus`（TASK-58.3・#435）が無いため
-//! `src/runtime_service.rs` のユニットテストが担い、ここでは二重 Start の失敗で間接的に確かめる。
+//! 状態は `ContainerStatus`・`ListContainers`（TASK-58.3・#435）で直接照合する。
 
 use std::future::Future;
 use std::pin::pin;
@@ -289,4 +288,66 @@ fn task_58_2_operations_are_recorded() {
             ("cri.remove_container", "failure", "INVALID_ARGUMENT"),
         ]
     );
+}
+
+fn list(service: &CriRuntimeService) -> Vec<v1::Container> {
+    block_on(RuntimeService::list_containers(
+        service,
+        Request::new(v1::ListContainersRequest::default()),
+    ))
+    .expect("list")
+    .into_inner()
+    .containers
+}
+
+fn status(service: &CriRuntimeService, id: &str) -> Result<v1::ContainerStatus, Status> {
+    block_on(RuntimeService::container_status(
+        service,
+        Request::new(v1::ContainerStatusRequest {
+            container_id: id.into(),
+            verbose: false,
+        }),
+    ))
+    .map(|r| r.into_inner().status.expect("status"))
+}
+
+/// CRI-1・TASK-58.3: Create → List → Start → Status → Stop → Status → Remove → List の流れで、
+/// 一覧と状態が各操作と整合し、結果が REPAIR-4 の計測に残る。
+#[test]
+fn task_58_3_list_and_status_follow_lifecycle() {
+    let collect = Arc::new(Collect::default());
+    let service = CriRuntimeService::with_recorder(collect.clone());
+    let sandbox = run_sandbox(&service);
+    let id = create(&service, &sandbox, Some(container("c"))).expect("create");
+    let listed = list(&service);
+    assert_eq!(listed.len(), 1);
+    assert_eq!((listed[0].id.as_str(), listed[0].state), (id.as_str(), 0));
+    assert_eq!(status(&service, &id).expect("status").state, 0);
+    start(&service, &id).expect("start");
+    assert_eq!(status(&service, &id).expect("status").state, 1);
+    assert_eq!(list(&service)[0].state, 1);
+    block_on(RuntimeService::stop_container(
+        &service,
+        Request::new(v1::StopContainerRequest {
+            container_id: id.clone(),
+            timeout: 0,
+        }),
+    ))
+    .expect("stop");
+    assert_eq!(status(&service, &id).expect("status").state, 2);
+    block_on(RuntimeService::remove_container(
+        &service,
+        Request::new(v1::RemoveContainerRequest {
+            container_id: id.clone(),
+        }),
+    ))
+    .expect("remove");
+    assert!(list(&service).is_empty());
+    assert_eq!(
+        status(&service, &id).expect_err("removed").code(),
+        Code::NotFound
+    );
+    let lines = collect.lines();
+    assert!(lines.contains(&("cri.list_containers", "success", "OK")));
+    assert!(lines.contains(&("cri.container_status", "failure", "NOT_FOUND")));
 }

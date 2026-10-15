@@ -1323,7 +1323,19 @@ impl Extractor<'_> {
                         self.reset_traversed_dir(&child, id)?;
                     }
                 }
-                _ => {
+                found => {
+                    // 下位由来の symlink は `remove_whiteout_target` と同じ履歴検査・登録を行い、
+                    // opaque / 祖先 whiteout の前後で結果が変わらないようにする（OCI-2）。
+                    let m = fs::symlink_metadata(&child).map_err(|e| map_fs_err(&e))?;
+                    if m.file_type().is_symlink() {
+                        if found.is_some_and(|id| self.names.traversed_links.contains(&id)) {
+                            return Err(err(
+                                OciErrorCode::InvalidArgument,
+                                "entry path depends on the order of a symlink whiteout in the same layer",
+                            ));
+                        }
+                        self.names.link_tombstones.insert((dir_id, name.clone()));
+                    }
                     crate::whiteout::remove_tree_nofollow(&child)?;
                     self.drop_deferred_subtree(&child);
                     self.names.forget_tree(dir_id, &name);
@@ -3763,6 +3775,22 @@ mod tests {
         for entries in [
             vec![file("lnk/new", 0o644, b"x"), wh(".wh.lnk")],
             vec![wh(".wh.lnk"), file("lnk/new", 0o644, b"x")],
+        ] {
+            let sb = Sandbox::new();
+            let mut ex = ex_for(&sb, host_lstat);
+            lay(&mut ex, &[dir("real", 0o755), symlink("lnk", "real")]);
+            let c = lay_err(&mut ex, &entries);
+            assert_eq!(c, OciErrorCode::InvalidArgument);
+        }
+    }
+
+    /// OCI-2: 下位の symlink を経由するエントリと、不透明マーカーによるその symlink の削除の併用は
+    /// 並び順に依らず拒否する（`prune_lower` も `remove_whiteout_target` と同じ履歴検査・登録を行う）。
+    #[test]
+    fn oci2_pipeline_symlink_opaque_with_traversal_is_rejected_in_both_orders() {
+        for entries in [
+            vec![file("lnk/new", 0o644, b"x"), wh(".wh..wh..opq")],
+            vec![wh(".wh..wh..opq"), file("lnk/new", 0o644, b"x")],
         ] {
             let sb = Sandbox::new();
             let mut ex = ex_for(&sb, host_lstat);

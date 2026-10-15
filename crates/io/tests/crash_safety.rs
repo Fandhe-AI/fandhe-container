@@ -7,13 +7,25 @@
 //! 判定ロジックは OS 非依存の `trial` に置き 3 OS でユニットテストする。
 //!
 //! #95（TASK-18.2）で、kill 後に `data.bin` を読んで seq 0..n と照合する損失計測と、
-//! 2 つの対照ケースを追加した。
+//! 対照ケースを追加した。#1832 で未フラッシュ対照を作り直した（下記）。
 //! - フラッシュ済み（`io3_flushed_data_survives_10_valid_sigkills`）: 有効 10/10 で損失 0 を検証する。
 //!   保証範囲は「プロセス強制終了（SIGKILL）後に、FLUSH ACK 済みデータが OS 経由の再読込で
 //!   欠落・重複なく見えること」に限る。再読込はページキャッシュ経由のため、電源断・カーネル
 //!   クラッシュ後の媒体上の永続化（IO-2 の fsync 等価の保証）はこの試験では検証しない。
-//! - 未フラッシュ対照（`io3_unflushed_control_records_loss_without_asserting`）: 損失件数は
-//!   記録するだけで、件数ではテストを失敗させない。
+//! - 未フラッシュ対照（#1832）: 製品の `AppendFileSink` は通常 ACK を `write()` 後に返し、
+//!   SIGKILL ではページキャッシュが残るため、未フラッシュでも損失 0 で対照にならない。
+//!   そこで `persist` まで書き込みをメモリに保持する試験専用 sink（`crash_test_server --sink
+//!   deferred`。製品コードには入らない）を相手役にし、2 ケースの対を作る。
+//!   `io3_deferred_sink_unflushed_loses_all_acked_data_in_10_valid_sigkills` は通常 ACK 30 件の
+//!   直後に kill して全件欠落（損失 300）を、`io3_deferred_sink_flushed_keeps_all_data_in_10_valid_sigkills`
+//!   は FLUSH ACK の直後に kill して損失 0 を検証する。示せる範囲は「FLUSH ACK が `persist` 成功の
+//!   後にだけ返ること」と「計測が損失を検出できること」までで、媒体への永続化（IO-2）は対象外。
+//!
+//! 件数の可視化（#1833）: 環境変数 `FANDHE_CONTAINER_CRASH_SUMMARY_DIR` に既存の実ディレクトリを
+//! 渡すと、各ケースの `crash_summary` 行を `<dir>/<case>.json` へ排他作成（0600）で書く
+//! （未設定なら書かない。空・symlink・不在は失敗）。CI の `platform-ci` はこれを
+//! `scripts/check-crash-summary.sh`（`make crash-summary-check`）で検証し `GITHUB_STEP_SUMMARY` に表を出す。
+//! 同じディレクトリでの再実行は排他作成のため失敗するので、毎回新規ディレクトリを使う。
 //!
 //! CI 回帰への組み込みは実装済み（#827）: `platform-ci`（PR は ubuntu・main は 3 OS）と `rust-ci`（`--all-features`）で
 //! 実行し、実機前提テストとしては分離しない。`platform-ci` は存在確認ステップで無言除外を検出する。
@@ -49,6 +61,24 @@ mod unix {
         TrialLedger, TrialObservation, TrialSummary, TrialVerdict, check_disk_records,
         classify_trial, loss_summary, run_until_valid,
     };
+
+    /// テストが起動するサーバーの書き込み先 sink（`crash_test_server` の `--sink`）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SinkChoice {
+        /// 製品の `AppendFileSink`（通常 ACK は `write()` 後に返る。既定）。
+        Product,
+        /// 試験専用の `DeferredPersistSink`（`persist` までファイルへ書かない。#1832）。
+        Deferred,
+    }
+
+    impl SinkChoice {
+        fn arg(self) -> &'static str {
+            match self {
+                Self::Product => "append-file",
+                Self::Deferred => "deferred",
+            }
+        }
+    }
 
     const READY_WAIT: Duration = Duration::from_secs(10);
     const EXIT_WAIT: Duration = Duration::from_secs(15);
@@ -91,8 +121,9 @@ mod unix {
 
     /// `batch_size` を `Some` にすると `--batch-size` を渡す（通常 ACK はバッチ書き込み後に返るため、
     /// 「n 件の Write に n 件の ACK が返る」試行では n をバッチサイズに合わせる）。
-    fn spawn_server(dir: &TempDir, batch_size: Option<u64>) -> ChildGuard {
+    fn spawn_server(dir: &TempDir, batch_size: Option<u64>, sink: SinkChoice) -> ChildGuard {
         let mut command = Command::new(env!("CARGO_BIN_EXE_crash_test_server"));
+        command.arg("--sink").arg(sink.arg());
         if let Some(n) = batch_size {
             command.arg("--batch-size").arg(n.to_string());
         }
@@ -141,7 +172,7 @@ mod unix {
     #[test]
     fn io3_crash_test_server_spawns_and_accepts() {
         let dir = TempDir::new("ok");
-        let mut child = spawn_server(&dir, None);
+        let mut child = spawn_server(&dir, None, SinkChoice::Product);
         wait_ready(&mut child);
         // 接続直後に閉じると、サーバーが accept する前に切断が listen キューへ届く競合が
         // 起こり得る。accept を済ませて recv 待ちに入る猶予を与えてから閉じる。
@@ -168,7 +199,7 @@ mod unix {
     #[test]
     fn io3_crash_test_server_can_be_sigkilled() {
         let dir = TempDir::new("kill");
-        let mut child = spawn_server(&dir, None);
+        let mut child = spawn_server(&dir, None, SinkChoice::Product);
         wait_ready(&mut child);
         child.0.kill().expect("kill (SIGKILL) must succeed");
         let status = wait_exit(&mut child);
@@ -358,7 +389,7 @@ mod unix {
 
     /// 1 試行を実行して観測値を返す（判定は [`classify_trial`] が行う）。
     /// 試行ごとに新しいパスを使う（SIGKILL 後はソケットが残るため。`crash_test_server` の doc 参照）。
-    fn run_trial(index: usize, kill_point: KillPoint) -> TrialObservation {
+    fn run_trial(index: usize, kill_point: KillPoint, sink: SinkChoice) -> TrialObservation {
         let (ack_target, flush_required, batch_size) = match kill_point {
             KillPoint::AfterWriteAcks(n) => (n, false, Some(n)),
             KillPoint::AfterFlushAck { writes } => (writes, true, None),
@@ -376,7 +407,7 @@ mod unix {
             disk: None,
         };
         let dir = TempDir::new(&format!("{}{index}", kill_point.label()));
-        let mut child = spawn_server(&dir, batch_size);
+        let mut child = spawn_server(&dir, batch_size, sink);
         wait_ready(&mut child);
         let stream = UnixStream::connect(dir.0.join("s.sock")).expect("connect must succeed");
 
@@ -526,11 +557,23 @@ mod unix {
         }
     }
 
-    /// ケースごとのサマリー行（実測結果レポートの材料。REPAIR-4）。
-    fn log_case_summary(case: &str, ledger: &TrialLedger, summary: &TrialSummary) {
+    /// 件数サマリーの出力先ディレクトリを指す環境変数（IO-3・REPAIR-4・#1833）。
+    /// 設定時は各ケースの `crash_summary` 行を `<dir>/<case>.json` へ排他作成で書く。
+    /// CI の `platform-ci`「結合試験の実行」ステップだけが設定し、`scripts/check-crash-summary.sh`
+    /// （`make crash-summary-check`）が検証して `GITHUB_STEP_SUMMARY` へ表を出す。
+    const SUMMARY_DIR_ENV: &str = "FANDHE_CONTAINER_CRASH_SUMMARY_DIR";
+
+    /// `crash_summary` の JSON 1 行を組み立てる（改行なし）。`persist_supported` が false の
+    /// 環境（FLUSH ACK 非対応）でも同じ項目を出し、表で区別できるようにする。
+    fn case_summary_line(
+        case: &str,
+        persist_supported: bool,
+        ledger: &TrialLedger,
+        summary: &TrialSummary,
+    ) -> String {
         let loss = loss_summary(ledger);
-        eprintln!(
-            "{{\"event\":\"crash_summary\",\"case\":\"{case}\",\"attempts\":{},\"valid\":{},\"invalid\":{},\"aborted\":{},\"checked\":{},\"total_lost\":{},\"max_lost\":{},\"trials_with_loss\":{},\"unexact\":{}}}",
+        format!(
+            "{{\"event\":\"crash_summary\",\"case\":\"{case}\",\"persist_supported\":{persist_supported},\"attempts\":{},\"valid\":{},\"invalid\":{},\"aborted\":{},\"checked\":{},\"total_lost\":{},\"max_lost\":{},\"trials_with_loss\":{},\"unexact\":{}}}",
             summary.attempts,
             summary.valid,
             summary.invalid,
@@ -540,20 +583,71 @@ mod unix {
             loss.max_lost,
             loss.trials_with_loss,
             loss.unexact_trials
-        );
+        )
+    }
+
+    /// 出力先ディレクトリを検査して `<dir>/<case>.json` を排他作成（0600）で書く。
+    /// symlink・通常ファイル・不在のディレクトリ、既存ファイルへの書き込みは拒否する（fail-closed）。
+    fn write_case_summary_file(
+        dir: &std::path::Path,
+        case: &str,
+        line: &str,
+    ) -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let meta = std::fs::symlink_metadata(dir)?;
+        if !meta.file_type().is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "summary dir must be a real directory (not a symlink or file)",
+            ));
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dir.join(format!("{case}.json")))?;
+        file.write_all(line.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()
+    }
+
+    /// 環境変数から出力先を得る。未設定は `None`、空文字は試験の失敗（無言で出さない）。
+    fn summary_dir() -> Option<PathBuf> {
+        let value = std::env::var_os(SUMMARY_DIR_ENV)?;
+        assert!(!value.is_empty(), "{SUMMARY_DIR_ENV} must not be empty");
+        Some(PathBuf::from(value))
+    }
+
+    /// ケースごとのサマリー行（実測結果レポートの材料。REPAIR-4）。stderr に出し、
+    /// 環境変数があればファイルにも書く。各アサートの前に呼ぶため、失敗時も残る。
+    fn log_case_summary(
+        case: &str,
+        persist_supported: bool,
+        ledger: &TrialLedger,
+        summary: &TrialSummary,
+    ) {
+        let line = case_summary_line(case, persist_supported, ledger, summary);
+        eprintln!("{line}");
+        if let Some(dir) = summary_dir()
+            && let Err(e) = write_case_summary_file(&dir, case, &line)
+        {
+            panic!("failed to write crash summary file for case {case}: {e}");
+        }
     }
 
     /// 試行ループ。結果を JSON 1 行の構造化ログとして stderr へ出す（REPAIR-4）。
     fn run_trials(
         kill_point: KillPoint,
+        sink: SinkChoice,
         target_valid: usize,
         max_attempts: usize,
     ) -> (TrialLedger, TrialSummary) {
         let mut ledger = TrialLedger::new(target_valid, max_attempts);
         let summary = run_until_valid(&mut ledger, |index| {
-            let obs = run_trial(index, kill_point);
+            let obs = run_trial(index, kill_point, sink);
             eprintln!(
-                "{{\"event\":\"crash_trial\",\"index\":{index},\"kill_point\":\"{kill_point:?}\",\"acks_observed\":{},\"verdict\":\"{:?}\",{}}}",
+                "{{\"event\":\"crash_trial\",\"index\":{index},\"kill_point\":\"{kill_point:?}\",\"sink\":\"{}\",\"acks_observed\":{},\"verdict\":\"{:?}\",{}}}",
+                sink.arg(),
                 obs.acks_observed,
                 classify_trial(&obs),
                 disk_log_fields(&obs.disk)
@@ -566,7 +660,7 @@ mod unix {
     /// IO-3・TASK-18.1.2: 通常 ACK を 30 件観測した直後に SIGKILL した試行は有効になる。
     #[test]
     fn io3_trial_after_write_acks_is_valid() {
-        let obs = run_trial(0, KillPoint::AfterWriteAcks(30));
+        let obs = run_trial(0, KillPoint::AfterWriteAcks(30), SinkChoice::Product);
         assert_eq!(obs.acks_observed, 30);
         assert_eq!(
             obs.final_exit,
@@ -584,7 +678,11 @@ mod unix {
     /// IO-3・TASK-18.1.2: FLUSH ACK 対応環境では有効、非対応環境ではハングせず無効に分類される。
     #[test]
     fn io3_trial_after_flush_ack_is_classified_by_persist_support() {
-        let obs = run_trial(0, KillPoint::AfterFlushAck { writes: 5 });
+        let obs = run_trial(
+            0,
+            KillPoint::AfterFlushAck { writes: 5 },
+            SinkChoice::Product,
+        );
         let verdict = classify_trial(&obs);
         if persist_support().is_supported() {
             assert!(obs.flush_ack_observed);
@@ -606,7 +704,7 @@ mod unix {
     /// IO-3・TASK-18.1.2: kill 前にサーバーが終了していた試行は ServerExitedEarly で除外される。
     #[test]
     fn io3_invalid_when_server_exits_before_kill() {
-        let obs = run_trial(0, KillPoint::DisconnectBeforeKill);
+        let obs = run_trial(0, KillPoint::DisconnectBeforeKill, SinkChoice::Product);
         assert_eq!(
             classify_trial(&obs),
             TrialVerdict::Invalid(InvalidReason::ServerExitedEarly(ServerExit {
@@ -684,7 +782,8 @@ mod unix {
     /// 本番の目標（有効 10・上限 30）は #95 の対照ケースで使う。
     #[test]
     fn io3_harness_collects_valid_trials_until_target() {
-        let (ledger, summary) = run_trials(KillPoint::AfterWriteAcks(30), 2, 6);
+        let (ledger, summary) =
+            run_trials(KillPoint::AfterWriteAcks(30), SinkChoice::Product, 2, 6);
         assert_eq!(summary.valid, 2);
         assert!(!summary.aborted);
         assert_eq!(ledger.valid_trials().count(), 2);
@@ -700,11 +799,17 @@ mod unix {
     fn io3_flushed_data_survives_10_valid_sigkills() {
         let (ledger, summary) = run_trials(
             KillPoint::AfterFlushAck { writes: 30 },
+            SinkChoice::Product,
             TARGET_VALID_TRIALS,
             MAX_ATTEMPTS,
         );
         let loss = loss_summary(&ledger);
-        log_case_summary("flushed", &ledger, &summary);
+        log_case_summary(
+            "flushed",
+            persist_support().is_supported(),
+            &ledger,
+            &summary,
+        );
         if persist_support().is_supported() {
             assert!(!summary.aborted, "summary: {summary:?}");
             assert_eq!(summary.valid, 10);
@@ -740,44 +845,155 @@ mod unix {
                     rec.verdict
                 );
             }
-            eprintln!(
-                "{{\"event\":\"crash_summary\",\"case\":\"flushed\",\"persist_supported\":false}}"
-            );
         }
     }
 
-    /// IO-3・TASK-18.2: 未フラッシュ対照ケース。ACK 30 件を観測した直後（Flush なし）に SIGKILL
-    /// する試行を有効 10 回集め、ディスク上の損失件数を記録・報告する。**損失件数ではテストを
-    /// 失敗させない**（対照データの記録とレポートが目的。アサートするのは計測が成立したことだけ）。
+    /// IO-3・IO-2・#1832: 未フラッシュ対照。`persist` まで書き込みをメモリに保持する試験専用 sink
+    /// （`--sink deferred`）に 30 件を書き、通常 ACK を 30 件観測した直後（Flush なし。`persist` は
+    /// 一度も呼ばれない）に SIGKILL する試行を有効 10 回集め、全試行で「ACK 済み 30 件がすべて
+    /// 欠落する」ことをアサートする。spec の PoC の「ACK 済みで未書き込み」の状態を再現し、
+    /// 計測の仕組み（ディスク照合）が損失を検出できることを示す。`deferred_flushed` と対にして読む。
     ///
-    /// 本実装は通常 ACK を `write()` 完了後に返し、SIGKILL ではページキャッシュが失われないため、
-    /// ACK 済みデータの損失はほぼ 0 と予想される。spec の PoC で見られた損失は ACK を書き込みより
-    /// 先に返す実装によるもので、本実装にその状態は無い。電源断相当の耐久性はこの試験の範囲外。
-    /// 対照として十分かどうかの判断は TASK-18 の人間担当に委ねる。
+    /// 製品の `AppendFileSink` は通常 ACK を `write()` 後に返し、SIGKILL ではページキャッシュが
+    /// 残るため、未フラッシュでも損失は 0 になる（`docs/design/io-crash-safety.md`）。このため
+    /// 製品 sink では対照にならず、相手役 sink を使う。
     #[test]
-    fn io3_unflushed_control_records_loss_without_asserting() {
+    fn io3_deferred_sink_unflushed_loses_all_acked_data_in_10_valid_sigkills() {
         let (ledger, summary) = run_trials(
             KillPoint::AfterWriteAcks(30),
+            SinkChoice::Deferred,
             TARGET_VALID_TRIALS,
             MAX_ATTEMPTS,
         );
-        log_case_summary("unflushed_control", &ledger, &summary);
+        let loss = loss_summary(&ledger);
+        log_case_summary("deferred_unflushed", true, &ledger, &summary);
         assert!(!summary.aborted, "summary: {summary:?}");
         assert_eq!(summary.valid, 10);
+        let all: Vec<u64> = (0..30).collect();
         for rec in ledger.valid_trials() {
-            assert!(
-                matches!(rec.observation.disk, Some(DiskObservation::Checked(_))),
-                "trial {} must be disk-checked, got {:?}",
-                rec.index,
-                rec.observation.disk
-            );
+            match &rec.observation.disk {
+                Some(DiskObservation::Checked(c)) => {
+                    assert!(c.found.is_empty(), "trial {}", rec.index);
+                    assert_eq!(c.missing, all, "trial {}", rec.index);
+                    assert_eq!(c.lost(), 30, "trial {}", rec.index);
+                    assert!(c.unexpected.is_empty(), "trial {}", rec.index);
+                    assert_eq!(c.trailing_partial_bytes, 0, "trial {}", rec.index);
+                }
+                other => panic!("trial {} must be disk-checked, got {other:?}", rec.index),
+            }
         }
+        assert_eq!(loss.checked_trials, 10);
+        assert_eq!(loss.total_lost, 300);
+        assert_eq!(loss.trials_with_loss, 10);
+        // 全件欠落は「ちょうど 0..30 が並ぶ」状態ではないため、全試行が非 exact になる
+        assert_eq!(loss.unexact_trials, 10);
+    }
+
+    /// IO-3・IO-2・#1832: フラッシュ済み側の対。同じ試験専用 sink で 30 件を書いて Flush し、
+    /// FLUSH ACK を観測した直後に SIGKILL する。FLUSH ACK は `persist` 成功の後にだけ返るため、
+    /// 全試行で 30 件が欠落・重複なく並ぶ（損失 0）。`persist` が抜けた、または FLUSH ACK が
+    /// `persist` 成功より先に返る実装はここで落ちる。保証範囲は SIGKILL 後の可視性までで、
+    /// 電源断後の媒体永続化（IO-2）は検証しない。FLUSH ACK 非対応環境では
+    /// `io3_flushed_data_survives_10_valid_sigkills` と同じ契約確認（全試行が FLUSH ACK 経路で
+    /// 無効）に切り替える。
+    #[test]
+    fn io3_deferred_sink_flushed_keeps_all_data_in_10_valid_sigkills() {
+        let (ledger, summary) = run_trials(
+            KillPoint::AfterFlushAck { writes: 30 },
+            SinkChoice::Deferred,
+            TARGET_VALID_TRIALS,
+            MAX_ATTEMPTS,
+        );
+        let loss = loss_summary(&ledger);
+        log_case_summary(
+            "deferred_flushed",
+            persist_support().is_supported(),
+            &ledger,
+            &summary,
+        );
+        if persist_support().is_supported() {
+            assert!(!summary.aborted, "summary: {summary:?}");
+            assert_eq!(summary.valid, 10);
+            let expected: Vec<u64> = (0..30).collect();
+            for rec in ledger.valid_trials() {
+                match &rec.observation.disk {
+                    Some(DiskObservation::Checked(c)) => {
+                        assert_eq!(c.found, expected, "trial {}", rec.index);
+                        assert!(c.missing.is_empty(), "trial {}", rec.index);
+                        assert!(c.unexpected.is_empty(), "trial {}", rec.index);
+                        assert_eq!(c.trailing_partial_bytes, 0, "trial {}", rec.index);
+                    }
+                    other => panic!("trial {} must be disk-checked, got {other:?}", rec.index),
+                }
+            }
+            assert_eq!(loss.checked_trials, 10);
+            assert_eq!(loss.total_lost, 0);
+            assert_eq!(loss.trials_with_loss, 0);
+            assert_eq!(loss.unexact_trials, 0);
+        } else {
+            assert!(summary.aborted);
+            assert_eq!(summary.valid, 0);
+            assert!(summary.invalid > 0, "summary: {summary:?}");
+            for rec in ledger.invalid_trials() {
+                assert_eq!(rec.observation.acks_observed, 30, "trial {}", rec.index);
+                assert!(!rec.observation.flush_ack_observed, "trial {}", rec.index);
+                assert!(
+                    is_persist_unsupported_reason(&rec.observation, &rec.verdict),
+                    "trial {}: {:?}",
+                    rec.index,
+                    rec.verdict
+                );
+            }
+        }
+    }
+
+    /// IO-3・REPAIR-4・REPAIR-12・#1833: サマリー行は全項目を含み、具体値で照合できる 1 行になる。
+    #[test]
+    fn case_summary_line_contains_all_fields_in_one_line() {
+        let ledger = TrialLedger::new(10, 30);
+        let line = case_summary_line("flushed", false, &ledger, &ledger.summary());
+        assert_eq!(
+            line,
+            "{\"event\":\"crash_summary\",\"case\":\"flushed\",\"persist_supported\":false,\"attempts\":0,\"valid\":0,\"invalid\":0,\"aborted\":false,\"checked\":0,\"total_lost\":0,\"max_lost\":0,\"trials_with_loss\":0,\"unexact\":0}"
+        );
+        assert!(!line.contains('\n'));
+    }
+
+    /// IO-3・REPAIR-12・#1833: 排他作成で書け、内容は行 + 改行。同名の 2 回目は AlreadyExists で失敗する。
+    #[test]
+    fn write_case_summary_file_is_exclusive_and_newline_terminated() {
+        let dir = TempDir::new("sumx");
+        write_case_summary_file(&dir.0, "flushed", "{\"a\":1}").expect("first write must succeed");
+        let body = std::fs::read_to_string(dir.0.join("flushed.json")).expect("must read back");
+        assert_eq!(body, "{\"a\":1}\n");
+        let err = write_case_summary_file(&dir.0, "flushed", "{\"a\":2}")
+            .expect_err("second write must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        let body = std::fs::read_to_string(dir.0.join("flushed.json")).expect("must read back");
+        assert_eq!(body, "{\"a\":1}\n");
+    }
+
+    /// IO-3・REPAIR-12・#1833: 出力先が symlink・通常ファイル・不在なら書かずに失敗する（fail-closed）。
+    #[test]
+    fn write_case_summary_file_rejects_bad_dirs() {
+        let dir = TempDir::new("sumb");
+        let real = dir.0.join("real");
+        std::fs::create_dir(&real).expect("mkdir");
+        let link = dir.0.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        assert!(write_case_summary_file(&link, "flushed", "{}").is_err());
+        assert!(!real.join("flushed.json").exists());
+        let file = dir.0.join("file");
+        std::fs::write(&file, b"x").expect("write file");
+        assert!(write_case_summary_file(&file, "flushed", "{}").is_err());
+        assert!(write_case_summary_file(&dir.0.join("missing"), "flushed", "{}").is_err());
     }
 
     /// IO-3・TASK-18.1.2: 無効試行しか得られない場合は上限で打ち切られ、有効数は 0 のまま。
     #[test]
     fn io3_harness_aborts_when_every_trial_is_invalid() {
-        let (ledger, summary) = run_trials(KillPoint::DisconnectBeforeKill, 2, 3);
+        let (ledger, summary) =
+            run_trials(KillPoint::DisconnectBeforeKill, SinkChoice::Product, 2, 3);
         assert_eq!(summary.attempts, 3);
         assert_eq!(summary.valid, 0);
         assert_eq!(summary.invalid, 3);

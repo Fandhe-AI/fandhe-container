@@ -7,7 +7,7 @@
     "ioengine": "psync",
     "direct": "1",
     "end_fsync": "1",
-    "group_reporting": ""
+    "group_reporting": "1"
   },
   "jobs": [
     {

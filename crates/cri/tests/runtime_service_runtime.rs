@@ -31,6 +31,8 @@ struct FakeRuntime {
     fail_start: Mutex<Option<ErrorCode>>,
     /// true のとき start は created を返す（running でない応答の検証用）。
     start_returns_created: AtomicBool,
+    /// true のとき create は running を返す（created 以外の応答の検証用）。
+    create_returns_running: AtomicBool,
     /// true の間、start は保留する（並行 Start の検証用）。
     hold_start: AtomicBool,
 }
@@ -52,6 +54,9 @@ impl ContainerRuntime for Shared {
         ));
         if let Some(c) = *self.0.fail_create.lock().unwrap() {
             return Err(TraitError::new(c, "create failed"));
+        }
+        if self.0.create_returns_running.load(Ordering::SeqCst) {
+            return Ok(ContainerStatus::running(r.id().clone(), None));
         }
         Ok(ContainerStatus::created(r.id().clone(), None))
     }
@@ -350,6 +355,28 @@ async fn task_59_2_start_failure_keeps_created() {
         status(&h.service, &id).await.state,
         S::ContainerRunning as i32
     );
+}
+
+/// 実行層が created 以外を返したら INTERNAL とし、記録を巻き戻して bundle を解放する（CRI-2）。
+#[tokio::test]
+async fn task_59_2_unexpected_create_state_releases_bundle() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    h.runtime
+        .create_returns_running
+        .store(true, Ordering::SeqCst);
+    let err = create(&h.service, &sb, "c").await.expect_err("create");
+    assert_eq!(err.code(), Code::Internal);
+    assert_eq!(list_count(&h.service).await, 0);
+    let releases = h
+        .bundles
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.starts_with("release "))
+        .count();
+    assert_eq!(releases, 1);
 }
 
 /// 実行層が running 以外を返したら INTERNAL とし、created のまま残す。

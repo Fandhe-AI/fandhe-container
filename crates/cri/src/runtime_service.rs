@@ -22,7 +22,9 @@
 //! 未実装（REPAIR-3）: `RunPodSandbox` は実行層に対応操作が無く記録のみ（共有 namespace・net 連携は後続）。
 //! bundle の生成の本体（image 展開・`ContainerConfig` から `config.json`）と Stop・Remove の kill・delete
 //! 接続（TASK-59.3・#439）は未提供で、呼び出し元の中断で実行層側に残った資源の回収も
-//! 後続（TASK-59.3・TASK-114）で扱う。コンテナの記録の型と上限は `container` サブモジュール。
+//! 後続（TASK-59.3・TASK-114）で扱う。Start 後に中断・確定失敗した場合は、実行層が
+//! running の可能性があるため記録を exited にして再 Start を拒否する（fail-closed）。
+//! コンテナの記録の型と上限は `container` サブモジュール。
 //!
 //! **Status/List の扱い（CRI-1・ERR-3・TASK-57.3）**: `PodSandboxStatus` は未知 ID を `NOT_FOUND`、空 ID を
 //! `INVALID_ARGUMENT` にする。`ListPodSandbox` は未知の ID や一致なしをエラーにせず空の一覧を返し、
@@ -246,6 +248,14 @@ struct RuntimeBinding {
     bundles: Arc<dyn BundleProvider>,
 }
 
+/// `reserve_container` の戻り値（登録したコンテナの識別子と、bundle 供給元へ渡す設定）。
+struct ReservedContainer {
+    container_id: String,
+    pod_sandbox_id: String,
+    /// `in_flight` 登録のときだけ `Some`（上限検証済みの複製）。
+    provider_config: Option<v1::ContainerConfig>,
+}
+
 /// 実行層を呼び出し中の操作の種類（[`InFlightGuard`] が巻き戻しの方法を選ぶ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InFlightKind {
@@ -262,6 +272,11 @@ struct InFlightGuard<'a> {
     id: String,
     kind: InFlightKind,
     committed: bool,
+    /// Create の巻き戻しで `release` を呼ぶ bundle の供給元。
+    bundles: Option<Arc<dyn BundleProvider>>,
+    /// 実行層の結果が不明（Start の呼び出し後で、定義的な失敗が確認できていない）か。
+    /// 真のまま破棄されたら、実行層では running かもしれないため created へ戻さず exited にする。
+    outcome_unknown: bool,
 }
 
 impl<'a> InFlightGuard<'a> {
@@ -271,7 +286,25 @@ impl<'a> InFlightGuard<'a> {
             id,
             kind,
             committed: false,
+            bundles: None,
+            outcome_unknown: false,
         }
+    }
+
+    /// Create の巻き戻し時に bundle を解放するよう設定する。
+    fn with_bundles(mut self, bundles: Arc<dyn BundleProvider>) -> Self {
+        self.bundles = Some(bundles);
+        self
+    }
+
+    /// 実行層の呼び出しを開始した（以後、中断・commit 失敗では結果が不明になる）。
+    fn mark_dispatched(&mut self) {
+        self.outcome_unknown = true;
+    }
+
+    /// 実行層がエラーを返し、何も起きていないと確定した。
+    fn mark_definitely_failed(&mut self) {
+        self.outcome_unknown = false;
     }
 
     /// 実行層の成功を記録へ反映して確定する。反映に失敗したら巻き戻される。
@@ -285,7 +318,13 @@ impl<'a> InFlightGuard<'a> {
 impl Drop for InFlightGuard<'_> {
     fn drop(&mut self) {
         if !self.committed {
-            self.service.rollback_in_flight(&self.id, self.kind);
+            self.service
+                .rollback_in_flight(&self.id, self.kind, self.outcome_unknown);
+            if self.kind == InFlightKind::Create
+                && let Some(bundles) = &self.bundles
+            {
+                bundles.release(&self.id);
+            }
         }
     }
 }
@@ -540,19 +579,19 @@ impl CriRuntimeService {
         &self,
         req: v1::CreateContainerRequest,
     ) -> Result<v1::CreateContainerResponse, Status> {
-        let (container_id, _, _) = self.reserve_container(req, false)?;
+        let container_id = self.reserve_container(req, false)?.container_id;
         Ok(v1::CreateContainerResponse { container_id })
     }
 
     /// 検証・採番・登録を行う（`in_flight` は実行層を呼び出し中として登録するか）。
     ///
-    /// 戻り値は `(container_id, pod_sandbox_id, config)`。`config` は `in_flight` のときだけ複製して返す
+    /// 戻り値は [`ReservedContainer`]。`provider_config` は `in_flight` のときだけ複製して返す
     /// （bundle の供給元へ渡すため。上限検証済みで有界）。
     fn reserve_container(
         &self,
         req: v1::CreateContainerRequest,
         in_flight: bool,
-    ) -> Result<(String, String, Option<v1::ContainerConfig>), Status> {
+    ) -> Result<ReservedContainer, Status> {
         let ValidatedCreate {
             pod_sandbox_id,
             name,
@@ -621,7 +660,11 @@ impl CriRuntimeService {
         );
         registry.container_keys.insert(key);
         registry.container_retained_bytes = total_retained_bytes;
-        Ok((container_id, sandbox_id, provider_config))
+        Ok(ReservedContainer {
+            container_id,
+            pod_sandbox_id: sandbox_id,
+            provider_config,
+        })
     }
 
     /// 実行層接続時の `CreateContainer`（TASK-59.2・CRI-2）。
@@ -633,21 +676,29 @@ impl CriRuntimeService {
         binding: &RuntimeBinding,
         req: v1::CreateContainerRequest,
     ) -> Result<v1::CreateContainerResponse, Status> {
-        let (container_id, sandbox_id, config) = self.reserve_container(req, true)?;
-        let guard = InFlightGuard::new(self, container_id.clone(), InFlightKind::Create);
-        let config = config.ok_or_else(|| Status::internal("container config is unavailable"))?;
+        let reserved = self.reserve_container(req, true)?;
+        let container_id = reserved.container_id;
+        let sandbox_id = reserved.pod_sandbox_id;
+        // 巻き戻し（失敗・中断・状態不一致・commit 失敗）で bundle を解放する。
+        let guard = InFlightGuard::new(self, container_id.clone(), InFlightKind::Create)
+            .with_bundles(Arc::clone(&binding.bundles));
+        let config = reserved
+            .provider_config
+            .ok_or_else(|| Status::internal("container config is unavailable"))?;
         let adapter = binding.adapter.clone();
         let bundles = Arc::clone(&binding.bundles);
         let id = container_id.clone();
         let status = tokio::task::spawn_blocking(move || {
             let bundle = bundles.prepare(&id, &sandbox_id, &config)?;
-            adapter
-                .create(&id, bundle)
-                .inspect_err(|_| bundles.release(&id))
+            adapter.create(&id, bundle)
         })
         .await
         .map_err(|_| Status::internal("runtime task failed"))??;
         if status.state != CriContainerState::ContainerCreated {
+            // 実行層側に残ったコンテナを best-effort で削除する（結果は無視。bundle は guard が解放する）。
+            let adapter = binding.adapter.clone();
+            let id = container_id.clone();
+            let _ = tokio::task::spawn_blocking(move || adapter.remove(&id, true)).await;
             return Err(Status::internal("runtime returned an unexpected state"));
         }
         guard.commit()?;
@@ -716,12 +767,22 @@ impl CriRuntimeService {
     ) -> Result<v1::StartContainerResponse, Status> {
         let id = req.container_id.clone();
         self.begin_start(req, true)?;
-        let guard = InFlightGuard::new(self, id.clone(), InFlightKind::Start);
+        let mut guard = InFlightGuard::new(self, id.clone(), InFlightKind::Start);
+        guard.mark_dispatched();
         let adapter = binding.adapter.clone();
-        let status = tokio::task::spawn_blocking(move || adapter.start(&id))
+        let result = tokio::task::spawn_blocking(move || adapter.start(&id))
             .await
-            .map_err(|_| Status::internal("runtime task failed"))??;
+            .map_err(|_| Status::internal("runtime task failed"))?;
+        let status = match result {
+            Ok(status) => status,
+            Err(status) => {
+                guard.mark_definitely_failed();
+                return Err(status);
+            }
+        };
         if status.state != CriContainerState::ContainerRunning {
+            // 実行層は created のままと報告した（起動していない）ため、created へ戻してよい。
+            guard.mark_definitely_failed();
             return Err(Status::internal("runtime returned an unexpected state"));
         }
         guard.commit()?;
@@ -750,16 +811,28 @@ impl CriRuntimeService {
     /// 実行層の呼び出しが失敗・中断したときの巻き戻し。Create は記録を除去し、Start は `in_flight` を解く。
     ///
     /// ロックの汚染時は何もできない（汚染済みのレジストリは以後の RPC が `INTERNAL` で拒否する）。
-    fn rollback_in_flight(&self, id: &str, kind: InFlightKind) {
+    ///
+    /// Start で `outcome_unknown` のときは、実行層が running の可能性があるため created へ戻さず
+    /// exited にする（再 Start による二重起動を防ぐ fail-closed。実状態の照合は TASK-59.3・TASK-114）。
+    fn rollback_in_flight(&self, id: &str, kind: InFlightKind, outcome_unknown: bool) {
         match kind {
             InFlightKind::Create => {
                 let _ = self.drop_container(id, true);
             }
             InFlightKind::Start => {
+                let finished_at_nanos = if outcome_unknown {
+                    now_nanos().unwrap_or(0)
+                } else {
+                    0
+                };
                 if let Ok(mut registry) = self.registry.lock()
                     && let Some(record) = registry.containers.get_mut(id)
                 {
                     record.in_flight = false;
+                    if outcome_unknown {
+                        record.state = ContainerState::Exited;
+                        record.finished_at_nanos = finished_at_nanos;
+                    }
                 }
             }
         }

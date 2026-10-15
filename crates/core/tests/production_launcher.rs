@@ -602,62 +602,83 @@ mod linux {
         assert_eq!(started.record().status().pid(), Some(pid));
         assert_eq!(state_of(&env.store, &id), ContainerState::Running);
 
-        // ホストから見た PID 1 の確認（NSpid の末尾が 1）。
-        let nspid = status_field(&format!("/proc/{pid}/status"), "NSpid:").expect("host NSpid");
-        let parts: Vec<&str> = nspid.split_whitespace().collect();
-        assert_eq!(parts.len(), 2, "NSpid must have two levels: {nspid:?}");
-        assert_eq!(parts.first().copied(), Some(pid.to_string().as_str()));
-        assert_eq!(parts.last().copied(), Some("1"));
-        // 起動のたびに登録された CgroupJoin 段で、子 cgroup に参加している。
-        let host_cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("cgroup");
-        assert_eq!(host_cgroup.trim(), expected_cgroup);
+        // 検証は catch_unwind の中で行い、成否に関わらず terminate と回収を行ってから panic を再送出する
+        // （`LaunchedProcess` は Drop で終了・回収しないため、ここで回収しないと実機にプロセスが残る）。
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // ホストから見た PID 1 の確認（NSpid の末尾が 1）。
+            let nspid = status_field(&format!("/proc/{pid}/status"), "NSpid:").expect("host NSpid");
+            let parts: Vec<&str> = nspid.split_whitespace().collect();
+            assert_eq!(parts.len(), 2, "NSpid must have two levels: {nspid:?}");
+            assert_eq!(parts.first().copied(), Some(pid.to_string().as_str()));
+            assert_eq!(parts.last().copied(), Some("1"));
+            // 起動のたびに登録された CgroupJoin 段で、子 cgroup に参加している。
+            let host_cgroup =
+                std::fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("cgroup");
+            assert_eq!(host_cgroup.trim(), expected_cgroup);
 
-        let output = started.process().take_output().expect("container output");
-        let stdout = output.stdout.expect("container stdout");
-        let (rx, reader) = spawn_reader(stdout);
-        let lines = collect_probe(&rx);
+            let output = started.process().take_output().expect("container output");
+            let stdout = output.stdout.expect("container stdout");
+            let (rx, reader) = spawn_reader(stdout);
+            // 以降の検証が panic しても、起動済みプロセスの終了と回収を必ず行うため rx / reader は外へ預ける。
+            reader_slot = Some((rx, reader));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
 
-        assert_eq!(value_of(&lines, "PID"), "1");
-        assert_eq!(value_of(&lines, "HOSTNAME"), HOSTNAME);
-        assert_eq!(value_of(&lines, "CGROUP"), expected_cgroup);
-        // 制限ステージ（no_new_privs・seccomp）の適用の間接証拠。Landlock 本体の直接観測は範囲外（モジュール doc）。
-        assert_eq!(value_of(&lines, "NONEWPRIVS"), "1");
-        assert_eq!(value_of(&lines, "SECCOMP"), "2");
-        for (name, major, minor) in [
-            ("null", 1, 3),
-            ("zero", 1, 5),
-            ("full", 1, 7),
-            ("random", 1, 8),
-            ("urandom", 1, 9),
-            ("tty", 5, 0),
-        ] {
-            assert_eq!(
-                value_of(&lines, &format!("DEV {name}")),
-                format!("c {major}:{minor}"),
-                "/dev/{name}"
+            assert_eq!(value_of(&lines, "PID"), "1");
+            assert_eq!(value_of(&lines, "HOSTNAME"), HOSTNAME);
+            assert_eq!(value_of(&lines, "CGROUP"), expected_cgroup);
+            // 制限ステージ（no_new_privs・seccomp）の適用の間接証拠。Landlock 本体の直接観測は範囲外（モジュール doc）。
+            assert_eq!(value_of(&lines, "NONEWPRIVS"), "1");
+            assert_eq!(value_of(&lines, "SECCOMP"), "2");
+            for (name, major, minor) in [
+                ("null", 1, 3),
+                ("zero", 1, 5),
+                ("full", 1, 7),
+                ("random", 1, 8),
+                ("urandom", 1, 9),
+                ("tty", 5, 0),
+            ] {
+                assert_eq!(
+                    value_of(&lines, &format!("DEV {name}")),
+                    format!("c {major}:{minor}"),
+                    "/dev/{name}"
+                );
+            }
+            for (name, target) in [
+                ("fd", "/proc/self/fd"),
+                ("stdin", "/proc/self/fd/0"),
+                ("stdout", "/proc/self/fd/1"),
+                ("stderr", "/proc/self/fd/2"),
+            ] {
+                assert_eq!(
+                    value_of(&lines, &format!("LINK {name}")),
+                    target,
+                    "/dev/{name}"
+                );
+            }
+            assert_eq!(value_of(&lines, "DIR pts"), "true");
+            assert_eq!(value_of(&lines, "DIR shm"), "true");
+            assert_eq!(value_of(&lines, "DEVNULL_WRITE"), "ok");
+            assert_eq!(value_of(&lines, "DEVZERO_READ"), "16");
+            println!(
+                "production_launcher: scenario=ok pid={pid} nspid={nspid:?} hostname={HOSTNAME}"
             );
-        }
-        for (name, target) in [
-            ("fd", "/proc/self/fd"),
-            ("stdin", "/proc/self/fd/0"),
-            ("stdout", "/proc/self/fd/1"),
-            ("stderr", "/proc/self/fd/2"),
-        ] {
-            assert_eq!(
-                value_of(&lines, &format!("LINK {name}")),
-                target,
-                "/dev/{name}"
-            );
-        }
-        assert_eq!(value_of(&lines, "DIR pts"), "true");
-        assert_eq!(value_of(&lines, "DIR shm"), "true");
-        assert_eq!(value_of(&lines, "DEVNULL_WRITE"), "ok");
-        assert_eq!(value_of(&lines, "DEVZERO_READ"), "16");
-        println!("production_launcher: scenario=ok pid={pid} nspid={nspid:?} hostname={HOSTNAME}");
+        }));
 
         // 終了と回収。
         let (_record, process) = started.into_parts();
-        process.terminate(timeout()).expect("terminate");
+        let terminated = process.terminate(timeout());
+        if let Err(p) = verified {
+            // 検証側の panic を優先する。terminate の失敗で元の panic を覆い隠さない。
+            if let Err(e) = &terminated {
+                eprintln!(
+                    "production_launcher: terminate after failed verification also failed: {e:?}"
+                );
+            }
+            std::panic::resume_unwind(p);
+        }
+        terminated.expect("terminate");
+        let (rx, reader) = reader_slot.take().expect("reader slot");
         assert!(
             eventually(|| !Path::new(&format!("/proc/{pid}")).exists()),
             "/proc/{pid} must disappear after terminate"

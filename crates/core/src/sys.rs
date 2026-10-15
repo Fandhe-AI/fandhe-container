@@ -42,6 +42,8 @@
 //! 稼働中コンテナへの exec（`exec/exec_command.rs`。SUP-6・TASK-163.4・#503）は、exec 専用 worker を
 //! non-dumpable にし、子を親の生存に結び付けるために `prctl(2)`（`PR_SET_DUMPABLE` / `PR_GET_DUMPABLE` /
 //! `PR_SET_PDEATHSIG`）を呼ぶ。
+//! child subreaper の設定と確認（`exec/subreaper.rs`。CORE-1・CORE-2・TASK-29 追補・#1813）は、launcher の中間プロセスが先に終わっても
+//! 孫の PID 1 を pid 指定の `waitpid` で回収できるよう、呼び出しプロセスに `prctl(PR_SET_CHILD_SUBREAPER)` / `PR_GET_CHILD_SUBREAPER` を呼ぶ。
 //! tmpfs のマウント（`crate::exec::mount_tmpfs`。SUP-12・TASK-169 追補・#1472）は、新マウント API（`fsopen(2)`・`fsconfig(2)`・
 //! `fsmount(2)`・`move_mount(2)`。Linux 5.2 以降）で検証済みの O_PATH fd の上へ直接載せる。未対応カーネルは拒否する（縮退しない）。
 //! 同じ経路で rootfs の `/dev` 用の nodev なし tmpfs も載せる入口（`mount_dev_tmpfs_on`。TASK-29 追補・#1652）を持つ。
@@ -434,6 +436,11 @@ mod consts {
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
     pub const PR_SET_KEEPCAPS: i32 = 8;
 
+    // include/uapi/linux/prctl.h の `PR_SET_CHILD_SUBREAPER`（36）・`PR_GET_CHILD_SUBREAPER`（37）。
+    // CORE-1・CORE-2・TASK-29 追補・#1813。全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const PR_SET_CHILD_SUBREAPER: i32 = 36;
+    pub const PR_GET_CHILD_SUBREAPER: i32 = 37;
+
     // include/uapi/asm-generic/resource.h の `RLIMIT_*`（0〜15。SUP-12・TASK-169.1）。
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
     pub const RLIMIT_CPU: i32 = 0;
@@ -719,6 +726,11 @@ mod consts {
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
     pub const PR_SET_KEEPCAPS: i32 = 8;
 
+    // include/uapi/linux/prctl.h の `PR_SET_CHILD_SUBREAPER`（36）・`PR_GET_CHILD_SUBREAPER`（37）。
+    // CORE-1・CORE-2・TASK-29 追補・#1813。全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
+    pub const PR_SET_CHILD_SUBREAPER: i32 = 36;
+    pub const PR_GET_CHILD_SUBREAPER: i32 = 37;
+
     // include/uapi/asm-generic/resource.h の `RLIMIT_*`（0〜15。SUP-12・TASK-169.1）。
     // 全アーキテクチャ共通の定義だが、他アーキテクチャの定義を流用しないため個別に持つ。
     pub const RLIMIT_CPU: i32 = 0;
@@ -938,6 +950,8 @@ mod consts {
     pub const PR_SET_DUMPABLE: i32 = 0;
     pub const PR_SET_PDEATHSIG: i32 = 0;
     pub const PR_SET_KEEPCAPS: i32 = 0;
+    pub const PR_SET_CHILD_SUBREAPER: i32 = 0;
+    pub const PR_GET_CHILD_SUBREAPER: i32 = 0;
 
     // rlimit の定数（対応外アーキテクチャでは各ラッパーが SUPPORTED で弾くため未使用）。
     pub const RLIMIT_CPU: i32 = 0;
@@ -3932,6 +3946,57 @@ pub(crate) fn set_keep_caps(keep: bool) -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// 呼び出したプロセスを child subreaper にする・解除する（`PR_SET_CHILD_SUBREAPER`。CORE-1・CORE-2・TASK-29 追補・#1813）。
+///
+/// `exec::ChildSubreaper::enable` が launcher を呼ぶ前に呼ぶ。設定後に孤児になった子孫は init ではなく
+/// 最も近い祖先の subreaper へ再親付けされるため、中間プロセスが先に終わっても PID 1 を pid 指定の
+/// `waitpid` で回収できる。フラグはプロセス（スレッドグループ）単位で、fork した子へは継承されない。
+/// 設定前に既に init へ再親付けされた孫は回収できないので、呼び出し側は fork の前に設定する。
+pub(crate) fn set_child_subreaper(on: bool) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す
+    // （arg2 が 0 / 1。arg3〜5 はカーネルが参照しないが 0 に揃える）。呼び出しプロセスの属性を変えるだけで、
+    // メモリ・fd には触れない。
+    let rc = unsafe {
+        prctl(
+            consts::PR_SET_CHILD_SUBREAPER,
+            u64::from(on),
+            0u64,
+            0u64,
+            0u64,
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 呼び出したプロセスが child subreaper か（`PR_GET_CHILD_SUBREAPER`。CORE-1・CORE-2・TASK-29 追補・#1813）。
+///
+/// [`set_child_subreaper`] の設定を読み戻して確認するために使う（設定の取り違えを fail-closed にする）。
+pub(crate) fn get_child_subreaper() -> Result<bool, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut value: i32 = 0;
+    // SAFETY: arg2 は `int *` の出力先で、`value` は呼び出しの間生存する有効な i32。カーネルが書くのは
+    // 4 バイトだけ。可変長部は `unsigned long` に合わせて u64 で渡し（ポインタは usize 経由）、arg3〜5 は 0 に揃える。
+    let rc = unsafe {
+        prctl(
+            consts::PR_GET_CHILD_SUBREAPER,
+            core::ptr::addr_of_mut!(value) as usize as u64,
+            0u64,
+            0u64,
+            0u64,
+        )
+    };
+    if rc == -1 {
+        Err(last_error())
+    } else {
+        Ok(value != 0)
+    }
+}
+
 /// 呼び出したプロセスが dumpable か（`PR_GET_DUMPABLE`。SUP-6・SEC-1・TASK-163.4・#503）。
 ///
 /// `0`（`SUID_DUMP_DISABLE`）だけを non-dumpable として `Ok(false)` を返す。`1`（`SUID_DUMP_USER`）と
@@ -4935,6 +5000,8 @@ mod tests {
         assert_eq!(consts::PR_SET_DUMPABLE, 4);
         assert_eq!(consts::PR_SET_PDEATHSIG, 1);
         assert_eq!(consts::PR_SET_KEEPCAPS, 8);
+        assert_eq!(consts::PR_SET_CHILD_SUBREAPER, 36);
+        assert_eq!(consts::PR_GET_CHILD_SUBREAPER, 37);
         // 親死亡シグナルの実 syscall は単体テストでは呼ばない（設定はスレッド単位で、テストプロセスを起動した
         // スレッドが先に終わるとテストプロセス全体へ SIGKILL が届く）。実プロセスでの照合は supervisor の
         // 結合試験 `exec_timeout` が行う。

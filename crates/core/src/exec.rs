@@ -120,6 +120,7 @@ mod sealed_copy;
 mod seccomp;
 mod setns;
 mod stages;
+mod subreaper;
 mod tmpfs;
 mod violation;
 #[cfg(test)]
@@ -240,6 +241,7 @@ pub use seccomp::{ProbeOutcome, SeccompProbeRecord};
 pub use seccomp::{SeccompEnforcementObservation, observe_default_seccomp_enforcement};
 pub use setns::{JoinNamespace, NamespaceJoinReport, Pid1Target, join_namespaces};
 pub use stages::{StageHook, StageKind, StagePipeline, StageReport, StageStatus};
+pub use subreaper::ChildSubreaper;
 pub use tmpfs::{TmpfsMountOutcome, TmpfsReport, mount_tmpfs};
 /// 結合試験 `tests/tmpfs_mount.rs` 専用の再公開（SUP-12・TASK-169 追補・#1472・#1669 事後監査 P2。通常の利用者は呼ばない。
 /// 詳細は定義側）。

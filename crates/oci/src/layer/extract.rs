@@ -21,6 +21,11 @@
 //!   「`root` 配下の実在項目はすべてこの展開が作った」ことに依るため）。別プロセスが同時に `root` を
 //!   書き換える競合（TOCTOU）は防げない。
 //! - 失敗時は部分的な展開物が残るため、呼び出し側が `root` ごと破棄すること。
+//! - 複数レイヤーは `extract_layers` / `extract_layer_blobs` で下位から上位の順に同一 `root` へ重ねる
+//!   （TASK-52.4・#410）。空であることの検査は最初のレイヤーの前だけで、別表記の索引・遅延ディレクトリ mode・
+//!   4 種の上限（`max_input_bytes` を含む）は全レイヤーで共有・累積する。上位が下位のファイルを上書きする。
+//!   未実装: whiteout（`.wh.*`・不透明ディレクトリ。TASK-53）と、上位レイヤーがディレクトリの位置へ
+//!   ファイルを置く置換（OCI image-spec は再帰削除して置換するが、ここでは `FailedPrecondition` で拒否する）。
 //! - tar の終端後に入力を EOF まで読み捨てる（gzip トレーラの CRC32・ISIZE 検証のため）。読み捨てを含む
 //!   入力全体は `ExtractLimits::max_input_bytes` で上限を課す（超過は `ResourceExhausted`）。
 //!
@@ -81,6 +86,8 @@ pub const DEFAULT_MAX_EXTRACTED_BYTES: u64 = DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTE
 /// 親ディレクトリのエントリを省いた tar が暗黙に作るディレクトリの分を見込み、エントリ数の既定の 2 倍とする。
 pub const DEFAULT_MAX_TRACKED_PATHS: u64 = 2 * DEFAULT_MAX_LAYER_ENTRIES;
 
+/// 重ねられるレイヤー数の上限（空レイヤーの無限供給による結果 Vec の無制限増加を防ぐ。超過は `ResourceExhausted`）。
+const MAX_LAYERS: usize = 1024;
 /// パス全体の最大バイト数（Linux の `PATH_MAX`）。
 const MAX_PATH_BYTES: usize = 4096;
 /// 1 コンポーネントの最大バイト数（`NAME_MAX`）。
@@ -166,15 +173,21 @@ pub fn extract_tar<R: Read>(
 /// 展開全体を `OciOpKind::ExtractLayer` として `recorder` へ記録する（REPAIR-4）。
 ///
 /// `src` は gzip 展開済みの tar バイトストリーム（通常は `GzipLayerReader`）。契約はモジュール冒頭を参照。
+/// 複数レイヤーを重ねるときは `extract_layers_with` を使う（これは要素 1 つのスタックと同じ）。
 pub fn extract_tar_with<R: Read>(
     recorder: &dyn OciOpRecorder,
     src: R,
     root: &Path,
     limits: ExtractLimits,
 ) -> Result<ExtractedLayer, OciError> {
-    record_oci_op(recorder, OciOpKind::ExtractLayer, || {
-        extract_inner(src, root, limits)
-    })
+    single(extract_stack(
+        recorder,
+        [src],
+        Ok,
+        root,
+        limits,
+        host_lstat,
+    )?)
 }
 
 /// 圧縮レイヤー blob（digest 検証済み）を開き、gzip 展開しながら `root` へ展開する便宜関数。
@@ -204,10 +217,75 @@ pub fn extract_layer_blob_with(
     max_uncompressed_bytes: u64,
     limits: ExtractLimits,
 ) -> Result<ExtractedLayer, OciError> {
-    record_oci_op(recorder, OciOpKind::ExtractLayer, || {
-        let reader = open_gzip_layer(blob_path, max_uncompressed_bytes)?;
-        extract_inner(reader, root, limits)
-    })
+    single(extract_stack(
+        recorder,
+        [blob_path],
+        |p| open_gzip_layer(p, max_uncompressed_bytes),
+        root,
+        limits,
+        host_lstat,
+    )?)
+}
+
+/// 計装なしの `extract_layers_with`（`NoopOciOpRecorder`）。
+pub fn extract_layers<R: Read>(
+    layers: impl IntoIterator<Item = R>,
+    root: &Path,
+    limits: ExtractLimits,
+) -> Result<Vec<ExtractedLayer>, OciError> {
+    extract_layers_with(&NoopOciOpRecorder, layers, root, limits)
+}
+
+/// 複数レイヤーの tar を下位から上位の順に同一 `root` へ重ねて展開する（TASK-52.4・OCI-1・#410）。
+///
+/// `layers` は下位（ベース）から上位の順の tar バイトストリーム。同じパスは後のレイヤーが勝つ。
+/// 戻り値はレイヤーごとの結果（入力と同じ順）。`root` が空であることは最初のレイヤーの前に 1 回だけ検査し、
+/// 別表記の索引（IO-5）・遅延ディレクトリ mode・上限は全レイヤーで共有する（上限は全体で累積）。
+/// 各レイヤーを `OciOpKind::ExtractLayer` として 1 回ずつ `recorder` へ記録する（REPAIR-4）。
+/// whiteout（`.wh.*`）は未対応（TASK-53）。空の `layers` は `InvalidArgument`。契約はモジュール冒頭を参照。
+pub fn extract_layers_with<R: Read>(
+    recorder: &dyn OciOpRecorder,
+    layers: impl IntoIterator<Item = R>,
+    root: &Path,
+    limits: ExtractLimits,
+) -> Result<Vec<ExtractedLayer>, OciError> {
+    extract_stack(recorder, layers, Ok, root, limits, host_lstat)
+}
+
+/// 計装なしの `extract_layer_blobs_with`（`NoopOciOpRecorder`）。
+pub fn extract_layer_blobs(
+    blob_paths: &[&Path],
+    root: &Path,
+    max_uncompressed_bytes: u64,
+    limits: ExtractLimits,
+) -> Result<Vec<ExtractedLayer>, OciError> {
+    extract_layer_blobs_with(
+        &NoopOciOpRecorder,
+        blob_paths,
+        root,
+        max_uncompressed_bytes,
+        limits,
+    )
+}
+
+/// 圧縮レイヤー blob（すべて digest 検証済み。下位から上位の順）を重ねて展開する（TASK-52.4・OCI-1・#410）。
+///
+/// `max_uncompressed_bytes` は各レイヤーの gzip 展開後の上限。その他は `extract_layers_with` と同じ。
+pub fn extract_layer_blobs_with(
+    recorder: &dyn OciOpRecorder,
+    blob_paths: &[&Path],
+    root: &Path,
+    max_uncompressed_bytes: u64,
+    limits: ExtractLimits,
+) -> Result<Vec<ExtractedLayer>, OciError> {
+    extract_stack(
+        recorder,
+        blob_paths.iter().copied(),
+        |p| open_gzip_layer(p, max_uncompressed_bytes),
+        root,
+        limits,
+        host_lstat,
+    )
 }
 
 /// 展開先 FS の名前解決（`lstat`）。既定は `fs::symlink_metadata`。
@@ -1020,21 +1098,8 @@ impl Extractor<'_> {
     }
 }
 
-fn extract_inner<R: Read>(
-    src: R,
-    root: &Path,
-    limits: ExtractLimits,
-) -> Result<ExtractedLayer, OciError> {
-    extract_with_lstat(src, root, limits, host_lstat)
-}
-
-/// `extract_inner` の本体。`lstat` は展開先 FS の名前解決で、テストだけが差し替える（`Lstat` を参照）。
-fn extract_with_lstat<R: Read>(
-    src: R,
-    root: &Path,
-    limits: ExtractLimits,
-    lstat: Lstat,
-) -> Result<ExtractedLayer, OciError> {
+/// `root` が既存の空ディレクトリであることを確かめる（最初のレイヤーの前に 1 回だけ呼ぶ）。
+fn check_root_empty(root: &Path) -> Result<(), OciError> {
     match fs::symlink_metadata(root) {
         Ok(m) if m.is_dir() => {}
         Ok(_) => {
@@ -1048,29 +1113,30 @@ fn extract_with_lstat<R: Read>(
     // 別表記の衝突の判定（`Extractor::probe`）は「`root` 配下の実在項目はすべてこの展開が作った」ことに依る。
     // 呼び出し契約（空のステージング）を前提にせず、ここで確かめる（IO-5）。
     match fs::read_dir(root).map_err(|e| map_fs_err(&e))?.next() {
-        None => {}
-        Some(Ok(_)) => {
-            return Err(err(
-                OciErrorCode::FailedPrecondition,
-                "extraction root is not empty",
-            ));
-        }
-        Some(Err(e)) => return Err(map_fs_err(&e)),
+        None => Ok(()),
+        Some(Ok(_)) => Err(err(
+            OciErrorCode::FailedPrecondition,
+            "extraction root is not empty",
+        )),
+        Some(Err(e)) => Err(map_fs_err(&e)),
     }
+}
+
+/// 1 レイヤー分の tar を `x` へ展開する。`input_budget` はこのレイヤーに残された入力バイト数の上限。
+///
+/// 戻り値は（このレイヤー分の結果〔`x` のカウンタの差分〕, 読み取った入力バイト数）。
+/// `finish_dirs` は呼ばない（全レイヤーの展開後に 1 回だけ呼ぶため）。
+fn extract_one_layer<R: Read>(
+    x: &mut Extractor<'_>,
+    src: R,
+    input_budget: u64,
+) -> Result<(ExtractedLayer, u64), OciError> {
+    let (entries0, bytes0, stripped0) = (x.entries, x.bytes, x.stripped_special);
+    let max_entries = x.limits.max_entries;
     let mut src = LimitedReader {
         inner: src,
         read: 0,
-        limit: limits.max_input_bytes,
-    };
-    let mut x = Extractor {
-        root,
-        limits,
-        entries: 0,
-        bytes: 0,
-        stripped_special: 0,
-        deferred_dirs: HashMap::new(),
-        names: NameIndex::new(limits.max_tracked_paths),
-        lstat,
+        limit: input_budget,
     };
     {
         let mut archive = Archive::new(TarGuard::new(&mut src));
@@ -1081,7 +1147,7 @@ fn extract_with_lstat<R: Read>(
                 continue;
             }
             x.entries += 1;
-            if x.entries > limits.max_entries {
+            if x.entries > max_entries {
                 return Err(err(
                     OciErrorCode::ResourceExhausted,
                     "layer exceeds the entry count limit",
@@ -1127,7 +1193,6 @@ fn extract_with_lstat<R: Read>(
             }
         }
     }
-    x.finish_dirs()?;
     // tar 終端後の残りを読み捨て、gzip トレーラ（CRC32・ISIZE）を検証させる。
     let mut buf = vec![0u8; COPY_BUF_LEN];
     loop {
@@ -1143,11 +1208,101 @@ fn extract_with_lstat<R: Read>(
             }
         }
     }
-    Ok(ExtractedLayer {
-        entries: x.entries,
-        bytes: x.bytes,
-        files_with_stripped_special_bits: x.stripped_special,
-    })
+    Ok((
+        ExtractedLayer {
+            entries: x.entries.saturating_sub(entries0),
+            bytes: x.bytes.saturating_sub(bytes0),
+            files_with_stripped_special_bits: x.stripped_special.saturating_sub(stripped0),
+        },
+        src.read,
+    ))
+}
+
+/// レイヤー列を `root` へ下位から順に重ねて展開する本体（単一レイヤー API もこれの 1 要素版）。
+///
+/// `open` は各要素から tar バイトストリームを開く（blob 版は gzip を開く）。`Extractor`（別表記の索引・
+/// 遅延ディレクトリ mode・上限のカウンタ）は全レイヤーで共有し、上限は全体で累積する。`lstat` は
+/// テストだけが差し替える（`Lstat` を参照）。
+fn extract_stack<T, R: Read>(
+    recorder: &dyn OciOpRecorder,
+    layers: impl IntoIterator<Item = T>,
+    mut open: impl FnMut(T) -> Result<R, OciError>,
+    root: &Path,
+    limits: ExtractLimits,
+    lstat: Lstat,
+) -> Result<Vec<ExtractedLayer>, OciError> {
+    let mut x: Option<Extractor<'_>> = None;
+    let mut input_used = 0u64;
+    let mut out = Vec::new();
+    let mut layers = layers.into_iter().peekable();
+    while let Some(item) = layers.next() {
+        // 空の reader は件数・入力バイトを消費しないため、既存の上限では結果の Vec の増加を止められない。
+        if out.len() >= MAX_LAYERS {
+            return Err(err(
+                OciErrorCode::ResourceExhausted,
+                "image exceeds the layer count limit",
+            ));
+        }
+        let is_last = layers.peek().is_none();
+        let res = record_oci_op(recorder, OciOpKind::ExtractLayer, || {
+            let src = open(item)?;
+            if x.is_none() {
+                check_root_empty(root)?;
+                x = Some(Extractor {
+                    root,
+                    limits,
+                    entries: 0,
+                    bytes: 0,
+                    stripped_special: 0,
+                    deferred_dirs: HashMap::new(),
+                    names: NameIndex::new(limits.max_tracked_paths),
+                    lstat,
+                });
+            }
+            let Some(ex) = x.as_mut() else {
+                return Err(err(OciErrorCode::Internal, "extractor is not initialized"));
+            };
+            let budget = limits.max_input_bytes.saturating_sub(input_used);
+            let (layer, read) = extract_one_layer(ex, src, budget)?;
+            input_used = input_used.saturating_add(read);
+            // 遅延ディレクトリ権限の適用は最後のレイヤーの記録に含める（失敗・所要時間を計装から漏らさない。REPAIR-4）。
+            if is_last {
+                ex.finish_dirs()?;
+            }
+            Ok(layer)
+        })?;
+        out.push(res);
+    }
+    if x.is_none() {
+        return Err(err(OciErrorCode::InvalidArgument, "no layers to extract"));
+    }
+    Ok(out)
+}
+
+/// 単一レイヤー版の結果（要素 1 つ）を取り出す。
+fn single(mut v: Vec<ExtractedLayer>) -> Result<ExtractedLayer, OciError> {
+    match (v.pop(), v.is_empty()) {
+        (Some(l), true) => Ok(l),
+        _ => Err(err(OciErrorCode::Internal, "unexpected layer result count")),
+    }
+}
+
+/// テスト用の単一レイヤー展開（`lstat` を差し替える）。
+#[cfg(test)]
+fn extract_with_lstat<R: Read>(
+    src: R,
+    root: &Path,
+    limits: ExtractLimits,
+    lstat: Lstat,
+) -> Result<ExtractedLayer, OciError> {
+    single(extract_stack(
+        &NoopOciOpRecorder,
+        [src],
+        Ok,
+        root,
+        limits,
+        lstat,
+    )?)
 }
 
 #[cfg(test)]
@@ -2410,5 +2565,260 @@ mod tests {
             code(run(&sb, &[symlink("a", "b")])),
             OciErrorCode::Unimplemented
         );
+    }
+
+    // ---- 複数レイヤーの重ね合わせ（TASK-52.4・OCI-1・#410） ----
+
+    const LIM: fn() -> ExtractLimits = || ExtractLimits::new(1000, 1 << 20, 1 << 30, 1 << 20);
+
+    fn run_stack(
+        sb: &Sandbox,
+        layers: &[Vec<Vec<u8>>],
+        limits: ExtractLimits,
+        lstat: Lstat,
+    ) -> Result<Vec<ExtractedLayer>, OciError> {
+        let tars: Vec<Vec<u8>> = layers.iter().map(|l| archive(l)).collect();
+        extract_stack(
+            &NoopOciOpRecorder,
+            tars.iter().map(|t| t.as_slice()),
+            Ok,
+            &sb.root,
+            limits,
+            lstat,
+        )
+    }
+
+    /// OCI-1: 上位レイヤーが下位の同名ファイルを上書きし、下位だけのファイルは残る。結果はレイヤーごと。
+    #[test]
+    fn oci1_stack_upper_layer_overwrites_lower() {
+        let sb = Sandbox::new();
+        let r = run_stack(
+            &sb,
+            &[
+                vec![file("f", 0o644, b"lower-long"), file("keep", 0o644, b"k")],
+                vec![file("f", 0o644, b"up"), file("new", 0o644, b"n")],
+            ],
+            LIM(),
+            host_lstat,
+        )
+        .unwrap();
+        assert_eq!(
+            r.iter().map(|l| (l.entries, l.bytes)).collect::<Vec<_>>(),
+            vec![(2, 11), (2, 3)]
+        );
+        assert_eq!(fs::read(sb.root.join("f")).unwrap(), b"up");
+        assert_eq!(fs::read(sb.root.join("keep")).unwrap(), b"k");
+        assert_eq!(fs::read(sb.root.join("new")).unwrap(), b"n");
+        assert_eq!(names_in(&sb.root), vec!["f", "keep", "new"]);
+    }
+
+    /// OCI-1: root が空でなければ最初のレイヤーの前に拒否し、既存項目に触れない。
+    #[test]
+    fn oci1_stack_rejects_non_empty_root() {
+        let sb = Sandbox::new();
+        fs::write(sb.root.join("pre"), b"x").unwrap();
+        let e = run_stack(&sb, &[vec![file("f", 0o644, b"a")]], LIM(), host_lstat).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(names_in(&sb.root), vec!["pre"]);
+    }
+
+    /// OCI-1: 空のレイヤー列は InvalidArgument。
+    #[test]
+    fn oci1_stack_rejects_empty_layer_list() {
+        let sb = Sandbox::new();
+        let e = run_stack(&sb, &[], LIM(), host_lstat).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::InvalidArgument);
+    }
+
+    /// OCI-1: エントリ数の上限は全レイヤーで累積する（各レイヤーは 2 件、上限 3）。
+    #[test]
+    fn oci1_stack_entry_limit_accumulates() {
+        let sb = Sandbox::new();
+        let layers = [
+            vec![file("a", 0o644, b"1"), file("b", 0o644, b"1")],
+            vec![file("c", 0o644, b"1"), file("d", 0o644, b"1")],
+        ];
+        let e = run_stack(
+            &sb,
+            &layers,
+            ExtractLimits::new(3, 1 << 20, 1 << 30, 1 << 20),
+            host_lstat,
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+        assert_eq!(e.message(), "layer exceeds the entry count limit");
+    }
+
+    /// OCI-1: 展開バイト数の上限は全レイヤーで累積する（各 6 バイト、上限 10）。
+    #[test]
+    fn oci1_stack_total_bytes_limit_accumulates() {
+        let sb = Sandbox::new();
+        let layers = [
+            vec![file("a", 0o644, b"123456")],
+            vec![file("b", 0o644, b"123456")],
+        ];
+        let e = run_stack(
+            &sb,
+            &layers,
+            ExtractLimits::new(100, 10, 1 << 30, 1 << 20),
+            host_lstat,
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+    }
+
+    /// OCI-1: 入力バイト数の上限も全レイヤーで累積する（1 レイヤー 2048 バイト、上限 3000）。
+    #[test]
+    fn oci1_stack_input_limit_accumulates() {
+        let sb = Sandbox::new();
+        let layers = [vec![file("a", 0o644, b"1")], vec![file("b", 0o644, b"1")]];
+        // 1 レイヤーは 512（ヘッダ）+ 512（データ）+ 1024（終端）= 2048 バイト。
+        assert!(
+            run_stack(
+                &sb,
+                &layers[..1],
+                ExtractLimits::new(100, 1 << 20, 3000, 1 << 20),
+                host_lstat
+            )
+            .is_ok()
+        );
+        let sb2 = Sandbox::new();
+        let e = run_stack(
+            &sb2,
+            &layers,
+            ExtractLimits::new(100, 1 << 20, 3000, 1 << 20),
+            host_lstat,
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+        assert_eq!(e.message(), "layer tar stream exceeds the input size limit");
+    }
+
+    /// IO-5 / OCI-1: 別表記の衝突検出はレイヤーをまたいで効く（下位の `f` に上位が `F` の hardlink を張れない）。
+    #[test]
+    fn io5_stack_alias_spelling_collision_across_layers() {
+        let sb = Sandbox::new();
+        let e = run_stack(
+            &sb,
+            &[vec![file("f", 0o644, b"orig")], vec![hardlink("F", "f")]],
+            LIM(),
+            folding_lstat,
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::AlreadyExists);
+        assert_eq!(fs::read(sb.root.join("f")).unwrap(), b"orig");
+        assert_eq!(names_in(&sb.root), vec!["f"]);
+    }
+
+    /// OCI-1: 上位レイヤーの `..` は既存どおり拒否され、ルート外へは何も書かれない。
+    #[test]
+    fn oci1_stack_upper_layer_traversal_is_rejected() {
+        let sb = Sandbox::new();
+        let e = run_stack(
+            &sb,
+            &[
+                vec![file("f", 0o644, b"a")],
+                vec![file("../escape", 0o644, b"x")],
+            ],
+            LIM(),
+            host_lstat,
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::PermissionDenied);
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-1: 上位レイヤーがディレクトリの位置へファイルを置く置換は未実装で、fail-closed に拒否する。
+    #[test]
+    fn oci1_stack_dir_to_file_replacement_is_rejected() {
+        let sb = Sandbox::new();
+        let e = run_stack(
+            &sb,
+            &[
+                vec![dir("d/", 0o755), file("d/x", 0o644, b"x")],
+                vec![file("d", 0o644, b"f")],
+            ],
+            LIM(),
+            host_lstat,
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(fs::read(sb.root.join("d/x")).unwrap(), b"x");
+    }
+
+    /// OCI-1: 下位が 0555 のディレクトリへ上位が書き込め、最終 mode は 0555（遅延適用は全レイヤー後）。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_stack_upper_writes_into_readonly_lower_dir() {
+        let sb = Sandbox::new();
+        run_stack(
+            &sb,
+            &[vec![dir("d/", 0o555)], vec![file("d/x", 0o644, b"up")]],
+            LIM(),
+            host_lstat,
+        )
+        .unwrap();
+        assert_eq!(fs::read(sb.root.join("d/x")).unwrap(), b"up");
+        assert_eq!(mode_of(&sb.root.join("d")), 0o555);
+    }
+
+    /// REPAIR-4: 各レイヤーを ExtractLayer として 1 回ずつ記録する。
+    #[test]
+    fn repair4_stack_records_one_sample_per_layer() {
+        let sb = Sandbox::new();
+        let rec = Collect::default();
+        let tars = [
+            archive(&[file("a", 0o644, b"1")]),
+            archive(&[file("b", 0o644, b"1")]),
+        ];
+        extract_layers_with(&rec, tars.iter().map(|t| t.as_slice()), &sb.root, LIM()).unwrap();
+        let s = rec.0.lock().unwrap();
+        assert_eq!(s.len(), 2);
+        assert!(s.iter().all(|x| x.kind() == OciOpKind::ExtractLayer));
+        assert!(s.iter().all(|x| x.outcome() == OciOpOutcome::Success));
+    }
+
+    /// REPAIR-4: 最終のディレクトリ権限適用（finish_dirs）の失敗は最後のレイヤーの記録に Failure として含まれる。
+    #[test]
+    fn repair4_finish_dirs_failure_is_recorded() {
+        struct SwapAtEof {
+            data: std::io::Cursor<Vec<u8>>,
+            dir: PathBuf,
+            done: bool,
+        }
+        impl Read for SwapAtEof {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.data.read(buf)?;
+                if n == 0 && !self.done {
+                    self.done = true;
+                    fs::remove_dir(&self.dir)?;
+                    fs::write(&self.dir, b"x")?;
+                }
+                Ok(n)
+            }
+        }
+        let sb = Sandbox::new();
+        let rec = Collect::default();
+        let src = SwapAtEof {
+            data: std::io::Cursor::new(archive(&[dir("d", 0o555)])),
+            dir: sb.root.join("d"),
+            done: false,
+        };
+        let e = extract_layers_with(&rec, [src], &sb.root, LIM()).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        let s = rec.items();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].outcome(), OciOpOutcome::Failure);
+        assert_eq!(s[0].error_code(), Some(OciErrorCode::FailedPrecondition));
+    }
+
+    /// 空レイヤーを無限に供給してもレイヤー数の上限で ResourceExhausted になる（結果 Vec が増え続けない）。
+    #[test]
+    fn stack_rejects_unbounded_empty_layers() {
+        let sb = Sandbox::new();
+        let layers = std::iter::repeat_with(std::io::empty);
+        let e = extract_layers(layers, &sb.root, LIM()).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+        assert_eq!(e.message(), "image exceeds the layer count limit");
     }
 }

@@ -31,6 +31,8 @@
 //! パス検証、ルートに閉じ込めた symlink 解決、hardlink の制限、エントリ数・累積サイズの上限を持つ。
 //! 展開先 FS が別表記（大文字小文字・Unicode 正規化）を既存の実体へ解決する名前は、変更操作の前に
 //! `AlreadyExists` で拒否する（IO-5）。
+//! 複数レイヤーは `layer::extract::extract_layers` / `extract_layer_blobs` で下位から同一ルートへ重ねて展開する
+//! （TASK-52.4・OCI-1・#410。whiteout は TASK-53 で未実装）。
 //! 未実装: ディレクトリ fd 起点の解決（TOCTOU 対策）、uid / gid 写像（SEC-5）、通常ファイルの
 //! setuid / setgid / sticky の保持（所有者の写像が入るまで落とし、件数を結果に返す。SEC-5）、綴りの畳み込みによる
 //! 名前衝突の検出（展開先 FS が区別する別表記は衝突として扱わない。IO-5）。

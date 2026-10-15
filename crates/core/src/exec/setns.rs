@@ -113,9 +113,10 @@
 //!   経路は実装済み（#1465）。この段関数単体は記録せず、`ExecError::violation` に載せて返すところまで
 //! - supervisor が起動時から保持する pidfd の、別プロセスの exec 専用プロセスへの受け渡し（execve 越しの継承・
 //!   `SCM_RIGHTS`。fork 継承は supervisor `exec::run_command_with_pidfd` で実装済み。#1461）
-//! - 本番 launcher（#1715 の Phase B）が PID 1 の pidfd を supervisor へ渡す手段（subreaper のもとで回収前に
-//!   `pidfd_open` する、または `SCM_RIGHTS`）。subreaper による pid 指定の回収経路自体は `ChildSubreaper`
-//!   （`exec/subreaper.rs`。#1813）で追加済みで、pidfd の受け渡しだけが未実装。記録 pid の契約は下記のとおり固定した（#1463）
+//! - 本番 launcher（`ProductionLauncher`）が起動した PID 1 の pidfd は `LaunchedProcess::launch_pidfd` で呼び出し側へ返す
+//!   （実装済み。#1816）。別プロセスの supervisor へ渡す手段（`SCM_RIGHTS` 等）と subreaper のもとで回収前に
+//!   `pidfd_open` する経路の結線は未実装。subreaper による pid 指定の回収経路自体は `ChildSubreaper`
+//!   （`exec/subreaper.rs`。#1813）で追加済み。記録 pid の契約は下記のとおり固定した（#1463）
 //!
 //! # 記録 pid の契約と pid1 の特定（#1463・TASK-163 追補）
 //!

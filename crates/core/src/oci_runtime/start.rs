@@ -472,6 +472,16 @@ fn start_inner(
     };
     let process = match launched {
         Ok(Ok(p)) => p,
+        // 回収を確認できていない子が残り得る失敗は、予約を Created へ戻さない(戻すと二重起動・delete が通る。CORE-2)。
+        Ok(Err(err)) if launcher.last_launch_may_have_left_process() => {
+            return Err(TraitError::new(
+                err.code(),
+                format!(
+                    "{}; a launched process may remain, so the start reservation remains until recovered",
+                    err.message()
+                ),
+            ));
+        }
         Ok(Err(err)) => return Err(release_claim(store, req.id(), &claimed, err)),
         // launch は呼ばれていないため予約を戻してよい。
         Err(Unbounded::SpawnFailed) => {
@@ -914,6 +924,8 @@ mod tests {
         self_bounded: AtomicBool,
         /// launch を呼んだスレッドの ID（呼び出し順）。
         launch_threads: Mutex<Vec<std::thread::ThreadId>>,
+        /// 失敗した launch が子を残し得ると答えるか（`last_launch_may_have_left_process`。CORE-2）。
+        may_leave: AtomicBool,
     }
 
     impl RecordingLauncher {
@@ -930,6 +942,7 @@ mod tests {
                 pid: std::sync::atomic::AtomicU32::new(4242),
                 self_bounded: AtomicBool::new(false),
                 launch_threads: Mutex::new(Vec::new()),
+                may_leave: AtomicBool::new(false),
             })
         }
 
@@ -984,6 +997,10 @@ mod tests {
             } else {
                 LaunchMode::CallerBounded
             }
+        }
+
+        fn last_launch_may_have_left_process(&self) -> bool {
+            self.may_leave.load(Ordering::SeqCst)
         }
 
         fn confirm_no_process(
@@ -1271,6 +1288,35 @@ mod tests {
             ))
             .expect("stored");
         assert_eq!(got.status().state(), ContainerState::Created);
+        assert_eq!(launcher.calls(), 1);
+    }
+
+    /// CORE-2: 失敗した launch が子を残し得るなら、予約(Running・pid なし)を Created へ戻さず、同じ ID の
+    /// 再 start は中断された start として拒否される(二重起動させない)。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core2_launch_failure_that_may_leave_a_process_keeps_the_reservation() {
+        let (_b, store) = created("may-leave");
+        let launcher = RecordingLauncher::new(true);
+        launcher.self_bounded.store(true, Ordering::SeqCst);
+        launcher.may_leave.store(true, Ordering::SeqCst);
+        let err = run(&store, &launcher, "may-leave").expect_err("launch fails");
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert!(
+            err.message()
+                .contains("the start reservation remains until recovered"),
+            "{}",
+            err.message()
+        );
+        let got = store
+            .get(&GetStateRequest::new(
+                ContainerId::new("may-leave").expect("id"),
+            ))
+            .expect("stored");
+        assert_eq!(got.status().state(), ContainerState::Running);
+        assert_eq!(got.status().pid(), None);
+        let again = run(&store, &launcher, "may-leave").expect_err("second start");
+        assert_eq!(again.code(), ErrorCode::FailedPrecondition);
         assert_eq!(launcher.calls(), 1);
     }
 

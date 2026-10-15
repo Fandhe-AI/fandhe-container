@@ -432,6 +432,8 @@ pub struct LaunchSpec {
 }
 
 impl LaunchSpec {
+    // 理由: start が一度だけ検証した各値を欠落なく束ねる唯一の構築点で、同じ型の引数を取り違えない
+    // よう公開しない(`pub(super)`)。呼び出しは start の 1 か所だけのため、引数用の中間構造体は設けない。
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         rootfs: PathBuf,
@@ -774,6 +776,16 @@ pub trait ProcessLauncher: Send + Sync {
         spec: &LaunchSpec,
         timeout: Duration,
     ) -> Result<Box<dyn LaunchedProcess>, TraitError>;
+
+    /// 直近の `launch` が `Err` で戻ったとき、回収を確認できていない子が残っている可能性があるか(CORE-2)。
+    ///
+    /// `true` なら start は起動予約(Running・pid なし)を `Created` へ戻さず保持する。戻すと、残った子が
+    /// いる状態で同じ ID の start や(cgroup 記録のない構成での)delete が通ってしまうため。回復は
+    /// `recover_interrupted_start`(`confirm_no_process` による確認つき)に限る。`launch` が `Ok` のときは
+    /// 呼ばれない。既定は `false`(失敗時にプロセスを残さない契約を信頼する)。
+    fn last_launch_may_have_left_process(&self) -> bool {
+        false
+    }
 
     /// `id` の起動が生存プロセスを残していないことを確認する（中断された start の回復用。CORE-2・SEC-1）。
     ///

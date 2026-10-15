@@ -42,14 +42,19 @@
 //!
 //! # 未実装・残余(REPAIR-3)
 //!
-//! - I が PID 1 を作った後、報告前に殺されると、C は PID 1 の pid を知れない(報告を失敗させた場合は I 自身が
-//!   PID 1 を kill する)。この経路の保証と `confirm_no_process` は #1817 の範囲
+//! - **報告前の PID 1(CORE-2)**: I が PID 1 を作った後、`K` の報告前に停止・終了すると C は pid を知れない。
+//!   I は fork の直前に起動ごとの識別子(`LaunchTag`)を `comm` へ設定し、PID 1 はそれを継承する。C は報告の
+//!   無い失敗で I を SIGKILL して回収した後(PID 1 は C へ再親付け済み)、`/proc` から「親が C で `comm` が
+//!   識別子と一致する」子を探して `kill_and_reap` する(`recover_unreported_init`)。I を回収できない場合は
+//!   再親付けが起きないため探索せず、I を `unreaped` で返す(呼び出し側が起動予約を保持する。`confirm_no_process`
+//!   は #1817 の範囲)。報告が `R`(失敗)の経路は PID 1 を作っていないため探索しない
 //! - 回収できなかった子は [`PreparedLaunchFailure::unreaped`] で呼び出し側(launcher)へ返す。握りつぶさない
 //! - `dev.tty.legacy_tiocsti` の警告出力(#1739)は本入口に足していない
 
 use std::io::Write as _;
 use std::num::NonZeroU32;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::audit_log::AuditedRejection;
@@ -275,6 +280,45 @@ fn report_read_error(e: PrePivotStatusError) -> ExecError {
     ExecError::new(code, IsolationStage::Spawn, what)
 }
 
+/// 起動ごとの識別子(`comm` に設定する 15 バイト以下の ASCII 名。CORE-2)。
+///
+/// 報告前に失われた PID 1 を C が特定するための印で、同じプロセス内の起動ごとに異なる(カウンタ)。
+/// `execve` で `comm` は実行ファイル名に置き換わるため、起動に成功したコンテナとは衝突しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LaunchTag {
+    comm: [u8; 16],
+    len: usize,
+}
+
+static LAUNCH_TAG_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+impl LaunchTag {
+    /// 新しい識別子(`fdh-l` + 8 桁の 16 進カウンタ = 13 バイト)。
+    pub(super) fn fresh() -> Self {
+        let n = LAUNCH_TAG_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let text = format!("fdh-l{n:08x}");
+        let mut comm = [0u8; 16];
+        let len = text.len().min(15);
+        if let (Some(dst), Some(src)) = (comm.get_mut(..len), text.as_bytes().get(..len)) {
+            dst.copy_from_slice(src);
+        }
+        Self { comm, len }
+    }
+
+    /// `PR_SET_NAME` へ渡す NUL 終端つきの 16 バイト。
+    fn comm_bytes(&self) -> &[u8; 16] {
+        &self.comm
+    }
+
+    /// `/proc/<pid>/comm` の内容(LF 抜き)との照合に使う名前。
+    fn name(&self) -> &str {
+        self.comm
+            .get(..self.len)
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .unwrap_or("")
+    }
+}
+
 /// 中間プロセスの各動作(単体テストが呼び出し順を記録できるよう差し替え可能にした継ぎ目。本番の実装は
 /// [`RealIntermediateOps`] で、既存の公開関数を呼ぶだけ)。
 pub(super) trait IntermediateOps {
@@ -333,6 +377,7 @@ struct RealIntermediateOps<'a> {
     stdio: Option<ChildStdio>,
     setup: PrePivotSetup<'a>,
     report: &'a std::fs::File,
+    tag: LaunchTag,
 }
 
 impl IntermediateOps for RealIntermediateOps<'_> {
@@ -349,6 +394,10 @@ impl IntermediateOps for RealIntermediateOps<'_> {
             ));
         };
         let (rootfs, entry, setup) = (self.rootfs, self.entry, self.setup);
+        // 識別子は fork で PID 1 へ継承される。設定できなければ、報告前に失われた PID 1 を C が特定できなく
+        // なるため、PID 1 を作らずに失敗させる(fail-closed。CORE-2)。
+        sys::set_process_comm(self.tag.comm_bytes())
+            .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "set the launch tag"))?;
         // 親(I)の stdio バッファを子が二重に出力しないよう flush しない経路を使う。子は `_exit` するだけ。
         sys::fork_single_threaded_no_flush(
             move || child_main(rootfs, entry, stages, Some(setup), stdio),
@@ -404,6 +453,7 @@ pub(crate) fn spawn_container_via_intermediate(
         entry,
         setup,
     } = spec;
+    let tag = LaunchTag::fresh();
     launch_via_intermediate(
         sys::self_is_single_threaded,
         |status, report| {
@@ -418,12 +468,14 @@ pub(crate) fn spawn_container_via_intermediate(
                     ..setup
                 },
                 report,
+                tag,
             };
             intermediate_body(&mut ops)
         },
         subreaper,
         audit,
         timeout,
+        &tag,
     )
 }
 
@@ -438,6 +490,7 @@ fn launch_via_intermediate(
     subreaper: &ChildSubreaper,
     audit: LaunchAudit<'_>,
     timeout: Duration,
+    tag: &LaunchTag,
 ) -> Result<ContainerChild, Box<PreparedLaunchFailure>> {
     let not_started = |e: ExecError| {
         Box::new(PreparedLaunchFailure {
@@ -477,10 +530,14 @@ fn launch_via_intermediate(
         }
         Err(e) => {
             // 報告が無い中間プロセスは眠っている可能性があるため、待たずに殺して回収する。
-            return Err(kill_intermediate_failure(
-                intermediate_child,
-                report_read_error(e),
-            ));
+            let mut failure = kill_intermediate_failure(intermediate_child, report_read_error(e));
+            // 中間プロセスが死んだ後なら、報告前に作られた PID 1 は C へ再親付け済みで、識別子で特定できる。
+            // 中間プロセスを回収できていなければ再親付けされておらず、探索しても見つからない(返す `unreaped` に
+            // 中間プロセスが残るため、呼び出し側は起動予約を保持する)。
+            if failure.unreaped.is_empty() {
+                recover_unreported_init(&mut failure, tag, subreaper);
+            }
+            return Err(failure);
         }
     };
 
@@ -520,6 +577,71 @@ fn launch_via_intermediate(
                 reap_error: Some(reap_error),
             })),
         },
+    }
+}
+
+/// `/proc/<pid>/stat` から親 pid を読む(`comm` に空白や `)` が含まれても、最後の `)` の後ろから読む)。
+fn parent_pid_of(stat: &str) -> Option<u32> {
+    let after = stat.rsplit_once(')')?.1;
+    // 続くフィールド: state ppid ...
+    after.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// 報告前に失われた PID 1 を特定して kill・回収し、回収できなかったものを `failure.unreaped` へ足す(CORE-2)。
+///
+/// 対象は「親が C 自身で、`comm` が `tag` と一致する」子だけ。`/proc` の読み取りに失敗しても起動失敗の理由は
+/// 変えない(探索できなかった事実は握りつぶさず `reap_error` に `Internal` を残す)。探索は失敗経路でのみ
+/// 走り、成功経路の負荷にならない。
+fn recover_unreported_init(
+    failure: &mut PreparedLaunchFailure,
+    tag: &LaunchTag,
+    subreaper: &ChildSubreaper,
+) {
+    let me = std::process::id();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        note_reap_failure(
+            failure,
+            ErrorCode::Internal,
+            "cannot scan /proc for the init",
+        );
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+            .and_then(NonZeroU32::new)
+        else {
+            continue;
+        };
+        let base = Path::new("/proc").join(pid.get().to_string());
+        let is_child = std::fs::read_to_string(base.join("stat"))
+            .ok()
+            .and_then(|stat| parent_pid_of(&stat))
+            == Some(me);
+        if !is_child {
+            continue;
+        }
+        let tagged = std::fs::read_to_string(base.join("comm"))
+            .is_ok_and(|comm| comm.trim_end_matches('\n') == tag.name());
+        if !tagged {
+            continue;
+        }
+        let child = ContainerChild::adopt_reparented(pid, subreaper);
+        if let Err(e) = child.kill_and_reap(KILL_REAP_TIMEOUT) {
+            if failure.reap_error.is_none() {
+                failure.reap_error = Some(e);
+            }
+            failure.unreaped.push(child);
+        }
+    }
+}
+
+/// 探索自体ができなかったことを `reap_error` に残す(未回収の子が無くても、呼び出し側が残存を疑えるようにする)。
+fn note_reap_failure(failure: &mut PreparedLaunchFailure, code: ErrorCode, what: &'static str) {
+    if failure.reap_error.is_none() {
+        failure.reap_error = Some(ExecError::new(code, IsolationStage::Wait, what));
     }
 }
 
@@ -798,6 +920,8 @@ mod tests {
         PidOneSilent,
         /// 中間プロセスが何も報告せず眠る(報告の期限切れ)。
         IntermediateSilent,
+        /// 中間プロセスが識別子を設定して PID 1 を作り、`K` を報告する前に眠る(報告前の PID 1。CORE-2)。
+        PidOneBeforeReport,
         /// 中間プロセスが isolate の失敗を報告して終了する。
         IsolateFails,
         /// 中間プロセスが不正な行を書いて終了する。
@@ -839,6 +963,7 @@ mod tests {
             sink: &sink,
             container: Some(&id),
         };
+        let tag = LaunchTag::fresh();
         let result = launch_via_intermediate(
             || true,
             |status, report| {
@@ -877,6 +1002,15 @@ mod tests {
                         let _ = w.write_all(&std::process::id().to_le_bytes());
                         std::thread::sleep(Duration::from_secs(120));
                     }
+                    Behavior::PidOneBeforeReport => {
+                        sys::set_process_comm(tag.comm_bytes()).expect("set the tag");
+                        let _pid1 = fork_stand_in(status, &pid_write, |_| {
+                            std::thread::sleep(Duration::from_secs(120));
+                            0
+                        });
+                        // 報告せずに眠る(C は期限切れで中間プロセスを殺す)。
+                        std::thread::sleep(Duration::from_secs(120));
+                    }
                     Behavior::IsolateFails => {
                         send_report(
                             report,
@@ -898,6 +1032,7 @@ mod tests {
             &subreaper,
             audit,
             timeout,
+            &tag,
         );
         drop(pid_write);
         let mut buf = [0u8; 4];
@@ -985,6 +1120,41 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(30));
     }
 
+    /// CORE-2(#1816): 中間プロセスが PID 1 を作った後、`K` の報告前に止まっても、C は識別子で再親付けされた
+    /// PID 1 を特定して回収する(残さない)。報告されない PID 1 の pid は fork_stand_in がテストへ渡す。
+    #[test]
+    fn core2_via_intermediate_unreported_init_is_recovered_by_tag() {
+        let (result, _sink, pid1) = run(Behavior::PidOneBeforeReport, Duration::from_millis(500));
+        let failure = result.expect_err("launch must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::Timeout);
+        assert!(failure.unreaped.is_empty());
+        assert!(failure.reap_error.is_none());
+        let pid1 = pid1.expect("the stand-in pid");
+        // 回収済みならゾンビも含めて `/proc/<pid>` が無い。
+        assert!(
+            gone(pid1),
+            "the unreported init {pid1} must be killed and reaped"
+        );
+    }
+
+    /// CORE-2: 識別子は起動ごとに異なり、15 バイト以下の ASCII。
+    #[test]
+    fn core2_launch_tag_is_unique_and_fits_comm() {
+        let (a, b) = (LaunchTag::fresh(), LaunchTag::fresh());
+        assert_ne!(a.name(), b.name());
+        assert_eq!(a.name().len(), 13);
+        assert!(a.name().starts_with("fdh-l"));
+        assert_eq!(a.comm_bytes().get(13), Some(&0));
+    }
+
+    /// CORE-2: `/proc/<pid>/stat` の親 pid は、comm に空白と `)` を含んでも読める。
+    #[test]
+    fn core2_parent_pid_parses_tricky_comm() {
+        assert_eq!(parent_pid_of("123 (a b) c) S 456 1 1 0"), Some(456));
+        assert_eq!(parent_pid_of("123 (x) S 7 1 1 0"), Some(7));
+        assert_eq!(parent_pid_of("garbage"), None);
+    }
+
     /// SEC-5(#1816): isolate の失敗報告は元の `ErrorCode` と固定文言で返り、監査は 0 件。
     #[test]
     fn sec5_via_intermediate_isolate_failure_is_propagated() {
@@ -1027,6 +1197,7 @@ mod tests {
             &subreaper,
             audit,
             Duration::from_secs(1),
+            &LaunchTag::fresh(),
         );
         let failure = result.expect_err("must refuse");
         assert_eq!(failure.rejection.error.code, ErrorCode::FailedPrecondition);

@@ -2407,7 +2407,8 @@ pub(crate) struct PreparedLaunchFailure {
     pub(crate) rejection: AuditedRejection<ExecError>,
     /// 回収できなかった子(回収済みなら空。中間プロセスの回収失敗時は PID 1 も未回収なら 2 個になり得る)。
     pub(crate) unreaped: Vec<ContainerChild>,
-    /// `unreaped` が空でないときの回収失敗の理由(最初の失敗)。
+    /// 回収失敗の理由(最初の失敗)。`unreaped` が空でないとき、または報告前の PID 1 の探索自体ができなかったとき
+    /// (`unreaped` は空のまま)に `Some`。どちらも「子が残っている可能性」を表す(CORE-2)。
     pub(crate) reap_error: Option<ExecError>,
 }
 

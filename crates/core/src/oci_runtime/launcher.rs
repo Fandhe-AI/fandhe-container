@@ -37,12 +37,16 @@
 //!   (CORE-6・TASK-40.2。`LaunchSpec` が uid/gid 写像を持たない)は `Unimplemented` で拒否する
 //! - **`confirm_no_process`**: 既定(`Unimplemented`)のまま。中間プロセスが PID 1 を作った後に殺された場合の
 //!   pid の把握とあわせて #1817 で実装する。回収できなかった子は [`ProductionLauncher::take_unreaped`] で
-//!   取り出せる(握りつぶさない)
+//!   取り出せる(握りつぶさない)。報告前の PID 1 は起動ごとの識別子で特定して回収する(`exec` 側。CORE-2)。
+//!   回収できなかった子が残り得る失敗では、start が起動予約(Running・pid なし)を `Created` へ戻さない
+//!   ([`ProcessLauncher::last_launch_may_have_left_process`])
 //! - **supervisor の結線**: `launch` は呼び出しスレッドで直接呼ぶ必要があり、supervisor の `run_start`
 //!   手順 8 と restart の再 launch は別スレッドで呼んでいる。再構成は #1819 の範囲
 //! - mounts・bind mount・`/dev` 以外の tmpfs の注入は `start` が拒否済みで、ここでは載せない
 
 #[cfg(target_os = "linux")]
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -64,6 +68,8 @@ use crate::exec::{
 };
 #[cfg(target_os = "linux")]
 use crate::landlock::LandlockRuleset;
+#[cfg(target_os = "linux")]
+use crate::tmpfs::TmpfsMountSet;
 use crate::traits::{ErrorCode, TraitError};
 
 /// 本番の [`ProcessLauncher`]。構築は [`ProductionLauncher::builder`]。
@@ -234,6 +240,18 @@ impl ProcessLauncher for ProductionLauncher {
         LaunchMode::SelfBounded
     }
 
+    /// 直近の `launch` の失敗で、回収できなかった子が残っている可能性があるか(CORE-2)。
+    fn last_launch_may_have_left_process(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.left_process.load(Ordering::SeqCst)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            match self.never {}
+        }
+    }
+
     fn launch(
         &self,
         spec: &LaunchSpec,
@@ -293,6 +311,9 @@ struct Inner {
     audit_sink: Arc<dyn AuditSink>,
     cgroup_join_source: Option<JoinSource>,
     unreaped: Mutex<Vec<UnreapedChild>>,
+    /// 直近の `launch` が失敗し、子が残っている可能性があるか(回収に失敗した子がある、または報告前の PID 1 の
+    /// 探索ができなかった。CORE-2)。`launch` の入口で偽に戻す。
+    left_process: AtomicBool,
 }
 
 #[cfg(target_os = "linux")]
@@ -309,6 +330,7 @@ impl Inner {
             audit_sink,
             cgroup_join_source,
             unreaped: Mutex::new(Vec::new()),
+            left_process: AtomicBool::new(false),
         }
     }
 
@@ -317,6 +339,7 @@ impl Inner {
         spec: &LaunchSpec,
         timeout: Duration,
     ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+        self.left_process.store(false, Ordering::SeqCst);
         self.check_privilege()?;
         let means = if self.cgroup_join_source.is_some() {
             CgroupJoinMeans::Provided
@@ -403,6 +426,10 @@ impl Inner {
             reap_error,
         } = failure;
         let AuditedRejection { error, .. } = rejection;
+        // 回収できなかった子、または探索自体の失敗(`reap_error` のみ)は、プロセスが残る可能性を表す(CORE-2)。
+        if !unreaped.is_empty() || reap_error.is_some() {
+            self.left_process.store(true, Ordering::SeqCst);
+        }
         let reason = reap_error.map_or(ErrorCode::Internal, |e| e.code);
         self.unreaped
             .lock()
@@ -506,9 +533,19 @@ impl LaunchOps for RealOps {
                 ))
             })?;
         let (stdio, stdout, stderr) = ChildStdio::pipes().map_err(not_started)?;
+        // Landlock の ruleset は暗黙の `/dev/shm` を許可対象に含める(`landlock_implicit_mount_missing` で拒否
+        // されないよう、既定の `/dev/shm`〔64 MiB〕を `/dev` の後に載せる。CORE-5・#1654)。
+        let mut default_tmpfs = TmpfsMountSet::new();
+        default_tmpfs.ensure_default_dev_shm().map_err(|e| {
+            not_started(ExecError::new(
+                e.code(),
+                IsolationStage::Validate,
+                "failed to prepare the default /dev/shm mount",
+            ))
+        })?;
         let setup = PrePivotSetup {
             devices: crate::exec::DevptsGidSource::Rootless(&gid_map),
-            tmpfs: None,
+            tmpfs: Some(&default_tmpfs),
             inject: None,
             pinned_rootfs: Some(input.spec.rootfs_dir().as_fd()),
             status: None,
@@ -882,6 +919,30 @@ mod tests {
             .expect("failed");
         assert_eq!(err.code(), ErrorCode::PermissionDenied);
         assert_eq!(err.message(), "container launch failed in the Spawn stage");
+        // 子を残していない失敗では、起動予約を保持させない。
+        assert!(!l.last_launch_may_have_left_process());
+    }
+
+    /// CORE-2: 回収できなかった子がある失敗は「子が残り得る」と start へ伝え、次の launch の入口で戻る。
+    #[test]
+    fn core2_unreaped_child_marks_the_launch_as_possibly_leaving_a_process() {
+        let spec = spec_for("leave", serde_json::json!({}));
+        let ev = events();
+        let mut ops = FakeOps::new(&ev);
+        ops.fail_spawn = Some((ErrorCode::Timeout, true));
+        let l = launcher(ops, rootless(), None);
+        assert!(!l.last_launch_may_have_left_process());
+        l.launch(&spec, Duration::from_secs(1))
+            .err()
+            .expect("failed");
+        assert!(l.last_launch_may_have_left_process());
+        // 取り出しても印は残る(start は launch の直後に読む)。次の launch の入口で偽に戻る。
+        let _ = l.take_unreaped();
+        assert!(l.last_launch_may_have_left_process());
+        l.launch(&spec, Duration::from_secs(1))
+            .err()
+            .expect("failed");
+        assert!(l.last_launch_may_have_left_process());
     }
 
     /// 構築: 必須値の欠落は `InvalidArgument`(固定文言)。

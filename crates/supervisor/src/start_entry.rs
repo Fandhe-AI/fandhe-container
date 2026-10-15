@@ -853,6 +853,12 @@ impl ProcessLauncher for InstanceCheckedLauncher {
         self.inner.launch_mode()
     }
 
+    /// 内側の launcher の「子が残り得る」判定を転送する(転送しないと既定の `false` になり、回収できなかった
+    /// 子が残るのに起動予約が戻る。CORE-2)。
+    fn last_launch_may_have_left_process(&self) -> bool {
+        self.inner.last_launch_may_have_left_process()
+    }
+
     fn launch(
         &self,
         spec: &LaunchSpec,

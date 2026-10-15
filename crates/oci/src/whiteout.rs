@@ -8,16 +8,14 @@
 //!   root への閉じ込め・別表記の衝突検出（IO-5）は呼び出し側 `Extractor::remove_whiteout_target` が担う。
 //! - `remove_dir_contents_nofollow`: 不透明ディレクトリ（`.wh..wh..opq`。TASK-53.2・#413）用に、ディレクトリ自体は
 //!   残して直下の全エントリを再帰削除する。`NameClass::Opaque` を受けた呼び出し側が `Extractor::clear_opaque_dir`
-//!   経由で呼ぶ（接続は #414）。
+//!   経由で呼んでいた部品で、世代管理つきの `prune_lower` へ置き換わった。
 //!
-//! # 未実装（実装済みを装わない。REPAIR-3）
+//! # 統合（TASK-53.3・#414）
 //!
-//! 本モジュールは部品のみで、展開パイプライン `extract_one_layer` からはまだ呼ばれない。
-//!
-//! - 展開パイプラインへの統合（TASK-53.3・#414）。同一レイヤー内で whiteout より先に作ったエントリを
-//!   消さない（image-spec は whiteout を下位レイヤーのリソースにのみ適用すると定める）ための世代管理も
-//!   そこで行う。ここでの削除は「呼ばれた時点の root 内の実体」を消す。
-//!   不透明ディレクトリも同様で、`remove_dir_contents_nofollow` は「呼ばれた時点の実体」を全消しする。
+//! 部品は `layer::extract::extract_one_layer` から接続済み。「同一レイヤー内で先に作ったエントリを消さない」
+//! 世代管理は `Extractor` の `NameIndex` が担い、ここの `remove_tree_nofollow` は「呼ばれた時点の root 内の
+//! 実体」を消す。`remove_dir_contents_nofollow` は現状テストからのみ呼ばれる（不透明ディレクトリは世代対応の
+//! `Extractor::prune_lower` が担う）。
 
 use std::fs;
 use std::path::Path;
@@ -34,12 +32,11 @@ const RESERVED_PREFIX: &[u8] = b".wh..wh.";
 /// 1 コンポーネントの最大バイト数（`NAME_MAX`）。
 const MAX_NAME_BYTES: usize = 255;
 /// 再帰削除の深さ上限（作成時のコンポーネント数上限 256 に余裕を足した防御値）。
-const MAX_REMOVE_DEPTH: usize = 300;
+pub(crate) const MAX_REMOVE_DEPTH: usize = 300;
 
 /// tar エントリの最終コンポーネントの分類結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum NameClass {
     /// whiteout ではない通常の名前。
     Regular,
@@ -53,8 +50,7 @@ pub(crate) enum NameClass {
 ///
 /// 不正な whiteout（対象が空・`.`・`..`・`/` や NUL を含む・長すぎる、`.wh..wh.` の未知の予約名）は
 /// `InvalidArgument` で拒否する（`.wh...` を `..` の whiteout として解釈し親を消す事故を防ぐ）。
-/// TASK-53.3 で `extract_one_layer` から呼ぶまで未接続。
-#[cfg_attr(not(test), allow(dead_code))]
+/// `extract_one_layer` が各エントリの最終コンポーネントに対して呼ぶ（TASK-53.3）。
 pub(crate) fn classify(name: &[u8]) -> Result<NameClass, OciError> {
     if name == OPAQUE_MARKER {
         return Ok(NameClass::Opaque);
@@ -89,7 +85,6 @@ pub(crate) fn classify(name: &[u8]) -> Result<NameClass, OciError> {
 ///
 /// symlink はリンク自体だけを消し、リンク先は触らない。所有者の rwx が欠けるディレクトリ（0555・0000 等）は
 /// 先に権限を戻してから中身を消す。深さは `MAX_REMOVE_DEPTH` で打ち切る（`ResourceExhausted`）。
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn remove_tree_nofollow(path: &Path) -> Result<(), OciError> {
     remove_at(path, 0)
 }
@@ -144,7 +139,7 @@ fn remove_at(path: &Path, depth: usize) -> Result<(), OciError> {
 }
 
 #[cfg(unix)]
-fn make_dir_removable(path: &Path, meta: &fs::Metadata) -> Result<(), OciError> {
+pub(crate) fn make_dir_removable(path: &Path, meta: &fs::Metadata) -> Result<(), OciError> {
     use std::os::unix::fs::PermissionsExt as _;
     let mode = meta.permissions().mode();
     if mode & 0o700 != 0o700 {
@@ -157,7 +152,7 @@ fn make_dir_removable(path: &Path, meta: &fs::Metadata) -> Result<(), OciError> 
 #[cfg(not(unix))]
 // unix 側とシグネチャ（Result）をそろえ、呼び出し側を cfg 分岐させないため。
 #[allow(clippy::unnecessary_wraps)]
-fn make_dir_removable(_path: &Path, _meta: &fs::Metadata) -> Result<(), OciError> {
+pub(crate) fn make_dir_removable(_path: &Path, _meta: &fs::Metadata) -> Result<(), OciError> {
     Ok(())
 }
 

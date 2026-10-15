@@ -1,8 +1,17 @@
-//! `RuntimeService` の CRI 実装（TASK-57.1・TASK-57.2・TASK-57.3・#429・#430・#431・CRI-1・ERR-3）。
+//! `RuntimeService` の CRI 実装（TASK-57.1〜57.3・TASK-58.1・#429・#430・#431・#433・CRI-1・ERR-3）。
 //!
 //! `fandhe-container-plugin-cri`（TASK-108）が gRPC サーバーへ載せる `RuntimeService` 実装の本体。
 //! 本ファイルの時点で実装済みなのは `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・
-//! `PodSandboxStatus`・`ListPodSandbox` で、他の RPC は `Unimplemented` を返す（Container 系は TASK-58 で追加する）。
+//! `PodSandboxStatus`・`ListPodSandbox` と、`CreateContainer`・`StartContainer`（TASK-58.1）で、
+//! 他の RPC は `Unimplemented` を返す（Stop/Remove/List/Status の Container 系は TASK-58.2・58.3）。
+//!
+//! **Create/Start の扱い（CRI-1・ERR-3・TASK-58.1）**: cri-api の `CreateContainerRequest` にクライアント指定の
+//! ID はなく、ID はサービスが採番する。proto は `(metadata.name, metadata.attempt)` を sandbox 内で一意と
+//! 定めるため、同一サンドボックスで同じ組の再作成を `ALREADY_EXISTS`（「同一 ID の再作成」）とする。未知の
+//! サンドボックスは `NOT_FOUND`、停止済み（notready）のサンドボックスへの作成・起動は `FAILED_PRECONDITION`。
+//! `StartContainer` は created から running へ遷移し、二重起動は `FAILED_PRECONDITION`（冪等にしない）。
+//! 実行層は呼ばず、プロセスも起動しない記録上の遷移で、TASK-59（CRI-2）で `ContainerRuntime` 経由の起動へ
+//! 置き換える（REPAIR-3）。コンテナの記録の型と上限は `container` サブモジュール。
 //!
 //! **Status/List の扱い（CRI-1・ERR-3・TASK-57.3）**: `PodSandboxStatus` は未知 ID を `NOT_FOUND`、空 ID を
 //! `INVALID_ARGUMENT` にする。`ListPodSandbox` は未知の ID や一致なしをエラーにせず空の一覧を返し、
@@ -15,7 +24,8 @@
 //! 受け入れ基準を優先している。`RemovePodSandbox` は proto コメントどおり未知 ID を成功（冪等）とする。
 //! どちらも空の `pod_sandbox_id` は `INVALID_ARGUMENT`。既に停止済みの Stop は成功で状態は変わらない。
 //! Stop は枠（件数・保持量）を解放せず、Remove だけが解放する。ready のままの Remove は強制削除で、
-//! コンテナの強制終了は TASK-58 で追加する（現状はレコード除去のみ。REPAIR-3）。
+//! 配下のコンテナ記録も連鎖して除去する（プロセスの強制終了は TASK-59 で追加する。REPAIR-3）。
+//! Stop 時の配下コンテナの停止（Exited 遷移）は TASK-58.2（#434）で追加する。
 //!
 //! **スタブの明示（REPAIR-3）**: サンドボックスの状態はプロセス内メモリのレジストリにだけ持つ。
 //! 実行層（core）には未接続で、永続化もしない。TASK-59 で `StateStore` / `ContainerRuntime` へ置き換える
@@ -30,15 +40,16 @@
 //! 直接呼ぶ経路にも効かせるためと、受信上限では累積を縛れないため。検証の詳細は `config_limits`
 //! サブモジュール。
 //!
-//! **可観測性（REPAIR-4）**: `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox` は全終了経路（成功・入力不正・上限超過・内部エラー）で、
+//! **可観測性（REPAIR-4）**: `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer` は全終了経路（成功・入力不正・上限超過・内部エラー）で、
 //! 結果のステータスコードと所要時間を [`CriOpRecorder`] へ 1 件渡す。記録先は
 //! [`CriRuntimeService::with_recorder`] で注入する（既定は記録しない）。`config`・labels・annotations・
 //! エラー文言は記録先へ渡さない。
 
 mod config_limits;
+mod container;
 
-use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,6 +64,9 @@ use crate::runtime::v1::{
     self, PodSandboxConfig, PodSandboxState, runtime_service_server::RuntimeService,
 };
 use config_limits::BoundedConfig;
+use container::{ContainerRecord, ContainerState, ValidatedCreate, validate_create_request};
+
+pub use container::{ContainerLimits, MAX_CONTAINERS, MAX_RETAINED_CONTAINER_CONFIG_BYTES};
 
 pub use config_limits::{
     MAX_CONFIG_COLLECTION_ENTRIES, MAX_CONFIG_ENCODED_BYTES, MAX_METADATA_FIELD_BYTES,
@@ -165,11 +179,18 @@ struct SandboxRecord {
 
 /// サンドボックスのメモリ上レジストリ（TASK-59 で `StateStore` に置換するスタブ。REPAIR-3）。
 ///
-/// 不変条件: `retained_bytes` は `records` の各記録の `retained_bytes` の合計に等しい。
+/// 不変条件: `retained_bytes` は `records` の、`container_retained_bytes` は `containers` の各記録の
+/// `retained_bytes` の合計に等しい。`container_keys` は `containers` と 1 対 1 に対応する。
 #[derive(Debug, Default)]
 struct SandboxRegistry {
     records: HashMap<String, SandboxRecord>,
     retained_bytes: usize,
+    /// コンテナ ID → 記録（TASK-58.1。TASK-59 で `StateStore` に置換するスタブ）。
+    containers: HashMap<String, ContainerRecord>,
+    /// `(sandbox_id, name, attempt)` の重複判定用。`containers` と 1 対 1 に対応する。
+    container_keys: HashSet<(String, String, u32)>,
+    /// コンテナ記録の `retained_bytes` の合計（不変条件）。
+    container_retained_bytes: usize,
 }
 
 /// CRI `RuntimeService` の実装（TASK-57.1）。
@@ -179,6 +200,7 @@ struct SandboxRegistry {
 pub struct CriRuntimeService {
     registry: Mutex<SandboxRegistry>,
     limits: SandboxLimits,
+    container_limits: ContainerLimits,
     recorder: Arc<dyn CriOpRecorder>,
 }
 
@@ -187,6 +209,7 @@ impl fmt::Debug for CriRuntimeService {
         // レジストリの中身（config・labels・annotations）は出さない。
         f.debug_struct("CriRuntimeService")
             .field("limits", &self.limits)
+            .field("container_limits", &self.container_limits)
             .finish_non_exhaustive()
     }
 }
@@ -224,8 +247,15 @@ impl CriRuntimeService {
         Self {
             registry: Mutex::new(SandboxRegistry::default()),
             limits,
+            container_limits: ContainerLimits::default(),
             recorder,
         }
+    }
+
+    /// コンテナ用の上限を指定する（既定値より大きくはできない。TASK-58.1）。
+    pub fn with_container_limits(mut self, container_limits: ContainerLimits) -> Self {
+        self.container_limits = container_limits;
+        self
     }
 
     /// 登録済みサンドボックス数（テスト用）。
@@ -238,6 +268,24 @@ impl CriRuntimeService {
     #[cfg(test)]
     fn retained_bytes(&self) -> usize {
         self.registry.lock().map(|r| r.retained_bytes).unwrap_or(0)
+    }
+
+    /// コンテナ数（テスト用）。
+    #[cfg(test)]
+    fn container_count(&self) -> usize {
+        self.registry
+            .lock()
+            .map(|r| r.containers.len())
+            .unwrap_or(0)
+    }
+
+    /// コンテナ記録の保持量の見積もりの合計（テスト用）。
+    #[cfg(test)]
+    fn container_retained_bytes(&self) -> usize {
+        self.registry
+            .lock()
+            .map(|r| r.container_retained_bytes)
+            .unwrap_or(0)
     }
 
     /// `RunPodSandbox` の本体。検証・採番・登録を行い、失敗時はレジストリを変更しない。
@@ -270,7 +318,7 @@ impl CriRuntimeService {
             .ok_or_else(|| Status::failed_precondition("sandbox config storage is full"))?;
         let mut pod_sandbox_id = None;
         for _ in 0..ID_RETRY_LIMIT {
-            let candidate = generate_sandbox_id();
+            let candidate = generate_id();
             if !registry.records.contains_key(&candidate) {
                 pod_sandbox_id = Some(candidate);
                 break;
@@ -338,9 +386,146 @@ impl CriRuntimeService {
             .retained_bytes
             .checked_sub(record.retained_bytes)
             .ok_or_else(|| Status::internal("sandbox registry is inconsistent"))?;
+        // 配下のコンテナ記録も連鎖して除去する（孤児と保持量の取りこぼしを防ぐ。TASK-58.1）。
+        let mut released: usize = 0;
+        for c in registry
+            .containers
+            .values()
+            .filter(|c| c.pod_sandbox_id == req.pod_sandbox_id)
+        {
+            released = released
+                .checked_add(c.retained_bytes)
+                .ok_or_else(|| Status::internal("container registry is inconsistent"))?;
+        }
+        let remaining_containers = registry
+            .container_retained_bytes
+            .checked_sub(released)
+            .ok_or_else(|| Status::internal("container registry is inconsistent"))?;
+        let pod_sandbox_id = &req.pod_sandbox_id;
+        registry
+            .containers
+            .retain(|_, c| c.pod_sandbox_id != *pod_sandbox_id);
+        registry
+            .container_keys
+            .retain(|(sandbox_id, _, _)| sandbox_id != pod_sandbox_id);
+        registry.container_retained_bytes = remaining_containers;
         registry.records.remove(&req.pod_sandbox_id);
         registry.retained_bytes = remaining;
         Ok(v1::RemovePodSandboxResponse {})
+    }
+
+    /// `CreateContainer` の本体。検証・採番・登録を行い、失敗時はレジストリを変更しない（TASK-58.1）。
+    ///
+    /// 状態は `Created`。実行層は呼ばない（TASK-59 で `ContainerRuntime` 経由にする。REPAIR-3）。
+    /// エラー文言には入力値（ID・名前・labels）を含めない。
+    fn create_container_impl(
+        &self,
+        req: v1::CreateContainerRequest,
+    ) -> Result<v1::CreateContainerResponse, Status> {
+        let ValidatedCreate {
+            pod_sandbox_id,
+            name,
+            attempt,
+            config,
+        } = validate_create_request(req)?;
+        let retained_bytes = config.retained_bytes();
+        let created_at_nanos = now_nanos()?;
+
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+        let sandbox = registry
+            .records
+            .get(&pod_sandbox_id)
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        if sandbox.state != SandboxState::Ready {
+            return Err(Status::failed_precondition("sandbox is not ready"));
+        }
+        // 要求由来の String は余分な capacity を持ちうる。照合に成功した ID（最大 64 文字）と名前は、
+        // 内容長ちょうどの新しい String へ複製して保持し、要求側の確保領域を削除まで残さない
+        // （retained_bytes は内容長の見積もりのため、capacity の保持は累積上限を迂回する）。
+        let key = (
+            String::from(pod_sandbox_id.as_str()),
+            String::from(name.as_str()),
+            attempt,
+        );
+        drop((pod_sandbox_id, name));
+        if registry.container_keys.contains(&key) {
+            return Err(Status::already_exists("container already exists"));
+        }
+        if registry.containers.len() >= self.container_limits.max_containers() {
+            return Err(Status::failed_precondition("too many containers"));
+        }
+        let total_retained_bytes = registry
+            .container_retained_bytes
+            .checked_add(retained_bytes)
+            .filter(|total| *total <= self.container_limits.max_retained_bytes())
+            .ok_or_else(|| Status::failed_precondition("container config storage is full"))?;
+        let mut container_id = None;
+        for _ in 0..ID_RETRY_LIMIT {
+            let candidate = generate_id();
+            if !registry.containers.contains_key(&candidate) {
+                container_id = Some(candidate);
+                break;
+            }
+        }
+        let container_id =
+            container_id.ok_or_else(|| Status::internal("failed to allocate container id"))?;
+        registry.containers.insert(
+            container_id.clone(),
+            ContainerRecord {
+                pod_sandbox_id: key.0.clone(),
+                config: config.into_config(),
+                state: ContainerState::Created,
+                created_at_nanos,
+                started_at_nanos: 0,
+                retained_bytes,
+            },
+        );
+        registry.container_keys.insert(key);
+        registry.container_retained_bytes = total_retained_bytes;
+        Ok(v1::CreateContainerResponse { container_id })
+    }
+
+    /// `StartContainer` の本体。created を running へ遷移させる（TASK-58.1）。
+    ///
+    /// 空 ID は `INVALID_ARGUMENT`、未知 ID は `NOT_FOUND`。running の再起動と、停止済みサンドボックス
+    /// 配下の起動は `FAILED_PRECONDITION`（冪等にしない）。プロセスは起動しない記録上の遷移で、
+    /// TASK-59（CRI-2）で `ContainerRuntime` 経由の namespace 分離起動に置き換える（REPAIR-3）。
+    fn start_container_impl(
+        &self,
+        req: v1::StartContainerRequest,
+    ) -> Result<v1::StartContainerResponse, Status> {
+        if req.container_id.is_empty() {
+            return Err(Status::invalid_argument("container_id is required"));
+        }
+        let started_at_nanos = now_nanos()?;
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+        let record = registry
+            .containers
+            .get(&req.container_id)
+            .ok_or_else(|| Status::not_found("container not found"))?;
+        let sandbox = registry
+            .records
+            .get(&record.pod_sandbox_id)
+            .ok_or_else(|| Status::internal("container registry is inconsistent"))?;
+        if sandbox.state != SandboxState::Ready {
+            return Err(Status::failed_precondition("sandbox is not ready"));
+        }
+        if record.state != ContainerState::Created {
+            return Err(Status::failed_precondition(
+                "container is not in created state",
+            ));
+        }
+        if let Some(record) = registry.containers.get_mut(&req.container_id) {
+            record.state = ContainerState::Running;
+            record.started_at_nanos = started_at_nanos;
+        }
+        Ok(v1::StartContainerResponse {})
     }
 
     /// `PodSandboxStatus` の本体。読み取り専用（CRI-1・ERR-3・TASK-57.3）。
@@ -500,11 +685,11 @@ impl ValidatedFilter {
     }
 }
 
-/// 64 文字の小文字 16 進 ID を採番する（containerd・crictl の慣習に合わせる）。
+/// 64 文字の小文字 16 進 ID（サンドボックス・コンテナ共通）を採番する（containerd・crictl の慣習に合わせる）。
 ///
 /// ID は秘密値ではなく暗号強度は不要。OS 乱数で鍵が初期化される `RandomState` に
 /// カウンタと時刻を混ぜ、衝突は登録時に検査する。クライアントが ID を指定する経路はない。
-fn generate_sandbox_id() -> String {
+fn generate_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -636,17 +821,27 @@ impl RuntimeService for CriRuntimeService {
     ) -> Result<Response<Self::StreamPodSandboxesStream>, Status> {
         Err(Status::unimplemented("stream_pod_sandboxes"))
     }
+    /// コンテナ ID を採番し、状態 created で登録する（同一 sandbox 内の `(name, attempt)` 重複は
+    /// `ALREADY_EXISTS`。CRI-1・ERR-3・TASK-58.1）。
     async fn create_container(
         &self,
-        _request: Request<v1::CreateContainerRequest>,
+        request: Request<v1::CreateContainerRequest>,
     ) -> Result<Response<v1::CreateContainerResponse>, Status> {
-        Err(Status::unimplemented("create_container"))
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::CreateContainer);
+        let result = self.create_container_impl(request.into_inner());
+        timer.finish_with(&result);
+        result.map(Response::new)
     }
+
+    /// コンテナを running にする（二重起動は `FAILED_PRECONDITION`。CRI-1・ERR-3・TASK-58.1）。
     async fn start_container(
         &self,
-        _request: Request<v1::StartContainerRequest>,
+        request: Request<v1::StartContainerRequest>,
     ) -> Result<Response<v1::StartContainerResponse>, Status> {
-        Err(Status::unimplemented("start_container"))
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::StartContainer);
+        let result = self.start_container_impl(request.into_inner());
+        timer.finish_with(&result);
+        result.map(Response::new)
     }
     async fn stop_container(
         &self,
@@ -1590,5 +1785,273 @@ mod tests {
             ]
         );
         assert!(!format!("{samples:?}").contains(&id));
+    }
+
+    fn container_config(name: &str, attempt: u32) -> v1::ContainerConfig {
+        let mut c = v1::ContainerConfig {
+            metadata: Some(v1::ContainerMetadata {
+                name: name.into(),
+                attempt,
+            }),
+            image: Some(v1::ImageSpec {
+                image: "busybox:1.36".into(),
+                ..Default::default()
+            }),
+            command: vec!["/bin/sh".into()],
+            ..Default::default()
+        };
+        c.labels.insert("k".into(), "v".into());
+        c.annotations.insert("a".into(), "b".into());
+        c
+    }
+
+    fn create(
+        svc: &CriRuntimeService,
+        sandbox_id: &str,
+        config: Option<v1::ContainerConfig>,
+    ) -> Result<String, Status> {
+        block_on(
+            svc.create_container(Request::new(v1::CreateContainerRequest {
+                pod_sandbox_id: sandbox_id.into(),
+                config,
+                sandbox_config: None,
+            })),
+        )
+        .map(|r| r.into_inner().container_id)
+    }
+
+    fn start(svc: &CriRuntimeService, id: &str) -> Result<(), Status> {
+        block_on(svc.start_container(Request::new(v1::StartContainerRequest {
+            container_id: id.into(),
+        })))
+        .map(|_| ())
+    }
+
+    /// CRI-1・TASK-58.1: Create は 64 文字の小文字 16 進 ID を返し、状態 created で登録する。
+    #[test]
+    fn task_58_1_create_registers_created_container() {
+        let svc = CriRuntimeService::new();
+        let sb = run_id(&svc);
+        let cfg = container_config("c", 0);
+        let id = create(&svc, &sb, Some(cfg.clone())).unwrap();
+        assert_eq!(id.len(), 64);
+        assert!(id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+        let reg = svc.registry.lock().unwrap();
+        let rec = reg.containers.get(&id).unwrap();
+        assert_eq!(rec.state.to_proto() as i32, 0);
+        assert_eq!(rec.pod_sandbox_id, sb);
+        assert!(rec.created_at_nanos > 0);
+        assert_eq!(rec.started_at_nanos, 0);
+        // labels・annotations を含む config を無改変で保持する。
+        assert_eq!(rec.config, cfg);
+        assert_eq!(reg.container_keys.len(), 1);
+        assert_eq!(reg.container_retained_bytes, rec.retained_bytes);
+    }
+
+    /// TASK-58.1・REPAIR-9（リソース上限）: 過大 capacity の ID・名前を渡しても、保持する key と
+    /// 記録の String は内容長ちょうどの確保になる。
+    #[test]
+    fn task_58_1_retained_strings_do_not_keep_oversized_capacity() {
+        let svc = CriRuntimeService::new();
+        let sb = run_id(&svc);
+        let mut big_id = String::with_capacity(1 << 20);
+        big_id.push_str(&sb);
+        let mut big_name = String::with_capacity(1 << 20);
+        big_name.push('c');
+        let mut cfg = container_config("c", 0);
+        cfg.metadata.as_mut().unwrap().name = big_name;
+        let id = block_on(
+            svc.create_container(Request::new(v1::CreateContainerRequest {
+                pod_sandbox_id: big_id,
+                config: Some(cfg),
+                sandbox_config: None,
+            })),
+        )
+        .unwrap()
+        .into_inner()
+        .container_id;
+        let reg = svc.registry.lock().unwrap();
+        for (sid, name, _) in &reg.container_keys {
+            assert_eq!(sid.capacity(), 64);
+            assert_eq!(name.capacity(), 1);
+        }
+        let rec = reg.containers.get(&id).unwrap();
+        assert_eq!(rec.pod_sandbox_id.capacity(), 64);
+    }
+
+    /// CRI-1・TASK-58.1（受け入れ条件）: Create の後の Start で running になる。
+    #[test]
+    fn task_58_1_create_then_start_makes_running() {
+        let svc = CriRuntimeService::new();
+        let sb = run_id(&svc);
+        let id = create(&svc, &sb, Some(container_config("c", 0))).unwrap();
+        start(&svc, &id).unwrap();
+        let reg = svc.registry.lock().unwrap();
+        let rec = reg.containers.get(&id).unwrap();
+        assert_eq!(rec.state, ContainerState::Running);
+        assert_eq!(rec.state.to_proto() as i32, 1);
+        assert!(rec.started_at_nanos >= rec.created_at_nanos);
+    }
+
+    /// ERR-3・TASK-58.1（受け入れ条件）: 同一 sandbox で同じ (name, attempt) の再作成は ALREADY_EXISTS で、
+    /// レジストリは変わらない。attempt が違う・別 sandbox なら成功する。
+    #[test]
+    fn task_58_1_duplicate_container_returns_already_exists() {
+        let svc = CriRuntimeService::new();
+        let sb = run_id(&svc);
+        let other = run_id(&svc);
+        create(&svc, &sb, Some(container_config("c", 0))).unwrap();
+        let (count, bytes) = (svc.container_count(), svc.container_retained_bytes());
+        let err = create(&svc, &sb, Some(container_config("c", 0))).unwrap_err();
+        assert_eq!(err.code(), Code::AlreadyExists);
+        assert_eq!(err.message(), "container already exists");
+        assert_eq!(svc.container_count(), count);
+        assert_eq!(svc.container_retained_bytes(), bytes);
+        create(&svc, &sb, Some(container_config("c", 1))).unwrap();
+        create(&svc, &other, Some(container_config("c", 0))).unwrap();
+        assert_eq!(svc.container_count(), 3);
+    }
+
+    /// ERR-3・TASK-58.1: Create の前提違反のコード対応。
+    #[test]
+    fn task_58_1_create_error_codes() {
+        let svc = CriRuntimeService::new();
+        let sb = run_id(&svc);
+        assert_eq!(
+            create(&svc, "", Some(container_config("c", 0)))
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+        assert_eq!(
+            create(&svc, &sb, None).unwrap_err().code(),
+            Code::InvalidArgument
+        );
+        let err = create(&svc, &"0".repeat(64), Some(container_config("c", 0))).unwrap_err();
+        assert_eq!(err.code(), Code::NotFound);
+        stop(&svc, &sb).unwrap();
+        let err = create(&svc, &sb, Some(container_config("c", 0))).unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(svc.container_count(), 0);
+    }
+
+    /// ERR-3・TASK-58.1: Start のコード対応（空 ID・未知 ID・二重 Start・停止済み sandbox）。
+    #[test]
+    fn task_58_1_start_error_codes() {
+        let svc = CriRuntimeService::new();
+        let sb = run_id(&svc);
+        assert_eq!(start(&svc, "").unwrap_err().code(), Code::InvalidArgument);
+        assert_eq!(
+            start(&svc, &"0".repeat(64)).unwrap_err().code(),
+            Code::NotFound
+        );
+        let id = create(&svc, &sb, Some(container_config("c", 0))).unwrap();
+        start(&svc, &id).unwrap();
+        let err = start(&svc, &id).unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        // 停止済み sandbox 配下の created コンテナは起動できない。
+        let sb2 = run_id(&svc);
+        let id2 = create(&svc, &sb2, Some(container_config("c", 0))).unwrap();
+        stop(&svc, &sb2).unwrap();
+        let err = start(&svc, &id2).unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        let reg = svc.registry.lock().unwrap();
+        assert_eq!(
+            reg.containers.get(&id2).unwrap().state,
+            ContainerState::Created
+        );
+    }
+
+    /// TASK-58.1: 件数・保持量の上限超過は FAILED_PRECONDITION。
+    #[test]
+    fn task_58_1_limits_are_enforced() {
+        let svc = CriRuntimeService::new()
+            .with_container_limits(ContainerLimits::new().with_max_containers(1));
+        let sb = run_id(&svc);
+        create(&svc, &sb, Some(container_config("a", 0))).unwrap();
+        let err = create(&svc, &sb, Some(container_config("b", 0))).unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(svc.container_count(), 1);
+
+        let svc = CriRuntimeService::new()
+            .with_container_limits(ContainerLimits::new().with_max_retained_bytes(1));
+        let sb = run_id(&svc);
+        let err = create(&svc, &sb, Some(container_config("a", 0))).unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(svc.container_count(), 0);
+        assert_eq!(svc.container_retained_bytes(), 0);
+    }
+
+    /// TASK-58.1: RemovePodSandbox は配下のコンテナと保持量を解放し、同名の再作成が通る。
+    #[test]
+    fn task_58_1_remove_sandbox_releases_containers() {
+        let svc = CriRuntimeService::new();
+        let sb = run_id(&svc);
+        let keep = run_id(&svc);
+        create(&svc, &sb, Some(container_config("c", 0))).unwrap();
+        create(&svc, &keep, Some(container_config("c", 0))).unwrap();
+        let kept_bytes = {
+            let reg = svc.registry.lock().unwrap();
+            reg.containers
+                .values()
+                .filter(|c| c.pod_sandbox_id == keep)
+                .map(|c| c.retained_bytes)
+                .sum::<usize>()
+        };
+        remove(&svc, &sb).unwrap();
+        assert_eq!(svc.container_count(), 1);
+        assert_eq!(svc.container_retained_bytes(), kept_bytes);
+        assert_eq!(svc.registry.lock().unwrap().container_keys.len(), 1);
+    }
+
+    /// REPAIR-4・TASK-58.1: 全終了経路が 1 件ずつ記録され、config の内容は記録先へ渡らない。
+    #[test]
+    fn task_58_1_outcomes_are_recorded_without_content() {
+        let collect = Arc::new(Collect::default());
+        let svc = CriRuntimeService::with_recorder(collect.clone());
+        let sb = run_id(&svc);
+        let mut cfg = container_config("c", 0);
+        cfg.envs.push(v1::KeyValue {
+            key: "TOKEN".into(),
+            value: "do-not-record".into(),
+        });
+        let id = create(&svc, &sb, Some(cfg.clone())).unwrap();
+        create(&svc, &sb, Some(cfg)).unwrap_err();
+        start(&svc, &id).unwrap();
+        start(&svc, &id).unwrap_err();
+        let (c, s) = (CriOpKind::CreateContainer, CriOpKind::StartContainer);
+        assert_eq!(
+            collect.outcomes()[1..],
+            [
+                (c, CriOpOutcome::Success, Code::Ok),
+                (c, CriOpOutcome::Failure, Code::AlreadyExists),
+                (s, CriOpOutcome::Success, Code::Ok),
+                (s, CriOpOutcome::Failure, Code::FailedPrecondition),
+            ]
+        );
+        let dump = format!("{:?}{svc:?}", collect.items());
+        assert!(!dump.contains("do-not-record") && !dump.contains(&id));
+    }
+
+    /// TASK-58.1: 並行 Create でも ID は一意で、件数の上限を超えない。
+    #[test]
+    fn task_58_1_concurrent_create_respects_limit() {
+        let svc = CriRuntimeService::new()
+            .with_container_limits(ContainerLimits::new().with_max_containers(8));
+        let sb = run_id(&svc);
+        let ids: Vec<Result<String, Status>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16u32)
+                .map(|i| {
+                    let (svc, sb) = (&svc, &sb);
+                    scope.spawn(move || create(svc, sb, Some(container_config("c", i))))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let ok: Vec<&String> = ids.iter().filter_map(|r| r.as_ref().ok()).collect();
+        assert_eq!(ok.len(), 8);
+        let unique: HashSet<&&String> = ok.iter().collect();
+        assert_eq!(unique.len(), 8);
+        assert_eq!(svc.container_count(), 8);
     }
 }

@@ -1,0 +1,678 @@
+//! コンテナ記録・入力検証・保持量の上限（TASK-58.1・#433・CRI-1・ERR-3）。
+//!
+//! 親モジュール（`runtime_service`）の `CreateContainer` / `StartContainer` が使う、コンテナ固有の
+//! 部品を置く。`ContainerConfig` は CRI クライアント（kubelet・crictl）由来の外部入力で、
+//! サンドボックスの `config_limits` と同じ 3 段（符号化長・可変長要素の件数と長さ・累積の保持量）で
+//! 有限の上限を課す。`envs` に秘密値が入り得るため、エラー文言・計装へ `config` の内容を出さない。
+//!
+//! **スタブの明示（REPAIR-3）**: 状態はプロセス内メモリにあるだけで、実行層（core）には未接続。
+//! `Running` は記録上の状態で、プロセスは起動しない。TASK-59（CRI-2）で `ContainerRuntime`
+//! 経由の namespace 分離起動と `StateStore` へ置き換える。`Exited` への遷移は TASK-58.2（#434）が追加する。
+//! `command`・`mounts`・`log_path` 等のパス類は保持するだけで検証していない（ホストへ触れる TASK-59 で検証する）。
+
+use prost::Message;
+use tonic::Status;
+
+use super::config_limits::{
+    MAX_CONFIG_COLLECTION_ENTRIES, MAX_CONFIG_ENCODED_BYTES, MAX_METADATA_FIELD_BYTES,
+    RETAINED_BYTES_PER_ENTRY, RETAINED_BYTES_PER_RECORD,
+};
+use crate::runtime::v1::{
+    self, Capability, ContainerConfig, ContainerState as ProtoContainerState, LinuxContainerConfig,
+    LinuxContainerResources, LinuxContainerSecurityContext, NamespaceOption, UserNamespace,
+    WindowsContainerConfig, WindowsContainerResources,
+};
+
+/// 受け付けるコンテナ数の上限（無制限確保の防止。ERR-3 の `FAILED_PRECONDITION`）。
+///
+/// 根拠: kubelet の既定の Pod 数上限（1 ノード 110）に Pod あたり数コンテナ（init・sidecar を含む）を
+/// 掛けても、4096 はその約 10 倍の余裕がある。
+pub const MAX_CONTAINERS: usize = 4096;
+
+/// レジストリが保持する全コンテナ `config` の保持量の見積もりの合計の上限: 128 MiB。
+///
+/// 根拠: 典型的なコンテナ（符号化長 数 KiB・要素 数十件）の見積もりは 1 件 16 KiB 前後で、件数の
+/// 上限まで登録しても 64 MiB 程度。サンドボックス側（64 MiB）の 2 倍とし、コンテナ数が多めの運用で
+/// 件数の上限より先に尽きないようにした。
+pub const MAX_RETAINED_CONTAINER_CONFIG_BYTES: usize = 128 * 1024 * 1024;
+
+/// コンテナ用レジストリの保持量の上限（件数と `config` の保持量の見積もりの合計）。
+///
+/// 既定値（[`MAX_CONTAINERS`]・[`MAX_RETAINED_CONTAINER_CONFIG_BYTES`]）より大きい値は指定できず
+/// 既定値へ丸める（絞る方向にだけ変えられる。`SandboxLimits` と同じ方針）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerLimits {
+    max_containers: usize,
+    max_retained_bytes: usize,
+}
+
+impl Default for ContainerLimits {
+    fn default() -> Self {
+        Self {
+            max_containers: MAX_CONTAINERS,
+            max_retained_bytes: MAX_RETAINED_CONTAINER_CONFIG_BYTES,
+        }
+    }
+}
+
+impl ContainerLimits {
+    /// 既定の上限。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// コンテナ数の上限を絞る（[`MAX_CONTAINERS`] を超える値は [`MAX_CONTAINERS`] になる）。
+    pub fn with_max_containers(mut self, max_containers: usize) -> Self {
+        self.max_containers = max_containers.min(MAX_CONTAINERS);
+        self
+    }
+
+    /// 保持量の見積もりの合計の上限を絞る（[`MAX_RETAINED_CONTAINER_CONFIG_BYTES`] を超える値は
+    /// [`MAX_RETAINED_CONTAINER_CONFIG_BYTES`] になる）。
+    pub fn with_max_retained_bytes(mut self, max_retained_bytes: usize) -> Self {
+        self.max_retained_bytes = max_retained_bytes.min(MAX_RETAINED_CONTAINER_CONFIG_BYTES);
+        self
+    }
+
+    /// コンテナ数の上限。
+    pub fn max_containers(&self) -> usize {
+        self.max_containers
+    }
+
+    /// 保持量の見積もりの合計の上限（バイト）。
+    pub fn max_retained_bytes(&self) -> usize {
+        self.max_retained_bytes
+    }
+}
+
+/// コンテナの内部状態（CRI の `ContainerState` に対応）。
+///
+/// `Exited`（停止済み）は StopContainer（TASK-58.2・#434）が追加する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ContainerState {
+    Created,
+    Running,
+}
+
+impl ContainerState {
+    /// CRI の列挙値へ変換する（ContainerStatus / ListContainers〔TASK-58.3〕が応答に使う）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn to_proto(self) -> ProtoContainerState {
+        match self {
+            Self::Created => ProtoContainerState::ContainerCreated,
+            Self::Running => ProtoContainerState::ContainerRunning,
+        }
+    }
+}
+
+/// レジストリに保持するコンテナ 1 件分の記録。
+///
+/// `config` は内容を変えずに保持する（annotations を書き換えない CRI の要件）。`retained_bytes` は
+/// 作成時にレジストリの保持量へ計上した見積もりで、除去のときに同じ値を引く。
+#[derive(Debug, Clone)]
+pub(super) struct ContainerRecord {
+    pub(super) pod_sandbox_id: String,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) config: ContainerConfig,
+    pub(super) state: ContainerState,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) created_at_nanos: i64,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) started_at_nanos: i64,
+    pub(super) retained_bytes: usize,
+}
+
+/// 入力検証を通過した `CreateContainer` の要求。
+pub(super) struct ValidatedCreate {
+    pub(super) pod_sandbox_id: String,
+    pub(super) name: String,
+    pub(super) attempt: u32,
+    pub(super) config: BoundedContainerConfig,
+}
+
+/// `CreateContainer` の入力検証（ERR-3: 必須欠落・値域外・サイズ超過は `INVALID_ARGUMENT`）。
+///
+/// 状態には触れない。`sandbox_config` は保持せず（サンドボックス記録側が正）、符号化長の上限だけ検査する。
+pub(super) fn validate_create_request(
+    req: v1::CreateContainerRequest,
+) -> Result<ValidatedCreate, Status> {
+    let v1::CreateContainerRequest {
+        pod_sandbox_id,
+        config,
+        sandbox_config,
+    } = req;
+    if pod_sandbox_id.is_empty() {
+        return Err(Status::invalid_argument("pod_sandbox_id is required"));
+    }
+    let config = config.ok_or_else(|| Status::invalid_argument("config is required"))?;
+    let metadata = config
+        .metadata
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("config.metadata is required"))?;
+    if metadata.name.is_empty() {
+        return Err(Status::invalid_argument("config.metadata.name is required"));
+    }
+    let image = config
+        .image
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("config.image is required"))?;
+    if image.image.is_empty() {
+        return Err(Status::invalid_argument("config.image.image is required"));
+    }
+    if let Some(sandbox_config) = sandbox_config.as_ref()
+        && sandbox_config.encoded_len() > MAX_CONFIG_ENCODED_BYTES
+    {
+        return Err(Status::invalid_argument("sandbox_config is too large"));
+    }
+    // 複製の前に、参照のまま名前長と config 全体の符号化長を検証する（確保前に上限検証）。
+    if metadata.name.len() > MAX_METADATA_FIELD_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "config.metadata.name is too long: {} bytes exceeds the limit of {MAX_METADATA_FIELD_BYTES} bytes",
+            metadata.name.len()
+        )));
+    }
+    let encoded_len = config.encoded_len();
+    if encoded_len > MAX_CONFIG_ENCODED_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "config is too large: {encoded_len} bytes exceeds the limit of {MAX_CONFIG_ENCODED_BYTES} bytes"
+        )));
+    }
+    let name = metadata.name.clone();
+    let attempt = metadata.attempt;
+    let config = BoundedContainerConfig::new(config)?;
+    Ok(ValidatedCreate {
+        pod_sandbox_id,
+        name,
+        attempt,
+        config,
+    })
+}
+
+/// サイズ・件数の検証を通過し、保持用に作り直した `ContainerConfig`。
+///
+/// [`BoundedContainerConfig::new`] だけが作れるため、未検証の `config` がレジストリへ入る経路はない。
+#[derive(Debug)]
+pub(super) struct BoundedContainerConfig {
+    config: ContainerConfig,
+    retained_bytes: usize,
+}
+
+impl BoundedContainerConfig {
+    /// `config` を検証し、保持用に作り直す。上限超過は `INVALID_ARGUMENT`（ERR-3）。
+    ///
+    /// 作り直し（符号化して復号）は内容を変えず、呼び出し元が確保した余分な容量を捨てる。
+    pub(super) fn new(config: ContainerConfig) -> Result<Self, Status> {
+        let retained_bytes = retained_bytes(&config)?;
+        let encoded = config.encode_to_vec();
+        drop(config);
+        let config = ContainerConfig::decode(encoded.as_slice())
+            .map_err(|_| Status::internal("failed to rebuild container config"))?;
+        Ok(Self {
+            config,
+            retained_bytes,
+        })
+    }
+
+    /// 保持量の見積もり。
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    /// 検証済みの `config` を取り出す。
+    pub(super) fn into_config(self) -> ContainerConfig {
+        self.config
+    }
+}
+
+/// `config` を検証し、保持量の見積もりを返す（アロケーションなし。演算は checked）。
+fn retained_bytes(config: &ContainerConfig) -> Result<usize, Status> {
+    let encoded_len = config.encoded_len();
+    if encoded_len > MAX_CONFIG_ENCODED_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "config is too large: {encoded_len} bytes exceeds the limit of {MAX_CONFIG_ENCODED_BYTES} bytes"
+        )));
+    }
+    if let Some(metadata) = config.metadata.as_ref()
+        && metadata.name.len() > MAX_METADATA_FIELD_BYTES
+    {
+        return Err(Status::invalid_argument(format!(
+            "config.metadata.name is too long: {} bytes exceeds the limit of {MAX_METADATA_FIELD_BYTES} bytes",
+            metadata.name.len()
+        )));
+    }
+    let mut entries: usize = 0;
+    for_each_collection(config, &mut |field, len| {
+        if len > MAX_CONFIG_COLLECTION_ENTRIES {
+            return Err(Status::invalid_argument(format!(
+                "config.{field} has too many entries: {len} exceeds the limit of {MAX_CONFIG_COLLECTION_ENTRIES}"
+            )));
+        }
+        entries = entries
+            .checked_add(len)
+            .ok_or_else(|| Status::invalid_argument("config has too many entries"))?;
+        Ok(())
+    })?;
+    entries
+        .checked_mul(RETAINED_BYTES_PER_ENTRY)
+        .and_then(|overhead| overhead.checked_add(mounts_struct_bytes(config.mounts.len())?))
+        .and_then(|overhead| overhead.checked_add(encoded_len))
+        .and_then(|bytes| bytes.checked_add(RETAINED_BYTES_PER_RECORD))
+        .ok_or_else(|| Status::invalid_argument("config is too large"))
+}
+
+/// `mounts` の要素（`Mount` 本体）の保持量の上乗せ（符号化長・[`RETAINED_BYTES_PER_ENTRY`] に含まれない分）。
+///
+/// `Mount` は複数の `String`・`Vec` とインラインの `Option<ImageSpec>` を持ち、構造体自体が
+/// `RETAINED_BYTES_PER_ENTRY` を超える。空の `Mount` は符号化長がほぼ 0 のため、要素ごとの
+/// 見積もりが無いと実保持量を過小に数える。復号後の `Vec` は倍々に伸びて最大 2 倍の容量を持ち得るため
+/// `size_of::<Mount>()` の 2 倍で計上する（保守側。TASK-58.1・ERR-3）。オーバーフローは `None`。
+fn mounts_struct_bytes(count: usize) -> Option<usize> {
+    count.checked_mul(std::mem::size_of::<v1::Mount>().checked_mul(2)?)
+}
+
+type Visit<'a> = &'a mut dyn FnMut(&'static str, usize) -> Result<(), Status>;
+
+/// `config` から辿れる repeated / map フィールドを、(フィールド名, 件数) で順に `visit` へ渡す。
+///
+/// 各メッセージを `..` なしで分解し、cri-api の更新でフィールドが増えたらコンパイルエラーにして
+/// 件数検証の入れ忘れを防ぐ（REPAIR-12。`config_limits` と同じ狙い）。
+fn for_each_collection(config: &ContainerConfig, visit: Visit<'_>) -> Result<(), Status> {
+    let ContainerConfig {
+        metadata: _,
+        image,
+        command,
+        args,
+        working_dir: _,
+        envs,
+        mounts,
+        devices,
+        labels,
+        annotations,
+        log_path: _,
+        stdin: _,
+        stdin_once: _,
+        tty: _,
+        linux,
+        windows,
+        cdi_devices,
+        stop_signal: _,
+    } = config;
+    if let Some(image) = image {
+        let v1::ImageSpec {
+            image: _,
+            annotations,
+            user_specified_image: _,
+            runtime_handler: _,
+            image_ref: _,
+        } = image;
+        visit("image.annotations", annotations.len())?;
+    }
+    visit("command", command.len())?;
+    visit("args", args.len())?;
+    visit("envs", envs.len())?;
+    visit("mounts", mounts.len())?;
+    for mount in mounts {
+        let v1::Mount {
+            container_path: _,
+            host_path: _,
+            readonly: _,
+            selinux_relabel: _,
+            propagation: _,
+            uid_mappings,
+            gid_mappings,
+            recursive_read_only: _,
+            image,
+            image_sub_path: _,
+            mount_options,
+        } = mount;
+        if let Some(v1::ImageSpec {
+            image: _,
+            annotations,
+            user_specified_image: _,
+            runtime_handler: _,
+            image_ref: _,
+        }) = image
+        {
+            visit("mounts.image.annotations", annotations.len())?;
+        }
+        visit("mounts.mount_options", mount_options.len())?;
+        visit("mounts.uid_mappings", uid_mappings.len())?;
+        visit("mounts.gid_mappings", gid_mappings.len())?;
+    }
+    visit("devices", devices.len())?;
+    visit("labels", labels.len())?;
+    visit("annotations", annotations.len())?;
+    visit("CDI_devices", cdi_devices.len())?;
+    if let Some(LinuxContainerConfig {
+        resources,
+        security_context,
+    }) = linux
+    {
+        if let Some(resources) = resources {
+            visit_linux_resources(resources, visit)?;
+        }
+        if let Some(security_context) = security_context {
+            visit_linux_security_context(security_context, visit)?;
+        }
+    }
+    if let Some(WindowsContainerConfig {
+        resources,
+        security_context: _,
+    }) = windows
+        && let Some(WindowsContainerResources {
+            cpu_shares: _,
+            cpu_count: _,
+            cpu_maximum: _,
+            memory_limit_in_bytes: _,
+            rootfs_size_in_bytes: _,
+            affinity_cpus,
+        }) = resources
+    {
+        visit("windows.resources.affinity_cpus", affinity_cpus.len())?;
+    }
+    Ok(())
+}
+
+/// `LinuxContainerResources` の repeated / map フィールドを `visit` へ渡す。
+fn visit_linux_resources(
+    resources: &LinuxContainerResources,
+    visit: Visit<'_>,
+) -> Result<(), Status> {
+    let LinuxContainerResources {
+        cpu_period: _,
+        cpu_quota: _,
+        cpu_shares: _,
+        memory_limit_in_bytes: _,
+        oom_score_adj: _,
+        cpuset_cpus: _,
+        cpuset_mems: _,
+        hugepage_limits,
+        unified,
+        memory_swap_limit_in_bytes: _,
+    } = resources;
+    visit("linux.resources.hugepage_limits", hugepage_limits.len())?;
+    visit("linux.resources.unified", unified.len())
+}
+
+/// `LinuxContainerSecurityContext` の repeated フィールドを `visit` へ渡す。
+// 非推奨の `apparmor_profile`・`seccomp_profile_path` も分解に含める（フィールドの増減を検出するため。値は読まない）。
+#[allow(deprecated)]
+fn visit_linux_security_context(
+    security_context: &LinuxContainerSecurityContext,
+    visit: Visit<'_>,
+) -> Result<(), Status> {
+    let LinuxContainerSecurityContext {
+        capabilities,
+        privileged: _,
+        namespace_options,
+        selinux_options: _,
+        run_as_user: _,
+        run_as_group: _,
+        run_as_username: _,
+        readonly_rootfs: _,
+        supplemental_groups,
+        supplemental_groups_policy: _,
+        no_new_privs: _,
+        masked_paths,
+        readonly_paths,
+        seccomp: _,
+        apparmor: _,
+        apparmor_profile: _,
+        seccomp_profile_path: _,
+    } = security_context;
+    if let Some(Capability {
+        add_capabilities,
+        drop_capabilities,
+        add_ambient_capabilities,
+    }) = capabilities
+    {
+        visit(
+            "linux.security_context.capabilities.add_capabilities",
+            add_capabilities.len(),
+        )?;
+        visit(
+            "linux.security_context.capabilities.drop_capabilities",
+            drop_capabilities.len(),
+        )?;
+        visit(
+            "linux.security_context.capabilities.add_ambient_capabilities",
+            add_ambient_capabilities.len(),
+        )?;
+    }
+    visit(
+        "linux.security_context.supplemental_groups",
+        supplemental_groups.len(),
+    )?;
+    visit("linux.security_context.masked_paths", masked_paths.len())?;
+    visit(
+        "linux.security_context.readonly_paths",
+        readonly_paths.len(),
+    )?;
+    if let Some(NamespaceOption {
+        network: _,
+        pid: _,
+        ipc: _,
+        target_id: _,
+        userns_options,
+    }) = namespace_options
+        && let Some(UserNamespace {
+            mode: _,
+            uids,
+            gids,
+        }) = userns_options
+    {
+        visit(
+            "linux.security_context.namespace_options.userns_options.uids",
+            uids.len(),
+        )?;
+        visit(
+            "linux.security_context.namespace_options.userns_options.gids",
+            gids.len(),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::Code;
+
+    fn base_config() -> ContainerConfig {
+        ContainerConfig {
+            metadata: Some(v1::ContainerMetadata {
+                name: "c".into(),
+                attempt: 0,
+            }),
+            image: Some(v1::ImageSpec {
+                image: "busybox".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn request(config: Option<ContainerConfig>) -> v1::CreateContainerRequest {
+        v1::CreateContainerRequest {
+            pod_sandbox_id: "sb".into(),
+            config,
+            sandbox_config: None,
+        }
+    }
+
+    fn code_of(req: v1::CreateContainerRequest) -> Code {
+        validate_create_request(req)
+            .err()
+            .map(|s| s.code())
+            .unwrap()
+    }
+
+    /// ERR-3・TASK-58.1: 必須フィールドの欠落は `INVALID_ARGUMENT`。
+    #[test]
+    fn task_58_1_missing_required_fields_are_invalid_argument() {
+        let mut no_sandbox = request(Some(base_config()));
+        no_sandbox.pod_sandbox_id.clear();
+        assert_eq!(code_of(no_sandbox), Code::InvalidArgument);
+        assert_eq!(code_of(request(None)), Code::InvalidArgument);
+        let mut c = base_config();
+        c.metadata = None;
+        assert_eq!(code_of(request(Some(c))), Code::InvalidArgument);
+        let mut c = base_config();
+        c.metadata.as_mut().unwrap().name.clear();
+        assert_eq!(code_of(request(Some(c))), Code::InvalidArgument);
+        let mut c = base_config();
+        c.image = None;
+        assert_eq!(code_of(request(Some(c))), Code::InvalidArgument);
+        let mut c = base_config();
+        c.image.as_mut().unwrap().image.clear();
+        assert_eq!(code_of(request(Some(c))), Code::InvalidArgument);
+    }
+
+    /// ERR-3・TASK-58.1: command / args が空でも許容する（イメージの Entrypoint / Cmd を使うため）。
+    #[test]
+    fn task_58_1_empty_command_is_accepted() {
+        let v = validate_create_request(request(Some(base_config()))).unwrap();
+        assert_eq!(v.name, "c");
+        assert_eq!(v.attempt, 0);
+        assert_eq!(
+            v.config.retained_bytes(),
+            base_config().encoded_len() + RETAINED_BYTES_PER_RECORD
+        );
+    }
+
+    /// ERR-3・TASK-58.1: 件数の境界（上限ちょうどは通り、1 件超過は拒否）。
+    #[test]
+    fn task_58_1_collection_limit_boundary() {
+        let mut c = base_config();
+        c.command = vec![String::new(); MAX_CONFIG_COLLECTION_ENTRIES];
+        assert!(BoundedContainerConfig::new(c).is_ok());
+        let mut c = base_config();
+        c.command = vec![String::new(); MAX_CONFIG_COLLECTION_ENTRIES + 1];
+        assert_eq!(
+            BoundedContainerConfig::new(c).unwrap_err().code(),
+            Code::InvalidArgument
+        );
+        let mut c = base_config();
+        c.linux = Some(LinuxContainerConfig {
+            security_context: Some(LinuxContainerSecurityContext {
+                masked_paths: vec![String::new(); MAX_CONFIG_COLLECTION_ENTRIES + 1],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            BoundedContainerConfig::new(c).unwrap_err().code(),
+            Code::InvalidArgument
+        );
+        let mut c = base_config();
+        c.mounts = vec![v1::Mount {
+            uid_mappings: vec![v1::IdMapping::default(); MAX_CONFIG_COLLECTION_ENTRIES + 1],
+            ..Default::default()
+        }];
+        assert_eq!(
+            BoundedContainerConfig::new(c).unwrap_err().code(),
+            Code::InvalidArgument
+        );
+    }
+
+    /// ERR-3・TASK-58.1: 符号化長の境界と name 長の境界。
+    #[test]
+    fn task_58_1_size_limit_boundary() {
+        let mut c = base_config();
+        c.log_path = "x".repeat(MAX_CONFIG_ENCODED_BYTES);
+        assert_eq!(
+            BoundedContainerConfig::new(c).unwrap_err().code(),
+            Code::InvalidArgument
+        );
+        let mut c = base_config();
+        c.metadata.as_mut().unwrap().name = "n".repeat(MAX_METADATA_FIELD_BYTES);
+        assert!(BoundedContainerConfig::new(c).is_ok());
+        let mut c = base_config();
+        c.metadata.as_mut().unwrap().name = "n".repeat(MAX_METADATA_FIELD_BYTES + 1);
+        assert_eq!(
+            BoundedContainerConfig::new(c).unwrap_err().code(),
+            Code::InvalidArgument
+        );
+    }
+
+    /// ERR-3・TASK-58.1: 過大な `sandbox_config` は拒否する。
+    #[test]
+    fn task_58_1_mount_image_annotations_are_limited_and_counted() {
+        let mount_with = |n: usize| v1::Mount {
+            image: Some(v1::ImageSpec {
+                annotations: (0..n).map(|i| (i.to_string(), String::new())).collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut c = base_config();
+        let base = BoundedContainerConfig::new(c.clone())
+            .unwrap()
+            .retained_bytes();
+        c.mounts = vec![mount_with(MAX_CONFIG_COLLECTION_ENTRIES)];
+        let ok = BoundedContainerConfig::new(c.clone()).unwrap();
+        assert!(
+            ok.retained_bytes() >= base + MAX_CONFIG_COLLECTION_ENTRIES * RETAINED_BYTES_PER_ENTRY
+        );
+        c.mounts = vec![mount_with(MAX_CONFIG_COLLECTION_ENTRIES + 1)];
+        assert_eq!(
+            BoundedContainerConfig::new(c).unwrap_err().code(),
+            Code::InvalidArgument
+        );
+    }
+
+    /// ERR-3・TASK-58.1: 空の `Mount` を大量に含む設定は、構造体のサイズ分を保持量に計上する。
+    #[test]
+    fn task_58_1_empty_mounts_count_struct_size() {
+        let mut c = base_config();
+        let base = BoundedContainerConfig::new(c.clone())
+            .unwrap()
+            .retained_bytes();
+        c.mounts = vec![v1::Mount::default(); MAX_CONFIG_COLLECTION_ENTRIES];
+        let retained = BoundedContainerConfig::new(c).unwrap().retained_bytes();
+        let per_mount = 2 * std::mem::size_of::<v1::Mount>() + RETAINED_BYTES_PER_ENTRY;
+        assert!(retained >= base + MAX_CONFIG_COLLECTION_ENTRIES * per_mount);
+        assert!(2 * std::mem::size_of::<v1::Mount>() > RETAINED_BYTES_PER_ENTRY);
+    }
+
+    #[test]
+    fn task_58_1_oversized_sandbox_config_is_rejected() {
+        let mut req = request(Some(base_config()));
+        req.sandbox_config = Some(v1::PodSandboxConfig {
+            log_directory: "x".repeat(MAX_CONFIG_ENCODED_BYTES),
+            ..Default::default()
+        });
+        assert_eq!(code_of(req), Code::InvalidArgument);
+    }
+
+    /// 上限は既定値より大きくできない。
+    #[test]
+    fn task_58_1_limits_never_exceed_defaults() {
+        let l = ContainerLimits::new()
+            .with_max_containers(usize::MAX)
+            .with_max_retained_bytes(usize::MAX);
+        assert_eq!(l.max_containers(), 4096);
+        assert_eq!(l.max_retained_bytes(), 128 * 1024 * 1024);
+        let l = l.with_max_containers(2).with_max_retained_bytes(10);
+        assert_eq!((l.max_containers(), l.max_retained_bytes()), (2, 10));
+    }
+
+    /// 状態の proto 値。
+    #[test]
+    fn task_58_1_state_proto_values() {
+        assert_eq!(ContainerState::Created.to_proto() as i32, 0);
+        assert_eq!(ContainerState::Running.to_proto() as i32, 1);
+    }
+
+    /// 作り直しは内容を変えない（labels・annotations 無改変）。
+    #[test]
+    fn task_58_1_rebuild_preserves_content() {
+        let mut c = base_config();
+        c.labels.insert("k".into(), "v".into());
+        c.annotations.insert("a".into(), "b".into());
+        let rebuilt = BoundedContainerConfig::new(c.clone())
+            .unwrap()
+            .into_config();
+        assert_eq!(rebuilt, c);
+    }
+}

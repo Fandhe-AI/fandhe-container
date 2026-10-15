@@ -13,7 +13,7 @@
 //!
 //! - core の `OpRecorder` との接続アダプタ（`fandhe-container-plugin-cri` の担当。TASK-108）。それまでは
 //!   既定の [`NoopCriOpRecorder`] が使われ、記録先を注入しない限り何も出力されない
-//! - `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`ListImages`・`ImageStatus`・`PullImage` 以外の RPC の種別は、RPC の実装（TASK-58 以降・TASK-61.3 以降）と一緒に [`CriOpKind`] へ追加する
+//! - `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer`・`ListImages`・`ImageStatus`・`PullImage` 以外の RPC の種別は、RPC の実装（TASK-58.2 以降・TASK-61.3 以降）と一緒に [`CriOpKind`] へ追加する
 //!
 //! # 機微情報
 //!
@@ -42,6 +42,10 @@ pub enum CriOpKind {
     PodSandboxStatus,
     /// `RuntimeService.ListPodSandbox` 1 回（レジストリの絞り込み一覧。CRI-1・TASK-57.3）。
     ListPodSandbox,
+    /// `RuntimeService.CreateContainer` 1 回（入力検証からレジストリ登録まで。CRI-1・TASK-58.1）。
+    CreateContainer,
+    /// `RuntimeService.StartContainer` 1 回（created から running への遷移。CRI-1・TASK-58.1）。
+    StartContainer,
     /// `ImageService.ListImages` 1 回（ローカルキャッシュの絞り込み一覧。CRI-4・TASK-61.1）。
     ListImages,
     /// `ImageService.ImageStatus` 1 回（ローカルキャッシュの単一参照解決。CRI-4・TASK-61.2）。
@@ -59,6 +63,8 @@ impl CriOpKind {
             CriOpKind::RemovePodSandbox => "cri.remove_pod_sandbox",
             CriOpKind::PodSandboxStatus => "cri.pod_sandbox_status",
             CriOpKind::ListPodSandbox => "cri.list_pod_sandbox",
+            CriOpKind::CreateContainer => "cri.create_container",
+            CriOpKind::StartContainer => "cri.start_container",
             CriOpKind::ListImages => "cri.list_images",
             CriOpKind::ImageStatus => "cri.image_status",
             CriOpKind::PullImage => "cri.pull_image",
@@ -266,12 +272,14 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [CriOpKind; 8] = [
+    const ALL_KINDS: [CriOpKind; 10] = [
         CriOpKind::RunPodSandbox,
         CriOpKind::StopPodSandbox,
         CriOpKind::RemovePodSandbox,
         CriOpKind::PodSandboxStatus,
         CriOpKind::ListPodSandbox,
+        CriOpKind::CreateContainer,
+        CriOpKind::StartContainer,
         CriOpKind::ListImages,
         CriOpKind::ImageStatus,
         CriOpKind::PullImage,
@@ -291,6 +299,8 @@ mod tests {
             "cri.pod_sandbox_status"
         );
         assert_eq!(CriOpKind::ListPodSandbox.as_str(), "cri.list_pod_sandbox");
+        assert_eq!(CriOpKind::CreateContainer.as_str(), "cri.create_container");
+        assert_eq!(CriOpKind::StartContainer.as_str(), "cri.start_container");
         assert_eq!(CriOpKind::ListImages.as_str(), "cri.list_images");
         assert_eq!(CriOpKind::ImageStatus.as_str(), "cri.image_status");
         assert_eq!(CriOpKind::PullImage.as_str(), "cri.pull_image");

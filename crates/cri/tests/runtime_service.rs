@@ -326,19 +326,19 @@ fn task_57_1_recorder_receives_every_outcome() {
     assert!(!format!("{service:?}").contains("do-not-record"));
 }
 
-/// TASK-57.1: 未実装の RPC（Container 系）は `Unimplemented` のままで、記録先へ何も渡さない
-/// （TASK-58 で実装するときに計測の種別も追加する。REPAIR-3）。
+/// TASK-57.1: 未実装の RPC（`UpdateContainerResources`）は `Unimplemented` のままで、記録先へ何も渡さない
+/// （実装するときに計測の種別も追加する。REPAIR-3）。
 #[test]
 fn task_57_1_other_rpcs_remain_unimplemented() {
     let collect = Arc::new(Collect::default());
     let service = CriRuntimeService::with_recorder(collect.clone());
-    let err = block_on(RuntimeService::container_status(
+    let err = block_on(RuntimeService::update_container_resources(
         &service,
-        Request::new(v1::ContainerStatusRequest::default()),
+        Request::new(v1::UpdateContainerResourcesRequest::default()),
     ))
     .expect_err("not implemented yet");
     assert_eq!(err.code(), Code::Unimplemented);
-    assert_eq!(err.message(), "container_status");
+    assert_eq!(err.message(), "update_container_resources");
     assert_eq!(collect.lines(), vec![]);
 }
 /// 公開トレイト経由で `StopPodSandbox` を呼ぶ。

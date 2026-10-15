@@ -3,8 +3,8 @@
 //! `fandhe-container-plugin-cri`（TASK-108）が gRPC サーバーへ載せる `RuntimeService` 実装の本体。
 //! 本ファイルの時点で実装済みなのは `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・
 //! `PodSandboxStatus`・`ListPodSandbox` と、`CreateContainer`・`StartContainer`（TASK-58.1）・
-//! `StopContainer`・`RemoveContainer`（TASK-58.2・#434）で、他の RPC は `Unimplemented` を返す
-//! （List/Status の Container 系は TASK-58.3）。
+//! `StopContainer`・`RemoveContainer`（TASK-58.2・#434）・`ListContainers`・`ContainerStatus`
+//! （TASK-58.3・#435）で、他の RPC は `Unimplemented` を返す。
 //!
 //! **Create/Start の扱い（CRI-1・ERR-3・TASK-58.1）**: cri-api の `CreateContainerRequest` にクライアント指定の
 //! ID はなく、ID はサービスが採番する。proto は `(metadata.name, metadata.attempt)` を sandbox 内で一意と
@@ -38,6 +38,13 @@
 //! 解放する（running の強制削除。プロセスの強制終了と、実待機の上限・REPAIR-5 のタイムアウトは TASK-59 で
 //! 追加する。REPAIR-3）。
 //!
+//! **ListContainers/ContainerStatus の扱い（CRI-1・ERR-3・TASK-58.3・#435）**: 読み取り専用。
+//! `ContainerStatus` は空 ID を `INVALID_ARGUMENT`、未知 ID（Remove 済みを含む）を `NOT_FOUND` にする。
+//! `ListContainers` は一致なし・未知 ID・`CONTAINER_UNKNOWN` を空の一覧とし、未知の state 値と過大な
+//! `label_selector` だけを `INVALID_ARGUMENT` にする。並びは `(created_at, id)` の昇順。labels・annotations は
+//! 無改変で返し、`envs` は返さない。`exit_code`・`reason`・`image_ref`・`user`・`info` は空・0 のスタブで、
+//! 実値は TASK-59（CRI-2）で埋める（REPAIR-3）。
+//!
 //! **スタブの明示（REPAIR-3）**: サンドボックスの状態はプロセス内メモリのレジストリにだけ持つ。
 //! 実行層（core）には未接続で、永続化もしない。TASK-59 で `StateStore` / `ContainerRuntime` へ置き換える
 //! （常駐デーモンを前提にしない CORE-1 とは、置換後の状態管理で整合させる）。
@@ -51,7 +58,7 @@
 //! 直接呼ぶ経路にも効かせるためと、受信上限では累積を縛れないため。検証の詳細は `config_limits`
 //! サブモジュール。
 //!
-//! **可観測性（REPAIR-4）**: `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer` は全終了経路（成功・入力不正・上限超過・内部エラー）で、
+//! **可観測性（REPAIR-4）**: `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer`・`StopContainer`・`RemoveContainer`・`ListContainers`・`ContainerStatus` は全終了経路（成功・入力不正・上限超過・内部エラー）で、
 //! 結果のステータスコードと所要時間を [`CriOpRecorder`] へ 1 件渡す。記録先は
 //! [`CriRuntimeService::with_recorder`] で注入する（既定は記録しない）。`config`・labels・annotations・
 //! エラー文言は記録先へ渡さない。
@@ -75,7 +82,10 @@ use crate::runtime::v1::{
     self, PodSandboxConfig, PodSandboxState, runtime_service_server::RuntimeService,
 };
 use config_limits::BoundedConfig;
-use container::{ContainerRecord, ContainerState, ValidatedCreate, validate_create_request};
+use container::{
+    ContainerRecord, ContainerState, ValidatedContainerFilter, ValidatedCreate,
+    validate_create_request,
+};
 
 pub use container::{ContainerLimits, MAX_CONTAINERS, MAX_RETAINED_CONTAINER_CONFIG_BYTES};
 
@@ -625,6 +635,59 @@ impl CriRuntimeService {
         Ok(v1::RemoveContainerResponse {})
     }
 
+    /// `ContainerStatus` の本体。読み取り専用（CRI-1・ERR-3・TASK-58.3・#435）。
+    ///
+    /// 空 ID は `INVALID_ARGUMENT`、未知 ID（Remove 済みを含む）は `NOT_FOUND`（文言に入力 ID を含めない）。
+    /// `verbose` でも `info` は空のスタブ（REPAIR-3）。`envs` 等は応答に含めない。
+    fn container_status_impl(
+        &self,
+        req: v1::ContainerStatusRequest,
+    ) -> Result<v1::ContainerStatusResponse, Status> {
+        if req.container_id.is_empty() {
+            return Err(Status::invalid_argument("container_id is required"));
+        }
+        let status = {
+            let registry = self
+                .registry
+                .lock()
+                .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+            let record = registry
+                .containers
+                .get(&req.container_id)
+                .ok_or_else(|| Status::not_found("container not found"))?;
+            record.to_status(&req.container_id)
+        };
+        Ok(v1::ContainerStatusResponse {
+            status: Some(status),
+            info: HashMap::new(),
+        })
+    }
+
+    /// `ListContainers` の本体。フィルタは AND、並びは `(created_at, id)` の昇順（CRI-1・TASK-58.3・#435）。
+    ///
+    /// 一致なし・未知 ID・`CONTAINER_UNKNOWN` は空の一覧。未知の state 値と過大な `label_selector` は
+    /// `INVALID_ARGUMENT`。件数はレジストリの上限（[`MAX_CONTAINERS`]）で有界。
+    fn list_containers_impl(
+        &self,
+        req: v1::ListContainersRequest,
+    ) -> Result<v1::ListContainersResponse, Status> {
+        let filter = ValidatedContainerFilter::new(req.filter)?;
+        let mut containers = {
+            let registry = self
+                .registry
+                .lock()
+                .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+            registry
+                .containers
+                .iter()
+                .filter(|(id, record)| filter.matches(id, record))
+                .map(|(id, record)| record.to_summary(id))
+                .collect::<Vec<_>>()
+        };
+        containers.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        Ok(v1::ListContainersResponse { containers })
+    }
+
     /// `PodSandboxStatus` の本体。読み取り専用（CRI-1・ERR-3・TASK-57.3）。
     ///
     /// 空 ID は `INVALID_ARGUMENT`、未知 ID は `NOT_FOUND`（文言に入力 ID を含めない）。
@@ -722,6 +785,34 @@ impl SandboxRecord {
     }
 }
 
+/// `label_selector` の件数・キー値長・合計バイト数（`extra_bytes` は同じフィルタの id 等の長さ）を検証する。
+///
+/// `ListPodSandbox`・`ListContainers`（TASK-58.3）が共用する。走査（レジストリのロック中）の前に拒否し、
+/// 入力サイズ×登録件数の処理を有限にする（ERR-3）。長さの加算は飽和演算で行う。
+fn validate_label_selector(
+    selector: &HashMap<String, String>,
+    extra_bytes: usize,
+) -> Result<(), Status> {
+    if selector.len() > MAX_CONFIG_COLLECTION_ENTRIES {
+        return Err(Status::invalid_argument(
+            "label_selector has too many entries",
+        ));
+    }
+    let mut total = extra_bytes;
+    for (k, v) in selector {
+        if k.len() > MAX_LABEL_SELECTOR_STRING_BYTES || v.len() > MAX_LABEL_SELECTOR_STRING_BYTES {
+            return Err(Status::invalid_argument(
+                "label_selector key or value is too long",
+            ));
+        }
+        total = total.saturating_add(k.len()).saturating_add(v.len());
+    }
+    if total > MAX_LABEL_SELECTOR_TOTAL_BYTES {
+        return Err(Status::invalid_argument("label_selector is too large"));
+    }
+    Ok(())
+}
+
 /// 検証済みの `ListPodSandbox` フィルタ（全条件 AND）。
 struct ValidatedFilter {
     id: String,
@@ -738,25 +829,7 @@ impl ValidatedFilter {
                 label_selector: HashMap::new(),
             });
         };
-        if filter.label_selector.len() > MAX_CONFIG_COLLECTION_ENTRIES {
-            return Err(Status::invalid_argument(
-                "label_selector has too many entries",
-            ));
-        }
-        let mut total = filter.id.len();
-        for (k, v) in &filter.label_selector {
-            if k.len() > MAX_LABEL_SELECTOR_STRING_BYTES
-                || v.len() > MAX_LABEL_SELECTOR_STRING_BYTES
-            {
-                return Err(Status::invalid_argument(
-                    "label_selector key or value is too long",
-                ));
-            }
-            total = total.saturating_add(k.len()).saturating_add(v.len());
-        }
-        if total > MAX_LABEL_SELECTOR_TOTAL_BYTES {
-            return Err(Status::invalid_argument("label_selector is too large"));
-        }
+        validate_label_selector(&filter.label_selector, filter.id.len())?;
         let state = match filter.state {
             None => None,
             Some(value) => match PodSandboxState::try_from(value.state) {
@@ -962,11 +1035,15 @@ impl RuntimeService for CriRuntimeService {
         timer.finish_with(&result);
         result.map(Response::new)
     }
+    /// コンテナの一覧を返す（読み取り専用。CRI-1・TASK-58.3・#435）。
     async fn list_containers(
         &self,
-        _request: Request<v1::ListContainersRequest>,
+        request: Request<v1::ListContainersRequest>,
     ) -> Result<Response<v1::ListContainersResponse>, Status> {
-        Err(Status::unimplemented("list_containers"))
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ListContainers);
+        let result = self.list_containers_impl(request.into_inner());
+        timer.finish_with(&result);
+        result.map(Response::new)
     }
     async fn stream_containers(
         &self,
@@ -974,11 +1051,15 @@ impl RuntimeService for CriRuntimeService {
     ) -> Result<Response<Self::StreamContainersStream>, Status> {
         Err(Status::unimplemented("stream_containers"))
     }
+    /// コンテナの状態を返す（読み取り専用。CRI-1・TASK-58.3・#435）。
     async fn container_status(
         &self,
-        _request: Request<v1::ContainerStatusRequest>,
+        request: Request<v1::ContainerStatusRequest>,
     ) -> Result<Response<v1::ContainerStatusResponse>, Status> {
-        Err(Status::unimplemented("container_status"))
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ContainerStatus);
+        let result = self.container_status_impl(request.into_inner());
+        timer.finish_with(&result);
+        result.map(Response::new)
     }
     async fn update_container_resources(
         &self,
@@ -1412,8 +1493,10 @@ mod tests {
     fn task_57_1_unimplemented_rpcs_are_not_recorded() {
         let collect = Arc::new(Collect::default());
         let svc = CriRuntimeService::with_recorder(collect.clone());
-        block_on(svc.container_status(Request::new(v1::ContainerStatusRequest::default())))
-            .unwrap_err();
+        block_on(svc.update_container_resources(Request::new(
+            v1::UpdateContainerResourcesRequest::default(),
+        )))
+        .unwrap_err();
         assert_eq!(collect.outcomes(), vec![]);
     }
 
@@ -1430,13 +1513,14 @@ mod tests {
         assert!(!debug.contains("do-not-print"));
     }
 
-    /// 未実装の RPC は Unimplemented のまま（TASK-58 で container_status を実装する際にこのテストを差し替える）。
+    /// 未実装の RPC は Unimplemented のまま（update_container_resources を実装する際にこのテストを差し替える）。
     #[test]
     fn task_57_1_other_rpcs_remain_unimplemented() {
         let svc = CriRuntimeService::new();
-        let err =
-            block_on(svc.container_status(Request::new(v1::ContainerStatusRequest::default())))
-                .unwrap_err();
+        let err = block_on(svc.update_container_resources(Request::new(
+            v1::UpdateContainerResourcesRequest::default(),
+        )))
+        .unwrap_err();
         assert_eq!(err.code(), Code::Unimplemented);
     }
 
@@ -2399,5 +2483,361 @@ mod tests {
             svc.registry.lock().unwrap().containers[&id].state,
             ContainerState::Exited
         );
+    }
+
+    fn list_c(
+        svc: &CriRuntimeService,
+        filter: Option<v1::ContainerFilter>,
+    ) -> Result<Vec<v1::Container>, Status> {
+        block_on(svc.list_containers(Request::new(v1::ListContainersRequest { filter })))
+            .map(|r| r.into_inner().containers)
+    }
+
+    fn status_c(svc: &CriRuntimeService, id: &str) -> Result<v1::ContainerStatus, Status> {
+        block_on(
+            svc.container_status(Request::new(v1::ContainerStatusRequest {
+                container_id: id.into(),
+                verbose: true,
+            })),
+        )
+        .map(|r| r.into_inner().status.unwrap())
+    }
+
+    fn state_filter(state: i32) -> Option<v1::ContainerFilter> {
+        Some(v1::ContainerFilter {
+            state: Some(v1::ContainerStateValue { state }),
+            ..Default::default()
+        })
+    }
+
+    /// 一覧の (id, state) を並びのまま取り出す。
+    fn id_states(list: &[v1::Container]) -> Vec<(String, i32)> {
+        list.iter().map(|c| (c.id.clone(), c.state)).collect()
+    }
+
+    /// CRI-1・TASK-58.3: Create・Start・Stop・Remove の各操作後の List が状態と整合し、Status とも一致する。
+    #[test]
+    fn task_58_3_list_reflects_create_stop_remove() {
+        let svc = CriRuntimeService::new();
+        let sb = run_id(&svc);
+        assert!(list_c(&svc, None).unwrap().is_empty());
+        let a = create(&svc, &sb, Some(container_config("a", 0))).unwrap();
+        let b = create(&svc, &sb, Some(container_config("b", 0))).unwrap();
+        let by_id =
+            |list: &[v1::Container], id: &str| list.iter().find(|c| c.id == id).map(|c| c.state);
+        let list = list_c(&svc, None).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(by_id(&list, &a), Some(0));
+        assert_eq!(by_id(&list, &b), Some(0));
+        start(&svc, &a).unwrap();
+        let list = list_c(&svc, None).unwrap();
+        assert_eq!(by_id(&list, &a), Some(1));
+        assert_eq!(by_id(&list, &b), Some(0));
+        assert_eq!(status_c(&svc, &a).unwrap().state, 1);
+        stop_c(&svc, &a, 0).unwrap();
+        let list = list_c(&svc, None).unwrap();
+        assert_eq!(by_id(&list, &a), Some(2));
+        assert_eq!(status_c(&svc, &a).unwrap().state, 2);
+        remove_c(&svc, &a).unwrap();
+        let list = list_c(&svc, None).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(by_id(&list, &b), Some(0));
+        assert_eq!(
+            status_c(&svc, &a).unwrap_err().code(),
+            Code::NotFound,
+            "removed container must not remain"
+        );
+        remove(&svc, &sb).unwrap();
+        assert!(list_c(&svc, None).unwrap().is_empty());
+        assert_eq!(status_c(&svc, &b).unwrap_err().code(), Code::NotFound);
+    }
+
+    /// CRI-1・TASK-58.3: 並びは (created_at, id) の昇順で決定的。
+    #[test]
+    fn task_58_3_list_is_sorted_by_created_at_then_id() {
+        let svc = CriRuntimeService::new();
+        let sb = run_id(&svc);
+        for i in 0..6 {
+            create(&svc, &sb, Some(container_config(&format!("c{i}"), 0))).unwrap();
+        }
+        let list = list_c(&svc, None).unwrap();
+        assert_eq!(list.len(), 6);
+        let keys: Vec<(i64, String)> = list.iter().map(|c| (c.created_at, c.id.clone())).collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted);
+        assert_eq!(id_states(&list), id_states(&list_c(&svc, None).unwrap()));
+    }
+
+    /// CRI-1・TASK-58.3: フィルタは AND。一致なし・未知 ID・CONTAINER_UNKNOWN は空の一覧。
+    #[test]
+    fn task_58_3_list_filters_are_and_combined() {
+        let svc = CriRuntimeService::new();
+        let sb1 = run_id(&svc);
+        let sb2 = run(&svc, Some(config("q")), "")
+            .unwrap()
+            .into_inner()
+            .pod_sandbox_id;
+        let a = running(&svc, &sb1, "a");
+        let b = create(&svc, &sb1, Some(container_config("b", 0))).unwrap();
+        let mut cfg = container_config("c", 0);
+        cfg.labels.insert("k".into(), "other".into());
+        let c = create(&svc, &sb2, Some(cfg)).unwrap();
+        let f = |id: &str, state: Option<i32>, pod: &str, labels: &[(&str, &str)]| {
+            Some(v1::ContainerFilter {
+                id: id.into(),
+                state: state.map(|state| v1::ContainerStateValue { state }),
+                pod_sandbox_id: pod.into(),
+                label_selector: labels
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            })
+        };
+        let ids = |filter| {
+            let mut v: Vec<String> = list_c(&svc, filter)
+                .unwrap()
+                .into_iter()
+                .map(|c| c.id)
+                .collect();
+            v.sort();
+            v
+        };
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+        assert_eq!(ids(f(&a, None, "", &[])), vec![a.clone()]);
+        assert_eq!(ids(f("", Some(1), "", &[])), vec![a.clone()]);
+        assert_eq!(
+            ids(f("", Some(0), "", &[])),
+            sorted(vec![b.clone(), c.clone()])
+        );
+        assert_eq!(
+            ids(f("", None, &sb1, &[])),
+            sorted(vec![a.clone(), b.clone()])
+        );
+        assert_eq!(ids(f("", None, &sb2, &[])), vec![c.clone()]);
+        assert_eq!(
+            ids(f("", None, "", &[("k", "v")])),
+            sorted(vec![a.clone(), b.clone()])
+        );
+        assert_eq!(ids(f("", Some(0), &sb1, &[("k", "v")])), vec![b.clone()]);
+        assert!(ids(f(&a, Some(0), "", &[])).is_empty());
+        assert!(ids(f(&"0".repeat(64), None, "", &[])).is_empty());
+        assert!(ids(f("", None, "", &[("k", "nope")])).is_empty());
+        assert!(ids(f("", None, "unknown-sandbox", &[])).is_empty());
+        assert!(list_c(&svc, state_filter(3)).unwrap().is_empty());
+        assert_eq!(list_c(&svc, state_filter(2)).unwrap().len(), 0);
+    }
+
+    /// ERR-3・TASK-58.3: 未知 state と label_selector の上限超過は INVALID_ARGUMENT。上限ちょうどは通る。
+    #[test]
+    fn task_58_3_list_validates_filter() {
+        let svc = CriRuntimeService::new();
+        assert_eq!(
+            list_c(&svc, state_filter(99)).unwrap_err().code(),
+            Code::InvalidArgument
+        );
+        let selector = |n: usize, klen: usize, vlen: usize| {
+            Some(v1::ContainerFilter {
+                label_selector: (0..n)
+                    .map(|i| (format!("{i:0>klen$}"), "v".repeat(vlen)))
+                    .collect(),
+                ..Default::default()
+            })
+        };
+        list_c(&svc, selector(MAX_CONFIG_COLLECTION_ENTRIES, 4, 1)).unwrap();
+        assert_eq!(
+            list_c(&svc, selector(MAX_CONFIG_COLLECTION_ENTRIES + 1, 4, 1))
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+        list_c(
+            &svc,
+            selector(
+                1,
+                MAX_LABEL_SELECTOR_STRING_BYTES,
+                MAX_LABEL_SELECTOR_STRING_BYTES,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            list_c(&svc, selector(1, MAX_LABEL_SELECTOR_STRING_BYTES + 1, 1))
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+        assert_eq!(
+            list_c(&svc, selector(1, 1, MAX_LABEL_SELECTOR_STRING_BYTES + 1))
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+        // 合計: id と pod_sandbox_id の長さも加算され、上限ちょうどは通り +1 で拒否される。
+        let total = |extra: usize| {
+            Some(v1::ContainerFilter {
+                id: "i".repeat(MAX_LABEL_SELECTOR_STRING_BYTES),
+                pod_sandbox_id: "p".repeat(extra),
+                ..Default::default()
+            })
+        };
+        let room = MAX_LABEL_SELECTOR_TOTAL_BYTES - MAX_LABEL_SELECTOR_STRING_BYTES;
+        list_c(&svc, total(room)).unwrap();
+        assert_eq!(
+            list_c(&svc, total(room + 1)).unwrap_err().code(),
+            Code::InvalidArgument
+        );
+    }
+
+    /// ERR-3・TASK-58.3: ContainerStatus の空 ID は INVALID_ARGUMENT、未知 ID は NOT_FOUND。
+    #[test]
+    fn task_58_3_status_error_codes() {
+        let svc = CriRuntimeService::new();
+        let err = status_c(&svc, "").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        let unknown = "f".repeat(64);
+        let err = status_c(&svc, &unknown).unwrap_err();
+        assert_eq!(err.code(), Code::NotFound);
+        assert!(!err.message().contains(&unknown));
+    }
+
+    /// CRI-1・TASK-58.3: Status の時刻が遷移ごとに記録され、config の値は無改変、未実装項目はスタブ値。
+    #[test]
+    fn task_58_3_status_content() {
+        let svc = CriRuntimeService::new();
+        let sb = run_id(&svc);
+        let mut cfg = container_config("c", 2);
+        cfg.log_path = "c/0.log".into();
+        cfg.stop_signal = 15;
+        cfg.mounts.push(v1::Mount {
+            container_path: "/data".into(),
+            host_path: "/srv/data".into(),
+            readonly: true,
+            ..Default::default()
+        });
+        cfg.envs.push(v1::KeyValue {
+            key: "SECRET".into(),
+            value: "hunter2".into(),
+        });
+        cfg.linux = Some(v1::LinuxContainerConfig {
+            resources: Some(v1::LinuxContainerResources {
+                cpu_shares: 512,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let id = create(&svc, &sb, Some(cfg.clone())).unwrap();
+        let created = status_c(&svc, &id).unwrap();
+        assert_eq!(created.id, id);
+        assert_eq!(created.state, 0);
+        assert!(created.created_at > 0);
+        assert_eq!((created.started_at, created.finished_at), (0, 0));
+        assert_eq!(created.metadata, cfg.metadata);
+        assert_eq!(created.image, cfg.image);
+        assert_eq!(created.labels, cfg.labels);
+        assert_eq!(created.annotations, cfg.annotations);
+        assert_eq!(created.mounts, cfg.mounts);
+        assert_eq!(created.log_path, "c/0.log");
+        assert_eq!(created.stop_signal, 15);
+        assert_eq!(
+            created.resources.clone().unwrap().linux.unwrap().cpu_shares,
+            512
+        );
+        assert_eq!(created.exit_code, 0);
+        assert_eq!(created.image_ref, "");
+        assert_eq!(created.reason, "");
+        assert_eq!(created.message, "");
+        assert!(!format!("{created:?}").contains("hunter2"));
+        start(&svc, &id).unwrap();
+        let running = status_c(&svc, &id).unwrap();
+        assert_eq!(running.state, 1);
+        assert!(running.started_at >= running.created_at);
+        assert_eq!(running.finished_at, 0);
+        stop_c(&svc, &id, 0).unwrap();
+        let exited = status_c(&svc, &id).unwrap();
+        assert_eq!(exited.state, 2);
+        assert_eq!(exited.started_at, running.started_at);
+        assert!(exited.finished_at >= exited.started_at);
+        let resp = block_on(
+            svc.container_status(Request::new(v1::ContainerStatusRequest {
+                container_id: id,
+                verbose: true,
+            })),
+        )
+        .unwrap()
+        .into_inner();
+        assert!(resp.info.is_empty());
+    }
+
+    /// REPAIR-4・TASK-58.3: List・Status の全終了経路が 1 件ずつ記録され、ID を含まない。
+    #[test]
+    fn task_58_3_outcomes_are_recorded_without_content() {
+        let collect = Arc::new(Collect::default());
+        let svc = CriRuntimeService::with_recorder(collect.clone());
+        let sb = run_id(&svc);
+        let id = running(&svc, &sb, "c");
+        list_c(&svc, None).unwrap();
+        list_c(&svc, state_filter(99)).unwrap_err();
+        status_c(&svc, &id).unwrap();
+        status_c(&svc, "").unwrap_err();
+        status_c(&svc, &"e".repeat(64)).unwrap_err();
+        let samples = collect.items();
+        let tail: Vec<(&str, CriOpOutcome, Code)> = samples[samples.len() - 5..]
+            .iter()
+            .map(|s| (s.kind().as_str(), s.outcome(), s.code()))
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                ("cri.list_containers", CriOpOutcome::Success, Code::Ok),
+                (
+                    "cri.list_containers",
+                    CriOpOutcome::Failure,
+                    Code::InvalidArgument
+                ),
+                ("cri.container_status", CriOpOutcome::Success, Code::Ok),
+                (
+                    "cri.container_status",
+                    CriOpOutcome::Failure,
+                    Code::InvalidArgument
+                ),
+                (
+                    "cri.container_status",
+                    CriOpOutcome::Failure,
+                    Code::NotFound
+                ),
+            ]
+        );
+        assert!(!format!("{samples:?}").contains(&id));
+    }
+
+    /// TASK-58.3: Create/Remove を繰り返す間の List は、常に内部で整合した結果を返す。
+    #[test]
+    fn task_58_3_list_during_concurrent_create_remove_is_consistent() {
+        let svc = CriRuntimeService::new();
+        let sb = run_id(&svc);
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                for i in 0..50 {
+                    let id =
+                        create(&svc, &sb, Some(container_config(&format!("w{i}"), 0))).unwrap();
+                    remove_c(&svc, &id).unwrap();
+                }
+            });
+            for _ in 0..50 {
+                for c in list_c(&svc, None).unwrap() {
+                    assert_eq!(c.pod_sandbox_id, sb);
+                    assert_eq!(c.state, 0);
+                    // 一覧に出た ID は、直後に Remove されていても NOT_FOUND 以外のエラーにはならない。
+                    if let Err(e) = status_c(&svc, &c.id) {
+                        assert_eq!(e.code(), Code::NotFound);
+                    }
+                }
+            }
+            writer.join().unwrap();
+        });
+        assert!(list_c(&svc, None).unwrap().is_empty());
     }
 }

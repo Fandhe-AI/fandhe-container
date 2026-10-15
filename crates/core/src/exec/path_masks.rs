@@ -48,6 +48,8 @@
 //!
 //! - `/sys` 配下の個別項目と sysfs の供給（TASK-127）。`/sys` は mount top だけを読み取り専用にする。将来 OCI
 //!   `mounts[]` で sysfs を `/sys` に載せる場合は、本段より前に載せること
+//! - `/proc` の供給（procfs マウント）。現状は本段より後に procfs をマウントする実装がない。将来 OCI `mounts[]`
+//!   等で procfs を `/proc` に載せる場合は、`/sys` と同様に本段より前に載せること（後から載せると読み取り専用の bind が隠れる）
 //! - 違反の監査（SEC-4）への記録: 失敗は `ExecError`（段 `MountReadonlyPaths`）で返すだけで、専用の
 //!   `ViolationReason` は足していない
 //! - `maskedPaths`（#1851）、config の `readonlyPaths` の解釈（#1852）

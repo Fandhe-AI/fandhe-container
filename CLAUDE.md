@@ -74,7 +74,8 @@ fandhe-container/
 │   │   ├── crate-naming.md        # crate 短縮名・plugin crate 配置の確定内容（TASK-1・REPAIR-1）
 │   │   ├── rootless-network.md    # rootless ネットワーク外部ヘルパーの判断記録（TASK-147・NET-9。pasta を採用〔#340〕。実装・実証は #341）
 │   │   ├── privilege-separation.md  # 権限分離方式の比較と必要最小権限の設計書（TASK-171.1.1・SUP-14。方式承認済み〔#1454〕）
-│   │   └── dev-default-mounts.md  # OCI 既定の /dev の残り（/dev/pts・/dev/ptmx・/dev/shm・/dev/console）と rootless の /dev 供給方式の設計ドラフト（TASK-29 追補・#1609。方式を確定し実装 issue を #54 配下に起票）
+│   │   ├── dev-default-mounts.md  # OCI 既定の /dev の残り（/dev/pts・/dev/ptmx・/dev/shm・/dev/console）と rootless の /dev 供給方式の設計ドラフト（TASK-29 追補・#1609。方式を確定し実装 issue を #54 配下に起票）
+│   │   └── audit-delivery.md      # seccomp・Landlock の拒否を監査の記録先へ届ける配送経路の設計ドラフト（採否未決。TASK-41 追補・#1835・SEC-4）
 │   ├── setup/                     # 利用者向けセットアップ手順
 │   │   └── windows.md             # Windows セットアップ前提条件（WSL2・Developer Mode・`.wslconfig` の virtiofs。TASK-69・WIN-5。NTFS セマンティクス差異への対応〔TASK-68・WIN-4〕を統合）
 │   ├── verification/              # 実機確認の記録雛形（cli-cross-platform-parity.md: CLI 基本 6 コマンドの 3 OS 同一構文・挙動チェックリスト。TASK-125.1・CLI-1。結果記入は #661）

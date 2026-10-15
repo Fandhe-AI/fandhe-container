@@ -598,14 +598,14 @@ mod linux {
         )
         .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
         let pid = started.process().pid();
-        assert_eq!(started.record().status().state(), ContainerState::Running);
-        assert_eq!(started.record().status().pid(), Some(pid));
-        assert_eq!(state_of(&env.store, &id), ContainerState::Running);
-
         // 検証は catch_unwind の中で行い、成否に関わらず terminate と回収を行ってから panic を再送出する
         // （`LaunchedProcess` は Drop で終了・回収しないため、ここで回収しないと実機にプロセスが残る）。
         let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
         let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // 起動直後の状態検証も保護範囲に含め、panic 時も terminate と回収を行う。
+            assert_eq!(started.record().status().state(), ContainerState::Running);
+            assert_eq!(started.record().status().pid(), Some(pid));
+            assert_eq!(state_of(&env.store, &id), ContainerState::Running);
             // ホストから見た PID 1 の確認（NSpid の末尾が 1）。
             let nspid = status_field(&format!("/proc/{pid}/status"), "NSpid:").expect("host NSpid");
             let parts: Vec<&str> = nspid.split_whitespace().collect();

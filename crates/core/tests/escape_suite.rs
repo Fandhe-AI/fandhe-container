@@ -50,14 +50,21 @@
 //! 「対象外」（`verdict=not-applicable`）として理由とビヘイビア ID を出力し、他のケースは実行する。分離方式（TASK-42.6・#204）は
 //! `harness = false` ＋ `--ignored` 引数ゲートで確定（CLONE_NEWUSER は単一スレッド前提で libtest と相容れないため
 //! `#[ignore]` や feature flag は使わない）。既定の集合では自己テストのみ走る。CI の `platform-ci` への
-//! 組み込みは ESC-04〜06 の既知失敗の解消と Landlock ABI 6+ runner の確保後に別 PR で行う。実行条件は AGENTS.md
+//! 組み込みは ESC-06 の解消と Landlock ABI 6+ runner の確保後に別 PR で行う。実行条件は AGENTS.md
 //! 「実機前提テスト」節を参照。
 //!
 //! # ESC-04〜ESC-06（TASK-42.3・#201・MS-2）
 //! - ESC-04（cgroup の `release_agent` 書き込み）・ESC-05（`/proc/sys`・`/proc/sysrq-trigger` 書き込み）は、
 //!   書き込み用に「開くだけ」で判定し 1 バイトも書かない（制限が欠けてもホストへ作用させないため）。
-//!   ESC-04 は対象（`sys/fs/cgroup/release_agent`）を rootfs に実在させ `Absent` を受理しない。ESC-04・05 とも
-//!   `linux.maskedPaths` / `readonlyPaths` が未適用のため、実機実行では本物の欠陥として失敗し得る（期待は変えない）。
+//!   ESC-04 は対象（`sys/fs/cgroup/release_agent`）を rootfs に実在させ `Absent` を受理しない。ESC-04・05 の
+//!   拒否は、実行層が `setup` の有無によらず pivot 前に常に適用する読み取り専用の固定集合（`crate::path_masks` の
+//!   `READONLY_PROC_PATHS` と `READONLY_SYS_PATH`。適用は `exec::path_masks`。SEC-2・TASK-29 追補・#1850）が担う。
+//!   覆う固定集合（`MASKED_PROC_PATHS`。#1851）は `setup` 指定時のみ適用され `spawn_container_probe`（`setup` なし）
+//!   では適用されないが、ESC-04・05 の対象はいずれも読み取り専用側に含まれるため最小構成でも拒否される。
+//!   ESC-04 は `/sys` 全体の読み取り専用化で `EROFS` になり、`has_mask_evidence` の証拠には頼らない。ESC-05 は
+//!   `/proc/sys`・`/proc/sysrq-trigger` の読み取り専用化による（rootful は `EROFS`。rootless は権限検査が先に
+//!   `EACCES` を返し得るため、読み取り専用マウントの証拠で受理する）。実機で失敗した場合は判定を緩めず
+//!   #1850・#1851 の実装不具合として扱う（期待は変えない）。
 //!   適用範囲の限定: ESC-04 は rootfs 内の「通常の空ファイル」への書き込み拒否（`maskedPaths` / `readonlyPaths`
 //!   相当のパスマスク）だけを検証し、実際の cgroup v1 `release_agent`（v1 階層の mount 経路）は検証しない
 //!   （v1 の mount 拒否は `tests/seccomp.rs`、ホスト側根拠は `tests/cgroups_release_agent.rs`）。
@@ -1841,8 +1848,8 @@ mod linux {
     /// ESC-04（SEC-2・TASK-42.3・#201・MS-2）: cgroup v1 の `release_agent` への書き込み。
     /// 対象は rootfs 作成時に実在させる（`make_rootfs` が `sys/fs/cgroup/release_agent` を空ファイルで置く。
     /// ホストの cgroup は触らない）。そのため `ENOENT`（`Absent`）は受理せず、`EPERM` / `EACCES` / `EROFS` の
-    /// 拒否だけを期待する。拒否の本番実装（`linux.readonlyPaths` / `maskedPaths` 適用）は未実装（REPAIR-3）のため、
-    /// 現行の実機実行では書き込み用に開けて失敗する（ESC-05 と同様に本物の欠陥として検出。期待は変えない）。
+    /// 拒否だけを期待する。拒否は `/sys` 全体の読み取り専用化（#1850）による `EROFS` で、`has_mask_evidence` の
+    /// 証拠には頼らない（実機で失敗すれば本物の欠陥として検出する。期待は変えない）。
     /// v1 階層の新規 mount の拒否は seccomp の `mount` 拒否（`tests/seccomp.rs`）、ホスト側の根拠は
     /// `tests/cgroups_release_agent.rs`（TASK-35）にある。
     fn attack_esc04_release_agent(rec: &Recorder, _host_canary: &Path) {
@@ -1850,12 +1857,13 @@ mod linux {
     }
 
     /// ESC-05（SEC-2・TASK-42.3・#201・MS-2）: マスク対象 `/proc/sys` 配下（`core_pattern`）への書き込み。
-    /// `maskedPaths` 未適用のため rootful では開けてしまい得る（本物の欠陥の検出。期待は変えない）。
+    /// `/proc/sys` の読み取り専用化（#1850）で拒否される。覆う側（#1851）には依存しない（期待は変えない）。
     fn attack_esc05_proc_sys_core_pattern(rec: &Recorder, _host_canary: &Path) {
         rec.outcome(open_write_only("/proc/sys/kernel/core_pattern"));
     }
 
     /// ESC-05（SEC-2・TASK-42.3・#201・MS-2）: `/proc/sysrq-trigger` への書き込み。開くだけで書かない。
+    /// 拒否の担い手は `/proc/sysrq-trigger` の読み取り専用化（#1850）。
     fn attack_esc05_sysrq_trigger(rec: &Recorder, _host_canary: &Path) {
         rec.outcome(open_write_only("/proc/sysrq-trigger"));
     }

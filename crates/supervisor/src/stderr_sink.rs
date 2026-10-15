@@ -171,11 +171,16 @@ mod tests {
     use super::*;
 
     /// 解放の合図まで書き込みが戻らない書き手（読み手の止まった満杯の pipe の代わり）。
-    struct StuckWriter(Receiver<()>);
+    /// 書き込みに入った時点で `arrived` へ通知し、専用スレッドが止まったことをテストが確認できる（#1970）。
+    struct StuckWriter {
+        release: Receiver<()>,
+        arrived: Sender<()>,
+    }
 
     impl Write for StuckWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            let _ = self.0.recv();
+            let _ = self.arrived.send(());
+            let _ = self.release.recv();
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -183,9 +188,17 @@ mod tests {
         }
     }
 
-    fn stuck() -> (Sender<()>, StuckWriter) {
+    fn stuck() -> (Sender<()>, Receiver<()>, StuckWriter) {
         let (release, rx) = channel();
-        (release, StuckWriter(rx))
+        let (arrived_tx, arrived) = channel();
+        (
+            release,
+            arrived,
+            StuckWriter {
+                release: rx,
+                arrived: arrived_tx,
+            },
+        )
     }
 
     /// 書いた内容を共有のバッファへ溜める書き手。
@@ -215,17 +228,30 @@ mod tests {
     }
 
     /// REPAIR-5: 書き手が止まっても `emit` は待たずに戻り、キューの上限を超えた行は `QueueFull` で捨てる。
+    /// 専用スレッドが 1 行目を取り出して書き手の中で止まるまで待ってから判定する。待たないと、
+    /// 取り出し前に `emit` が終わりキューに空きができて `QueueFull` にならない競合がある（#1970）。
     #[test]
     fn repair5_emit_does_not_block_on_stuck_writer() {
-        let (release, writer) = stuck();
+        let (release, arrived, writer) = stuck();
         let sink = StderrSink::spawn(writer, 2);
+        assert_eq!(sink.emit(b"x\n".to_vec()), EmitOutcome::Queued);
+        arrived
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker thread did not reach the writer");
+        // ここでキューは空で、専用スレッドは 1 行を抱えて止まっている。
         let started = Instant::now();
-        let accepted = (0..10)
-            .filter(|_| sink.emit(b"x\n".to_vec()) == EmitOutcome::Queued)
-            .count();
+        let outcomes: Vec<EmitOutcome> = (0..10).map(|_| sink.emit(b"x\n".to_vec())).collect();
         assert!(started.elapsed() < Duration::from_secs(1));
-        // 専用スレッドが止まった 1 行＋キューの 2 行まで。
-        assert!((2..=3).contains(&accepted), "accepted = {accepted}");
+        let queued = outcomes
+            .iter()
+            .filter(|o| **o == EmitOutcome::Queued)
+            .count();
+        let full = outcomes
+            .iter()
+            .filter(|o| **o == EmitOutcome::QueueFull)
+            .count();
+        // キュー容量の 2 行だけ受理し、残りは捨てる。
+        assert_eq!((queued, full), (2, 8));
         assert_eq!(sink.emit(b"y\n".to_vec()), EmitOutcome::QueueFull);
         drop(release);
     }
@@ -233,7 +259,7 @@ mod tests {
     /// REPAIR-5: 書き手が止まっていれば `emit_and_wait` は期限で `TimedOut` を返す。
     #[test]
     fn repair5_emit_and_wait_times_out_on_stuck_writer() {
-        let (release, writer) = stuck();
+        let (release, _arrived, writer) = stuck();
         let sink = StderrSink::spawn(writer, 4);
         let started = Instant::now();
         assert_eq!(

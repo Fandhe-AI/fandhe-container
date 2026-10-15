@@ -442,7 +442,15 @@ impl CriRuntimeService {
         if sandbox.state != SandboxState::Ready {
             return Err(Status::failed_precondition("sandbox is not ready"));
         }
-        let key = (pod_sandbox_id, name, attempt);
+        // 要求由来の String は余分な capacity を持ちうる。照合に成功した ID（最大 64 文字）と名前は、
+        // 内容長ちょうどの新しい String へ複製して保持し、要求側の確保領域を削除まで残さない
+        // （retained_bytes は内容長の見積もりのため、capacity の保持は累積上限を迂回する）。
+        let key = (
+            String::from(pod_sandbox_id.as_str()),
+            String::from(name.as_str()),
+            attempt,
+        );
+        drop((pod_sandbox_id, name));
         if registry.container_keys.contains(&key) {
             return Err(Status::already_exists("container already exists"));
         }
@@ -1838,6 +1846,37 @@ mod tests {
         assert_eq!(rec.config, cfg);
         assert_eq!(reg.container_keys.len(), 1);
         assert_eq!(reg.container_retained_bytes, rec.retained_bytes);
+    }
+
+    /// TASK-58.1・REPAIR-9（リソース上限）: 過大 capacity の ID・名前を渡しても、保持する key と
+    /// 記録の String は内容長ちょうどの確保になる。
+    #[test]
+    fn task_58_1_retained_strings_do_not_keep_oversized_capacity() {
+        let svc = CriRuntimeService::new();
+        let sb = run_id(&svc);
+        let mut big_id = String::with_capacity(1 << 20);
+        big_id.push_str(&sb);
+        let mut big_name = String::with_capacity(1 << 20);
+        big_name.push('c');
+        let mut cfg = container_config("c", 0);
+        cfg.metadata.as_mut().unwrap().name = big_name;
+        let id = block_on(
+            svc.create_container(Request::new(v1::CreateContainerRequest {
+                pod_sandbox_id: big_id,
+                config: Some(cfg),
+                sandbox_config: None,
+            })),
+        )
+        .unwrap()
+        .into_inner()
+        .container_id;
+        let reg = svc.registry.lock().unwrap();
+        for (sid, name, _) in &reg.container_keys {
+            assert_eq!(sid.capacity(), 64);
+            assert_eq!(name.capacity(), 1);
+        }
+        let rec = reg.containers.get(&id).unwrap();
+        assert_eq!(rec.pod_sandbox_id.capacity(), 64);
     }
 
     /// CRI-1・TASK-58.1（受け入れ条件）: Create の後の Start で running になる。

@@ -2,11 +2,11 @@
 
 カーネルが返す seccomp と Landlock の拒否を、`AuditSink`（`FileAuditSink` ほか）へ届ける配送経路の候補を、同じ比較軸で並べた判断資料。
 
-> **位置づけ**: **採否未決のドラフト**。TASK-41 追補・#1835 の設計ドラフトで、方式はユーザー（オーナー）が決める。本書は決まった方式があるようには書かない。実装済みを装わない（REPAIR-3）。方式と「100% 記録を満たせない環境での挙動」は 7 章の確認事項としてユーザーへ回す。
+> **位置づけ**: **方式は採用済み・実装は未着手**。TASK-41 追補・#1835 の設計ドラフトとして作り、2026-10-15 にオーナーが 4 章の組み合わせ案と 7 章の推奨を採用した（判断の記録は #2018 のコメント。11 章の承認事項 1〜4 を含む）。実装は 9 章の issue が担い、本書は実装済みを装わない（REPAIR-3）。SEC-4 の「100% 記録」の読み替えの要否は spec 側の課題として残る（11 章）。
 
 - 対象ビヘイビア: SEC-4（関連: SEC-2・CORE-1・CORE-5・SUP-2・SUP-6・REPAIR-3・REPAIR-5）
 - タスク: TASK-41 追補、MS-2、#1835（前提: #1834 の seccomp 拒否時の動作。origin/main 9a933113 で反映済み）
-- 作成日・確認日: 2026-10-15
+- 作成日・確認日: 2026-10-15（同日にオーナーが方式を採用。#2018）
 - 出典: SSOT は `docs/spec` の `04-behavior/security-isolation.md`（SEC-4）と `03-poc/security-isolation/`（ESC 表・監査ログ設計）。本書は ID で参照し、長い引用はしない
 
 ## 1. 背景と目的
@@ -60,7 +60,7 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 - **(d) 親が得る終了シグナルだけからの記録（`waitpid`）**: syscall 番号は得られない。SIGSYS はコンテナ内の `kill(SIGSYS)` でも同じになり、seccomp 由来と断定できない。親の側で syscall を推測して記録を作るのは監査の偽造になるため行わない。(c) の記録との突き合わせの補助としては使える。`AuditEvent::Seccomp` の型の制約により、単独で使うには新しいレコード種別が要る
 - **(e) `SECCOMP_RET_TRACE` と supervisor の ptrace**: syscall 番号・引数が得られる見込みだが、ptrace の権限と scope、コンテナ内の `ptrace` 禁止との関係、tracer 不在時の `ENOSYS`、複雑さの面で不利と見込む（詳細は未調査）
 
-**組み合わせ案（暫定）**: 3 件の `KILL_PROCESS` は (c) と (d)、40 件の `ERRNO` は (a)。#1834 の動作を変えずに全 43 件を覆えるかを、評価の対象にする。
+**組み合わせ案（2026-10-15 採用。#2018）**: 3 件の `KILL_PROCESS` は (c) と (d)、40 件の `ERRNO` は (a)。#1834 の動作を変えずに全 43 件を覆う。(d) は (c) との突き合わせの補助にとどめ、親の側で syscall を推測した記録は作らない。
 
 ### #1834 と両立する方式
 
@@ -105,7 +105,7 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 | 警告して続行し、縮退を状態に明示する | inspect・構造化ログ・記録に「記録の網羅が縮退している」と出す |
 | 利用者の選択にする（opt-in / opt-out） | 厳格モードの既定を決める必要がある |
 
-**推奨（暫定）**: rootless でも確実に使える層（USER_NOTIF など）は fail-closed、カーネル監査頼みの層は警告して続行し縮退を状態へ明示する。厳格モード（縮退を拒否する）は opt-in で選べるようにする。ただし本書では決めない。
+**推奨（暫定）**: rootless でも確実に使える層（USER_NOTIF など）は fail-closed、カーネル監査頼みの層は警告して続行し縮退を状態へ明示する。厳格モード（縮退を拒否する）は opt-in で選べるようにする。2026-10-15 にオーナーが採用した（#2018）。
 
 ## 8. 配線状況の一覧（マウント検証/API 層など）
 
@@ -114,26 +114,26 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 | supervisor の exec（`exec_target`・`entrypoint`・`rootfs_pivot` の mount） | `AuditSink` | 配線済み（`default_audit_sink`。#1594） | - |
 | launch 経路のマウントの拒否 | mount 層 | pivot 前段の失敗の記録は #1815（closed）で対応 | - |
 | `mounts[]` の bind mount | mount 層 | 未配線（検証済みの型への変換が先） | #1911（open）ほか |
-| seccomp・Landlock | `record_seccomp_denial`・`landlock_denial_record` | 配送経路が無い（本書の対象） | #1835（本書）→ 方式の決定後に実装 issue |
-| plugin 信頼検証（`AuditLayer::PluginTrust`） | 監査つき検証ラッパー実装済み | レジストリ・本番 sink への配線は未実装 | 追う issue 未確認（起票はユーザー承認後） |
-| CLI・healthcheck | - | 未配線 | #495（healthcheck。open）。CLI は追う issue 未確認 |
-| コンテナ ID の付与 | `AuditRecord::container_id` | seccomp・landlock・plugin_trust への配線は未実装 | #1618（closed。型のみ）。配線の issue は未確認 |
+| seccomp・Landlock | `record_seccomp_denial`・`landlock_denial_record` | 配送経路が無い（本書の対象） | #1835（本書）→ 実装は #2023〜#2028・#2004（9 章） |
+| plugin 信頼検証（`AuditLayer::PluginTrust`） | 監査つき検証ラッパー実装済み | レジストリ・本番 sink への配線は未実装 | #2013 |
+| CLI・healthcheck | - | 未配線 | #495（healthcheck。open）。CLI の本番 sink は #2013 |
+| コンテナ ID の付与 | `AuditRecord::container_id` | seccomp・landlock・plugin_trust への配線は未実装 | #1618（closed。型のみ）。plugin_trust への付与は #2013、seccomp は #2025 |
 
 監査ログ・可観測性・エラー出力の統一は #653（TASK-98.2。open）が担う。本書は配送経路に限り、レコード形式の統一とは分ける。着手時に `git grep` と issue 検索で最新の状態を確かめる。
 
-## 9. 実装 issue の分割案（未起票。方式が決まるまで確定ではない）
+## 9. 実装 issue の分割（2026-10-15 起票。#58 配下）
 
-起票はユーザー承認後。粒度は 2h・1 PR・1 関心事を目安とする。
+粒度は 2h・1 PR・1 関心事を目安とする。各案の issue は表の右端の列。
 
-| 案 | 内容 | crate |
-| -- | ---- | ----- |
-| 1 | `DenyAction` の拡張と USER_NOTIF 用フィルタの構築（命令数の期待値の更新） | core |
-| 2 | listener fd の取得と受け渡し（`sys` のラッパー） | core・supervisor |
-| 3 | supervisor の listener ループ（期限・PID 変換・`record_seccomp_denial`・`EPERM` 応答） | supervisor |
-| 4 | `KILL_PROCESS` 側の記録（親の終了シグナルとカーネル監査の突き合わせ。レコード型の拡張の要否） | core・supervisor |
-| 5 | Landlock のカーネル監査対応（ABI 7 のログ制御フラグ）と縮退時の状態表示 | core |
-| 6 | 縮退時の挙動（起動拒否／警告）の実装 | core・supervisor |
-| 7 | `escape_suite.rs` の整備 | core |
+| 案 | 内容 | crate | issue |
+| -- | ---- | ----- | ----- |
+| 1 | `DenyAction` の拡張と USER_NOTIF 用フィルタの構築（命令数の期待値の更新） | core | #2023 |
+| 2 | listener fd の取得と受け渡し（`sys` のラッパー） | core・supervisor | #2024 |
+| 3 | supervisor の listener ループ（期限・PID 変換・`record_seccomp_denial`・`EPERM` 応答） | supervisor | #2025 |
+| 4 | `KILL_PROCESS` 側の記録（親の終了シグナルとカーネル監査の突き合わせ。レコード型の拡張の要否） | core・supervisor | #2004 |
+| 5 | Landlock のカーネル監査対応（ABI 7 のログ制御フラグ）と縮退時の状態表示 | core | #2026 |
+| 6 | 縮退時の挙動（起動拒否／警告）の実装 | core・supervisor | #2027 |
+| 7 | `escape_suite.rs` の整備 | core | #2028 |
 
 **完了の条件**に含める: ESC-01・03・06・10 の `AuditExpectation::Deferred` を `Required` へ切り替える。ESC-07・08 が試験の側で作っている記録（`record_landlock_denial`、`audit_mount_config_error` の直接呼び出し）を、本番の配送経路が出した記録に置き換える。本番 sink の出力ファイルを親が回収して照合する形を含める。
 
@@ -155,6 +155,8 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 2. 100% を満たせない環境での挙動（7 章）
 3. `DenyAction` と `AuditEvent` の公開 API 変更の要否（syscall 必須の制約）
 4. `AuditSink` トレイトの変更の要否（現状の `record(&AuditRecord)` で足りる見込みだが未確認）
+
+2026-10-15 にオーナーが 1〜4 を承認した（#2018）。1・2 は 4 章の組み合わせ案と 7 章の推奨を採用し、3・4 は上の方式の実装に必要な範囲で変更を認めた。
 
 **spec 側の課題**（本リポでは変更しない。ユーザーへ報告するのみ）:
 

@@ -494,6 +494,9 @@ mod consts {
     pub const SYS_KEXEC_LOAD: ArchSysNo = ArchSysNo::new(246);
     pub const PTRACE_CONT: i64 = 7;
     pub const KEXEC_SEGMENT_MAX: i64 = 16;
+    // `kcmp`（x86_64 は syscall_64.tbl の 312）と `KCMP_VM`（include/uapi/linux/kcmp.h）。
+    pub const SYS_KCMP: ArchSysNo = ArchSysNo::new(312);
+    pub const KCMP_VM: i64 = 1;
     // include/uapi/linux/capability.h の `_LINUX_CAPABILITY_VERSION_3`（2 語・64 bit 形式）。
     pub const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
     // include/uapi/linux/prctl.h の `PR_CAPBSET_READ`（23）・`PR_CAPBSET_DROP`（24）・
@@ -782,6 +785,9 @@ mod consts {
     pub const SYS_KEXEC_LOAD: ArchSysNo = ArchSysNo::new(104);
     pub const PTRACE_CONT: i64 = 7;
     pub const KEXEC_SEGMENT_MAX: i64 = 16;
+    // `kcmp`（aarch64 は asm-generic/unistd.h の 272）と `KCMP_VM`（include/uapi/linux/kcmp.h）。
+    pub const SYS_KCMP: ArchSysNo = ArchSysNo::new(272);
+    pub const KCMP_VM: i64 = 1;
     // include/uapi/linux/capability.h の `_LINUX_CAPABILITY_VERSION_3`（2 語・64 bit 形式）。
     pub const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
     // include/uapi/linux/prctl.h の `PR_CAPBSET_READ`（23）・`PR_CAPBSET_DROP`（24）・
@@ -1001,6 +1007,8 @@ mod consts {
     pub const SYS_KEXEC_LOAD: ArchSysNo = ArchSysNo::UNSUPPORTED;
     pub const PTRACE_CONT: i64 = 0;
     pub const KEXEC_SEGMENT_MAX: i64 = 0;
+    pub const SYS_KCMP: ArchSysNo = ArchSysNo::UNSUPPORTED;
+    pub const KCMP_VM: i64 = 0;
     // include/uapi/linux/capability.h の `_LINUX_CAPABILITY_VERSION_3`（2 語・64 bit 形式）。
     pub const LINUX_CAPABILITY_VERSION_3: u32 = 0;
     // include/uapi/linux/prctl.h の `PR_CAPBSET_READ`（23）・`PR_CAPBSET_DROP`（24）・
@@ -4407,6 +4415,26 @@ pub(crate) fn ptrace_cont_probe(pid: u32) -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// `kcmp(自 pid, 自 pid, KCMP_VM, 0, 0)` を発行して errno を返す結合試験用プローブ（CORE-5・SEC-2・#1834）。
+///
+/// 同一プロセス同士の比較は ptrace アクセス検査を常に通り、読み取り比較だけで副作用が無いため、
+/// フィルタが無ければ成功（`0`）する。`kcmp` は `ERRNO(EPERM)` の禁止対象のため、seccomp が効いていれば
+/// `EPERM` になり、capability 不足と区別できる（`unshare`・`ptrace`・`kexec_load` は `KILL_PROCESS` で
+/// 戻らず、識別的な errno 観測に使えないための代替）。
+// 結合試験専用。テストビルドの単体テストは呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn kcmp_self_probe() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let nr = consts::SYS_KCMP.get()?;
+    let pid = i64::from(std::process::id());
+    // SAFETY: 引数はすべて整数（pid1・pid2・type・idx1=0・idx2=0）でポインタを渡さない。KCMP_VM では
+    // idx は読まれず、自プロセス同士の比較のため副作用は無く、結果は 0 か errno のみ。
+    let rc = unsafe { syscall(nr, pid, pid, consts::KCMP_VM, 0_i64, 0_i64) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
 /// `kexec_load(0, KEXEC_SEGMENT_MAX + 1, NULL, 0xffff_ffff)` を発行して errno を返す結合試験用プローブ
 /// （CORE-5・TASK-38.4・#179）。
 ///
@@ -4540,6 +4568,8 @@ mod tests {
             Ok(246)
         );
         assert_eq!(consts::PTRACE_CONT, 7);
+        assert_eq!(consts::SYS_KCMP.get().map(SyscallNumber::raw), Ok(312));
+        assert_eq!(consts::KCMP_VM, 1);
         assert_eq!(consts::KEXEC_SEGMENT_MAX, 16);
     }
 
@@ -4553,6 +4583,8 @@ mod tests {
             Ok(104)
         );
         assert_eq!(consts::PTRACE_CONT, 7);
+        assert_eq!(consts::SYS_KCMP.get().map(SyscallNumber::raw), Ok(272));
+        assert_eq!(consts::KCMP_VM, 1);
         assert_eq!(consts::KEXEC_SEGMENT_MAX, 16);
     }
 

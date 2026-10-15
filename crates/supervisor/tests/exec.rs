@@ -9,7 +9,7 @@
 //! - rlimit: `/proc/<pid>/limits` が launch 時の記録（`state.json` 相当の全 16 種）と一致し、pid1 が launch の後に soft を
 //!   上げていても記録の値になる（SUP-12・TASK-169 追補・#1467）
 //! - Landlock: 読み取り専用の root 配下への書き込みが拒否され（`deny/no` は作られない）、`rw` の mount 先
-//!   （`data/ok`）は作られる。seccomp: 禁止 syscall の `unshare(0)` が `EPERM`（`data/unshare_denied`）
+//!   （`data/ok`）は作られる。seccomp: 禁止 syscall の `setns(0, 0)` が `EPERM`（`data/unshare_denied`。フィルタ適用前は `EINVAL` で `data/unshare_ok`。ファイル名は `unshare` 時代の名残）
 //! - cgroup: `/proc/<pid>/cgroup` がコンテナ用 cgroup（`<scope>/fc-<id>@<instance>`）直下の exec 用の子
 //!   cgroup（`exec-<nonce>`。#1466）で、joiner が元いた cgroup と異なる
 //! - namespace: `NSpid` が入れ子で、`ns/{mnt,uts,ipc,net,pid}` が pid1 と一致（pid は参加後に fork した子の値）
@@ -200,20 +200,25 @@ mod linux {
     ///
     /// 1. `open("data/ok", O_WRONLY|O_CREAT, 0600)`: Landlock が `rw` の mount 先として許す
     /// 2. `open("deny/no", O_WRONLY|O_CREAT, 0600)`: 読み取り専用の root 配下のため Landlock が拒否する
-    /// 3. `unshare(0)`: 戻り値 0 なら `data/unshare_ok`、`-EPERM` なら `data/unshare_denied` を作る（seccomp）
+    /// 3. `setns(0, 0)`（272 ではなく 308。`edi` と `esi` を明示的に 0 にする）: 戻り値が `-EINVAL`（-22。fd 0 は
+    ///    namespace の fd ではない）なら `data/unshare_ok`（= seccomp に拒否されていない）、`-EPERM` なら
+    ///    `data/unshare_denied` を作る（seccomp）。それ以外の値ではどちらも作らず `pause` する
+    ///    `unshare`・`ptrace`・`kexec_load` は ESC-06 で `SECCOMP_RET_KILL_PROCESS`（SIGSYS）になり、プローブが死んで
+    ///    稼働中の観測ができないため、`ERRNO(EPERM)` の `setns` で exec 後の deny フィルタ適用を確かめる
+    ///    （KILL_PROCESS の経路は core の `exec_restrictions_reapply`・`seccomp` 試験が担う）。ファイル名は名残
     ///
-    /// 機械語は `as`（GNU as, Intel 構文）で組み立てた 169 バイトで、`probe.s` 相当の命令列（`_start` から
-    /// `lea rdi,[rip+..]; mov esi,0x41; mov edx,0x180; mov eax,2; syscall` を 2 回、`unshare` 272、判定、`pause` 34、
+    /// 機械語は `as`（GNU as, Intel 構文）で組み立てた 172 バイトで、`probe.s` 相当の命令列（`_start` から
+    /// `lea rdi,[rip+..]; mov esi,0x41; mov edx,0x180; mov eax,2; syscall` を 2 回、`setns` 308（`xor edi,edi; xor esi,esi`）、`cmp rax,-22` の判定、`pause` 34、
     /// `exit` 60）と文字列 4 つ。ホスト上で直接実行して自己検証する（バイト列の誤りをランタイムの不具合と
     /// 取り違えない）。
     fn probe_elf() -> Vec<u8> {
         #[rustfmt::skip]
         const CODE: &[u8] = &[
-            0x48, 0x8d, 0x3d, 0x6e, 0x00, 0x00, 0x00, 0xbe, 0x41, 0x00, 0x00, 0x00,
+            0x48, 0x8d, 0x3d, 0x71, 0x00, 0x00, 0x00, 0xbe, 0x41, 0x00, 0x00, 0x00,
             0xba, 0x80, 0x01, 0x00, 0x00, 0xb8, 0x02, 0x00, 0x00, 0x00, 0x0f, 0x05,
-            0x48, 0x8d, 0x3d, 0x5e, 0x00, 0x00, 0x00, 0xbe, 0x41, 0x00, 0x00, 0x00,
+            0x48, 0x8d, 0x3d, 0x61, 0x00, 0x00, 0x00, 0xbe, 0x41, 0x00, 0x00, 0x00,
             0xba, 0x80, 0x01, 0x00, 0x00, 0xb8, 0x02, 0x00, 0x00, 0x00, 0x0f, 0x05,
-            0xb8, 0x10, 0x01, 0x00, 0x00, 0x31, 0xff, 0x0f, 0x05, 0x48, 0x85, 0xc0,
+            0xb8, 0x34, 0x01, 0x00, 0x00, 0x31, 0xff, 0x31, 0xf6, 0x0f, 0x05, 0x48, 0x83, 0xf8, 0xea,
             0x75, 0x09, 0x48, 0x8d, 0x3d, 0x40, 0x00, 0x00, 0x00, 0xeb, 0x0d, 0x48,
             0x83, 0xf8, 0xff, 0x75, 0x18, 0x48, 0x8d, 0x3d, 0x41, 0x00, 0x00, 0x00,
             0xbe, 0x41, 0x00, 0x00, 0x00, 0xba, 0x80, 0x01, 0x00, 0x00, 0xb8, 0x02,
@@ -259,7 +264,7 @@ mod linux {
     }
 
     /// 自己検証: 分離前にホスト上でプローブを直接実行し、cwd 相対の 3 つの動作（書き込み 2 件と
-    /// `unshare(0)` の成功）を確かめる。
+    /// `setns(0, 0)` の `-EINVAL`。seccomp 適用前なので `data/unshare_ok` が作られ `data/unshare_denied` は作られない）を確かめる。
     fn verify_probe_on_host(bundle: &Bundle) {
         let work = bundle.dir.join("selfcheck");
         fs::create_dir_all(work.join("data")).expect("mkdir selfcheck/data");
@@ -274,6 +279,10 @@ mod linux {
         });
         let _ = child.kill();
         let _ = child.wait();
+        assert!(
+            !work.join("data/unshare_denied").exists(),
+            "the host probe must see -EINVAL from setns(0, 0), not -EPERM"
+        );
         assert!(
             work.join("data/ok").exists() && work.join("deny/no").exists(),
             "the hand-made probe is broken; this is a test bug, not a runtime bug"
@@ -1021,9 +1030,9 @@ mod linux {
         );
         assert!(
             !rootfs.join("data/unshare_ok").exists(),
-            "unshare allowed; {ctx}"
+            "setns allowed; {ctx}"
         );
-        assert!(denied.exists(), "unshare must be EPERM; {ctx}");
+        assert!(denied.exists(), "setns must be EPERM; {ctx}");
 
         // プローブを止める（親は worker。数値 pid へ送るのは、worker が回収するまで再利用されない子のみ）。
         let killed = Command::new("kill")

@@ -48,6 +48,11 @@
 //!   識別子と一致する」子を探して `kill_and_reap` する(`recover_unreported_init`)。I を回収できない場合は
 //!   再親付けが起きないため探索せず、I を `unreaped` で返す(呼び出し側が起動予約を保持する。`confirm_no_process`
 //!   は #1817 の範囲)。報告が `R`(失敗)の経路は PID 1 を作っていないため探索しない
+//! - **開始ゲート(CORE-2)**: PID 1 は C が `K` の pid を受領して pidfd を開き、1 行の許可を書くまで exec に進まない
+//!   (exec で `comm` の識別子が失われると、報告前の PID 1 を特定できなくなるため)。C が許可せず閉じる・期限
+//!   ([`START_GATE_TIMEOUT`])切れの PID 1 は exec せずに終了する
+//! - **探索の fail-closed**: `/proc` の列挙・stat / comm の読み取りや解析の失敗は `reap_error` に残し、消滅を
+//!   確認できた場合(対象が `ENOENT`/`ESRCH` で消えた)と区別する
 //! - 回収できなかった子は [`PreparedLaunchFailure::unreaped`] で呼び出し側(launcher)へ返す。握りつぶさない
 //! - `dev.tty.legacy_tiocsti` の警告出力(#1739)は本入口に足していない
 
@@ -77,6 +82,8 @@ pub(super) const REPORT_MAX_BYTES: usize = 48;
 /// 報告後に中間プロセスが終了して回収できるまでの待ち上限(REPAIR-5)。超えたら SIGKILL して回収する。
 pub(super) const INTERMEDIATE_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// PID 1 が C の開始許可を待つ上限(C は pid 受領直後に許可するため通常は即時。CORE-2・REPAIR-5)。
+const START_GATE_TIMEOUT: Duration = Duration::from_secs(60);
 /// 期限に許す最大値(`Instant` の加算オーバーフローを避ける丸め)。
 const TIMEOUT_MAX: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -368,6 +375,13 @@ pub(super) fn intermediate_body<O: IntermediateOps>(ops: &mut O) -> i32 {
     0
 }
 
+/// PID 1 側の開始ゲート: C の許可(1 行)を期限つきで待つ。C が許可せずに閉じた(EOF)・期限切れ・読み取り失敗は
+/// 失敗で、PID 1 は exec せずに終了する。C は許可の直前まで失敗経路で PID 1 を kill・回収するため、期限は
+/// 最後の砦(孤児が無期限に残らない)。CORE-2。
+fn await_start_gate(gate_r: &std::fs::File, timeout: Duration) -> Result<(), PrePivotStatusError> {
+    read_line_bounded::<1>(gate_r, timeout).map(|_| ())
+}
+
 /// 本番の動作(既存の `isolate`・`child_main` への薄い委譲)。
 struct RealIntermediateOps<'a> {
     plan: &'a IsolationPlan,
@@ -378,6 +392,7 @@ struct RealIntermediateOps<'a> {
     setup: PrePivotSetup<'a>,
     report: &'a std::fs::File,
     tag: LaunchTag,
+    gate_r: &'a std::fs::File,
 }
 
 impl IntermediateOps for RealIntermediateOps<'_> {
@@ -394,13 +409,17 @@ impl IntermediateOps for RealIntermediateOps<'_> {
             ));
         };
         let (rootfs, entry, setup) = (self.rootfs, self.entry, self.setup);
+        let gate_r = self.gate_r;
         // 識別子は fork で PID 1 へ継承される。設定できなければ、報告前に失われた PID 1 を C が特定できなく
         // なるため、PID 1 を作らずに失敗させる(fail-closed。CORE-2)。
         sys::set_process_comm(self.tag.comm_bytes())
             .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "set the launch tag"))?;
         // 親(I)の stdio バッファを子が二重に出力しないよう flush しない経路を使う。子は `_exit` するだけ。
         sys::fork_single_threaded_no_flush(
-            move || child_main(rootfs, entry, stages, Some(setup), stdio),
+            move || match await_start_gate(gate_r, START_GATE_TIMEOUT) {
+                Ok(()) => child_main(rootfs, entry, stages, Some(setup), stdio),
+                Err(_) => EXIT_SETUP_FAILED,
+            },
             EXIT_SETUP_FAILED,
         )
         .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))
@@ -456,7 +475,7 @@ pub(crate) fn spawn_container_via_intermediate(
     let tag = LaunchTag::fresh();
     launch_via_intermediate(
         sys::self_is_single_threaded,
-        |status, report| {
+        |status, report, gate_r| {
             let mut ops = RealIntermediateOps {
                 plan,
                 rootfs,
@@ -469,6 +488,7 @@ pub(crate) fn spawn_container_via_intermediate(
                 },
                 report,
                 tag,
+                gate_r,
             };
             intermediate_body(&mut ops)
         },
@@ -486,7 +506,7 @@ pub(crate) fn spawn_container_via_intermediate(
 /// 呼ばれ、戻り値が `_exit` の終了コードになる。
 fn launch_via_intermediate(
     is_single_threaded: impl FnOnce() -> bool,
-    intermediate: impl FnOnce(&std::fs::File, &std::fs::File) -> i32,
+    intermediate: impl FnOnce(&std::fs::File, &std::fs::File, &std::fs::File) -> i32,
     subreaper: &ChildSubreaper,
     audit: LaunchAudit<'_>,
     timeout: Duration,
@@ -503,18 +523,23 @@ fn launch_via_intermediate(
     let remaining = || deadline.saturating_duration_since(Instant::now());
     let (status_r, status_w) = exec_status_pipe().map_err(not_started)?;
     let (report_r, report_w) = exec_status_pipe().map_err(not_started)?;
+    // 開始ゲート: C が PID 1 の pid を受領して pidfd を開くまで、PID 1 を exec に進ませない(`comm` の識別子は
+    // exec で失われ、報告前の PID 1 を特定できなくなるため。CORE-2)。
+    let (gate_r, gate_w) = exec_status_pipe().map_err(not_started)?;
     let (status_ref, report_ref) = (&status_w, &report_w);
+    let gate_r_ref = &gate_r;
     // fork 前の stdout / stderr の同期 flush は無期限に止まり得て、下の期限が効かなくなる(REPAIR-5)ため、
     // flush しない経路を使う。中間プロセスは `_exit` するので二重出力は起きない。
     let intermediate_pid = sys::fork_single_threaded_with_no_flush(
         is_single_threaded,
-        move || intermediate(status_ref, report_ref),
+        move || intermediate(status_ref, report_ref, gate_r_ref),
         EXIT_SETUP_FAILED,
     )
     .map_err(|e| not_started(ExecError::from_sys(e, IsolationStage::Spawn, "fork")))?;
     // 親が書き込み側を持ち続けると、子が報告せずに終了しても EOF を観測できない。
     drop(status_w);
     drop(report_w);
+    drop(gate_r);
     let intermediate_child = ContainerChild::spawned(intermediate_pid);
 
     let report = read_line_bounded::<REPORT_MAX_BYTES>(&report_r, remaining())
@@ -543,6 +568,22 @@ fn launch_via_intermediate(
 
     // 中間プロセスの終了前に PID 1 の pidfd を開く(C が subreaper のため、回収まで pid は解放されない)。
     let child = ContainerChild::adopt_reparented(pid1, subreaper);
+    // pid を握った後で開始を許可する。許可できなければ PID 1 を殺して失敗にする(fail-closed)。
+    let mut gate = &gate_w;
+    if let Err(e) = gate.write_all(b"\n") {
+        let mut failure = reap_intermediate_failure(
+            intermediate_child,
+            ExecError::from_io(&e, IsolationStage::Spawn, "release the init start gate"),
+        );
+        if let Err(kill_error) = child.kill_and_reap(KILL_REAP_TIMEOUT) {
+            if failure.reap_error.is_none() {
+                failure.reap_error = Some(kill_error);
+            }
+            failure.unreaped.push(child);
+        }
+        return Err(failure);
+    }
+    drop(gate_w);
     if let Err(reap_error) = reap_intermediate(&intermediate_child) {
         // 中間プロセスを回収できない: PID 1 を殺し、回収できなかった中間プロセスを返す(孤児化の防止)。
         // PID 1 の回収に失敗した場合も握りつぶさず、中間プロセスとあわせて両方のハンドルを返す(CORE-2)。
@@ -590,7 +631,8 @@ fn parent_pid_of(stat: &str) -> Option<u32> {
 /// 報告前に失われた PID 1 を特定して kill・回収し、回収できなかったものを `failure.unreaped` へ足す(CORE-2)。
 ///
 /// 対象は「親が C 自身で、`comm` が `tag` と一致する」子だけ。`/proc` の読み取りに失敗しても起動失敗の理由は
-/// 変えない(探索できなかった事実は握りつぶさず `reap_error` に `Internal` を残す)。探索は失敗経路でのみ
+/// 変えない(列挙・読み取り・解析のどれかが失敗して候補を検査できなかった事実は、消滅を確認できた場合と区別するため
+/// `reap_error` に `Internal` を残す。fail-closed)。探索は失敗経路でのみ
 /// 走り、成功経路の負荷にならない。
 fn recover_unreported_init(
     failure: &mut PreparedLaunchFailure,
@@ -606,7 +648,16 @@ fn recover_unreported_init(
         );
         return;
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        // 列挙の途中の失敗は、見逃した候補があり得るため残存なしとは言えない(fail-closed)。
+        let Ok(entry) = entry else {
+            note_reap_failure(
+                failure,
+                ErrorCode::Internal,
+                "cannot enumerate /proc for the init",
+            );
+            continue;
+        };
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -616,16 +667,43 @@ fn recover_unreported_init(
             continue;
         };
         let base = Path::new("/proc").join(pid.get().to_string());
-        let is_child = std::fs::read_to_string(base.join("stat"))
-            .ok()
-            .and_then(|stat| parent_pid_of(&stat))
-            == Some(me);
-        if !is_child {
+        let stat = match read_proc_text(&base.join("stat")) {
+            Ok(Some(stat)) => stat,
+            // 探索中に消えた(= 回収済み)ので対象外。
+            Ok(None) => continue,
+            Err(_) => {
+                note_reap_failure(
+                    failure,
+                    ErrorCode::Internal,
+                    "cannot read a /proc stat while scanning for the init",
+                );
+                continue;
+            }
+        };
+        let Some(parent) = parent_pid_of(&stat) else {
+            note_reap_failure(
+                failure,
+                ErrorCode::Internal,
+                "cannot parse a /proc stat while scanning for the init",
+            );
+            continue;
+        };
+        if parent != me {
             continue;
         }
-        let tagged = std::fs::read_to_string(base.join("comm"))
-            .is_ok_and(|comm| comm.trim_end_matches('\n') == tag.name());
-        if !tagged {
+        let comm = match read_proc_text(&base.join("comm")) {
+            Ok(Some(comm)) => comm,
+            Ok(None) => continue,
+            Err(_) => {
+                note_reap_failure(
+                    failure,
+                    ErrorCode::Internal,
+                    "cannot read a /proc comm while scanning for the init",
+                );
+                continue;
+            }
+        };
+        if comm.trim_end_matches('\n') != tag.name() {
             continue;
         }
         let child = ContainerChild::adopt_reparented(pid, subreaper);
@@ -635,6 +713,18 @@ fn recover_unreported_init(
             }
             failure.unreaped.push(child);
         }
+    }
+}
+
+/// `/proc` のテキストを読む。対象が消えていれば `Ok(None)`(列挙から読むまでの間に終了した)、それ以外の失敗は
+/// `Err`(呼び出し側が fail-closed で扱う)。
+fn read_proc_text(path: &Path) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(3) => {
+            Ok(None)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -966,10 +1056,14 @@ mod tests {
         let tag = LaunchTag::fresh();
         let result = launch_via_intermediate(
             || true,
-            |status, report| {
+            |status, report, gate_r| {
                 match behavior {
                     Behavior::Ready => {
                         let pid1 = fork_stand_in(status, &pid_write, |s| {
+                            // C の許可(pid 受領後)より前には進まない。許可が無ければ失敗で終了する。
+                            if await_start_gate(gate_r, Duration::from_secs(10)).is_err() {
+                                return EXIT_SETUP_FAILED;
+                            }
                             let _ = report_ready(s);
                             0
                         });
@@ -1137,6 +1231,38 @@ mod tests {
         );
     }
 
+    /// CORE-2: 開始ゲートは許可の 1 行で通り、許可なしの close(EOF)では失敗する。
+    #[test]
+    fn core2_start_gate_requires_release_and_fails_on_eof() {
+        let (r, w) = exec_status_pipe().unwrap();
+        (&w).write_all(b"\n").unwrap();
+        assert_eq!(await_start_gate(&r, Duration::from_secs(5)), Ok(()));
+        let (r, w) = exec_status_pipe().unwrap();
+        drop(w);
+        assert!(await_start_gate(&r, Duration::from_secs(5)).is_err());
+        let (r, _w) = exec_status_pipe().unwrap();
+        assert_eq!(
+            await_start_gate(&r, Duration::from_millis(50)),
+            Err(PrePivotStatusError::Timeout)
+        );
+    }
+
+    /// CORE-2: 消えた /proc エントリは `None`、存在するが読めない/解析できないものは失敗として区別される。
+    #[test]
+    fn core2_read_proc_text_distinguishes_vanished_from_failure() {
+        assert!(matches!(
+            read_proc_text(Path::new("/proc/4294967295/stat")),
+            Ok(None)
+        ));
+        assert!(
+            read_proc_text(Path::new("/proc/self/stat"))
+                .unwrap()
+                .is_some()
+        );
+        // ディレクトリは読めず、消滅とは区別して失敗にする。
+        assert!(read_proc_text(Path::new("/proc/self")).is_err());
+    }
+
     /// CORE-2: 識別子は起動ごとに異なり、15 バイト以下の ASCII。
     #[test]
     fn core2_launch_tag_is_unique_and_fits_comm() {
@@ -1193,7 +1319,7 @@ mod tests {
         };
         let result = launch_via_intermediate(
             || false,
-            |_, _| panic!("the intermediate must not run"),
+            |_, _, _| panic!("the intermediate must not run"),
             &subreaper,
             audit,
             Duration::from_secs(1),

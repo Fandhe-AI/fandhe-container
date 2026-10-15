@@ -45,8 +45,8 @@
 //! - mounts・bind mount・`/dev` 以外の tmpfs の注入は `start` が拒否済みで、ここでは載せない
 
 #[cfg(target_os = "linux")]
-#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 

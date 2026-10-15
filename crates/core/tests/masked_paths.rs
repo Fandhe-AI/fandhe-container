@@ -110,10 +110,25 @@ mod linux {
     }
 
     fn make_rootfs() -> Rootfs {
+        // 共有 /tmp 上の推測可能なパスを削除・再利用すると、競合で置かれた symlink を root が辿りうる。
+        // 時刻由来の名前を付けて `create_dir` で排他的に作り、既存パスは採用しない（SEC-2）。
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
         let base = std::fs::canonicalize(std::env::temp_dir())
             .expect("canonicalize temp_dir")
-            .join(format!("fandhe-masked-paths-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+            .join(format!(
+                "fandhe-masked-paths-{}-{nanos}",
+                std::process::id()
+            ));
+        std::fs::create_dir(&base).expect("exclusively create rootfs dir");
+        let rootfs = Rootfs(base.clone());
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod rootfs dir");
+        }
         std::fs::create_dir_all(base.join("proc/sys")).expect("create rootfs/proc/sys");
         for t in MASKED_PROC_PATHS {
             let host = base.join(t.trim_start_matches('/'));
@@ -124,7 +139,7 @@ mod linux {
                 std::fs::write(&host, SECRET).expect("create file target");
             }
         }
-        Rootfs(base)
+        rootfs
     }
 
     /// マウントポイント `target` の mountinfo 行の (per-mount options, fstype)。

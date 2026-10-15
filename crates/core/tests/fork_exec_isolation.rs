@@ -58,6 +58,8 @@
 //!
 //! - シナリオ `landlock-exec`（#1714・CORE-5・SEC-1・REPAIR-12。`with_landlock` + `spawn_container_with_stages`）: 制限適用の証跡
 //!   `LaunchReady` がそろった launch 経路が実際に `execveat` まで到達する。プローブの終了コード 42 を照合する（拒否なら 126）。
+//!   root は User を除く rootful 構成で `DevptsGidSource::Rootful`（root では gid 0 の `single_id_mapping` を呼ばない。SEC-5・#1926）、
+//!   非 root は `Rootless`（単一 ID 写像）で起動する
 //!   `landlock-*` 系は実カーネルの Landlock を使うため ABI 6 以上（Linux 6.12 以上）が必要
 //!
 //! # 実機前提テストとしての分離
@@ -653,14 +655,20 @@ mod linux {
         use fandhe_container_core::exec::{
             DevptsGidSource, spawn_container_with_stages_and_devices,
         };
-        use fandhe_container_core::rootless::single_id_mapping;
-        let gid_map = single_id_mapping(host_egid).expect("single id mapping");
-        let source = if is_root {
-            DevptsGidSource::Rootful
+        // root は gid 0 を写せない（`single_id_mapping` は SEC-5 で host_id == 0 を拒否する）。
+        // User namespace を足さない rootful 構成なので、写像を組まず `Rootful`（mknodat）で起動する（#1926）。
+        if is_root {
+            spawn_container_with_stages_and_devices(rootfs, entry, stages, DevptsGidSource::Rootful)
         } else {
-            DevptsGidSource::Rootless(&gid_map)
-        };
-        spawn_container_with_stages_and_devices(rootfs, entry, stages, source)
+            use fandhe_container_core::rootless::single_id_mapping;
+            let gid_map = single_id_mapping(host_egid).expect("single id mapping");
+            spawn_container_with_stages_and_devices(
+                rootfs,
+                entry,
+                stages,
+                DevptsGidSource::Rootless(&gid_map),
+            )
+        }
     }
 
     /// feature なしのビルドでは入口が無い。検証せずに成功しない（fail-closed）。

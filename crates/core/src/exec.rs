@@ -23,7 +23,10 @@
 //!    `/dev/<名前>` の bind で基本デバイスを供給する〔#1660〕）
 //!    続けて、読み取り専用にするパスの固定集合（`/proc` 配下の 5 件と `/sys`。SEC-2・#1850）を、`setup` の有無によらず
 //!    [`pivot_root`] の前に常に適用する（`process::run_pre_pivot` の `readonly_paths` 段。定義は
-//!    [`crate::path_masks`]、適用は `exec::path_masks`。**実装済み**。`/sys` 配下の個別項目は未実装）
+//!    [`crate::path_masks`]、適用は `exec::path_masks`。**実装済み**。`/sys` 配下の個別項目は未実装）。
+//!    その直後に、覆うパスの固定集合（`/proc` 配下の 10 件。SEC-2・#1851）を `masked_paths` 段が適用する
+//!    （ファイルは検証済みの `/dev/null`、ディレクトリは読み取り専用の空 tmpfs を載せる。適用は `exec::masked_paths`。
+//!    **実装済み**だが、検証済みの `/dev/null` が要るため `setup` 指定時のみ。`setup` なしの最小構成は適用しない）
 //! 4. 順序固定のステージ列: cgroup 参加 → capability 削減 → `PR_SET_NO_NEW_PRIVS`
 //!    → Landlock → seccomp（#136・#832・#833。**枠・`NO_NEW_PRIVS`・capability 削減・seccomp は実装済み**: [`StagePipeline`] が
 //!    [`StageKind::ORDER`] の固定順でフックを呼び、`NO_NEW_PRIVS` は差し替え不可の組み込み段として
@@ -116,6 +119,7 @@ mod interpreter;
 mod landlock;
 mod launch_intermediate;
 mod launch_status;
+mod masked_paths;
 mod no_new_privs;
 mod path_masks;
 mod process;
@@ -182,10 +186,6 @@ pub(crate) use launch_status::LaunchAudit;
 /// supervisor の `SETUP_VIOLATIONS` との突き合わせ試験専用の再公開（SEC-4・SUP-6・#1579。通常の利用者は呼ばない）。
 #[doc(hidden)]
 pub use process::exec_child_violation_reasons;
-/// 結合試験 `tests/escape_suite.rs` 専用の再公開（SEC-2・TASK-42.1・#199。通常の利用者は呼ばない。詳細は定義側）。
-#[cfg(feature = "escape-probe")]
-#[doc(hidden)]
-pub use process::spawn_container_probe;
 /// 結合試験 `tests/seccomp.rs` 専用の再公開（CORE-5・TASK-38.4・#179。通常の利用者は呼ばない。詳細は定義側）。
 #[doc(hidden)]
 pub use process::spawn_container_seccomp_probe;
@@ -219,6 +219,10 @@ pub(crate) use process::{PrePivotSetup, PreparedLaunchFailure};
 #[cfg(all(feature = "exec-test-support", not(test)))]
 #[doc(hidden)]
 pub use process::{StandardFd, close_standard_fds_for_test};
+/// 結合試験 `tests/escape_suite.rs` 専用の再公開（SEC-2・TASK-42.1・#199。通常の利用者は呼ばない。詳細は定義側）。
+#[cfg(feature = "escape-probe")]
+#[doc(hidden)]
+pub use process::{spawn_container_probe, spawn_container_probe_with_devices};
 /// supervisor の結合試験 `tests/exec_audit.rs` 専用の再公開（SEC-4・SEC-1・#1614 の事後監査。通常の利用者は
 /// 呼ばない。詳細は定義側）。`exec-test-support` feature を付けたビルドにだけ存在する。
 #[cfg(feature = "exec-test-support")]
@@ -719,6 +723,8 @@ pub enum IsolationStage {
     InjectFiles,
     /// 読み取り専用にするパスの固定集合の適用（`/proc` 配下の 5 件と `/sys`。SEC-2・TASK-29 追補・#1850）。
     MountReadonlyPaths,
+    /// 覆うパスの固定集合の適用（`/proc` 配下の 10 件。SEC-2・TASK-29 追補・#1851）。
+    MountMaskedPaths,
 }
 
 /// 実行層の構造化エラー（`code` は `traits::types::ErrorCode` を再利用）。

@@ -435,8 +435,28 @@ pub fn create_default_devices(
     prepared: &PreparedRootfs,
     gid_source: DevptsGidSource<'_>,
 ) -> Result<DeviceReport, ExecError> {
+    create_default_devices_with_null_source(isolation, prepared, gid_source)
+        .map(|(report, _)| report)
+}
+
+/// 検証済みの `/dev/null`（載せた `/dev` の tmpfs の上のノードを、`O_PATH|O_NOFOLLOW` で fd 起点に開いて `fstat` で
+/// 文字デバイス 1:3 と確かめた fd）。`masked_paths` 段がファイルを覆う（`/dev/null` を載せる）ときの複製元になる
+/// （SEC-2・TASK-29 追補・#1851）。
+///
+/// ホストの `/dev/null` をパスで開き直さないために、`create_default_devices` が作った（または bind した）
+/// コンテナ側のノードから得る。crate 内限定で、公開の [`DeviceReport`] には持たせない（fd を載せられない）。
+#[derive(Debug)]
+pub(super) struct NullNodeSource(pub(super) sys::VerifiedDeviceNodeFd);
+
+/// [`create_default_devices`] と同じ処理に加え、検証済みの `/dev/null` の fd を返す（`run_pre_pivot` の
+/// `masked_paths` 段が使う。公開 API のシグネチャは変えない）。
+pub(super) fn create_default_devices_with_null_source(
+    isolation: &MountIsolation,
+    prepared: &PreparedRootfs,
+    gid_source: DevptsGidSource<'_>,
+) -> Result<(DeviceReport, NullNodeSource), ExecError> {
     isolation.verify_caller(STAGE)?;
-    create_default_devices_at(
+    create_default_devices_at_with_null(
         prepared.new_root(),
         &|dir| mount_is_shared(dir, STAGE),
         gid_source,
@@ -501,11 +521,21 @@ struct PtsState {
 /// [`create_default_devices`] の証跡検証後の本体。`root` は rootfs（新しい mount top）の fd、`is_shared` は
 /// `dev` が shared propagation かの判定（単体テストはホストの mountinfo に依存しないよう差し替える）。
 /// 単体テストは証跡を偽造せず一時ディレクトリの fd を直接渡す。失敗時は後始末をしてから元のエラーを返す。
+#[cfg(test)]
 fn create_default_devices_at(
     root: BorrowedFd<'_>,
     is_shared: &dyn Fn(&OwnedFd) -> Result<bool, ExecError>,
     gid_source: DevptsGidSource<'_>,
 ) -> Result<DeviceReport, ExecError> {
+    create_default_devices_at_with_null(root, is_shared, gid_source).map(|(report, _)| report)
+}
+
+/// [`create_default_devices_at`] に検証済みの `/dev/null` の fd を返させた版（本体）。
+fn create_default_devices_at_with_null(
+    root: BorrowedFd<'_>,
+    is_shared: &dyn Fn(&OwnedFd) -> Result<bool, ExecError>,
+    gid_source: DevptsGidSource<'_>,
+) -> Result<(DeviceReport, NullNodeSource), ExecError> {
     let rootfs = root_display(root);
     let mut state = DevState {
         created_dev: None,
@@ -530,7 +560,7 @@ fn populate_dev(
     gid: sys::DevptsGid,
     supply: DeviceSupply,
     state: &mut DevState,
-) -> Result<DeviceReport, ExecError> {
+) -> Result<(DeviceReport, NullNodeSource), ExecError> {
     let (opened, created) = open_dev_dir(root, rootfs)?;
     // 作成した `dev` の fd は複製せず所有権ごと `state` へ移す（複製の失敗で記録漏れが起きないように）。
     // 以降の処理はこの fd を借りて使い、どの失敗経路でも後始末が識別情報を参照できる。
@@ -596,12 +626,50 @@ fn populate_dev(
         });
     }
     let devpts = mount_pts(mount, rootfs, gid, &mut state.pts)?;
-    Ok(DeviceReport {
-        nodes,
-        links,
-        devpts,
-        dev_mount,
-    })
+    let null = open_null_source(mount)?;
+    Ok((
+        DeviceReport {
+            nodes,
+            links,
+            devpts,
+            dev_mount,
+        },
+        null,
+    ))
+}
+
+/// 載せた `/dev` の tmpfs のルート fd 起点で `null` を `O_PATH|O_NOFOLLOW` に開き、`fstat` で文字デバイス 1:3 と
+/// 確かめる。差し替えられて別ノードになっていれば違反記録つきで拒否する（`masked_paths` 段の複製元。#1851）。
+#[cfg(not(test))]
+fn open_null_source(mount: BorrowedFd<'_>) -> Result<NullNodeSource, ExecError> {
+    let d = null_device()?;
+    let fd = sys::open_path_nofollow(mount, d.name)
+        .map_err(|e| ExecError::from_sys(e, STAGE, "openat(dev/null)"))?;
+    verify_null_source(fd, d)
+}
+
+/// dry-run: `mknodat` が実ノードを作らないため、ホストの `/dev/null` を検証して返す（単体テスト専用。実機の挙動は
+/// 結合試験 `masked_paths` で確かめる）。
+#[cfg(test)]
+fn open_null_source(_mount: BorrowedFd<'_>) -> Result<NullNodeSource, ExecError> {
+    let d = null_device()?;
+    let file = std::fs::File::open("/dev/null")
+        .map_err(|e| ExecError::from_io(&e, STAGE, "open(/dev/null)"))?;
+    verify_null_source(OwnedFd::from(file), d)
+}
+
+/// 固定表の `null`。表の並びが崩れたら内部エラーにする。
+fn null_device() -> Result<&'static DefaultDevice, ExecError> {
+    DEFAULT_DEVICES
+        .iter()
+        .find(|d| d.node == sys::HostDeviceNode::Null)
+        .ok_or_else(|| ExecError::new(ErrorCode::Internal, STAGE, "the null device is not defined"))
+}
+
+fn verify_null_source(fd: OwnedFd, d: &DefaultDevice) -> Result<NullNodeSource, ExecError> {
+    sys::verify_device_node_fd(fd, d.node)
+        .map(NullNodeSource)
+        .map_err(|e| host_node_error(e, d))
 }
 
 /// 1 ノードの結果の組み立て。

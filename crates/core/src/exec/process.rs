@@ -11,6 +11,8 @@
 //! spawn_container(rootfs, &entry)                      // 親: fork して ContainerChild を返す
 //!   子: MountIsolation::establish()
 //!       -> prepare_rootfs(&isolation, rootfs)
+//!       -> (create_default_devices -> mount_tmpfs -> inject_files)   // 起動設定 `setup` の指定時のみ
+//!       -> apply_readonly_paths(&isolation, &prepared)  // 読み取り専用パスの固定集合。常に適用（SEC-2・#1850）
 //!       -> pivot_root(&isolation, prepared)            -> PivotReport
 //!       -> exec_entrypoint(&isolation, &report, &entry) // execve。成功時は戻らない
 //! 親: ContainerChild::wait_timeout(timeout)            // waitpid（期限超過で未回収に限り SIGKILL + 回収）
@@ -107,6 +109,7 @@ use crate::traits::types::ErrorCode;
 use super::entrypoint_mode::EntrypointExecMode;
 use super::interpreter::reject_runtime_interpreter;
 use super::launch_status::{PrePivotFailure, PrePivotStep, report_failure, report_ready};
+use super::path_masks;
 use super::rlimits::apply_rlimits;
 use super::rootfs::PreparedRootfs;
 use super::sealed_copy::{SealPolicy, check_not_on_noexec_mount, seal_entrypoint_copy};
@@ -1908,6 +1911,11 @@ trait PrePivotOps {
         prepared: &Self::Prepared,
         set: &InjectedFileSet,
     ) -> Result<(), ExecError>;
+    fn apply_readonly_paths(
+        &self,
+        isolation: &Self::Isolation,
+        prepared: &Self::Prepared,
+    ) -> Result<(), ExecError>;
     fn pivot_root(
         &self,
         isolation: &Self::Isolation,
@@ -1981,6 +1989,14 @@ impl PrePivotOps for RealPrePivotOps {
         inject_files(isolation, prepared, set).map(|_| ())
     }
 
+    fn apply_readonly_paths(
+        &self,
+        isolation: &MountIsolation,
+        prepared: &PreparedRootfs,
+    ) -> Result<(), ExecError> {
+        path_masks::apply_readonly_paths(isolation, prepared).map(|_| ())
+    }
+
     fn pivot_root(
         &self,
         isolation: &MountIsolation,
@@ -2006,11 +2022,12 @@ fn check_rootfs_identity(pinned: (u64, u64), prepared: (u64, u64)) -> Result<(),
 /// pivot までの前段を固定順で実行する（TASK-29 追補・#1715。CORE-1）。順序はここだけが決める:
 ///
 /// `establish` → `prepare_rootfs` → （固定した rootfs との照合）→ `create_default_devices` →
-/// `mount_tmpfs`（指定時）→ `inject_files`（指定時）→ `pivot_root`。
+/// `mount_tmpfs`（指定時）→ `inject_files`（指定時）→ `readonly_paths`（常時）→ `pivot_root`。
 ///
 /// デバイスノードと tmpfs は pivot の前に、`PreparedRootfs` の fd を起点に作る（pivot 後は旧 root が
 /// 切り離され、ホスト側の `/dev` を再解決できないため）。`setup` が `None` なら
-/// `establish` → `prepare_rootfs` → `pivot_root` だけの最小構成。
+/// `establish` → `prepare_rootfs` → `readonly_paths` → `pivot_root` の最小構成（読み取り専用パスの固定集合は
+/// 常に適用する。SEC-2・#1850）。
 fn run_pre_pivot<O: PrePivotOps>(
     ops: &O,
     rootfs: &Path,
@@ -2038,6 +2055,9 @@ fn run_pre_pivot<O: PrePivotOps>(
                 .map_err(StepError::at(S::InjectFiles))?;
         }
     }
+    // `setup` の有無によらず常に適用する（外す入口を作らない。SEC-2・#1850）。
+    ops.apply_readonly_paths(&isolation, &prepared)
+        .map_err(StepError::at(S::ReadonlyPaths))?;
     let pivoted = ops
         .pivot_root(&isolation, prepared)
         .map_err(StepError::at(S::PivotRoot))?;
@@ -4788,6 +4808,11 @@ mod tests {
                 IsolationStage::MountTmpfs,
                 "injected failure",
             ),
+            "readonly_paths" => ExecError::new(
+                ErrorCode::FailedPrecondition,
+                IsolationStage::MountReadonlyPaths,
+                "injected failure",
+            ),
             _ => ExecError::new(
                 ErrorCode::InvalidArgument,
                 IsolationStage::InjectFiles,
@@ -4834,6 +4859,9 @@ mod tests {
         fn inject_files(&self, _: &(), _: &(), _: &InjectedFileSet) -> Result<(), ExecError> {
             self.step("inject_files")
         }
+        fn apply_readonly_paths(&self, _: &(), _: &()) -> Result<(), ExecError> {
+            self.step("readonly_paths")
+        }
         fn pivot_root(&self, _: &(), _: ()) -> Result<(), ExecError> {
             self.step("pivot_root")
         }
@@ -4841,7 +4869,7 @@ mod tests {
 
     /// CORE-1・CORE-5（TASK-29 追補・#1715）: pivot 前の段は
     /// `establish` → `prepare_rootfs` → `verify_pinned` → `create_default_devices` → `mount_tmpfs` →
-    /// `inject_files` → `pivot_root` の固定順で呼ばれる。
+    /// `inject_files` → `readonly_paths` → `pivot_root` の固定順で呼ばれる。
     #[test]
     fn core1_run_pre_pivot_order_is_fixed() {
         let tmpfs = TmpfsMountSet::new();
@@ -4869,6 +4897,7 @@ mod tests {
                 "create_default_devices",
                 "mount_tmpfs",
                 "inject_files",
+                "readonly_paths",
                 "pivot_root",
             ]
         );
@@ -4896,11 +4925,43 @@ mod tests {
                 "establish",
                 "prepare_rootfs",
                 "create_default_devices",
+                "readonly_paths",
                 "pivot_root"
             ]
         );
         run_pre_pivot(&RecordingOps { fail_at: None }, Path::new("/rootfs"), None).unwrap();
-        assert_eq!(take_calls(), ["establish", "prepare_rootfs", "pivot_root"]);
+        assert_eq!(
+            take_calls(),
+            [
+                "establish",
+                "prepare_rootfs",
+                "readonly_paths",
+                "pivot_root"
+            ]
+        );
+    }
+
+    /// SEC-2（#1850）: 読み取り専用パスの適用が失敗したら `pivot_root` へ進まない。`setup` が `None` の最小構成でも
+    /// 適用され、失敗の段は `ReadonlyPaths`・段のエラーは `MountReadonlyPaths`。
+    #[test]
+    fn sec2_run_pre_pivot_readonly_paths_failure_stops_before_pivot() {
+        let _ = take_calls();
+        let err = run_pre_pivot(
+            &RecordingOps {
+                fail_at: Some("readonly_paths"),
+            },
+            Path::new("/rootfs"),
+            None,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(err.step, PrePivotStep::ReadonlyPaths);
+        assert_eq!(err.error.code, ErrorCode::FailedPrecondition);
+        assert_eq!(err.error.stage, IsolationStage::MountReadonlyPaths);
+        assert_eq!(
+            take_calls(),
+            ["establish", "prepare_rootfs", "readonly_paths"]
+        );
     }
 
     /// 途中の段が失敗したら後続の段（特に `pivot_root`）へ進まない（fail-closed）。
@@ -4931,7 +4992,7 @@ mod tests {
         );
     }
 
-    /// SEC-4・CORE-2（#1815）: 7 つの段のそれぞれの失敗が、状態行の符号化・復号を経て親で段の名前と
+    /// SEC-4・CORE-2（#1815）: 8 つの段のそれぞれの失敗が、状態行の符号化・復号を経て親で段の名前と
     /// `ErrorCode`・違反理由の具体値として復元される。
     #[test]
     fn sec4_1815_every_step_failure_is_restored_by_the_parent() {
@@ -4958,6 +5019,7 @@ mod tests {
             ),
             ("mount_tmpfs", ErrorCode::NotFound, None),
             ("inject_files", ErrorCode::InvalidArgument, None),
+            ("readonly_paths", ErrorCode::FailedPrecondition, None),
             (
                 "pivot_root",
                 ErrorCode::InvalidArgument,

@@ -109,6 +109,7 @@ pub mod legacy_tiocsti;
 pub mod observability;
 pub mod oci_runtime;
 pub mod open_flags;
+pub mod path_masks;
 #[cfg(feature = "plugin")]
 pub mod plugin;
 pub mod plugin_discovery;

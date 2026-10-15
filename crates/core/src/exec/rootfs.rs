@@ -318,7 +318,7 @@ fn mount_ids_dev(line: &str) -> Option<(u64, u64, &str)> {
 ///   マウントポイントのとき、カーネルは新マウントを bind 前のマウントの上（親 = bind 前のマウント）
 ///   にも、それを載せているマウントの上（親 = bind 前のマウントの親）にも作り得るため、
 ///   親 ID が bind 前のマウント ID に一致することだけを要求しない
-fn bind_lineage_ok(info: &str, before_mnt_id: u64, new_mnt_id: u64) -> bool {
+pub(super) fn bind_lineage_ok(info: &str, before_mnt_id: u64, new_mnt_id: u64) -> bool {
     let mut before = None;
     let mut new = None;
     for line in info.lines() {

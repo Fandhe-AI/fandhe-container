@@ -1,6 +1,6 @@
 //! fandhe-container-cri: CRI 実装ライブラリ（Runtime/ImageService・shim v2・streaming）。
 //!
-//! 雛形は TASK-1.3・REPAIR-1。現状の RPC 実装は `runtime_service` の `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`（TASK-57.1・57.2・CRI-1）と、`image_service` の `ListImages`・`ImageStatus`・`PullImage`（TASK-61.1・61.2・61.3・CRI-4。取り込み手順は `image_pull`）のみで、
+//! 雛形は TASK-1.3・REPAIR-1。現状の RPC 実装は `runtime_service` の `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer`（TASK-57.1〜57.3・58.1・CRI-1）と、`image_service` の `ListImages`・`ImageStatus`・`PullImage`（TASK-61.1・61.2・61.3・CRI-4。取り込み手順は `image_pull`）のみで、
 //! 他の RPC は `Unimplemented`、状態管理はメモリ上のスタブ（TASK-59 で置換。REPAIR-3）。
 //! RPC の結果と所要時間は `instrument` の記録先へ渡す（REPAIR-4。core の記録器への接続は plugin-cri。TASK-108）。
 //! 本体は G4（TASK-56〜63）で実装する。実行時は `fandhe-container-plugin-cri`（TASK-114）が

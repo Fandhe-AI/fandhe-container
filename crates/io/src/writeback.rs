@@ -316,7 +316,13 @@ impl AppendFileSink {
     /// バッチ単位の位置合わせで保証するのは「バッチの合間（ACK 送出後の
     /// 静止点）に行われた外部 truncate・拡張への追随」までであり、バッチの
     /// 書き込み途中の外部 truncate や他プロセスとの競合書き込みは対象外
-    /// （本 sink は単一の `serve_connection` ループからのみ使われる前提。
+    /// （通常モードでは truncate 後のカーソルが古い EOF に残り `[新 EOF, カーソル)` が
+    /// ゼロ埋めの穴になる。I7 が観測するのは縮小先がレコード境界の場合だけで、そこでは
+    /// 既存レコードは分断されないが、任意のバイト長への並行 truncate では既存レコードの
+    /// 前半だけが残りうる。また本実装は `write_all` のため、レコード全体の原子的な書き込みも
+    /// 保証しない。この期待値は回帰試験
+    /// `tests/consistency/interleave.rs` の I7〔`io4_interleave_truncate_during_single_write_batch_*`〕
+    /// が固定する。本 sink は単一の `serve_connection` ループからのみ使われる前提。
     /// 書き込みごとのアトミックな末尾追記が必要なら呼び出し側が
     /// `OpenOptions::append(true)` で開く）。
     pub fn new(mut file: File) -> Result<Self, IoError> {
@@ -459,6 +465,27 @@ fn sink_error_from_io(err: &io::Error, batch_len: usize) -> IoError {
 
 impl BatchSink for AppendFileSink {
     fn write_batch(&mut self, batch: &Batch) -> Result<SinkWriteReport, IoError> {
+        self.write_batch_with_frame_hook(batch, &mut |_| {})
+    }
+
+    fn persist(&mut self) -> Result<SinkPersistReport, IoError> {
+        self.persist_with_support(crate::barrier::persist_support())
+    }
+}
+
+impl AppendFileSink {
+    /// [`BatchSink::write_batch`] の本体。各フレームの `write_all` が成功した直後に
+    /// `on_frame_written(書き込み済みフレーム数)` を呼ぶ。
+    ///
+    /// 試験専用の継ぎ目（`#[doc(hidden)]`）。1 回の `write_batch` の最中（フレーム間）へ
+    /// 外部 truncate 等を決定的に差し込むため、結合試験（`tests/consistency/interleave.rs`
+    /// の I7・IO-4・REPAIR-12）が使う。通常の `write_batch` は何もしないフックで呼ぶ。
+    #[doc(hidden)]
+    pub fn write_batch_with_frame_hook(
+        &mut self,
+        batch: &Batch,
+        on_frame_written: &mut dyn FnMut(usize),
+    ) -> Result<SinkWriteReport, IoError> {
         // 書き込み前に立てる（途中失敗でも一部が書かれうるため。persist の合流判定）。
         self.dirty_since_persist = true;
         // バッチごとに現在の EOF へ位置合わせする（`AppendFileSink::new` の
@@ -501,13 +528,10 @@ impl BatchSink for AppendFileSink {
             bytes_written = bytes_written.checked_add(body_len).ok_or_else(|| {
                 IoError::new(IoErrorCode::Internal, "bytes_written counter overflowed")
             })?;
+            on_frame_written(frames_written);
         }
 
         Ok(SinkWriteReport::new(frames_written, bytes_written))
-    }
-
-    fn persist(&mut self) -> Result<SinkPersistReport, IoError> {
-        self.persist_with_support(crate::barrier::persist_support())
     }
 }
 

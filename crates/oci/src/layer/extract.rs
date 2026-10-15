@@ -86,6 +86,8 @@ pub const DEFAULT_MAX_EXTRACTED_BYTES: u64 = DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTE
 /// 親ディレクトリのエントリを省いた tar が暗黙に作るディレクトリの分を見込み、エントリ数の既定の 2 倍とする。
 pub const DEFAULT_MAX_TRACKED_PATHS: u64 = 2 * DEFAULT_MAX_LAYER_ENTRIES;
 
+/// 重ねられるレイヤー数の上限（空レイヤーの無限供給による結果 Vec の無制限増加を防ぐ。超過は `ResourceExhausted`）。
+const MAX_LAYERS: usize = 1024;
 /// パス全体の最大バイト数（Linux の `PATH_MAX`）。
 const MAX_PATH_BYTES: usize = 4096;
 /// 1 コンポーネントの最大バイト数（`NAME_MAX`）。
@@ -1232,7 +1234,16 @@ fn extract_stack<T, R: Read>(
     let mut x: Option<Extractor<'_>> = None;
     let mut input_used = 0u64;
     let mut out = Vec::new();
-    for item in layers {
+    let mut layers = layers.into_iter().peekable();
+    while let Some(item) = layers.next() {
+        // 空の reader は件数・入力バイトを消費しないため、既存の上限では結果の Vec の増加を止められない。
+        if out.len() >= MAX_LAYERS {
+            return Err(err(
+                OciErrorCode::ResourceExhausted,
+                "image exceeds the layer count limit",
+            ));
+        }
+        let is_last = layers.peek().is_none();
         let res = record_oci_op(recorder, OciOpKind::ExtractLayer, || {
             let src = open(item)?;
             if x.is_none() {
@@ -1254,14 +1265,17 @@ fn extract_stack<T, R: Read>(
             let budget = limits.max_input_bytes.saturating_sub(input_used);
             let (layer, read) = extract_one_layer(ex, src, budget)?;
             input_used = input_used.saturating_add(read);
+            // 遅延ディレクトリ権限の適用は最後のレイヤーの記録に含める（失敗・所要時間を計装から漏らさない。REPAIR-4）。
+            if is_last {
+                ex.finish_dirs()?;
+            }
             Ok(layer)
         })?;
         out.push(res);
     }
-    let Some(mut ex) = x else {
+    if x.is_none() {
         return Err(err(OciErrorCode::InvalidArgument, "no layers to extract"));
-    };
-    ex.finish_dirs()?;
+    }
     Ok(out)
 }
 
@@ -2762,5 +2776,49 @@ mod tests {
         assert_eq!(s.len(), 2);
         assert!(s.iter().all(|x| x.kind() == OciOpKind::ExtractLayer));
         assert!(s.iter().all(|x| x.outcome() == OciOpOutcome::Success));
+    }
+
+    /// REPAIR-4: 最終のディレクトリ権限適用（finish_dirs）の失敗は最後のレイヤーの記録に Failure として含まれる。
+    #[test]
+    fn repair4_finish_dirs_failure_is_recorded() {
+        struct SwapAtEof {
+            data: std::io::Cursor<Vec<u8>>,
+            dir: PathBuf,
+            done: bool,
+        }
+        impl Read for SwapAtEof {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.data.read(buf)?;
+                if n == 0 && !self.done {
+                    self.done = true;
+                    fs::remove_dir(&self.dir)?;
+                    fs::write(&self.dir, b"x")?;
+                }
+                Ok(n)
+            }
+        }
+        let sb = Sandbox::new();
+        let rec = Collect::default();
+        let src = SwapAtEof {
+            data: std::io::Cursor::new(archive(&[dir("d", 0o555)])),
+            dir: sb.root.join("d"),
+            done: false,
+        };
+        let e = extract_layers_with(&rec, [src], &sb.root, LIM()).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        let s = rec.items();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].outcome(), OciOpOutcome::Failure);
+        assert_eq!(s[0].error_code(), Some(OciErrorCode::FailedPrecondition));
+    }
+
+    /// 空レイヤーを無限に供給してもレイヤー数の上限で ResourceExhausted になる（結果 Vec が増え続けない）。
+    #[test]
+    fn stack_rejects_unbounded_empty_layers() {
+        let sb = Sandbox::new();
+        let layers = std::iter::repeat_with(std::io::empty);
+        let e = extract_layers(layers, &sb.root, LIM()).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+        assert_eq!(e.message(), "image exceeds the layer count limit");
     }
 }

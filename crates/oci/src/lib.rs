@@ -33,13 +33,13 @@
 //! `AlreadyExists` で拒否する（IO-5）。
 //! 複数レイヤーは `layer::extract::extract_layers` / `extract_layer_blobs` で下位から同一ルートへ重ねて展開する
 //! （TASK-52.4・OCI-1・#410）。
-//! whiteout の検出と下位実体の削除の部品は実装済みだが未接続（TASK-53.1・OCI-2・#412。`whiteout`。
-//! 不透明ディレクトリは TASK-53.2、パイプライン統合は TASK-53.3）。
+//! whiteout の検出と下位実体の削除の部品、不透明ディレクトリの中身を削除する部品は実装済みだが未接続
+//! （TASK-53.1・53.2・OCI-2・#412・#413。`whiteout`。パイプライン統合は TASK-53.3）。
 //! 未実装: ディレクトリ fd 起点の解決（TOCTOU 対策）、uid / gid 写像（SEC-5）、通常ファイルの
 //! setuid / setgid / sticky の保持（所有者の写像が入るまで落とし、件数を結果に返す。SEC-5）、綴りの畳み込みによる
 //! 名前衝突の検出（展開先 FS が区別する別表記は衝突として扱わない。IO-5）。
 //!
-//! 未実装（スタブではなく後続 issue の担当）: whiteout の適用（TASK-53.2・53.3）、
+//! 未実装（スタブではなく後続 issue の担当）: whiteout・不透明ディレクトリの適用（統合は TASK-53.3）、
 //! キャッシュ・`image ls`/`rm`/`tag`（TASK-52〜55・TASK-183〜184）。`RegistryClient` の通信は匿名トークン取得・
 //! manifest 取得・blob 取得のみ。
 //! PLUG-1 区分は core（crate-naming.md）。

@@ -145,7 +145,7 @@ pub fn normalize_container_path(value: &str, max_bytes: usize) -> Option<String>
 
 /// config の `linux.maskedPaths` / `linux.readonlyPaths` の 1 要素（検証済みの絶対パス。REPAIR-2）。
 ///
-/// 生成は [`ProtectedPath::parse`] のみ。`..`・空要素・相対パス・rootfs 全体（`/`）は表現できない。
+/// 生成は `ProtectedPath::parse` のみ。`..`・空要素・相対パス・rootfs 全体（`/`）は表現できない。
 /// OCI Runtime Spec は両プロパティの要素を「コンテナ名前空間の絶対パス」(MUST) と定めるため、
 /// `mounts[].destination` と違い相対パスは拒否する。
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -114,6 +114,8 @@ mod linux {
         std::fs::create_dir_all(base.join("rofile")).expect("create rofile");
         std::fs::write(base.join("rofile/file"), SECRET).expect("create rofile/file");
         std::fs::create_dir_all(base.join("rodir")).expect("create rodir");
+        // `prepare_rootfs` は rootfs/proc の存在を必須とし自動作成しない（open_proc_dir が拒否する）ため用意する。
+        std::fs::create_dir_all(base.join("proc")).expect("create proc");
         rootfs
     }
 

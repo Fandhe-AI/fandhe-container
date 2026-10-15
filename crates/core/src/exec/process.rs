@@ -2410,6 +2410,36 @@ pub(crate) struct PreparedLaunchFailure {
     /// 回収失敗の理由(最初の失敗)。`unreaped` が空でないとき、または報告前の PID 1 の探索自体ができなかったとき
     /// (`unreaped` は空のまま)に `Some`。どちらも「子が残っている可能性」を表す(CORE-2)。
     pub(crate) reap_error: Option<ExecError>,
+    /// 報告前の PID 1 の探索が未完了の起動識別子(探索を skip した・`/proc` の列挙や読み取りに失敗した場合)。
+    /// 呼び出し側(launcher の `confirm_no_process`。#1817)が中間プロセスの回収後に再探索する。空なら探索は完了
+    /// している。`unreaped` が空でも非空になり得る(CORE-2)。
+    pub(crate) rescans: Vec<super::launch_intermediate::LaunchTag>,
+}
+
+impl PreparedLaunchFailure {
+    /// 子が残らない失敗(回収済み・または子を作る前に拒否した)。
+    pub(crate) fn clean(rejection: AuditedRejection<ExecError>) -> Self {
+        Self {
+            rejection,
+            unreaped: Vec::new(),
+            reap_error: None,
+            rescans: Vec::new(),
+        }
+    }
+
+    /// 子を回収できなかった失敗(ハンドルごと返す。孤児化させない。CORE-2)。
+    pub(crate) fn with_unreaped(
+        rejection: AuditedRejection<ExecError>,
+        child: ContainerChild,
+        reap_error: ExecError,
+    ) -> Self {
+        Self {
+            rejection,
+            unreaped: vec![child],
+            reap_error: Some(reap_error),
+            rescans: Vec::new(),
+        }
+    }
 }
 
 /// 待ちのポーリング間隔。

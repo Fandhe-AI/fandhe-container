@@ -24,7 +24,7 @@
 //! - 複数レイヤーは `extract_layers` / `extract_layer_blobs` で下位から上位の順に同一 `root` へ重ねる
 //!   （TASK-52.4・#410）。空であることの検査は最初のレイヤーの前だけで、別表記の索引・遅延ディレクトリ mode・
 //!   4 種の上限（`max_input_bytes` を含む）は全レイヤーで共有・累積する。上位が下位のファイルを上書きする。
-//!   未実装: whiteout（`.wh.*`・不透明ディレクトリ。TASK-53）と、上位レイヤーがディレクトリの位置へ
+//!   未実装: whiteout の適用（部品は TASK-53.1 で実装済み・統合は TASK-53.3）・不透明ディレクトリ（TASK-53.2）と、上位レイヤーがディレクトリの位置へ
 //!   ファイルを置く置換（OCI image-spec は再帰削除して置換するが、ここでは `FailedPrecondition` で拒否する）。
 //! - tar の終端後に入力を EOF まで読み捨てる（gzip トレーラの CRC32・ISIZE 検証のため）。読み捨てを含む
 //!   入力全体は `ExtractLimits::max_input_bytes` で上限を課す（超過は `ResourceExhausted`）。
@@ -50,7 +50,9 @@
 //!
 //! # 未実装（実装済みを装わない。REPAIR-3）
 //!
-//! - whiteout（`.wh.*`・`.wh..wh..opq`）の解釈は TASK-53 の担当。本モジュールは通常ファイルとして展開する。
+//! - whiteout（`.wh.*`・`.wh..wh..opq`）の解釈。検出と下位実体の削除の部品（`Extractor::remove_whiteout_target`・
+//!   `crate::whiteout`。TASK-53.1・#412）は実装済みだがパイプライン未接続で、本モジュールは現状 `.wh.*` を
+//!   通常ファイルとして展開する。不透明ディレクトリは TASK-53.2、統合（同一レイヤー内の順序を含む）は TASK-53.3。
 //! - uid / gid の写像と `chown`（SEC-5）。展開物は実行ユーザー所有になる。
 //! - 通常ファイルの setuid / setgid / sticky の保持。展開物が実行ユーザー所有のまま setuid / setgid を残すと、
 //!   ホスト root がほかのユーザーも辿れるステージングへ展開したときに、レイヤー由来の実行ファイルが root 所有の
@@ -370,7 +372,7 @@ struct Extractor<'a> {
     lstat: Lstat,
 }
 
-fn err(code: OciErrorCode, msg: &'static str) -> OciError {
+pub(crate) fn err(code: OciErrorCode, msg: &'static str) -> OciError {
     OciError::new(code, msg)
 }
 
@@ -623,7 +625,7 @@ impl<R: Read> Read for TarGuard<R> {
     }
 }
 /// ファイルシステム操作の `io::Error` を写す（パス・OS メッセージは載せない）。
-fn map_fs_err(e: &std::io::Error) -> OciError {
+pub(crate) fn map_fs_err(e: &std::io::Error) -> OciError {
     match e.kind() {
         ErrorKind::PermissionDenied => err(
             OciErrorCode::PermissionDenied,
@@ -1069,6 +1071,36 @@ impl Extractor<'_> {
         self.clear_existing_non_dir(dir.id, &name, &path)?;
         self.names.insert(dir.id, &name)?;
         fs::hard_link(&tpath, &path).map_err(|e| map_fs_err(&e))
+    }
+
+    /// whiteout の対象（`parent` 直下の `target`）を root 内から再帰削除する（OCI-2・TASK-53.1・#412）。
+    ///
+    /// 親の解決は `resolve_dir` で root に閉じ込め、削除は symlink を追従しない。親や対象が存在しなければ
+    /// 下位に消す実体が無いのと同義で何もしない。別表記（大文字小文字・Unicode 正規化）で既存の実体へ
+    /// 解決される名前は削除せず `AlreadyExists` で拒否する（IO-5。保守的な fail-closed）。
+    /// 削除した木の配下の遅延ディレクトリ mode は取り除く（`finish_dirs` が置換と誤認しないため）。
+    /// `NameIndex` は据え置く（実在する名前は索引に残る不変条件が、削除後も保たれる）。
+    ///
+    /// 未接続: `extract_one_layer` からの呼び出しと、同一レイヤー内で先に作った実体を消さない世代管理は
+    /// TASK-53.3（#414）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn remove_whiteout_target(
+        &mut self,
+        parent: &[OsString],
+        target: &OsStr,
+    ) -> Result<(), OciError> {
+        let dir = match self.resolve_dir(parent, false) {
+            Ok(d) => d,
+            Err(e) if e.code() == OciErrorCode::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let path = join_resolved(self.root, &dir.comps, &target.to_os_string());
+        if self.probe(dir.id, target, &path)?.is_none() {
+            return Ok(());
+        }
+        crate::whiteout::remove_tree_nofollow(&path)?;
+        self.deferred_dirs.retain(|p, _| !p.starts_with(&path));
+        Ok(())
     }
 
     /// 遅延していたディレクトリの mode を深い順に適用する（実ディレクトリであることを再確認する）。
@@ -2820,5 +2852,152 @@ mod tests {
         let e = extract_layers(layers, &sb.root, LIM()).unwrap_err();
         assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
         assert_eq!(e.message(), "image exceeds the layer count limit");
+    }
+
+    // ---- whiteout の対象削除（TASK-53.1・OCI-2・#412） ----
+
+    fn ex_for(sb: &Sandbox, lstat: Lstat) -> Extractor<'_> {
+        let limits = LIM();
+        Extractor {
+            root: &sb.root,
+            limits,
+            entries: 0,
+            bytes: 0,
+            stripped_special: 0,
+            deferred_dirs: HashMap::new(),
+            names: NameIndex::new(limits.max_tracked_paths),
+            lstat,
+        }
+    }
+
+    fn lay(ex: &mut Extractor<'_>, entries: &[Vec<u8>]) {
+        extract_one_layer(ex, archive(entries).as_slice(), 1 << 30).unwrap();
+    }
+
+    fn os(v: &[&str]) -> Vec<OsString> {
+        v.iter().map(OsString::from).collect()
+    }
+
+    /// OCI-2: 下位の `d/foo` を whiteout すると rootfs から消え、同じディレクトリの `d/bar` は残る。
+    #[test]
+    fn oci2_whiteout_removes_lower_file_and_keeps_siblings() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(
+            &mut ex,
+            &[file("d/foo", 0o644, b"1"), file("d/bar", 0o644, b"2")],
+        );
+        ex.remove_whiteout_target(&os(&["d"]), OsStr::new("foo"))
+            .unwrap();
+        ex.finish_dirs().unwrap();
+        assert_eq!(names_in(&sb.root.join("d")), vec!["bar".to_string()]);
+        assert!(!sb.root.join("d/foo").exists());
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-2: ディレクトリの whiteout は中身ごと再帰削除し、深いツリー・0555 の中間ディレクトリも消せる。
+    #[test]
+    #[cfg(unix)]
+    fn oci2_whiteout_removes_directory_tree_recursively() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(
+            &mut ex,
+            &[
+                file("d/sub/x", 0o644, b"1"),
+                dir("d/ro", 0o755),
+                file("d/ro/c", 0o644, b"c"),
+                file("keep", 0o644, b"k"),
+            ],
+        );
+        // 深いツリー（tar の名前長の制約を避け、ディスク上に直接作る）と、権限を落とした中間ディレクトリ。
+        let deep: PathBuf = (0..60).map(|i| format!("n{i}")).collect();
+        fs::create_dir_all(sb.root.join("d").join(&deep)).unwrap();
+        fs::write(sb.root.join("d").join(&deep).join("leaf"), b"z").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(sb.root.join("d/ro"), fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        ex.remove_whiteout_target(&[], OsStr::new("d")).unwrap();
+        ex.finish_dirs().unwrap();
+        assert_eq!(names_in(&sb.root), vec!["keep".to_string()]);
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-2: symlink を whiteout してもリンク先の実体は残る。親が symlink でも root 外へ出ない。
+    #[test]
+    #[cfg(unix)]
+    fn oci2_whiteout_does_not_follow_symlinks() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(
+            &mut ex,
+            &[
+                file("real/f", 0o644, b"r"),
+                symlink("link", "real"),
+                symlink("esc", "/"),
+                file("real/g", 0o644, b"g"),
+            ],
+        );
+        ex.remove_whiteout_target(&[], OsStr::new("link")).unwrap();
+        assert!(fs::symlink_metadata(sb.root.join("link")).is_err());
+        assert_eq!(fs::read(sb.root.join("real/f")).unwrap(), b"r");
+        // 親が root 外を指す symlink でも root に閉じ込められ、外部の番兵は無傷。
+        ex.remove_whiteout_target(&os(&["esc"]), OsStr::new("sentinel"))
+            .unwrap();
+        ex.remove_whiteout_target(&os(&["real"]), OsStr::new("g"))
+            .unwrap();
+        assert_eq!(names_in(&sb.root.join("real")), vec!["f".to_string()]);
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-2: 存在しない対象・存在しない親は何もしない。親が非ディレクトリなら FailedPrecondition。
+    #[test]
+    fn oci2_whiteout_missing_target_or_parent_is_noop() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(&mut ex, &[file("f", 0o644, b"x")]);
+        ex.remove_whiteout_target(&[], OsStr::new("nope")).unwrap();
+        ex.remove_whiteout_target(&os(&["no", "dir"]), OsStr::new("x"))
+            .unwrap();
+        let e = ex
+            .remove_whiteout_target(&os(&["f"]), OsStr::new("x"))
+            .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(fs::read(sb.root.join("f")).unwrap(), b"x");
+    }
+
+    /// OCI-2: 遅延 mode のディレクトリ（mode 0）を whiteout した後でも `finish_dirs` が成功する。
+    #[test]
+    fn oci2_whiteout_clears_deferred_dir_modes() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(&mut ex, &[dir("d", 0o000), file("d/f", 0o644, b"x")]);
+        ex.remove_whiteout_target(&[], OsStr::new("d")).unwrap();
+        ex.finish_dirs().unwrap();
+        assert!(names_in(&sb.root).is_empty());
+    }
+
+    /// OCI-2・IO-5: 別表記（大文字小文字）で既存の実体へ解決される whiteout は削除せず AlreadyExists。
+    #[test]
+    fn oci2_whiteout_alias_spelling_is_rejected_without_removal() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, folding_lstat);
+        lay(&mut ex, &[file("f", 0o644, b"x")]);
+        let e = ex.remove_whiteout_target(&[], OsStr::new("F")).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::AlreadyExists);
+        assert_eq!(fs::read(sb.root.join("f")).unwrap(), b"x");
+    }
+
+    /// OCI-2: 削除後、上位レイヤーが同名を再作成できる。
+    #[test]
+    fn oci2_whiteout_then_upper_layer_can_recreate_name() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(&mut ex, &[file("foo", 0o644, b"old")]);
+        ex.remove_whiteout_target(&[], OsStr::new("foo")).unwrap();
+        lay(&mut ex, &[file("foo", 0o644, b"new")]);
+        ex.finish_dirs().unwrap();
+        assert_eq!(fs::read(sb.root.join("foo")).unwrap(), b"new");
     }
 }

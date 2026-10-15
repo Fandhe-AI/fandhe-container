@@ -24,7 +24,7 @@
 //! - 複数レイヤーは `extract_layers` / `extract_layer_blobs` で下位から上位の順に同一 `root` へ重ねる
 //!   （TASK-52.4・#410）。空であることの検査は最初のレイヤーの前だけで、別表記の索引・遅延ディレクトリ mode・
 //!   4 種の上限（`max_input_bytes` を含む）は全レイヤーで共有・累積する。上位が下位のファイルを上書きする。
-//!   未実装: whiteout の適用（部品は TASK-53.1 で実装済み・統合は TASK-53.3）・不透明ディレクトリ（TASK-53.2）と、上位レイヤーがディレクトリの位置へ
+//!   未実装: whiteout・不透明ディレクトリの適用（部品は TASK-53.1・53.2 で実装済み・統合は TASK-53.3）と、上位レイヤーがディレクトリの位置へ
 //!   ファイルを置く置換（OCI image-spec は再帰削除して置換するが、ここでは `FailedPrecondition` で拒否する）。
 //! - tar の終端後に入力を EOF まで読み捨てる（gzip トレーラの CRC32・ISIZE 検証のため）。読み捨てを含む
 //!   入力全体は `ExtractLimits::max_input_bytes` で上限を課す（超過は `ResourceExhausted`）。
@@ -52,7 +52,8 @@
 //!
 //! - whiteout（`.wh.*`・`.wh..wh..opq`）の解釈。検出と下位実体の削除の部品（`Extractor::remove_whiteout_target`・
 //!   `crate::whiteout`。TASK-53.1・#412）は実装済みだがパイプライン未接続で、本モジュールは現状 `.wh.*` を
-//!   通常ファイルとして展開する。不透明ディレクトリは TASK-53.2、統合（同一レイヤー内の順序を含む）は TASK-53.3。
+//!   通常ファイルとして展開する。不透明ディレクトリの部品（`Extractor::clear_opaque_dir`。TASK-53.2・#413）も
+//!   未接続で、統合（同一レイヤー内の順序を含む）は TASK-53.3。
 //! - uid / gid の写像と `chown`（SEC-5）。展開物は実行ユーザー所有になる。
 //! - 通常ファイルの setuid / setgid / sticky の保持。展開物が実行ユーザー所有のまま setuid / setgid を残すと、
 //!   ホスト root がほかのユーザーも辿れるステージングへ展開したときに、レイヤー由来の実行ファイルが root 所有の
@@ -333,11 +334,27 @@ impl NameIndex {
         let Some(root_id) = self.ids.remove(&(parent, name.to_os_string())) else {
             return;
         };
+        self.forget_descendants(vec![root_id]);
+    }
+
+    /// 不透明ディレクトリ（TASK-53.2）で中身を消した `parent` 直下の全登録と、その配下をまとめて外す（IO-5）。
+    fn forget_children(&mut self, parent: u64) {
+        let direct: Vec<(u64, OsString)> = self
+            .ids
+            .keys()
+            .filter(|(p, _)| *p == parent)
+            .cloned()
+            .collect();
+        let work: Vec<u64> = direct.iter().filter_map(|k| self.ids.remove(k)).collect();
+        self.forget_descendants(work);
+    }
+
+    /// `work` の各 ID を親とする登録を再帰的に外す（親 ID ごとに 1 パスで索引化して辿る）。
+    fn forget_descendants(&mut self, mut work: Vec<u64>) {
         let mut children: HashMap<u64, Vec<(u64, OsString)>> = HashMap::new();
         for (p, n) in self.ids.keys() {
             children.entry(*p).or_default().push((*p, n.clone()));
         }
-        let mut work = vec![root_id];
         while let Some(id) = work.pop() {
             for key in children.remove(&id).unwrap_or_default() {
                 if let Some(child) = self.ids.remove(&key) {
@@ -1129,6 +1146,34 @@ impl Extractor<'_> {
         crate::whiteout::remove_tree_nofollow(&path)?;
         self.deferred_dirs.retain(|p, _| !p.starts_with(&path));
         self.names.forget_tree(dir.id, target);
+        Ok(())
+    }
+
+    /// 不透明ディレクトリ（`parent`）の下位レイヤー由来の中身をすべて消す。ディレクトリ自体は残す
+    /// （OCI-2・TASK-53.2・#413。`parent = []` は root 直下で、root 自体は消さない）。
+    ///
+    /// 親の解決は `resolve_dir` で root に閉じ込め、削除は symlink を追従しない。親が存在しなければ何もせず、
+    /// 非ディレクトリなら `FailedPrecondition`、別表記で既存実体へ解決される親は `AlreadyExists`（IO-5）。
+    /// 配下の遅延ディレクトリ mode は取り除き（`finish_dirs` が置換と誤認しないため。トップ自身の mode は残す）、
+    /// 配下の `NameIndex` 登録も外す（IO-5）。
+    ///
+    /// 契約: 「呼ばれた時点の実体」を全消しする。未接続で、`extract_one_layer` からの呼び出しと、同一レイヤー内で
+    /// マーカーより先に作った実体を消さない世代管理は TASK-53.3（#414）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn clear_opaque_dir(&mut self, parent: &[OsString]) -> Result<(), OciError> {
+        let dir = match self.resolve_dir(parent, false) {
+            Ok(d) => d,
+            Err(e) if e.code() == OciErrorCode::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let path = dir
+            .comps
+            .iter()
+            .fold(self.root.to_path_buf(), |p, c| p.join(c));
+        crate::whiteout::remove_dir_contents_nofollow(&path)?;
+        self.deferred_dirs
+            .retain(|p, _| p == &path || !p.starts_with(&path));
+        self.names.forget_children(dir.id);
         Ok(())
     }
 
@@ -3045,5 +3090,163 @@ mod tests {
         let e = ex.remove_whiteout_target(&[], OsStr::new("D")).unwrap_err();
         assert_eq!(e.code(), OciErrorCode::AlreadyExists);
         assert_eq!(fs::read(sb.root.join("d/f")).unwrap(), b"new");
+    }
+
+    // ---- 不透明ディレクトリ（TASK-53.2・OCI-2・#413） ----
+
+    /// OCI-2: 不透明ディレクトリは下位由来の子を隠し、上位の子だけが残る。ディレクトリ自体と他は残る。
+    #[test]
+    fn oci2_opaque_hides_lower_files_in_dir() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(
+            &mut ex,
+            &[
+                file("d/a", 0o644, b"1"),
+                file("d/sub/b", 0o644, b"2"),
+                file("other/x", 0o644, b"3"),
+                file("top", 0o644, b"4"),
+            ],
+        );
+        ex.clear_opaque_dir(&os(&["d"])).unwrap();
+        lay(&mut ex, &[file("d/new", 0o644, b"n")]);
+        ex.finish_dirs().unwrap();
+        assert_eq!(names_in(&sb.root.join("d")), vec!["new".to_string()]);
+        assert_eq!(fs::read(sb.root.join("d/new")).unwrap(), b"n");
+        assert_eq!(fs::read(sb.root.join("other/x")).unwrap(), b"3");
+        assert_eq!(fs::read(sb.root.join("top")).unwrap(), b"4");
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-2: root 直下の不透明は中身だけ消し、root は残る。
+    #[test]
+    fn oci2_opaque_at_root_clears_everything_but_root() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(&mut ex, &[file("a/b", 0o644, b"1"), file("c", 0o644, b"2")]);
+        ex.clear_opaque_dir(&[]).unwrap();
+        assert!(sb.root.is_dir());
+        assert!(names_in(&sb.root).is_empty());
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-2: 不透明適用後もディレクトリの mode は維持され、0555・0000 の子と深いツリーも消せる。
+    #[test]
+    #[cfg(unix)]
+    fn oci2_opaque_keeps_dir_mode_and_removes_readonly_children() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(
+            &mut ex,
+            &[
+                dir("d", 0o750),
+                file("d/ro/c", 0o644, b"c"),
+                dir("d/zero", 0o000),
+            ],
+        );
+        let deep: PathBuf = (0..60).map(|i| format!("n{i}")).collect();
+        fs::create_dir_all(sb.root.join("d").join(&deep)).unwrap();
+        fs::set_permissions(sb.root.join("d/ro"), fs::Permissions::from_mode(0o555)).unwrap();
+        ex.clear_opaque_dir(&os(&["d"])).unwrap();
+        ex.finish_dirs().unwrap();
+        assert!(names_in(&sb.root.join("d")).is_empty());
+        let mode = fs::metadata(sb.root.join("d"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o750);
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-2: 子の symlink はリンクのみ消えリンク先は残る。親が root 外を指す symlink でも root に閉じ込める。
+    #[test]
+    #[cfg(unix)]
+    fn oci2_opaque_does_not_follow_symlinks() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(
+            &mut ex,
+            &[
+                file("real/f", 0o644, b"r"),
+                dir("d", 0o755),
+                symlink("d/lnk", "../real"),
+                symlink("esc", "/"),
+            ],
+        );
+        ex.clear_opaque_dir(&os(&["d"])).unwrap();
+        assert!(fs::symlink_metadata(sb.root.join("d/lnk")).is_err());
+        assert_eq!(fs::read(sb.root.join("real/f")).unwrap(), b"r");
+        // 絶対ターゲット `/` は root へ戻されるため、消えるのは root 配下の中身だけ（root 自体は残る）。
+        ex.clear_opaque_dir(&os(&["esc"])).unwrap();
+        assert!(sb.root.is_dir());
+        assert!(names_in(&sb.root).is_empty());
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-2: 存在しない親は何もせず、親が通常ファイルなら FailedPrecondition。
+    #[test]
+    fn oci2_opaque_missing_dir_is_noop_and_file_parent_is_rejected() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(&mut ex, &[file("f", 0o644, b"x")]);
+        ex.clear_opaque_dir(&os(&["no", "dir"])).unwrap();
+        let e = ex.clear_opaque_dir(&os(&["f"])).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(fs::read(sb.root.join("f")).unwrap(), b"x");
+    }
+
+    /// OCI-2: 配下・トップ自身が mode 0 の遅延ディレクトリでも `finish_dirs` が成功し、トップの mode は復元される。
+    #[test]
+    #[cfg(unix)]
+    fn oci2_opaque_clears_deferred_modes_of_descendants() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(
+            &mut ex,
+            &[
+                dir("d", 0o000),
+                dir("d/s", 0o000),
+                file("d/s/f", 0o644, b"x"),
+            ],
+        );
+        ex.clear_opaque_dir(&os(&["d"])).unwrap();
+        ex.finish_dirs().unwrap();
+        let mode = fs::metadata(sb.root.join("d"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o000);
+        fs::set_permissions(sb.root.join("d"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(names_in(&sb.root.join("d")).is_empty());
+    }
+
+    /// OCI-2・IO-5: 中身を消した後、旧綴りの別表記で再作成された実体を操作できない（AlreadyExists）。
+    #[test]
+    fn oci2_opaque_forgets_removed_spellings() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, folding_lstat);
+        lay(&mut ex, &[dir("d", 0o755), file("d/F", 0o644, b"old")]);
+        ex.clear_opaque_dir(&os(&["d"])).unwrap();
+        lay(&mut ex, &[file("d/f", 0o644, b"new")]);
+        let e = ex
+            .remove_whiteout_target(&os(&["d"]), OsStr::new("F"))
+            .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::AlreadyExists);
+        assert_eq!(fs::read(sb.root.join("d/f")).unwrap(), b"new");
+    }
+
+    /// OCI-2・IO-5: 親の別表記は削除せず AlreadyExists。
+    #[test]
+    fn oci2_opaque_alias_parent_is_rejected_without_removal() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, folding_lstat);
+        lay(&mut ex, &[file("d/f", 0o644, b"x")]);
+        let e = ex.clear_opaque_dir(&os(&["D"])).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::AlreadyExists);
+        assert_eq!(fs::read(sb.root.join("d/f")).unwrap(), b"x");
     }
 }

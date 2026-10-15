@@ -6,6 +6,9 @@
 //! - `classify`: tar エントリの最終コンポーネントを whiteout / 不透明マーカー / 通常名へ分類する。
 //! - `remove_tree_nofollow`: symlink を追従せずに実体（ファイル・symlink・ディレクトリの木）を再帰削除する。
 //!   root への閉じ込め・別表記の衝突検出（IO-5）は呼び出し側 `Extractor::remove_whiteout_target` が担う。
+//! - `remove_dir_contents_nofollow`: 不透明ディレクトリ（`.wh..wh..opq`。TASK-53.2・#413）用に、ディレクトリ自体は
+//!   残して直下の全エントリを再帰削除する。`NameClass::Opaque` を受けた呼び出し側が `Extractor::clear_opaque_dir`
+//!   経由で呼ぶ（接続は #414）。
 //!
 //! # 未実装（実装済みを装わない。REPAIR-3）
 //!
@@ -14,7 +17,7 @@
 //! - 展開パイプラインへの統合（TASK-53.3・#414）。同一レイヤー内で whiteout より先に作ったエントリを
 //!   消さない（image-spec は whiteout を下位レイヤーのリソースにのみ適用すると定める）ための世代管理も
 //!   そこで行う。ここでの削除は「呼ばれた時点の root 内の実体」を消す。
-//! - 不透明ディレクトリ `.wh..wh..opq` の処理（TASK-53.2・#413）。`classify` は `Opaque` と分類するだけ。
+//!   不透明ディレクトリも同様で、`remove_dir_contents_nofollow` は「呼ばれた時点の実体」を全消しする。
 
 use std::fs;
 use std::path::Path;
@@ -24,7 +27,7 @@ use crate::layer::extract::{err, map_fs_err};
 
 /// whiteout マーカーの接頭辞。
 const WHITEOUT_PREFIX: &[u8] = b".wh.";
-/// 不透明ディレクトリのマーカー名（TASK-53.2 が処理する）。
+/// 不透明ディレクトリのマーカー名（処理部品は `remove_dir_contents_nofollow`。TASK-53.2）。
 const OPAQUE_MARKER: &[u8] = b".wh..wh..opq";
 /// `.wh..wh.` で始まる名前は image-spec が予約する（`.wh..wh..opq` 以外は拒否する）。
 const RESERVED_PREFIX: &[u8] = b".wh..wh.";
@@ -42,7 +45,7 @@ pub(crate) enum NameClass {
     Regular,
     /// `.wh.<target>`。同じディレクトリの `target` を下位レイヤーから消す。
     Whiteout { target: Vec<u8> },
-    /// `.wh..wh..opq`（不透明ディレクトリ。TASK-53.2 の担当）。
+    /// `.wh..wh..opq`（不透明ディレクトリ。中身の削除は `remove_dir_contents_nofollow`・TASK-53.2）。
     Opaque,
 }
 
@@ -89,6 +92,32 @@ pub(crate) fn classify(name: &[u8]) -> Result<NameClass, OciError> {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn remove_tree_nofollow(path: &Path) -> Result<(), OciError> {
     remove_at(path, 0)
+}
+
+/// `path` のディレクトリ自体は残し、直下の全エントリを symlink を追従せず再帰削除する（OCI-2・TASK-53.2・#413）。
+///
+/// 存在しなければ成功（冪等）。`path` が symlink・非ディレクトリなら `FailedPrecondition`（追従しない）。
+/// 所有者の rwx が欠けるディレクトリ（0555・0000）は権限を戻してから消す。mode の復元は呼び出し側の遅延 mode
+/// （`Extractor::finish_dirs`）が担う。再帰の深さは `MAX_REMOVE_DEPTH`。
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn remove_dir_contents_nofollow(path: &Path) -> Result<(), OciError> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(map_fs_err(&e)),
+    };
+    if !meta.is_dir() {
+        return Err(err(
+            OciErrorCode::FailedPrecondition,
+            "opaque directory is not a directory",
+        ));
+    }
+    make_dir_removable(path, &meta)?;
+    for entry in fs::read_dir(path).map_err(|e| map_fs_err(&e))? {
+        let entry = entry.map_err(|e| map_fs_err(&e))?;
+        remove_at(&entry.path(), 1)?;
+    }
+    Ok(())
 }
 
 fn remove_at(path: &Path, depth: usize) -> Result<(), OciError> {
@@ -198,5 +227,64 @@ mod tests {
         let mut long = b".wh.".to_vec();
         long.extend(std::iter::repeat_n(b'a', 256));
         invalid(&long);
+    }
+
+    // ---- 不透明ディレクトリ（TASK-53.2・OCI-2・#413） ----
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("fc-opq-{tag}-{}", std::process::id()));
+        let _ = remove_tree_nofollow(&p);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// OCI-2: 子ファイル・子ディレクトリ・深いツリーを消し、`path` 自体は残る。
+    #[test]
+    fn oci2_remove_contents_keeps_dir_and_clears_children() {
+        let d = tmpdir("a");
+        fs::write(d.join("f"), b"1").unwrap();
+        fs::create_dir_all(d.join("s/t")).unwrap();
+        fs::write(d.join("s/t/g"), b"2").unwrap();
+        remove_dir_contents_nofollow(&d).unwrap();
+        assert!(d.is_dir());
+        assert_eq!(fs::read_dir(&d).unwrap().count(), 0);
+        remove_tree_nofollow(&d).unwrap();
+    }
+
+    /// OCI-2: 存在しない path は成功、通常ファイルは FailedPrecondition。
+    #[test]
+    fn oci2_remove_contents_missing_ok_and_file_rejected() {
+        let d = tmpdir("b");
+        remove_dir_contents_nofollow(&d.join("none")).unwrap();
+        fs::write(d.join("f"), b"x").unwrap();
+        let e = remove_dir_contents_nofollow(&d.join("f")).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(fs::read(d.join("f")).unwrap(), b"x");
+        remove_tree_nofollow(&d).unwrap();
+    }
+
+    /// OCI-2: 0000 のトップ・0555 の子を消せ、symlink は追従しない。
+    #[test]
+    #[cfg(unix)]
+    fn oci2_remove_contents_unix_modes_and_symlinks() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = tmpdir("c");
+        let outside = d.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep"), b"k").unwrap();
+        let top = d.join("top");
+        fs::create_dir_all(top.join("ro")).unwrap();
+        fs::write(top.join("ro/c"), b"c").unwrap();
+        std::os::unix::fs::symlink(&outside, top.join("lnk")).unwrap();
+        fs::set_permissions(top.join("ro"), fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&top, fs::Permissions::from_mode(0o000)).unwrap();
+        remove_dir_contents_nofollow(&top).unwrap();
+        assert_eq!(fs::read_dir(&top).unwrap().count(), 0);
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"k");
+        std::os::unix::fs::symlink(&outside, d.join("l2")).unwrap();
+        let e = remove_dir_contents_nofollow(&d.join("l2")).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"k");
+        remove_tree_nofollow(&d).unwrap();
     }
 }

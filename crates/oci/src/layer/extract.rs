@@ -76,7 +76,7 @@
 //!   保存時に名前を書き換える FS は前提外。
 //! - Windows ホストでの symlink エントリ（`Unimplemented` で拒否する）。
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
@@ -335,6 +335,9 @@ struct NameIndex {
     /// image-spec は whiteout・不透明ディレクトリを下位レイヤーのリソースにのみ適用すると定めるため、
     /// 同一レイヤーで作った実体は whiteout の対象にしない。レイヤーの展開完了で空にする。
     touched: HashSet<u64>,
+    /// `touched` のうち、現在のレイヤーが明示のディレクトリエントリで定義したものの ID。経路として通過しただけの
+    /// 下位由来ディレクトリの mode は、whiteout・不透明の適用順に依らず破棄する判定に使う（OCI-2）。
+    defined: HashSet<u64>,
 }
 
 impl NameIndex {
@@ -345,7 +348,18 @@ impl NameIndex {
             limit,
             next_id: ROOT_ID + 1,
             touched: HashSet::new(),
+            defined: HashSet::new(),
         }
+    }
+
+    /// 現在のレイヤーが明示のディレクトリエントリで定義したものとして記録する（`touch` を含む）。
+    fn define(&mut self, id: u64) {
+        self.touched.insert(id);
+        self.defined.insert(id);
+    }
+
+    fn is_defined(&self, id: u64) -> bool {
+        self.defined.contains(&id)
     }
 
     /// 現在のレイヤーが触ったエントリとして記録する。
@@ -360,6 +374,7 @@ impl NameIndex {
     /// レイヤーの区切りで世代（`touched`）を空にする。
     fn clear_touched(&mut self) {
         self.touched.clear();
+        self.defined.clear();
     }
 
     /// whiteout で削除した `parent` 直下の `name` と、その配下の登録をすべて索引から外す（IO-5）。
@@ -436,7 +451,8 @@ struct Extractor<'a> {
     stripped_special: u64,
     /// 所有者の rwx が欠けるディレクトリの mode。子の作成を妨げないよう全エントリ処理後に適用する。
     /// キーは物理パス。別表記は `probe` が先に拒否するため、同じディレクトリのキーは 1 つに定まる。
-    deferred_dirs: HashMap<PathBuf, u32>,
+    /// `BTreeMap` は部分木（あるパス配下）の範囲削除を件数全体の走査なしで行うため（`drop_deferred_subtree`）。
+    deferred_dirs: BTreeMap<PathBuf, u32>,
     /// この展開が作った名前（IO-5）。
     names: NameIndex,
     lstat: Lstat,
@@ -998,14 +1014,15 @@ impl Extractor<'_> {
         let path = join_resolved(self.root, &dir.comps, &name);
         // 別表記（`d/` の後の `D/`）は、下の遅延 mode の取り消し・mode の適用より前に `probe` が拒否する（IO-5）。
         match self.probe(dir.id, &name, &path)? {
-            Some((m, id)) if m.is_dir() => self.names.touch(id),
+            Some((m, id)) if m.is_dir() => self.names.define(id),
             Some((_, id)) => {
-                self.names.touch(id);
+                self.names.define(id);
                 fs::remove_file(&path).map_err(|e| map_fs_err(&e))?;
                 fs::create_dir(&path).map_err(|e| map_fs_err(&e))?;
             }
             None => {
-                self.names.insert(dir.id, &name)?;
+                let id = self.names.insert(dir.id, &name)?;
+                self.names.define(id);
                 fs::create_dir(&path).map_err(|e| map_fs_err(&e))?;
             }
         }
@@ -1127,8 +1144,8 @@ impl Extractor<'_> {
         let tdir = self.resolve_dir(&tparent, false)?;
         let tpath = join_resolved(self.root, &tdir.comps, &tname);
         // 参照先も `probe` を通す。別表記で既存の実体へ解決される参照先（`g → F` で実在するのは `f`）は拒否する。
-        match self.probe(tdir.id, &tname, &tpath)? {
-            Some((m, _)) if m.is_file() => {}
+        let target_id = match self.probe(tdir.id, &tname, &tpath)? {
+            Some((m, id)) if m.is_file() => id,
             Some(_) => {
                 return Err(err(
                     OciErrorCode::PermissionDenied,
@@ -1136,12 +1153,14 @@ impl Extractor<'_> {
                 ));
             }
             None => return Err(err(OciErrorCode::NotFound, "extraction path not found")),
-        }
+        };
         let dir = self.resolve_dir(&parent, true)?;
         let path = join_resolved(self.root, &dir.comps, &name);
         // 参照先と同一パス（f → f）なら削除すると参照元を失うため、既存ファイルをそのまま保持する。
         // 綴りだけが違う同じ実体（`F → f`）は、下の `clear_existing_non_dir` が削除の前に拒否する（IO-5）。
+        // 明示されたエントリなので現在のレイヤーの世代へ記録し、後続の whiteout・不透明の対象にしない（OCI-2）。
         if tpath == path {
+            self.names.touch(target_id);
             return Ok(());
         }
         self.clear_existing_non_dir(dir.id, &name, &path)?;
@@ -1179,13 +1198,38 @@ impl Extractor<'_> {
             // 現在のレイヤー由来。ディレクトリのときだけ、下位由来の子を消す。
             if meta.is_dir() {
                 self.prune_lower(&path, id, 0)?;
+                self.reset_traversed_dir(&path, id)?;
             }
             return Ok(());
         }
         crate::whiteout::remove_tree_nofollow(&path)?;
-        self.deferred_dirs.retain(|p, _| !p.starts_with(&path));
+        self.drop_deferred_subtree(&path);
         self.names.forget_tree(dir.id, target);
         Ok(())
+    }
+
+    /// `path` 配下（`path` 自身を含む）の遅延ディレクトリ mode を取り除く。`BTreeMap` の範囲走査で、
+    /// 削除する件数に比例した時間で済む（全件走査の繰り返しによる O(N×M) を避ける。DoS 対策）。
+    fn drop_deferred_subtree(&mut self, path: &Path) {
+        let keys: Vec<PathBuf> = self
+            .deferred_dirs
+            .range::<PathBuf, _>(path.to_path_buf()..)
+            .take_while(|(p, _)| p.starts_with(path))
+            .map(|(p, _)| p.clone())
+            .collect();
+        for k in keys {
+            self.deferred_dirs.remove(&k);
+        }
+    }
+
+    /// 現在のレイヤーが経路として通過しただけの下位由来ディレクトリの mode を、暗黙作成と同じ既定へ戻す。
+    /// whiteout が先に来て削除・暗黙再作成される並びと結果を揃え、同一レイヤー内の順序に依存させない（OCI-2）。
+    fn reset_traversed_dir(&mut self, path: &Path, id: u64) -> Result<(), OciError> {
+        if self.names.is_defined(id) {
+            return Ok(());
+        }
+        self.deferred_dirs.remove(path);
+        apply_dir_mode(path, IMPLICIT_DIR_MODE)
     }
 
     /// 不透明ディレクトリ（`parent`）の下位レイヤー由来の中身をすべて消す。ディレクトリ自体は残す
@@ -1237,11 +1281,12 @@ impl Extractor<'_> {
                     let m = fs::symlink_metadata(&child).map_err(|e| map_fs_err(&e))?;
                     if m.is_dir() {
                         self.prune_lower(&child, id, depth + 1)?;
+                        self.reset_traversed_dir(&child, id)?;
                     }
                 }
                 _ => {
                     crate::whiteout::remove_tree_nofollow(&child)?;
-                    self.deferred_dirs.retain(|p, _| !p.starts_with(&child));
+                    self.drop_deferred_subtree(&child);
                     self.names.forget_tree(dir_id, &name);
                 }
             }
@@ -1346,10 +1391,13 @@ fn extract_one_layer<R: Read>(
             if class != crate::whiteout::NameClass::Regular {
                 // マーカーは中身の無い通常ファイルに限る。他の型・ディレクトリ名のマーカー名は、
                 // 実体として展開もせず意図不明のまま黙って落としもしないよう拒否する（fail-closed）。
-                if !matches!(ty, EntryType::Regular | EntryType::Continuous) || is_dir_name {
+                if !matches!(ty, EntryType::Regular | EntryType::Continuous)
+                    || is_dir_name
+                    || entry.size() != 0
+                {
                     return Err(err(
                         OciErrorCode::InvalidArgument,
-                        "whiteout marker must be a regular file entry",
+                        "whiteout marker must be an empty regular file entry",
                     ));
                 }
                 let Some((parent, _)) = split_last(comps) else {
@@ -1464,7 +1512,7 @@ fn extract_stack<T, R: Read>(
                     entries: 0,
                     bytes: 0,
                     stripped_special: 0,
-                    deferred_dirs: HashMap::new(),
+                    deferred_dirs: BTreeMap::new(),
                     names: NameIndex::new(limits.max_tracked_paths),
                     lstat,
                 });
@@ -3042,7 +3090,7 @@ mod tests {
             entries: 0,
             bytes: 0,
             stripped_special: 0,
-            deferred_dirs: HashMap::new(),
+            deferred_dirs: BTreeMap::new(),
             names: NameIndex::new(limits.max_tracked_paths),
             lstat,
         }
@@ -3463,6 +3511,79 @@ mod tests {
         assert_eq!(names_in(&sb.root), vec!["a".to_string(), "d".to_string()]);
         lay(&mut ex, &[wh(".wh..wh..opq"), file("n", 0o644, b"n")]);
         assert_eq!(names_in(&sb.root), vec!["n".to_string()]);
+    }
+
+    /// OCI-2: 下位の mode 0 ディレクトリを `d/new` と `.wh.d` で触る並びが逆でも、最終 mode は同じ（既定 0755）。
+    #[test]
+    #[cfg(unix)]
+    fn oci2_pipeline_whiteout_dir_mode_is_order_independent() {
+        use std::os::unix::fs::PermissionsExt as _;
+        for entries in [
+            vec![file("d/new", 0o644, b"n"), wh(".wh.d")],
+            vec![wh(".wh.d"), file("d/new", 0o644, b"n")],
+        ] {
+            let sb = Sandbox::new();
+            let mut ex = ex_for(&sb, host_lstat);
+            lay(&mut ex, &[dir("d", 0o000), file("d/old", 0o644, b"o")]);
+            lay(&mut ex, &entries);
+            ex.finish_dirs().unwrap();
+            let mode = fs::metadata(sb.root.join("d"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, 0o755);
+            assert_eq!(names_in(&sb.root.join("d")), vec!["new".to_string()]);
+        }
+    }
+
+    /// OCI-2: 同一パスの hardlink エントリも現在のレイヤーの実体として不透明マーカーから保護される。
+    #[test]
+    fn oci2_pipeline_self_hardlink_is_protected_from_opaque() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(
+            &mut ex,
+            &[file("d/f", 0o644, b"x"), file("d/g", 0o644, b"y")],
+        );
+        lay(&mut ex, &[hardlink("d/f", "d/f"), wh("d/.wh..wh..opq")]);
+        assert_eq!(names_in(&sb.root.join("d")), vec!["f".to_string()]);
+    }
+
+    /// OCI-2: 非ゼロサイズのマーカーは削除を適用せず InvalidArgument で拒否する。
+    #[test]
+    fn oci2_pipeline_non_empty_markers_are_rejected() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(&mut ex, &[file("d/f", 0o644, b"x")]);
+        assert_eq!(
+            lay_err(&mut ex, &[file("d/.wh.f", 0o644, b"junk")]),
+            OciErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            lay_err(&mut ex, &[file("d/.wh..wh..opq", 0o644, b"junk")]),
+            OciErrorCode::InvalidArgument
+        );
+        assert_eq!(names_in(&sb.root.join("d")), vec!["f".to_string()]);
+    }
+
+    /// OCI-2: 不透明ディレクトリ配下の遅延 mode を多数持つ木でも、子の削除が全件走査に依らず終わる。
+    #[test]
+    fn oci2_deferred_subtree_drop_removes_only_subtree() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(
+            &mut ex,
+            &[
+                dir("a", 0o000),
+                dir("a/x", 0o000),
+                dir("ab", 0o000),
+                dir("b", 0o000),
+            ],
+        );
+        ex.drop_deferred_subtree(&sb.root.join("a"));
+        let keys: Vec<_> = ex.deferred_dirs.keys().cloned().collect();
+        assert_eq!(keys, vec![sb.root.join("ab"), sb.root.join("b")]);
     }
 
     /// OCI-2: マーカー名の非 Regular 型・ディレクトリ名・予約名は拒否する（実体化しない）。

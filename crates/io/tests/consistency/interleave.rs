@@ -38,8 +38,12 @@
 //!
 //! 破損は「どの k のモデルにも完全一致しない」（ずれ・重複・欠落・混入・断片）こと。
 //! 縮小前の内容の消失と通常モードの穴は呼び出し側の truncate の帰結で、破損と
-//! 判定しない。truncate が書き込みの途中に着地する試行（0 < k < 全数）は試行上限内で
-//! 10 回以上あることを assert する。
+//! 判定しない。truncate が書き込みの途中に着地する試行（0 < k < 全数）は、
+//! 最終内容から復元した k で数え、10 回に達するまで期限（60 秒）内で試行を重ねる
+//! （試行数の固定上限にしない。writer が先に書き終える試行は正しい実装でも起こりうるため、
+//! 1 試行ごとの着地は要求せず、期限内に十分な回数の交錯が得られることだけを assert する。
+//! 内側の `write_batch` の中は本番コードを変えずにゲートできないため、決定的な進行制御は
+//! 置けない）。
 //!
 //! # 成り立つ条件（期待値は `Vec<u8>` への追記・`set_len` 相当の単純な模型で作る）
 //!
@@ -439,11 +443,13 @@ fn io4_interleave_truncate_extend_zero_fills_matrix() {
 
 /// 書き込みの途中で信号を出す sink（I6 用）。n 番目のバッチをフレームごとのサブバッチへ
 /// 分けて書き、`signal_after` 個目のフレームを書いた直後に「それまでに書いたバイト数」を
-/// `tx` へ送る。送った後は待たずに残りのフレームを書き続けるため、受け手（rename スレッド）
-/// の操作は残りの書き込みと本当に重なる。
+/// `tx` へ送り、受け手（rename スレッド）が操作を終えて `resume` へ通知するまで
+/// 期限つきで待つ（進行制御のゲート。REPAIR-12）。これで受け手の操作は「残りのフレームを
+/// 書く前」に必ず着地し、スケジューラに依らず書き込みの途中での交錯が成立する。
 struct SignalingSink {
     inner: fandhe_container_io::AppendFileSink,
     tx: Option<std::sync::mpsc::Sender<u64>>,
+    resume: std::sync::mpsc::Receiver<()>,
     signal_batch: usize,
     signal_after: usize,
     calls: usize,
@@ -465,7 +471,10 @@ impl BatchSink for SignalingSink {
                 && let Some(tx) = self.tx.take()
             {
                 // 受け手が先に終了していても書き込みは続ける（送信失敗は無視）。
-                let _ = tx.send(self.bytes);
+                // 待ちは期限つき（REPAIR-5）。超過しても書き込みは続け、受け手側の assert が失敗を示す。
+                if tx.send(self.bytes).is_ok() {
+                    let _ = self.resume.recv_timeout(join_deadline());
+                }
             }
         }
         Ok(SinkWriteReport::new(frames, bytes))
@@ -477,11 +486,12 @@ impl BatchSink for SignalingSink {
 }
 
 /// I6: 書き込みの途中（2 バッチ目の 2 フレーム目の直後。6 レコード書いた時点）で sink が
-/// 信号を出し、rename スレッドがそれを受けて残りの書き込みと並行に rename する
+/// 信号を出して待ち、rename スレッドがそれを受けて rename し、終えたら sink が残りを書く
 /// （100 反復 × 2 モード）。移動先に全バイトが入り元パスは残らない。
-/// 信号は必ず書き込みの途中（0 < 書き込み済み < 全量）で出るので、全反復で
-/// rename が書き込みの途中に始まることを assert する（以前の barrier 方式は通常モードで
-/// 途中に着地した反復が 0/100 だった）。IO-4・REPAIR-6・REPAIR-5。
+/// rename スレッドは rename 直前に元ファイルの実サイズを観測し、信号どおり 6 レコード
+/// （全量未満）であること、つまり rename が実際に書き込みの途中に着地したことを
+/// 全反復で assert する（信号値の再確認ではなく、rename 側の観測。REPAIR-12）。
+/// IO-4・REPAIR-6・REPAIR-5。
 #[test]
 fn io4_interleave_concurrent_rename_signal_mid_write_iterations() {
     const ITERATIONS: usize = 100;
@@ -492,9 +502,11 @@ fn io4_interleave_concurrent_rename_signal_mid_write_iterations() {
             let src = dir.file_path(&format!("iter-{i}.bin"));
             let dst = dir.file_path(&format!("iter-{i}.moved"));
             let (tx, rx) = std::sync::mpsc::channel::<u64>();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
             let sink = SignalingSink {
                 inner: open_sink(&src, mode.open_mode()).expect("open sink"),
                 tx: Some(tx),
+                resume: resume_rx,
                 signal_batch: 2,
                 signal_after: 2,
                 calls: 0,
@@ -507,20 +519,29 @@ fn io4_interleave_concurrent_rename_signal_mid_write_iterations() {
                     let written = rx
                         .recv_timeout(join_deadline())
                         .expect("sink must signal mid-write");
-                    std::fs::rename(&src, &dst).map(|()| written)
+                    // sink は resume を受けるまで書かないので、実サイズは書き込み済み量に等しい。
+                    let observed = std::fs::metadata(&src).map(|md| md.len());
+                    let renamed = std::fs::rename(&src, &dst);
+                    let _ = resume_tx.send(());
+                    renamed.and(observed).map(|len| (written, len))
                 })
             };
             send_all_writes(&mut session.client, &bodies(TOTAL), timeout());
             drain_acks(&mut session.client, TOTAL, timeout());
             let report = session.finish();
-            let written = join_within(renamer, join_deadline()).expect("rename must succeed");
+            let (written, observed) =
+                join_within(renamer, join_deadline()).expect("rename must succeed");
             assert_eq!(report.stats.acks_sent, TOTAL as u64, "{label}");
             assert_eq!(
                 written,
                 ((BATCH_SIZE + 2) * BODY_LEN) as u64,
                 "{label}: signal must fire mid-write"
             );
-            assert!(written < (TOTAL * BODY_LEN) as u64, "{label}");
+            assert_eq!(
+                observed, written,
+                "{label}: size seen by the renamer just before rename"
+            );
+            assert!(observed < (TOTAL * BODY_LEN) as u64, "{label}");
             assert_eq!(
                 std::fs::read(&dst).expect("read moved"),
                 records(0..TOTAL),
@@ -536,7 +557,8 @@ const I7_TOTAL: usize = 512;
 const I7_BODY_LEN: usize = 512;
 /// truncater が動き出す書き込み済みレコード数と、縮小先のレコード数。
 const I7_TRIGGER: usize = 128;
-const I7_TRIALS: usize = 200;
+/// 途中着地が `I7_MIN_MID_BATCH` 回に達するまで試行を重ねる壁時計の期限（REPAIR-5）。
+const I7_TRIAL_DEADLINE: Duration = Duration::from_secs(60);
 const I7_MIN_MID_BATCH: usize = 10;
 
 fn i7_records(seqs: std::ops::Range<usize>) -> Vec<u8> {
@@ -639,7 +661,10 @@ fn i7_matrix(mode: Mode) {
     for m in [0usize, I7_TRIGGER / 2] {
         let dir = TempDir::new("interleave-write-batch-truncate");
         let mut mid_batch = 0usize;
-        for n in 0..I7_TRIALS {
+        let deadline = std::time::Instant::now() + I7_TRIAL_DEADLINE;
+        let mut trials = 0usize;
+        for n in 0.. {
+            trials = n + 1;
             let (data, log) = i7_run_once(mode, m, &dir, n);
             assert_no_failures(&log, &format!("{mode:?}/m={m}/trial {n}"));
             let k = i7_recover_k(mode, m, &data).unwrap_or_else(|| {
@@ -651,13 +676,13 @@ fn i7_matrix(mode: Mode) {
             if k < I7_TOTAL {
                 mid_batch += 1;
             }
-            if mid_batch >= I7_MIN_MID_BATCH {
+            if mid_batch >= I7_MIN_MID_BATCH || std::time::Instant::now() > deadline {
                 break;
             }
         }
         assert!(
             mid_batch >= I7_MIN_MID_BATCH,
-            "{mode:?}/m={m}: truncate landed mid-batch in only {mid_batch}/{I7_TRIALS} trials"
+            "{mode:?}/m={m}: truncate landed mid-batch in only {mid_batch}/{trials} trials within {I7_TRIAL_DEADLINE:?}"
         );
     }
 }

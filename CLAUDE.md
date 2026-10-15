@@ -23,6 +23,7 @@ fandhe-container/
 ├── MAINTAINERS.md                 # メンテナンス体制・コアチーム（TASK-100・OSS-6）
 ├── LICENSE-APACHE                 # Apache License 2.0（中核 crate は Apache-2.0 単独）
 ├── LICENSE-MIT                    # MIT License（補助 crate fandhe-container-plugin は MIT OR Apache-2.0）
+├── NOTICE                         # 第三者の帰属告知（Apache-2.0 4(d)。moby の readonlyPaths / maskedPaths 既定一覧の出典。#1894・OSS-3・OSS-5）
 ├── rust-toolchain.toml            # stable + rustfmt/clippy（単一真実源）
 ├── .editorconfig / .gitattributes # インデント・改行（LF 固定）・文字コード規約
 ├── skills-lock.json               # 導入スキルのロックファイル

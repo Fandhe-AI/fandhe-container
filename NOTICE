@@ -17,9 +17,9 @@ What was derived: only the path strings of the default OCI
 linux.readonlyPaths (5 entries: /proc/bus, /proc/fs, /proc/irq,
 /proc/sys, /proc/sysrq-trigger) and the /proc entries (10 entries) of
 the default linux.maskedPaths. No logic was copied. The corresponding
-definition file in this repository for the readonlyPaths entries is
-crates/core/src/path_masks.rs (issue #1850). The definition file for the
-maskedPaths entries will be listed here when it is added.
+definition file in this repository for both the readonlyPaths entries
+(issue #1850) and the maskedPaths entries (issue #1851) is
+crates/core/src/path_masks.rs.
 
 The attribution lines of the moby NOTICE file at that commit:
 

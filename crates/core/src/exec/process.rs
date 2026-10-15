@@ -13,6 +13,7 @@
 //!       -> prepare_rootfs(&isolation, rootfs)
 //!       -> (create_default_devices -> mount_tmpfs -> inject_files)   // 起動設定 `setup` の指定時のみ
 //!       -> apply_readonly_paths(&isolation, &prepared)  // 読み取り専用パスの固定集合。常に適用（SEC-2・#1850）
+//!       -> apply_masked_paths(&isolation, &prepared, &null) // 覆うパスの固定集合。`setup` 指定時のみ（SEC-2・#1851）
 //!       -> pivot_root(&isolation, prepared)            -> PivotReport
 //!       -> exec_entrypoint(&isolation, &report, &entry) // execve。成功時は戻らない
 //! 親: ContainerChild::wait_timeout(timeout)            // waitpid（期限超過で未回収に限り SIGKILL + 回収）
@@ -106,9 +107,11 @@ use crate::rlimits::{Rlimit, Rlimits};
 use crate::sys::{self, SealedReadOnlyCopy, Signal, SysError};
 use crate::traits::types::ErrorCode;
 
+use super::devices::{NullNodeSource, create_default_devices_with_null_source};
 use super::entrypoint_mode::EntrypointExecMode;
 use super::interpreter::reject_runtime_interpreter;
 use super::launch_status::{PrePivotFailure, PrePivotStep, report_failure, report_ready};
+use super::masked_paths;
 use super::path_masks;
 use super::rlimits::apply_rlimits;
 use super::rootfs::PreparedRootfs;
@@ -116,8 +119,8 @@ use super::sealed_copy::{SealPolicy, check_not_on_noexec_mount, seal_entrypoint_
 use super::stages::{LaunchNotReady, LaunchReady};
 use super::{
     DeviceReport, DevptsGidSource, ExecError, IsolationStage, MountIsolation, PivotReport,
-    StagePipeline, ViolationReason, create_default_devices, describe, fd_mount_id, inject_files,
-    mount_tmpfs, pivot_root, prepare_rootfs,
+    StagePipeline, ViolationReason, describe, fd_mount_id, inject_files, mount_tmpfs, pivot_root,
+    prepare_rootfs,
 };
 use crate::injected_files::InjectedFileSet;
 use crate::tmpfs::TmpfsMountSet;
@@ -1916,11 +1919,23 @@ trait PrePivotOps {
         isolation: &Self::Isolation,
         prepared: &Self::Prepared,
     ) -> Result<(), ExecError>;
+    fn apply_masked_paths(
+        &self,
+        isolation: &Self::Isolation,
+        prepared: &Self::Prepared,
+        devices: &Self::Devices,
+    ) -> Result<(), ExecError>;
     fn pivot_root(
         &self,
         isolation: &Self::Isolation,
         prepared: Self::Prepared,
     ) -> Result<Self::Pivoted, ExecError>;
+}
+
+/// `create_default_devices` の結果と、検証済みの `/dev/null`（`masked_paths` 段の複製元。SEC-2・#1851）。
+struct DeviceSet {
+    report: DeviceReport,
+    null: NullNodeSource,
 }
 
 /// 本番の段の実装（既存の公開関数への薄い委譲）。
@@ -1929,7 +1944,7 @@ struct RealPrePivotOps;
 impl PrePivotOps for RealPrePivotOps {
     type Isolation = MountIsolation;
     type Prepared = PreparedRootfs;
-    type Devices = DeviceReport;
+    type Devices = DeviceSet;
     type Pivoted = PivotReport;
 
     fn establish(&self) -> Result<MountIsolation, ExecError> {
@@ -1966,18 +1981,19 @@ impl PrePivotOps for RealPrePivotOps {
         isolation: &MountIsolation,
         prepared: &PreparedRootfs,
         source: DevptsGidSource<'_>,
-    ) -> Result<DeviceReport, ExecError> {
-        create_default_devices(isolation, prepared, source)
+    ) -> Result<DeviceSet, ExecError> {
+        let (report, null) = create_default_devices_with_null_source(isolation, prepared, source)?;
+        Ok(DeviceSet { report, null })
     }
 
     fn mount_tmpfs(
         &self,
         isolation: &MountIsolation,
         prepared: &PreparedRootfs,
-        devices: &DeviceReport,
+        devices: &DeviceSet,
         set: &TmpfsMountSet,
     ) -> Result<(), ExecError> {
-        mount_tmpfs(isolation, prepared, Some(devices), set).map(|_| ())
+        mount_tmpfs(isolation, prepared, Some(&devices.report), set).map(|_| ())
     }
 
     fn inject_files(
@@ -1995,6 +2011,15 @@ impl PrePivotOps for RealPrePivotOps {
         prepared: &PreparedRootfs,
     ) -> Result<(), ExecError> {
         path_masks::apply_readonly_paths(isolation, prepared).map(|_| ())
+    }
+
+    fn apply_masked_paths(
+        &self,
+        isolation: &MountIsolation,
+        prepared: &PreparedRootfs,
+        devices: &DeviceSet,
+    ) -> Result<(), ExecError> {
+        masked_paths::apply_masked_paths(isolation, prepared, &devices.null).map(|_| ())
     }
 
     fn pivot_root(
@@ -2022,12 +2047,18 @@ fn check_rootfs_identity(pinned: (u64, u64), prepared: (u64, u64)) -> Result<(),
 /// pivot までの前段を固定順で実行する（TASK-29 追補・#1715。CORE-1）。順序はここだけが決める:
 ///
 /// `establish` → `prepare_rootfs` → （固定した rootfs との照合）→ `create_default_devices` →
-/// `mount_tmpfs`（指定時）→ `inject_files`（指定時）→ `readonly_paths`（常時）→ `pivot_root`。
+/// `mount_tmpfs`（指定時）→ `inject_files`（指定時）→ `readonly_paths`（常時）→ `masked_paths`（`setup` 指定時）→
+/// `pivot_root`。
 ///
 /// デバイスノードと tmpfs は pivot の前に、`PreparedRootfs` の fd を起点に作る（pivot 後は旧 root が
 /// 切り離され、ホスト側の `/dev` を再解決できないため）。`setup` が `None` なら
 /// `establish` → `prepare_rootfs` → `readonly_paths` → `pivot_root` の最小構成（読み取り専用パスの固定集合は
 /// 常に適用する。SEC-2・#1850）。
+///
+/// `masked_paths`（覆うパスの固定集合。SEC-2・#1851）は、複製元の検証済み `/dev/null` を `create_default_devices` が
+/// 作るため `setup` 指定時にだけ走る。本番の起動経路は常に `setup` を渡す（`IntermediateSpec.setup` は `Option` でない）ので
+/// 本番では常に適用され、`setup` なしの最小構成だけが飛ばす（ESC スイートは影響を受けない。#1853 で入口を切り替える）。
+/// 順序は「読み取り専用化 → 覆う」（読み取り専用化の再帰 bind が覆いの子マウントに `ro` を付け損ねないため）。
 fn run_pre_pivot<O: PrePivotOps>(
     ops: &O,
     rootfs: &Path,
@@ -2038,26 +2069,32 @@ fn run_pre_pivot<O: PrePivotOps>(
     let prepared = ops
         .prepare_rootfs(&isolation, rootfs)
         .map_err(StepError::at(S::PrepareRootfs))?;
+    let mut devices = None;
     if let Some(setup) = setup {
         if let Some(pinned) = setup.pinned_rootfs {
             ops.verify_pinned(&prepared, pinned)
                 .map_err(StepError::at(S::VerifyPinned))?;
         }
-        let devices = ops
+        let created = ops
             .create_default_devices(&isolation, &prepared, setup.devices)
             .map_err(StepError::at(S::CreateDefaultDevices))?;
         if let Some(set) = setup.tmpfs {
-            ops.mount_tmpfs(&isolation, &prepared, &devices, set)
+            ops.mount_tmpfs(&isolation, &prepared, &created, set)
                 .map_err(StepError::at(S::MountTmpfs))?;
         }
         if let Some(set) = setup.inject {
             ops.inject_files(&isolation, &prepared, set)
                 .map_err(StepError::at(S::InjectFiles))?;
         }
+        devices = Some(created);
     }
     // `setup` の有無によらず常に適用する（外す入口を作らない。SEC-2・#1850）。
     ops.apply_readonly_paths(&isolation, &prepared)
         .map_err(StepError::at(S::ReadonlyPaths))?;
+    if let Some(devices) = &devices {
+        ops.apply_masked_paths(&isolation, &prepared, devices)
+            .map_err(StepError::at(S::MaskedPaths))?;
+    }
     let pivoted = ops
         .pivot_root(&isolation, prepared)
         .map_err(StepError::at(S::PivotRoot))?;
@@ -2229,6 +2266,55 @@ where
                 probe();
                 Ok(())
             });
+            match result {
+                Ok(()) => 0,
+                Err(err) => {
+                    let _ = writeln!(std::io::stderr(), "fandhe-container: {err}");
+                    exit_code_for(&err)
+                }
+            }
+        },
+        EXIT_SETUP_FAILED,
+    )
+    .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
+    Ok(ContainerChild::new(pid))
+}
+
+/// [`spawn_container_probe`] の `setup` 付き版。子が専用 `/dev`（`create_default_devices`）を作り、続く
+/// `masked_paths` 段（覆うパスの固定集合。SEC-2・TASK-29 追補・#1851）まで本番と同じ順序で適用してから、pivot 後に
+/// `probe` を実行する。結合試験 `tests/masked_paths.rs` 専用で、本番 launcher には依存しない（`exec_entrypoint` の
+/// fail-closed は変えない）。`tmpfs`・`inject`・`pinned_rootfs`・`status` は指定しない。
+/// `spawn_container_probe` と同じ制限適用証跡の例外・契約・将来仕様に従う（REPAIR-3）。
+#[cfg(feature = "escape-probe")]
+#[doc(hidden)]
+pub fn spawn_container_probe_with_devices<F>(
+    rootfs: &Path,
+    stages: StagePipeline,
+    devices: DevptsGidSource<'_>,
+    probe: F,
+) -> Result<ContainerChild, ExecError>
+where
+    F: FnOnce(),
+{
+    let pid = sys::fork_single_threaded(
+        move || {
+            let setup = PrePivotSetup {
+                devices,
+                tmpfs: None,
+                inject: None,
+                pinned_rootfs: None,
+                status: None,
+            };
+            let result = run_child_then(
+                rootfs,
+                Some(setup),
+                stages,
+                |isolation, _report, _evidence| {
+                    isolation.verify_caller(IsolationStage::Exec)?;
+                    probe();
+                    Ok(())
+                },
+            );
             match result {
                 Ok(()) => 0,
                 Err(err) => {
@@ -4813,6 +4899,11 @@ mod tests {
                 IsolationStage::MountReadonlyPaths,
                 "injected failure",
             ),
+            "masked_paths" => ExecError::new(
+                ErrorCode::FailedPrecondition,
+                IsolationStage::MountMaskedPaths,
+                "injected failure",
+            ),
             _ => ExecError::new(
                 ErrorCode::InvalidArgument,
                 IsolationStage::InjectFiles,
@@ -4862,6 +4953,9 @@ mod tests {
         fn apply_readonly_paths(&self, _: &(), _: &()) -> Result<(), ExecError> {
             self.step("readonly_paths")
         }
+        fn apply_masked_paths(&self, _: &(), _: &(), _: &()) -> Result<(), ExecError> {
+            self.step("masked_paths")
+        }
         fn pivot_root(&self, _: &(), _: ()) -> Result<(), ExecError> {
             self.step("pivot_root")
         }
@@ -4869,7 +4963,7 @@ mod tests {
 
     /// CORE-1・CORE-5（TASK-29 追補・#1715）: pivot 前の段は
     /// `establish` → `prepare_rootfs` → `verify_pinned` → `create_default_devices` → `mount_tmpfs` →
-    /// `inject_files` → `readonly_paths` → `pivot_root` の固定順で呼ばれる。
+    /// `inject_files` → `readonly_paths` → `masked_paths` → `pivot_root` の固定順で呼ばれる。
     #[test]
     fn core1_run_pre_pivot_order_is_fixed() {
         let tmpfs = TmpfsMountSet::new();
@@ -4898,6 +4992,7 @@ mod tests {
                 "mount_tmpfs",
                 "inject_files",
                 "readonly_paths",
+                "masked_paths",
                 "pivot_root",
             ]
         );
@@ -4926,6 +5021,7 @@ mod tests {
                 "prepare_rootfs",
                 "create_default_devices",
                 "readonly_paths",
+                "masked_paths",
                 "pivot_root"
             ]
         );
@@ -4964,6 +5060,61 @@ mod tests {
         );
     }
 
+    /// SEC-2（#1851）: 覆うパスの適用が失敗したら `pivot_root` へ進まない。失敗の段は `MaskedPaths`・段のエラーは
+    /// `MountMaskedPaths`。読み取り専用パスの失敗時は覆うパスへ進まない（順序の前提）。
+    #[test]
+    fn sec2_run_pre_pivot_masked_paths_failure_stops_before_pivot() {
+        let setup = || PrePivotSetup {
+            devices: DevptsGidSource::Rootful,
+            tmpfs: None,
+            inject: None,
+            pinned_rootfs: None,
+            status: None,
+        };
+        let _ = take_calls();
+        let err = run_pre_pivot(
+            &RecordingOps {
+                fail_at: Some("masked_paths"),
+            },
+            Path::new("/rootfs"),
+            Some(setup()),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(err.step, PrePivotStep::MaskedPaths);
+        assert_eq!(err.error.code, ErrorCode::FailedPrecondition);
+        assert_eq!(err.error.stage, IsolationStage::MountMaskedPaths);
+        assert_eq!(
+            take_calls(),
+            [
+                "establish",
+                "prepare_rootfs",
+                "create_default_devices",
+                "readonly_paths",
+                "masked_paths"
+            ]
+        );
+        let err = run_pre_pivot(
+            &RecordingOps {
+                fail_at: Some("readonly_paths"),
+            },
+            Path::new("/rootfs"),
+            Some(setup()),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(err.step, PrePivotStep::ReadonlyPaths);
+        assert_eq!(
+            take_calls(),
+            [
+                "establish",
+                "prepare_rootfs",
+                "create_default_devices",
+                "readonly_paths"
+            ]
+        );
+    }
+
     /// 途中の段が失敗したら後続の段（特に `pivot_root`）へ進まない（fail-closed）。
     #[test]
     fn core1_run_pre_pivot_stops_at_first_failure() {
@@ -4992,7 +5143,7 @@ mod tests {
         );
     }
 
-    /// SEC-4・CORE-2（#1815）: 8 つの段のそれぞれの失敗が、状態行の符号化・復号を経て親で段の名前と
+    /// SEC-4・CORE-2（#1815）: 9 つの段のそれぞれの失敗が、状態行の符号化・復号を経て親で段の名前と
     /// `ErrorCode`・違反理由の具体値として復元される。
     #[test]
     fn sec4_1815_every_step_failure_is_restored_by_the_parent() {
@@ -5020,6 +5171,7 @@ mod tests {
             ("mount_tmpfs", ErrorCode::NotFound, None),
             ("inject_files", ErrorCode::InvalidArgument, None),
             ("readonly_paths", ErrorCode::FailedPrecondition, None),
+            ("masked_paths", ErrorCode::FailedPrecondition, None),
             (
                 "pivot_root",
                 ErrorCode::InvalidArgument,

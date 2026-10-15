@@ -88,7 +88,7 @@ spec D-18 論点 3 の 3 案。spec には「(a) を MVP、(b) を将来」と�
 ## 6. D-14 との関係
 
 - D-14 は「データパスに plugin 境界を置かない」原則。rootful 構成ではパケットがカーネル（veth・bridge・nftables）を通り、plugin が担うのは制御面のみで整合する
-- rootless のユーザー空間転送は転送プロセス自体がデータパス上にある。IPC 往復がデータパスに入るのとは性質が異なる、という整理案が D-18 に記録されている。オーナーは 2026-10-12 に例外として認めた（#340）。例外は rootless の経路に限る。未解決疑問点 11 は、rootless 転送と DNS ヘルパーを例外とするかの部分が解消された。配置も同日に決まった（[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6129145225)）。pasta は core 側で、コンテナごとの supervisor が起動・監視・回収する（寿命がコンテナと同じで、親の supervisor が確実に回収できるため。常駐デーモンを置かない CORE-1 の下で plugin 側に置くと、都度起動の plugin が親になり回収の仕組みを別に作ることになる）。DNS ヘルパーは plugin 側で、`NetworkPlugin` の実装が起動・停止する（NET-5・NET-7）。未解決疑問点 11 のほかの論点は未決
+- rootless のユーザー空間転送は転送プロセス自体がデータパス上にある。IPC 往復がデータパスに入るのとは性質が異なる、という整理案が D-18 に記録されている。オーナーは 2026-10-12 に例外として認めた（#340）。例外は rootless の経路に限る。未解決疑問点 11 は、rootless 転送と DNS ヘルパーを例外とするかの部分が解消された。配置も同日に決まった（[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6129145225)）。pasta は core 側で、コンテナごとの supervisor が起動・監視・回収する（寿命がコンテナと同じで、親の supervisor が確実に回収できるため。常駐デーモンを置かない CORE-1 の下で plugin 側に置くと、都度起動の plugin が親になり回収の仕組みを別に作ることになる）。DNS ヘルパーは plugin 側で、`NetworkPlugin` の実装が起動・停止する（NET-5・NET-7）。未解決疑問点 11 のほかの論点も 2026-10-15 に決まった（[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6200154873)）。rootful のネットワーク設定（veth・bridge・nftables）は `NetworkPlugin` の実装が行い、core は network namespace を渡すだけにする。rootless の経路（本書）は変わらない
 - 関連: `docs/architecture.md`（境界表は rootless 転送の行と DNS ヘルパーの行に分かれ、配置の決定が反映された）、[crate-naming.md](crate-naming.md)（net crate の PLUG-1 区分は core 側のライブラリに確定した）。両書は spec のステータスに従う
 
 ## 7. 採用時の実装方針・工数概略（#341 の範囲）
@@ -146,6 +146,6 @@ spec D-18 論点 3 の 3 案。spec には「(a) を MVP、(b) を将来」と�
 
 - 2026-10-12 に判断記録へ更新した
 - 2026-10-12 に spec の更新（Fandhe-AI/fandhe-container-spec#18・#19。NET-9 の確定、未解決疑問点 11・14、NET-6 の既定、rootless でのネットワークの指定の読みと待ち受けアドレスの規則）へ追従した
-- 2026-10-12 に配置の決定（pasta は supervisor〔core 側〕、DNS ヘルパーは `NetworkPlugin` の実装〔plugin 側〕）へ追従した。未解決疑問点 11 のほかの論点が決まった場合は、6 章の関連の記述を追従する
+- 2026-10-12 に配置の決定（pasta は supervisor〔core 側〕、DNS ヘルパーは `NetworkPlugin` の実装〔plugin 側〕）へ追従した。2026-10-15 に未解決疑問点 11 のほかの論点の決定（Fandhe-AI/fandhe-container-spec#22）へ 6 章を追従した
 - #1935 の設計の確定で 7 章の内容が変わった場合は追従する
 - pasta を同梱・再配布することにした場合は、ライセンスの判断をやり直す

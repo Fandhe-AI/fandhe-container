@@ -25,10 +25,11 @@
 //! - 対象は PID 1 のみ。コンテナ内でさらに孤児になった PID 1 以外の子孫は subreaper ではなく PID 1 が
 //!   再親付けの受け皿になるため本モジュールの対象外
 //!
-//! # 未実装（REPAIR-3）
+//! # 配線（#1816）と未実装（REPAIR-3）
 //!
-//! 本番 launcher 本体への配線、状態 pipe 経由の pid 受け取り、PID 1 の pidfd の supervisor への受け渡しは
-//! #1715 の Phase B で扱う。本モジュールは設定と回収の入口までである。
+//! 本番 launcher（`oci_runtime::ProductionLauncher`）が構築時に [`ChildSubreaper::enable`] を呼んで証跡を保持し、
+//! `exec/launch_intermediate.rs` が報告 pipe で受け取った PID 1 の pid を [`ContainerChild::adopt_reparented`] へ渡す。
+//! 中間プロセスが報告後に PID 1 を作ったまま殺された場合に pid を知る手段は未実装（#1817）。
 
 use std::num::NonZeroU32;
 

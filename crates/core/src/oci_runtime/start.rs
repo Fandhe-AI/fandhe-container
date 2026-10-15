@@ -40,6 +40,10 @@
 //! 実装へ渡したうえで、`call_bounded` が別スレッドで呼び、上限（＋実装自身の `Timeout` 応答を受け取る
 //! 猶予 [`LAUNCHER_REPLY_GRACE`]）を過ぎたら待つのをやめる。実装が上限を守らず戻らなくても start は
 //! 有限時間で戻る。上限超過後に戻った結果は後始末スレッドが処理する（起動済みプロセスなら terminate）。
+//! 例外として、launcher が [`LaunchMode::SelfBounded`] を宣言した場合（fork する本番 launcher。単一スレッドの
+//! 呼び出しを要求する）は、launch を呼び出しスレッドで直接呼ぶ。上限は launcher 自身が `timeout` から導き、
+//! start はこの呼び出しを強制しない（`SpawnFailed`・`TimedOut` の枝には到達しない）。予約・claim・解放・Running 記録は
+//! 同じ手順で行う（#1816）。
 //!
 //! start のプロセスが手順 5〜7 の間に異常終了すると Running・pid なしの予約だけが残る。この状態は
 //! `FailedPrecondition`（`start was interrupted` を含むメッセージ）で識別でき、
@@ -116,7 +120,7 @@ use super::config::{NamespaceKind, OciConfig};
 use super::create::validate_bundle;
 use super::error::{LifecycleOp, OciRuntimeError};
 use super::launch::{
-    BundleLock, LaunchSpec, LaunchedProcess, ProcessLauncher, RootfsDir, StartTimeouts,
+    BundleLock, LaunchMode, LaunchSpec, LaunchedProcess, ProcessLauncher, RootfsDir, StartTimeouts,
 };
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
@@ -435,7 +439,7 @@ fn start_inner(
         ));
     }
 
-    let spec = build_spec(record.bundle())?;
+    let spec = build_spec(record.bundle(), req.id())?;
 
     // 起動権の所有ロック（プロセス間の排他）を予約の前に取り、launch が終わるまで保持する。所有ロックを
     // 持つプロセスが終了すればカーネルが解放するため、回復はその終了を条件にできる（CORE-2）。
@@ -452,14 +456,20 @@ fn start_inner(
     let l = Arc::clone(launcher);
     // 実行スレッドが launch を終えて後始末を済ませるまで、プロセス内の予約を保持する（CORE-2）。
     let hold = Arc::clone(&reservation);
-    let launched = call_bounded(
-        launch_timeout,
-        move || l.launch(&spec, launch_timeout),
-        move |late: Result<Box<dyn LaunchedProcess>, TraitError>| {
-            late_launch_cleanup(late, terminate_timeout);
-            drop(hold);
-        },
-    );
+    let launched = if launcher.launch_mode() == LaunchMode::SelfBounded {
+        // 自身で上限を守る launcher（fork する本番 launcher）は単一スレッドの呼び出しを要求するため、
+        // 呼び出しスレッドで直接呼ぶ。上限は launcher が `launch_timeout` から導く（REPAIR-5）。
+        Ok(l.launch(&spec, launch_timeout))
+    } else {
+        call_bounded(
+            launch_timeout,
+            move || l.launch(&spec, launch_timeout),
+            move |late: Result<Box<dyn LaunchedProcess>, TraitError>| {
+                late_launch_cleanup(late, terminate_timeout);
+                drop(hold);
+            },
+        )
+    };
     let process = match launched {
         Ok(Ok(p)) => p,
         Ok(Err(err)) => return Err(release_claim(store, req.id(), &claimed, err)),
@@ -601,7 +611,7 @@ fn release_claim(
 
 /// bundle の `config.json` を一度だけ読んで検証し、start が適用できない指定を拒否したうえで、rootfs を
 /// fd で固定して [`LaunchSpec`] を組み立てる（`config.json` は読み直さない）。
-fn build_spec(bundle: &Path) -> Result<LaunchSpec, TraitError> {
+fn build_spec(bundle: &Path, id: &ContainerId) -> Result<LaunchSpec, TraitError> {
     let (config, rootfs) = validate_bundle(bundle)?;
     let process = config.process().ok_or_else(|| {
         TraitError::new(
@@ -678,6 +688,8 @@ fn build_spec(bundle: &Path) -> Result<LaunchSpec, TraitError> {
         config.hostname().map(str::to_owned),
         namespaces,
         CgroupRequirement::of_config(&config),
+        Arc::new(config),
+        id.clone(),
     ))
 }
 
@@ -898,6 +910,10 @@ mod tests {
         term_gate: Arc<Gate>,
         /// 起動した模擬プロセスの pid（未回収レジストリは並行テストで共有されるため、テストごとに変える）。
         pid: std::sync::atomic::AtomicU32,
+        /// `launch_mode` が `SelfBounded` を返すか（#1816）。
+        self_bounded: AtomicBool,
+        /// launch を呼んだスレッドの ID（呼び出し順）。
+        launch_threads: Mutex<Vec<std::thread::ThreadId>>,
     }
 
     impl RecordingLauncher {
@@ -912,6 +928,8 @@ mod tests {
                 gate: Gate::new(true),
                 term_gate: Gate::new(true),
                 pid: std::sync::atomic::AtomicU32::new(4242),
+                self_bounded: AtomicBool::new(false),
+                launch_threads: Mutex::new(Vec::new()),
             })
         }
 
@@ -960,6 +978,14 @@ mod tests {
     }
 
     impl ProcessLauncher for RecordingLauncher {
+        fn launch_mode(&self) -> LaunchMode {
+            if self.self_bounded.load(Ordering::SeqCst) {
+                LaunchMode::SelfBounded
+            } else {
+                LaunchMode::CallerBounded
+            }
+        }
+
         fn confirm_no_process(
             &self,
             _id: &ContainerId,
@@ -982,6 +1008,10 @@ mod tests {
             spec: &LaunchSpec,
             timeout: Duration,
         ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            self.launch_threads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(std::thread::current().id());
             self.specs
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1193,6 +1223,55 @@ mod tests {
             Some(ProcessExit::Signaled(9))
         );
         assert_eq!(launcher.terminations(), 1);
+    }
+
+    /// REPAIR-5・CORE-1（#1816）: `SelfBounded` の launcher は start を呼んだスレッドで直接呼ばれ、
+    /// 起動待ち上限（既定 10 秒）がそのまま渡り、成功は Running（pid つき）で返る。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair5_self_bounded_launcher_is_called_on_the_caller_thread() {
+        let (_b, store) = created("self-bounded-ok");
+        let launcher = RecordingLauncher::new(false);
+        launcher.self_bounded.store(true, Ordering::SeqCst);
+        let record = run(&store, &launcher, "self-bounded-ok").expect("start");
+        assert_eq!(record.status().state(), ContainerState::Running);
+        assert_eq!(record.status().pid(), NonZeroU32::new(4242));
+        let threads = launcher.launch_threads.lock().expect("lock").clone();
+        assert_eq!(threads, [std::thread::current().id()]);
+        assert_eq!(
+            launcher.timeouts.lock().expect("lock").as_slice(),
+            [Duration::from_secs(10)]
+        );
+    }
+
+    /// REPAIR-5（#1816）: 既定（`CallerBounded`）は従来どおり別スレッドで呼ばれる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair5_default_launcher_is_called_on_a_separate_thread() {
+        let (_b, store) = created("caller-bounded-thread");
+        let launcher = RecordingLauncher::new(false);
+        run(&store, &launcher, "caller-bounded-thread").expect("start");
+        let threads = launcher.launch_threads.lock().expect("lock").clone();
+        assert_eq!(threads.len(), 1);
+        assert_ne!(threads.first(), Some(&std::thread::current().id()));
+    }
+
+    /// CORE-2（#1816）: `SelfBounded` の launch が `Err` なら、起動権の予約は Created へ戻る。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core2_self_bounded_launch_failure_releases_the_reservation() {
+        let (_b, store) = created("self-bounded-fail");
+        let launcher = RecordingLauncher::new(true);
+        launcher.self_bounded.store(true, Ordering::SeqCst);
+        let err = run(&store, &launcher, "self-bounded-fail").expect_err("launch fails");
+        assert_eq!(err.code(), ErrorCode::Internal);
+        let got = store
+            .get(&GetStateRequest::new(
+                ContainerId::new("self-bounded-fail").expect("id"),
+            ))
+            .expect("stored");
+        assert_eq!(got.status().state(), ContainerState::Created);
+        assert_eq!(launcher.calls(), 1);
     }
 
     /// CORE-2: create されていない ID の start は NotFound で、launcher は呼ばれない。

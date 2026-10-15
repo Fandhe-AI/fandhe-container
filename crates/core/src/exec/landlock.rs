@@ -83,7 +83,7 @@ pub(super) fn apply_landlock_stage_with(
 ///
 /// # 将来仕様（記録のみ）
 ///
-/// 本番 launcher（`oci_runtime`）からの呼び出しは後続作業（#1715。REPAIR-3）。
+/// 本番 launcher（`oci_runtime::ProductionLauncher`）が fork 前の親（`Threads: 1`）から呼ぶ（#1816）。
 pub(crate) fn landlock_ruleset_from_config(
     config: &OciConfig,
 ) -> Result<LandlockRuleset, ExecError> {
@@ -153,7 +153,7 @@ pub fn launch_isolation_from_bundle(
 
 /// [`landlock_ruleset_from_config`] の ABI 検出結果を差し替えられる版（試験用の継ぎ目。本番は
 /// `detect_landlock_abi()` の結果を渡すだけ）。
-fn ruleset_from_detection(
+pub(crate) fn ruleset_from_detection(
     detected: Result<LandlockSupport, LandlockError>,
     config: &OciConfig,
 ) -> Result<LandlockRuleset, ExecError> {

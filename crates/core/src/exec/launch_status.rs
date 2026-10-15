@@ -7,8 +7,8 @@
 //! 失敗しても、親は終了コードしか見えず、どの段がどの理由で失敗したか分からない。そこで子は pivot 前段の結果を
 //! bounded な pipe に 1 行書き（[`report_ready`]・[`report_failure`]）、親は期限つきで読んで
 //! （[`read_pre_pivot_status`]）判定し（[`resolve_pre_pivot_status`]）、拒否を呼び出し側から受け取った
-//! `AuditSink` へ書く。**子は sink に触らない**。呼び出し元は `process::spawn_container_prepared` だけで、
-//! 本番 launcher（`oci_runtime`）からの呼び出しは未実装（Phase B。REPAIR-3）。
+//! `AuditSink` へ書く。**子は sink に触らない**。呼び出し元は `launch_intermediate::spawn_container_via_intermediate`
+//! だけで、本番 launcher（`oci_runtime::ProductionLauncher`。#1816）が呼ぶ。
 //!
 //! # ワイヤー形式（ASCII 1 行・LF 終端・最大 [`PRE_PIVOT_STATUS_MAX_BYTES`] バイト）
 //!
@@ -102,7 +102,7 @@ impl PrePivotStep {
 
 /// `ErrorCode` の全 variant（`as_str` の逆引き用。`ErrorCode` に `from_str` が無いため）。
 /// 足し忘れは `error_code_ordinal` を使う単体テストが検出する。
-const ALL_ERROR_CODES: [ErrorCode; 9] = [
+pub(super) const ALL_ERROR_CODES: [ErrorCode; 9] = [
     ErrorCode::InvalidArgument,
     ErrorCode::NotFound,
     ErrorCode::AlreadyExists,
@@ -305,8 +305,21 @@ pub(super) fn read_pre_pivot_status(
     status: &std::fs::File,
     timeout: Duration,
 ) -> Result<PrePivotStatus, PrePivotStatusError> {
+    let (buf, end) = read_line_bounded::<PRE_PIVOT_STATUS_MAX_BYTES>(status, timeout)?;
+    PrePivotStatus::decode(buf.get(..end).unwrap_or(&[]))
+}
+
+/// pipe から LF 終端の 1 行を、全体で `timeout`・最大 `N` バイトの範囲で読む（REPAIR-5）。
+///
+/// 戻り値は `(バッファ, LF を含む行の長さ)`。行の後ろに余分なバイトがあれば `Malformed`、`N` バイト以内に LF が
+/// 無ければ `TooLong`、行の完成前に EOF なら `ClosedBeforeReport`（0 バイト）または `Truncated`。pivot 前段の状態行
+/// と、中間プロセスの報告行（`launch_intermediate`）が共用する。
+pub(super) fn read_line_bounded<const N: usize>(
+    pipe: &std::fs::File,
+    timeout: Duration,
+) -> Result<([u8; N], usize), PrePivotStatusError> {
     let deadline = Instant::now() + timeout.min(READ_TIMEOUT_MAX);
-    let mut buf = [0u8; PRE_PIVOT_STATUS_MAX_BYTES];
+    let mut buf = [0u8; N];
     let mut filled = 0usize;
     loop {
         if let Some(pos) = buf
@@ -317,7 +330,7 @@ pub(super) fn read_pre_pivot_status(
             if end < filled {
                 return Err(PrePivotStatusError::Malformed);
             }
-            return PrePivotStatus::decode(buf.get(..end).unwrap_or(&[]));
+            return Ok((buf, end));
         }
         let Some(rest) = buf.get_mut(filled..).filter(|r| !r.is_empty()) else {
             return Err(PrePivotStatusError::TooLong);
@@ -328,7 +341,7 @@ pub(super) fn read_pre_pivot_status(
             !remaining.subsec_nanos().is_multiple_of(1_000_000),
         ));
         let millis = i32::try_from(millis).unwrap_or(i32::MAX);
-        match sys::poll_readable(status.as_fd(), millis) {
+        match sys::poll_readable(pipe.as_fd(), millis) {
             Ok(true) => {}
             Ok(false) => {
                 if Instant::now() >= deadline {
@@ -339,7 +352,7 @@ pub(super) fn read_pre_pivot_status(
             Err(SysError::Os(errno)) if errno == sys::EINTR => continue,
             Err(_) => return Err(PrePivotStatusError::Io),
         }
-        match (&*status).read(rest) {
+        match (&*pipe).read(rest) {
             Ok(0) => {
                 return Err(if filled == 0 {
                     PrePivotStatusError::ClosedBeforeReport
@@ -355,7 +368,7 @@ pub(super) fn read_pre_pivot_status(
 }
 
 /// 起動時の監査の渡し先（借用。`LaunchSpec` に載せない理由: `Debug + Clone + PartialEq + Eq` の値型に
-/// `&dyn AuditSink` を載せると derive が壊れるため。Phase B の launcher が起動ごとに作って渡す）。
+/// `&dyn AuditSink` を載せると derive が壊れるため。本番 launcher が起動ごとに作って渡す）。
 #[derive(Clone, Copy)]
 pub(crate) struct LaunchAudit<'a> {
     /// 記録の書き込み先（親だけが触る）。

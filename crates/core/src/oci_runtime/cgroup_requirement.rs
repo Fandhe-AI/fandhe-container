@@ -4,7 +4,7 @@
 //! `config.json` が cgroup を使う設定（`linux.resources`・`linux.cgroupsPath` の指定）なのに、cgroup へ
 //! 入る手段（`cgroups::DelegatedCgroup` の参加フックが返す `CgroupJoin`）が launcher に渡されていないと、
 //! 資源制限が掛からないままコンテナが起動する。判定と拒否をこのモジュールの 1 か所に置き、本番
-//! launcher（#1715 Phase B・supervisor 結線 #1717）が fork の前に [`launch_after_cgroup_check`] で呼ぶ。
+//! launcher（`ProductionLauncher`。#1816。supervisor の結線は #1819）が fork の前に [`launch_after_cgroup_check`] で呼ぶ。
 //!
 //! # 判定条件
 //!

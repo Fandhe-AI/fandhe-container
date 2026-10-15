@@ -3873,6 +3873,7 @@ mod tests {
 
     /// OCI-2: 下位の symlink を経由するエントリと、その symlink の whiteout の併用は並び順に依らず拒否する。
     #[test]
+    #[cfg(unix)]
     fn oci2_pipeline_symlink_whiteout_with_traversal_is_rejected_in_both_orders() {
         for entries in [
             vec![file("lnk/new", 0o644, b"x"), wh(".wh.lnk")],
@@ -3889,6 +3890,7 @@ mod tests {
     /// OCI-2: 下位の symlink を経由するエントリと、不透明マーカーによるその symlink の削除の併用は
     /// 並び順に依らず拒否する（`prune_lower` も `remove_whiteout_target` と同じ履歴検査・登録を行う）。
     #[test]
+    #[cfg(unix)]
     fn oci2_pipeline_symlink_opaque_with_traversal_is_rejected_in_both_orders() {
         for entries in [
             vec![file("lnk/new", 0o644, b"x"), wh(".wh..wh..opq")],

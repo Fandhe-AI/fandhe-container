@@ -266,6 +266,13 @@ name = "namespace_isolation"
 path = "tests/namespace_isolation.rs"
 harness = false
 
+# child subreaper の設定と再親付けされた孫の pid 指定回収（CORE-1・CORE-2・TASK-29 追補・#1813）の結合試験。
+# subreaper はプロセス全体の属性なので harness = false の単一スレッド main。root・実コンテナは不要。
+[[test]]
+name = "child_subreaper"
+path = "tests/child_subreaper.rs"
+harness = false
+
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]
 workspace = true

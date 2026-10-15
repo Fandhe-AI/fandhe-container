@@ -23,7 +23,8 @@ use std::time::Duration;
 
 use fandhe_container_core::traits::{
     ContainerId, ContainerRuntime, ContainerState, ContainerStatus, CreateRequest, DeleteRequest,
-    ErrorCode, KillRequest, Signal, StartRequest, StateRequest, StopRequest, TraitError,
+    DeleteResponse, ErrorCode, KillRequest, Signal, StartRequest, StateRequest, StopRequest,
+    TraitError,
 };
 use tonic::{Code, Status};
 
@@ -65,6 +66,20 @@ impl From<&ContainerStatus> for RuntimeContainerStatus {
             pid: s.pid().map(|p| p.get()),
             exit_code: s.exit_code(),
         }
+    }
+}
+
+/// `ContainerRuntime::delete` の結果を CRI 側の語彙へ写した値（CRI-2）。
+///
+/// core の `DeleteResponse` を公開 API へ漏らさず、将来の拡張（解放した資源の情報等）に備えて
+/// `#[non_exhaustive]` とする。当面は core 側の応答が空のためフィールドを持たない。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RuntimeDeleteResult {}
+
+impl From<&DeleteResponse> for RuntimeDeleteResult {
+    fn from(_: &DeleteResponse) -> Self {
+        Self {}
     }
 }
 
@@ -148,12 +163,13 @@ impl RuntimeAdapter {
     }
 
     /// コンテナの資源を解放する（`ContainerRuntime::delete`）。`force` は実行中でも停止してから削除する。
-    pub fn remove(&self, id: &str, force: bool) -> Result<(), Status> {
+    pub fn remove(&self, id: &str, force: bool) -> Result<RuntimeDeleteResult, Status> {
         let req = DeleteRequest::new(Self::id(id)?).with_force(force);
         self.runtime
             .delete(&req)
-            .map(|_| ())
-            .map_err(|e| trait_error_to_status(&e))
+            .as_ref()
+            .map(RuntimeDeleteResult::from)
+            .map_err(trait_error_to_status)
     }
 
     /// シグナル番号（1..=64）を送る。範囲外は `INVALID_ARGUMENT`。
@@ -173,5 +189,92 @@ impl RuntimeAdapter {
         r.as_ref()
             .map(RuntimeContainerStatus::from)
             .map_err(trait_error_to_status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroU32;
+
+    fn cid(s: &str) -> ContainerId {
+        ContainerId::new(s).unwrap()
+    }
+
+    /// CRI-2: core の状態を CRI の状態へ具体値で写す。
+    #[test]
+    fn cri2_state_mapping() {
+        let pid = NonZeroU32::new(42);
+        let cases = [
+            (
+                ContainerStatus::creating(cid("a")),
+                CriContainerState::ContainerCreated,
+                None,
+                None,
+            ),
+            (
+                ContainerStatus::created(cid("a"), pid),
+                CriContainerState::ContainerCreated,
+                Some(42),
+                None,
+            ),
+            (
+                ContainerStatus::running(cid("a"), pid),
+                CriContainerState::ContainerRunning,
+                Some(42),
+                None,
+            ),
+            (
+                ContainerStatus::stopped(cid("a"), Some(137)),
+                CriContainerState::ContainerExited,
+                None,
+                Some(137),
+            ),
+        ];
+        for (src, state, pid, code) in cases {
+            let got = RuntimeContainerStatus::from(&src);
+            assert_eq!(got.id, "a");
+            assert_eq!(got.state, state);
+            assert_eq!(got.pid, pid);
+            assert_eq!(got.exit_code, code);
+        }
+    }
+
+    /// CRI-2: 削除応答を CRI 側の型へ写す。
+    #[test]
+    fn cri2_delete_result_mapping() {
+        assert_eq!(
+            RuntimeDeleteResult::from(&DeleteResponse::new()),
+            RuntimeDeleteResult::default()
+        );
+    }
+
+    /// ERR-3: ErrorCode を gRPC コードへ具体値で写す。
+    #[test]
+    fn err3_error_code_mapping() {
+        let cases = [
+            (ErrorCode::InvalidArgument, Code::InvalidArgument),
+            (ErrorCode::NotFound, Code::NotFound),
+            (ErrorCode::AlreadyExists, Code::AlreadyExists),
+            (ErrorCode::FailedPrecondition, Code::FailedPrecondition),
+            (ErrorCode::Unimplemented, Code::Unimplemented),
+            (ErrorCode::PermissionDenied, Code::PermissionDenied),
+            (ErrorCode::Timeout, Code::DeadlineExceeded),
+            (ErrorCode::Unavailable, Code::Unavailable),
+        ];
+        for (ec, code) in cases {
+            let st = trait_error_to_status(&TraitError::new(ec, "msg"));
+            assert_eq!(st.code(), code);
+            assert_eq!(st.message(), "msg");
+        }
+    }
+
+    /// ERR-3: 長いメッセージは文字境界で 4096 バイト以下に切る。
+    #[test]
+    fn err3_message_truncated_on_char_boundary() {
+        let long = "あ".repeat(2000);
+        let st = trait_error_to_status(&TraitError::new(ErrorCode::NotFound, long));
+        assert!(st.message().len() <= STATUS_MESSAGE_MAX_BYTES);
+        assert_eq!(st.message().len(), 4095);
     }
 }

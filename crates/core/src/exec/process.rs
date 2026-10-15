@@ -12,8 +12,8 @@
 //!   子: MountIsolation::establish()
 //!       -> prepare_rootfs(&isolation, rootfs)
 //!       -> (create_default_devices -> mount_tmpfs -> inject_files)   // 起動設定 `setup` の指定時のみ
-//!       -> apply_readonly_paths(&isolation, &prepared)  // 読み取り専用パスの固定集合。常に適用（SEC-2・#1850）
-//!       -> apply_masked_paths(&isolation, &prepared, &null) // 覆うパスの固定集合。`setup` 指定時のみ（SEC-2・#1851）
+//!       -> apply_readonly_paths(&isolation, &prepared, config)  // 読み取り専用パスの固定集合 + config の追加分。固定集合は常に適用（SEC-2・#1850・#1852）
+//!       -> apply_masked_paths(&isolation, &prepared, &null, config) // 覆うパスの固定集合 + config の追加分。`setup` 指定時のみ（SEC-2・#1851・#1852）
 //!       -> pivot_root(&isolation, prepared)            -> PivotReport
 //!       -> exec_entrypoint(&isolation, &report, &entry) // execve。成功時は戻らない
 //! 親: ContainerChild::wait_timeout(timeout)            // waitpid（期限超過で未回収に限り SIGKILL + 回収）
@@ -123,6 +123,7 @@ use super::{
     prepare_rootfs,
 };
 use crate::injected_files::InjectedFileSet;
+use crate::path_masks::ProtectedPath;
 use crate::tmpfs::TmpfsMountSet;
 
 /// argv の要素数の上限（アロケーション前に検証する）。
@@ -1862,6 +1863,8 @@ fn run_child(
 /// 専用 `/dev`（`create_default_devices`）は常に先頭で作る。
 #[derive(Clone, Copy)]
 pub(crate) struct PrePivotSetup<'a> {
+    /// config の `linux.readonlyPaths` / `maskedPaths`（固定集合への追加分。#1852）。
+    pub(crate) config_paths: ConfigPaths<'a>,
     /// 専用 `/dev` の devpts の `gid=` の決定元。
     pub(crate) devices: DevptsGidSource<'a>,
     /// `/dev` の後に載せる tmpfs（無ければ載せない）。
@@ -1875,6 +1878,24 @@ pub(crate) struct PrePivotSetup<'a> {
     /// 成功（`P`）または失敗（`F ...`）を 1 行書く。`None` なら何も返さない（従来どおり）。子はここ以外で sink に
     /// 触らない。pivot 前段が終われば `close_inherited_fds` が閉じる（workload へ渡らない）。
     pub(crate) status: Option<&'a std::fs::File>,
+}
+
+/// config の `linux.readonlyPaths` / `maskedPaths`（検証済み）。固定集合に**追加**されるだけで、外す・緩める
+/// 手段ではない（SEC-2・TASK-29 追補・#1852）。本番の launcher が `OciConfig` から組む。
+#[derive(Clone, Copy)]
+pub(crate) struct ConfigPaths<'a> {
+    /// 読み取り専用にする追加のパス。
+    pub(crate) readonly: &'a [ProtectedPath],
+    /// 覆う追加のパス。
+    pub(crate) masked: &'a [ProtectedPath],
+}
+
+impl ConfigPaths<'_> {
+    /// 追加なし（固定集合のみ）。
+    pub(crate) const NONE: ConfigPaths<'static> = ConfigPaths {
+        readonly: &[],
+        masked: &[],
+    };
 }
 
 /// [`run_pre_pivot`] が呼ぶ各段（単体テストが呼び出し順を記録できるよう差し替え可能にした継ぎ目。
@@ -1918,12 +1939,14 @@ trait PrePivotOps {
         &self,
         isolation: &Self::Isolation,
         prepared: &Self::Prepared,
+        extra: &[ProtectedPath],
     ) -> Result<(), ExecError>;
     fn apply_masked_paths(
         &self,
         isolation: &Self::Isolation,
         prepared: &Self::Prepared,
         devices: &Self::Devices,
+        extra: &[ProtectedPath],
     ) -> Result<(), ExecError>;
     fn pivot_root(
         &self,
@@ -2009,8 +2032,9 @@ impl PrePivotOps for RealPrePivotOps {
         &self,
         isolation: &MountIsolation,
         prepared: &PreparedRootfs,
+        extra: &[ProtectedPath],
     ) -> Result<(), ExecError> {
-        path_masks::apply_readonly_paths(isolation, prepared).map(|_| ())
+        path_masks::apply_readonly_paths(isolation, prepared, extra).map(|_| ())
     }
 
     fn apply_masked_paths(
@@ -2018,8 +2042,9 @@ impl PrePivotOps for RealPrePivotOps {
         isolation: &MountIsolation,
         prepared: &PreparedRootfs,
         devices: &DeviceSet,
+        extra: &[ProtectedPath],
     ) -> Result<(), ExecError> {
-        masked_paths::apply_masked_paths(isolation, prepared, &devices.null).map(|_| ())
+        masked_paths::apply_masked_paths(isolation, prepared, &devices.null, extra).map(|_| ())
     }
 
     fn pivot_root(
@@ -2070,6 +2095,7 @@ fn run_pre_pivot<O: PrePivotOps>(
         .prepare_rootfs(&isolation, rootfs)
         .map_err(StepError::at(S::PrepareRootfs))?;
     let mut devices = None;
+    let config_paths = setup.map_or(ConfigPaths::NONE, |s| s.config_paths);
     if let Some(setup) = setup {
         if let Some(pinned) = setup.pinned_rootfs {
             ops.verify_pinned(&prepared, pinned)
@@ -2089,10 +2115,10 @@ fn run_pre_pivot<O: PrePivotOps>(
         devices = Some(created);
     }
     // `setup` の有無によらず常に適用する（外す入口を作らない。SEC-2・#1850）。
-    ops.apply_readonly_paths(&isolation, &prepared)
+    ops.apply_readonly_paths(&isolation, &prepared, config_paths.readonly)
         .map_err(StepError::at(S::ReadonlyPaths))?;
     if let Some(devices) = &devices {
-        ops.apply_masked_paths(&isolation, &prepared, devices)
+        ops.apply_masked_paths(&isolation, &prepared, devices, config_paths.masked)
             .map_err(StepError::at(S::MaskedPaths))?;
     }
     let pivoted = ops
@@ -2296,6 +2322,41 @@ pub fn spawn_container_probe_with_devices<F>(
 where
     F: FnOnce(),
 {
+    spawn_container_probe_with_config_paths(rootfs, stages, devices, &[], &[], probe)
+}
+
+/// [`spawn_container_probe_with_devices`] に config 由来の追加パス（`linux.readonlyPaths` / `maskedPaths` 相当。
+/// 固定集合への追加。SEC-2・TASK-29 追補・#1852）を渡す版。結合試験 `tests/config_paths.rs` 専用。
+/// 各要素は config と同じ検証（絶対パス必須・`..` 拒否）を通し、不正なら fork せず `InvalidArgument` を返す。
+#[cfg(feature = "escape-probe")]
+#[doc(hidden)]
+pub fn spawn_container_probe_with_config_paths<F>(
+    rootfs: &Path,
+    stages: StagePipeline,
+    devices: DevptsGidSource<'_>,
+    readonly: &[&str],
+    masked: &[&str],
+    probe: F,
+) -> Result<ContainerChild, ExecError>
+where
+    F: FnOnce(),
+{
+    let parse = |list: &[&str]| -> Result<Vec<ProtectedPath>, ExecError> {
+        list.iter()
+            .map(|p| {
+                ProtectedPath::parse(p, crate::oci_runtime::CONFIG_MAX_PATH_BYTES).ok_or_else(
+                    || {
+                        ExecError::new(
+                            ErrorCode::InvalidArgument,
+                            IsolationStage::Spawn,
+                            "invalid config path for the probe",
+                        )
+                    },
+                )
+            })
+            .collect()
+    };
+    let (readonly, masked) = (parse(readonly)?, parse(masked)?);
     let pid = sys::fork_single_threaded(
         move || {
             let setup = PrePivotSetup {
@@ -2303,6 +2364,10 @@ where
                 tmpfs: None,
                 inject: None,
                 pinned_rootfs: None,
+                config_paths: ConfigPaths {
+                    readonly: &readonly,
+                    masked: &masked,
+                },
                 status: None,
             };
             let result = run_child_then(
@@ -2484,6 +2549,7 @@ pub fn spawn_container_with_stages_and_devices(
                 tmpfs: None,
                 inject: None,
                 pinned_rootfs: None,
+                config_paths: ConfigPaths::NONE,
                 status: None,
             }),
             StdioNulling::ALL,
@@ -4950,10 +5016,21 @@ mod tests {
         fn inject_files(&self, _: &(), _: &(), _: &InjectedFileSet) -> Result<(), ExecError> {
             self.step("inject_files")
         }
-        fn apply_readonly_paths(&self, _: &(), _: &()) -> Result<(), ExecError> {
+        fn apply_readonly_paths(
+            &self,
+            _: &(),
+            _: &(),
+            _: &[ProtectedPath],
+        ) -> Result<(), ExecError> {
             self.step("readonly_paths")
         }
-        fn apply_masked_paths(&self, _: &(), _: &(), _: &()) -> Result<(), ExecError> {
+        fn apply_masked_paths(
+            &self,
+            _: &(),
+            _: &(),
+            _: &(),
+            _: &[ProtectedPath],
+        ) -> Result<(), ExecError> {
             self.step("masked_paths")
         }
         fn pivot_root(&self, _: &(), _: ()) -> Result<(), ExecError> {
@@ -4978,6 +5055,7 @@ mod tests {
                 tmpfs: Some(&tmpfs),
                 inject: Some(&inject),
                 pinned_rootfs: Some(pinned.as_fd()),
+                config_paths: ConfigPaths::NONE,
                 status: None,
             }),
         )
@@ -5010,6 +5088,7 @@ mod tests {
                 tmpfs: None,
                 inject: None,
                 pinned_rootfs: None,
+                config_paths: ConfigPaths::NONE,
                 status: None,
             }),
         )
@@ -5069,6 +5148,7 @@ mod tests {
             tmpfs: None,
             inject: None,
             pinned_rootfs: None,
+            config_paths: ConfigPaths::NONE,
             status: None,
         };
         let _ = take_calls();
@@ -5130,6 +5210,7 @@ mod tests {
                 tmpfs: Some(&tmpfs),
                 inject: None,
                 pinned_rootfs: None,
+                config_paths: ConfigPaths::NONE,
                 status: None,
             }),
         )
@@ -5189,6 +5270,7 @@ mod tests {
                     tmpfs: Some(&tmpfs),
                     inject: Some(&inject),
                     pinned_rootfs: Some(pinned.as_fd()),
+                    config_paths: ConfigPaths::NONE,
                     status: None,
                 }),
             )

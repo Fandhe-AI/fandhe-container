@@ -50,25 +50,9 @@ pub struct MountDestination(String);
 impl MountDestination {
     /// destination 文字列を検証・正規化する（段 A）。
     pub(crate) fn parse(value: &str) -> Result<Self, OciConfigError> {
-        if value.is_empty() || value.contains('\0') || value.contains('\\') {
-            return Err(OciConfigError::invalid(DEST_FIELD));
-        }
-        let mut parts: Vec<&str> = Vec::new();
-        for part in value.split('/') {
-            match part {
-                "" | "." => {}
-                ".." => return Err(OciConfigError::invalid(DEST_FIELD)),
-                other => parts.push(other),
-            }
-        }
-        if parts.is_empty() {
-            return Err(OciConfigError::invalid(DEST_FIELD));
-        }
-        let normalized = format!("/{}", parts.join("/"));
-        // 相対パスは先頭に `/` が付き 1 バイト増えるため、正規化後にも上限を再検証する。
-        if normalized.len() > CONFIG_MAX_PATH_BYTES {
-            return Err(OciConfigError::invalid(DEST_FIELD));
-        }
+        // 規則は `ProtectedPath` と共有する（`crate::path_masks::normalize_container_path`）。
+        let normalized = crate::path_masks::normalize_container_path(value, CONFIG_MAX_PATH_BYTES)
+            .ok_or_else(|| OciConfigError::invalid(DEST_FIELD))?;
         Ok(Self(normalized))
     }
 

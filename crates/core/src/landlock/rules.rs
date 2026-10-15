@@ -21,7 +21,8 @@
 //! - 暗黙の固定集合（`/dev`・`/dev/pts`・`/dev/shm`。オーナー判断 #1609）は `mounts[]` に関係なく常に載るため、
 //!   [`crate::dev_mounts`] の定義（実マウントの属性）から導いた権利のルールを rootfs の次に足す（#1657）。
 //!   `mounts[]` が同じマウント先を指す場合は拒否する（統合の規則は TASK-127）
-//! - `linux.readonlyPaths` / `maskedPaths` は参照しない（`unapplied_fields` 扱いで create が拒否する）
+//! - `linux.readonlyPaths` / `maskedPaths` は参照しない（VFS のマウントが担うためルールは足さない。解釈は
+//!   `OciConfig::readonly_paths` / `masked_paths`、適用は `exec` の pivot 前段。#1852）
 //!
 //! # 未実装範囲（REPAIR-3）
 //!

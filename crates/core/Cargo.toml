@@ -184,6 +184,13 @@ name = "masked_paths"
 path = "tests/masked_paths.rs"
 harness = false
 
+# config の linux.maskedPaths / readonlyPaths が固定集合に追加されて適用される結合試験（SEC-2・TASK-29 追補・#1852）。
+# 上と同じ理由で harness = false。`-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
+[[test]]
+name = "config_paths"
+path = "tests/config_paths.rs"
+harness = false
+
 # 暗黙の /dev・/dev/pts・/dev/shm を Landlock のルールに反映する結合試験（CORE-5・TASK-29 追補・#1657）。
 # Landlock の適用は不可逆・単一スレッド前提のため harness = false。`-- --ignored` 指定時のみ実行する
 # 実機前提テスト（root もしくは非特権 user namespace を許すホスト・Landlock ABI 6+。AGENTS.md）。

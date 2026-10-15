@@ -204,6 +204,7 @@ pub use process::{
     SignalDelivery, exec_entrypoint, spawn_container, spawn_container_with_stages,
     spawn_container_with_stages_and_stdio,
 };
+pub(crate) use process::{ConfigPaths, PrePivotSetup, PreparedLaunchFailure};
 /// 結合試験 `tests/exec_child_setup.rs` 専用の再公開（SUP-6・TASK-163 追補・#1456。通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(all(feature = "exec-test-support", not(test)))]
 #[doc(hidden)]
@@ -213,7 +214,6 @@ pub use process::{
     observe_exec_child_setup_with_fsize,
 };
 pub use process::{LegacyTiocstiReport, report_legacy_tiocsti_to};
-pub(crate) use process::{PrePivotSetup, PreparedLaunchFailure};
 /// 結合試験 `tests/exec_child_setup.rs`・`tests/fork_exec_isolation.rs` 専用の再公開（SEC-1・CORE-1・TASK-27.4.1・#1299。
 /// 通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(all(feature = "exec-test-support", not(test)))]
@@ -222,7 +222,10 @@ pub use process::{StandardFd, close_standard_fds_for_test};
 /// 結合試験 `tests/escape_suite.rs` 専用の再公開（SEC-2・TASK-42.1・#199。通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(feature = "escape-probe")]
 #[doc(hidden)]
-pub use process::{spawn_container_probe, spawn_container_probe_with_devices};
+pub use process::{
+    spawn_container_probe, spawn_container_probe_with_config_paths,
+    spawn_container_probe_with_devices,
+};
 /// supervisor の結合試験 `tests/exec_audit.rs` 専用の再公開（SEC-4・SEC-1・#1614 の事後監査。通常の利用者は
 /// 呼ばない。詳細は定義側）。`exec-test-support` feature を付けたビルドにだけ存在する。
 #[cfg(feature = "exec-test-support")]

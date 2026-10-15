@@ -61,7 +61,6 @@
 //! - `/sys` 配下の項目（`/sys/firmware` 等）。実行層が sysfs を供給する時点（TASK-127）で足す
 //! - 違反の監査（SEC-4）への記録: 失敗は `ExecError`（段 `MountMaskedPaths`）で返すだけで、専用の `ViolationReason` は
 //!   足していない
-//! - config の `maskedPaths` の解釈（#1852）
 //!
 //! # 単体テストの安全策
 //!
@@ -72,7 +71,7 @@ use std::ffi::{CString, OsStr};
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::path::Path;
 
-use crate::path_masks::{self, MASKED_PROC_PATHS, MaskMethod, TargetKind};
+use crate::path_masks::{self, MaskMethod, ProtectedPath, TargetKind};
 use crate::sys::{self, SysError};
 use crate::traits::types::ErrorCode;
 
@@ -127,19 +126,30 @@ pub(super) fn apply_masked_paths(
     isolation: &MountIsolation,
     prepared: &PreparedRootfs,
     null: &NullNodeSource,
+    extra: &[ProtectedPath],
 ) -> Result<MaskedPathsReport, ExecError> {
     isolation.verify_caller(STAGE)?;
-    apply_at(prepared.new_root(), null)
+    apply_at_with(prepared.new_root(), null, extra)
+}
+
+/// 固定集合だけを適用する（単体テスト用の短縮形）。
+#[cfg(test)]
+fn apply_at(root: BorrowedFd<'_>, null: &NullNodeSource) -> Result<MaskedPathsReport, ExecError> {
+    apply_at_with(root, null, &[])
 }
 
 /// [`apply_masked_paths`] の証跡検証後の本体（単体テストは偽 rootfs の fd を渡す）。
-fn apply_at(root: BorrowedFd<'_>, null: &NullNodeSource) -> Result<MaskedPathsReport, ExecError> {
+fn apply_at_with(
+    root: BorrowedFd<'_>,
+    null: &NullNodeSource,
+    extra: &[ProtectedPath],
+) -> Result<MaskedPathsReport, ExecError> {
     let rootfs = root_display(root);
     let mut report = MaskedPathsReport {
         applied: 0,
         skipped: 0,
     };
-    for path in MASKED_PROC_PATHS {
+    for path in path_masks::masked_targets(extra) {
         let names = path_masks::components(path).ok_or_else(|| {
             ExecError::new(
                 ErrorCode::Internal,

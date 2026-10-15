@@ -343,8 +343,23 @@ impl Eq for RootfsDir {}
 /// 祖先）を rename して作り直せる者は、所有者と別の inode をロックさせてこの排他を外せる。ただし bundle の
 /// パスは状態記録が指す信頼境界で、rootfs の固定（`RootfsDir::pin`）と `config.json` の読み込みも同じ前提に
 /// 立つ（その者は config.json と rootfs を丸ごと差し替えて起動内容を制御できるため、新たな能力にはならない）。
-/// bundle とその祖先を書き換えられない者に対する排他であり、パスに依存しない起動権（所有者の識別を
-/// `StateStore` 側に持つ等）は公開トレイトの変更を要するため後続で扱う（TASK-31）。
+/// bundle とその祖先を書き換えられない者に対する排他である。
+///
+/// # 設計判断（起動権の排他方式。#1316・2026-10-12 確定、#1854。CORE-2・OCI-5・PLUG-1・SEC-1）
+///
+/// 起動権は、revision 照合つきの `StateStore::update`（Created から Running・pid なし）と、この
+/// bundle の `flock` で排他する現状の方式を維持する。起動権（所有者の識別）を `StateStore` 側へ持たせず、
+/// トレイトも変えない。
+///
+/// - 二重 start は revision 照合が防ぐ
+/// - `flock` が受け持つのは、中断された start の回復（`recover_interrupted_start`）で元の所有プロセスの
+///   終了を確かめることだけである
+/// - `flock` を外せるのは bundle か祖先を書き換えられる者で、その者は `config.json` と rootfs を差し替えて
+///   起動内容を決められる。起動権を `StateStore` 側へ移しても防げる攻撃は増えない
+/// - #1314 の決定で start を呼ぶのはコンテナごとの supervisor になり、争う相手は同じコンテナの別の
+///   supervisor だけである
+///
+/// 再検討の条件は、`StateStore` の別実装（plugin で差し替える実装）を作るときである。
 #[derive(Debug)]
 pub(super) struct BundleLock {
     #[cfg(target_os = "linux")]

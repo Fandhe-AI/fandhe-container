@@ -6,18 +6,22 @@
 //!
 //! # 流れ
 //! - 親: 利用者所有のフィクスチャを持つ rootfs を作る。`proc/` には対象 10 件に対応する中身つきのファイル（`secret`）と
-//!   ディレクトリ（中にファイルを持つ）、読み取り専用化側の `proc/sys` を置く（rootfs に procfs は載らないため、
-//!   フィクスチャで対象を用意する）。分離（root は rootful、非 root は rootless）→ `spawn_container_probe_with_devices`
+//!   ディレクトリ（中にファイルを持つ）、読み取り専用化側の `proc/sys` を置く。ただし `spawn_container_probe_with_devices`
+//!   は `prepare_rootfs` で `rootfs/proc` に実 procfs をマウントするため、子から見える対象は実カーネルの `/proc` で
+//!   あり、フィクスチャは隠れる（ホスト側で不変かの確認にだけ使う）。対象の有無はカーネル依存（例: `timer_stats` が無い
+//!   カーネルでは実装は正常に不在として飛ばす）なので、子が各対象の有無を観測し、存在する対象にだけ期待値を要求する。分離（root は rootful、非 root は rootless）→ `spawn_container_probe_with_devices`
 //!   （`setup` 付き。`create_default_devices` → `readonly_paths` → `masked_paths` を本番と同じ順序で適用）→
 //!   子をタイムアウト付きで待つ（REPAIR-5）。
 //! - 子（pivot 後。新しい PID namespace の PID 1）: コンテナ内から確かめられる観測値（読んだ長さ・`readdir` の件数・
-//!   作成 `open` の errno）を pipe へ `key=value` の行で書き、`ready` を書いたら親が許すまで待つ。rootfs に procfs は
-//!   載らないため、子は mountinfo を読めない。
+//!   作成 `open` の errno・対象の有無）を pipe へ `key=value` の行で書き、`ready` を書いたら親が許すまで待つ。
+//!   子の `/proc` は覆いの後の状態で、子は mountinfo を読まない。
 //! - 親は `ready` を受けたら `/proc/<子の PID>/mountinfo`（子の mount namespace・root から見た経路）を読んで
 //!   マウントの種別・per-mount options を照合し、続けて子を解放して終了を待つ。ホスト側 rootfs に副作用が無い
 //!   （フィクスチャの内容不変）ことも確かめる。
 //!
 //! # 期待値
+//! 実 procfs 上で存在する対象にだけ次を要求し、不在の対象は mountinfo にマウントポイントが無いことだけを確かめる
+//! （最低 1 件は存在して覆われていること）。
 //! - ファイルの対象: 読むと 0 バイト。mountinfo にマウントポイントが現れ、`nodev` は付かない（付くと開けない）
 //! - ディレクトリの対象: 空（`readdir` が 0 件）。mountinfo に `tmpfs` と `ro`・`nosuid`・`nodev`・`noexec` があり、
 //!   中への作成 `open(O_CREAT|O_WRONLY)` は `EROFS`（30）で拒否される
@@ -137,9 +141,15 @@ mod linux {
     }
 
     /// 子（コンテナ内）の観測。結果は `writer` へ 1 行ずつ書き、最後に `ready` を書いて `gate` が閉じられる（親が
-    /// mountinfo を読み終える）まで待つ。待ちは親の `wait_timeout` が上限になる（REPAIR-5）。
+    /// mountinfo を読み終えて解放バイトを送る）まで待つ。待ちは親の `wait_timeout` が上限になる（REPAIR-5）。
     fn observe(mut writer: std::io::PipeWriter, mut gate: std::io::PipeReader) {
         for t in MASKED_PROC_PATHS {
+            // 実 procfs では対象の有無がカーネル依存。不在なら以降の観測を省く。
+            let present = std::fs::symlink_metadata(t).is_ok();
+            writeln!(writer, "present:{t}={present}").expect("write");
+            if !present {
+                continue;
+            }
             if is_dir_target(t) {
                 let count = std::fs::read_dir(t).map(|d| d.count().to_string());
                 writeln!(writer, "dir_entries:{t}={count:?}").expect("write");
@@ -156,8 +166,9 @@ mod linux {
             }
         }
         writeln!(writer, "ready").expect("write");
-        let mut sink = Vec::new();
-        let _ = gate.read_to_end(&mut sink);
+        // 親が解放バイトを送るまで待つ。fork で子にも親の書き込み端が複製されるため、EOF は当てにしない。
+        let mut release = [0u8; 1];
+        let _ = gate.read_exact(&mut release);
     }
 
     pub fn run() {
@@ -234,6 +245,8 @@ mod linux {
         let mountinfo = std::fs::read_to_string(format!("/proc/{}/mountinfo", child.pid()))
             .unwrap_or_else(|e| kill(&format!("read the child's mountinfo: {e}")));
         // 子を解放して終了を待つ。
+        let mut gate_writer = gate_writer;
+        gate_writer.write_all(&[1]).expect("release the child");
         drop(gate_writer);
         let exit = child.wait_timeout(timeout()).unwrap_or_else(|e| {
             let _ = child.kill_and_reap(Duration::from_secs(5));
@@ -243,11 +256,10 @@ mod linux {
             matches!(exit, ChildExit::Exited(0)),
             "child must exit with 0, got {exit:?}"
         );
-        verify(&text, &mountinfo);
+        let (applied, absent) = verify(&text, &mountinfo);
         verify_host_untouched(&rootfs.0);
         println!(
-            "masked_paths: {} /proc entries masked (files read as 0 bytes, dirs empty and EROFS on create) (root={root})",
-            MASKED_PROC_PATHS.len()
+            "masked_paths: {applied} /proc entries masked, {absent} absent on this kernel (files read as 0 bytes, dirs empty and EROFS on create) (root={root})"
         );
     }
 
@@ -257,8 +269,19 @@ mod linux {
             .unwrap_or_else(|| panic!("missing observation {key}:\n{text}"))
     }
 
-    fn verify(text: &str, mountinfo: &str) {
+    /// 検証した（存在して覆われていた）対象の件数と、不在で飛ばした件数。
+    fn verify(text: &str, mountinfo: &str) -> (usize, usize) {
+        let (mut applied, mut absent) = (0, 0);
         for t in MASKED_PROC_PATHS {
+            if lookup(text, &format!("present:{t}")) != "true" {
+                assert!(
+                    mount_entry(mountinfo, t).is_none(),
+                    "{t} is absent on this kernel and must not become a mount point:\n{mountinfo}"
+                );
+                absent += 1;
+                continue;
+            }
+            applied += 1;
             let kind = if is_dir_target(t) {
                 TargetKind::Dir
             } else {
@@ -307,6 +330,11 @@ mod linux {
             Some(true),
             "/proc/sys must stay a read-only mount point"
         );
+        assert!(
+            applied > 0,
+            "at least one masked target must exist:\n{text}"
+        );
+        (applied, absent)
     }
 
     fn verify_host_untouched(rootfs: &Path) {

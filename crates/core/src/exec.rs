@@ -21,6 +21,9 @@
 //!    （#834・TASK-27.6・#1656。**実装済み**。[`create_default_devices`] を
 //!    [`prepare_rootfs`] の後・[`pivot_root`] の前に呼ぶ。rootful は `mknod`、rootless はホストの
 //!    `/dev/<名前>` の bind で基本デバイスを供給する〔#1660〕）
+//!    続けて、読み取り専用にするパスの固定集合（`/proc` 配下の 5 件と `/sys`。SEC-2・#1850）を、`setup` の有無によらず
+//!    [`pivot_root`] の前に常に適用する（`process::run_pre_pivot` の `readonly_paths` 段。定義は
+//!    [`crate::path_masks`]、適用は `exec::path_masks`。**実装済み**。`/sys` 配下の個別項目は未実装）
 //! 4. 順序固定のステージ列: cgroup 参加 → capability 削減 → `PR_SET_NO_NEW_PRIVS`
 //!    → Landlock → seccomp（#136・#832・#833。**枠・`NO_NEW_PRIVS`・capability 削減・seccomp は実装済み**: [`StagePipeline`] が
 //!    [`StageKind::ORDER`] の固定順でフックを呼び、`NO_NEW_PRIVS` は差し替え不可の組み込み段として
@@ -114,6 +117,7 @@ mod landlock;
 mod launch_intermediate;
 mod launch_status;
 mod no_new_privs;
+mod path_masks;
 mod process;
 mod reapply;
 mod rlimits;
@@ -713,6 +717,8 @@ pub enum IsolationStage {
     MountTmpfs,
     /// secrets / configs の注入（専用 tmpfs への書き込みと read-only 化。SUP-12・TASK-169.4.2）。
     InjectFiles,
+    /// 読み取り専用にするパスの固定集合の適用（`/proc` 配下の 5 件と `/sys`。SEC-2・TASK-29 追補・#1850）。
+    MountReadonlyPaths,
 }
 
 /// 実行層の構造化エラー（`code` は `traits::types::ErrorCode` を再利用）。

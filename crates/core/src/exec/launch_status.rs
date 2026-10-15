@@ -55,18 +55,21 @@ pub(super) enum PrePivotStep {
     MountTmpfs,
     /// ファイルの注入。
     InjectFiles,
+    /// 読み取り専用にするパスの固定集合の適用（`setup` の有無によらず常に走る。#1850）。
+    ReadonlyPaths,
     /// `pivot_root`。
     PivotRoot,
 }
 
 impl PrePivotStep {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Establish,
         Self::PrepareRootfs,
         Self::VerifyPinned,
         Self::CreateDefaultDevices,
         Self::MountTmpfs,
         Self::InjectFiles,
+        Self::ReadonlyPaths,
         Self::PivotRoot,
     ];
 
@@ -79,6 +82,7 @@ impl PrePivotStep {
             Self::CreateDefaultDevices => "create_default_devices",
             Self::MountTmpfs => "mount_tmpfs",
             Self::InjectFiles => "inject_files",
+            Self::ReadonlyPaths => "readonly_paths",
             Self::PivotRoot => "pivot_root",
         }
     }
@@ -95,6 +99,7 @@ impl PrePivotStep {
             Self::CreateDefaultDevices => IsolationStage::CreateDevices,
             Self::MountTmpfs => IsolationStage::MountTmpfs,
             Self::InjectFiles => IsolationStage::InjectFiles,
+            Self::ReadonlyPaths => IsolationStage::MountReadonlyPaths,
             Self::PivotRoot => IsolationStage::PivotRoot,
         }
     }
@@ -434,7 +439,8 @@ fn step_ordinal(step: PrePivotStep) -> usize {
         PrePivotStep::CreateDefaultDevices => 3,
         PrePivotStep::MountTmpfs => 4,
         PrePivotStep::InjectFiles => 5,
-        PrePivotStep::PivotRoot => 6,
+        PrePivotStep::ReadonlyPaths => 6,
+        PrePivotStep::PivotRoot => 7,
     }
 }
 
@@ -500,7 +506,7 @@ mod tests {
         for (i, s) in PrePivotStep::ALL.into_iter().enumerate() {
             assert_eq!(step_ordinal(s), i);
         }
-        assert_eq!(PrePivotStep::ALL.len(), 7);
+        assert_eq!(PrePivotStep::ALL.len(), 8);
     }
 
     /// 具体値の符号化（ワイヤー形式の固定。SEC-4・REPAIR-2）。

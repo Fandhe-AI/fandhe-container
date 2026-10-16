@@ -321,6 +321,17 @@ rc=0
 GUEST_KERNEL_LOCK="/etc/hosts" GUEST_KERNEL_TEST_SANDBOX="$sandbox" bash "$build" --output-dir "$sandbox/outs" >/dev/null 2>"$sandbox/seam.err" </dev/null || rc=$?
 grep -q '^error: code=test-seam-refused ' "$sandbox/seam.err" && ok || ng "seam path outside sandbox: not refused"
 
+# 10b. 読めない tarball（権限なし）は構造化エラー・2（root では権限が効かないので省略）
+unread="$sandbox/unreadable.tar.xz"
+cp "$good_tar" "$unread" && chmod 000 "$unread"
+if [ ! -r "$unread" ]; then
+    run_build "${std_env[@]}" -- --output-dir "$sandbox/outu" --cross-compile "$cc" --tarball "$unread"
+    expect_err "unreadable tarball" 2 bad-argument
+else
+    ok
+fi
+chmod 600 "$unread"
+
 # 11. Windows ホスト（uname の差し替え）: 2・unsupported-os
 run_build "${std_env[@]}" "GUEST_KERNEL_UNAME_S=MINGW64_NT-10.0" -- --output-dir "$sandbox/outw" --cross-compile "$cc"
 expect_err "windows host" 2 unsupported-os
@@ -328,8 +339,12 @@ expect_err "windows host" 2 unsupported-os
 # 12. 実リポのフラグメントとロックファイルの静的検査（ネットワーク不要）
 frag="$here/arm64-guest.config"
 lock="$here/source.lock"
-for sym in ARCH_VIRT VIRTIO_FS VIRTIO_VSOCKETS DRM_VIRTIO_GPU VIRTIO_CONSOLE VIRTIO_BLK BLK_DEV_INITRD DEVTMPFS; do
+for sym in VIRTIO_FS VIRTIO_VSOCKETS DRM_VIRTIO_GPU VIRTIO_CONSOLE VIRTIO_BLK BLK_DEV_INITRD DEVTMPFS; do
     grep -qx "CONFIG_$sym=y" "$frag" && ok || ng "fragment: CONFIG_$sym=y missing"
+done
+# arm64 の Kconfig に無い記号（実カーネルの allnoconfig で config-option-missing になる）を置かない
+for sym in ARCH_VIRT; do
+    ! grep -q "^CONFIG_$sym=" "$frag" && ok || ng "fragment: CONFIG_$sym is not an arm64 symbol"
 done
 grep -qx '# CONFIG_MODULES is not set' "$frag" && ok || ng "fragment: CONFIG_MODULES is not disabled"
 ! grep -q '^CONFIG_MODULES=' "$frag" && ok || ng "fragment: CONFIG_MODULES enabled"

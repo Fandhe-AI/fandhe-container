@@ -356,7 +356,10 @@ if [ -z "$tarball" ]; then
 fi
 
 # --- 完全性の照合（不一致ならここで止まり、展開もビルドもしない） ---
-actual_sha="$($sha_cmd "$tarball" | awk '{print $1}')"
+if ! actual_sha="$($sha_cmd "$tarball" 2>/dev/null | awk '{print $1}'; exit "${PIPESTATUS[0]}")"; then
+    err bad-argument "cannot read the tarball to compute its sha256"
+    exit 2
+fi
 if [ "$actual_sha" != "$lock_sha" ]; then
     err checksum-mismatch "sha256 of the tarball does not match source.lock (expected $lock_sha, got $actual_sha)"
     exit 4

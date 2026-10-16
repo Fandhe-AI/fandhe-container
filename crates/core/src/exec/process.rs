@@ -122,7 +122,9 @@ use super::{
     StagePipeline, ViolationReason, describe, fd_mount_id, inject_files, mount_tmpfs, pivot_root,
     prepare_rootfs,
 };
+use crate::dev_mounts::ImplicitDevMount;
 use crate::injected_files::InjectedFileSet;
+use crate::landlock::{MountedBy, MountedTarget, MountedTargets};
 use crate::oci_runtime::BindMountSet;
 use crate::path_masks::ProtectedPath;
 use crate::tmpfs::TmpfsMountSet;
@@ -1975,7 +1977,52 @@ struct DeviceSet {
 }
 
 /// 本番の段の実装（既存の公開関数への薄い委譲）。
-struct RealPrePivotOps;
+///
+/// 各段の成功直後に、その段が載せたマウント先の識別子を `mounted` へ記録する（#2071・CORE-5・SEC-1）。
+/// 記録は `run_child_then` が取り出して `StagePipeline::with_mounted_targets` で Landlock 段へ渡し、
+/// Mount 由来のルールの対象が pivot 前段の載せたマウントのルートであることの照合に使う。段の事後検証が
+/// 自分のマウントを確かめた直後に、同じ fd 起点（`prepared` の新しい mount top）で開き直して観測するため、
+/// 以降の段が宛先へ別のマウントを重ねれば、適用時の照合が食い違いとして拒否する。
+#[derive(Default)]
+struct RealPrePivotOps {
+    mounted: std::cell::RefCell<MountedTargets>,
+}
+
+impl RealPrePivotOps {
+    /// `destination`（コンテナ内の正規化済みパス）の識別子を観測して記録する。観測・記録に失敗したら、
+    /// 後段で照合できないまま進まないよう段ごと失敗させる（fail-closed）。
+    fn record(
+        &self,
+        prepared: &PreparedRootfs,
+        by: MountedBy,
+        destination: &str,
+        stage: IsolationStage,
+    ) -> Result<(), ExecError> {
+        let identity = crate::landlock::observe_mount_beneath(prepared.new_root(), destination)
+            .map_err(|e| {
+                ExecError::from_sys(e, stage, "observe the identity of a mounted target")
+            })?;
+        self.mounted
+            .borrow_mut()
+            .push(MountedTarget {
+                by,
+                destination: destination.to_string(),
+                identity,
+            })
+            .map_err(|_| {
+                ExecError::new(
+                    ErrorCode::FailedPrecondition,
+                    stage,
+                    "too many mounted targets to record",
+                )
+            })
+    }
+
+    /// 記録を取り出す（`run_child_then` が Landlock 段へ渡す）。
+    fn into_mounted(self) -> MountedTargets {
+        self.mounted.into_inner()
+    }
+}
 
 impl PrePivotOps for RealPrePivotOps {
     type Isolation = MountIsolation;
@@ -2019,6 +2066,14 @@ impl PrePivotOps for RealPrePivotOps {
         source: DevptsGidSource<'_>,
     ) -> Result<DeviceSet, ExecError> {
         let (report, null) = create_default_devices_with_null_source(isolation, prepared, source)?;
+        for mount in [ImplicitDevMount::Dev, ImplicitDevMount::DevPts] {
+            self.record(
+                prepared,
+                MountedBy::DefaultDevices(mount),
+                mount.destination(),
+                IsolationStage::CreateDevices,
+            )?;
+        }
         Ok(DeviceSet { report, null })
     }
 
@@ -2029,7 +2084,16 @@ impl PrePivotOps for RealPrePivotOps {
         devices: &DeviceSet,
         set: &TmpfsMountSet,
     ) -> Result<(), ExecError> {
-        mount_tmpfs(isolation, prepared, Some(&devices.report), set).map(|_| ())
+        let report = mount_tmpfs(isolation, prepared, Some(&devices.report), set)?;
+        for outcome in &report.mounts {
+            self.record(
+                prepared,
+                MountedBy::Tmpfs,
+                &outcome.destination,
+                IsolationStage::MountTmpfs,
+            )?;
+        }
+        Ok(())
     }
 
     fn inject_files(
@@ -2038,7 +2102,16 @@ impl PrePivotOps for RealPrePivotOps {
         prepared: &PreparedRootfs,
         set: &InjectedFileSet,
     ) -> Result<(), ExecError> {
-        inject_files(isolation, prepared, set).map(|_| ())
+        let report = inject_files(isolation, prepared, set)?;
+        for dir in &report.directories {
+            self.record(
+                prepared,
+                MountedBy::Inject,
+                &dir.destination,
+                IsolationStage::InjectFiles,
+            )?;
+        }
+        Ok(())
     }
 
     fn mount_binds(
@@ -2047,7 +2120,18 @@ impl PrePivotOps for RealPrePivotOps {
         prepared: &PreparedRootfs,
         set: &BindMountSet,
     ) -> Result<(), ExecError> {
-        super::mount_binds(isolation, prepared, set).map(|_| ())
+        let report = super::mount_binds(isolation, prepared, set)?;
+        for outcome in &report.mounts {
+            self.record(
+                prepared,
+                MountedBy::Bind {
+                    index: outcome.index,
+                },
+                &outcome.destination,
+                IsolationStage::MountBinds,
+            )?;
+        }
+        Ok(())
     }
 
     fn apply_readonly_paths(
@@ -2139,6 +2223,11 @@ fn check_bind_overlaps(
 /// Landlock との整合: `mount_binds` が付け替え後に自分のマウントを事後検証し、以降の段は `/proc`・`/sys` だけを対象と
 /// するため、pivot 時点で宛先の最上位のマウントは bind のまま残る。`RulePath::Beneath(dest)` を辿ると適用した bind の
 /// ルートに着く。ルールと bind は同じ `mounts[]` から導く（#1915 で結線済み。`LaunchSpec` が同じ `Arc<OciConfig>` から両方を作る）。
+/// 各段が載せたマウントの識別子（`mnt_id`・`st_dev`・`st_ino`）は [`RealPrePivotOps`] が段の成功直後に記録し、
+/// `run_child_then` が Landlock 段へ渡す。Landlock の適用時に、Mount 由来のルールの対象がその記録と一致する
+/// （宛先の最上位のマウントが載せたもののままである）ことを確かめる（#2071・CORE-5・SEC-1）。なお
+/// `readonly_paths` / `masked_paths` の config 由来の追加分が `/dev` 系の宛先と重なる構成では、宛先の最上位のマウントが
+/// 入れ替わるため、この照合で拒否される。
 ///
 /// デバイスノードと tmpfs は pivot の前に、`PreparedRootfs` の fd を起点に作る（pivot 後は旧 root が
 /// 切り離され、ホスト側の `/dev` を再解決できないため）。`setup` が `None` なら
@@ -2228,7 +2317,8 @@ fn run_child_then<T>(
     ) -> Result<T, ExecError>,
 ) -> Result<T, ExecError> {
     let status = setup.and_then(|s| s.status);
-    let (isolation, report) = match (run_pre_pivot(&RealPrePivotOps, rootfs, setup), status) {
+    let ops = RealPrePivotOps::default();
+    let (isolation, report) = match (run_pre_pivot(&ops, rootfs, setup), status) {
         (Ok(done), None) => done,
         (Err(failed), None) => return Err(failed.error),
         // 成功の報告に失敗したら先へ進まない（親が結果を判定できないまま exec しない。fail-closed）。
@@ -2247,10 +2337,11 @@ fn run_child_then<T>(
             return Err(failed.error);
         }
     };
-    // pivot 後・終端前にステージ列を固定順で実行する。
-    stages.run_then(|_stage_report, _capability_report, evidence| {
-        terminal(&isolation, &report, evidence)
-    })
+    // pivot 後・終端前にステージ列を固定順で実行する。pivot 前段が記録したマウントの識別子を Landlock 段へ渡す
+    // （Mount 由来のルールの対象がマウントのルートであることの照合。#2071）。
+    stages.with_mounted_targets(ops.into_mounted()).run_then(
+        |_stage_report, _capability_report, evidence| terminal(&isolation, &report, evidence),
+    )
 }
 
 /// 子のメイン（プローブ版）。失敗は `child_main` と同じ規約で stderr へ 1 行出して終了コードにする。

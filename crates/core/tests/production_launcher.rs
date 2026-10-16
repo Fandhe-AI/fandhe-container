@@ -21,6 +21,9 @@
 //!   mountinfo 上の `/data` のオプションに `rw`・`nosuid`・`nodev` が含まれることを照合する
 //! - シナリオ E（状態ルートの bind 拒否。#2066・SEC-1）: 状態ルート自身とその symlink 別名を bind の元にした start が
 //!   `InvalidArgument` で拒否され、状態が Created のまま子が残らないことを照合する
+//! - シナリオ F（Landlock の Mount 識別子照合。#2071・CORE-5・SEC-1）: `linux.readonlyPaths` に `/dev` を足し、
+//!   記録（`RealPrePivotOps`）より後に `/dev` へ別のマウントが重なる起動が、Landlock 適用時の照合で拒否されて
+//!   失敗し、状態が Created のまま子が残らないことを照合する。記録と一致する側はシナリオ A・D の成功が担う
 //! - root で実行された場合: 主経路は非 root（SEC-5）。launch が拒否され、状態が Created に戻り、子が残らないことだけを
 //!   照合する（コンテナ内 root をホスト root へ写す起動は試さない）
 //!
@@ -620,6 +623,7 @@ mod linux {
         scenario_c_multithreaded_refused(&env, tag);
         scenario_d_bind_mount(&env, tag);
         scenario_e_state_root_bind_refused(&env, tag);
+        scenario_f_landlock_mount_identity_swapped(&env, tag);
     }
 
     /// シナリオ A: 正常起動。
@@ -931,6 +935,61 @@ mod linux {
                 err.code()
             );
         }
+    }
+
+    /// シナリオ F: Landlock の Mount 由来のルールの識別子照合を、本番の起動経路（`RealPrePivotOps` の記録 → pivot →
+    /// `StagePipeline` → 本物の Landlock 適用）で通す（CORE-5・SEC-1・SEC-4・REPAIR-10 (d)・REPAIR-12・#2071）。
+    ///
+    /// - 一致する場合: シナリオ D（`/data` の bind を記録し、Landlock 適用後も bind 先へ書ける）とシナリオ A
+    ///   （既定の `/dev` 系の記録）が、記録と実マウントが一致したまま起動に成功することで担う
+    /// - 記録後にマウントが変わる場合（本シナリオ）: `linux.readonlyPaths` に `/dev` を足すと、`apply_readonly_paths` が
+    ///   `RealPrePivotOps` の記録（`create_devices` 直後）より後に `/dev` へ別のマウント（読み取り専用の bind）を重ねる。
+    ///   Landlock の暗黙の `/dev` ルールの対象は記録と別のマウントになるため、適用時の照合が拒否し、起動は失敗する。
+    ///   Landlock 段の拒否は pivot 後の子で起き、状態 pipe（pre-pivot 段のみ）では親へ届かない（`docs/design/audit-delivery.md`
+    ///   8 章。#2023〜）ため、親から観測できるのは「起動が失敗し、状態が Created に戻り、子が残らない」ことまで。
+    ///   拒否理由そのものは `exec/landlock.rs` の単体試験が `ViolationReason::LandlockMountIdentityMismatch` で照合する。
+    fn scenario_f_landlock_mount_identity_swapped(env: &Env, tag: u32) {
+        let bundle = Bundle::new("f");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &[], json!([]));
+        let path = bundle.dir.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read config.json"))
+                .expect("parse config.json");
+        config["linux"]["readonlyPaths"] = json!(["/dev"]);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&config).expect("serialize config"),
+        )
+        .expect("rewrite config.json");
+        let id = ContainerId::new(format!("plf{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+
+        wait_single_thread();
+        let err = match start(
+            &env.store,
+            &env.recorder,
+            &env.launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        ) {
+            Ok(_) => panic!("start must be refused when a mount is swapped after it was recorded"),
+            Err(e) => e,
+        };
+        // 検証段階（config の拒否）ではなく、launch 中の拒否であること。
+        assert_ne!(err.code(), ErrorCode::InvalidArgument, "{}", err.message());
+        assert_ne!(err.code(), ErrorCode::Timeout, "{}", err.message());
+        assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+        assert!(!env.launcher.last_launch_may_have_left_process());
+        assert!(
+            eventually(|| children_of_self().is_empty()),
+            "no process may remain after a refused launch: {:?}",
+            children_of_self()
+        );
+        println!(
+            "production_launcher: scenario=landlock-mount-swapped code={:?} state=created children=0",
+            err.code()
+        );
     }
 
     /// root 実行: launch が拒否され、状態は Created に戻り、子が残らない（SEC-5。成功起動は試さない）。

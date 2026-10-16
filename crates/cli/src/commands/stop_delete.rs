@@ -11,9 +11,12 @@
 //!   [`UnavailableSignaler`] が常に `Unimplemented` で失敗する。`state.json` の pid へ生の `kill(2)` は
 //!   送らない（PID 再利用で無関係なプロセスを止めない。SEC-1・CORE-1）。
 //! - `delete` の cgroup 削除は Linux では `DetectedCgroupRemover`（`cgroups::DelegatedCgroup` の遅延検出。
-//!   #1314 の 3-ii）が担う。cgroup 配置が記録されたレコードに出会った場合だけ検出し、検出の失敗・スコープの
-//!   不一致・削除の失敗はいずれも cgroup も状態記録も残したまま構造化エラーで失敗する（fail-closed。
-//!   OCI-6・CORE-3・SEC-1）。非 Linux では `UnavailableCgroupRemover` が `Unimplemented` で失敗する。
+//!   #1314 の 3-ii）が担う。cgroup 配置が記録されたレコードに出会った場合だけ検出し、検出の失敗・削除の失敗は
+//!   cgroup も状態記録も残したまま構造化エラーで失敗する（fail-closed。OCI-6・CORE-3・SEC-1）。検出したスコープと
+//!   記録のスコープが食い違う場合は、#2060 のオーナー決定（2026-10-16・案 B。#1314 の 3-ii の delete の行を変更）
+//!   により、core の `delete` が記録された配置を `remove_recorded` へ渡し、`cgroups::RecordedCgroupScope`
+//!   が記録のスコープを fd 起点で検証つきに開いてコンテナ cgroup を消す（#2096）。検証に失敗すれば何も消さず
+//!   記録を残す。非 Linux では `UnavailableCgroupRemover` が `Unimplemented` で失敗する。
 //!
 //! 状態ルートが無ければ `production_runtime` の状態ストアを開く段階で親の下に 0700 で作る（親は作らない）。
 //! list / logs と同じ判断で、読み取り専用 open は足さない（理由は `list_logs` の module doc。#1607 E2）。
@@ -24,8 +27,9 @@
 //! - 本番 signaler は未結線（#1544 の残り）。CLI と supervisor の間に制御チャネル（UDS。supervisor が保持する
 //!   起動ハンドルへシグナルを渡す受け口）がまだ無いため、その追加（TASK-157 追補）の後にクライアントとして
 //!   結線する。それまで `stop` は `Unimplemented` で失敗する。
-//! - `delete` が照合する委譲スコープは CLI 自身の cgroup から検出したもの。start 時に supervisor が記録した
-//!   スコープ（CLI の cgroup を継承する）と一致しなければ `FailedPrecondition` で失敗し、何も消さない。
+//! - `delete` が最初に照合する委譲スコープは CLI 自身の cgroup から検出したもの。start 時に supervisor が記録した
+//!   スコープと一致すれば従来の経路、食い違えば記録のスコープを直接開く経路（#2096）で消す。検出自体の失敗は
+//!   記録の経路へ回さず失敗させる（壊れた環境で使わない安全側の判断。再検討は別 issue）。
 //! - macOS / Windows は plugin 発見機構経由（TASK-79.4・PLUG-4）。非 Linux では `production_runtime` が
 //!   `plugin_backend` を呼び、現状は必ず fail-closed で失敗する（起動と RPC は TASK-114・TASK-125）。
 
@@ -38,8 +42,8 @@ use fandhe_container_core::oci_runtime::{
     ProcessSignaler, delete, kill,
 };
 use fandhe_container_core::traits::{
-    CgroupScope, ContainerId, ContainerStatus, DeleteRequest, DeleteResponse, ErrorCode,
-    KillRequest, Signal, StateRevision, StateStore, TraitError,
+    CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, DeleteRequest, DeleteResponse,
+    ErrorCode, KillRequest, Signal, StateRevision, StateStore, TraitError,
 };
 
 use super::CliExit;
@@ -126,6 +130,17 @@ where
     ) -> Result<CgroupRemoval, TraitError> {
         self.get()?.remove_with_recorder(id, instance, recorder)
     }
+
+    /// 記録のスコープが検出したスコープと食い違うときの経路を内側へ転送する（#2096・#2060 案 B）。
+    /// 検出の失敗はキャッシュしたエラーのまま返し、記録の経路へ回さない（fail-closed）。
+    fn remove_recorded(
+        &self,
+        id: &ContainerId,
+        placement: &CgroupPlacement,
+        recorder: &OpRecorder,
+    ) -> Result<CgroupRemoval, TraitError> {
+        self.get()?.remove_recorded(id, placement, recorder)
+    }
 }
 
 /// 検出失敗のエラーを `code` だけ保って固定文言にする（パス・errno を出さない。ERR-2）。
@@ -169,6 +184,15 @@ impl ContainerCgroupRemover for UnavailableCgroupRemover {
         &self,
         _id: &ContainerId,
         _instance: StateRevision,
+    ) -> Result<CgroupRemoval, TraitError> {
+        Err(unavailable_cgroup())
+    }
+
+    fn remove_recorded(
+        &self,
+        _id: &ContainerId,
+        _placement: &CgroupPlacement,
+        _recorder: &OpRecorder,
     ) -> Result<CgroupRemoval, TraitError> {
         Err(unavailable_cgroup())
     }
@@ -316,6 +340,14 @@ mod tests {
             let e = UnavailableCgroupRemover
                 .remove(&id, StateRevision::from_raw(1))
                 .expect_err("remove");
+            assert_eq!(e.code(), ErrorCode::Unimplemented);
+            let placement = CgroupPlacement::new(
+                CgroupScope::new("/user.slice/x.scope").expect("scope"),
+                StateRevision::from_raw(1),
+            );
+            let e = UnavailableCgroupRemover
+                .remove_recorded(&id, &placement, &OpRecorder::new())
+                .expect_err("remove_recorded");
             assert_eq!(e.code(), ErrorCode::Unimplemented);
         }
     }
@@ -481,6 +513,8 @@ mod tests {
             scope: &'static str,
             remove_error: Mutex<Option<TraitError>>,
             calls: Mutex<Vec<(&'static str, u64)>>,
+            /// `remove_recorded` に渡された記録のスコープ。
+            recorded_scopes: Mutex<Vec<String>>,
         }
 
         impl Default for FakeCgroup {
@@ -489,6 +523,7 @@ mod tests {
                     scope: FAKE_SCOPE,
                     remove_error: Mutex::new(None),
                     calls: Mutex::new(Vec::new()),
+                    recorded_scopes: Mutex::new(Vec::new()),
                 }
             }
         }
@@ -529,6 +564,18 @@ mod tests {
             ) -> Result<CgroupRemoval, TraitError> {
                 self.finish("remove_with_recorder", instance)
             }
+            fn remove_recorded(
+                &self,
+                _id: &ContainerId,
+                placement: &CgroupPlacement,
+                _recorder: &OpRecorder,
+            ) -> Result<CgroupRemoval, TraitError> {
+                self.recorded_scopes
+                    .lock()
+                    .expect("lock")
+                    .push(placement.scope().as_str().to_owned());
+                self.finish("remove_recorded", placement.instance())
+            }
         }
 
         /// テストから内側のフェイクを観測するための共有ラッパー。
@@ -552,6 +599,14 @@ mod tests {
                 recorder: &OpRecorder,
             ) -> Result<CgroupRemoval, TraitError> {
                 self.0.remove_with_recorder(id, instance, recorder)
+            }
+            fn remove_recorded(
+                &self,
+                id: &ContainerId,
+                placement: &CgroupPlacement,
+                recorder: &OpRecorder,
+            ) -> Result<CgroupRemoval, TraitError> {
+                self.0.remove_recorded(id, placement, recorder)
             }
         }
 
@@ -620,12 +675,13 @@ mod tests {
             assert_eq!(e.code(), ErrorCode::NotFound);
         }
 
-        /// CORE-3: 記録とスコープが異なれば FAILED_PRECONDITION で、remove せず記録を残す。
+        /// OCI-6・CORE-3（#2096・#2060 案 B）: 記録とスコープが異なれば、記録の配置（スコープ・instance）で
+        /// `remove_recorded` が 1 回だけ呼ばれ、`remove*` は呼ばれずに状態記録が消える。
         #[test]
-        fn core3_delete_scope_mismatch_keeps_record() {
+        fn oci6_delete_scope_mismatch_removes_via_recorded_scope() {
             let base = TmpDir::new("del-mismatch");
             let st = store(&base);
-            create_placed(&base, &st, "c1");
+            let rev = create_placed(&base, &st, "c1");
             let fake = Arc::new(FakeCgroup {
                 scope: "/user.slice/other.scope",
                 ..FakeCgroup::default()
@@ -633,11 +689,41 @@ mod tests {
             let detects = Arc::new(AtomicUsize::new(0));
             let remover = counted(&fake, &detects);
             let req = build_delete_request(&delete_args("c1", false)).expect("req");
+            delete_container(&st, &OpRecorder::new(), &remover, &req).expect("delete");
+            assert_eq!(
+                *fake.calls.lock().expect("lock"),
+                vec![("remove_recorded", rev.value())]
+            );
+            assert_eq!(
+                *fake.recorded_scopes.lock().expect("lock"),
+                vec![FAKE_SCOPE.to_owned()]
+            );
+            let e = st.get(&GetStateRequest::new(id("c1"))).expect_err("gone");
+            assert_eq!(e.code(), ErrorCode::NotFound);
+        }
+
+        /// SEC-1（#2096）: 記録の経路が失敗したら同じ code（FAILED_PRECONDITION・exit 5）で失敗し、記録を残す。
+        #[test]
+        fn sec1_delete_recorded_scope_failure_keeps_record() {
+            let base = TmpDir::new("del-mismatch-fail");
+            let st = store(&base);
+            create_placed(&base, &st, "c1");
+            let fake = Arc::new(FakeCgroup {
+                scope: "/user.slice/other.scope",
+                ..FakeCgroup::default()
+            });
+            *fake.remove_error.lock().expect("lock") = Some(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "container cgroup is not empty or changed; retry",
+            ));
+            let detects = Arc::new(AtomicUsize::new(0));
+            let remover = counted(&fake, &detects);
+            let req = build_delete_request(&delete_args("c1", false)).expect("req");
             let e =
-                delete_container(&st, &OpRecorder::new(), &remover, &req).expect_err("mismatch");
+                delete_container(&st, &OpRecorder::new(), &remover, &req).expect_err("recorded");
             assert_eq!(e.code(), ErrorCode::FailedPrecondition);
             assert_eq!(e.exit_code().get(), 5);
-            assert!(fake.calls.lock().expect("lock").is_empty());
+            assert_eq!(fake.calls.lock().expect("lock").len(), 1);
             st.get(&GetStateRequest::new(id("c1"))).expect("kept");
         }
 
@@ -692,6 +778,17 @@ mod tests {
             );
             remover.scope().expect("scope");
             assert_eq!(detects.load(Ordering::SeqCst), 1);
+            let placement = CgroupPlacement::new(
+                CgroupScope::new("/user.slice/y.scope").expect("scope"),
+                StateRevision::from_raw(9),
+            );
+            remover
+                .remove_recorded(&id("c1"), &placement, &OpRecorder::new())
+                .expect("remove_recorded");
+            assert_eq!(
+                *fake.calls.lock().expect("lock"),
+                vec![("remove_with_recorder", 7), ("remove_recorded", 9)]
+            );
         }
 
         /// CLI-1: 検出失敗のエラーは code を保ち、文言は固定。

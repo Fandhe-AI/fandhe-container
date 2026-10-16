@@ -2,7 +2,8 @@
 # 監視プロセスの PSS 計測（make supervisor-pss。TASK-158・SUP-2。Linux 限定。bash のみで完結）。
 #
 # 実測は製品バイナリ（fandhe-container-supervisor）提供後に人間が #485（TASK-158.h1）で行う。`make ci` には含めない（実機前提）。
-# PID=<pid ...>（空白区切りで複数可）または COUNT=<N> のどちらか必須。起動は操作者が事前に行う（スクリプトは起動しない・sudo を呼ばない）。
+# PID=<pid ...>（空白区切りで複数可）または COUNT=<N> のどちらか必須。RUN_AS=<ログイン名>（supervisor を起動した利用者）も必須。起動は操作者が事前に
+# 対象の利用者のシェルで行い（スクリプトは起動しない・sudo を呼ばない）、計測だけを root で実行する（案 A。#2099・SUP-14）。
 # 任意: SAMPLES・INTERVAL・EXE_NAME・EXPECTED_DIR・OUTPUT。/proc の読み取りがハングし得るため timeout で包む（REPAIR-5）。
 # 秒数は SUPERVISOR_PSS_TIMEOUT（1〜999999・既定 300）。スクリプトの終了コード 0〜3 はそのまま返し、timeout 超過（124・137）と
 # 想定外の値は 3、起動不能（125〜127）は 2。SUPERVISOR_PSS_SCRIPT は selftest が配線を stub で照合するための差し替え口。
@@ -18,8 +19,12 @@ if [ -z "${PID:-}" ] && [ -z "${COUNT:-}" ]; then
   echo 'error: invalid-argument: PID="<pid> ..." or COUNT=<N> is required (see scripts/bench/supervisor_pss.sh --help)' >&2
   exit 2
 fi
+if [ -z "${RUN_AS:-}" ]; then
+  echo 'error: invalid-argument: RUN_AS=<login name of the user that launched the supervisors> is required (measure as root, launch as RUN_AS; see scripts/bench/supervisor_pss.sh --help)' >&2
+  exit 2
+fi
 require_timeout_cmd
-args=()
+args=(--run-as "${RUN_AS}")
 for p in ${PID:-}; do args+=(--pid "${p}"); done
 if [ -n "${COUNT:-}" ]; then args+=(--count "${COUNT}"); fi
 if [ -n "${SAMPLES:-}" ]; then args+=(--samples "${SAMPLES}"); fi

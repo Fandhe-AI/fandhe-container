@@ -39,6 +39,15 @@
 #   STUB_LAUNCHER_PSS: launcher 自身の Pss（既定 100）
 #   STUB_NO_SMAPS=1: smaps_rollup を書かない（読めない値の模擬）
 #   FAKE_PROC: 疑似 /proc のルート（設定時のみ疑似エントリを書く）
+#   案 A（#2099・SUP-14）の降格まわり（スタブの setpriv が `--` 以降を exec する。root は使わず、実効 uid は
+#   FANDHE_CONCURRENT_MEMORY_SELFTEST_EUID=0 で注入し、--run-as には実行中の利用者を渡す）:
+#   STUB_FAKE_ID=1: スタブ setpriv が降格後の `id -u/-g/-G` に 99999 を返す（降格の不一致の模擬）
+#   STUB_STATUS_UID: 疑似 /proc の supervisor の status に書く Uid（既定は実行中の uid。起動後の不一致の模擬）
+#   STUB_CGROUP: 疑似 /proc の supervisor の cgroup に書くパス（既定は期待どおりの user@<uid>.service 配下のスコープ）
+#   STUB_CGROUP_LEAK=1 と STUB_CGROUP_FS: スタブ systemd-run のスコープの cgroup ディレクトリを残す（残存報告の模擬）
+#   STUB_STATE_LOG: スタブ supervisor が受けた状態ルート（利用者所有の作業ディレクトリ配下）を追記するファイル
+#   STUB_SETPRIV_LOG / STUB_FD_LOG / STUB_ENV_DUMP: スタブの setpriv が受けた降格の引数、setpriv が受けた fd 3 以上、
+#     systemd-run が受けた環境変数の記録先
 
 set -euo pipefail
 
@@ -111,8 +120,13 @@ expect_has() { # <名前> <ファイル> <部分文字列>
 
 # 終了コード 4（init を記録できず追跡不能）の経路が残した状態ディレクトリ（stderr の "state kept at <path>"）を
 # 回収する。通知が無ければ失敗（4 の経路は残置を通知する契約。SUP-5）。
+rm_user_kept() { # stderr の "user state kept at <パス>"（利用者所有の作業ディレクトリ）を片付ける
+  local u
+  for u in $(sed -n 's/.*user state kept at \(\/tmp\/fandhe-concurrent-user\.[A-Za-z0-9]*\).*/\1/p' "$errf"); do rm -rf -- "$u"; done
+}
 reclaim_kept() { # <名前>
   local k
+  rm_user_kept
   k="$(sed -n 's/.*state kept at \(\/[^)]*\)).*/\1/p' "$errf" | head -n 1)"
   if [ -n "$k" ] && [ -d "$k" ]; then pass "$1-state-kept"; rm -rf -- "$k"; else fail "$1-state-kept"; fi
 }
@@ -134,12 +148,47 @@ STUB
 {
   printf '#!%s\n' "$bash_bin"
   cat <<'STUB'
-[ "$1" = --user ] && [ "$2" = --scope ] && [ "$3" = --quiet ] && [ "$4" = -p ] && [ "$5" = Delegate=yes ] && [ "$6" = -- ] || exit 2
-shift 6
+[ "$1" = --user ] && [ "$2" = --scope ] && [ "$3" = --quiet ] && [ "$4" = --collect ] && [ "${5#--unit=fc-bench-}" != "$5" ] && [ "$6" = -p ] && [ "$7" = Delegate=yes ] && [ "$8" = -- ] || exit 2
+unit="${5#--unit=}"
+if [ -n "${STUB_ENV_DUMP:-}" ]; then env | sort >"$STUB_ENV_DUMP.$$"; fi
+if [ -n "${STUB_CGROUP_LEAK:-}" ] && [ -n "${STUB_CGROUP_FS:-}" ]; then
+  u="$(id -u)"
+  mkdir -p "$STUB_CGROUP_FS/user.slice/user-$u.slice/user@$u.service/app.slice/$unit.scope"
+fi
+export STUB_UNIT="$unit"
+shift 8
 exec "$@"
 STUB
 } >"$work/systemd-run"
-chmod +x "$work/bin/fandhe-container" "$work/systemd-run"
+# スタブ setpriv（util-linux の setpriv の代役）。降格の引数を検証し、fd 3 以上の漏れを記録して `--` 以降を exec する（pid は変わらない）。
+{
+  printf '#!%s\n' "$bash_bin"
+  cat <<'STUB'
+[ "${1#--reuid=}" != "$1" ] && [ "${2#--regid=}" != "$2" ] && [ "$3" = --init-groups ] && [ "$4" = --inh-caps=-all ] && [ "$5" = --ambient-caps=-all ] && [ "$6" = -- ] || exit 2
+[ -z "${STUB_SETPRIV_LOG:-}" ] || echo "$1 $2 $3 $4 $5" >>"$STUB_SETPRIV_LOG"
+if [ -n "${STUB_FD_LOG:-}" ]; then
+  fds=""
+  for n in $(seq 3 40); do [ ! -e "/proc/$$/fd/$n" ] || fds="$fds $n"; done
+  echo "fds:$fds" >>"$STUB_FD_LOG"
+fi
+shift 6
+if [ -n "${STUB_FAKE_ID:-}" ] && [ "${*: -2:1}" = id ]; then echo 99999; exit 0; fi
+exec "$@"
+STUB
+} >"$work/setpriv"
+chmod +x "$work/bin/fandhe-container" "$work/systemd-run" "$work/setpriv"
+
+# 案 A: 実効 uid の注入・user マネージャの bus・cgroupfs の差し替え（いずれも root 不要。FANDHE_CONCURRENT_MEMORY_SELFTEST=1 のときだけ有効）。
+ra_name="$(id -un)"
+ra=(--run-as "$ra_name" --setpriv "$work/setpriv")
+mkdir -p "$work/rt" "$work/cgfs"
+chmod 700 "$work/rt"
+python3 -I -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])' "$work/rt/bus" || { echo "FAIL: selftest requires python3 (AF_UNIX bind)" >&2; exit 1; }
+export FANDHE_CONCURRENT_MEMORY_SELFTEST_EUID=0
+export FANDHE_CONCURRENT_MEMORY_SELFTEST_RUNTIME_DIR="$work/rt"
+export FANDHE_CONCURRENT_MEMORY_SELFTEST_CGROUP_FS="$work/cgfs"
+# 実 /proc 上のスタブには systemd のスコープが無いため、cgroup の照合は疑似 /proc を使う run_fake だけで行う。
+export FANDHE_CONCURRENT_MEMORY_SELFTEST_SCOPE_CHECK=off
 {
   printf '#!%s\n' "$bash_bin"
   cat <<'STUB'
@@ -148,6 +197,7 @@ chmod +x "$work/bin/fandhe-container" "$work/systemd-run"
 [ "$1" = start ] && [ "$2" = --root ] && [ "$#" -eq 4 ] || exit 2
 id="${!#}"
 [ -f "$3/$id/state.json" ] || exit 2
+[ -z "${STUB_STATE_LOG:-}" ] || echo "$3" >>"$STUB_STATE_LOG"
 if [ ! -p /dev/stdout ]; then echo "FCSUP1 ERR INVALID_ARGUMENT 2 stdout is not a fifo"; exit 2; fi
 rest="${id#*-}"; rest="${rest#*-}"      # <trial>-<i>
 trial="${rest%%-*}"; idx="${rest##*-}"
@@ -217,6 +267,14 @@ if [ -n "${FAKE_PROC:-}" ] && [ "$mode" != "hang" ]; then
   }
   [ -z "$child" ] || mk "$child" "$v"
   mk "$$" "$lp"
+  # 案 A の検証対象（supervisor 自身）: 降格後の Uid・Gid・Groups と、user マネージャのスコープへ入った cgroup を疑似 /proc へ書く。
+  su="$(id -u)"
+  {
+    printf 'Uid:\t%s\t%s\t%s\t%s\n' "${STUB_STATUS_UID:-$su}" "${STUB_STATUS_UID:-$su}" "${STUB_STATUS_UID:-$su}" "${STUB_STATUS_UID:-$su}"
+    printf 'Gid:\t%s\t%s\t%s\t%s\n' "$(id -g)" "$(id -g)" "$(id -g)" "$(id -g)"
+    printf 'Groups:\t%s \n' "$(id -G)"
+  } >>"$FAKE_PROC/$$/status"
+  printf '0::%s\n' "${STUB_CGROUP:-/user.slice/user-$su.slice/user@$su.service/app.slice/${STUB_UNIT:-none}.scope${STUB_CGROUP_SUFFIX:-}}" >"$FAKE_PROC/$$/cgroup"
   [ -z "$child" ] || printf '%s \n' "$child" >"$FAKE_PROC/$$/task/$$/children"
   if [ -n "${STUB_GHOST:-}" ]; then
     # 実プロセスのない pid を木へ加える（起動時刻を記録できず、トークンも持たない = 帰属を証明できない）。
@@ -295,11 +353,12 @@ run_wrap=()
 run_target() {
   rc=0
   : >"$out"; : >"$errf"
-  "${run_wrap[@]}" "$bash_bin" "$target" --bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/bundle" --target own --settle 0 "$@" >"$out" 2>"$errf" || rc=$?
+  FANDHE_CONCURRENT_MEMORY_SELFTEST=1 "${run_wrap[@]}" "$bash_bin" "$target" --bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/bundle" --target own "${ra[@]}" --settle 0 "$@" >"$out" 2>"$errf" || rc=$?
+  [ -n "${NO_RM_USER_KEPT:-}" ] || rm_user_kept
 }
 run_fake() { # 疑似 /proc を使う（メモリ値の具体照合）
   rm -rf "$work/fake"; mkdir -p "$work/fake"
-  FAKE_PROC="$work/fake" FANDHE_CONCURRENT_MEMORY_SELFTEST=1 run_target --proc-root "$work/fake" "$@"
+  FAKE_PROC="$work/fake" FANDHE_CONCURRENT_MEMORY_SELFTEST=1 FANDHE_CONCURRENT_MEMORY_SELFTEST_SCOPE_CHECK=on run_target --proc-root "$work/fake" "$@"
 }
 # SIGKILL 直後はカーネルが終了処理中のことがあるため、孤児 sleep の残数は最大 3 秒ポーリングして 0 を待つ。
 # 数えるのはスタブが記録した pid（起動時刻一致）だけで、ホスト上の無関係な sleep 300 は数えない。
@@ -640,7 +699,7 @@ expect_eq "stale-start-test-cleanup" 0 "$(alive_stub_count)"
 #          SIGTERM を無視する launcher の終了待ち中に再送しても、launcher・子を残さない） ---
 : >"$STUB_PIDFILE"
 : >"$out"; : >"$errf"
-STUB_MODE=ignoreterm STUB_NO_READY=1 "$bash_bin" "$target" --bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/bundle" --target own \
+STUB_MODE=ignoreterm STUB_NO_READY=1 FANDHE_CONCURRENT_MEMORY_SELFTEST=1 "$bash_bin" "$target" --bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/bundle" --target own "${ra[@]}" \
   --count 2 --trials 1 --timeout 20 >"$out" 2>"$errf" &
 sig_pid=$!
 for _ in $(seq 1 50); do [ "$(wc -l <"$STUB_PIDFILE")" -lt 2 ] || break; sleep 0.2; done
@@ -666,7 +725,7 @@ expect_eq "resignal-no-orphan-child" 0 "$(orphan_sleep_count)"
 # --- 12k2. init を報告・記録した後の中断は従来どおり 143（init を記録して回収できた経路。状態は削除される） ---
 : >"$STUB_PIDFILE"
 : >"$out"; : >"$errf"
-"$bash_bin" "$target" --bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/bundle" --target own \
+FANDHE_CONCURRENT_MEMORY_SELFTEST=1 "$bash_bin" "$target" --bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/bundle" --target own "${ra[@]}" \
   --count 2 --trials 1 --settle 30 --timeout 20 >"$out" 2>"$errf" &
 sig_pid=$!
 for _ in $(seq 1 50); do [ "$(wc -l <"$STUB_PIDFILE")" -lt 2 ] || break; sleep 0.2; done
@@ -724,6 +783,140 @@ for b in bundle-abs bundle-dotdot bundle-nonstring bundle-symlink; do
   expect_eq "root-path-${b}-no-residual" 0 "$(alive_stub_count)"
 done
 
+# ==========================================================================================
+# 案 A: 計測だけを root で行い、create・systemd-run・supervisor の起動は --run-as の利用者へ降格する（#2099・SUP-2・CORE-9・SUP-14）。
+# 実 root は使わない。実効 uid は FANDHE_CONCURRENT_MEMORY_SELFTEST_EUID で注入し、降格はスタブ setpriv（pid を変えずに exec）で模す。
+# ==========================================================================================
+
+# --- 12p. 非 root での実行は前提欠如（exit 3）。降格コマンドも supervisor も起動しない ---
+: >"$work/setpriv.log"
+STUB_SETPRIV_LOG="$work/setpriv.log" FANDHE_CONCURRENT_MEMORY_SELFTEST_EUID=1000 run_target --count 2 --trials 1
+expect_eq "nonroot-exit3" 3 "$rc"
+expect_has "nonroot-stderr" "$errf" "unsupported-os: --mode own must run as root"
+expect_eq "nonroot-stdout-empty" 0 "$(wc -c <"$out")"
+expect_eq "nonroot-setpriv-not-called" 0 "$(wc -c <"$work/setpriv.log")"
+expect_eq "nonroot-no-residual" 0 "$(alive_stub_count)"
+
+# --- 12q. --run-as の欠如・uid 0・不正な名前・存在しない利用者は exit 2（fail-closed。降格コマンドを呼ばない） ---
+run_target --count 2 --trials 1 --run-as root
+expect_eq "run-as-root-exit2" 2 "$rc"
+expect_has "run-as-root-stderr" "$errf" "invalid-argument: --run-as must resolve to a non-root user (uid 0 refused)"
+rc=0
+FANDHE_CONCURRENT_MEMORY_SELFTEST=1 "$bash_bin" "$target" --bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/bundle" --target own --count 2 --trials 1 --setpriv "$work/setpriv" >"$out" 2>"$errf" || rc=$?
+expect_eq "run-as-missing-exit2" 2 "$rc"
+expect_has "run-as-missing-stderr" "$errf" "--run-as is required"
+run_target --count 2 --trials 1 --run-as 'Bad;name'
+expect_eq "run-as-badname-exit2" 2 "$rc"
+run_target --count 2 --trials 1 --run-as no_such_user_2099
+expect_eq "run-as-unknown-exit2" 2 "$rc"
+expect_has "run-as-unknown-stderr" "$errf" "--run-as user was not found"
+run_target --count 2 --trials 1 --setpriv relative/setpriv
+expect_eq "setpriv-relative-exit2" 2 "$rc"
+rc=0
+"$bash_bin" "$target" --mode docker --docker /bin/true --target docker --run-as "$ra_name" >"$out" 2>"$errf" || rc=$?
+expect_eq "run-as-with-docker-mode-exit2" 2 "$rc"
+
+# --- 12r. user マネージャの bus が無ければ exit 3（linger なし等。supervisor は 1 つも起動しない） ---
+FANDHE_CONCURRENT_MEMORY_SELFTEST_RUNTIME_DIR="$work/no-such-rt" run_target --count 2 --trials 1
+expect_eq "no-bus-exit3" 3 "$rc"
+expect_has "no-bus-stderr" "$errf" "user manager bus for uid"
+expect_eq "no-bus-no-residual" 0 "$(alive_stub_count)"
+
+# --- 12s. 降格の不一致（降格した id が passwd と違う）は起動前に exit 3 ---
+STUB_FAKE_ID=1 run_target --count 2 --trials 1
+expect_eq "demotion-probe-mismatch-exit3" 3 "$rc"
+expect_has "demotion-probe-mismatch-stderr" "$errf" "demotion-mismatch"
+expect_eq "demotion-probe-mismatch-stdout-empty" 0 "$(wc -c <"$out")"
+expect_eq "demotion-probe-mismatch-no-residual" 0 "$(alive_stub_count)"
+
+# --- 12t. 起動後の Uid の不一致（降格できていない supervisor）は exit 1・結果は公開せず、後始末は完了する ---
+STUB_STATUS_UID=99999 run_fake --count 2 --trials 1
+expect_eq "status-uid-mismatch-exit1" 1 "$rc"
+expect_has "status-uid-mismatch-stderr" "$errf" "reason=demotion-mismatch"
+expect_eq "status-uid-mismatch-stdout-empty" 0 "$(wc -c <"$out")"
+expect_eq "status-uid-mismatch-no-residual" 0 "$(alive_stub_count)"
+
+# --- 12u. cgroup が user マネージャの委譲スコープでなければ exit 1（system.slice・root の user@0.service・別名のスコープ） ---
+for cg in "/system.slice/run-x.scope" "/user.slice/user-0.slice/user@0.service/app.slice/x.scope" "/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice/other.scope"; do
+  STUB_CGROUP="$cg" run_fake --count 2 --trials 1
+  expect_eq "scope-mismatch-exit1" 1 "$rc"
+  expect_has "scope-mismatch-stderr" "$errf" "reason=scope-mismatch"
+  expect_eq "scope-mismatch-no-residual" 0 "$(alive_stub_count)"
+done
+# supervisor が退避リーフ（fc-runtime）へ移った場合は受け入れる
+STUB_CGROUP_SUFFIX="/fc-runtime" run_fake --count 2 --trials 1
+expect_eq "scope-fc-runtime-leaf-exit0" 0 "$rc"
+
+# --- 12v. 環境変数は許可リストだけを降格後へ渡す（root の HOME・PATH・秘密情報を持ち込まない） ---
+rm -f "$work"/envdump.*
+SECRET_SENTINEL=leak-me HOME=/nonexistent-root-home PATH="$PATH:/opt/extra-root-path" STUB_ENV_DUMP="$work/envdump" run_target --count 2 --trials 1
+expect_eq "env-allowlist-exit0" 0 "$rc"
+envfile="$(ls "$work"/envdump.* 2>/dev/null | head -n 1)"
+if [ -n "$envfile" ]; then
+  keys="$(sed 's/=.*//' "$envfile" | grep -vxE 'PWD|SHLVL|_|OLDPWD' | grep -vE '^(STUB_|FAKE_PROC$)' | sort | tr '\n' ' ')"
+  expect_eq "env-allowlist-keys" "DBUS_SESSION_BUS_ADDRESS FANDHE_BENCH_OWNER HOME LOGNAME PATH USER XDG_RUNTIME_DIR " "$keys"
+  expect_eq "env-allowlist-home" "HOME=$(getent passwd "$ra_name" | cut -d: -f6)" "$(grep '^HOME=' "$envfile")"
+  expect_eq "env-allowlist-path" "PATH=/usr/bin:/bin" "$(grep '^PATH=' "$envfile")"
+  expect_eq "env-allowlist-user" "USER=$ra_name" "$(grep '^USER=' "$envfile")"
+  expect_eq "env-allowlist-xdg" "XDG_RUNTIME_DIR=$work/rt" "$(grep '^XDG_RUNTIME_DIR=' "$envfile")"
+  expect_eq "env-allowlist-dbus" "DBUS_SESSION_BUS_ADDRESS=unix:path=$work/rt/bus" "$(grep '^DBUS_SESSION_BUS_ADDRESS=' "$envfile")"
+  expect_eq "env-allowlist-no-secret" 0 "$(grep -c 'SECRET_SENTINEL\|nonexistent-root-home\|extra-root-path' "$envfile" || true)"
+else
+  fail "env-allowlist-dump-missing"
+fi
+rm -f "$work"/envdump.*
+
+# --- 12w. root が開いた fd（3 以上）を降格後へ漏らさない ---
+: >"$work/fd.log"
+exec 7>"$work/fd7"
+STUB_FD_LOG="$work/fd.log" run_target --count 2 --trials 1
+exec 7>&-
+expect_eq "fd-leak-exit0" 0 "$rc"
+expect_eq "fd-leak-setpriv-calls-recorded" "true" "$([ "$(wc -l <"$work/fd.log")" -ge 4 ] && echo true || echo false)"
+expect_eq "fd-leak-none" 0 "$(grep -vxc 'fds:' "$work/fd.log" || true)"
+
+# --- 12x. 降格の引数（reuid・regid・init-groups・capability の消去）と、状態ルートが利用者の作業ディレクトリ配下であること ---
+: >"$work/setpriv.log"
+: >"$work/state.log"
+STUB_SETPRIV_LOG="$work/setpriv.log" STUB_STATE_LOG="$work/state.log" run_target --count 2 --trials 1
+expect_eq "demote-args-exit0" 0 "$rc"
+expect_has "demote-args-logged" "$work/setpriv.log" "--reuid=$(id -u) --regid=$(id -g) --init-groups --inh-caps=-all --ambient-caps=-all"
+state_root="$(head -n 1 "$work/state.log")"
+case "$state_root" in /tmp/fandhe-concurrent-user.*/state) pass "user-state-root-under-user-tmp" ;; *) fail "user-state-root-under-user-tmp (actual=$state_root)" ;; esac
+if [ -e "$(dirname "$state_root")" ]; then fail "user-tmp-removed-after-success"; else pass "user-tmp-removed-after-success"; fi
+
+# --- 12y. 中断（TERM）でも利用者の作業ディレクトリ・supervisor を回収する（143） ---
+: >"$STUB_PIDFILE"
+: >"$work/state.log"
+: >"$out"; : >"$errf"
+STUB_STATE_LOG="$work/state.log" FANDHE_CONCURRENT_MEMORY_SELFTEST=1 "$bash_bin" "$target" --bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/bundle" --target own "${ra[@]}" \
+  --count 2 --trials 1 --settle 30 --timeout 20 >"$out" 2>"$errf" &
+sig_pid=$!
+for _ in $(seq 1 50); do [ "$(wc -l <"$STUB_PIDFILE")" -lt 2 ] || break; sleep 0.2; done
+sleep 2
+kill -TERM "$sig_pid"
+r=0
+wait "$sig_pid" || r=$?
+expect_eq "interrupt-user-tmp-exit143" 143 "$r"
+state_root="$(head -n 1 "$work/state.log")"
+if [ -n "$state_root" ] && [ ! -e "$(dirname "$state_root")" ]; then pass "interrupt-user-tmp-removed"; else fail "interrupt-user-tmp-removed (state_root=$state_root)"; rm -rf -- "$(dirname "${state_root:-/nonexistent}")"; fi
+expect_eq "interrupt-user-tmp-no-residual" 0 "$(alive_stub_count)"
+
+# --- 12z. スコープの cgroup が残れば識別子つきで報告して exit 4 ---
+STUB_CGROUP_LEAK=1 STUB_CGROUP_FS="$work/cgfs" run_fake --count 2 --trials 1
+expect_eq "scope-leak-exit4" 4 "$rc"
+expect_has "scope-leak-stderr" "$errf" "cleanup-failed: scopes still present: fc-bench-"
+expect_eq "scope-leak-no-residual" 0 "$(alive_stub_count)"
+rm -rf -- "$work/cgfs/user.slice"
+
+# --- 12za. 利用者の領域に root 所有のファイルが残れば、削除せず識別子（パス）つきで報告して exit 4 ---
+# （自己テストでは root 所有ファイルを作れないため、検査対象の uid を実行中の uid に差し替えて、検出経路を決定的に通す）
+NO_RM_USER_KEPT=1 FANDHE_CONCURRENT_MEMORY_SELFTEST_ROOT_UID="$(id -u)" run_target --count 2 --trials 1
+expect_eq "root-owned-leftover-exit4" 4 "$rc"
+expect_has "root-owned-leftover-stderr" "$errf" "cleanup-failed: root-owned files remain under the user work directory"
+kept_user="$(sed -n 's/.*user state kept at \(\/tmp\/fandhe-concurrent-user\.[A-Za-z0-9]*\).*/\1/p' "$errf" | head -n 1)"
+if [ -n "$kept_user" ] && [ -d "$kept_user" ]; then pass "root-owned-leftover-kept"; rm -rf -- "$kept_user"; else fail "root-owned-leftover-kept"; fi
+
 # --- 13. 引数エラーは exit 2 ---
 expect_rc2() { # <名前> <引数...>
   local name="$1"; shift
@@ -731,7 +924,7 @@ expect_rc2() { # <名前> <引数...>
   "$bash_bin" "$target" "$@" >/dev/null 2>&1 || r=$?
   expect_eq "$name" 2 "$r"
 }
-base=(--bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/bundle" --target own)
+base=(--bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/bundle" --target own "${ra[@]}")
 expect_rc2 "arg-relative-bin-dir" --bin-dir bin --bundle "$work/bundle" --target own
 expect_rc2 "arg-legacy-launcher" --launcher "$stub" --bundle "$work/bundle" --target own
 expect_rc2 "arg-bin-dir-missing-supervisor" --bin-dir "$work" --bundle "$work/bundle" --target own

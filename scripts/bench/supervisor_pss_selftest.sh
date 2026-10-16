@@ -9,6 +9,10 @@
 set -euo pipefail
 
 export FANDHE_SUPERVISOR_PSS_SELFTEST=1
+# 案 A（#2099）: 計測スクリプトは root 必須。実効 uid は注入で 0 とみなし、--run-as には実行中の利用者を渡す（root 不要）。
+export FANDHE_SUPERVISOR_PSS_SELFTEST_EUID=0
+ra_name="$(id -un)"
+ra_uid="$(id -u)"
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 target="${script_dir}/supervisor_pss.sh"
@@ -31,6 +35,7 @@ pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1" >&2; failures=$((failures + 1)); }
 
 # 疑似プロセスを作る。引数: <proc-root> <pid> <argv0> <pss> <rss> [exe] [comm]
+# 環境変数 MK_UID / MK_CGROUP で、status の Uid 4 値と cgroup の 0:: 行を差し替える（既定は --run-as の利用者の委譲スコープ）。
 mkproc() {
   local d="$1/$2" exe="${6:-$3}"
   mkdir -p "$d"
@@ -38,7 +43,9 @@ mkproc() {
   printf '%s\0--flag\0' "$3" >"$d/cmdline"
   printf '%s\n' "${7:-${3##*/}}" >"$d/comm"
   printf 'Rss: 1 kB\nPss: %s kB\n' "$4" >"$d/smaps_rollup"
-  printf 'Name: x\nPPid:\t1000\nVmRSS: %s kB\n' "$5" >"$d/status"
+  local u="${MK_UID:-$ra_uid}"
+  printf 'Name: x\nPPid:\t1000\nVmRSS: %s kB\nUid:\t%s\t%s\t%s\t%s\n' "$5" "$u" "$u" "$u" "$u" >"$d/status"
+  printf '0::%s\n' "${MK_CGROUP:-/user.slice/user-${ra_uid}.slice/user@${ra_uid}.service/app.slice/run-r1.scope}" >"$d/cgroup"
 }
 
 # 期待 exit コードと stdout の部分一致を照合する。引数: <名前> <期待exit> <期待文字列(空可)> <args...>
@@ -46,7 +53,7 @@ check() {
   local name="$1" want="$2" needle="$3"
   shift 3
   local out actual=0
-  out="$(bash "$target" "$@" 2>/dev/null)" || actual=$?
+  out="$(bash "$target" --run-as "$ra_name" "$@" 2>/dev/null)" || actual=$?
   if [ "$actual" -ne "$want" ]; then
     fail "${name} (expected exit=${want}, actual=${actual})"
   elif [ -n "$needle" ] && ! grep -qF -- "$needle" <<<"$out"; then
@@ -138,7 +145,7 @@ mkproc "$unread" 830 "$sup" 5 1
 chmod 000 "$unread/830/smaps_rollup"
 check "smaps-unreadable" 3 "" --proc-root "$unread" --count 1
 # 読めない原因（supervisor の dumpable=0。SUP-14）を標準エラーで案内する
-unread_err="$(bash "$target" --proc-root "$unread" --count 1 2>&1 >/dev/null || true)"
+unread_err="$(bash "$target" --run-as "$ra_name" --proc-root "$unread" --count 1 2>&1 >/dev/null || true)"
 if grep -q 'dumpable flag; read it from a privileged shell' <<<"$unread_err"; then pass "smaps-unreadable-hint"; else fail "smaps-unreadable-hint (missing dumpable guidance)"; fi
 chmod 600 "$unread/830/smaps_rollup"
 
@@ -155,6 +162,32 @@ check "bad-exe-name" 2 "" --proc-root "$one" --pid 300 --exe-name bash
 check "bad-format" 2 "" --proc-root "$one" --pid 300 --format xml
 check "unknown-arg" 2 "" --bogus
 check "help" 0 "SUP-2" --help
+
+# 7b. 案 A: root で計測し、測定対象が --run-as の利用者の委譲スコープであることを確かめる（#2099・SUP-14）
+rc_out=0
+FANDHE_SUPERVISOR_PSS_SELFTEST_EUID=1000 bash "$target" --run-as "$ra_name" --proc-root "$one" --pid 300 >/dev/null 2>"${root}/err.txt" || rc_out=$?
+if [ "$rc_out" -eq 2 ] && grep -qF 'unsupported-os: must run as root' "${root}/err.txt"; then pass "nonroot-refused"; else fail "nonroot-refused (exit=${rc_out})"; fi
+rc_out=0
+bash "$target" --proc-root "$one" --pid 300 >/dev/null 2>"${root}/err.txt" || rc_out=$?
+if [ "$rc_out" -eq 2 ] && grep -qF -- '--run-as is required' "${root}/err.txt"; then pass "run-as-required"; else fail "run-as-required (exit=${rc_out})"; fi
+rc_out=0
+bash "$target" --run-as root --proc-root "$one" --pid 300 >/dev/null 2>"${root}/err.txt" || rc_out=$?
+if [ "$rc_out" -eq 2 ] && grep -qF 'uid 0 refused' "${root}/err.txt"; then pass "run-as-root-refused"; else fail "run-as-root-refused (exit=${rc_out})"; fi
+check "run-as-bad-name" 2 "" --run-as 'Bad;name' --proc-root "$one" --pid 300
+check "run-as-unknown-user" 2 "" --run-as no_such_user_2099 --proc-root "$one" --pid 300
+uidbad="${root}/uidbad"
+MK_UID=99999 mkproc "$uidbad" 900 "$sup" 600 1
+check "owner-uid-mismatch" 3 "" --proc-root "$uidbad" --pid 900
+check "owner-uid-mismatch-count" 3 "" --proc-root "$uidbad" --count 1
+cgbad="${root}/cgbad"
+MK_CGROUP=/system.slice/run-x.scope mkproc "$cgbad" 910 "$sup" 600 1
+check "owner-cgroup-system-slice" 3 "" --proc-root "$cgbad" --pid 910
+cgroot="${root}/cgroot"
+MK_CGROUP=/user.slice/user-0.slice/user@0.service/app.slice/run-r1.scope mkproc "$cgroot" 920 "$sup" 600 1
+check "owner-cgroup-root-manager" 3 "" --proc-root "$cgroot" --pid 920
+cgleaf="${root}/cgleaf"
+MK_CGROUP="/user.slice/user-${ra_uid}.slice/user@${ra_uid}.service/app.slice/run-r1.scope/fc-runtime" mkproc "$cgleaf" 930 "$sup" 600 1
+check "owner-cgroup-fc-runtime-leaf" 0 "pss_kb=600" --proc-root "$cgleaf" --pid 930
 
 # 8. selftest ゲートと OS 判定
 gate_out=0

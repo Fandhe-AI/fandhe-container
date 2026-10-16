@@ -12,18 +12,24 @@
 #
 # 現状（REPAIR-3）: 製品バイナリ fandhe-container-supervisor は提供済み（#1717・#1819）で、--exe-name の既定値は
 # crates/supervisor/src/launcher.rs の SUPERVISOR_FILE_NAME と一致する。実測は #485 で人間が行う（本スクリプトは起動をしない）。
-# 権限（重要）: supervisor は入口で PR_SET_DUMPABLE=0 にする（SUP-14）ため、同じ利用者の非 root からも
-# /proc/<pid>/exe・smaps_rollup を読めない。計測は root（init user namespace の CAP_SYS_PTRACE を持つ権限付きシェル）から行い、
-# supervisor 自体は非 root の利用者が別のシェルで起動したままにしておく（supervisor は rootful 起動を拒否する。SEC-5）。
-# 起動の手順（create → systemd-run → start）は docs/verification/supervisor-measurement-runbook.md を参照。
+# 権限（案 A。#2090 のオーナー決定・#2099・SUP-14）: supervisor は入口で PR_SET_DUMPABLE=0 にする（SUP-14）ため、同じ利用者の
+# 非 root からも /proc/<pid>/exe・smaps_rollup を読めない。一方 supervisor は rootful 起動を拒否する（SEC-5）。このため
+# 本スクリプトは root（init user namespace の CAP_SYS_PTRACE を持つ権限付きシェル）で動かし、root で行うのは計測
+# （/proc の読み取り）だけにする。supervisor の起動（create → systemd-run → start）は --run-as の利用者のシェルが行い、
+# 本スクリプトは起動しない。非 root での実行は終了コード 2（fail-closed）。--run-as（必須）は測定対象の取り違えを防ぐ
+# 検証に使う: 各対象の /proc/<pid>/status の Uid（4 値すべて）がその利用者であり、cgroup（0:: 行）が
+# user@<uid>.service 配下の .scope（systemd-run --user --scope の委譲スコープ。退避リーフ配下を含む）であること。
+# 違えば終了コード 3（root 所有の supervisor・別の利用者のプロセスの PSS を成功として公開しない）。
+# 起動の手順は docs/verification/supervisor-measurement-runbook.md を参照。
 # 読めない場合は終了コード 3 で、メッセージに dumpable の旨を足す。「監視プロセス」に runtime 側の補助プロセスを含めるか
 # （PoC-17 の N=1 は supervisor 単体 + runtime-proto 単体の合算）は判定側の解釈事項で、本スクリプトは exe 名 1 種の
 # 集計に留める。必要なら --exe-name を変えて複数回計測する。
 #
 # 使い方:
-#   supervisor_pss.sh --pid <pid> [--pid <pid>]... [共通オプション]   # PID 指定モード
-#   supervisor_pss.sh --count <N> [共通オプション]                    # 按分モード（N 個検出が必須）
+#   supervisor_pss.sh --run-as <ログイン名> --pid <pid> [--pid <pid>]... [共通オプション]   # PID 指定モード
+#   supervisor_pss.sh --run-as <ログイン名> --count <N> [共通オプション]                    # 按分モード（N 個検出が必須）
 # 共通オプション:
+#   --run-as: 必須。supervisor を起動した非 root の利用者（uid 0 に解決されたら終了コード 2）。上の「権限」を参照。
 #   [--samples K] [--interval SECS] [--exe-name NAME] [--expected-dir <dir>]...
 #   [--format text|json] [--output <file>] [--help]
 #   --samples K（1〜100・既定 1）: K 回走査する。サンプル間で対象 pid 集合が変わったら計測失敗。
@@ -50,9 +56,10 @@
 # 終了コード:
 #   0 = 計測成功
 #   1 = 未使用（set -e の暗黙終了で 1 を返さないよう失敗しうる操作は明示分岐する）
-#   2 = 引数・入力エラー、非 Linux（unsupported-os。0 を返して合格に見せない）、出力先エラー
+#   2 = 引数・入力エラー（--run-as の欠如・不正な名前・uid 0 を含む）、非 root での実行、非 Linux（unsupported-os。
+#       0 を返して合格に見せない）、出力先エラー
 #   3 = 計測失敗（発見数 != N、exe 不一致、PSS が 0・欠落・非数値・読めない、pid 消滅が収束しない、
-#       サンプル間で pid 集合が変化）。0 として足さず fail-closed
+#       サンプル間で pid 集合が変化、対象の Uid・cgroup が --run-as の利用者の委譲スコープでない）。0 として足さず fail-closed
 #
 # 前提・既知の制約:
 #   - Linux 限定（smaps_rollup はカーネル 4.14 以降）。スクリプト内で sudo は呼ばない
@@ -93,6 +100,8 @@ check_range() {
 }
 
 format="text"
+run_as=""
+ra_uid=""
 output=""
 proc_root=""
 proc_root_given=0
@@ -107,6 +116,7 @@ need_value() { [ "$1" -ge 2 ] || { err "invalid-argument" "$2 requires a value";
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --run-as) need_value $# --run-as; run_as="$2"; shift 2 ;;
     --pid) need_value $# --pid; pids+=("$2"); shift 2 ;;
     --count) need_value $# --count; count="$2"; shift 2 ;;
     --samples) need_value $# --samples; samples="$2"; shift 2 ;;
@@ -195,6 +205,28 @@ if [ ! -d "$proc_root" ]; then
   exit 2
 fi
 
+# --run-as（supervisor を起動した利用者）を passwd から解決する。名前は許可リストで検証してから getent へ渡す。uid 0 は拒否。
+[[ "$run_as" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { err "invalid-argument" "--run-as is required (login name matching ^[a-z_][a-z0-9_-]{0,31}\$)"; exit 2; }
+command -v getent >/dev/null 2>&1 || { err "unsupported-os" "getent is required"; exit 2; }
+ra_line="$(getent passwd -- "$run_as" 2>/dev/null | head -n 1)" || ra_line=""
+[ -n "$ra_line" ] || { err "invalid-argument" "--run-as user was not found"; exit 2; }
+IFS=: read -ra ra_fields <<<"$ra_line"
+ra_uid="${ra_fields[2]:-}"
+[[ "$ra_uid" =~ $num_re ]] || { err "invalid-argument" "--run-as user has a malformed passwd entry"; exit 2; }
+if [ "$ra_uid" -eq 0 ]; then
+  err "invalid-argument" "--run-as must resolve to a non-root user (uid 0 refused)"
+  exit 2
+fi
+# 計測は root で行う（supervisor は dumpable=0 のため非 root からは smaps_rollup を読めない）。非 root は読む前に止める。
+euid="$(id -u)"
+if [ "${FANDHE_SUPERVISOR_PSS_SELFTEST:-}" = "1" ] && [ -n "${FANDHE_SUPERVISOR_PSS_SELFTEST_EUID:-}" ]; then
+  euid="$FANDHE_SUPERVISOR_PSS_SELFTEST_EUID"
+fi
+if [ "$euid" -ne 0 ]; then
+  err "unsupported-os" "must run as root (the supervisor clears dumpable; launch it as --run-as user and measure as root, see the runbook)"
+  exit 2
+fi
+
 if [ -n "$output" ]; then
   case "$output" in
     -*) err "invalid-argument" "output path must not start with '-'"; exit 2 ;;
@@ -224,10 +256,40 @@ comm_claims_name() {
   [[ "$1" =~ $name_re ]] || [ "$1" = "fandhe-containe" ]
 }
 
+# 対象が --run-as の利用者の user マネージャの委譲スコープで動いていることを確かめる（案 A）。status の Uid（real・effective・
+# saved・fs の 4 値）が対象の uid で、cgroup（0:: 行）が user@<uid>.service 配下の .scope であること。違えば終了コード 3。
+# 戻り値: 0 = 一致 / 10 = pid 消滅（走査やり直し）。
+verify_owner() { # <dir> <pid>
+  local dir="$1" pid="$2" line a b c d seen=0 cg="" re
+  while IFS= read -r line; do
+    case "$line" in
+      Uid:*)
+        read -r _ a b c d <<<"$line" || true
+        seen=1
+        if ! { [ "$a" = "$ra_uid" ] && [ "$b" = "$ra_uid" ] && [ "$c" = "$ra_uid" ] && [ "$d" = "$ra_uid" ]; }; then
+          err "measurement-failed" "pid ${pid} does not run as the --run-as user (uid mismatch)"
+          exit 3
+        fi
+        ;;
+    esac
+  done 2>/dev/null <"$dir/status" || { [ -d "$dir" ] || return 10; err "measurement-failed" "cannot read status of pid ${pid}"; exit 3; }
+  [ "$seen" -eq 1 ] || { err "measurement-failed" "pid ${pid} status has no Uid line"; exit 3; }
+  while IFS= read -r line; do
+    case "$line" in 0::*) cg="$line" ;; esac
+  done 2>/dev/null <"$dir/cgroup" || { [ -d "$dir" ] || return 10; err "measurement-failed" "cannot read cgroup of pid ${pid}"; exit 3; }
+  re="^0::/user\.slice/user-${ra_uid}\.slice/user@${ra_uid}\.service/(.+/)?[^/]+\.scope(/.*)?\$"
+  if ! [[ "$cg" =~ $re ]]; then
+    err "measurement-failed" "pid ${pid} is not in a delegated scope of the --run-as user manager (user@${ra_uid}.service)"
+    exit 3
+  fi
+  return 0
+}
+
 # 対象 1 件の PSS / RSS を読んで records へ足す。0・欠落・非数値・読めない値は計測失敗（過小計上の防止）。
 # 戻り値: 0 = 追加 / 10 = pid 消滅（走査やり直し）。
 add_record() {
   local dir="$1" pid="$2" name="$3" pss rss
+  verify_owner "$dir" "$pid" || return 10
   if ! pss="$(read_kb "$dir/smaps_rollup" Pss 2>/dev/null)" ||
     ! rss="$(read_kb "$dir/status" VmRSS 2>/dev/null)"; then
     [ -d "$dir" ] || return 10

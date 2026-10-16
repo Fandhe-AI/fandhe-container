@@ -21,7 +21,8 @@
 #     計測条件に含め、起動失敗として顕在化させる）
 #
 # 使い方:
-#   concurrent_50_memory.sh --bin-dir <絶対パス> --bundle <dir> --target <名前> [--systemd-run <絶対パス（既定 /usr/bin/systemd-run）>]
+#   concurrent_50_memory.sh --bin-dir <絶対パス> --bundle <dir> --target <名前> --run-as <ログイン名>
+#       [--systemd-run <絶対パス（既定 /usr/bin/systemd-run）>] [--setpriv <絶対パス（既定 /usr/bin/setpriv）>]
 #       [--mode own] [--count N] [--trials N] [--min-procs N] [--settle SECS] [--timeout SECS]
 #       [--id-prefix STR] [--format json|text] [--output FILE] [--help]
 #   concurrent_50_memory.sh --mode docker --docker <docker CLI の絶対パス> --target <名前>
@@ -65,9 +66,10 @@
 #     として結果の解釈に含める。複製が失敗したら終了コード 2。複製の前に config.json の root.path を検証し、絶対パス・bundle 外へ出る相対パス・
 #     外を指す symlink は 2 で拒否する〔cp -a は root.path を書き換えず、全コンテナが元の同じ rootfs を共有するため。
 #     書き換えはしない〕。--bundle は計測専用の使い捨てを使うこと）、
-#     `<bin-dir>/fandhe-container --root <状態ルート> create --bundle <複製> <id>` を期限付き（--timeout）で済ませる。
-#   - 起動: `<systemd-run> --user --scope --quiet -p Delegate=yes -- <bin-dir>/fandhe-container-supervisor start --root <状態ルート> <id>`
-#     を本スクリプトの直接の子としてバックグラウンドで起動する（--scope は同じプロセスのまま exec する。supervisor は
+#     `<bin-dir>/fandhe-container --root <状態ルート> create --bundle <複製> <id>` を期限付き（--timeout）で済ませる
+#     （mkdir・cp・create は対象の利用者へ降格して実行する。下の「権限（案 A）」）。
+#   - 起動: `<systemd-run> --user --scope --quiet --collect --unit=fc-bench-<token>-<試行>-<番号> -p Delegate=yes -- <bin-dir>/fandhe-container-supervisor start --root <状態ルート> <id>`
+#     を降格した状態（下の「権限（案 A）」）で、本スクリプトの直接の子としてバックグラウンドで起動する（--scope は同じプロセスのまま exec する。supervisor は
 #     親 cgroup に自分だけがいることを要求するため、supervisor ごとに新しいスコープへ入れる）。supervisor は「コンテナ 1 つを
 #     監視するプロセス」としてフォアグラウンドに留まる（デーモン化・二重 fork で親子関係を切らない。SUP-1 のコンテナごとの
 #     監視プロセスと一致する）。CLI の start を経由しない理由: CLI の start は supervisor を別プロセスグループで起動し、
@@ -102,11 +104,35 @@
 #     観測した子孫の「pid:起動時刻」を記録し（record_tree）、その同一性で集計の対象と後始末の回収を決める。記録できない
 #     プロセスが木にあれば untracked-process で失敗にする（fail-closed）。トークンは補助の追跡として残す。
 #   - 現状（REPAIR-3）: 製品バイナリ（CLI・supervisor の bin）は提供済みだが、own の実測値は未取得（#219）。
-#     未解決の前提（特権の橋渡しは #2090 で案 A に決定、実装は #2099）: supervisor は起動時に dumpable=0 にするため、同じ利用者の非 root からは supervisor の smaps_rollup
-#     （PSS）を読めず、own を非 root で実行すると unreadable-memory-value で fail-closed になる。一方 supervisor は
-#     rootful 起動を拒否する（SEC-5）ため、root では起動前に終了コード 3 で止める。両立には「root が計測し、起動だけ
-#     非 root へ降格する」か、製品側で dumpable=0 を特権経路に限る判断（SUP-14）が要る。本スクリプトは特権の橋渡しを
-#     実装していない（別 issue で扱う）。受け入れは自己テスト（スタブ・疑似 /proc）で照合している。
+#     受け入れは自己テスト（スタブ・疑似 /proc）で照合しており、実機（root）での実行・検証は人間担当（#485・#219）。
+#
+# 権限（案 A。#2090 のオーナー決定・#2099・SUP-2・CORE-9・SUP-14）:
+#   - supervisor は起動時に dumpable=0 にする（SUP-14）ため、同じ利用者の非 root からは smaps_rollup（PSS）を読めず、
+#     一方 rootful 起動を拒否する（SEC-5）。両立のため own モードは root で実行し、root で行うのは計測
+#     （/proc・cgroupfs の読み取りとシグナル送信、root 所有の作業ディレクトリの操作）だけにする。bundle の複製・create・
+#     systemd-run・supervisor の起動と、対象の利用者の領域（状態ルート・bundle の複製）への書き込み・削除は、
+#     `--run-as <ログイン名>` の利用者へ降格して実行する（`setpriv --reuid --regid --init-groups`。製品の dumpable=0 と
+#     SEC-5 は変えない）。root の環境変数は持ち込まず `env -i` の許可リスト（HOME・USER・LOGNAME・PATH=/usr/bin:/bin・
+#     XDG_RUNTIME_DIR=/run/user/<uid>・DBUS_SESSION_BUS_ADDRESS・起動時のみ FANDHE_BENCH_OWNER）だけを渡し、fd 3 以上は
+#     exec の前に閉じる。capability は inheritable・ambient を空にする。--no-new-privs は付けない（rootless の
+#     user namespace の設定が setuid の newuidmap / newgidmap を使うため。計測条件を変えない）。
+#   - 起動前に、降格した `id -u` / `id -g` / `id -G` が passwd の値と一致すること（不一致は終了コード 3）と、対象の利用者の
+#     user マネージャの bus（/run/user/<uid>/bus）が利用者所有のソケットであること（無ければ 3）を確かめる。起動後は各
+#     supervisor の /proc/<pid>/status の Uid・Gid（4 値すべて）・Groups と、cgroup が対象の利用者の user@<uid>.service 配下の
+#     本スクリプトのスコープ（fc-bench-...scope。supervisor が退避リーフ fc-runtime へ移った場合を含む）であることを確かめ、
+#     違えば reason=demotion-mismatch / scope-mismatch（終了コード 1。結果は公開しない）。
+#   - 作業ディレクトリは 2 つ: root 所有 0700 の一時ディレクトリ（ログ・FIFO。root の収集プロセスが利用者の差し替えられる
+#     パスを開かないため）と、利用者所有の一時ディレクトリ（状態ルート・bundle の複製。降格した mktemp が作る）。root は
+#     利用者の領域に書かず、削除も降格した rm で行う（利用者が管理する木を root が再帰削除しない）。後始末では、利用者の
+#     領域に root 所有のファイルが無いこと、スコープが残っていないこと、利用者の領域が消えたことを確かめる。回収できない
+#     ものは識別子つきで報告して終了コード 4。
+#   - --bundle のテンプレートは対象の利用者が読めること。--output は root 所有のディレクトリに置くこと。
+#   - 非 root での実行は終了コード 3、--run-as が uid 0 に解決されたら終了コード 2（fail-closed）。
+#   - 自己テスト専用の差し替え口（すべて FANDHE_CONCURRENT_MEMORY_SELFTEST=1 のときだけ有効）:
+#     ..._SELFTEST_EUID（実効 uid の注入）・..._SELFTEST_RUNTIME_DIR（/run/user/<uid> の代わり）・
+#     ..._SELFTEST_CGROUP_FS（/sys/fs/cgroup の代わり）・..._SELFTEST_SCOPE_CHECK=off（実 /proc 上のスタブには systemd の
+#     スコープが無いため cgroup の照合だけ省略）・..._SELFTEST_ROOT_UID（root 所有ファイル検査の uid）。スタブの setpriv は
+#     root 所有でないため、所有者検査もこのときだけ緩める。名前が STUB_ で始まる変数と FAKE_PROC は降格後も通す。
 #
 # 計測手順（1 試行）: N 個を同時起動 → 起動完了待ち（期限 --timeout。launcher が生存し、`FCSUP1 OK` 行を
 #   出力済みで、ツリーのプロセス数が --min-procs 以上）→ --settle 秒待機して再確認 → 全ツリーの Pss（smaps_rollup）・
@@ -119,11 +145,14 @@
 #   1 = （docker モードでは計測前の拒否・docker 呼び出しの失敗も含む）起動数不足・PSS 0 混入・メモリ値を読めない／数値でない・起動完了待ちの期限切れ・トークンを
 #       継承しない（後始末で回収できない）プロセスの混入・集計中のコンテナ終了・子プロセス一覧を
 #       読めない（結果は公開しない）
-#   2 = 引数・入力エラー（--proc-root は FANDHE_CONCURRENT_MEMORY_SELFTEST=1 なしでは拒否）、出力先エラー、
+#   2 = 引数・入力エラー（--proc-root は FANDHE_CONCURRENT_MEMORY_SELFTEST=1 なしでは拒否。own では --run-as の欠如・
+#       不正な名前・uid 0）、出力先エラー、
 #       未対応の --mode、report モードの入力（結果ファイル）の検証失敗
-#   3 = 前提欠如（非 Linux・smaps_rollup 非対応・bash 5 未満・docker モードの timeout 欠如・report の jq 欠如等。
+#   3 = 前提欠如（非 Linux・smaps_rollup 非対応・bash 5 未満・docker モードの timeout 欠如・report の jq 欠如・
+#       own モードの非 root 実行・降格の不一致〔demotion-mismatch〕・対象の利用者の user マネージャの bus が無い等。
 #       0 を返して合格に見せない）
-#   4 = 後始末失敗（起動したプロセス・コンテナが残存。他の失敗より優先して返す。docker モードでは
+#   4 = 後始末失敗（起動したプロセス・コンテナ・スコープ・利用者の作業ディレクトリが残存、または利用者の領域に root 所有の
+#       ファイルが残存。他の失敗より優先して返す。docker モードでは
 #       docker rm -f の後にラベル一致のコンテナが残る場合と、docker run クライアント（timeout・docker CLI）の
 #       終了を確認できない場合を含む）。own では、FCSUP1 OK で報告されたコンテナ側 init を pid・起動時刻つきで
 #       記録できず、init 自身のトークン観測でも帰属を証明できない場合も 4（追跡不能。launcher の生存・一時的な
@@ -195,6 +224,15 @@ usage() {
 
 bin_dir=""
 systemd_run="/usr/bin/systemd-run"
+# own モードの降格（案 A）。run_as は対象の利用者のログイン名（既定値なし）、setpriv_bin は降格に使う util-linux の setpriv。
+run_as=""
+setpriv_bin="/usr/bin/setpriv"
+env_bin="/usr/bin/env"
+ra_uid=""
+ra_gid=""
+ra_home=""
+ra_groups=""
+ra_rt=""
 cli_bin=""
 sup_bin=""
 bundle=""
@@ -224,6 +262,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --bin-dir) need_val $# "$1"; bin_dir="$2"; shift 2 ;;
     --systemd-run) need_val $# "$1"; systemd_run="$2"; shift 2 ;;
+    --run-as) need_val $# "$1"; run_as="$2"; shift 2 ;;
+    --setpriv) need_val $# "$1"; setpriv_bin="$2"; shift 2 ;;
     --launcher) err "invalid-argument" "--launcher was replaced by --bin-dir"; exit 2 ;;
     --bundle) need_val $# "$1"; bundle="$2"; shift 2 ;;
     --docker) need_val $# "$1"; docker="$2"; shift 2 ;;
@@ -278,9 +318,9 @@ reject_opts() { # <オプション名...>
 
 case "$mode" in
   own) reject_opts --docker --image --own-result --docker-result ;;
-  docker) reject_opts --bin-dir --systemd-run --bundle --own-result --docker-result ;;
+  docker) reject_opts --bin-dir --systemd-run --bundle --run-as --setpriv --own-result --docker-result ;;
   report)
-    reject_opts --bin-dir --systemd-run --bundle --target --docker --image --count --trials --min-procs --settle --timeout --id-prefix --proc-root
+    reject_opts --bin-dir --systemd-run --bundle --run-as --setpriv --target --docker --image --count --trials --min-procs --settle --timeout --id-prefix --proc-root
     [ "$format" = "json" ] || { err "invalid-argument" "--format must be json with --mode report"; exit 2; }
     [ -n "$own_result" ] && [ -n "$docker_result" ] || { err "invalid-argument" "--own-result and --docker-result are required with --mode report"; exit 2; }
     ;;
@@ -316,6 +356,44 @@ check_bundle_root_path() {
   esac
 }
 
+# --run-as（対象の利用者）を passwd から解決する（案 A。uid 0 は拒否）。名前は許可リストで検証してから getent へ渡す。
+# 結果は ra_uid・ra_gid・ra_home・ra_groups（id -G を数値の昇順・重複なしにした空白区切り）・ra_rt（user マネージャの
+# ランタイムディレクトリ）。ここでは実行ファイルを起動しない（getent・id は読み取り専用）。
+resolve_run_as() {
+  local line f rest
+  [[ "$run_as" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { err "invalid-argument" "--run-as is required (login name matching ^[a-z_][a-z0-9_-]{0,31}\$)"; exit 2; }
+  command -v getent >/dev/null 2>&1 || { err "unsupported-os" "getent is required for --mode own"; exit 3; }
+  line="$(getent passwd -- "$run_as" 2>/dev/null | head -n 1)" || line=""
+  [ -n "$line" ] || { err "invalid-argument" "--run-as user was not found"; exit 2; }
+  IFS=: read -ra f <<<"$line"
+  ra_uid="${f[2]:-}"
+  ra_gid="${f[3]:-}"
+  ra_home="${f[5]:-}"
+  [[ "$ra_uid" =~ $num_re ]] && [[ "$ra_gid" =~ $num_re ]] || { err "invalid-argument" "--run-as user has a malformed passwd entry"; exit 2; }
+  if [ "$ra_uid" -eq 0 ]; then err "invalid-argument" "--run-as must resolve to a non-root user (uid 0 refused)"; exit 2; fi
+  [[ "$ra_home" =~ ^/[A-Za-z0-9._/@+-]*$ ]] || { err "invalid-argument" "--run-as user has an unusable home directory"; exit 2; }
+  rest="$(id -G -- "$run_as" 2>/dev/null)" || { err "invalid-argument" "cannot resolve the groups of --run-as user"; exit 2; }
+  # shellcheck disable=SC2086 # id -G の出力は空白区切りの数値で、意図して単語分割する
+  ra_groups="$(printf '%s\n' $rest | sort -nu | tr '\n' ' ')"
+  ra_groups="${ra_groups% }"
+  ra_rt="/run/user/${ra_uid}"
+  if [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST:-}" = "1" ] && [ -n "${FANDHE_CONCURRENT_MEMORY_SELFTEST_RUNTIME_DIR:-}" ]; then
+    ra_rt="$FANDHE_CONCURRENT_MEMORY_SELFTEST_RUNTIME_DIR"
+  fi
+}
+
+# setpriv・env は root が実行するため、実体が通常ファイルで root 所有・group / other 書き込み不可であることを確かめる
+# （symlink は解決先を検査する。自己テストのスタブは root 所有・権限が揃わないため、このときだけ通常ファイルであることの検査に緩める）。
+root_exe_is_safe() { # <絶対パス>
+  case "$1" in /*) ;; *) return 1 ;; esac
+  [ -x "$1" ] || return 1
+  if [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST:-}" = "1" ]; then
+    [ -n "$(find -L "$1" -maxdepth 0 -type f -print 2>/dev/null)" ]
+  else
+    [ -n "$(find -L "$1" -maxdepth 0 -type f -user 0 ! -perm /022 -print 2>/dev/null)" ]
+  fi
+}
+
 if [ "$mode" = "own" ]; then
   # 起動する 3 つの実行ファイルは固定名で解決し（PATH 探索なし。別のバイナリを測らない）、絶対パス・通常ファイル
   # （symlink でない）・実行可能であることを確かめる。
@@ -326,6 +404,10 @@ if [ "$mode" = "own" ]; then
   case "$systemd_run" in
     /*) ;;
     *) err "invalid-argument" "--systemd-run must be an absolute path"; exit 2 ;;
+  esac
+  case "$setpriv_bin" in
+    /*) ;;
+    *) err "invalid-argument" "--setpriv must be an absolute path"; exit 2 ;;
   esac
   cli_bin="${bin_dir}/fandhe-container"
   sup_bin="${bin_dir}/fandhe-container-supervisor"
@@ -340,6 +422,7 @@ if [ "$mode" = "own" ]; then
   # 実体の絶対パスへ解決してから複製する。
   bundle="$(cd -- "$bundle" 2>/dev/null && pwd -P)" || { err "invalid-argument" "--bundle cannot be resolved"; exit 2; }
   check_bundle_root_path
+  resolve_run_as
 fi
 
 if [ "$mode" = "docker" ]; then
@@ -499,13 +582,21 @@ if [ "$mode" != "report" ]; then
   fi
   [ -r /proc/self/stat ] || { err "unsupported-os" "/proc/<pid>/stat is not available"; exit 3; }
 fi
-# own モードは supervisor を起動する。supervisor は rootful 起動を拒否する（SEC-5）ため、起動前に 3 で止める
-# （0 を返して合格に見せない）。cp・timeout は bundle の複製と create の期限に使う。
+# own モードは root で実行する（案 A）。supervisor は dumpable=0 で非 root から smaps_rollup を読めないため計測は root で行い、
+# supervisor の起動は --run-as の利用者へ降格する（rootful 起動は SEC-5 で拒否される）。非 root は起動前に 3 で止める
+# （0 を返して合格に見せない）。cp・timeout は bundle の複製と create の期限、find・sort・tr は検査に使う。
 if [ "$mode" = "own" ]; then
-  for req in cp timeout; do
-    command -v "$req" >/dev/null 2>&1 || { err "unsupported-os" "cp and timeout are required for --mode own"; exit 3; }
+  for req in cp timeout find sort tr head sed; do
+    command -v "$req" >/dev/null 2>&1 || { err "unsupported-os" "cp, timeout, find, sort, tr, head and sed are required for --mode own"; exit 3; }
   done
-  if [ "$(id -u)" -eq 0 ]; then err "unsupported-os" "supervisor rejects rootful start (SEC-5); run as a non-root user"; exit 3; fi
+  euid="$(id -u)"
+  if [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST:-}" = "1" ] && [ -n "${FANDHE_CONCURRENT_MEMORY_SELFTEST_EUID:-}" ]; then
+    euid="$FANDHE_CONCURRENT_MEMORY_SELFTEST_EUID"
+  fi
+  if [ "$euid" -ne 0 ]; then
+    err "unsupported-os" "--mode own must run as root (measurement reads smaps_rollup of dumpable=0 supervisors; launch is demoted to --run-as)"
+    exit 3
+  fi
 fi
 # docker モードは全ての docker 呼び出しを timeout（coreutils）で包む（REPAIR-5）。
 if [ "$mode" = "docker" ]; then
@@ -514,6 +605,12 @@ fi
 
 # --- 状態 ---
 tmpdir=""
+# 対象の利用者が所有する作業ディレクトリ（状態ルート・bundle の複製。降格した mktemp が作る）。tmpdir は root 所有（ログ・FIFO）。
+user_tmp=""
+unit_tok=""
+DEM=()
+root_uid=0
+cgroup_fs="/sys/fs/cgroup"
 out_tmp=""
 pids=()
 pstart=()
@@ -700,18 +797,68 @@ collectors_stop() {
 }
 
 # コンテナ 1 つ分の bundle の複製と create を済ませる（supervisor の起動前。起動をずらさないため、全コンテナ分を先に行う）。
-# 複製の失敗は終了コード 2（別ファイルシステム等。）、
-# create の失敗は計測失敗の 1。create は --timeout を上限にし、出力・パスは出さない（REPAIR-5）。
+# 状態ルートと bundle の複製は利用者所有の user_tmp に置き、mkdir・cp・create はすべて降格して実行する（root は利用者の領域に
+# 書かない）。複製の失敗は終了コード 2（別ファイルシステム・テンプレートを利用者が読めない等）、
+# create の失敗は計測失敗の 1。create は --timeout を上限にし（timeout は root 側から外側に掛ける）、出力・パスは出さない（REPAIR-5）。
 ln_prepare() { # <id>
   local rc=0
-  mkdir -m 0700 -p -- "$tmpdir/state" "$tmpdir/bundles" || { err "invalid-input" "cannot create the state directory"; exit 1; }
-  if ! cp -a --reflink=auto -- "$bundle" "$tmpdir/bundles/$1" 2>/dev/null; then
-    err "invalid-argument" "cannot copy the bundle template"
+  run_demoted mkdir -m 0700 -p -- "$user_tmp/state" "$user_tmp/bundles" </dev/null >/dev/null 2>&1 || { err "invalid-input" "cannot create the state directory"; exit 1; }
+  if ! run_demoted cp -a --reflink=auto -- "$bundle" "$user_tmp/bundles/$1" </dev/null >/dev/null 2>&1; then
+    err "invalid-argument" "cannot copy the bundle template (it must be readable by the --run-as user)"
     exit 2
   fi
-  [ -f "$tmpdir/bundles/$1/config.json" ] || { err "invalid-argument" "the bundle must contain config.json"; exit 2; }
-  timeout --kill-after=5 "$timeout_s" "$cli_bin" --root "$tmpdir/state" create --bundle "$tmpdir/bundles/$1" "$1" </dev/null >/dev/null 2>&1 || rc=$?
+  [ -f "$user_tmp/bundles/$1/config.json" ] || { err "invalid-argument" "the bundle must contain config.json"; exit 2; }
+  (
+    close_extra_fds
+    build_demote
+    exec timeout --kill-after=5 "$timeout_s" "${DEM[@]}" "$cli_bin" --root "$user_tmp/state" create --bundle "$user_tmp/bundles/$1" "$1" </dev/null >/dev/null 2>&1
+  ) || rc=$?
   if [ "$rc" -ne 0 ]; then err "measurement-failed" "id=$1 reason=create-failed exit=$rc"; exit 1; fi
+}
+
+# スロット i（0 始まり）の supervisor を入れる systemd スコープの unit 名（現在の試行 t の番号つき。検証と残存報告に使う）。
+scope_unit() { # <i>
+  printf 'fc-bench-%s-%s-%s' "$unit_tok" "$t" "$(($1 + 1))"
+}
+
+# スロット i の supervisor が、対象の利用者へ降格済みで、その user マネージャの委譲スコープに入っていることを確かめる。
+# /proc/<pid>/status の Uid・Gid（real・effective・saved・fs の 4 値すべて）が対象の uid・gid で、Groups（に gid を足した集合）が
+# passwd の補助グループの集合と一致すること。cgroup（0:: 行）が user@<uid>.service 配下の本スクリプトのスコープであること
+# （supervisor が退避リーフ fc-runtime へ移った場合の接尾辞を許す）。不一致は m_reason を設定して 1。
+verify_demotion() { # <i>
+  local stf="$proc/${pids[$1]}/status" line a b c d seen_uid=0 seen_gid=0 gs="" cg="" re
+  m_reason="demotion-mismatch"
+  while IFS= read -r line; do
+    case "$line" in
+      Uid:*)
+        read -r _ a b c d <<<"$line" || true
+        [ "$a" = "$ra_uid" ] && [ "$b" = "$ra_uid" ] && [ "$c" = "$ra_uid" ] && [ "$d" = "$ra_uid" ] || return 1
+        seen_uid=1
+        ;;
+      Gid:*)
+        read -r _ a b c d <<<"$line" || true
+        [ "$a" = "$ra_gid" ] && [ "$b" = "$ra_gid" ] && [ "$c" = "$ra_gid" ] && [ "$d" = "$ra_gid" ] || return 1
+        seen_gid=1
+        ;;
+      Groups:*) gs="${line#Groups:}" ;;
+    esac
+  done 2>/dev/null <"$stf" || return 1
+  [ "$seen_uid" -eq 1 ] && [ "$seen_gid" -eq 1 ] || return 1
+  # shellcheck disable=SC2086 # Groups: 行は空白区切りの数値で、意図して単語分割する
+  gs="$(printf '%s\n' $gs "$ra_gid" | sort -nu | tr '\n' ' ')"
+  [ "${gs% }" = "$ra_groups" ] || return 1
+  if [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST:-}" = "1" ] && [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST_SCOPE_CHECK:-}" = "off" ]; then
+    m_reason=""
+    return 0
+  fi
+  m_reason="scope-mismatch"
+  while IFS= read -r line; do
+    case "$line" in 0::*) cg="$line" ;; esac
+  done 2>/dev/null <"$proc/${pids[$1]}/cgroup" || return 1
+  re="^0::/user\.slice/user-${ra_uid}\.slice/user@${ra_uid}\.service/(.+/)?$(scope_unit "$1")\.scope(/.*)?\$"
+  [[ "$cg" =~ $re ]] || return 1
+  m_reason=""
+  return 0
 }
 
 # コンテナ 1 つ分の supervisor を直接の子として起動し、pid を LAST_PID、起動時刻を LAST_START へ入れる
@@ -723,7 +870,9 @@ ln_prepare() { # <id>
 # （supervisor は標準出力が FIFO であることを要求する）。
 ln_spawn() { # <id> <logfile>
   (
-    FANDHE_BENCH_OWNER="${owner_tok}.s${#pids[@]}" exec "$systemd_run" --user --scope --quiet -p Delegate=yes -- "$sup_bin" start --root "$tmpdir/state" "$1" </dev/null >"$2.fifo" 2>&1
+    close_extra_fds
+    build_demote "FANDHE_BENCH_OWNER=${owner_tok}.s${#pids[@]}"
+    exec "${DEM[@]}" "$systemd_run" --user --scope --quiet --collect "--unit=$(scope_unit "${#pids[@]}")" -p Delegate=yes -- "$sup_bin" start --root "$user_tmp/state" "$1" </dev/null >"$2.fifo" 2>&1
   ) &
   LAST_PID=$!
   # FANDHE_CONCURRENT_MEMORY_SELFTEST_SIGNAL_IN_SPAWN は selftest が「launcher を起動した直後、pid を
@@ -851,6 +1000,21 @@ tracked_pid() { # <i> <pid>
   owned_by_token "$2"
 }
 
+# 実 /proc 上で pid の real uid が --run-as の利用者か（疑似 /proc ではなく実プロセスの所有者。読めなければ 1）。
+real_uid_is_target() { # <pid>
+  local line a
+  while IFS= read -r line; do
+    case "$line" in
+      Uid:*)
+        read -r _ a _ <<<"$line" || true
+        [ "$a" = "$ra_uid" ]
+        return
+        ;;
+    esac
+  done 2>/dev/null <"/proc/$1/status"
+  return 1
+}
+
 # 環境変数トークン FANDHE_BENCH_OWNER が一致する生存プロセス（launcher の孤児化した子孫を含む）を
 # 「pid:起動時刻」で OWNED へ入れる。トークンは実行ごとの乱数。列挙からシグナル送信までの間の pid
 # 再利用に備え、送信時は起動時刻とトークンを再照合する（owned_kill）。
@@ -862,7 +1026,8 @@ owned_scan() {
     p="${f#"$proc"/}"
     p="${p%%/*}"
     [[ "$p" =~ $num_re ]] || continue
-    if read_starttime "$p" && proc_alive "$p"; then
+    # root で実行すると全利用者の environ を読めてしまうため、実プロセスの real uid が対象の利用者のものだけに絞る（最小権限）。
+    if real_uid_is_target "$p" && read_starttime "$p" && proc_alive "$p"; then
       OWNED+=("${p}:${ST}")
       case "$owned_pids" in *" ${p} "*) ;; *) owned_pids="${owned_pids}${p} " ;; esac
     fi
@@ -1037,6 +1202,45 @@ ln_stop() {
     keep_tmpdir=1
     return 4
   fi
+  scopes_gone || return 4
+  return 0
+}
+
+# 本スクリプトが作った systemd スコープ（fc-bench-<token>-*.scope）が cgroupfs に残っていないことを確かめる（own のみ。
+# supervisor を回収した後に systemd が空のスコープを片付けるまでの猶予として最大 5 秒ポーリングする）。残っていれば識別子
+# （スコープ名）つきで報告して 1。見つけるのは user@<uid>.service 配下に限る。
+scopes_gone() {
+  local base left waited=0
+  [ "$mode" = "own" ] && [ -n "$unit_tok" ] && [ -n "$ra_uid" ] || return 0
+  base="${cgroup_fs}/user.slice/user-${ra_uid}.slice/user@${ra_uid}.service"
+  [ -d "$base" ] || return 0
+  while :; do
+    left="$(find -P "$base" -maxdepth 6 -type d -name "fc-bench-${unit_tok}-*.scope" -printf '%f ' 2>/dev/null || true)"
+    [ -n "$left" ] || return 0
+    [ "$waited" -lt 25 ] || break
+    sleep "$POLL_INTERVAL"
+    waited=$((waited + 1))
+  done
+  err "cleanup-failed" "scopes still present: $(sanitize "${left% }")"
+  return 1
+}
+
+# 利用者所有の作業ディレクトリ（状態ルート・bundle の複製）を後始末する。削除前に root 所有のファイルが無いことを確かめ
+# （あれば利用者の領域に root の痕跡を残したことになるので削除せず報告）、削除は降格した rm で行う（root が利用者の管理する
+# 木を再帰削除しない）。残れば識別子（パス）つきで報告して 1。成功したら user_tmp を空にする。
+user_cleanup() {
+  [ -n "$user_tmp" ] || return 0
+  [ -e "$user_tmp" ] || { user_tmp=""; return 0; }
+  if [ -n "$(find -P "$user_tmp" -user "$root_uid" -print -quit 2>/dev/null)" ]; then
+    err "cleanup-failed" "root-owned files remain under the user work directory (user state kept at ${user_tmp})"
+    return 1
+  fi
+  run_demoted rm -rf -- "$user_tmp" </dev/null >/dev/null 2>&1 || true
+  if [ -e "$user_tmp" ]; then
+    err "cleanup-failed" "the user work directory could not be removed (user state kept at ${user_tmp})"
+    return 1
+  fi
+  user_tmp=""
   return 0
 }
 
@@ -1055,6 +1259,13 @@ on_exit() {
   if declare -F dk_stop >/dev/null 2>&1; then dk_stop || rc=4; fi
   if [ -n "$out_tmp" ]; then rm -f "$out_tmp"; fi
   # 追跡不能のときは残存確認に必要な状態（ログ・状態ルート）を残し、手動回収へ進めるようにする。
+  if [ -n "$user_tmp" ]; then
+    if [ "$untracked" -eq 0 ] && [ "$keep_tmpdir" -eq 0 ]; then
+      user_cleanup || rc=4
+    else
+      err "cleanup-failed" "user state kept at ${user_tmp}"
+    fi
+  fi
   if [ -n "$tmpdir" ] && [ "$untracked" -eq 0 ] && [ "$keep_tmpdir" -eq 0 ]; then rm -rf "$tmpdir"; fi
   exit "$rc"
 }
@@ -1084,10 +1295,100 @@ spawn_section_end() {
   if [ -n "$pending_sig" ]; then on_signal "$pending_sig"; fi
 }
 
+# --- 降格（案 A。own モードだけ）。root で動くのは計測だけで、bundle の複製・create・systemd-run・supervisor の起動は --run-as の
+# 利用者へ降格して実行する。呼び出し元は ln_prepare・ln_spawn・user_cleanup・降格のプローブ。降格した側が systemd-run --user を
+# 呼ぶ（root が systemd-run -M を呼ぶと root 自身がスコープへ入り、supervisor も root のまま SEC-5 で拒否される）。 ---
+
+# 呼び出したサブシェルの fd 3 以上を閉じる（root が開いた fd を降格後のプロセスへ漏らさない）。bash の `exec {fd}<>` で開いた
+# fd は CLOEXEC が付かない。255 は bash が CLOEXEC 付きで持つ内部 fd なので閉じない。サブシェルの中でだけ呼ぶこと。
+close_extra_fds() {
+  local f n
+  for f in "/proc/$BASHPID/fd"/*; do
+    n="${f##*/}"
+    [[ "$n" =~ ^[0-9]+$ ]] || continue
+    [ "$n" -ge 3 ] && [ "$n" -ne 255 ] || continue
+    exec {n}>&- 2>/dev/null || true
+  done
+}
+
+# 降格した起動行の接頭辞（setpriv → env -i の許可リスト）を DEM へ入れる。引数は許可リストへ足す環境変数（NAME=値）。
+# setpriv は reuid / regid / initgroups の後に inheritable・ambient capability を空にする。--no-new-privs と bounding-set の
+# 全消去は付けない（rootless の user namespace の設定が setuid の newuidmap / newgidmap を使うため。計測条件を変えない）。
+# 自己テスト（FANDHE_CONCURRENT_MEMORY_SELFTEST=1）のときだけ、名前が STUB_ で始まる変数と FAKE_PROC をスタブへ通す。
+build_demote() { # <NAME=値...>
+  local v
+  DEM=("$setpriv_bin" "--reuid=${ra_uid}" "--regid=${ra_gid}" --init-groups --inh-caps=-all --ambient-caps=-all -- "$env_bin" -i
+    "HOME=${ra_home}" "USER=${run_as}" "LOGNAME=${run_as}" "PATH=/usr/bin:/bin"
+    "XDG_RUNTIME_DIR=${ra_rt}" "DBUS_SESSION_BUS_ADDRESS=unix:path=${ra_rt}/bus")
+  if [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST:-}" = "1" ]; then
+    for v in $(compgen -e); do
+      case "$v" in STUB_* | FAKE_PROC) DEM+=("${v}=${!v}") ;; esac
+    done
+  fi
+  DEM+=("$@")
+}
+
+# 降格してコマンドを実行する（サブシェルで fd を閉じてから exec。pid は変わらない）。標準入力・出力は呼び出し側で付け替える。
+run_demoted() { # <コマンド...>
+  (
+    close_extra_fds
+    build_demote
+    exec "${DEM[@]}" "$@"
+  )
+}
+
+# 降格の検証（起動前。fail-closed）: 降格した id が passwd の uid・gid・補助グループと一致すること。supervisor は 1 つも
+# 起動しない。不一致・実行失敗は終了コード 3。
+probe_demotion() {
+  local u g gs
+  u="$(run_demoted timeout 10 id -u 2>/dev/null </dev/null)" || u=""
+  g="$(run_demoted timeout 10 id -g 2>/dev/null </dev/null)" || g=""
+  gs="$(run_demoted timeout 10 id -G 2>/dev/null </dev/null)" || gs=""
+  # shellcheck disable=SC2086 # id -G の出力は空白区切りの数値で、意図して単語分割する
+  gs="$(printf '%s\n' $gs | sort -nu | tr '\n' ' ')"
+  gs="${gs% }"
+  if [ "$u" != "$ra_uid" ] || [ "$g" != "$ra_gid" ] || [ "$gs" != "$ra_groups" ]; then
+    err "unsupported-os" "demotion-mismatch: the demoted process does not have the uid, gid and groups of --run-as (setpriv failed or is unusable)"
+    exit 3
+  fi
+}
+
+if [ "$mode" = "own" ]; then
+  root_exe_is_safe "$setpriv_bin" || { err "invalid-argument" "--setpriv must be a regular root-owned executable that is not group/other writable"; exit 2; }
+  root_exe_is_safe "$env_bin" || { err "unsupported-os" "$env_bin must be a regular root-owned executable that is not group/other writable"; exit 3; }
+  if [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST:-}" = "1" ]; then
+    [ -z "${FANDHE_CONCURRENT_MEMORY_SELFTEST_ROOT_UID:-}" ] || root_uid="$FANDHE_CONCURRENT_MEMORY_SELFTEST_ROOT_UID"
+    [ -z "${FANDHE_CONCURRENT_MEMORY_SELFTEST_CGROUP_FS:-}" ] || cgroup_fs="$FANDHE_CONCURRENT_MEMORY_SELFTEST_CGROUP_FS"
+  fi
+  # 対象の利用者の user マネージャが動いていること（systemd-run --user の接続先。linger なしでログアウト済みなら無い）。
+  if [ -z "$(find -P "$ra_rt/bus" -maxdepth 0 -type s -user "$ra_uid" -print 2>/dev/null)" ]; then
+    err "unsupported-os" "user manager bus for uid ${ra_uid} not found (is the user manager running? e.g. loginctl enable-linger)"
+    exit 3
+  fi
+  probe_demotion
+fi
+
 if ! tmpdir="$(mktemp -d)"; then err "invalid-input" "cannot create a temporary directory"; exit 2; fi
 # 所有プロセス追跡用の実行ごとの乱数トークン（mktemp が返す英数字のディレクトリ名を流用）。
 owner_tok="owner-${tmpdir##*/}"
 [[ "$owner_tok" =~ ^[A-Za-z0-9_.-]{1,64}$ ]] || { err "invalid-input" "cannot derive an owner token"; exit 2; }
+# スコープ名（systemd の unit 名）に使う接尾辞。英数字以外は x に置き換える。
+unit_tok="${tmpdir##*/}"
+unit_tok="${unit_tok//[^A-Za-z0-9]/x}"
+if [ "$mode" = "own" ]; then
+  # 利用者所有の作業ディレクトリは降格した mktemp が作る（root は利用者の領域に書かない）。返ったパスは形式と所有者を検証する。
+  if ! user_tmp="$(run_demoted mktemp -d /tmp/fandhe-concurrent-user.XXXXXX 2>/dev/null </dev/null)"; then
+    user_tmp=""
+    err "invalid-input" "cannot create the user work directory"
+    exit 2
+  fi
+  if ! [[ "$user_tmp" =~ ^/tmp/fandhe-concurrent-user\.[A-Za-z0-9]{6}$ ]] ||
+    [ -z "$(find -P "$user_tmp" -maxdepth 0 -type d -user "$ra_uid" -print 2>/dev/null)" ]; then
+    err "invalid-input" "the user work directory is not owned by --run-as user"
+    user_tmp=""
+    exit 2
+  fi
+fi
 
 # --- メモリ値の読み取り（読めない・数値でないものは 0 として足さず失敗にする） ---
 
@@ -1139,6 +1440,9 @@ measure_container() {
       m_reason="launcher-not-ready" # supervisor が FCSUP1 OK を出していない
       return 1
     fi
+    # 計測の直前に、supervisor が対象の利用者へ降格済みで、その user マネージャの委譲スコープに入っていることを確かめる
+    # （root のまま・別の利用者・スコープ外のプロセスの PSS を成功として公開しない）。m_reason は verify_demotion が設定する。
+    verify_demotion "$i" || return 1
     for pid in "${tree_pids[@]}"; do
       # 後始末（記録済みの同一性・トークン照合）で回収できないプロセスを含む計測は成功にしない（所有権を追跡できない）。
       if ! tracked_pid "$i" "$pid"; then
@@ -2062,7 +2366,7 @@ while [ "$t" -le "$own_trials" ]; do
   # 成功した試行のログと FIFO は次の試行へ進む前に削除する（失敗時の診断にしか使わない。残すとディスク
   # 消費が「起動数 × 試行回数 × LOG_MAX_KIB KiB」まで増える）。失敗した試行はここへ来ずに終了し、
   # 診断の出力後に EXIT trap が一時ディレクトリごと削除する。
-  if ! rm -rf -- "$tmpdir/bundles/${id_prefix}-${t}-"* "$tmpdir/state/${id_prefix}-${t}-"* ||
+  if ! run_demoted rm -rf -- "$user_tmp/bundles/${id_prefix}-${t}-"* "$user_tmp/state/${id_prefix}-${t}-"* </dev/null >/dev/null 2>&1 ||
     ! rm -f -- "$tmpdir/${id_prefix}-${t}-"*.log "$tmpdir/${id_prefix}-${t}-"*.fifo; then
     err "measurement-failed" "trial=${t} reason=cannot-remove-trial-logs"
     exit 1

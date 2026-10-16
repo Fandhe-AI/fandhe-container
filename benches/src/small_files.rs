@@ -2,7 +2,7 @@
 //!
 //! `benches/benches/small_files.rs`（`harness = false` の薄い入口）から呼ばれる。計測定義の記録は
 //! `docs/design/small-files-bench.md`（承認は #1897）。回帰ゲート（`benches/metrics.json`・
-//! `scripts/check-bench-regression.sh` の対象）へは未接続で、登録は #1899 が行う。
+//! `scripts/check-bench-regression.sh` の対象）へは登録済み（#1899）。baseline 未登録の間は比較対象外（基準値は #230）。
 //!
 //! # 計測する区間（1 ファイル）
 //!

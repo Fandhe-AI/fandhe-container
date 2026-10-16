@@ -454,7 +454,8 @@ snapshot_descendants() {
     ok["$p"]=1
     track_pid "$p" "${ss[$p]}"
   done
-  snap_seen=1
+  # 子孫を 1 つも記録できていない空の snapshot は「観測済み」とみなさない（untracked の fail-closed を飛ばさないため）。
+  [ "${#tracked[@]}" -eq 0 ] || snap_seen=1
   return 0
 }
 

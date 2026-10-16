@@ -669,7 +669,7 @@ collectors_stop() {
 # create の失敗は計測失敗の 1。create は --timeout を上限にし、出力・パスは出さない（REPAIR-5）。
 ln_prepare() { # <id>
   local rc=0
-  mkdir -p -- "$tmpdir/state" "$tmpdir/bundles" || { err "invalid-input" "cannot create the state directory"; exit 1; }
+  mkdir -m 0700 -p -- "$tmpdir/state" "$tmpdir/bundles" || { err "invalid-input" "cannot create the state directory"; exit 1; }
   if ! cp -a --reflink=auto -- "$bundle" "$tmpdir/bundles/$1" 2>/dev/null; then
     err "invalid-argument" "cannot copy the bundle template"
     exit 2

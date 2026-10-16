@@ -490,17 +490,24 @@ on_exit() {
   trap - EXIT
   trap '' INT TERM HUP
   [ "$final_rc" -eq 0 ] || rc="$final_rc"
+  local keep_logdir=0
   if [ "$spawned" -eq 1 ]; then
     if ! cleanup_procs; then
       err "cleanup-failed" "owned processes remain or could not be tracked after cleanup"
       rc=4
+      keep_logdir=1
     fi
   fi
   if [ "$rc" -eq 0 ] && [ "$publish_pending" -eq 1 ]; then
     publish_result || rc=$?
   fi
   [ -z "$out_tmp" ] || rm -f -- "$out_tmp" || true
-  [ -z "$logdir" ] || rm -rf -- "$logdir" || true
+  if [ "$keep_logdir" -eq 1 ] && [ -n "$logdir" ]; then
+    # 回収失敗時は state.json・ログ・使用中の rootfs を残し、場所を通知する（SUP-5）。
+    err "cleanup-failed" "kept the working directory for inspection: ${logdir}"
+  elif [ -n "$logdir" ]; then
+    rm -rf -- "$logdir" || true
+  fi
   exit "$rc"
 }
 on_signal() { final_rc="$1"; exit "$1"; }

@@ -120,6 +120,7 @@ id="${!#}"
 sd="${3}/${id}"
 [ -f "$sd/state.json" ] || exit 2
 if [ ! -p /dev/stdout ]; then echo "FCSUP1 ERR INVALID_ARGUMENT 2 stdout is not a fifo"; exit 2; fi
+if [ "$STUB_MODE" = err_report_slow ]; then mkfifo "$sd/hold" && exec 3<>"$sd/hold" && read -r -t 1 -u 3 _ || true; echo "FCSUP1 ERR FAILED_PRECONDITION 1 stub"; exit 1; fi
 if [ "$STUB_MODE" = err_report ]; then echo "FCSUP1 ERR FAILED_PRECONDITION 1 stub"; exit 1; fi
 count=0
 idx=0
@@ -593,13 +594,18 @@ if grep -q 'cannot be tracked' "${root}/err_report.err"; then pass "err_report: 
 if grep -q 'cleanup-failed' "${root}/err_report.err"; then pass "err_report: cleanup-failed reported"; else fail "err_report: cleanup-failed missing"; fi
 kept="$(sed -n 's/.*state kept at \(\/[^)]*\))*$/\1/p' "${root}/err_report.err" | head -n 1)"
 if [ -n "$kept" ] && [ -d "$kept" ]; then pass "err_report: state kept"; rm -rf -- "$kept"; else fail "err_report: state not kept"; fi
+# 起動中に空の snapshot が取られてから ERR で終了しても、子孫を 1 つも記録できていなければ追跡不能（終了コード 4・状態保持）
+run_case err_report_slow 4 err_report_slow "" --trials 1 --warmup 0 --timeout 5 || true
+if grep -q 'cannot be tracked' "${root}/err_report_slow.err"; then pass "err_report_slow: untracked warning"; else fail "err_report_slow: untracked warning missing"; fi
+kept="$(sed -n 's/.*state kept at \(\/[^)]*\))*$/\1/p' "${root}/err_report_slow.err" | head -n 1)"
+if [ -n "$kept" ] && [ -d "$kept" ]; then pass "err_report_slow: state kept"; rm -rf -- "$kept"; else fail "err_report_slow: state not kept"; fi
 run_case bad_report 1 bad_report "" --trials 1 --warmup 0 --timeout 3 || true
 run_case no_backoff 1 no_backoff "" --trials 1 --warmup 0 --timeout 3 || true
 run_case reported_below 1 normal "1000 2000" --trials 2 --warmup 0 --timeout 5 || true
 if grep -q 'FAILED_PRECONDITION' "${root}/err_report.err"; then pass "err_report: error code reported"; else fail "err_report: error code missing"; fi
 if grep -q 'below the supervisor backoff' "${root}/no_backoff.err"; then pass "no_backoff: negative subtraction rejected"; else fail "no_backoff: message missing"; fi
 if grep -q 'below the supervisor backoff' "${root}/reported_below.err"; then pass "reported_below: negative subtraction rejected"; else fail "reported_below: message missing"; fi
-for m in no_ready early_exit no_restart same_pid count_jump dead_new error_line err_report bad_report no_backoff reported_below; do
+for m in no_ready early_exit no_restart same_pid count_jump dead_new error_line err_report err_report_slow bad_report no_backoff reported_below; do
   if [ -s "${root}/${m}.out" ]; then fail "${m}: stdout must be empty on failure"; else pass "${m}: no result published"; fi
 done
 

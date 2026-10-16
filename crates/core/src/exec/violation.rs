@@ -466,9 +466,28 @@ impl ViolationReason {
     ///
     /// 対象は `MountTarget`・`SharedPropagation`・`RootfsPivot`（[`IsolationViolation::mount_audit_event`] と同じ範囲）。
     /// 子から無制限長のパスを運ばないため、パスは載せない。
+    ///
+    /// 加えて、bind mount の段（`MountBinds`）が user namespace 由来で拒否した 2 理由
+    /// （[`Self::MOUNT_BINDS_USER_NAMESPACE_REASONS`]。SEC-5・#2072）も同じ形で写す。共有の写像
+    /// （`mount_layer_audit_event`）は広げないため、`plan()` 時点の拒否や worker の経路の記録は変わらない。
     pub(super) fn launch_mount_audit_event(self) -> Option<AuditEvent> {
-        self.mount_layer_audit_event(None)
+        if let Some(event) = self.mount_layer_audit_event(None) {
+            return Some(event);
+        }
+        if Self::MOUNT_BINDS_USER_NAMESPACE_REASONS.contains(&self) {
+            return Some(AuditEvent::Mount {
+                path: None,
+                reason: Some(AuditReason::new(self.as_str())),
+            });
+        }
+        None
     }
+
+    /// bind mount の段（`PrePivotStep::MountBinds`）が user namespace の状態で拒否する理由（SEC-5・SEC-4・#2072）。
+    /// 種別は `PlanRejected` のため [`Self::from_launch_token`] は通さず、`launch_status` が段 `mount_binds` と
+    /// 組のときだけ追加で受ける。理由の集合の唯一の定義。
+    pub(super) const MOUNT_BINDS_USER_NAMESPACE_REASONS: [Self; 2] =
+        [Self::UserNamespaceRequired, Self::HostRootIdentityMapping];
 
     /// マウント層（`MountTarget`・`SharedPropagation`・`RootfsPivot`）の理由なら、理由コードつきの
     /// `Mount` 監査イベントを返す。それ以外の種別は `None`（#1701）。
@@ -1048,6 +1067,26 @@ mod tests {
     }
 
     /// 監査イベントはマウント層の 3 種別だけに写り、パスは載らない（SEC-4・#1815）。
+    #[test]
+    fn sec4_2072_launch_mount_audit_event_maps_user_namespace_reasons() {
+        for r in ViolationReason::MOUNT_BINDS_USER_NAMESPACE_REASONS {
+            assert_eq!(ViolationReason::from_launch_token(r.as_str()), None);
+            assert_eq!(
+                r.launch_mount_audit_event(),
+                Some(AuditEvent::Mount {
+                    path: None,
+                    reason: Some(AuditReason::new(r.as_str())),
+                })
+            );
+            // 共有の写像は広げていない（plan() 時点の拒否の記録は変わらない）。
+            assert_eq!(r.mount_layer_audit_event(None), None);
+        }
+        assert_eq!(
+            ViolationReason::NoNamespaces.launch_mount_audit_event(),
+            None
+        );
+    }
+
     #[test]
     fn sec4_1815_launch_mount_audit_event_maps_mount_layer_only() {
         assert_eq!(

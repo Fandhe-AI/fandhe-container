@@ -99,7 +99,9 @@
 #   - 起動時刻（/proc/<pid>/stat の field 22）は 1/100 秒刻み。同じ刻みの中で pid が再利用された場合は区別できない。
 #   - 検出できない残存: トークンを継承せず、launcher 停止前の子孫スナップショットにも state.json にも現れない
 #     プロセス（スナップショット後に生まれた孤児・launcher が記録前に異常終了した場合の孤児）は検出できない。
-#     launcher が子孫を 1 度も記録できないまま終了した場合は標準エラーへ note を出す。
+#     launcher が先に消え、コンテナの init（supervisor の報告 pid・state.json の pid）を記録できないまま後始末へ入った場合は、一時的な
+#     中間プロセスを記録済みでもコンテナ全体を追跡できた証明にせず、終了コード 4 にして状態を残す。ただし、
+#     報告も state.json の pid も出る前に生まれた init は観測できない（原理的な制約）。
 #   - 本スクリプト自身が SIGKILL された場合（外側 timeout の --kill-after を含む）は後始末できない。launcher は
 #     setsid で別 session にあり、外側 timeout のシグナルは届かないため残存し得る。
 set -euo pipefail
@@ -454,9 +456,22 @@ snapshot_descendants() {
     ok["$p"]=1
     track_pid "$p" "${ss[$p]}"
   done
-  # 子孫を 1 つも記録できていない空の snapshot は「観測済み」とみなさない（untracked の fail-closed を飛ばさないため）。
-  [ "${#tracked[@]}" -eq 0 ] || snap_seen=1
+  # 「観測済み」にできるのは、コンテナの init（supervisor が報告した pid・state.json の pid）を記録できたときだけ。
+  # 一時的な中間プロセスを 1 件記録しただけでは、コンテナ全体を追跡できた証明にならない（untracked の fail-closed を
+  # 飛ばさないため。SUP-5）。
+  if init_tracked; then snap_seen=1; fi
   return 0
+}
+
+# コンテナの init（FCSUP1 OK の報告 pid か state.json の pid）の同一性（pid・起動時刻）を tracked へ記録済みなら 0。
+# state.json を読み直す（ST_* を更新する。呼び出し側は read_state し直してから ST_* を使う）。
+init_tracked() {
+  local ip
+  read_state || true
+  for ip in "$report_pid" "${ST_PID:-}"; do
+    if [ -n "$ip" ] && [ -n "${tracked[$ip]:-}" ]; then return 0; fi
+  done
+  return 1
 }
 
 # 待機ループから呼ぶ間引きつきスナップショット（0.2 秒に 1 回まで）。launcher が途中で異常終了しても、
@@ -622,7 +637,7 @@ tracked_alive() {
 # 回収。戻り値 0 = 回収確認済み / 非 0 = 残存または帰属不明（呼び出し側が終了コード 4 にする）。
 # 所要時間の上限は約 20 秒（launcher の停止待ち 5 + 2 秒、回収の再試行 5 秒、/proc 走査）。--print-budget は 60 秒を見込む。
 do_cleanup() {
-  local i d p rc=0 untracked=0 evidence=0
+  local i d p rc=0 untracked=0
   [ "$cleaned" -eq 0 ] || return 0
   cleaned=1
   trap '' INT TERM HUP
@@ -630,9 +645,10 @@ do_cleanup() {
   if launcher_ok; then
     snapshot_descendants || true
   elif [ -n "$launcher_pid" ] && [ "$snap_seen" -eq 0 ]; then
-    # FCSUP1 ERR の報告や早期終了は子の不在証明にならない（製品の start_contract.rs は ERR を後始末より先に報告し、
-    # start_entry.rs には未回収ハンドルを伴う失敗経路もある）。子孫を 1 つも記録できず、後段でトークン・state.json の
-    # いずれでも帰属を証明できなければ、追跡不能として終了コード 4 にし、手動回収のため状態を残す（SUP-5）。
+    # launcher が既に消え、コンテナの init（報告 pid・state.json の pid）を記録できていない。FCSUP1 ERR の報告や早期終了、一時的な中間
+    # プロセスの観測は init 不在の証明にならない（製品の start_contract.rs は ERR を後始末より先に報告し、
+    # start_entry.rs には未回収ハンドルを伴う失敗経路もある。init は所有トークンも継承しない）。後段で init の帰属を
+    # 証明できなければ、追跡不能として終了コード 4 にし、手動回収のため状態を残す（SUP-5）。
     untracked=1
   fi
   # 2. launcher を止める（同一性を確認できる間だけ送る。先に終了して PID が再利用されていれば送らない）。
@@ -656,7 +672,6 @@ do_cleanup() {
   # 5. トークン一致の所有プロセスと追跡済みプロセスを回収する。消えるまで最大 5 秒再試行する。
   for ((i = 0; i < 25; i++)); do
     owned_scan
-    if [ "${#OWNED[@]}" -gt 0 ]; then evidence=1; fi
     if [ "${#OWNED[@]}" -eq 0 ] && ! tracked_alive; then break; fi
     for d in ${OWNED[@]+"${OWNED[@]}"}; do
       p="${d%%:*}"
@@ -669,8 +684,10 @@ do_cleanup() {
   # 6. 最終確認。再試行の後に現れたものを含め、所有・追跡済みプロセスが 1 つでも生存していれば残存。
   owned_scan
   if [ "${#OWNED[@]}" -gt 0 ] || tracked_alive; then rc=4; fi
-  if [ "$untracked" -eq 1 ] && [ "$evidence" -eq 0 ] && [ "${#tracked[@]}" -eq 0 ]; then
-    printf 'warning: the launcher exited before any descendant was recorded; container-side processes cannot be tracked (state kept at %s)\n' "${workdir:-<none>}" >&2 || true
+  # 追跡不能の確定は init の記録の有無だけで行う。中間プロセスの記録や所有トークンの観測（init は継承しない）は
+  # コンテナ全体の追跡の証明にならない。attribute_suspects が init を帰属させていれば init_tracked が真になる。
+  if [ "$untracked" -eq 1 ] && ! init_tracked; then
+    printf 'warning: the launcher exited before the container init was recorded; container-side processes cannot be tracked (state kept at %s)\n' "${workdir:-<none>}" >&2 || true
     rc=4
     keep_state=1
   fi

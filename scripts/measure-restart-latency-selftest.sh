@@ -97,6 +97,8 @@ helper_pids+=("$!")
 #   継続を証明する追跡済みプロセスが残っていないため帰属不明で kill されず、終了コード 4）/
 # foreign_young（state.json の pid が launcher 起動後に生まれた、木から切り離された別 session・トークンなしのプロセス。
 #   子孫でないので kill されず計測失敗。無関係と確定できないため終了コード 4）/
+# mid_only（一時的な子孫だけが観測され、init は報告も state.json もされない木の外のプロセス。中間プロセスの記録を
+#   コンテナ全体の追跡の証明にしないこと。終了コード 4・状態を残す・init へシグナルを送らない）/
 # log_late（restart ログを state.json 更新より後、最後の 1 行は SIGTERM 時に出す）。
 # ログの elapsed_us は STUB_ELAPSED（空白区切り）を順に使う。STUB_DELAY（秒・空白区切り）は kill 検知後から
 # 新コンテナ起動までの待ちを順に与える時間制御入力（observed の下限が決定的になる）。
@@ -203,6 +205,13 @@ case "$STUB_MODE" in
   *) trap term_handler TERM ;;
 esac
 start_child
+if [ "$STUB_MODE" = mid_only ]; then
+  # 一時的な中間プロセス（上の child）だけを子孫として見せ、init は launcher の木に属さない別 session で起動する。
+  # 報告も state.json の pid も出さないまま終了する（init の記録なしに中間プロセスだけ観測され、launcher が先に消える経路）。
+  detached "${STUB_DIR}/init" "INIT=1"
+  sleep 1.2 # 中間プロセスが子孫として観測される時間（スナップショットは 0.2 秒間隔）
+  exit 1
+fi
 if [ "$STUB_MODE" = decoy ]; then
   # トークンを含むが FANDHE_BENCH_OWNER=<token> の完全一致エントリではない（grep -F の部分一致なら誤検出する）。
   detached "${STUB_DIR}/decoy" "DECOY=x_FANDHE_BENCH_OWNER=${FANDHE_BENCH_OWNER}"
@@ -373,6 +382,13 @@ expect_survivor() {
 expect_unpublished() { # <名前>: 結果を公開していない（標準出力が空）
   if [ ! -s "${root}/$1.out" ]; then pass "$1: no result published"; else fail "$1: result published"; fi
 }
+# <名前>: 終了コード 4 の経路が残した作業ディレクトリ（stderr の "state kept at <path>"）を回収する。
+# 通知が無ければ失敗（4 の経路は必ず残置を通知する契約。SUP-5）。
+reclaim_kept() {
+  local kept
+  kept="$(sed -n 's/.*state kept at \(\/[^)]*\))*$/\1/p' "${root}/$1.err" | head -n 1)"
+  if [ -n "$kept" ] && [ -d "$kept" ]; then pass "$1: kept state reclaimed"; rm -rf -- "$kept"; else fail "$1: kept state path missing"; fi
+}
 expect_warning() { # <名前>: 帰属不明の警告と cleanup-failed を出している
   if grep -q 'cannot be attributed' "${root}/$1.err" && grep -q 'cleanup-failed' "${root}/$1.err"; then
     pass "$1: attribution warning and cleanup-failed logged"
@@ -387,6 +403,7 @@ run_leftover_case late_session 4 late_session --trials 1 --warmup 0 --timeout 10
 expect_unpublished late_session
 expect_survivor late_session "${root}/d-late_session/leftover"
 expect_warning late_session
+reclaim_kept late_session
 
 # SIGTERM 時に既存コンテナを止めてから同じ session で起動された新 pid は、session の継続を証明できる追跡済みの
 # 生存プロセスが無いため帰属不明（session 番号の一致だけでは回収しない）。kill せず終了コード 4
@@ -394,6 +411,7 @@ run_leftover_case late_orphan 4 late_orphan --trials 1 --warmup 0 --timeout 10
 expect_unpublished late_orphan
 expect_survivor late_orphan "${root}/d-late_orphan/leftover"
 expect_warning late_orphan
+reclaim_kept late_orphan
 
 # state.json の pid が launcher 起動後に生まれた子孫でないプロセス（契約違反で木から外れたコンテナに相当）:
 # シグナルは送らず計測失敗。無関係とも本計測の生成物とも証明できず生存しているので終了コード 4
@@ -401,7 +419,16 @@ run_leftover_case foreign_young 4 foreign_young --trials 1 --warmup 0 --timeout 
 expect_unpublished foreign_young
 expect_survivor foreign_young "${root}/d-foreign_young/young"
 expect_warning foreign_young
+reclaim_kept foreign_young
 if grep -q 'refusing to send a signal' "${root}/foreign_young.err"; then pass "foreign_young: refused to signal"; else fail "foreign_young: refusal message missing"; fi
+
+# 一時的な中間プロセスだけが観測され init の記録が無い場合は、コンテナ全体を追跡できた扱いにせず終了コード 4 にする
+# （状態を残し、木の外の init へシグナルを送らない。codex 指摘 PRRT_kwDOUq78ts6tKUN0・SUP-5）
+run_leftover_case mid_only 4 mid_only --trials 1 --warmup 0 --timeout 3
+expect_unpublished mid_only
+expect_survivor mid_only "${root}/d-mid_only/init"
+if grep -q 'cannot be tracked' "${root}/mid_only.err"; then pass "mid_only: untracked warning"; else fail "mid_only: untracked warning missing"; fi
+reclaim_kept mid_only
 
 # 所有トークンを部分文字列として含む環境変数を持つ無関係プロセスは、完全一致しないため kill しない
 run_leftover_case decoy 0 decoy --trials 1 --warmup 0 --timeout 10
@@ -556,6 +583,7 @@ make_case make_leftover late_session TRIALS=1
 if [ "$MAKE_RC" -ne 0 ] && grep -q 'Error 4$' "${root}/make_leftover.err"; then pass "make_leftover: recipe exit 4"; else fail "make_leftover: make exit ${MAKE_RC} or Error 4 missing"; fi
 expect_unpublished make_leftover
 expect_survivor make_leftover "${root}/d-make_leftover/leftover"
+reclaim_kept make_leftover
 
 # restart ログが state.json 更新より後（最後の 1 行は停止時）でも、launcher 停止後に集計して副系列が欠損しない
 if run_case log_late 0 log_late "109000 101000 102000 103000" --trials 3 --warmup 1 --timeout 10; then
@@ -613,7 +641,7 @@ done
 sleep 300 &
 foreign_pid=$!
 echo "$foreign_pid" >"${root}/foreign.pid"
-sleep 0.1 # 起動時刻（1/100 秒刻み）が launcher より確実に前になるようにする（無関係と確定 → 終了コード 4 にしない）
+sleep 0.1 # 起動時刻（1/100 秒刻み）が launcher より確実に前になるようにする（無関係と確定。suspect にしない）
 run_case foreign_pid 1 foreign_pid "" --trials 1 --warmup 0 --timeout 2 || true
 if kill -0 "$foreign_pid" 2>/dev/null; then pass "foreign_pid: unrelated process was not signaled"; else fail "foreign_pid: unrelated process was killed"; fi
 kill "$foreign_pid" 2>/dev/null || true

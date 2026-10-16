@@ -37,7 +37,7 @@ fail() { echo "FAIL: $1" >&2; failures=$((failures + 1)); }
 # supervisor スタブはコンテナ側プロセスを 1 つ起動して `FCSUP1 OK <pid>` を出す。
 # STUB_MODE: normal（監視プロセスが死んでもコンテナは残る）/ collateral（対象の死で他の監視プロセスも死ぬ）/
 # die_with_target（対象のコンテナが監視プロセスと共に死ぬ）/ other_dies（他コンテナが対象の死で死ぬ）/
-# scrub_env（コンテナ側プロセスが環境変数を継承しない）/ no_ready（報告を出さない）/ err_report（FCSUP1 ERR）/ bad_report（書式不正）/ short_start（最後の launcher が起動直後に終了）/ restart（コンテナを再起動する）/ restart_aux（補助プロセスだけ増やす）/ restart_short（再起動後すぐ終了）/ restart_sup_dies（再起動後に監視プロセスが終了）/ restart_alias（同名・別コマンドの補助プロセスだけ増やす）/ many_kids（子孫が走査上限 512 件を超える）。
+# scrub_env（コンテナ側プロセスが環境変数を継承しない）/ no_ready（報告を出さない）/ err_report（FCSUP1 ERR）/ bad_report（書式不正）/ short_start（最後の launcher が起動直後に終了）/ restart（コンテナを再起動する）/ restart_aux（補助プロセスだけ増やす）/ restart_short（再起動後すぐ終了）/ restart_sup_dies（再起動後に監視プロセスが終了）/ restart_alias（同名・別コマンドの補助プロセスだけ増やす）/ many_kids（子孫が走査上限 512 件を超える）/ mid_only（対象だけ、一時的な中間プロセスを観測させた後、報告なしで終了し、木の外の init を残す）。
 # 待機はすべて組み込みの read -t（fork しない）で行い、一過性の子プロセスを作らない。
 mkdir -m 0755 "${root}/bin"
 cat >"${root}/bin/fandhe-container" <<'STUB'
@@ -91,6 +91,18 @@ start_container() {
   c=$!
   echo "$c" >"$STUB_DIR/$id.cpid"
 }
+if [ "$STUB_MODE" = mid_only ] && [ "$role" = t ]; then
+  # 一時的な中間プロセス（c）だけが子孫として観測され、init は二重 fork で孤児化した別プロセス（環境変数トークンも
+  # 継承しない）。報告を出さないまま約 1.5 秒で終了する（init の記録なしに supervisor が消える経路）。
+  sleep 300 &
+  c=$!
+  echo "$c" >"$STUB_DIR/$id.cpid"
+  (env -u FANDHE_BENCH_OWNER sleep 300 &)
+  trap 'kill "$c" 2>/dev/null; exit 0' TERM
+  read -t 1.5 -u 9 || true
+  kill "$c" 2>/dev/null
+  exit 0
+fi
 start_container
 trap 'kill "$c" 2>/dev/null; exit 0' TERM
 case "$STUB_MODE" in
@@ -177,7 +189,10 @@ run_case() {
       kill -KILL "$p" 2>/dev/null || true
     fi
   done < <(grep -lzxF -- "SELFTEST_MARK=${mark}" /proc/[0-9]*/environ 2>/dev/null || true)
-  if [ "$left" -eq 0 ]; then pass "case ${case_no} (${mode}): no leftover processes"; else fail "case ${case_no} (${mode}): ${left} leftover processes"; fi
+  if [ "${EXPECT_LEFTOVER:-0}" = 1 ]; then
+    # 追跡できない init を残す経路（mid_only）。回収できないことを契約どおり（終了コード 4）に残し、テスト側で片付ける。
+    if [ "$left" -ge 1 ]; then pass "case ${case_no} (${mode}): untracked init was left and reclaimed by the test"; else fail "case ${case_no} (${mode}): expected a leftover init"; fi
+  elif [ "$left" -eq 0 ]; then pass "case ${case_no} (${mode}): no leftover processes"; else fail "case ${case_no} (${mode}): ${left} leftover processes"; fi
   # rc=4 では本体が作業ディレクトリを残して場所を通知する（SUP-5）。通知されたパスを回収して mktemp ツリーを残さない。
   # 残存プロセスの回収後に消す。$root 配下と mktemp の既定場所（TMPDIR）以外は消さない。
   kept="$(sed -n 's/.*kept the working directory for inspection: \(\/.*\)$/\1/p' "$ERR" | head -n 1)"
@@ -241,6 +256,10 @@ expect_eq "no_ready: stdout is empty" "" "$(cat "$OUT")"
 
 # 5b. FCSUP1 ERR を返す / 書式不正の報告 → 結果を公開しない。ERR を出して終了した supervisor は子プロセス不在を
 # 確認できないため追跡不能（4）。生存したまま書式不正を返す場合は後始末できるので 1。
+EXPECT_LEFTOVER=1 run_case mid_only
+expect_eq "mid_only: exit code (transient helper is not proof of tracking the container => untracked)" 4 "$RC"
+expect_eq "mid_only: stdout is empty" "" "$(cat "$OUT")"
+if grep -q 'cleanup-failed' "$ERR"; then pass "mid_only: cleanup-failed reported"; else fail "mid_only: cleanup-failed missing"; fi
 run_case err_report
 expect_eq "err_report: exit code (ERR is not proof of no child => untracked)" 4 "$RC"
 expect_eq "err_report: stdout is empty" "" "$(cat "$OUT")"
@@ -350,6 +369,23 @@ arg_case "group-writable supervisor" --bin-dir "${root}/bin-gw" $B
 arg_case "missing supervisor" --bin-dir "${root}/bin-missing" $B
 ln -s "${root}/systemd-run" "${root}/systemd-run-link"
 arg_case "symlink systemd-run" --bin-dir "${root}/bin" --systemd-run "${root}/systemd-run-link" --bundle "${root}/bundle"
+
+# 10b. config.json の root.path が複製内の相対パスでなければ、複製・create・起動の前に 2 で拒否する
+# （cp -a は root.path を書き換えず、絶対パスだと全コンテナが元の同じ rootfs を共有する。codex 指摘 PRRT_kwDOUq78ts6tKUN5）。
+mk_bundle() { # <名前> <config.json の内容>
+  mkdir -m 0755 "${root}/$1" "${root}/$1/rootfs"
+  printf '%s\n' "$2" >"${root}/$1/config.json"
+}
+mk_bundle bundle-abs "{\"root\":{\"path\":\"${root}/bundle/rootfs\"}}"
+mk_bundle bundle-dotdot '{"root":{"path":"../bundle/rootfs"}}'
+mk_bundle bundle-nonstring '{"root":{"path":7}}'
+mk_bundle bundle-self '{"root":{"path":"."}}'
+mk_bundle bundle-symlink '{"root":{"path":"link"}}'
+ln -s "${root}/bundle/rootfs" "${root}/bundle-symlink/link"
+for b in bundle-abs bundle-dotdot bundle-nonstring bundle-self bundle-symlink; do
+  arg_case "root.path rejected (${b})" --bin-dir "${root}/bin" --systemd-run "${root}/systemd-run" --bundle "${root}/${b}"
+  if grep -q 'root.path\|config.json' "${root}/arg.err"; then pass "args: ${b} reports the root.path reason"; else fail "args: ${b} reason missing"; fi
+done
 
 # 11. AC3: スクリプト本文に SUP-5 のビヘイビア ID が明記されている。
 if grep -q 'SUP-5' "$target"; then pass "script mentions SUP-5"; else fail "script does not mention SUP-5"; fi

@@ -34,7 +34,8 @@
 # bundle: --bundle は使い捨てのテンプレートとして扱う。supervisor は bundle へ flock を取るため、コンテナごとに
 # 作業ディレクトリへ複製する（cp -a --reflink=auto。inode を共有しない複製にする。製品の rootfs 検査
 # check_no_external_hardlinks は rootfs 外にもリンクを持つ inode を起動前に拒否するため、cp -al は使えない）。
-# 複製の失敗時は 2。reflink 対応の FS では複製どうしがデータブロックを共有しうるが、page cache の共有条件は
+# 複製の失敗時は 2。複製の前に config.json の root.path を検証し、絶対パス・bundle 外へ出る相対パス・外を指す symlink は
+# 2 で拒否する（cp -a は root.path を書き換えず、全コンテナが元の同じ rootfs を共有してしまうため。書き換えはしない）。reflink 対応の FS では複製どうしがデータブロックを共有しうるが、page cache の共有条件は
 # 実行ごとに異なりうる（メモリ比較の前提として記録する）。
 # 後始末: 環境変数 FANDHE_BENCH_OWNER に実行ごとの乱数トークンを渡し、/proc/*/environ のトークン一致で孤児化した
 # 子孫も回収する。supervisor は dumpable=0 で environ を読めないため、記録した pid・起動時刻の同一性で追跡して回収する
@@ -129,6 +130,31 @@ case "$bin_dir$systemd_run$bundle" in *$'\n'*) err "invalid-argument" "paths mus
 [ -d "$bundle" ] || { err "invalid-argument" "--bundle is not a directory"; exit 2; }
 bundle="$(cd -- "$bundle" 2>/dev/null && pwd -P)" || { err "invalid-argument" "--bundle cannot be resolved"; exit 2; }  # cp -a がリンクのまま複製して flock 競合するのを避ける
 
+# bundle の config.json の root.path が、複製した bundle の中へ解決される相対パスであることを検証する（SEC・OCI の rootfs）。
+# cp -a は config.json を書き換えないため、root.path が絶対パス（や bundle 外へ出る相対パス・外を指す symlink）だと、
+# 複製した全コンテナが元の同じ rootfs を共有し、独立した複製という計測条件が崩れる（書き込みの相互干渉・page cache の共有）。
+# 書き換えではなく拒否にする理由: 計測対象の設定を本スクリプトが改変しない／bundle 外の rootfs には書き換え先がなく、
+# 全コンテナ分の rootfs の複製が別途要る。--bundle はテンプレートなので、複製の前に 1 度だけ検証する（複製は同一内容）。
+# 違反は終了コード 2（create・起動の前）。jq・realpath が無ければ 3。
+check_bundle_root_path() {
+  local rp resolved
+  command -v jq >/dev/null 2>&1 || { err "unsupported-os" "jq is required to validate the bundle config.json"; exit 3; }
+  command -v realpath >/dev/null 2>&1 || { err "unsupported-os" "realpath is required to validate the bundle config.json"; exit 3; }
+  # root.path が無ければ OCI の慣例どおり rootfs として扱う。読む量は 1 MiB に絞る（巨大ファイルを jq へ渡さない）。
+  if ! rp="$(head -c 1048577 -- "$bundle/config.json" 2>/dev/null | jq -er '(.root // {}) | (.path // "rootfs") | select(type=="string")' 2>/dev/null)"; then
+    err "invalid-argument" "the bundle config.json must be valid JSON with a string root.path (or none)"
+    exit 2
+  fi
+  case "$rp" in
+    '' | /* | *$'\n'*) err "invalid-argument" "the bundle root.path must be a relative path inside the bundle (an absolute path would share one rootfs across all copies)"; exit 2 ;;
+  esac
+  resolved="$(realpath -m -- "$bundle/$rp" 2>/dev/null)" || { err "invalid-argument" "the bundle root.path cannot be resolved"; exit 2; }
+  case "$resolved" in
+    "$bundle"/?*) ;;
+    *) err "invalid-argument" "the bundle root.path must stay inside the bundle (no .. or symlink to the outside)"; exit 2 ;;
+  esac
+}
+
 # 祖先を含むディレクトリが、他のユーザーに中のエントリを差し替えられないこと（concurrent_50_memory.sh の
 # dir_is_safe と同じ規則）。実行ユーザーか root の所有で、group / other の書き込み権がないか sticky ビット付き。
 dir_is_safe() {
@@ -211,6 +237,7 @@ for req in mktemp mkfifo cp timeout ln grep sleep kill uname date od head tr; do
   command -v "$req" >/dev/null 2>&1 || { err "unsupported-os" "$req is required"; exit 3; }
 done
 [ -r /proc/self/stat ] || { err "unsupported-os" "/proc is required"; exit 3; }
+check_bundle_root_path
 # supervisor は rootful 起動を拒否する（SEC-5）。0 を返して合格に見せないよう起動前に 3 で止める。
 if [ "$uid_now" -eq 0 ]; then err "unsupported-os" "supervisor rejects rootful start (SEC-5); run as a non-root user"; exit 3; fi
 
@@ -223,7 +250,7 @@ owner_tok=""
 out_tmp=""
 final_rc=0
 spawned=0
-declare -A SP SS SZ CH TRK SEEN BADREP
+declare -A SP SS SZ CH TRK BADREP
 untracked=0
 TREE_TRUNC=0
 publish_pending=0
@@ -382,7 +409,7 @@ any_launcher_alive() {
 # pid・起動時刻の組として TRK へ追加する。環境変数を継承しないコンテナ側プロセス（実機の実装）は
 # FANDHE_BENCH_OWNER のトークンでは見つからないため、起動時に記録した同一性で追跡する（SIGKILL 後の孤児を含む）。
 # 起動直後から定期的に呼ぶ（待機ループ・settle 中）ことで、launcher が途中で終了しても、それまでに見えた子孫は
-# 記録済みになる。子孫を 1 つも記録できないまま消滅した launcher（SEEN 未設定）と、走査上限（512 件）に達した
+# 記録済みになる。コンテナの init を記録できないまま消滅した launcher と、走査上限（512 件）に達した
 # 木は追跡不能（untracked=1）として記録し、後始末の成功とは判定しない（cleanup_procs が失敗を返す）。
 track_descendants() {
   local i d c rest
@@ -395,14 +422,14 @@ track_descendants() {
         c="${d%%:*}"
         rest="${d#*:}"
         TRK[$c]="${rest%%:*}"
-        SEEN[$i]=1
       done
-    elif [ -z "${SEEN[$i]:-}" ] && [ -z "${DESC[$i]:-}" ] ; then
-      # 既に消滅した supervisor で、子孫を 1 つも観測できていない。ERR・書式不正の報告を受けていても、
+    elif [ -z "${DESC[$i]:-}" ]; then
+      # 既に消滅した supervisor。コンテナの init（supervisor が報告した pid）を pid・起動時刻つきで記録できていなければ、
+      # 一時的な中間プロセスを観測していてもコンテナ全体を追跡できた証明にならない。ERR・書式不正の報告を受けていても、
       # 子プロセス不在の証明にならない（start_contract.rs は ERR 報告の後に terminate 等の後始末を行い、
       # start_entry.rs には未回収のハンドルを伴う失敗経路もある）ため、追跡不能（終了コード 4）にする。
       sup_report "$i" || true
-      untracked=1
+      if [ -z "${REP_PID[$i]:-}" ] || [ -z "${TRK[${REP_PID[$i]}]:-}" ]; then untracked=1; fi
     fi
     for d in ${DESC[$i]:-}; do
       c="${d%%:*}"

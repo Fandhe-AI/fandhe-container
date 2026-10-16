@@ -62,7 +62,9 @@
 #     失敗する。複製は cp -a --reflink=auto で inode を共有しない
 #     複製にする（製品の rootfs 検査 check_no_external_hardlinks は rootfs 外にもリンクを持つ inode を起動前に拒否するため
 #     cp -al は使えない）。複製どうしの page cache は共有されないため、Docker の lower 共有より PSS が大きく出うる比較条件
-#     として結果の解釈に含める。複製が失敗したら終了コード 2。--bundle は計測専用の使い捨てを使うこと）、
+#     として結果の解釈に含める。複製が失敗したら終了コード 2。複製の前に config.json の root.path を検証し、絶対パス・bundle 外へ出る相対パス・
+#     外を指す symlink は 2 で拒否する〔cp -a は root.path を書き換えず、全コンテナが元の同じ rootfs を共有するため。
+#     書き換えはしない〕。--bundle は計測専用の使い捨てを使うこと）、
 #     `<bin-dir>/fandhe-container --root <状態ルート> create --bundle <複製> <id>` を期限付き（--timeout）で済ませる。
 #   - 起動: `<systemd-run> --user --scope --quiet -p Delegate=yes -- <bin-dir>/fandhe-container-supervisor start --root <状態ルート> <id>`
 #     を本スクリプトの直接の子としてバックグラウンドで起動する（--scope は同じプロセスのまま exec する。supervisor は
@@ -286,6 +288,31 @@ if [ "$mode" != "report" ]; then
   [[ "$id_prefix" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || { err "invalid-argument" "--id-prefix must match ^[a-z0-9][a-z0-9-]{0,31}\$"; exit 2; }
 fi
 
+# bundle の config.json の root.path が、複製した bundle の中へ解決される相対パスであることを検証する（SEC・OCI の rootfs）。
+# cp -a は config.json を書き換えないため、root.path が絶対パス（や bundle 外へ出る相対パス・外を指す symlink）だと、
+# 複製した全コンテナが元の同じ rootfs を共有し、独立した複製という計測条件が崩れる（書き込みの相互干渉・page cache の共有）。
+# 書き換えではなく拒否にする理由: 計測対象の設定を本スクリプトが改変しない／bundle 外の rootfs には書き換え先がなく、
+# 全コンテナ分の rootfs の複製が別途要る。--bundle はテンプレートなので、複製の前に 1 度だけ検証する（複製は同一内容）。
+# 違反は終了コード 2（create・起動の前）。jq・realpath が無ければ 3。
+check_bundle_root_path() {
+  local rp resolved
+  command -v jq >/dev/null 2>&1 || { err "unsupported-os" "jq is required to validate the bundle config.json"; exit 3; }
+  command -v realpath >/dev/null 2>&1 || { err "unsupported-os" "realpath is required to validate the bundle config.json"; exit 3; }
+  # root.path が無ければ OCI の慣例どおり rootfs として扱う。読む量は 1 MiB に絞る（巨大ファイルを jq へ渡さない）。
+  if ! rp="$(head -c 1048577 -- "$bundle/config.json" 2>/dev/null | jq -er '(.root // {}) | (.path // "rootfs") | select(type=="string")' 2>/dev/null)"; then
+    err "invalid-argument" "the bundle config.json must be valid JSON with a string root.path (or none)"
+    exit 2
+  fi
+  case "$rp" in
+    '' | /* | *$'\n'*) err "invalid-argument" "the bundle root.path must be a relative path inside the bundle (an absolute path would share one rootfs across all copies)"; exit 2 ;;
+  esac
+  resolved="$(realpath -m -- "$bundle/$rp" 2>/dev/null)" || { err "invalid-argument" "the bundle root.path cannot be resolved"; exit 2; }
+  case "$resolved" in
+    "$bundle"/?*) ;;
+    *) err "invalid-argument" "the bundle root.path must stay inside the bundle (no .. or symlink to the outside)"; exit 2 ;;
+  esac
+}
+
 if [ "$mode" = "own" ]; then
   # 起動する 3 つの実行ファイルは固定名で解決し（PATH 探索なし。別のバイナリを測らない）、絶対パス・通常ファイル
   # （symlink でない）・実行可能であることを確かめる。
@@ -309,6 +336,7 @@ if [ "$mode" = "own" ]; then
   # cp -a はシンボリックリンクをリンクのまま複製し、全コンテナの bundle が同じ実体を指して flock 競合する。
   # 実体の絶対パスへ解決してから複製する。
   bundle="$(cd -- "$bundle" 2>/dev/null && pwd -P)" || { err "invalid-argument" "--bundle cannot be resolved"; exit 2; }
+  check_bundle_root_path
 fi
 
 if [ "$mode" = "docker" ]; then
@@ -494,8 +522,8 @@ known=()
 # 一時ディレクトリも削除しない）。
 untracked=0
 keep_tmpdir=0 # ln_stop が 4（回収失敗）を返したら 1。手動回収のため作業ディレクトリを残す（SUP-5）
-untracked_cand=" " # untracked の候補のスロット番号（空白区切り。ln_stop の中で、そのスロットの所有トークンによる追跡が無かったときだけ untracked へ確定する）
-owned_seen=" "     # 所有トークンを観測できたスロット番号（空白区切り。別スロットのトークンは不在証明に使わない）
+untracked_cand=" " # untracked の候補（空白区切りの「スロット番号:報告された init の pid」。ln_stop の中で、その init の pid が所有トークンを継承していると観測できたときだけ解除し、それ以外は untracked へ確定する）
+owned_pids=" "     # 所有トークンを観測できたプロセスの pid（空白区切り）。中間プロセスなど別の pid の観測は init の追跡証明に使わない
 # 起動した子プロセス（収集プロセス・launcher）を配列へ登録し終えるまでの間は 1。この間に受けた
 # TERM / INT / HUP は pending_sig へ記録するだけにして、登録後に処理する（on_signal・spawn_section_end）。
 in_spawn=0
@@ -824,7 +852,7 @@ tracked_pid() { # <i> <pid>
 # 「pid:起動時刻」で OWNED へ入れる。トークンは実行ごとの乱数。列挙からシグナル送信までの間の pid
 # 再利用に備え、送信時は起動時刻とトークンを再照合する（owned_kill）。
 owned_scan() {
-  local f p slot tok_re="${owner_tok//./\\.}"
+  local f p tok_re="${owner_tok//./\\.}"
   OWNED=()
   [ -n "$owner_tok" ] || return 0
   while IFS= read -r f; do
@@ -833,8 +861,7 @@ owned_scan() {
     [[ "$p" =~ $num_re ]] || continue
     if read_starttime "$p" && proc_alive "$p"; then
       OWNED+=("${p}:${ST}")
-      slot="$(tr '\0' '\n' <"$proc/$p/environ" 2>/dev/null | sed -n "s/^FANDHE_BENCH_OWNER=${tok_re}\\.s\([0-9][0-9]*\)\$/\1/p" | head -n 1)" || slot=""
-      case "$owned_seen" in *" ${slot:-x} "*) ;; *) [ -z "$slot" ] || owned_seen="${owned_seen}${slot} " ;; esac
+      case "$owned_pids" in *" ${p} "*) ;; *) owned_pids="${owned_pids}${p} " ;; esac
     fi
   done < <(grep -lzE -- "^FANDHE_BENCH_OWNER=${tok_re}\.s[0-9]+\$" "$proc"/[0-9]*/environ 2>/dev/null || true)
 }
@@ -863,11 +890,29 @@ any_alive() {
   return 1
 }
 
+# スロット i の supervisor が標準出力（ログ）へ出した `FCSUP1 OK <pid>`（コンテナ側 init のホスト上の pid）を返す。
+# 無ければ空。複数行あれば最初の 1 件。ログは収集プロセスが LOG_MAX_KIB KiB で打ち切るため読む量は上限内。
+ln_init_pid() { # <i>
+  local f="$tmpdir/${id_prefix}-${t}-$(($1 + 1)).log"
+  [ -r "$f" ] || return 0
+  sed -n 's/^FCSUP1 OK \([1-9][0-9]\{0,9\}\)$/\1/p' "$f" 2>/dev/null | head -n 1 || true
+}
+
+# known[i]（生存中に記録した「pid:起動時刻」）に init の pid（$2）があれば 0。pid が空なら失敗。
+init_in_known() { # <i> <init pid>
+  local desc
+  [ -n "$2" ] || return 1
+  for desc in ${known[$1]:-}; do
+    [ "${desc%%:*}" = "$2" ] && return 0
+  done
+  return 1
+}
+
 # 全 launcher を停止・回収する（SIGTERM → 期限内に終了しなければ SIGKILL。launcher にも、launcher の
 # 消滅後に残った子孫にも、起動時刻が一致するもの＝pid 再利用でないものにだけシグナルを送る）。
 # 残存があれば 4 を返す。成功・失敗・シグナルのいずれでも呼ばれる（EXIT trap）。何度呼んでも安全。
 ln_stop() {
-  local i pid grace desc waited residual=()
+  local i pid grace desc waited ip cand residual=()
   # launcher を 1 つも登録していなくても、先に起動した収集プロセスは必ず回収する（FIFO の作成失敗や、
   # 収集プロセスの起動中に受けたシグナルで終了する場合。FIFO の open 待ちのまま残さない）。
   # 起動区間へ入った後（need_sweep=1）は pids が空でも以降の処理を省略せず、所有トークンでの走査・
@@ -887,7 +932,10 @@ ln_stop() {
     # FANDHE_BENCH_OWNER を継承しないため、トークン走査でも見つからず、生存していても追跡できない。
     # 子プロセス不在の証明にならないので、追跡不能として扱う（SUP-5。独立性検証スクリプトと同じ）。
     # 所有トークンで 1 件でも見つかれば（スタブ等、環境変数を継承する場合）追跡できているので、回収後に判定する。
-    if ! ln_alive "$i" && [ -z "${known[i]:-}" ]; then untracked_cand="${untracked_cand}${i} "; fi
+    # launcher が既に消滅し、コンテナの init（FCSUP1 OK で報告された pid）を、起動時刻つきで生存中に記録できていない。
+    # 一時的な中間プロセスを 1 件記録しただけでは、コンテナ全体を追跡できた証明にならない。init は所有トークンも継承しない。
+    ip="$(ln_init_pid "$i")"
+    if ! ln_alive "$i" && ! init_in_known "$i" "$ip"; then untracked_cand="${untracked_cand}${i}:${ip} "; fi
   done
   for i in "${!pids[@]}"; do
     sig_same_proc TERM "${pids[i]}" "${pstart[i]:-}" "$$"
@@ -956,14 +1004,17 @@ ln_stop() {
     esac
   done
   # 追跡不能の確定は残存の有無に関わらず先に行う（残存で戻っても状態を残して手動回収へ進めるため）。
-  # 所有トークンの観測はスロット単位で照合し、別のコンテナのトークンを不在証明に使わない。
-  for i in "${!pids[@]}"; do
-    case "$untracked_cand" in
-      *" ${i} "*) case "$owned_seen" in *" ${i} "*) ;; *) untracked=1 ;; esac ;;
+  # 解除できるのは、報告された init の pid そのものが所有トークンを継承していると観測できた場合だけ（別の pid・
+  # 別スロットのトークンの観測は不在証明に使わない。init の追跡の証明にならない）。
+  for cand in ${untracked_cand}; do
+    ip="${cand#*:}"
+    case "$owned_pids" in
+      *" ${ip:-x} "*) ;;
+      *) untracked=1 ;;
     esac
   done
   untracked_cand=" "
-  owned_seen=" "
+  owned_pids=" "
   pids=()
   pstart=()
   snaps=()
@@ -971,7 +1022,7 @@ ln_stop() {
   need_sweep=0
   if [ "${#residual[@]}" -gt 0 ]; then
     if [ "$untracked" -eq 1 ]; then
-      err "cleanup-failed" "processes still running: ${residual[*]}; a launcher exited before any descendant was recorded (state kept at ${tmpdir:-<none>})"
+      err "cleanup-failed" "processes still running: ${residual[*]}; a launcher exited before the container init was recorded (state kept at ${tmpdir:-<none>})"
     else
       err "cleanup-failed" "processes still running: ${residual[*]} (state kept at ${tmpdir:-<none>})"
     fi
@@ -979,7 +1030,7 @@ ln_stop() {
     return 4
   fi
   if [ "$untracked" -eq 1 ]; then
-    err "cleanup-failed" "a launcher exited before any descendant was recorded; container-side processes cannot be tracked (state kept at ${tmpdir:-<none>})"
+    err "cleanup-failed" "a launcher exited before the container init was recorded; container-side processes cannot be tracked (state kept at ${tmpdir:-<none>})"
     keep_tmpdir=1
     return 4
   fi

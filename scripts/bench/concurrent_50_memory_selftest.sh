@@ -156,13 +156,22 @@ record_child() { # この selftest が起動した sleep の pid と起動時刻
   read -ra f <<<"$rest"
   printf '%s %s\n' "$1" "${f[19]:-}" >>"$STUB_PIDFILE"
 }
-if [ "$mode" = "dieafter" ]; then sleep 300 & record_child $!; sleep 1; exit 0; fi
-if [ "$mode" = "diefast" ]; then sleep 300 & record_child $!; exit 0; fi
+# dieafter / diefast: コンテナ側プロセス（init）の pid を FCSUP1 OK で報告してから、launcher だけが先に死ぬ。
+if [ "$mode" = "dieafter" ]; then sleep 300 & record_child $!; echo "FCSUP1 OK $!"; sleep 1; exit 0; fi
+if [ "$mode" = "diefast" ]; then sleep 300 & record_child $!; echo "FCSUP1 OK $!"; exit 0; fi
+# midonly: 一時的な中間プロセス（トークン継承・生存中の子孫として観測される）だけを残して約 1.5 秒後に死ぬ。init は報告せず、
+# 二重 fork で木の外へ出し、トークンも継承しない（init の記録なしに中間プロセスだけが観測される経路）。
+if [ "$mode" = "midonly" ]; then
+  sleep 300 & record_child $!
+  (env -u FANDHE_BENCH_OWNER sleep 300 & record_child $!)
+  sleep 1.5
+  exit 0
+fi
 # diefast_notoken: 実 supervisor と同じく、コンテナ側プロセスが FANDHE_BENCH_OWNER を継承せず、親（本スタブ）も即死する。
 # diefast_mixed: 1 番目のコンテナはトークン非継承の子を残して即死し、それ以外はトークンを継承する子を残して即死する
 # （別コンテナのトークン検出で、1 番目の追跡不能が解除されないことの照合用）。
 if [ "$mode" = "diefast_mixed" ]; then
-  if [ "$idx" = "1" ]; then env -u FANDHE_BENCH_OWNER sleep 300 & record_child $!; else sleep 300 & record_child $!; fi
+  if [ "$idx" = "1" ]; then env -u FANDHE_BENCH_OWNER sleep 300 & record_child $!; else sleep 300 & record_child $!; echo "FCSUP1 OK $!"; fi
   exit 0
 fi
 if [ "$mode" = "diefast_notoken" ]; then env -u FANDHE_BENCH_OWNER sleep 300 & record_child $!; exit 0; fi
@@ -379,7 +388,7 @@ expect_eq "default-count50-no-residual" 0 "$(alive_stub_count)"
 # 残存確認に必要な状態は削除せず保持する（stderr の "state kept at" のパス。確認後に本テストが片付ける）。
 STUB_DIE_I=3 run_fake --count 5 --trials 1 --output "$work/never.json"
 expect_eq "startup-incomplete-exit4" 4 "$rc"
-expect_has "startup-incomplete-untracked-stderr" "$errf" "cleanup-failed: a launcher exited before any descendant was recorded"
+expect_has "startup-incomplete-untracked-stderr" "$errf" "cleanup-failed: a launcher exited before the container init was recorded"
 kept="$(sed -n 's/.*state kept at \(\/[^)]*\)).*/\1/p' "$errf" | head -n 1)"
 if [ -n "$kept" ] && [ -d "$kept" ]; then pass "startup-incomplete-state-kept"; rm -rf -- "$kept"; else fail "startup-incomplete-state-kept"; fi
 expect_eq "startup-incomplete-stdout-empty" 0 "$(wc -c <"$out")"
@@ -464,10 +473,23 @@ expect_eq "diefast-no-orphan-child" 0 "$(orphan_sleep_count)"
 : >"$STUB_PIDFILE"
 STUB_MODE=diefast_notoken run_target --count 2 --trials 1 --settle 1 --timeout 5
 expect_eq "untracked-notoken-exit4" 4 "$rc"
-expect_has "untracked-notoken-stderr" "$errf" "cleanup-failed: a launcher exited before any descendant was recorded"
+expect_has "untracked-notoken-stderr" "$errf" "cleanup-failed: a launcher exited before the container init was recorded"
 kept="$(sed -n 's/.*state kept at \(\/[^)]*\)).*/\1/p' "$errf" | head -n 1)"
 if [ -n "$kept" ] && [ -d "$kept" ]; then pass "untracked-notoken-state-kept"; rm -rf -- "$kept"; else fail "untracked-notoken-state-kept"; fi
 # 未回収の sleep（記録した pid・起動時刻が一致するものだけ）を片付ける。
+while read -r p st; do
+  [ -n "$p" ] && [ "$(awk '{print $22}' "/proc/$p/stat" 2>/dev/null)" = "$st" ] && kill -KILL "$p" 2>/dev/null
+done <"$STUB_PIDFILE" || true
+
+# --- 12d2b. 一時的な中間プロセスだけを記録して launcher が死に、init は報告も記録もされない → 追跡不能（exit 4）・状態保持。
+#           中間プロセスの記録をコンテナ全体の追跡の証明にしない（codex 指摘 PRRT_kwDOUq78ts6tKUN0・SUP-5） ---
+: >"$STUB_PIDFILE"
+STUB_MODE=midonly run_target --count 2 --trials 1 --settle 1 --timeout 5
+expect_eq "midonly-exit4" 4 "$rc"
+expect_has "midonly-stderr" "$errf" "cleanup-failed: a launcher exited before the container init was recorded"
+expect_eq "midonly-stdout-empty" 0 "$(wc -c <"$out")"
+kept="$(sed -n 's/.*state kept at \(\/[^)]*\)).*/\1/p' "$errf" | head -n 1)"
+if [ -n "$kept" ] && [ -d "$kept" ]; then pass "midonly-state-kept"; rm -rf -- "$kept"; else fail "midonly-state-kept"; fi
 while read -r p st; do
   [ -n "$p" ] && [ "$(awk '{print $22}' "/proc/$p/stat" 2>/dev/null)" = "$st" ] && kill -KILL "$p" 2>/dev/null
 done <"$STUB_PIDFILE" || true
@@ -476,7 +498,7 @@ done <"$STUB_PIDFILE" || true
 : >"$STUB_PIDFILE"
 STUB_MODE=diefast_mixed run_target --count 2 --trials 1 --settle 1 --timeout 5
 expect_eq "untracked-mixed-exit4" 4 "$rc"
-expect_has "untracked-mixed-stderr" "$errf" "cleanup-failed: a launcher exited before any descendant was recorded"
+expect_has "untracked-mixed-stderr" "$errf" "cleanup-failed: a launcher exited before the container init was recorded"
 kept="$(sed -n 's/.*state kept at \(\/[^)]*\)).*/\1/p' "$errf" | head -n 1)"
 if [ -n "$kept" ] && [ -d "$kept" ]; then pass "untracked-mixed-state-kept"; rm -rf -- "$kept"; else fail "untracked-mixed-state-kept"; fi
 while read -r p st; do
@@ -488,7 +510,7 @@ done <"$STUB_PIDFILE" || true
 STUB_MODE=diefast_mixed FANDHE_CONCURRENT_MEMORY_SELFTEST=1 FANDHE_CONCURRENT_MEMORY_SELFTEST_NOKILL=1 run_target --count 2 --trials 1 --settle 1 --timeout 5
 expect_eq "untracked-residual-exit4" 4 "$rc"
 expect_has "untracked-residual-stderr" "$errf" "processes still running"
-expect_has "untracked-residual-kept-msg" "$errf" "a launcher exited before any descendant was recorded (state kept at"
+expect_has "untracked-residual-kept-msg" "$errf" "a launcher exited before the container init was recorded (state kept at"
 kept="$(sed -n 's/.*state kept at \(\/[^)]*\)).*/\1/p' "$errf" | head -n 1)"
 if [ -n "$kept" ] && [ -d "$kept" ]; then pass "untracked-residual-state-kept"; rm -rf -- "$kept"; else fail "untracked-residual-state-kept"; fi
 while read -r p st; do
@@ -646,6 +668,24 @@ chmod 700 "$work/bundle-bad/rootfs/sub"
 expect_eq "bundle-copy-fail-exit2" 2 "$rc"
 expect_has "bundle-copy-fail-stderr" "$errf" "cannot copy the bundle template"
 expect_eq "bundle-copy-fail-no-residual" 0 "$(alive_stub_count)"
+
+# --- 12n. config.json の root.path が複製内の相対パスでなければ、複製・create・起動の前に exit 2 で拒否する。
+#          cp -a は root.path を書き換えず、絶対パスだと全コンテナが同じ rootfs を共有する（codex 指摘 PRRT_kwDOUq78ts6tKUN5） ---
+mk_rp_bundle() { # <名前> <config.json の内容>
+  mkdir -p "$work/$1/rootfs"
+  printf '%s\n' "$2" >"$work/$1/config.json"
+}
+mk_rp_bundle bundle-abs "{\"root\":{\"path\":\"$work/bundle/rootfs\"}}"
+mk_rp_bundle bundle-dotdot '{"root":{"path":"../bundle/rootfs"}}'
+mk_rp_bundle bundle-nonstring '{"root":{"path":7}}'
+mk_rp_bundle bundle-symlink '{"root":{"path":"link"}}'
+ln -s "$work/bundle/rootfs" "$work/bundle-symlink/link"
+for b in bundle-abs bundle-dotdot bundle-nonstring bundle-symlink; do
+  run_target --count 2 --trials 1 --timeout 5 --bundle "$work/$b"
+  expect_eq "root-path-${b}-exit2" 2 "$rc"
+  expect_has "root-path-${b}-stderr" "$errf" "root.path"
+  expect_eq "root-path-${b}-no-residual" 0 "$(alive_stub_count)"
+done
 
 # --- 13. 引数エラーは exit 2 ---
 expect_rc2() { # <名前> <引数...>

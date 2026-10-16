@@ -32,7 +32,8 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! 指示を読んで `mount(2)` を実行し報告を出すゲスト init（TASK-64 の Rust 製 init）は本リポに未存在。
+//! 指示を読んで `mount(2)` を実行し報告を出すゲスト init は `crates/guest-init`（#1875）。initrd への梱包は #1878、
+//! 実機での確認は #1628（人間担当）で、いずれも未実施。
 //! 実機の end-to-end 検証は `tests/virtiofs_io.rs` の `#[ignore]` テスト（TASK-65.4・実機前提）。mount 後の再接続・エラー処理は TASK-65.5。
 
 use std::sync::Arc;

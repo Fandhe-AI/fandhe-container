@@ -77,6 +77,10 @@ cat <<'EOF'
                                         crash-summary-check の自己テスト（#1833・IO-3・REPAIR-12。fixture のみ）
   vz-virtio-gpu-guest-check-selftest  poc/vz-custom-virtio-gpu/guest/check-virtio-gpu-selftest.sh
                                         virtio-gpu ゲスト側確認スクリプトの自己テスト（TASK-172.6・GPU-6・REPAIR-12。fixture のみ）
+  guest-kernel-build                  guest/kernel/build.sh
+                                        macOS ゲストカーネル（arm64）の取得・sha256 照合・ビルド（TASK-64 追補・#1874・MAC-1。ネットワークと実ビルド。make ci には含めない）
+  guest-kernel-build-selftest         guest/kernel/build-selftest.sh
+                                        ゲストカーネルのビルドスクリプトの自己テスト（#1874・MAC-1・REPAIR-12。スタブのみ）
   third-party-licenses-selftest       scripts/generate-third-party-licenses-selftest.sh
                                         ライセンス表記生成スクリプトの自己テスト（スタブ cargo のみ。TASK-103.1）
   deny-license-fail-closed-selftest   scripts/targets/deny-license-fail-closed-selftest.sh

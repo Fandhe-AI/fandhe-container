@@ -18,3 +18,9 @@ _/
 
 # 環境変数
 .env*
+
+# macOS ゲストカーネルの取得物・成果物（guest/kernel/README.md。バイナリはコミットしない）
+/guest/kernel/*.tar.xz
+/guest/kernel/Image
+/guest/kernel/build/
+/guest/kernel/out/

@@ -207,6 +207,44 @@ impl Plan {
         }
     }
 
+    /// 副作用・確保の前に、全フィールドが `parse_args` と同じ範囲にあることを検証する。
+    ///
+    /// フィールドが公開で `run*` を直接呼べるため、公開の実行入口はすべてこれを通す
+    /// （`batch_size == 0` の剰余 panic・過大確保の防止。REPAIR-5・coding-rust）。
+    pub fn validate(&self) -> Result<(), SmallFilesError> {
+        let check = |ok: bool, msg: &'static str| {
+            if ok {
+                Ok(())
+            } else {
+                Err(SmallFilesError::args(msg))
+            }
+        };
+        check(
+            (MIN_COUNT..=MAX_COUNT).contains(&self.count),
+            "count is out of range",
+        )?;
+        check(
+            (1..=MAX_BATCH_SIZE_ARG).contains(&self.batch_size) && self.batch_size <= self.count,
+            "batch_size is out of range",
+        )?;
+        check(
+            (1..=MAX_FILE_SIZE).contains(&self.file_size),
+            "file_size is out of range",
+        )?;
+        check(
+            (1..=MAX_TRIALS).contains(&self.trials),
+            "trials is out of range",
+        )?;
+        check(
+            (1..=MAX_TRIAL_TIMEOUT_SECS).contains(&self.trial_timeout.as_secs()),
+            "trial_timeout is out of range",
+        )?;
+        check(
+            (1..=MAX_TIMEOUT_SECS).contains(&self.timeout.as_secs()),
+            "timeout is out of range",
+        )
+    }
+
     fn is_every_k(&self) -> bool {
         self.batch_size > 1
     }
@@ -385,6 +423,7 @@ pub fn run_trial(
     trial_deadline: Instant,
     overall_deadline: Instant,
 ) -> Result<Duration, SmallFilesError> {
+    plan.validate()?;
     // 区間の外: Batch の組み立てと creator の構築。
     let batch = build_write_batch(plan.file_size)?;
     let creator = GuestFileCreator::new(trial_root.to_path_buf()).map_err(|e| from_io(&e))?;
@@ -438,6 +477,7 @@ impl WorkDir {
             "fandhe-small-files-{}-{nanos:x}",
             std::process::id()
         ));
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
@@ -527,6 +567,7 @@ pub fn median(values: &[f64]) -> Option<f64> {
 
 /// 計画を `root` の下で実行する。全体の期限は呼び出し時点から `plan.timeout`。
 pub fn run(plan: &Plan, root: &Path) -> Result<Measurement, SmallFilesError> {
+    plan.validate()?;
     let deadline = Instant::now()
         .checked_add(plan.timeout)
         .ok_or_else(|| SmallFilesError::args("timeout is out of range"))?;
@@ -539,6 +580,7 @@ pub fn run_with_deadline(
     root: &Path,
     overall_deadline: Instant,
 ) -> Result<Measurement, SmallFilesError> {
+    plan.validate()?;
     if !persist_support().is_supported() {
         return Err(SmallFilesError::new(
             "persist-unsupported",
@@ -653,6 +695,42 @@ mod tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// IO-6: 公開の実行入口は不正な計画を副作用の前に構造化エラーで拒否する。
+    #[test]
+    fn invalid_plan_is_rejected_before_side_effects() {
+        let bad = [
+            Plan {
+                batch_size: 0,
+                ..Plan::smoke()
+            },
+            Plan {
+                file_size: 0,
+                ..Plan::smoke()
+            },
+            Plan {
+                file_size: MAX_FILE_SIZE + 1,
+                ..Plan::smoke()
+            },
+            Plan {
+                trials: MAX_TRIALS + 1,
+                ..Plan::smoke()
+            },
+            Plan {
+                count: MAX_COUNT + 1,
+                ..Plan::smoke()
+            },
+        ];
+        let root = std::env::temp_dir();
+        let now = Instant::now();
+        for plan in &bad {
+            assert_eq!(
+                run_trial(&root, plan, now, now).unwrap_err().code,
+                "invalid-args"
+            );
+            assert_eq!(run(plan, &root).unwrap_err().code, "invalid-args");
+        }
     }
 
     fn run_plan(v: &[&str]) -> (Plan, PathBuf, PathBuf) {

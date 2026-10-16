@@ -2,6 +2,8 @@
 
 TASK-189・IO-6・IO-7・REPAIR-8（関連: IO-1・IO-2・REPAIR-3・REPAIR-5）。計測定義の承認は #1897、実装は #1898。実装は `benches/src/small_files.rs`、入口は `benches/benches/small_files.rs`。
 
+- 対象マイルストーン: MS-1 Phase 2（IO 系ベンチ。io-fio-bench と同じ）。REPAIR-8 の基準値登録は MS-2 Phase 3（bench-calibration.md と同じ）。spec が未取得の環境で既存設計文書から対応づけたため、spec と食い違う場合は spec を正とする
+
 ## 位置づけ
 
 - IO-6（3〜5 万件の実機実測。#107）・IO-7（bind / named volume の比。#110）・REPAIR-8（主要ベンチ）が使う計測手段

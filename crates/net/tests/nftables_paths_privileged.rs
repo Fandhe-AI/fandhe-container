@@ -49,10 +49,33 @@
 //!
 //! # router の lo
 //!
-//! router は自分の netns の `lo` を up にする。(c) のルール投入前に、ホスト自身が外側アドレス宛てに
-//! 送る UDP を自分の待受が受ける場面は、ローカル宛て配送が loopback デバイスを通るため（新規 netns の
-//! `lo` は down で、そのままだと送信は成功扱いのまま破棄される。#1927）。子は自己宛て配送が無いため
-//! `lo` を触らない。`lo` の up も隔離 netns の中に閉じ host は変えない。
+//! router は自分の netns の `lo` を up にする。(c) のルール投入前に、ホスト自身が外側アドレス
+//! （`HOST_OUTER`）宛てに送る UDP を自分の待受が受ける場面があるため（#1927・#2078）。
+//!
+//! 仕組みは Linux v7.0（タグの commit `028ef9c96e96197026887c0f092424679298aae8`）のソースで確かめた。
+//! 行番号は版で動くためファイル名と関数名だけを挙げる。
+//!
+//! - 経路の解決: 付けたアドレスの /32 の `RTN_LOCAL` 経路は、デバイスが down でも `fib_add_ifaddr`
+//!   （`net/ipv4/fib_frontend.c`）が local 表へ入れる。`ip_route_output_key_hash_rcu`
+//!   （`net/ipv4/route.c`）は `RTN_LOCAL` の分岐で出口を `net->loopback_dev` にする。アドレスが
+//!   `lo` 以外（本試験では `fpe0`）に付いていても、自己宛ての送信は `lo` を経由する。出口を明示した
+//!   場合（`SO_BINDTODEVICE` 等）だけ `IFF_UP` を見て `-ENETUNREACH` を返す分岐があるが、本試験は
+//!   出口を指定しないので通らない。
+//! - 破棄の場所: `lo` は `IFF_NO_QUEUE`（`drivers/net/loopback.c` の `loopback_setup`）。一度も up に
+//!   していない新規 netns の `lo` は、`dev_activate`（`net/sched/sch_generic.c`）が未実行で
+//!   qdisc が `noop_qdisc` のまま。`__dev_queue_xmit` / `__dev_xmit_skb`（`net/core/dev.c`）はそれの
+//!   `noop_enqueue` を呼び、`noop_enqueue` は `tx_dropped` を数えて skb を捨て `NET_XMIT_CN` を返す。
+//!   `dev_queue_xmit` の `IFF_UP` 検査は、noqueue の直接送信の経路にあり、down のときは到達しない。
+//! - 送信側から見える結果: `net_xmit_errno(NET_XMIT_CN)` は 0 のため `sendto` は成功を返す（仮に
+//!   `-ENOBUFS` を返す分岐を通っても、`udp_send_skb` は `IP_RECVERR` が無ければ 0 にする）。
+//!   受信側には届かず、`set_read_timeout` の受信は期限切れになる。
+//! - 関係しないもの: 捨てられるのは送信側の qdisc で、受信の入力経路の解決
+//!   （`ip_rcv_finish_core`。`fib_validate_source` つまり `rp_filter` はここ）より前である。経路表も
+//!   上のとおり正しく解決される。どちらも原因ではない。
+//!
+//! 子は自己宛て配送が無いため `lo` を触らない。`lo` の up も隔離 netns の中に閉じ host は変えない。
+//! 製品コードは `network.rs` の `configure_in_netns`（`AttachStep::ConfigureLoopback`）で `lo` を up に
+//! するため、試験側の up で足りる。
 //!
 //! ip_forward・nft ルール・bridge・veth はすべて隔離 netns の中に閉じ、host の設定は変えない。待ちは
 //! すべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で期限を切る（REPAIR-5）。前提（root・
@@ -122,7 +145,7 @@ mod linux {
     const HOST_OUTER: Ipv4Addr = Ipv4Addr::new(10, 212, 2, 1);
     const EXTERNAL_ADDR: Ipv4Addr = Ipv4Addr::new(10, 212, 2, 2);
     const BRIDGE: &str = "fbr0";
-    /// router の netns のループバック。ホスト自身宛ての配送が通る（#1927）。
+    /// router の netns のループバック。自己宛て配送の出口になる（`//!` の「router の lo」、#1927・#2078）。
     const LO: &str = "lo";
     const PC1: &str = "fpc1";
     const CC1: &str = "fcc1";
@@ -766,8 +789,9 @@ mod linux {
         external.expect_prefix("ready");
 
         let sock = NetlinkRouteSocket::open().expect("open netlink route socket");
-        // 新規 netns の lo は down。down のままだと自己宛て（HOST_OUTER 宛て）の送信は noop qdisc で
-        // 黙って破棄され、(c) 投入前の照合が受信期限切れになる（#1927）。
+        // 新規 netns の lo は down。自己宛て（HOST_OUTER 宛て）は RTN_LOCAL で lo が出口になり、down の
+        // lo の noop qdisc（noop_enqueue）が黙って捨てる。sendto は成功し受信は期限切れになる。
+        // 根拠は `//!` の「router の lo」（Linux v7.0 で確認。#1927・#2078）。
         configure_router_side(&sock, LO, None);
         assert_lo_up(&sock, "after link up");
         sock.create_link(&LinkCreate::bridge(ifname(BRIDGE)), timeout())

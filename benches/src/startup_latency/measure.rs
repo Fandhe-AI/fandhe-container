@@ -1029,6 +1029,20 @@ mod real_process_tests {
             .expect("spawn sh")
     }
 
+    /// `sleep 30` を直接起動する（シェルを挟まないため、kill が孫を孤児にしない）。`arg0` を指定すると
+    /// cmdline の先頭にその値が載る（nonce の走査の試験用）。
+    fn sleeper(arg0: Option<&str>) -> Child {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(a) = arg0 {
+            cmd.arg0(a);
+        }
+        cmd.spawn().expect("spawn sleep")
+    }
+
     #[test]
     fn child_exit_code_is_reported_before_the_deadline() {
         let mut child = sh("exit 3", &[]);
@@ -1040,7 +1054,7 @@ mod real_process_tests {
 
     #[test]
     fn overdue_child_is_killed_and_reaped() {
-        let mut child = sh("sleep 30", &[]);
+        let mut child = sleeper(None);
         let started = Instant::now();
         match wait_for_exit(&mut child, Duration::from_millis(150)) {
             ExitWait::TimedOut { reaped } => assert!(reaped, "killed child must be reaped"),
@@ -1058,8 +1072,8 @@ mod real_process_tests {
             std::process::id(),
             Tmp::new("n").0.display()
         );
-        // 最後のコマンドが exec されて nonce（$0）が cmdline から消えないよう、`; :` で sleep を末尾にしない。
-        let mut child = sh("sleep 30; :", &[&nonce]);
+        // nonce を arg0 に載せた sleep を直接起動する（シェル経由だと kill がシェルだけを終わらせ、孫の sleep が残る）。
+        let mut child = sleeper(Some(&nonce));
         assert!(wait_until(Duration::from_secs(5), || probe_count(&nonce) == Some(1)));
         let _ = child.kill();
         let _ = child.wait();

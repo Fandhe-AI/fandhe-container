@@ -467,6 +467,79 @@ mod tests {
         assert_eq!(ok.rules()[0].allowed.bits(), 0x5);
     }
 
+    /// OCI-4・CORE-5・SEC-1(#1915): Landlock の ruleset は、適用する bind と同じ `mounts[]` から導かれる。
+    /// 各 bind の宛先・位置に `Mount` 由来のルールがあり、記録(`LaunchIsolationRecord`)にも同じ宛先で入り、
+    /// 記録から組み直した ruleset(`exec/reapply.rs` の再適用の入力)も元とルールが一致する。
+    #[test]
+    fn oci4_core5_bind_mounts_and_landlock_rules_share_one_mounts_list() {
+        use crate::landlock::{RuleOrigin, RulePath};
+        use crate::launch_isolation::{RecordedTarget, RootIdentity};
+        use crate::oci_runtime::BindMountSet;
+        let json = serde_json::json!({
+            "ociVersion": "1.2.0",
+            "root": {"path": "rootfs"},
+            "mounts": [
+                {"destination": "/data", "type": "bind", "source": "/srv/data", "options": ["bind", "rw"]},
+                {"destination": "/cache", "type": "bind", "source": "/srv/cache", "options": ["rbind", "noexec"]}
+            ]
+        });
+        let config =
+            crate::oci_runtime::parse_config_bytes(json.to_string().as_bytes()).expect("config");
+        let binds = BindMountSet::from_mounts(config.mounts()).expect("binds");
+        let ruleset =
+            ruleset_from_detection(crate::landlock::evaluate_abi(6), &config).expect("ruleset");
+        for b in binds.mounts() {
+            let rule = ruleset
+                .rules()
+                .iter()
+                .find(|r| r.origin == (RuleOrigin::Mount { index: b.index() }))
+                .expect("a rule for every bind");
+            assert_eq!(rule.path.as_str(), b.destination().as_str());
+            assert!(matches!(rule.path, RulePath::Beneath(_)));
+        }
+        let record = LaunchIsolationRecord::new(RootIdentity::new(1, 2), &ruleset).expect("record");
+        let recorded: Vec<(usize, String)> = record
+            .landlock()
+            .rules()
+            .iter()
+            .filter_map(|r| match r.target() {
+                RecordedTarget::Mount { destination, index } => {
+                    Some((*index, destination.as_str().to_owned()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![(0, "/data".to_owned()), (1, "/cache".to_owned())]
+        );
+        let rebuilt = record.landlock_ruleset().expect("rebuilt");
+        assert_eq!(rebuilt.rules(), ruleset.rules());
+    }
+
+    /// OCI-4・CORE-5(#1915): `ro` の bind は、root が書き込み可能な構成では Landlock が書き込み制限を
+    /// 保証できず fork 前に拒否される(`WriteRestrictionShadowed`。#1917 の解消までの想定挙動)。
+    #[test]
+    fn core5_readonly_bind_is_refused_before_fork_until_1917() {
+        let json = serde_json::json!({
+            "ociVersion": "1.2.0",
+            "root": {"path": "rootfs"},
+            "mounts": [
+                {"destination": "/data", "type": "bind", "source": "/srv/data", "options": ["bind", "ro"]}
+            ]
+        });
+        let config =
+            crate::oci_runtime::parse_config_bytes(json.to_string().as_bytes()).expect("config");
+        let e = ruleset_from_detection(crate::landlock::evaluate_abi(6), &config)
+            .expect_err("ro bind must be refused");
+        assert_eq!(e.stage, IsolationStage::Landlock);
+        assert!(
+            e.message.contains("write_restriction_shadowed"),
+            "{}",
+            e.message
+        );
+    }
+
     /// CORE-5・TASK-39.5: プローブ件数の上限超過は適用前に InvalidArgument で拒否する。
     #[test]
     fn core5_access_probe_limit_is_rejected_before_apply() {

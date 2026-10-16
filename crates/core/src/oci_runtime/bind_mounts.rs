@@ -5,7 +5,7 @@
 //! Linux の fandhe のコンテナは、利用者指定の bind mount（`config.json` の `mounts[]`）を適用する（#1907 の
 //! オーナー判断）。本モジュールは「何を受けて何を拒否するか」を 1 か所の純粋関数 [`BindMountSet::from_mounts`] と
 //! 検証済みの型 [`BindMountSpec`] に固定する。適用側は #1912（sys ラッパー）・#1913（適用の段）・#1914（pivot 前段）・
-//! #1915（`start` への結線）が本型だけを入力にする。`OciMount` は「未検証の指定」、[`BindMountSet`] は
+//! #1915（`start` への結線。済み）が本型だけを入力にする。`OciMount` は「未検証の指定」、[`BindMountSet`] は
 //! 「検証済みの bind」の分担で、`OciMount` 側は変更しない。
 //!
 //! 受け入れ範囲は #1910 のオーナー決定（2026-10-12）による。`cfg` を付けず 3 OS でビルドし、syscall・
@@ -60,9 +60,10 @@
 //! 本型は字句検証のみで、検証から適用までの TOCTOU を防がない。symlink を含む実体の照合・fd 起点 `O_NOFOLLOW` の
 //! 走査・種別と存在の確認・宛先ディレクトリの作成・利用者権限での到達性・rootfs 自身とその祖先の実体照合（`dev`/`ino`）は、
 //! 適用の段 `crate::exec::mount_binds`（#1913。実装済み。Linux 限定のため intra-doc リンクは張らない）が担う。
-//! 実体照合の残余（REPAIR-3）は bundle・状態ルートと、ホスト側の別の bind mount による別名で、字句検証（`check_against_host_paths`）
-//! だけが効く。`run_pre_pivot` への組み込みは済み（#1914）、`ro` と Landlock の `WriteRestrictionShadowed` の衝突解消は #1917、
-//! `start` の結線は #1915。監査 sink の本番配線も #1915 で未実装。`MountDestination::resolve_in` の文字列結合で直接 mount してはならない。
+//! 実体照合の残余（REPAIR-3）は bundle の実体で、字句検証（`check_against_host_paths`）だけが効く。`run_pre_pivot` への組み込みは済み（#1914）、`start` と本番 launcher への結線は済み（#1915。検証は `start`、tmpfs との重なりは launcher、
+//! 監査は `ProcessLauncher::rejection_audit_sink` 経由）。`ro` と Landlock の `WriteRestrictionShadowed` の衝突解消は #1917
+//! （それまで `ro` の bind は fork 前に拒否される）。状態ルートとの重なりは `start` が字句比較・`canonicalize` 比較・
+//! mountinfo によるファイルシステム内の実体照合（別の bind mount による別名）で検査する。適用の段も固定した元に対して状態ルートとの重なりを毎回再検証する（`ProtectedFsRoot`。元のマウントは fd の `mnt_id` で特定し、`rbind` のときだけ配下のマウントを照合する。保護対象と同じ FS 上のリンク数 2 以上の通常ファイルは拒否する。状態ルート配下にリンク数 2 以上の通常ファイルがあれば、同じ FS 上のディレクトリ元も拒否する）。`MountDestination::resolve_in` の文字列結合で直接 mount してはならない。
 
 use std::fmt;
 use std::path::Path;
@@ -265,9 +266,136 @@ impl std::error::Error for BindMountError {}
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BindMountSet {
     mounts: Vec<BindMountSpec>,
+    /// start の段が検査した保護対象（状態ストアのルート）のファイルシステム内の実体。適用の段が毎回照合する（SEC-1）。
+    protected: Vec<ProtectedFsRoot>,
+}
+
+/// 保護対象のファイルシステム内の実体（mountinfo の `major:minor` と FS 内パス。bind mount の別名は同じ値になる）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProtectedFsRoot {
+    dev: String,
+    path: String,
+    /// 状態ルート配下にリンク数 2 以上の通常ファイル（別名のハードリンクを持つ状態ファイル）があった。
+    /// 真なら同じ FS 上のディレクトリ元は、配下に状態ファイルの別名を含み得るため拒否する（SEC-1）。
+    has_hard_linked_files: bool,
+    /// 設定されていれば、適用の段が毎回この状態ルート（ホストの正規化済みパス）配下を走査し直して
+    /// `has_hard_linked_files` を更新する（start 後に追加されたハードリンクを restart でも検出する。SEC-1・#1915）。
+    scan_root: Option<String>,
+    /// 走査で降りないホストのパス（別のファイルシステムのマウントポイント）。そのマウントは別の `ProtectedFsRoot` が
+    /// 自分のマウントポイントを `scan_root` にして走査する。これにより、他の FS 上のリンクでこの FS を拒否しない（SEC-1・#1915）。
+    scan_prune: Vec<String>,
+    /// 真なら状態ルートではなく rootfs・bundle の実体。ハードリンクの検査は行わず、元（と rbind で公開される子孫マウント）が
+    /// この実体と同一・祖先のときだけ拒否する（配下の別の実体を元にすることは許す。SEC-1）。
+    containment_only: bool,
+}
+
+impl ProtectedFsRoot {
+    pub(crate) fn new(dev: String, path: String, has_hard_linked_files: bool) -> Self {
+        Self {
+            dev,
+            path,
+            has_hard_linked_files,
+            scan_root: None,
+            scan_prune: Vec::new(),
+            containment_only: false,
+        }
+    }
+
+    /// rootfs・bundle の実体を保護対象にする（同一・祖先の元だけを拒否する）。
+    pub(crate) fn contained(dev: String, path: String) -> Self {
+        Self {
+            containment_only: true,
+            ..Self::new(dev, path, false)
+        }
+    }
+
+    /// 適用の段（Linux 限定の `exec::mount_binds`）だけが読む。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn is_containment_only(&self) -> bool {
+        self.containment_only
+    }
+
+    /// 適用のたびに `root` 配下のハードリンクを走査し直すようにする（`new` の固定値より優先）。
+    /// `prune` のパス（走査根の配下の他 FS のマウントポイント）へは降りない。
+    pub(crate) fn with_scan_root(mut self, root: String, prune: Vec<String>) -> Self {
+        self.scan_root = Some(root);
+        self.scan_prune = prune;
+        self
+    }
+
+    /// 適用の段（Linux 限定の `exec::mount_binds`）だけが読む。
+    #[cfg(target_os = "linux")]
+    ///
+    /// `scan_root` があれば呼び出しのたびに走査し直す。走査できない・項目数が多すぎる場合は「持つ」とみなす（fail-closed）。
+    pub(crate) fn has_hard_linked_files(&self) -> bool {
+        match &self.scan_root {
+            Some(root) => state_tree_has_hard_links(std::path::Path::new(root), &self.scan_prune)
+                .unwrap_or(true),
+            None => self.has_hard_linked_files,
+        }
+    }
+
+    /// 適用の段（Linux 限定の `exec::mount_binds`）だけが読む。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn dev(&self) -> &str {
+        &self.dev
+    }
+
+    /// 適用の段（Linux 限定の `exec::mount_binds`）だけが読む。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+/// 状態ルート配下の走査で見る項目数の上限（超過は `None`。無制限の走査を避ける）。
+#[cfg(target_os = "linux")]
+const STATE_SCAN_MAX_ENTRIES: usize = 100_000;
+
+/// 状態ルート配下に、リンク数 2 以上の通常ファイルがあるかを調べる（SEC-1・#1915）。
+/// symlink は辿らない。読めない・項目数が `STATE_SCAN_MAX_ENTRIES` を超える場合は `None`（呼び出し側が「持つ」とみなす）。
+/// 走査から attach までの間に追加されるハードリンクは検出できない（残る競合。状態ルートへの書き込み権限が前提）。
+#[cfg(target_os = "linux")]
+/// `prune` に一致するパスのディレクトリには降りない（別 FS のマウントを、この FS の判定に混ぜない）。
+fn state_tree_has_hard_links(root: &std::path::Path, prune: &[String]) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut stack = vec![root.to_path_buf()];
+    let mut seen = 0usize;
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).ok()? {
+            let entry = entry.ok()?;
+            seen += 1;
+            if seen > STATE_SCAN_MAX_ENTRIES {
+                return None;
+            }
+            let meta = std::fs::symlink_metadata(entry.path()).ok()?;
+            if meta.is_dir() {
+                let path = entry.path();
+                if prune.iter().any(|p| path == std::path::Path::new(p)) {
+                    continue;
+                }
+                stack.push(path);
+            } else if meta.is_file() && meta.nlink() > 1 {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
 }
 
 impl BindMountSet {
+    /// start の段が検査した保護対象の実体を持たせる。適用の段が固定した元に対して毎回照合する（SEC-1・#1915）。
+    pub(crate) fn with_protected_roots(mut self, roots: Vec<ProtectedFsRoot>) -> Self {
+        self.protected = roots;
+        self
+    }
+
+    /// 適用の段（Linux 限定の `exec::mount_binds`）が照合する保護対象の実体。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn protected_roots(&self) -> &[ProtectedFsRoot] {
+        &self.protected
+    }
+
     /// `mounts[]` を検証して bind の集合へ変換する。1 件でも拒否されれば全体を拒否する（fail-closed）。
     ///
     /// 件数は確保前に検証する。処理順は種類 → オプション → マウント元 → マウント先 → 先行 bind との関係。
@@ -318,7 +446,10 @@ impl BindMountSet {
                 recursive: opts.recursive,
             });
         }
-        Ok(Self { mounts: out })
+        Ok(Self {
+            mounts: out,
+            protected: Vec::new(),
+        })
     }
 
     /// 指定順の bind 一覧。
@@ -411,6 +542,64 @@ impl BindMountSet {
         }
         Ok(())
     }
+
+    /// 元が `protected` のいずれかと同一・祖先・子孫のとき `ForbiddenSource` で拒否する（状態ルート用）。
+    ///
+    /// [`Self::check_against_host_paths`] は子孫を許すが、状態ルートの配下を書込み可能で公開すると
+    /// `state.json` 等を改変できるため、両方向で拒否する（SEC-1・OCI-4・#1915）。字句比較のみ。
+    pub fn check_against_protected_trees(&self, protected: &[&str]) -> Result<(), BindMountError> {
+        for b in &self.mounts {
+            if protected.iter().any(|f| overlaps(f, &b.source)) {
+                return Err(BindMountError::at(
+                    b.index,
+                    BindMountErrorKind::ForbiddenSource,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 各指定（元と `recursive` の指定を含む）を `hits` に渡し、`true`（保護対象に到達する）なら
+    /// `ForbiddenSource` で拒否する。
+    ///
+    /// 到達の判定（mountinfo によるファイルシステム内の実体照合など）は呼び出し側が担う（SEC-1・#1915）。
+    pub fn check_sources_with<F>(&self, hits: F) -> Result<(), BindMountError>
+    where
+        F: Fn(&BindMountSpec) -> bool,
+    {
+        for b in &self.mounts {
+            if hits(b) {
+                return Err(BindMountError::at(
+                    b.index,
+                    BindMountErrorKind::ForbiddenSource,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 各元を `resolve`（実体のパスへの正規化。解決できなければ `None` で対象外）で解決してから
+    /// [`Self::check_against_protected_trees`] と同じ規則で拒否する（symlink 経由の到達を塞ぐ）。
+    pub fn check_resolved_sources_against_protected_trees<F>(
+        &self,
+        protected: &[&str],
+        resolve: F,
+    ) -> Result<(), BindMountError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        for b in &self.mounts {
+            if let Some(real) = resolve(&b.source)
+                && protected.iter().any(|f| overlaps(f, &real))
+            {
+                return Err(BindMountError::at(
+                    b.index,
+                    BindMountErrorKind::ForbiddenSource,
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// options を畳み込んだ結果。
@@ -476,7 +665,7 @@ fn validate_source(index: usize, m: &OciMount) -> Result<String, BindMountError>
 /// bind mount の変換拒否を `Mount` 監査レコードにする（SEC-4）。
 ///
 /// `path` は位置が `mounts` で解決できるときだけコンテナ内の宛先を載せる。マウント元（ホスト側パス）は載せない。
-/// エラーは常にそのまま返る。sink の本番配線は #1915 で未実装（REPAIR-3）。
+/// エラーは常にそのまま返る。本番では `start` が `ProcessLauncher::rejection_audit_sink` の sink を渡す（#1915）。
 pub fn audit_bind_mount_error(
     err: BindMountError,
     mounts: &[OciMount],

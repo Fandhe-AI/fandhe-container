@@ -23,7 +23,7 @@
 //!
 //! # 未対応（REPAIR-3: 実装済みを装わない）
 //!
-//! `uid=`・`gid=`・`%` 指定・`suid` / `dev` の許可・OCI `mounts[]` からの変換（TASK-127・TASK-29 系）。
+//! `uid=`・`gid=`・`%` 指定・`suid` / `dev` の許可・OCI `mounts[]` からの tmpfs への変換（TASK-127・TASK-29 系。bind は `BindMountSet`）。
 
 use crate::dev_mounts::ImplicitDevMount;
 use crate::oci_runtime::{CONFIG_MAX_PATH_BYTES, MountDestination};

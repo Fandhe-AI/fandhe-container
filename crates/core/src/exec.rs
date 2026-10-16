@@ -29,7 +29,7 @@
 //!    **実装済み**だが、検証済みの `/dev/null` が要るため `setup` 指定時のみ。`setup` なしの最小構成は適用しない）
 //!    検証済みの bind mount（`config.json` の `mounts[]` の bind。CORE-1・SEC-1）は [`mount_binds`]（`exec/bind_mounts.rs`。
 //!    TASK-29 追補・#1913。**段の実装は済み**。`run_pre_pivot` へ組み込み済みで、`inject_files` の後・`readonly_paths` の前に固定した〔#1914〕。
-//!    `start` への結線は #1915）が、マウント元の固定・属性・付け替え・事後検証を fd 起点で行う
+//!    `start` と本番 launcher への結線は #1915 で済み）が、マウント元の固定・属性・付け替え・事後検証を fd 起点で行う
 //! 4. 順序固定のステージ列: cgroup 参加 → capability 削減 → `PR_SET_NO_NEW_PRIVS`
 //!    → Landlock → seccomp（#136・#832・#833。**枠・`NO_NEW_PRIVS`・capability 削減・seccomp は実装済み**: [`StagePipeline`] が
 //!    [`StageKind::ORDER`] の固定順でフックを呼び、`NO_NEW_PRIVS` は差し替え不可の組み込み段として
@@ -1944,9 +1944,18 @@ fn fd_mount_id(dir: &OwnedFd, stage: IsolationStage) -> Result<u64, ExecError> {
 /// 呼び出しスレッドの mount namespace の mountinfo（`/proc/self/mountinfo` はスレッドグループの
 /// 代表の namespace を映すため使わない）。
 fn read_thread_mountinfo(stage: IsolationStage) -> Result<String, ExecError> {
-    std::fs::read_to_string("/proc/thread-self/mountinfo").map_err(|_| {
-        mountinfo_error("cannot read /proc/thread-self/mountinfo to verify mount propagation")
-            .at_stage(stage)
+    use crate::oci_runtime::mountinfo_identity::{MountinfoReadError, read_mountinfo_bounded};
+    // 上限つきで読む（巨大な mountinfo による無制限確保を避ける。超過は fail-closed）。
+    read_mountinfo_bounded("/proc/thread-self/mountinfo").map_err(|e| {
+        let msg = match e {
+            MountinfoReadError::TooLarge => {
+                "/proc/thread-self/mountinfo exceeds the size limit; cannot verify mount propagation"
+            }
+            MountinfoReadError::Unreadable => {
+                "cannot read /proc/thread-self/mountinfo to verify mount propagation"
+            }
+        };
+        mountinfo_error(msg).at_stage(stage)
     })
 }
 

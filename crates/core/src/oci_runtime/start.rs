@@ -64,7 +64,8 @@
 //! - `process.cwd` が `/` 以外（exec フローが cwd 未対応）
 //! - `process.user` が uid 0・gid 0・追加 gid なし以外（ユーザー切替は未実装）
 //! - `process.terminal` が true（端末受け渡し未実装）
-//! - `mounts` が非空（mount 適用未実装）
+//! - `mounts` のうち bind 以外の種類・#1910 の拒否規則に反する bind（`BindMountSet`。検証済みの bind は
+//!   launcher が pivot 前に適用する。#1915。状態ルートとの重なりは字句・`canonicalize`・mountinfo の実体照合で検査する。`ro` の bind〔#1917〕は未対応）
 //! - `linux.namespaces[].path` の指定（既存 namespace への join 未実装）
 //! - `network`・`cgroup`・`time` namespace（exec の対応は PID/Mount/UTS/IPC/User のみ）
 //! - `linux.namespaces` に user namespace が無い（`process.user` は root 必須のため、ホスト root での
@@ -117,12 +118,17 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
+use super::bind_mounts::{BindMountError, BindMountSet, ProtectedFsRoot, audit_bind_mount_error};
 use super::cgroup_requirement::CgroupRequirement;
 use super::config::{NamespaceKind, OciConfig};
 use super::create::validate_bundle;
 use super::error::{LifecycleOp, OciRuntimeError};
 use super::launch::{
     BundleLock, LaunchMode, LaunchSpec, LaunchedProcess, ProcessLauncher, RootfsDir, StartTimeouts,
+};
+use super::mountinfo_identity::{
+    FsIdentity, MountinfoReadError, fs_identity, mounts_under, parse_mountinfo, path_mount_id,
+    read_mountinfo_bounded, source_contains, source_reaches,
 };
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
@@ -424,7 +430,7 @@ fn start_inner(
     req: &StartRequest,
     timeouts: &StartTimeouts,
 ) -> Result<StartedContainer, TraitError> {
-    let claimed = claim_inner(store, req)?;
+    let claimed = claim_inner(store, launcher.as_ref(), req)?;
     launch_inner(store, launcher, claimed, timeouts)
 }
 
@@ -479,13 +485,15 @@ impl std::fmt::Debug for ClaimedStart {
 
 /// [`start`] の前半（launch の前まで）。状態を検証し、起動権を予約して [`ClaimedStart`] を返す。
 ///
-/// launcher を呼ばない。`StateStore` と bundle のファイル I/O を含むため、呼び出し元が期限を課したい場合は
+/// launcher の launch は呼ばない（bind mount の検証の拒否を `launcher` の監査 sink へ記録するために受け取る）。`StateStore` と bundle のファイル I/O を含むため、呼び出し元が期限を課したい場合は
 /// 別スレッドで呼ぶ（REPAIR-5）。失敗時は予約を取っておらず、状態は変わらない（拒否の条件は [`start`] と同じ）。
 pub fn claim_start(
     store: &dyn StateStore,
+    launcher: &dyn ProcessLauncher,
     req: &StartRequest,
 ) -> Result<ClaimedStart, OciRuntimeError> {
-    claim_inner(store, req).map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Start, e))
+    claim_inner(store, launcher, req)
+        .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Start, e))
 }
 
 /// [`start`] の後半。`SelfBounded` の launcher は呼び出しスレッドで直接呼ぶ（単一スレッドの要求）。
@@ -506,7 +514,11 @@ pub fn launch_claimed(
     })
 }
 
-fn claim_inner(store: &dyn StateStore, req: &StartRequest) -> Result<ClaimedStart, TraitError> {
+fn claim_inner(
+    store: &dyn StateStore,
+    launcher: &dyn ProcessLauncher,
+    req: &StartRequest,
+) -> Result<ClaimedStart, TraitError> {
     let reservation = Arc::new(StartReservation::acquire(req.id())?);
     let record = store.get(&GetStateRequest::new(req.id().clone()))?;
     if record.status().state() != ContainerState::Created {
@@ -524,7 +536,7 @@ fn claim_inner(store: &dyn StateStore, req: &StartRequest) -> Result<ClaimedStar
         ));
     }
 
-    let spec = build_spec(record.bundle(), req.id())?;
+    let spec = build_spec(record.bundle(), req.id(), launcher, store.host_state_root())?;
 
     // 起動権の所有ロック（プロセス間の排他）を予約の前に取り、launch が終わるまで保持する。所有ロックを
     // 持つプロセスが終了すればカーネルが解放するため、回復はその終了を条件にできる（CORE-2）。
@@ -726,7 +738,12 @@ fn release_claim(
 
 /// bundle の `config.json` を一度だけ読んで検証し、start が適用できない指定を拒否したうえで、rootfs を
 /// fd で固定して [`LaunchSpec`] を組み立てる（`config.json` は読み直さない）。
-fn build_spec(bundle: &Path, id: &ContainerId) -> Result<LaunchSpec, TraitError> {
+fn build_spec(
+    bundle: &Path,
+    id: &ContainerId,
+    launcher: &dyn ProcessLauncher,
+    state_root: Option<&Path>,
+) -> Result<LaunchSpec, TraitError> {
     let (config, rootfs) = validate_bundle(bundle)?;
     let process = config.process().ok_or_else(|| {
         TraitError::new(
@@ -791,6 +808,8 @@ fn build_spec(bundle: &Path, id: &ContainerId) -> Result<LaunchSpec, TraitError>
             "the UTS namespace is required",
         ));
     }
+    // bind mount の検証は予約と fork の前に終える（失敗してもプロセスのいない Running を残さない。#1915）。
+    let bind_mounts = validate_bind_mounts(&config, bundle, &rootfs, state_root, id, launcher)?;
     // 検査済みの rootfs を、`/` から祖先を含む全要素を symlink 非追従で辿って fd で固定する（SEC-1）。
     // 以後の使用はこの fd に限るため、検査後に祖先や rootfs を差し替えても固定した実体は変わらない。
     // 違反の理由（`RootfsPinError::violation`）は start の経路では記録しない（`AuditSink` の配線が無い。#1314・#1702）。
@@ -805,15 +824,233 @@ fn build_spec(bundle: &Path, id: &ContainerId) -> Result<LaunchSpec, TraitError>
         CgroupRequirement::of_config(&config),
         Arc::new(config),
         id.clone(),
+        bind_mounts,
     ))
+}
+
+/// `mounts[]` を検証済みの bind mount 集合へ変換する（TASK-29 追補・#1915・OCI-4・CORE-5・SEC-1・SEC-4）。
+///
+/// 種類・オプション・元の字句（[`BindMountSet::from_mounts`]）、元が rootfs・bundle と同一またはその祖先で
+/// ないこと、`linux.readonlyPaths` / `maskedPaths` と宛先が重ならないことを検査する。いずれも fork の前に
+/// 終わる純粋な字句検査で、実体の照合は適用の段（`exec::mount_binds`）が担う。拒否は launcher の監査 sink
+/// （[`ProcessLauncher::rejection_audit_sink`]）へ記録する。記録の成否で拒否は覆さない。
+///
+/// 状態ルート（`StateStore::host_state_root`）は、元が同一・祖先・子孫のいずれでも拒否する（字句比較と、
+/// 元を `canonicalize` した実体の比較。state.json・@revision・@audit.log の改変を防ぐ。SEC-1）。状態ルートを
+/// 示せないストアでは、`mounts[]` が非空なら fail-closed で拒否する。
+///
+/// 検査と適用の間の差し替え（TOCTOU）に備え、検査した状態ルートの実体（`major:minor` と FS 内パス）を
+/// 集合へ持たせる。適用の段（`exec::mount_binds`）が、固定した元と配下のマウントに対して毎回照合する（SEC-1）。
+fn validate_bind_mounts(
+    config: &OciConfig,
+    bundle: &Path,
+    rootfs: &Path,
+    state_root: Option<&Path>,
+    id: &ContainerId,
+    launcher: &dyn ProcessLauncher,
+) -> Result<BindMountSet, TraitError> {
+    let reject = |err: BindMountError| -> TraitError {
+        let (code, message) = (err.code(), err.message());
+        if let Some(sink) = launcher.rejection_audit_sink() {
+            // 記録の成否は拒否の結果を変えない。
+            let _ = audit_bind_mount_error(err, config.mounts(), Some(id), sink);
+        }
+        TraitError::new(code, message)
+    };
+    let set = BindMountSet::from_mounts(config.mounts()).map_err(reject)?;
+    if set.is_empty() {
+        return Ok(set);
+    }
+    // 禁止するホストパスは字句正規化できたものだけを使う。できなければ fail-closed（mounts 非空のときのみ）。
+    let (Some(rootfs_lex), Some(bundle_lex)) = (lexical_abs(rootfs), lexical_abs(bundle)) else {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "the bundle or rootfs path cannot be compared with bind mount sources",
+        ));
+    };
+    set.check_against_host_paths(&[rootfs_lex.as_str(), bundle_lex.as_str()])
+        .map_err(reject)?;
+    let Some(state_root) = state_root else {
+        return Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "the state store root is unknown, so bind mounts cannot be checked",
+        ));
+    };
+    // 字句比較できない・正規化できない状態ルートは fail-closed。
+    let (Some(state_lex), Some(state_real)) = (
+        lexical_abs(state_root),
+        std::fs::canonicalize(state_root)
+            .ok()
+            .and_then(|p| lexical_abs(&p)),
+    ) else {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "the state store root cannot be compared with bind mount sources",
+        ));
+    };
+    set.check_against_protected_trees(&[state_lex.as_str()])
+        .map_err(reject)?;
+    // symlink 経由で状態ルートへ到達する元を、実体のパスで検出する（存在しない元は適用の段が拒否する）。
+    set.check_resolved_sources_against_protected_trees(&[state_real.as_str()], |src| {
+        std::fs::canonicalize(src)
+            .ok()
+            .and_then(|p| lexical_abs(&p))
+    })
+    .map_err(reject)?;
+    // bind mount による別名（`canonicalize` では解決されない）を、mountinfo のファイルシステム内の実体で検出する。
+    // `canonicalize` は呼び出しスレッドの mount namespace で解決するため、mountinfo も同じ namespace の
+    // `/proc/thread-self/mountinfo` から読む（`/proc/self/mountinfo` はスレッドグループ代表の namespace を示す。SEC-1）。
+    let mountinfo = read_mountinfo_bounded("/proc/thread-self/mountinfo").map_err(|e| match e {
+        MountinfoReadError::TooLarge => TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "mountinfo exceeds the size limit, so bind mounts cannot be checked against the state store root",
+        ),
+        MountinfoReadError::Unreadable => TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "mountinfo cannot be read, so bind mounts cannot be checked against the state store root",
+        ),
+    })?;
+    let mounts = parse_mountinfo(&mountinfo).ok_or_else(|| {
+        TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "mountinfo is malformed or too large, so bind mounts cannot be checked against the state store root",
+        )
+    })?;
+    // 属するマウントはパスの最長一致ではなく、開いた fd の mnt_id で特定する（overmount で覆われた行に惑わされない）。
+    let Some(state_id) =
+        path_mount_id(&state_real).and_then(|mnt| fs_identity(&mounts, mnt, &state_real))
+    else {
+        return Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "the state store root is not found in mountinfo",
+        ));
+    };
+    // 状態ルート配下の子マウント（別名の bind mount を含む）も保護対象に加える（SEC-1・#1915）。
+    let children = mounts_under(&mounts, &state_real);
+    let mut roots = build_protected_roots(&state_id, &state_real, &children);
+    // rootfs・bundle の実体も保護する。rbind が公開する子マウントが別名で rootfs・bundle を含む場合を拒否する（SEC-1）。
+    let mut contained = Vec::with_capacity(2);
+    for dir in [rootfs, bundle] {
+        let identity = std::fs::canonicalize(dir)
+            .ok()
+            .and_then(|p| lexical_abs(&p))
+            .and_then(|real| path_mount_id(&real).and_then(|mnt| fs_identity(&mounts, mnt, &real)));
+        let Some(identity) = identity else {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "the bundle or rootfs is not found in mountinfo",
+            ));
+        };
+        roots.push(ProtectedFsRoot::contained(
+            identity.dev.clone(),
+            identity.path.clone(),
+        ));
+        contained.push(identity);
+    }
+    set.check_sources_with(|spec| {
+        let Some(real) = std::fs::canonicalize(spec.source())
+            .ok()
+            .and_then(|p| lexical_abs(&p))
+        else {
+            // 存在しない元は適用の段が拒否する。
+            return false;
+        };
+        // ディレクトリ・通常ファイル以外・開けない元も適用の段が拒否する（種別・権限の検査）。
+        let Some(mnt) = path_mount_id(&real) else {
+            return false;
+        };
+        // 状態ルート自身と配下の子マウントのいずれかに到達する元は拒否する（適用の段と同じ照合を fork 前に行う）。
+        // 元のマウントを特定できないときは fail-closed（到達するものとして拒否）。
+        source_reaches_protected(&mounts, mnt, &real, spec.recursive(), &state_id, &children)
+            || contained.iter().any(|target| {
+                source_contains(&mounts, mnt, &real, spec.recursive(), target).unwrap_or(true)
+            })
+    })
+    .map_err(reject)?;
+    // 検査済みの実体を集合に持たせる。適用の段（restart を含む毎回）が、固定した元に対して再照合する。
+    let set = set.with_protected_roots(roots);
+    set.check_against_protected_paths(config.readonly_paths(), config.masked_paths())
+        .map_err(reject)?;
+    Ok(set)
+}
+
+/// 元が状態ルートまたは配下の子マウントのいずれかに到達するか。位置を特定できない場合は到達とみなす（fail-closed）。
+fn source_reaches_protected(
+    mounts: &[super::mountinfo_identity::MountRow],
+    src_mnt_id: u64,
+    src_real: &str,
+    recursive: bool,
+    state_id: &FsIdentity,
+    children: &[(FsIdentity, String)],
+) -> bool {
+    std::iter::once(state_id)
+        .chain(children.iter().map(|(id, _)| id))
+        .any(|protected| {
+            source_reaches(mounts, src_mnt_id, src_real, recursive, protected).unwrap_or(true)
+        })
+}
+
+/// 保護対象（状態ルートと配下の子マウント）ごとの `ProtectedFsRoot` を作る（SEC-1・#1915）。
+///
+/// 状態ファイルのハードリンクは、適用の段が毎回走査し直す。走査は保護対象ごとに自分のマウントの木に限り、別の FS の
+/// マウントポイントへは降りない（他の FS 上のリンクのせいで無関係な FS 上のディレクトリ元を誤って拒否しない）。
+/// 子マウントは自分のマウントポイントを走査根にする。同じマウントポイントに複数のマウントが重なるなど、走査で
+/// 実体を確定できないものは「リンクあり」に固定する（fail-closed）。
+fn build_protected_roots(
+    state_id: &FsIdentity,
+    state_real: &str,
+    children: &[(FsIdentity, String)],
+) -> Vec<ProtectedFsRoot> {
+    let prune_for = |dev: &str, scan_root: &str| -> Vec<String> {
+        children
+            .iter()
+            .filter(|(id, point)| {
+                id.dev != dev
+                    && point != scan_root
+                    && Path::new(point).starts_with(Path::new(scan_root))
+            })
+            .map(|(_, point)| point.clone())
+            .collect()
+    };
+    let mut roots = vec![
+        ProtectedFsRoot::new(state_id.dev.clone(), state_id.path.clone(), true)
+            .with_scan_root(state_real.to_owned(), prune_for(&state_id.dev, state_real)),
+    ];
+    for (id, point) in children {
+        let shared = children.iter().filter(|(_, p)| p == point).count() > 1;
+        let root = ProtectedFsRoot::new(id.dev.clone(), id.path.clone(), true);
+        roots.push(if shared {
+            root
+        } else {
+            root.with_scan_root(point.clone(), prune_for(&id.dev, point))
+        });
+    }
+    roots
+}
+
+/// 絶対パスを `Component::Normal` だけの `/a/b` 形式へ字句正規化する（`.` は落とす）。
+/// 相対・`..` を含む・UTF-8 でない場合は `None`。
+fn lexical_abs(path: &Path) -> Option<String> {
+    use std::path::Component;
+    let mut out = String::new();
+    let mut absolute = false;
+    for c in path.components() {
+        match c {
+            Component::RootDir => absolute = true,
+            Component::CurDir => {}
+            Component::Normal(n) => {
+                out.push('/');
+                out.push_str(n.to_str()?);
+            }
+            _ => return None,
+        }
+    }
+    (absolute && !out.is_empty()).then_some(out)
 }
 
 fn reject_unsupported_linux(config: &OciConfig) -> Result<(), TraitError> {
     if config.root().readonly() {
         return Err(unsupported("root.readonly"));
-    }
-    if !config.mounts().is_empty() {
-        return Err(unsupported("mounts"));
     }
     if !config.uid_mappings().is_empty() || !config.gid_mappings().is_empty() {
         return Err(unsupported("linux.uidMappings / linux.gidMappings"));
@@ -905,6 +1142,8 @@ mod tests {
         /// `update` の n 回目（0 始まり）の呼び出しだけ失敗させる。
         fail_update_at: Option<usize>,
         update_calls: AtomicUsize,
+        /// `host_state_root` が返す場所（テストでは実在する一時ディレクトリ）。
+        state_root: PathBuf,
     }
 
     impl MemStateStore {
@@ -913,11 +1152,17 @@ mod tests {
                 records: Mutex::new(HashMap::new()),
                 fail_update_at,
                 update_calls: AtomicUsize::new(0),
+                state_root: std::env::temp_dir(),
             }
         }
     }
 
     impl StateStore for MemStateStore {
+        /// bind mount の検証を通すため、実在し bundle の元になり得ない場所を状態ルートとして示す。
+        fn host_state_root(&self) -> Option<&Path> {
+            Some(self.state_root.as_path())
+        }
+
         fn create(&self, req: &CreateStateRequest) -> Result<StateRecord, TraitError> {
             let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
             if records.contains_key(req.id()) {
@@ -1031,6 +1276,8 @@ mod tests {
         launch_threads: Mutex<Vec<std::thread::ThreadId>>,
         /// 失敗した launch が子を残し得ると答えるか（`last_launch_may_have_left_process`。CORE-2）。
         may_leave: AtomicBool,
+        /// `rejection_audit_sink` が返す sink（未設定なら `None`。#1915）。
+        audit: std::sync::OnceLock<Arc<crate::audit_log::mount::tests::VecSink>>,
     }
 
     impl RecordingLauncher {
@@ -1048,6 +1295,7 @@ mod tests {
                 self_bounded: AtomicBool::new(false),
                 launch_threads: Mutex::new(Vec::new()),
                 may_leave: AtomicBool::new(false),
+                audit: std::sync::OnceLock::new(),
             })
         }
 
@@ -1096,6 +1344,12 @@ mod tests {
     }
 
     impl ProcessLauncher for RecordingLauncher {
+        fn rejection_audit_sink(&self) -> Option<&dyn crate::audit_log::AuditSink> {
+            self.audit
+                .get()
+                .map(|s| s.as_ref() as &dyn crate::audit_log::AuditSink)
+        }
+
         fn launch_mode(&self) -> LaunchMode {
             if self.self_bounded.load(Ordering::SeqCst) {
                 LaunchMode::SelfBounded
@@ -1292,6 +1546,24 @@ mod tests {
         err
     }
 
+    /// `build_spec` を状態ルートを指定して直接呼ぶ（`StateStore` を介さず、ルート不明の経路を検証する）。
+    #[cfg(target_os = "linux")]
+    fn build_spec_with_state_root(
+        name: &str,
+        cfg: &Value,
+        state_root: Option<&Path>,
+    ) -> Result<LaunchSpec, TraitError> {
+        let (b, _store) = created(name);
+        b.write_config(cfg);
+        let launcher = RecordingLauncher::new(false);
+        build_spec(
+            &b.dir,
+            &ContainerId::new(name).expect("id"),
+            launcher.as_ref(),
+            state_root,
+        )
+    }
+
     /// OCI-4・CORE-1: start で `process.args` 等がそのまま launcher に渡り、Running・pid 付きへ遷移する。
     /// 起動済みプロセスのハンドルは終了させずに呼び出し元へ引き渡される（監視・回収の所有者）。
     #[cfg(target_os = "linux")]
@@ -1454,7 +1726,7 @@ mod tests {
     fn core2_claim_release_and_launch_claimed_split_start() {
         let (_b, store) = created("split");
         let launcher = RecordingLauncher::new(false);
-        let claimed = claim_start(&store, &sid("split")).expect("claim");
+        let claimed = claim_start(&store, launcher.as_ref(), &sid("split")).expect("claim");
         assert_eq!(launcher.calls(), 0);
         let rec = store
             .get(&GetStateRequest::new(
@@ -1473,7 +1745,7 @@ mod tests {
             .expect("get");
         assert_eq!(rec.status().state(), ContainerState::Created);
 
-        let claimed = claim_start(&store, &sid("split")).expect("claim again");
+        let claimed = claim_start(&store, launcher.as_ref(), &sid("split")).expect("claim again");
         let started = launch_claimed(
             &store,
             &OpRecorder::new(),
@@ -1550,13 +1822,6 @@ mod tests {
             ),
             ("tty", Box::new(|c| c["process"]["terminal"] = json!(true))),
             (
-                "mounts",
-                Box::new(|c| {
-                    c["mounts"] =
-                        json!([{"destination": "/proc", "type": "proc", "source": "proc"}])
-                }),
-            ),
-            (
                 "nspath",
                 Box::new(|c| {
                     c["linux"]["namespaces"] = json!([{"type": "pid", "path": "/proc/1/ns/pid"}])
@@ -1586,6 +1851,220 @@ mod tests {
                 err.message()
             );
         }
+    }
+
+    /// bind mount つきの config（宛先・元・オプションを指定）。
+    fn with_mounts(mounts: Value) -> Value {
+        let mut cfg = valid_config();
+        cfg["mounts"] = mounts;
+        cfg
+    }
+
+    fn bind_json(dest: &str, source: &str, opts: &[&str]) -> Value {
+        json!({"destination": dest, "type": "bind", "source": source, "options": opts})
+    }
+
+    /// OCI-4・SEC-1・CORE-5（#1915）: 検証を通らない `mounts[]` は ERR-2 の構造化エラーで拒否し、
+    /// launcher は呼ばれず状態は Created のまま。メッセージは固定英文で入力値を含まない。
+    #[test]
+    fn oci4_sec1_start_rejects_invalid_bind_mounts() {
+        let cases: Vec<(&str, Value, ErrorCode, &str)> = vec![
+            (
+                "proc",
+                with_mounts(json!([{"destination": "/mnt", "type": "proc", "source": "proc"}])),
+                ErrorCode::Unimplemented,
+                "mounts[0]: mount type is not supported (only bind mounts)",
+            ),
+            (
+                "suid",
+                with_mounts(json!([bind_json("/mnt", "/srv/x", &["bind", "suid"])])),
+                ErrorCode::InvalidArgument,
+                "mounts[0]: mount option lifts a mandatory restriction",
+            ),
+            (
+                "shared",
+                with_mounts(json!([bind_json("/mnt", "/srv/x", &["bind", "shared"])])),
+                ErrorCode::InvalidArgument,
+                "mounts[0]: mount propagation options are not supported",
+            ),
+            (
+                "relsrc",
+                with_mounts(json!([bind_json("/mnt", "rel/x", &["bind"])])),
+                ErrorCode::InvalidArgument,
+                "mounts[0]: bind mount source is not a valid absolute path",
+            ),
+            (
+                "nosrc",
+                with_mounts(json!([{"destination": "/mnt", "type": "bind", "options": ["bind"]}])),
+                ErrorCode::InvalidArgument,
+                "mounts[0]: bind mount has no source",
+            ),
+            (
+                "procdst",
+                with_mounts(json!([bind_json("/proc/x", "/srv/x", &["bind"])])),
+                ErrorCode::InvalidArgument,
+                "mounts[0]: bind mount destination is reserved (/proc, /sys or /dev)",
+            ),
+        ];
+        for (name, cfg, code, message) in cases {
+            let err = start_rejected_after_rewrite(&format!("rej-bind-{name}"), &cfg);
+            assert_eq!(err.code(), code, "case {name}");
+            assert_eq!(err.message(), message, "case {name}");
+        }
+    }
+
+    /// OCI-4・SEC-1（#1915）: ホストパスの字句比較に入る拒否（bundle の祖先・保護パスとの重なり・状態ルート）。
+    /// ホストの絶対パスが POSIX 形式であることを前提とするため Linux 限定（Windows はドライブ接頭辞を
+    /// 字句正規化できず、macOS は rootfs の固定が未実装）。OS 非依存の判定は `tests/bind_mounts.rs` で照合する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci4_sec1_start_rejects_host_path_overlaps() {
+        let tmp = std::env::temp_dir();
+        let tmp_src = tmp
+            .to_str()
+            .expect("utf8 temp dir")
+            .trim_end_matches('/')
+            .to_owned();
+        let forbidden = "mounts[0]: bind mount source is a forbidden host path";
+        // 状態ルート（テストでは temp_dir）の子孫を元にしても拒否する（子孫は bundle の祖先判定では通る）。
+        let state_child = format!("{tmp_src}/fandhe-state-child");
+        let cases: Vec<(&str, Value, &str)> = vec![
+            (
+                "bundlesrc",
+                with_mounts(json!([bind_json("/mnt", &tmp_src, &["bind"])])),
+                forbidden,
+            ),
+            (
+                "statechild",
+                with_mounts(json!([bind_json("/mnt", &state_child, &["bind", "rw"])])),
+                forbidden,
+            ),
+            (
+                "protected",
+                {
+                    let mut c = with_mounts(json!([bind_json("/etc/secret", "/srv/x", &["bind"])]));
+                    c["linux"]["readonlyPaths"] = json!(["/etc/secret"]);
+                    c
+                },
+                "mounts[0]: bind mount destination overlaps a readonly or masked path",
+            ),
+        ];
+        for (name, cfg, message) in cases {
+            let err = start_rejected_after_rewrite(&format!("rej-host-{name}"), &cfg);
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "case {name}");
+            assert_eq!(err.message(), message, "case {name}");
+        }
+    }
+
+    /// SEC-1・OCI-4（#1915）: 状態ルートを示せないストアでは bind mount つきの start を fail-closed で拒否する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_start_rejects_bind_when_state_root_unknown() {
+        let err = build_spec_with_state_root(
+            "no-state-root",
+            &with_mounts(json!([bind_json("/data", "/srv/data", &["bind"])])),
+            None,
+        )
+        .expect_err("must fail");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "the state store root is unknown, so bind mounts cannot be checked"
+        );
+    }
+
+    /// OCI-4・OCI-5（#1915）: 検証を通った bind は launcher へ `spec.bind_mounts()` として渡り、
+    /// Landlock の入力である `spec.config().mounts()` と同じ並び・宛先になる。
+    /// 成功する start は rootfs の固定（Linux 限定）を要するため Linux 限定。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci4_start_passes_validated_bind_mounts_to_launcher() {
+        let name = "bind-ok";
+        let b = Bundle::new(name);
+        b.write_config(&with_mounts(json!([
+            bind_json("/data", "/srv/data", &["bind", "rw"]),
+            bind_json("/cache", "/srv/cache", &["rbind", "noexec"]),
+        ])));
+        std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
+        let store = MemStateStore::new(None);
+        create(&store, &OpRecorder::new(), &b.create_req(name)).expect("create");
+        let launcher = RecordingLauncher::new(false);
+        let record = run(&store, &launcher, name).expect("start");
+        assert_eq!(record.status().state(), ContainerState::Running);
+        assert_eq!(launcher.calls(), 1);
+        let specs = launcher.specs.lock().expect("lock");
+        let spec = specs.first().expect("spec");
+        let got: Vec<_> = spec
+            .bind_mounts()
+            .mounts()
+            .iter()
+            .map(|m| {
+                (
+                    m.index(),
+                    m.destination().as_str().to_owned(),
+                    m.source().to_owned(),
+                    m.read_only(),
+                    m.noexec(),
+                    m.recursive(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    0,
+                    "/data".to_owned(),
+                    "/srv/data".to_owned(),
+                    false,
+                    false,
+                    false
+                ),
+                (
+                    1,
+                    "/cache".to_owned(),
+                    "/srv/cache".to_owned(),
+                    false,
+                    true,
+                    true
+                ),
+            ]
+        );
+        let config_dests: Vec<_> = spec
+            .config()
+            .mounts()
+            .iter()
+            .map(|m| m.mount_destination().as_str().to_owned())
+            .collect();
+        assert_eq!(config_dests, ["/data", "/cache"]);
+    }
+
+    /// SEC-4（#1915）: 設定の検証での拒否は launcher の sink へ宛先のみで 1 件記録される。sink が無くても
+    /// エラーは同じ。
+    #[test]
+    fn sec4_start_records_bind_rejection_to_launcher_audit_sink() {
+        let cfg = with_mounts(json!([bind_json(
+            "/mnt/x",
+            "/secret-host-dir",
+            &["bind", "suid"]
+        )]));
+        let (b, store) = created("rej-bind-audit");
+        b.write_config(&cfg);
+        let launcher = RecordingLauncher::new(false);
+        let sink = Arc::new(crate::audit_log::mount::tests::VecSink::new(false));
+        assert!(launcher.audit.set(Arc::clone(&sink)).is_ok());
+        let err = run(&store, &launcher, "rej-bind-audit").expect_err("must fail");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(launcher.calls(), 0);
+        let recs = sink.snapshot();
+        assert_eq!(recs.len(), 1);
+        let line = format!("{:?}", recs[0]);
+        assert!(line.contains("/mnt/x"), "{line}");
+        assert!(!line.contains("secret-host-dir"), "{line}");
+        // sink 無し(既定)でも拒否の内容は同じ。
+        let err2 = start_rejected_after_rewrite("rej-bind-nosink", &cfg);
+        assert_eq!(err2.code(), err.code());
+        assert_eq!(err2.message(), err.message());
     }
 
     /// REPAIR-5: 状態更新に失敗したら起動済みプロセスをちょうど 1 回 terminate し、元のエラーを返す。
@@ -2307,5 +2786,154 @@ mod tests {
         assert_eq!(err.op(), LifecycleOp::Start);
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(err.exit_code().get(), 5);
+    }
+
+    /// SEC-1（#1915）: 他の FS 上のハードリンクは、無関係な FS の保護対象のリンク判定に混ぜない。
+    /// 状態ルート直下の別 FS のマウントポイント配下にだけリンクがあるとき、状態ルート側は「なし」、子マウント側は「あり」。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_hard_link_scan_is_confined_to_each_protected_filesystem() {
+        let base = std::env::temp_dir().join(format!("fandhe-oci-hl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let state = base.join("state");
+        let sub = state.join("sub");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+        std::fs::write(state.join("plain"), b"x").expect("write");
+        std::fs::write(sub.join("f"), b"x").expect("write");
+        std::fs::hard_link(sub.join("f"), sub.join("g")).expect("link");
+        let state_s = state.to_str().expect("utf8").to_owned();
+        let sub_s = sub.to_str().expect("utf8").to_owned();
+        let state_id = FsIdentity {
+            dev: "8:1".to_owned(),
+            path: "/srv/state".to_owned(),
+        };
+        let children = vec![(
+            FsIdentity {
+                dev: "8:2".to_owned(),
+                path: "/c1".to_owned(),
+            },
+            sub_s.clone(),
+        )];
+        let roots = build_protected_roots(&state_id, &state_s, &children);
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].dev(), "8:1");
+        assert!(
+            !roots[0].has_hard_linked_files(),
+            "other FS link must not count"
+        );
+        assert_eq!(roots[1].dev(), "8:2");
+        assert!(roots[1].has_hard_linked_files());
+        // 同じ FS（同じ dev）の子マウントは枝刈りしない（リンクは状態ルート側でも見つかる）。
+        let same = vec![(
+            FsIdentity {
+                dev: "8:1".to_owned(),
+                path: "/srv/state/sub".to_owned(),
+            },
+            sub_s,
+        )];
+        let roots = build_protected_roots(&state_id, &state_s, &same);
+        assert!(roots[0].has_hard_linked_files());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// SEC-1（#1915）: 同じマウントポイントに複数のマウントが重なる子は走査で確定できないため「リンクあり」に固定する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_shared_mount_point_child_is_fixed_to_linked() {
+        let base = std::env::temp_dir().join(format!("fandhe-oci-hl2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sub = base.join("sub");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+        let state_s = base.to_str().expect("utf8").to_owned();
+        let sub_s = sub.to_str().expect("utf8").to_owned();
+        let state_id = FsIdentity {
+            dev: "8:1".to_owned(),
+            path: "/s".to_owned(),
+        };
+        let child = |dev: &str| {
+            (
+                FsIdentity {
+                    dev: dev.to_owned(),
+                    path: "/".to_owned(),
+                },
+                sub_s.clone(),
+            )
+        };
+        let roots = build_protected_roots(&state_id, &state_s, &[child("8:2"), child("8:3")]);
+        assert!(roots[1].has_hard_linked_files());
+        assert!(roots[2].has_hard_linked_files());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// SEC-1（#1915）: rbind が公開する子マウントが別名で bundle を含むとき、元の位置を問わず拒否する。
+    /// bundle の配下だけを指す子マウントや無関係な FS の元は拒否しない。
+    #[test]
+    fn sec1_rbind_child_mount_containing_bundle_is_rejected() {
+        use super::super::mountinfo_identity::parse_mountinfo;
+        let info = "10 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+                    20 10 8:1 /srv/bundle /bundle rw - ext4 /dev/sda1 rw\n\
+                    30 10 8:1 / /opt/export rw - ext4 /dev/sda1 rw\n\
+                    40 30 8:1 /srv/bundle /opt/export/inner rw - ext4 /dev/sda1 rw\n\
+                    50 10 8:1 /srv/bundle/data /opt/data rw - ext4 /dev/sda1 rw\n\
+                    60 10 8:5 / /opt/other rw - ext4 /dev/sda5 rw\n\
+                    70 60 8:1 /srv/bundle /opt/other/inner rw - ext4 /dev/sda1 rw\n";
+        let mounts = parse_mountinfo(info).expect("parse");
+        let bundle = fs_identity(&mounts, 20, "/bundle").expect("bundle");
+        // /opt/export 自体は FS の `/` なので祖先として含む（字句検査でも拒否される形）。
+        assert_eq!(
+            source_contains(&mounts, 30, "/opt/export", true, &bundle),
+            Some(true)
+        );
+        // 子マウント経由の別名: root が `/srv/bundle` の子を持つ別 FS の元を rbind。
+        assert_eq!(
+            source_contains(&mounts, 60, "/opt/other", true, &bundle),
+            Some(true)
+        );
+        // 非再帰（bind）なら子マウントは公開されず、元自身（8:5）は含まない。
+        assert_eq!(
+            source_contains(&mounts, 60, "/opt/other", false, &bundle),
+            Some(false)
+        );
+        // bundle の配下だけを指す元は含まない。
+        assert_eq!(
+            source_contains(&mounts, 50, "/opt/data", true, &bundle),
+            Some(false)
+        );
+        // 位置を特定できない元は None（呼び出し側が fail-closed）。
+        assert_eq!(source_contains(&mounts, 99, "/x", true, &bundle), None);
+    }
+
+    /// SEC-1（#1915）: 状態ルート配下の子マウントの別名を元にした bind は、start の検査（fork 前）で拒否される。
+    #[test]
+    fn sec1_start_check_rejects_alias_of_nested_state_mount() {
+        use super::super::mountinfo_identity::parse_mountinfo;
+        let info = "10 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+                    20 10 8:1 /srv/state /state rw - ext4 /dev/sda1 rw\n\
+                    30 20 8:2 /c1 /state/c1 rw - ext4 /dev/sda2 rw\n\
+                    40 10 8:2 /c1 /alias rw - ext4 /dev/sda2 rw\n\
+                    50 10 8:3 / /other rw - ext4 /dev/sda3 rw\n";
+        let mounts = parse_mountinfo(info).expect("parse");
+        let state_id = fs_identity(&mounts, 20, "/state").expect("state");
+        let children = mounts_under(&mounts, "/state");
+        assert_eq!(children.len(), 1);
+        assert!(source_reaches_protected(
+            &mounts, 40, "/alias", true, &state_id, &children
+        ));
+        assert!(!source_reaches_protected(
+            &mounts, 50, "/other", true, &state_id, &children
+        ));
+        // 子マウントを考慮しない（状態ルートだけの）照合では見逃していた。
+        assert!(!source_reaches_protected(
+            &mounts,
+            40,
+            "/alias",
+            true,
+            &state_id,
+            &[]
+        ));
+        // 位置を特定できない元は fail-closed。
+        assert!(source_reaches_protected(
+            &mounts, 99, "/x", true, &state_id, &children
+        ));
     }
 }

@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::bind_mounts::BindMountSet;
 use super::cgroup_requirement::CgroupRequirement;
 use super::config::{NamespaceKind, OciConfig};
 use crate::traits::{ContainerId, ErrorCode, Signal, TraitError};
@@ -444,6 +445,8 @@ pub struct LaunchSpec {
     config: std::sync::Arc<OciConfig>,
     /// 起動対象のコンテナ ID（監査記録の `container` に使う。SEC-4）。
     container_id: ContainerId,
+    /// `config` と同じ `mounts[]` から `start` が検証した bind mount の集合（#1915）。
+    bind_mounts: BindMountSet,
 }
 
 impl LaunchSpec {
@@ -460,6 +463,7 @@ impl LaunchSpec {
         cgroup: CgroupRequirement,
         config: std::sync::Arc<OciConfig>,
         container_id: ContainerId,
+        bind_mounts: BindMountSet,
     ) -> Self {
         Self {
             rootfs,
@@ -471,7 +475,17 @@ impl LaunchSpec {
             cgroup,
             config,
             container_id,
+            bind_mounts,
         }
+    }
+
+    /// `start` が検証した bind mount の集合（`mounts[]` の指定順。TASK-29 追補・#1915・OCI-4・SEC-1）。
+    ///
+    /// `config` と同じ `Arc<OciConfig>` の `mounts()` から作るため、Landlock の ruleset
+    /// （`build_path_rules`）と入力が同一で、適用する bind と許可ルールが食い違わない。restart でも
+    /// 捕捉した spec を clone して再 launch するため、同じ集合が再適用される。空なら bind は無い。
+    pub fn bind_mounts(&self) -> &BindMountSet {
+        &self.bind_mounts
     }
 
     /// 起動対象のコンテナ ID（launcher が pivot 前段の違反を監査記録する際の `container`。SEC-4）。
@@ -812,6 +826,14 @@ pub trait ProcessLauncher: Send + Sync {
     /// 本番 launcher が複数スレッドの呼び出しとして拒否される）。
     fn launch_mode(&self) -> LaunchMode {
         LaunchMode::CallerBounded
+    }
+
+    /// `start` が設定の検証（bind mount 等）で拒否したとき、その違反を記録する launch 経路の監査 sink（SEC-4・#1915）。
+    ///
+    /// `start` は sink を持たないため、launcher が持つ sink を借りて拒否を記録する。既定は `None`
+    /// （記録先なし）。ラッパー実装は必ず内側へ転送すること（転送しないと本番で監査が黙って落ちる）。
+    fn rejection_audit_sink(&self) -> Option<&dyn crate::audit_log::AuditSink> {
+        None
     }
 
     /// プロセスを起動し、ハンドルを返す。`timeout` は起動確認（子からの通知待ち等）の上限。

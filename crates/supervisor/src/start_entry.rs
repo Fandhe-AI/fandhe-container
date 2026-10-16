@@ -1057,7 +1057,7 @@ fn prepare_start(
     let launcher: Arc<dyn ProcessLauncher> = capturing.clone();
     // 起動権の予約（状態の読み取り・bundle の検証・所有ロック・予約の更新）。ファイル I/O を含むため、入口が期限で
     // 待ち切れる作業スレッドで行う。ここまでで launcher は呼ばない（REPAIR-5・CORE-2）。
-    let claimed = match claim_start(store, req) {
+    let claimed = match claim_start(store, launcher.as_ref(), req) {
         Ok(c) => Box::new(c),
         // 予約は取れていない（状態は Created のまま）。作った cgroup だけを消す。
         Err(e) => {

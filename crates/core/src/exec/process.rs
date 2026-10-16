@@ -1872,9 +1872,9 @@ pub(crate) struct PrePivotSetup<'a> {
     pub(crate) tmpfs: Option<&'a TmpfsMountSet>,
     /// tmpfs の後に注入するファイル（無ければ注入しない）。
     pub(crate) inject: Option<&'a InjectedFileSet>,
-    /// 注入の後に載せる bind mount（無ければ載せない。#1914・TASK-29 追補）。呼び出し側（#1915）が `check_against_*`
-    /// （host_paths を含む）を通した集合を渡す。[`run_pre_pivot`] は tmpfs・注入・保護パスとの重なりを副作用の前に
-    /// 再検査する（多重防御）。本番の launcher は結線（#1915）まで `None`。
+    /// 注入の後に載せる bind mount（無ければ載せない。#1914・TASK-29 追補）。呼び出し側（`start` が host_paths・保護パスを、
+    /// 本番 launcher が tmpfs を検査済み。#1915）が `check_against_*` を通した集合を渡す。[`run_pre_pivot`] は tmpfs・注入・
+    /// 保護パスとの重なりを副作用の前に再検査する（多重防御）。本番の launcher は `LaunchSpec::bind_mounts` が非空のときだけ渡す。
     pub(crate) binds: Option<&'a BindMountSet>,
     /// 検証済みの rootfs を固定した fd。あれば `prepare_rootfs` の後、パスから辿り直した実体が同じ
     /// `(st_dev, st_ino)` であることを確かめる（検証後の差し替え対策）。
@@ -2138,7 +2138,7 @@ fn check_bind_overlaps(
 ///
 /// Landlock との整合: `mount_binds` が付け替え後に自分のマウントを事後検証し、以降の段は `/proc`・`/sys` だけを対象と
 /// するため、pivot 時点で宛先の最上位のマウントは bind のまま残る。`RulePath::Beneath(dest)` を辿ると適用した bind の
-/// ルートに着く。結線（ルールと bind を同じ `mounts[]` から導く）は #1915。
+/// ルートに着く。ルールと bind は同じ `mounts[]` から導く（#1915 で結線済み。`LaunchSpec` が同じ `Arc<OciConfig>` から両方を作る）。
 ///
 /// デバイスノードと tmpfs は pivot の前に、`PreparedRootfs` の fd を起点に作る（pivot 後は旧 root が
 /// 切り離され、ホスト側の `/dev` を再解決できないため）。`setup` が `None` なら

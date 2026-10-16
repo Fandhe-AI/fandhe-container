@@ -56,7 +56,8 @@ fandhe-container/
 ├── docs/
 │   ├── architecture.md            # crate 境界・依存関係グラフ・確定済み設計判断の索引（TASK-6・REPAIR-3・PLUG-1）
 │   ├── api/                       # 利用者向け API 契約
-│   │   └── io-barrier.md          # I/O 共有層の ACK と永続化保証の契約（TASK-17・IO-2）
+│   │   ├── io-barrier.md          # I/O 共有層の ACK と永続化保証の契約（TASK-17・IO-2）
+│   │   └── bind-mounts.md         # `config.json` の `mounts[]` の bind mount の書き方・受けるオプション・Docker / runc との差（TASK-29 追補・#1915・OCI-4）
 │   ├── design/                    # 設計決定・拡張点・リソース効率目標
 │   │   ├── orchestration-scope.md # オーケストレーション スコープ（TASK-5・CRI-8）
 │   │   ├── from-scratch-policy.md # フルスクラッチ方針・依存基準（TASK-7・MS-0）

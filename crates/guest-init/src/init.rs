@@ -43,17 +43,12 @@ impl GuestOps for LinuxOps {
     }
 
     fn mount_virtiofs(&mut self, d: &Directive) -> Result<(), Errno> {
-        // nosuid・nodev は fail-closed の既定。`ro` は必ず MS_RDONLY。
-        let mut flags = sys::MS_NOSUID | sys::MS_NODEV;
-        if d.access == Access::ReadOnly {
-            flags |= sys::MS_RDONLY;
-        }
-        sys::mount_fs(
+        // nosuid・nodev・`ro` なら MS_RDONLY は sys 側の固定値（呼び出し元は外せない）。
+        // 検査から mount までの TOCTOU は PID 1 のみが動く前提で許容（lib.rs「未実装」・#2080・#1905）。
+        sys::mount_virtiofs(
             d.tag.as_str(),
             Path::new(d.mount_point.as_str()),
-            "virtiofs",
-            flags,
-            None,
+            d.access == Access::ReadOnly,
         )
         .map_err(|e| Errno::from_io(&e))
     }
@@ -70,6 +65,9 @@ fn write_console_line(console: &mut dyn Write, line: &ReportLine) {
 }
 
 /// symlink でない実ディレクトリであることを要求する（symlink 経由の mount 先すり替えを防ぐ）。
+///
+/// 検査後に文字列パスで mount するため TOCTOU の余地がある。mount 時にゲスト内で動くのは PID 1 だけという
+/// 前提で許容しており、子プロセスを動かす前に fd 起点の mount へ移す（lib.rs「未実装」・#2080・#1905）。
 fn ensure_real_dir(path: &Path) -> Result<(), Errno> {
     let md = fs::symlink_metadata(path).map_err(|e| Errno::from_io(&e))?;
     if md.is_dir() {
@@ -93,15 +91,9 @@ fn open_console() -> Box<dyn Write> {
     Box::new(std::io::stdout())
 }
 
-/// `/dev` は devtmpfs が既に mount 済み（EBUSY）でも成功として扱う。
-fn mount_pseudo(
-    fstype: &str,
-    target: &str,
-    flags: u64,
-    data: Option<&str>,
-    tolerate_busy: bool,
-) -> Result<(), Errno> {
-    match sys::mount_fs(fstype, Path::new(target), fstype, flags, data) {
+/// mount の結果を `Errno` へ写す。`tolerate_busy` なら EBUSY（既に mount 済み。`/dev` の devtmpfs）を成功とする。
+fn tolerate(r: std::io::Result<()>, tolerate_busy: bool) -> Result<(), Errno> {
+    match r {
         Ok(()) => Ok(()),
         Err(e) if tolerate_busy && e.raw_os_error() == Some(EBUSY) => Ok(()),
         Err(e) => Err(Errno::from_io(&e)),
@@ -130,14 +122,7 @@ pub fn run() -> ! {
     }
     // /dev を先に用意して console を開けるようにする（以降の診断・報告を hvc0 へ出すため）。
     let dev = init_filesystems().and_then(|()| {
-        mount_pseudo(
-            "devtmpfs",
-            "/dev",
-            sys::MS_NOSUID | sys::MS_NOEXEC,
-            Some("mode=0755"),
-            true,
-        )
-        .map_err(|e| (InitStage::Dev, e))
+        tolerate(sys::mount_devtmpfs(Path::new("/dev")), true).map_err(|e| (InitStage::Dev, e))
     });
     let mut ops = LinuxOps {
         console: open_console(),
@@ -149,11 +134,10 @@ pub fn run() -> ! {
     if let Err((stage, errno)) = dev {
         fatal(&mut ops, stage, errno);
     }
-    let strict = sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC;
-    if let Err(e) = mount_pseudo("proc", "/proc", strict, None, false) {
+    if let Err(e) = tolerate(sys::mount_proc(Path::new("/proc")), false) {
         fatal(&mut ops, InitStage::Proc, e);
     }
-    if let Err(e) = mount_pseudo("sysfs", "/sys", strict, None, false) {
+    if let Err(e) = tolerate(sys::mount_sysfs(Path::new("/sys")), false) {
         fatal(&mut ops, InitStage::Sys, e);
     }
     let cmdline = match File::open("/proc/cmdline")

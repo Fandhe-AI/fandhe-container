@@ -25,12 +25,24 @@
 //! 指示に 1 件でも不正があれば 1 件も mount しない。致命的な初期化失敗では [`READY_MARKER`] を出さない。
 //! PID 1 が終了するとカーネルが panic するため、どの経路でも終了せず待機する。
 //!
+//! # unsafe の閉じ込め（REPAIR-9）
+//!
+//! lib のルートで `unsafe_code` を deny にし、`sys` だけを allow にする。`sys` の外に `unsafe` が入ると
+//! コンパイルで落ちる（workspace の `undocumented_unsafe_blocks` が見ない `unsafe extern` ブロックも対象）。
+//!
 //! # 未実装（REPAIR-3）
 //!
+//! - mount 先の検査（`ensure_real_dir`）と文字列パスの `mount(2)` の間には TOCTOU の余地がある。mount 時に
+//!   ゲスト内で動くのは PID 1 だけなので差し替える主体がいない。この前提はゲスト内で子プロセス（コンテナ）を
+//!   動かした時点で崩れるため、その変更の前に fd 起点の mount（要素ごとの `openat`＋`O_NOFOLLOW` から
+//!   `/proc/self/fd/<n>` へ mount、または `open_tree`／`move_mount`）へ移すことを前提条件とする
+//!   （#2080・#1905）。`/proc`・`/sys`・`/dev` は他のプロセスが生まれる前に固定パスへ mount する。
 //! - 協調停止: `reboot(2)` 等は呼ばない。VM の停止はホストの VZ の強制停止に任せる（TASK-115）。
 //! - 子プロセスの回収（`waitpid`）: 現状は子を作らない。ゲスト内でコンテナを実行する際に実装する。
 //! - 静的リンクのビルドと initrd への梱包は `scripts/build-guest-initrd.sh`（`make guest-initrd-build`。#1878）
 //!   で行う（梱包までの確認のみ。実機の VM での起動は未確認で #1628）。symlink・ハードリンクの観測モードは #1877。
+
+#![deny(unsafe_code)]
 
 pub mod cmdline;
 pub mod directive;
@@ -40,7 +52,9 @@ pub mod report;
 
 #[cfg(target_os = "linux")]
 mod init;
+// syscall の薄いラッパーの置き場。`unsafe` を許すのはここだけ（#4 の事前承認は `sys` に限る）。
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 mod sys;
 
 #[cfg(target_os = "linux")]

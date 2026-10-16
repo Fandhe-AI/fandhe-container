@@ -11,6 +11,9 @@
 //! - argv: `fandhe-container-supervisor start --root <状態ルートの絶対パス> [--restart <policy>] <container-id>`。
 //!   `--root` は必須（CLI が `StateRoot::resolve` で解決した値を渡す。supervisor は状態ルートを環境変数から決めない）。
 //!   `--restart` は任意で既定は `no`。各オプションは 1 回まで・順不同で、`<container-id>` は末尾の位置引数 1 個。
+//! - 契約の fd は 0〜2 のみ。supervisor は入口（`start_entry`）で fd [`FIRST_INHERITED_FD`] 以降を閉じる
+//!   （特権ランチャーと同じ処理。#2070・SEC-1）。呼び出し側が追加の fd を渡しても使われない。exec から入口までの
+//!   短い窓は残る（CLI は CLOEXEC の無い fd を自分では閉じない）。
 //! - 環境変数は契約に含めない（supervisor は契約の値を環境から読まない）。
 //! - stdin は `/dev/null`、**stdout は結果を通知する pipe の書き込み端**（supervisor は報告を 1 行書いたら以後 stdout に
 //!   何も書かない）、stderr は呼び出し側が選ぶ。supervisor の構造化ログは supervisor 自身が
@@ -51,6 +54,8 @@ use fandhe_container_core::traits::{ContainerId, ErrorCode, TraitError};
 
 use crate::restart::RestartPolicy;
 
+/// supervisor の入口とランチャーが閉じ始める fd 番号（0〜2 は契約の stdin / stdout / stderr。SEC-1・#2070）。
+pub const FIRST_INHERITED_FD: u32 = 3;
 /// 報告の先頭トークン（契約の版。互換性のない変更では数字を上げる）。
 pub const REPORT_MAGIC: &str = "FCSUP1";
 /// 報告 1 行（終端の `\n` を含む）の最大バイト数。

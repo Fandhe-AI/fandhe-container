@@ -1,7 +1,7 @@
 //! Linux ゲストの PID 1 としての起動シーケンスと [`GuestOps`] の実装（MAC-1・MAC-2・TASK-64 追補）。
 //!
 //! bin の入口（`main.rs`）から [`run`] だけが呼ばれる。mount は `sys` の安全なラッパー経由で、
-//! 指示の復号・報告は OS 非依存の `directive`・`process`・`report` が担う。
+//! 指示の復号・報告は OS 非依存の `directive`・`process`・`report` が、試験用プローブは `probe` が担う。
 //!
 //! どの経路でも終了しない（PID 1 が終了するとカーネルが panic する）。唯一の例外は PID 1 でないとき
 //! （ホストでの誤実行）で、何も mount せずに終了する。
@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use crate::cmdline::{MAX_CMDLINE_BYTES, read_bounded};
 use crate::directive::{Access, Directive, GUEST_MOUNT_BASE, MountPoint};
+use crate::probe::{GUEST_MOUNT, decode_test_mode, probe_plan, run_virtiofs_io};
 use crate::process::{GuestOps, emit_ready, process_directives};
 use crate::report::{Errno, InitStage, ReportLine};
 use crate::sys;
@@ -162,7 +163,11 @@ pub fn run() -> ! {
         Ok(s) => s,
         Err(e) => fatal(&mut ops, InitStage::Cmdline, e.errno()),
     };
-    process_directives(&cmdline, &mut ops);
+    let outcome = process_directives(&cmdline, &mut ops);
     emit_ready(&mut ops);
+    // 試験用プローブは ready の後（init 自身の責務の完了を遅らせない）。起動条件を満たさない本番の起動では何もしない。
+    if let Some(plan) = probe_plan(decode_test_mode(&cmdline), &outcome) {
+        run_virtiofs_io(plan, Path::new(GUEST_MOUNT), &mut |l| ops.write_line(&l));
+    }
     idle()
 }

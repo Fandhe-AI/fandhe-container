@@ -1073,6 +1073,32 @@ mod tests {
         );
     }
 
+    /// MAC-1・IO-5・#1876: 本番の生成経路はゲスト試験モード（プローブ）を有効にしない。
+    #[test]
+    fn mac1_io5_build_spec_never_enables_guest_test() {
+        let dir = tmp_dir("no-guest-test");
+        let k = kernel(&dir);
+        let share = dir.join("fandhe-io");
+        std::fs::create_dir_all(&share).expect("mkdir");
+        // 試験用の共有と同じ tag・RW を指定しても、試験モードは立たない（ホストのコードだけが有効にできる）。
+        let spec = build_spec(
+            &k,
+            "",
+            "console=hvc0",
+            &s(&["fandhe-io", share.to_str().expect("utf8"), "rw"]),
+            Duration::from_secs(5),
+        )
+        .expect("spec");
+        assert_eq!(spec.guest_test, None);
+        assert!(
+            !spec
+                .effective_cmdline()
+                .expect("cmdline")
+                .as_str()
+                .contains("fandhe.guest-test")
+        );
+    }
+
     /// TASK-115.3・PLUG-1: 状態遷移・重複・上限・未登録のエラーコード。
     #[test]
     fn task115_3_plug1_state_errors() {

@@ -3,12 +3,15 @@
 //! # 役割
 //!
 //! `fandhe-container-platform-macos` の `Vm::launch` が起動したゲストカーネルが最初に実行する。
-//! 責務は次の 3 点に限る。
+//! 責務は次の 3 点に限る（4 は試験専用の追加）。
 //!
 //! 1. `/proc`・`/sys`・`/dev` を mount する。
 //! 2. カーネルコマンドラインの `fandhe.virtiofs=<tag>:<mountpoint>:<ro|rw>` を untrusted として復号し、
 //!    virtiofs を mount して共有ごとに 1 行を hvc0 へ報告する（[`process::process_directives`]）。
 //! 3. 起動完了マーカー [`READY_MARKER`] を出し、以後は終了しない。
+//! 4. （試験専用）予約キー `fandhe.guest-test=virtiofs-io` があり、`fandhe-io` の RW mount が成功したときだけ、
+//!    ready の後に共有の read / readdir / write のプローブ行を出す（[`probe`]。MAC-1・IO-5・#1876）。
+//!    キーはホストの `reject_reserved_keys` により利用者指定では注入できず、本番の起動では走らない。
 //!
 //! # ホストとの契約
 //!
@@ -26,10 +29,11 @@
 //!
 //! - 協調停止: `reboot(2)` 等は呼ばない。VM の停止はホストの VZ の強制停止に任せる（TASK-115）。
 //! - 子プロセスの回収（`waitpid`）: 現状は子を作らない。ゲスト内でコンテナを実行する際に実装する。
-//! - 静的リンクの実ビルド・initrd への梱包は #1878、`virtiofs_io` のプローブは #1876、実機起動は #1628。
+//! - 静的リンクの実ビルド・initrd への梱包は #1878、symlink・ハードリンクの観測モードは #1877、実機起動は #1628。
 
 pub mod cmdline;
 pub mod directive;
+pub mod probe;
 pub mod process;
 pub mod report;
 
@@ -59,6 +63,6 @@ mod tests {
         assert!(!READY_MARKER.contains("Linux version"));
         assert!(!"Linux version".contains(READY_MARKER));
         assert!(!READY_MARKER.starts_with(report::REPORT_PREFIX));
-        assert!(!READY_MARKER.starts_with("fandhe-guest-test: virtiofs-io "));
+        assert!(!READY_MARKER.starts_with(report::PROBE_NAMESPACE));
     }
 }

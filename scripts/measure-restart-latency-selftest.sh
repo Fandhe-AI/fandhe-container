@@ -122,7 +122,9 @@ id="${!#}"
 sd="${3}/${id}"
 [ -f "$sd/state.json" ] || exit 2
 # 実 supervisor は構造化ログを <root>/@supervisor-logs/<id>.log へ `stderr <JSON>` 形式で残す（#2067・REPAIR-4）。
-logfile="${3}/@supervisor-logs/${id}.log"
+# ファイル名は RotatingFileSink と同じ符号化（大文字 X は `_x`、`_` は `__`）にする。
+stem="$(printf '%s' "$id" | sed -e 's/_/__/g' -e 's/\([A-Z]\)/_\1/g' | tr 'A-Z' 'a-z')"
+logfile="${3}/@supervisor-logs/${stem}.log"
 mkdir -p "${3}/@supervisor-logs"
 logline() { printf 'stderr %s\n' "$1" >>"$logfile"; }
 if [ ! -p /dev/stdout ]; then echo "FCSUP1 ERR INVALID_ARGUMENT 2 stdout is not a fifo"; exit 2; fi
@@ -670,6 +672,10 @@ mkdir -m 0700 "${root}/sr"
 run_case state_root 0 normal "101000 101000" --trials 1 --warmup 0 --timeout 10 --state-root "${root}/sr" || true
 if [ -s "${root}/state_root.out" ]; then pass "state_root: result published"; else fail "state_root: no result"; fi
 if [ "$(find "${root}/sr" -name state.json | wc -l)" -eq 1 ]; then pass "state_root: state.json created under --state-root"; else fail "state_root: state.json missing under --state-root"; fi
+
+# 大文字と '_' を含む --id-prefix でも、符号化されたログのファイル名から副系列を読める（REPAIR-4・IO-5）
+run_case id_prefix_enc 0 normal "101000 101000" --trials 1 --warmup 0 --timeout 10 --id-prefix Foo_bar || true
+jq_eq id_prefix_enc "${root}/id_prefix_enc.out" '.supervisor_reported.samples' '1'
 
 # --- 引数・入力エラーは 2 ---
 chk2() { # <名前> <script 引数...>

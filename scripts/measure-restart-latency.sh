@@ -550,6 +550,22 @@ sup_report() {
   fail "supervisor printed an unrecognized report line"
 }
 
+# コンテナ ID を supervisor ログのファイル名の語幹へ変換する（RotatingFileSink の encode_file_stem と同じ規則。
+# 大文字 X は `_x`、`_` は `__`。大文字小文字非区別の FS で別 ID が衝突しないための可逆表現。IO-5）。
+# ID は [A-Za-z0-9_-] と '-' 区切りの乱数だけで、'.' を含まず予約デバイス名にもならない。bash 3.2 でも動く書き方にする。
+encode_log_stem() { # <id>
+  local in="$1" out="" c i
+  for ((i = 0; i < ${#in}; i++)); do
+    c="${in:i:1}"
+    case "$c" in
+      _) out+="__" ;;
+      [A-Z]) out+="_$(printf '%s' "$c" | tr 'A-Z' 'a-z')" ;;
+      *) out+="$c" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 # launcher ログから副系列を集計する（launcher 停止後に do_cleanup から呼ぶ。非信頼入力として値域を検証し、
 # 数値のみ採用する）。結果は reported（null または改行区切り数値）・reported_err（失敗した restart 行の有無）。
 collect_reported() {
@@ -557,7 +573,8 @@ collect_reported() {
   # supervisor の構造化ログは状態ルート配下の <root>/@supervisor-logs/<id>.log（古い世代 .log.2 .log.1 が先）に
   # `stderr <JSON 1 行>` 形式で残る（#2067・REPAIR-4）。launcher の stderr（err.log）には出ないため、世代順に連結し、
   # 接頭辞 `stderr ` の行だけを JSON として取り出す。
-  local logbase="$state_dir/@supervisor-logs/$container_id" f
+  local logbase f
+  logbase="$state_dir/@supervisor-logs/$(encode_log_stem "$container_id")"
   local merged="$workdir/sup-merged.log"
   : >"$merged"
   for f in "$logbase.log.2" "$logbase.log.1" "$logbase.log"; do

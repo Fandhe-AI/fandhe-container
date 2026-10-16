@@ -623,7 +623,22 @@ fn repair4_delete_removes_supervisor_log() {
         w.write_all(b"{}\n").expect("write");
         w.flush().expect("flush");
     }
-    drop(fandhe_container_supervisor::supervisor_log::open(&root, &id).expect("reopen"));
+    // 並行する他の試験の子プロセス起動（fork から exec まで）が、直前に閉じた書き手の flock の記述子を
+    // 一瞬だけ継承して保持し得る。その間の open は FailedPrecondition になるため、期限つきで再試行する（REPAIR-5）。
+    let reopen_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let reopened = loop {
+        match fandhe_container_supervisor::supervisor_log::open(&root, &id) {
+            Ok(w) => break w,
+            Err(e)
+                if e.code() == fandhe_container_core::traits::ErrorCode::FailedPrecondition
+                    && std::time::Instant::now() < reopen_deadline =>
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("reopen: {e:?}"),
+        }
+    };
+    drop(reopened);
     assert!(logs.join("c1.log").exists());
     assert!(logs.join("c1.log.1").exists());
 

@@ -29,6 +29,25 @@ pub fn verify_executable(path: &Path, euid: u32) -> Result<PathBuf, StartupLaten
     }
     let meta =
         std::fs::symlink_metadata(path).map_err(|_| untrusted("executable is not accessible"))?;
+    check_body(&meta, euid)?;
+    // 字面上の祖先と、symlink を解決した実体の祖先の両方を検証する。symlink の差し替えにはそれを置く
+    // ディレクトリの書き込み権が要るため、字面上の祖先の検証がそれも覆う。
+    let real =
+        std::fs::canonicalize(path).map_err(|_| untrusted("executable is not accessible"))?;
+    for chain in [path, real.as_path()] {
+        for dir in chain.ancestors().skip(1) {
+            verify_ancestor(dir, euid)?;
+        }
+    }
+    // 解決途中の symlink が検証した本体と別の実体を指す場合に備え、起動に使う実体パスの本体も再検証する。
+    let real_meta =
+        std::fs::symlink_metadata(&real).map_err(|_| untrusted("executable is not accessible"))?;
+    check_body(&real_meta, euid)?;
+    Ok(real)
+}
+
+/// 実行ファイル本体のメタデータ検証（通常ファイル・実行ビット・group/other 書き込み不可・所有者）。
+fn check_body(meta: &std::fs::Metadata, euid: u32) -> Result<(), StartupLatencyError> {
     if !meta.file_type().is_file() {
         return Err(untrusted(
             "executable must be a regular file, not a symlink",
@@ -44,16 +63,7 @@ pub fn verify_executable(path: &Path, euid: u32) -> Result<PathBuf, StartupLaten
     if meta.uid() != euid && meta.uid() != 0 {
         return Err(untrusted("executable owner is neither the caller nor root"));
     }
-    // 字面上の祖先と、symlink を解決した実体の祖先の両方を検証する。symlink の差し替えにはそれを置く
-    // ディレクトリの書き込み権が要るため、字面上の祖先の検証がそれも覆う。
-    let real =
-        std::fs::canonicalize(path).map_err(|_| untrusted("executable is not accessible"))?;
-    for chain in [path, real.as_path()] {
-        for dir in chain.ancestors().skip(1) {
-            verify_ancestor(dir, euid)?;
-        }
-    }
-    Ok(real)
+    Ok(())
 }
 
 /// 祖先ディレクトリ 1 つを検証する。ディレクトリで、所有者が `euid` か root で、group / other 書き込み不可であること。
@@ -110,14 +120,20 @@ pub fn verify_work_base(base: &Path, euid: u32) -> Result<PathBuf, StartupLatenc
 /// 親ディレクトリを `verify_work_base` と同じ基準で検証し（コード `untrusted-output`）、出力先がすでに
 /// 存在する（FIFO・symlink・通常ファイルを問わず）なら拒否する。計測後の書き込みが FIFO で無期限に停止したり、
 /// symlink の参照先を上書きしたりするのを避ける。書き込みは `output::write_new` の `create_new` が担う。
-pub fn verify_output_target(path: &Path, euid: u32) -> Result<(), StartupLatencyError> {
+/// 成功時は検証済みの実体の親とファイル名を結合したパスを返し、呼び出し側はそのパスだけを書き込みに使う
+/// （解決途中の中間 symlink を検証後に差し替えられても別の場所へ作らせない）。
+pub fn verify_output_target(path: &Path, euid: u32) -> Result<PathBuf, StartupLatencyError> {
     let deny = |m: &str| StartupLatencyError::new("untrusted-output", m);
     let parent = path
         .parent()
         .ok_or_else(|| deny("output path has no parent directory"))?;
-    verify_dir_chain(parent, euid, "untrusted-output")?;
-    match std::fs::symlink_metadata(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+    let name = path
+        .file_name()
+        .ok_or_else(|| deny("output path has no file name"))?;
+    let real_parent = verify_dir_chain(parent, euid, "untrusted-output")?;
+    let target = real_parent.join(name);
+    match std::fs::symlink_metadata(&target) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(target),
         Err(_) => Err(deny("output path is not accessible")),
         Ok(_) => Err(deny("output path already exists")),
     }
@@ -202,7 +218,11 @@ mod tests {
     #[test]
     fn output_target_must_be_new_in_a_trusted_parent() {
         let d = Dir::new("out");
-        assert_eq!(verify_output_target(&d.0.join("r.json"), euid()), Ok(()));
+        let got = verify_output_target(&d.0.join("r.json"), euid()).expect("ok");
+        assert_eq!(
+            got,
+            std::fs::canonicalize(&d.0).expect("canon").join("r.json")
+        );
         // 既存の通常ファイル・symlink・FIFO 相当の存在は拒否する（開かない）。
         let existing = d.file("exists.json", 0o600);
         let e = verify_output_target(&existing, euid()).unwrap_err();
@@ -238,6 +258,21 @@ mod tests {
                 .unwrap_err()
                 .code,
             "untrusted-output"
+        );
+    }
+
+    #[test]
+    fn output_target_returns_the_resolved_parent_path() {
+        let d = Dir::new("outres");
+        let real = d.0.join("real");
+        std::fs::create_dir(&real).expect("mkdir");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let link = d.0.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let got = verify_output_target(&link.join("r.json"), euid()).expect("ok");
+        assert_eq!(
+            got,
+            std::fs::canonicalize(&real).expect("canon").join("r.json")
         );
     }
 

@@ -679,8 +679,9 @@ pub fn run(mut plan: Plan) -> Result<super::Execution, StartupLatencyError> {
         ));
     }
     // 出力先は計測の開始前に検証する（FIFO・symlink・既存ファイルを後から開かない）。
+    // 書き込みには検証済みの実体パスだけを使う（plan.output を置き換える）。
     if let Some(out) = &plan.output {
-        verify_output_target(out, euid)?;
+        plan.output = Some(verify_output_target(out, euid)?);
     }
     // 検証済みの実体パスで置き換え、起動には字面のパスを使わない（symlink 解決途中の差し替え対策）。
     plan.supervisor_bin = verify_executable(&plan.supervisor_bin, euid)?;

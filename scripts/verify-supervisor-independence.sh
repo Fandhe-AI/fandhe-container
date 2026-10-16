@@ -32,8 +32,10 @@
 # 標準エラーを捨て、子として wait しない。直接起動すれば supervisor が本スクリプトの直接の子（親 pid の照合）になり、
 # 「supervisor の子孫を数える」集計と後始末が成立する。
 # bundle: --bundle は使い捨てのテンプレートとして扱う。supervisor は bundle へ flock を取るため、コンテナごとに
-# 作業ディレクトリへ複製する（rootfs はハードリンク複製で inode と page cache を共有する。cp -al 失敗時は 2）。
-# テンプレートは計測専用の使い捨てにすること（ハードリンクの inode 共有により、コンテナ内の書き込みが波及しうる）。
+# 作業ディレクトリへ複製する（cp -a --reflink=auto。inode を共有しない複製にする。製品の rootfs 検査
+# check_no_external_hardlinks は rootfs 外にもリンクを持つ inode を起動前に拒否するため、cp -al は使えない）。
+# 複製の失敗時は 2。reflink 対応の FS では複製どうしがデータブロックを共有しうるが、page cache の共有条件は
+# 実行ごとに異なりうる（メモリ比較の前提として記録する）。
 # 後始末: 環境変数 FANDHE_BENCH_OWNER に実行ごとの乱数トークンを渡し、/proc/*/environ のトークン一致で孤児化した
 # 子孫も回収する。supervisor は dumpable=0 で environ を読めないため、記録した pid・起動時刻の同一性で追跡して回収する
 # （回収できなければ終了コード 4）。停止は SIGTERM、期限超過で SIGKILL。状態ルート・bundle の複製・FIFO は
@@ -220,7 +222,7 @@ owner_tok=""
 out_tmp=""
 final_rc=0
 spawned=0
-declare -A SP SS SZ CH TRK SEEN NOCHILD
+declare -A SP SS SZ CH TRK SEEN BADREP
 untracked=0
 TREE_TRUNC=0
 publish_pending=0
@@ -394,11 +396,12 @@ track_descendants() {
         TRK[$c]="${rest%%:*}"
         SEEN[$i]=1
       done
-    elif [ -z "${SEEN[$i]:-}" ] && [ -z "${DESC[$i]:-}" ] && [ -z "${NOCHILD[$i]:-}" ]; then
-      # 既に消滅した supervisor で、子孫を 1 つも観測できていない。ERR を出して終了したのなら
-      # （sup_report が NOCHILD を記録して起動失敗で終了する）追跡不能とは扱わない。
+    elif [ -z "${SEEN[$i]:-}" ] && [ -z "${DESC[$i]:-}" ] ; then
+      # 既に消滅した supervisor で、子孫を 1 つも観測できていない。ERR・書式不正の報告を受けていても、
+      # 子プロセス不在の証明にならない（start_contract.rs は ERR 報告の後に terminate 等の後始末を行い、
+      # start_entry.rs には未回収のハンドルを伴う失敗経路もある）ため、追跡不能（終了コード 4）にする。
       sup_report "$i" || true
-      [ -n "${NOCHILD[$i]:-}" ] || untracked=1
+      untracked=1
     fi
     for d in ${DESC[$i]:-}; do
       c="${d%%:*}"
@@ -515,15 +518,14 @@ declare -A REP_PID FDS
 
 # --- 起動契約の差し替え点（契約の根拠は冒頭コメント）。起動行・報告行の解釈はこの関数群に閉じる ---
 
-# bundle の複製（supervisor が bundle へ flock を取るため、コンテナごとに別ディレクトリを使う）。rootfs はハードリンクで共有する。
+# bundle の複製（supervisor が bundle へ flock を取るため、コンテナごとに別ディレクトリを使う）。inode は共有しない複製にする（--reflink=auto）。
 make_bundle_copy() { # <i>
   local dst="${work}/bundles/${id_prefix}-${1}"
-  if ! cp -al -- "$bundle" "$dst" 2>/dev/null; then
-    err "invalid-argument" "cannot hard-link the bundle template (it must be on the same filesystem as TMPDIR)"
+  if ! cp -a --reflink=auto -- "$bundle" "$dst" 2>/dev/null; then
+    err "invalid-argument" "cannot copy the bundle template"
     exit 2
   fi
-  # config.json は inode を共有せず通常のコピーにする。
-  cp -f --remove-destination -- "${bundle}/config.json" "${dst}/config.json" 2>/dev/null || { err "invalid-argument" "bundle must contain config.json"; exit 2; }
+  [ -f "${dst}/config.json" ] || { err "invalid-argument" "bundle must contain config.json"; exit 2; }
 }
 
 # create を期限付きで実行する（REPAIR-5）。失敗は終了コードだけを出す（出力・パスは出さない）。
@@ -548,13 +550,13 @@ sup_spawn() { # <i>
   if read_starttime "${pids[$i]}"; then pstart[i]="$ST"; fi
 }
 
-# 報告の 1 行を読み、FCSUP1 OK <pid> なら REP_PID へ記録して 0。ERR・書式不正は起動失敗として REP_FAIL・NOCHILD を記録して 2
+# 報告の 1 行を読み、FCSUP1 OK <pid> なら REP_PID へ記録して 0。ERR・書式不正は起動失敗として REP_FAIL・BADREP を記録して 2
 # （exit しない。EXIT trap 内の cleanup_procs からも呼ばれるため、後始末を中断させない。終了コードの決定は呼び出し側が
 # 後始末の前に行う）。未到着は 1。
 sup_report() { # <i>
   local i="$1" line=""
   [ -z "${REP_PID[$i]:-}" ] || return 0
-  [ -z "${NOCHILD[$i]:-}" ] || return 2
+  [ -z "${BADREP[$i]:-}" ] || return 2
   IFS= read -r -n 640 -t 0.05 -u "${FDS[$i]}" line || true
   [ -n "$line" ] || return 1
   if [[ "$line" =~ ^FCSUP1\ OK\ ([1-9][0-9]{0,9})$ ]]; then
@@ -566,8 +568,8 @@ sup_report() { # <i>
   else
     err "launch-failed" "supervisor ${i} printed an unrecognized report line"
   fi
-  # 起動失敗した supervisor はコンテナ側プロセスを持たないため、子孫を観測できなかったことを追跡不能にしない。
-  NOCHILD[$i]=1
+  # 同じ報告を読み直さないための印。子プロセス不在の証明にはしない（不在を確認できなければ追跡不能で終了コード 4）。
+  BADREP[$i]=1
   REP_FAIL=1
   return 2
 }

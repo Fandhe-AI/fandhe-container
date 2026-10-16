@@ -229,9 +229,10 @@ run_case no_ready --timeout 3
 expect_eq "no_ready: exit code" 1 "$RC"
 expect_eq "no_ready: stdout is empty" "" "$(cat "$OUT")"
 
-# 5b. FCSUP1 ERR を返す / 書式不正の報告 → 結果を公開せず 1。
+# 5b. FCSUP1 ERR を返す / 書式不正の報告 → 結果を公開しない。ERR を出して終了した supervisor は子プロセス不在を
+# 確認できないため追跡不能（4）。生存したまま書式不正を返す場合は後始末できるので 1。
 run_case err_report
-expect_eq "err_report: exit code" 1 "$RC"
+expect_eq "err_report: exit code (ERR is not proof of no child => untracked)" 4 "$RC"
 expect_eq "err_report: stdout is empty" "" "$(cat "$OUT")"
 if grep -q 'FAILED_PRECONDITION' "$ERR"; then pass "err_report: error code is reported"; else fail "err_report: error code missing from stderr"; fi
 run_case bad_report

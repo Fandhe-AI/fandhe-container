@@ -59,9 +59,10 @@
 # 起動契約（crates/supervisor/src/start_contract.rs・start_entry.rs。#1717・#1819。差し替え点は ln_prepare / ln_spawn /
 # ln_ready / ln_stop / ln_collect_pids に隔離している。以下の「launcher」は supervisor の bin のこと）:
 #   - 準備: コンテナごとに bundle の複製を作り（supervisor は start 中 bundle へ flock を取り、同じ bundle への同時 start は
-#     失敗する。複製は cp -al のハードリンクで rootfs の inode・page cache を共有し、Docker の lower 共有と同じ条件にする。
-#     cp -al が失敗したら --bundle が TMPDIR と別ファイルシステムの可能性があるため終了コード 2。--bundle は計測専用の
-#     使い捨てを使うこと。ハードリンク共有によりコンテナ内の書き込みがテンプレートへ波及しうる）、
+#     失敗する。複製は cp -a --reflink=auto で inode を共有しない
+#     複製にする（製品の rootfs 検査 check_no_external_hardlinks は rootfs 外にもリンクを持つ inode を起動前に拒否するため
+#     cp -al は使えない）。複製どうしの page cache は共有されないため、Docker の lower 共有より PSS が大きく出うる比較条件
+#     として結果の解釈に含める。複製が失敗したら終了コード 2。--bundle は計測専用の使い捨てを使うこと）、
 #     `<bin-dir>/fandhe-container --root <状態ルート> create --bundle <複製> <id>` を期限付き（--timeout）で済ませる。
 #   - 起動: `<systemd-run> --user --scope --quiet -p Delegate=yes -- <bin-dir>/fandhe-container-supervisor start --root <状態ルート> <id>`
 #     を本スクリプトの直接の子としてバックグラウンドで起動する（--scope は同じプロセスのまま exec する。supervisor は
@@ -659,18 +660,16 @@ collectors_stop() {
 }
 
 # コンテナ 1 つ分の bundle の複製と create を済ませる（supervisor の起動前。起動をずらさないため、全コンテナ分を先に行う）。
-# 複製の失敗は終了コード 2（別ファイルシステム等。cp -a へ黙って落とさない: 落とすと PSS が膨らみ比較できない値になる）、
+# 複製の失敗は終了コード 2（別ファイルシステム等。）、
 # create の失敗は計測失敗の 1。create は --timeout を上限にし、出力・パスは出さない（REPAIR-5）。
 ln_prepare() { # <id>
   local rc=0
   mkdir -p -- "$tmpdir/state" "$tmpdir/bundles" || { err "invalid-input" "cannot create the state directory"; exit 1; }
-  if ! cp -al -- "$bundle" "$tmpdir/bundles/$1" 2>/dev/null; then
-    err "invalid-argument" "cannot hard-link the bundle template (it must be on the same filesystem as TMPDIR)"
+  if ! cp -a --reflink=auto -- "$bundle" "$tmpdir/bundles/$1" 2>/dev/null; then
+    err "invalid-argument" "cannot copy the bundle template"
     exit 2
   fi
-  # config.json は inode を共有せず通常のコピーにする。
-  cp -f --remove-destination -- "$bundle/config.json" "$tmpdir/bundles/$1/config.json" 2>/dev/null ||
-    { err "invalid-argument" "the bundle must contain config.json"; exit 2; }
+  [ -f "$tmpdir/bundles/$1/config.json" ] || { err "invalid-argument" "the bundle must contain config.json"; exit 2; }
   timeout --kill-after=5 "$timeout_s" "$cli_bin" --root "$tmpdir/state" create --bundle "$tmpdir/bundles/$1" "$1" </dev/null >/dev/null 2>&1 || rc=$?
   if [ "$rc" -ne 0 ]; then err "measurement-failed" "id=$1 reason=create-failed exit=$rc"; exit 1; fi
 }

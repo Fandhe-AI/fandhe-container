@@ -580,7 +580,7 @@ expect_eq "signal-in-spawn-no-residual" 0 "$(alive_stub_count)"
 expect_eq "signal-in-spawn-no-orphan-child" 0 "$(orphan_sleep_count)"
 
 # --- 12m. create の失敗は計測失敗（exit 1。結果は公開せず、supervisor は 1 つも起動しない）。bundle の複製の失敗は exit 2
-#          （cp -a へ黙って落とさない。#1820） ---
+#          （#1820） ---
 STUB_CREATE_FAIL="fc-bench50-1-1" run_fake --count 2 --trials 1 --timeout 5
 expect_eq "create-fail-exit1" 1 "$rc"
 expect_has "create-fail-stderr" "$errf" "reason=create-failed exit=5"
@@ -592,7 +592,7 @@ chmod 000 "$work/bundle-bad/rootfs/sub"
 run_target --count 2 --trials 1 --timeout 5 --bundle "$work/bundle-bad"
 chmod 700 "$work/bundle-bad/rootfs/sub"
 expect_eq "bundle-copy-fail-exit2" 2 "$rc"
-expect_has "bundle-copy-fail-stderr" "$errf" "cannot hard-link the bundle template"
+expect_has "bundle-copy-fail-stderr" "$errf" "cannot copy the bundle template"
 expect_eq "bundle-copy-fail-no-residual" 0 "$(alive_stub_count)"
 
 # --- 13. 引数エラーは exit 2 ---

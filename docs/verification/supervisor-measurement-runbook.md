@@ -38,10 +38,10 @@ export BIN_DIR="$PWD/target/release"
 
 ## bundle の用意
 
-- 計測専用の使い捨てのテンプレートを作る。`TMPDIR` と同じファイルシステムに置く（コンテナごとの複製を `cp -al` のハードリンクで作るため。別ファイルシステムだと終了コード 2）
-- ハードリンクで rootfs の inode を共有するため、コンテナ内の書き込みがテンプレートへ波及しうる。使い捨てにする理由はこれ
+- 計測専用の使い捨てのテンプレートを作る。コンテナごとの複製は `cp -a --reflink=auto` で作る（inode を共有しない。複製に失敗すると終了コード 2）
+- `cp -al` は使わない。複製が rootfs 外にもリンクを持つ inode になり、製品の `check_no_external_hardlinks` が起動前に拒否するため。reflink 非対応の FS では複製ごとに page cache が別になり、PSS が Docker の lower 共有より大きく出うる（比較条件として結果に記す）
 - `config.json` を置く。user namespace（UID マッピング）を入れる。`process.args` は長時間動き続けるものにする（restart 計測では即時終了しないもの）。静的リンクのバイナリか、共有ライブラリを rootfs へコピーしたものにする
-- 並列起動するスクリプトは、コンテナごとに `config.json` を通常コピー・rootfs をハードリンク複製して使う（supervisor は start 中に bundle へ flock を取るため、同じ bundle を共有できない）
+- 並列起動するスクリプトは、コンテナごとに bundle 全体を `cp -a --reflink=auto` で複製して使う（supervisor は start 中に bundle へ flock を取るため、同じ bundle を共有できない）
 
 ## #499 監視プロセス独立性（SUP-5・TASK-162）
 
@@ -65,13 +65,14 @@ make supervisor-independence BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> COUN
    root=$(mktemp -d)
    declare -A FD
    for i in $(seq 1 50); do
-     cp -al <テンプレート> "$root/b$i"
+     cp -a --reflink=auto <テンプレート> "$root/b$i"
      "$BIN_DIR/fandhe-container" --root "$root/state" create --bundle "$root/b$i" "sup-$i"
      mkfifo "$root/f$i"
      exec {FD[$i]}<>"$root/f$i"   # コンテナごとの fd を保存する（報告の読み取りと後始末で使う）
      systemd-run --user --scope --quiet -p Delegate=yes -- \
        "$BIN_DIR/fandhe-container-supervisor" start --root "$root/state" "sup-$i" >"$root/f$i" &
-     echo $! >"$root/sup$i.pid"
+     sp=$!
+     echo "$sp $(awk '{print $22, $4}' "/proc/$sp/stat" 2>/dev/null)" >"$root/sup$i.pid"   # pid・起動時刻・親 pid
    done
    ```
 
@@ -103,8 +104,13 @@ make supervisor-independence BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> COUN
        echo "$c $(awk '{print $22}' "/proc/$c/stat" 2>/dev/null)" >>"$root/tracked"
      done
    done
-   # 2. supervisor を終了させ、保存した pid が同じ起動時刻のまま生きていれば SIGKILL
-   kill $(cat "$root"/sup*.pid) 2>/dev/null; sleep 1
+   # 2. supervisor を終了させる。送信直前に pid・起動時刻・親 pid（このシェルの $$）の一致を確認する（pid 再利用の取り違え防止）。
+   #    保存した pid が同じ起動時刻のまま生きていれば SIGKILL
+   for f in "$root"/sup*.pid; do
+     read -r sp st pp <"$f"
+     [ -n "$st" ] && [ "$(awk '{print $22, $4}' "/proc/$sp/stat" 2>/dev/null)" = "$st $pp" ] && [ "$pp" = "$$" ] && kill "$sp"
+   done
+   sleep 1
    while read -r c st; do
      [ "$(awk '{print $22}' "/proc/$c/stat" 2>/dev/null)" = "$st" ] && kill -KILL "$c"
    done <"$root/tracked"

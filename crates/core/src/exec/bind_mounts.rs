@@ -80,8 +80,9 @@
 //! message のパスは**コンテナ内の宛先**で、ホスト側のマウント元・rootfs の実パスは載せない。宛先は [`display_destination`]
 //! のエスケープと切り詰めを通す。新マウント API の無いカーネルでは `mount(2)` へ縮退せず `UNIMPLEMENTED` で拒否する。
 //!
-//! 失敗時は、載せたマウントを新しい順に `umount2(MNT_DETACH)` で外し、自分が作った空ファイル（作成時の `(dev, ino)` と
-//! 一致するときだけ）とディレクトリだけを消す。後始末の失敗は元のエラーの message に `; cleanup failed: ...` として併記する
+//! 失敗時は、載せたマウントを新しい順に `umount2(MNT_DETACH)` で外し、自分が作った空ファイル・ディレクトリを、作成時に記録した
+//! `(dev, ino)` と一致するときだけ消す（同じ親の中の隔離名へ `renameat` してから照合して消し、照合と削除の間の
+//! 差し替えを防ぐ）。後始末の失敗（umount・開き直し・照合不一致・削除）は元のエラーの message に `; cleanup failed: ...` として併記する
 //! （REPAIR-4）。呼び出し後もプロセスは破棄する（`pivot_root`・exec へ進まない）。
 //!
 //! # 未対応・残余（REPAIR-3: 実装済みを装わない）
@@ -111,10 +112,7 @@ use crate::sys::{
 };
 use crate::traits::types::ErrorCode;
 
-use super::tmpfs::{
-    DIR_MODE, RollbackFailure, display_destination, open_chain, root_display,
-    with_rollback_failures,
-};
+use super::tmpfs::{DIR_MODE, display_destination, open_chain, root_display};
 use super::{
     ExecError, IdMapping, IsolationStage, MountIsolation, PreparedRootfs, USER_NS_INIT_INO,
     ViolationReason, fd_mount_id, fd_still_at, mount_is_shared, read_thread_mountinfo,
@@ -288,6 +286,8 @@ struct Applied<'a> {
     names: Vec<&'a OsStr>,
     /// この呼び出しの `mkdirat` が成功した要素の添字（昇順）。
     created_dirs: Vec<usize>,
+    /// 作った各ディレクトリの `(要素の添字, (st_dev, st_ino))`（作成直後に記録。後始末は一致したものだけ消す）。
+    created_dir_ids: Vec<(usize, (u64, u64))>,
     /// この呼び出しが作った空ファイル（末尾の要素）の `(st_dev, st_ino)`。
     created_file: Option<(u64, u64)>,
     /// 付け替えた「自分のマウントのルート」を指す fd（付け替え直後に保持し、事後検証に通らなくても外せる）。
@@ -305,6 +305,7 @@ impl<'a> Applied<'a> {
                 .map(OsStr::new)
                 .collect(),
             created_dirs: Vec::new(),
+            created_dir_ids: Vec::new(),
             created_file: None,
             mounted: None,
         }
@@ -358,7 +359,7 @@ fn mount_binds_at(
             }),
             Err(e) => {
                 let failures = roll_back_binds(&ctx, &applied);
-                return Err(with_rollback_failures(e, &failures));
+                return Err(with_cleanup_failures(e, &failures));
             }
         }
     }
@@ -522,16 +523,51 @@ fn pin_target(
     let parent = parent_fd.as_ref().map_or(ctx.root, |f| f.as_fd());
     let c_leaf = CString::new(leaf.as_bytes())
         .map_err(|_| violation(spec, ViolationReason::PathContainsNul))?;
+    // 途中の要素を作った分は、作成直後に固定した実体の ID を記録する（失敗しても作った分は後始末できる）。
+    let recorded = record_created_dirs(ctx, state);
     let fd = match sys::open_path_nofollow(parent, &c_leaf) {
         Ok(fd) => fd,
         Err(SysError::Os(sys::ENOENT)) => {
-            create_target(spec, kind, parent, &c_leaf, last_index(state), state)?;
+            let created = create_target(spec, kind, parent, &c_leaf, last_index(state), state);
+            if created.is_ok() && state.created_dirs.contains(&last_index(state)) {
+                let id = sys::open_path_nofollow(parent, &c_leaf)
+                    .and_then(|fd| fstat_fd(fd.as_fd()))
+                    .map(|st| (st.dev, st.ino));
+                if let Ok(id) = id {
+                    state.created_dir_ids.push((last_index(state), id));
+                }
+            }
+            created?;
             reopen_created(spec, kind, parent, &c_leaf, state)?
         }
         Err(e) => return Err(mount_api_error(spec, e, "openat(bind mount target)")),
     };
+    recorded?;
     check_target_kind(spec, &fd, kind)?;
     Ok(fd)
+}
+
+/// `open_chain` が作った途中のディレクトリの `(st_dev, st_ino)` を、作成直後に名前から固定して記録する。
+///
+/// ID を取れなかった要素は記録されず、後始末はその要素を消さずに失敗として併記する（照合できないものは消さない）。
+fn record_created_dirs(ctx: &Ctx<'_>, state: &mut Applied<'_>) -> Result<(), ExecError> {
+    let names = state.names.clone();
+    let todo: Vec<usize> = state
+        .created_dirs
+        .iter()
+        .copied()
+        .filter(|i| state.created_dir_ids.iter().all(|(j, _)| j != i))
+        .collect();
+    for index in todo {
+        let Some(prefix) = names.get(..=index) else {
+            continue;
+        };
+        let fd = open_chain(ctx.root, Path::new("/"), prefix, None)?;
+        let st = fstat_fd(fd.as_fd())
+            .map_err(|e| ExecError::from_sys(e, STAGE, "fstat(created bind mount parent)"))?;
+        state.created_dir_ids.push((index, (st.dev, st.ino)));
+    }
+    Ok(())
 }
 
 /// 無いマウント先の末尾を作る（ディレクトリは 0755、通常ファイルは空の 0644）。競合で先に作られた場合は何もしない。
@@ -808,50 +844,73 @@ fn check_bind_subtree(
     Ok(())
 }
 
+/// 後始末で失敗した 1 件（元のエラーへ併記する。#1913・REPAIR-4）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CleanupFailure {
+    /// [`display_destination`] を通した宛先（エスケープ・切り詰め済み）。
+    destination: String,
+    /// 失敗した操作（`umount2`・`unlink`・`rmdir`・`open`・`rename`・`verify`）。
+    what: &'static str,
+    /// 失敗理由（英語の短い文）。
+    detail: String,
+}
+
+/// 後始末の失敗を、元のエラーの message に `; cleanup failed: <what>(<dest>) failed: <detail>` として併記する
+/// （`code`・`stage`・`violation` は保つ）。失敗が無ければ `err` をそのまま返す。件数は集合側の上限で抑えられる。
+fn with_cleanup_failures(mut err: ExecError, failures: &[CleanupFailure]) -> ExecError {
+    for f in failures {
+        err.message.push_str(&format!(
+            "; cleanup failed: {}({}) failed: {}",
+            f.what, f.destination, f.detail
+        ));
+    }
+    err
+}
+
+/// 要素列を表示用の宛先文字列にする。
+fn destination_of(names: &[&OsStr]) -> String {
+    display_destination(&format!(
+        "/{}",
+        names
+            .iter()
+            .map(|n| n.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+    ))
+}
+
 /// 失敗時の後始末（最善努力）。新しい順に、自分のマウントを外し、自分が作った空ファイル・ディレクトリを消す。
 ///
 /// 解除するのは付け替え時に得た自分のマウントの fd が指すマウントだけで、名前から開き直した先は解除しない。
-/// 空ファイルは名前で開き直して作成時の `(dev, ino)` と一致したときだけ消し（umount に失敗して元のファイルが
-/// 見えていれば一致せず消えない）、ディレクトリは `unlinkat(AT_REMOVEDIR)` が空のものしか消さない。
-/// umount の失敗は戻り値で返し、呼び出し元が元のエラーに併記する（黙って捨てない）。
-fn roll_back_binds(ctx: &Ctx<'_>, applied: &[Applied<'_>]) -> Vec<RollbackFailure> {
+/// 空ファイル・ディレクトリは [`remove_verified`] で、作成時に記録した `(dev, ino)` と一致した実体だけを消す。
+/// 失敗（umount・開き直し・照合不一致・削除）は戻り値で返し、呼び出し元が元のエラーに併記する（黙って捨てない）。
+fn roll_back_binds(ctx: &Ctx<'_>, applied: &[Applied<'_>]) -> Vec<CleanupFailure> {
     let mut failures = Vec::new();
     for state in applied.iter().rev() {
         if let Some(mount) = &state.mounted
             && let Err(error) = (ctx.deps.umount)(mount.as_fd())
         {
-            failures.push(RollbackFailure {
-                destination: display_destination(&format!(
-                    "/{}",
-                    state
-                        .names
-                        .iter()
-                        .map(|n| n.to_string_lossy())
-                        .collect::<Vec<_>>()
-                        .join("/")
-                )),
-                error,
+            failures.push(CleanupFailure {
+                destination: destination_of(&state.names),
+                what: "umount2",
+                detail: super::describe(error),
             });
         }
-        remove_created_file(ctx, state);
+        if let Some(recorded) = state.created_file {
+            let last = state.names.len().saturating_sub(1);
+            remove_created(ctx, state, last, recorded, false, &mut failures);
+        }
         for &index in state.created_dirs.iter().rev() {
-            let (Some(name), Some(prefix)) = (state.names.get(index), state.names.get(..index))
+            let Some((_, recorded)) = state.created_dir_ids.iter().find(|(i, _)| *i == index)
             else {
+                failures.push(CleanupFailure {
+                    destination: destination_of(state.names.get(..=index).unwrap_or(&[])),
+                    what: "verify",
+                    detail: "the created directory was not recorded; left in place".to_owned(),
+                });
                 break;
             };
-            let Ok(c_name) = CString::new(name.as_bytes()) else {
-                break;
-            };
-            let parent_fd = if prefix.is_empty() {
-                None
-            } else {
-                match open_chain(ctx.root, Path::new("/"), prefix, None) {
-                    Ok(fd) => Some(fd),
-                    Err(_) => break,
-                }
-            };
-            let parent = parent_fd.as_ref().map_or(ctx.root, |f| f.as_fd());
-            if sys::remove_dir_at(parent, &c_name).is_err() {
+            if !remove_created(ctx, state, index, *recorded, true, &mut failures) {
                 break;
             }
         }
@@ -859,34 +918,107 @@ fn roll_back_binds(ctx: &Ctx<'_>, applied: &[Applied<'_>]) -> Vec<RollbackFailur
     failures
 }
 
-/// 自分が作った空ファイルを、作成時の `(dev, ino)` と一致するときだけ消す（最善努力）。
-fn remove_created_file(ctx: &Ctx<'_>, state: &Applied<'_>) {
-    let Some(recorded) = state.created_file else {
-        return;
+/// `state.names[index]` の要素（自分が作ったもの）を消す。失敗は `failures` へ積み、続行してよければ `true`。
+fn remove_created(
+    ctx: &Ctx<'_>,
+    state: &Applied<'_>,
+    index: usize,
+    recorded: (u64, u64),
+    is_dir: bool,
+    failures: &mut Vec<CleanupFailure>,
+) -> bool {
+    let destination = destination_of(state.names.get(..=index).unwrap_or(&[]));
+    let mut fail = |what: &'static str, detail: String| {
+        failures.push(CleanupFailure {
+            destination: destination.clone(),
+            what,
+            detail,
+        });
+        false
     };
-    let Some((leaf, parents)) = state.names.split_last() else {
-        return;
+    let (Some(name), Some(prefix)) = (state.names.get(index), state.names.get(..index)) else {
+        return fail("verify", "the created element is out of range".to_owned());
     };
-    let Ok(c_leaf) = CString::new(leaf.as_bytes()) else {
-        return;
+    let Ok(c_name) = CString::new(name.as_bytes()) else {
+        return fail("verify", "the element name contains NUL".to_owned());
     };
-    let parent_fd = if parents.is_empty() {
+    let parent_fd = if prefix.is_empty() {
         None
     } else {
-        match open_chain(ctx.root, Path::new("/"), parents, None) {
+        match open_chain(ctx.root, Path::new("/"), prefix, None) {
             Ok(fd) => Some(fd),
-            Err(_) => return,
+            Err(e) => return fail("open", e.message),
         }
     };
     let parent = parent_fd.as_ref().map_or(ctx.root, |f| f.as_fd());
-    let Ok(fd) = sys::open_path_nofollow(parent, &c_leaf) else {
-        return;
-    };
-    if fstat_fd(fd.as_fd()).is_ok_and(|st| (st.dev, st.ino) == recorded) {
-        let _ = sys::remove_file_at(parent, &c_leaf);
+    match remove_verified(parent, &c_name, recorded, is_dir) {
+        Ok(()) => true,
+        Err((what, detail)) => fail(what, detail),
     }
 }
 
+/// 後始末用の隔離名の連番（同一プロセス内の衝突回避）。
+static QUARANTINE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `parent` 配下の `name` を、記録した `(dev, ino)` と一致する実体のときだけ消す（検証対象と削除対象を一致させる）。
+///
+/// 名前のまま照合して `unlinkat` すると、照合と削除の間に別プロセスが同名の別実体へ差し替えられる。そこで
+/// (1) `renameat` で同じ親の中の推測されにくい隔離名へ原子的に移し、(2) 隔離名を開いて `(dev, ino)` を照合し、
+/// (3) 一致したときだけ隔離名を消す。不一致・削除失敗のときは元の名前へ戻す（戻し先が再び作られていれば
+/// 置き換わる点は残る）。マウントが残っている要素は `renameat` が `EBUSY` で拒否するため、umount に失敗した
+/// 場合も消さない。
+fn remove_verified(
+    parent: BorrowedFd<'_>,
+    name: &CString,
+    recorded: (u64, u64),
+    is_dir: bool,
+) -> Result<(), (&'static str, String)> {
+    let errno = |e: SysError| super::describe(e);
+    let seq = QUARANTINE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let quarantine = CString::new(format!(
+        ".fandhe-rollback-{}-{seq}-{nanos:08x}",
+        std::process::id()
+    ))
+    .map_err(|_| ("rename", "invalid quarantine name".to_owned()))?;
+    match sys::rename_at(parent, name, &quarantine) {
+        Ok(()) => {}
+        // 既に無い（自分の作った実体が消えている）なら後始末は済んでいる。
+        Err(SysError::Os(sys::ENOENT)) => return Ok(()),
+        Err(e) => return Err(("rename", errno(e))),
+    }
+    let put_back = |what: &'static str, detail: String| {
+        let detail = match sys::rename_at(parent, &quarantine, name) {
+            Ok(()) => detail,
+            Err(e) => format!("{detail}; restoring the original name failed: {}", errno(e)),
+        };
+        Err((what, detail))
+    };
+    let id = sys::open_path_nofollow(parent, &quarantine)
+        .and_then(|fd| fstat_fd(fd.as_fd()))
+        .map(|st| (st.dev, st.ino));
+    match id {
+        Ok(id) if id == recorded => {}
+        Ok(_) => {
+            return put_back(
+                "verify",
+                "the element is not the one created by this call; left in place".to_owned(),
+            );
+        }
+        Err(e) => return put_back("verify", errno(e)),
+    }
+    let removed = if is_dir {
+        sys::remove_dir_at(parent, &quarantine)
+    } else {
+        sys::remove_file_at(parent, &quarantine)
+    };
+    match removed {
+        Ok(()) => Ok(()),
+        Err(e) => put_back(if is_dir { "rmdir" } else { "unlink" }, errno(e)),
+    }
+}
 /// rootfs とその祖先の `(st_dev, st_ino)`（先頭が rootfs 自身）。`..` を `O_NOFOLLOW` で辿り、同じ位置に戻ったら
 /// （namespace のルート）終わる。上限 [`MAX_ANCESTORS`] 段を超えたら fail-closed。
 fn rootfs_identity_chain(root: BorrowedFd<'_>) -> Result<Vec<(u64, u64)>, ExecError> {
@@ -2033,5 +2165,102 @@ mod tests {
             assert_eq!(ViolationReason::from_launch_token(token), Some(reason));
             assert!(!reason.message().is_empty());
         }
+    }
+
+    /// ディレクトリ `dir` を開いた fd と `(dev, ino)`。
+    fn dir_fd_and_id(dir: &Path) -> (OwnedFd, (u64, u64)) {
+        use std::os::unix::fs::MetadataExt as _;
+        let c = CString::new(dir.as_os_str().as_bytes()).expect("cstring");
+        let fd = sys::open_dir_path_nofollow(None, &c).expect("open dir");
+        let meta = std::fs::metadata(dir).expect("metadata");
+        (fd, (meta.dev(), meta.ino()))
+    }
+
+    /// SEC-1・REPAIR-4: 照合と削除の間に同名の別実体へ差し替えられたら消さず、元の名前へ戻して失敗を返す。
+    #[test]
+    fn sec1_remove_verified_leaves_a_swapped_file_and_reports() {
+        use std::os::unix::fs::MetadataExt as _;
+        let fx = fx();
+        let (parent, _) = dir_fd_and_id(&fx.rootfs);
+        let path = fx.rootfs.join("t");
+        std::fs::write(&path, b"").expect("create");
+        let meta = std::fs::metadata(&path).expect("meta");
+        let ours = (meta.dev(), meta.ino());
+        // 自分が作った実体を別プロセスが改名し、同名の別ファイルを置いた状況。
+        std::fs::rename(&path, fx.rootfs.join("moved")).expect("rename");
+        std::fs::write(&path, b"other").expect("swap");
+        let name = CString::new("t").expect("cstring");
+        let (what, _) = remove_verified(parent.as_fd(), &name, ours, false).expect_err("mismatch");
+        assert_eq!(what, "verify");
+        assert_eq!(std::fs::read(&path).expect("kept"), b"other");
+        // 一致する実体は消える。
+        let meta = std::fs::metadata(&path).expect("meta");
+        remove_verified(parent.as_fd(), &name, (meta.dev(), meta.ino()), false).expect("removed");
+        assert!(!path.exists());
+        // 既に無い要素は成功扱い。
+        remove_verified(parent.as_fd(), &name, ours, false).expect("already gone");
+    }
+
+    /// SEC-1・REPAIR-4: 差し替えられた空ディレクトリは消さず、中身のあるディレクトリは削除失敗として返す。
+    #[test]
+    fn sec1_remove_verified_leaves_a_swapped_or_non_empty_dir_and_reports() {
+        let fx = fx();
+        let (parent, _) = dir_fd_and_id(&fx.rootfs);
+        let path = fx.rootfs.join("d");
+        std::fs::create_dir(&path).expect("mkdir");
+        let (_, ours) = dir_fd_and_id(&path);
+        std::fs::rename(&path, fx.rootfs.join("moved")).expect("rename");
+        std::fs::create_dir(&path).expect("swap");
+        let name = CString::new("d").expect("cstring");
+        let (what, _) = remove_verified(parent.as_fd(), &name, ours, true).expect_err("mismatch");
+        assert_eq!(what, "verify");
+        assert!(path.is_dir());
+
+        let (_, id) = dir_fd_and_id(&path);
+        std::fs::write(path.join("f"), b"x").expect("content");
+        let (what, _) = remove_verified(parent.as_fd(), &name, id, true).expect_err("not empty");
+        assert_eq!(what, "rmdir");
+        assert!(path.join("f").exists(), "restored under the original name");
+    }
+
+    /// REPAIR-4: 後始末中の開き直しの失敗も `; cleanup failed: ...` として元のエラーへ併記する。
+    #[test]
+    fn repair4_cleanup_open_failure_is_reported() {
+        let fx = fx();
+        let fd = fx.rootfs_fd();
+        let unused = || SysError::Os(sys::EINVAL);
+        let deps = BindDeps {
+            is_shared: &|_| Ok(false),
+            still_at: &|_, _| true,
+            open_tree: &|_, _| Err(unused()),
+            set_attrs: &|_, _, _| Err(unused()),
+            flags_of: &|_| Err(unused()),
+            attach: &|_, _| Err(unused()),
+            observe: &|_, _, _| Err(ExecError::new(ErrorCode::Internal, STAGE, "unused")),
+            mountinfo: &|| Ok(String::new()),
+            umount: &|_| Ok(()),
+            before_attach: &|| {},
+        };
+        let ctx = Ctx {
+            root: fd.as_fd(),
+            host_root: fx.rootfs.clone(),
+            rootfs_ids: Vec::new(),
+            deps: &deps,
+        };
+        let set = one("/a/b", &fx.src("dir"), &[]);
+        let spec = &set.mounts()[0];
+        let mut state = Applied::new(spec);
+        state.created_dirs = vec![0, 1];
+        state.created_dir_ids = vec![(0, (1, 1)), (1, (1, 1))];
+        let failures = roll_back_binds(&ctx, &[state]);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].what, "open");
+        let err = with_cleanup_failures(failed(spec, "x"), &failures);
+        assert!(
+            err.message
+                .contains("; cleanup failed: open(/a/b) failed: "),
+            "{}",
+            err.message
+        );
     }
 }

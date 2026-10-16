@@ -1155,6 +1155,14 @@ unsafe extern "C" {
     fn mkdirat(dirfd: i32, path: *const core::ffi::c_char, mode: u32) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int unlinkat(int dirfd, const char *path, int flags)`。
     fn unlinkat(dirfd: i32, path: *const core::ffi::c_char, flags: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int renameat(int olddirfd, const char *oldpath, int newdirfd,
+    // const char *newpath)`。
+    fn renameat(
+        olddirfd: i32,
+        oldpath: *const core::ffi::c_char,
+        newdirfd: i32,
+        newpath: *const core::ffi::c_char,
+    ) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int fstatfs(int fd, struct statfs *buf)`。構造体は下の
     // [`StatFs`]（arch 別に個別定義）で、カーネルが書く 120 バイトを確保する。
     fn fstatfs(fd: i32, buf: *mut StatFs) -> i32;
@@ -3422,6 +3430,28 @@ pub(crate) fn remove_file_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<(), 
     // `unlinkat` は `AT_REMOVEDIR` を伴わず、ディレクトリは削除されない。副作用は `parent` 配下の非ディレクトリ
     // 1 件の削除のみで、ポインタは保持されない。
     let rc = unsafe { unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `parent` 配下の `old` を、同じ `parent` 配下の `new` へ `renameat(2)` で改名する（最終要素の symlink は辿らず、
+/// 改名先が既にあれば置き換わる）。bind mount の適用段（`crate::exec::mount_binds`）が、失敗時の後始末で
+/// 「消す対象を他者が差し替えられない名前へ移してから実体を照合して消す」ために使う（#1913・SEC-1）。
+/// `old`・`new` は呼び出し側が 1 要素に検証済みの前提。
+pub(crate) fn rename_at(parent: BorrowedFd<'_>, old: &CStr, new: &CStr) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `old`・`new` は NUL 終端の借用で呼び出しの間生存する。`parent` は生存中の `BorrowedFd` で、
+    // 旧・新の両方の dirfd に使う（同一ディレクトリ内の改名）。副作用は `parent` 配下の 1 要素の改名のみで、
+    // ポインタは保持されない。
+    let rc = unsafe {
+        renameat(
+            parent.as_raw_fd(),
+            old.as_ptr(),
+            parent.as_raw_fd(),
+            new.as_ptr(),
+        )
+    };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 

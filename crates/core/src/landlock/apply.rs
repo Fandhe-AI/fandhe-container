@@ -28,20 +28,31 @@
 //!   の独立したマウントのルート（`st_dev` が `..` と異なる）であることを確かめてから足す。パスが無ければ
 //!   `ImplicitMountMissing`、別の fs・素のディレクトリなら `ImplicitMountMismatch`（どちらも `FailedPrecondition`）で
 //!   拒否する（#1672 事後監査 P2。exec の再適用でも同じ判定を通る）
+//! - Mount 由来のルール（暗黙のマウントと bind。`RuleOrigin::Implicit` / `Mount`）は、launch 経路（[`MountCheck::Recorded`]）で
+//!   pivot 前段が載せた直後に記録したマウントの識別子（`mnt_id`・`st_dev`・`st_ino`。`mounted` 子モジュール）と、
+//!   適用時に開いた fd の識別子が一致することも要求する。記録が引けない（`MountRecordMissing`）・観測できない
+//!   （`MountIdentityUnobservable`）・`mnt_id` が違う（`MountIdentityMismatch`）・ルートでない（`MountNotRoot`）
+//!   はどれも `landlock_add_rule` の前に拒否する（#2071・CORE-5・SEC-1）。exec の再適用は launch 時の記録を持たない
+//!   ため [`MountCheck::NotRecorded`] で、この照合は行わない（REPAIR-3。後続作業）
 //! - syscall は `crate::sys` の安全なラッパーのみを使い、`unsafe` を持たない。実カーネルは
 //!   [`LandlockKernel`] の差し込み点で隔離し、単体テストは偽カーネルで呼び出し順を照合する
 //! - 分離違反の試行の監査ログ記録（SEC-4）は TASK-41 の範囲で、本モジュールは記録しない
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! ステージ列への組み込み口（`with_landlock`・#184）は実装済み。[`LandlockApplyReport`] は制限適用の証跡では
-//! なく、`require_restriction_evidence` の判定には使えない（証跡は `with_landlock` 経由の適用成功時に `run_then` が作る `LaunchReady`。#1714）。
+//! - Mount 由来のルールの識別子の照合の違反（`MountNotRoot`・`MountIdentityMismatch`）は `exec/landlock.rs` の写像で
+//!   SEC-4 の違反理由（`ViolationReason::LandlockMount*`）へ対応づけ済みだが、監査の記録先（親の `AuditSink`）へ
+//!   運ぶ経路は未実装（pivot 後の段の違反を親へ届ける経路が無い。`docs/design/audit-delivery.md`・#2023〜#2028・#2004、
+//!   #2013 と同種の欠落）
+//! - ステージ列への組み込み口（`with_landlock`・#184）は実装済み。[`LandlockApplyReport`] は制限適用の証跡では
+//!   なく、`require_restriction_evidence` の判定には使えない（証跡は `with_landlock` 経由の適用成功時に `run_then` が作る `LaunchReady`。#1714）。
 
 use std::ffi::CString;
 use std::fmt;
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::path::Path;
 
+use super::mounted::{MountCheck, MountIdentity};
 use super::rules::{AccessFs, LandlockRuleset, PathRule, RuleOrigin, RulePath};
 use crate::dev_mounts::ImplicitDevMount;
 use crate::exec::ThreadCountSource;
@@ -111,6 +122,30 @@ pub enum LandlockApplyErrorKind {
         /// 対象のマウント。
         mount: ImplicitDevMount,
     },
+    /// Mount 由来のルールに対応する pivot 前段のマウントの記録が無い（配線ミス。マウントを載せていないのに
+    /// ルールだけがある。#2071・CORE-5・SEC-1）。分離違反の試行ではない。
+    MountRecordMissing {
+        /// ルールの位置。
+        index: usize,
+    },
+    /// ルール対象の `mnt_id` は記録と一致するが、`(st_dev, st_ino)` が記録したルートと違う
+    /// （マウントのルートではなく、その配下を指している。#2071）。
+    MountNotRoot {
+        /// ルールの位置。
+        index: usize,
+    },
+    /// ルール対象の `mnt_id` が記録と違う（宛先に別のマウントが重なった・入れ替わった。#2071）。
+    MountIdentityMismatch {
+        /// ルールの位置。
+        index: usize,
+    },
+    /// ルール対象のマウントの識別子を観測できなかった（fdinfo の読み取り・`fstat` の失敗。fail-closed。#2071）。
+    MountIdentityUnobservable {
+        /// ルールの位置。
+        index: usize,
+        /// errno（errno を伴わない失敗は 0）。
+        errno: i32,
+    },
     /// 内部不整合（パスに NUL が含まれる等。型により通常は起こらない）。
     Internal,
 }
@@ -131,6 +166,10 @@ impl LandlockApplyErrorKind {
             Self::UnsupportedArchitecture => "unsupported_architecture",
             Self::ImplicitMountMissing { .. } => "landlock_implicit_mount_missing",
             Self::ImplicitMountMismatch { .. } => "landlock_implicit_mount_mismatch",
+            Self::MountRecordMissing { .. } => "landlock_mount_record_missing",
+            Self::MountNotRoot { .. } => "landlock_mount_not_root",
+            Self::MountIdentityMismatch { .. } => "landlock_mount_identity_mismatch",
+            Self::MountIdentityUnobservable { .. } => "landlock_mount_identity_unobservable",
             Self::Internal => "internal",
         }
     }
@@ -209,6 +248,8 @@ pub struct LandlockApplyReport {
     pub skipped_empty: usize,
     /// 実在（期待する fs の独立したマウントのルート）を確かめた暗黙のマウントの数（#1672 事後監査 P2）。
     pub implicit_mounts_verified: usize,
+    /// 記録したマウントの識別子と一致を確かめた Mount 由来のルールの数（`MountCheck::Recorded` のときだけ増える。#2071）。
+    pub mounts_verified: usize,
 }
 
 /// ルール対象の実体の種別。
@@ -257,6 +298,8 @@ pub(crate) trait LandlockKernel {
     fn restrict_self(&self, ruleset: &Self::Ruleset) -> Result<(), SysError>;
     /// 暗黙のマウントのルール対象（`open_rule_path` が返した fd。開き直さない）を観測する。
     fn probe_mount(&self, path: &Self::PathFd) -> Result<MountProbe, SysError>;
+    /// ルール対象（`open_rule_path` が返した fd。開き直さない）のマウントの識別子を観測する（#2071）。
+    fn mount_identity(&self, path: &Self::PathFd) -> Result<MountIdentity, SysError>;
 }
 
 /// 実カーネルへの適用（`crate::sys` の安全なラッパーを呼ぶだけ）。
@@ -290,45 +333,13 @@ impl LandlockKernel for RealKernel<'_> {
             Some(fd) => fd.try_clone_to_owned().map_err(|_| OpenError::Invalid)?,
             None => sys::open_dir_path_nofollow(None, c"/").map_err(OpenError::Sys)?,
         };
-        let comps: Vec<&str> = match path {
-            RulePath::Root => Vec::new(),
-            other => other
-                .as_str()
-                .split('/')
-                .filter(|c| !c.is_empty())
-                .collect(),
-        };
-        let mut cur = root;
-        let last_index = comps.len().checked_sub(1);
-        for (i, comp) in comps.iter().enumerate() {
-            let name = CString::new(*comp).map_err(|_| OpenError::Invalid)?;
-            if Some(i) != last_index {
-                // 中間要素は symlink・非ディレクトリを ENOTDIR で拒否する。
-                cur = sys::open_dir_path_nofollow(Some(cur.as_fd()), &name)
-                    .map_err(OpenError::Sys)?;
-                continue;
-            }
-            return match sys::open_dir_path_nofollow(Some(cur.as_fd()), &name) {
-                Ok(fd) => Ok((fd, PathKind::Dir)),
-                Err(SysError::Os(e)) if e == sys::ENOTDIR => {
-                    let fd = sys::open_path_nofollow(cur.as_fd(), &name).map_err(OpenError::Sys)?;
-                    // O_PATH fd への fstat（追従しない）で実体の種別を固定して判定する。
-                    let file = std::fs::File::from(fd);
-                    let ft = file.metadata().map_err(|_| OpenError::Invalid)?.file_type();
-                    let fd = OwnedFd::from(file);
-                    if ft.is_symlink() {
-                        Err(OpenError::Symlink)
-                    } else if ft.is_dir() {
-                        Ok((fd, PathKind::Dir))
-                    } else {
-                        Ok((fd, PathKind::File))
-                    }
-                }
-                Err(e) => Err(OpenError::Sys(e)),
-            };
-        }
-        // `/`（Root、または空要素のみ）。
-        Ok((cur, PathKind::Dir))
+        open_beneath(
+            root,
+            match path {
+                RulePath::Root => "",
+                other => other.as_str(),
+            },
+        )
     }
 
     fn add_rule(&self, ruleset: &OwnedFd, allowed: u64, path: &OwnedFd) -> Result<(), SysError> {
@@ -337,6 +348,10 @@ impl LandlockKernel for RealKernel<'_> {
 
     fn restrict_self(&self, ruleset: &OwnedFd) -> Result<(), SysError> {
         sys::landlock_restrict_self(ruleset.as_fd())
+    }
+
+    fn mount_identity(&self, path: &OwnedFd) -> Result<MountIdentity, SysError> {
+        MountIdentity::of_fd(path)
     }
 
     fn probe_mount(&self, path: &OwnedFd) -> Result<MountProbe, SysError> {
@@ -351,12 +366,124 @@ impl LandlockKernel for RealKernel<'_> {
     }
 }
 
+/// `root` の fd を起点に、`path`（`/` 区切りの正規化済み要素列。空なら `root` 自身）を 1 要素ずつ `O_NOFOLLOW` で
+/// 辿って開く（Landlock のルールの対象と、pivot 前段の Mount 由来の識別子の記録〔[`observe_mount_beneath`]〕が同じ
+/// 辿り方を共有するための関数。symlink・不在・開けないパスはスキップせずエラーにする）。
+fn open_beneath(root: OwnedFd, path: &str) -> Result<(OwnedFd, PathKind), OpenError> {
+    let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    let mut cur = root;
+    let last_index = comps.len().checked_sub(1);
+    for (i, comp) in comps.iter().enumerate() {
+        let name = CString::new(*comp).map_err(|_| OpenError::Invalid)?;
+        if Some(i) != last_index {
+            // 中間要素は symlink・非ディレクトリを ENOTDIR で拒否する。
+            cur = sys::open_dir_path_nofollow(Some(cur.as_fd()), &name).map_err(OpenError::Sys)?;
+            continue;
+        }
+        return match sys::open_dir_path_nofollow(Some(cur.as_fd()), &name) {
+            Ok(fd) => Ok((fd, PathKind::Dir)),
+            Err(SysError::Os(e)) if e == sys::ENOTDIR => {
+                let fd = sys::open_path_nofollow(cur.as_fd(), &name).map_err(OpenError::Sys)?;
+                // O_PATH fd への fstat（追従しない）で実体の種別を固定して判定する。
+                let file = std::fs::File::from(fd);
+                let ft = file.metadata().map_err(|_| OpenError::Invalid)?.file_type();
+                let fd = OwnedFd::from(file);
+                if ft.is_symlink() {
+                    Err(OpenError::Symlink)
+                } else if ft.is_dir() {
+                    Ok((fd, PathKind::Dir))
+                } else {
+                    Ok((fd, PathKind::File))
+                }
+            }
+            Err(e) => Err(OpenError::Sys(e)),
+        };
+    }
+    // `/`（Root、または空要素のみ）。
+    Ok((cur, PathKind::Dir))
+}
+
+/// pivot 前段が載せた直後のマウント先（`root` 配下の `destination`）の識別子を記録する（#2071・CORE-5・SEC-1）。
+///
+/// `exec/process.rs` の `RealPrePivotOps` が、各段の成功直後（`mount_tmpfs`・`inject_files`・`mount_binds`・
+/// `create_default_devices`）に呼ぶ。適用時の照合（[`check_mount_identity`]）と同じ辿り方・同じ観測
+/// （[`MountIdentity::of_fd`]）を使うため、値の出どころが食い違わない。
+pub(crate) fn observe_mount_beneath(
+    root: BorrowedFd<'_>,
+    destination: &str,
+) -> Result<MountIdentity, SysError> {
+    let root = root
+        .try_clone_to_owned()
+        .map_err(|e| SysError::Os(e.raw_os_error().unwrap_or(sys::EINVAL)))?;
+    match open_beneath(root, destination) {
+        Ok((fd, _)) => MountIdentity::of_fd(&fd),
+        Err(OpenError::Sys(e)) => Err(e),
+        Err(OpenError::Symlink | OpenError::Invalid) => Err(SysError::Os(sys::EINVAL)),
+    }
+}
+
 /// fd の `st_dev`（`O_PATH` fd への `fstat`。fd は消費しない）。
 fn st_dev(fd: &OwnedFd) -> Result<u64, SysError> {
     use std::os::unix::fs::MetadataExt as _;
     let io = |e: std::io::Error| SysError::Os(e.raw_os_error().unwrap_or(sys::EINVAL));
     let dup = fd.try_clone().map_err(io)?;
     Ok(std::fs::File::from(dup).metadata().map_err(io)?.dev())
+}
+
+impl MountIdentity {
+    /// `fd`（`O_PATH` のディレクトリ・ファイル）の識別子を観測する。`mnt_id` は `/proc/thread-self/fdinfo/N`、
+    /// `(st_dev, st_ino)` は `fstat`。pivot 前段の記録と適用時の照合が同じ関数を使い、出どころを揃える
+    /// （#2071）。fdinfo は上限つきで読む。
+    pub(crate) fn of_fd(fd: &OwnedFd) -> Result<Self, SysError> {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let io = |e: std::io::Error| SysError::Os(e.raw_os_error().unwrap_or(sys::EINVAL));
+        let mut text = String::new();
+        std::fs::File::open(format!("/proc/thread-self/fdinfo/{}", fd.as_raw_fd()))
+            .map_err(io)?
+            .take(FDINFO_MAX_BYTES)
+            .read_to_string(&mut text)
+            .map_err(io)?;
+        let mnt_id = crate::exec::parse_fdinfo_mnt_id(&text).ok_or(SysError::Os(sys::EINVAL))?;
+        let meta = std::fs::File::from(fd.try_clone().map_err(io)?)
+            .metadata()
+            .map_err(io)?;
+        Ok(Self {
+            mnt_id,
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+}
+
+/// fdinfo を読む上限（バイト。実際は数行）。
+const FDINFO_MAX_BYTES: u64 = 4096;
+
+/// Mount 由来のルール対象が、pivot 前段が載せたマウントのルートであることの判定（純粋関数。#2071・CORE-5・SEC-1）。
+///
+/// `mnt_id` が違えば別のマウント（重ねられた・入れ替わった）、`mnt_id` が同じで `(st_dev, st_ino)` が違えば
+/// マウントのルートではなくその配下。どちらも拒否する。
+fn check_mount_identity(
+    index: usize,
+    expected: &MountIdentity,
+    observed: &MountIdentity,
+) -> Result<(), LandlockApplyError> {
+    if observed.mnt_id != expected.mnt_id {
+        return Err(LandlockApplyError::new(
+            ErrorCode::FailedPrecondition,
+            LandlockApplyErrorKind::MountIdentityMismatch { index },
+            "rule target is not the mount that the runtime mounted (another mount is stacked there)",
+        ));
+    }
+    if observed.dev != expected.dev || observed.ino != expected.ino {
+        return Err(LandlockApplyError::new(
+            ErrorCode::FailedPrecondition,
+            LandlockApplyErrorKind::MountNotRoot { index },
+            "rule target is not the root of the mount that the runtime mounted",
+        ));
+    }
+    Ok(())
 }
 
 /// 暗黙のマウントの実在の判定（純粋関数。#1672 事後監査 P2・CORE-5・SEC-1）。
@@ -398,8 +525,9 @@ fn check_implicit_mount(
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn apply_landlock_ruleset(
     ruleset: &LandlockRuleset,
+    check: MountCheck<'_>,
 ) -> Result<LandlockApplyReport, LandlockApplyError> {
-    apply_landlock_ruleset_with(ruleset, &mut ThreadCountSource::ProcSelf, None)
+    apply_landlock_ruleset_with(ruleset, &mut ThreadCountSource::ProcSelf, None, check)
 }
 
 /// [`apply_landlock_ruleset`] のスレッド数取得元とルールパスの起点を差し替える版（SUP-6・TASK-163.3・#502）。
@@ -413,17 +541,19 @@ pub(crate) fn apply_landlock_ruleset_with(
     ruleset: &LandlockRuleset,
     threads: &mut ThreadCountSource,
     root: Option<BorrowedFd<'_>>,
+    check: MountCheck<'_>,
 ) -> Result<LandlockApplyReport, LandlockApplyError> {
     let kernel = RealKernel {
         threads: std::cell::RefCell::new(threads),
         root,
     };
-    apply_with(&kernel, ruleset)
+    apply_with(&kernel, ruleset, check)
 }
 
 fn apply_with<K: LandlockKernel>(
     kernel: &K,
     ruleset: &LandlockRuleset,
+    check: MountCheck<'_>,
 ) -> Result<LandlockApplyReport, LandlockApplyError> {
     use LandlockApplyErrorKind as Kind;
 
@@ -467,6 +597,7 @@ fn apply_with<K: LandlockKernel>(
         file_rules: 0,
         skipped_empty: 0,
         implicit_mounts_verified: 0,
+        mounts_verified: 0,
     };
     for (index, rule) in ruleset.rules().iter().enumerate() {
         let implicit = match rule.origin {
@@ -521,6 +652,31 @@ fn apply_with<K: LandlockKernel>(
             })?;
             check_implicit_mount(index, mount, probe)?;
             report.implicit_mounts_verified += 1;
+        }
+        // Mount 由来のルール（暗黙の `/dev` 系と bind）は、pivot 前段が載せた直後に記録した識別子と、いま開いた fd
+        // の識別子が一致することを要求する。`add_rule` の前に拒否するため、誤った木には権利が付かない（#2071）。
+        if let MountCheck::Recorded(recorded) = check
+            && matches!(
+                rule.origin,
+                RuleOrigin::Implicit { .. } | RuleOrigin::Mount { .. }
+            )
+        {
+            let Some(expected) = recorded.expected_for(&rule.origin) else {
+                return Err(LandlockApplyError::new(
+                    ErrorCode::FailedPrecondition,
+                    Kind::MountRecordMissing { index },
+                    "no record of the runtime's mount for this rule; refusing to apply Landlock",
+                ));
+            };
+            let observed = kernel.mount_identity(&fd).map_err(|e| {
+                LandlockApplyError::from_sys(
+                    e,
+                    |errno| Kind::MountIdentityUnobservable { index, errno },
+                    "failed to observe the mount identity of a rule target",
+                )
+            })?;
+            check_mount_identity(index, expected, &observed)?;
+            report.mounts_verified += 1;
         }
         let allowed = effective_allowed(rule, kind);
         if kind == PathKind::File {
@@ -636,7 +792,8 @@ pub fn observe_landlock_enforcement(
             origin: RuleOrigin::Root,
         }],
     );
-    let result = apply_landlock_ruleset(&ruleset);
+    // Root のルールだけで実マウントを伴わないため、照合する記録は無い（`NotRecorded`）。
+    let result = apply_landlock_ruleset(&ruleset, MountCheck::NotRecorded);
     let applied = result.is_ok();
     let apply_error = result.err();
     let create_after = match std::fs::File::create(probe_dir.join("after")) {
@@ -657,6 +814,7 @@ pub fn observe_landlock_enforcement(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::landlock::mounted::{MountedBy, MountedTarget, MountedTargets};
     use crate::landlock::rules::LandlockRuleset;
     use std::cell::RefCell;
 
@@ -672,6 +830,23 @@ mod tests {
         restrict: Result<(), SysError>,
         /// `probe_mount` の応答を呼び出し順に返す（尽きたら tmpfs の独立したマウントのルート）。
         probes: RefCell<Vec<Result<MountProbe, SysError>>>,
+        /// `mount_identity` の応答を呼び出し順に返す（尽きたら `ID_A`）。
+        identities: RefCell<Vec<Result<MountIdentity, SysError>>>,
+    }
+
+    /// 偽カーネルが既定で返す識別子。
+    const ID_A: MountIdentity = MountIdentity {
+        mnt_id: 52,
+        dev: 10,
+        ino: 2,
+    };
+
+    /// 既存の試験用: 照合しない（`NotRecorded`）で適用する。
+    fn apply_with<K: LandlockKernel>(
+        k: &K,
+        rs: &LandlockRuleset,
+    ) -> Result<LandlockApplyReport, LandlockApplyError> {
+        super::apply_with(k, rs, MountCheck::NotRecorded)
     }
 
     /// 期待どおりの tmpfs の独立したマウントのルート。
@@ -699,6 +874,7 @@ mod tests {
                 add: Ok(()),
                 restrict: Ok(()),
                 probes: RefCell::new(Vec::new()),
+                identities: RefCell::new(Vec::new()),
             }
         }
         fn log(&self, s: impl Into<String>) {
@@ -742,6 +918,11 @@ mod tests {
         fn restrict_self(&self, _: &()) -> Result<(), SysError> {
             self.log("restrict");
             self.restrict
+        }
+        fn mount_identity(&self, path: &usize) -> Result<MountIdentity, SysError> {
+            self.log(format!("identity:{path}"));
+            let mut p = self.identities.borrow_mut();
+            if p.is_empty() { Ok(ID_A) } else { p.remove(0) }
         }
         fn probe_mount(&self, path: &usize) -> Result<MountProbe, SysError> {
             self.log(format!("probe:{path}"));
@@ -1256,6 +1437,286 @@ mod tests {
         assert_eq!(
             LandlockApplyErrorKind::RestrictSelfFailed { errno: 1 }.as_str(),
             "landlock_restrict_self_failed"
+        );
+    }
+
+    /// 記録の組み立て（試験用）。
+    fn recorded(entries: &[(MountedBy, &str, MountIdentity)]) -> MountedTargets {
+        let mut m = MountedTargets::new();
+        for (by, dest, identity) in entries {
+            m.push(MountedTarget {
+                by: *by,
+                destination: (*dest).to_string(),
+                identity: *identity,
+            })
+            .expect("capacity");
+        }
+        m
+    }
+
+    fn apply_recorded(
+        k: &Fake,
+        rs: &LandlockRuleset,
+        m: &MountedTargets,
+    ) -> Result<LandlockApplyReport, LandlockApplyError> {
+        super::apply_with(k, rs, MountCheck::Recorded(m))
+    }
+
+    /// CORE-5・SEC-1・#2071: 識別子の判定。`mnt_id` 違いは別マウント、`mnt_id` 同一で `(dev, ino)` 違いは
+    /// マウントのルートではない。
+    #[test]
+    fn core5_2071_identity_match_mismatch_not_root() {
+        let want = MountIdentity {
+            mnt_id: 52,
+            dev: 10,
+            ino: 2,
+        };
+        assert!(check_mount_identity(3, &want, &want).is_ok());
+        let other_mount = MountIdentity { mnt_id: 53, ..want };
+        let e = check_mount_identity(3, &want, &other_mount).expect_err("other mount");
+        assert_eq!(
+            e.kind,
+            LandlockApplyErrorKind::MountIdentityMismatch { index: 3 }
+        );
+        assert_eq!(e.kind.as_str(), "landlock_mount_identity_mismatch");
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        let inner = MountIdentity { ino: 7, ..want };
+        let e = check_mount_identity(3, &want, &inner).expect_err("not root");
+        assert_eq!(e.kind, LandlockApplyErrorKind::MountNotRoot { index: 3 });
+        assert_eq!(e.kind.as_str(), "landlock_mount_not_root");
+        // mnt_id が再利用されても、`st_dev` が違えば取り違えない。
+        let reused = MountIdentity { dev: 11, ..want };
+        assert_eq!(
+            check_mount_identity(0, &want, &reused)
+                .expect_err("reused")
+                .kind,
+            LandlockApplyErrorKind::MountNotRoot { index: 0 }
+        );
+    }
+
+    /// CORE-5・#2071: 記録と一致する bind は通り、`mounts_verified` が増え、`add_rule` が呼ばれる。
+    #[test]
+    fn core5_2071_recorded_bind_rule_matches() {
+        let k = Fake::ok(2);
+        let set = rs(&[AccessFs::READ, AccessFs::ALL]);
+        let m = recorded(&[(MountedBy::Bind { index: 0 }, "/data", ID_A)]);
+        let r = apply_recorded(&k, &set, &m).expect("applied");
+        assert_eq!((r.rules_added, r.mounts_verified), (2, 1));
+        assert!(k.calls().contains(&"identity:1".to_string()));
+        assert!(k.calls().contains(&"add:1:0xffff".to_string()));
+    }
+
+    /// CORE-5・SEC-1・#2071: 識別子が違えば `restrict_self` の前に拒否する（権利は `add_rule` されない）。
+    #[test]
+    fn core5_2071_recorded_bind_rule_mismatch_refuses_before_restrict() {
+        let k = Fake::ok(2);
+        *k.identities.borrow_mut() = vec![Ok(MountIdentity { mnt_id: 99, ..ID_A })];
+        let set = rs(&[AccessFs::READ, AccessFs::ALL]);
+        let m = recorded(&[(MountedBy::Bind { index: 0 }, "/data", ID_A)]);
+        let e = apply_recorded(&k, &set, &m).expect_err("mismatch");
+        assert_eq!(
+            e.kind,
+            LandlockApplyErrorKind::MountIdentityMismatch { index: 1 }
+        );
+        let calls = k.calls();
+        assert!(!calls.contains(&"restrict".to_string()), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.starts_with("add:1")), "{calls:?}");
+    }
+
+    /// CORE-5・SEC-1・#2071: 観測に失敗したら拒否する（fail-closed）。
+    #[test]
+    fn core5_2071_observation_failure_refuses() {
+        let k = Fake::ok(2);
+        *k.identities.borrow_mut() = vec![Err(SysError::Os(sys::EACCES))];
+        let set = rs(&[AccessFs::READ, AccessFs::ALL]);
+        let m = recorded(&[(MountedBy::Bind { index: 0 }, "/data", ID_A)]);
+        let e = apply_recorded(&k, &set, &m).expect_err("unobservable");
+        assert_eq!(
+            e.kind,
+            LandlockApplyErrorKind::MountIdentityUnobservable {
+                index: 1,
+                errno: sys::EACCES
+            }
+        );
+        assert_eq!(e.code, ErrorCode::PermissionDenied);
+        assert!(!k.calls().contains(&"restrict".to_string()));
+    }
+
+    /// CORE-5・SEC-1・#2071: 記録が無い（マウントを載せていないのにルールだけがある）なら拒否する。
+    #[test]
+    fn core5_2071_missing_record_refuses() {
+        let k = Fake::ok(2);
+        let set = rs(&[AccessFs::READ, AccessFs::ALL]);
+        // 別の index の bind の記録では、`Mount{index:0}` に一致しない。
+        let m = recorded(&[(MountedBy::Bind { index: 5 }, "/other", ID_A)]);
+        let e = apply_recorded(&k, &set, &m).expect_err("no record");
+        assert_eq!(
+            e.kind,
+            LandlockApplyErrorKind::MountRecordMissing { index: 1 }
+        );
+        assert_eq!(e.kind.as_str(), "landlock_mount_record_missing");
+        let e = apply_recorded(&Fake::ok(2), &set, &MountedTargets::new()).expect_err("empty");
+        assert_eq!(
+            e.kind,
+            LandlockApplyErrorKind::MountRecordMissing { index: 1 }
+        );
+    }
+
+    /// CORE-5・#2071: 暗黙のマウントは fs 種別・独立性の確認（従来）に加えて識別子も照合する。
+    /// `/dev/shm` は tmpfs の段で宛先が `/dev/shm` の記録に対応し、`/dev` と `/dev/pts` は専用 `/dev` の段に対応する。
+    #[test]
+    fn core5_2071_implicit_rules_check_both_fs_and_identity() {
+        let all = [
+            (
+                MountedBy::DefaultDevices(ImplicitDevMount::Dev),
+                "/dev",
+                ID_A,
+            ),
+            (
+                MountedBy::DefaultDevices(ImplicitDevMount::DevPts),
+                "/dev/pts",
+                ID_A,
+            ),
+            (MountedBy::Tmpfs, "/dev/shm", ID_A),
+        ];
+        let set = implicit_rs(&ImplicitDevMount::ALL);
+        let k = Fake::ok(4);
+        *k.probes.borrow_mut() = vec![Ok(TMPFS_ROOT), Ok(DEVPTS_ROOT), Ok(TMPFS_ROOT)];
+        let r = apply_recorded(&k, &set, &recorded(&all)).expect("applied");
+        assert_eq!((r.implicit_mounts_verified, r.mounts_verified), (3, 3));
+
+        // 識別子が違えば、fs 種別が合っていても拒否する（同じ種類の fs を重ねた場合）。
+        let k = Fake::ok(4);
+        *k.identities.borrow_mut() =
+            vec![Ok(ID_A), Ok(ID_A), Ok(MountIdentity { mnt_id: 77, ..ID_A })];
+        *k.probes.borrow_mut() = vec![Ok(TMPFS_ROOT), Ok(DEVPTS_ROOT), Ok(TMPFS_ROOT)];
+        let e = apply_recorded(&k, &set, &recorded(&all)).expect_err("stacked tmpfs");
+        assert_eq!(
+            e.kind,
+            LandlockApplyErrorKind::MountIdentityMismatch { index: 3 }
+        );
+
+        // 識別子が合っていても fs 種別が違えば従来どおり拒否する。
+        let k = Fake::ok(4);
+        *k.probes.borrow_mut() = vec![Ok(TMPFS_ROOT), Ok(TMPFS_ROOT)];
+        let e = apply_recorded(&k, &set, &recorded(&all)).expect_err("wrong fs");
+        assert!(matches!(
+            e.kind,
+            LandlockApplyErrorKind::ImplicitMountMismatch { index: 2, .. }
+        ));
+    }
+
+    /// CORE-5・#2071: 単一ファイルの bind はマウントのルートそのもの。一致すれば通る。
+    #[test]
+    fn core5_2071_file_bind_is_accepted_as_mount_root() {
+        let mut k = Fake::ok(2);
+        k.open = vec![Ok(PathKind::Dir), Ok(PathKind::File)];
+        let set = rs(&[AccessFs::READ, AccessFs::ALL]);
+        let m = recorded(&[(MountedBy::Bind { index: 0 }, "/etc/f", ID_A)]);
+        let r = apply_recorded(&k, &set, &m).expect("applied");
+        assert_eq!((r.file_rules, r.mounts_verified), (1, 1));
+    }
+
+    /// CORE-5・#2071: `NotRecorded`（exec の再適用等）は識別子を観測せず、従来どおりに動く。
+    #[test]
+    fn core5_2071_not_recorded_mode_keeps_current_behavior() {
+        let k = Fake::ok(2);
+        let set = rs(&[AccessFs::READ, AccessFs::ALL]);
+        let r = apply_with(&k, &set).expect("applied");
+        assert_eq!(r.mounts_verified, 0);
+        assert!(!k.calls().iter().any(|c| c.starts_with("identity")));
+    }
+
+    /// 実 fd・実マウントの識別子を使い、制限の適用（`add_rule`・`restrict_self`）だけを行わない差し込み
+    /// （試験用）。テストプロセスを制限しないため root も実機も要らない。
+    struct RealIdentityKernel;
+
+    impl LandlockKernel for RealIdentityKernel {
+        type Ruleset = ();
+        type PathFd = OwnedFd;
+        fn thread_count(&self) -> Option<u64> {
+            Some(1)
+        }
+        fn no_new_privs_enabled(&self) -> Result<bool, SysError> {
+            Ok(true)
+        }
+        fn create_ruleset(&self, _: u64) -> Result<(), SysError> {
+            Ok(())
+        }
+        fn open_rule_path(&self, path: &RulePath) -> Result<(OwnedFd, PathKind), OpenError> {
+            let root = sys::open_dir_path_nofollow(None, c"/").map_err(OpenError::Sys)?;
+            open_beneath(
+                root,
+                match path {
+                    RulePath::Root => "",
+                    other => other.as_str(),
+                },
+            )
+        }
+        fn add_rule(&self, _: &(), _: u64, _: &OwnedFd) -> Result<(), SysError> {
+            Ok(())
+        }
+        fn restrict_self(&self, _: &()) -> Result<(), SysError> {
+            Ok(())
+        }
+        fn probe_mount(&self, _: &OwnedFd) -> Result<MountProbe, SysError> {
+            // Mount 由来（bind）のルールだけを使うため呼ばれない。
+            Err(SysError::Os(sys::EINVAL))
+        }
+        fn mount_identity(&self, path: &OwnedFd) -> Result<MountIdentity, SysError> {
+            MountIdentity::of_fd(path)
+        }
+    }
+
+    /// CORE-5・SEC-1・SEC-4・REPAIR-10・REPAIR-12・#2071: 実マウント（ホストの `/proc`・`/dev/shm`）の識別子を
+    /// pivot 前段と同じ `observe_mount_beneath` で記録し、適用時に実 fd（`O_PATH`・fdinfo の `mnt_id`・`fstat`）で
+    /// 照合する経路を、偽の識別子を使わずに通す。一致は通り、記録後に別のマウントが重なった状態
+    /// （`/dev/shm` の識別子を記録として渡す）と、同じマウントの別 inode（ルートでない）は拒否される。
+    /// root・実機を要さない（制限の適用だけを行わない）。pivot を経る実機の経路では `exec/process.rs` の
+    /// `RealPrePivotOps` の記録がこの関数を呼ぶ（pivot を含む実機の結合試験は後続作業）。
+    #[test]
+    fn core5_2071_real_mount_identity_match_swap_and_not_root() {
+        let root = sys::open_dir_path_nofollow(None, c"/").expect("open /");
+        let observe = |dest: &str| observe_mount_beneath(root.as_fd(), dest).expect("observe");
+        let proc_id = observe("/proc");
+        let shm = observe("/dev/shm");
+        let ruleset = LandlockRuleset::for_observation(
+            6,
+            vec![
+                PathRule {
+                    path: RulePath::Root,
+                    allowed: AccessFs::READ,
+                    origin: RuleOrigin::Root,
+                },
+                PathRule {
+                    path: rule_path("/proc"),
+                    allowed: AccessFs::READ,
+                    origin: RuleOrigin::Mount { index: 0 },
+                },
+            ],
+        );
+        let run = |expected: MountIdentity| {
+            let m = recorded(&[(MountedBy::Bind { index: 0 }, "/proc", expected)]);
+            super::apply_with(&RealIdentityKernel, &ruleset, MountCheck::Recorded(&m))
+        };
+
+        let ok = run(proc_id).expect("matching real identity");
+        assert_eq!(ok.mounts_verified, 1);
+
+        let swapped = run(shm).expect_err("another mount recorded");
+        assert_eq!(
+            swapped.kind,
+            LandlockApplyErrorKind::MountIdentityMismatch { index: 1 }
+        );
+
+        let inner = run(MountIdentity {
+            ino: proc_id.ino.wrapping_add(1),
+            ..proc_id
+        })
+        .expect_err("same mount, different inode");
+        assert_eq!(
+            inner.kind,
+            LandlockApplyErrorKind::MountNotRoot { index: 1 }
         );
     }
 }

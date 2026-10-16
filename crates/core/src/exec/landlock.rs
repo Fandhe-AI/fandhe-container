@@ -32,11 +32,11 @@ use std::path::PathBuf;
 
 use super::{ExecError, IsolationStage, ThreadCountSource};
 use crate::audit_log::{AuditRecord, AuditRecordError, landlock_denial_record_now};
-use crate::landlock::handled_for_abi;
 use crate::landlock::{
     LandlockApplyError, LandlockApplyReport, LandlockError, LandlockRuleError, LandlockRuleset,
     LandlockSupport, detect_landlock_abi, path_rules_from_config,
 };
+use crate::landlock::{MountCheck, handled_for_abi};
 use crate::launch_isolation::{LaunchIsolationRecord, RootIdentity};
 use crate::oci_runtime::{OciConfig, RootfsDir};
 use crate::sys;
@@ -49,8 +49,9 @@ use crate::traits::types::ErrorCode;
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn apply_landlock_stage(
     ruleset: &LandlockRuleset,
+    check: MountCheck<'_>,
 ) -> Result<LandlockApplyReport, ExecError> {
-    crate::landlock::apply_landlock_ruleset(ruleset).map_err(from_landlock_apply)
+    crate::landlock::apply_landlock_ruleset(ruleset, check).map_err(from_landlock_apply)
 }
 
 /// [`apply_landlock_stage`] のスレッド数取得元とルールパスの起点を差し替える版（SUP-6・TASK-163.3・#502）。
@@ -63,8 +64,15 @@ pub(super) fn apply_landlock_stage_with(
     threads: &mut ThreadCountSource,
     root: std::os::fd::BorrowedFd<'_>,
 ) -> Result<LandlockApplyReport, ExecError> {
-    crate::landlock::apply_landlock_ruleset_with(ruleset, threads, Some(root))
-        .map_err(from_landlock_apply)
+    // launch 時のマウントの識別子の記録は `state.json` に無い（未実装範囲）ため `NotRecorded`。暗黙のマウントの
+    // fs 種別・独立性の確認は従来どおり行い、弱めない（#2071。後続: 記録の永続化と照合）。
+    crate::landlock::apply_landlock_ruleset_with(
+        ruleset,
+        threads,
+        Some(root),
+        MountCheck::NotRecorded,
+    )
+    .map_err(from_landlock_apply)
 }
 
 /// `OciConfig` から Landlock ruleset を作る（ABI 検出 → ルール生成。CORE-5・TASK-39.4）。
@@ -279,7 +287,8 @@ pub fn observe_landlock_path_access(
             return Ok(obs);
         }
     };
-    if let Err(e) = apply_landlock_stage(&ruleset) {
+    // 実マウントを伴わない結合試験の観測のため、launch 時の記録は無い（`NotRecorded`。launch 経路では使わない）。
+    if let Err(e) = apply_landlock_stage(&ruleset, MountCheck::NotRecorded) {
         obs.apply_error = Some(e);
         return Ok(obs);
     }
@@ -350,7 +359,22 @@ fn make_char_device_probe(path: &std::path::Path) -> Option<i32> {
     super::device_probe::make_char_device_errno(path, 1, 3)
 }
 
+/// Landlock 適用の失敗を [`ExecError`] へ写す。Mount 由来のルールの識別子の照合の違反（`MountIdentityMismatch`・
+/// `MountNotRoot`）は分離違反の試行なので、SEC-4 の構造化された違反理由（`ViolationReason::LandlockMount*`）を
+/// `violation` に載せる（段は `Landlock`）。
+///
+/// 未実装（REPAIR-3）: この違反を親の `AuditSink` へ届ける配送経路。適用は pivot 後の子で行われ、子から親へ
+/// 違反を運ぶ経路が無い（`docs/design/audit-delivery.md` 8 章の配線状況。実装は #2023〜#2028・#2004、同種の欠落は
+/// #2013）。配送が入るまで、`violation` は呼び出し側が取り出せるが本番の sink には記録されない。
 fn from_landlock_apply(e: LandlockApplyError) -> ExecError {
+    let reason = super::violation::landlock_apply_violation(&e.kind);
+    if let Some(reason) = reason {
+        let mut err = ExecError::from_violation_at(reason, None, IsolationStage::Landlock);
+        // 詳細（ルールの位置）は message に保つ。違反理由は reason から決まる静的トークン。
+        err.code = e.code;
+        err.message = format!("{}: {}", e.kind.as_str(), e.message);
+        return err;
+    }
     ExecError::new(
         e.code,
         IsolationStage::Landlock,
@@ -379,10 +403,18 @@ fn from_landlock_rule(e: LandlockRuleError) -> ExecError {
 pub(super) mod testing {
     use std::cell::Cell;
 
-    use super::{ExecError, LandlockApplyReport, LandlockRuleset, ThreadCountSource};
+    use super::{ExecError, LandlockApplyReport, LandlockRuleset, MountCheck, ThreadCountSource};
 
     thread_local! {
         static LANDLOCK_ERR: Cell<Option<ExecError>> = const { Cell::new(None) };
+        /// 直近の呼び出しが受け取った照合モードの記録件数（`Recorded` なら `Some(件数)`、`NotRecorded` なら `None`）。
+        static LAST_CHECK: Cell<Option<Option<usize>>> = const { Cell::new(None) };
+    }
+
+    /// 直近の `apply_landlock_stage` の偽物が受け取った照合モード（`Some(Some(n))` は記録 n 件の `Recorded`、
+    /// `Some(None)` は `NotRecorded`、`None` は未呼び出し。取り出すと消える）。
+    pub(in crate::exec) fn take_last_check() -> Option<Option<usize>> {
+        LAST_CHECK.with(Cell::take)
     }
 
     /// 次の 1 回だけ、`apply_landlock_stage` の偽物を失敗させる（使うと既定へ戻る）。
@@ -393,8 +425,15 @@ pub(super) mod testing {
     /// `stages.rs` の `with_landlock` が `cfg(test)` で呼ぶ偽物。
     pub(in crate::exec) fn apply_landlock_stage(
         ruleset: &LandlockRuleset,
+        check: MountCheck<'_>,
     ) -> Result<LandlockApplyReport, ExecError> {
         crate::exec::no_new_privs::testing::rec("landlock");
+        LAST_CHECK.with(|c| {
+            c.set(Some(match check {
+                MountCheck::Recorded(m) => Some(m.len()),
+                MountCheck::NotRecorded => None,
+            }));
+        });
         match LANDLOCK_ERR.with(Cell::take) {
             Some(e) => Err(e),
             None => Ok(LandlockApplyReport {
@@ -402,6 +441,7 @@ pub(super) mod testing {
                 file_rules: 0,
                 skipped_empty: 0,
                 implicit_mounts_verified: 0,
+                mounts_verified: 0,
             }),
         }
     }
@@ -412,13 +452,14 @@ pub(super) mod testing {
         _threads: &mut ThreadCountSource,
         _root: std::os::fd::BorrowedFd<'_>,
     ) -> Result<LandlockApplyReport, ExecError> {
-        apply_landlock_stage(ruleset)
+        apply_landlock_stage(ruleset, MountCheck::NotRecorded)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec::ViolationReason;
     use crate::landlock::{LandlockApplyErrorKind, LandlockRuleErrorKind, LandlockUnavailable};
     use crate::traits::types::ErrorCode;
 
@@ -617,6 +658,43 @@ mod tests {
         assert_eq!(e.stage, IsolationStage::Landlock);
         assert!(e.violation.is_none());
         assert!(e.message.contains("no_new_privs_not_set"), "{}", e.message);
+    }
+
+    /// SEC-4・CORE-5・#2071: マウント識別子の不一致・ルートでない拒否は構造化された違反理由を載せる。
+    #[test]
+    fn sec4_mount_identity_errors_carry_violation_reason() {
+        for (kind, reason, token) in [
+            (
+                LandlockApplyErrorKind::MountIdentityMismatch { index: 2 },
+                ViolationReason::LandlockMountIdentityMismatch,
+                "landlock_mount_identity_mismatch",
+            ),
+            (
+                LandlockApplyErrorKind::MountNotRoot { index: 2 },
+                ViolationReason::LandlockMountNotRoot,
+                "landlock_mount_not_root",
+            ),
+        ] {
+            let e = from_landlock_apply(LandlockApplyError {
+                code: ErrorCode::FailedPrecondition,
+                kind,
+                message: "m".to_string(),
+            });
+            assert_eq!(e.code, ErrorCode::FailedPrecondition);
+            assert_eq!(e.stage, IsolationStage::Landlock);
+            let v = e.violation.expect("violation");
+            assert_eq!(v.reason, reason);
+            assert_eq!(v.reason.as_str(), token);
+            assert_eq!(v.behavior_id, "CORE-5");
+            assert!(
+                matches!(
+                    v.mount_audit_event(),
+                    Some(crate::audit_log::AuditEvent::Mount { .. })
+                ),
+                "{:?}",
+                v.mount_audit_event()
+            );
+        }
     }
 
     /// CORE-5・TASK-39.4: ABI 不足は FailedPrecondition・理由コード付き。

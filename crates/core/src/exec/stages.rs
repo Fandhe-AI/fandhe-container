@@ -68,7 +68,7 @@ use super::capabilities::testing::apply_default_capabilities;
 use super::landlock::testing::apply_landlock_stage;
 #[cfg(test)]
 use super::seccomp::testing::apply_default_seccomp;
-use crate::landlock::LandlockRuleset;
+use crate::landlock::{LandlockRuleset, MountCheck, MountedTargets};
 use crate::rlimits::Rlimits;
 use crate::traits::types::ErrorCode;
 
@@ -337,6 +337,9 @@ pub struct StagePipeline {
     rlimits: Option<Rlimits>,
     /// core の Landlock 適用（`with_landlock`）。これだけが `LandlockApplied` 証跡を作れる。
     landlock: Option<LandlockRuleset>,
+    /// pivot 前段が載せたマウントの識別子の記録（Landlock の Mount 由来のルールの照合に使う。#2071）。
+    /// 既定は空で、空のまま Mount 由来のルールがあれば Landlock 段は拒否する（fail-closed）。
+    mounts: MountedTargets,
 }
 
 impl Default for StagePipeline {
@@ -378,7 +381,18 @@ impl StagePipeline {
             hooks: [None, None, None, None, None, None],
             rlimits: None,
             landlock: None,
+            mounts: MountedTargets::new(),
         }
+    }
+
+    /// pivot 前段が載せたマウントの識別子の記録を Landlock 段へ渡す（#2071・CORE-5・SEC-1）。
+    ///
+    /// `process.rs::run_child_then` が `run_pre_pivot` の直後・`run_then` の直前にだけ呼ぶ。Landlock 段は
+    /// これを [`MountCheck::Recorded`] として Mount 由来のルールの照合に使う。launch の入口は
+    /// [`MountCheck::NotRecorded`] を構築しない。
+    pub(crate) fn with_mounted_targets(mut self, mounts: MountedTargets) -> Self {
+        self.mounts = mounts;
+        self
     }
 
     /// core の Landlock 適用処理（TASK-39.4・#184・CORE-5）を Landlock 段へ登録する。
@@ -570,7 +584,7 @@ impl StagePipeline {
                 }
                 StageKind::Landlock => {
                     if let Some(ruleset) = self.landlock.as_ref() {
-                        apply_landlock_stage(ruleset)
+                        apply_landlock_stage(ruleset, MountCheck::Recorded(&self.mounts))
                             .map_err(|e| e.at_stage(kind.isolation_stage()))?;
                         landlock_ev = Some(LandlockApplied { _private: () });
                     } else if let Some(Some(hook)) = self.hooks.get_mut(idx) {
@@ -1098,6 +1112,50 @@ mod tests {
                 "seccomp",
                 "exec"
             ]
+        );
+    }
+
+    /// CORE-5・SEC-1・#2071: launch 経路の Landlock 段は必ず `Recorded`（照合あり）で呼ばれ、渡した記録が
+    /// そのまま届く。記録を渡さなければ空の記録で呼ばれる（`NotRecorded` にはならず、Mount 由来のルールは拒否される）。
+    #[test]
+    fn core5_2071_launch_pipeline_uses_recorded_check() {
+        use crate::landlock::{MountedBy, MountedTarget, MountedTargets};
+        let id = crate::landlock::MountIdentity {
+            mnt_id: 1,
+            dev: 2,
+            ino: 3,
+        };
+        let mut m = MountedTargets::new();
+        for index in 0..2 {
+            m.push(MountedTarget {
+                by: MountedBy::Bind { index },
+                destination: format!("/d{index}"),
+                identity: id,
+            })
+            .unwrap();
+        }
+        take();
+        super::super::landlock::testing::take_last_check();
+        StagePipeline::new()
+            .with_landlock(landlock_fixture())
+            .unwrap()
+            .with_mounted_targets(m)
+            .run_then(exec_ok)
+            .unwrap();
+        assert_eq!(
+            super::super::landlock::testing::take_last_check(),
+            Some(Some(2))
+        );
+
+        take();
+        StagePipeline::new()
+            .with_landlock(landlock_fixture())
+            .unwrap()
+            .run_then(exec_ok)
+            .unwrap();
+        assert_eq!(
+            super::super::landlock::testing::take_last_check(),
+            Some(Some(0))
         );
     }
 

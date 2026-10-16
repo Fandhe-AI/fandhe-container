@@ -1911,7 +1911,7 @@ fn fd_still_at(dir: &OwnedFd, expected: &Path) -> bool {
 }
 
 /// `/proc/thread-self/fdinfo/<fd>` の `mnt_id:` 行（fd が属するマウントの ID）を取り出す。
-fn parse_fdinfo_mnt_id(fdinfo: &str) -> Option<u64> {
+pub(crate) fn parse_fdinfo_mnt_id(fdinfo: &str) -> Option<u64> {
     fdinfo
         .lines()
         .find_map(|l| l.strip_prefix("mnt_id:"))

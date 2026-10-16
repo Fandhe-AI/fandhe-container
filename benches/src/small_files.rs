@@ -637,6 +637,8 @@ pub fn run_with_deadline(
             .ok_or_else(|| SmallFilesError::args("trial timeout is out of range"))?;
         let elapsed = run_trial(&trial_root, plan, trial_deadline, overall_deadline)?;
         let _ = std::fs::remove_dir_all(&trial_root);
+        // 後始末（最大 5 万ファイルの削除）で全体期限を超えうるため、値を採用する前に再確認する（REPAIR-5）。
+        ensure_before(overall_deadline)?;
         trials.push(TrialResult {
             elapsed_ns: u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
             files_per_sec: files_per_sec(plan.count, elapsed)?,
@@ -645,10 +647,20 @@ pub fn run_with_deadline(
     let values: Vec<f64> = trials.iter().map(|t| t.files_per_sec).collect();
     let median_files_per_sec =
         median(&values).ok_or_else(|| SmallFilesError::new("invalid-measurement", "no trials"))?;
+    // 成功を返す直前にも再確認する。超過していれば値を出さず timeout にする（REPAIR-5）。
+    ensure_before(overall_deadline)?;
     Ok(Measurement {
         trials,
         median_files_per_sec,
     })
+}
+
+/// 全体期限 `deadline` を過ぎていれば `timeout` を返す（REPAIR-5）。
+pub fn ensure_before(deadline: Instant) -> Result<(), SmallFilesError> {
+    if Instant::now() >= deadline {
+        return Err(SmallFilesError::new("timeout", "deadline exceeded"));
+    }
+    Ok(())
 }
 
 /// 結果 JSON（`scripts/check-bench-regression.sh` の results スキーマと互換）。
@@ -776,6 +788,15 @@ mod tests {
 
     fn code(v: &[&str]) -> &'static str {
         parse_args(&args(v)).expect_err("must be rejected").code
+    }
+
+    /// REPAIR-5: 後始末後の再確認。期限超過なら `timeout`、期限内なら通る。
+    #[test]
+    fn repair5_ensure_before_rejects_expired_deadline() {
+        let past = Instant::now();
+        assert_eq!(ensure_before(past).unwrap_err().code, "timeout");
+        let future = Instant::now() + Duration::from_secs(60);
+        assert!(ensure_before(future).is_ok());
     }
 
     /// IO-6: 配置は決定的で、全ディレクトリが 256 件以内に収まる。

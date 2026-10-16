@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # scripts/bench/concurrent_50_memory.sh の自己テスト（TASK-50.1・TASK-50.2・CORE-9・SUP-1・REPAIR-12）。
 #
-# 役割: bash 製のスタブ launcher（`run --id <id> --bundle <dir>` を受け、子として sleep を起動して
-# 待つ）で計測スクリプトを実行し、終了コード・出力・後始末を具体値で照合する。実ランタイム・root・
+# 役割: bash 製のスタブ（CLI の create・systemd-run・supervisor の `start --root <R> <id>`。supervisor スタブは子として
+# sleep を起動し `FCSUP1 OK <pid>` を出して待つ。実バイナリの契約は #1717・#1819）で計測スクリプトを実行し、終了コード・出力・後始末を具体値で照合する。実ランタイム・root・
 # 実コンテナは使わない。docker モード・report モード（TASK-50.2）はスタブ docker CLI（bash）と疑似 /proc で
 # 照合する（実 Docker・root は使わない。デーモンの列挙は疑似 /proc の comm 走査なので、ホストの dockerd の有無に
 # 左右されない）。メモリ値の照合は、スタブが mktemp -d 配下の疑似 /proc（--proc-root）へ
@@ -109,13 +109,38 @@ expect_has() { # <名前> <ファイル> <部分文字列>
   if grep -qF -- "$3" "$2"; then pass "$1"; else fail "$1 (missing: $3)"; fi
 }
 
-mkdir -p "$work/bundle" "$work/fake"
-stub="$work/stub-launcher"
+mkdir -p "$work/bundle/rootfs" "$work/fake" "$work/bin"
+echo '{}' >"$work/bundle/config.json"
+stub="$work/bin/fandhe-container-supervisor"
+# スタブ CLI（`--root R create --bundle B <id>` だけを受理し、R/<id>/state.json を作る）とスタブ systemd-run
+# （`--user --scope --quiet -p Delegate=yes -- <cmd...>` を照合して exec する。pid は変わらない）。
 {
   printf '#!%s\n' "$bash_bin"
   cat <<'STUB'
-# スタブ launcher。$1=run $2=--id $3=<id> $4=--bundle $5=<dir>
-id="$3"
+[ "$1" = --root ] && [ "$3" = create ] && [ "$4" = --bundle ] && [ "$#" -eq 6 ] || exit 2
+[ -f "$5/config.json" ] && [ -d "$5/rootfs" ] || exit 2
+[ "${STUB_CREATE_FAIL:-}" != "$6" ] || exit 5
+mkdir -p "$2/$6" && echo '{"status":"created"}' >"$2/$6/state.json"
+STUB
+} >"$work/bin/fandhe-container"
+{
+  printf '#!%s\n' "$bash_bin"
+  cat <<'STUB'
+[ "$1" = --user ] && [ "$2" = --scope ] && [ "$3" = --quiet ] && [ "$4" = -p ] && [ "$5" = Delegate=yes ] && [ "$6" = -- ] || exit 2
+shift 6
+exec "$@"
+STUB
+} >"$work/systemd-run"
+chmod +x "$work/bin/fandhe-container" "$work/systemd-run"
+{
+  printf '#!%s\n' "$bash_bin"
+  cat <<'STUB'
+# スタブ supervisor。実バイナリの契約（#1717・#1819）に合わせ、`start --root <R> <id>` だけを受理する。create 済み
+# （<R>/<id>/state.json がある）で、標準出力が FIFO のときだけ `FCSUP1 OK <コンテナ pid>` を出す。
+[ "$1" = start ] && [ "$2" = --root ] && [ "$#" -eq 4 ] || exit 2
+id="${!#}"
+[ -f "$3/$id/state.json" ] || exit 2
+if [ ! -p /dev/stdout ]; then echo "FCSUP1 ERR INVALID_ARGUMENT 2 stdout is not a fifo"; exit 2; fi
 rest="${id#*-}"; rest="${rest#*-}"      # <trial>-<i>
 trial="${rest%%-*}"; idx="${rest##*-}"
 if [ -n "${STUB_DIE_I:-}" ] && [ "$idx" = "$STUB_DIE_I" ]; then echo "stub: boom" >&2; exit 7; fi
@@ -168,6 +193,13 @@ if [ -n "${FAKE_PROC:-}" ] && [ "$mode" != "hang" ]; then
   [ -z "$child" ] || mk "$child" "$v"
   mk "$$" "$lp"
   [ -z "$child" ] || printf '%s \n' "$child" >"$FAKE_PROC/$$/task/$$/children"
+  if [ -n "${STUB_GHOST:-}" ]; then
+    # 実プロセスのない pid を木へ加える（起動時刻を記録できず、トークンも持たない = 帰属を証明できない）。
+    ghost=$((899000 + idx))
+    mkdir -p "$FAKE_PROC/$ghost/task/$ghost"
+    : >"$FAKE_PROC/$ghost/task/$ghost/children"
+    printf '%s %s \n' "$child" "$ghost" >"$FAKE_PROC/$$/task/$$/children"
+  fi
   if [ -n "${STUB_UNREADABLE_CHILDREN:-}" ]; then
     mkdir -p "$FAKE_PROC/$$/task/999999"
     : >"$FAKE_PROC/$$/task/999999/children"
@@ -220,8 +252,8 @@ if [ -n "${FAKE_PROC:-}" ] && [ "$mode" != "hang" ]; then
     done
   fi
 fi
-# 起動完了の明示的な通知（ready 状態）。hang・noready は出さない。
-if [ "$mode" != "hang" ] && [ "$mode" != "noready" ] && [ -z "${STUB_NO_READY:-}" ]; then echo READY; fi
+# 起動完了の明示的な通知（ready 状態。FCSUP1 OK）。hang・noready は出さない。
+if [ "$mode" != "hang" ] && [ "$mode" != "noready" ] && [ -z "${STUB_NO_READY:-}" ]; then echo "FCSUP1 OK ${child:-$$}"; fi
 # SIGTERM を即座に処理するため、sleep を待つ形で待機する。
 while :; do sleep 1 & wait $! || true; done
 STUB
@@ -238,7 +270,7 @@ run_wrap=()
 run_target() {
   rc=0
   : >"$out"; : >"$errf"
-  "${run_wrap[@]}" "$bash_bin" "$target" --launcher "$stub" --bundle "$work/bundle" --target own --settle 0 "$@" >"$out" 2>"$errf" || rc=$?
+  "${run_wrap[@]}" "$bash_bin" "$target" --bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/bundle" --target own --settle 0 "$@" >"$out" 2>"$errf" || rc=$?
 }
 run_fake() { # 疑似 /proc を使う（メモリ値の具体照合）
   rm -rf "$work/fake"; mkdir -p "$work/fake"
@@ -255,7 +287,7 @@ orphan_sleep_count() {
   done
   printf '%s' "${n:-0}"
 }
-alive_stub_count() { pgrep -fc -- "${work}/stub-launcher" 2>/dev/null || true; }
+alive_stub_count() { pgrep -fc -- "${work}/bin/fandhe-container-supervisor" 2>/dev/null || true; }
 
 # --- 1. 正常系（疑似 /proc）: 5 個・3 試行。コンテナ PSS = 100 + 子 → 5*(100+x) ---
 export STUB_PSS_BY_TRIAL="1000,3000,2000"
@@ -292,8 +324,14 @@ expect_eq "even-trials-exit0" 0 "$rc"
 expect_eq "even-trials-median" 13000.0 "$(jq -r '.metrics.concurrent_5_pss_median_kb.value | tostring | if test("\\.") then . else . + ".0" end' "$out")"
 unset STUB_PSS_BY_TRIAL
 
-# --- 3b. トークンを継承しない子孫（追跡不能）は失敗にする（P1・後始末で回収できない） ---
+# --- 3a. トークンを継承しない子孫でも、生存中に記録した pid・起動時刻の同一性で追跡できれば計測できる
+#          （supervisor は dumpable=0 で environ を読めず、コンテナ側は環境変数を継承しない。#1820） ---
 STUB_NO_ENVIRON=1 run_fake --count 2 --trials 1
+expect_eq "tracked-without-token-exit0" 0 "$rc"
+expect_eq "tracked-without-token-no-residual" 0 "$(alive_stub_count)"
+
+# --- 3b. 帰属を証明できない子孫（実プロセスがなく起動時刻を記録できず、トークンも無い）は失敗にする（P1・後始末で回収できない） ---
+STUB_NO_ENVIRON=1 STUB_GHOST=1 run_fake --count 2 --trials 1
 expect_eq "untracked-exit1" 1 "$rc"
 expect_has "untracked-stderr" "$errf" "untracked-process"
 expect_eq "untracked-no-residual" 0 "$(alive_stub_count)"
@@ -501,7 +539,7 @@ expect_has "stale-start-stderr" "$errf" "startup-incomplete: trial=1 started=0/2
 expect_has "stale-start-reported" "$errf" "cleanup-failed: processes still running: pid="
 expect_eq "stale-start-stdout-empty" 0 "$(wc -c <"$out")"
 expect_eq "stale-start-not-signalled" 2 "$(alive_stub_count)"
-pkill -TERM -f -- "${work}/stub-launcher" 2>/dev/null || true
+pkill -TERM -f -- "${work}/bin/fandhe-container-supervisor" 2>/dev/null || true
 kill_recorded
 for _ in $(seq 1 15); do [ "$(alive_stub_count)" != "0" ] || break; sleep 0.2; done
 expect_eq "stale-start-test-cleanup" 0 "$(alive_stub_count)"
@@ -510,7 +548,7 @@ expect_eq "stale-start-test-cleanup" 0 "$(alive_stub_count)"
 #          SIGTERM を無視する launcher の終了待ち中に再送しても、launcher・子を残さない） ---
 : >"$STUB_PIDFILE"
 : >"$out"; : >"$errf"
-STUB_MODE=ignoreterm STUB_NO_READY=1 "$bash_bin" "$target" --launcher "$stub" --bundle "$work/bundle" --target own \
+STUB_MODE=ignoreterm STUB_NO_READY=1 "$bash_bin" "$target" --bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/bundle" --target own \
   --count 2 --trials 1 --timeout 20 >"$out" 2>"$errf" &
 sig_pid=$!
 for _ in $(seq 1 50); do [ "$(wc -l <"$STUB_PIDFILE")" -lt 2 ] || break; sleep 0.2; done
@@ -541,6 +579,22 @@ expect_eq "signal-in-spawn-stdout-empty" 0 "$(wc -c <"$out")"
 expect_eq "signal-in-spawn-no-residual" 0 "$(alive_stub_count)"
 expect_eq "signal-in-spawn-no-orphan-child" 0 "$(orphan_sleep_count)"
 
+# --- 12m. create の失敗は計測失敗（exit 1。結果は公開せず、supervisor は 1 つも起動しない）。bundle の複製の失敗は exit 2
+#          （cp -a へ黙って落とさない。#1820） ---
+STUB_CREATE_FAIL="fc-bench50-1-1" run_fake --count 2 --trials 1 --timeout 5
+expect_eq "create-fail-exit1" 1 "$rc"
+expect_has "create-fail-stderr" "$errf" "reason=create-failed exit=5"
+expect_eq "create-fail-stdout-empty" 0 "$(wc -c <"$out")"
+expect_eq "create-fail-no-residual" 0 "$(alive_stub_count)"
+mkdir -p "$work/bundle-bad/rootfs/sub"
+echo '{}' >"$work/bundle-bad/config.json"
+chmod 000 "$work/bundle-bad/rootfs/sub"
+run_target --count 2 --trials 1 --timeout 5 --bundle "$work/bundle-bad"
+chmod 700 "$work/bundle-bad/rootfs/sub"
+expect_eq "bundle-copy-fail-exit2" 2 "$rc"
+expect_has "bundle-copy-fail-stderr" "$errf" "cannot hard-link the bundle template"
+expect_eq "bundle-copy-fail-no-residual" 0 "$(alive_stub_count)"
+
 # --- 13. 引数エラーは exit 2 ---
 expect_rc2() { # <名前> <引数...>
   local name="$1"; shift
@@ -548,18 +602,20 @@ expect_rc2() { # <名前> <引数...>
   "$bash_bin" "$target" "$@" >/dev/null 2>&1 || r=$?
   expect_eq "$name" 2 "$r"
 }
-base=(--launcher "$stub" --bundle "$work/bundle" --target own)
-expect_rc2 "arg-relative-launcher" --launcher stub-launcher --bundle "$work/bundle" --target own
-expect_rc2 "arg-missing-launcher" --bundle "$work/bundle" --target own
+base=(--bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/bundle" --target own)
+expect_rc2 "arg-relative-bin-dir" --bin-dir bin --bundle "$work/bundle" --target own
+expect_rc2 "arg-legacy-launcher" --launcher "$stub" --bundle "$work/bundle" --target own
+expect_rc2 "arg-bin-dir-missing-supervisor" --bin-dir "$work" --bundle "$work/bundle" --target own
+expect_rc2 "arg-missing-bin-dir" --bundle "$work/bundle" --target own
 expect_rc2 "arg-count-zero" "${base[@]}" --count 0
 expect_rc2 "arg-count-over-limit" "${base[@]}" --count 1025
 expect_rc2 "arg-count-leading-zero" "${base[@]}" --count 08
 expect_rc2 "arg-trials-zero" "${base[@]}" --trials 0
-expect_rc2 "arg-bad-target" --launcher "$stub" --bundle "$work/bundle" --target 'Bad Target'
-expect_rc2 "arg-missing-target" --launcher "$stub" --bundle "$work/bundle"
+expect_rc2 "arg-bad-target" --bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/bundle" --target 'Bad Target'
+expect_rc2 "arg-missing-target" --bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/bundle"
 expect_rc2 "arg-mode-docker-with-launcher" "${base[@]}" --mode docker
 expect_rc2 "arg-proc-root-without-env" "${base[@]}" --proc-root "$work/fake"
-expect_rc2 "arg-bad-bundle" --launcher "$stub" --bundle "$work/nonexistent" --target own
+expect_rc2 "arg-bad-bundle" --bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/nonexistent" --target own
 expect_rc2 "arg-bad-format" "${base[@]}" --format yaml
 expect_rc2 "arg-unknown" "${base[@]}" --bogus
 expect_rc2 "arg-output-dir" "${base[@]}" --output "$work"

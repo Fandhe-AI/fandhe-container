@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/verify-supervisor-independence.sh の自己テスト（TASK-162・SUP-5・REPAIR-12）。
 #
-# 役割: 実行のたびに mktemp -d 配下へスタブ launcher（コンテナ側プロセスを 1 つ起動して READY を出す。
+# 役割: 実行のたびに mktemp -d 配下へスタブ（CLI・systemd-run・supervisor の bin。supervisor スタブはコンテナ側プロセスを 1 つ起動して FCSUP1 OK を出す。
 # 環境変数 STUB_MODE で巻き添え死・コンテナ死・再起動等の挙動を切り替える）を生成し、小さい N（5）で
 # 終了コード・出力 JSON・後始末を具体値で照合する。実コンテナ・実ランタイム・root は使わない
 # （実機での N=50 実証と SUP-5 の判定は #499・人間担当）。
@@ -31,14 +31,34 @@ trap 'rm -rf "$root"' EXIT
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1" >&2; failures=$((failures + 1)); }
 
-# スタブ launcher。`run --id <prefix>-<n> --bundle <dir>` を受け、コンテナ側プロセスを 1 つ起動して READY を出す。
+# スタブ群。実バイナリの契約（#1717・#1819）に合わせ、CLI は `--root R create --bundle B <id>`、systemd-run は
+# `--user --scope --quiet -p Delegate=yes -- <cmd...>`（exec するので pid は変わらない）、supervisor は
+# `start --root R [--restart P] <id>`（標準出力が FIFO でなければ ERR で終了）だけを受理し、他は終了コード 2 にする。
+# supervisor スタブはコンテナ側プロセスを 1 つ起動して `FCSUP1 OK <pid>` を出す。
 # STUB_MODE: normal（監視プロセスが死んでもコンテナは残る）/ collateral（対象の死で他の監視プロセスも死ぬ）/
 # die_with_target（対象のコンテナが監視プロセスと共に死ぬ）/ other_dies（他コンテナが対象の死で死ぬ）/
-# scrub_env（コンテナ側プロセスが環境変数を継承しない）/ no_ready（READY を出さない）/ short_start（最後の launcher が起動直後に終了）/ restart（コンテナを再起動する）/ restart_aux（補助プロセスだけ増やす）/ restart_short（再起動後すぐ終了）/ restart_sup_dies（再起動後に監視プロセスが終了）/ restart_alias（同名・別コマンドの補助プロセスだけ増やす）/ many_kids（子孫が走査上限 512 件を超える）。
+# scrub_env（コンテナ側プロセスが環境変数を継承しない）/ no_ready（報告を出さない）/ err_report（FCSUP1 ERR）/ bad_report（書式不正）/ short_start（最後の launcher が起動直後に終了）/ restart（コンテナを再起動する）/ restart_aux（補助プロセスだけ増やす）/ restart_short（再起動後すぐ終了）/ restart_sup_dies（再起動後に監視プロセスが終了）/ restart_alias（同名・別コマンドの補助プロセスだけ増やす）/ many_kids（子孫が走査上限 512 件を超える）。
 # 待機はすべて組み込みの read -t（fork しない）で行い、一過性の子プロセスを作らない。
-cat >"${root}/launcher.sh" <<'STUB'
+mkdir -m 0755 "${root}/bin"
+cat >"${root}/bin/fandhe-container" <<'STUB'
 #!/usr/bin/env bash
-id="$3"
+[ "$1" = --root ] && [ "$3" = create ] && [ "$4" = --bundle ] && [ "$#" -eq 6 ] || exit 2
+[ -f "$5/config.json" ] && [ -d "$5/rootfs" ] || exit 2
+mkdir -p "$2/$6" && echo '{"status":"created"}' >"$2/$6/state.json"
+STUB
+cat >"${root}/systemd-run" <<'STUB'
+#!/usr/bin/env bash
+[ "$1" = --user ] && [ "$2" = --scope ] && [ "$3" = --quiet ] && [ "$4" = -p ] && [ "$5" = Delegate=yes ] && [ "$6" = -- ] || exit 2
+shift 6
+exec "$@"
+STUB
+cat >"${root}/bin/fandhe-container-supervisor" <<'STUB'
+#!/usr/bin/env bash
+[ "$1" = start ] && [ "$2" = --root ] || exit 2
+id="${!#}"
+[ -f "$3/$id/state.json" ] || exit 2
+if [ ! -p /dev/stdout ]; then echo "FCSUP1 ERR INVALID_ARGUMENT 2 stdout is not a fifo"; exit 2; fi
+if [ "$STUB_MODE" = err_report ] && [ "${id##*-}" = "$STUB_TARGET" ]; then echo "FCSUP1 ERR FAILED_PRECONDITION 1 stub"; exit 1; fi
 n="${id##*-}"
 if [ "$STUB_MODE" = short_start ] && [ "$n" = "$STUB_COUNT" ]; then exit 1; fi
 mkfifo "$STUB_DIR/$id.fifo"
@@ -73,7 +93,11 @@ start_container() {
 }
 start_container
 trap 'kill "$c" 2>/dev/null; exit 0' TERM
-if [ "$STUB_MODE" != no_ready ]; then echo READY; fi
+case "$STUB_MODE" in
+  no_ready) ;;
+  bad_report) echo "FCSUP1 OK pid" ;;
+  *) echo "FCSUP1 OK $c" ;;
+esac
 while :; do
   if [ "$STUB_MODE" = collateral ] && [ "$role" = o ]; then
     read -r tp <"$STUB_DIR/$tid.pid" 2>/dev/null || { read -t 0.2 -u 9 || true; continue; }
@@ -115,8 +139,9 @@ while :; do
   read -t 1 -u 9 || true
 done
 STUB
-chmod 700 "${root}/launcher.sh"
-mkdir "${root}/bundle"
+chmod 700 "${root}/bin/fandhe-container" "${root}/bin/fandhe-container-supervisor" "${root}/systemd-run"
+mkdir "${root}/bundle" "${root}/bundle/rootfs"
+echo "{}" >"${root}/bundle/config.json"
 
 count=5
 tindex=3
@@ -141,7 +166,7 @@ run_case() {
   ERR="${d}/err"
   RC=0
   env STUB_MODE="$mode" STUB_DIR="$d" STUB_COUNT="$count" STUB_LAST="$count" STUB_TARGET="$tindex" STUB_PREFIX="$prefix" SELFTEST_MARK="$mark" \
-    bash "$target" --launcher "${root}/launcher.sh" --bundle "${root}/bundle" --count "$count" --target-index "$tindex" \
+    bash "$target" --bin-dir "${root}/bin" --systemd-run "${root}/systemd-run" --bundle "${root}/bundle" --count "$count" --target-index "$tindex" \
     --id-prefix "$prefix" --settle 1 --timeout 5 "$@" >"$OUT" 2>"$ERR" || RC=$?
   while IFS= read -r p; do
     p="${p#/proc/}"
@@ -178,7 +203,7 @@ if [[ "$(json_get target_container_reparented_to "$OUT")" =~ ^[1-9][0-9]*$ ]]; t
 else
   fail "normal: target_container_reparented_to is not a pid ($(json_get target_container_reparented_to "$OUT"))"
 fi
-if grep -q -e '/launcher.sh' -e "${root}" "$OUT" "$ERR"; then fail "normal: output leaks a path"; else pass "normal: output has no launcher/bundle path"; fi
+if grep -q -e '/fandhe-container-supervisor' -e "${root}" "$OUT" "$ERR"; then fail "normal: output leaks a path"; else pass "normal: output has no binary/bundle path"; fi
 
 # 2. 巻き添え死: 対象の kill で他の監視プロセスも死ぬ → 判定不成立。--output は作られない。
 run_case collateral --output "${root}/c2-result.json"
@@ -199,10 +224,19 @@ expect_eq "other_dies: exit code" 1 "$RC"
 expect_eq "other_dies: monitored_containers_alive" 0 "$(json_get monitored_containers_alive "$OUT")"
 expect_eq "other_dies: supervisors_alive_after_kill" 4 "$(json_get supervisors_alive_after_kill "$OUT")"
 
-# 5. READY を出さない → 結果を公開せず 1。
+# 5. 報告を出さない → 結果を公開せず 1。
 run_case no_ready --timeout 3
 expect_eq "no_ready: exit code" 1 "$RC"
 expect_eq "no_ready: stdout is empty" "" "$(cat "$OUT")"
+
+# 5b. FCSUP1 ERR を返す / 書式不正の報告 → 結果を公開せず 1。
+run_case err_report
+expect_eq "err_report: exit code" 1 "$RC"
+expect_eq "err_report: stdout is empty" "" "$(cat "$OUT")"
+if grep -q 'FAILED_PRECONDITION' "$ERR"; then pass "err_report: error code is reported"; else fail "err_report: error code missing from stderr"; fi
+run_case bad_report
+expect_eq "bad_report: exit code" 1 "$RC"
+expect_eq "bad_report: stdout is empty" "" "$(cat "$OUT")"
 
 # 6. N 個未満しか起動しない → 結果を公開せず 1。
 run_case short_start --timeout 3
@@ -273,16 +307,38 @@ arg_case() { # <説明> <引数...>
   bash "$target" "$@" >/dev/null 2>"${root}/arg.err" || rc=$?
   expect_eq "args: ${desc}" 2 "$rc"
 }
-arg_case "relative launcher" --launcher launcher.sh --bundle "${root}/bundle"
-arg_case "count 1" --launcher "${root}/launcher.sh" --bundle "${root}/bundle" --count 1
-arg_case "target-index out of range" --launcher "${root}/launcher.sh" --bundle "${root}/bundle" --count 5 --target-index 9
-arg_case "min-procs 1" --launcher "${root}/launcher.sh" --bundle "${root}/bundle" --min-procs 1
-arg_case "bad id-prefix" --launcher "${root}/launcher.sh" --bundle "${root}/bundle" --id-prefix 'a b'
-arg_case "missing bundle" --launcher "${root}/launcher.sh"
+B="--systemd-run ${root}/systemd-run --bundle ${root}/bundle"
+# shellcheck disable=SC2086
+arg_case "relative bin-dir" --bin-dir bin $B
+# shellcheck disable=SC2086
+arg_case "legacy --launcher is rejected" --launcher "${root}/bin/fandhe-container-supervisor" $B
+# shellcheck disable=SC2086
+arg_case "count 1" --bin-dir "${root}/bin" $B --count 1
+# shellcheck disable=SC2086
+arg_case "target-index out of range" --bin-dir "${root}/bin" $B --count 5 --target-index 9
+# shellcheck disable=SC2086
+arg_case "min-procs 1" --bin-dir "${root}/bin" $B --min-procs 1
+# shellcheck disable=SC2086
+arg_case "bad id-prefix" --bin-dir "${root}/bin" $B --id-prefix 'a b'
+arg_case "missing bundle" --bin-dir "${root}/bin" --systemd-run "${root}/systemd-run"
 : >"${root}/existing.json"
-arg_case "existing output" --launcher "${root}/launcher.sh" --bundle "${root}/bundle" --output "${root}/existing.json"
-ln -s "${root}/launcher.sh" "${root}/launcher-link.sh"
-arg_case "symlink launcher" --launcher "${root}/launcher-link.sh" --bundle "${root}/bundle"
+# shellcheck disable=SC2086
+arg_case "existing output" --bin-dir "${root}/bin" $B --output "${root}/existing.json"
+# bin-dir の中身を差し替えた複製で、symlink・group 書き込み可・欠落を拒否する。
+mkdir -m 0755 "${root}/bin-link" "${root}/bin-gw" "${root}/bin-missing"
+cp "${root}/bin/fandhe-container" "${root}/bin-link/fandhe-container"
+ln -s "${root}/bin/fandhe-container-supervisor" "${root}/bin-link/fandhe-container-supervisor"
+cp "${root}/bin/fandhe-container" "${root}/bin/fandhe-container-supervisor" "${root}/bin-gw/"
+chmod 770 "${root}/bin-gw/fandhe-container-supervisor"
+cp "${root}/bin/fandhe-container" "${root}/bin-missing/"
+# shellcheck disable=SC2086
+arg_case "symlink supervisor" --bin-dir "${root}/bin-link" $B
+# shellcheck disable=SC2086
+arg_case "group-writable supervisor" --bin-dir "${root}/bin-gw" $B
+# shellcheck disable=SC2086
+arg_case "missing supervisor" --bin-dir "${root}/bin-missing" $B
+ln -s "${root}/systemd-run" "${root}/systemd-run-link"
+arg_case "symlink systemd-run" --bin-dir "${root}/bin" --systemd-run "${root}/systemd-run-link" --bundle "${root}/bundle"
 
 # 11. AC3: スクリプト本文に SUP-5 のビヘイビア ID が明記されている。
 if grep -q 'SUP-5' "$target"; then pass "script mentions SUP-5"; else fail "script does not mention SUP-5"; fi

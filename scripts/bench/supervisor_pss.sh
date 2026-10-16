@@ -10,10 +10,14 @@
 # 判定は人間が行う）。コンテナ・監視プロセスの起動もしない（起動は操作者が事前に行う。
 # 50 コンテナ同時起動の起動ハーネスは concurrent_50_memory.sh が持つ）。
 #
-# 現状（REPAIR-3）: fandhe-container-supervisor の製品バイナリは未提供のため、現時点では実測できない。
-# 実測は製品バイナリ提供後に #485 で人間が行う。--exe-name の既定値が実バイナリ名と一致するかも
-# その時に確認する。「監視プロセス」に runtime 側の補助プロセスを含めるか（PoC-17 の N=1 は
-# supervisor 単体 + runtime-proto 単体の合算）は判定側の解釈事項で、本スクリプトは exe 名 1 種の
+# 現状（REPAIR-3）: 製品バイナリ fandhe-container-supervisor は提供済み（#1717・#1819）で、--exe-name の既定値は
+# crates/supervisor/src/launcher.rs の SUPERVISOR_FILE_NAME と一致する。実測は #485 で人間が行う（本スクリプトは起動をしない）。
+# 権限（重要）: supervisor は入口で PR_SET_DUMPABLE=0 にする（SUP-14）ため、同じ利用者の非 root からも
+# /proc/<pid>/exe・smaps_rollup を読めない。計測は root（init user namespace の CAP_SYS_PTRACE を持つ権限付きシェル）から行い、
+# supervisor 自体は非 root の利用者が別のシェルで起動したままにしておく（supervisor は rootful 起動を拒否する。SEC-5）。
+# 起動の手順（create → systemd-run → start）は docs/verification/supervisor-measurement-runbook.md を参照。
+# 読めない場合は終了コード 3 で、メッセージに dumpable の旨を足す。「監視プロセス」に runtime 側の補助プロセスを含めるか
+# （PoC-17 の N=1 は supervisor 単体 + runtime-proto 単体の合算）は判定側の解釈事項で、本スクリプトは exe 名 1 種の
 # 集計に留める。必要なら --exe-name を変えて複数回計測する。
 #
 # 使い方:
@@ -227,7 +231,7 @@ add_record() {
   if ! pss="$(read_kb "$dir/smaps_rollup" Pss 2>/dev/null)" ||
     ! rss="$(read_kb "$dir/status" VmRSS 2>/dev/null)"; then
     [ -d "$dir" ] || return 10
-    err "measurement-failed" "cannot read memory counters of pid ${pid} (insufficient permission?)"
+    err "measurement-failed" "cannot read memory counters of pid ${pid} (insufficient permission? the supervisor clears its dumpable flag; read it from a privileged shell)"
     exit 3
   fi
   if ! [[ "$pss" =~ $num_re ]] || ! [[ "$rss" =~ $num_re ]] || [ "$pss" -eq 0 ]; then

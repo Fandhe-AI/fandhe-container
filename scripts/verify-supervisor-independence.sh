@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # 監視プロセス独立性の実証スクリプト（TASK-162・SUP-5。実証は #499・TASK-162.h1 で人間が実機実行する）。
 #
-# 役割: N 個の監視プロセス（launcher。コンテナ 1 つにつき 1 つ）を同時に起動し、そのうち指定した 1 個
-# だけを SIGKILL して、次を機械照合する。実行・判定は人間担当で、本スクリプトは準備物（REPAIR-3: 実装済みを
-# 装わない。製品バイナリ〔TASK-79 の CLI・本番 launcher〕は未提供のため、CI で動かすのはスタブ launcher の
-# 自己テスト scripts/verify-supervisor-independence-selftest.sh のみ）。
+# 役割: N 個の監視プロセス（fandhe-container-supervisor。コンテナ 1 つにつき 1 つ）を同時に起動し、そのうち指定した 1 個
+# だけを SIGKILL して、次を機械照合する。実行・判定は人間担当（#499）で、CI で動かすのはスタブの自己テスト
+# scripts/verify-supervisor-independence-selftest.sh のみ。製品バイナリ（CLI・supervisor の bin）は提供済み
+# （#1717・#1819。REPAIR-3: 実機での実証は未実施で、本スクリプトは準備物）。
 #   (a) 対象の監視プロセスが実際に消滅している（消えていなければ検証不成立。自明な合格を防ぐ）
 #   (b) 残り N-1 個の監視プロセスが、記録した起動時刻のまま生存している（SUP-5 の「継続」）
 #   (c) 残り N-1 個のコンテナ側プロセス（launcher の子孫）が、記録した pid・起動時刻・親 pid のまま生存
@@ -13,24 +13,35 @@
 #       「同名のプロセスが居る」ではなく同一プロセスの照合）。再親化後の親 pid は参考値として出力する
 # 「監視継続」は既定では (b)+(c) の生存照合で定義する。残り N-1 個のコンテナを kill して再起動を確認する
 # PoC-17 相当の往復は --check-restart（opt-in・既定 off）で、SUP-3（restart ポリシー）の実装が前提のため
-# 現行 supervisor では成立しない（SUP-3 実装後に有効）。
+# supervisor の再 launch が本番 launcher で拒否される間（#2043）は成立しない（#2043 の後に有効）。
 # 孤児コンテナの re-adopt・終了ポリシーは SUP-8・TASK-165 の課題で本スクリプトの範囲外。
 #
 # 呼び出し元: Makefile の `supervisor-independence`（操作者が明示実行。make ci には含めない）。
-# 本スクリプトは sudo を呼ばない（権限が要る場合は操作者が権限付きシェルから実行する）。
+# 本スクリプトは sudo を呼ばない（権限が要る場合は操作者が権限付きシェルから実行する）。ただし supervisor は
+# rootful 起動を拒否する（SEC-5）ため、非 root の利用者で実行する（root では起動前に終了コード 3）。
 #
-# launcher 契約（scripts/bench/concurrent_50_memory.sh の own モードと同一。TASK-79 の CLI 提供後に起動行だけ
-# 合わせる暫定契約）:
-#   <launcher> run --id <id> --bundle <bundle> を本スクリプトの直接の子として起動する（配列で直接 exec。
-#   eval・sh -c を使わない）。launcher はコンテナ 1 つを監視してフォアグラウンドに留まり、起動完了時に標準出力へ
-#   `READY` だけの行を出す。環境変数 FANDHE_BENCH_OWNER に実行ごとの乱数トークンを渡し、後始末で
-#   /proc/*/environ のトークン一致により孤児化した子孫も回収する。環境変数を継承しないコンテナ側プロセスは、
-#   起動時に記録した pid・起動時刻の同一性でも追跡して回収する（回収できなければ終了コード 4）。
-#   停止は SIGTERM、期限超過で SIGKILL。
-#   launcher の標準出力・標準エラーは一時ファイルへ記録する（READY の確認用。実行後に削除する）。
+# 起動契約（crates/supervisor/src/start_contract.rs・start_entry.rs。差し替え点は sup_create / sup_spawn / sup_report）:
+#   1. <bin-dir>/fandhe-container --root <状態ルート> create --bundle <bundle の複製> <id> を済ませる。
+#   2. <systemd-run> --user --scope --quiet -p Delegate=yes -- <bin-dir>/fandhe-container-supervisor start --root <状態ルート> <id>
+#      を本スクリプトの直接の子として起動する（配列で直接 exec。eval・sh -c を使わない。--scope は同じプロセスのまま
+#      exec するので pid・親子関係は保たれる。supervisor は親 cgroup に自分だけがいることを要求するため、
+#      supervisor ごとに新しいスコープへ入れる）。標準出力は名前付き FIFO にする（supervisor は FIFO 以外の標準出力を拒否する）。
+#   3. 結果は標準出力の 1 行 `FCSUP1 OK <pid>`（pid はコンテナ側 init のホスト上の pid）か
+#      `FCSUP1 ERR <CODE> <exit> <msg>`。supervisor はコンテナを監視してフォアグラウンドに留まる。
+# CLI の start を経由しない理由: CLI の start は supervisor を別のプロセスグループ（process_group(0)）で起動し、
+# 標準エラーを捨て、子として wait しない。直接起動すれば supervisor が本スクリプトの直接の子（親 pid の照合）になり、
+# 「supervisor の子孫を数える」集計と後始末が成立する。
+# bundle: --bundle は使い捨てのテンプレートとして扱う。supervisor は bundle へ flock を取るため、コンテナごとに
+# 作業ディレクトリへ複製する（rootfs はハードリンク複製で inode と page cache を共有する。cp -al 失敗時は 2）。
+# テンプレートは計測専用の使い捨てにすること（ハードリンクの inode 共有により、コンテナ内の書き込みが波及しうる）。
+# 後始末: 環境変数 FANDHE_BENCH_OWNER に実行ごとの乱数トークンを渡し、/proc/*/environ のトークン一致で孤児化した
+# 子孫も回収する。supervisor は dumpable=0 で environ を読めないため、記録した pid・起動時刻の同一性で追跡して回収する
+# （回収できなければ終了コード 4）。停止は SIGTERM、期限超過で SIGKILL。状態ルート・bundle の複製・FIFO は
+# 本スクリプトが mktemp で作った配下だけを削除する（CLI の delete は呼ばない）。
+# supervisor の標準エラーは一時ファイルへ記録する（実行後に削除する）。
 #
 # 使い方:
-#   verify-supervisor-independence.sh --launcher <絶対パス> --bundle <dir>
+#   verify-supervisor-independence.sh --bin-dir <絶対パス> --bundle <dir> [--systemd-run <絶対パス（既定 /usr/bin/systemd-run）>]
 #       [--count N（既定 50。2〜200）] [--target-index K（既定 N/2 の切り上げ。1〜N）]
 #       [--min-procs N（各 launcher の木の最小プロセス数。既定 2〜64）] [--settle SECS（既定 2）]
 #       [--timeout SECS（各待機の上限。既定 30）] [--id-prefix STR（既定 fc-sup-indep）]
@@ -63,7 +74,8 @@ usage() {
   sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
 }
 
-launcher=""
+bin_dir=""
+systemd_run="/usr/bin/systemd-run"
 bundle=""
 count=50
 target_index=""
@@ -78,7 +90,9 @@ need_val() { [ "$1" -ge 2 ] || { err "invalid-argument" "$2 requires a value"; e
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --launcher) need_val $# "$1"; launcher="$2"; shift 2 ;;
+    --bin-dir) need_val $# "$1"; bin_dir="$2"; shift 2 ;;
+    --systemd-run) need_val $# "$1"; systemd_run="$2"; shift 2 ;;
+    --launcher) err "invalid-argument" "--launcher was replaced by --bin-dir"; exit 2 ;;
     --bundle) need_val $# "$1"; bundle="$2"; shift 2 ;;
     --count) need_val $# "$1"; count="$2"; shift 2 ;;
     --target-index) need_val $# "$1"; target_index="$2"; shift 2 ;;
@@ -98,7 +112,7 @@ check_range() { # <名前> <値> <最小> <最大>
   { [ "$2" -ge "$3" ] && [ "$2" -le "$4" ]; } || { err "invalid-argument" "$1 must be from $3 to $4"; exit 2; }
 }
 
-[ -n "$launcher" ] || { err "invalid-argument" "--launcher is required"; exit 2; }
+[ -n "$bin_dir" ] || { err "invalid-argument" "--bin-dir is required"; exit 2; }
 [ -n "$bundle" ] || { err "invalid-argument" "--bundle is required"; exit 2; }
 check_range "--count" "$count" 2 200
 [ -n "$target_index" ] || target_index=$(((count + 1) / 2))
@@ -107,8 +121,9 @@ check_range "--min-procs" "$min_procs" 2 64
 check_range "--settle" "$settle" 0 600
 check_range "--timeout" "$timeout_s" 1 600
 [[ "$id_prefix" =~ $id_re ]] || { err "invalid-argument" "--id-prefix must match [A-Za-z0-9_-]{1,32}"; exit 2; }
-case "$launcher" in /*) ;; *) err "invalid-argument" "--launcher must be an absolute path"; exit 2 ;; esac
-case "$launcher$bundle" in *$'\n'*) err "invalid-argument" "paths must not contain newlines"; exit 2 ;; esac
+case "$bin_dir" in /*) ;; *) err "invalid-argument" "--bin-dir must be an absolute path"; exit 2 ;; esac
+case "$systemd_run" in /*) ;; *) err "invalid-argument" "--systemd-run must be an absolute path"; exit 2 ;; esac
+case "$bin_dir$systemd_run$bundle" in *$'\n'*) err "invalid-argument" "paths must not contain newlines"; exit 2 ;; esac
 [ -d "$bundle" ] || { err "invalid-argument" "--bundle is not a directory"; exit 2; }
 
 # 祖先を含むディレクトリが、他のユーザーに中のエントリを差し替えられないこと（concurrent_50_memory.sh の
@@ -137,25 +152,33 @@ path_chain_is_safe() { # <dir>
   done
 }
 
-# root 実行時に launcher を他ユーザーが差し替えられないこと: 非 symlink の通常ファイルで、実行可能、
-# 所有者が実行ユーザーか root、group / other 書き込み不可、祖先ディレクトリも上記規則を満たす。
+# 起動する 3 つの実行ファイル（CLI・supervisor の bin・systemd-run）を他ユーザーが差し替えられないこと:
+# 非 symlink の通常ファイルで、実行可能、所有者が実行ユーザーか root、group / other 書き込み不可、
+# 祖先ディレクトリも上記規則を満たす。bin-dir 内は固定名で解決し PATH 探索はしない。
 if ! command -v find >/dev/null 2>&1 || ! command -v id >/dev/null 2>&1 || ! command -v dirname >/dev/null 2>&1; then
   err "unsupported-os" "find, id and dirname are required"
   exit 3
 fi
-if [ -L "$launcher" ] || [ ! -f "$launcher" ] || [ ! -x "$launcher" ]; then
-  err "invalid-argument" "--launcher must be an executable regular file (not a symlink)"
-  exit 2
-fi
 uid_now="$(id -u)"
-if [ -z "$(find -P "$launcher" -maxdepth 0 -type f \( -user "$uid_now" -o -user 0 \) ! -perm -0020 ! -perm -0002 -print 2>/dev/null)" ]; then
-  err "invalid-argument" "--launcher must be owned by you or root and not writable by group or others"
-  exit 2
-fi
-if ! path_chain_is_safe "$(dirname -- "$launcher")"; then
-  err "invalid-argument" "the directories above --launcher must be symlink-free, owned by you or root, and not writable by others (unless sticky)"
-  exit 2
-fi
+check_exe() { # <表示名> <パス>
+  if [ -L "$2" ] || [ ! -f "$2" ] || [ ! -x "$2" ]; then
+    err "invalid-argument" "$1 must be an executable regular file (not a symlink)"
+    exit 2
+  fi
+  if [ -z "$(find -P "$2" -maxdepth 0 -type f \( -user "$uid_now" -o -user 0 \) ! -perm -0020 ! -perm -0002 -print 2>/dev/null)" ]; then
+    err "invalid-argument" "$1 must be owned by you or root and not writable by group or others"
+    exit 2
+  fi
+  if ! path_chain_is_safe "$(dirname -- "$2")"; then
+    err "invalid-argument" "the directories above $1 must be symlink-free, owned by you or root, and not writable by others (unless sticky)"
+    exit 2
+  fi
+}
+cli_bin="${bin_dir}/fandhe-container"
+sup_bin="${bin_dir}/fandhe-container-supervisor"
+check_exe "fandhe-container in --bin-dir" "$cli_bin"
+check_exe "fandhe-container-supervisor in --bin-dir" "$sup_bin"
+check_exe "--systemd-run" "$systemd_run"
 
 if [ -n "$output" ]; then
   # 既存のパス（symlink・ディレクトリを含む）は拒否し上書きしない。公開は ln -T で「存在しない場合だけ作成」。
@@ -181,10 +204,12 @@ fi
 # --- 前提確認（欠如は 3。0 を返して合格に見せない） ---
 if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then err "unsupported-os" "bash 5 or later is required"; exit 3; fi
 if [ "$(uname -s 2>/dev/null || true)" != "Linux" ]; then err "unsupported-os" "only Linux is supported"; exit 3; fi
-for req in mktemp ln grep sleep kill uname date od head tr; do
+for req in mktemp mkfifo cp timeout ln grep sleep kill uname date od head tr; do
   command -v "$req" >/dev/null 2>&1 || { err "unsupported-os" "$req is required"; exit 3; }
 done
 [ -r /proc/self/stat ] || { err "unsupported-os" "/proc is required"; exit 3; }
+# supervisor は rootful 起動を拒否する（SEC-5）。0 を返して合格に見せないよう起動前に 3 で止める。
+if [ "$uid_now" -eq 0 ]; then err "unsupported-os" "supervisor rejects rootful start (SEC-5); run as a non-root user"; exit 3; fi
 
 # --- 状態 ---
 pids=()
@@ -195,7 +220,7 @@ owner_tok=""
 out_tmp=""
 final_rc=0
 spawned=0
-declare -A SP SS SZ CH TRK SEEN
+declare -A SP SS SZ CH TRK SEEN NOCHILD
 untracked=0
 TREE_TRUNC=0
 publish_pending=0
@@ -369,8 +394,10 @@ track_descendants() {
         TRK[$c]="${rest%%:*}"
         SEEN[$i]=1
       done
-    elif [ -z "${SEEN[$i]:-}" ] && [ -z "${DESC[$i]:-}" ]; then
-      # 既に消滅した launcher で、子孫を 1 つも観測できていない。
+    elif [ -z "${SEEN[$i]:-}" ] && [ -z "${DESC[$i]:-}" ] && [ -z "${NOCHILD[$i]:-}" ]; then
+      # 既に消滅した supervisor で、子孫を 1 つも観測できていない。ERR を出して終了したのなら
+      # （sup_report が NOCHILD を記録して起動失敗で終了する）追跡不能とは扱わない。
+      sup_report "$i" || true
       untracked=1
     fi
     for d in ${DESC[$i]:-}; do
@@ -481,34 +508,91 @@ trap 'on_signal 143' TERM
 
 logdir="$(mktemp -d)" || { err "unsupported-os" "cannot create a temporary directory"; exit 3; }
 
-# 引数は配列で直接 exec する（eval・sh -c を使わない）。ulimit 等の制限は掛けない（コンテナ内の挙動が変わるため）。
-spawn_one() { # <i>
-  local i="$1" log="${logdir}/l${1}.log"
-  : >"$log"
+state_root="${logdir}/state"
+work="${logdir}/work"
+mkdir -m 0700 "$state_root" "$work" "${work}/bundles" "${work}/fifos" || { err "unsupported-os" "cannot create a work directory"; exit 3; }
+declare -A REP_PID FDS
+
+# --- 起動契約の差し替え点（契約の根拠は冒頭コメント）。起動行・報告行の解釈はこの関数群に閉じる ---
+
+# bundle の複製（supervisor が bundle へ flock を取るため、コンテナごとに別ディレクトリを使う）。rootfs はハードリンクで共有する。
+make_bundle_copy() { # <i>
+  local dst="${work}/bundles/${id_prefix}-${1}"
+  if ! cp -al -- "$bundle" "$dst" 2>/dev/null; then
+    err "invalid-argument" "cannot hard-link the bundle template (it must be on the same filesystem as TMPDIR)"
+    exit 2
+  fi
+  # config.json は inode を共有せず通常のコピーにする。
+  cp -f --remove-destination -- "${bundle}/config.json" "${dst}/config.json" 2>/dev/null || { err "invalid-argument" "bundle must contain config.json"; exit 2; }
+}
+
+# create を期限付きで実行する（REPAIR-5）。失敗は終了コードだけを出す（出力・パスは出さない）。
+sup_create() { # <i>
+  local rc=0
+  timeout --kill-after=5 "$timeout_s" "$cli_bin" --root "$state_root" create --bundle "${work}/bundles/${id_prefix}-${1}" "${id_prefix}-${1}" </dev/null >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 0 ] || { err "launch-failed" "create failed for container ${1} (exit ${rc})"; final_rc=1; exit 1; }
+}
+
+# supervisor を直接の子として起動する。標準出力は FIFO（読み手を先に RDWR で開く）。引数は配列で直接 exec する。
+# ulimit 等の制限は掛けない（コンテナ内の挙動が変わるため）。
+sup_spawn() { # <i>
+  local i="$1" fifo="${work}/fifos/f${1}" fd
+  mkfifo -m 0600 "$fifo" || { err "launch-failed" "cannot create a fifo"; final_rc=1; exit 1; }
+  exec {fd}<>"$fifo"
+  FDS[$i]="$fd"
   (
-    FANDHE_BENCH_OWNER="$owner_tok" exec "$launcher" run --id "${id_prefix}-${i}" --bundle "$bundle" </dev/null >"$log" 2>&1
+    FANDHE_BENCH_OWNER="$owner_tok" exec "$systemd_run" --user --scope --quiet -p Delegate=yes -- "$sup_bin" start --root "$state_root" "${id_prefix}-${i}" </dev/null >"$fifo" 2>"${logdir}/l${i}.err"
   ) &
   pids[i]=$!
   pstart[i]=""
   if read_starttime "${pids[$i]}"; then pstart[i]="$ST"; fi
 }
 
+# 報告の 1 行を読み、FCSUP1 OK <pid> なら REP_PID へ記録して 0。ERR・書式不正は起動失敗として即終了。未到着は 1。
+sup_report() { # <i>
+  local i="$1" line=""
+  [ -z "${REP_PID[$i]:-}" ] || return 0
+  IFS= read -r -n 640 -t 0.05 -u "${FDS[$i]}" line || true
+  [ -n "$line" ] || return 1
+  if [[ "$line" =~ ^FCSUP1\ OK\ ([1-9][0-9]{0,9})$ ]]; then
+    REP_PID[$i]="${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ "$line" =~ ^FCSUP1\ ERR\ ([A-Z_]{1,32})\ ([0-9]{1,3})\  ]]; then
+    err "launch-failed" "supervisor ${i} reported ERR ${BASH_REMATCH[1]} (exit ${BASH_REMATCH[2]})"
+  else
+    err "launch-failed" "supervisor ${i} printed an unrecognized report line"
+  fi
+  # 起動失敗した supervisor はコンテナ側プロセスを持たないため、子孫を観測できなかったことを追跡不能にしない。
+  NOCHILD[$i]=1
+  final_rc=1
+  exit 1
+}
+
+# 全 supervisor が生存し、FCSUP1 OK を返し、報告 pid がその supervisor の子孫であること（直前の scan の結果で判定）。
 all_ready() {
   local i
+  # 全員の報告を先に読む（ERR を出した supervisor は、他の報告待ちに関係なく起動失敗として検出する）。
+  for i in $(seq 1 "$count"); do sup_report "$i" || true; done
   for i in $(seq 1 "$count"); do
+    # 報告を先に読む（ERR を出して終了した supervisor も、ここで起動失敗として検出する）。
+    sup_report "$i" || return 1
     same_proc_alive "${pids[$i]}" "${pstart[$i]:-}" "$$" || return 1
-    grep -qxF -- "READY" "${logdir}/l${i}.log" 2>/dev/null || return 1
+    tree_of "${pids[$i]}"
+    [[ " ${TREE}" == *" ${REP_PID[$i]}:"* ]] || return 1
   done
 }
 
 timed_out() { err "timeout" "$1"; final_rc=1; exit 1; }
 
 spawned=1
-for i in $(seq 1 "$count"); do spawn_one "$i"; done
+for i in $(seq 1 "$count"); do make_bundle_copy "$i"; done
+for i in $(seq 1 "$count"); do sup_create "$i"; done
+for i in $(seq 1 "$count"); do sup_spawn "$i"; done
 for i in $(seq 1 "$count"); do
   [ -n "${pstart[$i]:-}" ] || { err "launch-failed" "cannot record the start time of a launcher"; final_rc=1; exit 1; }
 done
-wait_tracked "$timeout_s" all_ready || timed_out "not all ${count} launchers became ready within ${timeout_s}s"
+wait_tracked "$timeout_s" all_ready || timed_out "not all ${count} supervisors reported FCSUP1 OK within ${timeout_s}s"
 
 # --- kill 前スナップショット: 全 launcher の生存・木の大きさ・子孫（コンテナ側プロセス）を記録 ---
 settle_tracked
@@ -527,6 +611,11 @@ for i in $(seq 1 "$count"); do
     exit 1
   fi
   DESC[i]="$TREE"
+  if [[ " ${TREE}" != *" ${REP_PID[$i]}:"* ]]; then
+    err "launch-failed" "the container pid reported by supervisor ${i} is not in its process tree"
+    final_rc=1
+    exit 1
+  fi
   # shellcheck disable=SC2086
   set -- $TREE
   if [ $(($# + 1)) -lt "$min_procs" ]; then
@@ -579,7 +668,7 @@ for desc in ${DESC[$target_index]}; do
   if [ "$cppid" = "$tpid" ] && [ "$reparented_to" = "null" ] && [ -n "${SP[$cpid]:-}" ]; then reparented_to="${SP[$cpid]}"; fi
 done
 
-# --- --check-restart（opt-in。SUP-3 の restart ポリシー実装が前提）: 残り N-1 個のコンテナ側プロセスを kill して再起動を確認 ---
+# --- --check-restart（opt-in。SUP-3 の restart ポリシー実装と再 launch〔#2043〕が前提）: 残り N-1 個のコンテナ側プロセスを kill して再起動を確認 ---
 # 再起動の成立条件: kill した旧プロセス（pid・起動時刻）がすべて消滅していること、かつ各監視プロセスについて、kill 前に記録した子孫（pid・起動時刻）に含まれない「新しい」直接の子で、
 # kill した子とシグネチャ（comm＋完全な cmdline）が一致するものが、シグネチャごとに kill した直接の子の数以上、生存していること。
 # 同名・別コマンドの補助プロセスが増えただけでは成立しない。待機中と settle 中も子孫を追跡し続け（環境変数を

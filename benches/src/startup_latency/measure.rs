@@ -160,17 +160,34 @@ fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     }
 }
 
-/// 子孫を含めて空になるまで待つ（空でなければ `cgroup.kill` で落とす）。空になった（または元から空）なら `true`。
+/// `cgroup.events` の `populated` を読む（子孫 cgroup を含めた在籍の有無）。
+/// `Some(true)` は子孫を含め在籍あり、`Some(false)` は空、`None` は読めない・解釈できない。
+/// cgroup が既に消えている場合は空として `Some(false)` を返す。読み取り失敗を空と扱わない（REPAIR-5）。
+fn read_populated(dir: &Path) -> Option<bool> {
+    match std::fs::read_to_string(dir.join("cgroup.events")) {
+        Ok(s) => s
+            .lines()
+            .find_map(|l| match l.strip_prefix("populated ")?.trim() {
+                "1" => Some(true),
+                "0" => Some(false),
+                _ => None,
+            }),
+        Err(_) if !dir.exists() => Some(false),
+        Err(_) => None,
+    }
+}
+
+/// 子孫 cgroup を含めて空になるまで待つ（空でなければ `cgroup.kill` で落とす）。空になった（または元から空）なら `true`。
+/// 判定は `cgroup.events` の `populated`（子孫を含む）で行う。supervisor・コンテナは子 cgroup に移るため、
+/// 直下の `cgroup.procs` だけでは残存を見落とす。読み取り失敗は後始末失敗として `false`。
 fn kill_and_drain(dir: &Path) -> bool {
-    let procs = dir.join("cgroup.procs");
-    let populated = std::fs::read_to_string(&procs).is_ok_and(|s| !s.trim().is_empty());
-    if !populated {
-        return true;
+    match read_populated(dir) {
+        Some(false) => return true,
+        None => return false,
+        Some(true) => {}
     }
     let _ = std::fs::write(dir.join("cgroup.kill"), "1");
-    wait_until(CLEANUP_TIMEOUT, || {
-        std::fs::read_to_string(&procs).is_ok_and(|s| s.trim().is_empty())
-    })
+    wait_until(CLEANUP_TIMEOUT, || read_populated(dir) == Some(false))
 }
 
 /// コンテナの cgroup（ベンチが作った `fc-<id>@<instance>` だけ）を消す。消えた（または元から無い）なら `true`。

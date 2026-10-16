@@ -15,6 +15,13 @@ pub fn effective_uid() -> Option<u32> {
     line.split_whitespace().nth(1)?.parse().ok()
 }
 
+/// `/proc/self/status` の実効 GID。読めない場合は `None`（呼び出し側は fail-closed にする）。
+pub fn effective_gid() -> Option<u32> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find_map(|l| l.strip_prefix("Gid:"))?;
+    line.split_whitespace().nth(1)?.parse().ok()
+}
+
 fn read_trimmed(path: &str) -> String {
     match std::fs::read_to_string(path) {
         Ok(s) => s.trim().chars().take(16).collect(),

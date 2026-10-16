@@ -51,7 +51,7 @@ core の `delete` は使わない。ベンチのプロセスは試行ごとの s
 
 1. supervisor の終了を 30 秒まで待つ（成功は終了コード 0、ERR は報告の終了コードと一致）。超えたら kill し、回収を 10 秒まで待つ
 2. 状態を確かめる（成功は `Stopped`、ERR は `Created` かつ pid なし）
-3. 記録の cgroup（`fc-<id>@<instance>`。`CgroupName` で作る）が消えているか。残っていれば空の cgroup を `rmdir` し、空でなければ `cgroup.kill` の後に消す
+3. 記録の cgroup（`fc-<id>@<instance>`。`CgroupName` で作る）が消えているか。残っていれば空の cgroup を `rmdir` し、空でなければ `cgroup.kill` の後に消す。スコープ・cgroup の空判定は子孫を含む `cgroup.events` の `populated` で行い、読み取り失敗は後始末失敗とする
 4. `/proc` を走査し、nonce を持つプローブが 0 件になるまで 10 秒まで待つ
 5. すべて満たしたときだけ状態ルートを消す。満たせなければ ID を `leftover_ids` に積み、以後の試行を止め、作業ディレクトリは調査用に残す（相対名だけを stderr へ出す）
 
@@ -64,7 +64,7 @@ core の `delete` は使わない。ベンチのプロセスは試行ごとの s
 ## セキュリティ上の扱い
 
 - 外部コマンドは argv 配列で渡し、シェルを使わない。`--supervisor-bin`・`--systemd-run` は絶対パスに限り、`PATH` から探さない
-- 起動前に、通常ファイル（symlink 不可）・実行ビットあり・group / other 書き込み不可・所有者が実効 UID か root・全祖先ディレクトリ（字面上と symlink 解決後の両方）が実効 UID か root 所有で group / other 書き込み不可（sticky 付きは可）であることを検証する。検証から exec までの TOCTOU は残る（開発者のローカル target 配下のバイナリを対象とする計測道具のため許容）
+- 起動前に、通常ファイル（symlink 不可）・実行ビットあり・group / other 書き込み不可・所有者が実効 UID か root・全祖先ディレクトリ（字面上と symlink 解決後の両方）が実効 UID か root 所有で other 書き込み不可・group 書き込み不可（実行ユーザー自身の実効 GID の group は可。cargo が umask 002 で作る `target/` を通すため。sticky 付きは可）であることを検証する。検証から exec までの TOCTOU は残る（開発者のローカル target 配下のバイナリを対象とする計測道具のため許容）
 - 作業ディレクトリ・状態ルートは 0700 で排他作成する。rootful（euid 0）は拒否する（SEC-5）
 - 出力に絶対パス・ホスト名・ユーザー名・OS のエラー文字列を載せない。新規の外部依存・`unsafe` は無い
 

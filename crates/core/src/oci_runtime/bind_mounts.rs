@@ -63,8 +63,8 @@
 //! 実体照合の残余（REPAIR-3）は bundle・状態ルートと、ホスト側の別の bind mount による別名で、字句検証（`check_against_host_paths`）
 //! だけが効く。`run_pre_pivot` への組み込みは済み（#1914）、`start` と本番 launcher への結線は済み（#1915。検証は `start`、tmpfs との重なりは launcher、
 //! 監査は `ProcessLauncher::rejection_audit_sink` 経由）。`ro` と Landlock の `WriteRestrictionShadowed` の衝突解消は #1917
-//! （それまで `ro` の bind は fork 前に拒否される）。状態ルートとの重なりは `StateStore` からルートを取れないため
-//! `start` は検査しない（残余。REPAIR-3）。`MountDestination::resolve_in` の文字列結合で直接 mount してはならない。
+//! （それまで `ro` の bind は fork 前に拒否される）。状態ルートとの重なりは `start` が字句比較・`canonicalize` 比較・
+//! mountinfo によるファイルシステム内の実体照合（別の bind mount による別名）で検査する。残余は検査と適用の間の差し替え（REPAIR-3）。`MountDestination::resolve_in` の文字列結合で直接 mount してはならない。
 
 use std::fmt;
 use std::path::Path;
@@ -421,6 +421,24 @@ impl BindMountSet {
     pub fn check_against_protected_trees(&self, protected: &[&str]) -> Result<(), BindMountError> {
         for b in &self.mounts {
             if protected.iter().any(|f| overlaps(f, &b.source)) {
+                return Err(BindMountError::at(
+                    b.index,
+                    BindMountErrorKind::ForbiddenSource,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 各元を `hits` に渡し、`true`（保護対象に到達する）なら `ForbiddenSource` で拒否する。
+    ///
+    /// 到達の判定（mountinfo によるファイルシステム内の実体照合など）は呼び出し側が担う（SEC-1・#1915）。
+    pub fn check_sources_with<F>(&self, hits: F) -> Result<(), BindMountError>
+    where
+        F: Fn(&str) -> bool,
+    {
+        for b in &self.mounts {
+            if hits(&b.source) {
                 return Err(BindMountError::at(
                     b.index,
                     BindMountErrorKind::ForbiddenSource,

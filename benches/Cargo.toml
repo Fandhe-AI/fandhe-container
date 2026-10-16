@@ -36,6 +36,11 @@ harness = false
 fandhe-container-plugin = { path = "../crates/plugin" }
 # `fandhe-container-io` も workspace 内の path 依存（外部クレートの追加ではない。TASK-189）。
 fandhe-container-io = { path = "../crates/io" }
+# core と supervisor も workspace 内の path 依存（外部クレートの追加ではない。TASK-190・#1900）。依存の向きは
+# benches -> supervisor -> core の一方向。supervisor の `exec-test-support` feature はここでは有効にしない
+# （bench プロファイルは `debug_assertions` が無効で、有効にすると compile_error! で止まる）。
+fandhe-container-core = { path = "../crates/core" }
+fandhe-container-supervisor = { path = "../crates/supervisor" }
 
 # [[bench]] plugin_boundary_list_images は TASK-113.2（#271・PLUG-5）の代表操作 B（イメージ一覧）計測ハーネス。
 # 代表操作 A（plugin_boundary。TASK-113.1）とは別ターゲットで、Δp50（TASK-113.3）も出力する。ゲート（bench-check）へは未接続（同上）。
@@ -54,6 +59,13 @@ harness = false
 # サーバー側 API の直接呼び出し（ワイヤー経路ではない）。metrics.json・BENCH_NAMES へ登録済み（#1899）。baseline 未登録のため bench-check の比較対象外（基準値は #230）。
 [[bench]]
 name = "small_files"
+harness = false
+
+# [[bench]] startup_latency は TASK-190（#1900・REPAIR-8・CORE-10）のコンテナ起動レイテンシ p95 ベンチ。
+# core の create から supervisor の bin（本番 launcher）の OK 報告までを測る。実機前提（Linux・非 root・
+# systemd-run --user）で CI では実行しない。metrics.json・BENCH_NAMES・baseline.json へは未登録（登録は #1901）。
+[[bench]]
+name = "startup_latency"
 harness = false
 
 [[bin]]

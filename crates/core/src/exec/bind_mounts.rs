@@ -521,9 +521,16 @@ fn pin_target(
             if kind == BindSourceKind::Directory {
                 // 自分が作った実体であることを証明してから配置する（作成と開き直しの間の差し替えを許さない）。
                 match create_dir_proven(parent, &c_leaf) {
-                    Ok(Some((fd, id))) => {
+                    Ok(Some((fd, id, leftover))) => {
+                        // 配置済みの実体は、ステージング掃除の失敗より先に記録する（失敗しても後始末が回収できる）。
                         state.created_dirs.push(last_index(state));
                         state.created_dir_ids.push((last_index(state), id));
+                        if let Some(detail) = leftover {
+                            return Err(failed(
+                                spec,
+                                &format!("mkdirat(bind mount target) rmdir: {detail}"),
+                            ));
+                        }
                         fd
                     }
                     Ok(None) => reopen_created(spec, kind, parent, &c_leaf, state)?,
@@ -566,9 +573,16 @@ fn open_parents_recording(
             Err(SysError::Os(sys::ENOENT)) => {
                 // 自分が作った実体であることを証明してから配置する（作成と開き直しの間の差し替えを許さない）。
                 match create_dir_proven(dir, &c) {
-                    Ok(Some((fd, id))) => {
+                    Ok(Some((fd, id, leftover))) => {
+                        // 配置済みの実体は、ステージング掃除の失敗より先に記録する（失敗しても後始末が回収できる）。
                         state.created_dirs.push(index);
                         state.created_dir_ids.push((index, id));
+                        if let Some(detail) = leftover {
+                            return Err(failed(
+                                spec,
+                                &format!("mkdirat(bind mount target) rmdir: {detail}"),
+                            ));
+                        }
                         fd
                     }
                     Ok(None) => sys::open_dir_path_nofollow(Some(dir), &c).map_err(|e| {
@@ -1109,7 +1123,10 @@ fn join_detail(detail: String, extra: Option<String>) -> String {
 }
 
 /// `create_dir_proven` の結果（作った fd と `(dev, ino)`、既存なら `None`、失敗は段名と詳細）。
-type CreateProven = Result<Option<(OwnedFd, (u64, u64))>, (&'static str, String)>;
+///
+/// 3 つ目はステージングディレクトリを消せなかったときの詳細。配置は済んでいるため `Ok` で返し、呼び出し側が
+/// 配置した実体を `created_dirs` / `created_dir_ids` へ記録してからエラー扱いにする（記録しないと後始末が回収できない）。
+type CreateProven = Result<Option<(OwnedFd, (u64, u64), Option<String>)>, (&'static str, String)>;
 
 /// `parent` 配下に新しいディレクトリ `name` を作り、自分が作った実体であることを証明した fd と `(dev, ino)` を返す。
 /// 既に `name` がある（競合を含む）ときは `Ok(None)`（何も作らない）。
@@ -1189,10 +1206,7 @@ fn create_dir_proven(parent: BorrowedFd<'_>, name: &CString) -> CreateProven {
         Err(e) => return Err(("verify", join_detail(errno(e), unstage(true)))),
     };
     match sys::rename_noreplace_at(sdir.as_fd(), &inner, parent, name) {
-        Ok(()) => match drop_stage() {
-            None => Ok(Some((fd, id))),
-            Some(x) => Err(("rmdir", x)),
-        },
+        Ok(()) => Ok(Some((fd, id, drop_stage()))),
         // 既に同名がある。作った分は捨てて、既存を使わせる。
         Err(SysError::Os(sys::EEXIST)) => match unstage(true) {
             None => Ok(None),
@@ -2371,9 +2385,10 @@ mod tests {
         let fx = fx();
         let (parent, _) = dir_fd_and_id(&fx.rootfs);
         let name = CString::new("d").expect("cstring");
-        let (fd, id) = create_dir_proven(parent.as_fd(), &name)
+        let (fd, id, leftover) = create_dir_proven(parent.as_fd(), &name)
             .expect("created")
             .expect("some");
+        assert_eq!(leftover, None);
         let meta = std::fs::metadata(fx.rootfs.join("d")).expect("meta");
         assert_eq!(id, (meta.dev(), meta.ino()));
         let st = fstat_fd(fd.as_fd()).expect("fstat");
@@ -2466,6 +2481,45 @@ mod tests {
             .expect_err("must not replace");
         assert!(matches!(err, SysError::Os(sys::EEXIST)), "{err:?}");
         assert_eq!(std::fs::read(fx.rootfs.join("b")).expect("kept"), b"b");
+    }
+
+    /// SEC-1・REPAIR-4: `create_dir_proven` が配置したディレクトリを記録すれば、`roll_back_binds` が回収して残さない
+    /// （ステージング掃除の失敗でも配置済みの実体を記録する契約の回帰）。
+    #[test]
+    fn sec1_placed_dir_recorded_from_create_dir_proven_is_rolled_back() {
+        let fx = fx();
+        let fd = fx.rootfs_fd();
+        let name = CString::new("p").expect("cstring");
+        let (_pfd, id, leftover) = create_dir_proven(fd.as_fd(), &name)
+            .expect("created")
+            .expect("some");
+        assert_eq!(leftover, None);
+        let unused = || SysError::Os(sys::EINVAL);
+        let deps = BindDeps {
+            is_shared: &|_| Ok(false),
+            still_at: &|_, _| true,
+            open_tree: &|_, _| Err(unused()),
+            set_attrs: &|_, _, _| Err(unused()),
+            flags_of: &|_| Err(unused()),
+            attach: &|_, _| Err(unused()),
+            observe: &|_, _, _| Err(ExecError::new(ErrorCode::Internal, STAGE, "unused")),
+            mountinfo: &|| Ok(String::new()),
+            umount: &|_| Ok(()),
+            before_attach: &|| {},
+        };
+        let ctx = Ctx {
+            root: fd.as_fd(),
+            host_root: fx.rootfs.clone(),
+            rootfs_ids: Vec::new(),
+            deps: &deps,
+        };
+        let set = one("/p", &fx.src("dir"), &[]);
+        let mut state = Applied::new(&set.mounts()[0]);
+        state.created_dirs = vec![0];
+        state.created_dir_ids = vec![(0, id)];
+        let failures = roll_back_binds(&ctx, &[state]);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert!(!fx.rootfs.join("p").exists());
     }
 
     /// REPAIR-4: 後始末中の開き直しの失敗も `; cleanup failed: ...` として元のエラーへ併記する。

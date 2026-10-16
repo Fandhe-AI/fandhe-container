@@ -54,16 +54,17 @@ chmod +x "$stubs/aarch64-stub-gcc"
 
 make_src() { # 展開元ディレクトリ（$1）へスタブの Makefile を置く
     mkdir -p "$1/$prefix"
-    cat >"$1/$prefix/Makefile" <<'EOF'
+    # recipe 行は先頭 TAB が必須だが、リポジトリは TAB インデントを禁じるため TAB> を TAB に置換して書く
+    sed "s/^TAB>/$(printf '\t')/" >"$1/$prefix/Makefile" <<'EOF'
 # スタブ: allnoconfig は KCONFIG_ALLCONFIG の =y 行を .config へ写す（DROP_OPTION の記号は落とす）。
 allnoconfig:
-	grep '^CONFIG_.*=y$$' "$(KCONFIG_ALLCONFIG)" | grep -v "^CONFIG_$$DROP_OPTION=y$$" > .config || true
-	echo called >> "$(CALL_MARK)"
+TAB>grep '^CONFIG_.*=y$$' "$(KCONFIG_ALLCONFIG)" | grep -v "^CONFIG_$$DROP_OPTION=y$$" > .config || true
+TAB>echo called >> "$(CALL_MARK)"
 olddefconfig:
-	@:
+TAB>@:
 Image:
-	mkdir -p arch/arm64/boot
-	$(CROSS_COMPILE)gcc -o arch/arm64/boot/Image
+TAB>mkdir -p arch/arm64/boot
+TAB>$(CROSS_COMPILE)gcc -o arch/arm64/boot/Image
 EOF
 }
 
@@ -163,6 +164,15 @@ printf 'KEEP-ME' >"$out4/Image"
 run_build "${std_env[@]}" -- --output-dir "$out4" --cross-compile "$cc" --tarball "$good_tar"
 expect_err "output exists" 2 output-exists
 expect_eq "output exists: bytes unchanged" "KEEP-ME" "$(cat "$out4/Image")"
+
+# 4b. 同じ出力先の同時実行は排他ロックで拒否する（ロック保持中は何も作らない）
+out4b="$sandbox/out4b"
+mkdir -p "$out4b.lock"
+run_build "${std_env[@]}" -- --output-dir "$out4b" --cross-compile "$cc" --tarball "$good_tar"
+expect_err "output busy" 2 output-busy
+[ ! -e "$out4b" ] && ok || ng "output busy: output dir was created"
+[ -d "$out4b.lock" ] && ok || ng "output busy: foreign lock was removed"
+rmdir "$out4b.lock"
 
 # 5. 引数の検証（すべて 2）
 args_cases=(

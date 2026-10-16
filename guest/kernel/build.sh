@@ -245,6 +245,8 @@ work_dir=""
 child_pid=""
 wd_pid=""
 out_created=0
+lock_dir=""
+publishing=0
 cleanup() {
     local rc=$?
     if [ -n "$child_pid" ]; then
@@ -255,15 +257,36 @@ cleanup() {
         kill "$wd_pid" 2>/dev/null || true
     fi
     [ -z "$work_dir" ] || rm -rf "$work_dir"
-    if [ "$rc" -ne 0 ] && [ "$out_created" -eq 1 ]; then
-        rm -f "$output_dir/.build-info.tmp" "$output_dir/.Image.tmp" "$output_dir/.config.tmp"
-        rmdir "$output_dir" 2>/dev/null || true
+    # 出力先の排他ロックを持つ間に始めた公開だけを回収する（ロックを持たない側は触らない）。
+    if [ "$rc" -ne 0 ] && [ "$publishing" -eq 1 ]; then
+        rm -f "$output_dir/.build-info.tmp" "$output_dir/.Image.tmp" "$output_dir/.config.tmp" \
+            "$output_dir/build-info.txt" "$output_dir/config" "$output_dir/Image"
+        if [ "$out_created" -eq 1 ]; then
+            rmdir "$output_dir" 2>/dev/null || true
+        fi
     fi
+    [ -z "$lock_dir" ] || rmdir "$lock_dir" 2>/dev/null || true
 }
 trap cleanup EXIT
 trap 'exit 143' INT TERM
 
 work_dir="$(mktemp -d)" || { work_dir=""; err bad-environment "cannot create a temporary directory"; exit 2; }
+
+# 出力先の排他ロック（mkdir は不可分）。同じ出力先への同時実行は後発を拒否し、
+# 「既存の出力を上書きしない」契約を守る。ロック確保後に空であることを再検査する。
+# ロックは <出力先>.lock ディレクトリで、異常終了（KILL 等）で残ったら手で削除する。
+mkdir -p "$(dirname "$output_dir")" 2>/dev/null || { err bad-output "cannot create the parent of the output directory"; exit 2; }
+if mkdir "$output_dir.lock" 2>/dev/null; then
+    lock_dir="$output_dir.lock"
+else
+    err output-busy "another run holds $output_dir.lock (remove it if no run is active)"
+    exit 2
+fi
+if [ -L "$output_dir" ] || { [ -e "$output_dir" ] && [ ! -d "$output_dir" ]; } \
+    || { [ -d "$output_dir" ] && [ -n "$(ls -A "$output_dir" 2>/dev/null)" ]; }; then
+    err output-exists "output directory is not empty; refusing to overwrite"
+    exit 2
+fi
 
 # 子プロセスを上限秒で打ち切る。子は job control（set -m）で独立したプロセスグループにし、
 # 超過時はグループ全体へ TERM → 猶予後 KILL を送って消滅を確認する。超過時は 124 を返す。
@@ -423,23 +446,31 @@ make_step Image "-j$jobs" Image
 image="$src/arch/arm64/boot/Image"
 [ -s "$image" ] || { err build-failed "Image was not produced"; exit 1; }
 
-# --- 出力（一時名へコピーしてから mv で確定する） ---
+# --- 出力（一時名へコピーしてから mv で確定する。失敗は構造化して exit 2） ---
+publishing=1
 if [ ! -d "$output_dir" ]; then
-    mkdir -p "$output_dir" 2>/dev/null || { err bad-output "cannot create the output directory"; exit 2; }
+    mkdir "$output_dir" 2>/dev/null || { err bad-output "cannot create the output directory"; exit 2; }
     out_created=1
 fi
-tc_line="$( ( if [ -n "$cross_compile" ]; then "${cross_compile}gcc" --version; elif [ "$use_llvm" -eq 1 ]; then clang --version; else gcc --version; fi ) 2>/dev/null | head -n 1 || true)"
+tc_cmd=(gcc)
+if [ -n "$cross_compile" ]; then tc_cmd=("${cross_compile}gcc"); elif [ "$use_llvm" -eq 1 ]; then tc_cmd=(clang); fi
+tc_line=""
+if run_limited 30 "${tc_cmd[0]}" --version >"$work_dir/tc-version" 2>/dev/null; then
+    tc_line="$(head -n 1 "$work_dir/tc-version" 2>/dev/null || true)"
+fi
 {
     printf 'kernel_version=%s\n' "$lock_ver"
     printf 'kernel_url=%s\n' "$lock_url"
     printf 'kernel_sha256=%s\n' "$lock_sha"
     printf 'toolchain=%s\n' "${tc_line:-unknown}"
     printf 'host=%s\n' "$host_os $host_arch"
-} >"$output_dir/.build-info.tmp"
-cp "$image" "$output_dir/.Image.tmp"
-cp "$src/.config" "$output_dir/.config.tmp"
-mv "$output_dir/.build-info.tmp" "$output_dir/build-info.txt"
-mv "$output_dir/.config.tmp" "$output_dir/config"
-mv "$output_dir/.Image.tmp" "$output_dir/Image"
+} >"$output_dir/.build-info.tmp" 2>/dev/null \
+    && cp "$image" "$output_dir/.Image.tmp" 2>/dev/null \
+    && cp "$src/.config" "$output_dir/.config.tmp" 2>/dev/null \
+    && mv "$output_dir/.build-info.tmp" "$output_dir/build-info.txt" 2>/dev/null \
+    && mv "$output_dir/.config.tmp" "$output_dir/config" 2>/dev/null \
+    && mv "$output_dir/.Image.tmp" "$output_dir/Image" 2>/dev/null \
+    || { err output-failed "cannot write the build outputs (disk full or permission?)"; exit 2; }
+publishing=0
 out_created=0
 printf '%s\n' "$output_dir/Image"

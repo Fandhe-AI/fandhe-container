@@ -127,6 +127,7 @@ case "$bin_dir" in /*) ;; *) err "invalid-argument" "--bin-dir must be an absolu
 case "$systemd_run" in /*) ;; *) err "invalid-argument" "--systemd-run must be an absolute path"; exit 2 ;; esac
 case "$bin_dir$systemd_run$bundle" in *$'\n'*) err "invalid-argument" "paths must not contain newlines"; exit 2 ;; esac
 [ -d "$bundle" ] || { err "invalid-argument" "--bundle is not a directory"; exit 2; }
+bundle="$(cd -- "$bundle" 2>/dev/null && pwd -P)" || { err "invalid-argument" "--bundle cannot be resolved"; exit 2; }  # cp -a がリンクのまま複製して flock 競合するのを避ける
 
 # 祖先を含むディレクトリが、他のユーザーに中のエントリを差し替えられないこと（concurrent_50_memory.sh の
 # dir_is_safe と同じ規則）。実行ユーザーか root の所有で、group / other の書き込み権がないか sticky ビット付き。

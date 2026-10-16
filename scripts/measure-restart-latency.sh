@@ -683,6 +683,11 @@ do_cleanup() {
       wait "$launcher_pid" 2>/dev/null || true
     fi
   fi
+  # 回収失敗（rc=4）の全経路で作業ディレクトリを残し、手動回収のため場所を通知する（SUP-5）。
+  if [ "$rc" -eq 4 ] && [ -n "$workdir" ] && [ "${keep_state:-0}" -eq 0 ]; then
+    keep_state=1
+    printf 'warning: cleanup incomplete; state kept at %s\n' "$workdir" >&2 || true
+  fi
   if [ -n "$workdir" ] && [ "${keep_state:-0}" -eq 0 ]; then rm -rf -- "$workdir" 2>/dev/null || true; fi
   if [ -n "$state_root" ] && [ -n "$container_id" ] && [ "$rc" -eq 0 ]; then
     # --state-root は操作者の領域。<id>/ は削除しない（残置を通知する）。

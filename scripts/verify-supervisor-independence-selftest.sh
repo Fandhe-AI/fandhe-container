@@ -156,7 +156,7 @@ json_get() {
 # 実行後、この実行が起動した全プロセス（トークンでなく SELFTEST_MARK を継承したもの。孤児を含む）の残存を照合する。
 case_no=0
 run_case() {
-  local mode="$1" mark d p left=0
+  local mode="$1" mark d p left=0 kept
   shift
   case_no=$((case_no + 1))
   mark="selftest-mark-${$}-${case_no}"
@@ -178,6 +178,16 @@ run_case() {
     fi
   done < <(grep -lzxF -- "SELFTEST_MARK=${mark}" /proc/[0-9]*/environ 2>/dev/null || true)
   if [ "$left" -eq 0 ]; then pass "case ${case_no} (${mode}): no leftover processes"; else fail "case ${case_no} (${mode}): ${left} leftover processes"; fi
+  # rc=4 では本体が作業ディレクトリを残して場所を通知する（SUP-5）。通知されたパスを回収して mktemp ツリーを残さない。
+  # 残存プロセスの回収後に消す。$root 配下と mktemp の既定場所（TMPDIR）以外は消さない。
+  kept="$(sed -n 's/.*kept the working directory for inspection: \(\/.*\)$/\1/p' "$ERR" | head -n 1)"
+  if [ -n "$kept" ]; then
+    case "$kept" in
+      "${TMPDIR:-/tmp}"/tmp.* | "${root}"/*)
+        if [ -d "$kept" ]; then rm -rf -- "$kept"; pass "case ${case_no} (${mode}): kept working directory reclaimed"; fi ;;
+      *) fail "case ${case_no} (${mode}): unexpected kept path" ;;
+    esac
+  fi
 }
 
 expect_eq() { # <説明> <期待> <実際>

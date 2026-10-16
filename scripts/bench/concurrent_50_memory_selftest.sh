@@ -434,6 +434,8 @@ expect_eq "ignoreterm-no-orphan-child" 0 "$(orphan_sleep_count)"
 STUB_MODE=ignoreterm FANDHE_CONCURRENT_MEMORY_SELFTEST_NOKILL=1 run_fake --count 2 --trials 1 --timeout 1
 expect_eq "cleanup-failed-exit4" 4 "$rc"
 expect_has "cleanup-failed-stderr" "$errf" "cleanup-failed"
+kept="$(sed -n 's/.*state kept at \(\/[^)]*\)).*/\1/p' "$errf" | head -n 1)"
+if [ -n "$kept" ] && [ -d "$kept" ]; then pass "cleanup-failed-state-kept"; rm -rf -- "$kept"; else fail "cleanup-failed-state-kept"; fi
 # 残存を片付ける（stderr に出た pid のみ）。
 for p in $(grep -o 'pid=[0-9]*' "$errf" | cut -d= -f2); do kill -KILL "$p" 2>/dev/null || true; done
 kill_recorded
@@ -585,6 +587,8 @@ STUB_NO_ENVIRON=1 FANDHE_CONCURRENT_MEMORY_SELFTEST_STALE_START=1 run_fake --cou
 expect_eq "stale-start-exit4" 4 "$rc"
 expect_has "stale-start-stderr" "$errf" "startup-incomplete: trial=1 started=0/2"
 expect_has "stale-start-reported" "$errf" "cleanup-failed: processes still running: pid="
+kept="$(sed -n 's/.*state kept at \(\/[^)]*\)).*/\1/p' "$errf" | head -n 1)"
+if [ -n "$kept" ] && [ -d "$kept" ]; then pass "stale-start-state-kept"; rm -rf -- "$kept"; else fail "stale-start-state-kept"; fi
 expect_eq "stale-start-stdout-empty" 0 "$(wc -c <"$out")"
 expect_eq "stale-start-not-signalled" 2 "$(alive_stub_count)"
 pkill -TERM -f -- "${work}/bin/fandhe-container-supervisor" 2>/dev/null || true

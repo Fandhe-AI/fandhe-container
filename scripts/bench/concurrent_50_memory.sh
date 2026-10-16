@@ -306,6 +306,9 @@ if [ "$mode" = "own" ]; then
     '' | -*) err "invalid-argument" "--bundle is required and must not start with '-'"; exit 2 ;;
   esac
   [ -d "$bundle" ] || { err "invalid-argument" "--bundle is not a directory"; exit 2; }
+  # cp -a はシンボリックリンクをリンクのまま複製し、全コンテナの bundle が同じ実体を指して flock 競合する。
+  # 実体の絶対パスへ解決してから複製する。
+  bundle="$(cd -- "$bundle" 2>/dev/null && pwd -P)" || { err "invalid-argument" "--bundle cannot be resolved"; exit 2; }
 fi
 
 if [ "$mode" = "docker" ]; then
@@ -490,6 +493,7 @@ known=()
 # 子孫を 1 つも記録できないまま launcher が消滅した場合に 1 にする（追跡不能。後始末の成功とは判定せず、
 # 一時ディレクトリも削除しない）。
 untracked=0
+keep_tmpdir=0 # ln_stop が 4（回収失敗）を返したら 1。手動回収のため作業ディレクトリを残す（SUP-5）
 untracked_cand=" " # untracked の候補のスロット番号（空白区切り。ln_stop の中で、そのスロットの所有トークンによる追跡が無かったときだけ untracked へ確定する）
 owned_seen=" "     # 所有トークンを観測できたスロット番号（空白区切り。別スロットのトークンは不在証明に使わない）
 # 起動した子プロセス（収集プロセス・launcher）を配列へ登録し終えるまでの間は 1。この間に受けた
@@ -969,12 +973,14 @@ ln_stop() {
     if [ "$untracked" -eq 1 ]; then
       err "cleanup-failed" "processes still running: ${residual[*]}; a launcher exited before any descendant was recorded (state kept at ${tmpdir:-<none>})"
     else
-      err "cleanup-failed" "processes still running: ${residual[*]}"
+      err "cleanup-failed" "processes still running: ${residual[*]} (state kept at ${tmpdir:-<none>})"
     fi
+    keep_tmpdir=1
     return 4
   fi
   if [ "$untracked" -eq 1 ]; then
     err "cleanup-failed" "a launcher exited before any descendant was recorded; container-side processes cannot be tracked (state kept at ${tmpdir:-<none>})"
+    keep_tmpdir=1
     return 4
   fi
   return 0
@@ -995,7 +1001,7 @@ on_exit() {
   if declare -F dk_stop >/dev/null 2>&1; then dk_stop || rc=4; fi
   if [ -n "$out_tmp" ]; then rm -f "$out_tmp"; fi
   # 追跡不能のときは残存確認に必要な状態（ログ・状態ルート）を残し、手動回収へ進めるようにする。
-  if [ -n "$tmpdir" ] && [ "$untracked" -eq 0 ]; then rm -rf "$tmpdir"; fi
+  if [ -n "$tmpdir" ] && [ "$untracked" -eq 0 ] && [ "$keep_tmpdir" -eq 0 ]; then rm -rf "$tmpdir"; fi
   exit "$rc"
 }
 trap on_exit EXIT

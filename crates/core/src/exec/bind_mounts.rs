@@ -47,7 +47,11 @@
 //!    `bind_source_symlink`、種別がディレクトリ・通常ファイル以外は `bind_source_unsupported_type`、存在しなければ
 //!    `NOT_FOUND`（違反ではない。何も作らない）。固定した fd から複製し、パス文字列で再解決しない
 //! 2. **rootfs との同一性**: rootfs の `(st_dev, st_ino)` とその祖先（`..` を `O_NOFOLLOW` で辿る。4096 段が上限）に元が
-//!    含まれれば `bind_source_contains_rootfs` で拒否する
+//!    含まれれば `bind_source_contains_rootfs` で拒否する。rootfs の祖先には bundle が入るため、bundle の bind 別名（同じ inode）も
+//!    ここで拒否する。bundle・rootfs の配下は受ける（#2063 案 B）。あわせて状態ルートの inode の鎖
+//!    （start の段が fd で固定し `BindMountSet` の `ProtectedFsRoot` で渡す。自身から `/` まで）に元が含まれるか、元の祖先に状態ルートが
+//!    あれば `bind_source_reaches_state_root` で拒否する（同一・祖先・子孫。`judge_source_inodes`。SEC-1・SEC-4・#2066）。
+//!    固定していない集合は `FAILED_PRECONDITION`（fail-closed）
 //! 3. **先の固定**: [`PreparedRootfs`] の fd から 1 要素ずつ辿る（symlink・非ディレクトリは `path_symlink_or_not_directory`）。
 //!    無い要素は 0755 で作り、元が通常ファイルなら末尾は空の通常ファイル（0644。umask の影響を受ける）にする。既存の
 //!    マウント先の種別が元と違えば `bind_target_kind_mismatch`
@@ -116,8 +120,12 @@
 //!   別名を持つ場合は、同じ FS 上のディレクトリ元も拒否する）。残余は検査から `open_tree` までの間の差し替え（固定した fd への複製のため元の差し替えは効かない）。
 //!   実機前提の結合試験の段ごとの観測（#1916。通しの確認は `tests/production_launcher.rs` のシナリオ D〔#1915〕）。
 //!   `ro` と Landlock の衝突解消（#1917）
-//! - bundle・状態ルートの実体照合（#1911 の字句検証だけ）と、ホスト側の別の bind mount による別名の検出。全要素で symlink を拒否するため、
-//!   字句パスと実パスは別名を除いて一致する
+//! - 状態ルートの inode の照合（#2066）は start の段で鎖を固定した実体に対するもので、start の後に状態ルートが祖先ごと改名されても
+//!   効く（inode は変わらない）。残余は、状態ルートを**別の親ディレクトリへ付け替えた**場合で、新しい親は固定した鎖に入っていないため
+//!   祖先の判定にかからない（同一と子孫の判定は効く）。`rbind` で公開される子マウントと状態ルート配下の子マウントは mountinfo の
+//!   照合（start 時点の FS 内パス）だけで見ており、start の後の改名には追随しない。別の superblock を通して同じデータを見せるもの
+//!   （overlayfs の lowerdir・FUSE 系）はどちらの層でも検出しない。bundle の実体は rootfs の鎖と mountinfo の `contained` で照合済み
+//!   （ホスト側の bind による別名を含む）。実機での別名の確認は #1916
 //! - procfs・sysfs など特殊な FS を元にすることは方針（#1910）上拒否していない
 //!
 //! # 単体テストの安全策
@@ -358,6 +366,8 @@ struct Ctx<'a> {
     host_root: PathBuf,
     /// rootfs とその祖先の `(st_dev, st_ino)`。
     rootfs_ids: Vec<(u64, u64)>,
+    /// start の段が固定した状態ルートの inode の鎖（自身が先頭、`/` が末尾。SEC-1・#2066）。
+    state_chains: Vec<&'a [(u64, u64)]>,
     /// start の段が検査した保護対象（状態ストアのルート）の実体。空なら照合しない。
     protected: &'a [ProtectedFsRoot],
     deps: &'a BindDeps<'a>,
@@ -372,11 +382,27 @@ fn mount_binds_at(
     if set.is_empty() {
         return Ok(BindMountReport { mounts: Vec::new() });
     }
+    let protected = set.protected_roots();
+    // 状態ルートの実体を固定できていない集合は、inode で照合できないため拒否する（fail-closed。SEC-1・#2066）。
+    // 保護対象が無い集合（start を通らない単体テストの経路）は照合しない。
+    let state_chains: Vec<&[(u64, u64)]> = protected
+        .iter()
+        .filter(|p| !p.is_containment_only() && !p.inode_chain().is_empty())
+        .map(|p| p.inode_chain())
+        .collect();
+    if !protected.is_empty() && state_chains.is_empty() {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            STAGE,
+            "the state store root identity is missing, so bind mount sources cannot be checked",
+        ));
+    }
     let ctx = Ctx {
         root,
         host_root: root_display(root),
         rootfs_ids: rootfs_identity_chain(root)?,
-        protected: set.protected_roots(),
+        state_chains,
+        protected,
         deps,
     };
     // 件数は `BindMountSet`（`CONFIG_MAX_MOUNTS` 以下）で上限が決まっている。
@@ -419,9 +445,12 @@ fn apply_one(
     state: &mut Applied<'_>,
 ) -> Result<BindSourceKind, ExecError> {
     let deps = ctx.deps;
-    let src = pin_source(spec)?;
-    if ctx.rootfs_ids.contains(&src.dev_ino()) {
-        return Err(violation(spec, ViolationReason::BindSourceContainsRootfs));
+    let PinnedSource { fd: src, dir_ids } = pin_source(spec)?;
+    // rootfs（と bundle・その祖先）・状態ルートとの重なりを (st_dev, st_ino) で照合する。mountinfo の照合とは独立の層。
+    if let Some(reason) =
+        judge_source_inodes(src.dev_ino(), &dir_ids, &ctx.rootfs_ids, &ctx.state_chains)
+    {
+        return Err(violation(spec, reason));
     }
     check_source_not_protected(ctx, spec, &src)?;
     let kind = src.kind();
@@ -585,8 +614,36 @@ fn mountinfo_failed(msg: &str) -> ExecError {
     ExecError::new(ErrorCode::FailedPrecondition, STAGE, msg)
 }
 
+/// 固定した元と、辿った途中のディレクトリ（`/` から葉の親まで）の `(st_dev, st_ino)`。
+struct PinnedSource {
+    fd: VerifiedBindSourceFd,
+    /// 元の祖先ディレクトリの実体。元が状態ルートの bind 別名の配下にあれば、別名の mount root（状態ルートと同じ inode）が入る。
+    dir_ids: Vec<(u64, u64)>,
+}
+
+/// 元の `(st_dev, st_ino)` を rootfs・状態ルートの実体と照合する純関数（SEC-1・SEC-4・#2066）。単体テストは (dev, ino) を
+/// 差し替えてここを直接試験する。違反理由にホスト側のパスは含まれない。
+///
+/// - 元が rootfs とその祖先（bundle を含む）と同一 → `BindSourceContainsRootfs`。bundle・rootfs の配下は受ける（#2063 案 B）
+/// - 元が状態ルートまたはその祖先と同一、または元の祖先に状態ルートがある（元が配下）→ `BindSourceReachesStateRoot`
+fn judge_source_inodes(
+    src: (u64, u64),
+    src_dirs: &[(u64, u64)],
+    rootfs_ids: &[(u64, u64)],
+    state_chains: &[&[(u64, u64)]],
+) -> Option<ViolationReason> {
+    if rootfs_ids.contains(&src) {
+        return Some(ViolationReason::BindSourceContainsRootfs);
+    }
+    let reaches = state_chains.iter().any(|chain| {
+        chain.contains(&src) || chain.first().is_some_and(|first| src_dirs.contains(first))
+    });
+    reaches.then_some(ViolationReason::BindSourceReachesStateRoot)
+}
+
 /// 元をルートから 1 要素ずつ `O_NOFOLLOW` で固定し、種別と読み取り権限を確かめる（モジュール doc の手順 1）。
-fn pin_source(spec: &BindMountSpec) -> Result<VerifiedBindSourceFd, ExecError> {
+/// 辿った途中のディレクトリの実体も記録する（`judge_source_inodes` の子孫判定に使う）。
+fn pin_source(spec: &BindMountSpec) -> Result<PinnedSource, ExecError> {
     let names: Vec<&str> = spec.source().split('/').filter(|e| !e.is_empty()).collect();
     let Some((leaf, parents)) = names.split_last() else {
         return Err(failed(spec, "bind mount source is empty"));
@@ -594,12 +651,21 @@ fn pin_source(spec: &BindMountSpec) -> Result<VerifiedBindSourceFd, ExecError> {
     let c_name = |n: &str| {
         CString::new(n.as_bytes()).map_err(|_| failed(spec, "bind mount source contains NUL"))
     };
+    let dir_id = |fd: &OwnedFd| {
+        fstat_fd(fd.as_fd())
+            .map(|st| (st.dev, st.ino))
+            .map_err(|e| mount_api_error(spec, e, "fstat(bind mount source parent)"))
+    };
     let mut cur = sys::open_dir_path_nofollow(None, c"/")
         .map_err(|e| source_open_error(spec, e, "openat(/)"))?;
+    // 長さは字句検証済みのパス長（`CONFIG_MAX_PATH_BYTES`）の要素数で頭打ち。
+    let mut dir_ids = Vec::with_capacity(parents.len() + 1);
+    dir_ids.push(dir_id(&cur)?);
     for name in parents {
         let c = c_name(name)?;
         cur = sys::open_dir_path_nofollow(Some(cur.as_fd()), &c)
             .map_err(|e| source_open_error(spec, e, "openat(bind mount source)"))?;
+        dir_ids.push(dir_id(&cur)?);
     }
     let c = c_name(leaf)?;
     let fd = sys::open_path_nofollow(cur.as_fd(), &c)
@@ -621,7 +687,10 @@ fn pin_source(spec: &BindMountSpec) -> Result<VerifiedBindSourceFd, ExecError> {
         }
         Err(e) => return Err(mount_api_error(spec, e, "open(bind mount source)")),
     }
-    Ok(verified)
+    Ok(PinnedSource {
+        fd: verified,
+        dir_ids,
+    })
 }
 
 /// `st_mode` の種別ビットとシンボリックリンクの値（`sys/stat.h`）。
@@ -1545,6 +1614,7 @@ mod tests {
     use crate::audit_log::mount::tests::VecSink;
     use crate::audit_log::{AuditDelivery, AuditLayer};
     use crate::exec::{ViolationKind, audit_mount_violation};
+    use crate::oci_runtime::mountinfo_identity::dir_identity_chain;
     use crate::oci_runtime::parse_config_bytes;
     use crate::test_support::TestTempDir;
     use serde_json::{Value, json};
@@ -1596,6 +1666,21 @@ mod tests {
         let cfg = json!({"ociVersion": "1.2.0", "root": {"path": "rootfs"}, "mounts": mounts});
         let cfg = parse_config_bytes(cfg.to_string().as_bytes()).expect("valid config");
         BindMountSet::from_mounts(cfg.mounts()).expect("valid bind set")
+    }
+
+    /// 状態ルートの inode の鎖を持つ保護対象が無い集合は適用の段が fail-closed で拒否する（#2066）。mountinfo の層だけを
+    /// 試験する既存のテストのため、元と無関係な状態ルート（`/proc`。FS 内パスと dev も無関係）を 1 件足す。
+    fn pinned(mut roots: Vec<ProtectedFsRoot>) -> Vec<ProtectedFsRoot> {
+        if !roots
+            .iter()
+            .any(|r| !r.is_containment_only() && !r.inode_chain().is_empty())
+        {
+            roots.push(
+                ProtectedFsRoot::new("9:9".to_owned(), "/unrelated-state".to_owned(), false)
+                    .with_inode_chain(dir_identity_chain("/proc").expect("chain of /proc")),
+            );
+        }
+        roots
     }
 
     fn m(dest: &str, src: &str, opts: &[&str]) -> Value {
@@ -1744,8 +1829,9 @@ mod tests {
         let real = std::fs::canonicalize(fx.src("dir")).expect("canon");
         let real = real.to_str().expect("utf8").to_owned();
         // 状態ルートの実体 = 元と同じ FS 内パス（差し替えで元が状態ルートの別名になった状況）。
-        let set = one("/mnt/d", &fx.src("dir"), &[])
-            .with_protected_roots(vec![ProtectedFsRoot::new("0:1".to_owned(), real, false)]);
+        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(pinned(vec![
+            ProtectedFsRoot::new("0:1".to_owned(), real, false),
+        ]));
         let knobs = Knobs {
             mountinfo: Some("1 0 0:1 / / rw - tmpfs none rw\n".to_owned()),
             ..Knobs::default()
@@ -1766,8 +1852,9 @@ mod tests {
         let fx = fx();
         let real = std::fs::canonicalize(fx.src("dir")).expect("canon");
         let state = format!("{}/state", real.to_str().expect("utf8"));
-        let set = one("/mnt/d", &fx.src("dir"), &[])
-            .with_protected_roots(vec![ProtectedFsRoot::new("0:1".to_owned(), state, false)]);
+        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(pinned(vec![
+            ProtectedFsRoot::new("0:1".to_owned(), state, false),
+        ]));
         let knobs = Knobs {
             mountinfo: Some("1 0 0:1 / / rw - tmpfs none rw\n".to_owned()),
             ..Knobs::default()
@@ -1778,6 +1865,136 @@ mod tests {
             reason_of(&err),
             Some(ViolationReason::BindSourceReachesStateRoot)
         );
+    }
+
+    /// SEC-1・SEC-4（#2066）: (dev, ino) を差し替える継ぎ目。字句が別でも同じ実体の元（bind の別名）、状態ルートの祖先、
+    /// 状態ルートの別名の配下は `BindSourceReachesStateRoot`、rootfs の鎖（bundle とその祖先）の別名は
+    /// `BindSourceContainsRootfs`。bundle・rootfs の配下と無関係な元は受ける（#2063 案 B）。
+    #[test]
+    fn sec1_judge_source_inodes_detects_aliases_by_identity() {
+        let state: &[(u64, u64)] = &[(7, 300), (7, 200), (7, 2)];
+        let chains = [state];
+        // rootfs の鎖: rootfs・bundle・`/`。
+        let rootfs = [(7, 400), (7, 390), (7, 2)];
+        let judge = |src, dirs: &[(u64, u64)]| judge_source_inodes(src, dirs, &rootfs, &chains);
+        // 状態ルートの別名（同じ dev/ino）。
+        assert_eq!(
+            judge((7, 300), &[(7, 2)]),
+            Some(ViolationReason::BindSourceReachesStateRoot)
+        );
+        // 状態ルートの祖先（鎖の 2 番目）。
+        assert_eq!(
+            judge((7, 200), &[(7, 2)]),
+            Some(ViolationReason::BindSourceReachesStateRoot)
+        );
+        // 状態ルートの別名の配下（元の祖先に状態ルートがある）。
+        assert_eq!(
+            judge((7, 301), &[(7, 2), (7, 300)]),
+            Some(ViolationReason::BindSourceReachesStateRoot)
+        );
+        // bundle の別名・rootfs の別名。
+        assert_eq!(
+            judge((7, 390), &[(7, 2)]),
+            Some(ViolationReason::BindSourceContainsRootfs)
+        );
+        assert_eq!(
+            judge((7, 400), &[(7, 2)]),
+            Some(ViolationReason::BindSourceContainsRootfs)
+        );
+        // bundle の配下（元の祖先に bundle がある）は受ける。
+        assert_eq!(judge((7, 500), &[(7, 2), (7, 390)]), None);
+        // 無関係な元。dev が違えば inode が同じでも別の実体。
+        assert_eq!(judge((7, 600), &[(7, 2), (7, 599)]), None);
+        assert_eq!(judge((8, 300), &[(8, 2)]), None);
+    }
+
+    /// SEC-1・SEC-4（#2066）: 実ファイルで、状態ルートの同一・祖先・配下（ディレクトリ・通常ファイル）を inode の層が拒否する。
+    /// 保護対象の FS 内パス・dev は無関係な値にして、mountinfo の層では拒否されない条件にする。兄弟は受ける。
+    #[test]
+    fn sec1_state_root_identity_rejects_same_ancestor_and_descendant_at_apply() {
+        let fx = fx();
+        let state = fx.src.join("state");
+        std::fs::create_dir_all(state.join("sub")).expect("state/sub");
+        std::fs::write(state.join("file"), b"s").expect("state/file");
+        std::fs::create_dir(fx.src.join("sibling")).expect("sibling");
+        let chain = dir_identity_chain(state.to_str().expect("utf8")).expect("chain");
+        let protected = || {
+            vec![
+                ProtectedFsRoot::new("9:9".to_owned(), "/registered/state".to_owned(), false)
+                    .with_inode_chain(chain.clone()),
+            ]
+        };
+        let reject = Knobs {
+            mountinfo: Some("1 0 0:1 / / rw - tmpfs none rw\n".to_owned()),
+            ..Knobs::default()
+        };
+        for (what, src) in [
+            ("same", fx.src("state")),
+            ("ancestor", fx.src.to_str().expect("utf8").to_owned()),
+            ("descendant dir", fx.src("state/sub")),
+            ("descendant file", fx.src("state/file")),
+        ] {
+            let set = one("/mnt/d", &src, &[]).with_protected_roots(protected());
+            let (r, _log) = run(&fx, &set, &reject);
+            assert_eq!(
+                reason_of(&r.expect_err(what)),
+                Some(ViolationReason::BindSourceReachesStateRoot),
+                "{what}"
+            );
+        }
+        let ok = Knobs {
+            mountinfo: Some(format!(
+                "1 0 0:1 / / rw - tmpfs none rw\n{}",
+                ideal_mountinfo(200, false, false)
+            )),
+            ..Knobs::default()
+        };
+        let set = one("/mnt/d", &fx.src("sibling"), &[]).with_protected_roots(protected());
+        let (r, _log) = run(&fx, &set, &ok);
+        r.expect("a sibling of the state root is applied");
+    }
+
+    /// SEC-1（#2066）: start の後に状態ルートが改名されても、固定した inode の鎖で拒否する（mountinfo の保存パスは古くなる）。
+    #[test]
+    fn sec1_renamed_state_root_is_still_rejected_at_apply() {
+        let fx = fx();
+        let state = fx.src.join("state");
+        std::fs::create_dir_all(state.join("sub")).expect("state/sub");
+        let chain = dir_identity_chain(state.to_str().expect("utf8")).expect("chain");
+        std::fs::rename(&state, fx.src.join("moved")).expect("rename");
+        let reject = Knobs {
+            mountinfo: Some("1 0 0:1 / / rw - tmpfs none rw\n".to_owned()),
+            ..Knobs::default()
+        };
+        for src in [fx.src("moved"), fx.src("moved/sub")] {
+            let set = one("/mnt/d", &src, &[]).with_protected_roots(vec![
+                ProtectedFsRoot::new("9:9".to_owned(), "/registered/state".to_owned(), false)
+                    .with_inode_chain(chain.clone()),
+            ]);
+            let (r, _log) = run(&fx, &set, &reject);
+            assert_eq!(
+                reason_of(&r.expect_err("renamed state root")),
+                Some(ViolationReason::BindSourceReachesStateRoot)
+            );
+        }
+    }
+
+    /// SEC-1（#2066）: 保護対象があるのに inode の鎖を持つ状態ルートが無い集合は、照合できないため `FAILED_PRECONDITION`。
+    #[test]
+    fn sec1_apply_fails_closed_without_state_root_identity() {
+        let fx = fx();
+        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(vec![
+            ProtectedFsRoot::new("9:9".to_owned(), "/registered/state".to_owned(), false),
+            ProtectedFsRoot::contained("0:1".to_owned(), "/srv/bundle".to_owned()),
+        ]);
+        let (r, log) = run(&fx, &set, &Knobs::default());
+        let err = r.expect_err("must fail closed");
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message,
+            "the state store root identity is missing, so bind mount sources cannot be checked"
+        );
+        assert!(log.is_empty());
     }
 
     /// SEC-1（#1915）: rootfs・bundle の実体（`ProtectedFsRoot::contained`）は、元がそれと同一・祖先のときだけ拒否する。
@@ -1801,24 +2018,24 @@ mod tests {
             ..Knobs::default()
         };
         // 元が保護対象（bundle）の祖先 → 拒否。
-        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(vec![
+        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(pinned(vec![
             ProtectedFsRoot::contained("0:1".to_owned(), format!("{real}/bundle")),
-        ]);
+        ]));
         let (r, _log) = run(&fx, &set, &knobs_reject);
         assert_eq!(
             reason_of(&r.expect_err("ancestor of bundle")),
             Some(ViolationReason::BindSourceReachesStateRoot)
         );
         // 保護対象の方が祖先（元はその配下）→ 許す。
-        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(vec![
+        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(pinned(vec![
             ProtectedFsRoot::contained("0:1".to_owned(), "/".to_owned()),
-        ]);
+        ]));
         let (r, _log) = run(&fx, &set, &knobs_ok);
         r.expect("a source under the protected path is applied");
         // 同じ FS 上のリンク数 2 の通常ファイルは、rootfs・bundle の保護では拒否しない。
-        let set = one("/mnt/f", &fx.src("alias"), &[]).with_protected_roots(vec![
+        let set = one("/mnt/f", &fx.src("alias"), &[]).with_protected_roots(pinned(vec![
             ProtectedFsRoot::contained("0:1".to_owned(), "/srv/bundle".to_owned()),
-        ]);
+        ]));
         let (r, _log) = run(&fx, &set, &knobs_ok);
         r.expect("hard-linked file is not a state file");
     }
@@ -1827,12 +2044,9 @@ mod tests {
     #[test]
     fn sec1_pinned_unrelated_source_passes_protected_check() {
         let fx = fx();
-        let set =
-            one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(vec![ProtectedFsRoot::new(
-                "0:9".to_owned(),
-                "/srv/state".to_owned(),
-                false,
-            )]);
+        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(pinned(vec![
+            ProtectedFsRoot::new("0:9".to_owned(), "/srv/state".to_owned(), false),
+        ]));
         let knobs = Knobs {
             mountinfo: Some(format!(
                 "1 0 0:1 / / rw - tmpfs none rw\n{}",
@@ -1864,7 +2078,8 @@ mod tests {
             )]
         };
         // 同じ FS（0:1）の状態ルートがあり、リンク数 2 の通常ファイルを元にする → 拒否。
-        let set = one("/mnt/f", &fx.src("alias"), &[]).with_protected_roots(protected("0:1"));
+        let set =
+            one("/mnt/f", &fx.src("alias"), &[]).with_protected_roots(pinned(protected("0:1")));
         let (r, log) = run(&fx, &set, &knobs);
         let err = r.expect_err("must be rejected");
         assert_eq!(
@@ -1873,7 +2088,8 @@ mod tests {
         );
         assert_eq!(log, ["mountinfo"]);
         // 状態ルートが別 FS（0:9）なら、同じファイルでもハードリンクで届かないため拒否しない。
-        let set = one("/mnt/f", &fx.src("alias"), &[]).with_protected_roots(protected("0:9"));
+        let set =
+            one("/mnt/f", &fx.src("alias"), &[]).with_protected_roots(pinned(protected("0:9")));
         let knobs = Knobs {
             mountinfo: Some(format!("{info}{}", ideal_mountinfo(200, false, false))),
             ..Knobs::default()
@@ -1882,7 +2098,8 @@ mod tests {
         r.expect("different filesystem is applied");
         // リンク数 1 の通常ファイルは拒否しない。
         std::fs::remove_file(fx.src.join("alias")).expect("unlink");
-        let set = one("/mnt/f", &fx.src("file"), &[]).with_protected_roots(protected("0:1"));
+        let set =
+            one("/mnt/f", &fx.src("file"), &[]).with_protected_roots(pinned(protected("0:1")));
         let knobs = Knobs {
             mountinfo: Some(format!("{info}{}", ideal_mountinfo(200, false, false))),
             ..Knobs::default()
@@ -1907,7 +2124,7 @@ mod tests {
                 linked,
             )]
         };
-        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(protected(true));
+        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(pinned(protected(true)));
         let (r, log) = run(&fx, &set, &knobs);
         let err = r.expect_err("must be rejected");
         assert_eq!(
@@ -1922,7 +2139,7 @@ mod tests {
             )),
             ..Knobs::default()
         };
-        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(protected(false));
+        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(pinned(protected(false)));
         let (r, _log) = run(&fx, &set, &knobs);
         r.expect("no hard linked state files is applied");
     }
@@ -1943,7 +2160,8 @@ mod tests {
                 false,
             )]
         };
-        let set = one("/mnt/d", &fx.src("dir"), &["rbind"]).with_protected_roots(protected());
+        let set =
+            one("/mnt/d", &fx.src("dir"), &["rbind"]).with_protected_roots(pinned(protected()));
         let knobs = Knobs {
             mountinfo: Some(info.clone()),
             ..Knobs::default()
@@ -1955,7 +2173,7 @@ mod tests {
             Some(ViolationReason::BindSourceReachesStateRoot)
         );
         // 非再帰 bind は配下のマウントを公開しないため、状態ルートの実体が配下にあっても拒否しない。
-        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(protected());
+        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(pinned(protected()));
         let knobs = Knobs {
             mountinfo: Some(format!("{info}{}", ideal_mountinfo(200, false, false))),
             ..Knobs::default()
@@ -1981,7 +2199,8 @@ mod tests {
                 true,
             )]
         };
-        let set = one("/mnt/d", &fx.src("dir"), &["rbind"]).with_protected_roots(protected());
+        let set =
+            one("/mnt/d", &fx.src("dir"), &["rbind"]).with_protected_roots(pinned(protected()));
         let knobs = Knobs {
             mountinfo: Some(info.clone()),
             ..Knobs::default()
@@ -1992,7 +2211,7 @@ mod tests {
             reason_of(&err),
             Some(ViolationReason::BindSourceReachesStateRoot)
         );
-        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(protected());
+        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(pinned(protected()));
         let knobs = Knobs {
             mountinfo: Some(format!("{info}{}", ideal_mountinfo(200, false, false))),
             ..Knobs::default()
@@ -2935,6 +3154,7 @@ mod tests {
             root: fd.as_fd(),
             host_root: fx.rootfs.clone(),
             rootfs_ids: Vec::new(),
+            state_chains: Vec::new(),
             protected: &[],
             deps: &deps,
         };
@@ -2971,6 +3191,7 @@ mod tests {
             root: fd.as_fd(),
             host_root: fx.rootfs.clone(),
             rootfs_ids: Vec::new(),
+            state_chains: Vec::new(),
             protected: &[],
             deps: &deps,
         };

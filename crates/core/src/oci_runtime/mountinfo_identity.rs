@@ -77,6 +77,46 @@ pub(crate) fn path_mount_id(_path: &str) -> Option<u64> {
     None
 }
 
+/// 鎖の長さの上限（適用の段の `MAX_ANCESTORS` と同じ。無制限の確保を避ける）。
+#[cfg(target_os = "linux")]
+const DIR_CHAIN_MAX: usize = 4096;
+
+/// 絶対パス `path` のディレクトリを `/` から 1 要素ずつ `O_NOFOLLOW` で辿り、`(st_dev, st_ino)` の鎖を返す
+/// （先頭が `path` 自身、末尾が `/`）。start の段が状態ルートの実体を固定するために使い、適用の段（restart を含む毎回）が
+/// 元との同一・祖先・子孫の照合に使う（SEC-1・SEC-4・#2066）。mountinfo の文字列に依存せず、start の後に状態ルートや
+/// 祖先が改名されても inode は変わらないため照合できる。
+/// symlink・ディレクトリでない要素・絶対パスでない・[`DIR_CHAIN_MAX`] 段超は `None`（呼び出し側が fail-closed にする）。
+#[cfg(target_os = "linux")]
+pub(crate) fn dir_identity_chain(path: &str) -> Option<Vec<(u64, u64)>> {
+    use std::os::fd::AsFd as _;
+    use std::os::unix::fs::MetadataExt as _;
+    if !path.starts_with('/') {
+        return None;
+    }
+    let id = |fd: &std::os::fd::OwnedFd| -> Option<(u64, u64)> {
+        let meta = std::fs::File::from(fd.try_clone().ok()?).metadata().ok()?;
+        meta.is_dir().then(|| (meta.dev(), meta.ino()))
+    };
+    let mut cur = crate::sys::open_dir_path_nofollow(None, c"/").ok()?;
+    let mut chain = vec![id(&cur)?];
+    for name in path.split('/').filter(|e| !e.is_empty()) {
+        if chain.len() >= DIR_CHAIN_MAX {
+            return None;
+        }
+        let c = std::ffi::CString::new(name).ok()?;
+        cur = crate::sys::open_dir_path_nofollow(Some(cur.as_fd()), &c).ok()?;
+        chain.push(id(&cur)?);
+    }
+    chain.reverse();
+    Some(chain)
+}
+
+/// Linux 以外では `crate::sys` が無いため固定できない（bind mount は Linux 限定。呼び出し側は fail-closed にする）。
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn dir_identity_chain(_path: &str) -> Option<Vec<(u64, u64)>> {
+    None
+}
+
 /// mountinfo の 1 行（必要なフィールドだけ。マウント ID・親 ID・`major:minor`・FS 内の root・マウントポイント）。
 pub(crate) struct MountRow {
     pub(crate) id: u64,
@@ -511,6 +551,35 @@ mod tests {
             Some(42)
         );
         assert_eq!(parse_fdinfo_mnt_id("pos:\t0\n"), None);
+    }
+
+    /// SEC-1（#2066）: 鎖は自身が先頭・`/` が末尾で、各要素は実ディレクトリの (dev, ino)。symlink・存在しない・相対は `None`。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_dir_identity_chain_runs_from_leaf_to_root() {
+        use std::os::unix::fs::MetadataExt as _;
+        let tmp = crate::test_support::TestTempDir::new("dir-chain").expect("temp dir");
+        let leaf = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&leaf).expect("a/b");
+        let id = |p: &std::path::Path| {
+            let m = std::fs::metadata(p).expect("metadata");
+            (m.dev(), m.ino())
+        };
+        let chain = dir_identity_chain(leaf.to_str().expect("utf8")).expect("chain");
+        assert_eq!(chain.first(), Some(&id(&leaf)));
+        assert_eq!(chain.get(1), Some(&id(&tmp.path().join("a"))));
+        assert_eq!(chain.get(2), Some(&id(tmp.path())));
+        assert_eq!(chain.last(), Some(&id(std::path::Path::new("/"))));
+        std::os::unix::fs::symlink(&leaf, tmp.path().join("link")).expect("symlink");
+        assert_eq!(
+            dir_identity_chain(tmp.path().join("link").to_str().expect("utf8")),
+            None
+        );
+        assert_eq!(
+            dir_identity_chain(tmp.path().join("nope").to_str().expect("utf8")),
+            None
+        );
+        assert_eq!(dir_identity_chain("relative/path"), None);
     }
 
     /// SEC-1（#1915）: 全体 bind（root が `/`）が状態ルートを含むときも到達と判定する（`/` を祖先として扱う）。

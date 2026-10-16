@@ -2,12 +2,12 @@
 
 sudo＋pty に頼らない権限昇格方式（setuid バイナリ・capability ベース）の選択肢と、本リポが rootful で必要とする最小権限を整理する（SUP-14）。
 
-> **位置づけ**: 方式は承認済み（オーナー判断 2026-10-10・[#1454](https://github.com/Fandhe-AI/fandhe-container/issues/1454)）。(c) 特権ランチャー＋ ambient capability を既定とし、xattr 非対応の環境に限り (a) setuid root を代わりに認める。どちらも失敗したら fail-closed にし、sudo へは戻らない。`unsafe` の syscall ラッパーは `crates/supervisor/src/sys`（Linux 版）に置く（事前承認の範囲）。ランチャーは `crates/supervisor` の bin（`fandhe-container-launcher`）とし、実装は #1719 で行う。9 章を採用方式として更新した。縮退の適用と読み戻し検証は TASK-171.1.3（#1475）で `privilege::elevate` として実装済みで、境界は 10 章末尾の補足を参照。
+> **位置づけ**: 方式は承認済み（オーナー判断 2026-10-10・[#1454](https://github.com/Fandhe-AI/fandhe-container/issues/1454)）。(c) 特権ランチャー＋ ambient capability を既定とし、xattr 非対応の環境に限り (a) setuid root を代わりに認める。どちらも失敗したら fail-closed にし、sudo へは戻らない。`unsafe` の syscall ラッパーは `crates/supervisor/src/sys`（Linux 版）に置く（事前承認の範囲）。ランチャーは `crates/supervisor` の bin（`fandhe-container-launcher`）とし、実装は #1719 で行う。9 章を採用方式として更新した。7 章に supervisor の入口の dumpable=0 を追記した（SUP-14 の 2026-10-16 明記・#2102）。縮退の適用と読み戻し検証は TASK-171.1.3（#1475）で `privilege::elevate` として実装済みで、境界は 10 章末尾の補足を参照。
 
 - 対象ビヘイビア: SUP-14（Must・確定。関連: SUP-1・CORE-1・CORE-5・CORE-6・SEC-1・SEC-5・PLUG-11・ERR-1・REPAIR-5・D-19）
 - タスク: TASK-171（MS-9・G12・担当: 共同）。本書は TASK-171.1.1（#857。親 #536・#535）
 - 後続: #858（TASK-171.1.2。成果物 `crates/supervisor/src/privilege.rs`〔仮称〕）・#537（TASK-171.2 pty 非経由の起動経路）・#538（TASK-171.3 SIGKILL 継続テスト）・#539（TASK-171.h1。実装後のセキュリティレビュー・実機検証。人間担当）
-- 出典: `docs/spec/04-behavior/api-supervisor.md` の `SUP-14`、`03-poc/supervisor-model/README.md` の発見事項 1（PoC-17）、`05-tasks.md` の TASK-171、`api-runtime-core.md` の `CORE-6`、`security-isolation.md` の `SEC-1`・`SEC-5`（submodule リビジョン `984f8a2`）。外部事実の出典は 3 章末尾に URL と確認日（2026-10-06）を付す
+- 出典: `docs/spec/04-behavior/api-supervisor.md` の `SUP-14`、`03-poc/supervisor-model/README.md` の発見事項 1（PoC-17）、`05-tasks.md` の TASK-171、`api-runtime-core.md` の `CORE-6`、`security-isolation.md` の `SEC-1`・`SEC-5`（submodule リビジョン `984f8a2`。7 章の supervisor の dumpable=0 は SUP-14 の 2026-10-16 明記〔spec#23・リビジョン `6a3e546`〕による）。外部事実の出典は 3 章末尾に URL と確認日（2026-10-06）を付す
 
 ## 1. 問題の整理
 
@@ -105,7 +105,10 @@ rootful 時に、本リポのコードが行う特権操作と、それに要す
 - ランチャーは exec の直前に supervisor の実体を検証する。パスを `open` して得た fd に対し `fstat` で所有者・パーミッション（グループ・他者の書き込みビットが無いこと）・通常ファイルであることを確認し、`/proc/self/fd` 経由や `execveat`（fd 指定）で検証した同一の実体を exec する。検証と exec の間の差し替え（TOCTOU）を避けるため、パス文字列で検証して別途パスで exec する方式にしない。許可済みハッシュ・署名との照合の要否は PLUG-11 に合わせて実装時に決める（未確認）。検証に失敗した場合は 6 章に従い fail-closed とする
 - supervisor のパスは固定の絶対パスまたは同一インストール先からの相対解決に限り、`PATH` 探索や呼び出し元が与える任意パスを受け付けない（既定）
 - core dump・ptrace の可否: `PR_SET_DUMPABLE=0` を `elevate` の前に設定する（#1719 で確定。昇格中の窓で同一 uid の別プロセスから ptrace・`/proc/<pid>/mem`・core dump を受けない）
+- supervisor の入口でも `PR_SET_DUMPABLE=0` を設定する（SUP-14。2026-10-16 に spec へ明記、spec#23、本リポへの取り込みは #2101・#2102）。`execve` は dumpable を 1 に戻し、ランチャー経由の昇格は ambient capability の受け渡しで AT_SECURE・資格情報の変化を伴わないため、ランチャー側の設定だけでは足りない。入口で改めて 0 にしないと、同じ UID の親や他プロセスから ptrace・`/proc/<pid>/`（`mem`・`smaps_rollup`・`exe` 等）の読み取り・core dump を受け、昇格した capability を奪われうる。位置は継承 fd を閉じ、結果チャネルを開いた直後で、引数の検証や起動処理より前。直接起動（ランチャー非経由）でも無条件に設定し、特権経路に限らない。設定に失敗したら結果チャネルへ構造化エラー（`code` は `INTERNAL`、メッセージは `PR_SET_DUMPABLE failed: <kind>`。ERR-1）を書いて非ゼロで終了し、起動しない（fail-closed。6 章）。`execve` での dumpable の扱いなどカーネル挙動の原文照合は 12 章の `prctl(2)`・`execve(2)` の未確認の行に含まれる
+  - 計測のために dumpable=0 を外さない。特権経路に限ることもしない（SUP-14）。supervisor の PSS の計測は読み取りだけを root で行う（TASK-158 追補。方式は #2090 で決定、実装は #2099 で未完了）。手順は `docs/verification/supervisor-measurement-runbook.md` の「計測の権限」、`scripts/bench/supervisor_pss.sh` を参照
 - 実装の対応（#1719。`crates/supervisor/src/launcher.rs`・`src/bin/fandhe-container-launcher.rs`）: 環境は `execveat` に渡す `envp` を許可リスト方式で新規に組む（固定の `PATH` のみ。`LD_*` を渡さない）。引数は supervisor と同じ `StartArgs::parse` で検証して転送する。supervisor のパスはランチャー自身の実体（`/proc/self/exe`）の親ディレクトリ + 固定名。パスは根から全要素を辿り、ディレクトリは root 所有・group / other 書き込み不可（sticky でも免除しない）、symlink は root 所有のみ許可して自前で解決する。最終ファイルは `open` した fd の `fstat` で通常ファイル・setuid / setgid 無し・group / other 書き込み不可・root 所有を確かめ（この順に最初の失敗を報告）、同じ fd を `execveat(AT_EMPTY_PATH)` で exec する。fd 0〜2 が閉じていれば結果チャネルを乗っ取られないため拒否し、fd 3 以降は閉じ、cwd は `/`。許可済みハッシュ・署名との照合は行わない（PLUG-11 との整合は 12 章に未確認として残す）
+- 実装の対応（supervisor 側の dumpable。#2102）: `crates/supervisor/src/start_entry.rs` の `run_main_inner`（結果チャネルを開いた直後の手順）が `crate::sys::set_dumpable(false)` を呼ぶ。ラッパーは `crates/supervisor/src/sys/linux.rs` の `set_dumpable` で、設定のみを行い読み戻しはしない。dumpable=0 では `/proc/self` 配下の所有者が変わるため、`ProductionStartDeps::new` は権限モデルを `/proc/self/status` の所有者ではなく内容から決める
 
 ## 8. 配置の論点（本書では決めない）
 

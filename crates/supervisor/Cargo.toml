@@ -26,6 +26,7 @@
 # TASK-163.4（#503）で exec にコマンド実行（run_command）と実コンテナへの通し結合試験 tests/exec.rs を追加した（依存は不変）。
 # TASK-163 追補（#1465）で exec::run_command に監査の記録先を必須の引数として追加した（依存は不変）。
 # TASK-164 追補（#1470）で Windows の世代 rename 再試行・ロックファイル ID 照合（src/sys.rs。自前 FFI 宣言）を追加した（依存は不変）。
+# TASK-157 追補（#1819）で ProductionStartDeps を core の本番 launcher へ結線した（依存は不変）。
 # TASK-157 追補（#1717）で bin の入口（src/main.rs）と起動の契約（start_contract・start_entry）を追加した（依存は不変）。
 # TASK-171 追補（#1719）で特権ランチャーの bin（src/launcher.rs・src/bin/）を追加した（依存は不変）。
 # 外部クレート（crates.io）の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
@@ -153,3 +154,12 @@ harness = false
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]
 workspace = true
+
+# supervisor の bin から core の本番 launcher を経て monitor まで通す実機シナリオ（起動 → 報告 → 監視 → Stopped の記録、
+# 起動失敗で何も残らないこと、restart の fail-closed。SUP-1・SUP-3・CORE-1・CORE-2・TASK-157 追補・#1819）。同じ実行ファイルが
+# コンテナ内のプローブも兼ねるため独自 main（harness = false）で動かす。非特権ユーザー・Linux 6.12 以上・委譲された
+# cgroup v2（systemd-run --user）を要する実機前提テストで、`-- --ignored` 指定時のみ実行する（AGENTS.md）。実行は人間担当。
+[[test]]
+name = "supervisor_bin_real"
+path = "tests/supervisor_bin_real.rs"
+harness = false

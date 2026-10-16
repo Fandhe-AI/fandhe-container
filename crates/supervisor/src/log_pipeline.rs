@@ -11,10 +11,11 @@
 //! - 生きている捕捉の取っ手は高々 1 つ。[`CaptureHub::attach`] は新しい捕捉を先に開始してから、直前の捕捉を短い期限で
 //!   `drain` する（旧プロセスは終了検知済みで EOF が届くはず。孫がパイプを保持して期限切れなら `drain` が自動で取り消し、
 //!   リーダー数は予算が上限管理する）。新しい捕捉を先にするのは、restart のレイテンシに drain の待ちを載せないため。
-//! - 読み取りスレッドを作るのは `oci_runtime::start` の完了後に限る（start は単一スレッド前提。start_entry 参照）。
-//!   再起動の launch の直前には [`CaptureHub::quiesce`] で直前の捕捉を畳み、捕捉スレッドを 0 にしてから launch する
-//!   （core の fork 経路が `Threads: 1` を要求するため。なお `relaunch_bounded` の実行スレッドは別途存在する。
-//!   Phase B の本番 launcher はそのスレッド構成で fork できる方式にする必要がある）。
+//! - 読み取りスレッドを作るのは `oci_runtime::start` の完了後に限る（start は単一スレッド前提で、入口スレッドが手順 8 を
+//!   直接行う。start_entry 参照）。再起動の launch の直前には [`CaptureHub::quiesce`] で直前の捕捉を畳み、捕捉スレッドを
+//!   0 にしてから launch する（core の fork 経路が `Threads: 1` を要求するため）。ただし `relaunch_bounded` の実行
+//!   スレッドや `stderr_sink` の常駐スレッドが別途存在するため、quiesce だけでは本番 launcher の要求を満たせず、
+//!   再 launch は拒否される（fail-closed）。再 launch を呼び出しスレッドで直接行う再構成は #2043（SUP-3・CORE-1）。
 //! - 捕捉を開始できなかったときは `Err` を返す。読み取り側を破棄するとコンテナは次の `write` で SIGPIPE を受けるため、
 //!   呼び出し側は fail-closed（起動・再起動を失敗として扱いプロセスを回収する）にする。ログ喪失を黙って許さない（REPAIR-4）。
 //! - 出力は非信頼バイト列として不透明に扱い、supervisor 自身のログへ行内容を出さない。

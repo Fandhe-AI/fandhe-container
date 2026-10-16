@@ -904,7 +904,9 @@ fn repair5_insufficient_budget_skips_launch() {
     );
     let after = env.record(&env.id);
     assert_eq!(after.status().state(), ContainerState::Created);
-    assert_eq!(after.revision(), before.revision());
+    // 予約（Created → Running）と報告後の解放（Running → Created）で revision は 2 進む。
+    assert_eq!(before.revision(), StateRevision::from_raw(0));
+    assert_eq!(after.revision(), StateRevision::from_raw(2));
     match report_of(&out) {
         StartReport::Failed { code, message, .. } => {
             assert_eq!(code, ErrorCode::Internal);

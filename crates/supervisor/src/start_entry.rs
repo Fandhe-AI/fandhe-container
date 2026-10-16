@@ -65,8 +65,8 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
 use fandhe_container_core::oci_runtime::{
-    ClaimedStart, LAUNCHER_REPLY_GRACE, LaunchMode, LaunchSpec, LaunchedProcess, LifecycleOp,
-    OciRuntimeError, ProcessLauncher, StartTimeouts, claim_start, exit_code_for, launch_claimed,
+    ClaimedStart, LAUNCHER_REPLY_GRACE, LaunchMode, LaunchedProcess, LifecycleOp, OciRuntimeError,
+    ProcessLauncher, StartTimeouts, claim_start, exit_code_for, launch_claimed,
     recover_interrupted_start, take_unreaped_processes,
 };
 use fandhe_container_core::traits::{
@@ -498,7 +498,7 @@ fn launch_after_prepare(
     if !has_launch_budget(deadline, timeouts) {
         // 期限内に終わらない launch を始めない（子を作ってから期限を超えない。REPAIR-5）。
         log_event("start_launch_skipped", Some(ErrorCode::Timeout));
-        let cleanup = discard_prepared(prepared, store.as_ref());
+        let cleanup = discard_prepared(prepared);
         return Attempt::Failed {
             error: OciRuntimeError::new(
                 LifecycleOp::Start,
@@ -653,6 +653,9 @@ enum Cleanup {
     /// `start` が失敗（Timeout を含む。予約が残れば Created へ戻し、予約の解放と core のワーカー完了を確かめ、
     /// 未回収のハンドルを terminate してから cgroup を消す）。
     AfterFailure(Arc<dyn ProcessLauncher>, Vec<Box<dyn LaunchedProcess>>),
+    /// launch しなかった準備済みの起動権の予約を、報告の後に Created へ戻す（`StateStore` の更新は報告を
+    /// 止め得るため報告の前に行わない。REPAIR-5）。戻せたら cgroup を消し、戻せなければ消さない。
+    DiscardClaim(Box<ClaimedStart>),
 }
 
 /// 手順 8（`oci_runtime::start`）に要るもの。準備（手順 3〜7）の成功の結果。
@@ -853,16 +856,11 @@ fn wait_task_gone(tid: Option<NonZeroU32>, limit: Duration) {
     }
 }
 
-/// launch しない準備済みの結果を捨てる。予約を Created へ戻せたら cgroup を消す後始末を、戻せなければ cgroup を
-/// 消さない（予約が Running・pid なしで残るため `recover_interrupted_start` での回復を待つ。CORE-2）。
-fn discard_prepared(prepared: Prepared, store: &dyn StateStore) -> Cleanup {
-    match prepared.claimed.release(store) {
-        Ok(()) => Cleanup::ReleaseCgroup,
-        Err(_) => {
-            log_event("start_claim_release_failed", Some(ErrorCode::Internal));
-            Cleanup::Nothing
-        }
-    }
+/// launch しない準備済みの結果を捨てる後始末へ変える（I/O はしない）。予約の解放は報告の後に
+/// [`cleanup_after_report`] が行い、戻せたら cgroup を消す。戻せなければ cgroup を消さない（予約が Running・pid
+/// なしで残るため `recover_interrupted_start` での回復を待つ。CORE-2・REPAIR-5）。
+fn discard_prepared(prepared: Prepared) -> Cleanup {
+    Cleanup::DiscardClaim(prepared.claimed)
 }
 
 /// 入口が待つのをやめた後に作業スレッドが戻ったとき（または期限超過の報告の後に結果が出たとき）の後始末。
@@ -877,7 +875,7 @@ fn abandoned_cleanup(
     outcome: PrepareOutcome,
 ) {
     let cleanup = match outcome {
-        PrepareOutcome::Ready(prepared) => discard_prepared(prepared, store),
+        PrepareOutcome::Ready(prepared) => discard_prepared(prepared),
         PrepareOutcome::Failed { cleanup, .. } => cleanup,
     };
     let _ = cleanup_after_report(deps, store, id, timeouts, cleanup);
@@ -893,6 +891,14 @@ fn cleanup_after_report(
     let confirmed = match cleanup {
         Cleanup::Nothing => return true,
         Cleanup::ReleaseCgroup => return release_logged(deps.as_mut()),
+        Cleanup::DiscardClaim(claimed) => match claimed.release(store) {
+            Ok(()) => return release_logged(deps.as_mut()),
+            Err(_) => {
+                // 予約が残り得る。cgroup は消さない。
+                log_event("start_claim_release_failed", Some(ErrorCode::Internal));
+                return false;
+            }
+        },
         Cleanup::AfterFailure(launcher, pending) => {
             settle_failed_start(store, &launcher, id, timeouts, pending)
         }
@@ -967,13 +973,7 @@ fn prepare_start(
         Ok(l) => l,
         Err(e) => return fail(e, Cleanup::ReleaseCgroup),
     };
-    let checked: Arc<dyn ProcessLauncher> = Arc::new(InstanceCheckedLauncher {
-        inner: Arc::clone(&inner),
-        store: Arc::clone(store_arc),
-        id: req.id().clone(),
-        expected: prepared,
-    });
-    let capturing = Arc::new(SpecCapturingLauncher::new(checked));
+    let capturing = Arc::new(SpecCapturingLauncher::new(Arc::clone(&inner)));
     let launcher: Arc<dyn ProcessLauncher> = capturing.clone();
     // 起動権の予約（状態の読み取り・bundle の検証・所有ロック・予約の更新）。ファイル I/O を含むため、入口が期限で
     // 待ち切れる作業スレッドで行う。ここまでで launcher は呼ばない（REPAIR-5・CORE-2）。
@@ -987,6 +987,29 @@ fn prepare_start(
             };
         }
     };
+    // 世代の照合。予約中のレコードは delete が拒否するため、予約の後にここで照合すれば、準備の後・予約の前に同じ ID が
+    // 削除・再作成された場合を漏れなく拒否できる。launch 時に `store.get` を入口スレッドで行うと期限の保護から外れる
+    // ため、作業スレッドで済ませる（CORE-2・CORE-3・SEC-1・REPAIR-5）。
+    let matches = store
+        .get(&GetStateRequest::new(req.id().clone()))
+        .map(|r| r.cgroup().map(|c| c.instance()) == prepared);
+    match matches {
+        Ok(true) => {}
+        other => {
+            let error = match other {
+                Err(e) => op_err(e),
+                _ => op_err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "the container was recreated after its cgroup was prepared",
+                )),
+            };
+            // 予約は報告の後に戻す（ここでは I/O を足さない）。
+            return PrepareOutcome::Failed {
+                error,
+                cleanup: Cleanup::DiscardClaim(claimed),
+            };
+        }
+    }
     PrepareOutcome::Ready(Prepared {
         inner,
         capturing,
@@ -1044,53 +1067,6 @@ fn launch_prepared(
         },
     }
 }
-/// launch の時点で、レコードの cgroup の instance が [`StartDeps::prepare_cgroup`] の準備した世代と一致するかを
-/// 確かめてから内側の launcher へ委ねる（CORE-2・CORE-3・SEC-1）。
-///
-/// core の `start` は起動権の予約（revision 照合つきの Created → Running〔pid なし〕）を済ませてから launch を呼び、
-/// 予約中のレコードは delete が拒否する。そのためこの時点の照合で、準備の後・予約の前に同じ ID が削除・再作成された
-/// 場合（別世代の bundle を旧世代の cgroup で起動する経路）を漏れなく拒否できる。拒否すると core は予約を Created へ
-/// 戻し、入口は準備した cgroup を消す。
-struct InstanceCheckedLauncher {
-    inner: Arc<dyn ProcessLauncher>,
-    store: Arc<dyn StateStore>,
-    id: ContainerId,
-    expected: Option<StateRevision>,
-}
-
-impl ProcessLauncher for InstanceCheckedLauncher {
-    /// 内側の launcher の時間上限の守り方を転送する（転送しないと `SelfBounded` が `CallerBounded` へ
-    /// 降格し、単一スレッドを要求する本番 launcher が拒否される。REPAIR-5・#1816）。
-    fn launch_mode(&self) -> fandhe_container_core::oci_runtime::LaunchMode {
-        self.inner.launch_mode()
-    }
-
-    /// 内側の launcher の「子が残り得る」判定を転送する(転送しないと既定の `false` になり、回収できなかった
-    /// 子が残るのに起動予約が戻る。CORE-2)。
-    fn last_launch_may_have_left_process(&self) -> bool {
-        self.inner.last_launch_may_have_left_process()
-    }
-
-    fn launch(
-        &self,
-        spec: &LaunchSpec,
-        timeout: Duration,
-    ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
-        let record = self.store.get(&GetStateRequest::new(self.id.clone()))?;
-        if record.cgroup().map(|c| c.instance()) != self.expected {
-            return Err(TraitError::new(
-                ErrorCode::FailedPrecondition,
-                "the container was recreated after its cgroup was prepared",
-            ));
-        }
-        self.inner.launch(spec, timeout)
-    }
-
-    fn confirm_no_process(&self, id: &ContainerId, timeout: Duration) -> Result<(), TraitError> {
-        self.inner.confirm_no_process(id, timeout)
-    }
-}
-
 /// `start` 失敗後に予約を Created へ戻し、未回収のハンドル（`extra` と登録済み分）を terminate する。
 /// 両方済んだら `true`。
 fn recover_after_timeout(
@@ -1902,60 +1878,6 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fandhe_container_core::traits::{
-        CreateStateRequest, DeleteStateRequest, DeleteStateResponse, ListStateRequest, StateList,
-    };
-
-    /// `launch_mode` だけを答えるフェイク（転送の照合用。#1816・REPAIR-5）。
-    struct SelfBoundedFake;
-
-    impl ProcessLauncher for SelfBoundedFake {
-        fn launch_mode(&self) -> fandhe_container_core::oci_runtime::LaunchMode {
-            fandhe_container_core::oci_runtime::LaunchMode::SelfBounded
-        }
-
-        fn launch(
-            &self,
-            _spec: &LaunchSpec,
-            _timeout: Duration,
-        ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
-            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
-        }
-    }
-
-    /// 使われない `StateStore`（`launch_mode` の転送の照合では store に触れない）。
-    struct UnusedStore;
-
-    impl StateStore for UnusedStore {
-        fn create(&self, _: &CreateStateRequest) -> Result<StateRecord, TraitError> {
-            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
-        }
-        fn update(&self, _: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
-            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
-        }
-        fn get(&self, _: &GetStateRequest) -> Result<StateRecord, TraitError> {
-            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
-        }
-        fn list(&self, _: &ListStateRequest) -> Result<StateList, TraitError> {
-            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
-        }
-        fn delete(&self, _: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
-            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
-        }
-    }
-
-    /// REPAIR-5・#1816: `InstanceCheckedLauncher` は内側の `launch_mode` を転送する（既定の降格をしない）。
-    #[test]
-    fn repair5_instance_checked_launcher_forwards_launch_mode() {
-        use fandhe_container_core::oci_runtime::LaunchMode;
-        let wrapped = InstanceCheckedLauncher {
-            inner: Arc::new(SelfBoundedFake),
-            store: Arc::new(UnusedStore),
-            id: ContainerId::new("c1").expect("id"),
-            expected: None,
-        };
-        assert_eq!(wrapped.launch_mode(), LaunchMode::SelfBounded);
-    }
 
     /// terminate が呼び出し側の期限より遅れて成功する起動ハンドル。
     struct SlowOk(u32, Duration);

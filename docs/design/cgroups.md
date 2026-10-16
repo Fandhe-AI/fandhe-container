@@ -94,6 +94,27 @@ OCI の default devices と同じ固定表（`DeviceAllowList::oci_default()`。
 - 試験用の major に 120 を使う理由: 当初想定の 240 はカーネルの動的 major 割り当て（`find_dynamic_major()` は 254 から 234 へ向けて割り当てる）と重なり、開発ホストの `/proc/devices` にも `240 ttyDBC` が実在した。devices.txt で char 120-127 は LOCAL/EXPERIMENTAL USE で動的割り当ての範囲の外にある
 - 実機での実行は人間担当で、結果は #1621 に記録する（AGENTS.md「実機前提テスト」）
 
+## 前提環境（委譲スコープの作り手。#2081・CORE-3・CORE-4・SUP-1・CLI-1）
+
+supervisor の `DelegatedCgroup::prepare` は、委譲された親 cgroup に自分以外のプロセスが 1 つでもあると拒否する。このため CLI の `start` は、supervisor を CLI と同じ cgroup ではなく、`systemd-run --user --scope --quiet -p Delegate=yes --`（`start_contract::USER_SCOPE_WRAPPER_ARGS`）で包んで起動し、新しい scope の中で一人で動かす。
+
+- systemd-run は scope の登録後に同じプロセスで supervisor を exec する。spawn した pid・プロセスグループ・stdio はそのまま supervisor のものになり、CLI は scope に居残らない（根拠は `man systemd-run` と systemd の `src/run/run.c` の `start_transient_scope`。実機での照合は `crates/cli/tests/start_scope_real.rs`）
+- systemd-run は固定候補（`/usr/sbin`・`/usr/bin`・`/sbin`・`/bin`）から解決し、`PATH` 探索はしない（PLUG-11）。実体が root 所有の通常ファイルで、実体と祖先ディレクトリの group / other に書き込み権が無いことを確かめてから使う。検証から exec までの TOCTOU は、root 所有で非 root が書けない場所に限ることで抑える
+- 渡す環境は `PATH`（固定値）と `XDG_RUNTIME_DIR`（絶対パスを検証）だけ。`DBUS_SESSION_BUS_ADDRESS` は渡さない（任意プログラムの起動や接続先の付け替えを防ぐ。user マネージャの直結ソケット `$XDG_RUNTIME_DIR/systemd/private` だけで足りる）
+- fail-closed: 次の場合は spawn の前に機械可読な `code` / `message` で失敗する。CLI の cgroup の下に子 cgroup を作る方式（案 B）へは落とさない
+
+| 条件 | code |
+| ---- | ---- |
+| rootful（uid のどれかが 0。SEC-5） | `UNIMPLEMENTED` |
+| `/proc/self/status` が読めない | `FAILED_PRECONDITION` |
+| systemd-run が無い、または信頼できる実行ファイルでない | `FAILED_PRECONDITION` |
+| `XDG_RUNTIME_DIR` が絶対パスでない、または user マネージャの直結ソケットが euid 所有のソケットでない | `FAILED_PRECONDITION` |
+| 委譲が効いていない（`Delegate=yes` が反映されない等） | supervisor の `detect` / `prepare` が報告したコード |
+
+- 簡易実装（REPAIR-3）: 結果の 1 行が無いまま EOF のとき、supervisor の異常終了と systemd-run の失敗（D-Bus 接続の失敗等）を区別できない（`INTERNAL`）。制御チャネル（#2058）の後の課題とする
+- 上記の「systemd cgroup driver 非対応」との関係: CLI は systemd-run を起動して scope を 1 つ作らせるだけで、D-Bus を自分では話さない。scope の中の cgroup 操作はすべて cgroupfs へ直接行う。CORE-4 の言い回しとの整合は spec 側の判断事項として報告する
+- 実機での実行は人間担当で、結果は #2062 に記録する（`AGENTS.md`「実機前提テスト」の `start_scope_real`・`supervisor_bin_real`）
+
 ## 関連・後続
 
 - TASK-35（SEC-6・CORE-4）で release_agent 悪用手法の無効化確認を記録する。本書は当該確認が済んでいるとは主張しない

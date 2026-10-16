@@ -1907,8 +1907,9 @@ mod linux {
     /// 手順 2b: `id` のレコードがあるときだけ supervisor ログ（`<root>/@supervisor-logs/<id>.log`）を開き、
     /// `stderr_sink` の書き先へ差し込む（#2067・REPAIR-4）。
     ///
-    /// レコードが無い・読めない場合は何もせず先へ進む（詳細なエラーは手順 3 が報告する。打ち間違えた ID のために
-    /// `delete` で消せないログを作らない）。開くのに失敗したら呼び出し側が fail-closed で報告する（ログ喪失を黙って
+    /// レコードが無い（`NotFound`）場合は何もせず先へ進む（詳細なエラーは手順 3 が報告する。打ち間違えた ID のために
+    /// `delete` で消せないログを作らない）。レコードの取得が `Timeout` 等で失敗したら保存先を確定できないため
+    /// 失敗として返す。開くのに失敗したら呼び出し側が fail-closed で報告する（ログ喪失を黙って
     /// 許さない。同じ ID の supervisor が生存中なら `FailedPrecondition`）。
     ///
     /// 状態ストアの取得とログのディレクトリ走査・ローテーション・`sync_dir` は保存先の I/O が止まりうるため、
@@ -1955,7 +1956,7 @@ mod linux {
         root: &std::path::Path,
         id: &ContainerId,
     ) -> Result<(), TraitError> {
-        if store.get(&GetStateRequest::new(id.clone())).is_err() {
+        if !record_exists(store.as_ref(), id)? {
             return Ok(());
         }
         // ストアが受理した（親 symlink 解決済みの）状態ルートの下に置く。生の `--root` だと、ストアは受理するのに
@@ -1963,6 +1964,16 @@ mod linux {
         let log_root = supervisor_log_root(store, root);
         let writer = crate::supervisor_log::open(log_root, id)?;
         crate::stderr_sink::install_stderr_writer(Box::new(writer))
+    }
+
+    /// `id` のレコードがあるか。`NotFound` だけを「なし」とし、`Timeout`（`@lock` 待ち）等の取得失敗は
+    /// 保存先を確定できないのでそのまま返す（ログが null の stderr へ流れるのを防ぐ fail-closed。#2067・REPAIR-4）。
+    fn record_exists(store: &dyn StateStore, id: &ContainerId) -> Result<bool, TraitError> {
+        match store.get(&GetStateRequest::new(id.clone())) {
+            Ok(_) => Ok(true),
+            Err(e) if e.code() == ErrorCode::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// supervisor ログを置く状態ルート。ストアの `host_state_root()`（検査済み）を優先し、無ければ引数の root。
@@ -2087,6 +2098,10 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use fandhe_container_core::traits::{
+            CreateStateRequest, DeleteStateRequest, DeleteStateResponse, ListStateRequest,
+            StateList,
+        };
 
         /// 資格情報だけを変えた `/proc/self/status` の fixture（必須項目は縮退後の非特権プロセス相当）。
         fn status(uid: &str, gid: &str) -> String {
@@ -2153,6 +2168,47 @@ mod linux {
                 "log must open under the store root: {:?}",
                 opened.err()
             );
+        }
+
+        /// 指定の結果を返す `get` だけのストア（他は到達しない）。
+        struct GetOnly(Result<(), ErrorCode>);
+        impl StateStore for GetOnly {
+            fn create(&self, _: &CreateStateRequest) -> Result<StateRecord, TraitError> {
+                Err(TraitError::new(ErrorCode::Internal, "unused"))
+            }
+            fn update(&self, _: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
+                Err(TraitError::new(ErrorCode::Internal, "unused"))
+            }
+            fn get(&self, _: &GetStateRequest) -> Result<StateRecord, TraitError> {
+                match self.0 {
+                    Ok(()) => StateRecord::new(
+                        ContainerStatus::created(ContainerId::new("c1").expect("id"), None),
+                        std::env::temp_dir().join("b"),
+                        StateRevision::from_raw(1),
+                    ),
+                    Err(c) => Err(TraitError::new(c, "fake")),
+                }
+            }
+            fn list(&self, _: &ListStateRequest) -> Result<StateList, TraitError> {
+                Err(TraitError::new(ErrorCode::Internal, "unused"))
+            }
+            fn delete(&self, _: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+                Err(TraitError::new(ErrorCode::Internal, "unused"))
+            }
+        }
+
+        /// REPAIR-4・#2067: レコードなし（`NotFound`）だけが「なし」。`Timeout` 等の取得失敗はエラーで返す。
+        #[test]
+        fn repair4_record_exists_distinguishes_not_found_from_get_failure() {
+            let id = ContainerId::new("c1").expect("id");
+            assert_eq!(record_exists(&GetOnly(Ok(())), &id), Ok(true));
+            assert_eq!(
+                record_exists(&GetOnly(Err(ErrorCode::NotFound)), &id),
+                Ok(false)
+            );
+            let e = record_exists(&GetOnly(Err(ErrorCode::Timeout)), &id)
+                .expect_err("timeout must not be treated as absent");
+            assert_eq!(e.code(), ErrorCode::Timeout);
         }
 
         /// SEC-5・#1819: 壊れた・欠けた入力は fail-closed に拒否し、入力値を文言へ埋め込まない。

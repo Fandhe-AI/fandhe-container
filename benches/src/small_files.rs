@@ -463,6 +463,10 @@ struct WorkDir {
     path: PathBuf,
     #[cfg(unix)]
     id: (u64, u64),
+    /// Windows では `FILE_SHARE_DELETE` なしでディレクトリのハンドルを保持し、測定中の改名・差し替えを
+    /// OS に拒否させる（安定版 std には volume serial / file index が無く、`unsafe` / 新規依存も使わないため）。
+    #[cfg(windows)]
+    guard: Option<std::fs::File>,
 }
 
 impl WorkDir {
@@ -495,16 +499,35 @@ impl WorkDir {
             let m = std::fs::symlink_metadata(&path).map_err(|e| from_fs(&e))?;
             (m.dev(), m.ino())
         };
+        #[cfg(windows)]
+        let guard = {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_FLAG_BACKUP_SEMANTICS（ディレクトリを開く）・FILE_READ_ATTRIBUTES・
+            // 共有は READ|WRITE のみ（DELETE を含めない = 改名・削除が共有違反になる）。
+            let f = std::fs::OpenOptions::new()
+                .access_mode(0x0080)
+                .share_mode(0x1 | 0x2)
+                .custom_flags(0x0200_0000)
+                .open(&path)
+                .map_err(|e| from_fs(&e))?;
+            Some(f)
+        };
         Ok(Self {
             path,
             #[cfg(unix)]
             id,
+            #[cfg(windows)]
+            guard,
         })
     }
 }
 
 impl Drop for WorkDir {
     fn drop(&mut self) {
+        // Windows: ハンドルを保持していた間は改名・差し替えが不可能だったため同一性は保証済み。
+        // 削除のため、ここでハンドルを閉じる。
+        #[cfg(windows)]
+        drop(self.guard.take());
         let Ok(meta) = std::fs::symlink_metadata(&self.path) else {
             return;
         };

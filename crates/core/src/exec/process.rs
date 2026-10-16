@@ -11,7 +11,7 @@
 //! spawn_container(rootfs, &entry)                      // 親: fork して ContainerChild を返す
 //!   子: MountIsolation::establish()
 //!       -> prepare_rootfs(&isolation, rootfs)
-//!       -> (create_default_devices -> mount_tmpfs -> inject_files)   // 起動設定 `setup` の指定時のみ
+//!       -> (create_default_devices -> mount_tmpfs -> inject_files -> mount_binds)   // 起動設定 `setup` の指定時のみ（bind mount は `binds` の指定時のみ。#1914）
 //!       -> apply_readonly_paths(&isolation, &prepared, config)  // 読み取り専用パスの固定集合 + config の追加分。固定集合は常に適用（SEC-2・#1850・#1852）
 //!       -> apply_masked_paths(&isolation, &prepared, &null, config) // 覆うパスの固定集合 + config の追加分。`setup` 指定時のみ（SEC-2・#1851・#1852）
 //!       -> pivot_root(&isolation, prepared)            -> PivotReport
@@ -123,6 +123,7 @@ use super::{
     prepare_rootfs,
 };
 use crate::injected_files::InjectedFileSet;
+use crate::oci_runtime::BindMountSet;
 use crate::path_masks::ProtectedPath;
 use crate::tmpfs::TmpfsMountSet;
 
@@ -1871,6 +1872,10 @@ pub(crate) struct PrePivotSetup<'a> {
     pub(crate) tmpfs: Option<&'a TmpfsMountSet>,
     /// tmpfs の後に注入するファイル（無ければ注入しない）。
     pub(crate) inject: Option<&'a InjectedFileSet>,
+    /// 注入の後に載せる bind mount（無ければ載せない。#1914・TASK-29 追補）。呼び出し側（#1915）が `check_against_*`
+    /// （host_paths を含む）を通した集合を渡す。[`run_pre_pivot`] は tmpfs・注入・保護パスとの重なりを副作用の前に
+    /// 再検査する（多重防御）。本番の launcher は結線（#1915）まで `None`。
+    pub(crate) binds: Option<&'a BindMountSet>,
     /// 検証済みの rootfs を固定した fd。あれば `prepare_rootfs` の後、パスから辿り直した実体が同じ
     /// `(st_dev, st_ino)` であることを確かめる（検証後の差し替え対策）。
     pub(crate) pinned_rootfs: Option<BorrowedFd<'a>>,
@@ -1934,6 +1939,14 @@ trait PrePivotOps {
         isolation: &Self::Isolation,
         prepared: &Self::Prepared,
         set: &InjectedFileSet,
+    ) -> Result<(), ExecError>;
+    /// 検証済みの bind mount の適用。`/dev` とその配下は宛先にできない（`RESERVED_DESTINATIONS`）ため、
+    /// `mount_tmpfs` と違い `/dev` の作成順の証跡（`Devices`）は受けない（#1914）。
+    fn mount_binds(
+        &self,
+        isolation: &Self::Isolation,
+        prepared: &Self::Prepared,
+        set: &BindMountSet,
     ) -> Result<(), ExecError>;
     fn apply_readonly_paths(
         &self,
@@ -2028,6 +2041,15 @@ impl PrePivotOps for RealPrePivotOps {
         inject_files(isolation, prepared, set).map(|_| ())
     }
 
+    fn mount_binds(
+        &self,
+        isolation: &MountIsolation,
+        prepared: &PreparedRootfs,
+        set: &BindMountSet,
+    ) -> Result<(), ExecError> {
+        super::mount_binds(isolation, prepared, set).map(|_| ())
+    }
+
     fn apply_readonly_paths(
         &self,
         isolation: &MountIsolation,
@@ -2069,11 +2091,54 @@ fn check_rootfs_identity(pinned: (u64, u64), prepared: (u64, u64)) -> Result<(),
     Ok(())
 }
 
+/// bind mount の集合が tmpfs・注入・config の保護パスと重ならないことを、副作用の前に再検査する（純関数。
+/// 多重防御。`start` 側の早期検査〔#1915〕を置き換えない。rootfs・bundle のホスト側パスはここに無いため
+/// `check_against_host_paths` は対象外で、rootfs の実体照合は `mount_binds` が行う。#1914・SEC-1・SEC-2）。
+fn check_bind_overlaps(
+    set: &BindMountSet,
+    tmpfs: Option<&TmpfsMountSet>,
+    inject: Option<&InjectedFileSet>,
+    config_paths: ConfigPaths<'_>,
+) -> Result<(), ExecError> {
+    let to_exec = |e: crate::oci_runtime::BindMountError| {
+        ExecError::new(e.code(), IsolationStage::MountBinds, e.message())
+    };
+    if let Some(t) = tmpfs {
+        set.check_against_tmpfs(t).map_err(to_exec)?;
+    }
+    if let Some(i) = inject {
+        set.check_against_injected(i).map_err(to_exec)?;
+    }
+    set.check_against_protected_paths(config_paths.readonly, config_paths.masked)
+        .map_err(to_exec)
+}
+
 /// pivot までの前段を固定順で実行する（TASK-29 追補・#1715。CORE-1）。順序はここだけが決める:
 ///
 /// `establish` → `prepare_rootfs` → （固定した rootfs との照合）→ `create_default_devices` →
-/// `mount_tmpfs`（指定時）→ `inject_files`（指定時）→ `readonly_paths`（常時）→ `masked_paths`（`setup` 指定時）→
-/// `pivot_root`。
+/// `mount_tmpfs`（指定時）→ `inject_files`（指定時）→ `mount_binds`（指定時）→ `readonly_paths`（常時）→
+/// `masked_paths`（`setup` 指定時）→ `pivot_root`。
+///
+/// # bind mount の段の位置（#1914・TASK-29 追補。CORE-1・CORE-5・SEC-1・SEC-2）
+///
+/// `inject_files` の直後・`readonly_paths` の前に置く。理由:
+///
+/// 1. 重なりは型と検査で除外済み。宛先は `/`・`/proc`・`/sys`・`/dev` とその配下になれず（`BindMountSet`）、
+///    tmpfs・注入・config の保護パスとの同一・祖先・子孫も拒否する（段の先頭の [`check_bind_overlaps`]）。
+///    よって tmpfs と bind mount の入れ子は、どちら向きも受けない。
+/// 2. rootfs へ作成を伴う段（tmpfs のマウント先・注入の親ディレクトリ）は bind mount より前に置く。逆順で検査漏れが
+///    あると、利用者の bind mount の中へホスト側のディレクトリ・ファイルを作ってしまう。この順なら失敗は「隠れる」側に倒れる。
+/// 3. 常に効く保護（`readonly_paths`・`masked_paths`）を最後に置き、上流の検査漏れがあっても固定の保護が最後に載る。
+/// 4. `/dev` 系は宛先になれないため、`mount_tmpfs` のような `/dev` の作成順の証跡（`DeviceReport`）は要らない。
+/// 5. OCI の「`mounts` は列挙順に適用」は、bind 以外を拒否し `mount_binds` が指定順に適用することで守る。他の段とは
+///    重ならないため、順序を入れ替えても木は同じになる。
+///
+/// #1872（`/etc/hosts`・`/etc/resolv.conf`）の段は `inject_files` と同種のため、`inject_files` の後・`mount_binds` の前に
+/// 置く想定。その際は `/etc` などの祖先 bind を拒否する重なり検査も要る（本 PR は先取りしない）。
+///
+/// Landlock との整合: `mount_binds` が付け替え後に自分のマウントを事後検証し、以降の段は `/proc`・`/sys` だけを対象と
+/// するため、pivot 時点で宛先の最上位のマウントは bind のまま残る。`RulePath::Beneath(dest)` を辿ると適用した bind の
+/// ルートに着く。結線（ルールと bind を同じ `mounts[]` から導く）は #1915。
 ///
 /// デバイスノードと tmpfs は pivot の前に、`PreparedRootfs` の fd を起点に作る（pivot 後は旧 root が
 /// 切り離され、ホスト側の `/dev` を再解決できないため）。`setup` が `None` なら
@@ -2111,6 +2176,12 @@ fn run_pre_pivot<O: PrePivotOps>(
         if let Some(set) = setup.inject {
             ops.inject_files(&isolation, &prepared, set)
                 .map_err(StepError::at(S::InjectFiles))?;
+        }
+        if let Some(set) = setup.binds {
+            check_bind_overlaps(set, setup.tmpfs, setup.inject, setup.config_paths)
+                .map_err(StepError::at(S::MountBinds))?;
+            ops.mount_binds(&isolation, &prepared, set)
+                .map_err(StepError::at(S::MountBinds))?;
         }
         devices = Some(created);
     }
@@ -2363,6 +2434,7 @@ where
                 devices,
                 tmpfs: None,
                 inject: None,
+                binds: None,
                 pinned_rootfs: None,
                 config_paths: ConfigPaths {
                     readonly: &readonly,
@@ -2548,6 +2620,7 @@ pub fn spawn_container_with_stages_and_devices(
                 devices,
                 tmpfs: None,
                 inject: None,
+                binds: None,
                 pinned_rootfs: None,
                 config_paths: ConfigPaths::NONE,
                 status: None,
@@ -4960,6 +5033,11 @@ mod tests {
                 IsolationStage::MountTmpfs,
                 "injected failure",
             ),
+            "mount_binds" => ExecError::from_violation_at(
+                ViolationReason::BindSourceNotAccessible,
+                None,
+                IsolationStage::MountBinds,
+            ),
             "readonly_paths" => ExecError::new(
                 ErrorCode::FailedPrecondition,
                 IsolationStage::MountReadonlyPaths,
@@ -5016,6 +5094,9 @@ mod tests {
         fn inject_files(&self, _: &(), _: &(), _: &InjectedFileSet) -> Result<(), ExecError> {
             self.step("inject_files")
         }
+        fn mount_binds(&self, _: &(), _: &(), _: &BindMountSet) -> Result<(), ExecError> {
+            self.step("mount_binds")
+        }
         fn apply_readonly_paths(
             &self,
             _: &(),
@@ -5038,13 +5119,26 @@ mod tests {
         }
     }
 
+    /// 重なり検査を通る bind 1 件の集合（宛先のみ意味を持つ。実マウントはしない）。
+    fn test_binds(dest: &str) -> BindMountSet {
+        use crate::oci_runtime::parse_config_bytes;
+        let v = serde_json::json!({
+            "ociVersion": "1.2.0",
+            "root": {"path": "rootfs"},
+            "mounts": [{"destination": dest, "type": "bind", "source": "/data", "options": []}],
+        });
+        let cfg = parse_config_bytes(v.to_string().as_bytes()).expect("valid config");
+        BindMountSet::from_mounts(cfg.mounts()).expect("bind set")
+    }
+
     /// CORE-1・CORE-5（TASK-29 追補・#1715）: pivot 前の段は
     /// `establish` → `prepare_rootfs` → `verify_pinned` → `create_default_devices` → `mount_tmpfs` →
-    /// `inject_files` → `readonly_paths` → `masked_paths` → `pivot_root` の固定順で呼ばれる。
+    /// `inject_files` → `mount_binds` → `readonly_paths` → `masked_paths` → `pivot_root` の固定順で呼ばれる（#1914）。
     #[test]
     fn core1_run_pre_pivot_order_is_fixed() {
         let tmpfs = TmpfsMountSet::new();
         let inject = InjectedFileSet::new();
+        let binds = test_binds("/mnt/data");
         let pinned = std::fs::File::open("/").unwrap();
         let _ = take_calls();
         run_pre_pivot(
@@ -5054,6 +5148,7 @@ mod tests {
                 devices: DevptsGidSource::Rootful,
                 tmpfs: Some(&tmpfs),
                 inject: Some(&inject),
+                binds: Some(&binds),
                 pinned_rootfs: Some(pinned.as_fd()),
                 config_paths: ConfigPaths::NONE,
                 status: None,
@@ -5069,6 +5164,7 @@ mod tests {
                 "create_default_devices",
                 "mount_tmpfs",
                 "inject_files",
+                "mount_binds",
                 "readonly_paths",
                 "masked_paths",
                 "pivot_root",
@@ -5087,6 +5183,7 @@ mod tests {
                 devices: DevptsGidSource::Rootful,
                 tmpfs: None,
                 inject: None,
+                binds: None,
                 pinned_rootfs: None,
                 config_paths: ConfigPaths::NONE,
                 status: None,
@@ -5147,6 +5244,7 @@ mod tests {
             devices: DevptsGidSource::Rootful,
             tmpfs: None,
             inject: None,
+            binds: None,
             pinned_rootfs: None,
             config_paths: ConfigPaths::NONE,
             status: None,
@@ -5209,6 +5307,7 @@ mod tests {
                 devices: DevptsGidSource::Rootful,
                 tmpfs: Some(&tmpfs),
                 inject: None,
+                binds: None,
                 pinned_rootfs: None,
                 config_paths: ConfigPaths::NONE,
                 status: None,
@@ -5224,13 +5323,132 @@ mod tests {
         );
     }
 
-    /// SEC-4・CORE-2（#1815）: 9 つの段のそれぞれの失敗が、状態行の符号化・復号を経て親で段の名前と
+    /// SEC-1（#1914）: bind mount の段が失敗したら `readonly_paths` 以降（特に `pivot_root`）へ進まない。
+    #[test]
+    fn sec1_run_pre_pivot_mount_binds_failure_stops_before_pivot() {
+        let binds = test_binds("/mnt/data");
+        let _ = take_calls();
+        let err = run_pre_pivot(
+            &RecordingOps {
+                fail_at: Some("mount_binds"),
+            },
+            Path::new("/rootfs"),
+            Some(PrePivotSetup {
+                devices: DevptsGidSource::Rootful,
+                tmpfs: None,
+                inject: None,
+                binds: Some(&binds),
+                pinned_rootfs: None,
+                config_paths: ConfigPaths::NONE,
+                status: None,
+            }),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(err.step, PrePivotStep::MountBinds);
+        assert_eq!(err.error.code, ErrorCode::PermissionDenied);
+        assert_eq!(err.error.stage, IsolationStage::MountBinds);
+        assert_eq!(
+            take_calls(),
+            [
+                "establish",
+                "prepare_rootfs",
+                "create_default_devices",
+                "mount_binds"
+            ]
+        );
+    }
+
+    /// `binds` が `None` なら段を呼ばない。`setup` が `None` の最小構成でも呼ばない（#1914）。
+    #[test]
+    fn core1_run_pre_pivot_binds_none_skips_mount_binds() {
+        let _ = take_calls();
+        run_pre_pivot(&RecordingOps { fail_at: None }, Path::new("/rootfs"), None).unwrap();
+        assert!(!take_calls().contains(&"mount_binds".to_owned()));
+    }
+
+    /// SEC-1・SEC-2（#1914）: tmpfs・注入・config の保護パスと重なる bind は、副作用（`mount_binds`）の前に
+    /// `InvalidArgument` で拒否し、`pivot_root` へ進まない。
+    #[test]
+    fn sec1_run_pre_pivot_bind_overlap_rejected_before_mount_binds() {
+        use crate::injected_files::{InjectedContent, InjectedFileMode, InjectedFileSpec};
+        use crate::oci_runtime::parse_config_bytes;
+        use crate::tmpfs::TmpfsMountSpec;
+        let mut tmpfs = TmpfsMountSet::new();
+        tmpfs
+            .push(TmpfsMountSpec::new("/scratch", None).unwrap())
+            .unwrap();
+        let mut inject = InjectedFileSet::new();
+        inject
+            .push(
+                InjectedFileSpec::new(
+                    "/run/secrets/a",
+                    InjectedContent::from_bytes(b"x".to_vec()).unwrap(),
+                    InjectedFileMode::DEFAULT,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let cfg = parse_config_bytes(
+            serde_json::json!({
+                "ociVersion": "1.2.0",
+                "root": {"path": "rootfs"},
+                "linux": {"readonlyPaths": ["/data/x"]},
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        for dest in ["/scratch/x", "/run/secrets", "/data"] {
+            let binds = test_binds(dest);
+            let _ = take_calls();
+            let err = run_pre_pivot(
+                &RecordingOps { fail_at: None },
+                Path::new("/rootfs"),
+                Some(PrePivotSetup {
+                    devices: DevptsGidSource::Rootful,
+                    tmpfs: Some(&tmpfs),
+                    inject: Some(&inject),
+                    binds: Some(&binds),
+                    pinned_rootfs: None,
+                    config_paths: ConfigPaths {
+                        readonly: cfg.readonly_paths(),
+                        masked: cfg.masked_paths(),
+                    },
+                    status: None,
+                }),
+            )
+            .err()
+            .unwrap();
+            assert_eq!(err.step, PrePivotStep::MountBinds, "{dest}");
+            assert_eq!(err.error.code, ErrorCode::InvalidArgument, "{dest}");
+            assert_eq!(err.error.stage, IsolationStage::MountBinds, "{dest}");
+            assert_eq!(
+                take_calls(),
+                [
+                    "establish",
+                    "prepare_rootfs",
+                    "create_default_devices",
+                    "mount_tmpfs",
+                    "inject_files"
+                ],
+                "{dest}"
+            );
+        }
+        // 重ならなければ検査は通る。
+        let ok = test_binds("/mnt/data");
+        assert!(check_bind_overlaps(&ok, Some(&tmpfs), Some(&inject), ConfigPaths::NONE).is_ok());
+        assert!(check_bind_overlaps(&ok, None, None, ConfigPaths::NONE).is_ok());
+    }
+
+    /// SEC-4・CORE-2（#1815）: 10 個の段のそれぞれの失敗が、状態行の符号化・復号を経て親で段の名前と
     /// `ErrorCode`・違反理由の具体値として復元される。
     #[test]
     fn sec4_1815_every_step_failure_is_restored_by_the_parent() {
         use super::super::launch_status::PrePivotStatus;
         let tmpfs = TmpfsMountSet::new();
         let inject = InjectedFileSet::new();
+        let binds = test_binds("/mnt/data");
         let pinned = std::fs::File::open("/").unwrap();
         let expected = [
             (
@@ -5251,6 +5469,11 @@ mod tests {
             ),
             ("mount_tmpfs", ErrorCode::NotFound, None),
             ("inject_files", ErrorCode::InvalidArgument, None),
+            (
+                "mount_binds",
+                ErrorCode::PermissionDenied,
+                Some("bind_source_not_accessible"),
+            ),
             ("readonly_paths", ErrorCode::FailedPrecondition, None),
             ("masked_paths", ErrorCode::FailedPrecondition, None),
             (
@@ -5269,6 +5492,7 @@ mod tests {
                     devices: DevptsGidSource::Rootful,
                     tmpfs: Some(&tmpfs),
                     inject: Some(&inject),
+                    binds: Some(&binds),
                     pinned_rootfs: Some(pinned.as_fd()),
                     config_paths: ConfigPaths::NONE,
                     status: None,

@@ -351,13 +351,63 @@ fn remove_supervisor_log(store: &dyn StateStore, req: &DeleteRequest) {
         SUPERVISOR_LOG_REMOVE_TIMEOUT,
     );
     if outcome == LogRemoval::TimedOut {
-        eprintln!("{}", log_removal_timeout_warning());
+        emit_warning_bounded(
+            log_removal_timeout_warning(),
+            write_warning_to_stderr,
+            WARNING_WRITE_TIMEOUT,
+        );
     }
+}
+
+/// 警告の書き出しを待つ上限（`main.rs` の `DEFERRED_REPORT_TIMEOUT` と同じ値）。
+const WARNING_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 本番の警告出力。`eprintln!` は書き込み失敗で panic するため使わず、エラーは捨てる（delete の成功を保つ）。
+fn write_warning_to_stderr(line: &str) {
+    use std::io::Write as _;
+    let mut err = std::io::stderr();
+    let _ = err.write_all(line.as_bytes());
+    let _ = err.write_all(b"\n");
+}
+
+/// 警告 1 行を `write` で作業スレッドから出し、`timeout` までだけ待つ（REPAIR-5）。
+///
+/// stderr が満杯の pipe / socket だと書き込みは無期限に止まり得るため、呼び出し元スレッドでは書かない。
+/// 期限切れ・書き込み側の panic・スレッド起動失敗のいずれでも何も伝播せず戻り、delete の結果は変えない
+/// （`main.rs` の `report_deferred` と同じ流儀。止まった書き込みのスレッドは置き去りにする）。
+fn emit_warning_bounded(
+    line: &'static str,
+    write: impl FnOnce(&str) + Send + 'static,
+    timeout: Duration,
+) {
+    let _ = run_log_removal_bounded(move || write(line), timeout);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REPAIR-5: 警告の書き込みが止まっても期限で戻り、書き込みが panic しても呼び出し元へ伝播しない。
+    #[test]
+    fn repair5_warning_write_is_bounded_and_panic_safe() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let started = Instant::now();
+        emit_warning_bounded(
+            "w",
+            move |_| {
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+            },
+            Duration::from_millis(100),
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        drop(release_tx);
+
+        emit_warning_bounded(
+            "w",
+            |_| panic!("injected write failure"),
+            Duration::from_secs(10),
+        );
+    }
 
     /// REPAIR-5・REPAIR-4: ログ削除が止まっても期限で戻り、`TimedOut` になる。期限内に終われば `Finished`。
     #[test]

@@ -57,7 +57,7 @@ make third-party-licenses-selftest  # 上記スクリプトの自己テスト（
 make ci                     # lint-docs + check-workspace-manifest + fmt-check + lint + test + doc + deny を一括実行
 make bench-check-selftest   # ベンチ回帰比較スクリプトの自己テスト（REPAIR-8）
 make plugin-feature-size    # core の既定 / plugin 除外 release ビルドの rlib サイズ記録（PLUG-3・TASK-111.2。最終バイナリ未実装のため rlib 計測）
-make bench-check            # ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8。現状はプレースホルダベンチ）
+make bench-check            # ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8。実行対象は plugin 境界ベンチ・small_files を含むが、baseline 登録済みの metric に限って比較する。現状の比較対象はプレースホルダのみ）
 cargo bench -p fandhe-container-benches --bench plugin_boundary -- --output <path>  # 代表操作 A の plugin 境界ベンチ（TASK-113.1・PLUG-5。同一プロセスと境界越しの p50 と Δp50（TASK-113.3）を ns で出力し、Δp50 と CORE-10 比は stderr へログ。Unix のみ。baseline 未登録のため bench-check には未接続）
 cargo bench -p fandhe-container-benches --bench plugin_boundary_list_images [-- --output <path>]  # 代表操作 B（イメージ一覧）の plugin 境界ベンチ（TASK-113.2・PLUG-5。引数なしはスモーク。Δp50 も出力。bench-check には未接続）
 make bench-plugin-boundary  # plugin 境界ベンチ A・B を実行し Δp50 と CORE-10 の Linux 実機値（0.290〜0.298 秒）に対する割合をログ出力（TASK-113.3・PLUG-5。基準値比較なし）
@@ -249,7 +249,7 @@ make concurrent-memory-report OWN_RESULT=<own の結果 JSON> DOCKER_RESULT=<doc
 
 数値・設定箇所は上記「推奨タイムアウト値」節に集約している。本節はその判定基準・実施記録の詳細を扱う。
 
-REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された結合試験は TASK-86.2（#36）で CI 導入済み。(4) ベンチ回帰チェック（15% 超の悪化で fail）の比較の仕組みは TASK-86.3（#37）で導入したが、計測対象がプレースホルダ（固定値）のため現時点では実装の性能悪化を検出しない（plugin 境界ベンチ〔TASK-113・#269〕は実装済みだが baseline 未登録のため比較対象外、files/s・起動 p95 のベンチは担当タスク未定〔`docs/design/bench-calibration.md`「既知の欠落」〕、基準値の確定は TASK-88.h1〔#230〕・TASK-113.h1〔#274〕）。`bench-regression` の成功を「性能回帰がない」根拠として扱わない。ACK・plugin RPC・子プロセスなど相手の応答を待つ処理に、タイムアウトなしで無期限に待ち得る経路を追加する差分は P0（REPAIR-5）
+REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された結合試験は TASK-86.2（#36）で CI 導入済み。(4) ベンチ回帰チェック（15% 超の悪化で fail）の比較の仕組みは TASK-86.3（#37）で導入したが、計測対象がプレースホルダ（固定値）のため現時点では実装の性能悪化を検出しない（plugin 境界ベンチ〔TASK-113・#269〕は実装済みだが baseline 未登録のため比較対象外、files/s ベンチ〔`small_files`・TASK-189 追補・#1899〕も `metrics.json`・`BENCH_NAMES` 登録済みだが baseline 未登録のため比較対象外、起動 p95 のベンチは担当タスク未定〔`docs/design/bench-calibration.md`「既知の欠落」〕、基準値の確定は TASK-88.h1〔#230〕・TASK-113.h1〔#274〕）。`bench-regression` の成功を「性能回帰がない」根拠として扱わない。ACK・plugin RPC・子プロセスなど相手の応答を待つ処理に、タイムアウトなしで無期限に待ち得る経路を追加する差分は P0（REPAIR-5）
 
 (3) の内容:
 
@@ -268,7 +268,7 @@ REPAIR-7 の 5 段階ゲートのうち、(3) タイムアウト保護された�
 - ベンチ実行結果（`benches/baseline.json` と同スキーマの JSON）と基準値を `scripts/check-bench-regression.sh` で比較し、metric ごとに `direction`（`higher_is_better` / `lower_is_better`）に応じた向きで悪化率を判定する
 - 15% **超**の悪化を回帰として fail させる（ちょうど 15.0% の悪化は合格）。終了コードは `0`（合格）/ `1`（回帰検出）/ `2`（入力エラー。引数・ファイル・スキーマ不正等）の 3 値
 - 基準値にある metric が結果に無い、または結果にしかない metric がある場合も入力エラー（`2`）として fail する（基準値の無いベンチを素通りさせない）
-- 現時点では `benches/benches/regression_placeholder.rs`（決定的な固定値を返す stub）と `benches/baseline.json`（`placeholder: true` の暫定値）で動作確認する段階にある。plugin 境界ベンチ（TASK-113）は実装済みだが baseline 未登録で `bench-check` の比較対象外、files/s・起動 p95 のベンチは担当タスク未定（`docs/design/bench-calibration.md`「既知の欠落」）、実測基準値の確定は TASK-88.h1・TASK-113.h1 で行う
+- 現時点では `benches/benches/regression_placeholder.rs`（決定的な固定値を返す stub）と `benches/baseline.json`（`placeholder: true` の暫定値）で動作確認する段階にある。plugin 境界ベンチ（TASK-113）と files/s ベンチ（`small_files`・TASK-189 追補）は `bench-check` で実行するが baseline 未登録のため比較対象外（段階登録の絞り込みは `scripts/bench/assemble_results.sh`）、起動 p95 のベンチは担当タスク未定（`docs/design/bench-calibration.md`「既知の欠落」）、実測基準値の確定は TASK-88.h1・TASK-113.h1 で行う
 - `benches/baseline.json` の値を回帰が隠れる方向へ書き換える差分、`scripts/check-bench-regression.sh` の閾値（`THRESHOLD_PERCENT`）を変える差分、比較対象から metric を外す差分、`benches/metrics.json` の `direction` を変える・metric を削除する差分は、TASK-88 の校正記録が無い限り「回帰検出の後退」（P0）として扱う
 
 ### 実機前提テスト

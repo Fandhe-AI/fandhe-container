@@ -62,7 +62,7 @@ macOS cold start 上乗せ確認（TASK-113.4・PLUG-6・MAC-2）は `benches/te
 
 1. `make fio-bench-selftest`（fio 4K ランダム write ベンチスクリプトの自己テスト。TASK-25.1・IO-8）
 2. `make fio-baseline-ratio-selftest`（fio ベースライン比の算出の自己テスト。TASK-25.2・IO-8）
-3. `make bench-check-selftest`（比較スクリプトの自己テスト。REPAIR-8・REPAIR-12）
+3. `make bench-check-selftest`（比較スクリプトと段階登録の絞り込み・照合の自己テスト。REPAIR-8・REPAIR-12）
 4. `make bench-baseline-selftest`（baseline.json 生成スクリプト `scripts/bench/generate_baseline.sh` の自己テスト。TASK-88.1）
 5. `make startup-latency-selftest`（起動レイテンシ計測スクリプトの自己テスト。TASK-46.1・CORE-10）
 6. `make net-setup-timing-selftest`（ネットワーク作成/接続/削除の所要時間計測スクリプトの自己テスト。TASK-139.5・NET-4）
@@ -83,7 +83,7 @@ macOS cold start 上乗せ確認（TASK-113.4・PLUG-6・MAC-2）は `benches/te
 
 - 現時点で基準値比較の対象は `benches/benches/regression_placeholder.rs`（決定的な固定値の stub）と `benches/baseline.json`（`placeholder: true` の暫定値）だけで、動作確認の段階にある。計測対象がプレースホルダのため、現時点では実装の性能悪化を検出せず、性能回帰ゲートとして機能しない
 - plugin 境界ベンチ（TASK-113〔#269〕・closed。`benches/benches/plugin_boundary*.rs`）は実装済みだが、baseline 未登録のため `bench-check` の比較対象外
-- files/s のベンチは TASK-189（`benches/benches/small_files.rs`）で実装済みだが、`metrics.json`・`BENCH_NAMES`・baseline 未登録（登録は #1899）のため `bench-check` の比較対象外。起動 p95 のベンチを実装するタスクは未定（`docs/design/bench-calibration.md`「既知の欠落」）
+- files/s のベンチは TASK-189（`benches/benches/small_files.rs`）で実装済みで、`metrics.json`・`BENCH_NAMES` へ登録済み（#1899。引数は `scripts/lib.sh` の `bench_args_for`、Windows では実行しない）だが、baseline 未登録のため `bench-check` の比較対象外（段階登録の絞り込み・照合は `scripts/bench/assemble_results.sh`、`BENCH_STAGED_NAMES` に名前を足すだけで使える）。起動 p95 のベンチを実装するタスクは未定（`docs/design/bench-calibration.md`「既知の欠落」）
 - 校正記録は TASK-88.2（#229）で `docs/design/bench-calibration.md` に整備済み。実測は前提ベンチが無いため保留している
 - 実測基準値の確定は TASK-88.h1（#230）・TASK-113.h1（#274）（どちらも open）
 

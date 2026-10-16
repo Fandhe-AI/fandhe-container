@@ -129,6 +129,8 @@ cat <<'EOF'
                                         ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
   bench-check                         scripts/targets/bench-check.sh
                                         ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8。現状はプレースホルダベンチ）
+  bench-check-manual                  scripts/targets/bench-check-manual.sh
+                                        実機前提ベンチ（起動 p95）の結果を基準値と比較する（REPAIR-8・#1901。CI では実行しない。BENCH_RESULTS=<絶対パス> 必須）
   bench-plugin-boundary               scripts/targets/bench-plugin-boundary.sh
                                         plugin 境界ベンチを実行し Δp50 と CORE-10 比をログ出力する（TASK-113.3・PLUG-5。基準値比較なし）
   bench-macos-cold-start              scripts/with-workspace.sh bench-macos-cold-start cargo bench -p fandhe-container-benches --bench plugin_boundary_macos_cold_start

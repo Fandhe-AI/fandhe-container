@@ -12,6 +12,8 @@ use std::time::Duration;
 
 /// metric 名。区間が違う `startup_latency_p50_ms`（TASK-46.1・CLI 経由の中央値）と取り違えない。
 pub const METRIC_NAME: &str = "startup_create_to_supervisor_ok_p95_ms";
+/// metric の単位。`benches/metrics.json` の unit と一致させる（自己テストが機械照合する。REPAIR-12）。
+pub const METRIC_UNIT: &str = "ms";
 /// 計測方法の識別子（区間と経路。`docs/design/startup-latency-bench.md`）。
 pub const METHOD: &str = "core-create-to-supervisor-ok/systemd-run-user-scope/production-launcher";
 
@@ -119,7 +121,7 @@ pub fn render_json(result: &RunResult) -> Result<String, StartupLatencyError> {
             ));
         }
         format!(
-            "{{\"{METRIC_NAME}\":{{\"value\":{},\"unit\":\"ms\"}}}}",
+            "{{\"{METRIC_NAME}\":{{\"value\":{},\"unit\":\"{METRIC_UNIT}\"}}}}",
             ms(p95)
         )
     } else {

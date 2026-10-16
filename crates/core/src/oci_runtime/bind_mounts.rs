@@ -267,9 +267,43 @@ impl std::error::Error for BindMountError {}
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BindMountSet {
     mounts: Vec<BindMountSpec>,
+    /// start の段が検査した保護対象（状態ストアのルート）のファイルシステム内の実体。適用の段が毎回照合する（SEC-1）。
+    protected: Vec<ProtectedFsRoot>,
+}
+
+/// 保護対象のファイルシステム内の実体（mountinfo の `major:minor` と FS 内パス。bind mount の別名は同じ値になる）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProtectedFsRoot {
+    dev: String,
+    path: String,
+}
+
+impl ProtectedFsRoot {
+    pub(crate) fn new(dev: String, path: String) -> Self {
+        Self { dev, path }
+    }
+
+    pub(crate) fn dev(&self) -> &str {
+        &self.dev
+    }
+
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
 }
 
 impl BindMountSet {
+    /// start の段が検査した保護対象の実体を持たせる。適用の段が固定した元に対して毎回照合する（SEC-1・#1915）。
+    pub(crate) fn with_protected_roots(mut self, roots: Vec<ProtectedFsRoot>) -> Self {
+        self.protected = roots;
+        self
+    }
+
+    /// 適用の段が照合する保護対象の実体。
+    pub(crate) fn protected_roots(&self) -> &[ProtectedFsRoot] {
+        &self.protected
+    }
+
     /// `mounts[]` を検証して bind の集合へ変換する。1 件でも拒否されれば全体を拒否する（fail-closed）。
     ///
     /// 件数は確保前に検証する。処理順は種類 → オプション → マウント元 → マウント先 → 先行 bind との関係。
@@ -320,7 +354,10 @@ impl BindMountSet {
                 recursive: opts.recursive,
             });
         }
-        Ok(Self { mounts: out })
+        Ok(Self {
+            mounts: out,
+            protected: Vec::new(),
+        })
     }
 
     /// 指定順の bind 一覧。

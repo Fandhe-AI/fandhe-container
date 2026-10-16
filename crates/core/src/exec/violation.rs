@@ -171,6 +171,8 @@ pub enum ViolationReason {
     BindSourceNotAccessible,
     /// bind mount の元が rootfs 自身またはその祖先である（#1913。SEC-1）。
     BindSourceContainsRootfs,
+    /// bind mount の元（または配下のマウント）が状態ストアのルートに到達する。適用の段が固定した元に対して判定する（#1915。SEC-1）。
+    BindSourceReachesStateRoot,
     /// bind mount 先の既存の種別が元と合わない（ディレクトリと通常ファイルの取り違え等。#1913。SEC-1）。
     BindTargetKindMismatch,
     /// rootless の基本デバイスノードの bind 元（ホストの `/dev/<名前>`）が、期待する文字デバイスではない
@@ -379,7 +381,7 @@ impl ViolationReason {
     ///
     /// 手書きの理由リストを別に持たず、種別（[`Self::kind`]）で絞って使う（[`Self::from_launch_token`]）。
     /// 足し忘れは単体テスト（`ALL` の件数が `as_str` の分岐数と一致すること）が検出する。
-    pub(super) const ALL: [ViolationReason; 57] = [
+    pub(super) const ALL: [ViolationReason; 58] = [
         Self::NoNamespaces,
         Self::HostnameWithoutUts,
         Self::PidWithoutMount,
@@ -412,6 +414,7 @@ impl ViolationReason {
         Self::BindSourceUnsupportedType,
         Self::BindSourceNotAccessible,
         Self::BindSourceContainsRootfs,
+        Self::BindSourceReachesStateRoot,
         Self::BindTargetKindMismatch,
         Self::HostDeviceNodeUnexpected,
         Self::RootfsIsHostRoot,
@@ -523,6 +526,7 @@ impl ViolationReason {
             Self::BindSourceUnsupportedType => "bind_source_unsupported_type",
             Self::BindSourceNotAccessible => "bind_source_not_accessible",
             Self::BindSourceContainsRootfs => "bind_source_contains_rootfs",
+            Self::BindSourceReachesStateRoot => "bind_source_reaches_state_root",
             Self::BindTargetKindMismatch => "bind_target_kind_mismatch",
             Self::HostDeviceNodeUnexpected => "host_device_node_unexpected",
             Self::RootfsIsHostRoot => "rootfs_is_host_root",
@@ -587,6 +591,7 @@ impl ViolationReason {
             | Self::BindSourceUnsupportedType
             | Self::BindSourceNotAccessible
             | Self::BindSourceContainsRootfs
+            | Self::BindSourceReachesStateRoot
             | Self::BindTargetKindMismatch
             | Self::HostDeviceNodeUnexpected => ViolationKind::MountTarget,
             Self::TargetOnSharedMount | Self::RootfsOnSharedMount => {
@@ -640,6 +645,7 @@ impl ViolationReason {
             | Self::BindSourceUnsupportedType
             | Self::BindSourceNotAccessible
             | Self::BindSourceContainsRootfs
+            | Self::BindSourceReachesStateRoot
             | Self::BindTargetKindMismatch => "SEC-1",
             Self::ExecTargetNotNestedPid1
             | Self::ExecTargetSharesPidNamespace
@@ -671,6 +677,7 @@ impl ViolationReason {
             | Self::BindSourceSymlink
             | Self::BindSourceUnsupportedType
             | Self::BindSourceContainsRootfs
+            | Self::BindSourceReachesStateRoot
             | Self::BindTargetKindMismatch
             | Self::RootfsIsHostRoot => ErrorCode::InvalidArgument,
             Self::BindSourceNotAccessible => ErrorCode::PermissionDenied,
@@ -800,6 +807,9 @@ impl ViolationReason {
             }
             Self::BindSourceContainsRootfs => {
                 "bind mount source must not be the rootfs or one of its ancestors"
+            }
+            Self::BindSourceReachesStateRoot => {
+                "bind mount source must not expose the container state store"
             }
             Self::BindTargetKindMismatch => {
                 "bind mount target kind does not match the source (directory vs regular file)"

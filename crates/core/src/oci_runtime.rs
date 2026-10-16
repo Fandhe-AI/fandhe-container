@@ -38,8 +38,10 @@ mod kill;
 mod launch;
 mod launcher;
 mod mount_destination;
+pub(crate) mod mountinfo_identity;
 mod start;
 
+pub(crate) use bind_mounts::ProtectedFsRoot;
 pub use bind_mounts::{
     BindMountError, BindMountErrorKind, BindMountSet, BindMountSpec, audit_bind_mount_error,
 };

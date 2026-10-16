@@ -881,6 +881,8 @@ impl LaunchOps for RealOps {
             devices: crate::exec::DevptsGidSource::Rootless(&gid_map),
             tmpfs: Some(&default_tmpfs),
             inject: None,
+            // bind mount の結線は #1915（それまで本番は載せない）。
+            binds: None,
             pinned_rootfs: Some(input.spec.rootfs_dir().as_fd()),
             config_paths: ConfigPaths {
                 readonly: input.spec.config().readonly_paths(),

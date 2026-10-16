@@ -291,6 +291,7 @@ launcher_pid=""
 launcher_start=""
 outfd=""
 report_pid=""
+report_buf=""
 intended_rc=""
 in_launch=0
 pending_rc=""
@@ -527,9 +528,17 @@ sup_create() {
 
 # 結果チャネル（FIFO）から FCSUP1 の 1 行を読み、OK なら report_pid を記録して 0。ERR・書式不正は計測失敗。未到着は 1。
 sup_report() {
-  local line=""
+  local chunk="" rc=0 line
   [ -z "$report_pid" ] || return 0
-  IFS= read -r -n 640 -t 0.01 -u "$outfd" line || true
+  # read -t は期限切れのとき、それまでに読めた途中の文字列を chunk へ返して消費する（終了コード 128 超）。
+  # 負荷でバイトの到着が 10ms を超えて分かれると途中で切れた行を誤って書式不正にするため、改行が来るまで
+  # report_buf へ継ぎ足す（行は supervisor が 1 回の書き込みで出すが、読み側は 1 バイトずつ読む）。
+  IFS= read -r -n 640 -t 0.01 -u "$outfd" chunk || rc=$?
+  report_buf+="$chunk"
+  if [ "$rc" -gt 128 ] && [ "${#report_buf}" -lt 640 ]; then
+    return 1
+  fi
+  line="$report_buf"
   [ -n "$line" ] || return 1
   if [[ "$line" =~ ^FCSUP1\ OK\ ([1-9][0-9]{0,9})$ ]]; then
     report_pid="${BASH_REMATCH[1]}"

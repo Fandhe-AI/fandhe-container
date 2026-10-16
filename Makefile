@@ -34,7 +34,7 @@ SHELL := /bin/bash
 	startup-latency-selftest net-setup-timing-selftest dns-helper-measure-selftest idle-memory-selftest \
 	idle-memory-supervised-selftest supervisor-pss-selftest concurrent-memory-selftest \
 	supervisor-independence-selftest restart-latency-selftest install-launcher-selftest deny deny-poc-venus-jig \
-	third-party-licenses install-cargo-about ci bench-check bench-plugin-boundary \
+	third-party-licenses install-cargo-about ci bench-check bench-check-manual bench-plugin-boundary \
 	bench-macos-cold-start bench-baseline cli-parity fio-bench fio-baseline-ratio startup-latency \
 	startup-latency-docker startup-latency-report net-setup-timing dns-helper-measure idle-memory \
 	idle-memory-supervised supervisor-pss concurrent-memory concurrent-memory-docker \
@@ -241,6 +241,9 @@ ci: lint-docs check-workspace-manifest fmt-check lint test doc deny ## ローカ
 
 bench-check: ## ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8。現状はプレースホルダベンチ）
 	@scripts/targets/bench-check.sh
+
+bench-check-manual: ## 実機前提ベンチ（起動 p95）の結果を基準値と比較する（REPAIR-8・#1901。CI では実行しない。BENCH_RESULTS=<絶対パス> 必須）
+	@scripts/with-tools.sh jq scripts/targets/bench-check-manual.sh
 
 bench-plugin-boundary: ## plugin 境界ベンチを実行し Δp50 と CORE-10 比をログ出力する（TASK-113.3・PLUG-5。基準値比較なし）
 	@scripts/targets/bench-plugin-boundary.sh

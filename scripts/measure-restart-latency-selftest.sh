@@ -306,6 +306,7 @@ run_case() {
     >"${root}/${name}.out" 2>"${root}/${name}.err" </dev/null || rc=$?
   if [ "$rc" -ne "$want" ]; then
     fail "${name}: exit code ${rc}, want ${want}"
+    sed -e "s/^/  [${name}.err] /" "${root}/${name}.err" >&2 2>/dev/null || true
     return 1
   fi
   if ! no_residue "${root}/d-${name}"; then fail "${name}: stub processes remain"; return 1; fi

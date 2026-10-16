@@ -12,7 +12,7 @@
 | metric | 向き | 単位 | 状態 |
 | ---- | ---- | ---- | ---- |
 | 小ファイル多数ワークロードの files/s | `higher_is_better` | 未確定（実測で確定。TASK-88.h1） | ハーネス実装済み（TASK-189・#1898。metric は `small_files_files_per_sec`）。`metrics.json`・`BENCH_NAMES` へ登録済み（#1899）。baseline 未登録のため `bench-check` の比較対象外 |
-| コンテナ起動レイテンシ p95 | `lower_is_better` | 未確定（同上） | ベンチ実装済み（TASK-190・#1900。metric は `startup_create_to_supervisor_ok_p95_ms`。`startup-latency-bench.md`）。実機前提で CI では実行しない。`metrics.json`・`BENCH_NAMES`・baseline へ未登録（登録は #1901。オーナー判断待ち） |
+| コンテナ起動レイテンシ p95 | `lower_is_better` | 未確定（同上） | ベンチ実装済み（TASK-190・#1900。metric は `startup_create_to_supervisor_ok_p95_ms`。`startup-latency-bench.md`）。実機前提で CI では実行しない。`metrics.json` へ登録済み（#1901。単位は ms）。`BENCH_NAMES` には入れず（`lib.sh` の `BENCH_MANUAL_NAMES`）、基準値は共有の `baseline.json` でなく `benches/baseline-manual.json`（未作成。実測は #230）。比較は人が実機で `make bench-check-manual`。CI では回帰を検出できない |
 | plugin 境界 代表操作 A の inproc / framed / Δp50（`plugin_boundary_op_a_{inproc,framed,delta}_p50`） | `lower_is_better`（ns） | 未確定（実測は未実施） | TASK-113.1・113.3 で実装済み。metrics.json・`BENCH_NAMES` に登録済み。baseline 未登録 |
 | plugin 境界 代表操作 B の inproc / framed / Δp50（`plugin_boundary_list_images_{inproc,framed,delta}_p50`） | `lower_is_better`（ns） | 未確定（実測は未実施） | TASK-113.2・113.3 で実装済み。登録状況は上と同じ |
 
@@ -22,11 +22,12 @@
 
 | 試行日時（UTC） | 実行環境 | 対象ベンチ | 結果 | 備考 |
 | ---- | ---- | ---- | ---- | ---- |
+| 2026-10-16 | Linux x86_64（ローカル開発機。ドライランのみ） | `make bench-baseline`（一時パス出力） | 実測なし。exit 0 で生成でき、生成物に `startup_create_to_supervisor_ok_p95_ms` が無いことを確認 | #1901。実機前提 metric を metrics から除く絞り込みの確認。生成物は破棄し、`benches/baseline.json` は変更していない |
 | 2026-09-30 | Linux x86_64（ローカル開発機。ドライランのみ） | `regression_placeholder` のみ | 実測不可。files/s・起動 p95 のベンチが存在しない | `make bench-baseline` を一時パス出力で実行し exit 0 で生成できることのみ確認（パイプライン疎通）。生成物は破棄し、`benches/baseline.json` は変更していない |
 
 ## 実測の前提条件
 
-1. files/s ベンチ（充足。#1898・#1899）と起動 p95 ベンチ（実装は充足〔#1900〕・登録は未充足〔#1901〕）が `benches/benches/` に実装され、`scripts/lib.sh` の `BENCH_NAMES` と `benches/metrics.json` に登録されている
+1. files/s ベンチ（充足。#1898・#1899）と起動 p95 ベンチ（実装は充足〔#1900〕・`metrics.json` への登録は充足〔#1901〕。実機前提のため `BENCH_NAMES` には入れず `BENCH_MANUAL_NAMES`）が `benches/benches/` に実装されている。files/s は `BENCH_NAMES` と `benches/metrics.json` にも登録されている
 2. 起動 p95 は TASK-29（コンテナ create/start）と supervisor の本番 launcher 結線（#1819）が完了している（充足）
 3. 計測環境の扱いが TASK-88.h1 で決まっている（下記）
 
@@ -49,7 +50,7 @@ placeholder ベンチの結果を `benches/baseline.json` へ書き出さない�
 
 - 計測環境: `bench-regression` は ubuntu-latest 単独で実行される。ローカル実機の値を基準にすると CI 上の比較が意味を持たない。CI runner 上で採るか、環境差の扱いを決める
 - 試行回数と集計: 単発か複数回の中央値か（生成器は 1 ベンチにつき results 1 ファイル）
-- 起動 p95 の計測権限: namespace 操作に root / rootless のどちらを使うか。実機前提テストとして分離するか（`.claude/rules/ci.md`）
+- 起動 p95 の計測権限: namespace 操作に root / rootless のどちらを使うか。実機前提テストとして分離するか（`.claude/rules/ci.md`）。#1901 は暫定の (b) に沿って実機前提として登録した（下記「CI の扱いの決定（TASK-190）」）。(c)/(d) を選ぶ場合の移行は、`lib.sh` の `BENCH_MANUAL_NAMES` / `BENCH_MANUAL_METRICS` から `startup_latency` を外して `BENCH_NAMES` と `BENCH_STAGED_NAMES` へ移し、基準値を `benches/baseline-manual.json` から共有の `baseline.json` へ移す
 - 15% 閾値と、placeholder 段階をいつ終了するか
 
 ## CI の扱いの決定（TASK-190）
@@ -69,14 +70,21 @@ TASK-190 は「CI で分離込みの起動を測れるか」を実装の前に�
 
 - (a)（区間を分ける）は採らない。特権なしで通る区間は `create` 単体だけで、それを「起動レイテンシ」と呼ぶと REPAIR-3 に反する
 - CI で走るのは単体テスト（`platform-ci` の `cargo test --workspace`。lib 側のテスト）だけ。引数なしのスモーク（何も起動しない）は bench ターゲットのため CI では走らず、`BENCH_NAMES` にも未登録で、手元で実行する
-- **REPAIR-8 の「CI で 15% 超の悪化を fail にする」は本 issue の時点では満たされない**。「REPAIR-8 を満たした」とは書かない。#1901 は、次の選択肢のオーナー判断（上の「起動 p95 の計測権限」）待ちでブロックされる
+- **REPAIR-8 の「CI で 15% 超の悪化を fail にする」は本 issue の時点では満たされない**。「REPAIR-8 を満たした」とは書かない。#1901 は暫定の (b) に沿って、起動 p95 を実機前提として回帰の仕組みへ登録した（`metrics.json` に metric、`lib.sh` に `BENCH_MANUAL_NAMES`、入口は `make bench-check-manual`）。CI では回帰を検出できず、REPAIR-8 の CI fail は未充足のまま。次の選択肢の判断（上の「起動 p95 の計測権限」）は引き続き #230 で行う
   - (c) hosted runner に sudo を追加して user manager を用意し、揺らぎを許容する
   - (d) self-hosted runner で比較する
   - (e) 実機の定期実測で基準値を管理する
 
 ## 既知の欠落（要ユーザー確認）
 
-files/s ベンチは TASK-189（#1898）で実装し、#1899 で `metrics.json`・`BENCH_NAMES` へ登録した（`small-files-bench.md`）。起動 p95 ベンチは TASK-190（#1900）で実装した（`startup-latency-bench.md`）。実機前提のため CI では測れず、回帰ゲートへの登録（#1901）はオーナー判断待ちである（下記「CI の扱いの決定（TASK-190）」）。
+files/s ベンチは TASK-189（#1898）で実装し、#1899 で `metrics.json`・`BENCH_NAMES` へ登録した（`small-files-bench.md`）。起動 p95 ベンチは TASK-190（#1900）で実装した（`startup-latency-bench.md`）。実機前提のため CI では測れず、#1901 で実機前提として `metrics.json` へ登録した（`BENCH_NAMES`・共有 `baseline.json` には入れない。基準値 `benches/baseline-manual.json` は #230 の実測後に作る）。CI で 15% 超の悪化を fail にする REPAIR-8 は未充足で、(c)/(d)/(e) の判断待ちである（下記「CI の扱いの決定（TASK-190）」）。
+
+## 実機前提ベンチの比較と基準値の作り方（#1901）
+
+- 比較: 実機で `cargo bench -p fandhe-container-benches --bench startup_latency -- <引数> --output <絶対パス>` を実行し、`make bench-check-manual BENCH_RESULTS=<その絶対パス>` で `benches/baseline-manual.json` と比べる。基準値が無い間は `skip:` を出して 0 で終わる（結果の検査は行う。失敗した実行・後始末の残りがある結果は 2）。`skip:` は合格の根拠にしない
+- 基準値の作り方（実測の後。#230）: `jq '.metrics |= {startup_create_to_supervisor_ok_p95_ms}' benches/metrics.json` を一時ファイルへ書き、`bash scripts/bench/generate_baseline.sh --metrics <その一時ファイル> --output benches/baseline-manual.json --environment "<一般化した環境>" <実測の結果>` を実行する。同じ手順が通ることは `make bench-check-selftest` が合成 fixture で確かめる。生成用ターゲットは未作成
+- 基準値と結果の `arch`・ホストの種類が違う比較には意味が無い。照合は機械化していないため、`environment` を見て人が判断する
+- Linux 以外: `startup_latency` は `bench_names_for_os` がどの OS でも返さず、`bench-baseline` の metrics からも全 OS で除く。ベンチ自体は Linux 以外で何も書かずに終わるため、比較できる結果は Linux の実測だけ
 
 ## 関連
 

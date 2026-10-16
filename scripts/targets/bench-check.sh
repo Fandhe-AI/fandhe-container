@@ -11,6 +11,8 @@
 # と small_files）は baseline.json に登録済みの metric に限って比較し、未登録の間は比較しない。それ以外のベンチ
 # （regression_placeholder 等）の未登録 metric は絞り込まず、check-bench-regression.sh が入力エラーにする
 # （登録漏れを検出する）。Windows は Unix 限定ベンチを実行しないため、baseline 側からもその metric を除いて比較する。
+# 実機前提ベンチ（lib.sh の BENCH_MANUAL_NAMES。起動 p95・#1901）は実行も比較もしない（CI では回帰を検出できない）。
+# 実機で採った結果の比較は make bench-check-manual（scripts/targets/bench-check-manual.sh）。
 # baseline 再生成（TASK-88.h1・TASK-113.h1）後は、再生成した metric がそのまま 15% 回帰判定の対象になり、本スクリプト
 # の追従修正が要らない。未登録の間は plugin 境界・files/s の性能回帰ゲートは未有効。
 set -euo pipefail

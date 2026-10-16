@@ -223,6 +223,127 @@ else
   failures=$((failures + 1))
 fi
 
+# --- 実機前提ベンチ（起動 p95。#1901・TASK-190 追補・REPAIR-8）---
+sl='"startup_create_to_supervisor_ok_p95_ms"'
+manual_script="${script_dir}/targets/bench-check-manual.sh"
+lib_sh="${repo_root}/scripts/lib.sh"
+
+# check <名> <条件の終了コード 0 なら PASS>: 結果の真偽を 1 件として数える。
+expect_eq() {
+  if [ "$2" = "$3" ]; then
+    echo "PASS: $1"
+  else
+    echo "FAIL: $1 (expected '$3', actual '$2')" >&2
+    failures=$((failures + 1))
+  fi
+}
+
+# lib の整合: 実機前提ベンチは CI 向けの一覧（BENCH_NAMES・段階登録・Unix 限定）に入らず、どの OS でも実行されない。
+manual_in_ci="$(bash -c 'source "$1"; for n in ${BENCH_MANUAL_NAMES}; do for l in "${BENCH_NAMES}" "${BENCH_STAGED_NAMES}" "${BENCH_UNIX_ONLY_NAMES}"; do case " ${l} " in *" ${n} "*) echo "in-ci:${n}" ;; esac; done; done' _ "${lib_sh}")"
+expect_eq "manual-bench-not-in-ci-lists" "${manual_in_ci}" ""
+expect_eq "manual-bench-not-run-on-linux" "$(bash -c 'unset OS; source "$1"; case " $(bench_names_for_os) " in *" startup_latency "*) echo yes ;; *) echo no ;; esac' _ "${lib_sh}")" "no"
+expect_eq "manual-bench-not-run-on-windows" "$(bash -c 'OS=Windows_NT; source "$1"; case " $(bench_names_for_os) " in *" startup_latency "*) echo yes ;; *) echo no ;; esac' _ "${lib_sh}")" "no"
+
+# metric の登録: ハーネスの定数（METRIC_NAME・METRIC_UNIT）と metrics.json が一致し、lib.sh の一覧に載る。
+sl_name="$(sed -n 's/^pub const METRIC_NAME: &str = "\(.*\)";$/\1/p' "${repo_root}/benches/src/startup_latency/output.rs")"
+sl_unit="$(sed -n 's/^pub const METRIC_UNIT: &str = "\(.*\)";$/\1/p' "${repo_root}/benches/src/startup_latency/output.rs")"
+if jq -e --arg n "${sl_name}" --arg u "${sl_unit}" \
+  '.metrics[$n] | .unit == $u and .direction == "lower_is_better"' "${repo_root}/benches/metrics.json" >/dev/null; then
+  echo "PASS: startup-p95-metric-registered (${sl_name} ${sl_unit})"
+else
+  echo "FAIL: startup-p95-metric-registered (${sl_name} ${sl_unit})" >&2
+  failures=$((failures + 1))
+fi
+expect_eq "startup-p95-metric-in-lib" "$(bash -c 'source "$1"; echo "${BENCH_MANUAL_METRICS}"' _ "${lib_sh}")" "${sl_name}"
+
+# bench-baseline の metrics 絞り込み: 実機前提 metric は全 OS で除き、Windows では Unix 限定 metric も除く。
+write_metrics "${ph}: {\"unit\": \"ops/s\", \"direction\": \"higher_is_better\"}, \"plugin_boundary_op_a_inproc_p50\": {\"unit\": \"ns\", \"direction\": \"lower_is_better\"}, \"small_files_files_per_sec\": {\"unit\": \"files/s\", \"direction\": \"higher_is_better\"}, ${sl}: {\"unit\": \"ms\", \"direction\": \"lower_is_better\"}" "${gate_tmp}/mix.json"
+bash -c 'unset OS; source "$1"; bench_filter_metrics_for_run "$2" "$3"' _ "${lib_sh}" "${gate_tmp}/mix.json" "${gate_tmp}/mix-linux.json"
+expect_eq "filter-metrics-linux" "$(jq -c '.metrics | keys' "${gate_tmp}/mix-linux.json")" '["placeholder_throughput","plugin_boundary_op_a_inproc_p50","small_files_files_per_sec"]'
+bash -c 'OS=Windows_NT; source "$1"; bench_filter_metrics_for_run "$2" "$3"' _ "${lib_sh}" "${gate_tmp}/mix.json" "${gate_tmp}/mix-win.json"
+expect_eq "filter-metrics-windows" "$(jq -c '.metrics | keys' "${gate_tmp}/mix-win.json")" '["placeholder_throughput"]'
+
+# CI 経路への影響なし: metrics.json に起動 p95 が増えても、bench-check の段階登録の判定は変わらない。
+write_metrics "${all_metrics}, ${sl}: {\"unit\": \"ms\", \"direction\": \"lower_is_better\"}" "${gate_tmp}/metrics-with-sl.json"
+write_baseline "${gate_tmp}/b-ph.json" "${ph}" 1000 ops/s higher_is_better
+run_gate_case "gate-manual-metric-in-metrics-no-effect" "${gate_tmp}/b-ph.json" "${gate_tmp}/metrics-with-sl.json" "${staged}" 0 0
+
+# bench-check-manual.sh: 基準値・metrics は必ず一時パスへ向ける（リポジトリの benches/ を読ませない）。
+mk_dir="${gate_tmp}/manual"
+mkdir "${mk_dir}"
+write_metrics "${ph}: {\"unit\": \"ops/s\", \"direction\": \"higher_is_better\"}, ${sl}: {\"unit\": \"ms\", \"direction\": \"lower_is_better\"}" "${mk_dir}/metrics.json"
+# 結果 JSON: <ファイル> <値> [追加の JSON オブジェクト断片（failures 等）]
+write_manual_results() {
+  printf '{"schema_version": 1, "metrics": {%s: {"value": %s, "unit": "ms"}}%s}\n' "${sl}" "$2" "${3:+, $3}" >"$1"
+}
+run_manual_case() {
+  local name="$1" res="$2" bl="$3" mt="$4" expected="$5" actual=0
+  BENCH_RESULTS="${res}" BENCH_MANUAL_BASELINE="${bl}" BENCH_METRICS="${mt}" \
+    bash "${manual_script}" >"${mk_dir}/out.txt" 2>&1 || actual=$?
+  if [ "${actual}" -eq "${expected}" ]; then
+    echo "PASS: ${name} (exit=${actual})"
+  else
+    echo "FAIL: ${name} (expected exit=${expected}, actual exit=${actual})" >&2
+    failures=$((failures + 1))
+  fi
+}
+write_baseline "${mk_dir}/baseline.json" "${sl}" 100 ms lower_is_better
+
+write_manual_results "${mk_dir}/ok.json" 100
+run_manual_case "manual-no-baseline-skips" "${mk_dir}/ok.json" "${mk_dir}/none.json" "${mk_dir}/metrics.json" 0
+if grep -q '^skip: ' "${mk_dir}/out.txt"; then
+  echo "PASS: manual-no-baseline-prints-skip"
+else
+  echo "FAIL: manual-no-baseline-prints-skip" >&2
+  failures=$((failures + 1))
+fi
+printf '{"schema_version": 1, "metrics": {}, "failures": {"total": 1}}\n' >"${mk_dir}/failed.json"
+run_manual_case "manual-no-baseline-failed-run" "${mk_dir}/failed.json" "${mk_dir}/none.json" "${mk_dir}/metrics.json" 2
+write_manual_results "${mk_dir}/failures.json" 100 '"failures": {"total": 2}'
+run_manual_case "manual-no-baseline-failures-total" "${mk_dir}/failures.json" "${mk_dir}/none.json" "${mk_dir}/metrics.json" 2
+write_manual_results "${mk_dir}/leftover.json" 100 '"leftover_ids": ["abc"]'
+run_manual_case "manual-no-baseline-leftover" "${mk_dir}/leftover.json" "${mk_dir}/none.json" "${mk_dir}/metrics.json" 2
+printf '{"schema_version": 1, "metrics": {%s: {"value": 100, "unit": "ms"}, %s: {"value": 1, "unit": "ops/s"}}}\n' "${sl}" "${ph}" >"${mk_dir}/mixed.json"
+run_manual_case "manual-result-with-ci-metric" "${mk_dir}/mixed.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 2
+
+# metric の値・単位の不正は基準値の有無に関わらず 2（既定経路で exit 0 にしない）
+for bad in '{}' '{"value": "100", "unit": "ms"}' '{"value": 0, "unit": "ms"}' '{"value": -5, "unit": "ms"}' \
+  '{"unit": "ms"}' '{"value": 100}' '{"value": 100, "unit": "s"}' 'null'; do
+  printf '{"schema_version": 1, "metrics": {%s: %s}}\n' "${sl}" "${bad}" >"${mk_dir}/bad.json"
+  run_manual_case "manual-no-baseline-invalid-metric ${bad}" "${mk_dir}/bad.json" "${mk_dir}/none.json" "${mk_dir}/metrics.json" 2
+  run_manual_case "manual-with-baseline-invalid-metric ${bad}" "${mk_dir}/bad.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 2
+done
+
+write_manual_results "${mk_dir}/r115.json" 115
+run_manual_case "manual-exactly-15-percent-worse" "${mk_dir}/r115.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 0
+write_manual_results "${mk_dir}/r116.json" 116
+run_manual_case "manual-16-percent-worse" "${mk_dir}/r116.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 1
+write_manual_results "${mk_dir}/r80.json" 80
+run_manual_case "manual-improvement" "${mk_dir}/r80.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 0
+write_metrics "${ph}: {\"unit\": \"ops/s\", \"direction\": \"higher_is_better\"}" "${mk_dir}/metrics-removed.json"
+run_manual_case "manual-registered-metric-removed" "${mk_dir}/ok.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics-removed.json" 2
+write_baseline "${mk_dir}/baseline-ci.json" "${sl}" 100 ms lower_is_better "${ph}" 1000 ops/s higher_is_better
+run_manual_case "manual-baseline-with-ci-metric" "${mk_dir}/ok.json" "${mk_dir}/baseline-ci.json" "${mk_dir}/metrics.json" 2
+
+# 入力検証: 未指定・相対パス・存在しない・symlink
+run_manual_case "manual-results-unset" "" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 2
+run_manual_case "manual-results-relative" "ok.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 2
+run_manual_case "manual-results-missing" "${mk_dir}/missing.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 2
+ln -s "${mk_dir}/ok.json" "${mk_dir}/link.json"
+run_manual_case "manual-results-symlink" "${mk_dir}/link.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 2
+
+# 基準値の生成手順（bench-calibration.md）の疎通: 実機前提 metric に絞った metrics で generate_baseline.sh が生成でき、
+# その生成物を基準値にした比較が通る。
+jq '.metrics |= {startup_create_to_supervisor_ok_p95_ms}' "${repo_root}/benches/metrics.json" >"${mk_dir}/metrics-manual-only.json"
+if bash "${script_dir}/bench/generate_baseline.sh" --metrics "${mk_dir}/metrics-manual-only.json" \
+  --output "${mk_dir}/generated.json" --environment "selftest" "${mk_dir}/ok.json" >/dev/null 2>&1; then
+  echo "PASS: manual-baseline-generation (exit=0)"
+else
+  echo "FAIL: manual-baseline-generation" >&2
+  failures=$((failures + 1))
+fi
+run_manual_case "manual-generated-baseline-compares" "${mk_dir}/ok.json" "${mk_dir}/generated.json" "${repo_root}/benches/metrics.json" 0
+
 if [ "$failures" -gt 0 ]; then
   echo "self-test failed: ${failures} case(s) did not match the expected exit code" >&2
   exit 1

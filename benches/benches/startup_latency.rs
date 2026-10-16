@@ -13,6 +13,7 @@
 //! エラーは標準エラーへ 1 行の JSON（`code` / `message`）で出し、非ゼロで終わる。
 
 use fandhe_container_benches::startup_latency::args::{Command, parse_args};
+use fandhe_container_benches::startup_latency::output::write_new;
 use fandhe_container_benches::startup_latency::{
     Execution, StartupLatencyError, execute, run_workload,
 };
@@ -39,12 +40,7 @@ fn run() -> Result<ExitCode, StartupLatencyError> {
             clean,
         } => {
             if let Some(path) = output {
-                std::fs::write(&path, &json).map_err(|e| {
-                    StartupLatencyError::new(
-                        "io-error",
-                        format!("write output failed ({:?})", e.kind()),
-                    )
-                })?;
+                write_new(&path, &json)?;
             }
             print!("{json}");
             Ok(if clean {

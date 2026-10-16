@@ -87,6 +87,23 @@ fn ms(d: Duration) -> String {
     format!("{:.3}", d.as_secs_f64() * 1000.0)
 }
 
+/// 結果を `path` へ新規作成で書く。`create_new`（O_CREAT|O_EXCL）で開くため、既存の FIFO・symlink・ファイルは
+/// 開かずに失敗する（FIFO で無期限に止まらず、symlink の参照先を上書きしない。REPAIR-5）。
+/// 親ディレクトリと既存の有無は計測の開始前に `bin_check::verify_output_target` が検証する。
+pub fn write_new(path: &std::path::Path, json: &str) -> Result<(), StartupLatencyError> {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| {
+            StartupLatencyError::new("io-error", format!("write output failed ({:?})", e.kind()))
+        })?;
+    f.write_all(json.as_bytes()).map_err(|e| {
+        StartupLatencyError::new("io-error", format!("write output failed ({:?})", e.kind()))
+    })
+}
+
 /// JSON を組み立てる。metric の値が 0 以下になる場合は `invalid-measurement`。
 pub fn render_json(result: &RunResult) -> Result<String, StartupLatencyError> {
     let totals: Vec<Duration> = result.samples.iter().map(|s| s.total).collect();
@@ -179,6 +196,26 @@ pub fn render_json(result: &RunResult) -> Result<String, StartupLatencyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn write_new_creates_once_and_never_follows_a_symlink() {
+        let dir = std::env::temp_dir().join(format!("fc-out-wn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).expect("mkdir");
+        let out = dir.join("r.json");
+        write_new(&out, "{}").expect("first write");
+        assert_eq!(std::fs::read_to_string(&out).expect("read"), "{}");
+        assert_eq!(write_new(&out, "x").unwrap_err().code, "io-error");
+        assert_eq!(std::fs::read_to_string(&out).expect("read"), "{}");
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "keep").expect("write");
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&victim, &link).expect("symlink");
+        assert_eq!(write_new(&link, "x").unwrap_err().code, "io-error");
+        assert_eq!(std::fs::read_to_string(&victim).expect("read"), "keep");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
 
     fn params() -> Params {
         Params {

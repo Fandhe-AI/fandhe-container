@@ -12,7 +12,7 @@
 
 use super::StartupLatencyError;
 use super::args::Plan;
-use super::bin_check::{verify_executable, verify_work_base};
+use super::bin_check::{verify_executable, verify_output_target, verify_work_base};
 use super::bundle::build_bundle;
 use super::output::{Failures, Params, RunResult, Sample, render_json};
 use super::probe_env::effective_uid;
@@ -677,6 +677,10 @@ pub fn run(mut plan: Plan) -> Result<super::Execution, StartupLatencyError> {
             "unsupported-environment",
             "must run as a non-root user",
         ));
+    }
+    // 出力先は計測の開始前に検証する（FIFO・symlink・既存ファイルを後から開かない）。
+    if let Some(out) = &plan.output {
+        verify_output_target(out, euid)?;
     }
     // 検証済みの実体パスで置き換え、起動には字面のパスを使わない（symlink 解決途中の差し替え対策）。
     plan.supervisor_bin = verify_executable(&plan.supervisor_bin, euid)?;

@@ -124,6 +124,28 @@ mod linux {
         assert_eq!(e.code, want);
     }
 
+    /// 既存の出力先（FIFO・symlink 等を含む）は、計測を始める前に拒否される（開かない）。
+    #[test]
+    fn existing_output_target_is_rejected_before_launch() {
+        if is_root() {
+            return; // root は入口で unsupported-environment になる。
+        }
+        let d = Dir::new("out");
+        let sup = d.exe("sup", 0o755);
+        let sd = d.exe("sd", 0o755);
+        let existing = d.exe("r.json", 0o600);
+        let e = measure_err(&[
+            "--supervisor-bin",
+            sup.to_str().expect("utf8"),
+            "--systemd-run",
+            sd.to_str().expect("utf8"),
+            "--output",
+            existing.to_str().expect("utf8"),
+        ]);
+        assert_eq!(e.code, "untrusted-output");
+        assert_eq!(e.message, "output path already exists");
+    }
+
     /// 他者が書き込める作業ディレクトリの親は、作業ディレクトリを作る前に拒否される。
     #[test]
     fn world_writable_work_dir_parent_is_rejected_before_creating_anything() {

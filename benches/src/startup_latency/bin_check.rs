@@ -102,7 +102,33 @@ fn ancestor_verdict(owner: u32, mode: u32, euid: u32) -> Result<(), &'static str
 /// 祖先を別ユーザーが差し替えられると、作業ディレクトリを rename で別の場所へ向けられ、後続の
 /// コピーが呼び出しユーザーの任意のファイルへ書いてしまうため。呼び出し側は返したパスだけを使う。
 pub fn verify_work_base(base: &Path, euid: u32) -> Result<PathBuf, StartupLatencyError> {
-    let deny = |m: &str| StartupLatencyError::new("untrusted-work-dir", m);
+    verify_dir_chain(base, euid, "untrusted-work-dir")
+}
+
+/// 結果の出力先 `path`（`--output`）を計測の開始前に検証する（TASK-190・REPAIR-5・OWASP 不安全な設計）。
+///
+/// 親ディレクトリを `verify_work_base` と同じ基準で検証し（コード `untrusted-output`）、出力先がすでに
+/// 存在する（FIFO・symlink・通常ファイルを問わず）なら拒否する。計測後の書き込みが FIFO で無期限に停止したり、
+/// symlink の参照先を上書きしたりするのを避ける。書き込みは `output::write_new` の `create_new` が担う。
+pub fn verify_output_target(path: &Path, euid: u32) -> Result<(), StartupLatencyError> {
+    let deny = |m: &str| StartupLatencyError::new("untrusted-output", m);
+    let parent = path
+        .parent()
+        .ok_or_else(|| deny("output path has no parent directory"))?;
+    verify_dir_chain(parent, euid, "untrusted-output")?;
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(deny("output path is not accessible")),
+        Ok(_) => Err(deny("output path already exists")),
+    }
+}
+
+fn verify_dir_chain(
+    base: &Path,
+    euid: u32,
+    code: &'static str,
+) -> Result<PathBuf, StartupLatencyError> {
+    let deny = |m: &str| StartupLatencyError::new(code, m);
     if !base.is_absolute() {
         return Err(StartupLatencyError::new(
             "invalid-args",
@@ -171,6 +197,48 @@ mod tests {
         assert!(ancestor_verdict(1000, 0o775, 1000).is_err());
         // sticky 付き（/tmp 型）は許す。
         assert_eq!(ancestor_verdict(0, 0o1777, 1000), Ok(()));
+    }
+
+    #[test]
+    fn output_target_must_be_new_in_a_trusted_parent() {
+        let d = Dir::new("out");
+        assert_eq!(verify_output_target(&d.0.join("r.json"), euid()), Ok(()));
+        // 既存の通常ファイル・symlink・FIFO 相当の存在は拒否する（開かない）。
+        let existing = d.file("exists.json", 0o600);
+        let e = verify_output_target(&existing, euid()).unwrap_err();
+        assert_eq!(
+            (e.code, e.message.as_str()),
+            ("untrusted-output", "output path already exists")
+        );
+        let link = d.0.join("link.json");
+        std::os::unix::fs::symlink(&existing, &link).expect("symlink");
+        assert_eq!(
+            verify_output_target(&link, euid()).unwrap_err().code,
+            "untrusted-output"
+        );
+        let dangling = d.0.join("dangling.json");
+        std::os::unix::fs::symlink(d.0.join("nowhere"), &dangling).expect("symlink");
+        assert_eq!(
+            verify_output_target(&dangling, euid()).unwrap_err().message,
+            "output path already exists"
+        );
+    }
+
+    #[test]
+    fn output_target_with_untrusted_parent_is_rejected() {
+        let d = Dir::new("outp");
+        let sub = d.0.join("sub");
+        std::fs::create_dir(&sub).expect("mkdir");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+        let e = verify_output_target(&sub.join("r.json"), euid()).unwrap_err();
+        assert_eq!(e.code, "untrusted-output");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        assert_eq!(
+            verify_output_target(&d.0.join("missing").join("r.json"), euid())
+                .unwrap_err()
+                .code,
+            "untrusted-output"
+        );
     }
 
     #[test]

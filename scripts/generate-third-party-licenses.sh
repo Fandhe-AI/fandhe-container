@@ -91,7 +91,7 @@ cleanup() {
         kill -KILL -- "-$child_pid" 2>/dev/null || true
     fi
     if [ -n "$wd_pid" ]; then
-        kill "$wd_pid" 2>/dev/null || true
+        kill -KILL "$wd_pid" 2>/dev/null || true
     fi
     [ -z "$tmp" ] || rm -f "$tmp"
     [ -z "$work_dir" ] || rm -rf "$work_dir"
@@ -115,6 +115,8 @@ run_limited() {
     set +m
     child_pid="$pid"
     (
+        # 親の EXIT / TERM trap（cleanup）を引き継がない
+        trap - EXIT INT TERM
         i=0
         while [ "$i" -lt "$limit" ]; do
             sleep 1
@@ -142,7 +144,7 @@ run_limited() {
         rm -f "$marker"
         return 124
     fi
-    kill "$wd_pid" 2>/dev/null || true
+    kill -KILL "$wd_pid" 2>/dev/null || true
     wait "$wd_pid" 2>/dev/null || true
     wd_pid=""
     child_pid=""

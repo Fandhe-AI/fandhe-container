@@ -1,5 +1,6 @@
-# コンテナ起動レイテンシ p95 ベンチの計測定義（TASK-190・REPAIR-8・CORE-10）
+# コンテナ起動レイテンシ p95 ベンチの計測定義（TASK-190・MS-2・CORE-10・REPAIR-8）
 
+- 対応: TASK-190（MS-2。前提の TASK-29・TASK-157 と後続の TASK-88 が MS-2 にあるため割り当て）・ビヘイビア CORE-10・REPAIR-8
 - 対象: `benches/benches/startup_latency.rs`（薄い入口）と `benches/src/startup_latency/`（計測ロジック）。Issue #1900
 - ステータス: **ベンチ実装済み・実測は未実施（人間担当）・回帰ゲート未登録**。`metrics.json`・`BENCH_NAMES`・`baseline.json` は変更していない（登録は #1901。実装済みを装わない。REPAIR-3）
 - CI での扱い（実機前提として分離・REPAIR-8 の「CI で 15% 超の悪化を fail」は未充足）は [bench-calibration.md](bench-calibration.md)「CI の扱いの決定（TASK-190）」

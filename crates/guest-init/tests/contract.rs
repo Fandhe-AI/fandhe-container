@@ -252,7 +252,9 @@ impl Tmp {
         ));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
-        Self(p)
+        // macOS の一時ディレクトリは `/var`（`/private/var` への symlink）配下にある。ホストの共有ディレクトリ検査は
+        // 経路上の symlink を拒否する（MAC-1・TASK-65.1）ため、実体パスへ正規化して使う。
+        Self(std::fs::canonicalize(&p).unwrap())
     }
 }
 impl Drop for Tmp {
@@ -374,4 +376,25 @@ fn mac1_io5_host_effective_cmdline_enables_probe_only_when_requested() {
         host::parse_directives(on_cmdline.as_str()).unwrap().len(),
         1
     );
+}
+
+/// MAC-1・TASK-65.1: 共有ディレクトリの経路に symlink があれば、その接頭辞を指して拒否する（OS 非依存の回帰）。
+///
+/// macOS で一時ディレクトリが `/var` の symlink 配下になり検査が通らなかった失敗（main の CI）を、
+/// Linux でも symlink を挟んだディレクトリで再現して捕まえる。
+#[cfg(unix)]
+#[test]
+fn mac1_shared_dir_under_symlinked_ancestor_is_rejected() {
+    use fandhe_container_platform_macos::config::ConfigError;
+    use fandhe_container_platform_macos::virtiofs::SharedDirectoryPath;
+    let t = Tmp::new("symlink-anc");
+    let real = t.0.join("real");
+    std::fs::create_dir_all(real.join("share")).unwrap();
+    let link = t.0.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert_eq!(
+        SharedDirectoryPath::try_new(&link.join("share")),
+        Err(ConfigError::SharedDirSymlink { path: link })
+    );
+    assert!(SharedDirectoryPath::try_new(&real.join("share")).is_ok());
 }

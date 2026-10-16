@@ -75,21 +75,47 @@ fn verify_ancestor(dir: &Path, euid: u32) -> Result<(), StartupLatencyError> {
     if !meta.is_dir() {
         return Err(untrusted("ancestor is not a directory"));
     }
-    if meta.uid() != euid && meta.uid() != 0 {
-        return Err(untrusted(
-            "ancestor directory owner is neither the caller nor root",
-        ));
+    ancestor_verdict(meta.uid(), meta.mode(), euid).map_err(untrusted)
+}
+
+/// 祖先ディレクトリのメタデータ（所有者 UID・mode）だけで決まる判定。ファイルシステムに触れない純関数。
+/// 所有者が `euid` か root でなければ拒否し、sticky なしで other / group 書き込み可なら拒否する。
+fn ancestor_verdict(owner: u32, mode: u32, euid: u32) -> Result<(), &'static str> {
+    if owner != euid && owner != 0 {
+        return Err("ancestor directory owner is neither the caller nor root");
     }
-    let mode = meta.mode();
     if mode & 0o1000 == 0 {
         if mode & 0o002 != 0 {
-            return Err(untrusted("ancestor directory is writable by others"));
+            return Err("ancestor directory is writable by others");
         }
         if mode & 0o020 != 0 {
-            return Err(untrusted("ancestor directory is writable by a group"));
+            return Err("ancestor directory is writable by a group");
         }
     }
     Ok(())
+}
+
+/// 作業ディレクトリを作る親 `base` を検証し、実体パス（canonicalize 済み）を返す（TASK-190・OWASP 不安全な設計）。
+///
+/// `base` 自身と、字面上・実体の全祖先が `verify_executable` と同じ基準（所有者は `euid` か root・
+/// group / other 書き込み不可、sticky 付きは可）を満たさなければ `untrusted-work-dir` で拒否する。
+/// 祖先を別ユーザーが差し替えられると、作業ディレクトリを rename で別の場所へ向けられ、後続の
+/// コピーが呼び出しユーザーの任意のファイルへ書いてしまうため。呼び出し側は返したパスだけを使う。
+pub fn verify_work_base(base: &Path, euid: u32) -> Result<PathBuf, StartupLatencyError> {
+    let deny = |m: &str| StartupLatencyError::new("untrusted-work-dir", m);
+    if !base.is_absolute() {
+        return Err(StartupLatencyError::new(
+            "invalid-args",
+            "work directory must be absolute",
+        ));
+    }
+    let real = std::fs::canonicalize(base).map_err(|_| deny("work directory is not accessible"))?;
+    for chain in [base, real.as_path()] {
+        for dir in chain.ancestors() {
+            verify_ancestor(dir, euid).map_err(|e| deny(&e.message))?;
+        }
+    }
+    Ok(real)
 }
 
 #[cfg(test)]
@@ -131,6 +157,78 @@ mod tests {
 
     fn euid() -> u32 {
         effective_uid().expect("euid")
+    }
+
+    #[test]
+    fn ancestor_verdict_matches_owner_and_mode_rules() {
+        // 自分・root 所有で 0755 は可。
+        assert_eq!(ancestor_verdict(1000, 0o755, 1000), Ok(()));
+        assert_eq!(ancestor_verdict(0, 0o755, 1000), Ok(()));
+        // 別ユーザー所有は拒否。
+        assert!(ancestor_verdict(1001, 0o755, 1000).is_err());
+        // other / group 書き込み可（sticky なし）は拒否。
+        assert!(ancestor_verdict(0, 0o777, 1000).is_err());
+        assert!(ancestor_verdict(1000, 0o775, 1000).is_err());
+        // sticky 付き（/tmp 型）は許す。
+        assert_eq!(ancestor_verdict(0, 0o1777, 1000), Ok(()));
+    }
+
+    #[test]
+    fn work_base_accepts_private_dir_and_returns_real_path() {
+        let d = Dir::new("wbok");
+        let real = verify_work_base(&d.0, euid()).expect("ok");
+        assert_eq!(real, std::fs::canonicalize(&d.0).expect("canon"));
+    }
+
+    #[test]
+    fn work_base_rejects_relative_and_missing() {
+        assert_eq!(
+            verify_work_base(Path::new("rel"), euid()).unwrap_err().code,
+            "invalid-args"
+        );
+        let d = Dir::new("wbmiss");
+        assert_eq!(
+            verify_work_base(&d.0.join("none"), euid())
+                .unwrap_err()
+                .code,
+            "untrusted-work-dir"
+        );
+    }
+
+    #[test]
+    fn work_base_with_other_writable_ancestor_is_rejected() {
+        let d = Dir::new("wbww");
+        let sub = d.0.join("sub");
+        std::fs::create_dir(&sub).expect("mkdir");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        std::fs::set_permissions(&d.0, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+        let e = verify_work_base(&sub, euid()).unwrap_err();
+        assert_eq!(e.code, "untrusted-work-dir");
+        assert_eq!(e.message, "ancestor directory is writable by others");
+        std::fs::set_permissions(&d.0, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+
+    #[test]
+    fn work_base_with_foreign_owner_is_rejected_when_euid_differs() {
+        // 自分所有のディレクトリを「別ユーザーの euid」で検証すると、所有者不一致で拒否される。
+        let d = Dir::new("wbown");
+        let other = euid().wrapping_add(12345);
+        assert_eq!(
+            verify_work_base(&d.0, other).unwrap_err().code,
+            "untrusted-work-dir"
+        );
+    }
+
+    #[test]
+    fn work_base_through_symlink_is_resolved_and_ancestors_checked() {
+        let d = Dir::new("wbsym");
+        let target = d.0.join("t");
+        std::fs::create_dir(&target).expect("mkdir");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let link = d.0.join("l");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let real = verify_work_base(&link, euid()).expect("ok");
+        assert_eq!(real, std::fs::canonicalize(&target).expect("canon"));
     }
 
     #[test]

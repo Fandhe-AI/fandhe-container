@@ -12,7 +12,7 @@
 
 use super::StartupLatencyError;
 use super::args::Plan;
-use super::bin_check::verify_executable;
+use super::bin_check::{verify_executable, verify_work_base};
 use super::bundle::build_bundle;
 use super::output::{Failures, Params, RunResult, Sample, render_json};
 use super::probe_env::effective_uid;
@@ -682,11 +682,14 @@ pub fn run(mut plan: Plan) -> Result<super::Execution, StartupLatencyError> {
     plan.supervisor_bin = verify_executable(&plan.supervisor_bin, euid)?;
     plan.systemd_run = verify_executable(&plan.systemd_run, euid)?;
 
-    let base: PathBuf = match &plan.work_dir {
-        Some(d) => d.clone(),
-        None => std::fs::canonicalize(std::env::temp_dir())
-            .map_err(|e| io_err("canonicalize temp dir", &e))?,
-    };
+    // 作業ディレクトリの親は全祖先の所有者・書き込み権限を検証し、実体パスだけを使う。
+    let base: PathBuf = verify_work_base(
+        &match &plan.work_dir {
+            Some(d) => d.clone(),
+            None => std::env::temp_dir(),
+        },
+        euid,
+    )?;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())

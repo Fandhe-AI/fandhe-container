@@ -8,7 +8,7 @@
 //! bundle は計測の前に 1 回だけ作り、全試行で再利用する（区間の外）。
 
 use super::StartupLatencyError;
-use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 fn io_err(what: &'static str, e: &std::io::Error) -> StartupLatencyError {
@@ -28,6 +28,20 @@ fn chmod(path: &Path, mode: u32) -> Result<(), StartupLatencyError> {
         .map_err(|e| io_err("set permissions", &e))
 }
 
+/// `src` を `dest` へ新規作成でコピーする。宛先は `create_new`（O_CREAT|O_EXCL）で開くため、既存のファイルや
+/// symlink があれば（指す先を辿らずに）失敗し、呼び出しユーザーの任意のファイルを上書きしない。mode は 0755。
+fn copy_new(src: &Path, dest: &Path, what: &'static str) -> Result<(), StartupLatencyError> {
+    let mut input = std::fs::File::open(src).map_err(|e| io_err(what, &e))?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .open(dest)
+        .map_err(|e| io_err(what, &e))?;
+    std::io::copy(&mut input, &mut output).map_err(|e| io_err(what, &e))?;
+    chmod(dest, 0o755)
+}
+
 /// `host` のファイルを rootfs 内の同じ絶対パスへコピーする。
 fn copy_into(rootfs: &Path, host: &Path) -> Result<(), StartupLatencyError> {
     let rel = host
@@ -38,8 +52,7 @@ fn copy_into(rootfs: &Path, host: &Path) -> Result<(), StartupLatencyError> {
         mkdir_all(parent, 0o755)?;
     }
     let _ = std::fs::remove_file(&dest);
-    std::fs::copy(host, &dest).map_err(|e| io_err("copy library", &e))?;
-    chmod(&dest, 0o755)
+    copy_new(host, &dest, "copy library")
 }
 
 /// ELF64（リトルエンディアン）の `PT_INTERP`（動的ローダのパス）を返す。範囲は `get()` と checked 演算で検査する。
@@ -111,8 +124,7 @@ fn make_rootfs(rootfs: &Path) -> Result<String, StartupLatencyError> {
     let exe = std::env::current_exe().map_err(|e| io_err("resolve current exe", &e))?;
     let exe = std::fs::canonicalize(exe).map_err(|e| io_err("canonicalize current exe", &e))?;
     let probe = rootfs.join("probe");
-    std::fs::copy(&exe, &probe).map_err(|e| io_err("copy probe binary", &e))?;
-    chmod(&probe, 0o755)?;
+    copy_new(&exe, &probe, "copy probe binary")?;
     let bytes = std::fs::read(&exe).map_err(|e| io_err("read current exe", &e))?;
     if let Some(interp) = elf_interp(&bytes) {
         copy_into(rootfs, Path::new(&interp))?;
@@ -201,5 +213,38 @@ mod tests {
 7f02-7f03 r-xp 0 00:00 0\n\
 7f03-7f04 r-xp 0 00:00 0 /nonexistent/libx.so\n";
         assert!(libraries_from_maps(maps, Path::new("/x/exe")).is_empty());
+    }
+
+    #[test]
+    fn copy_new_refuses_existing_symlink_without_following_it() {
+        let dir = std::env::temp_dir().join(format!("fc-bundle-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).expect("mkdir");
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"keep").expect("write");
+        let src = dir.join("src");
+        std::fs::write(&src, b"new").expect("write");
+        let dest = dir.join("dest");
+        std::os::unix::fs::symlink(&victim, &dest).expect("symlink");
+        let e = copy_new(&src, &dest, "copy test").unwrap_err();
+        assert_eq!(e.code, "io-error");
+        assert_eq!(std::fs::read(&victim).expect("read"), b"keep");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn copy_new_refuses_existing_file_and_creates_new_with_0755() {
+        let dir = std::env::temp_dir().join(format!("fc-bundle-copy2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).expect("mkdir");
+        let src = dir.join("src");
+        std::fs::write(&src, b"new").expect("write");
+        let dest = dir.join("dest");
+        copy_new(&src, &dest, "copy test").expect("first copy");
+        assert_eq!(std::fs::read(&dest).expect("read"), b"new");
+        let mode = std::fs::metadata(&dest).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+        assert!(copy_new(&src, &dest, "copy test").is_err());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 }

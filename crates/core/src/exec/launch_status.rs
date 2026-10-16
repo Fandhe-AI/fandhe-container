@@ -399,6 +399,35 @@ pub(super) fn read_line_bounded<const N: usize>(
     }
 }
 
+/// 結合試験専用: 段 `mount_binds` の違反 `reason` を、子の符号化・状態 pipe・親の復号と記録まで本番と同じ関数で
+/// 往復させる（SEC-4・SEC-5・REPAIR-10・#2072）。通常の利用者は呼ばない。
+///
+/// 子の失敗（`ExecError::from_violation_at(reason, None, MountBinds)`）を `report_failure` で pipe へ書き、
+/// `read_pre_pivot_status` で読んで `resolve_pre_pivot_status` に渡す。許可リスト外の理由は子で落ちて理由なしで届く。
+#[doc(hidden)]
+#[cfg(feature = "exec-test-support")]
+pub fn relay_mount_binds_failure_for_test(
+    reason: ViolationReason,
+    sink: &dyn AuditSink,
+    container: Option<&ContainerId>,
+) -> Result<(), Box<AuditedRejection<ExecError>>> {
+    let (r, w) = std::io::pipe().map_err(|e| {
+        Box::new(AuditedRejection::not_applicable(ExecError::from_io(
+            &e,
+            IsolationStage::Spawn,
+            "create the test pipe",
+        )))
+    })?;
+    let w = std::fs::File::from(std::os::fd::OwnedFd::from(w));
+    let r = std::fs::File::from(std::os::fd::OwnedFd::from(r));
+    let error = ExecError::from_violation_at(reason, None, IsolationStage::MountBinds);
+    let failure = PrePivotFailure::from_exec_error(PrePivotStep::MountBinds, &error);
+    report_failure(&w, &failure).map_err(|e| Box::new(AuditedRejection::not_applicable(e)))?;
+    drop(w);
+    let status = read_pre_pivot_status(&r, Duration::from_secs(5));
+    resolve_pre_pivot_status(status, LaunchAudit { sink, container })
+}
+
 /// 起動時の監査の渡し先（借用。`LaunchSpec` に載せない理由: `Debug + Clone + PartialEq + Eq` の値型に
 /// `&dyn AuditSink` を載せると derive が壊れるため。本番 launcher が起動ごとに作って渡す）。
 #[derive(Clone, Copy)]

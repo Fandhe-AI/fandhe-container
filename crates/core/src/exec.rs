@@ -193,6 +193,10 @@ pub(crate) use launch_intermediate::{
     IntermediateSpec, LaunchTag, Rescan, rescan_unreported_init, spawn_container_via_intermediate,
 };
 pub(crate) use launch_status::LaunchAudit;
+/// 結合試験 `tests/launch_userns_audit.rs` 専用の再公開（SEC-4・SEC-5・REPAIR-10・#2072。通常の利用者は呼ばない）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use launch_status::relay_mount_binds_failure_for_test;
 /// supervisor の `SETUP_VIOLATIONS` との突き合わせ試験専用の再公開（SEC-4・SUP-6・#1579。通常の利用者は呼ばない）。
 #[doc(hidden)]
 pub use process::exec_child_violation_reasons;

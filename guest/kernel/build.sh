@@ -212,9 +212,16 @@ if [ -e "$output_dir" ] && [ ! -d "$output_dir" ]; then
     err output-exists "output path exists and is not a directory"
     exit 2
 fi
-if [ -d "$output_dir" ] && [ -n "$(ls -A "$output_dir" 2>/dev/null)" ]; then
-    err output-exists "output directory is not empty; refusing to overwrite"
-    exit 2
+if [ -d "$output_dir" ]; then
+    # 一覧取得の失敗（読み取り不可の 0300 等）を空ディレクトリと誤認しない（fail-closed）。
+    dir_listing="$(ls -A "$output_dir" 2>/dev/null)" || {
+        err bad-output "cannot list the output directory; refusing to continue"
+        exit 2
+    }
+    if [ -n "$dir_listing" ]; then
+        err output-exists "output directory is not empty; refusing to overwrite"
+        exit 2
+    fi
 fi
 
 # --- ツール確認 ---
@@ -286,10 +293,19 @@ else
     err output-busy "another run holds $output_dir.lock (remove it if no run is active)"
     exit 2
 fi
-if [ -L "$output_dir" ] || { [ -e "$output_dir" ] && [ ! -d "$output_dir" ]; } \
-    || { [ -d "$output_dir" ] && [ -n "$(ls -A "$output_dir" 2>/dev/null)" ]; }; then
+if [ -L "$output_dir" ] || { [ -e "$output_dir" ] && [ ! -d "$output_dir" ]; }; then
     err output-exists "output directory is not empty; refusing to overwrite"
     exit 2
+fi
+if [ -d "$output_dir" ]; then
+    dir_listing="$(ls -A "$output_dir" 2>/dev/null)" || {
+        err bad-output "cannot list the output directory; refusing to continue"
+        exit 2
+    }
+    if [ -n "$dir_listing" ]; then
+        err output-exists "output directory is not empty; refusing to overwrite"
+        exit 2
+    fi
 fi
 
 # 子プロセスを上限秒で打ち切る。子は job control（set -m）で独立したプロセスグループにし、

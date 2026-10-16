@@ -166,6 +166,18 @@ run_build "${std_env[@]}" -- --output-dir "$out4" --cross-compile "$cc" --tarbal
 expect_err "output exists" 2 output-exists
 expect_eq "output exists: bytes unchanged" "KEEP-ME" "$(cat "$out4/Image")"
 
+# 4a. 読み取り不可の出力先（0300）は空とみなさず中止し、既存ファイルを保つ（root は権限を無視するため除く）
+if [ "$(id -u)" -ne 0 ]; then
+    out4a="$sandbox/out4a"
+    mkdir -p "$out4a"
+    printf 'KEEP-ME' >"$out4a/Image"
+    chmod 0300 "$out4a"
+    run_build "${std_env[@]}" -- --output-dir "$out4a" --cross-compile "$cc" --tarball "$good_tar"
+    chmod 0700 "$out4a"
+    expect_err "unreadable output" 2 bad-output
+    expect_eq "unreadable output: bytes unchanged" "KEEP-ME" "$(cat "$out4a/Image")"
+fi
+
 # 4b. 同じ出力先の同時実行は排他ロックで拒否する（ロック保持中は何も作らない）
 out4b="$sandbox/out4b"
 mkdir -p "$out4b.lock"

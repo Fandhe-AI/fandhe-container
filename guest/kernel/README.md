@@ -76,7 +76,7 @@ Kconfig は依存が満たされない記号を黙って落とすので、`build
 | 区分 | 記号 | 理由 |
 | ---- | ---- | ---- |
 | モジュール | `MODULES` 無効 | init（#1875）はモジュールをロードせず、initrd（#1878）は init だけを梱包するため、すべて組み込みにする |
-| initramfs | `BLK_DEV_INITRD`・`RD_GZIP` | `FANDHE_CONTAINER_MACOS_VM_INITRD` で渡す initramfs（圧縮形式は gzip を前提。#1878 で変わるなら更新） |
+| initramfs | `BLK_DEV_INITRD`・`RD_GZIP` | `FANDHE_CONTAINER_MACOS_VM_INITRD` で渡す initramfs（圧縮形式は gzip の newc。`scripts/build-guest-initrd.sh`〔#1878〕が `init` 1 個だけの gzip 圧縮 cpio を作るため前提どおり） |
 | /dev | `DEVTMPFS`・`DEVTMPFS_MOUNT` | `/dev` の供給 |
 | 転送 | `PCI`・`PCI_HOST_GENERIC`・`VIRTIO_PCI`・`VIRTIO_MMIO` | VZ の arm64 が virtio を PCI と MMIO のどちらで出すかが未確認のため両方 |
 | コンソール | `VIRTIO_CONSOLE` | `console=hvc0`、`vm_boot` のブートマーカー |

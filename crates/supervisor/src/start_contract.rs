@@ -30,8 +30,9 @@
 //!
 //! # 報告の後の後始末
 //! supervisor は報告を期限内に 1 回書いてから、失敗の後始末（予約を Created へ戻す・cgroup の削除・terminate・
-//! `Stopped` の記録）を行う。起動処理が期限に間に合わなかったときは `INTERNAL`（期限超過の message）を報告し、
-//! 起動処理が後から成功していれば起動したプロセスを terminate して `Stopped` を記録する。
+//! `Stopped` の記録）を行う。起動の準備（手順 3〜7）が期限に間に合わなかったときは `INTERNAL`（期限超過の
+//! message）を報告し、準備が後から終わっても launch せず作った cgroup を消す（launch は準備の完了後に入口スレッドが
+//! 行うため、期限超過の後に新しいプロセスは作られない。#1819）。
 //! **ERR（`INTERNAL` を含む）の報告の後、後始末が終わるまで同じ ID は予約中**で、その間の同じ ID の start は
 //! 記録済みの cgroup スコープ・起動権の予約（revision 照合）・bundle の所有ロックの照合で `FAILED_PRECONDITION`
 //! として拒否される。後始末を確かめられなければ supervisor は `INTERNAL` の終了コードで終わる。
@@ -300,19 +301,32 @@ impl StartArgs {
     }
 }
 
-/// supervisor が結果を書くまでの内部上限: `launch + terminate + confirm + 3 × LAUNCHER_REPLY_GRACE + 5s`
-/// （既定値で 33s。あふれたら `Duration::MAX` に張り付く）。
+/// 起動手順 8（`oci_runtime::start`。launch・失敗時の terminate・確認）に見込む時間:
+/// `launch + terminate + confirm + 3 × LAUNCHER_REPLY_GRACE`（あふれたら `Duration::MAX` に張り付く）。
 ///
-/// supervisor（`start_entry::run_start`）は起動処理を作業スレッドで行い、開始時刻にこの値を足した期限から報告の
-/// 書き込み分（`start_entry::REPORT_RESERVE`）を引いた時点まで結果を待つ。間に合わなければ `INTERNAL`
-/// （期限超過）を報告するため、報告はこの上限内に届く。失敗後の後始末は報告の後に行う（REPAIR-5）。
-pub fn result_deadline(timeouts: &StartTimeouts) -> Duration {
+/// 手順 8 は入口スレッドが直接行う（本番 launcher は単一スレッドの呼び出しを要求するため。#1819・CORE-1）。
+/// launcher 自身が上限を守る（`SelfBounded`）ので、入口は launch の前にこの時間が期限内に残っているかを確かめ、
+/// 足りなければ launch せず `INTERNAL`（期限超過）を報告する（期限内に終わらない launch を始めない。REPAIR-5）。
+/// 既定値で 28s。
+pub fn launch_step_budget(timeouts: &StartTimeouts) -> Duration {
     timeouts
         .launch()
         .saturating_add(timeouts.terminate())
         .saturating_add(timeouts.confirm())
         .saturating_add(LAUNCHER_REPLY_GRACE.saturating_mul(3))
-        .saturating_add(CGROUP_PREPARE_ALLOWANCE)
+}
+
+/// supervisor が結果を書くまでの内部上限: [`launch_step_budget`] + [`CGROUP_PREPARE_ALLOWANCE`]
+/// （既定値で 33s。あふれたら `Duration::MAX` に張り付く）。
+///
+/// supervisor（`start_entry::run_start`）は手順 3〜7（状態の確認・cgroup の連鎖・監査 sink・launcher の構築）を
+/// 作業スレッドで行い、開始時刻にこの値を足した期限から報告の書き込み分（`start_entry::REPORT_RESERVE`）を引いた
+/// 時点まで結果を待つ。作業スレッドが終わったら入口スレッドが手順 8 を直接行う（上の [`launch_step_budget`]）。
+/// 準備に使える実質の時間は [`CGROUP_PREPARE_ALLOWANCE`] から報告の書き込み分（1s）を引いた値で、
+/// 手順 3〜7 が長引いて手順 8 の見込みが残らなければ launch せず `INTERNAL`（期限超過）を報告するため、報告は
+/// この上限内に届く。失敗後の後始末は報告の後に行う（REPAIR-5）。
+pub fn result_deadline(timeouts: &StartTimeouts) -> Duration {
+    launch_step_budget(timeouts).saturating_add(CGROUP_PREPARE_ALLOWANCE)
 }
 
 /// CLI の受信期限: [`result_deadline`] + [`CLI_RECEIVE_GRACE`]。
@@ -516,6 +530,17 @@ mod tests {
             let e = StartArgs::parse(os(&c)).expect_err("must be rejected");
             assert_eq!(e.code(), ErrorCode::InvalidArgument, "input: {c:?}");
         }
+    }
+
+    /// REPAIR-5・#1819: 手順 8 の見込みは既定で 28s で、内部上限はそれに cgroup の準備の見込み（5s）を足した値。
+    #[test]
+    fn repair5_launch_step_budget_default_is_28s() {
+        let t = StartTimeouts::default();
+        assert_eq!(launch_step_budget(&t), Duration::from_secs(28));
+        assert_eq!(
+            result_deadline(&t),
+            launch_step_budget(&t) + CGROUP_PREPARE_ALLOWANCE
+        );
     }
 
     /// REPAIR-5: 既定の内部上限は 33s で、CLI の受信期限はそれより厳密に長い。

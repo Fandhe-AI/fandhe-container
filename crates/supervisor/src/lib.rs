@@ -3,7 +3,7 @@
 //! 常駐デーモンを持たない設計（CORE-1・D-19）の実装主体で、コンテナ 1 つにつき 1 プロセスで監視する（SUP-1）。
 //! PLUG-1 区分は core（plugin 境界〔PLUG-2〕を経由せず実行層コアの一部。crate-naming.md）。
 //!
-//! 現状は状態配線（[`state`]。TASK-157.3）・監視ループ基本（[`run`]。TASK-157.4）・restart の土台（TASK-157.5。`restart_count` の加算は TASK-159.3 で再 launch 成功時へ移設）・healthcheck フック（[`health`]。TASK-157.6。コマンド実行は未実装）・logs 捕捉の土台（[`logs`]。TASK-157.7。ファイルへのローテーション書き込みは TASK-164.2・#506 で実装済み、フラッシュ制御・大規模検証は SUP-7・TASK-164.3/4 で未実装）が実装済みで、終了分類と restart ポリシー評価（[`restart`]。TASK-159.1・#487／TASK-159.2・#488。呼び出し側への配線は未実装）と、再起動ループ（バックオフ・注入式の再 launch・`restart_count` 管理・state.json 反映。#489・TASK-159.3）も実装済みで、本番 launcher による再 launch・明示的 stop の検知（SUP-9）等は未実装（TASK-1.3・TASK-157.1〔#235〕・REPAIR-1。スタブの明示は REPAIR-3）。
+//! 現状は状態配線（[`state`]。TASK-157.3）・監視ループ基本（[`run`]。TASK-157.4）・restart の土台（TASK-157.5。`restart_count` の加算は TASK-159.3 で再 launch 成功時へ移設）・healthcheck フック（[`health`]。TASK-157.6。コマンド実行は未実装）・logs 捕捉の土台（[`logs`]。TASK-157.7。ファイルへのローテーション書き込みは TASK-164.2・#506 で実装済み、フラッシュ制御・大規模検証は SUP-7・TASK-164.3/4 で未実装）が実装済みで、終了分類と restart ポリシー評価（[`restart`]。TASK-159.1・#487／TASK-159.2・#488。呼び出し側への配線は未実装）と、再起動ループ（バックオフ・注入式の再 launch・`restart_count` 管理・state.json 反映。#489・TASK-159.3）も実装済みで、本番 launcher による再 launch の実機での成立（#2043）・明示的 stop の検知（SUP-9）等は未実装（TASK-1.3・TASK-157.1〔#235〕・REPAIR-1。スタブの明示は REPAIR-3）。
 //! inspect 相当の機械可読出力（[`inspect`]。TASK-168.1・#523・SUP-11）も実装済みで、出力をパースして型・値域・キー順・値を照合する結合テスト（TASK-168.2・#524。メモリ上のフェイクは 3 OS、実ストアは Linux）（`tests/inspect_output.rs`）も併置済み（CLI 配線は未実装）。
 //! cgroup 統計の読み取り・パース（[`stats`]。SUP-10・TASK-167.1・#520）と機械可読形式（JSON Lines）での出力（TASK-167.2・#521）も実装済みで、`stats` の CLI 配線は未実装。
 //! `--shm-size` / `--tmpfs` の解析と core の仕様型への変換（[`container_options`]。SUP-12・TASK-169.2・#527）と secrets / configs の指定モデル（TASK-169.4.2・#1473）も実装済みで、launcher・CLI 配線は未実装。
@@ -35,10 +35,11 @@
 //! | #856 | TASK-169.5.2 | 全オプション同時指定の結合テスト（`tests/container_options.rs`）。`--ipc=host` と `--shm-size` の併用は `ContainerOptions::tmpfs_set` が拒否 |
 //! | #488 | TASK-159.2 | restart ポリシー評価（実装済み） |
 //! | #858 | TASK-171.1.2 | 権限昇格の必要最小集合と検証ロジック（[`privilege`]。実装済み） |
-//! | #1717 | TASK-157 追補 | bin の入口（`src/main.rs`・[`start_entry`]）と CLI との起動の契約（[`start_contract`]）。core の本番 launcher が無い間は `UNIMPLEMENTED` で止まる。REPAIR-3 |
+//! | #1717 | TASK-157 追補 | bin の入口（`src/main.rs`・[`start_entry`]）と CLI との起動の契約（[`start_contract`]）。|
+//! | #1819 | TASK-157 追補 | `ProductionStartDeps` を core の本番 launcher（`ProductionLauncher`）へ結線（手順 8 は入口スレッドが直接行う）。restart の再 launch は単一スレッドの要求を満たせず fail-closed（#2043）。実機前提の通し試験は `tests/supervisor_bin_real.rs`。REPAIR-3 |
 //! | #1475 | TASK-171.1.3 | 権限昇格の実体 `privilege::elevate`（承認済みの方式〔#1454〕。縮退の syscall 適用と読み戻し検証は実装済み。fd 検証付き exec・入口検証・ランチャー bin は #1719 で実装） |
 //! | #1719 | TASK-171 追補 | 特権ランチャー bin `fandhe-container-launcher`（[`launcher`]。入口検証 → `elevate` → 検証済み fd の `execveat`。hash / 署名照合・ambient の子での解除〔healthcheck exec。#495〕・実機検証〔#538・#539〕は未実装。REPAIR-3） |
-//! | #489 | TASK-159.3 | restart_count 管理・state.json 反映・結合テスト（実装済み。本番 launcher は未実装） |
+//! | #489 | TASK-159.3 | restart_count 管理・state.json 反映・結合テスト（実装済み。本番 launcher での再 launch の成立は #2043） |
 //! | #523 | TASK-168.1 | state.json 読み取り・inspect 出力フォーマット（実装済み） |
 //! | #524 | TASK-168.2 | inspect 出力のパース検証結合テスト（`tests/inspect_output.rs`。#523 で先行追加し、#524 でキー順・型・値域・列挙値の照合を追加。実装済み） |
 //!

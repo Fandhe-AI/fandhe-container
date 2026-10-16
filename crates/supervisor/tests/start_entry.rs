@@ -17,7 +17,8 @@ use std::time::Duration;
 
 use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_core::oci_runtime::{
-    LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher, StartTimeouts, create, exit_code_for,
+    LaunchMode, LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher, StartTimeouts, create,
+    exit_code_for,
 };
 use fandhe_container_core::traits::{
     CgroupScope, ContainerId, ContainerState, CreateRequest, ErrorCode, GetStateRequest,
@@ -157,6 +158,15 @@ struct FakeLauncher {
     confirm_ok: bool,
     wait_mode: WaitMode,
     fail_terminate: bool,
+    /// `true` なら本番 launcher と同じ `SelfBounded` を宣言する（入口が呼び出しスレッドで直接 launch する。#1819）。
+    self_bounded: bool,
+    /// `true` なら launch の失敗で「子が残り得る」と答える（`last_launch_may_have_left_process`）。
+    left_process: bool,
+    /// `Some(n)` なら n 回目（1 始まり）以降の launch を、単一スレッドの要求を満たさない呼び出しの拒否
+    /// （`FailedPrecondition`）として失敗させる。
+    reject_from: Option<usize>,
+    /// launch を呼んだスレッドの ID と名前。
+    launch_threads: Mutex<Vec<(std::thread::ThreadId, Option<String>)>>,
 }
 
 impl FakeLauncher {
@@ -172,6 +182,10 @@ impl FakeLauncher {
             confirm_ok: true,
             wait_mode: WaitMode::Pending,
             fail_terminate: false,
+            self_bounded: false,
+            left_process: false,
+            reject_from: None,
+            launch_threads: Mutex::new(Vec::new()),
         }
     }
 
@@ -181,6 +195,18 @@ impl FakeLauncher {
 }
 
 impl ProcessLauncher for FakeLauncher {
+    fn launch_mode(&self) -> LaunchMode {
+        if self.self_bounded {
+            LaunchMode::SelfBounded
+        } else {
+            LaunchMode::CallerBounded
+        }
+    }
+
+    fn last_launch_may_have_left_process(&self) -> bool {
+        self.left_process
+    }
+
     fn launch(
         &self,
         spec: &LaunchSpec,
@@ -190,15 +216,29 @@ impl ProcessLauncher for FakeLauncher {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push("launch");
-        self.specs
+        self.launch_threads
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(spec.clone());
+            .push((
+                std::thread::current().id(),
+                std::thread::current().name().map(str::to_owned),
+            ));
+        let nth = {
+            let mut specs = self.specs.lock().unwrap_or_else(|e| e.into_inner());
+            specs.push(spec.clone());
+            specs.len()
+        };
         self.timeouts
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(timeout);
         std::thread::sleep(self.delay);
+        if self.reject_from.is_some_and(|n| nth >= n) {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "launch requires a single-threaded process",
+            ));
+        }
         if let Some(code) = self.launch_error {
             return Err(TraitError::new(code, "launch failed"));
         }
@@ -752,11 +792,12 @@ fn core2_recreated_after_prepare_is_not_launched() {
     }
 }
 
-/// REPAIR-5・CORE-1・SUP-1: 起動処理が期限までに終わらなければ、期限内に INTERNAL（期限超過）を報告し、
-/// 後始末は報告の後に行う。報告の後・後始末の前に同じ ID の start を試みても、記録済みのスコープ（予約）の照合で
-/// FailedPrecondition として拒否される。起動処理が後から成功したら、起動したプロセスを terminate して Stopped を記録する。
+/// REPAIR-5・CORE-1・SUP-1・#1819: 準備（手順 3〜7）が期限までに終わらなければ、期限内に INTERNAL（期限超過）を
+/// 報告し、後始末は報告の後に行う。報告の後・後始末の前に同じ ID の start を試みても、記録済みのスコープ（予約）の
+/// 照合で FailedPrecondition として拒否される。準備が後から終わっても launch せず、作った cgroup を解放して状態は
+/// Created のままにする（launch は入口スレッドが準備の完了後に行うため、期限超過の後に新しいプロセスは作られない）。
 #[test]
-fn repair5_deadline_exceeded_reports_first_and_cleans_up_late_start() {
+fn repair5_deadline_exceeded_in_prepare_reports_first_and_never_launches() {
     let env = Env::new("overdue");
     env.create(&env.id);
     let calls = new_calls();
@@ -817,12 +858,206 @@ fn repair5_deadline_exceeded_reports_first_and_cleans_up_late_start() {
         other => panic!("unexpected report: {other:?}"),
     }
     assert_eq!(code, Some(exit_code_for(ErrorCode::Internal)));
-    // 後から成功した起動は terminate され、Stopped が記録される。
-    assert_eq!(l.specs.lock().unwrap().len(), 1);
-    assert_eq!(l.terminated.load(Ordering::SeqCst), 1);
+    // 後から準備が終わっても launch せず、作った cgroup を解放する（子は作られず、terminate もしない）。
+    assert!(l.specs.lock().unwrap().is_empty());
+    assert_eq!(l.terminated.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        calls_of(&calls),
+        ["check", "prepare", "audit", "build", "release"]
+    );
+    let rec = env.record(&env.id);
+    assert_eq!(rec.status().state(), ContainerState::Created);
+    assert!(rec.status().pid().is_none());
+    assert!(rec.supervision().supervisor_pid().is_none());
+}
+
+/// REPAIR-5・#1819: 準備が済んでも手順 8 の見込み（`launch_step_budget`）が期限内に残らなければ、launch せず
+/// INTERNAL（期限超過）を報告し、作った cgroup を解放する（期限内に終わらない launch を始めない）。
+#[test]
+fn repair5_insufficient_budget_skips_launch() {
+    let env = Env::new("nobudget");
+    env.create(&env.id);
+    let before = env.record(&env.id);
+    let calls = new_calls();
+    let mut fl = FakeLauncher::new(&calls);
+    fl.self_bounded = true;
+    let (d, l) = deps(&calls, fl);
+    let mut out = Vec::new();
+    // 見込み（short_timeouts で 4.6s）に足りない期限（準備は即座に終わるので待ちの期限内には入る）。
+    let deadline = std::time::Instant::now().checked_add(Duration::from_secs(3));
+    let code = run_start_until(
+        Box::new(d),
+        &env.store,
+        &Arc::new(OpRecorder::new()),
+        &StartRequest::new(cid(&env.id)),
+        &short_timeouts(),
+        deadline,
+        &mut out,
+    )
+    .err()
+    .expect("start must fail");
+    assert_eq!(code, exit_code_for(ErrorCode::Internal));
+    assert!(l.specs.lock().unwrap().is_empty());
+    assert_eq!(
+        calls_of(&calls),
+        ["check", "prepare", "audit", "build", "release"]
+    );
+    let after = env.record(&env.id);
+    assert_eq!(after.status().state(), ContainerState::Created);
+    assert_eq!(after.revision(), before.revision());
+    match report_of(&out) {
+        StartReport::Failed { code, message, .. } => {
+            assert_eq!(code, ErrorCode::Internal);
+            assert_eq!(message.as_str(), DEADLINE_EXCEEDED_MESSAGE);
+        }
+        other => panic!("unexpected report: {other:?}"),
+    }
+}
+
+/// CORE-1・REPAIR-5・#1819: `SelfBounded` の launcher は、`run_start` を呼んだスレッドで直接 launch される
+/// （作業スレッド `supervisor-start` ではない）。作業スレッドの消滅そのもの（`/proc/self/task`）は、並列に走る
+/// 他の試験のスレッドと区別できないため、実機前提の `supervisor_bin_real` が照合する。
+#[test]
+fn repair5_sup1_launch_runs_on_the_calling_thread() {
+    let env = Env::new("callthread");
+    env.create(&env.id);
+    let calls = new_calls();
+    let mut fl = FakeLauncher::new(&calls);
+    fl.self_bounded = true;
+    let (d, l) = deps(&calls, fl);
+    let running =
+        start_with(&env, d, &env.id, &short_timeouts(), &mut Vec::new()).expect("started");
+    let threads = l
+        .launch_threads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let me = std::thread::current();
+    assert_eq!(threads, [(me.id(), me.name().map(str::to_owned))]);
+    assert_ne!(threads[0].1.as_deref(), Some("supervisor-start"));
+    drop(running);
+}
+
+/// CORE-1・CORE-2・#1819: 単一スレッドの要求を満たさない呼び出しは launcher が拒否する（`FailedPrecondition`・
+/// 子なし）。報告は FAILED_PRECONDITION、状態は Created に戻り（pid なしの Running を残さない）、cgroup は解放され、
+/// 終了コードは FAILED_PRECONDITION の写像のまま（後始末は確かめられた）。
+#[test]
+fn core1_multithreaded_launch_is_rejected_without_side_effects() {
+    let env = Env::new("mtreject");
+    env.create(&env.id);
+    let calls = new_calls();
+    let mut fl = FakeLauncher::new(&calls);
+    fl.self_bounded = true;
+    fl.reject_from = Some(1);
+    let (d, l) = deps(&calls, fl);
+    let mut out = Vec::new();
+    let code = start_with(&env, d, &env.id, &short_timeouts(), &mut out)
+        .err()
+        .expect("start must fail");
+    assert_eq!(code, exit_code_for(ErrorCode::FailedPrecondition));
+    assert_eq!(
+        calls_of(&calls),
+        ["check", "prepare", "audit", "build", "launch", "release"]
+    );
+    assert_eq!(l.terminated.load(Ordering::SeqCst), 0);
+    let rec = env.record(&env.id);
+    assert_eq!(rec.status().state(), ContainerState::Created);
+    assert!(rec.status().pid().is_none());
+    match report_of(&out) {
+        StartReport::Failed { code, message, .. } => {
+            assert_eq!(code, ErrorCode::FailedPrecondition);
+            assert_eq!(
+                message.as_str(),
+                "launch requires a single-threaded process"
+            );
+        }
+        other => panic!("unexpected report: {other:?}"),
+    }
+}
+
+/// CORE-2・REPAIR-5・#1819: launch が失敗して子が残り得る場合、予約は戻らない。入口は `confirm_no_process` で
+/// 消滅を確かめて Created へ戻し、cgroup を解放する。
+#[test]
+fn core2_left_process_is_confirmed_before_release() {
+    let env = Env::new("leftok");
+    env.create(&env.id);
+    let calls = new_calls();
+    let mut fl = FakeLauncher::new(&calls);
+    fl.self_bounded = true;
+    fl.launch_error = Some(ErrorCode::Internal);
+    fl.left_process = true;
+    let (d, l) = deps(&calls, fl);
+    let mut out = Vec::new();
+    let code = start_with(&env, d, &env.id, &short_timeouts(), &mut out)
+        .err()
+        .expect("start must fail");
+    assert_eq!(code, exit_code_for(ErrorCode::Internal));
+    assert!(l.confirms.load(Ordering::SeqCst) >= 1);
+    assert_eq!(calls_of(&calls).last(), Some(&"release"));
+    let rec = env.record(&env.id);
+    assert_eq!(rec.status().state(), ContainerState::Created);
+    assert!(rec.status().pid().is_none());
+}
+
+/// CORE-2・REPAIR-5・#1819: 子が残り得て消滅を確かめられない場合、cgroup は消さず、予約（Running・pid なし）を
+/// 残したまま INTERNAL の終了コードで終わる。pid つきの Running は残さない。
+#[test]
+fn core2_unconfirmed_left_process_keeps_reservation_and_cgroup() {
+    let env = Env::new("leftng");
+    env.create(&env.id);
+    let calls = new_calls();
+    let mut fl = FakeLauncher::new(&calls);
+    fl.self_bounded = true;
+    fl.launch_error = Some(ErrorCode::Internal);
+    fl.left_process = true;
+    fl.confirm_ok = false;
+    let (d, _l) = deps(&calls, fl);
+    let mut out = Vec::new();
+    let code = start_with(&env, d, &env.id, &short_timeouts(), &mut out)
+        .err()
+        .expect("start must fail");
+    assert_eq!(code, exit_code_for(ErrorCode::Internal));
+    assert!(!calls_of(&calls).contains(&"release"));
+    let rec = env.record(&env.id);
+    assert_eq!(rec.status().state(), ContainerState::Running);
+    assert!(rec.status().pid().is_none());
+    match report_of(&out) {
+        StartReport::Failed { code, .. } => assert_eq!(code, ErrorCode::Internal),
+        other => panic!("unexpected report: {other:?}"),
+    }
+}
+
+/// SUP-3・CORE-1・#1819・#2043: restart の再 launch が単一スレッドの要求で拒否される間は fail-closed に止まる。
+/// 初回の起動は成功し、2 回目の launch が拒否されると、新しい子は作られず、restart ポリシー `always` でも
+/// 再起動せず、状態は Stopped で、終了コードは FAILED_PRECONDITION の写像になる。
+/// 再 launch が実機で成立する再構成（#2043）が入ったらこの試験を置き換える。
+#[test]
+fn sup3_core1_single_thread_launcher_rejection_fails_closed() {
+    let env = Env::new("relrej");
+    env.create(&env.id);
+    let calls = new_calls();
+    let mut fl = FakeLauncher::new(&calls);
+    fl.self_bounded = true;
+    fl.reject_from = Some(2);
+    fl.wait_mode = WaitMode::ExitedOk;
+    let (d, l) = deps(&calls, fl);
+    let running =
+        start_with(&env, d, &env.id, &short_timeouts(), &mut Vec::new()).expect("started");
+    let code = run_supervised(
+        env.store.clone(),
+        cid(&env.id),
+        running,
+        RestartPolicy::Always,
+        &short_timeouts(),
+        &StopToken::new(),
+    );
+    assert_eq!(code, exit_code_for(ErrorCode::FailedPrecondition).get());
+    // 初回と、拒否された 1 回の再 launch だけ。拒否された launch は子を作らない。
+    assert_eq!(l.launches(), 2);
+    assert_eq!(l.terminated.load(Ordering::SeqCst), 0);
     let rec = env.record(&env.id);
     assert_eq!(rec.status().state(), ContainerState::Stopped);
-    assert!(rec.supervision().supervisor_pid().is_none());
+    assert!(rec.status().pid().is_none());
 }
 
 /// REPAIR-4: 起動の計測結果は英語のキーの 1 行 JSON で、操作ごとの成功・失敗数とレイテンシを載せる。

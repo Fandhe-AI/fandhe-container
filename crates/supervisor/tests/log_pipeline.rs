@@ -2,8 +2,9 @@
 //!
 //! 実プロセス（`sh -c`）の stdout / stderr を `LaunchedProcess::take_output` で受け取り、`run_start` →
 //! `run_supervised`（再起動を含む）を通して `LogSink` に入る行を具体値で照合する。launcher はテスト用のフェイクで、
-//! core の本番 `ProcessLauncher`（TASK-29 追補の Phase B）は未提供のため、「launcher がパイプを作って渡す」部分は
-//! 実コンテナ経由では照合しない（core 側は `exec::ChildStdio` の単体試験が照合する）。root 不要。
+//! 「launcher がパイプを作って渡す」部分は本試験では照合しない（core 側は `exec::ChildStdio` の単体試験と
+//! `tests/production_launcher.rs` が、bin → 本番 launcher の通しは実機前提の `supervisor_bin_real.rs`〔#1819〕が照合する）。
+//! root 不要。
 //! `FileStateStore` と rootfs の fd 固定は Linux 限定のため全体を Linux に置く。
 
 #![cfg(target_os = "linux")]

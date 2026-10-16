@@ -52,8 +52,10 @@
 //!   `FailedPrecondition` で返す(fail-closed)。cgroup の `cgroup.procs` が空であることの確認は別 issue の範囲
 //!   (StateStore の cgroup 記録との結線が要る)
 //! - 起動台帳はプロセス内のメモリのみ(再起動をまたがない。別プロセスの残存の確認は上記のとおり未対応)
-//! - **supervisor の結線**: `launch` は呼び出しスレッドで直接呼ぶ必要があり、supervisor の `run_start`
-//!   手順 8 と restart の再 launch は別スレッドで呼んでいる。再構成は #1819 の範囲
+//! - **supervisor の結線**: `launch` は単一スレッドの呼び出しスレッドで直接呼ぶ必要がある。supervisor の
+//!   `run_start` 手順 8 は、準備の作業スレッドを `join` してから入口スレッドが直接呼ぶ形に再構成済み(#1819)。
+//!   restart の再 launch は `fandhe-relaunch` スレッド等が存在する状態で呼ばれ、この launcher が拒否する
+//!   (`RelaunchFailed`・fail-closed)。呼び出しスレッドで直接行う再構成は #2043
 //! - mounts・bind mount・`/dev` 以外の tmpfs の注入は `start` が拒否済みで、ここでは載せない
 
 #[cfg(target_os = "linux")]

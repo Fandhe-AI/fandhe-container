@@ -129,22 +129,42 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> ExitWait {
     ExitWait::TimedOut { reaped: false }
 }
 
+/// `ErrorKind::NotFound` か、走査中にプロセスが消えたことを示す `ESRCH`（raw os error 3）か。
+fn is_gone(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(3)
+}
+
+/// `path` が存在しないと確かめられたときだけ `true`。権限エラー等で確認できない場合は `false`（REPAIR-5）。
+fn path_gone(path: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// `/proc` を走査し、この実行の nonce を引数に持つプローブの数を数える。
-fn probe_count(nonce: &str) -> usize {
-    let Ok(dir) = std::fs::read_dir("/proc") else {
-        return 0;
-    };
+/// 列挙・読み取りの失敗（走査中に消えたプロセスを除く）は確認不能として `None` を返し、0 件と扱わない（REPAIR-5）。
+fn probe_count(nonce: &str) -> Option<usize> {
+    let dir = std::fs::read_dir("/proc").ok()?;
     let needle = nonce.as_bytes();
-    dir.flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-                && std::fs::read(e.path().join("cmdline")).is_ok_and(|c| {
-                    !needle.is_empty() && c.windows(needle.len()).any(|w| w == needle)
-                })
-        })
-        .count()
+    let mut count = 0usize;
+    for entry in dir {
+        let entry = entry.ok()?;
+        let is_pid = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        if !is_pid {
+            continue;
+        }
+        match std::fs::read(entry.path().join("cmdline")) {
+            Ok(c) => {
+                if !needle.is_empty() && c.windows(needle.len()).any(|w| w == needle) {
+                    count += 1;
+                }
+            }
+            Err(e) if is_gone(&e) => {}
+            Err(_) => return None,
+        }
+    }
+    Some(count)
 }
 
 fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
@@ -172,7 +192,7 @@ fn read_populated(dir: &Path) -> Option<bool> {
                 "0" => Some(false),
                 _ => None,
             }),
-        Err(_) if !dir.exists() => Some(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && path_gone(dir) => Some(false),
         Err(_) => None,
     }
 }
@@ -192,33 +212,52 @@ fn kill_and_drain(dir: &Path) -> bool {
 
 /// コンテナの cgroup（ベンチが作った `fc-<id>@<instance>` だけ）を消す。消えた（または元から無い）なら `true`。
 fn remove_container_cgroup(dir: &Path) -> bool {
-    if wait_until(CGROUP_GC_GRACE, || !dir.exists()) {
+    if wait_until(CGROUP_GC_GRACE, || path_gone(dir)) {
         return true;
     }
     if !kill_and_drain(dir) {
         return false;
     }
     let _ = std::fs::remove_dir(dir);
-    !dir.exists()
+    path_gone(dir)
 }
 
 /// `base` 配下（深さ `depth` まで）から名前が `name` のディレクトリを探す。
-fn find_dir(base: &Path, name: &str, depth: u32) -> Option<PathBuf> {
+/// `Ok(None)` は存在しないと確かめられた場合だけ。読み取り失敗（権限等）は `Err` で確認不能を表す（REPAIR-5）。
+fn find_dir(base: &Path, name: &str, depth: u32) -> Result<Option<PathBuf>, std::io::Error> {
     let direct = base.join(name);
-    if direct.is_dir() {
-        return Some(direct);
+    match std::fs::metadata(&direct) {
+        Ok(m) if m.is_dir() => return Ok(Some(direct)),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
     if depth == 0 {
-        return None;
+        return Ok(None);
     }
-    for entry in std::fs::read_dir(base).ok()?.flatten() {
-        if entry.file_type().is_ok_and(|t| t.is_dir())
-            && let Some(found) = find_dir(&entry.path(), name, depth - 1)
-        {
-            return Some(found);
+    let entries = match std::fs::read_dir(base) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) if is_gone(&e) => continue,
+            Err(e) => return Err(e),
+        };
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => {
+                if let Some(found) = find_dir(&entry.path(), name, depth - 1)? {
+                    return Ok(Some(found));
+                }
+            }
+            Ok(_) => {}
+            Err(e) if is_gone(&e) => {}
+            Err(e) => return Err(e),
         }
     }
-    None
+    Ok(None)
 }
 
 /// 試行ごとの systemd スコープの名前（`--unit` に渡す。実行ごとに一意な ID から作る）。
@@ -305,7 +344,7 @@ struct RealWaiter {
 
 impl RealWaiter {
     /// ユーザーマネージャ配下のスコープ（`<unit>.scope`）の cgroup を探す。
-    fn scope_dir(&self) -> Option<PathBuf> {
+    fn scope_dir(&self) -> Result<Option<PathBuf>, std::io::Error> {
         let base = PathBuf::from(format!(
             "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service",
             uid = self.euid
@@ -322,8 +361,10 @@ impl Waiter for RealWaiter {
     /// waiter（`systemd-run`）だけでなくスコープ内の supervisor・子孫も `cgroup.kill` で止める。
     fn stop_scope(&mut self) -> bool {
         match self.scope_dir() {
-            Some(dir) => kill_and_drain(&dir),
-            None => true,
+            Ok(Some(dir)) => kill_and_drain(&dir),
+            Ok(None) => true,
+            // スコープの有無を確認できない場合は後始末の成功と扱わない（fail-closed）。
+            Err(_) => false,
         }
     }
 }
@@ -438,7 +479,9 @@ impl Host for RealHost {
                 Err(_) => ok = false,
             }
         }
-        let probes_gone = wait_until(ctx.cap(CLEANUP_TIMEOUT), || probe_count(ctx.nonce) == 0);
+        let probes_gone = wait_until(ctx.cap(CLEANUP_TIMEOUT), || {
+            probe_count(ctx.nonce) == Some(0)
+        });
         ok &= probes_gone;
         if ok {
             ok = std::fs::remove_dir_all(&created.root).is_ok();

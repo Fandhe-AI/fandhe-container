@@ -704,6 +704,10 @@ impl FileStateStore {
 }
 
 impl StateStore for FileStateStore {
+    fn host_state_root(&self) -> Option<&Path> {
+        Some(&self.root)
+    }
+
     fn create(&self, req: &CreateStateRequest) -> Result<StateRecord, TraitError> {
         check_bundle(req.bundle())?;
         let mut guard = self.lock()?;

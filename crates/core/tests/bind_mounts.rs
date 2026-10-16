@@ -126,6 +126,47 @@ fn core2_destination_rules() {
     );
 }
 
+/// SEC-1・OCI-4（#1915）: 状態ルートは同一・祖先・子孫のいずれの元も拒否する（OS 非依存の Linux 形式入力）。
+#[test]
+fn sec1_protected_trees_reject_both_directions() {
+    let cases = [
+        ("/var/lib/fandhe", true),
+        ("/var/lib", true),
+        ("/var/lib/fandhe/ctr-1", true),
+        ("/var/lib/fandhe-other", false),
+        ("/srv/data", false),
+    ];
+    for (source, rejected) in cases {
+        let c = config(
+            &format!(r#"[{{"destination":"/data","type":"bind","source":"{source}"}}]"#),
+            "{}",
+        );
+        let s = BindMountSet::from_mounts(c.mounts()).expect("accepted");
+        let r = s.check_against_protected_trees(&["/var/lib/fandhe"]);
+        assert_eq!(r.is_err(), rejected, "source {source}");
+        if let Err(e) = r {
+            assert_eq!(*e.kind(), BindMountErrorKind::ForbiddenSource);
+            assert_eq!(e.index(), Some(0));
+        }
+    }
+    // 実体解決後の元が保護対象に重なる場合（symlink 経由）も拒否し、解決できない元は対象外。
+    let c = config(
+        r#"[{"destination":"/data","type":"bind","source":"/srv/link"}]"#,
+        "{}",
+    );
+    let s = BindMountSet::from_mounts(c.mounts()).expect("accepted");
+    let e = s
+        .check_resolved_sources_against_protected_trees(&["/var/lib/fandhe"], |_| {
+            Some("/var/lib/fandhe/x".to_owned())
+        })
+        .expect_err("resolved overlap");
+    assert_eq!(*e.kind(), BindMountErrorKind::ForbiddenSource);
+    assert!(
+        s.check_resolved_sources_against_protected_trees(&["/var/lib/fandhe"], |_| None)
+            .is_ok()
+    );
+}
+
 /// CORE-2: tmpfs・注入ファイル・保護パス・ホストパスとの交差検査。
 #[test]
 fn core2_cross_checks() {

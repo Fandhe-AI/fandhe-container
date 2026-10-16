@@ -162,6 +162,15 @@ pub trait StateStore: Send + Sync {
     /// 別の書き込みが状態を更新した場合、古い判断に基づく削除が新しい状態を消してしまう
     /// のを防ぐ）で、削除にも revision の照合を要求する。対応: OCI-5・CRI-7・ERR-2。
     fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError>;
+
+    /// ストアがホストのファイルシステム上に持つ状態ルート（bind mount の元として公開してはならない場所）。
+    ///
+    /// 既定は `None`（ホスト上の場所を示せない実装）。`mounts[]` の bind mount を持つ start は、状態ルートを
+    /// 検査できない（`None`）場合に fail-closed で拒否する（SEC-1・OCI-4・#1915）。ファイルベースの
+    /// 実装は検査済みの絶対パスを返す。
+    fn host_state_root(&self) -> Option<&Path> {
+        None
+    }
 }
 
 /// ストアが採番するレコードの世代番号（楽観的排他に使う）。

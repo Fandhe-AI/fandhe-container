@@ -413,6 +413,45 @@ impl BindMountSet {
         }
         Ok(())
     }
+
+    /// 元が `protected` のいずれかと同一・祖先・子孫のとき `ForbiddenSource` で拒否する（状態ルート用）。
+    ///
+    /// [`Self::check_against_host_paths`] は子孫を許すが、状態ルートの配下を書込み可能で公開すると
+    /// `state.json` 等を改変できるため、両方向で拒否する（SEC-1・OCI-4・#1915）。字句比較のみ。
+    pub fn check_against_protected_trees(&self, protected: &[&str]) -> Result<(), BindMountError> {
+        for b in &self.mounts {
+            if protected.iter().any(|f| overlaps(f, &b.source)) {
+                return Err(BindMountError::at(
+                    b.index,
+                    BindMountErrorKind::ForbiddenSource,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 各元を `resolve`（実体のパスへの正規化。解決できなければ `None` で対象外）で解決してから
+    /// [`Self::check_against_protected_trees`] と同じ規則で拒否する（symlink 経由の到達を塞ぐ）。
+    pub fn check_resolved_sources_against_protected_trees<F>(
+        &self,
+        protected: &[&str],
+        resolve: F,
+    ) -> Result<(), BindMountError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        for b in &self.mounts {
+            if let Some(real) = resolve(&b.source)
+                && protected.iter().any(|f| overlaps(f, &real))
+            {
+                return Err(BindMountError::at(
+                    b.index,
+                    BindMountErrorKind::ForbiddenSource,
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// options を畳み込んだ結果。

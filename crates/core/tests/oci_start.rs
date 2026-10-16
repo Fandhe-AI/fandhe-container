@@ -72,6 +72,7 @@ struct MemStateStore {
     records: Mutex<HashMap<ContainerId, StateRecord>>,
     fail_update_at: Option<usize>,
     update_calls: AtomicUsize,
+    state_root: PathBuf,
 }
 
 impl MemStateStore {
@@ -80,6 +81,7 @@ impl MemStateStore {
             records: Mutex::new(HashMap::new()),
             fail_update_at,
             update_calls: AtomicUsize::new(0),
+            state_root: std::env::temp_dir(),
         }
     }
 
@@ -92,6 +94,11 @@ impl MemStateStore {
 }
 
 impl StateStore for MemStateStore {
+    /// bind mount の検証を通すための状態ルート（実在し、bind の元にならない場所）。
+    fn host_state_root(&self) -> Option<&std::path::Path> {
+        Some(self.state_root.as_path())
+    }
+
     fn create(&self, req: &CreateStateRequest) -> Result<StateRecord, TraitError> {
         let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
         if records.contains_key(req.id()) {

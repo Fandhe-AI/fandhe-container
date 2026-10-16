@@ -1155,13 +1155,14 @@ unsafe extern "C" {
     fn mkdirat(dirfd: i32, path: *const core::ffi::c_char, mode: u32) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int unlinkat(int dirfd, const char *path, int flags)`。
     fn unlinkat(dirfd: i32, path: *const core::ffi::c_char, flags: i32) -> i32;
-    // SAFETY（宣言そのものの妥当性）: `int renameat(int olddirfd, const char *oldpath, int newdirfd,
-    // const char *newpath)`。
-    fn renameat(
+    // SAFETY（宣言そのものの妥当性）: `int renameat2(int olddirfd, const char *oldpath, int newdirfd,
+    // const char *newpath, unsigned int flags)`（glibc 2.28 以降・musl）。
+    fn renameat2(
         olddirfd: i32,
         oldpath: *const core::ffi::c_char,
         newdirfd: i32,
         newpath: *const core::ffi::c_char,
+        flags: u32,
     ) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int fstatfs(int fd, struct statfs *buf)`。構造体は下の
     // [`StatFs`]（arch 別に個別定義）で、カーネルが書く 120 バイトを確保する。
@@ -3433,23 +3434,32 @@ pub(crate) fn remove_file_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<(), 
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
-/// `parent` 配下の `old` を、同じ `parent` 配下の `new` へ `renameat(2)` で改名する（最終要素の symlink は辿らず、
-/// 改名先が既にあれば置き換わる）。bind mount の適用段（`crate::exec::mount_binds`）が、失敗時の後始末で
-/// 「消す対象を他者が差し替えられない名前へ移してから実体を照合して消す」ために使う（#1913・SEC-1）。
+/// `old_dir` 配下の `old` を `new_dir` 配下の `new` へ `renameat2(2)` の `RENAME_NOREPLACE` で改名する（最終要素の
+/// symlink は辿らない。改名先が既にあれば置き換えず `EEXIST`）。bind mount の適用段（`crate::exec::mount_binds`）が、
+/// 失敗時の後始末で「消す対象を自分専用の隔離ディレクトリへ移してから実体を照合して消す」ことと、「照合に通らなかった
+/// 実体を元の名前へ戻すとき、新しく作られた同名の実体を上書きしない」ことに使う（#1913・SEC-1）。
 /// `old`・`new` は呼び出し側が 1 要素に検証済みの前提。
-pub(crate) fn rename_at(parent: BorrowedFd<'_>, old: &CStr, new: &CStr) -> Result<(), SysError> {
+pub(crate) fn rename_noreplace_at(
+    old_dir: BorrowedFd<'_>,
+    old: &CStr,
+    new_dir: BorrowedFd<'_>,
+    new: &CStr,
+) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
-    // SAFETY: `old`・`new` は NUL 終端の借用で呼び出しの間生存する。`parent` は生存中の `BorrowedFd` で、
-    // 旧・新の両方の dirfd に使う（同一ディレクトリ内の改名）。副作用は `parent` 配下の 1 要素の改名のみで、
+    // include/uapi/linux/fs.h の `RENAME_NOREPLACE`（全アーキテクチャ共通）。
+    const RENAME_NOREPLACE: u32 = 1;
+    // SAFETY: `old`・`new` は NUL 終端の借用で呼び出しの間生存する。`old_dir`・`new_dir` は生存中の
+    // `BorrowedFd`。flags は `RENAME_NOREPLACE` のみで、改名先を置き換えない。副作用は 1 要素の改名のみで、
     // ポインタは保持されない。
     let rc = unsafe {
-        renameat(
-            parent.as_raw_fd(),
+        renameat2(
+            old_dir.as_raw_fd(),
             old.as_ptr(),
-            parent.as_raw_fd(),
+            new_dir.as_raw_fd(),
             new.as_ptr(),
+            RENAME_NOREPLACE,
         )
     };
     if rc == -1 { Err(last_error()) } else { Ok(()) }

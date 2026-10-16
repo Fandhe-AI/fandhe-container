@@ -81,7 +81,7 @@
 //! のエスケープと切り詰めを通す。新マウント API の無いカーネルでは `mount(2)` へ縮退せず `UNIMPLEMENTED` で拒否する。
 //!
 //! 失敗時は、載せたマウントを新しい順に `umount2(MNT_DETACH)` で外し、自分が作った空ファイル・ディレクトリを、作成時に記録した
-//! `(dev, ino)` と一致するときだけ消す（同じ親の中の隔離名へ `renameat` してから照合して消し、照合と削除の間の
+//! `(dev, ino)` と一致するときだけ消す（自分専用の隔離ディレクトリへ `renameat2(RENAME_NOREPLACE)` してから照合して消し、照合と削除の間の
 //! 差し替えを防ぐ）。後始末の失敗（umount・開き直し・照合不一致・削除）は元のエラーの message に `; cleanup failed: ...` として併記する
 //! （REPAIR-4）。呼び出し後もプロセスは破棄する（`pivot_root`・exec へ進まない）。
 //!
@@ -510,64 +510,81 @@ fn pin_target(
     let parent_fd = if parents.is_empty() {
         None
     } else {
-        Some(
-            open_chain(
-                ctx.root,
-                Path::new("/"),
-                parents,
-                Some(&mut state.created_dirs),
-            )
-            .map_err(|e| annotate(spec, e.at_stage(STAGE)))?,
-        )
+        Some(open_parents_recording(ctx, spec, parents, state)?)
     };
     let parent = parent_fd.as_ref().map_or(ctx.root, |f| f.as_fd());
     let c_leaf = CString::new(leaf.as_bytes())
         .map_err(|_| violation(spec, ViolationReason::PathContainsNul))?;
-    // 途中の要素を作った分は、作成直後に固定した実体の ID を記録する（失敗しても作った分は後始末できる）。
-    let recorded = record_created_dirs(ctx, state);
     let fd = match sys::open_path_nofollow(parent, &c_leaf) {
         Ok(fd) => fd,
         Err(SysError::Os(sys::ENOENT)) => {
             let created = create_target(spec, kind, parent, &c_leaf, last_index(state), state);
-            if created.is_ok() && state.created_dirs.contains(&last_index(state)) {
-                let id = sys::open_path_nofollow(parent, &c_leaf)
-                    .and_then(|fd| fstat_fd(fd.as_fd()))
-                    .map(|st| (st.dev, st.ino));
-                if let Ok(id) = id {
-                    state.created_dir_ids.push((last_index(state), id));
-                }
-            }
             created?;
-            reopen_created(spec, kind, parent, &c_leaf, state)?
+            let fd = reopen_created(spec, kind, parent, &c_leaf, state)?;
+            if state.created_dirs.contains(&last_index(state)) {
+                // 開き直して固定した fd の実体を記録する（名前を辿り直さない）。
+                let st = fstat_fd(fd.as_fd())
+                    .map_err(|e| mount_api_error(spec, e, "fstat(bind mount target)"))?;
+                state
+                    .created_dir_ids
+                    .push((last_index(state), (st.dev, st.ino)));
+            }
+            fd
         }
         Err(e) => return Err(mount_api_error(spec, e, "openat(bind mount target)")),
     };
-    recorded?;
     check_target_kind(spec, &fd, kind)?;
     Ok(fd)
 }
 
-/// `open_chain` が作った途中のディレクトリの `(st_dev, st_ino)` を、作成直後に名前から固定して記録する。
+/// マウント先の親を rootfs の fd から 1 要素ずつ固定する（無い要素は作る）。
 ///
-/// ID を取れなかった要素は記録されず、後始末はその要素を消さずに失敗として併記する（照合できないものは消さない）。
-fn record_created_dirs(ctx: &Ctx<'_>, state: &mut Applied<'_>) -> Result<(), ExecError> {
-    let names = state.names.clone();
-    let todo: Vec<usize> = state
-        .created_dirs
-        .iter()
-        .copied()
-        .filter(|i| state.created_dir_ids.iter().all(|(j, _)| j != i))
-        .collect();
-    for index in todo {
-        let Some(prefix) = names.get(..=index) else {
-            continue;
+/// 作った要素は、作成直後に開き直して固定した fd の `(st_dev, st_ino)` をその場で `created_dir_ids` へ記録する
+/// （名前を辿り直さない）。途中で失敗しても、それまでに作った分は記録済みのため後始末が照合して消せる。
+/// 失敗は宛先の接頭辞つきの `IsolationStage::MountBinds` のエラーにする。
+fn open_parents_recording(
+    ctx: &Ctx<'_>,
+    spec: &BindMountSpec,
+    parents: &[&OsStr],
+    state: &mut Applied<'_>,
+) -> Result<OwnedFd, ExecError> {
+    let mut cur: Option<OwnedFd> = None;
+    for (index, name) in parents.iter().enumerate() {
+        let c = CString::new(name.as_bytes())
+            .map_err(|_| violation(spec, ViolationReason::PathContainsNul))?;
+        let dir = cur.as_ref().map_or(ctx.root, |f| f.as_fd());
+        let next = match sys::open_dir_path_nofollow(Some(dir), &c) {
+            Ok(fd) => fd,
+            Err(SysError::Os(sys::ENOENT)) => {
+                match sys::mkdir_at(dir, &c, DIR_MODE) {
+                    Ok(()) => state.created_dirs.push(index),
+                    Err(SysError::Os(sys::EEXIST)) => {}
+                    Err(e) => return Err(mount_api_error(spec, e, "mkdirat(bind mount target)")),
+                }
+                let fd = sys::open_dir_path_nofollow(Some(dir), &c).map_err(|e| {
+                    annotate(
+                        spec,
+                        super::open_error(e, true, Path::new("/"), parents).at_stage(STAGE),
+                    )
+                })?;
+                if state.created_dirs.contains(&index) {
+                    let st = fstat_fd(fd.as_fd()).map_err(|e| {
+                        mount_api_error(spec, e, "fstat(created bind mount parent)")
+                    })?;
+                    state.created_dir_ids.push((index, (st.dev, st.ino)));
+                }
+                fd
+            }
+            Err(e) => {
+                return Err(annotate(
+                    spec,
+                    super::open_error(e, true, Path::new("/"), parents).at_stage(STAGE),
+                ));
+            }
         };
-        let fd = open_chain(ctx.root, Path::new("/"), prefix, None)?;
-        let st = fstat_fd(fd.as_fd())
-            .map_err(|e| ExecError::from_sys(e, STAGE, "fstat(created bind mount parent)"))?;
-        state.created_dir_ids.push((index, (st.dev, st.ino)));
+        cur = Some(next);
     }
-    Ok(())
+    cur.ok_or_else(|| failed(spec, "bind mount destination is empty"))
 }
 
 /// 無いマウント先の末尾を作る（ディレクトリは 0755、通常ファイルは空の 0644）。競合で先に作られた場合は何もしない。
@@ -957,16 +974,24 @@ fn remove_created(
     }
 }
 
-/// 後始末用の隔離名の連番（同一プロセス内の衝突回避）。
+/// 後始末用の隔離ディレクトリ名の連番（同一プロセス内の衝突回避）。
 static QUARANTINE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 隔離ディレクトリの中での、移した実体の名前。
+const QUARANTINED: &str = "victim";
+
+/// 隔離ディレクトリの権限（所有者のみ）。
+const QUARANTINE_MODE: u32 = 0o700;
 
 /// `parent` 配下の `name` を、記録した `(dev, ino)` と一致する実体のときだけ消す（検証対象と削除対象を一致させる）。
 ///
-/// 名前のまま照合して `unlinkat` すると、照合と削除の間に別プロセスが同名の別実体へ差し替えられる。そこで
-/// (1) `renameat` で同じ親の中の推測されにくい隔離名へ原子的に移し、(2) 隔離名を開いて `(dev, ino)` を照合し、
-/// (3) 一致したときだけ隔離名を消す。不一致・削除失敗のときは元の名前へ戻す（戻し先が再び作られていれば
-/// 置き換わる点は残る）。マウントが残っている要素は `renameat` が `EBUSY` で拒否するため、umount に失敗した
-/// 場合も消さない。
+/// 名前のまま照合して `unlinkat` すると、照合と削除の間に別プロセスが同名の別実体へ差し替えられる。同じ親の中に
+/// 隔離名で改名するだけでも、その隔離名が他者から見えて書けるため差し替えられる。そこで
+/// (1) `parent` の中に自分専用（0700・実効 uid 所有）の隔離ディレクトリを作って fd で固定し、
+/// (2) `RENAME_NOREPLACE` の `renameat2` で対象をその中へ原子的に移し（他者はそこへ入れない）、
+/// (3) 移した実体を開いて `(dev, ino)` を照合し、(4) 一致したときだけ消す。不一致・削除失敗のときは元の名前へ
+/// `RENAME_NOREPLACE` で戻す。戻し先に別の実体が作られていれば上書きせず、実体を隔離ディレクトリに残して
+/// 失敗として報告する。マウントが残っている要素は改名が `EBUSY` で拒否されるため、umount に失敗した場合も消さない。
 fn remove_verified(
     parent: BorrowedFd<'_>,
     name: &CString,
@@ -978,25 +1003,52 @@ fn remove_verified(
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.subsec_nanos());
-    let quarantine = CString::new(format!(
+    let qname = CString::new(format!(
         ".fandhe-rollback-{}-{seq}-{nanos:08x}",
         std::process::id()
     ))
     .map_err(|_| ("rename", "invalid quarantine name".to_owned()))?;
-    match sys::rename_at(parent, name, &quarantine) {
+    let victim =
+        CString::new(QUARANTINED).map_err(|_| ("rename", "invalid quarantine name".to_owned()))?;
+    sys::mkdir_at(parent, &qname, QUARANTINE_MODE).map_err(|e| ("mkdir", errno(e)))?;
+    let qdir = sys::open_dir_path_nofollow(Some(parent), &qname).map_err(|e| ("open", errno(e)))?;
+    let qst = fstat_fd(qdir.as_fd()).map_err(|e| ("verify", errno(e)))?;
+    if !qst.is_dir || qst.uid != sys::effective_uid() || qst.mode & 0o777 != QUARANTINE_MODE {
+        // 作った直後に他者が差し替えた。中へ移すと他者から触れるため何もしない。
+        return Err((
+            "verify",
+            "the quarantine directory is not private to this process; left in place".to_owned(),
+        ));
+    }
+    match sys::rename_noreplace_at(parent, name, qdir.as_fd(), &victim) {
         Ok(()) => {}
         // 既に無い（自分の作った実体が消えている）なら後始末は済んでいる。
-        Err(SysError::Os(sys::ENOENT)) => return Ok(()),
-        Err(e) => return Err(("rename", errno(e))),
+        Err(SysError::Os(sys::ENOENT)) => {
+            let _ = sys::remove_dir_at(parent, &qname);
+            return Ok(());
+        }
+        Err(e) => {
+            let _ = sys::remove_dir_at(parent, &qname);
+            return Err(("rename", errno(e)));
+        }
     }
     let put_back = |what: &'static str, detail: String| {
-        let detail = match sys::rename_at(parent, &quarantine, name) {
-            Ok(()) => detail,
-            Err(e) => format!("{detail}; restoring the original name failed: {}", errno(e)),
+        let detail = match sys::rename_noreplace_at(qdir.as_fd(), &victim, parent, name) {
+            Ok(()) => {
+                let _ = sys::remove_dir_at(parent, &qname);
+                detail
+            }
+            Err(SysError::Os(sys::EEXIST)) => format!(
+                "{detail}; the original name was re-created by another process, so the element was left in the quarantine directory"
+            ),
+            Err(e) => format!(
+                "{detail}; restoring the original name failed: {}; the element was left in the quarantine directory",
+                errno(e)
+            ),
         };
         Err((what, detail))
     };
-    let id = sys::open_path_nofollow(parent, &quarantine)
+    let id = sys::open_path_nofollow(qdir.as_fd(), &victim)
         .and_then(|fd| fstat_fd(fd.as_fd()))
         .map(|st| (st.dev, st.ino));
     match id {
@@ -1010,15 +1062,20 @@ fn remove_verified(
         Err(e) => return put_back("verify", errno(e)),
     }
     let removed = if is_dir {
-        sys::remove_dir_at(parent, &quarantine)
+        sys::remove_dir_at(qdir.as_fd(), &victim)
     } else {
-        sys::remove_file_at(parent, &quarantine)
+        sys::remove_file_at(qdir.as_fd(), &victim)
     };
     match removed {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // 空になった自分専用ディレクトリを消す（差し替えられていても空ディレクトリしか消えない）。
+            let _ = sys::remove_dir_at(parent, &qname);
+            Ok(())
+        }
         Err(e) => put_back(if is_dir { "rmdir" } else { "unlink" }, errno(e)),
     }
 }
+
 /// rootfs とその祖先の `(st_dev, st_ino)`（先頭が rootfs 自身）。`..` を `O_NOFOLLOW` で辿り、同じ位置に戻ったら
 /// （namespace のルート）終わる。上限 [`MAX_ANCESTORS`] 段を超えたら fail-closed。
 fn rootfs_identity_chain(root: BorrowedFd<'_>) -> Result<Vec<(u64, u64)>, ExecError> {
@@ -1057,6 +1114,8 @@ struct FdStat {
     is_dir: bool,
     is_file: bool,
     is_symlink: bool,
+    uid: u32,
+    mode: u32,
 }
 
 /// `fd`（`O_PATH` でもよい）の `fstat`。fd は複製して見るだけで、呼び出し側の fd は保持される。
@@ -1071,6 +1130,8 @@ fn fstat_fd(fd: BorrowedFd<'_>) -> Result<FdStat, SysError> {
         is_dir: meta.file_type().is_dir(),
         is_file: meta.file_type().is_file(),
         is_symlink: meta.file_type().is_symlink(),
+        uid: meta.uid(),
+        mode: meta.mode(),
     })
 }
 
@@ -2221,6 +2282,36 @@ mod tests {
         let (what, _) = remove_verified(parent.as_fd(), &name, id, true).expect_err("not empty");
         assert_eq!(what, "rmdir");
         assert!(path.join("f").exists(), "restored under the original name");
+    }
+
+    /// SEC-1: 成功した削除は隔離ディレクトリを残さない。`RENAME_NOREPLACE` の改名は既存の同名を上書きしない。
+    #[test]
+    fn sec1_remove_verified_leaves_no_quarantine_and_rename_never_replaces() {
+        use std::os::unix::fs::MetadataExt as _;
+        let fx = fx();
+        let (parent, _) = dir_fd_and_id(&fx.rootfs);
+        let path = fx.rootfs.join("t");
+        std::fs::write(&path, b"").expect("create");
+        let meta = std::fs::metadata(&path).expect("meta");
+        let name = CString::new("t").expect("cstring");
+        remove_verified(parent.as_fd(), &name, (meta.dev(), meta.ino()), false).expect("removed");
+        let left: Vec<_> = std::fs::read_dir(&fx.rootfs)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name())
+            .filter(|n| n.to_string_lossy().starts_with(".fandhe-rollback-"))
+            .collect();
+        assert!(left.is_empty(), "quarantine left: {left:?}");
+
+        std::fs::write(fx.rootfs.join("a"), b"a").expect("a");
+        std::fs::write(fx.rootfs.join("b"), b"b").expect("b");
+        let (a, b) = (
+            CString::new("a").expect("cstring"),
+            CString::new("b").expect("cstring"),
+        );
+        let err = sys::rename_noreplace_at(parent.as_fd(), &a, parent.as_fd(), &b)
+            .expect_err("must not replace");
+        assert!(matches!(err, SysError::Os(sys::EEXIST)), "{err:?}");
+        assert_eq!(std::fs::read(fx.rootfs.join("b")).expect("kept"), b"b");
     }
 
     /// REPAIR-4: 後始末中の開き直しの失敗も `; cleanup failed: ...` として元のエラーへ併記する。

@@ -19,6 +19,8 @@
 //! - シナリオ D（bind mount。#1915）: `mounts[]` に `/data` の bind（`rw`）を指定して start し、コンテナ内プローブが
 //!   `/data` へ固定の内容を書く。親はホスト側の元ディレクトリに同じ内容のファイルが現れることを完全一致で、
 //!   mountinfo 上の `/data` のオプションに `rw`・`nosuid`・`nodev` が含まれることを照合する
+//! - シナリオ E（状態ルートの bind 拒否。#2066・SEC-1）: 状態ルート自身とその symlink 別名を bind の元にした start が
+//!   `InvalidArgument` で拒否され、状態が Created のまま子が残らないことを照合する
 //! - root で実行された場合: 主経路は非 root（SEC-5）。launch が拒否され、状態が Created に戻り、子が残らないことだけを
 //!   照合する（コンテナ内 root をホスト root へ写す起動は試さない）
 //!
@@ -617,6 +619,7 @@ mod linux {
         scenario_b_failed_launch_leaves_nothing(&env, tag);
         scenario_c_multithreaded_refused(&env, tag);
         scenario_d_bind_mount(&env, tag);
+        scenario_e_state_root_bind_refused(&env, tag);
     }
 
     /// シナリオ A: 正常起動。
@@ -881,6 +884,53 @@ mod linux {
             children_of_self().is_empty(),
             "no child may remain after terminate"
         );
+    }
+
+    /// シナリオ E: 状態ルート自身、または状態ルートへの symlink 別名を bind mount の元にした start は、本番 launcher
+    /// へ渡る前に `InvalidArgument` で拒否され、状態は Created のまま子が残らない（SEC-1・SEC-4・#2066）。
+    /// start 後の改名・別の bind mount による別名は、namespace 内の mount 権限が要るため本試験の範囲外
+    /// （`exec::mount_binds` の単体試験が inode の鎖で照合する）。
+    fn scenario_e_state_root_bind_refused(env: &Env, tag: u32) {
+        let state_root = env._root.dir.join("state");
+        let alias_dir = Bundle::new("e-alias");
+        let alias = alias_dir.dir.join("state-alias");
+        std::os::unix::fs::symlink(&state_root, &alias).expect("symlink alias of state root");
+        for (label, source) in [("direct", state_root.clone()), ("symlink", alias)] {
+            let bundle = Bundle::new("e");
+            let ld = make_rootfs(&bundle.rootfs(), true);
+            let mounts = json!([{
+                "destination": BIND_DEST,
+                "type": "bind",
+                "source": source.to_str().expect("utf8 source path"),
+                "options": ["bind", "rw"]
+            }]);
+            write_config(&bundle, &ld, &["--with-bind"], mounts);
+            let id = ContainerId::new(format!("ple{label}{tag}")).expect("id");
+            do_create(env, &bundle, &id);
+
+            wait_single_thread();
+            let err = match start(
+                &env.store,
+                &env.recorder,
+                &env.launcher,
+                &StartRequest::new(id.clone()),
+                &timeouts(),
+            ) {
+                Ok(_) => panic!("start must refuse a bind of the state root ({label})"),
+                Err(e) => e,
+            };
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "{}", err.message());
+            assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+            assert!(!env.launcher.last_launch_may_have_left_process());
+            assert!(
+                children_of_self().is_empty(),
+                "no process may be spawned for a refused bind ({label})"
+            );
+            println!(
+                "production_launcher: scenario=state-root-bind-refused kind={label} code={:?}",
+                err.code()
+            );
+        }
     }
 
     /// root 実行: launch が拒否され、状態は Created に戻り、子が残らない（SEC-5。成功起動は試さない）。

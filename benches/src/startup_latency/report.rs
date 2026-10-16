@@ -25,16 +25,21 @@ pub enum ReportOutcome {
 
 /// 読み取りスレッドを起こし、`(読んだ行, 読み終えた時刻)` を 1 回だけ送るチャネルを返す。
 /// 読む量は `MAX_REPORT_LEN` で打ち切る（無制限確保の防止）。
-pub fn spawn_report_reader<R: Read + Send + 'static>(reader: R) -> Receiver<(Vec<u8>, Instant)> {
+/// スレッドを作れない場合は panic せず `Err` を返す（呼び出し側が起動済みの子とスコープを回収する）。
+pub fn spawn_report_reader<R: Read + Send + 'static>(
+    reader: R,
+) -> std::io::Result<Receiver<(Vec<u8>, Instant)>> {
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut line = Vec::new();
-        let mut limited = BufReader::new(reader.take(MAX_REPORT_LEN as u64));
-        let _ = limited.read_until(b'\n', &mut line);
-        let at = Instant::now();
-        let _ = tx.send((line, at));
-    });
-    rx
+    std::thread::Builder::new()
+        .name("startup-latency-report".to_string())
+        .spawn(move || {
+            let mut line = Vec::new();
+            let mut limited = BufReader::new(reader.take(MAX_REPORT_LEN as u64));
+            let _ = limited.read_until(b'\n', &mut line);
+            let at = Instant::now();
+            let _ = tx.send((line, at));
+        })?;
+    Ok(rx)
 }
 
 /// 受信結果を分類する。
@@ -67,7 +72,7 @@ mod tests {
     use std::time::Duration;
 
     fn read(bytes: &[u8]) -> ReportOutcome {
-        let rx = spawn_report_reader(Cursor::new(bytes.to_vec()));
+        let rx = spawn_report_reader(Cursor::new(bytes.to_vec())).expect("spawn reader");
         classify(rx.recv_timeout(Duration::from_secs(5)))
     }
 
@@ -131,7 +136,7 @@ mod tests {
                 Ok(0)
             }
         }
-        let rx = spawn_report_reader(Blocked);
+        let rx = spawn_report_reader(Blocked).expect("spawn reader");
         assert_eq!(
             classify(rx.recv_timeout(Duration::from_millis(50))),
             ReportOutcome::Timeout

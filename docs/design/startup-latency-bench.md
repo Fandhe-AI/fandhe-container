@@ -53,7 +53,7 @@ core の `delete` は使わない。ベンチのプロセスは試行ごとの s
 2. 状態を確かめる（成功は `Stopped`、ERR は `Created` かつ pid なし）
 3. 記録の cgroup（`fc-<id>@<instance>`。`CgroupName` で作る）が消えているか。残っていれば空の cgroup を `rmdir` し、空でなければ `cgroup.kill` の後に消す。スコープ・cgroup の空判定は子孫を含む `cgroup.events` の `populated` で行い、読み取り失敗は後始末失敗とする
 4. `/proc` を走査し、nonce を持つプローブが 0 件になるまで 10 秒まで待つ
-5. すべて満たしたときだけ状態ルートを消す。満たせなければ ID を `leftover_ids` に積み、以後の試行を止め、作業ディレクトリは調査用に残す（相対名だけを stderr へ出す）
+5. すべて満たしたときだけ状態ルートを消す。満たせなければ ID を `leftover_ids` に積み、以後の試行を止め、作業ディレクトリは調査用に残す（相対名だけを stderr へ出す）。systemd-run の stderr は捨てる（絶対パス・OS のエラー文字列を出さない）
 
 応答待ち（結果 1 行・supervisor の終了・回収・cgroup・プローブ）はすべて期限つきで、全体の期限の残りで切り詰める。
 

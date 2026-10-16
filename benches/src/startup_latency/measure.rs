@@ -419,18 +419,24 @@ impl Host for RealHost {
             .arg(&created.id_str)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::null())
             .process_group(0)
             .spawn()
             // 起動できていないので、残るのは Created の状態だけ（settle が検証する）。
             .map_err(|_| SpawnFailed { clean: true })?;
-        let Some(stdout) = child.stdout.take() else {
-            let _ = child.kill();
-            let mut waiter = RealWaiter {
-                child,
-                euid: self.euid,
-                unit,
-            };
+        let rx = match child.stdout.take() {
+            Some(stdout) => spawn_report_reader(stdout).ok(),
+            None => None,
+        };
+        let waiter = RealWaiter {
+            child,
+            euid: self.euid,
+            unit,
+        };
+        let Some(rx) = rx else {
+            // 結果チャネルを読めない（pipe なし・読み取りスレッドを作れない）。起動済みの子とスコープを回収する。
+            let mut waiter = waiter;
+            let _ = waiter.child.kill();
             let reaped = matches!(
                 waiter.wait_exit(Duration::from_millis(1)),
                 ExitWait::Exited(_) | ExitWait::TimedOut { reaped: true }
@@ -441,12 +447,8 @@ impl Host for RealHost {
             });
         };
         Ok(Launched {
-            rx: spawn_report_reader(stdout),
-            waiter: Box::new(RealWaiter {
-                child,
-                euid: self.euid,
-                unit,
-            }),
+            rx,
+            waiter: Box::new(waiter),
         })
     }
 
@@ -837,7 +839,10 @@ mod tests {
             let script = self.script(created);
             std::thread::sleep(Duration::from_millis(1));
             let (rx, keep) = match script.report {
-                Some(bytes) => (spawn_report_reader(Cursor::new(bytes.to_vec())), None),
+                Some(bytes) => (
+                    spawn_report_reader(Cursor::new(bytes.to_vec())).expect("spawn reader"),
+                    None,
+                ),
                 None => {
                     let (tx, rx) = mpsc::channel();
                     (rx, Some(tx))

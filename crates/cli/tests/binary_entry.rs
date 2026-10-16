@@ -445,6 +445,100 @@ fn sup1_start_delegates_to_sibling_supervisor_on_linux() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// `PATH` 上の symlink（例: `/usr/local/bin/fandhe-container` -> 配置先の CLI）を作る。
+/// symlink の置き場所 `bin_dir` は呼び出し側が用意する。
+#[cfg(target_os = "linux")]
+fn link_cli_into(bin_dir: &std::path::Path, real_cli: &std::path::Path) -> std::path::PathBuf {
+    let link = bin_dir.join("fandhe-container");
+    std::os::unix::fs::symlink(real_cli, &link).expect("symlink");
+    link
+}
+
+/// SUP-14・CLI-1・CORE-6: `PATH` 上の symlink から起動しても、CLI は実体のディレクトリの supervisor を起動する
+/// （#2068）。Linux の `current_exe()` は `/proc/self/exe` の解決結果（実体のパス）で、argv[0] や symlink の置き場所には
+/// 依らない。symlink 側のディレクトリに置いたおとりの supervisor（ERR を返す）は使われない。
+/// 絶対パスでの起動と、`PATH` を symlink のディレクトリだけにした名前での起動の両方で確かめる。
+#[cfg(target_os = "linux")]
+#[test]
+fn sup14_start_via_path_symlink_uses_supervisor_beside_real_exe() {
+    let tmp = TmpDir::new("sup14a");
+    let dir = isolated_cli_dir("sup14a");
+    let cli = dir.join("fandhe-container");
+    let (_root, root_s) = prepare_c1(&tmp, &cli);
+    install_fake_supervisor(&dir, "printf 'FCSUP1 OK 4242\\n'; exec sleep 1");
+
+    let bin = tmp.0.join("bin");
+    std::fs::create_dir_all(&bin).expect("mkdir bin");
+    let link = link_cli_into(&bin, &cli);
+    install_fake_supervisor(
+        &bin,
+        "printf 'FCSUP1 ERR UNIMPLEMENTED 8 decoy beside the symlink must not be used\\n'",
+    );
+
+    // (a) symlink の絶対パスで起動する。
+    let out = run_exe_env(&link, &["--root", &root_s, "start", "c1"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{:?}", out.stderr);
+    assert!(out.stdout.is_empty());
+    assert!(
+        out.stderr.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // (b) `PATH` を symlink のディレクトリだけにして、名前 `fandhe-container` で起動する。
+    let out = run_exe_env(
+        std::path::Path::new("fandhe-container"),
+        &["--root", &root_s, "start", "c1"],
+        &[("PATH", bin.as_os_str())],
+    );
+    assert_eq!(out.status.code(), Some(0), "{:?}", out.stderr);
+    assert!(out.stdout.is_empty());
+    assert!(
+        out.stderr.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // CLI は start で状態を書かない（#1541）。
+    let out = run_isolated(&cli, &["--root", &root_s, "list"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ID\tSTATUS\tPID\nc1\tcreated\t-\n"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// SUP-14・ERR-2: 実体のディレクトリに supervisor が無ければ、symlink の隣に supervisor があっても使わず
+/// FAILED_PRECONDITION（5）で止まる（symlink の置き場所を見ていないことの判別。#2068）。
+#[cfg(target_os = "linux")]
+#[test]
+fn sup14_start_via_symlink_ignores_supervisor_beside_link() {
+    let tmp = TmpDir::new("sup14b");
+    let dir = isolated_cli_dir("sup14b");
+    let cli = dir.join("fandhe-container");
+    let (_root, root_s) = prepare_c1(&tmp, &cli);
+
+    let bin = tmp.0.join("bin");
+    std::fs::create_dir_all(&bin).expect("mkdir bin");
+    let link = link_cli_into(&bin, &cli);
+    // 実体側には supervisor を置かない。symlink 側にだけ、使われれば成功してしまう supervisor を置く。
+    install_fake_supervisor(&bin, "printf 'FCSUP1 OK 4242\\n'; exec sleep 1");
+
+    let out = run_exe_env(&link, &["--root", &root_s, "start", "c1"], &[]);
+    assert_eq!(out.status.code(), Some(5));
+    assert_eq!(
+        op_and_code(&out),
+        ("start".into(), "FAILED_PRECONDITION".into())
+    );
+    assert!(out.stdout.is_empty());
+
+    let out = run_isolated(&cli, &["--root", &root_s, "list"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ID\tSTATUS\tPID\nc1\tcreated\t-\n"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
 /// CLI-1・OCI-6・ERR-2: Linux で stop / delete が core を呼ぶ。未 create は 3、Created の stop は 5、
 /// delete は 0 で状態ファイルを消し、2 回目は 3。不正 ID は core 到達前に 2（op は kill / delete）。
 #[cfg(target_os = "linux")]

@@ -38,7 +38,9 @@
 //!
 //! # 未実装・簡易実装（REPAIR-3）
 //! - 実行ファイルは CLI 自身の実体パスと同じディレクトリの固定名 `fandhe-container-supervisor` から解決する
-//!   （`PATH` 探索・環境変数・引数による上書きは作らない）。同一ユーザーで起動するため CLI と supervisor の間に権限の境界は無く、
+//!   （`PATH` 探索・環境変数・引数による上書きは作らない）。`PATH` 上の symlink から起動されても、Linux の `current_exe()` は
+//!   `/proc/self/exe` の解決結果（実体のパス）を返すため、argv[0] や symlink の置き場所ではなく実体のディレクトリを見る
+//!   （配布手順は CLI を launcher・supervisor と同じディレクトリに置く。#2068・SUP-14）。同一ユーザーで起動するため CLI と supervisor の間に権限の境界は無く、
 //!   実行ファイルの所有者・権限の fd 経由の検証は特権経路のランチャー（#1719）の責務とする。
 //! - rootful の特権起動でランチャー（`fandhe-container-launcher`）を選ぶ規則は未実装（#1719・#1722）。
 //! - supervisor の stderr（構造化ログ）の保存先は未整備。

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/install-privileged-launcher.sh の自己テスト（TASK-171 追補・#1721・MS-9・SUP-14・SEC-1・REPAIR-5・REPAIR-12）。
+# scripts/install-privileged-launcher.sh の自己テスト（TASK-171 追補・#1721・#2068・MS-9・SUP-14・SEC-1・REPAIR-5・REPAIR-12）。
 #
 # 役割: 実行のたびに mktemp -d 配下へスタブ（stat / mkdir / flock / mktemp / dd / chown / chmod / setcap / getcap / ln / mv / rm / id）と
 #   入力元・配置先を作り、終了コード・stdout / stderr・スタブ呼び出し記録・最終ファイルの中身とモードを具体値で照合する。
@@ -60,6 +60,7 @@ new_sandbox() {
   : >"${SB}/calls.log"
   printf 'NEW-LAUNCHER\n' >"${SB}/src/launcher"
   printf 'NEW-SUPERVISOR\n' >"${SB}/src/supervisor"
+  printf 'NEW-CLI\n' >"${SB}/src/cli"
   # 全スタブ共通の前処理: 呼び出し記録・期限つき実行の確認・n 回目の呼び出しへのハング / 失敗の注入。
   #   STUB_HANG / STUB_FAIL / STUB_HANG_AFTER は `<command>:<n>` の空白区切り（そのコマンドの n 回目の呼び出し）。
   #   STUB_HANG_AFTER は本来の処理を済ませてからハングする（「操作は効いたが応答が返らない」の再現）。
@@ -166,6 +167,7 @@ file="$1"
 mode="${STUB_GETCAP_MODE:-match}"
 [ "${mode}" = "fail" ] && exit 1
 [ "${mode}" = "fail-supervisor" ] && case "$file" in *supervisor*) exit 1 ;; esac
+[ "${mode}" = "fail-cli" ] && case "$file" in */fandhe-container | */.cli.*) exit 1 ;; esac
 case "${mode}" in
   enotsup-stderr) echo "Failed to get capabilities of file '$file' (Operation not supported)" >&2; exit 0 ;;
   enotsup-exit1) echo "Failed to get capabilities of file '$file' (Operation not supported)" >&2; exit 1 ;;
@@ -192,6 +194,8 @@ case "$file" in
     if [ "${mode}" = "mismatch" ]; then emit "cap_sys_admin,cap_kill"; else emit "$caps"; fi ;;
   *supervisor*)
     if [ "${mode}" = "supervisor-has-caps" ]; then emit "$caps"; fi ;;
+  */fandhe-container | */.cli.*)
+    if [ "${mode}" = "cli-has-caps" ]; then emit "$caps"; fi ;;
 esac
 exit 0
 EOS
@@ -209,9 +213,9 @@ run_install() { # <env 代入>... -- <引数>...
   timeout "${OUTER_TIMEOUT}" bash -c 'echo "$$" >"$0"; exec "$@"' "${SB}/installer.pid" \
     env FANDHE_INSTALL_TEST_SANDBOX="${SB}" ${envs[@]+"${envs[@]}"} "${target}" "$@" >"${SB}/out" 2>"${SB}/err" || rc=$?
 }
-std_args() { echo "--launcher ${SB}/src/launcher --supervisor ${SB}/src/supervisor --dest-dir ${SB}/dest"; }
+std_args() { echo "--launcher ${SB}/src/launcher --supervisor ${SB}/src/supervisor --cli ${SB}/src/cli --dest-dir ${SB}/dest"; }
 norm_log() {
-  sed -E -e "s#${SB}#SB#g" -e 's#\.(launcher|supervisor)\.[A-Za-z0-9]{6}#.\1.TMP#g' "${SB}/calls.log"
+  sed -E -e "s#${SB}#SB#g" -e 's#\.(launcher|supervisor|cli)\.[A-Za-z0-9]{6}#.\1.TMP#g' "${SB}/calls.log"
 }
 count_log() { grep -c -E "$1" "${SB}/calls.log" || true; }
 count_err() { grep -c -E "$1" "${SB}/err" || true; }
@@ -226,7 +230,9 @@ lock_state() {
 }
 launcher_content() { cat "${SB}/dest/fandhe-container-launcher" 2>/dev/null || echo "<missing>"; }
 supervisor_content() { cat "${SB}/dest/fandhe-container-supervisor" 2>/dev/null || echo "<missing>"; }
+cli_content() { cat "${SB}/dest/fandhe-container" 2>/dev/null || echo "<missing>"; }
 backup_content() { cat "${SB}"/dest/.supervisor.bak.* 2>/dev/null || echo "<missing>"; }
+cli_backup_content() { cat "${SB}"/dest/.cli.bak.* 2>/dev/null || echo "<missing>"; }
 # stderr の n 行目。期限超過の終了コードは timeout(1) の実装と信号の無視の有無で 124 / 137 のどちらにもなるため、
 # 1 つの語へそろえてから照合する（どちらも期限超過を表す）。
 err_line() { # <n>
@@ -235,6 +241,7 @@ err_line() { # <n>
 put_old_files() {
   printf 'OLD-LAUNCHER\n' >"${SB}/dest/fandhe-container-launcher"
   printf 'OLD-SUPERVISOR\n' >"${SB}/dest/fandhe-container-supervisor"
+  printf 'OLD-CLI\n' >"${SB}/dest/fandhe-container"
 }
 
 # --- 1. root でない ---
@@ -248,7 +255,7 @@ eq "not-root: dest untouched" 0 "$(dest_count)"
 eq "not-root: no lock file" none "$(lock_state)"
 rc=0
 env -u FANDHE_INSTALL_TEST_SANDBOX "${target}" --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" \
-  --dest-dir "${SB}/dest" >"${SB}/out" 2>"${SB}/err" || rc=$?
+  --cli "${SB}/src/cli" --dest-dir "${SB}/dest" >"${SB}/out" 2>"${SB}/err" || rc=$?
 eq "not-root (real EUID): exit code" 3 "${rc}"
 eq "not-root (real EUID): stderr code" "error: not-root:" "$(stderr_head)"
 
@@ -282,7 +289,7 @@ mkdir "${SB}/parent"
 mkdir "${SB}/parent/dest"
 chmod 755 "${SB}/parent/dest"
 chmod 775 "${SB}/parent"
-run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --dest-dir "${SB}/parent/dest"
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" --dest-dir "${SB}/parent/dest"
 eq "parent group-writable: exit code" 3 "${rc}"
 eq "parent group-writable: stderr code" "error: untrusted-dest-dir:" "$(stderr_head)"
 eq "parent group-writable: no mutating calls" 0 "$(count_log "${MUTATING}")"
@@ -301,6 +308,24 @@ run_install -- $(std_args)
 eq "dest file is directory: exit code" 3 "${rc}"
 eq "dest file is directory: stderr code" "error: untrusted-dest-dir:" "$(stderr_head)"
 eq "dest file is directory: no mutating calls" 0 "$(count_log "${MUTATING}")"
+# CLI の最終名が symlink・ディレクトリでも、何も変えずに止まる（launcher・supervisor と同じ検査）
+new_sandbox
+put_old_files
+rm "${SB}/dest/fandhe-container"
+ln -s "${SB}/src/cli" "${SB}/dest/fandhe-container"
+# shellcheck disable=SC2046
+run_install -- $(std_args)
+eq "dest cli is symlink: exit code" 3 "${rc}"
+eq "dest cli is symlink: stderr code" "error: untrusted-dest-dir:" "$(stderr_head)"
+eq "dest cli is symlink: no mutating calls" 0 "$(count_log "${MUTATING}")"
+eq "dest cli is symlink: others unchanged" "OLD-LAUNCHER OLD-SUPERVISOR" "$(launcher_content) $(supervisor_content)"
+new_sandbox
+mkdir "${SB}/dest/fandhe-container"
+# shellcheck disable=SC2046
+run_install -- $(std_args)
+eq "dest cli is directory: exit code" 3 "${rc}"
+eq "dest cli is directory: stderr code" "error: untrusted-dest-dir:" "$(stderr_head)"
+eq "dest cli is directory: no mutating calls" 0 "$(count_log "${MUTATING}")"
 
 # --- 3. setcap 成功 ---
 success_case() { # <name> <getcap format>
@@ -312,12 +337,16 @@ success_case() { # <name> <getcap format>
   eq "$1: stderr empty" "" "$(cat "${SB}/err")"
   eq "$1: launcher mode" 755 "$(stat -c %a "${SB}/dest/fandhe-container-launcher")"
   eq "$1: supervisor mode" 755 "$(stat -c %a "${SB}/dest/fandhe-container-supervisor")"
+  eq "$1: cli mode" 755 "$(stat -c %a "${SB}/dest/fandhe-container")"
   eq "$1: launcher content" "NEW-LAUNCHER" "$(launcher_content)"
   eq "$1: supervisor content" "NEW-SUPERVISOR" "$(supervisor_content)"
-  eq "$1: chown count" 2 "$(count_log '^chown root:root ')"
-  eq "$1: setcap calls" "setcap ${CAPS} SB/dest/.launcher.TMP" "$(norm_log | grep '^setcap' || true)"
+  eq "$1: cli content" "NEW-CLI" "$(cli_content)"
+  eq "$1: chown count" 3 "$(count_log '^chown root:root ')"
+  eq "$1: setcap calls (launcher only, none for the cli or supervisor)" "setcap ${CAPS} SB/dest/.launcher.TMP" \
+    "$(norm_log | grep '^setcap' || true)"
   eq "$1: no setuid chmod" 0 "$(count_log '^chmod 4755')"
-  eq "$1: no leftover temp files" 2 "$(dest_count)"
+  eq "$1: cli chmod is 0755 only" "chmod 0755 SB/dest/.cli.TMP" "$(norm_log | grep '^chmod .*\.cli\.TMP' || true)"
+  eq "$1: no leftover temp files" 3 "$(dest_count)"
   eq "$1: lock file is private" "dest/.install.lock:600" "$(lock_state)"
   eq "$1: every change ran under the lock" "" "$(cat "${SB}/unlocked.log" 2>/dev/null || true)"
 }
@@ -328,7 +357,7 @@ success_case "setcap ok (new getcap format)" new
 run_install -- $(std_args)
 eq "upgrade rerun: exit code" 0 "${rc}"
 eq "upgrade rerun: stderr empty" "" "$(cat "${SB}/err")"
-eq "upgrade rerun: file count" 2 "$(dest_count)"
+eq "upgrade rerun: file count" 3 "$(dest_count)"
 # 以前の実行が残した退避ファイル（復元に失敗したとき等に残す）があっても、名前が衝突せず更新できる。残っていたものは消さない
 : >"${SB}/dest/.supervisor.bak.$$"
 printf 'STALE\n' >"${SB}/dest/.supervisor.bak.AAAAAA"
@@ -336,19 +365,20 @@ printf 'STALE\n' >"${SB}/dest/.supervisor.bak.AAAAAA"
 run_install -- $(std_args)
 eq "upgrade with stale backups: exit code" 0 "${rc}"
 eq "upgrade with stale backups: stale file kept" "STALE" "$(cat "${SB}/dest/.supervisor.bak.AAAAAA")"
-eq "upgrade with stale backups: file count" 4 "$(dest_count)"
+eq "upgrade with stale backups: file count" 5 "$(dest_count)"
 # 配置先が無ければ、信頼できる祖先の下に 0755 で作る（umask に依らない）
 new_sandbox
 rmdir "${SB}/dest"
 rc=0
 (umask 077 && run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" \
-  --dest-dir "${SB}/dest/a/b" && exit "${rc}") || rc=$?
+  --cli "${SB}/src/cli" --dest-dir "${SB}/dest/a/b" && exit "${rc}") || rc=$?
 eq "dest created: exit code" 0 "${rc}"
 eq "dest created: mkdir calls" "mkdir -m 0755 -- SB/dest|mkdir -m 0755 -- SB/dest/a|mkdir -m 0755 -- SB/dest/a/b" \
   "$(norm_log | grep '^mkdir' | paste -sd'|' -)"
 eq "dest created: directory modes" "755 755 755" \
   "$(stat -c %a "${SB}/dest" "${SB}/dest/a" "${SB}/dest/a/b" | paste -sd' ' -)"
 eq "dest created: launcher content" "NEW-LAUNCHER" "$(cat "${SB}/dest/a/b/fandhe-container-launcher")"
+eq "dest created: cli content" "NEW-CLI" "$(cat "${SB}/dest/a/b/fandhe-container")"
 eq "dest created: lock file is private" "dest/a/b/.install.lock:600" "$(lock_state)"
 
 # --- 3b. 同じ配置先への並行インストールの排他 ---
@@ -365,13 +395,13 @@ eq "lock held by another process: exit code" 3 "${rc}"
 eq "lock held by another process: stderr code" "error: install-locked:" "$(stderr_head)"
 eq "lock held by another process: stderr is one line" 1 "$(wc -l <"${SB}/err" | tr -d ' ')"
 eq "lock held by another process: no mutating calls" 0 "$(count_log "${MUTATING}")"
-eq "lock held by another process: files" "OLD-LAUNCHER OLD-SUPERVISOR" "$(launcher_content) $(supervisor_content)"
-eq "lock held by another process: file count" 2 "$(dest_count)"
+eq "lock held by another process: files" "OLD-LAUNCHER OLD-SUPERVISOR OLD-CLI" "$(launcher_content) $(supervisor_content) $(cli_content)"
+eq "lock held by another process: file count" 3 "$(dest_count)"
 exec 9>&-
 # shellcheck disable=SC2046
 run_install -- $(std_args)
 eq "lock released: exit code" 0 "${rc}"
-eq "lock released: files" "NEW-LAUNCHER NEW-SUPERVISOR" "$(launcher_content) $(supervisor_content)"
+eq "lock released: files" "NEW-LAUNCHER NEW-SUPERVISOR NEW-CLI" "$(launcher_content) $(supervisor_content) $(cli_content)"
 # ロックファイルが他の利用者から読める（読めるだけで flock を取れる）・通常ファイルでないときは、信頼できない配置先として止まる
 lock_untrusted_case() { # <name> <prep 関数>
   new_sandbox
@@ -382,7 +412,7 @@ lock_untrusted_case() { # <name> <prep 関数>
   eq "$1: exit code" 3 "${rc}"
   eq "$1: stderr code" "error: untrusted-dest-dir:" "$(stderr_head)"
   eq "$1: no mutating calls" 0 "$(count_log "${MUTATING}")"
-  eq "$1: files" "OLD-LAUNCHER OLD-SUPERVISOR" "$(launcher_content) $(supervisor_content)"
+  eq "$1: files" "OLD-LAUNCHER OLD-SUPERVISOR OLD-CLI" "$(launcher_content) $(supervisor_content) $(cli_content)"
 }
 prep_lock_644() { : >"${SB}/dest/.install.lock"; chmod 644 "${SB}/dest/.install.lock"; }
 prep_lock_symlink() { : >"${SB}/lock-target"; chmod 600 "${SB}/lock-target"; ln -s "${SB}/lock-target" "${SB}/dest/.install.lock"; }
@@ -407,7 +437,8 @@ setuid_case() { # <name> <setcap mode> [env 代入]...
   eq "${name}: chmod 4755 count" 1 "$(count_log '^chmod 4755 ')"
   eq "${name}: chown precedes chmod 4755" "chown root:root SB/dest/.launcher.TMP" \
     "$(norm_log | grep -B1 '^chmod 4755' | head -n1)"
-  eq "${name}: no leftover temp files" 2 "$(dest_count)"
+  eq "${name}: cli mode" 755 "$(stat -c %a "${SB}/dest/fandhe-container")"
+  eq "${name}: no leftover temp files" 3 "$(dest_count)"
 }
 setuid_case "setuid fallback (glibc ENOTSUP)" enotsup
 setuid_case "setuid fallback (musl wording)" enotsup-musl
@@ -434,7 +465,8 @@ stop_case() { # <name> <expected code> <env 代入>...
     if [ "${pre}" = old ]; then
       eq "${name} (${pre}): old launcher unchanged" "OLD-LAUNCHER" "$(launcher_content)"
       eq "${name} (${pre}): old supervisor unchanged" "OLD-SUPERVISOR" "$(supervisor_content)"
-      eq "${name} (${pre}): no leftover temp files" 2 "$(dest_count)"
+      eq "${name} (${pre}): old cli unchanged" "OLD-CLI" "$(cli_content)"
+      eq "${name} (${pre}): no leftover temp files" 3 "$(dest_count)"
     else
       eq "${name} (${pre}): nothing installed" 0 "$(dest_count)"
     fi
@@ -450,6 +482,9 @@ stop_case "getcap mismatch" capability-mismatch STUB_GETCAP_MODE=mismatch
 stop_case "getcap fails (launcher readback)" capability-mismatch STUB_GETCAP_MODE=fail
 stop_case "getcap fails (no-caps readback)" capability-mismatch STUB_GETCAP_MODE=fail-supervisor
 stop_case "supervisor has capabilities" capability-mismatch STUB_GETCAP_MODE=supervisor-has-caps
+# CLI には capability を付けない。付いていたら（読み戻しが空でなければ）止まる。
+stop_case "cli has capabilities" capability-mismatch STUB_GETCAP_MODE=cli-has-caps
+stop_case "getcap fails (cli readback)" capability-mismatch STUB_GETCAP_MODE=fail-cli
 # getcap の「非対応」を capability なしと読み替えるのは setcap が非対応で失敗した後だけ。setcap が成功した FS で
 # getcap が非対応を返すのは矛盾なので止まる（setuid への切り替え条件は広がらない）。
 stop_case "getcap ENOTSUP on stderr while setcap succeeded" capability-mismatch STUB_GETCAP_MODE=enotsup-stderr
@@ -474,7 +509,7 @@ setuid_stop_case() { # <name> <getcap mode>
   eq "$1: old launcher unchanged" "OLD-LAUNCHER" "$(launcher_content)"
   eq "$1: old launcher mode unchanged" 644 "$(stat -c %a "${SB}/dest/fandhe-container-launcher")"
   eq "$1: old supervisor unchanged" "OLD-SUPERVISOR" "$(supervisor_content)"
-  eq "$1: no leftover temp files" 2 "$(dest_count)"
+  eq "$1: no leftover temp files" 3 "$(dest_count)"
 }
 setuid_stop_case "setuid fallback: getcap reports EIO with exit 0" eio-stderr
 setuid_stop_case "setuid fallback: getcap fails without a message" fail
@@ -489,12 +524,15 @@ eq "SIGTERM mid-update: outcome line" 1 "$(count_err '^warning: rolled-back: pre
 eq "SIGTERM mid-update: stderr is the outcome only" 1 "$(wc -l <"${SB}/err" | tr -d ' ')"
 eq "SIGTERM mid-update: old launcher kept" "OLD-LAUNCHER" "$(launcher_content)"
 eq "SIGTERM mid-update: old supervisor restored" "OLD-SUPERVISOR" "$(supervisor_content)"
-eq "SIGTERM mid-update: no leftover files" 2 "$(dest_count)"
+eq "SIGTERM mid-update: old cli restored" "OLD-CLI" "$(cli_content)"
+eq "SIGTERM mid-update: both restorations on the one outcome line" 1 "$(count_err 'previous supervisor restored at .*, previous CLI restored at ')"
+eq "SIGTERM mid-update: no leftover files" 3 "$(dest_count)"
 new_sandbox
 # shellcheck disable=SC2046
 run_install STUB_GETCAP_MODE=term-installer -- $(std_args)
 eq "SIGTERM mid-update (fresh): exit code" 143 "${rc}"
 eq "SIGTERM mid-update (fresh): outcome line" 1 "$(count_err '^warning: rolled-back: new supervisor removed ')"
+eq "SIGTERM mid-update (fresh): the new cli is removed too" 1 "$(count_err 'new supervisor removed from .*, new CLI removed from ')"
 eq "SIGTERM mid-update (fresh): nothing installed" 0 "$(dest_count)"
 
 # 実行の途中で配置先が外から変えられた場合（ロックの外にいる root の操作）。スタブの呼び出しに合わせて hook.sh が変える。
@@ -508,10 +546,10 @@ new_sandbox
 # shellcheck disable=SC2016 # hook.sh の中で展開する
 write_hook 'printf "APPEARED\n" >"${FANDHE_INSTALL_TEST_SANDBOX}/dest/fandhe-container-supervisor"'
 # shellcheck disable=SC2046
-run_install STUB_HOOK_AT=dd:1 STUB_FAIL=mv:2 -- $(std_args)
+run_install STUB_HOOK_AT=dd:1 STUB_FAIL=mv:3 -- $(std_args)
 eq "supervisor appears mid-run: exit code" 1 "${rc}"
 eq "supervisor appears mid-run: stderr code" "error: install-failed:" "$(stderr_head)"
-eq "supervisor appears mid-run: outcome line" 1 "$(count_err '^warning: rolled-back: previous supervisor restored ')"
+eq "supervisor appears mid-run: outcome line" 1 "$(count_err '^warning: rolled-back: previous supervisor restored .*, new CLI removed from ')"
 eq "supervisor appears mid-run: files" "<missing> APPEARED" "$(launcher_content) $(supervisor_content)"
 eq "supervisor appears mid-run: file count" 1 "$(dest_count)"
 # 最初の確認の後に最終名が symlink になったら、置換せずに止まる
@@ -525,13 +563,13 @@ eq "launcher becomes a symlink mid-run: exit code" 3 "${rc}"
 eq "launcher becomes a symlink mid-run: stderr code" "error: untrusted-dest-dir:" "$(stderr_head)"
 eq "launcher becomes a symlink mid-run: no rename" 0 "$(count_log '^mv ')"
 eq "launcher becomes a symlink mid-run: supervisor unchanged" "OLD-SUPERVISOR" "$(supervisor_content)"
-eq "launcher becomes a symlink mid-run: file count" 2 "$(dest_count)"
+eq "launcher becomes a symlink mid-run: file count" 3 "$(dest_count)"
 # rename の直前に最終名がディレクトリになっても、その中へ移動せずに失敗する（mv -T）
 new_sandbox
 # shellcheck disable=SC2016 # hook.sh の中で展開する
 write_hook 'mkdir "${FANDHE_INSTALL_TEST_SANDBOX}/dest/fandhe-container-supervisor"'
 # shellcheck disable=SC2046
-run_install STUB_HOOK_AT=mv:1 -- $(std_args)
+run_install STUB_HOOK_AT=mv:2 -- $(std_args)
 eq "supervisor becomes a directory before rename: exit code" 1 "${rc}"
 eq "supervisor becomes a directory before rename: stderr code" "error: install-failed:" "$(stderr_head)"
 eq "supervisor becomes a directory before rename: nothing moved into it" 0 \
@@ -543,24 +581,24 @@ put_old_files
 # shellcheck disable=SC2016 # hook.sh の中で展開する
 write_hook 'rm -f "${FANDHE_INSTALL_TEST_SANDBOX}/dest/fandhe-container-supervisor"'
 # shellcheck disable=SC2046
-run_install STUB_HOOK_AT=mv:1 STUB_FAIL=mv:1 -- $(std_args)
+run_install STUB_HOOK_AT=mv:2 STUB_FAIL=mv:2 -- $(std_args)
 eq "supervisor vanishes during the update: exit code" 1 "${rc}"
 eq "supervisor vanishes during the update: stderr code" "error: install-failed:" "$(stderr_head)"
-eq "supervisor vanishes during the update: outcome line" 1 "$(count_err '^warning: rolled-back: previous supervisor restored ')"
-eq "supervisor vanishes during the update: files" "OLD-LAUNCHER OLD-SUPERVISOR" "$(launcher_content) $(supervisor_content)"
-eq "supervisor vanishes during the update: file count" 2 "$(dest_count)"
+eq "supervisor vanishes during the update: outcome line" 1 "$(count_err '^warning: rolled-back: previous supervisor restored .*, previous CLI restored ')"
+eq "supervisor vanishes during the update: files" "OLD-LAUNCHER OLD-SUPERVISOR OLD-CLI" "$(launcher_content) $(supervisor_content) $(cli_content)"
+eq "supervisor vanishes during the update: file count" 3 "$(dest_count)"
 
 new_sandbox
-run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --dest-dir "${SB}/dest/"
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" --dest-dir "${SB}/dest/"
 eq "dest-dir trailing slash: exit code" 0 "${rc}"
 eq "dest-dir trailing slash: stdout" "installed: method=file-capability dest-dir=${SB}/dest" "$(cat "${SB}/out")"
 new_sandbox
-run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --dest-dir "${SB}/dest//"
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" --dest-dir "${SB}/dest//"
 eq "dest-dir double trailing slash: exit code" 2 "${rc}"
 
 new_sandbox
 mkfifo "${SB}/src/fifo"
-run_install -- --launcher "${SB}/src/fifo" --supervisor "${SB}/src/supervisor" --dest-dir "${SB}/dest"
+run_install -- --launcher "${SB}/src/fifo" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" --dest-dir "${SB}/dest"
 eq "fifo source: exit code" 3 "${rc}"
 eq "fifo source: stderr code" "error: invalid-source:" "$(stderr_head)"
 # 検査（stat）の直後に入力元が書き手のいない FIFO へ差し替えられると、親シェルの open が止まる。watchdog が期限で
@@ -575,7 +613,7 @@ rc=0
 eq "source swapped to a fifo before open: exit code" 137 "${rc}"
 eq "source swapped to a fifo before open: stderr" "error: source-open-timeout: opening source timed out" "$(cat "${SB}/err")"
 eq "source swapped to a fifo before open: no mutating calls" 0 "$(count_log "${MUTATING}")"
-eq "source swapped to a fifo before open: files" "OLD-LAUNCHER OLD-SUPERVISOR" "$(launcher_content) $(supervisor_content)"
+eq "source swapped to a fifo before open: files" "OLD-LAUNCHER OLD-SUPERVISOR OLD-CLI" "$(launcher_content) $(supervisor_content) $(cli_content)"
 
 # --- 6. 引数エラー・入力元・テスト入口 ---
 new_sandbox
@@ -583,19 +621,32 @@ run_install --
 eq "no args: exit code" 2 "${rc}"
 run_install -- --bogus
 eq "unknown option: exit code" 2 "${rc}"
-run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --dest-dir relative/dir
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" --dest-dir relative/dir
 eq "relative dest-dir: exit code" 2 "${rc}"
-run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --dest-dir "${SB}/dest/../dest"
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" --dest-dir "${SB}/dest/../dest"
 eq "dest-dir with '..': exit code" 2 "${rc}"
-run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --dest-dir "${SB}/de st"
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" --dest-dir "${SB}/de st"
 eq "dest-dir with space: exit code" 2 "${rc}"
-run_install -- --supervisor "${SB}/src/supervisor" --dest-dir "${SB}/dest"
+run_install -- --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" --dest-dir "${SB}/dest"
 eq "missing --launcher: exit code" 2 "${rc}"
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --dest-dir "${SB}/dest"
+eq "missing --cli: exit code" 2 "${rc}"
 ln -s "${SB}/src/launcher" "${SB}/src/launcher-link"
-run_install -- --launcher "${SB}/src/launcher-link" --supervisor "${SB}/src/supervisor" --dest-dir "${SB}/dest"
+run_install -- --launcher "${SB}/src/launcher-link" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" --dest-dir "${SB}/dest"
 eq "symlink source: exit code" 3 "${rc}"
 eq "symlink source: stderr code" "error: invalid-source:" "$(stderr_head)"
-run_install -- --launcher "${SB}/src/none" --supervisor "${SB}/src/supervisor" --dest-dir "${SB}/dest"
+ln -s "${SB}/src/cli" "${SB}/src/cli-link"
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli-link" --dest-dir "${SB}/dest"
+eq "symlink cli source: exit code" 3 "${rc}"
+eq "symlink cli source: stderr code" "error: invalid-source:" "$(stderr_head)"
+mkfifo "${SB}/src/cli-fifo"
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli-fifo" --dest-dir "${SB}/dest"
+eq "fifo cli source: exit code" 3 "${rc}"
+eq "fifo cli source: stderr code" "error: invalid-source:" "$(stderr_head)"
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/none" --dest-dir "${SB}/dest"
+eq "missing cli source: exit code" 3 "${rc}"
+eq "missing cli source: stderr code" "error: invalid-source:" "$(stderr_head)"
+run_install -- --launcher "${SB}/src/none" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" --dest-dir "${SB}/dest"
 eq "missing source: exit code" 3 "${rc}"
 eq "missing source: stderr code" "error: invalid-source:" "$(stderr_head)"
 eq "invalid source: no mutating calls" 0 "$(count_log "${MUTATING}")"
@@ -610,7 +661,7 @@ done
 eq "timeout override refused: no mutating calls" 0 "$(count_log "${MUTATING}")"
 rc=0
 env -u FANDHE_INSTALL_TEST_SANDBOX FANDHE_INSTALL_TEST_TIMEOUT_SECS=1 "${target}" --launcher "${SB}/src/launcher" \
-  --supervisor "${SB}/src/supervisor" --dest-dir "${SB}/dest" >"${SB}/out" 2>"${SB}/err" || rc=$?
+  --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" --dest-dir "${SB}/dest" >"${SB}/out" 2>"${SB}/err" || rc=$?
 eq "timeout override outside the sandbox: exit code" 3 "${rc}"
 eq "timeout override outside the sandbox: stderr code" "error: test-seam-refused:" "$(stderr_head)"
 
@@ -662,10 +713,11 @@ run_install -- $(std_args)
 eq "reference upgrade: exit code" 0 "${rc}"
 eq "reference upgrade: every call ran under timeout" "" "$(cat "${SB}/unbounded.log" 2>/dev/null || true)"
 ref_log="${SB}/calls.log"
-eq "reference upgrade: rename count" 2 "$(grep -c '^mv ' "${ref_log}")"
-eq "reference upgrade: backup link count" 1 "$(grep -c '^ln ' "${ref_log}")"
-eq "reference upgrade: remove count" 1 "$(grep -c '^rm ' "${ref_log}")"
-eq "reference upgrade: temporary name count" 3 "$(grep -c '^mktemp ' "${ref_log}")"
+eq "reference upgrade: rename count" 3 "$(grep -c '^mv ' "${ref_log}")"
+eq "reference upgrade: backup link count" 2 "$(grep -c '^ln ' "${ref_log}")"
+eq "reference upgrade: remove count" 2 "$(grep -c '^rm ' "${ref_log}")"
+eq "reference upgrade: temporary name count" 5 "$(grep -c '^mktemp ' "${ref_log}")"
+eq "reference upgrade: setcap count (launcher only)" 1 "$(grep -c '^setcap ' "${ref_log}")"
 eq "reference upgrade: every change ran under the lock" "" "$(cat "${SB}/unlocked.log" 2>/dev/null || true)"
 eq "reference upgrade: stubbed commands seen" "chmod chown dd flock getcap ln mktemp mv rm setcap stat" \
   "$(cut -d' ' -f1 "${ref_log}" | sort -u | paste -sd' ' -)"
@@ -673,10 +725,12 @@ ref_specs=()
 while IFS= read -r spec; do ref_specs+=("${spec}"); done < <(awk '{c[$1]++; print $1 ":" c[$1]}' "${ref_log}")
 ref_mv1="$(grep -n '^mv ' "${ref_log}" | sed -n 1p | cut -d: -f1)"
 ref_mv2="$(grep -n '^mv ' "${ref_log}" | sed -n 2p | cut -d: -f1)"
-ref_rm="$(grep -n '^rm ' "${ref_log}" | sed -n 1p | cut -d: -f1)"
+ref_mv3="$(grep -n '^mv ' "${ref_log}" | sed -n 3p | cut -d: -f1)"
+ref_rm1="$(grep -n '^rm ' "${ref_log}" | sed -n 1p | cut -d: -f1)"
+ref_rm2="$(grep -n '^rm ' "${ref_log}" | sed -n 2p | cut -d: -f1)"
 # launcher の rename の直後に走る stat（後始末での inode の読み戻し）が何回目の stat か。
-ref_stat_after_mv2="$(($(head -n "${ref_mv2}" "${ref_log}" | grep -c '^stat ') + 1))"
-echo "INFO: reference upgrade makes ${#ref_specs[@]} bounded calls (mv at ${ref_mv1} and ${ref_mv2}, backup rm at ${ref_rm})"
+ref_stat_after_mv3="$(($(head -n "${ref_mv3}" "${ref_log}" | grep -c '^stat ') + 1))"
+echo "INFO: reference upgrade makes ${#ref_specs[@]} bounded calls (mv at ${ref_mv1}, ${ref_mv2} and ${ref_mv3}, backup rm at ${ref_rm1} and ${ref_rm2})"
 
 # 基準の呼び出し 1 件ずつをハングさせる（更新）。
 matrix_sb=()
@@ -698,16 +752,22 @@ extra_case() { # <name> <old|fresh> <env 代入>...
   extra_sb+=("${SB}")
   start_case "$@"
 }
-extra_case restore-timeout old "STUB_FAIL=mv:2" "STUB_HANG=mv:3"
-extra_case restore-failure old "STUB_FAIL=mv:2 mv:3"
-extra_case indeterminate old "STUB_HANG=mv:2 stat:${ref_stat_after_mv2}"
-extra_case supervisor-renamed-then-hang old "STUB_HANG_AFTER=mv:1"
-extra_case launcher-renamed-then-hang old "STUB_HANG_AFTER=mv:2"
+# mv の番号: 1 = CLI の rename・2 = supervisor の rename・3 = launcher の rename。launcher の失敗の後の復元は、
+# supervisor（mv:4）→ CLI（mv:5）の順。
+extra_case restore-timeout old "STUB_FAIL=mv:3" "STUB_HANG=mv:4"
+extra_case restore-failure old "STUB_FAIL=mv:3 mv:4"
+extra_case cli-restore-failure old "STUB_FAIL=mv:3 mv:5"
+extra_case supervisor-rename-failure old "STUB_FAIL=mv:2"
+extra_case cli-rename-failure old "STUB_FAIL=mv:1"
+extra_case indeterminate old "STUB_HANG=mv:3 stat:${ref_stat_after_mv3}"
+extra_case cli-renamed-then-hang old "STUB_HANG_AFTER=mv:1"
+extra_case supervisor-renamed-then-hang old "STUB_HANG_AFTER=mv:2"
+extra_case launcher-renamed-then-hang old "STUB_HANG_AFTER=mv:3"
 extra_case cleanup-timeout-after-failure old STUB_SETCAP_MODE=eperm "STUB_HANG=rm:1"
-extra_case fresh-launcher-rename-timeout fresh "STUB_HANG=mv:2"
-extra_case fresh-restore-timeout fresh "STUB_FAIL=mv:2" "STUB_HANG=rm:1"
-# 新規インストールでは退避ファイルの読み戻し（stat 1 回）が無いので、同じ stat は 1 つ前の番号になる。
-extra_case fresh-indeterminate fresh "STUB_HANG=mv:2 stat:$((ref_stat_after_mv2 - 1))"
+extra_case fresh-launcher-rename-timeout fresh "STUB_HANG=mv:3"
+extra_case fresh-restore-timeout fresh "STUB_FAIL=mv:3" "STUB_HANG=rm:1"
+# 新規インストールでは退避ファイルの読み戻し（stat 2 回）が無いので、同じ stat は 2 つ前の番号になる。
+extra_case fresh-indeterminate fresh "STUB_HANG=mv:3 stat:$((ref_stat_after_mv3 - 2))"
 wait
 
 i=0
@@ -716,37 +776,42 @@ for spec in "${ref_specs[@]}"; do
   i=$((i + 1))
   name="hang ${spec} (call ${i})"
   check_bounded_case "${name}" "hang ${spec}"
-  if [ "${i}" -eq "${ref_rm}" ]; then
+  if [ "${i}" -eq "${ref_rm1}" ] || [ "${i}" -eq "${ref_rm2}" ]; then
     # 置換が済んだ後の退避ファイルの削除だけが止まった: 導入は成功で、消せなかった退避ファイルを警告する。
+    # rm の 1 回目は旧 supervisor の退避・2 回目は旧 CLI の退避。
     eq "${name}: exit code" 0 "${rc}"
     eq "${name}: stdout" "installed: method=file-capability dest-dir=${SB}/dest" "$(cat "${SB}/out")"
     eq "${name}: stderr" "warning: cleanup-incomplete:" "$(stderr_head)"
     eq "${name}: stderr is the warning only" 1 "$(wc -l <"${SB}/err" | tr -d ' ')"
-    eq "${name}: files" "NEW-LAUNCHER NEW-SUPERVISOR" "$(launcher_content) $(supervisor_content)"
-    eq "${name}: backup kept" "OLD-SUPERVISOR" "$(backup_content)"
-    eq "${name}: file count" 3 "$(dest_count)"
+    eq "${name}: files" "NEW-LAUNCHER NEW-SUPERVISOR NEW-CLI" "$(launcher_content) $(supervisor_content) $(cli_content)"
+    if [ "${i}" -eq "${ref_rm1}" ]; then
+      eq "${name}: backups kept" "OLD-SUPERVISOR <missing>" "$(backup_content) $(cli_backup_content)"
+    else
+      eq "${name}: backups kept" "<missing> OLD-CLI" "$(backup_content) $(cli_backup_content)"
+    fi
+    eq "${name}: file count" 4 "$(dest_count)"
     continue
   fi
   eq "${name}: exit code" 1 "${rc}"
   eq "${name}: stderr code" "error: operation-timeout:" "$(stderr_head)"
   eq "${name}: stdout empty" "" "$(cat "${SB}/out")"
-  eq "${name}: file count" 2 "$(dest_count)"
+  eq "${name}: file count" 3 "$(dest_count)"
   if [ "${i}" -lt "${ref_mv1}" ]; then
     # 置換の前: 何も置き換わっていない。結果の行は要らない。
     eq "${name}: state in the message" 1 "$(head -n1 "${SB}/err" | grep -c 'no installed file was replaced')"
     eq "${name}: stderr is one line" 1 "$(wc -l <"${SB}/err" | tr -d ' ')"
-    eq "${name}: files" "OLD-LAUNCHER OLD-SUPERVISOR" "$(launcher_content) $(supervisor_content)"
-  elif [ "${i}" -le "${ref_mv2}" ]; then
-    # supervisor の rename から launcher の rename まで: 旧 supervisor へ戻り、その結果を 1 行で示す。
+    eq "${name}: files" "OLD-LAUNCHER OLD-SUPERVISOR OLD-CLI" "$(launcher_content) $(supervisor_content) $(cli_content)"
+  elif [ "${i}" -le "${ref_mv3}" ]; then
+    # CLI の rename から launcher の rename まで: 旧 supervisor・旧 CLI へ戻り、その結果を 1 行で示す。
     eq "${name}: outcome line" 1 "$(count_err '^warning: rolled-back: ')"
     eq "${name}: stderr is two lines" 2 "$(wc -l <"${SB}/err" | tr -d ' ')"
-    eq "${name}: files" "OLD-LAUNCHER OLD-SUPERVISOR" "$(launcher_content) $(supervisor_content)"
+    eq "${name}: files" "OLD-LAUNCHER OLD-SUPERVISOR OLD-CLI" "$(launcher_content) $(supervisor_content) $(cli_content)"
   else
-    # 2 つとも置換した後の読み戻し: 新しい組で揃っていて、検証が終わっていないことを示す。
-    eq "${name}: state in the message" 1 "$(head -n1 "${SB}/err" | grep -c 'both files are already replaced')"
+    # 3 つとも置換した後の読み戻し: 新しい組で揃っていて、検証が終わっていないことを示す。
+    eq "${name}: state in the message" 1 "$(head -n1 "${SB}/err" | grep -c 'all files are already replaced')"
     eq "${name}: outcome line" 1 "$(count_err '^warning: replaced-unverified: ')"
     eq "${name}: stderr is two lines" 2 "$(wc -l <"${SB}/err" | tr -d ' ')"
-    eq "${name}: files" "NEW-LAUNCHER NEW-SUPERVISOR" "$(launcher_content) $(supervisor_content)"
+    eq "${name}: files" "NEW-LAUNCHER NEW-SUPERVISOR NEW-CLI" "$(launcher_content) $(supervisor_content) $(cli_content)"
   fi
 done
 
@@ -755,54 +820,100 @@ for name in "${extra_names[@]}"; do
   SB="${extra_sb[${i}]}"
   i=$((i + 1))
   bak="$(find "${SB}/dest" -name '.supervisor.bak.*' | head -n1)"
+  clibak="$(find "${SB}/dest" -name '.cli.bak.*' | head -n1)"
   case "${name}" in
     restore-timeout | restore-failure)
-      # launcher の rename が失敗し、旧 supervisor への復元も失敗（期限超過 / エラー）: 退避ファイルを残して場所を示す。
+      # launcher の rename が失敗し、旧 supervisor への復元も失敗（期限超過 / エラー）: supervisor の退避ファイルを残して
+      # 場所を示す。CLI は復元できる（復元は supervisor → CLI の順で、片方の失敗で他方を止めない）。
       if [ "${name}" = restore-timeout ]; then
-        check_bounded_case "${name}" "fail mv:2 hang mv:3"
+        check_bounded_case "${name}" "fail mv:3 hang mv:4"
       else
-        check_bounded_case "${name}" "fail mv:2 fail mv:3"
+        check_bounded_case "${name}" "fail mv:3 fail mv:4"
       fi
       eq "${name}: exit code" 1 "${rc}"
       eq "${name}: stderr code" "error: install-failed:" "$(stderr_head)"
       eq "${name}: restore-failed line" \
         "error: restore-failed: could not restore the previous supervisor (exit code $([ "${name}" = restore-timeout ] && echo TIMEOUT || echo 1)); it is kept at ${bak} and ${SB}/dest/fandhe-container-supervisor is the new one; restore with: mv -f -T -- ${bak} ${SB}/dest/fandhe-container-supervisor" \
         "$(err_line 2)"
+      eq "${name}: cli restored line" 1 "$(count_err '^warning: rolled-back: previous CLI restored at .*; see the restore-failed error above ')"
+      eq "${name}: stderr is three lines" 3 "$(wc -l <"${SB}/err" | tr -d ' ')"
+      eq "${name}: files" "OLD-LAUNCHER NEW-SUPERVISOR OLD-CLI" "$(launcher_content) $(supervisor_content) $(cli_content)"
+      eq "${name}: backup kept" "OLD-SUPERVISOR <missing>" "$(backup_content) $(cli_backup_content)"
+      eq "${name}: file count" 4 "$(dest_count)"
+      ;;
+    cli-restore-failure)
+      # supervisor は戻せたが CLI を戻せない: CLI の退避ファイルを残して場所を示す。
+      check_bounded_case "${name}" "fail mv:3 fail mv:5"
+      eq "${name}: exit code" 1 "${rc}"
+      eq "${name}: stderr code" "error: install-failed:" "$(stderr_head)"
+      eq "${name}: restore-failed line" \
+        "error: restore-failed: could not restore the previous CLI (exit code 1); it is kept at ${clibak} and ${SB}/dest/fandhe-container is the new one; restore with: mv -f -T -- ${clibak} ${SB}/dest/fandhe-container" \
+        "$(err_line 2)"
+      eq "${name}: supervisor restored line" 1 "$(count_err '^warning: rolled-back: previous supervisor restored at .*; see the restore-failed error above ')"
+      eq "${name}: stderr is three lines" 3 "$(wc -l <"${SB}/err" | tr -d ' ')"
+      eq "${name}: files" "OLD-LAUNCHER OLD-SUPERVISOR NEW-CLI" "$(launcher_content) $(supervisor_content) $(cli_content)"
+      eq "${name}: backup kept" "<missing> OLD-CLI" "$(backup_content) $(cli_backup_content)"
+      eq "${name}: file count" 4 "$(dest_count)"
+      ;;
+    supervisor-rename-failure)
+      # supervisor の rename が失敗: 置換済みの CLI だけを旧 CLI へ戻す（supervisor は旧のまま）。
+      check_bounded_case "${name}" "fail mv:2"
+      eq "${name}: exit code" 1 "${rc}"
+      eq "${name}: stderr code" "error: install-failed:" "$(stderr_head)"
+      eq "${name}: outcome line" 1 "$(count_err '^warning: rolled-back: the previous supervisor is still in place at .*, previous CLI restored at .*; no installed file is replaced$')"
       eq "${name}: stderr is two lines" 2 "$(wc -l <"${SB}/err" | tr -d ' ')"
-      eq "${name}: files" "OLD-LAUNCHER NEW-SUPERVISOR" "$(launcher_content) $(supervisor_content)"
-      eq "${name}: backup kept" "OLD-SUPERVISOR" "$(backup_content)"
+      eq "${name}: files" "OLD-LAUNCHER OLD-SUPERVISOR OLD-CLI" "$(launcher_content) $(supervisor_content) $(cli_content)"
+      eq "${name}: file count" 3 "$(dest_count)"
+      ;;
+    cli-rename-failure)
+      # CLI の rename が失敗: 何も置換されていない（supervisor・launcher の rename には進まない）。
+      check_bounded_case "${name}" "fail mv:1"
+      eq "${name}: exit code" 1 "${rc}"
+      eq "${name}: stderr code" "error: install-failed:" "$(stderr_head)"
+      eq "${name}: outcome line" 1 "$(count_err '^warning: rolled-back: the previous CLI is still in place at ')"
+      eq "${name}: no further rename" 1 "$(grep -c '^mv ' "${SB}/calls.log")"
+      eq "${name}: files" "OLD-LAUNCHER OLD-SUPERVISOR OLD-CLI" "$(launcher_content) $(supervisor_content) $(cli_content)"
       eq "${name}: file count" 3 "$(dest_count)"
       ;;
     indeterminate)
-      # launcher の rename が期限超過し、置換の有無の読み戻しも期限超過: 何も動かさず退避ファイルを残す。
-      check_bounded_case "${name}" "hang mv:2 hang stat:${ref_stat_after_mv2}"
+      # launcher の rename が期限超過し、置換の有無の読み戻しも期限超過: 何も動かさず 2 つの退避ファイルを残す。
+      check_bounded_case "${name}" "hang mv:3 hang stat:${ref_stat_after_mv3}"
       eq "${name}: exit code" 1 "${rc}"
       eq "${name}: stderr code" "error: operation-timeout:" "$(stderr_head)"
       eq "${name}: state-indeterminate line" 1 \
-        "$(sed -n 2p "${SB}/err" | grep -c "^error: state-indeterminate: .* kept at ${bak}; .* restore with: mv -f -T -- ${bak} ${SB}/dest/fandhe-container-supervisor; ")"
+        "$(sed -n 2p "${SB}/err" | grep -c -F "the previous supervisor is kept at ${bak}; the previous CLI is kept at ${clibak}; if the launcher was not replaced, restore with: mv -f -T -- ${bak} ${SB}/dest/fandhe-container-supervisor && mv -f -T -- ${clibak} ${SB}/dest/fandhe-container; otherwise remove ${bak} ${clibak}; or rerun the installer")"
       eq "${name}: stderr is two lines" 2 "$(wc -l <"${SB}/err" | tr -d ' ')"
-      eq "${name}: backup kept" "OLD-SUPERVISOR" "$(backup_content)"
-      eq "${name}: supervisor not moved" "NEW-SUPERVISOR" "$(supervisor_content)"
-      eq "${name}: file count" 3 "$(dest_count)"
+      eq "${name}: backups kept" "OLD-SUPERVISOR OLD-CLI" "$(backup_content) $(cli_backup_content)"
+      eq "${name}: supervisor and cli not moved" "NEW-SUPERVISOR NEW-CLI" "$(supervisor_content) $(cli_content)"
+      eq "${name}: file count" 5 "$(dest_count)"
       ;;
-    supervisor-renamed-then-hang)
-      # supervisor の rename は効いたが応答が返らない: inode の読み戻しで置換済みと分かり、旧 supervisor へ戻す。
+    cli-renamed-then-hang)
+      # CLI の rename は効いたが応答が返らない: inode の読み戻しで置換済みと分かり、旧 CLI へ戻す。
       check_bounded_case "${name}" "hang-after mv:1"
       eq "${name}: exit code" 1 "${rc}"
       eq "${name}: stderr code" "error: operation-timeout:" "$(stderr_head)"
-      eq "${name}: outcome line" 1 "$(count_err '^warning: rolled-back: previous supervisor restored ')"
-      eq "${name}: files" "OLD-LAUNCHER OLD-SUPERVISOR" "$(launcher_content) $(supervisor_content)"
-      eq "${name}: file count" 2 "$(dest_count)"
+      eq "${name}: outcome line" 1 "$(count_err '^warning: rolled-back: previous CLI restored ')"
+      eq "${name}: files" "OLD-LAUNCHER OLD-SUPERVISOR OLD-CLI" "$(launcher_content) $(supervisor_content) $(cli_content)"
+      eq "${name}: file count" 3 "$(dest_count)"
+      ;;
+    supervisor-renamed-then-hang)
+      # supervisor の rename は効いたが応答が返らない: 置換済みの supervisor・CLI を旧ファイルへ戻す。
+      check_bounded_case "${name}" "hang-after mv:2"
+      eq "${name}: exit code" 1 "${rc}"
+      eq "${name}: stderr code" "error: operation-timeout:" "$(stderr_head)"
+      eq "${name}: outcome line" 1 "$(count_err '^warning: rolled-back: previous supervisor restored .*, previous CLI restored ')"
+      eq "${name}: files" "OLD-LAUNCHER OLD-SUPERVISOR OLD-CLI" "$(launcher_content) $(supervisor_content) $(cli_content)"
+      eq "${name}: file count" 3 "$(dest_count)"
       ;;
     launcher-renamed-then-hang)
       # launcher の rename は効いたが応答が返らない: 新しい組で揃っているので戻さない。
-      check_bounded_case "${name}" "hang-after mv:2"
+      check_bounded_case "${name}" "hang-after mv:3"
       eq "${name}: exit code" 1 "${rc}"
       eq "${name}: stderr code" "error: operation-timeout:" "$(stderr_head)"
       eq "${name}: outcome line" 1 "$(count_err '^warning: replaced-unverified: ')"
       eq "${name}: no rollback" 0 "$(count_err '^warning: rolled-back: ')"
-      eq "${name}: files" "NEW-LAUNCHER NEW-SUPERVISOR" "$(launcher_content) $(supervisor_content)"
-      eq "${name}: file count" 2 "$(dest_count)"
+      eq "${name}: files" "NEW-LAUNCHER NEW-SUPERVISOR NEW-CLI" "$(launcher_content) $(supervisor_content) $(cli_content)"
+      eq "${name}: file count" 3 "$(dest_count)"
       ;;
     cleanup-timeout-after-failure)
       # 置換の前に失敗し、一時ファイルの削除だけが期限超過: 原因は 1 行目、消せなかったファイルは警告で示す。
@@ -812,34 +923,35 @@ for name in "${extra_names[@]}"; do
       eq "${name}: cleanup-incomplete line" 1 \
         "$(err_line 2 | grep -c "^warning: cleanup-incomplete: could not remove the temporary file ${SB}/dest/.launcher.[A-Za-z0-9]* (exit code TIMEOUT); ")"
       eq "${name}: stderr is two lines" 2 "$(wc -l <"${SB}/err" | tr -d ' ')"
-      eq "${name}: files" "OLD-LAUNCHER OLD-SUPERVISOR" "$(launcher_content) $(supervisor_content)"
-      eq "${name}: file count" 3 "$(dest_count)"
+      eq "${name}: files" "OLD-LAUNCHER OLD-SUPERVISOR OLD-CLI" "$(launcher_content) $(supervisor_content) $(cli_content)"
+      eq "${name}: file count" 4 "$(dest_count)"
       ;;
     fresh-launcher-rename-timeout)
-      check_bounded_case "${name}" "hang mv:2"
+      check_bounded_case "${name}" "hang mv:3"
       eq "${name}: exit code" 1 "${rc}"
       eq "${name}: stderr code" "error: operation-timeout:" "$(stderr_head)"
-      eq "${name}: outcome line" 1 "$(count_err '^warning: rolled-back: new supervisor removed ')"
+      eq "${name}: outcome line" 1 "$(count_err '^warning: rolled-back: new supervisor removed from .*, new CLI removed from .*; nothing is installed$')"
       eq "${name}: nothing installed" 0 "$(dest_count)"
       ;;
     fresh-restore-timeout)
-      check_bounded_case "${name}" "fail mv:2 hang rm:1"
+      check_bounded_case "${name}" "fail mv:3 hang rm:1"
       eq "${name}: exit code" 1 "${rc}"
       eq "${name}: stderr code" "error: install-failed:" "$(stderr_head)"
       eq "${name}: restore-failed line" \
         "error: restore-failed: could not remove the new supervisor at ${SB}/dest/fandhe-container-supervisor (exit code TIMEOUT); there was no previous one, remove it manually" \
         "$(err_line 2)"
-      eq "${name}: files" "<missing> NEW-SUPERVISOR" "$(launcher_content) $(supervisor_content)"
+      eq "${name}: cli removed line" 1 "$(count_err '^warning: rolled-back: new CLI removed from .*; see the restore-failed error above ')"
+      eq "${name}: files" "<missing> NEW-SUPERVISOR <missing>" "$(launcher_content) $(supervisor_content) $(cli_content)"
       eq "${name}: file count" 1 "$(dest_count)"
       ;;
     fresh-indeterminate)
-      check_bounded_case "${name}" "hang mv:2 hang stat:$((ref_stat_after_mv2 - 1))"
+      check_bounded_case "${name}" "hang mv:3 hang stat:$((ref_stat_after_mv3 - 2))"
       eq "${name}: exit code" 1 "${rc}"
       eq "${name}: stderr code" "error: operation-timeout:" "$(stderr_head)"
       eq "${name}: state-indeterminate line" 1 \
-        "$(sed -n 2p "${SB}/err" | grep -c "^error: state-indeterminate: .* there was no previous one; if the launcher is missing, remove ${SB}/dest/fandhe-container-supervisor; ")"
-      eq "${name}: supervisor not moved" "NEW-SUPERVISOR" "$(supervisor_content)"
-      eq "${name}: file count" 1 "$(dest_count)"
+        "$(sed -n 2p "${SB}/err" | grep -c -F "there was no previous supervisor; there was no previous CLI; if the launcher was not replaced, restore with: rm -f -- ${SB}/dest/fandhe-container-supervisor && rm -f -- ${SB}/dest/fandhe-container; or rerun the installer")"
+      eq "${name}: supervisor and cli not moved" "NEW-SUPERVISOR NEW-CLI" "$(supervisor_content) $(cli_content)"
+      eq "${name}: file count" 2 "$(dest_count)"
       ;;
     *) fail "unknown extra case ${name}" ;;
   esac

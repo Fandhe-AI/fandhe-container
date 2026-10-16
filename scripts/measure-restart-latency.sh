@@ -67,7 +67,7 @@
 #   結果は後始末の成功を確認した後にだけ公開する（失敗・中断・後始末失敗では標準出力・--output とも出さない）。
 # 終了コード: 0 = 成功 / 1 = 計測失敗（FCSUP1 OK なし・期限切れ・再起動未観測・時計変更・launcher 異常終了・想定外の
 #   内部エラー）/ 2 = 引数・入力・出力先エラー / 3 = 前提欠如（非 Linux・bash 5 未満・jq・/proc。0 で合格に見せない）/
-#   4 = 後始末失敗（残存プロセス・帰属を証明できない生存 pid。最優先）/ 129・130・143 = HUP・INT・TERM による中断
+#   4 = 後始末失敗（残存プロセス・帰属を証明できない生存 pid・報告 pid か state.json の pid を記録できず追跡不能な場合。launcher の生存を問わない。最優先）/ 129・130・143 = HUP・INT・TERM による中断
 #   （後始末の完了後）。set -e による想定外の中断は、そのコマンドの終了コードに関わらず 1 に正規化する。
 # 期限: 各待機（create・FCSUP1・running・試行ごとの再起動観測）は --timeout を上限とし、単調時計（/proc/uptime）で判定する。
 #   実行全体の上限は --print-budget の値（既定の 20 試行・warmup 1・--timeout 30 で 843 秒）。本スクリプト自身は
@@ -99,7 +99,7 @@
 #   - 起動時刻（/proc/<pid>/stat の field 22）は 1/100 秒刻み。同じ刻みの中で pid が再利用された場合は区別できない。
 #   - 検出できない残存: トークンを継承せず、launcher 停止前の子孫スナップショットにも state.json にも現れない
 #     プロセス（スナップショット後に生まれた孤児・launcher が記録前に異常終了した場合の孤児）は検出できない。
-#     launcher が先に消え、コンテナの init（supervisor の報告 pid・state.json の pid）を記録できないまま後始末へ入った場合は、一時的な
+#     コンテナの init（supervisor の報告 pid・state.json の pid）を記録できないまま後始末へ入った場合は（launcher の生存を問わない）、一時的な
 #     中間プロセスを記録済みでもコンテナ全体を追跡できた証明にせず、終了コード 4 にして状態を残す。ただし、
 #     報告も state.json の pid も出る前に生まれた init は観測できない（原理的な制約）。
 #   - 本スクリプト自身が SIGKILL された場合（外側 timeout の --kill-after を含む）は後始末できない。launcher は
@@ -298,7 +298,6 @@ reported="null"
 reported_err=0
 collect_log=0
 snap_seen=0
-report_failed=0 # FCSUP1 ERR の報告を受けたら 1（supervisor は報告の直後に後始末へ入って終了する）
 keep_state=0
 last_snap_cs=0
 # 本計測への帰属を証明済みのプロセスの「pid → 起動時刻」（試行で kill 対象にしたコンテナ側プロセスと、launcher の
@@ -537,7 +536,6 @@ sup_report() {
     return 0
   fi
   if [[ "$line" =~ ^FCSUP1\ ERR\ ([A-Z_]{1,32})\ ([0-9]{1,3})\  ]]; then
-    report_failed=1
     fail "supervisor reported ERR ${BASH_REMATCH[1]} (exit ${BASH_REMATCH[2]})"
   fi
   fail "supervisor printed an unrecognized report line"
@@ -639,19 +637,16 @@ tracked_alive() {
 # 回収。戻り値 0 = 回収確認済み / 非 0 = 残存または帰属不明（呼び出し側が終了コード 4 にする）。
 # 所要時間の上限は約 20 秒（launcher の停止待ち 5 + 2 秒、回収の再試行 5 秒、/proc 走査）。--print-budget は 60 秒を見込む。
 do_cleanup() {
-  local i d p rc=0 untracked=0 launcher_was_alive=0
+  local i d p rc=0 untracked=0
   [ "$cleaned" -eq 0 ] || return 0
   cleaned=1
   trap '' INT TERM HUP
   # 1. launcher の生存中に子孫を記録する（停止後は親子関係を辿れない）。
-  if launcher_ok; then
-    snapshot_descendants || true
-    launcher_was_alive=1
-  fi
-  if [ -n "$launcher_pid" ] && [ "$snap_seen" -eq 0 ] && { [ "$launcher_was_alive" -eq 0 ] || [ "$report_failed" -eq 1 ]; }; then
-    # launcher が既に消えた（または FCSUP1 ERR の報告の直後で、まもなく消える。終了の競合に判定を依存させない）。
-    # コンテナの init（報告 pid・state.json の pid）を記録できていない。FCSUP1 ERR の報告や早期終了、一時的な中間
-    # プロセスの観測は init 不在の証明にならない（製品の start_contract.rs は ERR を後始末より先に報告し、
+  if launcher_ok; then snapshot_descendants || true; fi
+  if [ -n "$launcher_pid" ] && [ "$snap_seen" -eq 0 ]; then
+    # コンテナの init（報告 pid・state.json の pid）を記録できていない。launcher の生存・FCSUP1 ERR の報告・
+    # 一時的な中間プロセスの観測は、init の追跡も未生成も証明しない（最後のスナップショットの後に init が生まれ、
+    # その直後に launcher を止める順序が成立する。製品の start_contract.rs は ERR を後始末より先に報告し、
     # start_entry.rs には未回収ハンドルを伴う失敗経路もある。init は所有トークンも継承しない）。後段で init の帰属を
     # 証明できなければ、追跡不能として終了コード 4 にし、手動回収のため状態を残す（SUP-5）。
     untracked=1

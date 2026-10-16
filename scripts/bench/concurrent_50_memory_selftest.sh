@@ -109,6 +109,14 @@ expect_has() { # <名前> <ファイル> <部分文字列>
   if grep -qF -- "$3" "$2"; then pass "$1"; else fail "$1 (missing: $3)"; fi
 }
 
+# 終了コード 4（init を記録できず追跡不能）の経路が残した状態ディレクトリ（stderr の "state kept at <path>"）を
+# 回収する。通知が無ければ失敗（4 の経路は残置を通知する契約。SUP-5）。
+reclaim_kept() { # <名前>
+  local k
+  k="$(sed -n 's/.*state kept at \(\/[^)]*\)).*/\1/p' "$errf" | head -n 1)"
+  if [ -n "$k" ] && [ -d "$k" ]; then pass "$1-state-kept"; rm -rf -- "$k"; else fail "$1-state-kept"; fi
+}
+
 mkdir -p "$work/bundle/rootfs" "$work/fake" "$work/bin"
 echo '{}' >"$work/bundle/config.json"
 stub="$work/bin/fandhe-container-supervisor"
@@ -408,8 +416,10 @@ expect_eq "min-procs-no-residual" 0 "$(alive_stub_count)"
 
 # --- 8. 期限切れ（起動完了しない launcher）→ exit 1 かつ所定時間内 ---
 start=$SECONDS
+# init を報告しない launcher（FCSUP1 OK 無し）は、init を記録できないので追跡不能の経路（exit 4・状態保持。SUP-5）。
 STUB_MODE=hang run_fake --count 2 --trials 1 --timeout 2
-expect_eq "timeout-exit1" 1 "$rc"
+expect_eq "timeout-exit4-init-unrecorded" 4 "$rc"
+reclaim_kept "timeout"
 if [ $((SECONDS - start)) -le 20 ]; then pass "timeout-bounded-time"; else fail "timeout-bounded-time"; fi
 expect_eq "timeout-no-residual" 0 "$(alive_stub_count)"
 
@@ -451,8 +461,10 @@ kill_recorded
 sleep 0.5
 
 # --- 12b. 深さ上限（MAX_DEPTH=16）超のツリーは過少計上になるため成功にしない ---
+# 深さ上限で木を辿れず init を記録できない経路なので追跡不能（exit 4・状態保持。SUP-5）。
 STUB_DEEP=1 run_fake --count 2 --trials 1 --timeout 2
-expect_eq "deep-tree-exit1" 1 "$rc"
+expect_eq "deep-tree-exit4-init-unrecorded" 4 "$rc"
+reclaim_kept "deep-tree"
 expect_eq "deep-tree-stdout-empty" 0 "$(wc -c <"$out")"
 expect_eq "deep-tree-no-residual" 0 "$(alive_stub_count)"
 
@@ -519,7 +531,9 @@ done <"$STUB_PIDFILE" || true
 
 # --- 12e. READY 行を出さない launcher は、プロセス数が足りていても起動完了と見なさない ---
 STUB_MODE=noready run_target --count 2 --trials 1 --timeout 2
-expect_eq "noready-exit1" 1 "$rc"
+# 報告が無いので init を記録できない経路（exit 4・状態保持。SUP-5）。
+expect_eq "noready-exit4-init-unrecorded" 4 "$rc"
+reclaim_kept "noready"
 expect_has "noready-stderr" "$errf" "started=0/2"
 expect_eq "noready-stdout-empty" 0 "$(wc -c <"$out")"
 expect_eq "noready-no-residual" 0 "$(alive_stub_count)"
@@ -538,7 +552,9 @@ expect_eq "bigwrite-no-residual" 0 "$(alive_stub_count)"
 #          後の READY は記録されないので起動未完了になり、ログが上限ちょうどで打ち切られたことを報告する ---
 rm -f "$work/noise-done"
 STUB_NOISE_KIB=3072 STUB_NOISE_DONE="$work/noise-done" run_fake --count 1 --trials 1 --timeout 3
-expect_eq "log-limit-exit1" 1 "$rc"
+# 上限より後の FCSUP1 OK は記録されず、init を記録できない経路（exit 4・状態保持。SUP-5）。
+expect_eq "log-limit-exit4-init-unrecorded" 4 "$rc"
+reclaim_kept "log-limit"
 expect_has "log-limit-startup-incomplete" "$errf" "startup-incomplete: trial=1 started=0/1"
 expect_has "log-limit-truncated" "$errf" "unstarted-log-truncated: id=fc-bench50-1-1 bytes=262144 limit_kib=256"
 expect_eq "log-limit-launcher-wrote-all" "done" "$(cat "$work/noise-done" 2>/dev/null || echo missing)"
@@ -573,7 +589,9 @@ expect_eq "trial-logs-removed-counts" "0,0,0,0" "$(tr -d ' ' <"$work/prev-logs" 
 # --- 12g2. 子プロセス一覧（task/<tid>/children）に読めないものがあれば、読めた分だけで集計しない
 #           （CORE-9・SUP-1。過少計上を成功にしない。非 root で実行されるため chmod 000 で模擬できる） ---
 STUB_UNREADABLE_CHILDREN=1 run_fake --count 2 --trials 1 --timeout 2
-expect_eq "unreadable-children-exit1" 1 "$rc"
+# 読めない children があり木を確定できず init を記録できない経路（exit 4・状態保持。SUP-5）。
+expect_eq "unreadable-children-exit4-init-unrecorded" 4 "$rc"
+reclaim_kept "unreadable-children"
 expect_has "unreadable-children-stderr" "$errf" "startup-incomplete: trial=1 started=0/2"
 expect_eq "unreadable-children-stdout-empty" 0 "$(wc -c <"$out")"
 expect_eq "unreadable-children-no-residual" 0 "$(alive_stub_count)"
@@ -639,15 +657,34 @@ sleep 0.3
 kill -HUP "$sig_pid" 2>/dev/null || true
 r=0
 wait "$sig_pid" || r=$?
-expect_eq "resignal-exit143" 143 "$r"
+# READY 無し（STUB_NO_READY）で init の報告が無いため、中断でも追跡不能の経路（exit 4・状態保持。SUP-5）。
+expect_eq "resignal-exit4-init-unrecorded" 4 "$r"
+reclaim_kept "resignal"
 expect_eq "resignal-no-residual" 0 "$(alive_stub_count)"
 expect_eq "resignal-no-orphan-child" 0 "$(orphan_sleep_count)"
+
+# --- 12k2. init を報告・記録した後の中断は従来どおり 143（init を記録して回収できた経路。状態は削除される） ---
+: >"$STUB_PIDFILE"
+: >"$out"; : >"$errf"
+"$bash_bin" "$target" --bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/bundle" --target own \
+  --count 2 --trials 1 --settle 30 --timeout 20 >"$out" 2>"$errf" &
+sig_pid=$!
+for _ in $(seq 1 50); do [ "$(wc -l <"$STUB_PIDFILE")" -lt 2 ] || break; sleep 0.2; done
+sleep 2
+kill -TERM "$sig_pid"
+r=0
+wait "$sig_pid" || r=$?
+expect_eq "interrupt-recorded-exit143" 143 "$r"
+if grep -q "state kept at" "$errf"; then fail "interrupt-recorded-state-removed"; else pass "interrupt-recorded-state-removed"; fi
+expect_eq "interrupt-recorded-no-residual" 0 "$(alive_stub_count)"
 
 # --- 12l. launcher を起動した直後・pid を登録する前にシグナルを受けても（selftest 専用フックで模擬）、
 #          その launcher を登録してから後始末へ進み、残さない（REPAIR-5） ---
 : >"$STUB_PIDFILE"
 FANDHE_CONCURRENT_MEMORY_SELFTEST=1 FANDHE_CONCURRENT_MEMORY_SELFTEST_SIGNAL_IN_SPAWN=1 run_target --count 2 --trials 1 --timeout 5
-expect_eq "signal-in-spawn-exit143" 143 "$rc"
+# 起動直後（報告前）の中断なので init を記録できず、追跡不能の経路（exit 4・状態保持。SUP-5）。
+expect_eq "signal-in-spawn-exit4-init-unrecorded" 4 "$rc"
+reclaim_kept "signal-in-spawn"
 expect_has "signal-in-spawn-stderr" "$errf" "interrupted: received signal (exit 143); running cleanup"
 expect_eq "signal-in-spawn-stdout-empty" 0 "$(wc -c <"$out")"
 expect_eq "signal-in-spawn-no-residual" 0 "$(alive_stub_count)"

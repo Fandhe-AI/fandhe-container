@@ -53,7 +53,7 @@
 # 出力: JSON（標準出力。--output 指定時はそのファイル）。launcher・bundle のパス、cmdline、環境変数は出さない。
 # 終了コード: 0 = 全判定成立 / 1 = 判定不成立・起動数不足・期限切れ（起動数不足では結果を公開しない）/
 #   2 = 引数・入力・出力先エラー / 3 = 前提欠如（非 Linux 等。0 で合格に見せない）/
-#   4 = 後始末失敗（残存プロセス、または子孫を追跡しきれず回収を確認できない場合。最優先。結果ファイルは後始末の完了後に公開するため、4 のときは作られない）/ 129・130・143 = HUP・INT・TERM による中断（後始末の完了後）。
+#   4 = 後始末失敗（残存プロセス、または報告された init を pid・起動時刻つきで記録できず、追跡しきれず回収を確認できない場合〔supervisor の生存・ERR・無報告・一時的な子孫の観測だけでも 4。SUP-5〕。最優先。結果ファイルは後始末の完了後に公開するため、4 のときは作られない）/ 129・130・143 = HUP・INT・TERM による中断（後始末の完了後）。
 # 1 は機械照合できる事実の報告で、SUP-5 の合否判定・レポート化は #499（人間）が行う。
 # 既知の制約: 起動時刻の照合でも列挙から送信までの極めて短い pid 再利用の窓は理論上残る。コンテナ側プロセスは
 # 一過性の子を含めて「記録時点で存在した全プロセス」を対象にするため、一過性の子を持つ実装では不一致になり得る
@@ -250,7 +250,7 @@ owner_tok=""
 out_tmp=""
 final_rc=0
 spawned=0
-declare -A SP SS SZ CH TRK BADREP ERRREP
+declare -A SP SS SZ CH TRK BADREP
 untracked=0
 TREE_TRUNC=0
 publish_pending=0
@@ -481,10 +481,12 @@ tracked_alive() {
 cleanup_procs() {
   local i round
   track_descendants
-  # FCSUP1 ERR を報告した supervisor は報告の直後に終了する（生存中に後始末へ入ってもまもなく消える）。
-  # init の記録が無ければ、終了を待たず追跡不能とする（判定を終了の競合に依存させない）。
+  # supervisor の生存・FCSUP1 ERR の報告・一時的な中間プロセスの観測は、init の追跡も未生成も証明しない（最後の
+  # 記録の後に init が生まれ、その直後に supervisor を止める順序が成立する）。報告された init の pid を pid・
+  # 起動時刻つきで記録できていなければ、追跡不能として終了コード 4・状態保持にする（SUP-5）。
   for i in "${!pids[@]}"; do
-    if [ -n "${ERRREP[$i]:-}" ] && { [ -z "${REP_PID[$i]:-}" ] || [ -z "${TRK[${REP_PID[$i]}]:-}" ]; }; then untracked=1; fi
+    sup_report "$i" || true
+    if [ -z "${REP_PID[$i]:-}" ] || [ -z "${TRK[${REP_PID[$i]}]:-}" ]; then untracked=1; fi
   done
   for i in "${!pids[@]}"; do sig_same_proc TERM "${pids[$i]}" "${pstart[$i]:-}" "$$"; done
   wait_until 10 _none_alive || true
@@ -605,7 +607,6 @@ sup_report() { # <i>
   fi
   if [[ "$line" =~ ^FCSUP1\ ERR\ ([A-Z_]{1,32})\ ([0-9]{1,3})\  ]]; then
     err "launch-failed" "supervisor ${i} reported ERR ${BASH_REMATCH[1]} (exit ${BASH_REMATCH[2]})"
-    ERRREP[$i]=1
   else
     err "launch-failed" "supervisor ${i} printed an unrecognized report line"
   fi

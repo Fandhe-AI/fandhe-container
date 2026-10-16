@@ -633,17 +633,20 @@ run_case reported_below 1 normal "1000 2000" --trials 2 --warmup 0 --timeout 5 |
 if grep -q 'FAILED_PRECONDITION' "${root}/err_report.err"; then pass "err_report: error code reported"; else fail "err_report: error code missing"; fi
 if grep -q 'below the supervisor backoff' "${root}/no_backoff.err"; then pass "no_backoff: negative subtraction rejected"; else fail "no_backoff: message missing"; fi
 if grep -q 'below the supervisor backoff' "${root}/reported_below.err"; then pass "reported_below: negative subtraction rejected"; else fail "reported_below: message missing"; fi
-for m in no_ready early_exit no_restart same_pid count_jump dead_new error_line err_report err_report_slow bad_report no_backoff reported_below; do
+for m in no_ready early_exit no_restart same_pid count_jump dead_new error_line foreign_pid err_report err_report_slow bad_report no_backoff reported_below; do
   if [ -s "${root}/${m}.out" ]; then fail "${m}: stdout must be empty on failure"; else pass "${m}: no result published"; fi
 done
 
-# state.json の pid が launcher の子孫でないときは kill せず失敗する（偽造 state.json 対策）
+# state.json の pid が launcher の子孫でないときは kill せず失敗する（偽造 state.json 対策）。報告された pid が木の外の
+# 無関係プロセス（launcher より前から動いている）なので、本物の init は特定できておらず、中間プロセスの記録だけでは
+# コンテナ全体の追跡の証明にならない。無関係プロセスへはシグナルを送らず、終了コード 4・状態を残す（SUP-5）
 sleep 300 &
 foreign_pid=$!
 echo "$foreign_pid" >"${root}/foreign.pid"
 sleep 0.1 # 起動時刻（1/100 秒刻み）が launcher より確実に前になるようにする（無関係と確定。suspect にしない）
-run_case foreign_pid 1 foreign_pid "" --trials 1 --warmup 0 --timeout 2 || true
+run_case foreign_pid 4 foreign_pid "" --trials 1 --warmup 0 --timeout 2 || true
 if kill -0 "$foreign_pid" 2>/dev/null; then pass "foreign_pid: unrelated process was not signaled"; else fail "foreign_pid: unrelated process was killed"; fi
+reclaim_kept foreign_pid
 kill "$foreign_pid" 2>/dev/null || true
 foreign_pid=""
 

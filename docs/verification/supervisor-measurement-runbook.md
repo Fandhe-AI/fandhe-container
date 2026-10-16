@@ -76,28 +76,45 @@ make supervisor-independence BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> COUN
    done
    ```
 
-   起動報告を期限付きで読み、全員の `FCSUP1 OK <pid>` を確認する（60 秒で打ち切る）。
+   起動報告を期限付きで読み、全員の `FCSUP1 OK <pid>` を確認する（60 秒で打ち切る）。報告の pid はコンテナ側 init で、報告を受けた時点で supervisor の子孫であることを確かめ、pid と起動時刻の組を `ctr<i>.pid` に保存する（後始末で pid 再利用の取り違えを防ぎ、init 自身を追跡するため）。子孫と確かめられない pid は保存しない。
 
    ```bash
+   is_desc() { # <pid> <祖先の pid>: PPid 連鎖を 64 段まで辿り、祖先に到達すれば 0
+     local p="$1" d=0
+     while [ "$d" -lt 64 ] && [ -n "$p" ] && [ "$p" -gt 1 ]; do
+       p=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null) || return 1
+       [ "$p" = "$2" ] && return 0
+       d=$((d + 1))
+     done
+     return 1
+   }
    ok=0
    for i in $(seq 1 50); do
      line=""
      IFS= read -r -t 60 -u "${FD[$i]}" line || true
      case "$line" in
-       "FCSUP1 OK "*) ok=$((ok + 1)); echo "${line#FCSUP1 OK }" >"$root/ctr$i.pid" ;;
+       "FCSUP1 OK "*)
+         ip="${line#FCSUP1 OK }"
+         read -r sp _ <"$root/sup$i.pid"
+         is="$(awk '{print $22}' "/proc/$ip/stat" 2>/dev/null || true)"
+         if [[ "$ip" =~ ^[1-9][0-9]{0,9}$ ]] && [ -n "$is" ] && is_desc "$ip" "$sp"; then
+           echo "$ip $is" >"$root/ctr$i.pid"; ok=$((ok + 1))
+         else
+           echo "sup-$i: reported pid is not a verified descendant of the supervisor" >&2
+         fi ;;
        *) echo "sup-$i: not ready: ${line:-<no report within 60s>}" >&2 ;;   # ERR 行や無報告はここに出る
      esac
    done
    echo "ready: $ok/50"
    ```
 
-   `ready: 50/50` で起動完了。ERR や無報告があれば計測せず、下の後始末をして原因を調べる。報告の pid はコンテナ側プロセス（supervisor の子孫）で、`ctr<i>.pid` に保存する。
+   `ready: 50/50` で起動完了。ERR や無報告があれば計測せず、下の後始末をして原因を調べる。
 
-   後始末は、supervisor の SIGTERM ではコンテナを停止しない（コンテナ側プロセスが孤児として残る）ため、次の順で行う。起動報告（`ctr<i>.pid`）の有無は子プロセス不在の証明にならない（ERR 報告や無報告でも、失敗経路に未回収のコンテナ側プロセスが残りうる）。そのため全 supervisor を対象に、生存中の子孫を起動時刻つきで追跡する。
+   後始末は、supervisor の SIGTERM ではコンテナを停止しない（コンテナ側プロセスが孤児として残る）ため、次の順で行う。追跡の対象はコンテナ側 init（報告 pid）自身で、`ctr<i>.pid` に pid と起動時刻の組を保存できていない個体は「追跡不能」とする（supervisor が生きていても、一時的な子孫を数えられても同じ。ERR 報告・無報告・報告前の中断では、最後の記録の後に init が生まれる順序が成立し、未回収のコンテナ側プロセスが残りうるため）。追跡不能の個体が 1 つでもあれば状態を削除せず保持する（スクリプトの終了コード 4 に相当）。
 
    ```bash
    # 1. supervisor を止める前に、全 supervisor の生存中の子孫（孫以下を含む）の pid と起動時刻を保存する（pid 再利用の取り違え防止）。
-   #    supervisor が既に消えていて子孫を 1 つも記録できない個体は「追跡不能」とし、状態を削除しない
+   #    init（ctr<i>.pid の pid・起動時刻の組）を記録できていない個体は「追跡不能」とし、状態を削除しない
    : >"$root/tracked"
    untracked=0
    desc_of() { # <pid>: 子孫を再帰的に列挙する
@@ -106,15 +123,18 @@ make supervisor-independence BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> COUN
    }
    for i in $(seq 1 50); do
      read -r sp st pp <"$root/sup$i.pid" 2>/dev/null || { untracked=1; continue; }
-     n=0
      if [ "$(awk '{print $22, $4}' "/proc/$sp/stat" 2>/dev/null)" = "$st $pp" ]; then
-       for c in $(desc_of "$sp") $(cat "$root/ctr$i.pid" 2>/dev/null); do
+       for c in $(desc_of "$sp"); do
          s2=$(awk '{print $22}' "/proc/$c/stat" 2>/dev/null) || continue
-         [ -n "$s2" ] && { echo "$c $s2" >>"$root/tracked"; n=$((n + 1)); }
+         [ -n "$s2" ] && echo "$c $s2" >>"$root/tracked"
        done
      fi
-     # supervisor が消滅済み、または子孫を 1 つも記録できない個体は、コンテナ側プロセスの不在を証明できない
-     [ "$n" -gt 0 ] || { echo "sup-$i: no descendant recorded (cannot prove no container process remains)" >&2; untracked=1; }
+     # init 自身を、報告時に保存した起動時刻つきで追跡対象へ加える（supervisor が消えていても記録は残る）
+     if read -r ip is <"$root/ctr$i.pid" 2>/dev/null && [ -n "$is" ]; then
+       echo "$ip $is" >>"$root/tracked"
+     else
+       echo "sup-$i: container init not recorded (cannot prove no container process remains)" >&2; untracked=1
+     fi
    done
    # 2. supervisor を終了させる。送信直前に pid・起動時刻・親 pid（このシェルの $$）の一致を確認する（pid 再利用の取り違え防止）。
    #    保存した pid が同じ起動時刻のまま生きていれば SIGKILL

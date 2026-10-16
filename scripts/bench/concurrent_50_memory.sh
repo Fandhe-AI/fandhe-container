@@ -125,7 +125,10 @@
 #       0 を返して合格に見せない）
 #   4 = 後始末失敗（起動したプロセス・コンテナが残存。他の失敗より優先して返す。docker モードでは
 #       docker rm -f の後にラベル一致のコンテナが残る場合と、docker run クライアント（timeout・docker CLI）の
-#       終了を確認できない場合を含む）
+#       終了を確認できない場合を含む）。own では、FCSUP1 OK で報告されたコンテナ側 init を pid・起動時刻つきで
+#       記録できず、init 自身のトークン観測でも帰属を証明できない場合も 4（追跡不能。launcher の生存・一時的な
+#       子孫の記録・無報告・報告前の中断でも同じ。状態ディレクトリを残し、stderr の "state kept at" のパスを手で回収する。
+#       init を記録して回収できた場合だけ従来の 1・143 を返す。SUP-5）
 #   129 / 130 / 143 = HUP / INT / TERM による中断（後始末は必ず実行し、残存があれば 4 を優先する。
 #       後始末中に再度シグナルを受けても後始末を最後まで続ける）
 #   上記以外の値（set -e の暗黙終了等）を返さないよう、失敗しうる操作は明示的に分岐する。
@@ -518,7 +521,7 @@ cpids=()
 cstart=()
 snaps=()
 known=()
-# 子孫を 1 つも記録できないまま launcher が消滅した場合に 1 にする（追跡不能。後始末の成功とは判定せず、
+# 報告された init を記録できないまま後始末へ入った場合に 1 にする（追跡不能。後始末の成功とは判定せず、
 # 一時ディレクトリも削除しない）。
 untracked=0
 keep_tmpdir=0 # ln_stop が 4（回収失敗）を返したら 1。手動回収のため作業ディレクトリを残す（SUP-5）
@@ -902,6 +905,8 @@ ln_init_pid() { # <i>
 init_in_known() { # <i> <init pid>
   local desc
   [ -n "$2" ] || return 1
+  # 報告された pid が launcher 自身なら、launcher は生存中の同一性（起動時刻）で追跡・回収している。
+  [ "$2" != "${pids[$1]:-}" ] || return 0
   for desc in ${known[$1]:-}; do
     [ "${desc%%:*}" = "$2" ] && return 0
   done
@@ -928,14 +933,12 @@ ln_stop() {
     ln_collect_pids "${pids[i]}" || true
     record_tree "$i"
     snaps[i]="${known[i]:-}"
-    # launcher が既に消滅し、生存中に子孫を 1 つも記録できていない。実 supervisor のコンテナ側プロセスは
-    # FANDHE_BENCH_OWNER を継承しないため、トークン走査でも見つからず、生存していても追跡できない。
-    # 子プロセス不在の証明にならないので、追跡不能として扱う（SUP-5。独立性検証スクリプトと同じ）。
-    # 所有トークンで 1 件でも見つかれば（スタブ等、環境変数を継承する場合）追跡できているので、回収後に判定する。
-    # launcher が既に消滅し、コンテナの init（FCSUP1 OK で報告された pid）を、起動時刻つきで生存中に記録できていない。
-    # 一時的な中間プロセスを 1 件記録しただけでは、コンテナ全体を追跡できた証明にならない。init は所有トークンも継承しない。
+    # コンテナの init（FCSUP1 OK で報告された pid）を、起動時刻つきで生存中に記録できていない。launcher の生存・
+    # 一時的な中間プロセスの記録・FCSUP1 ERR 等の報告は、init の追跡も未生成も証明しない（最後の記録の後に init が
+    # 生まれ、その直後に launcher を止める順序が成立する。実 supervisor の init は所有トークンも継承しない）。
+    # 後段で init 自身のトークン観測による帰属も証明できなければ、追跡不能として終了コード 4・状態保持にする（SUP-5）。
     ip="$(ln_init_pid "$i")"
-    if ! ln_alive "$i" && ! init_in_known "$i" "$ip"; then untracked_cand="${untracked_cand}${i}:${ip} "; fi
+    if ! init_in_known "$i" "$ip"; then untracked_cand="${untracked_cand}${i}:${ip} "; fi
   done
   for i in "${!pids[@]}"; do
     sig_same_proc TERM "${pids[i]}" "${pstart[i]:-}" "$$"

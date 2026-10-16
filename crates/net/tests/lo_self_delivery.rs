@@ -8,7 +8,7 @@
 //! # 流れ
 //! - 親（`-- --ignored`）: 自分自身を `unshare -rn <exe> --child` で再実行し、子の成功行と終了コードを期限付きで待つ。
 //!   子が成功行を出して exit 0 のときだけ最終の成功行を出す。
-//! - 子（新しい user + network namespace の中）: ガード（親と別の netns・lo とフォールバックトンネルだけ・
+//! - 子（親が環境変数で渡した親の netns 識別子と比べる。新しい user + network namespace の中）: ガード（親と別の netns・lo とフォールバックトンネルだけ・
 //!   lo が down で `IFF_LOOPBACK`）を確かめた後、down の `lo` に `10.215.0.1/24` を付け、
 //!   (1) 送信は成功するのに受信が `WouldBlock`（EAGAIN）で期限切れになること、
 //!   (2) `lo` を up にすると `IFF_UP` が立ち、新しい送信ソケットの同じ内容が届き peer も一致することを具体値で照合する。
@@ -67,6 +67,8 @@ mod linux {
     const IFF_LOOPBACK: u32 = 0x8;
     /// Linux の `EAGAIN`（`EWOULDBLOCK` と同値。x86_64・aarch64 共通）。
     const EAGAIN: i32 = 11;
+    /// 親が子へ自分の netns 識別子（`net:[inode]`）を渡す環境変数名。
+    const PARENT_NETNS_ENV: &str = "FANDHE_LO_SELF_DELIVERY_PARENT_NETNS";
     const PAYLOAD: &[u8] = b"fandhe-lo-self-delivery";
     /// 他の試験（10.200〜10.214）と衝突しない、隔離 netns 内だけで使う試験用アドレス。
     const TEST_ADDR: Ipv4Addr = Ipv4Addr::new(10, 215, 0, 1);
@@ -113,11 +115,16 @@ mod linux {
     /// 親: `unshare -rn <自分> --child` を起動し、期限付きで成功行と終了コードを確かめる。
     pub fn parent() {
         let root = is_root();
+        // 親の netns の識別子は親自身が読んで子へ渡す（子は新しい user namespace の中で、親の
+        // `/proc/<pid>/ns/net` を ptrace 権限不足で読めないため。CI の EACCES の原因）。
+        let parent_netns = std::fs::read_link("/proc/self/ns/net")
+            .unwrap_or_else(|e| fail(&format!("read own netns: {e}")));
         let exe = std::env::current_exe().unwrap_or_else(|e| fail(&format!("current_exe: {e}")));
         let mut child = Command::new("unshare")
             .arg("-rn")
             .arg(&exe)
             .arg("--child")
+            .env(PARENT_NETNS_ENV, &parent_netns)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .spawn()
@@ -180,10 +187,10 @@ mod linux {
         // ガード (a): 親と別の netns でなければ何も変えずに拒否する（host の netns を変えない）。
         let own = std::fs::read_link("/proc/self/ns/net")
             .unwrap_or_else(|e| fail(&format!("read own netns: {e}")));
-        let parent_path = format!("/proc/{}/ns/net", std::os::unix::process::parent_id());
-        let parent = std::fs::read_link(&parent_path)
-            .unwrap_or_else(|e| fail(&format!("refusing to run: cannot read {parent_path}: {e}")));
-        if own == parent {
+        let parent = std::env::var_os(PARENT_NETNS_ENV).unwrap_or_else(|| {
+            fail("refusing to run: parent netns identity was not passed (run via the parent)")
+        });
+        if own.as_os_str() == parent.as_os_str() {
             fail("refusing to run: same network namespace as the parent");
         }
 

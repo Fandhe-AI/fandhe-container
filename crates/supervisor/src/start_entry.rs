@@ -2002,11 +2002,15 @@ mod linux {
         // 報告の後に作るのでスレッドの制約に触れない。作成に失敗したら install が停止を要求し、既存の停止経路が
         // コンテナを終了させて Stopped を記録する（停止できないコンテナを残さない）。
         let stop = StopToken::new();
-        // 認証境界の拒否の記録先（SEC-4）。開けなければ構造化ログのみになる（fail-closed の判定は変えない）。
+        // 認証境界の拒否の記録先（SEC-4）。制御チャネルのサーバスレッドは監視スレッドと並行して動くため、複数スレッドでは
+        // `FileAuditSink` の隔離（fork）が使えない。スレッドを作る前のここで監査専用の helper プロセスを fork し、
+        // 以後の記録はそこへ渡して期限付きで永続化する（`ControlAuditRelay`）。作れなければ構造化ログのみになる
+        // （fail-closed の判定は変えない）。listener の bind より前に作るので helper は listener を継承しない。
         let audit: Option<Arc<dyn fandhe_container_core::audit_log::AuditSink>> =
             crate::exec::default_audit_sink(Some(args.root.clone()))
                 .ok()
-                .map(|s| Arc::new(s) as _);
+                .and_then(|s| fandhe_container_core::audit_log::ControlAuditRelay::spawn(s).ok())
+                .map(|r| Arc::new(r) as _);
         let (running, control) =
             crate::control::install(&args.root, &args.id, running, &stop, audit);
         let code = run_supervised(store, args.id, running, args.restart, &timeouts, &stop);

@@ -50,11 +50,15 @@
 //! pid1 の PID は未検証の候補しか得られないため載せない。フィールドは非公開かつ `#[non_exhaustive]` なので、
 //! 後から追加しても破壊的変更にならない。
 
+#[cfg(target_os = "linux")]
+mod control_relay;
 mod file_sink;
 mod file_writer;
 mod kernel_audit;
 mod landlock;
 
+#[cfg(target_os = "linux")]
+pub use control_relay::ControlAuditRelay;
 pub use file_sink::{AUDIT_LOG_FILE_NAME, FileAuditSink, RECORD_WAIT_LIMIT};
 pub use file_writer::{
     AUDIT_LINE_MAX_BYTES, AuditFallback, AuditFileWriter, AuditWriteError, AuditWriteErrorKind,

@@ -495,7 +495,7 @@ fn sec1_install_failure_requests_stop_fail_closed() {
     assert!(stop.is_stop_requested());
     // SUP-1・REPAIR-4: 失敗は構造化エラーで返り、回収後の終了コード 0 を非 0 へ上書きする。
     let failure = handle.failure().expect("install must report the failure");
-    assert_eq!(failure.code(), ErrorCode::FailedPrecondition);
+    assert_eq!(failure.code(), ErrorCode::PermissionDenied);
     assert_ne!(handle.exit_code(0), 0);
     assert_eq!(handle.exit_code(7), 7);
     assert!(std::fs::symlink_metadata(dir.join(CONTROL_SOCKET_NAME)).is_err());

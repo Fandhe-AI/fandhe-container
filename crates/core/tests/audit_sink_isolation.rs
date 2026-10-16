@@ -50,7 +50,7 @@ mod linux {
     use fandhe_container_core::audit_log::{
         AuditEvent, AuditFallback, AuditFileWriter, AuditPid, AuditRecord, AuditSink,
         AuditSyscallArch, AuditSyscallNr, AuditTimestamp, AuditWriteError, AuditWriteErrorKind,
-        FileAuditSink,
+        ControlAuditRelay, ControlPeerRejection, FileAuditSink,
     };
     use fandhe_container_core::traits::ErrorCode;
 
@@ -298,6 +298,7 @@ mod linux {
         notify_child_timed_out_before_writing_is_retried();
         notify_child_failing_mid_line_is_retried_after_a_newline();
         multi_threaded_process_skips_the_primary();
+        control_relay_persists_from_a_multi_threaded_process();
         // `SIGCHLD` の disposition を変えるため最後に実行する。
         assert!(FileAuditSink::set_child_signal_ignored_for_test(true));
         sigchld_ignored_keeps_results_and_records_once();
@@ -438,6 +439,76 @@ mod linux {
         // join の直後は解放前の helper が `Threads:` に残り得る。1 に戻るのを待ってから次の試験へ進む（待たないと、
         // 続く試験の fork が `MultiThreaded` で拒否され、主経路の成功を照合する試験が両経路失敗で落ちる。#1616）。
         wait_single_threaded();
+    }
+
+    /// SEC-4・REPAIR-5・SUP-1・SEC-1・#2058: 単一スレッドの間に fork した中継の helper が、複数スレッドになった後の
+    /// 呼び出し（制御チャネルのサーバスレッド相当）の記録を主経路へ永続化する。複数スレッドでは主経路が試行されない
+    /// （直接の `FileAuditSink` は `isolation_unavailable`）ことと対にして、中継の効果を具体値で確かめる。
+    /// スレッドを作った後の `spawn` は `FailedPrecondition` で拒否される。
+    fn control_relay_persists_from_a_multi_threaded_process() {
+        let marker = tmp_marker("relay");
+        let _ = std::fs::remove_file(&marker);
+        let primary: Primary = Arc::new(|path, _| {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|_| unreachable_err())?;
+            f.write_all(b"relayed\n").map_err(|_| unreachable_err())
+        });
+        let (sink, _seen) = sink(primary, false, Notify::Discard, marker.clone());
+        let relay = Arc::new(ControlAuditRelay::spawn(sink).unwrap());
+        assert_eq!(threads(), 1, "the relay must not leave a thread behind");
+        let rec = AuditRecord::new(
+            AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 5)),
+            AuditPid::new(4242).unwrap(),
+            ControlPeerRejection::PeerUidMismatch.audit_event(),
+        );
+        // 以後はスレッドが 2 になる。
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let worker = {
+            let relay = Arc::clone(&relay);
+            let rec = rec.clone();
+            std::thread::spawn(move || {
+                let first = relay.record(&rec);
+                let second = relay.record(&rec);
+                let _ = release_rx.recv();
+                (first, second)
+            })
+        };
+        // 2 件の記録が済むまで待つ（worker は解放待ちで生きている = 複数スレッドのまま）。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let text = std::fs::read_to_string(&marker).unwrap_or_default();
+            if text == "relayed\nrelayed\n" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "relay did not persist both records: {text:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(threads() >= 2);
+        let late = ControlAuditRelay::spawn(sink_for_late(&marker));
+        assert_eq!(late.unwrap_err().code(), ErrorCode::FailedPrecondition);
+        // 非 ControlPeer の層は運ばない。
+        assert_eq!(
+            relay.record(&record()).unwrap_err().code(),
+            ErrorCode::InvalidArgument
+        );
+        drop(release_tx);
+        let (first, second) = worker.join().unwrap();
+        first.unwrap();
+        second.unwrap();
+        drop(relay);
+        wait_single_threaded();
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    fn sink_for_late(marker: &Path) -> FileAuditSink {
+        let primary: Primary = Arc::new(|_, _| Err(unreachable_err()));
+        sink(primary, false, Notify::Discard, marker.to_path_buf()).0
     }
 
     /// SEC-4・REPAIR-4・REPAIR-5・#1594: 未回収の子が上限（D 状態の子が溜まった状態の再現）でも、両経路失敗の

@@ -2256,6 +2256,13 @@ const fn open_tree_bind_flags(scope: MountTreeScope) -> u32 {
 /// ロックされたマウントを持つ場合、カーネルは `EINVAL` を返す（`__do_loopback` の `has_locked_children`。
 /// 黙って再帰へ切り替えず、呼び出し側が構造化エラーにする）。
 ///
+/// 伝播の前提（SEC-1・#2079）: 複製は複製元のマウントの伝播（`mnt_group_id`・`mnt_master`）を引き継ぐ。複製元が
+/// shared なら複製は同じ peer group に入り、その後の接続・解除が peer（ホスト側）へ伝播しうる。本関数も
+/// `bind_mount_attr`（`propagation` = 0）も伝播を変えない。安全は、`MountIsolation::establish`（`crate::exec`）が
+/// `unshare(CLONE_NEWNS)` の直後に `mount_root_private_recursive`（`/` を `MS_REC|MS_PRIVATE`）を呼ぶことに
+/// 依存する（通常の経路と rootless の経路の両方）。これを外す・順序を入れ替える改修は前提を壊す。呼び出し側
+/// （#1913 の適用段）は、付け替え先が shared でないことと付け替え後の mountinfo を照合して確かめている。
+///
 /// 想定する呼び出し順（#1913）: `verify_bind_source_fd` → 本関数 → [`set_bind_mount_attrs`]（切り離した状態で属性を設定し、
 /// 属性なしでコンテナから見える瞬間を作らない）→ [`move_mount_empty_path`]（rootfs 側の固定済みマウント先へ）。
 ///
@@ -3428,15 +3435,30 @@ pub(crate) fn remove_dir_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<(), S
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// `unlinkat(2)`・`renameat2(2)` に渡す名前が dirfd 直下の 1 要素であることを確かめる（空・`/` を含む・`.`・`..`
+/// は `EINVAL`）。これらの syscall は中間要素の symlink を辿るため、複数要素の名前を許すと dirfd（rootfs・隔離
+/// ディレクトリ）の外の実体を消す・動かす経路になる。呼び出し側の検証に頼らず `sys` の境界で塞ぐ
+/// （SEC-1・#2079。`remove_file_at`・`rename_noreplace_at` から呼ぶ）。`.hidden`・`..a` のような名前は通す。
+fn ensure_single_component(name: &CStr) -> Result<(), SysError> {
+    let b = name.to_bytes();
+    if b.is_empty() || b.contains(&b'/') || b == b"." || b == b".." {
+        return Err(SysError::Os(EINVAL));
+    }
+    Ok(())
+}
+
 /// `parent` 配下の `name` を `unlinkat(2)`（`flags` = 0）で削除する（ディレクトリは `EISDIR`/`EPERM` で拒否され、
 /// 最終要素の symlink は辿らずリンク自体を消す）。bind mount の適用段（`crate::exec::mount_binds`）が、失敗時の後始末で
-/// 自分が作った空の通常ファイル（マウント先の置き場）だけを消すために使う（#1913・SEC-1）。`name` は呼び出し側が
-/// 1 要素に検証済みの前提。
+/// 自分が作った空の通常ファイル（マウント先の置き場）だけを消すために使う（#1913・SEC-1）。`name` が 1 要素
+/// （空・`/` を含む・`.`・`..` のいずれでもない）であることは本関数が検証し、違反は syscall を発行せず `EINVAL`
+/// （#2079）。
 pub(crate) fn remove_file_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
-    // SAFETY: `name` は NUL 終端の借用で呼び出しの間生存する。`parent` は生存中の `BorrowedFd`。`flags` が 0 のため
+    ensure_single_component(name)?;
+    // SAFETY: `name` は NUL 終端の借用で呼び出しの間生存し、上で 1 要素と検証済み（dirfd 直下の 1 エントリだけが
+    // 対象になり、中間要素の symlink は辿られない）。`parent` は生存中の `BorrowedFd`。`flags` が 0 のため
     // `unlinkat` は `AT_REMOVEDIR` を伴わず、ディレクトリは削除されない。副作用は `parent` 配下の非ディレクトリ
     // 1 件の削除のみで、ポインタは保持されない。
     let rc = unsafe { unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
@@ -3447,7 +3469,22 @@ pub(crate) fn remove_file_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<(), 
 /// symlink は辿らない。改名先が既にあれば置き換えず `EEXIST`）。bind mount の適用段（`crate::exec::mount_binds`）が、
 /// 失敗時の後始末で「消す対象を自分専用の隔離ディレクトリへ移してから実体を照合して消す」ことと、「照合に通らなかった
 /// 実体を元の名前へ戻すとき、新しく作られた同名の実体を上書きしない」ことに使う（#1913・SEC-1）。
-/// `old`・`new` は呼び出し側が 1 要素に検証済みの前提。
+///
+/// `old`・`new` は本関数が 1 要素（空・`/` を含む・`.`・`..` のいずれでもない）であることを検証し、違反は
+/// syscall を発行せず `EINVAL`（#2079）。
+///
+/// # エラー
+///
+/// `EINVAL` は 2 つの原因で返る。(a) 名前が 1 要素でない（上記。syscall 前に拒否）、(b) 改名先の FS が
+/// `RENAME_NOREPLACE` を持たない（カーネルの返り値）。(b) でも `rename(2)` の上書き改名へは縮退しない
+/// （fail-closed）。呼び出し側では、`remove_verified` は `rename` の失敗を報告して要素を残し、`create_dir_proven` は
+/// ステージングを片付けたうえで `rename` の失敗を報告する。`renameat2` を持たないカーネル（3.15 未満）の
+/// `ENOSYS` は `SysError::Os(ENOSYS)` のまま返る。
+///
+/// # リンクの前提
+///
+/// `renameat2` は glibc 2.28 以降のシンボルで、それより古い glibc ではリンク時にシンボル未解決エラーになる
+/// （実行時の未定義動作ではない）。`extern` 宣言の `// SAFETY` コメントと同じ前提。
 pub(crate) fn rename_noreplace_at(
     old_dir: BorrowedFd<'_>,
     old: &CStr,
@@ -3457,9 +3494,12 @@ pub(crate) fn rename_noreplace_at(
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
+    ensure_single_component(old)?;
+    ensure_single_component(new)?;
     // include/uapi/linux/fs.h の `RENAME_NOREPLACE`（全アーキテクチャ共通）。
     const RENAME_NOREPLACE: u32 = 1;
-    // SAFETY: `old`・`new` は NUL 終端の借用で呼び出しの間生存する。`old_dir`・`new_dir` は生存中の
+    // SAFETY: `old`・`new` は NUL 終端の借用で呼び出しの間生存し、上で 1 要素と検証済み（各 dirfd 直下の 1 エントリ
+    // だけが対象になり、中間要素の symlink は辿られない）。`old_dir`・`new_dir` は生存中の
     // `BorrowedFd`。flags は `RENAME_NOREPLACE` のみで、改名先を置き換えない。副作用は 1 要素の改名のみで、
     // ポインタは保持されない。
     let rc = unsafe {
@@ -6022,6 +6062,75 @@ mod tests {
             assert!(MountFlags::from_bits(0x20 | 0x3).is_nosuid());
             assert!(!MountFlags::from_bits(0).is_read_only());
         }
+    }
+
+    /// SEC-1（#2079）: 1 要素検証は空・`/` を含む・`.`・`..` を `EINVAL` で拒否し、ドット始まりの通常名は通す。
+    #[test]
+    fn sec1_2079_single_component_check_rejects_multi_and_dot_names() {
+        let name = |n: &str| CString::new(n).expect("name");
+        for bad in ["", "a/b", "/a", "a/", ".", ".."] {
+            assert_eq!(
+                ensure_single_component(&name(bad)),
+                Err(SysError::Os(EINVAL)),
+                "{bad:?}"
+            );
+        }
+        for ok in [
+            "a",
+            ".hidden",
+            "..a",
+            "a.b",
+            ".fandhe-rollback-1-0-00000000",
+        ] {
+            assert_eq!(ensure_single_component(&name(ok)), Ok(()), "{ok:?}");
+        }
+    }
+
+    /// SEC-1（#2079）: 複数要素・`..`・空の名前は syscall を発行せず `EINVAL`（実体が残る）。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn sec1_2079_file_ops_reject_multi_component_names_without_syscall() {
+        let guard = crate::test_support::TestTempDir::new("sys-2079").expect("temp dir");
+        let base = guard.path().to_path_buf();
+        let dir = std::fs::File::open(&base).expect("open dir");
+        std::fs::create_dir(base.join("sub")).expect("mkdir");
+        std::fs::write(base.join("sub/f"), b"x").expect("write");
+        std::fs::write(base.join("ok"), b"y").expect("write");
+        let name = |n: &str| CString::new(n).expect("name");
+        let einval = Err(SysError::Os(EINVAL));
+        for bad in ["sub/f", "..", ""] {
+            assert_eq!(remove_file_at(dir.as_fd(), &name(bad)), einval, "{bad:?}");
+        }
+        assert!(base.join("sub/f").exists());
+        // old が不正
+        for bad in ["sub/f", ".."] {
+            assert_eq!(
+                rename_noreplace_at(dir.as_fd(), &name(bad), dir.as_fd(), &name("moved")),
+                einval,
+                "{bad:?}"
+            );
+        }
+        // new が不正
+        for bad in ["sub/g", ".."] {
+            assert_eq!(
+                rename_noreplace_at(dir.as_fd(), &name("ok"), dir.as_fd(), &name(bad)),
+                einval,
+                "{bad:?}"
+            );
+        }
+        assert!(base.join("sub/f").exists());
+        assert!(base.join("ok").exists());
+        assert!(!base.join("moved").exists());
+        assert!(!base.join("sub/g").exists());
+        // 回帰: 正しい名前どうしは従来どおり成功する
+        assert_eq!(
+            rename_noreplace_at(dir.as_fd(), &name("ok"), dir.as_fd(), &name("moved")),
+            Ok(())
+        );
+        assert!(base.join("moved").exists() && !base.join("ok").exists());
     }
 
     /// SEC-1（#1913）: `remove_file_at` は通常ファイルと symlink（リンク自体）を消し、ディレクトリは消さず、

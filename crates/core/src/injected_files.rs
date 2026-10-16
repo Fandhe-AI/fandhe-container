@@ -195,13 +195,17 @@ pub struct InjectedGroup<'a> {
     pub tmpfs_size: u64,
 }
 
+/// `child` が `parent` の厳密な子孫か（要素単位。`/a/bc` は `/a/b` の子孫ではない）。
+pub(crate) fn within(child: &str, parent: &str) -> bool {
+    child
+        .strip_prefix(parent)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// `a` と `b` が同一または祖先・子孫の関係か（要素単位。`/a/b` と `/a/bc` は関係なし）。
-fn overlaps(a: &str, b: &str) -> bool {
-    let within = |child: &str, parent: &str| {
-        child
-            .strip_prefix(parent)
-            .is_some_and(|rest| rest.starts_with('/'))
-    };
+///
+/// `oci_runtime::bind_mounts`（#1911）の交差検査と共有する（規則を 1 か所に保つ）。
+pub(crate) fn overlaps(a: &str, b: &str) -> bool {
     a == b || within(a, b) || within(b, a)
 }
 

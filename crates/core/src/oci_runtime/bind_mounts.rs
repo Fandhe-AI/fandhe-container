@@ -63,7 +63,7 @@
 //! 実体照合の残余（REPAIR-3）は bundle の実体で、字句検証（`check_against_host_paths`）だけが効く。`run_pre_pivot` への組み込みは済み（#1914）、`start` と本番 launcher への結線は済み（#1915。検証は `start`、tmpfs との重なりは launcher、
 //! 監査は `ProcessLauncher::rejection_audit_sink` 経由）。`ro` と Landlock の `WriteRestrictionShadowed` の衝突解消は #1917
 //! （それまで `ro` の bind は fork 前に拒否される）。状態ルートとの重なりは `start` が字句比較・`canonicalize` 比較・
-//! mountinfo によるファイルシステム内の実体照合（別の bind mount による別名）で検査する。適用の段も固定した元に対して状態ルートとの重なりを毎回再検証する（`ProtectedFsRoot`。元のマウントは fd の `mnt_id` で特定し、`rbind` のときだけ配下のマウントを照合する。保護対象と同じ FS 上のリンク数 2 以上の通常ファイルは拒否する）。残余はディレクトリ配下のハードリンクを検出できないこと（REPAIR-3）。`MountDestination::resolve_in` の文字列結合で直接 mount してはならない。
+//! mountinfo によるファイルシステム内の実体照合（別の bind mount による別名）で検査する。適用の段も固定した元に対して状態ルートとの重なりを毎回再検証する（`ProtectedFsRoot`。元のマウントは fd の `mnt_id` で特定し、`rbind` のときだけ配下のマウントを照合する。保護対象と同じ FS 上のリンク数 2 以上の通常ファイルは拒否する。状態ルート配下にリンク数 2 以上の通常ファイルがあれば、同じ FS 上のディレクトリ元も拒否する）。`MountDestination::resolve_in` の文字列結合で直接 mount してはならない。
 
 use std::fmt;
 use std::path::Path;
@@ -275,11 +275,24 @@ pub struct BindMountSet {
 pub(crate) struct ProtectedFsRoot {
     dev: String,
     path: String,
+    /// 状態ルート配下にリンク数 2 以上の通常ファイル（別名のハードリンクを持つ状態ファイル）があった。
+    /// 真なら同じ FS 上のディレクトリ元は、配下に状態ファイルの別名を含み得るため拒否する（SEC-1）。
+    has_hard_linked_files: bool,
 }
 
 impl ProtectedFsRoot {
-    pub(crate) fn new(dev: String, path: String) -> Self {
-        Self { dev, path }
+    pub(crate) fn new(dev: String, path: String, has_hard_linked_files: bool) -> Self {
+        Self {
+            dev,
+            path,
+            has_hard_linked_files,
+        }
+    }
+
+    /// 適用の段（Linux 限定の `exec::mount_binds`）だけが読む。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_hard_linked_files(&self) -> bool {
+        self.has_hard_linked_files
     }
 
     /// 適用の段（Linux 限定の `exec::mount_binds`）だけが読む。

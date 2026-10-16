@@ -49,18 +49,25 @@ pub(crate) fn parse_fdinfo_mnt_id(fdinfo: &str) -> Option<u64> {
         .and_then(|v| v.trim().parse().ok())
 }
 
-/// `path` を開いた fd の属するマウント ID（`/proc/thread-self/fdinfo/N`）。start の段が使う。
-/// ディレクトリと通常ファイル以外（FIFO 等。開くとブロックし得る）は `None`（適用の段が種別で拒否する）。
+/// `path` を `O_PATH` で開いた fd の属するマウント ID（`/proc/thread-self/fdinfo/N`）。start の段が使う。
+/// `O_PATH` はブロックしないため、検査と open の間に FIFO 等へ差し替えられても停止しない（REPAIR-5）。
+/// 種別は開いた同じ fd の `fstat` で見て、ディレクトリと通常ファイル以外は `None`（適用の段が種別で拒否する）。
 #[cfg(unix)]
 pub(crate) fn path_mount_id(path: &str) -> Option<u64> {
+    use std::os::fd::AsFd as _;
     use std::os::fd::AsRawFd as _;
-    let meta = std::fs::metadata(path).ok()?;
+    let c = std::ffi::CString::new(path).ok()?;
+    // 絶対パスのため dirfd は解決に影響しない（`/` の fd を渡す）。
+    let root = crate::sys::open_dir_path_nofollow(None, c"/").ok()?;
+    let fd = crate::sys::open_path_follow_at(root.as_fd(), &c).ok()?;
+    let meta = std::fs::File::from(fd.as_fd().try_clone_to_owned().ok()?)
+        .metadata()
+        .ok()?;
     if !meta.is_dir() && !meta.is_file() {
         return None;
     }
-    let file = std::fs::File::open(path).ok()?;
     let fdinfo =
-        std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", file.as_raw_fd())).ok()?;
+        std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", fd.as_raw_fd())).ok()?;
     parse_fdinfo_mnt_id(&fdinfo)
 }
 
@@ -345,6 +352,26 @@ mod tests {
             read_mountinfo_bounded(dir.join("none").to_str().expect("utf8")),
             Err(MountinfoReadError::Unreadable)
         );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// REPAIR-5（#1915）: `path_mount_id` は FIFO を開かず（ブロックせず）`None` を返す。通常ファイルは特定できる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair5_path_mount_id_does_not_block_on_fifo() {
+        let dir = std::env::temp_dir().join(format!("fandhe-mi-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let fifo = dir.join("f");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo");
+        assert!(status.success());
+        let file = dir.join("r");
+        std::fs::write(&file, b"x").expect("write");
+        assert_eq!(path_mount_id(fifo.to_str().expect("utf8")), None);
+        assert!(path_mount_id(file.to_str().expect("utf8")).is_some());
+        assert!(path_mount_id(dir.to_str().expect("utf8")).is_some());
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 

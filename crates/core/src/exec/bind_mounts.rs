@@ -91,8 +91,8 @@
 //! - 状態ルートとの重なりは `start` が一次検査し（字句・`canonicalize`・fd の `mnt_id` によるマウントの特定と mountinfo の実体照合）、
 //!   適用の段も固定した元に対して毎回再検証する（`ProtectedFsRoot`・`check_source_not_protected`。restart を含む。
 //!   元の属するマウントは固定した fd の `mnt_id` で特定し、`rbind` のときだけ配下のマウントを照合する。保護対象と同じ FS 上で
-//!   リンク数 2 以上の通常ファイルは状態ファイルへのハードリンクかもしれないため拒否する）。残余はディレクトリ配下の
-//!   ハードリンクを検出できないこと、検査から `open_tree` までの間の差し替え（固定した fd への複製のため元の差し替えは効かない）。
+//!   リンク数 2 以上の通常ファイルは状態ファイルへのハードリンクかもしれないため拒否する。状態ルート配下の状態ファイルが
+//!   別名を持つ場合は、同じ FS 上のディレクトリ元も拒否する）。残余は検査から `open_tree` までの間の差し替え（固定した fd への複製のため元の差し替えは効かない）。
 //!   実機前提の結合試験の段ごとの観測（#1916。通しの確認は `tests/production_launcher.rs` のシナリオ D〔#1915〕）。
 //!   `ro` と Landlock の衝突解消（#1917）
 //! - bundle・状態ルートの実体照合（#1911 の字句検証だけ）と、ホスト側の別の bind mount による別名の検出。全要素で symlink を拒否するため、
@@ -482,10 +482,21 @@ fn check_source_not_protected(
     };
     // 通常ファイルのハードリンクは別名のパスを持たず、パス・マウントの照合では状態ファイルとの同一性が分からない。
     // 保護対象と同じファイルシステム上でリンク数が 2 以上の通常ファイルは、状態ファイルへのリンクかもしれないため拒否する
-    // （fail-closed。ディレクトリ配下のハードリンクは検出できない残余。REPAIR-3）。
+    // （fail-closed）。
     if src.kind() == BindSourceKind::RegularFile
         && src.nlink() > 1
         && ctx.protected.iter().any(|p| p.dev() == identity.dev)
+    {
+        return Err(violation(spec, ViolationReason::BindSourceReachesStateRoot));
+    }
+    // ディレクトリ元の配下にある状態ファイルの別名は走査では見つけられない。代わりに start の段が状態ルート側の
+    // 状態ファイルのリンク数を調べており（`has_hard_linked_files`）、別名を持つ状態ファイルがあるなら、同じ FS 上の
+    // ディレクトリ元は別名を含み得るため拒否する（fail-closed。SEC-1）。
+    if src.kind() == BindSourceKind::Directory
+        && ctx
+            .protected
+            .iter()
+            .any(|p| p.dev() == identity.dev && p.has_hard_linked_files())
     {
         return Err(violation(spec, ViolationReason::BindSourceReachesStateRoot));
     }
@@ -1694,7 +1705,7 @@ mod tests {
         let real = real.to_str().expect("utf8").to_owned();
         // 状態ルートの実体 = 元と同じ FS 内パス（差し替えで元が状態ルートの別名になった状況）。
         let set = one("/mnt/d", &fx.src("dir"), &[])
-            .with_protected_roots(vec![ProtectedFsRoot::new("0:1".to_owned(), real)]);
+            .with_protected_roots(vec![ProtectedFsRoot::new("0:1".to_owned(), real, false)]);
         let knobs = Knobs {
             mountinfo: Some("1 0 0:1 / / rw - tmpfs none rw\n".to_owned()),
             ..Knobs::default()
@@ -1716,7 +1727,7 @@ mod tests {
         let real = std::fs::canonicalize(fx.src("dir")).expect("canon");
         let state = format!("{}/state", real.to_str().expect("utf8"));
         let set = one("/mnt/d", &fx.src("dir"), &[])
-            .with_protected_roots(vec![ProtectedFsRoot::new("0:1".to_owned(), state)]);
+            .with_protected_roots(vec![ProtectedFsRoot::new("0:1".to_owned(), state, false)]);
         let knobs = Knobs {
             mountinfo: Some("1 0 0:1 / / rw - tmpfs none rw\n".to_owned()),
             ..Knobs::default()
@@ -1737,6 +1748,7 @@ mod tests {
             one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(vec![ProtectedFsRoot::new(
                 "0:9".to_owned(),
                 "/srv/state".to_owned(),
+                false,
             )]);
         let knobs = Knobs {
             mountinfo: Some(format!(
@@ -1765,6 +1777,7 @@ mod tests {
             vec![ProtectedFsRoot::new(
                 dev.to_owned(),
                 "/srv/state".to_owned(),
+                false,
             )]
         };
         // 同じ FS（0:1）の状態ルートがあり、リンク数 2 の通常ファイルを元にする → 拒否。
@@ -1795,6 +1808,42 @@ mod tests {
         r.expect("single link is applied");
     }
 
+    /// SEC-1（#1915）: 状態ルート配下にハードリンクを持つ状態ファイルがあるとき、同じ FS 上のディレクトリ元は拒否する。
+    #[test]
+    fn sec1_directory_source_is_rejected_when_state_files_are_hard_linked() {
+        let fx = fx();
+        let info = "1 0 0:1 / / rw - tmpfs none rw\n".to_owned();
+        let knobs = Knobs {
+            mountinfo: Some(info),
+            ..Knobs::default()
+        };
+        let protected = |linked: bool| {
+            vec![ProtectedFsRoot::new(
+                "0:1".to_owned(),
+                "/srv/state".to_owned(),
+                linked,
+            )]
+        };
+        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(protected(true));
+        let (r, log) = run(&fx, &set, &knobs);
+        let err = r.expect_err("must be rejected");
+        assert_eq!(
+            reason_of(&err),
+            Some(ViolationReason::BindSourceReachesStateRoot)
+        );
+        assert_eq!(log, ["mountinfo"]);
+        let knobs = Knobs {
+            mountinfo: Some(format!(
+                "1 0 0:1 / / rw - tmpfs none rw\n{}",
+                ideal_mountinfo(200, false, false)
+            )),
+            ..Knobs::default()
+        };
+        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(protected(false));
+        let (r, _log) = run(&fx, &set, &knobs);
+        r.expect("no hard linked state files is applied");
+    }
+
     /// SEC-1・OCI-4（#1915）: 再帰 bind のときだけ、元の配下のマウント（状態ルートの実体）を理由に拒否する。
     #[test]
     fn sec1_nested_state_mount_is_rejected_only_for_rbind_at_apply() {
@@ -1804,7 +1853,13 @@ mod tests {
             "1 0 0:1 / / rw - tmpfs none rw\n5 1 0:2 /st {}/inner rw - tmpfs none rw\n",
             real.to_str().expect("utf8")
         );
-        let protected = || vec![ProtectedFsRoot::new("0:2".to_owned(), "/st".to_owned())];
+        let protected = || {
+            vec![ProtectedFsRoot::new(
+                "0:2".to_owned(),
+                "/st".to_owned(),
+                false,
+            )]
+        };
         let set = one("/mnt/d", &fx.src("dir"), &["rbind"]).with_protected_roots(protected());
         let knobs = Knobs {
             mountinfo: Some(info.clone()),

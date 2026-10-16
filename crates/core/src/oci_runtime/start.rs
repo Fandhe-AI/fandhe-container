@@ -838,10 +838,51 @@ fn validate_bind_mounts(
     })
     .map_err(reject)?;
     // 検査済みの実体を集合に持たせる。適用の段（restart を含む毎回）が、固定した元に対して再照合する。
-    let set = set.with_protected_roots(vec![ProtectedFsRoot::new(state_id.dev, state_id.path)]);
+    // 状態ルート配下の状態ファイルが別名（ハードリンク）を持つか。持つなら適用の段が同じ FS 上のディレクトリ元を拒否する。
+    // 走査できない・大きすぎる場合も「持つ」とみなす（fail-closed。同じ FS 上のディレクトリ元だけが拒否される）。
+    let linked = state_tree_has_hard_links(Path::new(&state_real)).unwrap_or(true);
+    let set = set.with_protected_roots(vec![ProtectedFsRoot::new(
+        state_id.dev,
+        state_id.path,
+        linked,
+    )]);
     set.check_against_protected_paths(config.readonly_paths(), config.masked_paths())
         .map_err(reject)?;
     Ok(set)
+}
+
+/// 状態ルート配下の走査で見る項目数の上限（超過は `None`。無制限の走査を避ける）。
+const STATE_SCAN_MAX_ENTRIES: usize = 100_000;
+
+/// 状態ルート配下に、リンク数 2 以上の通常ファイルがあるかを調べる（SEC-1・#1915）。
+/// symlink は辿らない。読めない・項目数が [`STATE_SCAN_MAX_ENTRIES`] を超える場合は `None`（呼び出し側が「持つ」とみなす）。
+#[cfg(unix)]
+fn state_tree_has_hard_links(root: &Path) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut stack = vec![root.to_path_buf()];
+    let mut seen = 0usize;
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).ok()? {
+            let entry = entry.ok()?;
+            seen += 1;
+            if seen > STATE_SCAN_MAX_ENTRIES {
+                return None;
+            }
+            let meta = std::fs::symlink_metadata(entry.path()).ok()?;
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() && meta.nlink() > 1 {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
+}
+
+/// unix 以外では走査しない（呼び出し側は「持つ」とみなす）。
+#[cfg(not(unix))]
+fn state_tree_has_hard_links(_root: &Path) -> Option<bool> {
+    None
 }
 
 /// 絶対パスを `Component::Normal` だけの `/a/b` 形式へ字句正規化する（`.` は落とす）。

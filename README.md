@@ -30,7 +30,7 @@ Rust でフルスクラッチ開発する軽量なコンテナ実行基盤の実
 
 ## クイックスタート
 
-現時点では利用者向けの統一 CLI（TASK-79・`CLI-1`）が未提供のため、ここではソースからのビルドとテストの手順を示します。利用者向けの手順は CLI の実装後に追記します。
+統一 CLI（`fandhe-container`。TASK-79・`CLI-1`）は Linux で `create` / `start` / `stop` / `delete` / `list` / `logs` の入口を提供済みですが、コンテナはまだ起動しません。`start` は CLI と同じディレクトリの `fandhe-container-supervisor` を起動して結果を受け取りますが（#1718）、core の本番 launcher（#1715 の Phase B）が入るまで supervisor は `UNIMPLEMENTED`（終了コード 8）を報告します。rootful の特権起動はランチャー（#1719。`scripts/install-privileged-launcher.sh` のインストールに root が必要）が前提で、CLI からの選択は未対応です。macOS / Windows は plugin 経由で未提供です。ここではソースからのビルドとテスト、現状の CLI の動作確認の手順を示します。
 
 前提: `git`・`make`・`rustup`（toolchain は `rust-toolchain.toml` で固定）。`make setup` は最後に git hooks を導入するため、`lefthook`・`brew`・`npx` のいずれかも必要です（いずれも無いと `make hooks` が終了コード 1 で停止します。ビルドとテストだけなら `make setup` を使わず、`git submodule update --init`〔任意〕の後に下記の `cargo build` / `make test` を実行できます）。
 
@@ -40,6 +40,14 @@ cd fandhe-container
 make setup               # submodule → rustup 確認 → git hooks 導入
 cargo build --workspace  # ビルド
 make test                # テスト（lint・deny まで含めた一括検証は make ci）
+```
+
+ビルド後は `target/debug/` に CLI と supervisor が並びます（`start` は CLI の隣の supervisor を探すため、同じディレクトリから実行してください）。`--root` は状態ルート、`<bundle>` は `config.json` と `rootfs/` を持つ OCI bundle の絶対パスです。
+
+```bash
+target/debug/fandhe-container --root /tmp/fc-state create --bundle <bundle> c1   # 状態を Created で記録
+target/debug/fandhe-container --root /tmp/fc-state start c1                      # 現状は UNIMPLEMENTED（8）
+target/debug/fandhe-container --root /tmp/fc-state list                          # c1 は created のまま
 ```
 
 `make help` でターゲット一覧を表示します（Makefile は薄い入口で、実体は `scripts/` 配下のスクリプトです。Make を使わない場合は `scripts/help.sh` を参照。編集規約は [.claude/rules/makefile.md](./.claude/rules/makefile.md)）。コントリビュートの流れは [CONTRIBUTING.md](./CONTRIBUTING.md)、crate 境界は [docs/architecture.md](./docs/architecture.md)、ビルド・回帰確認コマンドは [AGENTS.md](./AGENTS.md) を参照してください。

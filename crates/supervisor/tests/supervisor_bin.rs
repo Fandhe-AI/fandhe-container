@@ -201,3 +201,23 @@ fn sup1_bin_rejects_non_pipe_result_channel() {
         .unwrap();
     assert_eq!(rec.status().state(), ContainerState::Created);
 }
+
+/// SUP-1・REPAIR-5: 結果チャネルの読み端が先に閉じていても（CLI が期限切れで終了した場合）、supervisor は
+/// SIGPIPE で死なず、書き込み失敗（EPIPE）を握って通常の終了コードで終わる。Rust の実行時は起動時に SIGPIPE を
+/// 無視にするため `unsafe` の sigaction は不要で、この性質を回帰検出する。
+#[test]
+fn sup1_bin_survives_closed_result_channel() {
+    use std::os::unix::process::ExitStatusExt;
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let mut child = bin()
+        .args(["start", "--root", "relative", "c1"])
+        .stdout(Stdio::from(writer))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let status = wait_bounded(&mut child);
+    assert_eq!(status.signal(), None, "must not be killed by SIGPIPE");
+    let n = exit_code_for(ErrorCode::InvalidArgument);
+    assert_eq!(status.code(), Some(i32::from(n.get())));
+}

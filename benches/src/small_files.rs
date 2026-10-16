@@ -461,6 +461,8 @@ pub fn run_trial(
 /// 作業用の専用サブディレクトリ。`Drop` で自分が作ったものだけを消す（symlink は辿らない）。
 struct WorkDir {
     path: PathBuf,
+    /// `cleanup` が成功済みなら `true`（`Drop` の再試行を省く）。
+    cleaned: bool,
     #[cfg(unix)]
     id: (u64, u64),
     /// Windows では `FILE_SHARE_DELETE` なしでディレクトリのハンドルを保持し、測定中の改名・差し替えを
@@ -514,6 +516,7 @@ impl WorkDir {
         };
         Ok(Self {
             path,
+            cleaned: false,
             #[cfg(unix)]
             id,
             #[cfg(windows)]
@@ -522,28 +525,80 @@ impl WorkDir {
     }
 }
 
-impl Drop for WorkDir {
-    fn drop(&mut self) {
+impl WorkDir {
+    /// 作業ディレクトリを削除し、失敗を `cleanup-failed` で返す（REPAIR-4）。
+    ///
+    /// 成功経路ではこれを明示的に呼び、100 万ファイル規模の残骸を黙って残さない。成功するまで
+    /// 何度でも呼べる（失敗時は `Drop` が補助的に再試行する）。
+    fn cleanup(&mut self) -> Result<(), SmallFilesError> {
+        if self.cleaned {
+            return Ok(());
+        }
         // Windows: ハンドルを保持していた間は改名・差し替えが不可能だったため同一性は保証済み。
         // 削除のため、ここでハンドルを閉じる。
         #[cfg(windows)]
         drop(self.guard.take());
-        let Ok(meta) = std::fs::symlink_metadata(&self.path) else {
-            return;
+        let meta = match std::fs::symlink_metadata(&self.path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.cleaned = true;
+                return Ok(());
+            }
+            Err(_) => return Err(cleanup_failed()),
         };
-        // symlink に差し替わっていたら消さずに残す。
+        // symlink 等に差し替わっていたら消さずに残し、残置を報告する。
         if !meta.is_dir() {
-            return;
+            return Err(cleanup_failed());
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
             if (meta.dev(), meta.ino()) != self.id {
-                return;
+                return Err(cleanup_failed());
             }
         }
-        // 失敗しても後始末の失敗で本来の結果を隠さない。
-        let _ = std::fs::remove_dir_all(&self.path);
+        match std::fs::remove_dir_all(&self.path) {
+            Ok(()) => {
+                self.cleaned = true;
+                Ok(())
+            }
+            Err(_) => Err(cleanup_failed()),
+        }
+    }
+}
+
+impl Drop for WorkDir {
+    fn drop(&mut self) {
+        // 明示 cleanup が済んでいない経路（早期 return・panic）の補助的な再試行。
+        // Drop では失敗を報告できないため結果は捨てる。
+        let _ = self.cleanup();
+    }
+}
+
+/// 後始末の失敗（パス・OS 文字列は載せない。REPAIR-4）。
+fn cleanup_failed() -> SmallFilesError {
+    SmallFilesError::new(
+        "cleanup-failed",
+        "failed to remove the work directory; leftover files may remain under --root",
+    )
+}
+
+/// 本来の結果 `result` と後始末の結果 `cleanup` を合成する。
+///
+/// 後始末が失敗していれば、成功結果は値を出さず `cleanup-failed` にする。既存のエラーがある場合は
+/// そのエラーを主とし、message に後始末の失敗を併記する。
+fn merge_cleanup<T>(
+    result: Result<T, SmallFilesError>,
+    cleanup: Result<(), SmallFilesError>,
+) -> Result<T, SmallFilesError> {
+    match (result, cleanup) {
+        (Ok(v), Ok(())) => Ok(v),
+        (Ok(_), Err(c)) => Err(c),
+        (Err(e), Ok(())) => Err(e),
+        (Err(mut e), Err(c)) => {
+            e.message = format!("{}; also {}", e.message, c.message);
+            Err(e)
+        }
     }
 }
 
@@ -627,16 +682,27 @@ pub fn run_with_deadline(
 ) -> Result<Measurement, SmallFilesError> {
     plan.validate()?;
     check_environment(plan)?;
-    let work = WorkDir::create(root)?;
+    let mut work = WorkDir::create(root)?;
+    let result = run_trials(plan, &work.path, overall_deadline);
+    let cleanup = work.cleanup();
+    merge_cleanup(result, cleanup)
+}
+
+/// `work_path` の下で全試行を実行する（後始末は呼び出し側の `WorkDir` が担う）。
+fn run_trials(
+    plan: &Plan,
+    work_path: &Path,
+    overall_deadline: Instant,
+) -> Result<Measurement, SmallFilesError> {
     let mut trials = Vec::with_capacity(usize::try_from(plan.trials).unwrap_or(0));
     for n in 0..plan.trials {
-        let trial_root = work.path.join(format!("trial-{n}"));
+        let trial_root = work_path.join(format!("trial-{n}"));
         std::fs::create_dir(&trial_root).map_err(|e| from_fs(&e))?;
         let trial_deadline = Instant::now()
             .checked_add(plan.trial_timeout)
             .ok_or_else(|| SmallFilesError::args("trial timeout is out of range"))?;
         let elapsed = run_trial(&trial_root, plan, trial_deadline, overall_deadline)?;
-        let _ = std::fs::remove_dir_all(&trial_root);
+        std::fs::remove_dir_all(&trial_root).map_err(|_| cleanup_failed())?;
         // 後始末（最大 5 万ファイルの削除）で全体期限を超えうるため、値を採用する前に再確認する（REPAIR-5）。
         ensure_before(overall_deadline)?;
         trials.push(TrialResult {
@@ -991,5 +1057,35 @@ mod tests {
             e.to_string(),
             "{\"error\":{\"code\":\"timeout\",\"message\":\"deadline exceeded\"}}"
         );
+    }
+
+    /// REPAIR-4: 後始末の失敗は成功結果を握りつぶさず、既存エラーには併記される。
+    #[test]
+    fn merge_cleanup_reports_cleanup_failure() {
+        let e = merge_cleanup(Ok(1_u8), Err(cleanup_failed())).unwrap_err();
+        assert_eq!(e.code, "cleanup-failed");
+        let e = merge_cleanup::<u8>(
+            Err(SmallFilesError::new("timeout", "deadline exceeded")),
+            Err(cleanup_failed()),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "timeout");
+        assert!(
+            e.message
+                .contains("also failed to remove the work directory")
+        );
+        assert_eq!(merge_cleanup(Ok(7_u8), Ok(())).unwrap(), 7);
+    }
+
+    /// REPAIR-4: 明示 cleanup は作業ディレクトリを消し、2 回目も成功する。
+    #[test]
+    fn work_dir_cleanup_removes_directory() {
+        let base = std::env::temp_dir();
+        let mut work = WorkDir::create(&base).unwrap();
+        let path = work.path.clone();
+        std::fs::write(path.join("f"), b"x").unwrap();
+        work.cleanup().unwrap();
+        assert!(!path.exists());
+        work.cleanup().unwrap();
     }
 }

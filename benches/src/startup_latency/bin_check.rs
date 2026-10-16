@@ -7,7 +7,7 @@
 
 use super::StartupLatencyError;
 use std::os::unix::fs::MetadataExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn untrusted(message: &str) -> StartupLatencyError {
     StartupLatencyError::new("untrusted-binary", message)
@@ -15,7 +15,12 @@ fn untrusted(message: &str) -> StartupLatencyError {
 
 /// 実行ファイルを検証する。絶対パス・symlink でない通常ファイル・実行ビットあり・group/other 書き込み不可・
 /// 所有者が `euid` か root・全祖先ディレクトリ（字面上と実体の両方）が実効 UID か root 所有で other 書き込み不可・group 書き込み不可（sticky 付きは可）、をすべて満たさなければ拒否する。
-pub fn verify_executable(path: &Path, euid: u32) -> Result<(), StartupLatencyError> {
+///
+/// 成功時は検証に使った実体パス（canonicalize 済み）を返す。呼び出し側は起動にこのパスだけを使うこと。
+/// 元の字面のパスで起動すると、symlink 解決途中の経路（別 UID 所有のディレクトリ経由の redirect 等）が
+/// 検証後に差し替えられ、検証していない実行ファイルを起動できてしまう。実体パスは symlink を含まず、
+/// その全祖先を下で検証している。
+pub fn verify_executable(path: &Path, euid: u32) -> Result<PathBuf, StartupLatencyError> {
     if !path.is_absolute() {
         return Err(StartupLatencyError::new(
             "invalid-args",
@@ -48,7 +53,7 @@ pub fn verify_executable(path: &Path, euid: u32) -> Result<(), StartupLatencyErr
             verify_ancestor(dir, euid)?;
         }
     }
-    Ok(())
+    Ok(real)
 }
 
 /// 祖先ディレクトリ 1 つを検証する。ディレクトリで、所有者が `euid` か root で、group / other 書き込み不可であること。
@@ -131,7 +136,11 @@ mod tests {
     #[test]
     fn regular_0755_file_is_accepted() {
         let d = Dir::new("ok");
-        assert_eq!(verify_executable(&d.file("bin", 0o755), euid()), Ok(()));
+        let f = d.file("bin", 0o755);
+        assert_eq!(
+            verify_executable(&f, euid()),
+            Ok(std::fs::canonicalize(&f).expect("canon"))
+        );
     }
 
     #[test]
@@ -179,7 +188,7 @@ mod tests {
         let d = Dir::new("ng");
         let f = d.file("bin", 0o755);
         std::fs::set_permissions(&d.0, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        assert_eq!(verify_executable(&f, euid()), Ok(()));
+        assert!(verify_executable(&f, euid()).is_ok());
     }
 
     /// 祖先が other 書き込み可（sticky なし）なら、実行ファイル自体が 0755 でも拒否する。
@@ -246,6 +255,33 @@ mod tests {
             assert_eq!(err.code, "untrusted-binary");
             assert!(err.message.contains("symlink"), "{}", err.message);
             assert_eq!(verify_ancestor(&link, owner), Ok(()));
+        }
+    }
+
+    /// 解決途中の symlink（別 UID 所有の redirect 経由）で信頼済みの場所へ出る配置は、実体パスを返して
+    /// 起動側が字面のパスを使わないようにする。さらに redirect 自体が別 UID 所有なら祖先として拒否する。
+    #[test]
+    fn redirect_through_foreign_owned_symlink_is_rejected_and_real_path_returned() {
+        let d = Dir::new("rd");
+        let real_dir = d.0.join("real");
+        std::fs::create_dir(&real_dir).expect("mkdir");
+        std::fs::set_permissions(&real_dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let f = real_dir.join("bin");
+        std::fs::write(&f, b"x").expect("write");
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let redirect = d.0.join("redirect");
+        std::os::unix::fs::symlink(&real_dir, &redirect).expect("symlink");
+        let via = redirect.join("bin");
+        // 返るのは symlink を含まない実体パス。
+        assert_eq!(
+            verify_executable(&via, euid()),
+            Ok(std::fs::canonicalize(&f).expect("canon"))
+        );
+        // redirect の所有者が呼び出し元でも root でもない（euid を偽る）なら拒否する。
+        let owner = std::fs::symlink_metadata(&redirect).expect("meta").uid();
+        if owner != 0 {
+            let err = verify_executable(&via, owner.wrapping_add(1)).expect_err("reject");
+            assert_eq!(err.code, "untrusted-binary");
         }
     }
 

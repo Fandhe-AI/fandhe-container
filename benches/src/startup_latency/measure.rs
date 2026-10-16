@@ -664,7 +664,7 @@ fn run_trials<H: Host>(host: &H, ctx: &Ctx<'_>) -> Result<RunResult, StartupLate
 }
 
 /// 計測を実行する。入口（`startup_latency::execute`）から呼ばれる。
-pub fn run(plan: Plan) -> Result<super::Execution, StartupLatencyError> {
+pub fn run(mut plan: Plan) -> Result<super::Execution, StartupLatencyError> {
     let euid = effective_uid().ok_or_else(|| {
         StartupLatencyError::new(
             "unsupported-environment",
@@ -678,8 +678,9 @@ pub fn run(plan: Plan) -> Result<super::Execution, StartupLatencyError> {
             "must run as a non-root user",
         ));
     }
-    verify_executable(&plan.supervisor_bin, euid)?;
-    verify_executable(&plan.systemd_run, euid)?;
+    // 検証済みの実体パスで置き換え、起動には字面のパスを使わない（symlink 解決途中の差し替え対策）。
+    plan.supervisor_bin = verify_executable(&plan.supervisor_bin, euid)?;
+    plan.systemd_run = verify_executable(&plan.systemd_run, euid)?;
 
     let base: PathBuf = match &plan.work_dir {
         Some(d) => d.clone(),

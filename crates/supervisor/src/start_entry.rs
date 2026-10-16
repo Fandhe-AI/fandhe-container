@@ -1979,6 +1979,14 @@ mod linux {
         };
         let req = StartRequest::new(args.id.clone());
         let deps = Box::new(ProductionStartDeps::new(args.root.clone()));
+        // 制御チャネルの認証境界の拒否の記録先（SEC-4）。制御チャネルのサーバスレッドは監視スレッドと並行して動くため、
+        // 複数スレッドでは `FileAuditSink` の隔離（fork）が使えない。そこで監査専用の helper プロセスを fork し、以後の
+        // 記録はそこへ渡して期限付きで永続化する（`ControlAuditRelay`）。`spawn` は単一スレッドのときだけ成功するので、
+        // `run_start_until` が `stderr_sink` の常駐スレッドを作る前のここで作る（launch の単一スレッド要求にも触れない。
+        // helper は fork 子で親にスレッドを増やさない）。失敗の記録は常駐スレッドを作れる launch の後まで保留する。
+        let audit = crate::exec::default_audit_sink(Some(args.root.clone()))
+            .and_then(fandhe_container_core::audit_log::ControlAuditRelay::spawn)
+            .map_err(|e| e.code());
         // 回復・回収と報告の書き込みで同じ期限を共有し、報告を内部上限内に収める（REPAIR-5）。
         let deadline =
             Instant::now().checked_add(crate::start_contract::result_deadline(&timeouts));
@@ -2002,15 +2010,16 @@ mod linux {
         // 報告の後に作るのでスレッドの制約に触れない。作成に失敗したら install が停止を要求し、既存の停止経路が
         // コンテナを終了させて Stopped を記録する（停止できないコンテナを残さない）。
         let stop = StopToken::new();
-        // 認証境界の拒否の記録先（SEC-4）。制御チャネルのサーバスレッドは監視スレッドと並行して動くため、複数スレッドでは
-        // `FileAuditSink` の隔離（fork）が使えない。スレッドを作る前のここで監査専用の helper プロセスを fork し、
-        // 以後の記録はそこへ渡して期限付きで永続化する（`ControlAuditRelay`）。作れなければ構造化ログのみになる
-        // （fail-closed の判定は変えない）。listener の bind より前に作るので helper は listener を継承しない。
-        let audit: Option<Arc<dyn fandhe_container_core::audit_log::AuditSink>> =
-            crate::exec::default_audit_sink(Some(args.root.clone()))
-                .ok()
-                .and_then(|s| fandhe_container_core::audit_log::ControlAuditRelay::spawn(s).ok())
-                .map(|r| Arc::new(r) as _);
+        // 失敗は握りつぶさず、構造化ログに固定語彙で残す（拒否の判定自体は fail-closed のまま。SEC-4）。
+        let audit = match audit {
+            Ok(relay) => {
+                Some(Arc::new(relay) as Arc<dyn fandhe_container_core::audit_log::AuditSink>)
+            }
+            Err(code) => {
+                log_event("control_audit_relay_unavailable", Some(code));
+                None
+            }
+        };
         let (running, control) =
             crate::control::install(&args.root, &args.id, running, &stop, audit);
         let code = run_supervised(store, args.id, running, args.restart, &timeouts, &stop);
@@ -2024,6 +2033,26 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// SEC-4・SUP-1・#2058: 監査中継は単一スレッドでしか作れないため、`run_start_until`（`stderr_sink` の常駐スレッドを
+        /// 作る）より前に生成する。実プロセスの単一スレッド条件はテストハーネス（複数スレッド）では再現できないので、
+        /// 入口の呼び出し順をソースで固定し、前後が入れ替わる退行（接続拒否が監査へ届かなくなる）を検出する。
+        #[test]
+        fn sec4_audit_relay_is_spawned_before_the_first_logging_thread() {
+            let src = include_str!("start_entry.rs");
+            let entry = src
+                .find("let audit = crate::exec::default_audit_sink(")
+                .expect("relay construction in the entry");
+            let spawn = src[entry..]
+                .find("ControlAuditRelay::spawn")
+                .map(|p| p + entry)
+                .expect("relay spawn in the entry");
+            let run = src[entry..]
+                .find("run_start_until(\n")
+                .map(|p| p + entry)
+                .expect("run_start_until call in the entry");
+            assert!(spawn < run, "relay must be spawned before run_start_until");
+        }
 
         /// 資格情報だけを変えた `/proc/self/status` の fixture（必須項目は縮退後の非特権プロセス相当）。
         fn status(uid: &str, gid: &str) -> String {

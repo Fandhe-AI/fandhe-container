@@ -137,6 +137,9 @@ unread="${root}/unread"
 mkproc "$unread" 830 "$sup" 5 1
 chmod 000 "$unread/830/smaps_rollup"
 check "smaps-unreadable" 3 "" --proc-root "$unread" --count 1
+# 読めない原因（supervisor の dumpable=0。SUP-14）を標準エラーで案内する
+unread_err="$(bash "$target" --proc-root "$unread" --count 1 2>&1 >/dev/null || true)"
+if grep -q 'dumpable flag; read it from a privileged shell' <<<"$unread_err"; then pass "smaps-unreadable-hint"; else fail "smaps-unreadable-hint (missing dumpable guidance)"; fi
 chmod 600 "$unread/830/smaps_rollup"
 
 # 7. 引数エラー

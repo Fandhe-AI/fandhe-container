@@ -21,7 +21,7 @@
 #     計測条件に含め、起動失敗として顕在化させる）
 #
 # 使い方:
-#   concurrent_50_memory.sh --launcher <絶対パス> --bundle <dir> --target <名前>
+#   concurrent_50_memory.sh --bin-dir <絶対パス> --bundle <dir> --target <名前> [--systemd-run <絶対パス（既定 /usr/bin/systemd-run）>]
 #       [--mode own] [--count N] [--trials N] [--min-procs N] [--settle SECS] [--timeout SECS]
 #       [--id-prefix STR] [--format json|text] [--output FILE] [--help]
 #   concurrent_50_memory.sh --mode docker --docker <docker CLI の絶対パス> --target <名前>
@@ -56,14 +56,26 @@
 #   固定値・N/N 起動・中央値の再計算。count が own と docker で一致しなければ拒否）、1 つのレポート
 #   （benchmark = concurrent_memory_report）へまとめる。SUP-1 の合否は出さない（#219 で人間が判定）。jq が必要。
 #
-# launcher 契約（差し替え点は ln_spawn / ln_stop / ln_collect_pids の 3 関数に隔離している）:
-#   - 起動: `<launcher> run --id <id> --bundle <bundle>` を本スクリプトの直接の子としてバックグラウンドで
-#     起動する。launcher は「コンテナ 1 つを監視するプロセス」としてフォアグラウンドに留まる
-#     （デーモン化・二重 fork で親子関係を切らない。SUP-1 のコンテナごとの監視プロセスと一致する）。
-#   - 起動完了の通知: コンテナが実際に起動し終えたら、launcher は標準出力へ `READY` だけの行を 1 行出す
-#     （ログへ記録される）。本スクリプトはこの行を起動完了の明示的な ready 状態として扱い、プロセス数
-#     （--min-procs）だけでは完了と判定しない（起動途中の一時的な子プロセスで N/N 起動と誤判定しない）。
-#     ready 行は起動完了待ち・計測直前（measure_container）・全コンテナ集計後の再確認で確認する。
+# 起動契約（crates/supervisor/src/start_contract.rs・start_entry.rs。#1717・#1819。差し替え点は ln_prepare / ln_spawn /
+# ln_ready / ln_stop / ln_collect_pids に隔離している。以下の「launcher」は supervisor の bin のこと）:
+#   - 準備: コンテナごとに bundle の複製を作り（supervisor は start 中 bundle へ flock を取り、同じ bundle への同時 start は
+#     失敗する。複製は cp -a --reflink=auto で inode を共有しない
+#     複製にする（製品の rootfs 検査 check_no_external_hardlinks は rootfs 外にもリンクを持つ inode を起動前に拒否するため
+#     cp -al は使えない）。複製どうしの page cache は共有されないため、Docker の lower 共有より PSS が大きく出うる比較条件
+#     として結果の解釈に含める。複製が失敗したら終了コード 2。複製の前に config.json の root.path を検証し、絶対パス・bundle 外へ出る相対パス・
+#     外を指す symlink は 2 で拒否する〔cp -a は root.path を書き換えず、全コンテナが元の同じ rootfs を共有するため。
+#     書き換えはしない〕。--bundle は計測専用の使い捨てを使うこと）、
+#     `<bin-dir>/fandhe-container --root <状態ルート> create --bundle <複製> <id>` を期限付き（--timeout）で済ませる。
+#   - 起動: `<systemd-run> --user --scope --quiet -p Delegate=yes -- <bin-dir>/fandhe-container-supervisor start --root <状態ルート> <id>`
+#     を本スクリプトの直接の子としてバックグラウンドで起動する（--scope は同じプロセスのまま exec する。supervisor は
+#     親 cgroup に自分だけがいることを要求するため、supervisor ごとに新しいスコープへ入れる）。supervisor は「コンテナ 1 つを
+#     監視するプロセス」としてフォアグラウンドに留まる（デーモン化・二重 fork で親子関係を切らない。SUP-1 のコンテナごとの
+#     監視プロセスと一致する）。CLI の start を経由しない理由: CLI の start は supervisor を別プロセスグループで起動し、
+#     標準エラーを捨て、子として wait しないため、「launcher の子孫を数える」前提と後始末が成立しない。
+#   - 起動完了の通知: supervisor は標準出力（FIFO でなければ拒否する）へ `FCSUP1 OK <pid>`（pid はコンテナ側 init の
+#     ホスト上 pid）か `FCSUP1 ERR <CODE> <exit> <msg>` の 1 行を出す。本スクリプトは FCSUP1 OK の行を起動完了の明示的な
+#     ready 状態として扱い、プロセス数（--min-procs）だけでは完了と判定しない（起動途中の一時的な子プロセスで N/N 起動と
+#     誤判定しない）。ready 行は起動完了待ち・計測直前（measure_container）・全コンテナ集計後の再確認で確認する。
 #   - ログ: launcher とその子孫（コンテナ内の処理）へはリソース制限（ulimit -f 等）を掛けない（計測条件を
 #     変えないため）。ログの上限は収集側（本スクリプト）で設ける: launcher の標準出力・標準エラーは
 #     コンテナごとの FIFO へ流し、本スクリプトの直接の子である収集プロセスが先頭 LOG_MAX_KIB KiB だけを
@@ -73,8 +85,9 @@
 #     LOG_MAX_KIB KiB 以内に出すこと（それより後の READY は記録されず、起動未完了として失敗になる）。
 #     収集プロセスは launcher の子孫ではないので PSS・RSS の集計には入らない（参考値の
 #     mem_available_delta_kb には、コンテナごとに 2 プロセス程度の分が含まれる）。
-#   - 停止: 直接の子へ SIGTERM、期限内に終了しなければ SIGKILL。launcher は SIGTERM でコンテナも
-#     終了させる。シグナルは、起動直後に記録した起動時刻（/proc/<pid>/stat の 22 番目）と親 pid が
+#   - 停止: 直接の子へ SIGTERM、期限内に終了しなければ SIGKILL。supervisor に SIGTERM のハンドラは無くコンテナを
+#     止めないため（CLI の stop も未実装）、記録済みの子孫（record_tree）へ起動時刻を照合して SIGKILL を送り回収する
+#     （CLI の delete は呼ばない。状態ルート・bundle の複製は mktemp の一時ディレクトリごと削除する）。シグナルは、起動直後に記録した起動時刻（/proc/<pid>/stat の 22 番目）と親 pid が
 #     一致する場合にだけ送る（launcher の終了後に pid が再利用されても無関係なプロセスへ送らない）。
 #     launcher が先に死んで子孫が再親化（孤児化）しても回収できるよう、起動時に環境変数
 #     FANDHE_BENCH_OWNER=<実行ごとの乱数トークン> を launcher へ渡し、後始末では /proc/*/environ の
@@ -84,10 +97,16 @@
 #     幅優先でたどる。読めない環境では status の PPid 走査）。supervisor はコンテナ用 cgroup に入らない
 #     （crates/core/src/cgroups.rs の fc-runtime リーフ）ため、cgroup.procs の列挙では監視プロセス込みに
 #     ならない。
-#   - 現状（REPAIR-3）: own 実装はエンドツーエンドで起動できない。CLI（fandhe-container バイナリ。
-#     TASK-79）・supervisor のバイナリ入口・本番 ProcessLauncher が未提供のため、上の `run --id --bundle`
-#     形は暫定の契約であり、実 CLI が提供されたら ln_spawn の起動行だけを実形へ合わせる。本スクリプトの
-#     受け入れは自己テスト（スタブ launcher・疑似 /proc）で照合しており、own の実測値は未取得。
+#   - 所有の証明: supervisor は dumpable=0 で /proc/<pid>/environ を読めず、コンテナ側プロセスは環境変数を継承しない
+#     （OCI の process.env から作られる）。そのため FANDHE_BENCH_OWNER のトークンだけでは追跡できない。計測中に PPid 連鎖で
+#     観測した子孫の「pid:起動時刻」を記録し（record_tree）、その同一性で集計の対象と後始末の回収を決める。記録できない
+#     プロセスが木にあれば untracked-process で失敗にする（fail-closed）。トークンは補助の追跡として残す。
+#   - 現状（REPAIR-3）: 製品バイナリ（CLI・supervisor の bin）は提供済みだが、own の実測値は未取得（#219）。
+#     未解決の前提: supervisor は起動時に dumpable=0 にするため、同じ利用者の非 root からは supervisor の smaps_rollup
+#     （PSS）を読めず、own を非 root で実行すると unreadable-memory-value で fail-closed になる。一方 supervisor は
+#     rootful 起動を拒否する（SEC-5）ため、root では起動前に終了コード 3 で止める。両立には「root が計測し、起動だけ
+#     非 root へ降格する」か、製品側で dumpable=0 を特権経路に限る判断（SUP-14）が要る。本スクリプトは特権の橋渡しを
+#     実装していない（別 issue で扱う）。受け入れは自己テスト（スタブ・疑似 /proc）で照合している。
 #
 # 計測手順（1 試行）: N 個を同時起動 → 起動完了待ち（期限 --timeout。launcher が生存し、READY 行を
 #   出力済みで、ツリーのプロセス数が --min-procs 以上）→ --settle 秒待機して再確認 → 全ツリーの Pss（smaps_rollup）・
@@ -106,7 +125,10 @@
 #       0 を返して合格に見せない）
 #   4 = 後始末失敗（起動したプロセス・コンテナが残存。他の失敗より優先して返す。docker モードでは
 #       docker rm -f の後にラベル一致のコンテナが残る場合と、docker run クライアント（timeout・docker CLI）の
-#       終了を確認できない場合を含む）
+#       終了を確認できない場合を含む）。own では、FCSUP1 OK で報告されたコンテナ側 init を pid・起動時刻つきで
+#       記録できず、init 自身のトークン観測でも帰属を証明できない場合も 4（追跡不能。launcher の生存・一時的な
+#       子孫の記録・無報告・報告前の中断でも同じ。状態ディレクトリを残し、stderr の "state kept at" のパスを手で回収する。
+#       init を記録して回収できた場合だけ従来の 1・143 を返す。SUP-5）
 #   129 / 130 / 143 = HUP / INT / TERM による中断（後始末は必ず実行し、残存があれば 4 を優先する。
 #       後始末中に再度シグナルを受けても後始末を最後まで続ける）
 #   上記以外の値（set -e の暗黙終了等）を返さないよう、失敗しうる操作は明示的に分岐する。
@@ -171,7 +193,10 @@ usage() {
   sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
 }
 
-launcher=""
+bin_dir=""
+systemd_run="/usr/bin/systemd-run"
+cli_bin=""
+sup_bin=""
 bundle=""
 docker=""
 image="alpine:3.20"
@@ -197,7 +222,9 @@ need_val() { [ "$1" -ge 2 ] || { err "invalid-argument" "$2 requires a value"; e
 while [ $# -gt 0 ]; do
   case "$1" in --*) given+="$1 " ;; esac
   case "$1" in
-    --launcher) need_val $# "$1"; launcher="$2"; shift 2 ;;
+    --bin-dir) need_val $# "$1"; bin_dir="$2"; shift 2 ;;
+    --systemd-run) need_val $# "$1"; systemd_run="$2"; shift 2 ;;
+    --launcher) err "invalid-argument" "--launcher was replaced by --bin-dir"; exit 2 ;;
     --bundle) need_val $# "$1"; bundle="$2"; shift 2 ;;
     --docker) need_val $# "$1"; docker="$2"; shift 2 ;;
     --image) need_val $# "$1"; image="$2"; shift 2 ;;
@@ -251,9 +278,9 @@ reject_opts() { # <オプション名...>
 
 case "$mode" in
   own) reject_opts --docker --image --own-result --docker-result ;;
-  docker) reject_opts --launcher --bundle --own-result --docker-result ;;
+  docker) reject_opts --bin-dir --systemd-run --bundle --own-result --docker-result ;;
   report)
-    reject_opts --launcher --bundle --target --docker --image --count --trials --min-procs --settle --timeout --id-prefix --proc-root
+    reject_opts --bin-dir --systemd-run --bundle --target --docker --image --count --trials --min-procs --settle --timeout --id-prefix --proc-root
     [ "$format" = "json" ] || { err "invalid-argument" "--format must be json with --mode report"; exit 2; }
     [ -n "$own_result" ] && [ -n "$docker_result" ] || { err "invalid-argument" "--own-result and --docker-result are required with --mode report"; exit 2; }
     ;;
@@ -264,16 +291,55 @@ if [ "$mode" != "report" ]; then
   [[ "$id_prefix" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || { err "invalid-argument" "--id-prefix must match ^[a-z0-9][a-z0-9-]{0,31}\$"; exit 2; }
 fi
 
-if [ "$mode" = "own" ]; then
-  case "$launcher" in
-    /*) ;;
-    *) err "invalid-argument" "--launcher must be an absolute path (no default: avoids measuring the wrong binary)"; exit 2 ;;
+# bundle の config.json の root.path が、複製した bundle の中へ解決される相対パスであることを検証する（SEC・OCI の rootfs）。
+# cp -a は config.json を書き換えないため、root.path が絶対パス（や bundle 外へ出る相対パス・外を指す symlink）だと、
+# 複製した全コンテナが元の同じ rootfs を共有し、独立した複製という計測条件が崩れる（書き込みの相互干渉・page cache の共有）。
+# 書き換えではなく拒否にする理由: 計測対象の設定を本スクリプトが改変しない／bundle 外の rootfs には書き換え先がなく、
+# 全コンテナ分の rootfs の複製が別途要る。--bundle はテンプレートなので、複製の前に 1 度だけ検証する（複製は同一内容）。
+# 違反は終了コード 2（create・起動の前）。jq・realpath が無ければ 3。
+check_bundle_root_path() {
+  local rp resolved
+  command -v jq >/dev/null 2>&1 || { err "unsupported-os" "jq is required to validate the bundle config.json"; exit 3; }
+  command -v realpath >/dev/null 2>&1 || { err "unsupported-os" "realpath is required to validate the bundle config.json"; exit 3; }
+  # root.path が無ければ OCI の慣例どおり rootfs として扱う。読む量は 1 MiB に絞る（巨大ファイルを jq へ渡さない）。
+  if ! rp="$(head -c 1048577 -- "$bundle/config.json" 2>/dev/null | jq -er '(.root // {}) | (.path // "rootfs") | select(type=="string")' 2>/dev/null)"; then
+    err "invalid-argument" "the bundle config.json must be valid JSON with a string root.path (or none)"
+    exit 2
+  fi
+  case "$rp" in
+    '' | /* | *$'\n'*) err "invalid-argument" "the bundle root.path must be a relative path inside the bundle (an absolute path would share one rootfs across all copies)"; exit 2 ;;
   esac
-  { [ -f "$launcher" ] && [ -x "$launcher" ]; } || { err "invalid-argument" "--launcher is not an executable file"; exit 2; }
+  resolved="$(realpath -m -- "$bundle/$rp" 2>/dev/null)" || { err "invalid-argument" "the bundle root.path cannot be resolved"; exit 2; }
+  case "$resolved" in
+    "$bundle"/?*) ;;
+    *) err "invalid-argument" "the bundle root.path must stay inside the bundle (no .. or symlink to the outside)"; exit 2 ;;
+  esac
+}
+
+if [ "$mode" = "own" ]; then
+  # 起動する 3 つの実行ファイルは固定名で解決し（PATH 探索なし。別のバイナリを測らない）、絶対パス・通常ファイル
+  # （symlink でない）・実行可能であることを確かめる。
+  case "$bin_dir" in
+    /*) ;;
+    *) err "invalid-argument" "--bin-dir must be an absolute path (no default: avoids measuring the wrong binary)"; exit 2 ;;
+  esac
+  case "$systemd_run" in
+    /*) ;;
+    *) err "invalid-argument" "--systemd-run must be an absolute path"; exit 2 ;;
+  esac
+  cli_bin="${bin_dir}/fandhe-container"
+  sup_bin="${bin_dir}/fandhe-container-supervisor"
+  for exe in "$cli_bin" "$sup_bin" "$systemd_run"; do
+    { [ ! -L "$exe" ] && [ -f "$exe" ] && [ -x "$exe" ]; } || { err "invalid-argument" "fandhe-container, fandhe-container-supervisor (in --bin-dir) and --systemd-run must be executable regular files (not symlinks)"; exit 2; }
+  done
   case "$bundle" in
     '' | -*) err "invalid-argument" "--bundle is required and must not start with '-'"; exit 2 ;;
   esac
   [ -d "$bundle" ] || { err "invalid-argument" "--bundle is not a directory"; exit 2; }
+  # cp -a はシンボリックリンクをリンクのまま複製し、全コンテナの bundle が同じ実体を指して flock 競合する。
+  # 実体の絶対パスへ解決してから複製する。
+  bundle="$(cd -- "$bundle" 2>/dev/null && pwd -P)" || { err "invalid-argument" "--bundle cannot be resolved"; exit 2; }
+  check_bundle_root_path
 fi
 
 if [ "$mode" = "docker" ]; then
@@ -433,6 +499,14 @@ if [ "$mode" != "report" ]; then
   fi
   [ -r /proc/self/stat ] || { err "unsupported-os" "/proc/<pid>/stat is not available"; exit 3; }
 fi
+# own モードは supervisor を起動する。supervisor は rootful 起動を拒否する（SEC-5）ため、起動前に 3 で止める
+# （0 を返して合格に見せない）。cp・timeout は bundle の複製と create の期限に使う。
+if [ "$mode" = "own" ]; then
+  for req in cp timeout; do
+    command -v "$req" >/dev/null 2>&1 || { err "unsupported-os" "cp and timeout are required for --mode own"; exit 3; }
+  done
+  if [ "$(id -u)" -eq 0 ]; then err "unsupported-os" "supervisor rejects rootful start (SEC-5); run as a non-root user"; exit 3; fi
+fi
 # docker モードは全ての docker 呼び出しを timeout（coreutils）で包む（REPAIR-5）。
 if [ "$mode" = "docker" ]; then
   command -v timeout >/dev/null 2>&1 || { err "unsupported-os" "timeout (coreutils) is required for --mode docker"; exit 3; }
@@ -447,6 +521,12 @@ cpids=()
 cstart=()
 snaps=()
 known=()
+# 報告された init を記録できないまま後始末へ入った場合に 1 にする（追跡不能。後始末の成功とは判定せず、
+# 一時ディレクトリも削除しない）。
+untracked=0
+keep_tmpdir=0 # ln_stop が 4（回収失敗）を返したら 1。手動回収のため作業ディレクトリを残す（SUP-5）
+untracked_cand=" " # untracked の候補（空白区切りの「スロット番号:報告された init の pid」。ln_stop の中で、その init の pid が所有トークンを継承していると観測できたときだけ解除し、それ以外は untracked へ確定する）
+owned_pids=" "     # 所有トークンを観測できたプロセスの pid（空白区切り）。中間プロセスなど別の pid の観測は init の追跡証明に使わない
 # 起動した子プロセス（収集プロセス・launcher）を配列へ登録し終えるまでの間は 1。この間に受けた
 # TERM / INT / HUP は pending_sig へ記録するだけにして、登録後に処理する（on_signal・spawn_section_end）。
 in_spawn=0
@@ -619,15 +699,31 @@ collectors_stop() {
   cstart=()
 }
 
-# コンテナ 1 つ分の launcher を直接の子として起動し、pid を LAST_PID、起動時刻を LAST_START へ入れる
+# コンテナ 1 つ分の bundle の複製と create を済ませる（supervisor の起動前。起動をずらさないため、全コンテナ分を先に行う）。
+# 複製の失敗は終了コード 2（別ファイルシステム等。）、
+# create の失敗は計測失敗の 1。create は --timeout を上限にし、出力・パスは出さない（REPAIR-5）。
+ln_prepare() { # <id>
+  local rc=0
+  mkdir -m 0700 -p -- "$tmpdir/state" "$tmpdir/bundles" || { err "invalid-input" "cannot create the state directory"; exit 1; }
+  if ! cp -a --reflink=auto -- "$bundle" "$tmpdir/bundles/$1" 2>/dev/null; then
+    err "invalid-argument" "cannot copy the bundle template"
+    exit 2
+  fi
+  [ -f "$tmpdir/bundles/$1/config.json" ] || { err "invalid-argument" "the bundle must contain config.json"; exit 2; }
+  timeout --kill-after=5 "$timeout_s" "$cli_bin" --root "$tmpdir/state" create --bundle "$tmpdir/bundles/$1" "$1" </dev/null >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ]; then err "measurement-failed" "id=$1 reason=create-failed exit=$rc"; exit 1; fi
+}
+
+# コンテナ 1 つ分の supervisor を直接の子として起動し、pid を LAST_PID、起動時刻を LAST_START へ入れる
 # （起動時刻を読めなければ空。空の launcher は以後「生存していない」と扱い、シグナルも送らない。
 # その pid が直接の子として生存し続けていれば、後始末で残存として報告し終了コード 4 にする）。
-# 引数は配列で直接 exec する（eval・sh -c を使わない）。launcher とその子孫へ ulimit 等のリソース制限は
+# 引数は配列で直接 exec する（eval・sh -c を使わない）。supervisor とその子孫へ ulimit 等のリソース制限は
 # 掛けない（コンテナ内の書き込みが失敗して計測条件が変わるため）。標準出力・標準エラーは
-# log_collector_start が用意した FIFO（<logfile>.fifo）へ流し、ログの上限は収集プロセス側で設ける。
+# log_collector_start が用意した FIFO（<logfile>.fifo）へ流し、ログの上限は収集プロセス側で設ける
+# （supervisor は標準出力が FIFO であることを要求する）。
 ln_spawn() { # <id> <logfile>
   (
-    FANDHE_BENCH_OWNER="$owner_tok" exec "$launcher" run --id "$1" --bundle "$bundle" </dev/null >"$2.fifo" 2>&1
+    FANDHE_BENCH_OWNER="${owner_tok}.s${#pids[@]}" exec "$systemd_run" --user --scope --quiet -p Delegate=yes -- "$sup_bin" start --root "$tmpdir/state" "$1" </dev/null >"$2.fifo" 2>&1
   ) &
   LAST_PID=$!
   # FANDHE_CONCURRENT_MEMORY_SELFTEST_SIGNAL_IN_SPAWN は selftest が「launcher を起動した直後、pid を
@@ -738,31 +834,46 @@ record_tree() { # <i>
   done
 }
 
-# launcher が標準出力（ログ）へ `READY` 行を出したか（起動完了の明示的な ready 状態）。
+# supervisor が標準出力（ログ）へ `FCSUP1 OK <pid>` 行を出したか（起動完了の明示的な ready 状態）。
 # ログは収集プロセスが LOG_MAX_KIB KiB で打ち切るため、読む量もその範囲に収まる。
 ln_ready() { # <logfile>
-  [ -r "$1" ] && grep -qxF -- "READY" "$1" 2>/dev/null
+  [ -r "$1" ] && grep -qxE -- 'FCSUP1 OK [1-9][0-9]{0,9}' "$1" 2>/dev/null
+}
+
+# 集計対象の pid が本計測への帰属を証明できるか。supervisor 自身は spawn した直接の子（起動時刻の一致を ln_alive が確認）、
+# 子孫は record_tree が生存中に記録した「pid:起動時刻」と一致するもの。環境変数トークンも補助の根拠にする
+# （supervisor は dumpable=0 で environ を読めず、コンテナ側は環境変数を継承しないため、トークンだけでは足りない）。
+tracked_pid() { # <i> <pid>
+  if [ "$2" = "${pids[$1]}" ] && ln_alive "$1"; then return 0; fi
+  if read_starttime "$2"; then
+    case " ${known[$1]:-} " in *" $2:${ST} "*) return 0 ;; esac
+  fi
+  owned_by_token "$2"
 }
 
 # 環境変数トークン FANDHE_BENCH_OWNER が一致する生存プロセス（launcher の孤児化した子孫を含む）を
 # 「pid:起動時刻」で OWNED へ入れる。トークンは実行ごとの乱数。列挙からシグナル送信までの間の pid
 # 再利用に備え、送信時は起動時刻とトークンを再照合する（owned_kill）。
 owned_scan() {
-  local f p
+  local f p tok_re="${owner_tok//./\\.}"
   OWNED=()
   [ -n "$owner_tok" ] || return 0
   while IFS= read -r f; do
     p="${f#"$proc"/}"
     p="${p%%/*}"
     [[ "$p" =~ $num_re ]] || continue
-    if read_starttime "$p" && proc_alive "$p"; then OWNED+=("${p}:${ST}"); fi
-  done < <(grep -lzxF -- "FANDHE_BENCH_OWNER=${owner_tok}" "$proc"/[0-9]*/environ 2>/dev/null || true)
+    if read_starttime "$p" && proc_alive "$p"; then
+      OWNED+=("${p}:${ST}")
+      case "$owned_pids" in *" ${p} "*) ;; *) owned_pids="${owned_pids}${p} " ;; esac
+    fi
+  done < <(grep -lzE -- "^FANDHE_BENCH_OWNER=${tok_re}\.s[0-9]+\$" "$proc"/[0-9]*/environ 2>/dev/null || true)
 }
 
 # pid の environ が実行ごとのトークンを継承しているか（読めない・無ければ失敗）。
 owned_by_token() { # <pid>
   [ -n "$owner_tok" ] || return 1
-  [ -r "$proc/$1/environ" ] && grep -qzxF -- "FANDHE_BENCH_OWNER=${owner_tok}" "$proc/$1/environ" 2>/dev/null
+  local tok_re="${owner_tok//./\\.}"
+  [ -r "$proc/$1/environ" ] && grep -qzE -- "^FANDHE_BENCH_OWNER=${tok_re}\.s[0-9]+\$" "$proc/$1/environ" 2>/dev/null
 }
 
 # OWNED の各プロセスへ、トークンと起動時刻を再照合してから SIGKILL を送る。
@@ -782,11 +893,31 @@ any_alive() {
   return 1
 }
 
+# スロット i の supervisor が標準出力（ログ）へ出した `FCSUP1 OK <pid>`（コンテナ側 init のホスト上の pid）を返す。
+# 無ければ空。複数行あれば最初の 1 件。ログは収集プロセスが LOG_MAX_KIB KiB で打ち切るため読む量は上限内。
+ln_init_pid() { # <i>
+  local f="$tmpdir/${id_prefix}-${t}-$(($1 + 1)).log"
+  [ -r "$f" ] || return 0
+  sed -n 's/^FCSUP1 OK \([1-9][0-9]\{0,9\}\)$/\1/p' "$f" 2>/dev/null | head -n 1 || true
+}
+
+# known[i]（生存中に記録した「pid:起動時刻」）に init の pid（$2）があれば 0。pid が空なら失敗。
+init_in_known() { # <i> <init pid>
+  local desc
+  [ -n "$2" ] || return 1
+  # 報告された pid が launcher 自身なら、launcher は生存中の同一性（起動時刻）で追跡・回収している。
+  [ "$2" != "${pids[$1]:-}" ] || return 0
+  for desc in ${known[$1]:-}; do
+    [ "${desc%%:*}" = "$2" ] && return 0
+  done
+  return 1
+}
+
 # 全 launcher を停止・回収する（SIGTERM → 期限内に終了しなければ SIGKILL。launcher にも、launcher の
 # 消滅後に残った子孫にも、起動時刻が一致するもの＝pid 再利用でないものにだけシグナルを送る）。
 # 残存があれば 4 を返す。成功・失敗・シグナルのいずれでも呼ばれる（EXIT trap）。何度呼んでも安全。
 ln_stop() {
-  local i pid grace desc waited residual=()
+  local i pid grace desc waited ip cand residual=()
   # launcher を 1 つも登録していなくても、先に起動した収集プロセスは必ず回収する（FIFO の作成失敗や、
   # 収集プロセスの起動中に受けたシグナルで終了する場合。FIFO の open 待ちのまま残さない）。
   # 起動区間へ入った後（need_sweep=1）は pids が空でも以降の処理を省略せず、所有トークンでの走査・
@@ -802,6 +933,12 @@ ln_stop() {
     ln_collect_pids "${pids[i]}" || true
     record_tree "$i"
     snaps[i]="${known[i]:-}"
+    # コンテナの init（FCSUP1 OK で報告された pid）を、起動時刻つきで生存中に記録できていない。launcher の生存・
+    # 一時的な中間プロセスの記録・FCSUP1 ERR 等の報告は、init の追跡も未生成も証明しない（最後の記録の後に init が
+    # 生まれ、その直後に launcher を止める順序が成立する。実 supervisor の init は所有トークンも継承しない）。
+    # 後段で init 自身のトークン観測による帰属も証明できなければ、追跡不能として終了コード 4・状態保持にする（SUP-5）。
+    ip="$(ln_init_pid "$i")"
+    if ! init_in_known "$i" "$ip"; then untracked_cand="${untracked_cand}${i}:${ip} "; fi
   done
   for i in "${!pids[@]}"; do
     sig_same_proc TERM "${pids[i]}" "${pstart[i]:-}" "$$"
@@ -869,13 +1006,35 @@ ln_stop() {
       *) residual+=("pid=${pid}") ;;
     esac
   done
+  # 追跡不能の確定は残存の有無に関わらず先に行う（残存で戻っても状態を残して手動回収へ進めるため）。
+  # 解除できるのは、報告された init の pid そのものが所有トークンを継承していると観測できた場合だけ（別の pid・
+  # 別スロットのトークンの観測は不在証明に使わない。init の追跡の証明にならない）。
+  for cand in ${untracked_cand}; do
+    ip="${cand#*:}"
+    case "$owned_pids" in
+      *" ${ip:-x} "*) ;;
+      *) untracked=1 ;;
+    esac
+  done
+  untracked_cand=" "
+  owned_pids=" "
   pids=()
   pstart=()
   snaps=()
   known=()
   need_sweep=0
   if [ "${#residual[@]}" -gt 0 ]; then
-    err "cleanup-failed" "processes still running: ${residual[*]}"
+    if [ "$untracked" -eq 1 ]; then
+      err "cleanup-failed" "processes still running: ${residual[*]}; a launcher exited before the container init was recorded (state kept at ${tmpdir:-<none>})"
+    else
+      err "cleanup-failed" "processes still running: ${residual[*]} (state kept at ${tmpdir:-<none>})"
+    fi
+    keep_tmpdir=1
+    return 4
+  fi
+  if [ "$untracked" -eq 1 ]; then
+    err "cleanup-failed" "a launcher exited before the container init was recorded; container-side processes cannot be tracked (state kept at ${tmpdir:-<none>})"
+    keep_tmpdir=1
     return 4
   fi
   return 0
@@ -895,7 +1054,8 @@ on_exit() {
   # dk_stop は計測本体の手前で定義される。それより前（mktemp 失敗等）の exit でも終了コードを変えない。
   if declare -F dk_stop >/dev/null 2>&1; then dk_stop || rc=4; fi
   if [ -n "$out_tmp" ]; then rm -f "$out_tmp"; fi
-  if [ -n "$tmpdir" ]; then rm -rf "$tmpdir"; fi
+  # 追跡不能のときは残存確認に必要な状態（ログ・状態ルート）を残し、手動回収へ進めるようにする。
+  if [ -n "$tmpdir" ] && [ "$untracked" -eq 0 ] && [ "$keep_tmpdir" -eq 0 ]; then rm -rf "$tmpdir"; fi
   exit "$rc"
 }
 trap on_exit EXIT
@@ -976,12 +1136,12 @@ measure_container() {
     fi
     # 計測直前にも launcher の ready 状態を確認する（起動途中のプロセスを成功として公開しない）。
     if ! ln_ready "$tmpdir/${id_prefix}-${t}-$((i + 1)).log"; then
-      m_reason="launcher-not-ready"
+      m_reason="launcher-not-ready" # supervisor が FCSUP1 OK を出していない
       return 1
     fi
     for pid in "${tree_pids[@]}"; do
-      # 後始末（トークン照合）で回収できないプロセスを含む計測は成功にしない（所有権を追跡できない）。
-      if ! owned_by_token "$pid"; then
+      # 後始末（記録済みの同一性・トークン照合）で回収できないプロセスを含む計測は成功にしない（所有権を追跡できない）。
+      if ! tracked_pid "$i" "$pid"; then
         if [ ! -e "$proc/$pid" ]; then vanished=1; break; fi
         m_reason="untracked-process"
         return 1
@@ -1783,6 +1943,12 @@ while [ "$t" -le "$own_trials" ]; do
   cstart=()
   known=()
   ok_flags=()
+  # bundle の複製と create を全コンテナ分、supervisor の起動前に済ませる（同時起動の間に挟まない）。
+  i=0
+  while [ "$i" -lt "$count" ]; do
+    ln_prepare "${id_prefix}-${t}-$((i + 1))"
+    i=$((i + 1))
+  done
   # ログ収集プロセスを全コンテナ分、launcher より先に起動する（launcher の同時起動の間に挟まない）。
   i=0
   while [ "$i" -lt "$count" ]; do
@@ -1896,7 +2062,8 @@ while [ "$t" -le "$own_trials" ]; do
   # 成功した試行のログと FIFO は次の試行へ進む前に削除する（失敗時の診断にしか使わない。残すとディスク
   # 消費が「起動数 × 試行回数 × LOG_MAX_KIB KiB」まで増える）。失敗した試行はここへ来ずに終了し、
   # 診断の出力後に EXIT trap が一時ディレクトリごと削除する。
-  if ! rm -f -- "$tmpdir/${id_prefix}-${t}-"*.log "$tmpdir/${id_prefix}-${t}-"*.fifo; then
+  if ! rm -rf -- "$tmpdir/bundles/${id_prefix}-${t}-"* "$tmpdir/state/${id_prefix}-${t}-"* ||
+    ! rm -f -- "$tmpdir/${id_prefix}-${t}-"*.log "$tmpdir/${id_prefix}-${t}-"*.fifo; then
     err "measurement-failed" "trial=${t} reason=cannot-remove-trial-logs"
     exit 1
   fi

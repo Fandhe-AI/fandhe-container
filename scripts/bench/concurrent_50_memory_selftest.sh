@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # scripts/bench/concurrent_50_memory.sh の自己テスト（TASK-50.1・TASK-50.2・CORE-9・SUP-1・REPAIR-12）。
 #
-# 役割: bash 製のスタブ launcher（`run --id <id> --bundle <dir>` を受け、子として sleep を起動して
-# 待つ）で計測スクリプトを実行し、終了コード・出力・後始末を具体値で照合する。実ランタイム・root・
+# 役割: bash 製のスタブ（CLI の create・systemd-run・supervisor の `start --root <R> <id>`。supervisor スタブは子として
+# sleep を起動し `FCSUP1 OK <pid>` を出して待つ。実バイナリの契約は #1717・#1819）で計測スクリプトを実行し、終了コード・出力・後始末を具体値で照合する。実ランタイム・root・
 # 実コンテナは使わない。docker モード・report モード（TASK-50.2）はスタブ docker CLI（bash）と疑似 /proc で
 # 照合する（実 Docker・root は使わない。デーモンの列挙は疑似 /proc の comm 走査なので、ホストの dockerd の有無に
 # 左右されない）。メモリ値の照合は、スタブが mktemp -d 配下の疑似 /proc（--proc-root）へ
@@ -109,13 +109,46 @@ expect_has() { # <名前> <ファイル> <部分文字列>
   if grep -qF -- "$3" "$2"; then pass "$1"; else fail "$1 (missing: $3)"; fi
 }
 
-mkdir -p "$work/bundle" "$work/fake"
-stub="$work/stub-launcher"
+# 終了コード 4（init を記録できず追跡不能）の経路が残した状態ディレクトリ（stderr の "state kept at <path>"）を
+# 回収する。通知が無ければ失敗（4 の経路は残置を通知する契約。SUP-5）。
+reclaim_kept() { # <名前>
+  local k
+  k="$(sed -n 's/.*state kept at \(\/[^)]*\)).*/\1/p' "$errf" | head -n 1)"
+  if [ -n "$k" ] && [ -d "$k" ]; then pass "$1-state-kept"; rm -rf -- "$k"; else fail "$1-state-kept"; fi
+}
+
+mkdir -p "$work/bundle/rootfs" "$work/fake" "$work/bin"
+echo '{}' >"$work/bundle/config.json"
+stub="$work/bin/fandhe-container-supervisor"
+# スタブ CLI（`--root R create --bundle B <id>` だけを受理し、R/<id>/state.json を作る）とスタブ systemd-run
+# （`--user --scope --quiet -p Delegate=yes -- <cmd...>` を照合して exec する。pid は変わらない）。
 {
   printf '#!%s\n' "$bash_bin"
   cat <<'STUB'
-# スタブ launcher。$1=run $2=--id $3=<id> $4=--bundle $5=<dir>
-id="$3"
+[ "$1" = --root ] && [ "$3" = create ] && [ "$4" = --bundle ] && [ "$#" -eq 6 ] || exit 2
+[ -f "$5/config.json" ] && [ -d "$5/rootfs" ] || exit 2
+[ "${STUB_CREATE_FAIL:-}" != "$6" ] || exit 5
+mkdir -p "$2/$6" && echo '{"status":"created"}' >"$2/$6/state.json"
+STUB
+} >"$work/bin/fandhe-container"
+{
+  printf '#!%s\n' "$bash_bin"
+  cat <<'STUB'
+[ "$1" = --user ] && [ "$2" = --scope ] && [ "$3" = --quiet ] && [ "$4" = -p ] && [ "$5" = Delegate=yes ] && [ "$6" = -- ] || exit 2
+shift 6
+exec "$@"
+STUB
+} >"$work/systemd-run"
+chmod +x "$work/bin/fandhe-container" "$work/systemd-run"
+{
+  printf '#!%s\n' "$bash_bin"
+  cat <<'STUB'
+# スタブ supervisor。実バイナリの契約（#1717・#1819）に合わせ、`start --root <R> <id>` だけを受理する。create 済み
+# （<R>/<id>/state.json がある）で、標準出力が FIFO のときだけ `FCSUP1 OK <コンテナ pid>` を出す。
+[ "$1" = start ] && [ "$2" = --root ] && [ "$#" -eq 4 ] || exit 2
+id="${!#}"
+[ -f "$3/$id/state.json" ] || exit 2
+if [ ! -p /dev/stdout ]; then echo "FCSUP1 ERR INVALID_ARGUMENT 2 stdout is not a fifo"; exit 2; fi
 rest="${id#*-}"; rest="${rest#*-}"      # <trial>-<i>
 trial="${rest%%-*}"; idx="${rest##*-}"
 if [ -n "${STUB_DIE_I:-}" ] && [ "$idx" = "$STUB_DIE_I" ]; then echo "stub: boom" >&2; exit 7; fi
@@ -131,8 +164,25 @@ record_child() { # この selftest が起動した sleep の pid と起動時刻
   read -ra f <<<"$rest"
   printf '%s %s\n' "$1" "${f[19]:-}" >>"$STUB_PIDFILE"
 }
-if [ "$mode" = "dieafter" ]; then sleep 300 & record_child $!; sleep 1; exit 0; fi
-if [ "$mode" = "diefast" ]; then sleep 300 & record_child $!; exit 0; fi
+# dieafter / diefast: コンテナ側プロセス（init）の pid を FCSUP1 OK で報告してから、launcher だけが先に死ぬ。
+if [ "$mode" = "dieafter" ]; then sleep 300 & record_child $!; echo "FCSUP1 OK $!"; sleep 1; exit 0; fi
+if [ "$mode" = "diefast" ]; then sleep 300 & record_child $!; echo "FCSUP1 OK $!"; exit 0; fi
+# midonly: 一時的な中間プロセス（トークン継承・生存中の子孫として観測される）だけを残して約 1.5 秒後に死ぬ。init は報告せず、
+# 二重 fork で木の外へ出し、トークンも継承しない（init の記録なしに中間プロセスだけが観測される経路）。
+if [ "$mode" = "midonly" ]; then
+  sleep 300 & record_child $!
+  (env -u FANDHE_BENCH_OWNER sleep 300 & record_child $!)
+  sleep 1.5
+  exit 0
+fi
+# diefast_notoken: 実 supervisor と同じく、コンテナ側プロセスが FANDHE_BENCH_OWNER を継承せず、親（本スタブ）も即死する。
+# diefast_mixed: 1 番目のコンテナはトークン非継承の子を残して即死し、それ以外はトークンを継承する子を残して即死する
+# （別コンテナのトークン検出で、1 番目の追跡不能が解除されないことの照合用）。
+if [ "$mode" = "diefast_mixed" ]; then
+  if [ "$idx" = "1" ]; then env -u FANDHE_BENCH_OWNER sleep 300 & record_child $!; else sleep 300 & record_child $!; echo "FCSUP1 OK $!"; fi
+  exit 0
+fi
+if [ "$mode" = "diefast_notoken" ]; then env -u FANDHE_BENCH_OWNER sleep 300 & record_child $!; exit 0; fi
 if [ "$mode" != "nochild" ] && [ "$mode" != "hang" ]; then
   sleep 300 &
   child=$!
@@ -168,6 +218,13 @@ if [ -n "${FAKE_PROC:-}" ] && [ "$mode" != "hang" ]; then
   [ -z "$child" ] || mk "$child" "$v"
   mk "$$" "$lp"
   [ -z "$child" ] || printf '%s \n' "$child" >"$FAKE_PROC/$$/task/$$/children"
+  if [ -n "${STUB_GHOST:-}" ]; then
+    # 実プロセスのない pid を木へ加える（起動時刻を記録できず、トークンも持たない = 帰属を証明できない）。
+    ghost=$((899000 + idx))
+    mkdir -p "$FAKE_PROC/$ghost/task/$ghost"
+    : >"$FAKE_PROC/$ghost/task/$ghost/children"
+    printf '%s %s \n' "$child" "$ghost" >"$FAKE_PROC/$$/task/$$/children"
+  fi
   if [ -n "${STUB_UNREADABLE_CHILDREN:-}" ]; then
     mkdir -p "$FAKE_PROC/$$/task/999999"
     : >"$FAKE_PROC/$$/task/999999/children"
@@ -220,8 +277,8 @@ if [ -n "${FAKE_PROC:-}" ] && [ "$mode" != "hang" ]; then
     done
   fi
 fi
-# 起動完了の明示的な通知（ready 状態）。hang・noready は出さない。
-if [ "$mode" != "hang" ] && [ "$mode" != "noready" ] && [ -z "${STUB_NO_READY:-}" ]; then echo READY; fi
+# 起動完了の明示的な通知（ready 状態。FCSUP1 OK）。hang・noready は出さない。
+if [ "$mode" != "hang" ] && [ "$mode" != "noready" ] && [ -z "${STUB_NO_READY:-}" ]; then echo "FCSUP1 OK ${child:-$$}"; fi
 # SIGTERM を即座に処理するため、sleep を待つ形で待機する。
 while :; do sleep 1 & wait $! || true; done
 STUB
@@ -238,7 +295,7 @@ run_wrap=()
 run_target() {
   rc=0
   : >"$out"; : >"$errf"
-  "${run_wrap[@]}" "$bash_bin" "$target" --launcher "$stub" --bundle "$work/bundle" --target own --settle 0 "$@" >"$out" 2>"$errf" || rc=$?
+  "${run_wrap[@]}" "$bash_bin" "$target" --bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/bundle" --target own --settle 0 "$@" >"$out" 2>"$errf" || rc=$?
 }
 run_fake() { # 疑似 /proc を使う（メモリ値の具体照合）
   rm -rf "$work/fake"; mkdir -p "$work/fake"
@@ -255,7 +312,7 @@ orphan_sleep_count() {
   done
   printf '%s' "${n:-0}"
 }
-alive_stub_count() { pgrep -fc -- "${work}/stub-launcher" 2>/dev/null || true; }
+alive_stub_count() { pgrep -fc -- "${work}/bin/fandhe-container-supervisor" 2>/dev/null || true; }
 
 # --- 1. 正常系（疑似 /proc）: 5 個・3 試行。コンテナ PSS = 100 + 子 → 5*(100+x) ---
 export STUB_PSS_BY_TRIAL="1000,3000,2000"
@@ -292,8 +349,14 @@ expect_eq "even-trials-exit0" 0 "$rc"
 expect_eq "even-trials-median" 13000.0 "$(jq -r '.metrics.concurrent_5_pss_median_kb.value | tostring | if test("\\.") then . else . + ".0" end' "$out")"
 unset STUB_PSS_BY_TRIAL
 
-# --- 3b. トークンを継承しない子孫（追跡不能）は失敗にする（P1・後始末で回収できない） ---
+# --- 3a. トークンを継承しない子孫でも、生存中に記録した pid・起動時刻の同一性で追跡できれば計測できる
+#          （supervisor は dumpable=0 で environ を読めず、コンテナ側は環境変数を継承しない。#1820） ---
 STUB_NO_ENVIRON=1 run_fake --count 2 --trials 1
+expect_eq "tracked-without-token-exit0" 0 "$rc"
+expect_eq "tracked-without-token-no-residual" 0 "$(alive_stub_count)"
+
+# --- 3b. 帰属を証明できない子孫（実プロセスがなく起動時刻を記録できず、トークンも無い）は失敗にする（P1・後始末で回収できない） ---
+STUB_NO_ENVIRON=1 STUB_GHOST=1 run_fake --count 2 --trials 1
 expect_eq "untracked-exit1" 1 "$rc"
 expect_has "untracked-stderr" "$errf" "untracked-process"
 expect_eq "untracked-no-residual" 0 "$(alive_stub_count)"
@@ -329,8 +392,13 @@ expect_eq "default-count50-metric" "concurrent_50_pss_median_kb" "$(jq -r '.metr
 expect_eq "default-count50-no-residual" 0 "$(alive_stub_count)"
 
 # --- 6. 起動不足: 1 個が即終了 → exit 1・結果は公開されない ---
+# 子孫を 1 つも記録できないまま消滅した supervisor は子プロセス不在の証明にならないため、追跡不能（exit 4）。
+# 残存確認に必要な状態は削除せず保持する（stderr の "state kept at" のパス。確認後に本テストが片付ける）。
 STUB_DIE_I=3 run_fake --count 5 --trials 1 --output "$work/never.json"
-expect_eq "startup-incomplete-exit1" 1 "$rc"
+expect_eq "startup-incomplete-exit4" 4 "$rc"
+expect_has "startup-incomplete-untracked-stderr" "$errf" "cleanup-failed: a launcher exited before the container init was recorded"
+kept="$(sed -n 's/.*state kept at \(\/[^)]*\)).*/\1/p' "$errf" | head -n 1)"
+if [ -n "$kept" ] && [ -d "$kept" ]; then pass "startup-incomplete-state-kept"; rm -rf -- "$kept"; else fail "startup-incomplete-state-kept"; fi
 expect_eq "startup-incomplete-stdout-empty" 0 "$(wc -c <"$out")"
 expect_eq "startup-incomplete-no-output-file" 0 "$(find "$work" -maxdepth 1 -name 'never.json*' | wc -l)"
 expect_has "startup-incomplete-stderr" "$errf" "startup-incomplete: trial=1 started=4/5"
@@ -348,8 +416,10 @@ expect_eq "min-procs-no-residual" 0 "$(alive_stub_count)"
 
 # --- 8. 期限切れ（起動完了しない launcher）→ exit 1 かつ所定時間内 ---
 start=$SECONDS
+# init を報告しない launcher（FCSUP1 OK 無し）は、init を記録できないので追跡不能の経路（exit 4・状態保持。SUP-5）。
 STUB_MODE=hang run_fake --count 2 --trials 1 --timeout 2
-expect_eq "timeout-exit1" 1 "$rc"
+expect_eq "timeout-exit4-init-unrecorded" 4 "$rc"
+reclaim_kept "timeout"
 if [ $((SECONDS - start)) -le 20 ]; then pass "timeout-bounded-time"; else fail "timeout-bounded-time"; fi
 expect_eq "timeout-no-residual" 0 "$(alive_stub_count)"
 
@@ -383,14 +453,18 @@ expect_eq "ignoreterm-no-orphan-child" 0 "$(orphan_sleep_count)"
 STUB_MODE=ignoreterm FANDHE_CONCURRENT_MEMORY_SELFTEST_NOKILL=1 run_fake --count 2 --trials 1 --timeout 1
 expect_eq "cleanup-failed-exit4" 4 "$rc"
 expect_has "cleanup-failed-stderr" "$errf" "cleanup-failed"
+kept="$(sed -n 's/.*state kept at \(\/[^)]*\)).*/\1/p' "$errf" | head -n 1)"
+if [ -n "$kept" ] && [ -d "$kept" ]; then pass "cleanup-failed-state-kept"; rm -rf -- "$kept"; else fail "cleanup-failed-state-kept"; fi
 # 残存を片付ける（stderr に出た pid のみ）。
 for p in $(grep -o 'pid=[0-9]*' "$errf" | cut -d= -f2); do kill -KILL "$p" 2>/dev/null || true; done
 kill_recorded
 sleep 0.5
 
 # --- 12b. 深さ上限（MAX_DEPTH=16）超のツリーは過少計上になるため成功にしない ---
+# 深さ上限で木を辿れず init を記録できない経路なので追跡不能（exit 4・状態保持。SUP-5）。
 STUB_DEEP=1 run_fake --count 2 --trials 1 --timeout 2
-expect_eq "deep-tree-exit1" 1 "$rc"
+expect_eq "deep-tree-exit4-init-unrecorded" 4 "$rc"
+reclaim_kept "deep-tree"
 expect_eq "deep-tree-stdout-empty" 0 "$(wc -c <"$out")"
 expect_eq "deep-tree-no-residual" 0 "$(alive_stub_count)"
 
@@ -407,9 +481,59 @@ STUB_MODE=diefast run_target --count 2 --trials 1 --settle 1 --timeout 5
 expect_eq "diefast-exit1" 1 "$rc"
 expect_eq "diefast-no-orphan-child" 0 "$(orphan_sleep_count)"
 
+# --- 12d2. 環境変数を継承しないコンテナ側プロセスを残して launcher が即死 → 追跡不能（exit 4）・状態保持 ---
+: >"$STUB_PIDFILE"
+STUB_MODE=diefast_notoken run_target --count 2 --trials 1 --settle 1 --timeout 5
+expect_eq "untracked-notoken-exit4" 4 "$rc"
+expect_has "untracked-notoken-stderr" "$errf" "cleanup-failed: a launcher exited before the container init was recorded"
+kept="$(sed -n 's/.*state kept at \(\/[^)]*\)).*/\1/p' "$errf" | head -n 1)"
+if [ -n "$kept" ] && [ -d "$kept" ]; then pass "untracked-notoken-state-kept"; rm -rf -- "$kept"; else fail "untracked-notoken-state-kept"; fi
+# 未回収の sleep（記録した pid・起動時刻が一致するものだけ）を片付ける。
+while read -r p st; do
+  [ -n "$p" ] && [ "$(awk '{print $22}' "/proc/$p/stat" 2>/dev/null)" = "$st" ] && kill -KILL "$p" 2>/dev/null
+done <"$STUB_PIDFILE" || true
+
+# --- 12d2b. 一時的な中間プロセスだけを記録して launcher が死に、init は報告も記録もされない → 追跡不能（exit 4）・状態保持。
+#           中間プロセスの記録をコンテナ全体の追跡の証明にしない（codex 指摘 PRRT_kwDOUq78ts6tKUN0・SUP-5） ---
+: >"$STUB_PIDFILE"
+STUB_MODE=midonly run_target --count 2 --trials 1 --settle 1 --timeout 5
+expect_eq "midonly-exit4" 4 "$rc"
+expect_has "midonly-stderr" "$errf" "cleanup-failed: a launcher exited before the container init was recorded"
+expect_eq "midonly-stdout-empty" 0 "$(wc -c <"$out")"
+kept="$(sed -n 's/.*state kept at \(\/[^)]*\)).*/\1/p' "$errf" | head -n 1)"
+if [ -n "$kept" ] && [ -d "$kept" ]; then pass "midonly-state-kept"; rm -rf -- "$kept"; else fail "midonly-state-kept"; fi
+while read -r p st; do
+  [ -n "$p" ] && [ "$(awk '{print $22}' "/proc/$p/stat" 2>/dev/null)" = "$st" ] && kill -KILL "$p" 2>/dev/null
+done <"$STUB_PIDFILE" || true
+
+# --- 12d3. 別コンテナのトークン検出で追跡不能が解除されない（コンテナごとの照合）→ exit 4・状態保持 ---
+: >"$STUB_PIDFILE"
+STUB_MODE=diefast_mixed run_target --count 2 --trials 1 --settle 1 --timeout 5
+expect_eq "untracked-mixed-exit4" 4 "$rc"
+expect_has "untracked-mixed-stderr" "$errf" "cleanup-failed: a launcher exited before the container init was recorded"
+kept="$(sed -n 's/.*state kept at \(\/[^)]*\)).*/\1/p' "$errf" | head -n 1)"
+if [ -n "$kept" ] && [ -d "$kept" ]; then pass "untracked-mixed-state-kept"; rm -rf -- "$kept"; else fail "untracked-mixed-state-kept"; fi
+while read -r p st; do
+  [ -n "$p" ] && [ "$(awk '{print $22}' "/proc/$p/stat" 2>/dev/null)" = "$st" ] && kill -KILL "$p" 2>/dev/null
+done <"$STUB_PIDFILE" || true
+
+# --- 12d4. 残存があっても追跡不能を確定し、状態（tmpdir）を残す ---
+: >"$STUB_PIDFILE"
+STUB_MODE=diefast_mixed FANDHE_CONCURRENT_MEMORY_SELFTEST=1 FANDHE_CONCURRENT_MEMORY_SELFTEST_NOKILL=1 run_target --count 2 --trials 1 --settle 1 --timeout 5
+expect_eq "untracked-residual-exit4" 4 "$rc"
+expect_has "untracked-residual-stderr" "$errf" "processes still running"
+expect_has "untracked-residual-kept-msg" "$errf" "a launcher exited before the container init was recorded (state kept at"
+kept="$(sed -n 's/.*state kept at \(\/[^)]*\)).*/\1/p' "$errf" | head -n 1)"
+if [ -n "$kept" ] && [ -d "$kept" ]; then pass "untracked-residual-state-kept"; rm -rf -- "$kept"; else fail "untracked-residual-state-kept"; fi
+while read -r p st; do
+  [ -n "$p" ] && [ "$(awk '{print $22}' "/proc/$p/stat" 2>/dev/null)" = "$st" ] && kill -KILL "$p" 2>/dev/null
+done <"$STUB_PIDFILE" || true
+
 # --- 12e. READY 行を出さない launcher は、プロセス数が足りていても起動完了と見なさない ---
 STUB_MODE=noready run_target --count 2 --trials 1 --timeout 2
-expect_eq "noready-exit1" 1 "$rc"
+# 報告が無いので init を記録できない経路（exit 4・状態保持。SUP-5）。
+expect_eq "noready-exit4-init-unrecorded" 4 "$rc"
+reclaim_kept "noready"
 expect_has "noready-stderr" "$errf" "started=0/2"
 expect_eq "noready-stdout-empty" 0 "$(wc -c <"$out")"
 expect_eq "noready-no-residual" 0 "$(alive_stub_count)"
@@ -428,7 +552,9 @@ expect_eq "bigwrite-no-residual" 0 "$(alive_stub_count)"
 #          後の READY は記録されないので起動未完了になり、ログが上限ちょうどで打ち切られたことを報告する ---
 rm -f "$work/noise-done"
 STUB_NOISE_KIB=3072 STUB_NOISE_DONE="$work/noise-done" run_fake --count 1 --trials 1 --timeout 3
-expect_eq "log-limit-exit1" 1 "$rc"
+# 上限より後の FCSUP1 OK は記録されず、init を記録できない経路（exit 4・状態保持。SUP-5）。
+expect_eq "log-limit-exit4-init-unrecorded" 4 "$rc"
+reclaim_kept "log-limit"
 expect_has "log-limit-startup-incomplete" "$errf" "startup-incomplete: trial=1 started=0/1"
 expect_has "log-limit-truncated" "$errf" "unstarted-log-truncated: id=fc-bench50-1-1 bytes=262144 limit_kib=256"
 expect_eq "log-limit-launcher-wrote-all" "done" "$(cat "$work/noise-done" 2>/dev/null || echo missing)"
@@ -463,7 +589,9 @@ expect_eq "trial-logs-removed-counts" "0,0,0,0" "$(tr -d ' ' <"$work/prev-logs" 
 # --- 12g2. 子プロセス一覧（task/<tid>/children）に読めないものがあれば、読めた分だけで集計しない
 #           （CORE-9・SUP-1。過少計上を成功にしない。非 root で実行されるため chmod 000 で模擬できる） ---
 STUB_UNREADABLE_CHILDREN=1 run_fake --count 2 --trials 1 --timeout 2
-expect_eq "unreadable-children-exit1" 1 "$rc"
+# 読めない children があり木を確定できず init を記録できない経路（exit 4・状態保持。SUP-5）。
+expect_eq "unreadable-children-exit4-init-unrecorded" 4 "$rc"
+reclaim_kept "unreadable-children"
 expect_has "unreadable-children-stderr" "$errf" "startup-incomplete: trial=1 started=0/2"
 expect_eq "unreadable-children-stdout-empty" 0 "$(wc -c <"$out")"
 expect_eq "unreadable-children-no-residual" 0 "$(alive_stub_count)"
@@ -499,9 +627,11 @@ STUB_NO_ENVIRON=1 FANDHE_CONCURRENT_MEMORY_SELFTEST_STALE_START=1 run_fake --cou
 expect_eq "stale-start-exit4" 4 "$rc"
 expect_has "stale-start-stderr" "$errf" "startup-incomplete: trial=1 started=0/2"
 expect_has "stale-start-reported" "$errf" "cleanup-failed: processes still running: pid="
+kept="$(sed -n 's/.*state kept at \(\/[^)]*\)).*/\1/p' "$errf" | head -n 1)"
+if [ -n "$kept" ] && [ -d "$kept" ]; then pass "stale-start-state-kept"; rm -rf -- "$kept"; else fail "stale-start-state-kept"; fi
 expect_eq "stale-start-stdout-empty" 0 "$(wc -c <"$out")"
 expect_eq "stale-start-not-signalled" 2 "$(alive_stub_count)"
-pkill -TERM -f -- "${work}/stub-launcher" 2>/dev/null || true
+pkill -TERM -f -- "${work}/bin/fandhe-container-supervisor" 2>/dev/null || true
 kill_recorded
 for _ in $(seq 1 15); do [ "$(alive_stub_count)" != "0" ] || break; sleep 0.2; done
 expect_eq "stale-start-test-cleanup" 0 "$(alive_stub_count)"
@@ -510,7 +640,7 @@ expect_eq "stale-start-test-cleanup" 0 "$(alive_stub_count)"
 #          SIGTERM を無視する launcher の終了待ち中に再送しても、launcher・子を残さない） ---
 : >"$STUB_PIDFILE"
 : >"$out"; : >"$errf"
-STUB_MODE=ignoreterm STUB_NO_READY=1 "$bash_bin" "$target" --launcher "$stub" --bundle "$work/bundle" --target own \
+STUB_MODE=ignoreterm STUB_NO_READY=1 "$bash_bin" "$target" --bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/bundle" --target own \
   --count 2 --trials 1 --timeout 20 >"$out" 2>"$errf" &
 sig_pid=$!
 for _ in $(seq 1 50); do [ "$(wc -l <"$STUB_PIDFILE")" -lt 2 ] || break; sleep 0.2; done
@@ -527,19 +657,72 @@ sleep 0.3
 kill -HUP "$sig_pid" 2>/dev/null || true
 r=0
 wait "$sig_pid" || r=$?
-expect_eq "resignal-exit143" 143 "$r"
+# READY 無し（STUB_NO_READY）で init の報告が無いため、中断でも追跡不能の経路（exit 4・状態保持。SUP-5）。
+expect_eq "resignal-exit4-init-unrecorded" 4 "$r"
+reclaim_kept "resignal"
 expect_eq "resignal-no-residual" 0 "$(alive_stub_count)"
 expect_eq "resignal-no-orphan-child" 0 "$(orphan_sleep_count)"
+
+# --- 12k2. init を報告・記録した後の中断は従来どおり 143（init を記録して回収できた経路。状態は削除される） ---
+: >"$STUB_PIDFILE"
+: >"$out"; : >"$errf"
+"$bash_bin" "$target" --bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/bundle" --target own \
+  --count 2 --trials 1 --settle 30 --timeout 20 >"$out" 2>"$errf" &
+sig_pid=$!
+for _ in $(seq 1 50); do [ "$(wc -l <"$STUB_PIDFILE")" -lt 2 ] || break; sleep 0.2; done
+sleep 2
+kill -TERM "$sig_pid"
+r=0
+wait "$sig_pid" || r=$?
+expect_eq "interrupt-recorded-exit143" 143 "$r"
+if grep -q "state kept at" "$errf"; then fail "interrupt-recorded-state-removed"; else pass "interrupt-recorded-state-removed"; fi
+expect_eq "interrupt-recorded-no-residual" 0 "$(alive_stub_count)"
 
 # --- 12l. launcher を起動した直後・pid を登録する前にシグナルを受けても（selftest 専用フックで模擬）、
 #          その launcher を登録してから後始末へ進み、残さない（REPAIR-5） ---
 : >"$STUB_PIDFILE"
 FANDHE_CONCURRENT_MEMORY_SELFTEST=1 FANDHE_CONCURRENT_MEMORY_SELFTEST_SIGNAL_IN_SPAWN=1 run_target --count 2 --trials 1 --timeout 5
-expect_eq "signal-in-spawn-exit143" 143 "$rc"
+# 起動直後（報告前）の中断なので init を記録できず、追跡不能の経路（exit 4・状態保持。SUP-5）。
+expect_eq "signal-in-spawn-exit4-init-unrecorded" 4 "$rc"
+reclaim_kept "signal-in-spawn"
 expect_has "signal-in-spawn-stderr" "$errf" "interrupted: received signal (exit 143); running cleanup"
 expect_eq "signal-in-spawn-stdout-empty" 0 "$(wc -c <"$out")"
 expect_eq "signal-in-spawn-no-residual" 0 "$(alive_stub_count)"
 expect_eq "signal-in-spawn-no-orphan-child" 0 "$(orphan_sleep_count)"
+
+# --- 12m. create の失敗は計測失敗（exit 1。結果は公開せず、supervisor は 1 つも起動しない）。bundle の複製の失敗は exit 2
+#          （#1820） ---
+STUB_CREATE_FAIL="fc-bench50-1-1" run_fake --count 2 --trials 1 --timeout 5
+expect_eq "create-fail-exit1" 1 "$rc"
+expect_has "create-fail-stderr" "$errf" "reason=create-failed exit=5"
+expect_eq "create-fail-stdout-empty" 0 "$(wc -c <"$out")"
+expect_eq "create-fail-no-residual" 0 "$(alive_stub_count)"
+mkdir -p "$work/bundle-bad/rootfs/sub"
+echo '{}' >"$work/bundle-bad/config.json"
+chmod 000 "$work/bundle-bad/rootfs/sub"
+run_target --count 2 --trials 1 --timeout 5 --bundle "$work/bundle-bad"
+chmod 700 "$work/bundle-bad/rootfs/sub"
+expect_eq "bundle-copy-fail-exit2" 2 "$rc"
+expect_has "bundle-copy-fail-stderr" "$errf" "cannot copy the bundle template"
+expect_eq "bundle-copy-fail-no-residual" 0 "$(alive_stub_count)"
+
+# --- 12n. config.json の root.path が複製内の相対パスでなければ、複製・create・起動の前に exit 2 で拒否する。
+#          cp -a は root.path を書き換えず、絶対パスだと全コンテナが同じ rootfs を共有する（codex 指摘 PRRT_kwDOUq78ts6tKUN5） ---
+mk_rp_bundle() { # <名前> <config.json の内容>
+  mkdir -p "$work/$1/rootfs"
+  printf '%s\n' "$2" >"$work/$1/config.json"
+}
+mk_rp_bundle bundle-abs "{\"root\":{\"path\":\"$work/bundle/rootfs\"}}"
+mk_rp_bundle bundle-dotdot '{"root":{"path":"../bundle/rootfs"}}'
+mk_rp_bundle bundle-nonstring '{"root":{"path":7}}'
+mk_rp_bundle bundle-symlink '{"root":{"path":"link"}}'
+ln -s "$work/bundle/rootfs" "$work/bundle-symlink/link"
+for b in bundle-abs bundle-dotdot bundle-nonstring bundle-symlink; do
+  run_target --count 2 --trials 1 --timeout 5 --bundle "$work/$b"
+  expect_eq "root-path-${b}-exit2" 2 "$rc"
+  expect_has "root-path-${b}-stderr" "$errf" "root.path"
+  expect_eq "root-path-${b}-no-residual" 0 "$(alive_stub_count)"
+done
 
 # --- 13. 引数エラーは exit 2 ---
 expect_rc2() { # <名前> <引数...>
@@ -548,18 +731,20 @@ expect_rc2() { # <名前> <引数...>
   "$bash_bin" "$target" "$@" >/dev/null 2>&1 || r=$?
   expect_eq "$name" 2 "$r"
 }
-base=(--launcher "$stub" --bundle "$work/bundle" --target own)
-expect_rc2 "arg-relative-launcher" --launcher stub-launcher --bundle "$work/bundle" --target own
-expect_rc2 "arg-missing-launcher" --bundle "$work/bundle" --target own
+base=(--bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/bundle" --target own)
+expect_rc2 "arg-relative-bin-dir" --bin-dir bin --bundle "$work/bundle" --target own
+expect_rc2 "arg-legacy-launcher" --launcher "$stub" --bundle "$work/bundle" --target own
+expect_rc2 "arg-bin-dir-missing-supervisor" --bin-dir "$work" --bundle "$work/bundle" --target own
+expect_rc2 "arg-missing-bin-dir" --bundle "$work/bundle" --target own
 expect_rc2 "arg-count-zero" "${base[@]}" --count 0
 expect_rc2 "arg-count-over-limit" "${base[@]}" --count 1025
 expect_rc2 "arg-count-leading-zero" "${base[@]}" --count 08
 expect_rc2 "arg-trials-zero" "${base[@]}" --trials 0
-expect_rc2 "arg-bad-target" --launcher "$stub" --bundle "$work/bundle" --target 'Bad Target'
-expect_rc2 "arg-missing-target" --launcher "$stub" --bundle "$work/bundle"
+expect_rc2 "arg-bad-target" --bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/bundle" --target 'Bad Target'
+expect_rc2 "arg-missing-target" --bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/bundle"
 expect_rc2 "arg-mode-docker-with-launcher" "${base[@]}" --mode docker
 expect_rc2 "arg-proc-root-without-env" "${base[@]}" --proc-root "$work/fake"
-expect_rc2 "arg-bad-bundle" --launcher "$stub" --bundle "$work/nonexistent" --target own
+expect_rc2 "arg-bad-bundle" --bin-dir "$work/bin" --systemd-run "$work/systemd-run" --bundle "$work/nonexistent" --target own
 expect_rc2 "arg-bad-format" "${base[@]}" --format yaml
 expect_rc2 "arg-unknown" "${base[@]}" --bogus
 expect_rc2 "arg-output-dir" "${base[@]}" --output "$work"

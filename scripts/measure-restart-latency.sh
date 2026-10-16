@@ -1,29 +1,48 @@
 #!/usr/bin/env bash
 # restart レイテンシ実機実測スクリプト（TASK-160・SUP-3・MS-9。実測・合否判定は #491・TASK-160.h1 で人間が行う）。
 #
-# 役割: バックオフ 0 の restart ポリシー下で、コンテナ側プロセスを SIGKILL してから supervisor が新しい
-# コンテナを起動し終えるまでのレイテンシを複数試行計測し、中央値・p95 を JSON で出力する。
-# SUP-3 の目標は「バックオフ 0 の再起動レイテンシ中央値 100ms 以下」（PoC-17 own 実測: 中央値 1.79ms・
-# p95 2.29ms）。本スクリプトは合否を出さない（目標値との比較・レポート化は #491 の担当）。
-# 実装済みを装わない（REPAIR-3）: 製品バイナリ（TASK-79 の CLI・本番 launcher）は未提供のため現時点では
-# 実測できない。CI で動かすのはスタブ launcher の自己テスト scripts/measure-restart-latency-selftest.sh のみ。
+# 役割: restart ポリシー下で、コンテナ側プロセスを SIGKILL してから supervisor が新しいコンテナを起動し終えるまでの
+# レイテンシを複数試行計測し、中央値・p95 を JSON で出力する。supervisor の bin にはバックオフを指定する引数が無く
+# （既定 100ms 固定。crates/supervisor/src/restart.rs の DEFAULT_BACKOFF）、計測値にはバックオフが含まれる。
+# 本スクリプトは生の値（observed・supervisor_reported）に加え、バックオフを差し引いた値（*_minus_backoff）も出す。
+# SUP-3 の目標は「バックオフ 0 の再起動レイテンシ中央値 100ms 以下」（PoC-17 own 実測: 中央値 1.79ms・p95 2.29ms）。
+# 本スクリプトは合否を出さない（目標値との比較・レポート化は #491 の担当）。
+# 実装済みを装わない（REPAIR-3）: 製品バイナリ（CLI・supervisor の bin。#1717・#1819）は提供済みだが、restart の
+# 再 launch は本番 launcher で拒否される（#2043）。#2043 が入るまで試行は再起動未観測（終了コード 1）になり数値は出ない。
+# CI で動かすのはスタブの自己テスト scripts/measure-restart-latency-selftest.sh のみ。
 #
 # 呼び出し元: Makefile の `restart-latency`（操作者が明示実行。make ci には含めない）。sudo は呼ばない
 # （権限が要る場合は操作者が権限付きシェルから実行する）。crates/supervisor の restart ループ
 # （restart.rs の supervise_with_restart）と、state.json（crates/core の StateStore）を外から観測する。
+# supervisor は rootful 起動を拒否する（SEC-5）ため、非 root の利用者で実行する（root では起動前に終了コード 3）。
 #
-# launcher 契約（scripts/verify-supervisor-independence.sh と同一の暫定契約＋再起動用の 2 引数。
-# TASK-79 の CLI 確定後に起動行 build_launch_cmd だけ合わせる）:
-#   <launcher> run --id <id> --bundle <bundle> --restart <policy> --restart-backoff-ms 0
-#   をフォアグラウンドで実行（配列で直接 exec。eval・sh -c を使わない）。起動完了で標準出力に `READY` だけの
-#   行を出し、環境変数 FANDHE_BENCH_OWNER の実行ごとのトークンを受け取る。停止は SIGTERM、期限超過で SIGKILL。
-#   コンテナ側プロセスは launcher の子孫で、state.json（<state-root>/<id>/state.json。camelCase の
-#   status・pid・restartCount）に実行中 pid と再起動回数を反映する。
-#   状態保存先: 環境変数 FANDHE_BENCH_STATE_ROOT に state.json 群の親ディレクトリ（<state-root>）の絶対パスを渡す
-#   （--state-root 指定時はその値。省略時は本スクリプトが決めた既定の場所。root で省略時は /run/fandhe-container）。
-#   launcher は state.json をこの下の <id>/state.json へ書く。
+# 起動契約（crates/supervisor/src/start_contract.rs。差し替え点は build_launch_cmd・sup_create・sup_report）:
+#   1. <bin-dir>/fandhe-container --root <状態ルート> create --bundle <bundle> <id> を済ませる。
+#   2. <systemd-run> --user --scope --quiet -p Delegate=yes -- <bin-dir>/fandhe-container-supervisor start --root <状態ルート>
+#      --restart <policy> <id> をフォアグラウンドで実行（配列で直接 exec。eval・sh -c を使わない。--scope は同じ
+#      プロセスのまま exec する。supervisor は親 cgroup に自分だけがいることを要求するため新しいスコープへ入れる）。
+#      標準出力は名前付き FIFO にする（supervisor は FIFO 以外の標準出力を拒否する）。環境変数 FANDHE_BENCH_OWNER の
+#      実行ごとのトークンを渡す。停止は SIGTERM、期限超過で SIGKILL。
+#   3. 結果は標準出力の 1 行 `FCSUP1 OK <pid>`（pid はコンテナ側 init のホスト上 pid。state.json の pid と一致する）か
+#      `FCSUP1 ERR <CODE> <exit> <msg>`。
+#   CLI の start を経由しない理由: CLI の start は supervisor を別プロセスグループで起動し、標準エラー（restart の
+#   構造化ログ）を捨て、--restart を渡さず、子として wait しない。直接起動すれば supervisor が本スクリプトの
+#   直接の子になり、子孫の帰属証明と後始末が成立する。
+#   コンテナ側プロセスは supervisor の子孫で、state.json（<状態ルート>/<id>/state.json。camelCase の
+#   status・pid・restartCount）に実行中 pid と再起動回数が反映される。状態ルートは --state-root の値、省略時は
+#   本スクリプトが mktemp で作る 0700 のディレクトリ（実行後に削除する。CLI の delete は呼ばない）。
 #   restart のたびに構造化ログ {"component":"supervisor.monitor","operation":"restart","result":"ok",
-#   "elapsed_us":N} を標準エラーへ出す（任意。無ければ supervisor_reported は null）。
+#   "elapsed_us":N} が標準エラーへ出る（無ければ supervisor_reported は null）。--bundle は計測専用の使い捨てを使う。
+#   標準エラーはファイルへ記録する。ulimit での肥大化防止は、コンテナへ継承され計測条件が変わるため行わない
+#   （supervisor の標準エラーは restart・終了ごとの行だけで、全体期限が上限になる）。
+#
+# バックオフの差し引き（SUP-3）: supervisor の bin にバックオフ引数は無い。製品の引数を足す案は spec の確認が要るため
+#   足さず、定数 supervisor_backoff_ms（DEFAULT_BACKOFF と同値。自己テストが restart.rs と機械照合する）を
+#   両系列の各値から引いた値を *_minus_backoff として出す。supervisor は backoff 以上眠る（sleep_unless_stopped は
+#   現在時刻が開始 + backoff に達するまで待つ）ので、差し引いた値は「バックオフを除いた遅延の上側の推定」
+#   （寝過ごし分を含む保守側）になる。差し引いた結果が負なら計測異常として終了コード 1 にする。
+#   両系列とも区間にバックオフを含む（observed は SIGKILL から state.json 更新まで、supervisor_reported の
+#   elapsed_us は終了検知から Running 記録完了まで）。observed は終了検知のポーリング粒度も含む。
 #
 # 計測区間（出力 method にも明記）:
 #   observed            : コンテナ側プロセスへ SIGKILL を送る直前 → state.json が status=running・pid 変化・
@@ -36,23 +55,22 @@
 #   net_setup_timing.sh の p90 式とは別物）。
 #
 # 使い方:
-#   measure-restart-latency.sh --launcher <絶対パス> --bundle <dir>
+#   measure-restart-latency.sh --bin-dir <絶対パス> --bundle <dir> [--systemd-run <絶対パス（既定 /usr/bin/systemd-run）>]
 #       [--trials N（1〜200。既定 20＝PoC-17）] [--warmup W（0〜20。既定 1。集計から除外）]
 #       [--timeout SECS（各待機の上限 1〜600。既定 30）] [--policy on-failure|always（既定 on-failure）]
 #       [--state-root <絶対パス>] [--poll-us N（100〜100000。既定 1000）] [--settle-ms N（0〜5000。既定 50）]
 #       [--label STR] [--id-prefix STR（既定 fc-restart-lat）] [--output FILE（新規ファイルのみ）]
-#       [--print-budget（実行全体の所要時間の上限〔秒〕だけを出して終了。launcher は起動しない）] [--help]
-#   --state-root 省略時: 非 root は一時ディレクトリを XDG_RUNTIME_DIR として launcher に渡す。root は
-#   /run/fandhe-container を読む（crates/core の解決規則と同じ）。
+#       [--print-budget（実行全体の所要時間の上限〔秒〕だけを出して終了。supervisor は起動しない）] [--help]
+#   --state-root 省略時: 本スクリプトが作る一時ディレクトリを --root に渡す。指定時はそのディレクトリを --root に使う。
 #
 # 出力: JSON（標準出力。--output 指定時はそのファイル）。launcher・bundle・state-root のパス、cmdline、環境変数は出さない。
 #   結果は後始末の成功を確認した後にだけ公開する（失敗・中断・後始末失敗では標準出力・--output とも出さない）。
-# 終了コード: 0 = 成功 / 1 = 計測失敗（READY なし・期限切れ・再起動未観測・時計変更・launcher 異常終了・想定外の
+# 終了コード: 0 = 成功 / 1 = 計測失敗（FCSUP1 OK なし・期限切れ・再起動未観測・時計変更・launcher 異常終了・想定外の
 #   内部エラー）/ 2 = 引数・入力・出力先エラー / 3 = 前提欠如（非 Linux・bash 5 未満・jq・/proc。0 で合格に見せない）/
-#   4 = 後始末失敗（残存プロセス・帰属を証明できない生存 pid。最優先）/ 129・130・143 = HUP・INT・TERM による中断
+#   4 = 後始末失敗（残存プロセス・帰属を証明できない生存 pid・報告 pid か state.json の pid を記録できず追跡不能な場合。launcher の生存を問わない。最優先）/ 129・130・143 = HUP・INT・TERM による中断
 #   （後始末の完了後）。set -e による想定外の中断は、そのコマンドの終了コードに関わらず 1 に正規化する。
-# 期限: 各待機（READY・running・試行ごとの再起動観測）は --timeout を上限とし、単調時計（/proc/uptime）で判定する。
-#   実行全体の上限は --print-budget の値（既定の 20 試行・warmup 1・--timeout 30 で 813 秒）。本スクリプト自身は
+# 期限: 各待機（create・FCSUP1・running・試行ごとの再起動観測）は --timeout を上限とし、単調時計（/proc/uptime）で判定する。
+#   実行全体の上限は --print-budget の値（既定の 20 試行・warmup 1・--timeout 30 で 843 秒）。本スクリプト自身は
 #   全体期限を持たないので、外側で timeout をかける場合はこの値以上にする（Makefile の restart-latency は未指定時に
 #   この値を使う）。
 # 新プロセスの検証: 観測時と確定時に、新 pid が生存し（ゾンビ除外）launcher の子孫で、起動時刻が一致することを
@@ -81,7 +99,9 @@
 #   - 起動時刻（/proc/<pid>/stat の field 22）は 1/100 秒刻み。同じ刻みの中で pid が再利用された場合は区別できない。
 #   - 検出できない残存: トークンを継承せず、launcher 停止前の子孫スナップショットにも state.json にも現れない
 #     プロセス（スナップショット後に生まれた孤児・launcher が記録前に異常終了した場合の孤児）は検出できない。
-#     launcher が子孫を 1 度も記録できないまま終了した場合は標準エラーへ note を出す。
+#     コンテナの init（supervisor の報告 pid・state.json の pid）を記録できないまま後始末へ入った場合は（launcher の生存を問わない）、一時的な
+#     中間プロセスを記録済みでもコンテナ全体を追跡できた証明にせず、終了コード 4 にして状態を残す。ただし、
+#     報告も state.json の pid も出る前に生まれた init は観測できない（原理的な制約）。
 #   - 本スクリプト自身が SIGKILL された場合（外側 timeout の --kill-after を含む）は後始末できない。launcher は
 #     setsid で別 session にあり、外側 timeout のシグナルは届かないため残存し得る。
 set -euo pipefail
@@ -103,7 +123,8 @@ usage() {
   sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
 }
 
-launcher=""
+bin_dir=""
+systemd_run="/usr/bin/systemd-run"
 bundle=""
 trials=20
 warmup=1
@@ -121,7 +142,9 @@ need_val() { [ "$1" -ge 2 ] || { err "invalid-argument" "$2 requires a value"; e
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --launcher) need_val $# "$1"; launcher="$2"; shift 2 ;;
+    --bin-dir) need_val $# "$1"; bin_dir="$2"; shift 2 ;;
+    --systemd-run) need_val $# "$1"; systemd_run="$2"; shift 2 ;;
+    --launcher) err "invalid-argument" "--launcher was replaced by --bin-dir"; exit 2 ;;
     --bundle) need_val $# "$1"; bundle="$2"; shift 2 ;;
     --trials) need_val $# "$1"; trials="$2"; shift 2 ;;
     --warmup) need_val $# "$1"; warmup="$2"; shift 2 ;;
@@ -150,25 +173,27 @@ check_range "--timeout" "$timeout_s" 1 600
 check_range "--poll-us" "$poll_us" 100 100000
 check_range "--settle-ms" "$settle_ms" 0 5000
 # --print-budget: 実行全体の所要時間の上限（秒）だけを出して終わる（launcher は起動しない）。外側の timeout
-# （Makefile の restart-latency）はこの値を使う。内訳は「READY・running・各試行の待機 = (試行数 + 2) × --timeout」
+# （Makefile の restart-latency）はこの値を使う。内訳は「create・FCSUP1・running・各試行の待機 = (試行数 + 3) × --timeout」
 # ＋「試行ごとの settle（秒へ切り上げ）と検証・子孫記録の余裕 2 秒」＋「後始末 60 秒（do_cleanup の上限約 20 秒に余裕）」。
 if [ "$print_budget" -eq 1 ]; then
-  printf '%s\n' "$(((trials + warmup + 2) * timeout_s + (trials + warmup) * ((settle_ms + 999) / 1000 + 2) + 60))"
+  printf '%s\n' "$(((trials + warmup + 3) * timeout_s + (trials + warmup) * ((settle_ms + 999) / 1000 + 2) + 60))"
   exit 0
 fi
-[ -n "$launcher" ] || { err "invalid-argument" "--launcher is required"; exit 2; }
+[ -n "$bin_dir" ] || { err "invalid-argument" "--bin-dir is required"; exit 2; }
 [ -n "$bundle" ] || { err "invalid-argument" "--bundle is required"; exit 2; }
 case "$policy" in on-failure | always) ;; *) err "invalid-argument" "--policy must be on-failure or always"; exit 2 ;; esac
 [[ "$id_prefix" =~ $id_re ]] || { err "invalid-argument" "--id-prefix must match [A-Za-z0-9_-]{1,32}"; exit 2; }
 if [ -n "$label" ] && ! [[ "$label" =~ $label_re ]]; then
   err "invalid-argument" "--label must match [A-Za-z0-9._-]{1,64}"; exit 2
 fi
-case "$launcher" in /*) ;; *) err "invalid-argument" "--launcher must be an absolute path"; exit 2 ;; esac
+case "$bin_dir" in /*) ;; *) err "invalid-argument" "--bin-dir must be an absolute path"; exit 2 ;; esac
+case "$systemd_run" in /*) ;; *) err "invalid-argument" "--systemd-run must be an absolute path"; exit 2 ;; esac
 if [ -n "$state_root" ]; then
   case "$state_root" in /*) ;; *) err "invalid-argument" "--state-root must be an absolute path"; exit 2 ;; esac
 fi
-case "$launcher$bundle$state_root$output" in *$'\n'*) err "invalid-argument" "paths must not contain newlines"; exit 2 ;; esac
+case "$bin_dir$systemd_run$bundle$state_root$output" in *$'\n'*) err "invalid-argument" "paths must not contain newlines"; exit 2 ;; esac
 [ -d "$bundle" ] || { err "invalid-argument" "--bundle is not a directory"; exit 2; }
+bundle="$(cd -- "$bundle" && pwd -P)" || { err "invalid-argument" "--bundle cannot be resolved"; exit 2; }
 [ -z "$state_root" ] || [ -d "$state_root" ] || { err "invalid-argument" "--state-root is not a directory"; exit 2; }
 
 # 祖先を含むディレクトリが他ユーザーに差し替えられないこと（verify-supervisor-independence.sh と同じ規則）。
@@ -203,19 +228,28 @@ if [ -n "$state_root" ] && ! path_chain_is_safe "$state_root"; then
   err "invalid-argument" "--state-root and the directories above it must be symlink-free, owned by you or root, and not writable by others (unless sticky)"
   exit 2
 fi
-if [ -L "$launcher" ] || [ ! -f "$launcher" ] || [ ! -x "$launcher" ]; then
-  err "invalid-argument" "--launcher must be an executable regular file (not a symlink)"
-  exit 2
-fi
 uid_now="$(id -u)"
-if [ -z "$(find -P "$launcher" -maxdepth 0 -type f \( -user "$uid_now" -o -user 0 \) ! -perm -0020 ! -perm -0002 -print 2>/dev/null)" ]; then
-  err "invalid-argument" "--launcher must be owned by you or root and not writable by group or others"
-  exit 2
-fi
-if ! path_chain_is_safe "$(dirname -- "$launcher")"; then
-  err "invalid-argument" "the directories above --launcher must be symlink-free, owned by you or root, and not writable by others (unless sticky)"
-  exit 2
-fi
+# 起動する 3 つの実行ファイル（CLI・supervisor の bin・systemd-run）を他ユーザーが差し替えられないこと。bin-dir 内は固定名で
+# 解決し PATH 探索はしない。非 symlink の通常ファイルで実行可能・所有者が実行ユーザーか root・group / other 書き込み不可・祖先も安全。
+check_exe() { # <表示名> <パス>
+  if [ -L "$2" ] || [ ! -f "$2" ] || [ ! -x "$2" ]; then
+    err "invalid-argument" "$1 must be an executable regular file (not a symlink)"
+    exit 2
+  fi
+  if [ -z "$(find -P "$2" -maxdepth 0 -type f \( -user "$uid_now" -o -user 0 \) ! -perm -0020 ! -perm -0002 -print 2>/dev/null)" ]; then
+    err "invalid-argument" "$1 must be owned by you or root and not writable by group or others"
+    exit 2
+  fi
+  if ! path_chain_is_safe "$(dirname -- "$2")"; then
+    err "invalid-argument" "the directories above $1 must be symlink-free, owned by you or root, and not writable by others (unless sticky)"
+    exit 2
+  fi
+}
+cli_bin="${bin_dir}/fandhe-container"
+sup_bin="${bin_dir}/fandhe-container-supervisor"
+check_exe "fandhe-container in --bin-dir" "$cli_bin"
+check_exe "fandhe-container-supervisor in --bin-dir" "$sup_bin"
+check_exe "--systemd-run" "$systemd_run"
 
 if [ -n "$output" ]; then
   # 既存のパス（symlink・ディレクトリを含む）は拒否し上書きしない。公開は ln -T で「存在しない場合だけ作成」。
@@ -241,16 +275,22 @@ fi
 # --- 前提確認（欠如は 3。0 を返して合格に見せない） ---
 if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then err "unsupported-os" "bash 5 or later is required"; exit 3; fi
 if [ "$(uname -s 2>/dev/null || true)" != "Linux" ]; then err "unsupported-os" "only Linux is supported"; exit 3; fi
-for req in mktemp ln grep sleep kill uname od tr jq setsid env rm mkfifo; do
+for req in mktemp ln grep sleep kill uname od tr jq setsid env rm mkfifo timeout; do
   command -v "$req" >/dev/null 2>&1 || { err "unsupported-os" "$req is required"; exit 3; }
 done
 [ -r /proc/self/stat ] && [ -r /proc/uptime ] || { err "unsupported-os" "/proc is required"; exit 3; }
+# supervisor は rootful 起動を拒否する（SEC-5）。0 を返して合格に見せないよう起動前に 3 で止める。
+if [ "$uid_now" -eq 0 ]; then err "unsupported-os" "supervisor rejects rootful start (SEC-5); run as a non-root user"; exit 3; fi
+# supervisor の既定バックオフ（crates/supervisor/src/restart.rs の DEFAULT_BACKOFF。自己テストが同値を機械照合する）。
+readonly supervisor_backoff_ms=100
 
 # --- 状態 ---
 workdir=""
 owner_tok=""
 launcher_pid=""
 launcher_start=""
+outfd=""
+report_pid=""
 intended_rc=""
 in_launch=0
 pending_rc=""
@@ -258,6 +298,7 @@ reported="null"
 reported_err=0
 collect_log=0
 snap_seen=0
+keep_state=0
 last_snap_cs=0
 # 本計測への帰属を証明済みのプロセスの「pid → 起動時刻」（試行で kill 対象にしたコンテナ側プロセスと、launcher の
 # 生存中に採取した子孫のスナップショット）。後始末で全件を同一性照合のうえ回収する。
@@ -415,8 +456,22 @@ snapshot_descendants() {
     ok["$p"]=1
     track_pid "$p" "${ss[$p]}"
   done
-  snap_seen=1
+  # 「観測済み」にできるのは、コンテナの init（supervisor が報告した pid・state.json の pid）を記録できたときだけ。
+  # 一時的な中間プロセスを 1 件記録しただけでは、コンテナ全体を追跡できた証明にならない（untracked の fail-closed を
+  # 飛ばさないため。SUP-5）。
+  if init_tracked; then snap_seen=1; fi
   return 0
+}
+
+# コンテナの init（FCSUP1 OK の報告 pid か state.json の pid）の同一性（pid・起動時刻）を tracked へ記録済みなら 0。
+# state.json を読み直す（ST_* を更新する。呼び出し側は read_state し直してから ST_* を使う）。
+init_tracked() {
+  local ip
+  read_state || true
+  for ip in "$report_pid" "${ST_PID:-}"; do
+    if [ -n "$ip" ] && [ -n "${tracked[$ip]:-}" ]; then return 0; fi
+  done
+  return 1
 }
 
 # 待機ループから呼ぶ間引きつきスナップショット（0.2 秒に 1 回まで）。launcher が途中で異常終了しても、
@@ -456,11 +511,34 @@ validate_state_strict() { # <観測した新 pid> <期待 restartCount>
     <<<"$ST_RAW" >/dev/null 2>&1
 }
 
-# launcher 起動行。TASK-79 の CLI 確定時はここだけ合わせる（暫定契約）。
+# 起動契約の差し替え点（根拠は冒頭コメント）。supervisor の起動行を LAUNCH_CMD へ組む。
 build_launch_cmd() {
   local pol="$policy"
   [ "$policy" = "always" ] || pol="on-failure:$((trials + warmup))"
-  LAUNCH_CMD=("$launcher" run --id "$container_id" --bundle "$bundle" --restart "$pol" --restart-backoff-ms 0)
+  LAUNCH_CMD=("$systemd_run" --user --scope --quiet -p Delegate=yes -- "$sup_bin" start --root "$state_dir" --restart "$pol" "$container_id")
+}
+
+# create を期限付きで実行する（REPAIR-5）。失敗は終了コードだけを出す（出力・パスは出さない）。
+sup_create() {
+  local rc=0
+  timeout --kill-after=5 "$timeout_s" "$cli_bin" --root "$state_dir" create --bundle "$bundle" "$container_id" </dev/null >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 0 ] || fail "create failed (exit $rc)"
+}
+
+# 結果チャネル（FIFO）から FCSUP1 の 1 行を読み、OK なら report_pid を記録して 0。ERR・書式不正は計測失敗。未到着は 1。
+sup_report() {
+  local line=""
+  [ -z "$report_pid" ] || return 0
+  IFS= read -r -n 640 -t 0.01 -u "$outfd" line || true
+  [ -n "$line" ] || return 1
+  if [[ "$line" =~ ^FCSUP1\ OK\ ([1-9][0-9]{0,9})$ ]]; then
+    report_pid="${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ "$line" =~ ^FCSUP1\ ERR\ ([A-Z_]{1,32})\ ([0-9]{1,3})\  ]]; then
+    fail "supervisor reported ERR ${BASH_REMATCH[1]} (exit ${BASH_REMATCH[2]})"
+  fi
+  fail "supervisor printed an unrecognized report line"
 }
 
 # launcher ログから副系列を集計する（launcher 停止後に do_cleanup から呼ぶ。非信頼入力として値域を検証し、
@@ -559,15 +637,19 @@ tracked_alive() {
 # 回収。戻り値 0 = 回収確認済み / 非 0 = 残存または帰属不明（呼び出し側が終了コード 4 にする）。
 # 所要時間の上限は約 20 秒（launcher の停止待ち 5 + 2 秒、回収の再試行 5 秒、/proc 走査）。--print-budget は 60 秒を見込む。
 do_cleanup() {
-  local i d p rc=0
+  local i d p rc=0 untracked=0
   [ "$cleaned" -eq 0 ] || return 0
   cleaned=1
   trap '' INT TERM HUP
   # 1. launcher の生存中に子孫を記録する（停止後は親子関係を辿れない）。
-  if launcher_ok; then
-    snapshot_descendants || true
-  elif [ -n "$launcher_pid" ] && [ "$snap_seen" -eq 0 ]; then
-    printf 'note: the launcher exited before its process tree could be recorded; leftovers that neither inherit the owner token nor appear in state.json cannot be detected\n' >&2 || true
+  if launcher_ok; then snapshot_descendants || true; fi
+  if [ -n "$launcher_pid" ] && [ "$snap_seen" -eq 0 ]; then
+    # コンテナの init（報告 pid・state.json の pid）を記録できていない。launcher の生存・FCSUP1 ERR の報告・
+    # 一時的な中間プロセスの観測は、init の追跡も未生成も証明しない（最後のスナップショットの後に init が生まれ、
+    # その直後に launcher を止める順序が成立する。製品の start_contract.rs は ERR を後始末より先に報告し、
+    # start_entry.rs には未回収ハンドルを伴う失敗経路もある。init は所有トークンも継承しない）。後段で init の帰属を
+    # 証明できなければ、追跡不能として終了コード 4 にし、手動回収のため状態を残す（SUP-5）。
+    untracked=1
   fi
   # 2. launcher を止める（同一性を確認できる間だけ送る。先に終了して PID が再利用されていれば送らない）。
   if launcher_ok; then
@@ -602,6 +684,13 @@ do_cleanup() {
   # 6. 最終確認。再試行の後に現れたものを含め、所有・追跡済みプロセスが 1 つでも生存していれば残存。
   owned_scan
   if [ "${#OWNED[@]}" -gt 0 ] || tracked_alive; then rc=4; fi
+  # 追跡不能の確定は init の記録の有無だけで行う。中間プロセスの記録や所有トークンの観測（init は継承しない）は
+  # コンテナ全体の追跡の証明にならない。attribute_suspects が init を帰属させていれば init_tracked が真になる。
+  if [ "$untracked" -eq 1 ] && ! init_tracked; then
+    printf 'warning: the launcher exited before the container init was recorded; container-side processes cannot be tracked (state kept at %s)\n' "${workdir:-<none>}" >&2 || true
+    rc=4
+    keep_state=1
+  fi
   if [ -n "$launcher_pid" ]; then
     if launcher_ok; then
       rc=4
@@ -611,7 +700,12 @@ do_cleanup() {
       wait "$launcher_pid" 2>/dev/null || true
     fi
   fi
-  [ -z "$workdir" ] || rm -rf -- "$workdir" 2>/dev/null || true
+  # 回収失敗（rc=4）の全経路で作業ディレクトリを残し、手動回収のため場所を通知する（SUP-5）。
+  if [ "$rc" -eq 4 ] && [ -n "$workdir" ] && [ "${keep_state:-0}" -eq 0 ]; then
+    keep_state=1
+    printf 'warning: cleanup incomplete; state kept at %s\n' "$workdir" >&2 || true
+  fi
+  if [ -n "$workdir" ] && [ "${keep_state:-0}" -eq 0 ]; then rm -rf -- "$workdir" 2>/dev/null || true; fi
   if [ -n "$state_root" ] && [ -n "$container_id" ] && [ "$rc" -eq 0 ]; then
     # --state-root は操作者の領域。<id>/ は削除しない（残置を通知する）。
     printf 'note: left state entry for id %s under --state-root (operator-owned)\n' "$container_id" >&2 || true
@@ -665,17 +759,11 @@ owner_tok="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 rand8="$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
 [[ "$rand8" =~ ^[0-9a-f]{8}$ ]] || { err "unsupported-os" "cannot generate a container id"; finish 3; }
 container_id="${id_prefix}-${rand8}"
-launcher_env=()
 if [ -n "$state_root" ]; then
   state_dir="$state_root"
-  launcher_env=("FANDHE_BENCH_STATE_ROOT=$state_root")
-elif [ "$uid_now" -eq 0 ]; then
-  state_dir="/run/fandhe-container"
-  launcher_env=("FANDHE_BENCH_STATE_ROOT=$state_dir")
 else
-  mkdir -m 0700 "$workdir/xdg"
-  launcher_env=("XDG_RUNTIME_DIR=$workdir/xdg" "FANDHE_BENCH_STATE_ROOT=$workdir/xdg/fandhe-container")
-  state_dir="$workdir/xdg/fandhe-container"
+  state_dir="$workdir/state"
+  mkdir -m 0700 "$state_dir"
 fi
 state_file="$state_dir/$container_id/state.json"
 printf -v poll_s '0.%06d' "$poll_us"
@@ -683,11 +771,14 @@ printf -v settle_s '%d.%03d' "$((settle_ms / 1000))" "$((settle_ms % 1000))"
 total=$((trials + warmup))
 
 build_launch_cmd
+sup_create
+# 結果チャネルは FIFO（supervisor は FIFO 以外の標準出力を拒否する）。読み手を先に RDWR で開く。
+mkfifo "$workdir/out.fifo"
+exec {outfd}<>"$workdir/out.fifo"
 in_launch=1
 (
-  ulimit -f 4096 2>/dev/null || true # 標準エラーの肥大化を 4 MiB で止める（超過で launcher が止まり計測失敗）
-  exec setsid env "FANDHE_BENCH_OWNER=$owner_tok" "${launcher_env[@]}" "${LAUNCH_CMD[@]}" \
-    >"$workdir/out.log" 2>"$workdir/err.log" </dev/null
+  exec setsid env "FANDHE_BENCH_OWNER=$owner_tok" "${LAUNCH_CMD[@]}" \
+    >"$workdir/out.fifo" 2>"$workdir/err.log" </dev/null
 ) &
 launcher_pid=$!
 # 直接の子（親が $$）であることを確かめてから起動時刻を記録する。以後の同一性照合はこの記録だけを根拠にする。
@@ -711,11 +802,12 @@ deadline_wait() { # <説明> : 条件関数 "$@" が真になるまで --timeout
 }
 
 # shellcheck disable=SC2329 # deadline_wait へ関数名で渡す
-ready_seen() { grep -qx 'READY' "$workdir/out.log" 2>/dev/null; }
+ready_seen() { sup_report; }
 running_seen() { read_state && [ "$ST_STATUS" = "running" ] && [ -n "$ST_PID" ]; }
 
-deadline_wait "READY" ready_seen
+deadline_wait "FCSUP1 OK" ready_seen
 deadline_wait "the container to be running in state.json" running_seen
+[ "$ST_PID" = "$report_pid" ] || fail "state.json pid differs from the pid reported by the supervisor"
 
 vals=()
 for ((n = 1; n <= total; n++)); do
@@ -800,22 +892,33 @@ stats_filter='
         values: ($s | map(. / 1000 | r3)) };
 '
 observed_json="$(printf '%s\n' "${vals[@]}" | jq -s "$stats_filter stats")"
+backoff_us=$((supervisor_backoff_ms * 1000))
+# バックオフを差し引いた系列（µs）。負の値は計測異常（supervisor は backoff 以上眠る）として失敗にする。
+minus_filter="$stats_filter map(. - $backoff_us) | if any(. < 0) then error(\"negative\") else stats end"
+observed_net_json="$(printf '%s\n' "${vals[@]}" | jq -s "$minus_filter" 2>/dev/null)" ||
+  fail "an observed latency is below the supervisor backoff (${supervisor_backoff_ms}ms); cannot subtract the backoff"
 if [ "$reported" = "null" ]; then
   reported_json="null"
+  reported_net_json="null"
 else
   reported_json="$(printf '%s\n' "$reported" | jq -s "$stats_filter stats")"
+  reported_net_json="$(printf '%s\n' "$reported" | jq -s "$minus_filter" 2>/dev/null)" ||
+    fail "a supervisor-reported latency is below the supervisor backoff (${supervisor_backoff_ms}ms); cannot subtract the backoff"
 fi
 
 result="$(jq -n \
-  --arg label "$label" --arg policy "$policy" \
+  --arg label "$label" --arg policy "$policy" --argjson backoff "$supervisor_backoff_ms" \
   --argjson trials "$trials" --argjson warmup "$warmup" \
-  --argjson observed "$observed_json" --argjson reported "$reported_json" '
+  --argjson observed "$observed_json" --argjson reported "$reported_json" \
+  --argjson observed_net "$observed_net_json" --argjson reported_net "$reported_net_json" '
   { schema: "fandhe-container.restart-latency/v1", behavior: "SUP-3", task: "TASK-160", unit: "ms",
-    label: $label, trials: $trials, warmup: $warmup, policy: $policy, backoff_ms: 0,
+    label: $label, trials: $trials, warmup: $warmup, policy: $policy, backoff_ms_assumed: $backoff,
     observed: $observed, supervisor_reported: $reported,
+    observed_minus_backoff: $observed_net, supervisor_reported_minus_backoff: $reported_net,
     method: {
-      observed: "SIGKILL to the container process until state.json shows running, a new pid and restartCount+1; includes the pre-signal identity check, signal delivery, exit detection and the polling granularity of this script (upper bound)",
-      supervisor_reported: "elapsed_us of the supervisor.monitor restart log line (exit detected until the new Running state is recorded); null when the launcher log does not provide trials+warmup ok lines",
+      observed: "SIGKILL to the container process until state.json shows running, a new pid and restartCount+1; includes the supervisor restart backoff, the pre-signal identity check, signal delivery, exit detection and the polling granularity of this script (upper bound)",
+      supervisor_reported: "elapsed_us of the supervisor.monitor restart log line (exit detected until the new Running state is recorded, including the restart backoff); null when the supervisor log does not provide trials+warmup ok lines",
+      backoff_subtraction: "the supervisor bin has no backoff argument (fixed default, backoff_ms_assumed); *_minus_backoff subtracts it from every sample. The supervisor sleeps at least the backoff, so the result is an upper estimate of the latency without the backoff (it includes any oversleep); a negative value is a measurement error",
       poc17_difference: "PoC-17 measured the next start time minus the previous end time recorded by a self-exiting workload, which is a different interval; do not compare the numbers directly",
       percentile: "nearest-rank ceil(n*95/100)-1 on sorted samples; median averages the two middle values for an even count" } }')"
 

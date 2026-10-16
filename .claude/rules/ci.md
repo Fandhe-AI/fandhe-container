@@ -72,7 +72,7 @@ macOS cold start 上乗せ確認（TASK-113.4・PLUG-6・MAC-2）は `benches/te
 10. `make idle-memory-supervised-selftest`（監視プロセス付きのアイドル時常駐メモリ計測の自己テスト。TASK-47・CORE-7・SUP-1）
 11. `make supervisor-independence-selftest`（監視プロセス独立性の実証スクリプトの自己テスト。TASK-162・SUP-5）
 12. `make supervisor-pss-selftest`（監視プロセス常駐メモリ計測スクリプト `scripts/bench/supervisor_pss.sh` の自己テスト。疑似 /proc のみ。TASK-158・SUP-2）
-13. `make restart-latency-selftest`（restart レイテンシ計測スクリプト `scripts/measure-restart-latency.sh` の自己テスト。スタブ launcher のみ。TASK-160・SUP-3）
+13. `make restart-latency-selftest`（restart レイテンシ計測スクリプト `scripts/measure-restart-latency.sh` の自己テスト。スタブ（CLI・systemd-run・supervisor）のみ。TASK-160・SUP-3）
 14. `make install-launcher-selftest`（特権ランチャーのインストールスクリプト `scripts/install-privileged-launcher.sh` の自己テスト。スタブ・一時ディレクトリのみで root 不要。TASK-171 追補・#1721・SUP-14）
 15. `make bench-check`（ベンチ実行・基準値比較。現状はプレースホルダの配線確認のみ）
 16. `make bench-plugin-boundary`（plugin 境界ベンチの計測と CORE-10 比のログ出力のみ。基準値比較なし。TASK-113.3）

@@ -39,7 +39,7 @@
 //! 未実装・簡易実装（REPAIR-3）:
 //! - logs の内容読み出し: コンテナログのディレクトリ契約が未決で、書き手（supervisor への stdout / stderr 受け渡し。
 //!   #1471・本番 launcher #1314）も未提供。読み出しの正規入口は supervisor 側にあり、`cli -> supervisor` の依存辺は
-//!   `docs/architecture.md` に無い（crate 境界の設計変更を要する）。確定後に実装する（CLI-1）。
+//!   #1718 で `docs/architecture.md` に確定したが、ログの読み出し契約は未決。確定後に実装する（CLI-1）。
 //! - list の JSON 出力・bundle 列: JSON を手組みしない（REPAIR-2）ため serde 系の配線か core の公開ライタが前提
 //!   （TASK-95・TASK-98）。
 //! - macOS / Windows は plugin 発見機構経由（TASK-79.4・PLUG-4）。非 Linux では状態ストアを開けず core 側が

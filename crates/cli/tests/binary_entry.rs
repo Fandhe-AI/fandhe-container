@@ -41,7 +41,16 @@ fn run(args: &[&str]) -> Output {
 
 /// [`run`] と同じ手順で、環境変数 `envs` を追加して起動する。
 fn run_env(args: &[&str], envs: &[(&str, &std::ffi::OsStr)]) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_fandhe-container"))
+    run_exe_env(
+        std::path::Path::new(env!("CARGO_BIN_EXE_fandhe-container")),
+        args,
+        envs,
+    )
+}
+
+/// [`run_env`] の実体。起動する実行ファイルを `exe` で指定する。
+fn run_exe_env(exe: &std::path::Path, args: &[&str], envs: &[(&str, &std::ffi::OsStr)]) -> Output {
+    let mut child = Command::new(exe)
         .args(args)
         // PATH 探索の opt-in を環境から持ち込まず、結果を決定的にする（PLUG-11）。
         .env_remove("FANDHE_CONTAINER_PLUGIN_PATH_SEARCH")
@@ -258,12 +267,33 @@ fn op_and_code(out: &Output) -> (String, String) {
     (field("op"), field("code"))
 }
 
-/// CLI-1・OCI-4・ERR-2: Linux で create → 状態ファイル作成（0）、重複は 4、未作成 start は 3、
-/// 作成済み start は本番 launcher 未提供のため 8（REPAIR-3）。
+/// 実バイナリを `CARGO_TARGET_TMPDIR` 配下の一意なディレクトリへ置き直す（hard link、失敗したらコピー）。
+///
+/// `start` は CLI 自身の実体パスの隣の固定名 `fandhe-container-supervisor` を起動するため、`target/debug/` に
+/// 兄弟の supervisor bin があるかどうかに結果が左右されないようにする（#1718）。
 #[cfg(target_os = "linux")]
-#[test]
-fn cli1_create_start_flow_on_linux() {
-    let tmp = TmpDir::new("flow");
+fn isolated_cli_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("fc-cli-iso-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let dst = dir.join("fandhe-container");
+    let src = env!("CARGO_BIN_EXE_fandhe-container");
+    if std::fs::hard_link(src, &dst).is_err() {
+        std::fs::copy(src, &dst).expect("copy cli");
+    }
+    dir
+}
+
+/// 置き直した CLI を起動する（[`run_exe_env`] の薄い別名）。
+#[cfg(target_os = "linux")]
+fn run_isolated(exe: &std::path::Path, args: &[&str]) -> Output {
+    run_exe_env(exe, args, &[])
+}
+
+/// 状態ルートに bundle と Created のコンテナ `c1` を作る。bundle の絶対パスを返す。
+#[cfg(target_os = "linux")]
+fn prepare_c1(tmp: &TmpDir, cli: &std::path::Path) -> (std::path::PathBuf, String) {
     let bundle = tmp.0.join("bundle");
     std::fs::create_dir_all(bundle.join("rootfs")).expect("rootfs");
     std::fs::write(
@@ -272,28 +302,127 @@ fn cli1_create_start_flow_on_linux() {
     )
     .expect("config");
     let root = tmp.0.join("state");
-    let root_s = root.to_str().expect("utf8");
-    let bundle_s = bundle.to_str().expect("utf8");
-
-    let out = run(&["--root", root_s, "create", "--bundle", bundle_s, "c1"]);
+    let root_s = root.to_str().expect("utf8").to_string();
+    let out = run_isolated(
+        cli,
+        &[
+            "--root",
+            &root_s,
+            "create",
+            "--bundle",
+            bundle.to_str().expect("utf8"),
+            "c1",
+        ],
+    );
     assert_failure_free(&out);
-    assert!(root.join("c1").join("state.json").exists());
+    (root, root_s)
+}
 
-    let out = run(&["--root", root_s, "create", "--bundle", bundle_s, "c1"]);
+/// 固定名のフェイクの supervisor（シェルスクリプト）を `dir` に置く。作成と chmod は子プロセスで行い、
+/// テストのプロセスが書き込み用の fd を持たないようにする（ETXTBSY の回避）。
+#[cfg(target_os = "linux")]
+fn install_fake_supervisor(dir: &std::path::Path, body: &str) {
+    let path = dir.join("fandhe-container-supervisor");
+    let status = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("cat > \"$1\" && chmod 755 \"$1\"")
+        .arg("install-fake")
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .and_then(|mut c| {
+            use std::io::Write;
+            c.stdin
+                .take()
+                .expect("stdin")
+                .write_all(format!("#!/bin/sh\n{body}\n").as_bytes())?;
+            c.wait()
+        })
+        .expect("install fake supervisor");
+    assert!(status.success());
+}
+
+/// CLI-1・OCI-4・ERR-2: Linux で create → 状態ファイル作成（0）、重複は 4、未作成 start は 3。
+/// 作成済み start は、CLI の隣に supervisor が無ければ FAILED_PRECONDITION（5。#1718）で、
+/// 状態は Created のまま一覧に出る（Running を残さない。#1541）。
+#[cfg(target_os = "linux")]
+#[test]
+fn cli1_create_start_flow_on_linux() {
+    let tmp = TmpDir::new("flow");
+    let dir = isolated_cli_dir("flow");
+    let cli = dir.join("fandhe-container");
+    let (root, root_s) = prepare_c1(&tmp, &cli);
+    assert!(root.join("c1").join("state.json").exists());
+    let bundle_s = tmp.0.join("bundle");
+    let bundle_s = bundle_s.to_str().expect("utf8");
+
+    let out = run_isolated(
+        &cli,
+        &["--root", &root_s, "create", "--bundle", bundle_s, "c1"],
+    );
     assert_eq!(out.status.code(), Some(4));
     assert_eq!(
         op_and_code(&out),
         ("create".into(), "ALREADY_EXISTS".into())
     );
 
-    let out = run(&["--root", root_s, "start", "nope"]);
+    let out = run_isolated(&cli, &["--root", &root_s, "start", "nope"]);
     assert_eq!(out.status.code(), Some(3));
     assert_eq!(op_and_code(&out), ("start".into(), "NOT_FOUND".into()));
 
-    let out = run(&["--root", root_s, "start", "c1"]);
+    let out = run_isolated(&cli, &["--root", &root_s, "start", "c1"]);
+    assert_eq!(out.status.code(), Some(5));
+    assert_eq!(
+        op_and_code(&out),
+        ("start".into(), "FAILED_PRECONDITION".into())
+    );
+    assert!(out.stdout.is_empty());
+
+    let out = run_isolated(&cli, &["--root", &root_s, "list"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ID\tSTATUS\tPID\nc1\tcreated\t-\n"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// SUP-1・CLI-1・ERR-2: 同じディレクトリのフェイクの supervisor が OK を報告すれば start は 0 で何も出さず、
+/// ERR（UNIMPLEMENTED）を報告すれば 8 と構造化エラーになる。どちらも CLI は状態を書かず、一覧は created のまま。
+#[cfg(target_os = "linux")]
+#[test]
+fn sup1_start_delegates_to_sibling_supervisor_on_linux() {
+    let tmp = TmpDir::new("sup");
+    let dir = isolated_cli_dir("sup");
+    let cli = dir.join("fandhe-container");
+    let (_root, root_s) = prepare_c1(&tmp, &cli);
+
+    install_fake_supervisor(&dir, "printf 'FCSUP1 OK 4242\\n'; exec sleep 1");
+    let out = run_isolated(&cli, &["--root", &root_s, "start", "c1"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty());
+    assert!(
+        out.stderr.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    install_fake_supervisor(
+        &dir,
+        "printf 'FCSUP1 ERR UNIMPLEMENTED 8 production process launcher is not available yet\\n'",
+    );
+    let out = run_isolated(&cli, &["--root", &root_s, "start", "c1"]);
     assert_eq!(out.status.code(), Some(8));
     assert_eq!(op_and_code(&out), ("start".into(), "UNIMPLEMENTED".into()));
     assert!(out.stdout.is_empty());
+
+    let out = run_isolated(&cli, &["--root", &root_s, "list"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ID\tSTATUS\tPID\nc1\tcreated\t-\n"
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// CLI-1・OCI-6・ERR-2: Linux で stop / delete が core を呼ぶ。未 create は 3、Created の stop は 5、

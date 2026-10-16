@@ -11,8 +11,10 @@
 //! # 契約の要点（呼び出し側の責務。詳細は `start_contract` の module doc）
 //! - argv: `start --root <状態ルートの絶対パス> <id>`（`--restart` は渡さず既定の `no`）。環境変数は契約に含まれないため、
 //!   `env_clear` の後に固定の `PATH` だけを渡す（ランチャー経由の起動と同じ環境）。cwd は `/`。
-//! - stdin は null、stdout は結果の pipe、stderr は null。supervisor の構造化ログは stderr へ出るが、CLI の stderr は
-//!   「失敗時に 1 行の JSON」という契約のため混ぜず、受け手を置かない（保存先は未整備。下記）。
+//! - stdin は null、stdout は結果の pipe、stderr は null。CLI の stderr は「失敗時に 1 行の JSON」という契約のため、
+//!   supervisor のログを混ぜず受け手も置かない。supervisor の構造化ログは supervisor 自身が `<root>/@supervisor-logs/<id>.log*`
+//!   へ保存する（サイズ上限・世代ローテーションつき。`fandhe_container_supervisor::supervisor_log`。#2067・REPAIR-4）。
+//!   `delete` が後始末する（`stop_delete`）。
 //! - `process_group(0)` で別のプロセスグループにし、端末の SIGINT / SIGHUP が supervisor に届かないようにする。
 //!
 //! # 期限と子の扱い（REPAIR-5）
@@ -27,7 +29,8 @@
 //!   （`PATH` 探索・環境変数・引数による上書きは作らない）。同一ユーザーで起動するため CLI と supervisor の間に権限の境界は無く、
 //!   実行ファイルの所有者・権限の fd 経由の検証は特権経路のランチャー（#1719）の責務とする。
 //! - rootful の特権起動でランチャー（`fandhe-container-launcher`）を選ぶ規則は未実装（#1719・#1722）。
-//! - supervisor の stderr（構造化ログ）の保存先は未整備。
+//! - supervisor の fd 2 へ直接書かれるもの（core の診断・panic のメッセージ等）は保存されない（stderr が null のため捨てられる。
+//!   範囲は `supervisor_log` の「未実装・残余」。`legacy_tiocsti` の警告の届け方は #2008）。
 //! - 親から継承した CLOEXEC の無い fd は、直接起動では閉じられない（ランチャー経由の起動は fd 3 以降を閉じる）。
 //! - core の本番 launcher（#1715 の Phase B）が入るまで、supervisor は `UNIMPLEMENTED` を報告する。
 

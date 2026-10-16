@@ -13,7 +13,9 @@
 //!   `--restart` は任意で既定は `no`。各オプションは 1 回まで・順不同で、`<container-id>` は末尾の位置引数 1 個。
 //! - 環境変数は契約に含めない（supervisor は契約の値を環境から読まない）。
 //! - stdin は `/dev/null`、**stdout は結果を通知する pipe の書き込み端**（supervisor は報告を 1 行書いたら以後 stdout に
-//!   何も書かない）、stderr は呼び出し側が選ぶ（supervisor の構造化ログの出力先）。
+//!   何も書かない）、stderr は呼び出し側が選ぶ。supervisor の構造化ログは supervisor 自身が
+//!   `<root>/@supervisor-logs/` へ保存する（[`crate::supervisor_log`]。#2067）ので、呼び出し側の stderr へ行くのは fd 2 へ
+//!   直接書かれるもの（core の診断・panic 等。同モジュールの「未実装・残余」）だけで、null でもログは失われない。
 //! - supervisor は CLI より長く生きる（CORE-1・D-19）。端末の SIGINT / SIGHUP を受けないよう、CLI は
 //!   `CommandExt::process_group(0)` で別のプロセスグループにして spawn する。
 //!

@@ -9,6 +9,8 @@
 //! 0. 結果チャネルの検証（stdout が FIFO か。`run_main`）／1. argv の解析（[`crate::start_contract::StartArgs`]）／
 //! 2. スレッド数が 1 か（`oci_runtime::start` の前提。以後のスレッドは手順 3〜7 の作業スレッド〔入口は待つだけ〕と
 //!    手順 10 以降のログ捕捉・restart のワーカーに限る）／
+//!    2b. supervisor の構造化ログの保存先を開き、`stderr_sink` の書き先を差し替える（レコードがあるときだけ。スレッドを
+//!    作らない。失敗は fail-closed。保存先と上限は [`crate::supervisor_log`]。#2067・REPAIR-4）／
 //! 3. 状態の事前確認（Created・pid なし・cgroup 未記録。副作用なし）／4. [`StartDeps::check_launcher_available`]
 //!    （副作用なし。権限モデルと Landlock ABI を確かめ、満たさなければここで止まる）／5. cgroup の連鎖
 //!    （[`StartDeps::prepare_cgroup`]）／6. 監査 sink（[`StartDeps::build_audit_sink`]。fork の前）・ログ sink／
@@ -1899,6 +1901,24 @@ mod linux {
             .unwrap_or(false)
     }
 
+    /// 手順 2b: `id` のレコードがあるときだけ supervisor ログ（`<root>/@supervisor-logs/<id>.log`）を開き、
+    /// `stderr_sink` の書き先へ差し込む（#2067・REPAIR-4）。
+    ///
+    /// レコードが無い・読めない場合は何もせず先へ進む（詳細なエラーは手順 3 が報告する。打ち間違えた ID のために
+    /// `delete` で消せないログを作らない）。開くのに失敗したら呼び出し側が fail-closed で報告する（ログ喪失を黙って
+    /// 許さない。同じ ID の supervisor が生存中なら `FailedPrecondition`）。スレッドは作らない。
+    fn prepare_supervisor_log(
+        store: &Arc<dyn StateStore>,
+        root: &std::path::Path,
+        id: &ContainerId,
+    ) -> Result<(), TraitError> {
+        if store.get(&GetStateRequest::new(id.clone())).is_err() {
+            return Ok(());
+        }
+        let writer = crate::supervisor_log::open(root, id)?;
+        crate::stderr_sink::install_stderr_writer(Box::new(writer))
+    }
+
     /// supervisor の bin の入口（`src/main.rs` から呼ぶ）。`args` はプログラム名を除いた argv。
     ///
     /// 終了の前に、それまでの stderr のログが書かれるのを期限つきで待つ（読み手が止まっていても期限で終わる）。
@@ -1960,11 +1980,16 @@ mod linux {
             Err(e) => return fail(&mut out, op_err(e)),
         };
         let req = StartRequest::new(args.id.clone());
-        let deps = Box::new(ProductionStartDeps::new(args.root));
         // 回復・回収と報告の書き込みで同じ期限を共有し、報告を内部上限内に収める（REPAIR-5）。
         let deadline =
             Instant::now().checked_add(crate::start_contract::result_deadline(&timeouts));
         out.limit_until(deadline);
+        // 2b: supervisor の構造化ログの保存先を開き、stderr の出口の書き先を差し替える（#2067・REPAIR-4）。
+        // スレッドは作らない。開けなければ fail-closed で、手順 3 より前に止まる（何も動かさない）。
+        if let Err(e) = prepare_supervisor_log(&store, &args.root, &args.id) {
+            return fail(&mut out, op_err(e));
+        }
+        let deps = Box::new(ProductionStartDeps::new(args.root));
         let running = match run_start_until(
             deps,
             &store,

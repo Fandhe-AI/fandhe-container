@@ -15,6 +15,9 @@
 //!   不一致・削除の失敗はいずれも cgroup も状態記録も残したまま構造化エラーで失敗する（fail-closed。
 //!   OCI-6・CORE-3・SEC-1）。非 Linux では `UnavailableCgroupRemover` が `Unimplemented` で失敗する。
 //!
+//! `delete` は core の delete が成功した後に、supervisor の構造化ログ（`<root>/@supervisor-logs/<id>.log*`）を best effort で
+//! 消す（`remove_supervisor_log`。失敗は握り、成功時の stderr は空のまま。#2067・REPAIR-4・ERR-2）。
+//!
 //! 状態ルートが無ければ `production_runtime` の状態ストアを開く段階で親の下に 0700 で作る（親は作らない）。
 //! list / logs と同じ判断で、読み取り専用 open は足さない（理由は `list_logs` の module doc。#1607 E2）。
 //!
@@ -256,8 +259,23 @@ pub(super) fn run_delete(global: &GlobalArgs, args: &DeleteArgs) -> CliExit {
     let result = delete_container(rt.store.as_ref(), &rt.recorder, &remover, &req);
     export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
     match result {
-        Ok(_) => CliExit::Success,
+        Ok(_) => {
+            remove_supervisor_log(rt.store.as_ref(), &req);
+            CliExit::Success
+        }
         Err(e) => CliExit::Runtime(e),
+    }
+}
+
+/// core の `delete` が成功した後に、supervisor の構造化ログ（`<root>/@supervisor-logs/<id>.log*`）を best effort で消す
+/// （#2067・REPAIR-4）。
+///
+/// 失敗しても delete の結果は変えず、何も出力しない（成功時の stderr は空。ERR-2）。supervisor が生存中でロックを
+/// 取れない等で消せなかった分は、1 ID あたり世代数 × 上限（3 MiB）に収まり、同じ ID の次の start で世代として回される。
+/// core の delete より前には消さない（delete が失敗したとき稼働中のログを消さないため）。
+fn remove_supervisor_log(store: &dyn StateStore, req: &DeleteRequest) {
+    if let Some(root) = store.host_state_root() {
+        let _ = fandhe_container_supervisor::supervisor_log::remove(root, req.id());
     }
 }
 

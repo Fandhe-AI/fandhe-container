@@ -193,6 +193,10 @@ pub(crate) use launch_intermediate::{
     IntermediateSpec, LaunchTag, Rescan, rescan_unreported_init, spawn_container_via_intermediate,
 };
 pub(crate) use launch_status::LaunchAudit;
+/// 結合試験 `tests/launch_userns_audit.rs` 専用の再公開（SEC-4・SEC-5・REPAIR-10・#2072。通常の利用者は呼ばない）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use launch_status::relay_mount_binds_failure_for_test;
 /// supervisor の `SETUP_VIOLATIONS` との突き合わせ試験専用の再公開（SEC-4・SUP-6・#1579。通常の利用者は呼ばない）。
 #[doc(hidden)]
 pub use process::exec_child_violation_reasons;
@@ -425,8 +429,9 @@ pub fn record_exec_worker_rejection<E>(
 ///
 /// 呼び出し元は、子が状態 pipe で運んだ失敗を復号した親プロセス（`launch_status` の判定。将来は本番 launcher）。
 /// `reason` は `ViolationReason::from_launch_token` で引き直した値を渡す。種別 `mount_target`・
-/// `shared_propagation`・`rootfs_pivot` だけが層 `mount` のパスなし・理由コードつきのレコードになり
-/// （[`audit_mount_violation`] と同じ写像）、`establish_precondition`・`evidence_mismatch` は記録せず
+/// `shared_propagation`・`rootfs_pivot` と、bind mount の段の user namespace 由来の 2 理由
+/// （`user_namespace_required`・`host_root_identity_mapping`。SEC-5・#2072）だけが、層 `mount` の
+/// パスなし・理由コードつきのレコードになり（[`audit_mount_violation`] と同じ写像）、`establish_precondition`・`evidence_mismatch` は記録せず
 /// `NotApplicable`。時刻と PID は記録を行った親プロセスのもの（違反した子ではない）。パスは載らない。
 /// 記録の成否で `error` は変わらない（fail-closed）。
 pub fn record_launch_mount_rejection<E>(

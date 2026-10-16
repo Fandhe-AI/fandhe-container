@@ -169,6 +169,7 @@ impl std::fmt::Debug for ControlAuditRelay {
 
 impl ControlAuditRelay {
     /// `sink` を持つ helper を fork する。呼び出しプロセスが複数スレッドなら `FailedPrecondition`。
+    /// fork 直後に未回収の自分の子と確認できなければ `Unavailable`（pid を保持しない）。
     ///
     /// 呼び出し元: supervisor の `start`（制御チャネルの `install` の前、スレッドを作る前）。
     pub fn spawn(sink: FileAuditSink) -> Result<Self, TraitError> {
@@ -197,11 +198,13 @@ impl ControlAuditRelay {
         };
         // 回収前に開く（以後 pid が再利用されても元の子を指す）。
         // 開いた後に未回収の自分の子だと確かめる。SIGCHLD が SIG_IGN／SA_NOCLDWAIT だと fork から
-        // pidfd_open までの間に自動回収・PID 再利用が起き得るため、確認できない pidfd は保持しない
-        // （fail-closed。以後の送信は行わない。SUP-1・SEC-4）。
-        let pidfd = sys::pidfd_open(pid)
-            .ok()
-            .filter(|_| is_unreaped_own_child(sys::wait_pid_nohang(pid)));
+        // pidfd_open までの間に自動回収・PID 再利用が起き得る。確認できなければ helper は既に終了して
+        // いる（または自分の子でない）ため、pidfd も数値 pid も保持せず起動失敗にする（どの経路でも
+        // 送信・wait しない。fail-closed。回収済みなので回収の後始末は不要。SUP-1・SEC-4・CORE-1）。
+        let pidfd = sys::pidfd_open(pid).ok();
+        if !is_unreaped_own_child(sys::wait_pid_nohang(pid)) {
+            return Err(unavailable());
+        }
         Ok(Self {
             state: Mutex::new(State {
                 stream: parent,
@@ -307,6 +310,17 @@ impl Drop for ControlAuditRelay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SUP-1・SEC-4・CORE-1: 確認できない場合は送信 0 回（pidfd・pid どちらの送信手段でも同じ）。
+    #[test]
+    fn kill_if_unreaped_unverified_sends_zero_times() {
+        let mut sent = 0;
+        let r = kill_if_unreaped(Err(sys::SysError::Os(10)), || {
+            sent += 1;
+            Ok::<(), ()>(())
+        });
+        assert_eq!((r, sent), (false, 0));
+    }
 
     /// SUP-1・SEC-4: 未回収と確認できない場合（ECHILD・他エラー・回収済み）は送信しない。
     #[test]

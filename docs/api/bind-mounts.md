@@ -53,7 +53,7 @@ Linux の fandhe-container は、OCI `config.json` の `mounts[]` に書いた b
 
 - `ro` の bind は、root が書き込み可能な構成では Landlock が書き込み制限を保証できないため、起動前に拒否される。解消は #1917
 - bind 以外の `mounts[]` の種類は未対応
-- 状態ルート（`StateStore::host_state_root`）と同一・祖先・子孫の `source` は start が拒否する（字句比較と `canonicalize` した実体の比較。SEC-1）。状態ルートを示せないストアでは bind つきの start を拒否する。検査と適用の間の差し替え（TOCTOU）は rootfs 以外では照合しない（REPAIR-3）
+- 状態ルート（`StateStore::host_state_root`）と同一・祖先・子孫の `source` は start が拒否する（字句比較と `canonicalize` した実体の比較。SEC-1）。状態ルートを示せないストアでは bind つきの start を拒否する。適用の段も、固定した元に対して状態ルートとの重なりを毎回再検証する（元の属するマウントは fd の `mnt_id` で特定し、`rbind` のときだけ配下のマウントも照合する。保護対象と同じファイルシステム上でリンク数 2 以上の通常ファイルは状態ファイルへのハードリンクかもしれないため拒否する）。mountinfo は読み取りバイト数と行数に上限を設け、超過は構造化エラーで拒否する。残余はディレクトリ配下のハードリンクを検出できないこと（REPAIR-3）
 - restart でも、起動時と同じ bind の集合を適用する
 
 ## 拒否の記録

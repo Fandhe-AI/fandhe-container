@@ -126,7 +126,10 @@ use super::error::{LifecycleOp, OciRuntimeError};
 use super::launch::{
     BundleLock, LaunchMode, LaunchSpec, LaunchedProcess, ProcessLauncher, RootfsDir, StartTimeouts,
 };
-use super::mountinfo_identity::{fs_identity, parse_mountinfo, source_reaches};
+use super::mountinfo_identity::{
+    MountinfoReadError, fs_identity, parse_mountinfo, path_mount_id, read_mountinfo_bounded,
+    source_reaches,
+};
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
     ContainerId, ContainerState, ContainerStatus, ErrorCode, GetStateRequest, StartRequest,
@@ -793,29 +796,45 @@ fn validate_bind_mounts(
     // bind mount による別名（`canonicalize` では解決されない）を、mountinfo のファイルシステム内の実体で検出する。
     // `canonicalize` は呼び出しスレッドの mount namespace で解決するため、mountinfo も同じ namespace の
     // `/proc/thread-self/mountinfo` から読む（`/proc/self/mountinfo` はスレッドグループ代表の namespace を示す。SEC-1）。
-    let mountinfo = std::fs::read_to_string("/proc/thread-self/mountinfo").map_err(|_| {
-        TraitError::new(
+    let mountinfo = read_mountinfo_bounded("/proc/thread-self/mountinfo").map_err(|e| match e {
+        MountinfoReadError::TooLarge => TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "mountinfo exceeds the size limit, so bind mounts cannot be checked against the state store root",
+        ),
+        MountinfoReadError::Unreadable => TraitError::new(
             ErrorCode::FailedPrecondition,
             "mountinfo cannot be read, so bind mounts cannot be checked against the state store root",
-        )
+        ),
     })?;
     let mounts = parse_mountinfo(&mountinfo).ok_or_else(|| {
         TraitError::new(
             ErrorCode::FailedPrecondition,
-            "mountinfo is malformed, so bind mounts cannot be checked against the state store root",
+            "mountinfo is malformed or too large, so bind mounts cannot be checked against the state store root",
         )
     })?;
-    let Some(state_id) = fs_identity(&mounts, &state_real) else {
+    // 属するマウントはパスの最長一致ではなく、開いた fd の mnt_id で特定する（overmount で覆われた行に惑わされない）。
+    let Some(state_id) =
+        path_mount_id(&state_real).and_then(|mnt| fs_identity(&mounts, mnt, &state_real))
+    else {
         return Err(TraitError::new(
             ErrorCode::FailedPrecondition,
             "the state store root is not found in mountinfo",
         ));
     };
-    set.check_sources_with(|src| {
-        std::fs::canonicalize(src)
+    set.check_sources_with(|spec| {
+        let Some(real) = std::fs::canonicalize(spec.source())
             .ok()
             .and_then(|p| lexical_abs(&p))
-            .is_some_and(|real| source_reaches(&mounts, &real, &state_id))
+        else {
+            // 存在しない元は適用の段が拒否する。
+            return false;
+        };
+        // ディレクトリ・通常ファイル以外・開けない元も適用の段が拒否する（種別・権限の検査）。
+        let Some(mnt) = path_mount_id(&real) else {
+            return false;
+        };
+        // 元のマウントを特定できないときは fail-closed（到達するものとして拒否）。
+        source_reaches(&mounts, mnt, &real, spec.recursive(), &state_id).unwrap_or(true)
     })
     .map_err(reject)?;
     // 検査済みの実体を集合に持たせる。適用の段（restart を含む毎回）が、固定した元に対して再照合する。

@@ -2176,6 +2176,7 @@ pub(crate) struct VerifiedBindSourceFd {
     kind: BindSourceKind,
     dev: u64,
     ino: u64,
+    nlink: u64,
 }
 
 impl VerifiedBindSourceFd {
@@ -2187,6 +2188,11 @@ impl VerifiedBindSourceFd {
     /// 検証した fd の `(st_dev, st_ino)`。#1913 が複製後の事後検証（元の実体と同じ inode か）に使う。
     pub(crate) fn dev_ino(&self) -> (u64, u64) {
         (self.dev, self.ino)
+    }
+
+    /// 検証した fd の `st_nlink`（ハードリンク数）。状態ファイルへのハードリンクの検出に使う（SEC-1・#1915）。
+    pub(crate) fn nlink(&self) -> u64 {
+        self.nlink
     }
 }
 
@@ -2224,6 +2230,7 @@ pub(crate) fn verify_bind_source_fd(fd: OwnedFd) -> Result<VerifiedBindSourceFd,
         kind,
         dev: meta.dev(),
         ino: meta.ino(),
+        nlink: meta.nlink(),
     })
 }
 

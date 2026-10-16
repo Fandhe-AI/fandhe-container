@@ -41,6 +41,7 @@ mod mount_destination;
 pub(crate) mod mountinfo_identity;
 mod start;
 
+#[cfg(target_os = "linux")]
 pub(crate) use bind_mounts::ProtectedFsRoot;
 pub use bind_mounts::{
     BindMountError, BindMountErrorKind, BindMountSet, BindMountSpec, audit_bind_mount_error,

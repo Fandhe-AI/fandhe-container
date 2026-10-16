@@ -1,11 +1,79 @@
 //! bind mount の元がファイルシステム内で保護対象（状態ストアのルート）に到達するかを、mountinfo の実体で判定する。
 //!
 //! `canonicalize` は bind mount の別名を解決しないため、`major:minor` と FS 内パスの組で照合する（SEC-1・OCI-4・#1915）。
+//! 元の属するマウントは、パスの最長一致ではなく fd の `mnt_id`（fdinfo）で特定する。親への overmount で覆われた
+//! マウントがパス上は残るため、パスの最長一致は実際に参照するマウントと食い違い得る。
 //! 判定は start の段（検査）と bind mount の適用の段（`exec::mount_binds`。固定した元に対して毎回）の両方が使う。
 //! 呼び出し側は、パス解決と同じ mount namespace の mountinfo（`/proc/thread-self/mountinfo`）を渡すこと。
+//!
+//! mountinfo の読み取りは [`read_mountinfo_bounded`] が上限つきで行い、解析は [`parse_mountinfo`] が行数を制限する
+//! （無制限確保による DoS を防ぐ）。
 
-/// mountinfo の 1 行（必要なフィールドだけ。`major:minor`・FS 内の root・マウントポイント）。
+use std::collections::HashMap;
+use std::io::Read as _;
+
+/// mountinfo として読むバイト数の上限（超過は拒否）。実機の mountinfo は通常数十 KiB 以下。
+pub(crate) const MOUNTINFO_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// mountinfo として解釈する行数の上限（超過は拒否）。
+pub(crate) const MOUNTINFO_MAX_LINES: usize = 16 * 1024;
+
+/// [`read_mountinfo_bounded`] の失敗。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MountinfoReadError {
+    /// 読めない（存在しない・権限・UTF-8 でない）。
+    Unreadable,
+    /// [`MOUNTINFO_MAX_BYTES`] を超える。
+    TooLarge,
+}
+
+/// `path`（`/proc/thread-self/mountinfo` 等）を [`MOUNTINFO_MAX_BYTES`] までだけ読む。超過は `TooLarge`（fail-closed）。
+pub(crate) fn read_mountinfo_bounded(path: &str) -> Result<String, MountinfoReadError> {
+    let file = std::fs::File::open(path).map_err(|_| MountinfoReadError::Unreadable)?;
+    let mut text = String::new();
+    // 上限 + 1 バイトまで読み、超えたら拒否する（確保量は上限で頭打ち）。
+    file.take(MOUNTINFO_MAX_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|_| MountinfoReadError::Unreadable)?;
+    if u64::try_from(text.len()).map_or(true, |n| n > MOUNTINFO_MAX_BYTES) {
+        return Err(MountinfoReadError::TooLarge);
+    }
+    Ok(text)
+}
+
+/// `/proc/<...>/fdinfo/<fd>` の `mnt_id:` 行（fd が属するマウントの ID）を取り出す。
+#[cfg(unix)]
+pub(crate) fn parse_fdinfo_mnt_id(fdinfo: &str) -> Option<u64> {
+    fdinfo
+        .lines()
+        .find_map(|l| l.strip_prefix("mnt_id:"))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// `path` を開いた fd の属するマウント ID（`/proc/thread-self/fdinfo/N`）。start の段が使う。
+/// ディレクトリと通常ファイル以外（FIFO 等。開くとブロックし得る）は `None`（適用の段が種別で拒否する）。
+#[cfg(unix)]
+pub(crate) fn path_mount_id(path: &str) -> Option<u64> {
+    use std::os::fd::AsRawFd as _;
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_dir() && !meta.is_file() {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let fdinfo =
+        std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", file.as_raw_fd())).ok()?;
+    parse_fdinfo_mnt_id(&fdinfo)
+}
+
+/// unix 以外では `/proc` が無いため特定できない（bind mount は Linux 限定。呼び出し側は fail-closed にする）。
+#[cfg(not(unix))]
+pub(crate) fn path_mount_id(_path: &str) -> Option<u64> {
+    None
+}
+
+/// mountinfo の 1 行（必要なフィールドだけ。マウント ID・親 ID・`major:minor`・FS 内の root・マウントポイント）。
 pub(crate) struct MountRow {
+    pub(crate) id: u64,
+    pub(crate) parent: u64,
     pub(crate) dev: String,
     pub(crate) root: String,
     pub(crate) point: String,
@@ -42,15 +110,27 @@ fn unescape_mountinfo(field: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// `/proc/self/mountinfo` を行ごとに解釈する。解釈できない行があれば `None`（fail-closed）。
+/// `/proc/self/mountinfo` を行ごとに解釈する。解釈できない行・[`MOUNTINFO_MAX_LINES`] を超える行数は
+/// `None`（fail-closed）。
 pub(crate) fn parse_mountinfo(info: &str) -> Option<Vec<MountRow>> {
+    if info.lines().nth(MOUNTINFO_MAX_LINES).is_some() {
+        return None;
+    }
     info.lines()
         .map(|line| {
             let mut f = line.split(' ');
-            let dev = f.nth(2)?.to_owned();
+            let id = f.next()?.parse().ok()?;
+            let parent = f.next()?.parse().ok()?;
+            let dev = f.next()?.to_owned();
             let root = unescape_mountinfo(f.next()?)?;
             let point = unescape_mountinfo(f.next()?)?;
-            Some(MountRow { dev, root, point })
+            Some(MountRow {
+                id,
+                parent,
+                dev,
+                root,
+                point,
+            })
         })
         .collect()
 }
@@ -73,19 +153,15 @@ fn join_fs_path(root: &str, rest: &str) -> String {
     }
 }
 
-/// 正規化済みの絶対パスを含むマウント（マウントポイントが最長一致・同点は後勝ち）から、FS 内の実体を求める。
-pub(crate) fn fs_identity(mounts: &[MountRow], real: &str) -> Option<FsIdentity> {
-    let mut best: Option<(&MountRow, String)> = None;
-    for m in mounts {
-        if let Some(rest) = under(&m.point, real)
-            && best
-                .as_ref()
-                .is_none_or(|(b, _)| m.point.len() >= b.point.len())
-        {
-            best = Some((m, rest));
-        }
+/// マウント ID `mnt_id` のマウントを基準に、正規化済みの絶対パス `real` の FS 内の実体を求める。
+/// `mnt_id` の行が一意に無い・`real` がそのマウントポイント配下でない場合は `None`（fail-closed）。
+pub(crate) fn fs_identity(mounts: &[MountRow], mnt_id: u64, real: &str) -> Option<FsIdentity> {
+    let mut rows = mounts.iter().filter(|m| m.id == mnt_id);
+    let m = rows.next()?;
+    if rows.next().is_some() {
+        return None;
     }
-    let (m, rest) = best?;
+    let rest = under(&m.point, real)?;
     Some(FsIdentity {
         dev: m.dev.clone(),
         path: join_fs_path(&m.root, &rest),
@@ -102,23 +178,51 @@ fn path_overlaps(a: &str, b: &str) -> bool {
     a == "/" || b == "/" || crate::injected_files::overlaps(a, b)
 }
 
-/// 元（`canonicalize` 済み）が状態ルートの実体と、同一・祖先・子孫のいずれかで重なるかを判定する。
-/// 元の配下に載った別マウント（再帰 bind で一緒に公開されるもの）の実体も照合する（SEC-1）。
-pub(crate) fn source_reaches(mounts: &[MountRow], src_real: &str, state: &FsIdentity) -> bool {
-    if fs_identity(mounts, src_real).is_some_and(|id| identity_overlaps(&id, state)) {
-        return true;
+/// 元（マウント ID `src_mnt_id`・正規化済みパス `src_real`）が状態ルートの実体と、同一・祖先・子孫のいずれかで
+/// 重なるかを判定する。`recursive`（rbind）のときだけ、元のマウントの子孫マウントのうち元の配下に載るもの
+/// （一緒に公開される。覆い隠されたものも保守的に含める）の実体も照合する（SEC-1）。
+/// 元の位置を特定できない場合は `None`（呼び出し側が fail-closed にする）。
+pub(crate) fn source_reaches(
+    mounts: &[MountRow],
+    src_mnt_id: u64,
+    src_real: &str,
+    recursive: bool,
+    state: &FsIdentity,
+) -> Option<bool> {
+    let top = fs_identity(mounts, src_mnt_id, src_real)?;
+    if identity_overlaps(&top, state) {
+        return Some(true);
     }
-    mounts.iter().any(|m| {
-        m.point != src_real
-            && under(src_real, &m.point).is_some()
-            && identity_overlaps(
-                &FsIdentity {
-                    dev: m.dev.clone(),
-                    path: m.root.clone(),
-                },
-                state,
-            )
-    })
+    if !recursive {
+        return Some(false);
+    }
+    // 親子関係で子孫を辿る（各行は高々 1 回訪れるため行数に比例）。
+    let mut children: HashMap<u64, Vec<&MountRow>> = HashMap::new();
+    for m in mounts {
+        children.entry(m.parent).or_default().push(m);
+    }
+    let mut seen = std::collections::HashSet::from([src_mnt_id]);
+    let mut stack = vec![src_mnt_id];
+    while let Some(id) = stack.pop() {
+        for child in children.get(&id).into_iter().flatten() {
+            if !seen.insert(child.id) {
+                continue;
+            }
+            // 元の配下に載らない子（元がサブディレクトリのとき）は公開されない。
+            if under(src_real, &child.point).is_none() {
+                continue;
+            }
+            let id = FsIdentity {
+                dev: child.dev.clone(),
+                path: child.root.clone(),
+            };
+            if identity_overlaps(&id, state) {
+                return Some(true);
+            }
+            stack.push(child.id);
+        }
+    }
+    Some(false)
 }
 
 #[cfg(test)]
@@ -132,32 +236,126 @@ mod tests {
                     20 10 8:1 /srv/state /state rw - ext4 /dev/sda1 rw\n\
                     30 10 8:1 /other /mnt/other\\040dir rw - ext4 /dev/sda1 rw\n";
         let mounts = parse_mountinfo(info).expect("parse");
-        let state = fs_identity(&mounts, "/state").expect("state");
+        let state = fs_identity(&mounts, 20, "/state").expect("state");
         assert_eq!(state.path, "/srv/state");
         // 別名（/srv/state）・祖先（/srv）・子孫は拒否、無関係は許可。
-        assert!(source_reaches(&mounts, "/srv/state", &state));
-        assert!(source_reaches(&mounts, "/srv", &state));
-        assert!(source_reaches(&mounts, "/srv/state/sub", &state));
-        assert!(source_reaches(&mounts, "/", &state));
-        assert!(!source_reaches(&mounts, "/srv/data", &state));
-        assert!(!source_reaches(&mounts, "/mnt/other dir", &state));
+        assert_eq!(
+            source_reaches(&mounts, 10, "/srv/state", true, &state),
+            Some(true)
+        );
+        assert_eq!(
+            source_reaches(&mounts, 10, "/srv", true, &state),
+            Some(true)
+        );
+        assert_eq!(
+            source_reaches(&mounts, 10, "/srv/state/sub", true, &state),
+            Some(true)
+        );
+        assert_eq!(source_reaches(&mounts, 10, "/", true, &state), Some(true));
+        assert_eq!(
+            source_reaches(&mounts, 10, "/srv/data", true, &state),
+            Some(false)
+        );
+        assert_eq!(
+            source_reaches(&mounts, 30, "/mnt/other dir", true, &state),
+            Some(false)
+        );
     }
 
     /// SEC-1（#1915）: 再帰 bind で一緒に公開される配下マウントが状態ルートの実体なら拒否する。
+    /// 非再帰 bind は配下のマウントを公開しないため拒否しない（誤拒否の回避。P1）。
     #[test]
-    fn sec1_source_with_nested_mount_of_state_is_rejected() {
+    fn sec1_nested_mount_of_state_is_rejected_only_when_recursive() {
         let info = "10 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
                     20 10 8:2 /st /state rw - ext4 /dev/sdb1 rw\n\
                     30 10 8:2 /st /pub/inner rw - ext4 /dev/sdb1 rw\n";
         let mounts = parse_mountinfo(info).expect("parse");
-        let state = fs_identity(&mounts, "/state").expect("state");
-        assert!(source_reaches(&mounts, "/pub", &state));
-        assert!(!source_reaches(&mounts, "/unrelated", &state));
+        let state = fs_identity(&mounts, 20, "/state").expect("state");
+        assert_eq!(
+            source_reaches(&mounts, 10, "/pub", true, &state),
+            Some(true)
+        );
+        assert_eq!(
+            source_reaches(&mounts, 10, "/pub", false, &state),
+            Some(false)
+        );
+        assert_eq!(
+            source_reaches(&mounts, 10, "/unrelated", true, &state),
+            Some(false)
+        );
+    }
+
+    /// SEC-1（#1915）: 親への overmount で覆われた子マウントが残っていても、元は fd の mnt_id で特定する。
+    /// `/pub` に別のマウント（id 40）が載り、状態ルートの実体を持つ `/pub/inner`（id 30）が覆われている。
+    /// 元 `/pub/x`（id 40）は覆われた行ではなく id 40 の実体で判定する（最長一致なら 30 を選んでしまう）。
+    #[test]
+    fn sec1_overmounted_child_does_not_hide_actual_mount() {
+        let info = "10 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+                    20 10 8:2 /st /state rw - ext4 /dev/sdb1 rw\n\
+                    30 10 8:2 /st /pub/inner rw - ext4 /dev/sdb1 rw\n\
+                    40 10 8:3 / /pub rw - ext4 /dev/sdc1 rw\n";
+        let mounts = parse_mountinfo(info).expect("parse");
+        let state = fs_identity(&mounts, 20, "/state").expect("state");
+        // id 40 の中の `/pub/inner/y` は 8:3 の `/inner/y`（状態ルートではない）。
+        let id = fs_identity(&mounts, 40, "/pub/inner/y").expect("id");
+        assert_eq!((id.dev.as_str(), id.path.as_str()), ("8:3", "/inner/y"));
+        assert_eq!(
+            source_reaches(&mounts, 40, "/pub/inner/y", true, &state),
+            Some(false)
+        );
+        // 元のマウント ID が mountinfo に無い・パスがそのマウントの外なら位置を特定できない。
+        assert_eq!(source_reaches(&mounts, 99, "/pub", true, &state), None);
+        assert_eq!(
+            source_reaches(&mounts, 40, "/elsewhere", true, &state),
+            None
+        );
     }
 
     #[test]
     fn parse_mountinfo_rejects_malformed_line() {
         assert!(parse_mountinfo("garbage").is_none());
+    }
+
+    /// 行数の上限（[`MOUNTINFO_MAX_LINES`]）を超える入力は解釈せず拒否する。
+    #[test]
+    fn parse_mountinfo_rejects_too_many_lines() {
+        let line = "10 1 8:1 / / rw - ext4 /dev/sda1 rw\n";
+        let ok = line.repeat(MOUNTINFO_MAX_LINES);
+        assert_eq!(
+            parse_mountinfo(&ok).map(|v| v.len()),
+            Some(MOUNTINFO_MAX_LINES)
+        );
+        let over = line.repeat(MOUNTINFO_MAX_LINES + 1);
+        assert!(parse_mountinfo(&over).is_none());
+    }
+
+    /// バイト数の上限を超えるファイルは `TooLarge`、上限ちょうどは読める。
+    #[test]
+    fn read_mountinfo_bounded_enforces_byte_limit() {
+        let dir = std::env::temp_dir().join(format!("fandhe-mi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("mountinfo");
+        let at_cap = usize::try_from(MOUNTINFO_MAX_BYTES).expect("cap");
+        std::fs::write(&path, "a".repeat(at_cap)).expect("write");
+        let p = path.to_str().expect("utf8");
+        assert_eq!(read_mountinfo_bounded(p).map(|t| t.len()), Ok(at_cap));
+        std::fs::write(&path, "a".repeat(at_cap + 1)).expect("write");
+        assert_eq!(read_mountinfo_bounded(p), Err(MountinfoReadError::TooLarge));
+        assert_eq!(
+            read_mountinfo_bounded(dir.join("none").to_str().expect("utf8")),
+            Err(MountinfoReadError::Unreadable)
+        );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_fdinfo_mnt_id_reads_the_field() {
+        assert_eq!(
+            parse_fdinfo_mnt_id("pos:\t0\nflags:\t012\nmnt_id:\t42\n"),
+            Some(42)
+        );
+        assert_eq!(parse_fdinfo_mnt_id("pos:\t0\n"), None);
     }
 
     /// SEC-1（#1915）: 全体 bind（root が `/`）が状態ルートを含むときも到達と判定する（`/` を祖先として扱う）。
@@ -166,7 +364,7 @@ mod tests {
         let info = "10 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
                     20 10 8:1 / /mnt/root rw - ext4 /dev/sda1 rw\n";
         let mounts = parse_mountinfo(info).expect("parse");
-        let state = fs_identity(&mounts, "/mnt/root/srv/state").expect("state");
+        let state = fs_identity(&mounts, 20, "/mnt/root/srv/state").expect("state");
         assert_eq!(state.path, "/srv/state");
         // 元が `/` の全体 bind（FS 内パス `/`）は状態ルートの祖先。
         let whole = FsIdentity {
@@ -174,9 +372,18 @@ mod tests {
             path: "/".to_owned(),
         };
         assert!(identity_overlaps(&whole, &state));
-        assert!(source_reaches(&mounts, "/mnt/root", &state));
-        assert!(source_reaches(&mounts, "/mnt/root/srv", &state));
-        assert!(!source_reaches(&mounts, "/mnt/root/other", &state));
+        assert_eq!(
+            source_reaches(&mounts, 20, "/mnt/root", true, &state),
+            Some(true)
+        );
+        assert_eq!(
+            source_reaches(&mounts, 20, "/mnt/root/srv", true, &state),
+            Some(true)
+        );
+        assert_eq!(
+            source_reaches(&mounts, 20, "/mnt/root/other", true, &state),
+            Some(false)
+        );
         // 別デバイスの `/` は無関係。
         let other = FsIdentity {
             dev: "8:2".to_owned(),

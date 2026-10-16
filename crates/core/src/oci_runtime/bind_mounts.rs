@@ -60,11 +60,10 @@
 //! 本型は字句検証のみで、検証から適用までの TOCTOU を防がない。symlink を含む実体の照合・fd 起点 `O_NOFOLLOW` の
 //! 走査・種別と存在の確認・宛先ディレクトリの作成・利用者権限での到達性・rootfs 自身とその祖先の実体照合（`dev`/`ino`）は、
 //! 適用の段 `crate::exec::mount_binds`（#1913。実装済み。Linux 限定のため intra-doc リンクは張らない）が担う。
-//! 実体照合の残余（REPAIR-3）は bundle・状態ルートと、ホスト側の別の bind mount による別名で、字句検証（`check_against_host_paths`）
-//! だけが効く。`run_pre_pivot` への組み込みは済み（#1914）、`start` と本番 launcher への結線は済み（#1915。検証は `start`、tmpfs との重なりは launcher、
+//! 実体照合の残余（REPAIR-3）は bundle の実体で、字句検証（`check_against_host_paths`）だけが効く。`run_pre_pivot` への組み込みは済み（#1914）、`start` と本番 launcher への結線は済み（#1915。検証は `start`、tmpfs との重なりは launcher、
 //! 監査は `ProcessLauncher::rejection_audit_sink` 経由）。`ro` と Landlock の `WriteRestrictionShadowed` の衝突解消は #1917
 //! （それまで `ro` の bind は fork 前に拒否される）。状態ルートとの重なりは `start` が字句比較・`canonicalize` 比較・
-//! mountinfo によるファイルシステム内の実体照合（別の bind mount による別名）で検査する。残余は検査と適用の間の差し替え（REPAIR-3）。`MountDestination::resolve_in` の文字列結合で直接 mount してはならない。
+//! mountinfo によるファイルシステム内の実体照合（別の bind mount による別名）で検査する。適用の段も固定した元に対して状態ルートとの重なりを毎回再検証する（`ProtectedFsRoot`。元のマウントは fd の `mnt_id` で特定し、`rbind` のときだけ配下のマウントを照合する。保護対象と同じ FS 上のリンク数 2 以上の通常ファイルは拒否する）。残余はディレクトリ配下のハードリンクを検出できないこと（REPAIR-3）。`MountDestination::resolve_in` の文字列結合で直接 mount してはならない。
 
 use std::fmt;
 use std::path::Path;
@@ -283,10 +282,14 @@ impl ProtectedFsRoot {
         Self { dev, path }
     }
 
+    /// 適用の段（Linux 限定の `exec::mount_binds`）だけが読む。
+    #[cfg(target_os = "linux")]
     pub(crate) fn dev(&self) -> &str {
         &self.dev
     }
 
+    /// 適用の段（Linux 限定の `exec::mount_binds`）だけが読む。
+    #[cfg(target_os = "linux")]
     pub(crate) fn path(&self) -> &str {
         &self.path
     }
@@ -299,7 +302,8 @@ impl BindMountSet {
         self
     }
 
-    /// 適用の段が照合する保護対象の実体。
+    /// 適用の段（Linux 限定の `exec::mount_binds`）が照合する保護対象の実体。
+    #[cfg(target_os = "linux")]
     pub(crate) fn protected_roots(&self) -> &[ProtectedFsRoot] {
         &self.protected
     }
@@ -467,15 +471,16 @@ impl BindMountSet {
         Ok(())
     }
 
-    /// 各元を `hits` に渡し、`true`（保護対象に到達する）なら `ForbiddenSource` で拒否する。
+    /// 各指定（元と `recursive` の指定を含む）を `hits` に渡し、`true`（保護対象に到達する）なら
+    /// `ForbiddenSource` で拒否する。
     ///
     /// 到達の判定（mountinfo によるファイルシステム内の実体照合など）は呼び出し側が担う（SEC-1・#1915）。
     pub fn check_sources_with<F>(&self, hits: F) -> Result<(), BindMountError>
     where
-        F: Fn(&str) -> bool,
+        F: Fn(&BindMountSpec) -> bool,
     {
         for b in &self.mounts {
-            if hits(&b.source) {
+            if hits(b) {
                 return Err(BindMountError::at(
                     b.index,
                     BindMountErrorKind::ForbiddenSource,

@@ -88,8 +88,13 @@
 //!
 //! # 未対応・残余（REPAIR-3: 実装済みを装わない）
 //!
-//! - 状態ルートとの重なりの検査は `start` が行う（字句・`canonicalize`・mountinfo の実体照合。適用の段は照合しない）。実機前提の結合試験の
-//!   段ごとの観測（#1916。通しの確認は `tests/production_launcher.rs` のシナリオ D〔#1915〕）。`ro` と Landlock の衝突解消（#1917）
+//! - 状態ルートとの重なりは `start` が一次検査し（字句・`canonicalize`・fd の `mnt_id` によるマウントの特定と mountinfo の実体照合）、
+//!   適用の段も固定した元に対して毎回再検証する（`ProtectedFsRoot`・`check_source_not_protected`。restart を含む。
+//!   元の属するマウントは固定した fd の `mnt_id` で特定し、`rbind` のときだけ配下のマウントを照合する。保護対象と同じ FS 上で
+//!   リンク数 2 以上の通常ファイルは状態ファイルへのハードリンクかもしれないため拒否する）。残余はディレクトリ配下の
+//!   ハードリンクを検出できないこと、検査から `open_tree` までの間の差し替え（固定した fd への複製のため元の差し替えは効かない）。
+//!   実機前提の結合試験の段ごとの観測（#1916。通しの確認は `tests/production_launcher.rs` のシナリオ D〔#1915〕）。
+//!   `ro` と Landlock の衝突解消（#1917）
 //! - bundle・状態ルートの実体照合（#1911 の字句検証だけ）と、ホスト側の別の bind mount による別名の検出。全要素で symlink を拒否するため、
 //!   字句パスと実パスは別名を除いて一致する
 //! - procfs・sysfs など特殊な FS を元にすることは方針（#1910）上拒否していない
@@ -106,7 +111,9 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
 use crate::oci_runtime::ProtectedFsRoot;
-use crate::oci_runtime::mountinfo_identity::{FsIdentity, parse_mountinfo, source_reaches};
+use crate::oci_runtime::mountinfo_identity::{
+    FsIdentity, fs_identity, parse_fdinfo_mnt_id, parse_mountinfo, source_reaches,
+};
 use crate::oci_runtime::{BindMountSet, BindMountSpec};
 use crate::rootless::parse_id_map;
 use crate::sys::{
@@ -232,6 +239,7 @@ fn mount_binds_checked(
         observe: &observe_real,
         mountinfo: &|| read_thread_mountinfo(STAGE),
         source_path: &pinned_source_path,
+        source_mnt_id: &pinned_source_mnt_id,
         umount: &umount_fd,
         before_attach,
     };
@@ -258,6 +266,8 @@ struct BindDeps<'a> {
     mountinfo: &'a dyn Fn() -> Result<String, ExecError>,
     /// 固定した元の、呼び出しスレッドの mount namespace での現在のパス（保護対象との照合用）。
     source_path: &'a dyn Fn(&VerifiedBindSourceFd) -> Result<String, ExecError>,
+    /// 固定した元の属するマウントの ID。
+    source_mnt_id: &'a dyn Fn(&VerifiedBindSourceFd) -> Result<u64, ExecError>,
     /// 自分のマウントを fd 指定で外す（`MNT_DETACH`）。
     umount: &'a dyn Fn(BorrowedFd<'_>) -> Result<(), SysError>,
     /// 移動検査の後・付け替えの直前に呼ぶ（本番は空。結合試験専用の入口だけが差し込む）。
@@ -459,20 +469,56 @@ fn check_source_not_protected(
         return Ok(());
     }
     let real = (ctx.deps.source_path)(src)?;
+    let mnt_id = (ctx.deps.source_mnt_id)(src)?;
     let info = (ctx.deps.mountinfo)()?;
     let mounts = parse_mountinfo(&info)
-        .ok_or_else(|| failed(spec, "malformed line in /proc/thread-self/mountinfo"))?;
-    let hit = ctx.protected.iter().any(|p| {
+        .ok_or_else(|| failed(spec, "malformed or oversized /proc/thread-self/mountinfo"))?;
+    // 元の属するマウントは固定した fd の mnt_id で特定する（パスの最長一致は overmount で食い違い得る）。
+    let Some(identity) = fs_identity(&mounts, mnt_id, &real) else {
+        return Err(failed(
+            spec,
+            "the mount of the pinned bind mount source is not found in mountinfo",
+        ));
+    };
+    // 通常ファイルのハードリンクは別名のパスを持たず、パス・マウントの照合では状態ファイルとの同一性が分からない。
+    // 保護対象と同じファイルシステム上でリンク数が 2 以上の通常ファイルは、状態ファイルへのリンクかもしれないため拒否する
+    // （fail-closed。ディレクトリ配下のハードリンクは検出できない残余。REPAIR-3）。
+    if src.kind() == BindSourceKind::RegularFile
+        && src.nlink() > 1
+        && ctx.protected.iter().any(|p| p.dev() == identity.dev)
+    {
+        return Err(violation(spec, ViolationReason::BindSourceReachesStateRoot));
+    }
+    for p in ctx.protected {
         let state = FsIdentity {
             dev: p.dev().to_owned(),
             path: p.path().to_owned(),
         };
-        source_reaches(&mounts, &real, &state)
-    });
-    if hit {
-        return Err(violation(spec, ViolationReason::BindSourceReachesStateRoot));
+        match source_reaches(&mounts, mnt_id, &real, spec.recursive(), &state) {
+            Some(false) => {}
+            Some(true) => {
+                return Err(violation(spec, ViolationReason::BindSourceReachesStateRoot));
+            }
+            None => {
+                return Err(failed(
+                    spec,
+                    "the pinned bind mount source cannot be located in mountinfo",
+                ));
+            }
+        }
     }
     Ok(())
+}
+
+/// 固定した元の属するマウントの ID（`/proc/thread-self/fdinfo/N` の `mnt_id`）。
+fn pinned_source_mnt_id(src: &VerifiedBindSourceFd) -> Result<u64, ExecError> {
+    let fdinfo = std::fs::read_to_string(format!(
+        "/proc/thread-self/fdinfo/{}",
+        src.as_fd().as_raw_fd()
+    ))
+    .map_err(|_| mountinfo_failed("cannot read fdinfo of the pinned bind mount source"))?;
+    parse_fdinfo_mnt_id(&fdinfo)
+        .ok_or_else(|| mountinfo_failed("no mnt_id in fdinfo of the pinned bind mount source"))
 }
 
 /// 固定した元の現在のパス（`/proc/thread-self/fd/N` のリンク先）。削除済み・絶対パスでないものは拒否する。
@@ -1607,6 +1653,7 @@ mod tests {
                     .clone()
                     .unwrap_or_else(|| ideal_mountinfo(200, ro, ne)))
             },
+            source_mnt_id: &|_| Ok(1),
             source_path: &|src| {
                 let path =
                     std::fs::read_link(format!("/proc/thread-self/fd/{}", src.as_fd().as_raw_fd()))
@@ -1701,6 +1748,82 @@ mod tests {
         let (r, log) = run(&fx, &set, &knobs);
         r.expect("applied");
         assert_eq!(log.first().map(String::as_str), Some("mountinfo"));
+    }
+
+    /// SEC-1（#1915）: 保護対象と同じファイルシステム上でリンク数が 2 以上の通常ファイルは、状態ファイルへの
+    /// ハードリンクかもしれないため拒否する。リンク数 1 の通常ファイルや別 FS のファイルは拒否しない。
+    #[test]
+    fn sec1_hard_linked_regular_file_on_state_fs_is_rejected_at_apply() {
+        let fx = fx();
+        std::fs::hard_link(fx.src.join("file"), fx.src.join("alias")).expect("link");
+        let info = "1 0 0:1 / / rw - tmpfs none rw\n".to_owned();
+        let knobs = Knobs {
+            mountinfo: Some(info.clone()),
+            ..Knobs::default()
+        };
+        let protected = |dev: &str| {
+            vec![ProtectedFsRoot::new(
+                dev.to_owned(),
+                "/srv/state".to_owned(),
+            )]
+        };
+        // 同じ FS（0:1）の状態ルートがあり、リンク数 2 の通常ファイルを元にする → 拒否。
+        let set = one("/mnt/f", &fx.src("alias"), &[]).with_protected_roots(protected("0:1"));
+        let (r, log) = run(&fx, &set, &knobs);
+        let err = r.expect_err("must be rejected");
+        assert_eq!(
+            reason_of(&err),
+            Some(ViolationReason::BindSourceReachesStateRoot)
+        );
+        assert_eq!(log, ["mountinfo"]);
+        // 状態ルートが別 FS（0:9）なら、同じファイルでもハードリンクで届かないため拒否しない。
+        let set = one("/mnt/f", &fx.src("alias"), &[]).with_protected_roots(protected("0:9"));
+        let knobs = Knobs {
+            mountinfo: Some(format!("{info}{}", ideal_mountinfo(200, false, false))),
+            ..Knobs::default()
+        };
+        let (r, _log) = run(&fx, &set, &knobs);
+        r.expect("different filesystem is applied");
+        // リンク数 1 の通常ファイルは拒否しない。
+        std::fs::remove_file(fx.src.join("alias")).expect("unlink");
+        let set = one("/mnt/f", &fx.src("file"), &[]).with_protected_roots(protected("0:1"));
+        let knobs = Knobs {
+            mountinfo: Some(format!("{info}{}", ideal_mountinfo(200, false, false))),
+            ..Knobs::default()
+        };
+        let (r, _log) = run(&fx, &set, &knobs);
+        r.expect("single link is applied");
+    }
+
+    /// SEC-1・OCI-4（#1915）: 再帰 bind のときだけ、元の配下のマウント（状態ルートの実体）を理由に拒否する。
+    #[test]
+    fn sec1_nested_state_mount_is_rejected_only_for_rbind_at_apply() {
+        let fx = fx();
+        let real = std::fs::canonicalize(fx.src("dir")).expect("canon");
+        let info = format!(
+            "1 0 0:1 / / rw - tmpfs none rw\n5 1 0:2 /st {}/inner rw - tmpfs none rw\n",
+            real.to_str().expect("utf8")
+        );
+        let protected = || vec![ProtectedFsRoot::new("0:2".to_owned(), "/st".to_owned())];
+        let set = one("/mnt/d", &fx.src("dir"), &["rbind"]).with_protected_roots(protected());
+        let knobs = Knobs {
+            mountinfo: Some(info.clone()),
+            ..Knobs::default()
+        };
+        let (r, _log) = run(&fx, &set, &knobs);
+        let err = r.expect_err("rbind must be rejected");
+        assert_eq!(
+            reason_of(&err),
+            Some(ViolationReason::BindSourceReachesStateRoot)
+        );
+        // 非再帰 bind は配下のマウントを公開しないため、状態ルートの実体が配下にあっても拒否しない。
+        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(protected());
+        let knobs = Knobs {
+            mountinfo: Some(format!("{info}{}", ideal_mountinfo(200, false, false))),
+            ..Knobs::default()
+        };
+        let (r, _log) = run(&fx, &set, &knobs);
+        r.expect("non-recursive bind is applied");
     }
 
     /// CORE-1・SEC-1・OCI-4: ディレクトリ・非再帰・rw の呼び出し順と具体値。
@@ -2629,6 +2752,7 @@ mod tests {
             observe: &|_, _, _| Err(ExecError::new(ErrorCode::Internal, STAGE, "unused")),
             mountinfo: &|| Ok(String::new()),
             source_path: &|_| Ok(String::new()),
+            source_mnt_id: &|_| Ok(0),
             umount: &|_| Ok(()),
             before_attach: &|| {},
         };
@@ -2664,6 +2788,7 @@ mod tests {
             observe: &|_, _, _| Err(ExecError::new(ErrorCode::Internal, STAGE, "unused")),
             mountinfo: &|| Ok(String::new()),
             source_path: &|_| Ok(String::new()),
+            source_mnt_id: &|_| Ok(0),
             umount: &|_| Ok(()),
             before_attach: &|| {},
         };

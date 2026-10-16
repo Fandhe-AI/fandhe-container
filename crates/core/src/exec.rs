@@ -1944,9 +1944,18 @@ fn fd_mount_id(dir: &OwnedFd, stage: IsolationStage) -> Result<u64, ExecError> {
 /// 呼び出しスレッドの mount namespace の mountinfo（`/proc/self/mountinfo` はスレッドグループの
 /// 代表の namespace を映すため使わない）。
 fn read_thread_mountinfo(stage: IsolationStage) -> Result<String, ExecError> {
-    std::fs::read_to_string("/proc/thread-self/mountinfo").map_err(|_| {
-        mountinfo_error("cannot read /proc/thread-self/mountinfo to verify mount propagation")
-            .at_stage(stage)
+    use crate::oci_runtime::mountinfo_identity::{MountinfoReadError, read_mountinfo_bounded};
+    // 上限つきで読む（巨大な mountinfo による無制限確保を避ける。超過は fail-closed）。
+    read_mountinfo_bounded("/proc/thread-self/mountinfo").map_err(|e| {
+        let msg = match e {
+            MountinfoReadError::TooLarge => {
+                "/proc/thread-self/mountinfo exceeds the size limit; cannot verify mount propagation"
+            }
+            MountinfoReadError::Unreadable => {
+                "cannot read /proc/thread-self/mountinfo to verify mount propagation"
+            }
+        };
+        mountinfo_error(msg).at_stage(stage)
     })
 }
 

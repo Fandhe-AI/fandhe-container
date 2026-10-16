@@ -138,7 +138,7 @@ cli-parity-native-reclaim-check: ## capture のタイムアウトでネイティ
 cli-parity-native-reclaim-selftest: ## 回収確認スクリプトの全体期限の自己テスト（#1688・REPAIR-5・REPAIR-12）
 	@scripts/cli-parity-native-reclaim-check-selftest.sh
 
-lib-selftest: ## scripts/lib.sh の workspace 判定の回帰テスト（bash 3.2 を含む。一時ディレクトリのみ）
+lib-selftest: ## scripts/lib.sh の workspace 判定と run_limited の回帰テスト（bash 3.2 を含む。一時ディレクトリのみ）
 	@scripts/lib-selftest.sh
 
 commit-msg-line-length-selftest: ## commit-msg 行長検査スクリプトの自己テスト（Issue #1295・REPAIR-12）

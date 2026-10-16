@@ -216,10 +216,7 @@ record_child() { # この selftest が起動した sleep の pid と起動時刻
 }
 # dieafter / diefast: コンテナ側プロセス（init）の pid を FCSUP1 OK で報告してから、launcher だけが先に死ぬ。
 if [ "$mode" = "dieafter" ]; then sleep 300 & record_child $!; echo "FCSUP1 OK $!"; sleep 1; exit 0; fi
-# 子が exec を終えて所有トークンを environ に持つまで待ってから死ぬ（exec 途中の environ は空で、負荷の高い CI では
-# 追跡の観測が窓に当たり得るため。「親子関係を一度も観測できない」性質は launcher の即死で保たれる）。
-wait_token() { local _; for _ in $(seq 1 300); do grep -qz '^FANDHE_BENCH_OWNER=' "/proc/$1/environ" 2>/dev/null && return 0; sleep 0.01; done; return 0; }
-if [ "$mode" = "diefast" ]; then sleep 300 & record_child $!; wait_token $!; echo "FCSUP1 OK $!"; exit 0; fi
+if [ "$mode" = "diefast" ]; then sleep 300 & record_child $!; echo "FCSUP1 OK $!"; exit 0; fi
 # midonly: 一時的な中間プロセス（トークン継承・生存中の子孫として観測される）だけを残して約 1.5 秒後に死ぬ。init は報告せず、
 # 二重 fork で木の外へ出し、トークンも継承しない（init の記録なしに中間プロセスだけが観測される経路）。
 if [ "$mode" = "midonly" ]; then
@@ -232,7 +229,7 @@ fi
 # diefast_mixed: 1 番目のコンテナはトークン非継承の子を残して即死し、それ以外はトークンを継承する子を残して即死する
 # （別コンテナのトークン検出で、1 番目の追跡不能が解除されないことの照合用）。
 if [ "$mode" = "diefast_mixed" ]; then
-  if [ "$idx" = "1" ]; then env -u FANDHE_BENCH_OWNER sleep 300 & record_child $!; else sleep 300 & record_child $!; wait_token $!; echo "FCSUP1 OK $!"; fi
+  if [ "$idx" = "1" ]; then env -u FANDHE_BENCH_OWNER sleep 300 & record_child $!; else sleep 300 & record_child $!; echo "FCSUP1 OK $!"; fi
   exit 0
 fi
 if [ "$mode" = "diefast_notoken" ]; then env -u FANDHE_BENCH_OWNER sleep 300 & record_child $!; exit 0; fi

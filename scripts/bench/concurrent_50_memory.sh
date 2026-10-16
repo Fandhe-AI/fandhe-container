@@ -1097,8 +1097,10 @@ real_uid_is_target() { # <pid>
     case "$line" in
       Uid:*)
         read -r _ a _ <<<"$line" || true
-        [ "$a" = "$ra_uid" ]
-        return
+        # 終了状態は明示的に返す（bash 5.2 では、リダイレクト付きループ内の引数なし return が直前の [ ] の結果を返さず、
+        # 一致していても失敗扱いになることを CI〔Ubuntu 24.04・bash 5.2〕で確認した）。
+        if [ "$a" = "$ra_uid" ]; then return 0; fi
+        return 1
         ;;
     esac
   done 2>/dev/null <"/proc/$1/status"

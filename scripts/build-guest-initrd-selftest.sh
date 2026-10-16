@@ -232,6 +232,32 @@ run env GUEST_INITRD_CARGO="$sb/cargo-interp" "$target" --output-dir "$out"
 check "5 built dynamic binary exit code" 2 "$rc"
 check "5 built dynamic binary error code" not-static "$(errcode)"
 
+# FIFO は open 前に stat で拒否され、ブロックしない（REPAIR-5）。タイムアウト内に終わることも照合する。
+if command -v mkfifo >/dev/null 2>&1 && mkfifo "$sb/init-fifo" 2>/dev/null; then
+    newout
+    t0=$SECONDS
+    run "$target" --init "$sb/init-fifo" --output-dir "$out"
+    check "5 fifo exit code" 2 "$rc"
+    check "5 fifo error code" bad-input "$(errcode)"
+    if [ $((SECONDS - t0)) -lt 10 ]; then ok "5 fifo rejected without blocking"; else ng "5 fifo rejection took too long"; fi
+    if [ ! -e "$out" ]; then ok "5 fifo leaves no output"; else ng "5 fifo left an output"; fi
+else
+    skip "5 fifo (mkfifo unavailable)"
+fi
+
+# 出力ディレクトリへ固定名の symlink が先に置かれても、参照先を上書きしない（排他的な一時ファイル）。
+victim="$sb/victim"
+printf 'KEEP\n' >"$victim"
+mk_stub cargo-plant "mkdir -p \"\$PLANT_OUT\" && ln -s '$victim' \"\$PLANT_OUT/.build-info.tmp\" && ln -s '$victim' \"\$PLANT_OUT/.initrd.tmp\" && mkdir -p \"\$CARGO_TARGET_DIR/$rel\" && cp '$good' \"\$CARGO_TARGET_DIR/$rel/fandhe-container-guest-init\""
+newout
+run env GUEST_INITRD_CARGO="$sb/cargo-plant" PLANT_OUT="$out" "$target" --output-dir "$out"
+check "5 planted symlink victim untouched" "KEEP" "$(cat "$victim")"
+if [ -f "$out/initrd.cpio.gz" ] && [ -f "$out/build-info.txt" ] && [ ! -L "$out/initrd.cpio.gz" ]; then
+    ok "5 planted symlink outputs are regular files"
+else
+    ng "5 planted symlink outputs missing or symlinks (rc=$rc)"
+fi
+
 # --- 6: ビルド失敗 ---
 newout
 run env GUEST_INITRD_CARGO="$sb/cargo-fail" "$target" --output-dir "$out"

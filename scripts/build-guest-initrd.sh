@@ -38,7 +38,7 @@
 #   0: 成功（stdout に initrd の絶対パスを 1 行出す）
 #   1: ビルド失敗（build-failed）・gzip 失敗（pack-failed）
 #   2: 引数・環境・入力・出力先が不正、Windows ホスト
-#   3: 期限切れ（build-timeout・pack-timeout）
+#   3: 期限切れ（build-timeout・pack-timeout・input-timeout）
 # エラーは stderr に `error: code=<code> message=<英語>` の 1 行で出す。
 set -euo pipefail
 
@@ -202,6 +202,8 @@ out_created=0
 lock_dir=""
 publishing=0
 published=""
+tmp_info=""
+tmp_initrd=""
 cleanup() {
     local rc=$?
     if [ -n "$child_pid" ]; then
@@ -214,7 +216,8 @@ cleanup() {
     [ -z "$work_dir" ] || rm -rf "$work_dir"
     if [ "$rc" -ne 0 ] && [ "$publishing" -eq 1 ]; then
         # 一時名と、自分が確定させたファイルだけを消す（他者の同名ファイルは触らない）。
-        rm -f "$output_dir/.initrd.tmp" "$output_dir/.build-info.tmp"
+        [ -z "$tmp_info" ] || rm -f -- "$tmp_info"
+        [ -z "$tmp_initrd" ] || rm -f -- "$tmp_initrd"
         for f in $published; do rm -f "$output_dir/$f"; done
         if [ "$out_created" -eq 1 ]; then
             rmdir "$output_dir" 2>/dev/null || true
@@ -311,44 +314,57 @@ else
 fi
 
 # --- 入力の検査と複製（開いた 1 本のファイル記述子だけを使う） ---
-# 入力を fd 9 で 1 度だけ開き、メタデータ検査（通常ファイル・所有者・書き込み権限）と複製を
-# すべてその fd に対して行う（パスの再解決による検査後の差し替えを避ける）。検査は /dev/fd/9 を
-# `find -L` で辿り、fd の指す inode に対して行う。-L のパス検査は早期の分かりやすい拒否のためだけで
-# 安全性の根拠にしない。親ディレクトリが他者に書き換え可能な場合に「どのファイルを開くか」自体を
-# 差し替えられる点は防げないため、--init には自分の管理下のパスを渡すこと。
+# 入力の open を含む検査と複製の全体を、期限つきの子プロセス（run_limited）で行う。書き手のいない
+# FIFO 等で open が無期限にブロックしても input-timeout で打ち切る（REPAIR-5）。親側では open せず
+# `[ -f ]`（stat のみ）で通常ファイル以外を先に拒否する。子は入力を fd 9 で 1 度だけ開き、
+# メタデータ検査（通常ファイル・所有者・書き込み権限）と複製をすべてその fd に対して行う
+# （パスの再解決による検査後の差し替えを避ける）。検査は /dev/fd/9 を `find -L` で辿り、fd の指す
+# inode に対して行う。-L のパス検査は早期の分かりやすい拒否のためだけで安全性の根拠にしない。
+# 親ディレクトリが他者に書き換え可能な場合に「どのファイルを開くか」自体を差し替えられる点は
+# 防げないため、--init には自分の管理下のパスを渡すこと。
+input_timeout=30
 if [ -L "$init_src" ]; then
     err bad-input "init must not be a symlink"
     exit 2
 fi
-if ! { : <"$init_src"; } 2>/dev/null; then
-    err bad-input "cannot open init"
-    exit 2
-fi
-if ! exec 9<"$init_src"; then
-    err bad-input "cannot open init"
-    exit 2
-fi
-fd_path="/dev/fd/9"
-if [ -z "$(find -L "$fd_path" -prune -type f -print 2>/dev/null)" ]; then
+if [ ! -f "$init_src" ]; then
     err bad-input "init is not a regular file"
     exit 2
 fi
-if [ -z "$(find -L "$fd_path" -prune \( -user "$expect_uid" -o -user 0 \) -print 2>/dev/null)" ]; then
-    err bad-input "init must be owned by the current user or root"
-    exit 2
-fi
-if [ -n "$(find -L "$fd_path" -prune \( -perm -0020 -o -perm -0002 \) -print 2>/dev/null)" ]; then
-    err bad-input "init must not be group or other writable"
-    exit 2
-fi
-
-# 上限 +1 バイトまで読んでサイズ超過を検出し、複製は private な work_dir へ書く。以降は複製だけを使う。
 init_copy="$work_dir/init"
-if ! head -c $((max_init_bytes + 1)) <&9 >"$init_copy" 2>/dev/null; then
-    err bad-input "cannot read init"
-    exit 2
+# 上限 +1 バイトまで読んでサイズ超過を検出し、複製は private な work_dir へ書く。以降は複製だけを使う。
+copy_input() {
+    umask 077
+    if ! exec 9<"$init_src"; then
+        err bad-input "cannot open init"
+        exit 2
+    fi
+    local fd_path="/dev/fd/9"
+    if [ -z "$(find -L "$fd_path" -prune -type f -print 2>/dev/null)" ]; then
+        err bad-input "init is not a regular file"
+        exit 2
+    fi
+    if [ -z "$(find -L "$fd_path" -prune \( -user "$expect_uid" -o -user 0 \) -print 2>/dev/null)" ]; then
+        err bad-input "init must be owned by the current user or root"
+        exit 2
+    fi
+    if [ -n "$(find -L "$fd_path" -prune \( -perm -0020 -o -perm -0002 \) -print 2>/dev/null)" ]; then
+        err bad-input "init must not be group or other writable"
+        exit 2
+    fi
+    if ! head -c $((max_init_bytes + 1)) <&9 >"$init_copy" 2>/dev/null; then
+        err bad-input "cannot read init"
+        exit 2
+    fi
+}
+rc=0
+run_limited "$input_timeout" copy_input || rc=$?
+if [ "$rc" -eq 124 ]; then
+    err input-timeout "reading init exceeded ${input_timeout}s (is it a FIFO or a stalled file?)"
+    exit 3
+elif [ "$rc" -ne 0 ]; then
+    exit "$rc"
 fi
-exec 9<&-
 init_size="$(wc -c <"$init_copy" | tr -d ' ')"
 if ! [[ "$init_size" =~ ^[0-9]+$ ]] || [ "$init_size" -eq 0 ]; then
     err bad-input "init is empty or unreadable"
@@ -471,20 +487,25 @@ write_info() {
     printf 'rustc=%s\n' "$rustc_line"
     printf 'host=%s\n' "$host_os $(uname -m)"
 }
-if ! write_info >"$output_dir/.build-info.tmp" 2>/dev/null \
-    || ! cp "$final_file" "$output_dir/.initrd.tmp" 2>/dev/null; then
+# 一時ファイルは mktemp（O_EXCL・推測できない名前）で排他的に作る。固定名だと、空確認から書き込みまでに
+# 他者が置いた symlink の参照先を上書きしうる。確定は ln（既存・symlink があれば失敗）。
+tmp_info="$(mktemp "$output_dir/.build-info.XXXXXX" 2>/dev/null)" || tmp_info=""
+tmp_initrd="$(mktemp "$output_dir/.initrd.XXXXXX" 2>/dev/null)" || tmp_initrd=""
+if [ -z "$tmp_info" ] || [ -z "$tmp_initrd" ] \
+    || ! write_info >"$tmp_info" 2>/dev/null \
+    || ! cp "$final_file" "$tmp_initrd" 2>/dev/null; then
     err output-failed "cannot write the build outputs (disk full or permission?)"
     exit 2
 fi
-for pair in build-info.txt:.build-info.tmp "$final_name":.initrd.tmp; do
+for pair in "build-info.txt:$tmp_info" "$final_name:$tmp_initrd"; do
     dest="${pair%%:*}"
     tmp="${pair#*:}"
-    if ! ln -- "$output_dir/$tmp" "$output_dir/$dest" 2>/dev/null; then
+    if ! ln -- "$tmp" "$output_dir/$dest" 2>/dev/null; then
         err output-exists "cannot publish $dest: it already exists or the link failed; refusing to overwrite"
         exit 2
     fi
     published="$published $dest"
-    rm -f -- "$output_dir/$tmp"
+    rm -f -- "$tmp"
 done
 publishing=0
 out_created=0

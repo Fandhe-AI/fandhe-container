@@ -115,6 +115,21 @@ newout() {
     out="$sb/out-$n"
 }
 
+# --- Windows（Git Bash）ホストでは梱包しない契約だけを実ホストで照合して終える ---
+# 対象スクリプトは Windows を unsupported-os・終了コード 2 で拒否する（ホスト OS の差し替え口は
+# 梱包の共通ケースで使わない）。以降の梱包ケースは POSIX の権限・所有者に依存するため走らせない。
+case "$(uname -s)" in
+    MINGW* | MSYS* | CYGWIN*)
+        newout
+        run "$target" --init "$good" --output-dir "$out"
+        check "win exit code" 2 "$rc"
+        check "win error code" unsupported-os "$(errcode)"
+        printf 'pass=%s fail=%s\n' "$pass" "$fail"
+        [ "$fail" -eq 0 ]
+        exit $?
+        ;;
+esac
+
 # --- 1: 成功（スタブ cargo・無圧縮） ---
 newout
 run env GUEST_INITRD_CARGO="$sb/cargo-ok" "$target" --compress none --output-dir "$out"

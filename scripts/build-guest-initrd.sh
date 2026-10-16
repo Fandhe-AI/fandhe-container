@@ -24,8 +24,9 @@
 #   --pack-timeout  gzip の上限秒（既定 60。1〜600）
 #
 # 安全性: root・sudo を要求しない。入力は symlink・通常ファイル以外・空・上限（64 MiB）超・
-# 他者所有・group/other 書き込み可を拒否し、検査後は private な複製だけを ELF 検査と梱包に使う
-# （検査後の差し替え対策）。ELF は aarch64・64-bit LE・ET_EXEC・PT_INTERP 無し（静的）のみ受ける。
+# 他者所有・group/other 書き込み可を拒否する。検査と複製は開いた 1 本の fd に対して行い、以降は
+# private な複製だけを ELF 検査と梱包に使う（検査後の差し替え対策。ただし親ディレクトリが他者に
+# 書き換え可能な場合に開く対象自体を差し替えられる点は防げない）。ELF は aarch64・64-bit LE・ET_EXEC・PT_INTERP 無し（静的）のみ受ける。
 # 出力は排他ロック（<出力先>.lock）の下で ln により確定し、既存を上書きしない。ビルドは専用の
 # target ディレクトリと umask 077 で行う。cargo・gzip は期限つきで、超過時はグループごと停止する
 # （REPAIR-5）。macOS でのリンクは未検証（Linux x86_64 で rust-lld により確認）。
@@ -309,37 +310,52 @@ else
     init_src="$init_arg"
 fi
 
-# --- 入力のメタデータ検査（元ファイルに対して） ---
+# --- 入力の検査と複製（開いた 1 本のファイル記述子だけを使う） ---
+# 入力を fd 9 で 1 度だけ開き、メタデータ検査（通常ファイル・所有者・書き込み権限）と複製を
+# すべてその fd に対して行う（パスの再解決による検査後の差し替えを避ける）。検査は /dev/fd/9 を
+# `find -L` で辿り、fd の指す inode に対して行う。-L のパス検査は早期の分かりやすい拒否のためだけで
+# 安全性の根拠にしない。親ディレクトリが他者に書き換え可能な場合に「どのファイルを開くか」自体を
+# 差し替えられる点は防げないため、--init には自分の管理下のパスを渡すこと。
 if [ -L "$init_src" ]; then
     err bad-input "init must not be a symlink"
     exit 2
 fi
-if [ ! -f "$init_src" ]; then
+if ! { : <"$init_src"; } 2>/dev/null; then
+    err bad-input "cannot open init"
+    exit 2
+fi
+if ! exec 9<"$init_src"; then
+    err bad-input "cannot open init"
+    exit 2
+fi
+fd_path="/dev/fd/9"
+if [ -z "$(find -L "$fd_path" -prune -type f -print 2>/dev/null)" ]; then
     err bad-input "init is not a regular file"
     exit 2
 fi
-init_size="$(wc -c <"$init_src" 2>/dev/null | tr -d ' ')" || init_size=""
+if [ -z "$(find -L "$fd_path" -prune \( -user "$expect_uid" -o -user 0 \) -print 2>/dev/null)" ]; then
+    err bad-input "init must be owned by the current user or root"
+    exit 2
+fi
+if [ -n "$(find -L "$fd_path" -prune \( -perm -0020 -o -perm -0002 \) -print 2>/dev/null)" ]; then
+    err bad-input "init must not be group or other writable"
+    exit 2
+fi
+
+# 上限 +1 バイトまで読んでサイズ超過を検出し、複製は private な work_dir へ書く。以降は複製だけを使う。
+init_copy="$work_dir/init"
+if ! head -c $((max_init_bytes + 1)) <&9 >"$init_copy" 2>/dev/null; then
+    err bad-input "cannot read init"
+    exit 2
+fi
+exec 9<&-
+init_size="$(wc -c <"$init_copy" | tr -d ' ')"
 if ! [[ "$init_size" =~ ^[0-9]+$ ]] || [ "$init_size" -eq 0 ]; then
     err bad-input "init is empty or unreadable"
     exit 2
 fi
 if [ "$init_size" -gt "$max_init_bytes" ]; then
     err bad-input "init is larger than $max_init_bytes bytes"
-    exit 2
-fi
-if [ -z "$(find "$init_src" -prune \( -user "$expect_uid" -o -user 0 \) -print 2>/dev/null)" ]; then
-    err bad-input "init must be owned by the current user or root"
-    exit 2
-fi
-if [ -n "$(find "$init_src" -prune \( -perm -0020 -o -perm -0002 \) -print 2>/dev/null)" ]; then
-    err bad-input "init must not be group or other writable"
-    exit 2
-fi
-
-# 検査済みの入力を private な work_dir へ複製し、以降はその複製だけを使う。
-init_copy="$work_dir/init"
-if ! cp -- "$init_src" "$init_copy" 2>/dev/null; then
-    err bad-input "cannot read init"
     exit 2
 fi
 chmod 0700 "$init_copy"

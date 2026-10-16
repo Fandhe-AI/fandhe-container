@@ -1066,7 +1066,7 @@ mod tests {
         assert_eq!(ViolationReason::from_launch_token(""), None);
     }
 
-    /// 監査イベントはマウント層の 3 種別だけに写り、パスは載らない（SEC-4・#1815）。
+    /// bind mount の段の user namespace 由来 2 理由が `Mount` 監査イベントに写り、パスは載らない（SEC-4・#2072）。
     #[test]
     fn sec4_2072_launch_mount_audit_event_maps_user_namespace_reasons() {
         for r in ViolationReason::MOUNT_BINDS_USER_NAMESPACE_REASONS {
@@ -1087,6 +1087,7 @@ mod tests {
         );
     }
 
+    /// 監査イベントはマウント層の 3 種別だけに写り、パスは載らない（SEC-4・#1815）。
     #[test]
     fn sec4_1815_launch_mount_audit_event_maps_mount_layer_only() {
         assert_eq!(

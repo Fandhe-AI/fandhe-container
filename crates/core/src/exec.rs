@@ -426,8 +426,8 @@ pub fn record_exec_worker_rejection<E>(
 /// 呼び出し元は、子が状態 pipe で運んだ失敗を復号した親プロセス（`launch_status` の判定。将来は本番 launcher）。
 /// `reason` は `ViolationReason::from_launch_token` で引き直した値を渡す。種別 `mount_target`・
 /// `shared_propagation`・`rootfs_pivot` と、bind mount の段の user namespace 由来の 2 理由
-/// （`user_namespace_required`・`host_root_identity_mapping`。SEC-5・#2072）だけが層 `mount` のパスなし・理由コードつきのレコードになり
-/// （[`audit_mount_violation`] と同じ写像）、`establish_precondition`・`evidence_mismatch` は記録せず
+/// （`user_namespace_required`・`host_root_identity_mapping`。SEC-5・#2072）だけが、層 `mount` の
+/// パスなし・理由コードつきのレコードになり（[`audit_mount_violation`] と同じ写像）、`establish_precondition`・`evidence_mismatch` は記録せず
 /// `NotApplicable`。時刻と PID は記録を行った親プロセスのもの（違反した子ではない）。パスは載らない。
 /// 記録の成否で `error` は変わらない（fail-closed）。
 pub fn record_launch_mount_rejection<E>(

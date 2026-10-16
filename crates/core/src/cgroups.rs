@@ -68,8 +68,12 @@
 //!   検証つきで開き、`oci_runtime::ContainerCgroupRemover` の実装として [`DelegatedCgroup::remove_child`] へ渡す
 //!   （`oci_runtime::delete` が状態記録の削除の前に呼ぶ。本番の呼び出し元による結線は未実装）。
 //!   `ContainerCgroupRemover::scope` は検出した委譲パス（[`DelegatedCgroup::path`] と同じ文字列）を返し、
-//!   delete は状態に記録された配置（`StateRecord::cgroup`）のスコープと一致するときだけ、記録された instance の
-//!   名前（`fc-<id>@<n>`）で削除・不存在確認を行う。削除の直前に、コンテナ cgroup 直下に残った exec 用の
+//!   delete は状態に記録された配置（`StateRecord::cgroup`）のスコープと一致するときは、記録された instance の
+//!   名前（`fc-<id>@<n>`）で削除・不存在確認を行う。一致しないとき（別の端末・スコープの回収後）は、#2060 の
+//!   オーナー決定（2026-10-16・案 B。#1314 の決定 3-ii の delete の行を変更）により、記録のスコープを
+//!   [`RecordedCgroupScope`]（`recorded_scope` サブモジュール。#2096）で fd 起点（`O_NOFOLLOW`）に検証つきで
+//!   開いて消す（`ContainerCgroupRemover::remove_recorded`）。検出時と同じ委譲の検証〔所有者・`cgroup.type`〕に
+//!   通らなければ何も消さず失敗し、スコープが無ければ `NotPresent` である。削除の直前に、コンテナ cgroup 直下に残った exec 用の
 //!   子 cgroup（`exec-*`）を `cgroup.kill` で止めて消す（全体で 5 秒の期限つき。失敗・件数上限の超過は
 //!   `Err` で返し、コンテナ cgroup の `rmdir` は試みない。#1596・SUP-6。コンテナ cgroup 自体には `cgroup.kill`
 //!   を書かない）。`remove` は停止済みのコンテナに対してだけ呼ぶ前提で、kill の前にコンテナ cgroup 自身の
@@ -107,7 +111,9 @@ use std::os::unix::fs::MetadataExt as _;
 use crate::observability::{OpName, OpRecorder};
 use crate::oci_runtime::{CgroupRemoval, ContainerCgroupRemover};
 use crate::sys::{self, SysError};
-use crate::traits::{CgroupScope, ContainerId, ErrorCode, StateRevision, TraitError};
+use crate::traits::{
+    CgroupPlacement, CgroupScope, ContainerId, ErrorCode, StateRevision, TraitError,
+};
 
 mod cpu;
 pub use cpu::{CpuMax, CpuQuota, NANO_CPUS_PER_CPU};
@@ -142,11 +148,13 @@ pub use start_chain::{
 };
 mod exec_join;
 mod exec_kill;
+mod recorded_scope;
 pub(crate) use exec_join::{ExecJoinFds, contains_pid, open_cgroup_by_path};
 pub(crate) use exec_kill::{
     EXEC_SWEEP_DELETE_TIMEOUT, ExecChildCgroupFds, ExecChildRemoval, ExecChildSweep, SweepMode,
     remove_exec_child_cgroup_at, sweep_exec_children_at, validate_exec_child_name,
 };
+pub use recorded_scope::RecordedCgroupScope;
 
 /// 退避リーフ cgroup の名前。自プロセスの移動先（レイアウトは本モジュール冒頭を参照）。
 const EVACUATION_LEAF: &str = "fc-runtime";
@@ -963,27 +971,7 @@ impl DelegatedCgroup {
         }
         let fd = cur;
 
-        if euid != 0 {
-            check_owned_by(&fd, euid)?;
-        }
-        // `cgroup.type` はルート cgroup にのみ存在しない。非ルートで欠落する場合は
-        // 委譲済みと確認できないため fail-closed でエラーにする（ENOENT を許容するのはルートのみ）。
-        match read_iface(
-            CgroupStep::CheckDelegation,
-            fd.as_fd(),
-            "cgroup.type",
-            SMALL_FILE_LIMIT,
-        ) {
-            Ok(t) if t.trim() != "domain" => {
-                return Err(CgroupError::precondition(
-                    CgroupStep::CheckDelegation,
-                    "delegated cgroup is not of type domain",
-                ));
-            }
-            Ok(_) => {}
-            Err(e) if e.code == ErrorCode::NotFound && path.is_root() => {}
-            Err(e) => return Err(e),
-        }
+        verify_delegated_scope(&fd, path.is_root(), euid)?;
         let controllers = ControllerSet::parse(&read_iface(
             CgroupStep::ReadControllers,
             fd.as_fd(),
@@ -1283,14 +1271,7 @@ impl DelegatedCgroup {
     /// `child` がこの親の配下で作られたものであることを確認したうえで、`Self::remove_verified` で
     /// 同一性確認・削除・削除済み確認を行う。
     pub fn remove_child(&self, child: &ContainerCgroup) -> Result<(), CgroupError> {
-        let step = CgroupStep::Cleanup;
-        if child.parent_id != dir_identity(step, self.fd.as_fd(), "stat parent cgroup")? {
-            return Err(CgroupError::precondition(
-                step,
-                "container cgroup does not belong to this delegated cgroup",
-            ));
-        }
-        self.remove_verified(child.name.as_str(), child.fd.as_fd())
+        remove_child_at(self.fd.as_fd(), child)
     }
 
     /// 名前で既存のコンテナ用子 cgroup を検証つきで開く（TASK-30.3・別プロセスの delete 用）。
@@ -1301,31 +1282,12 @@ impl DelegatedCgroup {
     /// `PermissionDenied`）。返すハンドルの `parent_id` は本スコープの親で、[`Self::remove_child`] の
     /// 親照合を通る。開いた後の差し替えは `remove_verified` の同一性確認が検出する。
     pub fn open_child(&self, name: &CgroupName) -> Result<Option<ContainerCgroup>, CgroupError> {
-        let step = CgroupStep::Cleanup;
-        let fd = match open_cgroup_dir(step, self.fd.as_fd(), name.as_str()) {
-            Ok(fd) => fd,
-            Err(e) if e.code == ErrorCode::NotFound => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        let euid = sys::effective_uid();
-        if euid != 0 {
-            let dup = fd
-                .try_clone()
-                .map_err(|e| io_error(step, "dup container cgroup", &e))?;
-            if owner_uid(step, dup, "stat container cgroup")? != euid {
-                return Err(CgroupError::new(
-                    ErrorCode::PermissionDenied,
-                    step,
-                    "container cgroup is not owned by the effective user",
-                ));
-            }
-        }
-        let parent_id = dir_identity(step, self.fd.as_fd(), "stat parent cgroup")?;
-        Ok(Some(ContainerCgroup {
-            name: name.clone(),
-            fd,
-            parent_id,
-        }))
+        open_child_with(
+            self.fd.as_fd(),
+            name,
+            sys::effective_uid(),
+            &open_cgroup_dir,
+        )
     }
 
     /// 親直下の `name` を、保持 fd `held` と同一の cgroup であることを確かめてから削除し、削除済みを確認する。
@@ -1341,6 +1303,55 @@ impl DelegatedCgroup {
     fn remove_verified(&self, name: &str, held: BorrowedFd<'_>) -> Result<(), CgroupError> {
         remove_verified_at(self.fd.as_fd(), name, held)
     }
+}
+
+/// `parent` 直下のコンテナ用子 cgroup を検証つきで開く（[`DelegatedCgroup::open_child`] の実体）。
+///
+/// 記録済みスコープを開く経路（`RecordedCgroupScope`。#2096）も、親 fd を差し替えて共用する。`open_dir` は
+/// 子ディレクトリを開く関数で、本番は [`open_cgroup_dir`]（`O_NOFOLLOW`・cgroup2 確認）。テストだけが
+/// tmpfs 向けに差し替える。`euid` が 0 でなければ所有者が euid であることを確かめる。存在しなければ `Ok(None)`。
+fn open_child_with(
+    parent: BorrowedFd<'_>,
+    name: &CgroupName,
+    euid: u32,
+    open_dir: &dyn Fn(CgroupStep, BorrowedFd<'_>, &str) -> Result<OwnedFd, CgroupError>,
+) -> Result<Option<ContainerCgroup>, CgroupError> {
+    let step = CgroupStep::Cleanup;
+    let fd = match open_dir(step, parent, name.as_str()) {
+        Ok(fd) => fd,
+        Err(e) if e.code == ErrorCode::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if euid != 0 {
+        let dup = fd
+            .try_clone()
+            .map_err(|e| io_error(step, "dup container cgroup", &e))?;
+        if owner_uid(step, dup, "stat container cgroup")? != euid {
+            return Err(CgroupError::new(
+                ErrorCode::PermissionDenied,
+                step,
+                "container cgroup is not owned by the effective user",
+            ));
+        }
+    }
+    let parent_id = dir_identity(step, parent, "stat parent cgroup")?;
+    Ok(Some(ContainerCgroup {
+        name: name.clone(),
+        fd,
+        parent_id,
+    }))
+}
+
+/// `child` が `parent` の配下で作られたものであることを確かめて削除する（[`DelegatedCgroup::remove_child`] の実体）。
+fn remove_child_at(parent: BorrowedFd<'_>, child: &ContainerCgroup) -> Result<(), CgroupError> {
+    let step = CgroupStep::Cleanup;
+    if child.parent_id != dir_identity(step, parent, "stat parent cgroup")? {
+        return Err(CgroupError::precondition(
+            step,
+            "container cgroup does not belong to this delegated cgroup",
+        ));
+    }
+    remove_verified_at(parent, child.name.as_str(), child.fd.as_fd())
 }
 
 /// `parent` 直下の `name` を、保持 fd `held` と同一の cgroup であることを確かめてから削除し、削除済みを確認する
@@ -1419,6 +1430,26 @@ impl ContainerCgroupRemover for DelegatedCgroup {
     ) -> Result<CgroupRemoval, TraitError> {
         self.remove_container_cgroup(id, instance, Some(recorder))
     }
+
+    /// 記録された配置のスコープを検証つきで直接開いて、そのコンテナ cgroup を削除する（#2096・#2060 案 B）。
+    ///
+    /// 検出した委譲スコープ（`self`）は使わない。`oci_runtime::delete` が、記録のスコープと
+    /// [`Self::scope`] が食い違うときだけ呼ぶ。検証と契約は `RecordedCgroupScope` を参照。
+    fn remove_recorded(
+        &self,
+        id: &ContainerId,
+        placement: &CgroupPlacement,
+        recorder: &OpRecorder,
+    ) -> Result<CgroupRemoval, TraitError> {
+        recorded_scope::remove_recorded_with(
+            id,
+            placement,
+            Some(recorder),
+            sys::effective_uid(),
+            &open_cgroup_root,
+            &open_cgroup_dir,
+        )
+    }
 }
 
 impl DelegatedCgroup {
@@ -1429,35 +1460,53 @@ impl DelegatedCgroup {
         instance: StateRevision,
         recorder: Option<&OpRecorder>,
     ) -> Result<CgroupRemoval, TraitError> {
-        // 名前を作れない（長さ超過）cgroup は `prepare` に渡す名前も同じ規則で作れないため存在し得ない。
-        // 失敗にすると該当レコードが永久に削除不能になるので NotPresent とする。
-        let Ok(name) = CgroupName::for_instance(id, instance) else {
-            return Ok(CgroupRemoval::NotPresent);
-        };
-        match self.open_child(&name).map_err(removal_error)? {
-            None => Ok(CgroupRemoval::NotPresent),
-            Some(child) => {
-                // コンテナは停止済みなので、残った exec 用の子 cgroup はすべて止めて消す。残すと下の
-                // `rmdir` が EBUSY になり、何度再試行しても成功しない。停止済みでない（コンテナ cgroup 自身に
-                // プロセスが居る）ときは掃除が何も kill せず `FailedPrecondition` を返す。
-                let deadline = std::time::Instant::now() + EXEC_SWEEP_DELETE_TIMEOUT;
-                let swept = sweep_exec_children_at(
-                    child.fd.as_fd(),
-                    SweepMode::KillAll,
-                    deadline,
-                    recorder,
-                )
-                .map_err(removal_error)?;
-                if swept.failed > 0 || swept.truncated {
-                    return Err(sweep_removal_error(&swept));
-                }
-                match self.remove_child(&child) {
-                    Ok(()) => Ok(CgroupRemoval::Removed),
-                    // open_child の後に並行 delete 等で既に消えた。目的の状態（cgroup 無し）に
-                    // 到達済みなので成功扱いにする（OCI-6。TraitError にするとレコードが残る）。
-                    Err(e) if e.code == ErrorCode::NotFound => Ok(CgroupRemoval::NotPresent),
-                    Err(e) => Err(removal_error(e)),
-                }
+        remove_container_cgroup_with(
+            self.fd.as_fd(),
+            id,
+            instance,
+            recorder,
+            sys::effective_uid(),
+            &open_cgroup_dir,
+        )
+    }
+}
+
+/// `parent`（委譲スコープの fd）直下の `fc-<id>@<instance>` を削除する本体。検出したスコープ
+/// （[`DelegatedCgroup`]）と記録済みスコープ（`RecordedCgroupScope`。#2096）の両方が共用する（削除の経路を
+/// 2 本にしない）。名前は `id` と `instance` から [`CgroupName::for_instance`] で作り、それ以外には届かない。
+/// `euid`・`open_dir` はテストの継ぎ目（[`open_child_with`] と同じ）。
+fn remove_container_cgroup_with(
+    parent: BorrowedFd<'_>,
+    id: &ContainerId,
+    instance: StateRevision,
+    recorder: Option<&OpRecorder>,
+    euid: u32,
+    open_dir: &dyn Fn(CgroupStep, BorrowedFd<'_>, &str) -> Result<OwnedFd, CgroupError>,
+) -> Result<CgroupRemoval, TraitError> {
+    // 名前を作れない（長さ超過）cgroup は `prepare` に渡す名前も同じ規則で作れないため存在し得ない。
+    // 失敗にすると該当レコードが永久に削除不能になるので NotPresent とする。
+    let Ok(name) = CgroupName::for_instance(id, instance) else {
+        return Ok(CgroupRemoval::NotPresent);
+    };
+    match open_child_with(parent, &name, euid, open_dir).map_err(removal_error)? {
+        None => Ok(CgroupRemoval::NotPresent),
+        Some(child) => {
+            // コンテナは停止済みなので、残った exec 用の子 cgroup はすべて止めて消す。残すと下の
+            // `rmdir` が EBUSY になり、何度再試行しても成功しない。停止済みでない（コンテナ cgroup 自身に
+            // プロセスが居る）ときは掃除が何も kill せず `FailedPrecondition` を返す。
+            let deadline = std::time::Instant::now() + EXEC_SWEEP_DELETE_TIMEOUT;
+            let swept =
+                sweep_exec_children_at(child.fd.as_fd(), SweepMode::KillAll, deadline, recorder)
+                    .map_err(removal_error)?;
+            if swept.failed > 0 || swept.truncated {
+                return Err(sweep_removal_error(&swept));
+            }
+            match remove_child_at(parent, &child) {
+                Ok(()) => Ok(CgroupRemoval::Removed),
+                // open_child の後に並行 delete 等で既に消えた。目的の状態（cgroup 無し）に
+                // 到達済みなので成功扱いにする（OCI-6。TraitError にするとレコードが残る）。
+                Err(e) if e.code == ErrorCode::NotFound => Ok(CgroupRemoval::NotPresent),
+                Err(e) => Err(removal_error(e)),
             }
         }
     }
@@ -1482,6 +1531,33 @@ fn removal_error(e: CgroupError) -> TraitError {
         _ => "failed to remove container cgroup",
     };
     TraitError::new(e.code, message)
+}
+
+/// 委譲スコープの検証（所有者と `cgroup.type`）。[`DelegatedCgroup::detect`] と
+/// `RecordedCgroupScope::open`（記録済みスコープを開く経路。#2096・OCI-6・CORE-3）が共用し、規則が食い違わないようにする。
+///
+/// euid が 0 でなければディレクトリ・`cgroup.procs`・`cgroup.subtree_control` の所有者が euid であること、
+/// `cgroup.type` が `domain` であることを確かめる。`cgroup.type` はルート cgroup にのみ存在しないため、
+/// ENOENT を許すのはルート（`is_root`）だけで、非ルートの欠落は委譲済みと確認できず fail-closed にする。
+/// `euid` を引数で受けるのはテストの継ぎ目のため。
+fn verify_delegated_scope(fd: &OwnedFd, is_root: bool, euid: u32) -> Result<(), CgroupError> {
+    if euid != 0 {
+        check_owned_by(fd, euid)?;
+    }
+    match read_iface(
+        CgroupStep::CheckDelegation,
+        fd.as_fd(),
+        "cgroup.type",
+        SMALL_FILE_LIMIT,
+    ) {
+        Ok(t) if t.trim() != "domain" => Err(CgroupError::precondition(
+            CgroupStep::CheckDelegation,
+            "delegated cgroup is not of type domain",
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.code == ErrorCode::NotFound && is_root => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// ディレクトリ・`cgroup.procs`・`cgroup.subtree_control` の所有者がすべて `euid` であること

@@ -12,7 +12,8 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 target="$script_dir/build-guest-initrd.sh"
 
 for v in GUEST_INITRD_OUTPUT_DIR GUEST_INITRD_INIT GUEST_INITRD_COMPRESS GUEST_INITRD_LINKER \
-    GUEST_INITRD_CARGO GUEST_INITRD_UNAME_S GUEST_INITRD_EXPECT_UID GUEST_INITRD_TEST_SANDBOX; do
+    GUEST_INITRD_CARGO GUEST_INITRD_UNAME_S GUEST_INITRD_EXPECT_UID GUEST_INITRD_PRIVATE_GROUP \
+    GUEST_INITRD_TEST_SANDBOX; do
     unset "$v"
 done
 
@@ -203,9 +204,37 @@ chmod 700 "$out"
 newout
 mkdir "$out"
 chmod 770 "$out"
-run "$target" --init "$good" --output-dir "$out"
-check "3b group-writable output error code" unsafe-output "$(errcode)"
+run env GUEST_INITRD_PRIVATE_GROUP=no "$target" --init "$good" --output-dir "$out"
+check "3b group-writable shared group error code" unsafe-output "$(errcode)"
 chmod 700 "$out"
+# 自分専用 group（umask 002 の 0775 ツリー）の group 書き込みは許す（PR #2086 の指摘）。
+newout
+mkdir "$out"
+chmod 775 "$out"
+run env GUEST_INITRD_PRIVATE_GROUP=yes "$target" --init "$good" --output-dir "$out/sub"
+check "3b private-group 0775 ancestor exit code" 0 "$rc"
+chmod 700 "$out"
+# 出力先は ビルド前に 0700 で作られる（ビルド中に他者が先置きできない）。
+newout
+run env GUEST_INITRD_PRIVATE_GROUP=yes "$target" --init "$good" --output-dir "$out"
+check "3b created output exit code" 0 "$rc"
+check "3b created output mode" 700 "$(stat -c '%a' "$out" 2>/dev/null || stat -f '%Lp' "$out")"
+# 出力先が symlink の場合は拒否する。検査後の差し替えで別の場所へ書かせない。
+newout
+mkdir "$sb/real-$n"
+chmod 700 "$sb/real-$n"
+ln -s "$sb/real-$n" "$out"
+run "$target" --init "$good" --output-dir "$out"
+check "3b symlink output exit code" 2 "$rc"
+check "3b symlink output wrote nothing" "" "$(ls -A "$sb/real-$n")"
+# 親が symlink の場合は物理パスへ確定し、その配下へ作る（symlink 経由の再解決をしない）。
+newout
+mkdir "$sb/realparent-$n"
+chmod 700 "$sb/realparent-$n"
+ln -s "$sb/realparent-$n" "$out"
+run "$target" --init "$good" --output-dir "$out/sub"
+check "3b symlinked parent exit code" 0 "$rc"
+check "3b symlinked parent printed physical path" "$(cd -P "$sb/realparent-$n" && pwd -P)/sub/initrd.cpio.gz" "$(tail -n 1 "$sb/o.out")"
 # sticky 無しで他者が書ける祖先（未作成の出力先の親）も拒否し、何も作らない。
 newout
 mkdir "$out"

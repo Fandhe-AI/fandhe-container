@@ -106,9 +106,10 @@ esac
 cargo_cmd="cargo"
 host_os=""
 expect_uid=""
+private_group_seam=""
 sandbox="${GUEST_INITRD_TEST_SANDBOX:-}"
 seam_requested=0
-for v in GUEST_INITRD_CARGO GUEST_INITRD_UNAME_S GUEST_INITRD_EXPECT_UID; do
+for v in GUEST_INITRD_CARGO GUEST_INITRD_UNAME_S GUEST_INITRD_EXPECT_UID GUEST_INITRD_PRIVATE_GROUP; do
     [ -z "${!v:-}" ] || seam_requested=1
 done
 if [ "$seam_requested" -eq 1 ]; then
@@ -123,6 +124,10 @@ if [ "$seam_requested" -eq 1 ]; then
     [ -z "${GUEST_INITRD_CARGO:-}" ] || cargo_cmd="$GUEST_INITRD_CARGO"
     host_os="${GUEST_INITRD_UNAME_S:-}"
     expect_uid="${GUEST_INITRD_EXPECT_UID:-}"
+    case "${GUEST_INITRD_PRIVATE_GROUP:-}" in
+        "" | yes | no) private_group_seam="${GUEST_INITRD_PRIVATE_GROUP:-}" ;;
+        *) err test-seam-refused "GUEST_INITRD_PRIVATE_GROUP must be yes or no"; exit 2 ;;
+    esac
     if [ -n "$expect_uid" ] && ! [[ "$expect_uid" =~ ^[0-9]{1,10}$ ]]; then
         err test-seam-refused "GUEST_INITRD_EXPECT_UID must be numeric"
         exit 2
@@ -154,29 +159,65 @@ done
 # 出力先と祖先ディレクトリが他者に書き換えられないことの検査（fail-closed。PR #2086 の指摘）。
 # 他ユーザーが書き込める場所だと、mktemp が作った名前を観測して削除し、再オープン前に被害者の
 # ファイルへの symlink へ差し替えられ、write_info のリダイレクトや cp が参照先を上書きする。
-# 出力先自身は group/other 書き込み可を許さず、祖先は sticky 無しの group/other 書き込み可を拒否する
-# （/tmp のような sticky は他者の名前を消せないため許す）。所有者は実際の実行ユーザーか root に限る（テスト用の EXPECT_UID の差し替えは入力側のみ）。
-# 物理パス（cd -P）で辿り、存在しない出力先は最も近い既存の祖先から検査する。
+# 出力先自身は other 書き込み可と、自分専用でない group の書き込み可を許さず、祖先は sticky 無しの
+# 同条件を拒否する（/tmp のような sticky は他者の名前を消せないため許す）。自分専用 group
+# （primary group で、他に所属ユーザーがいない。umask 002 の Debian / Ubuntu 慣行）の group 書き込みは許す。
+# 所有者は実際の実行ユーザーか root に限る（テスト用の EXPECT_UID の差し替えは入力側のみ）。
+# 検査した物理パスで output_dir を確定し、以降の mkdir・mktemp・write_info・cp はすべてそのパスを使う
+# （検査後の symlink 差し替えで別の場所へ書かせない）。
+private_group_cache=""
+group_is_private() { # 自分の primary group が自分専用なら 0
+    if [ -n "$private_group_seam" ]; then
+        [ "$private_group_seam" = "yes" ]
+        return
+    fi
+    if [ -z "$private_group_cache" ]; then
+        private_group_cache=no
+        if command -v getent >/dev/null 2>&1; then
+            local gid user members others
+            gid="$(id -g)"
+            user="$(id -un)"
+            members="$(getent group "$gid" 2>/dev/null | awk -F: '{print $4}')"
+            others="$(getent passwd 2>/dev/null | awk -F: -v g="$gid" -v u="$user" '$4==g && $1!=u {n++} END {print n+0}')"
+            if [ "$others" = "0" ] && { [ -z "$members" ] || [ "$members" = "$user" ]; }; then
+                private_group_cache=yes
+            fi
+        fi
+    fi
+    [ "$private_group_cache" = "yes" ]
+}
 dir_unsafe_reason() { # $1=ディレクトリ $2=self|ancestor。危険なら理由を stdout に出す
     local d="$1" self_uid; self_uid="$(id -u)"
+    local sticky_filter=()
+    [ "$2" = "self" ] || sticky_filter=(! -perm -1000)
     if [ -z "$(find "$d" -prune \( -user "$self_uid" -o -user 0 \) -print 2>/dev/null)" ]; then
         printf 'is owned by another user'
-    elif [ "$2" = "self" ] && [ -n "$(find "$d" -prune \( -perm -0020 -o -perm -0002 \) -print 2>/dev/null)" ]; then
-        printf 'is group or other writable'
-    elif [ -n "$(find "$d" -prune \( -perm -0020 -o -perm -0002 \) ! -perm -1000 -print 2>/dev/null)" ]; then
-        printf 'is group or other writable without the sticky bit'
+    elif [ "$2" = "self" ] && [ -n "$(find "$d" -prune -perm -0002 -print 2>/dev/null)" ]; then
+        printf 'is other writable'
+    elif [ -n "$(find "$d" -prune -perm -0002 ${sticky_filter[@]+"${sticky_filter[@]}"} -print 2>/dev/null)" ]; then
+        printf 'is other writable without the sticky bit'
+    elif [ -n "$(find "$d" -prune -perm -0020 ${sticky_filter[@]+"${sticky_filter[@]}"} -print 2>/dev/null)" ]; then
+        if ! { group_is_private && [ -n "$(find "$d" -prune -group "$(id -g)" -print 2>/dev/null)" ]; }; then
+            printf 'is group writable and the group is shared'
+        fi
     fi
 }
 check_output_safe() {
-    local d="$output_dir" kind="self" reason
+    local d="$output_dir" kind="self" reason rest=""
     while [ ! -d "$d" ] && [ "$d" != "/" ]; do
+        rest="/${d##*/}$rest"
         d="$(dirname "$d")"
         kind="ancestor"
     done
+    case "$rest" in
+        */./* | */../* | */. | */..) err bad-output "output path must not contain . or .. components"; exit 2 ;;
+    esac
     d="$(cd -P "$d" 2>/dev/null && pwd -P)" || {
         err bad-output "cannot resolve the output directory path"
         exit 2
     }
+    # 物理パスで確定する（以後の操作はこのパスだけを使う）。
+    if [ "$d" = "/" ]; then output_dir="$rest"; else output_dir="$d$rest"; fi
     while :; do
         reason="$(dir_unsafe_reason "$d" "$kind")"
         if [ -n "$reason" ]; then
@@ -191,11 +232,11 @@ check_output_safe() {
 
 # 空ディレクトリであることの検査（一覧取得の失敗は空と誤認しない。fail-closed）。
 check_output_free() {
-    check_output_safe
     if [ -L "$output_dir" ]; then
         err bad-output "output directory must not be a symlink"
         exit 2
     fi
+    check_output_safe
     if [ -e "$output_dir" ] && [ ! -d "$output_dir" ]; then
         err output-exists "output path exists and is not a directory"
         exit 2
@@ -253,6 +294,9 @@ cleanup() {
         kill "$wd_pid" 2>/dev/null || true
     fi
     [ -z "$work_dir" ] || rm -rf "$work_dir"
+    if [ "$rc" -ne 0 ] && [ "$publishing" -eq 0 ] && [ "$out_created" -eq 1 ]; then
+        rmdir "$output_dir" 2>/dev/null || true
+    fi
     if [ "$rc" -ne 0 ] && [ "$publishing" -eq 1 ]; then
         # 一時名と、自分が確定させたファイルだけを消す（他者の同名ファイルは触らない）。
         [ -z "$tmp_info" ] || rm -f -- "$tmp_info"
@@ -279,6 +323,38 @@ else
     exit 2
 fi
 check_output_free
+
+# 出力先は cargo build より前に 0700 で作り、所有者・モード・symlink でないことを確認する
+# （ビルド中に他者が同じパスへ置いた物を、後続の mktemp・cp が使わないようにする。PR #2086 の指摘）。
+if [ ! -d "$output_dir" ]; then
+    mkdir -m 0700 "$output_dir" 2>/dev/null || { err bad-output "cannot create the output directory"; exit 2; }
+    out_created=1
+fi
+output_dir_identity=""
+# 作成済みのディレクトリを (dev:inode) で識別し、公開直前に同一であることを再確認する。
+dir_identity() { # $1=ディレクトリ
+    if stat -c '%d:%i' "$1" 2>/dev/null; then return 0; fi
+    stat -f '%d:%i' "$1" 2>/dev/null
+}
+recheck_output_dir() {
+    local ident
+    if [ -L "$output_dir" ] || [ ! -d "$output_dir" ]; then
+        err unsafe-output "output directory changed during the build; refusing to publish"
+        exit 2
+    fi
+    if [ -n "$(dir_unsafe_reason "$output_dir" self)" ]; then
+        err unsafe-output "output directory ownership or mode changed during the build; refusing to publish"
+        exit 2
+    fi
+    ident="$(dir_identity "$output_dir")" || ident=""
+    if [ -z "$ident" ] || [ "$ident" != "$output_dir_identity" ]; then
+        err unsafe-output "output directory was replaced during the build; refusing to publish"
+        exit 2
+    fi
+}
+output_dir_identity="$(dir_identity "$output_dir")" || output_dir_identity=""
+[ -n "$output_dir_identity" ] || { err bad-environment "cannot stat the output directory"; exit 2; }
+recheck_output_dir
 
 # 子プロセスを上限秒で打ち切る。子は job control（set -m）で独立したプロセスグループにし、
 # 超過時はグループ全体へ TERM → 猶予後 KILL を送って消滅を確認する。超過時は 124 を返す。
@@ -512,10 +588,7 @@ fi
 
 # --- 出力（一時名へ書いてから ln で確定する。既存は上書きしない） ---
 publishing=1
-if [ ! -d "$output_dir" ]; then
-    mkdir -m 0700 "$output_dir" 2>/dev/null || { err bad-output "cannot create the output directory"; exit 2; }
-    out_created=1
-fi
+recheck_output_dir
 write_info() {
     printf 'init_sha256=%s\n' "$init_sha"
     printf 'init_bytes=%s\n' "$copy_size"

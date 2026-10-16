@@ -569,7 +569,7 @@ fn start_reporting(
             }
             Attempt::Failed { error, cleanup } => {
                 report(out, &StartReport::failed(&error));
-                if cleanup_after_report(deps, store.as_ref(), req.id(), timeouts, cleanup) {
+                if cleanup_after_report(deps, store, req.id(), timeouts, cleanup) {
                     Err(error.exit_code())
                 } else {
                     Err(exit_code_for(ErrorCode::Internal))
@@ -589,7 +589,7 @@ fn start_reporting(
     let late_until = Instant::now().checked_add(crate::start_contract::result_deadline(timeouts));
     match worker.wait_or_abandon(late_until) {
         Some((deps, outcome)) => {
-            abandoned_cleanup(deps, store.as_ref(), req.id(), timeouts, outcome);
+            abandoned_cleanup(deps, store, req.id(), timeouts, outcome);
         }
         None => {
             // 作業スレッドがまだ戻らない（放棄は待ちの打ち切りと同じロックの下で記した）。以後に戻った結果は
@@ -742,7 +742,7 @@ impl StartWorker {
                 let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
                 if matches!(*slot, WorkerSlot::Abandoned) {
                     drop(slot);
-                    abandoned_cleanup(deps, store.as_ref(), req.id(), &timeouts, outcome);
+                    abandoned_cleanup(deps, &store, req.id(), &timeouts, outcome);
                     return;
                 }
                 *slot = WorkerSlot::Done(deps, outcome);
@@ -880,7 +880,7 @@ fn discard_prepared(prepared: Prepared) -> Cleanup {
 /// （best effort。プロセスの終了までに終われば行う）。
 fn abandoned_cleanup(
     deps: Box<dyn StartDeps + Send>,
-    store: &dyn StateStore,
+    store: &Arc<dyn StateStore>,
     id: &ContainerId,
     timeouts: &StartTimeouts,
     outcome: PrepareOutcome,
@@ -891,10 +891,29 @@ fn abandoned_cleanup(
     };
     let _ = cleanup_after_report(deps, store, id, timeouts, cleanup);
 }
+/// 予約の解放を作業スレッドで行い、`limit` まで結果を待つ。解放できたと確認できたら `true`。
+///
+/// 期限内に確認できない場合・スレッドを作れない場合・解放が失敗した場合は `false`（予約と cgroup は残り、
+/// `recover_interrupted_start` での回復に委ねる。CORE-2・REPAIR-5）。期限後もスレッドは解放を続け得る。
+fn release_claim_bounded(
+    claimed: Box<ClaimedStart>,
+    store: &Arc<dyn StateStore>,
+    limit: Duration,
+) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let store = Arc::clone(store);
+    let spawned = std::thread::Builder::new()
+        .name("supervisor-claim-release".into())
+        .spawn(move || {
+            let _ = tx.send(claimed.release(store.as_ref()).is_ok());
+        });
+    spawned.is_ok() && rx.recv_timeout(limit).unwrap_or(false)
+}
+
 /// 報告の後の後始末。確かめられたら `true`（確かめられなければ cgroup は消さない。CORE-1・CORE-2）。
 fn cleanup_after_report(
     mut deps: Box<dyn StartDeps + Send>,
-    store: &dyn StateStore,
+    store: &Arc<dyn StateStore>,
     id: &ContainerId,
     timeouts: &StartTimeouts,
     cleanup: Cleanup,
@@ -902,16 +921,22 @@ fn cleanup_after_report(
     let confirmed = match cleanup {
         Cleanup::Nothing => return true,
         Cleanup::ReleaseCgroup => return release_logged(deps.as_mut()),
-        Cleanup::DiscardClaim(claimed) => match claimed.release(store) {
-            Ok(()) => return release_logged(deps.as_mut()),
-            Err(_) => {
-                // 予約が残り得る。cgroup は消さない。
-                log_event("start_claim_release_failed", Some(ErrorCode::Internal));
-                return false;
+        Cleanup::DiscardClaim(claimed) => {
+            // `release` は `StateStore::update` を同期実行するため、予約を持つ別スレッドで行い、待ちを有限にする
+            // （状態ストレージの write/fsync が止まっても無期限に止まらない。REPAIR-5）。
+            if release_claim_bounded(
+                claimed,
+                store,
+                crate::start_contract::result_deadline(timeouts),
+            ) {
+                return release_logged(deps.as_mut());
             }
-        },
+            // 予約が残り得る（期限内に確認できない場合を含む）。cgroup は消さない。
+            log_event("start_claim_release_failed", Some(ErrorCode::Internal));
+            return false;
+        }
         Cleanup::AfterFailure(launcher, pending, late) => {
-            settle_after_late_writes(store, &launcher, id, timeouts, pending, &late)
+            settle_after_late_writes(store.as_ref(), &launcher, id, timeouts, pending, &late)
         }
     };
     if confirmed {

@@ -29,7 +29,7 @@ SHELL := /bin/bash
 	test-integration cli-parity-selftest cli-parity-native-reclaim-check \
 	cli-parity-native-reclaim-selftest commit-msg-line-length-selftest crash-summary-check \
 	crash-summary-check-selftest lib-selftest \
-	vz-virtio-gpu-guest-check-selftest guest-kernel-build guest-kernel-build-selftest third-party-licenses-selftest deny-license-fail-closed-selftest \
+	vz-virtio-gpu-guest-check-selftest guest-kernel-build guest-kernel-build-selftest guest-initrd-build guest-initrd-build-selftest third-party-licenses-selftest deny-license-fail-closed-selftest \
 	bench-check-selftest bench-baseline-selftest fio-bench-selftest fio-baseline-ratio-selftest \
 	startup-latency-selftest net-setup-timing-selftest dns-helper-measure-selftest idle-memory-selftest \
 	idle-memory-supervised-selftest supervisor-pss-selftest concurrent-memory-selftest \
@@ -158,6 +158,12 @@ guest-kernel-build: ## macOS ゲストカーネル（arm64）を取得・sha256 
 
 guest-kernel-build-selftest: ## ゲストカーネルのビルドスクリプトの自己テスト（#1874・MAC-1・REPAIR-12。スタブのみ）
 	@guest/kernel/build-selftest.sh
+
+guest-initrd-build: ## macOS ゲスト init を静的リンクでビルドし /init だけの initrd（newc・gzip）を作る（TASK-64 追補・#1878・MAC-1。ローカルの実ビルド。make ci には含めない）
+	@scripts/build-guest-initrd.sh
+
+guest-initrd-build-selftest: ## ゲスト initrd 梱包スクリプトの自己テスト（#1878・MAC-1・REPAIR-12。スタブ・fixture のみ）
+	@scripts/build-guest-initrd-selftest.sh
 
 third-party-licenses-selftest: ## ライセンス表記生成スクリプトの自己テスト（スタブ cargo のみ。TASK-103.1）
 	@scripts/generate-third-party-licenses-selftest.sh

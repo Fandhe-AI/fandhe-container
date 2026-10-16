@@ -339,6 +339,42 @@ mod consts {
     pub const ENOTEMPTY: i32 = 39;
     // include/uapi/linux/magic.h の `CGROUP2_SUPER_MAGIC`（"cgrp"）。
     pub const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
+    // include/uapi/linux/magic.h の `SYSFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const SYSFS_MAGIC: i64 = 0x6265_6572;
+    // include/uapi/linux/magic.h の `DEBUGFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const DEBUGFS_MAGIC: i64 = 0x6462_6720;
+    // include/uapi/linux/magic.h の `TRACEFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const TRACEFS_MAGIC: i64 = 0x7472_6163;
+    // include/uapi/linux/magic.h の `SECURITYFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const SECURITYFS_MAGIC: i64 = 0x7363_6673;
+    // include/uapi/linux/magic.h の `CGROUP_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const CGROUP_SUPER_MAGIC: i64 = 0x0027_e0eb;
+    // include/uapi/linux/magic.h の `BPF_FS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const BPF_FS_MAGIC: i64 = 0xcafe_4a11;
+    // fs/configfs/mount.c の `CONFIGFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const CONFIGFS_MAGIC: i64 = 0x6265_6570;
+    // include/uapi/linux/magic.h の `PSTOREFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const PSTOREFS_MAGIC: i64 = 0x6165_676c;
+    // include/uapi/linux/magic.h の `EFIVARFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const EFIVARFS_MAGIC: i64 = 0xde5e_81e4;
+    // include/uapi/linux/magic.h の `SELINUX_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const SELINUX_MAGIC: i64 = 0xf97c_ff8c;
+    // include/uapi/linux/magic.h の `SMACK_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const SMACK_MAGIC: i64 = 0x4341_5d53;
+    // include/uapi/linux/magic.h の `BINFMTFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const BINFMTFS_MAGIC: i64 = 0x4249_4e4d;
+    // fs/fuse/control.c の `FUSE_CTL_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const FUSE_CTL_SUPER_MAGIC: i64 = 0x6573_5543;
+    // include/uapi/linux/magic.h の `RDTGROUP_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const RDTGROUP_SUPER_MAGIC: i64 = 0x0765_5821;
+    // include/uapi/linux/magic.h の `XENFS_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const XENFS_SUPER_MAGIC: i64 = 0xabba_1974;
+    // include/uapi/linux/magic.h の `NSFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const NSFS_MAGIC: i64 = 0x6e73_6673;
+    // ipc/mqueue.c の `MQUEUE_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const MQUEUE_MAGIC: i64 = 0x1980_0202;
+    // include/uapi/linux/magic.h の `BINDERFS_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const BINDERFS_SUPER_MAGIC: i64 = 0x6c6f_6f70;
     // include/linux/statfs.h の `ST_NOEXEC`・`ST_VALID`（`statfs.f_flags`。全アーキテクチャ共通）。
     pub const ST_NOEXEC: i64 = 0x0008;
     // include/linux/statfs.h の `ST_NODEV`（#1676・rootfs の nodev の事後検証）。
@@ -640,6 +676,42 @@ mod consts {
     pub const ENOTEMPTY: i32 = 39;
     // include/uapi/linux/magic.h の `CGROUP2_SUPER_MAGIC`（"cgrp"）。
     pub const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
+    // include/uapi/linux/magic.h の `SYSFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const SYSFS_MAGIC: i64 = 0x6265_6572;
+    // include/uapi/linux/magic.h の `DEBUGFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const DEBUGFS_MAGIC: i64 = 0x6462_6720;
+    // include/uapi/linux/magic.h の `TRACEFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const TRACEFS_MAGIC: i64 = 0x7472_6163;
+    // include/uapi/linux/magic.h の `SECURITYFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const SECURITYFS_MAGIC: i64 = 0x7363_6673;
+    // include/uapi/linux/magic.h の `CGROUP_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const CGROUP_SUPER_MAGIC: i64 = 0x0027_e0eb;
+    // include/uapi/linux/magic.h の `BPF_FS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const BPF_FS_MAGIC: i64 = 0xcafe_4a11;
+    // fs/configfs/mount.c の `CONFIGFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const CONFIGFS_MAGIC: i64 = 0x6265_6570;
+    // include/uapi/linux/magic.h の `PSTOREFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const PSTOREFS_MAGIC: i64 = 0x6165_676c;
+    // include/uapi/linux/magic.h の `EFIVARFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const EFIVARFS_MAGIC: i64 = 0xde5e_81e4;
+    // include/uapi/linux/magic.h の `SELINUX_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const SELINUX_MAGIC: i64 = 0xf97c_ff8c;
+    // include/uapi/linux/magic.h の `SMACK_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const SMACK_MAGIC: i64 = 0x4341_5d53;
+    // include/uapi/linux/magic.h の `BINFMTFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const BINFMTFS_MAGIC: i64 = 0x4249_4e4d;
+    // fs/fuse/control.c の `FUSE_CTL_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const FUSE_CTL_SUPER_MAGIC: i64 = 0x6573_5543;
+    // include/uapi/linux/magic.h の `RDTGROUP_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const RDTGROUP_SUPER_MAGIC: i64 = 0x0765_5821;
+    // include/uapi/linux/magic.h の `XENFS_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const XENFS_SUPER_MAGIC: i64 = 0xabba_1974;
+    // include/uapi/linux/magic.h の `NSFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const NSFS_MAGIC: i64 = 0x6e73_6673;
+    // ipc/mqueue.c の `MQUEUE_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const MQUEUE_MAGIC: i64 = 0x1980_0202;
+    // include/uapi/linux/magic.h の `BINDERFS_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const BINDERFS_SUPER_MAGIC: i64 = 0x6c6f_6f70;
     // include/linux/statfs.h の `ST_NOEXEC`・`ST_VALID`（`statfs.f_flags`。全アーキテクチャ共通）。
     pub const ST_NOEXEC: i64 = 0x0008;
     // include/linux/statfs.h の `ST_NODEV`（#1676・rootfs の nodev の事後検証）。
@@ -912,6 +984,24 @@ mod consts {
     pub const EBUSY: i32 = -16;
     pub const ENOTEMPTY: i32 = -17;
     pub const CGROUP2_SUPER_MAGIC: i64 = 0;
+    pub const SYSFS_MAGIC: i64 = 0;
+    pub const DEBUGFS_MAGIC: i64 = 0;
+    pub const TRACEFS_MAGIC: i64 = 0;
+    pub const SECURITYFS_MAGIC: i64 = 0;
+    pub const CGROUP_SUPER_MAGIC: i64 = 0;
+    pub const BPF_FS_MAGIC: i64 = 0;
+    pub const CONFIGFS_MAGIC: i64 = 0;
+    pub const PSTOREFS_MAGIC: i64 = 0;
+    pub const EFIVARFS_MAGIC: i64 = 0;
+    pub const SELINUX_MAGIC: i64 = 0;
+    pub const SMACK_MAGIC: i64 = 0;
+    pub const BINFMTFS_MAGIC: i64 = 0;
+    pub const FUSE_CTL_SUPER_MAGIC: i64 = 0;
+    pub const RDTGROUP_SUPER_MAGIC: i64 = 0;
+    pub const XENFS_SUPER_MAGIC: i64 = 0;
+    pub const NSFS_MAGIC: i64 = 0;
+    pub const MQUEUE_MAGIC: i64 = 0;
+    pub const BINDERFS_SUPER_MAGIC: i64 = 0;
     pub const ST_NOEXEC: i64 = 0;
     pub const ST_NODEV: i64 = 0;
     pub const ST_RDONLY: i64 = 0;
@@ -3799,6 +3889,27 @@ fn statfs_of(fd: BorrowedFd<'_>) -> Result<StatFs, SysError> {
 /// CORE-3: cgroup2 の `statfs.f_type` 定数（`CGROUP2_SUPER_MAGIC`）。
 pub(crate) const CGROUP2_MAGIC: i64 = consts::CGROUP2_SUPER_MAGIC;
 
+/// #2098: bind mount の元として拒否する疑似 FS の `statfs.f_type`（`exec::bind_mounts` の拒否リストが使う）。
+/// 対応外アーキテクチャでは 0 になるが、`fs_type` が先に `Unsupported` を返すため照合には使われない。
+pub(crate) const SYSFS_MAGIC: i64 = consts::SYSFS_MAGIC;
+pub(crate) const DEBUGFS_MAGIC: i64 = consts::DEBUGFS_MAGIC;
+pub(crate) const TRACEFS_MAGIC: i64 = consts::TRACEFS_MAGIC;
+pub(crate) const SECURITYFS_MAGIC: i64 = consts::SECURITYFS_MAGIC;
+pub(crate) const CGROUP_SUPER_MAGIC: i64 = consts::CGROUP_SUPER_MAGIC;
+pub(crate) const BPF_FS_MAGIC: i64 = consts::BPF_FS_MAGIC;
+pub(crate) const CONFIGFS_MAGIC: i64 = consts::CONFIGFS_MAGIC;
+pub(crate) const PSTOREFS_MAGIC: i64 = consts::PSTOREFS_MAGIC;
+pub(crate) const EFIVARFS_MAGIC: i64 = consts::EFIVARFS_MAGIC;
+pub(crate) const SELINUX_MAGIC: i64 = consts::SELINUX_MAGIC;
+pub(crate) const SMACK_MAGIC: i64 = consts::SMACK_MAGIC;
+pub(crate) const BINFMTFS_MAGIC: i64 = consts::BINFMTFS_MAGIC;
+pub(crate) const FUSE_CTL_SUPER_MAGIC: i64 = consts::FUSE_CTL_SUPER_MAGIC;
+pub(crate) const RDTGROUP_SUPER_MAGIC: i64 = consts::RDTGROUP_SUPER_MAGIC;
+pub(crate) const XENFS_SUPER_MAGIC: i64 = consts::XENFS_SUPER_MAGIC;
+pub(crate) const NSFS_MAGIC: i64 = consts::NSFS_MAGIC;
+pub(crate) const MQUEUE_MAGIC: i64 = consts::MQUEUE_MAGIC;
+pub(crate) const BINDERFS_SUPER_MAGIC: i64 = consts::BINDERFS_SUPER_MAGIC;
+
 /// glibc の `gnu_dev_makedev` と同じビット配置で `dev_t` を作る純関数（`unsafe` なし）。
 pub(crate) const fn makedev(major: u32, minor: u32) -> u64 {
     let (major, minor) = (major as u64, minor as u64);
@@ -5162,6 +5273,31 @@ mod tests {
         assert_eq!((EAFNOSUPPORT, EPROTONOSUPPORT, ECONNREFUSED), (97, 93, 111));
         assert_eq!(std::mem::size_of::<SockaddrNl>(), 12);
         assert_eq!(std::mem::size_of::<PollFd>(), 8);
+    }
+
+    /// #2098: 疑似 FS の magic 定数の具体値（include/uapi/linux/magic.h と、非 uapi の 3 つはカーネルのソース）。
+    /// 0xcafe4a11 などは `i32::MAX` を超えるため、符号拡張されない正の `i64` のリテラルで固定する。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sec1_2098_pseudo_fs_magics_are_exact() {
+        assert_eq!(SYSFS_MAGIC, 0x6265_6572);
+        assert_eq!(DEBUGFS_MAGIC, 0x6462_6720);
+        assert_eq!(TRACEFS_MAGIC, 0x7472_6163);
+        assert_eq!(SECURITYFS_MAGIC, 0x7363_6673);
+        assert_eq!(CGROUP_SUPER_MAGIC, 0x0027_e0eb);
+        assert_eq!(BPF_FS_MAGIC, 0xcafe_4a11);
+        assert_eq!(CONFIGFS_MAGIC, 0x6265_6570);
+        assert_eq!(PSTOREFS_MAGIC, 0x6165_676c);
+        assert_eq!(EFIVARFS_MAGIC, 0xde5e_81e4);
+        assert_eq!(SELINUX_MAGIC, 0xf97c_ff8c);
+        assert_eq!(SMACK_MAGIC, 0x4341_5d53);
+        assert_eq!(BINFMTFS_MAGIC, 0x4249_4e4d);
+        assert_eq!(FUSE_CTL_SUPER_MAGIC, 0x6573_5543);
+        assert_eq!(RDTGROUP_SUPER_MAGIC, 0x0765_5821);
+        assert_eq!(XENFS_SUPER_MAGIC, 0xabba_1974);
+        assert_eq!(NSFS_MAGIC, 0x6e73_6673);
+        assert_eq!(MQUEUE_MAGIC, 0x1980_0202);
+        assert_eq!(BINDERFS_SUPER_MAGIC, 0x6c6f_6f70);
     }
 
     /// CORE-3・TASK-32.1: cgroup 操作用の定数・`statfs` バッファの具体値。

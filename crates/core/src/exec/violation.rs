@@ -173,6 +173,9 @@ pub enum ViolationReason {
     BindSourceContainsRootfs,
     /// bind mount の元（または配下のマウント）が状態ストアのルートに到達する。適用の段が固定した元に対して判定する（#1915。SEC-1）。
     BindSourceReachesStateRoot,
+    /// bind mount の元（または `rbind` で公開される配下のマウント）が procfs・sysfs などの疑似 FS 上にある。
+    /// 適用の段が固定した fd の `fstatfs` の `f_type` と、付け替えた木の mountinfo の fstype で判定する（#2098・#2065 案 B。SEC-1）。
+    BindSourcePseudoFs,
     /// bind mount 先の既存の種別が元と合わない（ディレクトリと通常ファイルの取り違え等。#1913。SEC-1）。
     BindTargetKindMismatch,
     /// Landlock の適用時に、Mount 由来のルールの対象のマウント ID（`mnt_id`）が、pivot 前段が載せた直後に記録した
@@ -387,7 +390,7 @@ impl ViolationReason {
     ///
     /// 手書きの理由リストを別に持たず、種別（[`Self::kind`]）で絞って使う（[`Self::from_launch_token`]）。
     /// 足し忘れは単体テスト（`ALL` の件数が `as_str` の分岐数と一致すること）が検出する。
-    pub(super) const ALL: [ViolationReason; 60] = [
+    pub(super) const ALL: [ViolationReason; 61] = [
         Self::NoNamespaces,
         Self::HostnameWithoutUts,
         Self::PidWithoutMount,
@@ -421,6 +424,7 @@ impl ViolationReason {
         Self::BindSourceNotAccessible,
         Self::BindSourceContainsRootfs,
         Self::BindSourceReachesStateRoot,
+        Self::BindSourcePseudoFs,
         Self::BindTargetKindMismatch,
         Self::LandlockMountIdentityMismatch,
         Self::LandlockMountNotRoot,
@@ -570,6 +574,7 @@ impl ViolationReason {
             Self::BindSourceNotAccessible => "bind_source_not_accessible",
             Self::BindSourceContainsRootfs => "bind_source_contains_rootfs",
             Self::BindSourceReachesStateRoot => "bind_source_reaches_state_root",
+            Self::BindSourcePseudoFs => "bind_source_pseudo_fs",
             Self::BindTargetKindMismatch => "bind_target_kind_mismatch",
             Self::LandlockMountIdentityMismatch => "landlock_mount_identity_mismatch",
             Self::LandlockMountNotRoot => "landlock_mount_not_root",
@@ -637,6 +642,7 @@ impl ViolationReason {
             | Self::BindSourceNotAccessible
             | Self::BindSourceContainsRootfs
             | Self::BindSourceReachesStateRoot
+            | Self::BindSourcePseudoFs
             | Self::BindTargetKindMismatch
             | Self::LandlockMountIdentityMismatch
             | Self::LandlockMountNotRoot
@@ -693,6 +699,7 @@ impl ViolationReason {
             | Self::BindSourceNotAccessible
             | Self::BindSourceContainsRootfs
             | Self::BindSourceReachesStateRoot
+            | Self::BindSourcePseudoFs
             | Self::BindTargetKindMismatch => "SEC-1",
             Self::LandlockMountIdentityMismatch | Self::LandlockMountNotRoot => "CORE-5",
             Self::ExecTargetNotNestedPid1
@@ -726,6 +733,7 @@ impl ViolationReason {
             | Self::BindSourceUnsupportedType
             | Self::BindSourceContainsRootfs
             | Self::BindSourceReachesStateRoot
+            | Self::BindSourcePseudoFs
             | Self::BindTargetKindMismatch
             | Self::RootfsIsHostRoot => ErrorCode::InvalidArgument,
             Self::BindSourceNotAccessible => ErrorCode::PermissionDenied,
@@ -860,6 +868,9 @@ impl ViolationReason {
             }
             Self::BindSourceReachesStateRoot => {
                 "bind mount source must not expose the container state store"
+            }
+            Self::BindSourcePseudoFs => {
+                "bind mount source must not be on a pseudo filesystem such as procfs or sysfs"
             }
             Self::BindTargetKindMismatch => {
                 "bind mount target kind does not match the source (directory vs regular file)"

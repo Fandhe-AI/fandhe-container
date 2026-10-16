@@ -222,7 +222,7 @@ check_output_safe() {
     }
     # 物理パスで確定する（以後の操作はこのパスだけを使う）。
     if [ "$d" = "/" ]; then output_dir="$rest"; else output_dir="$d$rest"; fi
-    # 解決後が空（"/"・"/."・"/tmp/.." 等のルート）だと not-empty 検査と mkdir が空パスで崩れる。
+    # 解決後が空（"/"・"/."・"/.." 等のルート）だと not-empty 検査と mkdir が空パスで崩れる。
     if [ -z "$output_dir" ] || [ "$output_dir" = "/" ]; then
         err bad-output "output directory must not be the filesystem root or empty"
         exit 2

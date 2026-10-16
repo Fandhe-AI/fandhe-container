@@ -226,7 +226,7 @@ for mode in fail empty; do
     chmod 700 "$out"
 done
 # ルート・空に解決される出力先は拒否し、カレントディレクトリへ何も作らない。
-for p in / /. /tmp/..; do
+for p in / /. /..; do
     newout
     mkdir "$sb/cwd-$n"
     rc=0

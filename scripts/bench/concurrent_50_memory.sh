@@ -382,16 +382,106 @@ resolve_run_as() {
   fi
 }
 
-# setpriv・env は root が実行するため、実体が通常ファイルで root 所有・group / other 書き込み不可であることを確かめる
-# （symlink は解決先を検査する。自己テストのスタブは root 所有・権限が揃わないため、このときだけ通常ファイルであることの検査に緩める）。
+# setpriv・env は root が実行するため、実体だけでなく根から実体までのすべての要素を検証する（SUP-14・SUP-2。権限分離設計
+# docs/design/privilege-separation.md 7 章、crates/supervisor の launcher と同じ方針）。非特権ユーザーが書ける祖先ディレクトリが
+# あると、検証の後でエントリを差し替えられ、root のまま任意のコードを実行されるため。
+#   - ディレクトリ: root 所有・group / other 書き込み不可（sticky でも免除しない）。
+#   - symlink: root 所有のものだけ許し、自前で解決して解決後の経路の各要素にも同じ条件を課す（`..` は解決済みの経路を戻る）。
+#   - 最終要素: 通常ファイル・root 所有・group / other 書き込み不可・実行可能。
+# 自己テスト（FANDHE_CONCURRENT_MEMORY_SELFTEST=1 かつ FANDHE_CONCURRENT_MEMORY_SELFTEST_EXE_WALK=1）のときだけ、所有者の uid を
+# FANDHE_CONCURRENT_MEMORY_SELFTEST_EXE_OWNER_UID、検証の起点を FANDHE_CONCURRENT_MEMORY_SELFTEST_EXE_WALK_BASE（それより上の
+# 要素は検査しない）で差し替える。EXE_WALK が 1 でない自己テストのスタブは root 所有でないため、通常ファイルの検査に緩める。
 root_exe_is_safe() { # <絶対パス>
   case "$1" in /*) ;; *) return 1 ;; esac
   [ -x "$1" ] || return 1
-  if [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST:-}" = "1" ]; then
+  if [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST:-}" = "1" ] && [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST_EXE_WALK:-}" != "1" ]; then
     [ -n "$(find -L "$1" -maxdepth 0 -type f -print 2>/dev/null)" ]
-  else
-    [ -n "$(find -L "$1" -maxdepth 0 -type f -user 0 ! -perm /022 -print 2>/dev/null)" ]
+    return
   fi
+  local owner=0 base="" cur="/" rest comp next info uid mode kind target n_links=0 comps=() tcomps=()
+  if [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST:-}" = "1" ]; then
+    owner="${FANDHE_CONCURRENT_MEMORY_SELFTEST_EXE_OWNER_UID:-0}"
+    base="${FANDHE_CONCURRENT_MEMORY_SELFTEST_EXE_WALK_BASE:-}"
+  fi
+  [[ "$owner" =~ ^[0-9]+$ ]] || return 1
+  # 起点（本番は "/"）自体も検査し、起点以下の経路を要素に分ける。
+  if [ -z "$base" ]; then
+    root_dir_ok "/" "$owner" || return 1
+    IFS=/ read -ra comps <<<"${1#/}"
+  else
+    case "$1" in "$base"/*) ;; *) return 1 ;; esac
+    root_dir_ok "$base" "$owner" || return 1
+    cur="$base"
+    IFS=/ read -ra comps <<<"${1#"$base"/}"
+  fi
+  while [ "${#comps[@]}" -gt 0 ]; do
+    comp="${comps[0]}"
+    comps=("${comps[@]:1}")
+    case "$comp" in
+      '' | .) continue ;;
+      ..)
+        # 解決済みの経路（symlink を含まない）の親へ戻る。起点より上へは出さない。
+        [ "$cur" != "/" ] && [ "$cur" != "$base" ] || return 1
+        cur="${cur%/*}"
+        [ -n "$cur" ] || cur="/"
+        continue
+        ;;
+    esac
+    if [ "$cur" = "/" ]; then next="/${comp}"; else next="${cur}/${comp}"; fi
+    info="$(stat -c '%u %a %F' -- "$next" 2>/dev/null)" || return 1
+    uid="${info%% *}"
+    rest="${info#* }"
+    mode="${rest%% *}"
+    kind="${rest#* }"
+    [[ "$uid" =~ ^[0-9]+$ ]] && [[ "$mode" =~ ^[0-7]+$ ]] || return 1
+    [ "$uid" = "$owner" ] || return 1
+    case "$kind" in
+      'symbolic link')
+        # symlink は root 所有のものだけ解決する（上で所有者を確認済み）。循環・過剰な連鎖は拒否する。
+        n_links=$((n_links + 1))
+        [ "$n_links" -le 40 ] || return 1
+        target="$(readlink -- "$next" 2>/dev/null)" || return 1
+        [ -n "$target" ] || return 1
+        IFS=/ read -ra tcomps <<<"${target#/}"
+        case "$target" in
+          /*)
+            # 絶対 symlink は根から辿り直す。起点指定の自己テストでは起点の外へ出る symlink を拒否する。
+            [ -z "$base" ] || return 1
+            cur="/"
+            ;;
+        esac
+        comps=("${tcomps[@]}" "${comps[@]}")
+        ;;
+      directory)
+        [ $((8#$mode & 8#022)) -eq 0 ] || return 1
+        cur="$next"
+        ;;
+      'regular file' | 'regular empty file')
+        [ $((8#$mode & 8#022)) -eq 0 ] || return 1
+        # 最終要素でなければ（残りが '.' / 空だけでなければ）拒否する。
+        for rest in "${comps[@]}"; do
+          case "$rest" in '' | .) ;; *) return 1 ;; esac
+        done
+        [ -x "$next" ] || return 1
+        return 0
+        ;;
+      *) return 1 ;;
+    esac
+  done
+  # 解決した先が通常ファイルに至らなかった（ディレクトリで終わった等）。
+  return 1
+}
+
+# ディレクトリ 1 つが所有者 uid で group / other 書き込み不可であること（root_exe_is_safe の起点用）。
+root_dir_ok() { # <dir> <uid>
+  local info uid rest mode kind
+  info="$(stat -c '%u %a %F' -- "$1" 2>/dev/null)" || return 1
+  uid="${info%% *}"
+  rest="${info#* }"
+  mode="${rest%% *}"
+  kind="${rest#* }"
+  [[ "$uid" =~ ^[0-9]+$ ]] && [[ "$mode" =~ ^[0-7]+$ ]] || return 1
+  [ "$kind" = directory ] && [ "$uid" = "$2" ] && [ $((8#$mode & 8#022)) -eq 0 ]
 }
 
 if [ "$mode" = "own" ]; then
@@ -2435,9 +2525,9 @@ else
   out_buf+="rss_median_kb=${rss_median}"$'\n'
 fi
 
-publish_out
-exit 0
 # 公開より前に利用者の作業ディレクトリを回収する（SUP-2・CORE-9）。root 所有のファイルが残った・削除に失敗した場合は
 # 終了コード 4 で、成功形式の結果を公開しない（EXIT trap の後始末は user_tmp が残っていれば再度試みるが、公開済みは残さない）。
 user_cleanup || exit 4
 
+publish_out
+exit 0

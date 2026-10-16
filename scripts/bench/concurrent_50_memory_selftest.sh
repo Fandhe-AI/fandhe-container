@@ -941,6 +941,58 @@ expect_eq "publish-after-cleanup-exit0" 0 "$rc"
 expect_eq "publish-after-cleanup-benchmark" '"concurrent_memory"' "$(jq -c '.benchmark' "$work/published.json" 2>/dev/null)"
 rm -f -- "$work/published.json"
 
+# --- 12zc. root で実行する setpriv・env は根から全要素を検証する（SUP-14・SUP-2。privilege-separation.md 7 章。#2127 の指摘） ---
+# 本物の root は使わない。所有者 uid は FANDHE_CONCURRENT_MEMORY_SELFTEST_EXE_OWNER_UID、検証の起点は ..._EXE_WALK_BASE で差し替え、
+# root_exe_is_safe を本体のスクリプトから取り出して直接呼ぶ（起点より上の /tmp 等は検査しない）。
+walk="$work/walk"
+rm -rf -- "$walk"; mkdir -p "$walk/ok/bin" "$walk/gw/bin" "$walk/ow/bin" "$walk/st/bin" "$walk/lk/real"
+chmod 755 "$walk" "$walk/ok" "$walk/ok/bin" "$walk/lk" "$walk/lk/real"
+chmod 775 "$walk/gw"; chmod 755 "$walk/gw/bin"
+chmod 757 "$walk/ow"; chmod 755 "$walk/ow/bin"
+chmod 1777 "$walk/st"; chmod 755 "$walk/st/bin"
+for d in ok gw ow st; do printf '#!/bin/sh\nexit 0\n' >"$walk/$d/bin/tool"; chmod 755 "$walk/$d/bin/tool"; done
+printf '#!/bin/sh\nexit 0\n' >"$walk/lk/real/tool"; chmod 755 "$walk/lk/real/tool"
+printf '#!/bin/sh\nexit 0\n' >"$walk/ok/bin/tool-gwx"; chmod 775 "$walk/ok/bin/tool-gwx"
+ln -s real "$walk/lk/dirlink"                     # 相対 symlink（解決先は安全）
+ln -s ../ow/bin/tool "$walk/lk/to-unsafe-file"    # 解決先の祖先（ow）が other 書き込み可
+ln -s "$walk/ok/bin/tool" "$walk/lk/abs"          # 起点指定では絶対 symlink を拒否する
+ln -s loop2 "$walk/lk/loop1"; ln -s loop1 "$walk/lk/loop2"
+walk_defs="$(sed -n '/^root_exe_is_safe()/,/^if \[ "\$mode" = "own" \]; then$/p' "$target" | sed '$d')"
+[ -n "$walk_defs" ] || { fail "walk-extract-definitions"; walk_defs=':'; }
+walk_check() { # <名前> <期待 rc> <パス> [所有者 uid]
+  local name="$1" want="$2" path="$3" owner="${4:-$(id -u)}" r=0
+  (
+    eval "$walk_defs"
+    FANDHE_CONCURRENT_MEMORY_SELFTEST=1 FANDHE_CONCURRENT_MEMORY_SELFTEST_EXE_WALK=1 \
+      FANDHE_CONCURRENT_MEMORY_SELFTEST_EXE_OWNER_UID="$owner" FANDHE_CONCURRENT_MEMORY_SELFTEST_EXE_WALK_BASE="$walk" \
+      root_exe_is_safe "$path"
+  ) || r=$?
+  [ "$r" = 0 ] || r=1
+  expect_eq "$name" "$want" "$r"
+}
+walk_check "exe-walk-safe-chain-accepted" 0 "$walk/ok/bin/tool"
+walk_check "exe-walk-safe-relative-symlink-accepted" 0 "$walk/lk/dirlink/tool"
+walk_check "exe-walk-group-writable-ancestor-rejected" 1 "$walk/gw/bin/tool"
+walk_check "exe-walk-other-writable-ancestor-rejected" 1 "$walk/ow/bin/tool"
+walk_check "exe-walk-sticky-world-writable-ancestor-rejected" 1 "$walk/st/bin/tool"
+walk_check "exe-walk-group-writable-file-rejected" 1 "$walk/ok/bin/tool-gwx"
+walk_check "exe-walk-symlink-into-unsafe-ancestor-rejected" 1 "$walk/lk/to-unsafe-file"
+walk_check "exe-walk-absolute-symlink-outside-base-rejected" 1 "$walk/lk/abs"
+walk_check "exe-walk-symlink-loop-rejected" 1 "$walk/lk/loop1"
+walk_check "exe-walk-directory-final-rejected" 1 "$walk/ok/bin"
+walk_check "exe-walk-missing-rejected" 1 "$walk/ok/bin/nothing"
+walk_check "exe-walk-dotdot-escape-rejected" 1 "$walk/../walk/ok/bin/tool"
+walk_check "exe-walk-wrong-owner-rejected" 1 "$walk/ok/bin/tool" "$(($(id -u) + 1))"
+# 実行全体: 祖先が group 書き込み可の setpriv は起動前に exit 2 で拒否し、降格コマンドも supervisor も起動しない。
+cp -- "$work/setpriv" "$walk/gw/bin/setpriv"; chmod 755 "$walk/gw/bin/setpriv"
+: >"$STUB_PIDFILE"
+FANDHE_CONCURRENT_MEMORY_SELFTEST_EXE_WALK=1 FANDHE_CONCURRENT_MEMORY_SELFTEST_EXE_OWNER_UID="$(id -u)" \
+  FANDHE_CONCURRENT_MEMORY_SELFTEST_EXE_WALK_BASE="$walk" run_target --count 2 --trials 1 --setpriv "$walk/gw/bin/setpriv"
+expect_eq "exe-walk-setpriv-unsafe-ancestor-exit2" 2 "$rc"
+expect_has "exe-walk-setpriv-unsafe-ancestor-stderr" "$errf" "--setpriv must be a regular root-owned executable"
+expect_eq "exe-walk-setpriv-unsafe-ancestor-no-residual" 0 "$(alive_stub_count)"
+rm -rf -- "$walk"
+
 # --- 13. 引数エラーは exit 2 ---
 expect_rc2() { # <名前> <引数...>
   local name="$1"; shift

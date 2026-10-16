@@ -7,7 +7,8 @@
 //! - `linux`: 権限昇格の縮退に使う capability / credential の syscall ラッパー
 //!   （`privilege::elevate`。SUP-14・TASK-171.1.3・#1475。方式は #1454 のオーナー判断 2026-10-10）。特権ランチャー
 //!   （`launcher`。#1719）向けに、検証済み fd の `execveat`・継承 fd の整理（`close_range`）・fd 開閉の確認・
-//!   `PR_SET_DUMPABLE` も持つ
+//!   `PR_SET_DUMPABLE` も持つ。制御チャネル（`control`。SUP-1・SEC-1・#2058）向けに、接続相手の資格情報の取得
+//!   （`getsockopt(SO_PEERCRED)`）とディレクトリを symlink 越しに開かないための `open(2)` フラグも持つ
 //!
 //! macOS は本モジュールを持たない（`unsafe` を要する機能が無い）。
 

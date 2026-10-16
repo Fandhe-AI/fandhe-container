@@ -9,7 +9,7 @@
 //! 0a. 継承 fd（fd 3 以降）を閉じる（ランチャーと同じ処理。結果チャネルの複製より前。#2070）／
 //! 0. 結果チャネルの検証（stdout が FIFO か。`run_main`）／1. argv の解析（[`crate::start_contract::StartArgs`]）／
 //! 2. スレッド数が 1 か（`oci_runtime::start` の前提。以後のスレッドは手順 3〜7 の作業スレッド〔入口は待つだけ〕と
-//!    手順 10 以降のログ捕捉・restart のワーカーに限る）／
+//!    手順 10 以降のログ捕捉・restart のワーカーと、制御チャネルの accept スレッド〔`control`。#2058〕に限る）／
 //! 3. 状態の事前確認（Created・pid なし・cgroup 未記録。副作用なし）／4. [`StartDeps::check_launcher_available`]
 //!    （副作用なし。権限モデルと Landlock ABI を確かめ、満たさなければここで止まる）／5. cgroup の連鎖
 //!    （[`StartDeps::prepare_cgroup`]）／6. 監査 sink（[`StartDeps::build_audit_sink`]。fork の前）・ログ sink／
@@ -54,6 +54,9 @@
 //!   再 launch は `fandhe-relaunch` スレッドや `stderr_sink` の常駐スレッドが存在する状態で呼ばれるため、本番 launcher が
 //!   `FailedPrecondition` で拒否し、`RelaunchFailed` で終わる（fail-closed。子は作られない）。単一スレッドの呼び出し
 //!   スレッドで再 launch する再構成は #2043（SUP-3・CORE-1）で行う。
+//!   制御チャネルの accept スレッドも #2043 で止める対象に 1 本増える（停止の口は `control::server::ControlServer::shutdown`）。
+//! - CLI の `stop`・`kill` からのシグナル送信は `control`（制御チャネル。#2058）が受けるが、CLI への結線（#1544 の段 C）と
+//!   明示的な stop の意図の伝達（SUP-9）は未実装。
 //! - 権限モデルは `RootlessSingleId` のみ（実効 uid が 0 の rootful 起動は手順 4 で拒否する。SEC-5）。
 //!
 //! フェイクの [`StartDeps`] を使う試験（`tests/start_entry.rs`）が処理順・報告・後始末・relaunch のアダプタを照合し、
@@ -1975,7 +1978,7 @@ mod linux {
             Err(e) => return fail(&mut out, op_err(e)),
         };
         let req = StartRequest::new(args.id.clone());
-        let deps = Box::new(ProductionStartDeps::new(args.root));
+        let deps = Box::new(ProductionStartDeps::new(args.root.clone()));
         // 回復・回収と報告の書き込みで同じ期限を共有し、報告を内部上限内に収める（REPAIR-5）。
         let deadline =
             Instant::now().checked_add(crate::start_contract::result_deadline(&timeouts));
@@ -1995,14 +1998,14 @@ mod linux {
         // 報告は 1 行だけ書く契約。複製は閉じるが、fd 1 自体は std の stdout が持つため pipe は開いたまま
         // （CLI は EOF ではなく 1 行の受信で完了とみなす。fd を閉じるには unsafe が要るため行わない）。
         drop(out);
-        let code = run_supervised(
-            store,
-            args.id,
-            running,
-            args.restart,
-            &timeouts,
-            &StopToken::new(),
-        );
+        // 制御チャネル（CLI からのシグナル送信を受ける UDS。SUP-1・SEC-1・#2058）。launch（手順 8。単一スレッド要求）と
+        // 報告の後に作るのでスレッドの制約に触れない。作成に失敗したら install が停止を要求し、既存の停止経路が
+        // コンテナを終了させて Stopped を記録する（停止できないコンテナを残さない）。
+        let stop = StopToken::new();
+        let (running, control) = crate::control::install(&args.root, &args.id, running, &stop);
+        let code = run_supervised(store, args.id, running, args.restart, &timeouts, &stop);
+        // サーバスレッドを止めてからソケットを消す（RAII）。
+        drop(control);
         ExitCode::from(code)
     }
 

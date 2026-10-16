@@ -19,6 +19,7 @@
 
 use std::ffi::CString;
 use std::io;
+use std::os::fd::{AsRawFd as _, BorrowedFd};
 
 /// `capget(2)` / `capset(2)` の syscall 番号（`syscall(2)` 経由。glibc にラッパーが無い）。
 /// 出典: x86_64 は arch/x86/entry/syscalls/syscall_64.tbl、aarch64 は include/uapi/asm-generic/unistd.h。
@@ -29,6 +30,13 @@ mod arch {
     pub(super) const SYS_CAPGET: Option<i64> = Some(125);
     pub(super) const SYS_CAPSET: Option<i64> = Some(126);
     pub(super) const SYS_EXECVEAT: Option<i64> = Some(322);
+    // 制御チャネル（#2058）。open(2) の O_DIRECTORY / O_NOFOLLOW は arch ごとに値が違う
+    // （arch/x86/include/uapi/asm/fcntl.h は asm-generic の既定値のまま: 0o200000 / 0o400000）。
+    pub(super) const O_DIRECTORY: Option<i32> = Some(0o200000);
+    pub(super) const O_NOFOLLOW: Option<i32> = Some(0o400000);
+    // asm-generic/socket.h の値（x86_64・aarch64 で共通）。
+    pub(super) const SOL_SOCKET: Option<i32> = Some(1);
+    pub(super) const SO_PEERCRED: Option<i32> = Some(17);
 }
 #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
 mod arch {
@@ -36,6 +44,13 @@ mod arch {
     pub(super) const SYS_CAPGET: Option<i64> = Some(90);
     pub(super) const SYS_CAPSET: Option<i64> = Some(91);
     pub(super) const SYS_EXECVEAT: Option<i64> = Some(281);
+    // 制御チャネル（#2058）。aarch64 の O_DIRECTORY / O_NOFOLLOW は
+    // arch/arm64/include/uapi/asm/fcntl.h の値（0o40000 / 0o100000）。
+    pub(super) const O_DIRECTORY: Option<i32> = Some(0o40000);
+    pub(super) const O_NOFOLLOW: Option<i32> = Some(0o100000);
+    // asm-generic/socket.h の値（x86_64・aarch64 で共通）。
+    pub(super) const SOL_SOCKET: Option<i32> = Some(1);
+    pub(super) const SO_PEERCRED: Option<i32> = Some(17);
 }
 #[cfg(not(any(
     all(target_arch = "x86_64", target_pointer_width = "64"),
@@ -46,6 +61,10 @@ mod arch {
     pub(super) const SYS_CAPGET: Option<i64> = None;
     pub(super) const SYS_CAPSET: Option<i64> = None;
     pub(super) const SYS_EXECVEAT: Option<i64> = None;
+    pub(super) const O_DIRECTORY: Option<i32> = None;
+    pub(super) const O_NOFOLLOW: Option<i32> = None;
+    pub(super) const SOL_SOCKET: Option<i32> = None;
+    pub(super) const SO_PEERCRED: Option<i32> = None;
 }
 
 /// include/uapi/linux/prctl.h の値。
@@ -86,6 +105,33 @@ unsafe extern "C" {
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int close(int fd)`。
     fn close(fd: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int getsockopt(int sockfd, int level, int optname, void *optval,
+    // socklen_t *optlen)`（`socklen_t` は Linux で u32）。制御チャネルの `SO_PEERCRED` 取得だけに使う（#2058）。
+    fn getsockopt(
+        fd: i32,
+        level: i32,
+        optname: i32,
+        optval: *mut std::ffi::c_void,
+        optlen: *mut u32,
+    ) -> i32;
+}
+
+/// `struct ucred`（`SO_PEERCRED` の結果。include/uapi/asm-generic/socket.h・`<sys/socket.h>`）。
+/// `libc` との機械照合はこの crate では未導入（dev-dependencies に `libc` が無い。coding-rust.md「照合が未導入の
+/// crate」）。レイアウトは pid_t(i32)・uid_t(u32)・gid_t(u32) の 12 バイトで、単体テストが大きさを固定する。
+#[repr(C)]
+struct Ucred {
+    pid: i32,
+    uid: u32,
+    gid: u32,
+}
+
+/// 接続相手の資格情報（`SO_PEERCRED`。接続時点の相手プロセスの値）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PeerCredentials {
+    pub(crate) pid: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
 }
 
 /// `capget(2)` / `capset(2)` のヘッダ（`struct __user_cap_header_struct`）。
@@ -342,6 +388,54 @@ pub(crate) fn fd_is_open(fd: i32) -> bool {
     unsafe { fcntl(fd, F_GETFD) != -1 }
 }
 
+/// ディレクトリを symlink を辿らずに開くための `open(2)` フラグ（`O_DIRECTORY | O_NOFOLLOW`）。
+/// 対応外の arch では `Unsupported`（別 arch の値を流用しない。fail-closed）。
+pub(crate) fn open_dir_nofollow_flags() -> io::Result<i32> {
+    match (arch::O_DIRECTORY, arch::O_NOFOLLOW) {
+        (Some(d), Some(n)) => Ok(d | n),
+        _ => Err(unsupported()),
+    }
+}
+
+/// 接続済みの UNIX ドメインソケットの相手の資格情報を取る（`getsockopt(SOL_SOCKET, SO_PEERCRED)`）。
+///
+/// 制御チャネルの accept 直後（サーバ）と connect 直後（クライアント）に、相手の uid を照合するために呼ぶ
+/// （SEC-1・PLUG-12 と同じ考え方）。結果の大きさが `struct ucred` と一致しなければ `EINVAL`。
+pub(crate) fn peer_credentials(fd: BorrowedFd<'_>) -> io::Result<PeerCredentials> {
+    let (Some(level), Some(optname)) = (arch::SOL_SOCKET, arch::SO_PEERCRED) else {
+        return Err(unsupported());
+    };
+    let mut cred = Ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let expected = u32::try_from(std::mem::size_of::<Ucred>())
+        .map_err(|_| io::Error::from_raw_os_error(22))?;
+    let mut len = expected;
+    // SAFETY: `fd` は借用で呼び出しの間開いている。`cred` は `#[repr(C)]` の 12 バイトで `optval` に渡すポインタは
+    // その先頭を指し、`len` は書き込み可能な大きさ（12）を表す `optlen`。カーネルは最大 `len` バイトを `cred` に書き、
+    // `len` を実際の大きさへ更新する。いずれもこの関数のスタック上の値で呼び出しの間有効かつ排他的。
+    let rc = unsafe {
+        getsockopt(
+            fd.as_raw_fd(),
+            level,
+            optname,
+            (&raw mut cred).cast(),
+            &raw mut len,
+        )
+    };
+    check(i64::from(rc))?;
+    if len != expected {
+        return Err(io::Error::from_raw_os_error(22)); // EINVAL
+    }
+    Ok(PeerCredentials {
+        pid: u32::try_from(cred.pid).unwrap_or(0),
+        uid: cred.uid,
+        gid: cred.gid,
+    })
+}
+
 /// `PR_SET_DUMPABLE` を設定する。0 にすると ptrace attach・core dump・`/proc/<pid>/mem` 等の読み取りを
 /// 同一 uid の別プロセスから受けない（昇格中の窓の防御）。
 pub(crate) fn set_dumpable(on: bool) -> io::Result<()> {
@@ -437,6 +531,44 @@ mod tests {
     #[test]
     fn sup14_task1719_execveat_number_aarch64() {
         assert_eq!(arch::SYS_EXECVEAT, Some(281));
+    }
+
+    /// SEC-1・SUP-1・#2058: `struct ucred` の大きさと制御チャネル用の ABI 定数を固定する。
+    #[test]
+    fn sup1_sec1_task2058_ucred_layout_and_constants() {
+        assert_eq!(std::mem::size_of::<Ucred>(), 12);
+        assert_eq!(std::mem::align_of::<Ucred>(), 4);
+        assert_eq!(arch::SOL_SOCKET, Some(1));
+        assert_eq!(arch::SO_PEERCRED, Some(17));
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    #[test]
+    fn sup1_sec1_task2058_open_flags_x86_64() {
+        assert_eq!(open_dir_nofollow_flags().unwrap(), 0o200000 | 0o400000);
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+    #[test]
+    fn sup1_sec1_task2058_open_flags_aarch64() {
+        assert_eq!(open_dir_nofollow_flags().unwrap(), 0o40000 | 0o100000);
+    }
+
+    /// socketpair 相手（自プロセス）の pid・uid が `/proc/self/status` と一致する。
+    #[test]
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
+    fn sup1_sec1_task2058_peer_credentials_match_self() {
+        use std::os::fd::AsFd as _;
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let cred = peer_credentials(a.as_fd()).unwrap();
+        assert_eq!(cred.pid, std::process::id());
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let uid_line = status.lines().find(|l| l.starts_with("Uid:")).unwrap();
+        let euid: u32 = uid_line.split_whitespace().nth(2).unwrap().parse().unwrap();
+        assert_eq!(cred.uid, euid);
     }
 
     /// 存在しない fd への execveat は exec せず EBADF で戻る。

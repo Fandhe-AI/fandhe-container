@@ -5,7 +5,7 @@
 //! Linux の fandhe のコンテナは、利用者指定の bind mount（`config.json` の `mounts[]`）を適用する（#1907 の
 //! オーナー判断）。本モジュールは「何を受けて何を拒否するか」を 1 か所の純粋関数 [`BindMountSet::from_mounts`] と
 //! 検証済みの型 [`BindMountSpec`] に固定する。適用側は #1912（sys ラッパー）・#1913（適用の段）・#1914（pivot 前段）・
-//! #1915（`start` への結線）が本型だけを入力にする。`OciMount` は「未検証の指定」、[`BindMountSet`] は
+//! #1915（`start` への結線。済み）が本型だけを入力にする。`OciMount` は「未検証の指定」、[`BindMountSet`] は
 //! 「検証済みの bind」の分担で、`OciMount` 側は変更しない。
 //!
 //! 受け入れ範囲は #1910 のオーナー決定（2026-10-12）による。`cfg` を付けず 3 OS でビルドし、syscall・
@@ -61,8 +61,10 @@
 //! 走査・種別と存在の確認・宛先ディレクトリの作成・利用者権限での到達性・rootfs 自身とその祖先の実体照合（`dev`/`ino`）は、
 //! 適用の段 `crate::exec::mount_binds`（#1913。実装済み。Linux 限定のため intra-doc リンクは張らない）が担う。
 //! 実体照合の残余（REPAIR-3）は bundle・状態ルートと、ホスト側の別の bind mount による別名で、字句検証（`check_against_host_paths`）
-//! だけが効く。`run_pre_pivot` への組み込みは済み（#1914）、`ro` と Landlock の `WriteRestrictionShadowed` の衝突解消は #1917、
-//! `start` の結線は #1915。監査 sink の本番配線も #1915 で未実装。`MountDestination::resolve_in` の文字列結合で直接 mount してはならない。
+//! だけが効く。`run_pre_pivot` への組み込みは済み（#1914）、`start` と本番 launcher への結線は済み（#1915。検証は `start`、tmpfs との重なりは launcher、
+//! 監査は `ProcessLauncher::rejection_audit_sink` 経由）。`ro` と Landlock の `WriteRestrictionShadowed` の衝突解消は #1917
+//! （それまで `ro` の bind は fork 前に拒否される）。状態ルートとの重なりは `StateStore` からルートを取れないため
+//! `start` は検査しない（残余。REPAIR-3）。`MountDestination::resolve_in` の文字列結合で直接 mount してはならない。
 
 use std::fmt;
 use std::path::Path;
@@ -476,7 +478,7 @@ fn validate_source(index: usize, m: &OciMount) -> Result<String, BindMountError>
 /// bind mount の変換拒否を `Mount` 監査レコードにする（SEC-4）。
 ///
 /// `path` は位置が `mounts` で解決できるときだけコンテナ内の宛先を載せる。マウント元（ホスト側パス）は載せない。
-/// エラーは常にそのまま返る。sink の本番配線は #1915 で未実装（REPAIR-3）。
+/// エラーは常にそのまま返る。本番では `start` が `ProcessLauncher::rejection_audit_sink` の sink を渡す（#1915）。
 pub fn audit_bind_mount_error(
     err: BindMountError,
     mounts: &[OciMount],

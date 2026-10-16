@@ -17,7 +17,7 @@
 //!
 //! 入口は検証済みの型（[`MountIsolation`]・[`PreparedRootfs`]・`BindMountSet`）だけを受け、生の `OciMount` や
 //! パス文字列を受ける入口は持たない。`run_pre_pivot` へは組み込み済み（#1914。`inject_files` の後・`readonly_paths` の前に固定）。
-//! `start` と本番 launcher への結線・`check_against_*` の呼び出しは #1915。`/dev` の tmpfs を覆い隠す宛先は
+//! `start` と本番 launcher への結線・`check_against_*` の呼び出しは #1915 で済み（`start` が host_paths・保護パス、launcher が tmpfs を検査する）。`/dev` の tmpfs を覆い隠す宛先は
 //! `BindMountSet` が `/proc`・`/sys`・`/dev` とその配下を拒否するため型の上で作れず、`DeviceReport` の証跡は受けない。
 //!
 //! # マウント元をどのプロセスがどの権限で開くか
@@ -88,8 +88,8 @@
 //!
 //! # 未対応・残余（REPAIR-3: 実装済みを装わない）
 //!
-//! - `start`・本番 launcher への結線と `check_against_*` の
-//!   呼び出し・利用者向けの文書・監査 sink の配線（#1915）。実機前提の結合試験（#1916）。`ro` と Landlock の衝突解消（#1917）
+//! - 状態ルートとの重なりの検査（`StateStore` からルートを取れないため `start` は検査しない。#1915 の残余）。実機前提の結合試験の
+//!   段ごとの観測（#1916。通しの確認は `tests/production_launcher.rs` のシナリオ D〔#1915〕）。`ro` と Landlock の衝突解消（#1917）
 //! - bundle・状態ルートの実体照合（#1911 の字句検証だけ）と、ホスト側の別の bind mount による別名の検出。全要素で symlink を拒否するため、
 //!   字句パスと実パスは別名を除いて一致する
 //! - procfs・sysfs など特殊な FS を元にすることは方針（#1910）上拒否していない

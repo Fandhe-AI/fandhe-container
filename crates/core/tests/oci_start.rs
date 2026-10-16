@@ -185,6 +185,8 @@ impl Gate {
 /// 起動を記録して固定 pid 7 の模擬プロセスを返す launcher。
 struct FakeLauncher {
     launched_args: Mutex<Vec<Vec<String>>>,
+    /// 起動ごとに渡された bind mount の (宛先, 元)(#1915)。
+    launched_binds: Mutex<Vec<Vec<(String, String)>>>,
     terminated: Arc<AtomicUsize>,
     confirms_no_process: AtomicBool,
     /// 起動した模擬プロセスの terminate を失敗させるか。
@@ -196,6 +198,7 @@ impl FakeLauncher {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             launched_args: Mutex::new(Vec::new()),
+            launched_binds: Mutex::new(Vec::new()),
             terminated: Arc::new(AtomicUsize::new(0)),
             confirms_no_process: AtomicBool::new(true),
             fail_terminate: AtomicBool::new(false),
@@ -252,6 +255,16 @@ impl ProcessLauncher for FakeLauncher {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(spec.args().to_vec());
+        self.launched_binds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(
+                spec.bind_mounts()
+                    .mounts()
+                    .iter()
+                    .map(|m| (m.destination().as_str().to_owned(), m.source().to_owned()))
+                    .collect(),
+            );
         self.gate.pass();
         Ok(Box::new(FakeProcess(
             self.terminated.clone(),
@@ -658,4 +671,77 @@ fn err2_start_unknown_container_yields_structured_error() {
     assert_eq!(v["op"], "start");
     assert_eq!(v["code"], "NOT_FOUND");
     assert_eq!(v["message"], err.message());
+}
+
+/// OCI-4・SEC-1(#1915): bind mount つきの config は検証を通って launcher へ `bind_mounts()` として渡る。
+#[cfg(target_os = "linux")]
+#[test]
+fn oci4_start_hands_validated_bind_mounts_to_launcher() {
+    let mut cfg = valid_config();
+    cfg["mounts"] = json!([
+        {"destination": "/data", "type": "bind", "source": "/srv/data", "options": ["rbind", "rw"]},
+        {"destination": "/cache", "type": "bind", "source": "/srv/cache", "options": ["bind", "noexec"]}
+    ]);
+    let b = Bundle::ready("binds", &cfg);
+    let store = MemStateStore::new(None);
+    b.create(&store, "it-binds");
+    let launcher = FakeLauncher::new();
+    let started = start(
+        &store,
+        &OpRecorder::new(),
+        &dynl(&launcher),
+        &start_req("it-binds"),
+        &StartTimeouts::default(),
+    )
+    .expect("start");
+    assert_eq!(
+        *launcher.launched_binds.lock().expect("lock"),
+        [vec![
+            ("/data".to_string(), "/srv/data".to_string()),
+            ("/cache".to_string(), "/srv/cache".to_string())
+        ]]
+    );
+    let (_, process) = started.into_parts();
+    process
+        .terminate(Duration::from_secs(1))
+        .expect("terminate");
+}
+
+/// OCI-4・SEC-1・ERR-2(#1915): 検証を通らない bind は launcher を呼ばず、op = start・code = INVALID_ARGUMENT・
+/// 終了コード 2 の構造化エラーで失敗し、状態は Created のまま。
+#[test]
+fn err2_start_rejects_invalid_bind_mount_with_structured_error() {
+    let mut cfg = valid_config();
+    cfg["mounts"] = json!([
+        {"destination": "/data", "type": "bind", "source": "/srv/data", "options": ["bind", "suid"]}
+    ]);
+    let b = Bundle::ready("badbind", &valid_config());
+    let store = MemStateStore::new(None);
+    b.create(&store, "it-badbind");
+    std::fs::write(
+        b.dir.join("config.json"),
+        serde_json::to_vec(&cfg).expect("serialize"),
+    )
+    .expect("rewrite");
+    let launcher = FakeLauncher::new();
+    let err = start(
+        &store,
+        &OpRecorder::new(),
+        &dynl(&launcher),
+        &start_req("it-badbind"),
+        &StartTimeouts::default(),
+    )
+    .expect_err("must fail");
+    assert_eq!(err.op(), LifecycleOp::Start);
+    assert_eq!(err.code(), ErrorCode::InvalidArgument);
+    assert_eq!(err.exit_code().get(), 2);
+    assert_eq!(
+        err.message(),
+        "mounts[0]: mount option lifts a mandatory restriction"
+    );
+    assert_eq!(launcher.launches(), 0);
+    assert_eq!(
+        store.status_of("it-badbind").state(),
+        ContainerState::Created
+    );
 }

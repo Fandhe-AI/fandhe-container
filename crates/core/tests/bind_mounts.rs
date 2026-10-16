@@ -2,7 +2,8 @@
 //!
 //! 公開 API だけを crate の外から呼ぶ。`parse_config_bytes` → `BindMountSet::from_mounts` → 各 `check_against_*`
 //! → `audit_bind_mount_error` の経路を具体値で照合する。実機権限は不要で 3 OS の既定のテスト集合で動く。
-//! 実マウントへの接続は #1912〜#1915 の担当で本試験の範囲外。
+//! 実マウントへの接続（#1912〜#1915。`start` と本番 launcher への結線は済み）は本試験の範囲外で、
+//! 通しの確認は `tests/production_launcher.rs` のシナリオ D（実機前提）が担う。
 
 use std::sync::Mutex;
 

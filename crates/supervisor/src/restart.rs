@@ -19,6 +19,7 @@
 //! - [`crate::run::MonitorOutcome::ExitedUnrecorded`]（終了は回収済みだが記録失敗）の回復は未実装で、
 //!   再 launch せずに [`SuperviseOutcome::MonitorFailed`] で返す（状態が不確かなまま再起動しない。fail-closed）。
 //! - 指数バックオフ等の高度な間隔制御は未実装（固定の [`RestartConfig::backoff`] のみ）。
+//! - bind mount の集合（`LaunchSpec::bind_mounts`）も捕捉した `LaunchSpec` に載るため、再 launch で同じ集合が再適用される（#1915）
 //! - 再起動をまたぐログ捕捉の引き継ぎ（`monitor_with_capture` との統合）は未実装（SUP-7・TASK-164）。
 //!
 //! # 外部入力の扱い
@@ -1145,6 +1146,12 @@ impl ProcessLauncher for SpecCapturingLauncher {
         self.inner.launch_mode()
     }
 
+    /// 内側の launcher の監査 sink を転送する(転送しないと既定の `None` になり、start の設定検証での拒否が
+    /// 本番で監査に記録されず黙って落ちる。SEC-4・#1915)。
+    fn rejection_audit_sink(&self) -> Option<&dyn fandhe_container_core::audit_log::AuditSink> {
+        self.inner.rejection_audit_sink()
+    }
+
     /// 内側の launcher の「子が残り得る」判定を転送する(転送しないと既定の `false` になり、回収できなかった
     /// 子が残るのに起動予約が戻る。CORE-2)。
     fn last_launch_may_have_left_process(&self) -> bool {
@@ -1243,7 +1250,25 @@ mod tests {
     /// `launch_mode` だけを答えるフェイク（転送の照合用。#1816・REPAIR-5）。
     struct SelfBoundedFake;
 
+    /// 何も記録しない sink(同一性の照合用。#1915)。
+    struct FakeSink;
+
+    impl fandhe_container_core::audit_log::AuditSink for FakeSink {
+        fn record(
+            &self,
+            _: &fandhe_container_core::audit_log::AuditRecord,
+        ) -> Result<(), TraitError> {
+            Ok(())
+        }
+    }
+
+    static FAKE_SINK: FakeSink = FakeSink;
+
     impl ProcessLauncher for SelfBoundedFake {
+        fn rejection_audit_sink(&self) -> Option<&dyn fandhe_container_core::audit_log::AuditSink> {
+            Some(&FAKE_SINK)
+        }
+
         fn launch_mode(&self) -> fandhe_container_core::oci_runtime::LaunchMode {
             fandhe_container_core::oci_runtime::LaunchMode::SelfBounded
         }
@@ -1263,6 +1288,15 @@ mod tests {
         use fandhe_container_core::oci_runtime::LaunchMode;
         let wrapped = SpecCapturingLauncher::new(Arc::new(SelfBoundedFake));
         assert_eq!(wrapped.launch_mode(), LaunchMode::SelfBounded);
+    }
+
+    /// SEC-4・#1915: `SpecCapturingLauncher` は内側の監査 sink を転送する(同一の sink が返る)。
+    #[test]
+    fn sec4_spec_capturing_launcher_forwards_rejection_audit_sink() {
+        let wrapped = SpecCapturingLauncher::new(Arc::new(SelfBoundedFake));
+        let got = wrapped.rejection_audit_sink().expect("forwarded sink");
+        let want: &dyn fandhe_container_core::audit_log::AuditSink = &FAKE_SINK;
+        assert!(std::ptr::addr_eq(got, want));
     }
     use fandhe_container_core::traits::ContainerState;
 

@@ -4,9 +4,9 @@
 //!
 //! bundle の `config.json` を検証済みの [`OciConfig`] に変換する。TASK-29.2（create）が
 //! `load_config(<bundle>/config.json)` を呼び、結果を `exec::Entrypoint` や rootfs / mount の
-//! セットアップへ渡す想定（未実装。呼び出し側は後続 TASK）。`mounts[].destination` は TASK-29.1.2 で
+//! セットアップへ渡す想定。`start` が `mounts[]` の bind を検証して launcher へ渡す（#1915）。bind 以外の種類の適用は未実装。`mounts[].destination` は TASK-29.1.2 で
 //! `MountDestination` に正規化済み（`..` 等を拒否）。rootfs 内 symlink の解決は create 側
-//! （TASK-29.2・TASK-127）の担当で、本モジュールは行わない。
+//! （TASK-29.2・TASK-127）の担当で、本モジュールは行わない。bind の宛先は適用の段（`exec::mount_binds`）が fd 起点で辿る。
 //!
 //! # 型設計（REPAIR-2）
 //!

@@ -64,7 +64,8 @@
 //! - `process.cwd` が `/` 以外（exec フローが cwd 未対応）
 //! - `process.user` が uid 0・gid 0・追加 gid なし以外（ユーザー切替は未実装）
 //! - `process.terminal` が true（端末受け渡し未実装）
-//! - `mounts` が非空（mount 適用未実装）
+//! - `mounts` のうち bind 以外の種類・#1910 の拒否規則に反する bind（`BindMountSet`。検証済みの bind は
+//!   launcher が pivot 前に適用する。#1915。状態ルートとの重なりの検査と `ro` の bind〔#1917〕は未対応）
 //! - `linux.namespaces[].path` の指定（既存 namespace への join 未実装）
 //! - `network`・`cgroup`・`time` namespace（exec の対応は PID/Mount/UTS/IPC/User のみ）
 //! - `linux.namespaces` に user namespace が無い（`process.user` は root 必須のため、ホスト root での
@@ -117,6 +118,7 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
+use super::bind_mounts::{BindMountError, BindMountSet, audit_bind_mount_error};
 use super::cgroup_requirement::CgroupRequirement;
 use super::config::{NamespaceKind, OciConfig};
 use super::create::validate_bundle;
@@ -441,7 +443,7 @@ fn start_inner(
         ));
     }
 
-    let spec = build_spec(record.bundle(), req.id())?;
+    let spec = build_spec(record.bundle(), req.id(), launcher.as_ref())?;
 
     // 起動権の所有ロック（プロセス間の排他）を予約の前に取り、launch が終わるまで保持する。所有ロックを
     // 持つプロセスが終了すればカーネルが解放するため、回復はその終了を条件にできる（CORE-2）。
@@ -623,7 +625,11 @@ fn release_claim(
 
 /// bundle の `config.json` を一度だけ読んで検証し、start が適用できない指定を拒否したうえで、rootfs を
 /// fd で固定して [`LaunchSpec`] を組み立てる（`config.json` は読み直さない）。
-fn build_spec(bundle: &Path, id: &ContainerId) -> Result<LaunchSpec, TraitError> {
+fn build_spec(
+    bundle: &Path,
+    id: &ContainerId,
+    launcher: &dyn ProcessLauncher,
+) -> Result<LaunchSpec, TraitError> {
     let (config, rootfs) = validate_bundle(bundle)?;
     let process = config.process().ok_or_else(|| {
         TraitError::new(
@@ -688,6 +694,8 @@ fn build_spec(bundle: &Path, id: &ContainerId) -> Result<LaunchSpec, TraitError>
             "the UTS namespace is required",
         ));
     }
+    // bind mount の検証は予約と fork の前に終える（失敗してもプロセスのいない Running を残さない。#1915）。
+    let bind_mounts = validate_bind_mounts(&config, bundle, &rootfs, id, launcher)?;
     // 検査済みの rootfs を、`/` から祖先を含む全要素を symlink 非追従で辿って fd で固定する（SEC-1）。
     // 以後の使用はこの fd に限るため、検査後に祖先や rootfs を差し替えても固定した実体は変わらない。
     // 違反の理由（`RootfsPinError::violation`）は start の経路では記録しない（`AuditSink` の配線が無い。#1314・#1702）。
@@ -702,15 +710,74 @@ fn build_spec(bundle: &Path, id: &ContainerId) -> Result<LaunchSpec, TraitError>
         CgroupRequirement::of_config(&config),
         Arc::new(config),
         id.clone(),
+        bind_mounts,
     ))
+}
+
+/// `mounts[]` を検証済みの bind mount 集合へ変換する（TASK-29 追補・#1915・OCI-4・CORE-5・SEC-1・SEC-4）。
+///
+/// 種類・オプション・元の字句（[`BindMountSet::from_mounts`]）、元が rootfs・bundle と同一またはその祖先で
+/// ないこと、`linux.readonlyPaths` / `maskedPaths` と宛先が重ならないことを検査する。いずれも fork の前に
+/// 終わる純粋な字句検査で、実体の照合は適用の段（`exec::mount_binds`）が担う。拒否は launcher の監査 sink
+/// （[`ProcessLauncher::rejection_audit_sink`]）へ記録する。記録の成否で拒否は覆さない。
+///
+/// 残余（REPAIR-3）: 状態ルートとの重なりは `StateStore` から取れないため検査しない。
+fn validate_bind_mounts(
+    config: &OciConfig,
+    bundle: &Path,
+    rootfs: &Path,
+    id: &ContainerId,
+    launcher: &dyn ProcessLauncher,
+) -> Result<BindMountSet, TraitError> {
+    let reject = |err: BindMountError| -> TraitError {
+        let (code, message) = (err.code(), err.message());
+        if let Some(sink) = launcher.rejection_audit_sink() {
+            // 記録の成否は拒否の結果を変えない。
+            let _ = audit_bind_mount_error(err, config.mounts(), Some(id), sink);
+        }
+        TraitError::new(code, message)
+    };
+    let set = BindMountSet::from_mounts(config.mounts()).map_err(reject)?;
+    if set.is_empty() {
+        return Ok(set);
+    }
+    // 禁止するホストパスは字句正規化できたものだけを使う。できなければ fail-closed（mounts 非空のときのみ）。
+    let (Some(rootfs_lex), Some(bundle_lex)) = (lexical_abs(rootfs), lexical_abs(bundle)) else {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "the bundle or rootfs path cannot be compared with bind mount sources",
+        ));
+    };
+    set.check_against_host_paths(&[rootfs_lex.as_str(), bundle_lex.as_str()])
+        .map_err(reject)?;
+    set.check_against_protected_paths(config.readonly_paths(), config.masked_paths())
+        .map_err(reject)?;
+    Ok(set)
+}
+
+/// 絶対パスを `Component::Normal` だけの `/a/b` 形式へ字句正規化する（`.` は落とす）。
+/// 相対・`..` を含む・UTF-8 でない場合は `None`。
+fn lexical_abs(path: &Path) -> Option<String> {
+    use std::path::Component;
+    let mut out = String::new();
+    let mut absolute = false;
+    for c in path.components() {
+        match c {
+            Component::RootDir => absolute = true,
+            Component::CurDir => {}
+            Component::Normal(n) => {
+                out.push('/');
+                out.push_str(n.to_str()?);
+            }
+            _ => return None,
+        }
+    }
+    (absolute && !out.is_empty()).then_some(out)
 }
 
 fn reject_unsupported_linux(config: &OciConfig) -> Result<(), TraitError> {
     if config.root().readonly() {
         return Err(unsupported("root.readonly"));
-    }
-    if !config.mounts().is_empty() {
-        return Err(unsupported("mounts"));
     }
     if !config.uid_mappings().is_empty() || !config.gid_mappings().is_empty() {
         return Err(unsupported("linux.uidMappings / linux.gidMappings"));
@@ -928,6 +995,8 @@ mod tests {
         launch_threads: Mutex<Vec<std::thread::ThreadId>>,
         /// 失敗した launch が子を残し得ると答えるか（`last_launch_may_have_left_process`。CORE-2）。
         may_leave: AtomicBool,
+        /// `rejection_audit_sink` が返す sink（未設定なら `None`。#1915）。
+        audit: std::sync::OnceLock<Arc<crate::audit_log::mount::tests::VecSink>>,
     }
 
     impl RecordingLauncher {
@@ -945,6 +1014,7 @@ mod tests {
                 self_bounded: AtomicBool::new(false),
                 launch_threads: Mutex::new(Vec::new()),
                 may_leave: AtomicBool::new(false),
+                audit: std::sync::OnceLock::new(),
             })
         }
 
@@ -993,6 +1063,12 @@ mod tests {
     }
 
     impl ProcessLauncher for RecordingLauncher {
+        fn rejection_audit_sink(&self) -> Option<&dyn crate::audit_log::AuditSink> {
+            self.audit
+                .get()
+                .map(|s| s.as_ref() as &dyn crate::audit_log::AuditSink)
+        }
+
         fn launch_mode(&self) -> LaunchMode {
             if self.self_bounded.load(Ordering::SeqCst) {
                 LaunchMode::SelfBounded
@@ -1407,13 +1483,6 @@ mod tests {
             ),
             ("tty", Box::new(|c| c["process"]["terminal"] = json!(true))),
             (
-                "mounts",
-                Box::new(|c| {
-                    c["mounts"] =
-                        json!([{"destination": "/proc", "type": "proc", "source": "proc"}])
-                }),
-            ),
-            (
                 "nspath",
                 Box::new(|c| {
                     c["linux"]["namespaces"] = json!([{"type": "pid", "path": "/proc/1/ns/pid"}])
@@ -1443,6 +1512,180 @@ mod tests {
                 err.message()
             );
         }
+    }
+
+    /// bind mount つきの config（宛先・元・オプションを指定）。
+    fn with_mounts(mounts: Value) -> Value {
+        let mut cfg = valid_config();
+        cfg["mounts"] = mounts;
+        cfg
+    }
+
+    fn bind_json(dest: &str, source: &str, opts: &[&str]) -> Value {
+        json!({"destination": dest, "type": "bind", "source": source, "options": opts})
+    }
+
+    /// OCI-4・SEC-1・CORE-5（#1915）: 検証を通らない `mounts[]` は ERR-2 の構造化エラーで拒否し、
+    /// launcher は呼ばれず状態は Created のまま。メッセージは固定英文で入力値を含まない。
+    #[test]
+    fn oci4_sec1_start_rejects_invalid_bind_mounts() {
+        // bundle の祖先(一時ディレクトリ)を元にすると、bundle・rootfs の祖先として拒否される。
+        let bundle_src = std::env::temp_dir()
+            .to_str()
+            .expect("utf8 temp dir")
+            .trim_end_matches('/')
+            .to_owned();
+        let cases: Vec<(&str, Value, ErrorCode, &str)> = vec![
+            (
+                "proc",
+                with_mounts(json!([{"destination": "/mnt", "type": "proc", "source": "proc"}])),
+                ErrorCode::Unimplemented,
+                "mounts[0]: mount type is not supported (only bind mounts)",
+            ),
+            (
+                "suid",
+                with_mounts(json!([bind_json("/mnt", "/srv/x", &["bind", "suid"])])),
+                ErrorCode::InvalidArgument,
+                "mounts[0]: mount option lifts a mandatory restriction",
+            ),
+            (
+                "shared",
+                with_mounts(json!([bind_json("/mnt", "/srv/x", &["bind", "shared"])])),
+                ErrorCode::InvalidArgument,
+                "mounts[0]: mount propagation options are not supported",
+            ),
+            (
+                "relsrc",
+                with_mounts(json!([bind_json("/mnt", "rel/x", &["bind"])])),
+                ErrorCode::InvalidArgument,
+                "mounts[0]: bind mount source is not a valid absolute path",
+            ),
+            (
+                "nosrc",
+                with_mounts(json!([{"destination": "/mnt", "type": "bind", "options": ["bind"]}])),
+                ErrorCode::InvalidArgument,
+                "mounts[0]: bind mount has no source",
+            ),
+            (
+                "procdst",
+                with_mounts(json!([bind_json("/proc/x", "/srv/x", &["bind"])])),
+                ErrorCode::InvalidArgument,
+                "mounts[0]: bind mount destination is reserved (/proc, /sys or /dev)",
+            ),
+            (
+                "bundlesrc",
+                with_mounts(json!([bind_json("/mnt", &bundle_src, &["bind"])])),
+                ErrorCode::InvalidArgument,
+                "mounts[0]: bind mount source is a forbidden host path",
+            ),
+            (
+                "protected",
+                {
+                    let mut c = with_mounts(json!([bind_json("/etc/secret", "/srv/x", &["bind"])]));
+                    c["linux"]["readonlyPaths"] = json!(["/etc/secret"]);
+                    c
+                },
+                ErrorCode::InvalidArgument,
+                "mounts[0]: bind mount destination overlaps a readonly or masked path",
+            ),
+        ];
+        for (name, cfg, code, message) in cases {
+            let err = start_rejected_after_rewrite(&format!("rej-bind-{name}"), &cfg);
+            assert_eq!(err.code(), code, "case {name}");
+            assert_eq!(err.message(), message, "case {name}");
+        }
+    }
+
+    /// OCI-4・OCI-5（#1915）: 検証を通った bind は launcher へ `spec.bind_mounts()` として渡り、
+    /// Landlock の入力である `spec.config().mounts()` と同じ並び・宛先になる。
+    #[test]
+    fn oci4_start_passes_validated_bind_mounts_to_launcher() {
+        let name = "bind-ok";
+        let b = Bundle::new(name);
+        b.write_config(&with_mounts(json!([
+            bind_json("/data", "/srv/data", &["bind", "rw"]),
+            bind_json("/cache", "/srv/cache", &["rbind", "noexec"]),
+        ])));
+        std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
+        let store = MemStateStore::new(None);
+        create(&store, &OpRecorder::new(), &b.create_req(name)).expect("create");
+        let launcher = RecordingLauncher::new(false);
+        let record = run(&store, &launcher, name).expect("start");
+        assert_eq!(record.status().state(), ContainerState::Running);
+        assert_eq!(launcher.calls(), 1);
+        let specs = launcher.specs.lock().expect("lock");
+        let spec = specs.first().expect("spec");
+        let got: Vec<_> = spec
+            .bind_mounts()
+            .mounts()
+            .iter()
+            .map(|m| {
+                (
+                    m.index(),
+                    m.destination().as_str().to_owned(),
+                    m.source().to_owned(),
+                    m.read_only(),
+                    m.noexec(),
+                    m.recursive(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    0,
+                    "/data".to_owned(),
+                    "/srv/data".to_owned(),
+                    false,
+                    false,
+                    false
+                ),
+                (
+                    1,
+                    "/cache".to_owned(),
+                    "/srv/cache".to_owned(),
+                    false,
+                    true,
+                    true
+                ),
+            ]
+        );
+        let config_dests: Vec<_> = spec
+            .config()
+            .mounts()
+            .iter()
+            .map(|m| m.mount_destination().as_str().to_owned())
+            .collect();
+        assert_eq!(config_dests, ["/data", "/cache"]);
+    }
+
+    /// SEC-4（#1915）: 設定の検証での拒否は launcher の sink へ宛先のみで 1 件記録される。sink が無くても
+    /// エラーは同じ。
+    #[test]
+    fn sec4_start_records_bind_rejection_to_launcher_audit_sink() {
+        let cfg = with_mounts(json!([bind_json(
+            "/mnt/x",
+            "/secret-host-dir",
+            &["bind", "suid"]
+        )]));
+        let (b, store) = created("rej-bind-audit");
+        b.write_config(&cfg);
+        let launcher = RecordingLauncher::new(false);
+        let sink = Arc::new(crate::audit_log::mount::tests::VecSink::new(false));
+        assert!(launcher.audit.set(Arc::clone(&sink)).is_ok());
+        let err = run(&store, &launcher, "rej-bind-audit").expect_err("must fail");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(launcher.calls(), 0);
+        let recs = sink.snapshot();
+        assert_eq!(recs.len(), 1);
+        let line = format!("{:?}", recs[0]);
+        assert!(line.contains("/mnt/x"), "{line}");
+        assert!(!line.contains("secret-host-dir"), "{line}");
+        // sink 無し(既定)でも拒否の内容は同じ。
+        let err2 = start_rejected_after_rewrite("rej-bind-nosink", &cfg);
+        assert_eq!(err2.code(), err.code());
+        assert_eq!(err2.message(), err.message());
     }
 
     /// REPAIR-5: 状態更新に失敗したら起動済みプロセスをちょうど 1 回 terminate し、元のエラーを返す。

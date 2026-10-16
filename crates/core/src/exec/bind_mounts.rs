@@ -64,15 +64,36 @@
 //!
 //! **伝播**: 明示の private 化はしない。`MountIsolation::establish` が `/` を `MS_REC|MS_PRIVATE` にしており、この
 //! namespace のマウントは shared でも slave でもない。shared でも slave でもないマウントの複製はやはりそうなる。付け替え先は
-//! 手順 4 で非 shared と確認済みで、手順 9 が `shared:`・`master:` の不在を確かめる。切り離した状態の伝播変更が許されるかは一次情報で
-//! 未確認のため、`mount_setattr` の伝播変更は使わない。
+//! 手順 4 で非 shared と確認済みで、手順 9 が `shared:`・`master:` の不在を確かめる。
 //!
-//! **属性の一次情報と未確認の点**: user namespace の中では、元の namespace からコピーしたマウントはロックされる
-//! （`mount_namespaces(7)` の locked mounts）。ロックされた `ro`・`nosuid`・`nodev`・`noexec` は外せないが、本段は足すだけなので
-//! `mount_setattr` は成功し、要求との差は手順 6・9 の構造化エラーになる。配下にロックされた子を持つ元を非再帰で複製すると
-//! `EINVAL` になり（`__do_loopback` の `has_locked_children`）、`rbind` を促す `FAILED_PRECONDITION` にする。
-//! 以上は #1659・#1912 で確認した知見に基づき、本 issue での一次情報の再照合は未実施（未確認）。`rbind` の配下の付け替え前の属性確認は
-//! 行わず（mount top だけを見る）、配下は手順 9 の mountinfo で確かめる。実機（user namespace・実マウント）での確認は #1916。
+//! 切り離したマウントへの伝播変更は、カーネルのソースで許されると確認済み（#2064・SEC-1。`mount_setattr(2)` の man page
+//! 〔man-pages 6.17〕は可否を明記せず、決め手はソース）。`mount_setattr_commit` はマウントごとに `change_mnt_propagation` を呼び、
+//! 対象の判定は v5.12 の `mount_setattr_prepare` が「親なしなら匿名 mount namespace であること」、v6.12 の `do_mount_setattr` が
+//! 「親を持つか匿名でないなら `check_mnt`」、v7.0 の `do_mount_setattr` が `!anon_ns_root(mnt) && !check_mnt(mnt)` で `EINVAL` とする。
+//! `open_tree(OPEN_TREE_CLONE)` の fd は匿名 namespace の root なのでいずれも通る。それでも使わないのは、複製（`clone_mnt`）が元の
+//! 伝播（`mnt_group_id`・`mnt_master`）を引き継ぐためで、**複製が private であることは `establish` の `MS_REC|MS_PRIVATE`
+//! に依存する**（これを外す改修は手順 4・9 の照合で検出されるが、前提として維持すること）。`MS_PRIVATE` を同じ呼び出しで設定する
+//! 変更は別 issue で扱う（本 issue ではコード不変）。
+//!
+//! **属性とロックの一次情報**（#2064 で版つきに確認。Linux v5.12・v6.12・v7.0 の `fs/namespace.c`・`fs/pnode.c`、man-pages 6.17）:
+//!
+//! - ロックが付く条件: `copy_mnt_ns` は user namespace が異なるとき `lock_mnt_tree` を呼び、`MNT_LOCK_ATIME` と、立っている
+//!   `ro`・`nodev`・`nosuid`・`noexec` に対応する `MNT_LOCK_*` を立てる（`mount_namespaces(7)` は nodev に触れないがソースは立てる）。
+//!   本経路は user namespace の後に PID 1 が `unshare(CLONE_NEWNS)` するため、ホストから引き継いだマウントはすべてロックされる。
+//! - 非再帰の `EINVAL`: `__do_loopback` は `!recurse` で、元の直接の子に配下で `MNT_LOCKED` のものがあると `EINVAL`
+//!   （`has_locked_children`。v7.0 は `__has_locked_children`。`mount(2)` の ERRORS にも同旨）。ホスト側で配下にマウントを持つ
+//!   ディレクトリは典型的にこれに当たり、`rbind` を促す `FAILED_PRECONDITION` にする。`__do_loopback` の `EINVAL` は他に
+//!   元が unbindable のときと `check_mnt` 不成立のときがあるが、前者は `establish` の `MS_PRIVATE`（`change_mnt_propagation` が
+//!   unbindable を外す）、後者は同じ mount namespace の中で開くことで起きない。この写像はその前提の下で成り立つ。
+//! - 属性の引き継ぎ: `clone_mnt` は `MNT_LOCK_*` を含む `mnt_flags` を複製に残す（落とすのは内部用フラグだけ）。`rbind`
+//!   （`copy_tree`）の unbindable 配下の `EPERM` も、unbindable が残らないため起きない。
+//! - 足すだけの `mount_setattr`: `can_change_locked_flags` が false になるのは、ロックされた属性が結果から消えるとき
+//!   （と `MNT_LOCK_ATIME` で atime が変わるとき）だけで、いずれも `EPERM`。`attr_clr` = 0・atime なしの本段は常に成功し、
+//!   ロックされた ro は外れないまま要求との差が手順 6・9 の構造化エラーになる（`mount_setattr(2)` の EPERM の記述は
+//!   「ロックされた属性が立っている」と読めるが、ソースは外そうとしたときだけ）。
+//!
+//! `rbind` の配下の付け替え前の属性確認は行わず（mount top だけを見る）、配下は手順 9 の mountinfo で確かめる。実機
+//! （user namespace・実マウント）での確認は #1916。
 //!
 //! # エラーと監査
 //!
@@ -1501,7 +1522,9 @@ fn mount_api_error(spec: &BindMountSpec, e: SysError, what: &str) -> ExecError {
 }
 
 /// `open_tree(OPEN_TREE_CLONE)` の失敗を写す。非再帰の `EINVAL` は、配下にロックされたマウントを持つ元を
-/// user namespace の中で非再帰に複製できないときに返る（`rbind` を促す）。
+/// user namespace の中で非再帰に複製できないときに返る（`rbind` を促す）。この写像は、`establish` の `MS_PRIVATE` で
+/// unbindable が残らないことと、同じ mount namespace の fd を開くことが前提（モジュール doc の一次情報の節、#2064）。
+/// 前提が崩れても fail-closed で、メッセージが過剰に特定的になるだけ。
 fn open_tree_error(spec: &BindMountSpec, e: SysError, scope: MountTreeScope) -> ExecError {
     if e == SysError::Os(sys::EINVAL) && scope == MountTreeScope::MountOnly {
         return failed(

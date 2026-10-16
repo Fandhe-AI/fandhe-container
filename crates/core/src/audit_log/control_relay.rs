@@ -196,7 +196,12 @@ impl ControlAuditRelay {
             Err(_) => return Err(unavailable()),
         };
         // 回収前に開く（以後 pid が再利用されても元の子を指す）。
-        let pidfd = sys::pidfd_open(pid).ok();
+        // 開いた後に未回収の自分の子だと確かめる。SIGCHLD が SIG_IGN／SA_NOCLDWAIT だと fork から
+        // pidfd_open までの間に自動回収・PID 再利用が起き得るため、確認できない pidfd は保持しない
+        // （fail-closed。以後の送信は行わない。SUP-1・SEC-4）。
+        let pidfd = sys::pidfd_open(pid)
+            .ok()
+            .filter(|_| is_unreaped_own_child(sys::wait_pid_nohang(pid)));
         Ok(Self {
             state: Mutex::new(State {
                 stream: parent,
@@ -213,19 +218,32 @@ impl ControlAuditRelay {
         self.pid
     }
 
-    /// helper を SIGKILL する（pidfd 優先。無ければ未回収を確かめてから pid へ送る）。
+    /// helper を SIGKILL する。どの経路でも、未回収の自分の子と確認できた場合だけ送る
+    /// （pidfd があればそれへ、無ければ pid へ。確認できなければ送らない。SUP-1・SEC-4）。
     fn kill_helper(&self) {
-        match &self.pidfd {
-            Some(fd) => {
-                let _ = sys::pidfd_send_signal(fd.as_fd(), sys::Signal::Kill);
-            }
-            None => {
-                if matches!(sys::wait_pid_nohang(self.pid), Ok(None)) {
-                    let _ = sys::kill_pid(self.pid, sys::Signal::Kill);
-                }
-            }
-        }
+        kill_if_unreaped(sys::wait_pid_nohang(self.pid), || match &self.pidfd {
+            Some(fd) => sys::pidfd_send_signal(fd.as_fd(), sys::Signal::Kill),
+            None => sys::kill_pid(self.pid, sys::Signal::Kill),
+        });
     }
+}
+
+/// `wait_pid_nohang` の結果が「自分の未回収の子（まだ終わっていない）」を示すか。
+/// `ECHILD`（自動回収済み・他人の PID）やその他のエラー、回収済みは false（fail-closed）。
+fn is_unreaped_own_child(polled: Result<Option<i32>, sys::SysError>) -> bool {
+    matches!(polled, Ok(None))
+}
+
+/// 未回収の自分の子と確認できた場合だけ `send` を呼ぶ。呼んだら true。
+fn kill_if_unreaped<E>(
+    polled: Result<Option<i32>, sys::SysError>,
+    send: impl FnOnce() -> Result<(), E>,
+) -> bool {
+    if !is_unreaped_own_child(polled) {
+        return false;
+    }
+    let _ = send();
+    true
 }
 
 impl AuditSink for ControlAuditRelay {
@@ -289,6 +307,28 @@ impl Drop for ControlAuditRelay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SUP-1・SEC-4: 未回収と確認できない場合（ECHILD・他エラー・回収済み）は送信しない。
+    #[test]
+    fn kill_if_unreaped_sends_only_for_unreaped_child() {
+        let mut sent = 0;
+        assert!(kill_if_unreaped(Ok(None), || {
+            sent += 1;
+            Ok::<(), ()>(())
+        }));
+        assert_eq!(sent, 1);
+        for polled in [
+            Ok(Some(0)),
+            Err(sys::SysError::Os(10)),
+            Err(sys::SysError::Os(22)),
+        ] {
+            assert!(!kill_if_unreaped(polled, || {
+                sent += 1;
+                Ok::<(), ()>(())
+            }));
+        }
+        assert_eq!(sent, 1);
+    }
 
     fn sample(rejection: ControlPeerRejection, id: Option<&str>) -> AuditRecord {
         let r = AuditRecord::new(

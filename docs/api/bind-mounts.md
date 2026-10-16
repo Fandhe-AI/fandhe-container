@@ -35,6 +35,7 @@ Linux の fandhe-container は、OCI `config.json` の `mounts[]` に書いた b
 | `bind` と `rbind` の併記 | 意味が曖昧なため |
 | 相対パス・`..`・`.`・空要素・`\`・NUL を含む `source`、`source: "/"` | 絶対パスの正規形のみ受ける |
 | bundle の rootfs・bundle ディレクトリと同一、またはその祖先の `source` | コンテナが自身の rootfs を書き換える経路を作らない |
+| 状態ルート（状態の保存先）と同一・祖先・子孫の `source` | `state.json` 等の改変を防ぐ。rootfs・bundle の配下の `source` は受ける（#2063・SEC-1・OCI-4） |
 | `/proc`・`/sys`・`/dev` とその配下の `destination` | 暗黙のマウントと固定の保護パスがあるため |
 | bind 同士で同一・入れ子の `destination` | 子の宛先がホストのディレクトリになるのを防ぐ |
 | `linux.readonlyPaths` / `maskedPaths` と重なる `destination` | 保護パスを覆えないようにする |

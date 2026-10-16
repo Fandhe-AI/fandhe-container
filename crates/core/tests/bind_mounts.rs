@@ -65,7 +65,7 @@ fn core2_oci4_parse_config_to_bind_mount_set() {
     assert!(m.iter().all(|x| x.nosuid() && x.nodev()));
 }
 
-/// CORE-5・SEC-1: 拒否の種類・位置・エラーコード・固定英文メッセージ。
+/// CORE-5・SEC-1: 拒否の種類・位置・エラーコード・固定英文メッセージ（#2063 の決定 (a): bind と rbind の併記を含む）。
 #[test]
 fn core5_sec1_rejections_have_kind_index_and_message() {
     let cases = [
@@ -100,7 +100,7 @@ fn core5_sec1_rejections_have_kind_index_and_message() {
     assert_eq!(e.code(), ErrorCode::Unimplemented);
 }
 
-/// CORE-2: 予約先・重複・入れ子の拒否。
+/// CORE-2: 予約先・重複・入れ子の拒否（#2063 の決定 (c)）。
 #[test]
 fn core2_destination_rules() {
     let m = |d: &str| format!(r#"{{"destination":"{d}","type":"bind","source":"/data"}}"#);
@@ -126,7 +126,25 @@ fn core2_destination_rules() {
     );
 }
 
-/// SEC-1・OCI-4（#1915）: 状態ルートは同一・祖先・子孫のいずれの元も拒否する（OS 非依存の Linux 形式入力）。
+/// SEC-1・OCI-4: #2063 の決定 (d)。rootfs・bundle の配下の元は受け、同じ元でも状態ルートとして渡せば拒否する。
+#[test]
+fn sec1_oci4_host_paths_accept_bundle_and_rootfs_descendants() {
+    let c = config(
+        r#"[{"destination":"/sub","type":"bind","source":"/srv/b/rootfs/sub"},
+        {"destination":"/data","type":"bind","source":"/srv/b/data"}]"#,
+        "{}",
+    );
+    let s = BindMountSet::from_mounts(c.mounts()).expect("accepted");
+    s.check_against_host_paths(&["/srv/b/rootfs", "/srv/b"])
+        .expect("descendants of rootfs and bundle are accepted");
+    let e = s
+        .check_against_protected_trees(&["/srv/b"])
+        .expect_err("descendant of state root");
+    assert_eq!(*e.kind(), BindMountErrorKind::ForbiddenSource);
+    assert_eq!(e.index(), Some(0));
+}
+
+/// SEC-1・OCI-4（#1915）: 状態ルートは同一・祖先・子孫のいずれの元も拒否する（#2063 の決定 (d)。OS 非依存の Linux 形式入力）。
 #[test]
 fn sec1_protected_trees_reject_both_directions() {
     let cases = [

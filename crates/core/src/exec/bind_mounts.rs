@@ -1909,7 +1909,7 @@ mod tests {
     }
 
     /// SEC-1・SEC-4（#2066）: 実ファイルで、状態ルートの同一・祖先・配下（ディレクトリ・通常ファイル）を inode の層が拒否する。
-    /// 保護対象の FS 内パス・dev は無関係な値にして、mountinfo の層では拒否されない条件にする。兄弟は受ける。
+    /// 保護対象の FS 内パス・dev は無関係な値にして、mountinfo の層では拒否されない条件にする。兄弟は受ける。（#2063 の決定 (d)。OCI-4）
     #[test]
     fn sec1_state_root_identity_rejects_same_ancestor_and_descendant_at_apply() {
         let fx = fx();
@@ -1998,7 +1998,7 @@ mod tests {
     }
 
     /// SEC-1（#1915）: rootfs・bundle の実体（`ProtectedFsRoot::contained`）は、元がそれと同一・祖先のときだけ拒否する。
-    /// 保護対象の配下の別の実体を元にすること、同じ FS 上のリンク数 2 以上の通常ファイルは拒否しない。
+    /// 保護対象の配下の別の実体を元にすること、同じ FS 上のリンク数 2 以上の通常ファイルは拒否しない。（#2063 の決定 (d)。OCI-4）
     #[test]
     fn sec1_contained_root_rejects_only_same_or_ancestor_sources() {
         let fx = fx();

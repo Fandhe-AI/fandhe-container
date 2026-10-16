@@ -1924,7 +1924,7 @@ mod tests {
         }
     }
 
-    /// OCI-4・SEC-1（#1915）: ホストパスの字句比較に入る拒否（bundle の祖先・保護パスとの重なり・状態ルート）。
+    /// OCI-4・SEC-1（#1915。#2063 の決定 (d)）: ホストパスの字句比較に入る拒否（bundle の祖先・保護パスとの重なり・状態ルート）。
     /// ホストの絶対パスが POSIX 形式であることを前提とするため Linux 限定（Windows はドライブ接頭辞を
     /// 字句正規化できず、macOS は rootfs の固定が未実装）。OS 非依存の判定は `tests/bind_mounts.rs` で照合する。
     #[cfg(target_os = "linux")]
@@ -1965,6 +1965,67 @@ mod tests {
             assert_eq!(err.code(), ErrorCode::InvalidArgument, "case {name}");
             assert_eq!(err.message(), message, "case {name}");
         }
+    }
+
+    /// SEC-1・OCI-4（#2063 の決定 (d)）: bundle・rootfs の配下の実在する元は受け、状態ルートの配下の実在する元は拒否する。
+    /// `MemStateStore` の状態ルートは `temp_dir()` で bundle の祖先になるため使わず、bundle の兄弟の別ディレクトリを
+    /// 状態ルートとして `build_spec` を直接呼ぶ。元は実在させ、実体照合（mountinfo）の段を通した結果を照合する。
+    /// POSIX 形式のホストパスと rootfs の固定を前提とするため Linux 限定。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_oci4_start_bundle_rootfs_descendants_accepted_state_root_descendant_rejected() {
+        let name = "decision-d";
+        let (b, _store) = created(name);
+        let state = Bundle::new(&format!("{name}-state"));
+        let data = b.dir.join("data");
+        let sub = b.dir.join("rootfs/sub");
+        std::fs::create_dir(&data).expect("data");
+        std::fs::create_dir(&sub).expect("sub");
+        let data_s = data.to_str().expect("utf8").to_owned();
+        let sub_s = sub.to_str().expect("utf8").to_owned();
+        b.write_config(&with_mounts(json!([
+            bind_json("/data", &data_s, &["bind", "rw"]),
+            bind_json("/sub", &sub_s, &["bind"]),
+        ])));
+        let launcher = RecordingLauncher::new(false);
+        let id = ContainerId::new(name).expect("id");
+        let spec = build_spec(&b.dir, &id, launcher.as_ref(), Some(state.dir.as_path()))
+            .expect("bundle and rootfs descendants are accepted");
+        let got: Vec<_> = spec
+            .bind_mounts()
+            .mounts()
+            .iter()
+            .map(|m| {
+                (
+                    m.index(),
+                    m.destination().as_str().to_owned(),
+                    m.source().to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, "/data".to_owned(), data_s),
+                (1, "/sub".to_owned(), sub_s)
+            ]
+        );
+
+        // 状態ルートの配下に実在するディレクトリを元にすると拒否する。
+        let ctr = state.dir.join("ctr");
+        std::fs::create_dir(&ctr).expect("ctr");
+        b.write_config(&with_mounts(json!([bind_json(
+            "/ctr",
+            ctr.to_str().expect("utf8"),
+            &["bind"]
+        )])));
+        let err = build_spec(&b.dir, &id, launcher.as_ref(), Some(state.dir.as_path()))
+            .expect_err("state root descendant is rejected");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "mounts[0]: bind mount source is a forbidden host path"
+        );
     }
 
     /// SEC-1・OCI-4（#1915）: 状態ルートを示せないストアでは bind mount つきの start を fail-closed で拒否する。

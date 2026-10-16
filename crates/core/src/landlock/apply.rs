@@ -40,9 +40,10 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! - Mount 由来のルールの識別子の照合の違反（`MountNotRoot`・`MountIdentityMismatch`）を SEC-4 の違反理由
-//!   （`ViolationReason`）と監査の記録先へ運ぶ経路は未実装（`exec/landlock.rs` の写像は `violation: None`。
-//!   pivot 後の段の違反を親の `AuditSink` へ届ける経路が無い。#2013 と同種の欠落）
+//! - Mount 由来のルールの識別子の照合の違反（`MountNotRoot`・`MountIdentityMismatch`）は `exec/landlock.rs` の写像で
+//!   SEC-4 の違反理由（`ViolationReason::LandlockMount*`）へ対応づけ済みだが、監査の記録先（親の `AuditSink`）へ
+//!   運ぶ経路は未実装（pivot 後の段の違反を親へ届ける経路が無い。`docs/design/audit-delivery.md`・#2023〜#2028・#2004、
+//!   #2013 と同種の欠落）
 //! - ステージ列への組み込み口（`with_landlock`・#184）は実装済み。[`LandlockApplyReport`] は制限適用の証跡では
 //!   なく、`require_restriction_evidence` の判定には使えない（証跡は `with_landlock` 経由の適用成功時に `run_then` が作る `LaunchReady`。#1714）。
 
@@ -1624,5 +1625,98 @@ mod tests {
         let r = apply_with(&k, &set).expect("applied");
         assert_eq!(r.mounts_verified, 0);
         assert!(!k.calls().iter().any(|c| c.starts_with("identity")));
+    }
+
+    /// 実 fd・実マウントの識別子を使い、制限の適用（`add_rule`・`restrict_self`）だけを行わない差し込み
+    /// （試験用）。テストプロセスを制限しないため root も実機も要らない。
+    struct RealIdentityKernel;
+
+    impl LandlockKernel for RealIdentityKernel {
+        type Ruleset = ();
+        type PathFd = OwnedFd;
+        fn thread_count(&self) -> Option<u64> {
+            Some(1)
+        }
+        fn no_new_privs_enabled(&self) -> Result<bool, SysError> {
+            Ok(true)
+        }
+        fn create_ruleset(&self, _: u64) -> Result<(), SysError> {
+            Ok(())
+        }
+        fn open_rule_path(&self, path: &RulePath) -> Result<(OwnedFd, PathKind), OpenError> {
+            let root = sys::open_dir_path_nofollow(None, c"/").map_err(OpenError::Sys)?;
+            open_beneath(
+                root,
+                match path {
+                    RulePath::Root => "",
+                    other => other.as_str(),
+                },
+            )
+        }
+        fn add_rule(&self, _: &(), _: u64, _: &OwnedFd) -> Result<(), SysError> {
+            Ok(())
+        }
+        fn restrict_self(&self, _: &()) -> Result<(), SysError> {
+            Ok(())
+        }
+        fn probe_mount(&self, _: &OwnedFd) -> Result<MountProbe, SysError> {
+            // Mount 由来（bind）のルールだけを使うため呼ばれない。
+            Err(SysError::Os(sys::EINVAL))
+        }
+        fn mount_identity(&self, path: &OwnedFd) -> Result<MountIdentity, SysError> {
+            MountIdentity::of_fd(path)
+        }
+    }
+
+    /// CORE-5・SEC-1・SEC-4・REPAIR-10・REPAIR-12・#2071: 実マウント（ホストの `/proc`・`/dev/shm`）の識別子を
+    /// pivot 前段と同じ `observe_mount_beneath` で記録し、適用時に実 fd（`O_PATH`・fdinfo の `mnt_id`・`fstat`）で
+    /// 照合する経路を、偽の識別子を使わずに通す。一致は通り、記録後に別のマウントが重なった状態
+    /// （`/dev/shm` の識別子を記録として渡す）と、同じマウントの別 inode（ルートでない）は拒否される。
+    /// root・実機を要さない（制限の適用だけを行わない）。pivot を経る実機の経路では `exec/process.rs` の
+    /// `RealPrePivotOps` の記録がこの関数を呼ぶ（pivot を含む実機の結合試験は後続作業）。
+    #[test]
+    fn core5_2071_real_mount_identity_match_swap_and_not_root() {
+        let root = sys::open_dir_path_nofollow(None, c"/").expect("open /");
+        let observe = |dest: &str| observe_mount_beneath(root.as_fd(), dest).expect("observe");
+        let proc_id = observe("/proc");
+        let shm = observe("/dev/shm");
+        let ruleset = LandlockRuleset::for_observation(
+            6,
+            vec![
+                PathRule {
+                    path: RulePath::Root,
+                    allowed: AccessFs::READ,
+                    origin: RuleOrigin::Root,
+                },
+                PathRule {
+                    path: rule_path("/proc"),
+                    allowed: AccessFs::READ,
+                    origin: RuleOrigin::Mount { index: 0 },
+                },
+            ],
+        );
+        let run = |expected: MountIdentity| {
+            let m = recorded(&[(MountedBy::Bind { index: 0 }, "/proc", expected)]);
+            super::apply_with(&RealIdentityKernel, &ruleset, MountCheck::Recorded(&m))
+        };
+
+        let ok = run(proc_id).expect("matching real identity");
+        assert_eq!(ok.mounts_verified, 1);
+
+        let swapped = run(shm).expect_err("another mount recorded");
+        assert_eq!(
+            swapped.kind,
+            LandlockApplyErrorKind::MountIdentityMismatch { index: 1 }
+        );
+
+        let inner = run(MountIdentity {
+            ino: proc_id.ino.wrapping_add(1),
+            ..proc_id
+        })
+        .expect_err("same mount, different inode");
+        assert_eq!(
+            inner.kind,
+            LandlockApplyErrorKind::MountNotRoot { index: 1 }
+        );
     }
 }

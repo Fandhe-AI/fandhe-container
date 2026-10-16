@@ -175,6 +175,12 @@ pub enum ViolationReason {
     BindSourceReachesStateRoot,
     /// bind mount 先の既存の種別が元と合わない（ディレクトリと通常ファイルの取り違え等。#1913。SEC-1）。
     BindTargetKindMismatch,
+    /// Landlock の適用時に、Mount 由来のルールの対象のマウント ID（`mnt_id`）が、pivot 前段が載せた直後に記録した
+    /// ものと違う（記録後にマウントが差し替えられた。CORE-5・SEC-1・SEC-4・#2071）。
+    LandlockMountIdentityMismatch,
+    /// Landlock の適用時に、Mount 由来のルールの対象がマウントのルートでない（マウントの内側のディレクトリを
+    /// 指している。CORE-5・SEC-1・SEC-4・#2071）。
+    LandlockMountNotRoot,
     /// rootless の基本デバイスノードの bind 元（ホストの `/dev/<名前>`）が、期待する文字デバイスではない
     /// （symlink・通常ファイル・ディレクトリ、または `rdev` が固定表と違う）。bind せずに拒否する
     /// （TASK-29 追補・#1660。CORE-6・SEC-5）。
@@ -381,7 +387,7 @@ impl ViolationReason {
     ///
     /// 手書きの理由リストを別に持たず、種別（[`Self::kind`]）で絞って使う（[`Self::from_launch_token`]）。
     /// 足し忘れは単体テスト（`ALL` の件数が `as_str` の分岐数と一致すること）が検出する。
-    pub(super) const ALL: [ViolationReason; 58] = [
+    pub(super) const ALL: [ViolationReason; 60] = [
         Self::NoNamespaces,
         Self::HostnameWithoutUts,
         Self::PidWithoutMount,
@@ -416,6 +422,8 @@ impl ViolationReason {
         Self::BindSourceContainsRootfs,
         Self::BindSourceReachesStateRoot,
         Self::BindTargetKindMismatch,
+        Self::LandlockMountIdentityMismatch,
+        Self::LandlockMountNotRoot,
         Self::HostDeviceNodeUnexpected,
         Self::RootfsIsHostRoot,
         Self::RootfsOnSharedMount,
@@ -491,6 +499,22 @@ impl ViolationReason {
         }
     }
 
+    /// Landlock 適用の失敗の種別から、対応する違反理由を引く（Mount 由来のルールの識別子の照合の違反だけ。
+    /// 他は分離違反の試行ではないため `None`。CORE-5・SEC-4・#2071）。
+    ///
+    /// launch 経路（`MountCheck::Recorded`）でのみ生じる。exec の再適用（worker の経路）は `NotRecorded` で
+    /// 照合しないため、これらは `EXEC_WORKER_REASONS` に含めない。
+    pub(super) fn from_landlock_apply_kind(
+        kind: &crate::landlock::LandlockApplyErrorKind,
+    ) -> Option<Self> {
+        use crate::landlock::LandlockApplyErrorKind as K;
+        match kind {
+            K::MountIdentityMismatch { .. } => Some(Self::LandlockMountIdentityMismatch),
+            K::MountNotRoot { .. } => Some(Self::LandlockMountNotRoot),
+            _ => None,
+        }
+    }
+
     /// 機械可読な理由コード（snake_case）。
     pub fn as_str(self) -> &'static str {
         match self {
@@ -528,6 +552,8 @@ impl ViolationReason {
             Self::BindSourceContainsRootfs => "bind_source_contains_rootfs",
             Self::BindSourceReachesStateRoot => "bind_source_reaches_state_root",
             Self::BindTargetKindMismatch => "bind_target_kind_mismatch",
+            Self::LandlockMountIdentityMismatch => "landlock_mount_identity_mismatch",
+            Self::LandlockMountNotRoot => "landlock_mount_not_root",
             Self::HostDeviceNodeUnexpected => "host_device_node_unexpected",
             Self::RootfsIsHostRoot => "rootfs_is_host_root",
             Self::RootfsOnSharedMount => "rootfs_on_shared_mount",
@@ -593,6 +619,8 @@ impl ViolationReason {
             | Self::BindSourceContainsRootfs
             | Self::BindSourceReachesStateRoot
             | Self::BindTargetKindMismatch
+            | Self::LandlockMountIdentityMismatch
+            | Self::LandlockMountNotRoot
             | Self::HostDeviceNodeUnexpected => ViolationKind::MountTarget,
             Self::TargetOnSharedMount | Self::RootfsOnSharedMount => {
                 ViolationKind::SharedPropagation
@@ -647,6 +675,7 @@ impl ViolationReason {
             | Self::BindSourceContainsRootfs
             | Self::BindSourceReachesStateRoot
             | Self::BindTargetKindMismatch => "SEC-1",
+            Self::LandlockMountIdentityMismatch | Self::LandlockMountNotRoot => "CORE-5",
             Self::ExecTargetNotNestedPid1
             | Self::ExecTargetSharesPidNamespace
             | Self::ExecTargetSharesMountNamespace
@@ -696,6 +725,8 @@ impl ViolationReason {
             | Self::TargetOnSharedMount
             | Self::TargetMoved
             | Self::HostDeviceNodeUnexpected
+            | Self::LandlockMountIdentityMismatch
+            | Self::LandlockMountNotRoot
             | Self::RootfsOnSharedMount
             | Self::RootfsMoved
             | Self::RootfsHasSubmounts
@@ -814,6 +845,10 @@ impl ViolationReason {
             Self::BindTargetKindMismatch => {
                 "bind mount target kind does not match the source (directory vs regular file)"
             }
+            Self::LandlockMountIdentityMismatch => {
+                "the mount identity of a landlock rule target differs from the one recorded after mounting"
+            }
+            Self::LandlockMountNotRoot => "the landlock rule target is not the root of its mount",
             Self::HostDeviceNodeUnexpected => {
                 "host device node is not the expected character device; refusing to bind it"
             }
@@ -997,6 +1032,16 @@ impl IsolationViolation {
     pub fn mount_audit_event(&self) -> Option<AuditEvent> {
         self.reason.mount_layer_audit_event(self.audit_path.clone())
     }
+}
+
+/// [`ViolationReason::from_landlock_apply_kind`] の自由関数版（`exec/landlock.rs` が呼ぶ入口）。
+///
+/// worker の経路のソース走査（`violation_scan`）は `ViolationReason::<名前>` の字面を数えるため、launch 経路でだけ
+/// 生じる本理由の引き直しは自由関数を経由する（exec の再適用は `NotRecorded` でこの違反を作らない。#2071）。
+pub(super) fn landlock_apply_violation(
+    kind: &crate::landlock::LandlockApplyErrorKind,
+) -> Option<ViolationReason> {
+    ViolationReason::from_landlock_apply_kind(kind)
 }
 
 #[cfg(test)]

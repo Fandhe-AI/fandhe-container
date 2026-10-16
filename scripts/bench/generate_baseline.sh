@@ -116,8 +116,15 @@ if [ "$have_arch" -ne "$have_kind" ]; then
 fi
 if [ "$have_arch" -eq 1 ]; then
   for v in "$host_arch" "$host_kind"; do
-    # grep は行単位のため改行入りの値を通してしまう。文字列全体を [[ =~ ]] で照合する
-    if ! [[ "$v" =~ ^[a-z0-9_-]{1,32}$ ]]; then
+    # bash 3.2（macOS）の [[ =~ ]] は区間指定 {1,32} の扱いが不定のため使わない。
+    # 文字種は case（改行入りも [!...] に合致して弾ける）、長さは ${#v} で検査する
+    case "$v" in
+      "" | *[!abcdefghijklmnopqrstuvwxyz0123456789_-]*)
+        err "invalid-input" "--arch / --host-kind must match ^[a-z0-9_-]{1,32}$"
+        exit 2
+        ;;
+    esac
+    if [ "${#v}" -gt 32 ]; then
       err "invalid-input" "--arch / --host-kind must match ^[a-z0-9_-]{1,32}$"
       exit 2
     fi

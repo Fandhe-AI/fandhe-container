@@ -41,7 +41,7 @@ pub(crate) fn read_mountinfo_bounded(path: &str) -> Result<String, MountinfoRead
 }
 
 /// `/proc/<...>/fdinfo/<fd>` の `mnt_id:` 行（fd が属するマウントの ID）を取り出す。
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(crate) fn parse_fdinfo_mnt_id(fdinfo: &str) -> Option<u64> {
     fdinfo
         .lines()
@@ -52,7 +52,7 @@ pub(crate) fn parse_fdinfo_mnt_id(fdinfo: &str) -> Option<u64> {
 /// `path` を `O_PATH` で開いた fd の属するマウント ID（`/proc/thread-self/fdinfo/N`）。start の段が使う。
 /// `O_PATH` はブロックしないため、検査と open の間に FIFO 等へ差し替えられても停止しない（REPAIR-5）。
 /// 種別は開いた同じ fd の `fstat` で見て、ディレクトリと通常ファイル以外は `None`（適用の段が種別で拒否する）。
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(crate) fn path_mount_id(path: &str) -> Option<u64> {
     use std::os::fd::AsFd as _;
     use std::os::fd::AsRawFd as _;
@@ -71,8 +71,8 @@ pub(crate) fn path_mount_id(path: &str) -> Option<u64> {
     parse_fdinfo_mnt_id(&fdinfo)
 }
 
-/// unix 以外では `/proc` が無いため特定できない（bind mount は Linux 限定。呼び出し側は fail-closed にする）。
-#[cfg(not(unix))]
+/// Linux 以外では `/proc` と `crate::sys` が無いため特定できない（bind mount は Linux 限定。呼び出し側は fail-closed にする）。
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn path_mount_id(_path: &str) -> Option<u64> {
     None
 }
@@ -232,6 +232,54 @@ pub(crate) fn source_reaches(
     Some(false)
 }
 
+/// 元（マウント ID `src_mnt_id`・パス `src_real`）が公開するマウントの `major:minor` の集合を返す。
+/// 元のマウント自身に加え、`recursive`（rbind）のときは元の配下に載る子孫マウントのデバイスも含む
+/// （子マウントが別 FS のとき、その FS 上のハードリンクも一緒に公開されるため。SEC-1・#1915）。
+/// 元の位置を特定できない場合は `None`（呼び出し側が fail-closed にする）。
+#[cfg(target_os = "linux")]
+pub(crate) fn exposed_devs(
+    mounts: &[MountRow],
+    src_mnt_id: u64,
+    src_real: &str,
+    recursive: bool,
+) -> Option<std::collections::HashSet<String>> {
+    let top = fs_identity(mounts, src_mnt_id, src_real)?;
+    let mut devs = std::collections::HashSet::from([top.dev]);
+    if !recursive {
+        return Some(devs);
+    }
+    let mut children: HashMap<u64, Vec<&MountRow>> = HashMap::new();
+    for m in mounts {
+        children.entry(m.parent).or_default().push(m);
+    }
+    let mut seen = std::collections::HashSet::from([src_mnt_id]);
+    let mut stack = vec![src_mnt_id];
+    while let Some(id) = stack.pop() {
+        for child in children.get(&id).into_iter().flatten() {
+            if !seen.insert(child.id) || under(src_real, &child.point).is_none() {
+                continue;
+            }
+            devs.insert(child.dev.clone());
+            stack.push(child.id);
+        }
+    }
+    Some(devs)
+}
+
+/// `state_root`（正規化済みの絶対パス）の配下に載るマウントの実体（状態ルート自身のマウントは含まない）。
+/// 状態ルート配下の子 bind mount 経由でも状態ファイルを公開させないため、保護対象に加える（SEC-1・#1915）。
+/// 覆い隠されたマウントも保守的に含める。
+pub(crate) fn mounts_under(mounts: &[MountRow], state_root: &str) -> Vec<FsIdentity> {
+    mounts
+        .iter()
+        .filter(|m| m.point != state_root && under(state_root, &m.point).is_some())
+        .map(|m| FsIdentity {
+            dev: m.dev.clone(),
+            path: m.root.clone(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,7 +423,37 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
-    #[cfg(unix)]
+    /// SEC-1（#1915）: 再帰 bind の公開範囲のデバイスに子マウントも含み、rbind でなければ含まない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_exposed_devs_includes_child_mounts_only_for_rbind() {
+        let info = "10 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+                    20 10 8:2 / /data rw - ext4 /dev/sda2 rw\n\
+                    30 10 8:3 / /other rw - ext4 /dev/sda3 rw\n";
+        let mounts = parse_mountinfo(info).expect("parse");
+        let r = exposed_devs(&mounts, 10, "/", true).expect("rbind");
+        assert_eq!(r.len(), 3);
+        let n = exposed_devs(&mounts, 10, "/", false).expect("bind");
+        assert_eq!(n, std::collections::HashSet::from(["8:1".to_owned()]));
+        let sub = exposed_devs(&mounts, 10, "/etc", true).expect("sub");
+        assert_eq!(sub, std::collections::HashSet::from(["8:1".to_owned()]));
+    }
+
+    /// SEC-1（#1915）: 状態ルート配下のマウントの実体を列挙する（状態ルート自身は除く）。
+    #[test]
+    fn sec1_mounts_under_lists_child_mounts_of_state_root() {
+        let info = "10 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+                    20 10 8:1 /srv/state /state rw - ext4 /dev/sda1 rw\n\
+                    30 20 8:2 /container-state /state/c1 rw - ext4 /dev/sda2 rw\n\
+                    40 10 8:3 / /statex rw - ext4 /dev/sda3 rw\n";
+        let mounts = parse_mountinfo(info).expect("parse");
+        let v = mounts_under(&mounts, "/state");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].dev, "8:2");
+        assert_eq!(v[0].path, "/container-state");
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn parse_fdinfo_mnt_id_reads_the_field() {
         assert_eq!(

@@ -278,6 +278,9 @@ pub(crate) struct ProtectedFsRoot {
     /// 状態ルート配下にリンク数 2 以上の通常ファイル（別名のハードリンクを持つ状態ファイル）があった。
     /// 真なら同じ FS 上のディレクトリ元は、配下に状態ファイルの別名を含み得るため拒否する（SEC-1）。
     has_hard_linked_files: bool,
+    /// 設定されていれば、適用の段が毎回この状態ルート（ホストの正規化済みパス）配下を走査し直して
+    /// `has_hard_linked_files` を更新する（start 後に追加されたハードリンクを restart でも検出する。SEC-1・#1915）。
+    scan_root: Option<String>,
 }
 
 impl ProtectedFsRoot {
@@ -286,13 +289,25 @@ impl ProtectedFsRoot {
             dev,
             path,
             has_hard_linked_files,
+            scan_root: None,
         }
+    }
+
+    /// 適用のたびに `root` 配下のハードリンクを走査し直すようにする（`new` の固定値より優先）。
+    pub(crate) fn with_scan_root(mut self, root: String) -> Self {
+        self.scan_root = Some(root);
+        self
     }
 
     /// 適用の段（Linux 限定の `exec::mount_binds`）だけが読む。
     #[cfg(target_os = "linux")]
+    ///
+    /// `scan_root` があれば呼び出しのたびに走査し直す。走査できない・項目数が多すぎる場合は「持つ」とみなす（fail-closed）。
     pub(crate) fn has_hard_linked_files(&self) -> bool {
-        self.has_hard_linked_files
+        match &self.scan_root {
+            Some(root) => state_tree_has_hard_links(std::path::Path::new(root)).unwrap_or(true),
+            None => self.has_hard_linked_files,
+        }
     }
 
     /// 適用の段（Linux 限定の `exec::mount_binds`）だけが読む。
@@ -306,6 +321,36 @@ impl ProtectedFsRoot {
     pub(crate) fn path(&self) -> &str {
         &self.path
     }
+}
+
+/// 状態ルート配下の走査で見る項目数の上限（超過は `None`。無制限の走査を避ける）。
+#[cfg(target_os = "linux")]
+const STATE_SCAN_MAX_ENTRIES: usize = 100_000;
+
+/// 状態ルート配下に、リンク数 2 以上の通常ファイルがあるかを調べる（SEC-1・#1915）。
+/// symlink は辿らない。読めない・項目数が `STATE_SCAN_MAX_ENTRIES` を超える場合は `None`（呼び出し側が「持つ」とみなす）。
+/// 走査から attach までの間に追加されるハードリンクは検出できない（残る競合。状態ルートへの書き込み権限が前提）。
+#[cfg(target_os = "linux")]
+fn state_tree_has_hard_links(root: &std::path::Path) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut stack = vec![root.to_path_buf()];
+    let mut seen = 0usize;
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).ok()? {
+            let entry = entry.ok()?;
+            seen += 1;
+            if seen > STATE_SCAN_MAX_ENTRIES {
+                return None;
+            }
+            let meta = std::fs::symlink_metadata(entry.path()).ok()?;
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() && meta.nlink() > 1 {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
 }
 
 impl BindMountSet {

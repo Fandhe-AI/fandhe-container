@@ -112,7 +112,7 @@ use std::path::{Path, PathBuf};
 
 use crate::oci_runtime::ProtectedFsRoot;
 use crate::oci_runtime::mountinfo_identity::{
-    FsIdentity, fs_identity, parse_fdinfo_mnt_id, parse_mountinfo, source_reaches,
+    FsIdentity, exposed_devs, fs_identity, parse_fdinfo_mnt_id, parse_mountinfo, source_reaches,
 };
 use crate::oci_runtime::{BindMountSet, BindMountSpec};
 use crate::rootless::parse_id_map;
@@ -492,13 +492,21 @@ fn check_source_not_protected(
     // ディレクトリ元の配下にある状態ファイルの別名は走査では見つけられない。代わりに start の段が状態ルート側の
     // 状態ファイルのリンク数を調べており（`has_hard_linked_files`）、別名を持つ状態ファイルがあるなら、同じ FS 上の
     // ディレクトリ元は別名を含み得るため拒否する（fail-closed。SEC-1）。
-    if src.kind() == BindSourceKind::Directory
-        && ctx
+    // 再帰 bind では子マウント（別 FS を含む）も一緒に公開されるため、公開されるすべてのデバイスで照合する。
+    if src.kind() == BindSourceKind::Directory {
+        let Some(devs) = exposed_devs(&mounts, mnt_id, &real, spec.recursive()) else {
+            return Err(failed(
+                spec,
+                "the pinned bind mount source cannot be located in mountinfo",
+            ));
+        };
+        if ctx
             .protected
             .iter()
-            .any(|p| p.dev() == identity.dev && p.has_hard_linked_files())
-    {
-        return Err(violation(spec, ViolationReason::BindSourceReachesStateRoot));
+            .any(|p| devs.contains(p.dev()) && p.has_hard_linked_files())
+        {
+            return Err(violation(spec, ViolationReason::BindSourceReachesStateRoot));
+        }
     }
     for p in ctx.protected {
         let state = FsIdentity {
@@ -1872,6 +1880,43 @@ mod tests {
             Some(ViolationReason::BindSourceReachesStateRoot)
         );
         // 非再帰 bind は配下のマウントを公開しないため、状態ルートの実体が配下にあっても拒否しない。
+        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(protected());
+        let knobs = Knobs {
+            mountinfo: Some(format!("{info}{}", ideal_mountinfo(200, false, false))),
+            ..Knobs::default()
+        };
+        let (r, _log) = run(&fx, &set, &knobs);
+        r.expect("non-recursive bind is applied");
+    }
+
+    /// SEC-1（#1915）: 再帰 bind の子マウントが別 FS のとき、その FS 上のハードリンクの保護も適用する。
+    /// 非再帰 bind は子マウントを公開しないため拒否しない。
+    #[test]
+    fn sec1_child_mount_fs_hard_links_are_checked_only_for_rbind() {
+        let fx = fx();
+        let real = std::fs::canonicalize(fx.src("dir")).expect("canon");
+        let info = format!(
+            "1 0 0:1 / / rw - tmpfs none rw\n5 1 0:7 / {}/inner rw - tmpfs none rw\n",
+            real.to_str().expect("utf8")
+        );
+        let protected = || {
+            vec![ProtectedFsRoot::new(
+                "0:7".to_owned(),
+                "/st".to_owned(),
+                true,
+            )]
+        };
+        let set = one("/mnt/d", &fx.src("dir"), &["rbind"]).with_protected_roots(protected());
+        let knobs = Knobs {
+            mountinfo: Some(info.clone()),
+            ..Knobs::default()
+        };
+        let (r, _log) = run(&fx, &set, &knobs);
+        let err = r.expect_err("rbind with linked child fs must be rejected");
+        assert_eq!(
+            reason_of(&err),
+            Some(ViolationReason::BindSourceReachesStateRoot)
+        );
         let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(protected());
         let knobs = Knobs {
             mountinfo: Some(format!("{info}{}", ideal_mountinfo(200, false, false))),

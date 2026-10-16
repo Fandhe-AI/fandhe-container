@@ -377,6 +377,139 @@ fn task115_6_mac1_virtiofs_share_reaches_backend() {
     assert!(shares[0].access.is_read_only());
 }
 
+/// MAC-1・REPAIR-12（#2075）: 非空の console_log とゲスト内マウント先が UDS 越しにバックエンドへ届き、
+/// 実効 cmdline にゲスト init への指示が付く。
+#[test]
+fn task2075_mac1_guest_mount_and_console_log_reach_backend_over_uds() {
+    let mut h = E2e::start();
+    let k = h.kernel();
+    for name in ["s1", "s2"] {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(h.dir.path().join(name))
+            .expect("mkdir share");
+    }
+    let (d1, d2) = (h.dir.join_str("s1"), h.dir.join_str("s2"));
+    let log = h.dir.join_str("console.log");
+    expect_ok(
+        h.call(
+            1,
+            &[
+                "create",
+                "c1",
+                &k,
+                "",
+                "console=hvc0",
+                &log,
+                "data",
+                &d1,
+                "rw",
+                "/mnt/fandhe/data",
+                "ro",
+                &d2,
+                "ro",
+                "/mnt/fandhe/ro",
+            ],
+        ),
+        1,
+    );
+    assert_eq!(expect_ok(h.call(2, &["start", "c1"]), 2), one("running"));
+    let (_o, rec) = h.disconnect();
+    let rec = rec.lock().expect("lock");
+    assert_eq!(rec.launched.len(), 1);
+    let spec = &rec.launched[0];
+    let mounts: Vec<Option<String>> = spec
+        .shares
+        .shares()
+        .iter()
+        .map(|s| s.guest_mount.as_ref().map(|m| m.as_str().to_string()))
+        .collect();
+    assert_eq!(
+        mounts,
+        vec![
+            Some("/mnt/fandhe/data".to_string()),
+            Some("/mnt/fandhe/ro".to_string())
+        ]
+    );
+    assert_eq!(
+        spec.effective_cmdline().expect("cmdline").as_str(),
+        "console=hvc0 fandhe.virtiofs=data:/mnt/fandhe/data:rw fandhe.virtiofs=ro:/mnt/fandhe/ro:ro"
+    );
+}
+
+/// MAC-1・SEC-4・REPAIR-12（#2075）: 不正なマウント先と、console_log なしのマウント先は Error フレームで拒否され、
+/// 固定文言のまま入力値を反射せず、接続は維持され、バックエンドへは届かない。
+#[test]
+fn task2075_mac1_sec4_invalid_guest_mount_is_rejected_over_uds() {
+    let mut h = E2e::start();
+    let k = h.kernel();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(h.dir.path().join("s1"))
+        .expect("mkdir share");
+    let d1 = h.dir.join_str("s1");
+    let log = h.dir.join_str("console.log");
+    let rejected = "VM configuration was rejected";
+    let (code, msg) = expect_err(
+        h.call(
+            1,
+            &[
+                "create",
+                "c1",
+                &k,
+                "",
+                "console=hvc0",
+                &log,
+                "data",
+                &d1,
+                "rw",
+                "/etc/SECRET",
+            ],
+        ),
+        1,
+    );
+    assert_eq!(
+        (code, msg.as_str()),
+        (
+            PluginErrorCode::InvalidArgument,
+            format!("config.guest_mount_point_not_under_base: {rejected}").as_str()
+        )
+    );
+    assert!(!msg.contains("SECRET"), "{msg}");
+    let (code, msg) = expect_err(
+        h.call(
+            2,
+            &[
+                "create",
+                "c1",
+                &k,
+                "",
+                "console=hvc0",
+                &log,
+                "data",
+                &d1,
+                "rw",
+                "/mnt/fandhe/../SECRET",
+            ],
+        ),
+        2,
+    );
+    assert_eq!(
+        (code, msg.as_str()),
+        (
+            PluginErrorCode::InvalidArgument,
+            format!("config.guest_mount_point_invalid: {rejected}").as_str()
+        )
+    );
+    assert!(!msg.contains("SECRET"), "{msg}");
+    // 接続は維持され、拒否された create は登録されていない（start は NOT_FOUND）。
+    let (code, _) = expect_err(h.call(3, &["start", "c1"]), 3);
+    assert_eq!(code, PluginErrorCode::NotFound);
+    assert_eq!(expect_ok(h.call(4, &["ping"]), 4), one("pong"));
+    let (_o, rec) = h.disconnect();
+    assert!(rec.lock().expect("lock").launched.is_empty());
+}
+
 /// PLUG-1: 状態違反はエラーフレームになるが接続は維持され、固定文言に入力値（id・パス）を反射しない。
 #[test]
 fn task115_6_plug1_error_frames_keep_connection() {

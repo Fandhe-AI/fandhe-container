@@ -2246,11 +2246,14 @@ mod tests {
     // ---- MAC-1・TASK-64 追補（#2075）: ゲスト内 virtiofs のマウント先とコンソールログ ----
 
     /// `(tag, host_dir, access, guest_mount)`。
+    #[cfg(unix)]
     type GmShare<'a> = (&'a str, &'a str, &'a str, &'a str);
 
+    #[cfg(unix)]
     const GM_REJECTED: &str = "VM configuration was rejected";
 
     /// マウント先つきの create 本体を組む（`shares` は `(tag, host_dir, access, guest_mount)`）。
+    #[cfg(unix)]
     fn gm_body(
         id: &str,
         k: &str,
@@ -2265,6 +2268,7 @@ mod tests {
         b
     }
 
+    #[cfg(unix)]
     fn gm_share_dir(dir: &Path, name: &str) -> String {
         let d = dir.join(name);
         std::fs::create_dir_all(&d).expect("mkdir");

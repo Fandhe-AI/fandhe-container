@@ -21,7 +21,9 @@
 //! - 非特権ユーザーでの実行（root では rootful として拒否される。SEC-5）
 //! - 非特権 user namespace を許可するホスト（`kernel.apparmor_restrict_unprivileged_userns=0` 等の緩和が要る場合がある）
 //! - `systemd-run --user`（bin を非特権ユーザーに委譲された cgroup v2 の新しいスコープで起動するため。試験プロセスと同じ
-//!   cgroup に他プロセスがいると `DelegatedCgroup::prepare` が失敗する）
+//!   cgroup に他プロセスがいると `DelegatedCgroup::prepare` が失敗する）。包み込みの引数は本番（CLI の `start`）と同じ
+//!   `start_contract::USER_SCOPE_WRAPPER_ARGS` で、CLI 経由で CLI が居残らないことの照合は
+//!   `crates/cli/tests/start_scope_real.rs` が行う（#2081・CORE-3・CORE-4）
 //! - 動的リンクのためホストの共有ライブラリを rootfs へコピーする（ネットワークは不要）
 //!
 //! # 実機前提テストとしての分離
@@ -308,7 +310,7 @@ mod linux {
     /// bin を非特権ユーザーに委譲された新しい cgroup スコープで起動する（CLI の契約と同じ argv・stdout は pipe）。
     fn spawn_supervisor(env: &Env, id: &str, restart: Option<&str>) -> Supervisor {
         let mut cmd = Command::new("systemd-run");
-        cmd.args(["--user", "--scope", "--quiet", "-p", "Delegate=yes", "--"])
+        cmd.args(fandhe_container_supervisor::start_contract::USER_SCOPE_WRAPPER_ARGS)
             .arg(BIN)
             .arg("start")
             .arg("--root")

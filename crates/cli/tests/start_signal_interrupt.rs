@@ -138,7 +138,12 @@ fn isolated_cli_dir(tag: &str) -> PathBuf {
 
 /// スタブ supervisor を書く。作成と chmod は子プロセスで行う（ETXTBSY の回避）。
 fn install_stub_supervisor(dir: &Path, body: &str) {
-    let path = dir.join("fandhe-container-supervisor");
+    install_stub_exe(dir, "fandhe-container-supervisor", body);
+}
+
+/// 固定名 `name` のスタブ（シェルスクリプト）を `dir` に置く。
+fn install_stub_exe(dir: &Path, name: &str, body: &str) {
+    let path = dir.join(name);
     let mut c = Command::new("/bin/sh")
         .arg("-c")
         .arg("cat > \"$1\" && chmod 755 \"$1\"")
@@ -158,6 +163,27 @@ fn install_stub_supervisor(dir: &Path, body: &str) {
             .expect("write stub");
     }
     wait_ok(c, "install stub");
+}
+
+/// 偽の systemd-run（本物と同じく包み込みの引数を検査して残りを exec する）と偽の user マネージャのソケット。
+/// 返す `UnixListener` は試験の間保持する（#2081）。
+fn install_fake_scope(
+    dir: &Path,
+    tmp: &TmpDir,
+) -> (PathBuf, PathBuf, std::os::unix::net::UnixListener) {
+    install_stub_exe(
+        dir,
+        "fake-systemd-run",
+        r#"[ "$1 $2 $3 $4 $5 $6" = "--user --scope --quiet -p Delegate=yes --" ] || { printf 'FCSUP1 ERR INTERNAL 1 badwrapper
+'; exit 0; }
+shift 6
+exec "$@""#,
+    );
+    let xdg = tmp.0.join("xdg");
+    std::fs::create_dir_all(xdg.join("systemd")).expect("mkdir xdg");
+    let listener = std::os::unix::net::UnixListener::bind(xdg.join("systemd").join("private"))
+        .expect("bind fake user manager socket");
+    (dir.join("fake-systemd-run"), xdg, listener)
 }
 
 fn cli_command(cli: &Path) -> Command {
@@ -217,10 +243,12 @@ struct Started {
 }
 
 /// CLI の `start c1` を spawn し、スタブが待機に入る（pid ファイルが現れる）まで待つ。
-fn start_waiting(dir: &Path, root_s: &str, own_group: bool) -> Started {
+fn start_waiting(dir: &Path, root_s: &str, own_group: bool, scope: &(PathBuf, PathBuf)) -> Started {
     let cli = dir.join("fandhe-container");
     let mut cmd = cli_command(&cli);
     cmd.args(["--root", root_s, "start", "c1"])
+        .env("FANDHE_CONTAINER_TEST_SYSTEMD_RUN", &scope.0)
+        .env("XDG_RUNTIME_DIR", &scope.1)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if own_group {
@@ -294,8 +322,9 @@ fn cli1_repair5_signal_while_waiting_ends_cli_by_signal_and_keeps_supervisor() {
         let cli = dir.join("fandhe-container");
         let root_s = prepare_c1(&tmp, &cli);
         install_stub_supervisor(&dir, STUB_BODY);
+        let (sd, xdg, _listener) = install_fake_scope(&dir, &tmp);
 
-        let mut s = start_waiting(&dir, &root_s, false);
+        let mut s = start_waiting(&dir, &root_s, false, &(sd, xdg));
         let cli_pid = s.guard.cli.id();
         send(name, cli_pid, false);
         let (status, out, err) = wait_cli(&mut s);
@@ -327,8 +356,9 @@ fn cli1_terminal_sigint_to_foreground_group_does_not_reach_supervisor() {
     let cli = dir.join("fandhe-container");
     let root_s = prepare_c1(&tmp, &cli);
     install_stub_supervisor(&dir, STUB_BODY);
+    let (sd, xdg, _listener) = install_fake_scope(&dir, &tmp);
 
-    let mut s = start_waiting(&dir, &root_s, true);
+    let mut s = start_waiting(&dir, &root_s, true, &(sd, xdg));
     send("INT", s.guard.cli.id(), true);
     let (status, out, err) = wait_cli(&mut s);
 

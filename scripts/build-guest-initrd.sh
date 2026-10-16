@@ -476,6 +476,16 @@ copy_input() {
         err bad-input "init must not be group or other writable"
         exit 2
     fi
+    # macOS の /dev/fd/N（fdesc）では上の fd 経由の権限検査が効かないことがあるため、パス側でも同じ検査を
+    # 重ねる（早期拒否。パスの検査は安全性の根拠にしない。fd 検査は Linux で有効）。
+    if [ -n "$(find "$init_src" -prune \( -perm -0020 -o -perm -0002 \) -print 2>/dev/null)" ]; then
+        err bad-input "init must not be group or other writable"
+        exit 2
+    fi
+    if [ -z "$(find "$init_src" -prune -type f \( -user "$expect_uid" -o -user 0 \) -print 2>/dev/null)" ]; then
+        err bad-input "init must be a regular file owned by the current user or root"
+        exit 2
+    fi
     if ! head -c $((max_init_bytes + 1)) <&9 >"$init_copy" 2>/dev/null; then
         err bad-input "cannot read init"
         exit 2
@@ -526,7 +536,10 @@ elf_fail() {
 }
 magic="$(od -An -tx1 -v -N 4 "$init_copy" | tr -d ' \n')"
 [ "$magic" = "7f454c46" ] || elf_fail not-elf "init is not an ELF file"
-ident="$(od -An -tu1 -v -j 4 -N 2 "$init_copy" | tr -s ' ' | sed 's/^ //')"
+# BSD od は列幅の空白と末尾の空白を付けるため、語分割で正規化してから比較する。
+# shellcheck disable=SC2046
+set -- $(od -An -tu1 -v -j 4 -N 2 "$init_copy")
+ident="${1:-} ${2:-}"
 [ "$ident" = "2 1" ] || elf_fail bad-elf "init must be a 64-bit little-endian ELF"
 e_type="$(rd_le "$init_copy" 16 2)" || elf_fail bad-elf "cannot read the ELF header"
 e_machine="$(rd_le "$init_copy" 18 2)" || elf_fail bad-elf "cannot read the ELF header"

@@ -207,7 +207,10 @@ impl Plan {
         }
     }
 
-    /// 副作用・確保の前に、全フィールドが `parse_args` と同じ範囲にあることを検証する。
+    /// 副作用・確保の前に、全フィールドが安全な内部範囲にあることを検証する。
+    ///
+    /// 件数の下限は 1（smoke・テスト用の小さい件数を許す）。計測用の下限 `MIN_COUNT` は
+    /// CLI 引数の解釈（`parse_args`）でのみ課す。上限・その他の範囲は `parse_args` と同じ。
     ///
     /// フィールドが公開で `run*` を直接呼べるため、公開の実行入口はすべてこれを通す
     /// （`batch_size == 0` の剰余 panic・過大確保の防止。REPAIR-5・coding-rust）。
@@ -220,7 +223,7 @@ impl Plan {
             }
         };
         check(
-            (MIN_COUNT..=MAX_COUNT).contains(&self.count),
+            (1..=MAX_COUNT).contains(&self.count),
             "count is out of range",
         )?;
         check(
@@ -424,6 +427,7 @@ pub fn run_trial(
     overall_deadline: Instant,
 ) -> Result<Duration, SmallFilesError> {
     plan.validate()?;
+    check_environment(plan)?;
     // 区間の外: Batch の組み立てと creator の構築。
     let batch = build_write_batch(plan.file_size)?;
     let creator = GuestFileCreator::new(trial_root.to_path_buf()).map_err(|e| from_io(&e))?;
@@ -565,6 +569,24 @@ pub fn median(values: &[f64]) -> Option<f64> {
     }
 }
 
+/// 永続化の対応状況と FLUSH 方式を、ファイルを作る前に検査する（`run_trial` と
+/// `run_with_deadline` が共有する）。
+fn check_environment(plan: &Plan) -> Result<(), SmallFilesError> {
+    if !persist_support().is_supported() {
+        return Err(SmallFilesError::new(
+            "persist-unsupported",
+            "persist is not supported on this host",
+        ));
+    }
+    if plan.is_every_k() && persist_support() != PersistSupport::Supported {
+        return Err(SmallFilesError::new(
+            "unsupported-flush-mode",
+            "flush-every-k requires syncfs support (Linux 5.8 or later)",
+        ));
+    }
+    Ok(())
+}
+
 /// 計画を `root` の下で実行する。全体の期限は呼び出し時点から `plan.timeout`。
 pub fn run(plan: &Plan, root: &Path) -> Result<Measurement, SmallFilesError> {
     plan.validate()?;
@@ -581,18 +603,7 @@ pub fn run_with_deadline(
     overall_deadline: Instant,
 ) -> Result<Measurement, SmallFilesError> {
     plan.validate()?;
-    if !persist_support().is_supported() {
-        return Err(SmallFilesError::new(
-            "persist-unsupported",
-            "persist is not supported on this host",
-        ));
-    }
-    if plan.is_every_k() && persist_support() != PersistSupport::Supported {
-        return Err(SmallFilesError::new(
-            "unsupported-flush-mode",
-            "flush-every-k requires syncfs support (Linux 5.8 or later)",
-        ));
-    }
+    check_environment(plan)?;
     let work = WorkDir::create(root)?;
     let mut trials = Vec::with_capacity(usize::try_from(plan.trials).unwrap_or(0));
     for n in 0..plan.trials {

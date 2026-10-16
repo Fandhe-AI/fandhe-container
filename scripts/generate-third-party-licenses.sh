@@ -44,6 +44,12 @@ err() {
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$script_dir/.." && pwd)"
+# lib.sh は source 時に cwd をリポジトリルートへ移す（make 経由と同じ意味にするため）。本スクリプトは
+# 利用者の相対パスを呼び出し元の cwd 基準で解釈するので、source 後に元の cwd へ戻す。
+caller_pwd="$PWD"
+# shellcheck source=lib.sh
+source "$root/scripts/lib.sh"
+cd -- "$caller_pwd" || { err bad-environment "cannot return to the working directory"; exit 2; }
 cargo="${CARGO:-cargo}"
 output=""
 timeout_s=600
@@ -83,16 +89,8 @@ done
 # 一時領域（タイムアウト印の置き場）。後始末は cleanup が行う。
 work_dir=""
 tmp=""
-child_pid=""
-wd_pid=""
 cleanup() {
-    if [ -n "$child_pid" ]; then
-        kill -TERM -- "-$child_pid" 2>/dev/null || true
-        kill -KILL -- "-$child_pid" 2>/dev/null || true
-    fi
-    if [ -n "$wd_pid" ]; then
-        kill -KILL "$wd_pid" 2>/dev/null || true
-    fi
+    run_limited_abort
     [ -z "$tmp" ] || rm -f "$tmp"
     [ -z "$work_dir" ] || rm -rf "$work_dir"
 }
@@ -100,56 +98,7 @@ trap cleanup EXIT
 trap 'exit 143' INT TERM
 
 work_dir="$(mktemp -d)" || { work_dir=""; err bad-environment "cannot create a temporary directory"; exit 2; }
-
-# 子プロセスを上限秒で打ち切る（macOS に timeout が無いため見張り役方式）。
-# 子は job control（set -m）で独立したプロセスグループにし、超過時はグループ全体へ
-# TERM → 猶予後 KILL を送って終了を確認する。超過時は 124 を返す。
-run_limited() {
-    local limit="$1"
-    shift
-    local marker="$work_dir/timeout-marker"
-    rm -f "$marker"
-    set -m
-    "$@" &
-    local pid=$!
-    set +m
-    child_pid="$pid"
-    (
-        # 親の EXIT / TERM trap（cleanup）を引き継がない
-        trap - EXIT INT TERM
-        i=0
-        while [ "$i" -lt "$limit" ]; do
-            sleep 1
-            kill -0 "$pid" 2>/dev/null || exit 0
-            i=$((i + 1))
-        done
-        : >"$marker"
-        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-        sleep 2
-        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-    ) &
-    wd_pid=$!
-    local rc=0
-    wait "$pid" || rc=$?
-    if [ -e "$marker" ]; then
-        # 見張り役が KILL まで送り終えるのを待ち、グループの消滅を確認する。
-        wait "$wd_pid" 2>/dev/null || true
-        local n=0
-        while kill -0 -- "-$pid" 2>/dev/null && [ "$n" -lt 5 ]; do
-            sleep 1
-            n=$((n + 1))
-        done
-        wd_pid=""
-        child_pid=""
-        rm -f "$marker"
-        return 124
-    fi
-    kill -KILL "$wd_pid" 2>/dev/null || true
-    wait "$wd_pid" 2>/dev/null || true
-    wd_pid=""
-    child_pid=""
-    return "$rc"
-}
+RUN_LIMITED_DIR="$work_dir"
 
 # パス要素のいずれかが symlink なら 1（symlink なし・未存在なら 0）を返す（存在する要素のみ検査し、無い要素で打ち切る）。
 # 非 root 実行時は root 所有の symlink（システム設定）を許容する。".." は字句的に畳む

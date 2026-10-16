@@ -156,9 +156,27 @@ mod linux {
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    fail("child did not finish within the deadline (killed)");
+                    // kill の失敗は握りつぶさず、回収も別の有限期限までの try_wait で確認する（REPAIR-5）。
+                    let kill_result = child.kill();
+                    let reap_deadline = Instant::now() + Duration::from_secs(10);
+                    let reaped = loop {
+                        match child.try_wait() {
+                            Ok(Some(_)) => break true,
+                            Ok(None) if Instant::now() < reap_deadline => {
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                            Ok(None) | Err(_) => break false,
+                        }
+                    };
+                    match (kill_result, reaped) {
+                        (Ok(()), true) => fail("child did not finish within the deadline (killed)"),
+                        (Ok(()), false) => fail(
+                            "child did not finish within the deadline and was not reaped after kill",
+                        ),
+                        (Err(e), _) => fail(&format!(
+                            "child did not finish within the deadline and kill failed: {e}"
+                        )),
+                    }
                 }
                 Err(e) => fail(&format!("try_wait: {e}")),
             }

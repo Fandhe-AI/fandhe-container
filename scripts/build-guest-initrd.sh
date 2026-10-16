@@ -151,8 +151,47 @@ while [ "${#output_dir}" -gt 1 ] && [ "${output_dir%/}" != "$output_dir" ]; do
     output_dir="${output_dir%/}"
 done
 
+# 出力先と祖先ディレクトリが他者に書き換えられないことの検査（fail-closed。PR #2086 の指摘）。
+# 他ユーザーが書き込める場所だと、mktemp が作った名前を観測して削除し、再オープン前に被害者の
+# ファイルへの symlink へ差し替えられ、write_info のリダイレクトや cp が参照先を上書きする。
+# 出力先自身は group/other 書き込み可を許さず、祖先は sticky 無しの group/other 書き込み可を拒否する
+# （/tmp のような sticky は他者の名前を消せないため許す）。所有者は実際の実行ユーザーか root に限る（テスト用の EXPECT_UID の差し替えは入力側のみ）。
+# 物理パス（cd -P）で辿り、存在しない出力先は最も近い既存の祖先から検査する。
+dir_unsafe_reason() { # $1=ディレクトリ $2=self|ancestor。危険なら理由を stdout に出す
+    local d="$1" self_uid; self_uid="$(id -u)"
+    if [ -z "$(find "$d" -prune \( -user "$self_uid" -o -user 0 \) -print 2>/dev/null)" ]; then
+        printf 'is owned by another user'
+    elif [ "$2" = "self" ] && [ -n "$(find "$d" -prune \( -perm -0020 -o -perm -0002 \) -print 2>/dev/null)" ]; then
+        printf 'is group or other writable'
+    elif [ -n "$(find "$d" -prune \( -perm -0020 -o -perm -0002 \) ! -perm -1000 -print 2>/dev/null)" ]; then
+        printf 'is group or other writable without the sticky bit'
+    fi
+}
+check_output_safe() {
+    local d="$output_dir" kind="self" reason
+    while [ ! -d "$d" ] && [ "$d" != "/" ]; do
+        d="$(dirname "$d")"
+        kind="ancestor"
+    done
+    d="$(cd -P "$d" 2>/dev/null && pwd -P)" || {
+        err bad-output "cannot resolve the output directory path"
+        exit 2
+    }
+    while :; do
+        reason="$(dir_unsafe_reason "$d" "$kind")"
+        if [ -n "$reason" ]; then
+            err unsafe-output "directory $d $reason; refusing to write there"
+            exit 2
+        fi
+        [ "$d" != "/" ] || break
+        d="$(dirname "$d")"
+        kind="ancestor"
+    done
+}
+
 # 空ディレクトリであることの検査（一覧取得の失敗は空と誤認しない。fail-closed）。
 check_output_free() {
+    check_output_safe
     if [ -L "$output_dir" ]; then
         err bad-output "output directory must not be a symlink"
         exit 2
@@ -474,7 +513,7 @@ fi
 # --- 出力（一時名へ書いてから ln で確定する。既存は上書きしない） ---
 publishing=1
 if [ ! -d "$output_dir" ]; then
-    mkdir "$output_dir" 2>/dev/null || { err bad-output "cannot create the output directory"; exit 2; }
+    mkdir -m 0700 "$output_dir" 2>/dev/null || { err bad-output "cannot create the output directory"; exit 2; }
     out_created=1
 fi
 write_info() {

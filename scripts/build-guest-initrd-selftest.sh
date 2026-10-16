@@ -169,6 +169,7 @@ if grep -qx 'compress=gzip' "$out/build-info.txt"; then ok "2 build-info has com
 # --- 3: 既存の出力は上書きしない ---
 newout
 mkdir "$out"
+chmod 700 "$out"
 printf 'KEEP-ME' >"$out/initrd.cpio.gz"
 run "$target" --init "$good" --output-dir "$out"
 check "3 exit code" 2 "$rc"
@@ -188,6 +189,39 @@ run "$target" --init "$good" --output-dir "$out"
 check "3b dir-symlink exit code" 2 "$rc"
 check "3b dir-symlink wrote nothing outside" 0 "$(find "$sb/outside" -mindepth 1 | wc -l | tr -d ' ')"
 rm -rf "$sb/outside"
+
+# --- 3b: 他者が書き換えられる出力先は拒否する（PR #2086 の指摘・fail-closed） ---
+# 出力先が group/other 書き込み可なら、一時名の削除と symlink 差し替えで参照先を上書きされうる。
+newout
+mkdir "$out"
+chmod 777 "$out"
+run "$target" --init "$good" --output-dir "$out"
+check "3b writable output exit code" 2 "$rc"
+check "3b writable output error code" unsafe-output "$(errcode)"
+check "3b writable output left empty" "" "$(ls -A "$out")"
+chmod 700 "$out"
+newout
+mkdir "$out"
+chmod 770 "$out"
+run "$target" --init "$good" --output-dir "$out"
+check "3b group-writable output error code" unsafe-output "$(errcode)"
+chmod 700 "$out"
+# sticky 無しで他者が書ける祖先（未作成の出力先の親）も拒否し、何も作らない。
+newout
+mkdir "$out"
+chmod 777 "$out"
+run "$target" --init "$good" --output-dir "$out/sub/dir"
+check "3b writable ancestor exit code" 2 "$rc"
+check "3b writable ancestor error code" unsafe-output "$(errcode)"
+check "3b writable ancestor nothing created" "" "$(ls -A "$out")"
+chmod 700 "$out"
+# sticky 付きの祖先（/tmp 相当）は許す。出力先は 0700 で作られる。
+newout
+mkdir "$out"
+chmod 1777 "$out"
+run "$target" --init "$good" --output-dir "$out/sub"
+check "3b sticky ancestor exit code" 0 "$rc"
+chmod 700 "$out"
 
 # --- 4: 他者のロック ---
 newout

@@ -61,7 +61,7 @@
 //! 走査・種別と存在の確認・宛先ディレクトリの作成・利用者権限での到達性・rootfs 自身とその祖先の実体照合（`dev`/`ino`）は、
 //! 適用の段 `crate::exec::mount_binds`（#1913。実装済み。Linux 限定のため intra-doc リンクは張らない）が担う。
 //! 実体照合の残余（REPAIR-3）は bundle・状態ルートと、ホスト側の別の bind mount による別名で、字句検証（`check_against_host_paths`）
-//! だけが効く。`run_pre_pivot` への組み込みは #1914、`ro` と Landlock の `WriteRestrictionShadowed` の衝突解消は #1917、
+//! だけが効く。`run_pre_pivot` への組み込みは済み（#1914）、`ro` と Landlock の `WriteRestrictionShadowed` の衝突解消は #1917、
 //! `start` の結線は #1915。監査 sink の本番配線も #1915 で未実装。`MountDestination::resolve_in` の文字列結合で直接 mount してはならない。
 
 use std::fmt;

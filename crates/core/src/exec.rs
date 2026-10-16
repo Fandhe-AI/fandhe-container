@@ -28,7 +28,7 @@
 //!    （ファイルは検証済みの `/dev/null`、ディレクトリは読み取り専用の空 tmpfs を載せる。適用は `exec::masked_paths`。
 //!    **実装済み**だが、検証済みの `/dev/null` が要るため `setup` 指定時のみ。`setup` なしの最小構成は適用しない）
 //!    検証済みの bind mount（`config.json` の `mounts[]` の bind。CORE-1・SEC-1）は [`mount_binds`]（`exec/bind_mounts.rs`。
-//!    TASK-29 追補・#1913。**段の実装は済み**だが、`run_pre_pivot` への組み込みと `/dev`・tmpfs・注入との順序の固定は #1914、
+//!    TASK-29 追補・#1913。**段の実装は済み**。`run_pre_pivot` へ組み込み済みで、`inject_files` の後・`readonly_paths` の前に固定した〔#1914〕。
 //!    `start` への結線は #1915）が、マウント元の固定・属性・付け替え・事後検証を fd 起点で行う
 //! 4. 順序固定のステージ列: cgroup 参加 → capability 削減 → `PR_SET_NO_NEW_PRIVS`
 //!    → Landlock → seccomp（#136・#832・#833。**枠・`NO_NEW_PRIVS`・capability 削減・seccomp は実装済み**: [`StagePipeline`] が

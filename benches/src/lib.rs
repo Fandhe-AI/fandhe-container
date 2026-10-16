@@ -5,6 +5,7 @@
 //! `plugin_boundary` モジュールは代表操作 A の計測ロジック（TASK-113.1・PLUG-5）。
 //! `plugin_boundary_list_images` モジュールは代表操作 B（イメージ一覧）の計測ロジック（TASK-113.2・PLUG-5）。
 //! `delta_p50` モジュールは Δp50 と CORE-10 比の算出（TASK-113.3・PLUG-5・CORE-10）。
+//! `small_files` モジュールは小ファイル多数の files/s 計測ロジック（TASK-189・IO-6・IO-7・REPAIR-8。ゲート未接続）。
 //! `macos_cold_start` モジュールは macOS の cold start 上乗せ回帰確認（TASK-113.4・PLUG-6・MAC-2）。
 //!
 //! `benches/regression_placeholder.rs` に TASK-86.3（REPAIR-7 第 4 段階）で導入した
@@ -18,3 +19,4 @@ pub mod delta_p50;
 pub mod macos_cold_start;
 pub mod plugin_boundary;
 pub mod plugin_boundary_list_images;
+pub mod small_files;

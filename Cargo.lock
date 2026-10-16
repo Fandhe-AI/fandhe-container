@@ -280,6 +280,7 @@ dependencies = [
 name = "fandhe-container-benches"
 version = "0.0.0"
 dependencies = [
+ "fandhe-container-io",
  "fandhe-container-plugin",
 ]
 

@@ -25,7 +25,8 @@
 //! （`join` が返った直後は `/proc/self/task` にまだ残り得るため、`SelfBounded` の launcher の前に短く待つ）。
 //! 状態の読み取り・bundle の検証・所有ロック・起動権の予約（`claim_start`。`StateStore` と bundle のファイル I/O）は
 //! 作業スレッドの末尾で行うため、入口は期限で待ち切れる（FUSE 上の bundle が止まっても報告できる。REPAIR-5）。入口
-//! スレッドが行うのは launcher の呼び出しと Running の記録（`launch_claimed`）だけである。
+//! スレッドが行うのは launcher の呼び出しと Running の記録（`launch_claimed`）だけで、launch の後の状態 I/O は
+//! 期限つきの別スレッドで実行して打ち切る（`deadline_store`。止まっても期限内に報告し、残る予約は報告の後に回復する）。
 //! 手順 8 の上限は launcher 自身が守る。入口は launch の前に [`crate::start_contract::launch_step_budget`] が期限内に
 //! 残っているかを確かめ、足りなければ launch しない。手順 8 より前に常駐スレッドを作らないよう、成功経路の
 //! 手順 3〜7 では `log_event`（`stderr_sink` の常駐スレッドを作る）を呼ばない。
@@ -74,6 +75,7 @@ use fandhe_container_core::traits::{
     StateRecord, StateRevision, StateStore, SupervisionState, TraitError, UpdateStateRequest,
 };
 
+use crate::deadline_store::DeadlineStore;
 use crate::log_pipeline::CaptureHub;
 use crate::logs::LogSink;
 use crate::restart::{
@@ -511,7 +513,7 @@ fn launch_after_prepare(
     if prepared.launcher.launch_mode() == LaunchMode::SelfBounded {
         wait_task_gone(worker_tid, START_WORKER_EXIT_WAIT);
     }
-    launch_prepared(prepared, store, recorder, timeouts)
+    launch_prepared(prepared, store, recorder, timeouts, deadline)
 }
 
 /// 起動の計測を [`START_OP`] に記録する（準備の開始から手順 8 の終わりまで）。
@@ -1025,6 +1027,7 @@ fn launch_prepared(
     store_arc: &Arc<dyn StateStore>,
     recorder: &OpRecorder,
     timeouts: &StartTimeouts,
+    deadline: Option<Instant>,
 ) -> Attempt {
     let Prepared {
         inner,
@@ -1033,9 +1036,12 @@ fn launch_prepared(
         logs,
         claimed,
     } = prepared;
-    let store: &dyn StateStore = store_arc.as_ref();
+    // launch の後の状態 I/O（Running の記録・失敗時の予約の解放）は期限（報告の書き込み分を除く）で打ち切る。
+    // 打ち切られて残る予約は報告の後の後始末が回復する（REPAIR-5・CORE-2）。
+    let until = deadline.map(|d| d.checked_sub(REPORT_RESERVE).unwrap_or(d));
+    let bounded = DeadlineStore::new(Arc::clone(store_arc), until);
     // 8（予約は作業スレッドで済ませてある。ここは launcher の呼び出しと Running の記録だけ）
-    match launch_claimed(store, recorder, &launcher, *claimed, timeouts) {
+    match launch_claimed(&bounded, recorder, &launcher, *claimed, timeouts) {
         Ok(started) => {
             let (record, process) = started.into_parts();
             let instance = record.cgroup().map(|c| c.instance());

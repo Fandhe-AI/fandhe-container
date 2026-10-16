@@ -56,6 +56,7 @@ compile_error!(
 );
 
 pub mod container_options;
+mod deadline_store;
 #[cfg(target_os = "linux")]
 pub mod exec;
 pub mod health;

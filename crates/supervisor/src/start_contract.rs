@@ -60,7 +60,7 @@ pub const MAX_ARGS: usize = 8;
 /// argv の 1 要素の最大バイト数。
 pub const MAX_ARG_LEN: usize = 4096;
 /// cgroup の準備（mkdir・退避・制限の設定）に見込む時間。
-pub const CGROUP_PREPARE_ALLOWANCE: Duration = Duration::from_secs(5);
+pub const CGROUP_PREPARE_ALLOWANCE: Duration = Duration::from_secs(6);
 /// CLI が [`result_deadline`] に足す受信の猶予。
 pub const CLI_RECEIVE_GRACE: Duration = Duration::from_secs(2);
 
@@ -317,12 +317,12 @@ pub fn launch_step_budget(timeouts: &StartTimeouts) -> Duration {
 }
 
 /// supervisor が結果を書くまでの内部上限: [`launch_step_budget`] + [`CGROUP_PREPARE_ALLOWANCE`]
-/// （既定値で 33s。あふれたら `Duration::MAX` に張り付く）。
+/// （既定値で 34s。あふれたら `Duration::MAX` に張り付く）。
 ///
 /// supervisor（`start_entry::run_start`）は手順 3〜7（状態の確認・cgroup の連鎖・監査 sink・launcher の構築）を
 /// 作業スレッドで行い、開始時刻にこの値を足した期限から報告の書き込み分（`start_entry::REPORT_RESERVE`）を引いた
 /// 時点まで結果を待つ。作業スレッドが終わったら入口スレッドが手順 8 を直接行う（上の [`launch_step_budget`]）。
-/// 準備に使える実質の時間は [`CGROUP_PREPARE_ALLOWANCE`] から報告の書き込み分（1s）を引いた値で、
+/// 準備に使える実質の時間は [`CGROUP_PREPARE_ALLOWANCE`] から報告の書き込み分（1s）と launch 前の作業スレッド消滅の待ち（最大 1s）を引いた 4s で、
 /// 手順 3〜7 が長引いて手順 8 の見込みが残らなければ launch せず `INTERNAL`（期限超過）を報告するため、報告は
 /// この上限内に届く。失敗後の後始末は報告の後に行う（REPAIR-5）。
 pub fn result_deadline(timeouts: &StartTimeouts) -> Duration {
@@ -532,7 +532,7 @@ mod tests {
         }
     }
 
-    /// REPAIR-5・#1819: 手順 8 の見込みは既定で 28s で、内部上限はそれに cgroup の準備の見込み（5s）を足した値。
+    /// REPAIR-5・#1819: 手順 8 の見込みは既定で 28s で、内部上限はそれに cgroup の準備の見込み（6s）を足した値。
     #[test]
     fn repair5_launch_step_budget_default_is_28s() {
         let t = StartTimeouts::default();
@@ -543,12 +543,12 @@ mod tests {
         );
     }
 
-    /// REPAIR-5: 既定の内部上限は 33s で、CLI の受信期限はそれより厳密に長い。
+    /// REPAIR-5: 既定の内部上限は 34s で、CLI の受信期限はそれより厳密に長い。
     #[test]
-    fn repair5_result_deadline_default_is_33s() {
+    fn repair5_result_deadline_default_is_34s() {
         let t = StartTimeouts::default();
-        assert_eq!(result_deadline(&t), Duration::from_secs(33));
-        assert_eq!(cli_receive_deadline(&t), Duration::from_secs(35));
+        assert_eq!(result_deadline(&t), Duration::from_secs(34));
+        assert_eq!(cli_receive_deadline(&t), Duration::from_secs(36));
         assert!(cli_receive_deadline(&t) > result_deadline(&t));
     }
 }

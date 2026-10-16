@@ -62,6 +62,8 @@ make supervisor-independence BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> COUN
 1. 非 root のシェルで、supervisor を N 個起動したまま保つ。コンテナごとに create し、結果チャネルは FIFO にする
 
    ```bash
+   # /proc/<pid>/stat は comm が空白を含みうるため、最後の ")" より後ろだけを読む（ppid が $2・起動時刻が $20）
+   pstat() { sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null; }
    root=$(mktemp -d)
    declare -A FD
    for i in $(seq 1 50); do
@@ -72,7 +74,7 @@ make supervisor-independence BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> COUN
      systemd-run --user --scope --quiet -p Delegate=yes -- \
        "$BIN_DIR/fandhe-container-supervisor" start --root "$root/state" "sup-$i" >"$root/f$i" &
      sp=$!
-     echo "$sp $(awk '{print $22, $4}' "/proc/$sp/stat" 2>/dev/null)" >"$root/sup$i.pid"   # pid・起動時刻・親 pid
+     echo "$sp $(pstat "$sp" | awk '{print $20, $2}')" >"$root/sup$i.pid"   # pid・起動時刻・親 pid
    done
    ```
 
@@ -82,7 +84,7 @@ make supervisor-independence BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> COUN
    is_desc() { # <pid> <祖先の pid>: PPid 連鎖を 64 段まで辿り、祖先に到達すれば 0
      local p="$1" d=0
      while [ "$d" -lt 64 ] && [ -n "$p" ] && [ "$p" -gt 1 ]; do
-       p=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null) || return 1
+       p=$(pstat "$p" | awk '{print $2}') || return 1
        [ "$p" = "$2" ] && return 0
        d=$((d + 1))
      done
@@ -96,7 +98,7 @@ make supervisor-independence BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> COUN
        "FCSUP1 OK "*)
          ip="${line#FCSUP1 OK }"
          read -r sp _ <"$root/sup$i.pid"
-         is="$(awk '{print $22}' "/proc/$ip/stat" 2>/dev/null || true)"
+         is="$(pstat "$ip" | awk '{print $20}' || true)"
          if [[ "$ip" =~ ^[1-9][0-9]{0,9}$ ]] && [ -n "$is" ] && is_desc "$ip" "$sp"; then
            echo "$ip $is" >"$root/ctr$i.pid"; ok=$((ok + 1))
          else
@@ -123,9 +125,9 @@ make supervisor-independence BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> COUN
    }
    for i in $(seq 1 50); do
      read -r sp st pp <"$root/sup$i.pid" 2>/dev/null || { untracked=1; continue; }
-     if [ "$(awk '{print $22, $4}' "/proc/$sp/stat" 2>/dev/null)" = "$st $pp" ]; then
+     if [ "$(pstat "$sp" | awk '{print $20, $2}')" = "$st $pp" ]; then
        for c in $(desc_of "$sp"); do
-         s2=$(awk '{print $22}' "/proc/$c/stat" 2>/dev/null) || continue
+         s2=$(pstat "$c" | awk '{print $20}') || continue
          [ -n "$s2" ] && echo "$c $s2" >>"$root/tracked"
        done
      fi
@@ -140,17 +142,17 @@ make supervisor-independence BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> COUN
    #    保存した pid が同じ起動時刻のまま生きていれば SIGKILL
    for f in "$root"/sup*.pid; do
      read -r sp st pp <"$f"
-     [ -n "$st" ] && [ "$(awk '{print $22, $4}' "/proc/$sp/stat" 2>/dev/null)" = "$st $pp" ] && [ "$pp" = "$$" ] && kill "$sp"
+     [ -n "$st" ] && [ "$(pstat "$sp" | awk '{print $20, $2}')" = "$st $pp" ] && [ "$pp" = "$$" ] && kill "$sp"
    done
    sleep 1
    while read -r c st; do
-     [ "$(awk '{print $22}' "/proc/$c/stat" 2>/dev/null)" = "$st" ] && kill -KILL "$c"
+     [ "$(pstat "$c" | awk '{print $20}')" = "$st" ] && kill -KILL "$c"
    done <"$root/tracked"
    sleep 1
    # 3. 残存確認（1 つでも残っている、または追跡不能の個体があれば削除せず手で回収する）
    left=0
    while read -r c st; do
-     [ "$(awk '{print $22}' "/proc/$c/stat" 2>/dev/null)" = "$st" ] && { echo "still alive: $c" >&2; left=1; }
+     [ "$(pstat "$c" | awk '{print $20}')" = "$st" ] && { echo "still alive: $c" >&2; left=1; }
    done <"$root/tracked"
    [ "$untracked" -eq 0 ] || left=1
    # 4. 残存も追跡不能も無いときだけ fd を閉じて状態を削除する

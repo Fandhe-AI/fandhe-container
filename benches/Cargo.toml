@@ -34,6 +34,8 @@ harness = false
 
 [dependencies]
 fandhe-container-plugin = { path = "../crates/plugin" }
+# `fandhe-container-io` も workspace 内の path 依存（外部クレートの追加ではない。TASK-189）。
+fandhe-container-io = { path = "../crates/io" }
 
 # [[bench]] plugin_boundary_list_images は TASK-113.2（#271・PLUG-5）の代表操作 B（イメージ一覧）計測ハーネス。
 # 代表操作 A（plugin_boundary。TASK-113.1）とは別ターゲットで、Δp50（TASK-113.3）も出力する。ゲート（bench-check）へは未接続（同上）。
@@ -46,6 +48,12 @@ harness = false
 # macOS のみ計測。回帰ゲート（baseline.json）へは未接続（TASK-88.h1・TASK-113.h1）。
 [[bench]]
 name = "plugin_boundary_macos_cold_start"
+harness = false
+
+# [[bench]] small_files は TASK-189（IO-6・IO-7・REPAIR-8）の小ファイル多数 files/s 計測ハーネス。
+# サーバー側 API の直接呼び出し（ワイヤー経路ではない）。ゲート（bench-check・metrics.json）への登録は #1899。
+[[bench]]
+name = "small_files"
 harness = false
 
 [[bin]]

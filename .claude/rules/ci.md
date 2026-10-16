@@ -83,7 +83,7 @@ macOS cold start 上乗せ確認（TASK-113.4・PLUG-6・MAC-2）は `benches/te
 
 - 現時点で基準値比較の対象は `benches/benches/regression_placeholder.rs`（決定的な固定値の stub）と `benches/baseline.json`（`placeholder: true` の暫定値）だけで、動作確認の段階にある。計測対象がプレースホルダのため、現時点では実装の性能悪化を検出せず、性能回帰ゲートとして機能しない
 - plugin 境界ベンチ（TASK-113〔#269〕・closed。`benches/benches/plugin_boundary*.rs`）は実装済みだが、baseline 未登録のため `bench-check` の比較対象外
-- files/s・起動 p95 のベンチを実装するタスクは未定（`docs/design/bench-calibration.md`「既知の欠落」）
+- files/s のベンチは TASK-189（`benches/benches/small_files.rs`）で実装済みだが、`metrics.json`・`BENCH_NAMES`・baseline 未登録（登録は #1899）のため `bench-check` の比較対象外。起動 p95 のベンチを実装するタスクは未定（`docs/design/bench-calibration.md`「既知の欠落」）
 - 校正記録は TASK-88.2（#229）で `docs/design/bench-calibration.md` に整備済み。実測は前提ベンチが無いため保留している
 - 実測基準値の確定は TASK-88.h1（#230）・TASK-113.h1（#274）（どちらも open）
 

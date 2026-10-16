@@ -1054,7 +1054,8 @@ mod real_process_tests {
             std::process::id(),
             Tmp::new("n").0.display()
         );
-        let mut child = sh("sleep 30", &[&nonce]);
+        // 最後のコマンドが exec されて nonce（$0）が cmdline から消えないよう、`; :` で sleep を末尾にしない。
+        let mut child = sh("sleep 30; :", &[&nonce]);
         assert!(wait_until(Duration::from_secs(5), || probe_count(&nonce) == Some(1)));
         let _ = child.kill();
         let _ = child.wait();

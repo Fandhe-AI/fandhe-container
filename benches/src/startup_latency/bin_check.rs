@@ -56,6 +56,15 @@ pub fn verify_executable(path: &Path, euid: u32) -> Result<(), StartupLatencyErr
 /// group 書き込み可は（自分の group でも）拒否する。umask 002 で `target/` が 0775 になる環境では
 /// `chmod g-w` した場所へバイナリを置く。sticky ビット付きは `/tmp` のように他者が差し替えられないため許容する。
 fn verify_ancestor(dir: &Path, euid: u32) -> Result<(), StartupLatencyError> {
+    // symlink 自体の所有者を先に検証する。`metadata` は symlink を辿るため、別 UID 所有の symlink が
+    // 信頼済みディレクトリを指す配置（sticky 共有ディレクトリ内で所有者が差し替えられる）を見逃す。
+    let link_meta = std::fs::symlink_metadata(dir)
+        .map_err(|_| untrusted("ancestor directory is not accessible"))?;
+    if link_meta.file_type().is_symlink() && link_meta.uid() != euid && link_meta.uid() != 0 {
+        return Err(untrusted(
+            "ancestor symlink owner is neither the caller nor root",
+        ));
+    }
     let meta =
         std::fs::metadata(dir).map_err(|_| untrusted("ancestor directory is not accessible"))?;
     if !meta.is_dir() {
@@ -223,6 +232,21 @@ mod tests {
                 .code,
             "untrusted-binary"
         );
+    }
+
+    /// 別 UID 所有の祖先 symlink は、指す先が信頼済み（root 所有）でも拒否する（euid を偽って照合する）。
+    #[test]
+    fn foreign_owned_ancestor_symlink_is_rejected() {
+        let d = Dir::new("fl");
+        let link = d.0.join("link");
+        std::os::unix::fs::symlink("/", &link).expect("symlink");
+        let owner = std::fs::symlink_metadata(&link).expect("meta").uid();
+        if owner != 0 {
+            let err = verify_ancestor(&link, owner.wrapping_add(1)).expect_err("reject");
+            assert_eq!(err.code, "untrusted-binary");
+            assert!(err.message.contains("symlink"), "{}", err.message);
+            assert_eq!(verify_ancestor(&link, owner), Ok(()));
+        }
     }
 
     #[test]

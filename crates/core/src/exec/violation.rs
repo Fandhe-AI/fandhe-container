@@ -48,7 +48,7 @@
 //!
 //! # `target_moved`（種別 `mount_target`）の扱い（#1595）
 //!
-//! `target_moved` の発生源は `mount_proc_at_dir`・`exec/inject.rs`・`exec/tmpfs.rs` の 3 箇所で、いずれも
+//! `target_moved` の発生源は `mount_proc_at_dir`・`exec/inject.rs`・`exec/tmpfs.rs`・`exec/bind_mounts.rs`（#1913）の 4 箇所で、いずれも
 //! launch 経路の `pivot_root` の前にある。稼働中コンテナへの exec の子（`prepare_exec_child` /
 //! `exec_checked_entrypoint`・インタプリタ検証・封印コピー）では生じず、supervisor の worker の結果行にも
 //! 載らない。そのため exec 側の記録（`Entrypoint` / `ExecTarget`）の対象外で、launch 側では
@@ -162,6 +162,17 @@ pub enum ViolationReason {
     TargetOnSharedMount,
     /// fd で固定した後にマウント先が改名・移動・削除された。
     TargetMoved,
+    /// bind mount の元の経路（中間要素または末端）に symlink がある。symlink は辿らず拒否する
+    /// （TASK-29 追補・#1913。SEC-1・CORE-1）。
+    BindSourceSymlink,
+    /// bind mount の元がディレクトリでも通常ファイルでもない（FIFO・ソケット・デバイス等。#1913。SEC-1）。
+    BindSourceUnsupportedType,
+    /// bind mount の元を起動を依頼した利用者の権限で読めない（#1913。SEC-1）。
+    BindSourceNotAccessible,
+    /// bind mount の元が rootfs 自身またはその祖先である（#1913。SEC-1）。
+    BindSourceContainsRootfs,
+    /// bind mount 先の既存の種別が元と合わない（ディレクトリと通常ファイルの取り違え等。#1913。SEC-1）。
+    BindTargetKindMismatch,
     /// rootless の基本デバイスノードの bind 元（ホストの `/dev/<名前>`）が、期待する文字デバイスではない
     /// （symlink・通常ファイル・ディレクトリ、または `rdev` が固定表と違う）。bind せずに拒否する
     /// （TASK-29 追補・#1660。CORE-6・SEC-5）。
@@ -368,7 +379,7 @@ impl ViolationReason {
     ///
     /// 手書きの理由リストを別に持たず、種別（[`Self::kind`]）で絞って使う（[`Self::from_launch_token`]）。
     /// 足し忘れは単体テスト（`ALL` の件数が `as_str` の分岐数と一致すること）が検出する。
-    pub(super) const ALL: [ViolationReason; 52] = [
+    pub(super) const ALL: [ViolationReason; 57] = [
         Self::NoNamespaces,
         Self::HostnameWithoutUts,
         Self::PidWithoutMount,
@@ -397,6 +408,11 @@ impl ViolationReason {
         Self::PathMissing,
         Self::TargetOnSharedMount,
         Self::TargetMoved,
+        Self::BindSourceSymlink,
+        Self::BindSourceUnsupportedType,
+        Self::BindSourceNotAccessible,
+        Self::BindSourceContainsRootfs,
+        Self::BindTargetKindMismatch,
         Self::HostDeviceNodeUnexpected,
         Self::RootfsIsHostRoot,
         Self::RootfsOnSharedMount,
@@ -503,6 +519,11 @@ impl ViolationReason {
             Self::PathMissing => "path_missing",
             Self::TargetOnSharedMount => "target_on_shared_mount",
             Self::TargetMoved => "target_moved",
+            Self::BindSourceSymlink => "bind_source_symlink",
+            Self::BindSourceUnsupportedType => "bind_source_unsupported_type",
+            Self::BindSourceNotAccessible => "bind_source_not_accessible",
+            Self::BindSourceContainsRootfs => "bind_source_contains_rootfs",
+            Self::BindTargetKindMismatch => "bind_target_kind_mismatch",
             Self::HostDeviceNodeUnexpected => "host_device_node_unexpected",
             Self::RootfsIsHostRoot => "rootfs_is_host_root",
             Self::RootfsOnSharedMount => "rootfs_on_shared_mount",
@@ -562,6 +583,11 @@ impl ViolationReason {
             | Self::PathSymlinkOrNotDirectory
             | Self::PathMissing
             | Self::TargetMoved
+            | Self::BindSourceSymlink
+            | Self::BindSourceUnsupportedType
+            | Self::BindSourceNotAccessible
+            | Self::BindSourceContainsRootfs
+            | Self::BindTargetKindMismatch
             | Self::HostDeviceNodeUnexpected => ViolationKind::MountTarget,
             Self::TargetOnSharedMount | Self::RootfsOnSharedMount => {
                 ViolationKind::SharedPropagation
@@ -609,7 +635,12 @@ impl ViolationReason {
             | Self::ExecRootNotContainerRootfs
             | Self::ExecJoinedNamespaceMismatch
             | Self::ExecJoinedPidNamespaceMismatch
-            | Self::ExecJoinedCgroupMismatch => "SEC-1",
+            | Self::ExecJoinedCgroupMismatch
+            | Self::BindSourceSymlink
+            | Self::BindSourceUnsupportedType
+            | Self::BindSourceNotAccessible
+            | Self::BindSourceContainsRootfs
+            | Self::BindTargetKindMismatch => "SEC-1",
             Self::ExecTargetNotNestedPid1
             | Self::ExecTargetSharesPidNamespace
             | Self::ExecTargetSharesMountNamespace
@@ -637,7 +668,12 @@ impl ViolationReason {
             | Self::TargetIsRootfs
             | Self::PathSymlinkOrNotDirectory
             | Self::PathMissing
+            | Self::BindSourceSymlink
+            | Self::BindSourceUnsupportedType
+            | Self::BindSourceContainsRootfs
+            | Self::BindTargetKindMismatch
             | Self::RootfsIsHostRoot => ErrorCode::InvalidArgument,
+            Self::BindSourceNotAccessible => ErrorCode::PermissionDenied,
             Self::HostRootIdentityMapping
             | Self::RootfulRequiresRoot
             | Self::IdentityChanged
@@ -755,6 +791,19 @@ impl ViolationReason {
                 "mount target is on a shared mount; isolate the mount namespace first"
             }
             Self::TargetMoved => "mount target was moved or removed after validation",
+            Self::BindSourceSymlink => "bind mount source path components must not be symlinks",
+            Self::BindSourceUnsupportedType => {
+                "bind mount source must be a directory or a regular file"
+            }
+            Self::BindSourceNotAccessible => {
+                "bind mount source is not readable with the privileges of the requesting user"
+            }
+            Self::BindSourceContainsRootfs => {
+                "bind mount source must not be the rootfs or one of its ancestors"
+            }
+            Self::BindTargetKindMismatch => {
+                "bind mount target kind does not match the source (directory vs regular file)"
+            }
             Self::HostDeviceNodeUnexpected => {
                 "host device node is not the expected character device; refusing to bind it"
             }

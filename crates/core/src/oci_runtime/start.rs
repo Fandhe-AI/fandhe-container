@@ -128,7 +128,7 @@ use super::launch::{
 };
 use super::mountinfo_identity::{
     FsIdentity, MountinfoReadError, fs_identity, mounts_under, parse_mountinfo, path_mount_id,
-    read_mountinfo_bounded, source_reaches,
+    read_mountinfo_bounded, source_contains, source_reaches,
 };
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
@@ -823,7 +823,26 @@ fn validate_bind_mounts(
     };
     // 状態ルート配下の子マウント（別名の bind mount を含む）も保護対象に加える（SEC-1・#1915）。
     let children = mounts_under(&mounts, &state_real);
-    let roots = build_protected_roots(&state_id, &state_real, &children);
+    let mut roots = build_protected_roots(&state_id, &state_real, &children);
+    // rootfs・bundle の実体も保護する。rbind が公開する子マウントが別名で rootfs・bundle を含む場合を拒否する（SEC-1）。
+    let mut contained = Vec::with_capacity(2);
+    for dir in [rootfs, bundle] {
+        let identity = std::fs::canonicalize(dir)
+            .ok()
+            .and_then(|p| lexical_abs(&p))
+            .and_then(|real| path_mount_id(&real).and_then(|mnt| fs_identity(&mounts, mnt, &real)));
+        let Some(identity) = identity else {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "the bundle or rootfs is not found in mountinfo",
+            ));
+        };
+        roots.push(ProtectedFsRoot::contained(
+            identity.dev.clone(),
+            identity.path.clone(),
+        ));
+        contained.push(identity);
+    }
     set.check_sources_with(|spec| {
         let Some(real) = std::fs::canonicalize(spec.source())
             .ok()
@@ -839,6 +858,9 @@ fn validate_bind_mounts(
         // 状態ルート自身と配下の子マウントのいずれかに到達する元は拒否する（適用の段と同じ照合を fork 前に行う）。
         // 元のマウントを特定できないときは fail-closed（到達するものとして拒否）。
         source_reaches_protected(&mounts, mnt, &real, spec.recursive(), &state_id, &children)
+            || contained.iter().any(|target| {
+                source_contains(&mounts, mnt, &real, spec.recursive(), target).unwrap_or(true)
+            })
     })
     .map_err(reject)?;
     // 検査済みの実体を集合に持たせる。適用の段（restart を含む毎回）が、固定した元に対して再照合する。
@@ -2697,6 +2719,44 @@ mod tests {
         assert!(roots[1].has_hard_linked_files());
         assert!(roots[2].has_hard_linked_files());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// SEC-1（#1915）: rbind が公開する子マウントが別名で bundle を含むとき、元の位置を問わず拒否する。
+    /// bundle の配下だけを指す子マウントや無関係な FS の元は拒否しない。
+    #[test]
+    fn sec1_rbind_child_mount_containing_bundle_is_rejected() {
+        use super::super::mountinfo_identity::parse_mountinfo;
+        let info = "10 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+                    20 10 8:1 /srv/bundle /bundle rw - ext4 /dev/sda1 rw\n\
+                    30 10 8:1 / /opt/export rw - ext4 /dev/sda1 rw\n\
+                    40 30 8:1 /srv/bundle /opt/export/inner rw - ext4 /dev/sda1 rw\n\
+                    50 10 8:1 /srv/bundle/data /opt/data rw - ext4 /dev/sda1 rw\n\
+                    60 10 8:5 / /opt/other rw - ext4 /dev/sda5 rw\n\
+                    70 60 8:1 /srv/bundle /opt/other/inner rw - ext4 /dev/sda1 rw\n";
+        let mounts = parse_mountinfo(info).expect("parse");
+        let bundle = fs_identity(&mounts, 20, "/bundle").expect("bundle");
+        // /opt/export 自体は FS の `/` なので祖先として含む（字句検査でも拒否される形）。
+        assert_eq!(
+            source_contains(&mounts, 30, "/opt/export", true, &bundle),
+            Some(true)
+        );
+        // 子マウント経由の別名: root が `/srv/bundle` の子を持つ別 FS の元を rbind。
+        assert_eq!(
+            source_contains(&mounts, 60, "/opt/other", true, &bundle),
+            Some(true)
+        );
+        // 非再帰（bind）なら子マウントは公開されず、元自身（8:5）は含まない。
+        assert_eq!(
+            source_contains(&mounts, 60, "/opt/other", false, &bundle),
+            Some(false)
+        );
+        // bundle の配下だけを指す元は含まない。
+        assert_eq!(
+            source_contains(&mounts, 50, "/opt/data", true, &bundle),
+            Some(false)
+        );
+        // 位置を特定できない元は None（呼び出し側が fail-closed）。
+        assert_eq!(source_contains(&mounts, 99, "/x", true, &bundle), None);
     }
 
     /// SEC-1（#1915）: 状態ルート配下の子マウントの別名を元にした bind は、start の検査（fork 前）で拒否される。

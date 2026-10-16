@@ -112,7 +112,8 @@ use std::path::{Path, PathBuf};
 
 use crate::oci_runtime::ProtectedFsRoot;
 use crate::oci_runtime::mountinfo_identity::{
-    FsIdentity, exposed_devs, fs_identity, parse_fdinfo_mnt_id, parse_mountinfo, source_reaches,
+    FsIdentity, exposed_devs, fs_identity, parse_fdinfo_mnt_id, parse_mountinfo, source_contains,
+    source_reaches,
 };
 use crate::oci_runtime::{BindMountSet, BindMountSpec};
 use crate::rootless::parse_id_map;
@@ -485,7 +486,10 @@ fn check_source_not_protected(
     // （fail-closed）。
     if src.kind() == BindSourceKind::RegularFile
         && src.nlink() > 1
-        && ctx.protected.iter().any(|p| p.dev() == identity.dev)
+        && ctx
+            .protected
+            .iter()
+            .any(|p| !p.is_containment_only() && p.dev() == identity.dev)
     {
         return Err(violation(spec, ViolationReason::BindSourceReachesStateRoot));
     }
@@ -513,7 +517,12 @@ fn check_source_not_protected(
             dev: p.dev().to_owned(),
             path: p.path().to_owned(),
         };
-        match source_reaches(&mounts, mnt_id, &real, spec.recursive(), &state) {
+        let reached = if p.is_containment_only() {
+            source_contains(&mounts, mnt_id, &real, spec.recursive(), &state)
+        } else {
+            source_reaches(&mounts, mnt_id, &real, spec.recursive(), &state)
+        };
+        match reached {
             Some(false) => {}
             Some(true) => {
                 return Err(violation(spec, ViolationReason::BindSourceReachesStateRoot));
@@ -1746,6 +1755,49 @@ mod tests {
             reason_of(&err),
             Some(ViolationReason::BindSourceReachesStateRoot)
         );
+    }
+
+    /// SEC-1（#1915）: rootfs・bundle の実体（`ProtectedFsRoot::contained`）は、元がそれと同一・祖先のときだけ拒否する。
+    /// 保護対象の配下の別の実体を元にすること、同じ FS 上のリンク数 2 以上の通常ファイルは拒否しない。
+    #[test]
+    fn sec1_contained_root_rejects_only_same_or_ancestor_sources() {
+        let fx = fx();
+        std::fs::hard_link(fx.src.join("file"), fx.src.join("alias")).expect("link");
+        let real = std::fs::canonicalize(fx.src("dir")).expect("canon");
+        let real = real.to_str().expect("utf8").to_owned();
+        let ok_info = format!(
+            "1 0 0:1 / / rw - tmpfs none rw\n{}",
+            ideal_mountinfo(200, false, false)
+        );
+        let knobs_ok = Knobs {
+            mountinfo: Some(ok_info),
+            ..Knobs::default()
+        };
+        let knobs_reject = Knobs {
+            mountinfo: Some("1 0 0:1 / / rw - tmpfs none rw\n".to_owned()),
+            ..Knobs::default()
+        };
+        // 元が保護対象（bundle）の祖先 → 拒否。
+        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(vec![
+            ProtectedFsRoot::contained("0:1".to_owned(), format!("{real}/bundle")),
+        ]);
+        let (r, _log) = run(&fx, &set, &knobs_reject);
+        assert_eq!(
+            reason_of(&r.expect_err("ancestor of bundle")),
+            Some(ViolationReason::BindSourceReachesStateRoot)
+        );
+        // 保護対象の方が祖先（元はその配下）→ 許す。
+        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(vec![
+            ProtectedFsRoot::contained("0:1".to_owned(), "/".to_owned()),
+        ]);
+        let (r, _log) = run(&fx, &set, &knobs_ok);
+        r.expect("a source under the protected path is applied");
+        // 同じ FS 上のリンク数 2 の通常ファイルは、rootfs・bundle の保護では拒否しない。
+        let set = one("/mnt/f", &fx.src("alias"), &[]).with_protected_roots(vec![
+            ProtectedFsRoot::contained("0:1".to_owned(), "/srv/bundle".to_owned()),
+        ]);
+        let (r, _log) = run(&fx, &set, &knobs_ok);
+        r.expect("hard-linked file is not a state file");
     }
 
     /// SEC-1（#1915）: 状態ルートと無関係な元は、保護対象があっても適用される（照合は mountinfo を 1 回読むだけ）。

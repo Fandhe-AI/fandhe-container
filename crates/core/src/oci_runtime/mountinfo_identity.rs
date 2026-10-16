@@ -196,8 +196,52 @@ pub(crate) fn source_reaches(
     recursive: bool,
     state: &FsIdentity,
 ) -> Option<bool> {
+    reaches_by(
+        mounts,
+        src_mnt_id,
+        src_real,
+        recursive,
+        state,
+        identity_overlaps,
+    )
+}
+
+/// `candidate` が `target` と同じデバイスで、同一または祖先のパスか（`target` を含むか）。
+fn identity_contains(candidate: &FsIdentity, target: &FsIdentity) -> bool {
+    candidate.dev == target.dev && under(&candidate.path, &target.path).is_some()
+}
+
+/// [`source_reaches`] の包含版。元（`recursive` なら公開される子孫マウントを含む）のいずれかが `target` の
+/// 同一・祖先の実体であれば `Some(true)`（`target` の子孫だけを指す元は含まない）。rootfs・bundle のように、
+/// 配下の別の実体を元にすることは許す一方で、それ自体を別名経由で公開させない保護対象に使う（SEC-1）。
+pub(crate) fn source_contains(
+    mounts: &[MountRow],
+    src_mnt_id: u64,
+    src_real: &str,
+    recursive: bool,
+    target: &FsIdentity,
+) -> Option<bool> {
+    reaches_by(
+        mounts,
+        src_mnt_id,
+        src_real,
+        recursive,
+        target,
+        identity_contains,
+    )
+}
+
+/// 元の実体と（`recursive` のとき）公開される子孫マウントの実体のいずれかが `hit(元側, protected)` を満たすか。
+fn reaches_by(
+    mounts: &[MountRow],
+    src_mnt_id: u64,
+    src_real: &str,
+    recursive: bool,
+    state: &FsIdentity,
+    hit: fn(&FsIdentity, &FsIdentity) -> bool,
+) -> Option<bool> {
     let top = fs_identity(mounts, src_mnt_id, src_real)?;
-    if identity_overlaps(&top, state) {
+    if hit(&top, state) {
         return Some(true);
     }
     if !recursive {
@@ -223,7 +267,7 @@ pub(crate) fn source_reaches(
                 dev: child.dev.clone(),
                 path: child.root.clone(),
             };
-            if identity_overlaps(&id, state) {
+            if hit(&id, state) {
                 return Some(true);
             }
             stack.push(child.id);

@@ -284,6 +284,9 @@ pub(crate) struct ProtectedFsRoot {
     /// 走査で降りないホストのパス（別のファイルシステムのマウントポイント）。そのマウントは別の `ProtectedFsRoot` が
     /// 自分のマウントポイントを `scan_root` にして走査する。これにより、他の FS 上のリンクでこの FS を拒否しない（SEC-1・#1915）。
     scan_prune: Vec<String>,
+    /// 真なら状態ルートではなく rootfs・bundle の実体。ハードリンクの検査は行わず、元（と rbind で公開される子孫マウント）が
+    /// この実体と同一・祖先のときだけ拒否する（配下の別の実体を元にすることは許す。SEC-1）。
+    containment_only: bool,
 }
 
 impl ProtectedFsRoot {
@@ -294,7 +297,22 @@ impl ProtectedFsRoot {
             has_hard_linked_files,
             scan_root: None,
             scan_prune: Vec::new(),
+            containment_only: false,
         }
+    }
+
+    /// rootfs・bundle の実体を保護対象にする（同一・祖先の元だけを拒否する）。
+    pub(crate) fn contained(dev: String, path: String) -> Self {
+        Self {
+            containment_only: true,
+            ..Self::new(dev, path, false)
+        }
+    }
+
+    /// 適用の段（Linux 限定の `exec::mount_binds`）だけが読む。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn is_containment_only(&self) -> bool {
+        self.containment_only
     }
 
     /// 適用のたびに `root` 配下のハードリンクを走査し直すようにする（`new` の固定値より優先）。

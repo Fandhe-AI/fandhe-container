@@ -98,6 +98,14 @@ mod linux {
     }
 
     fn scenarios() -> Result<(), String> {
+        // root では所有者検証が省かれ、非特権委譲の証跡にならない。cgroup や状態ルートを作る前に拒否する（REPAIR-12）。
+        let euid = effective_uid()?;
+        if euid == 0 {
+            return Err(
+                "must run as a non-root user: owner checks are skipped for root, so results would not prove unprivileged delegation"
+                    .to_string(),
+            );
+        }
         let delegated = DelegatedCgroup::detect().map_err(|e| format!("detect: {e:?}"))?;
         let detected = delegated.path().to_string();
         let own = own_cgroup()?;
@@ -131,15 +139,16 @@ mod linux {
             let id = ContainerId::new(format!("{tag}{pid}")).map_err(|e| format!("id: {e:?}"))?;
             let root = std::env::temp_dir().join(format!("fandhe-delete-real-{}", id.as_str()));
             let _ = fs::remove_dir_all(&root);
-            fs::create_dir_all(&root).map_err(|e| format!("mkdir root: {e}"))?;
-            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
-                .map_err(|e| format!("chmod root: {e}"))?;
+            // 以降のどこで失敗しても Drop が状態ルートを片付けるよう、作成前に Fixture を組む。
             let fixture = Self {
                 id: id.clone(),
                 root: root.clone(),
                 dirs: Vec::new(),
                 sleeper: None,
             };
+            fs::create_dir_all(&root).map_err(|e| format!("mkdir root: {e}"))?;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("chmod root: {e}"))?;
             let store = open_store(&root)?;
             let req = CreateStateRequest::new(
                 ContainerStatus::stopped(id.clone(), Some(0)),
@@ -191,14 +200,53 @@ mod linux {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            if let Some(mut c) = self.sleeper.take() {
-                let _ = c.kill();
-                let _ = c.wait();
+            if let Some(mut c) = self.sleeper.take()
+                && let Err(e) = kill_and_reap(&mut c)
+            {
+                eprintln!("delete_cgroup_real: cleanup incomplete: {e}");
             }
             for d in self.dirs.iter().rev() {
                 let _ = fs::remove_dir(d);
             }
             let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// 子を kill し、`REAP_TIMEOUT` 内に回収する。回収できなければ待ち続けずエラーにする（REPAIR-5）。
+    fn kill_and_reap(child: &mut Child) -> Result<(), String> {
+        let _ = child.kill();
+        let deadline = Instant::now() + REAP_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) if Instant::now() >= deadline => {
+                    return Err(format!(
+                        "child {} was not reaped within {REAP_TIMEOUT:?}; it may be left behind",
+                        child.id()
+                    ));
+                }
+                Ok(None) => thread::sleep(POLL),
+                Err(e) => return Err(format!("reap child {}: {e}", child.id())),
+            }
+        }
+    }
+
+    /// 実効 UID を `/proc/self/status` から読む（`unsafe` の syscall を使わないため）。
+    fn effective_uid() -> Result<u32, String> {
+        let text = fs::read_to_string("/proc/self/status").map_err(|e| e.to_string())?;
+        text.lines()
+            .find_map(|l| l.strip_prefix("Uid:"))
+            .and_then(|rest| rest.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| "no effective uid in /proc/self/status".to_string())
+    }
+
+    /// 記録スコープ用に作ったディレクトリを Drop で消す。`Fixture` より先に宣言し、後に Drop させる。
+    struct ScopeGuard(PathBuf);
+
+    impl Drop for ScopeGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir(&self.0);
         }
     }
 
@@ -300,8 +348,7 @@ mod linux {
 
         // 後始末を兼ねた再試行: メンバーを止めて空になれば消せる。
         if let Some(mut c) = fx.sleeper.take() {
-            let _ = c.kill();
-            let _ = c.wait();
+            kill_and_reap(&mut c).map_err(|e| format!("B: {e}"))?;
         }
         let deadline = Instant::now() + DRAIN_TIMEOUT;
         while !read_procs(&procs)?.is_empty() {
@@ -327,9 +374,9 @@ mod linux {
         )?;
         let scope_dir = base.join(&scope_name);
         fs::create_dir(&scope_dir).map_err(|e| format!("C: mkdir scope: {e}"))?;
+        // 作成直後に後始末を保証する（`fx` より先に宣言するので後に Drop される）。
+        let _scope_guard = ScopeGuard(scope_dir.clone());
         let (mut fx, cgroup) = Fixture::new("dr", &recorded, &scope_dir)?;
-        // 後で積んだものから消すため、スコープを先に、子 cgroup を後に積む。
-        fx.dirs.push(scope_dir.clone());
         fs::create_dir(&cgroup).map_err(|e| format!("C: mkdir cgroup: {e}"))?;
         fx.dirs.push(cgroup.clone());
 

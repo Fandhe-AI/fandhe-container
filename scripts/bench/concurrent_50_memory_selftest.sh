@@ -158,6 +158,8 @@ record_child() { # この selftest が起動した sleep の pid と起動時刻
 }
 if [ "$mode" = "dieafter" ]; then sleep 300 & record_child $!; sleep 1; exit 0; fi
 if [ "$mode" = "diefast" ]; then sleep 300 & record_child $!; exit 0; fi
+# diefast_notoken: 実 supervisor と同じく、コンテナ側プロセスが FANDHE_BENCH_OWNER を継承せず、親（本スタブ）も即死する。
+if [ "$mode" = "diefast_notoken" ]; then env -u FANDHE_BENCH_OWNER sleep 300 & record_child $!; exit 0; fi
 if [ "$mode" != "nochild" ] && [ "$mode" != "hang" ]; then
   sleep 300 &
   child=$!
@@ -367,8 +369,13 @@ expect_eq "default-count50-metric" "concurrent_50_pss_median_kb" "$(jq -r '.metr
 expect_eq "default-count50-no-residual" 0 "$(alive_stub_count)"
 
 # --- 6. 起動不足: 1 個が即終了 → exit 1・結果は公開されない ---
+# 子孫を 1 つも記録できないまま消滅した supervisor は子プロセス不在の証明にならないため、追跡不能（exit 4）。
+# 残存確認に必要な状態は削除せず保持する（stderr の "state kept at" のパス。確認後に本テストが片付ける）。
 STUB_DIE_I=3 run_fake --count 5 --trials 1 --output "$work/never.json"
-expect_eq "startup-incomplete-exit1" 1 "$rc"
+expect_eq "startup-incomplete-exit4" 4 "$rc"
+expect_has "startup-incomplete-untracked-stderr" "$errf" "cleanup-failed: a launcher exited before any descendant was recorded"
+kept="$(sed -n 's/.*state kept at \(\/[^)]*\)).*/\1/p' "$errf" | head -n 1)"
+if [ -n "$kept" ] && [ -d "$kept" ]; then pass "startup-incomplete-state-kept"; rm -rf -- "$kept"; else fail "startup-incomplete-state-kept"; fi
 expect_eq "startup-incomplete-stdout-empty" 0 "$(wc -c <"$out")"
 expect_eq "startup-incomplete-no-output-file" 0 "$(find "$work" -maxdepth 1 -name 'never.json*' | wc -l)"
 expect_has "startup-incomplete-stderr" "$errf" "startup-incomplete: trial=1 started=4/5"
@@ -444,6 +451,18 @@ expect_eq "dead-launcher-no-orphan-child" 0 "$(orphan_sleep_count)"
 STUB_MODE=diefast run_target --count 2 --trials 1 --settle 1 --timeout 5
 expect_eq "diefast-exit1" 1 "$rc"
 expect_eq "diefast-no-orphan-child" 0 "$(orphan_sleep_count)"
+
+# --- 12d2. 環境変数を継承しないコンテナ側プロセスを残して launcher が即死 → 追跡不能（exit 4）・状態保持 ---
+: >"$STUB_PIDFILE"
+STUB_MODE=diefast_notoken run_target --count 2 --trials 1 --settle 1 --timeout 5
+expect_eq "untracked-notoken-exit4" 4 "$rc"
+expect_has "untracked-notoken-stderr" "$errf" "cleanup-failed: a launcher exited before any descendant was recorded"
+kept="$(sed -n 's/.*state kept at \(\/[^)]*\)).*/\1/p' "$errf" | head -n 1)"
+if [ -n "$kept" ] && [ -d "$kept" ]; then pass "untracked-notoken-state-kept"; rm -rf -- "$kept"; else fail "untracked-notoken-state-kept"; fi
+# 未回収の sleep（記録した pid・起動時刻が一致するものだけ）を片付ける。
+while read -r p st; do
+  [ -n "$p" ] && [ "$(awk '{print $22}' "/proc/$p/stat" 2>/dev/null)" = "$st" ] && kill -KILL "$p" 2>/dev/null
+done <"$STUB_PIDFILE" || true
 
 # --- 12e. READY 行を出さない launcher は、プロセス数が足りていても起動完了と見なさない ---
 STUB_MODE=noready run_target --count 2 --trials 1 --timeout 2

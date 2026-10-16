@@ -93,16 +93,28 @@ make supervisor-independence BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> COUN
 
    `ready: 50/50` で起動完了。ERR や無報告があれば計測せず、下の後始末をして原因を調べる。報告の pid はコンテナ側プロセス（supervisor の子孫）で、`ctr<i>.pid` に保存する。
 
-   後始末は、supervisor の SIGTERM ではコンテナを停止しない（コンテナ側プロセスが孤児として残る）ため、次の順で行う。
+   後始末は、supervisor の SIGTERM ではコンテナを停止しない（コンテナ側プロセスが孤児として残る）ため、次の順で行う。起動報告（`ctr<i>.pid`）の有無は子プロセス不在の証明にならない（ERR 報告や無報告でも、失敗経路に未回収のコンテナ側プロセスが残りうる）。そのため全 supervisor を対象に、生存中の子孫を起動時刻つきで追跡する。
 
    ```bash
-   # 1. コンテナ側プロセスの pid と起動時刻を、supervisor を止める前に保存する（pid 再利用の取り違え防止）
+   # 1. supervisor を止める前に、全 supervisor の生存中の子孫（孫以下を含む）の pid と起動時刻を保存する（pid 再利用の取り違え防止）。
+   #    supervisor が既に消えていて子孫を 1 つも記録できない個体は「追跡不能」とし、状態を削除しない
    : >"$root/tracked"
+   untracked=0
+   desc_of() { # <pid>: 子孫を再帰的に列挙する
+     local c
+     for c in $(pgrep -P "$1" 2>/dev/null); do echo "$c"; desc_of "$c"; done
+   }
    for i in $(seq 1 50); do
-     cp=$(cat "$root/ctr$i.pid" 2>/dev/null) || continue
-     for c in $cp $(pgrep -P "$cp" 2>/dev/null); do
-       echo "$c $(awk '{print $22}' "/proc/$c/stat" 2>/dev/null)" >>"$root/tracked"
-     done
+     read -r sp st pp <"$root/sup$i.pid" 2>/dev/null || { untracked=1; continue; }
+     n=0
+     if [ "$(awk '{print $22, $4}' "/proc/$sp/stat" 2>/dev/null)" = "$st $pp" ]; then
+       for c in $(desc_of "$sp") $(cat "$root/ctr$i.pid" 2>/dev/null); do
+         s2=$(awk '{print $22}' "/proc/$c/stat" 2>/dev/null) || continue
+         [ -n "$s2" ] && { echo "$c $s2" >>"$root/tracked"; n=$((n + 1)); }
+       done
+     fi
+     # supervisor が消滅済み、または子孫を 1 つも記録できない個体は、コンテナ側プロセスの不在を証明できない
+     [ "$n" -gt 0 ] || { echo "sup-$i: no descendant recorded (cannot prove no container process remains)" >&2; untracked=1; }
    done
    # 2. supervisor を終了させる。送信直前に pid・起動時刻・親 pid（このシェルの $$）の一致を確認する（pid 再利用の取り違え防止）。
    #    保存した pid が同じ起動時刻のまま生きていれば SIGKILL
@@ -115,17 +127,22 @@ make supervisor-independence BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> COUN
      [ "$(awk '{print $22}' "/proc/$c/stat" 2>/dev/null)" = "$st" ] && kill -KILL "$c"
    done <"$root/tracked"
    sleep 1
-   # 3. 残存確認（1 つでも残っていれば削除せず手で回収する）
+   # 3. 残存確認（1 つでも残っている、または追跡不能の個体があれば削除せず手で回収する）
    left=0
    while read -r c st; do
      [ "$(awk '{print $22}' "/proc/$c/stat" 2>/dev/null)" = "$st" ] && { echo "still alive: $c" >&2; left=1; }
    done <"$root/tracked"
-   # 4. 残存が無いときだけ fd を閉じて状態を削除する
+   [ "$untracked" -eq 0 ] || left=1
+   # 4. 残存も追跡不能も無いときだけ fd を閉じて状態を削除する
    if [ "$left" -eq 0 ]; then
      for i in $(seq 1 50); do eval "exec ${FD[$i]}>&-"; done
      rm -rf "$root"
+   else
+     echo "cleanup incomplete: state kept at $root. Recover by hand (ps -ef --forest; compare each suspected process start time) before deleting." >&2
    fi
    ```
+
+   追跡不能・残存で状態を保持したときは、`ps -ef --forest` で `fandhe-container` 系の孤児プロセスを探し、起動時刻が本計測の開始以降のものだけを手で止めてから `$root` を削除する。
 
 2. root のシェル（権限付きシェル）で計測する
 

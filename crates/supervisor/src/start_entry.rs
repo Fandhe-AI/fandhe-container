@@ -891,26 +891,42 @@ fn abandoned_cleanup(
     };
     let _ = cleanup_after_report(deps, store, id, timeouts, cleanup);
 }
-/// 予約の解放を作業スレッドで行い、`limit` まで結果を待つ。解放できたと確認できたら `true`。
+/// `f`（状態ストア・cgroup への I/O を含む後始末の全体）を作業スレッドで実行し、`limit` まで結果を待つ。
+/// `f` が `true` を返したと確認できたら `true`。
 ///
-/// 期限内に確認できない場合・スレッドを作れない場合・解放が失敗した場合は `false`（予約と cgroup は残り、
-/// `recover_interrupted_start` での回復に委ねる。CORE-2・REPAIR-5）。期限後もスレッドは解放を続け得る。
-fn release_claim_bounded(
-    claimed: Box<ClaimedStart>,
-    store: &Arc<dyn StateStore>,
-    limit: Duration,
-) -> bool {
+/// 期限内に確認できない場合・スレッドを作れない場合・`f` が `false` の場合は `false`（予約と cgroup は残し、
+/// `recover_interrupted_start` での回復に委ねる）。期限後も作業スレッドは `f` を最後まで実行する（プロセスの
+/// 終了まで）。そのため、遅れて成功する予約の解放の後の cgroup の削除など、`f` の後半も取りこぼさない。
+/// 状態ストア（FUSE・ストレージ上の `FileStateStore` の fsync 等）が止まっても、入口は無期限に止まらない
+/// （REPAIR-5・CORE-2）。
+fn run_bounded<F>(name: &str, limit: Duration, f: F) -> bool
+where
+    F: FnOnce() -> bool + Send + 'static,
+{
     let (tx, rx) = std::sync::mpsc::channel();
-    let store = Arc::clone(store);
     let spawned = std::thread::Builder::new()
-        .name("supervisor-claim-release".into())
+        .name(name.into())
         .spawn(move || {
-            let _ = tx.send(claimed.release(store.as_ref()).is_ok());
+            let _ = tx.send(f());
         });
     spawned.is_ok() && rx.recv_timeout(limit).unwrap_or(false)
 }
 
+/// 失敗後の後始末（遅れた書き込みの完了待ち・修復・確認・terminate・cgroup の削除）を期限つきで行う上限。
+///
+/// 内側の待ち（`wait_settled`・`recover_after_timeout`・`settle_failed_start`・`terminate_retrying`）の各上限の
+/// 合計に余裕を足す。超えたら確かめられない扱いにし、cgroup を残して失敗終了する（REPAIR-5）。
+fn after_failure_limit(timeouts: &StartTimeouts) -> Duration {
+    let step = timeouts
+        .terminate()
+        .saturating_add(timeouts.confirm())
+        .saturating_add(LAUNCHER_REPLY_GRACE.saturating_mul(2));
+    crate::start_contract::result_deadline(timeouts).saturating_add(step.saturating_mul(3))
+}
+
 /// 報告の後の後始末。確かめられたら `true`（確かめられなければ cgroup は消さない。CORE-1・CORE-2）。
+///
+/// 状態ストアに触れる後始末はすべて作業スレッドで行い、待ちを有限にする（[`run_bounded`]。REPAIR-5）。
 fn cleanup_after_report(
     mut deps: Box<dyn StartDeps + Send>,
     store: &Arc<dyn StateStore>,
@@ -918,34 +934,62 @@ fn cleanup_after_report(
     timeouts: &StartTimeouts,
     cleanup: Cleanup,
 ) -> bool {
-    let confirmed = match cleanup {
-        Cleanup::Nothing => return true,
-        Cleanup::ReleaseCgroup => return release_logged(deps.as_mut()),
+    match cleanup {
+        Cleanup::Nothing => true,
+        Cleanup::ReleaseCgroup => release_logged(deps.as_mut()),
         Cleanup::DiscardClaim(claimed) => {
-            // `release` は `StateStore::update` を同期実行するため、予約を持つ別スレッドで行い、待ちを有限にする
-            // （状態ストレージの write/fsync が止まっても無期限に止まらない。REPAIR-5）。
-            if release_claim_bounded(
-                claimed,
-                store,
+            // `release` は `StateStore::update` を同期実行する。解放と、成功した場合の cgroup の削除を同じ作業
+            // スレッドで行い、期限後に遅れて解放が成功しても cgroup が Created の記録つきで残らないようにする。
+            let store = Arc::clone(store);
+            let confirmed = run_bounded(
+                "supervisor-claim-release",
                 crate::start_contract::result_deadline(timeouts),
-            ) {
-                return release_logged(deps.as_mut());
+                move || {
+                    if claimed.release(store.as_ref()).is_ok() {
+                        release_logged(deps.as_mut())
+                    } else {
+                        // 予約が残り得る。cgroup は消さない。
+                        log_event("start_claim_release_failed", Some(ErrorCode::Internal));
+                        false
+                    }
+                },
+            );
+            if !confirmed {
+                log_event("start_claim_release_unconfirmed", Some(ErrorCode::Internal));
             }
-            // 予約が残り得る（期限内に確認できない場合を含む）。cgroup は消さない。
-            log_event("start_claim_release_failed", Some(ErrorCode::Internal));
-            return false;
+            confirmed
         }
         Cleanup::AfterFailure(launcher, pending, late) => {
-            settle_after_late_writes(store.as_ref(), &launcher, id, timeouts, pending, &late)
+            let (store, id, timeouts_owned) = (Arc::clone(store), id.clone(), *timeouts);
+            let confirmed = run_bounded(
+                "supervisor-cleanup",
+                after_failure_limit(timeouts),
+                move || {
+                    if settle_after_late_writes(
+                        store.as_ref(),
+                        &launcher,
+                        &id,
+                        &timeouts_owned,
+                        pending,
+                        &late,
+                    ) {
+                        // cgroup の削除の失敗も後始末の失敗として返す（終了コードを INTERNAL にする。CORE-3）。
+                        release_logged(deps.as_mut())
+                    } else {
+                        // 予約か子が残り得る。cgroup は消さない（子が入っている可能性がある）。
+                        log_event("start_cleanup_unconfirmed", Some(ErrorCode::Internal));
+                        false
+                    }
+                },
+            );
+            if !confirmed {
+                log_event(
+                    "start_cleanup_unbounded_or_failed",
+                    Some(ErrorCode::Internal),
+                );
+            }
+            confirmed
         }
-    };
-    if confirmed {
-        // cgroup の削除の失敗も後始末の失敗として返す（終了コードを INTERNAL にする。CORE-3）。
-        release_logged(deps.as_mut())
-    } else {
-        // 予約か子が残り得る。cgroup は消さない（子が入っている可能性がある）。
-        log_event("start_cleanup_unconfirmed", Some(ErrorCode::Internal));
-        false
     }
 }
 
@@ -1319,6 +1363,8 @@ fn dispose(
 /// [`mark_stopped`] の試行回数と間隔（全体は数百 ms で、後始末の期限に比べ十分短い）。
 const MARK_STOPPED_ATTEMPTS: u32 = 3;
 const MARK_STOPPED_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+/// [`mark_stopped`] 全体の待ちの上限（REPAIR-5）。
+const MARK_STOPPED_LIMIT: Duration = Duration::from_secs(10);
 
 /// 回収を確かめられたハンドルに対応する Running の記録を、`Stopped` に落として監視権を解除する
 /// （inspect が死んだ pid を生存中と表示せず、delete が拒否されないようにする。SUP-1・CORE-2）。
@@ -1338,18 +1384,24 @@ fn mark_stopped(
     if reaped.is_empty() {
         return true;
     }
-    for attempt in 1..=MARK_STOPPED_ATTEMPTS {
-        match try_mark_stopped(store.as_ref(), id, instance, reaped) {
-            Ok(()) => return true,
-            Err(code) => {
-                log_event("mark_stopped_failed", Some(code));
-                if attempt < MARK_STOPPED_ATTEMPTS {
-                    std::thread::sleep(MARK_STOPPED_RETRY_INTERVAL);
+    // 読み書きは `StateStore` の同期呼び出し（FUSE・ストレージの停止で止まり得る）のため、作業スレッドで行い待ちを
+    // 有限にする。期限を過ぎたら記録できなかった扱い（INTERNAL）で終わる。遅れて成功する書き込みは `Stopped` で
+    // 照合つきのため害はない（REPAIR-5）。
+    let (store, id, reaped) = (Arc::clone(store), id.clone(), reaped.to_vec());
+    run_bounded("supervisor-mark-stopped", MARK_STOPPED_LIMIT, move || {
+        for attempt in 1..=MARK_STOPPED_ATTEMPTS {
+            match try_mark_stopped(store.as_ref(), &id, instance, &reaped) {
+                Ok(()) => return true,
+                Err(code) => {
+                    log_event("mark_stopped_failed", Some(code));
+                    if attempt < MARK_STOPPED_ATTEMPTS {
+                        std::thread::sleep(MARK_STOPPED_RETRY_INTERVAL);
+                    }
                 }
             }
         }
-    }
-    false
+        false
+    })
 }
 
 /// [`mark_stopped`] の 1 回の試行。照合に合わなければ書かずに `Ok`（別インスタンス・別の監視者の記録）。
@@ -2050,5 +2102,35 @@ mod tests {
             write_limit(base, Some(now), now + Duration::from_secs(1)),
             Duration::ZERO
         );
+    }
+
+    /// REPAIR-5・CORE-2: 止まった後始末は期限で `false` になり、遅れて終わった処理は放棄後も最後まで走る。
+    #[test]
+    fn repair5_run_bounded_times_out_but_lets_late_work_finish() {
+        let done = Arc::new(AtomicU32::new(0));
+        let flag = Arc::clone(&done);
+        let started = Instant::now();
+        let ok = run_bounded("test-bounded", Duration::from_millis(50), move || {
+            std::thread::sleep(Duration::from_millis(300));
+            flag.store(1, Ordering::SeqCst);
+            true
+        });
+        assert!(!ok);
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(done.load(Ordering::SeqCst), 0);
+        let end = Instant::now() + Duration::from_secs(5);
+        while done.load(Ordering::SeqCst) == 0 && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(done.load(Ordering::SeqCst), 1);
+    }
+
+    /// 期限内に終われば結果をそのまま返す。
+    #[test]
+    fn repair5_run_bounded_returns_the_result_within_the_limit() {
+        assert!(run_bounded("test-bounded", Duration::from_secs(5), || true));
+        assert!(!run_bounded("test-bounded", Duration::from_secs(5), || {
+            false
+        }));
     }
 }

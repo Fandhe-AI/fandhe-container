@@ -12,13 +12,16 @@
 # `--mode docker` / `--mode report` として追加した（下記「モード」）。
 #
 # 現状の制約（REPAIR-3: 実装済みを装わない）:
-#   - crates/cli は雛形で fandhe-container バイナリは未提供（TASK-79 で追加予定）。
-#   - oci_runtime::start の本番 ProcessLauncher は未提供（制限ステージ TASK-37〜39・
-#     TASK-157 待ち）、ファイルベース StateStore は TASK-31 待ちのため、現時点では
-#     own 実装を CLI からエンドツーエンドで起動できない。own の実測は CLI 提供後。
-#   - fandhe-container の CLI が下記契約と異なる形になった場合は、ランタイム呼び出し部
-#     （rt_create / rt_start / rt_delete / rt_kill / rt_state / rt_is_not_found の 6 関数）
-#     だけを差し替える。
+#   - CLI の fandhe-container は提供済みで create / start / stop / delete / list / logs を持つ。
+#     start は supervisor を user scope で起動し `FCSUP1 OK` を受けて復帰する（#1718・#2122）。
+#     本番 ProcessLauncher（#1715）とファイルベース StateStore（TASK-31）も提供済み。
+#   - 本スクリプトの契約が使う `state`・`kill` は CLI にまだ無く（#1903・#1902）、stop も未結線
+#     （#2059）。このため `--runtime <fandhe-container>` での own の実測は、ランタイム呼び出し部
+#     （rt_create / rt_start / rt_delete / rt_kill / rt_state / rt_is_not_found の 6 関数）を
+#     差し替える #1890 の後になる。
+#   - create から `FCSUP1 OK` までの p95 回帰ベンチは別に benches/benches/startup_latency.rs
+#     （TASK-190・docs/design/startup-latency-bench.md）がある。区間は CORE-10 の中央値
+#     （create からプロセス実行開始まで）と異なる。
 #   - Linux 専用（単調時計として /proc/uptime を使う。CORE-10 の比較対象も Linux）。各区間の
 #     値は壁時計（EPOCHREALTIME）で測り、単調時計と照合して時計の変更を検出した回は失敗にする。
 #   - create が成功しなかった場合の未作成判定は、ERR-1 の構造化エラー（code: NOT_FOUND）を
@@ -620,7 +623,7 @@ us_to_secs() {
   printf '%d.%06d' $(($1 / 1000000)) $(($1 % 1000000))
 }
 
-# --- ランタイム呼び出し部（CLI 契約が変わった場合はこの 6 関数のみ差し替える） ---
+# --- ランタイム呼び出し部（CLI 契約が変わった場合はこの 6 関数のみ差し替える。差し替えは #1890） ---
 rt_create() { run_rt "$1" "$1" create --bundle "$bundle" "$2"; }
 rt_start() { run_rt "$1" "$1" start "$2"; }
 rt_delete() { run_rt "$1" "$1" delete "$2"; }
@@ -633,7 +636,8 @@ rt_state() { run_rt "$1" "$2" state "$3"; }
 # 合わせる。空行を除く全行が「code・message が文字列の JSON オブジェクト」で、code がすべて
 # NOT_FOUND（1 行以上）の場合だけ真にする。自由文・不正な JSON・code が文字列でない行・
 # 別の code が 1 行でも混ざれば判定不能として偽にする（runc 等の構造化エラーを持たない
-# ランタイムは常に偽＝不明扱い）。CLI（TASK-79）のエラー形式が確定したらこの関数を合わせる。
+# ランタイムは常に偽＝不明扱い）。ERR-1 の構造化エラーは確定済み（TASK-95.2）。CLI の state の
+# 不存在応答（#1903）への照合は #1890 で行う。
 rt_is_not_found() {
   jq -Rse '
     [split("\n")[] | select(length > 0)] as $lines

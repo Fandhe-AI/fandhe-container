@@ -32,7 +32,7 @@
 #   status・pid・restartCount）に実行中 pid と再起動回数が反映される。状態ルートは --state-root の値、省略時は
 #   本スクリプトが mktemp で作る 0700 のディレクトリ（実行後に削除する。CLI の delete は呼ばない）。
 #   restart のたびに構造化ログ {"component":"supervisor.monitor","operation":"restart","result":"ok",
-#   "elapsed_us":N} が標準エラーへ出る（無ければ supervisor_reported は null）。--bundle は計測専用の使い捨てを使う。
+#   "elapsed_us":N} が<状態ルート>/@supervisor-logs/<id>.log へ `stderr ` 接頭辞つきで残る（無ければ supervisor_reported は null）。--bundle は計測専用の使い捨てを使う。
 #   標準エラーはファイルへ記録する。ulimit での肥大化防止は、コンテナへ継承され計測条件が変わるため行わない
 #   （supervisor の標準エラーは restart・終了ごとの行だけで、全体期限が上限になる）。
 #
@@ -554,17 +554,28 @@ sup_report() {
 # 数値のみ採用する）。結果は reported（null または改行区切り数値）・reported_err（失敗した restart 行の有無）。
 collect_reported() {
   local -a rep=()
-  [ -s "$workdir/err.log" ] || return 0
+  # supervisor の構造化ログは状態ルート配下の <root>/@supervisor-logs/<id>.log（古い世代 .log.2 .log.1 が先）に
+  # `stderr <JSON 1 行>` 形式で残る（#2067・REPAIR-4）。launcher の stderr（err.log）には出ないため、世代順に連結し、
+  # 接頭辞 `stderr ` の行だけを JSON として取り出す。
+  local logbase="$state_dir/@supervisor-logs/$container_id" f
+  local merged="$workdir/sup-merged.log"
+  : >"$merged"
+  for f in "$logbase.log.2" "$logbase.log.1" "$logbase.log"; do
+    if [ -f "$f" ] && [ ! -L "$f" ]; then
+      grep -a '^stderr ' "$f" 2>/dev/null | cut -c8- >>"$merged" || true
+    fi
+  done
+  [ -s "$merged" ] || return 0
   # jq の出力を grep -q へ直接パイプすると、失敗行が多く出力が複数回の書き込みになったとき、grep が先に
   # 終わった後の jq の書き込みが SIGPIPE（141）になり、pipefail で判定が偽（失敗の見落とし）になる。
   # 変数に取ってから照合する（#1726）。
   local err_hits=""
-  if err_hits="$(jq -Rre 'fromjson? | select(type=="object" and .component=="supervisor.monitor" and .operation=="restart" and .result=="error") | "x"' "$workdir/err.log" 2>/dev/null)" &&
+  if err_hits="$(jq -Rre 'fromjson? | select(type=="object" and .component=="supervisor.monitor" and .operation=="restart" and .result=="error") | "x"' "$merged" 2>/dev/null)" &&
     grep -q x <<<"$err_hits"; then
     reported_err=1
     return 0
   fi
-  mapfile -t rep < <(jq -Rre 'fromjson? | select(type=="object" and .component=="supervisor.monitor" and .operation=="restart" and .result=="ok") | .elapsed_us | select(type=="number" and .>=0 and .==floor and .<=3600000000)' "$workdir/err.log" 2>/dev/null || true)
+  mapfile -t rep < <(jq -Rre 'fromjson? | select(type=="object" and .component=="supervisor.monitor" and .operation=="restart" and .result=="ok") | .elapsed_us | select(type=="number" and .>=0 and .==floor and .<=3600000000)' "$merged" 2>/dev/null || true)
   if [ "${#rep[@]}" -eq "$total" ]; then
     reported="$(printf '%s\n' "${rep[@]:$warmup}")"
   fi

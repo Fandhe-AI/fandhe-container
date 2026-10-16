@@ -121,6 +121,10 @@ cat >"${root}/bin/fandhe-container-supervisor" <<'STUB'
 id="${!#}"
 sd="${3}/${id}"
 [ -f "$sd/state.json" ] || exit 2
+# 実 supervisor は構造化ログを <root>/@supervisor-logs/<id>.log へ `stderr <JSON>` 形式で残す（#2067・REPAIR-4）。
+logfile="${3}/@supervisor-logs/${id}.log"
+mkdir -p "${3}/@supervisor-logs"
+logline() { printf 'stderr %s\n' "$1" >>"$logfile"; }
 if [ ! -p /dev/stdout ]; then echo "FCSUP1 ERR INVALID_ARGUMENT 2 stdout is not a fifo"; exit 2; fi
 if [ "$STUB_MODE" = err_report_slow ]; then mkfifo "$sd/hold" && exec 3<>"$sd/hold" && read -r -t 1 -u 3 _ || true; echo "FCSUP1 ERR FAILED_PRECONDITION 1 stub"; exit 1; fi
 if [ "$STUB_MODE" = err_report ]; then echo "FCSUP1 ERR FAILED_PRECONDITION 1 stub"; exit 1; fi
@@ -196,7 +200,7 @@ write_state() {
   mv "${sd}/state.tmp" "${sd}/state.json"
 }
 term_handler() {
-  [ -z "$pending" ] || echo "$pending" >&2
+  [ -z "$pending" ] || logline "$pending"
   kill "$child" 2>/dev/null
   exit 0
 }
@@ -266,11 +270,11 @@ while :; do
   line="{\"component\":\"supervisor.monitor\",\"operation\":\"restart\",\"result\":\"ok\",\"elapsed_us\":${e}}"
   case "$STUB_MODE" in
     log_missing) ;;
-    log_late) [ -z "$pending" ] || echo "$pending" >&2; pending="$line" ;;
-    log_short) if [ "$idx" -ge 2 ]; then echo "$line" >&2; fi ;;
-    log_garbage) echo "not json" >&2; echo '{"component":"supervisor.monitor","operation":"restart","result":"ok","elapsed_us":"x"}' >&2 ;;
-    error_line) echo "{\"component\":\"supervisor.monitor\",\"operation\":\"restart\",\"result\":\"error\",\"code\":\"x\",\"elapsed_us\":${e}}" >&2 ;;
-    *) echo "$line" >&2 ;;
+    log_late) [ -z "$pending" ] || logline "$pending"; pending="$line" ;;
+    log_short) if [ "$idx" -ge 2 ]; then logline "$line"; fi ;;
+    log_garbage) logline "not json"; logline '{"component":"supervisor.monitor","operation":"restart","result":"ok","elapsed_us":"x"}' ;;
+    error_line) logline "{\"component\":\"supervisor.monitor\",\"operation\":\"restart\",\"result\":\"error\",\"code\":\"x\",\"elapsed_us\":${e}}" ;;
+    *) logline "$line" ;;
   esac
 done
 STUB

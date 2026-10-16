@@ -5275,7 +5275,6 @@ mod tests {
         assert_eq!(std::mem::size_of::<PollFd>(), 8);
     }
 
-    /// CORE-3・TASK-32.1: cgroup 操作用の定数・`statfs` バッファの具体値。
     /// #2098: 疑似 FS の magic 定数の具体値（include/uapi/linux/magic.h と、非 uapi の 3 つはカーネルのソース）。
     /// 0xcafe4a11 などは `i32::MAX` を超えるため、符号拡張されない正の `i64` のリテラルで固定する。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -5301,6 +5300,7 @@ mod tests {
         assert_eq!(BINDERFS_SUPER_MAGIC, 0x6c6f_6f70);
     }
 
+    /// CORE-3・TASK-32.1: cgroup 操作用の定数・`statfs` バッファの具体値。
     #[cfg(all(
         target_pointer_width = "64",
         any(target_arch = "x86_64", target_arch = "aarch64")

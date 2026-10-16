@@ -29,7 +29,7 @@ SHELL := /bin/bash
 	test-integration cli-parity-selftest cli-parity-native-reclaim-check \
 	cli-parity-native-reclaim-selftest commit-msg-line-length-selftest crash-summary-check \
 	crash-summary-check-selftest lib-selftest \
-	vz-virtio-gpu-guest-check-selftest third-party-licenses-selftest deny-license-fail-closed-selftest \
+	vz-virtio-gpu-guest-check-selftest guest-kernel-build guest-kernel-build-selftest third-party-licenses-selftest deny-license-fail-closed-selftest \
 	bench-check-selftest bench-baseline-selftest fio-bench-selftest fio-baseline-ratio-selftest \
 	startup-latency-selftest net-setup-timing-selftest dns-helper-measure-selftest idle-memory-selftest \
 	idle-memory-supervised-selftest supervisor-pss-selftest concurrent-memory-selftest \
@@ -152,6 +152,12 @@ crash-summary-check-selftest: ## crash-summary-check スクリプトの自己テ
 
 vz-virtio-gpu-guest-check-selftest: ## virtio-gpu ゲスト側確認スクリプトの自己テスト（TASK-172.6・GPU-6・REPAIR-12。fixture のみ）
 	@poc/vz-custom-virtio-gpu/guest/check-virtio-gpu-selftest.sh
+
+guest-kernel-build: ## macOS ゲストカーネル（arm64）を取得・sha256 照合・ビルドする（TASK-64 追補・#1874・MAC-1。ネットワークと実ビルド。make ci には含めない）
+	@guest/kernel/build.sh
+
+guest-kernel-build-selftest: ## ゲストカーネルのビルドスクリプトの自己テスト（#1874・MAC-1・REPAIR-12。スタブのみ）
+	@guest/kernel/build-selftest.sh
 
 third-party-licenses-selftest: ## ライセンス表記生成スクリプトの自己テスト（スタブ cargo のみ。TASK-103.1）
 	@scripts/generate-third-party-licenses-selftest.sh

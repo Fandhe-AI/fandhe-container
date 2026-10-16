@@ -758,6 +758,15 @@ jobs:
         timeout-minutes: 5
         run: make vz-virtio-gpu-guest-check-selftest
 
+      # macOS ゲストカーネルのビルドスクリプト（guest/kernel/build.sh）の自己テスト（#1874・MAC-1・REPAIR-12）。
+      # スタブの tar.xz・コンパイラ・curl だけを使い、ネットワーク・実ビルド・secrets は使わない。
+      # 開発者の macOS（BSD tar / shasum）・Windows（Git Bash では unsupported-os の拒否）でも回すため
+      # 3 OS で実行する。新ジョブは check-run 名が増えるため既存ジョブのステップとする（件数は不変）
+      - name: ゲストカーネルのビルドスクリプトの自己テスト（#1874・MAC-1。ubuntu・macos・windows）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make guest-kernel-build-selftest
+
       # commit-msg フックの本文行長検査（scripts/check-commit-msg-line-length.sh）の自己テスト
       # （Issue #1295・REPAIR-12）。一時ファイルと一時 git リポジトリだけを使い、ネットワーク・secrets・
       # `${{ }}` の埋め込みは使わない。フックは開発者の macOS（BSD tr / awk）・Windows（Git Bash）でも

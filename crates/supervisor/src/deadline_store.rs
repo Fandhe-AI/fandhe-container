@@ -242,8 +242,10 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(500));
     }
 
-    /// `update` だけを遅らせて内側へ委ねるストア。
+    /// `update` だけを遅らせて内側へ委ねるストア（使う試験が Linux 限定のため同じ cfg を付ける）。
+    #[cfg(target_os = "linux")]
     struct SlowUpdate(Arc<dyn StateStore>, Duration);
+    #[cfg(target_os = "linux")]
     impl StateStore for SlowUpdate {
         fn create(&self, r: &CreateStateRequest) -> Result<StateRecord, TraitError> {
             self.0.create(r)

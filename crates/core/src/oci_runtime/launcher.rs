@@ -35,8 +35,8 @@
 //! launch の失敗は、起動した全プロセス(中間プロセス I と PID 1)の消滅を確かめられたかを、コンテナ ID ごとの
 //! 台帳(上限 `LEDGER_MAX_ENTRIES` 件)に残す。`Clean` は消滅を確かめ済み、`Pending` は回収できなかった子の
 //! ハンドルと、報告前の PID 1 の再探索が要る起動識別子を保持する状態、`Handed` は launch 成功でハンドルの所有者が
-//! 呼び出し側に移った状態である。`confirm_no_process` は `Clean` のときだけ `Ok` を返し、`Pending` は期限内に
-//! 再回収(I → PID 1 の順。PID 1 は I の回収後でないと C の子にならない)と再探索を試みる。台帳に無い ID・`Handed`・
+//! 呼び出し側に移った状態である(そのハンドルの `terminate` が成功すると、同じ launch の項目だけが `Clean` に進む)。`confirm_no_process` は `Clean` のときだけ `Ok` を返し、`Pending` は期限内に
+//! 再回収(I → PID 1 の順。PID 1 は I の回収後でないと C の子にならない)と再探索を試みる。台帳に無い ID・回収前の `Handed`・
 //! 確かめられない `Pending` は `Ok` にしない。`Pending` の ID への再 launch は(再回収を試みても確かめられなければ)
 //! fork 前に拒否する。再回収の待ちの間は `Pending` を台帳から取り出し(記録は `Settling`)、台帳の Mutex を解放する
 //! ため、他コンテナの launch は待たされない(REPAIR-5・CORE-1)。同じ ID への並行な確認・launch は拒否する。期限内に確かめられなかった事実は、launch の `TraitError` の固定の接尾辞
@@ -327,7 +327,9 @@ enum LaunchRecord {
     /// 結果は呼び出し元が書き戻す。確かめ済みとは扱わず、捨てない。
     Settling,
     /// launch 成功。ハンドルの所有者は呼び出し側(start / supervisor)で、launcher は確証できない。
-    Handed,
+    /// 値は launch ごとの世代。そのハンドルの `terminate` が成功したら、同じ世代の項目だけを `Clean` へ進める
+    /// (回収の証跡を台帳へ引き継ぐ。再 launch 後の古いハンドルが新しい項目を書き換えない。CORE-2)。
+    Handed(u64),
 }
 
 /// 消滅を確かめられていない起動の残り(握りつぶさない。CORE-2)。
@@ -424,7 +426,10 @@ struct Inner {
     privilege: IsolationPrivilege,
     audit_sink: Arc<dyn AuditSink>,
     cgroup_join_source: Option<JoinSource>,
-    ledger: Mutex<Ledger>,
+    /// ハンドルの回収通知（`ContainerChildProcess::with_reap_notice`）と共有するため `Arc`。
+    ledger: Arc<Mutex<Ledger>>,
+    /// `Handed` の世代の採番。
+    next_generation: std::sync::atomic::AtomicU64,
     /// 直近の `launch` が失敗し、子が残っている可能性があるか(回収に失敗した子がある、または報告前の PID 1 の
     /// 探索ができなかった。CORE-2)。`launch` の入口で偽に戻す。
     left_process: AtomicBool,
@@ -443,7 +448,8 @@ impl Inner {
             privilege,
             audit_sink,
             cgroup_join_source,
-            ledger: Mutex::new(Ledger::default()),
+            ledger: Arc::new(Mutex::new(Ledger::default())),
+            next_generation: std::sync::atomic::AtomicU64::new(0),
             left_process: AtomicBool::new(false),
         }
     }
@@ -550,8 +556,28 @@ impl Inner {
         if child.pidfd().is_none() {
             return Err(self.reject_unusable_child(id, child));
         }
-        let process = super::launch::ContainerChildProcess::new(child)?.with_output(stdout, stderr);
-        self.ledger().set(id, LaunchRecord::Handed);
+        let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
+        // ハンドルの terminate が成功した（PID 1 の消滅を回収で確かめた）ら、同じ世代の Handed を Clean へ進める。
+        // 遅れて成功した状態更新の後始末が confirm_no_process で回収済みを確かめられるようにする（CORE-2）。
+        let ledger = Arc::downgrade(&self.ledger);
+        let owner = id.clone();
+        let process = super::launch::ContainerChildProcess::new(child)?
+            .with_output(stdout, stderr)
+            .with_reap_notice(Box::new(move || {
+                let Some(ledger) = ledger.upgrade() else {
+                    return;
+                };
+                let mut ledger = ledger.lock().unwrap_or_else(PoisonError::into_inner);
+                let slot = ledger
+                    .position(&owner)
+                    .and_then(|i| ledger.entries.get_mut(i));
+                if let Some((_, record)) = slot
+                    && matches!(record, LaunchRecord::Handed(g) if *g == generation)
+                {
+                    *record = LaunchRecord::Clean;
+                }
+            }));
+        self.ledger().set(id, LaunchRecord::Handed(generation));
         Ok(Box::new(process))
     }
 
@@ -728,7 +754,7 @@ impl Inner {
                     ));
                 }
                 Some((_, LaunchRecord::Pending(_))) => {}
-                Some((_, LaunchRecord::Handed)) | None => {
+                Some((_, LaunchRecord::Handed(_))) | None => {
                     return Err(TraitError::new(
                         ErrorCode::FailedPrecondition,
                         "the launched process is owned by its handle holder; cannot confirm",
@@ -1466,6 +1492,32 @@ mod tests {
             "the launched process is owned by its handle holder; cannot confirm"
         );
         p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// CORE-2・#1819: ハンドルの `terminate` が成功すると回収の証跡が台帳へ引き継がれ、`confirm_no_process` が
+    /// `Ok` になる。再 launch 後の古いハンドルの terminate は新しい項目を `Clean` にしない(世代照合)。
+    #[test]
+    fn core2_terminate_of_handed_process_makes_confirm_ok() {
+        let spec = spec_for("handed-reaped", serde_json::json!({}));
+        let ev = events();
+        let l = launcher(FakeOps::new(&ev), rootless(), None);
+        let first = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        assert!(
+            l.confirm_no_process(spec.container_id(), Duration::from_secs(1))
+                .is_err()
+        );
+        // 同じ ID を再 launch すると世代が進む。古いハンドルの回収は新しい項目に影響しない。
+        let second = l.launch(&spec, Duration::from_secs(1)).expect("relaunch");
+        first.terminate(Duration::from_secs(5)).expect("terminate");
+        assert_eq!(
+            l.confirm_no_process(spec.container_id(), Duration::from_secs(1))
+                .expect_err("stale handle must not confirm")
+                .code(),
+            ErrorCode::FailedPrecondition
+        );
+        second.terminate(Duration::from_secs(5)).expect("terminate");
+        l.confirm_no_process(spec.container_id(), Duration::from_secs(1))
+            .expect("confirm after reap");
     }
 
     /// CORE-2: 確かめられていない起動が残る ID への再 launch は、spawn を呼ばずに拒否する(二重起動の防止)。

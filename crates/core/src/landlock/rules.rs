@@ -466,6 +466,10 @@ impl MountFlagToggle {
 /// オプションに関係なく維持する。
 /// `nosuid` / `suid` と `defaults`（runtime-spec ではフラグ 0 の no-op）は対応する Landlock の権利が
 /// 無いため権利に影響しない。
+///
+/// bind mount の `ro`/`rw`・`noexec`/`exec` の畳み込みは `oci_runtime::bind_mounts`（#1911）と同じ読みで、
+/// 本ファイルのテスト `core5_landlock_bind_interpretation_matches` が両者を照合する。解釈を変えるときは
+/// もう一方と照合試験を更新する。
 fn mount_rights(m: &OciMount) -> AccessFs {
     let mut write = MountFlagToggle::default();
     let mut exec = MountFlagToggle::default();
@@ -683,6 +687,45 @@ mod tests {
     fn build_all(c: &OciConfig) -> LandlockRuleset {
         let s = evaluate_abi(6).expect("abi6");
         path_rules_from_config(&s, c).expect("rules")
+    }
+
+    /// CORE-5・#1911: bind mount の `ro`/`rw`・`noexec`/`exec` の解釈が `BindMountSet` と一致する。
+    /// `/dev` 配下の宛先は bind が拒否するため `IOCTL_DEV` 分岐は食い違わない。
+    #[test]
+    fn core5_landlock_bind_interpretation_matches() {
+        use crate::oci_runtime::BindMountSet;
+        let tokens = ["ro", "rw", "noexec", "exec", "nosuid", "nodev", "private"];
+        let mut cases: Vec<Vec<&str>> = vec![vec![]];
+        for a in tokens {
+            cases.push(vec![a]);
+            for b in tokens {
+                cases.push(vec![a, b]);
+                for c in ["ro", "rw", "noexec", "exec"] {
+                    cases.push(vec![a, b, c]);
+                }
+            }
+        }
+        for extra in cases {
+            let mut opts = vec!["rbind"];
+            opts.extend(extra.iter().copied());
+            let c = cfg(
+                false,
+                json!([{"destination": "/mnt/d", "type": "bind", "source": "/data", "options": opts}]),
+            );
+            let set = BindMountSet::from_mounts(c.mounts()).expect("bind accepted");
+            let spec = &set.mounts()[0];
+            let rights = mount_rights(&c.mounts()[0]);
+            assert_eq!(
+                rights.contains(AccessFs::WRITE),
+                !spec.read_only(),
+                "opts={opts:?}"
+            );
+            assert_eq!(
+                rights.contains(AccessFs::EXECUTE),
+                !spec.noexec(),
+                "opts={opts:?}"
+            );
+        }
     }
 
     fn summary(rs: &LandlockRuleset) -> Vec<(&str, RuleOrigin, u64)> {

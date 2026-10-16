@@ -11,13 +11,19 @@
 //! 専用スレッドは [`stderr`] の初回呼び出しで作る。`oci_runtime::start` より前の単一スレッド前提の区間の成功経路では
 //! 出力しないこと（スレッドが増えて start の前提を壊す。`start_entry` の手順 2）。
 //!
+//! 書き先は既定で fd 2 だが、[`install_stderr_writer`] で最初の [`stderr`] 呼び出しより前に差し替えられる。bin の入口は
+//! 状態ルート配下のローテーションログ（[`crate::supervisor_log`]。#2067・REPAIR-4）へ差し替える。差し込みはスレッドを
+//! 作らない（`start_entry` の手順 2 の単一スレッド前提を保つ）。
+//!
 //! 呼び出し元: `start_entry` の `log_event` と終了前の報告・`run::StderrLogObserver`・`main.rs`（Linux 以外）。
 //! core 側の stderr 出力（監査ログのフォールバック等）は本モジュールを通らない。
 
 use std::io::Write;
-use std::sync::OnceLock;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Duration;
+
+use fandhe_container_core::traits::{ErrorCode, TraitError};
 
 /// キューに溜められる行数の上限（読み手が止まっても無制限に溜めない）。
 pub const QUEUE_CAPACITY: usize = 256;
@@ -148,9 +154,47 @@ fn drain<W: Write>(mut writer: W, rx: Receiver<Line>) {
 
 static STDERR: OnceLock<StderrSink> = OnceLock::new();
 
-/// プロセスの stderr へ書く共有の出口（初回呼び出しで専用スレッドを作る）。
+/// 差し替える書き手の置き場。`consumed` は共有の出口の初期化が置き場を見た後を表し、以後の差し込みを拒否する
+/// （初期化との競合で、差し込みが黙って失われないようにする）。
+struct WriterSlot {
+    writer: Option<Box<dyn Write + Send>>,
+    consumed: bool,
+}
+
+static STDERR_WRITER: Mutex<WriterSlot> = Mutex::new(WriterSlot {
+    writer: None,
+    consumed: false,
+});
+
+/// 共有の出口の書き先を `writer` に差し替える（プロセスで 1 回だけ・最初の [`stderr`] より前に限る）。
+///
+/// スレッドは作らない。既に共有の出口が作られている・既に差し込み済みなら `FailedPrecondition` で拒否する
+/// （黙って捨てない）。呼び出し元: `start_entry` の入口（supervisor ログの保存先。#2067・REPAIR-4）。
+pub fn install_stderr_writer(writer: Box<dyn Write + Send>) -> Result<(), TraitError> {
+    let mut slot = STDERR_WRITER.lock().unwrap_or_else(PoisonError::into_inner);
+    if slot.consumed || slot.writer.is_some() {
+        return Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "stderr writer can only be installed once before first use",
+        ));
+    }
+    slot.writer = Some(writer);
+    Ok(())
+}
+
+/// プロセスの stderr（または差し込まれた書き手）へ書く共有の出口（初回呼び出しで専用スレッドを作る）。
 pub fn stderr() -> &'static StderrSink {
-    STDERR.get_or_init(|| StderrSink::spawn(std::io::stderr(), QUEUE_CAPACITY))
+    STDERR.get_or_init(|| {
+        let installed = {
+            let mut slot = STDERR_WRITER.lock().unwrap_or_else(PoisonError::into_inner);
+            slot.consumed = true;
+            slot.writer.take()
+        };
+        match installed {
+            Some(w) => StderrSink::spawn(w, QUEUE_CAPACITY),
+            None => StderrSink::spawn(std::io::stderr(), QUEUE_CAPACITY),
+        }
+    })
 }
 
 /// 共有の出口を使っていれば、それまでの行が書かれるのを `deadline` まで待つ（プロセス終了の直前に呼ぶ）。

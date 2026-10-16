@@ -269,3 +269,36 @@ fn sup1_bin_survives_closed_result_channel() {
     let n = exit_code_for(ErrorCode::InvalidArgument);
     assert_eq!(status.code(), Some(i32::from(n.get())));
 }
+
+/// SUP-1・REPAIR-4・#2067: CLI と同じく stderr を null にして起動しても、supervisor の構造化ログは
+/// `<root>/@supervisor-logs/<id>.log`（0600）に残る。レコードの無い ID ではログを作らない。
+#[test]
+fn sup1_repair4_bin_saves_structured_log_under_state_root() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let env = Env::new("suplog");
+    env.create("c1");
+    let (code, stdout, _) = run_with_pipe(bin().args(args(&env.root, "c1")).stderr(Stdio::null()));
+    assert!(code.is_some());
+    assert_eq!(stdout.iter().filter(|&&b| b == b'\n').count(), 1);
+    let dir = env.root.join("@supervisor-logs");
+    let log = dir.join("c1.log");
+    assert_eq!(
+        std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let body = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        body.lines().any(|l| l.starts_with(
+            "stderr {\"component\":\"supervisor\",\"event\":\"start_metrics\",\"ops\":["
+        )),
+        "log body: {body}"
+    );
+
+    // レコードの無い ID（打ち間違い）ではログを作らない。
+    let _ = run_with_pipe(bin().args(args(&env.root, "nope")).stderr(Stdio::null()));
+    assert!(!dir.join("nope.log").exists());
+}

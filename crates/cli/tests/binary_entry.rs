@@ -655,6 +655,75 @@ fn cli1_stop_delete_flow_on_linux() {
     assert!(!root.join("c1").join("state.json").exists());
 }
 
+/// REPAIR-4・ERR-2・#2067: delete は core の delete の成功後に supervisor ログを消し、成功時の stderr は空のまま。
+/// `@supervisor-logs` があっても list はコンテナ ID として扱わない。delete が失敗（未 create）ならログに触れない。
+#[cfg(target_os = "linux")]
+#[test]
+fn repair4_delete_removes_supervisor_log() {
+    let tmp = TmpDir::new("suplog");
+    let bundle = tmp.0.join("bundle");
+    std::fs::create_dir_all(bundle.join("rootfs")).expect("rootfs");
+    std::fs::write(
+        bundle.join("config.json"),
+        r#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"process":{"user":{"uid":0,"gid":0},"args":["/bin/echo","it"],"cwd":"/"},"linux":{"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"user"},{"type":"uts"},{"type":"ipc"}]}}"#,
+    )
+    .expect("config");
+    let root = tmp.0.join("state");
+    let root_s = root.to_str().expect("utf8");
+    let bundle_s = bundle.to_str().expect("utf8");
+    let id = fandhe_container_core::traits::ContainerId::new("c1").expect("id");
+    let logs = root.join("@supervisor-logs");
+
+    assert_failure_free(&run(&[
+        "--root", root_s, "create", "--bundle", bundle_s, "c1",
+    ]));
+    // supervisor が書いたログの代わりに、同じ入口でログ（現在ログと世代 1）を用意する。
+    {
+        use std::io::Write as _;
+        let mut w = fandhe_container_supervisor::supervisor_log::open(&root, &id).expect("open");
+        w.write_all(b"{}\n").expect("write");
+        w.flush().expect("flush");
+    }
+    // 並行する他の試験の子プロセス起動（fork から exec まで）が、直前に閉じた書き手の flock の記述子を
+    // 一瞬だけ継承して保持し得る。その間の open は FailedPrecondition になるため、期限つきで再試行する（REPAIR-5）。
+    let reopen_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let reopened = loop {
+        match fandhe_container_supervisor::supervisor_log::open(&root, &id) {
+            Ok(w) => break w,
+            Err(e)
+                if e.code() == fandhe_container_core::traits::ErrorCode::FailedPrecondition
+                    && std::time::Instant::now() < reopen_deadline =>
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("reopen: {e:?}"),
+        }
+    };
+    drop(reopened);
+    assert!(logs.join("c1.log").exists());
+    assert!(logs.join("c1.log.1").exists());
+
+    let out = run(&["--root", root_s, "list"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ID\tSTATUS\tPID\nc1\tcreated\t-\n"
+    );
+
+    // 未 create の ID の delete は失敗し、c1 のログには触れない。
+    assert_eq!(
+        run(&["--root", root_s, "delete", "nope"]).status.code(),
+        Some(3)
+    );
+    assert!(logs.join("c1.log").exists());
+
+    let out = run(&["--root", root_s, "delete", "c1"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty(), "stderr: {:?}", out.stderr);
+    assert!(out.stdout.is_empty());
+    let left: Vec<_> = std::fs::read_dir(&logs).expect("dir").collect();
+    assert!(left.is_empty(), "left: {left:?}");
+}
+
 /// REPAIR-4: 複数の CLI プロセスが同じ `FANDHE_CONTAINER_OP_LOG` へ並行に追記しても JSON 行が混ざらない。
 ///
 /// 相対 bundle の create は core へ到達する前に失敗し（終了コード 2）、失敗 1 件の計測を追記する。

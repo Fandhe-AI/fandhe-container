@@ -15,8 +15,10 @@
 //!   user マネージャの直結ソケット `$XDG_RUNTIME_DIR/systemd/private` だけで足りる。`man sd_bus_default` と systemd の
 //!   `src/shared/bus-util.c` の `bus_connect_user_systemd`）。supervisor は契約の値を環境から読まず、状態ルートは常に
 //!   `--root` で受けるため、契約に反しない。cwd は `/`。
-//! - stdin は null、stdout は結果の pipe、stderr は null。supervisor の構造化ログは stderr へ出るが、CLI の stderr は
-//!   「失敗時に 1 行の JSON」という契約のため混ぜず、受け手を置かない（保存先は未整備。下記）。
+//! - stdin は null、stdout は結果の pipe、stderr は null。CLI の stderr は「失敗時に 1 行の JSON」という契約のため、
+//!   supervisor のログを混ぜず受け手も置かない。supervisor の構造化ログは supervisor 自身が `<root>/@supervisor-logs/<id>.log*`
+//!   へ保存する（サイズ上限・世代ローテーションつき。`fandhe_container_supervisor::supervisor_log`。#2067・REPAIR-4）。
+//!   `delete` が後始末する（`stop_delete`）。
 //! - `process_group(0)` で別のプロセスグループにし、端末の SIGINT / SIGHUP が supervisor に届かないようにする。
 //!
 //! # 委譲スコープでの起動（#2081・CORE-3・CORE-4・SEC-5）
@@ -65,7 +67,8 @@
 //!   （配布手順は CLI を launcher・supervisor と同じディレクトリに置く。#2068・SUP-14）。同一ユーザーで起動するため CLI と supervisor の間に権限の境界は無く、
 //!   実行ファイルの所有者・権限の fd 経由の検証は特権経路のランチャー（#1719）の責務とする。
 //! - rootful の特権起動でランチャー（`fandhe-container-launcher`）を選ぶ規則は未実装（#1719・#1722）。
-//! - supervisor の stderr（構造化ログ）の保存先は未整備。
+//! - supervisor の fd 2 へ直接書かれるもの（core の診断・panic のメッセージ等）は保存されない（stderr が null のため捨てられる。
+//!   範囲は `supervisor_log` の「未実装・残余」。`legacy_tiocsti` の警告の届け方は #2008）。
 //! - 親から継承した CLOEXEC の無い fd は CLI では閉じない。supervisor の bin の入口が fd 3 以降を閉じる
 //!   （ランチャー経由と同じ処理。#2070・SEC-1）。exec から入口までの短い窓は残る。
 //! - core の本番 launcher（#1715 の Phase B）が入るまで、supervisor は `UNIMPLEMENTED` を報告する。

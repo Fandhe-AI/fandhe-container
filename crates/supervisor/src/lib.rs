@@ -39,6 +39,7 @@
 //! | #1819 | TASK-157 追補 | `ProductionStartDeps` を core の本番 launcher（`ProductionLauncher`）へ結線（手順 8 は入口スレッドが直接行う）。restart の再 launch は単一スレッドの要求を満たせず fail-closed（#2043）。実機前提の通し試験は `tests/supervisor_bin_real.rs`。REPAIR-3 |
 //! | #1475 | TASK-171.1.3 | 権限昇格の実体 `privilege::elevate`（承認済みの方式〔#1454〕。縮退の syscall 適用と読み戻し検証は実装済み。fd 検証付き exec・入口検証・ランチャー bin は #1719 で実装） |
 //! | #1719 | TASK-171 追補 | 特権ランチャー bin `fandhe-container-launcher`（[`launcher`]。入口検証 → `elevate` → 検証済み fd の `execveat`。hash / 署名照合・ambient の子での解除〔healthcheck exec。#495〕・実機検証〔#538・#539〕は未実装。REPAIR-3） |
+//! | #2067 | TASK-79 追補 | supervisor の構造化ログ（stderr）の保存先（[`supervisor_log`]。`<root>/@supervisor-logs/<id>.log*`。REPAIR-4） |
 //! | #2058 | TASK-157 追補 | CLI からのシグナル送信を受ける制御チャネル（[`control`]。コンテナごとの UDS。サーバ・クライアント入口〔`ControlSignaler`〕は実装済み。CLI の `stop`・`kill` への結線〔#1544 の段 C〕・stop の意図の伝達〔SUP-9〕は未実装。REPAIR-3） |
 //! | #489 | TASK-159.3 | restart_count 管理・state.json 反映・結合テスト（実装済み。本番 launcher での再 launch の成立は #2043） |
 //! | #523 | TASK-168.1 | state.json 読み取り・inspect 出力フォーマット（実装済み） |
@@ -75,5 +76,6 @@ pub mod start_entry;
 pub mod state;
 pub mod stats;
 pub mod stderr_sink;
+pub mod supervisor_log;
 #[cfg(any(windows, target_os = "linux"))]
 mod sys;

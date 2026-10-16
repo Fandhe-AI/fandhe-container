@@ -121,6 +121,12 @@ cat >"${root}/bin/fandhe-container-supervisor" <<'STUB'
 id="${!#}"
 sd="${3}/${id}"
 [ -f "$sd/state.json" ] || exit 2
+# 実 supervisor は構造化ログを <root>/@supervisor-logs/<id>.log へ `stderr <JSON>` 形式で残す（#2067・REPAIR-4）。
+# ファイル名は RotatingFileSink と同じ符号化（大文字 X は `_x`、`_` は `__`）にする。
+stem="$(printf '%s' "$id" | sed -e 's/_/__/g' -e 's/\([A-Z]\)/_\1/g' | tr 'A-Z' 'a-z')"
+logfile="${3}/@supervisor-logs/${stem}.log"
+mkdir -p "${3}/@supervisor-logs"
+logline() { printf 'stderr %s\n' "$1" >>"$logfile"; }
 if [ ! -p /dev/stdout ]; then echo "FCSUP1 ERR INVALID_ARGUMENT 2 stdout is not a fifo"; exit 2; fi
 if [ "$STUB_MODE" = err_report_slow ]; then mkfifo "$sd/hold" && exec 3<>"$sd/hold" && read -r -t 1 -u 3 _ || true; echo "FCSUP1 ERR FAILED_PRECONDITION 1 stub"; exit 1; fi
 if [ "$STUB_MODE" = err_report ]; then echo "FCSUP1 ERR FAILED_PRECONDITION 1 stub"; exit 1; fi
@@ -196,7 +202,7 @@ write_state() {
   mv "${sd}/state.tmp" "${sd}/state.json"
 }
 term_handler() {
-  [ -z "$pending" ] || echo "$pending" >&2
+  [ -z "$pending" ] || logline "$pending"
   kill "$child" 2>/dev/null
   exit 0
 }
@@ -260,18 +266,20 @@ while :; do
   [ "$STUB_MODE" != deep ] || shown="$grand"
   [ "$STUB_MODE" != foreign_new ] || shown="$(<"${STUB_FOREIGN}")"
   [ "$STUB_MODE" != same_pid ] || shown="$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "${sd}/state.json")"
-  write_state "$shown"
   e="${elapsed[$idx]:-101000}"
   idx=$((idx + 1))
   line="{\"component\":\"supervisor.monitor\",\"operation\":\"restart\",\"result\":\"ok\",\"elapsed_us\":${e}}"
   case "$STUB_MODE" in
     log_missing) ;;
-    log_late) [ -z "$pending" ] || echo "$pending" >&2; pending="$line" ;;
-    log_short) if [ "$idx" -ge 2 ]; then echo "$line" >&2; fi ;;
-    log_garbage) echo "not json" >&2; echo '{"component":"supervisor.monitor","operation":"restart","result":"ok","elapsed_us":"x"}' >&2 ;;
-    error_line) echo "{\"component\":\"supervisor.monitor\",\"operation\":\"restart\",\"result\":\"error\",\"code\":\"x\",\"elapsed_us\":${e}}" >&2 ;;
-    *) echo "$line" >&2 ;;
+    log_late) [ -z "$pending" ] || logline "$pending"; pending="$line" ;;
+    log_short) if [ "$idx" -ge 2 ]; then logline "$line"; fi ;;
+    log_garbage) logline "not json"; logline '{"component":"supervisor.monitor","operation":"restart","result":"ok","elapsed_us":"x"}' ;;
+    error_line) logline "{\"component\":\"supervisor.monitor\",\"operation\":\"restart\",\"result\":\"error\",\"code\":\"x\",\"elapsed_us\":${e}}" ;;
+    *) logline "$line" ;;
   esac
+  # ログ行を state.json の更新より先に残す。計測側は state.json を見て launcher を止めるため、順序が逆だと
+  # 停止の TERM が書き込みの前に届いて最終 trial の行が欠け、supervisor_reported が null になる（競合の除去）。
+  write_state "$shown"
 done
 STUB
 chmod 700 "${root}/bin/fandhe-container" "${root}/bin/fandhe-container-supervisor" "${root}/systemd-run" "$root"
@@ -666,6 +674,10 @@ mkdir -m 0700 "${root}/sr"
 run_case state_root 0 normal "101000 101000" --trials 1 --warmup 0 --timeout 10 --state-root "${root}/sr" || true
 if [ -s "${root}/state_root.out" ]; then pass "state_root: result published"; else fail "state_root: no result"; fi
 if [ "$(find "${root}/sr" -name state.json | wc -l)" -eq 1 ]; then pass "state_root: state.json created under --state-root"; else fail "state_root: state.json missing under --state-root"; fi
+
+# 大文字と '_' を含む --id-prefix でも、符号化されたログのファイル名から副系列を読める（REPAIR-4・IO-5）
+run_case id_prefix_enc 0 normal "101000 101000" --trials 1 --warmup 0 --timeout 10 --id-prefix Foo_bar || true
+jq_eq id_prefix_enc "${root}/id_prefix_enc.out" '.supervisor_reported.samples' '1'
 
 # --- 引数・入力エラーは 2 ---
 chk2() { # <名前> <script 引数...>

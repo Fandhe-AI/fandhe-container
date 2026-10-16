@@ -10,6 +10,8 @@
 //! 0. 結果チャネルの検証（stdout が FIFO か。`run_main`）／1. argv の解析（[`crate::start_contract::StartArgs`]）／
 //! 2. スレッド数が 1 か（`oci_runtime::start` の前提。以後のスレッドは手順 3〜7 の作業スレッド〔入口は待つだけ〕と
 //!    手順 10 以降のログ捕捉・restart のワーカーと、制御チャネルの accept スレッド〔`control`。#2058〕に限る）／
+//!    2b. supervisor の構造化ログの保存先を開き、`stderr_sink` の書き先を差し替える（レコードがあるときだけ。期限つきの
+//!    作業スレッドで行い終了を確認してから進む。失敗は fail-closed。保存先と上限は [`crate::supervisor_log`]。#2067・REPAIR-4）／
 //! 3. 状態の事前確認（Created・pid なし・cgroup 未記録。副作用なし）／4. [`StartDeps::check_launcher_available`]
 //!    （副作用なし。権限モデルと Landlock ABI を確かめ、満たさなければここで止まる）／5. cgroup の連鎖
 //!    （[`StartDeps::prepare_cgroup`]）／6. 監査 sink（[`StartDeps::build_audit_sink`]。fork の前）・ログ sink／
@@ -1652,6 +1654,8 @@ mod linux {
     const REPORT_WRITE_DEADLINE: Duration = Duration::from_secs(5);
     /// stderr への報告 1 行（結果チャネルが使えないとき）と、終了前のログの書き出しを待つ期限（REPAIR-5）。
     const STDERR_DEADLINE: Duration = Duration::from_secs(1);
+    /// supervisor ログの準備（手順 2b）を待つ上限（全体期限から報告の予約分を引いた残りでさらに絞る）。
+    const LOG_PREPARE_DEADLINE: Duration = Duration::from_secs(5);
 
     /// 本番の [`StartDeps`]。core の本番 `ProcessLauncher`（`oci_runtime::ProductionLauncher`）へ結線する
     /// （#1819・SUP-1・CORE-1・CORE-2・CORE-3・CORE-5・SEC-1・SEC-4・SEC-5）。
@@ -1915,6 +1919,86 @@ mod linux {
             .unwrap_or(false)
     }
 
+    /// 手順 2b: `id` のレコードがあるときだけ supervisor ログ（`<root>/@supervisor-logs/<id>.log`）を開き、
+    /// `stderr_sink` の書き先へ差し込む（#2067・REPAIR-4）。
+    ///
+    /// レコードが無い（`NotFound`）場合は何もせず先へ進む（詳細なエラーは手順 3 が報告する。打ち間違えた ID のために
+    /// `delete` で消せないログを作らない）。レコードの取得が `Timeout` 等で失敗したら保存先を確定できないため
+    /// 失敗として返す。開くのに失敗したら呼び出し側が fail-closed で報告する（ログ喪失を黙って
+    /// 許さない。同じ ID の supervisor が生存中なら `FailedPrecondition`）。
+    ///
+    /// 状態ストアの取得とログのディレクトリ走査・ローテーション・`sync_dir` は保存先の I/O が止まりうるため、
+    /// 作業スレッドで行い `until` まで待つ（REPAIR-5）。成功時は作業スレッドを `join` で終了させてから返すため、
+    /// 後続の `oci_runtime::start` の単一スレッド要求を満たす。期限超過時は `Timeout` を返す（作業スレッドは
+    /// 残るが、呼び出し側は launch せず失敗を報告して終わる）。
+    fn prepare_supervisor_log(
+        store: &Arc<dyn StateStore>,
+        root: &std::path::Path,
+        id: &ContainerId,
+        until: Option<Instant>,
+    ) -> Result<(), TraitError> {
+        let (store, root, id) = (Arc::clone(store), root.to_path_buf(), id.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("fandhe-suplog".into())
+            .spawn(move || {
+                let _ = tx.send(open_supervisor_log(&store, &root, &id));
+            })
+            .map_err(|_| {
+                TraitError::new(
+                    ErrorCode::Internal,
+                    "failed to spawn the log prepare worker",
+                )
+            })?;
+        let until = until.map(|d| d.checked_sub(REPORT_RESERVE).unwrap_or(d));
+        let limit = write_limit(LOG_PREPARE_DEADLINE, until, Instant::now());
+        match rx.recv_timeout(limit) {
+            Ok(result) => {
+                // 送信は作業スレッドの最後の処理。join で OS スレッドの終了まで確認する（単一スレッドの回復）。
+                let _ = handle.join();
+                result
+            }
+            Err(_) => Err(TraitError::new(
+                ErrorCode::Timeout,
+                "supervisor log preparation timed out",
+            )),
+        }
+    }
+
+    /// [`prepare_supervisor_log`] の本体（作業スレッドで実行する）。
+    fn open_supervisor_log(
+        store: &Arc<dyn StateStore>,
+        root: &std::path::Path,
+        id: &ContainerId,
+    ) -> Result<(), TraitError> {
+        if !record_exists(store.as_ref(), id)? {
+            return Ok(());
+        }
+        // ストアが受理した（親 symlink 解決済みの）状態ルートの下に置く。生の `--root` だと、ストアは受理するのに
+        // RotatingFileSink が root 所有でない symlink を拒否して fail-closed になる。ストアが示せなければ引数を使う。
+        let log_root = supervisor_log_root(store, root);
+        let writer = crate::supervisor_log::open(log_root, id)?;
+        crate::stderr_sink::install_stderr_writer(Box::new(writer))
+    }
+
+    /// `id` のレコードがあるか。`NotFound` だけを「なし」とし、`Timeout`（`@lock` 待ち）等の取得失敗は
+    /// 保存先を確定できないのでそのまま返す（ログが null の stderr へ流れるのを防ぐ fail-closed。#2067・REPAIR-4）。
+    fn record_exists(store: &dyn StateStore, id: &ContainerId) -> Result<bool, TraitError> {
+        match store.get(&GetStateRequest::new(id.clone())) {
+            Ok(_) => Ok(true),
+            Err(e) if e.code() == ErrorCode::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// supervisor ログを置く状態ルート。ストアの `host_state_root()`（検査済み）を優先し、無ければ引数の root。
+    fn supervisor_log_root<'a>(
+        store: &'a Arc<dyn StateStore>,
+        root: &'a std::path::Path,
+    ) -> &'a std::path::Path {
+        store.host_state_root().unwrap_or(root)
+    }
+
     /// supervisor の bin の入口（`src/main.rs` から呼ぶ）。`args` はプログラム名を除いた argv。
     ///
     /// 終了の前に、それまでの stderr のログが書かれるのを期限つきで待つ（読み手が止まっていても期限で終わる）。
@@ -2007,6 +2091,11 @@ mod linux {
         let deadline =
             Instant::now().checked_add(crate::start_contract::result_deadline(&timeouts));
         out.limit_until(deadline);
+        // 2b: supervisor の構造化ログの保存先を開き、stderr の出口の書き先を差し替える（#2067・REPAIR-4）。
+        // 期限つきの作業スレッドで行い、終了を確認してから先へ進む。開けなければ fail-closed で、手順 3 より前に止まる。
+        if let Err(e) = prepare_supervisor_log(&store, &args.root, &args.id, deadline) {
+            return fail(&mut out, op_err(e));
+        }
         let running = match run_start_until(
             deps,
             &store,
@@ -2049,6 +2138,10 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use fandhe_container_core::traits::{
+            CreateStateRequest, DeleteStateRequest, DeleteStateResponse, ListStateRequest,
+            StateList,
+        };
 
         /// SEC-4・SUP-1・#2058: 監査中継は単一スレッドでしか作れないため、`run_start_until`（`stderr_sink` の常駐スレッドを
         /// 作る）より前に生成する。実プロセスの単一スレッド条件はテストハーネス（複数スレッド）では再現できないので、
@@ -2114,6 +2207,77 @@ mod linux {
                     "rootful start is not supported by the production launcher"
                 );
             }
+        }
+
+        /// REPAIR-4・#2067: 親が symlink の `--root` でも、ログはストアの解決済み状態ルートの下に開ける。
+        #[cfg(unix)]
+        #[test]
+        fn repair4_log_root_follows_store_host_state_root_through_symlink() {
+            let base = std::env::temp_dir().join(format!("fc-slog-{}", std::process::id()));
+            let real = base.join("real");
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&real).expect("mkdir");
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                for d in [&base, &real] {
+                    std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))
+                        .expect("chmod");
+                }
+            }
+            let link_parent = base.join("link");
+            std::os::unix::fs::symlink(&base, &link_parent).expect("symlink");
+            let raw_root = link_parent.join("real");
+            let store = crate::state::open_default_store(Some(raw_root.clone())).expect("store");
+            let log_root = supervisor_log_root(&store, &raw_root).to_path_buf();
+            let id = ContainerId::new("c1").expect("id");
+            let opened = crate::supervisor_log::open(&log_root, &id);
+            let _ = std::fs::remove_dir_all(&base);
+            assert!(
+                opened.is_ok(),
+                "log must open under the store root: {:?}",
+                opened.err()
+            );
+        }
+
+        /// 指定の結果を返す `get` だけのストア（他は到達しない）。
+        struct GetOnly(Result<(), ErrorCode>);
+        impl StateStore for GetOnly {
+            fn create(&self, _: &CreateStateRequest) -> Result<StateRecord, TraitError> {
+                Err(TraitError::new(ErrorCode::Internal, "unused"))
+            }
+            fn update(&self, _: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
+                Err(TraitError::new(ErrorCode::Internal, "unused"))
+            }
+            fn get(&self, _: &GetStateRequest) -> Result<StateRecord, TraitError> {
+                match self.0 {
+                    Ok(()) => StateRecord::new(
+                        ContainerStatus::created(ContainerId::new("c1").expect("id"), None),
+                        std::env::temp_dir().join("b"),
+                        StateRevision::from_raw(1),
+                    ),
+                    Err(c) => Err(TraitError::new(c, "fake")),
+                }
+            }
+            fn list(&self, _: &ListStateRequest) -> Result<StateList, TraitError> {
+                Err(TraitError::new(ErrorCode::Internal, "unused"))
+            }
+            fn delete(&self, _: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+                Err(TraitError::new(ErrorCode::Internal, "unused"))
+            }
+        }
+
+        /// REPAIR-4・#2067: レコードなし（`NotFound`）だけが「なし」。`Timeout` 等の取得失敗はエラーで返す。
+        #[test]
+        fn repair4_record_exists_distinguishes_not_found_from_get_failure() {
+            let id = ContainerId::new("c1").expect("id");
+            assert_eq!(record_exists(&GetOnly(Ok(())), &id), Ok(true));
+            assert_eq!(
+                record_exists(&GetOnly(Err(ErrorCode::NotFound)), &id),
+                Ok(false)
+            );
+            let e = record_exists(&GetOnly(Err(ErrorCode::Timeout)), &id)
+                .expect_err("timeout must not be treated as absent");
+            assert_eq!(e.code(), ErrorCode::Timeout);
         }
 
         /// SEC-5・#1819: 壊れた・欠けた入力は fail-closed に拒否し、入力値を文言へ埋め込まない。

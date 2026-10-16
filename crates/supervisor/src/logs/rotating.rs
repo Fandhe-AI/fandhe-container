@@ -93,7 +93,8 @@
 //!   返るなら再試行せず失敗状態になる（恒久エラーとの区別がつかないため。実機の CI 結果で要判断）。
 //! - Windows のロックファイル削除は、自分のハンドルを閉じてから消すため、その間に別の sink が開くと
 //!   削除が失敗してロックファイルが残る（排他は保たれる）。
-//! - `dir`（状態ルート配下のどこか）の決定は配線側の責務で、本モジュールは決めない。
+//! - `dir`（状態ルート配下のどこか）の決定は配線側の責務で、本モジュールは決めない。コンテナのログは
+//!   `<root>/logs`、supervisor 自身の構造化ログは `<root>/@supervisor-logs`（`supervisor_log` モジュール。#2067）。
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, ErrorKind, Write};
@@ -401,6 +402,15 @@ impl RotatingFileSink {
             started.elapsed().as_micros()
         );
         result
+    }
+
+    /// [`Self::remove_all`] と同じ削除を、stderr へ何も書かずに行う（CLI の stderr 契約を破らない呼び出し側用。
+    /// supervisor ログの後始末。#2067・REPAIR-4・ERR-2）。
+    pub(crate) fn remove_all_quiet(
+        dir: &Path,
+        id: &ContainerId,
+    ) -> Result<RemovedLogs, TraitError> {
+        Self::remove_all_inner(dir, id).1
     }
 
     /// [`Self::remove_all`] の本体。実際に消せた数と結果を別々に返す（失敗時も削除数を観測に出すため）。
@@ -1047,7 +1057,7 @@ fn collect_log_names(
 }
 
 /// [`RotatingFileSink::remove_all`] の削除結果（将来の拡張に備えた構造体）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RemovedLogs {
     log_files: u32,
 }

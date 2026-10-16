@@ -15,6 +15,7 @@
 //! ├── @lock               ストア全体の排他用ロックファイル
 //! ├── @revision           次に払い出す revision（10 進 ASCII）
 //! ├── @audit.log          監査ログ（`FileAuditSink` が追記。TASK-163 追補・#1594。open 後にのみ作られる）
+//! ├── @supervisor-logs/   supervisor の構造化ログ（supervisor が書く。ストアは触れない。#2067・REPAIR-4）
 //! └── <id>/state.json     ContainerId をそのままパス要素に使う
 //! ```
 //!

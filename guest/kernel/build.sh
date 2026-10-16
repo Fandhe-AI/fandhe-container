@@ -258,6 +258,7 @@ wd_pid=""
 out_created=0
 lock_dir=""
 publishing=0
+published=""
 cleanup() {
     local rc=$?
     if [ -n "$child_pid" ]; then
@@ -270,8 +271,9 @@ cleanup() {
     [ -z "$work_dir" ] || rm -rf "$work_dir"
     # 出力先の排他ロックを持つ間に始めた公開だけを回収する（ロックを持たない側は触らない）。
     if [ "$rc" -ne 0 ] && [ "$publishing" -eq 1 ]; then
-        rm -f "$output_dir/.build-info.tmp" "$output_dir/.Image.tmp" "$output_dir/.config.tmp" \
-            "$output_dir/build-info.txt" "$output_dir/config" "$output_dir/Image"
+        # 一時名と、自分が確定させたファイルだけを消す（他者が作った同名の既存ファイルは触らない）。
+        rm -f "$output_dir/.build-info.tmp" "$output_dir/.Image.tmp" "$output_dir/.config.tmp"
+        for f in $published; do rm -f "$output_dir/$f"; done
         if [ "$out_created" -eq 1 ]; then
             rmdir "$output_dir" 2>/dev/null || true
         fi
@@ -369,6 +371,17 @@ if [ -z "$tarball" ]; then
         err fetch-failed "curl failed with exit code $rc"
         exit 2
     fi
+fi
+
+# --- 指定された tarball は private な work_dir（mktemp -d は 0700）へ複製し、以降の照合・一覧検査・展開は
+# その同じ複製だけを使う（照合後に元ファイルや親ディレクトリを差し替えられても未検証の内容を展開しない） ---
+if [ -n "$tarball_arg" ]; then
+    pinned="$work_dir/pinned-linux-${lock_ver}.tar.xz"
+    if ! cp -- "$tarball_arg" "$pinned" 2>/dev/null; then
+        err bad-argument "cannot read the tarball to compute its sha256"
+        exit 2
+    fi
+    tarball="$pinned"
 fi
 
 # --- 完全性の照合（不一致ならここで止まり、展開もビルドもしない） ---
@@ -498,10 +511,18 @@ fi
 } >"$output_dir/.build-info.tmp" 2>/dev/null \
     && cp "$image" "$output_dir/.Image.tmp" 2>/dev/null \
     && cp "$src/.config" "$output_dir/.config.tmp" 2>/dev/null \
-    && mv "$output_dir/.build-info.tmp" "$output_dir/build-info.txt" 2>/dev/null \
-    && mv "$output_dir/.config.tmp" "$output_dir/config" 2>/dev/null \
-    && mv "$output_dir/.Image.tmp" "$output_dir/Image" 2>/dev/null \
     || { err output-failed "cannot write the build outputs (disk full or permission?)"; exit 2; }
+# 確定は ln（ハードリンク）で行う。宛先が既にあれば原子的に失敗し、他者が作ったファイルを上書きしない。
+for pair in build-info.txt:.build-info.tmp config:.config.tmp Image:.Image.tmp; do
+    dest="${pair%%:*}"
+    tmp="${pair#*:}"
+    if ! ln -- "$output_dir/$tmp" "$output_dir/$dest" 2>/dev/null; then
+        err output-exists "cannot publish $dest: it already exists or the link failed; refusing to overwrite"
+        exit 2
+    fi
+    published="$published $dest"
+    rm -f -- "$output_dir/$tmp"
+done
 publishing=0
 out_created=0
 printf '%s\n' "$output_dir/Image"

@@ -355,7 +355,7 @@ expect_err "windows host" 2 unsupported-os
 # 12. 実リポのフラグメントとロックファイルの静的検査（ネットワーク不要）
 frag="$here/arm64-guest.config"
 lock="$here/source.lock"
-for sym in VIRTIO_FS VIRTIO_VSOCKETS DRM_VIRTIO_GPU VIRTIO_CONSOLE VIRTIO_BLK BLK_DEV_INITRD DEVTMPFS; do
+for sym in VIRTIO_FS VIRTIO_VSOCKETS DRM_VIRTIO_GPU VIRTIO_CONSOLE VIRTIO_BLK BLK_DEV BLK_DEV_INITRD DEVTMPFS; do
     grep -qx "CONFIG_$sym=y" "$frag" && ok || ng "fragment: CONFIG_$sym=y missing"
 done
 # arm64 の Kconfig に無い記号（実カーネルの allnoconfig で config-option-missing になる）を置かない

@@ -60,6 +60,14 @@ if ! bench_manual_in_vocab "${results_arch}" "${BENCH_MANUAL_ARCHES}"; then
   exit 2
 fi
 
+# 出力先が入力（metrics の SSOT・結果ファイル）と同一ファイルなら拒否する。metrics は一時ファイルへ変換してから
+# generate_baseline.sh へ渡すため、そちらの入出力同一検査では元ファイルを守れない。文字列比較だけでなく
+# symlink・相対パス経由の同一ファイルも -ef で検出する。
+if [ "${BENCH_BASELINE_OUT}" -ef "${BENCH_METRICS}" ] || [ "${BENCH_BASELINE_OUT}" -ef "${BENCH_RESULTS}" ]; then
+  err "BENCH_BASELINE_OUT must not be the same file as BENCH_METRICS or BENCH_RESULTS"
+  exit 2
+fi
+
 # 既定の出力先だけ親ディレクトリを作る（明示指定の出力先の親は操作者が用意する）。
 if [ "${BENCH_BASELINE_OUT}" = "${BENCH_MANUAL_BASELINE_OUT_DEFAULT}" ]; then
   mkdir -p "$(dirname "${BENCH_BASELINE_OUT}")"

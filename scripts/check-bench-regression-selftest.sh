@@ -431,6 +431,26 @@ BENCH_RESULTS="${mk_dir}/ok.json" BENCH_HOST_KIND=bare-metal BENCH_BASELINE_OUT=
 expect_eq "manual-baseline-output-symlink-exit" "${actual}" "2"
 expect_eq "manual-baseline-output-symlink-target-not-created" "$([ -e "${mk_dir}/target-of-link.json" ] && echo yes || echo no)" "no"
 
+# 出力先が BENCH_METRICS・BENCH_RESULTS と同一ファイル（直接指定・symlink 経由）なら 2 で拒否し、元ファイルを書き換えない。
+cp "${repo_root}/benches/metrics.json" "${mk_dir}/metrics-copy.json"
+cp "${mk_dir}/metrics-copy.json" "${mk_dir}/metrics-copy.orig"
+ln -s "${mk_dir}/metrics-copy.json" "${mk_dir}/metrics-alias.json"
+for alias_out in "${mk_dir}/metrics-copy.json" "${mk_dir}/metrics-alias.json"; do
+  actual=0
+  BENCH_RESULTS="${mk_dir}/ok.json" BENCH_HOST_KIND=bare-metal BENCH_BASELINE_OUT="${alias_out}" \
+    BENCH_METRICS="${mk_dir}/metrics-copy.json" bash "${gen_script}" >/dev/null 2>&1 || actual=$?
+  expect_eq "manual-baseline-output-is-metrics-exit ($(basename "${alias_out}"))" "${actual}" "2"
+  expect_eq "manual-baseline-output-is-metrics-untouched ($(basename "${alias_out}"))" \
+    "$(cmp -s "${mk_dir}/metrics-copy.json" "${mk_dir}/metrics-copy.orig" && echo same || echo changed)" "same"
+done
+cp "${mk_dir}/ok.json" "${mk_dir}/ok-copy.json"
+actual=0
+BENCH_RESULTS="${mk_dir}/ok-copy.json" BENCH_HOST_KIND=bare-metal BENCH_BASELINE_OUT="${mk_dir}/ok-copy.json" \
+  BENCH_METRICS="${repo_root}/benches/metrics.json" bash "${gen_script}" >/dev/null 2>&1 || actual=$?
+expect_eq "manual-baseline-output-is-results-exit" "${actual}" "2"
+expect_eq "manual-baseline-output-is-results-untouched" \
+  "$(cmp -s "${mk_dir}/ok.json" "${mk_dir}/ok-copy.json" && echo same || echo changed)" "same"
+
 # 既定の出力先は共有の基準値（benches/baseline-manual.json）と一致せず target/ 配下（既定で上書きしない）。
 default_out="$(bash -c 'source "$1"; echo "${BENCH_MANUAL_BASELINE_OUT_DEFAULT}"' _ "${lib_sh}")"
 case "${default_out}" in

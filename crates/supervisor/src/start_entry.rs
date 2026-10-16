@@ -1915,8 +1915,19 @@ mod linux {
         if store.get(&GetStateRequest::new(id.clone())).is_err() {
             return Ok(());
         }
-        let writer = crate::supervisor_log::open(root, id)?;
+        // ストアが受理した（親 symlink 解決済みの）状態ルートの下に置く。生の `--root` だと、ストアは受理するのに
+        // RotatingFileSink が root 所有でない symlink を拒否して fail-closed になる。ストアが示せなければ引数を使う。
+        let log_root = supervisor_log_root(store, root);
+        let writer = crate::supervisor_log::open(log_root, id)?;
         crate::stderr_sink::install_stderr_writer(Box::new(writer))
+    }
+
+    /// supervisor ログを置く状態ルート。ストアの `host_state_root()`（検査済み）を優先し、無ければ引数の root。
+    fn supervisor_log_root<'a>(
+        store: &'a Arc<dyn StateStore>,
+        root: &'a std::path::Path,
+    ) -> &'a std::path::Path {
+        store.host_state_root().unwrap_or(root)
     }
 
     /// supervisor の bin の入口（`src/main.rs` から呼ぶ）。`args` はプログラム名を除いた argv。
@@ -2055,6 +2066,36 @@ mod linux {
                     "rootful start is not supported by the production launcher"
                 );
             }
+        }
+
+        /// REPAIR-4・#2067: 親が symlink の `--root` でも、ログはストアの解決済み状態ルートの下に開ける。
+        #[cfg(unix)]
+        #[test]
+        fn repair4_log_root_follows_store_host_state_root_through_symlink() {
+            let base = std::env::temp_dir().join(format!("fc-slog-{}", std::process::id()));
+            let real = base.join("real");
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&real).expect("mkdir");
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                for d in [&base, &real] {
+                    std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))
+                        .expect("chmod");
+                }
+            }
+            let link_parent = base.join("link");
+            std::os::unix::fs::symlink(&base, &link_parent).expect("symlink");
+            let raw_root = link_parent.join("real");
+            let store = crate::state::open_default_store(Some(raw_root.clone())).expect("store");
+            let log_root = supervisor_log_root(&store, &raw_root).to_path_buf();
+            let id = ContainerId::new("c1").expect("id");
+            let opened = crate::supervisor_log::open(&log_root, &id);
+            let _ = std::fs::remove_dir_all(&base);
+            assert!(
+                opened.is_ok(),
+                "log must open under the store root: {:?}",
+                opened.err()
+            );
         }
 
         /// SEC-5・#1819: 壊れた・欠けた入力は fail-closed に拒否し、入力値を文言へ埋め込まない。

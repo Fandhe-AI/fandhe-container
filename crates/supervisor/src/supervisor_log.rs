@@ -111,12 +111,16 @@ fn open_with_config(
 }
 
 fn create_dir(dir: &Path) -> Result<(), TraitError> {
-    let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt as _;
-        builder.mode(0o700);
-    }
+        let mut b = std::fs::DirBuilder::new();
+        b.mode(0o700);
+        b
+    };
+    // unix 以外ではモード指定が無く、変更しないので mut を付けない（unused_mut 回避）。
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
     match builder.create(dir) {
         Ok(()) => Ok(()),
         // 既存の検証（symlink・種別・権限）は RotatingFileSink::open の check_dir に任せる。

@@ -250,7 +250,7 @@ owner_tok=""
 out_tmp=""
 final_rc=0
 spawned=0
-declare -A SP SS SZ CH TRK BADREP
+declare -A SP SS SZ CH TRK BADREP ERRREP
 untracked=0
 TREE_TRUNC=0
 publish_pending=0
@@ -481,6 +481,11 @@ tracked_alive() {
 cleanup_procs() {
   local i round
   track_descendants
+  # FCSUP1 ERR を報告した supervisor は報告の直後に終了する（生存中に後始末へ入ってもまもなく消える）。
+  # init の記録が無ければ、終了を待たず追跡不能とする（判定を終了の競合に依存させない）。
+  for i in "${!pids[@]}"; do
+    if [ -n "${ERRREP[$i]:-}" ] && { [ -z "${REP_PID[$i]:-}" ] || [ -z "${TRK[${REP_PID[$i]}]:-}" ]; }; then untracked=1; fi
+  done
   for i in "${!pids[@]}"; do sig_same_proc TERM "${pids[$i]}" "${pstart[$i]:-}" "$$"; done
   wait_until 10 _none_alive || true
   for i in "${!pids[@]}"; do sig_same_proc KILL "${pids[$i]}" "${pstart[$i]:-}" "$$"; done
@@ -600,6 +605,7 @@ sup_report() { # <i>
   fi
   if [[ "$line" =~ ^FCSUP1\ ERR\ ([A-Z_]{1,32})\ ([0-9]{1,3})\  ]]; then
     err "launch-failed" "supervisor ${i} reported ERR ${BASH_REMATCH[1]} (exit ${BASH_REMATCH[2]})"
+    ERRREP[$i]=1
   else
     err "launch-failed" "supervisor ${i} printed an unrecognized report line"
   fi

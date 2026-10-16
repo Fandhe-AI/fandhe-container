@@ -149,7 +149,12 @@ expect_eq "tarball path: exit code" "0" "$(rc_of)"
 
 # 3. sha256 不一致: 4・展開もビルドもしない
 lock_bad="$sandbox/lock.badsha"
-write_lock "$lock_bad" "$ver" "$url_ok" "$(printf '%s' "$good_sha" | sed 's/^./0/;s/^00/01/')"
+# 先頭 1 文字を必ず別の値へ変える（0 なら 1、それ以外なら 0。元の値と一致しない不一致ハッシュを保証する）
+case "$good_sha" in
+    0*) bad_sha="1${good_sha#?}" ;;
+    *) bad_sha="0${good_sha#?}" ;;
+esac
+write_lock "$lock_bad" "$ver" "$url_ok" "$bad_sha"
 rm -f "$sandbox/calls"
 out3="$sandbox/out3"
 run_build "GUEST_KERNEL_LOCK=$lock_bad" "GUEST_KERNEL_UNAME_S=Linux" "GUEST_KERNEL_UNAME_M=x86_64" "CALL_MARK=$sandbox/calls" -- \

@@ -20,6 +20,14 @@ compile_error!(
     "the `signal-test-support` feature exposes test-only signal handler entry points and must not be enabled in release builds"
 );
 
+// `start-test-support` は start の systemd-run の解決を環境変数で差し替える試験専用の入口を有効にする feature で、
+// 製品のバイナリに含める理由がない。最適化ビルドで有効になっていたらコンパイルを止める（#2081・CORE-3・REPAIR-3。
+// `signal-test-support` と同じ方式）。
+#[cfg(all(feature = "start-test-support", not(debug_assertions)))]
+compile_error!(
+    "the `start-test-support` feature lets the systemd-run path be overridden by an environment variable and must not be enabled in release builds"
+);
+
 pub mod commands;
 pub mod doctor;
 pub mod error;
